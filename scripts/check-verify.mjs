@@ -76,6 +76,7 @@ const text = async (loc) => (await loc.first().innerText().catch(() => '')).repl
 /** 两个颜色的对比度（WCAG）：颜色是 getComputedStyle 给的 rgb / rgba / color(srgb …)，半透明的叠在底色上 */
 function contrast(fg, bg, base) {
   const parse = (c) => {
+    if (typeof c !== 'string') return null
     const m = c.match(/color\(srgb ([\d.]+) ([\d.]+) ([\d.]+)(?: \/ ([\d.]+))?\)/)
     if (m) return [m[1] * 255, m[2] * 255, m[3] * 255, m[4] == null ? 1 : Number(m[4])]
     const n = c.match(/rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?\)/)
@@ -358,6 +359,168 @@ await section('审批卡：390px 不横向溢出、窄栏里上下排、深浅�
   const b = await metric(rail.page, 'gmv').locator('[data-dual-sql="blind"]').boundingBox()
   check('360px 画布右栏：宽屏下也按卡片的宽度上下排', !!o && !!b && b.y >= o.y + o.height - 1, JSON.stringify({ o, b }))
   await shot(rail.page, 'approval-rail-dark')
+})
+
+// ---------------------------------------------------------------- 检查器与节点卡片
+
+/**
+ * 检查器用例：设置（相对误差、启用的「跟随设置」要写出眼下的值）按夹具答，改配置触发的校验、变量分析回空，
+ * 节点配置直接从 studio store 读（window.__studio，开发服务器才挂）
+ */
+async function inspector(opts = {}) {
+  const out = await preview('dual-check-inspector', {
+    ...opts,
+    extra: (req, url) => {
+      if (req.method() === 'GET' && url.pathname === '/api/settings') return { json: { run: {}, verify: fx.verify } }
+      if (req.method() === 'POST' && url.pathname === '/api/workflows/validate') return { json: { issues: [] } }
+      if (req.method() === 'POST' && url.pathname === '/api/workflows/variables') return { json: { variables: [], issues: [] } }
+      return null
+    },
+  })
+  await out.page.waitForSelector('[data-field="card"] select')
+  return out
+}
+const config = (page) => page.evaluate(() => window.__studio.getState().nodes.find((n) => n.id === 'dc').data.config)
+const summaryOf = (page) => text(page.locator('.react-flow__node[data-id="dc"] .nc-summary'))
+/** 画布上的节点是 React Flow 在下一拍才按新配置重画的：等摘要变成想要的那句（最多 3 秒），返回最后看到的 */
+async function summaryBecomes(page, want) {
+  const ok = await page.waitForFunction((w) => {
+    const el = document.querySelector('.react-flow__node[data-id="dc"] .nc-summary')
+    return !!el && (typeof w === 'string' ? el.textContent.trim() === w : el.textContent.trim().endsWith(w.suffix))
+  }, want, { timeout: 3000 }).then(() => true, () => false)
+  return { ok, seen: await summaryOf(page) }
+}
+
+await section('检查器：每一项都写进节点配置，节点卡片的摘要跟着变', async () => {
+  const { page, errors, sent } = await inspector()
+  const panel = page.locator('[data-dual-inspector]')
+  check('说明里不再写「功能开发中」', !(await text(panel)).includes('功能开发中') && (await text(panel)).includes('另起一路独立计算'))
+  check('节点卡片的摘要：复算哪张口径卡、全部几个指标', await summaryOf(page) === '复算「周报口径卡」 · 全部 3 个指标', await summaryOf(page))
+
+  // 口径卡：下拉选画布上的口径卡，上游的一组、其余的一组；留空取上游的那张
+  const card = page.locator('[data-field="card"] select')
+  const groups = await card.evaluate((el) => [...el.querySelectorAll('optgroup')].map((g) => `${g.label}:${[...g.querySelectorAll('option')].map((o) => o.value).join('+')}`))
+  check('口径卡：上游的一组、其余的一组', groups.join('|') === '上游的口径卡:card|其他口径卡（需连接到本节点上游）:card2', groups.join('|'))
+  check('……留空那一项写明默认取上游的哪一张', (await card.locator('option').first().innerText()) === '默认：上游的口径卡「周报口径卡」')
+  check('……标签指向这个下拉', await page.locator('[data-field="card"] label').getAttribute('for') === await card.getAttribute('id'))
+  await card.selectOption('card2')
+  check('选另一张：写进 card', (await config(page)).card === 'card2', JSON.stringify(await config(page)))
+  check('……不在上游的照实提醒', (await text(page.locator('[data-dual-card-warn]'))).includes('不在本节点上游'))
+  const swapped = await summaryBecomes(page, '复算「月报口径卡」 · 全部 1 个指标')
+  check('……摘要换成这张卡', swapped.ok, swapped.seen)
+  await card.selectOption('')
+  check('选回默认：card 去掉，不留空串', !('card' in (await config(page))) || (await config(page)).card === undefined, JSON.stringify(await config(page)))
+
+  // 指标：逐个勾；全部勾着是缺省，不写；最后一个不让取消
+  const opts = page.locator('[data-dual-metric-option]')
+  check('指标：列出这张卡的三个指标，默认全勾、说明是缺省', await opts.count() === 3
+    && await page.locator('[data-dual-metric-option] input:checked').count() === 3
+    && (await text(page.locator('[data-dual-metrics-state]'))) === '未指定：复算全部输入来自查询的指标')
+  check('……一组有读屏名', await page.locator('[data-dual-metrics="list"]').getAttribute('aria-label') === '复算的指标')
+  await page.locator('[data-dual-metric-option="aov"] input').uncheck()
+  check('取消一个：写进 metrics（按卡里的顺序）', JSON.stringify((await config(page)).metrics) === '["gmv","orders"]', JSON.stringify((await config(page)).metrics))
+  const two = await summaryBecomes(page, '复算「周报口径卡」 · 2 个指标')
+  check('……摘要写几个指标', two.ok, two.seen)
+  check('……说明写已选几个', (await text(page.locator('[data-dual-metrics-state]'))) === '已选 2 / 3 个指标')
+  await page.locator('[data-dual-metric-option="orders"] input').uncheck()
+  check('只剩一个：不让取消（一个都不勾和缺省分不清）', await page.locator('[data-dual-metric-option="gmv"] input').isDisabled()
+    && JSON.stringify((await config(page)).metrics) === '["gmv"]')
+
+  // 口径说明：只列要复算的指标；写了的存成 {指标 id: 说明}
+  const defs = page.locator('[data-dual-definition]')
+  check('口径说明：只列要复算的指标', (await defs.evaluateAll((els) => els.map((e) => e.dataset.dualDefinition))).join(',') === 'gmv')
+  const words = '销售额按支付时间统计，不含退款'
+  await page.locator('[data-dual-definition="gmv"] textarea').fill(words)
+  check('写一段：存成 {指标 id: 说明}', JSON.stringify((await config(page)).definitions) === JSON.stringify({ gmv: words }),
+    JSON.stringify((await config(page)).definitions))
+  check('……每段有自己的标签（指标名）', (await text(page.locator('[data-dual-definition="gmv"] label'))) === '销售额（gmv）')
+  for (const id of ['orders', 'aov']) await page.locator(`[data-dual-metric-option="${id}"] input`).check()
+  check('全部勾回来：metrics 去掉（缺省）', (await config(page)).metrics === undefined, JSON.stringify((await config(page)).metrics))
+  await page.locator('[data-dual-definition="orders"] textarea').fill('订单数按支付成功的订单计')
+  await page.locator('[data-dual-metric-option="orders"] input').uncheck()
+  check('写了说明的指标被取消：照实提醒、能删掉', (await text(page.locator('[data-dual-definition-gone]'))).includes('「orders」'))
+  await page.locator('[data-dual-definition-gone] button').click()
+  check('……删掉后只剩还在复算的那段', JSON.stringify((await config(page)).definitions) === JSON.stringify({ gmv: words }))
+  await page.locator('[data-dual-definition="gmv"] textarea').fill('')
+  check('清空最后一段：definitions 去掉', (await config(page)).definitions === undefined)
+  await page.locator('[data-dual-metric-option="orders"] input').check()
+
+  // 启用：跟随设置 / 开启 / 关闭
+  const enabled = page.locator('[data-field="enabled"] [role="radiogroup"]')
+  check('启用：三态，跟随设置写出设置里眼下是开着的', (await enabled.locator('[role="radio"]').allInnerTexts()).join('|') === '跟随设置（当前开启）|开启|关闭'
+    && await enabled.locator('[role="radio"][aria-checked="true"]').getAttribute('data-value') === 'follow')
+  await enabled.locator('[data-value="off"]').click()
+  const off = await summaryBecomes(page, { suffix: ' · 已关闭' })
+  check('关闭：enabled 为 false，摘要标「已关闭」', (await config(page)).enabled === false && off.ok, off.seen)
+  await enabled.locator('[data-value="off"]').focus()
+  await page.keyboard.press('ArrowLeft')
+  check('键盘方向键换选项：开启是 true', (await config(page)).enabled === true
+    && await page.evaluate(() => document.activeElement?.getAttribute('data-value')) === 'on')
+  await enabled.locator('[data-value="follow"]').click()
+  check('跟随设置：enabled 去掉，不留 null', (await config(page)).enabled === undefined, JSON.stringify(await config(page)))
+
+  // 不采用原流程时
+  const reject = page.locator('[data-field="on_reject"] select')
+  check('不采用原流程时：默认落在「记为出具缺口」上', (await reject.locator('option:checked').innerText()) === '记为出具缺口，出具降档（默认）')
+  await reject.selectOption('fail')
+  check('……选判为失败：on_reject 为 fail', (await config(page)).on_reject === 'fail')
+
+  // 高级：盲算模型、相对误差
+  await page.locator('button', { hasText: '高级选项' }).click()
+  const provider = page.locator('[data-field="provider"] select')
+  check('盲算模型 · 接入：留空跟随设置，停用的接入照实标出', (await provider.locator('option').allInnerTexts()).join('|') === '跟随设置|云端接入|备用接入（已停用）',
+    (await provider.locator('option').allInnerTexts()).join('|'))
+  await provider.selectOption('云端接入')
+  const model = page.locator('[data-field="model"] input')
+  check('选了接入：provider 写进去，模型的占位换成接入的默认模型', (await config(page)).provider === '云端接入'
+    && await model.getAttribute('placeholder') === '留空则使用该接入的默认模型')
+  await model.fill('model-b')
+  check('模型：写进 model', (await config(page)).model === 'model-b')
+  await provider.selectOption('')
+  check('只填了模型：接入留空那一项改叫「按模型名找接入」，写明按模型名用哪个接入', (await provider.locator('option').first().innerText()) === '按模型名找接入'
+    && (await text(page.locator('[data-dual-by-model]'))).includes('将按模型名使用接入「云端接入」') && (await config(page)).provider === undefined)
+  const tol = page.locator('[data-field="tolerance"] input')
+  check('允许的相对误差：占位写出设置里的值', await tol.getAttribute('placeholder') === '跟随设置（0.000001）', await tol.getAttribute('placeholder'))
+  await tol.fill('0.001')
+  check('……填了写成数', (await config(page)).tolerance === 0.001)
+  await tol.fill('-1')
+  check('……负数标出来', (await text(page.locator('[data-field="tolerance"]'))).includes('请填写不小于 0 的数') && await tol.getAttribute('aria-invalid') === 'true')
+  await tol.fill('')
+  check('……清空回到跟随设置', (await config(page)).tolerance === undefined)
+  const KEYS = ['card', 'metrics', 'definitions', 'provider', 'model', 'tolerance', 'on_reject', 'enabled']
+  const keys = Object.entries(await config(page)).filter(([, v]) => v !== undefined).map(([k]) => k)
+  check('配置里只有约定的键，留空的项不留空值', keys.every((k) => KEYS.includes(k)) && keys.sort().join(',') === 'model,on_reject', keys.join(','))
+  check('没有写库的请求', !sent.some((s) => s.blocked), JSON.stringify(sent.filter((s) => s.blocked)))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+  await shot(page, 'inspector-dark')
+})
+
+await section('检查器：360px 栏、390px 窄屏不横向溢出，深浅色可读', async () => {
+  for (const [width, theme] of [[1280, 'dark'], [390, 'light']]) {
+    const { page, errors } = await inspector({ width, height: 900, theme })
+    await page.locator('button', { hasText: '高级选项' }).click()
+    await page.locator('[data-field="model"] input').fill('model-zzz')
+    const w = await page.evaluate(() => {
+      const panel = document.querySelector('[data-dual-inspector]')
+      const body = panel.querySelector('fieldset')
+      return { page: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        panel: panel.scrollWidth - panel.clientWidth, body: body ? body.scrollWidth - body.clientWidth : 0 }
+    })
+    check(`${width}px（${theme}）：检查器不横向溢出`, w.page <= 0 && w.panel <= 0 && w.body <= 0, JSON.stringify(w))
+    const c = await page.evaluate(() => {
+      const base = getComputedStyle(document.querySelector('[data-dual-inspector]')).backgroundColor
+      const el = document.querySelector('[data-dual-by-model]')
+      const radio = document.querySelector('[data-field="enabled"] [role="radio"][aria-checked="true"]')
+      return { base, hint: el && getComputedStyle(el).color, radio: radio && getComputedStyle(radio).color,
+        radioBg: radio && getComputedStyle(radio).backgroundColor }
+    })
+    const hint = contrast(c.hint, c.base, c.base)
+    check(`${theme}：只填了模型的提醒对比度 ≥ 4.5`, hint >= 4.5, `${hint.toFixed(2)}（${c.hint} on ${c.base}）`)
+    const radio = contrast(c.radio, c.radioBg, c.base)
+    check(`${theme}：启用里选中那一项对比度 ≥ 4.5`, radio >= 4.5, `${radio.toFixed(2)}（${c.radio} on ${c.radioBg}）`)
+    await shot(page, `inspector-${width}-${theme}`)
+    check(`${width}px（${theme}）：页面没有报错`, errors.length === 0, errors.join('；'))
+  }
 })
 
 await browser.close()

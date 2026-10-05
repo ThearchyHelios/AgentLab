@@ -3385,10 +3385,14 @@ export const DUAL_CHECK_TEXT = {
   metricsNone: '这张口径卡还没有定义指标',
   metricsPinned: '这张口径卡引用了其他工作流发布的口径，指标在运行时按引用的版本确定：将复算其中输入来自查询的全部指标',
   metricsStale: (ids: string[]) => `已选的指标不在这张口径卡中：${ids.join('、')}`,
-  metricsClear: '清除已选',
+  metricsClear: '清除不在卡中的指标',
+  metricsLast: '至少保留一个指标；要复算全部指标时全部勾选即可',
   metricOption: (name: string | null | undefined, id: string) => (name && name !== id ? `${name}（${id}）` : id),
   definitionPlaceholder: (name: string) => `「${name}」的口径说明`,
-  definitionsNone: '选择要复算的指标后，可以为每个指标写一段口径说明',
+  definitionsNone: '选择要复算的口径卡后，可以为每个指标写一段口径说明',
+  definitionsPinned: '这张口径卡引用了其他工作流发布的口径，指标在运行时才确定，无法在这里逐个填写口径说明',
+  definitionGone: (id: string) => `指标「${id}」已不在复算范围内，这段说明不会交给盲算模型`,
+  definitionRemove: '删除这段说明',
   providerFollow: '跟随设置',
   providerFromModel: '按模型名找接入',
   providerGone: (name: string) => `${name}（不存在）`,
@@ -3408,6 +3412,7 @@ export const DUAL_CHECK_TEXT = {
   tolerancePlaceholder: (v: number | null | undefined) => (v == null ? '跟随设置' : `跟随设置（${v}）`),
   toleranceInvalid: '请填写不小于 0 的数',
   onReject: { degrade: '记为出具缺口，出具降档（默认）', fail: '判为失败，运行终止' } as Record<string, string>,
+  onRejectUnknown: (v: string) => `${v}：无法识别的值，请从上方选项中选择`,
   enabled: { follow: '跟随设置', on: '开启', off: '关闭' },
   /** 「跟随设置」那一项附上设置里眼下是开是关（设置还没取回来就不附） */
   enabledFollow: (on: boolean | null | undefined) => (on == null ? '跟随设置' : `跟随设置（当前${on ? '开启' : '关闭'}）`),
@@ -3417,6 +3422,7 @@ export const DUAL_CHECK_TEXT = {
     card: (name: string, picked: number | null, total: number | null) => `复算「${name}」 · ${
       picked != null ? `${picked} 个指标` : total != null ? `全部 ${total} 个指标` : '全部指标'}`,
     noCard: '复算上游的口径卡 · 尚未连接口径卡',
+    many: (n: number) => `复算上游的口径卡 · 上游有 ${n} 张，请指定`,
     off: '已关闭',
   },
 

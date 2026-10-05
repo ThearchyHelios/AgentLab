@@ -24,7 +24,9 @@
           "original_rendered": "45,678.5元",
           "blind_rendered": "51,388.3元",
           "delta_pct": 12.5,
-          "diff": ["原流程按支付时间 paid_at 筛选时间范围，盲算按下单时间 created_at 筛选"],
+          "diff": [
+            "原流程按支付时间 paid_at 筛选时间范围，盲算按下单时间 created_at 筛选"
+          ],
           "fallback": false
         },
         {
@@ -79,7 +81,10 @@
         "diff": {
           "equivalent": false,
           "items": [
-            { "aspect": "time", "text": "原流程按支付时间 paid_at 筛选时间范围，盲算按下单时间 created_at 筛选" }
+            {
+              "aspect": "time",
+              "text": "原流程按支付时间 paid_at 筛选时间范围，盲算按下单时间 created_at 筛选"
+            }
           ],
           "fallback": false,
           "text_diff": [
@@ -140,7 +145,10 @@
         "diff": {
           "equivalent": false,
           "items": [
-            { "aspect": "other", "text": "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文" }
+            {
+              "aspect": "other",
+              "text": "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文"
+            }
           ],
           "fallback": true,
           "text_diff": [
@@ -150,5 +158,217 @@
         }
       }
     ]
+  },
+  "graph": {
+    "nodes": [
+      {
+        "id": "start",
+        "type": "input",
+        "position": {
+          "x": 0,
+          "y": 120
+        },
+        "data": {
+          "label": "输入",
+          "config": {
+            "fields": [
+              {
+                "name": "week",
+                "required": true
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "fetch",
+        "type": "agent",
+        "position": {
+          "x": 280,
+          "y": 120
+        },
+        "data": {
+          "label": "取数",
+          "config": {
+            "prompt": "查询本周各门店的订单",
+            "tools": [
+              "db_query__shop"
+            ],
+            "assign_to": "kpi"
+          }
+        }
+      },
+      {
+        "id": "card",
+        "type": "metrics",
+        "position": {
+          "x": 560,
+          "y": 40
+        },
+        "data": {
+          "label": "周报口径卡",
+          "config": {
+            "caliber": "周报口径",
+            "caliber_version": "v1",
+            "metrics": [
+              {
+                "id": "gmv",
+                "name": "销售额",
+                "unit": "元",
+                "expression": "vars.kpi.gmv"
+              },
+              {
+                "id": "orders",
+                "name": "订单数",
+                "unit": "单",
+                "expression": "vars.kpi.orders"
+              },
+              {
+                "id": "aov",
+                "name": "客单价",
+                "unit": "元",
+                "expression": "vars.kpi.gmv / vars.kpi.orders"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "card2",
+        "type": "metrics",
+        "position": {
+          "x": 560,
+          "y": 260
+        },
+        "data": {
+          "label": "月报口径卡",
+          "config": {
+            "caliber": "月报口径",
+            "caliber_version": "v2",
+            "metrics": [
+              {
+                "id": "m_gmv",
+                "name": "月销售额",
+                "unit": "元",
+                "expression": "vars.kpi.gmv"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "dc",
+        "type": "dual_check",
+        "position": {
+          "x": 840,
+          "y": 40
+        },
+        "data": {
+          "label": "复核周报口径",
+          "config": {}
+        }
+      },
+      {
+        "id": "done",
+        "type": "output",
+        "position": {
+          "x": 1120,
+          "y": 40
+        },
+        "data": {
+          "label": "成果",
+          "config": {
+            "fields": [
+              {
+                "name": "结果",
+                "value": "{{ last_message }}"
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e1",
+        "source": "start",
+        "target": "fetch"
+      },
+      {
+        "id": "e2",
+        "source": "fetch",
+        "target": "card"
+      },
+      {
+        "id": "e3",
+        "source": "fetch",
+        "target": "card2"
+      },
+      {
+        "id": "e4",
+        "source": "card",
+        "target": "dc"
+      },
+      {
+        "id": "e5",
+        "source": "dc",
+        "target": "done"
+      }
+    ]
+  },
+  "providers": [
+    {
+      "id": "prov-a",
+      "name": "云端接入",
+      "kind": "anthropic",
+      "base_url": null,
+      "default_model": "model-a",
+      "models": [
+        {
+          "id": "model-a"
+        },
+        {
+          "id": "model-b"
+        }
+      ],
+      "enabled": true,
+      "extra": {}
+    },
+    {
+      "id": "prov-b",
+      "name": "备用接入",
+      "kind": "openai",
+      "base_url": null,
+      "default_model": "model-c",
+      "models": [
+        {
+          "id": "model-c"
+        }
+      ],
+      "enabled": false,
+      "extra": {}
+    }
+  ],
+  "verify": {
+    "provider": null,
+    "model": null,
+    "dual_check": {
+      "enabled": true,
+      "tolerance": 1e-06,
+      "max_queries": 6,
+      "timeout_s": 120
+    },
+    "challenge": {
+      "enabled": true,
+      "max_claims": 5,
+      "max_queries": 4,
+      "timeout_s": 90
+    },
+    "inquiry": {
+      "enabled": true,
+      "max_queries": 6,
+      "timeout_s": 120
+    },
+    "daily_max_usd": 2.0
   }
 }

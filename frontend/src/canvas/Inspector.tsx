@@ -618,6 +618,9 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
   const defaults = useRunDefaults(field.key === 'scope' || field.type === 'collection')
   const aria = { 'aria-invalid': invalid || undefined, 'aria-describedby': describedBy }
 
+  if (field.render) {
+    return <>{field.render({ id, nodeId, value, config, invalid, describedBy, disabled, onChange })}</>
+  }
   switch (field.type) {
     case 'text':
       if (syntax !== 'plain') {
