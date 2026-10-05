@@ -59,7 +59,7 @@ function QueryItem({ q, k, nth }: { q: RunCompareQuery; k: string; nth: number |
         <span className="tnum text-2xs text-faint" data-compare-rows="">{rows}</span>
         {foldable && (
           <button type="button" className="btn btn-xs btn-ghost text-faint" data-compare-sql-toggle=""
-                  aria-expanded={showSql} aria-controls={sqlId} onClick={() => setShowSql((v) => !v)}>
+                  aria-expanded={showSql} aria-controls={showSql ? sqlId : undefined} onClick={() => setShowSql((v) => !v)}>
             <ChevronRight size={11} aria-hidden className={clsx('transition-transform', showSql && 'rotate-90')} />
             {showSql ? T.hideSql : T.showSql}
           </button>
@@ -82,7 +82,9 @@ function QueryItem({ q, k, nth }: { q: RunCompareQuery; k: string; nth: number |
             {q.literals.map((l, i) => (
               <li key={i} className="flex min-w-0 flex-wrap items-center gap-1.5">
                 <code className="mono rounded px-1 [overflow-wrap:anywhere]" style={MARK.del}>{valueText(l.base)}</code>
+                {/* 箭头只给眼睛看，读屏念「改为」 */}
                 <span className="text-faint" aria-hidden>→</span>
+                <span className="sr-only">{T.changedTo}</span>
                 <code className="mono rounded px-1 [overflow-wrap:anywhere]" style={MARK.add}>{valueText(l.target)}</code>
               </li>
             ))}

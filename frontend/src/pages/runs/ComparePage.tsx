@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { GitCompareArrows } from 'lucide-react'
 import { EmptyState, PageHeader, Skeleton, Spinner } from '../../components/ui'
@@ -44,7 +44,11 @@ export function ComparePage() {
 
   const targetRun = useRunRecord(target)
   const baseRun = useRunRecord(base)
-  const workflowId = targetRun.data?.workflow_id
+  // 换基准的下拉按本次的工作流取。互换、换了本次之后新的运行记录还在路上时沿用上一次知道的工作流：能比的两次运行
+  // 本来就是同一个工作流，不必让下拉先退回「正在读取」、再把同一份列表取一遍
+  const lastWorkflow = useRef<string | null | undefined>(undefined)
+  if (targetRun.state === 'ok') lastWorkflow.current = targetRun.data?.workflow_id ?? null
+  const workflowId = targetRun.state === 'ok' ? targetRun.data?.workflow_id : lastWorkflow.current
   const candidates = useCandidates(workflowId)
   const cmp = useComparison(target, base)
 

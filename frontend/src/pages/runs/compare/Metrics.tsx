@@ -108,7 +108,7 @@ function MetricRows({ m, k, detailId, open, onToggle }: {
     <Fragment>
       <tr className={clsx('border-b align-top last:border-0', open && 'bg-hover')} data-compare-metric={k} data-class={m.classification}>
         <th scope="row" className={clsx(STICKY, open ? 'bg-hover' : 'bg-panel', 'px-2.5 py-2 text-left font-normal')}>
-          <button type="button" data-compare-expand="" aria-expanded={open} aria-controls={detailId}
+          <button type="button" data-compare-expand="" aria-expanded={open} aria-controls={open ? detailId : undefined}
                   title={open ? T.collapse(m.name) : T.expand(m.name)} onClick={onToggle}
                   className="group flex max-w-[220px] items-start gap-1 rounded-sm text-left focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[color:var(--accent)]">
             <ChevronRight size={12} aria-hidden
@@ -128,7 +128,7 @@ function MetricRows({ m, k, detailId, open, onToggle }: {
         <td className="px-2.5 py-2"><ClassChip value={m.classification} /></td>
         <td className="px-2.5 py-2">
           {m.decomposition ? (
-            <Split d={m.decomposition} total={deltaText(m)} />
+            <Split d={m.decomposition} total={totalText(m)} />
           ) : m.decomposition_note ? (
             <p className="max-w-[280px] text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-compare-decomp-note="">
               {m.decomposition_note}
@@ -153,6 +153,15 @@ function MetricRows({ m, k, detailId, open, onToggle }: {
 function deltaText(m: RunCompareMetric): string {
   if (m.delta_rendered) return m.delta_rendered
   return m.delta === 0 ? T.noChange : NONE
+}
+
+/**
+ * 拆分那句话里的总变化：口径变了、数值却碰巧没变时服务端不给变化量的写法（两效应正好抵消），写「0」，
+ * 不写成「两者之和等于总变化 无变化」
+ */
+function totalText(m: RunCompareMetric): string {
+  if (m.delta_rendered) return m.delta_rendered
+  return m.delta === 0 ? '0' : NONE
 }
 
 /**
@@ -205,7 +214,7 @@ function MetricDetail({ m }: { m: RunCompareMetric }) {
         )}
         {m.decomposition && (
           <p className="text-xs leading-relaxed text-fg" data-compare-decomp-sum="">
-            {T.splitSum(m.decomposition.caliber_rendered, m.decomposition.data_rendered, deltaText(m))}
+            {T.splitSum(m.decomposition.caliber_rendered, m.decomposition.data_rendered, totalText(m))}
           </p>
         )}
         <Inputs m={m} />

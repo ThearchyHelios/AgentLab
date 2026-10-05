@@ -2878,6 +2878,8 @@ export const RUN_COMPARE_TEXT = {
   rowsBase: (base: string) => `基准 ${base}`,
   rowsTarget: (target: string) => `本次 ${target}`,
   literals: '变化的参数',
+  /** 参数前后两个值之间的箭头，读屏念这个 */
+  changedTo: '改为',
   baseSql: '基准的 SQL',
   targetSql: '本次的 SQL',
   bothSql: '两次相同的 SQL',

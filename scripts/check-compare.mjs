@@ -558,6 +558,8 @@ await section('换基准、互换', async () => {
   check('换基准：重新请求对比', compareHits(log, T, B2) === 1)
   check('换基准：页面换成新的一份', (await texts(page, '[data-compare-notes] li')).includes(NOTE_B2))
   check('换基准：基准卡跟着换', (await text(page, '[data-compare-run="base"]')).includes('9/21'))
+  const lists = () => log.filter((k) => k.startsWith('GET /api/runs?') && k.includes(`workflow_id=${WF}`)).length
+  const listsBefore = lists()
   await page.locator('button[data-compare-swap]').click()
   await until(async () => new URL(page.url()).searchParams.get('target') === B2)
   await until(async () => compareHits(log, B2, T) === 1)
@@ -566,6 +568,9 @@ await section('换基准、互换', async () => {
   check('互换：重新请求对比', compareHits(log, B2, T) === 1)
   await settled(page)
   check('互换：两张卡跟着对调', (await page.locator('[data-compare-run="target"] a[data-compare-run-link]').getAttribute('href')) === `/runs/${B2}`)
+  check('互换：同一工作流的运行列表不重取，下拉照常可用', lists() === listsBefore
+    && await page.locator('select[data-compare-base-picker]').isEnabled() && await page.locator('select[data-compare-base-picker]').inputValue() === T,
+    `${listsBefore} → ${lists()}`)
 })
 
 await section('过时的答复不盖掉新的', async () => {
