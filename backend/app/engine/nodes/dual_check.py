@@ -62,7 +62,8 @@ from app.engine.evidence import build_catalog, is_number, next_exec
 from app.engine.expressions import ExpressionError, _cell_call, _chain_root, cell_value, column_kind, numeric_text, \
     parse_expression
 from app.engine.replay import _in_graph, ask, once
-from app.engine.schema import DUAL_CHECK_FIELD_LABEL, DUAL_CHECK_ON_REJECT, NodeType, dual_check_card
+from app.engine.labels import DUAL_CHECK_FIELD_LABEL, DUAL_CHECK_ON_REJECT_LABEL
+from app.engine.schema import DUAL_CHECK_ON_REJECT, NodeType, dual_check_card
 from app.engine.state import GraphState
 
 #: 节点产出的状态：跳过、全部一致、核成了一部分（其余无法复算）、一个都没核成、人已裁决
@@ -208,7 +209,7 @@ async def run_dual_check(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 目录照样写了：审核人的选择是对数据的判断，和这次运行停不停无关
         names = "、".join(f"「{r['name']}」" for r in rejected[:5])
         raise NodeError(ctx.node.id, f"双盲复算不一致，审核人没有采用原流程的结果（指标{names}）。"
-                                     f"「{DUAL_CHECK_FIELD_LABEL['on_reject']}」设为「判为失败」，运行已停止；"
+                                     f"「{DUAL_CHECK_FIELD_LABEL['on_reject']}」设为「{DUAL_CHECK_ON_REJECT_LABEL['fail']}」，运行已停止；"
                                      "请按审核意见修正取数或口径后重新运行")
     return _finish(state, ctx, card_id, card, checked, status=RESOLVED, gaps=gaps, choices=choices, note=note,
                    artifact=review["card_artifact"], catalog=catalog)

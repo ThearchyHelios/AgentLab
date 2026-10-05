@@ -55,8 +55,8 @@ from app.engine.evidence import ENTITY_KINDS, iter_units, ledger_enabled, next_e
 from app.engine.judge import _usd
 from app.engine.merge_query import MERGE_SOURCE
 from app.engine.replay import _in_graph
-from app.engine.schema import CHALLENGE_LABEL, CHALLENGE_ON_REFUTED_LABEL, GraphSpec, NodeType, challenge_problems, \
-    challenge_report
+from app.engine.labels import CHALLENGE_LABEL, CHALLENGE_ON_REFUTED_LABEL
+from app.engine.schema import GraphSpec, NodeType, challenge_problems, challenge_report
 from app.engine.state import GraphState
 from app.engine.verify_agent import RATIONALE, VerifyOutcome, run_verify_agent
 from app.tools.datasource import run_versions
