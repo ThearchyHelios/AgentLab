@@ -3050,6 +3050,37 @@ export const SCHEDULE_TEXT = {
   allLoaded: '已全部加载',
   shown: (n: number) => `已显示 ${n} 条`,
 
+  // ---- 触发历史里的对比：运行结束后服务端自动和同一定时任务的上一次比一次
+  compareLink: '对比上一次',
+  /**
+   * 悬停写各类指标的个数，和 Webhook 通知里那一行同一个写法（服务端 scheduler/auto_compare.py 的 summary_text）：
+   * 变化三分法的三类总写上，0 个也写；其余各类有才写，次序同对比页；两边都没有指标时不写一串 0 个。只有个数，
+   * 不写数值。各类的叫法用对比页那一套（RUN_COMPARE_TEXT.classLabel）
+   */
+  compareTitle: (summary: Partial<Record<string, number>>) => {
+    const n = (key: string) => (typeof summary[key] === 'number' ? summary[key] as number : 0)
+    const core = ['data_only', 'caliber_and_data', 'sql_changed']
+    const rest = ['params_only', 'added', 'removed', 'incomparable', 'unchanged']
+    if (![...core, ...rest].some((key) => n(key) > 0)) return '与上一次相比：两次运行都没有指标'
+    const parts = [...core, ...rest.filter((key) => n(key) > 0)]
+      .map((key) => `${RUN_COMPARE_TEXT.classLabel[key] ?? key} ${n(key)} 个`)
+    return `与上一次相比：${parts.join('、')}`
+  },
+
+  // ---- 运行详情页头的来源
+  /**
+   * 到点发起（以及没有署名的立即运行）的运行记在「定时任务：名字」名下，前缀和服务端 scheduler/service.py 的
+   * actor_label 一致。页头据此不再写「定时任务：X 发起」，换成下面那条链接
+   */
+  actorPrefix: '定时任务：',
+  runSource: (name?: string | null) => (name ? `由定时任务「${name}」发起` : '由定时任务发起'),
+  /** 有人署名点「立即运行」发起的：署名照写（runStarter），后面接这一句 */
+  runSourceManual: (name?: string | null) => (name ? `来自定时任务「${name}」` : '来自定时任务'),
+  runStarter: (who: string) => `${who} 发起`,
+  /** 悬停写全名（页头窄时链接会截断）和点开去哪 */
+  runSourceTitle: (name?: string | null) =>
+    (name ? `定时任务「${name}」：查看设置和触发历史` : '查看这个定时任务的设置和触发历史'),
+
   // ---- 记录页的定时标记
   runTag: '定时',
   runTagTitle: (name?: string | null) => (name ? `由定时任务「${name}」发起，点击查看` : '由定时任务发起，点击查看'),

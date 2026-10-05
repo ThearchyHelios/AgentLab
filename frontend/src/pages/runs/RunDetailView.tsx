@@ -31,6 +31,7 @@ import { ProvenanceBar, Telemetry, runClocks } from './Telemetry'
 import { TracePane } from './TracePane'
 import { useRunDetail } from './useRunDetail'
 import { useCompareEntry } from './compare/entry'
+import { RunScheduleSource } from '../schedules/parts'
 
 /**
  * 一次运行的详情：头部读数、凭证、排错路径，下面分三个视图——
@@ -561,9 +562,12 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
                 {formatTime(run.created_at ?? null, new Date(now))}
               </time>
               <span>·</span>
-              <span title={run.started_by ? undefined : '发起时未设置署名'}>
-                {run.started_by || '未署名'} 发起
-              </span>
+              {/* 定时任务发起的：写成到那个定时任务的链接（键盘可达；记录页的「定时」标记只能鼠标点） */}
+              {run.schedule_id ? <RunScheduleSource scheduleId={run.schedule_id} startedBy={run.started_by} /> : (
+                <span title={run.started_by ? undefined : '发起时未设置署名'}>
+                  {run.started_by || '未署名'} 发起
+                </span>
+              )}
               <span>·</span>
               <span className="tnum">{formatNumber(d.events.length)} 条事件</span>
               {workflowGone && <span>· 工作流已删除</span>}

@@ -3207,6 +3207,15 @@ export interface ScheduleFireNotice {
   at: string
 }
 
+/**
+ * 运行结束后和同一定时任务上一次运行的自动对比：基准是哪一次、各类指标的个数（同对比接口的 summary）。只有个数，
+ * 具体的数在对比页上
+ */
+export interface ScheduleFireCompare {
+  base_run_id: string
+  summary: RunCompareSummary
+}
+
 /** 一次触发（触发历史的一行） */
 export interface ScheduleFire {
   id: string
@@ -3220,6 +3229,10 @@ export interface ScheduleFire {
   /** 跳过、发起失败的原因（中文） */
   reason: string | null
   notified: ScheduleFireNotice[]
+  /**
+   * 和同一定时任务上一次的对比。没有上一次、还没算、比不了、运行又在执行（不在终态）时为 null；老服务端不给
+   */
+  compare?: ScheduleFireCompare | null
   created_at: string
 }
 

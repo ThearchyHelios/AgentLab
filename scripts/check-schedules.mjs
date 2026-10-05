@@ -3,7 +3,9 @@
 // 守的是这些「看着没坏、其实不能用」的地方：预设生成的 cron 不对（选了每周一 09:00，交上去的是每天）、时区按本机写
 // 而不是按定时任务的时区、预览不防抖、非法 cron 只弹一句不知道指哪一项、启用开关不带版本号（别人改过也照样覆盖）、
 // 立即运行之后没有下文、触发历史只有一页、保存过的 Webhook 地址又被原样显示出来、改了别的字段却把地址清掉、
-// 记录页看不出哪些运行来自定时任务、390px 窄屏被表单撑出横向滚动。
+// 记录页看不出哪些运行来自定时任务、390px 窄屏被表单撑出横向滚动。运行结束后的自动对比：触发历史里「对比上一次」
+// 链到对比页、悬停只写各类指标的个数；运行详情页头的「由定时任务「X」发起」是键盘到得了的真链接（记录页的「定时」
+// 标记在整行按钮里，只能鼠标点）。
 // 还有几处时序和口径：晚到的刷新把刚切换的开关盖回去、先开触发历史再开设置时带着旧版本撞假的 409、保存途中又改了
 // 别的字段时替换过的地址明文留在框里、服务端会拒的组合（未发布 + 正式运行、必填没填、已发布版本里没有的字段）
 // 照样放行、测试消息的结果把服务端的整句又套一层、错过已跳过的那条悬停另说一个原因（和本条记的原因对不上）。
@@ -375,6 +377,13 @@ const S2 = {
  * 原因却有两种，各放一条、原因照服务端的原话写：f03 是停机一周多、在宽限内恢复时积压的那一次（最近一次就是补发的
  * f02），f05 是超出补发宽限的。f06、f07 没有记原因（约定里 reason 可以是 null），看兜底的说明
  */
+/** 服务端自动对比给的计数（只有个数）：f00 和同一任务的上一次（run-f02）比过 */
+const COMPARE_F00 = { base_run_id: 'run-f02', summary: { unchanged: 4, data_only: 3, caliber_and_data: 1, sql_changed: 0,
+  params_only: 2, added: 0, removed: 0, incomparable: 0 } }
+const COMPARE_F00_TITLE = '与上一次相比：只数据变 3 个、口径与数据都变 1 个、SQL 结构变 0 个、只参数变 2 个、未变 4 个'
+const NO_METRICS = { base_run_id: 'run-f09', summary: { unchanged: 0, data_only: 0, caliber_and_data: 0, sql_changed: 0,
+  params_only: 0, added: 0, removed: 0, incomparable: 0 } }
+
 function makeFires() {
   const out = []
   const local = (at) => {
@@ -385,14 +394,15 @@ function makeFires() {
   for (let i = 0; i < 25; i++) {
     const at = iso(nextMonday9(-(i + 1)))
     let f = fire(`f${String(i).padStart(2, '0')}`, { fire_at: at, created_at: at })
-    if (i === 0) f = { ...f, kind: 'manual', notified: [{ event: 'finished', status: 'ok', at }, { event: 'failed', status: 'failed', at }] }
+    if (i === 0) f = { ...f, kind: 'manual', compare: COMPARE_F00, notified: [{ event: 'finished', status: 'ok', at }, { event: 'failed', status: 'failed', at }] }
     if (i === 1) f = { ...f, status: 'skipped_overlap', run_id: null, run_status: null, reason: '上一次运行（#9f8e7d）尚未结束' }
-    if (i === 2) f = { ...f, kind: 'misfire', run_status: 'failed' }
+    if (i === 2) f = { ...f, kind: 'misfire', run_status: 'failed', compare: null }
     if (i === 3) f = { ...f, ...missed, reason: `服务未运行，错过了 ${local(at)} 的触发；积压的触发不补，只发起最近一次` }
     if (i === 4) f = { ...f, status: 'failed_to_start', run_id: null, run_status: null, reason: '工作流「门店周报」还没有发布：正式运行需要已发布的版本' }
     if (i === 5) f = { ...f, ...missed, reason: `服务未运行，错过了 ${local(at)} 的触发，超出补发宽限（1 小时），没有发起` }
     if (i === 6) f = { ...f, ...missed, reason: null }
     if (i === 7) f = { ...f, status: 'failed_to_start', run_id: null, run_status: null, reason: null }
+    if (i === 8) f = { ...f, compare: NO_METRICS }
     out.push(f)
   }
   return out
@@ -401,11 +411,26 @@ function makeFires() {
 const RUNS = [
   { id: 'run-sched-1', workflow_id: 'wf-weekly', workflow_name: '门店周报', status: 'succeeded', input: { date: '2026-10-04' },
     output: { 周报: '上周销售额 1,234 万元' }, error: null, usage: { duration_ms: 4200 }, run_class: 'formal', version: 3,
+    started_by: '定时任务：门店周报（旧名）',
     schedule_id: 's-weekly', created_at: iso(NOW - 2 * H), started_at: iso(NOW - 2 * H), finished_at: iso(NOW - 2 * H + 4200) },
   { id: 'run-manual-1', workflow_id: 'wf-weekly', workflow_name: '门店周报', status: 'succeeded', input: { date: '2026-10-03' },
     output: { 周报: '手动补一份' }, error: null, usage: { duration_ms: 3900 }, run_class: 'exploratory', version: null,
     schedule_id: null, created_at: iso(NOW - 3 * H), started_at: iso(NOW - 3 * H), finished_at: iso(NOW - 3 * H + 3900) },
 ]
+
+/** 有人署名点了「立即运行」：署名照写，页头另接到定时任务的链接 */
+const RUN_MANUAL_FIRE = { ...RUNS[0], id: 'run-sched-2', started_by: '检查员甲', created_at: iso(NOW - H), started_at: iso(NOW - H),
+  finished_at: iso(NOW - H + 4200) }
+/** 运行详情要的图和事件：一个节点、开始到结束两条，够页头和时间线画出来 */
+const RUN_GRAPH = { nodes: [{ id: 'out', type: 'output', position: { x: 0, y: 0 }, data: { label: '成果', config: {} } }], edges: [] }
+function runEvents(run) {
+  const t0 = Date.parse(run.started_at) / 1000
+  return [
+    { seq: 1, type: 'run.started', node_id: null, ts: t0, data: { nodes: 1 } },
+    { seq: 2, type: 'run.finished', node_id: null, ts: t0 + 4.2,
+      data: { output: run.output, usage: {}, timing: { wall_ms: 4200, active_ms: 4200, wait_ms: 0 } } },
+  ]
+}
 
 function freshState(patch = {}) {
   return {
@@ -538,7 +563,13 @@ async function reply(state, method, path, url, body) {
   if (state.runs && method === 'GET' && path.startsWith('/runs/')) {
     const run = state.runs.find((r) => path === `/runs/${r.id}`)
     if (run) return { json: run }
+    const m = path.match(/^\/runs\/([^/]+)\/(events|graph|artifacts)$/)
+    const of = m && state.runs.find((r) => r.id === m[1])
+    if (of && m[2] === 'events') return { json: runEvents(of) }
+    if (of && m[2] === 'graph') return { json: { graph: RUN_GRAPH, workflow_id: of.workflow_id, version: of.version } }
+    if (of) return { json: [] }
   }
+  if (state.runs && method === 'GET' && path === '/approvals' && url.searchParams.get('run_id')) return { json: [] }
   return null
 }
 
@@ -621,6 +652,18 @@ const saveDone = (page) => until(async () => {
 /** 等预览算完、说的是这个频率 */
 const previewSays = (page, words) => until(async () => (await page.locator('[data-schedule-preview][data-status="ok"]').count()) === 1
   && (await page.locator('[data-schedule-preview]').innerText()).includes(words))
+/**
+ * 只按 Tab 键把焦点移到 sel 上：从页面开头往后按，最多按 max 次。按到了返回按了几次，按不到返回 0。键盘可达就是
+ * 这个意思——鼠标能点、程序能 focus() 的不算
+ */
+const tabTo = async (page, sel, max = 160) => {
+  await page.evaluate(() => document.activeElement?.blur?.())
+  for (let i = 1; i <= max; i++) {
+    await page.keyboard.press('Tab')
+    if (await page.evaluate((s) => !!document.activeElement?.matches?.(s), sel)) return i
+  }
+  return 0
+}
 /** 元素整个在视口的横向范围里 */
 const inViewX = (page, sel) => page.evaluate((s) => {
   const el = document.querySelector(s)
@@ -1335,6 +1378,117 @@ await section('详情：触发历史分页', async () => {
     && await gone.page.locator('[data-schedule-missing] a[href="/schedules"]').count() === 1)
 })
 
+await section('详情：触发历史里的「对比上一次」', async () => {
+  const { page, sent, errors } = await open('/schedules/s-weekly?tab=history')
+  await page.locator('[data-fire-id]').first().waitFor()
+  const row = (id) => page.locator(`[data-fire-id="${id}"]`)
+  const link = row('f00').locator('[data-fire-compare]')
+  check('有对比的那次：给「对比上一次」', (await link.count()) === 1 && (await link.innerText()).trim() === '对比上一次',
+    await link.count() ? await link.innerText() : '没有链接')
+  check('……链到对比页，本次是这次的运行、基准是服务端比过的那一次',
+    await link.getAttribute('href') === '/runs/compare?target=run-f00&base=run-f02', (await link.getAttribute('href')) ?? '')
+  const title = (await link.getAttribute('title')) ?? ''
+  check('……悬停写各类指标的个数：三类总写，其余有才写，没有数值', title === COMPARE_F00_TITLE, title)
+  check('两边都没有指标：悬停不写一串 0 个', ((await row('f08').locator('[data-fire-compare]').getAttribute('title')) ?? '')
+    === '与上一次相比：两次运行都没有指标')
+  const linked = await page.locator('[data-fire-compare]').evaluateAll((els) => els.map((e) => e.closest('[data-fire-id]')?.getAttribute('data-fire-id')))
+  check('没有对比的（compare 为 null、老服务端不给、没有运行）不给链接', JSON.stringify(linked) === '["f00","f08"]', JSON.stringify(linked))
+  check('运行链接照旧在', await row('f00').locator('a[href="/runs/run-f00"]').count() === 1)
+  const presses = await tabTo(page, '[data-fire-id="f00"] [data-fire-compare]')
+  check('键盘：Tab 到得了「对比上一次」', presses > 0, `按了 ${presses} 次`)
+  await shot(page, 'history-compare-focus-dark')
+  await page.keyboard.press('Enter')
+  const url = await until(() => {
+    const u = new URL(page.url())
+    return u.pathname === '/runs/compare' ? u : null
+  })
+  check('……回车打开对比页，带着本次和基准', !!url && url.searchParams.get('target') === 'run-f00'
+    && url.searchParams.get('base') === 'run-f02', page.url())
+  const real = writes(sent, /./).filter((x) => x.key !== 'POST /schedules/preview')
+  check('只读：没有写请求', real.length === 0, real.map((x) => x.key).join('、'))
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
+// ---------------------------------------------------------------- 运行详情
+
+await section('运行详情：页头的定时任务链接', async () => {
+  const state = freshState({ runs: [...RUNS, RUN_MANUAL_FIRE] })
+  const { page, sent, errors } = await open('/runs/run-sched-1', { state })
+  await page.locator('[data-run-detail="run-sched-1"]').waitFor({ timeout: 10000 })
+  const head = page.locator('[data-run-detail] header').first()
+  const link = head.locator('[data-run-schedule-link]')
+  // 署名里记的是旧名字：取到定时任务列表之后写现在的名字
+  const said = await until(async () => {
+    const t = (await link.innerText().catch(() => '')).trim()
+    return t === '由定时任务「门店周报 · 每周」发起' ? t : null
+  })
+  check('页头写「由定时任务「X」发起」，X 是定时任务现在的名字', !!said, (await link.innerText().catch(() => '没有链接')).trim())
+  check('……是到那个定时任务的真链接', (await link.evaluate((el) => el.tagName)) === 'A'
+    && await link.getAttribute('href') === '/schedules/s-weekly', (await link.getAttribute('href')) ?? '')
+  const headText = await head.innerText()
+  check('……不再另写「定时任务：X 发起」', !headText.includes('定时任务：') && !headText.includes('旧名'), oneLine([headText]).slice(0, 160))
+  check('……悬停写全名和点开去哪', ((await link.getAttribute('title')) ?? '').includes('门店周报 · 每周'))
+  const presses = await tabTo(page, '[data-run-detail] header [data-run-schedule-link]')
+  check('键盘：Tab 到得了页头的定时任务链接', presses > 0, `按了 ${presses} 次`)
+  const ring = await page.evaluate(() => getComputedStyle(document.activeElement).boxShadow)
+  check('……聚焦时有焦点环', !!ring && ring !== 'none', ring)
+  await shot(page, 'run-detail-schedule-link-dark')
+  await page.keyboard.press('Enter')
+  check('……回车去那个定时任务', await until(() => new URL(page.url()).pathname === '/schedules/s-weekly'), page.url())
+  await page.locator('[data-schedule-form], [data-schedules-page] header').first().waitFor()
+
+  const manual = await open('/runs/run-sched-2', { state: freshState({ runs: [...RUNS, RUN_MANUAL_FIRE] }) })
+  await manual.page.locator('[data-run-detail="run-sched-2"]').waitFor({ timeout: 10000 })
+  const mHead = manual.page.locator('[data-run-detail] header').first()
+  const mLink = mHead.locator('[data-run-schedule-link]')
+  await until(async () => (await mLink.innerText().catch(() => '')).includes('门店周报 · 每周'))
+  const mText = oneLine([await mHead.innerText()])
+  check('有人署名点了立即运行：署名照写，后面接「来自定时任务「X」」的链接', mText.includes('检查员甲 发起')
+    && (await mLink.innerText()).trim() === '来自定时任务「门店周报 · 每周」' && await mLink.getAttribute('href') === '/schedules/s-weekly',
+  mText.slice(0, 160))
+
+  await shot(manual.page, 'run-detail-manual-fire-dark')
+  const light = await open('/runs/run-sched-1', { state: freshState({ runs: [...RUNS, RUN_MANUAL_FIRE] }), theme: 'light' })
+  await light.page.locator('[data-run-detail="run-sched-1"] header [data-run-schedule-link]').waitFor()
+  const lightTone = await light.page.evaluate(() => {
+    const link = document.querySelector('[data-run-detail] header [data-run-schedule-link]')
+    const head = document.querySelector('[data-run-detail] header')
+    return { theme: document.documentElement.dataset.theme, fg: getComputedStyle(link).color,
+      bg: getComputedStyle(head).backgroundColor }
+  })
+  check('浅色：页头的定时任务链接字和底色分得开', lightTone.theme === 'light' && lightTone.fg !== lightTone.bg, JSON.stringify(lightTone))
+  await shot(light.page, 'run-detail-schedule-link-light')
+  const plain = await open('/runs/run-manual-1', { state: freshState({ runs: [...RUNS, RUN_MANUAL_FIRE] }) })
+  await plain.page.locator('[data-run-detail="run-manual-1"]').waitFor({ timeout: 10000 })
+  check('手动发起的运行：页头没有定时任务链接', await plain.page.locator('[data-run-detail] header [data-run-schedule-link]').count() === 0)
+
+  // 名字很长、详情区不宽时链接截断，不把页头撑宽（全名在悬停里）
+  const longName = freshState({ runs: [...RUNS, RUN_MANUAL_FIRE] })
+  longName.schedules = longName.schedules.map((x) => (x.id === 's-weekly' ? { ...x, name: '华东区全部门店按品类与渠道拆分的周度销售与退款复盘' } : x))
+  const narrow = await open('/runs/run-sched-1', { state: longName, width: 900 })
+  await narrow.page.locator('[data-run-detail="run-sched-1"]').waitFor({ timeout: 10000 })
+  const nLink = narrow.page.locator('[data-run-detail] header [data-run-schedule-link]')
+  await until(async () => (await nLink.innerText().catch(() => '')).includes('复盘'))
+  const fit = await narrow.page.evaluate(() => {
+    const head = document.querySelector('[data-run-detail] header')
+    const link = head?.querySelector('[data-run-schedule-link]')
+    if (!head || !link) return null
+    const h = head.getBoundingClientRect()
+    const l = link.getBoundingClientRect()
+    return { headRight: Math.round(h.right), linkRight: Math.round(l.right), scroll: head.scrollWidth - head.clientWidth,
+      clipped: link.scrollWidth > link.clientWidth }
+  })
+  check('长名字：链接截断，不超出页头、页头不横向溢出', !!fit && fit.linkRight <= fit.headRight && fit.scroll <= 1 && fit.clipped,
+    JSON.stringify(fit))
+  // 回车打开的定时任务页会请求预览（POST，但只读），不算写
+  const writesSeen = [...writes(sent, /./), ...writes(manual.sent, /./), ...writes(light.sent, /./), ...writes(plain.sent, /./),
+    ...writes(narrow.sent, /./)]
+    .filter((x) => x.key !== 'POST /schedules/preview')
+  check('只读：没有写请求', writesSeen.length === 0, writesSeen.map((x) => x.key).join('、'))
+  const all = [...errors, ...manual.errors, ...light.errors, ...plain.errors, ...narrow.errors]
+  check('没有页面报错', !all.length, all.join(' ｜ '))
+})
+
 // ---------------------------------------------------------------- 记录页
 
 await section('记录页：定时标记', async () => {
@@ -1416,6 +1570,13 @@ await section('窄屏 390px 与浅色', async () => {
     const hist = await open('/schedules/s-weekly?tab=history', { ...narrow, theme })
     await hist.page.locator('[data-fire-id]').first().waitFor()
     check(`${theme}：触发历史不横向溢出`, await overflow(hist.page) <= 1, `${await overflow(hist.page)}px`)
+    check(`${theme}：「对比上一次」在屏幕里`, await inViewX(hist.page, '[data-fire-id="f00"] [data-fire-compare]'))
+    const cmp = await hist.page.evaluate(() => {
+      const link = document.querySelector('[data-fire-id="f00"] [data-fire-compare]')
+      const list = document.querySelector('[data-fire-list] ul')
+      return link && list && { fg: getComputedStyle(link).color, bg: getComputedStyle(list).backgroundColor }
+    })
+    check(`${theme}：「对比上一次」的字和底色分得开`, !!cmp && cmp.fg !== cmp.bg, JSON.stringify(cmp))
     check(`${theme}：页头的开关、立即运行、删除在屏幕里`, await inViewX(hist.page, 'header [data-schedule-run]')
       && await inViewX(hist.page, 'header [data-schedule-toggle]') && await inViewX(hist.page, 'header [data-schedule-delete]'))
     await shot(hist.page, `history-390-${theme}`)

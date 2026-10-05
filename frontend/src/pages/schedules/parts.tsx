@@ -269,8 +269,8 @@ export function useScheduleNames(ids: (string | null | undefined)[]): ReadonlyMa
  * 这里拦住冒泡，只去定时任务、不打开运行。
  *
  * 按钮里放不了可聚焦的链接（读屏会把按钮里的内容压平，Tab 也到不了），所以键盘到不了这个标记：读屏改念
- * 「由定时任务「X」发起」，至少在整行的名字里听到来源。键盘可达的入口要放到运行详情的页头，或者把整行改成
- * 「打开运行」按钮和这个链接并排，都不在本页的文件里，见交付说明
+ * 「由定时任务「X」发起」，至少在整行的名字里听到来源。键盘可达的入口在运行详情的页头（RunScheduleSource）：
+ * 打开这次运行之后，Tab 就能到那条链接
  */
 export function ScheduleTag({ scheduleId, name }: { scheduleId: string; name?: string | null }) {
   const navigate = useNavigate()
@@ -289,5 +289,42 @@ export function ScheduleTag({ scheduleId, name }: { scheduleId: string; name?: s
       <CalendarClock size={10} aria-hidden /> <span aria-hidden>{T.runTag}</span>
       <span className="sr-only">{T.runTagSr(name)}</span>
     </span>
+  )
+}
+
+// -------------------------------------------------------------------------
+// 运行详情页头的来源
+// -------------------------------------------------------------------------
+
+/**
+ * 运行详情页头里「谁发起的」那一段，定时任务发起的运行用它：「由定时任务「X」发起」是真的链接，Tab 到得了、回车能
+ * 打开，去那个定时任务的设置和触发历史。记录页的「定时」标记在整行按钮里，只能用鼠标点，键盘的入口在这里。
+ *
+ * 到点发起的运行（以及没有署名的立即运行）记在「定时任务：X」名下：原来那句「定时任务：X 发起」整句换成这条链接，
+ * 不写两遍。有人署名点「立即运行」的，署名照写，后面接「来自定时任务「X」」。名字取定时任务现在的名字（改过名的写
+ * 新名字），取不到时用署名里记的那个，再没有就不写名字。页头窄时链接截断，全名在悬停里
+ */
+export function RunScheduleSource({ scheduleId, startedBy }: { scheduleId: string; startedBy?: string | null }) {
+  const names = useScheduleNames([scheduleId])
+  const recorded = startedBy?.startsWith(T.actorPrefix) ? startedBy.slice(T.actorPrefix.length).trim() : null
+  const auto = !startedBy || recorded != null
+  const name = names.get(scheduleId) || recorded || null
+  const link = (
+    <Link
+      to={`/schedules/${encodeURIComponent(scheduleId)}`}
+      title={T.runSourceTitle(name)}
+      data-run-schedule-link={scheduleId}
+      className="min-w-0 truncate rounded-sm text-dim outline-none hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+    >
+      {auto ? T.runSource(name) : T.runSourceManual(name)}
+    </Link>
+  )
+  if (auto || !startedBy) return link
+  return (
+    <>
+      <span className="shrink-0">{T.runStarter(startedBy)}</span>
+      <span>·</span>
+      {link}
+    </>
   )
 }
