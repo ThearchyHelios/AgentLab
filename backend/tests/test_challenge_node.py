@@ -90,14 +90,6 @@ async def shop(tmp_path):
     await engines.invalidate(source_id)
 
 
-@pytest.fixture
-async def masked_shop(tmp_path):
-    """同样的库，买家电话按数据源的设置遮罩。"""
-    name, source_id = await _source(tmp_path, options={"mask_columns": ["buyer_phone"]})
-    yield name
-    await engines.invalidate(source_id)
-
-
 def node(nid, ntype, label=None, **config):
     return {"id": nid, "type": ntype, "position": {"x": 0, "y": 0}, "data": {"label": label or nid, "config": config}}
 
@@ -458,6 +450,7 @@ async def test_the_daily_cap_stops_the_remaining_claims(monkeypatch, shop):
     assert all("$2.00" in c["rationale"] for c in record["claims"])
     [limit] = await logs(row.id, "challenge_limit")
     assert limit["limit"] == "daily_max_usd" and limit["claims_skipped"] == 2
+    assert len(await logs(row.id, "verify_limit")) == 1, "第一句撞上每日上限之后，后面的句子不再派 agent 去试"
     assert row.output["_issuance"]["tier"] == "formal"
 
 
@@ -664,21 +657,42 @@ async def test_the_upstream_report_is_taken_when_none_is_chosen(monkeypatch, sho
     assert artifact_store.load((await output_of(row.id, "chal"))["challenge_artifact"])["report"] == "write"
 
 
-async def test_the_task_gives_the_claim_its_evidence_and_only_its_sources(monkeypatch, masked_shop):
-    """任务里给这句结论和它挂的证据摘录：遮罩的列照旧不给；工具只给这句引用的查询所在的数据源。"""
-    sql = "SELECT region AS 区域, buyer_phone, amount AS 金额 FROM sales ORDER BY id"
-    plays = {"华东有一笔": Play(["SELECT COUNT(*) AS 笔数 FROM sales WHERE region = '华东'"], "stands", "没有找到反例。")}
-    models = Models(monkeypatch, masked_shop, writer=("华东有一笔 [[v:Q1.r0.金额]] 的订单。[[see:Q1]]",), plays=plays)
-    row = await finish(graph(masked_shop, sql=sql), run_class="exploratory")
-    assert row.status == "succeeded", row.error
-    task = models.tasks()["华东有一笔"]
-    assert "华东有一笔 1,200 的订单。" in task
-    assert "原报告" in task and sql.split(" FROM")[0][:20] in task, "摘录里有这句挂的查询"
-    assert "13900000001" not in task and "buyer_phone" not in task.split("列：")[1].split("\n")[0]
-    assert "遮罩" in task
-    assert models.tools["华东有一笔"] == {f"db_schema__{masked_shop}", f"db_query__{masked_shop}"}
-    record = artifact_store.load((await output_of(row.id, "chal"))["challenge_artifact"])
-    assert [q["source"] for q in record["claims"][0]["queries"]] == [masked_shop]
+@pytest.mark.parametrize("when", ["at_query", "after_query"])
+async def test_the_task_gives_the_claim_its_evidence_and_only_its_sources(monkeypatch, tmp_path, when):
+    """任务里给这句结论和它挂的证据摘录：遮罩的列照旧不给——查询当时设的（记在查询快照里），和数据源现在设的
+    （运行中途才设上遮罩，同证据面板的口径）都算；工具只给这句引用的查询所在的数据源。"""
+    masked = {"mask_columns": ["buyer_phone"]}
+    name, source_id = await _source(tmp_path, options=masked if when == "at_query" else None)
+    try:
+        if when == "after_query":
+            real = report_mod._store
+
+            async def store_then_mask(doc, ctx):
+                # 报告写完、反方审稿开始之前，管理员给数据源设上了遮罩
+                out = await real(doc, ctx)
+                async with SessionLocal() as session:
+                    row = await session.get(DataSource, source_id)
+                    row.options = masked
+                    await session.commit()
+                return out
+
+            monkeypatch.setattr(report_mod, "_store", store_then_mask)
+        sql = "SELECT region AS 区域, buyer_phone, amount AS 金额 FROM sales ORDER BY id"
+        plays = {"华东有一笔": Play(["SELECT COUNT(*) AS 笔数 FROM sales WHERE region = '华东'"], "stands", "没有找到反例。")}
+        models = Models(monkeypatch, name, writer=("华东有一笔 [[v:Q1.r0.金额]] 的订单。[[see:Q1]]",), plays=plays)
+        row = await finish(graph(name, sql=sql), run_class="exploratory")
+        assert row.status == "succeeded", row.error
+        task = models.tasks()["华东有一笔"]
+        assert "华东有一笔 1,200 的订单。" in task
+        assert "【原报告 Q1】" in task and "SELECT region AS 区域" in task, "摘录里有这句挂的查询，编号标明属于原报告"
+        assert "13900000001" not in task, "遮罩的列不给"
+        assert "buyer_phone" not in task.split("列：")[1].split("\n")[0]
+        assert "遮罩" in task
+        assert models.tools["华东有一笔"] == {f"db_schema__{name}", f"db_query__{name}"}
+        record = artifact_store.load((await output_of(row.id, "chal"))["challenge_artifact"])
+        assert [q["source"] for q in record["claims"][0]["queries"]] == [name]
+    finally:
+        await engines.invalidate(source_id)
 
 
 async def test_each_claim_only_gets_the_sources_it_cites(monkeypatch, tmp_path, shop):
