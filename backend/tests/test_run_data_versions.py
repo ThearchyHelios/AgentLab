@@ -91,8 +91,24 @@ V1 = {"明细": [["区域", "数量"], ["分区甲", 1], ["分区乙", 2]]}
 V2 = {"明细": [["区域", "数量"], ["分区甲", 60], ["分区乙", 40]], "新增": [["时段", "客流"], ["上午", 7]]}
 
 
+#: 十六进制里的数字换成字母：名字里不带数字
+_NO_DIGITS = str.maketrans("0123456789", "ghijklmnop")
+
+
 def uniq(prefix: str = "dv") -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+    """一个不会重复的源名，只有字母。
+
+    报错原文里有源名（「数据源「dv_…」」），不少断言靠「第二版的 100 不在原文里」证明没有改用当前版本。十六进制名字
+    每 500 个左右就有一个带着「100」（dv_3a100bc2ef），那几条断言就会无缘无故地失败——这正是
+    test_snapshot_file_deleted_after_tools_were_built 偶尔失败的原因，和并行、时序无关。名字里不带数字，数字的断言
+    才只看得见数据。"""
+    return f"{prefix}_{uuid.uuid4().hex[:12].translate(_NO_DIGITS)}"
+
+
+def test_source_names_carry_no_digits():
+    """守住 uniq 的约定：名字里一个数字都没有，报错原文里出现的数字只能来自数据（见 uniq 的说明）"""
+    names = {uniq() for _ in range(2000)}
+    assert len(names) == 2000 and not any(ch.isdigit() for name in names for ch in name.removeprefix("dv_"))
 
 
 async def publish(name: str, sheets: dict[str, list[list]]) -> tuple[str, str]:
