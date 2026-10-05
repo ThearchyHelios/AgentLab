@@ -14,6 +14,7 @@
 - two-reports：另有一份月报，两份报告各自的引用链
 - legacy：早期运行，封存范围按结束事件推算（运行结束事件在范围外，运行结果无法核对）
 - failed：失败结束的运行（没有出具判定），封存说明多一句「继续运行会重新封存」
+- continued：早期运行先失败、经继续运行跑到成功：范围里有那条运行失败，之后运行又继续了，成功结束的那条在范围外
 - degraded：两条出具判定，先完整出具、后降档出具，认最后一条
 - missing-doc / missing-card：导出时服务端已没有报告文档 / 口径卡的文件
 - nan：运行开始事件和门店流水快照里有 json.dumps 写出的裸 NaN（快照里那一列报告没有引用）
@@ -133,6 +134,16 @@ class Sample:
                 add("issuance", "out", {"tier": tier, "mode": "citations"})
             add("node.finished", "out", {"duration_ms": 2, "attempt": 1, "preview": {"周报": "（报告正文）"}})
             add("run.finished", None, {"output": {"周报": "（报告正文）"}})
+        elif ending == "continued":
+            # 先失败，再从成果节点继续运行到成功（runner.continue_failed 记一条 run.resumed）
+            add("node.failed", "out", {"error": "出口复核没有通过"})
+            add("run.failed", None, {"error": "出口复核没有通过"})
+            add("run.resumed", None, {"from": ["out"], "message": "从「成果」继续运行，保留前面 6 个节点的结果",
+                                      "actor": "值班分析员"})
+            for tier in tiers:
+                add("issuance", "out", {"tier": tier, "mode": "citations"})
+            add("node.finished", "out", {"duration_ms": 2, "attempt": 1, "preview": {"周报": "（报告正文）"}})
+            add("run.finished", None, {"output": {"周报": "（报告正文）"}})
         else:
             add("node.failed", "out", {"error": "出口复核没有通过"})
             add("run.failed", None, {"error": "出口复核没有通过"})
@@ -171,6 +182,11 @@ def pages() -> dict[str, str]:
 
     events, bound = s.events({"write": weekly}, ending="failed")
     out["failed"] = render(s, events, bound, run={**RUN, "status": "failed"})
+
+    # 早期运行先失败、经继续运行跑到成功：封存范围同样按结束事件推算，到成功结束的前一条为止
+    events, _ = s.events({"write": weekly}, ending="continued")
+    finished = next(seq for seq, etype, _, _ in events if etype == "run.finished")
+    out["continued"] = render(s, events, finished - 1, legacy=True)
 
     events, bound = s.events({"write": weekly}, tiers=("formal", "degraded"))
     out["degraded"] = render(s, events, bound)

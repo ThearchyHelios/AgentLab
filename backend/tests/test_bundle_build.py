@@ -462,8 +462,8 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     from tests.bundle_samples import pages
 
     got = {name: json.loads(data_block(page)) for name, page in pages().items()}
-    assert set(got) == {"base", "two-reports", "legacy", "failed", "degraded", "missing-doc", "missing-card", "nan",
-                        "stray"}
+    assert set(got) == {"base", "two-reports", "legacy", "failed", "continued", "degraded", "missing-doc",
+                        "missing-card", "nan", "stray"}
     for name, bundle in got.items():
         assert browser_manifest(bundle["events"]) == bundle["meta"]["manifest_hash"], name
 
@@ -490,6 +490,12 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     failed = got["failed"]
     assert failed["meta"]["status"] == "failed" and failed["meta"]["tier"] is None
     assert max(failed["events"], key=lambda e: e["seq"])["type"] == "run.failed"
+    # 先失败、经继续运行跑到成功的早期运行：范围里有那条运行失败，之后运行又继续了，最后一条不是结束事件
+    continued = got["continued"]
+    sealed_types = [e["type"] for e in sorted(continued["events"], key=lambda e: e["seq"])]
+    assert continued["meta"]["legacy"] is True and continued["meta"]["status"] == "succeeded"
+    assert "run.failed" in sealed_types and sealed_types[sealed_types.index("run.failed") + 1] == "run.resumed"
+    assert sealed_types[-1] == "node.finished" and "run.finished" in [a["type"] for a in continued["appended"]]
     issuances = [e["seq"] for e in got["degraded"]["events"] if e["type"] == "issuance"]
     assert len(issuances) == 2 and got["degraded"]["meta"]["tier"] == {"value": "degraded", "seq": issuances[-1]}
     assert [a["kind"] for a in got["stray"]["artifacts"]] == ["report_doc"]

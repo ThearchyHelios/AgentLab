@@ -148,6 +148,8 @@
     statusMismatch: (claim, seq, what) => `文件里写的是「${claim}」，与封存范围内最后一条结束类事件（第 ${seq} 条，${what}）不符`,
     statusLegacy: '早期运行在结束事件落库之前封存，结束事件不在封存范围内，运行结果无法核对',
     statusNoEvent: '封存范围内没有运行结束、失败或取消的事件，运行结果无法核对',
+    statusContinued: (claim, seq, what) => `文件里写的是「${claim}」，但封存范围内第 ${seq} 条事件（${what}）之后运行又继续执行，`
+      + '它不是运行的结束，范围内也没有更晚的结束事件可以印证',
     classOk: (seq) => `与第 ${seq} 条事件（运行开始）记下的运行参数一致`,
     classMismatch: (claim, seq) => `文件里写的是「${claim}」，与第 ${seq} 条事件（运行开始）记下的运行参数不符`,
     classLegacy: (seq) => `第 ${seq} 条事件（运行开始）出自早期运行，没有记下区分运行类别的参数，运行类别无法核对`,
@@ -651,20 +653,24 @@
     const label = (map, value) => map[value] || (value ? String(value) : '—')
     const what = (ev) => EVENT_LABEL[ev.type] || ev.type
 
-    // 运行结果：封存范围内最后一条结束类事件的类型。早期运行在 run.finished 落库之前封存，成功结束的那条在范围外，
-    // 范围内最后一条也就不是结束类事件；失败、取消的那条在范围内
+    // 运行结果：按封存范围内真正截止的那条结束类事件核对——它之后再没有更晚的事件。新运行在结束事件落库之后马上封存，
+    // 它就是范围内的最后一条；早期运行在 run.finished 落库之前封存，成功结束的那条在范围外，失败、取消的那条在范围的最后。
+    // 先失败、经继续运行接着跑的，范围里那条运行失败之后运行又继续了，它不是运行的结束：拿它去对，元信息改成「已失败」
+    // 也会被标成已核对。真正截止的那条不在范围里时，只有早期运行成功结束说得通（无法核对），别的说法都没有事件印证
     const statusClaim = label(STATUS_LABEL, meta.status)
-    const end = [...order].reverse().find((ev) => TERMINAL[ev.type])
-    const lastEv = order[order.length - 1]
+    const lastSeq = order.length ? order[order.length - 1].seq : null
+    const final = [...order].reverse().find((ev) => TERMINAL[ev.type])
+    // 同一序号的几条（老数据里有）都算最后：结束事件和别的事件撞了序号，不能因此说它之后运行又继续了
+    const end = final && final.seq === lastSeq ? final : null
     if (!sealOk) add('status', statusClaim, statusClaim, NA, T.metaNeedsManifest)
-    else if (meta.legacy && meta.status === 'succeeded' && !(lastEv && TERMINAL[lastEv.type])) {
-      add('status', statusClaim, statusClaim, NA, T.statusLegacy)
-    } else if (!end) add('status', statusClaim, statusClaim, NA, T.statusNoEvent)
-    else {
+    else if (end) {
       const ok = TERMINAL[end.type] === meta.status
       add('status', label(STATUS_LABEL, TERMINAL[end.type]), statusClaim, ok ? PASS : FAIL,
         ok ? T.statusOk(end.seq, what(end)) : T.statusMismatch(statusClaim, end.seq, what(end)))
-    }
+    } else if (meta.legacy && meta.status === 'succeeded') add('status', statusClaim, statusClaim, NA, T.statusLegacy)
+    // 显示的值写「—」：范围里没有说明运行怎样结束的事件，不能把文件里写的当成核对出来的
+    else if (final) add('status', '—', statusClaim, FAIL, T.statusContinued(statusClaim, final.seq, what(final)))
+    else add('status', statusClaim, statusClaim, NA, T.statusNoEvent)
 
     // 运行类别：运行开始事件记下的工具信任档。正式运行记 formal，探索运行记各工具的档位（一个对象），升级前的运行没有
     const classClaim = label(CLASS_LABEL, meta.run_class)

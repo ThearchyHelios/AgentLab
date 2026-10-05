@@ -13,7 +13,8 @@
 //   总览显示不通过；另做一次「哈希全部重算」的伪造：改报告里一个数字的引用值，文档、事件、清单、页面顶部的封存哈希
 //   都重算一遍，①–④ 都对得上，只有 ⑤ 拿口径卡、快照对出来不通过，报告标题旁的徽标跟着不通过；
 // - 深浅色、窄屏：390 宽不横向溢出，点开的数字面板在窄屏上从底部抽出，深色下底是深的、字是浅的；
-// - 样本页：tests/bundle_samples.py 用虚构数据真实生成的几份页面（遮罩快照、两份报告、早期运行、失败结束、两条出具
+// - 样本页：tests/bundle_samples.py 用虚构数据真实生成的几份页面（遮罩快照、两份报告、早期运行、失败结束、先失败后
+//   经继续运行跑到成功的早期运行、两条出具
 //   判定、服务端缺文件、裸 NaN、别的运行的文档），逐份断言各项结果和原因文案；在上面篡改 ④ 引用链（换文档、拿掉报告、
 //   多一份没人引用的工件）、⑥ 运行信息（运行结果、类别、出具档位）、拿掉被引用的口径卡、把口径卡标成遮罩、只改页面顶部
 //   的封存哈希；宽屏点开表格里右对齐的数字不被面板盖住；不执行脚本时封存哈希、运行 ID 照样看得到，状态写「尚未核对」；
@@ -486,7 +487,7 @@ await section('样本页：各种形状', async () => {
     check('生成样本页（tests/bundle_samples.py）', false, String(e?.message ?? e))
     return
   }
-  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 9, Object.keys(samples).join('、'))
+  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 10, Object.keys(samples).join('、'))
 
   await sample('base', async (s, page) => {
     check('base：总览通过，有无法核对的项时写「可核对的项全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过',
@@ -570,6 +571,12 @@ await section('样本页：各种形状', async () => {
   })
   await sample('base', async (_, page) => {
     check('成功结束的运行不提重新封存', await page.locator('#seal-failed').isHidden())
+  })
+  // 早期运行先失败、经继续运行跑到成功：范围里那条运行失败之后运行又继续了，它不是运行的结束；成功结束的那条在范围外
+  await sample('continued', async (s) => {
+    check('continued：总览通过，运行结果无法核对（成功结束的那条不在封存范围内），不拿中途那条失败去对',
+      s.overall === 'pass' && s.meta.status?.result === 'na' && hasItem(s, 'meta', 'na', '早期运行在结束事件落库之前封存'),
+      JSON.stringify(s.meta.status))
   })
   await sample('degraded', async (s) => {
     check('degraded：出具档位认最后一条出具判定（降档出具）', s.meta.tier?.result === 'pass' && s.meta.tier.text.includes('降档出具'),
@@ -666,6 +673,16 @@ await section('样本页：篡改', async () => {
   }, (s) => [...turnsRed('meta', ['events', 'manifest'])(s),
     ['页面显示事件里的「已完成」并标明文件里写的不同', s.meta.status?.result === 'fail' && s.meta.status.text.includes('已完成')
       && s.meta.status.text.includes('已失败'), JSON.stringify(s.meta.status)]])
+  // 先失败、经继续运行跑到成功的早期运行，运行结果改成「已失败」：范围里那条运行失败之后运行又继续了，它不是运行的
+  // 结束，不能拿它把「已失败」标成已核对
+  for (const [status, label] of [['failed', '已失败'], ['cancelled', '已取消']]) {
+    await tamper(samples.continued, `继续运行过的早期运行的运行结果改成${label}`, (data) => {
+      data.meta.status = status
+      return `succeeded → ${status}`
+    }, (s) => [...turnsRed('meta', ['events', 'manifest'])(s),
+      ['运行结果不再标已核对，写明那条失败之后运行又继续了', s.meta.status?.result === 'fail'
+        && hasItem(s, 'meta', 'fail', '之后运行又继续执行'), JSON.stringify(s.meta.status)]])
+  }
   await tamper(base, '运行类别', (data) => {
     data.meta.run_class = 'exploratory'
     return 'formal → exploratory'
