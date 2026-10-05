@@ -3,9 +3,9 @@
 推演永远不是出具。这里只算数：不读库、不写工件、不追加事件。接口（api/whatif.py）把这次运行封存范围内取得到的
 工件交进来（Sources），结果原样交回给点开证据面板的人，运行记录和报告一个字都不动。
 
-口径卡怎么算的，这里就怎么算：同一条原式、同一个求值器（expressions.eval_expression），浮点结果按卡上记的小数位
-round（和 metrics.run_metrics 一样只 round 浮点），渲染走 evidence.render_metric。重算前先把每个输入当时的值还原
-出来，卡上记着的就用卡上的：
+口径卡怎么算的，这里就怎么算：同一条原式、同一个求值器（expressions.eval_expression），取整用口径卡的同一个函数
+（metrics.round_metric，只取整浮点），渲染走 evidence.render_metric。重算前先把每个输入当时的值还原出来，卡上记着的
+就用卡上的：
 
 - 标量输入（数、文本、布尔、空值）：卡上记的 value 就是当时代进去的值。cell() 取的格、agent 的单格字段和数组里的
   一个元素也是标量，它们落在查询快照的哪一行记在 locator 里：排除了那一行，这个输入就当缺失，指标标「排除后无法计算」
@@ -52,7 +52,7 @@ from app.engine.expressions import (
     parse_expression,
     substitute,
 )
-from app.engine.nodes.metrics import _REF_HEAD, _brief
+from app.engine.nodes.metrics import _REF_HEAD, _brief, round_metric
 
 NO_LINEAGE = "这个指标生成于系统升级前，口径卡没有记录输入，不能推演"
 NO_FULL_VALUE = "当时没有保存这个输入的完整值"
@@ -647,7 +647,7 @@ class _Bind(ast.NodeTransformer):
 
 
 def _evaluate(plan: _Plan, values: dict[str, Any]) -> tuple[Any, str | None]:
-    """按原式求值，报错的说法和口径卡一致。浮点结果按卡上的小数位 round（metrics.run_metrics 同样只 round 浮点）。"""
+    """按原式求值，报错的说法和口径卡一致。取整和口径卡共用 metrics.round_metric（只取整浮点）。"""
     names = {path: _PLACEHOLDER.format(i) for i, path in enumerate(plan.tops)}
     bound = ast.fix_missing_locations(_Bind(names).visit(copy.deepcopy(plan.tree)))
     ctx = {names[p]: values.get(p) for p in plan.tops}
@@ -663,10 +663,8 @@ def _evaluate(plan: _Plan, values: dict[str, Any]) -> tuple[Any, str | None]:
         if isinstance(e, TypeError):
             return None, "输入的类型不正确，无法计算"
         return None, f"无法计算（{describe_exception(e)}）"
-    decimals = plan.metric.get("decimals")
-    if isinstance(value, float) and isinstance(decimals, int) and not isinstance(decimals, bool):
-        value = round(value, decimals)
-    return value, None
+    # 取整和口径卡是同一个函数：卡上怎么取整的，推演就怎么取整
+    return round_metric(value, plan.metric.get("decimals")), None
 
 
 # --------------------------------------------------------------------------
@@ -723,11 +721,10 @@ def _delta(metric: dict[str, Any], old: Any, new: Any) -> tuple[Any, str | None]
     """变化量和它的写法。比率、百分数的变化写「个百分点」：8.7% 到 19.0% 是多了 10.3 个百分点，不是 10.3%。"""
     if not (_number(old) and _number(new)):
         return None, None
-    delta = new - old
     decimals = metric.get("decimals")
     places = decimals if isinstance(decimals, int) and not isinstance(decimals, bool) else None
-    if isinstance(delta, float) and places is not None:
-        delta = round(delta, places)
+    # 变化量按卡上的小数位取整，规则同指标本身（round_metric）：不然 8.7 到 19.0 会写成 +10.299999999999999
+    delta = round_metric(new - old, places)
     if delta == 0:
         return delta, None
     fmt = metric.get("format") or DEFAULT_FORMAT

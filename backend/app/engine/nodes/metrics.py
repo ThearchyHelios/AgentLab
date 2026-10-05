@@ -128,8 +128,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             errors.append(f"指标「{metric_id}」：小数位（decimals）需要填写整数，当前为「{definition.get('decimals')}」")
             continue
         decimals = display["decimals"]
-        if isinstance(value, float) and decimals is not None:
-            value = round(value, decimals)
+        value = round_metric(value, decimals)
         substituted = substitute(tree, values)
         incomplete: dict[str, Any] = {}
         if use.sources:
@@ -332,6 +331,17 @@ def _integer(raw: Any) -> int | None:
     if isinstance(raw, str) and re.fullmatch(r"\s*[+-]?\d+\s*", raw):
         return int(raw)
     return None
+
+
+def round_metric(value: Any, decimals: Any) -> Any:
+    """口径卡的取整：只取整浮点，按小数位 round（Python 的 round，负数取整到十位、百位）；整数、文本、空值原样，
+    小数位没写或不是整数（老卡上记着的 true、2.0 这类怪值）时也原样。
+
+    推演重算（engine/recompute.py）、双盲复算的盲值都按卡重算，取整规则只能有这一处：两边各写一行，口径卡哪天换了
+    取整方式，推演就会对着同一张卡算出另一个数。"""
+    if isinstance(value, float) and isinstance(decimals, int) and not isinstance(decimals, bool):
+        return round(value, decimals)
+    return value
 
 
 def _rendered(value: Any, definition: dict[str, Any], display: dict[str, Any]) -> str:
@@ -726,8 +736,7 @@ def _recompute(substituted: str, tctx: dict[str, Any], value: Any, decimals: int
         again = eval_expression(substituted, tctx)
     except Exception:  # noqa: BLE001 - 代入式算不出来本身就是「对不上」
         return False
-    if isinstance(again, float) and decimals is not None:
-        again = round(again, decimals)
+    again = round_metric(again, decimals)
     if is_number(again) and is_number(value):
         return math.isclose(again, value, rel_tol=1e-12, abs_tol=0.0) or again == value
     return again == value
