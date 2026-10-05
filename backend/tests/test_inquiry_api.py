@@ -64,15 +64,21 @@ NOT_RECORDED = "运行状态已经变化，这次质询的问答没有写入运�
 BUSY_DECIDE = {"detail": "正在回答质询，回答完再批准或驳回", "code": "inquiry_busy"}
 
 
-@pytest.fixture(autouse=True)
-async def engine_up():
-    await run_manager.setup()
+async def _clean_settings() -> None:
     async with SessionLocal() as session:
         await session.execute(delete(Setting).where(Setting.key.in_(
             [spend.SPEND_KEY, JUDGE_SPEND_KEY, "verify", "judge", "copilot"])))
         await session.commit()
+
+
+@pytest.fixture(autouse=True)
+async def engine_up():
+    await run_manager.setup()
+    await _clean_settings()
     yield
     await run_manager.shutdown()
+    # 这里写过的核查设置、花费账不留给同一进程里后面的测试文件
+    await _clean_settings()
 
 
 @pytest.fixture
@@ -743,8 +749,11 @@ async def test_listing_filters_by_report_and_sentence_and_artifacts_are_whitelis
     [approval] = await pending(paused.id)
     doc = await report_doc(paused.id)
     east, south = unit_of(doc, EAST), unit_of(doc, SOUTH)
-    first = (await ask(client, paused.id, report="write", unit=east, question=QUESTION,
-                       approval_id=approval.id)).json()["inquiry"]
+    # 署名照请求头记（前端按 encodeURIComponent 编码后发）
+    first = (await client.post(f"/api/runs/{paused.id}/inquiries", headers={"X-Actor": "%E5%BC%A0%E5%B7%A5"},
+                               json={"report": "write", "unit": east, "question": QUESTION,
+                                     "approval_id": approval.id})).json()["inquiry"]
+    assert first["actor"] == "张工"
     second = (await ask(client, paused.id, report="write", unit=south, question="华南为什么低？",
                         approval_id=approval.id)).json()["inquiry"]
     assert first["seq"] < second["seq"]
