@@ -579,7 +579,7 @@ def test_time_column_differs_with_catalog_names():
      [("time", "A 按 paid_at 筛时间，B 按 created_at")]),
     # 筛选
     ("SELECT SUM(amount) FROM orders WHERE is_deleted <> 1", "SELECT SUM(amount) FROM orders",
-     [("filter", "A 排除了 is_deleted = 1 的行，B 没有")]),
+     [("filter", "A 排除了 is_deleted = 1 的行和 is_deleted 为空的行，B 没有")]),
     ("SELECT SUM(amount) FROM orders", "SELECT SUM(amount) FROM orders WHERE refund_id IS NOT NULL",
      [("filter", "B 排除了 refund_id 为空的行，A 没有")]),
     ("SELECT SUM(amount) FROM orders", "SELECT SUM(amount) FROM orders WHERE status = 'paid'",
@@ -686,8 +686,10 @@ def test_a_difference_inside_an_aggregating_cte_names_the_cte_on_each_side():
 def test_an_outer_join_turned_inner_by_where_says_what_was_written():
     """原文写的是 LEFT / RIGHT JOIN、WHERE 里的条件把没关联上的行筛掉了：按内连接比，说法照实写「写的是 LEFT JOIN，
     实际是 INNER JOIN」，不说成「用 INNER JOIN」。从 RIGHT JOIN 改写来的外连接说以哪一侧为主表，不说 LEFT JOIN。"""
-    a = "SELECT SUM(o.amount) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE o.status = 'paid'"
-    b = "SELECT SUM(o.amount) FROM refunds r LEFT JOIN orders o ON o.id = r.order_id WHERE o.status = 'paid'"
+    # 用 COUNT：PostgreSQL 里对不知道是不是精确数的值求和，结果看行出来的先后（见 _Sensitivity），这样的一段不按 WHERE
+    # 把外连接改成内连接（SQLite 上降成内连接之后扫描的先后真的变了），说不出这一句
+    a = "SELECT COUNT(o.id) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE o.status = 'paid'"
+    b = "SELECT COUNT(o.id) FROM refunds r LEFT JOIN orders o ON o.id = r.order_id WHERE o.status = 'paid'"
     assert texts(a, b, "postgres") == [
         "A 用 LEFT JOIN 关联 refunds 表，B 写的是 LEFT JOIN，但 WHERE 里的条件把关联不上 orders 的行筛掉了，实际是 INNER JOIN"]
     a = "SELECT COUNT(*) FROM orders o RIGHT JOIN refunds r ON r.order_id = o.id"
@@ -707,7 +709,9 @@ def test_each_dialect_gives_the_same_three_findings(dialect):
     a = (f"SELECT COUNT(DISTINCT o.order_id) AS {q}订单数{q} FROM orders o "
          "WHERE o.paid_at >= '2026-09-01' AND o.is_deleted <> 1")
     b = f"SELECT COUNT(o.order_id) AS {q}订单数{q} FROM orders o WHERE o.created_at >= '2026-09-01'"
-    assert texts(a, b, dialect) == ["A 按 paid_at 筛时间，B 按 created_at", "A 排除了 is_deleted = 1 的行，B 没有",
+    # <> 1 也把 is_deleted 为空的行筛掉了（第 3 轮复验：以前只说「排除了 is_deleted = 1 的行」）
+    assert texts(a, b, dialect) == ["A 按 paid_at 筛时间，B 按 created_at",
+                                    "A 排除了 is_deleted = 1 的行和 is_deleted 为空的行，B 没有",
                                     "A 对 order_id 去重计数，B 没去重"]
 
 
@@ -1099,3 +1103,166 @@ def test_only_literals_changed_stays_the_same_template_after_the_rewrite(dialect
 def test_a_structural_change_is_still_a_different_template(dialect, a, b):
     """结构变了的（列名表的先后、IN 和 NOT IN、常量写成一个数、连接类型）照旧不是同一个模板。"""
     assert not normalize_sql(a, dialect).same_shape(normalize_sql(b, dialect))
+
+
+# --------------------------------------------------------------------------
+# 第 3 轮复验的反例：等价的结论、具体说法的可靠性
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name,dialect,a,b", sql_pairs.REGRESSIONS_R3,
+                         ids=[f"{n}-{d}" for n, d, _, _ in sql_pairs.REGRESSIONS_R3])
+def test_round_three_counterexamples_are_never_equivalent(name, dialect, a, b):
+    """第 3 轮复验报的 blocker（PostgreSQL / MySQL 的写法、执行起来每次都不同的 RANDOM()）：外连接改内连接时 NOT IN、
+    ALL、NOT … ANY、数组拼接其实留得下没关联上的行；ORDER BY 里单独一个名字先认列别名；没有 GROUP BY 的 HAVING 让
+    语句只出一行；MySQL 的 /*! … */、!、--1、类型不同的 BETWEEN；不确定的函数；解析时换成同一个节点的写法。不管
+    给不给表结构、谁先谁后，一律不判等价。"""
+    for schema in (None, sql_pairs.schema_cache()):
+        for x, y in ((a, b), (b, a)):
+            diff = explain_sql_diff(x, y, dialect, schema=schema)
+            check_shape(diff)
+            assert not diff.equivalent, name
+
+
+@pytest.mark.parametrize("name,dialect,a,b", sql_pairs.DIALECT_SAME_R3,
+                         ids=[f"{n}-{d}" for n, d, _, _ in sql_pairs.DIALECT_SAME_R3])
+def test_round_three_equivalent_rewrites_get_at_most_the_fallback(name, dialect, a, b):
+    """第 3 轮复验报的 major（意思一样，却说了具体的不同）在 PostgreSQL / MySQL 上的写法：认得出就判等价，认不出只给
+    兜底说明，不说「A 按 X 分组，B 按 Y 分组」「A 用 LEFT JOIN，B 用 INNER JOIN」这类其实不影响结果的话。"""
+    for schema in (None, sql_pairs.schema_cache()):
+        for x, y in ((a, b), (b, a)):
+            diff = explain_sql_diff(x, y, dialect, schema=schema)
+            check_shape(diff)
+            assert diff.equivalent or all(d.aspect == "other" for d in diff.items), (name, diff.items)
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_irrelevant_differences_inside_exists_and_in_are_never_described(dialect):
+    """EXISTS 只看有没有行、IN 只看在不在：子查询里去重、分组、UNION 还是 UNION ALL 都不影响。以前说「A 在 EXISTS
+    子查询里对 amount 去重，B 没有去重」「A 在 id IN 的子查询里用 UNION 合并」，还标成说全了。"""
+    ids = ["same:r3-exists-distinct", "same:r3-not-exists-distinct", "same:r3-exists-group-by",
+           "same:r3-exists-union-vs-union-all", "same:r3-in-union-vs-union-all", "same:r3-in-group-by",
+           "same:r3-in-group-by-two-keys", "same:r3-in-group-by-having-count-noop"]
+    for pid in ids:
+        pair = sql_pairs.PAIRS_BY_ID[pid]
+        for schema in (None, sql_pairs.schema_cache()):
+            diff = explain_sql_diff(pair.a, pair.b, dialect, schema=schema)
+            check_shape(diff)
+            assert diff.equivalent or all(d.aspect == "other" for d in diff.items), (pid, diff.items)
+
+
+def test_only_the_time_column_is_reported_when_the_group_key_is_equal_by_join():
+    """真正的差异只有时间列；分组键一边写 users.id、一边写 orders.user_id，被关联条件定成相等。给了表结构（两列都声明
+    INTEGER，相等就是一样）只说时间列、说全了（只差一个方面，选择才能写进数据目录）；没给表结构时类型不知道（SQLite 里
+    1 和 '1' 也相等），只说时间列，另附兜底，不说「A 按 users.id 分组，B 按 orders.user_id 分组」。"""
+    pair = sql_pairs.PAIRS_BY_ID["diff:r3-time-plus-group-key-equal"]
+    expected = ("time", "A 按 paid_at 筛时间，B 按 created_at")
+    diff = explain_sql_diff(pair.a, pair.b, "sqlite", schema=sql_pairs.schema_cache())
+    check_shape(diff)
+    assert [(d.aspect, d.text) for d in diff.items] == [expected] and not diff.fallback
+    diff = explain_sql_diff(pair.a, pair.b, "sqlite")
+    check_shape(diff)
+    assert (diff.items[0].aspect, diff.items[0].text) == expected
+    assert all(d.aspect in ("time", "other") for d in diff.items)
+
+
+def test_only_the_time_column_is_reported_when_the_left_join_cannot_matter():
+    """结果只是可空一侧的聚合（COALESCE(SUM(r.amount), 0)）：LEFT JOIN 和 INNER JOIN 结果一样，真正的差异只有时间列。
+    以前多说一句「A 用 LEFT JOIN 关联 refunds 表，B 用 INNER JOIN」，还标成说全了。"""
+    pair = sql_pairs.PAIRS_BY_ID["diff:r3-time-plus-left-coalesce"]
+    for schema in (None, sql_pairs.schema_cache()):
+        diff = explain_sql_diff(pair.a, pair.b, "sqlite", schema=schema)
+        check_shape(diff)
+        assert [(d.aspect, d.text) for d in diff.items] == [("time", "A 按 paid_at 筛时间，B 按 created_at")]
+    for dialect in ("postgres", "mysql"):
+        diff = explain_sql_diff(pair.a, pair.b, dialect)
+        check_shape(diff)
+        assert not any(d.aspect == "join" for d in diff.items), (dialect, diff.items)
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_a_self_join_direction_gets_only_the_fallback(dialect):
+    """自己关联自己，关联的方向不同：两个别名都是 orders，以前说成「A 关联 orders 表的条件是 orders.parent_id =
+    orders.id，B 是 orders.id = orders.parent_id」，读起来是同一个等式、自相矛盾。分不清哪个是哪个，只给兜底说明。"""
+    pair = sql_pairs.PAIRS_BY_ID["diff:r3-self-join-roles"]
+    for schema in (None, sql_pairs.schema_cache()):
+        diff = explain_sql_diff(pair.a, pair.b, dialect, schema=schema)
+        check_shape(diff)
+        assert not diff.equivalent and all(d.aspect == "other" for d in diff.items), diff.items
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_excluding_by_not_equal_also_mentions_the_null_rows(dialect):
+    """<>、NOT IN 也把这一列为空的行筛掉了：以前只说「A 排除了 is_deleted = 1 的行」，读的人会以为空值的行还在。
+    NOT 套着几个条件的，照原样说「只保留 NOT (…) 的行」。"""
+    diff = explain_sql_diff("SELECT SUM(amount) FROM orders WHERE is_deleted <> 1", "SELECT SUM(amount) FROM orders",
+                            dialect)
+    check_shape(diff)
+    assert [d.text for d in diff.items] == ["A 排除了 is_deleted = 1 的行和 is_deleted 为空的行，B 没有"]
+    diff = explain_sql_diff("SELECT COUNT(*) FROM orders WHERE status NOT IN ('void', 'open')",
+                            "SELECT COUNT(*) FROM orders", dialect)
+    check_shape(diff)
+    assert [d.text for d in diff.items] == ["A 排除了 status IN ('open', 'void') 的行和 status 为空的行，B 没有"]
+    diff = explain_sql_diff("SELECT COUNT(*) FROM orders WHERE NOT (status = 'void' AND is_deleted = 1)",
+                            "SELECT COUNT(*) FROM orders", dialect)
+    check_shape(diff)
+    assert len(diff.items) == 1 and diff.items[0].text.startswith("A 只保留 NOT ") and "B 没有这个条件" in diff.items[0].text
+
+
+@pytest.mark.parametrize("pid", ["hard:r3-disjoint-union-all-vs-union", "hard:r3-order-single-group",
+                                 "hard:r3-distinct-join-vs-in", "hard:r3-count-distinct-join-vs-in",
+                                 "hard:r3-join-vs-exists-distinct", "hard:r3-shadowed-alias-written-out"])
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_equivalent_rewrites_needing_reasoning_get_only_the_fallback(pid, dialect):
+    """意思一样、要按语义推理才看得出的（各支本身去重、互不相交的 UNION ALL 和 UNION；只有一组时的排序；关联一张表和
+    IN / EXISTS 子查询；被遮住的别名写明白）：以前说「A 用 UNION ALL（重复的行都留着）」「A 按 user_id 升序排，B 没有
+    排序」「A 关联了 users 表，B 没有关联它」「A 在 EXISTS 子查询里只保留 status = 'paid' 的行」。认不出只给兜底。"""
+    pair = sql_pairs.PAIRS_BY_ID[pid]
+    for schema in (None, sql_pairs.schema_cache()):
+        diff = explain_sql_diff(pair.a, pair.b, dialect, schema=schema)
+        check_shape(diff)
+        assert diff.equivalent or all(d.aspect == "other" for d in diff.items), diff.items
+
+
+def test_identical_text_is_equivalent_even_when_the_parser_would_lose_something():
+    """一字不差的两条就是同一条语句：带 MySQL 的 /*! … */、RANDOM() 这些不在语法树上判等价的写法，原文一样也算等价。"""
+    for sql, dialect in (("SELECT COUNT(*) FROM orders /*! WHERE status = 'paid' */", "mysql"),
+                         ("SELECT COUNT(*) FROM orders WHERE RANDOM() % 2 = 0", "sqlite"),
+                         ("SELECT COUNT(*) FROM orders WHERE MOD(amount, 2) = 0", "sqlite")):
+        diff = explain_sql_diff(sql, "  " + sql + "\n", dialect)
+        check_shape(diff)
+        assert diff.equivalent, sql
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    ("mysql", "SELECT COUNT(*) FROM orders /*! WHERE status = 'paid' */", "SELECT COUNT(*) FROM orders"),
+    ("mysql", "SELECT COUNT(*) FROM orders WHERE ! status = 'paid'", "SELECT COUNT(*) FROM orders WHERE NOT status = 'paid'"),
+    ("mysql", "SELECT id, amount --1 FROM orders", "SELECT id, amount FROM orders"),
+    ("sqlite", "SELECT COUNT(*) FROM orders WHERE MOD(amount, 2) = 0", "SELECT COUNT(*) FROM orders WHERE amount % 2 = 0"),
+    ("sqlite", "SELECT CHAR_LENGTH(name) FROM users", "SELECT LENGTH(name) FROM users"),
+], ids=["executable-comment", "bang", "double-dash", "mod-function", "char-length"])
+def test_a_structure_the_parser_loses_is_never_the_same_template(dialect, a, b):
+    """解析时丢了的结构（MySQL 会执行的 /*! … */ 注释、比比较结合得紧的 !、--1 是减负一，SQLite 的 MOD() 和 %、
+    SQLite 没有的 CHAR_LENGTH）不能被 normalize_sql 当成「只改了参数」。"""
+    assert not normalize_sql(a, dialect).same_shape(normalize_sql(b, dialect))
+
+
+@pytest.mark.parametrize("dialect,a,b", [
+    ("mysql", "SELECT COUNT(*) FROM orders /*! WHERE status = 'paid' */", "SELECT COUNT(*) FROM orders /*! WHERE status = 'void' */"),
+    ("mysql", "SELECT COUNT(*) FROM orders WHERE ! status = 'paid'", "SELECT COUNT(*) FROM orders WHERE ! status = 'void'"),
+    ("sqlite", "SELECT COUNT(*) FROM orders WHERE MOD(amount, 2) = 0", "SELECT COUNT(*) FROM orders WHERE MOD(amount, 3) = 1"),
+    ("sqlite", "SELECT o.id FROM orders o WHERE EXISTS (SELECT DISTINCT r.amount FROM refunds r WHERE r.order_id = o.id "
+               "AND r.refunded_at >= '2026-09-01')",
+     "SELECT o.id FROM orders o WHERE EXISTS (SELECT DISTINCT r.amount FROM refunds r WHERE r.order_id = o.id "
+     "AND r.refunded_at >= '2026-10-01')"),
+    ("sqlite", "SELECT id FROM orders ORDER BY id LIMIT -1", "SELECT id FROM orders ORDER BY id LIMIT -20"),
+    ("postgres", "SELECT COALESCE(SUM(r.amount), 0) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+                 "WHERE o.paid_at >= '2026-09-01'",
+     "SELECT COALESCE(SUM(r.amount), 1) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "WHERE o.paid_at >= '2026-10-01'"),
+], ids=["executable-comment", "bang", "mod-function", "exists-distinct", "limit", "left-coalesce"])
+def test_only_literals_changed_is_still_the_same_template_in_round_three(dialect, a, b):
+    """这一轮动过的写法（会执行的注释、!、MOD()、EXISTS 里去重、负数 LIMIT、LEFT JOIN 的聚合）：只改字面量的照旧是
+    同一个模板，字面量各是各的。"""
+    na, nb = normalize_sql(a, dialect), normalize_sql(b, dialect)
+    assert na.same_shape(nb) and na.literals != nb.literals

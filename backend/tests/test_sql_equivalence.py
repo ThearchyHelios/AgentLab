@@ -61,9 +61,11 @@ def test_equivalence_is_guarded_by_execution(databases, pair):
             assert not diff.equivalent, f"{pair.id}：第 {differs} 组数据上结果不同，却判了等价（schema={bool(schema)}）"
         if pair.expect == "diff":
             assert not diff.equivalent, f"{pair.id} 不该判等价（schema={bool(schema)}）"
-        if pair.expect == "same" and not diff.equivalent:
+        if pair.expect == "same" and not diff.equivalent and not (pair.needs_schema and schema is None):
             specific = [d.text for d in diff.items if d.aspect != "other"]
             assert not specific, f"{pair.id} 意思一样，却说了具体的不同（schema={bool(schema)}）：{specific}"
+        if pair.needs_schema and schema is not None:
+            assert diff.equivalent, f"{pair.id} 给了表结构（主键不为空）应认得出等价：{[d.text for d in diff.items]}"
         # 换个先后问，结论一样
         assert explain_sql_diff(pair.b, pair.a, "sqlite", schema=schema).equivalent == diff.equivalent, pair.id
 
@@ -73,9 +75,12 @@ def test_most_known_equivalent_rewrites_are_recognized():
     认不出的给的是兜底说明，不是错误的结论。要按语义推理才看得出的（hard:）另记，不算进比例。"""
     same = [p for p in sql_pairs.PAIRS if p.expect == "same" and not p.id.startswith("hard:")]
     hits = [p.id for p in same if explain_sql_diff(p.a, p.b, "sqlite", schema=SCHEMA).equivalent]
-    bare = [p.id for p in same if explain_sql_diff(p.a, p.b, "sqlite").equivalent]
-    ratio, bare_ratio = len(hits) / len(same), len(bare) / len(same)
-    print(f"\n已知等价的改写 {len(same)} 对里认出 {len(hits)} 对（{ratio:.0%}），不给表结构时 {len(bare)} 对（{bare_ratio:.0%}）")
+    # 不给表结构那一项只算不靠表结构就该认得出的（列的类型、主键不为空这些得看表结构）
+    plain = [p for p in same if not p.typed and not p.needs_schema]
+    bare = [p.id for p in plain if explain_sql_diff(p.a, p.b, "sqlite").equivalent]
+    ratio, bare_ratio = len(hits) / len(same), len(bare) / len(plain)
+    print(f"\n已知等价的改写 {len(same)} 对里认出 {len(hits)} 对（{ratio:.0%}）；不靠表结构的 {len(plain)} 对，"
+          f"不给表结构时认出 {len(bare)} 对（{bare_ratio:.0%}）")
     print("没认出来的：", sorted(set(p.id for p in same) - set(hits)))
     hard = [p for p in sql_pairs.PAIRS if p.id.startswith("hard:")]
     hard_hits = [p.id for p in hard if explain_sql_diff(p.a, p.b, "sqlite", schema=SCHEMA).equivalent]
@@ -90,6 +95,19 @@ def test_the_corpus_is_large_and_varied_enough():
                       "LIMIT", "ORDER BY", "RIGHT JOIN", "FULL JOIN", "NOT IN", "CROSS JOIN", "EXCEPT", "GROUP_CONCAT",
                       "USING (", "IIF("):
         assert construct in text, construct
+
+
+def test_the_datasets_expose_the_round_three_counterexamples(databases):
+    """第 3 轮复验的反例在这几组数据上确实结果不同：外连接改内连接（NOT IN 空集）、列名表和 EXISTS 里的列别名、USING
+    之后 ORDER BY 的别名、同名的两列、SQLite 的 % 和 MOD()、遮住外层的别名、找不到列的双引号名字。"""
+    pairs = {p.id: p for p in sql_pairs.PAIRS}
+    for pid in ("diff:r3-left-not-in-subquery", "diff:r3-left-not-in-empty-list", "diff:r3-cte-column-list-where-alias",
+                "diff:r3-cte-column-list-union-where-alias", "diff:r3-exists-alias-where",
+                "diff:r3-using-order-by-alias", "diff:r3-using-order-by-alias-left", "diff:r3-duplicate-output-name",
+                "diff:r3-mod-vs-percent", "diff:r3-shadowed-alias", "diff:r3-double-quoted-not-in-scope",
+                "diff:r3-double-quoted-not-in-outer-scope", "diff:r3-left-coalesce-inside-sum"):
+        pair = pairs[pid]
+        assert any(sql_pairs.run(c, pair.a) != sql_pairs.run(c, pair.b) for c in databases), pid
 
 
 def test_the_tricky_dataset_exposes_the_round_two_counterexamples(databases):
