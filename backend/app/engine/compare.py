@@ -23,8 +23,14 @@
     结果时，再按别名一路追到喂它的每一份上游快照。只差字面量时还要看图里的 SQL：图里的 SQL 改过（改了写死的筛选值、
     系数）是模板变化，图里一字未改的才是运行时代入的参数
   - Agent 按出处交来的字段还要引用同一列、同一段行（两边都引用整份结果的不算换了；行段相同、一边是整份结果一边
-    不是的算换了；行号相同、都不是整份结果的，一边引用了的维度值在另一边的快照里、却没被引用的也算换了——取前几名
-    时名次变了、按区域排序时多了一个区域）：取哪一列、哪几行是 Agent 每次运行时定的，换了就不是同一个数
+    不是的算换了；行号相同、都不是整份结果的，按维度值数两边各引用了它几行、引用的行外面还有没有它的行：引用过的
+    每个维度值两边要被切在同一处——都整个被引用（一边的快照里根本没有它的，那一边算整个被引用），或者都只引用了
+    它同样的那几行（排在引用的行前面的行数、引用的行数都一样）——否则也算换了：取前几名时名次变了、按区域排序时
+    多了一个区域、区域 × 日期的结果里一个区域有一天被挤出引用的行、一个区域多了一天却只引用了前几天。维度按两边
+    整份结果认一组、按归因用的行（引用的那段行）再认一组，两组都要切在同一处——归因按哪组维度说，就按哪组核对；
+    单格引用的那一行两次要是同一个维度值，还要是它同样的那一行（排在这一行前面的、它的行数一样）；快照读不出来、
+    有的行和列对不上，核对不了是不是同一批维度值的，说不清）：取哪一列、哪几行是 Agent 每次运行时定的，换了就不是
+    同一个数
   - 不落在快照上的：模型、人交出的值（Agent 没按出处交、模型调用、人工审批……）没有出处，值变了说不清是数据还是它
     本身的差异；代码、数据整形这类节点看它自己查过的库，不查库的看它的配置和画布上的全部上游；记不出写入者的看
     口径卡之前可能执行过的节点（口径卡自己、只在它下游的不算）。上游的查询结果两次一模一样、值却变了的同样说不清；
@@ -80,6 +86,8 @@ TOP_KEYS = 10
 MAX_DIFFERENCES = 5
 #: 表达式、取值写进说明时最多几个字
 _SHOWN_MAX = 60
+#: 说明里最多列几个行号：一个维度值挤出去几十行时，前几个就够人去快照里找
+_ROWS_SHOWN = 3
 #: 比较 SQL 时两边的叫法（diff_facets 的 labels）
 _LABELS = ("基准", "这次")
 #: 合并查询的 SQL 在 SQLite 里执行（engine/merge_query.py）
@@ -1071,8 +1079,10 @@ class _Compare:
     def _citation(self, agent: Any, b: Any, t: Any, qb: _Query, qt: _Query) -> _Change | None:
         """Agent 按出处交来的字段两次引用的是不是同一处：同一列（对象数组是同一组列）、同一行或同一段行。两边引用的都是
         整份结果的算同一处（这次多了几行也是）；行段相同、一边是整份结果一边不是的不算——没引用的那几行还在这次的快照
-        里，按维度配对会把它们算成「数据没了」。行号相同、都不是整份结果的，还要引用同一批维度值（_left_out）。不是
-        同一处、核对不了是不是同一处的，返回说明。"""
+        里，按维度配对会把它们算成「数据没了」。行号相同、都不是整份结果的，还要引用同一批维度值（_left_out）：行段
+        要把引用过的每个维度值切在同一处（两边都整个被引用，或者都只引用了它同样的那几行），单格要引用同一个维度值的
+        同一行。行段的起止行有一个不同就不是同一处（只差最后一行也是：多引用的那一行改变了合计）。不是同一处、核对
+        不了是不是同一处的，返回说明。"""
         name = f"Agent「{self.title(agent)}」" if agent else "Agent"
         lb, lt = _locator(b), _locator(t)
         cb, ct = lb.get("column") or lb.get("columns"), lt.get("column") or lt.get("columns")
@@ -1103,38 +1113,145 @@ class _Compare:
                                   "这次引用了整份结果，取的不是同一组数")
 
     def _left_out(self, name: str, what: str, b: Any, t: Any, qb: _Query, qt: _Query, column: Any) -> _Change | None:
-        """行号相同、都不是整份结果的引用，引用的是不是同一批维度值（区域……）。一边引用了的，另一边没引用、却还在那边的
-        快照里，取的就不是同一组数：按区域排序的结果多了北区，西区挪出了引用的行段；按金额取前 3 名，北区挤了进来——
-        按维度配对会把还在的西区算成「数据没了」。另一边的快照里也没有的，是数据真的没了，照常比。维度按两边整份结果
-        认（和归因同一个规则，_dimensions）；分不出维度（没有不是数值的列、维度列设了遮罩）、快照读不出来、行的形状
-        不对的，只能按行号认，返回 None。"""
+        """行号相同、都不是整份结果的引用，引用的是不是同一批维度值（区域……）。按维度键分别数两边引用了它几行、引用
+        的行外面还有没有它的行（_cut 按一组维度核对）：
+
+        - 行段（口径卡按引用的几行一起算）：引用过的每个维度值，两边要被切在同一处——都整个被引用（引用的行外面没有
+          它的行；那一边的快照里根本没有它的，也算整个被引用，没什么可漏的），或者都只引用了它同样的那几行（按查询
+          结果的先后数：它排在引用的行前面的行数一样、引用的行数也一样，两次都是南区的第一天）。切法不同就不是同一组
+          数：按区域排序的结果多了北区，西区整个挪出了引用的行段；区域 × 日期的结果东区多了一天，南区的第二天被挤到
+          引用的行外面；南区这次多了一天、引用的行只盖住前两天（引用的行数没变少，南区却从整个被引用变成只引用了一
+          部分）；北区这次新出现，三天里只引用了两天；引用的行不从第 1 行开始，东区两次都只引用了一行，基准运行是它
+          金额第二高的那天、这次是最高的那天。按维度配对会把还在快照里、只是没被引用的行算成数据变化，和真的少了、
+          真的多了分不出来，正负号都可能反。只比引用的行数查不出后三种，只看「引用的行里有没有这个键」连挤出一部分都
+          查不出。引用的行后面还剩它几行不进切法：两次都只引用了南区的第一天，后面剩一天还是两天，引用的都是同一天。
+        - 单格（数组字段里的一个元素）：引用的那一行两次要是同一个维度值，还要是它同样的那一行——按查询结果的先后，
+          排在这一行前面的、它的行数两边一样（两次都是南区的第一天）。区域 × 日期的结果东区少了一天，第 3 行从南区的
+          第一天变成了第二天；按金额排，第 2 行从东区第二高的那天变成了最高的那天：区域没变，取的却不是同一个数（同一处
+          引用换成只有一行的行段也说不清），按行号认会把南区第一天的 50 和第二天的 45 当成同一个数，同一天的南区其实
+          是 50 → 60，正负号都反了。只比排在前面的行数，不比「它在这一行外面还有没有行」：单格只有一行，口径卡不按它
+          算这个区域的合计，东区两天还是一天，第 1 行都是东区的第一天。不是同一个维度值的，一边引用的那个维度值在另一
+          边的快照里、只是不在这一行，取的不是同一个数。
+        - 一边引用了、另一边快照里没有的，是真的没有了（或者这次才有），照常比。快照被截断的按取回的行比，和引用整份
+          结果时一样（系统的行数上限当作查询的一部分，像 SQL 里的 LIMIT）：挤到截断点后面的行看不到，和真的没有了
+          分不出来——截断的快照不做归因，_attribute 写明截断。
+
+        说明里说的是引用的行外面有它的那一边（两边都有的，是引用得少的那一边；行数一样、只是引用的不是它同样那几行
+        的，两边排在前面的行数都写出来）；几个维度值切法都不同的，说基准运行引用的行里先出现的那个。
+
+        按哪组维度核对（_dimensions，遮罩列不当维度）：两边整份结果认出的那组，加上归因用的那组（_attributed_rows：数组
+        字段只在它引用的那段行上认），两组不同时两组都核对，都是同一处才算同一处。归因只在引用的行上认维度：渠道在引用
+        的行里两边都只有「线上」，不当维度，归因按区域说南区的变化；只按整份结果的（区域, 渠道）核对，南区 / 线上两边
+        都整个被引用、南区 / 线下两边都没被引用，看着都切在同一处，按区域看南区这次却有一行（线下）在引用的行外面，
+        归因说的南区就不是同一组数——归因按哪组维度说，就要按哪组维度核对。只按归因用的那组也不够：只引用了一行的，
+        引用的行里每列都只有一个值，认不出维度；整份结果里分得清的维度（区域, 渠道）也要切在同一处。
+
+        先只用没遮的列认，说明里写的是没遮的列的值和行号；有列设了遮罩的，再连遮住的列一起核对一遍（区域设了遮罩时它
+        往往正是唯一认得出行的那一列，只用没遮的列等于对它不核对），这一遍的说明只写行号、不写是哪个值。两遍都分不出
+        维度（没有不是数值的列）的，只能按行号认，返回 None。快照读不出来的说不清：只有单格会走到这里（行段在 _citation
+        里先核对整份结果，读不出来的已经说不清），那一行两次是不是同一个维度值核对不了，和行段一样不按行号当成同一处。
+        快照里有的行和列对不上（格数不对、不是一行）的，认不出各行是哪个维度值，同样说不清。"""
         if qb.snap is None or qt.snap is None:
-            return None
+            side = "基准运行" if qb.snap is None else "这次运行"
+            return _Change("unknown", f"{side}的查询快照无法读取，无法核对 {name}两次引用的{_rows_text(t)}"
+                                      "是不是同一个维度值")
         rb, rt = _records(qb.snap, None), _records(qt.snap, None)
         if rb is None or rt is None:
-            return None
-        dims, _ = _dimensions(qb.snap, qt.snap, rb, rt, column if isinstance(column, str) else "", self._hidden(b, t))
-        if not dims:
-            return None
+            side = "基准运行" if rb is None else "这次运行"
+            return _Change("unknown", f"{side}的查询快照里有的行和列对不上，无法核对 {name}两次引用的{_rows_text(t)}"
+                                      f"是不是同一{'个' if b.row is not None else '批'}维度值")
+        measure, hidden = column if isinstance(column, str) else "", self._hidden(b, t)
+        whole, _ = _dimensions(qb.snap, qt.snap, rb, rt, measure, hidden)
+        # 整份结果的行没问题，引用的那段行（它的一部分）也读得出来；单格的归因用整份结果，和 whole 是同一组
+        used, _ = _dimensions(qb.snap, qt.snap, _attributed_rows(qb.snap, b) or [], _attributed_rows(qt.snap, t) or [],
+                              measure, hidden)
+        for dims in dict.fromkeys(tuple(d) for d in (whole, used) if d):
+            if (found := self._cut(name, what, b, t, rb, rt, list(dims))) is not None:
+                return found
+        if hidden and any(str(c).lower() in hidden for snap in (qb.snap, qt.snap) for c in snap.get("columns") or []):
+            # 拿遮住的列核对过（哪怕最后没核对出不同）：整体说明照样提一句有列设了遮罩
+            self.masked_seen = True
+        if hidden:
+            # 遮罩列不当维度，是为了值不进说明；可它往往正是认得出行的那一列（区域设了遮罩），只拿没遮的列核对，等于对它
+            # 不核对，挤出引用的行就和真的没有了分不出来。连遮住的列一起再核对一遍，说明里只写行号、不写值
+            whole, _ = _dimensions(qb.snap, qt.snap, rb, rt, measure, frozenset())
+            used, _ = _dimensions(qb.snap, qt.snap, _attributed_rows(qb.snap, b) or [],
+                                  _attributed_rows(qt.snap, t) or [], measure, frozenset())
+            for dims in dict.fromkeys(tuple(d) for d in (whole, used) if d):
+                if (found := self._cut(name, what, b, t, rb, rt, list(dims), redact=True)) is not None:
+                    return found
+        return None
 
-        def split(records: list[tuple[int, dict[str, Any]]], inp: Any) -> tuple[dict[Any, int], dict[Any, int]]:
-            """{维度键: 第一次出现的行号}：引用的行里的，引用的行外面的。"""
+    def _cut(self, name: str, what: str, b: Any, t: Any, rb: list[tuple[int, dict[str, Any]]],
+             rt: list[tuple[int, dict[str, Any]]], dims: list[str], *, redact: bool = False) -> _Change | None:
+        """按 dims 这组维度核对两边引用的是不是同一批维度值（规则见 _left_out）：是返回 None，不是返回说明。rb、rt 是
+        两边整份结果的行。redact：dims 里有设了遮罩的列，说明里不写是哪个维度值，只写行号。"""
+
+        def named(key: tuple[Any, ...]) -> str:
+            return "其中一个维度值" if redact else _key_text(key)
+
+        masked_note = "（维度列设了遮罩，不写出是哪个值）" if redact else ""
+
+        def split(records: list[tuple[int, dict[str, Any]]], inp: Any) -> tuple[dict[Any, int], dict[Any, list[int]]]:
+            """{维度键: 引用的行里有几行}，{维度键: [引用的行外面的行号]}。一个键可能占几行（去掉日期这类每期都不同的
+            列以后），要数清几行，只记第一次出现的看不出「有一部分挪了出去」。"""
             first, last = _cited(inp, len(records))
             inside: dict[Any, int] = {}
-            outside: dict[Any, int] = {}
+            outside: dict[Any, list[int]] = {}
             for i, row in records:
-                (inside if first <= i <= last else outside).setdefault(tuple(_hashable(row.get(d)) for d in dims), i)
+                key = tuple(_hashable(row.get(d)) for d in dims)
+                if first <= i <= last:
+                    inside[key] = inside.get(key, 0) + 1
+                else:
+                    outside.setdefault(key, []).append(i)
             return inside, outside
 
         (in_b, out_b), (in_t, out_t) = split(rb, b), split(rt, t)
-        for key in in_b:
-            if key not in in_t and key in out_t:
-                return _Change("unknown", f"{name}两次都引用{_rows_text(t)}，{_key_text(key)}这次仍在查询结果第 "
-                                          f"{out_t[key] + 1} 行，不在引用的行里，取的不是{what}")
-        for key in in_t:
-            if key not in in_b and key in out_b:
-                return _Change("unknown", f"{name}两次都引用{_rows_text(b)}，{_key_text(key)}在基准运行中位于查询结果第 "
-                                          f"{out_b[key] + 1} 行，不在引用的行里，取的不是{what}")
+        single = b.row is not None             # 和 t.row 一样（_citation 只在两边行号相同时走到这里）
+        cited, first = _rows_text(t), _cited(t, len(rt))[0]
+
+        def ahead(outside: list[int]) -> int:
+            """它排在引用的行前面的行数：按查询结果的先后，引用的是它的第几行起。两边行号相同，first 是同一个。"""
+            return sum(1 for i in outside if i < first)
+
+        def cut(inside: int, outside: list[int]) -> tuple[int, int] | None:
+            """行段切在这个维度值的哪儿：引用的行外面没有它的行记 None（整个被引用；快照里根本没有它的也是 None）；
+            有的记（它排在引用的行前面的行数, 引用了它几行）——按查询结果的先后，引用的是它的第几行到第几行。"""
+            return (ahead(outside), inside) if outside else None
+
+        for key in dict.fromkeys([*in_b, *in_t]):          # 只看引用过的：两边都没引用的不进这个数
+            nb, nt = in_b.get(key, 0), in_t.get(key, 0)
+            ob, ot = out_b.get(key, []), out_t.get(key, [])
+            if single:
+                if nb == nt:
+                    # 那一行两次都是它（单格只有一行，nb、nt 都是 1）：还要是它同样的那一行，排在前面的行数一样
+                    if ahead(ob) == ahead(ot):
+                        continue
+                    return _Change("unknown", f"{name}两次都引用{cited}，两次都是{named(key)}，可不是它同样的那一行"
+                                              f"（它排在这一行前面的，基准运行有 {ahead(ob)} 行，这次有 {ahead(ot)} 行），"
+                                              f"取的不是{what}{masked_note}")
+                # 不是同一个维度值：看只在一边被引用的它在另一边的快照里还有没有——有（只是不在这一行）是换了一个数，
+                # 没有是真的没有了、这次才有
+                if not (ot if nb > nt else ob):
+                    continue
+            else:
+                cb, ct = cut(nb, ob), cut(nt, ot)
+                if cb == ct:
+                    continue
+                if cb is not None and ct is not None and nb == nt:
+                    # 都只引用了它的一部分、行数也一样，可排在引用的行前面的行数不同：引用的不是它同样的那几行
+                    return _Change("unknown", f"{name}两次都引用{cited}，两次都引用了{named(key)}的 {nb} 行，可不是"
+                                              f"它同样的那几行（它排在引用的行前面的，基准运行有 {cb[0]} 行，这次有 "
+                                              f"{ct[0]} 行），取的不是{what}{masked_note}")
+            # 说引用的行外面有它的那一边；两边都有的，说引用得少的那一边
+            if ot and (not ob or nt < nb):
+                where = (f"这次有 {len(ot)} 行在查询结果{_row_numbers(ot)}" if nt
+                         else f"这次仍在查询结果{_row_numbers(ot)}")
+            else:
+                where = (f"在基准运行中有 {len(ob)} 行位于查询结果{_row_numbers(ob)}" if nb
+                         else f"在基准运行中位于查询结果{_row_numbers(ob)}")
+            return _Change("unknown", f"{name}两次都引用{cited}，{named(key)}{where}，不在引用的行里，"
+                                      f"取的不是{what}{masked_note}")
         return None
 
     def _hidden(self, b: Any, t: Any) -> frozenset[str]:
@@ -1488,7 +1605,7 @@ class _Compare:
             self.masked_seen = True
         if measure.lower() in hidden:
             return {**empty, "note": MASKED_MEASURE.format(column=measure)}
-        rb, rt = _records(sb, b.rows), _records(st, t.rows)
+        rb, rt = _attributed_rows(sb, b), _attributed_rows(st, t)
         if rb is None or rt is None:
             return None
         values = (_input_total(b), _input_total(t))
@@ -1652,6 +1769,12 @@ def _rows_text(inp: Any) -> str:
     return "整份结果"
 
 
+def _row_numbers(rows: list[int]) -> str:
+    """快照里的几行（行号从 0 数）写进说明：「第 5 行」「第 5、6 行」，多的写「第 5、6、7 行等」。"""
+    shown = "、".join(str(i + 1) for i in rows[:_ROWS_SHOWN])
+    return f"第 {shown} 行" + ("等" if len(rows) > _ROWS_SHOWN else "")
+
+
 def _columns_text(columns: Any) -> str:
     if isinstance(columns, dict):
         return "「" + "、".join(str(c) for c in columns.values()) + "」"
@@ -1682,6 +1805,14 @@ def _records(snap: dict[str, Any], span: tuple[int, int] | None) -> list[tuple[i
         else:
             return None
     return out
+
+
+def _attributed_rows(snap: dict[str, Any], inp: Any) -> list[tuple[int, dict[str, Any]]] | None:
+    """归因用的行（_attribute 在这些行上认维度、按维度汇总）：数组字段是它引用的那一段行，单格是整份结果（单格按
+    整份结果归因，取的是合计行那一格时再去掉合计行）。_left_out 在同样这些行上再认一遍维度、按它核对引用的是不是同一
+    批维度值：归因按哪组维度说，就按哪组维度核对，两处取行的规则只写在这里。单格核对的是那一行本身，归因不把它和别的
+    行合在一起算，去不去合计行不影响核对。"""
+    return _records(snap, inp.rows)
 
 
 def _kind(snap: dict[str, Any], column: str) -> str | None:

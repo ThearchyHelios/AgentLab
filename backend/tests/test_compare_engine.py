@@ -7,12 +7,18 @@ SQL，Agent 节点 bot 自己再查一次、把各区域的金额作为数组字
   口径效应 + 数据效应 = 总变化（逐位相等）；取不到就不拆，说明缺的是哪一个
 - 维度归因：按维度键配对两边的行，按变化的绝对值取前 10；度量列之和等于输入的值（两边都等）才给占比，占比之和
   为 1；对不上时占比为空并说明；截断的快照不归因，照实写
-- 遮罩列的值绝不出现在结果里；用到遮罩列的指标不拆分
+- 遮罩列的值绝不出现在结果里（只有一边的快照遮了也算遮了）；用到遮罩列的指标不拆分
 - 模板对比：新增、删除的节点，配置有变化的节点和配置项名
 - 输入的出处：合并查询追到它的上游查询；Agent 按出处交的字段还要引用同一列、同一段行（行段相同、一边是整份结果
-  一边不是的不算；都不是整份结果的，一边引用了的区域另一边还在快照里却没引用的也不算）；没按出处交的数、上游数据
-  没变数却变了的、上游的 Agent 两次交出的结果不同的，说不清变化从哪来（incomparable），记不出写入者的只看口径卡
-  之前可能执行过的节点；图里写死的字面量改了、连线变了、读到的默认设置变了都算模板变化
+  一边不是的不算，起止行有一个不同的不算；都不是整份结果的，引用过的每个区域两边要被切在同一处——都整个被引用（一边
+  没有这个区域的算整个被引用），或者都只引用了它同样的那几行（排在引用的行前面的行数、引用的行数都一样，后面剩几行
+  不管）——区域整个挪出去、区域 × 日期的结果里有一天被挤出去、多了一天却只引用了前几天都不算，两边都没引用的区域
+  不管；维度有几列的按几列一起认，归因只按引用的行里分得出的那几列说，就按那几列再核对一遍；单格那一行要是同一个
+  区域的同一行（排在它前面的、这个区域的行数一样）；快照读不出来、有的行和列对不上的说不清）；没按出处交的数、上游
+  数据没变数却变了的、上游的 Agent 两次交出的结果不同的，说不清变化从哪来（incomparable），记不出写入者的只看口径卡
+  之前可能执行过的节点（循环回边连回来的算在它之前，只在一次运行的图里有的节点按两次的图合起来认先后，严格拆分也照
+  这个范围核对）；图里写死的字面量改了、连线变了、读到的默认设置变了都算模板变化；不归因的指标用到遮罩列也在整体
+  说明里提一句
 """
 from __future__ import annotations
 
@@ -38,6 +44,7 @@ from tests.fixtures.compare_runs import (
     NEXT_ROWS,
     REFUND,
     TOOL,
+    TYPES,
     WEEK37,
     Fake,
     amounts_in,
@@ -560,6 +567,20 @@ def test_a_masked_measure_is_not_attributed():
     assert "1200.5" not in json.dumps(east["inputs"]) and "800.0" not in json.dumps(result)
 
 
+def test_a_masked_input_is_noted_even_without_attribution():
+    """取数的 SQL 这次加了筛选（结构变了，不做归因），指标的输入取自遮罩列：整体说明照样提一句有列设了遮罩——输入的值
+    不给，看的人要知道是遮掉了，不是没有。只在归因时才记，不归因的指标就漏了这一句。"""
+    def masked(run):
+        run.masked = {a: frozenset({"gmv"}) for a in run.queries}
+        return run
+    result = run_compare(masked(week("r1")), masked(week("r2", NEXT_ROWS, sql=region_sql(extra=" AND paid = 1"))))
+    metrics = by_id(result)
+    assert {m["classification"] for m in metrics.values()} == {"sql_changed"}
+    assert all(m["attribution"] is None for m in metrics.values())
+    assert metrics["east"]["inputs"][0]["masked"] is True and metrics["east"]["inputs"][0]["base"] is None
+    assert compare.MASKED_NOTE in result["notes"]
+
+
 # --------------------------------------------------------------------------
 # 对不上具体查询的输入、运行输入、一边才有的指标
 # --------------------------------------------------------------------------
@@ -715,6 +736,129 @@ def test_an_unknown_writer_is_looked_for_only_among_nodes_before_the_card():
                              make("r2", NEXT_ROWS, 12, aside="nodes.fetch.rows[:2]")))["calc"]
     assert calc["classification"] == "incomparable"
     assert calc["reasons"] == ["输入「vars.adj」不知道由哪个节点写入，节点「旁路整理」的配置有变化，无法判断变化来源"]
+
+
+def test_an_unknown_writer_inside_a_loop_counts_the_nodes_on_the_loop_back():
+    """口径卡在循环里：循环体是 调整 → 口径卡 → 收尾整理，收尾整理再连回循环。收尾整理在口径卡下游，也在它上游——
+    下一轮的口径卡执行之前，上一轮的收尾整理已经执行过，可能先写了变量。它改了表达式，记不出写入者的输入说不清从哪来，
+    不能当成「只在口径卡之后执行」排除掉（排除了就成了「它上游的节点都没有变化」）；没改的照常是数据变化。"""
+    def make(run_id, rows, value, tail):
+        graph = {"nodes": [node("start", "input", "开始"),
+                           node("fetch", "tool", "区域取数", tool=TOOL, args={"sql": region_sql()}),
+                           node("loop", "loop", "逐周", mode="count", max_iterations=2),
+                           node("calc", "code", "调整", code="x", assign_to="adj"),
+                           node("card", "metrics", "周报口径卡", caliber="周报口径", caliber_version="v1"),
+                           node("tail", "transform", "收尾整理", mode="expression", expression=tail, assign_to="adj2"),
+                           node("out", "output", "成果")],
+                 "edges": [{"source": "start", "target": "fetch"}, {"source": "fetch", "target": "loop"},
+                           {"source": "loop", "target": "calc", "sourceHandle": "body"},
+                           {"source": "calc", "target": "card"}, {"source": "card", "target": "tail"},
+                           {"source": "tail", "target": "loop"},
+                           {"source": "loop", "target": "out", "sourceHandle": "done"}]}
+        run = Fake(run_id, graph=graph)
+        run.tool("fetch", region_sql(), rows=rows)
+        run.code("calc", value, "adj")
+        run.card([metric("calc", "vars.adj * 2", value * 2, [scalar_in("vars.adj", value, None, "state")])])
+        return run
+
+    calc = by_id(run_compare(make("r1", BASE_ROWS, 10, "1"), make("r2", NEXT_ROWS, 12, "2")))["calc"]
+    assert calc["classification"] == "incomparable"
+    assert calc["reasons"] == ["输入「vars.adj」不知道由哪个节点写入，上游节点「收尾整理」的配置有变化，无法判断变化来源"]
+    calc = by_id(run_compare(make("r1", BASE_ROWS, 10, "1"), make("r2", NEXT_ROWS, 12, "1")))["calc"]
+    assert (calc["classification"], calc["reasons"]) == ("data_only", [compare.DATA_FROM_UPSTREAM])
+
+
+def unknown_writer(run_id, rows, value, *, up="上周", aside="上周"):
+    """记不出 vars.adj 是哪个节点写的：开始 → 取数 → 上游分析（Agent）→ 调整 → 口径卡 → 写周报 → 成果，另有一条并行
+    支路 开始 → 旁路分析（Agent）→ 成果。up、aside 是两个 Agent 交出的文字。"""
+    graph = chain(node("start", "input", "开始"),
+                  node("fetch", "tool", "区域取数", tool=TOOL, args={"sql": region_sql()}),
+                  node("up", "agent", "上游分析", prompt="按区域写要点"),
+                  node("calc", "code", "调整", code="x", assign_to="adj"),
+                  node("card", "metrics", "周报口径卡", caliber="周报口径", caliber_version="v1"),
+                  node("write", "report", "写周报"), node("out", "output", "成果"))
+    graph["nodes"].append(node("aside", "agent", "旁路分析", prompt="写一段旁注"))
+    graph["edges"] += [{"source": "start", "target": "aside"}, {"source": "aside", "target": "out"}]
+    run = Fake(run_id, graph=graph)
+    run.tool("fetch", region_sql(), rows=rows)
+    for node_id, text in (("up", up), ("aside", aside)):
+        run.add("node.started", node_id, {"node_type": "agent"})
+        run.add("node.finished", node_id, {"artifact": run.put({"text": text})})
+    run.code("calc", value, "adj")
+    run.card([metric("calc", "vars.adj * 2", value * 2, [scalar_in("vars.adj", value, None, "state")])])
+    return run
+
+
+def test_an_unknown_writer_names_a_node_that_answered_differently_by_where_it_sits():
+    """记不出 vars.adj 是哪个节点写的，有 Agent 两次交出的不同（说不清）：在口径卡上游的说「上游节点」，并行支路上的
+    只说「节点」——它和口径卡不在一条线上，说成上游就指错了位置；写入者不知道，都不能说「它的上游节点」，「它」指不出
+    是谁（写入者知道时才这么说，见 test_a_code_node_after_an_agent_that_answered_differently_is_incomparable）。"""
+    calc = by_id(run_compare(unknown_writer("r1", BASE_ROWS, 10), unknown_writer("r2", NEXT_ROWS, 12, up="本周")))["calc"]
+    assert calc["classification"] == "incomparable"
+    assert calc["reasons"] == ["输入「vars.adj」不知道由哪个节点写入，上游节点「上游分析」（Agent）两次交出的结果不同，"
+                               "无法判断变化是否来自数据"]
+    calc = by_id(run_compare(unknown_writer("r1", BASE_ROWS, 10),
+                             unknown_writer("r2", NEXT_ROWS, 12, aside="本周")))["calc"]
+    assert calc["classification"] == "incomparable"
+    assert calc["reasons"] == ["输入「vars.adj」不知道由哪个节点写入，节点「旁路分析」（Agent）两次交出的结果不同，"
+                               "无法判断变化是否来自数据"]
+    # 两个都交得不同：点名画布上靠前的那个（口径卡上游的上游分析），不是后加在画布末尾的旁路分析
+    calc = by_id(run_compare(unknown_writer("r1", BASE_ROWS, 10),
+                             unknown_writer("r2", NEXT_ROWS, 12, up="本周", aside="本周")))["calc"]
+    assert calc["reasons"] == ["输入「vars.adj」不知道由哪个节点写入，上游节点「上游分析」（Agent）两次交出的结果不同，"
+                               "无法判断变化是否来自数据"]
+
+
+def test_a_split_with_an_unknown_writer_leaves_out_the_card_and_what_follows_it():
+    """口径变了（×2 → ×3、v1 → v2），旧口径用到的 vars.adj 记不出写入者，口径卡下游的写周报两次写得不同：严格拆分
+    核对「输入只是数据变了」时，同样只看口径卡之前可能执行过的节点。口径卡自己改了版本、写周报在它之后执行，都写不了
+    它读到的值，挡不住拆分，也不能点名成来源。"""
+    def make(run_id, rows, value, factor, version, report):
+        graph = chain(node("start", "input", "开始"),
+                      node("fetch", "tool", "区域取数", tool=TOOL, args={"sql": region_sql()}),
+                      node("calc", "code", "调整", code="x", assign_to="adj"),
+                      node("card", "metrics", "周报口径卡", caliber="周报口径", caliber_version=version),
+                      node("write", "report", "写周报"), node("out", "output", "成果"))
+        run = Fake(run_id, graph=graph)
+        run.tool("fetch", region_sql(), rows=rows)
+        run.code("calc", value, "adj")
+        run.card([metric("calc", f"vars.adj * {factor}", value * factor,
+                         [scalar_in("vars.adj", value, None, "state")])], version=version)
+        run.add("node.started", "write", {"node_type": "report"})
+        run.add("node.finished", "write", {"artifact": run.put({"text": report})})
+        return run
+
+    calc = by_id(run_compare(make("r1", BASE_ROWS, 10, 2, "v1", "上周"),
+                             make("r2", NEXT_ROWS, 12, 3, "v2", "本周")))["calc"]
+    assert calc["classification"] == "caliber_and_data"
+    assert calc["reasons"] == ["表达式由「vars.adj * 2」改为「vars.adj * 3」", "口径版本由 v1 改为 v2"]
+    # 20 → 36：口径效应 36 − 24 = 12，数据效应 24 − 20 = 4（24 是旧口径 ×2 配这次的 12）
+    assert calc["decomposition"] == {"caliber_effect": 12, "data_effect": 4, "caliber_rendered": "+12.0元",
+                                     "data_rendered": "+4.0元"}
+    assert calc["decomposition_note"] is None
+
+
+def test_a_node_after_the_card_in_one_run_only_is_still_after_it():
+    """记不出 vars.adj 是哪个节点写的，口径卡下游的写周报只在一次运行的图里有（这次删掉了，或者这次才加上）：按两次
+    运行合起来的图，它在口径卡之后执行，写不了口径卡读到的值，不点名、不挡住数据变化。只按这次的图认先后，删掉的写周报
+    在这次的图里没有连线，就成了「和口径卡不在一条线上」，被说成来源；只按基准运行的图，这次才加上的也一样。"""
+    def make(run_id, rows, value, with_report):
+        nodes = [node("start", "input", "开始"),
+                 node("fetch", "tool", "区域取数", tool=TOOL, args={"sql": region_sql()}),
+                 node("calc", "code", "调整", code="x", assign_to="adj"),
+                 node("card", "metrics", "周报口径卡", caliber="周报口径", caliber_version="v1"),
+                 *([node("write", "report", "写周报")] if with_report else []),
+                 node("out", "output", "成果")]
+        run = Fake(run_id, graph=chain(*nodes))
+        run.tool("fetch", region_sql(), rows=rows)
+        run.code("calc", value, "adj")
+        run.card([metric("calc", "vars.adj * 2", value * 2, [scalar_in("vars.adj", value, None, "state")])])
+        return run
+
+    for label, base, target in (("这次删掉了写周报", make("r1", BASE_ROWS, 10, True), make("r2", NEXT_ROWS, 12, False)),
+                                ("这次才加上写周报", make("r1", BASE_ROWS, 10, False), make("r2", NEXT_ROWS, 12, True))):
+        calc = by_id(run_compare(base, target))["calc"]
+        assert (calc["classification"], calc["reasons"]) == ("data_only", [compare.DATA_FROM_UPSTREAM_SCOPED]), label
 
 
 def test_a_run_input_upstream_of_a_code_node_is_a_parameter_change():
@@ -1069,12 +1213,25 @@ def test_an_agent_citing_other_rows_is_not_a_data_change():
     total = by_id(run_compare(cited("r1"), cited("r2", span=(1, 2))))["total"]
     assert total["classification"] == "incomparable" and total["attribution"] is None
     assert any("行" in r for r in total["reasons"]), total["reasons"]
+    # 起始行一样、只差最后一行（按金额取前 3 改成前 4，多引用的那一行是这次新出现的北区）：同样不是同一组数。只比起始行
+    # 会走到按区域核对，北区只在这次有、算两边都整个被引用，就报成北区多了 400、占比 67%
+    top = region_sql().replace("ORDER BY region", "ORDER BY gmv DESC")
+    total = by_id(run_compare(
+        cited("r1", [["东区", 1200.5, 100.0], ["南区", 800.0, 50.0], ["西区", 600.0, 0.0], ["中区", 30.0, 0.0]],
+              span=(0, 2), sql=top),
+        cited("r2", [["东区", 1500.5, 120.0], ["南区", 700.0, 40.0], ["西区", 600.0, 10.0], ["北区", 400.0, 0.0],
+                     ["中区", 35.0, 0.0]], span=(0, 3), sql=top)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」引用的行由第 1 至 3 行改为第 1 至 4 行，取的不是同一组数"]
     # 两边引用的都是整份结果（这次多了一个区域）：照常是数据变化
     total = by_id(run_compare(cited("r1"), cited("r2", [*NEXT_ROWS, ["北区", 90.0, 0.0]])))["total"]
     assert total["classification"] == "data_only" and total["attribution"]["rows"]
 
 
 #: 按区域排序的结果这次多了北区，排在南区前面，西区挪到第 4 行
+#: 区域列设了遮罩、西区挪出引用的第 1 至 3 行时的说明：只写行号，不写是哪个区域
+MASKED_MOVED = ("Agent「区域分析」两次都引用第 1 至 3 行，其中一个维度值这次仍在查询结果第 4 行，不在引用的行里，"
+                "取的不是同一组数（维度列设了遮罩，不写出是哪个值）")
 WITH_NORTH = [["东区", 1200.5, 100.0], ["北区", 90.0, 0.0], ["南区", 800.0, 50.0], ["西区", 600.0, 0.0]]
 
 
@@ -1127,15 +1284,55 @@ def test_the_same_rows_are_not_the_same_citation_when_a_cited_region_moved_out_o
         (["北区"], None, 700.0, 7.0), (["西区"], 600.0, None, -6.0), (["东区"], 1200.0, 1200.0, 0.0),
         (["南区"], 800.0, 800.0, 0.0)]
     assert sum(exact(r["share"]) for r in rows) == 1
+    # 对照：前 3 名还是那三个区域，只有排在引用的行后面的第 4 名每周不同（中区换成北区）——两边都没引用的区域不进
+    # 核对，照常是数据变化（最常见的取前几名；连它也核对，每周的对比就都说不清了）
+    tail = [["东区", 1300.0, 0.0], ["南区", 700.0, 0.0], ["西区", 650.0, 0.0], ["北区", 20.0, 0.0]]
+    total = by_id(run_compare(cited("r1", before, span=(0, 2), sql=top),
+                              cited("r2", tail, span=(0, 2), sql=top)))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    rows = total["attribution"]["rows"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in rows] == [
+        (["东区"], 1200.0, 1300.0, 2.0), (["南区"], 800.0, 700.0, -2.0), (["西区"], 600.0, 650.0, 1.0)]
+    assert sum(exact(r["share"]) for r in rows) == 1
 
-    # 区域列设了遮罩：不拿它认是哪一区，只能按行号认，遮住的区域名不出现在结果里
+    # 区域列设了遮罩：遮住的区域名不进说明，但照样拿它核对（它是唯一认得出行的那一列，不核对就和真的没有了分不出来）——
+    # 说明只写行号
     def masked(run):
         run.masked = {a: frozenset({"region"}) for a in run.queries}
         return run
     result = run_compare(masked(cited("r1", with_middle, span=(0, 2))), masked(cited("r2", WITH_NORTH, span=(0, 2))))
-    assert by_id(result)["total"]["classification"] == "data_only"
+    total = by_id(result)["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == [MASKED_MOVED]
     text = json.dumps(result, ensure_ascii=False)
     assert all(region not in text for region in ("东区", "南区", "西区", "北区", "中区"))
+
+
+def test_a_mask_on_one_side_only_still_hides_the_column():
+    """只有一边的快照遮了区域列（查询当时设了遮罩，后来撤了；或者反过来）：两边的区域名是同一批字，哪一边遮了都算
+    遮了，不拿它认是哪一区，也不写进说明、归因、整体说明。区域挪出了引用的行（西区落到第 4 行）时，只看基准那一边的
+    遮罩会写出「西区」，只看这次那一边的也会。"""
+    with_middle = [["东区", 1200.5, 100.0], ["南区", 800.0, 50.0], ["西区", 600.0, 0.0], ["中区", 30.0, 0.0]]
+
+    def masked(run):
+        run.masked = {a: frozenset({"region"}) for a in run.queries}
+        return run
+
+    for label, base, target in (
+            ("只有这次运行遮了", cited("r1", with_middle, span=(0, 2)), masked(cited("r2", WITH_NORTH, span=(0, 2)))),
+            ("只有基准运行遮了", masked(cited("r1", with_middle, span=(0, 2))), cited("r2", WITH_NORTH, span=(0, 2)))):
+        result = run_compare(base, target)
+        total = by_id(result)["total"]
+        # 说明、归因、整体说明里都不出现区域名（遮住的那一列的值），整份结果里也不出现
+        for where, part in (("reasons", total["reasons"]), ("attribution", total["attribution"]),
+                            ("notes", result["notes"]), ("整份结果", result)):
+            text = json.dumps(part, ensure_ascii=False)
+            leaked = [r for r in ("东区", "南区", "西区", "北区", "中区") if r in text]
+            assert not leaked, (label, where, leaked)
+        # 照样拿遮住的区域列核对出西区挪出了引用的行，说明只写行号（同上一条用例的遮罩那一段）
+        assert (total["classification"], total["reasons"]) == ("incomparable", [MASKED_MOVED]), label
+        # 整体说明照样提一句有列设了遮罩：归因少了区域这一列，看的人要知道是遮掉了，不是没有
+        assert compare.MASKED_NOTE in result["notes"], label
 
 
 def test_an_input_cites_the_whole_result_only_when_it_covers_every_row():
@@ -1179,31 +1376,617 @@ def test_cited_rows_on_an_unreadable_snapshot_are_not_taken_as_the_same():
     assert total["reasons"] == ["Agent「区域分析」引用的行由第 1 至 3 行改为第 2 至 3 行，取的不是同一组数"]
 
 
+def element(run_id, rows, span, *, index=0, sql=None, columns=COLUMNS, types=TYPES):
+    """口径卡取 Agent 数组字段 amounts 的第 index 个元素（默认 vars.kpi.amounts[0]）：落在快照上的是 Agent 交的行段的
+    第 span[0] + index 行。sql、columns、types 换查询的形状（默认是按区域汇总的那条）。指标的 id 总是 first。"""
+    run = Fake(run_id)
+    sql = sql or region_sql()
+    run.tool("fetch", sql, columns, rows, types=types)
+    bot = run.agent("bot", sql, columns, rows, types=types, span=span)
+    row, at = span[0] + index, columns.index("gmv")
+    item = {"path": f"vars.kpi.amounts[{index}]", "value": rows[row][at], "node_id": "bot", "via": "agent_field",
+            "field": f"amounts[{index}]", "ref": f"Q1.r{row}.gmv", "artifact": bot,
+            "locator": {"row": row, "column": "gmv"}, "eid": f"ev:cell:{bot[:8]}:{row}:gmv", "status": "verified"}
+    run.card([metric("first", f"vars.kpi.amounts[{index}]", rows[row][at], [item])])
+    return run
+
+
 def test_an_element_of_a_cited_array_follows_its_row():
     """口径卡取 Agent 数组字段里的第一个元素：Agent 交的行段换了起点，第一个元素落到了别的行，不是同一个数；起点没变
     的照常是数据变化。"""
-    def make(run_id, rows, span):
-        run = Fake(run_id)
-        run.tool("fetch", region_sql(), rows=rows)
-        bot = run.agent("bot", region_sql(), rows=rows, span=span)
-        row = span[0]
-        item = {"path": "vars.kpi.amounts[0]", "value": rows[row][1], "node_id": "bot", "via": "agent_field",
-                "field": "amounts[0]", "ref": f"Q1.r{row}.gmv", "artifact": bot,
-                "locator": {"row": row, "column": "gmv"}, "eid": f"ev:cell:{bot[:8]}:{row}:gmv", "status": "verified"}
-        run.card([metric("first", "vars.kpi.amounts[0]", rows[row][1], [item])])
-        return run
-
-    first = by_id(run_compare(make("r1", BASE_ROWS, (0, 2)), make("r2", NEXT_ROWS, (1, 2))))["first"]
+    first = by_id(run_compare(element("r1", BASE_ROWS, (0, 2)), element("r2", NEXT_ROWS, (1, 2))))["first"]
     assert first["classification"] == "incomparable"
     assert first["reasons"] == ["Agent「区域分析」引用的行由第 1 行改为第 2 行，取的不是同一个数"]
-    first = by_id(run_compare(make("r1", BASE_ROWS, (0, 2)), make("r2", NEXT_ROWS, (0, 2))))["first"]
+    first = by_id(run_compare(element("r1", BASE_ROWS, (0, 2)), element("r2", NEXT_ROWS, (0, 2))))["first"]
     assert (first["classification"], first["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
     # 起点没变，可这次北区排在了第一行：基准运行取的是东区，东区这次还在第 2 行，取的不是同一个数
-    first = by_id(run_compare(make("r1", BASE_ROWS, (0, 2)),
-                              make("r2", [["北区", 90.0, 0.0], *NEXT_ROWS], (0, 3))))["first"]
+    first = by_id(run_compare(element("r1", BASE_ROWS, (0, 2)),
+                              element("r2", [["北区", 90.0, 0.0], *NEXT_ROWS], (0, 3))))["first"]
     assert first["classification"] == "incomparable"
     assert first["reasons"] == ["Agent「区域分析」两次都引用第 1 行，「东区」这次仍在查询结果第 2 行，不在引用的行里，"
                                 "取的不是同一个数"]
+    # 反方向：基准运行北区排在第 1 行、东区在第 2 行，这次北区没了、东区到了第 1 行。这次取的东区在基准运行的快照里，
+    # 只是不在这一行，同样不是同一个数（只查「基准运行取的北区这次还在不在」，北区这次没了，会把北区 90 和东区
+    # 1500.5 当成同一个数报成数据变化）
+    first = by_id(run_compare(element("r1", [["北区", 90.0, 0.0], *BASE_ROWS], (0, 3)),
+                              element("r2", NEXT_ROWS, (0, 2))))["first"]
+    assert first["classification"] == "incomparable" and first["attribution"] is None
+    assert first["reasons"] == ["Agent「区域分析」两次都引用第 1 行，「东区」在基准运行中位于查询结果第 2 行，不在引用的"
+                                "行里，取的不是同一个数"]
+
+
+def test_an_element_on_an_unreadable_snapshot_is_not_taken_as_the_same():
+    """口径卡取 Agent 数组字段的第一个元素，两次都是第 1 行，可有一边 Agent 那次查询的快照读不出来：那一行两次是不是
+    同一个区域核对不了（这次北区排到了第 1 行，东区挪到第 2 行），不能按行号当成同一个数报成数据变化。行段遇到同样
+    情况说不清（test_cited_rows_on_an_unreadable_snapshot_are_not_taken_as_the_same），单格一样说不清。"""
+    def unreadable(run):
+        del run.store[run.queries[1]]          # Agent 那次查询的快照文件不在了
+        return run
+
+    north = [["北区", 90.0, 0.0], *NEXT_ROWS]
+    first = by_id(run_compare(element("r1", BASE_ROWS, (0, 2)), unreadable(element("r2", north, (0, 3)))))["first"]
+    assert first["classification"] == "incomparable" and first["attribution"] is None
+    assert first["reasons"] == ["这次运行的查询快照无法读取，无法核对 Agent「区域分析」两次引用的第 1 行是不是同一个维度值"]
+    first = by_id(run_compare(unreadable(element("r1", BASE_ROWS, (0, 2))), element("r2", north, (0, 3))))["first"]
+    assert first["classification"] == "incomparable" and first["attribution"] is None
+    assert first["reasons"] == ["基准运行的查询快照无法读取，无法核对 Agent「区域分析」两次引用的第 1 行是不是同一个维度值"]
+
+
+def test_cited_rows_on_a_snapshot_with_misshapen_rows_are_not_taken_as_the_same():
+    """有一边的快照里有一行的格数和列对不上（引用的行外面那一行少了一格）：认不出各行是哪个区域，引用的是不是同一批
+    区域核对不了，和快照读不出来一样说不清，不退回按行号认（这次北区排进了前 3，西区挪到了第 4 行，按行号认会把西区
+    算成「数据没了」）。两个方向都是。"""
+    with_middle = [["东区", 1200.5, 100.0], ["南区", 800.0, 50.0], ["西区", 600.0, 0.0], ["中区", 30.0, 0.0]]
+    broken = [*WITH_NORTH[:3], ["西区", 600.0]]
+    total = by_id(run_compare(cited("r1", with_middle, span=(0, 2)), cited("r2", broken, span=(0, 2))))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["这次运行的查询快照里有的行和列对不上，无法核对 Agent「区域分析」两次引用的第 1 至 3 行"
+                                "是不是同一批维度值"]
+    total = by_id(run_compare(cited("r1", broken, span=(0, 2)), cited("r2", with_middle, span=(0, 2))))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["基准运行的查询快照里有的行和列对不上，无法核对 Agent「区域分析」两次引用的第 1 至 3 行"
+                                "是不是同一批维度值"]
+
+
+#: 区域 × 日期的结果：日期按设计不当维度（每期都不同，见 _dimensions），一个区域占几行
+BY_DAY_SQL = "SELECT region, day, SUM(amount) AS gmv FROM orders GROUP BY region, day ORDER BY region, day"
+BY_DAY_COLUMNS = ["region", "day", "gmv"]
+BY_DAY_TYPES = {"region": "text", "day": "date", "gmv": "number"}
+#: 基准运行：东、南、西各两天，Agent 引用第 1 至 4 行（东区、南区各两行）
+BY_DAY_BASE = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 100.0], ["南区", "2026-09-01", 50.0],
+               ["南区", "2026-09-02", 50.0], ["西区", "2026-09-01", 30.0], ["西区", "2026-09-02", 30.0]]
+
+
+def by_day(run_id, rows, *, span=(0, 3), sql=BY_DAY_SQL, columns=BY_DAY_COLUMNS, types=BY_DAY_TYPES, masked=()):
+    """Agent 按出处交回一段行的金额（默认第 1 至 4 行），口径卡求和。masked 是这次运行每份快照都遮的列。"""
+    run = Fake(run_id)
+    run.tool("fetch", sql, columns, rows, types=types)
+    bot = run.agent("bot", sql, columns, rows, types=types, span=span)
+    first, last = span
+    at = columns.index("gmv")
+    run.card([metric("total", "sum(vars.kpi.amounts)", sum(r[at] for r in rows[first:last + 1]),
+                     [amounts_in(bot, rows, span=span)])])
+    if masked:
+        run.masked = {a: frozenset(masked) for a in run.queries}
+    return run
+
+
+def test_a_region_partly_pushed_out_of_the_cited_rows_is_not_the_same_citation():
+    """一个区域占几行（区域 × 日期）：两次都引用第 1 至 4 行，东区这次多了一天，把南区的第二天挤到了第 5 行——它还在
+    快照里，只是没被引用。只看「引用的行里有没有南区」两边都有，查不出来；按区域数两边各引用了几行，南区这次少引用了
+    一行、快照里引用的行外面还有南区的行，取的就不是同一组数，不能把南区说成少了一半（占比还会是 -100%）。反过来
+    （基准运行里南区有一行在引用的行外面）也一样。南区这次真的只有一天的，照常是数据变化。"""
+    more = [["东区", "2026-09-07", 100.0], ["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0],
+            ["南区", "2026-09-08", 50.0], ["南区", "2026-09-09", 50.0], ["西区", "2026-09-08", 30.0],
+            ["西区", "2026-09-09", 30.0]]
+    total = by_id(run_compare(by_day("r1", BY_DAY_BASE), by_day("r2", more)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」这次有 1 行在查询结果第 5 行，不在引用"
+                                "的行里，取的不是同一组数"]
+    total = by_id(run_compare(by_day("r1", more), by_day("r2", BY_DAY_BASE)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」在基准运行中有 1 行位于查询结果第 5 行，"
+                                "不在引用的行里，取的不是同一组数"]
+    # 北区这次排了进来，同样把南区的第二天挤到第 5 行
+    north = [["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0], ["北区", "2026-09-08", 10.0],
+             ["南区", "2026-09-08", 50.0], ["南区", "2026-09-09", 50.0], ["西区", "2026-09-08", 30.0]]
+    total = by_id(run_compare(by_day("r1", BY_DAY_BASE), by_day("r2", north)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」这次有 1 行在查询结果第 5 行，不在引用"
+                                "的行里，取的不是同一组数"]
+    # 北区两天都排了进来，南区整个挤出了引用的行：几行都写出来
+    both = [["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0], ["北区", "2026-09-08", 10.0],
+            ["北区", "2026-09-09", 10.0], ["南区", "2026-09-08", 50.0], ["南区", "2026-09-09", 50.0]]
+    total = by_id(run_compare(by_day("r1", BY_DAY_BASE), by_day("r2", both)))["total"]
+    assert total["classification"] == "incomparable"
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」这次仍在查询结果第 5、6 行，不在引用的"
+                                "行里，取的不是同一组数"]
+    # 东区多了一天、南区也多了一天：南区只引用了一天，两天挤在外面，挤出去的几行都写出来（写的是在外面的行数，不是
+    # 少引用的行数）；反过来（基准运行里南区有两行在外面）也是
+    crowded = [["东区", "2026-09-07", 100.0], ["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0],
+               ["南区", "2026-09-07", 50.0], ["南区", "2026-09-08", 50.0], ["南区", "2026-09-09", 50.0],
+               ["西区", "2026-09-08", 30.0]]
+    total = by_id(run_compare(by_day("r1", BY_DAY_BASE), by_day("r2", crowded)))["total"]
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」这次有 2 行在查询结果第 5、6 行，不在"
+                                "引用的行里，取的不是同一组数"]
+    total = by_id(run_compare(by_day("r1", crowded), by_day("r2", BY_DAY_BASE)))["total"]
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」在基准运行中有 2 行位于查询结果第 5、6 "
+                                "行，不在引用的行里，取的不是同一组数"]
+    # 挤出去的行多时只列前 3 个行号，后面写「等」（几十行全列出来说明就读不下去了）；正好 3 行的全列出来，不写「等」
+    assert compare._row_numbers([4, 5, 6, 7]) == "第 5、6、7 行等"
+    assert compare._row_numbers([4, 5, 6]) == "第 5、6、7 行"
+    # 对照：南区这次真的只有一天（快照里引用的行外面没有南区）：照常是数据变化，按区域归因，占比之和为 1
+    gone = [["东区", "2026-09-07", 100.0], ["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0],
+            ["南区", "2026-09-08", 50.0], ["西区", "2026-09-08", 30.0], ["西区", "2026-09-09", 30.0]]
+    total = by_id(run_compare(by_day("r1", BY_DAY_BASE), by_day("r2", gone)))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    rows = total["attribution"]["rows"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in rows] == [
+        (["东区"], 200.0, 300.0, 2.0), (["南区"], 100.0, 50.0, -1.0)]
+    assert sum(exact(r["share"]) for r in rows) == 1
+
+
+def test_a_masked_column_beside_the_region_is_spoken_of_by_row_number():
+    """经理列设了遮罩、区域列没有：只按区域认，一个区域有几位经理就占几行。南区这次有一行挤出了引用的行，说明里只写
+    区域和行号，不写遮住的经理名；经理列也不拿来认是哪一行（拿来认、写出「南区 / 经理丁」就把遮住的那一格说出去了）。"""
+    sql = "SELECT region, manager, SUM(amount) AS gmv FROM orders GROUP BY region, manager ORDER BY region, manager"
+    columns = ["region", "manager", "gmv"]
+    types = {"region": "text", "manager": "text", "gmv": "number"}
+    base = [["东区", "经理甲", 100.0], ["东区", "经理乙", 100.0], ["南区", "经理丙", 50.0], ["南区", "经理丁", 50.0],
+            ["西区", "经理戊", 30.0]]
+    this = [["东区", "经理甲", 110.0], ["东区", "经理乙", 100.0], ["东区", "经理庚", 20.0], ["南区", "经理丙", 50.0],
+            ["南区", "经理丁", 50.0], ["西区", "经理戊", 30.0]]
+    shape = {"sql": sql, "columns": columns, "types": types, "masked": {"manager"}}
+    result = run_compare(by_day("r1", base, **shape), by_day("r2", this, **shape))
+    total = by_id(result)["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」这次有 1 行在查询结果第 5 行，不在引用"
+                                "的行里，取的不是同一组数"]
+    text = json.dumps(result, ensure_ascii=False)
+    assert not [name for name in ("经理甲", "经理乙", "经理丙", "经理丁", "经理戊", "经理庚") if name in text]
+
+
+def test_a_region_cited_whole_on_one_side_and_partly_on_the_other_is_not_the_same_citation():
+    """一个区域在一边整个被引用、在另一边只引用了一部分（其余的行还在快照里，在引用的行外面）：引用的行数没变少、甚至
+    变多了，也不是同一组数。南区这次三天，引用的第 1 至 4 行只盖住了前两天，第三天（200）在第 5 行：按引用的行算南区是
+    100 → 20，快照里南区却是 220——归因会说南区少了 80，正负号都反了，还和「南区这次真的只有两天」的输出一字不差。东区
+    这次真的少了一天、南区引用了三天（比基准还多一天）、第四天在外面的也是；反方向（基准运行里南区有一天在引用的行
+    外面、这次整个被引用）也一样。对照：南区真的只有引用的那几天，照常是数据变化，按区域归因，占比之和为 1。"""
+    def attributed(base_rows, target_rows):
+        total = by_id(run_compare(by_day("r1", base_rows), by_day("r2", target_rows)))["total"]
+        assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+        rows = total["attribution"]["rows"]
+        assert sum(exact(r["share"]) for r in rows) == 1
+        return [(r["key"], r["base"], r["target"], r["share"]) for r in rows]
+
+    three = [["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0], ["南区", "2026-09-08", 10.0],
+             ["南区", "2026-09-09", 10.0], ["南区", "2026-09-10", 200.0], ["西区", "2026-09-08", 30.0],
+             ["西区", "2026-09-09", 30.0]]
+    total = by_id(run_compare(by_day("r1", BY_DAY_BASE), by_day("r2", three)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」这次有 1 行在查询结果第 5 行，不在引用"
+                                "的行里，取的不是同一组数"]
+    # 对照：南区这次真的只有两天（10、10）
+    assert attributed(BY_DAY_BASE, three[:4] + three[5:]) == [
+        (["南区"], 100.0, 20.0, 1.0), (["东区"], 200.0, 200.0, 0.0)]
+
+    # 东区这次真的少了一天；南区四天，引用了三天（比基准还多一天），第四天在第 5 行
+    four = [["东区", "2026-09-08", 100.0], ["南区", "2026-09-07", 50.0], ["南区", "2026-09-08", 50.0],
+            ["南区", "2026-09-09", 50.0], ["南区", "2026-09-10", 50.0], ["西区", "2026-09-08", 30.0]]
+    total = by_id(run_compare(by_day("r1", BY_DAY_BASE), by_day("r2", four)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」这次有 1 行在查询结果第 5 行，不在引用"
+                                "的行里，取的不是同一组数"]
+    # 对照：南区这次真的只有三天
+    assert attributed(BY_DAY_BASE, four[:4] + four[5:]) == [
+        (["东区"], 200.0, 100.0, 2.0), (["南区"], 100.0, 150.0, -1.0)]
+
+    # 反方向：基准运行南区三天，第三天（500）在第 5 行；这次南区两天都被引用。按引用的行算是 100 → 120，基准的南区
+    # 实际是 600
+    base3 = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 100.0], ["南区", "2026-09-01", 50.0],
+             ["南区", "2026-09-02", 50.0], ["南区", "2026-09-03", 500.0], ["西区", "2026-09-01", 30.0]]
+    now = [["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0], ["南区", "2026-09-08", 60.0],
+           ["南区", "2026-09-09", 60.0], ["西区", "2026-09-08", 30.0]]
+    total = by_id(run_compare(by_day("r1", base3), by_day("r2", now)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」在基准运行中有 1 行位于查询结果第 5 行，"
+                                "不在引用的行里，取的不是同一组数"]
+    # 对照：基准运行南区真的只有两天
+    assert attributed(base3[:4] + base3[5:], now) == [
+        (["南区"], 100.0, 120.0, 1.0), (["东区"], 200.0, 200.0, 0.0)]
+
+
+def test_a_region_cut_at_the_same_place_on_both_sides_is_the_same_citation():
+    """两边都只引用了南区的一部分、引用的行数也一样：行段在同一处切开了南区（两次都是第 3 行被引用、第 4 行在外面），
+    取的是同一组数（南区的第一天），照常是数据变化，按区域归因，占比之和为 1——不能因为南区有行在引用的行外面就一概
+    说不清，每周结构一样的对比就都比不了了。引用的行数不一样的（一边引用了南区两天、另一边一天）切在了不同处，不是
+    同一组数，说引用得少、有行在外面的那一边。两个区域都切法不同时，说基准运行引用的行里先出现的那个。"""
+    before = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 100.0], ["南区", "2026-09-01", 50.0],
+              ["南区", "2026-09-02", 50.0], ["西区", "2026-09-01", 30.0]]
+    after = [["东区", "2026-09-08", 120.0], ["东区", "2026-09-09", 110.0], ["南区", "2026-09-08", 40.0],
+             ["南区", "2026-09-09", 50.0], ["西区", "2026-09-08", 30.0]]
+    total = by_id(run_compare(by_day("r1", before, span=(0, 2)), by_day("r2", after, span=(0, 2))))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    rows = total["attribution"]["rows"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in rows] == [
+        (["东区"], 200.0, 230.0, 1.5), (["南区"], 50.0, 40.0, -0.5)]
+    assert sum(exact(r["share"]) for r in rows) == 1
+    # 切在哪儿只看排在引用的行前面的行数、引用的行数，不看后面还剩几行：南区这次多了一天、排在引用的行后面（后面
+    # 剩两天，基准运行剩一天），引用的仍是南区的第一天，照常是数据变化
+    longer = after[:4] + [["南区", "2026-09-10", 60.0]] + after[4:]
+    total = by_id(run_compare(by_day("r1", before, span=(0, 2)), by_day("r2", longer, span=(0, 2))))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    rows = total["attribution"]["rows"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in rows] == [
+        (["东区"], 200.0, 230.0, 1.5), (["南区"], 50.0, 40.0, -0.5)]
+
+    # 两边都只引用了南区的一部分、后面都剩一天，引用的行数却不同（基准运行两天，这次东区少了一天、南区引用了三天）：
+    # 切在了不同处。两边都有一行在外面，说引用得少的基准运行
+    base3 = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 100.0], ["南区", "2026-09-01", 50.0],
+             ["南区", "2026-09-02", 50.0], ["南区", "2026-09-03", 500.0], ["西区", "2026-09-01", 30.0]]
+    now3 = [["东区", "2026-09-08", 100.0], ["南区", "2026-09-07", 50.0], ["南区", "2026-09-08", 50.0],
+            ["南区", "2026-09-09", 50.0], ["南区", "2026-09-10", 500.0], ["西区", "2026-09-08", 30.0]]
+    total = by_id(run_compare(by_day("r1", base3), by_day("r2", now3)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」在基准运行中有 1 行位于查询结果第 5 行，"
+                                "不在引用的行里，取的不是同一组数"]
+    # 南区在基准运行里一行都没被引用（两天都在外面），这次引用了两天、还有一天在外面：说引用得少的基准运行，写它在
+    # 外面的那两行
+    east4 = [["东区", f"2026-09-0{d}", 100.0] for d in range(1, 5)] + [["南区", "2026-09-01", 50.0],
+                                                                         ["南区", "2026-09-02", 50.0]]
+    south3 = [["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0], ["南区", "2026-09-08", 50.0],
+              ["南区", "2026-09-09", 50.0], ["南区", "2026-09-10", 50.0]]
+    total = by_id(run_compare(by_day("r1", east4), by_day("r2", south3)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」在基准运行中位于查询结果第 5、6 行，不在"
+                                "引用的行里，取的不是同一组数"]
+
+    # 东区这次少了一天，南区引用了两天、第三天在第 4 行；基准运行只引用了南区一天、第二天在第 4 行：基准引用得少
+    more = [["东区", "2026-09-08", 100.0], ["南区", "2026-09-07", 50.0], ["南区", "2026-09-08", 50.0],
+            ["南区", "2026-09-09", 50.0], ["西区", "2026-09-08", 30.0]]
+    total = by_id(run_compare(by_day("r1", before, span=(0, 2)), by_day("r2", more, span=(0, 2))))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 3 行，「南区」在基准运行中有 1 行位于查询结果第 4 行，"
+                                "不在引用的行里，取的不是同一组数"]
+    # 反过来，这次引用得少
+    total = by_id(run_compare(by_day("r1", more, span=(0, 2)), by_day("r2", before, span=(0, 2))))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 3 行，「南区」这次有 1 行在查询结果第 4 行，不在引用"
+                                "的行里，取的不是同一组数"]
+
+    # 按金额取前 3 行：基准运行东区两天都在前 3、南区一天；这次南区两天都在前 3、东区一天。东区、南区都切法不同，
+    # 说基准运行引用的行里先出现的东区，不是这次先出现的南区
+    top = BY_DAY_SQL.replace("ORDER BY region, day", "ORDER BY gmv DESC")
+    ranked_before = [["东区", "2026-09-01", 300.0], ["南区", "2026-09-01", 250.0], ["东区", "2026-09-02", 200.0],
+                     ["南区", "2026-09-02", 100.0], ["西区", "2026-09-01", 50.0]]
+    ranked_after = [["南区", "2026-09-08", 320.0], ["东区", "2026-09-08", 300.0], ["南区", "2026-09-09", 260.0],
+                    ["东区", "2026-09-09", 150.0], ["西区", "2026-09-08", 60.0]]
+    total = by_id(run_compare(by_day("r1", ranked_before, span=(0, 2), sql=top),
+                              by_day("r2", ranked_after, span=(0, 2), sql=top)))["total"]
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 3 行，「东区」这次有 1 行在查询结果第 4 行，不在引用"
+                                "的行里，取的不是同一组数"]
+
+
+def test_a_region_cut_on_other_rows_of_it_is_not_the_same_citation():
+    """引用的行不从第 1 行开始（按金额排的第 2 至 4 行）：两边都只引用了东区的一行，行数一样，可基准运行引用的是东区
+    金额第二高的那天（最高的那天排在引用的行前面），这次是最高的那天（第二高的排在后面）——引用的不是它同样的那几行，
+    东区按引用的行算是 250 → 300，东区两天的合计却是 550 → 400。要按查询结果的先后数清引用的是它的第几行：排在引用的
+    行前面的行数一样、引用的行数也一样，才是同样那几行。对照：两次都是东区第二高的那天被引用，照常是数据变化。"""
+    top = BY_DAY_SQL.replace("ORDER BY region, day", "ORDER BY gmv DESC")
+    before = [["东区", "2026-09-01", 300.0], ["东区", "2026-09-02", 250.0], ["南区", "2026-09-01", 200.0],
+              ["南区", "2026-09-02", 150.0], ["西区", "2026-09-01", 50.0]]
+    after = [["西区", "2026-09-08", 400.0], ["南区", "2026-09-08", 350.0], ["南区", "2026-09-09", 320.0],
+             ["东区", "2026-09-08", 300.0], ["东区", "2026-09-09", 100.0]]
+    total = by_id(run_compare(by_day("r1", before, span=(1, 3), sql=top),
+                              by_day("r2", after, span=(1, 3), sql=top)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 2 至 4 行，两次都引用了「东区」的 1 行，可不是它同样的"
+                                "那几行（它排在引用的行前面的，基准运行有 1 行，这次有 0 行），取的不是同一组数"]
+    # 排在前面的行数要数清，不只看有没有：基准运行引用的是东区第三高的那天（前面有 2 行），这次是第二高的那天（前面
+    # 有 1 行）
+    third = [["东区", "2026-09-01", 300.0], ["东区", "2026-09-02", 280.0], ["东区", "2026-09-03", 250.0],
+             ["南区", "2026-09-01", 200.0], ["西区", "2026-09-01", 50.0]]
+    second = [["东区", "2026-09-08", 320.0], ["西区", "2026-09-08", 300.0], ["东区", "2026-09-09", 260.0],
+              ["南区", "2026-09-08", 210.0], ["东区", "2026-09-10", 100.0]]
+    total = by_id(run_compare(by_day("r1", third, span=(2, 3), sql=top),
+                              by_day("r2", second, span=(2, 3), sql=top)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 3 至 4 行，两次都引用了「东区」的 1 行，可不是它同样的"
+                                "那几行（它排在引用的行前面的，基准运行有 2 行，这次有 1 行），取的不是同一组数"]
+    # 说明里的「引用了它几行」是引用的行里的行数，不是它在外面的行数：基准运行东区在外面有两行（前一后一），引用的
+    # 仍是一行
+    around = [["东区", "2026-09-01", 300.0], ["东区", "2026-09-02", 250.0], ["南区", "2026-09-01", 200.0],
+              ["东区", "2026-09-03", 100.0]]
+    shifted = [["西区", "2026-09-08", 400.0], ["东区", "2026-09-08", 300.0], ["南区", "2026-09-08", 250.0],
+               ["东区", "2026-09-09", 200.0]]
+    total = by_id(run_compare(by_day("r1", around, span=(1, 2), sql=top),
+                              by_day("r2", shifted, span=(1, 2), sql=top)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 2 至 3 行，两次都引用了「东区」的 1 行，可不是它同样的"
+                                "那几行（它排在引用的行前面的，基准运行有 1 行，这次有 0 行），取的不是同一组数"]
+    # 对照：两次都是东区第二高的那天被引用（最高的那天都排在前面）
+    same = [["东区", "2026-09-08", 320.0], ["东区", "2026-09-09", 260.0], ["南区", "2026-09-08", 210.0],
+            ["南区", "2026-09-09", 140.0], ["西区", "2026-09-08", 60.0]]
+    total = by_id(run_compare(by_day("r1", before, span=(1, 3), sql=top),
+                              by_day("r2", same, span=(1, 3), sql=top)))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    rows = total["attribution"]["rows"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in rows] == [
+        (["东区"], 250.0, 260.0, 1.0), (["南区"], 350.0, 350.0, 0.0)]
+    assert sum(exact(r["share"]) for r in rows) == 1
+
+
+def test_a_region_on_one_side_only_counts_as_cited_whole_where_it_is_missing():
+    """只在一边的快照里有的区域（这次新出现，或者这次没有了）：没有它的那一边算整个被引用——没什么可漏的。另一边它只
+    被引用了一部分、还有行在引用的行外面的，切法不同，也不是同一组数：北区这次新出现、三天里只引用了两天，按引用的行
+    算北区是 20，快照里是 30，和「北区这次真的只有两天」的输出一字不差；基准运行里南区只引用了一天、另一天在外面，这次
+    南区没有了，归因会说南区少了 50，基准的南区实际是 100。对照：新出现、没有了的区域整个被引用的，照常是数据变化，
+    按区域归因，占比之和为 1。"""
+    # 南区这次没有了；北区新出现三天，引用的第 1 至 4 行盖住了前两天，第三天在第 5 行
+    north = [["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0], ["北区", "2026-09-07", 10.0],
+             ["北区", "2026-09-08", 10.0], ["北区", "2026-09-09", 10.0], ["西区", "2026-09-08", 30.0],
+             ["西区", "2026-09-09", 30.0]]
+    total = by_id(run_compare(by_day("r1", BY_DAY_BASE), by_day("r2", north)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「北区」这次有 1 行在查询结果第 5 行，不在引用"
+                                "的行里，取的不是同一组数"]
+    # 对照：北区这次真的只有两天
+    total = by_id(run_compare(by_day("r1", BY_DAY_BASE), by_day("r2", north[:4] + north[5:])))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    rows = total["attribution"]["rows"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in rows] == [
+        (["南区"], 100.0, None, 1.25), (["北区"], None, 20.0, -0.25), (["东区"], 200.0, 200.0, 0.0)]
+    assert sum(exact(r["share"]) for r in rows) == 1
+
+    # 基准运行引用第 1 至 3 行，南区只引用了一天、第二天在第 4 行；这次南区没有了，新出现的北区排在东区后面
+    before = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 100.0], ["南区", "2026-09-01", 50.0],
+              ["南区", "2026-09-02", 50.0], ["西区", "2026-09-01", 30.0]]
+    after = [["东区", "2026-09-08", 120.0], ["东区", "2026-09-09", 110.0], ["北区", "2026-09-08", 30.0],
+             ["西区", "2026-09-08", 30.0]]
+    total = by_id(run_compare(by_day("r1", before, span=(0, 2)), by_day("r2", after, span=(0, 2))))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 3 行，「南区」在基准运行中有 1 行位于查询结果第 4 行，"
+                                "不在引用的行里，取的不是同一组数"]
+    # 对照：基准运行南区真的只有一天（整个被引用）
+    total = by_id(run_compare(by_day("r1", before[:3] + before[4:], span=(0, 2)),
+                              by_day("r2", after, span=(0, 2))))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    rows = total["attribution"]["rows"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in rows] == [
+        (["南区"], 50.0, None, -5.0), (["东区"], 200.0, 230.0, 3.0), (["北区"], None, 30.0, 3.0)]
+    assert sum(exact(r["share"]) for r in rows) == 1
+
+
+#: 区域 × 渠道的结果按金额从大到小排：两列都是维度
+BY_CHANNEL = {"sql": "SELECT region, channel, SUM(amount) AS gmv FROM orders GROUP BY region, channel "
+                     "ORDER BY gmv DESC",
+              "columns": ["region", "channel", "gmv"], "types": {"region": "text", "channel": "text", "gmv": "number"}}
+
+
+def test_dimension_values_are_told_apart_by_every_dimension_column():
+    """维度有两列（区域、渠道）：按两列一起认是哪个维度值。按金额取前 3 行，南区 / 线上这次落到第 4 行（还在快照里），
+    南区 / 线下排了进来。只按区域认，南区两次都是一行被引用、一行在外面，看着切法一样，会报成数据变化（南区 / 线下
+    占 700%、南区 / 线上占 -600%）；说明里两列的值都写出来。对照：南区 / 线上这次真的没有了，新出现的西区 / 线上排进了
+    前 3，照常是数据变化，按两列归因，占比之和为 1。
+
+    区域列在一边只有一个值也拿来认（基准运行的结果只有东区）：两边各自都只有一个值的才分不出维度。这次北区排到第一，
+    东区有两天挤出了引用的前 2 行，不拿区域认就成了按行号认、报成数据变化。"""
+    before = [["东区", "线上", 500.0], ["东区", "线下", 400.0], ["南区", "线上", 300.0], ["南区", "线下", 100.0]]
+    after = [["东区", "线上", 500.0], ["东区", "线下", 400.0], ["南区", "线下", 350.0], ["南区", "线上", 200.0]]
+    total = by_id(run_compare(by_day("r1", before, span=(0, 2), **BY_CHANNEL),
+                              by_day("r2", after, span=(0, 2), **BY_CHANNEL)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 3 行，「南区 / 线上」这次仍在查询结果第 4 行，不在引用"
+                                "的行里，取的不是同一组数"]
+    gone = [["东区", "线上", 500.0], ["东区", "线下", 400.0], ["西区", "线上", 350.0], ["南区", "线下", 100.0]]
+    total = by_id(run_compare(by_day("r1", before, span=(0, 2), **BY_CHANNEL),
+                              by_day("r2", gone, span=(0, 2), **BY_CHANNEL)))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    attribution = total["attribution"]
+    assert attribution["columns"] == ["region", "channel"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in attribution["rows"]] == [
+        (["西区", "线上"], None, 350.0, 7.0), (["南区", "线上"], 300.0, None, -6.0),
+        (["东区", "线上"], 500.0, 500.0, 0.0), (["东区", "线下"], 400.0, 400.0, 0.0)]
+    assert sum(exact(r["share"]) for r in attribution["rows"]) == 1
+
+    top = BY_DAY_SQL.replace("ORDER BY region, day", "ORDER BY gmv DESC")
+    only_east = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 90.0], ["东区", "2026-09-03", 80.0]]
+    north_first = [["北区", "2026-09-08", 200.0], ["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 95.0],
+                   ["东区", "2026-09-10", 85.0]]
+    total = by_id(run_compare(by_day("r1", only_east, span=(0, 1), sql=top),
+                              by_day("r2", north_first, span=(0, 1), sql=top)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 2 行，「东区」这次有 2 行在查询结果第 3、4 行，不在"
+                                "引用的行里，取的不是同一组数"]
+    # 引用的行两边都只有东区、只有这次的整份结果里多了北区：区域要按两边整份结果认（只看基准运行的行，或者只看引用的
+    # 行，都认不出区域，退回按行号认）。基准运行东区三天只引用了前两天，这次东区两天都被引用，切法不同
+    east3 = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 90.0], ["东区", "2026-09-03", 80.0]]
+    east2 = [["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 95.0], ["北区", "2026-09-08", 85.0]]
+    total = by_id(run_compare(by_day("r1", east3, span=(0, 1)), by_day("r2", east2, span=(0, 1))))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 2 行，「东区」在基准运行中有 1 行位于查询结果第 3 行，"
+                                "不在引用的行里，取的不是同一组数"]
+
+
+def test_the_cited_column_is_never_a_dimension_even_when_stored_as_text():
+    """金额列在库里是文本类型（存的是数字文本，查询层记的类型是 text）：Agent 引用的这一列是度量，不拿来认维度。拿来认，
+    每个（区域, 金额）都成了只在一边有的维度值，算「真的没有了、这次才有」，南区的第二天挤出引用的行（东区多了一天）
+    就查不出来，报成只数据变。"""
+    types = {**BY_DAY_TYPES, "gmv": "text"}
+
+    def make(run_id, rows):
+        shown = [[region, day, str(gmv)] for region, day, gmv in rows]
+        run = Fake(run_id)
+        run.tool("fetch", BY_DAY_SQL, BY_DAY_COLUMNS, shown, types=types)
+        bot = run.agent("bot", BY_DAY_SQL, BY_DAY_COLUMNS, shown, types=types, span=(0, 3))
+        run.card([metric("total", "sum(vars.kpi.amounts)", sum(r[2] for r in rows[:4]),
+                         [amounts_in(bot, shown, span=(0, 3))])])
+        return run
+
+    before = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 100.0], ["南区", "2026-09-01", 50.0],
+              ["南区", "2026-09-02", 40.0], ["西区", "2026-09-01", 30.0]]
+    after = [["东区", "2026-09-07", 100.0], ["东区", "2026-09-08", 100.0], ["东区", "2026-09-09", 100.0],
+             ["南区", "2026-09-08", 60.0], ["南区", "2026-09-09", 45.0], ["西区", "2026-09-08", 30.0]]
+    total = by_id(run_compare(make("r1", before), make("r2", after)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」这次有 1 行在查询结果第 5 行，不在引用"
+                                "的行里，取的不是同一组数"]
+
+
+#: 区域 × 渠道 × 日期（日期不当维度），按区域、日期排序
+BY_CHANNEL_DAY = {"sql": "SELECT region, channel, day, SUM(amount) AS gmv FROM orders GROUP BY region, channel, day "
+                         "ORDER BY region, day",
+                  "columns": ["region", "channel", "day", "gmv"],
+                  "types": {"region": "text", "channel": "text", "day": "date", "gmv": "number"}}
+
+
+def test_cited_rows_are_checked_by_the_dimensions_the_attribution_uses():
+    """归因只在引用的行上认维度（_attribute）：渠道在引用的行里两边都只有「线上」，不当维度，归因按区域说。核对引用的
+    是不是同一批区域也要按区域核对一遍——只按整份结果认维度（区域, 渠道），南区 / 线上两边都整个被引用、南区 / 线下
+    两边都没被引用，看着都切在同一处，按区域看南区这次却有一行在引用的行外面，归因说的南区就不是同一组数。
+
+    区域 × 渠道 × 日期，两次都引用第 1 至 4 行：东区这次多了一天，南区的第二天这次走的是线下，排到第 5 行（还在快照
+    里）。按引用的行归因，南区是 100 → 50（占比 -100%），和「南区这次真的只有一天」的输出一字不差；反方向也是。区域 ×
+    渠道按金额取前 2 行：南区这次新开了线下（200），排第 3——快照里南区是 300 → 480，按引用的行归因却是 300 → 280，
+    正负号都反了。对照：南区真的只有引用的那几行的，照常是数据变化，按区域归因，占比之和为 1。"""
+    base = [["东区", "线上", "2026-09-01", 100.0], ["东区", "线上", "2026-09-02", 100.0],
+            ["南区", "线上", "2026-09-01", 50.0], ["南区", "线上", "2026-09-02", 50.0],
+            ["西区", "线上", "2026-09-01", 30.0], ["西区", "线上", "2026-09-02", 30.0]]
+    this = [["东区", "线上", "2026-09-07", 100.0], ["东区", "线上", "2026-09-08", 100.0],
+            ["东区", "线上", "2026-09-09", 100.0], ["南区", "线上", "2026-09-08", 50.0],
+            ["南区", "线下", "2026-09-09", 50.0], ["西区", "线上", "2026-09-08", 30.0],
+            ["西区", "线上", "2026-09-09", 30.0]]
+    total = by_id(run_compare(by_day("r1", base, **BY_CHANNEL_DAY), by_day("r2", this, **BY_CHANNEL_DAY)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」这次有 1 行在查询结果第 5 行，不在引用"
+                                "的行里，取的不是同一组数"]
+    total = by_id(run_compare(by_day("r1", this, **BY_CHANNEL_DAY), by_day("r2", base, **BY_CHANNEL_DAY)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 4 行，「南区」在基准运行中有 1 行位于查询结果第 5 行，"
+                                "不在引用的行里，取的不是同一组数"]
+    # 对照：南区这次真的只有一天（没有线下那一行）
+    gone = [r for r in this if r[1] != "线下"]
+    total = by_id(run_compare(by_day("r1", base, **BY_CHANNEL_DAY), by_day("r2", gone, **BY_CHANNEL_DAY)))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    attribution = total["attribution"]
+    assert attribution["columns"] == ["region"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in attribution["rows"]] == [
+        (["东区"], 200.0, 300.0, 2.0), (["南区"], 100.0, 50.0, -1.0)]
+    assert sum(exact(r["share"]) for r in attribution["rows"]) == 1
+
+    # 区域 × 渠道按金额取前 2 行：南区这次新开了线下，排第 3
+    before = [["东区", "线上", 500.0], ["南区", "线上", 300.0], ["西区", "线上", 100.0]]
+    after = [["东区", "线上", 600.0], ["南区", "线上", 280.0], ["南区", "线下", 200.0], ["西区", "线上", 120.0]]
+    total = by_id(run_compare(by_day("r1", before, span=(0, 1), **BY_CHANNEL),
+                              by_day("r2", after, span=(0, 1), **BY_CHANNEL)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 2 行，「南区」这次有 1 行在查询结果第 3 行，不在引用"
+                                "的行里，取的不是同一组数"]
+    # 对照：南区真的只有线上（这次多出来的北区排在最后，两边都没引用）
+    only_online = [["东区", "线上", 600.0], ["南区", "线上", 280.0], ["西区", "线上", 120.0], ["北区", "线上", 10.0]]
+    total = by_id(run_compare(by_day("r1", before, span=(0, 1), **BY_CHANNEL),
+                              by_day("r2", only_online, span=(0, 1), **BY_CHANNEL)))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    rows = total["attribution"]["rows"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in rows] == [
+        (["东区"], 500.0, 600.0, 1.25), (["南区"], 300.0, 280.0, -0.25)]
+    assert sum(exact(r["share"]) for r in rows) == 1
+
+    # 只按归因用的那组也不够：只引用了一行的，引用的行里每列都只有一个值，认不出维度（也不归因）。按金额排的第 2 行，
+    # 基准运行是东区第二高的那天，这次是东区最高的那天——按整份结果认出的区域照样核对，说不清
+    top = BY_DAY_SQL.replace("ORDER BY region, day", "ORDER BY gmv DESC")
+    ranked_before = [["东区", "2026-09-01", 300.0], ["东区", "2026-09-02", 250.0], ["南区", "2026-09-01", 200.0]]
+    ranked_after = [["南区", "2026-09-08", 350.0], ["东区", "2026-09-08", 300.0], ["东区", "2026-09-09", 100.0]]
+    total = by_id(run_compare(by_day("r1", ranked_before, span=(1, 1), sql=top),
+                              by_day("r2", ranked_after, span=(1, 1), sql=top)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 2 至 2 行，两次都引用了「东区」的 1 行，可不是它同样的"
+                                "那几行（它排在引用的行前面的，基准运行有 1 行，这次有 0 行），取的不是同一组数"]
+
+
+def test_an_element_does_not_mind_other_rows_of_its_region():
+    """口径卡取 Agent 数组字段的第一个元素（单格）：不套行段的切法，只看引用的那一行两次是不是同一个区域的同一行（排在
+    它前面的、这个区域的行数一样，见 test_an_element_on_another_row_of_the_same_region_is_not_the_same_number），不看这个
+    区域在这一行外面还有没有行。区域 × 日期的结果里，基准运行东区两天（第二天在引用的行外面）、这次只有一天：第 1 行
+    两次都是东区的第一天，是同一个数，照常是数据变化。行段要看每个区域被切成什么样（整个、还是只有一部分），因为口径卡
+    按引用的几行一起算；单格只有一行，东区还有没有别的行不改变它取的是哪个数。第 1 行的东区这次真的没有了（换成了
+    北区，东区不在这次的快照里）也照常比；东区还在快照里、只是不在第 1 行的说不清
+    （test_an_element_of_a_cited_array_follows_its_row）。"""
+    day = {"sql": BY_DAY_SQL, "columns": BY_DAY_COLUMNS, "types": BY_DAY_TYPES}
+    before = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 90.0], ["南区", "2026-09-01", 50.0],
+              ["西区", "2026-09-01", 30.0]]
+    after = [["东区", "2026-09-08", 110.0], ["南区", "2026-09-08", 60.0], ["西区", "2026-09-08", 30.0]]
+    first = by_id(run_compare(element("r1", before, (0, 2), **day), element("r2", after, (0, 2), **day)))["first"]
+    assert (first["classification"], first["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    first = by_id(run_compare(element("r1", after, (0, 2), **day), element("r2", before, (0, 2), **day)))["first"]
+    assert (first["classification"], first["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    gone = [["北区", "2026-09-08", 80.0], ["南区", "2026-09-08", 60.0], ["西区", "2026-09-08", 30.0]]
+    first = by_id(run_compare(element("r1", before, (0, 2), **day), element("r2", gone, (0, 2), **day)))["first"]
+    assert (first["classification"], first["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+
+
+def test_an_element_on_another_row_of_the_same_region_is_not_the_same_number():
+    """单格引用的那一行两次是同一个区域，还要是它同样的那一行：按查询结果的先后，排在这一行前面的、它的行数两边一样。
+    区域 × 日期的结果里，Agent 两次都交第 3 至 5 行，口径卡取第一个元素（第 3 行）：基准运行那是南区的第一天（50）；
+    这次东区真的少了一天，第 3 行成了南区的第二天（45），南区的第一天（60）在第 2 行。只看「是不是南区」会报成南区
+    少了 5，同一天的南区其实多了 10，正负号都反了。同一处引用换成只有一行的行段（第 3 至 3 行）说不清，单格也说不清。
+    按金额排的取第 2 行（基准运行是东区第二高的那天，这次是最高的那天）、取第二个元素的也一样。
+
+    只比排在前面的行数、不比「它在这一行外面还有没有行」：东区两天还是一天，第 1 行都是东区的第一天，照常是数据变化
+    （test_an_element_does_not_mind_other_rows_of_its_region）。"""
+    day = {"sql": BY_DAY_SQL, "columns": BY_DAY_COLUMNS, "types": BY_DAY_TYPES}
+    before = [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 90.0], ["南区", "2026-09-01", 50.0],
+              ["南区", "2026-09-02", 40.0], ["西区", "2026-09-01", 30.0]]
+    after = [["东区", "2026-09-08", 110.0], ["南区", "2026-09-08", 60.0], ["南区", "2026-09-09", 45.0],
+             ["西区", "2026-09-08", 30.0], ["西区", "2026-09-09", 20.0]]
+    first = by_id(run_compare(element("r1", before, (2, 4), **day), element("r2", after, (2, 4), **day)))["first"]
+    assert first["classification"] == "incomparable" and first["attribution"] is None
+    assert first["reasons"] == ["Agent「区域分析」两次都引用第 3 行，两次都是「南区」，可不是它同样的那一行（它排在这一行"
+                                "前面的，基准运行有 0 行，这次有 1 行），取的不是同一个数"]
+    first = by_id(run_compare(element("r1", after, (2, 4), **day), element("r2", before, (2, 4), **day)))["first"]
+    assert first["classification"] == "incomparable" and first["attribution"] is None
+    assert first["reasons"] == ["Agent「区域分析」两次都引用第 3 行，两次都是「南区」，可不是它同样的那一行（它排在这一行"
+                                "前面的，基准运行有 1 行，这次有 0 行），取的不是同一个数"]
+    # 同样的两份结果，只有一行的行段：同样说不清，单格不比它松
+    total = by_id(run_compare(by_day("r1", before, span=(2, 2)), by_day("r2", after, span=(2, 2))))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+
+    # 按金额排，取 Agent 交的第 2 至 3 行的第一个元素：基准运行是东区第二高的那天（250），这次是东区最高的那天（300）
+    top = {**day, "sql": BY_DAY_SQL.replace("ORDER BY region, day", "ORDER BY gmv DESC")}
+    ranked_before = [["东区", "2026-09-01", 300.0], ["东区", "2026-09-02", 250.0], ["南区", "2026-09-01", 200.0]]
+    ranked_after = [["南区", "2026-09-08", 350.0], ["东区", "2026-09-08", 300.0], ["东区", "2026-09-09", 100.0]]
+    first = by_id(run_compare(element("r1", ranked_before, (1, 2), **top),
+                              element("r2", ranked_after, (1, 2), **top)))["first"]
+    assert first["classification"] == "incomparable" and first["attribution"] is None
+    assert first["reasons"] == ["Agent「区域分析」两次都引用第 2 行，两次都是「东区」，可不是它同样的那一行（它排在这一行"
+                                "前面的，基准运行有 1 行，这次有 0 行），取的不是同一个数"]
+    # 排在前面的行数要数清，不只看有没有：第 3 行基准运行是东区第三高的那天（前面有 2 行），这次是第二高的那天（前面
+    # 有 1 行）
+    third = [["东区", "2026-09-01", 300.0], ["东区", "2026-09-02", 280.0], ["东区", "2026-09-03", 250.0],
+             ["南区", "2026-09-01", 200.0]]
+    second = [["东区", "2026-09-08", 320.0], ["西区", "2026-09-08", 300.0], ["东区", "2026-09-09", 260.0],
+              ["南区", "2026-09-08", 210.0], ["东区", "2026-09-10", 100.0]]
+    first = by_id(run_compare(element("r1", third, (2, 3), **top), element("r2", second, (2, 3), **top)))["first"]
+    assert first["classification"] == "incomparable" and first["attribution"] is None
+    assert first["reasons"] == ["Agent「区域分析」两次都引用第 3 行，两次都是「东区」，可不是它同样的那一行（它排在这一行"
+                                "前面的，基准运行有 2 行，这次有 1 行），取的不是同一个数"]
+    # 取第二个元素（Agent 交第 1 至 3 行，落在第 2 行）：基准运行是东区的第二天，这次北区排到第 1 行，第 2 行是东区的
+    # 第一天
+    first = by_id(run_compare(
+        element("r1", [["东区", "2026-09-01", 100.0], ["东区", "2026-09-02", 90.0], ["南区", "2026-09-01", 50.0]],
+                (0, 2), index=1, **day),
+        element("r2", [["北区", "2026-09-08", 70.0], ["东区", "2026-09-08", 95.0], ["南区", "2026-09-08", 55.0]],
+                (0, 2), index=1, **day)))["first"]
+    assert first["classification"] == "incomparable" and first["attribution"] is None
+    assert first["reasons"] == ["Agent「区域分析」两次都引用第 2 行，两次都是「东区」，可不是它同样的那一行（它排在这一行"
+                                "前面的，基准运行有 1 行，这次有 0 行），取的不是同一个数"]
+
+    # 对照：第 3 行两次都是南区的第一天（排在它前面的南区行两边都是 0），照常是数据变化：50 → 60
+    same = [["东区", "2026-09-08", 110.0], ["东区", "2026-09-09", 100.0], ["南区", "2026-09-08", 60.0],
+            ["南区", "2026-09-09", 45.0], ["西区", "2026-09-08", 30.0]]
+    first = by_id(run_compare(element("r1", before, (2, 4), **day), element("r2", same, (2, 4), **day)))["first"]
+    assert (first["classification"], first["reasons"], first["delta"]) == ("data_only", [compare.DATA_FROM_QUERIES],
+                                                                           10.0)
 
 
 def test_no_split_when_an_old_leaf_now_cites_another_column():
