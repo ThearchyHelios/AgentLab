@@ -276,6 +276,8 @@ async def test_a_refuted_conclusion_degrades_the_issuance(monkeypatch, shop):
                             {"unit": south, "text": SOUTH, "verdict": "refuted"}]
     assert out["on_refuted"] == "degrade"
     assert out["issuance_gaps"] == [f"推翻了 1 句结论：「{SOUTH}」"]
+    # 两句都真查过了；接在带出具契约的成果节点上游、按降档处置：被推翻的真的会让出具降档
+    assert out["unreviewed"] == 0 and out["degrades"] is True
 
     record = artifact_store.load(out["challenge_artifact"])
     assert set(record) == {"report", "doc_artifact", "claims", "model"}
@@ -337,6 +339,7 @@ async def test_flag_only_records_and_fail_stops_the_run(monkeypatch, shop):
     assert row.output["_issuance"]["tier"] == "formal" and row.output["_issuance"]["gaps"] == []
     out = await output_of(row.id, "chal")
     assert out["on_refuted"] == "flag" and "issuance_gaps" not in out and out["counts"]["refuted"] == 1
+    assert out["degrades"] is False, "只标注：被推翻的不会让出具降档"
     assert len(await logs(row.id, "challenge_refuted")) == 1, "flag 也照实记一条"
 
     Models(monkeypatch, shop)
@@ -408,6 +411,7 @@ async def test_a_verdict_without_any_query_is_not_taken(monkeypatch, shop):
     assert east["verdict"] == "inconclusive" and "「经受住」" in east["rationale"]
     [warn] = await logs(row.id, "challenge_unreviewed")
     assert warn["claims_skipped"] == 2 and "没有执行成功任何查询" in warn["reason"]
+    assert out["unreviewed"] == 2, "一条查询都没执行成功：两句都是没能反查，不是查过了判断不了"
 
 
 async def test_a_refutation_that_cites_none_of_its_queries_is_not_taken(monkeypatch, shop):
@@ -425,6 +429,7 @@ async def test_a_refutation_that_cites_none_of_its_queries_is_not_taken(monkeypa
     assert "没有引用" in south["rationale"] and "扣除退款后华南仍低于华东。" in south["rationale"]
     assert east["verdict"] == "stands", "「经受住」不要求引用：它不改变出具"
     assert await logs(row.id, "challenge_unreviewed") == [], "查过了，不算没能反查"
+    assert out["unreviewed"] == 0
 
 
 @pytest.mark.parametrize("queries, said, quoted", [
@@ -470,6 +475,7 @@ async def test_claims_whose_sources_are_gone_are_not_sent_out(monkeypatch, shop)
     assert all(f"「{shop}」" in c["rationale"] and "不存在或已停用" in c["rationale"] for c in claims)
     [warn] = await logs(row.id, "challenge_unreviewed")
     assert warn["claims_skipped"] == 2 and f"「{shop}」" in warn["reason"]
+    assert out["unreviewed"] == 2
 
 
 async def test_a_claim_with_part_of_its_sources_gone_says_so(monkeypatch, tmp_path, shop):
@@ -665,6 +671,8 @@ async def test_the_time_limit_applies_to_each_claim_and_still_settles(monkeypatc
     assert south["verdict"] == "inconclusive" and 1 <= len(south["queries"]) < 20
     limits = await logs(row.id, "challenge_limit")
     assert [(lm["limit"], lm["claims_skipped"]) for lm in limits] == [("timeout_s", 0)]
+    # 触顶但按查到的结果收了尾的那句，判断是反方自己给的，不算没能反查；另一句一条查询都没执行，算
+    assert (await output_of(row.id, "chal"))["unreviewed"] == 1
 
 
 async def test_the_daily_cap_stops_the_remaining_claims(monkeypatch, shop):
@@ -684,6 +692,7 @@ async def test_the_daily_cap_stops_the_remaining_claims(monkeypatch, shop):
         "第一句派出去就撞上上限、一次模型都没调用，和后面不再派出的句子是同一回事，同一种说法"
     [limit] = await logs(row.id, "challenge_limit")
     assert limit["limit"] == "daily_max_usd" and limit["claims_skipped"] == 2
+    assert out["unreviewed"] == 2, "撞上每日金额上限没反查的，也是没能反查"
     assert len(await logs(row.id, "verify_limit")) == 1, "第一句撞上每日上限之后，后面的句子不再派 agent 去试"
     assert row.output["_issuance"]["tier"] == "formal"
 
@@ -725,11 +734,43 @@ async def test_the_approval_card_carries_the_challenge_summary(monkeypatch, shop
     out = await output_of(row.id, "chal")
     assert report["node_id"] == "write"
     assert report["challenge"] == {"counts": out["counts"], "items": out["items"],
-                                   "artifact": out["challenge_artifact"], "on_refuted": "degrade"}
+                                   "artifact": out["challenge_artifact"], "on_refuted": "degrade",
+                                   "unreviewed": 0, "degrades": False}
     assert report["challenge"]["counts"]["refuted"] == 1
     # human.requested 事件里也带着：回放时界面一样读得到
     [requested] = await events(row.id, "human.requested", "gate")
     assert requested.data["reports"] == approval.payload["reports"]
+
+
+async def test_the_approval_card_says_whether_refutations_degrade(monkeypatch, shop):
+    """审批卡上「出具会降档」只在真的会降档时写：degrades 按「按降档处置、又接在带出具契约的成果节点上游」算。
+    审批之后的成果节点带了出具契约：会降档；没带（gated 的缺省）：不会，见上一个用例"""
+    Models(monkeypatch, shop)
+    spec = gated(shop)
+    next(n for n in spec["nodes"] if n["id"] == "out")["data"]["config"]["contract"] = {"report_from": "write"}
+    _, approval = await paused(spec)
+    challenge = approval.payload["reports"][0]["challenge"]
+    assert challenge["degrades"] is True and challenge["on_refuted"] == "degrade"
+
+
+async def test_a_challenge_off_the_issuance_path_does_not_degrade(monkeypatch, shop):
+    """反方审稿接在侧枝上（成果节点的出具契约收不到它的缺口）：按降档处置也降不了档，产出照实写 degrades 为假"""
+    Models(monkeypatch, shop)
+    spec = chain(
+        node("start", "input"),
+        node("fetch", "tool", tool=f"db_query__{shop}", args={"sql": QUERY}),
+        node("write", "report", "写周报", instructions="写周报"),
+        node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}],
+             contract={"report_from": "write"}),
+    )
+    spec["nodes"].append(node("chal", "challenge", "审稿", report="write"))
+    spec["edges"].append({"source": "write", "target": "chal"})
+    row = await finish(spec)
+    assert row.status == "succeeded", row.error
+    out = await output_of(row.id, "chal")
+    assert out["on_refuted"] == "degrade" and out["counts"]["refuted"] == 1 and out["issuance_gaps"]
+    assert out["degrades"] is False
+    assert row.output["_issuance"]["gaps"] == [], "缺口确实没进出具：和 degrades 说的一致"
 
 
 async def test_the_approval_card_shows_what_flag_means(monkeypatch, shop):
@@ -782,8 +823,11 @@ def test_the_card_only_carries_the_review_of_that_report():
     items = [{"unit": "u0", "text": "周报甲的一句结论。", "verdict": "stands"}]
     outputs = {"chal": {"challenge_artifact": "a1", "counts": counts, "items": items, "on_refuted": "degrade"}}
     assert challenge_mod.challenge_summary(spec, outputs, "a") == {
-        "counts": counts, "items": items, "artifact": "a1", "on_refuted": "degrade"}
+        "counts": counts, "items": items, "artifact": "a1", "on_refuted": "degrade"}, "老产出没有这两个键：概况也不带"
     assert challenge_mod.challenge_summary(spec, outputs, "b") is None
+    outputs["chal"].update(unreviewed=1, degrades=True)
+    assert challenge_mod.challenge_summary(spec, outputs, "a") == {
+        "counts": counts, "items": items, "artifact": "a1", "on_refuted": "degrade", "unreviewed": 1, "degrades": True}
     # 直接连着的报告，和直接连着的反方审稿审的那份，都算这个审批节点审的
     assert reviewed_report_ids(spec, spec.node_map()["gate"]) == ["a", "b"]
 
@@ -970,6 +1014,7 @@ async def test_an_unavailable_model_leaves_the_claims_inconclusive(monkeypatch, 
     # 时间线上看得出根本没审成：不是只有一条「审了 2 句」
     [warn] = await logs(row.id, "challenge_unreviewed")
     assert warn["level"] == "warn" and warn["claims_skipped"] == 2 and "核查模型不可用" in warn["reason"]
+    assert out["unreviewed"] == 2
     [done] = await logs(row.id, "challenge_done")
     assert "2 句未能反查" in done["message"]
 

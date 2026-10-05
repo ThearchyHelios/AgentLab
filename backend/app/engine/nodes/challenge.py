@@ -22,8 +22,10 @@
    没审全（这两个代码还不在期 3 约定的日志代码表里，界面认不得时照原话显示）
 5. 处置：被推翻的按 on_refuted 处置。degrade（默认）在产出里写 issuance_gaps，成果节点的出具契约照单收进缺口、
    出具降档（nodes/io.py 的 _upstream_issuance_gaps，所以反方审稿要接在成果节点上游，画布校验会提醒）；fail 判节点
-   失败；flag 只记录。产出和审批卡里的 on_refuted 是实际生效的那一种（只有 degrade / flag，见 _finish）。审批卡
-   （human.py 的 _reviewed_reports）附上审稿概况
+   失败；flag 只记录。产出和审批卡里的 on_refuted 是实际生效的那一种（只有 degrade / flag，见 _finish）；degrades
+   说被推翻的到底会不会让出具降档（按降档处置、又接在带出具契约的成果节点上游），unreviewed 是没能反查的句数（核查
+   模型不可用、触顶、数据源不在了……这几句记为无法判断，但根本没查成）。审批卡（human.py 的 _reviewed_reports）附上
+   审稿概况，据这两项说「出具会降档」「N 句没能反查」
 
 上限：句数、每句查询次数、每句时长、全局每日金额（核查和裁判各记各的账，engine/spend.py）。都按发起时快照的核查
 设置（run.options["verify"]），节点上写了的盖过它：审批停下期间改了设置，恢复、接着跑仍按发起时的那份。没有快照
@@ -56,7 +58,7 @@ from app.engine.judge import _usd
 from app.engine.merge_query import MERGE_SOURCE
 from app.engine.replay import _in_graph
 from app.engine.labels import CHALLENGE_LABEL, CHALLENGE_ON_REFUTED_LABEL
-from app.engine.schema import GraphSpec, NodeType, challenge_problems, challenge_report
+from app.engine.schema import GraphSpec, NodeType, _ancestors, challenge_problems, challenge_report
 from app.engine.state import GraphState
 from app.engine.verify_agent import RATIONALE, VerifyOutcome, run_verify_agent
 from app.tools.datasource import run_versions
@@ -622,6 +624,9 @@ class _Review:
                 unreviewed.append(why)
 
         counts = {v: sum(1 for c in claims if c["verdict"] == v) for v in VERDICTS}
+        # 没能反查的句数：没派出去、派出去却没查成的（unreviewed 里各有原因），加上触顶时没能给出结论的。都记为无法判断，
+        # 可「无法判断 2 句」既可能是查了、数据不够，也可能是根本没查：审批卡要分开说
+        missed = len(unreviewed) + sum(skipped for _, skipped in hit.values())
         artifact = await self._store({"report": self.report_id, "doc_artifact": self.doc_artifact, "claims": claims,
                                       "model": model})
         for limit, (touched, skipped) in hit.items():
@@ -651,7 +656,7 @@ class _Review:
             ctx.emit(EventType.LOG, level="warn", code="challenge_refuted",
                      items=[{"unit": c["unit"], "text": c["text"]} for c in refuted[:ITEMS_MAX]],
                      message=_refuted_words(refuted))
-        return {"artifact": artifact, "counts": counts, "usage": usage,
+        return {"artifact": artifact, "counts": counts, "usage": usage, "unreviewed": missed,
                 "claims": [{k: c[k] for k in ("unit", "text", "verdict")} for c in claims]}
 
     async def _store(self, record: dict[str, Any]) -> str | None:
@@ -680,7 +685,11 @@ def _finish(ctx: NodeContext, state: GraphState, outcome: dict[str, Any], *, on_
                                          f"「{CHALLENGE_LABEL['on_refuted']}」改为「{CHALLENGE_ON_REFUTED_LABEL['flag']}」")
         on_refuted = "degrade" if refuted else "flag"
     result: dict[str, Any] = {"challenge_artifact": outcome.get("artifact"), "counts": outcome.get("counts") or {},
-                              "items": pick_items(claims), "on_refuted": on_refuted}
+                              "items": pick_items(claims), "on_refuted": on_refuted,
+                              "degrades": on_refuted == "degrade" and feeds_issuance(ctx.run.spec, ctx.node.id)}
+    # checkpoint 里升级前审的结果没有这一项：不知道就不写，审批卡照旧不说
+    if isinstance(outcome.get("unreviewed"), int):
+        result["unreviewed"] = outcome["unreviewed"]
     if refuted and on_refuted == "degrade":
         result["issuance_gaps"] = [_refuted_gap(refuted)]
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
@@ -700,10 +709,19 @@ def _finish(ctx: NodeContext, state: GraphState, outcome: dict[str, Any], *, on_
 # --------------------------------------------------------------------------
 
 
+def feeds_issuance(spec: GraphSpec, node_id: str) -> bool:
+    """这个节点在不在某个带出具契约的成果节点上游。成果节点的出具契约只收上游报上来的缺口（nodes/io.py 的
+    _upstream_issuance_gaps）：接在侧枝上、或者在成果之后，被推翻的结论记了缺口也进不了出具。认法同画布校验
+    （schema._check_challenge 的「不在成果节点上游」警告）。"""
+    return any(node_id in _ancestors(spec, n.id) for n in spec.nodes
+               if n.type == NodeType.OUTPUT and n.config.get("contract"))
+
+
 def challenge_summary(spec: GraphSpec, outputs: dict[str, Any], report_id: str) -> dict[str, Any] | None:
-    """审批卡上这份报告的反方审稿概况 {counts, items, artifact, on_refuted}：审它的、已经审完的反方审稿节点给的。
-    没有（没加反方审稿、还没审到、直通了）返回 None，审批卡不加这个键。几个反方审稿节点审同一份报告时取画布上
-    靠后的那个。只看图和状态：重放时算出来的一样。"""
+    """审批卡上这份报告的反方审稿概况 {counts, items, artifact, on_refuted, unreviewed, degrades}：审它的、已经审完的
+    反方审稿节点给的。没有（没加反方审稿、还没审到、直通了）返回 None，审批卡不加这个键。几个反方审稿节点审同一份报告
+    时取画布上靠后的那个。只看图和状态：重放时算出来的一样。unreviewed、degrades 是期 4 加的：升级前的产出没有，
+    概况也不带（审批卡按旧规则说）。"""
     found: dict[str, Any] | None = None
     for node in spec.nodes:
         result = outputs.get(node.id)
@@ -713,8 +731,12 @@ def challenge_summary(spec: GraphSpec, outputs: dict[str, Any], report_id: str) 
             continue
         found = {"counts": dict(result["counts"]), "items": list(result.get("items") or [])[:ITEMS_MAX],
                  "artifact": result.get("challenge_artifact"), "on_refuted": result.get("on_refuted") or "degrade"}
+        if isinstance(result.get("unreviewed"), int) and not isinstance(result["unreviewed"], bool):
+            found["unreviewed"] = result["unreviewed"]
+        if isinstance(result.get("degrades"), bool):
+            found["degrades"] = result["degrades"]
     return found
 
 
-__all__ = ["CHALLENGE_SYSTEM", "ITEMS_MAX", "VERDICTS", "challenge_summary", "claim_sources", "mark_original",
-           "pick_claims", "pick_items", "run_challenge", "with_note"]
+__all__ = ["CHALLENGE_SYSTEM", "ITEMS_MAX", "VERDICTS", "challenge_summary", "claim_sources", "feeds_issuance",
+           "mark_original", "pick_claims", "pick_items", "run_challenge", "with_note"]
