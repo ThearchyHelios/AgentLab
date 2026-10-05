@@ -2839,6 +2839,7 @@ def _finish(tree: Any, read: str | None, info: _Schema, *, level: str, qualified
     _drop_unused_left_joins(tree, sens, info, read)
     if qualified:
         _substitute_equal_columns(tree, read, info, sens)
+        _constraint_rewrites(tree, read, info, sens)
     _exists_subqueries(tree)
     sens = _Sensitivity(tree, read, info)
     _membership_subqueries(tree, sens)
@@ -2854,7 +2855,7 @@ def _finish(tree: Any, read: str | None, info: _Schema, *, level: str, qualified
     _strip_asc(tree)
     _zero_offset(tree)
     _order_by_aliases(tree)
-    _dedupe_order(tree)
+    _dedupe_order(tree, sens)
     _drop_output_aliases(tree)
     pre = tree.copy()
     sens = _Sensitivity(tree, read, info)
@@ -3544,7 +3545,7 @@ def _push_into_groups(tree: Any, read: str | None, info: "_Schema") -> None:
             if not isinstance(item, exp.Subquery) or (index and not _inner(joins[index - 1])):
                 continue
             body = item.this
-            if not isinstance(body, exp.Select) or body.args.get("group") is None or \
+            if not isinstance(body, exp.Select) or body.args.get("group") is None or sens.of(body) or \
                     any(body.args.get(k) for k in ("limit", "offset", "distinct", "qualify", "windows", "with_")) or \
                     any(n.find(exp.Window) for n in body.expressions):
                 continue
@@ -4357,6 +4358,61 @@ def _drop_implied_not_null(tree: Any, read: str | None, info: _Schema, sens: _Se
                 select.set(holder.arg_key, None)
 
 
+def _not_null_source(select: Any, column: Any, info: _Schema, read: str | None) -> bool:
+    """column（带表名）在这一段里一定不为空：来源是这一段 FROM / JOIN 里的实表（不是 CTE），表结构里这一列确定不为空
+    （见 _not_null_column），这一段没有 RIGHT / FULL JOIN，它也不是 LEFT JOIN 可空的一侧（没关联上时整行补空）。"""
+    from sqlglot import exp
+
+    if not isinstance(column, exp.Column) or not column.table:
+        return False
+    joins = select.args.get("joins") or []
+    if any(str(j.side or "").upper() in ("RIGHT", "FULL") for j in joins) or \
+            any(str(j.side or "").upper() == "LEFT" and j.this.alias_or_name == column.table for j in joins):
+        return False
+    item = next((i for i in _items_of(select) if i.alias_or_name == column.table), None)
+    return isinstance(item, exp.Table) and not item.args.get("db") and \
+        item.name.translate(_ASCII_LOWER) not in _visible_ctes(select) and \
+        _not_null_column(info, item.name, column.name, read)
+
+
+def _constraint_rewrites(tree: Any, read: str | None, info: _Schema, sens: _Sensitivity) -> None:
+    """（认列之后，靠表结构里的约束）两处同义写法：
+
+    - COUNT(x)：x 在这一段里一定不为空（见 _not_null_source）时就是 COUNT(*)（COUNT(x) 只是跳过 x 为空的行）。结果看
+      行出来先后的一段不改（COUNT(*) 可能换一个索引扫）。
+    - SELECT DISTINCT：只有一个来源（实表，不关联别的表）、选出来的列里包含它的一个唯一键（主键，或者每一列都确定不为空
+      的唯一约束），又不分组不聚合时，每一行本来就不一样，DISTINCT 去掉。SQLite 里不是 INTEGER 的主键能存好几个空值，
+      不算（见 _not_null_column）。结果看行出来先后的一段不动（去不去重可能换一种扫描的先后）。"""
+    from sqlglot import exp
+
+    if not info.types:
+        return
+    for count in list(tree.find_all(exp.Count)):
+        arg = count.this
+        select = count.find_ancestor(exp.Select)
+        if select is None or isinstance(arg, exp.Distinct) or count.args.get("expressions") or \
+                isinstance(count.parent, exp.Window) or not isinstance(arg, exp.Column) or sens.of(select):
+            continue
+        if _not_null_source(select, arg, info, read):
+            count.set("this", exp.Star())
+    for select in list(tree.find_all(exp.Select)):
+        distinct = select.args.get("distinct")
+        if distinct is None or distinct.args.get("on") or sens.of(select) or select.args.get("joins") or \
+                _aggregating(select) or select.args.get("from_") is None:
+            continue
+        item = select.args["from_"].this
+        if not isinstance(item, exp.Table) or item.args.get("db") or \
+                item.name.translate(_ASCII_LOWER) in _visible_ctes(select):
+            continue
+        table = item.name.translate(_ASCII_LOWER)
+        chosen = {p.unalias().name.translate(_ASCII_LOWER) for p in select.expressions
+                  if isinstance(p.unalias(), exp.Column) and p.unalias().table == item.alias_or_name}
+        keys = ([info.pk[table]] if info.pk.get(table) else []) + info.unique.get(table, [])
+        if any(key and set(key) <= chosen and all(_not_null_column(info, item.name, k, read) for k in key)
+               for key in keys):
+            select.set("distinct", None)
+
+
 #: 换成同一组相等的列之后，原文写的那一列（实表名、列名）记在新列的 meta 里：比等价时不算（见 _fingerprint），差异
 #: 说明给人看时照原文写（见 _Explainer.show）
 _WRITTEN_COLUMN = "sql_semantics_written_column"
@@ -4495,6 +4551,10 @@ def _normalize_limits(tree: Any, read: str | None) -> None:
         limit = query.args.get("limit")
         if not isinstance(limit, exp.Limit) or limit.expression is None:
             continue
+        if isinstance(query, exp.Select) and (_loose_columns(query) or any(
+                isinstance(n, exp.Window) or _order_dependent(n) for n in _block_nodes(query))):
+            # 有 GROUP_CONCAT、窗口函数、既不分组也不聚合的列：去不去掉 LIMIT 子句可能换一种扫描的先后，结果跟着变
+            continue
         value = _int_value(limit.expression)
         if read == "sqlite" and value is not None and value < 0:
             if query.args.get("offset") is None:
@@ -4505,12 +4565,15 @@ def _normalize_limits(tree: Any, read: str | None) -> None:
             query.set("limit", None)
 
 
-def _dedupe_order(tree: Any) -> None:
-    """ORDER BY 里和前面某一项一模一样的项去掉（不管升序降序）：前面那项相等的行，这一项也相等，排不出先后。窗口函数、
-    聚合里的 ORDER BY 也一样。"""
+def _dedupe_order(tree: Any, sens: _Sensitivity) -> None:
+    """ORDER BY 里和前面某一项一模一样的项去掉（不管升序降序）：前面那项相等的行，这一项也相等，排不出先后。结果看行
+    出来先后的一段（取行、窗口函数、GROUP_CONCAT）不去：并列的行谁在前要看排序的实现，多一个排序键可能就换了。"""
     from sqlglot import exp
 
     for order in list(tree.find_all(exp.Order)):
+        owner = order.find_ancestor(exp.Select)
+        if owner is None or sens.of(owner):
+            continue
         seen: set[str] = set()
         kept = []
         for item in order.expressions:
@@ -5455,7 +5518,9 @@ def _sort_own(select: Any, read: str | None, sensitive: bool = False) -> None:
             if isinstance(_unparen_parent(node), type(node)):
                 continue
             parts = _flat(node, type(node))
-            if all(_predicate(p) for p in parts):
+            if all(_predicate(p) for p in parts) and not sensitive:
+                # 一模一样的条件去掉一个。结果看行出来先后的一段不去：MySQL 按条件估算行数，同一个条件写两遍就换了一种
+                # 关联的先后，GROUP_CONCAT 拼出来的先后跟着变（第 3 轮在真实的 MySQL 8.0 上压测时看到的）
                 uniq: dict[tuple[str, str], Any] = {}
                 for part in parts:
                     uniq.setdefault(key(part), part)
@@ -6902,7 +6967,8 @@ class _Explainer:
         kb = sorted(self.mfp(g, mapping) for g in B.group)
         if ka == kb:
             return True
-        if ctx in ("in", "exists"):
+        if ctx in ("in", "exists") or sorted(set(ka)) == sorted(set(kb)):
+            # 只差在重复写了一遍的分组键上（结果看行出来先后的一段规范化不去重）：分出的组一样
             return False
         classes = self.equal_classes(A, B, mapping)
         if sorted(self.classed(A.group, classes, {})) == sorted(self.classed(B.group, classes, mapping)):
@@ -7125,10 +7191,21 @@ class _Explainer:
                 if A.offset != B.offset:
                     self.add("limit", A.offset, B.offset, _say(la, _skip(A.offset), "，", lb, _skip(B.offset)))
         orders_a, orders_b = [self.fp(o) for o in A.order], [self.mfp(o, mapping) for o in B.order]
+
+        def keys_once(block: _Block, m: Mapping[str, str]) -> list[str]:
+            out: list[str] = []
+            for o in block.order:
+                key = self.mfp(o.this if isinstance(o, exp.Ordered) else o, m)
+                if key not in out:
+                    out.append(key)
+            return out
+
         if orders_a != orders_b:
             limited = A.limit is not None or B.limit is not None or A.offset is not None or B.offset is not None
             classes = self.equal_classes(A, B, mapping)
-            if self.classed(A.order, classes, {}) == self.classed(B.order, classes, mapping):
+            same_once = keys_once(A, {}) == keys_once(B, mapping) and all(
+                self.fp(x) == self.mfp(y, mapping) for x, y in zip(_first_orders(A.order), _first_orders(B.order)))
+            if same_once or self.classed(A.order, classes, {}) == self.classed(B.order, classes, mapping):
                 # 排序键只差在被关联条件定成相等的列上：排出来的先后可能一样，说不准
                 covered = False
             elif A.distinct_on or B.distinct_on or A.windowed or B.windowed or single(A) or single(B) or \
@@ -7309,6 +7386,20 @@ def _set_branches(query: Any) -> list[Any]:
             out.append(node)
 
     collect(query)
+    return out
+
+
+def _first_orders(order: list[Any]) -> list[Any]:
+    """ORDER BY 各项里每个表达式第一次出现的那一项（后面重复的不影响先后）。"""
+    from sqlglot import exp
+
+    seen: set[str] = set()
+    out = []
+    for o in order:
+        key = _fingerprint(o.this if isinstance(o, exp.Ordered) else o)
+        if key not in seen:
+            seen.add(key)
+            out.append(o)
     return out
 
 

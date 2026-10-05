@@ -2208,6 +2208,12 @@ _DIFF_R3 = [
      "SELECT o.id, r.id FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"),
     ("r3-limit-negative-vs-zero", "SELECT id FROM orders ORDER BY id LIMIT -1", "SELECT id FROM orders ORDER BY id LIMIT 0"),
     # 按不唯一的列关联（users.referrer_id、refunds.order_id）：LEFT JOIN 会把左边的行复制，去不掉
+    # 可空一侧的主键、不选主键的 DISTINCT：主键在这里帮不上忙
+    ("r3-count-primary-key-nullable-side", "SELECT o.user_id, COUNT(r.id) FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id GROUP BY o.user_id",
+     "SELECT o.user_id, COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id GROUP BY o.user_id"),
+    ("r3-distinct-without-primary-key", "SELECT DISTINCT user_id, status FROM orders",
+     "SELECT user_id, status FROM orders"),
     ("r3-left-join-on-non-unique-unused", "SELECT o.id, o.amount FROM orders o LEFT JOIN users u ON u.referrer_id = o.user_id",
      "SELECT o.id, o.amount FROM orders o"),
     ("r3-left-join-on-key-plus-other-table", "SELECT SUM(o.amount) FROM orders o LEFT JOIN users u ON u.id = o.user_id "
@@ -2339,6 +2345,11 @@ _SAME_SCHEMA_R3 = [
     ("r3-left-join-on-primary-key-sum", "SELECT SUM(o.amount), COUNT(*) FROM orders o LEFT JOIN stores s "
      "ON s.id = o.store_id AND s.region = 'east'",
      "SELECT SUM(o.amount), COUNT(*) FROM orders o"),
+    # 主键不为空：COUNT(id) 就是 COUNT(*)；选出来的列里有主键，DISTINCT 不起作用
+    ("r3-count-primary-key", "SELECT user_id, COUNT(id) FROM orders GROUP BY user_id",
+     "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id"),
+    ("r3-distinct-with-primary-key", "SELECT DISTINCT id, status FROM orders WHERE amount > 10",
+     "SELECT id, status FROM orders WHERE amount > 10"),
 ]
 
 #: 意思一样、要按语义推理才看得出的：认不出时只许给兜底说明（复验专挑这类对查「说出不存在的差异」）
