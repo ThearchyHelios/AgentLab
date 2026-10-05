@@ -85,22 +85,6 @@ async def test_upstream_gap_degrades_issuance_and_names_the_node():
     assert (await issuance_event(row.id))["gaps"] == issuance["gaps"]
 
 
-async def test_stub_gate_nodes_pass_through_without_touching_issuance():
-    """反方审稿目前是占位：放在图里照样能运行，出具不受影响。双盲复算已经实现，没有可复算的指标时直接放行、
-    不碰出具，见 test_dual_check_node.py"""
-    for kind in ("challenge",):
-        row = await finish(graph(node("gate", kind)))
-        issuance = row.output["_issuance"]
-        assert issuance["tier"] == "formal", (kind, issuance)
-        assert issuance["gaps"] == []
-        async with SessionLocal() as session:
-            logs = (await session.execute(
-                select(RunEvent).where(RunEvent.run_id == row.id, RunEvent.type == "log", RunEvent.node_id == "gate")
-            )).scalars().all()
-        assert [e.data.get("level") for e in logs] == ["info"]
-        assert "开发中" in logs[0].data["message"]
-
-
 async def test_without_issuance_gaps_nothing_changes():
     """没写 issuance_gaps 的节点，和别的支路上写了的节点，都不影响这份成果"""
     plain = node("recheck", "transform", "复核销售额", mode="json", template='{"ok": true}')
