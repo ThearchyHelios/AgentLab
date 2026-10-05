@@ -2741,8 +2741,6 @@ const PENDING_TEXT = '功能开发中'
 export const SCHEDULE_TEXT = {
   title: '定时任务',
   hint: '按设定的周期自动发起工作流运行',
-  pending: PENDING_TEXT,
-  pendingHint: '定时任务尚未开放，完成后可在此处管理',
 
   // ---- 列表
   create: '新建定时任务',
