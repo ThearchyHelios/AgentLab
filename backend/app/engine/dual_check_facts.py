@@ -229,6 +229,13 @@ def _value_text(item: str, value: Any) -> str:
     return str(value)
 
 
+def _same_fact(item: str, a: Any, b: Any) -> bool:
+    """目录里的一项和要写的是不是同一个说法：业务日期只看哪一列（规则、时区是补充），文字压掉多余的空白比。"""
+    if item == "business_date":
+        return isinstance(a, Mapping) and isinstance(b, Mapping) and a.get("column") == b.get("column")
+    return isinstance(a, str) and isinstance(b, str) and " ".join(a.split()) == " ".join(b.split())
+
+
 async def record_choices(candidates: list[Mapping[str, Any]], *, run_id: str, node_title: str,
                          actor: str | None) -> dict[str, list[dict[str, Any]]]:
     """把审核人的选择写进数据目录：{written: [{source, table, item}], skipped: [{reason}]}。永远不抛：数据源没了、
@@ -268,8 +275,13 @@ async def _write(session: Any, row: DataSource, fact: Fact, *, note: str, actor:
         entry = await catalog.read_entry(session, row.id, fact.table)
         notes = entry.notes if entry else {}
         version = entry.version if entry else 0
-        live = notes.get(fact.item) if isinstance(notes.get(fact.item), dict) else None
-        live = live if live is not None and live.get("status") != "rejected" else None
+        stored = notes.get(fact.item) if isinstance(notes.get(fact.item), dict) else None
+        if stored is not None and stored.get("status") == "rejected" and _same_fact(fact.item, stored.get("value"),
+                                                                                     fact.value):
+            # 同一个说法以前被人明确驳回过：两次人工判断对不上，不替人拿主意
+            return False, (f"「{fact.table}」的{label}「{_value_text(fact.item, fact.value)}」曾被人工驳回，"
+                           f"与这次指标「{fact.metric}」的选择相反，未写入。如需更改，请到数据目录中修改")
+        live = stored if stored is not None and stored.get("status") != "rejected" else None
         value = fact.value
         if fact.item == "business_date" and live is not None and isinstance(live.get("value"), dict) \
                 and live["value"].get("column") == value.get("column"):

@@ -188,6 +188,21 @@ async def test_the_same_column_inferred_is_confirmed_and_keeps_its_rule(shop):
     assert (item["source"], item["status"]) == ("human", "confirmed")
 
 
+async def test_a_rejected_item_is_not_brought_back_but_a_rejected_other_value_does_not_block(shop):
+    """同一个说法以前被人驳回过：两次人工判断对不上，不写；驳回的是别的说法：照写。"""
+    name, source_id = shop
+    await seed(source_id, {"business_date": catalog.make_item({"column": "paid_date"}, "llm", "rejected")})
+    out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "b", source=name)], run_id="run-1",
+                               node_title="复核", actor=None)
+    assert out["written"] == [] and "曾被人工驳回" in out["skipped"][0]["reason"]
+    assert (await entry_of(source_id)).version == 1
+
+    out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "a", source=name)], run_id="run-2",
+                               node_title="复核", actor=None)
+    assert out["written"] == [{"source": name, "table": "orders", "item": "business_date"}]
+    assert (await entry_of(source_id)).notes["business_date"]["value"] == {"column": "order_date"}
+
+
 async def test_a_missing_source_or_an_unrecordable_choice_is_reported(shop):
     name, _ = shop
     out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "b", source="no_such_source"),
