@@ -59,11 +59,22 @@ interface MetricView {
   full: DualCheckMetric | null
 }
 
-/** 服务端预告的一边：写的话写到哪（where 是 「orders」（shop）的业务日期 这样的说法）、写成什么 */
+/**
+ * 服务端预告的一边：写的话写到哪（where 是 「orders」（shop）的业务日期 这样的说法）、写成什么（value 是给人看的
+ * 写法，raw 是原样的取值，和别的指标的说法比是不是同一个时用）
+ */
 type PreviewSide =
-  | { write: true; table: string; source: string | null; item: string; where: string; value: string }
+  | { write: true; table: string; source: string | null; item: string; where: string; value: string; raw: unknown }
   | { write: false }
+type WritingSide = Extract<PreviewSide, { write: true }>
 interface CatalogPreview { a: PreviewSide; b: PreviewSide }
+
+/**
+ * 同一次裁决里，别的指标按当前的选择落到同一项上（同一数据源、同一张表、同一项）的：differ 是说法和这一边不同的指标名
+ * ——业务日期、去重规则说法不同时服务端一项都不写；joined 是条件和这一边不同的指标名——有效记录条件用 AND 合成一句写
+ */
+interface Peers { differ: string[]; joined: string[] }
+type PreviewPeers = Partial<Record<'a' | 'b', Peers>>
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
 const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
@@ -97,8 +108,9 @@ function notesOf(texts: string[]): { standard: boolean; notes: string[] } {
  * 服务端没有预告时（老服务端），审核人的选择可能被记进数据目录的形状：照服务端写目录的门槛（dual_check_facts.derive）
  * ——两条 SQL 不等价、没用兜底、差异恰好一条，而且是时间列、筛选条件或聚合。几个输入都对不上时节点把各自的差异合成
  * 一份（每个输入至少一条），所以「恰好一条」也就是只有一个输入对不上。过了这道门槛也不一定写：只有一边按时间筛、
- * 多出的条件是指标自己的范围、采用了不去重的一边都不写，这些卡上看不出来（差异条目只有方面和原话），所以只说必要
- * 条件，并把不写的几种照实说出来（DUAL_CHECK_TEXT.approval.catalog）
+ * 多出的条件是指标自己的范围、采用了不去重的一边都不写，同一次裁决里几个指标给同一张表记的业务日期、去重规则不同时
+ * 一项都不写，这些卡上看不出来（差异条目只有方面和原话，没有预告也认不出写到哪张表），所以只说必要条件，并把不写的
+ * 几种照实说出来（DUAL_CHECK_TEXT.approval.catalog）
  */
 function catalogOf(metric: DualCheckMetric, items: { aspect: string; text: string }[]): CatalogAspect | null {
   if (metric.diff?.equivalent === true || metric.diff?.fallback === true || items.length !== 1) return null
@@ -119,7 +131,7 @@ function previewSideOf(raw: unknown): PreviewSide | undefined {
   const label = CATALOG_TABLE_FIELD_LABEL[item as keyof typeof CATALOG_TABLE_FIELD_LABEL]
   return {
     write: true, table, source, item,
-    where: DUAL_CHECK_TEXT.log.catalogItem(table, source ?? undefined, label), value: patchValueText(item, s.value),
+    where: DUAL_CHECK_TEXT.log.catalogItem(table, source ?? undefined, label), value: patchValueText(item, s.value), raw: s.value,
   }
 }
 
@@ -132,6 +144,51 @@ function previewOf(raw: unknown): CatalogPreview | null {
   const a = previewSideOf((raw as Record<string, unknown>).a)
   const b = previewSideOf((raw as Record<string, unknown>).b)
   return a && b ? { a, b } : null
+}
+
+/** 两边写的是不是同一个数据源、同一张表的同一项（服务端写目录前按这三样归拢） */
+const sameTarget = (a: PreviewSide, b: PreviewSide): boolean =>
+  a.write && b.write && a.table === b.table && a.source === b.source && a.item === b.item
+
+const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
+/** 同一项的两个说法是不是同一个（同服务端的 _same_fact）：业务日期只看哪一列，其余是文字、压掉多余的空白比 */
+function sameFact(item: string, a: unknown, b: unknown): boolean {
+  if (item === 'business_date') return isRecord(a) && isRecord(b) && a.column === b.column
+  const flat = (s: string) => s.split(/\s+/).filter(Boolean).join(' ')
+  return typeof a === 'string' && typeof b === 'string' && flat(a) === flat(b)
+}
+
+/**
+ * 每个指标的预告是单独算的，服务端写目录前却把同一次裁决里落到同一张表同一项上的说法归拢成一项
+ * （dual_check_facts._merged）：业务日期一张表只有一个、去重规则说的未必是同一件事，说法不同就一项都不写；有效记录
+ * 条件都在排除无效记录，用 AND 合成一句写。这里按其余指标当前的选择，给每个指标的两种选择各找出落到同一项上的指标
+ * （见 Peers），卡上照它说。只看预告会写的一边：选「两边都不对」、还没选的，服务端不会并进来；预告说不写的，多半是
+ * 差异对不上目录项，服务端同样不并。少数是因为目录里已有的说法才不写，服务端仍会把它并进来、可能让这一项都不写，
+ * 可预告里没有它落到哪一项，卡上看不出，所以结尾说以时间线上的记录为准
+ */
+function peersOf(views: MetricView[], choices: Record<string, DualCheckChoice>): Map<string, PreviewPeers> {
+  const adopted: { id: string; name: string; side: WritingSide }[] = []
+  for (const v of views) {
+    const c = choices[v.id]
+    const side = c === 'a' || c === 'b' ? v.preview?.[c] : undefined
+    if (side?.write) adopted.push({ id: v.id, name: v.name, side })
+  }
+  const out = new Map<string, PreviewPeers>()
+  for (const v of views) {
+    const peers: PreviewPeers = {}
+    for (const c of ['a', 'b'] as const) {
+      const mine = v.preview?.[c]
+      if (!mine?.write) continue
+      // 说法和这一边不同的指标：业务日期、去重规则让整组都不写，有效记录条件要合成一句
+      const names = [...new Set(adopted
+        .filter((o) => o.id !== v.id && sameTarget(o.side, mine) && !sameFact(mine.item, o.side.raw, mine.raw))
+        .map((o) => o.name))]
+      if (!names.length) continue
+      peers[c] = mine.item === 'valid_filter' ? { differ: [], joined: names } : { differ: names, joined: [] }
+    }
+    out.set(v.id, peers)
+  }
+  return out
 }
 
 function viewsOf(summary: DualCheckSummaryItem[], card: DualCheckCard | null): MetricView[] {
@@ -267,6 +324,8 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const pending = views.filter((v) => !choices[v.id]).length
+  // 预告要按其余指标当前的选择补上「同一项上说法不同」「合成一句」：选择一变，各块的说法跟着变
+  const peers = useMemo(() => peersOf(views, choices), [views, choices])
 
   /** 提交裁决（approved 为真，value 是 {choices, note}）或驳回（认不出指标时的出口） */
   const send = async (approved: boolean) => {
@@ -338,7 +397,7 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
       ) : (
         <>
           {views.map((v) => (
-            <MetricBlock key={v.id} view={v} name={`${uid}-${v.id}`} choice={choices[v.id]}
+            <MetricBlock key={v.id} view={v} name={`${uid}-${v.id}`} choice={choices[v.id]} peers={peers.get(v.id)}
                          onChoose={(c) => setChoices((cur) => ({ ...cur, [v.id]: c }))} />
           ))}
 
@@ -364,8 +423,8 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
 }
 
 /** 一个不一致的指标：名字、两个值、相差多少、差异说明、对照两条 SQL、三选一 */
-function MetricBlock({ view, name, choice, onChoose }: {
-  view: MetricView; name: string; choice?: DualCheckChoice; onChoose: (c: DualCheckChoice) => void
+function MetricBlock({ view, name, choice, peers, onChoose }: {
+  view: MetricView; name: string; choice?: DualCheckChoice; peers?: PreviewPeers; onChoose: (c: DualCheckChoice) => void
 }) {
   const uid = useId()
   // 只有兜底说明（或只有解析失败）时默认展开：一条具体说法都没有，审核人只能对照原文判断
@@ -425,7 +484,7 @@ function MetricBlock({ view, name, choice, onChoose }: {
       {expanded && view.full && <Compare id={`${uid}-cmp`} metric={view.full} />}
       {view.preview ? (
         // 服务端预告了：两边都不写就不提数据目录
-        (view.preview.a.write || view.preview.b.write) && <CatalogPreviewNote preview={view.preview} choice={choice} />
+        (view.preview.a.write || view.preview.b.write) && <CatalogPreviewNote preview={view.preview} peers={peers} choice={choice} />
       ) : view.catalog && (
         <p className="mt-1.5 text-2xs leading-relaxed text-dim" data-dual-catalog={view.catalog}>{T.catalog[view.catalog]}{T.catalog.tail}</p>
       )}
@@ -450,31 +509,44 @@ function MetricBlock({ view, name, choice, onChoose }: {
   )
 }
 
-const sameTarget = (a: PreviewSide, b: PreviewSide): boolean =>
-  a.write && b.write && a.table === b.table && a.source === b.source && a.item === b.item
+/** 预告里的一句：说什么、这一选会不会写（说法不同、都不写的不算）、是不是说法不同、是不是要和别的条件合写 */
+interface Clause { side: DualCheckChoice; text: string; write: boolean; conflict: boolean; joined: boolean }
 
 /**
  * 服务端预告的「记入数据目录」：三个选择各一句，审核人当前选的那一句加重——选之前三句都看得到，选了之后一眼看出这一选
- * 会往目录里写什么。两边写的是同一项（只差取值，比如业务日期按哪一列）时，后一句省掉「哪张表的哪一项」
+ * 会往目录里写什么。两边写的是同一项（只差取值，比如业务日期按哪一列）时，后一句省掉「哪张表的哪一项」。
+ * peers 是同一次裁决里别的指标按当前的选择落到同一项上的（peersOf）：说法不同的这一句改说都不记，有效记录条件补一句
+ * 合写；选择变了跟着变
  */
-function CatalogPreviewNote({ preview, choice }: { preview: CatalogPreview; choice?: DualCheckChoice }) {
+function CatalogPreviewNote({ preview, peers, choice }: { preview: CatalogPreview; peers?: PreviewPeers; choice?: DualCheckChoice }) {
   const P = T.catalogPreview
-  const said = (side: 'a' | 'b'): string => {
+  const skip = (side: DualCheckChoice): Clause => ({ side, text: P.skip(T.choices[side]), write: false, conflict: false, joined: false })
+  const clause = (side: 'a' | 'b'): Clause => {
     const s = preview[side]
-    if (!s.write) return P.skip(T.choices[side])
-    return side === 'b' && sameTarget(preview.a, s) ? P.writeSame(T.choices.b, s.value) : P.write(T.choices[side], s.where, s.value)
+    if (!s.write) return skip(side)
+    // 前一句已经写明了是哪张表的哪一项（说法不同的那句也写），这一句省掉
+    const short = side === 'b' && sameTarget(preview.a, s)
+    const { differ = [], joined = [] } = peers?.[side] ?? {}
+    if (differ.length) {
+      const names = P.metricNames(differ)
+      const text = short ? P.conflictSame(T.choices.b, names) : P.conflict(T.choices[side], s.where, names)
+      return { side, text, write: false, conflict: true, joined: false }
+    }
+    const text = short ? P.writeSame(T.choices.b, s.value) : P.write(T.choices[side], s.where, s.value)
+    return joined.length
+      ? { side, text: text + P.joined(P.metricNames(joined)), write: true, conflict: false, joined: true }
+      : { side, text, write: true, conflict: false, joined: false }
   }
-  const clauses: [DualCheckChoice, string, boolean][] = [
-    ['a', said('a'), preview.a.write], ['b', said('b'), preview.b.write], ['neither', P.skip(T.choices.neither), false],
-  ]
+  const clauses = [clause('a'), clause('b'), skip('neither')]
   return (
     <p className="mt-1.5 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-catalog="preview">
       {P.head}
-      {clauses.map(([side, text, write], i) => (
+      {clauses.map(({ side, text, write, conflict, joined }, i) => (
         <Fragment key={side}>
           {i > 0 && '；'}
           <span className={clsx(choice === side && 'font-medium')} style={choice === side ? { color: 'var(--text)' } : undefined}
-                data-dual-catalog-side={side} data-write={write ? '' : undefined} data-current={choice === side ? '' : undefined}>
+                data-dual-catalog-side={side} data-write={write ? '' : undefined} data-current={choice === side ? '' : undefined}
+                data-conflict={conflict ? '' : undefined} data-joined={joined ? '' : undefined}>
             {text}
           </span>
         </Fragment>

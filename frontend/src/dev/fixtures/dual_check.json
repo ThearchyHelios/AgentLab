@@ -1,5 +1,5 @@
 {
-  "_note": "双盲复算的预览用例和 scripts/check-verify.mjs 共用的夹具。表名、数字都是虚构的通用示例，不来自任何真实数据。各处的 diff（差异说明）是服务端 explain_sql_diff 对同一对 SQL 的真实输出（方言 sqlite），catalog_preview 和 variants 里的 catalog（采用哪一边会往数据目录里写什么）是服务端写目录预告的真实输出，都由 backend/tests/test_dual_check_fixture.py 核对和重新生成，不要手改。variants 是另几对 SQL 及其差异说明，检查脚本拿来换掉「销售额」那个指标，看不同的差异下卡上怎么说",
+  "_note": "双盲复算的预览用例和 scripts/check-verify.mjs 共用的夹具。表名、数字都是虚构的通用示例，不来自任何真实数据。各处的 diff（差异说明）是服务端 explain_sql_diff 对同一对 SQL 的真实输出（方言 sqlite），catalog_preview 和 variants、peers 里的 catalog（采用哪一边会往数据目录里写什么）是服务端写目录预告的真实输出，都由 backend/tests/test_dual_check_fixture.py 核对和重新生成，不要手改；merges 里的 written 是服务端按那几种选择真写一遍（record_choices）的结果，同一个测试核对，它要建临时数据源才算得出，不重新生成，报不一致时照报出的实际结果改。variants 是另几对 SQL 及其差异说明，检查脚本拿来换掉「销售额」那个指标，看不同的差异下卡上怎么说；peers 换掉「退款率」对不上的那个输入，和「销售额」落到数据目录的同一项上，merges 是检查脚本看的几种组合（同一次裁决里几个指标说法不同、要合写时卡上怎么说）",
   "approval": {
     "id": "ap-dc-0001",
     "run_id": "run-dc-0001",
@@ -658,6 +658,168 @@
           "reason": "指标「销售额」两边差在能否解析，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
         }
       }
+    }
+  },
+  "peers": {
+    "time": {
+      "sql": [
+        "SELECT COUNT(*) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id\nWHERE o.paid_at >= '2026-09-01'\n  AND o.paid_at < '2026-09-08'",
+        "SELECT COUNT(*) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id\nWHERE o.created_at >= '2026-09-01'\n  AND o.created_at < '2026-09-08'"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "time",
+            "text": "原流程按 paid_at 筛时间，盲算按 created_at"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "-   AND orders.paid_at >= '2026-09-01'",
+          "+   AND orders.created_at >= '2026-09-01'",
+          "-   AND orders.paid_at < '2026-09-08'",
+          "+   AND orders.created_at < '2026-09-08'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "paid_at"
+          }
+        },
+        "b": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "created_at"
+          }
+        }
+      }
+    },
+    "dedup": {
+      "sql": [
+        "SELECT COUNT(DISTINCT o.id) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id",
+        "SELECT COUNT(o.id) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "aggregate",
+            "text": "原流程对 orders.id 去重计数，盲算没去重"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "-   COUNT(DISTINCT orders.id)",
+          "+   COUNT(orders.id)"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "dedup",
+          "value": "对 id 计数时去重"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「退款率」被采纳的盲算没有去重：不去重是这个指标自己的算法，不是表的去重规则，不写入数据目录"
+        }
+      }
+    },
+    "filter": {
+      "sql": [
+        "SELECT COUNT(*) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id\nWHERE o.status <> 'cancelled'",
+        "SELECT COUNT(*) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "filter",
+            "text": "原流程排除了 orders.status = 'cancelled' 的行，盲算没有"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "-   orders.id = refunds.order_id AND orders.status <> 'cancelled'",
+          "+   orders.id = refunds.order_id"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "valid_filter",
+          "value": "status <> 'cancelled'"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「退款率」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+        }
+      }
+    }
+  },
+  "merges": {
+    "time_split": {
+      "gmv": null,
+      "refund_rate": "time",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "b"
+      },
+      "written": []
+    },
+    "time_same": {
+      "gmv": null,
+      "refund_rate": "time",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "a"
+      },
+      "written": [
+        {
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "paid_at"
+          }
+        }
+      ]
+    },
+    "dedup_columns": {
+      "gmv": "dedup",
+      "refund_rate": "dedup",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "a"
+      },
+      "written": []
+    },
+    "filters": {
+      "gmv": "filter_extra",
+      "refund_rate": "filter",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "a"
+      },
+      "written": [
+        {
+          "table": "orders",
+          "item": "valid_filter",
+          "value": "status <> 'test' AND status <> 'cancelled'"
+        }
+      ]
     }
   }
 }

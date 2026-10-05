@@ -25,8 +25,10 @@ import data from './dual_check.json'
  * ?syn=dual-check-approval 另认地址上的几个参数（检查脚本用；不带时 payload 只有约定里的几项，同老服务端）：
  * - variant=<名字>：「销售额」的摘要换成 variants 里那一对 SQL 的（前 3 条差异的原话、是否只有兜底，同节点的写法），
  *   工件由检查脚本按同一个变体伪造
- * - catalog=1：摘要里每个指标带上服务端预告的「采用哪一边会往数据目录里写什么」（catalog_preview；换了变体的
- *   「销售额」用变体的 catalog）。catalog=bad：「销售额」带一份认不出的预告
+ * - peer=<名字>：「退款率」的摘要同样换成 peers 里那一对 SQL 的。peers 和「销售额」（或换上的变体）落到数据目录的
+ *   同一项上，看同一次裁决里几个指标说法不同、要合写时卡上怎么说（夹具的 merges）
+ * - catalog=1：摘要里每个指标带上服务端预告的「采用哪一边会往数据目录里写什么」（catalog_preview；换了变体、peers 的
+ *   指标用它们自己的 catalog）。catalog=bad：「销售额」带一份认不出的预告
  * - on_reject=<值>：payload 带上节点实际生效的「未采用原流程时」
  */
 const approval = (patch: Partial<Approval> = {}): Approval => ({
@@ -40,11 +42,12 @@ interface Variant { diff: { items: { aspect: string; text: string }[] }; catalog
 function approvalOf(search: string): Approval {
   const q = new URLSearchParams(search)
   const variant = (data.variants as unknown as Record<string, Variant>)[q.get('variant') ?? '']
+  const peer = (data.peers as unknown as Record<string, Variant>)[q.get('peer') ?? '']
   const catalog = q.get('catalog')
   const onReject = q.get('on_reject')
   const previews = data.catalog_preview as unknown as Record<string, unknown>
   const summary = data.approval.payload.summary.map((s) => {
-    const swapped = s.metric_id === 'gmv' && variant ? variant : null
+    const swapped = s.metric_id === 'gmv' && variant ? variant : s.metric_id === 'refund_rate' && peer ? peer : null
     const items = swapped?.diff.items
     return {
       ...s,
