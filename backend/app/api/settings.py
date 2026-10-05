@@ -563,6 +563,66 @@ async def verify_model_spec(session: AsyncSession, node_config: dict[str, Any] |
 
 
 # --------------------------------------------------------------------------
+# 通知：定时任务推送 Webhook 时拼运行链接用的对外访问地址
+# --------------------------------------------------------------------------
+
+#: 设置里 notify 这一组。public_base_url 是别人打开 AgentLab 用的地址（https://agentlab.example.com），通知里的
+#: 运行链接 = 它 + /runs/{运行 id}。服务端不知道自己在反向代理后面叫什么，只能由人填；留空的通知里不附链接
+NOTIFY_GROUP = "notify"
+NOTIFY_DEFAULTS: dict[str, Any] = {"public_base_url": None}
+NOTIFY_SETTING_LABEL = {"public_base_url": "对外访问地址"}
+
+
+def _base_url_problem(value: Any) -> str | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    label = NOTIFY_SETTING_LABEL["public_base_url"]
+    hint = (f"「{label}」需要是 http:// 或 https:// 开头的完整地址（例如 https://agentlab.example.com），"
+            f"留空表示通知里不附运行链接，当前为「{value}」")
+    if not isinstance(value, str):
+        return hint
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:
+        return hint
+    if parts.scheme not in ("http", "https") or not parts.hostname or " " in value.strip():
+        return hint
+    if parts.query or parts.fragment:
+        return f"「{label}」不能带 ? 或 # 之后的部分，运行链接会接在地址后面，当前为「{value}」"
+    return None
+
+
+def notify_problem(value: Any) -> str | None:
+    """设置页写进来的 notify 这一组有什么问题，没问题返回 None。"""
+    if not isinstance(value, dict):
+        return f"「通知」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key, item in value.items():
+        if key not in NOTIFY_DEFAULTS:
+            return (f"「通知」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{NOTIFY_SETTING_LABEL[k]}」" for k in NOTIFY_DEFAULTS))
+        if problem := _base_url_problem(item):
+            return problem
+    return None
+
+
+def notify_values(stored: Any) -> dict[str, Any]:
+    """库里存的（或刚写进来的）notify 一组 → 补齐默认、规范化：去掉首尾空白和末尾的 /，空串当没填；存坏了的按没填。"""
+    stored = stored if isinstance(stored, dict) else {}
+    url = stored.get("public_base_url")
+    if not isinstance(url, str) or not url.strip() or _base_url_problem(url):
+        return {"public_base_url": None}
+    return {"public_base_url": url.strip().rstrip("/")}
+
+
+async def notify_settings(session: AsyncSession) -> dict[str, Any]:
+    """设置里的 notify 一组，没存过的补默认。定时任务推送 Webhook 时从这里读。"""
+    row = await session.get(Setting, NOTIFY_GROUP)
+    return notify_values(row.value if row else None)
+
+
+# --------------------------------------------------------------------------
 # 用户设置
 # --------------------------------------------------------------------------
 
@@ -592,6 +652,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     JUDGE_GROUP: dict(JUDGE_DEFAULTS),
     # 核查（双盲复算、反方审稿、审批质询）：核查模型、三项的开关和上限、每日金额上限。和裁判一组一样由用户定
     VERIFY_GROUP: verify_values(None),
+    # 通知：定时任务的 Webhook 里拼运行链接用的对外访问地址
+    NOTIFY_GROUP: notify_values(None),
 }
 
 
@@ -647,6 +709,7 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     # 裁判、核查设置按引擎实际生效的样子给：存坏了的项显示默认，存了 null 的上限显示不限
     merged[JUDGE_GROUP] = judge_values(stored.get(JUDGE_GROUP))
     merged[VERIFY_GROUP] = verify_values(stored.get(VERIFY_GROUP))
+    merged[NOTIFY_GROUP] = notify_values(stored.get(NOTIFY_GROUP))
     for key, value in stored.items():
         merged.setdefault(key, value)
     return merged
@@ -667,6 +730,11 @@ async def put_settings(
         raise HTTPException(422, problem)
     if VERIFY_GROUP in payload.values and (problem := verify_problem(payload.values[VERIFY_GROUP])):
         raise HTTPException(422, problem)
+    if NOTIFY_GROUP in payload.values:
+        if problem := notify_problem(payload.values[NOTIFY_GROUP]):
+            raise HTTPException(422, problem)
+        # 存规范化之后的：末尾带 / 的地址拼链接会多出一个斜杠
+        payload.values[NOTIFY_GROUP] = notify_values(payload.values[NOTIFY_GROUP])
     for key, value in payload.values.items():
         if key in (TRUST_KEY, "limits", JUDGE_SPEND, VERIFY_SPEND):
             # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，

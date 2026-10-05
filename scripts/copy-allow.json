@@ -44,6 +44,12 @@
       "reason": "按用户数据源描述里的业务词（采购、供应商）造的示例问法，这里的「供应商」是采购供应商，不是模型接入"
     },
     {
+      "file": "backend/app/scheduler/webhook.py",
+      "text": "钉钉",
+      "rule": "钉",
+      "reason": "「钉钉」是 Webhook 通知的平台名（定时任务的消息格式：通用 / 飞书 / 企业微信 / 钉钉），用在格式不可选、格式和群机器人地址对不上的报错里，不是「钉住」的意思"
+    },
+    {
       "file": "backend/app/seed.py",
       "text": "print(json.dumps(...))",
       "rule": "半角标点",
