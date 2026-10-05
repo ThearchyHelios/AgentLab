@@ -4,6 +4,12 @@
 // 而不是按定时任务的时区、预览不防抖、非法 cron 只弹一句不知道指哪一项、启用开关不带版本号（别人改过也照样覆盖）、
 // 立即运行之后没有下文、触发历史只有一页、保存过的 Webhook 地址又被原样显示出来、改了别的字段却把地址清掉、
 // 记录页看不出哪些运行来自定时任务、390px 窄屏被表单撑出横向滚动。
+// 还有几处时序和口径：晚到的刷新把刚切换的开关盖回去、先开触发历史再开设置时带着旧版本撞假的 409、保存途中又改了
+// 别的字段时替换过的地址明文留在框里、服务端会拒的组合（未发布 + 正式运行、必填没填、已发布版本里没有的字段）
+// 照样放行、测试消息的结果把服务端的整句又套一层。
+//
+// 浏览器的本机时区故意设成 America/Los_Angeles，和定时任务的时区（Asia/Shanghai、America/New_York）都不同：
+// 两者相同时「按定时任务时区写」和「按本机写」在页面上看不出区别，时间相关的断言一律比对按定时任务时区写出的原文。
 //
 // 页面是真页面（/schedules 走真的应用外壳），接口全部在浏览器层答掉：定时任务、触发历史、预览、变量、工作流列表
 // 都是这里的假数据（虚构的门店周报、库存日报），写请求照约定改这里的假状态；设置接口读真的、只把 notify 一组换成
@@ -194,17 +200,120 @@ await section('纯函数：表单 ⇄ 请求体', async () => {
     && m.freqProblem({ ...m.DEFAULT_FREQ, preset: 'daily', time: '' }) === '请填写时间')
 })
 
+await section('纯函数：服务端会拒的组合、保存回来怎么接、测试结果', async () => {
+  const m = await import(await load('/src/pages/schedules/model.ts'))
+  const fields = [{ name: 'date', required: true }, { name: 'region', required: true, default: '华东' }, { name: 'note' },
+    { name: 'blank_default', required: true, default: '' }]
+  const ip = (inputs, fs = fields) => JSON.stringify(m.inputProblems(inputs, fs))
+  const cases = [
+    ['都填了', { date: '{{ schedule.yesterday }}', blank_default: 'x' }, { unknown: [], missing: [] }],
+    ['必填没填（默认值为空串也算没有默认值）', {}, { unknown: [], missing: ['date', 'blank_default'] }],
+    ['只填了空白算没填', { date: '  ', blank_default: 'x' }, { unknown: [], missing: ['date'] }],
+    ['多出来的字段', { date: 'a', blank_default: 'x', draft_only: 'y' }, { unknown: ['draft_only'], missing: [] }],
+    ['多出来但留空的不交、不算', { date: 'a', blank_default: 'x', draft_only: '' }, { unknown: [], missing: [] }],
+  ]
+  const bad = cases.filter(([, inputs, want]) => ip(inputs) !== JSON.stringify(want))
+  check(`inputProblems：${cases.length} 种情况`, !bad.length, bad.map(([n, inputs]) => `${n}：${ip(inputs)}`).join('；'))
+  check('入口没声明字段：什么键都收，不报', ip({ anything: 'x' }, []) === JSON.stringify({ unknown: [], missing: [] }))
+
+  const fresh = { ...m.formOf(null, 'Asia/Shanghai'), name: '库存日报', workflowId: 'wf-stock', runClass: 'formal' }
+  const p1 = m.formProblems(fresh, null, { published: null, fields: [{ name: 'warehouse', required: true }] })
+  check('新建：正式运行 + 没发布、必填没填，两样都拦', !!p1.runClass && !!p1.inputs, JSON.stringify(p1))
+  check('……工作流还没取回来（发布状态不知道）时不判', !m.formProblems(fresh, null, {}).runClass)
+  check('……探索运行不要求发布', !m.formProblems({ ...fresh, runClass: 'exploratory' }, null, { published: null }).runClass)
+  const saved = {
+    id: 's1', name: '门店周报', workflow_id: 'wf-weekly', workflow_name: '门店周报', cron: '0 9 * * 1', timezone: 'Asia/Shanghai',
+    run_class: 'formal', input_template: {}, enabled: true, overlap: 'skip', misfire_grace_s: 3600, webhook: null,
+    next_run_at: null, last_fire: null, description_text: '', created_by: null, created_at: '', updated_at: '', version: 3,
+  }
+  const edit = m.formOf(saved)
+  const ctx = { published: null, fields: [{ name: 'date', required: true }] }
+  check('修改：没动工作流、运行类别、输入时服务端不重新核对，前端也不拦（工作流后来撤了发布也能改名、停用）',
+    Object.keys(m.formProblems({ ...edit, name: '新名字' }, saved, { ...ctx, recheck: false })).length === 0)
+  check('……动了这三样就照新建一样拦', !!m.formProblems(edit, saved, { ...ctx, recheck: true }).runClass)
+
+  const sv = m.serverFieldValue
+  check('服务端指的那一项：改了它值就变，改别的不变', sv('name', { ...edit, name: 'X' }) !== sv('name', { ...edit, name: 'XY' })
+    && sv('name', edit) === sv('name', { ...edit, misfireGraceS: 60 })
+    && sv('run_class', edit) !== sv('run_class', { ...edit, runClass: 'exploratory' })
+    && sv('misfire_grace_s', edit) !== sv('misfire_grace_s', { ...edit, misfireGraceS: 60 })
+    && sv('not_a_field', edit) === null)
+
+  const wbase = { ...edit, webhook: { ...edit.webhook, on: true, format: 'feishu' } }
+  const sent = { ...wbase, webhook: { ...wbase.webhook, replaceUrl: true, url: 'https://open.feishu.cn/hook/secret-token-zz99' } }
+  const back = { ...wbase, webhook: { ...wbase.webhook, replaceUrl: false, url: '' } }
+  check('保存途中没再动：换成刚存下的', JSON.stringify(m.rebaseForm(sent, sent, back)) === JSON.stringify(back))
+  const during = m.rebaseForm({ ...sent, name: '途中改名' }, sent, back)
+  check('保存途中改了名字：名字留着，地址换成刚存下的（不再留明文）', during.name === '途中改名' && during.webhook.url === ''
+    && during.webhook.replaceUrl === false, JSON.stringify(during.webhook))
+  const evs = m.rebaseForm({ ...sent, webhook: { ...sent.webhook, events: ['failed'] } }, sent, back)
+  check('……途中改了 Webhook 的事件：事件留着，地址照样换掉', JSON.stringify(evs.webhook.events) === '["failed"]' && evs.webhook.url === '')
+
+  const t = m.webhookTestText
+  const tests = [
+    [{ ok: true, http_status: 200, message: '请到接收端确认已收到' }, '测试消息已送达（HTTP 200）：请到接收端确认已收到'],
+    [{ ok: true, http_status: 200, message: '测试消息已送达（HTTP 200）' }, '测试消息已送达（HTTP 200）'],
+    [{ ok: true, http_status: 204, message: '' }, '测试消息已送达（HTTP 204）'],
+    [{ ok: false, http_status: 404, message: 'open.feishu.cn 返回 HTTP 404：not found' }, '测试消息发送失败：open.feishu.cn 返回 HTTP 404：not found'],
+    [{ ok: false, http_status: 404, message: '推送失败：open.feishu.cn 返回 HTTP 404：not found' }, '测试消息发送失败：open.feishu.cn 返回 HTTP 404：not found'],
+    [{ ok: false, http_status: null, message: '无法连接 open.feishu.cn' }, '测试消息发送失败：无法连接 open.feishu.cn'],
+    [{ ok: false, http_status: 200, message: 'open.feishu.cn 返回错误码 19002：bad sign' }, '测试消息发送失败（HTTP 200）：open.feishu.cn 返回错误码 19002：bad sign'],
+  ]
+  const wrong = tests.filter(([r, want]) => t(r) !== want)
+  check(`测试结果：服务端给整句、给补充说明都只说一遍（${tests.length} 种）`, !wrong.length, wrong.map(([r]) => t(r)).join('；'))
+})
+
 // ---------------------------------------------------------------- 夹具：虚构的门店周报、库存日报
 
 const NOW = Date.now()
 const iso = (ms) => new Date(ms).toISOString()
 const H = 3600e3
-/** 下一个北京时间周一 09:00（UTC 01:00）之后再往后 k 周 */
+/** 下一个北京时间周一 09:00（UTC 01:00）之后再往后 k 周（k 为负数是往前） */
 function nextMonday9(k = 0) {
   const d = new Date(NOW)
   d.setUTCHours(1, 0, 0, 0)
   while (d.getUTCDay() !== 1 || d.getTime() <= NOW) d.setUTCDate(d.getUTCDate() + 1)
   return d.getTime() + k * 7 * 24 * H
+}
+
+// 按时区写时刻：和页面同一套写法，这里独立实现一遍，用来比对页面上的原文
+const WEEKDAY = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+const wallFormats = new Map()
+/** 某个时刻在某个时区里的年月日、时分、星期（0 是周日） */
+function wall(ms, tz) {
+  if (!wallFormats.has(tz)) {
+    wallFormats.set(tz, new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: 'numeric', day: 'numeric',
+      hour: 'numeric', minute: 'numeric', weekday: 'short', hourCycle: 'h23' }))
+  }
+  const p = Object.fromEntries(wallFormats.get(tz).formatToParts(new Date(ms)).map((x) => [x.type, x.value]))
+  return { y: +p.year, mo: +p.month, d: +p.day, h: +p.hour % 24, mi: +p.minute,
+    wd: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(p.weekday) }
+}
+const pad2 = (n) => String(n).padStart(2, '0')
+/** full：「2026-10-12 周一 09:00」；short：同一年省掉年份「10/12 周一 09:00」，跨年写「2027/1/4 周一 09:00」 */
+function zoned(ms, tz, mode = 'short') {
+  const w = wall(ms, tz)
+  const hm = `${pad2(w.h)}:${pad2(w.mi)}`
+  if (mode === 'full') return `${w.y}-${pad2(w.mo)}-${pad2(w.d)} ${WEEKDAY[w.wd]} ${hm}`
+  const md = `${w.mo}/${w.d}`
+  return `${w.y === wall(Date.now(), tz).y ? md : `${w.y}/${md}`} ${WEEKDAY[w.wd]} ${hm}`
+}
+/**
+ * 一个时区里从现在往后符合「分 时 * * 星期」的前 n 个时刻（按 15 分钟一格往后找，够用），照真服务端那样按所选时区算。
+ * 认不出的写法返回 null
+ */
+function occurrences(cron, tz, n) {
+  const [mi, ho, dom, mon, dow] = String(cron).trim().split(/\s+/)
+  const minute = Number(mi)
+  const hour = Number(ho)
+  if (!/^\d+$/.test(mi ?? '') || !/^\d+$/.test(ho ?? '') || dom !== '*' || mon !== '*') return null
+  const days = dow === '*' ? null : new Set(String(dow).split(',').map((d) => Number(d) % 7))
+  const out = []
+  for (let t = Math.ceil((NOW + 1) / 900e3) * 900e3, i = 0; out.length < n && i < 8 * 7 * 96; t += 900e3, i++) {
+    const w = wall(t, tz)
+    if (w.h === hour && w.mi === minute && (!days || days.has(w.wd))) out.push(t)
+  }
+  return out
 }
 
 const WORKFLOWS = [
@@ -260,16 +369,19 @@ const S2 = {
   version: 1,
 }
 
-/** 触发历史：25 条，新的在前，按 20 条一页给。几种类型、结局、通知结果各放一条 */
+/**
+ * 触发历史：25 条，新的在前，按 20 条一页给。计划时间都是北京时间周一 09:00（往前数第 i+1 周）。
+ * 几种类型、结局、通知结果各放一条；错过且超出宽限的照服务端的记法是 kind=misfire、status=skipped_misfire
+ */
 function makeFires() {
   const out = []
   for (let i = 0; i < 25; i++) {
-    const at = iso(NOW - (i + 1) * 7 * 24 * H)
+    const at = iso(nextMonday9(-(i + 1)))
     let f = fire(`f${String(i).padStart(2, '0')}`, { fire_at: at, created_at: at })
     if (i === 0) f = { ...f, kind: 'manual', notified: [{ event: 'finished', status: 'ok', at }, { event: 'failed', status: 'failed', at }] }
     if (i === 1) f = { ...f, status: 'skipped_overlap', run_id: null, run_status: null, reason: '上一次运行（#9f8e7d）尚未结束' }
     if (i === 2) f = { ...f, kind: 'misfire', run_status: 'failed' }
-    if (i === 3) f = { ...f, status: 'skipped_misfire', run_id: null, run_status: null, reason: '服务停机，错过触发时间 3 小时，超出补发宽限 1 小时' }
+    if (i === 3) f = { ...f, kind: 'misfire', status: 'skipped_misfire', run_id: null, run_status: null, reason: '服务停机，错过触发时间 3 小时，超出补发宽限 1 小时' }
     if (i === 4) f = { ...f, status: 'failed_to_start', run_id: null, run_status: null, reason: '工作流「门店周报」还没有发布：正式运行需要已发布的版本' }
     out.push(f)
   }
@@ -295,10 +407,11 @@ function freshState(patch = {}) {
   }
 }
 
-const shanghaiDay = (ms) => new Date(ms + 8 * H).toISOString().slice(0, 10)
-
-/** 预览：几种认得出的写法按北京时间排出 5 次，非法的回 422 和出错的那一项（照约定的形状） */
-function previewReply(body) {
+/**
+ * 预览：照真服务端那样按所选时区排出接下来几次（认不出的写法按每天一次凑数），非法的回 422 和出错的那一项
+ * （照约定的形状）。state.previewNoZone 时时间不带时区后缀（UTC），看页面是不是和别处一个口径
+ */
+function previewReply(body, state) {
   const [mi] = String(body?.cron ?? '').split(/\s+/)
   if (Number(mi) > 59) return { status: 422, json: { detail: '第 1 段（分钟）应在 0–59 之间，现为 61', field: 'cron' } }
   if (body?.timezone === 'Mars/Base') return { status: 422, json: { detail: '不认识的时区：Mars/Base', field: 'timezone' } }
@@ -306,12 +419,19 @@ function previewReply(body) {
   if (Object.values(tpl).some((v) => String(v).includes('schedule.nope'))) {
     return { status: 422, json: { detail: '输入「date」里有不认识的变量：schedule.nope', field: 'input_template' } }
   }
-  const weekly = body?.cron === '0 9 * * 1'
-  const next = Array.from({ length: body?.n ?? 5 }, (_, k) => iso(weekly ? nextMonday9(k) : NOW + (k + 1) * 24 * H))
-  const yesterday = shanghaiDay(new Date(next[0]).getTime() - 24 * H)
+  const tz = body?.timezone ?? 'UTC'
+  const n = body?.n ?? 5
+  const times = occurrences(body?.cron, tz, n) ?? Array.from({ length: n }, (_, k) => NOW + (k + 1) * 24 * H)
+  const next = times.map((t) => (state?.previewNoZone ? iso(t).replace(/Z$/, '') : iso(t)))
+  const day = wall(times[0] - 24 * H, tz)
+  const yesterday = `${day.y}-${pad2(day.mo)}-${pad2(day.d)}`
   const inputs = Object.fromEntries(Object.entries(tpl).map(([k, v]) => [k, String(v).replace(/\{\{\s*schedule\.yesterday\s*\}\}/g, yesterday)]))
-  return { json: { description_text: weekly ? '每周一 09:00（Asia/Shanghai）' : '每天 09:00（Asia/Shanghai）', next, inputs } }
+  const weekly = body?.cron === '0 9 * * 1'
+  return { json: { description_text: `${weekly ? '每周一 09:00' : '每天 09:00'}（${tz}）`, next, inputs } }
 }
+
+/** 测试消息的答复照后端的写法：message 是状态码之外的补充说明 */
+const WEBHOOK_TEST_OK = { ok: true, http_status: 200, message: '请到接收端确认已收到' }
 
 /** 照约定改假状态：PATCH 核对版本、按地址省略 / 空串改 Webhook */
 function applyPatch(s, body) {
@@ -351,7 +471,7 @@ async function reply(state, method, path, url, body) {
   }
   const m = path.match(/^\/schedules\/([^/]+)(\/.*)?$/)
   if (method === 'GET' && path === '/schedules') return { json: { items: state.schedules } }
-  if (method === 'POST' && path === '/schedules/preview') return previewReply(body)
+  if (method === 'POST' && path === '/schedules/preview') return previewReply(body, state)
   if (method === 'GET' && path === '/schedules/variables') return { json: VARIABLES }
   if (method === 'POST' && path === '/schedules') {
     const id = 's-new'
@@ -371,7 +491,9 @@ async function reply(state, method, path, url, body) {
     if (!s) return { status: 404, json: { detail: '定时任务不存在或已被删除' } }
     if (method === 'GET' && !rest) return { json: s }
     if (method === 'PATCH' && !rest) {
-      if (body?.version !== s.version) return { status: 409, json: { detail: '定时任务已被修改（版本不符），请刷新后重试' } }
+      if (body?.version !== s.version) {
+        return { status: 409, json: { detail: `这个定时任务已被修改（当前是第 ${s.version} 版，提交的是第 ${body?.version} 版），请刷新后再保存` } }
+      }
       const next = applyPatch(s, body)
       state.schedules = state.schedules.map((x) => (x.id === id ? next : x))
       return { json: next }
@@ -393,7 +515,7 @@ async function reply(state, method, path, url, body) {
       const more = start + limit < state.fires.length
       return { json: { items, next_before: more ? items.at(-1).fire_at : null } }
     }
-    if (method === 'POST' && rest === '/webhook/test') return { json: { ok: true, http_status: 200, message: '飞书机器人已接收' } }
+    if (method === 'POST' && rest === '/webhook/test') return { json: state.webhookTest ?? WEBHOOK_TEST_OK }
   }
   if (method === 'GET' && path === '/workflows') return { json: WORKFLOWS }
   if (method === 'GET' && path === '/workflows/wf-weekly/versions/3') return { json: VERSION3 }
@@ -414,10 +536,13 @@ async function reply(state, method, path, url, body) {
 
 const browser = await chromium.launch({ executablePath: CHROME })
 
+/** 浏览器的本机时区：和夹具里定时任务的时区都不同，见开头的说明 */
+const LOCAL_TZ = 'America/Los_Angeles'
+
 /** 开一页：接口按 reply 答，记下每个请求；所有原生对话框、页面报错都记下，最后核对 */
 async function open(path, { state = freshState(), width = 1280, height = 900, theme = 'dark' } = {}) {
   state.theme = theme
-  const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
+  const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, timezoneId: LOCAL_TZ })
   opened.add(ctx)
   ctx.setDefaultTimeout(6000)
   ctx.setDefaultNavigationTimeout(30000)
@@ -465,6 +590,8 @@ const until = async (fn, ms = 6000, step = 100) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const shot = async (page, name) => { if (SHOTS) await page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true }) }
 const writes = (sent, re) => sent.filter((s) => !s.key.startsWith('GET ') && re.test(s.key))
+/** 几段页面文字压成一行，失败时的说明不被换行截断 */
+const oneLine = (texts) => texts.map((t) => t.replace(/\s+/g, ' ').trim()).join(' ｜ ')
 const text = (page, sel) => page.locator(sel).first().innerText()
 /**
  * 本页自己的横向溢出：页面根和页里会横向滚动的容器（overflow-x 为 auto / scroll）。不量整页：390 宽时外壳里收起的
@@ -495,7 +622,7 @@ const inViewX = (page, sel) => page.evaluate((s) => {
 // ---------------------------------------------------------------- 列表
 
 await section('列表：渲染', async () => {
-  const { page, errors } = await open('/schedules')
+  const { page, sent, errors } = await open('/schedules')
   await page.locator('[data-schedule-row]').first().waitFor()
   const rows = await page.locator('[data-schedule-row]').count()
   check('两行定时任务', rows === 2, String(rows))
@@ -506,13 +633,9 @@ await section('列表：渲染', async () => {
   check('名字链到详情', await r1.locator('[data-schedule-name]').getAttribute('href') === '/schedules/s-weekly')
   const next = r1.locator('[data-schedule-next] time')
   const nextText = await next.innerText()
-  const wantAbs = (() => {
-    const d = new Date(S1.next_run_at)
-    const p = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
-      .formatToParts(d).reduce((o, x) => ({ ...o, [x.type]: x.value }), {})
-    return `${p.month}/${p.day}`
-  })()
-  check('下次运行：相对时间 + 按定时任务时区的绝对时间', nextText.includes('3 小时后') && nextText.includes(wantAbs), nextText)
+  const wantAbs = zoned(Date.parse(S1.next_run_at), 'Asia/Shanghai')
+  check(`下次运行：相对时间 + 按定时任务时区（Asia/Shanghai，不是本机的 ${LOCAL_TZ}）的绝对时间`,
+    nextText.includes('3 小时后') && nextText.includes(wantAbs), `${nextText} ｜ 应含 ${wantAbs}`)
   const title = await next.getAttribute('title')
   check('下次运行悬停看时区', !!title && title.includes('Asia/Shanghai'), title ?? '')
   check('下次运行的 datetime 是 ISO', (await next.getAttribute('datetime')) === S1.next_run_at)
@@ -524,6 +647,9 @@ await section('列表：渲染', async () => {
   check('暂停的：标「已暂停」，下次运行写暂停中', t2.includes('已暂停') && t2.includes('暂停中'), t2.replace(/\s+/g, ' ').slice(0, 160))
   check('跳过的上次触发写明原因', t2.includes('上次未结束已跳过')
     && ((await r2.locator('[data-schedule-last] [title]').first().getAttribute('title')) ?? '').includes('尚未结束'))
+  const lastAt = zoned(Date.parse(S2.last_fire.fire_at), 'America/New_York')
+  const lastText = await r2.locator('[data-schedule-last] time').innerText()
+  check('上次触发的时间按这一行自己的时区（America/New_York）写', lastText === lastAt, `${lastText} ｜ 应为 ${lastAt}`)
   check('启用开关是 switch，状态对得上', await r1.locator('[data-schedule-toggle]').getAttribute('role') === 'switch'
     && await r1.locator('[data-schedule-toggle]').getAttribute('aria-checked') === 'true'
     && await r2.locator('[data-schedule-toggle]').getAttribute('aria-checked') === 'false')
@@ -531,7 +657,8 @@ await section('列表：渲染', async () => {
     && await r1.locator('[data-schedule-edit]').getAttribute('href') === '/schedules/s-weekly'
     && await r1.locator('[data-schedule-delete]').count() === 1)
   check('顶部有「新建定时任务」', (await page.locator('[data-schedule-create]').innerText()).includes('新建定时任务'))
-  check('只读：没有写请求', true)
+  const listWrites = writes(sent, /./)
+  check('只读：列表渲染不发写请求', listWrites.length === 0, listWrites.map((w) => w.key).join('、'))
   await shot(page, 'list-dark')
   check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
 })
@@ -569,15 +696,16 @@ await section('列表：启用开关', async () => {
   const again = writes(sent, /^PATCH \/schedules\/s-weekly$/)
   check('再点一次带上新版本（4）', again.length === 2 && again[1].body?.version === 4 && again[1].body?.enabled === true,
     JSON.stringify(again.map((p) => p.body)))
-  // 别处改过：409 时说服务端的原话、重新载入
+  // 别处改过：409 时说清是别处改的、已重新载入。服务端那句是写给表单保存的（「请刷新后再保存」），开关不照搬，放进详情
   state.schedules = state.schedules.map((s) => (s.id === 's-stock' ? { ...s, version: 7 } : s))
   const t2 = page.locator('[data-schedule-row="s-stock"] [data-schedule-toggle]')
   await t2.click()
-  const toastText = await until(async () => {
-    const t = await page.locator('[data-toast]').allInnerTexts()
-    return t.find((x) => x.includes('版本不符')) ?? null
-  })
-  check('版本不符（409）：说清原因并重新载入', !!toastText, toastText ?? (await page.locator('[data-toast]').allInnerTexts()).join(' ｜ '))
+  const conflictToast = page.locator('[data-toast]', { hasText: '别处被修改' })
+  const toastText = await until(async () => (await conflictToast.count()) ? conflictToast.first().innerText() : null)
+  check('版本不符（409）：说清是别处改的、已重新载入，不叫人去刷新、也不提保存',
+    !!toastText && toastText.includes('库存日报') && toastText.includes('已重新载入') && !toastText.includes('刷新') && !toastText.includes('保存'),
+    toastText ?? (await page.locator('[data-toast]').allInnerTexts()).join(' ｜ '))
+  check('……服务端的原话放在详情里', ((await conflictToast.first().locator('details').textContent().catch(() => '')) ?? '').includes('当前是第 7 版'))
   const reloaded = await until(() => sent.filter((s) => s.key === 'GET /schedules').length >= 2)
   check('……重新拉了一次列表，开关回到服务端的状态', !!reloaded && await t2.getAttribute('aria-checked') === 'false')
   check('键盘：开关能聚焦、空格切换', await (async () => {
@@ -630,6 +758,42 @@ await section('列表：立即运行与删除', async () => {
   check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
 })
 
+/** 某个 GET 的答复按请求到达那一刻的快照、晚 ms 才回：模拟一次在写操作之前读到旧值、之后才回来的刷新 */
+const slowGet = (state, path, pick, ms = 1500) => async (method, p) => {
+  if (method !== 'GET' || p !== path) return null
+  const snap = structuredClone(pick(state))
+  await sleep(ms)
+  return { json: snap }
+}
+
+await section('列表：晚到的刷新不盖掉刚切换的开关', async () => {
+  const state = freshState()
+  const { page, sent, errors } = await open('/schedules', { state })
+  const row = page.locator('[data-schedule-row="s-weekly"]')
+  const toggle = row.locator('[data-schedule-toggle]')
+  await toggle.waitFor()
+  state.override = slowGet(state, '/schedules', (st) => ({ items: st.schedules }))
+  const lists = () => sent.filter((s) => s.key === 'GET /schedules').length
+  const before = lists()
+  // 立即运行之后静默刷新一次：这次读到的是开关之前的快照，晚 1.5 秒才回
+  await row.locator('[data-schedule-run]').click()
+  await until(() => lists() > before)
+  await until(async () => !(await row.locator('[data-schedule-run]').isDisabled()))
+  await toggle.click()
+  check('开关先变成关', await until(async () => (await toggle.getAttribute('aria-checked')) === 'false'))
+  await sleep(1900)
+  check('晚到的列表答复不把开关盖回去', await toggle.getAttribute('aria-checked') === 'false' && await row.getAttribute('data-enabled') === 'false',
+    `aria-checked=${await toggle.getAttribute('aria-checked')}`)
+  state.override = null
+  await toggle.click()
+  await until(() => writes(sent, /^PATCH \/schedules\/s-weekly$/).length === 2)
+  const p = writes(sent, /^PATCH \/schedules\/s-weekly$/).map((x) => x.body)
+  check('再点一次带开关之后的版本（4），不撞 409', p[1]?.version === 4 && p[1]?.enabled === true, JSON.stringify(p))
+  await sleep(300)
+  check('……没有冲突提示', !(await page.locator('[data-toast]').allInnerTexts()).some((t) => t.includes('别处被修改')))
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
 // ---------------------------------------------------------------- 新建
 
 /** 在新建页上填好「门店周报，每周一 09:00，飞书 Webhook」 */
@@ -652,8 +816,10 @@ await section('新建：每周一 09:00 的请求体', async () => {
   const { page, sent, errors } = await open('/schedules/new')
   await page.locator('[data-schedule-form]').waitFor()
   check('页头写「新建定时任务」', (await page.locator('[data-schedules-page] header h1').innerText()).includes('新建定时任务'))
-  check('时区默认取本机（Asia/Shanghai）', await page.locator('[data-timezone]').inputValue() === 'Asia/Shanghai')
+  check(`时区默认取本机（${LOCAL_TZ}）`, await page.locator('[data-timezone]').inputValue() === LOCAL_TZ,
+    await page.locator('[data-timezone]').inputValue())
   await fillWeekly(page)
+  await page.locator('[data-timezone]').selectOption('Asia/Shanghai')
   // 正式运行：字段取已发布的 v3（没有画布上的 draft_only）
   await page.locator('[data-input-field="date"]').waitFor()
   check('正式运行的输入字段取已发布的 v3', await page.locator('[data-input-field]').count() === 2
@@ -666,9 +832,12 @@ await section('新建：每周一 09:00 的请求体', async () => {
   await page.locator('[data-input-field="date"] [data-var="schedule.yesterday"]').click()
   check('点变量插入模板', await page.locator('[data-input-field="date"] input').inputValue() === '{{ schedule.yesterday }}',
     await page.locator('[data-input-field="date"] input').inputValue())
-  await previewSays(page, '每周一 09:00')
+  await previewSays(page, '每周一 09:00（Asia/Shanghai）')
   const times = await page.locator('[data-preview-time]').allInnerTexts()
-  check('预览接下来 5 次触发', times.length === 5 && times.every((t) => /周一 09:00/.test(t)), times.join(' ｜ '))
+  const want = occurrences('0 9 * * 1', 'Asia/Shanghai', 5).map((t) => zoned(t, 'Asia/Shanghai', 'full'))
+  check(`预览接下来 5 次触发：按所选时区（不是本机的 ${LOCAL_TZ}）写，逐条对得上`,
+    times.length === 5 && times.every((t, i) => t.includes(want[i])) && want.every((w) => w.endsWith('周一 09:00')),
+    `${oneLine(times)} ｜ 应为 ${want.join(' ｜ ')}`)
   check('预览写频率的中文说法', (await text(page, '[data-schedule-preview]')).includes('每周一 09:00'))
   const rendered = await until(async () => {
     const t = await page.locator('[data-input-rendered="date"]').innerText().catch(() => '')
@@ -736,7 +905,11 @@ await section('新建：预览出错与保存前的问题', async () => {
   await page.locator('[data-preview-time]').nth(4).waitFor()
   check('改对之后说明消失、预览回来', await page.locator('[data-freq-error]').count() === 0)
   await page.locator('[data-timezone]').selectOption('America/New_York')
-  check('换时区之后预览按新时区写', await until(async () => (await text(page, '[data-schedule-preview]')).includes('America/New_York')))
+  await previewSays(page, '（America/New_York）')
+  const ny = occurrences('0 9 * * 1', 'America/New_York', 5).map((t) => zoned(t, 'America/New_York', 'full'))
+  const nyTimes = await page.locator('[data-preview-time]').allInnerTexts()
+  check('换时区之后预览按新时区写：5 个时刻逐条对得上', nyTimes.length === 5 && nyTimes.every((t, i) => t.includes(ny[i])),
+    `${oneLine(nyTimes)} ｜ 应为 ${ny.join(' ｜ ')}`)
   await page.locator('[data-input-field="date"] input').fill('{{ schedule.nope }}')
   const inErr = await until(async () => {
     const t = await page.locator('[data-inputs-error]').innerText().catch(() => '')
@@ -766,6 +939,85 @@ await section('新建：离开前确认', async () => {
   check('没有页面报错', !errors.length, errors.join(' ｜ '))
 })
 
+await section('新建：换工作流、未发布与输入字段', async () => {
+  const { page, errors, state } = await open('/schedules/new')
+  await page.locator('[data-schedule-form]').waitFor()
+  const picker = page.locator('[data-workflow-picker] input')
+  const pick = async (id) => {
+    await picker.click()
+    await page.locator(`[data-workflow-option="${id}"]`).click()
+  }
+  const name = page.locator('[data-field="name"]')
+  const save = page.locator('[data-schedule-save]')
+  const saveTitle = async () => (await save.getAttribute('title')) ?? ''
+  await pick('wf-weekly')
+  check('选了门店周报：名称自动填成门店周报', await name.inputValue() === '门店周报')
+  await pick('wf-stock')
+  check('改选库存日报：自动填的名称跟着换', await name.inputValue() === '库存日报', await name.inputValue())
+  check('库存日报没有发布：运行类别替人选探索运行', await page.locator('[data-run-class="exploratory"]').getAttribute('aria-checked') === 'true')
+
+  // 服务端对「正式运行 + 没发布」在保存时就回 422：前端当场拦下，不说「到点才失败」
+  await page.locator('[data-run-class="formal"]').click()
+  const problem = page.locator('[data-run-class-problem]')
+  const pt = await problem.innerText().catch(() => '')
+  check('没发布又选正式运行：运行类别下面写明要先发布或改用探索运行', pt.includes('发布') && pt.includes('探索运行') && !pt.includes('发起失败'), pt)
+  check('……不能保存，按钮上说还要处理运行类别', await save.isDisabled() && (await saveTitle()).includes('运行类别'), await saveTitle())
+  await shot(page, 'new-not-published')
+  await page.locator('[data-run-class="exploratory"]').click()
+  check('改回探索运行：问题收起', await problem.count() === 0)
+  const wh = page.locator('[data-input-field="warehouse"]')
+  const wt = await wh.innerText()
+  check('必填且没有默认值：说要填写后才能保存，不说到点才失败', wt.includes('请填写') && !wt.includes('到点'), wt.replace(/\s+/g, ' '))
+  check('……不能保存，按钮上说还要处理输入', await save.isDisabled() && (await saveTitle()).includes('输入'), await saveTitle())
+  await wh.locator('input').fill('北仓')
+  check('填了之后可以保存', await until(async () => !(await save.isDisabled())), await saveTitle())
+  await name.fill('我的日报')
+  await pick('wf-weekly')
+  check('人改过的名称换工作流时不覆盖', await name.inputValue() === '我的日报', await name.inputValue())
+
+  // 探索运行用画布上的字段（有 draft_only），正式运行用已发布的 v3（没有）：交上去会被拒，写清是哪一版里没有
+  await page.locator('[data-input-field="draft_only"] input').fill('只在画布上')
+  await page.locator('[data-input-field="date"] input').fill('2026-10-01')
+  await page.locator('[data-run-class="formal"]').click()
+  const stale = page.locator('[data-input-stale="draft_only"]')
+  await stale.waitFor()
+  const st = await stale.innerText()
+  check('切到正式运行：画布独有的字段写明已发布的 v3 中没有，不说工作流里没有', st.includes('已发布的 v3 中没有这个字段') && !st.includes('工作流中已没有'),
+    st.replace(/\s+/g, ' '))
+  check('……交上去会被拒：不能保存，按钮上说还要处理输入', await save.isDisabled() && (await saveTitle()).includes('输入'), await saveTitle())
+  if (SHOTS) {
+    // 等运行类别的颜色过渡播完、把这一行挪到保存栏上面再截
+    await sleep(300)
+    await stale.evaluate((el) => el.scrollIntoView({ block: 'center' }))
+  }
+  await shot(page, 'new-stale-field')
+  await stale.getByRole('button', { name: '移除' }).click()
+  check('移除之后可以保存', await until(async () => !(await save.isDisabled())), await saveTitle())
+
+  // 保存被拒、指明运行类别：说明写在运行类别下面，不只在底部
+  state.override = (method, path) => (method === 'POST' && path === '/schedules'
+    ? { status: 422, json: { detail: '「门店周报」还没有发布版本，正式运行只能从发布版本发起。请先在编排页发布，或改为探索运行', field: 'run_class' } }
+    : null)
+  await save.click()
+  const rcErr = await until(async () => (await page.locator('[data-run-class-error]').innerText().catch(() => '')) || null)
+  check('保存被拒、指明运行类别：说明写在运行类别下面', !!rcErr && rcErr.includes('还没有发布版本'), rcErr ?? '')
+  await shot(page, 'new-run-class-error')
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
+await section('新建：预览时间不带时区后缀', async () => {
+  const { page, errors } = await open('/schedules/new', { state: freshState({ previewNoZone: true }) })
+  await page.locator('[data-schedule-form]').waitFor()
+  await fillWeekly(page)
+  await page.locator('[data-timezone]').selectOption('Asia/Shanghai')
+  await previewSays(page, '每周一 09:00（Asia/Shanghai）')
+  const times = await page.locator('[data-preview-time]').allInnerTexts()
+  const want = occurrences('0 9 * * 1', 'Asia/Shanghai', 5).map((t) => zoned(t, 'Asia/Shanghai', 'full'))
+  check('不带时区后缀的时间按 UTC 读（和列表、触发历史一个口径），不按本机时间读', times.length === 5 && times.every((t, i) => t.includes(want[i])),
+    `${oneLine(times)} ｜ 应为 ${want.join(' ｜ ')}`)
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
 // ---------------------------------------------------------------- 详情
 
 await section('详情：Webhook 与运行链接地址', async () => {
@@ -777,12 +1029,34 @@ await section('详情：Webhook 与运行链接地址', async () => {
   check('已保存的地址只显示 url_hint', (await text(page, '[data-webhook-url-hint]')).includes('open.feishu.cn/…ab12')
     && await page.locator('[data-webhook-url]').count() === 0)
   check('没改动时保存按钮不可点', await page.locator('[data-schedule-save]').isDisabled())
-  await page.locator('[data-webhook-test]').click()
-  const result = await until(async () => {
-    const t = await page.locator('[data-webhook-test-result]').innerText().catch(() => '')
-    return t.includes('飞书机器人已接收') ? t : null
-  })
-  check('发送测试消息并显示结果', writes(sent, /^POST \/schedules\/s-weekly\/webhook\/test$/).length === 1 && !!result && result.includes('200'), result ?? '')
+  // 测试结果：服务端的 message 是补充说明时接在结局后面；是整句（老写法）时不再套一层。状态码只写一次
+  const testResult = async (reply, want) => {
+    state.webhookTest = reply
+    const before = writes(sent, /^POST \/schedules\/s-weekly\/webhook\/test$/).length
+    await page.locator('[data-webhook-test]').click()
+    await until(() => writes(sent, /^POST \/schedules\/s-weekly\/webhook\/test$/).length > before)
+    const got = await until(async () => {
+      const t = (await page.locator('[data-webhook-test-result]').innerText().catch(() => '')).trim()
+      return t === want ? t : null
+    }, 3000)
+    return got ?? (await page.locator('[data-webhook-test-result]').innerText().catch(() => '')).trim()
+  }
+  const times = (str, word) => str.split(word).length - 1
+  const okText = await testResult(null, '测试消息已送达（HTTP 200）：请到接收端确认已收到')
+  check('发送测试消息并显示结果：结局、状态码、补充说明各一遍', okText === '测试消息已送达（HTTP 200）：请到接收端确认已收到'
+    && await page.locator('[data-webhook-test-result="ok"]').count() === 1, okText)
+  const whole = await testResult({ ok: true, http_status: 200, message: '测试消息已送达（HTTP 200）' }, '测试消息已送达（HTTP 200）')
+  check('……服务端给的是整句：不再套一层', whole === '测试消息已送达（HTTP 200）' && times(whole, 'HTTP 200') === 1, whole)
+  const fail = await testResult({ ok: false, http_status: 404, message: 'open.feishu.cn 返回 HTTP 404：not found' },
+    '测试消息发送失败：open.feishu.cn 返回 HTTP 404：not found')
+  check('……发送失败：状态码只写一遍', fail === '测试消息发送失败：open.feishu.cn 返回 HTTP 404：not found' && times(fail, 'HTTP 404') === 1
+    && await page.locator('[data-webhook-test-result="failed"]').count() === 1, fail)
+  const failOld = await testResult({ ok: false, http_status: 404, message: '推送失败：open.feishu.cn 返回 HTTP 404：not found' },
+    '测试消息发送失败：open.feishu.cn 返回 HTTP 404：not found')
+  check('……「发送失败」「推送失败」不叠在一起', !failOld.includes('推送失败') && times(failOld, 'HTTP 404') === 1, failOld)
+  await page.locator('[data-webhook-test-result]').scrollIntoViewIfNeeded()
+  await shot(page, 'detail-webhook-test-failed')
+  state.webhookTest = null
   // 只改事件：PATCH 不带地址
   await page.locator('[data-webhook-event="awaiting_approval"]').check()
   check('改了 Webhook 设置后，测试要先保存', await page.locator('[data-webhook-test]').isDisabled())
@@ -848,7 +1122,7 @@ await section('详情：保存冲突与页头操作', async () => {
   await page.locator('[data-field="name"]').fill('又改一次')
   await page.locator('[data-schedule-save]').click()
   const conflict = await until(async () => (await page.locator('[data-schedule-conflict]').innerText().catch(() => '')) || null)
-  check('版本不符（409）：明确说已在别处修改，并给重新载入', !!conflict && conflict.includes('别处被修改') && conflict.includes('版本不符')
+  check('版本不符（409）：明确说已在别处修改，并给重新载入', !!conflict && conflict.includes('别处被修改') && conflict.includes('当前是第 9 版')
     && await page.locator('[data-schedule-reload]').count() === 1, conflict ?? '')
   check('……没改页面上填的内容', await page.locator('[data-field="name"]').inputValue() === '又改一次')
   await page.locator('[data-schedule-reload]').click()
@@ -861,6 +1135,124 @@ await section('详情：保存冲突与页头操作', async () => {
   await page.locator('header [data-schedule-run]').click()
   check('页头立即运行发 POST 并说结果', await until(async () => (await page.locator('[data-toast]').allInnerTexts()).some((x) => x.includes('已发起运行'))))
   check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
+await section('详情：保存被拒后的字段说明', async () => {
+  const { page, errors, state } = await open('/schedules/s-weekly')
+  await page.locator('[data-schedule-form]').waitFor()
+  const reject = (field, detail, when = () => true) => {
+    state.override = (method, path, body) => (method === 'PATCH' && path === '/schedules/s-weekly' && when(body)
+      ? { status: 422, json: { detail, field } } : null)
+  }
+  const name = page.locator('[data-field="name"]')
+  const save = page.locator('[data-schedule-save]')
+  reject('name', '名称不能是单个字母', (b) => b?.name === 'X')
+  await name.fill('X')
+  await save.click()
+  const said = await until(async () => (await page.locator('#schedule-name-error').innerText().catch(() => '')) || null)
+  check('保存被拒、指明名称：名称下面写服务端的说明', !!said && said.includes('名称不能是单个字母'), said ?? '')
+  check('……名称框标成出错、说明接到 aria-describedby', await name.getAttribute('aria-invalid') === 'true'
+    && await name.getAttribute('aria-describedby') === 'schedule-name-error',
+    `${await name.getAttribute('aria-invalid')} ｜ ${await name.getAttribute('aria-describedby')}`)
+  check('……底部写保存失败', await page.locator('[data-schedule-save-error]').count() === 1)
+  await shot(page, 'detail-name-rejected')
+  await name.fill('XY')
+  check('改了名称：名称下的说明和底部的保存失败都收起', await until(async () => await page.locator('#schedule-name-error').count() === 0
+    && await page.locator('[data-schedule-save-error]').count() === 0))
+  check('……名称框不再标成出错', await name.getAttribute('aria-invalid') === null)
+  await name.fill('X')
+  check('改回被拒的那个值：说明又出来（服务端说的就是这个值）', await until(async () => await page.locator('#schedule-name-error').count() === 1))
+
+  // 运行类别、补发宽限被拒：说明写在各自下面
+  await name.fill('门店周报 · 每周')
+  reject('run_class', '运行类别需要选择正式运行或探索运行')
+  await page.locator('[data-run-class="exploratory"]').click()
+  await save.click()
+  const rc = await until(async () => (await page.locator('[data-run-class-error]').innerText().catch(() => '')) || null)
+  check('运行类别被拒：说明写在运行类别下面', !!rc && rc.includes('运行类别需要选择'), rc ?? '')
+  await page.locator('[data-run-class="formal"]').click()
+  check('……改了运行类别，说明收起', await until(async () => await page.locator('[data-run-class-error]').count() === 0))
+  reject('misfire_grace_s', '补发宽限需要是 0 到 604800 之间的整数秒数（最长 7 天）')
+  await page.locator('[data-misfire]').selectOption('86400')
+  await save.click()
+  const ms = await until(async () => (await page.locator('#schedule-misfire-error').innerText().catch(() => '')) || null)
+  check('补发宽限被拒：说明写在补发宽限下面，选择框标成出错', !!ms && ms.includes('补发宽限')
+    && await page.locator('[data-misfire]').getAttribute('aria-invalid') === 'true', ms ?? '')
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
+await section('详情：保存途中又改了别的', async () => {
+  const { page, sent, errors, state } = await open('/schedules/s-weekly')
+  await page.locator('[data-schedule-form]').waitFor()
+  // PATCH 晚 1.2 秒才回，期间改名字
+  state.override = async (method, path) => {
+    if (method === 'PATCH' && path === '/schedules/s-weekly') await sleep(1200)
+    return null
+  }
+  const SECRET_URL = 'https://open.feishu.cn/open-apis/bot/v2/hook/secret-token-zz99'
+  await page.locator('[data-webhook-replace]').click()
+  await page.locator('[data-webhook-url]').fill(SECRET_URL)
+  await page.locator('[data-schedule-save]').click()
+  await until(() => writes(sent, /^PATCH /).length === 1)
+  await page.locator('[data-field="name"]').fill('途中改名')
+  await until(async () => !(await page.locator('[data-schedule-save]').innerText()).includes('正在保存'), 5000)
+  await sleep(200)
+  const values = await page.locator('[data-schedules-page] input').evaluateAll((els) => els.map((e) => e.value))
+  check('保存后地址只显示 url_hint，输入框里不留含令牌的完整地址', (await text(page, '[data-webhook-url-hint]').catch(() => '')).includes('…zz99')
+    && !values.some((v) => v.includes('secret-token')), values.filter((v) => v.includes('http')).join(' ｜ '))
+  check('途中改的名字还在、仍算未保存', await page.locator('[data-field="name"]').inputValue() === '途中改名'
+    && !(await page.locator('[data-schedule-save]').isDisabled()))
+  check('……Webhook 这一块不算未保存：可以发测试消息', !(await page.locator('[data-webhook-test]').isDisabled()))
+  state.override = null
+  await page.locator('[data-schedule-save]').click()
+  await until(() => writes(sent, /^PATCH /).length === 2)
+  await saveDone(page)
+  const p2 = writes(sent, /^PATCH /)[1]?.body
+  check('下一次保存只交名字，不再带地址', JSON.stringify(p2) === JSON.stringify({ name: '途中改名', version: 4 }), JSON.stringify(p2))
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
+await section('详情：晚到的刷新与先开触发历史', async () => {
+  const state = freshState()
+  const { page, sent, errors } = await open('/schedules/s-weekly', { state })
+  await page.locator('[data-schedule-form]').waitFor()
+  const toggle = page.locator('header [data-schedule-toggle]')
+  state.override = slowGet(state, '/schedules/s-weekly', (st) => st.schedules.find((s) => s.id === 's-weekly'))
+  const gets = () => sent.filter((s) => s.key === 'GET /schedules/s-weekly').length
+  const before = gets()
+  // 立即运行之后刷新一次：读到开关之前的快照，晚 1.5 秒才回
+  await page.locator('header [data-schedule-run]').click()
+  await until(() => gets() > before)
+  await until(async () => !(await page.locator('header [data-schedule-run]').isDisabled()))
+  await toggle.click()
+  check('页头开关先变成关', await until(async () => (await toggle.getAttribute('aria-checked')) === 'false'))
+  await sleep(1900)
+  check('晚到的刷新不把页头开关盖回去', await toggle.getAttribute('aria-checked') === 'false', `aria-checked=${await toggle.getAttribute('aria-checked')}`)
+  state.override = null
+  await toggle.click()
+  await until(() => writes(sent, /^PATCH /).length === 2)
+  const p = writes(sent, /^PATCH /).map((x) => x.body)
+  check('再点页头开关带开关之后的版本（4）', JSON.stringify(p[1]) === JSON.stringify({ enabled: true, version: 4 }), JSON.stringify(p))
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+
+  // 先开触发历史，期间别处改过、页头刷新过；再切到设置：表单是刷新后的内容，保存就该带这一版
+  const st2 = freshState()
+  const h = await open('/schedules/s-weekly?tab=history', { state: st2 })
+  await h.page.locator('[data-fire-id]').first().waitFor()
+  st2.schedules = st2.schedules.map((s) => (s.id === 's-weekly' ? { ...s, version: 9, name: '别处改过的名字' } : s))
+  await h.page.locator('header [data-schedule-run]').click()
+  await until(async () => (await h.page.locator('[data-schedules-page] header').innerText()).includes('别处改过的名字'))
+  await h.page.locator('[role=tab]', { hasText: '设置' }).click()
+  await h.page.locator('[data-schedule-form]').waitFor()
+  check('切到设置：表单是刷新后的内容', await h.page.locator('[data-field="name"]').inputValue() === '别处改过的名字')
+  await h.page.locator('[data-misfire]').selectOption('86400')
+  await h.page.locator('[data-schedule-save]').click()
+  await until(() => writes(h.sent, /^PATCH /).length === 1)
+  await saveDone(h.page)
+  const hp = writes(h.sent, /^PATCH /)[0]?.body
+  check('保存带的是表单所基于的那一版（9），不撞假的 409', JSON.stringify(hp) === JSON.stringify({ misfire_grace_s: 86400, version: 9 }), JSON.stringify(hp))
+  check('……没有冲突提示', await h.page.locator('[data-schedule-conflict]').count() === 0)
+  check('没有页面报错', !h.errors.length, h.errors.join(' ｜ '))
 })
 
 await section('详情：触发历史分页', async () => {
@@ -879,10 +1271,18 @@ await section('详情：触发历史分页', async () => {
     t1.replace(/\s+/g, ' '))
   check('补发写「补发」，运行状态照实写', (await row('f02').innerText()).includes('补发') && (await row('f02').innerText()).includes('失败'))
   check('错过已跳过写原因', (await row('f03').innerText()).includes('错过已跳过') && (await row('f03').innerText()).includes('超出补发宽限'))
+  const k3 = row('f03').locator('[data-fire-kind-chip]')
+  const k3title = (await k3.getAttribute('title')) ?? ''
+  check('错过且超出宽限、没有补发的：类型不写「补发」，悬停也不说补发了一次', (await k3.innerText()).trim() === '定时'
+    && !k3title.includes('补发的一次') && k3title.includes('没有补发'), `${await k3.innerText()} ｜ ${k3title}`)
   check('发起失败写原因', (await row('f04').innerText()).includes('发起失败') && (await row('f04').innerText()).includes('还没有发布'))
   const when = row('f05').locator('time')
-  check('计划时间按定时任务的时区写，悬停看时区', /周一 09:00|周\S \d{2}:\d{2}/.test(await when.innerText())
-    && ((await when.getAttribute('title')) ?? '').includes('Asia/Shanghai'), `${await when.innerText()} ｜ ${await when.getAttribute('title')}`)
+  check('计划时间悬停看时区', ((await when.getAttribute('title')) ?? '').includes('Asia/Shanghai'), (await when.getAttribute('title')) ?? '')
+  const shownAt = await page.locator('[data-fire-id] time').allInnerTexts()
+  const wantAt = makeFires().slice(0, 20).map((f) => zoned(Date.parse(f.fire_at), 'Asia/Shanghai'))
+  check(`计划时间按定时任务的时区（Asia/Shanghai，不是本机的 ${LOCAL_TZ}）写：20 行逐条对得上、都是周一 09:00`,
+    shownAt.length === 20 && shownAt.every((t, i) => t === wantAt[i]) && wantAt.every((w) => w.endsWith('周一 09:00')),
+    shownAt.map((t, i) => (t === wantAt[i] ? null : `${t} ≠ ${wantAt[i]}`)).filter(Boolean).slice(0, 3).join('；'))
   await page.locator('[data-fire-more]').click()
   await until(async () => (await page.locator('[data-fire-id]').count()) === 25)
   const more = sent.filter((s) => s.key === 'GET /schedules/s-weekly/fires').at(-1)
@@ -918,6 +1318,10 @@ await section('记录页：定时标记', async () => {
   check('手动发起的不标', await page.locator('[data-run-id="run-manual-1"] [data-run-schedule]').count() === 0)
   check('悬停写是哪个定时任务', await until(async () => ((await tag.getAttribute('title')) ?? '').includes('门店周报 · 每周')),
     (await tag.getAttribute('title')) ?? '')
+  // 整行是打开运行的按钮，按钮里放不了可聚焦的链接：至少让读屏在这一行的名字里听到来源
+  const rowName = page.getByRole('button', { name: /由定时任务「门店周报 · 每周」发起/ })
+  check('读屏：整行按钮的名字里带上是哪个定时任务发起的', await until(async () => (await rowName.count()) === 1)
+    && (await rowName.getAttribute('data-run-id')) === 'run-sched-1')
   await tag.click()
   check('点标记去那个定时任务（不打开运行）', await until(() => new URL(page.url()).pathname === '/schedules/s-weekly'), page.url())
   check('没有页面报错', !errors.length, errors.join(' ｜ '))
@@ -967,6 +1371,20 @@ await section('窄屏 390px 与浅色', async () => {
     })
     check(`${theme}：窄屏上预览排在频率下面、输入上面`, order.freq < order.preview && order.preview < order.inputs, JSON.stringify(order))
     await shot(form.page, `new-390-${theme}`)
+    // 换成没发布的库存日报、选正式运行：运行类别下面的说明、必填说明在窄屏上也排得开
+    await form.page.locator('[data-workflow-picker] input').click()
+    await form.page.locator('[data-workflow-option="wf-stock"]').click()
+    await form.page.locator('[data-run-class="formal"]').click()
+    await form.page.locator('[data-run-class-problem]').waitFor()
+    check(`${theme}：运行类别的问题说明不横向溢出、在屏幕里`, await overflow(form.page) <= 1
+      && await inViewX(form.page, '[data-run-class-problem]'), `${await overflow(form.page)}px`)
+    const tone = await form.page.evaluate(() => {
+      const el = document.querySelector('[data-run-class-problem]')
+      return { fg: getComputedStyle(el).color, bg: getComputedStyle(document.querySelector('[data-schedule-form] section')).backgroundColor }
+    })
+    check(`${theme}：问题说明的字和底色分得开`, tone.fg !== tone.bg, JSON.stringify(tone))
+    await form.page.locator('[data-run-class-problem]').scrollIntoViewIfNeeded()
+    await shot(form.page, `new-390-problem-${theme}`)
 
     const hist = await open('/schedules/s-weekly?tab=history', { ...narrow, theme })
     await hist.page.locator('[data-fire-id]').first().waitFor()

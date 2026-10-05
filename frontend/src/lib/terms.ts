@@ -2776,8 +2776,8 @@ export const SCHEDULE_TEXT = {
   deleteConsequences: ['不再按计划发起运行，删除后不可恢复', '已发起的运行及其记录不受影响'],
   deleteConfirm: '删除定时任务',
   deleted: (name: string) => `已删除定时任务「${name}」`,
-  /** 写操作遇到 409：服务端的原话后面接这句 */
-  conflictReloaded: '已重新载入最新设置，请确认后再操作',
+  /** 启用开关遇到版本不符（409）：服务端那句是写给表单保存的，开关用这句，原话放进详情 */
+  toggleConflict: (name: string) => `「${name}」已在别处被修改，已重新载入最新状态，请确认后再切换`,
 
   // ---- 立即运行的结果
   runStarted: '已发起运行',
@@ -2792,6 +2792,8 @@ export const SCHEDULE_TEXT = {
     manual: '手动「立即运行」',
     misfire: '错过触发时间后，在补发宽限内恢复时补发的一次',
   } as Record<import('../types').ScheduleFireKind, string>,
+  /** 错过且超出补发宽限、没有补发的（服务端记 kind=misfire、status=skipped_misfire）：类型按「定时」写 */
+  fireKindMissedHint: '按计划应在此时触发，错过后已超出补发宽限，没有补发',
   fireStatus: {
     started: '已发起',
     skipped_overlap: '上次未结束已跳过',
@@ -2868,7 +2870,8 @@ export const SCHEDULE_TEXT = {
   formalVersion: (v: number) => `每次按当时的发布版本发起，当前为 v${v}`,
   exploratory: '探索运行',
   exploratoryHint: '使用工作流当前保存的内容，结果不出具',
-  notPublished: '这个工作流尚未发布：到点时无法发起正式运行，会记为发起失败。请先发布，或改用探索运行',
+  /** 已保存的定时任务、这次没动工作流和运行类别，工作流后来撤了发布：保存照常，到点会发起失败 */
+  notPublished: '这个工作流目前没有发布版本：到点时无法发起正式运行，会记为发起失败。请先发布，或改用探索运行',
 
   // ---- 表单：输入
   inputs: '输入',
@@ -2880,7 +2883,10 @@ export const SCHEDULE_TEXT = {
   inputsFromVersion: (v: number) => `字段取自已发布的 v${v}`,
   inputsFromDraft: '字段取自工作流当前保存的内容',
   required: '必填',
+  /** 已保存的定时任务、这次没动输入：保存照常，留空到点会发起失败 */
   requiredNoDefault: '必填且没有默认值：留空时到点会发起失败',
+  /** 新建、或者这次改了工作流、运行类别、输入：服务端保存时就会拒 */
+  requiredFill: '必填且没有默认值，请填写后再保存',
   defaultValue: (v: string) => `默认：${v}`,
   variables: '插入变量',
   variablesClose: '收起变量',
@@ -2890,6 +2896,10 @@ export const SCHEDULE_TEXT = {
   rendered: (v: string) => `下次触发时为：${v}`,
   renderedEmpty: '下次触发时为空',
   staleField: '工作流中已没有这个字段',
+  /** 画布上有、正式运行用的已发布版本里没有 */
+  staleNotInVersion: (v: number) => `已发布的 v${v} 中没有这个字段`,
+  /** 接在上面两句后面：交上去会被拒 */
+  staleRemove: '保存前请移除',
   removeField: '移除',
 
   // ---- 表单：重叠与补发
@@ -2945,8 +2955,11 @@ export const SCHEDULE_TEXT = {
   testing: '正在发送…',
   testNeedSave: '保存后才能发送测试消息',
   testDirty: '测试使用已保存的设置，请先保存修改',
-  testOk: (status: number | null, message: string) => `测试消息已送达${status != null ? `（HTTP ${status}）` : ''}${message ? `：${message}` : ''}`,
-  testFailed: (status: number | null, message: string) => `测试消息发送失败${status != null ? `（HTTP ${status}）` : ''}${message ? `：${message}` : ''}`,
+  testOk: '测试消息已送达',
+  testFailed: '测试消息发送失败',
+  /** 结局后面接状态码和说明（两样都可能没有） */
+  testResult: (head: string, status: number | null, detail: string) =>
+    `${head}${status != null ? `（HTTP ${status}）` : ''}${detail ? `：${detail}` : ''}`,
 
   // ---- 通知里的运行链接（设置 notify 组，所有定时任务共用）
   linkBase: '通知中的运行链接',
@@ -2997,11 +3010,15 @@ export const SCHEDULE_TEXT = {
     urlInvalid: '请输入以 http:// 或 https:// 开头的地址',
     secret: '请填写新的签名密钥',
     events: '至少选择一个事件',
+    notPublished: '这个工作流还没有发布版本，正式运行需要已发布的版本。请先发布，或改用探索运行',
+    inputsMissing: (names: string) => `必填输入「${names}」还没有填写`,
+    inputsUnknown: (names: string) => `输入「${names}」对不上工作流的输入字段，请移除`,
   },
   /** 「还需处理」里各项的叫法 */
   problemField: {
-    name: '名称', workflow: '工作流', freq: '频率', timezone: '时区', url: 'Webhook 地址', secret: '签名密钥', events: '通知事件',
-  } as Record<'name' | 'workflow' | 'freq' | 'timezone' | 'url' | 'secret' | 'events', string>,
+    name: '名称', workflow: '工作流', freq: '频率', timezone: '时区', runClass: '运行类别', inputs: '输入', url: 'Webhook 地址',
+    secret: '签名密钥', events: '通知事件',
+  } as Record<'name' | 'workflow' | 'freq' | 'timezone' | 'runClass' | 'inputs' | 'url' | 'secret' | 'events', string>,
 
   // ---- 相对时间（将来）
   until: {
@@ -3029,6 +3046,8 @@ export const SCHEDULE_TEXT = {
   // ---- 记录页的定时标记
   runTag: '定时',
   runTagTitle: (name?: string | null) => (name ? `由定时任务「${name}」发起，点击查看` : '由定时任务发起，点击查看'),
+  /** 读屏念的来源（整行是打开运行的按钮，标记本身点不到，至少在名字里听到） */
+  runTagSr: (name?: string | null) => (name ? `由定时任务「${name}」发起` : '由定时任务发起'),
 }
 
 /** 运行对比：记录页里两次运行的对照。配方前后对照另有 COMPARE_TEXT，别混用 */

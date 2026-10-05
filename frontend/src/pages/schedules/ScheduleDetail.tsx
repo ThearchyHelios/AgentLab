@@ -45,7 +45,8 @@ type TabKey = 'settings' | 'history'
  * 和触发历史（?tab=history）。切到触发历史时表单不卸载，改到一半的内容还在。
  *
  * 两份状态分开记：schedule 是页头和摘要显示的、随时可以刷新的最新值；version 是表单保存时带的版本，只跟着自己的
- * 写操作（开关、保存）和明确的「重新载入」走。别人在这期间改过时表单保存就该 409，不能因为页头顺手刷新过就悄悄覆盖
+ * 写操作（开关、保存）和明确的「重新载入」走。别人在这期间改过时表单保存就该 409，不能因为页头顺手刷新过就悄悄覆盖。
+ * 唯一的例外是表单第一次挂上的那一刻：表单基于的就是那时的 schedule，版本对齐到它
  */
 export function ScheduleDetailPage({ id }: { id: string }) {
   const navigate = useNavigate()
@@ -62,11 +63,19 @@ export function ScheduleDetailPage({ id }: { id: string }) {
   const [busy, setBusy] = useState<null | 'toggle' | 'run' | 'delete'>(null)
   const now = useTicker(30_000)
   const loaded = useRef(false)
+  /**
+   * 读的序号：后发的读胜过先发的读；开关、保存成功时也加一，作废还在路上的读。那次读可能在写之前读到旧值、
+   * 在写的答复之后才回来，落地会把页头的开关、名字盖回旧的（详情页没有定时刷新，错的会一直挂着）
+   */
+  const seq = useRef(0)
+  const wrote = () => { seq.current++ }
 
   /** 读最新的定时任务，读到了返回 true。adopt：表单保存时也改用它的版本（首次打开、重新载入） */
   const load = useCallback(async (adopt: boolean): Promise<boolean> => {
+    const n = ++seq.current
     try {
       const s = await api.schedules.get(id)
+      if (n !== seq.current) return false
       rememberScheduleNames([s])
       setSchedule(s)
       setError(null)
@@ -74,6 +83,7 @@ export function ScheduleDetailPage({ id }: { id: string }) {
       loaded.current = true
       return true
     } catch (e) {
+      if (n !== seq.current) return false
       // 读到过之后刷新失败：页头照旧显示手上的，只在首次打开时整页报错
       if (!loaded.current || (e instanceof ApiError && e.status === 404)) setError(e)
       else if (adopt) toast.error(e)
@@ -90,6 +100,14 @@ export function ScheduleDetailPage({ id }: { id: string }) {
     if (tab === 'history') setHistorySeen(true)
     else setSettingsSeen(true)
   }, [tab])
+  // 表单第一次挂上时版本对齐到此刻的 schedule（渲染中改状态，React 当场重渲染，表单挂上时两者已经一致）。
+  // 直接打开触发历史时表单要等切过来才挂，这期间页头可能已经刷新过（立即运行之后、重连、开关冲突之后），
+  // 表单显示的是刷新后的内容，还拿首次打开时的版本保存就会撞上并不存在的 409
+  const [formBased, setFormBased] = useState(false)
+  if (settingsSeen && schedule && !formBased) {
+    setFormBased(true)
+    if (version !== schedule.version) setVersion(schedule.version)
+  }
 
   const pickTab = (k: string) => setParams((p) => {
     const next = new URLSearchParams(p)
@@ -111,6 +129,7 @@ export function ScheduleDetailPage({ id }: { id: string }) {
     const out = await setEnabled(s, enabled)
     if (out === 'conflict') await load(false)
     else if (out) {
+      wrote()
       setSchedule(out)
       // 表单的版本只在开关前后没有别人插进来时跟着走：页头是在别人改过之后刷新出来的，表单还是旧的那份，
       // 照旧带旧版本，保存时由服务端说清
@@ -189,6 +208,7 @@ export function ScheduleDetailPage({ id }: { id: string }) {
                   schedule={schedule}
                   version={version}
                   onSaved={(s) => {
+                    wrote()
                     rememberScheduleNames([s])
                     setSchedule(s)
                     setVersion(s.version)

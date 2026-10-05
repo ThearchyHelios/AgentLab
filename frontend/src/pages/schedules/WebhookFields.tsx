@@ -6,7 +6,7 @@ import { Field, Notice, Spinner, isComposing, toast, useRadioGroup } from '../..
 import { errorMessage } from '../../lib/errors'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import type { ScheduleEvent, ScheduleWebhook, ScheduleWebhookTest } from '../../types'
-import { SCHEDULE_EVENTS, WEBHOOK_FORMATS, isHttpUrl, type FormField, type WebhookForm } from './model'
+import { SCHEDULE_EVENTS, WEBHOOK_FORMATS, isHttpUrl, webhookTestText, type FormField, type WebhookForm } from './model'
 
 /**
  * Webhook 通知：格式、地址、签名密钥、订阅事件、发送测试消息，外加通知里运行链接用的服务访问地址。
@@ -136,8 +136,8 @@ export function WebhookFields({ value, onChange, saved, problems, scheduleId, un
           {test && !test.busy && (
             <Notice tone={test.result?.ok ? 'info' : 'err'} attr={{ 'data-webhook-test-result': test.result?.ok ? 'ok' : 'failed' }}>
               {test.result
-                ? (test.result.ok ? T.testOk : T.testFailed)(test.result.http_status, test.result.message)
-                : T.testFailed(null, errorMessage(test.error))}
+                ? webhookTestText(test.result)
+                : T.testResult(T.testFailed, null, errorMessage(test.error))}
             </Notice>
           )}
 

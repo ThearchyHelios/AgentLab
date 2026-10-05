@@ -33,8 +33,13 @@ function ScheduleListPage() {
   /** 每行正在做的事：开关、立即运行、删除各自禁用，不让同一行连点出两个请求 */
   const [busy, setBusy] = useState<Record<string, 'toggle' | 'run' | 'delete'>>({})
   const now = useTicker(30_000)
+  /**
+   * 读列表的序号：后发的读胜过先发的读；写操作成功时也加一，作废还在路上的读。那次读可能在写之前就读到了旧值、
+   * 却在写的答复之后才回来，落地会把刚换上的那一行（开关的结果、删掉的行）整行盖回去
+   */
   const seq = useRef(0)
   const hasRows = useRef(false)
+  const wrote = () => { seq.current++ }
 
   const load = useCallback(async (opts?: { silent?: boolean }) => {
     const n = ++seq.current
@@ -76,18 +81,24 @@ function ScheduleListPage() {
   const toggle = (s: Schedule, enabled: boolean) => act(s, 'toggle', async () => {
     const out = await setEnabled(s, enabled)
     if (out === 'conflict') await load()
-    else if (out) replace(out)
+    else if (out) {
+      wrote()
+      replace(out)
+    }
   })
   const run = (s: Schedule) => act(s, 'run', async () => {
     const out = await runNow(s, navigate)
     if (!out) return
+    wrote()
     // 只换上次触发：这一行在请求途中可能被开关改过，不拿点下去那一刻的旧值整行盖回去
     setRows((rs) => rs && rs.map((r) => (r.id === s.id ? { ...r, last_fire: out.fire } : r)))
     // 下次运行、运行状态以服务端为准，再静默取一遍
     void load({ silent: true })
   })
   const remove = (s: Schedule) => act(s, 'delete', async () => {
-    if (await removeSchedule(s)) setRows((rs) => rs && rs.filter((r) => r.id !== s.id))
+    if (!(await removeSchedule(s))) return
+    wrote()
+    setRows((rs) => rs && rs.filter((r) => r.id !== s.id))
   })
 
   const unsupported = isUnsupported(error)

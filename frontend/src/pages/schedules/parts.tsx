@@ -110,11 +110,16 @@ export function FireStatusChip({ fire }: { fire: ScheduleFire }) {
   )
 }
 
-/** 触发类型：定时 / 手动 / 补发 */
+/**
+ * 触发类型：定时 / 手动 / 补发。服务端把错过的触发都记成 kind=misfire，宽限内补发了的是 started，超出宽限没补发的
+ * 是 skipped_misfire：后者没有「补发」这回事，按「定时」写，结局由旁边的「错过已跳过」说
+ */
 export function FireKindChip({ fire }: { fire: ScheduleFire }) {
+  const missed = fire.kind === 'misfire' && fire.status === 'skipped_misfire'
+  const kind = missed ? 'scheduled' : fire.kind
   return (
-    <span className="chip shrink-0" title={T.fireKindHint[fire.kind]} data-fire-kind-chip={fire.kind}>
-      {T.fireKind[fire.kind] ?? fire.kind}
+    <span className="chip shrink-0" title={missed ? T.fireKindMissedHint : T.fireKindHint[kind]} data-fire-kind-chip={fire.kind}>
+      {T.fireKind[kind] ?? kind}
     </span>
   )
 }
@@ -144,12 +149,10 @@ export function LastFire({ fire, tz, now }: { fire: ScheduleFire | null; tz: str
 // 列表行和详情页头共用的操作
 // -------------------------------------------------------------------------
 
-/** 去掉服务端原话末尾的句号，后面好接自己的话 */
-const clause = (text: string) => text.replace(/[。.！!]+$/, '')
-
 /**
- * 启用 / 暂停：带读到的版本 PATCH，成功交回新的定时任务。版本不符（409）时说服务端的原话、返回 'conflict'，
- * 由调用方重新载入；别的错误弹提示、返回 null
+ * 启用 / 暂停：带读到的版本 PATCH，成功交回新的定时任务。版本不符（409）时说清是别处改的、返回 'conflict'，
+ * 由调用方重新载入；别的错误弹提示、返回 null。409 的原话是写给表单保存的（「请刷新后再保存」），开关不照搬，
+ * 放进详情
  */
 export async function setEnabled(s: Schedule, enabled: boolean): Promise<Schedule | 'conflict' | null> {
   try {
@@ -158,7 +161,7 @@ export async function setEnabled(s: Schedule, enabled: boolean): Promise<Schedul
     return next
   } catch (e) {
     if (e instanceof ApiError && e.status === 409) {
-      toast.warn(`${clause(e.message)}。${T.conflictReloaded}`)
+      toast.warn(T.toggleConflict(s.name), e.message ? { detail: e.message } : undefined)
       return 'conflict'
     }
     toast.error(e)
@@ -262,7 +265,11 @@ export function useScheduleNames(ids: (string | null | undefined)[]): ReadonlyMa
 
 /**
  * 运行名字旁的「定时」标记：悬停写是哪个定时任务，点一下去那个定时任务。记录页的整行是打开运行的按钮，
- * 这里拦住冒泡，只去定时任务、不打开运行
+ * 这里拦住冒泡，只去定时任务、不打开运行。
+ *
+ * 按钮里放不了可聚焦的链接（读屏会把按钮里的内容压平，Tab 也到不了），所以键盘到不了这个标记：读屏改念
+ * 「由定时任务「X」发起」，至少在整行的名字里听到来源。键盘可达的入口要放到运行详情的页头，或者把整行改成
+ * 「打开运行」按钮和这个链接并排，都不在本页的文件里，见交付说明
  */
 export function ScheduleTag({ scheduleId, name }: { scheduleId: string; name?: string | null }) {
   const navigate = useNavigate()
@@ -278,7 +285,8 @@ export function ScheduleTag({ scheduleId, name }: { scheduleId: string; name?: s
       data-run-schedule={scheduleId}
       onClick={go}
     >
-      <CalendarClock size={10} aria-hidden /> {T.runTag}
+      <CalendarClock size={10} aria-hidden /> <span aria-hidden>{T.runTag}</span>
+      <span className="sr-only">{T.runTagSr(name)}</span>
     </span>
   )
 }

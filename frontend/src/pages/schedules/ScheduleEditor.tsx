@@ -5,15 +5,15 @@ import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import { Field, Notice, Skeleton, Spinner, confirmDialog, toast, useRadioGroup } from '../../components/ui'
 import { errorMessage } from '../../lib/errors'
+import { parseServerTime } from '../../lib/format'
 import { useLeaveGuard } from '../../lib/leave'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import { useCatalog, useCatalogListState } from '../../store/catalog'
-import type {
-  Schedule, SchedulePreview, ScheduleRunClass, ScheduleVariable, Workflow, WorkflowVersion,
-} from '../../types'
+import type { Schedule, SchedulePreview, ScheduleRunClass, ScheduleVariable, Workflow } from '../../types'
 import {
   FREQ_PRESETS, GRACE_OPTIONS, HOUR_STEPS, WEEKDAY_ORDER, createBody, cronOf, formOf, formProblems, formatZoned, freqProblem,
-  graceLabel, patchBody, templateOf, timezoneOptions, type Freq, type FormField, type FreqPreset, type ScheduleForm,
+  graceLabel, graphFields, patchBody, rebaseForm, serverFieldValue, templateOf, timezoneOptions, type Freq, type FormField,
+  type FreqPreset, type InputField, type ScheduleForm,
 } from './model'
 import { isUnsupported } from './parts'
 import { WebhookFields } from './WebhookFields'
@@ -42,8 +42,16 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
   const [touched, setTouched] = useState<Partial<Record<FormField, boolean>>>({})
   /** 新建时没动过运行类别：选工作流时按它发没发布替人选上 */
   const runClassTouched = useRef(!!schedule)
+  /** 名称是选工作流时替人填的哪个名字：人没改过它时，换工作流名称跟着换；人改过就不再动 */
+  const autoName = useRef<string | null>(null)
   const [saving, setSaving] = useState(false)
-  const [saveError, setSaveError] = useState<{ message: string; detail?: string; conflict?: boolean; field?: string } | null>(null)
+  /**
+   * 上一次保存的失败。field 是服务端 422 指的那一项，at 是交上去时那一项的值（serverFieldValue）：
+   * 人改了那一项，说明就不再摆着，免得看上去新值也不行
+   */
+  const [saveError, setSaveError] = useState<{
+    message: string; detail?: string; conflict?: boolean; field?: string; at?: string | null
+  } | null>(null)
 
   const workflow = workflows.find((w) => w.id === form.workflowId)
   const cron = cronOf(form.freq)
@@ -54,8 +62,14 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
   const fields: FieldsState = !workflow && form.workflowId && workflowsState !== 'ok' ? { status: 'loading' } : fieldsOf
   const variables = useVariables()
 
-  const problems = formProblems(form, base)
   const changes = base ? patchBody(form, initial, base) : null
+  // 服务端保存时只在新建、或者改了工作流、运行类别、输入时才核对这三样：照着拦，不多拦也不少拦
+  const recheck = !base || (!!changes && ('workflow_id' in changes || 'run_class' in changes || 'input_template' in changes))
+  const problems = formProblems(form, base, {
+    published: workflow ? workflow.published_version ?? null : undefined,
+    fields: fields.status === 'ok' ? fields.fields : undefined,
+    recheck,
+  })
   const dirty = base ? changes != null : JSON.stringify(form) !== JSON.stringify(initial)
   const previewField = preview.status === 'invalid' ? preview.field : undefined
   /** 预览判定非法、并指明是这一项时，服务端的说明 */
@@ -73,14 +87,20 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
   const setFreq = (patch: Partial<Freq>) => setForm((f) => ({ ...f, freq: { ...f.freq, ...patch } }))
   const touch = (k: FormField) => setTouched((t) => (t[k] ? t : { ...t, [k]: true }))
 
-  const pickWorkflow = (w: Workflow) => setForm((f) => {
-    if (w.id === f.workflowId) return f
-    // 换了工作流：新工作流里没有的字段的模板丢掉（同名的留着），名字空着时用工作流名
-    const keep = new Set(graphFields(w.graph).map((x) => x.name))
-    const inputs = Object.fromEntries(Object.entries(f.inputs).filter(([k]) => keep.has(k)))
-    const runClass: ScheduleRunClass = runClassTouched.current ? f.runClass : w.published_version ? 'formal' : 'exploratory'
-    return { ...f, workflowId: w.id, name: f.name.trim() ? f.name : w.name, inputs, runClass }
-  })
+  const pickWorkflow = (w: Workflow) => {
+    if (w.id === form.workflowId) return
+    // 名字空着、或者还是上次替人填的工作流名：跟着换成新工作流的名字。在这里判、不在 setForm 的回调里改 ref：
+    // 回调在严格模式下会调两遍
+    const follow = !form.name.trim() || form.name === autoName.current
+    if (follow) autoName.current = w.name
+    setForm((f) => {
+      // 换了工作流：新工作流里没有的字段的模板丢掉（同名的留着）
+      const keep = new Set(graphFields(w.graph).map((x) => x.name))
+      const inputs = Object.fromEntries(Object.entries(f.inputs).filter(([k]) => keep.has(k)))
+      const runClass: ScheduleRunClass = runClassTouched.current ? f.runClass : w.published_version ? 'formal' : 'exploratory'
+      return { ...f, workflowId: w.id, name: follow ? w.name : f.name, inputs, runClass }
+    })
+  }
 
   const save = async () => {
     if (!canSave) return
@@ -99,8 +119,9 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
       const next = formOf(saved)
       setBase(saved)
       setInitial(next)
-      // 保存的这段时间里人又改了：留着新改的，它们相对刚存下的设置照样算未保存
-      setForm((cur) => (cur === sent ? next : cur))
+      // 保存的这段时间里人又改了：只留途中改的那几项（相对刚存下的设置照样算未保存），其余换成刚存下的。
+      // 整份留着的话，交上去的替换地址会以完整明文留在框里，下次保存再发一遍
+      setForm((cur) => rebaseForm(cur, sent, next))
       setTouched({})
       if (base) toast.ok(T.saved)
       onSaved(saved, !base)
@@ -110,7 +131,7 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
       } else if (isUnsupported(e)) {
         setSaveError({ message: T.unsupportedHint })
       } else if (e instanceof ApiError && e.kind === 'http' && e.status >= 400 && e.status < 500) {
-        setSaveError({ message: e.message, field: e.field })
+        setSaveError({ message: e.message, field: e.field, at: e.field ? serverFieldValue(e.field, sent) : null })
       } else {
         toast.error(e)
       }
@@ -132,9 +153,12 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
     setSaveError(null)
   }
 
-  // 保存被 422 拒了、服务端指了是哪一项：写在那一项下面
-  const serverError = (keys: string[]) => (saveError?.field && keys.includes(saveError.field) ? saveError.message : undefined)
+  // 保存被 422 拒了、服务端指了是哪一项：写在那一项下面；那一项改过之后不再摆着（认不出的项留到下次保存）
+  const stillSays = !!saveError && (saveError.at == null || !saveError.field || serverFieldValue(saveError.field, form) === saveError.at)
+  const serverError = (keys: string[]) => (stillSays && saveError?.field && keys.includes(saveError.field) ? saveError.message : undefined)
   const shown = (k: FormField) => (touched[k] ? problems[k] : undefined)
+  const nameError = shown('name') ?? serverError(['name'])
+  const misfireError = serverError(['misfire_grace_s'])
 
   return (
     <form
@@ -145,10 +169,10 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
     >
       <div className="min-w-0 space-y-4 lg:col-start-1">
         <section className="space-y-3 rounded-lg border bg-panel p-3.5">
-          <Field label={T.name} htmlFor="schedule-name" required error={shown('name') ?? serverError(['name'])}>
+          <Field label={T.name} htmlFor="schedule-name" required error={nameError}>
             <input id="schedule-name" className="field" value={form.name} placeholder={T.namePlaceholder} autoComplete="off"
-                   maxLength={200} aria-invalid={!!shown('name') || undefined}
-                   aria-describedby={shown('name') ? 'schedule-name-error' : undefined}
+                   maxLength={200} aria-invalid={!!nameError || undefined}
+                   aria-describedby={nameError ? 'schedule-name-error' : undefined}
                    onChange={(e) => set({ name: e.target.value })} onBlur={() => touch('name')} data-field="name" />
           </Field>
           <WorkflowField form={form} workflows={workflows} state={workflowsState} workflow={workflow} base={base}
@@ -168,18 +192,20 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
       </aside>
 
       <div className="min-w-0 space-y-4 lg:col-start-1">
-        <RunClassSection value={form.runClass} workflow={workflow}
+        <RunClassSection value={form.runClass} workflow={workflow} problem={problems.runClass}
+                         error={serverError(['run_class'])}
                          onChange={(runClass) => { runClassTouched.current = true; set({ runClass }) }} />
         <InputsSection workflow={workflow} fields={fields} inputs={form.inputs} variables={variables}
-                       preview={preview}
+                       preview={preview} recheck={recheck}
                        error={previewSays('input_template') ?? serverError(['input_template'])}
                        onChange={(inputs) => set({ inputs })} />
         <section className="space-y-3 rounded-lg border bg-panel p-3.5" aria-labelledby="schedule-overlap-title">
           <h2 id="schedule-overlap-title" className="text-xs font-semibold">{T.overlap}</h2>
           <p className="text-xs leading-relaxed text-dim">{T.overlapText}</p>
-          <Field label={T.misfire} htmlFor="schedule-misfire" hint={T.misfireHint}>
+          <Field label={T.misfire} htmlFor="schedule-misfire" hint={T.misfireHint} error={misfireError}>
             <select id="schedule-misfire" className="field w-auto max-w-full" value={form.misfireGraceS}
-                    aria-describedby="schedule-misfire-hint"
+                    aria-invalid={!!misfireError || undefined}
+                    aria-describedby={misfireError ? 'schedule-misfire-error' : 'schedule-misfire-hint'}
                     onChange={(e) => set({ misfireGraceS: Number(e.target.value) })} data-misfire="">
               {[...new Set([...GRACE_OPTIONS, form.misfireGraceS])].sort((a, b) => a - b).map((s) => (
                 <option key={s} value={s}>{T.misfireOption(graceLabel(s))}</option>
@@ -208,7 +234,7 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
             <button type="button" className="btn btn-sm mt-1.5" onClick={() => void reload()} data-schedule-reload="">{T.reload}</button>
           </Notice>
         )}
-        {saveError && !saveError.conflict && (
+        {saveError && !saveError.conflict && stillSays && (
           <Notice tone="err" attr={{ 'data-schedule-save-error': '' }}>{T.saveFailed}：{saveError.message}</Notice>
         )}
         <div className="flex flex-wrap items-center justify-end gap-2">
@@ -432,12 +458,13 @@ function PreviewBox({ preview }: { preview: PreviewState }) {
           {data.next?.length ? (
             <ol className={clsx('space-y-1', preview.status === 'loading' && 'opacity-60')}>
               {data.next.map((at, i) => {
-                const d = new Date(at)
+                // 和列表、触发历史一个口径：不带时区后缀的按 UTC 读（new Date 会当成本机时间），读不了的照原文写
+                const d = parseServerTime(at)
                 return (
                   <li key={`${at}-${i}`} className="flex items-baseline gap-2 text-xs" data-preview-time="">
                     <span className="tnum w-4 shrink-0 text-right text-faint">{i + 1}</span>
-                    <time className="tnum" dateTime={Number.isNaN(d.getTime()) ? undefined : d.toISOString()}>
-                      {tz ? formatZoned(d, tz, 'full') : at}
+                    <time className="tnum" dateTime={d?.toISOString()}>
+                      {d && tz ? formatZoned(d, tz, 'full') : at}
                     </time>
                   </li>
                 )
@@ -465,15 +492,26 @@ function PreviewBox({ preview }: { preview: PreviewState }) {
 
 const RUN_CLASSES: readonly ScheduleRunClass[] = ['formal', 'exploratory']
 
-function RunClassSection({ value, workflow, onChange }: {
-  value: ScheduleRunClass; workflow: Workflow | undefined; onChange: (v: ScheduleRunClass) => void
+/**
+ * 运行类别。正式运行要工作流已发布：新建、或者这次改了工作流 / 运行类别时服务端保存就会拒，problem 写在这里、
+ * 保存按钮跟着禁用；已保存的定时任务没动这两样、工作流后来撤了发布时保存照常，只提醒到点会发起失败
+ */
+function RunClassSection({ value, workflow, problem, error, onChange }: {
+  value: ScheduleRunClass; workflow: Workflow | undefined
+  /** 保存前要处理的问题（formProblems 的 runClass） */
+  problem?: string
+  /** 保存被拒、服务端指明是运行类别时的说明 */
+  error?: string
+  onChange: (v: ScheduleRunClass) => void
 }) {
   const radio = useRadioGroup(RUN_CLASSES, value, onChange)
   const unpublished = !!workflow && !workflow.published_version
+  const describedBy = [problem ? 'schedule-class-problem' : null, error ? 'schedule-class-error' : null].filter(Boolean).join(' ')
   return (
     <section className="space-y-2.5 rounded-lg border bg-panel p-3.5" aria-labelledby="schedule-class-title">
       <h2 id="schedule-class-title" className="text-xs font-semibold">{T.runClass}</h2>
-      <div role="radiogroup" aria-labelledby="schedule-class-title" className="grid gap-2 sm:grid-cols-2">
+      <div role="radiogroup" aria-labelledby="schedule-class-title" aria-describedby={describedBy || undefined}
+           className="grid gap-2 sm:grid-cols-2">
         {RUN_CLASSES.map((rc) => {
           const on = value === rc
           return (
@@ -491,9 +529,16 @@ function RunClassSection({ value, workflow, onChange }: {
           )
         })}
       </div>
-      {value === 'formal' && unpublished && <Notice tone="warn" attr={{ 'data-not-published': '' }}>{T.notPublished}</Notice>}
+      {problem ? (
+        <Notice tone="err" attr={{ id: 'schedule-class-problem', 'data-run-class-problem': '' }}>{problem}</Notice>
+      ) : value === 'formal' && unpublished && (
+        <Notice tone="warn" attr={{ 'data-not-published': '' }}>{T.notPublished}</Notice>
+      )}
       {value === 'formal' && workflow?.published_version != null && (
         <p className="text-2xs leading-relaxed text-faint">{T.formalVersion(workflow.published_version)}</p>
+      )}
+      {error && (
+        <div id="schedule-class-error" className="text-2xs leading-relaxed text-[var(--err)]" role="alert" data-run-class-error="">{error}</div>
       )}
     </section>
   )
@@ -502,13 +547,6 @@ function RunClassSection({ value, workflow, onChange }: {
 // ---------------------------------------------------------------------------
 // 输入
 // ---------------------------------------------------------------------------
-
-type InputField = { name: string; required?: boolean; description?: string; default?: unknown }
-
-function graphFields(graph: WorkflowVersion['graph'] | Workflow['graph'] | undefined): InputField[] {
-  const entry = graph?.nodes?.find((n) => n.type === 'input')
-  return ((entry?.data?.config?.fields ?? []) as InputField[]).filter((f) => f && typeof f.name === 'string' && f.name)
-}
 
 /** 已发布版本的输入字段，按（工作流, 版本）记一份：发布之后那一版就不会再变 */
 const versionFields = new Map<string, InputField[]>()
@@ -570,12 +608,14 @@ function useVariables(): ScheduleVariable[] | null {
 
 const shownValue = (v: unknown) => (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v))
 
-function InputsSection({ workflow, fields, inputs, variables, preview, error, onChange }: {
+function InputsSection({ workflow, fields, inputs, variables, preview, recheck, error, onChange }: {
   workflow: Workflow | undefined
   fields: FieldsState
   inputs: Record<string, string>
   variables: ScheduleVariable[] | null
   preview: PreviewState
+  /** 保存时服务端会不会核对输入（新建，或者改了工作流、运行类别、输入）：会的话必填没填、字段对不上都要先处理 */
+  recheck: boolean
   error?: string
   onChange: (inputs: Record<string, string>) => void
 }) {
@@ -583,7 +623,15 @@ function InputsSection({ workflow, fields, inputs, variables, preview, error, on
   const [open, setOpen] = useState<string | null>(null)
   const rendered = preview.status === 'ok' ? preview.data.inputs ?? {} : null
   const names = fields.status === 'ok' ? new Set(fields.fields.map((f) => f.name)) : null
-  const stale = names ? Object.keys(inputs).filter((k) => !names.has(k)) : []
+  // 对不上的字段：只列填了值的（留空的本来就不交）
+  const stale = names ? Object.keys(inputs).filter((k) => !names.has(k) && inputs[k]?.trim()) : []
+  // 正式运行的字段取已发布的版本：画布上有、那一版里没有的，说清是哪一版里没有，不说成工作流里已经删了
+  const draft = useMemo(() => new Set(graphFields(workflow?.graph).map((f) => f.name)), [workflow])
+  const staleText = (name: string) => {
+    const reason = fields.status === 'ok' && fields.version != null && draft.has(name) ? T.staleNotInVersion(fields.version) : T.staleField
+    // 入口声明了字段时服务端只收这些，交上去会被拒；入口什么都没声明时什么键都收
+    return recheck && fields.status === 'ok' && fields.fields.length ? `${reason}，${T.staleRemove}` : reason
+  }
 
   const setValue = (name: string, value: string) => onChange({ ...inputs, [name]: value })
   /** 变量插在光标处（选中了文字就替换它），插完光标落在变量后面 */
@@ -654,7 +702,9 @@ function InputsSection({ workflow, fields, inputs, variables, preview, error, on
                 </div>
               )}
               {noDefault && !value.trim() && (
-                <div id={`${id}-required`} className="mt-1 text-2xs" style={{ color: 'var(--warn)' }}>{T.requiredNoDefault}</div>
+                <div id={`${id}-required`} className="mt-1 text-2xs" style={{ color: 'var(--warn)' }}>
+                  {recheck ? T.requiredFill : T.requiredNoDefault}
+                </div>
               )}
             </div>
           )
@@ -663,7 +713,7 @@ function InputsSection({ workflow, fields, inputs, variables, preview, error, on
           <div key={name} className="flex min-w-0 flex-wrap items-center gap-1.5 text-2xs" data-input-stale={name}>
             <span className="mono text-dim">{name}</span>
             <span className="mono min-w-0 truncate text-faint">{inputs[name]}</span>
-            <span style={{ color: 'var(--warn)' }}>{T.staleField}</span>
+            <span style={{ color: 'var(--warn)' }}>{staleText(name)}</span>
             <button type="button" className="btn btn-xs" onClick={() => {
               const { [name]: _, ...rest } = inputs
               onChange(rest)

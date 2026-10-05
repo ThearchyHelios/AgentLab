@@ -1,6 +1,7 @@
 /**
- * 定时任务页的纯函数：频率预设和 cron 互转、按定时任务的时区写时间、表单和请求体互转、表单的问题。
- * 不碰 React、不发请求，scripts/check-schedules.mjs 直接借 vite 转译后调用它们。
+ * 定时任务页的纯函数：频率预设和 cron 互转、按定时任务的时区写时间、表单和请求体互转（含保存回来怎么接）、
+ * 输入字段的对照、表单的问题、测试消息的结果。不碰 React、不发请求，scripts/check-schedules.mjs 直接借 vite
+ * 转译后调用它们。
  *
  * 时间一律按定时任务自己的时区写（「每周一 09:00（Asia/Shanghai）」说的就是那个时区的 09:00），本机时区不同时
  * 在悬停提示里另给本机时间：只按本机写，人在外地打开就会以为周报改成了凌晨三点发。
@@ -8,6 +9,7 @@
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import type {
   Schedule, ScheduleCreate, ScheduleEvent, SchedulePatch, ScheduleRunClass, ScheduleWebhookFormat, ScheduleWebhookIn,
+  ScheduleWebhookTest, Workflow, WorkflowVersion,
 } from '../../types'
 
 // ---------------------------------------------------------------------------
@@ -414,20 +416,125 @@ function webhookPatch(w: WebhookForm, before: WebhookForm, saved: Schedule): Sch
   return changed ? out : null
 }
 
+/**
+ * 保存回来时表单怎么接：保存途中人没再动过的项换成刚存下的设置，动过的留着（相对刚存下的设置照样算未保存）。
+ * Webhook 逐项比：途中只改了事件时，交上去的替换地址、新密钥照样换成「已保存」，不让含令牌的完整地址留在框里、
+ * 下次保存再发一遍
+ */
+export function rebaseForm(cur: ScheduleForm, sent: ScheduleForm, saved: ScheduleForm): ScheduleForm {
+  if (cur === sent) return saved
+  const pick = <K extends keyof ScheduleForm>(k: K) => (sameJson(cur[k], sent[k]) ? saved[k] : cur[k])
+  const hook = <K extends keyof WebhookForm>(k: K) => (sameJson(cur.webhook[k], sent.webhook[k]) ? saved.webhook[k] : cur.webhook[k])
+  // 地址和「替换」、密钥和它的处理方式各算一组：只换半组会留下「要替换却没填地址」这种拼不上的状态
+  const urlSame = cur.webhook.url === sent.webhook.url && cur.webhook.replaceUrl === sent.webhook.replaceUrl
+  const secretSame = cur.webhook.secret === sent.webhook.secret && cur.webhook.secretMode === sent.webhook.secretMode
+  return {
+    name: pick('name'),
+    workflowId: pick('workflowId'),
+    freq: pick('freq'),
+    timezone: pick('timezone'),
+    runClass: pick('runClass'),
+    inputs: pick('inputs'),
+    enabled: pick('enabled'),
+    misfireGraceS: pick('misfireGraceS'),
+    webhook: {
+      on: hook('on'),
+      format: hook('format'),
+      url: urlSame ? saved.webhook.url : cur.webhook.url,
+      replaceUrl: urlSame ? saved.webhook.replaceUrl : cur.webhook.replaceUrl,
+      secret: secretSame ? saved.webhook.secret : cur.webhook.secret,
+      secretMode: secretSame ? saved.webhook.secretMode : cur.webhook.secretMode,
+      events: hook('events'),
+    },
+  }
+}
+
+/**
+ * 服务端 422 指的那一项在表单里的值，拿来比：人改过那一项就不再摆着那句说明（改回原值时说明又出来）。
+ * 运行类别、输入连带工作流一起算：换了工作流，「没发布」「字段对不上」也就不一定成立了。认不出的项返回 null
+ */
+export function serverFieldValue(field: string, f: ScheduleForm): string | null {
+  switch (field) {
+    case 'name': return f.name.trim()
+    case 'workflow_id': return f.workflowId
+    case 'cron': return cronOf(f.freq)
+    case 'timezone': return f.timezone
+    case 'run_class': return JSON.stringify([f.runClass, f.workflowId])
+    case 'input_template': return JSON.stringify([sortedEntries(templateOf(f.inputs)), f.workflowId, f.runClass])
+    case 'misfire_grace_s': return String(f.misfireGraceS)
+    case 'webhook':
+    case 'webhook.url': return JSON.stringify(f.webhook)
+    default: return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 输入字段
+// ---------------------------------------------------------------------------
+
+export type InputField = { name: string; required?: boolean; description?: string; default?: unknown }
+
+/** 工作流（或某个版本）入口节点声明的输入字段 */
+export function graphFields(graph: WorkflowVersion['graph'] | Workflow['graph'] | undefined): InputField[] {
+  const entry = graph?.nodes?.find((n) => n.type === 'input')
+  return ((entry?.data?.config?.fields ?? []) as InputField[]).filter((f) => f && typeof f.name === 'string' && f.name)
+}
+
+const blankDefault = (v: unknown) => v == null || (typeof v === 'string' ? v : JSON.stringify(v)) === ''
+
+/**
+ * 输入模板对照这次会用到的字段（正式运行是已发布的那一版，探索运行是画布）。照服务端保存时的核对：
+ * unknown 是填了值、但不在这些字段里的（交上去会被拒）；missing 是必填、没有默认值、又没填的。
+ * 只有空白的不交，不算。入口没声明字段的工作流什么键都收，两样都不报
+ */
+export function inputProblems(inputs: Record<string, string>, fields: readonly InputField[]): { unknown: string[]; missing: string[] } {
+  if (!fields.length) return { unknown: [], missing: [] }
+  const tpl = templateOf(inputs)
+  const names = new Set(fields.map((x) => x.name))
+  return {
+    unknown: Object.keys(tpl).filter((k) => !names.has(k)),
+    missing: fields.filter((x) => x.required && blankDefault(x.default) && !(x.name in tpl)).map((x) => x.name),
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 表单的问题
 // ---------------------------------------------------------------------------
 
-export type FormField = 'name' | 'workflow' | 'freq' | 'timezone' | 'url' | 'secret' | 'events'
+export type FormField = 'name' | 'workflow' | 'freq' | 'timezone' | 'runClass' | 'inputs' | 'url' | 'secret' | 'events'
 
-/** 表单哪几项还不能保存，值是写在那一项下面的话。saved 是修改中的定时任务（新建时为 null） */
-export function formProblems(f: ScheduleForm, saved: Schedule | null): Partial<Record<FormField, string>> {
+/** 判表单问题时要的、表单之外的事 */
+export interface FormContext {
+  /** 选中的工作流的发布版本：null 是没发布；undefined 是还不知道（工作流列表没取回来），不判 */
+  published?: number | null
+  /** 这次会用到的输入字段；还没读到时不判 */
+  fields?: readonly InputField[]
+  /**
+   * 保存时服务端会不会核对工作流、运行类别和输入：新建总会；修改只在改了这三样之一时才会（只改名、停用不查，
+   * 工作流后来撤了发布也能先改名、先停下来）。不给按新建、修改区分
+   */
+  recheck?: boolean
+}
+
+/**
+ * 表单哪几项还不能保存，值是写在那一项下面的话。saved 是修改中的定时任务（新建时为 null）。
+ * 服务端保存时就会拒的组合（正式运行 + 工作流没发布、必填没填、字段对不上）在这里拦下，不让人点了保存才知道
+ */
+export function formProblems(f: ScheduleForm, saved: Schedule | null, ctx: FormContext = {}): Partial<Record<FormField, string>> {
   const out: Partial<Record<FormField, string>> = {}
   if (!f.name.trim()) out.name = T.problem.name
   if (!f.workflowId) out.workflow = T.problem.workflow
   const freq = freqProblem(f.freq)
   if (freq) out.freq = freq
   if (!f.timezone) out.timezone = T.problem.timezone
+  if (f.workflowId && (ctx.recheck ?? !saved)) {
+    if (f.runClass === 'formal' && ctx.published === null) out.runClass = T.problem.notPublished
+    if (ctx.fields) {
+      const { unknown, missing } = inputProblems(f.inputs, ctx.fields)
+      if (unknown.length) out.inputs = T.problem.inputsUnknown(unknown.join('、'))
+      else if (missing.length) out.inputs = T.problem.inputsMissing(missing.join('、'))
+    }
+  }
   const w = f.webhook
   if (w.on) {
     const needUrl = !saved?.webhook || w.replaceUrl
@@ -455,4 +562,23 @@ export function freqProblem(f: Freq): string | null {
 /** 以 http:// 或 https:// 开头、中间没有空白的地址（Webhook、服务访问地址都用它） */
 export function isHttpUrl(text: string): boolean {
   return /^https?:\/\/\S+$/i.test(text.trim())
+}
+
+// ---------------------------------------------------------------------------
+// 测试消息的结果
+// ---------------------------------------------------------------------------
+
+/**
+ * 测试消息的结果写成一句：结局（已送达 / 发送失败）、状态码、服务端的说明各说一遍。服务端的 message 两种写法都接得住：
+ * 只是补充说明（「请到接收端确认已收到」「open.feishu.cn 返回 HTTP 404：…」）时接在结局后面；已经是整句
+ * （「测试消息已送达（HTTP 200）」「推送失败：…」）时不再套一层。说明里写过状态码就不在结局后面再写
+ */
+export function webhookTestText(r: Pick<ScheduleWebhookTest, 'ok' | 'http_status'> & { message?: string | null }): string {
+  const head = r.ok ? T.testOk : T.testFailed
+  let detail = (r.message ?? '').trim()
+  if (detail.startsWith(head)) return detail
+  // 失败时开头那半句「推送失败：」「发送失败：」和结局重复
+  if (!r.ok) detail = detail.replace(/^(?:测试消息)?(?:推送|发送)失败[：:]\s*/, '')
+  const status = r.http_status != null && !detail.includes(`HTTP ${r.http_status}`) ? r.http_status : null
+  return T.testResult(head, status, detail)
 }
