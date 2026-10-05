@@ -7,9 +7,10 @@
 - 不一致：挂起，审批 payload 和对照工件按约定，payload 另带实际生效的 on_reject、摘要里每个指标带选 a、选 b 各会往
   数据目录里写什么的预告；a / b / neither 三种选择的产出和缺口，没选的照实记，驳回、on_reject 为 fail 时失败
 - 差异说明只比这一格所在的那一列（一条查询算好几列、分组后取一行的，收窄了再比，HAVING 一并去掉）；分组的列设了
-  遮罩时不收窄，遮罩列的取值不进审批卡、对照工件、产出和事件
+  遮罩时（改了名再分组的也算）不收窄，遮罩列的取值不进审批卡、对照工件、产出和事件
 - 只差一个方面时写数据目录（业务日期、有效记录条件），差了不止一处不写，人工确认过的不同说法不覆盖，指标自己的
-  筛选范围（取值在运行输入里、用到分组的列）不写，两条 SQL 规范化后一致的不写
+  筛选范围（取值在运行输入里、用到分组的列）不写，两条 SQL 规范化后一致的不写；人工驳回过的条件不会借着和别的
+  指标并成一项写回去，真写的和审批卡上的预告一致
 - 全局关闭直通、节点覆盖；设置按发起时的快照；重放时盲算不再执行、事件不重复；报告的写作目录不含盲算的查询
 - 触顶、分组结果的维度（只给取值、遮罩列不给）、带着取舍的列名不交给盲算、两个指标用到同一格只盲算一次、遮罩列上的
   盲算结果不采用
@@ -588,6 +589,37 @@ async def test_a_confirmed_catalog_entry_is_not_overwritten(monkeypatch, shop, c
     assert entry.version == 1 and entry.notes["business_date"]["value"] == {"column": "order_date"}
 
 
+async def test_a_rejected_filter_is_not_written_back_along_with_another_metric(monkeypatch, shop, client, tmp_path):
+    """目录里「status <> 'refunded'」被人工驳回过。同一次裁决里「销售额」采纳了排除退款的盲算、「订单金额」采纳了排除
+    测试单的盲算：审批卡上预告前者不写、后者写「is_test = 0」。真写的和预告一字不差——驳回过的条件不会借着两个指标
+    并成一项又写成人工确认。"""
+    name, source_id = shop
+    db = sqlite3.connect(tmp_path / "shop.db")
+    db.execute("INSERT INTO orders VALUES (6, '华东', 105, 40.0, 'paid', '2026-09-03', '2026-09-03', 'online', 1)")
+    db.commit()
+    db.close()
+    async with SessionLocal() as session:
+        await catalog.write_entry(session, source_id, "orders", {
+            "valid_filter": catalog.make_item("status <> 'refunded'", "human", "rejected")}, if_version=0, actor="数据组")
+    original = f"SELECT SUM(amount) AS gmv, SUM(amount) AS total FROM orders WHERE paid_date {WEEK}"
+    no_test = f"SELECT SUM(amount) AS total FROM orders WHERE is_test = 0 AND paid_date {WEEK}"
+    total = {**GMV, "id": "total", "name": "订单金额", "expression": "cell(nodes.fetch, 0, 'total')"}
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv"), "订单金额": (no_test, "total")})
+    run = await start(graph(name, original, metrics=[GMV, total], dual={"definitions": {}}))
+    assert run.status == "interrupted", run.error
+    said = {s["metric_id"]: s["catalog"]["b"] for s in (await pending(run.id)).payload["summary"]}
+    assert said["gmv"]["write"] is False and "曾被人工驳回" in said["gmv"]["reason"]
+    assert said["total"]["write"] is True and said["total"]["value"] == "is_test = 0"
+    done = await decide(client, run.id, {"gmv": "b", "total": "b"})
+    assert done.status == "succeeded", done.error
+    [wrote] = logs(await events(run.id), "dual_check_catalog")
+    assert wrote["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}]
+    assert [s["reason"] for s in wrote["skipped"]] == [said["gmv"]["reason"]]
+    item = (await notes_of(source_id)).notes["valid_filter"]
+    assert item["value"] == said["total"]["value"] and (item["source"], item["status"]) == ("human", "confirmed")
+    assert "「订单金额」" in item["note"] and "「销售额」" not in item["note"]
+
+
 async def test_a_metric_scope_filter_is_not_written_as_a_valid_filter(monkeypatch, shop, client):
     """「华东销售额」原流程按指标名只看华东，盲算漏了地区：审核人选原流程，但 region = '华东' 是这个指标自己的筛选
     范围，写成表的有效记录条件，以后所有查订单表的工作流（包括下一次盲算）都会只看华东。"""
@@ -843,6 +875,26 @@ async def test_masked_group_values_stay_out_of_the_card_and_the_catalog_log(monk
     assert len(payload["summary"][0]["diff"]) > 1
     [wrote] = logs(evs, "dual_check_catalog")
     assert wrote["written"] == [] and "不止差一个方面" in wrote["skipped"][0]["reason"]
+
+
+async def test_a_renamed_masked_group_column_is_not_narrowed_either(monkeypatch, masked_shop, client):
+    """原流程把遮罩列改了名再分组（region AS area）：结果列名 area 不在遮罩里，分组值却还是 region 的取值。收窄时看的
+    是分组键用到的列，一样不拿这一行的分组值补等值条件，「华东」不进审批卡、对照工件、产出和事件。"""
+    name, _ = masked_shop
+    renamed = (f"SELECT region AS area, SUM(amount) AS gmv FROM orders WHERE status <> 'refunded' "
+               f"AND paid_date {WEEK} GROUP BY region ORDER BY region")
+    first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    Blind(monkeypatch, name, {"首组销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, renamed, metrics=[first], dual={"definitions": {}}))
+    assert run.status == "interrupted", run.error
+    payload = (await pending(run.id)).payload
+    assert payload["summary"][0]["original_rendered"].startswith("300")
+    card = artifact_store.load(payload["card_artifact"])
+    done = await decide(client, run.id, {"first": "a"})
+    assert done.status == "succeeded", done.error
+    _no_masked_value(payload, card, done, await events(run.id))
+    # 照整条比：原流程分组、盲算没分组都列出来
+    assert len(payload["summary"][0]["diff"]) > 1
 
 
 async def test_a_masked_group_column_of_the_blind_query_is_not_narrowed_either(monkeypatch, masked_shop, client):

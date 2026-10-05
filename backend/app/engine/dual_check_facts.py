@@ -23,17 +23,23 @@ is_test = 0、is_valid = 1、deleted_at IS NULL）；只涉及一张表。拿不
 
 **怎么写。** 照对话提案的规矩核对（plan_patch：列在不在表结构里、取值格式），记为人工填写、已确认，备注写明来自哪次
 运行、哪个节点、哪个指标。目录里这一项已经是人工确认过的另一种说法时不覆盖，照实交回原因；已经是同样的说法就什么都
-不写（再写一遍也不升版本）。有效记录条件是一整句条件：目录里已有的条件被采纳的一边（几个指标并成一项时是每一个）
-也按它筛了的，和新条件合起来写（已确认的不改，照实说）；有一个没按它筛的，两者的关系拿不准，不动。推断的去重规则
-说的未必是同一件事，也不替换。整个写入由节点放在 ask() 之后的一个 @task 里：审批恢复重放、接着运行时不会再写一遍。
+不写（再写一遍也不升版本）；这一项被人工驳回过、要写的又带回了驳回的说法（有效记录条件按段比：驳回的那句每一段都在
+要写的条件里），两次人工判断对不上，不写。有效记录条件是一整句条件：目录里已有的条件被采纳的一边（几个指标并成一项
+时是每一个）也按它筛了的，和新条件合起来写，已有的段只写一次（已确认的不改，照实说多出了哪几段）；有一个没按它筛
+的，两者的关系拿不准，不动。推断的去重规则说的未必是同一件事，也不替换。整个写入由节点放在 ask() 之后的一个 @task
+里：审批恢复重放、接着运行时不会再写一遍。
 
 **同一次裁决里几个指标落到同一项上。** 说法一样的写一次，备注里列出每个指标。有效记录条件是能用 AND 叠加的排除条件
 （这里只收排除无效记录的），几个指标各自采纳的条件都有人的选择撑着，合成一句写——「排除退款」和「排除测试单」并不
-矛盾。业务日期一张表只有一个，去重规则说的未必是同一件事，说法不同就一个都不写。
+矛盾。业务日期一张表只有一个，去重规则说的未必是同一件事，说法不同就一个都不写。合起来之前先按每个指标自己的说法
+过一遍驳回检查：自己采纳的说法曾被人工驳回的指标拿出来不写、照实说原因，其余的照写；合起来以后又包含了驳回的整句的，
+也不写。
 
 **预告。** 审批卡上要让审核人看得出选了之后会往目录里写什么（preview）：按发起审批时的目录，选原流程、选盲算各会
-写什么、不写的为什么。和真写是同一套判断（derive 认事实、_plan 对目录），所以只在两处可能和最后写的不一样：审批停下
-期间目录被人改了，或者同一次裁决里几个指标落到同一项上（上一段）。
+写什么、不写的为什么。和真写是同一套判断（derive 认事实、_plan 对目录、_revives 认驳回），所以只在两处可能和最后写
+的不一样：审批停下期间目录被人改了；同一次裁决里几个指标落到同一项上（上一段）——写进去的是合起来的说法，预告说会
+写的也可能因为说法互相矛盾、和已有条件的关系拿不准、合起来又成了驳回过的说法而不写。反过来不会：预告说不写的，
+不会因为和别的指标并成一项被写进去。
 
 catalog.save_patch 不收备注，这里用它的同一套原料（read_entry、apply_patch、write_entry 的乐观锁）写，只多把备注放进项里。
 """
@@ -41,7 +47,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -86,8 +92,9 @@ _SCOPE_DIGITS = 2
 @dataclass(frozen=True)
 class Fact:
     """要写进目录的一项：哪个数据源的哪张表、哪一项、写什么。metric、choice 只用来写备注和说明；sql、dialect 是被采纳
-    那一边的写法和方言，有效记录条件和目录里已有的条件合并时要看它还按哪些条件筛了。also 是同一次裁决里落到同一项上、
-    并进这一项的其余几个指标（各自的指标、选择、写法），value 是合起来之后的说法。"""
+    那一边的写法和方言，有效记录条件和目录里已有的条件合并时要看它还按哪些条件筛了。同一次裁决里几个指标落到同一项上
+    时并成一项：members 是并进来的每个指标各自的那一项（各带自己的说法，审批卡上各自的预告就是按它算的），value 是
+    合起来之后的说法；单个指标的 members 为空。"""
 
     source: str
     table: str
@@ -97,17 +104,17 @@ class Fact:
     choice: str
     sql: str = ""
     dialect: str | None = None
-    also: tuple[Fact, ...] = ()
+    members: tuple[Fact, ...] = ()
 
 
 def _members(fact: Fact) -> tuple[Fact, ...]:
-    """这一项背后的每个指标的选择：并过的连同并进来的。"""
-    return (fact, *fact.also)
+    """这一项背后的每个指标的选择：并成一项的是并进来的每一个（各带自己的说法），单个指标的是它自己。"""
+    return fact.members or (fact,)
 
 
-def _names(fact: Fact) -> str:
-    """说明里的指标叫法：「销售额」，几个指标并成一项时「销售额」、「订单金额」。"""
-    names = list(dict.fromkeys(m.metric for m in _members(fact)))
+def _names(members: Sequence[Fact]) -> str:
+    """说明里的指标叫法：「销售额」，几个指标时「销售额」、「订单金额」。"""
+    names = list(dict.fromkeys(m.metric for m in members))
     return "、".join(f"「{n}」" for n in names[:4]) + (f"等 {len(names)} 个" if len(names) > 4 else "")
 
 
@@ -422,39 +429,57 @@ def _conditions_of(sql: str, read: str | None) -> set[str] | None:
     return {_normalized(part, read) for where in tree.find_all(exp.Where) for part in _and_parts(where.this)}
 
 
-def _and_join(base: str | None, values: list[str], dialect: str | None) -> str | None:
-    """几句条件用 AND 接成一句：已经有的（base 里的、前面接过的，按 _normalized 比）不再接；最外层是 OR 的加括号，
-    不然后面接的条件只并到 OR 的后一半上。每句保留原来的写法。有一句解析不了返回 None。"""
+def _keys(condition: Any, read: str | None) -> set[str] | None:
+    """一句条件按 AND 拆开后每一段的比较用写法；不是文字、解析不了返回 None。"""
+    tree = _parse(condition, read) if isinstance(condition, str) and condition.strip() else None
+    return {_normalized(part, read) for part in _and_parts(tree)} if tree is not None else None
+
+
+def _and_join(base: str | None, values: list[str], dialect: str | None, *, keep_base: bool = True) -> str | None:
+    """几句条件用 AND 接成一句：已经有的段（base 里的、前面接过的，按 _normalized 比）不再接。一句里每一段都是新的，
+    原样接上（保留原来的写法）；只有几段是新的，只接那几段（按方言重新写）——整句接上会把已有的段再写一遍。
+    keep_base 为假时 base 只用来认哪些段已经有了、不写进结果（说「另外多出哪些条件」用），什么都没多出时为空串。
+    不止一段时，最外层是 OR 的加括号，不然后面接的条件只并到 OR 的后一半上。有一句解析不了返回 None。"""
     from sqlglot import exp
 
     read = _read(dialect)
-    texts: list[str] = []
+    pieces: list[tuple[str, bool]] = []  # (写法, 最外层是不是 OR)
     seen: set[str] = set()
-    for text in [*([base] if base else []), *values]:
+    for i, text in enumerate([*([base] if base else []), *values]):
         tree = _parse(str(text), read)
         if tree is None:
             return None
-        keys = {_normalized(p, read) for p in _and_parts(tree)}
-        if keys <= seen:
+        parts = _and_parts(tree)
+        fresh = []
+        for part in parts:
+            key = _normalized(part, read)
+            if key not in seen:
+                seen.add(key)
+                fresh.append(part)
+        if not fresh or (base and i == 0 and not keep_base):
             continue
-        seen |= keys
-        texts.append(f"({text})" if isinstance(tree, exp.Or) else str(text))
-    return " AND ".join(texts)
+        if len(fresh) == len(parts):
+            pieces.append((str(text).strip(), isinstance(tree, exp.Or)))
+        else:
+            pieces += [(part.sql(dialect=read), isinstance(part, exp.Or)) for part in fresh]
+    if len(pieces) == 1:
+        return pieces[0][0]
+    return " AND ".join(f"({text})" if is_or else text for text, is_or in pieces)
 
 
 def _combined_filter(existing: str, fact: Fact) -> tuple[str | None, str | None]:
     """目录里已有的有效记录条件和这次的新条件合起来：(合起来的整句条件, None) 或 (None, 为什么不动)。
 
     有效记录条件是一整句（copilot 提案也要求「原有条件也要带上」）。只写新条件会把两边都按着筛的原有条件静默替换掉；
-    原有条件有一个被采纳的一边没按它筛，审核人的选择说明不了它对不对（合起来写就等于替人确认了它），也不能替人删掉。"""
+    原有条件有一个被采纳的一边没按它筛，审核人的选择说明不了它对不对（合起来写就等于替人确认了它），也不能替人删掉。
+    接的是每个指标各自的条件（不是并好的整句）：哪个指标的条件和已有的重了，那一段都只写一次。"""
     label = catalog.TABLE_FIELD_LABEL["valid_filter"]
     read = _read(fact.dialect)
-    have_tree = _parse(existing, read)
+    have = _keys(existing, read)
     combined = _and_join(existing, [str(m.value) for m in _members(fact)], fact.dialect) \
-        if have_tree is not None else None
-    if combined is None:
+        if have is not None else None
+    if have is None or combined is None:
         return None, f"「{fact.table}」已有的{label}「{existing}」无法解析，与这次的条件合不起来，未改动"
-    have = {_normalized(p, read) for p in _and_parts(have_tree)}
     for member in _members(fact):
         if not have <= (_conditions_of(member.sql, read) or set()):
             return None, (f"「{fact.table}」已有的{label}「{existing}」，指标「{member.metric}」被采纳的"
@@ -560,19 +585,73 @@ def _differing(facts: list[Fact]) -> str:
 
 
 def _merged(members: list[Fact]) -> tuple[Fact | None, str | None]:
-    """同一次裁决里落到同一项上的几个说法合成一项：(合起来的那一项, None) 或 (None, 为什么都不写)。
+    """同一次裁决里落到同一项上的几个说法合成一项：(合起来的那一项, None) 或 (None, 为什么都不写)。只有一个时就是它。
 
     说法都一样的写一次。有效记录条件用 AND 合成一句（derive 只收排除无效记录的条件，几句叠起来不会互相打架）。
-    业务日期一张表只有一个、去重规则说的未必是同一件事，说法不同就都不写。"""
-    first, rest = members[0], tuple(members[1:])
-    if not rest:
+    业务日期一张表只有一个、去重规则说的未必是同一件事，说法不同就都不写。每个指标各自的那一项原样留在 members 里：
+    驳回检查（_screen）、和目录里已有条件的合并（_combined_filter）都要按各自的说法算。"""
+    first = members[0]
+    if len(members) == 1:
         return first, None
     if first.item == "valid_filter":
         value = _and_join(None, [str(m.value) for m in members], first.dialect)
-        return (replace(first, value=value, also=rest), None) if value is not None else (None, _differing(members))
-    if all(_same_fact(first.item, m.value, first.value) for m in rest):
-        return replace(first, also=rest), None
+        return (replace(first, value=value, members=tuple(members)), None) if value is not None \
+            else (None, _differing(members))
+    if all(_same_fact(first.item, m.value, first.value) for m in members[1:]):
+        return replace(first, members=tuple(members)), None
     return None, _differing(members)
+
+
+def _rejected(notes: Mapping[str, Any], item: str) -> tuple[bool, Any]:
+    """目录里这一项是不是被人工驳回的：(是不是, 驳回的说法)。"""
+    stored = notes.get(item)
+    if isinstance(stored, Mapping) and stored.get("status") == "rejected":
+        return True, stored.get("value")
+    return False, None
+
+
+def _revives(fact: Fact, rejected: Any) -> bool:
+    """要写的说法是不是又带回了曾被人工驳回的说法。业务日期、去重规则：同一个说法。有效记录条件：驳回的那句的每一段
+    都在要写的条件里（按 _normalized 比，!= 和 <>、列名大小写、先后不同都认得出；有一边解析不了按原文比）——驳回的
+    那句只是要写的一部分也算，写进去就等于替人把驳回过的条件又确认了一遍。"""
+    if fact.item != "valid_filter":
+        return _same_fact(fact.item, rejected, fact.value)
+    read = _read(fact.dialect)
+    mine, theirs = _keys(fact.value, read), _keys(rejected, read)
+    if mine is None or theirs is None:
+        return _same_fact(fact.item, rejected, fact.value)
+    return bool(theirs) and theirs <= mine
+
+
+def _rejected_text(fact: Fact, rejected: Any, members: Sequence[Fact]) -> str:
+    """驳回检查拦下时的说法：驳回的是哪一句（照目录里记的原文），哪几个指标的选择又带回了它。审批卡上的预告和真写
+    拦下时用的是同一句话。"""
+    label = catalog.TABLE_FIELD_LABEL.get(fact.item, fact.item)
+    return (f"「{fact.table}」的{label}「{_value_text(fact.item, rejected)}」曾被人工驳回，与这次指标{_names(members)}"
+            "的选择相反，未写入。如需更改，请到数据目录中修改")
+
+
+def _screen(notes: Mapping[str, Any], fact: Fact) -> tuple[Fact | None, list[str]]:
+    """几个指标并成的一项，先拿掉自己采纳的说法曾被人工驳回的指标：(剩下的重新并成的一项, 拿掉的为什么不写)，一个
+    都不剩时前者为 None。单个指标的、这一项没被驳回过的原样返回，由 _plan 照常判断。
+
+    审批卡上每个指标的预告是按它自己的说法单独算的（preview → _plan），在那里被驳回检查拦下、卡上写着「不写」的，
+    并进来以后也得拦下。只拿合起来的整句去比，「status <> 'refunded'」和别的条件 AND 在一起就不再等于驳回的那句，
+    会被写成人工确认，和卡上说的正相反。拿掉的指标照实说原因（和它的预告同一句话），其余的照写，也和各自的预告一致。"""
+    rejected, said = _rejected(notes, fact.item)
+    if not rejected or not fact.members:
+        return fact, []
+    out: list[Fact] = []
+    kept: list[Fact] = []
+    for member in fact.members:
+        (out if _revives(member, said) else kept).append(member)
+    if not out:
+        return fact, []
+    reasons = [_rejected_text(fact, said, out)]
+    if not kept:
+        return None, reasons
+    narrowed, why = _merged(kept)
+    return narrowed, reasons if why is None else [*reasons, why]
 
 
 async def record_choices(candidates: list[Mapping[str, Any]], *, run_id: str, node_title: str,
@@ -581,7 +660,7 @@ async def record_choices(candidates: list[Mapping[str, Any]], *, run_id: str, no
     目录写不进去，都落在 skipped 里照实说。
 
     先把每个候选认成目录项，再按（数据源、表、项）归拢成一项（_merged：说法一样的、有效记录条件合起来写，说法
-    不同的整组不写），逐项写。"""
+    不同的整组不写），逐项写（_write：按读到的目录先拿掉各自带回驳回说法的指标，其余的照写）。"""
     skipped: list[dict[str, Any]] = []
     facts: list[Fact] = []
     for candidate in candidates:
@@ -611,39 +690,39 @@ async def record_choices(candidates: list[Mapping[str, Any]], *, run_id: str, no
         if fact is None:
             skipped.append({"reason": why})
             continue
-        done, why = await _record(fact, run_id=run_id, node_title=node_title, actor=actor)
+        done, reasons = await _record(fact, run_id=run_id, node_title=node_title, actor=actor)
         if done:
             written.append({"source": fact.source, "table": fact.table, "item": fact.item})
-        else:
-            skipped.append({"reason": why})
+        skipped += [{"reason": r} for r in reasons]
     return {"written": written, "skipped": skipped}
 
 
-async def _record(fact: Fact, *, run_id: str, node_title: str, actor: str | None) -> tuple[bool, str | None]:
+async def _record(fact: Fact, *, run_id: str, node_title: str, actor: str | None) -> tuple[bool, list[str]]:
+    """写一项：(写了没有, 没写的原因)。几个指标并成的一项可能写了、同时有几个指标被拿出来没写，原因照样交回。"""
     try:
         async with SessionLocal() as session:
             row = (await session.execute(select(DataSource).where(DataSource.name == fact.source))).scalar_one_or_none()
             if row is None:
-                return False, f"数据源「{fact.source}」已不存在，指标{_names(fact)}的选择未写入数据目录"
-            return await _write(session, row, fact, note=note_of(fact, run_id=run_id, node_title=node_title),
-                                actor=actor)
+                return False, [f"数据源「{fact.source}」已不存在，指标{_names(_members(fact))}的选择未写入数据目录"]
+            return await _write(session, row, fact, run_id=run_id, node_title=node_title, actor=actor)
     except Exception:  # noqa: BLE001 - 目录写不进去不能毁掉审批的结果：缺口照样按选择记
         logger.exception("双盲复算的选择写入数据目录失败（数据源 %s）", fact.source)
-        return False, f"指标{_names(fact)}的选择写入数据目录时出错，未写入"
+        return False, [f"指标{_names(_members(fact))}的选择写入数据目录时出错，未写入"]
 
 
 def _plan(notes: Mapping[str, Any], fact: Fact, tables: Mapping[str, Any] | None) -> tuple[Any, str | None]:
     """按目录里这张表现在的说法，算出这一项要写成什么：(要写的取值, None) 或 (None, 为什么不写)。不读库、不写库：
-    真写（_write）和审批卡上的预告（preview）用的是这同一套判断。"""
+    真写（_write）和审批卡上的预告（preview）用的是这同一套判断。几个指标并成的一项，先由 _screen 拿掉各自带回驳回
+    说法的指标再交到这里。"""
     label = catalog.TABLE_FIELD_LABEL.get(fact.item, fact.item)
-    names = _names(fact)
+    names = _names(_members(fact))
     stored = notes.get(fact.item) if isinstance(notes.get(fact.item), dict) else None
-    if stored is not None and stored.get("status") == "rejected" and _same_fact(fact.item, stored.get("value"),
-                                                                                 fact.value):
-        # 同一个说法以前被人明确驳回过：两次人工判断对不上，不替人拿主意
-        return None, (f"「{fact.table}」的{label}「{_value_text(fact.item, fact.value)}」曾被人工驳回，"
-                      f"与这次指标{names}的选择相反，未写入。如需更改，请到数据目录中修改")
-    live = stored if stored is not None and stored.get("status") != "rejected" else None
+    rejected, said = _rejected(notes, fact.item)
+    if rejected and _revives(fact, said):
+        # 同一个说法以前被人明确驳回过：两次人工判断对不上，不替人拿主意。并成的一项各自的说法都不是驳回的那句、
+        # 合起来却又包含了它，也在这里拦下
+        return None, _rejected_text(fact, said, _members(fact))
+    live = stored if stored is not None and not rejected else None
     value = fact.value
     if fact.item == "business_date" and live is not None and isinstance(live.get("value"), dict) \
             and live["value"].get("column") == value.get("column"):
@@ -655,9 +734,13 @@ def _plan(notes: Mapping[str, Any], fact: Fact, tables: Mapping[str, Any] | None
         if combined is None:
             return None, why
         if live.get("status") == "confirmed" and not _same_fact(fact.item, combined, live["value"]):
-            adopted = f"被采纳的{SIDE_LABEL.get(fact.choice, fact.choice)}" if not fact.also else "这次几个指标被采纳的写法"
+            # 只说已确认的说法里没有的那几段：已有的段算成「多出」，审核人会以为连它也被改了
+            extra = _and_join(live["value"].strip(), [str(m.value) for m in _members(fact)], fact.dialect,
+                              keep_base=False)
+            adopted = f"被采纳的{SIDE_LABEL.get(fact.choice, fact.choice)}" if not fact.members \
+                else "这次几个指标被采纳的写法"
             return None, (f"「{fact.table}」的{label}已有人工确认过的说法「{live['value'].strip()}」，{adopted}"
-                          f"另外多出条件「{fact.value}」，未改动。如需补上，请到数据目录中修改")
+                          f"另外多出条件「{extra or fact.value}」，未改动。如需补上，请到数据目录中修改")
         value = combined
     elif fact.item == "dedup" and isinstance(live, dict) and live.get("status") != "confirmed" \
             and not _same_fact(fact.item, live.get("value"), value):
@@ -702,34 +785,41 @@ def preview(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None
     return out
 
 
-async def _write(session: Any, row: DataSource, fact: Fact, *, note: str, actor: str | None) -> tuple[bool, str | None]:
-    """写一项。(写了没有, 没写的原因)。写什么、写不写由 _plan 按读到的目录定；版本对不上（别人刚改过）重读再来。"""
+async def _write(session: Any, row: DataSource, fact: Fact, *, run_id: str, node_title: str,
+                 actor: str | None) -> tuple[bool, list[str]]:
+    """写一项：(写了没有, 没写的原因)。几个指标并成的一项先按读到的目录拿掉各自带回驳回说法的指标（_screen），写什么、
+    写不写再由 _plan 定；备注只列真写进去的指标。版本对不上（别人刚改过）重读再来。"""
     label = catalog.TABLE_FIELD_LABEL.get(fact.item, fact.item)
     tables = (row.schema_cache or {}).get("tables") if isinstance(row.schema_cache, dict) else None
+    reasons: list[str] = []
     for _ in range(_RETRIES):
         entry = await catalog.read_entry(session, row.id, fact.table)
         notes = entry.notes if entry else {}
         version = entry.version if entry else 0
-        value, why = _plan(notes, fact, tables)
+        kept, reasons = _screen(notes, fact)
+        if kept is None:
+            return False, reasons
+        value, why = _plan(notes, kept, tables)
         if why is not None:
-            return False, why
+            return False, [*reasons, why]
+        note = note_of(kept, run_id=run_id, node_title=node_title)
         at = catalog.now_iso()
         try:
-            merged = catalog.apply_patch(notes, [{"path": fact.item, "value": value, "reason": note}],
-                                         table=fact.table, tables=tables, at=at)
+            merged = catalog.apply_patch(notes, [{"path": kept.item, "value": value, "reason": note}],
+                                         table=kept.table, tables=tables, at=at)
         except catalog.CatalogInvalid as e:
-            return False, f"「{fact.table}」的{label}未写入数据目录：{e}"
+            return False, [*reasons, f"「{kept.table}」的{label}未写入数据目录：{e}"]
         # 不论原来是谁提的：这一项现在出自人的选择，记为人工填写、已确认，备注写明出处
-        merged[fact.item] = catalog.make_item(value, "human", "confirmed", note=note, at=at)
+        merged[kept.item] = catalog.make_item(value, "human", "confirmed", note=note, at=at)
         try:
-            await catalog.write_entry(session, row.id, fact.table, merged, if_version=version, actor=actor)
+            await catalog.write_entry(session, row.id, kept.table, merged, if_version=version, actor=actor)
         except catalog.CatalogConflict:
             await session.rollback()
             continue
         except catalog.CatalogInvalid as e:
-            return False, f"「{fact.table}」的{label}未写入数据目录：{e}"
-        return True, None
-    return False, f"「{fact.table}」的数据目录正被修改，{label}未能写入，请稍后在数据目录中确认"
+            return False, [*reasons, f"「{kept.table}」的{label}未写入数据目录：{e}"]
+        return True, reasons
+    return False, [*reasons, f"「{fact.table}」的数据目录正被修改，{label}未能写入，请稍后在数据目录中确认"]
 
 
 __all__ = ["FACT_ITEMS", "Fact", "derive", "note_of", "preview", "record_choices"]

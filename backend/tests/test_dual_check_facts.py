@@ -7,9 +7,10 @@
 - 指标自己的筛选范围（只看华东、只看线上）不是有效记录条件：取值出现在指标名称、口径说明、所在分组、运行输入里的，
   条件用到分组的列的，不是在排除退款、作废、测试这类无效记录的，都不写
 - 写的是人工填写、已确认，备注写明运行、节点、指标；同样的说法已确认过就不再写（不升版本），确认过的不同说法不覆盖；
-  目录里已有的有效记录条件被采纳的一边也用着的，合起来写，没用着的不动
+  目录里已有的有效记录条件被采纳的一边也用着的，合起来写（已有的段只写一次），没用着的不动；驳回过的说法不写回
+  （!= 和 <>、列名大小写、先后不同也认得出）
 - 同一次裁决里几个指标落到同一项上：说法一样的写一次；有效记录条件（都在排除无效记录）用 AND 合成一句写；业务日期
-  说法不同的都不写
+  说法不同的都不写；自己的说法驳回过的指标拿出来不写、其余照写（和各自的预告一致），合起来又成了驳回的整句也不写
 - 审批卡上的预告（preview）：选 a、选 b 各会写什么、不写的为什么，按目录里已有的说法算，和真写同一套判断
 
 差异条目一律由 sql_semantics.explain_sql_diff 真算出来，和节点交给审核人看的是同一份。表名、数字都是虚构的。
@@ -420,6 +421,110 @@ async def test_combined_filters_extend_an_inferred_condition_every_adopted_side_
     reason = out["skipped"][0]["reason"]
     assert "「channel <> 'test'」" in reason and "指标「订单金额」被采纳的盲算没有按它筛选" in reason and "未改动" in reason
     assert (await entry_of(source_id)).notes["valid_filter"]["value"] == "channel <> 'test'"
+
+
+async def test_a_rejected_condition_is_not_written_back_through_a_combined_decision(shop):
+    """目录里「status <> 'refunded'」被人工驳回过。同一次裁决里「销售额」「订单数」采纳了排除退款、「订单金额」采纳了
+    排除测试单：审批卡上预告前两个不写（曾被人工驳回）、后一个写「is_test = 0」，真写也照这样。驳回过的条件不能借着
+    合并又写成人工确认，拿出来的指标照实说原因。"""
+    name, source_id = shop
+    rejected = {"valid_filter": catalog.make_item("status <> 'refunded'", "llm", "rejected")}
+    await seed(source_id, rejected)
+    refunds = candidate(SUM_WEEK, extra("status <> 'refunded'"), "b", metric="销售额", source=name)
+    tests = candidate(SUM_WEEK, extra("is_test = 0"), "b", metric="订单金额", source=name)
+    counted = candidate(COUNT_WEEK, extra("status <> 'refunded'", COUNT_WEEK), "b", metric="订单数", source=name)
+    notes = {"orders": (await entry_of(source_id)).notes}
+    assert preview(refunds, SCHEMA, notes)["b"]["write"] is False
+    assert preview(tests, SCHEMA, notes)["b"]["value"] == "is_test = 0"
+    out = await record_choices([refunds, tests, counted], run_id="run-1", node_title="复核", actor=None)
+    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}], out
+    [skipped] = out["skipped"]
+    assert "「status <> 'refunded'」曾被人工驳回" in skipped["reason"] and "「销售额」、「订单数」" in skipped["reason"]
+    assert "订单金额" not in skipped["reason"]
+    item = (await entry_of(source_id)).notes["valid_filter"]
+    assert item["value"] == "is_test = 0" and (item["source"], item["status"]) == ("human", "confirmed")
+    assert "「订单金额」" in item["note"] and "销售额" not in item["note"] and "订单数" not in item["note"]
+
+    # 并成一项的每个指标采纳的都是驳回过的说法：一个都不写，一条原因说清是哪几个指标
+    await seed_again(source_id, rejected)
+    out = await record_choices([refunds, counted], run_id="run-2", node_title="复核", actor=None)
+    assert out["written"] == [] and len(out["skipped"]) == 1, out
+    assert "曾被人工驳回" in out["skipped"][0]["reason"] and "「销售额」、「订单数」" in out["skipped"][0]["reason"]
+    assert (await entry_of(source_id)).notes["valid_filter"]["status"] == "rejected"
+
+
+async def test_a_rejected_statement_is_not_rebuilt_from_several_metrics(shop):
+    """驳回的是「is_test = 0 AND status != 'refunded'」整句：单看每个指标都不是这句（预告各写各的），合起来却正是这句
+    （!= 和 <>、先后不同也是同一个说法）。两次人工判断对不上，都不写；再并进一个别的条件，驳回的整句仍在里面，照样不写。"""
+    name, source_id = shop
+    rejected = catalog.make_item("is_test = 0 AND status != 'refunded'", "llm", "rejected")
+    await seed(source_id, {"valid_filter": rejected})
+    refunds = candidate(SUM_WEEK, extra("status <> 'refunded'"), "b", metric="销售额", source=name)
+    tests = candidate(SUM_WEEK, extra("is_test = 0"), "b", metric="订单金额", source=name)
+    channel = candidate(COUNT_WEEK, extra("channel <> 'test'", COUNT_WEEK), "b", metric="订单数", source=name)
+    notes = {"orders": (await entry_of(source_id)).notes}
+    assert all(preview(c, SCHEMA, notes)["b"]["write"] is True for c in (refunds, tests, channel))
+    for picked, names in (([refunds, tests], "「销售额」、「订单金额」"),
+                          ([refunds, tests, channel], "「销售额」、「订单金额」、「订单数」")):
+        out = await record_choices(picked, run_id="run-1", node_title="复核", actor=None)
+        assert out["written"] == [], out
+        [skipped] = out["skipped"]
+        assert "曾被人工驳回" in skipped["reason"] and names in skipped["reason"]
+    entry = await entry_of(source_id)
+    assert entry.version == 1 and entry.notes["valid_filter"]["status"] == "rejected"
+
+
+@pytest.mark.parametrize("rejected", ["status != 'refunded'", "STATUS <> 'refunded'"])
+async def test_a_rejected_condition_is_recognised_however_it_was_written(shop, rejected):
+    """驳回时写的是 != 、列名大写：和这次要写的「status <> 'refunded'」是同一个说法，预告和真写都不写。"""
+    name, source_id = shop
+    await seed(source_id, {"valid_filter": catalog.make_item(rejected, "llm", "rejected")})
+    picked = candidate(WITH_REFUNDS, RIGHT, "b", source=name)
+    said = preview(picked, SCHEMA, {"orders": (await entry_of(source_id)).notes})
+    assert said["b"]["write"] is False and f"「{rejected}」曾被人工驳回" in said["b"]["reason"]
+    out = await record_choices([picked], run_id="run-1", node_title="复核", actor=None)
+    assert out == {"written": [], "skipped": [{"reason": said["b"]["reason"]}]}
+    assert (await entry_of(source_id)).version == 1
+
+
+async def test_combined_filters_do_not_repeat_a_condition_already_in_the_catalog(shop):
+    """目录里推断的「status <> 'refunded'」：「销售额」采纳了带着它的盲算，「订单金额」两边都按它筛、盲算另外排除了
+    测试单。合起来写时已有的条件只出现一次（正是「订单金额」的预告）；已有的条件是人工确认过的，原因里只说另外多出
+    的那一段。"""
+    name, source_id = shop
+    await seed(source_id, {"valid_filter": catalog.make_item("status <> 'refunded'", "llm")})
+    base = extra("status <> 'refunded'")
+    picked = [candidate(SUM_WEEK, base, "b", metric="销售额", source=name),
+              candidate(base, extra("is_test = 0", base), "b", metric="订单金额", source=name)]
+    said = preview(picked[1], SCHEMA, {"orders": (await entry_of(source_id)).notes})
+    out = await record_choices(picked, run_id="run-1", node_title="复核", actor=None)
+    assert out == {"written": [{"source": name, "table": "orders", "item": "valid_filter"}], "skipped": []}
+    item = (await entry_of(source_id)).notes["valid_filter"]
+    assert item["value"] == said["b"]["value"] == "status <> 'refunded' AND is_test = 0"
+
+    await seed_again(source_id, {"valid_filter": catalog.make_item("status <> 'refunded'", "human", "confirmed")})
+    out = await record_choices(picked, run_id="run-2", node_title="复核", actor=None)
+    assert out["written"] == []
+    reason = out["skipped"][0]["reason"]
+    assert "已有人工确认过的说法「status <> 'refunded'」" in reason and "另外多出条件「is_test = 0」" in reason
+    assert (await entry_of(source_id)).notes["valid_filter"]["value"] == "status <> 'refunded'"
+
+
+def test_conditions_are_joined_without_repeating_a_part():
+    """几句条件接成一句：已经有的段不再接（整句接上会把已有的段再写一遍）；只说多出的时不带原有的；最外层是 OR 的
+    只在接了别的条件时加括号。"""
+    from app.engine.dual_check_facts import _and_join
+
+    assert _and_join("status <> 'refunded'", ["status <> 'refunded' AND is_test = 0"], "sqlite") == \
+        "status <> 'refunded' AND is_test = 0"
+    assert _and_join("status <> 'refunded'", ["STATUS != 'refunded'", "is_test = 0", "is_test = 0"], "sqlite") == \
+        "status <> 'refunded' AND is_test = 0"
+    assert _and_join("status <> 'refunded'", ["status <> 'refunded' AND is_test = 0"], "sqlite",
+                     keep_base=False) == "is_test = 0"
+    assert _and_join("status = 'void' OR is_test = 1", ["(status = 'void' OR is_test = 1)"], "sqlite") == \
+        "status = 'void' OR is_test = 1"
+    assert _and_join("status = 'void' OR is_test = 1", ["is_test = 0"], "sqlite") == \
+        "(status = 'void' OR is_test = 1) AND is_test = 0"
 
 
 async def test_the_same_choice_from_two_metrics_is_written_once(shop):
