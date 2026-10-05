@@ -68,9 +68,10 @@ DIFF_TIMEOUT_S = 15.0
 #: 交给盲算 agent 的数据目录最多这么多字（表清单、各表的说明分开算），再多就请它自己用 db_schema 查
 _INDEX_CHARS = 3_000
 _NOTES_CHARS = 6_000
-#: 交给盲算 agent 的同一行其他列最多几列、每个值最多几个字
+#: 交给盲算 agent 的同一行其他列、运行输入最多几项、每个值最多几个字
 _DIMS = 6
 _DIM_CHARS = 40
+_INPUTS = 12
 #: 卡上给容器输入记的大概（metrics._brief）：「[12 项]」「{3 个字段}」，写进计算式时不当成字面量
 _BRIEF = re.compile(r"^(?:\[\d+ 项\]|\{\d+ 个字段\})$")
 
@@ -102,13 +103,15 @@ BLIND_TASK_PROMPT = (
     "口径说明：{definition}\n"
     "计算式：{formula}\n"
     "你要算的是计算式里的 {label}{whole}：原流程里它是一次查询结果中「{column}」列的值{dims}。只交这一个数。\n"
-    "数据源：{source}\n\n"
+    "数据源：{source}\n"
+    "{inputs}\n"
     "{catalog}"
 )
 BLIND_UNIT_PROMPT = "（单位：{unit}）"
 BLIND_NO_DEFINITION_PROMPT = "（未提供，按指标名称和数据目录理解）"
 BLIND_WHOLE_PROMPT = "（这个指标就是它本身）"
 BLIND_DIMS_PROMPT = "，所在行的其他列：{dims}"
+BLIND_INPUTS_PROMPT = "本次运行的输入（统计期之类的参数在这里）：{inputs}\n"
 BLIND_INDEX_PROMPT = "数据源里的表（表名｜中文名｜粒度）：\n{index}"
 BLIND_NOTES_PROMPT = "数据目录（标「推断，未确认」的项是推断，使用前请核实）：\n{notes}"
 BLIND_NO_CATALOG_PROMPT = "这个数据源还没有数据目录，请用 db_schema 工具查看表结构。"
@@ -351,10 +354,13 @@ async def _check(state: GraphState, ctx: NodeContext, targets: list[dict[str, An
     sources = _Sources()
     load, outputs = _loader(state)
     aliases = _original_aliases(state)
+    inputs = _run_inputs(state)
     rows: list[dict[str, Any]] = []
     jobs: dict[str, dict[str, Any]] = {}
     for metric in targets:
         row, metric_jobs = await _plan_metric(state, metric, options, sources, aliases, load, outputs)
+        for job in metric_jobs.values():
+            job["inputs"] = inputs
         rows.append(row)
         for key, job in metric_jobs.items():
             # 两个指标用到同一格只盲算一次，按先出现的那个指标说清要算什么；先出现的没写口径说明、后一个写了，用后一个
@@ -371,6 +377,19 @@ async def _check(state: GraphState, ctx: NodeContext, targets: list[dict[str, An
         ctx.emit(EventType.LOG, level="info", code="dual_check_agreed", metrics=agreed,
                  message=f"双盲复算一致：{agreed} 个指标两边的结果相同，已放行")
     return {"rows": rows, "results": results, "model": model, "same_model": same, "usage": usage}
+
+
+def _run_inputs(state: GraphState) -> list[str]:
+    """这次运行的输入里的标量（统计期、地区这类参数）：原流程的 SQL 常常是拿它们拼出来的，盲算 agent 不知道统计期
+    就算不出同一个数。只给参数，不给 SQL。"""
+    out: list[str] = []
+    for key, value in (state.get("input") or {}).items():
+        if isinstance(key, str) and key and (value is None or isinstance(value, (str, int, float, bool))):
+            text = str(value).replace("\n", " ")
+            out.append(f"{key} = {text[:_DIM_CHARS]}")
+        if len(out) >= _INPUTS:
+            break
+    return out
 
 
 def _original_aliases(state: GraphState) -> dict[str, str]:
@@ -576,7 +595,8 @@ def _task_text(job: dict[str, Any], catalog: str) -> str:
         definition=job["definition"] or BLIND_NO_DEFINITION_PROMPT, formula=job["formula"], label=job["label"],
         whole=BLIND_WHOLE_PROMPT if job["formula"].strip() == job["label"] else "", column=job["column"],
         dims=BLIND_DIMS_PROMPT.format(dims="、".join(job["dims"])) if job["dims"] else "",
-        source=job["source"], catalog=catalog)
+        source=job["source"], catalog=catalog,
+        inputs=BLIND_INPUTS_PROMPT.format(inputs="；".join(job["inputs"])) if job.get("inputs") else "")
 
 
 async def _blind(ctx: NodeContext, jobs: dict[str, dict[str, Any]], options: _Options, settings: Mapping[str, Any],

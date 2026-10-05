@@ -106,8 +106,8 @@ async def wait(run_id: str, statuses=("succeeded", "failed", "interrupted")) -> 
     raise AssertionError(f"运行 {run_id} 停在 {row.status}：{row.error}")
 
 
-async def start(spec: dict, **kwargs) -> Run:
-    run = await run_manager.start(graph=spec, input_payload={}, **kwargs)
+async def start(spec: dict, inputs: dict | None = None, **kwargs) -> Run:
+    run = await run_manager.start(graph=spec, input_payload=inputs or {}, **kwargs)
     return await wait(run.id)
 
 
@@ -185,14 +185,17 @@ async def test_agreeing_check_passes_without_asking(monkeypatch, shop):
 
 
 async def test_grouped_rows_tell_the_blind_agent_which_group(monkeypatch, shop):
-    """结果分了组：盲算 agent 要知道算的是哪一组（同一行的维度列），但看不到同一行别的数。"""
+    """结果分了组：盲算 agent 要知道算的是哪一组（同一行的维度列），但看不到同一行别的数；统计期这类参数在运行输入里。"""
     name, _ = shop
     metric = {**GMV, "name": "华东销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
     blind = Blind(monkeypatch, name, {"华东销售额": (BY_REGION, "gmv")})
-    run = await start(graph(name, BY_REGION, metrics=[metric], dual={"definitions": {}}))
+    spec = graph(name, BY_REGION, metrics=[metric], dual={"definitions": {}})
+    spec["nodes"][0]["data"]["config"]["fields"] = [{"name": "week_start"}, {"name": "week_end"}]
+    run = await start(spec, {"week_start": "2026-09-01", "week_end": "2026-09-07"})
     assert run.status == "succeeded", run.error
     [task] = blind.tasks
-    assert "region 为「华东」" in task and "（未提供" in task
+    assert "region 为「华东」" in task and "（未提供" in task and "300" not in task
+    assert "week_start = 2026-09-01" in task and "week_end = 2026-09-07" in task
     out = dual_output(run, await events(run.id))
     assert out["status"] == "agreed" and out["metrics"][0]["status"] == "agreed"
 
