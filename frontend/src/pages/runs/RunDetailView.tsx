@@ -30,6 +30,7 @@ import { ClassChip, MoreMenu, RunTabs, TierChip, copyText, type MenuItem, type T
 import { ProvenanceBar, Telemetry, runClocks } from './Telemetry'
 import { TracePane } from './TracePane'
 import { useRunDetail } from './useRunDetail'
+import { useCompareEntry } from './compare/entry'
 
 /**
  * 一次运行的详情：头部读数、凭证、排错路径，下面分三个视图——
@@ -61,6 +62,8 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const [feedback, setFeedback] = useState<Feedback | null>(null)
   const streamBox = useRef<HTMLDivElement>(null)
   const now = useTicker(60_000)
+  // 「更多」里的「与上一次对比」：查找基准时的状态在这里挂着，菜单项等拿到运行之后再造（下面有提前返回）
+  const compareEntry = useCompareEntry()
 
   useEffect(() => {
     if (d.state !== 'missing') return
@@ -460,6 +463,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       key: 'copy-link', label: '复制链接', icon: <Link2 size={12} />,
       onSelect: () => void copyText(`${location.origin}/runs/${run.id}`, '链接'),
     },
+    compareEntry(run, live),
     {
       key: 'delete', label: '删除记录…', icon: <Trash2 size={12} />, danger: true, onSelect: () => void remove(),
       disabled: live || busy === 'delete',
