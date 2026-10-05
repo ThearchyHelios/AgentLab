@@ -316,6 +316,21 @@ def test_a_period_column_that_never_matches_is_not_a_dimension():
     assert "day" in attribution["note"]
 
 
+def test_odd_values_stay_json_safe():
+    """维度列里有非数、度量加起来超出浮点范围：结果照样写得进 JSON（接口按 allow_nan=False 写，写不进就是 500）。"""
+    def make(run_id, rows):
+        run = Fake(run_id)
+        bot = run.agent("bot", region_sql(), ["region", "gmv"], rows, types={"region": "text", "gmv": "number"})
+        # 卡上的值随便取一个有限的数（这里不重算它），两次不同就行
+        run.card([metric("total", "sum(vars.kpi.amounts)", float(len(rows)), [amounts_in(bot, rows)])])
+        return run
+
+    nan = float("nan")
+    result = run_compare(make("r1", [["东区", 1.0], [nan, 2.0]]), make("r2", [["东区", 1e308], ["东区", 1e308], [nan, 1.0]]))
+    rows = {tuple(r["key"]): r for r in by_id(result)["total"]["attribution"]["rows"]}
+    assert rows[("东区",)]["target"] is None and rows[("nan",)]["delta"] == -1.0
+
+
 # --------------------------------------------------------------------------
 # 遮罩列
 # --------------------------------------------------------------------------

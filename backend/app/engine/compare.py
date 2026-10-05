@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import ast
+import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -355,11 +356,13 @@ def _exact(value: Any) -> Decimal | None:
         return None
 
 
-def _plain(d: Decimal, *, whole: bool) -> int | float:
-    """十进制换回 JSON 里的数：参与的都是整数时给整数，否则给浮点。"""
+def _plain(d: Decimal, *, whole: bool) -> int | float | None:
+    """十进制换回 JSON 里的数：参与的都是整数时给整数，否则给浮点。浮点放不下的（超过 1e308）给 None：接口按 JSON
+    交回，写不出无穷大。"""
     if whole and d == d.to_integral_value():
         return int(d)
-    return float(d)
+    value = float(d)
+    return value if math.isfinite(value) else None
 
 
 def _places(*metrics: dict[str, Any]) -> int | None:
@@ -853,7 +856,7 @@ class _Compare:
         delta = _plain(t - b, whole=whole)
         meta = {**tm, "decimals": _places(bm, tm)}
         out.update(delta=delta, delta_rendered=_signed(meta, delta) if delta != 0 else None,
-                   delta_pct=float(round((t - b) / abs(b) * 100, 2)) if b != 0 else None)
+                   delta_pct=_plain(round((t - b) / abs(b) * 100, 2), whole=False) if b != 0 else None)
 
     def _decompose(self, bm: dict[str, Any], tm: dict[str, Any], b: _Card, t: _Card, bp: Any,
                    tp: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -992,7 +995,7 @@ class _Compare:
             rows.append((abs(delta), {"key": list(key), "base": None if vb is None else _plain(vb, whole=False),
                                       "target": None if vt is None else _plain(vt, whole=False),
                                       "delta": _plain(delta, whole=False),
-                                      "share": float(delta / total) if share and total != 0 else None}))
+                                      "share": _plain(delta / total, whole=False) if share and total != 0 else None}))
         rows.sort(key=lambda r: -r[0])         # 稳定排序：变化一样大的按先出现的
         if len(rows) > TOP_KEYS:
             notes.append(MORE_KEYS.format(count=len(rows), top=TOP_KEYS))
@@ -1120,6 +1123,9 @@ def _dimensions(sb: dict[str, Any], st: dict[str, Any], rb: list[tuple[int, dict
 
 
 def _hashable(value: Any) -> Any:
+    """维度值当键：文本、数、布尔、空值原样；别的（列表、对象）和非数、无穷大写成文字——键要能比较，也要写得进 JSON。"""
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
     return value if isinstance(value, (str, int, float, bool)) or value is None else repr(value)
 
 
