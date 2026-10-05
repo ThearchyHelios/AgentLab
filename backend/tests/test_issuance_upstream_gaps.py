@@ -86,8 +86,9 @@ async def test_upstream_gap_degrades_issuance_and_names_the_node():
 
 
 async def test_stub_gate_nodes_pass_through_without_touching_issuance():
-    """双盲复算、反方审稿目前是占位：放在图里照样能运行，出具不受影响"""
-    for kind in ("dual_check", "challenge"):
+    """反方审稿目前是占位：放在图里照样能运行，出具不受影响。双盲复算已经实现，没有可复算的指标时直接放行、
+    不碰出具，见 test_dual_check_node.py"""
+    for kind in ("challenge",):
         row = await finish(graph(node("gate", kind)))
         issuance = row.output["_issuance"]
         assert issuance["tier"] == "formal", (kind, issuance)

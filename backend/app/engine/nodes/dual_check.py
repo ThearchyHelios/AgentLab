@@ -1,21 +1,988 @@
-"""双盲复算节点：另起一路、不看原结果独立算一遍，再和原结果逐项比对。
+"""双盲复算节点：正式出具前，口径卡上输入来自查询的指标，另起一个看不到原 SQL 的只读 agent 独立算一遍再比对。
 
-目前只是占位：图里放了这个节点也能运行，执行器原样跳过、记一条日志，不改任何状态。
-真正的复算和比对由后续工作包补上；比不上的项通过节点产出里的 issuance_gaps 交给成果节点的
-出具契约降档（见 nodes/io.py 的 _upstream_issuance_gaps）。
+**按输入复算。** 指标由口径卡的原式算出，原式本身确定、可复算（metrics 的 recompute_ok）；会错的是喂给它的那几个数：
+查哪张表、按哪天归属、排没排除退款……所以盲算的单位是「一个来自查询快照的输入」。盲算 agent（engine/verify_agent.py）
+只看得到指标名、口径说明（节点配置的 definitions）、这个输入在计算式里是哪一项、数据源的数据目录，看不到原 SQL 和
+原结果；它自己写只读 SQL，最后交一个格子引用，由代码从它自己的查询快照里取值。盲值是拿原式代入盲算的输入算出来的
+（engine/recompute.py，取整同口径卡），和原值按相对误差比，原值为 0 时按绝对误差。两个指标用到同一格的只盲算一次。
+
+**一致就放行，不一致交给人。** 不一致时逐个对不上的输入说清两条 SQL 差在哪（data/sql_semantics.explain_sql_diff），
+完整对照落成一件工件（审批 payload 经 runner._safe 会截断，长 SQL 放不下），用 replay.ask 挂起。审核人逐个指标选采用
+原流程（a）、采用盲算（b）或两边都不对（neither）：a 没有缺口；b、neither 写进产出的 issuance_gaps，成果节点的出具
+契约据此降档（on_reject 为 fail 时节点直接失败）。两边只差一个方面、又对得上数据目录事实的，选择写进数据目录
+（engine/dual_check_facts.py）。盲算触顶、出错、交不出数，或者输入本身没法单独复算的指标按「无法复算」记缺口。
+
+**重放。** 审批恢复时节点从头重放。读设置（发起时没快照的才读）、盲算连同比对、差异说明连同工件、写数据目录各在一个
+@task 里，重放时直接取 checkpoint 里的结果：不再调用模型、不再计费、不再写目录，事件也都在 task 里发、不会再发一遍；
+task 外面的日志经 replay.once 发。task 的先后只取决于这次运行固定下来的东西（图、运行选项、上游的产出）。设置读发起
+时的快照（launch_run 写进 run.options["verify"]）：审批停下期间改了设置，恢复后照旧按发起时的。
+
+**不进写作目录。** 盲算的查询发 tool.end（role: verify），随运行封存、证据面板能下钻；台账只记一条 kind: dual_check，
+绝不写 kind: query——报告的写作目录按台账里的 query 编号，盲算的查询混进去，写作者就会引用它们。
 """
 from __future__ import annotations
 
+import ast
+import asyncio
+import copy
+import math
+import re
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
+from langgraph.func import task
+from sqlalchemy import select
+
+from app.core import artifact_store
+from app.core.errors import describe_exception
 from app.core.events import EventType
-from app.engine.context import NodeContext
+from app.db.base import SessionLocal
+from app.db.models import DataSource
+from app.engine import recompute
+from app.engine.approval import read_decision
+from app.engine.context import NodeContext, NodeError
+from app.engine.evidence import build_catalog, is_number, next_exec
+from app.engine.expressions import ExpressionError, _cell_call, _chain_root, cell_value, column_kind, numeric_text, \
+    parse_expression
+from app.engine.replay import _in_graph, ask, once
+from app.engine.schema import DUAL_CHECK_FIELD_LABEL, DUAL_CHECK_ON_REJECT, NodeType, dual_check_card
 from app.engine.state import GraphState
 
-#: 占位期间的跳过原因：节点产出和日志里都写这一句
-PENDING_REASON = "双盲复算功能开发中，本节点暂未生效，已跳过"
+#: 节点产出的状态：跳过、无需裁决、人已裁决
+SKIPPED, AGREED, RESOLVED = "skipped", "agreed", "resolved"
+#: 单个指标的结果：一致、不一致、无法复算
+SAME, DIFFERENT, UNCHECKED = "agreed", "disagreed", "unchecked"
+#: 审核人的三种选择：采用原流程、采用盲算、两边都不对
+CHOICES = ("a", "b", "neither")
+#: 盲算触顶的原因里交给界面认的几种（dual_check_limit 日志的 limit）；max_steps 只由核查本身的 verify_limit 日志说
+LIMIT_CODES = ("max_queries", "timeout_s", "max_cost_usd", "daily_max_usd")
+#: 输入的出处：口径卡的 cell() 取的格、Agent 经 cite_fields 交来的字段，都落在一份查询快照上
+QUERY_VIAS = ("tool_cell", "agent_field")
+#: 差异说明里两边的叫法，先原流程后盲算：dual_check_facts 按 a / b 认这个顺序
+SIDES = ("原流程", "盲算")
+#: 审批卡摘要里每个指标最多列几条差异
+SUMMARY_DIFFS = 3
+#: 一次 SQL 比较最多等多久：解析是纯计算，放在线程里，超时就给兜底说明
+DIFF_TIMEOUT_S = 15.0
+#: 交给盲算 agent 的数据目录最多这么多字（表清单、各表的说明分开算），再多就请它自己用 db_schema 查
+_INDEX_CHARS = 3_000
+_NOTES_CHARS = 6_000
+#: 交给盲算 agent 的同一行其他列最多几列、每个值最多几个字
+_DIMS = 6
+_DIM_CHARS = 40
+#: 卡上给容器输入记的大概（metrics._brief）：「[12 项]」「{3 个字段}」，写进计算式时不当成字面量
+_BRIEF = re.compile(r"^(?:\[\d+ 项\]|\{\d+ 个字段\})$")
+
+SKIP_DISABLED = "双盲复算已在设置中关闭，本节点直接放行"
+SKIP_NODE_OFF = "本节点已关闭双盲复算，直接放行"
+SKIP_NO_INPUTS = "口径卡上没有输入来自查询的指标，无需双盲复算，直接放行"
+#: 两条 SQL 规范化后一致、算出的值却不同：差在数据（两次取数之间数据变了、结果被截断），不在写法
+SAME_SQL = "两条 SQL 规范化后一致，差异可能来自两次取数之间数据有变化或取数结果被截断"
+SAME_SQL_ASPECT = "data"
+DIFF_TIMEOUT = "两条 SQL 比较超时，未能归纳成具体差异，请对照原文"
+DIFF_FAILED = "两条 SQL 比较时出错，未能归纳成具体差异，请对照原文"
+NO_SQL = "有一边没有可比较的 SQL，请对照原文"
+#: 交给成果节点的缺口（不带节点名：出具契约统一加「双盲复算「节点名」：」）
+GAP_BLIND = "指标「{name}」双盲复算不一致，审核人选择了盲算结果"
+GAP_NEITHER = "指标「{name}」双盲复算不一致，审核人判断两边都不对"
+GAP_UNCHECKED = "指标「{name}」无法复算：{reason}"
+
+BLIND_SYSTEM = (
+    "你在做双盲复算：另一条流程已经算出了口径卡上的一个指标，你要在看不到它的 SQL 和结果的情况下，按业务定义独立算出"
+    "计算式里的一个数，交给人和原流程比对。\n"
+    "- 业务含义只按下面给的指标名称、口径说明和数据目录理解。数据目录里人工确认过的说明（业务日期按哪一列、有效记录"
+    "条件、去重规则）要遵守，标「推断，未确认」的谨慎使用\n"
+    "- 时间范围、要排除哪些行、要不要去重，都按口径说明来；口径说明没写到的，按数据目录和最常见的业务理解，并在理由里"
+    "写明你的取舍\n"
+    "- 尽量用一条 SQL 直接算出要交的那个数（聚合放在 SQL 里做），最后交出它所在的格子"
+)
+BLIND_TASK_PROMPT = (
+    "指标：{name}{unit}\n"
+    "口径说明：{definition}\n"
+    "计算式：{formula}\n"
+    "你要算的是计算式里的 {label}{whole}：原流程里它是一次查询结果中「{column}」列的值{dims}。只交这一个数。\n"
+    "数据源：{source}\n\n"
+    "{catalog}"
+)
+BLIND_UNIT_PROMPT = "（单位：{unit}）"
+BLIND_NO_DEFINITION_PROMPT = "（未提供，按指标名称和数据目录理解）"
+BLIND_WHOLE_PROMPT = "（这个指标就是它本身）"
+BLIND_DIMS_PROMPT = "，所在行的其他列：{dims}"
+BLIND_INDEX_PROMPT = "数据源里的表（表名｜中文名｜粒度）：\n{index}"
+BLIND_NOTES_PROMPT = "数据目录（标「推断，未确认」的项是推断，使用前请核实）：\n{notes}"
+BLIND_NO_CATALOG_PROMPT = "这个数据源还没有数据目录，请用 db_schema 工具查看表结构。"
+BLIND_MORE_PROMPT = "\n…（其余的请用 db_schema 工具查看）"
+#: 盲算交回的结构：一个数（交给模型时换成格子引用，由代码取值），verify_agent 另加理由
+BLIND_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"value": {"type": "number", "description": "要你算的那个数"}},
+    "required": ["value"],
+}
+
+
+@dataclass(frozen=True)
+class _Options:
+    """这次复算按什么来：节点配置优先，没写的取发起时的核查设置快照。"""
+
+    tolerance: float
+    on_reject: str
+    metrics: list[str] | None
+    definitions: dict[str, str]
+    max_queries: int | None
+    timeout_s: float | None
+    daily_max_usd: float | None
 
 
 async def run_dual_check(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
-    ctx.emit(EventType.LOG, level="info", code="node_pending", message=PENDING_REASON)
-    return {"nodes": {ctx.node.id: {"skipped": True, "reason": PENDING_REASON}}}
+    settings = await _settings(ctx)
+    part = settings.get("dual_check") if isinstance(settings.get("dual_check"), dict) else {}
+    switch = ctx.config.get("enabled")
+    if switch is False or (switch is not True and not part.get("enabled", True)):
+        await once(ctx, EventType.LOG, level="info", code="dual_check_skipped", reason="disabled",
+                   message=SKIP_NODE_OFF if switch is False else SKIP_DISABLED)
+        return _skipped(ctx, "disabled")
+
+    card_id, card = _card(state, ctx)
+    options = _options(ctx, part, settings)
+    targets = _targets(card, options, ctx) if card is not None else []
+    if not targets:
+        await once(ctx, EventType.LOG, level="info", code="dual_check_skipped", reason="no_inputs",
+                   message=SKIP_NO_INPUTS)
+        return _skipped(ctx, "no_inputs")
+
+    checked = await _step("dual_check_blind", lambda: _check(state, ctx, targets, options, settings))
+    rows = checked["rows"]
+    disagreed = [r for r in rows if r["status"] == DIFFERENT]
+    if not disagreed:
+        return _finish(state, ctx, card_id, card, checked, status=AGREED, gaps=_unchecked_gaps(rows))
+
+    review = await _step("dual_check_review", lambda: _review(ctx, checked))
+    response = await ask(ctx, review["payload"], **review["payload"])
+    # 谁裁决的跟着事件走，和人工审批节点一样
+    await once(ctx, EventType.HUMAN_RESOLVED, response=response, actor=ctx.actor())
+    choices, note = _choices(ctx, response, disagreed)
+    gaps = _gaps(rows, choices)
+    await once(ctx, EventType.LOG, level="info", code="dual_check_resolved", choices=choices, gaps=gaps,
+               message=_resolved_text(disagreed, choices))
+    candidates = [{**review["facts"][r["metric_id"]], "choice": choices[r["metric_id"]]}
+                  for r in disagreed if choices[r["metric_id"]] in ("a", "b") and r["metric_id"] in review["facts"]]
+    catalog = await _step("dual_check_catalog", lambda: _catalog(ctx, candidates)) if candidates else None
+    rejected = [r for r in disagreed if choices[r["metric_id"]] != "a"]
+    if rejected and options.on_reject == "fail":
+        # 目录照样写了：审核人的选择是对数据的判断，和这次运行停不停无关
+        names = "、".join(f"「{r['name']}」" for r in rejected[:5])
+        raise NodeError(ctx.node.id, f"双盲复算不一致，审核人没有采用原流程的结果（指标{names}）。"
+                                     f"「{DUAL_CHECK_FIELD_LABEL['on_reject']}」设为「判为失败」，运行已停止；"
+                                     "请按审核意见修正取数或口径后重新运行")
+    return _finish(state, ctx, card_id, card, checked, status=RESOLVED, gaps=gaps, choices=choices, note=note,
+                   artifact=review["card_artifact"], catalog=catalog)
+
+
+# --------------------------------------------------------------------------
+# 设置、口径卡、要复算的指标
+# --------------------------------------------------------------------------
+
+
+async def _step(name: str, work: Callable[[], Awaitable[Any]]) -> Any:
+    """在一个 @task 里做 work：审批恢复、接着运行时节点从头重放，结果直接取 checkpoint 里的，不再做一遍；work 里发的
+    事件也就只发一次。不在图里执行（单独调用执行器）时直接做。"""
+    if not _in_graph():
+        return await work()
+
+    @task(name=name)
+    async def step() -> Any:
+        return await work()
+
+    return await step()
+
+
+async def _settings(ctx: NodeContext) -> dict[str, Any]:
+    """这次运行的核查设置：发起时的快照（run.options["verify"]）。发起时没快照的（不经 launch_run 发起、子工作流里的
+    节点）读当前设置，读一次记进 checkpoint：重放时不再读，审批停下期间改了设置也不会让重放走上另一条路。"""
+    from app.api.settings import VERIFY_GROUP, verify_settings, verify_values
+    from app.engine.runner import RUN_OPTIONS_KEY
+
+    options = ctx.run.extra.get(RUN_OPTIONS_KEY)
+    snapshot = options.get(VERIFY_GROUP) if isinstance(options, dict) else None
+    if isinstance(snapshot, dict):
+        return verify_values(snapshot)
+
+    async def read() -> dict[str, Any]:
+        async with SessionLocal() as session:
+            return await verify_settings(session)
+
+    return await _step("dual_check_settings", read)
+
+
+def _card(state: GraphState, ctx: NodeContext) -> tuple[str, dict[str, Any] | None]:
+    """要复算的口径卡：(节点 id, 它这次的产出)。配置不对（发起前的校验已经拦下，这里兜底）报节点错误；卡没执行到
+    （在没走到的分支上）产出为 None。"""
+    card_id, problem = dual_check_card(ctx.run.spec, ctx.node)
+    if problem or not card_id:
+        raise NodeError(ctx.node.id, problem or f"「{DUAL_CHECK_FIELD_LABEL['card']}」需要选择一个口径卡节点")
+    node = ctx.run.spec.node_map().get(card_id)
+    if node is None or node.type != NodeType.METRICS:
+        raise NodeError(ctx.node.id, f"「{DUAL_CHECK_FIELD_LABEL['card']}」选择的「{card_id}」不是口径卡节点，"
+                                     "请重新选择")
+    output = (state.get("nodes") or {}).get(card_id)
+    return card_id, output if isinstance(output, dict) and output.get("kind") == "metric_set" else None
+
+
+def _options(ctx: NodeContext, part: Mapping[str, Any], settings: Mapping[str, Any]) -> _Options:
+    cfg = ctx.config
+    tolerance = cfg.get("tolerance")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance) \
+            or tolerance < 0:
+        tolerance = part.get("tolerance")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or tolerance < 0:
+        tolerance = 0.0
+    wanted = cfg.get("metrics")
+    definitions = cfg.get("definitions") if isinstance(cfg.get("definitions"), dict) else {}
+    return _Options(
+        tolerance=float(tolerance),
+        on_reject=cfg.get("on_reject") if cfg.get("on_reject") in DUAL_CHECK_ON_REJECT else "degrade",
+        metrics=[str(m) for m in wanted if isinstance(m, str) and m.strip()] if isinstance(wanted, list) else None,
+        definitions={str(k): str(v) for k, v in definitions.items() if isinstance(v, str) and v.strip()},
+        max_queries=part.get("max_queries"), timeout_s=part.get("timeout_s"),
+        daily_max_usd=settings.get("daily_max_usd"),
+    )
+
+
+def _from_query(item: Any) -> bool:
+    return isinstance(item, dict) and item.get("via") in QUERY_VIAS and isinstance(item.get("artifact"), str) \
+        and bool(item["artifact"]) and isinstance(item.get("path"), str)
+
+
+def _number(value: Any) -> bool:
+    if not is_number(value):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _targets(card: dict[str, Any], options: _Options, ctx: NodeContext) -> list[dict[str, Any]]:
+    """要复算的指标，按配置的先后（没配就按卡上的先后）：原值是数、至少一个输入来自查询快照。配置里写了卡上没有的
+    指标 ID 报节点错误（口径卡引用自别的工作流时，画图时查不出来）。"""
+    metrics = [m for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id") is not None]
+    by_id = {str(m["id"]): m for m in metrics}
+    if options.metrics:
+        if unknown := [m for m in options.metrics if m not in by_id]:
+            raise NodeError(ctx.node.id, f"「{DUAL_CHECK_FIELD_LABEL['metrics']}」中的「{'、'.join(unknown[:5])}」"
+                                         f"不是口径卡上的指标 ID，可选的指标 ID：{'、'.join(list(by_id)[:12])}")
+        chosen = [by_id[m] for m in dict.fromkeys(options.metrics)]
+    else:
+        chosen = metrics
+    return [m for m in chosen if _number(m.get("value")) and any(_from_query(i) for i in m.get("inputs") or [])]
+
+
+def _skipped(ctx: NodeContext, reason: str) -> dict[str, Any]:
+    return {"nodes": {ctx.node.id: {"status": SKIPPED, "reason": reason}}}
+
+
+# --------------------------------------------------------------------------
+# 盲算与比对（一个 @task）
+# --------------------------------------------------------------------------
+
+
+class _Sources:
+    """一次复算里要读的查询快照和数据源：同一份只读一次。"""
+
+    def __init__(self) -> None:
+        self.snapshots: dict[str, tuple[Any, str | None]] = {}
+        self.rows: dict[str, DataSource | None] = {}
+
+    def snapshot(self, artifact: str) -> tuple[dict[str, Any] | None, str | None]:
+        if artifact not in self.snapshots:
+            try:
+                content = artifact_store.load(artifact)
+                self.snapshots[artifact] = (content, None if content is not None else "查询快照无法读取")
+            except ValueError:
+                self.snapshots[artifact] = (None, "查询快照与哈希不一致，疑似被修改")
+        content, why = self.snapshots[artifact]
+        if why is None and not (isinstance(content, dict) and isinstance(content.get("rows"), list)):
+            return None, "查询快照无法读取"
+        return content, why
+
+    async def source(self, name: str) -> DataSource | None:
+        if name not in self.rows:
+            async with SessionLocal() as session:
+                self.rows[name] = (await session.execute(
+                    select(DataSource).where(DataSource.name == name))).scalar_one_or_none()
+        return self.rows[name]
+
+    async def hidden(self, artifact: str) -> frozenset[str]:
+        """这份快照要遮的列（小写）：查询当时记下的，加上数据源现在设的。宁可多遮。"""
+        from app.data.engine import masked_columns
+
+        snap, _ = self.snapshot(artifact)
+        recorded = (snap or {}).get("mask_columns")
+        out = {c.lower() for c in recorded if isinstance(c, str)} if isinstance(recorded, list) else set()
+        name = (snap or {}).get("source")
+        if isinstance(name, str) and name:
+            row = await self.source(name)
+            out |= {c.lower() for c in masked_columns(row.options if row is not None else None)}
+        return frozenset(out)
+
+
+def _loader(state: GraphState) -> tuple[Callable[[str], Any], dict[str, str]]:
+    """重算要的取工件函数和节点产出：nodes.* 的容器输入从这次运行的状态里取（口径卡执行时上游的产出就是这些）。"""
+    prefix = "state:"
+    outputs = {str(nid): f"{prefix}{nid}" for nid in state.get("nodes") or {}}
+
+    def load(key: str) -> Any:
+        if key.startswith(prefix):
+            return (state.get("nodes") or {}).get(key[len(prefix):])
+        return artifact_store.load(key)
+
+    return load, outputs
+
+
+async def _check(state: GraphState, ctx: NodeContext, targets: list[dict[str, Any]], options: _Options,
+                 settings: Mapping[str, Any]) -> dict[str, Any]:
+    """逐个指标认出能复算的输入、按输入盲算、代回原式比对。返回 {rows, results, model, same_model, usage}。
+
+    rows 每个指标一项：{metric_id, name, unit, decimals, status, reason?, original: {value, rendered}, blind: {value,
+    rendered}, delta_pct, inputs: [{path, key, value, sql, source, alias, artifact, row, column, node_id}], differing}；
+    results 是每个盲算（按格子去重）的结果，见 _slim。
+    """
+    sources = _Sources()
+    load, outputs = _loader(state)
+    aliases = _original_aliases(state)
+    rows: list[dict[str, Any]] = []
+    jobs: dict[str, dict[str, Any]] = {}
+    for metric in targets:
+        row, metric_jobs = await _plan_metric(state, metric, options, sources, aliases, load, outputs)
+        rows.append(row)
+        for key, job in metric_jobs.items():
+            # 两个指标用到同一格只盲算一次，按先出现的那个指标说清要算什么；先出现的没写口径说明、后一个写了，用后一个
+            if key not in jobs or (not jobs[key]["definition"] and job["definition"]):
+                jobs[key] = job
+    results, model, same, usage = await _blind(ctx, jobs, options, settings, _producer_models(state, rows))
+    for row, metric in zip(rows, targets):
+        if row["status"] != UNCHECKED:
+            _compare(row, metric, results, options, load, outputs, row.pop("_masks"))
+        else:
+            row.pop("_masks", None)
+    agreed = sum(1 for r in rows if r["status"] == SAME)
+    if agreed and not any(r["status"] == DIFFERENT for r in rows):
+        ctx.emit(EventType.LOG, level="info", code="dual_check_agreed", metrics=agreed,
+                 message=f"双盲复算一致：{agreed} 个指标两边的结果相同，已放行")
+    return {"rows": rows, "results": results, "model": model, "same_model": same, "usage": usage}
+
+
+def _original_aliases(state: GraphState) -> dict[str, str]:
+    """原流程的查询快照在这次运行的证据台账里的编号（Q1、Q2…，和报告取全部上游查询时的编号一致）。"""
+    ledger = [e for e in state.get("evidence") or [] if isinstance(e, dict)]
+    catalog = build_catalog(nodes={}, ledger=ledger)
+    return {str(entry.get("artifact")): alias for alias, entry in catalog.items()
+            if entry.get("kind") == "query" and entry.get("artifact")}
+
+
+async def _plan_metric(state: GraphState, metric: dict[str, Any], options: _Options, sources: _Sources,
+                       aliases: dict[str, str], load: Callable[[str], Any], outputs: dict[str, str]
+                       ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """一个指标：认出来自查询的输入能不能单独复算，能的话给每个输入建一个盲算任务。"""
+    row: dict[str, Any] = {
+        "metric_id": str(metric["id"]), "name": str(metric.get("name") or metric["id"]),
+        "unit": str(metric.get("unit") or ""), "decimals": metric.get("decimals"),
+        "status": "pending", "original": {"value": metric.get("value"), "rendered": metric.get("rendered")},
+        "blind": {"value": None, "rendered": None}, "delta_pct": None, "inputs": [], "differing": [],
+    }
+    tops = _tops(metric)
+    masks: dict[str, frozenset[str]] = {}
+    problem: str | None = None
+    for item in metric.get("inputs") or []:
+        if not _from_query(item):
+            continue
+        info, why = await _query_input(item, sources, aliases, tops)
+        masks[item["artifact"]] = await sources.hidden(item["artifact"])
+        if why:
+            problem = problem or why
+            continue
+        row["inputs"].append(info)
+    row["_masks"] = masks
+    if problem is None:
+        # 什么都不改先重算一遍：和卡上记的对不上（输入还原不了、用到了遮罩列），换了盲算的输入也算不准
+        check = recompute.recompute(metric, recompute.Changes(), recompute.Sources(
+            load=load, outputs=outputs, masked=masks, queries=tuple(dict.fromkeys(masks))))
+        if check["status"] != "ok" or check["changed"]:
+            problem = f"无法按原表达式重算这个指标（{check.get('reason') or '重算结果与口径卡不一致'}）"
+    if problem:
+        row.update(status=UNCHECKED, reason=problem)
+        return row, {}
+    labels = {inp["path"]: f"输入{i}" for i, inp in enumerate(row["inputs"], 1)}
+    formula = _formula(metric, labels)
+    jobs: dict[str, dict[str, Any]] = {}
+    for inp in row["inputs"]:
+        snap, _ = sources.snapshot(inp["artifact"])
+        jobs[inp["key"]] = {
+            "key": inp["key"], "metric_id": row["metric_id"], "metric": row["name"], "unit": row["unit"],
+            "definition": options.definitions.get(row["metric_id"]) or "", "formula": formula,
+            "label": labels[inp["path"]], "column": inp["column"], "source": inp["source"],
+            "dims": _dims(snap or {}, inp["row"], inp["column"], masks.get(inp["artifact"]) or frozenset()),
+        }
+    return row, jobs
+
+
+async def _query_input(item: dict[str, Any], sources: _Sources, aliases: dict[str, str], tops: list[str]
+                       ) -> tuple[dict[str, Any], str | None]:
+    """一个来自查询快照的输入：(盲算要用的信息, None) 或 (_, 为什么不能单独复算)。"""
+    from app.engine.merge_query import MERGE_SOURCE
+
+    artifact = item["artifact"]
+    snap, why = sources.snapshot(artifact)
+    if why:
+        return {}, f"输入 {item['path']} 的{why}"
+    source = snap.get("source")
+    if source == MERGE_SOURCE:
+        return {}, f"输入 {item['path']} 来自合并查询（跨数据源合并的结果），盲算只能在单个数据源里查询"
+    if not isinstance(source, str) or not source:
+        return {}, f"输入 {item['path']} 的查询快照没有记下数据源"
+    locator = item.get("locator") if isinstance(item.get("locator"), dict) else {}
+    row, column = locator.get("row"), locator.get("column")
+    if isinstance(row, bool) or not isinstance(row, int) or row < 0 or not isinstance(column, str):
+        return {}, f"输入 {item['path']} 取的是一整段查询结果，盲算只能复核单个格子"
+    if item["path"] not in tops:
+        return {}, f"输入 {item['path']} 决定取哪一格，不能单独复算"
+    value = cell_value(item.get("value"))
+    if not _number(value):
+        return {}, f"输入 {item['path']} 不是数值"
+    if column.lower() in await sources.hidden(artifact):
+        return {}, f"输入 {item['path']} 取自设置了遮罩的列，不能用于复算"
+    found = await sources.source(source)
+    if found is None or not found.enabled:
+        return {}, f"数据源「{source}」不存在或已停用"
+    return {"path": item["path"], "key": f"{artifact}|{row}|{column}", "value": value,
+            "sql": str(snap.get("sql") or ""), "source": source, "alias": aliases.get(artifact),
+            "artifact": artifact, "row": row, "column": column, "node_id": item.get("node_id"),
+            "via": item["via"]}, None
+
+
+def _tops(metric: dict[str, Any]) -> list[str]:
+    """表达式最外层的引用：只有它们的值直接参与计算，嵌在下标、cell() 行列里的决定取哪一格。"""
+    try:
+        tree, _, _ = parse_expression(str(metric.get("expression") or ""))
+    except ExpressionError:
+        return []
+    tops, _ = recompute._refs(tree)
+    return tops
+
+
+class _Swap(ast.NodeTransformer):
+    """把最外层的引用换成给人（给盲算 agent）看的写法：取值链、整个 cell() 调用，认法同 recompute._Bind。"""
+
+    def __init__(self, shown: Callable[[str], ast.AST | None]) -> None:
+        self.shown = shown
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        if _cell_call(node) and (swapped := self.shown(ast.unparse(node))) is not None:
+            return ast.copy_location(swapped, node)
+        return self.generic_visit(node)
+
+    def _chain(self, node: ast.AST) -> ast.AST:
+        if _chain_root(node) is None:
+            return self.generic_visit(node)
+        swapped = self.shown(ast.unparse(node))
+        return ast.copy_location(swapped, node) if swapped is not None else node
+
+    visit_Attribute = visit_Subscript = visit_Name = _chain
+
+
+def _formula(metric: dict[str, Any], labels: dict[str, str]) -> str:
+    """交给盲算 agent 的计算式：来自查询的输入写成「输入1」「输入2」，别的输入写当时代进去的值（容器写「其他输入」）。
+    不露出取数节点的 id、cell() 的行列：那是原流程的取法，不是业务定义。"""
+    expr = str(metric.get("expression") or "")
+    try:
+        tree, _, _ = parse_expression(expr)
+    except ExpressionError:
+        return "、".join(labels.values())
+    values = {i.get("path"): i.get("value") for i in metric.get("inputs") or [] if isinstance(i, dict)}
+
+    def shown(path: str) -> ast.AST | None:
+        if path in labels:
+            return ast.Name(id=labels[path], ctx=ast.Load())
+        value = values.get(path)
+        if value is None or isinstance(value, (bool, int, float)) or (
+                isinstance(value, str) and len(value) <= _DIM_CHARS and not _BRIEF.match(value)):
+            return ast.Constant(value=value)
+        return ast.Name(id="其他输入", ctx=ast.Load())
+
+    swapped = _Swap(shown).visit(copy.deepcopy(tree))
+    return ast.unparse(ast.fix_missing_locations(swapped))
+
+
+def _dims(snapshot: dict[str, Any], row: int, column: str, hidden: frozenset[str]) -> list[str]:
+    """原流程那一格所在行的其他列里不是数的那些（地区、日期这类维度）：结果分了组时，盲算 agent 要知道算的是哪一组。
+    数不给（同一行别的指标值会带偏它），遮罩列不给。"""
+    rows = snapshot.get("rows") or []
+    if not 0 <= row < len(rows):
+        return []
+    record = rows[row]
+    columns = [str(c) for c in snapshot.get("columns") or []]
+    pairs = list(record.items()) if isinstance(record, dict) else list(zip(columns, record))
+    out: list[str] = []
+    for name, value in pairs:
+        name = str(name)
+        if name == column or name.lower() in hidden or value is None:
+            continue
+        kind = column_kind(snapshot, name)
+        if kind == "number" or (kind is None and (is_number(value) or numeric_text(value) is not None)):
+            continue
+        text = str(value).replace("\n", " ")
+        out.append(f"{name} 为「{text[:_DIM_CHARS]}」")
+        if len(out) >= _DIMS:
+            break
+    return out
+
+
+async def _catalog_text(sources: _Sources, name: str) -> str:
+    """交给盲算 agent 的数据目录：表清单（表名、中文名、粒度）和有目录的表的业务说明（业务日期、有效记录条件、去重、
+    字段含义、码值、关联关系）。太长的截断，其余请它用 db_schema 查。"""
+    from app.data import catalog
+
+    row = await sources.source(name)
+    if row is None:
+        return BLIND_NO_CATALOG_PROMPT
+    async with SessionLocal() as session:
+        entries = await catalog.read_catalog(session, row.id)
+    cache = row.schema_cache if isinstance(row.schema_cache, dict) else {}
+    tables = cache.get("tables") or {}
+    notes = {table: entry.notes for table, entry in entries.items()}
+    parts: list[str] = []
+    if index := catalog.render_table_index(cache, notes):
+        parts.append(BLIND_INDEX_PROMPT.format(index=_clip(index, _INDEX_CHARS)))
+    blocks = []
+    for table, body in notes.items():
+        block = catalog.render_table_notes(body, meta=tables.get(table), system_notes=catalog.system_notes_source(row))
+        # 每张表的说明去掉标题行，整段只在前面说一次「推断，未确认」的意思
+        lines = block.split("\n", 1)[1] if "\n" in block else ""
+        if lines:
+            blocks.append(f"表 {table}：\n{lines}")
+    if blocks:
+        parts.append(BLIND_NOTES_PROMPT.format(notes=_clip("\n".join(blocks), _NOTES_CHARS)))
+    return "\n\n".join(parts) or BLIND_NO_CATALOG_PROMPT
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit].rsplit("\n", 1)[0] + BLIND_MORE_PROMPT
+
+
+def _task_text(job: dict[str, Any], catalog: str) -> str:
+    return BLIND_TASK_PROMPT.format(
+        name=job["metric"], unit=BLIND_UNIT_PROMPT.format(unit=job["unit"]) if job["unit"] else "",
+        definition=job["definition"] or BLIND_NO_DEFINITION_PROMPT, formula=job["formula"], label=job["label"],
+        whole=BLIND_WHOLE_PROMPT if job["formula"].strip() == job["label"] else "", column=job["column"],
+        dims=BLIND_DIMS_PROMPT.format(dims="、".join(job["dims"])) if job["dims"] else "",
+        source=job["source"], catalog=catalog)
+
+
+async def _blind(ctx: NodeContext, jobs: dict[str, dict[str, Any]], options: _Options, settings: Mapping[str, Any],
+                 producers: set[str]) -> tuple[dict[str, Any], str | None, bool, dict[str, Any]]:
+    """按先后逐个盲算：(各格子的结果, 盲算模型, 是否和产出原数据的模型相同, 用量)。producers 是产出原数据的模型。"""
+    from app.api.settings import verify_model_spec
+    from app.engine.verify_agent import run_verify_agent
+    from app.tools.datasource import run_versions
+
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "calls": 0}
+    if not jobs:
+        return {}, None, False, usage
+    async with SessionLocal() as session:
+        spec = await verify_model_spec(session, ctx.config, settings=dict(settings))
+    sources = _Sources()
+    catalogs: dict[str, str] = {}
+    results: dict[str, Any] = {}
+    model: str | None = None
+    same = False
+    broken: dict[str, Any] | None = None
+    for key, job in jobs.items():
+        if broken is not None:
+            # 核查模型本身用不了（没配好、接入出错）：后面的盲算一样用不了，照这一次的原因记，不再一个个去试
+            results[key] = broken
+            continue
+        if job["source"] not in catalogs:
+            catalogs[job["source"]] = await _catalog_text(sources, job["source"])
+        outcome = await run_verify_agent(
+            spec=spec, system=BLIND_SYSTEM, task=_task_text(job, catalogs[job["source"]]), sources=[job["source"]],
+            output_schema=BLIND_SCHEMA, max_queries=options.max_queries, timeout_s=options.timeout_s,
+            daily_max_usd=options.daily_max_usd, emit=ctx.emit, run_id=ctx.run.run_id, node_id=ctx.node.id,
+            data_versions=run_versions(ctx.run))
+        results[key] = _slim(outcome)
+        if outcome.error and not outcome.model:
+            broken = results[key]
+        for k in usage:
+            usage[k] += outcome.usage.get(k) or 0
+        if outcome.model and model is None:
+            model = outcome.model
+            if model in producers:
+                same = True
+                ctx.emit(EventType.LOG, level="warn", code="dual_check_same_model", model=model,
+                         message=f"盲算模型与产出原数据的模型相同（「{model}」），难以发现原流程自身的错误。"
+                                 "请在「设置 → 偏好设置 → 核查」中选择另一个核查模型，"
+                                 f"或在节点的「{DUAL_CHECK_FIELD_LABEL['model']}」中指定")
+        if outcome.limit in LIMIT_CODES:
+            ctx.emit(EventType.LOG, level="warn", code="dual_check_limit", limit=outcome.limit, metric=job["metric_id"],
+                     message=f"指标「{job['metric']}」的盲算{_limit_text(outcome.limit, options)}，按无法复算处理")
+    usage["cost_usd"] = round(usage["cost_usd"], 6)
+    return results, model, same, usage
+
+
+def _producer_models(state: GraphState, rows: list[dict[str, Any]]) -> set[str]:
+    """产出原数据的模型：要复算的输入是 Agent 经 cite_fields 交来的，那个 Agent 用的模型（节点产出里的 model）。调用
+    工具节点写死的 SQL 没有模型参与，不算。"""
+    outputs = state.get("nodes") or {}
+    out: set[str] = set()
+    for row in rows:
+        for inp in row["inputs"]:
+            found = outputs.get(inp.get("node_id")) if inp.get("via") == "agent_field" else None
+            if isinstance(found, dict) and isinstance(found.get("model"), str) and found["model"]:
+                out.add(found["model"])
+    return out
+
+
+def _slim(outcome: Any) -> dict[str, Any]:
+    """一次盲算的结果里要留进 checkpoint 的部分。"""
+    cell = next((c for c in outcome.cells if c.get("path") == "value"), None) or {}
+    query = next((q for q in outcome.queries if q.get("alias") == cell.get("alias")), None) or {}
+    value = cell.get("value") if cell.get("status") == "resolved" else None
+    reason = None
+    if outcome.error:
+        reason = outcome.error
+    elif cell.get("status") == "missing":
+        reason = "盲算没有查到这个数"
+    elif cell.get("status") == "unresolved":
+        reason = f"盲算交回的格子引用不可用（{cell.get('reason') or '没有交这个数'}）"
+    elif value is None:
+        reason = "盲算取到的那一格是空值"
+    elif _cell_masked(cell):
+        value, reason = None, "盲算取的是设置了遮罩的列，不采用"
+    return {
+        "value": value, "reason": reason, "limit": outcome.limit, "model": outcome.model,
+        "alias": cell.get("alias"), "ref": cell.get("ref"), "artifact": cell.get("artifact"),
+        "row": cell.get("row"), "column": cell.get("column"), "eid": cell.get("eid"),
+        "sql": query.get("sql"), "source": query.get("source"),
+        "rationale": (outcome.result or {}).get("rationale") or "",
+        "queries": [{k: q.get(k) for k in ("alias", "artifact", "sql", "row_count", "truncated", "source")}
+                    for q in outcome.queries],
+        "notes": list(outcome.notes),
+    }
+
+
+def _cell_masked(cell: dict[str, Any]) -> bool:
+    """盲算交的那一格在遮罩列上（查询当时数据源设的遮罩记在它自己的快照里）：值会进审批卡和对照工件，不能用。"""
+    if not cell.get("artifact"):
+        return False
+    try:
+        snap = artifact_store.load(str(cell["artifact"]))
+    except (ValueError, OSError):
+        return True
+    recorded = snap.get("mask_columns") if isinstance(snap, dict) else None
+    column = str(cell.get("column") or "").lower()
+    return isinstance(recorded, list) and any(isinstance(c, str) and c.lower() == column for c in recorded)
+
+
+def _limit_text(limit: str | None, options: _Options) -> str:
+    """盲算为什么停下，接在「盲算」后面读：「盲算已达每项最多查询次数（6 次）」。"""
+    if limit == "max_queries" and options.max_queries is not None:
+        return f"已达每项最多查询次数（{options.max_queries} 次）"
+    if limit == "timeout_s" and options.timeout_s is not None:
+        return f"已达每项时长上限（{options.timeout_s:g} 秒）"
+    if limit == "daily_max_usd" and options.daily_max_usd is not None:
+        return f"已达核查每日金额上限（${float(options.daily_max_usd):g}）"
+    if limit in LIMIT_CODES:
+        return "已达核查的上限"
+    return "轮数已用完"
+
+
+def _agree(original: Any, blind: Any, tolerance: float) -> bool:
+    """按相对误差比（原值为 0 时按绝对误差）。"""
+    if original == blind:
+        return True
+    if not (_number(original) and _number(blind)):
+        return False
+    if original == 0:
+        return abs(blind) <= tolerance
+    return abs(blind - original) <= tolerance * abs(original)
+
+
+def _delta_pct(original: Any, blind: Any) -> float | None:
+    """相差比例，口径同运行对比：(盲算值 − 原流程值) ÷ |原流程值| × 100，两位小数；原流程值为 0 时为 None。"""
+    if not (_number(original) and _number(blind)) or original == 0:
+        return None
+    return round((blind - original) / abs(original) * 100, 2)
+
+
+def _compare(row: dict[str, Any], metric: dict[str, Any], results: dict[str, Any], options: _Options,
+             load: Callable[[str], Any], outputs: dict[str, str], masks: dict[str, frozenset[str]]) -> None:
+    """盲算的输入代回原式，和原值比。row 就地改成一致 / 不一致 / 无法复算。"""
+    values: dict[str, Any] = {}
+    for inp in row["inputs"]:
+        found = results.get(inp["key"])
+        if found is None:
+            row.update(status=UNCHECKED, reason="盲算没有执行")
+            return
+        if found.get("limit"):
+            row.update(status=UNCHECKED, reason="盲算" + _limit_text(found["limit"], options))
+            return
+        if found.get("value") is None:
+            row.update(status=UNCHECKED, reason=found.get("reason") or "盲算没有交回可用的数值")
+            return
+        values[inp["path"]] = found["value"]
+    outcome = recompute.recompute(metric, recompute.Changes(inputs=values), recompute.Sources(
+        load=load, outputs=outputs, masked=masks, queries=tuple(dict.fromkeys(masks))))
+    if outcome["status"] != "ok":
+        row.update(status=UNCHECKED, reason=f"用盲算的输入按原表达式算不出结果（{outcome.get('reason') or '无法计算'}）")
+        return
+    original = row["original"]["value"]
+    blind = outcome["new"]
+    row["blind"] = {"value": blind, "rendered": outcome.get("rendered_new")}
+    row["delta_pct"] = _delta_pct(original, blind)
+    if _agree(original, blind, options.tolerance):
+        row["status"] = SAME
+        return
+    row["status"] = DIFFERENT
+    # 对不上的输入：超出误差的；都没超出（误差经算式放大了）就取值不同的，再不行就全部
+    differing = [i["key"] for i in row["inputs"] if not _agree(i["value"], values[i["path"]], options.tolerance)]
+    differing = differing or [i["key"] for i in row["inputs"] if i["value"] != values[i["path"]]]
+    row["differing"] = differing or [i["key"] for i in row["inputs"]]
+
+
+def _unchecked_gaps(rows: list[dict[str, Any]]) -> list[str]:
+    return [GAP_UNCHECKED.format(name=r["name"], reason=r.get("reason") or "原因不明")
+            for r in rows if r["status"] == UNCHECKED]
+
+
+# --------------------------------------------------------------------------
+# 不一致：差异说明、对照工件、审批（一个 @task）
+# --------------------------------------------------------------------------
+
+
+async def _review(ctx: NodeContext, checked: dict[str, Any]) -> dict[str, Any]:
+    """不一致的指标逐个说清差在哪，完整对照落成工件，组好审批的 payload。返回 {payload, facts, card_artifact}。
+
+    facts 是每个不一致指标写数据目录要用的东西（dual_check_facts.derive 的候选，少一个 choice）：只有一个输入对不上时是
+    那一处完整的差异条目（带两边的写法和涉及的表、列），几个输入都对不上时只说「不止一处」。
+    """
+    rows = [r for r in checked["rows"] if r["status"] == DIFFERENT]
+    results = checked["results"]
+    sources = _Sources()
+    infos: dict[str, dict[str, Any]] = {}
+    metrics: list[dict[str, Any]] = []
+    summary: list[dict[str, Any]] = []
+    facts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        per_input: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+        for inp in row["inputs"]:
+            if inp["key"] not in row["differing"]:
+                continue
+            if inp["source"] not in infos:
+                infos[inp["source"]] = await _source_info(sources, inp["source"])
+            blind = results.get(inp["key"]) or {}
+            diff = await _explain(inp["sql"], blind.get("sql"), infos[inp["source"]])
+            per_input.append((inp, blind, diff))
+        merged = _merge(per_input)
+        metrics.append({
+            "metric_id": row["metric_id"], "name": row["name"], "unit": row["unit"], "decimals": row["decimals"],
+            "original": {**row["original"], "inputs": [
+                {"path": i["path"], "value": i["value"], "sql": i["sql"], "source": i["source"], "alias": i["alias"]}
+                for i in row["inputs"]]},
+            "blind": {**row["blind"], "inputs": [
+                {"path": i["path"], "value": (results.get(i["key"]) or {}).get("value"),
+                 "sql": (results.get(i["key"]) or {}).get("sql"), "source": (results.get(i["key"]) or {}).get("source"),
+                 "alias": (results.get(i["key"]) or {}).get("alias"),
+                 "rationale": (results.get(i["key"]) or {}).get("rationale") or ""}
+                for i in row["inputs"]]},
+            "diff": {"equivalent": merged["equivalent"],
+                     "items": [{"aspect": i.get("aspect"), "text": i.get("text")} for i in merged["items"]],
+                     "fallback": merged["fallback"], "text_diff": merged["text_diff"]},
+        })
+        summary.append({
+            "metric_id": row["metric_id"], "name": row["name"], "unit": row["unit"],
+            "original_rendered": row["original"]["rendered"], "blind_rendered": row["blind"]["rendered"],
+            "delta_pct": row["delta_pct"], "diff": [str(i.get("text")) for i in merged["items"][:SUMMARY_DIFFS]],
+            "fallback": not any(i.get("aspect") not in ("other", "parse") for i in merged["items"]),
+        })
+        first = per_input[0][0] if per_input else (row["inputs"][0] if row["inputs"] else {})
+        single = per_input[0] if len(per_input) == 1 else None
+        facts[row["metric_id"]] = {
+            "metric_id": row["metric_id"], "metric": row["name"], "source": first.get("source"),
+            "dialect": (infos.get(str(first.get("source"))) or {}).get("kind"),
+            "sql": {"a": single[0]["sql"], "b": single[1].get("sql")} if single else {},
+            "diff": {"equivalent": merged["equivalent"], "fallback": merged["fallback"] or single is None,
+                     "items": merged["items"]},
+        }
+    content = {"metrics": metrics, "model": checked.get("model"), "same_model": bool(checked.get("same_model"))}
+    try:
+        artifact = await artifact_store.put_json(content, kind="dual_check", run_id=ctx.run.run_id,
+                                                 node_id=ctx.node.id, meta={"metrics": len(metrics)})
+    except Exception as e:  # noqa: BLE001 - 对照存不下，审核人就看不到完整的两条 SQL：不能让人凭摘要裁决
+        raise NodeError(ctx.node.id, f"双盲复算的对照结果保存失败（{describe_exception(e)}），请稍后接着运行") from e
+    payload = {
+        "kind": "dual_check", "node_id": ctx.node.id, "mode": "input",
+        "title": f"双盲复算：{len(rows)} 个指标两边结果不一致，请选择采用哪一边的结果",
+        "card_artifact": artifact, "summary": summary,
+    }
+    names = "、".join(f"「{r['name']}」" for r in rows[:5]) + (f"等 {len(rows)} 个" if len(rows) > 5 else "")
+    ctx.emit(EventType.LOG, level="warn", code="dual_check_disagreed",
+             metrics=[{"id": r["metric_id"], "name": r["name"]} for r in rows], card_artifact=artifact,
+             message=f"双盲复算不一致：指标{names}两边的结果对不上，已暂停等待审核")
+    return {"payload": payload, "facts": facts, "card_artifact": artifact}
+
+
+async def _source_info(sources: _Sources, name: str) -> dict[str, Any]:
+    """比较两条 SQL 要用的：方言、表结构、列的中文名（数据目录里的）。数据源没了就都不给，照样比原文。"""
+    from app.data import catalog
+    from app.data.sql_semantics import catalog_labels
+
+    row = await sources.source(name)
+    if row is None:
+        return {"kind": None, "schema": None, "names": {}}
+    async with SessionLocal() as session:
+        entries = await catalog.read_catalog(session, row.id)
+    return {"kind": row.kind, "schema": row.schema_cache if isinstance(row.schema_cache, dict) else None,
+            "names": catalog_labels({table: entry.notes for table, entry in entries.items()})}
+
+
+async def _explain(original: Any, blind: Any, info: dict[str, Any]) -> dict[str, Any]:
+    """两条 SQL 的差异说明（SqlDiff.as_dict 的形状，条目带两边的写法和 detail）。规范化后一致的换成「差在数据」的
+    一句：值不同，写法却一样，具体差异一条都说不出。"""
+    from app.data.sql_semantics import explain_sql_diff
+
+    if not isinstance(original, str) or not original.strip() or not isinstance(blind, str) or not blind.strip():
+        return {"equivalent": False, "items": [{"aspect": "other", "a": None, "b": None, "text": NO_SQL}],
+                "fallback": True, "text_diff": []}
+    try:
+        diff = await asyncio.wait_for(asyncio.to_thread(
+            explain_sql_diff, original, blind, info.get("kind"), schema=info.get("schema"), names=info.get("names"),
+            labels=SIDES), timeout=DIFF_TIMEOUT_S)
+    except Exception as e:  # noqa: BLE001 - 比较本身出了意外（超时、规范化的缺陷）：给兜底说明，审核人对照原文
+        text = DIFF_TIMEOUT if isinstance(e, asyncio.TimeoutError) else DIFF_FAILED
+        return {"equivalent": False, "items": [{"aspect": "other", "a": None, "b": None, "text": text}],
+                "fallback": True, "text_diff": [f"- {original.strip()}", f"+ {blind.strip()}"]}
+    out = diff.as_dict()
+    if out["equivalent"]:
+        return {"equivalent": True, "items": [{"aspect": SAME_SQL_ASPECT, "a": None, "b": None, "text": SAME_SQL}],
+                "fallback": False, "text_diff": []}
+    return out
+
+
+def _merge(per_input: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]) -> dict[str, Any]:
+    """一个指标几个对不上的输入的差异合成一份：一个输入时就是它的；几个时每条前面写明是哪一列的输入。"""
+    if not per_input:
+        return {"equivalent": False, "items": [{"aspect": "other", "a": None, "b": None, "text": NO_SQL}],
+                "fallback": True, "text_diff": []}
+    if len(per_input) == 1:
+        diff = per_input[0][2]
+        return {"equivalent": bool(diff["equivalent"]), "items": list(diff["items"]),
+                "fallback": bool(diff["fallback"]), "text_diff": list(diff.get("text_diff") or [])}
+    items: list[dict[str, Any]] = []
+    lines: list[str] = []
+    for inp, _, diff in per_input:
+        items += [{**i, "text": f"输入「{inp['column']}」：{i.get('text')}"} for i in diff["items"]]
+        lines += list(diff.get("text_diff") or [])
+    return {"equivalent": all(d["equivalent"] for _, _, d in per_input), "items": items,
+            "fallback": any(d["fallback"] for _, _, d in per_input), "text_diff": lines[:40]}
+
+
+# --------------------------------------------------------------------------
+# 恢复之后：审核人的选择、缺口、数据目录
+# --------------------------------------------------------------------------
+
+
+def _choices(ctx: NodeContext, response: Any, rows: list[dict[str, Any]]) -> tuple[dict[str, str], str]:
+    """审核人的回复 → ({指标 id: a | b | neither}, 备注)。回复的 value 是 {choices, note}；某个指标没选、选了认不出的
+    按「两边都不对」：不替人认可任何一边。明确驳回（approved 为否）的按人工驳回让节点失败，和人工审批节点的填写模式
+    一样：这一步没有驳回的出口。"""
+    decision = read_decision(response)
+    if isinstance(response, dict) and decision.rejected:
+        raise NodeError(ctx.node.id, f"人工驳回：{decision.note or '未说明原因'}")
+    value = decision.value if isinstance(decision.value, dict) else response if isinstance(response, dict) else {}
+    raw = value.get("choices") if isinstance(value.get("choices"), dict) else {}
+    choices = {r["metric_id"]: raw[r["metric_id"]] if raw.get(r["metric_id"]) in CHOICES else "neither" for r in rows}
+    note = value.get("note") if isinstance(value.get("note"), str) and value.get("note").strip() else decision.note
+    return choices, str(note or "").strip()
+
+
+def _gaps(rows: list[dict[str, Any]], choices: dict[str, str]) -> list[str]:
+    out: list[str] = []
+    for row in rows:
+        if row["status"] == UNCHECKED:
+            out.append(GAP_UNCHECKED.format(name=row["name"], reason=row.get("reason") or "原因不明"))
+        elif row["status"] == DIFFERENT and choices.get(row["metric_id"]) == "b":
+            out.append(GAP_BLIND.format(name=row["name"]))
+        elif row["status"] == DIFFERENT and choices.get(row["metric_id"]) != "a":
+            out.append(GAP_NEITHER.format(name=row["name"]))
+    return out
+
+
+_CHOICE_TEXT = {"a": "采用原流程", "b": "采用盲算", "neither": "两边都不对"}
+
+
+def _resolved_text(rows: list[dict[str, Any]], choices: dict[str, str]) -> str:
+    parts = "；".join(f"「{r['name']}」{_CHOICE_TEXT[choices[r['metric_id']]]}" for r in rows[:8])
+    return f"审核人已裁决 {len(rows)} 个不一致的指标：{parts}" + ("等" if len(rows) > 8 else "")
+
+
+async def _catalog(ctx: NodeContext, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    from app.data.catalog import TABLE_FIELD_LABEL
+    from app.engine.dual_check_facts import record_choices
+
+    result = await record_choices(candidates, run_id=ctx.run.run_id, node_title=ctx.node.title, actor=ctx.actor())
+    written, skipped = result["written"], result["skipped"]
+    parts = []
+    if written:
+        parts.append("已写入数据目录：" + "、".join(
+            f"「{w['table']}」的{TABLE_FIELD_LABEL.get(w['item'], w['item'])}" for w in written))
+    if skipped:
+        parts.append("未写入数据目录：" + "；".join(s["reason"] for s in skipped[:3])
+                     + (f"等 {len(skipped)} 条" if len(skipped) > 3 else ""))
+    ctx.emit(EventType.LOG, level="info", code="dual_check_catalog", written=written, skipped=skipped,
+             message="。".join(parts))
+    return result
+
+
+# --------------------------------------------------------------------------
+# 产出
+# --------------------------------------------------------------------------
+
+
+def _finish(state: GraphState, ctx: NodeContext, card_id: str, card: dict[str, Any] | None, checked: dict[str, Any],
+            *, status: str, gaps: list[str], choices: dict[str, str] | None = None, note: str = "",
+            artifact: str | None = None, catalog: dict[str, Any] | None = None) -> dict[str, Any]:
+    rows = checked["rows"]
+    picked = choices or {}
+    metrics = [{
+        "metric_id": r["metric_id"], "name": r["name"], "unit": r["unit"], "status": r["status"],
+        "original_rendered": r["original"]["rendered"], "blind_rendered": r["blind"]["rendered"],
+        "delta_pct": r["delta_pct"],
+        **({"reason": r["reason"]} if r.get("reason") else {}),
+        **({"choice": picked[r["metric_id"]]} if r["metric_id"] in picked else {}),
+    } for r in rows]
+    result: dict[str, Any] = {"status": status, "metrics": metrics, "model": checked.get("model"),
+                              "same_model": bool(checked.get("same_model"))}
+    if artifact:
+        result["card_artifact"] = artifact
+    if choices is not None:
+        result.update(choices=choices, note=note)
+    if catalog is not None:
+        result["catalog"] = catalog
+    if gaps:
+        result["issuance_gaps"] = gaps
+    entry: dict[str, Any] = {
+        "kind": "dual_check", "node_id": ctx.node.id, "exec": next_exec(state, ctx.node.id), "card": card_id,
+        "status": status,
+        "metrics": [{"id": m["metric_id"], "status": m["status"], **({"choice": m["choice"]} if "choice" in m else {})}
+                    for m in metrics],
+        **({"metric_set": card["artifact"]} if card and isinstance(card.get("artifact"), str) else {}),
+        **({"artifact": artifact} if artifact else {}),
+    }
+    updates: dict[str, Any] = {"nodes": {ctx.node.id: result}, "evidence": [entry]}
+    usage = checked.get("usage") or {}
+    if usage.get("calls"):
+        updates["usage"] = dict(usage)
+    return updates
+
+
+__all__ = ["AGREED", "CHOICES", "RESOLVED", "SKIPPED", "run_dual_check"]

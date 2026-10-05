@@ -1,0 +1,571 @@
+"""双盲复算节点（engine/nodes/dual_check.py）：真跑一遍图。虚构的 SQLite 订单库埋了退款行、下单日和支付日两个陷阱
+（tests/fixtures/dual_check_shop.py），盲算模型是 MockChatModel 剧本。
+
+- 一致：不挂起，产出 agreed，日志 dual_check_agreed；盲算的查询发 tool.end（role: verify），台账只有一条 dual_check，
+  用量计入运行；盲算 agent 的任务里没有原 SQL
+- 不一致：挂起，审批 payload 和对照工件按约定；a / b / neither 三种选择的产出和缺口，on_reject 为 fail 时失败
+- 只差一个方面时写数据目录（业务日期、有效记录条件），差了不止一处不写，人工确认过的不同说法不覆盖
+- 全局关闭直通、节点覆盖；设置按发起时的快照；重放时盲算不再执行、事件不重复；报告的写作目录不含盲算的查询
+- 触顶、分组结果的维度、两个指标用到同一格只盲算一次
+"""
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import delete, select
+
+from app.core import artifact_store
+from app.data import catalog
+from app.db.base import SessionLocal
+from app.db.models import Approval, Run, RunEvent, Setting
+from app.engine import spend
+from app.engine.launch import launch_run
+from app.engine.runner import run_manager
+from app.main import app
+from tests.fixtures.dual_check_shop import (
+    BOTH_WRONG,
+    BY_ORDER_DATE,
+    BY_REGION,
+    DEFINITION,
+    RIGHT,
+    WEEK,
+    WITH_REFUNDS,
+    Blind,
+    add_source,
+    build,
+)
+from tests.fixtures.sources import drop_source
+
+#: 和 RIGHT 等价、写法不同（别名、列名都换了），值也是 330.0：报告的写作目录里若混进了盲算的查询，认得出来
+BLIND_TOTAL = f"SELECT SUM(o.amount) AS blind_total FROM orders o WHERE o.status <> 'refunded' AND o.paid_date {WEEK}"
+GMV = {"id": "gmv", "name": "销售额", "unit": "元", "decimals": 1, "format": "thousands",
+       "expression": "cell(nodes.fetch, 0, 'gmv')"}
+
+
+@pytest.fixture(autouse=True)
+async def engine_up():
+    await run_manager.setup()
+    yield
+    await run_manager.shutdown()
+
+
+@pytest.fixture(autouse=True)
+async def clean_settings():
+    async def clear() -> None:
+        async with SessionLocal() as session:
+            await session.execute(delete(Setting).where(Setting.key.in_(["verify", spend.SPEND_KEY])))
+            await session.commit()
+
+    await clear()
+    yield
+    await clear()
+
+
+@pytest.fixture
+async def shop(tmp_path):
+    name, source_id = await add_source(build(tmp_path / "shop.db"))
+    yield name, source_id
+    await drop_source(source_id)
+
+
+@pytest.fixture
+async def client():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+
+
+def node(nid, ntype, label=None, **config):
+    return {"id": nid, "type": ntype, "position": {"x": 0, "y": 0}, "data": {"label": label or nid, "config": config}}
+
+
+def graph(source: str, sql: str, *, dual: dict | None = None, metrics: list | None = None, report: bool = False):
+    """取数 → 口径卡 → 双盲复算 →（报告）→ 成果。成果的叙述里没有数字：不加双盲复算时是完整出具。"""
+    nodes = [
+        node("start", "input"),
+        node("fetch", "tool", tool=f"db_query__{source}", args={"sql": sql}),
+        node("card", "metrics", caliber="销售口径", caliber_version="v1", metrics=metrics or [GMV]),
+        node("dual", "dual_check", "复核销售额", **{"definitions": {"gmv": DEFINITION}, **(dual or {})}),
+    ]
+    if report:
+        nodes.append(node("write", "report", instructions="写一句周报", on_violation="flag"))
+    nodes.append(node("out", "output", fields=[{"name": "结论", "value": "本周销售额见口径卡"}],
+                      contract={"metrics_from": "card", "narrative": "本周销售额见口径卡"}))
+    return {"nodes": nodes, "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}
+
+
+async def wait(run_id: str, statuses=("succeeded", "failed", "interrupted")) -> Run:
+    for _ in range(600):
+        await asyncio.sleep(0.05)
+        async with SessionLocal() as session:
+            row = await session.get(Run, run_id)
+        if row.status in statuses and (row.status == "interrupted" or row.manifest_seq is not None):
+            await run_manager.wait_idle(run_id)
+            return row
+    raise AssertionError(f"运行 {run_id} 停在 {row.status}：{row.error}")
+
+
+async def start(spec: dict, **kwargs) -> Run:
+    run = await run_manager.start(graph=spec, input_payload={}, **kwargs)
+    return await wait(run.id)
+
+
+async def events(run_id: str) -> list[RunEvent]:
+    async with SessionLocal() as session:
+        return list((await session.execute(
+            select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.seq))).scalars())
+
+
+def logs(evs: list[RunEvent], code: str) -> list[dict]:
+    return [e.data for e in evs if e.type == "log" and e.data.get("code") == code]
+
+
+async def pending(run_id: str) -> Approval:
+    async with SessionLocal() as session:
+        return (await session.execute(select(Approval).where(
+            Approval.run_id == run_id, Approval.status == "pending"))).scalar_one()
+
+
+async def decide(client, run_id: str, choices: dict, note: str = "") -> Run:
+    approval = await pending(run_id)
+    res = await client.post(f"/api/approvals/{approval.id}/decide",
+                            json={"approved": True, "value": {"choices": choices, "note": note}})
+    assert res.status_code == 200, res.text
+    return await wait(run_id, ("succeeded", "failed"))
+
+
+def dual_output(run: Run, evs: list[RunEvent]) -> dict:
+    finished = [e for e in evs if e.type == "node.finished" and e.node_id == "dual"]
+    assert finished, "双盲复算节点没有跑完"
+    return artifact_store.load(finished[-1].data["artifact"])
+
+
+async def notes_of(source_id: str, table: str = "orders"):
+    async with SessionLocal() as session:
+        return await catalog.read_entry(session, source_id, table)
+
+
+# --------------------------------------------------------------------------
+# 一致：不挂起
+# --------------------------------------------------------------------------
+
+
+async def test_agreeing_check_passes_without_asking(monkeypatch, shop):
+    name, _ = shop
+    blind = Blind(monkeypatch, name, {"销售额": (BLIND_TOTAL, "blind_total")})
+    run = await start(graph(name, RIGHT))
+    assert run.status == "succeeded", run.error
+    evs = await events(run.id)
+    out = dual_output(run, evs)
+    assert out["status"] == "agreed" and "issuance_gaps" not in out
+    [metric] = out["metrics"]
+    assert metric["metric_id"] == "gmv" and metric["status"] == "agreed" and metric["delta_pct"] == 0.0
+    assert metric["original_rendered"] == metric["blind_rendered"]
+    assert [d["metrics"] for d in logs(evs, "dual_check_agreed")] == [1]
+    assert not logs(evs, "dual_check_disagreed") and not [e for e in evs if e.type == "human.requested"]
+    # 盲算的查询发 tool.end（role: verify），带查询快照，随运行封存
+    ends = [e.data for e in evs if e.type == "tool.end" and e.node_id == "dual"]
+    assert ends and all(d.get("role") == "verify" for d in ends)
+    assert any(d.get("query_artifact") for d in ends)
+    # 台账只记一条 dual_check，绝不写 query：报告的写作目录按台账里的 query 编号
+    [finished] = [e for e in evs if e.type == "node.finished" and e.node_id == "dual"]
+    kinds = [entry["kind"] for entry in finished.data.get("evidence") or []]
+    assert kinds == ["dual_check"]
+    entry = finished.data["evidence"][0]
+    assert entry["card"] == "card" and entry["status"] == "agreed"
+    assert entry["metrics"] == [{"id": "gmv", "status": "agreed"}]
+    # 用量计入运行：图里只有盲算调用了模型
+    assert blind.calls and run.usage["calls"] == len(blind.calls)
+    assert run.output["_issuance"]["tier"] == "formal" and run.output["_issuance"]["gaps"] == []
+    # 盲算 agent 只看得到指标名、口径说明、计算式里是哪一项：看不到原 SQL、取数节点
+    [task] = blind.tasks
+    assert "指标：销售额" in task and DEFINITION in task and "输入1" in task
+    assert "status <> 'refunded'" not in task and "nodes.fetch" not in task and "SUM(" not in task
+
+
+async def test_grouped_rows_tell_the_blind_agent_which_group(monkeypatch, shop):
+    """结果分了组：盲算 agent 要知道算的是哪一组（同一行的维度列），但看不到同一行别的数。"""
+    name, _ = shop
+    metric = {**GMV, "name": "华东销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    blind = Blind(monkeypatch, name, {"华东销售额": (BY_REGION, "gmv")})
+    run = await start(graph(name, BY_REGION, metrics=[metric], dual={"definitions": {}}))
+    assert run.status == "succeeded", run.error
+    [task] = blind.tasks
+    assert "region 为「华东」" in task and "（未提供" in task
+    out = dual_output(run, await events(run.id))
+    assert out["status"] == "agreed" and out["metrics"][0]["status"] == "agreed"
+
+
+async def test_two_metrics_using_one_cell_are_checked_once(monkeypatch, shop):
+    name, _ = shop
+    share = {"id": "gmv_k", "name": "销售额（千元）", "unit": "千元", "decimals": 2, "format": "thousands",
+             "expression": "round(cell(nodes.fetch, 0, 'gmv') / 1000, 2)"}
+    blind = Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, RIGHT, metrics=[GMV, share]))
+    assert run.status == "succeeded", run.error
+    assert blind.runs == 1, "同一格盲算了不止一次"
+    out = dual_output(run, await events(run.id))
+    assert [m["status"] for m in out["metrics"]] == ["agreed", "agreed"]
+
+
+async def test_hitting_a_limit_counts_as_unchecked(monkeypatch, shop):
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, RIGHT), options={"verify": {"dual_check": {"max_queries": 1}}})
+    assert run.status == "succeeded", run.error
+    evs = await events(run.id)
+    assert [(d["limit"], d["metric"]) for d in logs(evs, "dual_check_limit")] == [("max_queries", "gmv")]
+    out = dual_output(run, evs)
+    assert out["status"] == "agreed" and out["metrics"][0]["status"] == "unchecked"
+    assert out["issuance_gaps"] == ["指标「销售额」无法复算：盲算已达每项最多查询次数（1 次）"]
+    assert not [e for e in evs if e.type == "human.requested"]
+    assert run.output["_issuance"]["tier"] == "degraded"
+    assert run.output["_issuance"]["gaps"] == ["双盲复算「复核销售额」：指标「销售额」无法复算：盲算已达每项最多查询次数（1 次）"]
+
+
+async def test_an_unusable_verify_model_is_tried_once(monkeypatch, shop):
+    """核查模型没配好：每个指标都记无法复算、原因照实，后面的盲算不再一个个去试。"""
+    from app.engine import verify_agent
+    from app.providers.factory import ProviderNotConfigured
+
+    name, _ = shop
+    tried: list[str] = []
+
+    async def broken(session, spec):
+        tried.append(spec.model or "")
+        raise ProviderNotConfigured("核查用的模型接入已停用", "请到「设置 → 模型接入」中启用")
+
+    monkeypatch.setattr(verify_agent, "get_chat_model", broken)
+    east = {**GMV, "id": "east", "name": "华东销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    north = {**GMV, "id": "north", "name": "华北销售额", "expression": "cell(nodes.fetch, 1, 'gmv')"}
+    run = await start(graph(name, BY_REGION, metrics=[east, north], dual={"definitions": {}}))
+    assert run.status == "succeeded", run.error
+    out = dual_output(run, await events(run.id))
+    assert [m["status"] for m in out["metrics"]] == ["unchecked", "unchecked"]
+    assert all("核查模型不可用" in m["reason"] and "已停用" in m["reason"] for m in out["metrics"])
+    assert len(out["issuance_gaps"]) == 2 and len(tried) == 1
+
+
+# --------------------------------------------------------------------------
+# 不一致：挂起，按约定的 payload 和工件
+# --------------------------------------------------------------------------
+
+
+async def test_disagreement_pauses_with_the_agreed_payload_and_card(monkeypatch, shop):
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    assert run.status == "interrupted", run.error
+    approval = await pending(run.id)
+    assert approval.mode == "input" and approval.node_id == "dual"
+    payload = approval.payload
+    assert set(payload) == {"kind", "node_id", "mode", "title", "card_artifact", "summary"}
+    assert payload["kind"] == "dual_check" and payload["node_id"] == "dual" and payload["mode"] == "input"
+    [item] = payload["summary"]
+    assert set(item) == {"metric_id", "name", "unit", "original_rendered", "blind_rendered", "delta_pct", "diff",
+                         "fallback"}
+    assert (item["metric_id"], item["name"], item["unit"]) == ("gmv", "销售额", "元")
+    assert item["original_rendered"].startswith("310") and item["blind_rendered"].startswith("330")
+    assert item["delta_pct"] == round((330 - 310) / 310 * 100, 2)
+    assert item["fallback"] is False and len(item["diff"]) == 1
+    assert "order_date" in item["diff"][0] and "paid_date" in item["diff"][0] and "原流程" in item["diff"][0]
+
+    card = artifact_store.load(payload["card_artifact"])
+    assert set(card) == {"metrics", "model", "same_model"} and card["same_model"] is False
+    [metric] = card["metrics"]
+    assert set(metric) == {"metric_id", "name", "unit", "decimals", "original", "blind", "diff"}
+    assert metric["decimals"] == 1
+    [orig] = metric["original"]["inputs"]
+    assert set(orig) == {"path", "value", "sql", "source", "alias"}
+    assert (orig["sql"], orig["value"], orig["source"], orig["alias"]) == (BY_ORDER_DATE, 310.0, name, "Q1")
+    [mine] = metric["blind"]["inputs"]
+    assert set(mine) == {"path", "value", "sql", "source", "alias", "rationale"}
+    assert (mine["sql"], mine["value"], mine["source"], mine["alias"]) == (RIGHT, 330.0, name, "Q1")
+    assert mine["path"] == orig["path"] == "cell(nodes.fetch, 0, 'gmv')" and "330" in mine["rationale"]
+    assert metric["original"]["value"] == 310.0 and metric["blind"]["value"] == 330.0
+    assert set(metric["diff"]) == {"equivalent", "items", "fallback", "text_diff"}
+    assert metric["diff"]["equivalent"] is False and metric["diff"]["fallback"] is False
+    assert [set(i) for i in metric["diff"]["items"]] == [{"aspect", "text"}]
+    assert metric["diff"]["items"][0]["aspect"] == "time" and metric["diff"]["text_diff"]
+
+    evs = await events(run.id)
+    [said] = logs(evs, "dual_check_disagreed")
+    assert said["metrics"] == [{"id": "gmv", "name": "销售额"}] and said["card_artifact"] == payload["card_artifact"]
+    assert len([e for e in evs if e.type == "human.requested"]) == 1
+
+
+async def test_choosing_the_original_leaves_no_gap(monkeypatch, shop, client):
+    name, source_id = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    done = await decide(client, run.id, {"gmv": "a"}, note="周报一直按下单日统计")
+    assert done.status == "succeeded", done.error
+    evs = await events(run.id)
+    out = dual_output(done, evs)
+    assert out["status"] == "resolved" and out["choices"] == {"gmv": "a"} and "issuance_gaps" not in out
+    assert out["note"] == "周报一直按下单日统计" and out["metrics"][0]["choice"] == "a"
+    assert [d["gaps"] for d in logs(evs, "dual_check_resolved")] == [[]]
+    assert logs(evs, "dual_check_resolved")[0]["choices"] == {"gmv": "a"}
+    assert done.output["_issuance"]["tier"] == "formal"
+    assert len([e for e in evs if e.type == "human.resolved"]) == 1
+    # 只差时间列一处：采纳原流程，业务日期记原流程那一列
+    entry = await notes_of(source_id)
+    item = entry.notes["business_date"]
+    assert item["value"] == {"column": "order_date"} and (item["source"], item["status"]) == ("human", "confirmed")
+    assert run.id in item["note"] and "复核销售额" in item["note"] and "销售额" in item["note"]
+    [wrote] = logs(evs, "dual_check_catalog")
+    assert wrote["written"] == [{"source": name, "table": "orders", "item": "business_date"}] and wrote["skipped"] == []
+
+
+async def test_choosing_the_blind_result_degrades_and_writes_the_catalog(monkeypatch, shop, client):
+    name, source_id = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    done = await decide(client, run.id, {"gmv": "b"})
+    assert done.status == "succeeded", done.error
+    out = dual_output(done, await events(run.id))
+    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人选择了盲算结果"]
+    issuance = done.output["_issuance"]
+    assert issuance["tier"] == "degraded"
+    assert issuance["gaps"] == ["双盲复算「复核销售额」：指标「销售额」双盲复算不一致，审核人选择了盲算结果"]
+    assert (await notes_of(source_id)).notes["business_date"]["value"] == {"column": "paid_date"}
+
+
+async def test_neither_degrades_and_writes_nothing(monkeypatch, shop, client):
+    name, source_id = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    done = await decide(client, run.id, {"gmv": "neither"}, note="两边都没排除测试单")
+    assert done.status == "succeeded", done.error
+    evs = await events(run.id)
+    out = dual_output(done, evs)
+    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人判断两边都不对"]
+    assert done.output["_issuance"]["tier"] == "degraded"
+    assert not logs(evs, "dual_check_catalog") and await notes_of(source_id) is None
+
+
+async def test_a_missing_choice_counts_as_neither(monkeypatch, shop, client):
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    done = await decide(client, run.id, {"gmv": "maybe"})
+    out = dual_output(done, await events(run.id))
+    assert out["choices"] == {"gmv": "neither"}
+    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人判断两边都不对"]
+
+
+async def test_on_reject_fail_stops_the_run(monkeypatch, shop, client):
+    name, source_id = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE, dual={"on_reject": "fail"}))
+    done = await decide(client, run.id, {"gmv": "b"})
+    assert done.status == "failed" and "审核人没有采用原流程的结果" in (done.error or "") and "销售额" in done.error
+    evs = await events(run.id)
+    assert [d["gaps"] for d in logs(evs, "dual_check_resolved")] == [
+        ["指标「销售额」双盲复算不一致，审核人选择了盲算结果"]]
+    # 审核人的选择照样写进了目录：那是对数据的判断，和运行停不停无关
+    entry = await notes_of(source_id)
+    assert entry.notes["business_date"]["value"] == {"column": "paid_date"} and entry.version == 1
+
+
+async def test_on_reject_fail_lets_the_original_through(monkeypatch, shop, client):
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE, dual={"on_reject": "fail"}))
+    done = await decide(client, run.id, {"gmv": "a"})
+    assert done.status == "succeeded", done.error
+
+
+async def test_the_same_choice_twice_writes_the_catalog_once(monkeypatch, shop, client):
+    """同样的不一致、同样的选择再来一次：目录里已经是这个说法，不再写，也不升版本。"""
+    name, source_id = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    for _ in range(2):
+        run = await start(graph(name, BY_ORDER_DATE))
+        await decide(client, run.id, {"gmv": "b"})
+    [wrote] = logs(await events(run.id), "dual_check_catalog")
+    assert wrote["written"] == [] and "无需重复写入" in wrote["skipped"][0]["reason"]
+    assert (await notes_of(source_id)).version == 1
+
+
+# --------------------------------------------------------------------------
+# 写数据目录：只差一个方面才写，确认过的不覆盖
+# --------------------------------------------------------------------------
+
+
+async def test_a_refund_filter_becomes_the_valid_row_filter(monkeypatch, shop, client):
+    name, source_id = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, WITH_REFUNDS))
+    payload = (await pending(run.id)).payload
+    assert "status = 'refunded'" in payload["summary"][0]["diff"][0]
+    await decide(client, run.id, {"gmv": "b"})
+    item = (await notes_of(source_id)).notes["valid_filter"]
+    assert item["value"] == "status <> 'refunded'" and item["status"] == "confirmed" and item["source"] == "human"
+
+
+async def test_the_adopted_side_without_the_filter_writes_nothing(monkeypatch, shop, client):
+    """多出条件的是原流程，审核人却采纳了没有这个条件的盲算：目录里没有对应的写法，照实说。"""
+    name, source_id = shop
+    Blind(monkeypatch, name, {"销售额": (WITH_REFUNDS, "gmv")})
+    run = await start(graph(name, RIGHT))
+    done = await decide(client, run.id, {"gmv": "b"})
+    [wrote] = logs(await events(done.id), "dual_check_catalog")
+    assert wrote["written"] == [] and "被采纳的盲算没有这个条件" in wrote["skipped"][0]["reason"]
+    assert await notes_of(source_id) is None
+
+
+async def test_two_differences_are_not_written(monkeypatch, shop, client):
+    name, source_id = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BOTH_WRONG))
+    assert len((await pending(run.id)).payload["summary"][0]["diff"]) == 2
+    done = await decide(client, run.id, {"gmv": "b"})
+    [wrote] = logs(await events(done.id), "dual_check_catalog")
+    assert wrote["written"] == [] and "不止差一个方面" in wrote["skipped"][0]["reason"]
+    assert await notes_of(source_id) is None
+
+
+async def test_a_confirmed_catalog_entry_is_not_overwritten(monkeypatch, shop, client):
+    name, source_id = shop
+    async with SessionLocal() as session:
+        await catalog.write_entry(session, source_id, "orders", {
+            "business_date": catalog.make_item({"column": "order_date"}, "human", "confirmed")}, if_version=0,
+            actor="数据组")
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    done = await decide(client, run.id, {"gmv": "b"})
+    [wrote] = logs(await events(done.id), "dual_check_catalog")
+    assert wrote["written"] == []
+    assert "已有人工确认过的说法「order_date」" in wrote["skipped"][0]["reason"] and "paid_date" in wrote["skipped"][0]["reason"]
+    entry = await notes_of(source_id)
+    assert entry.version == 1 and entry.notes["business_date"]["value"] == {"column": "order_date"}
+
+
+# --------------------------------------------------------------------------
+# 设置：全局开关、节点覆盖、发起时的快照
+# --------------------------------------------------------------------------
+
+
+async def save_verify(values: dict) -> None:
+    async with SessionLocal() as session:
+        row = await session.get(Setting, "verify")
+        if row is None:
+            session.add(Setting(key="verify", value=values))
+        else:
+            row.value = values
+        await session.commit()
+
+
+async def launch(spec: dict) -> Run:
+    async with SessionLocal() as session:
+        run = await launch_run(session, graph=spec, actor="测试")
+    return await wait(run.id)
+
+
+async def test_globally_disabled_passes_through(monkeypatch, shop):
+    name, _ = shop
+    blind = Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    await save_verify({"dual_check": {"enabled": False}})
+    run = await launch(graph(name, BY_ORDER_DATE))
+    assert run.status == "succeeded", run.error
+    assert run.options["verify"]["dual_check"]["enabled"] is False
+    evs = await events(run.id)
+    assert dual_output(run, evs) == {"status": "skipped", "reason": "disabled"}
+    assert [d["reason"] for d in logs(evs, "dual_check_skipped")] == ["disabled"]
+    assert blind.calls == [] and run.output["_issuance"]["tier"] == "formal"
+
+
+async def test_the_node_can_override_the_global_switch(monkeypatch, shop):
+    name, _ = shop
+    blind = Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    await save_verify({"dual_check": {"enabled": False}})
+    run = await launch(graph(name, RIGHT, dual={"enabled": True}))
+    assert run.status == "succeeded" and dual_output(run, await events(run.id))["status"] == "agreed"
+    assert blind.runs == 1
+
+    await save_verify({"dual_check": {"enabled": True}})
+    off = await launch(graph(name, RIGHT, dual={"enabled": False}))
+    assert dual_output(off, await events(off.id)) == {"status": "skipped", "reason": "disabled"}
+    assert blind.runs == 1
+
+
+async def test_no_query_inputs_pass_through(monkeypatch, shop):
+    name, _ = shop
+    blind = Blind(monkeypatch, name, {})
+    constant = {"id": "target", "name": "目标", "unit": "元", "expression": "300"}
+    run = await start(graph(name, RIGHT, metrics=[constant], dual={"definitions": {}}))
+    evs = await events(run.id)
+    assert dual_output(run, evs) == {"status": "skipped", "reason": "no_inputs"}
+    assert [d["reason"] for d in logs(evs, "dual_check_skipped")] == ["no_inputs"] and blind.calls == []
+    assert run.output["_issuance"]["tier"] == "formal" and run.output["_issuance"]["gaps"] == []
+
+
+async def test_settings_changed_while_waiting_do_not_apply(monkeypatch, shop, client):
+    """发起时是开着的：停在审批上的时候把双盲复算关了，恢复后照旧按发起时的设置裁决，不会走成直接放行。"""
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await launch(graph(name, BY_ORDER_DATE))
+    assert run.status == "interrupted" and run.options["verify"]["dual_check"]["enabled"] is True
+    await save_verify({"dual_check": {"enabled": False}})
+    done = await decide(client, run.id, {"gmv": "b"})
+    assert done.status == "succeeded", done.error
+    evs = await events(run.id)
+    out = dual_output(done, evs)
+    assert out["status"] == "resolved" and out["issuance_gaps"]
+    assert not logs(evs, "dual_check_skipped")
+    started = [e.data for e in evs if e.type == "run.started"]
+    assert len(started) == 2 and all(s["options"]["verify"]["dual_check"]["enabled"] is True for s in started)
+
+
+async def test_the_node_reads_the_snapshot_not_the_current_settings(monkeypatch, shop):
+    name, _ = shop
+    blind = Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE), options={"verify": {"dual_check": {"enabled": False}}})
+    assert dual_output(run, await events(run.id)) == {"status": "skipped", "reason": "disabled"}
+    assert blind.calls == []
+
+
+# --------------------------------------------------------------------------
+# 重放、写作目录
+# --------------------------------------------------------------------------
+
+
+async def test_resuming_does_not_run_the_blind_agent_again(monkeypatch, shop, client):
+    """照 test_replay_side_effects：恢复后节点从头重放，盲算 agent 不再执行，事件不重复。"""
+    name, _ = shop
+    blind = Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    calls_before = list(blind.calls)
+    before = await events(run.id)
+    verify_starts = [e for e in before if e.type == "tool.start" and e.node_id == "dual"]
+    llm_ends = [e for e in before if e.type == "llm.end" and e.node_id == "dual"]
+    assert verify_starts and llm_ends
+
+    done = await decide(client, run.id, {"gmv": "a"})
+    assert done.status == "succeeded", done.error
+    assert blind.calls == calls_before, f"恢复之后盲算又调用了模型：{blind.calls[len(calls_before):]}"
+    evs = await events(run.id)
+    assert [e.seq for e in evs if e.type == "tool.start" and e.node_id == "dual"] == [e.seq for e in verify_starts]
+    assert [e.seq for e in evs if e.type == "llm.end" and e.node_id == "dual"] == [e.seq for e in llm_ends]
+    for code in ("dual_check_disagreed", "dual_check_resolved", "dual_check_catalog"):
+        assert len(logs(evs, code)) == 1, code
+    assert len([e for e in evs if e.type == "human.requested"]) == 1
+    assert len([e for e in evs if e.type == "human.resolved"]) == 1
+    assert len([e for e in evs if e.type == "node.finished" and e.node_id == "dual"]) == 1
+
+
+async def test_the_report_catalog_leaves_out_the_blind_queries(monkeypatch, shop):
+    name, _ = shop
+    blind = Blind(monkeypatch, name, {"销售额": (BLIND_TOTAL, "blind_total")}, writer="本周销售额 [[m:gmv]]。")
+    run = await start(graph(name, RIGHT, report=True))
+    assert run.status == "succeeded", run.error
+    [prompt] = blind.writer_prompts
+    assert "blind_total" not in prompt and "Q2" not in prompt, "盲算的查询进了报告的写作目录"
+    assert "Q1" in prompt and "m:gmv" in prompt
+    evs = await events(run.id)
+    blind_queries = [e.data["query_artifact"] for e in evs
+                     if e.type == "tool.end" and e.node_id == "dual" and e.data.get("query_artifact")]
+    ledger = [entry for e in evs if e.type == "node.finished" for entry in e.data.get("evidence") or []]
+    assert blind_queries and not any(entry.get("artifact") in blind_queries for entry in ledger)
