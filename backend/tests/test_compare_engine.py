@@ -16,6 +16,7 @@ import json
 from decimal import Decimal
 
 from app.engine import compare
+from app.engine.merge_query import MERGE_SOURCE
 from tests.fixtures.compare_runs import (
     BASE_ROWS,
     EAST,
@@ -528,6 +529,47 @@ def test_an_agent_reconfigured_with_the_same_sql_is_a_template_change():
     assert any("区域分析" in r for r in metrics["total"]["reasons"])
     # 取数节点的格子不经过这个 Agent：照旧是数据变化
     assert metrics["east"]["classification"] == "data_only"
+
+
+def test_a_merge_query_is_compared_by_its_merge_sql():
+    """合并查询只记在节点的台账里（没有 tool.end），SQL 在快照和 merge.end 里；快照文件不在了也比得了。"""
+    def make(run_id, sql, *, drop=False):
+        run = Fake(run_id)
+        run.tool("fetch", region_sql())
+        snap = {"columns": ["region", "gmv"], "rows": [["东区", 1.0]], "truncated": False, "sql": sql,
+                "source": MERGE_SOURCE, "sources": ["shop"]}
+        artifact = run.put(snap)
+        run.add("node.started", "join", {"node_type": "merge"})
+        run.add("merge.end", "join", {"sql": sql, "query_artifact": artifact, "rows": 1})
+        run.add("node.finished", "join", {"duration_ms": 1, "attempt": 1, "evidence": [
+            {"kind": "query", "node_id": "join", "exec": 1, "artifact": artifact, "source": MERGE_SOURCE,
+             "columns": ["region", "gmv"], "rows": 1, "truncated": False}]})
+        if drop:
+            del run.store[artifact]
+        return run
+
+    result = run_compare(make("r1", "SELECT region, gmv FROM a WHERE gmv > 10"),
+                         make("r2", "SELECT region, gmv FROM a WHERE gmv > 20"))
+    join = result_queries(result, "join")
+    assert (join["ordinal"], join["structure"], join["literals"]) == (1, "params_only", [{"base": "10", "target": "20"}])
+    result = run_compare(make("r1", "SELECT region, gmv FROM a WHERE gmv > 10", drop=True),
+                         make("r2", "SELECT region, gmv FROM a WHERE gmv > 10 AND region <> '西区'"))
+    join = result_queries(result, "join")
+    assert join["structure"] == "changed" and join["base_sql"] == "SELECT region, gmv FROM a WHERE gmv > 10"
+    assert "无法读取" in join["problem"]
+
+
+def test_a_node_run_in_a_loop_is_paired_execution_by_execution():
+    def make(run_id, regions):
+        run = Fake(run_id)
+        for region in regions:
+            run.tool("fetch", f"SELECT SUM(amount) AS gmv FROM orders WHERE region = '{region}'", ["gmv"], [[1.0]],
+                     types={"gmv": "number"})
+        return run
+
+    result = run_compare(make("r1", ["东区", "南区", "西区"]), make("r2", ["东区", "北区"]))
+    assert [(q["ordinal"], q["structure"]) for q in result["queries"]] == [(1, "same"), (2, "params_only"), (3, "removed")]
+    assert result["queries"][1]["literals"] == [{"base": "'南区'", "target": "'北区'"}]
 
 
 def test_unpaired_queries_are_added_or_removed():

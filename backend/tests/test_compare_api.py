@@ -28,7 +28,6 @@ from app.db.models import Artifact, DataSource, Run, RunEvent, Workflow
 from app.engine.runner import run_manager, verify_manifest
 from app.main import app
 from tests.fixtures.compare_runs import (
-    BASE_ROWS,
     EAST,
     NEXT_ROWS,
     Fake,

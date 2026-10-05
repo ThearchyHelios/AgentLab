@@ -317,11 +317,12 @@ def _cards(side: Side) -> dict[str, _Card]:
 
 
 def _card_problem(load: Callable[[str], Any], artifact: str) -> str:
+    """指标集为什么用不了，接在「口径卡「X」」后面。"""
     try:
         content = load(artifact)
     except ValueError:
-        return "指标集与哈希不一致，疑似被修改"
-    return "无法读取指标集" if content is None else "指标集的内容不完整"
+        return "的指标集与哈希不一致，疑似被修改"
+    return "的指标集无法读取" if content is None else "的指标集内容不完整"
 
 
 def _plan_card(side: Side, card: _Card, queries: list[_Query]) -> None:
