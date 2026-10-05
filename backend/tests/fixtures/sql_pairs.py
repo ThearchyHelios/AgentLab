@@ -739,18 +739,12 @@ DIALECT_SAME: list[tuple[str, str, str, str]] = [
     ("names_given_to_derived_tables_are_no_difference", "mysql",
      "SELECT SUM(o.amount) FROM orders o JOIN (SELECT order_id, COUNT(*) AS n FROM refunds GROUP BY order_id) r ON r.order_id = o.id WHERE r.n > 1",
      "SELECT SUM(o.amount) FROM orders o JOIN (SELECT order_id, COUNT(*) AS n FROM refunds GROUP BY order_id) `退款` ON o.id = `退款`.order_id WHERE `退款`.n > 1"),
-    ("the_same_derived_column_written_differently_is_no_difference", "mysql",
-     "SELECT SUM(x.total) FROM (SELECT p.user_id, p.total FROM (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) p JOIN (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) r ON r.user_id = p.user_id) x",
-     "SELECT SUM(y.total) FROM (SELECT a.user_id, a.total FROM (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) b JOIN (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) a ON a.user_id = b.user_id) y"),
     ("derived_tables_reading_the_same_table_written_differently_ar", "mysql",
      "WITH paid AS (SELECT * FROM orders WHERE status = 'paid'), open AS (SELECT * FROM orders WHERE status = 'open') SELECT SUM(p.amount) FROM paid p JOIN open o ON o.user_id = p.user_id",
      "WITH settled AS (SELECT * FROM orders WHERE status = 'paid'), pending AS (SELECT * FROM orders WHERE status = 'open') SELECT SUM(s.amount) FROM settled s JOIN pending q ON q.user_id = s.user_id"),
     ("names_given_to_derived_tables_are_no_difference", "postgres",
      "SELECT SUM(amount) FROM orders WHERE user_id IN (WITH t AS (SELECT id FROM users WHERE grade >= 3) SELECT id FROM t)",
      "SELECT SUM(amount) FROM orders WHERE user_id IN (WITH g AS (SELECT id FROM users WHERE grade >= 3) SELECT g.id FROM g)"),
-    ("derived_tables_reading_the_same_table_written_differently_ar", "postgres",
-     "SELECT SUM(p.amount) FROM (SELECT * FROM orders WHERE status = 'paid') p JOIN (SELECT * FROM orders WHERE status = 'open') o ON o.user_id = p.user_id",
-     "SELECT SUM(x.amount) FROM (SELECT * FROM orders WHERE status = 'open') y JOIN (SELECT * FROM orders WHERE status = 'paid') x ON x.user_id = y.user_id"),
     ("the_same_output_computation_written_differently_is_no_differ", "postgres",
      "SELECT order_id, RANK() OVER (PARTITION BY user_id ORDER BY amount DESC) AS k FROM orders",
      "SELECT o.order_id, RANK() OVER (PARTITION BY o.user_id ORDER BY o.amount DESC) FROM orders o"),
@@ -2149,6 +2143,17 @@ REGRESSIONS_R2: list[tuple[str, str, str, str]] = [
     ("float_folding", "postgres",
      "SELECT COUNT(*) FROM orders WHERE amount = 0.1 + 0.2", "SELECT COUNT(*) FROM orders WHERE amount = 0.3"),
     ("double_negation", "mysql", "SELECT id, -(-name) FROM users", "SELECT id, name FROM users"),
+    # 本轮自己在私起的 PostgreSQL 18、MySQL 8.0 上跑出来的：调换 UNION ALL 各支，浮点数加的先后变了
+    # （1902.2 对 1902.2000000000003）；MySQL 把外层只涉及分组键的条件推进子查询的 WHERE，和 HAVING 结果不同
+    ("float_sum_union_branch_order", "postgres",
+     "SELECT SUM(x) FROM (SELECT amount AS x FROM orders UNION ALL SELECT amount AS x FROM refunds) t",
+     "SELECT SUM(x) FROM (SELECT amount AS x FROM refunds UNION ALL SELECT amount AS x FROM orders) t"),
+    ("float_sum_union_branch_order", "mysql",
+     "SELECT SUM(x) FROM (SELECT amount AS x FROM orders UNION ALL SELECT amount AS x FROM refunds) t",
+     "SELECT SUM(x) FROM (SELECT amount AS x FROM refunds UNION ALL SELECT amount AS x FROM orders) t"),
+    ("outer_where_on_group_key_vs_having", "mysql",
+     "SELECT COUNT(*) FROM (SELECT city, COUNT(*) AS n FROM users GROUP BY city) t WHERE BINARY t.city = 'SH'",
+     "SELECT COUNT(*) FROM (SELECT city, COUNT(*) AS n FROM users GROUP BY city HAVING BINARY city = 'SH') t"),
 ]
 
 #: 意思一样、规范化认得出的（PostgreSQL / MySQL 的写法）
@@ -2167,8 +2172,16 @@ DIALECT_SAME_R2: list[tuple[str, str, str, str]] = [
      "SELECT SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) FROM orders"),
 ]
 
-#: 意思一样、规范化故意不认的（认了就要假设「相等就是一样」，见模块说明）：只给兜底说明，不给具体说法
+#: 意思一样、规范化故意不认的（认了就要假设「相等就是一样」、或者 PostgreSQL / MySQL 里浮点数求和的先后不变，见模块
+#: 说明）：只给兜底说明，不给具体说法
 KNOWN_UNRECOGNIZED: list[tuple[str, str, str, str]] = [
+    # PostgreSQL / MySQL 里对浮点数求和的一段调换关联先后：加的先后变了，结果的最后几位可能不同
+    ("the_same_derived_column_written_differently_is_no_difference", "mysql",
+     "SELECT SUM(x.total) FROM (SELECT p.user_id, p.total FROM (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) p JOIN (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) r ON r.user_id = p.user_id) x",
+     "SELECT SUM(y.total) FROM (SELECT a.user_id, a.total FROM (SELECT user_id, SUM(amount) AS total FROM refunds GROUP BY user_id) b JOIN (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) a ON a.user_id = b.user_id) y"),
+    ("derived_tables_reading_the_same_table_written_differently_ar", "postgres",
+     "SELECT SUM(p.amount) FROM (SELECT * FROM orders WHERE status = 'paid') p JOIN (SELECT * FROM orders WHERE status = 'open') o ON o.user_id = p.user_id",
+     "SELECT SUM(x.amount) FROM (SELECT * FROM orders WHERE status = 'open') y JOIN (SELECT * FROM orders WHERE status = 'paid') x ON x.user_id = y.user_id"),
     ("having_on_group_key_vs_where", "sqlite",
      "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders WHERE user_id > 100 GROUP BY user_id) SELECT SUM(total) FROM t",
      "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) SELECT SUM(total) FROM t WHERE user_id > 100"),

@@ -47,18 +47,22 @@ canonicalize（给日期比较加 CAST）、pushdown_projections；HAVING 里的
 'SH'、'sh' 在同一组，HAVING BINARY city = 'SH' 看的是这一组留下的那个值）；只有一项、又不是常量的 IN 列表写成 =
 （SQLite 里 a IN (b) 是 a = +b）。
 
-**结果看行出来的先后的一段（见 _Sensitivity）不调换来源的先后、不把 CROSS JOIN 写成逗号连接、不排 GROUP BY 的键、
-不改 DISTINCT、不往里并子查询**：取行（LIMIT / OFFSET / FETCH，ORDER BY 有并列时取哪几行也看先后）、DISTINCT ON、
-窗口函数、拼串拼数组的聚合（GROUP_CONCAT）、聚合里既不分组也不聚合的列、当成标量用的子查询（SQLite 取第一行），以及
-去重、分组、MIN / MAX、去重的 UNION 留下的值「相等却不一样」的时候（MySQL 默认不分大小写的字符串、PostgreSQL numeric
-的 2.0 和 2.00、SQLite 没有类型亲和的列、算出来的表达式：留下的是先扫到的那个）；给这样一段供行的子查询、CTE 也算。
-SQLite 里逗号连接和 CROSS JOIN 解析成同一个节点，按原文分开（_mark_comma_joins：SQLite 不调换 CROSS JOIN 两边）。
+**结果看行出来的先后的一段（见 _Sensitivity）不调换来源的先后、不排 GROUP BY 的键、不改 DISTINCT、不并子查询、不把
+引用了好几次的 CTE 拆开**：取行（LIMIT / OFFSET / FETCH，ORDER BY 有并列时取哪几行也看先后）、DISTINCT ON、窗口函数、
+拼串拼数组的聚合（GROUP_CONCAT）、聚合里既不分组也不聚合的列、当成标量用的子查询（SQLite 取第一行），去重、分组、
+MIN / MAX、去重的 UNION 留下的值「相等却不一样」的时候（MySQL 默认不分大小写的字符串、PostgreSQL numeric 的 2.0 和
+2.00、SQLite 没有类型亲和的列、算出来的表达式：留下的是先扫到的那个），以及 PostgreSQL、MySQL 里对不知道是不是精确数
+的值求和、求平均（浮点数加的先后不同，结果的最后几位就不同：1902.2 和 1902.2000000000003，在真实的库上跑出来过）；
+给这样一段供行的子查询、CTE 也算。外连接按 WHERE 变成内连接、内连接的条件挪进 WHERE 这两步三种库的优化器自己也做，
+执行起来先后不变，这样的一段也照做——只有 SQLite 里写了 CROSS JOIN 的不挪（SQLite 不调换 CROSS JOIN 两边、会调换逗号
+连接；两种写法解析成同一个节点，按原文分开，见 _mark_comma_joins）。
 
 **假设（做不到的）**：SQLite 没给表结构时按列有声明的类型、默认的 BINARY 排序规则算——声明了 COLLATE NOCASE 的列、
 没有类型亲和的列（能同时存 1 和 1.0）表结构里看不出来，这样的列上去重、分组再调换关联先后可能留下不同的代表值；
-比较两边都是列时对调两边（SQLite 比较两列用左边那列声明的排序规则，两边都写了 COLLATE 的不对调）。PostgreSQL、
-MySQL 没给表结构时一律不当成「相等就是一样」，去重、分组、MIN / MAX 的一段不调换来源。MySQL 的表名按 Linux 上分
-大小写算（BILLS 和 bills 不判等价）。
+比较两边都是列时对调两边（SQLite 比较两列用左边那列声明的排序规则，两边都写了 COLLATE 的不对调）。SQLite 的求和
+当成和先后无关（它用 Kahan-Babuska-Neumaier 求和，关联先后也不跟着 FROM 的先后变；语料在 7 组数据上按精确值比也没有
+差别）。PostgreSQL、MySQL 没给表结构时一律不当成「相等就是一样」、也不当成精确数，去重、分组、MIN / MAX、求和的一段
+不调换来源。MySQL 的表名按 Linux 上分大小写算（BILLS 和 bills 不判等价）。
 
 等价的结论另有执行比对守门（tests/test_sql_equivalence.py）：虚构库上五组随机数据、一组极端数据、一组专挑写法差异的
 数据，判等价的两条每组结果都得一样，结果不一样的绝不能判等价。原文里有 sqlglot 解析时会丢掉、语义却不同的写法
@@ -97,7 +101,7 @@ MySQL 没给表结构时一律不当成「相等就是一样」，去重、分�
   SQLite 里套在子查询里的 UNION、三项以上的加乘换结合、和方言有关的同义写法（DATE(x) 和 CAST(x AS DATE)）、LATERAL、
   递归 CTE、实表别名带列名、USING 用在第一个连接以外的地方；没给表结构时 WHERE、GROUP BY、HAVING 里用列别名的、
   SELECT 列表里和前面的列别名同名的；结果看行出来的先后的一段调换关联先后、DISTINCT 改 GROUP BY；PostgreSQL、MySQL
-  没给表结构时去重、分组的一段调换关联先后。
+  没给表结构时去重、分组、求和的一段调换关联先后、并子查询。
 - 说不出具体差异、只给兜底的：自己关联自己的方向或角色不同、几个派生来源互相交错、相关子查询内外层的条件、
   另一边别处（别的子查询、CTE）也用到同一列筛选的、读的来源对不上、CTE 和子查询里选出来的列不同、条件或算法写法
   不同又判断不了是不是真不一样的、EXCEPT 两边对调、几处不同交错在一起的。
@@ -2287,6 +2291,9 @@ _ORDERED_AGGS = frozenset({"groupconcat", "stringagg", "arrayagg", "arrayconcata
                            "jsonobjectagg", "jsonagg", "jsonbagg", "jsongrouparray", "jsongroupobject", "listagg",
                            "xmlagg", "anyvalue", "first", "last", "firstvalue", "lastvalue", "nthvalue",
                            "jsonbobjectagg", "jsonobjectaggstrict", "arrayaggdistinct", "bitstringagg"})
+#: 浮点数求和类的聚合：浮点数加法不满足结合律，加的先后不同结果的最后几位就不同（1902.2 和 1902.2000000000003）
+_FLOAT_AGGS = frozenset({"sum", "avg", "stddev", "stddevpop", "stddevsamp", "variance", "variancepop", "varpop",
+                         "varsamp", "covarpop", "covarsamp", "corr", "total"})
 #: 拿空值做比较、算术都得空值（外连接没关联上的那一侧整行是空值）
 _STRICT_UNARY = ("Neg", "Cast", "Lower", "Upper", "Length", "Abs")
 _STRICT_BINARY = ("Add", "Sub", "Mul", "Div", "Mod")
@@ -2541,13 +2548,13 @@ def _optimized(root: Any, read: str | None, info: _Schema) -> _Form:
     if qualified is None:
         raise _Unsupported("认不全列")
     tree = qualified
-    _split_simple_ctes(tree)
+    _split_simple_ctes(tree, read, info)
     _inline_ctes(tree)
     # 写回的 CTE 定义各是一份副本，里面的别名一样：同一个 CTE 写回外层和相关子查询两处，并进去之后子查询里本来指外层
     # 的列就被里层同名的别名遮住了。写回之后再把整条语句的别名改成互不相同的
     _unique_aliases(tree)
     _merge_derived(tree, read, info)
-    _push_into_groups(tree)
+    _push_into_groups(tree, read, info)
     _drop_unused_ctes(tree)
     return _finish(tree, read, info, level=_OPTIMIZER, qualified=True)
 
@@ -2589,8 +2596,8 @@ def _finish(tree: Any, read: str | None, info: _Schema, *, level: str, qualified
     sens = _Sensitivity(tree, read, info)
     _right_to_left(tree, sens)
     sens = _Sensitivity(tree, read, info)
-    _reject_nulls(tree, sens, read)
-    _flatten_prefix(tree, sens)
+    _reject_nulls(tree, read)
+    _flatten_prefix(tree, sens, read)
     _in_subquery_distinct(tree, sens)
     _distinct_to_group(tree, sens)
     _count_star(tree)
@@ -3033,7 +3040,9 @@ def _merge_derived(tree: Any, read: str | None, info: _Schema) -> None:
 
     for _ in range(64):
         resolver = _Resolver(tree)
-        sens = _Sensitivity(tree, read, info, resolver)
+        # 浮点数求和这一条不挡并子查询：只筛行选列的子查询三种库自己也会并进外层（PostgreSQL 的 subquery pull-up、
+        # MySQL 的 derived_merge、SQLite 的 flattening），并不并执行起来先后一样
+        sens = _Sensitivity(tree, read, info, resolver, floats=False)
         done = False
         for select in reversed(list(tree.find_all(exp.Select))):
             if sens.of(select):
@@ -3107,21 +3116,24 @@ def _merge_derived(tree: Any, read: str | None, info: _Schema) -> None:
             return
 
 
-def _split_simple_ctes(tree: Any) -> None:
+def _split_simple_ctes(tree: Any, read: str | None, info: "_Schema") -> None:
     """引用了好几次、只从几张表里筛行选列的 CTE（见 _mergeable），每处引用各写回一份 FROM 里的子查询（别名照旧）：
     这样的 CTE 是确定的（有不确定函数的语句不走这一级），算几遍结果一样，写回之后每处都能并进外层。语句里还有别的
-    WITH 的不动（名字可能被里层的 CTE 遮住）。"""
+    WITH 的不动（名字可能被里层的 CTE 遮住）；有一处引用在结果看行出来先后的一段里的不动（PostgreSQL 把引用了好几次
+    的 CTE 先算出来存着，写回之后扫描的先后可能就变了）。"""
     from sqlglot import exp
 
     with_ = tree.args.get("with_")
     if with_ is None or with_.args.get("recursive") or _nested_with(tree):
         return
     resolver = _Resolver(tree)
+    sens = _Sensitivity(tree, read, info, resolver)
     for cte in list(with_.expressions):
         if not _mergeable(cte.this):
             continue
         refs = [t for t in tree.find_all(exp.Table) if resolver.cte_of.get(id(t)) is cte]
-        if len(refs) < 2 or any(r.find_ancestor(exp.CTE) is not None for r in refs):
+        if len(refs) < 2 or any(r.find_ancestor(exp.CTE) is not None for r in refs) or \
+                any(sens.of(resolver.owner[id(r)]) for r in refs):
             continue
         for ref in refs:
             ref.replace(exp.Subquery(this=cte.this.copy(), alias=exp.TableAlias(this=exp.to_identifier(ref.alias_or_name))))
@@ -3144,13 +3156,16 @@ def _grouped(expression: Any, keys: set[str]) -> bool:
     return True
 
 
-def _push_into_groups(tree: Any) -> None:
+def _push_into_groups(tree: Any, read: str | None, info: "_Schema") -> None:
     """（认列之后）外层 WHERE 里只涉及一个分组子查询（FROM 或内连接进来的）选出来的列的条件，换成子查询里对应的表达式、
     挪进它的 HAVING：子查询的每一行就是一组，外层按这一行的值筛和 HAVING 按这一组的值筛，用的是同一个值（分组键取的
-    是同一个代表值，聚合是同一个结果）。子查询有窗口函数、取行、去重、ROLLUP 这些的不挪；HAVING 里的条件不往 WHERE
-    挪（相等不等于一样时，组里的行各是各的值）。"""
+    是同一个代表值，聚合是同一个结果）。条件涉及分组键时，分组键得是「相等就是一样」的（见 _Sensitivity._identity_safe）：
+    MySQL 会把外层只涉及分组键的条件推进子查询的 WHERE 里先筛行，不分大小写时 BINARY city = 'SH' 推进去和放在 HAVING
+    里结果不同（在真实的 MySQL 8.0 上跑出来过）。子查询有窗口函数、取行、去重、ROLLUP 这些的不挪；HAVING 里的条件
+    不往 WHERE 挪（相等不等于一样时，组里的行各是各的值）。"""
     from sqlglot import exp
 
+    sens = _Sensitivity(tree, read, info)
     for select in list(tree.find_all(exp.Select)):
         where = select.args.get("where")
         joins = select.args.get("joins") or []
@@ -3172,7 +3187,9 @@ def _push_into_groups(tree: Any) -> None:
                 cols = list(cond.find_all(exp.Column))
                 if not cols or cond.find(exp.Query, exp.Subquery) is not None or \
                         any(c.table != alias or c.name not in outputs or not _grouped(outputs[c.name], keys)
-                            for c in cols):
+                            for c in cols) or \
+                        any(k is not None and not sens._identity_safe(k, body)
+                            for c in cols for k in [outputs[c.name] if _fingerprint(outputs[c.name]) in keys else None]):
                     kept.append(cond)
                     continue
                 new = cond.copy()
@@ -3260,14 +3277,17 @@ class _Sensitivity:
     取任意一个这类聚合（GROUP_CONCAT）；聚合里既不分组也不聚合的列（SQLite、MySQL 取组里任意一行的值）；当成标量
     用的子查询（SQLite 取第一行），除非是不分组的聚合（只出一行）；去重、分组、MIN / MAX、去重的 UNION 留下的是先
     出现的那个值，而「相等」不等于「写法一样」的时候（MySQL 默认不分大小写的排序规则下的 'SH' 和 'sh'、PostgreSQL
-    numeric 的 2.0 和 2.00、SQLite 没有类型亲和的列里的 1 和 1.0、算出来的表达式）看先后，见 _identity_safe。
+    numeric 的 2.0 和 2.00、SQLite 没有类型亲和的列里的 1 和 1.0、算出来的表达式）看先后，见 _identity_safe；
+    PostgreSQL、MySQL 里对不知道是不是精确数的值求和、求平均（浮点数加的先后不同，结果的最后几位就不同，见 _exact）。
     给看先后的一段供行的（它 FROM 里的子查询、引用的 CTE，层层往里）也看先后。"""
 
-    def __init__(self, tree: Any, read: str | None, info: _Schema, resolver: _Resolver | None = None) -> None:
+    def __init__(self, tree: Any, read: str | None, info: _Schema, resolver: _Resolver | None = None,
+                 floats: bool = True) -> None:
         from sqlglot import exp
 
         self.read = read
         self.info = info
+        self.floats = floats
         try:
             self.resolver = resolver or _Resolver(tree)
         except _Unsupported:
@@ -3321,6 +3341,40 @@ class _Sensitivity:
                     not self._identity_safe(n.this.expressions[0] if isinstance(n.this, exp.Distinct) and
                                             n.this.expressions else n.this, select):
                 return True
+            if self.floats and self.read != "sqlite" and _float_aggregate(n) and not self._exact(n.this, select):
+                return True
+        return False
+
+    def _exact(self, node: Any, select: Any, depth: int = 0) -> bool:
+        """node 的取值是不是精确的数（整数、定点小数）：浮点数求和的先后不同结果就不同（PostgreSQL、MySQL 按扫到的先后
+        一个个加；SQLite 用 Kahan-Babuska-Neumaier 求和、关联先后也不跟着 FROM 的先后变，当成精确的）。不知道类型的不算。"""
+        from sqlglot import exp
+
+        node = _unparen(node)
+        if isinstance(node, exp.Distinct) and len(node.expressions) == 1:
+            node = node.expressions[0]
+        if isinstance(node, exp.Count) or (isinstance(node, exp.Literal) and node.is_int):
+            return True
+        if isinstance(node, (exp.Add, exp.Sub, exp.Mul)):
+            return self._exact(node.left, select, depth) and self._exact(node.right, select, depth)
+        if not isinstance(node, exp.Column) or node.is_star or depth > 16 or self.resolver is None:
+            return False
+        item = self.resolver.source_of.get(id(node))
+        if item is None:
+            items = _items_of(select)
+            item = items[0] if len(items) == 1 and not node.table else None
+        if item is None:
+            return False
+        body = self.resolver.body(item)
+        if body is None:
+            columns = self.info.types.get(item.name.translate(_ASCII_LOWER)) if isinstance(item, exp.Table) else None
+            declared = (columns or {}).get(node.name.translate(_ASCII_LOWER), "").lower()
+            return any(declared.startswith(w) for w in ("int", "integer", "bigint", "smallint", "tinyint", "mediumint",
+                                                        "serial", "bigserial", "decimal", "numeric", "dec"))
+        if isinstance(body, exp.Select):
+            for p in body.expressions:
+                if not _is_star(p) and p.alias_or_name == node.name:
+                    return self._exact(p.unalias(), body, depth + 1)
         return False
 
     def _identity_safe(self, node: Any, select: Any, depth: int = 0) -> bool:
@@ -3397,6 +3451,18 @@ class _Sensitivity:
         return any(lower.startswith(w) for w in ("int", "integer", "bigint", "smallint", "serial", "bigserial",
                                                  "text", "varchar", "character", "char", "bpchar", "date",
                                                  "timestamp", "time", "bool", "uuid"))
+
+
+def _float_aggregate(node: Any) -> bool:
+    """浮点数求和类的聚合（不在窗口函数里的）。"""
+    from sqlglot import exp
+
+    if isinstance(node.parent, exp.Window):
+        return False
+    name = type(node).__name__.lower()
+    if isinstance(node, exp.Anonymous):
+        name = str(node.name).lower().replace("_", "")
+    return name in _FLOAT_AGGS
 
 
 def _order_dependent(node: Any) -> bool:
@@ -3598,15 +3664,16 @@ def _rejects(cond: Any, alias: str, read: str | None) -> bool:
     return False
 
 
-def _reject_nulls(tree: Any, sens: _Sensitivity, read: str | None) -> None:
+def _reject_nulls(tree: Any, read: str | None) -> None:
     """LEFT JOIN 关联进来的那一侧，同一段 WHERE 里有把它整行为空的行筛掉的条件（见 _rejects）：没关联上的行反正留
-    不下来，这次外连接就是内连接。有 RIGHT / FULL JOIN 的段、结果看行出来的先后的段不动。"""
+    不下来，这次外连接就是内连接。三种库的优化器自己也做这一步（outer join reduction），执行起来扫描的先后一样，结果
+    看行出来先后的一段也照做。有 RIGHT / FULL JOIN 的段不动。"""
     from sqlglot import exp
 
     for select in list(tree.find_all(exp.Select)):
         joins = select.args.get("joins") or []
         where = select.args.get("where")
-        if where is None or sens.of(select) or any(str(j.side or "").upper() in ("RIGHT", "FULL") for j in joins):
+        if where is None or any(str(j.side or "").upper() in ("RIGHT", "FULL") for j in joins):
             continue
         conds = _conjuncts(where.this)
         for join in joins:
@@ -3619,18 +3686,22 @@ def _reject_nulls(tree: Any, sens: _Sensitivity, read: str | None) -> None:
                 join.this.meta[_REJECTED] = "RIGHT JOIN" if join.meta.get(_FLIPPED) else "LEFT JOIN"
 
 
-def _flatten_prefix(tree: Any, sens: _Sensitivity) -> None:
+def _flatten_prefix(tree: Any, sens: _Sensitivity, read: str | None) -> None:
     """开头那组内连接（FROM 和紧跟着的内连接、CROSS JOIN、逗号连接，到第一个外连接为止）的 ON 条件挪进 WHERE、写成
     逗号连接：内连接的条件写在 ON 还是 WHERE 一样；后面的 LEFT JOIN 对左边每一行各自关联，左边先筛后筛一样。后面有
     RIGHT / FULL JOIN 的不动：没关联上的那一侧整行空值，挪到 WHERE 的条件会把它们筛掉（PostgreSQL、MySQL 里逗号还比
-    JOIN 结合得松，a, b RIGHT JOIN c 是 a 乘上 b RIGHT JOIN c）。结果看行出来的先后的一段也不动（SQLite 不调换 CROSS
-    JOIN 两边、会调换逗号连接）。"""
+    JOIN 结合得松，a, b RIGHT JOIN c 是 a 乘上 b RIGHT JOIN c）。内连接的条件写在 ON 还是 WHERE，优化器一视同仁，结果
+    看行出来先后的一段也照做；只有 SQLite 里结果看先后、又写了 CROSS JOIN 的一段不动（SQLite 不调换 CROSS JOIN 两边、
+    会调换逗号连接）。"""
     from sqlglot import exp
 
     for select in list(tree.find_all(exp.Select)):
         joins = select.args.get("joins") or []
-        if not joins or select.args.get("from_") is None or sens.of(select) or \
+        if not joins or select.args.get("from_") is None or \
                 any(str(j.side or "").upper() in ("RIGHT", "FULL") for j in joins):
+            continue
+        if read in (None, "sqlite") and sens.of(select) and \
+                any(str(j.kind or "").upper() == "CROSS" or j.meta.get("sql_semantics_join") for j in joins):
             continue
         moved: list[Any] = []
         for join in joins:
@@ -3641,7 +3712,8 @@ def _flatten_prefix(tree: Any, sens: _Sensitivity) -> None:
                 moved += _conjuncts(on)
                 join.set("on", None)
             join.set("kind", None)
-            join.meta.pop("sql_semantics_join", None)
+            if not sens.of(select):
+                join.meta.pop("sql_semantics_join", None)
         if moved:
             where = select.args.get("where")
             select.set("where", exp.Where(this=_and_all((_conjuncts(where.this) if where else []) + moved)))
