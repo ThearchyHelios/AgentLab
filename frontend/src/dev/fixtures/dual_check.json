@@ -1,0 +1,154 @@
+{
+  "_note": "双盲复算的预览用例和 scripts/check-verify.mjs 共用的夹具。表名、数字都是虚构的通用示例，不来自任何真实数据。",
+  "approval": {
+    "id": "ap-dc-0001",
+    "run_id": "run-dc-0001",
+    "node_id": "dc",
+    "mode": "input",
+    "title": "双盲复算：2 个指标不一致",
+    "status": "pending",
+    "response": {},
+    "workflow_name": "门店周报",
+    "node_label": "复核周报口径",
+    "run_class": "formal",
+    "payload": {
+      "kind": "dual_check",
+      "node_id": "dc",
+      "title": "双盲复算：2 个指标不一致",
+      "card_artifact": "d0ab1e5c0ffee000d0ab1e5c0ffee000d0ab1e5c0ffee000d0ab1e5c0ffee000",
+      "summary": [
+        {
+          "metric_id": "gmv",
+          "name": "销售额",
+          "unit": "元",
+          "original_rendered": "45,678.5元",
+          "blind_rendered": "51,388.3元",
+          "delta_pct": 12.5,
+          "diff": ["原流程按支付时间 paid_at 筛选时间范围，盲算按下单时间 created_at 筛选"],
+          "fallback": false
+        },
+        {
+          "metric_id": "refund_rate",
+          "name": "退款率",
+          "unit": "",
+          "original_rendered": "2.35%",
+          "blind_rendered": "3.10%",
+          "delta_pct": 31.91,
+          "diff": [],
+          "fallback": true
+        }
+      ]
+    }
+  },
+  "card": {
+    "model": "blind-model-x",
+    "same_model": false,
+    "metrics": [
+      {
+        "metric_id": "gmv",
+        "name": "销售额",
+        "unit": "元",
+        "decimals": 1,
+        "original": {
+          "value": 45678.5,
+          "rendered": "45,678.5元",
+          "inputs": [
+            {
+              "path": "vars.kpi.gmv",
+              "value": 45678.5,
+              "sql": "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'",
+              "source": "shop",
+              "alias": "Q1"
+            }
+          ]
+        },
+        "blind": {
+          "value": 51388.3,
+          "rendered": "51,388.3元",
+          "inputs": [
+            {
+              "path": "vars.kpi.gmv",
+              "value": 51388.3,
+              "sql": "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE created_at >= '2026-09-01'\n  AND created_at < '2026-09-08'",
+              "source": "shop",
+              "alias": "B1",
+              "rationale": "销售额按下单时间统计本周全部订单金额之和"
+            }
+          ]
+        },
+        "diff": {
+          "equivalent": false,
+          "items": [
+            { "aspect": "time", "text": "原流程按支付时间 paid_at 筛选时间范围，盲算按下单时间 created_at 筛选" }
+          ],
+          "fallback": false,
+          "text_diff": [
+            "- WHERE paid_at >= '2026-09-01'",
+            "-   AND paid_at < '2026-09-08'",
+            "+ WHERE created_at >= '2026-09-01'",
+            "+   AND created_at < '2026-09-08'"
+          ]
+        }
+      },
+      {
+        "metric_id": "refund_rate",
+        "name": "退款率",
+        "unit": "",
+        "decimals": 4,
+        "original": {
+          "value": 0.0235,
+          "rendered": "2.35%",
+          "inputs": [
+            {
+              "path": "vars.kpi.refunds",
+              "value": 47,
+              "sql": "SELECT COUNT(*) AS refunds FROM refunds r JOIN orders o ON o.id = r.order_id WHERE o.status <> 'test'",
+              "source": "shop",
+              "alias": "Q2"
+            },
+            {
+              "path": "vars.kpi.orders",
+              "value": 2000,
+              "sql": "SELECT COUNT(*) AS orders FROM orders WHERE status <> 'test'",
+              "source": "shop",
+              "alias": "Q3"
+            }
+          ]
+        },
+        "blind": {
+          "value": 0.031,
+          "rendered": "3.10%",
+          "inputs": [
+            {
+              "path": "vars.kpi.refunds",
+              "value": 62,
+              "sql": "SELECT COUNT(DISTINCT order_id) AS refunds FROM refunds WHERE order_id IN (SELECT id FROM orders)",
+              "source": "shop",
+              "alias": "B2",
+              "rationale": "退款笔数按有退款记录的订单去重计数"
+            },
+            {
+              "path": "vars.kpi.orders",
+              "value": 2000,
+              "sql": "SELECT COUNT(*) AS orders FROM orders WHERE status <> 'test'",
+              "source": "shop",
+              "alias": "B3",
+              "rationale": "订单总数，不含测试订单"
+            }
+          ]
+        },
+        "diff": {
+          "equivalent": false,
+          "items": [
+            { "aspect": "other", "text": "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文" }
+          ],
+          "fallback": true,
+          "text_diff": [
+            "- SELECT COUNT(*) AS refunds FROM refunds AS r JOIN orders AS o ON o.id = r.order_id WHERE o.status <> 'test'",
+            "+ SELECT COUNT(DISTINCT order_id) AS refunds FROM refunds WHERE order_id IN (SELECT id FROM orders)"
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -104,6 +104,9 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
   const where = approval.node_label || approval.node_id
   // 人工审批节点挂起的审批（工具、代码的审批另有 kind）：卡上标明运行类别、批了会怎样，审的是报告时附上核对概况
   const humanNode = payload.kind === 'human_node'
+  // 双盲复算两路对不上的审批：mode 是 input，但三选一和提交由 DualCheckApproval 自己画——通用的输入框、备注和
+  // 「提交 / 驳回并终止」会和它重复，通用的提交还会把一个字符串当 value 发出去
+  const dualCheck = payload.kind === 'dual_check'
   const reports: ApprovalReport[] = Array.isArray(payload.reports)
     ? payload.reports.filter((r: unknown): r is ApprovalReport =>
       !!r && typeof r === 'object' && typeof (r as ApprovalReport).node_id === 'string')
@@ -147,7 +150,7 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
       )}
 
       {/* 双盲复算对不上、交给人裁决的审批，卡上画两路结果的对照 */}
-      {payload.kind === 'dual_check' && <DualCheckApproval approval={approval} />}
+      {dualCheck && <DualCheckApproval approval={approval} onResolved={onResolved} />}
 
       <ApprovalReports reports={reports} runId={approval.run_id} runClass={approval.run_class} />
       <ChallengeSummary reports={reports} runId={approval.run_id} />
@@ -169,7 +172,7 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
         </pre>
       )}
 
-      {!approveMode && (
+      {!approveMode && !dualCheck && (
         <textarea
           className="field mb-2"
           rows={4}
@@ -180,40 +183,42 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
         />
       )}
 
-      <input
-        className="field mb-2"
-        aria-label="备注"
-        placeholder="备注（将传递给后续节点）"
-        value={note}
-        onChange={(e) => setNote(e.target.value)}
-      />
+      {!dualCheck && (<>
+        <input
+          className="field mb-2"
+          aria-label="备注"
+          placeholder="备注（将传递给后续节点）"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+        />
 
-      <div className="flex gap-2">
-        <button className="btn btn-primary flex-1 justify-center" disabled={busy} onClick={() => decide(true)}>
-          <Check size={12} aria-hidden /> {approveMode ? '批准' : '提交'}
-        </button>
-        {trustKey && (
-          <button className="btn flex-1 justify-center" disabled={busy} data-approval-always
-                  title={TOOL_TRUST_TEXT.alwaysHint(trustKey)} aria-describedby={`approval-always-${approval.id}`}
-                  onClick={() => decide(true, true)}>
-            <CheckCheck size={12} aria-hidden /> {TOOL_TRUST_TEXT.alwaysButton}
+        <div className="flex gap-2">
+          <button className="btn btn-primary flex-1 justify-center" disabled={busy} onClick={() => decide(true)}>
+            <Check size={12} aria-hidden /> {approveMode ? '批准' : '提交'}
           </button>
-        )}
-        <button className="btn btn-danger flex-1 justify-center" disabled={busy} onClick={() => decide(false)}>
-          <Ban size={12} aria-hidden /> {approveMode ? '驳回' : '驳回并终止'}
-        </button>
-      </div>
-      {/* 批了会怎样，常显而不是藏在 hover 里：审批人得在按下去之前知道 */}
-      <div className="mt-1.5 text-2xs leading-relaxed text-dim">
-        {approveMode
-          ? '批准：继续运行；驳回：转入「驳回」分支'
-          : '提交：以你填写的内容继续运行；驳回：终止本次运行'}
-      </div>
-      {trustKey && (
-        <div id={`approval-always-${approval.id}`} className="mt-0.5 text-2xs leading-relaxed text-dim">
-          {TOOL_TRUST_TEXT.alwaysButton}：{TOOL_TRUST_TEXT.alwaysHint(trustKey)}
+          {trustKey && (
+            <button className="btn flex-1 justify-center" disabled={busy} data-approval-always
+                    title={TOOL_TRUST_TEXT.alwaysHint(trustKey)} aria-describedby={`approval-always-${approval.id}`}
+                    onClick={() => decide(true, true)}>
+              <CheckCheck size={12} aria-hidden /> {TOOL_TRUST_TEXT.alwaysButton}
+            </button>
+          )}
+          <button className="btn btn-danger flex-1 justify-center" disabled={busy} onClick={() => decide(false)}>
+            <Ban size={12} aria-hidden /> {approveMode ? '驳回' : '驳回并终止'}
+          </button>
         </div>
-      )}
+        {/* 批了会怎样，常显而不是藏在 hover 里：审批人得在按下去之前知道 */}
+        <div className="mt-1.5 text-2xs leading-relaxed text-dim">
+          {approveMode
+            ? '批准：继续运行；驳回：转入「驳回」分支'
+            : '提交：以你填写的内容继续运行；驳回：终止本次运行'}
+        </div>
+        {trustKey && (
+          <div id={`approval-always-${approval.id}`} className="mt-0.5 text-2xs leading-relaxed text-dim">
+            {TOOL_TRUST_TEXT.alwaysButton}：{TOOL_TRUST_TEXT.alwaysHint(trustKey)}
+          </div>
+        )}
+      </>)}
       <div className="mt-1 flex items-center gap-1 text-2xs leading-relaxed"
            style={actor ? { color: 'var(--text-dim)' } : { color: 'var(--st-waiting)' }}>
         <PenLine size={10} aria-hidden className="shrink-0" />
