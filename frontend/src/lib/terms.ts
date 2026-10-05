@@ -2732,12 +2732,305 @@ export const COPILOT_CONTEXT_TEXT = {
 /** 尚未完成的功能在界面上的统一说法 */
 const PENDING_TEXT = '功能开发中'
 
-/** 定时任务：导航、命令面板和定时任务页 */
+/**
+ * 定时任务：导航、命令面板、定时任务页（pages/schedules）和记录页里的「定时」标记。
+ *
+ * 触发、跳过、补发各有固定说法：「触发」是到点（或手动）的那一下，「发起」是由它开始一次运行；跳过分「上次未结束」
+ * 和「错过时间」两种，不笼统写「失败」。时间都按定时任务自己的时区写，悬停另给本机时间
+ */
 export const SCHEDULE_TEXT = {
   title: '定时任务',
   hint: '按设定的周期自动发起工作流运行',
   pending: PENDING_TEXT,
   pendingHint: '定时任务尚未开放，完成后可在此处管理',
+
+  // ---- 列表
+  create: '新建定时任务',
+  emptyTitle: '还没有定时任务',
+  emptyBody: '定时任务按设定的周期自动发起工作流运行，适合日报、周报这类定期产出的结果。选择工作流、设定频率和输入即可创建，每次触发都记入触发历史。',
+  unsupported: '服务端暂不支持定时任务',
+  unsupportedHint: '当前服务端没有定时任务接口，请升级服务端后再使用',
+  listLabel: '定时任务列表',
+  formalChip: '正式运行',
+  pausedChip: '已暂停',
+  nextRun: '下次运行',
+  lastFire: '上次触发',
+  neverFired: '尚未触发',
+  /** 暂停中的没有下一次 */
+  nextPaused: '暂停中，不会触发',
+  /** 启用着却算不出下一次（如 2 月 30 日） */
+  nextNone: '往后不会再触发',
+  /** 计划时间已过、还没有这一次的触发记录：调度可能没开，或者正在发起 */
+  nextOverdue: '已到触发时间',
+  /** 悬停提示：按哪个时区、本机是几点 */
+  zoneTitle: (when: string, tz: string) => `${when}（${tz}）`,
+  localTitle: (when: string) => `本机时间 ${when}`,
+  enable: '启用',
+  enableLabel: (name: string) => `启用定时任务「${name}」`,
+  enabledOk: (name: string) => `已启用「${name}」`,
+  pausedOk: (name: string) => `已暂停「${name}」，到点不再发起运行`,
+  runNow: '立即运行',
+  runNowLabel: (name: string) => `立即运行定时任务「${name}」`,
+  edit: '编辑',
+  editLabel: (name: string) => `编辑定时任务「${name}」`,
+  deleteLabel: (name: string) => `删除定时任务「${name}」`,
+  deleteTitle: (name: string) => `删除定时任务「${name}」？`,
+  deleteConsequences: ['不再按计划发起运行，删除后不可恢复', '已发起的运行及其记录不受影响'],
+  deleteConfirm: '删除定时任务',
+  deleted: (name: string) => `已删除定时任务「${name}」`,
+  /** 写操作遇到 409：服务端的原话后面接这句 */
+  conflictReloaded: '已重新载入最新设置，请确认后再操作',
+
+  // ---- 立即运行的结果
+  runStarted: '已发起运行',
+  runSkipped: '上一次运行尚未结束，本次已按重叠策略跳过',
+  runFailed: (reason: string | null) => (reason ? `未能发起运行：${reason}` : '未能发起运行'),
+  openRun: '查看运行',
+
+  // ---- 触发
+  fireKind: { scheduled: '定时', manual: '手动', misfire: '补发' } as Record<import('../types').ScheduleFireKind, string>,
+  fireKindHint: {
+    scheduled: '到点按计划触发',
+    manual: '手动「立即运行」',
+    misfire: '错过触发时间后，在补发宽限内恢复时补发的一次',
+  } as Record<import('../types').ScheduleFireKind, string>,
+  fireStatus: {
+    started: '已发起',
+    skipped_overlap: '上次未结束已跳过',
+    skipped_misfire: '错过已跳过',
+    failed_to_start: '发起失败',
+  } as Record<import('../types').ScheduleFireStatus, string>,
+  fireStatusHint: {
+    started: '已发起运行',
+    skipped_overlap: '上一次运行还没有结束，按重叠策略跳过了这一次',
+    skipped_misfire: '服务停机等原因错过了触发时间，且超出补发宽限，这一次没有发起',
+    failed_to_start: '到点发起时被拒绝，原因见本条记录',
+  } as Record<import('../types').ScheduleFireStatus, string>,
+  event: { finished: '运行结束', failed: '运行失败', awaiting_approval: '等待审批' } as Record<import('../types').ScheduleEvent, string>,
+  noticeStatus: { ok: '已发送', failed: '发送失败' } as Record<'ok' | 'failed', string>,
+
+  // ---- 详情
+  tabs: { settings: '设置', history: '触发历史' } as Record<'settings' | 'history', string>,
+  back: '返回列表',
+  notFound: '定时任务不存在或已被删除',
+  notFoundHint: '请返回列表查看现有的定时任务',
+
+  // ---- 表单：基本
+  newTitle: '新建定时任务',
+  name: '名称',
+  namePlaceholder: '例如：门店周报',
+  workflow: '工作流',
+  workflowPlaceholder: '搜索并选择工作流',
+  workflowNone: '没有匹配的工作流',
+  workflowEmpty: '还没有工作流，请先在编排页创建并保存。',
+  toStudio: '去编排',
+  /** 定时任务指向的工作流已经不在列表里 */
+  workflowGone: (name: string) => `工作流「${name}」已不存在，请重新选择`,
+  workflowDraft: '草稿',
+  workflowVersion: (status: string, v: number) => `${status} v${v}`,
+
+  // ---- 表单：频率
+  freq: '频率',
+  preset: { daily: '每天', weekly: '每周', monthly: '每月', hourly: '每隔几小时', custom: '自定义 cron' } as Record<
+    'daily' | 'weekly' | 'monthly' | 'hourly' | 'custom', string>,
+  time: '时间',
+  weekdays: '星期',
+  weekdayShort: ['周日', '周一', '周二', '周三', '周四', '周五', '周六'] as readonly string[],
+  monthday: '日期',
+  monthdayOption: (d: number) => `${d} 日`,
+  monthdayHint: '没有这一天的月份不触发',
+  everyHours: '间隔',
+  everyHoursOption: (n: number) => `每 ${n} 小时`,
+  minute: '第几分',
+  hourlyHint: (n: number, m: number) => `从 0 点起每 ${n} 小时一次，每次在第 ${m} 分`,
+  cron: 'cron 表达式',
+  cronHint: '五段，依次为分、时、日、月、星期，例如 0 9 * * 1-5 表示工作日 09:00',
+  timezone: '时区',
+  timezoneHint: '触发时间按这个时区计算',
+  timezoneLocal: '本机',
+  timezoneLabel: {
+    'Asia/Shanghai': '北京', 'Asia/Hong_Kong': '香港', 'Asia/Taipei': '台北', 'Asia/Singapore': '新加坡',
+    'Asia/Tokyo': '东京', 'Asia/Seoul': '首尔', 'Asia/Kolkata': '印度', 'Asia/Dubai': '迪拜', 'Europe/London': '伦敦',
+    'Europe/Paris': '巴黎', 'Europe/Berlin': '柏林', 'America/New_York': '纽约', 'America/Chicago': '芝加哥',
+    'America/Los_Angeles': '洛杉矶', UTC: '协调世界时',
+  } as Record<string, string>,
+
+  // ---- 表单：预览
+  preview: '接下来 5 次触发',
+  previewLoading: '正在计算…',
+  previewIdle: '填好频率后在此预览触发时间',
+  previewNone: '按这个频率往后不会触发',
+  previewFailed: '无法预览触发时间',
+  previewZone: (tz: string) => `按 ${tz} 计算`,
+
+  // ---- 表单：运行类别
+  runClass: '运行类别',
+  formal: '正式运行',
+  formalHint: '从已发布版本发起，结果出具、可审计。工作流须已发布',
+  formalVersion: (v: number) => `每次按当时的发布版本发起，当前为 v${v}`,
+  exploratory: '探索运行',
+  exploratoryHint: '使用工作流当前保存的内容，结果不出具',
+  notPublished: '这个工作流尚未发布：到点时无法发起正式运行，会记为发起失败。请先发布，或改用探索运行',
+
+  // ---- 表单：输入
+  inputs: '输入',
+  inputsHint: '可填固定值或模板，模板中的变量按触发时间计算；留空的字段按工作流的默认值',
+  inputsPick: '选择工作流后在此填写输入',
+  inputsNone: '这个工作流没有输入字段',
+  inputsLoading: '正在读取输入字段…',
+  inputsFailed: '无法读取输入字段',
+  inputsFromVersion: (v: number) => `字段取自已发布的 v${v}`,
+  inputsFromDraft: '字段取自工作流当前保存的内容',
+  required: '必填',
+  requiredNoDefault: '必填且没有默认值：留空时到点会发起失败',
+  defaultValue: (v: string) => `默认：${v}`,
+  variables: '插入变量',
+  variablesClose: '收起变量',
+  variablesLabel: (field: string) => `插入到「${field}」的变量`,
+  variablesEmpty: '服务端没有提供可用的变量',
+  variableTitle: (name: string, example: string) => (example ? `${name}，例如 ${example}` : name),
+  rendered: (v: string) => `下次触发时为：${v}`,
+  renderedEmpty: '下次触发时为空',
+  staleField: '工作流中已没有这个字段',
+  removeField: '移除',
+
+  // ---- 表单：重叠与补发
+  overlap: '重叠与补发',
+  overlapText: '上一次运行还没有结束时，跳过这一次，记入触发历史',
+  misfire: '错过触发时间',
+  misfireHint: '服务停机等原因错过触发时间时，在宽限内恢复则补发一次，超过则跳过',
+  misfireOption: (span: string) => `${span}内补发`,
+  span: { day: (n: number) => `${n} 天`, hour: (n: number) => `${n} 小时`, minute: (n: number) => `${n} 分钟`, second: (n: number) => `${n} 秒` },
+  enabledOnCreate: '创建后立即启用',
+
+  // ---- 表单：Webhook
+  webhook: 'Webhook 通知',
+  webhookOn: '运行有结果时发送 Webhook 通知',
+  webhookFormat: '格式',
+  format: { generic: '通用', feishu: '飞书', wecom: '企业微信', dingtalk: '钉钉' } as Record<
+    import('../types').ScheduleWebhookFormat, string>,
+  formatHint: {
+    generic: '以 JSON 发送到指定地址',
+    feishu: '飞书群机器人的 Webhook 地址',
+    wecom: '企业微信群机器人的 Webhook 地址',
+    dingtalk: '钉钉群机器人的 Webhook 地址',
+  } as Record<import('../types').ScheduleWebhookFormat, string>,
+  urlPlaceholder: {
+    generic: 'https://example.com/hooks/agentlab',
+    feishu: 'https://open.feishu.cn/open-apis/bot/v2/hook/…',
+    wecom: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…',
+    dingtalk: 'https://oapi.dingtalk.com/robot/send?access_token=…',
+  } as Record<import('../types').ScheduleWebhookFormat, string>,
+  url: '地址',
+  urlSaved: '已保存的地址',
+  urlSavedHint: '完整地址已加密保存，只显示主机和末 4 位',
+  urlReplace: '替换地址',
+  urlKeep: '保留原地址',
+  webhookRemove: '删除 Webhook',
+  webhookRemoving: '保存后将删除这个 Webhook',
+  webhookUndoRemove: '撤销删除',
+  secret: '签名密钥',
+  secretHint: {
+    generic: '可选。填写后每条消息带签名，接收端可据此校验来源',
+    feishu: '可选。机器人开启了签名校验时填写',
+    wecom: '企业微信群机器人不使用签名，留空即可',
+    dingtalk: '可选。机器人开启了加签时填写',
+  } as Record<import('../types').ScheduleWebhookFormat, string>,
+  secretSet: '已设置',
+  secretReplace: '替换',
+  secretClear: '清除',
+  secretClearing: '保存后将清除签名密钥',
+  secretUndo: '撤销',
+  secretNew: '新的签名密钥',
+  events: '通知哪些事件',
+  test: '发送测试消息',
+  testing: '正在发送…',
+  testNeedSave: '保存后才能发送测试消息',
+  testDirty: '测试使用已保存的设置，请先保存修改',
+  testOk: (status: number | null, message: string) => `测试消息已送达${status != null ? `（HTTP ${status}）` : ''}${message ? `：${message}` : ''}`,
+  testFailed: (status: number | null, message: string) => `测试消息发送失败${status != null ? `（HTTP ${status}）` : ''}${message ? `：${message}` : ''}`,
+
+  // ---- 通知里的运行链接（设置 notify 组，所有定时任务共用）
+  linkBase: '通知中的运行链接',
+  linkBaseValue: (url: string) => `按 ${url} 拼接`,
+  linkBaseUnset: '未设置服务访问地址，通知中不附带运行链接',
+  linkBaseEdit: '修改',
+  linkBaseSet: '设置',
+  linkBaseLabel: '服务访问地址',
+  linkBaseHint: '收件人打开运行链接用的地址，例如 https://agentlab.example.com。所有定时任务共用',
+  linkBasePlaceholder: 'https://agentlab.example.com',
+  linkBaseInvalid: '请输入以 http:// 或 https:// 开头的地址',
+  linkBaseSaved: '已保存服务访问地址',
+  linkBaseCleared: '已清除服务访问地址',
+  linkBaseFailed: '无法读取服务访问地址',
+
+  // ---- 表单：保存
+  save: '保存',
+  createSubmit: '创建',
+  discard: '撤销修改',
+  retry: '重试',
+  saving: '正在保存…',
+  cancel: '取消',
+  saved: '已保存',
+  created: (name: string) => `已创建定时任务「${name}」`,
+  missing: (items: string) => `还需处理：${items}`,
+  previewBlocks: '请先修正频率、时区或输入中标出的问题',
+  saveFailed: '保存失败',
+  conflict: '保存失败：这个定时任务已在别处被修改，请重新载入后再修改',
+  reload: '重新载入',
+  reloadTitle: '重新载入最新设置？',
+  reloadConsequences: ['页面上未保存的修改将丢失'],
+  reloadConfirm: '放弃修改并重新载入',
+  leaveTitle: '定时任务有未保存的修改',
+  leaveConsequences: ['离开后，这些修改将丢失'],
+  leaveConfirm: '放弃修改',
+
+  // ---- 表单的问题（写在对应字段下）
+  problem: {
+    name: '请填写名称',
+    workflow: '请选择工作流',
+    timezone: '请选择时区',
+    cronEmpty: '请填写 cron 表达式',
+    cronFields: 'cron 表达式应为五段，以空格分隔',
+    minute: '请填写 0–59 之间的分钟',
+    time: '请填写时间',
+    weekdays: '至少选择一天',
+    url: '请填写 Webhook 地址',
+    urlInvalid: '请输入以 http:// 或 https:// 开头的地址',
+    secret: '请填写新的签名密钥',
+    events: '至少选择一个事件',
+  },
+  /** 「还需处理」里各项的叫法 */
+  problemField: {
+    name: '名称', workflow: '工作流', freq: '频率', timezone: '时区', url: 'Webhook 地址', secret: '签名密钥', events: '通知事件',
+  } as Record<'name' | 'workflow' | 'freq' | 'timezone' | 'url' | 'secret' | 'events', string>,
+
+  // ---- 相对时间（将来）
+  until: {
+    soon: '不到 1 分钟后',
+    minutes: (n: number) => `${n} 分钟后`,
+    hours: (n: number) => `${n} 小时后`,
+    days: (n: number) => `${n} 天后`,
+  },
+
+  // ---- 触发历史
+  history: '触发历史',
+  historyHint: '每次触发都记在这里，包括跳过和发起失败的',
+  historyEmpty: '还没有触发记录',
+  historyEmptyHint: '到点后的每次触发都会记在这里，包括跳过和发起失败的',
+  historyRefresh: '刷新',
+  fireAt: '计划时间',
+  fireAtManual: '触发时间',
+  reason: '原因',
+  noRun: '未发起运行',
+  notified: '通知',
+  loadMore: '加载更多',
+  allLoaded: '已全部加载',
+  shown: (n: number) => `已显示 ${n} 条`,
+
+  // ---- 记录页的定时标记
+  runTag: '定时',
+  runTagTitle: (name?: string | null) => (name ? `由定时任务「${name}」发起，点击查看` : '由定时任务发起，点击查看'),
 }
 
 /** 运行对比：记录页里两次运行的对照。配方前后对照另有 COMPARE_TEXT，别混用 */
