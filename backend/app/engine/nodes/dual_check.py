@@ -14,11 +14,14 @@
 里看不出日期、口径的取舍时才给，好让它分得清哪一项是哪一项。
 
 **一致就放行，不一致交给人。** 不一致时逐个对不上的输入说清两条 SQL 差在哪（data/sql_semantics.explain_sql_diff）：
-两边先收窄到这一格（只留算出这一列的那一项；分组的按这一行的分组值改成等值条件），一条查询算好几列、分组后取一行时
-才不会混进「选出的列」「分组」这类和这一格无关的差别。完整对照落成一件工件（审批 payload 经 runner._safe 会截断，
+两边先收窄到这一格（只留算出这一列的那一项；分组的按这一行的分组值改成等值条件，HAVING 一并去掉），一条查询算好几列、
+分组后取一行时才不会混进「选出的列」「分组」这类和这一格无关的差别。分组的列设了遮罩时不收窄：这一行的分组值写进
+SQL，就跟着差异说明进了审批卡、对照工件和目录日志。完整对照落成一件工件（审批 payload 经 runner._safe 会截断，
 长 SQL 放不下），用 replay.ask 挂起。审核人逐个指标选采用原流程（a）、采用盲算（b）或两边都不对（neither）：a 没有
 缺口；b、neither、没选的写进产出的 issuance_gaps，成果节点的出具契约据此降档（on_reject 为 fail 时节点直接失败）。
 两边只差一个方面、又对得上数据目录事实的，选择写进数据目录（engine/dual_check_facts.py，指标自己的筛选范围不写）。
+选了会怎样要在卡上看得出：payload 在约定的几项之外带上实际生效的 on_reject，摘要里每个指标带 catalog——选 a、选 b
+按发起审批时的目录各会往目录里写什么、不写的为什么（dual_check_facts.preview，和真写同一套判断）。
 盲算触顶、出错、交不出数，或者输入本身没法单独复算的指标按「无法复算」记缺口，发 dual_check_unchecked。
 
 **产出的状态。** 全部一致是 agreed；没有不一致、但有无法复算的：一个都没核成是 unchecked，核成了一部分是 partial；
@@ -54,6 +57,7 @@ from app.db.models import DataSource
 from app.engine import recompute
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
+from app.engine.dual_check_facts import preview, record_choices
 from app.engine.evidence import build_catalog, is_number, next_exec
 from app.engine.expressions import ExpressionError, _cell_call, _chain_root, cell_value, column_kind, numeric_text, \
     parse_expression
@@ -907,10 +911,14 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
     """不一致的指标逐个说清差在哪，完整对照落成工件，组好审批的 payload。返回 {payload, facts, card_artifact}。
 
     两条 SQL 先收窄到这一格再比（_narrowed）：原流程一条查询算好几列、分组后取一行时，整条拿去比会混进「选出的列」
-    「分组」这类和这一格无关的差别，审批卡上只列前几条，审核人看到的多半是噪声，只差一个方面的也就写不进目录。
+    「分组」这类和这一格无关的差别，审批卡上只列前几条，审核人看到的多半是噪声，只差一个方面的也就写不进目录。两边
+    各按自己那份快照要遮的列收窄（原流程的、盲算的快照各记着查询当时的遮罩，再加数据源现在设的）。
     facts 是每个不一致指标写数据目录要用的东西（dual_check_facts.derive 的候选，少一个 choice）：只有一个输入对不上时是
     那一处完整的差异条目（带两边比较的写法和涉及的表、列），几个输入都对不上时只说「不止一处」；scope 是这个指标自己的
-    范围（口径说明、所在分组、运行输入、分组的列），有效记录条件据此排除指标自己的筛选范围。
+    范围（口径说明、所在分组、运行输入、分组的列），有效记录条件据此排除指标自己的筛选范围。scope 只在节点里用、不进
+    payload 和工件（所在分组的取值里可能有遮罩列的）。
+    payload 在约定的几项之外带 on_reject（实际生效的处置），摘要里每个指标带 catalog（选 a、选 b 各会往数据目录里写
+    什么，dual_check_facts.preview）：审核人在卡上要看得出没采用原流程会不会让运行失败、选了会不会记成人工确认的目录项。
     """
     rows = [r for r in checked["rows"] if r["status"] == DIFFERENT]
     results = checked["results"]
@@ -938,9 +946,11 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
             if inp["key"] not in row["differing"]:
                 continue
             blind_snap, _ = sources.snapshot(str(blind["artifact"])) if blind.get("artifact") else (None, None)
-            a_sql = _narrowed(inp["sql"], inp["column"], _record(original_snap, inp["row"]), kind) or inp["sql"]
-            b_sql = _narrowed(blind.get("sql"), blind.get("column"), _record(blind_snap, blind.get("row")), kind) \
-                or blind.get("sql")
+            blind_hidden = await sources.hidden(str(blind["artifact"])) if blind.get("artifact") else frozenset()
+            a_sql = _narrowed(inp["sql"], inp["column"], _record(original_snap, inp["row"]), kind,
+                              await sources.hidden(inp["artifact"])) or inp["sql"]
+            b_sql = _narrowed(blind.get("sql"), blind.get("column"), _record(blind_snap, blind.get("row")), kind,
+                              blind_hidden) or blind.get("sql")
             diff = await _explain(a_sql, b_sql, infos[inp["source"]])
             per_input.append((inp, blind, diff))
             compared.append((a_sql, str(b_sql or "")))
@@ -960,22 +970,24 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
                      "items": [{"aspect": i.get("aspect"), "text": i.get("text")} for i in merged["items"]],
                      "fallback": merged["fallback"], "text_diff": merged["text_diff"]},
         })
-        summary.append({
-            "metric_id": row["metric_id"], "name": row["name"], "unit": row["unit"],
-            "original_rendered": row["original"]["rendered"], "blind_rendered": row["blind"]["rendered"],
-            "delta_pct": row["delta_pct"], "diff": [str(i.get("text")) for i in merged["items"][:SUMMARY_DIFFS]],
-            "fallback": not any(i.get("aspect") not in ("other", "parse") for i in merged["items"]),
-        })
         first = per_input[0][0] if per_input else (row["inputs"][0] if row["inputs"] else {})
         single = compared[0] if len(per_input) == 1 else None
+        info = infos.get(str(first.get("source"))) or {}
         facts[row["metric_id"]] = {
             "metric_id": row["metric_id"], "metric": row["name"], "source": first.get("source"),
-            "dialect": (infos.get(str(first.get("source"))) or {}).get("kind"),
+            "dialect": info.get("kind"),
             "sql": {"a": single[0], "b": single[1]} if single else {},
             "diff": {"equivalent": merged["equivalent"], "fallback": merged["fallback"] or single is None,
                      "items": merged["items"]},
             "scope": {"texts": [t for t in dict.fromkeys(scope_texts) if t], "columns": sorted(scope_columns)},
         }
+        summary.append({
+            "metric_id": row["metric_id"], "name": row["name"], "unit": row["unit"],
+            "original_rendered": row["original"]["rendered"], "blind_rendered": row["blind"]["rendered"],
+            "delta_pct": row["delta_pct"], "diff": [str(i.get("text")) for i in merged["items"][:SUMMARY_DIFFS]],
+            "fallback": not any(i.get("aspect") not in ("other", "parse") for i in merged["items"]),
+            "catalog": preview(facts[row["metric_id"]], info.get("schema"), info.get("notes")),
+        })
     content = {"metrics": metrics, "model": checked.get("model"), "same_model": bool(checked.get("same_model"))}
     try:
         artifact = await artifact_store.put_json(content, kind="dual_check", run_id=ctx.run.run_id,
@@ -985,7 +997,7 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
     payload = {
         "kind": "dual_check", "node_id": ctx.node.id, "mode": "input",
         "title": f"双盲复算：{len(rows)} 个指标两边结果不一致，请选择采用哪一边的结果",
-        "card_artifact": artifact, "summary": summary,
+        "card_artifact": artifact, "summary": summary, "on_reject": options.on_reject,
     }
     names = "、".join(f"「{r['name']}」" for r in rows[:5]) + (f"等 {len(rows)} 个" if len(rows) > 5 else "")
     ctx.emit(EventType.LOG, level="warn", code="dual_check_disagreed",
@@ -995,17 +1007,18 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
 
 
 async def _source_info(sources: _Sources, name: str) -> dict[str, Any]:
-    """比较两条 SQL 要用的：方言、表结构、列的中文名（数据目录里的）。数据源没了就都不给，照样比原文。"""
+    """比较两条 SQL、预告目录写入要用的：方言、表结构、列的中文名和整份数据目录。数据源没了就都不给，照样比原文。"""
     from app.data import catalog
     from app.data.sql_semantics import catalog_labels
 
     row = await sources.source(name)
     if row is None:
-        return {"kind": None, "schema": None, "names": {}}
+        return {"kind": None, "schema": None, "names": {}, "notes": {}}
     async with SessionLocal() as session:
         entries = await catalog.read_catalog(session, row.id)
+    notes = {table: entry.notes for table, entry in entries.items()}
     return {"kind": row.kind, "schema": row.schema_cache if isinstance(row.schema_cache, dict) else None,
-            "names": catalog_labels({table: entry.notes for table, entry in entries.items()})}
+            "names": catalog_labels(notes), "notes": notes}
 
 
 async def _explain(original: Any, blind: Any, info: dict[str, Any]) -> dict[str, Any]:
@@ -1088,12 +1101,16 @@ def _sql_literal(value: Any) -> Any:
     return None
 
 
-def _narrowed(sql: Any, column: Any, record: Mapping[str, Any] | None, kind: str | None) -> str | None:
+def _narrowed(sql: Any, column: Any, record: Mapping[str, Any] | None, kind: str | None,
+              hidden: frozenset[str] = frozenset()) -> str | None:
     """把一条查询收窄到这一格：最外层 SELECT 只留算出这一列的那一项；分组的去掉分组，按这一行的分组值补上等值条件
-    （华东那一行 → WHERE … AND region = '华东'），排序、取行数跟着去掉。
+    （华东那一行 → WHERE … AND region = '华东'），HAVING、排序、取行数跟着去掉——这一行既然在结果里，它所在的组就
+    满足 HAVING，留着只会多出一条和这一格无关的差异。
 
     差异说明拿收窄后的两条比，才只说这一格是怎么算出来的。认不准的（SELECT *、DISTINCT、窗口函数、集合运算、分组键
-    对不上结果列、这一行没有分组值）返回 None，调用方照整条比。"""
+    对不上结果列、这一行没有分组值）返回 None，调用方照整条比。hidden 是这份快照要遮的列（小写）：分组键的结果列、
+    或者它用到的列在里面时也返回 None——分组值写进 SQL 就跟着差异说明进了审批卡、对照工件和目录日志，遮罩列的值
+    不能出现在那些地方。"""
     import sqlglot
     from sqlglot import exp
 
@@ -1128,6 +1145,8 @@ def _narrowed(sql: Any, column: Any, record: Mapping[str, Any] | None, kind: str
             if name is None or name not in values:
                 return None
             expr = projections[index].this if isinstance(projections[index], exp.Alias) else projections[index]
+            if name in hidden or any(col.name.lower() in hidden for col in expr.find_all(exp.Column)):
+                return None
             if values[name] is None:
                 conditions.append(exp.Is(this=expr.copy(), expression=exp.Null()))
                 continue
@@ -1135,7 +1154,7 @@ def _narrowed(sql: Any, column: Any, record: Mapping[str, Any] | None, kind: str
             if literal is None:
                 return None
             conditions.append(exp.EQ(this=expr.copy(), expression=literal))
-        for arg in ("group", "order", "limit", "offset"):
+        for arg in ("group", "having", "order", "limit", "offset"):
             tree.set(arg, None)
         tree = tree.where(*conditions, copy=False)
     elif tree.args.get("limit") is None and tree.args.get("offset") is None:
@@ -1233,7 +1252,6 @@ def _resolved_text(rows: list[dict[str, Any]], choices: dict[str, str]) -> str:
 
 async def _catalog(ctx: NodeContext, candidates: list[dict[str, Any]]) -> dict[str, Any]:
     from app.data.catalog import TABLE_FIELD_LABEL
-    from app.engine.dual_check_facts import record_choices
 
     result = await record_choices(candidates, run_id=ctx.run.run_id, node_title=ctx.node.title, actor=ctx.actor())
     written, skipped = result["written"], result["skipped"]

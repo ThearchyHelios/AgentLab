@@ -7,7 +7,10 @@
 - 指标自己的筛选范围（只看华东、只看线上）不是有效记录条件：取值出现在指标名称、口径说明、所在分组、运行输入里的，
   条件用到分组的列的，不是在排除退款、作废、测试这类无效记录的，都不写
 - 写的是人工填写、已确认，备注写明运行、节点、指标；同样的说法已确认过就不再写（不升版本），确认过的不同说法不覆盖；
-  目录里已有的有效记录条件被采纳的一边也用着的，合起来写，没用着的不动；同一次裁决里互相矛盾的选择都不写
+  目录里已有的有效记录条件被采纳的一边也用着的，合起来写，没用着的不动
+- 同一次裁决里几个指标落到同一项上：说法一样的写一次；有效记录条件（都在排除无效记录）用 AND 合成一句写；业务日期
+  说法不同的都不写
+- 审批卡上的预告（preview）：选 a、选 b 各会写什么、不写的为什么，按目录里已有的说法算，和真写同一套判断
 
 差异条目一律由 sql_semantics.explain_sql_diff 真算出来，和节点交给审核人看的是同一份。表名、数字都是虚构的。
 """
@@ -18,7 +21,7 @@ import pytest
 from app.data import catalog
 from app.data.sql_semantics import explain_sql_diff
 from app.db.base import SessionLocal
-from app.engine.dual_check_facts import derive, record_choices
+from app.engine.dual_check_facts import derive, preview, record_choices
 from tests.fixtures.dual_check_shop import (
     BOTH_WRONG,
     BUYERS,
@@ -237,6 +240,13 @@ async def seed(source_id: str, notes: dict) -> None:
         await catalog.write_entry(session, source_id, "orders", notes, if_version=0, actor="数据组")
 
 
+async def seed_again(source_id: str, notes: dict) -> None:
+    """把目录这张表整份改回 notes（在现有版本上写）。"""
+    async with SessionLocal() as session:
+        entry = await catalog.read_entry(session, source_id, "orders")
+        await catalog.write_entry(session, source_id, "orders", notes, if_version=entry.version, actor="数据组")
+
+
 async def test_a_choice_is_written_as_a_confirmed_human_item_with_its_origin(shop):
     name, source_id = shop
     out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "b", source=name)], run_id="run-42",
@@ -359,7 +369,8 @@ async def test_a_rejected_item_is_not_brought_back_but_a_rejected_other_value_do
 
 
 async def test_contradictory_choices_in_one_decision_write_nothing(shop):
-    """同一次裁决里，一个指标采纳了按下单日、另一个采纳了按支付日：写哪个都是替人拿主意，都不写。"""
+    """同一次裁决里，一个指标采纳了按下单日、另一个采纳了按支付日：一张表只有一个业务日期，写哪个都是替人拿主意，
+    都不写。"""
     name, source_id = shop
     out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "a", metric="销售额", source=name),
                                 candidate(BY_ORDER_DATE, RIGHT, "b", metric="复核销售额", source=name)],
@@ -367,8 +378,92 @@ async def test_contradictory_choices_in_one_decision_write_nothing(shop):
     assert out["written"] == []
     [skipped] = out["skipped"]
     assert "「销售额」" in skipped["reason"] and "「复核销售额」" in skipped["reason"]
-    assert "order_date" in skipped["reason"] and "paid_date" in skipped["reason"] and "互相矛盾" in skipped["reason"]
+    assert "order_date" in skipped["reason"] and "paid_date" in skipped["reason"]
+    assert "给出了不同的说法" in skipped["reason"] and "无法确定哪一个是数据事实" in skipped["reason"]
     assert await entry_of(source_id) is None
+
+
+async def test_complementary_valid_filters_in_one_decision_are_combined(shop):
+    """同一次裁决里，一个指标采纳了排除退款、另一个采纳了排除测试单：两条都在排除无效记录，各有人的选择撑着，
+    不互相矛盾，用 AND 合成一句写。"""
+    name, source_id = shop
+    out = await record_choices([
+        candidate(SUM_WEEK, extra("status <> 'refunded'"), "b", metric="销售额", source=name),
+        candidate(SUM_WEEK, extra("is_test = 0"), "b", metric="订单金额", source=name),
+        # 第三个指标采纳的是和第一个一样的条件：合并时不重复
+        candidate(COUNT_WEEK, extra("status <> 'refunded'", COUNT_WEEK), "b", metric="订单数", source=name),
+    ], run_id="run-1", node_title="复核", actor=None)
+    assert out == {"written": [{"source": name, "table": "orders", "item": "valid_filter"}], "skipped": []}
+    entry = await entry_of(source_id)
+    item = entry.notes["valid_filter"]
+    assert item["value"] == "status <> 'refunded' AND is_test = 0" and entry.version == 1
+    assert (item["source"], item["status"]) == ("human", "confirmed")
+    assert all(f"「{m}」" in item["note"] for m in ("销售额", "订单金额", "订单数")) and "run-1" in item["note"]
+
+
+async def test_combined_filters_extend_an_inferred_condition_every_adopted_side_uses(shop):
+    """目录里推断的「channel <> 'test'」：几个被采纳的一边都按它筛了，合起来写；有一个没按它筛的，关系拿不准，不动。"""
+    name, source_id = shop
+    await seed(source_id, {"valid_filter": catalog.make_item("channel <> 'test'", "llm")})
+    base = extra("channel <> 'test'")
+    both = [candidate(base, extra("status <> 'refunded'", base), "b", metric="销售额", source=name),
+            candidate(base, extra("is_test = 0", base), "b", metric="订单金额", source=name)]
+    out = await record_choices(both, run_id="run-1", node_title="复核", actor=None)
+    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}], out
+    assert (await entry_of(source_id)).notes["valid_filter"]["value"] == \
+        "channel <> 'test' AND status <> 'refunded' AND is_test = 0"
+
+    await seed_again(source_id, {"valid_filter": catalog.make_item("channel <> 'test'", "llm")})
+    one_without = [both[0], candidate(SUM_WEEK, extra("is_test = 0"), "b", metric="订单金额", source=name)]
+    out = await record_choices(one_without, run_id="run-2", node_title="复核", actor=None)
+    assert out["written"] == []
+    reason = out["skipped"][0]["reason"]
+    assert "「channel <> 'test'」" in reason and "指标「订单金额」被采纳的盲算没有按它筛选" in reason and "未改动" in reason
+    assert (await entry_of(source_id)).notes["valid_filter"]["value"] == "channel <> 'test'"
+
+
+async def test_the_same_choice_from_two_metrics_is_written_once(shop):
+    name, source_id = shop
+    out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "b", metric="销售额", source=name),
+                                candidate(BY_ORDER_DATE, RIGHT, "b", metric="订单金额", source=name)],
+                               run_id="run-1", node_title="复核", actor=None)
+    assert out == {"written": [{"source": name, "table": "orders", "item": "business_date"}], "skipped": []}
+    entry = await entry_of(source_id)
+    assert entry.version == 1 and "「销售额」" in entry.notes["business_date"]["note"]
+    assert "「订单金额」" in entry.notes["business_date"]["note"]
+
+
+# --------------------------------------------------------------------------
+# 审批卡上的预告：选哪一边各会写什么（和真写同一套判断）
+# --------------------------------------------------------------------------
+
+
+def test_the_preview_says_what_each_choice_would_write():
+    picked = candidate(BY_ORDER_DATE, RIGHT, "a")
+    assert preview(picked, SCHEMA, {}) == {
+        "a": {"write": True, "source": "shop", "table": "orders", "item": "business_date",
+              "value": {"column": "order_date"}},
+        "b": {"write": True, "source": "shop", "table": "orders", "item": "business_date",
+              "value": {"column": "paid_date"}},
+    }
+    # 只有被采纳的一边有条件时才写：选另一边照实说为什么不写
+    said = preview(candidate(WITH_REFUNDS, RIGHT, "a"), SCHEMA, {})
+    assert said["a"]["write"] is False and "被采纳的原流程没有这个条件" in said["a"]["reason"]
+    assert said["b"] == {"write": True, "source": "shop", "table": "orders", "item": "valid_filter",
+                         "value": "status <> 'refunded'"}
+
+
+def test_the_preview_reads_the_catalog_as_it_is():
+    """目录里已有的说法照写入时的规矩算：确认过的不覆盖、同样的说法不重写、推断的有效记录条件合起来写。"""
+    confirmed = {"orders": {"business_date": catalog.make_item({"column": "order_date"}, "human", "confirmed")}}
+    said = preview(candidate(BY_ORDER_DATE, RIGHT, "a"), SCHEMA, confirmed)
+    assert said["a"]["write"] is False and "无需重复写入" in said["a"]["reason"]
+    assert said["b"]["write"] is False and "已有人工确认过的说法「order_date」" in said["b"]["reason"]
+
+    inferred = {"orders": {"valid_filter": catalog.make_item("is_test = 0", "llm")}}
+    base = f"SELECT SUM(amount) AS gmv FROM orders WHERE is_test = 0 AND paid_date {WEEK}"
+    said = preview(candidate(base, extra("status <> 'refunded'", base), "a"), SCHEMA, inferred)
+    assert said["b"]["write"] is True and said["b"]["value"] == "is_test = 0 AND status <> 'refunded'"
 
 
 async def test_a_missing_source_or_an_unrecordable_choice_is_reported(shop):

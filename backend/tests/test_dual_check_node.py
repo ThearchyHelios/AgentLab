@@ -4,13 +4,15 @@
 - 一致：不挂起，产出 agreed，日志 dual_check_agreed；盲算的查询发 tool.end（role: verify），台账只有一条 dual_check，
   用量计入运行；盲算 agent 的任务里没有原 SQL，也没有原流程结果的列名
 - 一个都没核成是 unchecked、只核成一部分是 partial，日志 dual_check_unchecked 说清哪几个、为什么
-- 不一致：挂起，审批 payload 和对照工件按约定；a / b / neither 三种选择的产出和缺口，没选的照实记，驳回、on_reject
-  为 fail 时失败
-- 差异说明只比这一格所在的那一列（一条查询算好几列、分组后取一行的，收窄了再比）
+- 不一致：挂起，审批 payload 和对照工件按约定，payload 另带实际生效的 on_reject、摘要里每个指标带选 a、选 b 各会往
+  数据目录里写什么的预告；a / b / neither 三种选择的产出和缺口，没选的照实记，驳回、on_reject 为 fail 时失败
+- 差异说明只比这一格所在的那一列（一条查询算好几列、分组后取一行的，收窄了再比，HAVING 一并去掉）；分组的列设了
+  遮罩时不收窄，遮罩列的取值不进审批卡、对照工件、产出和事件
 - 只差一个方面时写数据目录（业务日期、有效记录条件），差了不止一处不写，人工确认过的不同说法不覆盖，指标自己的
-  筛选范围不写，两条 SQL 规范化后一致的不写
+  筛选范围（取值在运行输入里、用到分组的列）不写，两条 SQL 规范化后一致的不写
 - 全局关闭直通、节点覆盖；设置按发起时的快照；重放时盲算不再执行、事件不重复；报告的写作目录不含盲算的查询
-- 触顶、分组结果的维度（只给取值、遮罩列不给）、两个指标用到同一格只盲算一次、遮罩列上的盲算结果不采用
+- 触顶、分组结果的维度（只给取值、遮罩列不给）、带着取舍的列名不交给盲算、两个指标用到同一格只盲算一次、遮罩列上的
+  盲算结果不采用
 """
 from __future__ import annotations
 
@@ -234,6 +236,23 @@ async def test_the_blind_agent_is_not_told_which_date_column_the_original_groupe
     assert "order_date" not in task and "gmv" not in task
 
 
+async def test_column_names_carrying_a_choice_are_not_given_as_hints(monkeypatch, shop):
+    """几项输入都来自查询、又没写口径说明时，列名才交给盲算区分计算式里的几项；列名里带着原流程的取舍的（按下单日、
+    已支付）不给：「gmv_by_order_date」等于告诉它按下单日归属。看不出取舍的（total）照给。"""
+    name, _ = shop
+    wide = (f"SELECT SUM(amount) AS gmv_by_order_date, COUNT(*) AS paid_orders, SUM(amount) AS total FROM orders "
+            f"WHERE status <> 'refunded' AND order_date {WEEK}")
+    aov = {"id": "aov", "name": "客单价", "unit": "元", "decimals": 2, "format": "plain",
+           "expression": "(cell(nodes.fetch, 0, 'gmv_by_order_date') + cell(nodes.fetch, 0, 'total')) "
+                         "/ cell(nodes.fetch, 0, 'paid_orders')"}
+    blind = Blind(monkeypatch, name, {})    # 盲算都交不出数：这里只看任务原文
+    await start(graph(name, wide, metrics=[aov], dual={"definitions": {}}))
+    assert len(blind.tasks) == 3
+    said = "\n".join(blind.tasks)
+    assert "gmv_by_order_date" not in said and "paid_orders" not in said
+    assert "「total」" in said
+
+
 async def test_two_metrics_using_one_cell_are_checked_once(monkeypatch, shop):
     name, _ = shop
     share = {"id": "gmv_k", "name": "销售额（千元）", "unit": "千元", "decimals": 2, "format": "thousands",
@@ -352,16 +371,25 @@ async def test_disagreement_pauses_with_the_agreed_payload_and_card(monkeypatch,
     approval = await pending(run.id)
     assert approval.mode == "input" and approval.node_id == "dual"
     payload = approval.payload
-    assert set(payload) == {"kind", "node_id", "mode", "title", "card_artifact", "summary"}
+    # 约定的六个键，另加 on_reject（实际生效的处置）：审核人在卡上要看得出没采用原流程会不会让运行失败
+    assert set(payload) == {"kind", "node_id", "mode", "title", "card_artifact", "summary", "on_reject"}
     assert payload["kind"] == "dual_check" and payload["node_id"] == "dual" and payload["mode"] == "input"
+    assert payload["on_reject"] == "degrade"
     [item] = payload["summary"]
     assert set(item) == {"metric_id", "name", "unit", "original_rendered", "blind_rendered", "delta_pct", "diff",
-                         "fallback"}
+                         "fallback", "catalog"}
     assert (item["metric_id"], item["name"], item["unit"]) == ("gmv", "销售额", "元")
     assert item["original_rendered"].startswith("310") and item["blind_rendered"].startswith("330")
     assert item["delta_pct"] == round((330 - 310) / 310 * 100, 2)
     assert item["fallback"] is False and len(item["diff"]) == 1
     assert "order_date" in item["diff"][0] and "paid_date" in item["diff"][0] and "原流程" in item["diff"][0]
+    # 选哪一边会往数据目录里写什么，按发起审批时的目录预告：只差时间列一处，选哪边就记哪一列
+    assert item["catalog"] == {
+        "a": {"write": True, "source": name, "table": "orders", "item": "business_date",
+              "value": {"column": "order_date"}},
+        "b": {"write": True, "source": name, "table": "orders", "item": "business_date",
+              "value": {"column": "paid_date"}},
+    }
 
     card = artifact_store.load(payload["card_artifact"])
     assert set(card) == {"metrics", "model", "same_model"} and card["same_model"] is False
@@ -470,6 +498,8 @@ async def test_on_reject_fail_stops_the_run(monkeypatch, shop, client):
     name, source_id = shop
     Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
     run = await start(graph(name, BY_ORDER_DATE, dual={"on_reject": "fail"}))
+    # 审批卡上看得出：这一步没采用原流程，运行就会停下
+    assert (await pending(run.id)).payload["on_reject"] == "fail"
     done = await decide(client, run.id, {"gmv": "b"})
     assert done.status == "failed" and "审核人没有采用原流程的结果" in (done.error or "") and "销售额" in done.error
     evs = await events(run.id)
@@ -546,6 +576,10 @@ async def test_a_confirmed_catalog_entry_is_not_overwritten(monkeypatch, shop, c
             actor="数据组")
     Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
     run = await start(graph(name, BY_ORDER_DATE))
+    # 预告按目录里已有的说法算：选原流程是同一个说法、不用再写，选盲算不会覆盖已确认的
+    preview = (await pending(run.id)).payload["summary"][0]["catalog"]
+    assert preview["a"]["write"] is False and "无需重复写入" in preview["a"]["reason"]
+    assert preview["b"]["write"] is False and "已有人工确认过的说法「order_date」" in preview["b"]["reason"]
     done = await decide(client, run.id, {"gmv": "b"})
     [wrote] = logs(await events(done.id), "dual_check_catalog")
     assert wrote["written"] == []
@@ -564,6 +598,9 @@ async def test_a_metric_scope_filter_is_not_written_as_a_valid_filter(monkeypatc
     run = await start(graph(name, original, metrics=[east], dual={"definitions": {"east": "华东地区已支付订单的金额"}}))
     [item] = (await pending(run.id)).payload["summary"]
     assert len(item["diff"]) == 1 and "region = '华东'" in item["diff"][0]
+    # 预告和真写的是同一套判断：两边选哪个都不写，原因照实
+    assert item["catalog"]["a"]["write"] is False and "可能是指标自己的筛选范围" in item["catalog"]["a"]["reason"]
+    assert item["catalog"]["b"]["write"] is False and "被采纳的盲算没有这个条件" in item["catalog"]["b"]["reason"]
     done = await decide(client, run.id, {"east": "a"})
     assert done.status == "succeeded", done.error
     [wrote] = logs(await events(run.id), "dual_check_catalog")
@@ -629,6 +666,61 @@ async def test_a_grouped_query_is_compared_on_the_row_it_was_taken_from(monkeypa
     assert len(item["diff"]) == 1 and "order_date" in item["diff"][0] and "paid_date" in item["diff"][0]
     await decide(client, run.id, {"east": "b"})
     assert (await notes_of(source_id)).notes["business_date"]["value"] == {"column": "paid_date"}
+
+
+async def test_a_having_clause_is_dropped_when_narrowing_to_one_row(monkeypatch, shop, client):
+    """原流程分组后另有 HAVING：取的这一行既然在结果里，它所在的组就满足 HAVING，对这一格是噪声。收窄时连 HAVING
+    一起去掉，差异只剩真正的那一处（时间列），写得进目录。"""
+    name, source_id = shop
+    by_region = (f"SELECT region, SUM(amount) AS gmv FROM orders WHERE status <> 'refunded' AND order_date {WEEK} "
+                 "GROUP BY region HAVING SUM(amount) > 10 ORDER BY region")
+    east_paid = RIGHT.replace("WHERE ", "WHERE region = '华东' AND ")
+    east = {**GMV, "id": "east", "name": "华东销售额"}
+    Blind(monkeypatch, name, {"华东销售额": (east_paid, "gmv")})
+    run = await start(graph(name, by_region, metrics=[east], dual={"definitions": {}}))
+    [item] = (await pending(run.id)).payload["summary"]
+    assert item["original_rendered"].startswith("200") and item["blind_rendered"].startswith("300")
+    assert len(item["diff"]) == 1 and "order_date" in item["diff"][0] and "paid_date" in item["diff"][0]
+    await decide(client, run.id, {"east": "b"})
+    assert (await notes_of(source_id)).notes["business_date"]["value"] == {"column": "paid_date"}
+
+
+async def test_a_condition_on_a_grouped_column_is_not_written(monkeypatch, shop, client, tmp_path):
+    """原流程按 is_test 分组、口径卡取 is_test = 0 那一行：收窄后原流程多出「is_test = 0」，看着像排除测试单的有效
+    记录条件，可它用的是原流程分组的列——是这个指标按组取的范围，不写目录。取值 0 太短、不在任何文字里，只有分组的列
+    拦得下它。"""
+    name, source_id = shop
+    db = sqlite3.connect(tmp_path / "shop.db")
+    db.execute("INSERT INTO orders VALUES (6, '华东', 105, 40.0, 'paid', '2026-09-03', '2026-09-03', 'online', 1)")
+    db.commit()
+    db.close()
+    by_flag = (f"SELECT is_test, SUM(amount) AS gmv FROM orders WHERE status <> 'refunded' AND paid_date {WEEK} "
+               "GROUP BY is_test ORDER BY is_test")
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, by_flag, dual={"definitions": {}}))
+    [item] = (await pending(run.id)).payload["summary"]
+    assert item["original_rendered"].startswith("330") and item["blind_rendered"].startswith("370")
+    assert len(item["diff"]) == 1 and "is_test = 0" in item["diff"][0]
+    done = await decide(client, run.id, {"gmv": "a"})
+    [wrote] = logs(await events(done.id), "dual_check_catalog")
+    assert wrote["written"] == [] and "分组的列" in wrote["skipped"][0]["reason"]
+    assert await notes_of(source_id) is None
+
+
+async def test_a_condition_matching_a_run_input_is_not_written(monkeypatch, shop, client):
+    """排除退款的条件看着像有效记录条件，可取值正是本次运行的输入（这一期要排除的状态）：是这个指标这一期的筛选范围，
+    不是整张表的事实，不写目录。没有这个输入时同样的选择会写（test_a_refund_filter_becomes_the_valid_row_filter）。"""
+    name, source_id = shop
+    spec = graph(name, RIGHT, dual={"definitions": {}})
+    spec["nodes"][0]["data"]["config"]["fields"] = [{"name": "exclude_status"}]
+    Blind(monkeypatch, name, {"销售额": (WITH_REFUNDS, "gmv")})
+    run = await start(spec, {"exclude_status": "refunded"})
+    [item] = (await pending(run.id)).payload["summary"]
+    assert len(item["diff"]) == 1 and "refunded" in item["diff"][0]
+    done = await decide(client, run.id, {"gmv": "a"})
+    [wrote] = logs(await events(done.id), "dual_check_catalog")
+    assert wrote["written"] == [] and "本次运行的输入" in wrote["skipped"][0]["reason"]
+    assert await notes_of(source_id) is None
 
 
 async def test_two_differing_inputs_do_not_write_the_catalog(monkeypatch, shop, client):
@@ -731,6 +823,50 @@ async def test_masked_group_columns_are_not_shown_to_the_blind_agent(monkeypatch
     await start(graph(name, BY_REGION, metrics=[first], dual={"definitions": {}}))
     [task] = blind.tasks
     assert "华东" not in task and "region" not in task
+
+
+async def test_masked_group_values_stay_out_of_the_card_and_the_catalog_log(monkeypatch, masked_shop, client):
+    """原流程按遮罩列（region）分组、口径卡取华东那一行：差异说明收窄到这一行时，不能拿这一行的分组值补等值条件——
+    那样「region = '华东'」就进了审批卡、对照工件、事件和目录日志。遮罩的分组列上不收窄，照整条比。"""
+    name, _ = masked_shop
+    first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    Blind(monkeypatch, name, {"首组销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_REGION, metrics=[first], dual={"definitions": {}}))
+    assert run.status == "interrupted", run.error
+    payload = (await pending(run.id)).payload
+    card = artifact_store.load(payload["card_artifact"])
+    done = await decide(client, run.id, {"first": "a"})
+    assert done.status == "succeeded", done.error
+    evs = await events(run.id)
+    _no_masked_value(payload, card, done, evs)
+    # 照整条比：原流程分组、盲算没分组都列出来，不止差一个方面，选了也不写目录
+    assert len(payload["summary"][0]["diff"]) > 1
+    [wrote] = logs(evs, "dual_check_catalog")
+    assert wrote["written"] == [] and "不止差一个方面" in wrote["skipped"][0]["reason"]
+
+
+async def test_a_masked_group_column_of_the_blind_query_is_not_narrowed_either(monkeypatch, masked_shop, client):
+    """盲算自己按遮罩列分组、交了华东那一行：同样不拿这一行的分组值改写盲算的 SQL。"""
+    name, _ = masked_shop
+    Blind(monkeypatch, name, {"销售额": (BY_REGION, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    assert run.status == "interrupted", run.error
+    payload = (await pending(run.id)).payload
+    assert payload["summary"][0]["blind_rendered"].startswith("300")
+    card = artifact_store.load(payload["card_artifact"])
+    done = await decide(client, run.id, {"gmv": "b"})
+    assert done.status == "succeeded", done.error
+    _no_masked_value(payload, card, done, await events(run.id))
+
+
+def _no_masked_value(payload: dict, card: dict, done: Run, evs: list[RunEvent], value: str = "华东") -> None:
+    """遮罩列上的取值不出现在审批 payload、对照工件、节点产出和节点发的事件里。查询本身的 tool.end、模型的往来按
+    设计带着原始结果（证据面板显示时再遮），不在此列。"""
+    seen = {"payload": payload, "card": card, "output": dual_output(done, evs),
+            "events": [e.data for e in evs if (e.node_id == "dual" or e.type.startswith("human.") or e.type == "log")
+                       and not e.type.startswith(("tool.", "llm."))]}
+    for where, content in seen.items():
+        assert value not in json.dumps(content, ensure_ascii=False), where
 
 
 # --------------------------------------------------------------------------
