@@ -17,16 +17,24 @@ export interface ChallengeSummaryProps {
 }
 
 /**
- * 审批卡里反方审稿的摘要，紧跟在报告核对概况（ApprovalReports）后面：一行概况（四种判断各几句），逐句列出结论原文和判断，
- * 点开一句再按 challenge_artifact 取完整内容，看反方的理由和它执行过的查询。审稿记录没存上（没有工件）时只列判断、
- * 不能点开，整块说一次。
+ * 审批卡里反方审稿的摘要，紧跟在报告核对概况（ApprovalReports）后面：一行概况（四种判断各几句），有句子根本没反查成时
+ * 另起一行说「N 句没能反查」，逐句列出结论原文和判断，点开一句再按 challenge_artifact 取完整内容，看反方的理由和它执行
+ * 过的查询。审稿记录没存上（没有工件）时只列判断、不能点开，整块说一次。
  *
  * 判断是反方模型给的，不是系统核对：颜色照结论句裁判的那一套，「经受住」也不用确定性的绿。
- * 「出具会降档」只在正式运行、有被推翻的结论、按降档处理时才写——只标注的不写降档，探索运行不出具，和出具有关的话一句不说。
- * 运行类别不由审批卡传进来，按运行 id 从证据 store 取（loadRunClass），取到之前不说；取不到时照实说取不到，可重试。
+ * 「出具会降档」只在正式运行、有被推翻的结论、被推翻的真会让出具降档时才写：服务端给了 degrades 就照它（按降档处置、又接
+ * 在带出具契约的成果节点上游才为真），老服务端没给时按「没写只标注」算。只标注的写一句不影响出具，按降档处置却不在出具
+ * 路径上的写一句为什么不影响；探索运行不出具，和出具有关的话一句不说。运行类别不由审批卡传进来，按运行 id 从证据 store
+ * 取（loadRunClass），取到之前、取不到时都不说和出具有关的话（窗口重新拿到焦点时再取）。
  *
  * 审的报告都没有经过反方审稿时什么都不画，也不发任何请求，卡片和以前一样。
  */
+/**
+ * 审批卡上的反方审稿概况，约定之外服务端另带两项（期 4）：unreviewed 没能反查的句数，degrades 被推翻的会不会让出具降档。
+ * 老服务端都不给
+ */
+type Challenge = ApprovalChallenge & { unreviewed?: number; degrades?: boolean }
+
 export function ChallengeSummary({ reports, runId }: ChallengeSummaryProps) {
   const reviewed = useMemo(() => reports.flatMap((r) => {
     const challenge = challengeOf(r)
@@ -37,7 +45,7 @@ export function ChallengeSummary({ reports, runId }: ChallengeSummaryProps) {
 }
 
 function ChallengeList({ reviewed, runId }: {
-  reviewed: { report: ApprovalReport; challenge: ApprovalChallenge }[]; runId: string
+  reviewed: { report: ApprovalReport; challenge: Challenge }[]; runId: string
 }) {
   const run = useRunClass(runId)
   return (
@@ -74,7 +82,7 @@ const count = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v 
  * payload.reports[i].challenge 认不认得：要么有计数、要么有条目。计数缺了按条目数（条目最多 10 条，计数才是全部）；
  * 条目缺了 unit 的留空（行的键带序号，区分得开），不补假的：补出来的键会被当成真的 unit 去和工件里的句子比
  */
-function challengeOf(report: ApprovalReport): ApprovalChallenge | null {
+function challengeOf(report: ApprovalReport): Challenge | null {
   const raw = report.challenge as unknown
   if (!raw || typeof raw !== 'object') return null
   const c = raw as Record<string, unknown>
@@ -86,41 +94,32 @@ function challengeOf(report: ApprovalReport): ApprovalChallenge | null {
   const counts = Object.fromEntries(VERDICTS.map((v) => [v, given
     ? count(given[v]) : items.filter((it) => it.verdict === v).length])) as ChallengeCounts
   if (!given && !items.length) return null
+  const unreviewed = typeof c.unreviewed === 'number' && Number.isFinite(c.unreviewed) ? count(c.unreviewed) : undefined
   return {
     counts, items, artifact: typeof c.artifact === 'string' && c.artifact ? c.artifact : null,
     on_refuted: typeof c.on_refuted === 'string' ? c.on_refuted : undefined,
+    ...(unreviewed !== undefined ? { unreviewed } : {}),
+    ...(typeof c.degrades === 'boolean' ? { degrades: c.degrades } : {}),
   }
 }
 
-interface RunClass {
-  runClass: 'formal' | 'exploratory' | null
-  /** 取失败了、还没取到（重取期间也算：那一行和焦点所在的重试按钮不跟着闪掉） */
-  failed: boolean
-  retry: () => void
-}
-
-function useRunClass(runId: string): RunClass {
+/**
+ * 这次运行的类别：取到之前、取不到时为 null——不知道是不是正式运行，就一句和出具有关的话都不说（卡顶照审批自带的运行
+ * 类别写着，这里再猜一个只会和它对不上）。取失败了不就此作罢：窗口重新拿到焦点时再取一次（store 对出错的槽会重发），
+ * 取到了正式运行，降档的提示随之出现
+ */
+function useRunClass(runId: string): 'formal' | 'exploratory' | null {
   const slot = useEvidence((s) => (runId ? s.runClasses[runId] : undefined))
   const load = useEvidence((s) => s.loadRunClass)
   useEffect(() => { if (runId) void load(runId) }, [runId, load])
   const status = slot?.status
-  const [hadError, setHadError] = useState(false)
-  useEffect(() => {
-    if (status === 'error') setHadError(true)
-    else if (status === 'ok') setHadError(false)
-  }, [status])
-  const failed = status === 'error' || (hadError && status === 'loading')
-  // 取失败了不就此作罢：窗口重新拿到焦点时再取一次（store 对出错的槽会重发）。只取一次就放弃的话，一次网络抖动
-  // 会让「出具会降档」一直不出现，而卡顶按审批自带的运行类别照样写着正式运行
   useEffect(() => {
     if (status !== 'error' || !runId) return
     const again = () => { void load(runId) }
     window.addEventListener('focus', again)
     return () => window.removeEventListener('focus', again)
   }, [status, runId, load])
-  const retry = useCallback(() => { if (runId) void load(runId) }, [runId, load])
-  const runClass = status === 'ok' && (slot?.data === 'formal' || slot?.data === 'exploratory') ? slot.data : null
-  return { runClass, failed, retry }
+  return status === 'ok' && (slot?.data === 'formal' || slot?.data === 'exploratory') ? slot.data : null
 }
 
 // ---------------------------------------------------------------- 取工件
@@ -213,7 +212,7 @@ const focusLost = () => !document.activeElement || document.activeElement === do
 // ---------------------------------------------------------------- 卡片
 
 function ChallengeBlock({ report, challenge, run }: {
-  report: ApprovalReport; challenge: ApprovalChallenge; run: RunClass
+  report: ApprovalReport; challenge: Challenge; run: 'formal' | 'exploratory' | null
 }) {
   const [open, setOpen] = useState<Set<string>>(() => new Set())
   const [all, setAll] = useState(false)
@@ -222,9 +221,12 @@ function ChallengeBlock({ report, challenge, run }: {
   const total = VERDICTS.reduce((n, v) => n + counts[v], 0)
   // 审批里没带工件：服务端保存审稿记录失败了。每句都看不了理由和查询，不画成能点开的样子，整块说一次
   const noRecord = !challenge.artifact
-  const refuted = counts.refuted > 0 && run.runClass === 'formal'
+  const refuted = counts.refuted > 0 && run === 'formal'
   // 没给 on_refuted（老服务端）按降档；报错的节点到不了审批，不会是 fail
   const flagged = challenge.on_refuted === 'flag'
+  // 被推翻的真会让出具降档：服务端给了就照它，老服务端没给时按「不是只标注」算
+  const degrades = challenge.degrades ?? !flagged
+  const unreviewed = challenge.unreviewed ?? 0
   // 条目之外的几句（条目最多 10 条）：要看全部时从工件里补上，排在后面，顺序照工件
   const extra = all && detail.data ? detail.data.claims.filter((c) => !items.some((it) => sameClaim(c, it))) : []
   const rows: ChallengeItem[] = [...items, ...extra]
@@ -256,24 +258,13 @@ function ChallengeBlock({ report, challenge, run }: {
   const showAll = () => { focusMore.current = true; setAll(true) }
   const retryAll = () => { focusMore.current = true; detail.retry?.() }
 
-  // 运行类别重取成功后，「暂时无法确认」那一行（连同焦点所在的重试按钮）换成降档说明：焦点接到概况那一行上
-  const countsRef = useRef<HTMLDivElement>(null)
-  const runRetried = useRef(false)
-  useEffect(() => {
-    if (run.failed || !runRetried.current) return
-    runRetried.current = false
-    if (focusLost()) countsRef.current?.focus()
-  }, [run.failed])
-  const retryRun = () => { runRetried.current = true; run.retry() }
-
   return (
     <div ref={blockRef} className="mb-2 rounded border bg-bg p-2" data-challenge={report.node_id}>
       <div className="mb-1 flex items-center gap-1 text-2xs font-medium text-faint">
         <ShieldAlert size={11} aria-hidden /> {CHALLENGE_TEXT.head(report.label || report.node_id)}
       </div>
       {total > 0 || items.length ? (
-        <div ref={countsRef} tabIndex={-1} className={`tnum flex flex-wrap items-center gap-x-1.5 gap-y-1 text-2xs ${FOCUS_RING}`}
-             data-challenge-counts="">
+        <div className="tnum flex flex-wrap items-center gap-x-1.5 gap-y-1 text-2xs" data-challenge-counts="">
           {VERDICTS.map((v, i) => (
             <Fragment key={v}>
               {i > 0 && <span className="text-faint" aria-hidden>·</span>}
@@ -282,7 +273,7 @@ function ChallengeBlock({ report, challenge, run }: {
               </span>
             </Fragment>
           ))}
-          {refuted && !flagged && (
+          {refuted && !flagged && degrades && (
             <span className="chip shrink-0 font-semibold" data-challenge-degrade=""
                   style={{ color: 'var(--st-failed)', borderColor: 'var(--st-failed)' }}>
               <AlertTriangle size={11} aria-hidden /> {CHALLENGE_TEXT.degrade}
@@ -292,19 +283,22 @@ function ChallengeBlock({ report, challenge, run }: {
       ) : (
         <div className="text-2xs text-dim" data-challenge-empty="">{CHALLENGE_TEXT.none}</div>
       )}
+      {/* 根本没反查成的几句：「无法判断」里分不出查了数据不够和一条都没查，单独说一次 */}
+      {unreviewed > 0 && (
+        <p className="mt-0.5 text-2xs leading-relaxed" data-challenge-unreviewed={unreviewed}>
+          <span className="font-medium" style={{ color: 'var(--st-waiting)' }}>{CHALLENGE_TEXT.unreviewed(unreviewed)}</span>
+          <span className="text-dim">。{CHALLENGE_TEXT.unreviewedHint}</span>
+        </p>
+      )}
       {/* 降档的原因常显，不放在悬停提示里：触屏、键盘用户也得看得到为什么、会怎样（只标注那一档同样常显一行） */}
-      {refuted && !flagged && (
+      {refuted && !flagged && degrades && (
         <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-degrade-note="">{CHALLENGE_TEXT.degradeHint}</div>
+      )}
+      {refuted && !flagged && !degrades && (
+        <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-degrade-off="">{CHALLENGE_TEXT.degradeOff}</div>
       )}
       {refuted && flagged && (
         <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-flag="">{CHALLENGE_TEXT.flagNote}</div>
-      )}
-      {/* 运行类别取不到：不知道是不是正式运行，不能装作没事（卡顶按审批自带的运行类别照样写着正式运行），照实说并可重试 */}
-      {counts.refuted > 0 && !flagged && run.failed && (
-        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs leading-relaxed" data-challenge-runclass="failed">
-          <span style={{ color: 'var(--st-waiting)' }}>{CHALLENGE_TEXT.runClassFailed}</span>
-          <button type="button" className="btn btn-xs" onClick={retryRun}>{CHALLENGE_TEXT.retry}</button>
-        </div>
       )}
       {rows.length > 0 && (
         <ul className="mt-1.5 space-y-0.5" data-challenge-items="">
@@ -525,7 +519,11 @@ function Rationale({ claim, onJump }: { claim: ChallengeClaim; onJump: (alias: s
 /** 列表项从哪一个片段开始：同 EvidenceDoc（行首的「- 」「1. 」是结构片段） */
 const ITEM_START = /(^|\n)[ \t]*([-*+]|\d+[.)])[ \t]+$/
 
-function RationaleDoc({ doc, onJump }: { doc: EvidenceDocData; onJump: (alias: string) => void }) {
+/**
+ * 核查 agent 的理由文档（evidence.compose_doc 组装的，数字带出处、裸数字被标出）。反方审稿、双盲复算的审批卡共用：
+ * onJump 给了的（反方审稿，旁边列着它的查询）有出处的数字是按钮，点一下跳到那次查询；没给的（双盲复算）只画出处
+ */
+export function RationaleDoc({ doc, onJump }: { doc: EvidenceDocData; onJump?: (alias: string) => void }) {
   return (
     <div className="min-w-0 space-y-1.5 text-[11.5px] leading-relaxed" data-challenge-doc="">
       {doc.blocks.map((block, b) => <RationaleBlock key={block.id ?? b} block={block} doc={doc} onJump={onJump} />)}
@@ -534,7 +532,7 @@ function RationaleDoc({ doc, onJump }: { doc: EvidenceDocData; onJump: (alias: s
 }
 
 /** 一块：外观借 Markdown 的 BlockView，和报告文档、普通答案长得一样（块的分法同 EvidenceDoc 的 DocBlock） */
-function RationaleBlock({ block, doc, onJump }: { block: EvidenceBlock; doc: EvidenceDocData; onJump: (alias: string) => void }) {
+function RationaleBlock({ block, doc, onJump }: { block: EvidenceBlock; doc: EvidenceDocData; onJump?: (alias: string) => void }) {
   const units = block.units ?? []
   const unit = (u: EvidenceUnit, code = false) => <RationaleUnit key={u.id} unit={u} doc={doc} code={code} onJump={onJump} />
   switch (block.type) {
@@ -605,11 +603,12 @@ function cellAlias(seg: EvidenceSegment, doc: EvidenceDocData): string | null {
 }
 
 /**
- * 一句话：文字按行内 Markdown 渲染（整句算一次样式，同 EvidenceDoc 的 UnitView）。有出处的数字是按钮，后面挂查询编号；
- * 裸数字、疑似不存在的名称画点状线，句末挂「无证据」「疑似不存在的名称」。别的片段（表名、字段名的链接）照普通文字
+ * 一句话：文字按行内 Markdown 渲染（整句算一次样式，同 EvidenceDoc 的 UnitView）。有出处的数字画实线、后面挂查询编号，
+ * 给了 onJump 时是按钮；裸数字、疑似不存在的名称画点状线，句末挂「无证据」「疑似不存在的名称」。别的片段（表名、字段名的
+ * 链接）照普通文字
  */
 function RationaleUnit({ unit, doc, code, onJump }: {
-  unit: EvidenceUnit; doc: EvidenceDocData; code: boolean; onJump: (alias: string) => void
+  unit: EvidenceUnit; doc: EvidenceDocData; code: boolean; onJump?: (alias: string) => void
 }) {
   const segs = (unit.segments ?? []).filter((s) => s.kind !== 'structural')
   const whole = segs.map((s) => s.text).join('')
@@ -624,13 +623,22 @@ function RationaleUnit({ unit, doc, code, onJump }: {
     const body = styles ? <StyledSlice text={whole} styles={styles} from={from} to={pos} links={!state} /> : s.text
     if (alias) {
       const source = sourceOf(s, doc)
+      // inline-block：不吃上面那条下划线
+      const tag = <sup className="mono ml-px inline-block select-none text-[9px] font-semibold text-faint" aria-hidden>{alias}</sup>
+      if (!onJump) {
+        return (
+          // 不是按钮：.ev-seg 的手形光标换成问号，悬停看出处
+          <span key={s.id} className="ev-seg" data-ev-state="deterministic" data-ev-line="solid" data-challenge-cite={alias}
+                style={{ ...evStyle('deterministic'), cursor: 'help' }} title={source}>
+            {body}{tag}<span className="sr-only">{CHALLENGE_TEXT.citedPlain(source)}</span>
+          </span>
+        )
+      }
       return (
         <button key={s.id} type="button" className="ev-seg" data-ev-state="deterministic" data-ev-line="solid"
                 data-challenge-cite={alias} style={evStyle('deterministic')} title={source}
                 aria-label={CHALLENGE_TEXT.cited(s.text, source)} onClick={() => onJump(alias)}>
-          {body}
-          {/* inline-block：不吃上面那条下划线 */}
-          <sup className="mono ml-px inline-block select-none text-[9px] font-semibold text-faint" aria-hidden>{alias}</sup>
+          {body}{tag}
         </button>
       )
     }

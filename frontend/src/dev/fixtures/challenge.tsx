@@ -22,7 +22,9 @@ import fx from './challenge.json'
  * - ?syn=challenge-approval-dense：同第一个，摆在 360px 的右栏里
  * - ?syn=challenge-approval-clear / -clear-flag：正式运行，没有被推翻的结论（降档 / 只标注），两种都不写降档、不写只标注
  * - ?syn=challenge-approval-explore-flag：探索运行配只标注，同样不说任何和出具有关的话
- * - ?syn=challenge-approval-runfail：运行类别取不到（检查脚本先答 500），说明并可重试
+ * - ?syn=challenge-approval-runfail：运行类别取不到（检查脚本先答 500），不说任何和出具有关的话
+ * - ?syn=challenge-approval-unreviewed：正式运行，四句里有两句没能反查（unreviewed），被推翻的会降档（degrades）
+ * - ?syn=challenge-approval-offpath：正式运行，按降档处置，但反方审稿不在带出具契约的成果节点上游（degrades 为假）
  * - ?syn=challenge-approval-dup：同 many，工件里补出来的一句和条目里的一句原文相同、unit 不同（工件由检查脚本合成）
  * - ?syn=challenge-approval-norecord：同 many，审稿记录没存上（artifact 为 null）
  *
@@ -57,7 +59,9 @@ function Card({ approval, name, dense = false }: { approval: Approval; name: str
 }
 
 const RUNS = fx.runs
-const withChallenge = (c: Partial<ApprovalChallenge>): ApprovalReport => ({ ...report, challenge: { ...challenge, ...c } })
+/** 期 4 起服务端另带的两项：unreviewed（没能反查的句数）、degrades（被推翻的会不会让出具降档） */
+type Challenge = ApprovalChallenge & { unreviewed?: number; degrades?: boolean }
+const withChallenge = (c: Partial<Challenge>): ApprovalReport => ({ ...report, challenge: { ...challenge, ...c } as ApprovalChallenge })
 const many = fx.many as unknown as ApprovalChallenge
 /** 没有被推翻的结论：同第一个用例去掉被推翻的那句，计数跟着改 */
 const clear: Partial<ApprovalChallenge> = {
@@ -206,6 +210,14 @@ export const cases: Record<string, () => JSX.Element> = {
   'challenge-approval-norecord': () => (
     <Card name="challenge-approval-norecord"
           approval={approvalOf('ap-chal-13', RUNS.norecord, 'formal', { ...report, challenge: { ...many, artifact: null } })} />
+  ),
+  'challenge-approval-unreviewed': () => (
+    <Card name="challenge-approval-unreviewed"
+          approval={approvalOf('ap-chal-14', RUNS.unreviewed, 'formal', withChallenge({ unreviewed: 2, degrades: true }))} />
+  ),
+  'challenge-approval-offpath': () => (
+    <Card name="challenge-approval-offpath"
+          approval={approvalOf('ap-chal-15', RUNS.offpath, 'formal', withChallenge({ on_refuted: 'degrade', degrades: false, unreviewed: 0 }))} />
   ),
   'challenge-inspector': () => <InspectorCase name="challenge-inspector" workflow={WORKFLOW} />,
   'challenge-inspector-chain': () => <InspectorCase name="challenge-inspector-chain" workflow={CHAIN} />,
