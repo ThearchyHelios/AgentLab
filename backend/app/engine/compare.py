@@ -7,22 +7,31 @@
 怎么对：
 
 - 查询：两次运行各自封存范围内交回过的查询快照，按「节点 + 该节点里第几次查询 + 工具」配对，配不上的再按规范化
-  SQL（data/sql_semantics.normalize_sql）配；同一节点、同一工具里规范化 SQL 相同的先配上（Agent 每次查询的先后
-  可能不同，见 _pair）。结构：规范文本和字面量都相同是 same；规范文本相同、只有字面量不同是 params_only（定时运行
-  每次的日期不同，属于参数变化不是模板变化）；否则 changed（数据源换了也算）。核查类的查询（双盲复算、反方审稿发的
-  role: verify）不进报告，不参与对比。
-- 口径卡：同一个口径卡节点按指标 id 配对；循环里执行了几次的取最后一次。表达式、口径版本、小数位、单位、显示格式
-  有一样不同就是口径变了：小数位改变取整，单位、比率与否改变数值的含义，都不只是换个写法。
-- 每个指标一个分类，按这个次序判：一边有一边没有（added / removed）；口径变了（caliber_and_data，可能连同数据）；
-  喂它的查询结构变了、上游节点改了配置（sql_changed，标出、不拆）；输入对不上具体的查询，上游又有变化，说不清变化
-  从哪来（incomparable）；只有参数变了（params_only，含运行输入）；都没变时数值相等是 unchanged，不等是 data_only。
-  「喂它的查询」按输入的出处认：cell() 那一格、Agent 按出处交来的字段落在哪份快照上就是哪条查询（两边各自的快照
-  直接比 SQL）；不落在快照上的，看写它的节点自己查过的库，节点不查库（代码、数据整形……）就看它的配置和画布上的
-  全部上游。
+  SQL（data/sql_semantics.normalize_sql）配；同一节点、同一工具里规范化 SQL 相同的先配上，字面量也相同的又在前
+  （Agent 每次查询的先后可能不同，见 _pair）。结构：规范文本和字面量都相同是 same；规范文本相同、只有字面量不同是
+  params_only（定时运行每次的日期不同，属于参数变化不是模板变化）；否则 changed（数据源换了也算）。核查类的查询
+  （双盲复算、反方审稿发的 role: verify）不进报告，不参与对比。
+- 口径卡：同一个口径卡节点按指标 id 配对；循环里执行了几次的取最后一次。表达式、口径版本、小数位、单位、比率与否
+  有一样不同就是口径变了：小数位改变取整，单位、比率与否改变数值的含义，都不只是换个写法。千分位和不分组互换只影响
+  显示，写进说明、不算口径变化。升级前的卡没记小数位、显示格式的，按那次运行图里的指标定义核对，定义也没有就不比。
+- 每个指标一个分类，按这个次序判：一边有一边没有（added / removed）；口径变了（caliber_and_data，可能连同数据；
+  喂它的取数也有变化的照样写进说明）；喂它的查询结构变了、上游节点改了配置（sql_changed，标出、不拆）；输入对不上、
+  说不清变化从哪来（incomparable）；只有参数变了（params_only，含运行输入）；都没变时数值相等是 unchanged，
+  不等是 data_only。
+- 「喂它的查询」按输入的出处认：
+  - cell() 那一格、Agent 按出处交来的字段落在哪份快照上就是哪条查询，两边各自的快照直接比 SQL；快照是合并查询的
+    结果时，再按别名一路追到喂它的每一份上游快照。只差字面量时还要看图里的 SQL：图里的 SQL 改过（改了写死的筛选值、
+    系数）是模板变化，图里一字未改的才是运行时代入的参数
+  - Agent 按出处交来的字段还要引用同一列、同一段行（两边都引用整份结果的不算换了）：取哪一列、哪几行是 Agent 每次
+    运行时定的，换了就不是同一个数
+  - 不落在快照上的：模型、人交出的值（Agent 没按出处交、模型调用、人工审批……）没有出处，值变了说不清是数据还是它
+    本身的差异；代码、数据整形这类节点看它自己查过的库，不查库的看它的配置和画布上的全部上游，上游的查询结果两次
+    一模一样、值却变了的同样说不清
+  - 图级的变化落到节点上：连线有增删的，终点节点算改了；默认设置改了的，没有自行设置这几项的模型类节点算改了
 - 严格拆分（只对口径变了的）：旧表达式的每个叶子路径都能在这次的口径卡输入里取得值时，
   口径效应 = f_new(x_new) − f_old(x_new)，数据效应 = f_old(x_new) − f_old(x_old)。f_old(x_new) 用推演重算
   （engine/recompute.py）的还原和求值算，取整按旧口径卡的小数位；三个数按十进制精确相减，两效应之和逐位等于
-  总变化。取数的 SQL 也变了、用到了遮罩列、单位不同的不拆，说明为什么。
+  总变化（转成浮点后也逐位相加，见 _split_exact）。取数的 SQL 也变了、用到了遮罩列、单位不同的不拆，说明为什么。
 - 维度归因：指标的输入落在查询快照的某一格（或 Agent 数组字段的一段行）、两边快照都没截断时，取快照里不是数值的
   列作维度（遮罩的、日期类型的不算；两边都只有一个值的、两边没有一个值相同的——日期、期次这类每期都不同的列——
   也不拿来配对），按维度键配对两边的行，算每个键的 base / target / delta，按 |delta| 取前 10。只有度量列之和
@@ -44,9 +53,10 @@ from app.data.sql_semantics import NormalizedSql, diff_facets, facets, normalize
 from app.engine import recompute
 from app.engine.evidence import DEFAULT_FORMAT, RenderError, is_number, render_number
 from app.engine.expressions import ExpressionError, cell_value, leaf_refs, parse_expression
-from app.engine.labels import field_label
+from app.engine.labels import TYPE_LABEL, field_label
 from app.engine.merge_query import MERGE_SOURCE
-from app.engine.nodes.metrics import _REF_HEAD
+from app.engine.nodes.metrics import _REF_HEAD, _display_of
+from app.engine.toolcalls import QUERY_PREFIX
 
 UNCHANGED = "unchanged"
 DATA_ONLY = "data_only"
@@ -74,6 +84,18 @@ _MERGE_DIALECT = "sqlite"
 #: 日期类的列不当维度：每期都不同，按它配对两边的行一个都配不上
 _TEMPORAL = frozenset({"date", "datetime", "time"})
 _FORMAT_LABEL = {"thousands": "千分位", "plain": "不分组", "percent_of_ratio": "比率按百分数显示"}
+_RATIO = "percent_of_ratio"
+#: 图里写 SQL 的配置项：调用工具节点的参数、合并查询的合并 SQL
+_SQL_KEY = {"tool": "args.sql", "merge": "sql"}
+#: 交出的值由模型或人给出的节点（类型、口径卡记的来历）：同样的输入、同样的配置，交出的值也可能不同
+_GENERATED = frozenset({"agent", "llm", "supervisor", "human", "memory", "retrieve", "subgraph"})
+_GENERATED_VIA = frozenset({"agent", "agent_field", "llm", "team", "human", "memory", "retrieval", "subgraph"})
+#: 图级默认设置只有模型类节点在读（节点没配 provider、model 时回退到它，GraphSpec.defaults）
+_MODEL_TYPES = frozenset({"llm", "agent", "supervisor"})
+#: 改了也不影响交出的值的默认设置：审批策略只管调用工具前问不问人
+_QUIET_DEFAULTS = frozenset({"approval"})
+#: 浮点能原样写回的十进制有效数字位数（DBL_DIG）
+_FLOAT_DIGITS = 15
 
 NO_CARDS = "两次运行都没有口径卡，没有可以对比的指标"
 EDGES_CHANGED = "节点之间的连线有变化"
@@ -82,6 +104,8 @@ MASKED_NOTE = "部分列在数据源中设置了遮罩，对比中不显示这�
 NO_LINEAGE = "口径卡没有记录输入（生成于系统升级前），无法判断变化来源"
 DATA_FROM_QUERIES = "取数的 SQL 没有变化，查询结果有变化"
 DATA_FROM_UPSTREAM = "模板和取数的 SQL 都没有变化，变化来自上游数据"
+#: 图有别的改动、都不在它的上游：不能说「模板没有变化」
+DATA_FROM_UPSTREAM_SCOPED = "它上游的节点和取数的 SQL 都没有变化，变化来自上游数据"
 SQL_NOT_SPLIT = "取数的 SQL 或上游配置有变化，变化无法在口径与数据之间拆分"
 NOT_NUMBERS = "有一边的值不是数值，无法拆分"
 SPLIT_MASKED = "用到了设置了遮罩的列，不做拆分"
@@ -136,9 +160,13 @@ def compare(base: Side, target: Side) -> dict[str, Any]:
       delta_pct（相对基准的百分比，两位小数；基准为 0 时为 None）, classification, reasons: [说明], decomposition:
       {caliber_effect, data_effect, caliber_rendered, data_rendered} 或 None, decomposition_note（为什么没拆）,
       inputs: [{path, base, target, masked?, base_artifact?, target_artifact?}], attribution}
-    - attribution：{columns, measure, rows: [{key: [维度值…], base, target, delta, share}], total_delta, note} 或
-      None。归不了因的（快照截断、度量列遮罩、快照读不出来、维度列每期都不同）rows 为空、total_delta 为 None，原因
-      写在 note；一边没有的维度值那一边写 None
+    - classification 按这个次序取第一个对得上的：added / removed → caliber_and_data → sql_changed → incomparable
+      → params_only → unchanged / data_only。口径变了的指标喂它的取数也变了时，分类仍是 caliber_and_data，取数的
+      变化接在口径的说明后面写进 reasons
+    - attribution：{path, base_artifact, target_artifact（归因用的是哪个输入、两边各自哪份快照）, columns, measure,
+      rows: [{key: [维度值…], base, target, delta, share}], total_delta, note} 或 None。归不了因的（快照截断、
+      度量列遮罩、快照读不出来、维度列每期都不同）rows 为空、total_delta 为 None，原因写在 note；一边没有的维度值
+      那一边写 None
     - queries：每对查询一项 {node_id, node_title, ordinal, structure, base_sql, target_sql, literals: [{base,
       target}]（只列不同的字面量）, base_rows, target_rows, base_truncated, target_truncated, base_artifact,
       target_artifact, differences: [结构上差在哪], problem?（快照读不出来、被改过）}
@@ -168,6 +196,8 @@ class _Query:
     #: 快照读不出来的原因：missing / tampered
     problem: str | None = None
     source: str | None = None
+    #: 合并查询的各个输入 [{alias, node_id, artifact, …}]：快照里记的，快照读不出来时取 merge.end 的
+    inputs: list[dict[str, Any]] | None = None
 
 
 def _snapshot(load: Callable[[str], Any], artifact: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -189,16 +219,20 @@ def _queries(side: Side) -> list[_Query]:
     seen: set[tuple[str, str]] = set()
     asked: dict[tuple[str, Any], str] = {}      # (节点, call_id) → tool.start 里的 SQL
     merged: dict[str, str] = {}                  # 合并节点 → merge.end 里的 SQL
+    merged_inputs: dict[str, Any] = {}           # 合并节点 → merge.end 里的输入
     count: dict[str, int] = {}
 
     def add(node_id: str, artifact: str, tool: Any, call_id: Any, sql: Any, source: Any) -> None:
         count[node_id] = count.get(node_id, 0) + 1
         snap, problem = _snapshot(side.load, artifact)
         own = snap.get("sql") if snap is not None and isinstance(snap.get("sql"), str) else None
+        source = (snap or {}).get("source") or source
+        inputs = (snap or {}).get("inputs") if snap is not None else merged_inputs.get(node_id)
         out.append(_Query(artifact=artifact, node_id=node_id, tool=str(tool) if tool else None,
                           ordinal=count[node_id], call_id=str(call_id) if call_id else None,
                           sql=own or (sql if isinstance(sql, str) and sql.strip() else None), snap=snap,
-                          problem=problem, source=(snap or {}).get("source") or source))
+                          problem=problem, source=source,
+                          inputs=inputs if source == MERGE_SOURCE and isinstance(inputs, list) else None))
 
     for _, etype, node_id, data in side.events:
         if not node_id or not isinstance(data, dict) or data.get("role") == "verify":
@@ -212,8 +246,10 @@ def _queries(side: Side) -> list[_Query]:
             seen.add((node_id, artifact))
             add(node_id, artifact, data.get("tool"), data.get("call_id"), asked.get((node_id, data.get("call_id"))),
                 None)
-        elif etype == EventType.MERGE_END and isinstance(data.get("sql"), str):
-            merged[node_id] = data["sql"]
+        elif etype == EventType.MERGE_END:
+            if isinstance(data.get("sql"), str):
+                merged[node_id] = data["sql"]
+            merged_inputs[node_id] = data.get("inputs")
         elif etype == EventType.NODE_FINISHED:
             for entry in data.get("evidence") or []:
                 if not (isinstance(entry, dict) and entry.get("kind") == "query" and entry.get("artifact")):
@@ -232,12 +268,13 @@ def _queries(side: Side) -> list[_Query]:
 
 
 def _pair(base: list[_Query], target: list[_Query],
-          text: Callable[[_Query], str | None]) -> list[tuple[_Query | None, _Query | None]]:
+          norm: Callable[[_Query], NormalizedSql | None]) -> list[tuple[_Query | None, _Query | None]]:
     """配对，一轮比一轮宽：
-    1. 同一节点、同一工具、规范化 SQL 相同（只有字面量不同也算）：Agent 每次查询的先后可能不同，按「第几次」硬配
-       会把换了先后的两条都配成「结构变了」；循环里同一个模板查几次的，按先后一一配上，和按第几次配一样
-    2. 剩下的按「节点 + 第几次 + 工具」配：同一个位置上的查询换了写法，就是这条查询的结构变了
-    3. 再剩下的跨节点按规范化 SQL 配：节点换了 ID，查的还是同一个模板
+    1. 同一节点、同一工具、规范化 SQL 和字面量都相同：Agent 每次查询的先后可能不同，按「第几次」硬配会把换了先后的
+       两条都配成「结构变了」；先配一字不差的，换了先后的东区、南区两条才各自配上自己，不会配成两条「参数不同」
+    2. 同一节点、同一工具、规范化 SQL 相同（只有字面量不同）：循环里同一个模板查几次的，按先后一一配上
+    3. 剩下的按「节点 + 第几次 + 工具」配：同一个位置上的查询换了写法，就是这条查询的结构变了
+    4. 再剩下的跨节点按规范化 SQL 配（同样先配字面量也相同的）：节点换了 ID，查的还是同一个模板
     结果按这次运行的先后排，基准运行多出来的接在后面。"""
     matched: dict[int, int] = {}
     taken: set[int] = set()
@@ -251,12 +288,20 @@ def _pair(base: list[_Query], target: list[_Query],
                 matched[j] = i
                 taken.add(i)
 
-    def same_sql(b: _Query, q: _Query) -> bool:
-        key = text(q)
-        return key is not None and text(b) == key
+    def same_sql(b: _Query, q: _Query, *, literals: bool = False) -> bool:
+        nq = norm(q)
+        if nq is None:
+            return False
+        nb = norm(b)
+        return nb is not None and nb.text == nq.text and (not literals or nb.literals == nq.literals)
 
-    link(lambda b, q: b.node_id == q.node_id and b.tool == q.tool and same_sql(b, q))
+    def here(b: _Query, q: _Query) -> bool:
+        return b.node_id == q.node_id and b.tool == q.tool
+
+    link(lambda b, q: here(b, q) and same_sql(b, q, literals=True))
+    link(lambda b, q: here(b, q) and same_sql(b, q))
     link(lambda b, q: (b.node_id, b.ordinal, b.tool) == (q.node_id, q.ordinal, q.tool))
+    link(lambda b, q: same_sql(b, q, literals=True))
     link(same_sql)
     pairs: list[tuple[_Query | None, _Query | None]] = [
         (base[matched[j]] if j in matched else None, q) for j, q in enumerate(target)]
@@ -382,6 +427,44 @@ def _plain(d: Decimal, *, whole: bool) -> int | float | None:
     return value if math.isfinite(value) else None
 
 
+def _percent(base: Decimal, target: Decimal) -> float | None:
+    """相对基准的百分比，两位小数；基准为 0 没有百分比。基准极小（浮点误差那么小的数）、这次很大时，百分比的整数
+    部分比十进制的默认精度（28 位）还长，量化到两位小数会抛 InvalidOperation：退回浮点算，浮点也放不下的给 None。"""
+    if base == 0:
+        return None
+    ratio = (target - base) / abs(base) * 100
+    try:
+        return _plain(ratio.quantize(Decimal("0.01")), whole=False)
+    except ArithmeticError:
+        value = float(ratio)
+        return round(value, 2) if math.isfinite(value) else None
+
+
+def _round_trips(d: Decimal) -> bool:
+    """这个十进制数换成浮点、再按最短写法写回来还是它自己（JSON 里交出去的就是浮点）。"""
+    value = float(d)
+    return math.isfinite(value) and Decimal(repr(value)) == d
+
+
+def _split_exact(delta: Decimal, caliber: Decimal) -> tuple[Decimal, Decimal, Decimal]:
+    """(总变化, 口径效应, 数据效应)，三个数转成浮点交出去以后仍逐位相加。
+
+    十进制里数据效应 = 总变化 − 口径效应是精确的，可转成浮点时三个数各舍入各的：没设小数位的指标（0.1 + 0.2 =
+    0.30000000000000004 这种）交出去的两效应之和会和总变化差在最后一位。这时三个数按同一个精度量化（最多 15 位
+    有效数字，浮点能原样写回的位数）：总变化和口径效应各自量化，数据效应取两者之差。设了小数位的值本来就写得回，
+    原样交回。"""
+    data = delta - caliber
+    if all(_round_trips(x) for x in (delta, caliber, data)):
+        return delta, caliber, data
+    top = max(abs(delta), abs(caliber), abs(data))
+    for digits in range(_FLOAT_DIGITS, _FLOAT_DIGITS - 3, -1):
+        exp = Decimal(1).scaleb(top.adjusted() + 1 - digits)
+        d, c = delta.quantize(exp), caliber.quantize(exp)
+        if all(_round_trips(x) for x in (d, c, d - c)):
+            return d, c, d - c
+    return delta, caliber, data
+
+
 def _places(*metrics: dict[str, Any]) -> int | None:
     """几个指标里最多的小数位；有一个没设的就不定小数位（按值本来的样子写）。"""
     found = [m.get("decimals") for m in metrics]
@@ -483,6 +566,38 @@ def _key_label(key: str, node_type: Any) -> str:
     return "节点类型" if key == "type" else field_label(key, node_type)
 
 
+def _unset(value: Any) -> bool:
+    """节点上没写这一项：运行时回退到图级默认设置（NodeContext.cfg 同一个规则）。"""
+    return value in (None, "")
+
+
+def _graph_sql(node: dict[str, Any] | None) -> tuple[str, str | None] | None:
+    """节点在图里写的 SQL 和它的数据源：调用工具节点是参数里的 SQL（数据源从工具名来），合并查询是合并 SQL。
+    别的节点（Agent 自己写 SQL）返回 None。"""
+    if node is None:
+        return None
+    config = _config(node)
+    if node.get("type") == "tool":
+        args = config.get("args")
+        sql = args.get("sql") if isinstance(args, dict) else None
+        tool = str(config.get("tool") or "")
+        source = tool[len(QUERY_PREFIX):] if tool.startswith(QUERY_PREFIX) else None
+        return (sql, source) if isinstance(sql, str) and sql.strip() else None
+    if node.get("type") == "merge":
+        sql = config.get("sql")
+        return (sql, MERGE_SOURCE) if isinstance(sql, str) and sql.strip() else None
+    return None
+
+
+def _definition(graph: dict[str, Any], card_id: str, metric_id: str) -> dict[str, Any] | None:
+    """图里口径卡节点上写的指标定义；指标定义来自别的工作流（口径卡来源）的不算，那里写的才是当时用的。"""
+    card = _nodes(graph).get(card_id)
+    if card is None or card.get("type") != "metrics" or _config(card).get("caliber_from") not in (None, "", {}):
+        return None
+    return next((d for d in _config(card).get("metrics") or []
+                 if isinstance(d, dict) and str(d.get("id")) == metric_id), None)
+
+
 # --------------------------------------------------------------------------
 # 输入的出处有没有变
 # --------------------------------------------------------------------------
@@ -523,11 +638,12 @@ class _Compare:
         self._norm: dict[tuple[str, str | None], NormalizedSql] = {}
         self._shapes: dict[tuple[int, int], _Shape] = {}
         self._ancestors: dict[str, set[str]] = {}
+        self.base_nodes, self.target_nodes = _nodes(base.graph), _nodes(target.graph)
         self.base_queries, self.target_queries = _queries(base), _queries(target)
-        self.pairs = _pair(self.base_queries, self.target_queries, self._text)
+        self.pairs = _pair(self.base_queries, self.target_queries, self._norm_of)
         self.template, self.changed = self._template()
-        self.titles = {**{k: self._title_of(n) for k, n in _nodes(base.graph).items()},
-                       **{k: self._title_of(n) for k, n in _nodes(target.graph).items()}}
+        self.titles = {**{k: self._title_of(n) for k, n in self.base_nodes.items()},
+                       **{k: self._title_of(n) for k, n in self.target_nodes.items()}}
         self.parents: dict[str, set[str]] = {}
         for source, target_id, _ in _edges(base.graph) | _edges(target.graph):
             self.parents.setdefault(target_id, set()).add(source)
@@ -576,8 +692,15 @@ class _Compare:
             self._norm[key] = normalize_sql(sql, dialect)
         return self._norm[key]
 
-    def _text(self, q: _Query) -> str | None:
-        return self._normalize(q.sql, self._dialect(q.source)).text if q.sql else None
+    def _norm_of(self, q: _Query) -> NormalizedSql | None:
+        return self._normalize(q.sql, self._dialect(q.source)) if q.sql else None
+
+    def _same_graph_sql(self, a: tuple[str, str | None] | None, b: tuple[str, str | None] | None) -> bool:
+        """图里的两段 SQL 规范化以后一模一样（只差空白、大小写、注释）。"""
+        if a is None or b is None:
+            return False
+        na, nb = self._normalize(a[0], self._dialect(a[1])), self._normalize(b[0], self._dialect(b[1]))
+        return (na.text, na.literals) == (nb.text, nb.literals)
 
     def shape(self, b: _Query | None, t: _Query | None) -> _Shape:
         if b is None:
@@ -656,10 +779,71 @@ class _Compare:
             return _Change("params", f"{name}的 SQL 只有参数不同（{shown}{more}）")
         return _Change("same")
 
+    def _snapshot_change(self, b: _Query | None, t: _Query | None, seen: frozenset[str] = frozenset()) -> _Change:
+        """一对查询的取数变没变：SQL 和数据源（_query_change）；只差字面量时再看图里的 SQL 改没改过；合并查询再
+        一路追到喂它的每一份上游快照。"""
+        change = self._query_change(b, t)
+        if b is None or t is None:
+            return change
+        found = [change]
+        if change.kind == "params" and (edited := self._edited_sql(b, t)) is not None:
+            found.append(edited)
+        if b.source == MERGE_SOURCE and t.source == MERGE_SOURCE:
+            found += self._merge_change(b, t, seen | {b.artifact, t.artifact})
+        return _worst(found)
+
+    def _edited_sql(self, b: _Query, t: _Query) -> _Change | None:
+        """执行的 SQL 只差字面量时，图里写的 SQL 改没改过。定时运行代进去的日期不同，图里一字未改：是参数。图里写死的
+        筛选值、系数改了（'paid' 改成 'refunded'、0.9 改成 0.8）：执行的 SQL 同样只差字面量，却是改了模板。规范化
+        以后一模一样的（只改了空白、大小写）不算改过。Agent 自己写的 SQL 图里没有，返回 None。"""
+        was, now = _graph_sql(self.base_nodes.get(b.node_id)), _graph_sql(self.target_nodes.get(t.node_id))
+        if was is None or now is None or self._same_graph_sql(was, now):
+            return None
+        nb, nt = self._normalize(was[0], self._dialect(was[1])), self._normalize(now[0], self._dialect(now[1]))
+        shown = [f"{x} → {y}" for x, y in zip(nb.literals, nt.literals) if x != y] if nb.text == nt.text else []
+        detail = "（" + "，".join(shown[:2]) + (f" 等 {len(shown)} 处" if len(shown) > 2 else "") + "）" if shown else ""
+        return _Change("sql", f"工作流里「{self.title(t.node_id)}」的 SQL 改过{detail}，不是运行时代入的参数")
+
+    def _merge_change(self, b: _Query, t: _Query, seen: frozenset[str]) -> list[_Change]:
+        """合并查询的每个输入（按别名配对两边）各自的取数变没变。合并 SQL 一字未改，喂它的取数 SQL 加了筛选，合并
+        结果说的也已经不是同一回事。输入是另一个合并查询的结果时接着往上追。"""
+        name = f"合并查询「{self.title(t.node_id)}」"
+        before, after = _merge_inputs(b), _merge_inputs(t)
+        if before is None or after is None:
+            return [_Change("unknown", f"{name}没有记录它的输入，无法比较上游的取数")]
+        out = []
+        for alias in dict.fromkeys([*after, *before]):
+            was, now = before.get(alias), after.get(alias)
+            if was is None or now is None:
+                out.append(_Change("sql", f"{name}的输入有变化：这次{'多了' if was is None else '少了'}「{alias}」"))
+                continue
+            if was in seen or now in seen:
+                continue        # 合并查询的输入只能是上游的快照，成不了环；防一手
+            qb = next((q for q in self.base_queries if q.artifact == was), None)
+            qt = next((q for q in self.target_queries if q.artifact == now), None)
+            if qb is None or qt is None:
+                out.append(_Change("unknown", f"{name}的输入「{alias}」落在的查询快照不在封存范围内，无法比较上游的取数"))
+                continue
+            change = self._snapshot_change(qb, qt, seen)
+            out.append(_Change(change.kind, f"{name}的输入「{alias}」：{change.reason}") if change.reason else change)
+        return out
+
     def _node_change(self, node_id: str) -> _Change | None:
         """一个节点自己查过的库在两次运行之间变没变；它两边都没查过库返回 None。"""
         own = [(b, t) for b, t in self.pairs if (b and b.node_id == node_id) or (t and t.node_id == node_id)]
-        return _worst(self._query_change(b, t) for b, t in own) if own else None
+        return _worst(self._snapshot_change(b, t) for b, t in own) if own else None
+
+    def _data_moved(self, scope: set[str]) -> bool:
+        """这几个节点查到的数据两次有没有不同：有一对查询的行（或列）不同就算有；快照读不出来、只在一边有的核对不了，
+        也算有（不能说它们一样）。一条查询都没有的算没有。"""
+        for b, t in self.pairs:
+            if (t or b).node_id not in scope:
+                continue
+            if b is None or t is None or b.snap is None or t.snap is None:
+                return True
+            if b.snap.get("rows") != t.snap.get("rows") or b.snap.get("columns") != t.snap.get("columns"):
+                return True
+        return False
 
     def _upstream(self, node_id: str) -> set[str]:
         """画布上 node_id 的全部上游（两次运行的图合起来，宁可多算）。"""
@@ -674,56 +858,137 @@ class _Compare:
             self._ancestors[node_id] = seen
         return self._ancestors[node_id]
 
-    def provenance(self, path: str, b: Any, t: Any) -> _Change:
-        """一个输入的出处在两次运行之间变没变（b、t 是推演重算还原出来的输入）。"""
+    def _type_of(self, node_id: str) -> str | None:
+        node = self.target_nodes.get(node_id) or self.base_nodes.get(node_id)
+        return str(node.get("type")) if node is not None else None
+
+    def _moved(self, node_id: str) -> str:
+        """一个影响取值的节点变化（self.changed）写成一句话。"""
+        name = f"上游节点「{self.title(node_id)}」"
+        return {"added": f"{name}是这次新增的", "removed": f"{name}这次被删除了", "edges": f"{name}的连线有变化",
+                "defaults": f"工作流默认设置有变化，{name}没有单独设置这些项，随之改变"
+                }.get(self.changed.get(node_id, ""), f"{name}的配置有变化")
+
+    def provenance(self, path: str, b: Any, t: Any, *, moved: bool = True) -> _Change:
+        """一个输入的出处在两次运行之间变没变（b、t 是推演重算还原出来的输入）。moved 是这个指标的值变没变：输入是
+        容器、完整值又还原不出来，核对不了它变没变时，按它推断。"""
         if b is None or t is None:
             return _Change("unknown", f"输入「{path}」只在一边的口径卡里有记录")
         if b.snapshot or t.snapshot:
-            # 落在查询快照上：两边各自的那份快照直接比 SQL，不管全局配对把它们配给了谁
-            if not (b.snapshot and t.snapshot):
-                return _Change("unknown", f"输入「{path}」只有一边对得上查询快照，无法比较取数")
-            qb, qt = self._side_query(self.base_queries, b), self._side_query(self.target_queries, t)
-            if qb is None or qt is None:
-                return _Change("unknown", f"输入「{path}」落在的查询快照不在封存范围内的查询里，无法比较取数")
-            change = self._query_change(qb, qt)
-            agent = t.item.get("node_id")
-            if t.item.get("via") == "agent_field" and agent and self.changed.get(str(agent)) \
-                    and change.kind in ("same", "params"):
-                # Agent 按出处交来的字段：SQL 没变，Agent 自己改了配置（提示词、工具……）也可能换了取哪一格。
-                # 调用工具节点的格子由口径卡的 cell() 定，节点配置变了要么是 SQL 变了（上面已经比过），要么不影响取值
-                return _Change("template", f"Agent「{self.title(agent)}」的配置有变化，它按出处交来的字段可能换了取法")
-            return change
+            return self._linked(path, b, t)
         nb, nt = b.item.get("node_id"), t.item.get("node_id")
         if nb != nt:
+            if not nb or not nt:
+                side = "基准运行" if not nb else "这次运行"
+                return _Change("unknown", f"{side}没有记录输入「{path}」由哪个节点写入，无法比较来源")
             return _Change("template", f"输入「{path}」的来源节点由「{self.title(nb)}」换成了「{self.title(nt)}」")
+        same = _same_input(b, t)
         if _from_input(path, b.item):
-            if recompute._same(b.item.get("value"), t.item.get("value")):
-                return _Change("same")
-            return _Change("params", f"运行输入「{path}」由「{_shown(b.item.get('value'))}」"
-                                     f"改为「{_shown(t.item.get('value'))}」")
-        if nb and (own := self._node_change(str(nb))) is not None:
-            # 写它的节点自己查过库（Agent 没按出处交、调用工具节点的结果整份用）：它查的那几条就是喂它的查询
-            if self.changed.get(str(nb)) and own.kind in ("same", "params"):
-                return _Change("template", f"上游节点「{self.title(nb)}」的配置有变化")
+            return self._run_input(path, b, t, same, moved=moved)
+        if same is None:
+            same = not moved
+        writer = str(nb) if nb else None
+        if writer and (self._type_of(writer) in _GENERATED
+                       or {b.item.get("via"), t.item.get("via")} & _GENERATED_VIA):
+            return self._generated(path, writer, same)
+        own = self._node_change(writer) if writer else None
+        if writer and own is not None:
+            # 写它的节点自己查过库（调用工具节点的结果整份用、合并查询……）：它查的那几条就是喂它的查询
+            if writer in self.changed and own.kind in ("same", "params"):
+                return _Change("template", self._moved(writer))
+            if own.kind == "same" and not same and not self._data_moved({writer}):
+                return _Change("unknown", f"输入「{path}」来自「{self.title(writer)}」，它查到的数据两次相同，"
+                                          "交出的值却变了，无法判断变化来源")
             return own
-        if nb and self.changed.get(str(nb)):
-            return _Change("template", f"上游节点「{self.title(nb)}」的配置有变化")
-        # 写它的节点不查库（代码、数据整形、模型调用……）：看画布上它的全部上游；写它的节点不知道就看整张图
-        scope = self._upstream(str(nb)) if nb else set(self.titles)
-        moved = [n for n in scope if self.changed.get(n)]
-        changes = [self._query_change(b2, t2) for b2, t2 in self.pairs if (t2 or b2).node_id in scope]
-        worst = _worst(changes)
-        where = f"来自「{self.title(nb)}」" if nb else "不知道由哪个节点写入"
-        if moved or worst.kind in ("sql", "template", "unknown"):
+        if writer and writer in self.changed:
+            return _Change("template", self._moved(writer))
+        # 写它的节点不查库（代码、数据整形……）：看画布上它的全部上游；写它的节点不知道就看整张图
+        scope = self._upstream(writer) if writer else set(self.titles)
+        moved_nodes = [n for n in scope if n in self.changed]
+        worst = _worst(self._query_change(b2, t2) for b2, t2 in self.pairs if (t2 or b2).node_id in scope)
+        where = f"来自「{self.title(writer)}」" if writer else "不知道由哪个节点写入"
+        if moved_nodes or worst.kind in ("sql", "template", "unknown"):
             return _Change("unknown", f"输入「{path}」{where}，对不上具体的查询；它的上游有变化，无法判断变化来源")
+        if worst.kind == "same" and not same and not self._data_moved(scope):
+            # 上游查到的数据两次一模一样，它交的值却变了：不是数据变的。上游只有运行输入变了的，算参数
+            if (self.base.inputs or {}) != (self.target.inputs or {}) \
+                    and any(self._type_of(n) == "input" for n in scope):
+                return _Change("params", f"输入「{path}」{where}，它的上游只有运行输入有变化")
+            return _Change("unknown", f"输入「{path}」{where}，它上游的查询结果两次相同，交出的值却变了，"
+                                      "无法判断变化来源")
         return worst
+
+    def _linked(self, path: str, b: Any, t: Any) -> _Change:
+        """落在查询快照上的输入：两边各自的那份快照直接比取数，不管全局配对把它们配给了谁。Agent 按出处交来的字段还要
+        引用同一列、同一段行。"""
+        if not (b.snapshot and t.snapshot):
+            return _Change("unknown", f"输入「{path}」只有一边对得上查询快照，无法比较取数")
+        qb, qt = self._side_query(self.base_queries, b), self._side_query(self.target_queries, t)
+        if qb is None or qt is None:
+            return _Change("unknown", f"输入「{path}」落在的查询快照不在封存范围内的查询里，无法比较取数")
+        change = self._snapshot_change(qb, qt)
+        if "agent_field" not in (b.item.get("via"), t.item.get("via")):
+            # cell() 取哪一格由口径卡的表达式定（行列用到的变量是另外的输入，各比各的）
+            return change
+        agent = t.item.get("node_id") or b.item.get("node_id")
+        if (cited := self._citation(agent, b, t, qb, qt)) is not None:
+            change = _worst([change, cited])
+        if agent and str(agent) in self.changed and change.kind in ("same", "params"):
+            # SQL 没变、引用的也是同一处，Agent 自己的配置（提示词、工具、模型……）变了：字段的意思可能已经不同
+            return _Change("template", f"{self._moved(str(agent))}，它按出处交来的字段可能换了取法")
+        return change
+
+    def _citation(self, agent: Any, b: Any, t: Any, qb: _Query, qt: _Query) -> _Change | None:
+        """Agent 按出处交来的字段两次引用的是不是同一处：同一列（对象数组是同一组列）、同一行或同一段行。行段不同、但
+        两边引用的都是整份结果（这次多了几行）的算同一处。不是同一处返回说明。"""
+        name = f"Agent「{self.title(agent)}」" if agent else "Agent"
+        lb, lt = _locator(b), _locator(t)
+        cb, ct = lb.get("column") or lb.get("columns"), lt.get("column") or lt.get("columns")
+        if cb != ct:
+            return _Change("unknown", f"{name}引用的列由{_columns_text(cb)}改为{_columns_text(ct)}，取的不是同一个数")
+        if (b.row, b.rows) == (t.row, t.rows) or (b.row is None and t.row is None and _whole(b, qb) and _whole(t, qt)):
+            return None
+        return _Change("unknown", f"{name}引用的行由{_rows_text(b)}改为{_rows_text(t)}，取的不是同一组数")
+
+    def _generated(self, path: str, writer: str, same: bool) -> _Change:
+        """模型、人交出的值（Agent 没按出处交、模型调用、人工审批……）：没有出处，值变了说不清是数据变了还是它本身的
+        差异——同样的数据、同样的配置，模型两次交出的数也可能不同。它自己查的库结构变了、它的配置变了照常标出。"""
+        own = self._node_change(writer)
+        if own is not None and own.kind == "sql":
+            return own
+        if writer in self.changed:
+            return _Change("template", self._moved(writer))
+        if own is not None and own.kind == "unknown":
+            return own
+        if same:
+            return own or _Change("same")
+        kind = TYPE_LABEL.get(self._type_of(writer) or "", "节点")
+        return _Change("unknown", f"输入「{path}」由节点「{self.title(writer)}」（{kind}）直接给出，没有对应的查询快照，"
+                                  "无法判断变化是否来自数据")
+
+    def _run_input(self, path: str, b: Any, t: Any, same: bool | None, *, moved: bool) -> _Change:
+        """运行输入（input.*、入口节点写进 vars 的）：变了就是参数变化。列表、对象按还原出来的完整值比，卡上只记了
+        「[2 项]」这样的大概，长度不变、内容变了的不能当没变。"""
+        if same is None:
+            if moved:
+                return _Change("unknown", f"运行输入「{path}」是列表或对象，当时没有保存完整值，无法核对是否有变化")
+            return _Change("same")
+        if same:
+            return _Change("same")
+        if b.shape == "container" or t.shape == "container":
+            return _Change("params", f"运行输入「{path}」的内容有变化")
+        return _Change("params", f"运行输入「{path}」由「{_shown(b.item.get('value'))}」"
+                                 f"改为「{_shown(t.item.get('value'))}」")
 
     # ---------------------------------------------------------------- 模板
 
     def _template(self) -> tuple[dict[str, Any], dict[str, str]]:
-        """两次运行的图快照比较：新增、删除的节点，配置有变化的节点和配置项名（不展示值）。changed 是影响取值的
-        变化（新增、删除、类型或配置变了；只改名称的不算），判断输入的出处时用。"""
-        before, after = _nodes(self.base.graph), _nodes(self.target.graph)
+        """两次运行的图快照比较：新增、删除的节点，配置有变化的节点和配置项名（不展示值）。
+
+        changed 是影响取值的变化，判断输入的出处时用：节点 → added / removed / config / edges / defaults。只改名称的
+        不算；图里的 SQL 只改了空白、大小写的不算（规范化以后一模一样）。图级的变化也落到节点上：连线有增删的，终点
+        节点交出的值可能变了（接进来的东西、执行的条件变了）；默认设置改了的，没有自行设置这几项的模型类节点跟着变。"""
+        before, after = self.base_nodes, self.target_nodes
         nodes: list[dict[str, Any]] = []
         changed: dict[str, str] = {}
 
@@ -737,17 +1002,32 @@ class _Compare:
                 nodes.append(entry(node_id, node, "added", []))
                 changed[node_id] = "added"
                 continue
-            keys, renamed_only = _config_keys(was, node)
+            keys, _ = _config_keys(was, node)
             if keys:
                 nodes.append(entry(node_id, node, "config", keys))
-                if not renamed_only:
+                sql_key = _SQL_KEY.get(str(node.get("type"))) if was.get("type") == node.get("type") else None
+                if any(k != "label" and not (k == sql_key and self._same_graph_sql(_graph_sql(was), _graph_sql(node)))
+                       for k in keys):
                     changed[node_id] = "config"
         for node_id, node in before.items():
             if node_id not in after:
                 nodes.append(entry(node_id, node, "removed", []))
                 changed[node_id] = "removed"
-        same_edges = _edges(self.base.graph) == _edges(self.target.graph)
-        same_defaults = (self.base.graph.get("defaults") or {}) == (self.target.graph.get("defaults") or {})
+        edges_before, edges_after = _edges(self.base.graph), _edges(self.target.graph)
+        for _, target_id, _ in edges_before ^ edges_after:
+            if target_id in before and target_id in after:
+                changed.setdefault(target_id, "edges")
+        defaults_before = self.base.graph.get("defaults") or {}
+        defaults_after = self.target.graph.get("defaults") or {}
+        differing = [k for k in dict.fromkeys([*defaults_before, *defaults_after])
+                     if defaults_before.get(k) != defaults_after.get(k) and k not in _QUIET_DEFAULTS]
+        for node_id, node in after.items():
+            was = before.get(node_id)
+            if differing and was is not None and str(node.get("type")) in _MODEL_TYPES and any(
+                    _unset(_config(node).get(k)) and _unset(_config(was).get(k)) for k in differing):
+                changed.setdefault(node_id, "defaults")
+        same_edges = edges_before == edges_after
+        same_defaults = defaults_before == defaults_after
         if not same_edges:
             self.notes.append(EDGES_CHANGED)
         if not same_defaults:
@@ -828,33 +1108,46 @@ class _Compare:
                 out.update(classification=cls, reasons=[f"{side}的口径卡「{self.title(card_id)}」里没有这个指标"])
             return out
         assert bm is not None and tm is not None and b is not None and t is not None
-        caliber = _caliber_reasons(bm, tm, b.content or {}, t.content or {})
+        defs = (_definition(self.base.graph, card_id, mid), _definition(self.target.graph, card_id, mid))
+        caliber = _caliber_reasons(bm, tm, b.content or {}, t.content or {}, defs)
+        if shown := _display_change(bm, tm, defs):
+            self.notes.append(f"口径卡「{self.title(card_id)}」的指标「{out['name']}」{shown}，只影响显示，不算口径变化")
         self._delta(out, bm, tm)
         lineage = isinstance(bm.get("inputs"), list) and isinstance(tm.get("inputs"), list)
+        moved = not recompute._same(bm.get("value"), tm.get("value"))
+        changes: dict[str, _Change] = {}
+        if lineage and bp is not None and tp is not None:
+            changes = {p: self.provenance(p, bp.inputs.get(p), tp.inputs.get(p), moved=moved)
+                       for p in dict.fromkeys([*tp.inputs, *bp.inputs])}
         if caliber:
-            out.update(classification=CALIBER_AND_DATA, reasons=caliber)
-            out["decomposition"], out["decomposition_note"] = self._decompose(bm, tm, b, t, bp, tp)
+            # 口径优先；喂它的取数也变了、说不清的，接在口径的说明后面照样写出来，不因为口径变了就不提。只在一边才有
+            # 的输入是改表达式带来的，口径的说明已经说了
+            both = set(bp.inputs) & set(tp.inputs) if bp is not None and tp is not None else set()
+            also = [c.reason for p, c in changes.items() if p in both and c.kind in ("sql", "template", "unknown")
+                    and c.reason]
+            out.update(classification=CALIBER_AND_DATA, reasons=list(dict.fromkeys([*caliber, *also])))
+            self._decompose(out, bm, tm, b, t, bp, tp)
         elif not lineage:
             quiet = self.template["same_graph"] and all(self.shape(x, y).structure == "same" for x, y in self.pairs)
-            same = recompute._same(bm.get("value"), tm.get("value"))
-            out.update(classification=UNCHANGED if quiet and same else INCOMPARABLE,
-                       reasons=[] if quiet and same else [NO_LINEAGE])
+            out.update(classification=UNCHANGED if quiet and not moved else INCOMPARABLE,
+                       reasons=[] if quiet and not moved else [NO_LINEAGE])
         else:
-            paths = list(dict.fromkeys([*tp.inputs, *bp.inputs]))
-            changes = [self.provenance(p, bp.inputs.get(p), tp.inputs.get(p)) for p in paths]
-            worst = _worst(changes)
-            reasons = list(dict.fromkeys(c.reason for c in changes if c.kind == worst.kind and c.reason))
+            worst = _worst(changes.values())
+            reasons = list(dict.fromkeys(c.reason for c in changes.values() if c.kind == worst.kind and c.reason))
             if worst.kind in ("sql", "template"):
                 out.update(classification=SQL_CHANGED, reasons=reasons, decomposition_note=SQL_NOT_SPLIT)
             elif worst.kind == "unknown":
                 out.update(classification=INCOMPARABLE, reasons=reasons)
             elif worst.kind == "params":
                 out.update(classification=PARAMS_ONLY, reasons=reasons)
-            elif recompute._same(bm.get("value"), tm.get("value")):
+            elif not moved:
                 out.update(classification=UNCHANGED)
+            elif all(inp.snapshot for inp in tp.inputs.values()) and tp.inputs:
+                out.update(classification=DATA_ONLY, reasons=[DATA_FROM_QUERIES])
             else:
-                linked = all(inp.snapshot for inp in tp.inputs.values()) and bool(tp.inputs)
-                out.update(classification=DATA_ONLY, reasons=[DATA_FROM_QUERIES if linked else DATA_FROM_UPSTREAM])
+                # 「模板没有变化」只在整张图都没变时说；图有别的改动、都不在它的上游的，只说它的上游没变
+                out.update(classification=DATA_ONLY, reasons=[
+                    DATA_FROM_UPSTREAM if self.template["same_graph"] else DATA_FROM_UPSTREAM_SCOPED])
         for side, metric in (("基准运行", bm), ("这次运行", tm)):
             if metric.get("status") == "missing_input":
                 out["reasons"].append(f"{side}这个指标缺少输入，没有值")
@@ -872,11 +1165,21 @@ class _Compare:
         whole = all(isinstance(m.get("value"), int) for m in (bm, tm))
         delta = _plain(t - b, whole=whole)
         meta = {**tm, "decimals": _places(bm, tm)}
-        out.update(delta=delta, delta_rendered=_signed(meta, delta) if delta != 0 else None,
-                   delta_pct=_plain(round((t - b) / abs(b) * 100, 2), whole=False) if b != 0 else None)
+        out.update(delta=delta, delta_rendered=_signed(meta, delta) if delta != 0 else None, delta_pct=_percent(b, t))
 
-    def _decompose(self, bm: dict[str, Any], tm: dict[str, Any], b: _Card, t: _Card, bp: Any,
-                   tp: Any) -> tuple[dict[str, Any] | None, str | None]:
+    def _decompose(self, out: dict[str, Any], bm: dict[str, Any], tm: dict[str, Any], b: _Card, t: _Card, bp: Any,
+                   tp: Any) -> None:
+        """严格拆分，写进 out 的 decomposition（拆不了的原因写进 decomposition_note）。为了两效应之和在 JSON 里也逐位
+        等于总变化，总变化可能按拆分的精度重写一遍（_split_exact）。"""
+        split, note = self._split(bm, tm, b, t, bp, tp)
+        out["decomposition"], out["decomposition_note"] = split, note
+        if split is not None and "delta" in split:
+            delta = split.pop("delta")
+            meta = {**tm, "decimals": _places(bm, tm)}
+            out.update(delta=delta, delta_rendered=_signed(meta, delta) if delta != 0 else None)
+
+    def _split(self, bm: dict[str, Any], tm: dict[str, Any], b: _Card, t: _Card, bp: Any,
+               tp: Any) -> tuple[dict[str, Any] | None, str | None]:
         """严格拆分：(拆分, None) 或 (None, 为什么没法拆)。"""
         old, new = _exact(bm.get("value")), _exact(tm.get("value"))
         if old is None or new is None:
@@ -899,8 +1202,10 @@ class _Compare:
             return None, SPLIT_MASKED
         for path in leaves:
             change = self.provenance(path, bp.inputs.get(path), t.inputs[path])
-            if change.kind in ("sql", "template", "unknown"):
+            if change.kind in ("sql", "template"):
                 return None, f"旧口径用到的输入取数也有变化，无法严格拆分：{change.reason}"
+            if change.kind == "unknown":
+                return None, f"无法确认旧口径用到的输入只是数据有变化，无法严格拆分：{change.reason}"
         # f_old(x_new)：旧表达式配这次的输入，按推演重算的规则还原、求值，取整按旧口径卡的小数位
         synthetic = {"id": bm.get("id"), "expression": bm.get("expression"), "decimals": bm.get("decimals"),
                      "inputs": [inp.item for inp in used], "substituted": None, "value": None}
@@ -918,10 +1223,14 @@ class _Compare:
         if middle is None:
             return None, "按旧口径在这次的数据上算出的不是有限的数值，无法严格拆分"
         whole = all(isinstance(v, int) and not isinstance(v, bool) for v in (bm.get("value"), tm.get("value"), value))
-        caliber, data = _plain(new - middle, whole=whole), _plain(middle - old, whole=whole)
+        total, caliber_d, data_d = _split_exact(new - old, new - middle)
+        caliber, data = _plain(caliber_d, whole=whole), _plain(data_d, whole=whole)
         meta = {**tm, "decimals": _places(bm, tm)}
-        return {"caliber_effect": caliber, "data_effect": data, "caliber_rendered": _signed(meta, caliber),
-                "data_rendered": _signed(meta, data)}, None
+        split = {"caliber_effect": caliber, "data_effect": data, "caliber_rendered": _signed(meta, caliber),
+                 "data_rendered": _signed(meta, data)}
+        if total != new - old:
+            split["delta"] = _plain(total, whole=whole)
+        return split, None
 
     def _inputs(self, bp: Any, tp: Any) -> list[dict[str, Any]]:
         """两边的输入按路径对齐：值（遮罩列、核对不了遮没遮的不给），各自落在的查询快照。"""
@@ -961,13 +1270,15 @@ class _Compare:
         return next((r for r in found if r["rows"]), found[0] if found else None)
 
     def _attribute(self, b: Any, t: Any) -> dict[str, Any] | None:
-        """一个输入的维度归因：{columns, measure, rows, total_delta, note}；归不了因的照实写在 note 里（rows 为空）。
-        快照里没有可以当维度的列（只有一行汇总这种）返回 None：没什么可归的。"""
+        """一个输入的维度归因：{path, base_artifact, target_artifact, columns, measure, rows, total_delta, note}；
+        归不了因的照实写在 note 里（rows 为空）。快照里没有可以当维度的列（只有一行汇总这种）返回 None：没什么可归的。"""
         measure = _locator(b).get("column")
         if not isinstance(measure, str) or _locator(t).get("column") != measure:
             return None
         sb, st = self._snap(self.base_queries, b), self._snap(self.target_queries, t)
-        empty = {"columns": [], "measure": measure, "rows": [], "total_delta": None}
+        # 归因用的是哪个输入、两边各自哪份快照：一个指标有几个落在快照上的输入时分得清
+        trace = {"path": t.path, "base_artifact": b.snapshot, "target_artifact": t.snapshot}
+        empty = {**trace, "columns": [], "measure": measure, "rows": [], "total_delta": None}
         if sb is None or st is None:
             return {**empty, "note": UNREADABLE_SNAPSHOT}
         for side, snap in (("基准运行", sb), ("这次运行", st)):
@@ -1016,7 +1327,7 @@ class _Compare:
         rows.sort(key=lambda r: -r[0])         # 稳定排序：变化一样大的按先出现的
         if len(rows) > TOP_KEYS:
             notes.append(MORE_KEYS.format(count=len(rows), top=TOP_KEYS))
-        return {"columns": dims, "measure": measure, "rows": [r for _, r in rows[:TOP_KEYS]],
+        return {**trace, "columns": dims, "measure": measure, "rows": [r for _, r in rows[:TOP_KEYS]],
                 "total_delta": _plain(total, whole=False), "note": "；".join(notes) or None}
 
     def _snap(self, queries: list[_Query], inp: Any) -> dict[str, Any] | None:
@@ -1043,24 +1354,48 @@ def _rendered(metric: dict[str, Any] | None) -> str | None:
     return rendered if isinstance(rendered, str) else recompute._render(metric, metric.get("value"))
 
 
-def _caliber_reasons(bm: dict[str, Any], tm: dict[str, Any], bc: dict[str, Any], tc: dict[str, Any]) -> list[str]:
-    """口径变了的地方，一处一句；没变返回空列表。"""
+def _setting(metric: dict[str, Any], definition: dict[str, Any] | None, key: str) -> tuple[bool, Any]:
+    """指标的小数位（decimals）或显示格式（format）：(知不知道, 值)。卡上记了的按卡上的；升级前的卡没记这两项（当时
+    按定义里的小数位取过整），按那次运行图里的指标定义（和当时一样规整）；定义也找不到的不知道，不拿来比。"""
+    if key in metric:
+        value = metric[key]
+        return True, (value or DEFAULT_FORMAT) if key == "format" else value
+    if definition is None:
+        return False, None
+    display, problem = _display_of(definition)
+    return (False, None) if problem else (True, display[key])
+
+
+def _caliber_reasons(bm: dict[str, Any], tm: dict[str, Any], bc: dict[str, Any], tc: dict[str, Any],
+                     defs: tuple[dict[str, Any] | None, dict[str, Any] | None] = (None, None)) -> list[str]:
+    """口径变了的地方，一处一句；没变返回空列表。defs 是两次运行图里这个指标的定义（老卡没记小数位、格式时用）。"""
     out = []
     if _expression(bm) != _expression(tm):
         out.append(f"表达式由「{_shown(bm.get('expression'))}」改为「{_shown(tm.get('expression'))}」")
     before, after = str(bc.get("caliber_version") or ""), str(tc.get("caliber_version") or "")
     if before != after:
         out.append(f"口径版本由 {before or '未设置'} 改为 {after or '未设置'}")
-    if bm.get("decimals") != tm.get("decimals"):
+    (kb, db), (kt, dt) = _setting(bm, defs[0], "decimals"), _setting(tm, defs[1], "decimals")
+    if kb and kt and db != dt:
         def places(d: Any) -> str:
             return "未设置" if d is None else str(d)
-        out.append(f"小数位由 {places(bm.get('decimals'))} 改为 {places(tm.get('decimals'))}")
+        out.append(f"小数位由 {places(db)} 改为 {places(dt)}")
     if (bm.get("unit") or "") != (tm.get("unit") or ""):
         out.append(f"单位由「{bm.get('unit') or '无'}」改为「{tm.get('unit') or '无'}」")
-    fb, ft = bm.get("format") or DEFAULT_FORMAT, tm.get("format") or DEFAULT_FORMAT
-    if fb != ft:
+    (kb, fb), (kt, ft) = _setting(bm, defs[0], "format"), _setting(tm, defs[1], "format")
+    if kb and kt and (fb == _RATIO) != (ft == _RATIO):
+        # 比率（0.087 显示成 8.7%）和普通数值的含义不同；千分位、不分组只是写法，见 _display_change
         out.append(f"显示格式由「{_FORMAT_LABEL.get(fb, fb)}」改为「{_FORMAT_LABEL.get(ft, ft)}」")
     return out
+
+
+def _display_change(bm: dict[str, Any], tm: dict[str, Any],
+                    defs: tuple[dict[str, Any] | None, dict[str, Any] | None]) -> str | None:
+    """只影响显示的格式变化（千分位和不分组互换）：一句说明；没有返回 None。"""
+    (kb, fb), (kt, ft) = _setting(bm, defs[0], "format"), _setting(tm, defs[1], "format")
+    if not (kb and kt) or fb == ft or _RATIO in (fb, ft):
+        return None
+    return f"显示格式由「{_FORMAT_LABEL.get(fb, fb)}」改为「{_FORMAT_LABEL.get(ft, ft)}」"
 
 
 def _input_value(inp: Any) -> Any:
@@ -1075,6 +1410,45 @@ def _input_value(inp: Any) -> Any:
 def _locator(inp: Any) -> dict[str, Any]:
     locator = inp.item.get("locator")
     return locator if isinstance(locator, dict) else {}
+
+
+def _same_input(b: Any, t: Any) -> bool | None:
+    """一个输入两边的值相不相同。容器按还原出来的完整值比（卡上只记了「[2 项]」这样的大概，长度相同、内容不同的
+    不能当一样）；完整值还原不出来时，大概不同的就是不同，大概相同的说不清，返回 None。"""
+    if b.shape == "container" or t.shape == "container":
+        if b.shape == t.shape == "container" and b.problem is None and t.problem is None:
+            return recompute._same(b.value, t.value)
+        return None if recompute._same(b.item.get("value"), t.item.get("value")) else False
+    return recompute._same(b.item.get("value"), t.item.get("value"))
+
+
+def _whole(inp: Any, q: _Query) -> bool:
+    """这个输入引用的是整份查询结果：数组字段的行段从第一行到最后一行，或者容器本身就是整份结果。"""
+    if inp.table:
+        return True
+    return inp.rows is not None and q.snap is not None and inp.rows == (0, len(q.snap["rows"]) - 1)
+
+
+def _rows_text(inp: Any) -> str:
+    if inp.row is not None:
+        return f"第 {inp.row + 1} 行"
+    if inp.rows is not None:
+        return f"第 {inp.rows[0] + 1} 至 {inp.rows[1] + 1} 行"
+    return "整份结果"
+
+
+def _columns_text(columns: Any) -> str:
+    if isinstance(columns, dict):
+        return "「" + "、".join(str(c) for c in columns.values()) + "」"
+    return f"「{columns}」" if columns else "（未记录）"
+
+
+def _merge_inputs(q: _Query) -> dict[str, str] | None:
+    """合并查询的输入：别名 → 上游快照。没记录的返回 None。"""
+    if q.inputs is None:
+        return None
+    return {str(i["alias"]): str(i["artifact"]) for i in q.inputs
+            if isinstance(i, dict) and i.get("alias") and i.get("artifact")}
 
 
 def _records(snap: dict[str, Any], inp: Any) -> list[tuple[int, dict[str, Any]]] | None:

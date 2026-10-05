@@ -149,12 +149,14 @@ async def test_unsealed_runs_are_refused(client):
                               seal=False)
     body = await get(client, f"/api/runs/{target_id}/compare?base={base_id}", 409)
     assert body["code"] == "compare_unsealed" and body["detail"].startswith("这次运行")
+    # 已经结束、只是没有封存清单的：说没有封存清单，不说「运行结束后才能对比」
+    assert "没有封存清单" in body["detail"] and "尚未结束" not in body["detail"]
     body = await get(client, f"/api/runs/{base_id}/compare?base={target_id}", 409)
     assert body["code"] == "compare_unsealed" and body["detail"].startswith("作为基准的运行")
     # 封存过、又被接着运行（还在运行）的：封存范围之后还会变，同样不比
     running = await persist(week("r3", NEXT_ROWS, source=SOURCE), workflow, status="running")
     body = await get(client, f"/api/runs/{running}/compare?base={base_id}", 409)
-    assert body["code"] == "compare_unsealed"
+    assert body["code"] == "compare_unsealed" and "尚未结束" in body["detail"]
 
 
 async def test_a_broken_seal_is_refused(client):
@@ -233,12 +235,15 @@ async def test_masked_columns_never_leave_the_server(client):
 # --------------------------------------------------------------------------
 
 
-async def bare(workflow_id, finished, *, status="succeeded", run_class="formal", schedule_id=None, sealed=True) -> str:
-    """只为挑基准用的运行记录：挑基准只看运行记录上的几列。"""
+async def bare(workflow_id, finished, *, status="succeeded", run_class="formal", schedule_id=None, sealed=True,
+               resumed=False) -> str:
+    """只为挑基准用的运行记录：挑基准只看运行记录上的几列。resumed：结束、封存过又被接着运行（状态已回到运行中，
+    结束时间和封存还没清掉），只能靠状态把它挡在外面。"""
+    done = status in ("succeeded", "failed", "cancelled") or resumed
     async with SessionLocal() as session:
         run = Run(workflow_id=workflow_id, workflow_name="区域周报", status=status, run_class=run_class,
                   schedule_id=schedule_id, started_at=finished - timedelta(minutes=2),
-                  finished_at=finished if status in ("succeeded", "failed", "cancelled") else None,
+                  finished_at=finished if done else None,
                   manifest_hash="ab" * 32 if sealed else None, manifest_seq=1 if sealed else None)
         session.add(run)
         await session.commit()
@@ -271,6 +276,7 @@ async def test_the_default_base_skips_what_cannot_be_compared(client):
     good = await bare(workflow, T0)
     await bare(workflow, T0 + day, sealed=False)                       # 没封存
     await bare(workflow, T0 + 2 * day, status="running")               # 还在运行
+    await bare(workflow, T0 + 2 * day, status="running", resumed=True)  # 结束过、又被接着运行
     await bare(workflow, T0 + 3 * day, run_class="exploratory")        # 别的运行类别
     await bare(await new_workflow("另一个周报"), T0 + 4 * day)          # 别的工作流
     current = await bare(workflow, T0 + 5 * day)

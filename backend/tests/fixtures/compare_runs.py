@@ -12,6 +12,7 @@ from app.core.artifact_store import canonical_json, content_hash
 from app.engine import compare, recompute
 from app.engine.evidence import render_number
 from app.engine.expressions import parse_expression, substitute
+from app.engine.merge_query import MERGE_SOURCE
 
 TOOL = "db_query__shop"
 WEEK36 = ("2026-08-31", "2026-09-06")
@@ -110,15 +111,15 @@ class Fake:
         return artifact
 
     def agent(self, node_id, sql, columns=COLUMNS, rows=BASE_ROWS, *, types=TYPES, truncated=False, masks=None,
-              verify=()):
-        """Agent 节点自己查一次库，按出处交回数组字段 amounts（快照 gmv 列的全部行）。verify 是同一节点里核查类的
-        查询（role: verify，不进台账）。"""
+              verify=(), column="gmv", span=None):
+        """Agent 节点自己查一次库，按出处交回数组字段 amounts（默认是快照 gmv 列的全部行；column、span 改引用的列和
+        行段）。verify 是同一节点里核查类的查询（role: verify，不进台账）。"""
         artifact = self.snapshot(sql, columns, rows, truncated=truncated, types=types, masks=masks)
-        last = len(rows) - 1
-        gmv = columns.index("gmv")
-        data = {"amounts": [r[gmv] for r in rows]}
-        evidence = {"amounts": {"ref": f"Q1.r0-{last}.gmv", "call": "Q1", "artifact": artifact,
-                                "locator": {"rows": [0, last], "column": "gmv"}, "status": "verified"}}
+        first, last = span or (0, len(rows) - 1)
+        at = columns.index(column)
+        data = {"amounts": [r[at] for r in rows[first:last + 1]]}
+        evidence = {"amounts": {"ref": f"Q1.r{first}-{last}.{column}", "call": "Q1", "artifact": artifact,
+                                "locator": {"rows": [first, last], "column": column}, "status": "verified"}}
         output = self.put({"text": "按区域列出了金额", "data": data, "data_evidence": evidence})
         self.add("node.started", node_id, {"node_type": "agent"})
         self.add("tool.start", node_id, {"tool": TOOL, "args": {"sql": sql}, "call_id": "c1"})
@@ -128,6 +129,40 @@ class Fake:
             self.add("tool.end", node_id, {"tool": TOOL, "call_id": f"v{i}", "role": "verify", "query_artifact": check})
         self.add("node.finished", node_id, {"duration_ms": 9, "attempt": 1, "artifact": output, "evidence": [
             self.entry(node_id, artifact, columns, rows, call_id="c1", truncated=truncated)]})
+        return artifact
+
+    def plain_agent(self, node_id, sqls, data, columns=COLUMNS, rows=BASE_ROWS, *, types=TYPES):
+        """没开按出处核对的 Agent：查几次库，交回的 data 没有出处（data_evidence），口径卡只知道是它写的。"""
+        self.add("node.started", node_id, {"node_type": "agent"})
+        entries = []
+        for i, sql in enumerate(sqls):
+            artifact = self.snapshot(sql, columns, rows, types=types)
+            self.add("tool.start", node_id, {"tool": TOOL, "args": {"sql": sql}, "call_id": f"c{i}"})
+            self.add("tool.end", node_id, {"tool": TOOL, "call_id": f"c{i}", "duration_ms": 5,
+                                           "query_artifact": artifact})
+            entries.append(self.entry(node_id, artifact, columns, rows, call_id=f"c{i}"))
+        output = self.put({"text": "按区域分析了金额", "data": data})
+        self.add("node.finished", node_id, {"duration_ms": 9, "attempt": 1, "artifact": output, "evidence": entries})
+
+    def merge(self, node_id, sql, inputs, columns, rows, *, types=None):
+        """合并查询：几份上游快照按别名落进内存库，再执行一条合并 SQL。快照里记着各个输入（别名、节点、快照），
+        事件照合并节点的形状写（merge.end 加 node.finished 台账里的 query 条目，没有 tool.end）。
+        inputs 是 [(别名, 上游节点, 上游快照)]。"""
+        snap = {"columns": columns, "rows": rows, "row_count": len(rows), "truncated": False, "sql": sql,
+                "source": MERGE_SOURCE, "sources": [self.source],
+                "inputs": [{"alias": alias, "node_id": upstream, "artifact": artifact,
+                            "rows": len(self.store[artifact]["rows"]), "columns": self.store[artifact]["columns"],
+                            "source": self.store[artifact].get("source")} for alias, upstream, artifact in inputs],
+                "warnings": [], **({"column_types": types} if types else {})}
+        artifact = self.put(snap)
+        self.queries.append(artifact)
+        output = self.put({**snap, "artifact": artifact})
+        view = [{k: v for k, v in item.items() if k != "columns"} for item in snap["inputs"]]
+        self.add("node.started", node_id, {"node_type": "merge"})
+        self.add("merge.end", node_id, {"inputs": view, "sql": sql, "rows": len(rows), "query_artifact": artifact})
+        self.add("node.finished", node_id, {"duration_ms": 2, "attempt": 1, "artifact": output, "evidence": [
+            {"kind": "query", "node_id": node_id, "exec": 1, "artifact": artifact, "source": MERGE_SOURCE,
+             "columns": columns, "rows": len(rows), "truncated": False}]})
         return artifact
 
     def code(self, node_id, value, var):
@@ -169,11 +204,12 @@ def cell_in(row, column, value, artifact, node_id="fetch"):
             "eid": f"ev:cell:{artifact[:8]}:{row}:{column}", "status": "verified"}
 
 
-def amounts_in(artifact, rows):
-    last = len(rows) - 1
-    return {"path": "vars.kpi.amounts", "value": f"[{len(rows)} 项]", "node_id": "bot", "via": "agent_field",
-            "field": "amounts", "ref": f"Q1.r0-{last}.gmv", "artifact": artifact,
-            "locator": {"rows": [0, last], "column": "gmv"}, "eid": f"ev:rows:{artifact[:8]}", "status": "verified"}
+def amounts_in(artifact, rows, *, column="gmv", span=None):
+    first, last = span or (0, len(rows) - 1)
+    return {"path": "vars.kpi.amounts", "value": f"[{last - first + 1} 项]", "node_id": "bot", "via": "agent_field",
+            "field": "amounts", "ref": f"Q1.r{first}-{last}.{column}", "artifact": artifact,
+            "locator": {"rows": [first, last], "column": column}, "eid": f"ev:rows:{artifact[:8]}:{first}:{column}",
+            "status": "verified"}
 
 
 def scalar_in(path, value, node_id, via):

@@ -7,8 +7,8 @@ GET /api/runs/{run_id}/compare/base：默认拿哪一次来比，{base_run_id, r
 
 GET /api/runs/{run_id}/compare?base={base_id}：{target, base, summary, template, metrics, queries, notes}，每个字段
 的形状见 engine/compare.py。两次运行都必须已结束、封存且封存核对一致，封存判定照搬证据接口（api/evidence._sealed）：
-没封存的运行事件还会变，封存核对不一致的事件被改过，拿它们比出来的结论都不作数，回 409。不是同一个工作流、或者
-是同一次运行，回 422。
+没封存的运行事件还会变，封存核对不一致的事件被改过，拿它们比出来的结论都不作数，回 409（还没结束的和已经结束却没有
+封存清单的分开说：后者再等也等不来封存）。不是同一个工作流、或者是同一次运行，回 422。
 
 只读：两次运行都不追加事件、不落工件、不改运行记录；结果只交回给发请求的人。只认各自封存范围内的工件（证据接口的
 白名单，加上封存的节点产出和指标集里写着的完整值，同推演），遮罩列（查询当时记下的加数据源现在设的）的值不出现在
@@ -48,6 +48,8 @@ SAME_RUN = "不能和同一次运行自己对比，请选择另一次运行作�
 UNSAVED = "{who}不属于任何已保存的工作流，无法确认两次运行是同一个工作流，不能对比"
 OTHER_WORKFLOW = "两次运行不属于同一个工作流（「{target}」与「{base}」），不能对比"
 UNSEALED_TEXT = "{who}尚未结束并封存：对比只用封存的运行记录，运行结束后才能对比"
+#: 已经结束、只是没有封存清单（封存上线前结束的、结束时没封上的）：再等也等不来封存，不能说「运行结束后才能对比」
+NO_MANIFEST_TEXT = "{who}没有封存清单，不能用于对比"
 SEAL_BROKEN_TEXT = "{who}的封存核对不一致：封存后有事件被修改、删除或插入，不能用于对比。可在记录页点「核对」查看核对结果"
 NO_BASE_TEXT = ("没有找到可以对比的上一次运行：需要同一工作流、同一运行类别（定时任务发起的优先找同一定时任务）、"
                 "更早结束并已封存的运行")
@@ -120,8 +122,10 @@ async def compare_runs(run_id: str, base_id: str) -> dict[str, Any]:
     sealed = []
     for run, who in ((target, TARGET), (base, BASE)):
         found = await _sealed(run.id)
-        if not found.sealed or found.status not in _TERMINAL:
+        if found.status not in _TERMINAL:
             raise CodedHTTPException(409, UNSEALED_TEXT.format(who=who), UNSEALED)
+        if not found.sealed:
+            raise CodedHTTPException(409, NO_MANIFEST_TEXT.format(who=who), UNSEALED)
         if not found.trusted:
             raise CodedHTTPException(409, SEAL_BROKEN_TEXT.format(who=who), SEAL_BROKEN)
         sealed.append(found)
