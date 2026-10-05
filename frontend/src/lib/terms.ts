@@ -2751,8 +2751,11 @@ export const RUN_COMPARE_TEXT = {
   // 入口：运行详情的「更多」菜单
   menu: '与上一次对比',
   menuSealedOnly: '运行结束并封存后才能对比',
+  /** 没有 workflow_id 的运行：画布、问数据里没保存就运行的，或者工作流删掉之后被置空的。服务端只比同一个已保存的工作流 */
+  menuNoWorkflow: '工作流未保存或已删除，无法对比',
   menuFinding: '正在查找上一次运行…',
   pickManually: '手动选择基准',
+  retry: '重试',
   // 顶部的两次运行
   base: '基准',
   target: '本次',
@@ -2763,6 +2766,7 @@ export const RUN_COMPARE_TEXT = {
   unsealed: '未封存',
   unsealedHint: '这次运行没有封存清单，不能参与对比',
   runFailed: '无法读取这次运行',
+  runMissing: '运行记录不存在',
   noBase: '未选择',
   reason: {
     same_schedule: '默认基准：同一定时任务的上一次运行',
@@ -2773,25 +2777,37 @@ export const RUN_COMPARE_TEXT = {
   pickLoading: '正在读取同一工作流的运行…',
   pickFailed: '无法读取同一工作流的运行',
   pickNone: '同一工作流没有其他运行',
-  pickUnsaved: '临时构建的工作流没有其他运行可选',
+  pickUnsaved: '工作流未保存或已删除，没有可对比的运行',
   pickPlaceholder: '选择一次运行作为基准',
   /** 下拉里的一次运行：时间 · 类别和版本 · 短 id，没封存的另标 */
   pickOption: (time: string, cls: string, id: string, sealed: boolean) =>
     `${time} · ${cls} · ${id}${sealed ? '' : '（未封存）'}`,
+  /** 当前的基准读不到时下拉里的那一项（短 id）：如实显示选的是哪一次 */
+  pickGone: (id: string, missing: boolean) => `${id}（${missing ? '记录不存在' : '无法读取'}）`,
   // 页面状态
   noTarget: '未指定要对比的运行',
   noTargetHint: '在运行详情的「更多」菜单中选择「与上一次对比」，即可对照本次与上一次运行',
   toRuns: '前往记录',
   finding: '正在查找基准运行…',
   loading: '正在对比两次运行…',
-  errSealed: '无法对比：有运行未封存或封存核对未通过',
-  errSealedHint: '两次运行都需已结束并封存，且封存核对一致。可在运行详情的封存凭证条上核对',
+  // 对比失败：标题说是哪一种，服务端的原因原样跟在后面，最后一句下一步只写界面上真有的入口，服务端已经写了的不再重复
+  errSealed: '无法对比：有运行未封存或封存核对不一致',
+  errUnsealed: '无法对比：有运行尚未结束并封存',
+  errSealBroken: '无法对比：封存核对不一致',
+  /** 409 时不知道（或者知道不是）本次的问题：服务端的原因里写着是哪一次 */
+  errSealedHint: '若是基准运行的问题，可在上方更换基准',
   errMismatch: '无法对比这两次运行',
-  errMismatchHint: '请选择同一工作流的另一次运行作为基准',
+  errMismatchHint: '可在上方选择同一工作流的另一次运行作为基准',
+  /** 本次没有 workflow_id：哪一次都比不了，不给下一步 */
+  errUnsaved: '无法对比：本次运行的工作流未保存或已删除',
   errMissing: '运行记录不存在',
   errMissingHint: '链接可能已失效，请从记录页重新打开',
+  /** 本次的记录读得到、对比却回 404：缺的是基准 */
+  errBaseMissingHint: '可在上方选择另一次运行作为基准',
   errNoBase: '未找到可作为基准的运行',
   errNoBaseHint: '可在上方选择同一工作流的其他运行作为基准',
+  /** 下拉里一次能选的都没有（只有本次、或者都没封存） */
+  errNoBaseNone: '同一工作流还没有其他已封存的运行',
   viewBase: '查看基准运行',
   viewTarget: '查看本次运行',
   // 摘要
@@ -2807,11 +2823,12 @@ export const RUN_COMPARE_TEXT = {
     incomparable: '无法比较',
     unchanged: '未变',
   } as Record<string, string>,
+  // 照服务端（engine/compare.py）的分类口径写：口径变了含小数位、单位、显示格式，SQL 结构变含上游节点改配置
   classHint: {
     data_only: '口径与 SQL 都没有改动，变化来自数据',
-    caliber_and_data: '口径卡的计算式有改动，数据也变了；能严格拆分的分别给出口径效应和数据效应',
-    sql_changed: '所依据的查询 SQL 结构有改动，口径不同，不做拆分',
-    params_only: '所依据的查询 SQL 结构相同，只有参数（如日期）不同',
+    caliber_and_data: '口径（计算式、口径版本、小数位、单位或显示格式）有改动，数据可能也有变化；能严格拆分的分别给出口径效应和数据效应',
+    sql_changed: '取数的 SQL 或上游节点的配置有改动，无法在口径与数据之间拆分',
+    params_only: '所依据的查询 SQL 结构相同，只有参数（如日期）或运行输入不同',
     added: '本次有、基准没有的指标',
     removed: '基准有、本次没有的指标',
     incomparable: '缺少比较所需的信息，无法判断变化来自哪里',
@@ -2824,6 +2841,8 @@ export const RUN_COMPARE_TEXT = {
   metrics: '指标',
   metricsEmpty: '两次运行的口径卡上都没有指标',
   count: (n: number) => `${formatNumber(n)} 个`,
+  /** 查询按「条」数，和「第 N 条」一致 */
+  queryCount: (n: number) => `${formatNumber(n)} 条`,
   colMetric: '指标',
   colBase: '基准',
   colTarget: '本次',
@@ -2850,6 +2869,17 @@ export const RUN_COMPARE_TEXT = {
   attrMore: (n: number) => `另有 ${formatNumber(n)} 项未列出`,
   attrTotal: (value: string) => `合计变化 ${value}`,
   attrNone: '没有可按维度归因的明细',
+  /**
+   * 服务端只对只数据变、只参数变、口径与数据都变的指标做维度归因（两边的行说的是同一回事）。别的类不是「没有明细」，
+   * 是有意不做：写明为什么
+   */
+  attrSkipped: {
+    sql_changed: '取数的 SQL 或上游配置有改动，两边的行不能直接对照，不做维度归因',
+    incomparable: '无法判断变化来源，不做维度归因',
+    added: '基准没有这个指标，不做维度归因',
+    removed: '本次没有这个指标，不做维度归因',
+    unchanged: '数值没有变化，不做维度归因',
+  } as Record<string, string>,
   /** 服务端没给占比、也没说为什么时的说法 */
   attrNoShare: '无法计算各项占比',
   colKey: '维度',
@@ -2867,7 +2897,8 @@ export const RUN_COMPARE_TEXT = {
   structureHint: {
     same: 'SQL 完全相同',
     params_only: 'SQL 结构相同，只有字面量不同',
-    changed: 'SQL 结构不同：表、连接、筛选条件、分组或聚合有改动',
+    // 服务端在只换了数据源、有一边的 SQL 读不出来时也标「结构变」
+    changed: 'SQL 结构或数据源不同，或有一边的 SQL 无法读取',
     added: '本次新增的查询，基准中没有',
     removed: '基准中有、本次没有的查询',
   } as Record<string, string>,
@@ -2883,6 +2914,8 @@ export const RUN_COMPARE_TEXT = {
   baseSql: '基准的 SQL',
   targetSql: '本次的 SQL',
   bothSql: '两次相同的 SQL',
+  /** 快照读不出来、又拿不到执行时的参数：这一边没有 SQL，不能拿空串去和另一边比 */
+  sqlUnreadable: '这一边的 SQL 无法读取',
   onlyBase: '基准独有',
   onlyTarget: '本次独有',
   showSql: '查看 SQL',

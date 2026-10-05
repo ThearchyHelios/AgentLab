@@ -34,8 +34,19 @@ export function classTone(k: string): { color: string; soft: boolean } {
 /** 一个指标在表里的键：同一张卡里指标 id 唯一，几张卡之间可能重名 */
 export const metricKey = (m: Pick<RunCompareMetric, 'card_id' | 'metric_id'>) => `${m.card_id}:${m.metric_id}`
 
-/** 一条查询的键：同一节点里按服务端的序号区分 */
-export const queryKey = (q: Pick<RunCompareQuery, 'node_id' | 'ordinal'>) => `${q.node_id}:${q.ordinal}`
+/**
+ * 「拆分或原因」一栏没有拆分时写的那句话：服务端写了「为什么没拆」就用它。无法比较、新增、移除的服务端不写这一项，
+ * 原因只在 reasons 里——退回写 reasons 的第一句（全部在展开的变化说明里），不让这一栏只剩一个「—」、要展开才知道
+ * 为什么。SQL 结构变的服务端一向写着，万一没写，reasons 说的就是哪条查询变了，也是不拆的原因。只数据变、只参数变、
+ * 未变的本来就用不着拆；口径与数据都变的服务端总会给拆分或原因，它的 reasons 说的是口径改了什么、不是为什么不拆，
+ * 都不退回
+ */
+const REASON_IN_CELL = new Set<string>(['incomparable', 'added', 'removed', 'sql_changed'])
+
+export function splitReason(m: Pick<RunCompareMetric, 'classification' | 'decomposition_note' | 'reasons'>): string | null {
+  if (m.decomposition_note) return m.decomposition_note
+  return REASON_IN_CELL.has(m.classification) && m.reasons?.length ? m.reasons[0] : null
+}
 
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
 
@@ -92,19 +103,29 @@ export function sameValue(a: unknown, b: unknown): boolean {
   }
 }
 
+/** 查询区的一项：位置键（同一对比里唯一）和同一节点里的「第 N 条」（节点只有一条时为 null） */
+export interface QueryItem {
+  q: RunCompareQuery
+  key: string
+  nth: number | null
+}
+
 /**
- * 同一节点有几条查询时，界面按 1 起数写「第 N 条」。服务端的 ordinal 只用来排先后：它从 0 还是从 1 数、中间有没有
- * 空号（只有一边有的那条），都不该漏到界面上
+ * 查询区按服务端给的先后列：服务端已经按本次的先后排好，基准多出来的接在后面。同一节点有几条时，按在列表里出现的
+ * 先后从 1 数「第 N 条」，键是「节点:第几」。
+ *
+ * 不拿服务端的 ordinal 当键、也不按它编号：配上的一对取本次的序号，落单的基准查询取基准的序号，Agent 换了查询的先后
+ * 时两者会撞上（同一节点两条都是 1），按它当键 React 会报键冲突、编号会重复或缺号
  */
-export function queryNumbers(queries: RunCompareQuery[]): Map<string, number | null> {
-  const byNode = new Map<string, RunCompareQuery[]>()
-  for (const q of queries) byNode.set(q.node_id, [...(byNode.get(q.node_id) ?? []), q])
-  const out = new Map<string, number | null>()
-  for (const list of byNode.values()) {
-    const sorted = [...list].sort((a, b) => a.ordinal - b.ordinal)
-    sorted.forEach((q, i) => out.set(queryKey(q), list.length > 1 ? i + 1 : null))
-  }
-  return out
+export function queryItems(queries: RunCompareQuery[]): QueryItem[] {
+  const total = new Map<string, number>()
+  for (const q of queries) total.set(q.node_id, (total.get(q.node_id) ?? 0) + 1)
+  const seen = new Map<string, number>()
+  return queries.map((q) => {
+    const n = (seen.get(q.node_id) ?? 0) + 1
+    seen.set(q.node_id, n)
+    return { q, key: `${q.node_id}:${n}`, nth: (total.get(q.node_id) ?? 0) > 1 ? n : null }
+  })
 }
 
 /**
@@ -115,6 +136,14 @@ export type CompareErrorKind = '409' | '422' | '404' | 'no-base' | 'other'
 
 /** 服务端「运行记录不存在」的机读码（api/evidence.py 的 RUN_NOT_FOUND，运行对比的接口沿用） */
 const RUN_NOT_FOUND = 'run_not_found'
+/** 409 的两种机读码（api/compare.py）：没结束封存、封存核对不一致。标题按它分开写 */
+export const UNSEALED = 'compare_unsealed'
+export const SEAL_BROKEN = 'compare_seal_broken'
+
+/** 请求回的是 404（记录不存在）：和连不上、服务端出错分开说，前者重试也没用 */
+export function isGone(e: unknown): boolean {
+  return e instanceof ApiError && e.kind === 'http' && e.status === 404
+}
 
 export function compareErrorKind(e: unknown, finding: boolean): CompareErrorKind {
   if (!(e instanceof ApiError) || e.kind !== 'http') return 'other'

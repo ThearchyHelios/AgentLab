@@ -5,7 +5,7 @@ import { NONE } from '../../../lib/format'
 import { RUN_COMPARE_TEXT as T } from '../../../lib/terms'
 import type { RunCompareAttribution, RunCompareDecomposition, RunCompareMetric } from '../../../types'
 import { Block, ClassChip } from './parts'
-import { changeText, metricKey, sameValue, shareText, signedNumber, valueText } from './model'
+import { changeText, metricKey, sameValue, shareText, signedNumber, splitReason, valueText } from './model'
 
 /** 维度归因列前几项：后端按变化从大到小排好，多的只写还有几项 */
 const ATTR_TOP = 10
@@ -20,7 +20,7 @@ const STICKY = 'sticky left-0 z-[1] min-w-[9em] shadow-[inset_-1px_0_0_var(--bor
 
 /**
  * 指标表：基准 → 本次、变化量和百分比（渲染值照服务端给的写）、分类、能严格拆分的口径效应和数据效应（并列的数加一段
- * 两截的条形），不能拆的写服务端给的原因。每行能展开：变化说明、输入对比、维度归因前 10 项。
+ * 两截的条形），不能拆、比不了的写原因（splitReason）。每行能展开：变化说明、输入对比、维度归因前 10 项。
  *
  * 表格比窄屏宽，在自己的框里横向滚动（框能用键盘聚焦），页面本身不横向溢出。展开的明细贴着框的左边、宽度等于框的
  * 可见宽度：窄屏上不用横着滚也读得全
@@ -104,6 +104,7 @@ function MetricRows({ m, k, detailId, open, onToggle }: {
   m: RunCompareMetric; k: string; detailId: string; open: boolean; onToggle: () => void
 }) {
   const pct = m.delta_pct != null && m.delta_pct !== 0 ? changeText(m.delta_pct) : null
+  const why = m.decomposition ? null : splitReason(m)
   return (
     <Fragment>
       <tr className={clsx('border-b align-top last:border-0', open && 'bg-hover')} data-compare-metric={k} data-class={m.classification}>
@@ -129,9 +130,10 @@ function MetricRows({ m, k, detailId, open, onToggle }: {
         <td className="px-2.5 py-2">
           {m.decomposition ? (
             <Split d={m.decomposition} total={totalText(m)} />
-          ) : m.decomposition_note ? (
-            <p className="max-w-[280px] text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-compare-decomp-note="">
-              {m.decomposition_note}
+          ) : why ? (
+            <p className="max-w-[280px] text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-compare-decomp-note=""
+               data-from={m.decomposition_note ? 'note' : 'reasons'}>
+              {why}
             </p>
           ) : (
             <span className="text-faint">{NONE}</span>
@@ -199,7 +201,11 @@ function Split({ d, total }: { d: RunCompareDecomposition; total: string }) {
   )
 }
 
-/** 展开的明细：变化说明、拆分写成一句话、输入对比、维度归因。贴着滚动框的左边，宽度等于框的可见宽度 */
+/**
+ * 展开的明细：变化说明、拆分写成一句话（不能拆的写服务端说的为什么）、输入对比、维度归因。贴着滚动框的左边，宽度
+ * 等于框的可见宽度：窄屏上表格里「拆分或原因」那一格比钉在左边的指标名右侧剩下的地方宽，横着滚到哪儿都看不全，
+ * 这里读得全
+ */
 function MetricDetail({ m }: { m: RunCompareMetric }) {
   return (
     <div className="sticky left-0 box-border grid gap-4 px-3 py-3 lg:grid-cols-2" style={{ width: 'var(--compare-view, 100%)' }}>
@@ -212,15 +218,17 @@ function MetricDetail({ m }: { m: RunCompareMetric }) {
             </ul>
           </div>
         )}
-        {m.decomposition && (
+        {m.decomposition ? (
           <p className="text-xs leading-relaxed text-fg" data-compare-decomp-sum="">
             {T.splitSum(m.decomposition.caliber_rendered, m.decomposition.data_rendered, totalText(m))}
           </p>
-        )}
+        ) : m.decomposition_note ? (
+          <p className="text-xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-compare-detail-note="">{m.decomposition_note}</p>
+        ) : null}
         <Inputs m={m} />
       </div>
       <div className="min-w-0">
-        <Attribution a={m.attribution} />
+        <Attribution a={m.attribution} classification={m.classification} />
       </div>
     </div>
   )
@@ -270,14 +278,17 @@ function Inputs({ m }: { m: RunCompareMetric }) {
 /**
  * 维度归因：按键对齐两边查询结果的行，列前 10 项的键、两边的值、变化和占比。占比只在度量列之和等于指标的输入时才有，
  * 没有时那一栏写「—」，下面照服务端的说明写原因（没给说明时写一句通用的）。归不了因的（查询结果截断、度量列遮罩、
- * 快照读不出来）服务端给空的 rows 和一句说明：不画空表，只写这句话
+ * 快照读不出来）服务端给空的 rows 和一句说明：不画空表，只写这句话。服务端有意不做归因的几类（SQL 结构变、无法
+ * 比较、新增、移除、未变）写为什么不做，不说成「没有明细」
  */
-function Attribution({ a }: { a: RunCompareAttribution | null }) {
+function Attribution({ a, classification }: { a: RunCompareAttribution | null; classification: string }) {
   if (!a) {
     return (
       <div>
         <h3 className="mb-1 text-2xs font-medium text-faint">{T.attribution}</h3>
-        <p className="text-2xs text-faint" data-compare-attr-none="">{T.attrNone}</p>
+        <p className="text-2xs leading-relaxed text-faint [overflow-wrap:anywhere]" data-compare-attr-none="">
+          {T.attrSkipped[classification] ?? T.attrNone}
+        </p>
       </div>
     )
   }

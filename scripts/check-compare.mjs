@@ -5,6 +5,9 @@
 // 渲染的写法对不上）；不能拆的一声不吭；展开后归因只给数没有占比时不说为什么；SQL 结构变了只给一条、差异不标；
 // 换了基准、互换了却不重新请求，或者慢的旧答复盖掉新的；409（未封存、封存核对不一致）、422（不是同一工作流）、
 // 404（找不到基准）只弹一句通用报错；窄屏（390px）被表格撑出横向滚动；浅色下分类标签、差异高亮看不清。
+// 还有几处照服务端（engine/compare.py、api/compare.py）的实际输出才看得出来的：无法比较的指标原因只在 reasons 里；
+// 同一节点两条查询的 (node_id, ordinal) 相同；一边的 SQL 是 null；基准运行读不到；本次的记录读不到；不属于已保存
+// 工作流的运行；查找基准期间离开运行详情。下一步的提示要和页面上真能做的事对得上。
 //
 // 全部用 page.route 假接口：虚构的「区域销售周报」三次已封存的正式运行和一次没封存的，运行详情、运行列表、
 // compare/base、compare 都在浏览器层答掉，别的 GET 放行（外壳要的工作流、待审批），非 GET 一律拦掉。
@@ -12,7 +15,7 @@
 //
 //   node scripts/check-compare.mjs
 // 对别的实例跑时带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-compare.mjs
-// COMPARE_SHOTS=<目录> 时亮暗、宽窄各截几张，供人眼复核。
+// COMPARE_SHOTS=<目录> 时亮暗、宽窄各截几张，供人眼复核。COMPARE_ONLY=查询,窄屏 只跑标题里带这几截的段。
 import { mkdirSync } from 'node:fs'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 
@@ -21,12 +24,17 @@ const CHROME = process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Conte
 const SHOTS = process.env.COMPARE_SHOTS ?? ''
 
 let failed = 0
+let ran = 0
 const check = (name, cond, detail = '') => {
   console.log(`  ${cond ? '✓' : '✗'} ${name}${detail ? ` — ${detail}` : ''}`)
+  ran++
   if (!cond) failed++
 }
+// 只跑其中几段：COMPARE_ONLY=<段标题里的一截>,<…>，改样式、补用例时省时间（check-all 不往下传）
+const ONLY = (process.env.COMPARE_ONLY ?? '').split(',').filter(Boolean)
 const opened = new Set()
 async function section(name, fn) {
+  if (ONLY.length && !ONLY.some((part) => name.includes(part))) return
   console.log(`\n=== ${name} ===`)
   try {
     await fn()
@@ -79,6 +87,13 @@ const ALL_ROWS = REGIONS.map((name, i) => ({
 }))
 const MORE_KEYS = '共 12 个维度值，列出变化最大的 10 个'
 
+// 服务端（engine/compare.py）的原话：SQL 结构变的一律带这句「为什么没拆」；无法比较的只写 reasons，
+// decomposition_note 为 null（新增、移除也一样）——夹具照这个形状给，检查才走得到真实的路径
+const SQL_NOT_SPLIT = '取数的 SQL 或上游配置有变化，变化无法在口径与数据之间拆分'
+const NO_LINEAGE = '口径卡没有记录输入（生成于系统升级前），无法判断变化来源'
+const ADDED_WHY = '基准运行的口径卡「周报口径」里没有这个指标'
+const REMOVED_WHY = '这次运行的口径卡「周报口径」里没有这个指标'
+
 const metric = (over) => ({
   card_id: 'caliber', card_title: '周报口径', unit: '', decimals: 1, reasons: [], decomposition: null,
   decomposition_note: null, inputs: [], attribution: null, delta_pct: null, ...over,
@@ -104,8 +119,7 @@ const METRICS = [
         { key: ['白石区', '线上'], base: 300, target: 327, delta: 27, share: null }] } }),
   metric({ metric_id: 'refund_rate', name: '退货率', unit: '%', decimals: 2, base: 0.0235, target: 0.0198, base_rendered: '2.35%',
     target_rendered: '1.98%', delta: -0.0037, delta_rendered: '-0.37 个百分点', delta_pct: -15.74, classification: 'sql_changed',
-    reasons: ['所依据的查询「退货明细」的筛选条件有改动'],
-    decomposition_note: '所依据的查询「退货明细」SQL 结构有改动，口径不同，不做拆分' }),
+    reasons: ['查询「退货明细」的 SQL 结构有变化：时间条件的列不同'], decomposition_note: SQL_NOT_SPLIT }),
   metric({ metric_id: 'visitors', name: '日均访客', unit: '人', decimals: 0, base: 5200, target: 5480, base_rendered: '5,200人',
     target_rendered: '5,480人', delta: 280, delta_rendered: '+280人', delta_pct: 5.38, classification: 'params_only',
     reasons: ['「拉取销量」只有日期参数不同'],
@@ -113,12 +127,12 @@ const METRICS = [
     attribution: { columns: [], measure: 'visits', rows: [], total_delta: null,
       note: '查询结果被截断（基准运行只取回了前 500 行），不做维度归因' } }),
   metric({ metric_id: 'new_users', name: '新客数', unit: '人', decimals: 0, base: null, target: 320, base_rendered: '—',
-    target_rendered: '320人', delta: null, delta_rendered: null, classification: 'added', reasons: ['本次新增的指标'] }),
+    target_rendered: '320人', delta: null, delta_rendered: null, classification: 'added', reasons: [ADDED_WHY] }),
   metric({ metric_id: 'members', name: '会员数', unit: '人', decimals: 0, base: 8800, target: null, base_rendered: '8,800人',
-    target_rendered: '—', delta: null, delta_rendered: null, classification: 'removed', reasons: ['本次没有这个指标'] }),
+    target_rendered: '—', delta: null, delta_rendered: null, classification: 'removed', reasons: [REMOVED_WHY] }),
   metric({ metric_id: 'margin', name: '毛利率', unit: '%', decimals: 1, base: 0.31, target: 0.33, base_rendered: '31.0%',
     target_rendered: '33.0%', delta: 0.02, delta_rendered: '+2.0 个百分点', delta_pct: 6.45, classification: 'incomparable',
-    reasons: ['基准运行的口径卡没有记录输入'], decomposition_note: '基准运行的口径卡没有记录输入，无法拆分' }),
+    reasons: [NO_LINEAGE] }),
   ...[['stores', '门店数', '家', 56], ['complaints', '客诉数', '件', 12], ['sku', 'SKU 数', '个', 1500]].map(([id, name, unit, v]) =>
     metric({ metric_id: id, name, unit, decimals: 0, base: v, target: v, base_rendered: `${v.toLocaleString('en-US')}${unit}`,
       target_rendered: `${v.toLocaleString('en-US')}${unit}`, delta: 0, delta_rendered: null, delta_pct: 0, classification: 'unchanged' })),
@@ -126,23 +140,24 @@ const METRICS = [
 const SUMMARY = { unchanged: 3, data_only: 2, caliber_and_data: 1, sql_changed: 1, params_only: 1, added: 1, removed: 1, incomparable: 1 }
 const PULL_BASE = "SELECT region, SUM(amount) AS gmv FROM sales WHERE sold_on >= '2026-09-21' AND sold_on < '2026-09-28' GROUP BY region"
 const PULL_TARGET = "SELECT region, SUM(amount) AS gmv FROM sales WHERE sold_on >= '2026-09-28' AND sold_on < '2026-10-05' GROUP BY region"
+// ordinal 照服务端从 1 数（同一节点里第几次查询）；查询项的位置键（data-compare-query）是「节点:同一节点里排第几」
 const QUERIES = [
-  { node_id: 'pull', node_title: '拉取销量', ordinal: 0, structure: 'params_only', base_sql: PULL_BASE, target_sql: PULL_TARGET,
+  { node_id: 'pull', node_title: '拉取销量', ordinal: 1, structure: 'params_only', base_sql: PULL_BASE, target_sql: PULL_TARGET,
     literals: [{ base: "'2026-09-21'", target: "'2026-09-28'" }, { base: "'2026-09-28'", target: "'2026-10-05'" }],
     base_rows: 12, target_rows: 12, base_truncated: false, target_truncated: false },
-  { node_id: 'refund', node_title: '退货明细', ordinal: 0, structure: 'changed',
+  { node_id: 'refund', node_title: '退货明细', ordinal: 1, structure: 'changed',
     base_sql: "SELECT COUNT(*) AS n\nFROM refunds r\nWHERE r.created_at >= '2026-09-21'",
     target_sql: "SELECT COUNT(*) AS n\nFROM refunds r\nWHERE r.paid_at >= '2026-09-28' AND r.status = 'done'",
     literals: [], base_rows: 500, target_rows: 488, base_truncated: true, target_truncated: false,
     differences: ['时间条件的列不同：基准按 refunds.created_at，这次按 refunds.paid_at', "这次多了筛选条件 refunds.status = 'done'"] },
-  { node_id: 'stores', node_title: '门店清单', ordinal: 0, structure: 'same', base_sql: 'SELECT COUNT(*) AS n FROM stores',
+  { node_id: 'stores', node_title: '门店清单', ordinal: 1, structure: 'same', base_sql: 'SELECT COUNT(*) AS n FROM stores',
     target_sql: 'SELECT COUNT(*) AS n FROM stores', literals: [], base_rows: 1, target_rows: 1, base_truncated: false, target_truncated: false },
-  { node_id: 'pull', node_title: '拉取销量', ordinal: 1, structure: 'same', base_sql: 'SELECT COUNT(*) AS n FROM visits',
+  { node_id: 'pull', node_title: '拉取销量', ordinal: 2, structure: 'same', base_sql: 'SELECT COUNT(*) AS n FROM visits',
     target_sql: 'SELECT COUNT(*) AS n FROM visits', literals: [], base_rows: 1, target_rows: 1, base_truncated: false, target_truncated: false },
-  { node_id: 'newbie', node_title: '新客查询', ordinal: 0, structure: 'added', base_sql: null,
+  { node_id: 'newbie', node_title: '新客查询', ordinal: 1, structure: 'added', base_sql: null,
     target_sql: "SELECT COUNT(*) AS n FROM users WHERE first_order_on >= '2026-09-28'", literals: [], base_rows: null, target_rows: 1,
     base_truncated: null, target_truncated: false },
-  { node_id: 'member', node_title: '会员查询', ordinal: 0, structure: 'removed', base_sql: 'SELECT COUNT(*) AS n FROM members',
+  { node_id: 'member', node_title: '会员查询', ordinal: 1, structure: 'removed', base_sql: 'SELECT COUNT(*) AS n FROM members',
     target_sql: null, literals: [], base_rows: 1, target_rows: null, base_truncated: false, target_truncated: null,
     problem: '基准运行的查询快照无法读取' },
 ]
@@ -165,6 +180,7 @@ const LABEL = { unchanged: '未变', data_only: '只数据变', caliber_and_data
   params_only: '只参数变', added: '新增', removed: '移除', incomparable: '无法比较' }
 const ORDER = ['data_only', 'caliber_and_data', 'sql_changed', 'params_only', 'added', 'removed', 'incomparable', 'unchanged']
 const REASON = '默认基准：同一定时任务的上一次运行'
+const FINDING = '正在查找上一次运行'
 
 // ---------------------------------------------------------------- 假接口
 
@@ -180,9 +196,15 @@ const GRAPH = { nodes: [
   { id: 'caliber', type: 'metrics', position: { x: 200, y: 0 }, data: { label: '周报口径', config: {} } },
 ], edges: [{ source: 'pull', target: 'caliber' }] }
 
+/** 运行对比的接口说「运行记录不存在」：带机读码（api/evidence.py 的 RUN_NOT_FOUND） */
+const RUN_GONE = { status: 404, json: { detail: '运行记录不存在', code: 'run_not_found' } }
+/** 读一次运行（GET /api/runs/{id}）时记录不存在：api/runs.py 只给 detail，不带机读码 */
+const RECORD_GONE = { status: 404, json: { detail: '运行记录不存在' } }
+
 /**
- * 默认的假接口。opts.base(runId) / opts.compare(target, base, n) 可以换掉对应接口的答复，返回 {status, json, wait}
- * （wait 是一个 Promise：等它落定再答，用来压住某一次请求）
+ * 默认的假接口。opts.base(runId) / opts.compare(target, base, n) / opts.run(runId, n) / opts.list(workflowId) 可以换掉
+ * 对应接口的答复（返回 null 的照默认答），返回 {status, json, wait}（wait 是一个 Promise：等它落定再答，用来压住
+ * 某一次请求）。不在夹具里的运行一律答 404，不放行到服务端
  */
 function defaults(opts) {
   return async (method, url, n) => {
@@ -190,6 +212,8 @@ function defaults(opts) {
     if (method !== 'GET') return null
     if (p === '/api/runs') {
       const wf = url.searchParams.get('workflow_id')
+      const own = opts.list?.(wf)
+      if (own) return own
       const list = Object.values(RUNS).filter((r) => !wf || r.workflow_id === wf)
         .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
       return { json: list }
@@ -207,6 +231,11 @@ function defaults(opts) {
       return { json: comparison(m[1], base) }
     }
     m = p.match(/^\/api\/runs\/([^/]+)(\/[a-z]+)?$/)
+    if (m && !m[2]) {
+      const own = opts.run?.(m[1], n)
+      if (own) return own
+      if (!RUNS[m[1]]) return RECORD_GONE
+    }
     if (m && RUNS[m[1]]) {
       if (!m[2]) return { json: RUNS[m[1]] }
       if (m[2] === '/events') return { json: events() }
@@ -222,7 +251,8 @@ const browser = await chromium.launch({ executablePath: CHROME })
 
 /**
  * 开一页：/api 的请求先问 defaults（再由 opts 换掉其中几个），答不了的 GET 放行到服务端，非 GET 一律拦掉。
- * 记下每次请求（「GET /api/runs/…?base=…」）和页面报错；原生对话框都算失败
+ * 记下每次请求（「GET /api/runs/…?base=…」）和页面报错；原生对话框都算失败。console 里的报错另记一份
+ * （React 的列表键冲突只打在 console 上，不抛错）
  */
 async function open(path, { width = 1280, height = 900, theme = 'dark', waitUntil = 'networkidle', ...opts } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
@@ -239,8 +269,10 @@ async function open(path, { width = 1280, height = 900, theme = 'dark', waitUnti
   const log = []
   const blocked = []
   const errors = []
+  const consoleErrors = []
   page.on('pageerror', (e) => errors.push(e.message))
   page.on('dialog', (d) => { errors.push(`原生对话框：${d.message()}`); void d.dismiss() })
+  page.on('console', (msg) => { if (msg.type() === 'error') consoleErrors.push(msg.text().slice(0, 200)) })
   const answer = defaults(opts)
   let n = 0
   await page.route((u) => new URL(u).pathname.startsWith('/api/'), async (route) => {
@@ -267,14 +299,19 @@ async function open(path, { width = 1280, height = 900, theme = 'dark', waitUnti
     void getComputedStyle(root).backgroundColor
     requestAnimationFrame(() => root.classList.remove('theme-switching'))
   }, theme)
-  return { ctx, page, log, blocked, errors }
+  return { ctx, page, log, blocked, errors, consoleErrors }
 }
+
+/** React 的「两个子元素用了同一个键」告警 */
+const keyClashes = (consoleErrors) => consoleErrors.filter((t) => t.includes('same key'))
 
 const comparePath = (target, base) => `/runs/compare?target=${target}${base ? `&base=${base}` : ''}`
 /** 等对比页落定：state 是 ok / error / no-target / finding… */
 const settled = (page, state = 'ok') => page.locator(`[data-compare-page][data-compare-state="${state}"]`).waitFor({ timeout: 8000 })
 const text = (page, sel) => page.locator(sel).first().innerText()
 const texts = (page, sel) => page.locator(sel).allInnerTexts()
+/** 有就取第一个的文字，没有给空串：不在这里干等超时，没找到的照常记成一项不通过 */
+const maybeText = (loc) => loc.count().then((c) => (c ? loc.first().innerText() : ''))
 const has = (page, sel) => page.locator(sel).count().then((c) => c > 0)
 const compareHits = (log, target, base) => log.filter((k) => k === `GET /api/runs/${target}/compare?base=${base}`).length
 const until = async (fn, ms = 6000, step = 100) => {
@@ -314,8 +351,60 @@ await section('从运行详情进入', async () => {
   check('菜单问到基准之后才跳，一步到带基准的地址', compareUrls.length >= 1 && compareUrls.every((u) => u.searchParams.get('base') === B),
     compareUrls.map((u) => u.search).join(' → '))
   check('写明基准是怎么选的', (await text(page, '[data-compare-reason]')).trim() === REASON, await text(page, '[data-compare-reason]').catch(() => ''))
+  check('跳过去之后「正在查找」的提示收起', await until(async () => await page.locator('[data-toast]', { hasText: FINDING }).count() === 0))
   check('没有发出写请求', blocked.length === 0, blocked.join('；'))
   check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('查找基准期间：看得见在做事，离开之后不再跳走', async () => {
+  let release
+  const gate = new Promise((r) => { release = r })
+  const { page, log, errors } = await open(`/runs/${T}`,
+    { base: () => ({ json: { base_run_id: B, reason: 'same_schedule', base: refOf(B) }, wait: gate }) })
+  // compare/base 这一请求了结（答完，或者被取消）
+  const ended = new Promise((resolve) => {
+    const done = (req) => { if (new URL(req.url()).pathname.endsWith('/compare/base')) resolve() }
+    page.on('requestfinished', done)
+    page.on('requestfailed', done)
+  })
+  await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+  await page.getByRole('button', { name: '更多操作' }).click()
+  await page.locator('[data-menu=compare]').click()
+  // 菜单点完就收起了：查找期间要有一条看得见的提示，接口慢的时候不像点了没反应
+  check('点了之后有「正在查找上一次运行」的提示', await until(async () =>
+    await page.locator('[data-toast]', { hasText: FINDING }).count() === 1, 3000))
+  await until(async () => log.includes(`GET /api/runs/${T}/compare/base`), 3000)
+  // 改主意去了别的页面：答复晚到也不能把人拽回对比页
+  await page.evaluate(() => { history.pushState({}, '', '/data'); dispatchEvent(new PopStateEvent('popstate')) })
+  await page.waitForURL((u) => u.pathname.startsWith('/data'), { timeout: 5000 })
+  release()
+  // 等请求了结，再给跳转留足时间：第一次进 /data 要现编那一页，主线程忙的时候晚到的跳转会落在固定的等待之后
+  await Promise.race([ended, new Promise((r) => setTimeout(r, 4000))])
+  const jumped = await until(async () => new URL(page.url()).pathname === '/runs/compare', 2500)
+  const at = new URL(page.url())
+  check('离开运行详情之后答复才回来：留在原地，不跳到对比页', !jumped && at.pathname.startsWith('/data'), at.pathname + at.search)
+  check('离开之后「正在查找」的提示也收起', await page.locator('[data-toast]', { hasText: FINDING }).count() === 0)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('不属于已保存工作流的运行：入口不可点并说明原因', async () => {
+  const saved = RUNS[T]
+  // 两种都没有 workflow_id：画布上没保存就运行的，和工作流删掉之后被置空的（名字还是原来的）
+  for (const [what, over] of [['未保存的工作流', { workflow_name: '未保存的工作流' }], ['工作流已删除', {}]]) {
+    RUNS[T] = { ...saved, workflow_id: null, ...over }
+    try {
+      const { page, log } = await open(`/runs/${T}`)
+      await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+      await page.getByRole('button', { name: '更多操作' }).click()
+      const item = page.locator('[data-menu=compare]')
+      const label = (await item.innerText()).replace(/\s+/g, ' ')
+      check(`${what}：「与上一次对比」不可点，写明工作流未保存或已删除`, await item.isDisabled() && label.includes('未保存或已删除'), label)
+      check(`${what}：不给「手动选择基准」，也不请求 compare/base`, !log.some((k) => k.includes('/compare'))
+        && await page.getByRole('button', { name: '手动选择基准' }).count() === 0)
+    } finally {
+      RUNS[T] = saved
+    }
+  }
 })
 
 await section('未封存的运行：入口不可点并说明原因', async () => {
@@ -377,10 +466,16 @@ await section('指标表', async () => {
     (await aov.locator('[data-compare-decomp]').innerText().catch(() => '')).replace(/\s+/g, ' '))
   check('能拆分的：画了两段条形', await aov.locator('[data-compare-decomp] [data-compare-bar] > i').count() === 2)
   check('表头说明两者之和等于总变化', (await text(page, '[data-compare-legend]')).includes('两者之和等于总变化'))
-  check('不能拆的：写出服务端给的原因', (await refund.locator('[data-compare-decomp-note]').innerText())
-    === '所依据的查询「退货明细」SQL 结构有改动，口径不同，不做拆分')
-  check('无法比较的也写原因', (await page.locator('tr[data-compare-metric="caliber:margin"] [data-compare-decomp-note]').innerText())
-    .includes('没有记录输入'))
+  check('不能拆的：写出服务端给的原因', (await refund.locator('[data-compare-decomp-note]').innerText()) === SQL_NOT_SPLIT)
+  // 「拆分或原因」一栏（第 5 个 td）：无法比较、新增、移除的服务端只给 reasons、不给 decomposition_note，
+  // 这一栏不能只剩一个「—」，要展开才知道为什么
+  const splitCell = (id) => page.locator(`tr[data-compare-metric="caliber:${id}"] td`).nth(4).innerText().then((s) => s.trim())
+  check('无法比较的：「拆分或原因」写出原因（服务端只放在 reasons 里）', await splitCell('margin') === NO_LINEAGE, await splitCell('margin'))
+  check('新增、移除的：「拆分或原因」写出原因', await splitCell('new_users') === ADDED_WHY && await splitCell('members') === REMOVED_WHY,
+    `${await splitCell('new_users')} | ${await splitCell('members')}`)
+  check('分类的悬停说明和服务端的分类口径一致', (await aov.locator('[data-compare-chip]').getAttribute('title')).includes('小数位')
+    && (await refund.locator('[data-compare-chip]').getAttribute('title')).includes('上游'),
+    `${await aov.locator('[data-compare-chip]').getAttribute('title')} | ${await refund.locator('[data-compare-chip]').getAttribute('title')}`)
   check('新增的：基准写「—」，本次照写', (await page.locator('tr[data-compare-metric="caliber:new_users"] [data-compare-base]').innerText()) === '—'
     && (await page.locator('tr[data-compare-metric="caliber:new_users"] [data-compare-target]').innerText()) === '320人')
   check('未变的：变化写「无变化」', (await page.locator('tr[data-compare-metric="caliber:stores"] [data-compare-delta]').innerText()) === '无变化')
@@ -445,6 +540,19 @@ await section('展开：输入对比与维度归因', async () => {
   const visitors = page.locator('tr[data-compare-detail="caliber:visitors"]')
   check('归不了因：写服务端的说明，不画空表', (await visitors.locator('[data-compare-attr-note]').innerText()).includes('被截断')
     && await visitors.locator('[data-compare-attr] table').count() === 0 && await visitors.locator('[data-compare-attr-total]').count() === 0)
+  // 不能拆的：明细里也写「为什么没拆」——窄屏上表格那一格横着滚也看不全，明细按框的可见宽度排
+  await page.locator('tr[data-compare-metric="caliber:refund_rate"] button[data-compare-expand]').click()
+  const refundDetail = page.locator('tr[data-compare-detail="caliber:refund_rate"]')
+  await refundDetail.waitFor()
+  check('不能拆的：明细里也写出原因', (await maybeText(refundDetail.locator('[data-compare-detail-note]'))).trim() === SQL_NOT_SPLIT,
+    await maybeText(refundDetail.locator('[data-compare-detail-note]')))
+  // 服务端只对只数据变、只参数变、口径与数据都变的做维度归因：别的类不是「没有明细」，是有意不做，写明为什么
+  check('SQL 结构变的：写明为什么不做维度归因', (await maybeText(refundDetail.locator('[data-compare-attr-none]'))).includes('不做维度归因'),
+    await maybeText(refundDetail.locator('[data-compare-attr-none]')))
+  await page.locator('tr[data-compare-metric="caliber:margin"] button[data-compare-expand]').click()
+  const marginNone = page.locator('tr[data-compare-detail="caliber:margin"] [data-compare-attr-none]')
+  await marginNone.waitFor()
+  check('无法比较的：写明为什么不做维度归因', (await maybeText(marginNone)).includes('无法判断变化来源'), await maybeText(marginNone))
   check('页面没有报错', errors.length === 0, errors.join('；'))
 })
 
@@ -483,7 +591,7 @@ await section('查询', async () => {
   await settled(page)
   const qs = page.locator('[data-compare-query]')
   check('每条查询一项', await qs.count() === QUERIES.length, String(await qs.count()))
-  const refund = page.locator('[data-compare-query="refund:0"]')
+  const refund = page.locator('[data-compare-query="refund:1"]')
   check('结构变：标「结构变」', (await refund.getAttribute('data-structure')) === 'changed'
     && (await refund.locator('[data-compare-structure]').innerText()).trim() === '结构变')
   const baseSql = refund.locator('[data-compare-sql="base"]')
@@ -500,27 +608,83 @@ await section('查询', async () => {
   check('截断照实标', (await refund.locator('[data-compare-rows]').innerText()).includes('已截断'))
   check('结构变：列出服务端说的差在哪', JSON.stringify(await refund.locator('[data-compare-differences] li').allInnerTexts())
     === JSON.stringify(QUERIES[1].differences))
-  check('快照读不出来：照服务端的说明写在那一条上', (await page.locator('[data-compare-query="member:0"] [data-compare-query-problem]').innerText())
+  check('快照读不出来：照服务端的说明写在那一条上', (await page.locator('[data-compare-query="member:1"] [data-compare-query-problem]').innerText())
     === '基准运行的查询快照无法读取')
-  const pull = page.locator('[data-compare-query="pull:0"]')
+  const pull = page.locator('[data-compare-query="pull:1"]')
   const lits = await pull.locator('[data-compare-literals] li').allInnerTexts()
   check('只参数变：列出变化的参数', lits.length === 2 && lits[0].includes("'2026-09-21'") && lits[0].includes("'2026-09-28'")
     && lits[1].includes("'2026-10-05'"), lits.join(' | '))
   check('只参数变：默认不并排摆两条 SQL', await pull.locator('[data-compare-sql]').count() === 0)
-  const same = page.locator('[data-compare-query="stores:0"]')
+  const same = page.locator('[data-compare-query="stores:1"]')
   check('相同的：默认不展开 SQL', (await same.locator('[data-compare-structure]').innerText()).trim() === '相同'
     && await same.locator('[data-compare-sql]').count() === 0)
   await same.locator('button[data-compare-sql-toggle]').click()
   check('相同的：点开能看 SQL', (await same.locator('[data-compare-sql]').first().innerText()).includes('FROM stores'))
-  check('同一节点的第二条查询写「第 2 条」', (await page.locator('[data-compare-query="pull:1"] [data-compare-nth]').innerText()).includes('第 2 条')
+  check('同一节点的第二条查询写「第 2 条」', (await page.locator('[data-compare-query="pull:2"] [data-compare-nth]').innerText()).includes('第 2 条')
     && (await pull.locator('[data-compare-nth]').innerText()).includes('第 1 条'))
   check('只有一条查询的节点不写第几条', await refund.locator('[data-compare-nth]').count() === 0)
-  const added = page.locator('[data-compare-query="newbie:0"]')
+  const added = page.locator('[data-compare-query="newbie:1"]')
   check('新增、移除的查询各只有一边的 SQL', await added.locator('[data-compare-sql="target"]').count() === 1
     && await added.locator('[data-compare-sql="base"]').count() === 0
-    && await page.locator('[data-compare-query="member:0"] [data-compare-sql="base"]').count() === 1)
+    && await page.locator('[data-compare-query="member:1"] [data-compare-sql="base"]').count() === 1)
+  const head = (await page.locator('[data-compare-queries] header').innerText()).replace(/\s+/g, ' ')
+  check('查询的个数按「条」写（和「第 N 条」一致）', head.includes(`${QUERIES.length} 条`), head)
+  check('「结构变」的悬停说明也算上数据源不同、SQL 读不出来', (await refund.locator('[data-compare-structure]').getAttribute('title')).includes('数据源'),
+    await refund.locator('[data-compare-structure]').getAttribute('title'))
   await refund.scrollIntoViewIfNeeded()
   await shot(page, 'queries-dark')
+})
+
+await section('查询的边界：照服务端配对、读快照的实际输出', async () => {
+  // 服务端配对（engine/compare.py 的 _pair）：配上的一对用本次的 node_id / ordinal，落单的基准查询用基准的。Agent 在基准里
+  // 查了两次、这次只查一次且和基准的第 2 次同构时，配上的一对是 agent·1，落单的基准第 1 次也是 agent·1——(node_id, ordinal)
+  // 不唯一。一边的 SQL 拿不到时服务端标「结构变」，那一边的 SQL 是 null
+  const AGENT = [
+    { node_id: 'agent', node_title: '分析助手', ordinal: 1, structure: 'same', base_sql: 'SELECT channel, SUM(amount) AS gmv FROM sales GROUP BY channel',
+      target_sql: 'SELECT channel, SUM(amount) AS gmv FROM sales GROUP BY channel', literals: [], base_rows: 3, target_rows: 3,
+      base_truncated: false, target_truncated: false, differences: [] },
+    { node_id: 'agent', node_title: '分析助手', ordinal: 1, structure: 'removed', base_sql: 'SELECT region, SUM(amount) AS gmv FROM sales GROUP BY region',
+      target_sql: null, literals: [], base_rows: 12, target_rows: null, base_truncated: false, target_truncated: null, differences: [] },
+    { node_id: 'pull', node_title: '拉取销量', ordinal: 1, structure: 'changed', base_sql: null, target_sql: 'SELECT region, amount FROM sales WHERE sold_on >= 20260928',
+      literals: [], base_rows: null, target_rows: 12, base_truncated: null, target_truncated: false,
+      differences: ['基准运行的查询快照无法读取，无法比较 SQL'], problem: '基准运行的查询快照无法读取' },
+  ]
+  const { page, errors, consoleErrors } = await open(comparePath(T, B), { compare: (t, b) => ({ json: { ...comparison(t, b), queries: AGENT } }) })
+  await settled(page)
+  const items = await page.locator('[data-compare-query]').evaluateAll((els) => els.map((e) => ({
+    key: e.getAttribute('data-compare-query'), structure: e.getAttribute('data-structure'), nth: e.querySelector('[data-compare-nth]')?.textContent?.trim() ?? null,
+  })))
+  const agent = items.filter((i) => i.key?.startsWith('agent'))
+  check('同一节点的两条查询 (node_id, ordinal) 相同：各写「第 1 条」「第 2 条」，按列表的先后数',
+    JSON.stringify(agent.map((i) => i.nth)) === JSON.stringify(['第 1 条', '第 2 条']), JSON.stringify(items))
+  check('每一项的位置键都不重复', new Set(items.map((i) => i.key)).size === items.length, items.map((i) => i.key).join(','))
+  check('没有 React 列表键冲突的告警', keyClashes(consoleErrors).length === 0, keyClashes(consoleErrors)[0] ?? '')
+  const pull = page.locator('[data-compare-query="pull:1"]')
+  const baseText = (await maybeText(pull.locator('[data-compare-sql="base"]'))).trim()
+  const marks = await pull.locator('mark[data-diff]').count()
+  check('一边的 SQL 读不出来：不做逐词比较，另一边不标「独有」', marks === 0, `${marks} 处标记`)
+  check('一边的 SQL 读不出来：这一边写明无法读取', baseText.includes('无法读取'), baseText)
+  check('一边的 SQL 读不出来：另一边照原文显示', (await maybeText(pull.locator('[data-compare-sql="target"]'))).includes('sold_on >= 20260928'))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('SQL 逐词比较：注释里的撇号不吞掉后面的语句', async () => {
+  const { page } = await open(comparePath(T, B))
+  await settled(page)
+  // 纯函数：直接 import Vite 现编的 sqlDiff.ts。模型写的英文注释里常有 it's、user's
+  const out = await page.evaluate(async () => {
+    const { diffSql } = await import('/src/pages/runs/compare/sqlDiff.ts')
+    const changed = (parts) => parts.filter((p) => p.changed).map((p) => p.text.trim())
+    const line = diffSql("SELECT a -- it's a note\nFROM t WHERE x = 1", "SELECT a -- it's a note\nFROM t WHERE x = 2")
+    const block = diffSql("SELECT a /* user's pick */ FROM t WHERE x = 1", "SELECT a /* user's pick */ FROM t WHERE x = 2")
+    const edited = diffSql('SELECT a -- old note\nFROM t', 'SELECT a -- new note\nFROM t')
+    return { line: [changed(line.base), changed(line.target)], block: [changed(block.base), changed(block.target)],
+      edited: [changed(edited.base), changed(edited.target)] }
+  })
+  check('行注释里有撇号：只标出真正不同的 1 和 2', JSON.stringify(out.line) === JSON.stringify([['1'], ['2']]), JSON.stringify(out.line))
+  check('块注释里有撇号：只标出真正不同的 1 和 2', JSON.stringify(out.block) === JSON.stringify([['1'], ['2']]), JSON.stringify(out.block))
+  check('注释改了：整段注释算一处不同，后面没改的语句不标', JSON.stringify(out.edited) === JSON.stringify([['-- old note'], ['-- new note']]),
+    JSON.stringify(out.edited))
 })
 
 await section('模板与说明', async () => {
@@ -596,24 +760,44 @@ await section('过时的答复不盖掉新的', async () => {
 /** 「其他错误」那一节：第一次对比回 500，之后照常 */
 let flakyCalls = 0
 await section('出错与找不到基准', async () => {
-  const sealed = await open(comparePath(T, B), { compare: () => ({ status: 409, json: { detail: '基准运行的封存核对不一致，无法对比' } }) })
+  // 409 照服务端（api/compare.py）的原话和机读码：封存核对不一致的原因里已经写了去记录页点「核对」
+  const broken = '作为基准的运行的封存核对不一致：封存后有事件被修改、删除或插入，不能用于对比。可在记录页点「核对」查看核对结果'
+  const sealed = await open(comparePath(T, B), { compare: () => ({ status: 409, json: { detail: broken, code: 'compare_seal_broken' } }) })
   await settled(sealed.page, 'error')
   const e409 = sealed.page.locator('[data-compare-error="409"]')
-  check('409：写明未封存或封存核对不一致，带上服务端的原因', (await e409.locator('[data-compare-error-title]').innerText()).includes('封存')
-    && (await e409.innerText()).includes('基准运行的封存核对不一致，无法对比'), (await e409.innerText().catch(() => '')).replace(/\s+/g, ' '))
+  const t409 = (await e409.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('409 封存核对不一致：标题照实写，带上服务端的原因', (await e409.locator('[data-compare-error-title]').innerText()) === '无法对比：封存核对不一致'
+    && t409.includes(broken), t409)
+  check('409：下一步只指向界面上有的入口（不提「封存凭证条」，可在上方更换基准）', !t409.includes('封存凭证条') && t409.includes('上方更换基准'), t409)
   check('409：给出去两次运行详情核对的入口', await e409.locator(`a[href="/runs/${B}"]`).count() === 1
     && await e409.locator(`a[href="/runs/${T}"]`).count() === 1)
   check('409：两张运行卡仍在，下拉仍能换基准', await sealed.page.locator('[data-compare-run="base"]').count() === 1
     && await sealed.page.locator('select[data-compare-base-picker]').isEnabled())
   check('409：不显示摘要、指标', await sealed.page.locator('[data-compare-summary], tr[data-compare-metric]').count() === 0)
 
-  const other = await open(comparePath(T, B), { compare: () => ({ status: 422, json: { detail: '两次运行不属于同一个工作流' } }) })
+  // 本次自己没封存：换基准也没用，服务端的原因里已经写了要等运行结束，不再叫人去换基准
+  const savedT = RUNS[T]
+  RUNS[T] = { ...savedT, manifest_hash: null, manifest_seq: null }
+  try {
+    const open409 = await open(comparePath(T, B), { compare: () => ({ status: 409,
+      json: { detail: '这次运行尚未结束并封存：对比只用封存的运行记录，运行结束后才能对比', code: 'compare_unsealed' } }) })
+    await settled(open409.page, 'error')
+    const u409 = open409.page.locator('[data-compare-error="409"]')
+    const tu = (await u409.innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check('409 本次未封存：标题写「尚未结束并封存」，不叫人去换基准', (await u409.locator('[data-compare-error-title]').innerText()).includes('尚未结束并封存')
+      && !tu.includes('更换基准'), tu)
+  } finally {
+    RUNS[T] = savedT
+  }
+
+  const other = await open(comparePath(T, B), { compare: () => ({ status: 422,
+    json: { detail: '两次运行不属于同一个工作流（「区域销售周报」与「门店日报」），不能对比', code: 'compare_mismatch' } }) })
   await settled(other.page, 'error')
   const e422 = other.page.locator('[data-compare-error="422"]')
   check('422：写明无法对比，带上原因和下一步', (await e422.innerText()).includes('两次运行不属于同一个工作流')
-    && (await e422.innerText()).includes('同一工作流'), (await e422.innerText().catch(() => '')).replace(/\s+/g, ' '))
+    && (await e422.innerText()).includes('同一工作流的另一次运行'), (await e422.innerText().catch(() => '')).replace(/\s+/g, ' '))
 
-  const gone = await open(comparePath(T, B), { compare: () => ({ status: 404, json: { detail: '运行记录不存在' } }) })
+  const gone = await open(comparePath(T, B), { compare: () => RUN_GONE })
   await settled(gone.page, 'error')
   check('404：写明运行记录不存在', (await gone.page.locator('[data-compare-error="404"]').innerText()).includes('运行记录不存在'))
 
@@ -631,14 +815,27 @@ await section('出错与找不到基准', async () => {
   check('找不到基准：写明原因', (await noBase.locator('[data-compare-error-title]').innerText()).includes('未找到可作为基准的运行')
     && (await noBase.innerText()).includes('同一工作流没有其他已封存的正式运行'))
   check('找不到基准：仍能手动选', await lone.page.locator('select[data-compare-base-picker]').isEnabled())
+  check('找不到基准、下拉里有能选的：说可在上方选', await until(async () => (await noBase.innerText()).includes('可在上方选择')),
+    (await noBase.innerText()).replace(/\s+/g, ' '))
+  // 同一工作流只有一次没封存的：下拉里没有能选的，不能再叫人去上方选
+  const bare = await open(comparePath(T), { base: () => ({ status: 404, json: { detail: '同一工作流没有其他已封存的正式运行', code: 'compare_no_base' } }),
+    list: () => ({ json: [RUNS[T], RUNS[U]] }) })
+  await settled(bare.page, 'error')
+  const bareBox = bare.page.locator('[data-compare-error="no-base"]')
+  await until(async () => (await bare.page.locator('select[data-compare-base-picker] option').count()) > 1)
+  const tb = (await bareBox.innerText()).replace(/\s+/g, ' ')
+  check('找不到基准、下拉里没有能选的：不说「可在上方选择」，写明同一工作流没有已封存的运行', !tb.includes('可在上方') && tb.includes('已封存'), tb)
   await lone.page.locator('select[data-compare-base-picker]').selectOption(B2)
   await settled(lone.page)
   check('手动选了之后照常对比', new URL(lone.page.url()).searchParams.get('base') === B2 && compareHits(lone.log, T, B2) === 1)
 
-  const missing = await open(comparePath(T), { base: () => ({ status: 404, json: { detail: '运行记录不存在', code: 'run_not_found' } }) })
+  const missing = await open(comparePath(T), { base: () => RUN_GONE, run: (id) => (id === T ? RECORD_GONE : null) })
   await settled(missing.page, 'error')
-  check('找基准时本次就不存在：写运行记录不存在', await missing.page.locator('[data-compare-error="404"]').count() === 1
-    && (await missing.page.locator('[data-compare-error-title]').innerText()) === '运行记录不存在')
+  const gone404 = missing.page.locator('[data-compare-error="404"]')
+  check('找基准时本次就不存在：写运行记录不存在、链接可能已失效，给去记录页的入口', await gone404.count() === 1
+    && (await missing.page.locator('[data-compare-error-title]').innerText()) === '运行记录不存在'
+    && (await gone404.innerText()).includes('链接可能已失效') && await gone404.locator('a[href="/runs"]').count() === 1,
+    (await gone404.innerText().catch(() => '')).replace(/\s+/g, ' '))
 
   // 只带本次、找得到：自己补上基准，写明怎么选的
   const auto = await open(comparePath(T))
@@ -662,6 +859,67 @@ await section('出错与找不到基准', async () => {
   const none = await open('/runs/compare')
   await settled(none.page, 'no-target')
   check('什么都没带：说明从哪里进来', (await text(none.page, '[data-compare-page]')).includes('与上一次对比'))
+})
+
+await section('基准运行读不到（删了、链接过期）', async () => {
+  const GONE = 'c0ffee0gone0000000000000000000009'
+  const { page, log, errors } = await open(comparePath(T, GONE), { compare: (t, b) => (b === GONE
+    ? { status: 404, json: { detail: '作为对比基准的运行记录不存在', code: 'run_not_found' } } : { json: comparison(t, b) }) })
+  await settled(page, 'error')
+  const picker = page.locator('select[data-compare-base-picker]')
+  await until(async () => (await picker.locator('option').count()) > 1)
+  const current = await picker.evaluate((s) => ({ value: s.value, text: s.selectedOptions[0]?.textContent ?? '' }))
+  // 受控下拉的值对不上任何选项时浏览器会选中第一项：显示成另一次运行被选中，而选它又不触发 change
+  check('下拉如实显示当前的基准（短 id，写明读不到），不显示成别的运行', current.value === GONE && current.text.includes('不存在'), JSON.stringify(current))
+  const box = (await page.locator('[data-compare-error="404"]').innerText()).replace(/\s+/g, ' ')
+  check('缺的是基准：提示在上方另选基准，不叫人回记录页', box.includes('在上方选择另一次运行作为基准') && !box.includes('链接可能已失效'), box)
+  await picker.selectOption(B)
+  await settled(page)
+  check('另选一次之后照常对比', new URL(page.url()).searchParams.get('base') === B && compareHits(log, T, B) === 1)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('本次的运行记录读不到：换基准不一直停在「正在读取」', async () => {
+  let calls = 0
+  const { page, errors } = await open(comparePath(T, B), { run: (id) => (id === T && calls++ === 0
+    ? { status: 500, json: { detail: '服务暂时不可用' } } : null) })
+  await settled(page)
+  const failed = page.locator('[data-compare-run="base"] [data-compare-pick-failed]')
+  check('读不到本次的记录、不知道是哪个工作流：写明读不到同一工作流的运行，不显示加载中',
+    await until(() => failed.count().then((c) => c === 1), 3000)
+    && await page.locator('select[data-compare-base-picker]').count() === 0,
+    (await page.locator('[data-compare-run="base"]').innerText()).replace(/\s+/g, ' '))
+  await failed.getByRole('button', { name: '重试' }).click()
+  const picker = page.locator('select[data-compare-base-picker]')
+  check('点「重试」重新读本次的记录，之后下拉照常可用', await until(async () => (await picker.count()) === 1 && await picker.isEnabled(), 4000)
+    && await picker.inputValue() === B)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('不属于已保存工作流的运行：对比页的说明前后一致', async () => {
+  const saved = RUNS[T]
+  RUNS[T] = { ...saved, workflow_id: null, workflow_name: '未保存的工作流' }
+  try {
+    // 只带本次：服务端找不到基准（这种运行没有可比的）
+    const lone = await open(comparePath(T), { base: () => ({ status: 404, json: {
+      detail: '没有找到可以对比的上一次运行：需要同一工作流、同一运行类别（定时任务发起的优先找同一定时任务）、更早结束并已封存的运行',
+      code: 'compare_no_base' } }) })
+    await settled(lone.page, 'error')
+    await until(async () => (await lone.page.locator('[data-compare-run="base"]').innerText()).includes('未保存或已删除'), 3000)
+    const card = (await lone.page.locator('[data-compare-run="base"]').innerText()).replace(/\s+/g, ' ')
+    const box = (await lone.page.locator('[data-compare-error]').innerText()).replace(/\s+/g, ' ')
+    check('基准卡：写明工作流未保存或已删除（不说「临时构建」）', card.includes('未保存或已删除') && !card.includes('临时构建'), card)
+    check('说明框：写明原因，不叫人去上方选', box.includes('未保存或已删除') && !box.includes('上方'), box)
+    // 地址里带了基准：服务端回 422
+    const other = await open(comparePath(T, B), { compare: () => ({ status: 422,
+      json: { detail: '这次运行不属于任何已保存的工作流，无法确认两次运行是同一个工作流，不能对比', code: 'compare_mismatch' } }) })
+    await settled(other.page, 'error')
+    await until(async () => (await other.page.locator('[data-compare-error]').innerText()).includes('未保存或已删除'), 3000)
+    const b422 = (await other.page.locator('[data-compare-error]').innerText()).replace(/\s+/g, ' ')
+    check('422：不再叫人选另一次运行作为基准', b422.includes('未保存或已删除') && !b422.includes('作为基准') && !b422.includes('上方'), b422)
+  } finally {
+    RUNS[T] = saved
+  }
 })
 
 await section('空的对比', async () => {
@@ -703,7 +961,7 @@ await section('窄屏', async () => {
     })
     check(`390px（${theme}）：指标表在自己的框里横向滚动，键盘可聚焦`, !!scroller && scroller.sw > scroller.cw && scroller.focusable,
       JSON.stringify(scroller))
-    const refund = page.locator('[data-compare-query="refund:0"]')
+    const refund = page.locator('[data-compare-query="refund:1"]')
     const [bb, tb] = [await refund.locator('[data-compare-sql="base"]').boundingBox(), await refund.locator('[data-compare-sql="target"]').boundingBox()]
     check(`390px（${theme}）：两条 SQL 上下排、都在屏幕里`, !!bb && !!tb && tb.y >= bb.y + bb.height - 1 && bb.x >= 0 && bb.x + bb.width <= 390,
       JSON.stringify({ bb, tb }))
@@ -778,5 +1036,7 @@ await section('深浅色可读', async () => {
 })
 
 await browser.close()
-console.log(failed ? `\n✗ 运行对比：${failed} 项未通过` : '\n✓ 运行对比：全部通过')
+// 段过滤一段都没对上：报成没通过，不让一个写错的过滤词顶着「全部通过」
+if (!ran) failed++
+console.log(failed ? `\n✗ 运行对比：${ran ? `${failed} 项未通过` : '一项都没有检查'}` : '\n✓ 运行对比：全部通过')
 process.exit(failed ? 1 : 0)

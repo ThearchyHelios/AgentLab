@@ -4,7 +4,7 @@ import clsx from 'clsx'
 import { RUN_COMPARE_TEXT as T } from '../../../lib/terms'
 import type { RunCompareQuery } from '../../../types'
 import { Block, StructureChip } from './parts'
-import { queryKey, queryNumbers, valueText } from './model'
+import { queryItems, valueText } from './model'
 import { diffSql, type DiffPart } from './sqlDiff'
 
 /** 基准独有、本次独有的高亮：颜色之外，删去的划线、新加的下划线，色弱、灰度打印也分得出 */
@@ -26,17 +26,14 @@ const MARK = {
  */
 export function Queries({ queries }: { queries: RunCompareQuery[] }) {
   const id = useId()
-  const numbers = useMemo(() => queryNumbers(queries), [queries])
+  const items = useMemo(() => queryItems(queries), [queries])
   return (
-    <Block id={`${id}-queries`} title={T.queries} count={T.count(queries.length)} attr={{ 'data-compare-queries': '' }}>
+    <Block id={`${id}-queries`} title={T.queries} count={T.queryCount(queries.length)} attr={{ 'data-compare-queries': '' }}>
       {!queries.length ? (
         <p className="py-4 text-center text-xs text-faint" data-compare-empty="queries">{T.queriesEmpty}</p>
       ) : (
         <ul className="divide-y">
-          {queries.map((q) => {
-            const k = queryKey(q)
-            return <QueryItem key={k} q={q} k={k} nth={numbers.get(k) ?? null} />
-          })}
+          {items.map((it) => <QueryItem key={it.key} q={it.q} k={it.key} nth={it.nth} />)}
         </ul>
       )}
     </Block>
@@ -91,22 +88,37 @@ function QueryItem({ q, k, nth }: { q: RunCompareQuery; k: string; nth: number |
           </ul>
         </div>
       )}
-      {q.structure === 'changed' && <SideBySide base={q.base_sql ?? ''} target={q.target_sql ?? ''} />}
-      {q.structure === 'added' && <SqlPane which="target" label={T.targetSql} sql={q.target_sql ?? ''} />}
-      {q.structure === 'removed' && <SqlPane which="base" label={T.baseSql} sql={q.base_sql ?? ''} />}
+      {q.structure === 'changed' && <SideBySide base={q.base_sql} target={q.target_sql} />}
+      {q.structure === 'added' && <SqlPane which="target" label={T.targetSql} sql={q.target_sql} />}
+      {q.structure === 'removed' && <SqlPane which="base" label={T.baseSql} sql={q.base_sql} />}
       {foldable && showSql && (
         <div id={sqlId}>
           {q.structure === 'same'
-            ? <SqlPane which="both" label={T.bothSql} sql={q.target_sql ?? q.base_sql ?? ''} />
-            : <SideBySide base={q.base_sql ?? ''} target={q.target_sql ?? ''} />}
+            ? <SqlPane which="both" label={T.bothSql} sql={q.target_sql ?? q.base_sql} />
+            : <SideBySide base={q.base_sql} target={q.target_sql} />}
         </div>
       )}
     </li>
   )
 }
 
-/** 两条 SQL 并排，逐词标出各自独有的部分 */
-function SideBySide({ base, target }: { base: string; target: string }) {
+/**
+ * 两条 SQL 并排，逐词标出各自独有的部分。有一边拿不到 SQL（快照读不出来、又没有执行时的参数）时不比：拿空串去比，
+ * 另一边会整条被标成「独有」，像是整条新写的，其实只是不知道。这时两边原样摆着，拿不到的那一边写明无法读取
+ */
+function SideBySide({ base, target }: { base: string | null; target: string | null }) {
+  if (base == null || target == null) {
+    return (
+      <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <SqlPane which="base" label={T.baseSql} sql={base} />
+        <SqlPane which="target" label={T.targetSql} sql={target} />
+      </div>
+    )
+  }
+  return <Diffed base={base} target={target} />
+}
+
+function Diffed({ base, target }: { base: string; target: string }) {
   const diff = useMemo(() => diffSql(base, target), [base, target])
   return (
     <div className="mt-2">
@@ -123,21 +135,26 @@ function SideBySide({ base, target }: { base: string; target: string }) {
   )
 }
 
-/** 一条 SQL。折行显示，不横向撑开；太长时在框里纵向滚动，框能用键盘聚焦 */
+/**
+ * 一条 SQL。折行显示，不横向撑开；太长时在框里纵向滚动，框能用键盘聚焦。sql 为 null（这一边拿不到 SQL）时
+ * 框里写明无法读取，不摆一个空框
+ */
 function SqlPane({ which, label, sql, parts }: {
-  which: 'base' | 'target' | 'both'; label: string; sql?: string; parts?: DiffPart[]
+  which: 'base' | 'target' | 'both'; label: string; sql?: string | null; parts?: DiffPart[]
 }) {
   const kind = which === 'base' ? 'del' : 'add'
+  const missing = !parts && sql == null
   return (
     <figure className="m-0 mt-1.5 min-w-0">
       <figcaption className="mb-0.5 text-2xs text-faint">{label}</figcaption>
-      <pre className="mono max-h-64 overflow-y-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere] focus-visible:outline-2 focus-visible:outline-[color:var(--accent)]"
-           data-compare-sql={which} tabIndex={0} aria-label={label}>
+      <pre className={clsx('max-h-64 overflow-y-auto whitespace-pre-wrap rounded bg-bg px-2 py-1.5 text-2xs leading-relaxed [overflow-wrap:anywhere] focus-visible:outline-2 focus-visible:outline-[color:var(--accent)]',
+             missing ? 'font-sans text-faint' : 'mono text-dim')}
+           data-compare-sql={which} data-unreadable={missing ? '' : undefined} tabIndex={0} aria-label={label}>
         {parts
           ? parts.map((p, i) => (p.changed
             ? <mark key={i} data-diff={kind} className="rounded-sm" style={MARK[kind]}>{p.text}</mark>
             : <Fragment key={i}>{p.text}</Fragment>))
-          : sql}
+          : missing ? T.sqlUnreadable : sql}
       </pre>
     </figure>
   )

@@ -7,8 +7,8 @@ import type { RunComparison } from '../../types'
 import { useCandidates, useComparison, useDefaultBase, useRunRecord } from './compare/data'
 import { comparePath, type CompareVia } from './compare/entry'
 import { Metrics } from './compare/Metrics'
-import { compareErrorKind } from './compare/model'
-import { CompareError } from './compare/parts'
+import { compareErrorKind, isGone } from './compare/model'
+import { CompareError, type CompareErrorContext } from './compare/parts'
 import { Queries } from './compare/Queries'
 import { RunPair } from './compare/RunPair'
 import { Summary } from './compare/Summary'
@@ -51,6 +51,8 @@ export function ComparePage() {
   const workflowId = targetRun.state === 'ok' ? targetRun.data?.workflow_id : lastWorkflow.current
   const candidates = useCandidates(workflowId)
   const cmp = useComparison(target, base)
+  // 不属于已保存的工作流：没保存过，或者工作流删掉之后 workflow_id 被置空（名字还是原来的）。服务端两种都不比
+  const unsaved = targetRun.state === 'ok' && !workflowId
 
   const go = (t: string, b: string) => navigate(comparePath(t, b), { replace: true })
 
@@ -58,6 +60,16 @@ export function ComparePage() {
   if (!target) state = 'no-target'
   else if (!base) state = finder.state === 'error' ? 'error' : 'finding'
   else state = cmp.state === 'ok' ? 'ok' : cmp.state === 'error' ? 'error' : 'loading'
+
+  // 错误说明的下一步按页面已经知道的挑（parts.tsx 的 errorCopy）：下拉里没有能选的就不叫人去上方选
+  const errorContext: CompareErrorContext = {
+    targetKnown: targetRun.state === 'ok',
+    targetUnsaved: unsaved,
+    targetUnsealed: targetRun.state === 'ok' && !targetRun.data?.manifest_hash,
+    targetGone: targetRun.state === 'error' && isGone(targetRun.error),
+    baseGone: baseRun.state === 'error' && isGone(baseRun.error),
+    pickable: candidates.state === 'ok' ? (candidates.data ?? []).some((r) => r.id !== target && !!r.manifest_hash) : null,
+  }
 
   return (
     <div className="flex h-full flex-col">
@@ -70,7 +82,7 @@ export function ComparePage() {
           <div className="mx-auto flex w-full min-w-0 max-w-6xl flex-col gap-3 px-3 py-3 sm:px-4 sm:py-4">
             <RunPair
               target={target} base={base} targetRun={targetRun} baseRun={baseRun} candidates={candidates}
-              unsaved={targetRun.state === 'ok' && !workflowId} reason={reason}
+              unsaved={unsaved} reason={reason}
               onPick={(b) => go(target, b)} onSwap={() => { if (base) go(base, target) }}
             />
             {state === 'finding' && <Pending text={RUN_COMPARE_TEXT.finding} />}
@@ -80,7 +92,7 @@ export function ComparePage() {
                 kind={compareErrorKind(base ? cmp.error : finder.error, !base)}
                 error={base ? cmp.error : finder.error}
                 onRetry={base ? cmp.reload : finder.reload}
-                target={target} base={base}
+                target={target} base={base} context={errorContext}
               />
             )}
             {state === 'ok' && cmp.data && <Comparison key={`${target}|${base}`} data={cmp.data} />}
