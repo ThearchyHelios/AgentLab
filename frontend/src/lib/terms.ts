@@ -3305,6 +3305,74 @@ export const INQUIRY_TEXT = {
     error: (e: string) => `原因：${e}`,
     model: (m: string) => `核查模型：${m}`,
   },
+
+  // ---- 报告上的入口（EvidenceDoc）：句末的「质询」、划选原文时浮出的「质询」 ----
+  ask: '质询',
+  askUnit: (text: string) => `质询这句：${text}`,
+  askSelection: '就选中的原文质询',
+  /** 读屏摘要里接在按键说明后面 */
+  keysHint: '每句结论后有「质询」按钮：方向键走到这一句，再按 Tab 到达；没有可点内容的句子，方向键直接走到它的「质询」',
+
+  // ---- 问答串（ReportInquiry） ----
+  headCount: (n: number) => `${formatNumber(n)} 次`,
+  askReport: '就整份报告提问',
+  intro: '展开逐段证据后，悬停一句结论或划选一段原文，点「质询」即可就该处提问',
+  introRun: '悬停一句结论或划选一段原文，点「质询」即可就该处提问',
+  wholeReport: '整份报告',
+  /** 报告文档取不到，写不出问的是哪一句 */
+  unitMissing: '报告中的一句',
+  loadFailed: '无法读取之前的质询记录',
+  retry: '重试',
+  q: '问',
+  a: '答',
+  unsigned: '未署名',
+  entryLabel: (question: string) => `质询：${question}`,
+  quoteLine: (quote: string) => `原文「${quote}」`,
+  notRecorded: '这次问答没有写入运行记录',
+  notRecordedHint: '它只显示在当前页面，刷新后不再显示，也不会随运行封存',
+  /** 屏幕阅读器：回答回来了 */
+  arrived: '已收到回答',
+
+  // ---- 提问框 ----
+  target: { unit: '就这句提问', quote: '就选中的原文提问', report: '就整份报告提问' } as Record<'unit' | 'quote' | 'report', string>,
+  questionLabel: '问题',
+  placeholder: '例如：这个数是否扣除了退款？',
+  submit: '提问',
+  cancel: '取消',
+  chars: (n: number, max: number) => `${formatNumber(n)}/${formatNumber(max)}`,
+  keys: 'Ctrl + 回车提交 · Esc 关闭',
+  empty: '请填写问题',
+  tooLong: (max: number) => `问题最多 ${formatNumber(max)} 字，请删减后再提交`,
+  quoteCut: (max: number) => `选中的原文超过 ${formatNumber(max)} 字，只提交前 ${formatNumber(max)} 字`,
+  hint: '由核查模型只读查询数据作答，问答写入运行记录，不改动报告',
+  hintPostSeal: '运行已封存：问答追加在封存之后，不改动报告',
+  busyOther: '这次运行另有一条质询正在回答，回答完再提问',
+  submitFailed: '提问失败',
+
+  // ---- 回答中：审批卡的批准 / 驳回暂停（服务端这时也会拒绝） ----
+  pending: '正在查询与回答，通常需要几十秒',
+  waited: (seconds: number) => `已等待 ${formatNumber(seconds)} 秒`,
+  decideBlocked: '正在回答质询，回答完再批准或驳回',
+
+  // ---- 回答 ----
+  noAnswer: '没有给出回答',
+  answerIncomplete: (limit: string) => `${limit}：回答依据已查到的结果，可能不完整`,
+  answeredBy: (model: string | null) => `回答由核查模型${model ? `「${model}」` : ''}给出，并非系统核对`,
+  cost: (usd: string) => `花费 ${usd}`,
+  /** 回答里有出处的数字：读屏听到「数字，出处：查询 Q1 · 第 1 行 · amount」，点一下展开那次查询的结果 */
+  cited: (text: string, source: string) => `${text}，出处：${source}，查看这次查询的结果`,
+  citedReport: (text: string, source: string) => `${text}，出处：${source}，在报告中查看证据`,
+  /** 引用的是报告已有的出处，报告里却找不到引用它的地方：照回答文档记下的出处说一句 */
+  reportSource: (source: string) => `出处：${source}（报告已有的出处，报告中没有引用它的地方）`,
+  queriesHead: (n: number) => `核查模型执行的查询（${formatNumber(n)} 次）`,
+  noQueries: '核查模型没有执行查询',
+  rows: (n: number) => `${formatNumber(n)} 行`,
+  truncated: '结果已截断，数据库中还有更多数据',
+  showResult: '查看结果',
+  hideResult: '收起结果',
+  snapshotLoading: '正在读取查询结果…',
+  snapshotFailed: '无法读取这次查询的结果',
+  masked: (columns: string) => `${columns} 在数据源中设置了遮罩，不显示原值`,
 }
 
 /**
