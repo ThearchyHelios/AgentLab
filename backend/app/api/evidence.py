@@ -21,6 +21,9 @@ artifacts 表可以事后插行，run.output 是可以改写的一列，封存�
 options.mask_columns 里的列换成「已遮罩」——在有身份体系之前，这只减少暴露，不是
 安全边界：知道工件 id 的人照样能取到整份快照。
 
+期 4 的核查状态同样只读封存范围内的东西：指标步骤带双盲复算的结果（_dual_check_of，读双盲复算节点的产出和台账
+条目），句子带反方审稿的判断（_challenge_of，读反方审稿节点的产出和审稿记录）。它们是核查，不是证据：没有就不带这两个键。
+
 结论句的判定（四期）是模型给的，不是证据：正式运行的判定在报告文档里、随文档封存；探索运行
 按需裁判（POST …/evidence/judge），判定作为 evidence.judged 事件追加在封存之后，只填补没判过的
 句子。交给裁判的摘录同样只取封存范围内的工件。
@@ -75,7 +78,7 @@ from app.data.provenance_types import (
 from app.data.table_versions import SnapshotManifestMismatch, SnapshotMissing
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent, Workflow
-from app.engine import direct_select
+from app.engine import direct_select, recompute
 from app.engine.evidence import (
     ENTITY_KINDS,
     GUESS_NOTE,
@@ -103,6 +106,7 @@ from app.engine.evidence import (
 )
 from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candidates, outdated
 from app.engine.merge_query import MERGE_SOURCE, trace_cell
+from app.engine.schema import GraphSpec, challenge_report, dual_check_card
 from app.engine.toolcalls import QUERY_PREFIX
 
 router = APIRouter(prefix="/api/runs", tags=["evidence"])
@@ -726,8 +730,11 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
     start, end = unit.get("span") or [0, 0]
     chain = await _chain(seg, doc, sealed, chosen.node_id)
     covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
-    masked = list(dict.fromkeys(c for step in chain if step.get("step") == "query" for c in step.get("masked") or []))
+    # 遮罩列：查询步骤里遮着的，加上指标步骤里取自遮罩列的输入（按位置取的那一格可能没有对应的查询步骤）
+    masked = list(dict.fromkeys(c for step in chain if step.get("step") in ("query", "input")
+                                for c in step.get("masked") or []))
     verdict = _effective_verdicts(chosen, sealed)[0].get(str(unit.get("id")))
+    challenged = _challenge_of(sealed, chosen, str(unit.get("id")))
     return {
         "report": {"node_id": chosen.node_id, "doc_artifact": chosen.doc_artifact},
         "segment": {"id": seg["id"], "text": seg.get("text"), "kind": seg.get("kind"), "state": seg.get("state"),
@@ -736,6 +743,8 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
         "unit": {"id": unit.get("id"), "kind": unit.get("kind"), "text": markdown[start:end],
                  "span": unit.get("span"), "cites": unit.get("cites") or [],
                  **({"verdict": verdict} if verdict is not None else {}),
+                 # 期 4：反方审稿对这一句的判断，没审到这一句的没有这个键
+                 **({"challenge": challenged} if challenged is not None else {}),
                  "on_demand": _on_demand(sealed, doc, str(unit.get("id")), verdict)},
         "block": {"id": block.get("id"), "type": block.get("type")},
         "chain": chain,
@@ -855,10 +864,15 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         "source": await _caliber_source((card or {}).get("source")),
         "caliber_upgrade": _caliber_upgrade(sealed.upgrades.get(str(entry.get("node_id") or ""))),
     }
+    # 期 4：这个指标做没做过双盲复算、结果如何。没有双盲复算复核过这份指标集时没有这个键，老运行一字不差
+    if checked := _dual_check_of(sealed, str(entry.get("node_id") or ""), artifact, metric_id):
+        step["dual_check"] = checked
     catalog = doc.get("catalog") or {}
     inputs: list[dict[str, Any]] = []
     #: 输入指到的查询快照 → 被引用的格；同一份快照只给一个查询步骤，格合在一起高亮
     wanted: dict[str, list[tuple[Any, Any]]] = {}
+    hide = _InputMasks(sealed, masks, str(entry.get("node_id") or ""), artifact)
+    withheld: set[str] = set()
     for item in (metric or {}).get("inputs") or []:
         one = {"step": "input", **item}
         artifact_of = item.get("artifact")
@@ -867,9 +881,97 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
             if cell := _input_cell(item, catalog):
                 one["cell"] = cell
             wanted.setdefault(str(artifact_of), []).extend(_located(item.get("locator") or {}))
+        if columns := await hide.columns(item):
+            one = _withheld(one, columns)
+            withheld.add(str(item.get("path")))
         inputs.append(one)
+    if withheld:
+        # 代入式里那几处同样写「已遮罩」：不然标签里遮着、代入式里亮着，同一个值换个地方照样看得到
+        step["substituted"] = recompute.substituted_without(metric or {}, withheld, MASKED)
     queries = [s for a, cells in wanted.items() for s in await _query_steps(a, cells, doc, sealed, masks)]
     return [step, *inputs, *queries]
+
+
+def _withheld(step: dict[str, Any], columns: list[str]) -> dict[str, Any]:
+    """取自遮罩列的输入：值写「已遮罩」（本来就没有值的照旧是空的，缺输入还得看得出来），模型报的值、快照里的值一并
+    拿掉，masked 写明是哪几列。"""
+    out = {k: v for k, v in step.items() if k not in ("model_value", "snapshot_value")}
+    if out.get("value") is not None:
+        out["value"] = MASKED
+    out["masked"] = columns
+    return out
+
+
+class _InputMasks:
+    """一个指标的输入里哪些取自遮罩列。遮的列和查询步骤同一套（_query_step）：查询当时记下的加数据源现在设的，合并查询
+    按它合并的那几个数据源算；快照读不出来时只能按数据源现在设的算。
+
+    cell() 的格、Agent 交来的字段按定位里的列认。vars.res.rows[0][2] 这种按位置取自查询结果的标量卡上没记定位：顺着
+    取值链找到那份结果（recompute.positional_cell，推演用同一个认法），结果里带着快照的 id 和数据源。取值链从写变量的
+    节点在口径卡算这一次之前的产出起走（_card_outputs）。认不出来的不遮——卡上本来就只记着路径和值。
+    """
+
+    def __init__(self, sealed: _Sealed, masks: _Masks, card_node: str, artifact: str) -> None:
+        self._sealed, self._masks = sealed, masks
+        self._card, self._artifact = card_node, artifact
+        self._outputs: dict[str, str] | None = None
+        self._memo: dict[tuple[str | None, str | None], set[str]] = {}
+
+    async def columns(self, item: dict[str, Any]) -> list[str]:
+        """这个输入用到的遮罩列（列名照原样，按出现的先后）；没用到的交回空列表。"""
+        if item.get("via") in ("tool_cell", "agent_field") and item.get("artifact"):
+            artifact, source = str(item["artifact"]), None
+            used = [c for _, c in _located(item.get("locator") or {}) if isinstance(c, str)]
+        else:
+            found = recompute.positional_cell(str(item.get("path") or ""), item.get("node_id"), self._output)
+            if found is None:
+                return []
+            artifact, source, used = found["artifact"], found["source"], [found["column"]]
+        if not used:
+            return []
+        hidden = await self._hidden(artifact, source)
+        return list(dict.fromkeys(c for c in used if c.lower() in hidden))
+
+    def _output(self, node_id: Any) -> Any:
+        if self._outputs is None:
+            self._outputs = _card_outputs(self._sealed, self._card, self._artifact)
+        artifact = self._outputs.get(str(node_id or ""))
+        content, ok = _fetch(artifact) if artifact else (None, None)
+        return content if ok is True else None
+
+    async def _hidden(self, artifact: str | None, source: str | None) -> set[str]:
+        key = (artifact, source)
+        if key not in self._memo:
+            snap, ok = _fetch(artifact) if artifact else (None, None)
+            snap = snap if ok is True and isinstance(snap, dict) else None
+            if snap is not None and snap.get("source") == MERGE_SOURCE:
+                hidden, _ = await _merge_masks(snap, self._masks)
+            else:
+                info = self._sealed.queries.get(artifact) if artifact else None
+                current, _ = await self._masks.of((info or {}).get("source") or source or (snap or {}).get("source"))
+                hidden = set(current) | (_recorded_masks(snap) if snap is not None else set())
+            self._memo[key] = hidden
+        return self._memo[key]
+
+
+def _card_outputs(sealed: _Sealed, card_node: str, artifact: str) -> dict[str, str]:
+    """口径卡算出这份指标集的那一次执行开始之前，每个节点最后一次的产出工件：卡上 vars.*、nodes.* 取到的就是它们。
+    认不出是哪一次执行（台账里没有这份指标集）时，取封存范围内每个节点最后一次的产出。"""
+    finished = next((seq for seq, etype, node_id, data in sealed.events
+                     if etype == "node.finished" and node_id == card_node and isinstance(data, dict)
+                     and any(isinstance(e, dict) and e.get("kind") == "metric_set" and e.get("artifact") == artifact
+                             for e in data.get("evidence") or [])), None)
+    if finished is None:
+        return dict(sealed.outputs)
+    started = max((seq for seq, etype, node_id, _ in sealed.events
+                   if etype == "node.started" and node_id == card_node and seq < finished), default=finished)
+    out: dict[str, str] = {}
+    for seq, etype, node_id, data in sealed.events:
+        if seq >= started:
+            break
+        if etype == "node.finished" and node_id and isinstance(data, dict) and data.get("artifact"):
+            out[node_id] = str(data["artifact"])
+    return out
 
 
 def _located(locator: dict[str, Any]) -> list[tuple[Any, Any]]:
@@ -897,6 +999,144 @@ def _caliber_upgrade(event: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(event, dict):
         return None
     return {k: event.get(k) for k in ("workflow_id", "caliber_node", "pinned", "latest", "policy", "policy_label")}
+
+
+#: 双盲复算节点产出里一个指标的结果（engine/nodes/dual_check.py 的 SAME / DIFFERENT / UNCHECKED），原样交给界面
+_DUAL_RESULTS = ("agreed", "disagreed", "unchecked")
+
+
+def _spec_of(sealed: _Sealed) -> GraphSpec | None:
+    """这次运行的图（认双盲复算复算哪张卡、反方审稿审哪份报告，和执行时同一个认法）。图读不懂的是 None。"""
+    try:
+        return GraphSpec.model_validate(sealed.graph)
+    except Exception:  # noqa: BLE001 - 图读不懂只是认不出来，证据照常给
+        return None
+
+
+def _dual_check_of(sealed: _Sealed, card_node: str, artifact: str, metric_id: Any) -> dict[str, Any] | None:
+    """这个指标的双盲复算状态：{status, node_id, choice?, blind_rendered?, reason?}。没有双盲复算复核过这份指标集的是 None。
+
+    认的是复核了口径卡的哪一次结果：台账条目（kind dual_check）记着它复算的指标集工件，和指标步骤的工件对上才算——口径卡
+    在循环里算了几次时，报告引用的那一次才是。直通了的（设置里关了、口径卡上没有来自查询的输入）没有台账条目：按画布上
+    它复算的那张卡、和它跑完之前那张卡最后一次的指标集认。几个双盲复算复核了同一份指标集时取最后跑完的那个。
+
+    - agreed / disagreed / unchecked：节点产出里这个指标的结果。不一致的带审核人的选择（a / b / neither，没选的不带）；
+      一致、不一致的带盲算值（渲染好的）；无法复算的带原因
+    - skipped：节点直通，reason 同节点产出（disabled / no_inputs）；或者节点跑了、这个指标不在复算范围里（没选它、值不是
+      数、没有来自查询的输入），reason 为 not_targeted
+    产出读不出来（文件不在、与哈希不一致）时按台账条目说状态和选择，不带盲算值和原因。
+    """
+    if not card_node or not artifact or metric_id is None:
+        return None
+    checkers = set(sealed.nodes_of("dual_check"))
+    if not checkers:
+        return None
+    spec: GraphSpec | None = None
+    #: 口径卡节点 → 到这一刻为止它最后一次的指标集
+    latest: dict[str, str] = {}
+    found: dict[str, Any] | None = None
+    for _, etype, node_id, data in sealed.events:
+        if etype != "node.finished" or not node_id or not isinstance(data, dict):
+            continue
+        ledger = [e for e in data.get("evidence") or [] if isinstance(e, dict)]
+        for e in ledger:
+            if e.get("kind") == "metric_set" and e.get("artifact"):
+                latest[node_id] = str(e["artifact"])
+        if node_id not in checkers:
+            continue
+        output, ok = _fetch(str(data.get("artifact") or ""))
+        output = output if ok is True and isinstance(output, dict) else {}
+        entry = next((e for e in ledger if e.get("kind") == "dual_check"), None)
+        if entry is not None:
+            card, checked = str(entry.get("card") or ""), str(entry.get("metric_set") or "")
+        elif output.get("status") == "skipped":
+            spec = spec or _spec_of(sealed)
+            node = spec.node_map().get(node_id) if spec else None
+            card = (dual_check_card(spec, node)[0] or "") if spec and node else ""
+            checked = latest.get(card, "")
+        else:
+            continue
+        if card != card_node or checked != artifact:
+            continue
+        found = _dual_status(node_id, output, entry, str(metric_id))
+    return found
+
+
+def _dual_status(node_id: str, output: dict[str, Any], entry: dict[str, Any] | None, metric_id: str) -> dict[str, Any]:
+    """一次双盲复算里这个指标的状态（_dual_check_of 的答复）。"""
+    if output.get("status") == "skipped":
+        return {"status": "skipped", "node_id": node_id, "reason": str(output.get("reason") or "")}
+    row = next((m for m in output.get("metrics") or [] if isinstance(m, dict) and str(m.get("metric_id")) == metric_id),
+               None)
+    if row is None and not output and entry is not None:
+        # 产出读不出来：退回台账条目，只有状态和选择
+        brief = next((m for m in entry.get("metrics") or [] if isinstance(m, dict) and str(m.get("id")) == metric_id),
+                     None)
+        row = {"status": brief.get("status"), **({"choice": brief["choice"]} if "choice" in brief else {})} \
+            if brief is not None else None
+    if row is None:
+        return {"status": "skipped", "node_id": node_id, "reason": "not_targeted"}
+    status = row.get("status") if row.get("status") in _DUAL_RESULTS else "unchecked"
+    out: dict[str, Any] = {"status": status, "node_id": node_id}
+    if status == "disagreed" and row.get("choice") in ("a", "b", "neither"):
+        out["choice"] = row["choice"]
+    rendered = row.get("blind_rendered")
+    if status != "unchecked" and isinstance(rendered, str) and rendered:
+        out["blind_rendered"] = rendered
+    if status == "unchecked" and isinstance(row.get("reason"), str) and row["reason"]:
+        out["reason"] = row["reason"]
+    return out
+
+
+def _challenge_of(sealed: _Sealed, report: _Report, unit_id: str) -> dict[str, Any] | None:
+    """这一句的反方审稿判断：{verdict, node_id, artifact, on_refuted, report_label}。没审到这一句的是 None。
+
+    只认审的就是正文这一份报告文档的：审稿记录（challenge_artifact）里记着它审的报告节点和文档工件，和这份对上才算——
+    报告在审稿之后又重写了（循环、接着跑），同一个句子编号在新的一稿里说的可能是另一句话。记录没存上（产出里的
+    challenge_artifact 为空）或读不出来时，按画布上它审的报告、和它跑完之前那份报告最后一次自查记下的文档认，判断取
+    产出里列的那几句（最多 10 句，被推翻、被削弱的排在前面），artifact 照产出写（没存上的为空）。几个反方审稿审了同一
+    份文档时取最后跑完、审到了这一句的那个。on_refuted 是实际生效的处置（degrade / flag），report_label 是报告节点的名字。
+    """
+    reviewers = set(sealed.nodes_of("challenge"))
+    if not reviewers or not unit_id:
+        return None
+    spec: GraphSpec | None = None
+    #: 报告节点 → 到这一刻为止它最后一次自查记下的文档
+    drafts: dict[str, str] = {}
+    found: dict[str, Any] | None = None
+    for _, etype, node_id, data in sealed.events:
+        if not node_id or not isinstance(data, dict):
+            continue
+        if etype == "report.checked" and data.get("doc_artifact"):
+            drafts[node_id] = str(data["doc_artifact"])
+            continue
+        if etype != "node.finished" or node_id not in reviewers:
+            continue
+        output, ok = _fetch(str(data.get("artifact") or ""))
+        if ok is not True or not isinstance(output, dict) or not isinstance(output.get("counts"), dict):
+            continue    # 直通了（关闭、没有可审的句子）或者产出读不出来
+        artifact = output.get("challenge_artifact") if isinstance(output.get("challenge_artifact"), str) else None
+        record, saved = _fetch(artifact) if artifact else (None, None)
+        if saved is True and isinstance(record, dict):
+            if record.get("report") != report.node_id or record.get("doc_artifact") != report.doc_artifact:
+                continue
+            claims = record.get("claims")
+        else:
+            spec = spec or _spec_of(sealed)
+            node = spec.node_map().get(node_id) if spec else None
+            target = challenge_report(spec, node)[0] if spec and node else None
+            if target != report.node_id or drafts.get(target) != report.doc_artifact:
+                continue
+            claims = output.get("items")
+        verdict = next((c.get("verdict") for c in claims or [] if isinstance(c, dict) and c.get("unit") == unit_id), None)
+        if not isinstance(verdict, str) or not verdict:
+            continue
+        spec = spec or _spec_of(sealed)
+        writer = spec.node_map().get(report.node_id) if spec else None
+        found = {"verdict": verdict, "node_id": node_id, "artifact": artifact,
+                 "on_refuted": str(output.get("on_refuted") or "degrade"),
+                 "report_label": writer.title if writer else report.node_id}
+    return found
 
 
 class _Masks:

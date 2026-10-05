@@ -14,7 +14,8 @@
   - nodes.* / input.*：那个节点在口径卡执行之前最后一次的产出工件
   - vars.*：有 value_artifact（口径卡当时另存的完整值）才还原得出来；老运行照实说当时没有保存
   - 容器本身是一份查询结果（带 artifact 的 {columns, rows}，或者和某份快照的 rows 一模一样的列表）：排除行就去掉那几行
-- 遮罩列取来的输入不给值、也不拿来推演：改一个输入、排除一行，新值和原值一比就能算出遮住的那一格
+- 遮罩列取来的输入不给值、也不拿来推演：改一个输入、排除一行，新值和原值一比就能算出遮住的那一格。vars.res.rows[0][2]
+  这种按位置取自查询结果的标量没有定位，顺着取值链认出是哪一列（positional_cell，证据面板的指标步骤用同一个认法）
 - 落在读不出来（文件不在、与哈希不一致）的查询快照上的输入同样不给值、不推演：那一格遮没遮核对不了，宁可多遮
 
 有的指标不论改什么都推演不了（_Plan.blocked）：卡上没记全输入、用到了遮罩列、最外层的输入还原不了（容器的完整值
@@ -334,7 +335,7 @@ def _restore(item: dict[str, Any], remaining: set[str], nested: set[str], store:
             # 也不拿来推演。数据源现在设的遮罩照样认（_masked），认出来了就按遮罩说
             inp.unreadable = True
             inp.problem = inp.problem or (TAMPERED if trouble == "tampered" else UNREADABLE)
-    inp.masked = _masked(inp, locator, store)
+    inp.masked = _masked(inp, locator, store) or _positional_masked(inp, store)
     return inp
 
 
@@ -414,6 +415,110 @@ def _masked(inp: _Input, locator: dict[str, Any], store: _Store) -> bool:
         return any(str(c).lower() in hidden for c in snap.get("columns") or [])
     columns = [locator.get("column")] if locator.get("column") else list((locator.get("columns") or {}).values())
     return any(isinstance(c, str) and c.lower() in hidden for c in columns)
+
+
+def _positional_masked(inp: _Input, store: _Store) -> bool:
+    """按位置取自查询结果的一格（vars.res.rows[0][2]）落在遮罩列上：卡上没记定位，顺着取值链找到那份结果、认出是哪一列。
+    认不出来的（结果里没带快照的 id、取值链走不通）不算：和以前一样照常推演。"""
+    if inp.snapshot is not None or inp.shape != "scalar" or inp.item.get("via") in ("tool_cell", "agent_field"):
+        return False
+    found = positional_cell(inp.path, inp.item.get("node_id"), lambda node_id: store.output(node_id)[0])
+    hidden = store.sources.masked.get(found["artifact"]) if found and found["artifact"] else None
+    return bool(hidden) and isinstance(found["column"], str) and found["column"].lower() in hidden
+
+
+#: 取值链没走通
+_GONE = object()
+
+
+def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any]) -> dict[str, Any] | None:
+    """按位置取自一份查询结果的一格：vars.res.rows[0][2]、nodes.parse.rows[1]['amount'] 这种标量引用——查询结果经数据
+    整形解析成对象之后按行号、列号（或列名）取。返回 {artifact, source, row, column}：artifact、source 是那份结果里带着的
+    （数据源工具、合并查询交回的结果都带，没有的是 None），row 是从 0 数的行号，column 是列名。认不出来的返回 None。
+
+    遮罩要按列认（证据面板的指标步骤、推演都用这个）：cell() 和 Agent 字段有定位，这种引用卡上只记了路径和值。
+
+    output(节点 id) 交回那个节点当时的产出（读不出来给 None）。nodes.X 的根就是 X 的产出；vars.X 是写它的节点（输入记着
+    的 node_id）交给变量的那个值——数据整形、合并查询交的是产出本身，Agent、LLM、代码节点交的是产出里的 data，工具节点
+    交的是 JSON 文本，都试一遍，取值链走得通的那个就是。下标得是字面量：rows[vars.i] 要另取一个值才知道是哪一行，不认。
+    """
+    try:
+        tree = ast.parse(path, mode="eval").body
+    except SyntaxError:
+        return None
+    keys: list[Any] = []
+    while isinstance(tree, (ast.Attribute, ast.Subscript)):
+        if isinstance(tree, ast.Attribute):
+            keys.append(tree.attr)
+        else:
+            key = _literal_key(tree.slice)
+            if key is _GONE:
+                return None
+            keys.append(key)
+        tree = tree.value
+    keys.reverse()
+    if not isinstance(tree, ast.Name) or tree.id not in ("vars", "nodes") or len(keys) < 4 \
+            or not isinstance(keys[0], str):
+        return None
+    base = output(keys[0] if tree.id == "nodes" else node_id)
+    candidates = [base]
+    if isinstance(base, dict) and "data" in base:
+        candidates.append(base["data"])
+    if isinstance(base, str):
+        try:
+            candidates.append(json.loads(base))
+        except ValueError:
+            pass
+    for value in candidates:
+        if (found := _cell_in(value, keys[1:])) is not None:
+            return found
+    return None
+
+
+def _literal_key(node: ast.AST) -> Any:
+    """下标里的字面量：整数（含负数）或者文本。别的（变量、算式）交回 _GONE。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, str)) and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) and isinstance(node.operand, ast.Constant) \
+            and isinstance(node.operand.value, int) and not isinstance(node.operand.value, bool):
+        return -node.operand.value
+    return _GONE
+
+
+def _cell_in(value: Any, keys: list[Any]) -> dict[str, Any] | None:
+    """沿取值链往下走，走到一份查询结果（带 rows 列表的对象）、剩下的正好是 rows[行][列] 时交回那一格。"""
+    for i, key in enumerate(keys):
+        if isinstance(value, dict) and isinstance(value.get("rows"), list) and len(keys) - i == 3 and key == "rows":
+            return _cell_at(value, keys[i + 1], keys[i + 2])
+        if isinstance(value, dict) and isinstance(key, str):
+            value = value.get(key, _GONE)
+        elif isinstance(value, list) and isinstance(key, int) and -len(value) <= key < len(value):
+            value = value[key]
+        else:
+            return None
+        if value is _GONE:
+            return None
+    return None
+
+
+def _cell_at(result: dict[str, Any], row: Any, column: Any) -> dict[str, Any] | None:
+    rows = result["rows"]
+    if not isinstance(row, int) or not -len(rows) <= row < len(rows):
+        return None
+    row = row % len(rows)
+    record = rows[row]
+    columns = [str(c) for c in result.get("columns") or []]
+    if isinstance(column, int) and isinstance(record, (list, tuple)) and -len(columns) <= column < len(columns):
+        name: str | None = columns[column]
+    elif isinstance(column, str) and (column in columns or (isinstance(record, dict) and column in record)):
+        name = column
+    else:
+        name = None
+    if name is None:
+        return None
+    artifact, source = result.get("artifact"), result.get("source")
+    return {"artifact": artifact if isinstance(artifact, str) and artifact else None,
+            "source": source if isinstance(source, str) and source else None, "row": row, "column": name}
 
 
 def _static(path: str) -> bool:
@@ -838,6 +943,30 @@ def _fixed(inp: _Input) -> str | None:
         return None if _row_span(inp) is not None else FIXED_CONTAINER
     value = inp.item.get("value")
     return None if value is None or is_number(value) else NOT_NUMBER
+
+
+def substituted_without(metric: dict[str, Any], paths: Iterable[str], token: str) -> str | None:
+    """卡上的代入式，只把 paths 这几个输入代成 token（证据面板给取自遮罩列的输入写「已遮罩」），别的照卡上代。
+
+    按卡上记的输入值重新代一遍：先核对一个都不换时代出来的和卡上记的一字不差，对不上（卡上记的不是原值、老卡的写法）
+    就整条不给，交回 None——宁可不显示代入式，也不能让遮着的值从对不上的那一处漏出来。卡上没代成字面量的（容器、太长的
+    文本）照旧留原路径。嵌在别的引用里的输入不单独换：外面那个引用代成了它的值，里面那一格本来就不出现。
+    """
+    expr, recorded = metric.get("expression"), metric.get("substituted")
+    if not isinstance(expr, str) or not isinstance(recorded, str):
+        return None
+    try:
+        tree, _, _ = parse_expression(expr)
+        kept = set(leaf_refs(parse_expression(recorded)[0]))
+    except ExpressionError:
+        return None
+    values = {str(i["path"]): i.get("value") for i in metric.get("inputs") or []
+              if isinstance(i, dict) and isinstance(i.get("path"), str) and i["path"] not in kept}
+    if substitute(tree, values) != recorded:
+        return None
+    hidden = set(paths)
+    swapped = ast.fix_missing_locations(_Bind({p: token for p in hidden}).visit(copy.deepcopy(tree)))
+    return substitute(swapped, {p: v for p, v in values.items() if p not in hidden})
 
 
 # --------------------------------------------------------------------------
