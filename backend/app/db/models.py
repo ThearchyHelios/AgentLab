@@ -749,3 +749,97 @@ class ConversationTurn(Base, TimestampMixin):
     meta: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     conversation: Mapped[Conversation] = relationship(back_populates="turns")
+
+
+# --------------------------------------------------------------------------
+# 定时任务：按 cron 到点发起运行，结束、失败、停在审批时推送 Webhook（app/scheduler）
+# --------------------------------------------------------------------------
+
+
+class Schedule(Base, TimestampMixin):
+    """一个定时任务。webhook_url、webhook_secret 落库前经 app.core.crypto 加密，接口只返回主机和末 4 位。
+
+    不给 workflow_id 设外键：工作流删掉之后任务留着，到点照常发起、照实记一次未能发起（「工作流不存在」），
+    订阅了失败通知的人会收到——悄悄跟着删掉，每周的报告就无声无息地没了。
+    """
+
+    __tablename__ = "schedules"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(200), default="")
+    workflow_id: Mapped[str] = mapped_column(String(32), index=True)
+    # 保存时的工作流名。工作流还在时接口给它现在的名字，删掉之后才用这一份
+    workflow_name: Mapped[str] = mapped_column(String(200), default="")
+    cron: Mapped[str] = mapped_column(String(200))
+    timezone: Mapped[str] = mapped_column(String(64))
+    # formal：每次都从当前发布版本发起正式运行；exploratory：用工作流现在的画布
+    run_class: Mapped[str] = mapped_column(String(20), default="formal")
+    # {输入字段名: 模板字符串}，到点按触发时间渲染（scheduler/service.py）
+    input_template: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    # 上一次运行还没结束时怎么办。目前只有 skip：记一次跳过
+    overlap: Mapped[str] = mapped_column(String(20), default="skip")
+    # 错过的触发（服务停机等）在这么多秒内补一次，超出就记跳过
+    misfire_grace_s: Mapped[int] = mapped_column(Integer, default=3600)
+    # generic | feishu | wecom | dingtalk。没配 Webhook 时 url 为空
+    webhook_format: Mapped[str | None] = mapped_column(String(20), default=None)
+    webhook_url: Mapped[str | None] = mapped_column(Text, default=None)  # 密文
+    webhook_secret: Mapped[str | None] = mapped_column(Text, default=None)  # 密文
+    webhook_events: Mapped[list[Any]] = mapped_column(default=list)
+    # 下一次触发的时刻（UTC）。停用时为空；调度循环按它认领，认领时推进到再下一次
+    next_run_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None, index=True)
+    created_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    # 乐观锁：PATCH 带上读到的版本，对不上回 409。调度循环推进 next_run_at 不改它
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ScheduleFire(Base):
+    """一次触发：到点、立即运行、或者错过的补跑 / 跳过。(schedule_id, fire_at, kind) 唯一：两拍撞在一起时，
+    后插入的那条撞上约束就知道这一次已经有人处理了，不会发起第二次。"""
+
+    __tablename__ = "schedule_fires"
+    __table_args__ = (
+        UniqueConstraint("schedule_id", "fire_at", "kind"),
+        Index("ix_schedule_fires_schedule_created", "schedule_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    schedule_id: Mapped[str] = mapped_column(ForeignKey("schedules.id", ondelete="CASCADE"))
+    # 计划触发的时刻（UTC）。立即运行是点下去的那一秒；输入模板的日期变量都按它算
+    fire_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    # scheduled | manual | misfire
+    kind: Mapped[str] = mapped_column(String(20), default="scheduled")
+    # started | skipped_overlap | skipped_misfire | failed_to_start
+    status: Mapped[str] = mapped_column(String(30), default="started")
+    run_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
+    # 渲染后的输入，就是交给运行的那一份
+    inputs: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # 已经按哪个运行状态处理过通知（succeeded / failed / cancelled / interrupted / failed_to_start）。
+    # 运行状态变了、和它不同才再看要不要推送，同一状态只处理一次
+    notified_status: Mapped[str | None] = mapped_column(String(30), default=None)
+    # 和同一任务上一次运行的比较结果（工件 id），后续的运行对比工作包写
+    compare_artifact: Mapped[str | None] = mapped_column(String(64), default=None)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class WebhookDelivery(Base):
+    """一次 Webhook 推送（含重试）的结果。error 只写主机名和平台返回的错误码，不含地址、key、密钥。
+    「测试 Webhook」也记一条：fire_id、run_id 为空，event 是 test。"""
+
+    __tablename__ = "webhook_deliveries"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    schedule_id: Mapped[str] = mapped_column(ForeignKey("schedules.id", ondelete="CASCADE"), index=True)
+    fire_id: Mapped[str | None] = mapped_column(
+        ForeignKey("schedule_fires.id", ondelete="CASCADE"), default=None, index=True
+    )
+    run_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    # finished | failed | awaiting_approval | test
+    event: Mapped[str] = mapped_column(String(30))
+    # ok | failed
+    status: Mapped[str] = mapped_column(String(20))
+    http_status: Mapped[int | None] = mapped_column(Integer, default=None)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

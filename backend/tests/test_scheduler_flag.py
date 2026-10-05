@@ -38,7 +38,7 @@ def test_unrecognized_value_fails_at_startup(monkeypatch):
 
 
 async def test_start_and_stop_are_safe_noops():
-    """调度循环还没实现：start / stop 什么都不做，没 start 过直接 stop 也不出错"""
+    """测试环境关着调度（conftest）：start 不起循环，没 start 过直接 stop 也不出错。开着时的循环见 test_scheduler_loop"""
     await scheduler.stop()
     await scheduler.start()
     await scheduler.stop()
