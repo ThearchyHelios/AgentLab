@@ -124,6 +124,13 @@ def test_bad_templates_explain_in_chinese(template, fragments):
         assert fragment in str(caught.value), str(caught.value)
 
 
+def test_field_names_are_trimmed_and_unique():
+    assert service.check_template({" stat_date ": "{{ schedule.yesterday }}"}) == {"stat_date": "{{ schedule.yesterday }}"}
+    with pytest.raises(TemplateError) as caught:
+        service.check_template({"stat_date": "a", "stat_date ": "b"})
+    assert "stat_date" in str(caught.value) and "两次" in str(caught.value)
+
+
 def test_variable_catalog():
     items = service.variables(datetime(2026, 10, 5, 1, 0, tzinfo=UTC), "Asia/Shanghai")
     names = [i["name"] for i in items]

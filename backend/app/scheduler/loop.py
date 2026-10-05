@@ -116,6 +116,14 @@ async def tick(now: datetime | None = None) -> None:
     await webhook.notify_due(now)
 
 
+async def _notify(webhook) -> None:  # noqa: ANN001 - 传进来的是 app.scheduler.webhook 模块
+    """后台跑一遍通知扫描。出错只记日志：这个任务没人 await，异常留在里面只会变成一句「从未取回的异常」。"""
+    try:
+        await webhook.notify_due()
+    except Exception:  # noqa: BLE001
+        logger.exception("定时任务的通知推送这一拍出错，下一拍照常进行")
+
+
 class _Runner:
     """调度循环的任务。照 sandbox/manager.py 回收闲置会话的写法：一个 asyncio 任务，出错记日志接着下一拍。"""
 
@@ -142,7 +150,7 @@ class _Runner:
             try:
                 await fire_due()
                 if self.notify is None or self.notify.done():
-                    self.notify = asyncio.create_task(webhook.notify_due(), name="agentlab-scheduler-notify")
+                    self.notify = asyncio.create_task(_notify(webhook), name="agentlab-scheduler-notify")
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - 这一拍出错不该让循环停下

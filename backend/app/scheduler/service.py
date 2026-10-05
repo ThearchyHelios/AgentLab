@@ -107,13 +107,19 @@ def check_template(template: Any) -> dict[str, str]:
         return {}
     if not isinstance(template, dict):
         raise TemplateError("输入模板需要是「字段名：模板」的对象，例如 stat_date 对应 {{ schedule.yesterday }}")
-    for name, text in template.items():
-        if not isinstance(name, str) or not name.strip():
+    out: dict[str, str] = {}
+    for raw, text in template.items():
+        # 字段名去掉首尾空白再存：「 stat_date」交给运行，入口节点认不出它，必填项照样报缺
+        name = raw.strip() if isinstance(raw, str) else ""
+        if not name:
             raise TemplateError("输入模板里有空的字段名，请填写工作流的输入字段名")
+        if name in out:
+            raise TemplateError(f"输入模板里字段「{name}」写了两次，请只保留一个")
         if not isinstance(text, str):
             raise TemplateError(f"输入「{name}」的值需要是文本（可以带 {{{{ schedule.yesterday }}}} 这样的变量），当前为「{text}」")
         _check_text(name, text)
-    return dict(template)
+        out[name] = text
+    return out
 
 
 def _check_text(name: str, text: str) -> None:
