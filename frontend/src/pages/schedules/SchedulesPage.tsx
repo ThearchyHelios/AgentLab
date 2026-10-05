@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { CalendarClock, Play, Plus, Trash2 } from 'lucide-react'
 import { api } from '../../api/client'
-import { EmptyState, ErrorState, IconButton, PageHeader, Skeleton, Spinner, useTicker } from '../../components/ui'
+import { EmptyState, ErrorState, IconButton, PageHeader, Skeleton, Spinner, toast, useTicker } from '../../components/ui'
 import { useOnReconnect } from '../../store/catalog'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import type { Schedule } from '../../types'
@@ -48,8 +48,9 @@ function ScheduleListPage() {
       setError(null)
     } catch (e) {
       if (n !== seq.current) return
-      // 读到过列表之后，定时刷新失败不把整页换成错误：手上的照旧是真数据
-      if (!(opts?.silent && hasRows.current)) setError(e)
+      // 读到过列表之后失败不把整页换成错误，手上的照旧是真数据：定时刷新不吭声，别的（重新载入）弹提示
+      if (!hasRows.current) setError(e)
+      else if (!opts?.silent) toast.error(e)
     }
   }, [])
   useEffect(() => { void load() }, [load])
@@ -80,7 +81,8 @@ function ScheduleListPage() {
   const run = (s: Schedule) => act(s, 'run', async () => {
     const out = await runNow(s, navigate)
     if (!out) return
-    replace({ ...s, last_fire: out.fire })
+    // 只换上次触发：这一行在请求途中可能被开关改过，不拿点下去那一刻的旧值整行盖回去
+    setRows((rs) => rs && rs.map((r) => (r.id === s.id ? { ...r, last_fire: out.fire } : r)))
     // 下次运行、运行状态以服务端为准，再静默取一遍
     void load({ silent: true })
   })
