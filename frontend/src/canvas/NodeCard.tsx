@@ -768,7 +768,7 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const fanIn = useStudio((s) => (state === 'queued' ? fanInOf(s.nodes, s.edges)[id] ?? 0 : 0))
   // 节点定义给了摘要钩子（摘要要提到别的节点：双盲复算复算的是哪张口径卡）就用它，没给照旧走 summarize。
   // 选择器只返回字符串：别的节点改了、这一句没变，卡片就不重渲染
-  const hookedSummary = useStudio((s) => def?.summary?.({ id, config: data.config, nodes: s.nodes, edges: s.edges }) ?? '')
+  const hookedSummary = useStudio((s) => def?.summary?.({ id, config: data.config ?? {}, nodes: s.nodes, edges: s.edges }) ?? '')
 
   const Icon = def?.icon ?? Sparkles
   const handles = sourceHandles(type, data.config)
