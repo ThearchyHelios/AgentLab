@@ -10,20 +10,27 @@ SQL，Agent 节点 bot 自己再查一次、把各区域的金额作为数组字
 - 遮罩列的值绝不出现在结果里；用到遮罩列的指标不拆分
 - 模板对比：新增、删除的节点，配置有变化的节点和配置项名
 - 输入的出处：合并查询追到它的上游查询；Agent 按出处交的字段还要引用同一列、同一段行（行段相同、一边是整份结果
-  一边不是的不算）；没按出处交的数、上游数据没变数却变了的、上游的 Agent 两次交出的结果不同的，说不清变化从哪来
-  （incomparable）；图里写死的字面量改了、连线变了、读到的默认设置变了都算模板变化
+  一边不是的不算；都不是整份结果的，一边引用了的区域另一边还在快照里却没引用的也不算）；没按出处交的数、上游数据
+  没变数却变了的、上游的 Agent 两次交出的结果不同的，说不清变化从哪来（incomparable），记不出写入者的只看口径卡
+  之前可能执行过的节点；图里写死的字面量改了、连线变了、读到的默认设置变了都算模板变化
 """
 from __future__ import annotations
 
+import ast
 import copy
+import importlib
 import inspect
 import json
-import re
+import pkgutil
+import textwrap
 from decimal import Decimal
+from types import SimpleNamespace
 
+import app.engine.nodes as nodes_package
 from app.engine import compare
 from app.engine.compiler import RUNNERS
 from app.engine.merge_query import MERGE_SOURCE
+from app.engine.schema import NodeType
 from tests.fixtures.compare_runs import (
     BASE_ROWS,
     COLUMNS,
@@ -610,6 +617,9 @@ def test_a_code_node_after_an_agent_that_answered_differently_is_incomparable():
     assert calc["classification"] == "incomparable" and calc["attribution"] is None
     assert calc["reasons"] == ["输入「vars.adj」来自「调整」，它的上游节点「区域分析」（Agent）两次交出的结果不同，"
                                "无法判断变化是否来自数据"]
+    # Agent 交的不同，代码节点交的数两次一样：照常没变，没有可说不清的变化
+    calc = by_id(run_compare(make("r1", BASE_ROWS, 0.46, value=1.0), make("r2", NEXT_ROWS, 0.52, value=1.0)))["calc"]
+    assert (calc["classification"], calc["reasons"]) == ("unchanged", [])
 
     # Agent 的产出两次都没落成工件（写工件失败）：一样不一样核对不了，同样不报成数据变化
     def unstored(run):
@@ -622,20 +632,89 @@ def test_a_code_node_after_an_agent_that_answered_differently_is_incomparable():
 
 
 def test_a_reconfigured_node_upstream_of_a_code_node_is_named():
-    """代码节点上游的数据整形节点改了表达式（SQL 一字没改）：代码节点交的数变了说不清从哪来，说明里点出改的是哪个节点。"""
-    def make(run_id, expression, rows, value):
-        shape = node("shape", "transform", "整理", mode="expression", expression=expression, assign_to="kept")
-        run = Fake(run_id, graph=weekly_graph(after_fetch=(shape, calc_node())))
+    """代码节点上游的数据整形节点改了表达式（SQL 一字没改）：代码节点交的数变了说不清从哪来，说明里点出改的是哪个节点；
+    改了几个的，点名画布上最靠前的那个（节点 ID 的先后和画布上的先后不同）。"""
+    def make(run_id, expressions, rows, value):
+        shapes = [node(nid, "transform", label, mode="expression", expression=expression, assign_to=f"kept_{nid}")
+                  for (nid, label), expression in zip((("shape_m", "整理"), ("shape_z", "再整理"), ("shape_a", "汇总")),
+                                                      expressions)]
+        run = Fake(run_id, graph=weekly_graph(after_fetch=(*shapes, calc_node())))
         run.tool("fetch", region_sql(), rows=rows)
         run.agent("bot", region_sql(), rows=rows)
         run.code("calc", value, "adj")
         run.card(code_metrics(value)(None, None, rows, rows))
         return run
 
-    calc = by_id(run_compare(make("r1", "nodes.fetch.rows", BASE_ROWS, 10),
-                             make("r2", "nodes.fetch.rows[:2]", NEXT_ROWS, 12)))["calc"]
+    same = ["nodes.fetch.rows"] * 3
+    calc = by_id(run_compare(make("r1", same, BASE_ROWS, 10),
+                             make("r2", ["nodes.fetch.rows[:2]", *same[1:]], NEXT_ROWS, 12)))["calc"]
     assert calc["classification"] == "incomparable"
     assert calc["reasons"] == ["输入「vars.adj」来自「调整」，上游节点「整理」的配置有变化，无法判断变化来源"]
+    calc = by_id(run_compare(make("r1", same, BASE_ROWS, 10),
+                             make("r2", ["nodes.fetch.rows[:2]"] * 3, NEXT_ROWS, 12)))["calc"]
+    assert calc["reasons"] == ["输入「vars.adj」来自「调整」，上游节点「整理」的配置有变化，无法判断变化来源"]
+
+
+def test_a_report_upstream_of_a_code_node_that_wrote_differently_is_incomparable():
+    """代码节点上游有报告撰写节点（文字是模型写的），两次写得不同：代码节点交的数变了，可能来自数据，也可能来自模型
+    本身的差异；两次写得一字不差的（产出工件一样）照常是数据变化。"""
+    def make(run_id, rows, text, value):
+        run = Fake(run_id, graph=weekly_graph(after_fetch=(node("draft", "report", "初稿"), calc_node())))
+        run.tool("fetch", region_sql(), rows=rows)
+        run.add("node.started", "draft", {"node_type": "report"})
+        run.add("node.finished", "draft", {"artifact": run.put({"text": text})})
+        run.agent("bot", region_sql(), rows=rows)
+        run.code("calc", value, "adj")
+        run.card(code_metrics(value)(None, None, rows, rows))
+        return run
+
+    calc = by_id(run_compare(make("r1", BASE_ROWS, "上周初稿", 10), make("r2", NEXT_ROWS, "本周初稿", 12)))["calc"]
+    assert calc["classification"] == "incomparable"
+    assert calc["reasons"] == ["输入「vars.adj」来自「调整」，它的上游节点「初稿」（报告撰写）两次交出的结果不同，"
+                               "无法判断变化是否来自数据"]
+    calc = by_id(run_compare(make("r1", BASE_ROWS, "初稿", 10), make("r2", NEXT_ROWS, "初稿", 12)))["calc"]
+    assert (calc["classification"], calc["reasons"]) == ("data_only", [compare.DATA_FROM_UPSTREAM])
+
+
+def test_an_unknown_writer_is_looked_for_only_among_nodes_before_the_card():
+    """两边都记不出 vars.adj 是哪个节点写的：只看口径卡之前可能执行过的节点。口径卡自己改了配置、它下游的写周报两次写得
+    不同，都写不了它读到的值，不能点名成它的上游；它上游的节点改了配置照常说不清，并行支路上的节点也可能先写了变量，
+    同样说不清，只是不说成「上游」。"""
+    def make(run_id, rows, value, *, other="1", report="上周", reshape="nodes.fetch.rows", aside="nodes.fetch.rows"):
+        graph = chain(node("start", "input", "开始"),
+                      node("fetch", "tool", "区域取数", tool=TOOL, args={"sql": region_sql()}),
+                      node("shape", "transform", "整理", mode="expression", expression=reshape, assign_to="kept"),
+                      node("calc", "code", "调整", code="x", assign_to="adj"),
+                      node("card", "metrics", "周报口径卡", caliber="周报口径", caliber_version="v1",
+                           metrics=[{"id": "other", "expression": other}]),
+                      node("write", "report", "写周报"), node("out", "output", "成果"))
+        # 并行支路：开始 → 旁路整理 → 成果，和口径卡不在一条线上
+        graph["nodes"].append(node("aside", "transform", "旁路整理", mode="expression", expression=aside,
+                                   assign_to="extra"))
+        graph["edges"] += [{"source": "start", "target": "aside"}, {"source": "aside", "target": "out"}]
+        run = Fake(run_id, graph=graph)
+        run.tool("fetch", region_sql(), rows=rows)
+        run.code("calc", value, "adj")
+        run.card([metric("calc", "vars.adj * 2", value * 2, [scalar_in("vars.adj", value, None, "state")])])
+        run.add("node.started", "write", {"node_type": "report"})
+        run.add("node.finished", "write", {"artifact": run.put({"text": report})})
+        return run
+
+    # 口径卡自己改了另一个指标的定义，写周报两次写得不同：都在它之后执行，变化照常来自上游数据
+    calc = by_id(run_compare(make("r1", BASE_ROWS, 10), make("r2", NEXT_ROWS, 12, other="2", report="本周")))["calc"]
+    assert (calc["classification"], calc["reasons"]) == ("data_only", [compare.DATA_FROM_UPSTREAM_SCOPED])
+    calc = by_id(run_compare(make("r1", BASE_ROWS, 10), make("r2", NEXT_ROWS, 12, report="本周")))["calc"]
+    assert (calc["classification"], calc["reasons"]) == ("data_only", [compare.DATA_FROM_UPSTREAM])
+    # 口径卡上游的整理节点改了表达式
+    calc = by_id(run_compare(make("r1", BASE_ROWS, 10),
+                             make("r2", NEXT_ROWS, 12, reshape="nodes.fetch.rows[:2]")))["calc"]
+    assert calc["classification"] == "incomparable"
+    assert calc["reasons"] == ["输入「vars.adj」不知道由哪个节点写入，上游节点「整理」的配置有变化，无法判断变化来源"]
+    # 并行支路上的旁路整理改了表达式
+    calc = by_id(run_compare(make("r1", BASE_ROWS, 10),
+                             make("r2", NEXT_ROWS, 12, aside="nodes.fetch.rows[:2]")))["calc"]
+    assert calc["classification"] == "incomparable"
+    assert calc["reasons"] == ["输入「vars.adj」不知道由哪个节点写入，节点「旁路整理」的配置有变化，无法判断变化来源"]
 
 
 def test_a_run_input_upstream_of_a_code_node_is_a_parameter_change():
@@ -798,6 +877,11 @@ def test_a_changed_default_model_is_a_template_change_for_agents_that_follow_it(
     many["defaults"] = {"provider": "openai", "model": "model-b", "temperature": 0.5, "max_tokens": 2000}
     share = by_id(run_compare(uncited("r1", 0.46, graph=base_graph), uncited("r2", 0.52, graph=many)))["share"]
     assert share["reasons"] == ["上游节点「区域分析」跟随的工作流默认设置（模型接入、模型、温度等 4 项）有变化"]
+    # 同时改了 Agent 不读的结论句裁判：只写它跟着变的模型
+    judged = copy.deepcopy(target_graph)
+    judged["defaults"]["judge"] = {"max_cost_usd": 1.0}
+    share = by_id(run_compare(uncited("r1", 0.46, graph=base_graph), uncited("r2", 0.52, graph=judged)))["share"]
+    assert share["reasons"] == ["上游节点「区域分析」跟随的工作流默认设置（模型）有变化"]
     # Agent 自己指定了模型：默认设置变了它不跟着变
     for graph in (base_graph, target_graph):
         graph["nodes"][2]["data"]["config"]["model"] = "model-x"
@@ -823,17 +907,19 @@ def test_defaults_that_agents_do_not_read_leave_them_alone():
 def test_a_model_default_reaches_every_node_that_calls_the_model():
     """默认模型换了，跟着换的不只 Agent：让模型分类的条件分支、让模型修复的结构校验（默认开着）、用模型重排的知识检索
     也是。它们在代码节点上游时，代码节点交的数变了不能说来自上游数据；不调模型的照常。"""
-    def calc(extra):
-        def make(run_id, model, rows, value):
+    def calc(extra, before=None, after=None):
+        def make(run_id, defaults, rows, value):
             graph = weekly_graph(after_fetch=(extra, calc_node()))
-            graph["defaults"] = {"provider": "anthropic", "model": model}
+            graph["defaults"] = defaults
             run = Fake(run_id, graph=graph)
             run.tool("fetch", region_sql(), rows=rows)
             run.agent("bot", region_sql(), rows=rows)
             run.code("calc", value, "adj")
             run.card(code_metrics(value)(None, None, rows, rows))
             return run
-        return by_id(run_compare(make("r1", "model-a", BASE_ROWS, 10), make("r2", "model-b", NEXT_ROWS, 12)))["calc"]
+        before = before or {"provider": "anthropic", "model": "model-a"}
+        after = after or {"provider": "anthropic", "model": "model-b"}
+        return by_id(run_compare(make("r1", before, BASE_ROWS, 10), make("r2", after, NEXT_ROWS, 12)))["calc"]
 
     cases = [{"key": "peak", "condition": "true"}]
     for extra in (node("route", "branch", "分流", mode="llm", instruction="判断是否旺季", cases=cases),
@@ -849,29 +935,121 @@ def test_a_model_default_reaches_every_node_that_calls_the_model():
         found = calc(extra)
         assert found["classification"] == "data_only", (extra["type"], found["reasons"])
 
+    # 调不调模型也可能由默认设置定：条件分支没写判断方式、默认设置写了让模型判断的，跟着默认模型变；结构校验的默认
+    # 设置关了让模型修复的，不跟着变
+    asks = node("route", "branch", "分流", instruction="判断是否旺季", cases=cases)
+    found = calc(asks, {"mode": "llm", "model": "model-a"}, {"mode": "llm", "model": "model-b"})
+    assert found["classification"] == "incomparable", found["reasons"]
+    assert found["reasons"] == ["输入「vars.adj」来自「调整」，上游节点「分流」跟随的工作流默认设置（模型）有变化，"
+                                "无法判断变化来源"]
+    found = calc(node("route", "validate", "校验", schema={"type": "object"}),
+                 {"repair_with_llm": False, "model": "model-a"}, {"repair_with_llm": False, "model": "model-b"})
+    assert found["classification"] == "data_only", found["reasons"]
+    # 默认的判断方式这次改成了按表达式：基准运行那次让模型判断过，跟着变的是判断方式和模型两项
+    found = calc(asks, {"mode": "llm", "model": "model-a"}, {"mode": "expression", "model": "model-b"})
+    assert found["reasons"] == ["输入「vars.adj」来自「调整」，上游节点「分流」跟随的工作流默认设置（判断方式、模型）"
+                                "有变化，无法判断变化来源"]
+
+
+#: 只顺着节点模块里的函数往下找：别处的函数不经 NodeContext.cfg 读节点配置
+_NODE_MODULES = "app.engine.nodes."
+
+
+def _defined_here(obj):
+    """obj 是定义在节点模块里的函数或类（装饰过的取原函数），否则 None。"""
+    obj = inspect.unwrap(obj) if inspect.isfunction(obj) else getattr(obj, "func", obj)
+    if (inspect.isfunction(obj) or inspect.isclass(obj)) and obj.__module__.startswith(_NODE_MODULES):
+        return obj
+    return None
+
+
+def _settings_read(runner):
+    """一类节点的执行器运行时按 NodeContext.cfg 读的配置项（节点上没写就回退到默认设置）：执行器自己的函数体，加上它
+    用到的、定义在节点模块里的函数和类，一层层往下找（函数里就地 import 的也算）。返回 (配置项, 认不出键名的读法,
+    走到的函数)。键名是变量的，只认在字面量元组上循环出来的（Agent 的预算三项）；别的变量键名认不出是哪几项，
+    原样交回，测试据此失败。"""
+    read, unknown, seen = set(), [], set()
+    todo = [runner]
+    while todo:
+        fn = _defined_here(todo.pop())
+        if fn is None or (fn.__module__, fn.__qualname__) in seen:
+            continue
+        seen.add((fn.__module__, fn.__qualname__))
+        names = vars(importlib.import_module(fn.__module__))        # 它所在模块里的名字（类没有 __globals__）
+        parts = list(ast.walk(ast.parse(textwrap.dedent(inspect.getsource(fn)))))
+        imported = {alias.asname or alias.name: (part.module, alias.name) for part in parts
+                    if isinstance(part, ast.ImportFrom) and part.module for alias in part.names}
+        looped = {}         # 循环变量 → 它在字面量元组上取到的键名：{k: ctx.cfg(k) for k in ("max_steps", …)}
+        for part in parts:
+            for gen in getattr(part, "generators", None) or ([part] if isinstance(part, ast.For) else []):
+                if isinstance(gen.target, ast.Name) and isinstance(gen.iter, (ast.Tuple, ast.List)) and all(
+                        isinstance(e, ast.Constant) and isinstance(e.value, str) for e in gen.iter.elts):
+                    looped[gen.target.id] = {e.value for e in gen.iter.elts}
+        for part in parts:
+            called = part.func if isinstance(part, ast.Call) else None
+            if isinstance(called, ast.Attribute) and called.attr == "cfg":
+                key = part.args[0] if part.args else None
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    read.add(key.value)
+                elif isinstance(key, ast.Name) and key.id in looped:
+                    read |= looped[key.id]
+                else:
+                    unknown.append(f"{fn.__qualname__}: {ast.unparse(part)}")
+            elif isinstance(called, ast.Attribute) and called.attr == "approval_mode":
+                read.add("approval")        # NodeContext.approval_mode 同样先读节点、再回退到默认设置
+            elif isinstance(called, ast.Name) and called.id == "_setting":
+                # 报告模块的 _setting(spec, 节点, 键) 和 NodeContext.cfg 同一个规则
+                key = part.args[2] if len(part.args) > 2 else None
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    read.add(key.value)
+                else:
+                    unknown.append(f"{fn.__qualname__}: {ast.unparse(part)}")
+            elif isinstance(part, ast.Name) and isinstance(part.ctx, ast.Load):
+                # 调用、当回调传出去的函数都算用到了
+                target = names.get(part.id)
+                if target is None and part.id in imported:
+                    module, name = imported[part.id]
+                    target = getattr(importlib.import_module(module), name, None)
+                todo.append(target)
+            elif isinstance(part, ast.Attribute) and isinstance(part.value, ast.Name):
+                module = names.get(part.value.id)
+                if inspect.ismodule(module):
+                    todo.append(getattr(module, part.attr, None))
+    return read, unknown, seen
+
 
 def test_every_setting_a_node_reads_is_known_to_the_comparison():
     """节点运行时按 NodeContext.cfg 读配置，节点上没写就回退到图级默认设置。对比按「哪类节点读哪几项」把默认设置的
-    变化落到节点上（compare._CFG_KEYS）：执行器新读了一项、这里没登记，默认设置改了这一项就会被漏掉。"""
-    by_module: dict = {}
+    变化落到节点上（compare._CFG_KEYS）：执行器新读了一项、这里没登记，默认设置改了这一项就会被漏掉；登记了不读的，
+    默认设置改了它就会被误标。按节点类型比，不按模块比：一个模块管几类节点（Agent 和模型调用、调用工具和代码……），
+    其中一类读了、另一类没读的，不能拿另一类的登记充数。"""
+    reached = set()
     for kind, runner in RUNNERS.items():
-        by_module.setdefault(inspect.getmodule(runner), set()).add(str(kind))
-    for module, kinds in by_module.items():
-        source = inspect.getsource(module)
-        read = set(re.findall(r'ctx\.cfg\(\s*"(\w+)"', source))
-        read |= set(re.findall(r'_setting\(spec, node, "(\w+)"', source))
-        if "ctx.approval_mode()" in source:
-            read.add("approval")        # NodeContext.approval_mode 同样先读节点、再回退到默认设置
-        known = set().union(
-            *(compare._CFG_KEYS.get(k, frozenset()) | compare._CFG_KEYS_IF.get(k, frozenset()) for k in kinds))
-        assert read <= known, (module.__name__, sorted(read - known))
+        read, unknown, seen = _settings_read(runner)
+        assert not unknown, (str(kind), unknown)
+        known = compare._CFG_KEYS.get(str(kind), frozenset()) | compare._CFG_KEYS_IF.get(str(kind), frozenset())
+        assert read == known, (str(kind), "没登记", sorted(read - known), "登记了不读", sorted(known - read))
+        reached |= seen
+    # 键名不是字面量的读法也认得出来
+    assert {"max_steps", "budget_tokens", "budget_usd"} <= _settings_read(RUNNERS[NodeType.AGENT])[0]
+    # 节点模块里每个按 cfg 读配置的函数都走到了：走不到的说明上面漏了某种用法，查出来的配置项就不全
+    holders = set()
+    for info in pkgutil.iter_modules(nodes_package.__path__):
+        module = importlib.import_module(_NODE_MODULES + info.name)
+        for top in ast.parse(inspect.getsource(module)).body:
+            if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and any(
+                    isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr in ("cfg", "approval_mode") for n in ast.walk(top)):
+                holders.add((module.__name__, top.name))
+    assert holders and holders <= reached, sorted(holders - reached)
 
 
-def cited(run_id, rows=BASE_ROWS, *, column="gmv", span=None):
+def cited(run_id, rows=BASE_ROWS, *, column="gmv", span=None, sql=None):
     """Agent 按出处交回数组字段：引用快照的哪一列、哪一段行由调用方定。"""
     run = Fake(run_id)
-    run.tool("fetch", region_sql(), rows=rows)
-    bot = run.agent("bot", region_sql(), rows=rows, column=column, span=span)
+    sql = sql or region_sql()
+    run.tool("fetch", sql, rows=rows)
+    bot = run.agent("bot", sql, rows=rows, column=column, span=span)
     first, last = span or (0, len(rows) - 1)
     values = [r[COLUMNS.index(column)] for r in rows[first:last + 1]]
     run.card([metric("total", "sum(vars.kpi.amounts)", sum(values),
@@ -917,6 +1095,65 @@ def test_the_same_rows_are_not_the_same_citation_when_only_one_side_is_the_whole
     assert total["classification"] == "data_only" and total["attribution"]["rows"]
 
 
+def test_the_same_rows_are_not_the_same_citation_when_a_cited_region_moved_out_of_them():
+    """两边都只引用第 1 至 3 行、都不是整份结果：基准运行引用了西区，这次北区排进了前 3 行，西区挪到第 4 行，还在这次
+    的快照里，只是没被引用。取的不是同一组数，不能把西区算成「数据没了」（占比会远超 100%）；反过来（这次引用的区域
+    在基准运行的快照里、没被引用）也一样。西区这次真的没有了的，照常是数据变化。"""
+    with_middle = [["东区", 1200.5, 100.0], ["南区", 800.0, 50.0], ["西区", 600.0, 0.0], ["中区", 30.0, 0.0]]
+    total = by_id(run_compare(cited("r1", with_middle, span=(0, 2)), cited("r2", WITH_NORTH, span=(0, 2))))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 3 行，「西区」这次仍在查询结果第 4 行，不在引用的"
+                                "行里，取的不是同一组数"]
+    total = by_id(run_compare(cited("r1", WITH_NORTH, span=(0, 2)), cited("r2", with_middle, span=(0, 2))))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert total["reasons"] == ["Agent「区域分析」两次都引用第 1 至 3 行，「西区」在基准运行中位于查询结果第 4 行，不在"
+                                "引用的行里，取的不是同一组数"]
+
+    # 按金额从大到小取前 3 名：北区这次挤进了前 3，西区落到第 4 行
+    top = region_sql().replace("ORDER BY region", "ORDER BY gmv DESC")
+    before = [["东区", 1200.0, 0.0], ["南区", 800.0, 0.0], ["西区", 600.0, 0.0], ["中区", 30.0, 0.0]]
+    after = [["东区", 1200.0, 0.0], ["南区", 800.0, 0.0], ["北区", 700.0, 0.0], ["西区", 600.0, 0.0]]
+    total = by_id(run_compare(cited("r1", before, span=(0, 2), sql=top),
+                              cited("r2", after, span=(0, 2), sql=top)))["total"]
+    assert total["classification"] == "incomparable" and total["attribution"] is None
+    assert "「西区」这次仍在查询结果第 4 行" in total["reasons"][0]
+    # 对照：西区这次真的没有了（不在这次的快照里），照常是数据变化，按区域归因，占比之和为 1
+    gone = [["东区", 1200.0, 0.0], ["南区", 800.0, 0.0], ["北区", 700.0, 0.0], ["中区", 30.0, 0.0]]
+    total = by_id(run_compare(cited("r1", before, span=(0, 2), sql=top),
+                              cited("r2", gone, span=(0, 2), sql=top)))["total"]
+    assert (total["classification"], total["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    rows = total["attribution"]["rows"]
+    assert [(r["key"], r["base"], r["target"], r["share"]) for r in rows] == [
+        (["北区"], None, 700.0, 7.0), (["西区"], 600.0, None, -6.0), (["东区"], 1200.0, 1200.0, 0.0),
+        (["南区"], 800.0, 800.0, 0.0)]
+    assert sum(exact(r["share"]) for r in rows) == 1
+
+    # 区域列设了遮罩：不拿它认是哪一区，只能按行号认，遮住的区域名不出现在结果里
+    def masked(run):
+        run.masked = {a: frozenset({"region"}) for a in run.queries}
+        return run
+    result = run_compare(masked(cited("r1", with_middle, span=(0, 2))), masked(cited("r2", WITH_NORTH, span=(0, 2))))
+    assert by_id(result)["total"]["classification"] == "data_only"
+    text = json.dumps(result, ensure_ascii=False)
+    assert all(region not in text for region in ("东区", "南区", "西区", "北区", "中区"))
+
+
+def test_an_input_cites_the_whole_result_only_when_it_covers_every_row():
+    """怎么认整份结果（compare._whole）：容器本身就是一份查询结果的（没有行号、行段）、数组字段的行段从第一行到最后
+    一行的是；单格、只有一段行的不是；快照读不出来的不知道。Agent 的字段在真实运行里总带着行号或行段，容器这一支
+    只是兜底，造不出真实的运行来走它，在这里直接核对。"""
+    query = compare._Query(artifact="q1", node_id="bot", tool=TOOL, ordinal=1, snap={"rows": [["东区"], ["南区"], ["西区"]]})
+    lost = compare._Query(artifact="q1", node_id="bot", tool=TOOL, ordinal=1)
+
+    def cites(row=None, rows=None):
+        return SimpleNamespace(row=row, rows=rows)
+    assert compare._whole(cites(), query) is True
+    assert compare._whole(cites(rows=(0, 2)), query) is True
+    assert compare._whole(cites(rows=(0, 1)), query) is False
+    assert compare._whole(cites(row=0), query) is False
+    assert compare._whole(cites(rows=(0, 2)), lost) is None
+
+
 def test_cited_rows_on_an_unreadable_snapshot_are_not_taken_as_the_same():
     """基准运行 Agent 那次查询的快照文件不在了：两边都引用第 1 至 3 行，可基准那次是不是整份结果核对不了，不报成
     数据变化。"""
@@ -928,6 +1165,18 @@ def test_cited_rows_on_an_unreadable_snapshot_are_not_taken_as_the_same():
     # 这次引用的是整份结果、基准那次的行段不同：同样核对不了是不是两边都是整份
     total = by_id(run_compare(base, cited("r2", WITH_NORTH)))["total"]
     assert total["classification"] == "incomparable" and "无法核对" in total["reasons"][0]
+
+    # 反过来只有这次运行的快照读不出来：说的是这次运行
+    def unreadable(run):
+        del run.store[run.queries[1]]
+        return run
+    total = by_id(run_compare(cited("r1"), unreadable(cited("r2", WITH_NORTH, span=(0, 2)))))["total"]
+    assert total["classification"] == "incomparable"
+    assert total["reasons"] == ["这次运行的查询快照无法读取，无法核对 Agent「区域分析」引用的是不是整份结果"]
+    # 基准运行只引用了一部分、这次的行段又不同：这次是不是整份结果都不是同一处，照实说行段换了
+    total = by_id(run_compare(cited("r1", WITH_NORTH, span=(0, 2)), unreadable(cited("r2", span=(1, 2)))))["total"]
+    assert total["classification"] == "incomparable"
+    assert total["reasons"] == ["Agent「区域分析」引用的行由第 1 至 3 行改为第 2 至 3 行，取的不是同一组数"]
 
 
 def test_an_element_of_a_cited_array_follows_its_row():
@@ -949,6 +1198,12 @@ def test_an_element_of_a_cited_array_follows_its_row():
     assert first["reasons"] == ["Agent「区域分析」引用的行由第 1 行改为第 2 行，取的不是同一个数"]
     first = by_id(run_compare(make("r1", BASE_ROWS, (0, 2)), make("r2", NEXT_ROWS, (0, 2))))["first"]
     assert (first["classification"], first["reasons"]) == ("data_only", [compare.DATA_FROM_QUERIES])
+    # 起点没变，可这次北区排在了第一行：基准运行取的是东区，东区这次还在第 2 行，取的不是同一个数
+    first = by_id(run_compare(make("r1", BASE_ROWS, (0, 2)),
+                              make("r2", [["北区", 90.0, 0.0], *NEXT_ROWS], (0, 3))))["first"]
+    assert first["classification"] == "incomparable"
+    assert first["reasons"] == ["Agent「区域分析」两次都引用第 1 行，「东区」这次仍在查询结果第 2 行，不在引用的行里，"
+                                "取的不是同一个数"]
 
 
 def test_no_split_when_an_old_leaf_now_cites_another_column():

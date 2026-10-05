@@ -23,10 +23,12 @@
     结果时，再按别名一路追到喂它的每一份上游快照。只差字面量时还要看图里的 SQL：图里的 SQL 改过（改了写死的筛选值、
     系数）是模板变化，图里一字未改的才是运行时代入的参数
   - Agent 按出处交来的字段还要引用同一列、同一段行（两边都引用整份结果的不算换了；行段相同、一边是整份结果一边
-    不是的算换了）：取哪一列、哪几行是 Agent 每次运行时定的，换了就不是同一个数
+    不是的算换了；行号相同、都不是整份结果的，一边引用了的维度值在另一边的快照里、却没被引用的也算换了——取前几名
+    时名次变了、按区域排序时多了一个区域）：取哪一列、哪几行是 Agent 每次运行时定的，换了就不是同一个数
   - 不落在快照上的：模型、人交出的值（Agent 没按出处交、模型调用、人工审批……）没有出处，值变了说不清是数据还是它
-    本身的差异；代码、数据整形这类节点看它自己查过的库，不查库的看它的配置和画布上的全部上游。上游的查询结果两次
-    一模一样、值却变了的同样说不清；上游有模型、人交出值的节点、两次交出的不同的也说不清
+    本身的差异；代码、数据整形这类节点看它自己查过的库，不查库的看它的配置和画布上的全部上游；记不出写入者的看
+    口径卡之前可能执行过的节点（口径卡自己、只在它下游的不算）。上游的查询结果两次一模一样、值却变了的同样说不清；
+    上游有模型、人交出值的节点、两次交出的不同的也说不清
   - 图级的变化落到节点上：连线有增删的，终点节点算改了；默认设置改了的，运行时会读这几项（_CFG_KEYS）、又没有自行
     设置的节点算改了
 - 严格拆分（只对口径变了的）：旧表达式的每个叶子路径都能在这次的口径卡输入里取得值时，
@@ -97,10 +99,12 @@ _MODEL_KEYS = frozenset({"provider", "model", "temperature", "max_tokens", "thin
 #: 各类节点运行时按 NodeContext.cfg 读的配置项：节点上没写这一项就回退到图级默认设置（GraphSpec.defaults），默认
 #: 设置改了这一项，没自行设置它的这类节点交出的值可能跟着变；不读它的不受影响（结论句裁判只有报告节点读）。读了也
 #: 不影响交出的值的见 _QUIET_DEFAULTS。合并查询、双盲复算、反方审稿不经 cfg 读配置。执行器新读了一项要在这里登记，
-#: tests/test_compare_engine.py 按源码核对
+#: tests/test_compare_engine.py 按各类节点的执行器（连同它用到的函数）的源码逐类核对
 _CFG_KEYS: dict[str, frozenset[str]] = {
     "input": frozenset({"fields"}),
-    "output": frozenset({"fields", "contract"}),
+    # 出具契约按报告节点同一套参数重建证据目录：后三项读的是报告节点上的，报告节点没写同样回退到默认设置。成果节点
+    # 自己从不写这三项，默认设置改了就算它跟着变（报告节点自己写了的也算，宁可多算）
+    "output": frozenset({"fields", "contract", "evidence_from", "metrics_from", "entities"}),
     "transform": frozenset({"mode", "expression", "template", "assign_to"}),
     "llm": _MODEL_KEYS | {"system", "skills", "use_history", "prompt", "output_schema", "emit_message", "assign_to"},
     "agent": _MODEL_KEYS | {"system", "skills", "use_history", "prompt", "output_schema", "cite_fields", "tools",
@@ -691,6 +695,20 @@ def _worst(changes: Iterable[_Change]) -> _Change:
     return max(found, key=lambda c: _WEIGHT[c.kind]) if found else _Change("same")
 
 
+def _reach(node_id: str, links: Mapping[str, set[str]], memo: dict[str, set[str]]) -> set[str]:
+    """顺着连线（links：节点 → 上一层或下一层的节点）能走到的全部节点，不含它自己（成环的除外）。"""
+    if node_id not in memo:
+        seen: set[str] = set()
+        todo = [node_id]
+        while todo:
+            for nxt in links.get(todo.pop(), ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    todo.append(nxt)
+        memo[node_id] = seen
+    return memo[node_id]
+
+
 def _from_input(path: str, item: dict[str, Any]) -> bool:
     head = _REF_HEAD.match(path)
     return item.get("via") == "input" or (head is not None and head.group(1) == "input")
@@ -709,6 +727,7 @@ class _Compare:
         self._norm: dict[tuple[str, str | None], NormalizedSql] = {}
         self._shapes: dict[tuple[int, int], _Shape] = {}
         self._ancestors: dict[str, set[str]] = {}
+        self._descendants: dict[str, set[str]] = {}
         self.base_nodes, self.target_nodes = _nodes(base.graph), _nodes(target.graph)
         self.base_queries, self.target_queries = _queries(base), _queries(target)
         self.pairs = _pair(self.base_queries, self.target_queries, self._norm_of)
@@ -719,8 +738,10 @@ class _Compare:
         self.order = {n: i for i, n in enumerate(dict.fromkeys([*self.target_nodes, *self.base_nodes]))}
         self.base_outputs, self.target_outputs = _outputs(base), _outputs(target)
         self.parents: dict[str, set[str]] = {}
+        self.children: dict[str, set[str]] = {}
         for source, target_id, _ in _edges(base.graph) | _edges(target.graph):
             self.parents.setdefault(target_id, set()).add(source)
+            self.children.setdefault(source, set()).add(target_id)
 
     # ---------------------------------------------------------------- 结果
 
@@ -921,24 +942,26 @@ class _Compare:
 
     def _upstream(self, node_id: str) -> set[str]:
         """画布上 node_id 的全部上游（两次运行的图合起来，宁可多算）。"""
-        if node_id not in self._ancestors:
-            seen: set[str] = set()
-            todo = [node_id]
-            while todo:
-                for parent in self.parents.get(todo.pop(), ()):
-                    if parent not in seen:
-                        seen.add(parent)
-                        todo.append(parent)
-            self._ancestors[node_id] = seen
-        return self._ancestors[node_id]
+        return _reach(node_id, self.parents, self._ancestors)
+
+    def _downstream(self, node_id: str) -> set[str]:
+        """画布上 node_id 的全部下游（两次运行的图合起来）。"""
+        return _reach(node_id, self.children, self._descendants)
+
+    def _before(self, card: str) -> set[str]:
+        """口径卡执行之前可能执行过的节点：画布上它的上游，加上和它不在一条线上的（并行的支路可能先写了变量）。它自己、
+        只在它下游的节点在它之后才执行，写不了它读到的值（循环回边连回来的算上游）。"""
+        after = self._downstream(card) - self._upstream(card)
+        return {n for n in self.titles if n != card and n not in after}
 
     def _type_of(self, node_id: str) -> str | None:
         node = self.target_nodes.get(node_id) or self.base_nodes.get(node_id)
         return str(node.get("type")) if node is not None else None
 
-    def _moved(self, node_id: str) -> str:
-        """一个影响取值的节点变化（self.changed）写成一句话。"""
-        name = f"上游节点「{self.title(node_id)}」"
+    def _moved(self, node_id: str, *, upstream: bool = True) -> str:
+        """一个影响取值的节点变化（self.changed）写成一句话。upstream 是它在不在画布上的上游（并行支路上的节点不在，
+        不说成「上游」）。"""
+        name = f"{'上游节点' if upstream else '节点'}「{self.title(node_id)}」"
         change = self.changed.get(node_id, "")
         if change == "defaults":
             keys = self.inherited.get(node_id, [])
@@ -959,9 +982,9 @@ class _Compare:
         before, after = self.base_outputs.get(node_id, ()), self.target_outputs.get(node_id, ())
         return before != after or None in before or None in after
 
-    def provenance(self, path: str, b: Any, t: Any, *, moved: bool = True) -> _Change:
-        """一个输入的出处在两次运行之间变没变（b、t 是推演重算还原出来的输入）。moved 是这个指标的值变没变：输入是
-        容器、完整值又还原不出来，核对不了它变没变时，按它推断。"""
+    def provenance(self, path: str, b: Any, t: Any, *, card: str, moved: bool = True) -> _Change:
+        """一个输入的出处在两次运行之间变没变（b、t 是推演重算还原出来的输入，card 是读它的口径卡节点）。moved 是这个
+        指标的值变没变：输入是容器、完整值又还原不出来，核对不了它变没变时，按它推断。"""
         if b is None or t is None:
             return _Change("unknown", f"输入「{path}」只在一边的口径卡里有记录")
         if b.snapshot or t.snapshot:
@@ -992,21 +1015,30 @@ class _Compare:
             return own
         if writer and writer in self.changed:
             return _Change("template", self._moved(writer))
-        # 写它的节点不查库（代码、数据整形……）：看画布上它的全部上游；写它的节点不知道就看整张图
-        scope = self._upstream(writer) if writer else set(self.titles)
+        # 写它的节点不查库（代码、数据整形……）：看画布上它的全部上游。写它的节点不知道时，看口径卡之前可能执行过的
+        # 节点（_before）：口径卡自己、只在它下游的节点（写周报……）写不了它读到的值，点名它们就把下游的变化说成了
+        # 它的来源。above 是点名时算「上游」的节点
+        if writer:
+            scope = above = self._upstream(writer)
+        else:
+            scope, above = self._before(card), self._upstream(card)
         moved_nodes = self._ordered(n for n in scope if n in self.changed)
         worst = _worst(self._query_change(b2, t2) for b2, t2 in self.pairs if (t2 or b2).node_id in scope)
         where = f"来自「{self.title(writer)}」" if writer else "不知道由哪个节点写入"
         if moved_nodes:
-            return _Change("unknown", f"输入「{path}」{where}，{self._moved(moved_nodes[0])}，无法判断变化来源")
+            first = moved_nodes[0]
+            return _Change("unknown", f"输入「{path}」{where}，{self._moved(first, upstream=first in above)}，"
+                                      "无法判断变化来源")
         if worst.kind in ("sql", "template", "unknown"):
             return _Change("unknown", f"输入「{path}」{where}，对不上具体的查询；它的上游有变化，无法判断变化来源")
         if not same and (spoken := self._ordered(n for n in scope if self._regenerated(n))):
             # 上游有模型、人交出的值，两次不同：它交的数变了，可能是数据变了，也可能是模型本身的差异（它可能用的
             # 正是 Agent 没按出处交的数）。上游的查询结果变没变都一样说不清
-            kind = TYPE_LABEL.get(self._type_of(spoken[0]) or "", "节点")
-            return _Change("unknown", f"输入「{path}」{where}，它的上游节点「{self.title(spoken[0])}」（{kind}）两次"
-                                      "交出的结果不同，无法判断变化是否来自数据")
+            first = spoken[0]
+            who = ("它的上游节点" if writer else "上游节点") if first in above else "节点"
+            kind = TYPE_LABEL.get(self._type_of(first) or "", "节点")
+            return _Change("unknown", f"输入「{path}」{where}，{who}「{self.title(first)}」（{kind}）两次交出的结果不同，"
+                                      "无法判断变化是否来自数据")
         if worst.kind == "same" and not same and not self._data_moved(scope):
             # 上游查到的数据两次一模一样，它交的值却变了：不是数据变的。上游只有运行输入变了的，算参数
             if (self.base.inputs or {}) != (self.target.inputs or {}) \
@@ -1039,7 +1071,8 @@ class _Compare:
     def _citation(self, agent: Any, b: Any, t: Any, qb: _Query, qt: _Query) -> _Change | None:
         """Agent 按出处交来的字段两次引用的是不是同一处：同一列（对象数组是同一组列）、同一行或同一段行。两边引用的都是
         整份结果的算同一处（这次多了几行也是）；行段相同、一边是整份结果一边不是的不算——没引用的那几行还在这次的快照
-        里，按维度配对会把它们算成「数据没了」。不是同一处、核对不了是不是同一处的，返回说明。"""
+        里，按维度配对会把它们算成「数据没了」。行号相同、都不是整份结果的，还要引用同一批维度值（_left_out）。不是
+        同一处、核对不了是不是同一处的，返回说明。"""
         name = f"Agent「{self.title(agent)}」" if agent else "Agent"
         lb, lt = _locator(b), _locator(t)
         cb, ct = lb.get("column") or lb.get("columns"), lt.get("column") or lt.get("columns")
@@ -1050,11 +1083,13 @@ class _Compare:
         if b.row is not None or t.row is not None:
             # 单格（数组字段里的一个元素、按出处交的一格）：取哪一行由口径卡的下标和 Agent 交的行段一起定，同一行才是
             # 同一处
-            return None if (b.row, b.rows) == (t.row, t.rows) else changed
+            return self._left_out(name, what, b, t, qb, qt, cb) if (b.row, b.rows) == (t.row, t.rows) else changed
         wb, wt = _whole(b, qb), _whole(t, qt)
         same_span = b.rows == t.rows
-        if (wb and wt) or (same_span and wb is False and wt is False):
+        if wb and wt:
             return None
+        if same_span and wb is False and wt is False:
+            return self._left_out(name, what, b, t, qb, qt, cb)
         if (wb is None or wt is None) and (same_span or (wb is not False and wt is not False)):
             # 快照读不出来，核对不了是不是整份结果：行段相同的可能一边整份一边不是，行段不同的也可能两边都是整份
             side = "基准运行" if wb is None else "这次运行"
@@ -1066,6 +1101,45 @@ class _Compare:
                                       f"（结果共 {len(qt.snap['rows'])} 行），取的不是同一组数")
         return _Change("unknown", f"{name}在基准运行中只引用了{_rows_text(b)}（结果共 {len(qb.snap['rows'])} 行），"
                                   "这次引用了整份结果，取的不是同一组数")
+
+    def _left_out(self, name: str, what: str, b: Any, t: Any, qb: _Query, qt: _Query, column: Any) -> _Change | None:
+        """行号相同、都不是整份结果的引用，引用的是不是同一批维度值（区域……）。一边引用了的，另一边没引用、却还在那边的
+        快照里，取的就不是同一组数：按区域排序的结果多了北区，西区挪出了引用的行段；按金额取前 3 名，北区挤了进来——
+        按维度配对会把还在的西区算成「数据没了」。另一边的快照里也没有的，是数据真的没了，照常比。维度按两边整份结果
+        认（和归因同一个规则，_dimensions）；分不出维度（没有不是数值的列、维度列设了遮罩）、快照读不出来、行的形状
+        不对的，只能按行号认，返回 None。"""
+        if qb.snap is None or qt.snap is None:
+            return None
+        rb, rt = _records(qb.snap, None), _records(qt.snap, None)
+        if rb is None or rt is None:
+            return None
+        dims, _ = _dimensions(qb.snap, qt.snap, rb, rt, column if isinstance(column, str) else "", self._hidden(b, t))
+        if not dims:
+            return None
+
+        def split(records: list[tuple[int, dict[str, Any]]], inp: Any) -> tuple[dict[Any, int], dict[Any, int]]:
+            """{维度键: 第一次出现的行号}：引用的行里的，引用的行外面的。"""
+            first, last = _cited(inp, len(records))
+            inside: dict[Any, int] = {}
+            outside: dict[Any, int] = {}
+            for i, row in records:
+                (inside if first <= i <= last else outside).setdefault(tuple(_hashable(row.get(d)) for d in dims), i)
+            return inside, outside
+
+        (in_b, out_b), (in_t, out_t) = split(rb, b), split(rt, t)
+        for key in in_b:
+            if key not in in_t and key in out_t:
+                return _Change("unknown", f"{name}两次都引用{_rows_text(t)}，{_key_text(key)}这次仍在查询结果第 "
+                                          f"{out_t[key] + 1} 行，不在引用的行里，取的不是{what}")
+        for key in in_t:
+            if key not in in_b and key in out_b:
+                return _Change("unknown", f"{name}两次都引用{_rows_text(b)}，{_key_text(key)}在基准运行中位于查询结果第 "
+                                          f"{out_b[key] + 1} 行，不在引用的行里，取的不是{what}")
+        return None
+
+    def _hidden(self, b: Any, t: Any) -> frozenset[str]:
+        """两边输入落在的快照上要遮的列（小写）。"""
+        return (self.base.masked.get(b.snapshot) or frozenset()) | (self.target.masked.get(t.snapshot) or frozenset())
 
     def _generated(self, path: str, writer: str, same: bool) -> _Change:
         """模型、人交出的值（Agent 没按出处交、模型调用、人工审批……）：没有出处，值变了说不清是数据变了还是它本身的
@@ -1241,7 +1315,7 @@ class _Compare:
         moved = not recompute._same(bm.get("value"), tm.get("value"))
         changes: dict[str, _Change] = {}
         if lineage and bp is not None and tp is not None:
-            changes = {p: self.provenance(p, bp.inputs.get(p), tp.inputs.get(p), moved=moved)
+            changes = {p: self.provenance(p, bp.inputs.get(p), tp.inputs.get(p), card=card_id, moved=moved)
                        for p in dict.fromkeys([*tp.inputs, *bp.inputs])}
         if caliber:
             # 口径优先；喂它的取数也变了、说不清的，接在口径的说明后面照样写出来，不因为口径变了就不提。只在一边才有
@@ -1276,7 +1350,7 @@ class _Compare:
             if metric.get("status") == "missing_input":
                 out["reasons"].append(f"{side}这个指标缺少输入，没有值")
         if out["classification"] in _ATTRIBUTED and bp is not None and tp is not None:
-            out["attribution"] = self._attribution(bp, tp)
+            out["attribution"] = self._attribution(bp, tp, card_id)
         if any(inp.masked for plan in (bp, tp) if plan is not None for inp in plan.inputs.values()):
             self.masked_seen = True
         return out
@@ -1325,7 +1399,7 @@ class _Compare:
         if any(inp.masked for inp in used) or any(inp.masked for plan in plans for inp in plan.inputs.values()):
             return None, SPLIT_MASKED
         for path in leaves:
-            change = self.provenance(path, bp.inputs.get(path), t.inputs[path])
+            change = self.provenance(path, bp.inputs.get(path), t.inputs[path], card=t.node_id)
             if change.kind in ("sql", "template"):
                 return None, f"旧口径用到的输入取数也有变化，无法严格拆分：{change.reason}"
             if change.kind == "unknown":
@@ -1375,7 +1449,7 @@ class _Compare:
 
     # ---------------------------------------------------------------- 维度归因
 
-    def _attribution(self, bp: Any, tp: Any) -> dict[str, Any] | None:
+    def _attribution(self, bp: Any, tp: Any, card: str) -> dict[str, Any] | None:
         """挑一个落在查询快照上、两边都变了的输入做维度归因：先找给得出占比的，没有就取第一个列得出行的，再没有
         就取第一个说明（截断、度量列遮罩……）。一个都挑不出来返回 None。"""
         found: list[dict[str, Any]] = []
@@ -1383,7 +1457,7 @@ class _Compare:
             b = bp.inputs.get(path)
             if b is None or not (b.snapshot and t.snapshot) or recompute._same(b.value, t.value):
                 continue
-            if self.provenance(path, b, t).kind not in ("same", "params"):
+            if self.provenance(path, b, t, card=card).kind not in ("same", "params"):
                 continue
             result = self._attribute(b, t)
             if result is None:
@@ -1409,12 +1483,12 @@ class _Compare:
             if snap.get("truncated"):
                 # 截断的结果只是前几行：各键的和不是完整的和，按它归因会把没取回的行的变化算到别的键头上
                 return {**empty, "note": TRUNCATED.format(side=side, rows=len(snap["rows"]))}
-        hidden = (self.base.masked.get(b.snapshot) or frozenset()) | (self.target.masked.get(t.snapshot) or frozenset())
+        hidden = self._hidden(b, t)
         if any(str(c).lower() in hidden for c in [*(sb.get("columns") or []), *(st.get("columns") or [])]):
             self.masked_seen = True
         if measure.lower() in hidden:
             return {**empty, "note": MASKED_MEASURE.format(column=measure)}
-        rb, rt = _records(sb, b), _records(st, t)
+        rb, rt = _records(sb, b.rows), _records(st, t.rows)
         if rb is None or rt is None:
             return None
         values = (_input_total(b), _input_total(t))
@@ -1546,14 +1620,28 @@ def _same_input(b: Any, t: Any) -> bool | None:
     return recompute._same(b.item.get("value"), t.item.get("value"))
 
 
+def _cited(inp: Any, count: int) -> tuple[int, int]:
+    """输入引用了快照的哪几行（第一行, 最后一行），count 是快照共几行：单格是那一行，数组字段是它那一段行，容器本身
+    是一份查询结果的是全部的行。"""
+    if inp.row is not None:
+        return inp.row, inp.row
+    if inp.rows is not None:
+        return inp.rows
+    return 0, count - 1
+
+
 def _whole(inp: Any, q: _Query) -> bool | None:
-    """这个输入引用的是不是整份查询结果：容器本身就是整份结果，或者数组字段的行段从第一行到最后一行。快照读不出来、
-    不知道结果共几行的返回 None。"""
-    if inp.table:
-        return True
+    """这个输入引用的是不是整份查询结果：引用的行从第一行到最后一行（容器本身就是整份结果）。快照读不出来、不知道
+    结果共几行的返回 None。"""
     if q.snap is None:
         return None
-    return inp.rows is not None and inp.rows == (0, len(q.snap["rows"]) - 1)
+    count = len(q.snap["rows"])
+    return _cited(inp, count) == (0, count - 1)
+
+
+def _key_text(key: tuple[Any, ...]) -> str:
+    """维度值写进说明：几列的用「 / 」连起来，和对比页上归因行的写法一样。"""
+    return "「" + " / ".join(_shown(v) for v in key) + "」"
 
 
 def _rows_text(inp: Any) -> str:
@@ -1578,11 +1666,12 @@ def _merge_inputs(q: _Query) -> dict[str, str] | None:
             if isinstance(i, dict) and i.get("alias") and i.get("artifact")}
 
 
-def _records(snap: dict[str, Any], inp: Any) -> list[tuple[int, dict[str, Any]]] | None:
-    """归因用到的行：(行号, {列: 值})。数组字段只用它那一段行，单格用整份结果。"""
+def _records(snap: dict[str, Any], span: tuple[int, int] | None) -> list[tuple[int, dict[str, Any]]] | None:
+    """快照里的行：(行号, {列: 值})。span 给了只取那一段行（归因时数组字段只用它那一段），None 是整份结果（单格按
+    整份结果归因）。行的形状不对返回 None。"""
     columns = [str(c) for c in snap.get("columns") or []]
     rows = snap.get("rows") or []
-    first, last = (inp.rows if inp.rows is not None else (0, len(rows) - 1))
+    first, last = span if span is not None else (0, len(rows) - 1)
     out = []
     for i in range(first, min(last, len(rows) - 1) + 1):
         row = rows[i]
