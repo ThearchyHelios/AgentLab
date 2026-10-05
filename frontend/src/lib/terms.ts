@@ -473,6 +473,27 @@ export const EVIDENCE_TEXT = {
     loading: '正在推断来源…',
     failed: '未能获取推断的来源',
   },
+
+  // ---- 期 4：核查状态。指标步骤上的双盲复算、取自遮罩列的输入（反方审稿的判断复用审批卡的 CHALLENGE_TEXT）----
+  dualCheck: {
+    label: '双盲复算',
+    status: { agreed: '一致', disagreed: '不一致', unchecked: '无法复算', skipped: '已跳过' } as Record<string, string>,
+    /** 服务端给了一个界面不认识的状态：照写原值，不归到哪一类 */
+    unknown: (status: string) => `未知状态「${status}」`,
+    /** 盲算的值，服务端按口径卡的格式渲染好的 */
+    blind: (value: string) => `盲算 ${value}`,
+    choice: { a: '审核人采用原流程的结果', b: '审核人采用盲算结果', neither: '审核人判断两边都不对' } as Record<string, string>,
+    noChoice: '审核人没有作出选择',
+    /** 跳过的原因：节点直通（设置或节点里关了、口径卡上没有来自查询的输入），或者这个指标不在复算范围里 */
+    skip: {
+      disabled: '双盲复算已关闭',
+      no_inputs: '口径卡上没有来自查询的输入',
+      not_targeted: '这个指标不在复算范围内',
+    } as Record<string, string>,
+  },
+  /** 指标的输入取自数据源设置了遮罩的列：标签和代入式里不显示值 */
+  maskedInput: '取自设置了遮罩的列，不显示值',
+  maskedMismatch: '与快照不一致；取自设置了遮罩的列，不显示值',
 } as const
 
 /**

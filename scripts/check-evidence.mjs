@@ -3289,6 +3289,190 @@ await section('copy-r2','按后端原文匹配的地方：后端现在的原文�
     got.suspect.join(' ｜ '))
 })
 
+// ---------------------------------------------------------------- 期 4：核查状态
+
+/**
+ * 双盲复算的几种状态，按片段挂到一期夹具的指标步骤上。形状照服务端（api/evidence.py 的 _dual_check_of）：一致、不一致
+ * （审核人采用原流程 / 采用盲算 / 没选）、无法复算（带原因）、已跳过（带原因代码）
+ */
+const DUAL = {
+  s6: { status: 'agreed', node_id: 'dual', blind_rendered: '45,678.5元' },
+  s8: { status: 'disagreed', node_id: 'dual', choice: 'a', blind_rendered: '9.1%' },
+  s10: { status: 'disagreed', node_id: 'dual', choice: 'b', blind_rendered: '1,301单' },
+  s45: { status: 'disagreed', node_id: 'dual', blind_rendered: '45,900.0元' },
+  s12: { status: 'unchecked', node_id: 'dual', reason: '盲算没有交出可用的数：查询全部失败' },
+  s23: { status: 'skipped', node_id: 'dual', reason: 'not_targeted' },
+}
+/** 虚构的反方审稿记录（challenge_artifact）：整句面板里点开那一句，按它取理由 */
+const CH_ART = 'c4'.repeat(32)
+const CH_RATIONALE = '扣除退款后新客首单只占增长的一小部分，老客复购反而下降。'
+
+/** WCAG 对比度：rgb()/rgba()/color(srgb …) 都认 */
+function contrastOf(fg, bg) {
+  const parse = (c) => {
+    const m = c.match(/color\(srgb ([\d.]+) ([\d.]+) ([\d.]+)/)
+    if (m) return [m[1], m[2], m[3]].map((x) => Number(x) * 255)
+    return (c.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number)
+  }
+  const lum = (c) => {
+    const [r, g, b] = parse(c).map((v) => {
+      const x = v / 255
+      return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4
+    })
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+  }
+  const [a, b] = [lum(fg), lum(bg)].sort((x, y) => y - x)
+  return (a + 0.05) / (b + 0.05)
+}
+
+await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列的输入、整句的反方审稿判断', async () => {
+  // ---- 指标步骤多一行双盲复算的结果；没复核过的不画
+  const r = await probe((id, body) => {
+    const metric = body.chain?.find((st) => st.step === 'metric')
+    if (metric && DUAL[id]) metric.dual_check = DUAL[id]
+    if (id === 's12' && metric) {
+      // 服务端遮罩之后的样子：订单数取自遮罩列，标签和代入式里都写「已遮罩」
+      metric.substituted = metric.substituted.replace('1234', '已遮罩')
+      for (const st of body.chain) {
+        if (st.step === 'input' && st.path === 'vars.kpi.order_cnt') Object.assign(st, { value: '已遮罩', masked: ['order_cnt'] })
+      }
+      body.redacted = { columns: ['order_cnt'], note: '这些列在数据源中设置了遮罩' }
+    }
+    return body
+  })
+  const pg = r.page
+  const p = panel(pg)
+  const line = p.locator('[data-ev-dual-check]')
+  for (const [id, status, words, token] of [
+    ['s6', 'agreed', ['双盲复算：', '一致', '盲算 45,678.5元'], '--st-done'],
+    ['s8', 'disagreed', ['不一致', '盲算 9.1%', '审核人采用原流程的结果'], '--st-waiting'],
+    ['s10', 'disagreed', ['不一致', '盲算 1,301单', '审核人采用盲算结果'], '--st-failed'],
+    ['s45', 'disagreed', ['不一致', '盲算 45,900.0元', '审核人没有作出选择'], '--st-failed'],
+    ['s12', 'unchecked', ['无法复算', '查询全部失败'], '--st-waiting'],
+    ['s23', 'skipped', ['已跳过', '这个指标不在复算范围内'], '--text-dim'],
+  ]) {
+    await openSeg(pg, id, '[data-ev-dual-check]')
+    const text = (await line.innerText().catch(() => '')).replace(/\s+/g, ' ')
+    const got = await line.getAttribute('data-ev-dual-check').catch(() => null)
+    const color = await line.locator('span.font-medium').evaluate((el) => getComputedStyle(el).color).catch(() => '')
+    check(`双盲复算 ${status}（${words.slice(1).join('、') || words[0]}）：指标步骤写成一行，颜色按要不要多看一眼`,
+      got === status && words.every((w) => text.includes(w)) && color === await tokenColor(pg, 'color', `var(${token})`),
+      `${got}：${text}（${color}）`)
+    await pg.keyboard.press('Escape')
+    await pg.waitForTimeout(80)
+  }
+  for (const theme of ['light', 'dark']) {
+    await pg.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+    let worst = Infinity
+    for (const id of ['s6', 's10', 's8', 's23']) {
+      await openSeg(pg, id, '[data-ev-dual-check]')
+      const pair = await line.evaluate((el) => {
+        const back = (node) => {
+          for (let n = node; n; n = n.parentElement) {
+            const c = getComputedStyle(n).backgroundColor
+            if (c && !/rgba\(0, 0, 0, 0\)|transparent/.test(c)) return c
+          }
+          return getComputedStyle(document.body).backgroundColor
+        }
+        return [...el.querySelectorAll('span')].map((sp) => [getComputedStyle(sp).color, back(sp)])
+      }).catch(() => [])
+      for (const [fg, bg] of pair) worst = Math.min(worst, contrastOf(fg, bg))
+      await pg.keyboard.press('Escape')
+      await pg.waitForTimeout(80)
+    }
+    check(`${theme}：双盲复算那一行的字对比度都 ≥ 4.5`, worst >= 4.5, worst.toFixed(2))
+  }
+  await pg.evaluate(() => document.documentElement.removeAttribute('data-theme'))
+  await openSeg(pg, 's49', '[data-ev-substituted]')
+  check('没有双盲复算复核过的指标：不画这一行', await line.count() === 0)
+  await pg.keyboard.press('Escape')
+
+  // ---- 取自遮罩列的输入：标签写「已遮罩」（遮罩格的样子），代入式里也是，底下写明遮罩不是安全边界
+  await openSeg(pg, 's12', '[data-ev-substituted]')
+  const masked = p.locator('[data-ev-input="vars.kpi.order_cnt"]')
+  const chip = (await masked.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  const italic = await masked.locator('.italic').evaluate((el) => getComputedStyle(el).fontStyle).catch(() => '')
+  check('遮罩列的输入：标签写「已遮罩 ← 路径」，按遮罩格的样子画，不露出原值',
+    await masked.getAttribute('data-ev-input-masked') === '' && chip.includes('已遮罩 ← vars.kpi.order_cnt')
+      && !chip.includes('1,234') && italic === 'italic', `${chip}（${italic}）`)
+  const sub = await p.locator('[data-ev-substituted]').innerText().catch(() => '')
+  check('遮罩列的输入：代入式里那一处写「已遮罩」', sub === 'round(45678.5 / 已遮罩, 1)', sub)
+  check('没用到遮罩列的输入照常写值', (await p.locator('[data-ev-input="vars.kpi.gmv"]').innerText()).includes('45,678.5 ← vars.kpi.gmv')
+    && await p.locator('[data-ev-input="vars.kpi.gmv"]').getAttribute('data-ev-input-masked') === null)
+  check('面板底下写明遮罩的列和遮罩不是安全边界', (await p.locator('[data-ev-mask-note]').innerText().catch(() => '')).includes('order_cnt'))
+  await pg.keyboard.press('Escape')
+  check('核查状态那几页没有运行时报错', r.errors.length === 0, r.errors.join(' | '))
+  await r.ctx.close()
+
+  // ---- 输入来源：遮罩列的 Agent 字段核对不一致时只说不一致，不写两边的值
+  const q = await probeQ((id, body) => {
+    if (body.segment?.text !== '37.0元') return body
+    for (const st of body.chain) {
+      if (st.step === 'input' && st.path === 'vars.kpi.order_cnt') {
+        delete st.model_value
+        Object.assign(st, { value: '已遮罩', masked: ['order_cnt'] })
+      }
+    }
+    return body
+  })
+  await openQ(q.page, '37.0元', { wait: '[data-ev-sources]' })
+  const src = await panel(q.page).locator('[data-ev-source="vars.kpi.order_cnt"]').innerText().catch(() => '')
+  check('输入来源：遮罩列的字段核对不一致，只说不一致、不写值', src.includes('与快照不一致；取自设置了遮罩的列，不显示值')
+    && !src.includes('1,240') && !src.includes('1,234'), src.replace(/\s+/g, ' '))
+  const verified = await panel(q.page).locator('[data-ev-source="vars.kpi.gmv"]').innerText().catch(() => '')
+  check('输入来源：没遮罩的字段照旧', verified.includes('与快照一致') && !verified.includes('遮罩'), verified.replace(/\s+/g, ' '))
+  await q.ctx.close()
+
+  // ---- 整句面板：反方审稿的判断，复用审批卡的展示，点开看理由；没审到的句子不画
+  const u = fxj.formal.units
+  const challenge = { verdict: 'refuted', node_id: 'chal', artifact: CH_ART, on_refuted: 'degrade', report_label: '写周报' }
+  const segPatch = (jset, body) => {
+    if (jset === fxj.formal && body.unit?.id === u.bad) body.unit.challenge = challenge
+    return body
+  }
+  for (const [w, h] of [[1280, 1000], [390, 844]]) {
+    const c = await open('/ui-harness.html?evidence=1', { segPatch, w, h })
+    const artifactHits = []
+    await c.page.route((url) => new URL(url).pathname === `/api/artifacts/${CH_ART}`, (route) => {
+      artifactHits.push(route.request().url())
+      return route.fulfill({ json: { id: CH_ART, content: {
+        report: 'write', doc_artifact: fxj.formal.doc_artifact, model: 'challenger-x',
+        claims: [{ unit: u.bad, text: '增长主要来自新客首单，老客复购持平。', verdict: 'refuted', rationale: CH_RATIONALE,
+          rationale_doc: null, queries: [] }],
+      } } })
+    })
+    const cp = panel(c.page)
+    const block = cp.locator('[data-ev-challenge]')
+    await badge(c.page, J, u.bad).click()
+    await c.page.waitForSelector('[data-evidence-panel] [data-ev-challenge] [data-challenge-item]', { timeout: 4000 }).catch(() => {})
+    const text = (await block.innerText().catch(() => '')).replace(/\s+/g, ' ')
+    if (w === 1280) {
+      check('整句面板：反方审稿的判断（被推翻）挂在这一句下，写明是哪份报告的反方审稿', await block.getAttribute('data-ev-challenge') === 'refuted'
+        && text.includes('报告「写周报」的反方审稿') && text.includes('被推翻') && text.includes('新客首单'), text)
+      check('……判断由反方模型给出，并非系统核对', text.includes('并非系统核对'), text)
+      check('……正式运行、按降档处理：写明出具会降档', await block.locator('[data-challenge-degrade]').first()
+        .waitFor({ timeout: 3000 }).then(() => true, () => false))
+      await block.locator('[data-challenge-toggle]').click()
+      await c.page.waitForSelector('[data-evidence-panel] [data-challenge-detail-state="ok"]', { timeout: 4000 }).catch(() => {})
+      const why = await block.locator('[data-challenge-rationale]').innerText().catch(() => '')
+      check('……点开看得到反方的理由（按审稿记录取）', why.includes(CH_RATIONALE) && artifactHits.length === 1, why)
+      await badge(c.page, J, u.ok).click()
+      await c.page.waitForSelector('[data-evidence-panel] [data-ev-judge="supported"]', { timeout: 4000 }).catch(() => {})
+      await c.page.waitForTimeout(200)
+      check('没审到的句子：不画反方审稿', await block.count() === 0)
+    } else {
+      const wide = await c.page.evaluate(() => {
+        const el = document.querySelector('[data-evidence-panel]')
+        return { page: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+          panel: el ? el.scrollWidth - el.clientWidth : 99 }
+      })
+      check('390px：整句面板带着反方审稿不横向溢出', !!text && wide.page <= 0 && wide.panel <= 1, JSON.stringify(wide))
+    }
+    check(`${w}px：没有运行时报错`, c.errors.length === 0, c.errors.join(' | '))
+    await c.ctx.close()
+  }
+})
+
 check('没有运行时报错（组件预览）', harness.errors.length === 0, harness.errors.join(' | '))
 await harness.ctx.close()
 await browser.close()
