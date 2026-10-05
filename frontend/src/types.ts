@@ -3167,3 +3167,161 @@ export interface WhatIfResult {
   unsupported: WhatIfUnsupported[]
   affected_cards: WhatIfAffectedCard[]
 }
+
+// ---------------------------------------------------------------------------
+// 定时任务（/api/schedules，页面在 pages/schedules）。前后端按同一份接口约定，字段名和形状不各自发挥；时间一律是
+// ISO 字符串（UTC），按定时任务自己的时区显示
+// ---------------------------------------------------------------------------
+
+/**
+ * 运行列表里的定时来源：发起它的定时任务，手动发起的是 null，老服务端不给。写在这里而不是上面 Run 的定义里：
+ * 同名接口会合并，定时任务的类型集中在文件末尾这一段，不和别的工作包改同一处
+ */
+export interface Run {
+  schedule_id?: string | null
+}
+
+export type ScheduleRunClass = 'formal' | 'exploratory'
+/** Webhook 消息的格式：通用 JSON、飞书 / 企业微信 / 钉钉的群机器人 */
+export type ScheduleWebhookFormat = 'generic' | 'feishu' | 'wecom' | 'dingtalk'
+/** 订阅的事件：运行结束、运行失败、停在人工审批上（只在真有待审批时发） */
+export type ScheduleEvent = 'finished' | 'failed' | 'awaiting_approval'
+/** 触发的来源：到点、手动「立即运行」、错过之后在宽限内补发 */
+export type ScheduleFireKind = 'scheduled' | 'manual' | 'misfire'
+/** 触发的结局：发起了运行、上一次还没结束而跳过、错过时间超出宽限而跳过、发起时被拒 */
+export type ScheduleFireStatus = 'started' | 'skipped_overlap' | 'skipped_misfire' | 'failed_to_start'
+
+/** 读出来的 Webhook 设置。完整地址服务端加密保存、不再返回，只露主机和末 4 位 */
+export interface ScheduleWebhook {
+  format: ScheduleWebhookFormat
+  /** 如 open.feishu.cn/…ab12 */
+  url_hint: string
+  has_secret: boolean
+  events: ScheduleEvent[]
+}
+
+/** 一次触发发出的一条通知 */
+export interface ScheduleFireNotice {
+  event: ScheduleEvent
+  status: 'ok' | 'failed'
+  at: string
+}
+
+/** 一次触发（触发历史的一行） */
+export interface ScheduleFire {
+  id: string
+  /** 计划触发的时间；手动运行是按下的那一刻 */
+  fire_at: string
+  kind: ScheduleFireKind
+  status: ScheduleFireStatus
+  run_id: string | null
+  /** 发起的那次运行现在的状态（同 Run.status） */
+  run_status: RunStatus | null
+  /** 跳过、发起失败的原因（中文） */
+  reason: string | null
+  notified: ScheduleFireNotice[]
+  created_at: string
+}
+
+export interface Schedule {
+  id: string
+  name: string
+  workflow_id: string
+  workflow_name: string
+  /** 五段 cron：分 时 日 月 星期 */
+  cron: string
+  /** IANA 时区名，如 Asia/Shanghai */
+  timezone: string
+  run_class: ScheduleRunClass
+  /** 字段名 → 模板字符串，变量（{{ schedule.yesterday }} 这类）按触发时间计算 */
+  input_template: Record<string, string>
+  enabled: boolean
+  /** 上一次还没结束时怎么办：目前只有跳过 */
+  overlap: 'skip'
+  /** 错过触发时间后多少秒内恢复还补发一次 */
+  misfire_grace_s: number
+  webhook: ScheduleWebhook | null
+  /** 暂停中、或者往后不会再触发时为 null */
+  next_run_at: string | null
+  last_fire: ScheduleFire | null
+  /** 频率的中文说法，如「每周一 09:00（Asia/Shanghai）」 */
+  description_text: string
+  created_by: string | null
+  created_at: string
+  updated_at: string
+  /** 乐观锁：修改时带上读到的版本，别人在这期间改过时回 409 */
+  version: number
+}
+
+/** 新建、修改时交上去的 Webhook。地址、密钥的明文只在写的时候给 */
+export interface ScheduleWebhookIn {
+  format: ScheduleWebhookFormat
+  /** 修改时：省略表示不改，空串表示删除整个 Webhook */
+  url?: string
+  /** 修改时：省略表示不改，空串表示清除 */
+  secret?: string
+  events: ScheduleEvent[]
+}
+
+/** POST /api/schedules 的请求体 */
+export interface ScheduleCreate {
+  name: string
+  workflow_id: string
+  cron: string
+  timezone: string
+  run_class: ScheduleRunClass
+  input_template: Record<string, string>
+  enabled: boolean
+  overlap: 'skip'
+  misfire_grace_s: number
+  webhook: ScheduleWebhookIn | null
+}
+
+/** PATCH /api/schedules/{id} 的请求体：只带改了的字段，外加读到的版本 */
+export type SchedulePatch = Partial<Omit<ScheduleCreate, 'webhook'>> & {
+  webhook?: ScheduleWebhookIn
+  version: number
+}
+
+export interface SchedulePreviewRequest {
+  cron: string
+  timezone: string
+  input_template?: Record<string, string>
+  workflow_id?: string
+  n?: number
+}
+
+/** 预览：频率的中文说法、接下来几次触发时间、按下一次触发时间渲染出的输入。非法时 422 {detail, field} */
+export interface SchedulePreview {
+  description_text: string
+  next: string[]
+  inputs: Record<string, string>
+}
+
+/** 输入模板里能用的变量 */
+export interface ScheduleVariable {
+  /** 如 schedule.yesterday */
+  name: string
+  /** 如「昨天（YYYY-MM-DD）」 */
+  label: string
+  example: string
+}
+
+/** POST /api/schedules/{id}/run：这次手动触发和它发起的运行（没发起时为 null） */
+export interface ScheduleRunResult {
+  fire: ScheduleFire
+  run_id: string | null
+}
+
+/** GET /api/schedules/{id}/fires 的一页，新的在前；next_before 是下一页的游标，没有更多时为 null */
+export interface ScheduleFirePage {
+  items: ScheduleFire[]
+  next_before: string | null
+}
+
+/** POST /api/schedules/{id}/webhook/test：用已保存的设置发一条测试消息 */
+export interface ScheduleWebhookTest {
+  ok: boolean
+  http_status: number | null
+  message: string
+}
