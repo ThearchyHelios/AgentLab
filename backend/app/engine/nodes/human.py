@@ -81,12 +81,16 @@ _JUDGE_KEYS = ("mode", "counts", "complete", "unjudged", "limits_hit")
 
 
 def reviewed_report_ids(spec: Any, human: Any) -> list[str]:
-    """一个人工审批节点审的是哪几份报告：上游直接连着的报告撰写节点，加上标题、说明里引用了正文的
-    （{{ nodes.<id>.text }}，或者报告的 assign_to 变量）。只看图，不看运行状态。
+    """一个人工审批节点审的是哪几份报告：上游直接连着的报告撰写节点，直接连着的反方审稿节点审的那份报告，加上
+    标题、说明里引用了正文的（{{ nodes.<id>.text }}，或者报告的 assign_to 变量）。只看图，不看运行状态。
+
+    「报告 → 反方审稿 → 人工审批」是反方审稿推荐的接法：审批节点的直接上游是反方审稿，只认直接连着的报告撰写节点的话，
+    审批卡上一份报告都没有，被推翻的结论审批人批准时完全不知道。反方审稿审哪份照 schema.challenge_report 认，和它
+    执行时审的是同一份。
 
     审批卡（_reviewed_reports）和报告节点（reviewed_by_human：要交给人审的报告，探索运行也在节点里判）
     用的是同一套认法，两边说的「这份报告要人审」不会对不上。"""
-    from app.engine.schema import NodeType
+    from app.engine.schema import NodeType, challenge_report
 
     config = human.config or {}
     text = " ".join(json.dumps(config.get(key), ensure_ascii=False, default=str)
@@ -95,9 +99,15 @@ def reviewed_report_ids(spec: Any, human: Any) -> list[str]:
     by_var = {str(n.config.get("assign_to")): n.id for n in spec.nodes
               if n.type == NodeType.REPORT and n.config.get("assign_to")}
     nodes = spec.node_map()
-    wanted = ([e.source for e in spec.edges if e.target == human.id] + _NODE_REF.findall(text)
+
+    def upstream(source: str) -> str | None:
+        node = nodes.get(source)
+        return challenge_report(spec, node)[0] if node is not None and node.type == NodeType.CHALLENGE else source
+
+    wanted = ([upstream(e.source) for e in spec.edges if e.target == human.id] + _NODE_REF.findall(text)
               + [by_var[v] for v in _VAR_REF.findall(text) if v in by_var])
-    return [rid for rid in dict.fromkeys(wanted) if (n := nodes.get(rid)) is not None and n.type == NodeType.REPORT]
+    return [rid for rid in dict.fromkeys(wanted)
+            if rid and (n := nodes.get(rid)) is not None and n.type == NodeType.REPORT]
 
 
 def reviewed_by_human(spec: Any, report_id: str) -> bool:

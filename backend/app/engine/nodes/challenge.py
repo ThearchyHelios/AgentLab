@@ -7,15 +7,20 @@
    取前「最多审几句」句；裁判判成「不是结论」的不审。同一份文档永远选出同样的句子、同样的顺序
 2. 反查：每句一个只读 agent（verify_agent.run_verify_agent）。工具只给这句引用的查询所在的数据源（指标按它的输入
    取自的查询算，合并查询按它合并的那几个源算）；这句没挂依据，就在这份报告引用的数据源里查。任务里给这句结论
-   和它挂的证据摘录（judge.prepare，数据源遮罩的列照旧不给），要它先想清楚「如果这句不成立，数据里会看到什么」，
-   写只读查询去找，最后交结论（经受住 / 被削弱 / 被推翻 / 无法判断）和理由。理由里的数字只能引用它自己查询的
-   格子，裸数字由 compose_doc 标出来
-3. 记录：每句的结论、理由（渲染后的正文和组装好的文档）、查询快照、用量写进审稿记录（challenge_artifact），随运行
+   和它挂的证据摘录（judge.prepare，数据源遮罩的列照旧不给；摘录里原报告的编号都标成「原报告 Qn」，和 agent 自己
+   的 Q1 分开），要它先想清楚「如果这句不成立，数据里会看到什么」，写只读查询去找，最后交结论（经受住 / 被削弱 /
+   被推翻 / 无法判断）和理由。理由里的数字只能引用它自己查询的格子，裸数字由 compose_doc 标出来
+3. 出处：一条查询都没执行成功的，判什么都记为无法判断；判「被推翻」的，理由里还得引用到自己的查询结果——它要让
+   正式出具降档，审稿记录里得查得到凭什么。不采信时系统写明原因，反方原本的结论和理由照录在后面。这句引用的数据源
+   都不存在或已停用、核查模型本身用不了时不派 agent（模型用不了的，后面的句子照同一个原因记，不再逐句去建模型）
+4. 记录：每句的结论、理由（渲染后的正文和组装好的文档）、查询快照、用量写进审稿记录（challenge_artifact），随运行
    封存。查询照常发 tool.end（role: verify，带查询快照，可下钻）；台账只记 kind challenge，绝不记 query——核查的
-   查询进了写作目录，下游的写作者会把它们当成可以引用的证据
-4. 处置：被推翻的按 on_refuted 处置。degrade（默认）在产出里写 issuance_gaps，成果节点的出具契约照单收进缺口、
-   出具降档（nodes/io.py 的 _upstream_issuance_gaps）；fail 判节点失败；flag 只记录。审批卡（human.py 的
-   _reviewed_reports）附上审稿概况
+   查询进了写作目录，下游的写作者会把它们当成可以引用的证据。有句子没能反查的另记一条 challenge_unreviewed，
+   不然时间线上只有一句「审了 N 句」，看不出根本没审成
+5. 处置：被推翻的按 on_refuted 处置。degrade（默认）在产出里写 issuance_gaps，成果节点的出具契约照单收进缺口、
+   出具降档（nodes/io.py 的 _upstream_issuance_gaps，所以反方审稿要接在成果节点上游，画布校验会提醒）；fail 判节点
+   失败；flag 只记录。产出和审批卡里的 on_refuted 是实际生效的那一种（只有 degrade / flag，见 _finish）。审批卡
+   （human.py 的 _reviewed_reports）附上审稿概况
 
 上限：句数、每句查询次数、每句时长、全局每日金额（核查和裁判各记各的账，engine/spend.py）。都按发起时快照的核查
 设置（run.options["verify"]），节点上写了的盖过它：审批停下期间改了设置，恢复、接着跑仍按发起时的那份。没有快照
@@ -24,19 +29,23 @@
 
 逐句串行反查：并行的话几句的工具调用在时间线上交错，看不出哪条查询在审哪一句；每日余额按先后扣，结果也才确定。
 整个反查连同存审稿记录、发日志都在一个 @task 里：接着跑时取 checkpoint 里的结果，不重复查库、不重复记账，时间线
-上也不再发一遍。
+上也不再发一遍。结果带着输入指纹，接着跑时改了审稿本身的配置就重审；同一次执行里的重试沿用已经审完的（见 _reviewed）。
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+import re
+from collections.abc import Callable, Collection, Iterable
 from typing import Any
 
 from langgraph.func import task
+from sqlalchemy import select
 
 from app.core import artifact_store
+from app.core.artifact_store import canonical_json, content_hash
 from app.core.errors import describe_exception
 from app.core.events import EventType
 from app.db.base import SessionLocal
+from app.db.models import DataSource
 from app.engine import judge as judging
 from app.engine.context import NodeContext, NodeError
 from app.engine.evidence import ENTITY_KINDS, iter_units, ledger_enabled, next_exec
@@ -63,6 +72,12 @@ _QUERY_KEYS = ("alias", "artifact", "sql", "row_count", "truncated", "source")
 _CLAIM_LIMITS = ("max_queries", "timeout_s", "daily_max_usd")
 #: 列「审批卡上的几句」时谁先留：被推翻、被削弱、没能判断的比经受住的更要让审批人看到
 _RANK = {"refuted": 0, "weakened": 1, "inconclusive": 2, "stands": 3}
+#: 系统改判时照录反方原本的结论用的叫法（界面的叫法见 lib/terms.ts 的 CHALLENGE_TEXT.verdict）
+_VERDICT_LABEL = {"stands": "经受住", "weakened": "被削弱", "refuted": "被推翻", "inconclusive": "无法判断"}
+#: 接着跑时 checkpoint 里缓存的审稿最多翻几条去找这一份配置的（每条都是按先前某一份配置审的，对不上就往后翻）
+_STALE_LIMIT = 16
+#: 同一次执行里审完的结果放在 RunContext.extra 的这个键下：{(节点, 第几次执行, 输入指纹): 审稿结果}。重试沿用它
+_REVIEWS_KEY = "challenge_reviews"
 
 CHALLENGE_SYSTEM = (
     "你是反方审稿人：报告已经写完，你站在反方，专门找其中一句结论的反例。你不写报告，也不改报告。\n"
@@ -71,7 +86,9 @@ CHALLENGE_SYSTEM = (
     "不要只是重复写作者的查询\n"
     "- verdict 四选一：stands 认真找过、没有找到反例；weakened 大体成立，但有重要的例外或前提，或者把范围、程度、"
     "原因说过了头；refuted 查到的数据和这句结论相矛盾；inconclusive 查不到判断所需的数据\n"
-    "- 没有找到反例不等于结论被推翻：只有数据和结论冲突时才判 refuted"
+    "- 没有找到反例不等于结论被推翻：只有数据和结论冲突时才判 refuted\n"
+    "- 结论要有出处：一条查询都没执行成功时，判什么都不会被采信；判 refuted 时，理由里至少要引用一处你自己查询的"
+    "结果（[[v:Qn.rX.列名]] 或 [[see:Qn]]），否则同样不会被采信"
 )
 CHALLENGE_TASK_PROMPT = (
     "要审的结论（报告「{report}」中的一句{section}）：\n「{claim}」\n\n"
@@ -143,17 +160,39 @@ async def run_challenge(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         spec=model_spec, masks=await judging.source_masks(catalog),
         writer_model=written.get("model") if isinstance(written.get("model"), str) else None,
     )
+    outcome = await _reviewed(ctx, state, review)
+    return _finish(ctx, state, outcome, on_refuted=str(config.get("on_refuted") or "degrade"))
+
+
+async def _reviewed(ctx: NodeContext, state: GraphState, review: _Review) -> dict[str, Any]:
+    """这一次执行的审稿结果。
+
+    - 进 checkpoint：整个反查在一个 @task 里，接着跑时直接取这里的结果，不再查库、不再记账（每日账也记在这里面）；
+      事件都在这里面发，取缓存时不会再发一遍
+    - 带输入指纹（_Review.key）：接着跑时可以带着改过配置的图（runner.continue_failed）。只改了「结论被推翻时」的，
+      审稿沿用（判失败的报错就是这么建议的）；改了要审的报告、反方模型、上限的，缓存里那份是按旧配置审的，对不上就
+      往后翻、重新审——不然换了报告，审批卡会把对另一份报告的审稿挂上来（做法同 report.py 的裁判）
+    - 同一次执行里的重试（节点的「失败重试次数」）沿用已经审完的：重试把执行器整个再调一遍，task 成了这次执行里的
+      又一次调用，不命中缓存。再审一遍既多花一份钱，模型换个说法还会把「被推翻」重审掉，最严的处置反倒放行
+    """
+    reviews = ctx.run.extra.setdefault(_REVIEWS_KEY, {})
+    slot = (ctx.node.id, next_exec(state, ctx.node.id), review.key)
+    if slot not in reviews:
+        reviews[slot] = await _review_once(review)
+    return reviews[slot]
+
+
+async def _review_once(review: _Review) -> dict[str, Any]:
     if _in_graph():
         @task
-        async def challenge_step() -> dict[str, Any]:
-            # 反查进 checkpoint：接着跑时直接取这里的结果，不再查库、不再记账（每日账也记在这里面）；
-            # 事件都在这里面发，取缓存时不会再发一遍
-            return await review.run()
+        async def challenge_step(key: str) -> dict[str, Any]:
+            return {**await review.run(), "key": key}
 
-        outcome = await challenge_step()
-    else:
-        outcome = await review.run()
-    return _finish(ctx, state, outcome, on_refuted=str(config.get("on_refuted") or "degrade"))
+        for _ in range(_STALE_LIMIT):
+            outcome = await challenge_step(review.key)
+            if outcome.get("key") == review.key:
+                return outcome
+    return await review.run()
 
 
 def _skip(ctx: NodeContext, reason: str, message: str) -> dict[str, Any]:
@@ -289,14 +328,68 @@ def _claim(cand: judging.Candidate, verdict: str, rationale: str, *, doc: dict[s
             "queries": [{k: q.get(k) for k in _QUERY_KEYS} for q in queries], "usage": usage or _zero_usage()}
 
 
-def _claim_of(cand: judging.Candidate, outcome: VerifyOutcome) -> dict[str, Any]:
+def _claim_of(cand: judging.Candidate, outcome: VerifyOutcome) -> tuple[dict[str, Any], str | None]:
+    """反查 agent 交回的 → (审稿记录里的一句, 这句没能反查的原因)。反查过了的原因是 None。
+
+    反方的结论要有出处才采信：一条查询都没执行成功的（没有可用的工具、查询全部失败、根本没查），判什么都记为无法
+    判断——零查询的「被推翻」能让正式出具降档，零查询的「经受住」会在审批卡上给人假安心。判「被推翻」的，理由里还得
+    引用到自己的查询结果（resolved 的 [[v:]] / [[see:]]），审稿记录里才查得到凭什么推翻。"""
     if outcome.result is None:
         # 没交成结果（模型不可用、调用失败、触顶时连收尾都没赶上）：查过的照记，结论只能是无法判断
-        return _claim(cand, "inconclusive", f"反查未完成：{outcome.error or '原因不明'}", queries=outcome.queries,
-                      usage=outcome.usage)
+        why = outcome.error or "原因不明"
+        return _claim(cand, "inconclusive", f"反查未完成：{why}", queries=outcome.queries, usage=outcome.usage), why
     verdict = str(outcome.result.get("verdict") or "").strip().lower()
-    return _claim(cand, verdict if verdict in VERDICTS else "inconclusive", str(outcome.result.get(RATIONALE) or ""),
-                  doc=outcome.rationale, queries=outcome.queries, usage=outcome.usage)
+    verdict = verdict if verdict in VERDICTS else "inconclusive"
+    rationale = str(outcome.result.get(RATIONALE) or "")
+    if not outcome.queries:
+        why = "反查没有执行成功任何查询"
+        return _unfounded(cand, outcome, verdict, rationale, why), why
+    if verdict == "refuted" and not _cites(outcome.rationale):
+        return _unfounded(cand, outcome, verdict, rationale, "理由没有引用任何查询结果"), None
+    return _claim(cand, verdict, rationale, doc=outcome.rationale, queries=outcome.queries, usage=outcome.usage), None
+
+
+def _cites(doc: dict[str, Any] | None) -> bool:
+    """理由文档里有没有一处引用解析到了 agent 自己的查询结果（compose_doc 只把解析成功的引用记进 unit.cites）。"""
+    return isinstance(doc, dict) and any(unit.get("cites") for _, unit in iter_units(doc))
+
+
+def _unfounded(cand: judging.Candidate, outcome: VerifyOutcome, verdict: str, rationale: str,
+               why: str) -> dict[str, Any]:
+    """没有出处的结论：记为无法判断，系统写明原因，反方原本的结论和理由照录在后面。rationale_doc 为 None：这段话是
+    系统说的，界面照 rationale 显示，不拿反方那份文档冒充理由。查过的照记。"""
+    taken = f"反方给出的「{_VERDICT_LABEL[verdict]}」不予采信，记为无法判断" if verdict != "inconclusive" else "记为无法判断"
+    said = f"反方的理由：{rationale.strip()}" if rationale.strip() else "反方没有给出理由"
+    return _claim(cand, "inconclusive", f"{why}，{taken}。{said}", queries=outcome.queries, usage=outcome.usage)
+
+
+async def _usable_sources(names: Iterable[str]) -> set[str]:
+    """这几个数据源里现在能查的：存在、没有停用（核查建工具时也只认这样的，tools/datasource.build_datasource_tools）。
+    报告写完到审稿之间源被停用了，这句就没有可查的源：不派 agent，免得白建一次模型、白花一次钱。"""
+    wanted = list(dict.fromkeys(names))
+    if not wanted:
+        return set()
+    async with SessionLocal() as session:
+        rows = await session.execute(
+            select(DataSource.name).where(DataSource.name.in_(wanted), DataSource.enabled.is_(True)))
+    return {str(name) for name in rows.scalars()}
+
+
+def mark_original(excerpt: str, alias: str, queries: Collection[str]) -> str:
+    """证据摘录里指向原报告编号的写法都标上「原报告」：开头的【编号】，和正文里的「查询 Qn」（指标的输入取自哪次
+    查询、那次查询的 SQL，表名、字段名出现在哪次查询）。核查 agent 自己的查询也编 Q1、Q2…，不分开的话，它在理由里
+    引用的 Q1 会被当成原报告那份快照的格子。只认摘录自己的这两种写法、只认这份报告目录里的查询编号：数据里的值
+    （季度列里的 Q1）不动。"""
+    text = excerpt.replace(f"【{alias}】", f"【原报告 {alias}】", 1)
+    if not queries:
+        return text
+    names = "|".join(re.escape(q) for q in sorted(queries, key=len, reverse=True))
+    return re.sub(rf"查询 ({names})(?!\w)", r"原报告 \1", text)
+
+
+def _quoted(names: Iterable[str]) -> str:
+    """「a」、「b」：点名几个数据源。"""
+    return "、".join(f"「{n}」" for n in names)
 
 
 def _named(claims: list[dict[str, Any]]) -> str:
@@ -319,7 +412,10 @@ def pick_items(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class _Review:
-    """一次审稿：逐句派核查 agent，写审稿记录，发日志。run() 的返回值进 checkpoint，只放节点产出用得到的。"""
+    """一次审稿：逐句派核查 agent，写审稿记录，发日志。run() 的返回值进 checkpoint，只放节点产出用得到的。
+
+    key 是这次审稿的输入指纹：审哪份报告的哪一稿、反方模型、四个上限、数据源现在的遮罩（摘录按它遮）。「结论被推翻时」
+    不在里面：它只管审完之后怎么处置，改了它接着跑不必重审。"""
 
     def __init__(self, ctx: NodeContext, *, report_id: str, title: str, doc_artifact: str, doc: dict[str, Any],
                  catalog: dict[str, Any], claims: list[judging.Candidate], max_claims: int | None,
@@ -334,6 +430,12 @@ class _Review:
             max_claims, max_queries, timeout_s, daily_max_usd
         self.spec, self.masks, self.writer_model = spec, masks, writer_model
         self.fetch = _fetcher()
+        #: 这份报告目录里的查询编号：摘录里指向它们的写法标上「原报告」（mark_original）
+        self.queries = {a for a, e in catalog.items() if isinstance(e, dict) and e.get("kind") == "query"}
+        self.key = content_hash(canonical_json({
+            "report": report_id, "doc": doc_artifact, "model": [spec.provider, spec.model],
+            "limits": [max_claims, max_queries, timeout_s, daily_max_usd], "masks": masks,
+        }))
 
     def _limit_words(self, limit: str) -> str:
         if limit == "max_claims":
@@ -344,15 +446,16 @@ class _Review:
             return f"每句时长上限 {self.timeout_s:g} 秒"
         return f"全局每日核查金额上限 {_usd(self.daily_max_usd)}"
 
-    def _task(self, cand: judging.Candidate, sources: list[str]) -> str:
-        """交给核查 agent 的任务：这句结论、它挂的证据摘录（遮罩照旧）、可以查的数据源。摘录开头的编号改成
-        「原报告 Qn」：agent 自己的查询也编 Q1、Q2，不分开的话理由里引用的会是另一份快照的格子。"""
+    def _task(self, cand: judging.Candidate, sources: list[str], lost: list[str]) -> str:
+        """交给核查 agent 的任务：这句结论、它挂的证据摘录（遮罩照旧，原报告的编号标明，见 mark_original）、可以查的
+        数据源；这句引用的源有停用了的，也告诉它查不了哪几个，免得它把查不到当成没有反例。"""
         request = judging.prepare(self.doc, self.catalog, units=[cand.unit], loader=self.fetch, masked=self.masks)
         aliases = dict.fromkeys(a for c in request.cands for a in c.aliases if a in request.excerpts)
-        evidence = "\n\n".join(request.excerpts[a].replace(f"【{a}】", f"【原报告 {a}】", 1) for a in aliases)
+        evidence = "\n\n".join(mark_original(request.excerpts[a], a, self.queries) for a in aliases)
+        gone = f"（这句还引用了{_quoted(lost)}，已不存在或已停用，无法查询）" if lost else ""
         return CHALLENGE_TASK_PROMPT.format(
             report=self.title, section=f"，所在小节「{cand.section}」" if cand.section else "", claim=cand.text,
-            evidence=evidence or "（这句没有挂依据）", sources="、".join(sources))
+            evidence=evidence or "（这句没有挂依据）", sources="、".join(sources) + gone)
 
     async def run(self) -> dict[str, Any]:
         ctx = self.ctx
@@ -363,45 +466,67 @@ class _Review:
                              f"{skipped} 句未审")
         # 这句没挂依据时在整份报告引用的数据源里查：写作者看得到的就是这几个库
         everywhere = claim_sources(self.catalog, self.catalog, self.fetch)
+        usable = await _usable_sources(everywhere)
         claims: list[dict[str, Any]] = []
         usage = _zero_usage()
         model: str | None = None
         warned = False
         hit: dict[str, list[int]] = {}       # 上限 → [触顶的句数, 因此没能给出结论的句数]
         broke = False                        # 全局每日金额用完了：后面的句子不再派 agent
+        broken: str | None = None            # 核查模型本身用不了：后面的句子照这个原因记，不再逐句去建模型
+        unreviewed: list[str] = []           # 没能反查的句子各自的原因（触顶的由 challenge_limit 说，不在这里）
+
+        def unreached(cand: judging.Candidate, rationale: str, why: str) -> None:
+            claims.append(_claim(cand, "inconclusive", rationale))
+            unreviewed.append(why)
+
         for cand in self.picked:
             if broke:
                 hit["daily_max_usd"][1] += 1
                 claims.append(_claim(cand, "inconclusive", f"已达上限（{self._limit_words('daily_max_usd')}），这句未反查"))
                 continue
+            if broken is not None:
+                unreached(cand, f"反查未完成：{broken}", broken)
+                continue
             try:
                 sources = claim_sources(cand.aliases, self.catalog, self.fetch) or everywhere
-                task_text = self._task(cand, sources) if sources else ""
+                live = [s for s in sources if s in usable]
+                task_text = self._task(cand, live, [s for s in sources if s not in usable]) if live else ""
             except Exception as e:  # noqa: BLE001 - 一句的摘录出了意外（坏形状的工件），只让这一句没审成
-                claims.append(_claim(cand, "inconclusive", f"反查未完成：{describe_exception(e)}"))
+                why = f"整理证据摘录时出错（{describe_exception(e)}）"
+                unreached(cand, f"反查未完成：{why}", why)
                 continue
             if not sources:
-                claims.append(_claim(cand, "inconclusive",
-                                     "这份报告引用的证据中没有数据库查询，没有可以反查的数据源，这句未反查"))
+                why = "这份报告引用的证据中没有数据库查询，没有可以反查的数据源"
+                unreached(cand, f"{why}，这句未反查", why)
+                continue
+            if not live:
+                why = f"数据源{_quoted(sources)}不存在或已停用"
+                unreached(cand, f"这句引用的{why}，没有可以反查的数据源，这句未反查", why)
                 continue
             outcome = await run_verify_agent(
-                spec=self.spec, system=CHALLENGE_SYSTEM, task=task_text, sources=sources,
+                spec=self.spec, system=CHALLENGE_SYSTEM, task=task_text, sources=live,
                 output_schema=CHALLENGE_SCHEMA, max_queries=self.max_queries, timeout_s=self.timeout_s,
                 daily_max_usd=self.daily_max_usd, emit=ctx.emit, run_id=ctx.run.run_id, node_id=ctx.node.id,
                 data_versions=run_versions(ctx.run))
+            if outcome.error and not outcome.model:
+                broken = outcome.error      # 连模型都没建成（没配好、接入出错）：换一句也一样
             model = model or outcome.model
             if not warned and outcome.model and outcome.model == self.writer_model:
                 warned = True
                 ctx.emit(EventType.LOG, level="warn", code="challenge_same_model", model=outcome.model,
                          message=f"反方模型与报告的写作模型相同（「{outcome.model}」），难以发现写作模型自身的错误。"
                                  f"请在设置的「核查」一节选择另一个模型，或在节点的「{CHALLENGE_LABEL['model']}」中指定")
-            claims.append(_claim_of(cand, outcome))
+            claim, why = _claim_of(cand, outcome)
+            claims.append(claim)
             usage = _add_usage(usage, outcome.usage)
             if outcome.limit in _CLAIM_LIMITS:
                 counted = hit.setdefault(outcome.limit, [0, 0])
                 counted[0] += 1
-                counted[1] += outcome.result is None
+                counted[1] += why is not None
                 broke = outcome.limit == "daily_max_usd"
+            elif why is not None:
+                unreviewed.append(why)
 
         counts = {v: sum(1 for c in claims if c["verdict"] == v) for v in VERDICTS}
         artifact = await self._store({"report": self.report_id, "doc_artifact": self.doc_artifact, "claims": claims,
@@ -413,9 +538,17 @@ class _Review:
                 (f"，其中 {skipped} 句未能给出结论" if skipped else "")
             ctx.emit(EventType.LOG, level="warn", code="challenge_limit", limit=limit, claims_skipped=skipped,
                      message=message)
+        if unreviewed:
+            more = "等" if len(set(unreviewed)) > 1 else ""
+            ctx.emit(EventType.LOG, level="warn", code="challenge_unreviewed", claims_skipped=len(unreviewed),
+                     reason=unreviewed[0],
+                     message=f"反方审稿有 {len(unreviewed)} 句结论未能反查，已记为无法判断：{unreviewed[0]}{more}")
+        # 真正查过的和没查成的分开说：「无法判断 2 句」可能是数据不够，也可能是一条查询都没执行成功
+        idle = sum(1 for c in claims if not c["queries"])
         ctx.emit(EventType.LOG, level="info", code="challenge_done", counts=counts, artifact=artifact,
                  message=f"反方审稿完成：审了 {len(claims)} 句结论，经受住 {counts['stands']} 句、被削弱 "
-                         f"{counts['weakened']} 句、被推翻 {counts['refuted']} 句、无法判断 {counts['inconclusive']} 句")
+                         f"{counts['weakened']} 句、被推翻 {counts['refuted']} 句、无法判断 {counts['inconclusive']} 句"
+                         + (f"，其中 {idle} 句未能反查（没有执行成功任何查询）" if idle else ""))
         if refuted := [c for c in claims if c["verdict"] == "refuted"]:
             ctx.emit(EventType.LOG, level="warn", code="challenge_refuted",
                      items=[{"unit": c["unit"], "text": c["text"]} for c in refuted[:ITEMS_MAX]],
@@ -434,12 +567,19 @@ class _Review:
 
 
 def _finish(ctx: NodeContext, state: GraphState, outcome: dict[str, Any], *, on_refuted: str) -> dict[str, Any]:
-    """反查的结果 → 节点产出；被推翻的按 on_refuted 处置。重放时 outcome 取自 checkpoint，算出来的一样。"""
+    """反查的结果 → 节点产出；被推翻的按 on_refuted 处置。重放时 outcome 取自 checkpoint，算出来的一样。
+
+    产出里的 on_refuted 写实际生效的处置，只有 degrade / flag 两种（期 3 的约定：审批卡据此决定写不写「出具会降档」）。
+    配的是「报错并停止运行」却走到了这里，只有两种情形：没有句子被推翻，什么都没处置，记成只标注；有被推翻的却又配了
+    「出错时：记录错误并继续」（画布校验拦这个组合，跳过校验的旧图才会走到）——这时报错会被当成普通错误吞掉，被推翻
+    的结论照常完整出具，比默认的降档还松，所以改按出具降档处置。"""
     claims = outcome.get("claims") or []
     refuted = [c for c in claims if c.get("verdict") == "refuted"]
-    if refuted and on_refuted == "fail":
-        raise NodeError(ctx.node.id, f"{_refuted_words(refuted)}。请核对这几句结论；如只需记录，可将"
-                                     f"「{CHALLENGE_LABEL['on_refuted']}」改为「{CHALLENGE_ON_REFUTED_LABEL['flag']}」")
+    if on_refuted == "fail":
+        if refuted and ctx.node.config.get("on_error") != "continue":
+            raise NodeError(ctx.node.id, f"{_refuted_words(refuted)}。请核对这几句结论；如只需记录，可将"
+                                         f"「{CHALLENGE_LABEL['on_refuted']}」改为「{CHALLENGE_ON_REFUTED_LABEL['flag']}」")
+        on_refuted = "degrade" if refuted else "flag"
     result: dict[str, Any] = {"challenge_artifact": outcome.get("artifact"), "counts": outcome.get("counts") or {},
                               "items": pick_items(claims), "on_refuted": on_refuted}
     if refuted and on_refuted == "degrade":
@@ -477,5 +617,5 @@ def challenge_summary(spec: GraphSpec, outputs: dict[str, Any], report_id: str) 
     return found
 
 
-__all__ = ["CHALLENGE_SYSTEM", "ITEMS_MAX", "VERDICTS", "challenge_summary", "claim_sources", "pick_claims",
-           "pick_items", "run_challenge"]
+__all__ = ["CHALLENGE_SYSTEM", "ITEMS_MAX", "VERDICTS", "challenge_summary", "claim_sources", "mark_original",
+           "pick_claims", "pick_items", "run_challenge"]

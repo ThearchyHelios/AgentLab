@@ -22,9 +22,13 @@ def test_the_guide_names_every_setting_the_validator_knows():
 
 def test_the_guide_says_when_to_add_it_and_where():
     entry = _challenge_entry()
-    # 什么时候加：多个来源汇总的分析报告、要正式出具的报告；接在报告之后，审批节点在后面时引用报告正文
-    assert "多个来源" in entry and "正式出具" in entry and "report → challenge" in entry
+    # 什么时候加：多个来源汇总的分析报告、要正式出具的报告；串在报告和成果之间（降档靠成果节点收上游的缺口，
+    # 接在侧枝上不生效），审批节点在后面时引用报告正文
+    assert "多个来源" in entry and "正式出具" in entry and "report → challenge → output" in entry
+    assert "侧枝" in entry
     assert "{{ nodes.报告节点id.text }}" in entry
+    # 「报错并停止运行」配「出错时：记录错误并继续」画布校验会挡：助手别这么配
+    assert "on_error: continue" in entry
     # 反方模型建议和写作模型不同：同一个模型等于自己审自己
     assert "自己审自己" in entry
     # 不写上限就取设置里的默认：助手不要替人把核查的花费写死

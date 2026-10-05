@@ -5,11 +5,14 @@
   （judge.prepare，遮罩照旧）；理由里的数字只能引用它自己的查询格子，裸数字被标出来
 - 结论四选一：经受住 / 被削弱 / 被推翻 / 无法判断；完整记录写进 challenge_artifact，随运行封存；台账只记 kind challenge，
   它的查询不进任何报告的写作目录
-- 被推翻的：on_refuted 为 degrade（默认）时写 issuance_gaps，出具降档；fail 判节点失败；flag 只记录
-- 上限：句数、每句查询数、每句时长、全局每日金额；全局关闭、报告没有可审的结论句时直通
-- 整个反查放在一个 @task 里：接着跑时不重复执行、不重复记账
-- 人工审批审这份报告时，审批卡附上反方审稿的概况
-- 画布校验：要审的报告必须是上游的报告撰写节点
+- 结论要有出处：零查询的判什么都记为无法判断，推翻还得引用到自己的查询结果；没有可查的源、模型用不了时不派 agent
+- 被推翻的：on_refuted 为 degrade（默认）时写 issuance_gaps，出具降档；fail 判节点失败；flag 只记录。产出和审批卡里
+  的 on_refuted 写实际生效的那一种
+- 上限：句数、每句查询数、每句时长、全局每日金额（都按发起时的设置快照）；全局关闭、报告没有可审的结论句时直通
+- 整个反查放在一个 @task 里：接着跑时不重复执行、不重复记账；改了审稿本身的配置才重审；节点重试不重审
+- 人工审批审这份报告时（含「报告 → 反方审稿 → 人工审批」的接法），审批卡附上反方审稿的概况
+- 画布校验：要审的报告必须是上游的报告撰写节点；「报错并停止运行」不能配「出错时：记录错误并继续」；不在成果节点
+  上游的「出具降档」给警告
 
 模型一律是 MockChatModel 剧本，数据源是现造的 SQLite 文件，区域、金额、电话都是虚构的。
 """
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -36,8 +40,9 @@ from app.engine.evidence import iter_units
 from app.engine.judge import SPEND_KEY as JUDGE_SPEND_KEY
 from app.engine.nodes import challenge as challenge_mod
 from app.engine.nodes import report as report_mod
+from app.engine.nodes.human import reviewed_by_human, reviewed_report_ids
 from app.engine.runner import run_manager, verify_manifest
-from app.engine.schema import GraphSpec, validate_graph
+from app.engine.schema import GraphSpec, ValidationResult, validate_graph
 from app.providers.factory import ProviderNotConfigured
 from app.providers.mock_model import MockChatModel
 
@@ -121,6 +126,20 @@ class Play:
     rationale: str = "没有找到反例。"
 
 
+@dataclass
+class Fickle:
+    """第一次交结果判「被推翻」，之后都判「经受住」：同一句重审一遍，模型就换了说法。"""
+
+    queries: list[str]
+    rationale: str
+    asked: int = 0
+
+    @property
+    def verdict(self) -> str:
+        self.asked += 1
+        return "refuted" if self.asked == 1 else "stands"
+
+
 #: 默认剧本：错误结论被推翻（扣除退款后华南仍低于华东），首句被削弱（华东含退款）
 PLAYS = {
     "华南销售额超过华东": Play([NET], "refuted", "扣除退款后华南为 [[v:Q1.r1.净销售额]]，仍低于华东的 [[v:Q1.r0.净销售额]]。[[see:Q1]]"),
@@ -138,6 +157,8 @@ class Models:
         self.writes: list[list] = []
         #: 反查 agent 每句拿到的工具：{句子片段: 工具名集合}
         self.tools: dict[str | None, set[str]] = {}
+        #: 核查每次建模型时要的是哪个模型（ModelSpec）：反查一句要建两次（查库、交结果）
+        self.specs: list = []
         plays = PLAYS if plays is None else plays
 
         def which(messages) -> str | None:
@@ -169,6 +190,7 @@ class Models:
         monkeypatch.setattr(MockChatModel, "_decide", decide)
 
         async def verify_model(session, spec):
+            self.specs.append(spec)
             if broken is not None:
                 raise broken
             return MockChatModel(model_name=model_id, latency=latency), model_id
@@ -308,6 +330,7 @@ async def test_flag_only_records_and_fail_stops_the_run(monkeypatch, shop):
     assert failed.status == "failed"
     assert failed.error_node_id == "chal"
     assert "反方审稿推翻了 1 句结论" in failed.error and SOUTH in failed.error
+    assert "「结论被推翻时」改为「只标注」" in failed.error, "报错里点的选项名和检查器下拉里的一致"
     # 判失败之前审稿记录已经存下、时间线照常有完成那一条
     [done] = await logs(failed.id, "challenge_done")
     record = artifact_store.load(done["artifact"])
@@ -344,6 +367,74 @@ async def test_the_verify_queries_never_reach_a_writer_downstream(monkeypatch, s
     doc = artifact_store.load(checked.data["doc_artifact"])
     queries = [a for a, e in doc["catalog"].items() if e.get("kind") == "query"]
     assert queries == ["Q1"] and doc["catalog"]["Q1"]["node_id"] == "fetch"
+
+
+# --------------------------------------------------------------------------
+# 没有出处的结论不采信
+# --------------------------------------------------------------------------
+
+
+async def test_a_verdict_without_any_query_is_not_taken(monkeypatch, shop):
+    """一条查询都没执行成功就判「被推翻」「经受住」：没有出处，记为无法判断——不让正式出具降档，也不给审批人「经受住」
+    的假安心。反方原本给的结论和理由照录在理由里，审稿记录看得出发生了什么。"""
+    plays = {"华南销售额超过华东": Play([], "refuted", "我认为这句不成立。"),
+             "居各区域之首": Play([], "stands", "没有找到反例。")}
+    Models(monkeypatch, shop, plays=plays)
+    row = await finish(graph(shop))
+    assert row.status == "succeeded", row.error
+    assert row.output["_issuance"]["tier"] == "formal", "零查询的推翻没有出处，不能让正式出具降档"
+    out = await output_of(row.id, "chal")
+    assert out["counts"] == {"stands": 0, "weakened": 0, "refuted": 0, "inconclusive": 2}
+    assert "issuance_gaps" not in out and await logs(row.id, "challenge_refuted") == []
+    east, south = artifact_store.load(out["challenge_artifact"])["claims"]
+    assert south["verdict"] == "inconclusive" and south["queries"] == [] and south["rationale_doc"] is None
+    assert "没有执行成功任何查询" in south["rationale"]
+    assert "「被推翻」" in south["rationale"] and "我认为这句不成立。" in south["rationale"]
+    assert east["verdict"] == "inconclusive" and "「经受住」" in east["rationale"]
+    [warn] = await logs(row.id, "challenge_unreviewed")
+    assert warn["claims_skipped"] == 2 and "没有执行成功任何查询" in warn["reason"]
+
+
+async def test_a_refutation_that_cites_none_of_its_queries_is_not_taken(monkeypatch, shop):
+    """查过了，可理由里一处查询结果都没引用就判「被推翻」：推翻没有出处，记为无法判断、不降档；查过的照录。"""
+    plays = {"华南销售额超过华东": Play([NET], "refuted", "扣除退款后华南仍低于华东。"),
+             "居各区域之首": Play([REFUNDS], "stands", "没有找到反例。")}
+    Models(monkeypatch, shop, plays=plays)
+    row = await finish(graph(shop))
+    assert row.status == "succeeded", row.error
+    assert row.output["_issuance"]["tier"] == "formal"
+    out = await output_of(row.id, "chal")
+    assert out["counts"] == {"stands": 1, "weakened": 0, "refuted": 0, "inconclusive": 1}
+    east, south = artifact_store.load(out["challenge_artifact"])["claims"]
+    assert south["verdict"] == "inconclusive" and len(south["queries"]) == 1 and south["rationale_doc"] is None
+    assert "没有引用" in south["rationale"] and "扣除退款后华南仍低于华东。" in south["rationale"]
+    assert east["verdict"] == "stands", "「经受住」不要求引用：它不改变出具"
+    assert await logs(row.id, "challenge_unreviewed") == [], "查过了，不算没能反查"
+
+
+async def test_claims_whose_sources_are_gone_are_not_sent_out(monkeypatch, shop):
+    """报告写完、审稿开始之前数据源被停用：这句没有可查的源，不建模型、不花钱，照实记无法判断并点出是哪个源。"""
+    real = report_mod._store
+
+    async def store_then_disable(doc, ctx):
+        out = await real(doc, ctx)
+        async with SessionLocal() as session:
+            row = (await session.execute(select(DataSource).where(DataSource.name == shop))).scalar_one()
+            row.enabled = False
+            await session.commit()
+        return out
+
+    monkeypatch.setattr(report_mod, "_store", store_then_disable)
+    models = Models(monkeypatch, shop)
+    row = await finish(graph(shop))
+    assert row.status == "succeeded", row.error
+    assert models.calls == [] and models.specs == [], "没有可查的源就不建模型、不调用"
+    out = await output_of(row.id, "chal")
+    assert out["counts"]["inconclusive"] == 2 and row.output["_issuance"]["tier"] == "formal"
+    claims = artifact_store.load(out["challenge_artifact"])["claims"]
+    assert all(f"「{shop}」" in c["rationale"] and "不存在或已停用" in c["rationale"] for c in claims)
+    [warn] = await logs(row.id, "challenge_unreviewed")
+    assert warn["claims_skipped"] == 2 and f"「{shop}」" in warn["reason"]
 
 
 # --------------------------------------------------------------------------
@@ -394,6 +485,31 @@ async def test_the_settings_snapshot_sets_the_limits_and_the_node_overrides_it(m
     row = await finish(graph(shop, max_claims=2), options={"verify": {"challenge": {"max_claims": 1}}})
     assert models.reviewed() == ["居各区域之首", "华南销售额超过华东"]
     assert await logs(row.id, "challenge_limit") == []
+
+
+async def test_the_snapshot_decides_the_model(monkeypatch, shop):
+    """反方模型也按发起时快照的核查设置：设置里现在写的是另一个模型，照样用快照里的。"""
+    async with SessionLocal() as session:
+        session.add(Setting(key="verify", value={"model": "stored-model"}))
+        await session.commit()
+    models = Models(monkeypatch, shop)
+    row = await finish(graph(shop), run_class="exploratory", options={"verify": {"model": "snap-model"}})
+    assert row.status == "succeeded", row.error
+    assert models.specs and {s.model for s in models.specs} == {"snap-model"}
+
+
+async def test_the_snapshot_decides_the_daily_cap(monkeypatch, shop):
+    """每日金额上限也按快照：设置现在放宽到 $5，发起时的 $0.50 当天已经用完，照样一句不反查。"""
+    async with SessionLocal() as session:
+        session.add(Setting(key="verify", value={"daily_max_usd": 5.0}))
+        session.add(Setting(key=spend.SPEND_KEY, value={"date": spend._today(), "usd": 1.0, "calls": 3}))
+        await session.commit()
+    models = Models(monkeypatch, shop)
+    row = await finish(graph(shop), options={"verify": {"daily_max_usd": 0.5}})
+    assert row.status == "succeeded", row.error
+    assert [kind for kind, _, _ in models.calls] == []
+    [limit] = await logs(row.id, "challenge_limit")
+    assert limit["limit"] == "daily_max_usd" and "$0.50" in limit["message"]
 
 
 async def test_without_a_snapshot_the_current_settings_apply(monkeypatch, shop):
@@ -459,14 +575,15 @@ async def test_the_daily_cap_stops_the_remaining_claims(monkeypatch, shop):
 # --------------------------------------------------------------------------
 
 
-def gated(source: str, **challenge) -> dict:
+def gated(source: str, *, message: str = "{{ nodes.write.text }}", **challenge) -> dict:
+    """取数 → 报告 → 反方审稿 → 人工审批 → 成果。message 是审批说明，缺省引用报告正文。"""
     challenge.setdefault("report", "write")
     nodes = [
         node("start", "input"),
         node("fetch", "tool", tool=f"db_query__{source}", args={"sql": QUERY}),
         node("write", "report", "写周报", instructions="写周报"),
         node("chal", "challenge", "审稿", **challenge),
-        node("gate", "human", "主管审批", mode="approve", title="审核周报", message="{{ nodes.write.text }}"),
+        node("gate", "human", "主管审批", mode="approve", title="审核周报", message=message),
         node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
     ]
     spec = chain(*nodes[:-1])
@@ -508,6 +625,49 @@ async def test_a_skipped_challenge_adds_nothing_to_the_card(monkeypatch, shop):
     _, approval = await paused(gated(shop, enabled=False))
     [report] = approval.payload["reports"]
     assert "challenge" not in report, "没审就不加这个键：老行为逐字不变"
+
+
+async def test_report_then_challenge_then_human_shows_the_report_on_the_card(monkeypatch, shop):
+    """按推荐的接法「报告 → 反方审稿 → 人工审批」、审批说明里不引用正文：审批卡上照样有这份报告和它的审稿概况，
+    审批人批准时知道有一句被推翻了。报告节点也认它要交给人审（两边是同一个认法，不会对不上）。"""
+    Models(monkeypatch, shop)
+    spec = gated(shop, message="请审批本周周报")
+    row, approval = await paused(spec)
+    [report] = approval.payload["reports"]
+    out = await output_of(row.id, "chal")
+    assert report["node_id"] == "write" and report["challenge"]["counts"] == out["counts"]
+    assert report["challenge"]["counts"]["refuted"] == 1
+    parsed = GraphSpec.model_validate(spec)
+    assert reviewed_report_ids(parsed, parsed.node_map()["gate"]) == ["write"]
+    assert reviewed_by_human(parsed, "write")
+
+
+async def test_fail_with_nothing_refuted_reports_what_took_effect(monkeypatch, shop):
+    """「报错并停止运行」又没有句子被推翻：走到了审批，节点产出和审批卡里的 on_refuted 写实际生效的处置（只标注），
+    不写约定之外的 fail。"""
+    plays = {"华南销售额超过华东": Play([NET], "stands", "没有找到反例。"),
+             "居各区域之首": Play([REFUNDS], "stands", "没有找到反例。")}
+    Models(monkeypatch, shop, plays=plays)
+    row, approval = await paused(gated(shop, on_refuted="fail"))
+    assert approval.payload["reports"][0]["challenge"]["on_refuted"] == "flag"
+    assert (await output_of(row.id, "chal"))["on_refuted"] == "flag"
+
+
+def test_the_card_only_carries_the_review_of_that_report():
+    """一个审批节点审两份报告，反方审稿只审了其中一份：审稿概况只挂在被审的那份上。"""
+    spec = spec_of(node("start", "input"), node("a", "report", "周报甲"), node("b", "report", "周报乙"),
+                   node("chal", "challenge", report="a"), node("gate", "human"),
+                   edges=[{"source": "start", "target": "a"}, {"source": "start", "target": "b"},
+                          {"source": "a", "target": "chal"}, {"source": "chal", "target": "gate"},
+                          {"source": "b", "target": "gate"}])
+    counts = {"stands": 1, "weakened": 0, "refuted": 0, "inconclusive": 0}
+    items = [{"unit": "u0", "text": "周报甲的一句结论。", "verdict": "stands"}]
+    outputs = {"chal": {"challenge_artifact": "a1", "counts": counts, "items": items, "on_refuted": "degrade"}}
+    assert challenge_mod.challenge_summary(spec, outputs, "a") == {
+        "counts": counts, "items": items, "artifact": "a1", "on_refuted": "degrade"}
+    assert challenge_mod.challenge_summary(spec, outputs, "b") is None
+    # 直接连着的报告，和直接连着的反方审稿审的那份，都算这个审批节点审的
+    assert reviewed_report_ids(spec, spec.node_map()["gate"]) == ["a", "b"]
 
 
 def test_items_keep_the_refuted_ones_when_there_are_many():
@@ -555,6 +715,67 @@ async def test_continuing_after_a_failure_does_not_run_the_agents_again(monkeypa
     assert len(await events(run.id, "tool.end", "chal")) == tool_ends
     assert len(await logs(row.id, "challenge_done")) == 1
     assert row.output["_issuance"]["tier"] == "degraded"
+
+
+async def test_retrying_after_a_refutation_does_not_review_again(monkeypatch, shop):
+    """「报错并停止运行」配了失败重试：重试沿用同一次审稿，不再派 agent——再审一遍既多花一份钱，模型换个说法还会把
+    「被推翻」重审掉，最严的处置反倒放行。"""
+    plays = {"华南销售额超过华东": Fickle([NET], "扣除退款后华南为 [[v:Q1.r1.净销售额]]。[[see:Q1]]"),
+             "居各区域之首": Play([REFUNDS], "stands", "没有找到反例。")}
+    models = Models(monkeypatch, shop, plays=plays)
+    row = await finish(graph(shop, on_refuted="fail", retries=1, retry_backoff=0.01))
+    assert row.status == "failed" and "反方审稿推翻了 1 句结论" in (row.error or ""), row.error
+    assert [key for kind, key, _ in models.calls if kind == "final"] == ["居各区域之首", "华南销售额超过华东"]
+    assert len(await logs(row.id, "challenge_done")) == 1
+    assert len(await logs(row.id, "node_retry")) == 1, "重试照常发生，只是不再审一遍"
+
+
+async def test_a_fail_that_would_be_swallowed_degrades_instead(monkeypatch, shop):
+    """「报错并停止运行」配「出错时：记录错误并继续」（画布校验拦这个组合，这里模拟跳过了校验的旧图）：报的错会被吞掉，
+    被推翻的结论照常完整出具。节点改按出具降档处置。"""
+    monkeypatch.setattr("app.engine.runner.validate_graph", lambda spec: ValidationResult())
+    Models(monkeypatch, shop)
+    row = await finish(graph(shop, on_refuted="fail", on_error="continue"))
+    assert row.status == "succeeded", row.error
+    out = await output_of(row.id, "chal")
+    assert out["on_refuted"] == "degrade" and out["issuance_gaps"] == [f"反方审稿推翻了 1 句结论：「{SOUTH}」"]
+    assert row.output["_issuance"]["tier"] == "degraded"
+
+
+async def test_continuing_with_only_the_disposition_changed_keeps_the_review(monkeypatch, shop):
+    """判失败后只把「结论被推翻时」改成「只标注」再接着跑（报错里就是这么建议的）：审稿沿用 checkpoint 里的，不重审。"""
+    models = Models(monkeypatch, shop)
+    run = await run_manager.start(graph=graph(shop, on_refuted="fail"), input_payload={}, run_class="formal")
+    row = await wait(run.id)
+    assert row.status == "failed", row.error
+    calls = len(models.calls)
+    await run_manager.continue_failed(run.id, graph=graph(shop, on_refuted="flag"))
+    row = await wait(run.id)
+    assert row.status == "succeeded", row.error
+    assert len(models.calls) == calls
+    out = await output_of(row.id, "chal")
+    assert out["on_refuted"] == "flag" and out["counts"]["refuted"] == 1
+    assert row.output["_issuance"]["tier"] == "formal"
+
+
+async def test_continuing_with_a_revised_review_reviews_again(monkeypatch, shop):
+    """接着跑时改了审稿本身（句数、反方模型）：checkpoint 里那份是按旧配置审的，对不上就重审，不拿旧结果冒充。"""
+    models = Models(monkeypatch, shop)
+    run = await run_manager.start(graph=graph(shop, on_refuted="fail"), input_payload={}, run_class="formal")
+    row = await wait(run.id)
+    assert row.status == "failed", row.error
+    assert models.reviewed() == ["居各区域之首", "华南销售额超过华东"]
+    models.calls.clear()
+    models.specs.clear()
+    revised = graph(shop, on_refuted="flag", max_claims=1, model="another-model")
+    await run_manager.continue_failed(run.id, graph=revised)
+    row = await wait(run.id)
+    assert row.status == "succeeded", row.error
+    assert models.reviewed() == ["居各区域之首"], "按新的句数重审"
+    assert models.specs and {s.model for s in models.specs} == {"another-model"}, "按新的反方模型重审"
+    out = await output_of(row.id, "chal")
+    assert [i["text"] for i in out["items"]] == [EAST] and sum(out["counts"].values()) == 1
+    assert len(await logs(row.id, "challenge_done")) == 2, "两次审稿各记各的"
 
 
 # --------------------------------------------------------------------------
@@ -619,7 +840,7 @@ async def test_claims_without_any_query_behind_them_are_not_sent_out(monkeypatch
 
 
 async def test_an_unavailable_model_leaves_the_claims_inconclusive(monkeypatch, shop):
-    Models(monkeypatch, shop, broken=ProviderNotConfigured("没有配置可用的模型接入"))
+    models = Models(monkeypatch, shop, broken=ProviderNotConfigured("没有配置可用的模型接入"))
     row = await finish(graph(shop))
     assert row.status == "succeeded", row.error
     out = await output_of(row.id, "chal")
@@ -627,6 +848,12 @@ async def test_an_unavailable_model_leaves_the_claims_inconclusive(monkeypatch, 
     record = artifact_store.load(out["challenge_artifact"])
     assert all(c["rationale"].startswith("反查未完成：核查模型不可用") for c in record["claims"])
     assert row.output["_issuance"]["tier"] == "formal"
+    assert len(models.specs) == 1, "核查模型本身用不了：后面的句子照这一次的原因记，不再逐句去建模型"
+    # 时间线上看得出根本没审成：不是只有一条「审了 2 句」
+    [warn] = await logs(row.id, "challenge_unreviewed")
+    assert warn["level"] == "warn" and warn["claims_skipped"] == 2 and "核查模型不可用" in warn["reason"]
+    [done] = await logs(row.id, "challenge_done")
+    assert "2 句未能反查" in done["message"]
 
 
 # --------------------------------------------------------------------------
@@ -645,6 +872,20 @@ async def test_reviewing_with_the_writers_own_model_is_called_out(monkeypatch, s
     Models(monkeypatch, shop)
     other = await finish(graph(shop), run_class="exploratory")
     assert await logs(other.id, "challenge_same_model") == []
+
+
+async def test_sentences_the_judge_ruled_out_are_not_reviewed(monkeypatch, shop):
+    """结论句裁判已经判成「不是结论」的句子不审：同一份文档，标上之后就不在要审的句子里。"""
+    Models(monkeypatch, shop)
+    row = await finish(graph(shop), run_class="exploratory")
+    assert row.status == "succeeded", row.error
+    doc = await report_doc(row.id)
+    east, south = unit_of(doc, EAST), unit_of(doc, SOUTH)
+    assert [c.unit for c in challenge_mod.pick_claims(doc)] == [east, south]
+    for _, unit in iter_units(doc):
+        if unit["id"] == south:
+            unit["verdict"] = {"status": "not_a_claim"}
+    assert [c.unit for c in challenge_mod.pick_claims(doc)] == [east]
 
 
 async def test_the_upstream_report_is_taken_when_none_is_chosen(monkeypatch, shop):
@@ -693,6 +934,40 @@ async def test_the_task_gives_the_claim_its_evidence_and_only_its_sources(monkey
         assert [q["source"] for q in record["claims"][0]["queries"]] == [name]
     finally:
         await engines.invalidate(source_id)
+
+
+async def test_a_metric_excerpt_marks_the_report_query_numbers_too(monkeypatch, shop):
+    """句子挂的是口径卡指标（正式报告的主路径「取数 → 口径卡 → 报告」）：摘录正文里「取自查询 Q1」「查询 Q1 的 SQL」
+    也标成原报告的编号，和反查 agent 自己的 Q1 分开；工具按指标的输入取自的查询找源。"""
+    metrics = [{"id": "gmv", "name": "华东销售额", "unit": "元", "decimals": 0,
+                "expression": "cell(nodes.fetch, 0, '销售额')"}]
+    plays = {"本周华东销售额": Play([NET], "stands", "没有找到反例。")}
+    models = Models(monkeypatch, shop, writer=("本周华东销售额 [[m:gmv]]，居各区域之首。[[see:m:gmv]]",), plays=plays)
+    spec = chain(
+        node("start", "input"),
+        node("fetch", "tool", tool=f"db_query__{shop}", args={"sql": QUERY}),
+        node("caliber", "metrics", caliber="周报口径", caliber_version="v1", metrics=metrics),
+        node("write", "report", "写周报", instructions="写周报"),
+        node("chal", "challenge", "审稿"),
+        node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
+    )
+    row = await finish(spec, run_class="exploratory")
+    assert row.status == "succeeded", row.error
+    task = models.tasks()["本周华东销售额"]
+    evidence = task.split("写作者给这句挂的证据摘录")[1].split("可以查询的数据源")[0]
+    assert "【原报告 m:gmv】" in evidence and "取自原报告 Q1 的" in evidence and "原报告 Q1 的 SQL" in evidence
+    assert re.findall(r"(?<!原报告 )(?<![A-Za-z0-9])Q\d+(?!\d)", evidence) == [], evidence
+    assert models.tools["本周华东销售额"] == {f"db_schema__{shop}", f"db_query__{shop}"}
+
+
+def test_only_the_excerpts_own_ways_of_naming_a_query_are_marked():
+    """表名、字段名摘录里的「出现在查询 Qn」也标；数据里的值（季度列里的 Q1）、不是这份报告查询的编号不动。"""
+    excerpt = ("【c:sales.amount】字段 sales.amount\n出现在查询 Q1：SELECT amount FROM sales\n"
+               "出现在查询 Q12：SELECT SUM(amount) FROM sales\n出现在查询 Q3：SELECT 1\n列：季度 | 金额\nr0：Q1 | 1,200")
+    lines = challenge_mod.mark_original(excerpt, "c:sales.amount", {"Q1", "Q12"}).splitlines()
+    assert lines[:4] == ["【原报告 c:sales.amount】字段 sales.amount", "出现在原报告 Q1：SELECT amount FROM sales",
+                         "出现在原报告 Q12：SELECT SUM(amount) FROM sales", "出现在查询 Q3：SELECT 1"]
+    assert lines[-1] == "r0：Q1 | 1,200", "数据里的值不动"
 
 
 async def test_each_claim_only_gets_the_sources_it_cites(monkeypatch, tmp_path, shop):
@@ -788,12 +1063,49 @@ def test_bad_settings_are_named_in_chinese(config, field_name):
     assert fld == field_name and code == "challenge.config_invalid"
     assert field_name not in message, "写界面上的叫法，不写键名"
     assert message.startswith("「反方审稿」的「")
+    if field_name == "on_refuted":
+        assert "只能选「出具降档」、「只标注」或「报错并停止运行」" in message, "选项名和检查器下拉里的一致"
+    if field_name == "enabled":
+        assert "开启、关闭或跟随设置" in message
 
 
 def test_good_settings_pass():
     spec = spec_of(*BASE, node("chal", "challenge", report="write", max_claims=3, max_queries=2, timeout_s=45.5,
                                on_refuted="flag", enabled=None, provider=None, model="claude-sonnet-5"))
     assert problems(spec) == []
+
+
+def test_fail_with_continue_on_error_is_refused():
+    """「报错并停止运行」配「出错时：记录错误并继续」：报的错会被当成普通错误跳过，被推翻的结论照常完整出具——比默认的
+    降档还松。挡住运行，说清怎么改。"""
+    spec = spec_of(*BASE, node("chal", "challenge", report="write", on_refuted="fail", on_error="continue"))
+    [(fld, message, code)] = problems(spec)
+    assert fld == "on_refuted" and code == "challenge.config_invalid"
+    assert "「报错并停止运行」" in message and "「记录错误并继续」" in message and "完整出具" in message
+    assert "on_error" not in message and "continue" not in message
+    for config in ({"on_refuted": "degrade", "on_error": "continue"}, {"on_refuted": "fail", "retries": 2}):
+        assert problems(spec_of(*BASE, node("chal", "challenge", report="write", **config))) == [], config
+
+
+def test_a_challenge_off_the_issuance_path_is_called_out():
+    """反方审稿接在侧枝上（报告 → 成果、报告 → 反方审稿）：它写的出具缺口没有成果节点收，按默认的「出具降档」也不会
+    降档。画布上说破；接在成果之前、没有出具契约、不靠降档的处置都不提醒。"""
+    def warned(nodes, edges=None):
+        return [i for i in validate_graph(spec_of(*nodes, edges=edges)).issues if i.code == "challenge.no_issuance"]
+
+    out = node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}],
+               contract={"report_from": "write"})
+    side = [{"source": "start", "target": "fetch"}, {"source": "fetch", "target": "write"},
+            {"source": "write", "target": "chal"}, {"source": "write", "target": "out"}]
+    [issue] = warned([*BASE, node("chal", "challenge", "审稿", report="write"), out], side)
+    assert issue.level == "warning" and issue.node_id == "chal"
+    assert "成果" in issue.message and "降档" in issue.message
+    assert warned([*BASE, node("chal", "challenge", "审稿", report="write"), out]) == [], "接在成果之前"
+    loose = node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}])
+    assert warned([*BASE, node("chal", "challenge", "审稿", report="write"), loose], side) == [], "没有出具契约"
+    for disposition in ("flag", "fail"):
+        assert warned([*BASE, node("chal", "challenge", "审稿", report="write", on_refuted=disposition), out],
+                      side) == [], disposition
 
 
 def test_reviewing_with_the_writer_model_is_a_warning():

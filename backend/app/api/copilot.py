@@ -261,13 +261,15 @@ NODE_REFERENCE = """\
 - challenge：反方审稿。报告写完后挑出几句关键结论（挂了依据的、带比较或因果的优先），每句派一个只读 agent 站在反方
   自己写查询找反例，逐句判经受住、被削弱、被推翻或无法判断，理由引用它自己查到的数据；不改报告。
   config: {report, max_claims, max_queries, timeout_s, provider, model, on_refuted, enabled}
-  **多个来源汇总成的分析报告、要正式出具的报告**加这个节点，接在 report 之后：report → challenge → human 或 output。
+  **多个来源汇总成的分析报告、要正式出具的报告**加这个节点，串在 report 和 output 之间：report → challenge → output
+  （有审批时 report → challenge → human → output）。challenge 要在 output 上游：只从 report 拉出一条侧枝接 challenge、
+  output 不经过它时，降档不会发生。
   report 写要审的报告节点 id（上游只有一个 report 时可以不写）；on_refuted 是结论被推翻时怎么办：degrade（默认，计入
-  出具缺口、出具降档）/ flag（只记录）/ fail（判节点失败）。max_claims（每份报告最多审几句）、max_queries（每句最多
-  查询次数）、timeout_s（每句时长上限，秒）、enabled（不写就跟随设置里「核查」一节的开关）一般都不写，取设置里的默认；
-  provider、model 指定反方模型，不写用设置里的核查模型（建议和写作模型不同，同一个模型等于自己审自己）。后面接 human
-  时，human 的 message 里引用 {{ nodes.报告节点id.text }}，审批卡会附上这份报告的审稿结果。只回答一个问题、一次查询的
-  不必加
+  出具缺口、出具降档）/ flag（只标注，不影响出具）/ fail（报错并停止运行，不要再配 on_error: continue）。max_claims
+  （每份报告最多审几句）、max_queries（每句最多查询次数）、timeout_s（每句时长上限，秒）、enabled（不写就跟随设置里
+  「核查」一节的开关）一般都不写，取设置里的默认；provider、model 指定反方模型，不写用设置里的核查模型（建议和写作
+  模型不同，同一个模型等于自己审自己）。challenge 后面直接接 human 时，审批卡自动附上这份报告的核对和审稿结果；
+  human 的 message 里引用 {{ nodes.报告节点id.text }}，审批人能直接读到正文。只回答一个问题、一次查询的不必加
 
 搭图规则（有数字结论时必须遵守）：
 1. 取数（tool 节点查库；或者 agent 查库并配 output_schema + cite_fields）→ 口径卡 → report → output

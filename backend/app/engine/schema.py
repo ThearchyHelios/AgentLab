@@ -623,9 +623,11 @@ CHALLENGE_LABEL = {
     "timeout_s": "每句时长上限（秒）", "provider": "反方模型 · 接入", "model": "反方模型",
     "on_refuted": "结论被推翻时", "enabled": "启用",
 }
-#: 结论被推翻时怎么办：degrade 计入出具缺口、出具降档（默认）/ flag 只记录 / fail 判节点失败
+#: 结论被推翻时怎么办：degrade 计入出具缺口、出具降档（默认）/ flag 只标注 / fail 判节点失败、运行停止
 CHALLENGE_ON_REFUTED = ("degrade", "flag", "fail")
-CHALLENGE_ON_REFUTED_LABEL = {"degrade": "出具降档", "flag": "仅记录", "fail": "判为失败"}
+#: 选项的叫法和检查器下拉一致（lib/terms.ts 的 CHALLENGE_TEXT.onRefuted），只去掉「（默认）」：报错让人去改某一项时，
+#: 人在下拉里找得到这个名字
+CHALLENGE_ON_REFUTED_LABEL = {"degrade": "出具降档", "flag": "只标注", "fail": "报错并停止运行"}
 
 
 def _challenge_field(key: str) -> str:
@@ -659,7 +661,7 @@ def challenge_problems(config: dict[str, Any]) -> list[tuple[str, str]]:
                                   f"当前为「{value}」"))
     value = config.get("enabled")
     if value is not None and not isinstance(value, bool):
-        out.append(("enabled", f"{_challenge_field('enabled')}只能是开启、关闭或留空（沿用设置），当前为「{value}」"))
+        out.append(("enabled", f"{_challenge_field('enabled')}只能是开启、关闭或跟随设置，当前为「{value}」"))
     return out
 
 
@@ -703,13 +705,36 @@ def challenge_report(spec: GraphSpec, node: GraphNode) -> tuple[str | None, str 
 
 def _check_challenge(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
     """反方审稿的配置写错了挡住运行：执行时节点照样会报这一句，与其取数、写完报告才死在审稿这一步，不如在画图时说破。
-    反方模型和要审的报告的写作模型写成同一个的给警告：等于自己审自己。"""
+    反方模型和要审的报告的写作模型写成同一个的给警告：等于自己审自己。
+
+    两种「看着配了、其实不生效」的接法也在这里说破：
+    - 「报错并停止运行」配「出错时：记录错误并继续」：节点报的错被当成普通错误跳过，被推翻的结论照常完整出具，比默认的
+      降档还松，挡住运行。不放进 challenge_problems：执行时再报一遍的错照样会被这个设置吞掉，执行时改按降档处置
+    - 「出具降档」靠成果节点的出具契约收上游的出具缺口（nodes/io.py 只认成果节点的上游）：反方审稿接在侧枝上、或者在
+      成果之后，降档不会发生，给警告。图里没有带出具契约的成果节点时无所谓出具，不提醒
+    """
+    who = f"「{type_label(NodeType.CHALLENGE)}」"
     for field, message in challenge_problems(node.config):
         result.add(message, node_id=node.id, field=field, code="challenge.config_invalid")
+    on_refuted = node.config.get("on_refuted") or "degrade"
+    if on_refuted == "fail" and node.config.get("on_error") == "continue":
+        result.add(f"{_challenge_field('on_refuted')}选了「{CHALLENGE_ON_REFUTED_LABEL['fail']}」，"
+                   f"「{field_label('on_error')}」却是「{option_label('on_error', 'continue')}」：结论被推翻时节点报的错"
+                   "会被当作普通错误跳过，被推翻的结论照常完整出具。"
+                   f"请把「{CHALLENGE_LABEL['on_refuted']}」改为「{CHALLENGE_ON_REFUTED_LABEL['degrade']}」，"
+                   f"或把「{field_label('on_error')}」改回「中断整个运行」",
+                   node_id=node.id, field="on_refuted", code="challenge.config_invalid")
+    if on_refuted == "degrade":
+        issued = [n for n in spec.nodes if n.type == NodeType.OUTPUT and n.config.get("contract")]
+        if issued and not any(node.id in _ancestors(spec, n.id) for n in issued):
+            report_kind, output_kind = type_label(NodeType.REPORT), type_label(NodeType.OUTPUT)
+            result.add(f"{who}不在带出具契约的「{output_kind}」节点上游：结论被推翻时，「{output_kind}」节点收不到它记下的"
+                       f"出具缺口，出具不会降档。请改为「{report_kind} → {type_label(NodeType.CHALLENGE)} → {output_kind}」"
+                       f"的接法；只需记录的，把「{CHALLENGE_LABEL['on_refuted']}」改为「{CHALLENGE_ON_REFUTED_LABEL['flag']}」",
+                       level="warning", node_id=node.id, code="challenge.no_issuance")
     report, problem = challenge_report(spec, node)
     if report is None:
-        result.add(problem or f"「{type_label(NodeType.CHALLENGE)}」找不到要审的报告", node_id=node.id, field="report",
-                   code="challenge.report_invalid")
+        result.add(problem or f"{who}找不到要审的报告", node_id=node.id, field="report", code="challenge.report_invalid")
         return
     writer = spec.node_map()[report]
     model = node.config.get("model")
