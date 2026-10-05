@@ -425,6 +425,97 @@ def _check_report_sources(node: GraphNode, spec: GraphSpec, result: ValidationRe
                        node_id=node.id, field="metrics_from", code=code)
 
 
+#: 双盲复算节点各配置项在检查器上的叫法（前端 nodeDefs 的 dual_check 字段）。按 labels.py 的规矩应放在那里，
+#: 那个文件不归双盲复算的工作包，先放在校验旁边，节点执行时报错也从这里取
+DUAL_CHECK_FIELD_LABEL = {
+    "card": "口径卡", "metrics": "复算的指标", "definitions": "口径说明", "provider": "盲算模型 · 接入",
+    "model": "盲算模型", "tolerance": "允许的相对误差", "on_reject": "未采用原流程时", "enabled": "启用双盲复算",
+}
+#: 审核人没有采用原流程的结果（选了盲算，或者判断两边都不对）时：degrade 计入缺口、出具降档（默认）/ fail 判为失败
+DUAL_CHECK_ON_REJECT = ("degrade", "fail")
+DUAL_CHECK_ON_REJECT_LABEL = {"degrade": "计入缺口、出具降档", "fail": "判为失败"}
+
+
+def dual_check_card(spec: GraphSpec, node: GraphNode) -> tuple[str | None, str | None]:
+    """双盲复算要复算的口径卡：(节点 id, None) 或 (None, 为什么认不出)。写了「口径卡」（card）就是它，否则取上游唯一的
+    那张口径卡。校验和节点执行用的是这一个认法；写了的那个节点存不存在、是不是口径卡、在不在上游由调用方查。"""
+    card = node.config.get("card")
+    if card not in (None, ""):
+        return (card, None) if isinstance(card, str) else (None, f"「{DUAL_CHECK_FIELD_LABEL['card']}」需要选择一个口径卡节点")
+    upstream = _ancestors(spec, node.id)
+    cards = [n for n in spec.nodes if n.id in upstream and n.type == NodeType.METRICS]
+    if not cards:
+        return None, "「双盲复算」的上游没有口径卡：它复算的是口径卡上的指标，请把它接在口径卡之后"
+    if len(cards) > 1:
+        names = "、".join(f"「{n.title}」" for n in cards[:5])
+        return None, (f"「双盲复算」的上游有 {len(cards)} 张口径卡（{names}），"
+                      f"请在「{DUAL_CHECK_FIELD_LABEL['card']}」中选择要复算的那一张")
+    return cards[0].id, None
+
+
+def _check_dual_check(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
+    """双盲复算的配置：口径卡必须是它上游的口径卡；复算的指标、口径说明的键必须是那张卡上的指标 ID；开关、
+    误差、处置的取值。指标定义从别的工作流引用来的口径卡（caliber_from），画图时不知道有哪些指标，不查指标 ID。"""
+    cfg = node.config
+    label = DUAL_CHECK_FIELD_LABEL
+
+    def add(message: str, field: str, code: str) -> None:
+        result.add(message, node_id=node.id, field=field, code=code)
+
+    if cfg.get("enabled") not in (None, True, False):
+        add(f"「{label['enabled']}」只能选跟随设置、开启或关闭，当前为「{cfg.get('enabled')}」", "enabled",
+            "dual_check.option_invalid")
+    if cfg.get("on_reject") not in (None, "", *DUAL_CHECK_ON_REJECT):
+        allowed = "或".join(f"「{v}」" for v in DUAL_CHECK_ON_REJECT_LABEL.values())
+        add(f"「{label['on_reject']}」只能选{allowed}，当前为「{cfg.get('on_reject')}」", "on_reject",
+            "dual_check.option_invalid")
+    tolerance = cfg.get("tolerance")
+    if tolerance not in (None, "") and (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
+                                        or not math.isfinite(tolerance) or tolerance < 0):
+        add(f"「{label['tolerance']}」需要填写不小于 0 的数（例如 0.000001 表示百万分之一），留空表示按设置，"
+            f"当前为「{tolerance}」", "tolerance", "dual_check.option_invalid")
+
+    card_id, problem = dual_check_card(spec, node)
+    if problem:
+        add(problem, "card", "dual_check.card_invalid")
+        return
+    target = spec.node_map().get(card_id or "")
+    if target is None:
+        add(f"「{label['card']}」选择了「{card_id}」，但工作流中不存在这个节点", "card", "dual_check.card_invalid")
+        return
+    if target.type != NodeType.METRICS:
+        add(f"「{label['card']}」选择了「{target.title}」，它是「{type_label(target.type)}」节点，不是口径卡；"
+            "双盲复算只能复算口径卡上的指标", "card", "dual_check.card_invalid")
+        return
+    if target.id not in _ancestors(spec, node.id):
+        add(f"「{label['card']}」选择的口径卡「{target.title}」不在双盲复算的上游：复算时这张卡还没有计算。"
+            "请把口径卡连到双盲复算之前", "card", "dual_check.card_invalid")
+        return
+    if target.config.get("caliber_from") not in (None, "", {}):
+        known = None
+    else:
+        known = [str(d.get("id")) for d in target.config.get("metrics") or [] if isinstance(d, dict) and d.get("id")]
+    hint = ("，可选的指标 ID：" + "、".join(known[:12])) if known else ""
+
+    metrics = cfg.get("metrics")
+    if metrics not in (None, "", []):
+        if not isinstance(metrics, list) or not all(isinstance(m, str) and m.strip() for m in metrics):
+            add(f"「{label['metrics']}」需要填写口径卡上的指标 ID 列表，留空表示复算输入来自查询的全部指标", "metrics",
+                "dual_check.metrics_invalid")
+        elif known is not None and (unknown := [m for m in metrics if m not in known]):
+            add(f"「{label['metrics']}」中的「{'、'.join(unknown[:5])}」不是口径卡「{target.title}」上的指标 ID{hint}",
+                "metrics", "dual_check.metrics_invalid")
+    definitions = cfg.get("definitions")
+    if definitions not in (None, "", {}):
+        if not isinstance(definitions, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                        for k, v in definitions.items()):
+            add(f"「{label['definitions']}」需要写成「指标 ID → 口径说明」的对照，口径说明写成文字", "definitions",
+                "dual_check.definitions_invalid")
+        elif known is not None and (unknown := [k for k in definitions if k not in known]):
+            add(f"「{label['definitions']}」中的「{'、'.join(unknown[:5])}」不是口径卡「{target.title}」上的指标 ID{hint}",
+                "definitions", "dual_check.definitions_invalid")
+
+
 def _produces_query(node: GraphNode) -> bool:
     """这个节点的产出是一份存成快照的查询结果：调用数据库查询工具的「调用工具」节点，或另一个合并查询。"""
     if node.type == NodeType.MERGE:
@@ -674,6 +765,8 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                 if not d.get("id") or not d.get("expression"):
                     result.add(f"指标定义缺少 ID 或表达式：{d.get('id') or '（空）'}",
                                node_id=node.id, field=f"metrics[{i}]")
+        elif node.type == NodeType.DUAL_CHECK:
+            _check_dual_check(node, spec, result)
         elif node.type == NodeType.REPORT:
             _check_report_sources(node, spec, result)
             _check_report_claims(node, spec, result)

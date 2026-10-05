@@ -60,7 +60,8 @@ async def launch_run(
     运行也没有开始执行。
 
     参数和 POST /api/runs 的请求体一一对应（input 叫 input_payload）；actor 是记在运行上的发起人。
-    schedule_id 是发起它的定时任务，options 是整次运行沿用的选项快照，都原样交给 run_manager.start。
+    schedule_id 是发起它的定时任务，options 是整次运行沿用的选项快照，都原样交给 run_manager.start；图里有双盲复算、
+    反方审稿节点时 options 另加核查设置的快照（_with_verify_snapshot）。
     """
     # 没挂在工作流上（画布没保存就发起、问数据当场搭的）。老数据里是「临时图」，前端两种都认
     name = "未保存的工作流"
@@ -135,6 +136,7 @@ async def launch_run(
     if not graph:
         raise LaunchRefused(400, "没有要运行的内容：请求中既没有工作流 ID，也没有工作流内容")
     await _refuse_missing_tools(session, graph)
+    options = await _with_verify_snapshot(session, graph, options)
 
     from app.api.settings import resolve_run_scope
 
@@ -176,6 +178,32 @@ async def launch_run(
     except ValueError as e:
         raise LaunchRefused(400, str(e)) from e
     return run
+
+
+#: 运行中途要读核查设置的节点：双盲复算、反方审稿
+_VERIFY_NODES = (NodeType.DUAL_CHECK, NodeType.CHALLENGE)
+
+
+async def _with_verify_snapshot(session: AsyncSession, graph: dict[str, Any],
+                                options: dict[str, Any] | None) -> dict[str, Any] | None:
+    """图里有双盲复算或反方审稿节点时，把核查设置（api/settings.py 的 verify 一组）快照进 options["verify"]。
+
+    这两种节点在运行中途读设置（开关、上限、核查模型）。审批停下期间有人改了设置，恢复后的那一段读到的就和前面
+    不一样：本该复算的被关掉了、重放时走了另一条路，正式运行也说不清当时按什么规则核的。所以在发起这一刻定下来，
+    节点只读运行选项里的这一份（同 _approval_default 的道理）。没有这两种节点的图 options 原样不动，run.started
+    和以前逐字相同；调用方已经给了 options["verify"] 的照它的。
+    """
+    from app.api.settings import VERIFY_GROUP, verify_settings
+
+    if isinstance(options, dict) and VERIFY_GROUP in options:
+        return options
+    try:
+        spec = GraphSpec.model_validate(graph)
+    except Exception:  # noqa: BLE001 - 图本身不成形交给 run_manager.start 报
+        return options
+    if not any(node.type in _VERIFY_NODES for node in spec.nodes):
+        return options
+    return {**(options or {}), VERIFY_GROUP: await verify_settings(session)}
 
 
 # --------------------------------------------------------------------------
