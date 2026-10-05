@@ -94,7 +94,7 @@ const ORDER = [
 // 各项的耗时（秒）。只决定排队顺序：长的先开跑，短的填空，结果不受影响。新加的检查不在表里就按 60 秒算；
 // 拆开的两项看 SPLIT 里各份的 est。2026-09-29 八道并行、关浏览器不干等之后的实测
 const ESTIMATE = {
-  challenge: 40,
+  challenge: 17,
   stream: 173, chat: 160, studio: 149, manage: 145, runs: 112, publish: 92, shell: 87,
   evidence: 91, versions: 60, catalog: 45, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
   // 占位，换成真检查时按实测改
