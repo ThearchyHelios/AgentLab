@@ -265,7 +265,7 @@ async def test_a_refuted_conclusion_degrades_the_issuance(monkeypatch, shop):
 
     issuance = row.output["_issuance"]
     assert issuance["tier"] == "degraded"
-    assert issuance["gaps"] == [f"反方审稿「审稿」：反方审稿推翻了 1 句结论：「{SOUTH}」"], "缺口不带节点名，前缀由出具契约加"
+    assert issuance["gaps"] == [f"反方审稿「审稿」：推翻了 1 句结论：「{SOUTH}」"], "缺口不带节点名，前缀由出具契约加"
 
     doc = await report_doc(row.id)
     east, south = unit_of(doc, EAST), unit_of(doc, SOUTH)
@@ -275,7 +275,7 @@ async def test_a_refuted_conclusion_degrades_the_issuance(monkeypatch, shop):
     assert out["items"] == [{"unit": east, "text": EAST, "verdict": "weakened"},
                             {"unit": south, "text": SOUTH, "verdict": "refuted"}]
     assert out["on_refuted"] == "degrade"
-    assert out["issuance_gaps"] == [f"反方审稿推翻了 1 句结论：「{SOUTH}」"]
+    assert out["issuance_gaps"] == [f"推翻了 1 句结论：「{SOUTH}」"]
 
     record = artifact_store.load(out["challenge_artifact"])
     assert set(record) == {"report", "doc_artifact", "claims", "model"}
@@ -315,6 +315,19 @@ async def test_a_refuted_conclusion_degrades_the_issuance(monkeypatch, shop):
     verdict = await verify_manifest(row.id)
     assert verdict["ok"] is True
     assert finished.seq <= row.manifest_seq
+
+
+async def test_a_challenge_named_after_its_type_is_named_once_in_the_gap(monkeypatch, shop):
+    """拖进画布没改名的反方审稿：缺口读成「反方审稿：推翻了 1 句结论：…」，前缀和正文都不再重复「反方审稿」"""
+    Models(monkeypatch, shop)
+    spec = graph(shop)
+    next(n for n in spec["nodes"] if n["id"] == "chal")["data"]["label"] = "反方审稿"
+    row = await finish(spec)
+    assert row.status == "succeeded", row.error
+    assert row.output["_issuance"]["gaps"] == [f"反方审稿：推翻了 1 句结论：「{SOUTH}」"]
+    # 时间线、报错里那一句照旧带主语：它们不经出具契约加前缀
+    [refuted] = await logs(row.id, "challenge_refuted")
+    assert refuted["message"] == f"反方审稿推翻了 1 句结论：「{SOUTH}」"
 
 
 async def test_flag_only_records_and_fail_stops_the_run(monkeypatch, shop):
@@ -843,7 +856,7 @@ async def test_a_fail_that_would_be_swallowed_degrades_instead(monkeypatch, shop
     row = await finish(graph(shop, on_refuted="fail", on_error="continue"))
     assert row.status == "succeeded", row.error
     out = await output_of(row.id, "chal")
-    assert out["on_refuted"] == "degrade" and out["issuance_gaps"] == [f"反方审稿推翻了 1 句结论：「{SOUTH}」"]
+    assert out["on_refuted"] == "degrade" and out["issuance_gaps"] == [f"推翻了 1 句结论：「{SOUTH}」"]
     assert row.output["_issuance"]["tier"] == "degraded"
 
 

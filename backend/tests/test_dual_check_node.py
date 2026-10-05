@@ -446,11 +446,23 @@ async def test_choosing_the_blind_result_degrades_and_writes_the_catalog(monkeyp
     done = await decide(client, run.id, {"gmv": "b"})
     assert done.status == "succeeded", done.error
     out = dual_output(done, await events(run.id))
-    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人选择了盲算结果"]
+    assert out["issuance_gaps"] == ["指标「销售额」两路结果不一致，审核人选择了盲算结果"]
     issuance = done.output["_issuance"]
     assert issuance["tier"] == "degraded"
-    assert issuance["gaps"] == ["双盲复算「复核销售额」：指标「销售额」双盲复算不一致，审核人选择了盲算结果"]
+    assert issuance["gaps"] == ["双盲复算「复核销售额」：指标「销售额」两路结果不一致，审核人选择了盲算结果"]
     assert (await notes_of(source_id)).notes["business_date"]["value"] == {"column": "paid_date"}
+
+
+async def test_a_dual_check_named_after_its_type_is_named_once_in_the_gap(monkeypatch, shop, client):
+    """拖进画布没改名的双盲复算：缺口读成「双盲复算：指标「销售额」两路结果不一致……」，不写两遍「双盲复算」"""
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    spec = graph(name, BY_ORDER_DATE)
+    next(n for n in spec["nodes"] if n["id"] == "dual")["data"]["label"] = "双盲复算"
+    run = await start(spec)
+    done = await decide(client, run.id, {"gmv": "neither"})
+    assert done.status == "succeeded", done.error
+    assert done.output["_issuance"]["gaps"] == ["双盲复算：指标「销售额」两路结果不一致，审核人判断两边都不对"]
 
 
 async def test_neither_degrades_and_writes_nothing(monkeypatch, shop, client):
@@ -461,7 +473,7 @@ async def test_neither_degrades_and_writes_nothing(monkeypatch, shop, client):
     assert done.status == "succeeded", done.error
     evs = await events(run.id)
     out = dual_output(done, evs)
-    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人判断两边都不对"]
+    assert out["issuance_gaps"] == ["指标「销售额」两路结果不一致，审核人判断两边都不对"]
     assert done.output["_issuance"]["tier"] == "degraded"
     assert not logs(evs, "dual_check_catalog") and await notes_of(source_id) is None
 
@@ -476,7 +488,7 @@ async def test_a_missing_choice_is_recorded_as_no_choice(monkeypatch, shop, clie
     evs = await events(run.id)
     out = dual_output(done, evs)
     assert out["choices"] == {} and "choice" not in out["metrics"][0]
-    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人没有作出选择"]
+    assert out["issuance_gaps"] == ["指标「销售额」两路结果不一致，审核人没有作出选择"]
     [resolved] = logs(evs, "dual_check_resolved")
     assert resolved["choices"] == {} and resolved["gaps"] == out["issuance_gaps"]
     assert "没有作出选择" in resolved["message"] and "两边都不对" not in resolved["message"]
@@ -505,7 +517,7 @@ async def test_on_reject_fail_stops_the_run(monkeypatch, shop, client):
     assert done.status == "failed" and "审核人没有采用原流程的结果" in (done.error or "") and "销售额" in done.error
     evs = await events(run.id)
     assert [d["gaps"] for d in logs(evs, "dual_check_resolved")] == [
-        ["指标「销售额」双盲复算不一致，审核人选择了盲算结果"]]
+        ["指标「销售额」两路结果不一致，审核人选择了盲算结果"]]
     # 审核人的选择照样写进了目录：那是对数据的判断，和运行停不停无关
     entry = await notes_of(source_id)
     assert entry.notes["business_date"]["value"] == {"column": "paid_date"} and entry.version == 1

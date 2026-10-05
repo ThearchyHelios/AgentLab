@@ -322,7 +322,8 @@ def _upstream_issuance_gaps(state: GraphState, ctx: NodeContext) -> list[str]:
     这是给「把关类」节点留的通用口子：节点觉得这次的结论不该完整出具（双盲复算两路对不上、
     反方审稿的反驳没有回应），在自己的产出里写 issuance_gaps，成果节点的出具契约照单收进缺口，
     出具随之降档。写的时候不用带节点名，这里统一加上「双盲复算「复核销售额」：」这样的前缀，
-    和别的缺口一样读得出是谁报的。
+    和别的缺口一样读得出是谁报的。节点名就是类型的叫法（拖进画布没改名）时只写一次：「反方审稿：」，
+    不写成「反方审稿「反方审稿」：」。缺口正文也不必再提节点类型，前缀已经说了。
 
     只认这个成果节点的上游：另一条支路上的节点管不到这份成果。不是字符串、空白的条目跳过——
     这个键谁都能写（数据整形的 JSON 模板也行），写坏了只当没写，不能让出具崩掉。
@@ -340,7 +341,8 @@ def _upstream_issuance_gaps(state: GraphState, ctx: NodeContext) -> list[str]:
         reported = payload.get("issuance_gaps")
         if not isinstance(reported, list):
             continue
-        prefix = f"{type_label(node.type)}「{node.title}」："
+        kind = type_label(node.type)
+        prefix = f"{kind}：" if node.title == kind else f"{kind}「{node.title}」："
         out.extend(prefix + gap.strip() for gap in reported if isinstance(gap, str) and gap.strip())
     return out
 

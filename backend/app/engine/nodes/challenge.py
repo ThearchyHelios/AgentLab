@@ -466,9 +466,15 @@ def _named(claims: list[dict[str, Any]]) -> str:
     return names + ("等" if len(claims) > _NAMED else "")
 
 
+def _refuted_gap(claims: list[dict[str, Any]]) -> str:
+    """出具缺口里的那句：「推翻了 N 句结论：「…」」。不带节点名也不带「反方审稿」：出具契约统一加「反方审稿「节点名」：」
+    （没改名的节点只加「反方审稿：」），正文再说一遍就成了「反方审稿：反方审稿推翻了……」。"""
+    return f"推翻了 {len(claims)} 句结论：{_named(claims)}"
+
+
 def _refuted_words(claims: list[dict[str, Any]]) -> str:
-    """出具缺口、时间线、报错里的那句：「反方审稿推翻了 N 句结论：「…」」。不带节点名：出具契约统一加前缀。"""
-    return f"反方审稿推翻了 {len(claims)} 句结论：{_named(claims)}"
+    """时间线、报错里的那句：「反方审稿推翻了 N 句结论：「…」」。它们不经出具契约加前缀，主语得自己带上。"""
+    return f"反方审稿{_refuted_gap(claims)}"
 
 
 def pick_items(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -676,7 +682,7 @@ def _finish(ctx: NodeContext, state: GraphState, outcome: dict[str, Any], *, on_
     result: dict[str, Any] = {"challenge_artifact": outcome.get("artifact"), "counts": outcome.get("counts") or {},
                               "items": pick_items(claims), "on_refuted": on_refuted}
     if refuted and on_refuted == "degrade":
-        result["issuance_gaps"] = [_refuted_words(refuted)]
+        result["issuance_gaps"] = [_refuted_gap(refuted)]
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     spent = outcome.get("usage") or {}
     if spent.get("calls"):
