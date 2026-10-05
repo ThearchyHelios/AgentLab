@@ -393,7 +393,8 @@ async def test_while_answering_approving_resuming_and_continuing_are_refused(mon
                                     json={"response": {"approved": True}, "approval_id": approval.id})
         assert refused.status_code == 409 and refused.json() == BUSY_DECIDE
         refused = await client.post(f"/api/runs/{paused.id}/continue", json={})
-        assert refused.status_code == 409 and refused.json()["code"] == "inquiry_busy"
+        assert refused.status_code == 409
+        assert refused.json() == {"detail": "正在回答质询，回答完再继续运行", "code": "inquiry_busy"}
         second = await ask(client, paused.id, report="write", unit=None, question="华南为什么低？",
                            approval_id=approval.id)
         assert second.status_code == 409 and second.json()["code"] == "inquiry_busy"
@@ -560,12 +561,15 @@ async def test_bare_numbers_are_flagged_and_masked_values_never_show(monkeypatch
     plays = {"买得最多": Play([TOP_BUYER, BUYER_ORDERS],
                            "金额最高的一笔来自 [[v:Q1.r0.buyer_phone]]（手机号 13900000001），金额 [[v:Q1.r0.金额]]；"
                            "这位客户共 [[v:Q2.r0.笔数]] 笔订单，另有 3 笔小额订单。")}
-    Models(monkeypatch, masked_shop, plays=plays)
+    models = Models(monkeypatch, masked_shop, plays=plays)
     paused = await pause(masked_shop)
     [approval] = await pending(paused.id)
-    r = await ask(client, paused.id, report="write", unit=None, question="买得最多的是哪位客户？",
+    r = await ask(client, paused.id, report="write", unit="", question="买得最多的是哪位客户？",
                   approval_id=approval.id)
     assert r.status_code == 200, r.text
+    assert r.json()["inquiry"]["unit"] is None, "不指明句子时写空串和写 null 一样"
+    [task] = models.tasks
+    assert f"设了遮罩的列（回答里不要写出这些列的值）：「{masked_shop}」的 buyer_phone" in task
     assert "1390000000" not in r.text, "回答、查询清单里都不能出现遮罩列的值"
     item = r.json()["inquiry"]
     answer = item["answer"]
@@ -667,7 +671,7 @@ async def test_hitting_the_query_limit_is_recorded(monkeypatch, shop, client):
     assert (item["answer"]["ok"], item["answer"]["limit"]) == (True, "max_queries"), "触顶照样按查到的结果收尾"
     # 没指明句子：任务里给报告正文，不给哪一句的摘录
     [task] = models.tasks
-    assert "审批人没有指明是哪一句" in task and f"报告正文：\n{EAST}{SOUTH}" in task and "原报告" not in task
+    assert "提问人没有指明是哪一句" in task and f"报告正文：\n{EAST}{SOUTH}" in task and "原报告" not in task
     assert [q["sql"] for q in item["queries"]] == [NO_TEST]
     [event] = await events(paused.id, "approval.inquiry")
     assert (event.data["ok"], event.data["limit"]) == (True, "max_queries")
@@ -688,6 +692,27 @@ async def test_an_unavailable_model_is_recorded_as_a_failure(monkeypatch, shop, 
     assert body["inquiry"]["queries"] == [] and body["inquiry"]["usage"]["calls"] == 0
     [event] = await events(paused.id, "approval.inquiry")
     assert event.data["ok"] is False and event.data["error"] == answer["error"]
+
+
+async def test_an_answer_that_cannot_be_put_together_is_recorded_as_a_failure(monkeypatch, shop, client):
+    """回答原文没能组装成文档：原文里的引用没换成值、遮罩也没做，不交出去；查过的、花掉的照记。"""
+    Models(monkeypatch, shop)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("文档结构异常")
+
+    monkeypatch.setattr(inquiry_mod, "compose_doc", broken)
+    paused = await pause(shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question=QUESTION, approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    item = r.json()["inquiry"]
+    assert (item["answer"]["ok"], item["answer"]["text"], item["answer"]["doc_artifact"]) == (False, "", None)
+    assert item["answer"]["error"].startswith("整理回答时出错")
+    assert [q["sql"] for q in item["queries"]] == [NO_TEST] and item["usage"]["calls"] >= 2
+    assert r.json()["recorded"] is True
+    [event] = await events(paused.id, "approval.inquiry")
+    assert event.data["ok"] is False and event.data["usage"] == item["usage"]
 
 
 async def test_the_daily_cap_is_recorded_as_a_limit(monkeypatch, shop, client):

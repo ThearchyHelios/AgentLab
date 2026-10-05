@@ -93,11 +93,12 @@ _TERMINAL = ("succeeded", "failed", "cancelled")
 _WORD = re.compile(r"[0-9A-Za-z_]")
 
 INQUIRY_SYSTEM = (
-    "你在帮审批人核对一份待批准的报告：审批人针对报告里的一句话提了问题，你查库作答。你不写报告，也不改报告。\n"
+    "你在帮人核对一份报告：提问人针对报告里的一句话提了问题，你查库作答。你不写报告，也不改报告。\n"
     "- 问题是「如果……会怎样」（排除测试账号、换个时间范围、只看某个区域）时，写只读查询把它算出来，不要凭印象推测\n"
     "- 回答直截了当：第一句直接给结论（是还是不是、是多少、差多少），再用一两句说依据；不要复述问题，不要客套\n"
     "- 回答里的每个数字都写成引用：你自己查询结果里的一格写 [[v:Qn.rX.列名]]，报告里已有的指标、运行输入照任务里列出的"
     "写法引用；不要直接写数字，没有出处的数字会被标出来\n"
+    "- 数据源设了遮罩的列（手机号、姓名这类）不要在回答里写出原值，需要指明时说「该客户」「这一笔」\n"
     "- 查不到、数据里没有判断所需的信息，就照实说查不到，不要编造"
 )
 INQUIRY_TASK_PROMPT = (
@@ -105,7 +106,8 @@ INQUIRY_TASK_PROMPT = (
     "{evidence}"
     "{refs}"
     "可以查询的数据源：{sources}\n\n"
-    "审批人的问题：\n{question}\n\n"
+    "{masked}"
+    "提问人的问题：\n{question}\n\n"
     "按上面的做法作答，回答写在 rationale 里。"
 )
 #: 交给核查 agent 的结果结构：只有回答一项（verify_agent 的理由字段，沿用这里写的说明）
@@ -212,7 +214,8 @@ def parse_ask(body: Any) -> Ask:
     report = body.get("report")
     if not isinstance(report, str) or not report.strip():
         raise _invalid("请指明质询的是哪份报告（报告撰写节点的 ID）", "report")
-    unit = body.get("unit")
+    # 不指明句子、不是在审批卡上问的，写 null 和写空串是一个意思
+    unit = body.get("unit") or None
     if unit is not None and (not isinstance(unit, str) or not unit.strip()):
         raise _invalid("句子编号需要是文字，例如「u12」；不指明句子时留空", "unit")
     quote = body.get("quote")
@@ -227,7 +230,7 @@ def parse_ask(body: Any) -> Ask:
     question = question.strip()
     if len(question) > QUESTION_MAX:
         raise _invalid(f"问题最长 {QUESTION_MAX} 字，当前为 {len(question)} 字", "question")
-    approval_id = body.get("approval_id")
+    approval_id = body.get("approval_id") or None
     if approval_id is not None and (not isinstance(approval_id, str) or not approval_id.strip()):
         raise _invalid("审批卡的 ID 需要是文字；不是在审批卡上提问时留空", "approval_id")
     return Ask(report=report.strip(), unit=unit.strip() if unit else None, quote=quote, question=question,
@@ -260,17 +263,20 @@ class _Opening:
 
 
 async def _open(run_id: str, ask: Ask) -> _Opening:
+    """这条质询开不开放：开放就交回往哪写、问的是哪份文档；不开放抛 409（输入不对的抛 422、运行不在的抛 404）。"""
+    cards: list[str] = []
+    rows: Events = []
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if run is None:
             raise InquiryRefused(404, "运行记录不存在", code=RUN_NOT_FOUND)
         status, run_class, graph, versions = run.status, run.run_class, run.graph or {}, run.data_versions
-        cards = [str(a) for a in (await session.execute(
-            select(Approval.id).where(Approval.run_id == run_id, Approval.status == "pending"))).scalars()] \
-            if status == "interrupted" else []
-        rows: Events = [tuple(r) for r in await session.execute(
-            select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)
-            .where(RunEvent.run_id == run_id).order_by(RunEvent.seq))] if status == "interrupted" else []
+        if status == "interrupted":
+            cards = [str(a) for a in (await session.execute(
+                select(Approval.id).where(Approval.run_id == run_id, Approval.status == "pending"))).scalars()]
+            rows = [tuple(r) for r in await session.execute(
+                select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)
+                .where(RunEvent.run_id == run_id).order_by(RunEvent.seq))]
     title = _node_title(graph, ask.report)
     if status == "interrupted":
         if not cards:
@@ -291,6 +297,9 @@ async def _open(run_id: str, ask: Ask) -> _Opening:
     from app.api.evidence import _reports, _sealed, _sealed_loader   # api.evidence 导入了 engine 里的模块
 
     sealed = await _sealed(run_id)
+    if sealed.status not in _TERMINAL:
+        # 上面读完状态之后运行被继续了：记录上的封存是上一次结束时的，追加会被下一次封存收进去
+        raise _not_open(STILL_RUNNING)
     if not sealed.sealed:
         raise _not_open(UNSEALED)
     if not sealed.trusted:
@@ -398,9 +407,10 @@ def _excerpts(doc: dict[str, Any], catalog: dict[str, Any], cand: judging.Candid
 
 
 def _report_refs(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """报告目录里回答可以直接引用的出处：口径卡指标（m:）和运行输入（i:）。它们的编号和 agent 自己的 Q1… 不会撞；
-    报告的查询格子不行——agent 的查询也编 Q1，引用 Q1 说不清是哪一份。"""
-    return {a: e for a, e in catalog.items() if isinstance(e, dict) and e.get("kind") in ("metric", "input")}
+    """报告目录里回答可以直接引用的出处：有值的口径卡指标（m:）和运行输入（i:）。它们的编号和 agent 自己的 Q1… 不会
+    撞；报告的查询格子不行——agent 的查询也编 Q1，引用 Q1 说不清是哪一份。没有值的引用了也解析不了，不列。"""
+    return {a: e for a, e in catalog.items()
+            if isinstance(e, dict) and e.get("kind") in ("metric", "input") and e.get("value") not in (None, "")}
 
 
 def _run_sources(events: Events) -> list[str]:
@@ -416,15 +426,17 @@ def _run_sources(events: Events) -> list[str]:
     return out
 
 
-async def _usable_sources(names: Iterable[str]) -> set[str]:
-    """现在能查的：存在、没有停用（核查建工具时也只认这样的）。"""
+async def _usable_sources(names: Iterable[str]) -> dict[str, list[str]]:
+    """现在能查的数据源（存在、没有停用，核查建工具时也只认这样的）→ 它现在设了遮罩的列。"""
+    from app.data.engine import masked_columns
+
     wanted = list(dict.fromkeys(names))
     if not wanted:
-        return set()
+        return {}
     async with SessionLocal() as session:
-        rows = await session.execute(
-            select(DataSource.name).where(DataSource.name.in_(wanted), DataSource.enabled.is_(True)))
-    return {str(name) for name in rows.scalars()}
+        rows = await session.execute(select(DataSource.name, DataSource.options)
+                                     .where(DataSource.name.in_(wanted), DataSource.enabled.is_(True)))
+    return {str(name): masked_columns(options) for name, options in rows.all()}
 
 
 def _quoted(names: Iterable[str]) -> str:
@@ -432,16 +444,16 @@ def _quoted(names: Iterable[str]) -> str:
 
 
 def _task(op: _Opening, ask: Ask, target: _Target | None, excerpts: list[str], refs: dict[str, dict[str, Any]],
-          live: list[str], lost: list[str]) -> str:
+          live: dict[str, list[str]], lost: list[str]) -> str:
     if target is not None:
         cand = target.cand
         where = f"中的这句话{f'（所在小节「{cand.section}」）' if cand.section else ''}：\n「{cand.text}」"
         if target.table:
             where += f"\n\n这句话在一张表格里，表格是（每行一条，单元格用 | 隔开）：\n{target.table}"
     else:
-        where = "，审批人没有指明是哪一句"
+        where = "，提问人没有指明是哪一句"
     if ask.quote:
-        where += f"\n\n审批人选中的原文：\n「{ask.quote}」"
+        where += f"\n\n提问人选中的原文：\n「{ask.quote}」"
     if target is None:
         markdown = str(op.doc.get("markdown") or "")
         cut = markdown[:REPORT_CHARS] + ("\n…（后面的省略了）" if len(markdown) > REPORT_CHARS else "")
@@ -457,8 +469,10 @@ def _task(op: _Opening, ask: Ask, target: _Target | None, excerpts: list[str], r
     sources = "、".join(live) if live else "（没有可以查询的数据源，只能依据上面的报告内容作答）"
     if lost:
         sources += f"（这次运行还用到了{_quoted(lost)}，已不存在或已停用，无法查询）"
+    hidden = [f"「{name}」的 {'、'.join(cols)}" for name, cols in live.items() if cols]
+    masked = f"设了遮罩的列（回答里不要写出这些列的值）：{'；'.join(hidden)}\n\n" if hidden else ""
     return INQUIRY_TASK_PROMPT.format(report=op.title, where=where, evidence=evidence, refs=refs_text,
-                                      sources=sources, question=ask.question)
+                                      sources=sources, masked=masked, question=ask.question)
 
 
 # --------------------------------------------------------------------------
@@ -598,7 +612,8 @@ def _limit(outcome: VerifyOutcome) -> str | None:
 
 
 async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict[str, Any]) -> dict[str, Any]:
-    """问 agent，组装回答文档，交回事件数据里回答的那几项。永远不抛：模型用不了、触顶都落在 ok / limit / error 里。"""
+    """问 agent，组装回答文档，交回事件数据里回答的那几项。模型用不了、触顶、组装出错都落在 ok / limit / error 里：
+    钱已经花了，回答没成也照样记一条。"""
     from app.api.evidence import _Masks
     from app.api.settings import verify_model_spec
 
@@ -609,12 +624,12 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
     refs = _report_refs(catalog)
     wanted = _run_sources(op.events)
     usable = await _usable_sources(wanted)
-    live, lost = [s for s in wanted if s in usable], [s for s in wanted if s not in usable]
+    live, lost = {s: usable[s] for s in wanted if s in usable}, [s for s in wanted if s not in usable]
     part = settings.get("inquiry") if isinstance(settings.get("inquiry"), dict) else {}
     async with SessionLocal() as session:
         spec = await verify_model_spec(session, None, settings=settings)
     outcome = await run_verify_agent(
-        spec=spec, system=INQUIRY_SYSTEM, task=_task(op, ask, target, excerpts, refs, live, lost), sources=live,
+        spec=spec, system=INQUIRY_SYSTEM, task=_task(op, ask, target, excerpts, refs, live, lost), sources=list(live),
         output_schema=INQUIRY_SCHEMA, max_queries=part.get("max_queries"), timeout_s=part.get("timeout_s"),
         daily_max_usd=settings.get("daily_max_usd"), run_id=op.run_id, data_versions=op.versions)
 
@@ -634,21 +649,26 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
                 secrets.add(snapshot, (await _hidden_columns(snapshot, masks))[0])
     scrub = secrets.scrubber()
 
-    text, doc_id = "", None
+    text, doc_id, failed = "", None, None
     source = (outcome.rationale or {}).get("source") if outcome.result is not None else None
     if isinstance(source, str) and source.strip():
-        answer = _compose(source, {**refs, **((outcome.rationale or {}).get("catalog") or {})}, op.run_id, hidden,
-                          scrub)
-        if lost:
-            answer = with_note(answer, f"注：这次运行还用到了数据源{_quoted(lost)}，已不存在或已停用，未能查询，"
-                                       "以上回答不含其中的数据。")
-        text = str(answer.get("markdown") or "")
-        doc_id = await _store(answer, op, ask)
+        try:
+            answer = _compose(source, {**refs, **((outcome.rationale or {}).get("catalog") or {})}, op.run_id,
+                              hidden, scrub)
+        except Exception as e:  # noqa: BLE001 - 原文没组装成文档就不交出去：里面的引用没换成值，遮罩也没做
+            logger.warning("质询的回答组装失败（运行 %s）", op.run_id, exc_info=True)
+            failed = f"整理回答时出错（{describe_exception(e)}）"
+        else:
+            if lost:
+                answer = with_note(answer, f"注：这次运行还用到了数据源{_quoted(lost)}，已不存在或已停用，未能查询，"
+                                           "以上回答不含其中的数据。")
+            text = str(answer.get("markdown") or "")
+            doc_id = await _store(answer, op, ask)
     ok = bool(text.strip())
     queries = [{**{k: q.get(k) for k in QUERY_KEYS}, "sql": scrub(str(q.get("sql") or ""))} for q in outcome.queries]
     return {
         "answer_text": text, "answer_doc": doc_id, "ok": ok, "limit": _limit(outcome),
-        "error": None if ok else (outcome.error or NO_ANSWER),
+        "error": None if ok else (outcome.error or failed or NO_ANSWER),
         "inquiry_artifacts": [q["artifact"] for q in queries if q.get("artifact")], "queries": queries,
         "model": outcome.model, "usage": {k: outcome.usage.get(k, 0) for k in USAGE_KEYS},
     }
