@@ -23,8 +23,10 @@
     结果时，再按别名一路追到喂它的每一份上游快照。只差字面量时还要看图里的 SQL：图里的 SQL 改过（改了写死的筛选值、
     系数）是模板变化，图里一字未改的才是运行时代入的参数
   - Agent 按出处交来的字段还要引用同一列、同一段行（两边都引用整份结果的不算换了；行段相同、一边是整份结果一边
-    不是的算换了；行号相同、都不是整份结果的，一边引用了的维度值在另一边的快照里、却没被引用的也算换了——取前几名
-    时名次变了、按区域排序时多了一个区域）：取哪一列、哪几行是 Agent 每次运行时定的，换了就不是同一个数
+    不是的算换了；行号相同、都不是整份结果的，按维度值数两边各引用了几行，一边引用得少、那一边的快照里引用的行外面
+    还有它的行，也算换了——取前几名时名次变了、按区域排序时多了一个区域、区域 × 日期的结果里一个区域有一天被挤出
+    引用的行；单格引用的那一边快照读不出来、核对不了是不是同一个维度值的，和行段一样说不清）：取哪一列、哪几行是
+    Agent 每次运行时定的，换了就不是同一个数
   - 不落在快照上的：模型、人交出的值（Agent 没按出处交、模型调用、人工审批……）没有出处，值变了说不清是数据还是它
     本身的差异；代码、数据整形这类节点看它自己查过的库，不查库的看它的配置和画布上的全部上游；记不出写入者的看
     口径卡之前可能执行过的节点（口径卡自己、只在它下游的不算）。上游的查询结果两次一模一样、值却变了的同样说不清；
@@ -80,6 +82,8 @@ TOP_KEYS = 10
 MAX_DIFFERENCES = 5
 #: 表达式、取值写进说明时最多几个字
 _SHOWN_MAX = 60
+#: 说明里最多列几个行号：一个维度值挤出去几十行时，前几个就够人去快照里找
+_ROWS_SHOWN = 3
 #: 比较 SQL 时两边的叫法（diff_facets 的 labels）
 _LABELS = ("基准", "这次")
 #: 合并查询的 SQL 在 SQLite 里执行（engine/merge_query.py）
@@ -1071,8 +1075,8 @@ class _Compare:
     def _citation(self, agent: Any, b: Any, t: Any, qb: _Query, qt: _Query) -> _Change | None:
         """Agent 按出处交来的字段两次引用的是不是同一处：同一列（对象数组是同一组列）、同一行或同一段行。两边引用的都是
         整份结果的算同一处（这次多了几行也是）；行段相同、一边是整份结果一边不是的不算——没引用的那几行还在这次的快照
-        里，按维度配对会把它们算成「数据没了」。行号相同、都不是整份结果的，还要引用同一批维度值（_left_out）。不是
-        同一处、核对不了是不是同一处的，返回说明。"""
+        里，按维度配对会把它们算成「数据没了」。行号相同、都不是整份结果的，还要引用同一批维度值：一个维度值在一边
+        引用的行更少、那一边引用的行外面还有它的行的不算（_left_out）。不是同一处、核对不了是不是同一处的，返回说明。"""
         name = f"Agent「{self.title(agent)}」" if agent else "Agent"
         lb, lt = _locator(b), _locator(t)
         cb, ct = lb.get("column") or lb.get("columns"), lt.get("column") or lt.get("columns")
@@ -1103,13 +1107,21 @@ class _Compare:
                                   "这次引用了整份结果，取的不是同一组数")
 
     def _left_out(self, name: str, what: str, b: Any, t: Any, qb: _Query, qt: _Query, column: Any) -> _Change | None:
-        """行号相同、都不是整份结果的引用，引用的是不是同一批维度值（区域……）。一边引用了的，另一边没引用、却还在那边的
-        快照里，取的就不是同一组数：按区域排序的结果多了北区，西区挪出了引用的行段；按金额取前 3 名，北区挤了进来——
-        按维度配对会把还在的西区算成「数据没了」。另一边的快照里也没有的，是数据真的没了，照常比。维度按两边整份结果
-        认（和归因同一个规则，_dimensions）；分不出维度（没有不是数值的列、维度列设了遮罩）、快照读不出来、行的形状
-        不对的，只能按行号认，返回 None。"""
+        """行号相同、都不是整份结果的引用，引用的是不是同一批维度值（区域……）。按维度键分别数两边各引用了几行：某个键
+        在一边引用的行更少、那一边的快照里引用的行外面还有它的行，取的就不是同一组数——按区域排序的结果多了北区，西区
+        整个挪出了引用的行段；按金额取前 3 名，北区挤了进来；区域 × 日期的结果东区多了一天，南区的第二天被挤到引用的
+        行外面。按维度配对会把还在快照里的那几行算成「数据没了」，和真的少了一天分不出来。只看「引用的行里有没有这个
+        键」查不出最后一种：南区两边都被引用过，只是有一行挪了出去。那一边的快照里引用的行外面也没有的，是数据真的
+        少了，照常比。
+
+        维度按两边整份结果认（和归因同一个规则，_dimensions）：遮罩列不当维度，只用没遮的列认、说明里写的也只有没遮的
+        列的值和行号，遮住的值不进说明；分不出维度（没有不是数值的列、维度列都设了遮罩）、行的形状不对的，只能按行号
+        认，返回 None。快照读不出来的说不清：只有单格会走到这里（行段在 _citation 里先核对整份结果，读不出来的已经
+        说不清），那一行两次是不是同一个维度值核对不了，和行段一样不按行号当成同一处。"""
         if qb.snap is None or qt.snap is None:
-            return None
+            side = "基准运行" if qb.snap is None else "这次运行"
+            return _Change("unknown", f"{side}的查询快照无法读取，无法核对 {name}两次引用的{_rows_text(t)}"
+                                      "是不是同一个维度值")
         rb, rt = _records(qb.snap, None), _records(qt.snap, None)
         if rb is None or rt is None:
             return None
@@ -1117,24 +1129,35 @@ class _Compare:
         if not dims:
             return None
 
-        def split(records: list[tuple[int, dict[str, Any]]], inp: Any) -> tuple[dict[Any, int], dict[Any, int]]:
-            """{维度键: 第一次出现的行号}：引用的行里的，引用的行外面的。"""
+        def split(records: list[tuple[int, dict[str, Any]]], inp: Any) -> tuple[dict[Any, int], dict[Any, list[int]]]:
+            """{维度键: 引用的行里有几行}，{维度键: [引用的行外面的行号]}。一个键可能占几行（去掉日期这类每期都不同的
+            列以后），要数清几行，只记第一次出现的看不出「有一部分挪了出去」。"""
             first, last = _cited(inp, len(records))
             inside: dict[Any, int] = {}
-            outside: dict[Any, int] = {}
+            outside: dict[Any, list[int]] = {}
             for i, row in records:
-                (inside if first <= i <= last else outside).setdefault(tuple(_hashable(row.get(d)) for d in dims), i)
+                key = tuple(_hashable(row.get(d)) for d in dims)
+                if first <= i <= last:
+                    inside[key] = inside.get(key, 0) + 1
+                else:
+                    outside.setdefault(key, []).append(i)
             return inside, outside
 
         (in_b, out_b), (in_t, out_t) = split(rb, b), split(rt, t)
-        for key in in_b:
-            if key not in in_t and key in out_t:
-                return _Change("unknown", f"{name}两次都引用{_rows_text(t)}，{_key_text(key)}这次仍在查询结果第 "
-                                          f"{out_t[key] + 1} 行，不在引用的行里，取的不是{what}")
-        for key in in_t:
-            if key not in in_b and key in out_b:
-                return _Change("unknown", f"{name}两次都引用{_rows_text(b)}，{_key_text(key)}在基准运行中位于查询结果第 "
-                                          f"{out_b[key] + 1} 行，不在引用的行里，取的不是{what}")
+        for key, count in in_b.items():
+            if in_t.get(key, 0) < count and key in out_t:
+                rows = out_t[key]
+                where = (f"这次有 {len(rows)} 行在查询结果{_row_numbers(rows)}" if key in in_t
+                         else f"这次仍在查询结果{_row_numbers(rows)}")
+                return _Change("unknown", f"{name}两次都引用{_rows_text(t)}，{_key_text(key)}{where}，不在引用的行里，"
+                                          f"取的不是{what}")
+        for key, count in in_t.items():
+            if in_b.get(key, 0) < count and key in out_b:
+                rows = out_b[key]
+                where = (f"在基准运行中有 {len(rows)} 行位于查询结果{_row_numbers(rows)}" if key in in_b
+                         else f"在基准运行中位于查询结果{_row_numbers(rows)}")
+                return _Change("unknown", f"{name}两次都引用{_rows_text(b)}，{_key_text(key)}{where}，不在引用的行里，"
+                                          f"取的不是{what}")
         return None
 
     def _hidden(self, b: Any, t: Any) -> frozenset[str]:
@@ -1650,6 +1673,12 @@ def _rows_text(inp: Any) -> str:
     if inp.rows is not None:
         return f"第 {inp.rows[0] + 1} 至 {inp.rows[1] + 1} 行"
     return "整份结果"
+
+
+def _row_numbers(rows: list[int]) -> str:
+    """快照里的几行（行号从 0 数）写进说明：「第 5 行」「第 5、6 行」，多的写「第 5、6、7 行等」。"""
+    shown = "、".join(str(i + 1) for i in rows[:_ROWS_SHOWN])
+    return f"第 {shown} 行" + ("等" if len(rows) > _ROWS_SHOWN else "")
 
 
 def _columns_text(columns: Any) -> str:
