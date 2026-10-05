@@ -2207,6 +2207,9 @@ _DIFF_R3 = [
      "WHERE r.id IS NOT NULL",
      "SELECT o.id, r.id FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"),
     ("r3-limit-negative-vs-zero", "SELECT id FROM orders ORDER BY id LIMIT -1", "SELECT id FROM orders ORDER BY id LIMIT 0"),
+    # NOT (a AND b) 不是 NOT a AND NOT b
+    ("r3-not-and-is-not-and-not", "SELECT COUNT(*) FROM orders WHERE NOT (status = 'void' AND amount > 10)",
+     "SELECT COUNT(*) FROM orders WHERE status <> 'void' AND amount <= 10"),
     # 按不唯一的列关联（users.referrer_id、refunds.order_id）：LEFT JOIN 会把左边的行复制，去不掉
     # 可空一侧的主键、不选主键的 DISTINCT：主键在这里帮不上忙
     ("r3-count-primary-key-nullable-side", "SELECT o.user_id, COUNT(r.id) FROM orders o LEFT JOIN refunds r "
@@ -2304,6 +2307,12 @@ _SAME_R3 = [
      "SELECT id FROM orders ORDER BY id LIMIT -7 OFFSET 2"),
     ("r3-limit-arithmetic", "SELECT id FROM orders ORDER BY id LIMIT 1 + 2", "SELECT id FROM orders ORDER BY id LIMIT 3"),
     ("r3-having-true-aggregate", "SELECT COUNT(*) FROM orders HAVING 1 = 1", "SELECT COUNT(*) FROM orders"),
+    # 德摩根律（三值逻辑下照样成立）：NOT (a OR b) 就是 NOT a AND NOT b
+    ("r3-de-morgan-or", "SELECT COUNT(*) FROM orders WHERE NOT (status = 'void' OR amount < 0)",
+     "SELECT COUNT(*) FROM orders WHERE status <> 'void' AND amount >= 0"),
+    ("r3-de-morgan-and-in-on", "SELECT o.id, r.amount FROM orders o LEFT JOIN refunds r "
+     "ON NOT (NOT (r.order_id = o.id) OR NOT (r.state = 'done'))",
+     "SELECT o.id, r.amount FROM orders o LEFT JOIN refunds r ON r.order_id = o.id AND r.state = 'done'"),
 ]
 
 #: 意思一样、要给表结构才认得出的（双引号里的名字是不是外层表的列、关联条件定成相等的两列声明的类型一样不一样，都要

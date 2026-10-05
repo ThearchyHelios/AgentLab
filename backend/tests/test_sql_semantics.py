@@ -1203,10 +1203,11 @@ def test_excluding_by_not_equal_also_mentions_the_null_rows(dialect):
                             "SELECT COUNT(*) FROM orders", dialect)
     check_shape(diff)
     assert [d.text for d in diff.items] == ["A 排除了 status IN ('open', 'void') 的行和 status 为空的行，B 没有"]
+    # NOT 往里推成 status <> 'void' OR is_deleted <> 1（三值逻辑下一样），照原样说「只保留 … 的行」
     diff = explain_sql_diff("SELECT COUNT(*) FROM orders WHERE NOT (status = 'void' AND is_deleted = 1)",
                             "SELECT COUNT(*) FROM orders", dialect)
     check_shape(diff)
-    assert len(diff.items) == 1 and diff.items[0].text.startswith("A 只保留 NOT ") and "B 没有这个条件" in diff.items[0].text
+    assert [d.text for d in diff.items] == ["A 只保留 status <> 'void' OR is_deleted <> 1 的行，B 没有这个条件"]
 
 
 @pytest.mark.parametrize("pid", ["hard:r3-disjoint-union-all-vs-union", "hard:r3-order-single-group",

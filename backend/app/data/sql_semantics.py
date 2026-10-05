@@ -38,12 +38,13 @@ _canonical_forms），哪一级对上都算：
 ON 里的 TRUE、1 = 1、分组后的 COUNT(*) >= 1 去掉（没有 GROUP BY、别处也没有聚合的 HAVING TRUE 留着：PostgreSQL
 里它让语句只出一行）；同一组 AND 里另一项已经保证不为空、或者表结构里确定不为空（NOT NULL、主键）的 x IS NOT NULL
 去掉；给了表结构、两列声明的类型一样又「相等就是一样」时，WHERE 里两列相等的，SELECT / GROUP BY / HAVING / ORDER BY
-里都换成同一列（_substitute_equal_columns）；EXISTS 子查询写成 SELECT 1（去重、分组、排序、取前 n 行、UNION 还是
+里都换成同一列（_substitute_equal_columns）；给了表结构时一定不为空的列上的 COUNT(x) 写成 COUNT(*)、选出来的列包含
+唯一的表的主键时 DISTINCT 去掉（_constraint_rewrites）；按唯一键关联、又没用到的 LEFT JOIN 去掉；EXISTS 子查询写成 SELECT 1（去重、分组、排序、取前 n 行、UNION 还是
 UNION ALL 都不影响）；IN 子查询里不影响取值集合的 DISTINCT、GROUP BY、ORDER BY 去掉、UNION 写成 UNION ALL（只在
 那一列「相等就是一样」时）；SELECT DISTINCT 写成按选出来的列 GROUP BY、已经按选出来的列分组的 DISTINCT 去掉；
 COUNT(1) 写成 COUNT(*)、MIN / MAX 里的 DISTINCT 去掉；SQLite 的 IIF、MySQL 的 IF 写成 CASE，CASE 的 ELSE NULL 去掉；
 IN 列表去重排序、只有一个常量的写成 =；BETWEEN 写成两个比较（SYMMETRIC、MySQL 里上下界类型不同或不是常量的不改）；
-NOT 套比较写成反过来的比较（ANY / ALL 不动）、NOT NOT 条件去掉；LIMIT / OFFSET 的整数算式算成一个数（SQLite、
+NOT 往里推：套比较写成反过来的比较（ANY / ALL 不动）、NOT NOT 条件去掉、德摩根律（三值逻辑下照样成立）；LIMIT / OFFSET 的整数算式算成一个数（SQLite、
 PostgreSQL），SQLite 的负数 LIMIT、PostgreSQL 的 LIMIT NULL 写成不限行数；ORDER BY 的 ASC、OFFSET 0、和前面一模一样
 的排序键、分组键去掉；最外层 ORDER BY 引用的别名换成表达式，最外层和条件里的子查询选出来的列名去掉；最后起规范的
 名字、交换律成立的地方排好序。
@@ -64,12 +65,14 @@ a = +b）；改列别名、把 EXISTS 写成 SELECT 1、去掉列名之前，本
 （见 _alias_refs）；USING 的列和某个列别名同名的（ORDER BY 里单独一个名字先认列别名）。
 
 **结果看行出来的先后的一段（见 _Sensitivity）不调换来源的先后、不排 GROUP BY 的键、不改 DISTINCT、不并子查询、不把
-引用了好几次的 CTE 拆开，也不按 WHERE 把外连接改成内连接、不去掉条件、不换列**：取行（LIMIT / OFFSET / FETCH，有
+引用了好几次的 CTE 拆开，也不按 WHERE 把外连接改成内连接、不去掉条件（连一模一样写了两遍的也不去）、不去重排序键和
+分组键、不换列、不把 COUNT(x) 换成 COUNT(*)、不把 BETWEEN 拆成两个比较、不去掉 MIN / MAX 里的 DISTINCT**：取行（LIMIT / OFFSET / FETCH，有
 并列时取哪几行也看先后）、DISTINCT ON、窗口函数、拼串拼数组的聚合（GROUP_CONCAT）、聚合里既不分组也不聚合的列、
 当成标量用的子查询，去重、分组、MIN / MAX、去重的 UNION 留下的值「相等却不一样」的时候（MySQL 默认不分大小写的
 字符串、PostgreSQL numeric 的 2.0 和 2.00、算出来的表达式），以及 PostgreSQL、MySQL 里对不知道是不是精确数的值求和；
-给这样一段供行的子查询、CTE 也算。第 3 轮压测在真实的 SQLite 上看到：WHERE 让 LEFT JOIN 降成内连接之后，扫描的先后
-和直接写内连接的不一样（EXPLAIN QUERY PLAN 一个先扫 refunds、一个先扫 orders），GROUP_CONCAT 拼出来的先后就不同。
+给这样一段供行的子查询、CTE 也算。第 3 轮压测在真实的库上看到：SQLite 里 WHERE 让 LEFT JOIN 降成内连接之后，扫描
+的先后和直接写内连接的不一样（EXPLAIN QUERY PLAN 一个先扫 refunds、一个先扫 orders）；MySQL 里同一个条件写两遍，按
+条件估算的行数变了、换了关联的先后——GROUP_CONCAT 拼出来的先后都跟着变。
 
 **假设（做不到的）**：SQLite 没给表结构时按列有声明的类型、默认的 BINARY 排序规则算——声明了 COLLATE NOCASE 的列、
 没有类型亲和的列（能同时存 1 和 1.0）表结构里看不出来；比较两边都是列时对调两边（SQLite 比较两列用左边那列声明的
@@ -2831,6 +2834,7 @@ def _finish(tree: Any, read: str | None, info: _Schema, *, level: str, qualified
     sens = _Sensitivity(tree, read, info)
     _right_to_left(tree, sens)
     sens = _Sensitivity(tree, read, info)
+    _fold_not(tree, sens)
     _reject_nulls(tree, read, sens)
     _null_blind_left_joins(tree, read, sens)
     _flatten_prefix(tree, sens, read)
@@ -2845,11 +2849,11 @@ def _finish(tree: Any, read: str | None, info: _Schema, *, level: str, qualified
     _membership_subqueries(tree, sens)
     _distinct_to_group(tree, sens)
     _count_star(tree)
-    _minmax_distinct(tree)
+    _minmax_distinct(tree, sens)
     _case_forms(tree, read)
     _in_lists(tree)
-    _expand_between(tree, read)
-    _fold_not(tree)
+    _expand_between(tree, read, sens)
+    _fold_not(tree, sens)
     _normalize_limits(tree, read)
     _strip_parens(tree)
     _strip_asc(tree)
@@ -4764,11 +4768,15 @@ def _count_star(tree: Any) -> None:
             c.set("this", exp.Star())
 
 
-def _minmax_distinct(tree: Any) -> None:
-    """MIN(DISTINCT x)、MAX(DISTINCT x) 就是 MIN(x)、MAX(x)：去不去重最小最大的都是那个值。"""
+def _minmax_distinct(tree: Any, sens: "_Sensitivity | None" = None) -> None:
+    """MIN(DISTINCT x)、MAX(DISTINCT x) 就是 MIN(x)、MAX(x)：去不去重最小最大的都是那个值。结果看行出来先后的一段不改
+    （带 DISTINCT 的聚合可能换一种执行方式）。"""
     from sqlglot import exp
 
     for node in list(tree.find_all(exp.Min, exp.Max)):
+        owner = node.find_ancestor(exp.Select)
+        if sens is not None and owner is not None and sens.of(owner):
+            continue
         arg = node.this
         if not node.expressions and isinstance(arg, exp.Distinct) and len(arg.expressions) == 1 and \
                 not arg.args.get("on"):
@@ -4885,7 +4893,7 @@ def _in_lists(tree: Any) -> None:
             node.set("expressions", ordered)
 
 
-def _expand_between(tree: Any, read: str | None) -> None:
+def _expand_between(tree: Any, read: str | None, sens: "_Sensitivity | None" = None) -> None:
     """x BETWEEN a AND b 就是 x >= a AND x <= b（SQLite 文档原话，PostgreSQL、MySQL 也是）。x 里有子查询、不确定的
     函数的不改（BETWEEN 只算一次 x）。"""
     from sqlglot import exp
@@ -4893,6 +4901,11 @@ def _expand_between(tree: Any, read: str | None) -> None:
     for node in list(tree.find_all(exp.Between)):
         x = node.this
         if node.args.get("symmetric") or x is None or x.find(exp.Query, exp.Subquery) is not None or _volatile(x):
+            continue
+        owner = node.find_ancestor(exp.Select)
+        if sens is not None and owner is not None and sens.of(owner):
+            # 结果看行出来先后的一段不改：一个 BETWEEN 和两个比较估算出的行数可能不同（MySQL 的 condition filtering），
+            # 换一种扫描的先后，GROUP_CONCAT 拼出来的先后就跟着变
             continue
         if read == "mysql":
             # MySQL 的 BETWEEN 按三个参数一起定比较的类型，两个比较各定各的：上下界一个数字一个字符串（name BETWEEN 2
@@ -4920,10 +4933,16 @@ def _predicate(node: Any) -> bool:
     return False
 
 
-def _fold_not(tree: Any) -> None:
-    """NOT 套比较写成反过来的比较（NOT a = b 就是 a <> b，NOT a > b 就是 a <= b：两边有空值时都是空值）；NOT NOT p 写成 p
-    （p 是条件时；NOT NOT 5 是 1，不是 5）。"""
+def _fold_not(tree: Any, sens: "_Sensitivity | None" = None) -> None:
+    """NOT 往里推（三值逻辑下都成立，两边有空值时结果一样）：NOT 套比较写成反过来的比较（NOT a = b 就是 a <> b，NOT a > b
+    就是 a <= b）；NOT NOT p 写成 p（p 是条件时；NOT NOT 5 是 1，不是 5）；NOT (p AND q) 写成 NOT p OR NOT q、NOT (p OR q)
+    写成 NOT p AND NOT q（德摩根律，p、q 是条件时；空值 AND / OR 的真值表左右对称，三值逻辑下照样成立）。ANY / ALL 不动；
+    结果看行出来先后的一段只做前两样（换了条件的形状可能换一种扫描的先后）。"""
     from sqlglot import exp
+
+    def sensitive(node: Any) -> bool:
+        owner = node.find_ancestor(exp.Select)
+        return sens is not None and owner is not None and sens.of(owner)
 
     changed = True
     while changed:
@@ -4938,6 +4957,14 @@ def _fold_not(tree: Any) -> None:
                 changed = True
             elif isinstance(inner, exp.Not) and _predicate(inner.this):
                 node.replace(inner.this)
+                changed = True
+            elif isinstance(inner, (exp.And, exp.Or)) and _predicate(inner.left) and _predicate(inner.right) and \
+                    not sensitive(node):
+                left = exp.Not(this=exp.Paren(this=inner.left.copy()))
+                right = exp.Not(this=exp.Paren(this=inner.right.copy()))
+                flipped = exp.Or(this=left, expression=right) if isinstance(inner, exp.And) else \
+                    exp.And(this=left, expression=right)
+                node.replace(exp.Paren(this=flipped))
                 changed = True
             if changed:
                 break
