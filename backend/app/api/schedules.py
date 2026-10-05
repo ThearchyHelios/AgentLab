@@ -282,7 +282,7 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
     compare 是运行结束后和同一任务上一次的自动对比 {base_run_id, summary}（summary 同对比接口的计数），没有为 null。
 
     运行又被继续执行、现在不在终态时 compare 也给 null：对比页只认结束并封存的运行，链过去只会被拒；再结束时
-    通知扫描会按新的封存重新比。工件读不出来、被改过的同样给 null。"""
+    通知扫描会按新的封存重新比。基准那一次被删掉、被继续执行的，工件读不出来、被改过的，同样给 null。"""
     run_ids = [f.run_id for f in fires if f.run_id]
     statuses = dict((await session.execute(select(Run.id, Run.status).where(Run.id.in_(run_ids)))).all()) \
         if run_ids else {}
@@ -299,6 +299,12 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
     compared = {f.id: f.compare_artifact for f in fires
                 if f.compare_artifact and statuses.get(f.run_id) in auto_compare.TERMINAL}
     compares = await auto_compare.briefs(list(compared.values()))
+    # 基准一侧同样要在终态：被删掉（强制删除封存的正式运行）、失败后被继续执行的，对比页比不了
+    base_ids = list({brief["base_run_id"] for brief in compares.values()})
+    if base_ids:
+        bases = dict((await session.execute(select(Run.id, Run.status).where(Run.id.in_(base_ids)))).all())
+        compares = {artifact: brief for artifact, brief in compares.items()
+                    if bases.get(brief["base_run_id"]) in auto_compare.TERMINAL}
     return [{
         "id": f.id,
         "fire_at": _iso(f.fire_at),

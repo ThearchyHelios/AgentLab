@@ -25,6 +25,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
 
+from app.core import artifact_store
 from app.core.artifact_store import canonical_json, load, manifest_hash, put_json
 from app.core.crypto import encrypt
 from app.db.base import SessionLocal
@@ -340,16 +341,56 @@ async def test_compare_is_hidden_once_the_run_is_running_again(client):
     assert item["compare"] == {"base_run_id": base_id, "summary": SUMMARY}
 
 
-async def test_a_missing_artifact_reads_as_no_compare(client):
-    """工件文件不在了、被改过：接口给 null，不报错"""
+async def test_compare_is_hidden_once_the_base_run_is_gone_or_running(client):
+    """基准那一次被删掉、或者被继续执行（不在终态）：对比页比不了，链过去只会报错，接口同样给 null"""
+    sid, base_id, _, fire_id = await weekly_pair(url=None)
+    await webhook.notify_due()
+    assert (await fire_row(fire_id)).compare_artifact
+
+    async def shown():
+        items = (await client.get(f"/api/schedules/{sid}/fires")).json()["items"]
+        return {f["id"]: f for f in items}[fire_id]["compare"]
+
+    assert (await shown())["base_run_id"] == base_id
+    await set_run(base_id, status="running")
+    assert await shown() is None
+    await set_run(base_id, status="succeeded")
+    assert (await shown())["base_run_id"] == base_id
+    # 封存过的正式运行要强制删除
+    assert (await client.delete(f"/api/runs/{base_id}", params={"force": "true"})).status_code == 204
+    assert await shown() is None
+
+
+def unreadable(artifact_id):
+    raise PermissionError(13, "Permission denied")
+
+
+@pytest.mark.parametrize("damage", ["missing", "tampered", "unreadable"])
+async def test_a_damaged_artifact_reads_as_no_compare(client, monkeypatch, caplog, damage):
+    """工件文件不在了、被改过、读不出来（权限、磁盘出错）：接口给 null，触发历史照常打开，不回 500"""
     sid, _, _, fire_id = await weekly_pair(url=None)
-    async with SessionLocal() as session:
-        await session.execute(ScheduleFire.__table__.update().where(ScheduleFire.id == fire_id)
-                              .values(compare_artifact="0" * 64))
-        await session.commit()
-    resp = await client.get(f"/api/schedules/{sid}/fires")
+    await webhook.notify_due()
+    artifact = (await fire_row(fire_id)).compare_artifact
+    # 刚比完的摘要记在进程里，清掉才会去读盘
+    auto_compare._BRIEFS.clear()
+    if damage == "missing":
+        async with SessionLocal() as session:
+            await session.execute(ScheduleFire.__table__.update().where(ScheduleFire.id == fire_id)
+                                  .values(compare_artifact="0" * 64))
+            await session.commit()
+    elif damage == "tampered":
+        path = artifact_store._path_of(artifact)
+        text = path.read_text(encoding="utf-8")
+        assert '"data_only":2' in text
+        path.write_text(text.replace('"data_only":2', '"data_only":7'), encoding="utf-8")
+    else:
+        monkeypatch.setattr(artifact_store, "load", unreadable)
+    with caplog.at_level(logging.WARNING, logger="app.scheduler"):
+        resp = await client.get(f"/api/schedules/{sid}/fires")
     assert resp.status_code == 200
     assert {f["id"]: f for f in resp.json()["items"]}[fire_id]["compare"] is None
+    if damage != "missing":
+        assert artifact[:12] in caplog.text
 
 
 # --------------------------------------------------------------------------

@@ -145,7 +145,8 @@ def _remember(artifact: str, brief: dict[str, Any]) -> None:
 
 
 def brief_of(artifact: str) -> dict[str, Any] | None:
-    """读一份对比工件的摘要。文件不在、内容和哈希对不上（另记一条警告）、形状不对的返回 None，不抛异常。"""
+    """读一份对比工件的摘要。文件不在、内容和哈希对不上、读不出来（后两种另记一条警告）、形状不对的返回 None，
+    不抛异常：一份对比读不出来不能让整页触发历史打不开。"""
     with _BRIEFS_LOCK:
         known = _BRIEFS.get(artifact)
     if known is not None:
@@ -154,6 +155,9 @@ def brief_of(artifact: str) -> dict[str, Any] | None:
         brief = _brief(artifact_store.load(artifact))
     except ValueError:
         logger.warning("对比工件 %s… 内容与哈希不符，触发历史中不显示这次对比", artifact[:12])
+        return None
+    except OSError as e:   # 权限、磁盘出错
+        logger.warning("对比工件 %s… 读取失败（%s），触发历史中不显示这次对比", artifact[:12], type(e).__name__)
         return None
     if brief is None:
         return None

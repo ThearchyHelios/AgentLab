@@ -671,6 +671,40 @@ const inViewX = (page, sel) => page.evaluate((s) => {
   const b = el.getBoundingClientRect()
   return b.left >= 0 && b.right <= innerWidth + 0.5
 }, sel)
+/**
+ * 元素的字和它实际落在上面的底色的对比度（WCAG 算法），{ratio, fg, bg}，找不到元素为 null。底色顺着祖先往上找，
+ * 半透明的一层层叠上去，直到不透明的那层（都透明就按白底）。只比「字色和某个容器的底色不相等」不够：页头本身是
+ * 透明的，那样比永远成立
+ */
+const readable = (page, sel) => page.evaluate((s) => {
+  const el = document.querySelector(s)
+  if (!el) return null
+  const parse = (c) => {
+    const m = c.match(/color\(srgb ([\d.]+) ([\d.]+) ([\d.]+)(?: \/ ([\d.]+))?\)/)
+    if (m) return [m[1] * 255, m[2] * 255, m[3] * 255, m[4] == null ? 1 : Number(m[4])]
+    const n = c.match(/rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?\)/)
+    return n ? [Number(n[1]), Number(n[2]), Number(n[3]), n[4] == null ? 1 : Number(n[4])] : null
+  }
+  const over = (top, under) => top.slice(0, 3).map((v, i) => v * top[3] + under[i] * (1 - top[3]))
+  const layers = []
+  for (let n = el; n; n = n.parentElement) {
+    const c = parse(getComputedStyle(n).backgroundColor)
+    if (c && c[3] > 0) layers.push(c)
+    if (c && c[3] >= 1) break
+  }
+  let bg = [255, 255, 255]
+  for (const layer of layers.reverse()) bg = over(layer, bg)
+  const color = parse(getComputedStyle(el).color)
+  if (!color) return null
+  const fg = over(color, bg)
+  const lum = (rgb) => {
+    const [r, g, b] = rgb.map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4 })
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+  }
+  const [hi, lo] = [lum(fg), lum(bg)].sort((a, b) => b - a)
+  return { ratio: Math.round(((hi + 0.05) / (lo + 0.05)) * 100) / 100, fg: getComputedStyle(el).color,
+    bg: `rgb(${bg.map(Math.round).join(', ')})` }
+}, sel)
 
 // ---------------------------------------------------------------- 列表
 
@@ -1432,6 +1466,8 @@ await section('运行详情：页头的定时任务链接', async () => {
   check('键盘：Tab 到得了页头的定时任务链接', presses > 0, `按了 ${presses} 次`)
   const ring = await page.evaluate(() => getComputedStyle(document.activeElement).boxShadow)
   check('……聚焦时有焦点环', !!ring && ring !== 'none', ring)
+  const darkTone = await readable(page, '[data-run-detail] header [data-run-schedule-link]')
+  check('深色：页头的定时任务链接对比度 ≥ 4.5', !!darkTone && darkTone.ratio >= 4.5, JSON.stringify(darkTone))
   await shot(page, 'run-detail-schedule-link-dark')
   await page.keyboard.press('Enter')
   check('……回车去那个定时任务', await until(() => new URL(page.url()).pathname === '/schedules/s-weekly'), page.url())
@@ -1450,13 +1486,10 @@ await section('运行详情：页头的定时任务链接', async () => {
   await shot(manual.page, 'run-detail-manual-fire-dark')
   const light = await open('/runs/run-sched-1', { state: freshState({ runs: [...RUNS, RUN_MANUAL_FIRE] }), theme: 'light' })
   await light.page.locator('[data-run-detail="run-sched-1"] header [data-run-schedule-link]').waitFor()
-  const lightTone = await light.page.evaluate(() => {
-    const link = document.querySelector('[data-run-detail] header [data-run-schedule-link]')
-    const head = document.querySelector('[data-run-detail] header')
-    return { theme: document.documentElement.dataset.theme, fg: getComputedStyle(link).color,
-      bg: getComputedStyle(head).backgroundColor }
-  })
-  check('浅色：页头的定时任务链接字和底色分得开', lightTone.theme === 'light' && lightTone.fg !== lightTone.bg, JSON.stringify(lightTone))
+  const lightTheme = await light.page.evaluate(() => document.documentElement.dataset.theme)
+  const lightTone = await readable(light.page, '[data-run-detail] header [data-run-schedule-link]')
+  check('浅色：页头的定时任务链接对比度 ≥ 4.5', lightTheme === 'light' && !!lightTone && lightTone.ratio >= 4.5,
+    `${lightTheme} ${JSON.stringify(lightTone)}`)
   await shot(light.page, 'run-detail-schedule-link-light')
   const plain = await open('/runs/run-manual-1', { state: freshState({ runs: [...RUNS, RUN_MANUAL_FIRE] }) })
   await plain.page.locator('[data-run-detail="run-manual-1"]').waitFor({ timeout: 10000 })
@@ -1480,12 +1513,30 @@ await section('运行详情：页头的定时任务链接', async () => {
   })
   check('长名字：链接截断，不超出页头、页头不横向溢出', !!fit && fit.linkRight <= fit.headRight && fit.scroll <= 1 && fit.clipped,
     JSON.stringify(fit))
+  // 署名的立即运行（署名加链接，这一行最挤）配长名字：链接照样截断，署名不被挤掉
+  const crowdedState = freshState({ runs: [...RUNS, RUN_MANUAL_FIRE] })
+  crowdedState.schedules = longName.schedules
+  const crowded = await open('/runs/run-sched-2', { state: crowdedState, width: 900 })
+  await crowded.page.locator('[data-run-detail="run-sched-2"]').waitFor({ timeout: 10000 })
+  const cLink = crowded.page.locator('[data-run-detail] header [data-run-schedule-link]')
+  await until(async () => (await cLink.innerText().catch(() => '')).includes('复盘'))
+  const crowd = await crowded.page.evaluate(() => {
+    const head = document.querySelector('[data-run-detail] header')
+    const link = head?.querySelector('[data-run-schedule-link]')
+    if (!head || !link) return null
+    const l = link.getBoundingClientRect()
+    return { headRight: Math.round(head.getBoundingClientRect().right), linkRight: Math.round(l.right),
+      linkWidth: Math.round(l.width), scroll: head.scrollWidth - head.clientWidth,
+      starter: head.innerText.includes('检查员甲 发起') }
+  })
+  check('……署名的立即运行配长名字：署名照写，链接截断、看得到，页头不横向溢出', !!crowd && crowd.starter
+    && crowd.linkRight <= crowd.headRight && crowd.linkWidth >= 24 && crowd.scroll <= 1, JSON.stringify(crowd))
   // 回车打开的定时任务页会请求预览（POST，但只读），不算写
   const writesSeen = [...writes(sent, /./), ...writes(manual.sent, /./), ...writes(light.sent, /./), ...writes(plain.sent, /./),
-    ...writes(narrow.sent, /./)]
+    ...writes(narrow.sent, /./), ...writes(crowded.sent, /./)]
     .filter((x) => x.key !== 'POST /schedules/preview')
   check('只读：没有写请求', writesSeen.length === 0, writesSeen.map((x) => x.key).join('、'))
-  const all = [...errors, ...manual.errors, ...light.errors, ...plain.errors, ...narrow.errors]
+  const all = [...errors, ...manual.errors, ...light.errors, ...plain.errors, ...narrow.errors, ...crowded.errors]
   check('没有页面报错', !all.length, all.join(' ｜ '))
 })
 
@@ -1571,12 +1622,8 @@ await section('窄屏 390px 与浅色', async () => {
     await hist.page.locator('[data-fire-id]').first().waitFor()
     check(`${theme}：触发历史不横向溢出`, await overflow(hist.page) <= 1, `${await overflow(hist.page)}px`)
     check(`${theme}：「对比上一次」在屏幕里`, await inViewX(hist.page, '[data-fire-id="f00"] [data-fire-compare]'))
-    const cmp = await hist.page.evaluate(() => {
-      const link = document.querySelector('[data-fire-id="f00"] [data-fire-compare]')
-      const list = document.querySelector('[data-fire-list] ul')
-      return link && list && { fg: getComputedStyle(link).color, bg: getComputedStyle(list).backgroundColor }
-    })
-    check(`${theme}：「对比上一次」的字和底色分得开`, !!cmp && cmp.fg !== cmp.bg, JSON.stringify(cmp))
+    const cmp = await readable(hist.page, '[data-fire-id="f00"] [data-fire-compare]')
+    check(`${theme}：「对比上一次」对比度 ≥ 4.5`, !!cmp && cmp.ratio >= 4.5, JSON.stringify(cmp))
     check(`${theme}：页头的开关、立即运行、删除在屏幕里`, await inViewX(hist.page, 'header [data-schedule-run]')
       && await inViewX(hist.page, 'header [data-schedule-toggle]') && await inViewX(hist.page, 'header [data-schedule-delete]'))
     await shot(hist.page, `history-390-${theme}`)
