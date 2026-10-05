@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import {
   Bot, Braces, Brain, CheckCircle2, Code2, Combine, Database, FileInput, FileOutput, FileText,
   Gauge, GitBranch, GitCompareArrows, Hand, Repeat, Search, ShieldAlert, Shuffle, Users, Wrench,
@@ -6,6 +7,7 @@ import {
   APPROVAL_POLICY_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, UPGRADE_POLICY_LABEL,
 } from '../lib/terms'
 import type { NodeType } from '../types'
+import { dualCheckFields, dualCheckSummary } from './DualCheckFields'
 
 export type FieldType =
   | 'text' | 'textarea' | 'prompt' | 'code' | 'number' | 'select' | 'switch'
@@ -51,6 +53,23 @@ export interface FieldDef {
    */
   unknownLabel?: (value: string) => string
   advanced?: boolean
+  /**
+   * 现有字段类型画不了的配置（选画布上某一类节点、三态开关、接入加模型）交给它画。
+   * 给了 render 就不再按 type 渲染；type 仍用于默认值和校验
+   */
+  render?: (p: FieldRenderProps) => ReactNode
+}
+
+/** FieldDef.render 拿到的：当前值、写回、所在节点和配置，以及无障碍属性 */
+export interface FieldRenderProps {
+  id: string
+  nodeId: string
+  value: any
+  config: Record<string, any>
+  invalid: boolean
+  describedBy?: string
+  disabled?: boolean
+  onChange: (v: any) => void
 }
 
 /**
@@ -91,6 +110,19 @@ export interface NodeDef {
   sources: HandleDef[] | null
   fields: FieldDef[]
   defaults: Record<string, any>
+  /**
+   * 卡片正文那一行摘要要提到画布上别的节点时给它（双盲复算复算的是哪张口径卡、几个指标），没给的照旧走
+   * NodeCard 的 summarize。NodeCard 在 studio store 的选择器里调它、每条事件都会跑：要快、没有副作用、只返回字符串
+   */
+  summary?: (ctx: NodeSummaryContext) => string
+}
+
+/** NodeDef.summary 拿到的：这个节点的 id 和配置，以及画布上的全部节点和连线 */
+export interface NodeSummaryContext {
+  id: string
+  config: Record<string, any>
+  nodes: readonly { id: string; data: { nodeType: NodeType; label?: string; config?: Record<string, any> } }[]
+  edges: readonly { source: string; target: string }[]
 }
 
 const MODEL_FIELDS: FieldDef[] = [
@@ -658,14 +690,48 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       metrics: [{ id: 'total', name: '', unit: '', expression: '' }],
     },
   },
-  // 下面两种还是占位：服务端的执行器原样跳过（engine/nodes/dual_check.py、challenge.py），没有可配的字段。
-  // 说明里写明尚未生效，检查器顶上就是这一句；各自的工作包补上字段时把这句去掉
   dual_check: {
     type: 'dual_check', label: NODE_TYPE_LABEL.dual_check, category: '把关', icon: GitCompareArrows,
-    description: `${DUAL_CHECK_TEXT.description}。${DUAL_CHECK_TEXT.pending}`,
+    description: DUAL_CHECK_TEXT.description,
     hasTarget: true, sources: [{ id: 'out', label: '' }],
-    fields: [],
+    // 配置的键和缺省见 types.ts 的 DualCheckConfig（期 3 约定）。口径卡、指标、口径说明要看画布上别的节点，
+    // 盲算模型是接入加模型，启用是三态，都交给 DualCheckFields 画；type 只管默认值和校验时当什么看。
+    // 盲算模型不放进高级选项：时间线上「模型相同」那一行的「打开设置」要定位到它，高级选项收着时定位不到
+    fields: [
+      { key: 'card', label: DUAL_CHECK_TEXT.field.card, type: 'select', help: DUAL_CHECK_TEXT.help.card, render: dualCheckFields.card },
+      {
+        key: 'metrics', label: DUAL_CHECK_TEXT.field.metrics, type: 'json', help: DUAL_CHECK_TEXT.help.metrics,
+        render: dualCheckFields.metrics,
+      },
+      {
+        key: 'definitions', label: DUAL_CHECK_TEXT.field.definitions, type: 'json', help: DUAL_CHECK_TEXT.help.definitions,
+        render: dualCheckFields.definitions,
+      },
+      {
+        key: 'enabled', label: DUAL_CHECK_TEXT.field.enabled, type: 'select', help: DUAL_CHECK_TEXT.help.enabled,
+        render: dualCheckFields.enabled,
+      },
+      {
+        // 没写和写 degrade 是一回事：选项从 degrade 排起，没写时下拉框落在它上面，正好是缺省
+        key: 'on_reject', label: DUAL_CHECK_TEXT.field.on_reject, type: 'select', help: DUAL_CHECK_TEXT.help.on_reject,
+        options: [
+          { value: 'degrade', label: DUAL_CHECK_TEXT.onReject.degrade },
+          { value: 'fail', label: DUAL_CHECK_TEXT.onReject.fail },
+        ],
+        unknownLabel: DUAL_CHECK_TEXT.onRejectUnknown,
+      },
+      { key: 'provider', label: DUAL_CHECK_TEXT.field.provider, type: 'select', render: dualCheckFields.provider },
+      {
+        key: 'model', label: DUAL_CHECK_TEXT.field.model, type: 'text', help: DUAL_CHECK_TEXT.help.model,
+        render: dualCheckFields.model,
+      },
+      {
+        key: 'tolerance', label: DUAL_CHECK_TEXT.field.tolerance, type: 'number', min: 0, advanced: true,
+        help: DUAL_CHECK_TEXT.help.tolerance, render: dualCheckFields.tolerance,
+      },
+    ],
     defaults: {},
+    summary: dualCheckSummary,
   },
   challenge: {
     type: 'challenge', label: NODE_TYPE_LABEL.challenge, category: '把关', icon: ShieldAlert,

@@ -3334,10 +3334,268 @@ export const WHATIF_TEXT = {
   empty: '这个指标的计算式没有引用任何输入，无可推演',
 }
 
-/** 双盲复算节点：节点库说明、检查器和运行结果 */
+/**
+ * 双盲复算：节点库说明、检查器、节点卡片摘要、两边对不上时的审批卡，以及时间线上双盲复算和反方审稿的日志。
+ *
+ * 两边的叫法固定为「原流程」「盲算」（服务端 explain_sql_diff 的 labels 也是这两个词），审核人的三个选择固定为
+ * 「采用原流程的结果」「采用盲算的结果」「两边都不对」。选「采用盲算的结果」不会替换报告里的数，只记缺口，
+ * 卡上要说清；探索运行不出具，出具相关的话只对正式运行说
+ */
 export const DUAL_CHECK_TEXT = {
   description: '另起一路独立计算，与原结果逐项比对',
-  pending: `${PENDING_TEXT}：本节点暂未生效，运行时将跳过`,
+  original: '原流程',
+  blind: '盲算',
+
+  // ---- 检查器（nodeDefs 的 dual_check、canvas/DualCheckFields.tsx）
+  /**
+   * 字段名，键就是配置键。服务端校验和报错引用的是同一套叫法（schema.py 的 DUAL_CHECK_FIELD_LABEL，check-verify 在
+   * 服务端合入后逐项比对）：问题挂在字段下面、出现在问题面板里时，人才找得到是哪一项。模型两项照「裁判模型 · 接入」
+   * 「裁判模型」的写法
+   */
+  field: {
+    card: '口径卡',
+    metrics: '复算的指标',
+    definitions: '口径说明',
+    provider: '盲算模型 · 接入',
+    model: '盲算模型',
+    tolerance: '允许的相对误差',
+    on_reject: '未采用原流程时',
+    enabled: '启用双盲复算',
+  },
+  help: {
+    card: '留空则复算上游的口径卡。只能复算本节点上游的口径卡：运行到本节点时，它的结果已经算出',
+    metrics: '默认复算口径卡中输入来自查询结果的全部指标，取消勾选可以只复算其中一部分。输入不是来自查询的指标无法盲算',
+    definitions: '给盲算模型看的业务定义，例如「销售额按支付时间统计，不含退款」。盲算模型看不到原流程的 SQL，'
+      + '只能依据指标名称、这里的说明和数据目录编写查询，说明越具体，比对越有意义',
+    model: '接入和模型均未填写时，使用「设置 → 偏好设置 → 核查」中的核查模型；填写任一项后，整组以节点配置为准，'
+      + '不与设置合并。建议与原流程使用的模型不同，同一模型不易发现自身的错误',
+    tolerance: '两边的值相差不超过这个比例时算一致，例如 0.001 表示千分之一，0 表示必须完全相同。留空则使用设置中的值',
+    on_reject: '盲算与原流程不一致时运行暂停，由审核人逐个指标选择采用哪一边。选择「采用盲算的结果」或「两边都不对」时按这里处理',
+    enabled: '关闭时本节点不复算，直接放行，并在时间线上记录一条说明',
+  },
+  /**
+   * 口径卡下拉留空那一项：上游没有、只有一张、有好几张。好几张时服务端校验要求选一张（不选会挡住发起运行），
+   * 写成要选，不写「建议」
+   */
+  cardDefault: (name: string | null, upstream: number) => (upstream === 0 ? '默认：上游的口径卡（上游没有口径卡）'
+    : upstream === 1 && name ? `默认：上游的口径卡「${name}」` : `请选择要复算的口径卡（上游有 ${upstream} 张）`),
+  cardChoose: (n: number) => `上游有 ${n} 张口径卡，请选择要复算的那一张`,
+  cardUpstream: '上游的口径卡',
+  cardOther: '其他口径卡（需连接到本节点上游）',
+  /** 画布上一张口径卡的叫法：节点名，口径名不同时附在后面 */
+  cardOption: (label: string, caliber?: string | null) => (caliber && caliber !== label ? `${label}（${caliber}）` : label),
+  cardGone: (id: string) => `${id}（不在画布上）`,
+  cardNotUpstream: '所选口径卡不在本节点上游，运行到本节点时还没有它的结果。请把它连接到本节点之前',
+  cardMissing: (id: string) => `口径卡「${id}」不在画布上，请重新选择`,
+  metricsAll: '全部指标',
+  metricsDefault: '未指定：复算全部输入来自查询的指标',
+  metricsPicked: (n: number, total: number) => `已选 ${n} / ${total} 个指标`,
+  metricsNoCard: '先选择要复算的口径卡',
+  metricsNone: '这张口径卡还没有定义指标',
+  metricsPinned: '这张口径卡引用了其他工作流发布的口径，指标在运行时按引用的版本确定：将复算其中输入来自查询的全部指标',
+  metricsStale: (ids: string[]) => `已选的指标不在这张口径卡中：${ids.join('、')}`,
+  metricsClear: '清除不在卡中的指标',
+  metricsLast: '至少保留一个指标；要复算全部指标时全部勾选即可',
+  metricOption: (name: string | null | undefined, id: string) => (name && name !== id ? `${name}（${id}）` : id),
+  definitionPlaceholder: (name: string) => `「${name}」的口径说明`,
+  definitionsNone: '选择要复算的口径卡后，可以为每个指标写一段口径说明',
+  definitionsPinned: '这张口径卡引用了其他工作流发布的口径，指标在运行时才确定，无法在这里逐个填写口径说明',
+  definitionGone: (id: string) => `指标「${id}」已不在复算范围内，这段说明不会交给盲算模型`,
+  definitionRemove: '删除这段说明',
+  providerFollow: '跟随设置',
+  providerFromModel: '按模型名找接入',
+  providerGone: (name: string) => `${name}（不存在）`,
+  providerOff: '（已停用）',
+  modelFollow: '跟随设置',
+  modelOfProvider: '留空则使用该接入的默认模型',
+  /**
+   * 节点上只填了盲算模型、接入留空时实际用哪个接入（verify_model_spec：哪一级写了就整组用哪一级，不跨级拼；
+   * 再按模型名找接入）。found：按模型名找到的接入；fallback：认不出时去调的默认接入
+   */
+  byModel: (model: string, found: { name: string; enabled: boolean } | null | undefined, fallback: string | null | undefined) => {
+    if (found && !found.enabled) return `只填了模型：「${model}」属于已停用的接入「${found.name}」，盲算调用将失败。请启用该接入或选择其他接入`
+    if (found) return `只填了模型：将按模型名使用接入「${found.name}」。接入和模型都未填写时，才跟随设置中的核查模型`
+    return `只填了模型：所有接入的模型列表中都没有「${model}」，将使用默认接入${fallback ? `「${fallback}」` : ''}调用。`
+      + '如该模型不属于默认接入，请选择对应的接入'
+  },
+  tolerancePlaceholder: (v: number | null | undefined) => (v == null ? '跟随设置' : `跟随设置（${v}）`),
+  toleranceInvalid: '请填写不小于 0 的数',
+  /** 选项以服务端报错里的短说法（schema.py 的 DUAL_CHECK_ON_REJECT_LABEL）开头，后面可以带一句用途 */
+  onReject: { degrade: '计入缺口、出具降档（默认）', fail: '判为失败，运行终止' } as Record<string, string>,
+  onRejectUnknown: (v: string) => `${v}：无法识别的值，请从上方选项中选择`,
+  enabled: { follow: '跟随设置', on: '开启', off: '关闭' },
+  /** 「跟随设置」那一项附上设置里现在是开是关（设置还没取到就不附） */
+  enabledFollow: (on: boolean | null | undefined) => (on == null ? '跟随设置' : `跟随设置（当前${on ? '开启' : '关闭'}）`),
+
+  // ---- 节点卡片的摘要：复算哪张卡、几个指标
+  summary: {
+    card: (name: string, picked: number | null, total: number | null) => `复算「${name}」 · ${
+      picked != null ? `${picked} 个指标` : total != null ? `全部 ${total} 个指标` : '全部指标'}`,
+    noCard: '复算上游的口径卡 · 尚未连接口径卡',
+    many: (n: number) => `复算上游的口径卡 · 上游有 ${n} 张，请指定`,
+    off: '已关闭',
+  },
+
+  // ---- 审批卡（run/DualCheckApproval.tsx）
+  approval: {
+    intro: (n: number) => `盲算与原流程有 ${n} 个指标不一致，请逐个选择采用哪一边的结果`,
+    model: (model: string) => `盲算模型：${model}`,
+    sameModel: '盲算模型与原流程相同，复算缺乏独立性',
+    /** delta_pct 已经乘过 100、带正负号写好（「+12.5%」） */
+    delta: (text: string) => `相差 ${text}`,
+    deltaZero: '原流程值为 0，无法计算相差比例',
+    deltaHint: '相差比例 =（盲算值 − 原流程值）÷ |原流程值|',
+    diffHead: '差异说明',
+    /** 一条具体差异都没有时的固定说法（服务端兜底说明的前半句）；兜底的原话另有原因（比较超时、解析失败）时附在下面 */
+    fallbackOnly: '两条 SQL 的写法不同，未能归纳成具体差异',
+    equivalent: '两条 SQL 的写法等价，差异出在取用的结果上，请对照两边取用的值',
+    loading: '正在加载完整对照…',
+    loadFailed: '无法加载完整对照，以下仅为摘要',
+    compare: '对照两条 SQL',
+    compareClose: '收起对照',
+    sqlOriginal: '原流程的 SQL',
+    sqlBlind: '盲算的 SQL',
+    sqlMissing: '没有记录 SQL',
+    source: (s: string) => `数据源 ${s}`,
+    inputs: '输入取值',
+    textDiff: '规范化后不同的行',
+    textDiffNone: '这一边没有不同的行',
+    rationale: '盲算的说明',
+    /**
+     * 服务端没有预告（老服务端，见 catalogPreview）、两边又只差一处时，提交前说清选择可能被记进数据目录。卡上只看得到
+     * 差异的方面，看不到服务端写目录的其余条件（dual_check_facts.derive：只有一边按时间筛的不记，多出的条件得在排除
+     * 无效记录、又不是指标自己的范围，只差去不去重时得采用去重的一边；同一次裁决里几个指标给同一张表记的业务日期、
+     * 去重规则不同时一项都不写），所以每句只说必要条件（「仅当……才」），不写的几种常见情况照实说出来，免得审核人
+     * 为了不让目录被写错而避开本来对的一边。卡上是「方面那句 + tail」。tail 紧跟在「……时不记」后面，开头写明说的是
+     * 写入的项
+     */
+    catalog: {
+      time: '仅当两边按不同的列筛时间，采用的一边所用的时间列才会作为该表的业务日期记入数据目录；只有一边按时间筛时不记，'
+        + '同一次裁决里几个指标给同一张表记的业务日期不同时都不记',
+      filter: '仅当多出的条件只在一边、并且是在排除退款、作废、测试这类无效记录，采用有它的一边时，这个条件才会作为该表的'
+        + '有效记录条件记入数据目录；只看某个地区、某个渠道这类限定指标范围的条件不记',
+      aggregate: '仅当两边只差是否去重、并且采用的是去重的一边，去重的做法才会作为该表的去重规则记入数据目录；采用不去重的一边时不记，'
+        + '同一次裁决里几个指标给同一张表记的去重规则不同时都不记',
+      tail: '。写入的项记为人工确认的事实；选「两边都不对」时不记，数据目录中已有人工确认的不同说法时不覆盖，是否记入以时间线上的记录为准',
+    },
+    /**
+     * 服务端预告了采用哪一边会往数据目录里写什么（payload.summary[].catalog）时照它说：三个选择各一句，写的说哪张表的
+     * 哪一项记成什么，不写的只说不记（原因在裁决后的时间线上）。两边都不写时卡上不提数据目录。卡上是
+     * 「head + 三句（；分隔）+ tail」，审核人当前选的那一句加重。
+     *
+     * 预告是每个指标单独算的，服务端写目录前却把同一次裁决里落到同一张表同一项上的说法归拢（dual_check_facts._merged）：
+     * 业务日期、去重规则说法不同的一项都不写（conflict），有效记录条件用 AND 合成一句写（joined）。卡上按其余指标当前的
+     * 选择补上这一层，tail 里说明预告是按当前的选择算的
+     */
+    catalogPreview: {
+      head: '记入数据目录：',
+      /** where 同时间线（log.catalogItem）：「orders」（shop）的业务日期；value 是要写进去的说法 */
+      write: (choice: string, where: string, value: string) => `${choice}时，${where}记为「${value}」`,
+      /** 两边写的是同一张表的同一项、只差取值时，后一边省掉「哪张表的哪一项」 */
+      writeSame: (choice: string, value: string) => `${choice}时记为「${value}」`,
+      skip: (choice: string) => `${choice}时不记`,
+      /** metrics 是 metricNames 写好的、和这一边说法不同的指标（按它们当前的选择） */
+      conflict: (choice: string, where: string, metrics: string) => `${choice}时，${where}与${metrics}的选择说法不同，都不记`,
+      /** 同 writeSame：两边写的是同一项时，后一边省掉「哪张表的哪一项」 */
+      conflictSame: (choice: string, metrics: string) => `${choice}时与${metrics}的选择说法不同，都不记`,
+      /** 有效记录条件接在 write / writeSame 后面：和这些指标当前采用的条件合成一句写 */
+      joined: (metrics: string) => `，与${metrics}采用的条件用 AND 合成一句`,
+      /** 「退款率」、「订单数」；多于 3 个只列前 3 个 */
+      metricNames: (names: string[]) => names.slice(0, 3).map((n) => `「${n}」`).join('、')
+        + (names.length > 3 ? `等 ${names.length} 个指标` : ''),
+      tail: '。写入的项记为人工确认的事实；以上按发起审批时的数据目录和各指标当前的选择预告，实际写入以时间线上的记录为准',
+    },
+    choices: { a: '采用原流程的结果', b: '采用盲算的结果', neither: '两边都不对' } as Record<'a' | 'b' | 'neither', string>,
+    choiceGroup: (name: string) => `「${name}」采用哪一边的结果`,
+    /** 三个选择的后果，按运行类别说：探索运行不出具，不提出具；老服务端没给类别的照实说「正式运行」 */
+    consequence: (runClass: string | null | undefined) => (runClass === 'formal'
+      ? '采用原流程的结果：沿用原流程的值，不影响出具。采用盲算的结果或两边都不对：报告中的数仍取自原流程，这个指标记为出具缺口，出具降档'
+      : runClass === 'exploratory'
+        ? '采用原流程的结果：沿用原流程的值。采用盲算的结果或两边都不对：报告中的数仍取自原流程，这个指标记为缺口'
+        : '采用原流程的结果：沿用原流程的值。采用盲算的结果或两边都不对：报告中的数仍取自原流程，这个指标记为缺口，正式运行的出具随之降档'),
+    /**
+     * 节点的「未采用原流程时」设为判为失败（从这次运行的图快照里读到的）：采用盲算或都不对时节点失败、运行终止，
+     * 不再说出具降档
+     */
+    consequenceFail: '采用原流程的结果：沿用原流程的值，运行继续。采用盲算的结果或两边都不对：节点的「未采用原流程时」'
+      + '设为「判为失败」，提交后运行将终止',
+    /** 读不到节点怎么设的（图快照取不到、节点在子工作流里）：降档那句后面有条件地补一句 */
+    consequenceMaybeFail: '如节点的「未采用原流程时」设为「判为失败」，选择后两项会终止运行',
+    note: '备注（可选）',
+    notePlaceholder: '说明裁决的依据，会随裁决记入运行记录',
+    submit: '提交裁决',
+    pending: (n: number) => `还有 ${n} 个指标未选择`,
+    /** 提交后的提示：全采用原流程、或节点按缺省处置时运行继续；判为失败时运行终止；读不到节点设置时不下结论 */
+    done: '已提交裁决，运行继续',
+    doneFail: '已提交裁决，运行将按节点设置终止',
+    doneUnknown: '已提交裁决',
+    empty: '审批内容不完整，没有可以裁决的指标',
+    /** 认不出任何指标时留的出口：驳回后节点按人工驳回失败 */
+    reject: '驳回并终止',
+    emptyReject: '驳回后节点失败，本次运行终止。可以在备注中说明原因',
+    rejected: '已驳回，本次运行终止',
+  },
+
+  // ---- 时间线（run/decode.ts explainLog）：按日志的 code 和结构化字段说，不从原话里认
+  /** 日志里的 limit 字段（达到了哪个上限） */
+  limitLabel: {
+    max_queries: '查询次数上限', timeout_s: '时长上限', max_cost_usd: '金额上限', daily_max_usd: '每日金额上限', max_claims: '句数上限',
+  } as Record<string, string>,
+  limitAny: '上限',
+  limitDailyNext: '今日核查费用已达上限。请在「设置 → 偏好设置 → 核查」中调高每日金额上限，或等到次日再运行',
+  log: {
+    skippedDisabled: '双盲复算未启用，已跳过',
+    skippedDisabledNext: '如需复算，请在节点的「启用双盲复算」中选择「开启」，或在「设置 → 偏好设置 → 核查」中启用双盲复算',
+    skippedNoInputs: '没有输入来自查询的指标，已跳过复算',
+    skippedNoInputsNext: '双盲复算只复算输入来自查询结果的指标。请检查节点的「复算的指标」，或确认口径卡的输入取自查询',
+    skipped: '双盲复算已跳过',
+    sameModel: (model?: string) => (model ? `盲算模型与原流程同为「${model}」，复算缺乏独立性` : '盲算模型与原流程相同，复算缺乏独立性'),
+    sameModelNext: '请在节点的「盲算模型」中指定其他模型，或在「设置 → 偏好设置 → 核查」中修改核查模型',
+    agreed: (n?: number) => (n ? `双盲复算一致：${formatNumber(n)} 个指标与盲算结果相符` : '双盲复算一致：与盲算结果相符'),
+    disagreed: (n?: number) => (n ? `双盲复算有 ${formatNumber(n)} 个指标与盲算结果不一致，等待审核人裁决`
+      : '双盲复算有指标与盲算结果不一致，等待审核人裁决'),
+    disagreedNext: '请在审批卡上对照两边的 SQL，逐个指标选择采用哪一边的结果',
+    resolved: (parts: string[]) => (parts.length ? `审核人已裁决：${parts.join('，')}` : '审核人已裁决'),
+    resolvedA: (n: number) => `采用原流程 ${formatNumber(n)} 个`,
+    resolvedB: (n: number) => `采用盲算 ${formatNumber(n)} 个`,
+    resolvedNeither: (n: number) => `两边都不对 ${formatNumber(n)} 个`,
+    gaps: (n: number) => (n ? `${formatNumber(n)} 项记为缺口` : '没有缺口'),
+    catalog: (n: number) => `已将 ${formatNumber(n)} 项人工确认的事实记入数据目录`,
+    catalogNone: '本次裁决未写入数据目录',
+    /**
+     * 写进数据目录的一项：「orders」（shop）的业务日期。item 是目录项的中文叫法（认不出的键不传，只写表）；
+     * 老版本给的一句中文也从这里过
+     */
+    catalogItem: (table?: string, source?: string, item?: string) => {
+      const where = table ? `「${table}」${source ? `（${source}）` : ''}` : ''
+      return where && item ? `${where}的${item}` : where || item || ''
+    },
+    catalogSkipped: (n: number) => `${formatNumber(n)} 项未写入`,
+    catalogNext: '可在「数据 → 数据目录」中查看或修改',
+    /** metric 是指标 ID（服务端日志只带 ID，中文名在原话里），不当名字加引号 */
+    limit: (label: string, metric?: string) => (metric ? `指标 ${metric} 的盲算已达${label}，按无法复算处理` : `双盲复算已达${label}`),
+    limitNext: '请在「设置 → 偏好设置 → 核查」中调高双盲复算的上限',
+  },
+  /** 反方审稿日志的时间线说法：时间线解读统一在这里做，反方审稿的工作包不另写一份 */
+  challengeLog: {
+    skippedDisabled: '反方审稿未启用，已跳过',
+    skippedDisabledNext: '如需审稿，请在节点中开启，或在「设置 → 偏好设置 → 核查」中启用反方审稿',
+    // no_report：要审的报告节点找得到（找不到时节点直接报错，到不了这里），但它的报告文档读不出来——没有写出、
+    // 保存失败，或者它在这次没有执行到的分支上
+    skippedNoReport: '要审的报告没有可读取的报告文档，已跳过反方审稿',
+    skippedNoReportNext: '请确认报告撰写节点是否执行成功、是否写出了报告；它位于条件分支上时，确认本次运行执行到了它',
+    skippedNoClaims: '报告中没有需要审的关键结论，已跳过反方审稿',
+    skipped: '反方审稿已跳过',
+    sameModel: (model?: string) => (model ? `反方审稿模型与报告撰写模型同为「${model}」，审稿缺乏独立性`
+      : '反方审稿模型与报告撰写模型相同，审稿缺乏独立性'),
+    sameModelNext: '请在节点中指定其他审稿模型，或在「设置 → 偏好设置 → 核查」中修改核查模型',
+    done: (n?: number) => (n ? `反方审稿完成：审阅了 ${formatNumber(n)} 句结论` : '反方审稿完成'),
+    verdict: { stands: '经受住', weakened: '被削弱', refuted: '被推翻', inconclusive: '无法判断' } as Record<string, string>,
+    refuted: (n?: number) => (n ? `反方审稿推翻了 ${formatNumber(n)} 句结论` : '反方审稿推翻了报告中的结论'),
+    refutedNext: '请在证据中对照反方审稿的查询和理由，核实这些结论',
+    limit: (label: string, skipped?: number) => (skipped ? `反方审稿已达${label}，${formatNumber(skipped)} 句结论未审` : `反方审稿已达${label}`),
+    limitNext: '请在节点或「设置 → 偏好设置 → 核查」中调高反方审稿的上限',
+  },
 }
 
 /** 反方审稿节点：节点库说明、检查器和运行结果 */
@@ -3346,5 +3604,78 @@ export const CHALLENGE_TEXT = {
   pending: `${PENDING_TEXT}：本节点暂未生效，运行时将跳过`,
 }
 
-/** 设置页里复核套件（双盲复算、反方审稿等）的默认值一栏 */
-export const VERIFY_SETTING_TEXT = {}
+/**
+ * 设置页「核查」一节（双盲复算、反方审稿、审批质询共用的核查模型、各自的开关和上限、每日金额上限）。
+ *
+ * 顶层是各项的叫法，和服务端 api/settings.py 的 VERIFY_SETTING_LABEL 一字不差（保存时 422 的报错写的就是这些，
+ * 界面上的字段名得对得上），嵌套的项写成「组.项」；check-verify 从 settings.py 读出来逐一比对。
+ * 这一节其余的标题、说明、今日花费放在 section 里
+ */
+export const VERIFY_SETTING_TEXT = {
+  provider: '核查模型 · 接入',
+  model: '核查模型 · 模型',
+  daily_max_usd: '核查每日金额上限（美元）',
+  dual_check: '双盲复算',
+  'dual_check.enabled': '双盲复算 · 启用',
+  'dual_check.tolerance': '双盲复算 · 允许的相对误差',
+  'dual_check.max_queries': '双盲复算 · 每项最多查询次数',
+  'dual_check.timeout_s': '双盲复算 · 每项时长上限（秒）',
+  challenge: '反方审稿',
+  'challenge.enabled': '反方审稿 · 启用',
+  'challenge.max_claims': '反方审稿 · 每份报告最多审几句',
+  'challenge.max_queries': '反方审稿 · 每句最多查询次数',
+  'challenge.timeout_s': '反方审稿 · 每句时长上限（秒）',
+  inquiry: '审批质询',
+  'inquiry.enabled': '审批质询 · 启用',
+  'inquiry.max_queries': '审批质询 · 每次最多查询次数',
+  'inquiry.timeout_s': '审批质询 · 每次时长上限（秒）',
+  section: {
+    title: '核查',
+    hint: '双盲复算、反方审稿和审批质询都由只读的 Agent 查询数据来核对：三项共用核查模型和每日金额上限，'
+      + '各自可以单独开关、设置上限。节点中已设置的项以节点为准。',
+    model: '核查模型',
+    /** 接入和模型都没填：服务端沿用证据裁判模型的取值链（verify_model_spec）。醒目地说一句，并给出建议 */
+    notSet: '未单独配置，将使用证据裁判的模型',
+    notSetAdvice: '建议配置一个与撰写报告、查询数据的模型都不同的模型：同一模型核对自身的输出时，不易发现其中的错误',
+    differ: '建议与撰写报告、查询数据的模型不同：同一模型不易发现自身的错误',
+    providerDefault: '跟随证据裁判模型',
+    providerFromModel: '按模型名找接入',
+    providerGone: (name: string) => `模型接入「${name}」不存在：核查调用将失败`,
+    providerGoneOption: (name: string) => `${name}（不存在）`,
+    providerOff: '（已停用）',
+    modelDefault: '留空：用接入的默认模型',
+    modelFollow: '留空：跟随证据裁判模型',
+    modelOf: (model: string) => `留空则使用 ${model}`,
+    /** 只填了核查模型、接入留空时实际用哪个接入（同裁判的说法，只是上一级是证据裁判模型） */
+    byModel: (model: string, found: { name: string; enabled: boolean } | null | undefined, fallback: string | null | undefined) => {
+      if (found && !found.enabled) return `只填了模型：「${model}」属于已停用的接入「${found.name}」，核查调用将失败。请启用该接入或选择其他接入`
+      if (found) return `只填了模型：将按模型名使用接入「${found.name}」。「跟随证据裁判模型」仅在接入和模型都留空时生效`
+      return `只填了模型：所有接入的模型列表中都没有「${model}」，将使用默认接入${fallback ? `「${fallback}」` : ''}调用。`
+        + '如该模型不属于默认接入，请选择对应的接入。「跟随证据裁判模型」仅在接入和模型都留空时生效'
+    },
+    parts: {
+      dual_check: '另起一路，由盲算模型在看不到原流程 SQL 的情况下独立查询，再与原流程的结果逐项比对',
+      challenge: '从报告中挑出关键结论，由反方模型查询数据尝试推翻',
+      inquiry: '审批人在批准前就报告提问，由核查模型查询数据作答，问答随运行一并封存',
+    } as Record<string, string>,
+    toleranceHint: '两边的值相差不超过这个比例时算一致，例如 0.000001 表示百万分之一，0 表示必须完全相同',
+    unlimited: '不限',
+    /** 某项设成不限时写明它还受什么约束，不要悄悄生效。by：眼下还设着上限的相关项 */
+    unlimitedNote: (kind: 'queries' | 'claims' | 'timeout' | 'daily', by: string[]) => {
+      if (kind === 'timeout') return '不设上限，时长仅受模型接口自身的超时约束'
+      const what = kind === 'queries' ? '查询次数' : kind === 'claims' ? '句数' : '每日核查费用'
+      return by.length ? `不设上限，${what}仅受${by.join('、')}约束` : `不设上限，${what}不受其他上限约束`
+    },
+    bound: { timeout: '时长上限', daily: '每日金额上限', claims: '报告中关键结论的数量', queries: '各项的查询次数上限', timeouts: '各项的时长上限' },
+    invalid: {
+      count: '请填写正整数，或勾选「不限」',
+      seconds: '请填写大于 0 的秒数，或勾选「不限」',
+      usd: '请填写大于 0 的金额，或勾选「不限」',
+      tolerance: '请填写不小于 0 的数',
+    },
+    spend: (usd: string, calls: number) => `今日已花费 $${usd}（${formatNumber(calls)} 次调用）`,
+    spendNone: '今日尚无核查调用',
+    unpriced: (n: number) => `另有 ${formatNumber(n)} 次调用无法估算金额（模型不在价格目录中），未计入`,
+    saveInvalid: '核查设置中有无效值，请修正后再保存',
+  },
+}

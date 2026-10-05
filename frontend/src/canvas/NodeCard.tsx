@@ -95,8 +95,6 @@ function summarize(type: NodeType, config: Record<string, any>): string {
     case 'subgraph':
       return config.workflow_id ? '嵌套工作流' : '未选择工作流'
     // 还是占位的两种：卡片上直接说尚未生效，免得以为放上去就会执行
-    case 'dual_check':
-      return DUAL_CHECK_TEXT.pending
     case 'challenge':
       return CHALLENGE_TEXT.pending
     default:
@@ -768,10 +766,13 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const reportStamp = useReportStamp(id, type === 'report')
   // 只有排队中的卡片要知道自己有几路上游，别的卡片不必为改图重跑这一趟
   const fanIn = useStudio((s) => (state === 'queued' ? fanInOf(s.nodes, s.edges)[id] ?? 0 : 0))
+  // 节点定义给了摘要钩子（摘要要提到别的节点：双盲复算复算的是哪张口径卡）就用它，没给照旧走 summarize。
+  // 选择器只返回字符串：别的节点改了、这一句没变，卡片就不重渲染
+  const hookedSummary = useStudio((s) => def?.summary?.({ id, config: data.config ?? {}, nodes: s.nodes, edges: s.edges }) ?? '')
 
   const Icon = def?.icon ?? Sparkles
   const handles = sourceHandles(type, data.config)
-  const summary = summarize(type, data.config)
+  const summary = hookedSummary || summarize(type, data.config)
   const meta = statusMeta(state)
   // 循环容器在两轮之间也是 running，但在跑的是循环体：不转圈、不挂光弧。
   // 回放时取游标那一刻的（航迹上的 looping 是最后的值）

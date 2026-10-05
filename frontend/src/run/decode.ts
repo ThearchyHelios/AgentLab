@@ -3,6 +3,7 @@ import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
   ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
+  CATALOG_TABLE_FIELD_LABEL, DUAL_CHECK_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -715,12 +716,33 @@ function gateTitle(tool: string, verdict: 'allow' | 'escalate' | 'team', reason:
 }
 
 /**
+ * 双盲复算、反方审稿的日志代码（期 3 前后端共用的约定）。这几条按 code 和结构化字段解读，不看原话；后端发成 info 的
+ * （一致、裁决、记入数据目录、审稿完成）也上时间线，不然这两种节点就是一个跑了几十秒、什么都没说的黑盒
+ */
+const VERIFY_LOG_CODES = new Set([
+  'dual_check_skipped', 'dual_check_same_model', 'dual_check_agreed', 'dual_check_disagreed', 'dual_check_resolved',
+  'dual_check_catalog', 'dual_check_limit',
+  'challenge_skipped', 'challenge_same_model', 'challenge_done', 'challenge_refuted', 'challenge_limit',
+])
+
+const DC = DUAL_CHECK_TEXT
+const CL = DUAL_CHECK_TEXT.challengeLog
+const isRecord = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v)
+/** 老日志、别的服务端版本可能给的是一句中文原因而不是代码：中文的照写，认不得的代码不往界面上放 */
+const cjkText = (v: unknown): string | undefined => (typeof v === 'string' && /[㐀-鿿]/.test(v) ? v : undefined)
+/** 个数：给的是数就取整，给的是清单就数一下，别的（缺了、写坏了）当不知道 */
+const countOf = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v)
+  : Array.isArray(v) ? v.length : undefined)
+
+/**
  * 几种「看着跑完了、其实没做成」的状况（NI-3/4/5）。后端这几条日志是写给排查的，原样
  * 贴出来是一串标记和术语，而且不说该去哪儿改——这里说成人话，并给出下一步。
- * 认不得的 code 返回 null，照原话显示
+ * 认不得的 code 返回 null，照原话显示。
+ *
+ * 双盲复算、反方审稿那几条（VERIFY_LOG_CODES）另带 level（该不该用提醒色）和 artifact（完整对照、审稿记录可下钻）
  */
 function explainLog(code: string | undefined, message: string, d: Record<string, any> = {},
-): Pick<Step, 'title' | 'sub' | 'next' | 'fix' | 'fixNode' | 'fixField' | 'checks'> | null {
+): Pick<Step, 'title' | 'sub' | 'next' | 'fix' | 'fixNode' | 'fixField' | 'checks' | 'level' | 'artifact'> | null {
   const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
   const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && !!x) : [])
   switch (code) {
@@ -969,6 +991,120 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         sub: `结果中包含原文不存在的值${what}，已作废`,
         next: '修复只能调整格式，不能补充数据。请先检查上游节点为何未获取到数据（常见原因是未绑定查询工具）',
         fix: 'canvas',
+      }
+    }
+    // ---- 双盲复算：只读结构化字段。老日志缺了字段就不点名、不报数，标题照样说得通
+    case 'dual_check_skipped': {
+      const reason = str(d.reason)
+      if (reason === 'disabled') {
+        return { title: DC.log.skippedDisabled, next: DC.log.skippedDisabledNext, fix: 'canvas', fixField: 'enabled', level: 'info' }
+      }
+      // 放了这个节点却一个指标都复算不了：多半是配错了，用提醒色
+      if (reason === 'no_inputs') {
+        return { title: DC.log.skippedNoInputs, next: DC.log.skippedNoInputsNext, fix: 'canvas', fixField: 'metrics', level: 'warn' }
+      }
+      return { title: DC.log.skipped, sub: cjkText(d.reason), level: 'info' }
+    }
+    case 'dual_check_same_model':
+      return { title: DC.log.sameModel(str(d.model)), next: DC.log.sameModelNext, fix: 'canvas', fixField: 'model', level: 'warn' }
+    case 'dual_check_agreed':
+      return { title: DC.log.agreed(countOf(d.metrics) || undefined), level: 'info' }
+    case 'dual_check_disagreed': {
+      // metrics 是 [{id, name}]：副标题点名，没起名字的指标写 id
+      const list = Array.isArray(d.metrics) ? d.metrics.filter(isRecord) : []
+      const names = list.map((m) => str(m.name) ?? str(m.id)).filter((n): n is string => !!n)
+      return {
+        title: DC.log.disagreed(list.length || undefined),
+        sub: names.length ? names.map((n) => `「${n}」`).join('') : undefined,
+        next: DC.log.disagreedNext,
+        level: 'warn',
+        ...(str(d.card_artifact) ? { artifact: str(d.card_artifact) } : {}),
+      }
+    }
+    case 'dual_check_resolved': {
+      // choices 是 {指标 id: a | b | neither}；gaps 是记成缺口的个数（给成清单的也数得出来）
+      const picked = isRecord(d.choices) ? Object.values(d.choices) : []
+      const n = (c: string) => picked.filter((v) => v === c).length
+      const parts = [
+        n('a') ? DC.log.resolvedA(n('a')) : '', n('b') ? DC.log.resolvedB(n('b')) : '', n('neither') ? DC.log.resolvedNeither(n('neither')) : '',
+      ].filter(Boolean)
+      const gaps = countOf(d.gaps)
+      // 没给缺口数时按约定推：采用盲算、两边都不对都会记缺口
+      const warn = gaps != null ? gaps > 0 : n('b') + n('neither') > 0
+      return { title: DC.log.resolved(parts), sub: gaps != null ? DC.log.gaps(gaps) : undefined, level: warn ? 'warn' : 'info' }
+    }
+    case 'dual_check_catalog': {
+      // written：[{source, table, item}] 写进数据目录的已确认事实；skipped：[{reason}] 没写的（已有已确认的不覆盖……）。
+      // item 是表级目录项的键（business_date / valid_filter / dedup），按数据目录页的叫法写；认不出的键不往界面上放，
+      // 只写表；老版本给的一句中文照写
+      const written = Array.isArray(d.written) ? d.written.filter(isRecord) : []
+      const skipped = Array.isArray(d.skipped) ? d.skipped.filter(isRecord) : []
+      const what = written.map((w) => {
+        const key = str(w.item)
+        const item = key && Object.hasOwn(CATALOG_TABLE_FIELD_LABEL, key)
+          ? CATALOG_TABLE_FIELD_LABEL[key as keyof typeof CATALOG_TABLE_FIELD_LABEL] : cjkText(key)
+        return DC.log.catalogItem(str(w.table), str(w.source), item)
+      }).filter(Boolean)
+      const why = skipped.map((s) => str(s.reason)).filter((r): r is string => !!r)
+      const rest = skipped.length ? `${DC.log.catalogSkipped(skipped.length)}${why.length ? `：${why.join('；')}` : ''}` : ''
+      return {
+        title: written.length ? DC.log.catalog(written.length) : DC.log.catalogNone,
+        sub: [what.join('；'), rest].filter(Boolean).join('；') || undefined,
+        next: written.length ? DC.log.catalogNext : undefined,
+        level: 'info',
+      }
+    }
+    case 'dual_check_limit': {
+      const which = str(d.limit)
+      return {
+        title: DC.log.limit((which && DC.limitLabel[which]) || DC.limitAny, str(d.metric)),
+        next: which === 'daily_max_usd' ? DC.limitDailyNext : DC.log.limitNext,
+        level: 'warn',
+      }
+    }
+    // ---- 反方审稿：同上，文案在 DUAL_CHECK_TEXT.challengeLog（时间线的解读统一在这里做）
+    case 'challenge_skipped': {
+      const reason = str(d.reason)
+      if (reason === 'disabled') {
+        return { title: CL.skippedDisabled, next: CL.skippedDisabledNext, fix: 'canvas', fixField: 'enabled', level: 'info' }
+      }
+      if (reason === 'no_report') return { title: CL.skippedNoReport, next: CL.skippedNoReportNext, fix: 'canvas', level: 'warn' }
+      if (reason === 'no_claims') return { title: CL.skippedNoClaims, level: 'info' }
+      return { title: CL.skipped, sub: cjkText(d.reason), level: 'info' }
+    }
+    case 'challenge_same_model':
+      return { title: CL.sameModel(str(d.model)), next: CL.sameModelNext, fix: 'canvas', fixField: 'model', level: 'warn' }
+    case 'challenge_done': {
+      // counts：{stands, weakened, refuted, inconclusive}，四种结论各几句；为 0 的不写
+      const c = isRecord(d.counts) ? d.counts : {}
+      const keys = ['stands', 'weakened', 'refuted', 'inconclusive']
+      const nums = keys.map((k) => countOf(c[k]) ?? 0)
+      const total = nums.reduce((a, b) => a + b, 0)
+      const parts = keys.map((k, i) => (nums[i] ? `${CL.verdict[k]} ${formatNumber(nums[i])}` : '')).filter(Boolean)
+      return {
+        title: CL.done(total || undefined),
+        sub: parts.length ? parts.join(' · ') : undefined,
+        level: nums[2] > 0 ? 'warn' : 'info',
+        ...(str(d.artifact) ? { artifact: str(d.artifact) } : {}),
+      }
+    }
+    case 'challenge_refuted': {
+      const items = Array.isArray(d.items) ? d.items.filter(isRecord) : []
+      const texts = items.map((i) => str(i.text)).filter((t): t is string => !!t)
+      return {
+        title: CL.refuted(items.length || undefined),
+        sub: texts.length ? texts.map((t) => `「${t}」`).join('') : undefined,
+        next: CL.refutedNext,
+        level: 'warn',
+      }
+    }
+    case 'challenge_limit': {
+      const which = str(d.limit)
+      const skipped = countOf(d.claims_skipped)
+      return {
+        title: CL.limit((which && DC.limitLabel[which]) || DC.limitAny, skipped || undefined),
+        next: which === 'daily_max_usd' ? DC.limitDailyNext : CL.limitNext,
+        level: 'warn',
       }
     }
     default:
@@ -2143,6 +2279,19 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
             const full = gateTitle(gate.tool, 'team', gate.reason)
             gate.step.title = clip(full, 120)
             gate.step.detail = [full.length > 120 ? gate.reason : '', message].filter(Boolean).join('\n') || undefined
+            break
+          }
+        }
+        // 双盲复算、反方审稿的日志按 code 和结构化字段解读：info 的也上时间线，没有原话的老日志照样说得出来。
+        // 后端标了 warn / error 的照它的来，explainLog 认为该提醒的（有缺口、有推翻）也用提醒色
+        if (typeof d.code === 'string' && VERIFY_LOG_CODES.has(d.code)) {
+          const said = explainLog(d.code, message, d)
+          if (said) {
+            const tone = level === 'error' ? 'error' : level === 'warn' || said.level === 'warn' ? 'warn' : 'info'
+            push({
+              id: `lg-${seq}`, seq, kind: 'note', nodeId, status: 'done', code: d.code, ...said, level: tone,
+              ...(message ? { detail: message } : {}),
+            }, nodeId)
             break
           }
         }
