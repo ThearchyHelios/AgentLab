@@ -690,10 +690,13 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
     type: 'challenge', label: NODE_TYPE_LABEL.challenge, category: '把关', icon: ShieldAlert,
     description: CHALLENGE_TEXT.description,
     hasTarget: true, sources: [{ id: 'out', label: '' }],
-    // 上限、模型、开关都可以不写：服务端按「设置 → 核查」里反方审稿那一组取（verify_settings）。没写的项不往配置里落默认值，
-    // 设置改了，没单独配过的节点跟着变
+    // 上限、模型、开关都可以不写：服务端按「设置 → 偏好设置 → 核查」里反方审稿那一组取（verify_settings）。
+    // 没写的项不往配置里落默认值，设置改了，没单独配过的节点跟着变
     fields: [
-      nodePickField({ key: 'report', label: CHALLENGE_TEXT.field.report, nodeType: 'report', text: CHALLENGE_TEXT.reportPick }),
+      // 留空时先认直接连着的报告（「初稿 → 终稿 → 反方审稿」审终稿），同服务端 schema.challenge_report
+      nodePickField({
+        key: 'report', label: CHALLENGE_TEXT.field.report, nodeType: 'report', rule: 'direct', text: CHALLENGE_TEXT.reportPick,
+      }),
       {
         key: 'max_claims', label: CHALLENGE_TEXT.field.max_claims, type: 'number', min: 1,
         placeholder: CHALLENGE_TEXT.followSettings, help: CHALLENGE_TEXT.help.max_claims,
@@ -701,7 +704,7 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       // 和撰写报告的模型相同时提醒：同一个模型审自己写的结论，较难发现错误
       ...verifyModelFields({
         labels: { provider: CHALLENGE_TEXT.field.provider, model: CHALLENGE_TEXT.field.model },
-        text: CHALLENGE_TEXT.model, subject: upstreamModel('report', 'report'),
+        text: CHALLENGE_TEXT.model, subject: upstreamModel('report', 'report', 'direct'),
       }),
       {
         // 没写等于 degrade：降档放第一项，没写时下拉框正好落在它上面

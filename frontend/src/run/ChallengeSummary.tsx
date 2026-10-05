@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useId, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { AlertTriangle, ChevronRight, ShieldAlert } from 'lucide-react'
 import { api } from '../api/client'
 import { EVIDENCE_STATE, segmentLabel, segmentState, sourceOf, unitText, type EvidenceStateCode } from '../lib/evidence'
@@ -18,11 +18,12 @@ export interface ChallengeSummaryProps {
 
 /**
  * 审批卡里反方审稿的摘要，紧跟在报告核对概况（ApprovalReports）后面：一行概况（四种判断各几句），逐句列出结论原文和判断，
- * 点开一句再按 challenge_artifact 取完整内容，看反方的理由和它执行过的查询。
+ * 点开一句再按 challenge_artifact 取完整内容，看反方的理由和它执行过的查询。审稿记录没存上（没有工件）时只列判断、
+ * 不能点开，整块说一次。
  *
  * 判断是反方模型给的，不是系统核对：颜色照结论句裁判的那一套，「经受住」也不用确定性的绿。
- * 「出具会降档」只在正式运行、被推翻的结论按降档处理时才写——只标注的不写降档，探索运行不出具，和出具有关的话一句不说。
- * 运行类别不由审批卡传进来，按运行 id 从证据 store 取（loadRunClass），取到之前不说。
+ * 「出具会降档」只在正式运行、有被推翻的结论、按降档处理时才写——只标注的不写降档，探索运行不出具，和出具有关的话一句不说。
+ * 运行类别不由审批卡传进来，按运行 id 从证据 store 取（loadRunClass），取到之前不说；取不到时照实说取不到，可重试。
  *
  * 审的报告都没有经过反方审稿时什么都不画，也不发任何请求，卡片和以前一样。
  */
@@ -38,11 +39,11 @@ export function ChallengeSummary({ reports, runId }: ChallengeSummaryProps) {
 function ChallengeList({ reviewed, runId }: {
   reviewed: { report: ApprovalReport; challenge: ApprovalChallenge }[]; runId: string
 }) {
-  const runClass = useRunClass(runId)
+  const run = useRunClass(runId)
   return (
     <>
       {reviewed.map(({ report, challenge }) => (
-        <ChallengeBlock key={report.node_id} report={report} challenge={challenge} runClass={runClass} />
+        <ChallengeBlock key={report.node_id} report={report} challenge={challenge} run={run} />
       ))}
     </>
   )
@@ -71,14 +72,14 @@ const count = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v 
 
 /**
  * payload.reports[i].challenge 认不认得：要么有计数、要么有条目。计数缺了按条目数（条目最多 10 条，计数才是全部）；
- * 条目缺了 unit 的按序号补一个键，只用来区分行
+ * 条目缺了 unit 的留空（行的键带序号，区分得开），不补假的：补出来的键会被当成真的 unit 去和工件里的句子比
  */
 function challengeOf(report: ApprovalReport): ApprovalChallenge | null {
   const raw = report.challenge as unknown
   if (!raw || typeof raw !== 'object') return null
   const c = raw as Record<string, unknown>
   const items = (Array.isArray(c.items) ? c.items.filter(isItem) : [])
-    .map((it, i) => ({ unit: typeof it.unit === 'string' && it.unit ? it.unit : `#${i}`, text: it.text, verdict: it.verdict }))
+    .map((it) => ({ unit: typeof it.unit === 'string' ? it.unit : '', text: it.text, verdict: it.verdict }))
   // 计数里一个数都没有（格式不对）也按条目数，免得概况写四个 0、下面却列着几句
   const given = c.counts && typeof c.counts === 'object' && VERDICTS.some((v) => typeof (c.counts as any)[v] === 'number')
     ? c.counts as Record<string, unknown> : null
@@ -86,17 +87,40 @@ function challengeOf(report: ApprovalReport): ApprovalChallenge | null {
     ? count(given[v]) : items.filter((it) => it.verdict === v).length])) as ChallengeCounts
   if (!given && !items.length) return null
   return {
-    counts, items, artifact: typeof c.artifact === 'string' ? c.artifact : '',
+    counts, items, artifact: typeof c.artifact === 'string' && c.artifact ? c.artifact : null,
     on_refuted: typeof c.on_refuted === 'string' ? c.on_refuted : undefined,
   }
 }
 
-function useRunClass(runId: string): 'formal' | 'exploratory' | null {
+interface RunClass {
+  runClass: 'formal' | 'exploratory' | null
+  /** 取失败了、还没取到（重取期间也算：那一行和焦点所在的重试按钮不跟着闪掉） */
+  failed: boolean
+  retry: () => void
+}
+
+function useRunClass(runId: string): RunClass {
   const slot = useEvidence((s) => (runId ? s.runClasses[runId] : undefined))
   const load = useEvidence((s) => s.loadRunClass)
   useEffect(() => { if (runId) void load(runId) }, [runId, load])
-  if (slot?.status !== 'ok') return null
-  return slot.data === 'formal' || slot.data === 'exploratory' ? slot.data : null
+  const status = slot?.status
+  const [hadError, setHadError] = useState(false)
+  useEffect(() => {
+    if (status === 'error') setHadError(true)
+    else if (status === 'ok') setHadError(false)
+  }, [status])
+  const failed = status === 'error' || (hadError && status === 'loading')
+  // 取失败了不就此作罢：窗口重新拿到焦点时再取一次（store 对出错的槽会重发）。只取一次就放弃的话，一次网络抖动
+  // 会让「出具会降档」一直不出现，而卡顶按审批自带的运行类别照样写着正式运行
+  useEffect(() => {
+    if (status !== 'error' || !runId) return
+    const again = () => { void load(runId) }
+    window.addEventListener('focus', again)
+    return () => window.removeEventListener('focus', again)
+  }, [status, runId, load])
+  const retry = useCallback(() => { if (runId) void load(runId) }, [runId, load])
+  const runClass = status === 'ok' && (slot?.data === 'formal' || slot?.data === 'exploratory') ? slot.data : null
+  return { runClass, failed, retry }
 }
 
 // ---------------------------------------------------------------- 取工件
@@ -168,29 +192,41 @@ function useChallengeArtifact(id: string, want: boolean): Detail {
   return id ? { ...state, retry } : { status: 'error' }
 }
 
-/** 这一句在工件里的完整内容：按 unit 认，unit 对不上（老服务端没给）再按原文认 */
+/**
+ * 工件里的一句和审批条目里的一句是不是同一句：两边都有 unit 时只按 unit 认——同一句话在摘要和正文各出现一次、各自被挑来审，
+ * 原文一样、unit 不同，是两句（按原文认会把其中一句吞掉，被吞的可能正是被推翻的那句）；有一边没给 unit（老服务端）才按原文认
+ */
+const sameClaim = (a: ChallengeItem, b: ChallengeItem) => (a.unit && b.unit ? a.unit === b.unit : a.text === b.text)
+
+/** 这一句在工件里的完整内容 */
 function claimOf(artifact: ChallengeArtifact | undefined, item: ChallengeItem): ChallengeClaim | undefined {
-  if (!artifact) return undefined
-  return artifact.claims.find((c) => c.unit && c.unit === item.unit) ?? artifact.claims.find((c) => c.text === item.text)
+  return artifact?.claims.find((c) => sameClaim(c, item))
 }
+
+/** 补齐、重试之后接住焦点的几处：本身不在 Tab 顺序里（tabIndex -1），键盘用户得看得见焦点落在哪 */
+const FOCUS_RING = 'rounded-sm focus:outline-none focus-visible:outline focus-visible:outline-solid focus-visible:outline-2 '
+  + 'focus-visible:outline-offset-1 focus-visible:outline-[color:var(--accent)]'
+
+/** 焦点丢了（按过的按钮被拿掉，落回 body）才替它接住；取的这一会儿用户已经去了别处的，不抢 */
+const focusLost = () => !document.activeElement || document.activeElement === document.body
 
 // ---------------------------------------------------------------- 卡片
 
-function ChallengeBlock({ report, challenge, runClass }: {
-  report: ApprovalReport; challenge: ApprovalChallenge; runClass: 'formal' | 'exploratory' | null
+function ChallengeBlock({ report, challenge, run }: {
+  report: ApprovalReport; challenge: ApprovalChallenge; run: RunClass
 }) {
   const [open, setOpen] = useState<Set<string>>(() => new Set())
   const [all, setAll] = useState(false)
-  const detail = useChallengeArtifact(challenge.artifact, all || open.size > 0)
+  const detail = useChallengeArtifact(challenge.artifact ?? '', all || open.size > 0)
   const { counts, items } = challenge
   const total = VERDICTS.reduce((n, v) => n + counts[v], 0)
-  const refuted = counts.refuted > 0 && runClass === 'formal'
+  // 审批里没带工件：服务端保存审稿记录失败了。每句都看不了理由和查询，不画成能点开的样子，整块说一次
+  const noRecord = !challenge.artifact
+  const refuted = counts.refuted > 0 && run.runClass === 'formal'
   // 没给 on_refuted（老服务端）按降档；报错的节点到不了审批，不会是 fail
   const flagged = challenge.on_refuted === 'flag'
   // 条目之外的几句（条目最多 10 条）：要看全部时从工件里补上，排在后面，顺序照工件
-  const extra = all && detail.data
-    ? detail.data.claims.filter((c) => !items.some((it) => (c.unit && c.unit === it.unit) || c.text === it.text))
-    : []
+  const extra = all && detail.data ? detail.data.claims.filter((c) => !items.some((it) => sameClaim(c, it))) : []
   const rows: ChallengeItem[] = [...items, ...extra]
   const hidden = Math.max(0, total - items.length)
   const toggle = (key: string) => setOpen((cur) => {
@@ -199,13 +235,45 @@ function ChallengeBlock({ report, challenge, runClass }: {
     else next.add(key)
     return next
   })
+
+  // 「显示全部」那一行补齐后整行拿掉、取的时候按钮也停用，焦点会掉到页面上，下一个 Tab 就跳过了新补出来的几句：
+  // 按过「显示全部」或那一行的「重试」之后，取到了落到补出来的第一句上（计数和工件对不上、什么也没补到时落到最后一句），
+  // 又没取到落到那一行新出现的「重试」上
+  const blockRef = useRef<HTMLDivElement>(null)
+  const moreRef = useRef<HTMLDivElement>(null)
+  const focusMore = useRef(false)
+  useEffect(() => {
+    if (!focusMore.current || !all || (detail.status !== 'ok' && detail.status !== 'error')) return
+    focusMore.current = false
+    if (!focusLost()) return
+    if (detail.status === 'error') {
+      moreRef.current?.querySelector<HTMLElement>('button')?.focus()
+      return
+    }
+    const toggles = blockRef.current?.querySelectorAll<HTMLElement>('[data-challenge-toggle]')
+    ;(toggles?.[items.length] ?? toggles?.[toggles.length - 1])?.focus()
+  }, [all, detail.status, items.length])
+  const showAll = () => { focusMore.current = true; setAll(true) }
+  const retryAll = () => { focusMore.current = true; detail.retry?.() }
+
+  // 运行类别重取成功后，「暂时无法确认」那一行（连同焦点所在的重试按钮）换成降档说明：焦点接到概况那一行上
+  const countsRef = useRef<HTMLDivElement>(null)
+  const runRetried = useRef(false)
+  useEffect(() => {
+    if (run.failed || !runRetried.current) return
+    runRetried.current = false
+    if (focusLost()) countsRef.current?.focus()
+  }, [run.failed])
+  const retryRun = () => { runRetried.current = true; run.retry() }
+
   return (
-    <div className="mb-2 rounded border bg-bg p-2" data-challenge={report.node_id}>
+    <div ref={blockRef} className="mb-2 rounded border bg-bg p-2" data-challenge={report.node_id}>
       <div className="mb-1 flex items-center gap-1 text-2xs font-medium text-faint">
         <ShieldAlert size={11} aria-hidden /> {CHALLENGE_TEXT.head(report.label || report.node_id)}
       </div>
       {total > 0 || items.length ? (
-        <div className="tnum flex flex-wrap items-center gap-x-1.5 gap-y-1 text-2xs" data-challenge-counts="">
+        <div ref={countsRef} tabIndex={-1} className={`tnum flex flex-wrap items-center gap-x-1.5 gap-y-1 text-2xs ${FOCUS_RING}`}
+             data-challenge-counts="">
           {VERDICTS.map((v, i) => (
             <Fragment key={v}>
               {i > 0 && <span className="text-faint" aria-hidden>·</span>}
@@ -215,23 +283,41 @@ function ChallengeBlock({ report, challenge, runClass }: {
             </Fragment>
           ))}
           {refuted && !flagged && (
-            <span className="chip shrink-0 font-semibold" data-challenge-degrade="" title={CHALLENGE_TEXT.degradeHint}
+            <span className="chip shrink-0 font-semibold" data-challenge-degrade=""
                   style={{ color: 'var(--st-failed)', borderColor: 'var(--st-failed)' }}>
               <AlertTriangle size={11} aria-hidden /> {CHALLENGE_TEXT.degrade}
-              <span className="sr-only">：{CHALLENGE_TEXT.degradeHint}</span>
             </span>
           )}
         </div>
       ) : (
         <div className="text-2xs text-dim" data-challenge-empty="">{CHALLENGE_TEXT.none}</div>
       )}
+      {/* 降档的原因常显，不放在悬停提示里：触屏、键盘用户也得看得到为什么、会怎样（只标注那一档同样常显一行） */}
+      {refuted && !flagged && (
+        <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-degrade-note="">{CHALLENGE_TEXT.degradeHint}</div>
+      )}
       {refuted && flagged && (
         <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-flag="">{CHALLENGE_TEXT.flagNote}</div>
+      )}
+      {/* 运行类别取不到：不知道是不是正式运行，不能装作没事（卡顶按审批自带的运行类别照样写着正式运行），照实说并可重试 */}
+      {counts.refuted > 0 && !flagged && run.failed && (
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs leading-relaxed" data-challenge-runclass="failed">
+          <span style={{ color: 'var(--st-waiting)' }}>{CHALLENGE_TEXT.runClassFailed}</span>
+          <button type="button" className="btn btn-xs" onClick={retryRun}>{CHALLENGE_TEXT.retry}</button>
+        </div>
       )}
       {rows.length > 0 && (
         <ul className="mt-1.5 space-y-0.5" data-challenge-items="">
           {rows.map((item, i) => {
             const key = `${item.unit}\u0000${i}`
+            if (noRecord) {
+              return (
+                <li key={key} data-challenge-item={item.unit} data-challenge-verdict={item.verdict}
+                    className="flex min-w-0 items-start gap-1.5 px-1 py-0.5 text-2xs leading-relaxed">
+                  <ClaimLine item={item} />
+                </li>
+              )
+            }
             return (
               <ClaimRow key={key} item={item} open={open.has(key)} onToggle={() => toggle(key)}>
                 <ClaimDetail item={item} detail={detail} />
@@ -240,21 +326,27 @@ function ChallengeBlock({ report, challenge, runClass }: {
           })}
         </ul>
       )}
-      {/* 工件取回来了、却没有条目之外的句子（计数和工件对不上）：没什么可补的，这一行也不留 */}
-      {hidden > 0 && !extra.length && challenge.artifact && !(all && detail.status === 'ok') && (
-        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs text-dim" data-challenge-more={hidden}>
+      {/* 工件取回来了、却没有条目之外的句子（计数和工件对不上）：没什么可补的，这一行也不留。没有工件时照样交代
+          还有几句没列出，只是补不了 */}
+      {hidden > 0 && !extra.length && !(all && detail.status === 'ok') && (
+        <div ref={moreRef} className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs text-dim" data-challenge-more={hidden}>
           <span>{CHALLENGE_TEXT.more(hidden)}</span>
-          {detail.status === 'error' && all ? (
+          {noRecord ? null : detail.status === 'error' && all ? (
             <>
               <span style={{ color: 'var(--st-waiting)' }} role="alert">{CHALLENGE_TEXT.failed}</span>
-              {detail.retry && <button type="button" className="btn btn-xs" onClick={detail.retry}>{CHALLENGE_TEXT.retry}</button>}
+              {detail.retry && <button type="button" className="btn btn-xs" onClick={retryAll}>{CHALLENGE_TEXT.retry}</button>}
             </>
           ) : (
             <button type="button" className="btn btn-xs" disabled={all && detail.status === 'loading'}
-                    data-challenge-show-all="" onClick={() => setAll(true)}>
+                    data-challenge-show-all="" onClick={showAll}>
               {all && detail.status === 'loading' ? CHALLENGE_TEXT.loading : CHALLENGE_TEXT.showAll}
             </button>
           )}
+        </div>
+      )}
+      {noRecord && (total > 0 || items.length > 0) && (
+        <div className="mt-1 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }} data-challenge-norecord="">
+          {CHALLENGE_TEXT.noRecord}
         </div>
       )}
       {/* 判断标签看着像结论，得说清是谁判的：整块说一次，工件取回来之后带上模型名 */}
@@ -278,6 +370,19 @@ function VerdictTag({ verdict }: { verdict: string }) {
   )
 }
 
+/** 一句的判断标签和结论原文 */
+function ClaimLine({ item }: { item: ChallengeItem }) {
+  return (
+    <>
+      <VerdictTag verdict={item.verdict} />
+      {/* 原文取自报告文档，是 Markdown：粗体、行内代码照样画出来；链接不画成链接，按钮里不能再套一个可点的东西 */}
+      <span className="min-w-0 flex-1 [overflow-wrap:anywhere]" data-challenge-text="">
+        <StyledSlice text={item.text} styles={inlineStyles(item.text)} from={0} to={item.text.length} links={false} />
+      </span>
+    </>
+  )
+}
+
 function ClaimRow({ item, open, onToggle, children }: {
   item: ChallengeItem; open: boolean; onToggle: () => void; children: ReactNode
 }) {
@@ -288,11 +393,7 @@ function ClaimRow({ item, open, onToggle, children }: {
               className="flex w-full min-w-0 items-start gap-1.5 rounded px-1 py-0.5 text-left text-2xs leading-relaxed hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[color:var(--accent)]">
         <ChevronRight size={11} aria-hidden className="mt-[3px] shrink-0 text-faint"
                       style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }} />
-        <VerdictTag verdict={item.verdict} />
-        {/* 原文取自报告文档，是 Markdown：粗体、行内代码照样画出来；链接不画成链接，按钮里不能再套一个可点的东西 */}
-        <span className="min-w-0 flex-1 [overflow-wrap:anywhere]" data-challenge-text="">
-          <StyledSlice text={item.text} styles={inlineStyles(item.text)} from={0} to={item.text.length} links={false} />
-        </span>
+        <ClaimLine item={item} />
       </button>
       {open && (
         <div id={detailId} className="mb-1 ml-4 mt-1 min-w-0 space-y-2 rounded border p-2" data-challenge-detail={item.unit}>
@@ -317,22 +418,43 @@ function ClaimDetail({ item, detail }: { item: ChallengeItem; detail: Detail }) 
     part.dataset.flash = 'focus'
     setTimeout(() => { if (part.dataset.flash === 'focus') delete part.dataset.flash }, 1600)
   }, [baseId])
+  // 点了「重试」，按钮在加载时就拿掉了：取到了焦点落到理由上，又没取到落到新的「重试」上，不掉到页面上
+  const retried = useRef(false)
+  const landing = useRef<HTMLElement | null>(null)
+  const land = useCallback((el: HTMLElement | null) => { landing.current = el }, [])
+  useEffect(() => {
+    if (!retried.current || (detail.status !== 'ok' && detail.status !== 'error')) return
+    retried.current = false
+    if (focusLost()) landing.current?.focus()
+  }, [detail.status])
   if (detail.status === 'error') {
     return (
       <div className="flex flex-wrap items-center gap-2 text-2xs" data-challenge-detail-state="error">
         <span role="alert" style={{ color: 'var(--st-waiting)' }}>{CHALLENGE_TEXT.failed}</span>
-        {detail.retry && <button type="button" className="btn btn-xs" onClick={detail.retry}>{CHALLENGE_TEXT.retry}</button>}
+        {detail.retry && (
+          <button ref={land} type="button" className="btn btn-xs"
+                  onClick={() => { retried.current = true; detail.retry?.() }}>
+            {CHALLENGE_TEXT.retry}
+          </button>
+        )}
       </div>
     )
   }
   if (detail.status !== 'ok') {
     return <div className="text-2xs text-faint" data-challenge-detail-state="loading">{CHALLENGE_TEXT.loading}</div>
   }
-  if (!claim) return <div className="text-2xs text-dim" data-challenge-detail-state="missing">{CHALLENGE_TEXT.claimMissing}</div>
+  if (!claim) {
+    return (
+      <div ref={land} tabIndex={-1} className={`text-2xs text-dim ${FOCUS_RING}`}
+           data-challenge-detail-state="missing">
+        {CHALLENGE_TEXT.claimMissing}
+      </div>
+    )
+  }
   const aliases = new Set(claim.queries.map((q) => q.alias))
   return (
     <>
-      <section data-challenge-detail-state="ok" data-challenge-rationale="">
+      <section ref={land} tabIndex={-1} className={FOCUS_RING} data-challenge-detail-state="ok" data-challenge-rationale="">
         <div className="mb-0.5 text-2xs font-medium text-faint">{CHALLENGE_TEXT.rationale}</div>
         <Rationale claim={claim} onJump={(alias) => (aliases.has(alias) ? jump(alias) : undefined)} />
       </section>

@@ -3343,7 +3343,8 @@ export const DUAL_CHECK_TEXT = {
 /**
  * 反方审稿节点：节点库说明、检查器、节点卡片摘要，以及审批卡上的反方审稿（run/ChallengeSummary.tsx）。
  * 四种判断全站只有这一种叫法：经受住、被削弱、被推翻、无法判断。判断由反方模型给出，不是系统核对。
- * 「出具会降档」只在正式运行、按降档处理时才说；探索运行不出具，不说任何和出具有关的话
+ * 「出具会降档」只在正式运行、有被推翻的结论、按降档处理时才说；探索运行不出具，不说任何和出具有关的话；
+ * 运行类别取不到时照实说取不到
  */
 export const CHALLENGE_TEXT = {
   description: '从反方立场复核上游报告的关键结论：另一个模型只读查库，逐句判断经受住、被削弱、被推翻还是无法判断',
@@ -3371,9 +3372,9 @@ export const CHALLENGE_TEXT = {
   },
   followSettings: '跟随设置',
   help: {
-    max_claims: '每份报告最多挑几句关键结论来审。留空则使用「设置 → 核查」中的值',
-    max_queries: '复核每句结论时最多执行几次查询。留空则使用「设置 → 核查」中的值',
-    timeout_s: '复核每句结论的时长上限，到时按已查到的结果给出判断。留空则使用「设置 → 核查」中的值',
+    max_claims: '每份报告最多挑几句关键结论来审。留空则使用「设置 → 偏好设置 → 核查」中的值',
+    max_queries: '复核每句结论时最多执行几次查询。留空则使用「设置 → 偏好设置 → 核查」中的值',
+    timeout_s: '复核每句结论的时长上限，到时按已查到的结果给出判断。留空则使用「设置 → 偏好设置 → 核查」中的值',
     on_refuted: '降档：被推翻的结论计入出具缺口，正式运行降档出具；只标注：在审批卡和运行记录中标出，不影响出具；'
       + '报错：本节点失败，运行停止',
   },
@@ -3385,13 +3386,15 @@ export const CHALLENGE_TEXT = {
     many: (n: number) => `上游有 ${formatNumber(n)} 个报告撰写节点，请选择要审的那一个`,
     missing: (id: string) => `${id}（已不在画布上）`,
     notUpstream: (label: string) => `${label}（不在上游）`,
+    wrongType: (label: string) => `${label}（不是报告撰写节点）`,
     missingHint: '所选节点已不在画布上，请重新选择',
     notUpstreamHint: '所选节点不在本节点上游，运行到这里时它还没有写出报告，请重新选择或调整连线',
+    wrongTypeHint: (type: string) => `所选节点是「${type}」节点，不是报告撰写节点，请重新选择`,
   },
   enabled: {
     follow: '跟随设置', on: '开启', off: '关闭',
     hint: {
-      follow: '使用「设置 → 核查」中「反方审稿 · 启用」的值',
+      follow: '使用「设置 → 偏好设置 → 核查」中「反方审稿 · 启用」的值',
       on: '无论设置如何都执行反方审稿',
       off: '不执行反方审稿，上游的结果原样交给下游，运行记录中记一条说明',
     },
@@ -3403,8 +3406,8 @@ export const CHALLENGE_TEXT = {
     providerDisabled: '（已停用）',
     modelFollow: '跟随设置',
     modelDefault: '留空则使用该接入的默认模型',
-    help: '接入和模型均未填写时，使用「设置 → 核查」中的核查模型；填写任一项后，整组以节点配置为准，不与设置合并。'
-      + '建议反方模型与撰写报告的模型不同，同一模型较难发现自身的错误',
+    help: '接入和模型均未填写时，使用「设置 → 偏好设置 → 核查」中的核查模型；填写任一项后，整组以节点配置为准，'
+      + '不与设置合并。建议反方模型与撰写报告的模型不同，同一模型较难发现自身的错误',
     byModel: (model: string, found: { name: string; enabled: boolean } | null | undefined, fallback: string | null | undefined) => (
       found && !found.enabled
         ? `只填了模型：「${model}」属于已停用的接入「${found.name}」，调用将失败。请启用该接入或选择其他接入`
@@ -3422,6 +3425,10 @@ export const CHALLENGE_TEXT = {
   degrade: '出具会降档',
   degradeHint: '被推翻的结论计入出具缺口，本次正式运行将降档出具',
   flagNote: '按节点设置，被推翻的结论只做标注，不影响出具档位',
+  /** 运行类别没取到：不知道是不是正式运行，照实说，并写出正式运行时的后果（旁边给重试） */
+  runClassFailed: '暂时无法确认运行类别；如为正式运行，被推翻的结论会使出具降档',
+  /** 审批里没带工件（服务端保存审稿记录失败）：每句都看不了理由和查询，整块说一次 */
+  noRecord: '反方审稿记录未保存，无法查看理由和查询',
   more: (n: number) => `另有 ${formatNumber(n)} 句未列出`,
   showAll: '显示全部',
   loading: '正在加载反方审稿…',

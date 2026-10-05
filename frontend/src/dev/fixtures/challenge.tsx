@@ -20,12 +20,18 @@ import fx from './challenge.json'
  * - ?syn=challenge-approval-many：十二句，条目只列前十句，「显示全部」从工件里补齐
  * - ?syn=challenge-approval-broken：工件取不到（检查脚本先答 404，再改成能取到，测重试）
  * - ?syn=challenge-approval-dense：同第一个，摆在 360px 的右栏里
+ * - ?syn=challenge-approval-clear / -clear-flag：正式运行，没有被推翻的结论（降档 / 只标注），两种都不写降档、不写只标注
+ * - ?syn=challenge-approval-explore-flag：探索运行配只标注，同样不说任何和出具有关的话
+ * - ?syn=challenge-approval-runfail：运行类别取不到（检查脚本先答 500），说明并可重试
+ * - ?syn=challenge-approval-dup：同 many，工件里补出来的一句和条目里的一句原文相同、unit 不同（工件由检查脚本合成）
+ * - ?syn=challenge-approval-norecord：同 many，审稿记录没存上（artifact 为 null）
  *
  * 运行类别（GET /api/runs/{id}）、工件（GET /api/artifacts/{id}）都由检查脚本用 page.route 伪造；直接打开时取不到，
  * 卡上照实不说降档、点开一句说无法获取。
  *
- * 检查器：?syn=challenge-inspector：一张虚构的图（两个上游报告、一个下游报告），选中反方审稿节点，旁边是同一张图的
- * 节点卡片和节点配置的实时内容。
+ * 检查器：选中反方审稿节点，旁边是同一张图的节点卡片和节点配置的实时内容。
+ * - ?syn=challenge-inspector：两个上游报告、一个下游报告
+ * - ?syn=challenge-inspector-chain：「初稿 → 终稿 → 反方审稿」，留空时审直接连着的终稿，反方模型和终稿的模型相同
  */
 
 const report = fx.report as unknown as ApprovalReport
@@ -52,6 +58,12 @@ function Card({ approval, name, dense = false }: { approval: Approval; name: str
 
 const RUNS = fx.runs
 const withChallenge = (c: Partial<ApprovalChallenge>): ApprovalReport => ({ ...report, challenge: { ...challenge, ...c } })
+const many = fx.many as unknown as ApprovalChallenge
+/** 没有被推翻的结论：同第一个用例去掉被推翻的那句，计数跟着改 */
+const clear: Partial<ApprovalChallenge> = {
+  counts: { stands: 1, weakened: 1, refuted: 0, inconclusive: 1 },
+  items: challenge.items.filter((it) => it.verdict !== 'refuted'),
+}
 
 // ---------------------------------------------------------------- 检查器
 
@@ -86,6 +98,24 @@ const WORKFLOW = {
   },
 } as unknown as Workflow
 
+/** 链式接法：初稿、终稿都在上游，直接连着的只有终稿。终稿和反方审稿写的是同一个模型 */
+const CHAIN = {
+  id: 'wf-challenge-chain', name: '月报（链式，预览）', description: '', tags: [], version: 1, is_template: false, status: 'draft',
+  graph: {
+    nodes: [
+      { id: 'input', type: 'input', position: at(0, 120), data: { label: '输入', config: { fields: [{ name: 'month', required: true }] } } },
+      { id: 'draft', type: 'report', position: at(260, 120), data: { label: '初稿', config: { instructions: '写初稿', model: 'spare-mini' } } },
+      { id: 'final', type: 'report', position: at(520, 120), data: { label: '终稿', config: { instructions: '改成终稿', model: 'writer-large' } } },
+      { id: 'critic', type: 'challenge', position: at(780, 120), data: { label: '反方审稿', config: { model: 'writer-large' } } },
+      { id: 'out', type: 'output', position: at(1040, 120), data: { label: '输出', config: {} } },
+    ],
+    edges: [
+      { source: 'input', target: 'draft' }, { source: 'draft', target: 'final' },
+      { source: 'final', target: 'critic' }, { source: 'critic', target: 'out' },
+    ],
+  },
+} as unknown as Workflow
+
 const nodeTypes = { card: NodeCard }
 
 /** 同一张图的节点卡片：看反方审稿节点的摘要跟着配置变 */
@@ -109,16 +139,16 @@ function ConfigView() {
   )
 }
 
-function InspectorCase() {
+function InspectorCase({ name, workflow }: { name: string; workflow: Workflow }) {
   // 首次渲染前装好图和接入：检查器、卡片一挂上就是选中反方审稿节点的样子
   useState(() => {
     useCatalog.setState({ providers: PROVIDERS })
-    useStudio.getState().load(WORKFLOW)
+    useStudio.getState().load(workflow)
     useStudio.getState().select('critic')
     return true
   })
   return (
-    <div className="flex min-h-screen flex-col md:h-screen md:flex-row" data-fixture="challenge-inspector">
+    <div className="flex min-h-screen flex-col md:h-screen md:flex-row" data-fixture={name}>
       <div className="w-full shrink-0 border-b bg-panel md:h-full md:w-[360px] md:border-b-0 md:border-r" data-challenge-inspector="">
         <Inspector />
       </div>
@@ -146,8 +176,7 @@ export const cases: Record<string, () => JSX.Element> = {
     <Card name="challenge-approval-none" approval={approvalOf('ap-chal-4', RUNS.none, 'formal', report)} />
   ),
   'challenge-approval-many': () => (
-    <Card name="challenge-approval-many"
-          approval={approvalOf('ap-chal-5', RUNS.many, 'formal', { ...report, challenge: fx.many as unknown as ApprovalChallenge })} />
+    <Card name="challenge-approval-many" approval={approvalOf('ap-chal-5', RUNS.many, 'formal', { ...report, challenge: many })} />
   ),
   'challenge-approval-broken': () => (
     <Card name="challenge-approval-broken"
@@ -156,5 +185,28 @@ export const cases: Record<string, () => JSX.Element> = {
   'challenge-approval-dense': () => (
     <Card name="challenge-approval-dense" dense approval={approvalOf('ap-chal-7', RUNS.formal, 'formal', withChallenge({}))} />
   ),
-  'challenge-inspector': () => <InspectorCase />,
+  'challenge-approval-clear': () => (
+    <Card name="challenge-approval-clear" approval={approvalOf('ap-chal-8', RUNS.clear, 'formal', withChallenge(clear))} />
+  ),
+  'challenge-approval-clear-flag': () => (
+    <Card name="challenge-approval-clear-flag"
+          approval={approvalOf('ap-chal-9', RUNS.clearFlag, 'formal', withChallenge({ ...clear, on_refuted: 'flag' }))} />
+  ),
+  'challenge-approval-explore-flag': () => (
+    <Card name="challenge-approval-explore-flag"
+          approval={approvalOf('ap-chal-10', RUNS.exploreFlag, 'exploratory', withChallenge({ on_refuted: 'flag' }))} />
+  ),
+  'challenge-approval-runfail': () => (
+    <Card name="challenge-approval-runfail" approval={approvalOf('ap-chal-11', RUNS.runfail, 'formal', withChallenge({}))} />
+  ),
+  'challenge-approval-dup': () => (
+    <Card name="challenge-approval-dup"
+          approval={approvalOf('ap-chal-12', RUNS.dup, 'formal', { ...report, challenge: { ...many, artifact: 'd'.repeat(64) } })} />
+  ),
+  'challenge-approval-norecord': () => (
+    <Card name="challenge-approval-norecord"
+          approval={approvalOf('ap-chal-13', RUNS.norecord, 'formal', { ...report, challenge: { ...many, artifact: null } })} />
+  ),
+  'challenge-inspector': () => <InspectorCase name="challenge-inspector" workflow={WORKFLOW} />,
+  'challenge-inspector-chain': () => <InspectorCase name="challenge-inspector-chain" workflow={CHAIN} />,
 }

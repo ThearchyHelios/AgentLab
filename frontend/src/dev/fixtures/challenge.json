@@ -6,7 +6,13 @@
   "explore": "run-chal-explore",
   "none": "run-chal-none",
   "many": "run-chal-many",
-  "broken": "run-chal-broken"
+  "broken": "run-chal-broken",
+  "clear": "run-chal-clear",
+  "clearFlag": "run-chal-clear-flag",
+  "exploreFlag": "run-chal-explore-flag",
+  "runfail": "run-chal-runfail",
+  "dup": "run-chal-dup",
+  "norecord": "run-chal-norecord"
  },
  "report": {
   "node_id": "write",

@@ -3507,7 +3507,8 @@ export interface ChallengeItem {
 export interface ApprovalChallenge {
   counts: ChallengeCounts
   items: ChallengeItem[]
-  artifact: string
+  /** challenge_artifact 工件 id。服务端保存审稿记录失败时为 null：判断照样有，理由和查询看不了 */
+  artifact: string | null
   on_refuted?: 'degrade' | 'flag' | (string & {})
 }
 
