@@ -21,7 +21,8 @@ SQL，就跟着差异说明进了审批卡、对照工件和目录日志。完�
 缺口；b、neither、没选的写进产出的 issuance_gaps，成果节点的出具契约据此降档（on_reject 为 fail 时节点直接失败）。
 两边只差一个方面、又对得上数据目录事实的，选择写进数据目录（engine/dual_check_facts.py，指标自己的筛选范围不写）。
 选了会怎样要在卡上看得出：payload 在约定的几项之外带上实际生效的 on_reject，摘要里每个指标带 catalog——选 a、选 b
-按发起审批时的目录各会往目录里写什么、不写的为什么（dual_check_facts.preview，和真写同一套判断）。
+按发起审批时的目录各会往目录里写什么、不写的为什么（dual_check_facts.preview，和真写同一套判断）；几个指标落到目录
+同一项上时每种选择组合合起来会怎样写（preview_joint），放在对照工件的 catalog_joint 里。
 盲算触顶、出错、交不出数，或者输入本身没法单独复算的指标按「无法复算」记缺口，发 dual_check_unchecked。
 
 **产出的状态。** 全部一致是 agreed；没有不一致、但有无法复算的：一个都没核成是 unchecked，核成了一部分是 partial；
@@ -57,7 +58,7 @@ from app.db.models import DataSource
 from app.engine import recompute
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
-from app.engine.dual_check_facts import preview, record_choices
+from app.engine.dual_check_facts import preview, preview_joint, record_choices
 from app.engine.evidence import build_catalog, is_number, next_exec
 from app.engine.expressions import ExpressionError, _cell_call, _chain_root, cell_value, column_kind, numeric_text, \
     parse_expression
@@ -807,6 +808,8 @@ def _slim(outcome: Any) -> dict[str, Any]:
         "row": cell.get("row"), "column": cell.get("column"), "eid": cell.get("eid"),
         "sql": query.get("sql"), "source": query.get("source"),
         "rationale": (outcome.result or {}).get("rationale") or "",
+        # 理由组装成的文档（evidence.compose_doc）：数字有出处的挂着盲算自己查询的格子，裸数字已标出。审批卡照它画理由
+        "rationale_doc": outcome.rationale if isinstance(outcome.rationale, dict) else None,
         "queries": [{k: q.get(k) for k in ("alias", "artifact", "sql", "row_count", "truncated", "source")}
                     for q in outcome.queries],
         "notes": list(outcome.notes),
@@ -966,7 +969,8 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
                 {"path": i["path"], "value": (results.get(i["key"]) or {}).get("value"),
                  "sql": (results.get(i["key"]) or {}).get("sql"), "source": (results.get(i["key"]) or {}).get("source"),
                  "alias": (results.get(i["key"]) or {}).get("alias"),
-                 "rationale": (results.get(i["key"]) or {}).get("rationale") or ""}
+                 "rationale": (results.get(i["key"]) or {}).get("rationale") or "",
+                 "rationale_doc": (results.get(i["key"]) or {}).get("rationale_doc")}
                 for i in row["inputs"]]},
             "diff": {"equivalent": merged["equivalent"],
                      "items": [{"aspect": i.get("aspect"), "text": i.get("text")} for i in merged["items"]],
@@ -991,6 +995,13 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
             "catalog": preview(facts[row["metric_id"]], info.get("schema"), info.get("notes")),
         })
     content = {"metrics": metrics, "model": checked.get("model"), "same_model": bool(checked.get("same_model"))}
+    # 同一次裁决里几个指标落到数据目录的同一项上时，按各自的选择合起来写（dual_check_facts._merged）：每个指标单独的
+    # 预告说不准，把每种组合的结果都算好放进对照工件（payload 里放不下，审批卡打开时就取工件），卡上按当前的选择取
+    catalogs = {name: (info.get("schema"), info.get("notes") or {}) for name, info in infos.items()}
+    joint = await asyncio.to_thread(preview_joint, [facts[r["metric_id"]] for r in rows if r["metric_id"] in facts],
+                                    catalogs)
+    if joint:
+        content["catalog_joint"] = joint
     try:
         artifact = await artifact_store.put_json(content, kind="dual_check", run_id=ctx.run.run_id,
                                                  node_id=ctx.node.id, meta={"metrics": len(metrics)})

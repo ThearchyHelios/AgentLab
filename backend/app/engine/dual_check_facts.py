@@ -36,10 +36,11 @@ is_test = 0、is_valid = 1、deleted_at IS NULL）；只涉及一张表。拿不
 也不写。
 
 **预告。** 审批卡上要让审核人看得出选了之后会往目录里写什么（preview）：按发起审批时的目录，选原流程、选盲算各会
-写什么、不写的为什么。和真写是同一套判断（derive 认事实、_plan 对目录、_revives 认驳回），所以只在两处可能和最后写
-的不一样：审批停下期间目录被人改了；同一次裁决里几个指标落到同一项上（上一段）——写进去的是合起来的说法，预告说会
-写的也可能因为说法互相矛盾、和已有条件的关系拿不准、合起来又成了驳回过的说法而不写。反过来不会：预告说不写的，
-不会因为和别的指标并成一项被写进去。
+写什么、不写的为什么。认出了事实、只是被目录挡下（已确认、驳回过、和已有条件合不起来）的那一边也带上写到哪张表的
+哪一项、本来要写什么，卡上才认得出它和别的指标是不是落到同一项上。同一次裁决里几个指标落到同一项上时，写进去的是
+合起来的说法（上一段），单个指标的预告说不准：preview_joint 把这几个指标各自选哪一边的每种组合都按真写的办法算一遍
+（_merged 归拢、_screen 拿掉驳回的、_plan 对目录），卡上按各指标当前的选择取对应的那一种。和真写是同一套判断、同一句
+原因，只有审批停下期间目录被人改了时才会和最后写的不一样。组合太多的（JOINT_LIMIT）那一项不预告，卡上有条件地说。
 
 catalog.save_patch 不收备注，这里用它的同一套原料（read_entry、apply_patch、write_entry 的乐观锁）写，只多把备注放进项里。
 """
@@ -73,6 +74,9 @@ ASPECT_LABEL = {
 _VERB = {"count": "计数", "sum": "求和", "avg": "求平均"}
 #: 写入时版本对不上（别人刚改过这张表）最多重试几次
 _RETRIES = 2
+#: 同一次裁决里几个指标落到同一项上时，最多预告多少种组合（preview_joint）。每个指标两边都落在这一项上时是
+#: 3 的指标数次方：四个指标 72 种还在里面，再多的那一项不预告，审批卡回到按其余指标当前的选择有条件地说
+JOINT_LIMIT = 128
 
 #: 无效记录的取值：被排除的取值（或码值表里它的意思）里有这些词，才算在排除无效记录
 _INVALID_WORDS = frozenset({
@@ -94,7 +98,7 @@ class Fact:
     """要写进目录的一项：哪个数据源的哪张表、哪一项、写什么。metric、choice 只用来写备注和说明；sql、dialect 是被采纳
     那一边的写法和方言，有效记录条件和目录里已有的条件合并时要看它还按哪些条件筛了。同一次裁决里几个指标落到同一项上
     时并成一项：members 是并进来的每个指标各自的那一项（各带自己的说法，审批卡上各自的预告就是按它算的），value 是
-    合起来之后的说法；单个指标的 members 为空。"""
+    合起来之后的说法；单个指标的 members 为空。metric_id 是指标 ID：几个指标并成一项时，预告按它说清每个指标的结果。"""
 
     source: str
     table: str
@@ -105,6 +109,7 @@ class Fact:
     sql: str = ""
     dialect: str | None = None
     members: tuple[Fact, ...] = ()
+    metric_id: str = ""
 
 
 def _members(fact: Fact) -> tuple[Fact, ...]:
@@ -160,7 +165,8 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
     dialect = candidate.get("dialect")
     return Fact(source=str(candidate.get("source") or ""), table=resolved, item=key, value=value, metric=name,
                 choice=str(side), sql=str(sql.get(side) or ""),
-                dialect=dialect if isinstance(dialect, str) else None), None
+                dialect=dialect if isinstance(dialect, str) else None,
+                metric_id=str(candidate.get("metric_id") or "")), None
 
 
 def _business_date(item: Mapping[str, Any], side: str) -> tuple[tuple[str, str, Any] | None, str | None]:
@@ -631,33 +637,35 @@ def _rejected_text(fact: Fact, rejected: Any, members: Sequence[Fact]) -> str:
             "的选择相反，未写入。如需更改，请到数据目录中修改")
 
 
-def _screen(notes: Mapping[str, Any], fact: Fact) -> tuple[Fact | None, list[str]]:
-    """几个指标并成的一项，先拿掉自己采纳的说法曾被人工驳回的指标：(剩下的重新并成的一项, 拿掉的为什么不写)，一个
-    都不剩时前者为 None。单个指标的、这一项没被驳回过的原样返回，由 _plan 照常判断。
+def _screen(notes: Mapping[str, Any], fact: Fact) -> tuple[Fact | None, list[Fact], list[str]]:
+    """几个指标并成的一项，先拿掉自己采纳的说法曾被人工驳回的指标：(剩下的重新并成的一项, 拿掉的指标, 没写的原因)，
+    一个都不剩、或者剩下的又合不起来时前者为 None；原因先是拿掉的那几个的（一条），剩下的合不起来时再跟一条。单个指标
+    的、这一项没被驳回过的原样返回，由 _plan 照常判断。
 
     审批卡上每个指标的预告是按它自己的说法单独算的（preview → _plan），在那里被驳回检查拦下、卡上写着「不写」的，
     并进来以后也得拦下。只拿合起来的整句去比，「status <> 'refunded'」和别的条件 AND 在一起就不再等于驳回的那句，
     会被写成人工确认，和卡上说的正相反。拿掉的指标照实说原因（和它的预告同一句话），其余的照写，也和各自的预告一致。"""
     rejected, said = _rejected(notes, fact.item)
     if not rejected or not fact.members:
-        return fact, []
+        return fact, [], []
     out: list[Fact] = []
     kept: list[Fact] = []
     for member in fact.members:
         (out if _revives(member, said) else kept).append(member)
     if not out:
-        return fact, []
+        return fact, [], []
     reasons = [_rejected_text(fact, said, out)]
     if not kept:
-        return None, reasons
+        return None, out, reasons
     narrowed, why = _merged(kept)
-    return narrowed, reasons if why is None else [*reasons, why]
+    return narrowed, out, reasons if why is None else [*reasons, why]
 
 
 async def record_choices(candidates: list[Mapping[str, Any]], *, run_id: str, node_title: str,
                          actor: str | None) -> dict[str, list[dict[str, Any]]]:
-    """把审核人的选择写进数据目录：{written: [{source, table, item}], skipped: [{reason}]}。永远不抛：数据源没了、
-    目录写不进去，都落在 skipped 里照实说。
+    """把审核人的选择写进数据目录：{written: [{source, table, item, value}], skipped: [{reason}]}。value 是真写进去的
+    说法（和已有条件合起来的就是合起来的整句），审批卡上的预告说「会记为」的就是它。永远不抛：数据源没了、目录写不
+    进去，都落在 skipped 里照实说。
 
     先把每个候选认成目录项，再按（数据源、表、项）归拢成一项（_merged：说法一样的、有效记录条件合起来写，说法
     不同的整组不写），逐项写（_write：按读到的目录先拿掉各自带回驳回说法的指标，其余的照写）。"""
@@ -690,24 +698,25 @@ async def record_choices(candidates: list[Mapping[str, Any]], *, run_id: str, no
         if fact is None:
             skipped.append({"reason": why})
             continue
-        done, reasons = await _record(fact, run_id=run_id, node_title=node_title, actor=actor)
-        if done:
-            written.append({"source": fact.source, "table": fact.table, "item": fact.item})
+        value, reasons = await _record(fact, run_id=run_id, node_title=node_title, actor=actor)
+        if value is not None:
+            written.append({"source": fact.source, "table": fact.table, "item": fact.item, "value": value})
         skipped += [{"reason": r} for r in reasons]
     return {"written": written, "skipped": skipped}
 
 
-async def _record(fact: Fact, *, run_id: str, node_title: str, actor: str | None) -> tuple[bool, list[str]]:
-    """写一项：(写了没有, 没写的原因)。几个指标并成的一项可能写了、同时有几个指标被拿出来没写，原因照样交回。"""
+async def _record(fact: Fact, *, run_id: str, node_title: str, actor: str | None) -> tuple[Any, list[str]]:
+    """写一项：(写进去的说法，没写为 None, 没写的原因)。几个指标并成的一项可能写了、同时有几个指标被拿出来没写，原因
+    照样交回。"""
     try:
         async with SessionLocal() as session:
             row = (await session.execute(select(DataSource).where(DataSource.name == fact.source))).scalar_one_or_none()
             if row is None:
-                return False, [f"数据源「{fact.source}」已不存在，指标{_names(_members(fact))}的选择未写入数据目录"]
+                return None, [f"数据源「{fact.source}」已不存在，指标{_names(_members(fact))}的选择未写入数据目录"]
             return await _write(session, row, fact, run_id=run_id, node_title=node_title, actor=actor)
     except Exception:  # noqa: BLE001 - 目录写不进去不能毁掉审批的结果：缺口照样按选择记
         logger.exception("双盲复算的选择写入数据目录失败（数据源 %s）", fact.source)
-        return False, [f"指标{_names(_members(fact))}的选择写入数据目录时出错，未写入"]
+        return None, [f"指标{_names(_members(fact))}的选择写入数据目录时出错，未写入"]
 
 
 def _plan(notes: Mapping[str, Any], fact: Fact, tables: Mapping[str, Any] | None) -> tuple[Any, str | None]:
@@ -767,7 +776,9 @@ def preview(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None
 
     candidate 同 derive（choice 不用给）；notes 是这个数据源的目录（{表名: notes}）。返回 {a: …, b: …}，每边是
     {write: true, source, table, item, value}（value 是真要写进去的说法：和目录里已有的有效记录条件合起来的，是合起来
-    之后的整句）或 {write: false, reason}。和恢复后真写是同一套判断，只在模块说明里说的两处可能不一样。永远不抛。"""
+    之后的整句）或 {write: false, reason}；认出了事实、只是被目录挡下的不写，照样带上 source、table、item 和本来要写
+    的 value（这个指标自己的说法）——卡上据此认出几个指标落到同一项上。这个指标单独落在这一项上时，reason 和真写时
+    跳过的原因一字不差；和别的指标落到同一项上时看 preview_joint。永远不抛。"""
     notes = notes or {}
     tables = schema_cache.get("tables") if isinstance(schema_cache, Mapping) else None
     out: dict[str, dict[str, Any]] = {}
@@ -780,15 +791,87 @@ def preview(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None
         except Exception:  # noqa: BLE001 - 预告算不出来不能拦住审批：照实说，以写入后的结果为准
             logger.exception("双盲复算预告数据目录的写入失败（指标 %s）", candidate.get("metric"))
             fact, why = None, f"指标「{candidate.get('metric')}」的选择核对数据目录时出错，无法预告是否写入"
-        out[side] = {"write": True, "source": fact.source, "table": fact.table, "item": fact.item, "value": value} \
-            if fact is not None and why is None else {"write": False, "reason": why}
+        if fact is None:
+            out[side] = {"write": False, "reason": why}
+            continue
+        where = {"source": fact.source, "table": fact.table, "item": fact.item}
+        out[side] = {"write": True, **where, "value": value} if why is None else \
+            {"write": False, **where, "value": fact.value, "reason": why}
+    return out
+
+
+def _joint_outcome(notes: Mapping[str, Any], members: list[Fact], tables: Mapping[str, Any] | None
+                   ) -> dict[str, dict[str, Any]]:
+    """几个指标落到同一项上、各按自己的选择并成一项时，每个指标的结果：{指标 ID: {write: true, value} 或 {write: false,
+    reason}}。和 record_choices 逐步一样：_merged 归拢（说法不同的整组不写），_screen 拿掉带回驳回说法的（它们说驳回
+    那一句，剩下的合不起来时说合不起来的那一句），剩下的按 _plan 对目录（写的是同一个值，不写的是同一句原因）。"""
+    fact, why = _merged(members)
+    if fact is None:
+        return {m.metric_id: {"write": False, "reason": why} for m in members}
+    kept, out, reasons = _screen(notes, fact)
+    result = {m.metric_id: {"write": False, "reason": reasons[0]} for m in out}
+    rest = [m for m in members if m.metric_id not in result]
+    if kept is None:
+        result.update({m.metric_id: {"write": False, "reason": reasons[-1]} for m in rest})
+        return result
+    value, why = _plan(notes, kept, tables)
+    result.update({m.metric_id: {"write": False, "reason": why} if why is not None else {"write": True, "value": value}
+                   for m in rest})
+    return result
+
+
+def preview_joint(candidates: Sequence[Mapping[str, Any]],
+                  catalogs: Mapping[str, tuple[Mapping[str, Any] | None, Mapping[str, Mapping[str, Any]]]]
+                  ) -> list[dict[str, Any]]:
+    """同一次裁决里几个指标落到同一项上时的预告：[{source, table, item, members: [{metric_id, choice}], outcomes:
+    {指标 ID: {write: true, value} 或 {write: false, reason}}}]，每条是一种组合（members 是按各自的选择落到这一项上的
+    指标，照候选的先后，至少两个）。
+
+    candidates 照节点交给真写的先后（不一致的指标的先后），带 metric_id，不带 choice；catalogs 是 {数据源名: (表结构,
+    {表名: notes})}，同 preview 的两个参数。每个指标的两边先各按 derive 认出落到哪一项（同 preview），落到同一项上的
+    几个指标，每种「谁选了哪一边」的组合按 _joint_outcome 算一遍：真写时这几个指标就是这样被归拢、写或不写的。组合超过
+    JOINT_LIMIT 的那一项整项不预告。永远不抛：算不出来的那一项不预告。"""
+    from itertools import product
+
+    landed: dict[tuple[str, str, str], dict[int, list[tuple[str, Fact]]]] = {}
+    for index, candidate in enumerate(candidates):
+        schema, notes = catalogs.get(str(candidate.get("source") or ""), (None, {}))
+        for side in SIDE_LABEL:
+            try:
+                fact, _ = derive({**candidate, "choice": side}, schema, notes)
+            except Exception:  # noqa: BLE001 - 认不出就当这一边落不到任何一项上，同 preview 照实不说
+                fact = None
+            if fact is not None:
+                landed.setdefault((fact.source, fact.table, fact.item), {}).setdefault(index, []).append((side, fact))
+    out: list[dict[str, Any]] = []
+    budget = JOINT_LIMIT
+    for (source, table, item), by_metric in landed.items():
+        if len(by_metric) < 2:
+            continue
+        options = [[None, *sides] for _, sides in sorted(by_metric.items())]
+        combos = [[c for c in combo if c is not None] for combo in product(*options)]
+        combos = [c for c in combos if len(c) >= 2]
+        if len(combos) > budget:
+            continue
+        budget -= len(combos)
+        schema, notes = catalogs.get(source, (None, {}))
+        tables = schema.get("tables") if isinstance(schema, Mapping) else None
+        try:
+            entries = [{"source": source, "table": table, "item": item,
+                        "members": [{"metric_id": fact.metric_id, "choice": side} for side, fact in combo],
+                        "outcomes": _joint_outcome((notes or {}).get(table) or {}, [fact for _, fact in combo], tables)}
+                       for combo in combos]
+        except Exception:  # noqa: BLE001 - 预告算不出来不能拦住审批：这一项不预告，卡上有条件地说
+            logger.exception("双盲复算预告几个指标落到同一项上的写入失败（%s 的 %s）", table, item)
+            continue
+        out.extend(entries)
     return out
 
 
 async def _write(session: Any, row: DataSource, fact: Fact, *, run_id: str, node_title: str,
                  actor: str | None) -> tuple[bool, list[str]]:
-    """写一项：(写了没有, 没写的原因)。几个指标并成的一项先按读到的目录拿掉各自带回驳回说法的指标（_screen），写什么、
-    写不写再由 _plan 定；备注只列真写进去的指标。版本对不上（别人刚改过）重读再来。"""
+    """写一项：(写进去的说法，没写为 None, 没写的原因)。几个指标并成的一项先按读到的目录拿掉各自带回驳回说法的指标
+    （_screen），写什么、写不写再由 _plan 定；备注只列真写进去的指标。版本对不上（别人刚改过）重读再来。"""
     label = catalog.TABLE_FIELD_LABEL.get(fact.item, fact.item)
     tables = (row.schema_cache or {}).get("tables") if isinstance(row.schema_cache, dict) else None
     reasons: list[str] = []
@@ -796,19 +879,19 @@ async def _write(session: Any, row: DataSource, fact: Fact, *, run_id: str, node
         entry = await catalog.read_entry(session, row.id, fact.table)
         notes = entry.notes if entry else {}
         version = entry.version if entry else 0
-        kept, reasons = _screen(notes, fact)
+        kept, _, reasons = _screen(notes, fact)
         if kept is None:
-            return False, reasons
+            return None, reasons
         value, why = _plan(notes, kept, tables)
         if why is not None:
-            return False, [*reasons, why]
+            return None, [*reasons, why]
         note = note_of(kept, run_id=run_id, node_title=node_title)
         at = catalog.now_iso()
         try:
             merged = catalog.apply_patch(notes, [{"path": kept.item, "value": value, "reason": note}],
                                          table=kept.table, tables=tables, at=at)
         except catalog.CatalogInvalid as e:
-            return False, [*reasons, f"「{kept.table}」的{label}未写入数据目录：{e}"]
+            return None, [*reasons, f"「{kept.table}」的{label}未写入数据目录：{e}"]
         # 不论原来是谁提的：这一项现在出自人的选择，记为人工填写、已确认，备注写明出处
         merged[kept.item] = catalog.make_item(value, "human", "confirmed", note=note, at=at)
         try:
@@ -817,9 +900,9 @@ async def _write(session: Any, row: DataSource, fact: Fact, *, run_id: str, node
             await session.rollback()
             continue
         except catalog.CatalogInvalid as e:
-            return False, [*reasons, f"「{kept.table}」的{label}未写入数据目录：{e}"]
-        return True, reasons
-    return False, [*reasons, f"「{fact.table}」的数据目录正被修改，{label}未能写入，请稍后在数据目录中确认"]
+            return None, [*reasons, f"「{kept.table}」的{label}未写入数据目录：{e}"]
+        return value, reasons
+    return None, [*reasons, f"「{fact.table}」的数据目录正被修改，{label}未能写入，请稍后在数据目录中确认"]
 
 
-__all__ = ["FACT_ITEMS", "Fact", "derive", "note_of", "preview", "record_choices"]
+__all__ = ["FACT_ITEMS", "JOINT_LIMIT", "Fact", "derive", "note_of", "preview", "preview_joint", "record_choices"]
