@@ -495,7 +495,8 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   )
 
   // 审批质询：划选一段原文，浮出「质询」，问的是选中的这段（带上它起头的那一句）
-  const [pick, dropPick] = useSelectionPick(rootRef, ask)
+  const pickAnchor = useRef<HTMLDivElement>(null)
+  const [pick, dropPick] = useSelectionPick(rootRef, pickAnchor, ask)
   const askPick = () => {
     if (!pick || !inquiry || !runId || !report) return
     // 浮出的按钮点完就没了：Esc 之后焦点回到那一句的「质询」
@@ -511,6 +512,22 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
 
   return (
     <div ref={rootRef} data-evidence-doc="" className="min-w-0">
+      {ask && (
+        // 划选原文浮出的「质询」挂在文档里（高度为 0 的定位锚点下面，按锚点算坐标），不挂到页面末尾：画布上的审批浮层
+        // 按下在它外面就收起，挂在外面的按钮一按，浮层连同报告一起收掉。也因此会被报告框裁切，位置按可见范围摆（见
+        // useSelectionPick）
+        <div ref={pickAnchor} className="relative" data-inquiry-pick-anchor="">
+          {pick && (
+            // 按下时不抢焦点、不清掉选区：点下去才读选区
+            <button type="button" className="btn btn-xs absolute z-20 whitespace-nowrap shadow-elev-3" data-inquiry-selection=""
+                    style={{ left: pick.left, top: pick.top }} aria-label={INQUIRY_TEXT.askSelection}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={(e) => { e.stopPropagation(); askPick() }}>
+              <MessageCircleQuestion size={11} aria-hidden /> {INQUIRY_TEXT.ask}
+            </button>
+          )}
+        </div>
+      )}
       <p id={summaryId} className="sr-only" data-evidence-summary="">{summary}</p>
       <div className="sr-only" aria-live="polite" aria-atomic="true">{announce}</div>
       {tally && (counts.total > 0 || counts.other > 0 || !!counts.suspect || !!claims?.total) && (
@@ -555,32 +572,46 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
       )}
       {mode === 'dock' && panelNode && dock && createPortal(panelNode, dock)}
       {mode !== 'inline' && mode !== 'dock' && panelNode && createPortal(panelNode, document.body)}
-      {pick && createPortal(
-        // 按下时不抢焦点、不清掉选区：点下去才读选区
-        <button type="button" className="btn btn-xs fixed z-[70] shadow-elev-3" data-inquiry-selection=""
-                style={{ left: pick.left, top: pick.top }} aria-label={INQUIRY_TEXT.askSelection}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={(e) => { e.stopPropagation(); askPick() }}>
-          <MessageCircleQuestion size={11} aria-hidden /> {INQUIRY_TEXT.ask}
-        </button>,
-        document.body,
-      )}
     </div>
   )
 })
 
-/** 划选的一段原文：要问的字、它起头的那一句、浮出按钮的位置（视口坐标） */
+/** 划选的一段原文：要问的字、它起头的那一句、浮出按钮的位置（相对定位锚点） */
 interface SelectionPick { quote: string; unit: string | null; left: number; top: number }
-/** 浮出按钮的大致尺寸：放在选区末尾下方，贴边时收进视口，下方放不下时放到选区上方 */
+/** 浮出按钮的大致尺寸（宁大勿小）：放在选区末尾下方，贴边时收进可见范围，下方放不下时放到选区上方 */
 const PICK_W = 64
 const PICK_H = 26
+/** 按钮和选区、和可见范围边上留的空 */
+const PICK_GAP = 6
 
 /**
- * 报告正文里划选了一段原文：返回要问的字和浮出按钮的位置，选区收起、移出正文时为 null。只认报告正文里的字——栏内展开
- * 的证据面板也在这个容器里，那里的字不算。要问的字按选区克隆出来算，去掉句末徽标、「无证据」小标签、读屏文字和
- * 「质询」本身（它们在 DOM 里，却不是报告的原文）
+ * 一个元素眼下看得见的范围（视口坐标）：视口，再和每一层会裁切内容的祖先（overflow 不是 visible 的，比如审批卡里
+ * 限高滚动的报告框）取交集。浮出的按钮挂在文档里，超出这个范围的部分会被裁掉
  */
-function useSelectionPick(root: RefObject<HTMLElement | null>, enabled: boolean): [SelectionPick | null, () => void] {
+function visibleBox(el: Element): { top: number; bottom: number; left: number; right: number } {
+  const box = { top: 0, left: 0, bottom: window.innerHeight, right: window.innerWidth }
+  for (let p: Element | null = el; p && p !== document.documentElement; p = p.parentElement) {
+    const style = getComputedStyle(p)
+    if (style.overflowX === 'visible' && style.overflowY === 'visible') continue
+    const r = p.getBoundingClientRect()
+    box.top = Math.max(box.top, r.top)
+    box.left = Math.max(box.left, r.left)
+    box.bottom = Math.min(box.bottom, r.bottom)
+    box.right = Math.min(box.right, r.right)
+  }
+  return box
+}
+
+/**
+ * 报告正文里划选了一段原文：返回要问的字和浮出按钮的位置，选区收起、移出正文、滚出可见范围时为 null。只认报告正文
+ * 里的字——栏内展开的证据面板也在这个容器里，那里的字不算。要问的字按选区克隆出来算，去掉句末徽标、「无证据」小标签、
+ * 读屏文字和「质询」本身（它们在 DOM 里，却不是报告的原文）。
+ *
+ * 位置相对 anchor（文档里高度为 0 的定位锚点）算：按钮挂在文档里，会被限高滚动的报告框裁切，所以按可见范围摆——
+ * 默认在选区末尾下方，下方放不下放到选区上方，左右收进文档的宽度（不把报告框撑出横向滚动）和可见范围
+ */
+function useSelectionPick(root: RefObject<HTMLElement | null>, anchor: RefObject<HTMLElement | null>,
+  enabled: boolean): [SelectionPick | null, () => void] {
   const [pick, setPick] = useState<SelectionPick | null>(null)
   useEffect(() => {
     if (!enabled) { setPick(null); return }
@@ -588,8 +619,9 @@ function useSelectionPick(root: RefObject<HTMLElement | null>, enabled: boolean)
     const read = () => {
       frame = 0
       const el = root.current
+      const origin = anchor.current
       const sel = document.getSelection()
-      if (!el || !sel || sel.isCollapsed || !sel.rangeCount) { setPick(null); return }
+      if (!el || !origin || !sel || sel.isCollapsed || !sel.rangeCount) { setPick(null); return }
       const range = sel.getRangeAt(0)
       const at = (n: Node) => (n instanceof Element ? n : n.parentElement)
       const inside = (x: Element | null) => !!x && el.contains(x) && !!x.closest('[data-block]') && !x.closest('[data-evidence-panel]')
@@ -602,17 +634,27 @@ function useSelectionPick(root: RefObject<HTMLElement | null>, enabled: boolean)
       const rects = range.getClientRects()
       const last = rects[rects.length - 1] ?? range.getBoundingClientRect()
       const first = rects[0] ?? last
-      const below = last.bottom + 6 + PICK_H <= window.innerHeight
+      const view = visibleBox(el)
+      // 选区整个滚出了可见范围：按钮也不留（滚回来再量出来）
+      if (last.bottom <= view.top || first.top >= view.bottom) { setPick(null); return }
+      const doc = el.getBoundingClientRect()
+      const lo = Math.max(doc.left, view.left)
+      const hi = Math.min(doc.right, view.right) - PICK_W
+      const x = Math.max(lo, Math.min(last.right - PICK_W / 2, hi))
+      const fitsBelow = last.bottom + PICK_GAP + PICK_H <= view.bottom
+      const fitsAbove = first.top - PICK_GAP - PICK_H >= view.top
+      const y = fitsBelow || !fitsAbove ? Math.min(last.bottom + PICK_GAP, Math.max(view.top, view.bottom - PICK_H))
+        : first.top - PICK_GAP - PICK_H
+      const o = origin.getBoundingClientRect()
       const next: SelectionPick = {
         quote, unit: start?.closest('[data-ev-unit]')?.getAttribute('data-ev-unit') ?? null,
-        left: Math.max(8, Math.min(last.right - PICK_W / 2, window.innerWidth - PICK_W - 8)),
-        top: below ? last.bottom + 6 : Math.max(8, first.top - PICK_H - 6),
+        left: Math.round(x - o.left), top: Math.round(y - o.top),
       }
       // 滚动时每一帧都会量一次：没变就不换对象，整份报告不跟着重画
       setPick((cur) => (cur && cur.quote === next.quote && cur.unit === next.unit && cur.left === next.left && cur.top === next.top
         ? cur : next))
     }
-    // 选区一变、页面一滚（报告在可滚动的卡片里）都重新量：按钮跟着选区走
+    // 选区一变、页面或报告框一滚、窗口一变都重新量：可见范围变了，按钮放上方还是下方跟着变
     const schedule = () => { if (!frame) frame = requestAnimationFrame(read) }
     document.addEventListener('selectionchange', schedule)
     window.addEventListener('scroll', schedule, true)
@@ -623,7 +665,7 @@ function useSelectionPick(root: RefObject<HTMLElement | null>, enabled: boolean)
       window.removeEventListener('scroll', schedule, true)
       window.removeEventListener('resize', schedule)
     }
-  }, [root, enabled])
+  }, [root, anchor, enabled])
   return [pick, useCallback(() => setPick(null), [])]
 }
 

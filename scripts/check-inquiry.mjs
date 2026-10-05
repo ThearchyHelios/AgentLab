@@ -484,6 +484,76 @@ await section('划选原文：浮出「质询」，带上原文', async () => {
   await ctx.close()
 })
 
+await section('划选原文：浮出的「质询」算在审批卡里，贴着报告框底边时也看得见', async () => {
+  const { ctx, page, hits, errors } = await open('inquiry-approval')
+  await expand(page)
+  // 画布上的审批浮层（canvas/NodeCard）在 document 上按捕获阶段听 pointerdown，按在浮层外面就收起。浮出的「质询」
+  // 要是挂在页面末尾，点它等于点外面：浮层连同报告一起收掉，问不成
+  await page.evaluate(() => {
+    window.__outside = []
+    document.addEventListener('pointerdown', (e) => {
+      const card = document.querySelector('[data-approval]')
+      if (!card?.contains(e.target)) window.__outside.push(String(e.target?.outerHTML ?? e.target).slice(0, 80))
+    }, true)
+  })
+  await select(page, 'u4', '枫岭区销售额最高')
+  await page.locator('[data-inquiry-selection]').waitFor()
+  await page.locator('[data-inquiry-selection]').click()
+  await composer(page).waitFor()
+  const outside = await page.evaluate(() => window.__outside)
+  check('点浮出的「质询」：按下的位置在审批卡里，「点外面就收起」的浮层不会因此收起', outside.length === 0, outside.join(' | '))
+  check('……照样打开提问框，带上原文', (await text(composer(page).locator('[data-inquiry-target]'))) === '枫岭区销售额最高')
+  await page.keyboard.press('Escape')
+  // 报告框压矮、滚到某一句的第一行贴着框的底边（取压矮之后落在框外、滚得过去的第一句），在那一行开头划选几个字：
+  // 浮出的按钮放在选区下方会被框裁掉，得换到上方
+  const edge = await page.evaluate(() => {
+    const box = document.querySelector('[data-approval-evidence-doc]')
+    if (!box) return null
+    box.style.maxHeight = '150px'
+    for (const unit of box.querySelectorAll('[data-ev-unit]')) {
+      const b = box.getBoundingClientRect()
+      const line = unit.getClientRects()[0]
+      const need = line.bottom - (b.bottom - 6)
+      if (need <= 0 || need > box.scrollHeight - box.clientHeight - box.scrollTop) continue
+      box.scrollTop += need
+      const walker = document.createTreeWalker(unit, NodeFilter.SHOW_TEXT)
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        const t = n.data.trim()
+        if (t.length < 4 || n.parentElement?.closest('[data-inquiry-ask], .sr-only')) continue
+        const at = n.data.indexOf(t)
+        const range = document.createRange()
+        range.setStart(n, at)
+        range.setEnd(n, at + 4)
+        getSelection().removeAllRanges()
+        getSelection().addRange(range)
+        const r = range.getBoundingClientRect()
+        const after = box.getBoundingClientRect()
+        return { unit: unit.getAttribute('data-ev-unit'), words: t.slice(0, 4), gap: Math.round(after.bottom - r.bottom) }
+      }
+    }
+    return null
+  })
+  check('报告框压矮后可以滚动：一句的第一行贴着框的底边，在那一行开头划选', !!edge && edge.gap >= 0 && edge.gap < 20, JSON.stringify(edge))
+  await page.locator('[data-inquiry-selection]').waitFor()
+  await page.waitForTimeout(150)
+  const vis = await page.evaluate(() => {
+    const btn = document.querySelector('[data-inquiry-selection]')
+    const r = btn.getBoundingClientRect()
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)
+    const box = document.querySelector('[data-approval-evidence-doc]').getBoundingClientRect()
+    return { shown: !!hit && btn.contains(hit), w: Math.round(r.width), inBox: r.top >= box.top - 1 && r.bottom <= box.bottom + 1 }
+  })
+  check('浮出的「质询」看得见：不被报告框裁掉', vis.shown && vis.w > 20, JSON.stringify(vis))
+  await page.locator('[data-inquiry-selection]').click()
+  await composer(page).waitFor()
+  check('点它照样打开提问框，带上划选的字', (await text(composer(page).locator('[data-inquiry-target]'))) === edge?.words,
+    `${await text(composer(page).locator('[data-inquiry-target]'))} / ${edge?.words}`)
+  await shot(page, 'selection-edge-dark')
+  check('没有发出任何写请求', hits.writes.length === 0 && hits.asks.length === 0, hits.writes.join('、'))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+  await ctx.close()
+})
+
 await section('就整份报告提问；recorded 为假时醒目说明', async () => {
   const { ctx, page, hits, state, errors } = await open('inquiry-approval')
   state.reply = (body) => ({ status: 200, json: answerFor(body, {
