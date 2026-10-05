@@ -2181,5 +2181,82 @@ await section('双盲复算与反方审稿的日志（期 3）：按 code 和结
   check('……缺字段的工件 id 不当成可下钻的工件', !rows.some((s) => s?.artifact != null))
 })
 
+await section('审批质询 approval.inquiry（期 4）：一行「审批人质询」，标题带问题前 40 字，副标题说回答是否完成、查了几次', async () => {
+  // 前后端共用的约定：运行停在审批上时服务端追加 approval.inquiry，node_id 为空；data 里有问题、划选的原文、回答正文、
+  // 回答文档、成没成、触顶原因、查询（queries 和 inquiry_artifacts 两份）。以前这类事件落进「未识别的事件」
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const DOC = 'd0c0'.repeat(16)
+  const art = (i) => String(i).repeat(64).slice(0, 64)
+  const q = (i) => ({ alias: `Q${i}`, artifact: art(i), sql: `SELECT ${i}`, row_count: 1, truncated: false, source: 'shop' })
+  const LONG = '本月华东区销售额环比增长 12%，其中新客贡献了多少？请按门店拆开说明，并说明是否扣除了退款与优惠券抵扣的金额'
+  const base = { report: 'write', unit: 'u3', approval_id: 'ap-1', answer_doc: DOC, model: 'verify-mini', usage: { calls: 3 } }
+  const events = [
+    E(1, 'run.started', null, { nodes: 3 }),
+    E(2, 'node.started', 'h', { node_type: 'human', label: '主管审批' }),
+    E(3, 'human.requested', 'h', { kind: 'human_node', node_id: 'h', mode: 'approve', title: '月报可以发出吗？' }),
+    E(4, 'run.interrupted', 'h', { payload: { kind: 'human_node', node_id: 'h' } }),
+    E(5, 'approval.inquiry', null, { ...base, question: '销售额是否扣除了退款？', quote: null, answer_text: '已扣除退款，退款合计 21,500 元。',
+      ok: true, limit: null, error: null, inquiry_artifacts: [art(1), art(2)], queries: [q(1), q(2)] }),
+    E(6, 'approval.inquiry', null, { ...base, question: LONG, quote: '华东区增长最快', answer_text: '按已查到的结果：新客贡献约一半。',
+      ok: true, limit: 'max_queries', error: null, inquiry_artifacts: [1, 2, 3, 4, 5, 6].map(art), queries: [1, 2, 3, 4, 5, 6].map(q) }),
+    E(7, 'approval.inquiry', null, { ...base, unit: null, question: '新客数是多少？', quote: null, answer_text: '', answer_doc: null,
+      ok: false, limit: null, error: '核查模型未配置，无法作答', inquiry_artifacts: [], queries: [] }),
+  ]
+  const steps = mod.decodeRun(events)
+  const all = flatten(steps)
+  const rows = steps.filter((s) => s.code === 'approval_inquiry')
+  check('三条质询各一行，挂在顶层（node_id 为空），不再是「未识别的事件」', rows.length === 3
+    && !all.some((s) => s.title === '未识别的事件'), steps.map((s) => s.title).join(' | '))
+  check('……审批那一行仍在等待，相位仍是 waiting', all.some((s) => s.kind === 'human' && s.nodeId === 'h' && s.status === 'waiting')
+    && mod.isAwaitingHuman(steps) && mod.decodePhase(events) === 'waiting', mod.decodePhase(events))
+  const [a, b, c] = rows
+  check('标题：「审批人质询：」加问题', a?.title === '审批人质询：销售额是否扣除了退款？', a?.title)
+  check('长问题只取前 40 字，后面加省略号', b?.title === `审批人质询：${[...LONG].slice(0, 40).join('')}…` && [...LONG].length > 40, b?.title)
+  check('答完了：副标题写回答完成、查询 2 次，不用提醒色', a?.sub === '回答完成 · 查询 2 次' && a.level === 'info', `${a?.sub} / ${a?.level}`)
+  check('触顶收尾：回答不完整、写明是哪个上限，查询 6 次，提醒色', b?.sub === '回答不完整（已达查询次数上限） · 查询 6 次'
+    && b.level === 'warn', `${b?.sub} / ${b?.level}`)
+  check('没答成：未能回答、未执行查询，提醒色', c?.sub === '未能回答 · 未执行查询' && c.level === 'warn', `${c?.sub} / ${c?.level}`)
+  check('展开区：完整的问题、划选的原文、回答（没答成的写原因）、核查模型', !!b?.detail?.includes(LONG) && b.detail.includes('原文：「华东区增长最快」')
+    && b.detail.includes('按已查到的结果') && !!c?.detail?.includes('核查模型未配置，无法作答') && !!a?.detail?.includes('verify-mini'),
+  `${b?.detail} // ${c?.detail}`)
+  check('回答文档可下钻，没有文档的不挂工件', a?.artifact === DOC && c?.artifact === undefined, `${a?.artifact} / ${c?.artifact}`)
+  check('图标同人工审批（kind human），状态完成，不在转圈', rows.every((s) => s.kind === 'human' && s.status === 'done'))
+  check('标题、副标题里没有内部代码', !rows.some((s) => /approval\.inquiry|approval_inquiry|max_queries|post_seal/.test(`${s.title}${s.sub ?? ''}`)))
+
+  // 其余三个上限、封存之后追加（只有探索运行可以）
+  const more = mod.decodeRun([
+    E(1, 'run.started', null, { nodes: 2 }), E(2, 'run.finished', null, { output: {} }),
+    E(3, 'approval.inquiry', null, { ...base, approval_id: null, post_seal: true, question: '退款率怎么算的？', answer_text: '退款金额除以订单金额。',
+      ok: true, limit: null, error: null, queries: [q(1)], inquiry_artifacts: [art(1)] }),
+    E(4, 'approval.inquiry', null, { ...base, question: '甲', answer_text: '乙', ok: true, limit: 'timeout_s', queries: [q(1)] }),
+    E(5, 'approval.inquiry', null, { ...base, question: '丙', answer_text: '', ok: false, limit: 'daily_max_usd', queries: [] }),
+    E(6, 'approval.inquiry', null, { ...base, question: '丁', answer_text: '戊', ok: true, limit: 'max_cost_usd', queries: [q(1), q(2)] }),
+  ]).filter((s) => s.code === 'approval_inquiry')
+  check('封存之后问的：副标题写明封存后追加', more[0]?.sub === '回答完成 · 查询 1 次 · 封存后追加', more[0]?.sub)
+  check('时长上限、每日金额上限、单次金额上限各有说法', more[1]?.sub === '回答不完整（已达时长上限） · 查询 1 次'
+    && more[2]?.sub === '未能回答（已达核查每日金额上限） · 未执行查询' && more[3]?.sub === '回答不完整（已达单次金额上限） · 查询 2 次',
+  more.slice(1).map((s) => s.sub).join(' / '))
+  check('运行跑完之后来的质询不把相位带回等待', mod.decodePhase([E(1, 'run.started', null, {}), E(2, 'run.finished', null, {}),
+    E(3, 'approval.inquiry', null, { question: 'x', ok: true })]) === 'succeeded')
+
+  // 缺字段、类型不对：不崩，不出 undefined、NaN、[object Object]，不瞎填数
+  const odd = [{}, { question: 7, queries: 'x', ok: 'yes' }, { question: '  ', answer_text: 3, inquiry_artifacts: {} },
+    { question: '只给了工件', inquiry_artifacts: [art(1), art(2), art(3)] }, { question: '有回答没写成没成', answer_text: '有' }]
+  let broken = null
+  let oddRows = []
+  try {
+    oddRows = mod.decodeRun(odd.map((d, i) => E(i + 1, 'approval.inquiry', null, d))).filter((s) => s.code === 'approval_inquiry')
+  } catch (e) {
+    broken = String(e?.message ?? e)
+  }
+  check('缺字段的质询事件：不抛异常，每条照样一行', broken === null && oddRows.length === odd.length, broken ?? `${oddRows.length} 行`)
+  check('……问题不是字符串、是空白：标题只写「审批人质询」', oddRows[0]?.title === '审批人质询' && oddRows[1]?.title === '审批人质询'
+    && oddRows[2]?.title === '审批人质询', oddRows.slice(0, 3).map((s) => s.title).join(' / '))
+  check('……前三条不出 undefined、NaN、[object Object]，也不瞎填数', !oddRows.slice(0, 3).some((s) => /undefined|NaN|object Object|\d/.test(`${s.title}${s.sub ?? ''}`)),
+    oddRows.slice(0, 3).map((s) => `${s.title}|${s.sub}`).join(' ; '))
+  check('……只给了质询工件：按工件数说查了几次', oddRows[3]?.sub === '未能回答 · 查询 3 次', oddRows[3]?.sub)
+  check('……有回答、没写成没成：只说已回答，不说完成', oddRows[4]?.sub === '已回答' && oddRows[4].level === 'info', `${oddRows[4]?.sub} / ${oddRows[4]?.level}`)
+})
+
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')
 process.exit(failed ? 1 : 0)

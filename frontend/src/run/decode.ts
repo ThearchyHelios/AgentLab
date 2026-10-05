@@ -3,7 +3,7 @@ import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
   ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
-  CATALOG_TABLE_FIELD_LABEL, DUAL_CHECK_TEXT,
+  CATALOG_TABLE_FIELD_LABEL, DUAL_CHECK_TEXT, INQUIRY_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -703,6 +703,52 @@ const JUDGE_FAILED_TITLE = '结论句裁判未能执行'
 
 /** 审批行末尾：批的时候点了「始终允许」，这个工具之后不再问人 */
 const ALWAYS_NOTE = '，并设为「始终允许 · 门控把关」'
+
+/** 「审批人质询」那一行的标题里，问题最多带几个字（按字数，不按 UTF-16 码元） */
+const INQUIRY_TITLE = 40
+
+/**
+ * approval.inquiry → 一行「审批人质询」：标题带问题的前 40 字，副标题说回答是否完成、查了几次（封存之后问的另写一句）。
+ *
+ * 只认服务端给的：ok 为真才说「回答完成」，带着触顶原因的说不完整、写明是哪个上限；没说成没成（缺字段）又有回答正文的
+ * 只说「已回答」。查了几次认 queries，没有再认 inquiry_artifacts，两样都没有就不说次数——不拿 0 去顶。字段类型不对的
+ * 当没给：问题不是字符串就只写「审批人质询」
+ */
+function inquiryStep(d: Record<string, any>, seq: number): Step {
+  const T = INQUIRY_TEXT
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '')
+  const question = str(d.question)
+  const chars = [...question]
+  const head = chars.length > INQUIRY_TITLE ? `${chars.slice(0, INQUIRY_TITLE).join('')}…` : question
+  const limit = str(d.limit)
+  const limitText = limit ? T.limit[limit] ?? T.limitOther : ''
+  const answer = str(d.answer_text)
+  const error = str(d.error)
+  const state = d.ok === true ? (limit ? T.incomplete(limitText) : T.complete)
+    : d.ok === false || !answer ? T.failed(limitText || null) : T.answered
+  const runs = Array.isArray(d.queries) ? d.queries.length
+    : Array.isArray(d.inquiry_artifacts) ? d.inquiry_artifacts.length : null
+  const fine = !limit && !error && (d.ok === true || (d.ok !== false && !!answer))
+  const quote = str(d.quote)
+  const model = str(d.model)
+  const doc = str(d.answer_doc)
+  const detail = [
+    question ? T.detail.question(question) : '',
+    quote ? T.detail.quote(quote) : '',
+    answer ? T.detail.answer(answer) : '',
+    error ? T.detail.error(error) : '',
+    model ? T.detail.model(model) : '',
+  ].filter(Boolean).join('\n')
+  return {
+    id: `iq-${seq}`, seq, kind: 'human', status: 'done', code: 'approval_inquiry',
+    level: fine ? 'info' : 'warn',
+    title: T.timeline(head),
+    sub: [state, runs != null ? T.queries(runs) : '', d.post_seal === true ? T.postSeal : ''].filter(Boolean).join(' · '),
+    ...(detail ? { detail } : {}),
+    // 回答组装成的文档（数字带出处）：展开区可以下钻
+    ...(doc ? { artifact: doc } : {}),
+  }
+}
 
 /**
  * 门控模型（工具信任档「始终允许 · 门控把关」）对一次调用的结论。team：协作团队里拦下的，
@@ -2111,6 +2157,12 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         }, nodeId)
         break
       }
+
+      case 'approval.inquiry':
+        // 审批人在批准前就待审的报告提问（审批质询）：运行停在审批上时服务端追加这一条，node_id 为空，运行本身没动、
+        // 报告也不改（相位照旧，见 nextPhase）。封存之后探索运行也能问，带 post_seal。一条事件就是一问一答，挂在顶层
+        out.push(inquiryStep(d, seq))
+        break
 
       case 'catalog.drift': {
         // 从发布版本发起的正式运行：发布之后数据目录有变化。只提醒、运行照常，所以是一条警告，不是失败

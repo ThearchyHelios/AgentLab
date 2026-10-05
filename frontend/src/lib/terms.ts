@@ -3274,9 +3274,37 @@ export const BUNDLE_TEXT = {
   fileName: (name: string) => `${name}-可验证报告.html`,
 }
 
-/** 审批质询：审批人在批准前就待审的报告提出质询 */
+/**
+ * 审批质询：审批人在批准前就待审的报告提问（选一句、划一段原文，或就整份报告），核查模型只读查库作答。问答写进运行
+ * 记录、随运行一并封存，不改动报告；封存之后只有探索运行还能问，追加在封存之后
+ */
 export const INQUIRY_TEXT = {
   title: '审批质询',
+
+  // ---- 时间线（decode.ts 解读 approval.inquiry）：标题带问题的前 40 字，副标题说回答是否完成、查了几次 ----
+  timeline: (question: string) => (question ? `审批人质询：${question}` : '审批人质询'),
+  complete: '回答完成',
+  /** 按已查到的结果收了尾：回答可能缺了没来得及查的部分 */
+  incomplete: (limit: string) => `回答不完整（${limit}）`,
+  failed: (limit: string | null) => (limit ? `未能回答（${limit}）` : '未能回答'),
+  /** 服务端没说成没成（缺字段）、却有回答正文：只说答了，不说完成 */
+  answered: '已回答',
+  queries: (n: number) => (n > 0 ? `查询 ${formatNumber(n)} 次` : '未执行查询'),
+  postSeal: '封存后追加',
+  limit: {
+    max_queries: '已达查询次数上限',
+    timeout_s: '已达时长上限',
+    max_cost_usd: '已达单次金额上限',
+    daily_max_usd: '已达核查每日金额上限',
+  } as Record<string, string>,
+  limitOther: '已达上限',
+  detail: {
+    question: (q: string) => `问题：${q}`,
+    quote: (q: string) => `原文：「${q}」`,
+    answer: (t: string) => `回答：${t}`,
+    error: (e: string) => `原因：${e}`,
+    model: (m: string) => `核查模型：${m}`,
+  },
 }
 
 /**
