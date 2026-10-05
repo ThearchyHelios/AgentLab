@@ -2,7 +2,9 @@
 
 - POST /api/runs/{run_id}/inquiries：{report, unit, quote?, question, approval_id?} → {inquiry, recorded, note}
 - GET  /api/runs/{run_id}/inquiries?report=&unit=：{items: [Inquiry]}，封存前后的都算，按先后
-- GET  /api/runs/{run_id}/inquiries/artifacts/{artifact_id}：质询引用过的工件，查询快照的遮罩列照证据面板遮好
+- GET  /api/runs/{run_id}/inquiries/artifacts/{artifact_id}：质询引用过的工件 {id, content, masked[, mask_note]}——
+  查询快照的遮罩列照证据面板遮好（masked 是遮掉的列名）；回答文档（answer.doc_artifact）组装时就遮好了，原样给。
+  不是这次运行的质询引用过的回 404：工件 id 不能拿来取任意快照
 
 不受理：409 {detail, code}（inquiry_not_open / inquiry_busy / inquiry_disabled）；输入不合法 422 {detail, field}，
 field 指明是哪一项（前后端约定的形状，不是 FastAPI 自己那种校验错误数组，所以请求体自己解析）。

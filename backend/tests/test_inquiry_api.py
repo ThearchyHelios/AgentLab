@@ -34,12 +34,15 @@ from app.data import introspect
 from app.data.engine import engines
 from app.db.base import SessionLocal
 from app.db.models import Approval, DataSource, Run, RunEvent, Setting
+from app.engine import compiler
 from app.engine import inquiry as inquiry_mod
 from app.engine import spend, verify_agent
+from app.engine.context import NodeError
 from app.engine.evidence import iter_segments, iter_units
 from app.engine.judge import SPEND_KEY as JUDGE_SPEND_KEY
 from app.engine.nodes import report as report_mod
 from app.engine.runner import run_manager, verify_manifest
+from app.engine.schema import NodeType
 from app.main import app
 from app.providers.factory import ProviderNotConfigured
 from app.providers.mock_model import MockChatModel
@@ -331,7 +334,8 @@ async def test_asking_while_waiting_is_recorded_and_sealed_with_the_run(monkeypa
     final = await wait(paused.id)
     assert final.status == "succeeded", final.error
     assert final.manifest_seq > event.seq
-    assert (await verify_manifest(paused.id))["ok"] is True
+    verified = (await client.get(f"/api/runs/{paused.id}/verify")).json()
+    assert verified["ok"] is True and verified["sealed_at"] == final.manifest_seq >= event.seq
     # 用量计进运行用量，明细在 inquiry 下
     assert final.usage["inquiry"]["calls"] == item["usage"]["calls"]
     assert final.usage["inquiry"]["input_tokens"] == item["usage"]["input_tokens"]
@@ -392,9 +396,10 @@ async def test_while_answering_approving_resuming_and_continuing_are_refused(mon
                                      approval_id=approval.id))
     try:
         await asyncio.wait_for(entered.wait(), 10)
-        refused = await client.post(f"/api/approvals/{approval.id}/decide", json={"approved": False, "note": "先别批"},
-                                    headers={"X-Actor": "reviewer"})
-        assert refused.status_code == 409 and refused.json() == BUSY_DECIDE
+        for decision in ({"approved": True}, {"approved": False, "note": "先别批"}):
+            refused = await client.post(f"/api/approvals/{approval.id}/decide", json=decision,
+                                        headers={"X-Actor": "reviewer"})
+            assert refused.status_code == 409 and refused.json() == BUSY_DECIDE
         refused = await client.post(f"/api/runs/{paused.id}/resume",
                                     json={"response": {"approved": True}, "approval_id": approval.id})
         assert refused.status_code == 409 and refused.json() == BUSY_DECIDE
@@ -456,6 +461,44 @@ async def test_after_the_seal_only_exploratory_runs_take_inquiries(monkeypatch, 
     assert r.status_code == 409 and r.json()["code"] == "inquiry_not_open"
     assert "正式运行" in r.json()["detail"]
     assert await events(formal.id, "approval.inquiry") == []
+
+
+async def test_a_follow_up_is_not_written_once_the_run_is_continued(monkeypatch, shop, client):
+    """失败的探索运行也封存了，可以追问。追问途中运行被继续了（另一个进程、或者抢在登记之前）：记录上的封存不再是
+    开始回答时的那份，回答照样交回，不写进运行记录；继续运行跑完重新封存，核对照旧一致。"""
+    state = {"fail": True, "continued": False}
+    original = compiler.RUNNERS[NodeType.TRANSFORM]
+
+    async def flaky(st, ctx):
+        if ctx.node.id == "boom" and state["fail"]:
+            raise NodeError(ctx.node.id, "下游接口暂时不可用")
+        return await original(st, ctx)
+
+    monkeypatch.setitem(compiler.RUNNERS, NodeType.TRANSFORM, flaky)
+
+    async def continue_meanwhile():
+        if not state["continued"]:
+            state["continued"], state["fail"] = True, False
+            await run_manager.continue_failed(state["run"])
+
+    Models(monkeypatch, shop, before=continue_meanwhile)
+    graph = chain(node("start", "input"), node("fetch", "tool", tool=f"db_query__{shop}", args={"sql": QUERY}),
+                  node("write", "report", "写周报", instructions="写周报"),
+                  node("boom", "transform", mode="template", template="门店 17 家"),
+                  node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
+    failed = await finish(shop, graph=graph)
+    assert failed.status == "failed" and failed.manifest_seq is not None
+    state["run"] = failed.id
+
+    r = await ask(client, failed.id, report="write", unit=None, question=QUESTION)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["recorded"] is False and body["note"] == NOT_RECORDED
+    assert body["inquiry"]["post_seal"] is True and body["inquiry"]["answer"]["text"] == NO_TEST_TEXT
+    final = await wait(failed.id)
+    assert final.status == "succeeded", final.error
+    assert await events(failed.id, "approval.inquiry") == []
+    assert (await verify_manifest(failed.id))["ok"] is True
 
 
 async def test_a_formal_run_waiting_for_approval_takes_inquiries(monkeypatch, shop, client):
