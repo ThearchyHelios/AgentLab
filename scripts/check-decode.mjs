@@ -2181,5 +2181,88 @@ await section('双盲复算与反方审稿的日志（期 3）：按 code 和结
   check('……缺字段的工件 id 不当成可下钻的工件', !rows.some((s) => s?.artifact != null))
 })
 
+await section('核查类日志与出具缺口（期 4）：无法复算、没能反查、只查了部分数据源说人话，核查报上来的缺口另起一组', async () => {
+  // 期 3 时这三个代码界面认不得，只能照原话显示；出具缺口里双盲复算、反方审稿报上来的几条读成
+  // 「校验不完整：反方审稿「反方审稿」：反方审稿推翻了 1 句结论…」，前缀和正文重复，归在「校验不完整」下也不准——
+  // 它们是核查查出来的问题，不是校验没做完
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const events = [
+    E(1, 'run.started', null, { total: 3 }),
+    E(2, 'node.started', 'dc', { node_type: 'dual_check', label: '复核销售额' }),
+    // metrics 是 [{id, name, reason}]：没起名字的写 id，原因是一句中文
+    E(3, 'log', 'dc', { level: 'warn', code: 'dual_check_unchecked', message: '双盲复算未能核对 2 个指标，按无法复算计入缺口',
+      metrics: [{ id: 'gmv', name: '销售额', reason: '输入来自合并查询，无法单独复算' }, { id: 'aov', name: '', reason: '盲算已达查询次数上限' }] }),
+    E(4, 'node.finished', 'dc', { duration_ms: 20 }),
+    E(5, 'node.started', 'ch', { node_type: 'challenge', label: '审月报' }),
+    E(6, 'log', 'ch', { level: 'warn', code: 'challenge_unreviewed', claims_skipped: 2, reason: '数据源「北仓库」已不存在或已停用',
+      message: '反方审稿有 2 句结论未能反查，已记为无法判断：数据源「北仓库」已不存在或已停用' }),
+    E(7, 'log', 'ch', { level: 'warn', code: 'challenge_sources_lost', claims: 1, sources: ['北仓库', '南仓库'],
+      message: '反方审稿有 1 句结论只查了部分数据源' }),
+    E(8, 'node.finished', 'ch', { duration_ms: 30 }),
+    E(9, 'node.started', 'done', { node_type: 'output', label: '成果' }),
+    E(10, 'issuance', 'done', { tier: 'degraded', missing_required: [], missing_expected: [], unmatched: 0, metrics_checked: 2, matched_numbers: 3,
+      gaps: ['双盲复算「复核销售额」：指标「销售额」两路结果不一致，审核人选择了盲算结果', '反方审稿：推翻了 1 句结论：「东区增长主要来自新客」',
+        '叙述模板渲染为空（路径可能有误）', '数据整形「双盲复算备份」：两路结果不一致'] }),
+    E(11, 'node.finished', 'done', { duration_ms: 5 }),
+    E(12, 'run.finished', null, { status: 'succeeded' }),
+  ]
+  const steps = mod.decodeRun(events)
+  const all = flatten(steps)
+  const by = (code) => all.find((s) => s.code === code)
+  const NEW = ['dual_check_unchecked', 'challenge_unreviewed', 'challenge_sources_lost']
+  check('三个日志代码各有一行、挂在自己的节点下', NEW.every((c) => all.some((s) => s.kind === 'node' && s.children?.some((x) => x.code === c))),
+    NEW.filter((c) => !by(c)).join('、'))
+  check('……标题里没有内部代码，原话留在展开区', NEW.every((c) => !/dual_check_|challenge_/.test(`${by(c)?.title}${by(c)?.sub ?? ''}${by(c)?.next ?? ''}`))
+    && by('challenge_unreviewed')?.detail === events[5].data.message)
+  const un = by('dual_check_unchecked')
+  check('dual_check_unchecked：几个指标无法复算、计入缺口，副标题点名带原因（没名字的写 id），提醒色',
+    un?.title === '双盲复算有 2 个指标无法复算，按缺口计入出具' && un.sub === '「销售额」：输入来自合并查询，无法单独复算；「aov」：盲算已达查询次数上限'
+    && un.level === 'warn' && !!un.next?.includes('核查'), `${un?.title} / ${un?.sub}`)
+  const ur = by('challenge_unreviewed')
+  check('challenge_unreviewed：几句没能反查、记为无法判断，原因放副标题', ur?.title === '反方审稿有 2 句结论没能反查，已记为无法判断'
+    && ur.sub === '数据源「北仓库」已不存在或已停用' && ur.level === 'warn' && !!ur.next?.includes('没有真正查询数据'), `${ur?.title} / ${ur?.sub}`)
+  const lost = by('challenge_sources_lost')
+  check('challenge_sources_lost：几句只查了部分数据源，点名没查成的源、判断不含它们', lost?.title === '反方审稿有 1 句结论只查了部分数据源'
+    && lost.sub === '未能查询：「北仓库」、「南仓库」（已不存在或已停用），判断不含其中的数据' && lost.level === 'warn' && !!lost.next?.includes('数据源'),
+    `${lost?.title} / ${lost?.sub}`)
+
+  const issuance = steps.find((s) => s.kind === 'issuance')
+  const title = issuance?.title ?? ''
+  const detail = issuance?.detail ?? ''
+  check('出具那一行：核查报上来的两条归在「核查未通过」下', detail.split('\n').includes(
+    '核查未通过：双盲复算「复核销售额」：指标「销售额」两路结果不一致，审核人选择了盲算结果；反方审稿：推翻了 1 句结论：「东区增长主要来自新客」'), detail)
+  check('……校验没做完的那条仍在「校验不完整」下，核查的不在那里', detail.split('\n').some((l) => l.startsWith('校验不完整：')
+    && l.includes('叙述模板渲染为空') && !l.includes('两路结果不一致，审核人') && !l.includes('推翻了')), detail)
+  check('……只是名字里带「双盲复算」的别的节点不算核查（按节点类型的前缀认）', detail.split('\n').some((l) => l.startsWith('校验不完整：')
+    && l.includes('数据整形「双盲复算备份」：两路结果不一致')), detail)
+  const lines = detail.split('\n')
+  check('……核查那一组排在校验不完整前面，标题以档位开头', title.startsWith('降档出具：核查未通过：')
+    && lines.findIndex((l) => l.startsWith('核查未通过：')) < lines.findIndex((l) => l.startsWith('校验不完整：')), title)
+  check('……前缀和正文不重复节点类型', !/反方审稿：反方审稿|双盲复算「[^」]*」：[^；]*双盲复算/.test(detail), detail)
+
+  // splitIssuanceGaps：成果卡片、证据页按同一个函数分组
+  const split = mod.splitIssuanceGaps(['双盲复算：指标「订单数」无法复算：输入来自合并查询', '反方审稿「审周报」：推翻了 2 句结论：「甲」「乙」',
+    '缺少必需指标：gmv', '反方审稿报告没写完'])
+  check('splitIssuanceGaps：「类型：」「类型「名」：」开头的才算核查缺口，同名开头的普通文字不算', JSON.stringify(split) === JSON.stringify({
+    verify: ['双盲复算：指标「订单数」无法复算：输入来自合并查询', '反方审稿「审周报」：推翻了 2 句结论：「甲」「乙」'],
+    other: ['缺少必需指标：gmv', '反方审稿报告没写完'] }), JSON.stringify(split))
+
+  // 老日志缺字段、字段类型不对：不崩，不出 undefined、NaN、[object Object]，不瞎填数
+  const odd = [['dual_check_unchecked', { metrics: 'x' }], ['challenge_unreviewed', { claims_skipped: 'x', reason: 3 }],
+    ['challenge_sources_lost', { claims: null, sources: 'x' }]]
+  let broken = null
+  let rows = []
+  try {
+    const got = flatten(mod.decodeRun([E(1, 'node.started', 'x', { node_type: 'challenge' }),
+      ...odd.map(([code, data], i) => E(i + 2, 'log', 'x', { level: 'warn', code, ...data })), E(9, 'node.finished', 'x', {})]))
+    rows = odd.map(([code]) => got.find((s) => s.code === code))
+  } catch (e) {
+    broken = String(e?.message ?? e)
+  }
+  check('缺字段的老日志：不抛异常，每个代码照样一行', broken === null && rows.every((r) => r?.title), broken ?? '')
+  check('……不出 undefined、NaN、[object Object]，也不瞎填数', !rows.some((r) => /undefined|NaN|object Object|\d/.test(`${r?.title}${r?.sub ?? ''}`)),
+    rows.map((r) => `${r?.title}|${r?.sub ?? ''}`).join(' ; '))
+})
+
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')
 process.exit(failed ? 1 : 0)

@@ -3,7 +3,7 @@ import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
   ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
-  CATALOG_TABLE_FIELD_LABEL, DUAL_CHECK_TEXT,
+  CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, NODE_TYPE_LABEL,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -717,16 +717,31 @@ function gateTitle(tool: string, verdict: 'allow' | 'escalate' | 'team', reason:
 
 /**
  * 双盲复算、反方审稿的日志代码（期 3 前后端共用的约定）。这几条按 code 和结构化字段解读，不看原话；后端发成 info 的
- * （一致、裁决、记入数据目录、审稿完成）也上时间线，不然这两种节点就是一个跑了几十秒、什么都没说的黑盒
+ * （一致、裁决、记入数据目录、审稿完成）也上时间线，不然这两种节点就是一个跑了几十秒、什么都没说的黑盒。
+ * 无法复算（dual_check_unchecked）、没能反查（challenge_unreviewed）、只查了部分数据源（challenge_sources_lost）是
+ * 期 4 补上的：以前认不得，只能照原话显示
  */
 const VERIFY_LOG_CODES = new Set([
   'dual_check_skipped', 'dual_check_same_model', 'dual_check_agreed', 'dual_check_disagreed', 'dual_check_resolved',
-  'dual_check_catalog', 'dual_check_limit',
+  'dual_check_catalog', 'dual_check_limit', 'dual_check_unchecked',
   'challenge_skipped', 'challenge_same_model', 'challenge_done', 'challenge_refuted', 'challenge_limit',
+  'challenge_unreviewed', 'challenge_sources_lost',
 ])
 
 const DC = DUAL_CHECK_TEXT
-const CL = DUAL_CHECK_TEXT.challengeLog
+const CL = CHALLENGE_TEXT.log
+
+/**
+ * 出具缺口里哪几条是双盲复算、反方审稿报上来的：出具契约给上游节点报的缺口加了「节点类型「节点名」：」的前缀
+ * （nodes/io.py 的 _upstream_issuance_gaps，节点名就是类型叫法时只写「节点类型：」），按这两种节点类型的叫法认。
+ * 它们是核查查出来的问题（两路结果不一致、结论被推翻、指标无法复算），时间线、成果卡片、证据页另起一组「核查未通过」，
+ * 不和「校验没跑全」的缺口混在一起。其余的照旧
+ */
+const VERIFY_GAP_KINDS = [NODE_TYPE_LABEL.dual_check, NODE_TYPE_LABEL.challenge]
+export function splitIssuanceGaps(gaps: readonly string[]): { verify: string[]; other: string[] } {
+  const isVerify = (g: string) => VERIFY_GAP_KINDS.some((kind) => g.startsWith(`${kind}「`) || g.startsWith(`${kind}：`))
+  return { verify: gaps.filter(isVerify), other: gaps.filter((g) => !isVerify(g)) }
+}
 const isRecord = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v)
 /** 老日志、别的服务端版本可能给的是一句中文原因而不是代码：中文的照写，认不得的代码不往界面上放 */
 const cjkText = (v: unknown): string | undefined => (typeof v === 'string' && /[㐀-鿿]/.test(v) ? v : undefined)
@@ -1034,16 +1049,18 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       return { title: DC.log.resolved(parts), sub: gaps != null ? DC.log.gaps(gaps) : undefined, level: warn ? 'warn' : 'info' }
     }
     case 'dual_check_catalog': {
-      // written：[{source, table, item}] 写进数据目录的已确认事实；skipped：[{reason}] 没写的（已有已确认的不覆盖……）。
+      // written：[{source, table, item, value}] 写进数据目录的已确认事实；skipped：[{reason}] 没写的（已有已确认的不覆盖……）。
       // item 是表级目录项的键（business_date / valid_filter / dedup），按数据目录页的叫法写；认不出的键不往界面上放，
-      // 只写表；老版本给的一句中文照写
+      // 只写表；老版本给的一句中文照写。value 是写进去的说法（期 4 起带），写法同审批卡上的「会记为」，两处一字不差
       const written = Array.isArray(d.written) ? d.written.filter(isRecord) : []
       const skipped = Array.isArray(d.skipped) ? d.skipped.filter(isRecord) : []
       const what = written.map((w) => {
         const key = str(w.item)
-        const item = key && Object.hasOwn(CATALOG_TABLE_FIELD_LABEL, key)
-          ? CATALOG_TABLE_FIELD_LABEL[key as keyof typeof CATALOG_TABLE_FIELD_LABEL] : cjkText(key)
-        return DC.log.catalogItem(str(w.table), str(w.source), item)
+        const known = !!key && Object.hasOwn(CATALOG_TABLE_FIELD_LABEL, key)
+        const item = known ? CATALOG_TABLE_FIELD_LABEL[key as keyof typeof CATALOG_TABLE_FIELD_LABEL] : cjkText(key)
+        const where = DC.log.catalogItem(str(w.table), str(w.source), item)
+        const value = known && w.value != null && w.value !== '' ? patchValueText(key, w.value) : ''
+        return where && value ? DC.log.catalogValue(where, value) : where
       }).filter(Boolean)
       const why = skipped.map((s) => str(s.reason)).filter((r): r is string => !!r)
       const rest = skipped.length ? `${DC.log.catalogSkipped(skipped.length)}${why.length ? `：${why.join('；')}` : ''}` : ''
@@ -1062,7 +1079,22 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         level: 'warn',
       }
     }
-    // ---- 反方审稿：同上，文案在 DUAL_CHECK_TEXT.challengeLog（时间线的解读统一在这里做）
+    case 'dual_check_unchecked': {
+      // metrics 是 [{id, name, reason}]：副标题点名、说原因（没起名字的写 id）
+      const list = Array.isArray(d.metrics) ? d.metrics.filter(isRecord) : []
+      const parts = list.map((m) => {
+        const name = str(m.name) ?? str(m.id)
+        const why = cjkText(m.reason)
+        return name ? `「${name}」${why ? `：${why}` : ''}` : ''
+      }).filter(Boolean)
+      return {
+        title: DC.log.unchecked(list.length || undefined),
+        sub: parts.length ? parts.join('；') : undefined,
+        next: DC.log.uncheckedNext,
+        level: 'warn',
+      }
+    }
+    // ---- 反方审稿：同上，文案在 CHALLENGE_TEXT.log（时间线的解读统一在这里做）
     case 'challenge_skipped': {
       const reason = str(d.reason)
       if (reason === 'disabled') {
@@ -1104,6 +1136,25 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       return {
         title: CL.limit((which && DC.limitLabel[which]) || DC.limitAny, skipped || undefined),
         next: which === 'daily_max_usd' ? DC.limitDailyNext : CL.limitNext,
+        level: 'warn',
+      }
+    }
+    case 'challenge_unreviewed': {
+      // claims_skipped：没能反查的句数；reason：第一句没能反查的原因（一句中文）
+      return {
+        title: CL.unreviewed(countOf(d.claims_skipped) || undefined),
+        sub: cjkText(d.reason),
+        next: CL.unreviewedNext,
+        level: 'warn',
+      }
+    }
+    case 'challenge_sources_lost': {
+      // claims：只查了部分数据源的句数；sources：没查成的数据源名
+      const names = strs(d.sources)
+      return {
+        title: CL.sourcesLost(countOf(d.claims) || undefined),
+        sub: names.length ? CL.sourcesLostSub(names) : undefined,
+        next: CL.sourcesLostNext,
         level: 'warn',
       }
     }
@@ -2051,8 +2102,10 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         if (d.missing_expected?.length) gaps.push(`缺少期望指标：${d.missing_expected.join('、')}`)
         if (num(d.unmatched)) gaps.push(`${d.unmatched} 个数字无法追溯到指标集`)
         // 校验本身没跑全（叙述渲染为空、指标集为空）也会降档。不写出来的话，
-        // 时间线上就是一个光秃秃的「降档出具」，看起来和"全部通过"只差一个字
-        const notRun: string[] = Array.isArray(d.gaps) ? d.gaps.map(String) : []
+        // 时间线上就是一个光秃秃的「降档出具」，看起来和"全部通过"只差一个字。
+        // 双盲复算、反方审稿报上来的缺口是核查查出来的问题，另起一组，不归在「校验不完整」下
+        const { verify, other: notRun } = splitIssuanceGaps(Array.isArray(d.gaps) ? d.gaps.map(String) : [])
+        if (verify.length) gaps.push(`${DC.verifyGaps.head}：${verify.join('；')}`)
         if (notRun.length) gaps.push(`校验不完整：${notRun.join('；')}`)
         const checked = [
           num(d.metrics_checked) != null ? `核对 ${d.metrics_checked} 个指标` : '',

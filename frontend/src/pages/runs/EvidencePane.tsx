@@ -12,8 +12,9 @@ import {
   issuanceMarks, segmentState, unitVerdict, verdictState, type AuditFilter, type AuditGroup, type AuditRow,
 } from '../../lib/evidence'
 import { formatNumber } from '../../lib/format'
-import { EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
+import { DUAL_CHECK_TEXT, EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
 import { IssuanceBanner } from '../../run/AssistantStream'
+import { splitIssuanceGaps } from '../../run/decode'
 import { EvidenceDoc, type EvidenceDocHandle } from '../../run/EvidenceDoc'
 import { EvidenceGuessView } from '../../run/EvidenceGuess'
 import { Markdown, inlineStyles } from '../../run/Markdown'
@@ -145,11 +146,7 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
           <UpgradeBanner run={run} mode={mode} />
           {/* 出具档位和降档原因写在报告上方：降档时只在侧栏小标签里写「SQL 检查未通过」，报告上却是绿色的
               「10 个数字都有出处」，读的人会以为一切正常。SQL 检查导致的降档在横幅里单列一块 */}
-          {!!output?._issuance?.tier && (
-            <div data-evidence-issuance="">
-              <IssuanceBanner issuance={output._issuance} runClass={run.run_class} />
-            </div>
-          )}
+          {!!output?._issuance?.tier && <IssuanceWithChecks issuance={output._issuance} runClass={run.run_class} />}
 
           {mode === 'cited' && reports.map((r) => {
             const doc = docOf(r.node_id)
@@ -312,6 +309,31 @@ function useAudit(runId: string, key: string): AuditState {
     return () => ctrl.abort()
   }, [runId, key])
   return state
+}
+
+/**
+ * 出具横幅，外加双盲复算、反方审稿报上来的缺口另起的一组「核查未通过」。那几条是核查查出来的问题（两路结果不一致、
+ * 结论被推翻、指标无法复算），横幅把缺口都列在「校验未全部完成」下，读起来像是校验没做完：这里从横幅里拿出来，
+ * 紧跟在它下面单列，颜色和横幅里的缺口一样
+ */
+function IssuanceWithChecks({ issuance, runClass }: { issuance: Record<string, any>; runClass?: string }) {
+  const { verify, other } = useMemo(
+    () => splitIssuanceGaps(Array.isArray(issuance.gaps) ? issuance.gaps.map(String) : []), [issuance])
+  const shown = useMemo(() => (verify.length ? { ...issuance, gaps: other } : issuance), [issuance, verify, other])
+  return (
+    <div className="space-y-1.5" data-evidence-issuance="">
+      <IssuanceBanner issuance={shown} runClass={runClass} />
+      {verify.length > 0 && (
+        <div className="rounded-lg border px-2 py-1.5 text-2xs leading-relaxed"
+             style={{ borderColor: 'var(--st-waiting)', color: 'var(--st-waiting)' }} data-evidence-verify-gaps="">
+          <div className="font-medium">{DUAL_CHECK_TEXT.verifyGaps.head}</div>
+          <ul className="mt-0.5 space-y-0.5 pl-2 [overflow-wrap:anywhere]">
+            {verify.map((g) => <li key={g}>· {g}</li>)}
+          </ul>
+        </div>
+      )}
+    </div>
+  )
 }
 
 /** 顶上一行：这次运行按哪种方式展示证据、封存核对的结果、每份报告文档的哈希 */

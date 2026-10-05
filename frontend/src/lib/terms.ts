@@ -3335,7 +3335,9 @@ export const WHATIF_TEXT = {
 }
 
 /**
- * 双盲复算：节点库说明、检查器、节点卡片摘要、两边对不上时的审批卡，以及时间线上双盲复算和反方审稿的日志。
+ * 双盲复算：节点库说明、检查器、节点卡片摘要、两边对不上时的审批卡，以及时间线上双盲复算的日志。核查的上限叫法
+ * （limitLabel）和出具缺口里「核查未通过」那一组（verifyGaps）反方审稿也用，放在这里一处；反方审稿自己的时间线说法在
+ * CHALLENGE_TEXT.log。
  *
  * 两边的叫法固定为「原流程」「盲算」（服务端 explain_sql_diff 的 labels 也是这两个词），审核人的三个选择固定为
  * 「采用原流程的结果」「采用盲算的结果」「两边都不对」。选「采用盲算的结果」不会替换报告里的数，只记缺口，
@@ -3570,31 +3572,24 @@ export const DUAL_CHECK_TEXT = {
       const where = table ? `「${table}」${source ? `（${source}）` : ''}` : ''
       return where && item ? `${where}的${item}` : where || item || ''
     },
+    /** 写进数据目录的一项连同写进去的值：「orders」（shop）的业务日期记为「paid_date」 */
+    catalogValue: (where: string, value: string) => `${where}记为「${value}」`,
     catalogSkipped: (n: number) => `${formatNumber(n)} 项未写入`,
     catalogNext: '可在「数据 → 数据目录」中查看或修改',
     /** metric 是指标 ID（服务端日志只带 ID，中文名在原话里），不当名字加引号 */
     limit: (label: string, metric?: string) => (metric ? `指标 ${metric} 的盲算已达${label}，按无法复算处理` : `双盲复算已达${label}`),
     limitNext: '请在「设置 → 偏好设置 → 核查」中调高双盲复算的上限',
+    /** dual_check_unchecked：盲算触顶、出错、交不出数，或者输入本身没法单独复算（合并查询、遮罩列） */
+    unchecked: (n?: number) => (n ? `双盲复算有 ${formatNumber(n)} 个指标无法复算，按缺口计入出具`
+      : '双盲复算有指标无法复算，按缺口计入出具'),
+    uncheckedNext: '无法复算的原因见展开内容。来自合并查询、遮罩列的输入无法单独复算；盲算触顶、出错的，可调高「设置 → 偏好设置 → 核查」中的上限后重新运行',
   },
-  /** 反方审稿日志的时间线说法：时间线解读统一在这里做，反方审稿的工作包不另写一份 */
-  challengeLog: {
-    skippedDisabled: '反方审稿未启用，已跳过',
-    skippedDisabledNext: '如需审稿，请在节点中开启，或在「设置 → 偏好设置 → 核查」中启用反方审稿',
-    // no_report：要审的报告节点找得到（找不到时节点直接报错，到不了这里），但它的报告文档读不出来——没有写出、
-    // 保存失败，或者它在这次没有执行到的分支上
-    skippedNoReport: '要审的报告没有可读取的报告文档，已跳过反方审稿',
-    skippedNoReportNext: '请确认报告撰写节点是否执行成功、是否写出了报告；它位于条件分支上时，确认本次运行执行到了它',
-    skippedNoClaims: '报告中没有需要审的关键结论，已跳过反方审稿',
-    skipped: '反方审稿已跳过',
-    sameModel: (model?: string) => (model ? `反方审稿模型与报告撰写模型同为「${model}」，审稿缺乏独立性`
-      : '反方审稿模型与报告撰写模型相同，审稿缺乏独立性'),
-    sameModelNext: '请在节点中指定其他审稿模型，或在「设置 → 偏好设置 → 核查」中修改核查模型',
-    done: (n?: number) => (n ? `反方审稿完成：审阅了 ${formatNumber(n)} 句结论` : '反方审稿完成'),
-    verdict: { stands: '经受住', weakened: '被削弱', refuted: '被推翻', inconclusive: '无法判断' } as Record<string, string>,
-    refuted: (n?: number) => (n ? `反方审稿推翻了 ${formatNumber(n)} 句结论` : '反方审稿推翻了报告中的结论'),
-    refutedNext: '请在证据中对照反方审稿的查询和理由，核实这些结论',
-    limit: (label: string, skipped?: number) => (skipped ? `反方审稿已达${label}，${formatNumber(skipped)} 句结论未审` : `反方审稿已达${label}`),
-    limitNext: '请在节点或「设置 → 偏好设置 → 核查」中调高反方审稿的上限',
+  /**
+   * 出具缺口里双盲复算、反方审稿报上来的那几条（缺口以「双盲复算「节点名」：」「反方审稿：」开头）：时间线、成果卡片、
+   * 证据页把它们另起一组，不和「校验没跑全」混在一起——它们是核查查出来的问题，不是校验没做完
+   */
+  verifyGaps: {
+    head: '核查未通过',
   },
 }
 
@@ -3703,6 +3698,35 @@ export const CHALLENGE_TEXT = {
   truncated: '结果已截断，数据库中还有更多数据',
   /** 理由里有出处的数字：读屏听到的是「数字，出处：查询 Q2 · 第 1 行 · amount」，点一下跳到那次查询 */
   cited: (text: string, source: string) => `${text}，出处：${source}，跳到这次查询`,
+
+  // ---- 时间线（run/decode.ts explainLog）：按日志的 code 和结构化字段说，不从原话里认
+  log: {
+    skippedDisabled: '反方审稿未启用，已跳过',
+    skippedDisabledNext: '如需审稿，请在节点中开启，或在「设置 → 偏好设置 → 核查」中启用反方审稿',
+    // no_report：要审的报告节点找得到（找不到时节点直接报错，到不了这里），但它的报告文档读不出来——没有写出、
+    // 保存失败，或者它在这次没有执行到的分支上
+    skippedNoReport: '要审的报告没有可读取的报告文档，已跳过反方审稿',
+    skippedNoReportNext: '请确认报告撰写节点是否执行成功、是否写出了报告；它位于条件分支上时，确认本次运行执行到了它',
+    skippedNoClaims: '报告中没有需要审的关键结论，已跳过反方审稿',
+    skipped: '反方审稿已跳过',
+    sameModel: (model?: string) => (model ? `反方审稿模型与报告撰写模型同为「${model}」，审稿缺乏独立性`
+      : '反方审稿模型与报告撰写模型相同，审稿缺乏独立性'),
+    sameModelNext: '请在节点中指定其他审稿模型，或在「设置 → 偏好设置 → 核查」中修改核查模型',
+    done: (n?: number) => (n ? `反方审稿完成：审阅了 ${formatNumber(n)} 句结论` : '反方审稿完成'),
+    verdict: { stands: '经受住', weakened: '被削弱', refuted: '被推翻', inconclusive: '无法判断' } as Record<string, string>,
+    refuted: (n?: number) => (n ? `反方审稿推翻了 ${formatNumber(n)} 句结论` : '反方审稿推翻了报告中的结论'),
+    refutedNext: '请在证据中对照反方审稿的查询和理由，核实这些结论',
+    limit: (label: string, skipped?: number) => (skipped ? `反方审稿已达${label}，${formatNumber(skipped)} 句结论未审` : `反方审稿已达${label}`),
+    limitNext: '请在节点或「设置 → 偏好设置 → 核查」中调高反方审稿的上限',
+    /** challenge_unreviewed：有句子没能反查（核查模型不可用、数据源不在了……），记为无法判断 */
+    unreviewed: (n?: number) => (n ? `反方审稿有 ${formatNumber(n)} 句结论没能反查，已记为无法判断`
+      : '反方审稿有结论没能反查，已记为无法判断'),
+    unreviewedNext: '这几句没有真正查询数据。请检查核查模型和数据源是否可用，或在「设置 → 偏好设置 → 核查」中调高上限后重新运行',
+    /** challenge_sources_lost：反查了，但该查的数据源有停用了的，判断不含它们的数据 */
+    sourcesLost: (n?: number) => (n ? `反方审稿有 ${formatNumber(n)} 句结论只查了部分数据源` : '反方审稿有结论只查了部分数据源'),
+    sourcesLostSub: (names: string[]) => `未能查询：${names.map((x) => `「${x}」`).join('、')}（已不存在或已停用），判断不含其中的数据`,
+    sourcesLostNext: '请在「数据」页确认这些数据源是否应启用，启用后重新运行',
+  },
 }
 
 /**

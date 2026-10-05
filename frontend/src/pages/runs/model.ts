@@ -332,6 +332,8 @@ export const ARTIFACT_KIND_LABEL: Record<string, string> = {
   metric_set: '口径卡指标集',
   report_doc: '报告文档',
   schema_snapshot: '表结构快照',
+  dual_check: '双盲复算对照',
+  challenge: '反方审稿记录',
 }
 export const artifactKindLabel = (kind: string): string => ARTIFACT_KIND_LABEL[kind] ?? kind
 
@@ -349,6 +351,11 @@ export function artifactDescription(kind: string, meta?: Record<string, any> | n
     // 查库时冻结的表结构（工件行的 meta 里有 {source, tables: 表数量}）：报告里的表名、字段名按它核对
     case 'schema_snapshot': return meta?.source
       ? `表结构：数据源「${meta.source}」${typeof meta.tables === 'number' ? ` · ${meta.tables} 张表` : ''}` : '查询时保存的表结构'
+    // 两路结果对不上时交给审核人的完整对照（工件行的 meta 里有 {metrics: 指标个数}）
+    case 'dual_check': return typeof meta?.metrics === 'number'
+      ? `双盲复算：${meta.metrics} 个指标两边的 SQL、取值与差异说明` : '双盲复算：两边的 SQL、取值与差异说明'
+    // 反方审稿的完整记录（工件行的 meta 里有 {report: 审的报告节点}）
+    case 'challenge': return '反方审稿：每句结论的判断、理由和反方执行的查询'
     default: return '工件'
   }
 }
