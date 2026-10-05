@@ -3325,3 +3325,158 @@ export interface ScheduleWebhookTest {
   http_status: number | null
   message: string
 }
+
+// 运行对比（GET /api/runs/{id}/compare/base、/compare?base=）：两次运行的指标变化按数据 / 口径 / 模板与 SQL 拆开说。
+// 形状照前后端共用的接口约定，字段名一个不改；数值都是服务端算好的，界面只排版，渲染值原样显示
+// ---------------------------------------------------------------------------
+
+/** 对比里的一次运行。版本是空的：没从固定版本发起（探索运行）；schedule_id 是空的：手动发起 */
+export interface RunCompareRef {
+  id: string
+  workflow_name: string
+  version: number | null
+  run_class: 'formal' | 'exploratory' | null
+  started_at: string | null
+  finished_at: string | null
+  schedule_id: string | null
+}
+
+/** 默认基准从哪来：同一定时任务的上一次，没有就同一工作流、同一运行类别的上一次 */
+export type RunCompareBaseReason = 'same_schedule' | 'same_workflow'
+
+/** GET /runs/{id}/compare/base。找不到时 404，detail 是一句原因 */
+export interface RunCompareBase {
+  base_run_id: string
+  reason: RunCompareBaseReason | (string & {})
+  base: RunCompareRef
+}
+
+/**
+ * 指标的分类。unchanged：未变；data_only：只数据变；caliber_and_data：口径与数据都变（能严格拆时给口径效应、数据效应）；
+ * sql_changed：所依据的查询 SQL 结构变了（口径不同，不拆）；params_only：SQL 只差字面量（定时运行的日期）；
+ * added / removed：只有本次 / 只有基准有；incomparable：缺比较所需的信息
+ */
+export type RunCompareClass =
+  | 'unchanged' | 'data_only' | 'caliber_and_data' | 'sql_changed' | 'params_only' | 'added' | 'removed' | 'incomparable'
+
+/** 各类指标的个数 */
+export type RunCompareSummary = Record<RunCompareClass, number>
+
+export interface RunCompareTemplateNode {
+  node_id: string
+  title: string
+  change: 'added' | 'removed' | 'config' | (string & {})
+  /** 改了的配置项（节点配置里的键） */
+  keys: string[]
+  /** 约定之外、服务端顺带给的：各配置项在界面上的叫法，和 keys 一一对应。没给（或对不上）时照写键名 */
+  labels?: string[]
+}
+
+export interface RunCompareTemplate {
+  base_version: number | null
+  target_version: number | null
+  /** 两次运行的执行图完全相同 */
+  same_graph: boolean
+  nodes: RunCompareTemplateNode[]
+}
+
+/**
+ * 严格拆分：口径效应 = 新口径(本次的数据) − 旧口径(本次的数据)，数据效应 = 旧口径(本次的数据) − 旧口径(基准的数据)，
+ * 两者之和正好是总变化。*_rendered 是服务端按口径卡格式写好的（带正负号）
+ */
+export interface RunCompareDecomposition {
+  caliber_effect: number
+  data_effect: number
+  caliber_rendered: string
+  data_rendered: string
+}
+
+/** 一个输入在两次运行里的值（容器写大概，缺的是 null） */
+export interface RunCompareInput {
+  path: string
+  base: unknown
+  target: unknown
+  /** 约定之外、服务端顺带给的：取自设置了遮罩的列，两边的值都不给 */
+  masked?: boolean
+}
+
+export interface RunCompareAttributionRow {
+  /** 各维度列上的取值，和 columns 一一对应 */
+  key: unknown[]
+  base: number | null
+  target: number | null
+  delta: number | null
+  /** 这一项的变化占总变化的比例（小数，0.4 是 40%）。度量列之和对不上指标的输入时为 null，原因在 note */
+  share: number | null
+}
+
+/** 维度归因：按键对齐两边查询结果的行，变化最大的排在前面 */
+export interface RunCompareAttribution {
+  columns: string[]
+  measure: string
+  rows: RunCompareAttributionRow[]
+  total_delta: number | null
+  note: string | null
+}
+
+export interface RunCompareMetric {
+  card_id: string
+  card_title: string
+  metric_id: string
+  name: string
+  unit: string
+  decimals: number | null
+  base: number | null
+  target: number | null
+  base_rendered: string | null
+  target_rendered: string | null
+  delta: number | null
+  /** 带正负号；比率、百分数写「个百分点」。没变化、不是数时可能为 null */
+  delta_rendered: string | null
+  /** 相对基准变化了百分之几（已乘 100，保留两位：12.5 是 +12.5%，和占比的小数写法不同）；基准为 0、缺值时为 null */
+  delta_pct: number | null
+  classification: RunCompareClass | (string & {})
+  reasons: string[]
+  decomposition: RunCompareDecomposition | null
+  /** 没法严格拆分的原因；能拆、或者用不着拆（只数据变、未变）时为 null */
+  decomposition_note: string | null
+  inputs: RunCompareInput[]
+  attribution: RunCompareAttribution | null
+}
+
+/** same：完全相同；params_only：规范化之后相同，只差字面量；changed：结构不同；added / removed：只有一边有 */
+export type RunCompareStructure = 'same' | 'params_only' | 'changed' | 'added' | 'removed'
+
+export interface RunCompareQuery {
+  node_id: string
+  node_title: string
+  /** 同一节点里的第几条查询（服务端的序号，只用来排序和区分，界面另按 1 起数） */
+  ordinal: number
+  structure: RunCompareStructure | (string & {})
+  base_sql: string | null
+  target_sql: string | null
+  /** 不同的字面量（SQL 写法，字符串带引号），按出现的顺序 */
+  literals: { base: unknown; target: unknown }[]
+  base_rows: number | null
+  target_rows: number | null
+  base_truncated: boolean | null
+  target_truncated: boolean | null
+  /** 约定之外、服务端顺带给的：结构变了时差在哪，一处一句中文（按对结果的影响从大到小） */
+  differences?: string[]
+  /** 约定之外、服务端顺带给的：快照读不出来、与哈希不一致时的一句说明 */
+  problem?: string
+}
+
+/** GET /runs/{id}/compare?base=。任一未封存或封存核对不一致 409；不是同一工作流、是同一次运行 422 */
+export interface RunComparison {
+  target: RunCompareRef
+  base: RunCompareRef
+  summary: RunCompareSummary
+  template: RunCompareTemplate
+  metrics: RunCompareMetric[]
+  queries: RunCompareQuery[]
+  notes: string[]
+}
+
+/** 运行接口回的运行带着发起它的定时任务（RunOut.schedule_id）；Run 上没写这一项，对比页的运行卡要用 */
+export type RunWithSchedule = Run & { schedule_id?: string | null }

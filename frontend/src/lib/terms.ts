@@ -3057,12 +3057,201 @@ export const SCHEDULE_TEXT = {
   runTagSr: (name?: string | null) => (name ? `由定时任务「${name}」发起` : '由定时任务发起'),
 }
 
-/** 运行对比：记录页里两次运行的对照。配方前后对照另有 COMPARE_TEXT，别混用 */
+/**
+ * 运行对比（/runs/compare，pages/runs/ComparePage.tsx）：两次运行的指标变化拆成数据、口径、模板与 SQL 三类说清楚。
+ * 配方前后对照另有 COMPARE_TEXT，别混用。分类、拆分原因、说明（reasons、decomposition_note、notes）是服务端写的话，
+ * 原样显示，这里不改写
+ */
 export const RUN_COMPARE_TEXT = {
   title: '运行对比',
-  hint: '对照两次运行的结论与数据',
-  pending: PENDING_TEXT,
-  pendingHint: '运行对比尚未开放，完成后可从记录页选择两次运行进行对照',
+  hint: '把两次运行的指标变化拆成数据、口径、模板与 SQL 三类',
+  // 入口：运行详情的「更多」菜单
+  menu: '与上一次对比',
+  menuSealedOnly: '运行结束并封存后才能对比',
+  /** 没有 workflow_id 的运行：画布、问数据里没保存就运行的，或者工作流删掉之后被置空的。服务端只比同一个已保存的工作流 */
+  menuNoWorkflow: '工作流未保存或已删除，无法对比',
+  menuFinding: '正在查找上一次运行…',
+  pickManually: '手动选择基准',
+  retry: '重试',
+  // 顶部的两次运行
+  base: '基准',
+  target: '本次',
+  swap: '互换',
+  swapHint: '互换基准与本次',
+  openRun: (name: string) => `查看「${name}」这次运行的详情`,
+  scheduled: '定时任务发起',
+  unsealed: '未封存',
+  unsealedHint: '这次运行没有封存清单，不能参与对比',
+  runFailed: '无法读取这次运行',
+  runMissing: '运行记录不存在',
+  noBase: '未选择',
+  reason: {
+    same_schedule: '默认基准：同一定时任务的上一次运行',
+    same_workflow: '默认基准：同一工作流、同一运行类别的上一次运行',
+  } as Record<string, string>,
+  pickBase: '更换基准',
+  pickHint: '同一工作流最近的运行，未封存的不能作为基准',
+  pickLoading: '正在读取同一工作流的运行…',
+  pickFailed: '无法读取同一工作流的运行',
+  pickNone: '同一工作流没有其他运行',
+  pickUnsaved: '工作流未保存或已删除，没有可对比的运行',
+  pickPlaceholder: '选择一次运行作为基准',
+  /** 下拉里的一次运行：时间 · 类别和版本 · 短 id，没封存的另标 */
+  pickOption: (time: string, cls: string, id: string, sealed: boolean) =>
+    `${time} · ${cls} · ${id}${sealed ? '' : '（未封存）'}`,
+  /** 当前的基准读不到时下拉里的那一项（短 id）：如实显示选的是哪一次 */
+  pickGone: (id: string, missing: boolean) => `${id}（${missing ? '记录不存在' : '无法读取'}）`,
+  // 页面状态
+  noTarget: '未指定要对比的运行',
+  noTargetHint: '在运行详情的「更多」菜单中选择「与上一次对比」，即可对照本次与上一次运行',
+  toRuns: '前往记录',
+  finding: '正在查找基准运行…',
+  loading: '正在对比两次运行…',
+  // 对比失败：标题说是哪一种，服务端的原因原样跟在后面，最后一句下一步只写界面上真有的入口，服务端已经写了的不再重复
+  errSealed: '无法对比：有运行未封存或封存核对不一致',
+  errUnsealed: '无法对比：有运行尚未结束并封存',
+  errSealBroken: '无法对比：封存核对不一致',
+  /** 409 时不知道（或者知道不是）本次的问题：服务端的原因里写着是哪一次 */
+  errSealedHint: '若是基准运行的问题，可在上方更换基准',
+  errMismatch: '无法对比这两次运行',
+  errMismatchHint: '可在上方选择同一工作流的另一次运行作为基准',
+  /** 本次没有 workflow_id：哪一次都比不了，不给下一步 */
+  errUnsaved: '无法对比：本次运行的工作流未保存或已删除',
+  errMissing: '运行记录不存在',
+  errMissingHint: '链接可能已失效，请从记录页重新打开',
+  /** 本次的记录读得到、对比却回 404：缺的是基准 */
+  errBaseMissingHint: '可在上方选择另一次运行作为基准',
+  errNoBase: '未找到可作为基准的运行',
+  errNoBaseHint: '可在上方选择同一工作流的其他运行作为基准',
+  /** 下拉里一次能选的都没有（只有本次、或者都没封存） */
+  errNoBaseNone: '同一工作流还没有其他已封存的运行',
+  viewBase: '查看基准运行',
+  viewTarget: '查看本次运行',
+  // 摘要
+  summary: '变化摘要',
+  summaryHint: '点击一类只看这一类的指标',
+  classLabel: {
+    data_only: '只数据变',
+    caliber_and_data: '口径与数据都变',
+    sql_changed: 'SQL 结构变',
+    params_only: '只参数变',
+    added: '新增',
+    removed: '移除',
+    incomparable: '无法比较',
+    unchanged: '未变',
+  } as Record<string, string>,
+  // 照服务端（engine/compare.py）的分类口径写：口径变了含小数位、单位、显示格式，SQL 结构变含上游节点改配置
+  classHint: {
+    data_only: '口径与 SQL 都没有改动，变化来自数据',
+    caliber_and_data: '口径（计算式、口径版本、小数位、单位或显示格式）有改动，数据可能也有变化；能严格拆分的分别给出口径效应和数据效应',
+    sql_changed: '取数的 SQL 或上游节点的配置有改动，无法在口径与数据之间拆分',
+    params_only: '所依据的查询 SQL 结构相同，只有参数（如日期）或运行输入不同',
+    added: '本次有、基准没有的指标',
+    removed: '基准有、本次没有的指标',
+    incomparable: '缺少比较所需的信息，无法判断变化来自哪里',
+    unchanged: '两次的值相同，口径与 SQL 也没有改动',
+  } as Record<string, string>,
+  classOther: '其他',
+  filterOn: (label: string, n: number) => `只显示「${label}」的 ${formatNumber(n)} 个指标`,
+  showAll: '显示全部',
+  // 指标
+  metrics: '指标',
+  metricsEmpty: '两次运行的口径卡上都没有指标',
+  count: (n: number) => `${formatNumber(n)} 个`,
+  /** 查询按「条」数，和「第 N 条」一致 */
+  queryCount: (n: number) => `${formatNumber(n)} 条`,
+  colMetric: '指标',
+  colBase: '基准',
+  colTarget: '本次',
+  colDelta: '变化',
+  colClass: '分类',
+  colSplit: '拆分或原因',
+  legend: '口径效应按本次的数据计算，是只换口径带来的变化；数据效应按基准的口径计算，是只换数据带来的变化。两者之和等于总变化',
+  caliber: '口径',
+  data: '数据',
+  splitSum: (caliber: string, data: string, total: string) =>
+    `口径效应 ${caliber}，数据效应 ${data}，两者之和等于总变化 ${total}`,
+  noChange: '无变化',
+  expand: (name: string) => `展开「${name}」的输入对比与维度归因`,
+  collapse: (name: string) => `收起「${name}」的明细`,
+  reasons: '变化说明',
+  inputs: '输入对比',
+  inputsNone: '口径卡没有记录这个指标的输入',
+  /** 取自设置了遮罩的列：两边的值都不显示 */
+  masked: '已遮罩',
+  colInput: '输入',
+  attribution: '维度归因',
+  attrBy: (measure: string) => `按「${measure}」的变化，从大到小`,
+  attrTop: (n: number) => `前 ${formatNumber(n)} 项`,
+  attrMore: (n: number) => `另有 ${formatNumber(n)} 项未列出`,
+  attrTotal: (value: string) => `合计变化 ${value}`,
+  attrNone: '没有可按维度归因的明细',
+  /**
+   * 服务端只对只数据变、只参数变、口径与数据都变的指标做维度归因（两边的行说的是同一回事）。别的类不是「没有明细」，
+   * 是有意不做：写明为什么
+   */
+  attrSkipped: {
+    sql_changed: '取数的 SQL 或上游配置有改动，两边的行不能直接对照，不做维度归因',
+    incomparable: '无法判断变化来源，不做维度归因',
+    added: '基准没有这个指标，不做维度归因',
+    removed: '本次没有这个指标，不做维度归因',
+    unchanged: '数值没有变化，不做维度归因',
+  } as Record<string, string>,
+  /** 服务端没给占比、也没说为什么时的说法 */
+  attrNoShare: '无法计算各项占比',
+  colKey: '维度',
+  colShare: '占比',
+  // 查询
+  queries: '查询',
+  queriesEmpty: '两次运行都没有执行查询',
+  structure: {
+    same: '相同',
+    params_only: '只参数变',
+    changed: '结构变',
+    added: '新增',
+    removed: '移除',
+  } as Record<string, string>,
+  structureHint: {
+    same: 'SQL 完全相同',
+    params_only: 'SQL 结构相同，只有字面量不同',
+    // 服务端在只换了数据源、有一边的 SQL 读不出来时也标「结构变」
+    changed: 'SQL 结构或数据源不同，或有一边的 SQL 无法读取',
+    added: '本次新增的查询，基准中没有',
+    removed: '基准中有、本次没有的查询',
+  } as Record<string, string>,
+  nth: (n: number) => `第 ${n} 条`,
+  rows: (n: number | null | undefined, truncated: boolean | null | undefined) =>
+    (n == null ? '—' : `${formatNumber(n)} 行${truncated ? '（已截断）' : ''}`),
+  rowsBoth: (base: string, target: string) => `基准 ${base} → 本次 ${target}`,
+  rowsBase: (base: string) => `基准 ${base}`,
+  rowsTarget: (target: string) => `本次 ${target}`,
+  literals: '变化的参数',
+  /** 参数前后两个值之间的箭头，读屏念这个 */
+  changedTo: '改为',
+  baseSql: '基准的 SQL',
+  targetSql: '本次的 SQL',
+  bothSql: '两次相同的 SQL',
+  /** 快照读不出来、又拿不到执行时的参数：这一边没有 SQL，不能拿空串去和另一边比 */
+  sqlUnreadable: '这一边的 SQL 无法读取',
+  onlyBase: '基准独有',
+  onlyTarget: '本次独有',
+  showSql: '查看 SQL',
+  hideSql: '收起 SQL',
+  diffCoarse: '两条 SQL 差异较大，只标出了大致范围',
+  // 模板
+  template: '模板',
+  version: (v: number | null | undefined) => (v == null ? '未固定版本' : `v${v}`),
+  versions: (base: string, target: string) => `基准 ${base} → 本次 ${target}`,
+  sameGraph: '两次运行使用同一张执行图',
+  nodesNone: '执行图有变化，但没有列出具体节点',
+  nodeChange: {
+    added: '新增节点',
+    removed: '移除节点',
+    config: '配置变更',
+  } as Record<string, string>,
+  keys: '配置项',
+  // 说明
+  notes: '说明',
 }
 
 /**
