@@ -22,8 +22,9 @@ import type { Provider } from '../types'
 import { normalizeTheme } from '../lib/theme'
 import { useLeaveGuard } from '../lib/leave'
 import { localActor, setLocalActor } from '../lib/actor'
-import { AGENT_GUARD_TEXT, JUDGE_SETTING_TEXT, TOOL_GATE_TEXT, judgeByModelText, judgeUnlimitedText } from '../lib/terms'
+import { AGENT_GUARD_TEXT, JUDGE_SETTING_TEXT, TOOL_GATE_TEXT, VERIFY_SETTING_TEXT, judgeByModelText, judgeUnlimitedText } from '../lib/terms'
 import type { ThemePref } from '../lib/theme'
+import { VerifySection, verifyChanged, verifyDraftOf, verifyErrors, verifyLabels, verifyPayload, type VerifyDraft } from './VerifySettings'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
 // 数据源搬去了顶级的「数据」页（/data），/settings/datasources 跳过去
@@ -615,6 +616,9 @@ function PrefsTab() {
     jClaims: string | null; jCost: string | null; jTimeout: string | null; jClick: string | null; jDaily: string | null
   } | null>(null)
   const [spend, setSpend] = useState<{ usd?: number; calls?: number; unpriced_calls?: number } | null>(null)
+  // 核查一组（双盲复算、反方审稿、审批质询）的草稿另放一份，和上面的共用保存条；verifySaves 是存过几次，今日核查花费跟着再取
+  const [verifyDraft, setVerifyDraft] = useState<VerifyDraft | null>(null)
+  const [verifySaves, setVerifySaves] = useState(0)
   const [saving, setSaving] = useState(false)
   const [savedFlash, setSavedFlash] = useState(0)
   const [saveError, setSaveError] = useState<unknown>(null)
@@ -686,9 +690,14 @@ function PrefsTab() {
     jClick: judgeError('jClick'), jDaily: judgeError('jDaily'),
   }
   const judgeInvalid = Object.values(judgeErrors).some(Boolean)
-  const invalid = guardInvalid || judgeInvalid
+  const verifySaved = verifyDraftOf(values?.verify)
+  const verifyCur = verifyDraft ?? verifySaved
+  const verifyKeys = verifyChanged(verifyCur, verifySaved)
+  const verifyErrs = verifyErrors(verifyCur, verifySaved)
+  const verifyInvalid = Object.values(verifyErrs).some(Boolean)
+  const invalid = guardInvalid || judgeInvalid || verifyInvalid
   const changed = (Object.keys(saved) as (keyof typeof saved)[]).filter((k) => cur[k] !== saved[k])
-  const dirty = values ? changed.length : 0
+  const dirty = values ? changed.length + verifyKeys.length : 0
   // 外壳唯一的 blocker 在地址（pathname）变化时问：切标签、导航、⌘K、⌥ 数字、后退都算
   useLeaveGuard(dirty > 0, () => confirmLeave(dirty))
 
@@ -701,6 +710,10 @@ function PrefsTab() {
   const edit = (patch: Partial<typeof saved>) => {
     setSaveError(null)
     setDraft({ ...cur, ...patch })
+  }
+  const editVerify = (patch: Partial<VerifyDraft>) => {
+    setSaveError(null)
+    setVerifyDraft({ ...verifyCur, ...patch })
   }
 
   /**
@@ -730,7 +743,9 @@ function PrefsTab() {
         click_max_cost_usd: parseLimit(cur.jClick),
         daily_max_usd: parseLimit(cur.jDaily),
       } : null
-      if (runChanged || judge) {
+      // 核查一组同样整组写（VerifySettings 的 verifyPayload）
+      const verify = verifyKeys.length ? verifyPayload(verifyCur) : null
+      if (runChanged || judge || verify) {
         const run = {
           ...(values.run ?? {}),
           default_memory_scope: cur.scope,
@@ -742,16 +757,19 @@ function PrefsTab() {
           agent_budget_tokens: cur.budgetTokens.trim() === '' ? null : Number(cur.budgetTokens),
           agent_budget_usd: cur.budgetUsd.trim() === '' ? null : Number(cur.budgetUsd),
         }
-        const out = await api.settings.put({ ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}) })
+        const out = await api.settings.put({ ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}), ...(verify ? { verify } : {}) })
         setValues((v) => ({
           ...(v ?? {}),
           ...(runChanged ? { run: out?.run ?? run } : {}),
           ...(judge ? { judge: out?.judge ?? judge } : {}),
+          ...(verify ? { verify: out?.verify ?? verify } : {}),
         }))
         // 每日上限改了：旁边那句「今天已花」的分母跟着变，顺手再取一次
         if (judge) void loadSpend()
+        if (verify) setVerifySaves((n) => n + 1)
       }
       setDraft(null)
+      setVerifyDraft(null)
       setSavedFlash(Date.now())
     } catch (e) {
       // 署名已经存上了：留在草稿里的只剩运行默认值，条上的计数跟着变少
@@ -1029,6 +1047,8 @@ function PrefsTab() {
               </div>
             </section>
           )}
+
+          {values.verify && <VerifySection cur={verifyCur} errors={verifyErrs} onEdit={editVerify} refresh={verifySaves} />}
         </>
       )}
 
@@ -1052,7 +1072,7 @@ function PrefsTab() {
                     judgeProvider: '裁判模型的接入', judgeModel: '裁判模型',
                     jClaims: '每份报告最多裁判句数', jCost: '每份报告的金额上限', jTimeout: '每份报告的时长上限',
                     jClick: '每次点击的金额上限', jDaily: '每日金额上限',
-                  })[k]).join('、')}
+                  })[k]).concat(verifyLabels(verifyKeys)).join('、')}
                 </span>
               </span>
               {saveError != null && (
@@ -1060,10 +1080,11 @@ function PrefsTab() {
               )}
               <span className="flex-1" />
               <button className="btn btn-sm btn-ghost" disabled={saving}
-                      onClick={() => { setDraft(null); setSaveError(null) }}>放弃</button>
+                      onClick={() => { setDraft(null); setVerifyDraft(null); setSaveError(null) }}>放弃</button>
               <button className="btn btn-sm btn-primary" disabled={saving || invalid}
                       title={guardInvalid ? '护栏设置中有无效值，请修正后再保存'
-                        : judgeInvalid ? '证据裁判的上限有无效值，请修正后再保存' : undefined}
+                        : judgeInvalid ? '证据裁判的上限有无效值，请修正后再保存'
+                        : verifyInvalid ? VERIFY_SETTING_TEXT.section.saveInvalid : undefined}
                       onClick={() => void save()}>
                 {saving ? <Spinner size={11} /> : <Check size={12} aria-hidden />} 保存设置
               </button>

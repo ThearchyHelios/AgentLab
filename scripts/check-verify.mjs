@@ -523,6 +523,199 @@ await section('检查器：360px 栏、390px 窄屏不横向溢出，深浅色�
   }
 })
 
+// ---------------------------------------------------------------- 设置页「核查」一节
+
+/**
+ * 设置页（真页面）：设置的读写、今日核查花费、模型接入按夹具答，PUT 记下请求体、合进存着的那份再回给页面；
+ * put 给了就由它答（模拟 422）。别的 GET 放行到服务端，别的写请求一律拦掉
+ */
+async function settingsPage({ width = 1280, height = 900, theme = 'dark', verify = fx.verify, put = null } = {}) {
+  const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
+  opened.add(ctx)
+  ctx.setDefaultTimeout(6000)
+  await ctx.addInitScript((t) => {
+    try { localStorage.setItem('agentlab.theme', t); localStorage.setItem('agentlab_actor', '张工') } catch { /* 隐私窗口 */ }
+  }, theme)
+  const page = await ctx.newPage()
+  const errors = []
+  const sent = []
+  let spendGets = 0
+  let stored = {
+    ui: { theme }, run: { default_memory_scope: 'default', default_collection: 'default', confirm_dangerous_tools: true,
+      tool_gate_provider: null, tool_gate_model: null, agent_max_steps: 100, agent_budget_tokens: 2000000, agent_budget_usd: null },
+    limits: { max_graph_steps: 200, max_agent_steps: 100, max_run_seconds: 1800 },
+    judge: { provider: 'judge-provider-x', model: null, report_max_claims: 40, report_max_cost_usd: 0.05, report_timeout_s: 30,
+      click_max_cost_usd: 0.01, daily_max_usd: 2 },
+    ...(verify ? { verify } : {}),
+  }
+  page.on('pageerror', (e) => errors.push(e.message))
+  page.on('dialog', (d) => { errors.push(`原生对话框：${d.message()}`); void d.dismiss() })
+  await page.route((u) => new URL(u).pathname.startsWith('/api/'), async (route) => {
+    const req = route.request()
+    const url = new URL(req.url())
+    if (url.pathname === '/api/settings' && req.method() === 'GET') return route.fulfill({ json: stored })
+    if (url.pathname === '/api/settings' && req.method() === 'PUT') {
+      const body = req.postDataJSON()
+      sent.push({ path: url.pathname, body })
+      if (put) {
+        const out = await put(body)
+        if (out) return route.fulfill({ status: out.status ?? 200, json: out.json })
+      }
+      stored = { ...stored, ...body.values }
+      return route.fulfill({ json: stored })
+    }
+    if (url.pathname === '/api/settings/verify/spend') {
+      spendGets += 1
+      return route.fulfill({ json: { date: '2026-10-05', usd: 0.0456, calls: 12, unpriced_calls: 1, daily_max_usd: stored.verify?.daily_max_usd ?? null } })
+    }
+    if (url.pathname === '/api/settings/judge/spend') return route.fulfill({ json: { date: '2026-10-05', usd: 0, calls: 0, unpriced_calls: 0 } })
+    if (url.pathname === '/api/providers') return route.fulfill({ json: fx.providers })
+    if (req.method() !== 'GET') {
+      sent.push({ path: url.pathname, blocked: true, method: req.method() })
+      return route.abort()
+    }
+    return route.continue()
+  })
+  await page.goto(`${WEB}/settings/prefs`, { waitUntil: 'domcontentloaded' })
+  await page.waitForSelector('[data-prefs-bar], [data-judge-settings]', { timeout: 15000 })
+  return { ctx, page, errors, sent, spends: () => spendGets }
+}
+
+await section('设置页「核查」一节：读回各项、叫法和服务端一致', async () => {
+  const { page, errors } = await settingsPage()
+  await page.waitForSelector('[data-verify-settings]')
+  const box = page.locator('[data-verify-settings]')
+  const { VERIFY_SETTING_TEXT: T } = await import(await load('/src/lib/terms.ts'))
+  check('偏好设置里有「核查」一节，说明三项共用核查模型和每日金额上限', (await text(box.locator('h2'))) === '核查'
+    && (await text(box)).includes('共用核查模型和每日金额上限'))
+  const label = async (id) => text(page.locator(`label[for="${id}"]`))
+  check('核查模型：接入、模型两项，叫法和服务端一致', await label('pref-verify-provider') === T.provider && await label('pref-verify-model') === T.model)
+  check('……接入留空时跟随证据裁判模型，并醒目提示未单独配置', (await page.locator('#pref-verify-provider option').first().innerText()) === '跟随证据裁判模型'
+    && (await text(page.locator('[data-verify-not-set]'))).includes('未单独配置，将使用证据裁判的模型'))
+  const parts = await page.locator('[data-verify-part]').evaluateAll((els) => els.map((e) => e.dataset.verifyPart))
+  check('三项各一组：双盲复算、反方审稿、审批质询', parts.join(',') === 'dual_check,challenge,inquiry', parts.join(','))
+  const v = (id) => page.locator(`#${id}`).inputValue()
+  check('双盲复算：启用、允许的相对误差、每项最多查询次数、时长上限', await page.locator('[data-verify-toggle="dual_check.enabled"]').isChecked()
+    && await v('pref-verify-dual_check-tolerance') === '0.000001' && await v('pref-verify-dual_check-max_queries') === '6'
+    && await v('pref-verify-dual_check-timeout_s') === '120')
+  check('反方审稿：启用、每份报告最多审几句、每句最多查询次数、时长上限', await page.locator('[data-verify-toggle="challenge.enabled"]').isChecked()
+    && await v('pref-verify-challenge-max_claims') === '5' && await v('pref-verify-challenge-max_queries') === '4'
+    && await v('pref-verify-challenge-timeout_s') === '90')
+  check('审批质询：启用、每次最多查询次数、时长上限', await page.locator('[data-verify-toggle="inquiry.enabled"]').isChecked()
+    && await v('pref-verify-inquiry-max_queries') === '6' && await v('pref-verify-inquiry-timeout_s') === '120')
+  check('每日金额上限', await v('pref-verify-daily_max_usd') === '2')
+  const ids = ['dual_check-tolerance', 'dual_check-max_queries', 'dual_check-timeout_s', 'challenge-max_claims', 'challenge-max_queries',
+    'challenge-timeout_s', 'inquiry-max_queries', 'inquiry-timeout_s', 'daily_max_usd']
+  const wrong = []
+  for (const id of ids) if (await label(`pref-verify-${id}`) !== T[id.replace('-', '.')]) wrong.push(id)
+  for (const k of ['dual_check.enabled', 'challenge.enabled', 'inquiry.enabled']) {
+    if ((await text(page.locator(`[data-verify-toggle="${k}"]`).locator('xpath=..'))) !== T[k]) wrong.push(k)
+  }
+  check('……每一项的字段名就是服务端报错时写的叫法', !wrong.length, wrong.join('、'))
+  const spend = await text(page.locator('[data-verify-spend]'))
+  check('每日上限旁边写今日核查花费', spend.includes('今日已花费 $0.0456（12 次调用）'), spend)
+  check('……估不出金额的调用另说', (await text(page.locator('[data-verify-unpriced]'))).includes('另有 1 次调用无法估算金额'))
+  check('没有运行时报错', errors.length === 0, errors.join('；'))
+  await shot(page, 'settings-dark')
+})
+
+await section('设置页「核查」一节：改了之后整组写 verify，不限存 null，错了不让存', async () => {
+  const { page, sent, errors, spends } = await settingsPage()
+  await page.waitForSelector('[data-verify-settings]')
+  const save = page.getByRole('button', { name: /保存设置/ })
+  await page.locator('[data-verify-toggle="challenge.enabled"]').uncheck()
+  await page.locator('#pref-verify-dual_check-tolerance').fill('0.001')
+  // 键盘勾「不限」：Tab 到复选框上按空格
+  await page.locator('[data-verify-limit="inquiry.timeout_s"] [data-verify-unlimited-toggle]').focus()
+  await page.keyboard.press('Space')
+  check('勾了「不限」：框变灰，写明还受什么约束', await page.locator('#pref-verify-inquiry-timeout_s').isDisabled()
+    && (await text(page.locator('[data-verify-limit="inquiry.timeout_s"] [data-verify-unlimited]'))) === '不设上限，时长仅受模型接口自身的超时约束')
+  await page.locator('#pref-verify-challenge-max_claims').fill('0')
+  check('句数填 0：标红、保存不可用', await save.isDisabled()
+    && (await text(page.locator('[data-verify-limit="challenge.max_claims"]'))).includes('请填写正整数，或勾选「不限」'))
+  await page.locator('#pref-verify-challenge-max_claims').fill('8')
+  await page.locator('#pref-verify-dual_check-tolerance').fill('-1')
+  check('相对误差填负数：标红、保存不可用', await save.isDisabled()
+    && (await text(page.locator('[data-verify-part="dual_check"]'))).includes('请填写不小于 0 的数'))
+  await page.locator('#pref-verify-dual_check-tolerance').fill('0.001')
+  await page.locator('#pref-verify-provider').selectOption('云端接入')
+  await page.locator('#pref-verify-model').fill('model-b')
+  check('填了核查模型：「未单独配置」的提示收起', await page.locator('[data-verify-not-set]').count() === 0)
+  const bar = (await text(page.locator('[data-prefs-bar]')))
+  check('保存条写明改了哪几项（用的是同一套叫法）', bar.includes('有 6 项未保存') && bar.includes('反方审稿 · 启用') && bar.includes('双盲复算 · 允许的相对误差')
+    && bar.includes('审批质询 · 每次时长上限（秒）') && bar.includes('核查模型 · 接入'), bar)
+  const before = spends()
+  await save.click()
+  await page.waitForFunction(() => document.querySelector('[data-prefs-bar]')?.textContent?.includes('已保存'))
+  const put = sent.filter((s) => s.path === '/api/settings' && !s.blocked).at(-1)?.body?.values ?? {}
+  check('保存：只写 verify 一组（运行默认值、裁判没改就不碰）', Object.keys(put).join(',') === 'verify', Object.keys(put).join(','))
+  const want = {
+    provider: '云端接入', model: 'model-b',
+    dual_check: { enabled: true, tolerance: 0.001, max_queries: 6, timeout_s: 120 },
+    challenge: { enabled: false, max_claims: 8, max_queries: 4, timeout_s: 90 },
+    inquiry: { enabled: true, max_queries: 6, timeout_s: null },
+    daily_max_usd: 2,
+  }
+  check('……整组写（没改的项照原值），不限存 null，数存成数', JSON.stringify(put.verify) === JSON.stringify(want), JSON.stringify(put.verify))
+  check('……存完再取一次今日花费', spends() > before, `${before} → ${spends()}`)
+  check('……存完读回来的就是刚存的', await page.locator('#pref-verify-model').inputValue() === 'model-b'
+    && !(await page.locator('[data-verify-toggle="challenge.enabled"]').isChecked()))
+  await page.locator('[data-verify-limit="daily_max_usd"] [data-verify-unlimited-toggle]').check()
+  const daily = await text(page.locator('[data-verify-limit="daily_max_usd"] [data-verify-unlimited]'))
+  check('每日上限设成不限：写明每日费用还受什么约束', daily.startsWith('不设上限，每日核查费用仅受'), daily)
+  await page.locator('[data-verify-limit="daily_max_usd"] [data-verify-unlimited-toggle]').uncheck()
+  check('勾掉「不限」：填回原来的数', await page.locator('#pref-verify-daily_max_usd').inputValue() === '2')
+  check('没有别的写请求', !sent.some((s) => s.blocked), JSON.stringify(sent.filter((s) => s.blocked)))
+  check('没有运行时报错', errors.length === 0, errors.join('；'))
+})
+
+await section('设置页「核查」一节：服务端拒收时照实说（报错里的叫法对得上字段名）', async () => {
+  const detail = '「反方审稿 · 每份报告最多审几句」需要填写正整数（句数），留空表示不限，当前为「2.5」'
+  const { page } = await settingsPage({ put: async () => ({ status: 422, json: { detail } }) })
+  await page.waitForSelector('[data-verify-settings]')
+  await page.locator('[data-verify-toggle="inquiry.enabled"]').uncheck()
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForSelector('[data-prefs-bar] [role="alert"]')
+  const bar = await text(page.locator('[data-prefs-bar]'))
+  check('保存失败：保存条照实说，改动还在', bar.includes('保存失败') && bar.includes('有 1 项未保存')
+    && !(await page.locator('[data-verify-toggle="inquiry.enabled"]').isChecked()), bar)
+  check('……报错里写的叫法就是页面上的字段名', (await text(page.locator('label[for="pref-verify-challenge-max_claims"]'))) === '反方审稿 · 每份报告最多审几句')
+})
+
+await section('设置页「核查」一节：老服务端没有这一组时不显示；390px 不横向溢出、深浅色可读', async () => {
+  const old = await settingsPage({ verify: null })
+  await old.page.waitForSelector('[data-judge-settings]')
+  check('老服务端没有 verify 一组：这一节不出现', await old.page.locator('[data-verify-settings]').count() === 0)
+  for (const theme of ['dark', 'light']) {
+    const { page, errors } = await settingsPage({ width: 390, height: 844, theme })
+    await page.waitForSelector('[data-verify-settings]')
+    await page.locator('[data-verify-limit="challenge.max_queries"] [data-verify-unlimited-toggle]').check()
+    await page.locator('#pref-verify-model').fill('model-zzz')
+    await page.locator('[data-verify-settings]').scrollIntoViewIfNeeded()
+    // 设置页的外壳在 390px 下本来就有一处隐形提示条伸出视口（没有这一节时也一样），这里只看这一节自己：
+    // 自己不出横向滚动条，里面的每个元素都不越过视口右边
+    const w = await page.evaluate(() => {
+      const box = document.querySelector('[data-verify-settings]')
+      const vw = document.documentElement.clientWidth
+      const right = Math.max(...[box, ...box.querySelectorAll('*')].map((e) => e.getBoundingClientRect().right))
+      return { box: box.scrollWidth - box.clientWidth, beyond: Math.round(right - vw) }
+    })
+    check(`390px（${theme}）：「核查」一节不横向溢出`, w.box <= 0 && w.beyond <= 0, JSON.stringify(w))
+    const c = await page.evaluate(() => {
+      const base = getComputedStyle(document.body).backgroundColor
+      const pick = (sel) => { const el = document.querySelector(sel); return el && getComputedStyle(el).color }
+      return { base, unlimited: pick('[data-verify-unlimited]'), hint: pick('[data-verify-by-model]'), spend: pick('[data-verify-spend]') }
+    })
+    for (const key of ['unlimited', 'hint', 'spend']) {
+      const ratio = contrast(c[key], c.base, c.base)
+      check(`${theme}：${({ unlimited: '不限的说明', hint: '只填了模型的提醒', spend: '今日花费' })[key]}对比度 ≥ 4.5`, ratio >= 4.5,
+        `${ratio.toFixed(2)}（${c[key]} on ${c.base}）`)
+    }
+    await shot(page, `settings-narrow-${theme}`)
+    check(`390px（${theme}）：没有运行时报错`, errors.length === 0, errors.join('；'))
+  }
+})
+
 await browser.close()
 console.log(failed ? `\n✗ 双盲复算与反方审稿：${failed} 项未通过` : '\n✓ 双盲复算与反方审稿：全部通过')
 process.exit(failed ? 1 : 0)
