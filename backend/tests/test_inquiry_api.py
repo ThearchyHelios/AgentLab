@@ -526,7 +526,9 @@ async def test_the_run_must_be_waiting_on_that_approval(monkeypatch, shop, clien
     ({"report": "write", "unit": None, "question": QUESTION, "quote": "引" * 501}, "quote"),
     ({"report": "write", "unit": None, "question": QUESTION, "quote": 5}, "quote"),
     ({"report": "write", "unit": 12, "question": QUESTION}, "unit"),
+    ({"report": "write", "unit": 0, "question": QUESTION}, "unit"),
     ({"report": "write", "unit": None, "question": QUESTION, "approval_id": 7}, "approval_id"),
+    ({"report": "write", "unit": None, "question": QUESTION, "approval_id": False}, "approval_id"),
 ])
 async def test_bad_requests_name_the_field(monkeypatch, shop, client, body, field_name):
     Models(monkeypatch, shop)

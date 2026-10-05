@@ -214,9 +214,8 @@ def parse_ask(body: Any) -> Ask:
     report = body.get("report")
     if not isinstance(report, str) or not report.strip():
         raise _invalid("请指明质询的是哪份报告（报告撰写节点的 ID）", "report")
-    # 不指明句子、不是在审批卡上问的，写 null 和写空串是一个意思
-    unit = body.get("unit") or None
-    if unit is not None and (not isinstance(unit, str) or not unit.strip()):
+    unit = _blank_as_none(body.get("unit"))
+    if unit is not None and not isinstance(unit, str):
         raise _invalid("句子编号需要是文字，例如「u12」；不指明句子时留空", "unit")
     quote = body.get("quote")
     if quote is not None and not isinstance(quote, str):
@@ -230,11 +229,16 @@ def parse_ask(body: Any) -> Ask:
     question = question.strip()
     if len(question) > QUESTION_MAX:
         raise _invalid(f"问题最长 {QUESTION_MAX} 字，当前为 {len(question)} 字", "question")
-    approval_id = body.get("approval_id") or None
-    if approval_id is not None and (not isinstance(approval_id, str) or not approval_id.strip()):
+    approval_id = _blank_as_none(body.get("approval_id"))
+    if approval_id is not None and not isinstance(approval_id, str):
         raise _invalid("审批卡的 ID 需要是文字；不是在审批卡上提问时留空", "approval_id")
     return Ask(report=report.strip(), unit=unit.strip() if unit else None, quote=quote, question=question,
                approval_id=approval_id.strip() if approval_id else None)
+
+
+def _blank_as_none(value: Any) -> Any:
+    """不指明句子、不是在审批卡上问的：写 null 和写空串是一个意思。别的类型原样交回，由调用方报格式不对。"""
+    return None if isinstance(value, str) and not value.strip() else value
 
 
 # --------------------------------------------------------------------------
@@ -669,7 +673,9 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
     return {
         "answer_text": text, "answer_doc": doc_id, "ok": ok, "limit": _limit(outcome),
         "error": None if ok else (outcome.error or failed or NO_ANSWER),
-        "inquiry_artifacts": [q["artifact"] for q in queries if q.get("artifact")], "queries": queries,
+        # 结果一模一样的两次查询是同一份快照（工件按内容寻址）：引用列表里只记一次
+        "inquiry_artifacts": list(dict.fromkeys(q["artifact"] for q in queries if q.get("artifact"))),
+        "queries": queries,
         "model": outcome.model, "usage": {k: outcome.usage.get(k, 0) for k in USAGE_KEYS},
     }
 
