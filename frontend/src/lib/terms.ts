@@ -3340,10 +3340,104 @@ export const DUAL_CHECK_TEXT = {
   pending: `${PENDING_TEXT}：本节点暂未生效，运行时将跳过`,
 }
 
-/** 反方审稿节点：节点库说明、检查器和运行结果 */
+/**
+ * 反方审稿节点：节点库说明、检查器、节点卡片摘要，以及审批卡上的反方审稿（run/ChallengeSummary.tsx）。
+ * 四种判断全站只有这一种叫法：经受住、被削弱、被推翻、无法判断。判断由反方模型给出，不是系统核对。
+ * 「出具会降档」只在正式运行、按降档处理时才说；探索运行不出具，不说任何和出具有关的话
+ */
 export const CHALLENGE_TEXT = {
-  description: '从反方立场审阅上游报告，逐条提出质疑',
-  pending: `${PENDING_TEXT}：本节点暂未生效，运行时将跳过`,
+  description: '从反方立场复核上游报告的关键结论：另一个模型只读查库，逐句判断经受住、被削弱、被推翻还是无法判断',
+  verdict: { stands: '经受住', weakened: '被削弱', refuted: '被推翻', inconclusive: '无法判断' },
+  /** 服务端给了一个界面不认识的判断：照写原值，不归到哪一类 */
+  verdictUnknown: (v: string) => `未知判断「${v}」`,
+
+  // ---- 节点卡片的摘要。report 是节点 id：卡片摘要只看配置 ----
+  summary: (c: { report?: unknown; max_claims?: unknown; enabled?: unknown }) => [
+    c.enabled === false ? '已关闭' : '',
+    typeof c.report === 'string' && c.report.trim() ? `审报告节点 ${c.report.trim()}` : '审上游报告',
+    typeof c.max_claims === 'number' && c.max_claims > 0 ? `最多审 ${formatNumber(c.max_claims)} 句结论` : '句数跟随设置',
+  ].filter(Boolean).join(' · '),
+
+  // ---- 检查器 ----
+  field: {
+    report: '要审的报告',
+    max_claims: '最多审几句',
+    max_queries: '每句最多查询次数',
+    timeout_s: '每句时长上限（秒）',
+    provider: '反方模型 · 接入',
+    model: '反方模型',
+    on_refuted: '结论被推翻时',
+    enabled: '启用',
+  },
+  followSettings: '跟随设置',
+  help: {
+    max_claims: '每份报告最多挑几句关键结论来审。留空则使用「设置 → 核查」中的值',
+    max_queries: '复核每句结论时最多执行几次查询。留空则使用「设置 → 核查」中的值',
+    timeout_s: '复核每句结论的时长上限，到时按已查到的结果给出判断。留空则使用「设置 → 核查」中的值',
+    on_refuted: '降档：被推翻的结论计入出具缺口，正式运行降档出具；只标注：在审批卡和运行记录中标出，不影响出具；'
+      + '报错：本节点失败，运行停止',
+  },
+  onRefuted: { degrade: '出具降档（默认）', flag: '只标注', fail: '报错并停止运行' },
+  unknownValue: (v: string) => `${v}：无法识别的值，请从上方选项中选择`,
+  reportPick: {
+    auto: (only: string | null) => (only ? `未选择：审上游的「${only}」` : '未选择：审上游的报告撰写节点'),
+    none: '上游没有报告撰写节点，请先在本节点之前连接一个报告撰写节点',
+    many: (n: number) => `上游有 ${formatNumber(n)} 个报告撰写节点，请选择要审的那一个`,
+    missing: (id: string) => `${id}（已不在画布上）`,
+    notUpstream: (label: string) => `${label}（不在上游）`,
+    missingHint: '所选节点已不在画布上，请重新选择',
+    notUpstreamHint: '所选节点不在本节点上游，运行到这里时它还没有写出报告，请重新选择或调整连线',
+  },
+  enabled: {
+    follow: '跟随设置', on: '开启', off: '关闭',
+    hint: {
+      follow: '使用「设置 → 核查」中「反方审稿 · 启用」的值',
+      on: '无论设置如何都执行反方审稿',
+      off: '不执行反方审稿，上游的结果原样交给下游，运行记录中记一条说明',
+    },
+  },
+  model: {
+    providerFollow: '跟随设置',
+    providerFromModel: '按模型名找接入',
+    providerMissing: (name: string) => `${name}（不存在）`,
+    providerDisabled: '（已停用）',
+    modelFollow: '跟随设置',
+    modelDefault: '留空则使用该接入的默认模型',
+    help: '接入和模型均未填写时，使用「设置 → 核查」中的核查模型；填写任一项后，整组以节点配置为准，不与设置合并。'
+      + '建议反方模型与撰写报告的模型不同，同一模型较难发现自身的错误',
+    byModel: (model: string, found: { name: string; enabled: boolean } | null | undefined, fallback: string | null | undefined) => (
+      found && !found.enabled
+        ? `只填了模型：「${model}」属于已停用的接入「${found.name}」，调用将失败。请启用该接入或选择其他接入`
+        : found
+          ? `只填了模型：将按模型名使用接入「${found.name}」。接入和模型都未填写时，才跟随设置中的核查模型`
+          : `只填了模型：所有接入的模型列表中都没有「${model}」，将使用默认接入${fallback ? `「${fallback}」` : ''}调用；`
+            + '如该模型不属于默认接入，请选择对应的接入'),
+    same: (model: string) => `反方模型与撰写报告的模型相同（「${model}」），审稿效果有限`,
+  },
+
+  // ---- 审批卡 ----
+  head: (label: string) => `报告「${label}」的反方审稿`,
+  count: (verdict: string, n: number) => `${verdict} ${formatNumber(n)} 句`,
+  none: '报告中没有需要反方复核的关键结论',
+  degrade: '出具会降档',
+  degradeHint: '被推翻的结论计入出具缺口，本次正式运行将降档出具',
+  flagNote: '按节点设置，被推翻的结论只做标注，不影响出具档位',
+  more: (n: number) => `另有 ${formatNumber(n)} 句未列出`,
+  showAll: '显示全部',
+  loading: '正在加载反方审稿…',
+  failed: '无法获取反方审稿的详细内容',
+  retry: '重试',
+  claimMissing: '反方审稿记录中没有这一句的详细内容',
+  judgedBy: (model: string | null) => `判断由反方模型${model ? `「${model}」` : ''}给出，并非系统核对`,
+  rationale: '理由',
+  rationaleEmpty: '反方没有给出理由',
+  docLoading: '正在加载理由…',
+  queries: (n: number) => `反方执行的查询（${formatNumber(n)} 次）`,
+  noQueries: '反方没有执行查询',
+  rows: (n: number) => `${formatNumber(n)} 行`,
+  truncated: '结果已截断，数据库中还有更多数据',
+  /** 理由里有出处的数字：读屏听到的是「数字，出处：查询 Q2 · 第 1 行 · amount」，点一下跳到那次查询 */
+  cited: (text: string, source: string) => `${text}，出处：${source}，跳到这次查询`,
 }
 
 /** 设置页里复核套件（双盲复算、反方审稿等）的默认值一栏 */

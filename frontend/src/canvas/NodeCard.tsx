@@ -98,7 +98,7 @@ function summarize(type: NodeType, config: Record<string, any>): string {
     case 'dual_check':
       return DUAL_CHECK_TEXT.pending
     case 'challenge':
-      return CHALLENGE_TEXT.pending
+      return CHALLENGE_TEXT.summary(config)
     default:
       return ''
   }

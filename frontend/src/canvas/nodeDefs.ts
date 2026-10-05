@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import {
   Bot, Braces, Brain, CheckCircle2, Code2, Combine, Database, FileInput, FileOutput, FileText,
   Gauge, GitBranch, GitCompareArrows, Hand, Repeat, Search, ShieldAlert, Shuffle, Users, Wrench,
@@ -6,6 +7,7 @@ import {
   APPROVAL_POLICY_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, UPGRADE_POLICY_LABEL,
 } from '../lib/terms'
 import type { NodeType } from '../types'
+import { nodePickField, triStateField, upstreamModel, verifyModelFields } from './verifyFields'
 
 export type FieldType =
   | 'text' | 'textarea' | 'prompt' | 'code' | 'number' | 'select' | 'switch'
@@ -51,6 +53,23 @@ export interface FieldDef {
    */
   unknownLabel?: (value: string) => string
   advanced?: boolean
+  /**
+   * 现有字段类型画不了的配置（选画布上某一类节点、三态开关、接入加模型）交给它画。
+   * 给了 render 就不再按 type 渲染；type 仍用于默认值和校验
+   */
+  render?: (p: FieldRenderProps) => ReactNode
+}
+
+/** FieldDef.render 拿到的：当前值、写回、所在节点和配置，以及无障碍属性 */
+export interface FieldRenderProps {
+  id: string
+  nodeId: string
+  value: any
+  config: Record<string, any>
+  invalid: boolean
+  describedBy?: string
+  disabled?: boolean
+  onChange: (v: any) => void
 }
 
 /**
@@ -669,9 +688,41 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   },
   challenge: {
     type: 'challenge', label: NODE_TYPE_LABEL.challenge, category: '把关', icon: ShieldAlert,
-    description: `${CHALLENGE_TEXT.description}。${CHALLENGE_TEXT.pending}`,
+    description: CHALLENGE_TEXT.description,
     hasTarget: true, sources: [{ id: 'out', label: '' }],
-    fields: [],
+    // 上限、模型、开关都可以不写：服务端按「设置 → 核查」里反方审稿那一组取（verify_settings）。没写的项不往配置里落默认值，
+    // 设置改了，没单独配过的节点跟着变
+    fields: [
+      nodePickField({ key: 'report', label: CHALLENGE_TEXT.field.report, nodeType: 'report', text: CHALLENGE_TEXT.reportPick }),
+      {
+        key: 'max_claims', label: CHALLENGE_TEXT.field.max_claims, type: 'number', min: 1,
+        placeholder: CHALLENGE_TEXT.followSettings, help: CHALLENGE_TEXT.help.max_claims,
+      },
+      // 和撰写报告的模型相同时提醒：同一个模型审自己写的结论，较难发现错误
+      ...verifyModelFields({
+        labels: { provider: CHALLENGE_TEXT.field.provider, model: CHALLENGE_TEXT.field.model },
+        text: CHALLENGE_TEXT.model, subject: upstreamModel('report', 'report'),
+      }),
+      {
+        // 没写等于 degrade：降档放第一项，没写时下拉框正好落在它上面
+        key: 'on_refuted', label: CHALLENGE_TEXT.field.on_refuted, type: 'select',
+        options: [
+          { value: 'degrade', label: CHALLENGE_TEXT.onRefuted.degrade },
+          { value: 'flag', label: CHALLENGE_TEXT.onRefuted.flag },
+          { value: 'fail', label: CHALLENGE_TEXT.onRefuted.fail },
+        ],
+        help: CHALLENGE_TEXT.help.on_refuted, unknownLabel: CHALLENGE_TEXT.unknownValue,
+      },
+      triStateField({ key: 'enabled', label: CHALLENGE_TEXT.field.enabled, text: CHALLENGE_TEXT.enabled }),
+      {
+        key: 'max_queries', label: CHALLENGE_TEXT.field.max_queries, type: 'number', min: 1, advanced: true,
+        placeholder: CHALLENGE_TEXT.followSettings, help: CHALLENGE_TEXT.help.max_queries,
+      },
+      {
+        key: 'timeout_s', label: CHALLENGE_TEXT.field.timeout_s, type: 'number', min: 1, advanced: true,
+        placeholder: CHALLENGE_TEXT.followSettings, help: CHALLENGE_TEXT.help.timeout_s,
+      },
+    ],
     defaults: {},
   },
 }
