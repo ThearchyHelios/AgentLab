@@ -6012,8 +6012,6 @@ class _Usage:
         return "cond"
 
     def _bases(self, col: Any, depth: int) -> list[tuple[str | None, str]]:
-        from sqlglot import exp
-
         if depth > 16 or self.resolver is None:
             return [(None, col.name)]
         item = self.resolver.source_of.get(id(col))
