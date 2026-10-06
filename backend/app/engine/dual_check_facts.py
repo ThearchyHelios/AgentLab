@@ -4,7 +4,10 @@
 对得上的事实只有三种（data/catalog.py 的表级项）：
 
 - 两边按不同的时间列筛时间 → 业务日期（business_date）：被采纳的一边按哪一列筛，业务日期就记哪一列。只有一边按时间
-  筛的不算：审核人判断的是要不要限定时间，没在两列之间选过
+  筛的不算：审核人判断的是要不要限定时间，没在两列之间选过。两边的列都得在表结构里声明为日期 / 时间类型（DATE、
+  DATETIME、TIMESTAMP、TIMESTAMPTZ、TIME，带精度、带时区的写法也算）：差异说明认时间列只看列名和常量像不像日期，
+  文本列（SQLite 常把日期存成文字）、整数列（Unix 秒、20260901 这类日期键）、名字带 time 的时长列都可能被说成「按它筛
+  时间」，认不准存的是不是日期，不记
 - 一边多一个排除无效记录的条件 → 有效记录条件（valid_filter）：被采纳的一边有这个条件才记，记的就是这个条件
 - 聚合只差去不去重、被采纳的一边去重 → 去重规则（dedup）。采纳了不去重的一边不记：那是这个指标自己的算法（数行），
   写成表的「不去重」会把别的指标带偏
@@ -55,6 +58,7 @@ from typing import Any
 from sqlalchemy import select
 
 from app.data import catalog
+from app.data.names import name_key
 from app.db.base import SessionLocal
 from app.db.models import DataSource
 
@@ -92,6 +96,11 @@ _MARKS_INVALID = _INVALID_WORDS | {"del", "removed", "hidden", "archived", "inte
 _MARKS_VALID = frozenset({"valid", "enabled", "active", "effective"})
 #: 取值和指标名称、口径说明比对时，数字至少这么长才比（0、1 这种标记值到处都是）
 _SCOPE_DIGITS = 2
+#: 表结构里声明的日期 / 时间类型（业务日期只记这样的列）：DATE、DATETIME、TIMESTAMP、TIMESTAMPTZ、TIME、TIMETZ，可以带
+#: 精度（TIMESTAMP(3)、DATETIME(6)）、带时区（TIMESTAMP WITH TIME ZONE、TIME WITHOUT TIME ZONE、Oracle 的 WITH LOCAL
+#: TIME ZONE），大小写不论。整个类型名都得是这个样子：DATE_KEY、INTERVAL 这类名字里带着 date、time 的不算
+_TEMPORAL_TYPE = re.compile(r"(?:date|datetime|timestamp|timestamptz|time|timetz)(?:\s*\(\s*\d+\s*\))?"
+                            r"(?:\s+with(?:out)?\s+(?:local\s+)?time\s+zone)?", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -131,8 +140,8 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
     candidate：{metric 指标名, choice "a" | "b", source 数据源名, dialect, sql: {a, b}（比较的两条 SQL）, diff:
     {equivalent, fallback, items: [FacetDiff.as_dict()]}, scope: {texts, columns}}。scope 是这个指标自己的范围：
     texts 是口径说明、所在分组的取值、本次运行的输入（指标名称总算在内），columns 是分组的列；有效记录条件用它排除
-    指标自己的筛选范围。notes 是这个数据源的目录（{表名: notes}），认码值的意思用。只看差异说明，不重新比 SQL：审核人
-    看到的就是这份说明。
+    指标自己的筛选范围。schema_cache 是数据源的表结构：认表，业务日期还要看两边的列声明的类型。notes 是这个数据源的
+    目录（{表名: notes}），认码值的意思用。只看差异说明，不重新比 SQL：审核人看到的就是这份说明。
     """
     name = str(candidate.get("metric") or "")
     side = candidate.get("choice")
@@ -148,7 +157,7 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
     item = items[0]
     aspect = str(item.get("aspect") or "")
     if aspect == "time":
-        fact, why = _business_date(item, side)
+        fact, why = _business_date(item, side, schema_cache)
     elif aspect == "filter":
         fact, why = _valid_filter(item, side, candidate, schema_cache, notes or {})
     elif aspect == "aggregate":
@@ -170,7 +179,10 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
                 metric_id=str(candidate.get("metric_id") or "")), None
 
 
-def _business_date(item: Mapping[str, Any], side: str) -> tuple[tuple[str, str, Any] | None, str | None]:
+def _business_date(item: Mapping[str, Any], side: str, schema_cache: Mapping[str, Any] | None
+                   ) -> tuple[tuple[str, str, Any] | None, str | None]:
+    """两边按不同的列筛时间、被采纳的一边按哪一列：(表, business_date, {column}) 或 (None, 为什么不记)。两边的列都要在
+    表结构里声明为日期 / 时间类型（_temporal_problem），被采纳的一边先看：它有问题说它，没问题再看另一边。"""
     other = "b" if side == "a" else "a"
     detail = item.get("detail") if isinstance(item.get("detail"), Mapping) else {}
 
@@ -187,7 +199,37 @@ def _business_date(item: Mapping[str, Any], side: str) -> tuple[tuple[str, str, 
         return None, "有一边按好几列筛时间，无法确定业务日期按哪一列"
     if (mine[0]["table"], mine[0]["column"]) == (theirs[0]["table"], theirs[0]["column"]):
         return None, "两边按同一列筛时间，没有可记的业务日期"
+    for label, ref in ((SIDE_LABEL[side], mine[0]), (SIDE_LABEL[other], theirs[0])):
+        if (problem := _temporal_problem(schema_cache, ref)) is not None:
+            return None, f"{label}按时间筛的列「{ref['table']}.{ref['column']}」{problem}，无法确认是日期 / 时间类型"
     return (str(mine[0]["table"]), "business_date", {"column": str(mine[0]["column"])}), None
+
+
+def _temporal_problem(schema_cache: Mapping[str, Any] | None, ref: Mapping[str, Any]) -> str | None:
+    """按时间筛的这一列在表结构里是不是声明成了日期 / 时间类型（_TEMPORAL_TYPE）：是的为 None，不是的交回它怎么了
+    （查不到、没声明类型、声明成了别的类型），接在列名后面读。
+
+    表按 catalog.resolve_table_name 认，列先按原样、再按 name_key 认（差异说明里的名字是规范化过的，SQLite 不加引号的
+    名字一律小写）。按 name_key 认出好几列的说对应好几列：哪一列是它说不准。"""
+    cache = schema_cache if isinstance(schema_cache, Mapping) else None
+    table = catalog.resolve_table_name(cache, str(ref["table"]))
+    tables = cache.get("tables") if cache is not None else None
+    meta = tables.get(table) if isinstance(tables, Mapping) and table is not None else None
+    columns = [c for c in meta.get("columns") or [] if isinstance(c, Mapping) and c.get("name")] \
+        if isinstance(meta, Mapping) else []
+    column = str(ref["column"])
+    found = [c for c in columns if str(c["name"]) == column] \
+        or [c for c in columns if name_key(str(c["name"])) == name_key(column)]
+    if not found:
+        return "不在数据源的表结构里"
+    if len(found) > 1:
+        return "在表结构里对应好几列"
+    declared = " ".join(str(found[0].get("type") or "").split())
+    if not declared:
+        return "在表结构里没有声明类型"
+    if not _TEMPORAL_TYPE.fullmatch(declared):
+        return f"在表结构里声明为 {declared}"
+    return None
 
 
 def _valid_filter(item: Mapping[str, Any], side: str, candidate: Mapping[str, Any],
