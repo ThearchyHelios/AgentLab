@@ -16,8 +16,9 @@ OR 里的标量子查询改成 CROSS JOIN，都是复验时真踩到的），所
 DIALECT_SAME_R2、KNOWN_UNRECOGNIZED（各方言，只查结论）里；第 3 轮的在 _DIFF_R3、_SAME_R3、_SAME_TYPED_R3（要给表结构才认得出，Pair.typed）、_SAME_SCHEMA_R3（要靠
 表结构里的主键才看得出等价，Pair.needs_schema）、_SAME_HARD_R3（执行）和 REGRESSIONS_R3、DIALECT_SAME_R3（只查
 结论）里；第 4 轮的在 _DIFF_R4、_SAME_HARD_R4、_SAME_SCHEMA_R4（执行）和 REGRESSIONS_R4、DIALECT_SAME_R4、
-CONSTRAINT_TRAPS_R4（只查结论，靠约束改写的陷阱另造一个小库执行）里。规范化不再靠约束改写，needs_schema 的对一律
-不判等价，给了表结构时只许给兜底。LIMIT 都带能定出唯一顺序的排序，没有 ORDER BY 的 LIMIT 不进语料（EXISTS 里的 LIMIT 1 OFFSET 1 只看有没有
+CONSTRAINT_TRAPS_R4（只查结论，靠约束改写的陷阱另造一个小库执行）里；第 5 轮的在 _DIFF_R5、_DIFF_TIME_R5、
+_SAME_HARD_R5、_SAME_SCHEMA_R5（执行）和 REGRESSIONS_R5、EXPLAIN_TRAPS_R5（只查结论）里。规范化不再靠约束改写，
+needs_schema 的对一律不判等价，给了表结构时只许给兜底。LIMIT 都带能定出唯一顺序的排序，没有 ORDER BY 的 LIMIT 不进语料（EXISTS 里的 LIMIT 1 OFFSET 1 只看有没有
 第二行，不看先后）。过去复验报过的反例都收进来了：第 5 轮回退的「只在 IN 子查询里用到的 CTE」在 PAIRS 里；复验者留在 /private/tmp 的脚本里、在这几组数据上
 结果不同的对是 VALIDATOR_DIFF（也进 PAIRS 执行）；旧测试（五轮复核修正按复验报告补的用例，各方言，用到的列这个库里
 不全有）里报过不同的对是 REGRESSIONS、意思一样的对是 DIALECT_SAME，这两份不执行，只查判没判等价。
@@ -3002,6 +3003,205 @@ def coupon_schema(dialect: str) -> dict:
     return _coupon_schema(mysql=dialect == "mysql")
 
 
+# ---------------------------------------------------------------------------- 第 5 轮复验的反例
+# 收尾第 1 轮之后的复验（回归、漏报、错报三位复验者）报的全部 blocker / major，外加自己在真实的 PostgreSQL 18.6 上
+# 差分压测（不加括号的运算符混用对 sqlglot 读出来的树每个操作数都加括号）找到的同一类写法。复验者的 channel 列改写成
+# 这里的 region，customers / invoices 改写成 users / orders；数仓的 sales_fact 这个库里没有，只查结论（见
+# EXPLAIN_TRAPS_R5）。
+
+#: 不许判等价、也不许给具体说法的（SQLite 上执行）：两条确实不同，以前却说错了不同在哪——
+#: - 条件写在聚合的参数里（SUM(status = 'paid')、COUNT(… OR NULL)、SUM(… IN (…))、COUNT(NULLIF(…))、
+#:   SUM(amount * (status = 'paid'))、SUM(amount * (1 - is_deleted))）：这一边也只数、只加满足条件的行，说「这一边没有
+#:   这个条件」等于说它把所有行都算进去了（真正的不同是另一边没有计数为 0 的组、空集时是 NULL 还是 0）；
+#: - 时间条件写在聚合的参数里（SUM(paid_at >= … AND paid_at < …)）：这一边是按 paid_at 归月的，不能说「没有按时间
+#:   筛选」；
+#: - 反连接（LEFT JOIN … WHERE 可空一侧的列 IS NULL）：说的是「没关联上」，不是有效行过滤；
+#: - 规范化因为结果不怕重复去掉了的 LEFT JOIN：原文明明写了 LEFT JOIN refunds，不能说「这一边没有关联 refunds 表」。
+_DIFF_R5 = [
+    ("r5-sum-of-condition", "SELECT region, SUM(status = 'paid') FROM orders GROUP BY region",
+     "SELECT region, COUNT(*) FROM orders WHERE status = 'paid' GROUP BY region"),
+    ("r5-count-condition-or-null", "SELECT region, COUNT(status = 'paid' OR NULL) FROM orders GROUP BY region",
+     "SELECT region, COUNT(*) FROM orders WHERE status = 'paid' GROUP BY region"),
+    ("r5-sum-of-in-list", "SELECT region, SUM(status IN ('paid', 'shipped')) FROM orders GROUP BY region",
+     "SELECT region, COUNT(*) FROM orders WHERE status IN ('paid', 'shipped') GROUP BY region"),
+    ("r5-count-nullif", "SELECT region, COUNT(NULLIF(status, 'void')) FROM orders GROUP BY region",
+     "SELECT region, COUNT(*) FROM orders WHERE status <> 'void' GROUP BY region"),
+    ("r5-sum-times-condition", "SELECT SUM(amount * (status = 'paid')) FROM orders",
+     "SELECT SUM(amount) FROM orders WHERE status = 'paid'"),
+    ("r5-sum-times-flag", "SELECT region, SUM(amount * (1 - is_deleted)) FROM orders GROUP BY region",
+     "SELECT region, SUM(amount) FROM orders WHERE is_deleted = 0 GROUP BY region"),
+    ("r5-sum-times-flag-ungrouped", "SELECT SUM(amount * (1 - is_deleted)) FROM orders",
+     "SELECT SUM(amount) FROM orders WHERE is_deleted = 0"),
+    ("r5-time-window-inside-sum", "SELECT region, SUM(paid_at >= '2026-09-01' AND paid_at < '2026-10-01') FROM orders "
+     "GROUP BY region",
+     "SELECT region, COUNT(*) FROM orders WHERE created_at >= '2026-09-01' AND created_at < '2026-10-01' "
+     "GROUP BY region"),
+    ("r5-time-lower-bound-inside-sum", "SELECT SUM(paid_at >= '2026-09-01') FROM orders",
+     "SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01'"),
+    ("r5-anti-join-vs-inner-join", "SELECT COUNT(*) FROM orders o LEFT JOIN payments p ON p.order_id = o.id "
+     "WHERE p.id IS NULL",
+     "SELECT COUNT(*) FROM orders o JOIN payments p ON p.order_id = o.id"),
+    ("r5-anti-join-key-vs-nullable-column", "SELECT u.id, u.name FROM users u LEFT JOIN orders o ON o.user_id = u.id "
+     "WHERE o.id IS NULL",
+     "SELECT u.id, u.name FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.created_at IS NULL"),
+    ("r5-dropped-left-join-vs-inner-join", "SELECT COUNT(DISTINCT o.user_id) FROM orders o LEFT JOIN refunds r "
+     "ON r.order_id = o.id",
+     "SELECT COUNT(DISTINCT o.user_id) FROM orders o JOIN refunds r ON r.order_id = o.id"),
+]
+
+#: 时间列上的日期范围（BETWEEN、LIKE '2026-09%'）是统计窗口，不是有效行过滤（SQLite 上执行，不许判等价）：以前在结果
+#: 看行先后的一段里（按日期表达式分组、取前 N 行）BETWEEN 不拆，被说成两条「只保留 … 的行」，时间列这一事实丢了；
+#: LIKE 取月也被说成有效行过滤。现在说成 time，或者只给兜底，不许说成 filter。每一项 (编号, A, B, A 的时间列, B 的
+#: 时间列)：SQLite 里说成 time 时 detail 里就是这两列（没有按时间筛选的一边是空列表）
+_DIFF_TIME_R5 = [
+    ("r5-between-on-two-time-columns-grouped-by-date",
+     "SELECT date(paid_at) AS d, SUM(amount) FROM orders WHERE paid_at BETWEEN '2026-09-01' AND '2026-09-30 23:59:59' "
+     "GROUP BY 1",
+     "SELECT date(paid_at) AS d, SUM(amount) FROM orders "
+     "WHERE created_at BETWEEN '2026-09-01' AND '2026-09-30 23:59:59' GROUP BY 1", ["paid_at"], ["created_at"]),
+    ("r5-between-on-two-time-columns-top-n",
+     "SELECT region, SUM(amount) AS revenue FROM orders WHERE paid_at BETWEEN '2026-09-01' AND '2026-09-30 23:59:59' "
+     "GROUP BY region ORDER BY revenue DESC, region LIMIT 3",
+     "SELECT region, SUM(amount) AS revenue FROM orders "
+     "WHERE created_at BETWEEN '2026-09-01' AND '2026-09-30 23:59:59' "
+     "GROUP BY region ORDER BY revenue DESC, region LIMIT 3", ["paid_at"], ["created_at"]),
+    ("r5-between-window-on-one-side-grouped-by-date",
+     "SELECT date(paid_at) AS d, SUM(amount) FROM orders WHERE status = 'paid' GROUP BY 1",
+     "SELECT date(paid_at) AS d, SUM(amount) FROM orders WHERE status = 'paid' "
+     "AND paid_at BETWEEN '2026-09-01' AND '2026-09-30 23:59:59' GROUP BY 1", [], ["paid_at"]),
+    ("r5-like-month-vs-no-window", "SELECT COUNT(*) FROM orders",
+     "SELECT COUNT(*) FROM orders WHERE paid_at LIKE '2026-09%'", [], ["paid_at"]),
+    ("r5-range-vs-like-month-on-another-column",
+     "SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01' AND paid_at < '2026-10-01'",
+     "SELECT COUNT(*) FROM orders WHERE created_at LIKE '2026-09%'", ["paid_at"], ["created_at"]),
+]
+
+#: 意思一样、要按语义推理才看得出的（SQLite 上执行）：可空一侧的关联键 u.id 为空就是没关联上，整行都是空值，多写的
+#: u.name IS NULL 被 u.id IS NULL 蕴含——不靠约束。以前说「B 只保留 users.name IS NULL 的行，A 没有这个条件」
+_SAME_HARD_R5 = [
+    ("r5-anti-join-extra-null-test",
+     "SELECT o.id FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE u.id IS NULL",
+     "SELECT o.id FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE u.id IS NULL AND u.name IS NULL"),
+]
+
+#: 意思一样、要靠表结构里的主键才看得出的（SQLite 上执行，needs_schema）：给了表结构时只许给兜底。
+#: - 两种反连接的写法：关联键 r.order_id 为空就是没关联上，蕴含 r.id 为空；r.id 是主键（不为空）时反过来也成立。没给
+#:   表结构时也不许说具体的：r.id IS NULL 那一边留下的行更多（关联上了、r.id 却为空的行），说它「只保留 … 的行、另一边
+#:   没有这个条件」把留得多的一边说成了严的一边（见 test_anti_joins_are_never_called_a_filter）；
+#: - 按主键分组（或者经关联条件等于主键）：同一组里这张表的列只有一个值，LEFT JOIN、内连接把行复制了也一样，MAX 和
+#:   MIN 一样、AVG(DISTINCT) 和 AVG 一样。没给表结构时说「A 取最大值，B 取最小值」按已知信息成立
+_SAME_SCHEMA_R5 = [
+    ("r5-anti-join-key-vs-join-column", "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "WHERE r.id IS NULL",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE r.order_id IS NULL"),
+    ("r5-max-vs-min-of-a-column-the-group-key-determines", "SELECT u.id, MAX(u.city), COUNT(o.id) FROM users u "
+     "LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id",
+     "SELECT u.id, MIN(u.city), COUNT(o.id) FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id"),
+    ("r5-avg-distinct-of-a-column-the-group-key-determines", "SELECT o.id, AVG(DISTINCT o.amount), COUNT(r.id) "
+     "FROM orders o LEFT JOIN refunds r ON r.order_id = o.id GROUP BY o.id",
+     "SELECT o.id, AVG(o.amount), COUNT(r.id) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id GROUP BY o.id"),
+    ("r5-max-vs-min-through-the-join-key-top-n", "SELECT o.user_id, MAX(u.name) AS name, SUM(o.amount) AS total "
+     "FROM orders o JOIN users u ON u.id = o.user_id WHERE o.status = 'paid' GROUP BY o.user_id "
+     "ORDER BY total DESC, o.user_id LIMIT 5",
+     "SELECT o.user_id, MIN(u.name) AS name, SUM(o.amount) AS total FROM orders o JOIN users u ON u.id = o.user_id "
+     "WHERE o.status = 'paid' GROUP BY o.user_id ORDER BY total DESC, o.user_id LIMIT 5"),
+]
+
+#: 只在 PostgreSQL 才有的写法（不执行，只查不判等价、只给兜底、附原文的逐行对照）：复验者和自己在真实的 PostgreSQL
+#: 18.6 上跑出结果不同。PostgreSQL 里 ~、~*、~~、~~*、@@ 这些写成符号的匹配运算符和 ||、&、# 同级（「别的运算符」），
+#: 从左往右结合：status ~ 'p' || 'x' 是 (status ~ 'p') || 'x'，得到 'truex' 这样的文字；sqlglot 把它们放在比 || 松的
+#: 一级，读成 status ~ ('p' || 'x')。前缀的 @ 是取绝对值、和 - 20 一起是 @ (amount - 20)，sqlglot 读成参数 $amount；
+#: |/ 是双精度的平方根，sqlglot 写成 SQRT（numeric 的 SQRT 多出几位小数）；x COLLATE "C"::text 的 :: 套在整个 COLLATE
+#: 上，sqlglot 读成套在排序规则的名字上。不知道是哪种库时：块注释里再写 /*（PostgreSQL 嵌套、SQLite / MySQL 不嵌套）、
+#: 后面紧跟着字的 --（MySQL 里是两个减号）各库读法不同。每一项 (编号, 方言, A, B)，方言为空串是不知道
+REGRESSIONS_R5: list[tuple[str, str, str, str]] = [
+    ("pg_regex_match_then_concat", "postgres", "SELECT id, status ~ 'p' || 'x' FROM orders",
+     "SELECT id, status ~ ('p' || 'x') FROM orders"),
+    ("pg_regex_imatch_then_concat_grouped", "postgres",
+     "SELECT status ~* '^PA' || '' AS f, COUNT(*) FROM orders GROUP BY 1",
+     "SELECT status ~* ('^PA' || '') AS f, COUNT(*) FROM orders GROUP BY 1"),
+    ("pg_regex_match_then_concat_in_cte", "postgres",
+     "WITH t AS (SELECT id, status ~ '^p' || '' AS f FROM orders) SELECT f, COUNT(*) FROM t GROUP BY f",
+     "WITH t AS (SELECT id, status ~ ('^p' || '') AS f FROM orders) SELECT f, COUNT(*) FROM t GROUP BY f"),
+    ("pg_regex_match_then_concat_with_a_time_filter", "postgres",
+     "SELECT id, status ~ 'p' || 'x' FROM orders WHERE created_at >= '2026-09-01'",
+     "SELECT id, status ~ ('p' || 'x') FROM orders"),
+    ("pg_like_operator_then_concat", "postgres", "SELECT id, status ~~ 'p%' || 'x' FROM orders",
+     "SELECT id, status ~~ ('p%' || 'x') FROM orders"),
+    ("pg_ilike_operator_then_concat", "postgres", "SELECT id, status ~~* 'P%' || 'x' FROM orders",
+     "SELECT id, status ~~* ('P%' || 'x') FROM orders"),
+    ("pg_text_search_then_concat", "postgres", "SELECT id, to_tsvector(status) @@ 'paid' || '' FROM orders",
+     "SELECT id, to_tsvector(status) @@ ('paid' || '') FROM orders"),
+    ("pg_absolute_value_prefix", "postgres", "SELECT id, @ amount - 20 FROM orders",
+     "SELECT id, (@ amount) - 20 FROM orders"),
+    ("pg_square_root_prefix", "postgres", "SELECT id, |/ amount FROM orders", "SELECT id, SQRT(amount) FROM orders"),
+    ("pg_collate_then_cast", "postgres", "SELECT id, status COLLATE \"C\"::text FROM orders",
+     "SELECT id, status COLLATE (\"C\"::text) FROM orders"),
+    # 嵌套着读是一整段注释（SELECT id）；不嵌套着读，/* a /* b */ 到第一个 */ 就完了，+ 1 是代码，-- */ 是行注释
+    ("unknown_dialect_nested_block_comment", "", "SELECT id /* a /* b */ + 1 -- */\nFROM orders",
+     "SELECT id\nFROM orders"),
+    # sqlglot 当成注释吃掉 --1；MySQL 里 amount--1 是 amount - (-1)
+    ("unknown_dialect_dashes_without_space", "", "SELECT id, amount--1\nFROM orders", "SELECT id, amount\nFROM orders"),
+    # sqlglot 的通用读法（和 PostgreSQL、SQLite 一样）把 "status" 读成列名；MySQL 默认的 sql_mode 里双引号括起来的是
+    # 字符串，"status" = 'paid' 恒为假、SELECT "status" 每行都是 'status'（自查时发现，规格外，按最保守的做法拦下）
+    ("unknown_dialect_double_quoted_name", "", "SELECT COUNT(*) FROM orders WHERE \"status\" = 'paid'",
+     "SELECT COUNT(*) FROM orders WHERE status = 'paid'"),
+    ("unknown_dialect_double_quoted_select", "", "SELECT \"status\" FROM orders", "SELECT status FROM orders"),
+]
+
+#: 第 5 轮：要专门的表结构才看得出的（不执行，只查给的都是兜底）。每一项 (编号, 方言, A, B, 表结构, 没给表结构时也查)：
+#: - 数仓事实表的业务日期键（date_key BETWEEN 20260901 AND 20260930、stat_month = 202609）：认不出是不是时间列时，
+#:   不许说另一边「没有按时间筛选」，也不许把它说成有效行过滤；
+#: - 反连接的两种写法：关联上的行里主键、NOT NULL 的列不为空，两种写法都是「没关联上」；
+#: - 经关联条件等于分组键、又是那张表的主键：同一组里那张表的列只有一个值，MAX 和 MIN 一样（没给表结构时这么说按已知
+#:   信息成立，不查）。
+_SALES_FACT = {"tables": {"sales_fact": {"columns": [
+    {"name": "id", "type": "INTEGER", "nullable": False}, {"name": "date_key", "type": "INTEGER", "nullable": True},
+    {"name": "stat_month", "type": "INTEGER", "nullable": True}, {"name": "amount", "type": "REAL", "nullable": True},
+    {"name": "created_at", "type": "TEXT", "nullable": True}], "primary_key": ["id"]}}}
+_INVOICES = {"tables": {
+    "customers": {"columns": [{"name": "cid", "type": "INTEGER", "nullable": False},
+                              {"name": "cname", "type": "TEXT", "nullable": True},
+                              {"name": "region", "type": "TEXT", "nullable": True}], "primary_key": ["cid"]},
+    "invoices": {"columns": [{"name": "iid", "type": "INTEGER", "nullable": False},
+                             {"name": "cid", "type": "INTEGER", "nullable": True},
+                             {"name": "issued_at", "type": "TEXT", "nullable": False},
+                             {"name": "amount", "type": "REAL", "nullable": True},
+                             {"name": "state", "type": "TEXT", "nullable": True}], "primary_key": ["iid"]}}}
+_SALES_FACT_SEPTEMBER = ("SELECT SUM(amount) FROM sales_fact "
+                         "WHERE created_at >= '2026-09-01' AND created_at < '2026-10-01'")
+EXPLAIN_TRAPS_R5: list[tuple[str, str, str, str, dict, bool]] = [
+    ("date_key_between_vs_created_at_range", "sqlite",
+     "SELECT SUM(amount) FROM sales_fact WHERE date_key BETWEEN 20260901 AND 20260930",
+     _SALES_FACT_SEPTEMBER, _SALES_FACT, True),
+    ("date_key_between_vs_created_at_range", "postgres",
+     "SELECT SUM(amount) FROM sales_fact WHERE date_key BETWEEN 20260901 AND 20260930",
+     _SALES_FACT_SEPTEMBER, _SALES_FACT, True),
+    ("date_key_between_vs_created_at_range", "",
+     "SELECT SUM(amount) FROM sales_fact WHERE date_key BETWEEN 20260901 AND 20260930",
+     _SALES_FACT_SEPTEMBER, _SALES_FACT, True),
+    ("stat_month_vs_created_at_range", "sqlite", "SELECT SUM(amount) FROM sales_fact WHERE stat_month = 202609",
+     _SALES_FACT_SEPTEMBER, _SALES_FACT, True),
+    ("anti_join_primary_key_vs_not_null_column", "sqlite",
+     "SELECT c.cid, c.cname FROM customers c LEFT JOIN invoices i ON i.cid = c.cid WHERE i.iid IS NULL",
+     "SELECT c.cid, c.cname FROM customers c LEFT JOIN invoices i ON i.cid = c.cid WHERE i.issued_at IS NULL",
+     _INVOICES, True),
+    ("anti_join_join_column_vs_primary_key", "postgres",
+     "SELECT c.cid FROM customers c LEFT JOIN invoices i ON i.cid = c.cid WHERE i.cid IS NULL",
+     "SELECT c.cid FROM customers c LEFT JOIN invoices i ON i.cid = c.cid WHERE i.iid IS NULL", _INVOICES, True),
+    ("max_vs_min_through_the_join_key_top_n", "mysql",
+     "SELECT i.cid, MAX(c.cname) AS name, SUM(i.amount) AS total FROM invoices i JOIN customers c ON c.cid = i.cid "
+     "WHERE i.state = 'paid' GROUP BY i.cid ORDER BY total DESC, i.cid LIMIT 5",
+     "SELECT i.cid, MIN(c.cname) AS name, SUM(i.amount) AS total FROM invoices i JOIN customers c ON c.cid = i.cid "
+     "WHERE i.state = 'paid' GROUP BY i.cid ORDER BY total DESC, i.cid LIMIT 5", _INVOICES, False),
+    ("max_vs_min_of_a_column_the_group_key_determines", "sqlite",
+     "SELECT c.cid, MAX(c.region) AS region, COUNT(i.iid) AS n FROM customers c LEFT JOIN invoices i ON i.cid = c.cid "
+     "GROUP BY c.cid",
+     "SELECT c.cid, MIN(c.region) AS region, COUNT(i.iid) AS n FROM customers c LEFT JOIN invoices i ON i.cid = c.cid "
+     "GROUP BY c.cid", _INVOICES, False),
+]
+
+
 def build_coupon_database() -> sqlite3.Connection:
     """CONSTRAINT_TRAPS_R4 的小库（SQLite，内存）：TEXT 主键里同时有 '1' 和 '01'、'paid' 和 'Paid'，部分唯一索引下同一个
     code 有一行已删、一行未删。"""
@@ -3028,11 +3228,19 @@ PAIRS: list[Pair] = [Pair(f"same:{i}", a, b, "same") for i, a, b in _SAME] + \
     [Pair(f"hard:{i}", a, b, "same") for i, a, b in _SAME_HARD_R3] + \
     [Pair(f"diff:{i}", a, b, "diff") for i, a, b in _DIFF_R4] + \
     [Pair(f"hard:{i}", a, b, "same") for i, a, b in _SAME_HARD_R4] + \
-    [Pair(f"hard:{i}", a, b, "same", needs_schema=True) for i, a, b in _SAME_SCHEMA_R4]
+    [Pair(f"hard:{i}", a, b, "same", needs_schema=True) for i, a, b in _SAME_SCHEMA_R4] + \
+    [Pair(f"diff:{i}", a, b, "diff") for i, a, b in _DIFF_R5] + \
+    [Pair(f"diff:{i}", a, b, "diff") for i, a, b, _, _ in _DIFF_TIME_R5] + \
+    [Pair(f"hard:{i}", a, b, "same") for i, a, b in _SAME_HARD_R5] + \
+    [Pair(f"hard:{i}", a, b, "same", needs_schema=True) for i, a, b in _SAME_SCHEMA_R5]
 
 #: 第 4 轮复验报的、在 SQLite 上执行的那几对的编号（测试里按类别引用）
 ROUND_FOUR_DIFF = tuple(f"diff:{i}" for i, _, _ in _DIFF_R4)
 ROUND_FOUR_SAME = tuple(f"hard:{i}" for i, _, _ in _SAME_HARD_R4 + _SAME_SCHEMA_R4)
+#: 第 5 轮：真不同、只许给兜底的；时间窗口（只许说成 time 或者只给兜底）和各自的时间列；意思一样的
+ROUND_FIVE_DIFF = tuple(f"diff:{i}" for i, _, _ in _DIFF_R5)
+ROUND_FIVE_TIME = {f"diff:{i}": (ta, tb) for i, _, _, ta, tb in _DIFF_TIME_R5}
+ROUND_FIVE_SAME = tuple(f"hard:{i}" for i, _, _ in _SAME_HARD_R5 + _SAME_SCHEMA_R5)
 
 #: 按编号找语料里的一对（测试里引用第 2 轮的反例用）
 PAIRS_BY_ID: dict[str, Pair] = {p.id: p for p in PAIRS}

@@ -63,8 +63,15 @@ NOT NOT 条件去掉、德摩根律（三值逻辑下照样成立）；LIMIT / O
   写成 \\\\Z 的撞成同一个值）；数字后面紧跟着字母、下划线（1_000 是一千、0o17 是 15，sqlglot 切成数字加别名）；两个字符串
   常量挨着写（MySQL 里是拼接，SQLite 里是别名）；同一层括号、同一段条件里比较运算和 IS / IN / LIKE / BETWEEN / 另一个
   比较运算没加括号地混用（a = b IS NULL、a < 100 IN (0, 1)、a = 100 < 200：各方言的结合顺序和 sqlglot 的不一样）；
-  按位运算（& | ^ << >> ~，PostgreSQL 的 # 这类）和算术、拼接、另一种按位运算没加括号地混用；XOR；不知道是哪种库时
-  的 ||、MySQL 以外的 &&。
+  按位运算（& | ^ << >> ~，PostgreSQL 的 # 这类）和算术、拼接、另一种按位运算没加括号地混用；写成符号、sqlglot 却当成
+  LIKE 那一级来读的运算符（PostgreSQL 的 ~、~*、~~、~~*、@@、-|-……）和别的二元运算混用（PostgreSQL 里它们和 ||、&
+  同级、从左往右：status ~ 'p' || 'x' 是 (status ~ 'p') || 'x'，sqlglot 读成 status ~ ('p' || 'x')；写成关键字的
+  LIKE / ILIKE 本来就比 || 松，不算）；PostgreSQL 的前缀 @（取绝对值，sqlglot 读成参数）、|/ 和 ||/（双精度的开方，
+  sqlglot 写成 numeric 的 SQRT）、COLLATE 后面同一段里的 ::；XOR；不知道是哪种库时的 ||、#、块注释里套着的 /*（PostgreSQL
+  嵌套、SQLite / MySQL 不嵌套）、后面紧跟着字的 --（MySQL 里是两个减号）、双引号括起来的名字（MySQL 默认的 sql_mode 里
+  是字符串），MySQL 以外的 &&。第 5 轮在真实的
+  PostgreSQL 18.6、MySQL 8.0、SQLite 上做过差分压测（不加括号的随机运算符混用对 sqlglot 读出来的树每个操作数都加
+  括号，各几千条）：读错了的都在这里拦下。
 - 丢掉的：一元加号（SQLite 里 +a 去掉了类型亲和）、0x10 和 x'10' 这类只留下值的字面量、换了名字的类型名、MySQL 会执行
   的注释（/*! … */）、写成 ! 的 NOT；解析时换了写法又没留位置的函数名（见 _mark_surfaces：SQLite 的 MOD() 和 % 解析成
   同一个节点，记下原文写的名字就不会判成等价）。MySQL 里后面不跟空白的 -- 是两个减号，先拆开再解析。
@@ -95,7 +102,8 @@ PostgreSQL numeric 的 2.0 和 2.00、算出来的表达式），以及 PostgreS
 **假设（做不到的）**：SQLite 没给表结构时按列有声明的类型、默认的 BINARY 排序规则算——声明了 COLLATE NOCASE 的列、
 没有类型亲和的列（能同时存 1 和 1.0）表结构里看不出来；比较两边都是列时对调两边（SQLite 比较两列用左边那列声明的
 排序规则）。SQLite 的求和当成和先后无关。PostgreSQL、MySQL 没给表结构时一律不当成「相等就是一样」、也不当成精确数。
-MySQL 的表名按 Linux 上分大小写算。
+MySQL 的表名按 Linux 上分大小写算；MySQL 按默认的 sql_mode 读：双引号括起来的是字符串、|| 是 OR（开了 ANSI_QUOTES、
+PIPES_AS_CONCAT 的库这两处的意思不同，sqlglot 的 MySQL 读法和这里都按默认的算）。
 
 等价的结论另有执行比对守门（tests/test_sql_equivalence.py）：虚构库上五组随机数据、一组极端数据、一组专挑写法差异的
 数据，判等价的两条每组结果都得一样，结果不一样的绝不能判等价；复验报过的反例都收在语料里。
@@ -106,22 +114,32 @@ LIMIT 是至少为 1 的常数；没有认不准的名字、SELECT 列表里没�
 WHERE / GROUP BY 里用列别名的），而且只说四类：
 
 - 时间列（time）：两边各在一张底层表的一列上按时间筛、列不同（另一边哪儿都没用这一列筛选，两边的时间条件都不是恒为
-  真的）；一边按时间筛了、另一边哪儿都没有像时间的列和常量的，也说成 time（「A 按 paid_at 筛时间，B 没有按时间
-  筛选」）。detail 给两边的 [{table, column}]。
+  真的，时间列不在 LEFT JOIN 的可空一侧）；一边按时间筛了、另一边哪儿都没有可能是时间窗口的条件的（见下），也说成
+  time（「A 按 paid_at 筛时间，B 没有按时间筛选」）。时间条件是一列（可以套着日期函数、CAST）和常量比较、IN、BETWEEN，
+  列名像时间或者常量像日期；或者时间列 LIKE 一个像日期的模式（SQLite 里日期存成文字，paid_at LIKE '2026-09%' 是取月）。
+  两边的时间列在不同的表上时写成「表.列」。detail 给两边的 [{table, column}]。
+  「另一边可能按时间筛了」（_Usage.temporal）认得很宽：条件里（WHERE、ON、HAVING，聚合的参数、CASE、FILTER 里也算）
+  用到可能是时间的列（date_key、stat_month、pt、fiscal_year 这类，见 _timeish_name）、日期函数、像日期的常量
+  （20260901、202609 这类整数，'2026'、'2026Q3'、'2026-09%'），或者对同一个对象有上下界（BETWEEN、>= 和 < 一对）。
 - 多一个筛选条件（filter）：一边多出来、只涉及一张底层表的列和常量比的条件——另一边整条语句（WHERE、ON、HAVING、CASE /
-  FILTER 里，判空、或者条件只筛掉空值时连聚合的参数）对这些列没有任何条件；这一边对这些列的条件全是另一边没有的
-  （不是被另一边也有的条件蕴含的）；比的对象就是那一列（不是 LOWER(x) 这类认不出取值范围的）；按取值逐段算过不是
-  恒为真的（_Range.always：表结构里确定不为空、又不在真的可能整行为空的外连接一侧的列不取空值）。detail 给条件涉及的
-  实表列。
+  FILTER 里，聚合的参数里套在别的运算、函数里的：SUM(status = 'paid')、COUNT(… OR NULL)、COUNT(NULLIF(…))、
+  SUM(amount * (1 - is_deleted))；判空、或者条件只筛掉空值时连光一列的聚合参数）对这些列没有任何条件；这一边对这些列
+  的条件全是另一边没有的（不是被另一边也有的条件蕴含的）；比的对象就是那一列（不是 LOWER(x) 这类认不出取值范围的）；
+  按取值逐段算过不是恒为真的（_Range.always：表结构里确定不为空、又不在真的可能整行为空的外连接一侧的列不取空值）；
+  不用到 LEFT JOIN 可空一侧的列（WHERE r.id IS NULL 是反连接，说的是「没关联上」；r.order_id IS NULL 和 ON 里的
+  r.order_id = o.id 一起已经蕴含 r.id IS NULL）；不是可能的时间窗口（_window_like：date_key BETWEEN 20260901 AND
+  20260930、stat_month = 202609——认不准是不是时间列，说成有效行过滤会被写进数据目录）。detail 给条件涉及的实表列。
 - 聚合与去重（aggregate / group_by）：选出来的列只差在顶层的聚合函数上（同一列做参数，SUM 对 AVG；COUNT(*) 对 SUM(x)）
   或者去重上（COUNT / SUM / AVG 去不去重、COUNT(*) 对 COUNT(DISTINCT x)、SELECT DISTINCT 对不去重），分组一样。参数
-  得是光一列、在每组里不是定死的（不被 WHERE 定成常量、不等于分组键）；去重不起作用的不说（MIN / MAX；不分组的聚合只出
+  得是光一列、在每组里不是定死的（不被 WHERE 定成常量、不等于分组键、表结构里它那张表的键没有在组里定死——按 u.id 分组
+  时 MAX(u.city) 和 MIN(u.city) 一样，LEFT JOIN 把行复制了也一样）；去重不起作用的不说（MIN / MAX；不分组的聚合只出
   一行；已经按选出来的列分组；只取一行；表结构里的键说明每行本来就不一样）；每组只有一行时 SUM、AVG、MIN、MAX 不说。
 - 关联的表、关联类型（tables / join）：换了一张表；一边多关联了一张表（表结构里有指向它的外键、关联条件又用到它的键的
   不说）；一边多 LEFT JOIN 了一张表（在 ON 之外没用到、结果看得见重复的行、表结构里这张表的键不在 ON 里）；同一张表、
   同样的条件，LEFT JOIN 对内连接（可空一侧在 WHERE、HAVING、后面的连接里都没用到——后面的内连接引用可空一侧时没关联上
   的行反正留不下来；结果看得见没关联上的那些行，不是只取可空一侧跳过空值的聚合、FILTER；原文写的是 RIGHT JOIN、或者
-  被 WHERE / 聚合改成内连接的，说法和原文对不上，不说）。
+  被 WHERE / 聚合改成内连接的，说法和原文对不上，不说）。另一边原文也 LEFT JOIN 了这张表、只是规范化因为结果不怕重复
+  把它去掉了的，不说「另一边没有」。
 
 每一句都先确认这处不同真会影响结果：两边的 WHERE、HAVING、ON 里有可能恒为假的条件（常量条件，同一个对象上取不到值的
 几个条件）时什么都不说；结果看不见行的（SELECT COUNT(*) > -1 这类只出一行、值又和行无关的）不说筛选、关联上的不同；
@@ -148,11 +166,19 @@ WHERE / GROUP BY 里用列别名的），而且只说四类：
   可空一侧聚合的 LEFT JOIN 写成内连接。
 - 只给兜底的：不是简单形状的（CTE、子查询、UNION、窗口函数，规范化没把它们并掉的）；四类以外的不同（同一列上的时间
   范围、同一列上换了筛选的值、关联条件、分组、HAVING、排序、取几行、选出来的列、聚合的参数）；几张表、几列交错的条件；
-  自己关联自己、同名的表关联了几次的；换了表又有关联条件不同的。
+  自己关联自己、同名的表关联了几次的；换了表又有关联条件不同的；条件写在聚合里的一边对条件写在 WHERE 里的一边（SUM(status
+  = 'paid') 对 COUNT(*) … WHERE status = 'paid'：真正的不同是计数为 0 的组、空集时是 0 还是 NULL，说不清）；反连接；
+  可能是时间窗口、又认不准是不是时间列的条件（业务日期键、统计月份、分区，第几天这类范围）。
 - 已知的漏洞（只会说出「真会影响结果」以外的话，不会判错等价）：几列交错的矛盾条件（a > b AND b > a）认不出恒为假，
   两边都带着它时别处的不同其实看不出来；结果看不看得见行只按「SELECT 列表里有没有一项本身就是聚合」粗看，CASE WHEN
   COUNT(*) > 0 THEN 1 END 这类恒为一个值的表达式不算聚合，认作看不见（少说），可 MAX(x) 旁边并排的那一项恒为一个值时
-  仍按看得见说；表结构里没写外键、没写键的，按「可能对不上、可能重复」说（库里实际有约束时这句话可能不起作用）。
+  仍按看得见说；表结构里没写外键、没写键的，按「可能对不上、可能重复」说（库里实际有约束时这句话可能不起作用）；没给
+  表结构时按主键分组的 MAX(x) 对 MIN(x)、AVG(DISTINCT x) 对 AVG(x) 照说（那时不知道键）；「可能是时间」只认列名里的
+  词和像日期的常量，一边按 id 的单边范围、按批次号这类筛出来的其实是一段时间时，另一边仍会被说成「没有按时间筛选」。
+- 收窄换来的代价：一边的聚合参数里用到某一列（SUM(amount - discount)），另一边多一个这一列上的条件（WHERE discount
+  > 0）时，这个条件不再说成「另一边没有这个条件」（认不出参数里的运算是不是在筛）；列名带 day / month / period 这类
+  词、常量像日期的条件（delivery_days < 3、period_type = 'monthly'）不再说成有效行过滤；另一边有任何上下界（amount
+  BETWEEN 10 AND 100）时不再说它「没有按时间筛选」。都只给兜底。
 
 **和 sqlcheck 一样宁可漏报。** 解析不了（语法错、方言特性、多条语句、不是查询）就只给一条 aspect="parse"；从不抛异常，
 规范化或说明本身出了意外就当作这一级没有、说不清，记日志。只读语法树，不执行 SQL。
@@ -830,6 +856,80 @@ def _atomic(node: Any) -> bool:
 def _temporal_name(name: str) -> bool:
     """列名像日期、时间：英文按 catalog.is_date_column 的命名规则（paid_at、order_date），中文看结尾（支付日期）。"""
     return catalog.is_date_column(name, None) or bool(_CN_TIME.search(name))
+
+
+#: 切词后有一个词是这些的列名「可能是时间」：数仓的业务日期键 date_key、统计月份 stat_month、分区 pt / ds、财年
+#: fiscal_year、第几天 day_no……认不准是不是时间列（_temporal_name 认的是一定像日期的），只拿来少说：这样的列上的
+#: 窗口不说成有效行过滤，另一边有它时也不说「没有按时间筛选」
+_TIMEISH_WORDS = frozenset({"date", "dates", "time", "times", "day", "days", "dt", "ds", "ts", "timestamp", "datetime",
+                            "month", "months", "mon", "year", "years", "yr", "fy", "fiscal", "week", "weeks", "wk",
+                            "quarter", "qtr", "period", "hour", "hr", "minute", "ym", "ymd", "yyyymm", "yyyymmdd",
+                            "yyyy", "pt", "datekey", "datekeys"})
+_CN_TIMEISH = re.compile(r"日期|时间|时刻|年月|月份|年度|季度|账期|期间|统计期|周期|[年月日周]$")
+#: 可能是日期的数字写法：yyyymm、yyyymmdd（20260901、202609，数仓常这么存日期键、月份）
+_YMD_DIGITS = re.compile(r"^(?:19|20|21)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])?$")
+#: 可能是日期的文字：年（'2026'）、季度（'2026Q3'、'2026-Q3'）、周（'2026-W36'）
+_PARTIAL_DATE_TEXT = re.compile(r"^\s*(?:19|20|21)\d{2}(?:[-/]?[Qq][1-4]|-?[Ww]\d{1,2})?\s*$")
+
+
+def _timeish_name(name: str) -> bool:
+    """列名可能是时间（见 _TIMEISH_WORDS）：比 _temporal_name 宽。"""
+    return _temporal_name(name) or any(w in _TIMEISH_WORDS for w in catalog.name_words(name)) or \
+        bool(_CN_TIMEISH.search(name))
+
+
+def _date_like_literal(node: Any) -> bool:
+    """常量可能是日期：像日期的字符串（2026-09-01、2026-09、2026、20260901、2026Q3），yyyymm / yyyymmdd 的整数，
+    LIKE 的模式去掉两头的 % / _ 之后像日期（'2026-09%'）。"""
+    from sqlglot import exp
+
+    node = _unparen(node)
+    if not isinstance(node, exp.Literal):
+        return False
+    text = str(node.this).strip()
+    if node.is_string:
+        text = text.strip("%_")
+        return bool(_DATE_TEXT.match(text) or _PARTIAL_DATE_TEXT.match(text) or _YMD_DIGITS.match(text))
+    return bool(_YMD_DIGITS.match(text))
+
+
+#: 拿列和值比的谓词（判空不算：x IS NOT NULL 是有效行过滤，不是时间窗口）
+_WINDOW_PREDICATES = ("EQ", "NEQ", "GT", "GTE", "LT", "LTE", "In", "Between", "Like", "ILike", "RegexpLike",
+                      "RegexpILike", "Glob", "SimilarTo")
+
+
+def _window_like(node: Any) -> bool:
+    """node 里有可能是时间窗口的比较：拿可能是时间的列（见 _timeish_name）、日期函数、像日期的常量（见
+    _date_like_literal、_datey）去比。判空不算。只拿来少说：这样的条件不说成有效行过滤，另一边有它时也不说「没有按
+    时间筛选」。"""
+    from sqlglot import exp
+
+    for n in node.walk():
+        if type(n).__name__ not in _WINDOW_PREDICATES:
+            continue
+        if _datey(n) or any(_date_like_literal(x) for x in n.find_all(exp.Literal)) or \
+                any(c.name and _timeish_name(c.name) for c in n.find_all(exp.Column)):
+            return True
+    return False
+
+
+def _bounded_both_ways(tree: Any) -> bool:
+    """语句里有对同一个对象的上下界（BETWEEN，或者 x >= 常量 和 x < 常量 都有）：可能是认不出的时间窗口（第几天
+    day_no BETWEEN 20697 AND 20726）。只拿来少说。"""
+    from sqlglot import exp
+
+    if tree.find(exp.Between) is not None:
+        return True
+    low: set[str] = set()
+    high: set[str] = set()
+    for n in tree.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE):
+        left, right = _literal_value(n.this) is not None, _literal_value(n.expression) is not None
+        if left == right:
+            continue
+        subject = n.expression if left else n.this
+        upward = isinstance(n, (exp.GT, exp.GTE)) != left
+        (low if upward else high).add(_fingerprint(subject))
+    return bool(low & high)
 
 
 def _join_kind(join: Any) -> str:
@@ -2604,6 +2704,24 @@ _OPERAND_ENDS = frozenset({"VAR", "IDENTIFIER", "NUMBER", "R_PAREN", "R_BRACKET"
 #: 字符串里的反斜杠是转义的方言（MySQL / MariaDB，以及不知道是哪种库时）：sqlglot 不认 \Z（Ctrl+Z）、\0（NUL），
 #: 原样留着反斜杠，和写成 \\Z 的撞成同一个值。SQLite、PostgreSQL 的普通字符串里反斜杠就是反斜杠
 _PLAIN_BACKSLASH = frozenset({"sqlite", "postgres"})
+#: sqlglot 读注释的方式和库一样的方言：块注释 SQLite、MySQL 不嵌套（sqlglot 的这两种读法也不嵌套），PostgreSQL 嵌套
+#: （sqlglot 也嵌套）。别的方言、不知道是哪种库时，块注释里再写 /* 就说不准注释到哪儿为止
+_COMMENTS_AS_SQLGLOT = frozenset({"sqlite", "mysql", "postgres"})
+
+
+def _symbolic(word: str) -> bool:
+    """运算符写成符号（~、~*、@@、-|-），不是写成关键字（LIKE、ILIKE、REGEXP）。"""
+    return bool(word) and not any(ch.isalnum() or ch == "_" for ch in word)
+
+
+def _range_tokens(read: str | None) -> frozenset[str]:
+    """这个方言里 sqlglot 当成 LIKE、IN 那一级（比 ||、+ 松）来读的词的类型名（RANGE_PARSERS）。"""
+    from sqlglot.dialects.dialect import Dialect
+
+    try:
+        return frozenset(t.name for t in Dialect.get_or_raise(read).parser_class.RANGE_PARSERS)
+    except Exception:  # noqa: BLE001 - 取不到：只靠下面列出来的几类
+        return frozenset()
 
 
 def _misread(tokens: list[Any], text: str, read: str | None) -> str | None:
@@ -2619,12 +2737,31 @@ def _misread(tokens: list[Any], text: str, read: str | None) -> str | None:
       a < 100 IN (0, 1)、a = 100 < 200）：SQLite 里 IS、IN 和 = 同级从左往右，PostgreSQL 里 IS 比 = 松，MySQL 里
       比较运算都同级从左往右，sqlglot 让 IS / IN 先结合；
     - 同一层括号、同一段里，按位运算（& | ^ << >> ~ 和 PostgreSQL 的 # 这类）、COLLATE 和别的二元运算（算术、拼接、
-      另一种按位运算）混用。
+      另一种按位运算）混用；
+    - 写成符号、sqlglot 却当成 LIKE / IN 那一级来读的运算符（PostgreSQL 的 ~、~*、~~、~~*、@@、-|-、&<……）和别的二元
+      运算混用：PostgreSQL 里它们是「别的运算符」，和 ||、&、# 同级、从左往右结合，status ~ 'p' || 'x' 是
+      (status ~ 'p') || 'x'（得到 'truex' 这样的文字），sqlglot 读成 status ~ ('p' || 'x')。写成关键字的 LIKE、ILIKE
+      本来就比 || 松，PostgreSQL 和 sqlglot 读得一样，不算；
+    - PostgreSQL（以及不知道是哪种库时）的前缀 @（取绝对值，@ amount - 20 是 @ (amount - 20)，sqlglot 读成参数
+      $amount）、|/ 和 ||/（双精度的开方，sqlglot 写成 SQRT / CBRT，numeric 的 SQRT 结果多出几位小数）；COLLATE 后面
+      同一段里又有 ::（PostgreSQL 里 x COLLATE "C"::text 的 :: 套在整个 COLLATE 上，sqlglot 读成套在排序规则的名字上）；
+    - 不知道是哪种库时：块注释里再写 /*（PostgreSQL 嵌套、SQLite / MySQL 不嵌套，见 _COMMENTS_AS_SQLGLOT）、后面紧跟着
+      字的 --（MySQL 里 amount--1 是 amount - (-1)，别的库是注释）、#（MySQL 里是注释，PostgreSQL 里是按位异或）、双引号
+      括起来的名字（MySQL 默认的 sql_mode 里 "status" 是字符串，别的库和 sqlglot 的通用读法里是列名）。
 
     一段条件到 AND、OR、逗号、子句关键字为止（BETWEEN 自己的 AND 不算；IS [NOT] DISTINCT FROM 的 FROM 不算）。"""
     if read not in _PLAIN_BACKSLASH and any(
             t.token_type.name.endswith("STRING") and "\\" in text[t.start:t.end + 1] for t in tokens):
         return "字符串里的反斜杠转义"
+    if read not in _COMMENTS_AS_SQLGLOT and any("/*" in c for t in tokens for c in (t.comments or [])):
+        return "块注释里套着 /*"
+    if read is None and (_mysql_dashes(text) != text or any(t.token_type.name == "HASH" for t in tokens)):
+        return "-- 和 # 在这个方言里是不是注释说不准"
+    if read is None and any(t.token_type.name == "IDENTIFIER" and text[t.start:t.start + 1] == '"' for t in tokens):
+        # sqlglot 的通用读法（和 PostgreSQL、SQLite 一样）把 "status" 读成名字，MySQL 默认的 sql_mode 里它是字符串：
+        # WHERE "status" = 'paid' 恒为假，和 WHERE status = 'paid' 读成了同一棵树
+        return "双引号括起来的是名字还是字符串说不准"
+    ranged = _range_tokens(read)
     for prev, token in zip(tokens, tokens[1:]):
         if prev.token_type.name.endswith("STRING") and token.token_type.name.endswith("STRING"):
             return "两个字符串常量挨着写"
@@ -2634,7 +2771,7 @@ def _misread(tokens: list[Any], text: str, read: str | None) -> str | None:
     frames: list[dict[str, Any]] = [{}]
 
     def fresh(frame: dict[str, Any]) -> None:
-        frame.update(compare=0, between=0, bitwise=set(), arithmetic=False)
+        frame.update(compare=0, between=0, bitwise=set(), arithmetic=False, collated=False)
 
     def done(frame: dict[str, Any]) -> str | None:
         if frame["compare"] >= 2:
@@ -2658,6 +2795,15 @@ def _misread(tokens: list[Any], text: str, read: str | None) -> str | None:
             return "XOR"
         if (kind == "DPIPE" and read is None) or (kind == "DAMP" and read != "mysql"):
             return f"{token.text} 在这个方言里的意思说不准"
+        if kind == "PARAMETER" and token.text == "@" and read in ("postgres", None):
+            # PostgreSQL 里前缀的 @ 是取绝对值（@ amount - 20 是 @ (amount - 20)），sqlglot 读成参数 $amount
+            return "PostgreSQL 的前缀 @"
+        if kind in ("PIPE_SLASH", "DPIPE_SLASH"):
+            # PostgreSQL 的 |/、||/ 是双精度的开方，sqlglot 写成 SQRT / CBRT：numeric 的 SQRT 多出几位小数
+            return f"PostgreSQL 的 {token.text}"
+        if kind == "DCOLON" and frame["collated"]:
+            # x COLLATE "C"::text：PostgreSQL 里 :: 套在整个 COLLATE 上，sqlglot 读成套在排序规则的名字上
+            return "COLLATE 后面跟着 ::"
         if kind in ("L_PAREN", "L_BRACKET", "CASE"):
             frames.append({})
             fresh(frames[-1])
@@ -2688,6 +2834,9 @@ def _misread(tokens: list[Any], text: str, read: str | None) -> str | None:
         elif kind in _MISREAD_PREDICATES and not (called and kind not in ("IN", "BETWEEN", "IS")):
             # MySQL 的 ISNULL(x)、SQLite 的 like(x, y)、MATCH (…) AGAINST 这类写在值的位置、后面跟括号的是函数
             frame["compare"] += 1
+            if _symbolic(token.text):
+                # 写成符号的 ~、~*、~~、~~*：PostgreSQL 里和 ||、& 同级，sqlglot 当成 LIKE 那一级（比 || 松）
+                frame["bitwise"].add(kind)
             if kind == "BETWEEN":
                 frame["between"] += 1
             elif kind == "IS":
@@ -2703,12 +2852,14 @@ def _misread(tokens: list[Any], text: str, read: str | None) -> str | None:
         elif kind == "NOT" and nxt is not None and nxt.token_type.name == "NULL":
             # SQLite 的后缀 x NOT NULL（前面是 IS 的已经整个算过了）
             frame["compare"] += 1
-        elif kind in _MISREAD_BITWISE:
+        elif kind in _MISREAD_BITWISE or (kind in ranged and _symbolic(token.text)):
+            # 后一种：@@、-|-、&<、@? 这些写成符号的运算符，sqlglot 当成 LIKE 那一级，PostgreSQL 里和 ||、& 同级
             frame["bitwise"].add(kind)
         elif kind == "COLLATE":
             # MySQL 的 COLLATE 比 + 结合得紧，sqlglot 的 MySQL 读法让 a + b COLLATE x 整个套上 COLLATE：和算术、拼接、
             # 按位运算混用时当成按位运算一样拦下
             frame["bitwise"].add(kind)
+            frame["collated"] = True
         elif kind in _MISREAD_ARITHMETIC:
             frame["arithmetic"] = True
         i += 1
@@ -2729,8 +2880,9 @@ def _lost_in_parsing(text: str, read: str | None, tree: Any) -> bool:
       sqlglot 都按 NOT 读；
     - 类型名：解析后重新生成换了名字、又不是这个方言里的同义写法（SQLite 的 CAST(x AS STRING) 是数值亲和，解析成
       和 CAST(x AS TEXT) 一样的节点）；
-    - 已知会被读错的写法（MySQL 字符串里的反斜杠转义、1_000 这类数字、没加括号地混用的比较 / 按位运算、XOR，见
-      _misread）。"""
+    - 已知会被读错的写法（MySQL 字符串里的反斜杠转义、1_000 这类数字、没加括号地混用的比较 / 按位运算、PostgreSQL 写成
+      符号的匹配运算符和 || 混用、前缀的 @、|/、XOR，不知道是哪种库时套着的块注释、紧跟着字的 --、双引号括起来的名字，
+      见 _misread）。"""
     try:
         tokens = _tokens(text, read)
     except Exception:  # noqa: BLE001 - 切词都不行的，解析也过不了，那边会说
@@ -6217,11 +6369,21 @@ class _Usage:
     """一条语句里每一列（按定义找到实表列，认不出来源的只记列名）用在了哪儿：
 
     - cond：WHERE、ON、HAVING 里，条件里的子查询（IN、EXISTS、标量）选出来的列；
-    - case：CASE / IF / FILTER 里（SUM(CASE WHEN status = 'paid' THEN amount END) 等于先按 status 筛再求和）；
-    - agg：聚合函数、窗口函数的参数（COUNT(x)、SUM(x) 跳过空值，等于先筛掉 x 为空的行）。
+    - case：CASE / IF / FILTER 里（SUM(CASE WHEN status = 'paid' THEN amount END) 等于先按 status 筛再求和），以及聚合
+      的参数里套在别的运算、函数里的列（SUM(status = 'paid')、COUNT(status = 'paid' OR NULL)、COUNT(NULLIF(status,
+      'void'))、SUM(amount * (status = 'paid'))、SUM(amount * (1 - is_deleted))：乘上 0、变成空值的行就是被筛掉了，
+      和写 CASE 是一回事。认不出是不是在筛，一律当成在筛，只会少说）；
+    - agg：光一列做聚合函数、窗口函数的参数（COUNT(x)、SUM(x) 跳过空值，等于先筛掉 x 为空的行）。
 
     光选出来、分组、排序的列不记。说「另一边没有这个条件」「另一边没有按时间筛选」之前，先看另一边在这一段能影响到的
-    地方（整条语句，除了合并里别的支）用没用到这些列。"""
+    地方（整条语句，除了合并里别的支）用没用到这些列。
+
+    temporal：这条语句哪儿可能按时间筛了——在条件里（cond / case）用到可能是时间的列（_timeish_name：paid_at，也包括
+    date_key、stat_month 这类认不准的）；WHERE、HAVING、ON 里有日期函数、像日期的常量；任何地方（聚合的参数、CASE、
+    FILTER 里也算）有可能是时间窗口的比较（_window_like：20260901 这类整数、'2026-09%' 这类模式）；对同一个对象有
+    上下界（BETWEEN、x >= … 和 x < … 都有，见 _bounded_both_ways）。这时不说它「没有按时间筛选」：第 5 轮复验抓到
+    SUM(paid_at >= '2026-09-01' AND paid_at < '2026-10-01')、date_key BETWEEN 20260901 AND 20260930 都被说成了没有按时间
+    筛选。"""
 
     def __init__(self, tree: Any) -> None:
         from sqlglot import exp
@@ -6243,38 +6405,46 @@ class _Usage:
                 bases.append((None, col.name))
             for table, column in bases:
                 self.nodes.setdefault(_usage_key(table, column), {})[id(col)] = kind
-                if kind != "agg" and _temporal_name(column):
+                if kind != "agg" and (_timeish_name(column) or _timeish_name(col.name)):
                     self.temporal = True
         for node in tree.find_all(exp.Where, exp.Having, exp.Join):
             target = node.args.get("on") if isinstance(node, exp.Join) else node.this
             if target is not None and _datey(target):
                 self.temporal = True
+        if _window_like(tree) or _bounded_both_ways(tree):
+            self.temporal = True
 
     @staticmethod
-    def _owner(node: Any) -> tuple[Any, str | None, bool, bool]:
-        """node 属于哪一段 SELECT、在它的哪个子句里、路上有没有 CASE / IF / FILTER、有没有聚合 / 窗口函数。"""
+    def _owner(node: Any) -> tuple[Any, str | None, bool, bool, bool]:
+        """node 属于哪一段 SELECT、在它的哪个子句里、路上有没有 CASE / IF / FILTER、有没有聚合 / 窗口函数，以及在聚合的
+        参数里是不是套在别的运算、函数里（不是光一列：括号、DISTINCT、CAST 不算）。"""
         from sqlglot import exp
 
-        case = agg = False
+        case = agg = computed = False
         child, parent = node, node.parent
         while parent is not None:
             if isinstance(parent, (exp.Case, exp.If, exp.Filter)):
                 case = True
             if isinstance(parent, (exp.AggFunc, exp.Window)):
                 agg = True
+            elif not agg and not isinstance(parent, (exp.Paren, exp.Distinct, exp.Cast, exp.TryCast)):
+                # 只换类型（CAST）还是那一列；别的运算、函数（比较、NULLIF、乘上标记……）可能就是在筛
+                computed = True
             if isinstance(parent, exp.Select):
-                return parent, child.arg_key, case, agg
+                return parent, child.arg_key, case, agg, computed
             child, parent = parent, parent.parent
-        return None, None, case, agg
+        return None, None, case, agg, computed
 
     def _kind(self, col: Any) -> str | None:
-        select, key, case, agg = self._owner(col)
+        select, key, case, agg, computed = self._owner(col)
         if select is None:
             return None
         if key == "expressions":
             if _scalar_context(select) or _condition_query(select):
                 return "cond"
-            return "case" if case else ("agg" if agg else None)
+            if case or (agg and computed):
+                return "case"
+            return "agg" if agg else None
         if key in ("group", "order", "distinct"):
             return "case" if case else None
         return "cond"
@@ -6558,21 +6728,25 @@ class _Explainer:
     只在两边都是简单形状时说（见 _simple_block），也只说下面四类；别的不同（同一列上的时间范围、同一列上换了筛选的值、
     关联条件、分组、HAVING、排序、取几行、选出来的列、聚合的参数……）一律算没说到，交给兜底说明：
 
-    - time：底层表上按哪一列筛时间不同（两边各在一列上按时间筛，列不同，另一边哪儿都没用这一列筛选）；一边按时间筛了、
-      另一边哪儿都没有像时间的列和常量的，算多出来的筛选，也说成 time。
+    - time：底层表上按哪一列筛时间不同（两边各在一列上按时间筛，列不同，另一边哪儿都没用这一列筛选，时间列不在 LEFT
+      JOIN 的可空一侧）；一边按时间筛了、另一边哪儿都没有可能是时间窗口的条件的（见 _Usage.temporal），算多出来的
+      筛选，也说成 time。时间条件见 timed（比较、IN、BETWEEN，时间列 LIKE '2026-09%'）。
     - filter：一边多一个只涉及一张底层表的列、和常量比的筛选条件：另一边整条语句（WHERE、ON、HAVING、CASE / FILTER 里，
-      判空、或者条件只筛掉空值时连聚合的参数）对这些列没有任何条件；这一边对这些列的条件全是另一边没有的（不是被另一边
-      也有的条件蕴含的，x > 5 之外多写的 x IS NOT NULL 不说）；比的对象就是那一列（LOWER(x) <> 'PAID' 这类认不出取值
-      范围、可能恒为真）；按取值逐段算过不是恒为真的（见 _Range.always，一定不为空的列不算空值，见 _never_null）。
+      聚合的参数里套在别的运算、函数里的，判空、或者条件只筛掉空值时连光一列的聚合参数）对这些列没有任何条件；这一边
+      对这些列的条件全是另一边没有的（不是被另一边也有的条件蕴含的，x > 5 之外多写的 x IS NOT NULL 不说）；比的对象就是
+      那一列（LOWER(x) <> 'PAID' 这类认不出取值范围、可能恒为真）；按取值逐段算过不是恒为真的（见 _Range.always，一定
+      不为空的列不算空值，见 _never_null）；不用到 LEFT JOIN 可空一侧的列（反连接，见 _on_nullable_side）；不是认不准
+      的时间窗口（见 _window_like）。
     - aggregate / group_by：选出来的列只差在顶层的聚合函数（同一列做参数，SUM 对 AVG；COUNT(*) 对 SUM(x)）或者去重上
       （COUNT / SUM / AVG 去不去重，COUNT(*) 对 COUNT(DISTINCT x)，SELECT DISTINCT 对不去重），分组一样。参数在组里
-      定死的不说（被 WHERE / ON 定成常量、等于分组键、本身是常量，见 _fixed_in_group）；去重不起作用的不说：MIN / MAX；
-      不分组的聚合只出一行；已经按选出来的列分组；只取一行；表结构里的键说明每行本来就不一样（见 _maybe_unique）。每组
-      只有一行时 SUM、AVG、MIN、MAX 都是那一行的值，也不说。
+      定死的不说（被 WHERE / ON 定成常量、等于分组键、本身是常量、它那张表的键在组里定死了，见 _fixed_in_group）；去重
+      不起作用的不说：MIN / MAX；不分组的聚合只出一行；已经按选出来的列分组；只取一行；表结构里的键说明每行本来就不一样
+      （见 _maybe_unique）。每组只有一行时 SUM、AVG、MIN、MAX 都是那一行的值，也不说。
     - join / tables：关联的表不同（换了一张表、一边多关联了一张表）或者关联类型不同（同一个条件，LEFT JOIN 对内连接）。
       LEFT JOIN 对内连接要可空一侧在别处（WHERE、HAVING、后面的连接）都没用到、结果看得见没关联上的那些行（不是只取可空
       一侧跳过空值的聚合、FILTER）；一边多出来的 LEFT JOIN 要那张表在 ON 之外没用到、结果怕重复的行；表结构说关联起来
-      每行正好一行（外键、键）的不说。原文写的是 RIGHT JOIN、被 WHERE 或者聚合改成内连接的，说法和原文对不上，不说。
+      每行正好一行（外键、键）的不说。原文写的是 RIGHT JOIN、被 WHERE 或者聚合改成内连接的，说法和原文对不上，不说；
+      另一边原文也 LEFT JOIN 了这张表、被规范化去掉了的（见 _drop_unused_left_joins），不说「另一边没有」。
 
     两边的 WHERE、HAVING、ON 里有可能恒为假的条件（常量条件、同一个对象上取不到值的几个条件）时什么都不说：结果都是空的，
     别处的不同看不出来。结果看不见行的（只出一行、SELECT 列表里又没有一项本身就是聚合，见 _rows_visible）不说筛选、
@@ -6698,10 +6872,13 @@ class _Explainer:
             return self.show(conds[0], block)
         return self.show(exp.and_(*[c.copy() for c in conds], copy=False), block)
 
-    def named(self, table: str, column: str) -> str:
-        """列带中文名（有的话）：「支付时间 paid_at」。"""
+    def named(self, table: str, column: str, *, qualified: bool = False) -> str:
+        """列带中文名（有的话）：「支付时间 paid_at」。qualified 时写成「表.列」：两边的时间列在不同的表上（A 按
+        orders.paid_at、B 按 users.created_at），或者说「另一边没有按时间筛选」的这一边关联了好几张表时，光写 created_at
+        分不清是订单的下单时间还是用户的注册时间。"""
         label = self.label((table, column))
-        return _say(label, column) if label else column
+        shown = f"{table}.{column}" if qualified else column
+        return _say(label, shown) if label else shown
 
     @staticmethod
     def what(rel: _Rel) -> str:
@@ -6882,7 +7059,10 @@ class _Explainer:
         conds = [c for c in big.where if rel.alias in {col.table for col in c.find_all(exp.Column)}]
         skip = {self.fp(c) for c in conds}
         skips = (skip, set()) if side == 0 else (set(), skip)
-        if not self.visible or self._lossless(big, rel, conds):
+        # 另一边原文也 LEFT JOIN 了这张表、规范化因为结果不怕重复把它去掉了（见 _drop_unused_left_joins）：不能说「另一边
+        # 没有」（第 5 轮复验：COUNT(DISTINCT …) … LEFT JOIN refunds 对内连接 refunds，以前说「A 没有」关联 refunds）
+        dropped = small.select.meta.get(_DROPPED_JOINS) or []
+        if not self.visible or rel.name in dropped or self._lossless(big, rel, conds):
             return False, {}, *skips
         shown = _say("（关联的条件是", self.show_all(conds, big), "）") if conds and \
             all(self.base_columns(c, big) is not None for c in conds) else ""
@@ -7039,28 +7219,65 @@ class _Explainer:
     # ---- WHERE
 
     def timed(self, cond: Any, block: _Block) -> tuple[str, str] | None:
-        """时间条件：一列（可以套着日期函数、CAST）和常量比较，列名像时间或者常量像日期。返回 (实表, 列)。"""
+        """时间条件：一列（可以套着日期函数、CAST）和常量比较（=、<>、<、<=、>、>=、IN、BETWEEN），列名像时间或者常量
+        像日期；或者时间列（列名像时间、套着日期函数）LIKE 一个像日期的模式（SQLite 里日期存成文字，paid_at LIKE
+        '2026-09%' 是取月）。返回 (实表, 列)。只认一定是时间的：date_key BETWEEN 20260901 AND 20260930 这类认不准的
+        （见 _window_like）不算，调用方只给兜底。"""
         from sqlglot import exp
 
-        if not isinstance(cond, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.In)):
-            return None
+        like = isinstance(cond, (exp.Like, exp.ILike)) and not cond.args.get("escape")
         if isinstance(cond, exp.In):
             column_side, others = cond.this, list(cond.expressions)
+        elif isinstance(cond, exp.Between):
+            if cond.args.get("symmetric"):
+                return None
+            column_side, others = cond.this, [cond.args.get("low"), cond.args.get("high")]
+        elif like:
+            column_side, others = cond.this, [cond.expression]
+        elif not isinstance(cond, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+            return None
         elif _fixed(cond.expression):
             column_side, others = cond.this, [cond.expression]
         elif _fixed(cond.this):
             column_side, others = cond.expression, [cond.this]
         else:
             return None
-        if not others or not all(_fixed(o) for o in others):
+        if not others or not all(o is not None and _fixed(o) for o in others):
             return None
         cols = self.base_columns(column_side, block)
         if not cols or len({(r.alias, c.name) for r, c in cols}) != 1 or _value_column(column_side) is None:
             return None
         rel, col = cols[0]
+        if like:
+            # 模式得像日期（去掉两头的 %、_ 之后），对象得是时间列：status LIKE '2026%' 不是时间窗口
+            if not _date_like_literal(others[0]) or not (_temporal_name(col.name) or _datey(column_side)):
+                return None
+            return rel.name, col.name
         if _temporal_name(col.name) or any(_datey(o) for o in others) or _datey(column_side):
             return rel.name, col.name
         return None
+
+    @staticmethod
+    def _left_joined(block: _Block) -> set[str]:
+        """这一段里 LEFT JOIN 进来的来源（可空一侧）的别名。"""
+        return {j.this.alias_or_name for j in block.joins if str(j.side or "").upper() == "LEFT"}
+
+    def _on_nullable_side(self, conds: list[Any], block: _Block) -> bool:
+        """几个条件用到了 LEFT JOIN 可空一侧的列：可空一侧的列为空说的是「没关联上」（反连接），不为空的条件又让 LEFT
+        JOIN 变得像内连接——都是关联上的事，不是有效行过滤、时间窗口。认不出列的来源时也算用到了（少说）。"""
+        from sqlglot import exp
+
+        left = self._left_joined(block)
+        if not left:
+            return False
+        for cond in conds:
+            for col in cond.find_all(exp.Column):
+                if col.is_star:
+                    continue
+                cols = self.base_columns(col, block)
+                if not cols or cols[0][0].alias in left:
+                    return True
+        return False
 
     def _unmatched(self, xs: list[Any], ys: list[Any], mapping: Mapping[str, str]) -> tuple[list[Any], list[Any]]:
         rest = list(ys)
@@ -7107,11 +7324,15 @@ class _Explainer:
         all_b = {t for c in B.where if (t := self.timed(c, B)) is not None}
         on_a = [c for c in A.where if (self.refs(c, A) or set()) & {ka}]
         on_b = [c for c in B.where if (self.refs(c, B) or set()) & {kb}]
+        # 时间列在 LEFT JOIN 的可空一侧：条件管的是关联上的那些行，说成「按它筛时间」说不准
         if all_a != cols_a or all_b != cols_b or len(on_a) != len(conds_a) or len(on_b) != len(conds_b) or \
                 self._touched(self.usage_b, {ka}) or self._touched(self.usage_a, {kb}) or \
+                self._on_nullable_side(conds_a, A) or self._on_nullable_side(conds_b, B) or \
                 self._always(conds_a, A) is True or self._always(conds_b, B) is True:
             return only_a, only_b, False
-        text = _say(self.la, "按", self.named(*ka), "筛时间，", self.lb, "按", self.named(*kb))
+        qualified = not self.swapped and ka[0] != kb[0]
+        text = _say(self.la, "按", self.named(*ka, qualified=qualified), "筛时间，", self.lb, "按",
+                    self.named(*kb, qualified=qualified))
         if self._time_shape(conds_a) != self._time_shape(conds_b):
             text += _say("（", self.la, "是", self.show_all(_by_bound(conds_a), A), "，", self.lb, "是",
                          self.show_all(_by_bound(conds_b), B), "）")
@@ -7124,9 +7345,15 @@ class _Explainer:
         """block 这一边多出来的筛选条件（rest 是它没配上的 WHERE 项）。按用到的列连成一组（x > 5 和 x IS NOT NULL
         是一组）一组一组看，说得准的说「A 只保留 … 的行，B 没有这个条件」「A 排除了 … 的行，B 没有」「A 按 X 筛时间，
         B 没有按时间筛选」，说不准的算没说到。说得准要：这一组全是另一边没有的（有一项配上了，说明另一边对这些列也有
-        条件，多出来的可能被它蕴含）；只涉及一张实表的列；另一边整条语句对这些列没有任何条件（见 _Usage）；不是时间
-        条件的，比的对象就是那几列本身（LOWER(x)、LENGTH(x) 的取值范围认不出，x <> 'PAID' 可能恒为真）；按取值逐段算
-        过不是恒为真的（见 _always）。"""
+        条件，多出来的可能被它蕴含）；只涉及一张实表的列；另一边整条语句对这些列没有任何条件（见 _Usage：写在聚合的参数
+        里的 SUM(status = 'paid')、SUM(amount * (1 - is_deleted)) 也算有）；不是时间条件的，比的对象就是那几列本身
+        （LOWER(x)、LENGTH(x) 的取值范围认不出，x <> 'PAID' 可能恒为真）；按取值逐段算过不是恒为真的（见 _always）。
+
+        这几种不说（第 5 轮复验抓到的）：用到 LEFT JOIN 可空一侧的列的（WHERE r.id IS NULL 是反连接，说的是「没关联
+        上」；r.order_id IS NULL 和 ON 里的 r.order_id = o.id 一起已经蕴含 r.id IS NULL，说「另一边没有这个条件」把留得
+        多的一边说成了严的一边）；可能是时间窗口、又认不准是哪一列的时间的（date_key BETWEEN 20260901 AND 20260930、
+        stat_month = 202609，见 _window_like：说成有效行过滤会被写进数据目录）；说「另一边没有按时间筛选」时另一边可能
+        按时间筛了（见 _Usage.temporal）。"""
         usage = self.usage_b if side == 0 else self.usage_a
         me, them = (self.la, self.lb) if side == 0 else (self.lb, self.la)
         covered = True
@@ -7135,11 +7362,16 @@ class _Explainer:
             group = self._linked(pending[0], where, block)
             pending = [c for c in pending if all(c is not g for g in group)]
             refs = [self.refs(g, block) for g in group]
-            if any(all(g is not r for r in rest) for g in group) or any(r is None for r in refs) or usage is None:
+            if any(all(g is not r for r in rest) for g in group) or any(r is None for r in refs) or usage is None or \
+                    self._on_nullable_side(group, block):
                 covered = False
                 continue
             cols = set().union(*refs)
             times = {t for g in group if (t := self.timed(g, block)) is not None}
+            if not times and any(_window_like(g) for g in group):
+                # 可能是时间窗口，又认不准是不是时间列：既不说成有效行过滤，也不说成按它筛时间
+                covered = False
+                continue
             always = self._always(group, block)
             kinds = _kinds_for(group)
             if "agg" not in kinds and self._always(group, block, assume_values=True) is True:
@@ -7154,8 +7386,9 @@ class _Explainer:
             columns = {"columns": [{"table": t, "column": c} for t, c in sorted(cols)]}
             if times:
                 (key,) = times
-                text = _say(me, "按", self.named(*key), "筛时间，", them, "没有按时间筛选") if side == 0 else \
-                    _say(them, "没有按时间筛选，", me, "按", self.named(*key), "筛时间")
+                shown_key = self.named(*key, qualified=not self.swapped and len(block.all_rels()) > 1)
+                text = _say(me, "按", shown_key, "筛时间，", them, "没有按时间筛选") if side == 0 else \
+                    _say(them, "没有按时间筛选，", me, "按", shown_key, "筛时间")
                 self.add("time", key[1] if side == 0 else None, key[1] if side == 1 else None, text,
                          {"a" if side == 0 else "b": [{"table": key[0], "column": key[1]}],
                           "b" if side == 0 else "a": []})
@@ -7352,12 +7585,18 @@ class _Explainer:
 
     def _fixed_in_group(self, block: _Block, col: Any) -> bool:
         """col 在每一组里是不是只有一个值：被 WHERE、ON 里的「列 = 常量」定死，或者等于某个分组键（顺着 WHERE、ON 里
-        两列相等传过去）。认不出是哪一列的也当成定死了（少说）。"""
+        两列相等传过去），或者它那张表的某个键（主键、唯一约束）在组里定死了（同一组里这张表就只有一行的值：按 u.id 分组
+        时 u.city 只有一个值，LEFT JOIN、内连接把行复制了也一样，MAX(u.city) 和 MIN(u.city)、AVG(DISTINCT o.amount) 和
+        AVG(o.amount) 都一样——第 5 轮复验抓到以前照说不误）。认不出是哪一列的也当成定死了（少说）。
+
+        表结构里的键只拿来少说：类型亲和、COLLATE 让「唯一」不成立时，这里多当成定死了，只会少说一句，不会说错。"""
         from sqlglot import exp
 
         key = self._col_key(col, block)
         fixed = self._pinned(block) | {self._col_key(_unparen(g), block) for g in block.group
                                        if isinstance(_unparen(g), exp.Column)}
+        keys = {r.alias: self._keys(r) for r in block.all_rels() if r.table}
+        whole: set[str] = set()
         changed = True
         while changed:
             changed = False
@@ -7367,10 +7606,15 @@ class _Explainer:
                         isinstance(_unparen(c.expression), exp.Column):
                     left, right = self._col_key(_unparen(c.this), block), self._col_key(_unparen(c.expression), block)
                     for x, y in ((left, right), (right, left)):
-                        if x in fixed and y is not None and y not in fixed:
+                        if x is not None and (x in fixed or x[0] in whole) and y is not None and y not in fixed:
                             fixed.add(y)
                             changed = True
-        return key is None or key in fixed
+            for alias, groups in keys.items():
+                if alias not in whole and any(key_cols and all((alias, k) in fixed for k in key_cols)
+                                              for key_cols in groups):
+                    whole.add(alias)
+                    changed = True
+        return key is None or key in fixed or key[0] in whole
 
     # ---- 表结构里的键：只拿来少说
 
@@ -7539,7 +7783,8 @@ def explain_sql_diff(a: str, b: str, dialect: str | None = None, *, schema: Mapp
     只做保持语义的变换；同一级的两个规范形式完全一样（比语法树，见 _Form.key）才算等价，否则一律不等价，items 一定
     不为空。schema 是数据源的 schema_cache，给了就按它认列、展开 SELECT *（表结构要和库对得上）；里面的约束（主键、
     唯一约束、外键、NOT NULL）不拿来判等价，只拿来让说明少说。原文里有 sqlglot 会读错、会丢掉的写法的（MySQL 字符串
-    里的反斜杠转义、1_000、没加括号地混用的比较和按位运算、XOR、一元加号、0x10、换了名字的类型名……，见
+    里的反斜杠转义、1_000、没加括号地混用的比较和按位运算、PostgreSQL 写成符号的 ~ / ~~ / @@ 和 || 混用、前缀的 @、XOR、
+    一元加号、0x10、换了名字的类型名，不知道是哪种库时套着的块注释、紧跟着字的 --、双引号括起来的名字……，见
     _lost_in_parsing、_misread）不在语法树上判等价，只给兜底和原文的逐行对照。
 
     不等价时怎么说：两边的规范形式都是简单形状时（一段 SELECT、实表、普通的连接，见 _simple_block），只把四类有把握、
@@ -7549,7 +7794,8 @@ def explain_sql_diff(a: str, b: str, dialect: str | None = None, *, schema: Mapp
     的行（没有规范形式可比时给原文的逐行对照）。
 
     labels 是两边的叫法（缺省 A / B，双盲复算传「原流程」「盲算」）；names 是列的中文名（{「表.列」或「列」: 中文名}，
-    可以用 catalog_labels 从数据目录取），时间列写成「支付时间 paid_at」。任一边解析不了：只给一条 aspect="parse"。
+    可以用 catalog_labels 从数据目录取），时间列写成「支付时间 paid_at」（两边的时间列在不同的表上时写「表.列」）。任一边
+    解析不了：只给一条 aspect="parse"。
     """
     la, lb = labels
     read = _read(dialect)

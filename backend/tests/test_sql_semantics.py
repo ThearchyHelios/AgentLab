@@ -1439,6 +1439,14 @@ def test_differences_that_cannot_change_the_result_are_not_described(a, b):
     ("SELECT COUNT(DISTINCT status) FROM orders WHERE id = 5", "SELECT COUNT(status) FROM orders WHERE id = 5"),
     ("SELECT o.id FROM orders o LEFT JOIN users u ON u.id = o.user_id", "SELECT o.id FROM orders o"),
     ("SELECT COUNT(*) FROM orders o JOIN users u ON u.id = o.user_id", "SELECT COUNT(*) FROM orders o"),
+    # 第 5 轮：按主键分组（或者经关联条件等于主键），同一组里这张表的列只有一个值——LEFT JOIN 把行复制了也一样
+    ("SELECT u.id, MAX(u.city), COUNT(o.id) FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id",
+     "SELECT u.id, MIN(u.city), COUNT(o.id) FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id"),
+    ("SELECT o.id, AVG(DISTINCT o.amount), COUNT(r.id) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+     "GROUP BY o.id",
+     "SELECT o.id, AVG(o.amount), COUNT(r.id) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id GROUP BY o.id"),
+    ("SELECT o.user_id, MAX(u.name), SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id GROUP BY o.user_id",
+     "SELECT o.user_id, MIN(u.name), SUM(o.amount) FROM orders o JOIN users u ON u.id = o.user_id GROUP BY o.user_id"),
 ], ids=lambda v: None)
 def test_constraints_only_make_the_explanation_say_less(a, b):
     """表结构里的约束不拿来判等价，只拿来少说：主键不为空（id IS NOT NULL 恒为真）、主键定下来每组只有一行（SUM 和
@@ -1453,3 +1461,161 @@ def test_constraints_only_make_the_explanation_say_less(a, b):
         diff = explain_sql_diff(x, y, "sqlite")
         check_shape(diff)
         assert any(d.aspect != "other" for d in diff.items), (x, y, diff.items)
+
+
+# --------------------------------------------------------------------------
+# 第 5 轮：PostgreSQL 写成符号的运算符、各库读法不同的注释；条件写在聚合里、时间窗口、反连接、经主键定下来的列
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect,sql", [
+    ("postgres", "SELECT id, status ~ 'p' || 'x' FROM orders"),
+    ("postgres", "SELECT id, status ~* 'p' || 'x' FROM orders"),
+    ("postgres", "SELECT id, status ~~ 'p%' || 'x' FROM orders"),
+    ("postgres", "SELECT id, status ~~* 'P%' || 'x' FROM orders"),
+    ("postgres", "SELECT id, to_tsvector(status) @@ 'paid' || '' FROM orders"),
+    ("postgres", "SELECT id, tags @> 'a' || 'b' FROM orders"),
+    ("postgres", "SELECT id, @ amount - 20 FROM orders"),
+    ("postgres", "SELECT id, |/ amount FROM orders"),
+    ("postgres", "SELECT id, status COLLATE \"C\"::text FROM orders"),
+    (None, "SELECT id /* a /* b */ + 1 -- */\nFROM orders"),
+    (None, "SELECT id, amount--1\nFROM orders"),
+    (None, "SELECT COUNT(*) FROM orders WHERE \"status\" = 'paid'"),
+], ids=["regex-concat", "iregex-concat", "like-op-concat", "ilike-op-concat", "text-search-concat", "contains-concat",
+        "absolute-value", "square-root", "collate-cast", "unknown-nested-comment", "unknown-dashes",
+        "unknown-double-quotes"])
+def test_operators_postgres_reads_differently_from_sqlglot_are_held_back(dialect, sql):
+    """PostgreSQL 里 ~、~*、~~、~~*、@@、@> 这些写成符号的运算符和 ||、&、# 同级（「别的运算符」）、从左往右结合，sqlglot
+    把它们当成 LIKE、IN 那一级、比 || 松：status ~ 'p' || 'x' 在 PostgreSQL 里是 (status ~ 'p') || 'x'。前缀的 @ 是取
+    绝对值（sqlglot 读成参数），|/ 是双精度的平方根（sqlglot 写成 SQRT），x COLLATE "C"::text 的 :: 套在整个 COLLATE 上。
+    不知道是哪种库时，块注释里的 /*、紧跟着字的 --、双引号括起来的名字（MySQL 默认的 sql_mode 里是字符串）各库读法不同。
+    这些都不在语法树上判等价。"""
+    from app.data.sql_semantics import _lost_in_parsing, _parse, _read
+
+    read = _read(dialect)
+    tree, error = _parse(sql, read)
+    assert error is None and _lost_in_parsing(sql, read, tree)
+
+
+@pytest.mark.parametrize("dialect,sql", [
+    ("postgres", "SELECT id FROM orders WHERE status LIKE 'p' || '%'"),
+    ("postgres", "SELECT id FROM orders WHERE status ILIKE 'p' || '%' AND amount > 1"),
+    ("postgres", "SELECT id FROM orders WHERE status ~ ('p' || 'x')"),
+    ("postgres", "SELECT id FROM orders WHERE status ~ '^p' AND amount + 1 > 2"),
+    ("postgres", "SELECT id, status::text || 'x' FROM orders WHERE status COLLATE \"C\" > 'a'"),
+    ("sqlite", "SELECT id /* a /* b */ + 1 -- */\nFROM orders"),
+    ("postgres", "SELECT id /* a /* b */ + 1 -- */\nFROM orders"),
+    ("mysql", "SELECT id /* a /* b */ + 1 -- */\nFROM orders"),
+    ("sqlite", "SELECT id, amount--1\nFROM orders"),
+    ("postgres", "SELECT id, amount--1\nFROM orders"),
+    ("postgres", "SELECT COUNT(*) FROM orders WHERE \"status\" = 'paid'"),
+    ("mysql", "SELECT COUNT(*) FROM orders WHERE status = \"paid\""),
+], ids=["pg-like-concat", "pg-ilike-concat", "pg-regex-parenthesized", "pg-regex-own-segment", "pg-cast-collate-apart",
+        "sqlite-comment", "pg-comment", "mysql-comment", "sqlite-dashes", "pg-dashes", "pg-double-quotes",
+        "mysql-double-quotes"])
+def test_writings_each_engine_reads_like_sqlglot_are_not_held_back(dialect, sql):
+    """写成关键字的 LIKE / ILIKE 本来就比 || 松（PostgreSQL 和 sqlglot 读得一样）；加了括号、AND 隔开的不算混用；知道是
+    SQLite、PostgreSQL、MySQL 时，注释怎么嵌套、-- 后面要不要空白、双引号括起来的是名字还是字符串，sqlglot 和库读得一样：
+    照常规范化，加个空格照样认得出等价。"""
+    from app.data.sql_semantics import _lost_in_parsing, _parse, _read
+
+    read = _read(dialect)
+    tree, error = _parse(sql, read)
+    assert error is None and not _lost_in_parsing(sql, read, tree)
+    assert explain_sql_diff(sql, sql.replace(" FROM", "  FROM"), dialect).equivalent
+
+
+@pytest.mark.parametrize("pid,expected", [
+    ("diff:r5-between-on-two-time-columns-grouped-by-date", "A 按 paid_at 筛时间，B 按 created_at"),
+    ("diff:r5-between-on-two-time-columns-top-n", "A 按 paid_at 筛时间，B 按 created_at"),
+    ("diff:r5-between-window-on-one-side-grouped-by-date", "A 没有按时间筛选，B 按 paid_at 筛时间"),
+    ("diff:r5-like-month-vs-no-window", "A 没有按时间筛选，B 按 paid_at 筛时间"),
+    ("diff:r5-range-vs-like-month-on-another-column",
+     "A 按 paid_at 筛时间，B 按 created_at（A 是 paid_at >= '2026-09-01' AND paid_at < '2026-10-01'，"
+     "B 是 created_at LIKE '2026-09%'）"),
+])
+def test_time_windows_written_as_between_or_like_are_told_as_time_columns(pid, expected):
+    """时间列上的 BETWEEN、LIKE '2026-09%'（SQLite 里日期存成文字，取月常这么写）是统计窗口：说成按哪一列筛时间，不说成
+    「只保留 … 的行」（那是有效行过滤，会写进数据目录）。结果看行先后的一段（按日期表达式分组、取前 N 行）里 BETWEEN
+    不拆成两个比较，照样认得出。"""
+    pair = sql_pairs.PAIRS_BY_ID[pid]
+    for schema in (None, sql_pairs.schema_cache()):
+        diff = explain_sql_diff(pair.a, pair.b, "sqlite", schema=schema)
+        check_shape(diff)
+        assert [(d.aspect, d.text) for d in diff.items] == [("time", expected)], diff.items
+
+
+@pytest.mark.parametrize("a,b,expected", [
+    # 聚合的参数就是那一列（不是写在参数里的条件）：另一边确实没有按 status 筛
+    ("SELECT region, SUM(amount) FROM orders GROUP BY region",
+     "SELECT region, SUM(amount) FROM orders WHERE status = 'paid' GROUP BY region",
+     [("filter", "B 只保留 status = 'paid' 的行，A 没有这个条件")]),
+    ("SELECT SUM(amount) FROM orders", "SELECT SUM(amount) FROM orders WHERE amount > 0",
+     [("filter", "B 只保留 amount > 0 的行，A 没有这个条件")]),
+    # 只是选出来给人看的标记（不聚合，行都在结果里）：另一边确实把别的行也列出来了
+    ("SELECT id, status = 'paid' AS is_paid FROM orders",
+     "SELECT id, status = 'paid' AS is_paid FROM orders WHERE status = 'paid'",
+     [("filter", "B 只保留 status = 'paid' 的行，A 没有这个条件")]),
+    # 判空、按状态筛这类和日期无关的条件照说；时间列上的判空是有效行过滤，不是时间窗口
+    ("SELECT COUNT(*) FROM orders", "SELECT COUNT(*) FROM orders WHERE paid_at IS NOT NULL",
+     [("filter", "B 排除了 paid_at 为空的行，A 没有")]),
+    ("SELECT COUNT(*) FROM orders", "SELECT COUNT(*) FROM orders WHERE grade = 3",
+     [("filter", "B 只保留 grade = 3 的行，A 没有这个条件")]),
+], ids=lambda v: None)
+def test_filters_the_other_side_really_does_not_have_are_still_told(a, b, expected):
+    """收窄之后的对照：另一边确实没有这个条件时照说。"""
+    diff = explain_sql_diff(a, b, "sqlite")
+    check_shape(diff)
+    assert [(d.aspect, d.text) for d in diff.items] == expected, diff.items
+
+
+@pytest.mark.parametrize("a,b", [
+    # 条件、时间窗口写在聚合的参数里：这一边也只算满足条件的行
+    ("SELECT region, SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) FROM orders GROUP BY region",
+     "SELECT region, COUNT(*) FROM orders WHERE status = 'paid' GROUP BY region"),
+    ("SELECT region, SUM(IIF(status = 'paid', amount, 0)) FROM orders GROUP BY region",
+     "SELECT region, SUM(amount) FROM orders WHERE status = 'paid' GROUP BY region"),
+    ("SELECT region, AVG(status = 'paid') FROM orders GROUP BY region",
+     "SELECT region, AVG(status = 'paid') FROM orders WHERE status = 'paid' GROUP BY region"),
+    ("SELECT region, SUM(amount * is_paid) FROM orders GROUP BY region",
+     "SELECT region, SUM(amount) FROM orders WHERE is_paid = 1 GROUP BY region"),
+    ("SELECT SUM(amount) FILTER (WHERE created_at >= '2026-09-01') FROM orders",
+     "SELECT SUM(amount) FROM orders WHERE paid_at >= '2026-09-01'"),
+    # 分不清是不是日期的列上的窗口（业务日期键、统计月份、分区）：既不说成有效行过滤，也不说另一边「没有按时间筛选」
+    ("SELECT SUM(amount) FROM sales WHERE stat_month = 202609", "SELECT SUM(amount) FROM sales"),
+    ("SELECT SUM(amount) FROM sales WHERE pt = '20260901'", "SELECT SUM(amount) FROM sales"),
+    ("SELECT SUM(amount) FROM sales WHERE biz_key BETWEEN 20260901 AND 20260930",
+     "SELECT SUM(amount) FROM sales WHERE created_at >= '2026-09-01' AND created_at < '2026-10-01'"),
+    ("SELECT SUM(amount) FROM sales WHERE fiscal_year = 2026",
+     "SELECT SUM(amount) FROM sales WHERE created_at >= '2026-01-01'"),
+    # 另一边对别的列有范围（BETWEEN、上下界一对）：可能是认不出的时间窗口，不说「没有按时间筛选」
+    ("SELECT SUM(amount) FROM sales WHERE day_no BETWEEN 20697 AND 20726",
+     "SELECT SUM(amount) FROM sales WHERE created_at >= '2026-09-01' AND created_at < '2026-10-01'"),
+    # 反连接：可空一侧的列为空说的是「没关联上」
+    ("SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE r.state IS NULL",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"),
+    ("SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE r.refunded_at IS NULL",
+     "SELECT COUNT(*) FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE r.id IS NULL"),
+], ids=lambda v: None)
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_conditions_the_other_side_has_in_another_form_are_not_called_missing(a, b, dialect):
+    """第 5 轮：另一边其实有这个条件（写在聚合的参数里、写在 CASE / IIF / FILTER 里、乘上 0 / 1 的标记），或者这个条件
+    可能是认不出的时间窗口，或者是反连接——说「另一边没有这个条件」「另一边没有按时间筛选」就说错了，只给兜底。"""
+    for x, y in ((a, b), (b, a)):
+        diff = explain_sql_diff(x, y, dialect)
+        check_shape(diff)
+        assert not diff.equivalent and diff.items == [FacetDiff("other", None, None, FALLBACK)], (x, y, diff.items)
+
+
+def test_time_columns_on_different_tables_are_written_with_their_tables():
+    """两边的时间列在不同的表上：光写「B 按 created_at」读起来像订单的下单时间，其实是用户的注册时间。写成「表.列」；
+    说「另一边没有按时间筛选」的一边关联了好几张表时也写表名。detail 照旧给各自的表。"""
+    a = "SELECT COUNT(*) FROM orders o JOIN users u ON u.id = o.user_id WHERE o.paid_at >= '2026-09-01'"
+    b = "SELECT COUNT(*) FROM orders o JOIN users u ON u.id = o.user_id WHERE u.created_at >= '2026-09-01'"
+    plain = "SELECT COUNT(*) FROM orders o JOIN users u ON u.id = o.user_id"
+    [item] = explain_sql_diff(a, b, "sqlite", names={"users.created_at": "注册时间"}).items
+    assert item.text == "A 按 orders.paid_at 筛时间，B 按注册时间 users.created_at"
+    assert item.detail == {"a": [{"table": "orders", "column": "paid_at"}],
+                           "b": [{"table": "users", "column": "created_at"}]}
+    [item] = explain_sql_diff(b, plain, "sqlite").items
+    assert (item.aspect, item.text) == ("time", "A 按 users.created_at 筛时间，B 没有按时间筛选")
