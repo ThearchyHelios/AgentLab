@@ -14,40 +14,50 @@ export interface ChallengeSummaryProps {
   /** 这张审批卡审的报告（payload.reports，和 ApprovalReports 拿到的是同一份） */
   reports: ApprovalReport[]
   runId: string
+  /**
+   * 这次运行的类别（审批自带的 approval.run_class，同 ApprovalReports 的 runClass）。给了就照它说、不再另取；没给
+   * （老服务端的审批没有这一项）才按运行 id 取一次
+   */
+  runClass?: string | null
 }
 
 /**
- * 审批卡里反方审稿的摘要，紧跟在报告核对概况（ApprovalReports）后面：一行概况（四种判断各几句），有句子根本没反查成时
- * 另起一行说「N 句没能反查」，逐句列出结论原文和判断，点开一句再按 challenge_artifact 取完整内容，看反方的理由和它执行
- * 过的查询。审稿记录没存上（没有工件）时只列判断、不能点开，整块说一次。
+ * 审批卡里反方审稿的摘要，紧跟在报告核对概况（ApprovalReports）后面：一行概况（四种判断各几句），出具相关的那一句，
+ * 有句子反查没完成时再说一行「N 句未能反查」，逐句列出结论原文和判断，点开一句再按 challenge_artifact 取完整内容，看反方
+ * 的理由和它执行过的查询。审稿记录没存上（没有工件）时只列判断、不能点开，整块说一次。
  *
  * 判断是反方模型给的，不是系统核对：颜色照结论句裁判的那一套，「经受住」也不用确定性的绿。
  * 「出具会降档」只在正式运行、有被推翻的结论、被推翻的真会让出具降档时才写：服务端给了 degrades 就照它（按降档处置、又接
  * 在带出具契约的成果节点上游才为真），老服务端没给时按「没写只标注」算。只标注的写一句不影响出具，按降档处置却不在出具
- * 路径上的写一句为什么不影响；探索运行不出具，和出具有关的话一句不说。运行类别不由审批卡传进来，按运行 id 从证据 store
- * 取（loadRunClass），取到之前、取不到时都不说和出具有关的话（窗口重新拿到焦点时再取）。
+ * 路径上的写一句为什么不影响；探索运行不出具，和出具有关的话一句不说。运行类别照审批卡给的（runClass，审批自带的那一项，
+ * 卡顶写的也是它）；没给时按运行 id 从证据 store 取（loadRunClass），取到之前、取不到时都不说和出具有关的话（窗口重新
+ * 拿到焦点时再取）。
  *
  * 审的报告都没有经过反方审稿时什么都不画，也不发任何请求，卡片和以前一样。
  */
 /**
- * 审批卡上的反方审稿概况，约定之外服务端另带两项（期 4）：unreviewed 没能反查的句数，degrades 被推翻的会不会让出具降档。
+ * 审批卡上的反方审稿概况，约定之外服务端另带两项（期 4）：unreviewed 未能反查的句数，degrades 被推翻的会不会让出具降档。
  * 老服务端都不给
  */
 type Challenge = ApprovalChallenge & { unreviewed?: number; degrades?: boolean }
+type RunClass = 'formal' | 'exploratory'
+const runClassOf = (v: unknown): RunClass | null => (v === 'formal' || v === 'exploratory' ? v : null)
 
-export function ChallengeSummary({ reports, runId }: ChallengeSummaryProps) {
+export function ChallengeSummary({ reports, runId, runClass }: ChallengeSummaryProps) {
   const reviewed = useMemo(() => reports.flatMap((r) => {
     const challenge = challengeOf(r)
     return challenge ? [{ report: r, challenge }] : []
   }), [reports])
   if (!reviewed.length) return null
-  return <ChallengeList reviewed={reviewed} runId={runId} />
+  return <ChallengeList reviewed={reviewed} runId={runId} given={runClassOf(runClass)} />
 }
 
-function ChallengeList({ reviewed, runId }: {
-  reviewed: { report: ApprovalReport; challenge: Challenge }[]; runId: string
+function ChallengeList({ reviewed, runId, given }: {
+  reviewed: { report: ApprovalReport; challenge: Challenge }[]; runId: string; given: RunClass | null
 }) {
-  const run = useRunClass(runId)
+  // 审批卡给了运行类别就照它，不另取：另取的那一次失败了，正式运行里的「出具会降档」会无端消失，而卡顶照样写着正式运行
+  const fetched = useRunClass(given ? '' : runId)
+  const run = given ?? fetched
   return (
     <>
       {reviewed.map(({ report, challenge }) => (
@@ -104,11 +114,11 @@ function challengeOf(report: ApprovalReport): Challenge | null {
 }
 
 /**
- * 这次运行的类别：取到之前、取不到时为 null——不知道是不是正式运行，就一句和出具有关的话都不说（卡顶照审批自带的运行
- * 类别写着，这里再猜一个只会和它对不上）。取失败了不就此作罢：窗口重新拿到焦点时再取一次（store 对出错的槽会重发），
- * 取到了正式运行，降档的提示随之出现
+ * 这次运行的类别（审批卡没给时才取，runId 为空就不取）：取到之前、取不到时为 null——不知道是不是正式运行，就一句和出具
+ * 有关的话都不说。取失败了不就此作罢：窗口重新拿到焦点时再取一次（store 对出错的槽会重发），取到了正式运行，降档的提示
+ * 随之出现
  */
-function useRunClass(runId: string): 'formal' | 'exploratory' | null {
+function useRunClass(runId: string): RunClass | null {
   const slot = useEvidence((s) => (runId ? s.runClasses[runId] : undefined))
   const load = useEvidence((s) => s.loadRunClass)
   useEffect(() => { if (runId) void load(runId) }, [runId, load])
@@ -119,7 +129,7 @@ function useRunClass(runId: string): 'formal' | 'exploratory' | null {
     window.addEventListener('focus', again)
     return () => window.removeEventListener('focus', again)
   }, [status, runId, load])
-  return status === 'ok' && (slot?.data === 'formal' || slot?.data === 'exploratory') ? slot.data : null
+  return status === 'ok' ? runClassOf(slot?.data) : null
 }
 
 // ---------------------------------------------------------------- 取工件
@@ -212,7 +222,7 @@ const focusLost = () => !document.activeElement || document.activeElement === do
 // ---------------------------------------------------------------- 卡片
 
 function ChallengeBlock({ report, challenge, run }: {
-  report: ApprovalReport; challenge: Challenge; run: 'formal' | 'exploratory' | null
+  report: ApprovalReport; challenge: Challenge; run: RunClass | null
 }) {
   const [open, setOpen] = useState<Set<string>>(() => new Set())
   const [all, setAll] = useState(false)
@@ -226,7 +236,8 @@ function ChallengeBlock({ report, challenge, run }: {
   const flagged = challenge.on_refuted === 'flag'
   // 被推翻的真会让出具降档：服务端给了就照它，老服务端没给时按「不是只标注」算
   const degrades = challenge.degrades ?? !flagged
-  const unreviewed = challenge.unreviewed ?? 0
+  // 未能反查的每一句都记为无法判断（服务端的约定），不会多于概况里的「无法判断」：对不上时按概况的数说，两个数不打架
+  const unreviewed = Math.min(challenge.unreviewed ?? 0, counts.inconclusive)
   // 条目之外的几句（条目最多 10 条）：要看全部时从工件里补上，排在后面，顺序照工件
   const extra = all && detail.data ? detail.data.claims.filter((c) => !items.some((it) => sameClaim(c, it))) : []
   const rows: ChallengeItem[] = [...items, ...extra]
@@ -283,14 +294,8 @@ function ChallengeBlock({ report, challenge, run }: {
       ) : (
         <div className="text-2xs text-dim" data-challenge-empty="">{CHALLENGE_TEXT.none}</div>
       )}
-      {/* 根本没反查成的几句：「无法判断」里分不出查了数据不够和一条都没查，单独说一次 */}
-      {unreviewed > 0 && (
-        <p className="mt-0.5 text-2xs leading-relaxed" data-challenge-unreviewed={unreviewed}>
-          <span className="font-medium" style={{ color: 'var(--st-waiting)' }}>{CHALLENGE_TEXT.unreviewed(unreviewed)}</span>
-          <span className="text-dim">。{CHALLENGE_TEXT.unreviewedHint}</span>
-        </p>
-      )}
-      {/* 降档的原因常显，不放在悬停提示里：触屏、键盘用户也得看得到为什么、会怎样（只标注那一档同样常显一行） */}
+      {/* 降档的原因常显，不放在悬停提示里：触屏、键盘用户也得看得到为什么、会怎样（只标注那一档同样常显一行）。
+          紧跟在概况那一行（「出具会降档」的标记）下面，中间不插别的话 */}
       {refuted && !flagged && degrades && (
         <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-degrade-note="">{CHALLENGE_TEXT.degradeHint}</div>
       )}
@@ -299,6 +304,13 @@ function ChallengeBlock({ report, challenge, run }: {
       )}
       {refuted && flagged && (
         <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-flag="">{CHALLENGE_TEXT.flagNote}</div>
+      )}
+      {/* 反查没完成的几句：「无法判断」里分不出查了数据不够和反查没做完，单独说一次 */}
+      {unreviewed > 0 && (
+        <p className="mt-0.5 text-2xs leading-relaxed" data-challenge-unreviewed={unreviewed}>
+          <span className="font-medium" style={{ color: 'var(--st-waiting)' }}>{CHALLENGE_TEXT.unreviewed(unreviewed)}</span>
+          <span className="text-dim">。{CHALLENGE_TEXT.unreviewedHint}</span>
+        </p>
       )}
       {rows.length > 0 && (
         <ul className="mt-1.5 space-y-0.5" data-challenge-items="">

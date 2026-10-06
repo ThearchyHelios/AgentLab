@@ -213,9 +213,15 @@ interface Clause {
   joint: boolean
   /** 合并结果里和别的指标一起记入 */
   together: boolean
-  /** 没有算好的合并结果、按其余指标当前的选择推的：说法不同都不记（conflict）、有效记录条件合写（joined） */
+  /**
+   * 没有算好的合并结果、按其余指标当前的选择推的：说法不同都不记（conflict）、有效记录条件合写（joined）、同一项上有被
+   * 目录挡下的指标，写不写说不准、只说可能（pending）。inferred：这一条是推出来的（以上几种，以及推的路上照单个指标的
+   * 预告说的），结尾换成「以时间线上的记录为准」的一般说法
+   */
   conflict: boolean
   joined: boolean
+  pending: boolean
+  inferred: boolean
 }
 
 /**
@@ -224,12 +230,20 @@ interface Clause {
  * 那一边认出了写到哪的；被目录挡下的也算——服务端照样并进来）：
  * - 只有它自己：照它自己的预告说，会写的说会记为什么，不写的说原因；
  * - 还有别的：照对照工件里服务端为这几个成员算好的那一条（catalog_joint）说，会写的是合起来的值、写明和谁一起记，
- *   不写的照原因说；工件里没有（老服务端、组合太多、工件还没取到）时按旧办法推：会写的一边，业务日期、去重规则说法
- *   不同说都不记，有效记录条件说合成一句，结尾说以时间线上的记录为准
+ *   不写的照原因说；工件里没有（老服务端、组合太多、工件还没取到）时照服务端归拢的先后推（inferred），被目录挡下的
+ *   同项指标也算进来——服务端先归拢、后对目录：
+ *   - 业务日期、去重规则：有一个说法不同（不论它会不会被目录挡下），归拢就失败，都不记；说法都一样时结果和单个指标
+ *     一样（同一个说法对同一份目录），照自己的预告说；
+ *   - 有效记录条件：自己被挡下的，合起来也写不进去（驳回过的会被拿掉，别的原因连合起来的整句一起挡下），照自己的原因说；
+ *     同项上有别的指标被挡下时说不准（挡下它的若是驳回，拿掉它照写；若是别的原因，这一边也一起挡下），只说可能；
+ *     都会写、条件不同的说合成一句
+ *   推出来的不是服务端算好的结果，结尾换成以时间线上的记录为准的一般说法
  */
 function clausesOf(view: MetricView, views: MetricView[], choices: Record<string, DualCheckChoice>, joint: JointEntry[]): Clause[] {
   const P = T.catalogPreview
-  const blank = { write: false, where: false, reason: false, joint: false, together: false, conflict: false, joined: false }
+  const blank = {
+    write: false, where: false, reason: false, joint: false, together: false, conflict: false, joined: false, pending: false, inferred: false,
+  }
   const skip = (side: DualCheckChoice): Clause => ({ side, text: P.skip(T.choices[side]), ...blank })
   const out: Clause[] = []
   for (const side of ['a', 'b'] as const) {
@@ -266,19 +280,28 @@ function clausesOf(view: MetricView, views: MetricView[], choices: Record<string
         with_.length ? P.together(P.metricNames(with_)) : ''))
       continue
     }
-    if (!mine.write) { out.push(blocked(mine.reason)); continue }
-    // 没有算好的合并结果：照服务端归拢的规矩推。只看会写的那几个（挡下的说不准会怎样）
-    const differ = [...new Set(peers.filter((o) => {
-      const theirs = o.preview?.[choices[o.id] as 'a' | 'b']
-      return theirs?.write && !sameFact(mine.target!.item, theirs.raw, mine.raw)
-    }).map((o) => o.name))]
-    if (differ.length && mine.target!.item !== 'valid_filter') {
+    // 没有算好的合并结果：照服务端归拢的先后推。同项上的指标不论会写还是被挡下都带着本来要写的说法（raw），一起算
+    const item = mine.target!.item
+    const theirs = peers.map((o) => ({ name: o.name, side: o.preview![choices[o.id] as 'a' | 'b']! }))
+    // 认不出本来要写什么（没带 raw）的不算说法不同：说不准，落到下面的「可能」里
+    const differ = [...new Set(theirs.filter((t) => t.side.raw != null && !sameFact(item, t.side.raw, mine.raw)).map((t) => t.name))]
+    const held = [...new Set(theirs.filter((t) => !t.side.write).map((t) => t.name))]
+    const inferred = { inferred: true }
+    if (differ.length && item !== 'valid_filter') {
+      // 业务日期、去重规则说法不同：归拢这一步就不写了，轮不到对目录，挡下的那个也一样
       const names = P.metricNames(differ)
-      out.push({ side, ...blank, conflict: true, where: !short,
+      out.push({ side, ...blank, ...inferred, conflict: true, where: !short,
         text: short ? P.conflictSame(T.choices.b, names) : P.conflict(T.choices[side], mine.target!.where, names) })
       continue
     }
-    out.push(differ.length ? writing(mine.value, { joined: true }, P.joined(P.metricNames(differ))) : writing(mine.value))
+    if (!mine.write) { out.push({ ...blocked(mine.reason), ...inferred }); continue }
+    if (held.length) {
+      const names = P.metricNames(held)
+      out.push({ side, ...blank, ...inferred, pending: true, where: !short,
+        text: short ? P.pendingSame(T.choices[side], mine.value, names) : P.pending(T.choices[side], mine.target!.where, mine.value, names) })
+      continue
+    }
+    out.push(differ.length ? writing(mine.value, { ...inferred, joined: true }, P.joined(P.metricNames(differ))) : writing(mine.value, inferred))
   }
   out.push(skip('neither'))
   return out
@@ -607,10 +630,12 @@ function MetricBlock({ view, name, choice, clauses, onChoose }: {
 
 /**
  * 服务端预告的「记入数据目录」：三个选择逐条一句（clausesOf），审核人当前选的那一条加重——选之前三条都看得到，选了之后
- * 一眼看出这一选会往目录里写什么、不写的为什么。不写的原因是服务端的原话，往往不短，逐条分行写，不挤在一句里
+ * 一眼看出这一选会往目录里写什么、不写的为什么。不写的原因是服务端的原话，往往不短，逐条分行写，不挤在一句里。有一条
+ * 是推出来的（没有算好的合并结果）时，结尾换成「实际写入以时间线上的记录为准」的一般说法
  */
 function CatalogPreviewNote({ clauses, choice }: { clauses: Clause[]; choice?: DualCheckChoice }) {
   const P = T.catalogPreview
+  const inferred = clauses.some((c) => c.inferred)
   return (
     <div className="mt-1.5 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-catalog="preview">
       <div>{P.head}</div>
@@ -619,12 +644,13 @@ function CatalogPreviewNote({ clauses, choice }: { clauses: Clause[]; choice?: D
           <li key={c.side} className={clsx(choice === c.side && 'font-medium')} style={choice === c.side ? { color: 'var(--text)' } : undefined}
               data-dual-catalog-side={c.side} data-write={c.write ? '' : undefined} data-current={choice === c.side ? '' : undefined}
               data-reason={c.reason ? '' : undefined} data-joint={c.joint ? '' : undefined} data-together={c.together ? '' : undefined}
-              data-conflict={c.conflict ? '' : undefined} data-joined={c.joined ? '' : undefined}>
+              data-conflict={c.conflict ? '' : undefined} data-joined={c.joined ? '' : undefined}
+              data-pending={c.pending ? '' : undefined} data-inferred={c.inferred ? '' : undefined}>
             {c.text}
           </li>
         ))}
       </ul>
-      <p className="mt-0.5" data-dual-catalog-tail="">{P.tail}</p>
+      <p className="mt-0.5" data-dual-catalog-tail={inferred ? 'inferred' : 'exact'}>{inferred ? P.tailInferred : P.tail}</p>
     </div>
   )
 }

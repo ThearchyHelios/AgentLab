@@ -312,24 +312,31 @@ function useAudit(runId: string, key: string): AuditState {
 }
 
 /**
- * 出具横幅，外加双盲复算、反方审稿报上来的缺口另起的一组「核查未通过」。那几条是核查查出来的问题（两路结果不一致、
- * 结论被推翻、指标无法复算），横幅把缺口都列在「校验未全部完成」下，读起来像是校验没做完：这里从横幅里拿出来，
- * 紧跟在它下面单列，颜色和横幅里的缺口一样
+ * 出具横幅，外加双盲复算、反方审稿报上来的缺口另起的两组：「核查未通过」（两路结果不一致、结论被推翻）、「核查未完成」
+ * （指标无法复算）。横幅把缺口都列在「校验未全部完成」下，读起来像是校验没做完：这里从横幅里拿出来，紧跟在它下面单列，
+ * 颜色和横幅里的缺口一样（分组见 run/decode.ts 的 splitIssuanceGaps）。导出给预览用例（dev/fixtures/dual_check.tsx）
  */
-function IssuanceWithChecks({ issuance, runClass }: { issuance: Record<string, any>; runClass?: string }) {
-  const { verify, other } = useMemo(
+export function IssuanceWithChecks({ issuance, runClass }: { issuance: Record<string, any>; runClass?: string }) {
+  const { failed, unfinished, other } = useMemo(
     () => splitIssuanceGaps(Array.isArray(issuance.gaps) ? issuance.gaps.map(String) : []), [issuance])
-  const shown = useMemo(() => (verify.length ? { ...issuance, gaps: other } : issuance), [issuance, verify, other])
+  const verify = failed.length + unfinished.length > 0
+  const shown = useMemo(() => (verify ? { ...issuance, gaps: other } : issuance), [issuance, verify, other])
+  const group = (kind: 'failed' | 'unfinished', gaps: string[]) => gaps.length > 0 && (
+    <div data-evidence-verify-group={kind}>
+      <div className="font-medium">{DUAL_CHECK_TEXT.verifyGaps[kind]}</div>
+      <ul className="mt-0.5 space-y-0.5 pl-2 [overflow-wrap:anywhere]">
+        {gaps.map((g) => <li key={g}>· {g}</li>)}
+      </ul>
+    </div>
+  )
   return (
     <div className="space-y-1.5" data-evidence-issuance="">
       <IssuanceBanner issuance={shown} runClass={runClass} />
-      {verify.length > 0 && (
-        <div className="rounded-lg border px-2 py-1.5 text-2xs leading-relaxed"
+      {verify && (
+        <div className="space-y-1 rounded-lg border px-2 py-1.5 text-2xs leading-relaxed"
              style={{ borderColor: 'var(--st-waiting)', color: 'var(--st-waiting)' }} data-evidence-verify-gaps="">
-          <div className="font-medium">{DUAL_CHECK_TEXT.verifyGaps.head}</div>
-          <ul className="mt-0.5 space-y-0.5 pl-2 [overflow-wrap:anywhere]">
-            {verify.map((g) => <li key={g}>· {g}</li>)}
-          </ul>
+          {group('failed', failed)}
+          {group('unfinished', unfinished)}
         </div>
       )}
     </div>

@@ -17,7 +17,11 @@
 //   节点设置时有条件地说；
 // - 审批卡（期 4）：预告逐条说「会记为……」或「不会记入：原因」，原因是服务端的原话；被目录挡下的一边照样说写到哪；
 //   几个指标落到同一项上时照完整对照里服务端算好的合并预告（catalog_joint）说，和真写的一字不差（夹具的 merges 是服务端
-//   真写一遍的结果）；盲算的理由按核查 agent 组装的理由文档画，有出处的数字画实线、裸数字醒目标出，老工件照旧纯文本；
+//   真写一遍的结果）；没有合并预告时按其余指标当前的选择推，被目录挡下的同项指标也算进来（说法不同就说都不记，说不准的
+//   只说可能），结尾换成以时间线上的记录为准；盲算的理由按核查 agent 组装的理由文档画，有出处的数字画实线、裸数字醒目
+//   标出，老工件照旧纯文本；
+// - 出具缺口：证据页（真的 EvidencePane）和成果节点印章的悬停说明把双盲复算、反方审稿报上来的缺口另起「核查未通过」
+//   「核查未完成」两组，不放在「校验未全部完成」下；
 // - 记录页的工件列表：双盲复算对照、反方审稿记录两种工件有名字和说明，不露键名；
 // - 检查器：口径卡、指标、口径说明、盲算模型、相对误差、未采用原流程时、启用，每一项都真的写进节点配置；字段的
 //   叫法和服务端校验报错里的（engine/labels.py 的 DUAL_CHECK_FIELD_LABEL）一字不差；选口径卡、盲算模型、启用三态用的是
@@ -456,16 +460,23 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
 })
 
 /**
- * 一块里预告的三条：{a, b, neither} → {text, write, current, reason, joint, together, conflict, joined}。reason：不写、照服务端
- * 的原话说原因；joint：照完整对照里服务端算好的合并预告说；together：和别的指标一起记入；conflict、joined：没有合并预告时
- * 按其余指标当前的选择推的（说法不同都不记、有效记录条件合成一句）
+ * 一块里预告的三条：{a, b, neither} → {text, write, current, reason, joint, together, conflict, joined, pending, inferred}。
+ * reason：不写、照服务端的原话说原因；joint：照完整对照里服务端算好的合并预告说；together：和别的指标一起记入；
+ * conflict、joined、pending：没有合并预告时按其余指标当前的选择推的（说法不同都不记、有效记录条件合成一句、同项上有
+ * 被挡下的指标说不准只说可能）；inferred：这一条是推出来的
  */
 const previewClauses = (loc) => loc.evaluate((el) => Object.fromEntries([...el.querySelectorAll('[data-dual-catalog="preview"] [data-dual-catalog-side]')]
   .map((s) => [s.dataset.dualCatalogSide, {
     text: s.textContent.trim(), write: s.dataset.write != null, current: s.dataset.current != null, weight: Number(getComputedStyle(s).fontWeight),
     reason: s.dataset.reason != null, joint: s.dataset.joint != null, together: s.dataset.together != null,
-    conflict: s.dataset.conflict != null, joined: s.dataset.joined != null,
+    conflict: s.dataset.conflict != null, joined: s.dataset.joined != null, pending: s.dataset.pending != null,
+    inferred: s.dataset.inferred != null,
   }])))
+/** 一块预告的结尾：{kind: exact（照服务端算好的说）| inferred（有推出来的）, text} */
+const previewTail = async (loc) => {
+  const tail = loc.locator('[data-dual-catalog-tail]')
+  return { kind: await tail.getAttribute('data-dual-catalog-tail'), text: await text(tail) }
+}
 /** 不写的一条：选择的叫法加服务端的原话 */
 const blockedText = (label, reason) => `${label}时不会记入：${reason}`
 const CHOICE_LABEL = { a: '采用原流程的结果', b: '采用盲算的结果', neither: '两边都不对' }
@@ -662,6 +673,10 @@ await section('审批卡：几个指标落到同一项上、工件里没有合�
   const note = await text(metric(page, 'gmv').locator('[data-dual-catalog]'))
   check('……结尾说清预告按各指标当前的选择算，「人工确认」说的是写入的项', note.includes('各指标当前的选择')
     && note.includes('写入的项记为人工确认的事实') && !note.includes('不记。记为'), note)
+  const tail = await previewTail(metric(page, 'gmv'))
+  check('……推出来的：结尾不说只有目录被改了才会不一致，说实际写入以时间线上的记录为准', tail.kind === 'inferred'
+    && tail.text.includes('推断') && tail.text.endsWith('实际写入以时间线上的记录为准') && !tail.text.includes('审批期间数据目录有改动时'),
+    `${tail.kind} / ${tail.text}`)
   // 退款率改选两边都不对：不再落到同一项上，销售额照常记
   await choose(page, 'refund_rate', 'neither')
   g = await previewClauses(metric(page, 'gmv'))
@@ -697,6 +712,42 @@ await section('审批卡：几个指标落到同一项上、工件里没有合�
     cur.gmv?.text === `采用原流程的结果时，「orders」（shop）的有效记录条件会记为「${own.gmv}」，与「退款率」采用的条件用 AND 合成一句`
     && cur.refund_rate?.text === `采用原流程的结果时，「orders」（shop）的有效记录条件会记为「${own.refund_rate}」，与「销售额」采用的条件用 AND 合成一句`
     && cur.gmv.write && cur.gmv.joined && cur.refund_rate.write && cur.refund_rate.joined, `${cur.gmv?.text} ‖ ${cur.refund_rate?.text}`)
+
+  // 被目录挡下的同项指标也算进来（2026-10 复核）：目录里人工驳回过业务日期 created_at（夹具 time_rejected）。销售额采用
+  // 原流程（paid_at，单独看会写），退款率采用盲算（created_at，单独看被驳回挡下，但带着写到哪）。服务端先归拢：说法不同，
+  // 一项都不写，轮不到对目录。以前只看会写的同伴，销售额照样加粗说「会记为 paid_at」
+  const tr = fx.merges.time_rejected
+  check('夹具：退款率那一边被驳回挡下、带着写到哪，销售额那一边单独看会写，服务端一项都不写',
+    tr.catalog.refund_rate.b.write === false && tr.catalog.refund_rate.b.table === 'orders' && tr.catalog.gmv.a.write === true
+    && tr.written.length === 0, JSON.stringify(tr.catalog))
+  const rj = await preview('dual-check-approval', {
+    query: `merge=time_rejected&peer=${tr.refund_rate}`, artifact: cardWith(tr.gmv, { peer: tr.refund_rate }),
+  })
+  await rj.page.waitForSelector('[data-dual-check][data-state="ready"]')
+  await chooseAll(rj.page, 'time_rejected')
+  cur = await current(rj.page)
+  check('……两边加粗的那一句都说说法不同、都不记，销售额不再说「会记为」', ['gmv', 'refund_rate'].every((id) => cur[id]?.conflict
+    && !cur[id].write && cur[id].inferred && !cur[id].text.includes('会记为')), JSON.stringify(cur))
+  check('……退款率被挡下的那一句照归拢的结果说（和销售额说法不同），不照它单独的驳回原因说',
+    cur.refund_rate?.text === '采用盲算的结果时与「销售额」的选择说法不同，都不记', cur.refund_rate?.text)
+  const rjTail = await previewTail(metric(rj.page, 'gmv'))
+  check('……结尾换成实际写入以时间线上的记录为准', rjTail.kind === 'inferred' && rjTail.text.endsWith('实际写入以时间线上的记录为准'), rjTail.text)
+
+  // 有效记录条件、同项上有被挡下的指标（夹具 filters_rejected：销售额采纳的条件曾被驳回）：挡下它的若是驳回，服务端
+  // 拿掉它、退款率照写；若是别的原因（和已有条件合不起来），退款率也一起挡下。卡上认不出是哪一种，退款率那一句只说可能
+  const fr = fx.merges.filters_rejected
+  const fp = await preview('dual-check-approval', {
+    query: `merge=filters_rejected&peer=${fr.refund_rate}&variant=${fr.gmv}`, artifact: cardWith(fr.gmv, { peer: fr.refund_rate }),
+  })
+  await fp.page.waitForSelector('[data-dual-check][data-state="ready"]')
+  await chooseAll(fp.page, 'filters_rejected')
+  cur = await current(fp.page)
+  check('有效记录条件、同项上有被挡下的：退款率说可能记为自己的条件、也可能不记，不说定了「会记为」', !!cur.refund_rate?.pending
+    && !cur.refund_rate.write && cur.refund_rate.inferred && cur.refund_rate.text === '采用原流程的结果时，「orders」（shop）的有效记录条件'
+      + `可能记为「${fr.catalog.refund_rate.a.value}」，也可能不记：要与「销售额」的选择合起来才能确定`, cur.refund_rate?.text)
+  check('……销售额（被驳回挡下）照它的原因说不会记入，和服务端一致（确实没写）', !!cur.gmv?.reason && !cur.gmv.write
+    && cur.gmv.text === blockedText(CHOICE_LABEL.a, fr.catalog.gmv.a.reason)
+    && !fr.written.some((w) => w.value === fr.catalog.gmv.a.value), cur.gmv?.text)
 
   // 窄屏：说法不同的那一句更长，也不撑宽
   for (const theme of ['dark', 'light']) {
@@ -765,6 +816,10 @@ await section('审批卡：几个指标落到同一项上时，照完整对照�
   const { page, errors } = await open('time_split')
   for (const [id, c] of Object.entries(fx.merges.time_split.choices)) await choose(page, id, c)
   let cur = await current(page)
+  const exact = await previewTail(metric(page, 'gmv'))
+  check('照服务端算好的合并结果说：结尾只说审批期间目录有改动时以时间线为准，不说是推断的', exact.kind === 'exact'
+    && exact.text.includes('审批期间数据目录有改动时') && !exact.text.includes('推断')
+    && !Object.values(cur).some((c) => c?.inferred), `${exact.kind} / ${exact.text}`)
   check('分开选：两边都说不会记入、写明给出了不同的说法', ['gmv', 'refund_rate'].every((id) => cur[id]?.reason
     && cur[id].text.includes('给出了不同的说法') && cur[id].text.includes('都未写入数据目录')), JSON.stringify(cur))
   await choose(page, 'refund_rate', 'a')
@@ -1041,6 +1096,66 @@ await section('审批卡：390px 不横向溢出、窄栏里上下排、深浅�
   const b = await metric(rail.page, 'gmv').locator('[data-dual-sql="blind"]').boundingBox()
   check('360px 画布右栏：宽屏下也按卡片的宽度上下排', !!o && !!b && b.y >= o.y + o.height - 1, JSON.stringify({ o, b }))
   await shot(rail.page, 'approval-rail-dark')
+})
+
+await section('出具缺口：证据页、成果节点的印章把核查报上来的缺口另起两组，不放在「校验未全部完成」下', async () => {
+  // 双盲复算、反方审稿报上来的缺口（出具契约加了「双盲复算「节点名」：」「反方审稿：」的前缀）以前和「叙述模板渲染为空」
+  // 一起列在「校验未全部完成」下。证据页（真的 EvidencePane）在出具横幅下面另起「核查未通过」（两路不一致、结论被推翻）
+  // 「核查未完成」（无法复算）两组，横幅里只留校验没做完的；成果节点印章的悬停说明同样分组、同样的先后。用例
+  // verify-gaps（dev/fixtures/dual_check.tsx）：缺口的先后照服务端，核查的和别的混在一起；证据图、审计接口在这里伪造
+  const RUN = 'run-verify-gaps'
+  const FAILED = ['双盲复算「复核周报口径」：指标「销售额」两路结果不一致，审核人选择了盲算结果', '反方审稿：推翻了 1 句结论：「东区增长主要来自新客」']
+  const UNFINISHED = ['双盲复算「复核周报口径」：指标「订单数」无法复算：输入来自合并查询，无法单独复算']
+  const OTHER = ['叙述模板渲染为空（路径可能有误）']
+  const extra = async (req, url) => {
+    if (url.pathname === `/api/runs/${RUN}/evidence`) {
+      return { json: { run_id: RUN, mode: 'none', note: '这次运行没有报告文档', seal: { sealed: true, ok: true, manifest_seq: 7 } } }
+    }
+    if (url.pathname === `/api/runs/${RUN}/evidence/audit`) return { status: 404, json: { detail: 'Not Found' } }
+    return null
+  }
+  const items = (els) => els.map((el) => el.textContent.replace(/^·\s*/, '').trim())
+  for (const [width, theme] of [[1280, 'dark'], [390, 'dark'], [390, 'light']]) {
+    const what = `${width}px（${theme}）`
+    const { page, errors } = await preview('verify-gaps', { extra, width, height: 900, theme })
+    await page.waitForSelector('[data-evidence-verify-gaps]')
+    const groups = await page.evaluate(() => [...document.querySelectorAll('[data-evidence-verify-group]')].map((g) => ({
+      kind: g.dataset.evidenceVerifyGroup, head: g.firstElementChild?.textContent.trim(),
+      items: [...g.querySelectorAll('li')].map((li) => li.textContent.replace(/^·\s*/, '').trim()),
+    })))
+    check(`${what} 证据页：横幅下面另起两组，先「核查未通过」（两路不一致、被推翻），再「核查未完成」（无法复算）`,
+      JSON.stringify(groups) === JSON.stringify([{ kind: 'failed', head: '核查未通过', items: FAILED },
+        { kind: 'unfinished', head: '核查未完成', items: UNFINISHED }]), JSON.stringify(groups))
+    const banner = await page.locator('[data-evidence-issuance] [data-issuance-gaps] li').evaluateAll(items)
+    check(`${what} ……横幅的「校验未全部完成」里只剩校验没做完的那条`, JSON.stringify(banner) === JSON.stringify(OTHER)
+      && (await text(page.locator('[data-evidence-issuance] [data-issuance-gaps]'))).startsWith('校验未全部完成'), JSON.stringify(banner))
+    // 成果节点的印章：悬停说明里核查的两组排在「校验未全部完成」前面，各组只列自己的
+    const stamp = page.locator('.react-flow__node[data-id="done"] .nc-stamp')
+    await stamp.waitFor()
+    const lines = ((await stamp.getAttribute('title')) ?? '').split('\n')
+    const at = (head) => lines.findIndex((l) => l.startsWith(head))
+    check(`${what} 成果节点印章：悬停说明先「核查未通过」、再「核查未完成」、最后「校验未全部完成」，各列各的`,
+      lines[at('核查未通过：')] === `核查未通过：${FAILED.join('；')}` && lines[at('核查未完成：')] === `核查未完成：${UNFINISHED.join('；')}`
+      && lines[at('校验未全部完成：')] === `校验未全部完成：${OTHER.join('；')}`
+      && at('核查未通过：') < at('核查未完成：') && at('核查未完成：') < at('校验未全部完成：'), lines.join(' / '))
+    const w = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    check(`${what}：证据页不横向溢出`, w <= 0, `${w}px`)
+    const c = await page.evaluate(() => {
+      const box = document.querySelector('[data-evidence-verify-gaps]')
+      const bgOf = (el) => {
+        for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
+          const v = getComputedStyle(n).backgroundColor
+          if (v !== 'rgba(0, 0, 0, 0)' && v !== 'transparent') return v
+        }
+        return 'rgba(0, 0, 0, 0)'
+      }
+      return { fg: getComputedStyle(box).color, bg: bgOf(box), base: getComputedStyle(document.body).backgroundColor }
+    })
+    const ratio = contrast(c.fg, c.bg, c.base)
+    check(`${what}：核查那两组的字对比度 ≥ 4.5`, ratio >= 4.5, `${ratio.toFixed(2)}（${c.fg} on ${c.bg}）`)
+    await shot(page, `verify-gaps-${width}-${theme}`)
+    check(`${what}：页面没有报错`, errors.length === 0, errors.join('；'))
+  }
 })
 
 await section('记录页的工件列表：双盲复算对照、反方审稿记录有名字', async () => {

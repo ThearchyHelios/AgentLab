@@ -3,8 +3,10 @@
 //
 // 守的是这些「看着没坏、其实用不了」的地方：概况的句数和条目对不上、有被推翻的结论却不提醒降档（或者原因只藏在悬停里）、
 // 没有被推翻的结论也写降档、只标注时也写降档、探索运行里说出具、运行类别取不到时说起出具（取不到就不知道是不是正式
-// 运行，一句和出具有关的话都不说，窗口重新拿到焦点时再取）、反方审稿不在出具路径上（服务端的 degrades 为假）还写降档、
-// 根本没反查成的几句混在「无法判断」里看不出来、没经过反方审稿的报告也冒出一块空框（或者白发一次请求）、点开一句不取工件（或者每点一句取一次）、理由里的数字看不出引用了哪次查询、
+// 运行，一句和出具有关的话都不说，窗口重新拿到焦点时再取）、审批带着运行类别时还另取一次（取失败了降档提示就没了）、
+// 反方审稿不在出具路径上（服务端的 degrades 为假）还写降档、说明里用「本节点」（画在审批卡上，读着像审批节点）、
+// 反查没完成的几句混在「无法判断」里看不出来（或者比「无法判断」还多、插在降档标记和它的说明中间）、
+// 没经过反方审稿的报告也冒出一块空框（或者白发一次请求）、点开一句不取工件（或者每点一句取一次）、理由里的数字看不出引用了哪次查询、
 // 裸数字没被标出来、理由文档是另一个工件时不去取、查询的 SQL / 行数 / 截断不显示、工件取不到时卡死在加载中、
 // 审稿记录没存上时每句还能点开、条目只列前十句时看不到其余的（或者补的时候吞掉原文相同的另一句、键盘焦点掉到页面上）；
 // 检查器里的字段写不进节点配置（或者写进去的不是约定的形状：跟随设置要把这一项拿掉，不能写成空字符串）、下拉里列出了
@@ -41,17 +43,31 @@ const DUP_CONTENT = {
   claims: fx.artifacts[MANY].claims.map((c) => (c.unit === 'u30' ? { ...c, text: fx.many.items.find((it) => it.unit === 'u20').text } : c)),
 }
 const RUNS = fx.runs
+// RUNS.given 不在这里：那次运行的 GET 一律答 404，审批带着的运行类别得照样管用
 const RUN_CLASS = {
   [RUNS.formal]: 'formal', [RUNS.flag]: 'formal', [RUNS.explore]: 'exploratory', [RUNS.none]: 'formal',
   [RUNS.many]: 'formal', [RUNS.broken]: 'formal', [RUNS.clear]: 'formal', [RUNS.clearFlag]: 'formal',
   [RUNS.exploreFlag]: 'exploratory', [RUNS.runfail]: 'formal', [RUNS.dup]: 'formal', [RUNS.norecord]: 'formal',
-  [RUNS.unreviewed]: 'formal', [RUNS.offpath]: 'formal',
+  [RUNS.unreviewed]: 'formal', [RUNS.offpath]: 'formal', [RUNS.over]: 'formal',
+}
+// challenge-approval-unreviewed 的工件：同第一个用例，被削弱（u5）、经受住（u8）的两句换成数据源已停用、没查成
+// （服务端 unreached 的写法：记为无法判断，理由是系统说的，没有理由文档和查询）
+const UNREVIEWED_ART = 'f'.repeat(64)
+const UNREVIEWED_UNITS = ['u5', 'u8']
+const UNREVIEWED_CONTENT = {
+  ...fx.artifacts[ART],
+  claims: fx.artifacts[ART].claims.map((c) => (UNREVIEWED_UNITS.includes(c.unit) ? {
+    ...c, verdict: 'inconclusive', rationale_doc: null, queries: [],
+    rationale: '这句引用的数据源「北仓库」已不存在或已停用，没有可以反查的数据源，这句未反查',
+  } : c)),
 }
 const LABEL = { stands: '经受住', weakened: '被削弱', refuted: '被推翻', inconclusive: '无法判断' }
 const FLAG_NOTE = '按节点设置，被推翻的结论只做标注，不影响出具档位'
 const DEGRADE_NOTE = '被推翻的结论计入出具缺口，本次正式运行将降档出具'
-const DEGRADE_OFF = '本节点不在带出具契约的成果节点上游，被推翻的结论不影响出具档位'
-const UNREVIEWED = (n) => `${n} 句没能反查，已记为无法判断。核查模型不可用、达到上限或数据源已停用时，这几句没有真正查询数据，原因见运行时间线`
+// 主语写明是反方审稿节点：这句画在人工审批的卡上，「本节点」读着像审批节点
+const DEGRADE_OFF = '反方审稿节点没有接在带出具契约的成果节点上游，被推翻的结论不计入出具缺口，不影响出具档位'
+const UNREVIEWED = (n) => `${n} 句未能反查，已记为无法判断。反查没有完成：可能是核查模型不可用、达到上限、数据源已不存在或已停用，`
+  + '或报告未引用数据库查询，原因见运行时间线'
 const FAILED = '无法获取反方审稿的详细内容'
 // F3a 画布校验（schema._check_challenge）在同样情形下的说法：检查器按 field 挂在字段下面
 const SERVER_MANY = '「反方审稿」的上游有多个「报告撰写」节点（「写月报」、「写周报」），请在「要审的报告」中选择要审的那一份'
@@ -152,6 +168,7 @@ async function open(syn, { width = 1100, height = 900, theme = 'dark' } = {}) {
       hits.artifacts.push(id)
       if (id === BROKEN && !state.broken) return route.fulfill({ json: { id, content: fx.artifacts[ART] } })
       if (id === DUP) return route.fulfill({ json: { id, content: DUP_CONTENT } })
+      if (id === UNREVIEWED_ART) return route.fulfill({ json: { id, content: UNREVIEWED_CONTENT } })
       const content = fx.artifacts[id]
       return content ? route.fulfill({ json: { id, content } })
         : route.fulfill({ status: 404, json: { detail: '工件不存在，可能已被删除' } })
@@ -354,9 +371,9 @@ await section('正式运行、没有被推翻的结论：不写降档', async ()
 })
 
 await section('运行类别取不到：不说任何和出具有关的话，重新拿到焦点时再取', async () => {
-  // 取不到就不知道是不是正式运行：以前写「暂时无法确认运行类别；如为正式运行……会降档」外加重试，卡顶却按审批自带的
-  // 运行类别写着正式运行，两处说法打架。期 4 起取不到时和出具有关的话一句不说，窗口重新拿到焦点时再取，取到了正式运行
-  // 降档提示才出现
+  // 老服务端的审批不带运行类别，只能按运行 id 取。取不到就不知道是不是正式运行：以前写「暂时无法确认运行类别；如为
+  // 正式运行……会降档」外加重试。期 4 起取不到时和出具有关的话一句不说，窗口重新拿到焦点时再取，取到了正式运行降档
+  // 提示才出现。审批带着运行类别时照它说、不另取，见下一节
   const { ctx, page, hits, state, errors } = await open('challenge-approval-runfail')
   const block = page.locator('[data-challenge="write"]')
   await block.waitFor()
@@ -386,31 +403,67 @@ await section('运行类别取不到：不说任何和出具有关的话，重�
   await ctx.close()
 })
 
-await section('有句子根本没反查成：单独说一行，不混在「无法判断」里', async () => {
-  // 服务端的 unreviewed：核查模型不可用、触顶、数据源不在了……这几句记为无法判断，可一条查询都没执行。「无法判断 2 句」
-  // 分不出是查了、数据不够，还是根本没查，审批卡单独说
+await section('审批带着运行类别：照它说出具，不另取（另取失败也不影响）', async () => {
+  // 审批自带 approval.run_class（卡顶写的就是它）。以前反方审稿那一块只拿运行 id 另取一次，这一次失败了，正式运行里
+  // 「出具会降档」整块消失，卡顶却照样写着正式运行。用例把反方审稿那一块单独画，运行类别由调用方传进来，这次运行的
+  // GET 一律答 404
+  const { ctx, page, hits, errors } = await open('challenge-summary-given')
+  const block = page.locator('[data-challenge="write"]')
+  await block.waitFor()
+  await page.waitForTimeout(500)
+  check('给了运行类别（正式运行）：写「出具会降档」和原因', (await text(page.locator('[data-challenge-degrade]'))) === '出具会降档'
+    && (await text(page.locator('[data-challenge-degrade-note]'))) === DEGRADE_NOTE, await text(block))
+  check('……不另取运行类别', !hits.runs.includes(RUNS.given), hits.runs.join('、'))
+  check('……页面没有报错', errors.length === 0, errors.join('；'))
+  await ctx.close()
+})
+
+await section('有句子反查没完成：单独说一行，不混在「无法判断」里，不插在降档标记和它的说明中间', async () => {
+  // 服务端的 unreviewed：核查模型不可用、触顶没给出结论、数据源不在了……这几句记为无法判断，可反查没有完成。「无法判断
+  // 3 句」分不出是查了、数据不够，还是没查成，审批卡单独说。未能反查的每一句都记为无法判断，unreviewed 不会多于它
   const { ctx, page, hits, errors } = await open('challenge-approval-unreviewed')
   const block = page.locator('[data-challenge="write"]')
   await block.waitFor()
   await runClassSettled(page, hits, RUNS.unreviewed)
   const line = block.locator('[data-challenge-unreviewed]')
-  check('写明几句没能反查、记为无法判断，原因去时间线看', await line.count() === 1 && (await text(line)) === UNREVIEWED(2)
+  check('写明几句未能反查、记为无法判断，原因去时间线看', await line.count() === 1 && (await text(line)) === UNREVIEWED(2)
     && (await line.getAttribute('data-challenge-unreviewed')) === '2', await line.count() ? await text(line) : '没有')
-  check('……概况照服务端的计数写，不另算', (await text(block.locator('[data-challenge-count="inconclusive"]'))) === '无法判断 1 句')
+  const inconclusive = await text(block.locator('[data-challenge-count="inconclusive"]'))
+  check('……概况照服务端的计数写（无法判断 3 句：两句未能反查、一句查过了数据不够），未能反查的不多于无法判断',
+    inconclusive === '无法判断 3 句' && 2 <= Number(inconclusive.match(/\d+/)?.[0]), inconclusive)
+  check('……用「未能」，不说「没能」「真正」', !/没能|真正/.test(await text(block)))
   // degrades 为真、正式运行、有被推翻的：照常写降档
   check('服务端说会降档（degrades 为真）：写「出具会降档」和原因', (await text(page.locator('[data-challenge-degrade]'))) === '出具会降档'
     && (await text(page.locator('[data-challenge-degrade-note]'))) === DEGRADE_NOTE && await page.locator('[data-challenge-degrade-off]').count() === 0)
-  check('没能反查：页面没有报错', errors.length === 0, errors.join('；'))
+  // 降档的说明紧跟在概况那一行（「出具会降档」的标记）下面，未能反查的那一行在它后面
+  const order = await block.evaluate((el) => [...el.children].map((c) => (c.hasAttribute('data-challenge-counts') ? 'counts'
+    : c.hasAttribute('data-challenge-degrade-note') ? 'note' : c.hasAttribute('data-challenge-unreviewed') ? 'unreviewed' : '')).filter(Boolean))
+  check('……降档的说明紧跟在降档标记那一行下面，未能反查的那一行排在后面', order.join(',') === 'counts,note,unreviewed', order.join(','))
+  // 点开一句未能反查的：理由是系统说的原因，没有查询
+  await toggle(page, 'u5').click()
+  await detail(page, 'u5').locator('[data-challenge-rationale-text]').waitFor()
+  check('点开未能反查的一句：理由写明数据源已停用、这句未反查', (await text(detail(page, 'u5').locator('[data-challenge-rationale-text]')))
+    .includes('这句未反查'), await text(detail(page, 'u5')))
+  check('未能反查：页面没有报错', errors.length === 0, errors.join('；'))
   await ctx.close()
   // 老服务端不给 unreviewed（第一个用例）、给了 0（offpath 用例）：都不写这一行
   for (const [syn, run] of [['challenge-approval', RUNS.formal], ['challenge-approval-offpath', RUNS.offpath]]) {
     const other = await open(syn)
     await other.page.locator('[data-challenge="write"]').waitFor()
     await runClassSettled(other.page, other.hits, run)
-    check(`${syn}：没有没能反查的句子时不写这一行`, await other.page.locator('[data-challenge-unreviewed]').count() === 0
-      && !(await text(other.page.locator('[data-challenge="write"]'))).includes('没能反查'))
+    check(`${syn}：没有未能反查的句子时不写这一行`, await other.page.locator('[data-challenge-unreviewed]').count() === 0
+      && !(await text(other.page.locator('[data-challenge="write"]'))).includes('未能反查'))
     await other.ctx.close()
   }
+  // 服务端给的 unreviewed 比「无法判断」还多（不该出现）：按「无法判断」的句数说，两个数不打架
+  const over = await open('challenge-approval-unreviewed-over')
+  await over.page.locator('[data-challenge="write"]').waitFor()
+  await runClassSettled(over.page, over.hits, RUNS.over)
+  const capped = over.page.locator('[data-challenge-unreviewed]')
+  check('unreviewed 比「无法判断」多：按「无法判断」的句数说', (await capped.getAttribute('data-challenge-unreviewed')) === '1'
+    && (await text(capped)).startsWith('1 句未能反查') && (await text(over.page.locator('[data-challenge-count="inconclusive"]'))) === '无法判断 1 句',
+    await text(capped))
+  await over.ctx.close()
 })
 
 await section('按降档处置、却不在出具路径上（degrades 为假）：不写降档，说清为什么不影响', async () => {
@@ -423,8 +476,8 @@ await section('按降档处置、却不在出具路径上（degrades 为假）�
   check('不写「出具会降档」', await page.locator('[data-challenge-degrade], [data-challenge-degrade-note]').count() === 0
     && !(await text(block)).includes('出具会降档'), await text(block))
   const off = page.locator('[data-challenge-degrade-off]')
-  check('写明本节点不在带出具契约的成果节点上游、不影响出具档位', await off.count() === 1 && (await text(off)) === DEGRADE_OFF,
-    await off.count() ? await text(off) : '没有')
+  check('写明反方审稿节点不在带出具契约的成果节点上游、不影响出具档位（不说「本节点」）', await off.count() === 1 && (await text(off)) === DEGRADE_OFF
+    && !(await text(off)).includes('本节点'), await off.count() ? await text(off) : '没有')
   check('不是只标注：没有「只做标注」那句', await page.locator('[data-challenge-flag]').count() === 0)
   check('不在出具路径上：页面没有报错', errors.length === 0, errors.join('；'))
   await ctx.close()
@@ -775,7 +828,7 @@ await section('窄屏与深浅色', async () => {
     check(`390px（${theme}）：页面没有报错`, errors.length === 0, errors.join('；'))
     await ctx.close()
   }
-  // 几行说明（降档原因、没能反查、不在出具路径上、审稿记录没存上）：窄屏不撑宽，深浅色都看得清
+  // 几行说明（降档原因、未能反查、不在出具路径上、审稿记录没存上）：窄屏不撑宽，深浅色都看得清
   for (const theme of ['dark', 'light']) {
     const notes = [
       ['challenge-approval', '[data-challenge-degrade-note]'],

@@ -4,9 +4,10 @@ import { ReactFlow, ReactFlowProvider } from '@xyflow/react'
 import { ApprovalCard } from '../../run/RunPanel'
 import { Inspector } from '../../canvas/Inspector'
 import { NodeCard } from '../../canvas/NodeCard'
+import { EvidencePane } from '../../pages/runs/EvidencePane'
 import { toFlow, useStudio } from '../../store/studio'
 import { useCatalog } from '../../store/catalog'
-import type { Approval, GraphSpec, Provider } from '../../types'
+import type { Approval, GraphSpec, Provider, Run, RunEvent } from '../../types'
 import data from './dual_check.json'
 
 /**
@@ -33,6 +34,10 @@ import data from './dual_check.json'
  * - merge=<名字>：两个指标的预告换成 merges 里那一种组合按它的目录算的（catalog；和 variant、peer 一起用，换上的 SQL
  *   照它的 gmv、refund_rate 写）。合起来的预告（joint）在完整对照里，由检查脚本按同一种组合伪造工件
  * - on_reject=<值>：payload 带上节点实际生效的「未采用原流程时」
+ *
+ * ?syn=verify-gaps：出具缺口里有双盲复算、反方审稿报上来的几条（两路结果不一致、结论被推翻、指标无法复算）和一条
+ * 校验没做完的。上面是运行详情的证据页（真的 EvidencePane：证据图、审计接口由检查脚本伪造），下面是同一次运行的成果
+ * 节点卡片（出具印章的悬停说明）：两处都把核查的缺口另起「核查未通过」「核查未完成」两组，不放在「校验未全部完成」下
  */
 const approval = (patch: Partial<Approval> = {}): Approval => ({
   ...(data.approval as unknown as Approval),
@@ -103,6 +108,73 @@ function InspectorCase() {
   )
 }
 
+/** verify-gaps 用例的运行和出具明细（库、指标、地名都是虚构的） */
+const VERIFY_GAPS = {
+  run: 'run-verify-gaps',
+  gaps: {
+    failed: ['双盲复算「复核周报口径」：指标「销售额」两路结果不一致，审核人选择了盲算结果', '反方审稿：推翻了 1 句结论：「东区增长主要来自新客」'],
+    unfinished: ['双盲复算「复核周报口径」：指标「订单数」无法复算：输入来自合并查询，无法单独复算'],
+    other: ['叙述模板渲染为空（路径可能有误）'],
+  },
+}
+const GAPS = VERIFY_GAPS.gaps
+const GAPS_ISSUANCE = {
+  tier: 'degraded', matched_numbers: 3, metrics_checked: 2, missing_required: [], missing_expected: [], unmatched_numbers: [],
+  // 缺口的先后照服务端（出具契约按上游节点的先后收）：核查的和别的混在一起，分组靠前缀认
+  gaps: [GAPS.failed[0], GAPS.other[0], GAPS.unfinished[0], GAPS.failed[1]],
+}
+const GAPS_RUN: Run = {
+  id: VERIFY_GAPS.run, workflow_id: null, workflow_name: '周报（预览）', status: 'succeeded', input: {},
+  output: { _issuance: GAPS_ISSUANCE }, error: null, usage: {} as Run['usage'], run_class: 'formal',
+}
+const GAPS_GRAPH = {
+  nodes: [
+    { id: 'dc', type: 'dual_check', position: { x: 0, y: 40 }, data: { label: '复核周报口径', config: {} } },
+    { id: 'done', type: 'output', position: { x: 300, y: 40 }, data: { label: '成果', config: {} } },
+  ],
+  edges: [{ id: 'g1', source: 'dc', target: 'done' }],
+} as unknown as GraphSpec
+
+/**
+ * 证据页和成果节点卡片：图放进 studio store，再按一次运行的事件灌进去（出具事件带着完整的明细，卡片的印章按它画、
+ * 悬停说明按它写）。只在这个用例渲染时改 store
+ */
+function VerifyGapsCase() {
+  useState(() => {
+    const { nodes, edges } = toFlow(GAPS_GRAPH)
+    const st = useStudio.getState()
+    st.clearRun()
+    useStudio.setState({ nodes, edges, selectedId: null, run: { ...GAPS_RUN, status: 'running', output: {} }, runSnapshot: null })
+    const at = Date.now() / 1000 - 5
+    const events: RunEvent[] = [
+      { seq: 1, type: 'run.started', node_id: null, ts: at, data: { nodes: 2 } },
+      { seq: 2, type: 'node.started', node_id: 'dc', ts: at + 0.1, data: {} },
+      { seq: 3, type: 'node.finished', node_id: 'dc', ts: at + 1, data: { duration_ms: 900 } },
+      { seq: 4, type: 'node.started', node_id: 'done', ts: at + 1.1, data: {} },
+      { seq: 5, type: 'issuance', node_id: 'done', ts: at + 1.2, data: { ...GAPS_ISSUANCE, unmatched: 0 } },
+      { seq: 6, type: 'node.finished', node_id: 'done', ts: at + 1.3, data: { duration_ms: 200 } },
+      { seq: 7, type: 'run.finished', node_id: null, ts: at + 1.4, data: { output: { _issuance: GAPS_ISSUANCE }, duration_ms: 1400 } },
+    ]
+    for (const e of events) useStudio.getState().applyEvent(e)
+    return true
+  })
+  const nodes = useStudio((s) => s.nodes)
+  const edges = useStudio((s) => s.edges)
+  return (
+    <div className="flex min-h-screen max-w-full flex-col" data-fixture="verify-gaps">
+      <div className="h-[520px] min-h-0 border-b" data-verify-gaps-evidence="">
+        <EvidencePane run={GAPS_RUN} output={GAPS_RUN.output} labelOf={() => undefined} refreshKey="" />
+      </div>
+      <div className="h-64 min-h-0 min-w-0" data-verify-gaps-canvas="">
+        <ReactFlowProvider>
+          <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} fitView nodesDraggable={false} nodesConnectable={false}
+                     proOptions={{ hideAttribution: true }} />
+        </ReactFlowProvider>
+      </div>
+    </div>
+  )
+}
+
 export const cases: Record<string, () => JSX.Element> = {
   'dual-check-approval': () => (
     <div className="mx-auto max-w-3xl p-4 text-sm" data-fixture="dual-check-approval"><Card value={approvalOf(location.search)} /></div>
@@ -123,4 +195,5 @@ export const cases: Record<string, () => JSX.Element> = {
     </div>
   ),
   'dual-check-inspector': () => <InspectorCase />,
+  'verify-gaps': () => <VerifyGapsCase />,
 }

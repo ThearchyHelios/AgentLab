@@ -3336,8 +3336,8 @@ export const WHATIF_TEXT = {
 
 /**
  * 双盲复算：节点库说明、检查器、节点卡片摘要、两边对不上时的审批卡，以及时间线上双盲复算的日志。核查的上限叫法
- * （limitLabel）和出具缺口里「核查未通过」那一组（verifyGaps）反方审稿也用，放在这里一处；反方审稿自己的时间线说法在
- * CHALLENGE_TEXT.log。
+ * （limitLabel）和出具缺口里「核查未通过」「核查未完成」那两组（verifyGaps）反方审稿也用，放在这里一处；反方审稿自己的
+ * 时间线说法在 CHALLENGE_TEXT.log。
  *
  * 两边的叫法固定为「原流程」「盲算」（服务端 explain_sql_diff 的 labels 也是这两个词），审核人的三个选择固定为
  * 「采用原流程的结果」「采用盲算的结果」「两边都不对」。选「采用盲算的结果」不会替换报告里的数，只记缺口，
@@ -3492,8 +3492,9 @@ export const DUAL_CHECK_TEXT = {
      * 同一次裁决里几个指标按当前的选择落到同一张表同一项上时，服务端写目录前把它们归拢（dual_check_facts._merged）：
      * 说法相同的写一次，有效记录条件用 AND 合成一句，业务日期、去重规则说法不同的都不写，驳回过的拿出来不写。对照工件
      * 里有服务端把每种组合算好的结果（catalog_joint）时照它说：会写的是合起来的那个值，并写明和哪几个指标一起记
-     * （together）；没有时（老服务端、组合太多、工件还没取到）按其余指标当前的选择有条件地说（conflict、joined），
-     * tail 里说明预告是按当前的选择算的
+     * （together）；没有时（老服务端、组合太多、工件还没取到）按其余指标当前的选择推（conflict、joined、pending），
+     * 被目录挡下的同项指标也算进来，推不准的（pending）只说可能，结尾换成 tailInferred：推出来的不是服务端算好的结果，
+     * 不能和 tail 一样只在「审批期间目录有改动」时才不准
      */
     catalogPreview: {
       head: '记入数据目录：',
@@ -3512,10 +3513,22 @@ export const DUAL_CHECK_TEXT = {
       conflictSame: (choice: string, metrics: string) => `${choice}时与${metrics}的选择说法不同，都不记`,
       /** 有效记录条件接在 write / writeSame 后面：和这些指标当前采用的条件合成一句写 */
       joined: (metrics: string) => `，与${metrics}采用的条件用 AND 合成一句`,
+      /**
+       * 没有算好的合并结果、同一项上又有被目录挡下的指标（有效记录条件）：挡下的原因卡上认不出（驳回过的会被拿掉，
+       * 别的原因会连这一边一起挡下），写不写说不准，只说可能。value 同 write
+       */
+      pending: (choice: string, where: string, value: string, metrics: string) =>
+        `${choice}时，${where}可能记为「${value}」，也可能不记：要与${metrics}的选择合起来才能确定`,
+      /** 同 writeSame：两边写的是同一项时，后一边省掉「哪张表的哪一项」 */
+      pendingSame: (choice: string, value: string, metrics: string) =>
+        `${choice}时可能记为「${value}」，也可能不记：要与${metrics}的选择合起来才能确定`,
       /** 「退款率」、「订单数」；多于 3 个只列前 3 个 */
       metricNames: (names: string[]) => names.slice(0, 3).map((n) => `「${n}」`).join('、')
         + (names.length > 3 ? `等 ${names.length} 个指标` : ''),
       tail: '写入的项记为人工确认的事实。以上按发起审批时的数据目录和各指标当前的选择预告，审批期间数据目录有改动时，以时间线上的记录为准',
+      /** 有一条是按其余指标当前的选择推出来的（没有算好的合并结果）：推断不一定准，实际写入一律以时间线为准 */
+      tailInferred: '写入的项记为人工确认的事实。几个指标落到同一项上时，以上是按各指标当前的选择推断的结果，'
+        + '实际写入以时间线上的记录为准',
     },
     choices: { a: '采用原流程的结果', b: '采用盲算的结果', neither: '两边都不对' } as Record<'a' | 'b' | 'neither', string>,
     choiceGroup: (name: string) => `「${name}」采用哪一边的结果`,
@@ -3589,17 +3602,23 @@ export const DUAL_CHECK_TEXT = {
     /** metric 是指标 ID（服务端日志只带 ID，中文名在原话里），不当名字加引号 */
     limit: (label: string, metric?: string) => (metric ? `指标 ${metric} 的盲算已达${label}，按无法复算处理` : `双盲复算已达${label}`),
     limitNext: '请在「设置 → 偏好设置 → 核查」中调高双盲复算的上限',
-    /** dual_check_unchecked：盲算触顶、出错、交不出数，或者输入本身没法单独复算（合并查询、遮罩列） */
-    unchecked: (n?: number) => (n ? `双盲复算有 ${formatNumber(n)} 个指标无法复算，按缺口计入出具`
-      : '双盲复算有指标无法复算，按缺口计入出具'),
+    /**
+     * dual_check_unchecked：盲算触顶、出错、交不出数，或者输入本身没法单独复算（合并查询、遮罩列）。只说记为缺口，
+     * 不说出具：探索运行不出具，节点接在侧枝上时缺口也进不了出具，降不降档由出具那一行说（同 gaps）
+     */
+    unchecked: (n?: number) => (n ? `双盲复算有 ${formatNumber(n)} 个指标无法复算，已记为缺口`
+      : '双盲复算有指标无法复算，已记为缺口'),
     uncheckedNext: '无法复算的原因见展开内容。来自合并查询、遮罩列的输入无法单独复算；盲算触顶、出错的，可调高「设置 → 偏好设置 → 核查」中的上限后重新运行',
   },
   /**
    * 出具缺口里双盲复算、反方审稿报上来的那几条（缺口以「双盲复算「节点名」：」「反方审稿：」开头）：时间线、成果卡片、
-   * 证据页把它们另起一组，不和「校验没跑全」混在一起——它们是核查查出来的问题，不是校验没做完
+   * 证据页把它们另起，不和「校验没跑全」混在一起，再按是查出了问题还是没核成分两组（run/decode.ts 的 splitIssuanceGaps）：
+   * failed 是核查查出来的问题（两路结果不一致、结论被推翻），unfinished 是没核成的（指标无法复算：合并查询、遮罩列的
+   * 输入做不了复算，盲算触顶、出错）——没核过的数不能说成「未通过」，读的人会以为这个数被查出了错
    */
   verifyGaps: {
-    head: '核查未通过',
+    failed: '核查未通过',
+    unfinished: '核查未完成',
   },
 }
 
@@ -3689,11 +3708,17 @@ export const CHALLENGE_TEXT = {
   degrade: '出具会降档',
   degradeHint: '被推翻的结论计入出具缺口，本次正式运行将降档出具',
   flagNote: '按节点设置，被推翻的结论只做标注，不影响出具档位',
-  /** 按降档处置，但节点不在带出具契约的成果节点上游（服务端的 degrades 为假）：缺口进不了出具 */
-  degradeOff: '本节点不在带出具契约的成果节点上游，被推翻的结论不影响出具档位',
-  /** 服务端的 unreviewed：核查模型不可用、触顶、数据源不在了等，这几句根本没查成，只是记为无法判断 */
-  unreviewed: (n: number) => `${formatNumber(n)} 句没能反查，已记为无法判断`,
-  unreviewedHint: '核查模型不可用、达到上限或数据源已停用时，这几句没有真正查询数据，原因见运行时间线',
+  /**
+   * 按降档处置，但反方审稿节点不在带出具契约的成果节点上游（服务端的 degrades 为假）：缺口进不了出具。这句画在人工审批
+   * 的卡上（画布上也会在审批节点旁弹出），主语写明是反方审稿节点，不说「本节点」——那里的本节点是审批节点
+   */
+  degradeOff: '反方审稿节点没有接在带出具契约的成果节点上游，被推翻的结论不计入出具缺口，不影响出具档位',
+  /**
+   * 服务端的 unreviewed：反查没有完成的句数（核查模型不可用、触顶没给出结论、数据源已不存在或已停用、报告没有引用
+   * 数据库查询……），都记为无法判断。触顶的可能已经查过几次，不能说成「没有查询数据」；不会多于「无法判断」的句数
+   */
+  unreviewed: (n: number) => `${formatNumber(n)} 句未能反查，已记为无法判断`,
+  unreviewedHint: '反查没有完成：可能是核查模型不可用、达到上限、数据源已不存在或已停用，或报告未引用数据库查询，原因见运行时间线',
   /** 审批里没带工件（服务端保存审稿记录失败）：每句都看不了理由和查询，整块说一次 */
   noRecord: '反方审稿记录未保存，无法查看理由和查询',
   more: (n: number) => `另有 ${formatNumber(n)} 句未列出`,
@@ -3734,10 +3759,13 @@ export const CHALLENGE_TEXT = {
     refutedNext: '请在证据中对照反方审稿的查询和理由，核实这些结论',
     limit: (label: string, skipped?: number) => (skipped ? `反方审稿已达${label}，${formatNumber(skipped)} 句结论未审` : `反方审稿已达${label}`),
     limitNext: '请在节点或「设置 → 偏好设置 → 核查」中调高反方审稿的上限',
-    /** challenge_unreviewed：有句子没能反查（核查模型不可用、数据源不在了……），记为无法判断 */
-    unreviewed: (n?: number) => (n ? `反方审稿有 ${formatNumber(n)} 句结论没能反查，已记为无法判断`
-      : '反方审稿有结论没能反查，已记为无法判断'),
-    unreviewedNext: '这几句没有真正查询数据。请检查核查模型和数据源是否可用，或在「设置 → 偏好设置 → 核查」中调高上限后重新运行',
+    /**
+     * challenge_unreviewed：有句子未能反查（核查模型不可用、整理证据出错、报告没有引用数据库查询、数据源不在了、一条
+     * 查询都没执行成功），记为无法判断。触顶的不在这里（由 challenge_limit 说），所以建议里不提调高上限
+     */
+    unreviewed: (n?: number) => (n ? `反方审稿有 ${formatNumber(n)} 句结论未能反查，已记为无法判断`
+      : '反方审稿有结论未能反查，已记为无法判断'),
+    unreviewedNext: '原因见展开内容。请检查核查模型和数据源是否可用，修正后重新运行；报告未引用数据库查询的结论无法反查',
     /** challenge_sources_lost：反查了，但该查的数据源有停用了的，判断不含它们的数据 */
     sourcesLost: (n?: number) => (n ? `反方审稿有 ${formatNumber(n)} 句结论只查了部分数据源` : '反方审稿有结论只查了部分数据源'),
     sourcesLostSub: (names: string[]) => `未能查询：${names.map((x) => `「${x}」`).join('、')}（已不存在或已停用），判断不含其中的数据`,

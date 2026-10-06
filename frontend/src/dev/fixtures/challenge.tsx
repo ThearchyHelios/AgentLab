@@ -3,6 +3,7 @@ import { ReactFlow, ReactFlowProvider } from '@xyflow/react'
 import { Inspector } from '../../canvas/Inspector'
 import { NodeCard } from '../../canvas/NodeCard'
 import { ApprovalCard } from '../../run/RunPanel'
+import { ChallengeSummary } from '../../run/ChallengeSummary'
 import { useCatalog } from '../../store/catalog'
 import { useStudio } from '../../store/studio'
 import type { Approval, ApprovalChallenge, ApprovalReport, Provider, Workflow } from '../../types'
@@ -22,9 +23,16 @@ import fx from './challenge.json'
  * - ?syn=challenge-approval-dense：同第一个，摆在 360px 的右栏里
  * - ?syn=challenge-approval-clear / -clear-flag：正式运行，没有被推翻的结论（降档 / 只标注），两种都不写降档、不写只标注
  * - ?syn=challenge-approval-explore-flag：探索运行配只标注，同样不说任何和出具有关的话
- * - ?syn=challenge-approval-runfail：运行类别取不到（检查脚本先答 500），不说任何和出具有关的话
- * - ?syn=challenge-approval-unreviewed：正式运行，四句里有两句没能反查（unreviewed），被推翻的会降档（degrades）
+ * - ?syn=challenge-approval-runfail：老服务端的审批（不带 run_class），运行类别也取不到（检查脚本先答 500）：不说任何
+ *   和出具有关的话。审批带着运行类别时照它说、不另取，见 challenge-summary-given
+ * - ?syn=challenge-approval-unreviewed：正式运行，四句里有两句未能反查（unreviewed：被削弱、经受住的那两句换成数据源
+ *   已停用、记为无法判断，计数跟着改成无法判断 3 句；工件由检查脚本按同样的改法合成），被推翻的会降档（degrades）
+ * - ?syn=challenge-approval-unreviewed-over：服务端给的 unreviewed（5）比「无法判断」的句数（1）还多（不该出现）：
+ *   卡上按「无法判断」的句数说，两个数不打架
  * - ?syn=challenge-approval-offpath：正式运行，按降档处置，但反方审稿不在带出具契约的成果节点上游（degrades 为假）
+ * - ?syn=challenge-summary-given：反方审稿那一块单独画，审批自带的运行类别（正式运行）由调用方传进来；检查脚本让这次运行的
+ *   GET 失败，卡上照样写「出具会降档」，也不另发这次请求。审批卡（RunPanel 的 ApprovalCard）把 approval.run_class
+ *   传给它之后，卡上走的就是这条路
  * - ?syn=challenge-approval-dup：同 many，工件里补出来的一句和条目里的一句原文相同、unit 不同（工件由检查脚本合成）
  * - ?syn=challenge-approval-norecord：同 many，审稿记录没存上（artifact 为 null）
  *
@@ -39,12 +47,13 @@ import fx from './challenge.json'
 const report = fx.report as unknown as ApprovalReport
 const challenge = fx.challenge as unknown as ApprovalChallenge
 
-function approvalOf(id: string, runId: string, runClass: 'formal' | 'exploratory', reviewed: ApprovalReport): Approval {
+/** runClass 为 null：老服务端的审批，不带运行类别 */
+function approvalOf(id: string, runId: string, runClass: 'formal' | 'exploratory' | null, reviewed: ApprovalReport): Approval {
   return {
     id, run_id: runId, node_id: 'review', mode: 'approve', title: '本月月报可以发出吗？', status: 'pending', response: {},
     payload: { kind: 'human_node', message: '请审核本月月报。', reports: [reviewed] },
     created_at: new Date(Date.now() - 300_000).toISOString().replace('Z', ''),
-    workflow_name: '月报', node_label: '主管审批', run_class: runClass,
+    workflow_name: '月报', node_label: '主管审批', ...(runClass ? { run_class: runClass } : {}),
   }
 }
 
@@ -67,6 +76,18 @@ const many = fx.many as unknown as ApprovalChallenge
 const clear: Partial<ApprovalChallenge> = {
   counts: { stands: 1, weakened: 1, refuted: 0, inconclusive: 1 },
   items: challenge.items.filter((it) => it.verdict !== 'refuted'),
+}
+/**
+ * 有两句未能反查：被削弱（u5）、经受住（u8）的那两句换成数据源已停用、没查成，记为无法判断（服务端未能反查的每一句都
+ * 记为无法判断，unreviewed 不会多于 inconclusive）。原来无法判断的 u11 是查过了、数据不够，不算未能反查
+ */
+const UNREVIEWED_UNITS = ['u5', 'u8']
+const unreviewed: Partial<Challenge> = {
+  counts: { stands: 0, weakened: 0, refuted: 1, inconclusive: 3 },
+  items: challenge.items.map((it) => (UNREVIEWED_UNITS.includes(it.unit) ? { ...it, verdict: 'inconclusive' } : it)),
+  artifact: 'f'.repeat(64),
+  unreviewed: 2,
+  degrades: true,
 }
 
 // ---------------------------------------------------------------- 检查器
@@ -201,7 +222,7 @@ export const cases: Record<string, () => JSX.Element> = {
           approval={approvalOf('ap-chal-10', RUNS.exploreFlag, 'exploratory', withChallenge({ on_refuted: 'flag' }))} />
   ),
   'challenge-approval-runfail': () => (
-    <Card name="challenge-approval-runfail" approval={approvalOf('ap-chal-11', RUNS.runfail, 'formal', withChallenge({}))} />
+    <Card name="challenge-approval-runfail" approval={approvalOf('ap-chal-11', RUNS.runfail, null, withChallenge({}))} />
   ),
   'challenge-approval-dup': () => (
     <Card name="challenge-approval-dup"
@@ -213,7 +234,16 @@ export const cases: Record<string, () => JSX.Element> = {
   ),
   'challenge-approval-unreviewed': () => (
     <Card name="challenge-approval-unreviewed"
-          approval={approvalOf('ap-chal-14', RUNS.unreviewed, 'formal', withChallenge({ unreviewed: 2, degrades: true }))} />
+          approval={approvalOf('ap-chal-14', RUNS.unreviewed, 'formal', withChallenge(unreviewed))} />
+  ),
+  'challenge-approval-unreviewed-over': () => (
+    <Card name="challenge-approval-unreviewed-over"
+          approval={approvalOf('ap-chal-16', RUNS.over, 'formal', withChallenge({ unreviewed: 5, degrades: true }))} />
+  ),
+  'challenge-summary-given': () => (
+    <div className="mx-auto max-w-3xl p-4" data-fixture="challenge-summary-given">
+      <ChallengeSummary reports={[withChallenge({ degrades: true })]} runId={RUNS.given} runClass="formal" />
+    </div>
   ),
   'challenge-approval-offpath': () => (
     <Card name="challenge-approval-offpath"

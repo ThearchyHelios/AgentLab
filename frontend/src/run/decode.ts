@@ -718,7 +718,7 @@ function gateTitle(tool: string, verdict: 'allow' | 'escalate' | 'team', reason:
 /**
  * 双盲复算、反方审稿的日志代码（期 3 前后端共用的约定）。这几条按 code 和结构化字段解读，不看原话；后端发成 info 的
  * （一致、裁决、记入数据目录、审稿完成）也上时间线，不然这两种节点就是一个跑了几十秒、什么都没说的黑盒。
- * 无法复算（dual_check_unchecked）、没能反查（challenge_unreviewed）、只查了部分数据源（challenge_sources_lost）是
+ * 无法复算（dual_check_unchecked）、未能反查（challenge_unreviewed）、只查了部分数据源（challenge_sources_lost）是
  * 期 4 补上的：以前认不得，只能照原话显示
  */
 const VERIFY_LOG_CODES = new Set([
@@ -734,13 +734,23 @@ const CL = CHALLENGE_TEXT.log
 /**
  * 出具缺口里哪几条是双盲复算、反方审稿报上来的：出具契约给上游节点报的缺口加了「节点类型「节点名」：」的前缀
  * （nodes/io.py 的 _upstream_issuance_gaps，节点名就是类型叫法时只写「节点类型：」），按这两种节点类型的叫法认。
- * 它们是核查查出来的问题（两路结果不一致、结论被推翻、指标无法复算），时间线、成果卡片、证据页另起一组「核查未通过」，
- * 不和「校验没跑全」的缺口混在一起。其余的照旧
+ * 时间线、成果卡片、证据页把它们另起，不和「校验没跑全」的缺口混在一起，再分两组（叫法在 DUAL_CHECK_TEXT.verifyGaps）：
+ * - failed「核查未通过」：核查查出来的问题——两路结果不一致（审核人选了盲算、两边都不对、没作出选择），结论被推翻；
+ * - unfinished「核查未完成」：没核成的——指标无法复算（nodes/dual_check.py 的 GAP_UNCHECKED「指标「X」无法复算：原因」）。
+ *   合并查询、遮罩列的输入做不了复算，盲算触顶、出错的也没核过，说成「未通过」读的人会以为这个数被查出了错。
+ * 其余的照旧
  */
 const VERIFY_GAP_KINDS = [NODE_TYPE_LABEL.dual_check, NODE_TYPE_LABEL.challenge]
-export function splitIssuanceGaps(gaps: readonly string[]): { verify: string[]; other: string[] } {
-  const isVerify = (g: string) => VERIFY_GAP_KINDS.some((kind) => g.startsWith(`${kind}「`) || g.startsWith(`${kind}：`))
-  return { verify: gaps.filter(isVerify), other: gaps.filter((g) => !isVerify(g)) }
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+/** 双盲复算报的「无法复算」：前缀（节点名可有可无）之后紧跟 GAP_UNCHECKED 的开头 */
+const UNCHECKED_GAP = new RegExp(`^${escapeRe(NODE_TYPE_LABEL.dual_check)}(?:「.*?」)?：指标「.+?」无法复算：`)
+export function splitIssuanceGaps(gaps: readonly string[]): { failed: string[]; unfinished: string[]; other: string[] } {
+  const out = { failed: [] as string[], unfinished: [] as string[], other: [] as string[] }
+  for (const g of gaps) {
+    const verify = VERIFY_GAP_KINDS.some((kind) => g.startsWith(`${kind}「`) || g.startsWith(`${kind}：`))
+    ;(!verify ? out.other : UNCHECKED_GAP.test(g) ? out.unfinished : out.failed).push(g)
+  }
+  return out
 }
 const isRecord = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v)
 /** 老日志、别的服务端版本可能给的是一句中文原因而不是代码：中文的照写，认不得的代码不往界面上放 */
@@ -1140,7 +1150,7 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       }
     }
     case 'challenge_unreviewed': {
-      // claims_skipped：没能反查的句数；reason：第一句没能反查的原因（一句中文）
+      // claims_skipped：未能反查的句数；reason：第一句未能反查的原因（一句中文）
       return {
         title: CL.unreviewed(countOf(d.claims_skipped) || undefined),
         sub: cjkText(d.reason),
@@ -2103,9 +2113,10 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         if (num(d.unmatched)) gaps.push(`${d.unmatched} 个数字无法追溯到指标集`)
         // 校验本身没跑全（叙述渲染为空、指标集为空）也会降档。不写出来的话，
         // 时间线上就是一个光秃秃的「降档出具」，看起来和"全部通过"只差一个字。
-        // 双盲复算、反方审稿报上来的缺口是核查查出来的问题，另起一组，不归在「校验不完整」下
-        const { verify, other: notRun } = splitIssuanceGaps(Array.isArray(d.gaps) ? d.gaps.map(String) : [])
-        if (verify.length) gaps.push(`${DC.verifyGaps.head}：${verify.join('；')}`)
+        // 双盲复算、反方审稿报上来的缺口另起，按查出了问题、没核成分成两组，不归在「校验不完整」下
+        const { failed, unfinished, other: notRun } = splitIssuanceGaps(Array.isArray(d.gaps) ? d.gaps.map(String) : [])
+        if (failed.length) gaps.push(`${DC.verifyGaps.failed}：${failed.join('；')}`)
+        if (unfinished.length) gaps.push(`${DC.verifyGaps.unfinished}：${unfinished.join('；')}`)
         if (notRun.length) gaps.push(`校验不完整：${notRun.join('；')}`)
         const checked = [
           num(d.metrics_checked) != null ? `核对 ${d.metrics_checked} 个指标` : '',
