@@ -19,6 +19,7 @@ thinking=off，思考就能把 4096 用光：这次调用 finish_reason=length�
 from __future__ import annotations
 
 import json
+import uuid
 
 from langchain_core.messages import AIMessage, BaseMessage
 from openai import LengthFinishReasonError
@@ -26,13 +27,20 @@ from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletion
 
 from app.core.events import EventType
+from app.db.models import Provider
 from app.engine import judge as judging
 from app.engine import review as rv
 from app.engine import verify_agent
 from app.engine.inquiry import _error_words
 from app.engine.nodes.challenge import _claim_of
 from app.engine.nodes.dual_check import _slim
+from app.providers.factory import build_chat_model
 from tests.test_verify_agent import VALID_SUM, clean_spend, q, run, shop  # noqa: F401 - 夹具按名字引入
+
+try:  # openai SDK 3 起换成了 httpx2（和 httpx 同一套接口）：假服务要装在 SDK 真正用的那个库上
+    from langchain_openai._compat import httpx
+except ImportError:  # pragma: no cover - 老版本的 langchain_openai
+    import httpx
 
 CUT_16K = "核查模型的输出达到上限（16384 token）被截断"
 ADVICE = "通常是推理占满了输出额度，可在「设置 → 偏好设置 → 核查」中换用不带推理的模型"
@@ -343,3 +351,86 @@ def test_the_review_layer_knows_the_truncation_log():
 
 def test_the_reply_shapes_used_here_are_messages():
     assert isinstance(cut_reply(), BaseMessage) and isinstance(anthropic_cut()["raw"], BaseMessage)
+
+
+# --------------------------------------------------------------------------
+# 真实的 ChatOpenAI 和 openai SDK：只有 HTTP 层是假的（经 OpenAI 兼容网关接入的推理模型就是这一路）
+# --------------------------------------------------------------------------
+
+GATEWAY_MODEL = "reasoner-v4"
+
+
+class Gateway:
+    """OpenAI 兼容网关：按顺序回 chat.completion（最后一个重复用）。cap 给了，请求的额度超过它就回 400（DeepSeek chat 系
+    只收 8K 那样）。bodies 记下每个请求体。"""
+
+    def __init__(self, replies: list, *, cap: int | None = None) -> None:
+        self.replies, self.cap = list(replies), cap
+        self.bodies: list[dict] = []
+
+    async def handle(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content or b"{}")
+        self.bodies.append(body)
+        budget = body.get("max_completion_tokens") or body.get("max_tokens")
+        if self.cap and budget and budget > self.cap:
+            message = f"max_tokens: {budget} > {self.cap}, which is the maximum allowed number of output tokens"
+            return httpx.Response(400, json={"error": {"message": message, "type": "invalid_request_error"}},
+                                  request=request)
+        message, finish, spent = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+        return httpx.Response(200, request=request, json={
+            "id": "c-1", "object": "chat.completion", "created": 1, "model": GATEWAY_MODEL,
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 900, "completion_tokens": spent, "total_tokens": 900 + spent}})
+
+
+def gateway(monkeypatch, replies: list, *, cap: int | None = None) -> Gateway:
+    fake = Gateway(replies, cap=cap)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", fake.handle)
+    provider = Provider(name=f"gw-{uuid.uuid4().hex[:8]}", kind="openai_compatible", base_url="http://gw.example.test/v1",
+                        api_key=None, models=[{"id": GATEWAY_MODEL}], default_model=GATEWAY_MODEL, enabled=True, extra={})
+
+    async def build(session, spec):
+        return build_chat_model(provider, spec), GATEWAY_MODEL
+
+    monkeypatch.setattr(verify_agent, "get_chat_model", build)
+    return fake
+
+
+THINKING_ONLY = ({"role": "assistant", "content": "", "reasoning_content": "先看看有哪些表……"}, "length", 16384)
+
+
+def tool_call(name: str) -> tuple:
+    return ({"role": "assistant", "content": None, "tool_calls": [{
+        "id": "c1", "type": "function",
+        "function": {"name": f"db_query__{name}", "arguments": json.dumps({"sql": VALID_SUM})}}]}, "tool_calls", 120)
+
+
+async def test_a_real_client_cut_off_in_the_loop(monkeypatch, shop):
+    name, _ = shop
+    fake = gateway(monkeypatch, [THINKING_ONLY])
+    out = await run(name)
+    assert out.error == f"{CUT_16K}，核查未能完成。{ADVICE}"
+    assert len(fake.bodies) == 1 and fake.bodies[0]["max_completion_tokens"] == 16384
+    assert "tools" in fake.bodies[0], "工具循环那次带着只读的查询工具"
+
+
+async def test_a_real_client_cut_off_in_the_json_schema_settle(monkeypatch, shop):
+    """收尾走 openai 的结构化输出（json_schema）：finish_reason=length 时 SDK 抛 LengthFinishReasonError。"""
+    name, _ = shop
+    half = ({"role": "assistant", "content": '{"value": {"alias": "Q1", "row'}, "length", 16384)
+    fake = gateway(monkeypatch, [tool_call(name), ({"role": "assistant", "content": "查完了。"}, "stop", 20), half])
+    out = await run(name)
+    assert out.error == f"{CUT_16K}，核查未能完成。{ADVICE}" and len(out.queries) == 1
+    assert len(fake.bodies) == 3 and "response_format" in fake.bodies[2], "收尾被截断：没有再退回普通调用"
+    assert out.usage["output_tokens"] == 120 + 20 + 16384, "异常里带着的那次用量照记"
+
+
+async def test_a_real_client_rejecting_the_budget_falls_back_to_4096(monkeypatch, shop):
+    name, _ = shop
+    done = ({"role": "assistant", "content": json.dumps(FOUND, ensure_ascii=False)}, "stop", 60)
+    fake = gateway(monkeypatch, [tool_call(name), ({"role": "assistant", "content": "查完了。"}, "stop", 20), done],
+                   cap=8192)
+    out = await run(name)
+    assert out.error is None and out.result["value"] == 230
+    budgets = [b.get("max_completion_tokens") for b in fake.bodies]
+    assert budgets == [16384, 4096, 4096, 4096], "第一次被拒后退回 4096，之后工具循环和收尾都用小的，不再先撞一次"
