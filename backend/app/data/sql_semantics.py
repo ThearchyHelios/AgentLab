@@ -174,7 +174,11 @@ WHERE / GROUP BY 里用列别名的），而且只说四类：
   COUNT(*) > 0 THEN 1 END 这类恒为一个值的表达式不算聚合，认作看不见（少说），可 MAX(x) 旁边并排的那一项恒为一个值时
   仍按看得见说；表结构里没写外键、没写键的，按「可能对不上、可能重复」说（库里实际有约束时这句话可能不起作用）；没给
   表结构时按主键分组的 MAX(x) 对 MIN(x)、AVG(DISTINCT x) 对 AVG(x) 照说（那时不知道键）；「可能是时间」只认列名里的
-  词和像日期的常量，一边按 id 的单边范围、按批次号这类筛出来的其实是一段时间时，另一边仍会被说成「没有按时间筛选」。
+  词和像日期的常量，一边按 id 的单边范围、按批次号这类筛出来的其实是一段时间时，另一边仍会被说成「没有按时间筛选」；
+  存成 Unix 秒的时间列（created >= 1788220800）认不出是时间，会说成有效行条件；列名带 time 的时长列（wait_time <
+  3600）会被说成「按它筛时间」；被 CURRENT_DATE、DATE('now', …)、CAST(…)、上下界相同的 BETWEEN 定死的列不算定死，
+  MAX(stat_date) 对 MIN(stat_date) 这类仍会照说。这几类只影响说明的准确度，不会判错等价；双盲复算写数据目录时另有一道
+  门槛（业务日期只在两边的列都确实是日期 / 时间类型时才写，有效行条件只收排除无效记录的写法），不会因此写进错的事实。
 - 收窄换来的代价：一边的聚合参数里用到某一列（SUM(amount - discount)），另一边多一个这一列上的条件（WHERE discount
   > 0）时，这个条件不再说成「另一边没有这个条件」（认不出参数里的运算是不是在筛）；列名带 day / month / period 这类
   词、常量像日期的条件（delivery_days < 3、period_type = 'monthly'）不再说成有效行过滤；另一边有任何上下界（amount
@@ -2747,7 +2751,9 @@ def _misread(tokens: list[Any], text: str, read: str | None) -> str | None:
       同一段里又有 ::（PostgreSQL 里 x COLLATE "C"::text 的 :: 套在整个 COLLATE 上，sqlglot 读成套在排序规则的名字上）；
     - 不知道是哪种库时：块注释里再写 /*（PostgreSQL 嵌套、SQLite / MySQL 不嵌套，见 _COMMENTS_AS_SQLGLOT）、后面紧跟着
       字的 --（MySQL 里 amount--1 是 amount - (-1)，别的库是注释）、#（MySQL 里是注释，PostgreSQL 里是按位异或）、双引号
-      括起来的名字（MySQL 默认的 sql_mode 里 "status" 是字符串，别的库和 sqlglot 的通用读法里是列名）。
+      括起来的名字（MySQL 默认的 sql_mode 里 "status" 是字符串，别的库和 sqlglot 的通用读法里是列名）；
+    - 前缀的 NOT 后面同一段里既有谓词、又有算术 / 拼接 / 按位运算（NOT status IN (…) * amount、NOT paid_at IS NULL * amount）：
+      SQLite 里 NOT 最松，sqlglot 的 NOT 只取等值那一级。宁可多拦（NOT a = 1 + 2 其实读得对），只给兜底不会说错。
 
     一段条件到 AND、OR、逗号、子句关键字为止（BETWEEN 自己的 AND 不算；IS [NOT] DISTINCT FROM 的 FROM 不算）。"""
     if read not in _PLAIN_BACKSLASH and any(
@@ -2771,11 +2777,15 @@ def _misread(tokens: list[Any], text: str, read: str | None) -> str | None:
     frames: list[dict[str, Any]] = [{}]
 
     def fresh(frame: dict[str, Any]) -> None:
-        frame.update(compare=0, between=0, bitwise=set(), arithmetic=False, collated=False)
+        frame.update(compare=0, between=0, bitwise=set(), arithmetic=False, collated=False, negated=False)
 
     def done(frame: dict[str, Any]) -> str | None:
         if frame["compare"] >= 2:
             return "比较运算和 IS / IN / LIKE / BETWEEN 没加括号地混用"
+        if frame["negated"] and frame["compare"] and (frame["arithmetic"] or frame["bitwise"]):
+            # 前缀的 NOT 后面同一段里既有谓词、又有算术 / 拼接 / 按位运算（NOT status IN (…) * amount）：SQLite 里 NOT 最松、
+            # * 比 IN 紧，是 NOT ((status IN (…)) * amount)；sqlglot 的 NOT 只取等值那一级，读成 (NOT status IN (…)) * amount
+            return "前缀的 NOT 和谓词、算术运算没加括号地混用"
         if frame["bitwise"] and (len(frame["bitwise"]) >= 2 or frame["arithmetic"]):
             return "按位运算、COLLATE 和别的运算没加括号地混用"
         return None
@@ -2849,6 +2859,9 @@ def _misread(tokens: list[Any], text: str, read: str | None) -> str | None:
                     continue
                 i = j
                 continue
+        elif kind == "NOT" and not after_operand and not (nxt is not None and nxt.token_type.name == "NULL"):
+            # 前缀的 NOT（前面不是操作数）：x NOT IN / NOT LIKE / NOT BETWEEN 跟在操作数后面，不算；IS NOT 在 IS 那一支整个算过
+            frame["negated"] = True
         elif kind == "NOT" and nxt is not None and nxt.token_type.name == "NULL":
             # SQLite 的后缀 x NOT NULL（前面是 IS 的已经整个算过了）
             frame["compare"] += 1

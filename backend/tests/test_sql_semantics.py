@@ -1619,3 +1619,44 @@ def test_time_columns_on_different_tables_are_written_with_their_tables():
                            "b": [{"table": "users", "column": "created_at"}]}
     [item] = explain_sql_diff(b, plain, "sqlite").items
     assert (item.aspect, item.text) == ("time", "A 按 users.created_at 筛时间，B 没有按时间筛选")
+
+
+# ---------------------------------------------------------------- 前缀的 NOT 和谓词、算术混用（解析保真守卫）
+
+_NOT_PREDICATES = ["status IN ('void', 'refunded')", "status NOT IN ('void')", "paid_at IS NULL", "paid_at IS NOT NULL",
+                   "user_id IN (SELECT user_id FROM refunds)", "paid_at NOT NULL"]
+_NOT_OPERATORS = ["*", "+", "-", "/", "%", "||", "&", "|"]
+
+
+@pytest.mark.parametrize("predicate", _NOT_PREDICATES)
+@pytest.mark.parametrize("operator", _NOT_OPERATORS)
+@pytest.mark.parametrize("dialect", ["sqlite", None])
+def test_a_prefix_not_mixed_with_a_predicate_and_arithmetic_is_never_equivalent(predicate, operator, dialect):
+    """SQLite 里 NOT 最松：NOT status IN (…) * amount 是 NOT ((status IN (…)) * amount)；sqlglot 的 NOT 只取等值那一级，
+    读成 (NOT status IN (…)) * amount，和加了括号的写法成了同一棵树。这类写法不在语法树上判等价，只给兜底。"""
+    a = f"SELECT id, NOT {predicate} {operator} amount FROM orders"
+    b = f"SELECT id, (NOT {predicate}) {operator} amount FROM orders"
+    diff = explain_sql_diff(a, b, dialect)
+    assert not diff.equivalent and diff.fallback, (a, diff)
+
+
+@pytest.mark.parametrize(("a", "b"), [
+    ("SELECT user_id, SUM(NOT status IN ('void', 'refunded') * amount) AS net FROM orders GROUP BY user_id",
+     "SELECT user_id, SUM((NOT status IN ('void', 'refunded')) * amount) AS net FROM orders GROUP BY user_id"),
+    ("SELECT user_id, SUM(NOT paid_at IS NULL * amount) AS paid FROM orders GROUP BY user_id",
+     "SELECT user_id, SUM((NOT paid_at IS NULL) * amount) AS paid FROM orders GROUP BY user_id"),
+])
+def test_the_reported_prefix_not_pairs_are_not_equivalent(a, b):
+    for dialect in ("sqlite", None):
+        assert not explain_sql_diff(a, b, dialect).equivalent
+
+
+@pytest.mark.parametrize(("a", "b"), [
+    ("SELECT COUNT(*) FROM orders WHERE NOT status IN ('void') AND amount > 0",
+     "SELECT COUNT(*) FROM orders o WHERE NOT o.status IN ('void') AND o.amount > 0"),
+    ("SELECT SUM(amount) FROM orders WHERE NOT status = 'void'",
+     "SELECT SUM(o.amount) FROM orders AS o WHERE NOT o.status = 'void'"),
+])
+def test_ordinary_prefix_not_is_still_recognised_as_equivalent(a, b):
+    """守卫只拦同一段里 NOT、谓词、算术三样都有的；常见的 NOT … IN、NOT … = 照样认得出等价改写。"""
+    assert explain_sql_diff(a, b, "sqlite").equivalent
