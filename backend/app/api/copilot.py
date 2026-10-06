@@ -525,9 +525,10 @@ async def get_copilot_model(session: AsyncSession = Depends(get_session)) -> dic
     """当前 Copilot 会用哪个模型，以及是显式配的还是兜底来的。
 
     存的接入不存在、已停用（或者只存了模型名、提供它的接入已停用）时实际什么都用不了：effective_* 为空，
-    error 写明原因（和生成时报的同一句），能用时 error 为 None。"""
+    error 写明原因（和生成时报的同一句），能用时 error 为 None。panel_error 是同一件事写在助手栏「助手使用的模型」
+    那一格下面的说法：人就在这个下拉框旁边，去向写「上方」，不再把人指回这个下拉框本身。"""
     from app.db.models import Setting
-    from app.providers.factory import resolve_provider
+    from app.providers.factory import assistant_unavailable, resolve_provider
 
     row = await session.get(Setting, COPILOT_SETTING_KEY)
     saved = row.value if row else {}
@@ -537,7 +538,7 @@ async def get_copilot_model(session: AsyncSession = Depends(get_session)) -> dic
     except ProviderNotConfigured as e:
         return {"configured": configured, "provider": saved.get("provider") or None,
                 "model": saved.get("model") or None, "effective_provider": None, "effective_model": None,
-                "error": _unconfigured(e)}
+                "error": _unconfigured(e), "panel_error": assistant_unavailable(e, here=True)}
     return {
         "configured": configured,
         "provider": saved.get("provider") or None,
@@ -545,6 +546,7 @@ async def get_copilot_model(session: AsyncSession = Depends(get_session)) -> dic
         "effective_provider": resolved.name if resolved else None,
         "effective_model": saved.get("model") or (resolved.default_model if resolved else None),
         "error": None,
+        "panel_error": None,
     }
 
 

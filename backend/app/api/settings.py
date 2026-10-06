@@ -23,7 +23,7 @@ from app.engine.judge import sanitize_settings as judge_values, settings_problem
 from app.engine.spend import SPEND_KEY as VERIFY_SPEND, daily_spend as verify_daily_spend
 from app.providers import catalog
 from app.providers.factory import (
-    ModelSpec, ProviderNotConfigured, _resolve_key, assistant_model_note, build_chat_model,
+    ModelSpec, ProviderNotConfigured, _resolve_key, assistant_unavailable, build_chat_model,
     list_providers as all_providers, model_note, named_provider,
 )
 
@@ -732,8 +732,8 @@ PROVIDER_INVALID = "settings_provider_invalid"
 
 def _provider_fields() -> dict[tuple[str, str], tuple[str, str | None]]:
     """设置里点名模型接入的项：(组, 键) → (这一项在界面上的叫法, 同一组模型那一项的叫法)。门控、裁判、核查的叫法和
-    设置页一致；助手的模型由「编排」页助手栏的「助手使用的模型」单独设定（PUT /api/copilot/model），只有这一个下拉框，
-    这里只防经设置接口写进去的那一份。"""
+    设置页一致；助手的模型由「编排」页助手栏的「助手使用的模型」单独设定（PUT /api/copilot/model），只有这一个下拉框
+    （模型那一项为 None），这里只防经设置接口写进去的那一份。"""
     from app.api.copilot import COPILOT_SETTING_KEY   # 在这里导入：copilot 模块很大，设置模块被引擎各处导入
     from app.providers.factory import ASSISTANT_MODEL_FIELD
 
@@ -747,7 +747,9 @@ def _provider_fields() -> dict[tuple[str, str], tuple[str, str | None]]:
 
 async def _provider_problem(session: AsyncSession, values: dict[str, Any]) -> tuple[str, str] | None:
     """这次写进来的设置里点名的模型接入有没有问题：(字段, 说明)，没问题返回 None。说明和运行时报的原因、提示同一句
-    （factory.named_provider），主语写这一项在设置页上的叫法；下拉框里选的，写「指定的」。
+    （factory.named_provider），主语写这一项在设置页上的叫法；下拉框里选的，写「指定的」。助手那一项只有「编排」页
+    助手栏一个下拉框（只选模型，选了就清掉接入），没有「换一个接入」的地方：说法同助手取不到模型时那一句
+    （factory.assistant_unavailable），哪里报都一样。
 
     以前点名的接入不存在时运行悄悄换成演示模型，名字写错一个字就由演示模型写报告、做核查，现在运行时照实报错；保存时
     先拦一道。留空照旧表示沿用上一级——说明里不再讲留空是什么意思：设置页那一格的空选项写着（「默认接入」「跟随助手
@@ -775,11 +777,12 @@ async def _provider_problem(session: AsyncSession, values: dict[str, Any]) -> tu
         try:
             named_provider(providers, name)
         except ProviderNotConfigured as e:
+            if model_label is None:
+                return f"{group}.{key}", assistant_unavailable(e)
             said = f"「{label}」指定的{e.reason}。{e.hint}"
             if e.model_owner:
-                note = model_note(e.name, e.model_owner, f"「{model_label}」", f"「{label}」") if model_label \
-                    else assistant_model_note(e.name, e.model_owner)
-                said += f"。{note}"
+                # 这几组的模型一栏是输入框：写「填写」
+                said += f"。{model_note(e.name, e.model_owner, f'「{model_label}」', f'「{label}」', '填写')}"
             return f"{group}.{key}", said
     return None
 

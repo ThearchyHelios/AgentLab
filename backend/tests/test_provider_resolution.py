@@ -119,7 +119,7 @@ async def test_a_disabled_provider_named_like_a_model_is_not_swapped_for_the_one
     assert e.value.code == "disabled" and "fake-v4.1-flash" in str(e.value)
     # 照「启用它」去做启用的是那条旧接入：另补一句这个名字是哪个接入的模型、怎么用它
     assert e.value.model_owner == "云端接入" and str(e.value).endswith(
-        "「fake-v4.1-flash」是接入「云端接入」的模型：如需使用该模型，请在模型一栏中填写，接入留空或选择「云端接入」")
+        "「fake-v4.1-flash」是接入「云端接入」的模型：如需使用该模型，请在模型一栏中选择它，接入留空或选择「云端接入」")
     assert (await resolve_provider(session, None, "fake-v4.1-flash")).id == serving.id
 
 

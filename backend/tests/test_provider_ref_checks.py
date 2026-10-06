@@ -77,13 +77,21 @@ FIELDS = [
 ]
 
 
+def refused(group: str, label: str, reason: str, fix: str) -> str:
+    """保存时拒收的说法。助手那一项只有「编排」页助手栏一个下拉框（只选模型），没有「换一个接入」的地方：和助手取不到
+    模型时报的同一句（factory.assistant_unavailable，见 test_provider_ref_wording）。"""
+    if group == "copilot":
+        return f"助手使用的{reason}。{fix}，或在「编排」页助手栏的「助手使用的模型」中重新选择"
+    return f"「{label}」指定的{reason}。{fix}，或换一个接入"
+
+
 @pytest.mark.parametrize("group,key,label", FIELDS)
 async def test_saving_a_provider_that_does_not_exist_is_refused_with_the_field(client, group, key, label):
     r = await client.put("/api/settings", json={"values": {group: {key: GONE}}})
     assert r.status_code == 422, r.text
     body = r.json()
     assert body["code"] == "settings_provider_invalid" and body["field"] == f"{group}.{key}"
-    assert body["detail"] == f"「{label}」指定的模型接入「{GONE}」不存在。请在「设置 → 模型接入」中核对名称，或换一个接入"
+    assert body["detail"] == refused(group, label, f"模型接入「{GONE}」不存在", "请在「设置 → 模型接入」中核对名称")
     assert await stored(group) is None
 
 
@@ -93,7 +101,7 @@ async def test_saving_a_disabled_provider_is_refused_too(client, group, key, lab
     assert r.status_code == 422, r.text
     body = r.json()
     assert body["field"] == f"{group}.{key}"
-    assert body["detail"] == f"「{label}」指定的模型接入「{OFF}」已停用。请在「设置 → 模型接入」中启用它，或换一个接入"
+    assert body["detail"] == refused(group, label, f"模型接入「{OFF}」已停用", "请在「设置 → 模型接入」中启用它")
     assert await stored(group) is None
 
 

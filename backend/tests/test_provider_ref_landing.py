@@ -107,7 +107,7 @@ def test_the_problem_is_recorded_once_where_the_model_is_written():
     提示指到那里。节点点名了启用的接入时，跟随它的成员、取全图默认模型的节点以点名的为准，不提。
 
     「协作二」的成员自己写着丙家的模型，换哪个接入、去掉这个模型（又跟随全图默认的丙家模型）都落不稳，没有修复：
-    提示只说去设置里启用，不指到发布前检查。"""
+    提示说去设置里启用，不指到发布前检查，再说卡在哪里（去掉以后落到全图默认那个同样停用接入的模型）。"""
     graph = flow(node("a", "llm", "提问", prompt="总结"), node("b", "agent", "查数", prompt="查数"),
                  node("team", "supervisor", "协作", provider="甲接入", goal="分析",
                       agents=[{"name": "分析师", "model": "丙一号", "system": "分析"}]),
@@ -117,7 +117,8 @@ def test_the_problem_is_recorded_once_where_the_model_is_written():
     got = [(i["node_id"], i["field"], i["message"]) for i in gate(graph)]
     enable = "请在「设置 → 模型接入」中启用它"
     assert got == [
-        ("team2", "agents[0].model", f"「协作二」（多 Agent 协作）的成员「研究员」指定的模型「丙一号」{STOPPED}。{enable}"),
+        ("team2", "agents[0].model", f"「协作二」（多 Agent 协作）的成员「研究员」指定的模型「丙一号」{STOPPED}。{enable}。"
+                                     f"无法改用其他接入：工作流默认设置指定的模型「丙一号」{STOPPED}"),
         (None, "defaults.model", f"工作流默认设置指定的模型「丙一号」{STOPPED}。{enable}，或在「发布前检查」中改用其他接入"),
     ]
 

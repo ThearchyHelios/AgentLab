@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import copy
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from pydantic import BaseModel
 
@@ -94,6 +94,16 @@ class _Ctx:
         self.level = level
         #: 模型接入表（provider_refs.load_providers）：点名的接入出了问题时，候选从里面启用的那些里挑
         self.providers = providers or []
+        self._provider_refs: dict[tuple[str | None, str], Any] | None = None
+
+    def provider_ref(self, node_id: str | None, field: str) -> Any:
+        """图里写着接入或模型的那一处（provider_refs.ProviderRef）。整张图只算一遍：每条接入问题都去扫一遍全图，
+        几十处同时坏掉时就是几十遍。"""
+        if self._provider_refs is None:
+            from app.engine.provider_refs import provider_refs
+
+            self._provider_refs = {(r.node_id, r.field): r for r in provider_refs(self.spec)}
+        return self._provider_refs.get((node_id, field))
 
     def upstream(self, node_id: str, *types: NodeType) -> list[GraphNode]:
         """这个节点上游的某几类节点，按画布上的节点顺序。"""
@@ -518,125 +528,169 @@ def _landing_text(landed: list[tuple[Any, Any]]) -> str:
 
 def _plan_provider(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
     """执行时取不到模型的那一处（engine/provider_refs.py）：改用一个启用的接入，或者不再指定（provider_choice）。"""
-    from app.engine.provider_refs import provider_refs
-
-    field = str(issue.get("field") or "")
-    ref = next((r for r in provider_refs(ctx.spec) if r.node_id == issue.get("node_id") and r.field == field), None)
+    ref = ctx.provider_ref(issue.get("node_id"), str(issue.get("field") or ""))
     return provider_choice(ctx.spec, ref, ctx.providers) if ref is not None else None
 
 
-def provider_choice(spec: GraphSpec, ref: Any, providers: list[Any]) -> dict[str, Any] | None:
-    """图里一处点名的接入（provider_refs.ProviderRef）的修复：要人选的 choice（_edits 记每个候选怎么改），一个候选都
-    落不稳时为 None。provider_refs 拿它判断问题的提示指不指到发布前检查——给不出修复就别让人去那里找。
+class _ProviderPlan:
+    """图里一处点名的接入（provider_refs.ProviderRef）的修复候选，一个一个算：provider_choice 要全部，provider_fixable
+    （问题提示指不指到发布前检查）找到第一个落得稳的就停。
 
     点名的接入不存在、已停用的，候选是「不指定接入」和各个启用的接入；只写了模型、提供它的接入已停用的，是「不指定
     模型」和各个启用的接入（写在模型旁边的接入上）。
 
-    要人选、不给默认：换成哪个接入只有人知道（同一个模型可能有两家提供，价格、配额都不同）。多数节点的检查器里没有
-    接入下拉框（只能选模型），全图默认、协作成员也没有，这里是界面上唯一能改它的地方。一处一条（plan_fixes 的 id
-    带字段）：协作节点自己的接入和成员的接入各修各的。
-
     每个候选先在副本上改，按执行时的取法（provider_refs.land）算出改动波及的每一处落到哪里：去掉以后成员跟随节点、
     节点跟随全图默认，都没写按模型名找；协作节点、全图默认换了接入，没写自己接入的成员、节点跟着换。落到的接入不提供
     那一处的模型、按模型名落到停用的接入或认不出的模型时，同一级写着的模型一并去掉再算——拿 A 家的模型名去调 B 家
-    必然失败（设置页换接入时同一个做法）；还落不稳的候选不给，修完了运行照样失败的修复不能交给人。候选的说明写清执行
-    时改用哪里、模型去没去掉，落到演示类接入的照实说。复核（judge）另把一道关：门禁同样查只写了模型、提供它的接入
-    已停用的那一处。
+    必然失败（设置页换接入时同一个做法）；还落不稳的候选不给，修完了运行照样失败的修复不能交给人。
 
     只否决这次改动造成的失败：改动波及的一处要是点名的接入没变、而那个接入本来就不存在或已停用（比如节点点名的接入
     写错了，这次改的是它跟随的全图默认模型），它落不稳不是这次改动的事，它自己那条问题照样在、照样拦着发布。拿它否决
     的话，两处互相牵连时谁都给不出修复，规划器自己卡住。
-    """
-    from app.engine.provider_refs import land, uses
-    from app.providers.factory import ProviderNotConfigured, named_provider, serves
 
-    field = ref.field
-    node = spec.node_map().get(ref.node_id) if ref.node_id is not None else None
-    path = field.removeprefix("defaults.") if ref.node_id is None else field
-    if ref.kind == "model":
-        model_path, provider_path = path, path[: -len("model")] + "provider"
-    else:
-        provider_path, model_path = path, _model_path(path)
-    prefix = "defaults." if ref.node_id is None else ""
-    root = spec.defaults if ref.node_id is None else (node.config if node is not None else {})
-    model = _read_path(root, model_path)
-    model = model.strip() if isinstance(model, str) and model.strip() else None
-    before = {use.key: use for use in uses(spec)}
+    改的是节点上的一处时只重算这个节点（provider_refs.node_uses：节点只读自己的配置和全图默认），不复制、不重算整张图；
+    改的是全图默认时各节点都可能跟着变，整张图重算（这样的引用最多几处）。"""
 
-    def broken_before(use: Any) -> bool:
+    def __init__(self, spec: GraphSpec, ref: Any, providers: list[Any]) -> None:
+        from app.engine.provider_refs import node_uses, uses
+
+        self.spec, self.ref, self.providers = spec, ref, providers
+        path = ref.field.removeprefix("defaults.") if ref.node_id is None else ref.field
+        if ref.kind == "model":
+            self.model_path, self.provider_path = path, path[: -len("model")] + "provider"
+        else:
+            self.provider_path, self.model_path = path, _model_path(path)
+        self.prefix = "defaults." if ref.node_id is None else ""
+        self.node = spec.node_map()[ref.node_id] if ref.node_id is not None else None
+        model = _read_path(spec.defaults if self.node is None else self.node.config, self.model_path)
+        self.model = model.strip() if isinstance(model, str) and model.strip() else None
+        self.before = {use.key: use for use in (uses(spec) if self.node is None else node_uses(spec, self.node))}
+        #: 一个候选都落不稳时说给人听的：第一个候选最后一次试算里第一处落不稳的地方（provider_refs.Landing.why）
+        self.stuck = ""
+
+    def _broken_before(self, use: Any) -> bool:
         """这一处点名的接入改动前后没变，而它本来就不存在或已停用：落不稳不是这次改动造成的。"""
-        was = before.get(use.key)
+        from app.providers.factory import ProviderNotConfigured, named_provider
+
+        was = self.before.get(use.key)
         if was is None or use.provider is None or use.provider != was.provider:
             return False
         try:
-            named_provider(providers, use.provider.name)
+            named_provider(self.providers, use.provider.name)
         except ProviderNotConfigured:
             return True
         return False
 
-    def trial(edits: list[tuple[str, Any]]) -> list[tuple[Any, Any]] | None:
-        """在副本上改，改动波及的每一处（取法变了的）执行时落到哪里；有一处因这次改动落不稳返回 None。"""
-        copied = spec.model_copy(deep=True)
-        target = copied.defaults if ref.node_id is None else copied.node_map()[ref.node_id].config
-        for at, value in edits:
-            _put_path(target, at, value)
-        landed = []
-        for use in uses(copied):
-            if before.get(use.key) == use:
-                continue
-            if not (landing := land(use, providers)).ok:
-                if broken_before(use):
-                    continue
-                return None
-            landed.append((use, landing))
-        # 改完没有一处落到新地方：这一处没修好（比如它跟随的那一级也坏着、原因还一样）
-        return landed or None
+    def _trial(self, edits: list[tuple[str, Any]]) -> tuple[list[tuple[Any, Any]] | None, Any]:
+        """在副本上改，改动波及的每一处（取法变了的）执行时落到哪里：（各处落到哪里，None）；有一处因这次改动落不稳
+        时是（None，那一处的 Landing）。改完没有一处落到新地方也算没修好（比如它跟随的那一级也坏着、原因还一样）。"""
+        from app.engine.provider_refs import land, node_uses, uses
 
-    def settle(edits: list[tuple[str, Any]]) -> tuple[list[tuple[str, Any]], list[tuple[Any, Any]]] | None:
+        if self.node is None:
+            defaults = copy.deepcopy(self.spec.defaults)
+            for at, value in edits:
+                _put_path(defaults, at, value)
+            # 浅拷贝：节点原样共用，只换全图默认（uses 只读不写）
+            after = uses(self.spec.model_copy(update={"defaults": defaults}))
+        else:
+            twin = self.node.model_copy(deep=True)
+            for at, value in edits:
+                _put_path(twin.config, at, value)
+            after = node_uses(self.spec, twin)
+        landed = []
+        for use in after:
+            if self.before.get(use.key) == use:
+                continue
+            if not (landing := land(use, self.providers)).ok:
+                if self._broken_before(use):
+                    continue
+                return None, landing
+            landed.append((use, landing))
+        return landed or None, None
+
+    def _settle(self, edits: list[tuple[str, Any]]) -> tuple[list[tuple[str, Any]], list[tuple[Any, Any]]] | None:
         """先只改这一处；落不稳而同一级写着模型时，连模型一并去掉再试。返回（改法，波及的各处落到哪里），还落不稳为 None。"""
-        if (landed := trial(edits)) is not None:
+        landed, failed = self._trial(edits)
+        if landed is None and self.model and all(at != self.model_path for at, _ in edits):
+            edits = [*edits, (self.model_path, None)]
+            landed, failed = self._trial(edits)
+        if landed is not None:
             return edits, landed
-        if model and all(at != model_path for at, _ in edits):
-            edits = [*edits, (model_path, None)]
-            if (landed := trial(edits)) is not None:
-                return edits, landed
+        if not self.stuck and failed is not None:
+            self.stuck = failed.why
         return None
 
+    def options(self) -> Iterator[tuple[dict[str, Any], list[tuple[str, Any]]]]:
+        """落得稳的候选（选项，改法），先「不指定」，再按接入表的顺序各个启用的接入。"""
+        from app.providers.factory import serves
+
+        ref, model = self.ref, self.model
+        if (got := self._settle([(self.model_path if ref.kind == "model" else self.provider_path, None)])) is not None:
+            edits, landed = got
+            what = "模型" if ref.kind == "model" else "接入" + (f"和模型「{model}」" if len(edits) > 1 else "")
+            option = {"value": PROVIDER_CLEAR, "label": f"不指定{'模型' if ref.kind == 'model' else '接入'}",
+                      "hint": f"去掉这一处指定的{what}，执行时{_landing_text(landed)}"}
+            yield _demo_mark(option, landed), edits
+        seen = {PROVIDER_CLEAR}
+        for p in self.providers:
+            if not getattr(p, "enabled", False) or not getattr(p, "name", None) or p.name in seen:
+                continue
+            seen.add(p.name)
+            if (got := self._settle([(self.provider_path, p.name)])) is None:
+                continue
+            edits, landed = got
+            notes = []
+            if len(edits) > 1:
+                # 这一处原来用的就是去掉的那个模型：换上的接入实际用哪个模型（多半是它的默认模型，上一级写了模型就是那个）
+                mine = {landing.model for use, landing in landed
+                        if (was := self.before.get(use.key)) is not None and was.model is not None
+                        and (was.model.node_id, was.model.field) == (ref.node_id, self.prefix + self.model_path)}
+                used = next(iter(mine)) if len(mine) == 1 else None
+                said = [f"不提供模型「{model}」" if not serves(p, model) else f"模型「{model}」一并去掉"]
+                if used:
+                    said.append(f"将改用{'它的默认模型' if used == p.default_model else '模型'}「{used}」")
+                elif not serves(p, model):
+                    said.append("这一处的模型一并去掉")
+                notes.append("，".join(said))
+            if getattr(p, "kind", None) == "mock":
+                notes.append(DEMO_PROVIDER)
+            yield _demo_mark({"value": p.name, "label": p.name, "hint": "；".join(notes) or None}, landed), edits
+
+
+def _demo_mark(option: dict[str, Any], landed: list[tuple[Any, Any]]) -> dict[str, Any]:
+    """修完以后有一处落到演示类接入（provider_refs.Landing.demo）：候选带上 demo 标记，发布弹窗在选项名旁加一个
+    醒目的「演示模型」标签。说明里那半句演示说明照旧写，只是淡色小字、排在长句末尾，不够醒目——K1 要防的就是
+    悄悄换成演示模型。"""
+    return {**option, "demo": True} if any(landing.demo for _, landing in landed) else option
+
+
+def provider_choice(spec: GraphSpec, ref: Any, providers: list[Any]) -> dict[str, Any] | None:
+    """图里一处点名的接入（provider_refs.ProviderRef）的修复：要人选的 choice（_edits 记每个候选怎么改），一个候选都
+    落不稳时为 None。候选怎么算见 _ProviderPlan。
+
+    要人选、不给默认：换成哪个接入只有人知道（同一个模型可能有两家提供，价格、配额都不同）。多数节点的检查器里没有
+    接入下拉框（只能选模型），全图默认、协作成员也没有，这里是界面上唯一能改它的地方。一处一条（plan_fixes 的 id
+    带字段）：协作节点自己的接入和成员的接入各修各的。候选的说明写清执行时改用哪里、模型去没去掉，落到演示类接入的
+    照实说并带 demo 标记。复核（judge）另把一道关：门禁同样查只写了模型、提供它的接入已停用的那一处。"""
     options: list[dict[str, Any]] = []
     plans: dict[str, list[tuple[str, Any]]] = {}
-    if (got := settle([(model_path if ref.kind == "model" else provider_path, None)])) is not None:
-        edits, landed = got
-        what = "模型" if ref.kind == "model" else "接入" + (f"和模型「{model}」" if len(edits) > 1 else "")
-        options.append({"value": PROVIDER_CLEAR, "label": f"不指定{'模型' if ref.kind == 'model' else '接入'}",
-                        "hint": f"去掉这一处指定的{what}，执行时{_landing_text(landed)}"})
-        plans[PROVIDER_CLEAR] = edits
-    for p in providers:
-        if not getattr(p, "enabled", False) or not getattr(p, "name", None) or p.name in plans:
-            continue
-        if (got := settle([(provider_path, p.name)])) is None:
-            continue
-        edits, landed = got
-        notes = []
-        if len(edits) > 1:
-            # 这一处原来用的就是去掉的那个模型：换上的接入实际用哪个模型（多半是它的默认模型，上一级写了模型就是那个）
-            mine = {landing.model for use, landing in landed
-                    if (was := before.get(use.key)) is not None and was.model is not None
-                    and (was.model.node_id, was.model.field) == (ref.node_id, prefix + model_path)}
-            used = next(iter(mine)) if len(mine) == 1 else None
-            said = [f"不提供模型「{model}」" if not serves(p, model) else f"模型「{model}」一并去掉"]
-            if used:
-                said.append(f"将改用{'它的默认模型' if used == p.default_model else '模型'}「{used}」")
-            elif not serves(p, model):
-                said.append("这一处的模型一并去掉")
-            notes.append("，".join(said))
-        if getattr(p, "kind", None) == "mock":
-            notes.append(DEMO_PROVIDER)
-        options.append({"value": p.name, "label": p.name, "hint": "；".join(notes) or None})
-        plans[p.name] = edits
+    for option, edits in _ProviderPlan(spec, ref, providers).options():
+        options.append(option)
+        plans[option["value"]] = edits
     if not options:
-        # 一个都落不稳（比如一个启用的接入都没有）：不给修复，问题照样拦着发布，提示里只说去设置里核对、启用
+        # 一个都落不稳（比如一个启用的接入都没有）：不给修复，问题照样拦着发布，提示里说去设置里核对、启用、卡在哪里
         return None
-    return _choice(f"选择{ref.who}改用的模型接入", field, options, _edits=plans)
+    return _choice(f"选择{ref.who}改用的模型接入", ref.field, options, _edits=plans)
+
+
+def provider_fixable(spec: GraphSpec, ref: Any, providers: list[Any]) -> tuple[bool, str]:
+    """这一处给不给得出修复：（给得出，卡在哪里）。provider_refs 拿它决定问题提示指不指到发布前检查——给不出修复就别让
+    人去那里找，改说第一处落不稳的地方（Landing.why）。找到第一个落得稳的候选就停：画布每改一下都要校验，不必为了
+    一句提示把每个候选都算一遍。"""
+    plan = _ProviderPlan(spec, ref, providers)
+    for _ in plan.options():
+        return True, ""
+    return False, plan.stuck
 
 
 #: 候选本身是演示类接入（kind 为 mock）时的说明。「不指定」落到演示类接入时说明里另带 provider_refs.DEMO_LANDING
