@@ -26,7 +26,7 @@
    append_events 不写，回答照样交回给提问的人，说明没有写进运行记录（这样的回答在进程里留一阵，_HELD）。触顶、失败
    照样记一条
 5. 读取：列表读 approval.inquiry 事件（封存前后的都算，按先后）；质询工件只认质询引用过的（查询快照、回答文档、回答里
-   引用的报告口径卡），遮罩照回答时的办法
+   引用的报告口径卡），遮罩照回答时的办法，快照里 SQL 检查结果的片段照 SQL 换（_masked_checks）
 
 不发 tool.start、llm.start 这类事件（run_verify_agent 不传 emit）：界面从接口的返回取回答；runner 的 _stale_replay
 只看 tool.start，质询不影响恢复后的重放。
@@ -2154,7 +2154,8 @@ async def _report_material(run_id: str, reports: Iterable[Any]) -> tuple[list[di
 
 async def inquiry_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
     """质询引用过的工件：查询快照（遮罩照回答时的办法，另把文字格里夹着的遮罩值按子串换掉；SQL 用事件里记下的那条，
-    两处一字不差）、回答文档（组装时就遮好了）、回答里引用的报告口径卡。{id, content, masked[, mask_note]}。
+    两处一字不差；SQL 检查结果见 _masked_checks）、回答文档（组装时就遮好了）、回答里引用的报告口径卡。
+    {id, content, masked[, mask_note]}。
 
     认的是这次运行的质询事件引用过的，加上没写进运行记录、还留在进程里的回答（_HELD）引用过的；别的一律 404。"""
     from app.api.evidence import SOURCE_GONE
