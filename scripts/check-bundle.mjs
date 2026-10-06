@@ -162,7 +162,7 @@ const hasItem = (s, check, result, text) => s.items.some((i) => i.check === chec
 /**
  * 「哈希全部重算」的伪造：报告里挑一个能核对的数字或取值（引用口径卡或随文件附带的快照，pick(片段) 为真的第一个），
  * edit(片段) 改它，再把文档、引用它的事件、清单哈希、页面顶部的封存哈希全部重算。返回改了哪一处的说明（what、所在报告
- * node、片段 seg、改之前的显示文字 before），找不到可改的返回 null
+ * node、改过的片段 seg），找不到可改的返回 null
  */
 function rewrite(data, pick, edit) {
   const docArt = data.artifacts.find((a) => a.kind === 'report_doc' && typeof a.b64 === 'string')
@@ -176,7 +176,6 @@ function rewrite(data, pick, edit) {
         && embedded.has(doc.catalog?.[c.alias]?.artifact) && pick(seg)) hit = seg
   }
   if (!hit) return null
-  const before = hit.text
   edit(hit)
   const bytes = Buffer.from(JSON.stringify(doc), 'utf8')
   const oldId = docArt.id
@@ -194,7 +193,7 @@ function rewrite(data, pick, edit) {
     .map(([e]) => `${e.seq}|${e.type}|${e.node_id ?? ''}|${e.data_sha256}`)
   data.meta.manifest_hash = sha(lines.join('\n'))
   return { what: `片段 ${hit.id}（${hit.cite.kind}）`, node: data.reports.find((r) => r.doc_artifact === newId)?.node_id,
-    seg: hit, before }
+    seg: hit }
 }
 
 /** 改一个数字的引用值（显示文字不动），重算全部哈希：⑤ 拿口径卡、快照对出来 */
