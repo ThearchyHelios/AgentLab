@@ -6,7 +6,8 @@
 
 1. 建目录：收齐上游口径卡的指标和运行输入，编成 [[m:gmv]]、[[i:week]] 这样的引用
 2. 流式写作：模型写标记，StreamRenderer 边收边换成真值，流里看到的就是最终的数字
-3. 核对：compose_doc 切块、分句、切片段，找出裸数字和解析不了的引用
+3. 核对：compose_doc 切块、分句、切片段，找出裸数字和解析不了的引用。模型把整篇包在一个 ```markdown 代码块
+   里的，先去掉外层围栏（_unfenced）：不然整篇是一个代码块，一句结论都切不出来
 4. 修复：有违规就把清单交回去重写，最多 max_repairs 次
 5. 收尾：文档落成 report_doc 工件，report.checked 事件进封存；仍然违规时按
    on_violation 失败（fail）或者照常产出、把违规片段标出来（flag）
@@ -30,6 +31,7 @@
 """
 from __future__ import annotations
 
+import re
 import time
 from collections import Counter
 from typing import Any
@@ -437,6 +439,62 @@ def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims
     ]
 
 
+#: 整篇报告外面包的那层代码块（_unfenced）。第一行：围栏（三个以上反引号或波浪号）加信息串
+_OPEN_FENCE = re.compile(r"(`{3,}|~{3,})[ \t]*([^\s`]*)[ \t]*")
+#: 最后一行：行首最多缩进三格（同 CommonMark），缩进四格的是一行缩进代码，不算收尾
+_CLOSE_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+#: 正文里以围栏开头的行（行首空白不讲究）：和外层同种符号、比外层长的，分不清哪一行收尾
+_FENCE_RUN = re.compile(r"\s*(`{3,}|~{3,})")
+#: 其中 compose_doc 的切块（evidence._FENCE）和前端 Markdown.tsx 认作围栏的：信息串只能是紧跟着的一个词（字母、数字、
+#: 下划线）。去掉外层之后正文按它们切，``` sql、```sql title 这样的行它们不认，是一行正文
+_INNER_FENCE = re.compile(r"\s*(`{3,}|~{3,})([A-Za-z0-9_]*)\s*")
+#: 信息串只认这几个（大小写不敏感）：写成 sql、json 的是模型真要贴一段代码
+_PROSE_INFO = frozenset({"", "markdown", "md"})
+
+
+def _unfenced(raw: str) -> str:
+    """模型把整篇报告包成一个代码块（```markdown … ```）时去掉外层围栏，返回里面的正文；别的一律原样返回。
+
+    不去的话整篇在 compose_doc 里是一个代码块：裸数字照样标出，可一句结论都切不出来，裁判、反方审稿没有句子可审，
+    界面上整篇显示成代码。只在拿得准的时候去：去掉首尾空白后，第一行是围栏、信息串为空或 markdown / md，最后一行
+    是同一道围栏（同种符号、同样长、不带信息串）。sql、json 这类信息串、围栏外还有前言结语的，都不是整篇报告被包了
+    起来，原样交给 compose_doc。
+
+    正文自己的代码块可以套在里面，中间的围栏行这样看（只看和外层同种符号的）：
+    - 比外层短：收不掉外层，外层收在哪一行没有疑问，跳过
+    - 比外层长：分不清哪一行收尾，不去
+    - 和外层一样长：模型最常见的写法是 ```markdown 里再套 ```sql … ```。带信息串的一行开一个代码块，不带的一行收掉它，
+      两两配对；去掉外层后，compose_doc 和前端每见到一行 ``` 开合一次，配好的这一对正好切成一个代码块。配不成对的
+      不去：没有代码块可收的 ``` 说明外层在这里就收了，后面是围栏外的字（好几个代码块）；开着的代码块里又来一个
+      ```sql，compose_doc 和前端会拿它当收尾；扫到最后还开着的，后半篇会被吞进代码块
+
+    换一种符号的（外层反引号、里面 ~~~）也跳过，照常去掉外层。跳过的这些行去掉外层后怎么切，和模型不包外层、直接
+    这么写时一样：compose_doc 和前端只认 ``` 围栏，里面 ~~~、四个以上反引号的代码块按正文切，当一段话核对——比整篇
+    一个代码块强，真正的结论句至少有得审。
+    """
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = text.split("\n")
+    head = _OPEN_FENCE.fullmatch(lines[0])
+    tail = _CLOSE_FENCE.fullmatch(lines[-1]) if len(lines) > 1 else None
+    if head is None or tail is None or head.group(2).lower() not in _PROSE_INFO or tail.group(1) != head.group(1):
+        return raw
+    fence = head.group(1)
+    nested = False      # 正文自己的、和外层一样长的代码块开着
+    for line in lines[1:-1]:
+        run = _FENCE_RUN.match(line)
+        if run is None or run.group(1)[0] != fence[0] or len(run.group(1)) < len(fence):
+            continue
+        if len(run.group(1)) > len(fence):
+            return raw
+        if (inner := _INNER_FENCE.fullmatch(line)) is None:
+            continue    # ``` sql 这样的行 compose_doc 和前端不认，去掉外层后是一行正文
+        # 一样长的：带信息串的只能开（已经开着就配不成对），不带的只能收（没有开着的就是外层在这里收了）
+        if bool(inner.group(2)) == nested:
+            return raw
+        nested = not nested
+    return raw if nested else "\n".join(lines[1:-1])
+
+
 async def _store(doc: dict[str, Any], ctx: NodeContext) -> str | None:
     from app.core.artifact_store import put_json
 
@@ -515,7 +573,9 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     entities = report_entities(spec, ctx.node) == "link"
 
     def compose(raw: str) -> dict[str, Any]:
-        return compose_doc(raw, catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
+        # 第一稿、重写稿、裁判退回的改写稿都从这里过：整篇包在代码块里的先去掉外层围栏。文档的 source 记的是去掉
+        # 围栏之后的正文——markdown 由它渲染，出口契约复核取回的也是这份文档
+        return compose_doc(_unfenced(raw), catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
                            cells_allowed=cells, entities=entities, absence=writer.trimmed)
 
     response, raw = await draft(messages)
