@@ -12,7 +12,8 @@
    （按需裁判传只认封存工件的那个）。规则里写明数字已经由系统核对过。带期 4 文档标记的报告，上传表格的
    查询在 SQL 之后另有来历行（来源、口径、已接受、区域外文字，_provenance_lines）
 3. 调用（judge_doc）：一份报告合并成一次调用，超过每批的句数就分批；结构化输出失败退回 JSON 解析，
-   再失败就记未裁判。thinking 关掉，max_tokens 4096
+   再失败就记未裁判。thinking 关掉，输出额度 MAX_TOKENS（推理模型的思考也算在里面），服务方嫌大时退回
+   FALLBACK_MAX_TOKENS；输出到了上限被截断的记未裁判（truncated），照实说是额度不够、不再退回纯文本多花一次
 4. 预算：每份报告的句数、金额、时长和全局每日金额，每一项都能是 None（不限）。调用前按目录价估算，
    超了按优先级截断；触顶就停，已判的保留，没判的记未裁判并说明是哪个上限——不报错
 5. 每日计数落在设置表（SPEND_KEY），按本地日期滚动。目录里没有价格的模型估不出金额，金额上限对它
@@ -104,7 +105,13 @@ BATCH_SIZE = 8
 #: 一波最多几批同时问：几批共用剩下的时长，句数上限内的句子一两波就判完。第一批单独问：接入调不通（鉴权、
 #: 网关挂了）时只撞这一次，不让一整波一起失败
 PARALLEL_BATCHES = 4
-MAX_TOKENS = 4096
+#: 裁判（和核查：api/settings.py 的 verify_model_spec、engine/verify_agent.py 沿用这一档）的输出额度。thinking 关掉只对
+#: Anthropic 有用：经 OpenAI 兼容接入的推理模型（DeepSeek、GLM、Kimi 这一类）收不到 thinking=off，思考算在额度里，原来的
+#: 4096 常常想完就没额度写判定了（cite_fields 的抽取在 2026-10 撞过同一堵墙，那边也改成了 16384）。16384 是常见网关、
+#: 模型接受的输出上限里偏大的一档（GPT-4o 的上限就是它）；更小的服务方会拒收，那时退回 FALLBACK_MAX_TOKENS
+MAX_TOKENS = 16384
+#: 服务方嫌 MAX_TOKENS 太大（400 / 422，报错里有 max_tokens 一类字样）时退回这个：原来的额度，各家都收。之后的调用都用它
+FALLBACK_MAX_TOKENS = 4096
 #: 证据摘录：SQL 前几个字、每次查询最多几行几列、每段知识库片段最多几个字、整份引用的检索给几段。
 #: 列数上限只管没被引用的列：句子引用的格子所在的列一律给（遮罩的除外），再用别的列补满到这么多列
 SQL_CHARS = 300
@@ -897,7 +904,8 @@ def _text(value: Any) -> str | None:
 async def judge_model_spec(session: Any, node_judge: dict[str, Any] | None = None, *,
                            settings: dict[str, Any] | None = None) -> ModelSpec:
     """裁判用哪个模型：节点上的 judge.model（连同 provider）> 设置里的证据裁判模型 > Copilot 模型 >
-    默认 provider。哪一级写了就整组用哪一级，不跨级拼 provider 和模型。thinking 关、max_tokens 4096。
+    默认 provider。哪一级写了就整组用哪一级，不跨级拼 provider 和模型。thinking 关、额度 MAX_TOKENS（推理模型关不掉
+    思考，见 MAX_TOKENS 的说明；服务方嫌大时 run_request 退回 FALLBACK_MAX_TOKENS）。
 
     建议和写作模型不同，否则等于自己审自己（报告节点发现相同会发 judge_same_model 警告）。
     """
