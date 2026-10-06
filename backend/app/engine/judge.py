@@ -843,7 +843,8 @@ def settings_problem(value: Any) -> str | None:
         label = SETTING_LABEL.get(key, key)
         if key in ("provider", "model"):
             if item is not None and not isinstance(item, str):
-                return f"「{label}」需要填写模型接入的名称或模型 ID，留空表示不指定，当前为「{item}」"
+                # 「跟随助手的模型」是设置页接入下拉框空选项的原话（核查一组同样照设置页写，api/settings.verify_problem）
+                return f"「{label}」需要填写模型接入的名称或模型 ID，留空表示跟随助手的模型，当前为「{item}」"
         elif not _limit_ok(key, item):
             return f"「{label}」需要填写{_limit_words(key)}，留空表示不限，当前为「{item}」"
     return None

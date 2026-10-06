@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react'
 import { AlertCircle, ArrowUp, CornerDownRight, Database, Settings2, Sparkles, Square, Wrench } from 'lucide-react'
 import clsx from 'clsx'
-import { api } from '../api/client'
+import { api, type CopilotModel } from '../api/client'
 import { useCatalog, useDatasources, modelOptions } from '../store/catalog'
 import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
 import { isComposing, Spinner, TechDetails, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
+import { ASSISTANT_MODEL_TEXT as MT } from '../lib/terms'
 import type { DataSource } from '../types'
 import { COPILOT_PHASE_TEXT } from './decode'
+
+/** 「助手使用的模型」下拉里代表「存着的设定」的那一项的值（模型 id 不会是它） */
+const SAVED = '\u0000saved'
 
 /**
  * Copilot 的输入。
@@ -39,17 +43,26 @@ export function Composer({ hero, onFocusChange }: {
   const lock = useEditLock()
   const [text, setText] = useState('')
   const [opts, setOpts] = useState(false)
-  const [model, setModel] = useState('')
-  const [effective, setEffective] = useState('')
+  // 存着的助手模型设定（GET /api/copilot/model）：接入、模型、实际会用的模型、用不了时的原因
+  const [saved, setSaved] = useState<CopilotModel | null>(null)
+  // 重新选择时保存失败：下拉已退回选之前的样子，下面说明没改成
+  const [saveFailed, setSaveFailed] = useState(false)
+  // 只认最后一次选择的回包：连着选两次时，先发的那次晚回来也不能盖掉后一次
+  const picks = useRef(0)
   const [useBase, setUseBase] = useState(true)
   const ref = useRef<HTMLTextAreaElement>(null)
 
+  // 挂上时取一次；每次展开「助手使用的模型」再取一次：接入可能刚在设置里启用、停用或改了名。取的途中人已经重新选过
+  // 的话不用这一份（它是选之前的样子）。重新取回来的就是服务端现在存着的，上一次「保存失败」的说明不再留着
   useEffect(() => {
-    void api.copilot.getModel().then((m) => {
-      setModel(m.model ?? '')
-      setEffective(m.effective_model ?? '')
-    }).catch(() => undefined)
-  }, [])
+    if (!opts && saved) return
+    let alive = true
+    setSaveFailed(false)
+    const seq = picks.current
+    void api.copilot.getModel().then((m) => { if (alive && seq === picks.current) setSaved(m) }).catch(() => undefined)
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [opts])
 
   // 工具栏的 Copilot 按钮把焦点甩过来
   useEffect(() => {
@@ -63,18 +76,38 @@ export function Composer({ hero, onFocusChange }: {
     if (hero) ref.current?.focus()
   }, [hero])
 
+  const options = modelOptions(providers)
+  const groups = [...new Set(options.map((o) => o.group))]
+  // 存着的设定下拉里列不出来：点名了接入（下拉只选模型，选了会清掉接入），或者模型不在可选列表中。照实列成一项并选中
+  // 它——否则下拉停在「跟随默认」，看着一切正常，接入失效了也看不出来，再选「跟随默认」不算改动、清不掉存着的接入
+  const custom = !!saved && (!!saved.provider || (!!saved.model && !options.some((o) => o.value === saved.model)))
+  const model = custom ? SAVED : saved?.model ?? ''
+  // 下拉下面写的原因：服务端给的这一格专用的说法（去向写「上方」），老服务端只给整句
+  const broken = saved?.panel_error || saved?.error || null
+
   const pickModel = (value: string) => {
-    setModel(value)
-    void api.copilot.setModel({ model: value || null })
-      .then((m) => setEffective(m.effective_model ?? ''))
-      .catch(() => undefined)
+    if (value === SAVED) return
+    const before = saved
+    const seq = ++picks.current
+    setSaveFailed(false)
+    // 先按选的显示；存的是 provider 置空、只写模型（跟随默认时两项都空），回来的是服务端认下的样子。跟随默认时实际用
+    // 哪个模型由服务端说了算，回来之前不写「当前」
+    setSaved({ configured: !!value, provider: null, model: value || null, effective_provider: null,
+      effective_model: value || null, error: null, panel_error: null })
+    void api.copilot.setModel({ model: value || null }).then((m) => { if (seq === picks.current) setSaved(m) }).catch(() => {
+      if (seq !== picks.current) return
+      // 没存上：服务端存着的还是原来那一组，退回选之前的样子（原因、齿轮上的红点照旧），并说明保存失败
+      setSaved(before)
+      setSaveFailed(true)
+    })
   }
 
   const send = (override?: string) => {
     const q = (override ?? text).trim()
     if (!q || copilot.active) return
-    // 被正式运行拦下时（store 已经弹过提示）什么都没开始：这句话留在框里，结束后直接再发
-    if (!runCopilot(q, useBase && nodes.length > 0, model || undefined)) return
+    // 被正式运行拦下时（store 已经弹过提示）什么都没开始：这句话留在框里，结束后直接再发。
+    // 存着的设定列不出来时不带模型：服务端按存着的整组取（带了模型就会绕过存着的接入，和这里说的对不上）
+    if (!runCopilot(q, useBase && nodes.length > 0, model && model !== SAVED ? model : undefined)) return
     setText('')
     // 从头生成是一次性的：新图一落到画布上，下一句多半是在它上面改。停在「从头生成」
     // 的话，下一句又把刚生成的图整张换掉（撤销找得回，但人得先发现）
@@ -82,8 +115,6 @@ export function Composer({ hero, onFocusChange }: {
   }
   const mode = useRadioGroup(MODES, useBase ? 'base' : 'fresh', (m) => setUseBase(m === 'base'))
 
-  const options = modelOptions(providers)
-  const groups = [...new Set(options.map((o) => o.group))]
   const examples = hero ? exampleFor(nodes.length, sources) : []
 
   return (
@@ -136,14 +167,17 @@ export function Composer({ hero, onFocusChange }: {
         leading={
           <>
             <button
-              className={clsx('rounded-md p-1.5 transition-colors hover:bg-hover',
+              className={clsx('relative rounded-md p-1.5 transition-colors hover:bg-hover',
                 opts ? 'text-[var(--accent)]' : 'text-faint')}
-              title="助手使用的模型"
-              aria-label="助手使用的模型"
+              title={broken ? MT.broken : MT.label}
+              aria-label={MT.label}
               aria-expanded={opts}
+              data-copilot-model-broken={broken ? '' : undefined}
               onClick={() => setOpts((v) => !v)}
             >
               <Settings2 size={13} />
+              {/* 存着的设定用不了：收着的时候也要看得出来，不然要等发出一句话才报错 */}
+              {broken && <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-[var(--err)]" aria-hidden />}
             </button>
             {/* 两种方式并排摆出来，选中的那个就是这一句会怎么做。以前是一个 10px 的字，
                 点一下就翻成另一个词，看不出它是开关，更看不出另一头是什么。从头生成
@@ -169,9 +203,13 @@ export function Composer({ hero, onFocusChange }: {
       {opts && (
         <div className="fade-up mt-2 space-y-2 rounded-lg border bg-panel p-2.5">
           <div>
-            <label className="label" htmlFor="copilot-model">助手使用的模型</label>
-            <select id="copilot-model" className="field" value={model} onChange={(e) => pickModel(e.target.value)}>
-              <option value="">跟随默认{effective ? `（当前：${effective}）` : ''}</option>
+            <label className="label" htmlFor="copilot-model">{MT.label}</label>
+            <select id="copilot-model" className="field" value={model} onChange={(e) => pickModel(e.target.value)}
+                    aria-invalid={broken ? true : undefined} aria-describedby={broken ? 'copilot-model-error' : undefined}>
+              {/* 「当前」只在选着跟随默认、用得了的时候写：选了别的模型时 effective_model 是那个模型，不是跟随默认会用的；
+                  存着的设定列成单独一项时，这一项说的是选它以后会用哪个 */}
+              <option value="">{MT.follow}{model === '' && saved?.effective_model ? MT.current(saved.effective_model) : ''}</option>
+              {custom && <option value={SAVED}>{MT.saved(saved!.provider, saved!.model)}</option>}
               {groups.map((g) => (
                 <optgroup key={g} label={g}>
                   {options.filter((o) => o.group === g).map((o) => (
@@ -180,10 +218,15 @@ export function Composer({ hero, onFocusChange }: {
                 </optgroup>
               ))}
             </select>
-            <div className="mt-1 text-2xs leading-snug text-faint">
-              仅影响助手，不改变节点使用的模型。助手需要严格按格式输出，
-              指令遵循能力较弱的模型可能无法生成工作流。
-            </div>
+            {saveFailed && (
+              <div role="alert" data-copilot-model-save-failed=""
+                   className="mt-1 text-2xs leading-relaxed text-[var(--err)]">{MT.saveFailed}</div>
+            )}
+            {broken && (
+              <div id="copilot-model-error" role="alert" data-copilot-model-error=""
+                   className="mt-1 text-2xs leading-relaxed text-[var(--err)] [overflow-wrap:anywhere]">{broken}</div>
+            )}
+            <div className="mt-1 text-2xs leading-snug text-faint">{MT.note}</div>
           </div>
         </div>
       )}

@@ -103,8 +103,11 @@ def test_a_node_naming_only_a_model_of_a_disabled_provider_is_stopped_before_pub
 
 
 def test_the_problem_is_recorded_once_where_the_model_is_written():
-    """全图默认里的模型几个节点共用时只记一条；协作成员、全图默认里的模型在检查器里改不了，提示指到发布前检查。
-    节点点名了启用的接入时，跟随它的成员、取全图默认模型的节点以点名的为准，不提。"""
+    """全图默认里的模型几个节点共用时只记一条；协作成员、全图默认里的模型在检查器里改不了，发布前检查给得出修复时
+    提示指到那里。节点点名了启用的接入时，跟随它的成员、取全图默认模型的节点以点名的为准，不提。
+
+    「协作二」的成员自己写着丙家的模型，换哪个接入、去掉这个模型（又跟随全图默认的丙家模型）都落不稳，没有修复：
+    提示说去设置里启用，不指到发布前检查，再说卡在哪里（去掉以后落到全图默认那个同样停用接入的模型）。"""
     graph = flow(node("a", "llm", "提问", prompt="总结"), node("b", "agent", "查数", prompt="查数"),
                  node("team", "supervisor", "协作", provider="甲接入", goal="分析",
                       agents=[{"name": "分析师", "model": "丙一号", "system": "分析"}]),
@@ -112,10 +115,11 @@ def test_the_problem_is_recorded_once_where_the_model_is_written():
                       agents=[{"name": "研究员", "model": "丙一号", "system": "研究"}]),
                  defaults={"model": "丙一号"})
     got = [(i["node_id"], i["field"], i["message"]) for i in gate(graph)]
-    tail = "请在「设置 → 模型接入」中启用它，或在「发布前检查」中改用其他接入"
+    enable = "请在「设置 → 模型接入」中启用它"
     assert got == [
-        ("team2", "agents[0].model", f"「协作二」（多 Agent 协作）的成员「研究员」指定的模型「丙一号」{STOPPED}。{tail}"),
-        (None, "defaults.model", f"工作流默认设置指定的模型「丙一号」{STOPPED}。{tail}"),
+        ("team2", "agents[0].model", f"「协作二」（多 Agent 协作）的成员「研究员」指定的模型「丙一号」{STOPPED}。{enable}。"
+                                     f"无法改用其他接入：工作流默认设置指定的模型「丙一号」{STOPPED}"),
+        (None, "defaults.model", f"工作流默认设置指定的模型「丙一号」{STOPPED}。{enable}，或在「发布前检查」中改用其他接入"),
     ]
 
 
@@ -127,7 +131,7 @@ def test_verify_nodes_and_the_judge_naming_only_a_model_of_a_disabled_provider_a
                  node("chal", "challenge", "审稿", report="write", model="丙一号"))
     got = {(i["node_id"], i["field"]): i["message"] for i in gate(graph)}
     assert set(got) == {("write", "judge.model"), ("dual", "model"), ("chal", "model")}
-    assert got[("dual", "model")] == (f"「复核销售额」（双盲复算）的盲算模型指定的模型「丙一号」{STOPPED}。"
+    assert got[("dual", "model")] == (f"「复核销售额」（双盲复算）的「盲算模型」指定的模型「丙一号」{STOPPED}。"
                                       "请在「设置 → 模型接入」中启用它，或在节点中换一个模型")
     assert got[("write", "judge.model")].startswith(f"「写周报」（报告撰写）的结论句裁判指定的模型「丙一号」{STOPPED}")
 

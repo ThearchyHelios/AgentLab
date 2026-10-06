@@ -117,6 +117,9 @@ async def test_a_disabled_provider_named_like_a_model_is_not_swapped_for_the_one
     with pytest.raises(ProviderNotConfigured) as e:
         await resolve_provider(session, "fake-v4.1-flash", "fake-v4.1-flash")
     assert e.value.code == "disabled" and "fake-v4.1-flash" in str(e.value)
+    # 照「启用它」去做启用的是那条旧接入：另补一句这个名字是哪个接入的模型、怎么用它
+    assert e.value.model_owner == "云端接入" and str(e.value).endswith(
+        "「fake-v4.1-flash」是接入「云端接入」的模型：如需使用该模型，请在模型一栏中选择它，接入留空或选择「云端接入」")
     assert (await resolve_provider(session, None, "fake-v4.1-flash")).id == serving.id
 
 
@@ -201,10 +204,11 @@ async def test_the_assistant_is_told_which_provider_is_broken(session):
         with pytest.raises(ProviderNotConfigured) as e:
             await resolve_provider(session, ref, model)
         said[case] = assistant_unavailable(e.value)
-    assert said["missing"] == "助手使用的模型接入「甲接人」不存在。请在「设置 → 模型接入」中核对名称，或为助手换一个模型"
-    assert said["disabled"] == "助手使用的模型接入「停用接入」已停用。请在「设置 → 模型接入」中启用它，或为助手换一个模型"
+    repick = "或在「编排」页助手栏的「助手使用的模型」中重新选择"
+    assert said["missing"] == f"助手使用的模型接入「甲接人」不存在。请在「设置 → 模型接入」中核对名称，{repick}"
+    assert said["disabled"] == f"助手使用的模型接入「停用接入」已停用。请在「设置 → 模型接入」中启用它，{repick}"
     assert said["by_model"] == ("助手使用的模型「m-off」所属的模型接入「停用接入」已停用。"
-                                "请在「设置 → 模型接入」中启用它，或为助手换一个模型")
+                                f"请在「设置 → 模型接入」中启用它，{repick}")
     keyless = ProviderNotConfigured("模型接入「云端接入」没有配置 API Key", "请在接入中填写", code="missing_key")
     assert assistant_unavailable(keyless) == (
         "助手使用的模型尚未配置完成：模型接入「云端接入」没有配置 API Key。请到「设置 → 模型接入」检查")

@@ -34,13 +34,19 @@ class ModelSpec(BaseModel):
 class ProviderNotConfigured(RuntimeError):
     """模型接入没配好。reason 说缺了什么，hint 说去哪里补；str(e) 是两句连起来的整句，
     运行失败原因直接用它。设置页的测试弹窗本来就在接入的编辑框里，只取 reason、另给自己的 hint。
-    code 给调用方按类别分支：missing（点名的接入不存在）/ disabled / no_model / missing_key / missing_base_url。"""
+    code 给调用方按类别分支：missing（点名的接入不存在）/ disabled / no_model / missing_key / missing_base_url。
 
-    def __init__(self, reason: str, hint: str = "", code: str = "") -> None:
-        super().__init__(f"{reason}。{hint}" if hint else reason)
+    name、model_owner 只有 named_provider 填：点名的名字（去掉两边空白）恰好是某个启用接入的模型时，model_owner 是
+    那个接入的名称。str(e) 末尾补上 model_note 那一句；画布、设置页、助手各自另拼，说清在哪一栏改（同 hint）。"""
+
+    def __init__(self, reason: str, hint: str = "", code: str = "", *, name: str = "", model_owner: str = "") -> None:
+        note = model_note(name, model_owner) if model_owner else ""
+        super().__init__("。".join(part for part in (reason, hint, note) if part))
         self.reason = reason
         self.hint = hint
         self.code = code
+        self.name = name
+        self.model_owner = model_owner
 
 
 async def list_providers(session: AsyncSession) -> list[Provider]:
@@ -48,24 +54,54 @@ async def list_providers(session: AsyncSession) -> list[Provider]:
     return list(rows.scalars())
 
 
-#: 点名的接入不存在、已停用时，提示的前半句：在设置里能做什么。后半句（去哪里换一个接入）看场合：运行时报错、
-#: 设置页写「或换一个接入」；画布校验、发布前检查按这一处在界面上能不能改另写（engine/provider_refs.py）
-NAMED_FIX = {"missing": "请在「设置 → 模型接入」中核对名称", "disabled": "请在「设置 → 模型接入」中启用它"}
+#: 点名的接入不存在、已停用时，在「设置 → 模型接入」里能做什么。NAMED_FIX 是整句的前半句；后半句（去哪里换一个
+#: 接入）看场合：运行时报错、设置页写「或换一个接入」；画布校验、发布前检查按这一处在界面上能不能改另写
+#:（engine/provider_refs.py）；助手栏那一格下面先说「在上方重新选择」，再说去设置里做什么（assistant_unavailable）
+NAMED_ACTION = {"missing": "核对名称", "disabled": "启用它"}
+NAMED_FIX = {code: f"请在「设置 → 模型接入」中{act}" for code, act in NAMED_ACTION.items()}
+
+
+def model_fact(name: str, owner: str) -> str:
+    """点名的接入名恰好是某个启用接入的模型：先照实说这是哪个接入的模型，怎么用它各处另说（model_note……）。"""
+    return f"「{name}」是接入「{owner}」的模型"
+
+
+def model_note(name: str, owner: str, model_field: str = "模型一栏", provider_field: str = "接入",
+               how: str = "选择它") -> str:
+    """点名的接入名恰好是某个启用接入的模型时补的那一句：多半是把模型名填进了接入那一栏。开发数据里真有一条停用的
+    接入，名字就是一个模型 id，同名模型由另一条启用的接入提供——照「启用它」的提示去做，启用的是那条旧接入（它的
+    模型清单里根本没有这个模型），用户要的是这个模型。model_field、provider_field 是这一处模型、接入两栏的叫法，
+    how 是在模型那一栏里怎么做：设置页、核查节点的模型是输入框，写「填写」；运行时报错不分节点类型，多数节点的模型
+    是下拉框，写「模型一栏」「接入」「选择它」。画布、发布前检查按这一处在检查器里有哪几栏另写（provider_refs）。"""
+    return (f"{model_fact(name, owner)}：如需使用该模型，请在{model_field}中{how}，"
+            f"{provider_field}留空或选择「{owner}」")
+
+
+def _model_owner(providers: list[Provider], name: str) -> Provider | None:
+    """提供这个模型的启用接入，认法同 provider_for_model（先认模型列表、再认默认模型）。只看启用的：停用接入的模型
+    补了这一句，照着做也一样调不了。"""
+    enabled = [p for p in providers if p.enabled]
+    return next((p for p in enabled if any((m or {}).get("id") == name for m in (p.models or []))), None) \
+        or next((p for p in enabled if p.default_model == name), None)
 
 
 def named_provider(providers: list[Provider], ref: Any) -> Provider:
     """按名称或 id 找显式点名的接入（providers 是 list_providers 的结果）。找不到、找到的已停用都抛
     ProviderNotConfigured：点名了就只用它，不换别家。运行时取模型、设置和画布校验都按这一处认，说法一致。
-    名称两边的空白不算；不是字符串的（接口写进来的数字一类）当作点了一个不存在的名字。"""
+    名称两边的空白不算；不是字符串的（接口写进来的数字一类）当作点了一个不存在的名字。点名的名字恰好是某个启用接入
+    的模型时，异常带上 model_owner，报错补一句这是哪个接入的模型、怎么用它（model_note）。"""
     key = ref.strip() if isinstance(ref, str) else str(ref)
     found = next((p for p in providers if key in (p.id, p.name)), None) \
         or next((p for p in providers if (p.name or "").strip() == key), None)
+    if found is not None and found.enabled:
+        return found
+    owner = _model_owner(providers, key)
+    trap = {"name": key, "model_owner": owner.name} if owner is not None else {}
     if found is None:
-        raise ProviderNotConfigured(f"模型接入「{key}」不存在", f"{NAMED_FIX['missing']}，或换一个接入", code="missing")
-    if not found.enabled:
-        raise ProviderNotConfigured(f"模型接入「{found.name}」已停用", f"{NAMED_FIX['disabled']}，或换一个接入",
-                                    code="disabled")
-    return found
+        raise ProviderNotConfigured(f"模型接入「{key}」不存在", f"{NAMED_FIX['missing']}，或换一个接入", code="missing",
+                                    **trap)
+    raise ProviderNotConfigured(f"模型接入「{found.name}」已停用", f"{NAMED_FIX['disabled']}，或换一个接入",
+                                code="disabled", **trap)
 
 
 def serves(provider: Any, model: str) -> bool:
@@ -100,17 +136,36 @@ def fallback_provider(providers: list[Provider]) -> Provider | None:
     return (real or enabled or [None])[0]
 
 
-def assistant_unavailable(e: BaseException) -> str:
+#: 助手的模型在界面上只有一处能改：「编排」页助手栏的「助手使用的模型」（设置页里没有这一项）。选「跟随默认」或一个
+#: 模型都会清掉存着的接入。画布、问数据页、表格导入、数据目录起草报的是同一句，所以写明是哪一页
+ASSISTANT_MODEL_FIELD = "助手使用的模型"
+ASSISTANT_PICKER = f"「编排」页助手栏的「{ASSISTANT_MODEL_FIELD}」中"
+ASSISTANT_REPICK = f"或在{ASSISTANT_PICKER}重新选择"
+
+
+def assistant_unavailable(e: BaseException, *, here: bool = False) -> str:
     """助手（画布上改图、表格导入与数据目录的 AI 起草）用的模型取不到时给人看的那句话。
 
-    点名的接入不存在、已停用（按模型名找到的接入已停用也算）照实说是哪个接入、在设置里能做什么，或者给助手换一个
-    模型；以前这几种要么悄悄换成演示模型，要么各处自己判停用。其余（缺 key、没有模型……）是接入本身没配完。"""
+    点名的接入不存在、已停用（按模型名找到的接入已停用也算）照实说是哪个接入、在设置里能做什么，或者到助手栏重新
+    选一个模型；以前这几种要么悄悄换成演示模型，要么各处自己判停用。点名的名字恰好是启用接入的模型时并成一句：先说
+    在设置里能做什么，再说这是哪个接入的模型、也可以在助手栏直接选它（不再另起一句把「助手使用的模型」说两遍）。
+    其余（缺 key、没有模型……）是接入本身没配完。
+
+    here：说给助手栏「助手使用的模型」那一格下面（GET /api/copilot/model 的 panel_error）。人就在这个下拉框旁边，
+    去向写「上方」，不再把人指回「编排」页助手栏。"""
     from app.core.errors import not_configured
 
     code = getattr(e, "code", "")
     if code in NAMED_FIX:
-        return f"助手使用的{getattr(e, 'reason', '') or e}。{NAMED_FIX[code]}，或为助手换一个模型"
-    return f"助手使用的模型尚未配置完成：{not_configured(e, with_hint=False)}。请到「设置 → 模型接入」检查"
+        said = f"助手使用的{getattr(e, 'reason', '') or e}。"
+        if owner := getattr(e, "model_owner", ""):
+            where = "上方" if here else ASSISTANT_PICKER
+            return f"{said}{NAMED_FIX[code]}；{model_fact(getattr(e, 'name', ''), owner)}，也可在{where}直接选择它"
+        if here:
+            return f"{said}请在上方重新选择，或在「设置 → 模型接入」中{NAMED_ACTION[code]}"
+        return f"{said}{NAMED_FIX[code]}，{ASSISTANT_REPICK}"
+    return (f"助手使用的模型尚未配置完成：{not_configured(e, with_hint=False)}。请到「设置 → 模型接入」检查"
+            + ("，或在上方重新选择" if here else ""))
 
 
 async def resolve_provider(

@@ -164,9 +164,13 @@ export function VerifySection({ cur, errors, onEdit, refresh }: {
   const provider = cur.provider ? providers.find((p) => p.name === cur.provider) : undefined
   const providerMissing = !!cur.provider && providers.length > 0 && !provider
   // 点名停用的接入以前照常调用，现在核查时照实报「已停用」、记缺口：和「不存在」一样在这一格下面说。服务端按这一项
-  // 拒收时（errors.provider，设置页从 422 的 field 落过来）照它的整句
-  const providerError = errors.provider ?? (providerMissing ? S.providerGone(cur.provider)
-    : provider && !provider.enabled ? `${PROVIDER_REF_TEXT.disabled(cur.provider)}：${PROVIDER_REF_TEXT.verifyBroken}` : undefined)
+  // 拒收时（errors.provider，设置页从 422 的 field 落过来）照它的整句。名字恰好是某个启用接入的模型时补一句怎么用它
+  //（同设置页门控、裁判两组，和服务端保存时那句一致）
+  const providerTrap = provider?.enabled === false || providerMissing ? providerOfModel(providers, cur.provider) : undefined
+  const providerNote = providerTrap?.enabled ? `。${PROVIDER_REF_TEXT.modelNote(cur.provider, providerTrap.provider.name, T.model, T.provider)}` : ''
+  const providerError = errors.provider ?? (providerMissing ? `${S.providerGone(cur.provider)}${providerNote}`
+    : provider && !provider.enabled
+      ? `${PROVIDER_REF_TEXT.disabled(cur.provider)}：${PROVIDER_REF_TEXT.verifyBroken}${providerNote}` : undefined)
   const modelName = cur.model.trim()
   const byModel = !cur.provider && !!modelName
   const notSet = !cur.provider && !modelName

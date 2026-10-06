@@ -6,7 +6,8 @@
 - 画布校验：节点点名的接入不存在或已停用给警告，说清哪个节点、哪个接入；发布前检查、发布、自动修复的复核给错误，
   挡住发布。只查执行时真会去取模型的那几处（分支「让模型分类」、校验「让模型修复」且允许重试、检索「让模型重排」
   时才算；核查节点自己的开关关着不算）；报告没写裁判配置时查全图默认里的那一份；
-- 提示按这一处在界面上能不能改：检查器里有接入下拉框的说「在节点中换一个接入」，别处说「在发布前检查中改用」；
+- 提示按这一处在界面上能不能改：检查器里有接入下拉框的说「在节点中换一个接入」，别处在发布前检查给得出修复时
+  说「在发布前检查中改用」（给不出时不说，见 test_provider_ref_wording）；
 - 发布前检查给每一处配一条要人选的修复：改用一个启用的接入，或不指定接入（修完以后执行时落到哪里、只写了模型而
   提供它的接入已停用的那一处，见 test_provider_ref_landing）。
 
@@ -72,8 +73,16 @@ FIELDS = [
     ("verify", "provider", "核查模型 · 接入"),
     ("judge", "provider", "裁判模型 · 接入"),
     ("run", "tool_gate_provider", "门控模型 · 接入"),
-    ("copilot", "provider", "助手模型 · 接入"),
+    ("copilot", "provider", "助手使用的模型"),
 ]
+
+
+def refused(group: str, label: str, reason: str, fix: str) -> str:
+    """保存时拒收的说法。助手那一项只有「编排」页助手栏一个下拉框（只选模型），没有「换一个接入」的地方：和助手取不到
+    模型时报的同一句（factory.assistant_unavailable，见 test_provider_ref_wording）。"""
+    if group == "copilot":
+        return f"助手使用的{reason}。{fix}，或在「编排」页助手栏的「助手使用的模型」中重新选择"
+    return f"「{label}」指定的{reason}。{fix}，或换一个接入"
 
 
 @pytest.mark.parametrize("group,key,label", FIELDS)
@@ -82,8 +91,7 @@ async def test_saving_a_provider_that_does_not_exist_is_refused_with_the_field(c
     assert r.status_code == 422, r.text
     body = r.json()
     assert body["code"] == "settings_provider_invalid" and body["field"] == f"{group}.{key}"
-    assert body["detail"].startswith(f"「{label}」填写的模型接入「{GONE}」不存在。"), body["detail"]
-    assert "请在「设置 → 模型接入」中核对名称，或换一个接入" in body["detail"] and "留空表示" in body["detail"]
+    assert body["detail"] == refused(group, label, f"模型接入「{GONE}」不存在", "请在「设置 → 模型接入」中核对名称")
     assert await stored(group) is None
 
 
@@ -93,8 +101,7 @@ async def test_saving_a_disabled_provider_is_refused_too(client, group, key, lab
     assert r.status_code == 422, r.text
     body = r.json()
     assert body["field"] == f"{group}.{key}"
-    assert body["detail"].startswith(f"「{label}」填写的模型接入「{OFF}」已停用。"), body["detail"]
-    assert "请在「设置 → 模型接入」中启用它，或换一个接入" in body["detail"]
+    assert body["detail"] == refused(group, label, f"模型接入「{OFF}」已停用", "请在「设置 → 模型接入」中启用它")
     assert await stored(group) is None
 
 
@@ -207,8 +214,9 @@ async def test_every_place_a_graph_names_a_provider_is_checked(client):
         f"「协作」（多 Agent 协作）的成员「分析师」指定的模型接入「{GONE}」不存在")
     assert got[("write", "judge.provider")]["message"].startswith(
         f"「写周报」（报告撰写）的结论句裁判指定的模型接入「{GONE}」不存在")
-    assert got[("dual", "provider")]["message"].startswith(f"「复核销售额」（双盲复算）的盲算模型指定的模型接入「{GONE}」")
-    assert got[("chal", "provider")]["message"].startswith(f"「审稿」（反方审稿）的反方模型指定的模型接入「{OFF}」已停用")
+    assert got[("dual", "provider")]["message"].startswith(
+        f"「复核销售额」（双盲复算）的「盲算模型 · 接入」指定的模型接入「{GONE}」")
+    assert got[("chal", "provider")]["message"].startswith(f"「审稿」（反方审稿）的「反方模型 · 接入」指定的模型接入「{OFF}」已停用")
     assert got[(None, "defaults.provider")]["message"].startswith(f"工作流默认设置指定的模型接入「{GONE}」不存在")
 
 
@@ -281,14 +289,15 @@ async def test_publish_check_reads_the_unsaved_canvas_and_autofix_keeps_the_prob
 
 
 async def test_handing_only_a_provider_problem_to_the_assistant_says_it_cannot_help(client):
-    """修复之后门禁不再拦、只剩点名接入的问题：不说「已没有阻止发布的错误」，说清助手处理不了、该去哪里改。"""
-    from app.api.workflows import PROVIDER_LEFT
+    """修复之后门禁不再拦、只剩点名接入的问题：不说「已没有阻止发布的错误」，说清助手处理不了、该去哪里改（这一处
+    有修复，连同各条问题的修复一起说；没有修复时的说法见 test_provider_ref_wording）。"""
+    from app.api.workflows import PROVIDER_LEFT, PROVIDER_LEFT_FIX
 
     wf = await _workflow(writer(None))
     r = await client.post(f"/api/workflows/{wf}/autofix", json={"level": "published", "graph": writer(GONE),
                                                                 "assist": True})
     out = r.json()
-    assert out["assist"] == {"ok": False, "summary": PROVIDER_LEFT, "questions": []}
+    assert out["assist"] == {"ok": False, "summary": PROVIDER_LEFT + PROVIDER_LEFT_FIX, "questions": []}
     assert out["ok"] is False and [i["code"] for i in provider_issues({"issues": out["remaining"]})] == [
         "provider.missing"]
     r = await client.post(f"/api/workflows/{wf}/autofix", json={"level": "published", "graph": writer(LIVE),
@@ -303,15 +312,14 @@ async def test_publishing_a_clean_graph_is_unaffected(client):
 
 
 @pytest.mark.parametrize("group,key,label", [("run", "tool_gate_provider", "门控模型 · 接入"),
-                                             ("copilot", "provider", "助手模型 · 接入")])
+                                             ("copilot", "provider", "助手使用的模型")])
 async def test_a_provider_name_that_is_not_text_is_refused_with_the_field(client, group, key, label):
     """门控、助手两组没有自己的格式检查：名字写成数字一类以前照样存下，查助手当前用哪个模型时就出错。"""
     r = await client.put("/api/settings", json={"values": {group: {key: 123}}})
     assert r.status_code == 422, r.text
     body = r.json()
     assert body["code"] == "settings_provider_invalid" and body["field"] == f"{group}.{key}"
-    assert body["detail"].startswith(f"「{label}」需要填写模型接入的名称，留空表示"), body["detail"]
-    assert body["detail"].endswith("当前为「123」")
+    assert body["detail"] == f"「{label}」需要填写模型接入的名称，当前为「123」", body["detail"]
     assert await stored(group) is None
 
 

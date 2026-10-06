@@ -14,7 +14,7 @@ from app.data.catalog_impact import catalog_drift, catalog_versions_for, recorde
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import publish_issues
-from app.engine.provider_refs import CODES as PROVIDER_CODES, load_issues, load_providers
+from app.engine.provider_refs import CODES as PROVIDER_CODES, load_issues, load_providers, quiet_unset_model
 from app.engine.schema import GraphSpec, NodeType, validate_graph
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
@@ -22,9 +22,14 @@ router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 _GONE = "工作流不存在，可能已被删除"
 _LEVELS = ("published", "governed")
 _BAD_LEVEL = "发布级别只能是「已发布」或「受管」"
-#: 剩下的挡住发布的只有点名接入的问题、人又要交给助手时的说明：换成哪个接入要人拿主意，每一处都有自己的修复
-PROVIDER_LEFT = ("剩下的问题是指定的模型接入不存在或已停用，需要你决定改用哪个接入：请在每一处的修复中选择，"
-                 "或在「设置 → 模型接入」中核对")
+#: 剩下的挡住发布的只有模型接入的问题、人又要交给助手时的说明：换成哪个接入要人拿主意，助手处理不了。发布弹窗里
+#: 渲染成「助手：……」，说明里不再带冒号；可能是全图默认、也可能只写了模型而提供它的接入停用了，不说「节点」「点名」。
+#: 人刚点了「交给助手」，写「助手无法处理」，不写「无法交给助手处理」（读来像没交出去）
+PROVIDER_LEFT = ("剩余的问题是所用的模型接入不存在或已停用，助手无法处理。"
+                 "请在「设置 → 模型接入」中核对名称或启用相应的接入")
+#: 剩下的问题里有一条带着修复（provider_refs 按候选算得出来）才补这半句：一个候选都落不稳时那里什么都不给。弹窗里那一组
+#: 选项在每条问题下方，标题是「选择……改用的模型接入」；另起半句，不和前面的「或」连用
+PROVIDER_LEFT_FIX = "；也可在各条问题下方选择改用的模型接入"
 
 
 class WorkflowIn(BaseModel):
@@ -490,9 +495,12 @@ async def autofix(
         if out["ok"]:
             out["assist"] = {"ok": True, "summary": "修复后已没有阻止发布的错误，未再交给助手", "questions": []}
             return out
-        if all(i.get("code") in PROVIDER_CODES for i in out["remaining"] if i["level"] == "error"):
+        left = [i for i in out["remaining"] if i["level"] == "error"]
+        if all(i.get("code") in PROVIDER_CODES for i in left):
             # 剩下的只有点名接入的问题：换成哪个接入要人拿主意（助手的自查也不看接入表），不交给助手
-            out["assist"] = {"ok": False, "summary": PROVIDER_LEFT, "questions": []}
+            fixable = any(i.get("fix") for i in left)
+            out["assist"] = {"ok": False, "summary": PROVIDER_LEFT + (PROVIDER_LEFT_FIX if fixable else ""),
+                             "questions": []}
             return out
         from app.api.copilot import assist_publish_fix
 
@@ -523,14 +531,16 @@ async def validate(payload: ValidateIn, session: AsyncSession = Depends(get_sess
     """画布上的实时校验。前端每次改动都会调它来标红。
 
     点名的模型接入不存在或已停用（只写了模型、提供它的接入已停用也算）只给警告：探索运行仍可发起，执行到那个节点时
-    照实报错；发布时才挡住。"""
+    照实报错；发布时才挡住。这时同一节点上「没有指定模型，将使用接入「X」的默认模型」和它矛盾，不再列
+    （quiet_unset_model，发布一类在 governance._not_repeated 里同样处理）。"""
     try:
         spec = GraphSpec.model_validate(payload.graph)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
-    result = validate_graph(spec).model_dump()
-    result["issues"] += [i.model_dump() for i in await load_issues(session, spec, level="warning")]
-    return result
+    result = validate_graph(spec)
+    found = await load_issues(session, spec, level="warning")
+    result.issues = [*quiet_unset_model(spec, result.issues, found), *found]
+    return result.model_dump()
 
 
 @router.post("/variables")

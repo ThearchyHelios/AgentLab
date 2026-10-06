@@ -91,6 +91,21 @@ export interface ProviderTest {
   [key: string]: any
 }
 
+/**
+ * 助手当前用哪个模型（GET / PUT /api/copilot/model）。provider、model 是存着的设定；存的接入不存在、已停用（或只存了
+ * 模型名、提供它的接入已停用）时实际什么都用不了：effective_* 为空，error 是和生成时报的同一句。老后端不给 error
+ */
+export interface CopilotModel {
+  configured: boolean
+  provider: string | null
+  model: string | null
+  effective_provider: string | null
+  effective_model: string | null
+  error?: string | null
+  /** 同一件事写在助手栏「助手使用的模型」那一格下面的说法：去向写「上方」，不把人指回这个下拉框本身。老后端不给 */
+  panel_error?: string | null
+}
+
 /** 还没保存的模型接入配置。带 id 表示在编辑已有的那个，api_key 留空沿用已存的 */
 export interface ProviderDraft {
   id?: string
@@ -718,12 +733,9 @@ export const api = {
     layout: (graph: GraphSpec) => post<GraphSpec>('/copilot/layout', { graph }),
     fromRun: (runId: string, name?: string) =>
       post<any>('/copilot/from-run', { run_id: runId, name }),
-    getModel: () => get<{
-      configured: boolean; provider: string | null; model: string | null
-      effective_provider: string | null; effective_model: string | null
-    }>('/copilot/model'),
+    getModel: () => get<CopilotModel>('/copilot/model'),
     setModel: (body: { provider?: string | null; model?: string | null }) =>
-      put<any>('/copilot/model', body),
+      put<CopilotModel>('/copilot/model', body),
     /** 跑完之后复核一次。干净的运行后端直接返回 verdict='ok'，不调模型 */
     review: (body: { run_id: string; question: string }) =>
       post<ReviewResult>('/copilot/review', body),

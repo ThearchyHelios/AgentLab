@@ -430,9 +430,11 @@ async def test_judging_on_demand_with_a_broken_judge_provider_says_why(monkeypat
 # --------------------------------------------------------------------------
 
 
-#: 助手报给人的那一句：照实说是哪个接入、在设置里能做什么，或者给助手换一个模型（不再说「尚未配置完成」）
-SAID = {MISSING: f"助手使用的{REASONS[MISSING]}。请在「设置 → 模型接入」中核对名称，或为助手换一个模型",
-        DISABLED: f"助手使用的{REASONS[DISABLED]}。请在「设置 → 模型接入」中启用它，或为助手换一个模型"}
+#: 助手报给人的那一句：照实说是哪个接入、在设置里能做什么，或者到「编排」页助手栏重新选一个模型（设置页里没有助手的
+#: 接入这一项，能改的只有那个下拉框；不再说「尚未配置完成」）
+REPICK = "或在「编排」页助手栏的「助手使用的模型」中重新选择"
+SAID = {MISSING: f"助手使用的{REASONS[MISSING]}。请在「设置 → 模型接入」中核对名称，{REPICK}",
+        DISABLED: f"助手使用的{REASONS[DISABLED]}。请在「设置 → 模型接入」中启用它，{REPICK}"}
 
 
 @pytest.mark.parametrize("ref", [MISSING, DISABLED])
@@ -591,8 +593,9 @@ async def test_after_the_publish_fix_stops_naming_a_disabled_provider_the_formal
     [issue] = [i for i in r.json()["issues"] if i.get("code") == "provider.disabled"]
     [fix] = [f for f in r.json()["fixes"] if f["id"] == issue["fix"]]
     [clear] = [o for o in fix["options"] if o["value"] == ""]
-    # 没点名接入、也没写模型时落到第一个可用的接入：本文件只建了一个启用的接入
-    assert clear["hint"] == f"去掉这一处指定的接入和模型「停用演示模型」，执行时改用第一个可用的模型接入「{WRITER_PROVIDER}」"
+    # 没点名接入、也没写模型时落到第一个可用的接入：本文件只建了一个启用的接入，是演示类的，说明里照实写
+    assert clear["hint"] == (f"去掉这一处指定的接入和模型「停用演示模型」，执行时改用第一个可用的模型接入「{WRITER_PROVIDER}」"
+                             "（演示用，不调用真实模型）")
     r = await client.post(f"/api/workflows/{wid}/autofix", json={"level": "published", "apply": [fix["id"]],
                                                                  "choices": {fix["id"]: ""}})
     fixed = r.json()

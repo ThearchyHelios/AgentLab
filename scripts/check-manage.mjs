@@ -607,7 +607,8 @@ await section('设置 · 点名的接入已停用或不存在', async () => {
     judge: { ...(stored.judge ?? {}), provider: 'demo-off', model: null },
     verify: { ...(stored.verify ?? {}), provider: 'demo-off', model: null },
   }
-  const REFUSED = '「门控模型 · 接入」填写的模型接入「demo-main」已停用。请在「设置 → 模型接入」中启用它，或换一个接入；留空表示使用默认接入的默认模型'
+  // 服务端的说法（api/settings._provider_problem）：下拉框里选的写「指定的」，不另讲留空是什么意思（空选项写着）
+  const REFUSED = '「门控模型 · 接入」指定的模型接入「demo-main」已停用。请在「设置 → 模型接入」中启用它，或换一个接入'
   let refuse = true
   const { page, sent, errors, close } = await open('/settings/prefs', {
     handlers: [
@@ -649,6 +650,83 @@ await section('设置 · 点名的接入已停用或不存在', async () => {
   const put = sent.filter((x) => x.key === 'PUT /settings').at(-1)?.body?.values?.run ?? {}
   check('……再保存：照常写进去', put.tool_gate_provider === null && (await page.locator('[data-prefs-save-error]').count()) === 0,
     `provider=${JSON.stringify(put.tool_gate_provider)}`)
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('设置 · 停用接入的后果写全；接入名恰好是模型名时说清怎么用这个模型', async () => {
+  // 停用一个接入以后，点名它（或只写了它的模型）的节点和设置都调不了它（K1）：卡片上「已停用」的悬停说明、编辑框里
+  // 「启用」下面的说明都要写到这一层，不只是「下拉里看不到」；调不了以后怎样（报错、转人工审批、记未裁判、记缺口）各组
+  // 自己说，这里不笼统写「运行时报错」。停用的接入恰好叫 big-model，而 big-model 是启用的 demo-main 提供的模型：设置页
+  // 三格下面补一句这是哪个接入的模型、在哪一栏用它，和服务端保存时 422 的那句一致。接入表、设置都是假的
+  const PROVIDERS = [
+    { id: 'check-trap-p1', name: 'demo-main', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'big-model',
+      models: [{ id: 'big-model' }], enabled: true, extra: {}, api_key_masked: '', has_key: true },
+    { id: 'check-trap-p2', name: 'big-model', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'old-model',
+      models: [{ id: 'old-model' }], enabled: false, extra: {}, api_key_masked: '', has_key: true },
+  ]
+  const EFFECT = '该接入的模型不再出现在下拉列表中，指定它或其模型的节点和设置也无法调用'
+  // 编辑框里「启用」的版式：「启用」两个字只占一行（以前长说明和它并排放在 label 里，1440 宽时把它挤成上下两个字）；
+  // 说明不在 label 里，复选框的读屏名只是「启用」，说明由 aria-describedby 接上
+  const enabledLayout = (page) => page.evaluate(() => {
+    const hint = document.querySelector('[data-provider-enabled-hint]')
+    const box = [...document.querySelectorAll('[role="dialog"] input[type="checkbox"]')]
+      .find((el) => el.closest('label')?.textContent?.trim().startsWith('启用'))
+    const label = box?.closest('label')
+    const word = label && [...label.childNodes].find((n) => n.nodeType === 3 && n.textContent.includes('启用'))
+    const range = document.createRange()
+    if (word) range.selectNodeContents(word)
+    const lines = word ? new Set([...range.getClientRects()].filter((r) => r.width > 0).map((r) => Math.round(r.top))).size : 0
+    const d = document.querySelector('[role="dialog"]')
+    // 弹窗自己不出横向滚动条，「启用」一行和说明都在弹窗里
+    const fits = !!d && d.scrollWidth - d.clientWidth <= 0
+      && [label, hint].every((el) => el && el.getBoundingClientRect().right <= d.getBoundingClientRect().right + 0.5)
+    return { lines, inLabel: !!label && !!hint && label.contains(hint), described: !!hint?.id && box?.getAttribute('aria-describedby') === hint.id, fits }
+  })
+  const cards = await open('/settings/providers', { handlers: [[/^GET \/providers$/, json(PROVIDERS)]], viewport: { width: 1440, height: 900 } })
+  const chip = cards.page.locator('[data-provider="big-model"] .chip', { hasText: '已停用' })
+  check('卡片上「已停用」：悬停写明点名它的节点和设置也无法调用', await chip.getAttribute('title').catch(() => '') === `已停用：${EFFECT}`,
+    await chip.getAttribute('title').catch(() => ''))
+  await cards.page.locator('[data-provider="big-model"]').getByRole('button', { name: '编辑' }).click()
+  const enabledHint = await cards.page.locator('[data-provider-enabled-hint]').innerText().catch(() => '')
+  check('编辑框「启用」下面：不只说下拉里看不到，也说点名它的节点和设置无法调用', enabledHint === `停用后，${EFFECT}`, enabledHint)
+  const wide = await enabledLayout(cards.page)
+  check('1440 宽：「启用」只占一行，说明另起一行、不在 label 里，由复选框的 aria-describedby 接上',
+    wide.lines === 1 && !wide.inLabel && wide.described && wide.fits, JSON.stringify(wide))
+  check('……复选框的读屏名只是「启用」', await cards.page.getByRole('checkbox', { name: '启用', exact: true }).count() === 1)
+  await shot(cards.page, 'provider-enabled-hint')
+  check('没有运行时报错', cards.errors.length === 0, cards.errors[0] ?? '')
+  await cards.close()
+
+  const phone = await open('/settings/providers', { handlers: [[/^GET \/providers$/, json(PROVIDERS)]], viewport: { width: 390, height: 844 } })
+  await phone.page.locator('[data-provider="big-model"]').getByRole('button', { name: '编辑' }).click()
+  await phone.page.locator('[data-provider-enabled-hint]').waitFor()
+  const narrow = await enabledLayout(phone.page)
+  check('390 宽：「启用」同样只占一行，说明在弹窗里折行，弹窗不出横向滚动条', narrow.lines === 1 && narrow.fits, JSON.stringify(narrow))
+  await shot(phone.page, 'provider-enabled-hint-390')
+  check('没有运行时报错', phone.errors.length === 0, phone.errors[0] ?? '')
+  await phone.close()
+
+  let stored = await get('/settings')
+  stored = {
+    ...stored,
+    run: { ...(stored.run ?? {}), tool_gate_provider: 'big-model', tool_gate_model: null },
+    judge: { ...(stored.judge ?? {}), provider: 'big-model', model: null },
+    verify: { ...(stored.verify ?? {}), provider: 'big-model', model: null },
+  }
+  const { page, errors, close } = await open('/settings/prefs', {
+    handlers: [[/^GET \/settings$/, (route) => json(stored)(route)], [/^GET \/providers$/, json(PROVIDERS)]],
+  })
+  const said = async (id) => page.locator(`#${id}-error`).innerText().catch(() => '')
+  const note = (model, provider) => `「big-model」是接入「demo-main」的模型：如需使用该模型，请在「${model}」中填写，「${provider}」留空或选择「demo-main」`
+  check('门控模型：先说停用了、会怎样，再补一句这是 demo-main 的模型、在哪一栏用它',
+    await said('pref-gate-provider') === `模型接入「big-model」已停用：门控模型无法调用，所有工具调用将转为人工审批。${note('门控模型 · 模型', '门控模型 · 接入')}`,
+    await said('pref-gate-provider'))
+  check('证据裁判：同样补这一句，写裁判那两栏的叫法', (await said('pref-judge-provider')).endsWith(`。${note('裁判模型 · 模型', '裁判模型 · 接入')}`),
+    await said('pref-judge-provider'))
+  check('核查模型：同样补这一句，写核查那两栏的叫法', (await said('pref-verify-provider')).endsWith(`。${note('核查模型 · 模型', '核查模型 · 接入')}`),
+    await said('pref-verify-provider'))
+  await shot(page, 'prefs-provider-named-like-model')
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })
