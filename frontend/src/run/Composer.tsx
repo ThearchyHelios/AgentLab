@@ -45,14 +45,21 @@ export function Composer({ hero, onFocusChange }: {
   const [opts, setOpts] = useState(false)
   // 存着的助手模型设定（GET /api/copilot/model）：接入、模型、实际会用的模型、用不了时的原因
   const [saved, setSaved] = useState<CopilotModel | null>(null)
+  // 重新选择时保存失败：下拉已退回选之前的样子，下面说明没改成
+  const [saveFailed, setSaveFailed] = useState(false)
+  // 只认最后一次选择的回包：连着选两次时，先发的那次晚回来也不能盖掉后一次
+  const picks = useRef(0)
   const [useBase, setUseBase] = useState(true)
   const ref = useRef<HTMLTextAreaElement>(null)
 
-  // 挂上时取一次；每次展开「助手使用的模型」再取一次：接入可能刚在设置里启用、停用或改了名
+  // 挂上时取一次；每次展开「助手使用的模型」再取一次：接入可能刚在设置里启用、停用或改了名。取的途中人已经重新选过
+  // 的话不用这一份（它是选之前的样子）。重新取回来的就是服务端现在存着的，上一次「保存失败」的说明不再留着
   useEffect(() => {
     if (!opts && saved) return
     let alive = true
-    void api.copilot.getModel().then((m) => { if (alive) setSaved(m) }).catch(() => undefined)
+    setSaveFailed(false)
+    const seq = picks.current
+    void api.copilot.getModel().then((m) => { if (alive && seq === picks.current) setSaved(m) }).catch(() => undefined)
     return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [opts])
@@ -75,14 +82,24 @@ export function Composer({ hero, onFocusChange }: {
   // 它——否则下拉停在「跟随默认」，看着一切正常，接入失效了也看不出来，再选「跟随默认」不算改动、清不掉存着的接入
   const custom = !!saved && (!!saved.provider || (!!saved.model && !options.some((o) => o.value === saved.model)))
   const model = custom ? SAVED : saved?.model ?? ''
-  const broken = saved?.error || null
+  // 下拉下面写的原因：服务端给的这一格专用的说法（去向写「上方」），老服务端只给整句
+  const broken = saved?.panel_error || saved?.error || null
 
   const pickModel = (value: string) => {
     if (value === SAVED) return
-    // 先按选的显示；存的是 provider 置空、只写模型（跟随默认时两项都空），回来的是服务端认下的样子
-    setSaved((s) => ({ configured: !!value, provider: null, model: value || null, effective_provider: null,
-      effective_model: value || s?.effective_model || null, error: null }))
-    void api.copilot.setModel({ model: value || null }).then(setSaved).catch(() => undefined)
+    const before = saved
+    const seq = ++picks.current
+    setSaveFailed(false)
+    // 先按选的显示；存的是 provider 置空、只写模型（跟随默认时两项都空），回来的是服务端认下的样子。跟随默认时实际用
+    // 哪个模型由服务端说了算，回来之前不写「当前」
+    setSaved({ configured: !!value, provider: null, model: value || null, effective_provider: null,
+      effective_model: value || null, error: null, panel_error: null })
+    void api.copilot.setModel({ model: value || null }).then((m) => { if (seq === picks.current) setSaved(m) }).catch(() => {
+      if (seq !== picks.current) return
+      // 没存上：服务端存着的还是原来那一组，退回选之前的样子（原因、齿轮上的红点照旧），并说明保存失败
+      setSaved(before)
+      setSaveFailed(true)
+    })
   }
 
   const send = (override?: string) => {
@@ -189,8 +206,9 @@ export function Composer({ hero, onFocusChange }: {
             <label className="label" htmlFor="copilot-model">{MT.label}</label>
             <select id="copilot-model" className="field" value={model} onChange={(e) => pickModel(e.target.value)}
                     aria-invalid={broken ? true : undefined} aria-describedby={broken ? 'copilot-model-error' : undefined}>
-              {/* 「当前」只在跟随默认、用得了的时候写：存着的设定列成单独一项时，这一项说的是选它以后会用哪个 */}
-              <option value="">{MT.follow}{!custom && saved?.effective_model ? MT.current(saved.effective_model) : ''}</option>
+              {/* 「当前」只在选着跟随默认、用得了的时候写：选了别的模型时 effective_model 是那个模型，不是跟随默认会用的；
+                  存着的设定列成单独一项时，这一项说的是选它以后会用哪个 */}
+              <option value="">{MT.follow}{model === '' && saved?.effective_model ? MT.current(saved.effective_model) : ''}</option>
               {custom && <option value={SAVED}>{MT.saved(saved!.provider, saved!.model)}</option>}
               {groups.map((g) => (
                 <optgroup key={g} label={g}>
@@ -200,6 +218,10 @@ export function Composer({ hero, onFocusChange }: {
                 </optgroup>
               ))}
             </select>
+            {saveFailed && (
+              <div role="alert" data-copilot-model-save-failed=""
+                   className="mt-1 text-2xs leading-relaxed text-[var(--err)]">{MT.saveFailed}</div>
+            )}
             {broken && (
               <div id="copilot-model-error" role="alert" data-copilot-model-error=""
                    className="mt-1 text-2xs leading-relaxed text-[var(--err)] [overflow-wrap:anywhere]">{broken}</div>

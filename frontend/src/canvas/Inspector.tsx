@@ -545,18 +545,23 @@ function SyntaxBadge({ syntax }: { syntax: FieldSyntax }) {
 }
 
 /**
- * 模型一栏留空时执行用什么：节点点名了接入（没写就是全图默认点名的，同后端 NodeContext.cfg 和 schema 那条「没有指定模型」）
- * 时是那个接入的默认模型。那个接入不存在、已停用时空选项说状态、下面不写说明：检查器顶上另有接入那条问题，这里再说
- * 「使用它的默认模型」就和它矛盾。全图默认不在节点里，从 toGraph 带回去的那一份读。接入表还没取回来时不判状态
+ * 模型一栏留空时执行用什么，同后端 NodeContext.cfg：节点没写的取工作流默认设置里的。工作流默认设置写了模型，用的就是那个
+ * 模型（后端这时也不报「没有指定模型」）；否则节点点名了接入（没写就是全图默认点名的）时是那个接入的默认模型。点名的接入
+ * 不存在、已停用时空选项说状态、下面不写说明：检查器顶上另有接入那条问题，这里再说「使用……」就和它矛盾。全图默认不在
+ * 节点里，从 toGraph 带回去的那一份读。接入表还没取回来时不判状态。help 为 undefined 时用节点定义里那句
  */
-function modelDefault(config: Record<string, any>, providers: Provider[]): { blank: string; named: string | null; ok: boolean } {
+function modelDefault(config: Record<string, any>, providers: Provider[]): { blank: string; help?: string | null } {
+  const defaults = toGraph([], []).defaults ?? {}
   let value = config.provider
-  if (value == null || value === '') value = toGraph([], []).defaults?.provider
+  if (value == null || value === '') value = defaults.provider
   const named = typeof value === 'string' && value.trim() ? value.trim() : null
+  const fallback = typeof defaults.model === 'string' && defaults.model.trim() ? defaults.model.trim() : null
   // 认法同后端 named_provider：名称或 id，名称两边的空白不算
   const found = named ? providers.find((p) => p.id === named || p.name === named || p.name.trim() === named) : undefined
   const state = !named || !providers.length || found?.enabled ? 'ok' : found ? 'disabled' : 'missing'
-  return { blank: PROVIDER_REF_TEXT.modelBlank(named, state), named, ok: state === 'ok' }
+  const help = state !== 'ok' ? null : fallback ? PROVIDER_REF_TEXT.modelHelpDefaults(fallback)
+    : named ? PROVIDER_REF_TEXT.modelHelp(named) : undefined
+  return { blank: PROVIDER_REF_TEXT.modelBlank(named, state, fallback), help }
 }
 
 function Field({ field, nodeId, value, config, issues, onChange }: {
@@ -564,10 +569,13 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
   issues: FieldIssue[]; onChange: (v: any) => void
 }) {
   const id = `f-${nodeId}-${field.key}`
-  // 模型一栏的说明跟着点名的接入走（modelDefault）：节点定义里那句只适用于没点名接入的时候
-  const providers = useCatalog((s) => (field.type === 'model' ? s.providers : NO_ROWS))
-  const model = field.type === 'model' ? modelDefault(config, providers) : null
-  const help = !model?.named ? field.help : model.ok ? PROVIDER_REF_TEXT.modelHelp(model.named) : undefined
+  // 节点定义里的模型一栏（MODEL_FIELDS）：说明跟着全图默认的模型、点名的接入走（modelDefault），节点定义里那句只适用于
+  // 两样都没写的时候。自己画的模型栏（核查节点的反方模型、盲算模型）只读节点自己的配置、留空跟随设置，不取全图默认，
+  // 说明在它自己里面——这里再套一句「留空则使用接入「X」的默认模型」就和它相反
+  const modelField = field.type === 'model' && !field.render
+  const providers = useCatalog((s) => (modelField ? s.providers : NO_ROWS))
+  const model = modelField ? modelDefault(config, providers) : null
+  const help = model?.help === undefined ? field.help : model.help ?? undefined
   const syntax = syntaxOf(field)
   const composite = field.type === 'cases' || field.type === 'agents' || field.type === 'ioFields'
     || field.type === 'metricsList' || field.type === 'caliberFrom' || field.type === 'judge'

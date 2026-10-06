@@ -259,7 +259,9 @@ function normalizeFix(raw: any): PublishFix | null {
   const options = asArray<any>(raw.options)
     .filter((o) => o && typeof o === 'object' && 'value' in o)
     .map((o) => ({ value: o.value, label: asText(o.label ?? o.value), hint: o.hint ? asText(o.hint) : null,
-      ...(o.handoff === true ? { handoff: true } : {}) }))
+      ...(o.handoff === true ? { handoff: true } : {}),
+      // 点名的模型接入：修完以后落到演示类接入（后端 autofix._demo_mark），弹窗在选项名旁加醒目的标签
+      ...(o.demo === true ? { demo: true } : {}) }))
   // 选项类没有候选就没法选：不给控件，比给一个空下拉强
   if (kind === 'choice' && !options.length) return null
   return {

@@ -102,6 +102,8 @@ export interface CopilotModel {
   effective_provider: string | null
   effective_model: string | null
   error?: string | null
+  /** 同一件事写在助手栏「助手使用的模型」那一格下面的说法：去向写「上方」，不把人指回这个下拉框本身。老后端不给 */
+  panel_error?: string | null
 }
 
 /** 还没保存的模型接入配置。带 id 表示在编辑已有的那个，api_key 留空沿用已存的 */

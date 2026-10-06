@@ -920,10 +920,11 @@ export const PUBLISH_FIX_TEXT = {
 } as const
 
 /**
- * 停用一个接入的后果。不只是下拉里看不到：点名它（或只写了它的模型）的节点、门控 / 裁判 / 核查设置，运行时都照实报错，
- * 由定时任务发起的正式运行直接失败（后端 providers/factory.named_provider）
+ * 停用一个接入的后果。不只是下拉里看不到：点名它（或只写了它的模型）的节点、门控 / 裁判 / 核查设置都调不了它（后端
+ * providers/factory.named_provider）。调不了以后怎样各处不同（节点报错、门控转人工审批、裁判记未裁判、核查记缺口），
+ * 由设置页各组自己那一句说，这里只说「无法调用」；整句控制在 40 字以内
  */
-const PROVIDER_DISABLED_EFFECT = '该接入的模型不再出现在下拉列表中；指定该接入或其模型的节点和设置将无法调用，运行时报错'
+const PROVIDER_DISABLED_EFFECT = '该接入的模型不再出现在下拉列表中，指定它或其模型的节点和设置也无法调用'
 
 /**
  * 点名的模型接入不存在或已停用（后端 providers/factory.named_provider、engine/provider_refs.py）。以前点名的接入不存在时
@@ -954,19 +955,29 @@ export const PROVIDER_REF_TEXT = {
    */
   modelNote: (name: string, owner: string, modelField: string, providerField: string) =>
     `「${name}」是接入「${owner}」的模型：如需使用该模型，请在「${modelField}」中填写，「${providerField}」留空或选择「${owner}」`,
-  /** 接入编辑框「启用」旁的说明、接入卡片上「已停用」的悬停说明 */
+  /** 接入编辑框「启用」下面的说明、接入卡片上「已停用」的悬停说明 */
   enabledHint: `停用后，${PROVIDER_DISABLED_EFFECT}`,
   disabledChip: `已停用：${PROVIDER_DISABLED_EFFECT}`,
   /**
-   * 检查器模型一栏的空选项：节点（没写就是全图默认）点名了接入时，留空用的是那个接入的默认模型，照实说是哪个；那个接入
-   * 不存在、已停用时说状态（检查器顶上另有接入那条问题），不说「使用」。和画布校验那条「没有指定模型，将使用接入「X」的
-   * 默认模型」同一个说法（后端 schema.MODEL_UNSET）
+   * 检查器模型一栏的空选项：留空时执行用什么（同后端 NodeContext.cfg：节点没写的取工作流默认设置里的）。工作流默认设置
+   * 写了模型，用的就是那个模型（后端这时也不报「没有指定模型」）；节点（没写就是全图默认）点名了接入，用那个接入的默认
+   * 模型，照实说是哪个；那个接入不存在、已停用时说状态（检查器顶上另有接入那条问题），不说「使用」。和画布校验那条
+   * 「没有指定模型，将使用接入「X」的默认模型」同一个说法（后端 schema.MODEL_UNSET）
    */
-  modelBlank: (named: string | null, state: 'ok' | 'missing' | 'disabled') => (!named ? '默认（使用第一个可用的模型接入）'
-    : state === 'missing' ? `默认（模型接入「${named}」不存在）`
-      : state === 'disabled' ? `默认（模型接入「${named}」已停用）` : `默认（使用接入「${named}」的默认模型）`),
+  modelBlank: (named: string | null, state: 'ok' | 'missing' | 'disabled', fromDefaults: string | null = null) => (
+    state === 'missing' ? `默认（模型接入「${named}」不存在）`
+      : state === 'disabled' ? `默认（模型接入「${named}」已停用）`
+        : fromDefaults ? `默认（使用工作流默认设置的模型「${fromDefaults}」）`
+          : named ? `默认（使用接入「${named}」的默认模型）` : '默认（使用第一个可用的模型接入）'),
   /** 同一栏下面的说明（没点名接入时用节点定义里的那句）；点名的接入不存在、已停用时不写，免得和接入那条问题打架 */
   modelHelp: (named: string) => `留空则使用接入「${named}」的默认模型`,
+  modelHelpDefaults: (model: string) => `留空则使用工作流默认设置的模型「${model}」`,
+  /**
+   * 发布前检查里修完以后落到演示类接入的候选（后端 autofix 的 demo 标记）：选项名旁的醒目标签。说明里那半句「演示用，
+   * 不调用真实模型」照旧写，只是淡色小字、排在长句末尾——K1 要防的就是悄悄换成演示模型
+   */
+  demoTag: '演示模型',
+  demoTagHint: '选择后执行时由演示模型产出，不调用真实模型',
 } as const
 
 /**
@@ -987,6 +998,8 @@ export const ASSISTANT_MODEL_TEXT = {
   note: '仅影响助手，不改变节点使用的模型。助手需要严格按格式输出，指令遵循能力较弱的模型可能无法生成工作流。',
   /** 存着的设定用不了时，齿轮按钮的悬停说明（按钮上另有一个红点） */
   broken: '助手使用的模型当前无法调用，点击查看原因',
+  /** 重新选择时保存失败：下拉退回选之前的样子（服务端存着的没变），在下面说明 */
+  saveFailed: '保存失败，助手使用的模型未更改',
 } as const
 
 /**

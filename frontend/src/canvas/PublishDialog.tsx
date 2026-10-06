@@ -12,7 +12,9 @@ import {
 import { useCatalog } from '../store/catalog'
 import { Modal, Spinner, toast, useRadioGroup } from '../components/ui'
 import { humanizeError } from '../lib/errors'
-import { CATALOG_UI_TEXT as UT, PUBLISH_FIX_TEXT as T, WORKFLOW_STATUS_HINT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import {
+  CATALOG_UI_TEXT as UT, PROVIDER_REF_TEXT, PUBLISH_FIX_TEXT as T, WORKFLOW_STATUS_HINT, WORKFLOW_STATUS_LABEL,
+} from '../lib/terms'
 import { isSqlCheckCode, sqlRuleLabel } from '../lib/sqlcheck'
 import { SqlLevelBadge } from '../run/SqlChecks'
 import { setLocalActor, useLocalActor } from '../lib/actor'
@@ -622,6 +624,14 @@ function FixControl({ fix, pf }: { fix: PublishFix; pf: PreflightState }) {
                      checked={picked(o.value)} disabled={pf.working} onChange={() => pf.choose(fix, o.value)} />
               <span className="min-w-0 [overflow-wrap:anywhere]">
                 {o.label}
+                {/* 修完以后落到演示类接入：说明里那半句是淡色小字、排在长句末尾，选项名旁另加醒目的标签 */}
+                {o.demo && (
+                  <span className="ml-1 whitespace-nowrap rounded border px-1 font-medium" data-fix-demo=""
+                        title={PROVIDER_REF_TEXT.demoTagHint}
+                        style={{ color: 'var(--warn)', borderColor: 'color-mix(in srgb, var(--warn) 45%, var(--border))' }}>
+                    {PROVIDER_REF_TEXT.demoTag}
+                  </span>
+                )}
                 {fix.default !== undefined && (fix.multiple
                   ? Array.isArray(fix.default) && fix.default.some((d) => same(d, o.value))
                   : same(fix.default, o.value)) && (

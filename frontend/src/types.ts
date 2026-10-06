@@ -1389,8 +1389,9 @@ export interface PublishFix {
   label: string
   preview?: { field?: string | null; before?: unknown; after?: unknown } | null
   /** handoff：选了这一项就是「交给 Copilot」（G4 的「它在做计算」）。只认这个标记，不认值——
-   *  别的选项拿节点 id 当值，节点 id 恰好叫 copilot 的报告撰写节点照样是普通候选 */
-  options?: { value: unknown; label: string; hint?: string | null; handoff?: boolean }[]
+   *  别的选项拿节点 id 当值，节点 id 恰好叫 copilot 的报告撰写节点照样是普通候选。
+   *  demo：点名的模型接入的候选，修完以后执行时落到演示类接入（不调用真实模型），选项名旁加醒目的标签 */
+  options?: { value: unknown; label: string; hint?: string | null; handoff?: boolean; demo?: boolean }[]
   multiple?: boolean
   /** 建议值：界面上标「建议」，仍然要人选 */
   default?: unknown

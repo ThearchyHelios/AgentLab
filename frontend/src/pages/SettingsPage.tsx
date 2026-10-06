@@ -575,10 +575,18 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
           />
         </div>
 
-        <label className="flex items-center gap-2 text-xs">
-          <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
-          启用<span className="text-2xs text-faint" data-provider-enabled-hint="">{PROVIDER_REF_TEXT.enabledHint}</span>
-        </label>
+        <div>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={form.enabled} aria-describedby="provider-enabled-hint"
+                   onChange={(e) => set({ enabled: e.target.checked })} />
+            启用
+          </label>
+          {/* 停用的后果另起一行写在复选框下面，不放进 label：放在里面时它和「启用」是并排的两个 flex 项，长说明会把「启用」
+              挤成上下两个字，读屏也把整句连着当成复选框的名字念 */}
+          <p id="provider-enabled-hint" className="mt-0.5 pl-5 text-2xs leading-snug text-faint" data-provider-enabled-hint="">
+            {PROVIDER_REF_TEXT.enabledHint}
+          </p>
+        </div>
 
         {blocked && <p className="text-2xs text-faint">还缺：{missing.join('、')}</p>}
 
