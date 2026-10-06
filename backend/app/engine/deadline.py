@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 from collections.abc import AsyncIterator
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -42,7 +43,7 @@ _SEGMENT: ContextVar[Segment | None] = ContextVar("agentlab_segment", default=No
 @contextlib.asynccontextmanager
 async def segment(deadline: float | None, seconds: float) -> AsyncIterator[None]:
     """runner 用：这一段执行的截止时刻（asyncio.Timeout.when()）和总时长，退出时清掉。写成异步的上下文管理器，好和
-    时长上限写在同一个 async with 里。deadline 为 None（没有上限）时什么都不放。"""
+    时长上限写在同一个 async with 里。deadline 为 None（没有上限）时放 None：里面看不到外面的截止时刻。"""
     token = _SEGMENT.set(Segment(float(deadline), float(seconds)) if deadline is not None else None)
     try:
         yield
@@ -81,13 +82,14 @@ def allot(timeout_s: float | None, *, grace: float) -> Allot:
     grace 是到点之后收尾那次调用的宽限（verify_agent.SETTLE_GRACE_S）。
 
     一项最坏要用「时长上限 + 收尾宽限」。剩下的时间先扣掉给下游的余量、再扣掉收尾宽限，就是这一项查库最多能用的时长：
-    比配置的短就收紧到它。收紧之后不到 min(配置的时长上限, 收尾宽限) 就不再开始：收尾宽限是留给一次模型调用的时间，
-    查库的时长比它还短，连一轮都做不完，只会白花一次收尾的钱、记成没能核查。配置的时长上限本来就比它短的，按配置的
-    整段算。没有上限时原样放行。"""
+    比配置的短就收紧到它（取到 0.1 秒，往下取：时间线上写「时长上限 69.7 秒」，不写一串小数）。收紧之后不到
+    min(配置的时长上限, 收尾宽限) 就不再开始：收尾宽限是留给一次模型调用的时间，查库的时长比它还短，连一轮都做不完，
+    只会白花一次收尾的钱、记成没能核查。配置的时长上限本来就比它短的，按配置的整段算；配置的是不限的，按收尾宽限算。
+    没有上限时原样放行。"""
     found = _SEGMENT.get()
     if found is None:
         return Allot(True, timeout_s)
-    room = found.deadline - _now() - reserve(found.seconds) - grace
+    room = math.floor((found.deadline - _now() - reserve(found.seconds) - grace) * 10) / 10
     limit = room if timeout_s is None else min(timeout_s, room)
     floor = grace if timeout_s is None else min(timeout_s, grace)
     if limit < floor:

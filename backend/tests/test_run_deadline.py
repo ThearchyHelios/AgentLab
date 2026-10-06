@@ -76,6 +76,16 @@ async def test_a_configured_limit_shorter_than_the_grace_runs_whole_or_not_at_al
         assert deadline.allot(10, grace=30.0) == deadline.Allot(False, None, seconds=600)
 
 
+async def test_a_tightened_limit_is_cut_to_a_tenth_of_a_second(clock):
+    """收紧到的时长取到 0.1 秒、往下取：时间线上写「时长上限 69.7 秒」，不写 69.7012；往下取不会超出算好的余量。"""
+    async with deadline.segment(clock.now + 159.7012, 600):
+        assert deadline.allot(90, grace=30.0).timeout_s == 69.7
+    async with deadline.segment(clock.now + 120.05, 600):
+        assert deadline.allot(90, grace=30.0).timeout_s == 30.0
+    async with deadline.segment(clock.now + 119.99, 600):
+        assert not deadline.allot(90, grace=30.0).start, "差一点也是不够：往下取之后不到 30 秒"
+
+
 async def test_an_unlimited_item_is_bounded_by_the_deadline(clock):
     """配置的是不限（None）：有截止时刻时照样按剩余时间收紧，不然它能一直查到运行被中止。"""
     async with deadline.segment(clock.now + 400, 600):
