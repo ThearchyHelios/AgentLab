@@ -49,9 +49,17 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
   const reloadGraph = useEvidence((s) => s.reloadGraph)
   const first = useRef(true)
   useEffect(() => {
-    if (first.current) { first.current = false; void loadGraph(run.id); return }
+    if (first.current) {
+      first.current = false
+      // 报告正文（成果区、审批卡里展开的那份）有运行就先取过证据图，取的时候运行可能还停在审批上、刚收尾还没封存：
+      // 运行已经结束、手里那份却说没封存时重取一次，不然这一页顶上一直写着尚未封存（之后没有新事件，refreshKey 不再变）
+      const held = useEvidence.getState().graphs[run.id]
+      if (held?.status === 'ok' && SETTLED.has(run.status) && !held.data?.seal?.sealed) void reloadGraph(run.id)
+      else void loadGraph(run.id)
+      return
+    }
     void reloadGraph(run.id)
-  }, [run.id, refreshKey, loadGraph, reloadGraph])
+  }, [run.id, run.status, refreshKey, loadGraph, reloadGraph])
   const audit = useAudit(run.id, refreshKey)
   const graph = graphSlot?.data
 

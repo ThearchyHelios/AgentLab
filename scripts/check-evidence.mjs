@@ -87,8 +87,11 @@ function judgeReply(set, body) {
  * 三节都不画，只看 DOM 的断言不论前端发没发请求都会过。推断来源夹具的运行按 provenance[<片段>] 作答，其余一律回
  * 可识别的哨兵（418，harness_unexpected_provenance），界面会画出「未能获取推断的来源」。prov 给了就由它改答复
  * （prov(运行, 片段, 默认答复) → {status?, json} 或它的 Promise：延迟、出错、老服务端）
+ *
+ * 期 4：graph 给了就由它改四期夹具（结论句裁判那几份）的证据图答复（graph(夹具, 证据图拷贝) → 证据图），并把每次请求
+ * 记成 graph:<运行>（数得出同一次运行取了几回）；不给时照夹具答、不记
  */
-async function routed(page, { judge = null, segPatch = null, prov = null } = {}) {
+async function routed(page, { judge = null, segPatch = null, prov = null, graph = null } = {}) {
   const hits = []
   const judged = new Set()
   await page.route((u) => new URL(u).pathname.startsWith('/api/'), async (r) => {
@@ -152,7 +155,11 @@ async function routed(page, { judge = null, segPatch = null, prov = null } = {})
         return body ? r.fulfill({ json: body })
           : r.fulfill({ status: 404, json: { detail: '报告中没有这个片段', code: 'evidence_segment_not_found' } })
       }
-      if (/\/evidence$/.test(url.pathname)) return r.fulfill({ json: jset.graph })
+      if (/\/evidence$/.test(url.pathname)) {
+        if (!graph) return r.fulfill({ json: jset.graph })
+        hits.push(`graph:${jset.run_id}`)
+        return r.fulfill({ json: graph(jset, structuredClone(jset.graph)) })
+      }
       if (url.pathname.endsWith(`/runs/${jset.run_id}`)) {
         hits.push(`run:${jset.run_id}`)
         return r.fulfill({ json: { id: jset.run_id, run_class: jset.run_class, status: 'succeeded' } })
@@ -182,14 +189,17 @@ async function routed(page, { judge = null, segPatch = null, prov = null } = {})
   return hits
 }
 
-async function open(url, { w = 1280, h = 1000, reduced = false, patchQuery = null, judge = null, segPatch = null, prov = null } = {}) {
+async function open(url, { w = 1280, h = 1000, reduced = false, patchQuery = null, judge = null, segPatch = null, prov = null,
+  graph = null, before = null } = {}) {
   const ctx = await browser.newContext({ viewport: { width: w, height: h }, ...(reduced ? { reducedMotion: 'reduce' } : {}) })
   const page = await ctx.newPage()
   // 找不到元素时 8 秒就报，不等默认的 30 秒：改坏验证时一节里十几处都找不到
   page.setDefaultTimeout(8000)
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
-  const hits = await routed(page, { judge, segPatch, prov })
+  const hits = await routed(page, { judge, segPatch, prov, graph })
+  // 打开页面之前再挂的路由（排在 routed 前面，认不出的交回 routed）：报告一挂上就取这次运行的证据图，换答复得赶在那之前
+  if (before) await before(page)
   // 预览页直接 import 第二期夹具（vite 把 JSON 当模块给）：要一份改过的文档时把那个模块换掉
   if (patchQuery) {
     await page.route((u) => new URL(u).pathname.endsWith('/run/__tests__/evidence-query.json'), (r) =>
@@ -580,16 +590,15 @@ await section('integrity', '证据接口复核出问题：醒目写出来，不�
 })
 
 /**
- * 组件预览页，片段接口按 answer(segId, 夹具里那一份的拷贝) 回：返回对象就当 200，返回数字
- * 就当那个状态码。证据图按 graph(夹具拷贝) 回
+ * 组件预览页，一期夹具那份报告（#evidence-wide）的片段接口按 answer(segId, 夹具里那一份的拷贝) 回：返回对象就当 200，
+ * 返回数字就当那个状态码。它的证据图按 graph(夹具拷贝) 回。在打开页面之前挂上：报告一挂上就会取证据图（期 4 起正文
+ * 要它带的反方审稿标记），换答复晚了，取回来缓存住的就是换之前那一份。别的请求照 routed 答
  */
 async function probe(answer, { graph = (g) => g } = {}) {
-  const r = await open('/ui-harness.html?evidence=1')
-  await r.page.unroute((u) => new URL(u).pathname.startsWith('/api/'))
-  await r.page.route((u) => new URL(u).pathname.startsWith('/api/'), (route) => {
+  return open('/ui-harness.html?evidence=1', { before: (page) => page.route((u) => new URL(u).pathname.startsWith('/api/'), (route) => {
     const req = route.request()
-    if (req.method() !== 'GET') return route.abort()
     const path = new URL(req.url()).pathname
+    if (req.method() !== 'GET' || !path.startsWith(`/api/runs/${fx.run_id}/`)) return route.fallback()
     const m = path.match(/\/evidence\/segments\/([^/]+)$/)
     if (m) {
       const body = answer(m[1], structuredClone(fx.segments[m[1]] ?? {}))
@@ -598,9 +607,8 @@ async function probe(answer, { graph = (g) => g } = {}) {
         : route.fulfill({ json: body })
     }
     if (/\/evidence$/.test(path)) return route.fulfill({ json: graph(structuredClone(fx.graph)) })
-    return route.continue()
-  })
-  return r
+    return route.fallback()
+  }) })
 }
 const sealOf = async (p) => ({
   state: await p.locator('[data-evidence-panel] [data-ev-seal-state]').getAttribute('data-ev-seal-state').catch(() => null),
@@ -3582,6 +3590,221 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
     check(`${w}px：没有运行时报错`, c.errors.length === 0, c.errors.join(' | '))
     await c.ctx.close()
   }
+})
+
+// ---------------------------------------------------------------- 期 4：正文里被反方审过的句子
+
+/**
+ * 证据图带的被反方审过的句子（服务端 _challenge_verdicts，{句子: 判断}）：没开裁判的那份挂在纯文字的结论句（u2、u4、u6
+ * 一个可点的片段都没有）和带数字的句子（u3）上；正式运行那份和裁判的徽标并在一起；探索运行那份的证据图说的是另一稿
+ * （工件 id 对不上），一个都不该挂
+ */
+const MARKS = {
+  plain: { u2: 'refuted', u3: 'weakened', u4: 'inconclusive', u6: 'stands' },
+  formal: { [fxj.formal.units.bad]: 'refuted', [fxj.formal.units.ok]: 'stands', [fxj.formal.units.limit]: 'inconclusive' },
+  explore: { [fxj.explore.units.ok]: 'refuted' },
+}
+/**
+ * 片段接口答的 unit.challenge 里整份报告的计数：没开裁判的那份无法判断 1 句、未能反查 1 句（无法判断的就是没反查成的）；
+ * 正式运行那份无法判断 2 句、未能反查 1 句（说不准是哪一句）
+ */
+const MARK_COUNTS = {
+  plain: { counts: { stands: 1, weakened: 1, refuted: 1, inconclusive: 1 }, unreviewed: 1 },
+  formal: { counts: { stands: 1, weakened: 0, refuted: 1, inconclusive: 2 }, unreviewed: 1 },
+}
+const markSet = (jset) => (jset === fxj.plain ? 'plain' : jset === fxj.formal ? 'formal' : jset === fxj.explore ? 'explore' : '')
+const markGraph = (jset, g) => {
+  const key = markSet(jset)
+  if (!key) return g
+  g.reports[0].challenge_verdicts = MARKS[key]
+  if (key === 'explore') g.reports[0].doc_artifact = 'e0'.repeat(32)
+  return g
+}
+const markSeg = (jset, body) => {
+  const key = markSet(jset)
+  const verdict = MARKS[key]?.[body.unit?.id]
+  if (verdict && MARK_COUNTS[key]) {
+    body.unit.challenge = { verdict, node_id: 'chal', artifact: CH_ART, on_refuted: 'degrade', report_label: '写周报', ...MARK_COUNTS[key] }
+  }
+  return body
+}
+/** 半透明的前景叠在底色上之后的颜色（rgb 字符串），量对比度用 */
+function blendOver(fg, bg, alpha) {
+  const nums = (c) => (c.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number)
+  const [f, b] = [nums(fg), nums(bg)]
+  return `rgb(${f.map((v, i) => Math.round(v * alpha + b[i] * (1 - alpha))).join(', ')})`
+}
+
+await section('marks', '期 4：被反方审过的句子在正文里挂句末标记——和裁判徽标并在一起、点开是整句面板、不逐句请求', async () => {
+  const r = await open('/ui-harness.html?evidence=1', { graph: markGraph, segPatch: markSeg })
+  const pg = r.page
+  await pg.waitForSelector(`${JP} [data-ev-challenge-mark]`, { timeout: 5000 }).catch(() => {})
+  // 正文一挂上、一处都没点：不请求片段接口；证据图每次运行只取一回（正式运行那份宽窄各摆一份也一样）
+  const segHits = () => r.hits.filter((h) => h.startsWith('j:'))
+  const graphs = (run) => r.hits.filter((h) => h === `graph:${run}`).length
+  check('一处都没点：没有逐句请求片段接口，证据图每次运行只取一回', segHits().length === 0
+    && graphs(fxj.plain.run_id) === 1 && graphs(fxj.formal.run_id) === 1,
+  `${segHits().join(',')} ｜ ${r.hits.filter((h) => h.startsWith('graph:')).join(',')}`)
+
+  const look = await pg.evaluate((sel) => [...document.querySelectorAll(`${sel} [data-ev-claim]`)].map((el) => {
+    const mark = el.querySelector('[data-ev-challenge-look]')
+    return { unit: el.getAttribute('data-ev-claim'), verdict: el.getAttribute('data-ev-verdict'),
+             mark: el.getAttribute('data-ev-challenge-mark'), look: mark?.getAttribute('data-ev-challenge-look') ?? null,
+             text: el.textContent ?? '', color: mark ? getComputedStyle(mark).color : '', icon: !!mark?.querySelector('svg'),
+             label: el.getAttribute('aria-label'), title: el.getAttribute('title'), tag: el.tagName, type: el.getAttribute('type') }
+  }), JP)
+  const by = Object.fromEntries(look.map((x) => [x.unit, x]))
+  check('没开裁判的报告：被审过的四句都挂了标记（纯文字的结论句、带数字的句子都有），没被审的不挂',
+    JSON.stringify(Object.keys(by).sort()) === JSON.stringify(['u2', 'u3', 'u4', 'u6'])
+      && look.every((x) => x.mark === MARKS.plain[x.unit] && x.verdict === null && x.tag === 'BUTTON' && x.type === 'button'),
+    JSON.stringify(look.map((x) => [x.unit, x.mark, x.verdict])))
+  const [failedC, waitingC, faintC] = await Promise.all(['--st-failed', '--st-waiting', '--text-faint'].map((t) => colorOf(pg, t)))
+  check('被推翻、被削弱醒目：盾牌图标加判断两个字，失败色、提醒色', by.u2?.look === 'loud' && by.u2.text.includes('被推翻')
+    && by.u2.color === failedC && by.u2.icon && by.u3?.look === 'loud' && by.u3.text.includes('被削弱') && by.u3.color === waitingC
+    && by.u3.icon, JSON.stringify([by.u2, by.u3]))
+  check('经受住、无法判断低调：只有淡色的盾牌图标，不写字', ['u4', 'u6'].every((k) => by[k]?.look === 'quiet' && by[k].icon
+    && !by[k].text.trim() && by[k].color === faintC), JSON.stringify([by.u4, by.u6]))
+  check('读屏名写明句子和反方审稿的判断，悬停写明是反方模型的判断',
+    by.u2?.label === '结论句「增长主要来自新客首单，老客复购持平。」，反方审稿：被推翻'
+      && by.u2?.title === '反方审稿：被推翻（反方模型的判断，并非系统核对）', `${by.u2?.label} ｜ ${by.u2?.title}`)
+
+  const both = await pg.evaluate(({ sel, unit }) => {
+    const els = document.querySelectorAll(`${sel} [data-ev-claim="${unit}"]`)
+    const el = els[0]
+    return { n: els.length, verdict: el?.getAttribute('data-ev-verdict'), mark: el?.getAttribute('data-ev-challenge-mark'),
+             text: el?.textContent ?? '', label: el?.getAttribute('aria-label'), title: el?.getAttribute('title') ?? '' }
+  }, { sel: J, unit: fxj.formal.units.bad })
+  check('正式运行：有裁判徽标的句子并在一个徽标里，不挂两个', both.n === 1 && both.verdict === 'unsupported' && both.mark === 'refuted'
+    && both.text.startsWith('!') && both.text.includes('被推翻'), JSON.stringify(both))
+  check('……读屏名、悬停说明两样都说', both.label === '结论句「增长主要来自新客首单，老客复购持平。」，模型判断：证据不支持，反方审稿：被推翻'
+    && both.title.startsWith('模型判断：证据不支持') && both.title.endsWith('反方审稿：被推翻（反方模型的判断，并非系统核对）'),
+  `${both.label} ｜ ${both.title}`)
+  check('……两份报告仍各只占一个 Tab 位', await pg.locator(`${JP} [data-seg][tabindex="0"], ${JP} [data-ev-claim][tabindex="0"]`).count() === 1
+    && await pg.locator(`${J} [data-seg][tabindex="0"], ${J} [data-ev-claim][tabindex="0"]`).count() === 1)
+  check('证据图说的是另一稿（工件 id 对不上）：一个标记都不挂', await pg.locator(`${JX} [data-ev-challenge-mark]`).count() === 0)
+
+  // 键盘：没有可点片段的那句，标记就是它在键盘顺序里的位置；回车打开整句面板，Esc 回到标记
+  await pg.locator(`${JP} [data-seg="s8"]`).focus()
+  await pg.keyboard.press('ArrowDown')
+  check('↓ 从上一句走到只有标记的那一句', await activeKey(pg) === 'claim:u2', await activeKey(pg))
+  await pg.keyboard.press('Enter')
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-challenge]', { timeout: 4000 }).catch(() => {})
+  const p = panel(pg)
+  const block = p.locator('[data-ev-challenge]')
+  const blockText = (await block.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('回车打开整句面板：标题是这一句，「反方审稿」一节写被推翻（单句展示）',
+    (await p.locator('h3').innerText().catch(() => '')).trim() === '增长主要来自新客首单，老客复购持平。'
+      && await block.getAttribute('data-ev-challenge').catch(() => null) === 'refuted'
+      && await block.locator('[data-challenge-scope="claim"]').count() === 1, blockText)
+  check('……只请求了这一句的一个片段', JSON.stringify(segHits()) === JSON.stringify(['j:s11']), segHits().join(','))
+  check('……标记标着展开了面板', await pg.locator(`${JP} [data-ev-claim="u2"]`).getAttribute('aria-expanded') === 'true')
+  check('……读屏从 live region 听到这一句的反方审稿判断',
+    (await pg.locator(`${JP} [aria-live="polite"]`).first().innerText()).includes('反方审稿：被推翻'))
+  check('……判断不是无法判断：不说未能反查', await p.locator('[data-challenge-unreviewed]').count() === 0)
+  await pg.keyboard.press('Escape')
+  await pg.waitForTimeout(150)
+  check('Esc 关掉，焦点回到标记', await panel(pg).count() === 0 && await activeKey(pg) === 'claim:u2', await activeKey(pg))
+
+  // 判为无法判断的句子：这份报告无法判断的全是没反查成的，就说这一句未能反查；还有查过了、数据不够的，说可能在其中
+  await pg.locator(`${JP} [data-ev-claim="u4"]`).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-challenge-unreviewed]', { timeout: 4000 }).catch(() => {})
+  const sure = p.locator('[data-challenge-unreviewed]')
+  const sureText = (await sure.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('无法判断、而无法判断的全是没反查成的：说这一句未能反查', await sure.getAttribute('data-challenge-unreviewed').catch(() => null) === 'claim'
+    && sureText.startsWith('这一句未能反查，已记为无法判断。反查没有完成'), sureText)
+  await badge(pg, J, fxj.formal.units.limit).click()
+  await pg.waitForSelector('[data-evidence-panel] [data-ev-challenge="inconclusive"] [data-challenge-unreviewed]', { timeout: 4000 })
+    .catch(() => {})
+  const maybe = p.locator('[data-challenge-unreviewed]')
+  const maybeText = (await maybe.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('……无法判断的还有查过了、数据不够的：说这份报告几句未能反查、这一句可能在其中',
+    await maybe.getAttribute('data-challenge-unreviewed').catch(() => null) === 'maybe'
+      && maybeText.startsWith('这份报告有 1 句未能反查，已记为无法判断，这一句可能在其中'), maybeText)
+  await pg.keyboard.press('Escape')
+  await pg.waitForTimeout(120)
+
+  for (const theme of ['light', 'dark']) {
+    await pg.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+    await pg.waitForTimeout(100)
+    const pairs = await pg.evaluate((sel) => [...document.querySelectorAll(`${sel} [data-ev-challenge-look]`)].map((el) => {
+      const back = (node) => {
+        for (let n = node; n; n = n.parentElement) {
+          const c = getComputedStyle(n).backgroundColor
+          if (c && !/rgba\(0, 0, 0, 0\)|transparent/.test(c)) return c
+        }
+        return getComputedStyle(document.body).backgroundColor
+      }
+      return { loud: el.getAttribute('data-ev-challenge-look') === 'loud', fg: getComputedStyle(el).color, bg: back(el) }
+    }), JP)
+    const worst = (loud) => Math.min(...pairs.filter((x) => x.loud === loud).map((x) => contrastOf(x.fg, x.bg)))
+    check(`${theme}：醒目的标记（带字）对比度 ≥ 4.5，低调的图标 ≥ 3`, pairs.length === 4 && worst(true) >= 4.5 && worst(false) >= 3,
+      `${worst(true).toFixed(2)} / ${worst(false).toFixed(2)}`)
+  }
+  await pg.evaluate(() => document.documentElement.removeAttribute('data-theme'))
+  const narrow = await pg.evaluate(() => {
+    const el = document.querySelector('#evidence-judge-narrow')
+    return el ? el.scrollWidth - el.clientWidth : 99
+  })
+  check('360px 画布右栏那份（并在一起的徽标）不撑出横向滚动', narrow <= 0, `${narrow}px`)
+  check('没有运行时报错', r.errors.length === 0, r.errors.join(' | '))
+  await r.ctx.close()
+
+  const n = await open('/ui-harness.html?evidence=1', { graph: markGraph, segPatch: markSeg, w: 390, h: 844 })
+  await n.page.waitForSelector(`${JP} [data-ev-challenge-mark]`, { timeout: 5000 }).catch(() => {})
+  await n.page.locator(`${JP} [data-ev-claim="u2"]`).click()
+  await n.page.waitForSelector('[data-evidence-panel] [data-ev-challenge]', { timeout: 4000 }).catch(() => {})
+  const wide390 = await n.page.evaluate(() => {
+    const doc = document.querySelector('#evidence-judge-plain')
+    const el = document.querySelector('[data-evidence-panel]')
+    return { doc: doc ? doc.scrollWidth - doc.clientWidth : 99, panel: el ? el.scrollWidth - el.clientWidth : 99 }
+  })
+  check('390px：带标记的报告、点开的整句面板都不横向溢出', wide390.doc <= 0 && wide390.panel <= 1, JSON.stringify(wide390))
+  check('390px：没有运行时报错', n.errors.length === 0, n.errors.join(' | '))
+  await n.ctx.close()
+})
+
+await section('ask', '期 4：句末「质询」图标平时的对比度——深浅两套、页面底色和面板底色上都 ≥ 3:1，显出来时不撑开排版', async () => {
+  // 平时是淡淡的一个小图标（字色压一层不透明度），可 WCAG 1.4.11 要求界面组件对背景 ≥ 3:1（以前最淡的字色压到 60%，深色
+  // 约 2.75、浅色约 2.33）。用例 evidence-ask（dev/fixtures/evidence_ask.tsx）：同一份报告摆在页面底色（同审批卡）和面板
+  // 底色（同证据页）上，深浅两套各量一遍，按叠上不透明度之后的颜色算
+  const r = await open('/preview.html?syn=evidence-ask')
+  const pg = r.page
+  await pg.waitForSelector('[data-ask-on="panel"] [data-inquiry-ask]')
+  await pg.mouse.move(1, 1)
+  await pg.evaluate(() => document.activeElement?.blur?.())
+  for (const theme of ['dark', 'light']) {
+    await pg.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+    await pg.waitForTimeout(120)
+    for (const [on, name] of [['bg', '页面底色'], ['panel', '面板底色']]) {
+      const m = await pg.evaluate((box) => [...document.querySelectorAll(`[data-ask-on="${box}"] [data-inquiry-ask]`)].map((b) => {
+        const back = (node) => {
+          for (let n = node; n; n = n.parentElement) {
+            const c = getComputedStyle(n).backgroundColor
+            if (c && !/rgba\(0, 0, 0, 0\)|transparent/.test(c)) return c
+          }
+          return getComputedStyle(document.body).backgroundColor
+        }
+        const cs = getComputedStyle(b)
+        return { fg: cs.color, opacity: Number(cs.opacity), bg: back(b) }
+      }), on)
+      const ratios = m.map((x) => contrastOf(blendOver(x.fg, x.bg, x.opacity), x.bg))
+      const worst = Math.min(...ratios)
+      check(`${theme} · ${name}：平时的「质询」图标对比度 ≥ 3:1`, m.length >= 3 && worst >= 3 && m.every((x) => x.opacity < 1),
+        `${worst.toFixed(2)}（${m[0]?.fg} × ${m[0]?.opacity} on ${m[0]?.bg}）`)
+    }
+  }
+  await pg.evaluate(() => document.documentElement.removeAttribute('data-theme'))
+  // 悬停一句时显出来：只换颜色、描边和不透明度，宽度、位置不变
+  const btn = pg.locator('[data-ask-on="panel"] [data-inquiry-ask]').first()
+  const rest = await btn.boundingBox()
+  await pg.locator('[data-ask-on="panel"] [data-ev-unit]').first().hover()
+  await pg.waitForTimeout(150)
+  const shown = await btn.boundingBox()
+  const opacity = await btn.evaluate((el) => getComputedStyle(el).opacity)
+  check('悬停这一句：图标显出来（不透明），宽度、位置不变，不撑开排版', opacity === '1' && !!rest && !!shown
+    && Math.abs(rest.width - shown.width) < 0.5 && Math.abs(rest.x - shown.x) < 0.5, JSON.stringify({ rest, shown, opacity }))
+  check('没有运行时报错', r.errors.length === 0, r.errors.join(' | '))
+  await r.ctx.close()
 })
 
 check('没有运行时报错（组件预览）', harness.errors.length === 0, harness.errors.join(' | '))
