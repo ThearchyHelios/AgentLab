@@ -3511,7 +3511,7 @@ export const INQUIRY_TEXT = {
     const chars = [...question.trim()]
     return `质询「${chars.join('')}${chars.length >= 40 ? '…' : ''}」的回答`
   },
-  /** 没记问题摘要的（这一版之前存的）：照报告文档的说法写装的是什么 */
+  /** meta 里没有问题摘要时的说法（服务端照理都会记，这里兜底）：照报告文档那一句写装的是什么 */
   artifactAboutNone: '审批质询的回答：逐段的片段和每个数字的出处',
 }
 
