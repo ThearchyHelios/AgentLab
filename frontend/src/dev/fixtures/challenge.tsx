@@ -31,8 +31,9 @@ import fx from './challenge.json'
  *   卡上按「无法判断」的句数说，两个数不打架
  * - ?syn=challenge-approval-offpath：正式运行，按降档处置，但反方审稿不在带出具契约的成果节点上游（degrades 为假）
  * - ?syn=challenge-summary-given：反方审稿那一块单独画，审批自带的运行类别（正式运行）由调用方传进来；检查脚本让这次运行的
- *   GET 失败，卡上照样写「出具会降档」，也不另发这次请求。审批卡（RunPanel 的 ApprovalCard）把 approval.run_class
- *   传给它之后，卡上走的就是这条路
+ *   GET 失败（500），卡上照样写「出具会降档」，也不另发这次请求
+ * - ?syn=challenge-approval-given：同一次运行（GET 同样 500），整张审批卡（RunPanel 的 ApprovalCard）：审批带着
+ *   run_class，卡把它传给反方审稿那一块，照它说出具、不另取
  * - ?syn=challenge-approval-dup：同 many，工件里补出来的一句和条目里的一句原文相同、unit 不同（工件由检查脚本合成）
  * - ?syn=challenge-approval-norecord：同 many，审稿记录没存上（artifact 为 null）
  *
@@ -68,9 +69,8 @@ function Card({ approval, name, dense = false }: { approval: Approval; name: str
 }
 
 const RUNS = fx.runs
-/** 期 4 起服务端另带的两项：unreviewed（没能反查的句数）、degrades（被推翻的会不会让出具降档） */
-type Challenge = ApprovalChallenge & { unreviewed?: number; degrades?: boolean }
-const withChallenge = (c: Partial<Challenge>): ApprovalReport => ({ ...report, challenge: { ...challenge, ...c } as ApprovalChallenge })
+/** 期 4 起服务端另带的两项（unreviewed 没能反查的句数、degrades 被推翻的会不会让出具降档）类型里都有，按需盖上 */
+const withChallenge = (c: Partial<ApprovalChallenge>): ApprovalReport => ({ ...report, challenge: { ...challenge, ...c } })
 const many = fx.many as unknown as ApprovalChallenge
 /** 没有被推翻的结论：同第一个用例去掉被推翻的那句，计数跟着改 */
 const clear: Partial<ApprovalChallenge> = {
@@ -82,7 +82,7 @@ const clear: Partial<ApprovalChallenge> = {
  * 记为无法判断，unreviewed 不会多于 inconclusive）。原来无法判断的 u11 是查过了、数据不够，不算未能反查
  */
 const UNREVIEWED_UNITS = ['u5', 'u8']
-const unreviewed: Partial<Challenge> = {
+const unreviewed: Partial<ApprovalChallenge> = {
   counts: { stands: 0, weakened: 0, refuted: 1, inconclusive: 3 },
   items: challenge.items.map((it) => (UNREVIEWED_UNITS.includes(it.unit) ? { ...it, verdict: 'inconclusive' } : it)),
   artifact: 'f'.repeat(64),
@@ -244,6 +244,10 @@ export const cases: Record<string, () => JSX.Element> = {
     <div className="mx-auto max-w-3xl p-4" data-fixture="challenge-summary-given">
       <ChallengeSummary reports={[withChallenge({ degrades: true })]} runId={RUNS.given} runClass="formal" />
     </div>
+  ),
+  'challenge-approval-given': () => (
+    <Card name="challenge-approval-given"
+          approval={approvalOf('ap-chal-17', RUNS.given, 'formal', withChallenge({ degrades: true }))} />
   ),
   'challenge-approval-offpath': () => (
     <Card name="challenge-approval-offpath"

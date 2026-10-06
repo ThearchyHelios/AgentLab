@@ -157,7 +157,7 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
 
       <ApprovalReports reports={reports} runId={approval.run_id} runClass={approval.run_class}
                        approvalId={approval.id} askable={approval.status === 'pending'} />
-      <ChallengeSummary reports={reports} runId={approval.run_id} />
+      <ChallengeSummary reports={reports} runId={approval.run_id} runClass={approval.run_class} />
 
       {payload.tool && (
         <div className="mb-2 rounded border bg-bg p-2">

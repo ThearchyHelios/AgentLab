@@ -20,8 +20,8 @@
 //   真写一遍的结果）；没有合并预告时按其余指标当前的选择推，被目录挡下的同项指标也算进来（说法不同就说都不记，说不准的
 //   只说可能），结尾换成以时间线上的记录为准；盲算的理由按核查 agent 组装的理由文档画，有出处的数字画实线、裸数字醒目
 //   标出，老工件照旧纯文本；
-// - 出具缺口：证据页（真的 EvidencePane）和成果节点印章的悬停说明把双盲复算、反方审稿报上来的缺口另起「核查未通过」
-//   「核查未完成」两组，不放在「校验未全部完成」下；
+// - 出具缺口：证据页的出具横幅（真的 EvidencePane 里那一个 IssuanceBanner，和问数据、画布右栏同一个）和成果节点印章的
+//   悬停说明把双盲复算、反方审稿报上来的缺口另起「核查未通过」「核查未完成」两组，不放在「校验未全部完成」下；
 // - 记录页的工件列表：双盲复算对照、反方审稿记录两种工件有名字和说明，不露键名；
 // - 检查器：口径卡、指标、口径说明、盲算模型、相对误差、未采用原流程时、启用，每一项都真的写进节点配置；字段的
 //   叫法和服务端校验报错里的（engine/labels.py 的 DUAL_CHECK_FIELD_LABEL）一字不差；选口径卡、盲算模型、启用三态用的是
@@ -1098,11 +1098,12 @@ await section('审批卡：390px 不横向溢出、窄栏里上下排、深浅�
   await shot(rail.page, 'approval-rail-dark')
 })
 
-await section('出具缺口：证据页、成果节点的印章把核查报上来的缺口另起两组，不放在「校验未全部完成」下', async () => {
+await section('出具缺口：证据页的出具横幅、成果节点的印章把核查报上来的缺口另起两组，不放在「校验未全部完成」下', async () => {
   // 双盲复算、反方审稿报上来的缺口（出具契约加了「双盲复算「节点名」：」「反方审稿：」的前缀）以前和「叙述模板渲染为空」
-  // 一起列在「校验未全部完成」下。证据页（真的 EvidencePane）在出具横幅下面另起「核查未通过」（两路不一致、结论被推翻）
-  // 「核查未完成」（无法复算）两组，横幅里只留校验没做完的；成果节点印章的悬停说明同样分组、同样的先后。用例
-  // verify-gaps（dev/fixtures/dual_check.tsx）：缺口的先后照服务端，核查的和别的混在一起；证据图、审计接口在这里伪造
+  // 一起列在「校验未全部完成」下。证据页（真的 EvidencePane）的出具横幅里另起「核查未通过」（两路不一致、结论被推翻）
+  // 「核查未完成」（无法复算）两组，排在「校验未全部完成」上面，那一组只留校验没做完的；横幅外面不再另列一遍。成果节点
+  // 印章的悬停说明同样分组、同样的先后。用例 verify-gaps（dev/fixtures/dual_check.tsx）：缺口的先后照服务端，核查的和
+  // 别的混在一起；证据图、审计接口在这里伪造
   const RUN = 'run-verify-gaps'
   const FAILED = ['双盲复算「复核周报口径」：指标「销售额」两路结果不一致，审核人选择了盲算结果', '反方审稿：推翻了 1 句结论：「东区增长主要来自新客」']
   const UNFINISHED = ['双盲复算「复核周报口径」：指标「订单数」无法复算：输入来自合并查询，无法单独复算']
@@ -1118,17 +1119,24 @@ await section('出具缺口：证据页、成果节点的印章把核查报上�
   for (const [width, theme] of [[1280, 'dark'], [390, 'dark'], [390, 'light']]) {
     const what = `${width}px（${theme}）`
     const { page, errors } = await preview('verify-gaps', { extra, width, height: 900, theme })
-    await page.waitForSelector('[data-evidence-verify-gaps]')
-    const groups = await page.evaluate(() => [...document.querySelectorAll('[data-evidence-verify-group]')].map((g) => ({
-      kind: g.dataset.evidenceVerifyGroup, head: g.firstElementChild?.textContent.trim(),
+    await page.waitForSelector('[data-evidence-issuance] [data-issuance-banner] [data-issuance-verify-gaps]')
+    const groups = await page.evaluate(() => [...document.querySelectorAll('[data-evidence-issuance] [data-issuance-banner] '
+      + ':is([data-issuance-verify-gaps], [data-issuance-gaps])')].map((g) => ({
+      kind: g.dataset.issuanceVerifyGaps ?? 'other', head: g.firstElementChild?.textContent.trim(),
       items: [...g.querySelectorAll('li')].map((li) => li.textContent.replace(/^·\s*/, '').trim()),
     })))
-    check(`${what} 证据页：横幅下面另起两组，先「核查未通过」（两路不一致、被推翻），再「核查未完成」（无法复算）`,
-      JSON.stringify(groups) === JSON.stringify([{ kind: 'failed', head: '核查未通过', items: FAILED },
-        { kind: 'unfinished', head: '核查未完成', items: UNFINISHED }]), JSON.stringify(groups))
+    check(`${what} 证据页：出具横幅里先「核查未通过」（两路不一致、被推翻），再「核查未完成」（无法复算），最后「校验未全部完成」`,
+      JSON.stringify(groups) === JSON.stringify([{ kind: 'failed', head: '核查未通过：', items: FAILED },
+        { kind: 'unfinished', head: '核查未完成：', items: UNFINISHED }, { kind: 'other', head: '校验未全部完成：', items: OTHER }]),
+      JSON.stringify(groups))
     const banner = await page.locator('[data-evidence-issuance] [data-issuance-gaps] li').evaluateAll(items)
     check(`${what} ……横幅的「校验未全部完成」里只剩校验没做完的那条`, JSON.stringify(banner) === JSON.stringify(OTHER)
       && (await text(page.locator('[data-evidence-issuance] [data-issuance-gaps]'))).startsWith('校验未全部完成'), JSON.stringify(banner))
+    const outside = await page.evaluate((all) => [...document.querySelectorAll('[data-evidence-issuance] li')]
+      .filter((li) => !li.closest('[data-issuance-banner]') && all.some((g) => li.textContent.includes(g))).length,
+    [...FAILED, ...UNFINISHED])
+    check(`${what} ……横幅外面不再另列一遍核查的缺口`, outside === 0 && await page.locator('[data-evidence-verify-gaps]').count() === 0,
+      `${outside} 条`)
     // 成果节点的印章：悬停说明里核查的两组排在「校验未全部完成」前面，各组只列自己的
     const stamp = page.locator('.react-flow__node[data-id="done"] .nc-stamp')
     await stamp.waitFor()
@@ -1140,8 +1148,7 @@ await section('出具缺口：证据页、成果节点的印章把核查报上�
       && at('核查未通过：') < at('核查未完成：') && at('核查未完成：') < at('校验未全部完成：'), lines.join(' / '))
     const w = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
     check(`${what}：证据页不横向溢出`, w <= 0, `${w}px`)
-    const c = await page.evaluate(() => {
-      const box = document.querySelector('[data-evidence-verify-gaps]')
+    const cs = await page.evaluate(() => [...document.querySelectorAll('[data-evidence-issuance] [data-issuance-verify-gaps]')].map((box) => {
       const bgOf = (el) => {
         for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
           const v = getComputedStyle(n).backgroundColor
@@ -1150,9 +1157,10 @@ await section('出具缺口：证据页、成果节点的印章把核查报上�
         return 'rgba(0, 0, 0, 0)'
       }
       return { fg: getComputedStyle(box).color, bg: bgOf(box), base: getComputedStyle(document.body).backgroundColor }
-    })
-    const ratio = contrast(c.fg, c.bg, c.base)
-    check(`${what}：核查那两组的字对比度 ≥ 4.5`, ratio >= 4.5, `${ratio.toFixed(2)}（${c.fg} on ${c.bg}）`)
+    }))
+    const ratios = cs.map((c) => contrast(c.fg, c.bg, c.base))
+    check(`${what}：核查那两组的字对比度 ≥ 4.5`, ratios.length === 2 && ratios.every((r) => r >= 4.5),
+      cs.map((c, i) => `${ratios[i].toFixed(2)}（${c.fg} on ${c.bg}）`).join('；'))
     await shot(page, `verify-gaps-${width}-${theme}`)
     check(`${what}：页面没有报错`, errors.length === 0, errors.join('；'))
   }

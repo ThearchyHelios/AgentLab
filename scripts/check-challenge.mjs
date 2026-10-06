@@ -3,7 +3,8 @@
 //
 // 守的是这些「看着没坏、其实用不了」的地方：概况的句数和条目对不上、有被推翻的结论却不提醒降档（或者原因只藏在悬停里）、
 // 没有被推翻的结论也写降档、只标注时也写降档、探索运行里说出具、运行类别取不到时说起出具（取不到就不知道是不是正式
-// 运行，一句和出具有关的话都不说，窗口重新拿到焦点时再取）、审批带着运行类别时还另取一次（取失败了降档提示就没了）、
+// 运行，一句和出具有关的话都不说，窗口重新拿到焦点时再取）、审批带着运行类别时还另取一次（取失败了降档提示就没了；
+// 整张审批卡得把 approval.run_class 交给反方审稿那一块）、
 // 反方审稿不在出具路径上（服务端的 degrades 为假）还写降档、说明里用「本节点」（画在审批卡上，读着像审批节点）、
 // 反查没完成的几句混在「无法判断」里看不出来（或者比「无法判断」还多、插在降档标记和它的说明中间）、
 // 没经过反方审稿的报告也冒出一块空框（或者白发一次请求）、点开一句不取工件（或者每点一句取一次）、理由里的数字看不出引用了哪次查询、
@@ -43,7 +44,7 @@ const DUP_CONTENT = {
   claims: fx.artifacts[MANY].claims.map((c) => (c.unit === 'u30' ? { ...c, text: fx.many.items.find((it) => it.unit === 'u20').text } : c)),
 }
 const RUNS = fx.runs
-// RUNS.given 不在这里：那次运行的 GET 一律答 404，审批带着的运行类别得照样管用
+// RUNS.given 不在这里：那次运行的 GET 一律答 500，审批带着的运行类别得照样管用
 const RUN_CLASS = {
   [RUNS.formal]: 'formal', [RUNS.flag]: 'formal', [RUNS.explore]: 'exploratory', [RUNS.none]: 'formal',
   [RUNS.many]: 'formal', [RUNS.broken]: 'formal', [RUNS.clear]: 'formal', [RUNS.clearFlag]: 'formal',
@@ -178,6 +179,7 @@ async function open(syn, { width = 1100, height = 900, theme = 'dark' } = {}) {
       const id = decodeURIComponent(run[1])
       hits.runs.push(id)
       if (id === RUNS.runfail && state.runFail) return route.fulfill({ status: 500, json: { detail: '服务暂时不可用' } })
+      if (id === RUNS.given) return route.fulfill({ status: 500, json: { detail: '服务暂时不可用' } })
       return RUN_CLASS[id] ? route.fulfill({ json: { id, run_class: RUN_CLASS[id], status: 'interrupted' } })
         : route.fulfill({ status: 404, json: { detail: '运行不存在' } })
     }
@@ -193,9 +195,12 @@ const shot = async (page, name) => {
   mkdirSync(SHOTS, { recursive: true })
   await page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true })
 }
-/** 等运行类别答完、界面画上：否定的断言（不写降档）得在这之后做 */
-async function runClassSettled(page, hits, runId) {
-  for (let i = 0; i < 50 && !hits.runs.includes(runId); i++) await page.waitForTimeout(100)
+/**
+ * 等界面画定：否定的断言（不写降档）得在这之后做。审批带着运行类别时卡上照它说、不另取，画上就是定了；老服务端的审批
+ * 不带运行类别（fetches 为真），要等卡上按运行 id 取的那一次答完
+ */
+async function runClassSettled(page, hits, runId, { fetches = false } = {}) {
+  if (fetches) for (let i = 0; i < 50 && !hits.runs.includes(runId); i++) await page.waitForTimeout(100)
   await page.waitForTimeout(400)
 }
 const item = (page, unit) => page.locator(`[data-challenge-item="${unit}"]`)
@@ -232,7 +237,7 @@ await section('审批卡：概况与降档提示', async () => {
   check('每句是一个收起的按钮', await block.locator('[data-challenge-toggle][aria-expanded="false"]').count() === 4)
   check('没点开之前也说清判断出自反方模型', (await text(block.locator('[data-challenge-judged]'))) === '判断由反方模型给出，并非系统核对')
   check('没点开之前不取工件', hits.artifacts.length === 0, hits.artifacts.join('、'))
-  check('运行类别按运行 id 取了一次', hits.runs.filter((r) => r === RUNS.formal).length === 1, hits.runs.join('、'))
+  check('审批带着运行类别：照它说，不另取', !hits.runs.includes(RUNS.formal), hits.runs.join('、'))
   await shot(page, 'approval-dark')
   check('页面没有报错', errors.length === 0, errors.join('；'))
   await ctx.close()
@@ -377,7 +382,7 @@ await section('运行类别取不到：不说任何和出具有关的话，重�
   const { ctx, page, hits, state, errors } = await open('challenge-approval-runfail')
   const block = page.locator('[data-challenge="write"]')
   await block.waitFor()
-  await runClassSettled(page, hits, RUNS.runfail)
+  await runClassSettled(page, hits, RUNS.runfail, { fetches: true })
   const quiet = async () => {
     const all = await text(block)
     return await page.locator('[data-challenge-degrade], [data-challenge-degrade-note], [data-challenge-degrade-off], '
@@ -406,7 +411,7 @@ await section('运行类别取不到：不说任何和出具有关的话，重�
 await section('审批带着运行类别：照它说出具，不另取（另取失败也不影响）', async () => {
   // 审批自带 approval.run_class（卡顶写的就是它）。以前反方审稿那一块只拿运行 id 另取一次，这一次失败了，正式运行里
   // 「出具会降档」整块消失，卡顶却照样写着正式运行。用例把反方审稿那一块单独画，运行类别由调用方传进来，这次运行的
-  // GET 一律答 404
+  // GET 一律答 500
   const { ctx, page, hits, errors } = await open('challenge-summary-given')
   const block = page.locator('[data-challenge="write"]')
   await block.waitFor()
@@ -414,6 +419,22 @@ await section('审批带着运行类别：照它说出具，不另取（另取�
   check('给了运行类别（正式运行）：写「出具会降档」和原因', (await text(page.locator('[data-challenge-degrade]'))) === '出具会降档'
     && (await text(page.locator('[data-challenge-degrade-note]'))) === DEGRADE_NOTE, await text(block))
   check('……不另取运行类别', !hits.runs.includes(RUNS.given), hits.runs.join('、'))
+  check('……页面没有报错', errors.length === 0, errors.join('；'))
+  await ctx.close()
+})
+
+await section('整张审批卡：把审批带着的运行类别交给反方审稿那一块，运行的 GET 失败也照样写降档、不另取', async () => {
+  // RunPanel 的 ApprovalCard 得把 approval.run_class 传给 ChallengeSummary（同 ApprovalReports）。不传的话那一块按运行 id
+  // 另取一次：这里那次 GET 一律答 500，正式运行里「出具会降档」整块消失，卡顶却照样写着正式运行
+  const { ctx, page, hits, errors } = await open('challenge-approval-given')
+  const block = page.locator('[data-challenge="write"]')
+  await block.waitFor()
+  await page.waitForTimeout(500)
+  check('卡顶照审批写正式运行', await page.locator('[data-approval-run-class="formal"]').count() === 1)
+  const degrade = page.locator('[data-challenge-degrade]')
+  check('……反方审稿那一块照样写「出具会降档」和原因', await degrade.count() === 1 && (await text(degrade)) === '出具会降档'
+    && (await text(page.locator('[data-challenge-degrade-note]'))) === DEGRADE_NOTE, await text(block))
+  check('……不另取这次运行的类别（那次 GET 答 500）', !hits.runs.includes(RUNS.given), hits.runs.join('、') || '一次都没取')
   check('……页面没有报错', errors.length === 0, errors.join('；'))
   await ctx.close()
 })

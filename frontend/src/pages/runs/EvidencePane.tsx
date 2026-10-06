@@ -12,9 +12,8 @@ import {
   issuanceMarks, segmentState, unitVerdict, verdictState, type AuditFilter, type AuditGroup, type AuditRow,
 } from '../../lib/evidence'
 import { formatNumber } from '../../lib/format'
-import { DUAL_CHECK_TEXT, EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
+import { EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
 import { IssuanceBanner } from '../../run/AssistantStream'
-import { splitIssuanceGaps } from '../../run/decode'
 import { EvidenceDoc, type EvidenceDocHandle } from '../../run/EvidenceDoc'
 import { EvidenceGuessView } from '../../run/EvidenceGuess'
 import { ReportInquiry, inquiryOpen, locateIn, useInquiryAccess } from '../../run/Inquiry'
@@ -150,8 +149,13 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
                       reports={graph.reports ?? []} labelOf={labelOf} />
           <UpgradeBanner run={run} mode={mode} />
           {/* 出具档位和降档原因写在报告上方：降档时只在侧栏小标签里写「SQL 检查未通过」，报告上却是绿色的
-              「10 个数字都有出处」，读的人会以为一切正常。SQL 检查导致的降档在横幅里单列一块 */}
-          {!!output?._issuance?.tier && <IssuanceWithChecks issuance={output._issuance} runClass={run.run_class} />}
+              「10 个数字都有出处」，读的人会以为一切正常。SQL 检查导致的降档在横幅里单列一块，双盲复算、反方审稿报上来的
+              缺口分「核查未通过」「核查未完成」两组（和问数据、画布右栏同一个横幅） */}
+          {!!output?._issuance?.tier && (
+            <div data-evidence-issuance="">
+              <IssuanceBanner issuance={output._issuance} runClass={run.run_class} />
+            </div>
+          )}
 
           {mode === 'cited' && reports.map((r) => {
             const doc = docOf(r.node_id)
@@ -320,38 +324,6 @@ function useAudit(runId: string, key: string): AuditState {
     return () => ctrl.abort()
   }, [runId, key])
   return state
-}
-
-/**
- * 出具横幅，外加双盲复算、反方审稿报上来的缺口另起的两组：「核查未通过」（两路结果不一致、结论被推翻）、「核查未完成」
- * （指标无法复算）。横幅把缺口都列在「校验未全部完成」下，读起来像是校验没做完：这里从横幅里拿出来，紧跟在它下面单列，
- * 颜色和横幅里的缺口一样（分组见 run/decode.ts 的 splitIssuanceGaps）。导出给预览用例（dev/fixtures/dual_check.tsx）
- */
-export function IssuanceWithChecks({ issuance, runClass }: { issuance: Record<string, any>; runClass?: string }) {
-  const { failed, unfinished, other } = useMemo(
-    () => splitIssuanceGaps(Array.isArray(issuance.gaps) ? issuance.gaps.map(String) : []), [issuance])
-  const verify = failed.length + unfinished.length > 0
-  const shown = useMemo(() => (verify ? { ...issuance, gaps: other } : issuance), [issuance, verify, other])
-  const group = (kind: 'failed' | 'unfinished', gaps: string[]) => gaps.length > 0 && (
-    <div data-evidence-verify-group={kind}>
-      <div className="font-medium">{DUAL_CHECK_TEXT.verifyGaps[kind]}</div>
-      <ul className="mt-0.5 space-y-0.5 pl-2 [overflow-wrap:anywhere]">
-        {gaps.map((g) => <li key={g}>· {g}</li>)}
-      </ul>
-    </div>
-  )
-  return (
-    <div className="space-y-1.5" data-evidence-issuance="">
-      <IssuanceBanner issuance={shown} runClass={runClass} />
-      {verify && (
-        <div className="space-y-1 rounded-lg border px-2 py-1.5 text-2xs leading-relaxed"
-             style={{ borderColor: 'var(--st-waiting)', color: 'var(--st-waiting)' }} data-evidence-verify-gaps="">
-          {group('failed', failed)}
-          {group('unfinished', unfinished)}
-        </div>
-      )}
-    </div>
-  )
 }
 
 /** 顶上一行：这次运行按哪种方式展示证据、封存核对的结果、每份报告文档的哈希 */
