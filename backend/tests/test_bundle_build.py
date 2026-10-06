@@ -461,9 +461,10 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     本身：封存哈希是对事件真算的（浏览器的拼法重算得出），各页的形状是 check-bundle 的断言预期的那样。"""
     from tests.bundle_samples import pages
 
-    got = {name: json.loads(data_block(page)) for name, page in pages().items()}
+    rendered = pages()
+    got = {name: json.loads(data_block(page)) for name, page in rendered.items()}
     assert set(got) == {"base", "two-reports", "legacy", "failed", "continued", "degraded", "missing-doc",
-                        "missing-card", "nan", "stray", "masked-card"}
+                        "missing-card", "nan", "stray", "masked-card", "masked-source"}
     for name, bundle in got.items():
         assert browser_manifest(bundle["events"]) == bundle["meta"]["manifest_hash"], name
 
@@ -502,6 +503,13 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     # 口径卡上有输入取自遮罩列：整张卡只给 id，页面里找不到那个号码
     card = next(a for a in got["masked-card"]["artifacts"] if a["kind"] == "metric_set")
     assert card.get("masked") is True and "b64" not in card
+    # 会员库设了号码遮罩：按地区汇总的那份没碰号码列，随文件附带；选出了号码的那份只给 id，页面里找不到号码
+    source = got["masked-source"]
+    shapes = {(a["kind"], a.get("node_id")): {k for k in a if k in ("b64", "masked", "missing")}
+              for a in source["artifacts"]}
+    assert shapes == {("report_doc", "write"): {"b64"}, ("query", "regions"): {"b64"}, ("query", "members"): {"masked"}}
+    assert [n for n in segments(source) if n.get("cite", {}).get("alias") == "Q3"]
+    assert not any(phone in rendered["masked-source"] for phone in ("000-0001", "000-0002"))
     nan = got["nan"]
     assert "NaN" in next(e["canonical"] for e in nan["events"] if e["type"] == "run.started")
     assert b"NaN" in base64.b64decode(next(a["b64"] for a in nan["artifacts"] if a.get("node_id") == "fetch"))

@@ -12,7 +12,7 @@
  *      engine/expressions.py 的 cell_value / same_value；数字怎么显示是服务端渲染好的，这里不重新排版；
  *   ⑥ 运行信息：运行结果、运行类别、出具档位拿封存范围内已核对的事件对照。工作流名、版本、起止时间、节点名称
  *      绑不进封存，页面上写明它们取自运行记录。
- * 每项给出通过 / 不通过 / 无法核对和原因。服务端导出时不会出现的状态（被引用的工件不在清单里、口径卡标着遮罩）
+ * 每项给出通过 / 不通过 / 无法核对和原因。服务端导出时不会出现的状态（被引用的工件不在清单里、报告文档标着遮罩）
  * 一律算不通过：只可能是文件被改过。这些只证明内部一致，真伪要拿封存哈希去系统里对照，页面上写明。
  *
  * SHA-256 优先用浏览器的 crypto.subtle；拿不到（非安全上下文、某些浏览器打开本地文件时）用下面的纯 JS 实现，
@@ -105,6 +105,9 @@
     artifactMismatch: '内容与工件 id（哈希）不一致',
     artifactUndecodable: '内容无法解码',
     artifactUnparsable: '哈希一致，但内容无法解析',
+    /** 查询快照只给哈希：服务端证明不了这条查询没碰设了遮罩的列（没碰的照常随文件附带） */
+    maskedQuery: '这条查询用到或可能用到设了遮罩的列，快照未随文件附带，只能核对到哈希',
+    /** 口径卡只给哈希：卡上有输入取自遮罩列（卡上记着输入的值和代入式） */
     masked: '含遮罩列，未随文件附带，只能核对到哈希',
     maskedMismatch: '导出时服务端的这份文件与工件 id（哈希）不一致，可能被改过；按含遮罩列处理，未随文件附带',
     maskedUnparsable: '导出时服务端的这份文件无法解析，认不出是否含遮罩列，按含遮罩列处理，未随文件附带',
@@ -487,7 +490,8 @@
           }
         }
       } else if (a.masked) {
-        // 查询快照带遮罩列；口径卡上有输入取自遮罩列（卡上记着输入的值和代入式）。两种都只给 id，报告文档不会。
+        // 查询快照：这条查询用到或可能用到设了遮罩的列；口径卡：卡上有输入取自遮罩列（卡上记着输入的值和代入式）。
+        // 两种都只给 id，报告文档不会。
         // 内容不随文件附带，浏览器算不出它对不对得上：导出时服务端看到自己的文件和 id 对不上（mismatch）、解析不出来
         // （unparsable）的照实说，对不上的判不通过——不然被改过的文件看起来和正常的遮罩一样，篡改的证据就丢了
         if (a.kind !== 'query' && a.kind !== 'metric_set') {
@@ -497,7 +501,7 @@
           item.result = FAIL
           item.reason = T.maskedMismatch
         } else {
-          item.reason = a.unparsable ? T.maskedUnparsable : T.masked
+          item.reason = a.unparsable ? T.maskedUnparsable : a.kind === 'query' ? T.maskedQuery : T.masked
         }
       } else if (a.missing) {
         item.reason = T.artifactMissing
@@ -980,7 +984,7 @@
     if (snap && typeof snap.sql === 'string' && snap.sql) parts.push(h('p', { class: 'sub' }, T.dSql), h('pre', { class: 'sql' }, snap.sql))
     const record = snap && Number.isInteger(number.row) && Array.isArray(snap.rows) ? snap.rows[number.row] : undefined
     if (Array.isArray(record) || isObj(record)) {
-      // 被引用的那一行：快照随文件附带（没有遮罩）才走到这里，整行照原样列出，引用的那一格高亮
+      // 被引用的那一行：快照随文件附带（没碰设了遮罩的列）才走到这里，整行照原样列出，引用的那一格高亮
       let columns = (Array.isArray(snap.columns) ? snap.columns : []).map(String)
       if (isObj(record) && !columns.length) columns = Object.keys(record)
       const cellAt = (c, i) => (isObj(record) ? own(record, c) : record[i])

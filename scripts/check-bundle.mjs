@@ -15,9 +15,11 @@
 // - 深浅色、窄屏：390 宽不横向溢出，点开的数字面板在窄屏上从底部抽出，深色下底是深的、字是浅的；
 // - 样本页：tests/bundle_samples.py 用虚构数据真实生成的几份页面（遮罩快照、两份报告、早期运行、失败结束、先失败后
 //   经继续运行跑到成功的早期运行、两条出具
-//   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列），逐份断言各项结果和原因文案；在上面篡改 ④
+//   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列、设了遮罩的数据源上按地区汇总的查询），逐份
+//   断言各项结果和原因文案；在上面篡改 ④
 //   引用链（换文档、拿掉报告、多一份没人引用的工件）、⑥ 运行信息（运行结果、类别、出具档位）、拿掉被引用的口径卡、把
 //   报告文档标成遮罩、把遮罩卡标成服务端的文件与 id 不一致或解析不出来（服务端对被改过、解析不了的遮罩卡就这么标）、
+//   遮罩源上随文件附带的汇总快照改一个字节、它的数字改引用值并重算全部哈希、
 //   只改页面顶部的封存哈希；宽屏点开表格里右对齐的数字不被面板盖住；不执行脚本时封存哈希、运行 ID 照样看得到，状态写
 //   「尚未核对」；
 // - 记录页的导出按钮（预览用例 ?syn=bundle-provenance-*，page.route 假装导出接口）：已封存时可点、下载的文件名同服务端；
@@ -145,6 +147,8 @@ const stateOf = (page) => page.evaluate(() => ({
 }))
 
 const describe = (s) => Object.entries(s.checks).map(([k, v]) => `${k}=${v}`).join(' ')
+/** 查询快照只给哈希时核对页写的原因（verifier.js 的 T.maskedQuery） */
+const MASKED_QUERY = '这条查询用到或可能用到设了遮罩的列，快照未随文件附带，只能核对到哈希'
 /** 有通过、没有不通过：「部分无法核对」也算（遮罩快照、没有出处的数字是正常的无法核对） */
 const noFail = (r) => r === 'pass' || r === 'partial'
 const hasItem = (s, check, result, text) => s.items.some((i) => i.check === check && i.result === result
@@ -489,16 +493,15 @@ await section('样本页：各种形状', async () => {
     check('生成样本页（tests/bundle_samples.py）', false, String(e?.message ?? e))
     return
   }
-  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 11, Object.keys(samples).join('、'))
+  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 12, Object.keys(samples).join('、'))
 
   await sample('base', async (s, page) => {
     check('base：总览通过，有无法核对的项时写「可核对的项全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过',
       `${s.overall}：${s.text}`)
     check('base：①②④⑥ 通过，③⑤ 部分无法核对', ['events', 'manifest', 'chain', 'meta'].every((k) => s.checks[k] === 'pass')
       && s.checks.artifacts === 'partial' && s.checks.numbers === 'partial', describe(s))
-    check('base：遮罩快照在 ③ 无法核对，写明「含遮罩列，未随文件附带，只能核对到哈希」',
-      hasItem(s, 'artifacts', 'na', '含遮罩列，未随文件附带，只能核对到哈希'))
-    check('base：引用遮罩快照的数字无法核对，原因同上', hasItem(s, 'numbers', 'na', '含遮罩列，未随文件附带，只能核对到哈希'))
+    check(`base：选出了遮罩列的快照在 ③ 无法核对，写明「${MASKED_QUERY}」`, hasItem(s, 'artifacts', 'na', MASKED_QUERY))
+    check('base：引用这份快照的数字无法核对，原因同上', hasItem(s, 'numbers', 'na', MASKED_QUERY))
     check('base：没有出处的数字写明未使用引用标记', hasItem(s, 'numbers', 'na', '该数字未使用引用标记，无法核对其来源'))
     const outside = s.items.filter((i) => i.check === 'numbers' && !i.folded)
     check('base：⑤ 超过 20 项收起来时，无法核对的列在外面', outside.length === 2 && outside.every((i) => i.result === 'na')
@@ -616,6 +619,31 @@ await section('样本页：各种形状', async () => {
     const html = await page.content()
     check('masked-card：页面里找不到卡上那个遮罩列的号码', !html.includes('000-0001') && !html.includes('000-0002'))
   })
+  // 会员库设了号码遮罩（查询当时记下了，数据源现在也设着）：按地区汇总的查询没碰号码列，快照随文件附带、数字核对得过；
+  // 选出了号码的那份只给哈希，原因写明这条查询用到或可能用到设了遮罩的列
+  await sample('masked-source', async (s, page) => {
+    const regions = s.items.find((i) => i.check === 'artifacts' && i.text.includes('会员地区汇总'))
+    check('masked-source：按地区汇总的快照随文件附带，③ 通过', regions?.result === 'pass', regions?.text)
+    const cited = s.items.filter((i) => i.check === 'numbers' && i.text.includes('查询 Q3'))
+    check('masked-source：引用地区汇总的 2 个数字都核对通过', cited.length === 2 && cited.every((i) => i.result === 'pass'),
+      cited.map((i) => `${i.result}：${i.text}`).join(' | '))
+    const members = s.items.find((i) => i.check === 'artifacts' && i.text.includes('会员消费'))
+    check('masked-source：选出了号码的快照只给哈希，写明这条查询用到或可能用到设了遮罩的列',
+      members?.result === 'na' && members.text.includes(MASKED_QUERY), members?.text)
+    const phoneCited = s.items.find((i) => i.check === 'numbers' && i.text.includes('查询 Q2'))
+    check('masked-source：引用它的数字无法核对，原因同上', phoneCited?.result === 'na' && phoneCited.text.includes(MASKED_QUERY),
+      phoneCited?.text)
+    check('masked-source：总览通过（可核对的项全部通过），没有一项不通过', s.overall === 'pass'
+      && s.text === '可核对的项全部通过' && !s.items.some((i) => i.result === 'fail'), `${s.overall}：${s.text}`)
+    // 点开地区汇总的第一个数字：出处面板里有这条查询的 SQL 和被引用的那一行
+    await page.locator('button.num[data-result="pass"]').first().click()
+    await page.locator('#detail').waitFor({ state: 'visible', timeout: 5000 })
+    const detail = await page.locator('#detail').innerText()
+    check('masked-source：点开数字看得到汇总查询的 SQL 和被引用的那一行', detail.includes('SUM(spend)')
+      && detail.includes('快照第 1 行') && detail.includes('华东'), detail.replace(/\s+/g, ' ').slice(0, 120))
+    const html = await page.content()
+    check('masked-source：页面里找不到号码', !html.includes('000-0001') && !html.includes('000-0002'))
+  })
   await sample('nan', async (s) => {
     check('nan：内容里有裸 NaN 的事件和工件照常通过', s.overall === 'pass' && s.checks.events === 'pass'
       && !s.items.some((i) => i.result === 'fail'), describe(s))
@@ -694,6 +722,13 @@ await section('样本页：篡改', async () => {
         && metricNumber.text.includes('引用的工件没有通过核对'), metricNumber?.text],
     ]
   })
+  // 遮罩源上随文件附带的汇总快照照样逐字节核对：改一个字节 ③ 变红；改它的数字的引用值、哈希全部重算，⑤ 拿快照对出来变红
+  await tamper(samples['masked-source'], '遮罩源上汇总快照的一个字节', (data) => {
+    const art = data.artifacts.find((a) => a.kind === 'query' && typeof a.b64 === 'string')
+    return art ? flipByte(art) : null
+  }, turnsRed('artifacts', ['events', 'manifest']))
+  await tamper(samples['masked-source'], '遮罩源上汇总查询的数字的引用值并重算全部哈希', forge,
+    turnsRed('numbers', ['events', 'manifest', 'artifacts', 'chain']), { seal: true })
   // 服务端标了解析不出来、哈希又对得上的遮罩卡：照实说认不出是否含遮罩列，是正常的无法核对（同哈希一致却解析不了的
   // 嵌入工件），不说成「含遮罩列」
   await tamper(samples['masked-card'], '遮罩卡标成服务端解析不出来', (data) => {

@@ -19,6 +19,8 @@
 - missing-doc / missing-card：导出时服务端已没有报告文档 / 口径卡的文件
 - masked-card：口径卡上一个指标的输入取自会员消费的号码列（设了遮罩），卡上记着号码原值：整张卡只给 id，引用它的
   数字无法核对
+- masked-source：会员库设了号码遮罩（查询当时记下了，数据源现在也设着）。报告引用会员按地区汇总的查询（没碰遮罩列：
+  快照随文件附带，数字核对得过）和选出了号码的那份会员消费（只给哈希）
 - nan：运行开始事件和门店流水快照里有 json.dumps 写出的裸 NaN（快照里那一列报告没有引用）
 - stray：报告自查记下的文档是另一次运行写的
 """
@@ -39,8 +41,8 @@ RUN = {"id": RUN_ID, "workflow_id": "wf-sample-weekly", "workflow_name": "门店
        "started_at": "2026-09-07T01:00:00+00:00", "finished_at": "2026-09-07T01:02:03+00:00"}
 GRAPH = {"nodes": [{"id": n, "type": t, "data": {"label": label}} for n, t, label in [
     ("start", "input", "开始"), ("fetch", "tool", "门店流水"), ("members", "tool", "会员消费"),
-    ("card", "metrics", "周报口径"), ("write", "report", "写周报"), ("monthly", "report", "写月报"),
-    ("out", "output", "成果")]]}
+    ("regions", "tool", "会员地区汇总"), ("card", "metrics", "周报口径"), ("write", "report", "写周报"),
+    ("monthly", "report", "写月报"), ("out", "output", "成果")]]}
 EXPORTED_AT = "2026-10-05T08:00:00+00:00"
 
 STORES = [["青石店", 1280.5], ["白沙店", "960.00"], ["临川店", 732], ["望江店", 1105.25], ["枫桥店", 418],
@@ -48,6 +50,11 @@ STORES = [["青石店", 1280.5], ["白沙店", "960.00"], ["临川店", 732], ["
 CRM = {"columns": ["name", "phone", "spend"], "column_types": {"name": "text", "phone": "text", "spend": "number"},
        "rows": [["林一", "000-0001", 320.0], ["周二", "000-0002", 188.5]], "source": "crm",
        "sql": "SELECT name, phone, spend FROM members ORDER BY id", "truncated": False, "mask_columns": ["phone"]}
+#: 会员按地区汇总：同一个设了号码遮罩的会员库，SQL 没碰号码列
+REGIONS = {"columns": ["region", "spend"], "column_types": {"region": "text", "spend": "number"},
+           "rows": [["华东", 320.0], ["华南", 188.5]], "source": "crm",
+           "sql": "SELECT region, SUM(spend) AS spend FROM members GROUP BY region ORDER BY region", "truncated": False,
+           "mask_columns": ["phone"]}
 CARD = {"kind": "metric_set", "caliber": "周报口径", "caliber_version": "v2",
         "metrics": [{"id": "gmv", "name": "销售额", "value": 8381.25, "unit": "元", "decimals": 2, "format": "thousands"}]}
 
@@ -55,6 +62,9 @@ WEEKLY = ("## 门店周报\n\n本周销售额 [[m:gmv]]，*按发生周统计*�
           "**会员消费** [[v:Q2.r0.spend]]，另有 42 笔退款待入账。[[see:Q1]]\n\n- 云岭店流水最高\n- 枫桥店流水最低\n\n"
           "[[table:Q1 cols=store,amount rows=0-7]]")
 MONTHLY = "## 门店月报\n\n本月销售额 [[m:gmv]]，青石店流水 [[v:Q1.r0.amount]]。[[see:Q1]]"
+#: 会员周报：Q3 是会员按地区汇总（没碰遮罩列），Q2 是选出了号码的会员消费
+MEMBERS = ("## 会员周报\n\n华东会员消费 [[v:Q3.r0.spend]]，华南 [[v:Q3.r1.spend]]。[[see:Q3]]\n\n"
+           "会员林一消费 [[v:Q2.r0.spend]]。")
 
 
 def stored(obj: Any) -> tuple[str, bytes]:
@@ -83,21 +93,29 @@ def masked_card(crm_id: str) -> dict[str, Any]:
 
 
 class Sample:
-    """一次虚构的已封存运行：工件（原字节）、证据目录、报告文档、事件。masked=True 时口径卡带着取自遮罩列的输入。"""
+    """一次虚构的已封存运行：工件（原字节）、证据目录、报告文档、事件。masked=True 时口径卡带着取自遮罩列的输入；
+    regions=True 时会员库另有一次按地区汇总的查询（目录里排在 Q3）。"""
 
-    def __init__(self, *, nan: bool = False, masked: bool = False) -> None:
+    def __init__(self, *, nan: bool = False, masked: bool = False, regions: bool = False) -> None:
         self.files: dict[str, bytes] = {}
         self.shop_id = self.put(shop(nan))
         self.crm_id = self.put(CRM)
         self.card = masked_card(self.crm_id) if masked else CARD
         self.card_id = self.put(self.card)
-        self.ledger = [
-            {"kind": "query", "node_id": "fetch", "exec": 1, "artifact": self.shop_id, "tool": "db_query__shop",
-             "source": "shop", "columns": ["store", "amount", "ratio"], "rows": len(STORES), "truncated": False},
-            {"kind": "query", "node_id": "members", "exec": 1, "artifact": self.crm_id, "tool": "db_query__crm",
-             "source": "crm", "columns": CRM["columns"], "rows": len(CRM["rows"]), "truncated": False},
-            {"kind": "metric_set", "node_id": "card", "artifact": self.card_id},
-        ]
+        self.entries = {
+            "fetch": {"kind": "query", "node_id": "fetch", "exec": 1, "artifact": self.shop_id,
+                      "tool": "db_query__shop", "source": "shop", "columns": ["store", "amount", "ratio"],
+                      "rows": len(STORES), "truncated": False},
+            "members": {"kind": "query", "node_id": "members", "exec": 1, "artifact": self.crm_id,
+                        "tool": "db_query__crm", "source": "crm", "columns": CRM["columns"], "rows": len(CRM["rows"]),
+                        "truncated": False},
+        }
+        if regions:
+            self.entries["regions"] = {"kind": "query", "node_id": "regions", "exec": 1,
+                                       "artifact": self.put(REGIONS), "tool": "db_query__crm", "source": "crm",
+                                       "columns": REGIONS["columns"], "rows": len(REGIONS["rows"]), "truncated": False}
+        self.entries["card"] = {"kind": "metric_set", "node_id": "card", "artifact": self.card_id}
+        self.ledger = list(self.entries.values())
         self.catalog = build_catalog(nodes={"card": self.card}, ledger=self.ledger)
 
     def put(self, obj: Any) -> str:
@@ -131,12 +149,17 @@ class Sample:
                                   "preview": json.dumps({"columns": ["store", "amount"], "rows": STORES[:2]},
                                                         ensure_ascii=False)})
         add("node.finished", "fetch", {"duration_ms": 14, "attempt": 1, "preview": "{\"rows\": …}",
-                                       "evidence": [self.ledger[0]]})
+                                       "evidence": [self.entries["fetch"]]})
         add("tool.end", "members", {"tool": "db_query__crm", "duration_ms": 9, "query_artifact": self.crm_id,
                                     "preview": json.dumps(CRM["rows"][:1], ensure_ascii=False)})
-        add("node.finished", "members", {"duration_ms": 10, "attempt": 1, "evidence": [self.ledger[1]]})
+        add("node.finished", "members", {"duration_ms": 10, "attempt": 1, "evidence": [self.entries["members"]]})
+        if "regions" in self.entries:
+            add("tool.end", "regions", {"tool": "db_query__crm", "duration_ms": 7,
+                                        "query_artifact": self.entries["regions"]["artifact"],
+                                        "preview": json.dumps(REGIONS["rows"], ensure_ascii=False)})
+            add("node.finished", "regions", {"duration_ms": 8, "attempt": 1, "evidence": [self.entries["regions"]]})
         add("node.finished", "card", {"duration_ms": 3, "attempt": 1, "preview": {"kind": "metric_set"},
-                                      "evidence": [self.ledger[2]]})
+                                      "evidence": [self.entries["card"]]})
         for node_id, doc_id in reports.items():
             add("llm.end", node_id, {"model": "mock", "output": "（写作草稿）"})
             add("report.checked", node_id, {"doc_artifact": doc_id, "ok": True})
@@ -167,12 +190,12 @@ class Sample:
 
 
 def render(sample: Sample, events: list[tuple[int, str, str | None, Any]], bound: int, *, run: dict[str, Any] | None = None,
-           legacy: bool = False, drop: tuple[str, ...] = ()) -> str:
-    """真实封存哈希的页面。drop：导出时服务端已没有文件的工件。"""
+           legacy: bool = False, drop: tuple[str, ...] = (), source_masks: dict[str, list[str]] | None = None) -> str:
+    """真实封存哈希的页面。drop：导出时服务端已没有文件的工件；source_masks：数据源现在设的遮罩。"""
     sealed = [e for e in events if e[0] <= bound]
     files = {k: v for k, v in sample.files.items() if k not in drop}
     bundle = build_bundle(run or RUN, events, manifest_seq=bound, manifest_hash=manifest_hash(sealed), read=files.get,
-                          exported_at=EXPORTED_AT, legacy=legacy, graph=GRAPH, source_masks={})
+                          exported_at=EXPORTED_AT, legacy=legacy, graph=GRAPH, source_masks=source_masks or {})
     return render_html(bundle)
 
 
@@ -215,6 +238,10 @@ def pages() -> dict[str, str]:
     m = Sample(masked=True)
     events, bound = m.events({"write": m.doc(WEEKLY, "write")})
     out["masked-card"] = render(m, events, bound)
+
+    r = Sample(regions=True)
+    events, bound = r.events({"write": r.doc(MEMBERS, "write")})
+    out["masked-source"] = render(r, events, bound, source_masks={"crm": ["phone"]})
     return out
 
 
