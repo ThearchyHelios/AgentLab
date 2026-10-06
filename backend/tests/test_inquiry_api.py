@@ -933,6 +933,49 @@ async def test_the_inquiry_agent_sees_and_stores_its_queries_masked(monkeypatch,
     assert content == artifact_store.load(query["artifact"])
 
 
+@pytest.mark.parametrize("sql, rows", [
+    pytest.param("SELECT '合计' AS 区域, SUM(amount) AS 金额 FROM sales UNION ALL SELECT * FROM "
+                 "(SELECT buyer_phone, amount FROM sales ORDER BY amount DESC LIMIT 2)",
+                 [["已遮罩", 2800], ["已遮罩", 1200], ["已遮罩", 900]], id="UNION 后一支的 *"),
+    pytest.param("WITH t(a, b, c, d, e) AS (SELECT * FROM sales) SELECT c AS 区域, d AS 金额 FROM t "
+                 "ORDER BY d DESC LIMIT 2", [["已遮罩", 1200], ["已遮罩", 900]], id="CTE 列名表套 *"),
+])
+async def test_a_star_renaming_the_masked_column_never_shows(monkeypatch, tmp_path, client, sql, rows):
+    """复核第 2 轮的 blocker：* 把手机号带进了别的列名（UNION 后一支的 *，结果的列名取第一支的「区域」；CTE 的列名表把
+    SELECT * 展开的列换了名字）。以前交给模型的工具结果里就有原值，回答「金额最大的一笔来自 13900000001」照常交出，事件、
+    质询工件、通用工件接口都给原值。现在 * 展开落到的那几列查询时就遮掉：只展开一个子查询的按位置只遮号码那一列；展开
+    数据源里的表的按查询当时的表结构数出号码排在第几，也只遮那一列。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=SALES)
+    plays = {"最大": Play([sql], "金额最大的一笔来自 [[v:Q1.r1.区域]]。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东销售额 [[v:Q1.r0.销售额]]。[[see:Q1]]", plays=plays)
+    seen: list[str] = []
+    answering = MockChatModel._decide
+
+    def spy(model, messages):
+        seen.extend(str(m.content) for m in messages if isinstance(m, ToolMessage))
+        return answering(model, messages)
+
+    monkeypatch.setattr(MockChatModel, "_decide", spy)
+    try:
+        paused = await pause(name, graph=fetching(name, QUERY))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="金额最大的一笔来自哪里？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (True, "金额最大的一笔来自 已遮罩。")
+        assert seen and all("1390000000" not in s for s in seen), "交给模型的查询结果里就是遮好的"
+        [query] = item["queries"]
+        for url in (f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}",
+                    f"/api/artifacts/{query['artifact']}"):
+            got = await client.get(url)
+            assert got.status_code == 200 and got.json()["content"]["rows"] == rows and "1390000000" not in got.text
+        [event] = await events(paused.id, "approval.inquiry")
+        assert "1390000000" not in json.dumps(event.data, ensure_ascii=False)
+    finally:
+        await engines.invalidate(source_id)
+
+
 async def test_a_masked_column_under_another_name_is_masked_everywhere(monkeypatch, masked_shop, client):
     """遮罩列起了中文别名（本仓库查询的惯例）：回答里引用到的格子、事件、回答文档、质询工件里都不露出原值。
     报告自己的查询没选手机号，原值哪里都认不出来，只能按 SQL 认出「手机号」就是 buyer_phone。"""
@@ -1548,6 +1591,40 @@ async def test_a_number_from_the_agents_other_query_is_masked_when_the_number_ca
         assert got.json()["content"]["rows"] == [["已遮罩", 1200], ["已遮罩", 300]] and got.json()["masked"] == ["号码"]
         [event] = await events(paused.id, "approval.inquiry")
         assert "1390000000" not in json.dumps(event.data, ensure_ascii=False)
+    finally:
+        await engines.invalidate(source_id)
+
+
+async def test_a_number_the_agent_found_is_masked_even_when_report_values_fill_the_cap(monkeypatch, tmp_path, client):
+    """复核第 2 轮：报告快照里的遮罩值收满了上限（这里把 SECRETS_MAX 调成报告正好收满的大小）。agent 先查出华东的号码
+    （查询时遮掉），再查回访备注：备注里的号码照样在交给模型之前换掉，回答、事件、质询工件里都没有。以前开始回答时先并
+    报告的值、收满就停，agent 查到的号码并不进去：备注原样交给模型、原样落库，回答引用这一格时第二道防线也认不出，原值
+    写进了运行记录。"""
+    from app.engine import masking
+
+    name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=CALLBACKS)
+    report_sql = "SELECT buyer_phone, amount AS 金额 FROM sales WHERE region <> '华东' ORDER BY id"
+    plays = {"回访": Play([PHONES_EAST, NOTES], "华东的回访备注是 [[v:Q2.r0.备注]]。[[see:Q2]]")}
+    Models(monkeypatch, name, writer="华南一笔金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=fetching(name, report_sql))
+        [approval] = await pending(paused.id)
+        report = [artifact_store.load(e.data["query_artifact"]) for e in await events(paused.id, "tool.end")
+                  if e.data.get("query_artifact")]
+        full = masking._Secrets()
+        full.add(report[0], {"buyer_phone"})
+        monkeypatch.setattr(masking, "SECRETS_MAX", len(full.weak))
+        r = await ask(client, paused.id, report="write", unit=None, question="华东的回访说了什么？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (True, "华东的回访备注是 客户已遮罩来电改址。")
+        phones, notes = item["queries"]
+        assert artifact_store.load(notes["artifact"])["rows"] == [["华东", "客户已遮罩来电改址"], ["华南", "例行回访"]]
+        [event] = await events(paused.id, "approval.inquiry")
+        assert "1390000000" not in json.dumps(event.data, ensure_ascii=False)
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{notes['artifact']}")
+        assert got.status_code == 200 and "1390000000" not in got.text
     finally:
         await engines.invalidate(source_id)
 

@@ -58,10 +58,10 @@ async def clean_spend():
     yield
 
 
-async def _source(tmp_path, options: dict | None) -> tuple[str, int]:
+async def _source(tmp_path, options: dict | None, script: str = SALES) -> tuple[str, int]:
     path = tmp_path / f"{uuid.uuid4().hex[:8]}.db"
     db = sqlite3.connect(path)
-    db.executescript(SALES)
+    db.executescript(script)
     db.commit()
     db.close()
     name = f"shop_{uuid.uuid4().hex[:8]}"
@@ -385,3 +385,108 @@ def test_labels_written_in_this_query_are_not_masked_by_values_from_earlier_ones
     payload = {"sql": "SELECT CASE WHEN amount > 1000 THEN '大单' ELSE '小单' END AS 档, COUNT(*) AS 笔数 FROM sales "
                       "GROUP BY 1", "columns": ["档", "笔数"], "rows": [["大单", 1], ["小单", 3]]}
     assert masking.mask_query_result(payload, ["amount"], "sqlite", known).payload["rows"] == [["大单", 1], ["小单", 3]]
+
+
+# --------------------------------------------------------------------------
+# * 把遮罩列带进别的列名、函数参数里的 JSON 箭头（复核第 2 轮）
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("sql, masked", [
+    pytest.param("SELECT region, amount FROM sales WHERE id < 0 UNION ALL "
+                 "SELECT * FROM (SELECT buyer_phone, amount FROM sales ORDER BY id)", ["region"],
+                 id="UNION 后一支的 *"),
+    pytest.param("WITH t(k, v) AS (SELECT * FROM (SELECT buyer_name, amount FROM sales ORDER BY id)) "
+                 "SELECT k AS 姓名, v AS amount FROM t", ["姓名"], id="CTE 列名表套 *"),
+    pytest.param("SELECT (SELECT * FROM (SELECT s2.buyer_phone FROM sales s2 WHERE s2.id = s.id)) AS 号码, s.amount "
+                 "FROM sales s ORDER BY s.id", ["号码"], id="标量子查询里的 *"),
+])
+async def test_a_star_renaming_a_masked_column_is_masked_before_the_model_sees_it(monkeypatch, masked_shop, sql,
+                                                                                    masked):
+    """* 把遮罩列的值带进了别的列名（UNION 后一支、写了列名表的 CTE、标量子查询）：交给模型的、落库的、通用接口给的都是
+    「已遮罩」，金额照常。以前 * 本身不算取自哪一列，原值原样交给模型、落进快照。"""
+    name = masked_shop
+    script = Script(monkeypatch, [q(name, sql, "c1")],
+                    {"value": {"alias": "Q1", "row": 0, "column": "amount"}, "rationale": "见 [[see:Q1]]。"})
+    out, _ = await ask(name)
+    assert out.error is None and out.result["value"] == 1200
+    seen = script.tool_results()["c1"]
+    assert MASKED in seen and _clean(seen), seen
+    snapshot = artifact_store.load(out.queries[0]["artifact"])
+    assert snapshot["masked_at_query"] == masked and set(_cells(snapshot, masked[0])) == {MASKED}
+    assert _cells(snapshot, "amount") == [1200, 300, 900, 400]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        got = await client.get(f"/api/artifacts/{out.queries[0]['artifact']}")
+    assert got.status_code == 200 and got.json()["content"] == snapshot and _clean(got.text)
+
+
+@pytest.mark.parametrize("sql, masked", [
+    pytest.param("SELECT c.id AS 编号, j.value AS 值 FROM customers c, json_each(profile->'$') AS j "
+                 "ORDER BY c.id, j.key", ["值"], id="json_each 参数带箭头"),
+    pytest.param("SELECT id AS 编号, upper(profile->'$.name') AS 姓名 FROM customers ORDER BY id", ["姓名"],
+                 id="函数参数里的箭头"),
+])
+async def test_a_json_arrow_over_the_masked_column_is_masked_before_the_model_sees_it(monkeypatch, json_shop, sql,
+                                                                                      masked):
+    """遮罩的是 JSON 列：函数参数里没写表名的 profile->'…' 被解析器当成 lambda，以前认不出，拆开、取出来的号码和姓名原样
+    交给模型、落库。"""
+    name = json_shop
+    script = Script(monkeypatch, [q(name, sql, "c1")],
+                    {"value": {"alias": "Q1", "row": 0, "column": "编号"}, "rationale": "x"})
+    out, _ = await ask(name)
+    assert out.result["value"] == 1 and _clean(script.tool_results()["c1"])
+    snapshot = artifact_store.load(out.queries[0]["artifact"])
+    assert snapshot["masked_at_query"] == masked and set(_cells(snapshot, masked[0])) == {MASKED}
+    assert _clean(json.dumps(snapshot, ensure_ascii=False))
+
+
+# --------------------------------------------------------------------------
+# 遮罩值的上限：agent 自己查到的值先收（复核第 2 轮）
+# --------------------------------------------------------------------------
+
+
+async def test_values_the_agent_finds_survive_caller_values_that_fill_the_cap(monkeypatch, masked_shop):
+    """调用方交进来的值（报告快照里的）收满了上限 SECRETS_MAX：agent 自己查到的号码照样收，后面查到的备注按它遮，交回
+    调用方的 masked_values 里也认得出。以前先并调用方的值、满了就停，agent 查到的一个也并不进去：后面的备注原样交给
+    模型、原样落库，回答时按值遮也认不出。"""
+    monkeypatch.setattr(masking, "SECRETS_MAX", 40)
+    name = masked_shop
+    given = masking._Secrets()
+    given.add({"columns": ["buyer_phone"], "rows": [[str(13800000000 + i)] for i in range(40)]}, {"buyer_phone"})
+    assert len(given.weak) == masking.SECRETS_MAX and not given.hit("13900000001")
+    steps = [q(name, "SELECT buyer_phone, amount AS total FROM sales ORDER BY id", "c1"),
+             q(name, "SELECT id, note FROM sales ORDER BY id", "c2")]
+    script = Script(monkeypatch, steps, {"value": {"alias": "Q1", "row": 0, "column": "total"}, "rationale": "x"})
+    out, _ = await ask(name, masked_values=given)
+    assert out.result["value"] == 1200
+    assert _clean(script.tool_results()["c2"]), script.tool_results()["c2"]
+    notes = artifact_store.load(out.queries[1]["artifact"])
+    assert _cells(notes, "note") == [f"客户{MASKED}来电改址", "例行回访", f"回访：联系 {MASKED}", ""]
+    assert out.masked_values.hit("13900000001") and out.masked_values.hit("13900000003")
+    assert len(out.masked_values.weak) <= masking.SECRETS_MAX, "合起来照样不超过上限：挤掉的是调用方的值"
+
+
+#: 两个月的订单表，列一样、次序一样（上传表格里的月度工作表常这样）
+MONTHS = ("CREATE TABLE jan (id INTEGER PRIMARY KEY, region TEXT, buyer_phone TEXT, amount INTEGER);"
+          "CREATE TABLE feb (id INTEGER PRIMARY KEY, region TEXT, buyer_phone TEXT, amount INTEGER);"
+          "INSERT INTO jan VALUES (1, '华东', '13900000001', 1200), (2, '华南', '13900000002', 300);"
+          "INSERT INTO feb VALUES (3, '华东', '13900000003', 900);")
+
+
+async def test_a_union_of_monthly_tables_is_counted_with_the_sources_schema(monkeypatch, tmp_path):
+    """几张列一样的月度表用 SELECT * 连起来再汇总：按数据源的表结构数得出号码落在第几列，汇总的金额照常交给模型、照常
+    取值；选出全部列的，只遮号码那一列。* 展开数据源里的表又不按表结构数位置的话，展开落到的那一段整段都遮，金额也拿不到。"""
+    name, source_id = await _source(tmp_path, {"mask_columns": "buyer_phone"}, script=MONTHS)
+    try:
+        steps = [q(name, "SELECT region, SUM(amount) AS total FROM (SELECT * FROM jan UNION ALL SELECT * FROM feb) t "
+                          "GROUP BY region ORDER BY total DESC", "c1"),
+                 q(name, "SELECT * FROM jan UNION ALL SELECT * FROM feb ORDER BY id", "c2")]
+        script = Script(monkeypatch, steps, {"value": {"alias": "Q1", "row": 0, "column": "total"}, "rationale": "x"})
+        out, _ = await ask(name)
+        assert out.error is None and out.result["value"] == 2100
+        assert all(_clean(text) for text in script.tool_results().values())
+        totals, rows = (artifact_store.load(query["artifact"]) for query in out.queries)
+        assert totals["masked_at_query"] == [] and totals["rows"] == [["华东", 2100], ["华南", 300]]
+        assert rows["masked_at_query"] == ["buyer_phone"] and _cells(rows, "amount") == [1200, 300, 900]
+    finally:
+        await engines.invalidate(source_id)

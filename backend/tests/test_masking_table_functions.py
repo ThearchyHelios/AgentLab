@@ -107,3 +107,55 @@ def test_a_masked_column_only_in_the_condition_of_an_aggregated_case_is_like_a_f
 ])
 def test_a_case_returning_the_masked_value_or_not_aggregated_is_still_derived(sql):
     assert "total" in hidden_of(sql, ["total"])
+
+
+# --------------------------------------------------------------------------
+# 函数参数里的 JSON 箭头（复核第 2 轮）
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind, sql, columns, shown", [
+    pytest.param("sqlite", "SELECT j.value AS v FROM sales, json_each(profile->'$.tels') AS j", ["v"], ["v"],
+                 id="SQLite json_each 参数带箭头"),
+    pytest.param("postgres", "SELECT e AS 号 FROM sales, json_array_elements_text(profile->'tels') AS e", ["号"],
+                 ["号"], id="Postgres json_array_elements_text"),
+    pytest.param("postgres", "SELECT e.value AS 号 FROM sales, jsonb_array_elements(profile->'tels') AS e", ["号"],
+                 ["号"], id="Postgres jsonb_array_elements"),
+    pytest.param("postgres", "SELECT t.tel FROM sales, jsonb_to_recordset(profile->'contacts') AS t(tel text)",
+                 ["tel"], ["tel"], id="Postgres jsonb_to_recordset 列名表"),
+    pytest.param("postgres", "SELECT k, v FROM sales, jsonb_each_text(profile->'contact') AS x(k, v)", ["k", "v"],
+                 ["k", "v"], id="Postgres jsonb_each_text 列名表"),
+    pytest.param("postgres", "SELECT jsonb_array_elements_text(profile->'tels') AS 号 FROM sales", ["号"], ["号"],
+                 id="Postgres 选出项里拆开"),
+    pytest.param("postgres", "SELECT jsonb_array_elements_text(profile -> 'contact' -> 'tels') AS 号 FROM sales",
+                 ["号"], ["号"], id="Postgres 连着两个箭头"),
+    pytest.param("mysql", "SELECT JSON_UNQUOTE(profile->'$.tel') AS 电话 FROM sales", ["电话"], ["电话"],
+                 id="MySQL JSON_UNQUOTE"),
+    pytest.param("mysql", "SELECT CONCAT(profile->'$.tel', '') AS 电话 FROM sales", ["电话"], ["电话"],
+                 id="MySQL CONCAT"),
+])
+def test_a_json_arrow_inside_function_arguments_is_read_as_the_masked_column(kind, sql, columns, shown):
+    """函数参数里没写表名的 col->'path' 被解析器当成以 col 为参数的 lambda（不是一列）：以前认不出遮罩列，拆开、取出来的
+    值原样交给模型、落库。遮罩列是 JSON 时这几种是最自然的写法。写了表名、用 ->> 的本来就认得出。"""
+    assert {c.lower() for c in shown} <= hidden_of(sql, columns, kind)
+
+
+def test_a_json_arrow_over_an_unmasked_column_stays_visible():
+    """箭头取的不是遮罩列：一列都不遮。真的 lambda 的参数照列名收，只有和遮罩列同名时才多遮。"""
+    assert hidden_of("SELECT j.value AS 标签 FROM sales, json_each(tags->'$.list') AS j", ["标签"]) == MASKED
+    assert hidden_of("SELECT transform(scores, x -> x + 1) AS 分 FROM sales", ["分"], "postgres") == MASKED
+
+
+def test_a_json_arrow_inside_json_each_is_masked_when_really_run():
+    """SQLite 里真跑一遍：json_each(profile->'$.tels') 拆出来的号码在交给模型之前就遮掉。"""
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.executescript("CREATE TABLE sales (id INTEGER, profile TEXT);"
+                     "INSERT INTO sales VALUES (1, '{\"tels\": [\"13900000001\", \"13900000002\"]}');")
+    sql = "SELECT j.value AS v FROM sales, json_each(profile->'$.tels') AS j"
+    cursor = db.execute(sql)
+    payload = {"columns": [d[0] for d in cursor.description], "rows": [list(r) for r in cursor.fetchall()], "sql": sql}
+    db.close()
+    done = masking.mask_query_result(payload, ["profile"], "sqlite")
+    assert done.columns == ["v"] and done.payload["rows"] == [["已遮罩"], ["已遮罩"]]

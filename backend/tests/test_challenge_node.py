@@ -1405,3 +1405,26 @@ async def test_the_node_refuses_the_same_bad_settings_at_run_time():
     with pytest.raises(NodeError) as caught:
         await challenge_mod.run_challenge({"nodes": {}}, ctx)
     assert str(caught.value) == message
+
+
+def test_values_the_agent_found_are_masked_in_the_rationale_when_the_report_fills_the_cap(monkeypatch):
+    """复核第 2 轮：报告快照里的遮罩值收满了上限 SECRETS_MAX，反方 agent 查询时遮掉的号码照样认得出（agent 查到的先收）。
+    以前先收报告的值、满了就停，agent 查到的号码写进理由原样存下。"""
+    from app.engine import masking
+    from app.engine.evidence import compose_doc
+    from app.engine.verify_agent import VerifyOutcome
+
+    monkeypatch.setattr(masking, "SECRETS_MAX", 40)
+    secrets = masking._Secrets()
+    secrets.add({"columns": ["p"], "rows": [[str(13800000000 + i)] for i in range(40)]}, {"p"})
+    assert len(secrets.weak) == masking.SECRETS_MAX
+    found = masking._Secrets()
+    found.add({"columns": ["p"], "rows": [["19914742785"]]}, {"p"})
+    # 和 run_verify_agent 交回的一样：agent 查到的在前，调用方交进去的在后
+    seen = masking.SeenValues(given=secrets)
+    seen.add(found)
+    doc = compose_doc("号码 199-1474-2785 的客户在华南。", {}, node_id="chal", run_id="r1")
+    outcome = VerifyOutcome(result={"verdict": "stands", "rationale": doc["markdown"]}, cells=[], queries=[],
+                            rationale=doc, usage={}, masked_values=seen.pooled())
+    masked = challenge_mod._masked_rationale(outcome, secrets, given=[])
+    assert masked.result["rationale"] == "号码 已遮罩 的客户在华南。"

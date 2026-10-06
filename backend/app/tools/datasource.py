@@ -53,8 +53,9 @@ RUN_VERSIONS_KEY = "data_versions"
 DATA_UNAVAILABLE = "查询失败（数据不可用）："
 #: 运行中途补固定一个源时发的那条日志事件的 code（_pin_late）
 LATE_PIN_CODE = "data_version_pinned"
-#: ToolContext.extra 里放「查询时遮掉的值」的键（engine/masking 的 _Secrets）：核查 agent（engine/verify_agent.py）放进去，
-#: 打开了遮罩开关的查询工具把每次遮掉的值并进去。只在内存里给调用方按值遮用，不进快照、不交给模型
+#: ToolContext.extra 里放「认出的遮罩值」的键（engine/masking 的 SeenValues：调用方交进来的，加上查询时遮掉的）：核查
+#: agent（engine/verify_agent.py）放进去，打开了遮罩开关的查询工具按它们按值遮，再把每次遮掉的值并进去。只在内存里给
+#: 调用方按值遮用，不进快照、不交给模型
 MASKED_VALUES_KEY = "masked_values"
 
 #: 每次查询之后基于数据目录的 SQL 检查最多等这么久。正常一条 SQL 几毫秒；等不到就放弃这一次检查，
@@ -498,9 +499,11 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
                 return f"SQL 被拒绝：{FORCED_READONLY}"
         limits = QueryLimits(timeout_seconds=seconds, **({"max_rows": int(limit)} if limit else {}))
         mask = masked_columns(source.options)
-        # 此前认出的遮罩值：交给线程的是一份拷贝，线程里读的时候这边不会再往里并
+        # 此前认出的遮罩值合起来的另一份（agent 前面的查询遮掉的在前，调用方交进来的在后，见 masking.SeenValues）：线程里
+        # 读的时候这边不会再往里并。上万个值合一遍要几十毫秒，放进线程
         sink = ctx.extra.get(MASKED_VALUES_KEY) if mask_results else None
-        known = sink.copy() if sink is not None and sink.strong else None
+        known = await asyncio.to_thread(sink.pooled) if sink is not None else None
+        known = known if known is not None and known.strong else None
         try:
             result = await run_query(source, sql, limits=limits)
         except SqlRejected as e:
@@ -538,8 +541,8 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
             if mask or done.payload is not payload:
                 payload, masked_now = done.payload, done.columns
             if sink is not None:
-                # 上万个值并一遍要几十毫秒（免遮的文字要重新过一遍），也放进线程
-                await asyncio.to_thread(sink.merge, done.secrets)
+                # 并进 agent 查到的那一份（不和调用方交进来的混在一起，上限收满了也不丢），也放进线程
+                await asyncio.to_thread(sink.add, done.secrets)
         # 对照数据目录检查这条 SQL（一对多关联后重复计算、存量跨期求和……）。结果交给模型（Agent 据此改写），
         # 也随查询快照存下：证据面板看得到，口径卡据此给指标标「存疑」、出具降档。没查出问题不加这个键，
         # 快照和以前一字不差

@@ -393,11 +393,13 @@ def _masked_rationale(outcome: VerifyOutcome, secrets: Any, *, given: Iterable[s
     换的办法同审批质询的回答（_scrubbed_source）：原文里的值先换掉，再照原来的目录重新组装理由文档；引用到的格子按
     遮好的快照渲染（文字格里夹着的遮罩值换掉那一截）。理由里认不出遮罩值的原样交回。"""
     from app.engine.evidence import compose_doc
-    from app.engine.masking import _masked_view, _scrubbed_source
+    from app.engine.masking import _masked_view, _scrubbed_source, _Secrets
 
     doc, result = outcome.rationale, outcome.result
-    pool = secrets.copy()
+    # agent 查询时遮掉的值先收（masked_values 里已经排在报告的值前面）：报告的值收满了上限 SECRETS_MAX，也不丢 agent 查到的
+    pool = _Secrets()
     pool.merge(outcome.masked_values)
+    pool.merge(secrets)
     pool.protect(given)
     if result is None or not isinstance(doc, dict) or not pool.strong:
         return outcome

@@ -7,12 +7,14 @@
 （tools/datasource.py）。这一路没有审批关卡，不能指望人在半路拦下一条 DELETE。
 
 **先遮再交。** 建查询工具时还打开遮罩开关（tools/datasource 的 mask_results）：数据源设了遮罩时，取自遮罩列的格子
-（按 SQL 认，起别名、套函数、经子查询或 WITH 转一道、SELECT *、表值函数拆开的都算）在交给模型、落进查询快照之前就
-换成「已遮罩」，别的格子按值换：这份结果里的遮罩值、前面的查询遮掉的、调用方交进来的（masked_values：审批质询、
-反方审稿收的报告快照里的值），文字格里夹着的换那一截（engine/masking.py 的 mask_query_result）；查询失败时报错原话
-里的值也换。模型看不到遮罩值，就不会把它写进回答、理由、SQL；以前是事后按值认，每一轮复核都找到新的漏法。快照里的
-masked_at_query 记下查询时就遮了的列，格子引用指到这几列、指到按值换掉的格子的都不采信。遮掉的值只在内存里交回
-调用方（VerifyOutcome.masked_values，审批质询、反方审稿按值遮的第二道防线用），不进快照、不交给模型、不进 as_dict。
+（按 SQL 认，起别名、套函数、经子查询或 WITH 转一道、SELECT *（展开的列换了名字的也算）、表值函数拆开的都算）在交给
+模型、落进查询快照之前就换成「已遮罩」，别的格子按值换：这份结果里的遮罩值、前面的查询遮掉的、调用方交进来的
+（masked_values：审批质询、反方审稿收的报告快照里的值），文字格里夹着的换那一截（engine/masking.py 的
+mask_query_result）；查询失败时报错原话里的值也换。模型看不到遮罩值，就不会把它写进回答、理由、SQL；以前是事后
+按值认，每一轮复核都找到新的漏法。快照里的 masked_at_query 记下查询时就遮了的列，格子引用指到这几列、指到按值换掉
+的格子的都不采信。遮掉的值只在内存里交回调用方（VerifyOutcome.masked_values，审批质询、反方审稿按值遮的第二道防线
+用），不进快照、不交给模型、不进 as_dict。调用方交进来的和查询时遮掉的分开记（masking.SeenValues），合起来时 agent
+查到的在前：合起来到了上限 SECRETS_MAX，挤掉的是报告里的值。
 
 **数从快照取。** 每次成功的查询是一份查询快照（工具自己落的 put_json），按这个 agent 自己的顺序编 Q1、Q2…。
 最后交结果时，调用方结构里的数值字段一律改成格子引用 {alias, row, column}，由代码按引用从快照里取值：模型自己
@@ -67,7 +69,7 @@ from app.engine import spend
 from app.engine.evidence import build_catalog, cell_eid, compose_doc, query_entry_fields, schema_ledger_entry
 from app.engine.expressions import CellError, column_kind, locate_cell, numeric_text
 from app.engine.judge import FALLBACK_MAX_TOKENS, MAX_TOKENS, _json_in, _tokens, _usd
-from app.engine.masking import _masked_word, _Secrets
+from app.engine.masking import SeenValues, _masked_word, _Secrets
 from app.engine.nodes.llm import _DIGEST_BUDGET, _digest, _split_structured, _typed, explain_model_error
 from app.engine.state import message_text
 from app.engine.toolcalls import ToolTimeout, limit_fields, limit_of, run_bounded
@@ -160,8 +162,9 @@ class VerifyOutcome:
     output_tokens, total_tokens, cost_usd, calls, unpriced_calls}。limit：触顶原因（LIMITS 之一），没触顶为 None。
     answered：模型是不是自己停下来的（没被上限掐断，也没因为输出到了上限被截断）。被截断的一律没有结果，error 是
     TRUNCATED_ERROR。
-    masked_values：查询时在工具边界遮掉的值（engine/masking 的 _Secrets），连同调用方交进来的。只在内存里交给调用方按值遮
-    （审批质询的回答、反方审稿的理由），不进 as_dict、不往外交。
+    masked_values：查询时在工具边界遮掉的值（engine/masking 的 _Secrets），连同调用方交进来的：agent 查到的在前，合起来
+    到了上限 SECRETS_MAX 挤掉的是调用方的（SeenValues.pooled）。只在内存里交给调用方按值遮（审批质询的回答、反方审稿的
+    理由），不进 as_dict、不往外交。
     """
 
     result: dict[str, Any] | None
@@ -670,9 +673,9 @@ class _State:
     queries: list[dict[str, Any]] = field(default_factory=list)
     ledger: list[dict[str, Any]] = field(default_factory=list)
     model: str | None = None
-    #: 查询工具在工具边界遮掉的值（经 ToolContext.extra 并进来，只在内存里），起头是调用方交进来的。后面的查询按它们
-    #: 按值遮
-    seen: _Secrets = field(default_factory=_Secrets)
+    #: 认出的遮罩值（只在内存里）：调用方交进来的，加上查询工具在工具边界遮掉的（经 ToolContext.extra 并进来）。后面的
+    #: 查询按它们按值遮，最后合起来交回调用方（run_verify_agent），agent 查到的在前
+    seen: SeenValues = field(default_factory=SeenValues)
 
     def outcome(self, **fields: Any) -> VerifyOutcome:
         usage = self.usage
@@ -682,8 +685,7 @@ class _State:
                  for q in self.queries]
         base: dict[str, Any] = {"result": None, "cells": [], "queries": shown, "rationale": None, "usage": usage,
                                 "notes": self.notes, "model": self.model,
-                                "duration_ms": int((time.monotonic() - self.started) * 1000),
-                                "masked_values": self.seen}
+                                "duration_ms": int((time.monotonic() - self.started) * 1000)}
         return VerifyOutcome(**{**base, **fields})
 
 
@@ -720,20 +722,25 @@ async def run_verify_agent(
       data_versions；不在运行里传 Versions.CURRENT；缺省 UNSET 时上传源一律报错，不拿当前版本顶上）。
     - masked_values：调用方已经认出的遮罩值（engine/masking 的 _Secrets，审批质询、反方审稿收的报告快照里的值）。
       查询工具从第一条查询起就按它们按值遮：agent 查到的备注、别的表里写着同一个号码时，模型看不到。随查询时遮掉的值
-      一起交回（VerifyOutcome.masked_values）。
+      一起交回（VerifyOutcome.masked_values）。不改它。
     """
-    state = _State(started=time.monotonic())
+    state = _State(started=time.monotonic(), seen=SeenValues(
+        given=masked_values if masked_values is not None else _Secrets()))
     try:
-        if masked_values is not None:
-            # 上万个值并一遍要几十毫秒，放进线程，别挡住同一进程里别的运行
-            await asyncio.to_thread(state.seen.merge, masked_values)
-        return await _verify(state, spec=spec, system=system, task=task, sources=sources,
-                             output_schema=output_schema, max_queries=max_queries, timeout_s=timeout_s,
-                             max_cost_usd=max_cost_usd, daily_max_usd=daily_max_usd, max_steps=max_steps, emit=emit,
-                             run_id=run_id, node_id=node_id, data_versions=data_versions)
+        out = await _verify(state, spec=spec, system=system, task=task, sources=sources,
+                            output_schema=output_schema, max_queries=max_queries, timeout_s=timeout_s,
+                            max_cost_usd=max_cost_usd, daily_max_usd=daily_max_usd, max_steps=max_steps, emit=emit,
+                            run_id=run_id, node_id=node_id, data_versions=data_versions)
     except Exception as e:  # noqa: BLE001 - 永远不抛：库写不进去、建工具出错这类意外也落在返回值里
         logger.warning("核查出错", exc_info=True)
-        return state.outcome(error=f"核查出错（{describe_exception(e)}）")
+        out = state.outcome(error=f"核查出错（{describe_exception(e)}）")
+    try:
+        # agent 查到的在前、调用方交进来的在后：上万个值合一遍要几十毫秒，放进线程，别挡住同一进程里别的运行
+        pooled = await asyncio.to_thread(state.seen.pooled)
+    except Exception:  # noqa: BLE001 - 永远不抛：合不起来就只交调用方交进来的（agent 的查询结果在工具边界已经遮过）
+        logger.warning("核查遮掉的值合并出错", exc_info=True)
+        pooled = state.seen.given
+    return replace(out, masked_values=pooled)
 
 
 async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sources: Iterable[str],

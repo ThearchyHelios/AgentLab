@@ -11,16 +11,19 @@
   审稿理由里的按值遮降为第二道防线。查询失败时报错原话里的值也换（mask_error_text）
 
 - 哪些列（_derived_hidden）：从遮罩列本身起，按 SQL 一层层认出值取自遮罩列的结果列（别名、函数、子查询、WITH、UNION 的
-  另一支、和 * 写在同一支里没起别名的表达式、FROM 里拆开遮罩列的表值函数）；COUNT 只数个数、窗口的分区键只决定次序、
-  按遮罩列分档又当分组键或套在汇总里数个数的、汇总里的 CASE 只在条件里用到的不算（_value_columns、_band_only）。认不出
-  落在哪一列的、SQL 解析不了又写着遮罩列的，整份快照的列都算。双盲复算按同一套认法在派盲算之前挡下取自遮罩列的指标
-  （derived_columns）
+  另一支、和 * 写在同一支里没起别名的表达式、FROM 里拆开遮罩列的表值函数、函数参数里的 JSON 箭头 col->'path'）；* 把
+  遮罩列带进别的列名的（写了列名表的派生来源、UNION 后一支的 *、标量子查询里的 *）按它展开落到的位置算（_star_places，
+  展开数据源里的表的按查询当时冻结的表结构数位置，_schema_columns）。
+  COUNT 只数个数、窗口的分区键只决定次序、按遮罩列分档又当分组键或套在汇总里数个数的、汇总里的 CASE 只在条件里用到的
+  不算（_value_columns、_band_only）。认不出落在哪一列的、SQL 解析不了又写着遮罩列的，整份快照的列都算。双盲复算按同一套
+  认法在派盲算之前挡下取自遮罩列的指标（derived_columns）
 - 只装着分档标签的列（_label_columns）：标签是 agent 写在 SQL 里的字，不当遮罩值；* 展开数据源里的表时按冻结的表结构
   认它带不带同名的列（_schema_tables）
 - 哪些值（_Secrets）：遮罩列里出现过的值，按值认有门槛（SECRET_MIN、SECRET_DIGITS），换的时候先按词、按开头几个字筛出
   正文里真有的那几个值，不现编上万个分支的正则；正文、文字格、SQL 的字符串和注释里换了写法的长号码（199-1474-2785、
   +86 …、全角数字）按纯数字写法在集合里查（loose_spans）；已经摆在读者眼前的值免遮，之后并进来的照样免（protected）
 - 快照遮好的样子（_masked_view），回答时才认得出、事后要照位置重放的地方（view_edits、replay_edits）
+- 一次核查里认出的遮罩值（SeenValues）：调用方交进来的和 agent 查询时遮掉的分开记，合起来时 agent 查到的在前
 
 除 mask_query_result、换了写法的号码和这一轮新加的几样之外，这里的函数原来都在 engine/inquiry.py 里，名字不变，
 inquiry 照旧导出（别处按 inquiry 的名字引用）。
@@ -32,7 +35,7 @@ import functools
 import json
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -72,16 +75,26 @@ def _masked_word() -> str:
 # --------------------------------------------------------------------------
 
 
+#: _value_columns 里「值可能取自数据源里一张表的任何一列」：套在里面的子查询里的 * 展开了表，SQL 里看不出这张表有哪几列。
+#: 按它认（_reads）一律算取自遮罩列（宁可多遮）；真实的列名不会是这个
+_ANY_COLUMN = "*"
+
+
 def _value_columns(node: Any) -> set[str]:
     """一个选出列的值取自哪些列（列名小写）。COUNT 里的只数个数，窗口的分区键、排序键只决定次序，结果全是写死常量的
     分档（_band_only：当分组键，或者套在汇总里按条件数个数）只决定一行落在哪一档，都带不出值，不算；套在里面的子查询
     只看它选出来的列（它的条件、连接里写的列带不出值）。汇总里的 CASE / IIF 只看各个结果：条件只决定这一行算不算进来，
     同写在 WHERE 里（SUM(CASE WHEN buyer_phone IS NOT NULL THEN amount ELSE 0 END) 的值全部来自金额）；不汇总的逐行
-    CASE 照旧连条件一起算（每一行落在哪一支本身就是这一行的信息）。"""
+    CASE 照旧连条件一起算（每一行落在哪一支本身就是这一行的信息）。
+    套在里面的子查询选的是 *（标量子查询、ARRAY(SELECT * …)）：值取自 * 展开的来源（_star_inputs），派生来源看它的各个
+    选出项，表值函数看参数，展开了数据源里的表的记成 _ANY_COLUMN；EXISTS 里的 * 只说有没有，不算。函数参数里的
+    col->'path'（JSON 箭头）被解析器当成以 col 为参数的 lambda，参数名照列名收（真的 lambda 的参数多算一列无害）。"""
     from sqlglot import exp
 
     out: set[str] = set()
     stack = [node]
+    # 已经展开过的派生来源：递归的 CTE 里 * 展开它自己时不再绕回去
+    expanded = {id(node)}
     while stack:
         item = stack.pop()
         if isinstance(item, exp.Column):
@@ -94,11 +107,30 @@ def _value_columns(node: Any) -> set[str]:
             stack.extend(r for r in results if r is not None)
         elif isinstance(item, exp.Window):
             stack.append(item.this)
+        elif isinstance(item, exp.Lambda):
+            out.update(p.name.lower() for p in item.expressions if isinstance(p, exp.Identifier) and p.name)
+            stack.append(item.this)
         elif isinstance(item, exp.Select):
-            stack.extend(item.expressions)
+            for part in item.expressions:
+                if not _is_star(part):
+                    stack.append(part)
+                elif not isinstance(item.parent, exp.Exists):
+                    inputs = _star_inputs(part, item)
+                    if inputs is None:
+                        out.add(_ANY_COLUMN)
+                        continue
+                    fresh = [n for n in inputs if id(n) not in expanded]
+                    expanded.update(id(n) for n in fresh)
+                    stack.extend(fresh)
         else:
             stack.extend(item.iter_expressions())
     return out
+
+
+def _reads(names: set[str], columns: set[str]) -> bool:
+    """值取自 columns（_value_columns）的一项是不是取自 names：有一列对上，或者 * 展开了数据源里的表（_ANY_COLUMN，说不清
+    带出的是哪一列）。"""
+    return bool(names & columns) or _ANY_COLUMN in columns
 
 
 def _aggregated(node: Any) -> bool:
@@ -228,6 +260,26 @@ def _schema_tables(schema: Any) -> dict[str, set[str]] | None:
                      str(meta.get("qualified") or key).lower().rsplit(".", 1)[-1]}:
             out.setdefault(name, set()).update(names)
     return out
+
+
+def _schema_columns(schema: Any) -> dict[str, list[str]] | None:
+    """冻结的表结构 → {表名（小写）: 按表里次序的列名（小写）}，名字的记法同 _schema_tables；几个库里同名、列又不一样的表
+    不记（说不清 * 展开的是哪一张）。* 展开数据源里的表时按它数位置（_star_columns）；整份拿不到的为 None。"""
+    tables = schema.get("tables") if isinstance(schema, dict) else None
+    if not isinstance(tables, dict):
+        return None
+    out: dict[str, list[str]] = {}
+    clashed: set[str] = set()
+    for key, meta in tables.items():
+        columns = meta.get("columns") if isinstance(meta, dict) else None
+        if not isinstance(columns, list) or not all(isinstance(c, dict) and c.get("name") is not None for c in columns):
+            continue
+        names = [str(c["name"]).lower() for c in columns]
+        for name in {str(key).lower(), str(key).lower().rsplit(".", 1)[-1],
+                     str(meta.get("qualified") or key).lower().rsplit(".", 1)[-1]}:
+            if out.setdefault(name, names) != names:
+                clashed.add(name)
+    return {name: names for name, names in out.items() if name not in clashed}
 
 
 def _table_lacks(source: Any, name: str, memo: _LabelMemo) -> bool:
@@ -577,6 +629,165 @@ def _places(branch: list[Any], width: int | None) -> list[int | None]:
             for i in range(len(branch))]
 
 
+#: 按位置数 * 展开成的列最多往下数几层：再深的（递归的 CTE 绕回自己）按数不清算
+_STAR_DEPTH = 16
+#: * 上的改动（DuckDB 一类的 EXCLUDE / REPLACE / RENAME / ILIKE）：展开成的列不再是来源那几列的原样，不按位置数
+_STAR_EDITS = ("except_", "replace", "rename", "ilike")
+
+
+def _star_sources(star: Any, select: Any) -> list[Any] | None:
+    """select 里的这个 * 展开的是哪几个来源：没写表名的是 FROM、JOIN、LATERAL VIEW 里的全部，写了的（t.*）只有那一个；
+    写的表名对不上任何来源（外层的表）为 None。"""
+    from sqlglot import exp
+
+    sources = _from_sources(select) + [((lateral.alias_or_name or "").lower(), lateral)
+                                       for lateral in select.args.get("laterals") or []]
+    qualifier = (star.table.lower() or None) if isinstance(star, exp.Column) else None
+    if qualifier is None:
+        return [source for _, source in sources]
+    found = [source for alias, source in sources if alias == qualifier]
+    return found or None
+
+
+def _star_inputs(star: Any, select: Any) -> list[Any] | None:
+    """* 带出的值取自哪里：要接着看的节点——派生来源的每一支（值取自它的各个选出项），表值函数、VALUES 这类来源本身
+    （值取自参数）。展开了数据源里的表、写的表名对不上任何来源的为 None：SQL 里看不出这张表有哪几列，哪一列都可能带出来。"""
+    from sqlglot import exp
+
+    sources = _star_sources(star, select)
+    if sources is None:
+        return None
+    out: list[Any] = []
+    for source in sources:
+        derived = _derived_block(source)
+        if derived is not None:
+            out += _leaves(derived[0])
+        elif isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
+            return None
+        else:
+            out.append(source)
+    return out
+
+
+def _star_feeds(star: Any, select: Any, names: set[str]) -> bool:
+    """select 里的这个 * 带出的值里有没有取自 names 的（展开了数据源里的表的一律算，见 _star_inputs）。"""
+    inputs = _star_inputs(star, select)
+    return inputs is None or any(_reads(names, _value_columns(node)) for node in inputs)
+
+
+def _table_columns(source: Any, tables: dict[str, list[str]] | None) -> list[str] | None:
+    """FROM 里的这个来源是数据源里的一张表、冻结的表结构里查得到它时，它按次序的列名（_schema_columns）；别的为 None。"""
+    from sqlglot import exp
+
+    if not tables or not isinstance(source, exp.Table) or not isinstance(source.this, exp.Identifier):
+        return None
+    return tables.get(source.name.lower())
+
+
+def _single_source(star: Any, select: Any, depth: int) -> Any:
+    """* 只展开一个来源、展开成的就是那个来源的列原样（没带 EXCLUDE 这类改动）时，那个来源；别的为 None。"""
+    from sqlglot import exp
+
+    node = star.this if isinstance(star, exp.Column) else star
+    if depth > _STAR_DEPTH or any(node.args.get(k) for k in _STAR_EDITS):
+        return None
+    sources = _star_sources(star, select)
+    return sources[0] if sources is not None and len(sources) == 1 else None
+
+
+def _star_columns(star: Any, select: Any, names: set[str], memo: dict[int, Any],
+                  tables: dict[str, list[str]] | None, depth: int = 0) -> list[bool] | None:
+    """* 展开成的每一列（按位置）取不取自 names：只展开一个来源时才数得清——派生来源按它的每一列（_block_columns），数据源
+    里的表按查询当时冻结的表结构（tables，_schema_columns）。表结构里查不到的表、几个来源（按同名列连起来的会合成一列）、
+    表值函数，或者 * 带着 EXCLUDE / REPLACE 这类改动的，为 None。"""
+    source = _single_source(star, select, depth)
+    if source is None:
+        return None
+    if (derived := _derived_block(source)) is not None:
+        return _block_columns(derived[0], names, memo, tables, depth + 1)
+    columns = _table_columns(source, tables)
+    return [column in names for column in columns] if columns is not None else None
+
+
+def _block_columns(block: Any, names: set[str], memo: dict[int, Any], tables: dict[str, list[str]] | None,
+                   depth: int = 0) -> list[bool] | None:
+    """一块查询（派生来源）的每一列（按位置）取不取自 names：每一支一项项数，* 按它展开成的几列数（_star_columns），任何
+    一支的那一列取自 names 就算；有一支数不清、几支不一样宽的为 None。memo 记下数过的（id(那块查询) → 结果）。"""
+    from sqlglot import exp
+
+    if id(block) in memo:
+        return memo[id(block)]
+    memo[id(block)] = None
+    rows: list[list[bool]] = []
+    for leaf in _leaves(block):
+        if not isinstance(leaf, exp.Select):
+            return None
+        row: list[bool] = []
+        for item in leaf.expressions:
+            if not _is_star(item):
+                row.append(_reads(names, _value_columns(item)))
+            elif (spread := _star_columns(item, leaf, names, memo, tables, depth)) is not None:
+                row += spread
+            else:
+                return None
+        rows.append(row)
+    if not rows or len({len(row) for row in rows}) != 1:
+        return None
+    memo[id(block)] = [any(column) for column in zip(*rows)]
+    return memo[id(block)]
+
+
+def _branch_names(select: Any, tables: dict[str, list[str]] | None, depth: int = 0) -> list[str | None] | None:
+    """一支（一条 SELECT）结果里按次序的列名：没起别名的表达式为 None（_output_name 认不准的）；* 按它展开成的列名
+    （只展开一个来源时：数据源里的表按表结构，派生来源按它写的列名表、第一支的列名）。有 * 说不清展开成哪几列的为 None。
+    UNION 第一支是 * 时，后一支的值按位置落进的就是这几个名字（_source_names）。"""
+    from sqlglot import exp
+
+    out: list[str | None] = []
+    for item in select.expressions:
+        if not _is_star(item):
+            out.append(_output_name(item))
+            continue
+        source = _single_source(item, select, depth)
+        if source is None:
+            return None
+        if (derived := _derived_block(source)) is not None:
+            block, listed = derived
+            first = _leaves(block)[0]
+            names = list(listed) if listed is not None else (
+                _branch_names(first, tables, depth + 1) if isinstance(first, exp.Select) else None)
+        else:
+            names = _table_columns(source, tables)
+        if names is None:
+            return None
+        out += names
+    return out
+
+
+def _star_places(select: Any, width: int | None, names: set[str], tables: dict[str, list[str]] | None = None
+                 ) -> set[int] | None:
+    """select 这一支里的 * 把取自 names 的值带到了结果（width 列）的哪几列。* 展开的列落在第一个 * 起、最后一个 * 后面
+    那几项之前的那一段：只有一个 *、它展开成的每一列都数得清的（_star_columns：派生来源，表结构里查得到的表）只算取自
+    names 的那几列，别的整段都算。数出来的列数和这一段对不上的（表结构过期了）也整段算。没有 * 带出这样的值为空；不知道
+    结果有几列、* 前后的几项就比结果还宽的为 None。
+    用在 * 展开的列换了名字的地方：写了列名表的派生来源（WITH t(a, b) AS (SELECT * FROM sales)）、UNION 后一支的 *
+    （结果的列名取第一支的）。"""
+    branch = list(select.expressions)
+    stars = [i for i, item in enumerate(branch) if _is_star(item)]
+    # 展开数据源里的表的一律算带出了遮罩列的值：表结构只用来数位置，不用来断定这张表没有遮罩列（表结构可能过期）
+    if not any(_star_feeds(branch[i], select, names) for i in stars):
+        return set()
+    if width is None:
+        return None
+    first, end = stars[0], width - (len(branch) - 1 - stars[-1])
+    if end < first:
+        return None
+    spread = _star_columns(branch[first], select, names, {}, tables) if len(stars) == 1 else None
+    if spread is not None and len(spread) == end - first:
+        return {first + k for k, hit in enumerate(spread) if hit}
+    return set(range(first, end))
+
+
 def _blocks(root: Any) -> list[tuple[Any, str, list[str] | None]]:
     """SQL 里的每一块查询（一条 SELECT，或者 UNION 这类连起来的一串）和它的结果流到哪：
     - "result"：最外层，结果就是快照的列；
@@ -608,10 +819,16 @@ def _blocks(root: Any) -> list[tuple[Any, str, list[str] | None]]:
     return out
 
 
-def _source_names(top: Any, listed: list[str] | None, names: set[str]) -> tuple[set[str], bool]:
+def _source_names(top: Any, listed: list[str] | None, names: set[str],
+                  tables: dict[str, list[str]] | None = None) -> tuple[set[str], bool]:
     """派生来源的结果里值取自遮罩列的那几列的名字，以及有没有认不出名字的（没起别名的表达式、两个 * 之间的项）。
-    写了列名表的按位置对上列名表；没写的，单独一条 SELECT 取各项自己的列名，UNION 这类按位置对上第一支的列名。"""
-    branches = _branches(top)
+    写了列名表的按位置对上列名表；没写的，单独一条 SELECT 取各项自己的列名，UNION 这类按位置对上第一支的列名。
+    * 带出遮罩列的值、展开的列又换了名字的（写了列名表、UNION 后一支的 *），它展开落到的那几列照位置对上（_star_places）；
+    单独一条 SELECT、第一支的 * 不改名，遮罩列照原名传出去，按名字就认得出。第一支的 * 展开成哪几列数得清的（_branch_names），
+    后一支落进去的位置按它对上列名。tables 是查询当时冻结的表结构（_schema_columns），* 展开数据源里的表时按它数位置。"""
+    from sqlglot import exp
+
+    selects = [leaf for leaf in _leaves(top) if isinstance(leaf, exp.Select)]
     found: set[str] = set()
     unknown = False
 
@@ -622,28 +839,39 @@ def _source_names(top: Any, listed: list[str] | None, names: set[str]) -> tuple[
         else:
             found.add(name)
 
+    def taken(select: Any, width: int | None, head: Callable[[int | None], str | None]) -> None:
+        branch = list(select.expressions)
+        for item, place in zip(branch, _places(branch, width)):
+            if not _is_star(item) and _reads(names, _value_columns(item)):
+                take(head(place))
+        spread = _star_places(select, width, names, tables)
+        for place in sorted(spread) if spread is not None else [None]:
+            take(head(place))
+
     if listed is not None:
-        for branch in branches:
-            for item, place in zip(branch, _places(branch, len(listed))):
-                if names & _value_columns(item):
-                    take(listed[place] if place is not None and place < len(listed) else None)
+        for select in selects:
+            taken(select, len(listed), lambda p: listed[p] if p is not None and p < len(listed) else None)
         return found, unknown
-    first = branches[0] if branches else []
+    first = list(selects[0].expressions) if selects else []
     for item in first:
-        if names & _value_columns(item):
+        if not _is_star(item) and _reads(names, _value_columns(item)):
             take(_output_name(item))
-    if len(branches) > 1:
-        # 每一支一样宽：拿一支没有 * 的定宽度，* 后面的项才数得出位置
-        width = next((len(b) for b in branches if not any(_is_star(i) for i in b)), None)
-        heads = {place: _output_name(item) for item, place in zip(first, _places(first, width)) if place is not None}
-        for branch in branches[1:]:
-            for item, place in zip(branch, _places(branch, width)):
-                if names & _value_columns(item):
-                    take(heads.get(place) if place is not None else None)
+    if len(selects) > 1:
+        header = _branch_names(selects[0], tables)
+        if header is not None:
+            width, heads = len(header), dict(enumerate(header))
+        else:
+            # 每一支一样宽：拿一支没有 * 的定宽度，* 后面的项才数得出位置
+            width = next((len(s.expressions) for s in selects if not any(_is_star(i) for i in s.expressions)), None)
+            heads = {place: _output_name(item) for item, place in zip(first, _places(first, width))
+                     if place is not None}
+        for select in selects[1:]:
+            taken(select, width, lambda p: heads.get(p) if p is not None else None)
     return found, unknown
 
 
-def _tainted(sql: str, kind: str | None, masked: set[str], width: int) -> tuple[set[str], set[int]] | None:
+def _tainted(sql: str, kind: str | None, masked: set[str], width: int, tables: dict[str, list[str]] | None = None
+             ) -> tuple[set[str], set[int]] | None:
     """SQL 里指代遮罩列的名字（小写），和结果（width 列）里值取自遮罩列的那几列的位置。解析不了返回 None。
 
     名字从遮罩列本身起，一层层传下去：选出列的值取自这些名字的（buyer_phone AS 手机号、UPPER(buyer_phone) AS x），它的
@@ -653,7 +881,10 @@ def _tainted(sql: str, kind: str | None, masked: set[str], width: int) -> tuple[
     后面的从末尾倒着数。认不出的——两个 * 之间的项、派生来源里没起别名的表达式（外层的 * 会把它原样带出来，列名
     又认不准）——整份快照的列都算（同解析不了）。
     FROM、JOIN、LATERAL 里的表值函数（json_each、unnest、JSON_TABLE、LATERAL VALUES）参数里写着这些名字的，它出的列
-    都算（_function_columns）：遮罩列是 JSON 时，json_each 拆开是最自然的写法。出哪几列说不清的整份快照都算。"""
+    都算（_function_columns）：遮罩列是 JSON 时，json_each 拆开是最自然的写法。出哪几列说不清的整份快照都算。
+    * 展开的列换了名字（写了列名表的派生来源、UNION 后一支的 *）：* 带出这些名字的值时，它展开落到的那几列照位置算
+    （_star_places，展开数据源里的表的按 tables 数位置，数不清的整段算）；标量子查询里的 * 按 _value_columns 算进外层的
+    表达式。"""
     from sqlglot import exp
 
     from app.data.sql_semantics import _parse, _read
@@ -676,29 +907,37 @@ def _tainted(sql: str, kind: str | None, masked: set[str], width: int) -> tuple[
             for select_ in selects:
                 for item in select_.expressions:
                     name = item.alias_or_name.lower()
-                    if name and name not in names and names & _value_columns(item):
+                    if name and not _is_star(item) and name not in names and _reads(names, _value_columns(item)):
                         names.add(name)
             for top, listed in sources:
-                names |= _source_names(top, listed, names)[0]
+                names |= _source_names(top, listed, names, tables)[0]
             for source in functions:
-                if names & _value_columns(source):
+                if _reads(names, _value_columns(source)):
                     columns = _function_columns(source)
                     unreadable = unreadable or columns is None
                     names |= columns or set()
             if len(names) == before:
                 break
-        everything = unreadable or any(_source_names(top, listed, names)[1] for top, listed in sources)
+        everything = unreadable or any(_source_names(top, listed, names, tables)[1] for top, listed in sources)
         positions: set[int] = set()
         for top, role, _listed in blocks:
             if role != "result":
                 continue
-            for branch in _branches(top):
+            branches = [leaf for leaf in _leaves(top) if isinstance(leaf, exp.Select)]
+            for k, select_ in enumerate(branches):
+                branch = list(select_.expressions)
                 for item, place in zip(branch, _places(branch, width)):
-                    if names & _value_columns(item):
+                    if not _is_star(item) and _reads(names, _value_columns(item)):
                         if place is None or place >= width:
                             everything = True
                         else:
                             positions.add(place)
+                # UNION 后一支的 * 按位置落进第一支起的列名里；第一支、单独一条 SELECT 的 * 照原名带出，按名字认得出
+                spread = _star_places(select_, width, names, tables) if k else set()
+                if spread is None or any(place >= width for place in spread):
+                    everything = True
+                else:
+                    positions |= spread
         return names, set(range(width)) if everything else positions
     except Exception:  # noqa: BLE001 - 分析本身的缺陷不能让回答出错：按解析不了处理（宁可多遮）
         logger.warning("质询的 SQL 遮罩分析失败", exc_info=True)
@@ -709,8 +948,10 @@ def _mentions(sql: str, names: Iterable[str]) -> bool:
     return any(re.search(rf"(?<![0-9A-Za-z_]){re.escape(n)}(?![0-9A-Za-z_])", sql, re.I) for n in names if n)
 
 
-def _derived_hidden(snapshot: dict[str, Any], hidden: set[str], kind: str | None) -> tuple[set[str], set[str]]:
-    """(这份快照要遮的列, SQL 里指代遮罩列的名字)，都是小写。
+def _derived_hidden(snapshot: dict[str, Any], hidden: set[str], kind: str | None,
+                    tables: dict[str, list[str]] | None = None) -> tuple[set[str], set[str]]:
+    """(这份快照要遮的列, SQL 里指代遮罩列的名字)，都是小写。tables 是查询当时冻结的表结构（_schema_columns），* 展开
+    数据源里的表时按它数位置；没给的按快照记着的表结构快照（schema_artifact）认，和工具边界遮的时候是同一份。
 
     证据面板只按列名遮（hidden）；agent 的查询起了别名、套了函数，结果列名就对不上。本仓库的查询惯例是起中文别名
     （region AS 区域），所以按 SQL 认出改了名字的遮罩列（_tainted）。SQL 解析不了、里面又写着遮罩列的，整份快照的
@@ -720,7 +961,7 @@ def _derived_hidden(snapshot: dict[str, Any], hidden: set[str], kind: str | None
     if not base or not isinstance(sql, str) or not sql.strip() or snapshot.get("source") == MERGE_SOURCE:
         return base, base
     columns = [str(c) for c in snapshot.get("columns") or []]
-    found = _tainted(sql, kind, base, len(columns))
+    found = _tainted(sql, kind, base, len(columns), _snapshot_columns(snapshot) if tables is None else tables)
     if found is None:
         return (base | {c.lower() for c in columns}, base) if _mentions(sql, base) else (base, base)
     names, positions = found
@@ -729,12 +970,13 @@ def _derived_hidden(snapshot: dict[str, Any], hidden: set[str], kind: str | None
 
 def derived_columns(snapshot: dict[str, Any], hidden: set[str], kind: str | None) -> set[str] | None:
     """按 SQL 认出值取自遮罩列（hidden，小写）的结果列（小写，列名直接对上的也算）。SQL 解析不了、合并查询的快照（不看
-    SQL）为 None：认不准，宽严由调用方定（_derived_hidden 整份遮；双盲复算照常派盲算，由盲算自己的查询去认）。"""
+    SQL）为 None：认不准，宽严由调用方定（_derived_hidden 整份遮；双盲复算照常派盲算，由盲算自己的查询去认）。表结构同
+    _derived_hidden，按快照记着的表结构快照认。"""
     sql = snapshot.get("sql")
     if not hidden or not isinstance(sql, str) or not sql.strip() or snapshot.get("source") == MERGE_SOURCE:
         return None
     columns = [str(c) for c in snapshot.get("columns") or []]
-    found = _tainted(sql, kind, set(hidden), len(columns))
+    found = _tainted(sql, kind, set(hidden), len(columns), _snapshot_columns(snapshot))
     if found is None:
         return None
     names, positions = found
@@ -751,6 +993,23 @@ def _snapshot_labels(snapshot: dict[str, Any], kind: str | None, tables: dict[st
     if tables is None and isinstance(snapshot.get("schema_artifact"), str):
         tables = _frozen_tables(snapshot["schema_artifact"])
     return _label_columns(sql, kind, [str(c) for c in snapshot.get("columns") or []], tables)
+
+
+def _snapshot_columns(snapshot: dict[str, Any]) -> dict[str, list[str]] | None:
+    """快照记着的表结构快照（schema_artifact，查询当时冻结的，和工具边界遮的时候用的是同一份）里按次序的列名。"""
+    artifact = snapshot.get("schema_artifact")
+    return _frozen_columns(artifact) if isinstance(artifact, str) else None
+
+
+@functools.lru_cache(maxsize=64)
+def _frozen_columns(artifact: str) -> dict[str, list[str]] | None:
+    """表结构快照工件里每张表按次序的列名（_schema_columns）。同 _frozen_tables：按内容寻址，记下来；取不到的为 None。"""
+    from app.core import artifact_store
+
+    try:
+        return _schema_columns(artifact_store.load(artifact))
+    except Exception:  # noqa: BLE001 - 取不到就当不知道表结构（* 展开表的整段遮，宁可多遮）
+        return None
 
 
 @functools.lru_cache(maxsize=64)
@@ -1489,16 +1748,39 @@ class QueryMask:
     secrets: _Secrets
 
 
+@dataclass
+class SeenValues:
+    """一次核查里认出的遮罩值，只在内存里：given 是调用方交进来的（审批质询、反方审稿收的报告快照里的值），found 是
+    agent 自己的查询在工具边界遮掉的（tools/datasource 每次查询并进来，add）。两份分开记：合起来（pooled）时 agent 查到的
+    在前，到了上限 SECRETS_MAX 挤掉的是报告里的值——agent 查到的就在它眼前这几份结果里，后面的查询、它写的回答和理由
+    最可能再碰到。以前先并报告的值，收满了上限，agent 查到的一个也并不进去。"""
+
+    given: _Secrets = field(default_factory=_Secrets)
+    found: _Secrets = field(default_factory=_Secrets)
+
+    def add(self, secrets: _Secrets) -> None:
+        """并进一次查询时遮掉的值（mask_query_result 交回的 secrets）。"""
+        self.found.merge(secrets)
+
+    def pooled(self) -> _Secrets:
+        """合起来的另一份（改它不影响这两份）：agent 查到的在前，调用方交进来的在后；调用方免遮的文字（问题、被审的那句
+        结论原文里写着的值）对两边都算。上万个值合一遍要几十毫秒，调用方放进线程。"""
+        out = self.found.copy()
+        out.merge(self.given)
+        return out
+
+
 def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str | None,
                       known: _Secrets | None = None, *, schema: Any = None) -> QueryMask:
     """一份查询结果（tools/datasource 的查询工具交回的样子：columns / rows / column_types / sql）在交给核查 agent、落进
     快照之前先遮。masked 是数据源设了遮罩的列，kind 是数据源的类型（SQL 按它的方言解析）。known 是此前已经认出的遮罩值：
     这个 agent 前面的查询遮掉的，加上调用方交进来的（审批质询、反方审稿收的报告快照里的值）。schema 是数据源的表结构
-    （schema_cache，和随快照冻结的是同一份），认分档标签时用（_label_columns 的 tables）。
+    （schema_cache，和随快照冻结的是同一份）：认分档标签（_label_columns 的 tables）、数 * 展开数据源里的表落在第几列
+    （_derived_hidden 的 tables）时用。
 
     - 整列遮：列名直接对上遮罩列的，加上按 SQL 认出值取自遮罩列的（_derived_hidden：别名、函数、子查询、WITH、
-      SELECT *、表值函数；COUNT、只在条件里用到、分档当分组键的不算）；SQL 解析不了、又写着遮罩列的，整份结果的列都遮。
-      这几列的格子换成「已遮罩」，类型记成文本
+      SELECT *（展开的列换了名字的也算）、表值函数；COUNT、只在条件里用到、分档当分组键的不算）；SQL 解析不了、又写着
+      遮罩列的，整份结果的列都遮。这几列的格子换成「已遮罩」，类型记成文本
     - 别的列按值换：整格就是遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，_Secrets.loose_spans）。遮罩值
       是这份结果里的加上 known：先查号码、再查写着号码的备注、没设遮罩的联系方式表（别的库里的也一样）时，后一份同样
       遮好。门槛同按值遮（SECRET_DIGITS、SECRET_MIN）；只装着分档标签的列里的标签不算遮罩值，这份结果自己写的标签也不
@@ -1514,7 +1796,7 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
     if not (base or given) or not columns or not _query_shaped(payload):
         return QueryMask(payload, [], _Secrets())
     try:
-        hidden = _derived_hidden(payload, base, kind)[0] if base else set()
+        hidden = _derived_hidden(payload, base, kind, _schema_columns(schema))[0] if base else set()
         own = _Secrets()
         labels = _snapshot_labels(payload, kind, _schema_tables(schema))
         if any(c.lower() in hidden for c in columns):
