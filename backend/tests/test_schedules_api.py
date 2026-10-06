@@ -40,7 +40,7 @@ SECRET = "SECdemo-api-not-real-7"
 SCHEDULE_KEYS = {"id", "name", "workflow_id", "workflow_name", "cron", "timezone", "run_class", "input_template",
                  "enabled", "overlap", "misfire_grace_s", "webhook", "next_run_at", "last_fire", "description_text",
                  "created_by", "created_at", "updated_at", "version"}
-FIRE_KEYS = {"id", "fire_at", "kind", "status", "run_id", "run_status", "reason", "notified", "created_at"}
+FIRE_KEYS = {"id", "fire_at", "kind", "status", "run_id", "run_status", "reason", "notified", "compare", "created_at"}
 
 
 @pytest.fixture(autouse=True)

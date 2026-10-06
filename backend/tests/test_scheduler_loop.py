@@ -369,9 +369,20 @@ async def test_start_does_nothing_when_switched_off():
     await scheduler.stop()
 
 
-async def test_loop_ticks_until_stopped():
-    # 下一次放在整分上（和 cron 对齐）：放在「现在 - 1 秒」的话，这一秒里恰好跨过整分时会多记一条错过的跳过
+async def fire_count(schedule_id: str) -> int:
+    async with SessionLocal() as session:
+        return await session.scalar(select(func.count()).select_from(ScheduleFire)
+                                    .where(ScheduleFire.schedule_id == schedule_id))
+
+
+@pytest.mark.parametrize("crossed", [False, True], ids=["on_the_minute", "minute_crossed"])
+async def test_loop_ticks_until_stopped(crossed):
+    """循环按拍执行、stop 之后不再有拍。只看「发起了」和停下前后的条数差，不看总条数：建任务和第一拍之间恰好跨过
+    整分时，第一拍会先记一条错过的跳过、再发起最近这一次——以前按总条数断言，跨整分时偶发失败。crossed 把下一次
+    放在上一个整分，必然走到这一种"""
     due = cron.last_due("* * * * *", "UTC", datetime.now(UTC))
+    if crossed:
+        due -= timedelta(minutes=1)
     sid = await schedule(await workflow(), next_run_at=due, cron="* * * * *")
     on = Settings(_env_file=None, scheduler=True)
     assert await scheduler.start(interval=0.05, config=on) is True
@@ -382,18 +393,20 @@ async def test_loop_ticks_until_stopped():
         await asyncio.sleep(0.02)
     await scheduler.stop()
     assert scheduler.running() is False
-    # 只认发起的那一条：建任务和第一拍之间跨过整分时，前面还会有一条错过的跳过，那不是这里要测的
-    [fire] = [f for f in await fires(sid) if f.status == "started"]
-    await settle(fire.run_id)
-    # 停下之后不再有拍：把下一次拨回过去也不会再发起
+    started = [f for f in await fires(sid) if f.status == "started"]
+    assert started
+    if crossed:
+        assert [f.status for f in await fires(sid)][0] == "skipped_misfire"
+    for fire in started:
+        await settle(fire.run_id)
+    # 停下之后不再有拍：把下一次拨回过去，过一会儿条数一条不多
+    before = await fire_count(sid)
     async with SessionLocal() as session:
         await session.execute(Schedule.__table__.update().where(Schedule.id == sid)
                               .values(next_run_at=datetime.now(UTC) - timedelta(seconds=1)))
         await session.commit()
     await asyncio.sleep(0.2)
-    async with SessionLocal() as session:
-        assert await session.scalar(select(func.count()).select_from(ScheduleFire)
-                                    .where(ScheduleFire.schedule_id == sid)) == 1
+    assert await fire_count(sid) == before
 
 
 async def test_start_twice_keeps_one_loop():

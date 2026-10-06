@@ -1,4 +1,5 @@
-"""定时任务：按周期自动发起工作流运行，结束、失败、停在审批时推送 Webhook。
+"""定时任务：按周期自动发起工作流运行，结束、失败、停在审批时推送 Webhook，运行成功结束后和同一任务上一次成功的运行
+自动对比。
 
 形状按前后端约定（Schedule、Fire 两种对象，见 _schedule_out、_fire_outs）。Webhook 地址和签名密钥加密存放，接口
 只给主机和末 4 位（url_hint）、有没有密钥（has_secret）。请求体自己解析、自己校验：错误一律回中文 detail，表单
@@ -18,7 +19,7 @@ from app.api.runs import actor_of
 from app.core.crypto import decrypt, encrypt
 from app.db.base import get_session, utcnow
 from app.db.models import Run, Schedule, ScheduleFire, WebhookDelivery, Workflow, WorkflowVersion
-from app.scheduler import cron, service, webhook
+from app.scheduler import auto_compare, cron, service, webhook
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
 
@@ -278,10 +279,31 @@ def _webhook_out(row: Schedule) -> dict[str, Any] | None:
 
 
 async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[dict[str, Any]]:
-    """Fire 对象：run_status 是运行现在的状态，notified 是这次触发的推送记录 [{event, status, at}]（按时间先后）。"""
-    run_ids = [f.run_id for f in fires if f.run_id]
-    statuses = dict((await session.execute(select(Run.id, Run.status).where(Run.id.in_(run_ids)))).all()) \
-        if run_ids else {}
+    """Fire 对象：run_status 是运行现在的状态，notified 是这次触发的推送记录 [{event, status, at}]（按时间先后），
+    compare 是运行成功结束后和同一任务上一次成功的运行的自动对比 {base_run_id, summary, previous}（summary 同对比接口
+    的计数，previous 说基准是不是紧挨着的上一次），没有为 null。
+
+    对比和比的时候两边的封存绑定（auto_compare）：哪一边现在不在终态（被继续执行）、被删掉、清单哈希和比的时候不一样
+    （重新封存过）都给 null——对比页按现在的封存现算，记下的计数和点进去看到的会对不上，或者干脆比不了。工件读不出来、
+    被改过的同样给 null。"""
+    compared = {f.id: f.compare_artifact for f in fires if f.compare_artifact and f.run_id}
+    compares = await auto_compare.briefs(list(compared.values()))
+    run_ids = {f.run_id for f in fires if f.run_id} | {brief["base_run_id"] for brief in compares.values()}
+    # 运行现在的状态和清单哈希：run_status 照写，对比按它核对两边的封存
+    current = {run_id: (status, seal) for run_id, status, seal in (await session.execute(
+        select(Run.id, Run.status, Run.manifest_hash).where(Run.id.in_(run_ids)))).all()} if run_ids else {}
+
+    def compare_of(f: ScheduleFire) -> dict[str, Any] | None:
+        brief = compares.get(compared.get(f.id) or "")
+        if brief is None or brief["target_run_id"] != f.run_id:
+            return None
+        for run_id, seal in ((brief["target_run_id"], brief["target_manifest"]),
+                             (brief["base_run_id"], brief["base_manifest"])):
+            status, now_seal = current.get(run_id, (None, None))
+            if status not in auto_compare.TERMINAL or now_seal != seal:
+                return None
+        return auto_compare.public(brief)
+
     notified: dict[str, list[dict[str, Any]]] = {}
     if fires:
         rows = (await session.execute(
@@ -298,9 +320,10 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
         "kind": f.kind,
         "status": "started" if f.id in launching else f.status,
         "run_id": f.run_id,
-        "run_status": statuses.get(f.run_id) if f.run_id else None,
+        "run_status": current.get(f.run_id, (None, None))[0] if f.run_id else None,
         "reason": None if f.id in launching else f.reason,
         "notified": notified.get(f.id, []),
+        "compare": compare_of(f),
         "created_at": _iso(f.created_at),
     } for f in fires]
 

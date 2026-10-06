@@ -9,7 +9,7 @@ import type { ScheduleEvent, ScheduleWebhook, ScheduleWebhookTest } from '../../
 import { SCHEDULE_EVENTS, WEBHOOK_FORMATS, isHttpUrl, webhookTestText, type FormField, type WebhookForm } from './model'
 
 /**
- * Webhook 通知：格式、地址、签名密钥、订阅事件、发送测试消息，外加通知里运行链接用的服务访问地址。
+ * Webhook 通知：格式、地址、签名密钥、订阅事件、发送测试消息，外加通知里运行、对比页链接用的服务访问地址。
  *
  * 地址和密钥保存之后服务端不再返回明文：地址只显示主机和末 4 位（url_hint），可以替换或删除；密钥只说「已设置」，
  * 可以替换或清除。没点替换时请求里不带它们，改别的字段不会把地址清掉。测试消息用的是已保存的设置，
@@ -195,7 +195,7 @@ function SecretField({ value: w, saved, onChange, error }: {
 }
 
 /**
- * 通知里运行链接用的服务访问地址：设置里 notify 一组的 public_base_url，所有定时任务共用。这里给出当前值和修改入口，
+ * 通知里运行、对比页链接用的服务访问地址：设置里 notify 一组的 public_base_url，所有定时任务共用。这里给出当前值和修改入口，
  * 写的时候先重读一遍 notify 组、只换这一项，不把同组别的设置冲掉
  */
 function LinkBase() {

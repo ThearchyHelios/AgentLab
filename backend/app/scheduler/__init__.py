@@ -4,6 +4,8 @@
 - service.py：输入模板、和工作流入口字段的对照、发起一次触发（调度循环和「立即运行」共用）
 - loop.py：调度循环，条件 UPDATE 认领到点的任务
 - webhook.py：通知推送（通用 / 飞书 / 企业微信 / 钉钉）
+- auto_compare.py：运行成功结束后和同一定时任务上一次成功的运行自动对比，结果记在触发记录上，通知里只带计数摘要和
+  对比页链接
 
 服务启动时（main.py 的 lifespan）只在 scheduler_enabled() 时调 start，关闭时总是调 stop——stop 要能在没 start
 过时安全返回。start 自己也看一次开关：拷来的数据目录（检查脚本的 --stacks、验收副本）不管从哪条路径起服务，

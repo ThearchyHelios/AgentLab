@@ -2968,14 +2968,14 @@ export const SCHEDULE_TEXT = {
   testResult: (head: string, status: number | null, detail: string) =>
     `${head}${status != null ? `（HTTP ${status}）` : ''}${detail ? `：${detail}` : ''}`,
 
-  // ---- 通知里的运行链接（设置 notify 组，所有定时任务共用）
-  linkBase: '通知中的运行链接',
+  // ---- 通知里的链接：运行、对比页都按这个地址拼（设置 notify 组，所有定时任务共用）
+  linkBase: '通知中的链接',
   linkBaseValue: (url: string) => `按 ${url} 拼接`,
-  linkBaseUnset: '未设置服务访问地址，通知中不附带运行链接',
+  linkBaseUnset: '未设置服务访问地址，通知中不附带运行和对比页链接',
   linkBaseEdit: '修改',
   linkBaseSet: '设置',
   linkBaseLabel: '服务访问地址',
-  linkBaseHint: '收件人打开运行链接用的地址，例如 https://agentlab.example.com。所有定时任务共用',
+  linkBaseHint: '收件人打开运行、对比页链接用的地址，例如 https://agentlab.example.com。所有定时任务共用',
   linkBasePlaceholder: 'https://agentlab.example.com',
   linkBaseInvalid: '请输入以 http:// 或 https:// 开头的地址',
   linkBaseSaved: '已保存服务访问地址',
@@ -3049,6 +3049,63 @@ export const SCHEDULE_TEXT = {
   loadMore: '加载更多',
   allLoaded: '已全部加载',
   shown: (n: number) => `已显示 ${n} 条`,
+
+  // ---- 触发历史里的对比：运行成功结束后，服务端自动和同一定时任务上一次成功的运行比一次
+  /**
+   * 和运行详情「更多」菜单里的入口是同一件事，用同一个叫法。RUN_COMPARE_TEXT 定义在本对象之后，模块初始化时还取不到，
+   * 写成 getter 用到时再取
+   */
+  get compareLink() { return RUN_COMPARE_TEXT.menu },
+  /**
+   * 悬停写各类指标的个数，和 Webhook 通知里那一行同一个写法（服务端 scheduler/auto_compare.py 的 summary_text）：
+   * 变化三分法的三类总写上，0 个也写；其余各类有才写，次序同对比页；两边都没有指标时不写一串 0 个。只有个数，
+   * 不写数值。各类的叫法用对比页那一套（RUN_COMPARE_TEXT.classLabel）。base 是基准的短编号，基准不是紧挨着的
+   * 上一次（上一次失败了、取消了）时给，写明比的是哪一次，同通知
+   */
+  compareTitle: (summary: Partial<Record<string, number>>, base?: string | null) => {
+    const n = (key: string) => (typeof summary[key] === 'number' ? summary[key] as number : 0)
+    const core = ['data_only', 'caliber_and_data', 'sql_changed']
+    const rest = ['params_only', 'added', 'removed', 'incomparable', 'unchanged']
+    const head = base ? `与上一次成功的运行（${base}）相比` : '与上一次相比'
+    if (![...core, ...rest].some((key) => n(key) > 0)) return `${head}：两次运行都没有指标`
+    const parts = [...core, ...rest.filter((key) => n(key) > 0)]
+      .map((key) => `${RUN_COMPARE_TEXT.classLabel[key] ?? key} ${n(key)} 个`)
+    return `${head}：${parts.join('、')}`
+  },
+  /**
+   * 链接旁看得见的简短计数：触屏没有悬停，键盘聚焦时也不显示 title，只靠悬停看不出变化的规模。有变化的几类（只数据变、
+   * 口径与数据都变、SQL 结构变、只参数变、新增、移除）合起来写一个数；都没变化时说有几个无法比较，或者都未变；两边都
+   * 没有指标时不写（悬停里有）
+   */
+  compareCount: (summary: Partial<Record<string, number>>) => {
+    const n = (key: string) => (typeof summary[key] === 'number' ? summary[key] as number : 0)
+    const changed = ['data_only', 'caliber_and_data', 'sql_changed', 'params_only', 'added', 'removed']
+      .reduce((sum, key) => sum + n(key), 0)
+    if (changed) return `${changed} 个指标有变化`
+    if (n('incomparable')) return `${n('incomparable')} 个指标无法比较`
+    return n('unchanged') ? '指标都未变' : null
+  },
+
+  // ---- 运行详情页头的来源
+  /**
+   * 到点发起（以及没有署名的立即运行）的运行记在「定时任务：名字」名下，前缀和服务端 scheduler/service.py 的
+   * actor_label 一致。页头据此不再写「定时任务：X 发起」，换成下面那条链接
+   */
+  actorPrefix: '定时任务：',
+  runSource: (name?: string | null) => (name ? `由定时任务「${name}」发起` : '由定时任务发起'),
+  /** 有人署名点「立即运行」发起的：署名照写（runStarter），后面接这一句 */
+  runSourceManual: (name?: string | null) => (name ? `来自定时任务「${name}」` : '来自定时任务'),
+  runStarter: (who: string) => `${who} 发起`,
+  /** 悬停写全名（页头窄时链接会截断）和点开去哪 */
+  runSourceTitle: (name?: string | null) =>
+    (name ? `定时任务「${name}」：查看设置和触发历史` : '查看这个定时任务的设置和触发历史'),
+  /**
+   * 定时任务已经删除（取回的定时任务列表里没有它）：不再链过去——只会落到「不存在」页，页上的返回又回到定时任务列表。
+   * 和同一行的「工作流已删除」一样写成纯文本
+   */
+  runSourceGone: (name?: string | null) => (name ? `由定时任务「${name}」发起（已删除）` : '由已删除的定时任务发起'),
+  runSourceManualGone: (name?: string | null) => (name ? `来自定时任务「${name}」（已删除）` : '来自已删除的定时任务'),
+  runSourceGoneTitle: '这个定时任务已删除，它发起的运行记录仍然保留',
 
   // ---- 记录页的定时标记
   runTag: '定时',
