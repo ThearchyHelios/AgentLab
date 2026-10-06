@@ -45,7 +45,7 @@ PAYLOAD = {"sql": "SELECT id, buyer_phone, note FROM sales", "columns": ["id", "
            "column_types": {"id": "number", "buyer_phone": "text", "note": "text"}}
 
 
-@pytest.mark.parametrize("step", ["_derived_hidden", "_snapshot_labels", "_masked_view"])
+@pytest.mark.parametrize("step", ["_derived_masks", "_snapshot_labels", "_masked_view"])
 def test_a_failing_analysis_masks_every_cell(monkeypatch, step):
     """认遮罩列、认标签列、逐格换值，哪一步出了意外都整份遮：每一格都是「已遮罩」、类型记成文本，整列遮掉的是全部的列。"""
     monkeypatch.setattr(masking, step, _broken)
@@ -55,6 +55,7 @@ def test_a_failing_analysis_masks_every_cell(monkeypatch, step):
     assert done.columns == ["id", "buyer_phone", "note"]
     assert done.payload["sql"] == PAYLOAD["sql"], "SQL 是模型自己写的，照原样"
     assert not done.secrets.strong, "认不准，不收值"
+    assert done.whole, "快照记下是整份遮的"
 
 
 def test_a_failing_analysis_masks_rows_of_any_shape(monkeypatch):
@@ -66,10 +67,10 @@ def test_a_failing_analysis_masks_rows_of_any_shape(monkeypatch):
     assert done.payload["rows"] == [{"id": MASKED, "buyer_phone": MASKED}]
 
 
-@pytest.mark.parametrize("step", ["_derived_hidden", "_masked_view"])
+@pytest.mark.parametrize("step", ["_derived_masks", "_masked_view"])
 async def test_the_model_and_the_snapshot_see_only_masks_when_the_analysis_fails(monkeypatch, masked_shop, step):
     """端到端：分析出了意外，交给模型的工具结果、落库的快照、通用接口给的都只有「已遮罩」，masked_at_query 是全部的列；
-    格子引用照实说是遮罩列，不采信。"""
+    格子引用照实说写法认不全、整份遮了，不采信——金额在这里没设遮罩，不说成「取自设置了遮罩的列」。"""
     monkeypatch.setattr(masking, step, _broken)
     name = masked_shop
     sql = "SELECT id, region, buyer_phone AS 手机号, amount FROM sales ORDER BY id"
@@ -80,13 +81,14 @@ async def test_the_model_and_the_snapshot_see_only_masks_when_the_analysis_fails
     assert seen["rows"] == [[MASKED] * 4] * 4, seen
     snapshot = artifact_store.load(out.queries[0]["artifact"])
     assert snapshot["rows"] == [[MASKED] * 4] * 4
-    assert snapshot["masked_at_query"] == ["id", "region", "手机号", "amount"]
+    assert snapshot["masked_at_query"] == ["id", "region", "手机号", "amount"] and snapshot["masked_whole"] is True
+    assert "masked_whole" not in seen, "记录只在快照里，不交给模型"
     assert _clean(json.dumps(snapshot, ensure_ascii=False))
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         got = await client.get(f"/api/artifacts/{out.queries[0]['artifact']}")
     assert got.status_code == 200 and _clean(got.text) and "1200" not in got.text
     assert out.result["value"] is None
-    assert out.cells[0]["reason"] == "Q1 的「amount」取自设置了遮罩的列，查询时已遮罩，不采信"
+    assert out.cells[0]["reason"] == "Q1 的写法认不全，整份结果查询时已遮罩，不采信"
 
 
 # --------------------------------------------------------------------------
@@ -250,3 +252,121 @@ def test_without_a_schema_a_star_next_to_the_band_is_still_masked():
     payload = {"sql": sql, "columns": ["档位", "笔数"], "rows": [list(r) for r in ROWS]}
     done = masking.mask_query_result(payload, ["amount"], "sqlite")
     assert done.columns == ["档位"] and done.payload["rows"] == [[MASKED, 3], [MASKED, 2]]
+
+
+# --------------------------------------------------------------------------
+# 数值格按位置认：同名的列、写成字符串的数
+# --------------------------------------------------------------------------
+
+
+def _known(*values: str) -> masking._Secrets:
+    """此前认出的遮罩值（前面的查询遮掉的、报告快照里的）。"""
+    secrets = masking._Secrets()
+    secrets.add({"columns": ["v"], "rows": [[v] for v in values]}, {"v"})
+    return secrets
+
+
+def test_a_text_column_sharing_its_name_with_a_number_column_is_still_masked_by_value():
+    """column_types 按列名记，同名的几列只留下后面那一列的类型：两张表里都叫 phone，前一列是文字（写着号码）、后一列是
+    整数，记成 number。以前按列名认数值列，文字列也当成了数值列，号码原样交给模型、落库；现在同名的几列按格子本身认，
+    文字格照换、记进 masked_cells，真正的整数照原样。写成字符串的数在同名列里也按文字处理（宁可多遮）。"""
+    payload = {"sql": "SELECT a.region, a.phone, b.phone FROM contacts a JOIN legacy b ON a.id = b.id",
+               "columns": ["region", "phone", "phone"],
+               "rows": [["华东", "联系人 13900000001", 13900000002], ["华南", "13900000001", "13900000001"]],
+               "column_types": {"region": "text", "phone": "number"}}
+    done = masking.mask_query_result(payload, [], "sqlite", _known("13900000001"))
+    assert done.payload["rows"] == [["华东", f"联系人 {MASKED}", 13900000002], ["华南", MASKED, MASKED]]
+    assert done.cells == [[0, 1], [1, 1], [1, 2]]
+
+
+def test_a_numeric_column_written_as_decimal_strings_is_kept():
+    """Postgres 的 NUMERIC、MySQL 的 DECIMAL 交回来是字符串（"20000.00"），列类型记着 number：没设遮罩的这一列正好等于某个
+    遮罩值（金额也是 NUMERIC）也照原样，不记进 masked_cells——数值证据不改写。"""
+    payload = {"sql": "SELECT id, visits FROM sales2 ORDER BY id", "columns": ["id", "visits"],
+               "rows": [[1, "20000.00"], [2, "9000.00"]], "column_types": {"id": "number", "visits": "number"}}
+    done = masking.mask_query_result(payload, [], "postgresql", _known("20000.00", "30000.00"))
+    assert done.payload["rows"] == [[1, "20000.00"], [2, "9000.00"]] and done.cells == []
+
+
+#: 两张表里都有 remark：工单的是文字（写着号码），评分的是整数
+DUPLICATES = ("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, buyer_phone TEXT, amount INTEGER);"
+              "INSERT INTO sales VALUES (1, '华东', '13900000001', 1200), (2, '华南', '13900000002', 900);"
+              "CREATE TABLE tickets (id INTEGER PRIMARY KEY, remark TEXT);"
+              "INSERT INTO tickets VALUES (1, '客户 13900000001 来电投诉'), (2, '回访 13900000002');"
+              "CREATE TABLE scores (id INTEGER PRIMARY KEY, remark INTEGER);"
+              "INSERT INTO scores VALUES (1, 5), (2, 4);")
+
+
+@pytest.fixture
+async def ticket_shop(tmp_path):
+    name, source_id = await _source(tmp_path, {"mask_columns": "buyer_phone"}, script=DUPLICATES)
+    yield name
+    await engines.invalidate(source_id)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT t.remark, s.remark FROM tickets t JOIN scores s ON s.id = t.id ORDER BY t.id",
+    "SELECT * FROM tickets t JOIN scores s ON s.id = t.id ORDER BY t.id",
+])
+async def test_duplicate_names_do_not_let_numbers_shield_text(monkeypatch, ticket_shop, sql):
+    """端到端：先查出号码（查询时遮掉），再把工单和评分连起来查，两列都叫 remark（* 连两张表时 id 也同名）。工单备注里的
+    号码交给模型、落库之前照样换掉，评分照原样；以前评分的 number 套到了同名的备注上，号码原样交了出去。"""
+    name = ticket_shop
+    steps = [q(name, "SELECT id, buyer_phone FROM sales ORDER BY id", "c1"), q(name, sql, "c2")]
+    script = Script(monkeypatch, steps, {"value": None, "rationale": "x"})
+    out, _ = await ask(name)
+    seen = script.tool_results()["c2"]
+    assert "1390000000" not in seen and f"客户 {MASKED} 来电投诉" in seen, seen
+    snapshot = artifact_store.load(out.queries[1]["artifact"])
+    remarks = [i for i, c in enumerate(snapshot["columns"]) if c == "remark"]
+    assert [[row[i] for i in remarks] for row in snapshot["rows"]] == [[f"客户 {MASKED} 来电投诉", 5],
+                                                                      [f"回访 {MASKED}", 4]]
+    assert snapshot["masked_cells"] == [[0, remarks[0]], [1, remarks[0]]]
+
+
+async def test_a_decimal_column_is_cited_as_a_number(monkeypatch, composite_numbers):
+    """端到端：NUMERIC 的访问次数（字符串 "20000.00"、列类型 number）正好等于某一笔被遮的金额：交给模型的、落库的照原样，
+    格子引用照常取到 20000（双盲复算拿得到它）。"""
+    name, sql = composite_numbers
+    script = Script(monkeypatch, [q(name, "SELECT id, amount FROM sales ORDER BY id", "c1"), q(name, sql, "c2")],
+                    {"value": {"alias": "Q2", "row": 0, "column": "visits"}, "rationale": "x"})
+    out, _ = await ask(name)
+    seen = json.loads(script.tool_results()["c2"].split("\n", 1)[1])
+    assert seen["rows"] == [[1, "20000.00"], [2, "9000.00"]]
+    snapshot = artifact_store.load(out.queries[1]["artifact"])
+    assert snapshot["rows"] == seen["rows"] and "masked_cells" not in snapshot
+    assert out.result["value"] == 20000 and out.cells[0]["status"] == "resolved"
+
+
+@pytest.fixture
+async def composite_numbers(monkeypatch):
+    """造一个 Postgres 数据源（查询交给换掉的 run_query，不连库）：金额设了遮罩，金额、访问次数都是 NUMERIC，驱动交回
+    Decimal，查询层转成字符串、列类型记 number。交回 (源名, 查访问次数的 SQL)。"""
+    import uuid
+
+    from app.data.engine import QueryResult
+    from app.db.base import SessionLocal
+    from app.db.models import DataSource
+    from app.tools import datasource
+
+    visits = "SELECT id, visits FROM sales ORDER BY id"
+    results = {"SELECT id, amount FROM sales ORDER BY id": (["id", "amount"], [[1, "20000.00"], [2, "30000.00"]]),
+               visits: (["id", "visits"], [[1, "20000.00"], [2, "9000.00"]])}
+
+    async def driver(source, statement, **kwargs):
+        columns, rows = results[statement]
+        return QueryResult(columns=columns, rows=[list(r) for r in rows], row_count=len(rows), truncated=False,
+                           elapsed_ms=1, sql=statement, column_types={c: "number" for c in columns})
+
+    monkeypatch.setattr(datasource, "run_query", driver)
+    name = f"pg_{uuid.uuid4().hex[:8]}"
+    async with SessionLocal() as session:
+        row = DataSource(name=name, kind="postgresql", host="127.0.0.1", port=5432, username="probe", database="shop",
+                         readonly=True, enabled=True, options={"mask_columns": "amount"},
+                         schema_cache={"tables": {"sales": {"columns": [{"name": c} for c in ("id", "amount",
+                                                                                             "visits")]}}})
+        session.add(row)
+        await session.commit()
+        source_id = row.id
+    yield name, visits
+    await engines.invalidate(source_id)

@@ -39,6 +39,7 @@ from urllib.parse import quote
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.events import EventType
 from app.engine.evidence import iter_units, query_entry_fields
+from app.engine.masking import OPAQUE_SQL, SYSTEM_SCHEMAS, indirect_reads
 from app.engine.merge_query import MERGE_SOURCE
 from app.engine.recompute import input_origin
 from app.engine.schema import NodeType
@@ -231,43 +232,12 @@ _QUERY_KEYS = frozenset({"columns", "rows", "row_count", "truncated", "elapsed_m
 #: 导出时只知道数据源设的遮罩、不知道是哪种库：SQL 按每种支持的库的读法各解析一遍（None 是 sqlglot 的通用读法），
 #: 至少一种读得通，读得通的每一种都要过关
 _READINGS = (None, "sqlite", "mysql", "postgres", "oracle")
-#: 语法树和数据库实际执行的对不上的写法：MySQL、MariaDB 会执行的注释（/*! … */、/*M! … */，解析器当注释扔掉），
-#: Postgres 按 Unicode 转义写的名字（U&"…"，原文里看不出是哪一列）
-_OPAQUE_SQL = re.compile(r'/\*m?!|u&"', re.I)
-#: 不点列名也读得出表里内容的写法。SQL 原文里出现就按碰了遮罩列算，写在字符串里的也算（宁可多挡）。函数要跟着左括号
-#: 才算（列名碰巧叫 crosstab 的不算），表、视图、schema 按名字认
-_INDIRECT_READS = re.compile(r"(?<![0-9A-Za-z_$])(?:(?:" + "|".join((
-    # 表名、SQL 写在字符串里交给函数执行或整表导出：Postgres 的 XML 一族、ts_stat、tablefunc 的 crosstab / connectby、
-    # dblink，Oracle 的 XMLTYPE、XQuery（XMLQUERY、XMLTABLE）
-    r"(?:query|table|cursor|schema|database)_to_xml\w*", r"ts_stat", r"crosstab\d*", r"connectby", r"dblink\w*",
-    r"xmltype", r"xmlquery", r"xmltable",
-    # 按页、按文件、按日志读出的原始数据：Postgres 的 pageinspect（按索引名读 B 树页的 bt_page_items 也算）、服务器文件、
-    # 逻辑解码、pg_walinspect 读出的 WAL 块，MySQL 的 LOAD_FILE，Oracle 的 BFILENAME，SQLite 的 readfile
-    r"get_raw_page", r"bt_page_items", r"pg_read_(?:binary_)?file", r"pg_logical_slot_\w+", r"pg_get_wal_block_info",
-    r"load_file", r"bfilename", r"readfile",
-    # 别的会话执行过的 SQL 原文：Postgres 的 pg_stat_activity 背后的函数和按会话取的那一个，MySQL 企业版的审计日志
-    r"pg_stat_get_(?:backend_)?activity", r"audit_log_read",
-)) + r")[\"`]?\s*\(|(?:" + "|".join((
-    # Oracle 的 DBMS_XMLGEN 这一族（包名后面跟着点），XQuery 里的 ora:view 和 oradb: 表
-    r"dbms_xml\w*", r"ora:view", r"oradb",
-    # 统计信息里的采样值、全文索引里的词：Postgres 的 pg_stats、pg_statistic 一族，SQLite 的 sqlite_stat*，MySQL 的
-    # column_statistics、innodb_ft_*，MariaDB 的 column_stats，Oracle 的直方图、列统计和记着最小最大值的 *_tab_columns，
-    # 以及它们的底表 histgrm$、hist_head$
-    r"pg_stat(?:s|istic)\w*", r"sqlite_stat\d", r"column_statistics", r"innodb_ft_\w+", r"column_stats",
-    r"(?:all|dba|user|cdb)_(?:\w+_)?(?:histograms|col_statistics|tab_cols|tab_columns)", r"(?:histgrm|hist_head)\$",
-    # 别的会话执行过的 SQL 原文（写入语句里就是值）：Postgres 的 pg_stat_activity、pg_stat_statements，本连接预备过的
-    # 语句（连接池里的连接留着前几次查询的原文）；MySQL 的 general_log、slow_log，sys 库里建在 performance_schema 上的
-    # 会话、锁等待视图（带 x$ 的是不排版的那一份；只认这几张，Oracle 常写的 sys.dual 不算）；Oracle 的 V$SQL 一族、
-    # 打开着的游标、审计记录
-    r"pg_stat_activity", r"pg_stat_statements", r"pg_prepared_statements", r"general_log", r"slow_log",
-    r"sys[\"`]?\s*\.\s*[\"`]?(?:x\$)?(?:session|processlist|innodb_lock_waits|schema_table_lock_waits)",
-    r"g?v\$sql\w*", r"(?:dba|cdb)_hist_sql\w*", r"g?v\$open_cursor",
-    r"(?:dba|cdb|user)_(?:\w+_)?audit_trail", r"unified_audit_trail", r"aud\$\w*", r"fga_log\$",
-    # SQLite 按页读出的原始数据
-    r"sqlite_dbpage",
-    # 系统 schema：哪几张表采样了列值、记着别的会话的 SQL，一张张数靠不住，整个不认
-    r"pg_catalog", r"information_schema", r"performance_schema",
-)) + r")(?![0-9A-Za-z_$]))", re.I)
+#: 语法树和数据库实际执行的对不上的写法（MySQL 会执行的注释、Postgres 的 U&"…"），不点列名也读得出表里内容的写法（表名、
+#: SQL 写在字符串里交给函数，按页按文件读的原始数据，统计信息、会话记录里存着值的）：和核查 agent 的工具边界共用一份名单
+#: （engine/masking.py 的 OPAQUE_SQL、indirect_reads），这里另把系统 schema 整个算上（只决定附不附快照，宁可多挡）。SQL
+#: 原文里出现就按碰了遮罩列算，写在字符串里的也算
+_OPAQUE_SQL = OPAQUE_SQL
+_INDIRECT_READS = indirect_reads(*SYSTEM_SCHEMAS)
 #: Postgres 的函数记法（m.to_jsonb 就是 to_jsonb(m)）下能把一整行交出来的内置函数（_whole_row）：只收一个参数、收得下
 #: 整行（record、anyelement、"any" 这类），交回的值里带着整行。汇总函数也能这么写：any_value、*_agg 交回整行，max、min
 #: 交回最大、最小的那一整行。照 PG 18 的 pg_proc 逐个对过：只交回个数、大小、类型、哈希的不算，这么写会报错的（伪类型的

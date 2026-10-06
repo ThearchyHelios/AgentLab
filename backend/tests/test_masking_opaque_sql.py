@@ -140,11 +140,13 @@ async def composite_shop():
      [[1, PHONE, "某路 1 号"]]),
     ("SELECT p.id AS n, (jsonb_populate_record(NULL::contact, p.pj)).* FROM people2 p", ["n", "tel", "addr"],
      [[1, PHONE, "某路 1 号"]]),
-], ids=["复合类型", "子查询里的复合类型", "按类型展开 JSON"])
+    ("SELECT p.id AS n, ((p.profile).*) FROM people p", ["n", "tel", "addr"], [[1, PHONE, "某路 1 号"]]),
+], ids=["复合类型", "子查询里的复合类型", "按类型展开 JSON", "外面套了括号"])
 async def test_an_expression_star_never_reaches_the_model_or_the_store(monkeypatch, composite_shop, sql, columns,
                                                                        rows):
     """端到端（核查 agent 的真实查询工具）：交给模型的、落库的、通用工件接口给的都只有「已遮罩」，masked_at_query 是
-    全部的列。以前三条的 masked_at_query 都是空的，号码原样交给模型、落库。"""
+    全部的列，快照记着整份遮（masked_whole），格子引用照实说写法认不全。以前前三条的 masked_at_query 都是空的，套了外括号
+    的只遮了第一列，号码原样交给模型、落库。"""
     from app.data.engine import QueryResult
     from app.tools import datasource
 
@@ -162,6 +164,8 @@ async def test_an_expression_star_never_reaches_the_model_or_the_store(monkeypat
     assert MASKED_WORD in seen and "1390000000" not in seen, seen
     snapshot = artifact_store.load(out.queries[0]["artifact"])
     assert snapshot["masked_at_query"] == columns and "1390000000" not in json.dumps(snapshot, ensure_ascii=False)
+    assert snapshot["masked_whole"] is True and "masked_whole" not in seen
+    assert out.cells[0]["reason"] == "Q1 的写法认不全，整份结果查询时已遮罩，不采信"
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         got = await client.get(f"/api/artifacts/{out.queries[0]['artifact']}")
     assert got.status_code == 200 and "1390000000" not in got.text
@@ -280,3 +284,229 @@ def test_a_failing_analysis_masks_the_whole_result_instead_of_reading_the_text(m
     monkeypatch.setattr(masking, "_tainted_in", broken)
     snapshot = {"sql": "SELECT s AS r FROM sales s", "columns": ["r"], "rows": []}
     assert "r" in masking._derived_hidden(snapshot, {"buyer_phone"}, "postgresql")[0]
+
+
+# --------------------------------------------------------------------------
+# (表达式).* 套了外括号、起了别名
+# --------------------------------------------------------------------------
+
+
+#: Postgres 实测：((p.card).*)、(((p.card)).*)、(((p.card).*))、(p.card).* AS x 都照样展开成好几列（别名不起作用）
+WRAPPED = [
+    pytest.param("SELECT ((p.profile).*) FROM people p", ["tel", "addr"], [PHONE, "某路 1 号"], id="复合类型-外括号"),
+    pytest.param("SELECT (((p.profile)).*) FROM people p", ["tel", "addr"], [PHONE, "某路 1 号"],
+                 id="复合类型-两层外括号"),
+    pytest.param("SELECT (((p.profile).*)) FROM people p", ["tel", "addr"], [PHONE, "某路 1 号"],
+                 id="复合类型-套两层"),
+    pytest.param("SELECT (p.profile).* AS x FROM people p", ["tel", "addr"], [PHONE, "某路 1 号"], id="复合类型-别名"),
+    pytest.param("SELECT ((jsonb_each_text(pj)).*) FROM people2", ["key", "value"], ["tel", PHONE],
+                 id="记录函数-外括号"),
+    pytest.param("SELECT ((q.r).*) FROM (SELECT ROW(region, buyer_phone) AS r FROM sales) q", ["f1", "f2"],
+                 ["华东", PHONE], id="匿名 ROW-外括号"),
+    pytest.param("SELECT ((jsonb_each_text(pj)).*) FROM people2 UNION ALL SELECT 'a', 'b'", ["key", "value"],
+                 ["tel", PHONE], id="UNION 第一支"),
+    pytest.param("SELECT 'a' AS k, 'b' AS v UNION ALL SELECT ((jsonb_each_text(pj)).*) FROM people2", ["k", "v"],
+                 ["tel", PHONE], id="UNION 后一支"),
+    pytest.param("SELECT 'a' AS k, 'b' AS v UNION ALL SELECT ((p.profile).*) FROM people p", ["k", "v"],
+                 [PHONE, "某路 1 号"], id="UNION 后一支-复合类型"),
+    pytest.param("SELECT x.* FROM (SELECT ((q.r).*) FROM (SELECT ROW(buyer_phone, region) AS r FROM sales) q) x",
+                 ["f1", "f2"], [PHONE, "华东"], id="子查询里-外括号"),
+    # 和 * 写在同一支里：选出项和结果的列数本来就对不上（* 展开成几列），只能靠认出外括号里的 (表达式).*
+    pytest.param("SELECT p.*, ((p.profile).*) FROM people p", ["id", "profile", "address", "tel", "addr"],
+                 [1, f"({PHONE},某路 1 号)", "某路 1 号", PHONE, "某路 1 号"], id="和 * 写在一起-外括号"),
+    pytest.param("SELECT p.*, (p.profile).* AS x FROM people p", ["id", "profile", "address", "tel", "addr"],
+                 [1, f"({PHONE},某路 1 号)", "某路 1 号", PHONE, "某路 1 号"], id="和 * 写在一起-别名"),
+]
+
+
+@pytest.mark.parametrize("sql, columns, row", WRAPPED)
+def test_a_wrapped_expression_star_reading_a_masked_column_masks_the_whole_result(sql, columns, row):
+    """(表达式).* 外面套了括号、起了别名，Postgres 照样展开成好几列：整份遮。以前只认不带外括号的写法，((p.card).*) 按一项
+    数，只遮了第一列，号码原样交给模型、落库。"""
+    done = masked(sql, columns, [list(row)])
+    assert done.whole and done.columns == columns
+    assert done.payload["rows"] == [[MASKED_WORD] * len(columns)] and not _leaks(done)
+
+
+def test_a_wrapped_expression_star_with_a_numeric_phone_is_masked_whole():
+    """号码存成整数（bigint）、前面的查询已经认出它：数值格不按值换，(表达式).* 认不出就全靠整份遮挡住。"""
+    known = masking._Secrets()
+    known.add({"columns": ["p"], "rows": [[13900000001]]}, {"p"})
+    payload = {"columns": ["f1", "f2"], "rows": [[1200, 13900000001]],
+               "sql": "SELECT ((q.r).*) FROM (SELECT ROW(amount, buyer_phone) AS r FROM sales) q"}
+    done = masking.mask_query_result(payload, MASKED, "postgresql", known, schema=SCHEMA)
+    assert done.payload["rows"] == [[MASKED_WORD, MASKED_WORD]]
+
+
+@pytest.mark.parametrize("sql", ["SELECT ((s).*) FROM sales s", "SELECT (s.*) AS x FROM sales s"])
+def test_a_wrapped_source_star_is_still_read_as_its_columns(sql):
+    """((s).*)、(s.*) AS x、s 是 FROM 里的来源：照旧当 s.* 认，只遮号码那一列。"""
+    done = masked(sql, ["id", "region", "buyer_phone", "amount"], [[1, "华东", PHONE, 1200]])
+    assert not done.whole and done.columns == ["buyer_phone"]
+    assert done.payload["rows"] == [[1, "华东", MASKED_WORD, 1200]]
+
+
+# --------------------------------------------------------------------------
+# 和数据源里的表同名的 CTE
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("sql, columns, row", [
+    pytest.param("WITH sales AS (SELECT * FROM sales WHERE region = '华东') SELECT row_to_json(sales) AS j FROM sales",
+                 ["j"], [json.dumps({"id": 1, "buyer_phone": PHONE})], id="整行引用"),
+    pytest.param("WITH sales AS (SELECT * FROM sales WHERE region = '华东') SELECT s AS r FROM sales s", ["r"],
+                 [f"(1,华东,{PHONE},1200)"], id="选出整行"),
+    pytest.param("WITH orders AS (SELECT * FROM sales), sales AS (SELECT * FROM sales WHERE amount > 0) "
+                 "SELECT to_jsonb(x) AS j FROM sales x", ["j"], [json.dumps({"buyer_phone": PHONE})],
+                 id="排在后面的同名段"),
+    pytest.param("WITH sales AS (SELECT * FROM sales) SELECT * FROM sales t(a, b, c, d)", ["a", "b", "c", "d"],
+                 [1, "华东", PHONE, 1200], id="列名表"),
+])
+def test_a_cte_named_like_a_table_reads_the_table(sql, columns, row):
+    """WITH sales AS (SELECT * FROM sales WHERE …) 里的 sales 是数据源里的表，不是这一段自己（不带 RECURSIVE 的 WITH 里，
+    一段只看得见排在它前面的段）。以前认成它自己，* 展开绕回自己什么列都不带出，号码原样交了出去。"""
+    done = masked(sql, columns, [list(row)])
+    assert done.columns and not _leaks(done)
+    assert done.payload["rows"] == [[MASKED_WORD if c in done.columns else v for c, v in zip(columns, row)]]
+
+
+def test_a_cte_named_like_a_table_masks_like_any_other_name():
+    """对照：同一段 CTE 改叫 t，同样遮；列名表按表结构对上位置，只遮号码那一列。"""
+    for sql in ("WITH t AS (SELECT * FROM sales WHERE region = '华东') SELECT row_to_json(t) AS j FROM t",
+                "WITH sales AS (SELECT * FROM sales WHERE region = '华东') SELECT row_to_json(sales) AS j FROM sales"):
+        assert masked(sql, ["j"], [[json.dumps({"buyer_phone": PHONE})]]).columns == ["j"]
+    done = masked("WITH sales AS (SELECT * FROM sales) SELECT * FROM sales t(a, b, c, d)", ["a", "b", "c", "d"],
+                  [[1, "华东", PHONE, 1200]])
+    assert done.columns == ["c"]
+
+
+def test_a_recursive_cte_still_sees_itself():
+    """带 RECURSIVE 的 WITH 里递归的那一支指向它自己：取自号码的那一列照遮，只数步数的照常。"""
+    body = ("WITH RECURSIVE t(n, p) AS (SELECT 1, buyer_phone FROM sales UNION ALL SELECT n + 1, p FROM t "
+            "WHERE n < 3) ")
+    assert masked(body + "SELECT n FROM t", ["n"], [[1]]).columns == []
+    assert masked(body + "SELECT p FROM t", ["p"], [[PHONE]]).columns == ["p"]
+
+
+# --------------------------------------------------------------------------
+# 语法树和实际执行的对不上、存着值的视图：和可验证报告共用一份名单
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("sql, kind, columns", [
+    pytest.param("SELECT id /*!, buyer_phone AS x */ FROM sales", "mysql", ["id", "x"], id="MySQL 会执行的注释"),
+    pytest.param("SELECT /*! buyer_phone AS */ region FROM sales", "mysql", ["region"],
+                 id="MySQL 会执行的注释改了列的来历"),
+    pytest.param('SELECT U&"\\0062uyer_phone" AS x FROM sales', "postgresql", ["x"], id="U&转义的名字"),
+    pytest.param("SELECT id, U&\"buyer!005fphone\" UESCAPE '!' AS p FROM sales", "postgresql", ["id", "p"],
+                 id="U&带 UESCAPE"),
+    pytest.param("SELECT query FROM pg_stat_get_activity(NULL)", "postgresql", ["query"], id="pg_stat_get_activity"),
+    pytest.param("SELECT data FROM pg_logical_slot_peek_changes('s', NULL, NULL)", "postgresql", ["data"],
+                 id="逻辑解码"),
+    pytest.param("SELECT HISTOGRAM AS h FROM information_schema.COLUMN_STATISTICS WHERE TABLE_NAME = 'sales'", "mysql",
+                 ["h"], id="MySQL 直方图"),
+    pytest.param("SELECT sql_text AS v FROM performance_schema.events_statements_history_long", "mysql", ["v"],
+                 id="MySQL 语句历史"),
+    pytest.param("SELECT info AS v FROM information_schema.PROCESSLIST", "mysql", ["v"], id="MySQL 会话列表"),
+    pytest.param("SELECT argument AS v FROM mysql.general_log", "mysql", ["v"], id="MySQL 通用日志"),
+    pytest.param("SELECT min_value AS v FROM mysql.column_stats", "mariadb", ["v"], id="MariaDB 列统计"),
+    pytest.param("SELECT sql_fulltext AS v FROM v$sql", "oracle", ["v"], id="Oracle V$SQL"),
+    pytest.param("SELECT value_string AS v FROM v$sql_bind_capture", "oracle", ["v"], id="Oracle 绑定变量"),
+    pytest.param("SELECT endpoint_actual_value AS v FROM all_tab_histograms WHERE table_name = 'SALES'", "oracle",
+                 ["v"], id="Oracle 直方图"),
+    pytest.param("SELECT * FROM all_tab_columns WHERE table_name = 'SALES'", "oracle", ["column_name", "low_value"],
+                 id="Oracle 列的最小最大值"),
+    pytest.param("SELECT query_to_xml/**/('select * from sales', true, false, '') AS x", "postgresql", ["x"],
+                 id="函数名后夹块注释"),
+    pytest.param("SELECT query_to_xml --c\n('select * from sales', true, false, '') AS x", "postgresql", ["x"],
+                 id="函数名后夹行注释"),
+    pytest.param("SELECT id FROM sales", "mysql", ["id", "x"], id="选出项和结果列数对不上"),
+])
+def test_writings_the_analysis_cannot_follow_mask_the_whole_result(sql, kind, columns):
+    """语法树和实际执行的对不上（MySQL 会执行的注释、U&"…"、选出项和结果的列数对不上），统计信息、会话记录里存着值的视图和
+    函数，函数名和括号之间夹着注释：整份遮。以前工具边界的名单比可验证报告的少一大截，这些写法号码原样交给模型、落库。"""
+    row = [PHONE] * len(columns)
+    done = masked(sql, columns, [row], kind=kind)
+    assert done.whole and done.payload["rows"] == [[MASKED_WORD] * len(columns)]
+
+
+@pytest.mark.parametrize("sql, columns, row", [
+    pytest.param("WITH query(r, n) AS (SELECT region, COUNT(*) FROM sales GROUP BY region) SELECT r AS region, n "
+                 "FROM query", ["region", "n"], ["华东", 2], id="叫 query 的 CTE"),
+    pytest.param("SELECT region, 'Query (x)' AS q FROM sales", ["region", "q"], ["华东", "Query (x)"],
+                 id="字符串里的 Query ("),
+    pytest.param("SELECT column_name FROM information_schema.columns WHERE table_name = 'sales'", ["column_name"],
+                 ["buyer_phone"], id="information_schema 的列清单"),
+])
+def test_names_of_unsupported_databases_and_plain_schema_views_are_not_masked(sql, columns, row):
+    """不支持的库（DuckDB 的 query()、SQL Server 的 OPENQUERY）的函数不再收：名叫 query 的 CTE、字符串里的「Query (x)」不再
+    整份遮；information_schema 里只有表结构的视图照常（核查 agent 查列名、类型常用）。"""
+    done = masked(sql, columns, [list(row)])
+    assert not done.whole and done.payload["rows"] == [list(row)]
+
+
+def test_the_tool_boundary_and_the_bundle_share_one_list():
+    """工具边界和可验证报告共用一份名单：报告那边另把系统 schema 整个挡（只决定附不附快照）。"""
+    from app.bundle import build
+
+    assert build._OPAQUE_SQL is masking.OPAQUE_SQL
+    for sql in ("SELECT HISTOGRAM FROM information_schema.COLUMN_STATISTICS", "SELECT * FROM v$sql",
+                "SELECT data FROM pg_logical_slot_peek_changes('s', NULL, NULL)"):
+        assert build._INDIRECT_READS.search(sql) and masking._INDIRECT.search(sql)
+    plain = "SELECT column_name FROM information_schema.columns"
+    assert build._INDIRECT_READS.search(plain) and not masking._INDIRECT.search(plain)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT row_to_json(s) AS j FROM sales s ORDER BY s.id USING >",
+    "SELECT s AS j FROM sales s WHERE s.region IS NOT NFC NORMALIZED OR true",
+    "SELECT to_jsonb(s) - 'id' AS j FROM sales s ORDER BY s.id USING <",
+])
+def test_postgres_sql_that_cannot_be_read_masks_the_whole_result(sql):
+    """Postgres 合法、解析器解析不了的写法：整行引用不写列名、也没有 *，只看文字认不出，整份遮。以前 masked=[]，整行连同
+    号码交给模型、落库。"""
+    done = masked(sql, ["j"], [[json.dumps({"id": 1, "buyer_phone": PHONE})]])
+    assert done.whole and not _leaks(done)
+
+
+# --------------------------------------------------------------------------
+# 整份遮的结果不把每一格都收成遮罩值
+# --------------------------------------------------------------------------
+
+
+def test_a_whole_masked_result_does_not_turn_every_cell_into_a_masked_value():
+    """统计视图整份遮之后，里面的列名、区域名不收成遮罩值：后一条查询的区域照常，封存的 SQL 照原样。以前每一格都收，
+    区域名、列名在同一次核查里处处被换掉，封存的 SQL 成了「WHERE 已遮罩 = '华东'」。"""
+    from app.engine.inquiry import _scrub_sql
+
+    stats = masked("SELECT attname, n_distinct FROM pg_stats WHERE tablename = 'sales'", ["attname", "n_distinct"],
+                   [["amount", 5], ["buyer_phone", -1], ["region", 3]])
+    assert stats.whole and not stats.secrets.strong
+    payload = {"columns": ["id", "region", "amount"], "rows": [[1, "华东", 1200]],
+               "sql": "SELECT id, region, amount FROM sales ORDER BY id"}
+    later = masking.mask_query_result(payload, MASKED, "postgresql", stats.secrets, schema=SCHEMA)
+    assert later.payload["rows"] == [[1, "华东", 1200]]
+    sql = "SELECT region, COUNT(*) AS n FROM sales WHERE region = '华东' GROUP BY region"
+    assert _scrub_sql(sql, stats.secrets, {"buyer_phone"}, "postgresql") == sql
+
+
+def test_a_whole_masked_result_still_collects_what_surely_came_from_a_masked_column():
+    """整份遮时，认得出取自遮罩列的那几列照收（号码改了名字选出来、又夹着认不全的写法），别的列不收。"""
+    sql = "SELECT buyer_phone AS 手机号, region FROM sales UNION ALL SELECT query_to_xml('x', true, false, ''), 'y'"
+    done = masked(sql, ["手机号", "region"], [[PHONE, "华东"]])
+    assert done.whole and done.secrets.hit(PHONE) and not done.secrets.hit("华东")
+
+
+def test_report_snapshots_that_were_masked_whole_give_only_their_sure_values():
+    """报告自己的查询快照（报告取数时没遮）收遮罩值时同一条规则：写法认不全的只收确定取自遮罩列的那几列，区域名、列名不收
+    （审批质询、反方审稿把它们交给查询工具、拿来换回答和理由，收了就处处被换掉）。"""
+    from app.engine.inquiry import _add_based
+
+    secrets = masking._Secrets()
+    stats = {"source": "pg", "sql": "SELECT attname, n_distinct FROM pg_stats WHERE tablename = 'sales'",
+             "columns": ["attname", "n_distinct"], "rows": [["region", 3], ["buyer_phone", -1]]}
+    mixed = {"source": "pg", "columns": ["手机号", "region"], "rows": [[PHONE, "华东"]],
+             "sql": "SELECT buyer_phone AS 手机号, region FROM sales UNION ALL SELECT query_to_xml('x', true, false, ''), "
+                    "'y'"}
+    _add_based(secrets, [(stats, set(MASKED)), (mixed, set(MASKED))], {"pg": "postgresql"})
+    assert secrets.hit(PHONE) and not secrets.hit("华东") and not secrets.hit("region")

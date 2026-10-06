@@ -12,8 +12,8 @@
 （masked_values：审批质询、反方审稿收的报告快照里的值），文字格里夹着的换那一截（engine/masking.py 的
 mask_query_result）；数值格不按值换（存下的是证据，没设遮罩的访问次数正好等于某一笔被遮的金额也照原样）；查询失败时
 报错原话里的值也换。模型看不到遮罩值，就不会把它写进回答、理由、SQL；以前是事后按值认，每一轮复核都找到新的漏法。
-快照里的 masked_at_query 记下查询时就遮了的列，masked_cells 记下按值换过的格子，格子引用指到这几列、这几格的都不采信，
-照实说是遮罩。遮掉的值只在内存里交回调用方（VerifyOutcome.masked_values，审批质询、反方审稿按值遮的第二道防线
+快照里的 masked_at_query 记下查询时就遮了的列，masked_cells 记下按值换过的格子，masked_whole 记下写法认不全、整份
+都遮了，格子引用指到这几列、这几格的都不采信，照实说是遮罩（整份遮的说写法认不全）。遮掉的值只在内存里交回调用方（VerifyOutcome.masked_values，审批质询、反方审稿按值遮的第二道防线
 用），不进快照、不交给模型、不进 as_dict。调用方交进来的和查询时遮掉的分开记（masking.SeenValues），合起来时 agent
 查到的在前：合起来到了上限 SECRETS_MAX，挤掉的是报告里的值。
 
@@ -428,10 +428,12 @@ class _Cells:
                                "reason": f"{alias} {e}"})
             return None
         if str(name).lower() in _masked_at_query(content):
-            # 查询时就遮了的列：格子里是「已遮罩」，不是数据源里的值。照实说是遮罩列，不说成「不是数值」
+            # 查询时就遮了的列：格子里是「已遮罩」，不是数据源里的值。照实说是遮罩列，不说成「不是数值」；认不全、整份
+            # 遮的（快照记着 masked_whole）说是写法认不全——这一列不一定取自遮罩列，说成遮罩列会让审批人以为它设了遮罩
+            why = f"{alias} 的写法认不全，整份结果查询时已遮罩，不采信" if _masked_whole(content) \
+                else f"{alias} 的「{name}」取自设置了遮罩的列，查询时已遮罩，不采信"
             self.cells.append({"path": path, "status": "unresolved", "ref": f"{alias}.r{row}.{name}", "alias": alias,
-                               "row": row, "column": name, "artifact": query["artifact"],
-                               "reason": f"{alias} 的「{name}」取自设置了遮罩的列，查询时已遮罩，不采信"})
+                               "row": row, "column": name, "artifact": query["artifact"], "reason": why})
             return None
         if raw == _masked_word() and isinstance(content, dict) and "masked_at_query" in content:
             # 这一格查询时按值换掉了（和别的查询、报告里的遮罩值相同）：同样照实说
@@ -545,6 +547,11 @@ def _masked_at_query(content: Any) -> set[str]:
     """查询快照里查询时就整列遮掉的列（小写，tools/datasource 记下的 masked_at_query）。"""
     listed = content.get("masked_at_query") if isinstance(content, dict) else None
     return {c.lower() for c in listed if isinstance(c, str)} if isinstance(listed, list) else set()
+
+
+def _masked_whole(content: Any) -> bool:
+    """查询快照记着这条 SQL 的写法认不全、整份结果查询时都遮了（tools/datasource 记下的 masked_whole）。"""
+    return isinstance(content, dict) and content.get("masked_whole") is True
 
 
 def _masked_cell(content: Any, row: Any, name: str) -> bool:

@@ -535,6 +535,7 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
         # 别的列里按值换过的格子另记（masked_cells），没有就不记
         masked_now: list[str] | None = None
         masked_cells: list[list[int]] = []
+        masked_whole = False
         if mask_results and (mask or known is not None):
             from app.engine.masking import mask_query_result
 
@@ -543,6 +544,7 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
                                            schema=source.schema_cache)
             if mask or done.payload is not payload:
                 payload, masked_now, masked_cells = done.payload, done.columns, done.cells
+                masked_whole = done.whole
             if sink is not None:
                 # 并进 agent 查到的那一份（不和调用方交进来的混在一起，上限收满了也不丢），也放进线程
                 await asyncio.to_thread(sink.add, done.secrets)
@@ -567,6 +569,8 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
             #   改了名字的也在这里）。有这一项的快照，别的格子整格是「已遮罩」的是查询时按值换掉的；
             # - masked_cells：别的列里查询时按值换过的文字格 [行, 列号]（整格换的、换掉一截的），格子引用指到它们时照实
             #   说是遮罩。数值格不按值换，存下的数和数据库里的一样；
+            # - masked_whole：这条 SQL 的写法认不全，整份结果查询时都遮了（masked_at_query 是全部的列），格子引用指到它时
+            #   照实说写法认不全，不说成取自遮罩列；
             # - data_version：上传表格查的是哪个快照，事后据此认得出这个数出自哪一版数据。
             # 手工源、没设遮罩的，快照和原来一字不差
             extra: dict[str, Any] = {}
@@ -576,6 +580,8 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
                 extra["masked_at_query"] = masked_now
             if masked_cells:
                 extra["masked_cells"] = masked_cells
+            if masked_whole:
+                extra["masked_whole"] = True
             if version := getattr(source, "snapshot_id", None):
                 extra["data_version"] = version
             # 工件引用的 meta 记下源和 SQL 里用到的表：数据目录按它数每张表被运行查询过几次

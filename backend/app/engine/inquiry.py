@@ -8,7 +8,8 @@
    （同按需裁判）；设置里关了「审批质询 · 启用」一律不答。同一次运行同时只答一条：进程内登记（_ANSWERING），登记期间
    这次运行的审批回复、继续运行也不受理（api/runs.py），免得运行往下走了、问答还在路上
 2. 回答（_answer）：交给 agent 被问的那句原文、它挂的证据摘录（照 judge.prepare 的办法取，原报告的编号标明「原报告」；
-   摘录先遮：遮罩列不给，改了名字的遮罩列按 SQL 认出来也不给，别的列、SQL 里写着的遮罩值按值换掉，见 _excerpts）、
+   摘录先遮，和工具边界同一套口径：遮罩列、改了名字的遮罩列按 SQL 认出来都不给，文字格、SQL 的字符串和注释里的遮罩值
+   按值换，和遮罩列做等值比较的字面量都换，数值格、范围比较的阈值、LIMIT 照原样，见 _excerpts、ExcerptMask）、
    审批人选中的原文和问题；工具是这次运行用过的查询工具对应的数据源（同名重建的、没固定过版本的
    上传表格不算，见 _usable_sources）；上限按设置（每次的查询次数、时长，全局每日金额）。回答先给结论，数字只能引用 agent
    自己查询的格子，或者报告里已有的指标、运行输入；回答文档由 compose_doc 组装，裸数字被标出来（提问人自己写的数除外）。
@@ -51,6 +52,8 @@
   数（访问次数正好等于某一笔金额）也遮掉，这是产品取舍，不按上下文去猜；工具边界不按值换数值格（存下的是证据），交给
   agent 的、存下的查询快照里这样的数照原样，只在回答和质询工件里遮。反过来，没设遮罩的列里存成数的号码（别的库里的
   联系方式表把手机号存成整数）工具边界也不按值换，agent 看得到：要遮就在那个数据源上把那一列也设成遮罩。存成文字的照换。
+  数值格按列类型认（Postgres 的 NUMERIC、MySQL 的 DECIMAL 交回来是字符串），列类型按列名记，结果里同名的几列说不清是
+  哪一列的类型，按格子本身认：整数、小数才算数，写成字符串的数按文字照换（多遮，换过的记进 masked_cells）。
   占位的写法（未知、暂无……，masking.PLACEHOLDERS）不当遮罩值
 - 遮罩数值列的 SUM / AVG / MIN / MAX 算派生自遮罩列，整列遮（COUNT 不算，见 _value_columns），CASE 里有一支取的是
   遮罩列的也算：MIN / MAX 就是某一行的原值，只有一行的分组 SUM / AVG 也是，按列认不出哪些汇总值安全，宁可多遮。
@@ -75,14 +78,25 @@
   Oracle 的 JSON_OBJECT(*)）按 * 展开的来源算：取自子查询、CTE 的看它选出的列，取自数据源里的表的一律算取自遮罩列（整列
   遮）。Postgres 先按列认：表结构里查得到和表同名的列（visits 表的 visits 列）才当列，查不到时按整行算（多遮）；LATERAL
   里只看排在它前面的来源，它自己的结果列不算。PIVOT、UNPIVOT、MATCH_RECOGNIZE 读到遮罩列的，整份快照的列都遮（多遮）。
-  SQL 解析不了的只看文字：写着遮罩列、*（COUNT(*) 除外）、TABLE x、下面那几类函数和视图的整份遮，整行引用这类不写列名的
-  写法认不出
+  SQL 解析不了的：Postgres 的一律整份遮（整行引用不写列名、也没有 *，只看文字认不出）；别的库只看文字，写着遮罩列、
+  *（COUNT(*) 除外）、TABLE x、下面那几类写法的整份遮
+- WITH 里和数据源里的表同名的一段（WITH sales AS (SELECT * FROM sales WHERE …)）：不带 RECURSIVE 的 WITH 里一段只看得见
+  排在它前面的段，里面的 sales 是数据源里的表（按表算，整行引用、* 展开的照遮）；SQLite 里一段看得见排在后面的段，这里
+  按看不见算（当成数据源里的表，多遮）
 - 认不全的写法整份遮（多遮，同一份里没碰遮罩列的编号、金额也遮）：(表达式).* 展开读到遮罩列的（复合类型的列
-  (p.profile).*、函数交回的记录 (jsonb_each_text(pj)).*、子查询里的 ROW (q.r).*，展开成几列、各叫什么 SQL 里看不出）；
-  表名、SQL 写在字符串里交给函数执行、整表导出的（query_to_xml、table_to_xml、cursor_to_xml、schema_to_xml、
-  database_to_xml 这一族，dblink、crosstab、ts_stat，Oracle 的 DBMS_XMLGEN、XMLTYPE，DuckDB 的 query，SQL Server 的
-  OPENQUERY）、按页按文件读原始数据的、统计信息和会话记录里存着值的（pg_stats、sqlite_stat4、pg_stat_statements），
-  按名字认（masking._INDIRECT），自己建的同类函数认不出；分析出了意外、一长串 CTE 超出工作量上限（ANALYSIS_STEPS）的
+  (p.profile).*、函数交回的记录 (jsonb_each_text(pj)).*、子查询里的 ROW (q.r).*，外面套了括号、起了别名的也算，展开成
+  几列、各叫什么 SQL 里看不出）；语法树和实际执行的对不上的（MySQL、MariaDB 会执行的注释 /*! … */，Postgres 的
+  U&"…" 名字，没有 * 的一支选出项和结果的列数对不上）；表名、SQL 写在字符串里交给函数执行、整表导出的（query_to_xml、
+  table_to_xml、cursor_to_xml、schema_to_xml、database_to_xml 这一族，dblink、crosstab、ts_stat，Oracle 的
+  DBMS_XMLGEN、XMLTYPE）、按页按文件按日志读原始数据的（pageinspect、逻辑解码、LOAD_FILE）、统计信息和会话记录里存着值
+  的（Postgres 的 pg_stats、pg_stat_statements、pg_stat_activity；SQLite 的 sqlite_stat4；MySQL 的 column_statistics、
+  general_log、PROCESSLIST、performance_schema；MariaDB 的 column_stats；Oracle 的直方图、记着最小最大值的
+  *_tab_columns、V$SQL 一族、审计记录），按名字认（masking 的 INDIRECT_FUNCTIONS、INDIRECT_NAMES，可验证报告用的同一份
+  名单），去掉注释再认一遍（函数名和括号之间夹着注释），自己建的同类函数、视图认不出；information_schema、pg_catalog 里
+  只有表结构的视图不算（核查 agent 查列名、类型常用）。只收支持的几种库的：DuckDB、SQL Server 的同类函数不收；分析出了
+  意外、一长串 CTE 超出工作量上限（ANALYSIS_STEPS）的。整份遮的只收确定取自遮罩列的那几列的值当遮罩值（别的列的值
+  本来就没交给模型，收了会把区域名、列名在同一次核查里处处换掉）；快照记下整份遮（masked_whole），格子引用指到它时照实
+  说写法认不全
 - 按遮罩列分档的标签（CASE、IIF 的结果全是写死的常量）：标签文字是 agent 写在 SQL 里的，不当遮罩值，SQL、回答正文里
   照原样；标签列当分组键（每一档一行）照常显示，分档写在子查询、WITH 里、外层（或中间一层）按它分组的也算
   （masking._grouped_labels），不分组的逐行标签列整列遮（格子里看不出某一笔落在哪一档），可 agent
@@ -127,9 +141,12 @@
   点、括号，含全角），带 +86 / 0086 / 86 前缀、全角数字：写成汉字（一三九……）、中间夹着别的字、拆成几处写的、跨行
   写的认不出；和别的数字只隔着一个连字符或点连着的（13900000001-2、19914.74）不算号码；SQL 里不带引号的数不这样认
   （199-1474-2785 在 SQL 里是三个数相减），字符串、带引号的名字、注释里照样认
-- 质询 agent 的任务里的证据摘录先遮（_excerpts）：遮罩列、按 SQL 认出改了名字的遮罩列（和工具边界同一套规则）不给，
-  别的列、SQL 里写着的遮罩值按值换（报告快照里的值），按值认的门槛同上：短的数（年龄、等级）写在 SQL 的条件里、别的列
-  里照原样。没指明是哪一句时任务里给的是报告正文，正文里写着的值照原样（读者本来就看得到）
+- 质询 agent 的任务里的证据摘录先遮（_excerpts、ExcerptMask，和工具边界同一套口径）：遮罩列、按 SQL 认出改了名字的
+  遮罩列不给；文字格、SQL 的字符串和注释、列名里的遮罩值按值换（报告快照里的值，门槛同上）；SQL 里和遮罩列做等值、
+  IN、LIKE 比较的字面量不论认不认得出都换（报告没选出遮罩列时快照里收不到这些值）；数值格、范围比较的阈值、LIMIT 照
+  原样，没设遮罩的数值格恰好等于某个遮罩值也照原样（同工具边界不改写数值证据）。被问的那句（在表格里的连同整张表）、
+  问题、报告列出的指标和运行输入里写着的值不换，回答里复述也不换。没指明是哪一句时任务里给的是报告正文，正文里写着
+  的值照原样（读者本来就看得到）
 """
 from __future__ import annotations
 
@@ -165,10 +182,11 @@ from app.engine.masking import (  # noqa: F401
     SECRETS_MAX, SECRET_DIGITS, SECRET_MIN, _ABSENT, _DIGITS, _EXPONENT_MAX, _LabelMemo, _NUMERIC, _PLAIN_NUMBER,
     _PREFIX, _Secrets, _WORD, _WORDS, _all_labels, _arithmetic, _band_only, _block_label, _block_label_of, _blocks,
     _branch_results, _branches, _canonical, _constant, _constants, _decimal, _derived_block, _derived_hidden,
-    _digits_of, _fixed, _forms, _from_sources, _is_star, _item_label, _label_columns, _leaves, _literal_types,
-    _masked_view, _masked_word, _mentions, _merging, _numeric, _output_name, _pattern, _places, _plain_text,
-    _point_text, _query_shaped, _result_label, _scrubbed_source, _snapshot_labels, _source_label, _source_names,
-    _star_label, _strong, _tainted, _value_columns, _worked_out, replay_edits, view_edits,
+    _derived_masks, _digits_of, _fixed, _forms, _from_sources, _is_star, _item_label, _label_columns, _leaves,
+    _literal_types, _masked_view, _masked_word, _mentions, _merging, _numeric, _output_name, _pattern, _places,
+    _plain_text, _point_text, _query_shaped, _result_label, _schema_columns, _scrubbed_source, _snapshot_labels,
+    _source_label, _source_names, _star_label, _strong, _tainted, _value_columns, _worked_out, masked_cell,
+    replay_edits, view_edits,
 )
 from app.engine.merge_query import MERGE_SOURCE
 from app.engine.nodes.challenge import mark_original, with_note
@@ -584,13 +602,12 @@ def _table_text(block: dict[str, Any], markdown: str) -> str:
 
 
 def _excerpts(doc: dict[str, Any], catalog: dict[str, Any], cand: judging.Candidate, loader: Callable[[str], Any],
-              masked: dict[str, Any], kinds: dict[str, Any] | None = None, secrets: _Secrets | None = None
-              ) -> list[str]:
+              masked: dict[str, Any], mask: ExcerptMask | None = None) -> list[str]:
     """这句挂的每件证据的摘录：和 judge.prepare 一样逐件摘（带期 4 标记的文档多来历行），指向原报告编号的写法标上
     「原报告」——agent 自己的查询也编 Q1、Q2…，不分开的话会把它们混成一回事。
-    摘录先遮，模型从任务里也看不到遮罩值：数据源遮罩的列不给，改了名字的（buyer_phone AS 手机号）按 SQL 认出来也不给
-    （kinds：{数据源名: 类型}，和工具边界同一套规则，judge._derived）；别的列、SQL 里写着的遮罩值按值换成「已遮罩」，
-    换了写法的号码也认（secrets：报告快照里的遮罩值，同交给查询工具的那一份）。解析 SQL、按值换是纯计算，调用方放进线程。"""
+    摘录先遮，模型从任务里也看不到遮罩值（mask，见 ExcerptMask）：数据源遮罩的列、按 SQL 认出改了名字的
+    （buyer_phone AS 手机号）不给；文字格、SQL 里的字符串和注释里的遮罩值按值换成「已遮罩」，换了写法的号码也认，和遮罩列
+    做等值比较的字面量都换；数值格、范围比较的阈值、LIMIT 照原样。解析 SQL、按值换是纯计算，调用方放进线程。"""
     fetch = judging._Fetch(loader)
     provenance_on = doc.get("provenance") == DOC_PROVENANCE
     queries = {a for a, e in catalog.items() if isinstance(e, dict) and e.get("kind") == "query"}
@@ -598,9 +615,7 @@ def _excerpts(doc: dict[str, Any], catalog: dict[str, Any], cand: judging.Candid
     for alias in cand.aliases:
         entry = catalog.get(alias)
         if isinstance(entry, dict) and (text := judging._excerpt(alias, entry, [cand], fetch, masked, catalog,
-                                                                 provenance_on=provenance_on, kinds=kinds)):
-            if secrets is not None and secrets.strong:
-                text = secrets.scrub(text, loose=True)
+                                                                 provenance_on=provenance_on, mask=mask)):
             out.append(mark_original(text, alias, queries))
     return out
 
@@ -1479,6 +1494,78 @@ def _scrub_sql(sql: str, secrets: _Secrets, compared: set[str], kind: str | None
         raw, tokens[i].text, kinds[i], uses[i], secrets, compared)[0] if i in uses else raw)
 
 
+def _scrub_excerpt_sql(sql: str, secrets: _Secrets, compared: set[str], kind: str | None) -> str:
+    """交给核查 agent 的证据摘录里的 SQL（报告取数的那条）：照封存 SQL 的办法换（_scrub_sql：字符串、注释、名字里的遮罩值
+    换，范围比较的边界、LIMIT 的行数照原样，别处够长的遮罩值换），另外和遮罩列（compared：_derived_hidden 认出的名字，
+    含改了名字的）做等值、IN、LIKE 一类比较的字面量，不论认不认得出是遮罩值都换成「已遮罩」：报告没选出遮罩列时快照里
+    收不到这些值（WHERE buyer_phone NOT IN ('13900000002', …)），摘录又不是封存的 SQL，可以多遮。同一个数写成阈值、行数的
+    也换（同 _literals）。已经摆在读者眼前的值（问题、被问的那句、这句结论原文里写着的，_Secrets.spared）照旧不换。
+    以前对渲染好的整段摘录按值换，范围比较的阈值（amount >= 20000）也成了「已遮罩」，agent 看不到报告按什么取数。
+    分词出错的整条按值换（同 _scrub_sql）。"""
+    if not sql or not (secrets.strong or secrets.weak or compared):
+        return sql
+    split = _literals(sql, kind, secrets, compared)
+    if split is None:
+        return secrets.scrub(sql)
+    tokens, kinds, uses = split
+    word = _masked_word()
+    pinned = {i for i, (how, columns, _) in uses.items()
+              if how == "equal" and columns & compared and not secrets.spared(tokens[i].text)}
+    numbers = _number_forms(v for i in pinned for v in (tokens[i].text, *uses[i][2]))
+
+    def literal(i: int, raw: str) -> str:
+        if i not in uses:
+            return raw
+        if i in pinned or (kinds[i] == "NUMBER" and uses[i][0] in _KEPT and _digits_of(tokens[i].text) in numbers):
+            return _requote(raw, lambda _: word)
+        return _swap_literal(raw, tokens[i].text, kinds[i], uses[i], secrets, compared)[0]
+
+    return _rebuild(sql, tokens, kinds, secrets, literal)
+
+
+@dataclass
+class ExcerptMask:
+    """交给核查 agent（反方审稿、审批质询）的证据摘录怎么遮：judge.prepare 的 mask，judge 只按这几个方法用它。口径和工具
+    边界一样，模型从任务里也看不到遮罩值，又不改写没设遮罩的数值证据：
+    - columns：哪几列不给。按列名的，加上按 SQL 认出改了名字的（buyer_phone AS 手机号，masking._derived_masks，表结构按
+      快照冻结的那份）；认的过程出了意外，整份的列都不给
+    - cell：格子逐格遮（masking.masked_cell）：数值格照原样，文字格按值换（整格的、夹着的那一截，换了写法的号码也认）
+    - sql：SQL 照 _scrub_excerpt_sql 换：范围比较的边界、LIMIT 照原样，和遮罩列做等值比较的字面量都换
+    - text：别的文字（列名、检索片段、来历行）按值换，换了写法的号码也认，同 SQL 里的名字
+    报告里列出的指标值、原式、运行输入的值不经它（报告本来就摆在读者眼前，同 _ref_values 免遮）。以前先渲染好整段摘录、
+    再对整段按值换，分不出格子和 SQL 里的用法：阈值、没设遮罩的访问次数正好等于某一笔被遮的金额，都成了「已遮罩」。
+    kinds：{数据源名: 类型}（SQL 按它的方言解析）；secrets：按值换的值（报告快照里的遮罩值去掉已经摆在读者眼前的，同交给
+    查询工具的那一份），没有为 None（只按列遮、只换和遮罩列做等值比较的字面量）。"""
+
+    kinds: dict[str, Any]
+    secrets: _Secrets | None = None
+
+    def _kind(self, snapshot: dict[str, Any]) -> str | None:
+        return self.kinds.get(str(snapshot.get("source") or ""))
+
+    def columns(self, snapshot: dict[str, Any], hidden: set[str], schema: Any) -> tuple[set[str], set[str]]:
+        """(不给的列, SQL 里指代遮罩列的名字)，都是小写。schema 是快照冻结的表结构快照（经 judge 的 fetch 取），没有为
+        None（按快照记着的认）。"""
+        if not hidden:
+            return set(hidden), set(hidden)
+        try:
+            tables = _schema_columns(schema) if isinstance(schema, dict) else None
+            found = _derived_masks(dict(snapshot), set(hidden), self._kind(snapshot), tables)
+            return set(hidden) | found.hidden, found.names
+        except Exception:  # noqa: BLE001 - 认不准就整份不给：摘录少几列，不让遮罩值交给核查 agent
+            logger.warning("按 SQL 认摘录里改了名字的遮罩列时出错，整份快照的列都按遮罩处理", exc_info=True)
+            return set(hidden) | {str(c).lower() for c in snapshot.get("columns") or []}, set(hidden)
+
+    def cell(self, value: Any, *, numeric: bool) -> Any:
+        return masked_cell(value, self.secrets, numeric=numeric)
+
+    def sql(self, sql: str, snapshot: dict[str, Any], names: set[str]) -> str:
+        return _scrub_excerpt_sql(sql, self.secrets or _Secrets(), set(names), self._kind(snapshot))
+
+    def text(self, text: str) -> str:
+        return self.secrets.scrub(text, loose=True) if self.secrets is not None and self.secrets.strong else text
+
+
 def _rebuild(sql: str, tokens: list[Any], kinds: list[str], secrets: _Secrets, literal: Callable[[int, str], str]
              ) -> str:
     """按词重写一段 SQL：字面量交给 literal（第几个词、原文）定换成什么，名字（带不带引号）、注释和别的字按值换。
@@ -1689,8 +1776,10 @@ def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str]
     tainted: dict[str, set[str]] = {}
     for artifact, snapshot in own.items():
         kind, base = kinds.get(str(snapshot.get("source") or "")), named[artifact][0]
-        hidden[artifact], tainted[artifact] = _derived_hidden(snapshot, base, kind)
-        secrets.add(snapshot, hidden[artifact], labels=_snapshot_labels(snapshot, kind), base=base)
+        found = _derived_masks(snapshot, base, kind)
+        hidden[artifact], tainted[artifact] = found.hidden, found.names
+        # 收值只收确定取自遮罩列的那几列（整份遮的不是每一列都收，见 masking._derived_masks）
+        secrets.add(snapshot, found.collect, labels=_snapshot_labels(snapshot, kind), base=base)
     # agent 查询时遮掉的值先收（报告快照里的值收满了上限 SECRETS_MAX，也不丢 agent 自己查到的）；不带它们的一份另算，
     # 比出事后取质询工件时认不出、要照位置重放的地方
     baseline = secrets.copy() if seen is not None and seen.strong else None
@@ -1715,10 +1804,11 @@ def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str]
 
 
 def _add_based(secrets: _Secrets, based: list[tuple[dict[str, Any], set[str]]], kinds: dict[str, str | None]) -> None:
-    """收报告自己的查询快照里遮罩列的值（based：快照和它要遮的列），按 SQL 认出改了名字的遮罩列（_derived_hidden）。"""
+    """收报告自己的查询快照里遮罩列的值（based：快照和它要遮的列），按 SQL 认出改了名字的遮罩列（masking._derived_masks）。
+    写法认不全、整份遮的快照只收确定取自遮罩列的那几列：以前每一格都收，区域名、列名在这次核查里处处被换掉。"""
     for snapshot, base in based:
         kind = kinds.get(str(snapshot.get("source") or ""))
-        secrets.add(snapshot, _derived_hidden(snapshot, base, kind)[0], labels=_snapshot_labels(snapshot, kind),
+        secrets.add(snapshot, _derived_masks(snapshot, base, kind).collect, labels=_snapshot_labels(snapshot, kind),
                     base=base)
 
 
@@ -1827,15 +1917,20 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
     async with SessionLocal() as session:
         spec = await verify_model_spec(session, None, settings=settings)
     # 报告自己的查询快照：被问的那句可能直接写着遮罩列的值，agent 会照着复述；里面的遮罩值在派 agent 之前就交给它的
-    # 查询工具（masked_values），agent 查到写着同一个号码的备注、别的表时，交给模型之前就换掉；证据摘录也按它们先遮
+    # 查询工具（masked_values），agent 查到写着同一个号码的备注、别的表时，交给模型之前就换掉；证据摘录也按它们先遮。
+    # 被问的那句（在表格里的连同整张表）就写在任务开头、摆在审批人眼前，里面的值同问题一样哪里都不换（同反方审稿的
+    # _spared）：以前不算，这句引用的那一格在摘录里成了「已遮罩」，和任务开头写着的原句对不上
     given = [ask.question, ask.quote, *_ref_values(refs)]
+    if target is not None:
+        given += [target.cand.text, target.table]
     others = [snapshot for entry in catalog.values() if isinstance(entry, dict) and entry.get("kind") == "query"
               and _query_shaped(snapshot := _quiet_load(op.loader, entry.get("artifact")))]
     seed = await snapshot_secrets(others, given)
     excerpts: list[str] = []
     if target is not None:
         kinds = await _source_kinds([*masked, *(str(s.get("source") or "") for s in others)])
-        excerpts = await asyncio.to_thread(_excerpts, doc, catalog, target.cand, op.loader, masked, kinds, seed)
+        excerpts = await asyncio.to_thread(_excerpts, doc, catalog, target.cand, op.loader, masked,
+                                           ExcerptMask(kinds, seed))
     outcome = await run_verify_agent(
         spec=spec, system=INQUIRY_SYSTEM, task=_task(op, ask, target, excerpts, refs, live, lost), sources=list(live),
         output_schema=INQUIRY_SCHEMA, max_queries=part.get("max_queries"), timeout_s=part.get("timeout_s"),
