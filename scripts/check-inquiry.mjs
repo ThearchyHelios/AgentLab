@@ -504,12 +504,18 @@ await section('划选原文：浮出的「质询」算在审批卡里，贴着�
   check('点浮出的「质询」：按下的位置在审批卡里，「点外面就收起」的浮层不会因此收起', outside.length === 0, outside.join(' | '))
   check('……照样打开提问框，带上原文', (await text(composer(page).locator('[data-inquiry-target]'))) === '枫岭区销售额最高')
   await page.keyboard.press('Escape')
+  // Esc 之后焦点在下一帧才回到原文起头那一句的「质询」，它一出现那一段可能多折一行、下面的句子往下挪：等它落定再量，
+  // 不然量好的「贴着底边」被挤到框外
+  check('Esc 关掉提问框，焦点回到原文起头那一句的「质询」', await until(async () => (await active(page))?.ask === 'u4'),
+    JSON.stringify(await active(page)))
   // 报告框压矮、滚到某一句的第一行贴着框的底边（取压矮之后落在框外、滚得过去的第一句），在那一行开头划选几个字：
   // 浮出的按钮放在选区下方会被框裁掉，得换到上方
   const edge = await page.evaluate(() => {
     const box = document.querySelector('[data-approval-evidence-doc]')
     if (!box) return null
     box.style.maxHeight = '150px'
+    // 刚才提问框滚进过视野，页面滚到哪要看时机：先把报告框整个放进视口（选区滚出视口时按钮本来就不出）
+    box.scrollIntoView({ block: 'center' })
     for (const unit of box.querySelectorAll('[data-ev-unit]')) {
       const b = box.getBoundingClientRect()
       const line = unit.getClientRects()[0]
@@ -550,6 +556,28 @@ await section('划选原文：浮出的「质询」算在审批卡里，贴着�
     `${await text(composer(page).locator('[data-inquiry-target]'))} / ${edge?.words}`)
   await shot(page, 'selection-edge-dark')
   check('没有发出任何写请求', hits.writes.length === 0 && hits.asks.length === 0, hits.writes.join('、'))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+  await ctx.close()
+})
+
+await section('划选原文：选区上面的排版变了（不滚动、不改选区），浮出的「质询」跟着选区走', async () => {
+  const { ctx, page, errors } = await open('inquiry-approval')
+  await expand(page)
+  check('划选一段原文', await select(page, 'u4', '枫岭区销售额最高'))
+  await page.locator('[data-inquiry-selection]').waitFor()
+  await page.waitForTimeout(100)
+  const place = () => page.evaluate(() => {
+    const sel = getSelection().getRangeAt(0).getBoundingClientRect()
+    const b = document.querySelector('[data-inquiry-selection]')?.getBoundingClientRect()
+    return { sel: Math.round(sel.bottom), gap: b ? Math.round(b.top - sel.bottom) : null }
+  })
+  const before = await place()
+  // 同悬停一句时它的「质询」出现、那一段多折一行：上面的内容变高，选区往下挪，却没有滚动、没有选区变化的事件
+  await page.evaluate(() => { document.querySelector('[data-approval-evidence-doc] [data-block]').style.paddingTop = '30px' })
+  await page.waitForTimeout(200)
+  const after = await place()
+  check('选区往下挪了，浮出的「质询」跟着挪，仍贴在选区下方', after.sel - before.sel >= 25 && before.gap != null && after.gap != null
+    && Math.abs(after.gap - before.gap) <= 2, `${JSON.stringify(before)} → ${JSON.stringify(after)}`)
   check('页面没有报错', errors.length === 0, errors.join('；'))
   await ctx.close()
 })

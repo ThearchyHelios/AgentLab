@@ -654,16 +654,20 @@ function useSelectionPick(root: RefObject<HTMLElement | null>, anchor: RefObject
       setPick((cur) => (cur && cur.quote === next.quote && cur.unit === next.unit && cur.left === next.left && cur.top === next.top
         ? cur : next))
     }
-    // 选区一变、页面或报告框一滚、窗口一变都重新量：可见范围变了，按钮放上方还是下方跟着变
+    // 选区一变、页面或报告框一滚、窗口一变都重新量：可见范围变了，按钮放上方还是下方跟着变。文档自己的尺寸变了也量：
+    // 悬停一句时它的「质询」出现、那一段多折一行，下面的字整体下移，既不滚动也不改选区，按钮却得跟着挪
     const schedule = () => { if (!frame) frame = requestAnimationFrame(read) }
     document.addEventListener('selectionchange', schedule)
     window.addEventListener('scroll', schedule, true)
     window.addEventListener('resize', schedule)
+    const resized = typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null
+    if (root.current) resized?.observe(root.current)
     return () => {
       cancelAnimationFrame(frame)
       document.removeEventListener('selectionchange', schedule)
       window.removeEventListener('scroll', schedule, true)
       window.removeEventListener('resize', schedule)
+      resized?.disconnect()
     }
   }, [root, anchor, enabled])
   return [pick, useCallback(() => setPick(null), [])]
