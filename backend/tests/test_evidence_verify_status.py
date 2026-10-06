@@ -310,9 +310,12 @@ async def test_a_challenged_sentence_carries_the_verdict(client, monkeypatch, sa
     output = await challenge_output(run.id)
     record = output["challenge_artifact"]
     south = (await sentence(client, run.id, SOUTH))["unit"]["challenge"]
-    # counts 是整份报告的审稿计数（节点产出里的那一份）：一句被推翻、一句被削弱，不是只数这一句
+    # counts 是整份报告的审稿计数（节点产出里的那一份）：一句被推翻、一句被削弱，不是只数这一句；节点产出带着
+    # unreviewed（没能反查的句数，这里两句都查了），照样带上
     assert south == {"verdict": "refuted", "node_id": "chal", "artifact": record, "on_refuted": "degrade",
-                     "report_label": "写周报", "counts": {"stands": 0, "weakened": 1, "refuted": 1, "inconclusive": 0}}
+                     "report_label": "写周报", "counts": {"stands": 0, "weakened": 1, "refuted": 1, "inconclusive": 0},
+                     "unreviewed": 0}
+    assert south["unreviewed"] == output["unreviewed"]
     assert south["counts"] == output["counts"]
     # 点开句子里的数字，片段接口答的这一句同样带着判断
     east = (await segment(client, run.id, "1,500"))["unit"]["challenge"]
@@ -334,7 +337,8 @@ async def test_a_lost_review_record_still_shows_the_listed_verdicts(client, monk
     assert (await challenge_output(run.id))["challenge_artifact"] is None
     south = (await sentence(client, run.id, SOUTH))["unit"]["challenge"]
     assert south == {"verdict": "refuted", "node_id": "chal", "artifact": None, "on_refuted": "degrade",
-                     "report_label": "写周报", "counts": {"stands": 0, "weakened": 1, "refuted": 1, "inconclusive": 0}}
+                     "report_label": "写周报", "counts": {"stands": 0, "weakened": 1, "refuted": 1, "inconclusive": 0},
+                     "unreviewed": 0}
 
 
 async def test_a_review_that_stopped_the_run_still_marks_its_sentences(client, monkeypatch, sales):
