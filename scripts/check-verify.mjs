@@ -18,6 +18,7 @@
 // - 审批卡（期 4）：预告逐条说「会记为……」或「不会记入：原因」，原因是服务端的原话；被目录挡下的一边照样说写到哪；
 //   几个指标落到同一项上时照完整对照里服务端算好的合并预告（catalog_joint）说，和真写的一字不差（夹具的 merges 是服务端
 //   真写一遍的结果）；盲算的理由按核查 agent 组装的理由文档画，有出处的数字画实线、裸数字醒目标出，老工件照旧纯文本；
+// - 记录页的工件列表：双盲复算对照、反方审稿记录两种工件有名字和说明，不露键名；
 // - 检查器：口径卡、指标、口径说明、盲算模型、相对误差、未采用原流程时、启用，每一项都真的写进节点配置；字段的
 //   叫法和服务端校验报错里的（engine/labels.py 的 DUAL_CHECK_FIELD_LABEL）一字不差；选口径卡、盲算模型、启用三态用的是
 //   和反方审稿共用的控件（verifyFields.tsx）；盲算模型不藏在高级选项里
@@ -1040,6 +1041,27 @@ await section('审批卡：390px 不横向溢出、窄栏里上下排、深浅�
   const b = await metric(rail.page, 'gmv').locator('[data-dual-sql="blind"]').boundingBox()
   check('360px 画布右栏：宽屏下也按卡片的宽度上下排', !!o && !!b && b.y >= o.y + o.height - 1, JSON.stringify({ o, b }))
   await shot(rail.page, 'approval-rail-dark')
+})
+
+await section('记录页的工件列表：双盲复算对照、反方审稿记录有名字', async () => {
+  // 工件列表按 pages/runs/model.ts 的 ARTIFACT_KIND_LABEL 写种类：期 3 新加的两种工件没登记时，列表里露出的是键名
+  // dual_check、challenge，说明一栏只有一句「工件」。按页面自己加载的那一份取（同 check-evidence 的工件一节）
+  const { page, errors } = await preview('dual-check-approval')
+  const got = await page.evaluate(async () => {
+    const m = await import('/src/pages/runs/model.ts')
+    return {
+      dual: m.artifactKindLabel('dual_check'), challenge: m.artifactKindLabel('challenge'),
+      dualDesc: m.artifactDescription('dual_check', { metrics: 2 }), dualBare: m.artifactDescription('dual_check', null),
+      challengeDesc: m.artifactDescription('challenge', { report: 'report' }),
+      evidence: m.isEvidence('dual_check') && m.isEvidence('challenge'),
+    }
+  })
+  check('种类：双盲复算对照、反方审稿记录，不露键名', got.dual === '双盲复算对照' && got.challenge === '反方审稿记录', JSON.stringify(got))
+  check('……说明写清装的是什么：双盲复算带指标个数，没有 meta 的老数据也有一句', got.dualDesc === '双盲复算：2 个指标两边的 SQL、取值与差异说明'
+    && got.dualBare === '双盲复算：两边的 SQL、取值与差异说明' && got.challengeDesc === '反方审稿：每句结论的判断、理由和反方执行的查询',
+  JSON.stringify(got))
+  check('……两种都算证据（列表里醒目）', got.evidence)
+  check('……页面没有报错', errors.length === 0, errors.join('；'))
 })
 
 // ---------------------------------------------------------------- 检查器与节点卡片
