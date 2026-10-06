@@ -475,24 +475,36 @@ export const EVIDENCE_TEXT = {
   },
 
   // ---- 期 4：核查状态。指标步骤上的双盲复算、取自遮罩列的输入（反方审稿的判断复用审批卡的 CHALLENGE_TEXT）----
+  /**
+   * 指标步骤上的一行：「双盲复算：状态（盲算 值），审核人的选择。后果」。状态词和同一节里按代入式重算的「复算一致 /
+   * 无法复算」分开说（两件事），用时间线上的说法（与盲算结果一致 / 不一致）；选项名照审批卡的 choices 原样加引号。
+   * 运行已经结束：后果只说节点已经做了什么（记为缺口），降没降档看报告的出具横幅，这里不预告
+   */
   dualCheck: {
     label: '双盲复算',
-    status: { agreed: '一致', disagreed: '不一致', unchecked: '无法复算', skipped: '已跳过' } as Record<string, string>,
+    status: { agreed: '与盲算结果一致', disagreed: '与盲算结果不一致', unchecked: '未能完成', skipped: '已跳过' } as Record<string, string>,
     /** 服务端给了一个界面不认识的状态：照写原值，不归到哪一类 */
     unknown: (status: string) => `未知状态「${status}」`,
     /** 盲算的值，服务端按口径卡的格式渲染好的 */
     blind: (value: string) => `盲算 ${value}`,
-    choice: { a: '审核人采用原流程的结果', b: '审核人采用盲算结果', neither: '审核人判断两边都不对' } as Record<string, string>,
+    /** choice 是审批卡上那个选项的原名（DUAL_CHECK_TEXT.approval.choices） */
+    choice: (choice: string) => `审核人选择「${choice}」`,
     noChoice: '审核人没有作出选择',
-    /** 跳过的原因：节点直通（设置或节点里关了、口径卡上没有来自查询的输入），或者这个指标不在复算范围里 */
+    /** 采用盲算、两边都不对、没选：报告里的数没换，节点把它记成了缺口。正式运行叫出具缺口，探索运行不出具 */
+    kept: (formal: boolean) => `报告中的数仍取自原流程，这个指标已记为${formal ? '出具缺口' : '缺口'}`,
+    /** 未能完成：同样记了缺口 */
+    gap: (formal: boolean) => `这个指标已记为${formal ? '出具缺口' : '缺口'}`,
+    /** 跳过的原因，按这个指标说；认不出的原因代码不写 */
     skip: {
-      disabled: '双盲复算已关闭',
-      no_inputs: '口径卡上没有来自查询的输入',
+      disabled: '节点或设置中已关闭',
+      no_inputs: '这个指标没有来自查询的输入',
       not_targeted: '这个指标不在复算范围内',
     } as Record<string, string>,
   },
   /** 指标的输入取自数据源设置了遮罩的列：标签和代入式里不显示值 */
   maskedInput: '取自设置了遮罩的列，不显示值',
+  /** 遮没遮核对不了（快照、取值链上的产出读不出来）：原因是服务端写好的一句 */
+  unverifiedInput: (why: string) => `${why}，不显示值`,
   maskedMismatch: '与快照不一致；取自设置了遮罩的列，不显示值',
 } as const
 

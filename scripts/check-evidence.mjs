@@ -3293,7 +3293,8 @@ await section('copy-r2','按后端原文匹配的地方：后端现在的原文�
 
 /**
  * 双盲复算的几种状态，按片段挂到一期夹具的指标步骤上。形状照服务端（api/evidence.py 的 _dual_check_of）：一致、不一致
- * （审核人采用原流程 / 采用盲算 / 没选）、无法复算（带原因）、已跳过（带原因代码）
+ * （审核人采用原流程 / 采用盲算 / 没选）、未能完成（带原因）、已跳过（带原因代码）。DUAL_MORE 是第二轮：跳过的另几种原因
+ * （关闭了、没有来自查询的输入、认不出的代码）和「两边都不对」
  */
 const DUAL = {
   s6: { status: 'agreed', node_id: 'dual', blind_rendered: '45,678.5元' },
@@ -3303,9 +3304,22 @@ const DUAL = {
   s12: { status: 'unchecked', node_id: 'dual', reason: '盲算没有交出可用的数：查询全部失败' },
   s23: { status: 'skipped', node_id: 'dual', reason: 'not_targeted' },
 }
+const DUAL_MORE = {
+  s23: { status: 'skipped', node_id: 'dual', reason: 'disabled' },
+  s49: { status: 'skipped', node_id: 'dual', reason: 'no_inputs' },
+  s45: { status: 'skipped', node_id: 'dual', reason: 'no_such_reason' },
+  s10: { status: 'disagreed', node_id: 'dual', choice: 'neither', blind_rendered: '1,301单' },
+}
+/** 双盲复算那一行标签上的说明（DUAL_CHECK_TEXT.description）：悬停、读屏都说得出是什么 */
+const DUAL_ABOUT = '另起一路独立计算，与原结果逐项比对'
 /** 虚构的反方审稿记录（challenge_artifact）：整句面板里点开那一句，按它取理由 */
 const CH_ART = 'c4'.repeat(32)
 const CH_RATIONALE = '扣除退款后新客首单只占增长的一小部分，老客复购反而下降。'
+/** 整份报告的审稿计数（服务端从节点产出里取）：审了 6 句，经受住 3、被削弱 1、被推翻 2 */
+const CH_COUNTS = { stands: 3, weakened: 1, refuted: 2, inconclusive: 0 }
+/** 出具预告的几行（审批卡上说「出具会降档」那一套）：证据面板看的是已经结束的运行，一行都不该有 */
+const ISSUANCE_LINES = '[data-challenge-degrade], [data-challenge-degrade-note], [data-challenge-degrade-off], '
+  + '[data-challenge-flag], [data-challenge-runclass]'
 
 /** WCAG 对比度：rgb()/rgba()/color(srgb …) 都认 */
 function contrastOf(fg, bg) {
@@ -3325,7 +3339,7 @@ function contrastOf(fg, bg) {
   return (a + 0.05) / (b + 0.05)
 }
 
-await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列的输入、整句的反方审稿判断', async () => {
+await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列的输入、反方审稿的判断', async () => {
   // ---- 指标步骤多一行双盲复算的结果；没复核过的不画
   const r = await probe((id, body) => {
     const metric = body.chain?.find((st) => st.step === 'metric')
@@ -3338,29 +3352,48 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
       }
       body.redacted = { columns: ['order_cnt'], note: '这些列在数据源中设置了遮罩' }
     }
+    if (id === 's23' && metric) {
+      // 遮没遮核对不了（快照读不出来）：同样不显示值，原因是服务端写好的一句，不进遮罩列
+      for (const st of body.chain) {
+        if (st.step === 'input' && st.path === 'vars.kpi.refund_cnt') {
+          Object.assign(st, { value: '已遮罩', mask_unverified: '查询快照无法读取，核对不了这一格是否取自设置了遮罩的列' })
+        }
+      }
+    }
     return body
   })
   const pg = r.page
   const p = panel(pg)
   const line = p.locator('[data-ev-dual-check]')
-  for (const [id, status, words, token] of [
-    ['s6', 'agreed', ['双盲复算：', '一致', '盲算 45,678.5元'], '--st-done'],
-    ['s8', 'disagreed', ['不一致', '盲算 9.1%', '审核人采用原流程的结果'], '--st-waiting'],
-    ['s10', 'disagreed', ['不一致', '盲算 1,301单', '审核人采用盲算结果'], '--st-failed'],
-    ['s45', 'disagreed', ['不一致', '盲算 45,900.0元', '审核人没有作出选择'], '--st-failed'],
-    ['s12', 'unchecked', ['无法复算', '查询全部失败'], '--st-waiting'],
-    ['s23', 'skipped', ['已跳过', '这个指标不在复算范围内'], '--text-dim'],
+  const lineText = async () => (await line.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  for (const [id, status, words, token, none = []] of [
+    ['s6', 'agreed', ['双盲复算', '与盲算结果一致', '盲算 45,678.5元'], '--st-done', ['缺口']],
+    ['s8', 'disagreed', ['与盲算结果不一致', '盲算 9.1%', '审核人选择「采用原流程的结果」'], '--st-waiting', ['缺口']],
+    ['s10', 'disagreed', ['与盲算结果不一致', '盲算 1,301单', '审核人选择「采用盲算的结果」',
+      '报告中的数仍取自原流程，这个指标已记为缺口'], '--st-failed', ['审核人采用盲算结果', '出具缺口', '降档']],
+    ['s45', 'disagreed', ['与盲算结果不一致', '盲算 45,900.0元', '审核人没有作出选择', '报告中的数仍取自原流程'], '--st-failed'],
+    ['s12', 'unchecked', ['未能完成', '查询全部失败', '这个指标已记为缺口'], '--st-waiting', ['无法复算']],
+    ['s23', 'skipped', ['已跳过', '这个指标不在复算范围内'], '--text-dim', ['缺口']],
   ]) {
     await openSeg(pg, id, '[data-ev-dual-check]')
-    const text = (await line.innerText().catch(() => '')).replace(/\s+/g, ' ')
+    const text = await lineText()
     const got = await line.getAttribute('data-ev-dual-check').catch(() => null)
     const color = await line.locator('span.font-medium').evaluate((el) => getComputedStyle(el).color).catch(() => '')
     check(`双盲复算 ${status}（${words.slice(1).join('、') || words[0]}）：指标步骤写成一行，颜色按要不要多看一眼`,
-      got === status && words.every((w) => text.includes(w)) && color === await tokenColor(pg, 'color', `var(${token})`),
-      `${got}：${text}（${color}）`)
+      got === status && words.every((w) => text.includes(w)) && !none.some((w) => text.includes(w))
+        && color === await tokenColor(pg, 'color', `var(${token})`), `${got}：${text}（${color}）`)
     await pg.keyboard.press('Escape')
     await pg.waitForTimeout(80)
   }
+  // 「双盲复算」和同一节里按代入式重算的「复算」是两件事：标签悬停、读屏都说明是什么，状态词也不同
+  await openSeg(pg, 's12', '[data-ev-dual-check]')
+  const label = p.locator('[data-ev-dual-check-label]')
+  const recompute = await p.locator('[data-ev-recompute]').innerText().catch(() => '')
+  check('双盲复算的标签悬停写明是什么（另起一路独立计算），读屏同样读得到', await label.getAttribute('title') === DUAL_ABOUT
+    && (await label.locator('.sr-only').innerText().catch(() => '')).includes(DUAL_ABOUT))
+  check('双盲复算的状态词和「复算」那一行分得开：未能完成 ≠ 无法复算', (await lineText()).includes('未能完成')
+    && !(await lineText()).includes('无法复算') && !!recompute, `${await lineText()} ｜ ${recompute}`)
+  await pg.keyboard.press('Escape')
   for (const theme of ['light', 'dark']) {
     await pg.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
     let worst = Infinity
@@ -3374,7 +3407,8 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
           }
           return getComputedStyle(document.body).backgroundColor
         }
-        return [...el.querySelectorAll('span')].map((sp) => [getComputedStyle(sp).color, back(sp)])
+        return [...el.querySelectorAll('span')].filter((sp) => !sp.classList.contains('sr-only'))
+          .map((sp) => [getComputedStyle(sp).color, back(sp)])
       }).catch(() => [])
       for (const [fg, bg] of pair) worst = Math.min(worst, contrastOf(fg, bg))
       await pg.keyboard.press('Escape')
@@ -3401,8 +3435,40 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
     && await p.locator('[data-ev-input="vars.kpi.gmv"]').getAttribute('data-ev-input-masked') === null)
   check('面板底下写明遮罩的列和遮罩不是安全边界', (await p.locator('[data-ev-mask-note]').innerText().catch(() => '')).includes('order_cnt'))
   await pg.keyboard.press('Escape')
+  // 遮没遮核对不了：同样写「已遮罩」，悬停说明原因（快照读不出来），不算进遮罩列
+  await openSeg(pg, 's23', '[data-ev-substituted]')
+  const unsure = p.locator('[data-ev-input="vars.kpi.refund_cnt"]')
+  const unsureTitle = await unsure.getAttribute('title').catch(() => '')
+  check('遮没遮核对不了的输入：标签写「已遮罩」，悬停写明快照读不出来、不显示值',
+    await unsure.getAttribute('data-ev-input-masked') === '' && (await unsure.innerText()).includes('已遮罩')
+      && (unsureTitle ?? '').includes('查询快照无法读取，核对不了这一格是否取自设置了遮罩的列，不显示值'), unsureTitle ?? '')
+  check('……面板底下的遮罩说明不把它算进遮罩列', await p.locator('[data-ev-mask-note]').count() === 0)
+  await pg.keyboard.press('Escape')
   check('核查状态那几页没有运行时报错', r.errors.length === 0, r.errors.join(' | '))
   await r.ctx.close()
+
+  // ---- 第二轮：跳过的另几种原因、「两边都不对」。原因代码认不出来的不写进句子；关闭了的不说两遍「双盲复算」
+  const r2 = await probe((id, body) => {
+    const metric = body.chain?.find((st) => st.step === 'metric')
+    if (metric && DUAL_MORE[id]) metric.dual_check = DUAL_MORE[id]
+    return body
+  })
+  const line2 = panel(r2.page).locator('[data-ev-dual-check]')
+  for (const [id, words, none] of [
+    ['s23', ['已跳过', '节点或设置中已关闭'], ['双盲复算已关闭']],
+    ['s49', ['已跳过', '这个指标没有来自查询的输入'], ['口径卡上没有']],
+    ['s45', ['已跳过'], ['no_such_reason', '，']],
+    ['s10', ['审核人选择「两边都不对」', '报告中的数仍取自原流程，这个指标已记为缺口'], ['审核人判断']],
+  ]) {
+    await openSeg(r2.page, id, '[data-ev-dual-check]')
+    const text = (await line2.innerText().catch(() => '')).replace(/\s+/g, ' ').replace(`（${DUAL_ABOUT}）`, '')
+    check(`双盲复算 ${id}：${words.join('、')}${none.length ? `，不写「${none.join('」「')}」` : ''}`,
+      words.every((w) => text.includes(w)) && !none.some((w) => text.includes(w)), text)
+    await r2.page.keyboard.press('Escape')
+    await r2.page.waitForTimeout(80)
+  }
+  check('第二轮没有运行时报错', r2.errors.length === 0, r2.errors.join(' | '))
+  await r2.ctx.close()
 
   // ---- 输入来源：遮罩列的 Agent 字段核对不一致时只说不一致，不写两边的值
   const q = await probeQ((id, body) => {
@@ -3423,11 +3489,25 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
   check('输入来源：没遮罩的字段照旧', verified.includes('与快照一致') && !verified.includes('遮罩'), verified.replace(/\s+/g, ' '))
   await q.ctx.close()
 
-  // ---- 整句面板：反方审稿的判断，复用审批卡的展示，点开看理由；没审到的句子不画
+  // ---- 反方审稿：整句面板、片段面板都看得到这一句的判断。复用审批卡的展示，概况是整份报告的真实计数，不预告出具
   const u = fxj.formal.units
-  const challenge = { verdict: 'refuted', node_id: 'chal', artifact: CH_ART, on_refuted: 'degrade', report_label: '写周报' }
+  const challenge = (verdict) => ({ verdict, node_id: 'chal', artifact: CH_ART, on_refuted: 'degrade', report_label: '写周报',
+    counts: CH_COUNTS })
   const segPatch = (jset, body) => {
-    if (jset === fxj.formal && body.unit?.id === u.bad) body.unit.challenge = challenge
+    if (jset === fxj.formal && body.unit?.id === u.bad) body.unit.challenge = challenge('refuted')
+    if (jset === fxj.formal && body.unit?.id === u.ok) {
+      body.unit.challenge = challenge('weakened')
+      // 正式运行里的一个指标：双盲复算不一致、审核人采用盲算。记的是出具缺口
+      if (body.segment?.id === 's6') {
+        body.chain = [{ step: 'metric', metric: 'gmv', name: '销售额', value: 45678.5, rendered: '45,678.5', unit: '元',
+          expression: 'vars.kpi.gmv', substituted: '45678.5', recompute_ok: true,
+          dual_check: { status: 'disagreed', node_id: 'dual', choice: 'b', blind_rendered: '45,900.0元' } }]
+      }
+    }
+    // 计数缺了（格式不对）：不画，免得审批卡的展示按这一句拼一个「被推翻 1 句、其余 0 句」
+    if (jset === fxj.formal && body.unit?.id === u.limit) body.unit.challenge = { verdict: 'refuted', node_id: 'chal' }
+    // 没开结论句裁判的报告：没有句末徽标，点句中的数字也要看得到
+    if (jset === fxj.plain && body.unit?.id === 'u3') body.unit.challenge = challenge('refuted')
     return body
   }
   for (const [w, h] of [[1280, 1000], [390, 844]]) {
@@ -3443,23 +3523,51 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
     })
     const cp = panel(c.page)
     const block = cp.locator('[data-ev-challenge]')
+    const blockText = async () => (await block.innerText().catch(() => '')).replace(/\s+/g, ' ')
     await badge(c.page, J, u.bad).click()
     await c.page.waitForSelector('[data-evidence-panel] [data-ev-challenge] [data-challenge-item]', { timeout: 4000 }).catch(() => {})
-    const text = (await block.innerText().catch(() => '')).replace(/\s+/g, ' ')
+    const text = await blockText()
     if (w === 1280) {
-      check('整句面板：反方审稿的判断（被推翻）挂在这一句下，写明是哪份报告的反方审稿', await block.getAttribute('data-ev-challenge') === 'refuted'
+      check('整句面板：反方审稿的判断（被推翻）挂在这一句下，写明是哪份报告的审稿', await block.getAttribute('data-ev-challenge', { timeout: 3000 }).catch(() => null) === 'refuted'
         && text.includes('报告「写周报」的反方审稿') && text.includes('被推翻') && text.includes('新客首单'), text)
+      check('……概况是整份报告的真实计数（服务端给的），不凭这一句拼', text.includes('经受住 3 句') && text.includes('被削弱 1 句')
+        && text.includes('被推翻 2 句') && text.includes('无法判断 0 句') && await block.locator('[data-challenge-more="5"]').count() === 1, text)
+      check('……运行已经结束：不预告「出具会降档」，降没降档看报告的出具横幅', await block.locator(ISSUANCE_LINES).count() === 0
+        && !text.includes('降档'), text)
       check('……判断由反方模型给出，并非系统核对', text.includes('并非系统核对'), text)
-      check('……正式运行、按降档处理：写明出具会降档', await block.locator('[data-challenge-degrade]').first()
-        .waitFor({ timeout: 3000 }).then(() => true, () => false))
       await block.locator('[data-challenge-toggle]').click()
       await c.page.waitForSelector('[data-evidence-panel] [data-challenge-detail-state="ok"]', { timeout: 4000 }).catch(() => {})
       const why = await block.locator('[data-challenge-rationale]').innerText().catch(() => '')
       check('……点开看得到反方的理由（按审稿记录取）', why.includes(CH_RATIONALE) && artifactHits.length === 1, why)
+      // 被削弱的那一句：概况照样是整份报告的数，不出现凭这一句拼的「被推翻 0 句」
       await badge(c.page, J, u.ok).click()
-      await c.page.waitForSelector('[data-evidence-panel] [data-ev-judge="supported"]', { timeout: 4000 }).catch(() => {})
+      await c.page.waitForSelector('[data-evidence-panel] [data-ev-challenge="weakened"]', { timeout: 4000 }).catch(() => {})
+      const weak = await blockText()
+      check('被削弱的那一句：概况写整份报告的计数（被推翻 2 句），不写凭这一句拼的「被推翻 0 句」', weak.includes('被推翻 2 句')
+        && !weak.includes('被推翻 0 句') && !weak.includes('被削弱 1 句 · 被推翻 0 句'), weak)
+      // 片段面板：点这一句里的数字，同样看得到判断；正式运行里双盲复算记的是出具缺口
+      await c.page.locator(`${J} [data-seg="s6"]`).click()
+      await c.page.waitForSelector('[data-evidence-panel] [data-ev-challenge="weakened"]', { timeout: 4000 }).catch(() => {})
+      check('片段面板：点句中的数字，看得到这一句的反方审稿判断', await block.getAttribute('data-ev-challenge', { timeout: 3000 }).catch(() => null) === 'weakened'
+        && (await blockText()).includes('被削弱'), await blockText())
+      const dual = (await cp.locator('[data-ev-dual-check]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+      check('……正式运行：审核人采用盲算的，写明报告中的数仍取自原流程、已记为出具缺口',
+        dual.includes('审核人选择「采用盲算的结果」') && dual.includes('报告中的数仍取自原流程，这个指标已记为出具缺口'), dual)
+      // 计数格式不对的：不画
+      await badge(c.page, J, u.limit).click()
+      await c.page.waitForSelector('[data-evidence-panel] [data-ev-judge]', { timeout: 4000 }).catch(() => {})
+      await c.page.waitForTimeout(200)
+      check('服务端没给计数的判断：不画（不拼一个只数这一句的概况）', await block.count() === 0)
+      await badge(c.page, J, u.partial).click()
+      await c.page.waitForSelector('[data-evidence-panel] [data-ev-judge="partial"]', { timeout: 4000 }).catch(() => {})
       await c.page.waitForTimeout(200)
       check('没审到的句子：不画反方审稿', await block.count() === 0)
+      // 没开结论句裁判的报告：没有句末徽标，点句中的数字照样看得到判断
+      await c.page.keyboard.press('Escape')
+      await c.page.locator(`${JP} [data-seg="s14"]`).click()
+      await c.page.waitForSelector('[data-evidence-panel] [data-ev-challenge]', { timeout: 4000 }).catch(() => {})
+      check('没开结论句裁判的报告：点句中的数字看得到反方审稿判断', await block.getAttribute('data-ev-challenge', { timeout: 3000 }).catch(() => null) === 'refuted'
+        && (await blockText()).includes('退款 29 单'), await blockText())
     } else {
       const wide = await c.page.evaluate(() => {
         const el = document.querySelector('[data-evidence-panel]')
