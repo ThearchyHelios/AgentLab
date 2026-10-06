@@ -127,7 +127,8 @@ async def test_the_reserve_follows_the_segment_length(clock):
 
 
 async def test_downstream_model_nodes_take_their_share(clock):
-    """下游还有写报告、反方审稿：剩 300 秒时给下游留 180 秒，这一项最多 90 秒（300 − 180 − 30）；只剩 230 秒时不再开始。"""
+    """下游还有写报告、反方审稿：剩 300 秒时给下游留 180 秒，这一项最多 90 秒（300 − 180 − 30）；剩 239 秒时（不到
+    180 + 30 + 30）不再开始。"""
     async with deadline.segment(clock.now + 300, 600):
         assert deadline.allot(120, grace=30.0, after=2) == deadline.Allot(True, 90.0, tightened=True, seconds=600)
         assert deadline.allot(120, grace=30.0).timeout_s == 120, "下游没有调模型的节点：照旧只留一份"

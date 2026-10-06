@@ -480,9 +480,9 @@ async def test_slow_blind_checks_no_longer_abort_the_run(monkeypatch, orders):
 
 
 async def test_a_slow_report_after_the_blind_checks_still_finishes(monkeypatch, orders):
-    """真的钟：双盲复算 → 写报告 → 成果，这一段只有 10 秒。盲算一项接一项，每项都查到时长用完（查不完的查询）；写报告要
-    3 秒。双盲复算给下游的写报告多留了一份余量（4 秒），收尾之后报告写得完，运行照常完成——只留一份（2 秒）的话，盲算
-    用到最后，报告写到一半整次运行就被中止。几项来得及随机器快慢变，只断言不变的。"""
+    """真的钟：双盲复算 → 写报告 → 成果，这一段只有 10 秒。盲算一项接一项，每项都查到时长用完（查不完的查询）；写报告的
+    执行器换成一个要 3 秒的替身（像写作模型慢）。双盲复算给下游的写报告多留了一份余量（4 秒），收尾之后报告写得完，运行
+    照常完成——只留一份（2 秒）的话，盲算用到最后，报告写到一半整次运行就被中止。几项来得及随机器快慢变，只断言不变的。"""
     monkeypatch.setattr(settings, "max_run_seconds", 10)
     monkeypatch.setattr(deadline, "RESERVE_S", 2.0)
     monkeypatch.setattr(verify_agent, "SETTLE_GRACE_S", 0.4)
