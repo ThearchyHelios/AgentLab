@@ -722,6 +722,18 @@ _WORDS = re.compile(r"[0-9A-Za-z_]+")
 _DIGITS = re.compile(r"\d[\d,]*(?:\.\d+)?")
 #: 中文这类遮罩值按开头几个字分桶找（_Secrets._partition）
 _PREFIX = 8
+#: 正文里一串允许夹分隔符的数字（换了写法的号码，见 _Secrets.loose_spans）：数字（含全角）之间夹着一到三个空格、连字符、
+#: 点、括号（含全角），开头可以带 + 和括号。逗号不算分隔符（千分位按 _DIGITS 认），冒号、斜杠也不算（时间、日期），不跨行
+_LOOSE_RUN = re.compile(r"[(（]?[+＋]?[(（]?[0-9０-９]+(?:[ \u3000\-‐‑‒–—－.．·・()（）]{1,3}[0-9０-９]+)*[)）]?")
+_LOOSE_DIGITS = re.compile(r"[0-9０-９]+")
+#: 两截数字之间只隔着这样一个字（不带空格）：是更长的编号、小数、日期的两截（13900000001-2、13900000001.5），号码到这里
+#: 不算完——同 _pattern 里「前后不能是 [.:/-] 加数字」
+_JOINERS = frozenset("-‐‑‒–—－.．")
+_POINTS = frozenset(".．")
+#: 去掉国家码（0086、86）之后至少还要有这么多位才算号码（固话号码最短 7 位）：86 开头的短数不拆
+_LOCAL_MIN = 7
+_OPENS, _CLOSES = frozenset("(（"), frozenset(")）")
+_HALF_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
 
 
 def _plain_text(value: Any) -> str:
@@ -756,6 +768,64 @@ def _digits_of(form: str) -> str:
     return form.replace(",", "").lstrip("+-").rstrip("%")
 
 
+def _loose_candidates(digits: str) -> list[str]:
+    """一串数字（半角）可能是哪个号码的纯数字写法：原样；以国家码（0086、86）开头、去掉之后还有 _LOCAL_MIN 位以上的，
+    去掉国家码的也算。"""
+    out = [digits]
+    for code in ("0086", "86"):
+        if digits.startswith(code) and len(digits) - len(code) >= _LOCAL_MIN:
+            out.append(digits[len(code):])
+    return out
+
+
+def _loose_keys(form: str) -> list[str]:
+    """一个按值认得出的遮罩值的纯数字写法（换了写法的号码按它认，见 _Secrets.loose_spans）：整个是一个整数（可带千分位、
+    正负号、全角数字）的取它的数字；整个是夹着分隔符的数字串（存的就是 199-1474-2785、+86 199 1474 2785）的取规范化
+    之后的数字；以国家码开头的另加去掉国家码的。带小数的、不到 SECRET_DIGITS 位的、别的写法没有。"""
+    if _NUMERIC.fullmatch(form):
+        digits = _digits_of(form).translate(_HALF_DIGITS)
+    elif _LOOSE_RUN.fullmatch(form):
+        digits = "".join(_LOOSE_DIGITS.findall(form)).translate(_HALF_DIGITS)
+    else:
+        return []
+    if not (digits.isascii() and digits.isdigit()) or len(digits) < SECRET_DIGITS:
+        return []
+    return _loose_candidates(digits)
+
+
+def _loose_whole(text: str, run: re.Match[str], groups: list[tuple[int, int, str]], i: int, j: int) -> bool:
+    """一串数字里第 i 到第 j 截拼起来是一个完整的号码，不是更长的编号、小数、日期的一截：两头不和别的数字只隔着一个
+    连字符或点（13900000001-2、13900000001.5、2026-10-06），只有两截、中间是一个点的按小数算（19914.74）；这一串
+    前后不紧挨着字母数字（ID13900000001），同 _pattern 的词边界。"""
+    def gap(a: int, b: int) -> str:
+        return text[groups[a][1]:groups[b][0]]
+
+    if (i > 0 and gap(i - 1, i) in _JOINERS) or (j < len(groups) - 1 and gap(j, j + 1) in _JOINERS):
+        return False
+    if j == i + 1 and gap(i, j) in _POINTS:
+        return False
+    before = text[run.start() - 1] if i == 0 and run.start() > 0 else ""
+    after = text[run.end()] if j == len(groups) - 1 and run.end() < len(text) else ""
+    return not (_WORD.match(before) or _WORD.match(after))
+
+
+def _loose_span(text: str, run: re.Match[str], groups: list[tuple[int, int, str]], i: int, j: int) -> tuple[int, int]:
+    """第 i 到第 j 截这个号码在 text 里换掉的那一段：从第一截到最后一截，从这一串开头起的连同前面的 + 和括号。括号配成
+    对：号码里有落单的左括号，紧跟着的右括号一起换掉；配不上的落单左括号留着不换（「（电话 199-1474-2785）」两个括号
+    都留着）；落单的右括号，紧挨在前面的左括号一起换掉（(199)1474-2785 从第二截起认出来时）。"""
+    start, end = groups[i][0], groups[j][1]
+    if i == 0:
+        start = run.start()
+    depth = sum((c in _OPENS) - (c in _CLOSES) for c in text[start:end])
+    while depth > 0 and end < len(text) and text[end] in _CLOSES:
+        end, depth = end + 1, depth - 1
+    while depth > 0 and text[start] in _OPENS:
+        start, depth = start + 1, depth - 1
+    while depth < 0 and start > 0 and text[start - 1] in _OPENS:
+        start, depth = start - 1, depth + 1
+    return start, end
+
+
 def _pattern(value: str) -> str:
     """一个值的正则：头尾是字母数字的按词边界认；数字还不能是更长的数、日期、时间的一截（12.5 里的 2.5、2026-01-25 里的
     25、12:30 里的 30），也不能是千分位写法里的一组（1,390 里的 390）。逗号隔开的一串长号码（13900000001,13900000002）
@@ -780,7 +850,9 @@ class _Secrets:
     strong 是按值认得出的写法（够长的数、两个字以上的文字），正文、SQL 里的字面量、名字和注释、别的列里的格子、列名都按
     它换；weak 是遮罩列里的全部写法（含短的数），只用在 SQL 里和遮罩列做等值比较的字面量上；shown 是 SQL 里照原样
     留着的阈值、行数（去掉千分位、正负号的数字），只在回答正文里不换（scrub 的 prose）。换的时候先按词、按开头两个
-    字筛出正文里真有的那几个值，再拿它们现编正则：遮罩值上万个时，现编一个上万分支的正则要一秒上下，每次都卡住整个进程。"""
+    字筛出正文里真有的那几个值，再拿它们现编正则：遮罩值上万个时，现编一个上万分支的正则要一秒上下，每次都卡住整个进程。
+    正文、文字格里另认换了写法的长号码（199-1474-2785、+86 199 1474 2785、全角数字，见 loose_spans）：按纯数字写法
+    在集合里查，不进正则。"""
 
     strong: set[str] = field(default_factory=set)
     weak: set[str] = field(default_factory=set)
@@ -826,9 +898,13 @@ class _Secrets:
         if not given:
             return
         numbers = {_digits_of(n) for n in _DIGITS.findall(given)}
+        # 换了写法写进来的号码（「199-1474-2785 这位客户」）按纯数字写法认
+        reformatted = {key for _, _, key in self.loose_spans(given)}
 
         def asked(form: str) -> bool:
-            return _digits_of(form) in numbers if _NUMERIC.fullmatch(form) else form in given
+            if _digits_of(form) in numbers if _NUMERIC.fullmatch(form) else form in given:
+                return True
+            return bool(reformatted) and any(key in reformatted for key in _loose_keys(form))
 
         self.strong = {f for f in self.strong if not asked(f)}
         self.weak = {f for f in self.weak if not asked(f)}
@@ -844,7 +920,8 @@ class _Secrets:
         return bool(_NUMERIC.fullmatch(form)) and _digits_of(form) in self.shown
 
     def hit(self, value: Any) -> bool:
-        """一格（或 SQL 里一个字面量）的值是不是按值认得出的遮罩值。短的数不算（见 SECRET_DIGITS）。"""
+        """一格（或 SQL 里一个字面量）的值是不是按值认得出的遮罩值。短的数不算（见 SECRET_DIGITS）。整格就是一个换了
+        写法的号码的（没设遮罩的联系方式列里写着 199-1474-2785）也算。"""
         if value is None or isinstance(value, bool) or not self.strong:
             return False
         text = _plain_text(value)
@@ -852,19 +929,59 @@ class _Secrets:
             return True
         if _numeric(value) and sum(c.isdigit() for c in text) >= SECRET_DIGITS:
             with contextlib.suppress(RenderError, ValueError, ArithmeticError):
-                return render_cell(value) in self.strong
-        return False
+                if render_cell(value) in self.strong:
+                    return True
+        return isinstance(value, str) and any(start == 0 and end == len(text) for start, end, _ in self.loose_spans(text))
 
     def weak_hit(self, text: str) -> bool:
         """SQL 里一个字面量是不是遮罩列里出现过的值（短的数也算）。"""
         return _plain_text(text) in self.weak
 
-    def scrub(self, text: str, *, prose: bool = False) -> str:
-        """text 里的遮罩值换成「已遮罩」。prose：这是回答正文，SQL 里照原样留着的阈值、行数不换（show）。"""
+    def scrub(self, text: str, *, prose: bool = False, loose: bool | None = None) -> str:
+        """text 里的遮罩值换成「已遮罩」。prose：这是回答正文，SQL 里照原样留着的阈值、行数不换（show）。loose：换了写法
+        的长号码也换（loose_spans），缺省同 prose——只在正文、文字格里这样认，SQL 里的 199-1474-2785 是一个算式。"""
         if not text or not self.strong:
             return text
+        if prose if loose is None else loose:
+            # 先换换了写法的：+86 19914742785 整个换掉，不留下一截「+86」
+            for start, end, _ in reversed(self.loose_spans(text, prose=prose)):
+                text = text[:start] + _masked_word() + text[end:]
         pattern = self.pattern(text, prose=prose)
         return pattern.sub(_masked_word(), text) if pattern is not None else text
+
+    def loose_spans(self, text: str, *, prose: bool = False) -> list[tuple[int, int, str]]:
+        """text 里换了写法的长号码（199-1474-2785、(199)1474-2785、+86 199 1474 2785、全角数字……）：(起, 止, 纯数字
+        写法)，按先后、不重叠。在正文里找允许夹分隔符的数字串（_LOOSE_RUN），从每一截起往后拼，规范化（全角转半角、去
+        分隔符、去国家码）之后在遮罩值的纯数字写法里查（集合查找，不现编正则），取拼得最长的那个；拼出来的不是完整的
+        号码（更长的编号、小数、日期的一截，见 _loose_whole）不算。prose 同 scrub：SQL 里照原样留着的阈值不算。"""
+        if not text or not self.strong:
+            return []
+        keys, longest = self._partition()[3]
+        if not keys:
+            return []
+        out: list[tuple[int, int, str]] = []
+        for run in _LOOSE_RUN.finditer(text):
+            groups = [(run.start() + g.start(), run.start() + g.end(), g.group().translate(_HALF_DIGITS))
+                      for g in _LOOSE_DIGITS.finditer(run.group())]
+            i = 0
+            while i < len(groups):
+                best: tuple[int, str] | None = None
+                digits = ""
+                for j in range(i, len(groups)):
+                    digits += groups[j][2]
+                    if len(digits) > longest + 4:     # 再拼也对不上任何一个了（4 是国家码 0086 的长度）
+                        break
+                    key = next((c for c in _loose_candidates(digits) if c in keys), None)
+                    if key is not None and _loose_whole(text, run, groups, i, j):
+                        best = (j, key)
+                if best is None:
+                    i += 1
+                    continue
+                j, key = best
+                if not (prose and key in self.shown):
+                    out.append((*_loose_span(text, run, groups, i, j), key))
+                i = j + 1
+        return out
 
     def pattern(self, text: str, *, prose: bool = False) -> re.Pattern[str] | None:
         """认 text 里出现的遮罩值的正则；一个都没有时为 None。prose 同 scrub。"""
@@ -882,7 +999,7 @@ class _Secrets:
         return self._compiled[key]
 
     def _found(self, text: str) -> set[str]:
-        words, numbers, others = self._partition()
+        words, numbers, others, _ = self._partition()
         found = {w for w in _WORDS.findall(text) if w in words}
         if numbers:
             for run in _DIGITS.findall(text):
@@ -898,15 +1015,17 @@ class _Secrets:
         """先把索引建好（收完值、去掉提问人写的之后）：上万个值建一次要几十毫秒，放在线程里建，别等到事件循环里第一次换。"""
         self._partition()
 
-    def _partition(self) -> tuple[set[str], dict[str, set[str]], dict[int, dict[str, dict[int, set[str]]]]]:
+    def _partition(self) -> tuple[set[str], dict[str, set[str]], dict[int, dict[str, dict[int, set[str]]]],
+                                  tuple[frozenset[str], int]]:
         """strong 分成三类：只有字母数字的（按词比）、带千分位小数的数（按去掉逗号的数比）、其余的（中文、日期、
         邮箱）。其余的按开头至多 _PREFIX 个字分桶、桶里再按长短分：同一个市区的上万个地址开头七八个字都一样，只按开头
         分的话，正文里每碰到一次那几个字都要逐个比；再按长短分，碰到一次只是按几种长短各查一下。三类各自只在正文里
-        真出现时才进正则。"""
+        真出现时才进正则。另记长号码的纯数字写法和其中最长的有几位（_loose_keys，loose_spans 按它查）。"""
         if self._index is None:
             words: set[str] = set()
             numbers: dict[str, set[str]] = {}
             others: dict[int, dict[str, dict[int, set[str]]]] = {}
+            loose: set[str] = set()
             for value in self.strong:
                 if _WORDS.fullmatch(value):
                     words.add(value)
@@ -915,7 +1034,8 @@ class _Secrets:
                 else:
                     size = min(len(value), _PREFIX)
                     others.setdefault(size, {}).setdefault(value[:size], {}).setdefault(len(value), set()).add(value)
-            self._index = (words, numbers, others)
+                loose.update(_loose_keys(value))
+            self._index = (words, numbers, others, (frozenset(loose), max(map(len, loose), default=0)))
         return self._index
 
 
@@ -926,8 +1046,8 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     列名里写着遮罩值的（agent 把遮罩值写进了别名，「13900000001 的单」），列名也换（同 SQL 里的名字，_scrub_sql）。
     原快照不动；没有要遮的返回原快照。
 
-    embedded 只给质询工件用：别的列里一格文字夹着遮罩值（备注里写着手机号），把那一截换成「已遮罩」，这一格别的字
-    照原样，门槛同整格（_Secrets.scrub）；这一列不记进遮掉的列——界面把记进去的列整列画成「已遮罩」，这一列在数据源
+    embedded 只给质询工件用：别的列里一格文字夹着遮罩值（备注里写着手机号，换了写法的也算），把那一截换成「已遮罩」，
+    这一格别的字照原样，门槛同整格（_Secrets.scrub）；这一列不记进遮掉的列——界面把记进去的列整列画成「已遮罩」，这一列在数据源
     里也没设遮罩。回答一路不这样换：渲染出来露了就整份不交（_leaked），不然回答被问的那一格看着像查到了别的东西。"""
     columns = [str(c) for c in snapshot.get("columns") or []]
     index = {i for i, c in enumerate(columns) if c.lower() in hidden}
@@ -951,7 +1071,7 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
         if embedded and by_value and isinstance(value, (str, dict, list)):
             # JSON 列（对象、数组）按界面画出来的样子换，换过的照文字给
             text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-            if (scrubbed := secrets.scrub(text)) != text:
+            if (scrubbed := secrets.scrub(text, loose=True)) != text:
                 edited = True
                 return scrubbed
         return value

@@ -20,8 +20,9 @@
    认用在哪（_literal_uses），数字照原样留着的只有范围比较的边界（没把某一个值夹住的，_pinned）和 LIMIT 的行数，而且
    同一个数在这条 SQL 别处没被换掉，封存的是实际执行的语句；在找某一个值的（等值、IN、简单 CASE、夹住某一个值的
    范围……，值换个写法、写成几个数的算式也认）和别处够长的遮罩值都换。已经摆在读者眼前的值不换：问题和选中原文里的、
-   报告列出的指标和运行输入的值；SQL 里照原样留着的阈值只在回答正文里不换，格子照旧换。组装之后还认得出遮罩值的，
-   这份回答不交出去
+   报告列出的指标和运行输入的值；SQL 里照原样留着的阈值只在回答正文里不换，格子照旧换。回答正文、质询工件的文字格里，
+   换了写法的长号码（199-1474-2785、(199)1474-2785、+86 199 1474 2785、全角数字）按纯数字写法认（masking 的
+   _Secrets.loose_spans）。组装之后还认得出遮罩值的（换了写法的也算），这份回答不交出去
 4. 写入（_record）：一条 approval.inquiry 事件，node_id 为空，用量写在数据的 usage 里（计进运行用量，见 runner 的
    _usage_of_events）。质询的查询快照只放在 inquiry_artifacts / queries 里，绝不放在 query_artifact 下：证据接口按那个键
    收集封存的查询，会把质询的查询当成报告的证据。回答期间运行状态变了（被批准、被放弃、继续运行之后重新封存），
@@ -75,6 +76,9 @@
 - 运行详情的「工件」页签、通用的工件接口按工件原样给：质询的查询快照记在这次运行名下（同报告自己的查询快照），从
   那里打开不经这里的遮罩
 - 遮罩值最多收 SECRETS_MAX 种写法，再多的按值认不出（按列遮照旧）
+- 换了写法的号码只认数字之间夹着一到三个空格、连字符、点、括号（含全角），带 +86 / 0086 / 86 前缀、全角数字：写成
+  汉字（一三九……）、中间夹着别的字、拆成几处写的认不出；和别的数字只隔着一个连字符或点连着的（13900000001-2、
+  19914.74）不算号码；SQL 里不这样认（199-1474-2785 在 SQL 里是一个算式）
 """
 from __future__ import annotations
 
@@ -1834,15 +1838,17 @@ def _compose(source: str, catalog: dict[str, Any], *, run_id: str, views: dict[s
 
 
 def _leaked(doc: dict[str, Any], secrets: _Secrets) -> bool:
-    """组装出来的正文里还认得出遮罩值。SQL 里照原样留着的阈值写在正文里不算（_Secrets.show），渲染进单元格引用里的
-    算：格子已经按值遮过，遮完还认得出，就是一格文字里夹着这个数，渲染出来才露。"""
+    """组装出来的正文里还认得出遮罩值，换了写法的长号码也算（199-1474-2785、+86 …、全角数字，_Secrets.loose_spans）。
+    SQL 里照原样留着的阈值写在正文里不算（_Secrets.show），渲染进单元格引用里的算：格子已经按值遮过，遮完还认得出，
+    就是一格文字里夹着这个数，渲染出来才露。"""
     markdown = str(doc.get("markdown") or "")
     pattern = secrets.pattern(markdown)
-    if pattern is None:
+    hits = [(m.start(), m.end(), secrets.is_shown(m.group())) for m in pattern.finditer(markdown)] if pattern else []
+    hits += [(start, end, key in secrets.shown) for start, end, key in secrets.loose_spans(markdown)]
+    if not hits:
         return False
     cells = [seg["span"] for seg in iter_segments(doc) if str(seg.get("ref") or "").startswith("v:")]
-    return any(not secrets.is_shown(m.group()) or any(a < m.end() and m.start() < b for a, b in cells)
-               for m in pattern.finditer(markdown))
+    return any(not shown or any(a < end and start < b for a, b in cells) for start, end, shown in hits)
 
 
 def _renamed_entry(entry: Any, secrets: _Secrets) -> Any:

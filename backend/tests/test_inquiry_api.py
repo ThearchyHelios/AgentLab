@@ -1651,6 +1651,76 @@ async def test_a_customer_looked_up_in_any_shape_never_shows(monkeypatch, tmp_pa
         await engines.invalidate(source_id)
 
 
+#: 同一个号码（13900000001）换了写法：带空格、连字符、点、括号、全角数字或全角标点、+86 / 0086 / 86 前缀
+REWRITTEN = [
+    pytest.param("139-0000-0001", id="连字符"), pytest.param("139 0000 0001", id="空格"),
+    pytest.param("139.0000.0001", id="点"), pytest.param("(139)0000-0001", id="括号"),
+    pytest.param("+8613900000001", id="+86"), pytest.param("+86 139 0000 0001", id="+86 加空格"),
+    pytest.param("0086 139 0000 0001", id="0086"), pytest.param("86-139-0000-0001", id="86"),
+    pytest.param("１３９０００００００１", id="全角数字"), pytest.param("１３９－００００－０００１", id="全角连字符"),
+    pytest.param("（139）0000　0001", id="全角括号和空格"),
+]
+
+
+def _shown_anywhere(*texts: str) -> str:
+    return "\n".join(texts)
+
+
+@pytest.mark.parametrize("written", REWRITTEN)
+async def test_a_masked_number_written_in_another_shape_never_shows(monkeypatch, tmp_path, client, written):
+    """验收准备时复现过：模型把号码换个写法写进回答（139-0000-0001、+86 …、全角数字），回答正文、事件、回答文档原样
+    带着，最后一道关也拦不住，正式运行里永久封存。现在正文里按纯数字写法认出来，换成「已遮罩」。报告取数选了手机号，
+    号码是从报告自己的查询快照里认出来的。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=SALES)
+    asked = "SELECT COUNT(*) AS 笔数 FROM sales WHERE buyer_phone = '13900000001'"
+    plays = {"这位客户": Play([asked], f"客户 {written} 共下了 [[v:Q1.r0.笔数]] 笔。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=fetching(name, WITH_PHONE))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="这位客户下了几笔？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (True, "客户 已遮罩 共下了 1 笔。")
+        [event] = await events(paused.id, "approval.inquiry")
+        doc = artifact_store.load(item["answer"]["doc_artifact"])
+        shown = _shown_anywhere(json.dumps(r.json(), ensure_ascii=False), json.dumps(event.data, ensure_ascii=False),
+                                json.dumps(doc, ensure_ascii=False))
+        assert written not in shown and "1390000000" not in shown
+    finally:
+        await engines.invalidate(source_id)
+
+
+#: 回访记录的备注里写着换了写法的号码（备注没设遮罩）
+REWRITTEN_CALLBACKS = SALES + ("CREATE TABLE callbacks (id INTEGER PRIMARY KEY, region TEXT, note TEXT);"
+                               "INSERT INTO callbacks VALUES (1, '华东', '客户 (139)0000-0001 来电改址'), "
+                               "(2, '华南', '例行回访');")
+
+
+async def test_a_reformatted_number_inside_a_text_cell_stops_the_answer(monkeypatch, tmp_path, client):
+    """备注里夹着换了写法的号码，agent 引用这一格：渲染出来才露，最后一道关认得出，回答整份不交；质询工件里只换掉那一截。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=REWRITTEN_CALLBACKS)
+    notes = "SELECT region AS 区域, note AS 备注 FROM callbacks ORDER BY id"
+    plays = {"回访": Play([notes], "华东的回访备注是 [[v:Q1.r0.备注]]。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=fetching(name, WITH_PHONE))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="华东的回访说了什么？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["error"]) == (False, LEAKED)
+        [query] = item["queries"]
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+        assert got.status_code == 200, got.text
+        assert got.json()["content"]["rows"] == [["华东", "客户 已遮罩 来电改址"], ["华南", "例行回访"]]
+        assert "0000-0001" not in got.text
+    finally:
+        await engines.invalidate(source_id)
+
+
 # --------------------------------------------------------------------------
 # 接线：两道审批的竞态、上传表格的版本、设置、开放之后状态又变了、张冠李戴的报告文档
 # --------------------------------------------------------------------------
