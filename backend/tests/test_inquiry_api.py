@@ -16,7 +16,7 @@
   也一样；遮罩值不误伤阈值、天数、LIMIT（长的数也一样）、提问人自己写的数、报告口径卡里的指标，分档共用的边界、
   和日期、天数修饰、标签里写着的同一个数也不牵连阈值；SQL 里照原样留着的阈值只在回答正文里不遮，格子照旧按值遮，
   回答和质询工件对得上；质询工件按值遮只出现在报告快照里的遮罩值；一格文字里夹着遮罩值时回答整份不交，质询工件里
-  只换掉那一截
+  只换掉那一截；质询工件里 SQL 检查结果的片段照 SQL 换，给模型的那句改法不交出去
 - 接线：设置里的上限、运行固定的数据版本交到 agent 手里（上传表格重传之后查的仍是运行固定的那一版）；同名重建的
   数据源、没固定过版本的上传表格不查
 - 触顶、失败照样记一条事件，说法给提问人看得懂、说下一步；轮数用完不算查询次数到顶，查询失败、引用解析不了在末尾注明
@@ -1284,6 +1284,35 @@ async def test_a_masked_value_inside_a_text_cell_is_cut_out_of_the_artifact(monk
         assert got.json()["masked"] == [] and "1390000000" not in got.text
     finally:
         await engines.invalidate(source_id)
+
+
+async def test_sql_check_excerpts_in_the_artifact_are_masked_like_the_sql(monkeypatch, masked_shop, client):
+    """agent 的查询带着 SQL 检查结果（对照数据目录查出的问题，片段摘自这条 SQL）：质询工件里片段照查询清单的 SQL
+    换掉遮罩值，给模型的那句改法照抄了片段，不交出去（同证据面板）。"""
+    from app.tools import datasource
+
+    excerpt = "buyer_phone = '13900000001'"
+
+    async def flagged(checker, sql):
+        return [{"code": "wrong_date_column", "level": "warning", "table": "sales", "column": "buyer_phone",
+                 "message": "查询按「买家手机号」筛选", "for_model": f"这条 SQL 按 {excerpt} 筛选",
+                 "sql_excerpt": excerpt}] if excerpt in sql else []
+
+    monkeypatch.setattr(datasource, "_sql_checks", flagged)
+    plays = {"买得最多": Play([TOP_BUYER, BUYER_ORDERS], "这位客户共 [[v:Q2.r0.笔数]] 笔。[[see:Q2]]")}
+    Models(monkeypatch, masked_shop, plays=plays)
+    paused = await pause(masked_shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="买得最多的客户买过几笔？",
+                  approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    _, orders = r.json()["inquiry"]["queries"]
+    got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{orders['artifact']}")
+    assert got.status_code == 200, got.text
+    assert got.json()["content"]["checks"] == [
+        {"code": "wrong_date_column", "level": "warning", "table": "sales", "column": "buyer_phone",
+         "message": "查询按「买家手机号」筛选", "sql_excerpt": "buyer_phone = '已遮罩'"}]
+    assert got.json()["content"]["sql"] == orders["sql"] and "1390000000" not in got.text
 
 
 #: 同样的四笔订单，手机号存成整数：遮罩值在 SQL 里写成数字

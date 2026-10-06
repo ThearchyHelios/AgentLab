@@ -15,7 +15,7 @@
 - 阈值只在同一个数在这条 SQL 别处确实被换掉时才不留（换不换和 SQL 里换字面量是同一套判断）：日期、天数、标签里写着
   同一个短的数，没设遮罩的列上的等值，都不牵连阈值
 - 快照按列遮，另按值遮：别的列里写着遮罩值的格子也换成「已遮罩」；列名里写着遮罩值的，列名也换；质询工件里，
-  没设遮罩的列里一格文字夹着的遮罩值按子串换（回答一路照旧整份不交）
+  没设遮罩的列里一格文字夹着的遮罩值按子串换（回答一路照旧整份不交），SQL 检查结果的片段照 SQL 换
 - 组装回答之后还认得出遮罩值的（正文里复述的阈值除外），不交出去
 - 遮罩值上万个时换一遍也不卡：不现编上万个分支的正则；上千个条件连成一长串照样按结构认，成百个分档边界看不过来的
   按夹住算，也不卡
@@ -667,6 +667,23 @@ def test_a_masked_value_inside_a_text_cell_is_cut_out_of_the_artifact_view():
     assert view["rows"] == [[MASKED, "回电 已遮罩"]] and masked == ["联系方式"]
     # 回答一路照旧：文字格不动，交给最后一道关
     assert inquiry_mod._masked_view(snapshot, set(), secrets)[0] is snapshot
+
+
+def test_sql_check_excerpts_in_the_artifact_are_masked_like_the_sql():
+    """质询工件里快照记下的 SQL 检查结果：片段（sql_excerpt）摘自同一条 SQL，照查询清单的 SQL 换掉遮罩值（日期这样的
+    字也认得出是在找哪一天）；给模型的那句改法（for_model）照抄了片段，不交出去（同证据面板）。"""
+    secrets = secrets_of({"columns": ["birth_date"], "rows": [["1990-05-01"]]}, {"birth_date"})
+    message = "「客户」的业务日期按「注册日期」计，查询却按「生日」筛选"
+    checks = [{"code": "wrong_date_column", "level": "warning", "table": "customers", "column": "birth_date",
+               "message": message, "for_model": "这条 SQL 按 birth_date = '1990-05-01' 筛选",
+               "sql_excerpt": "birth_date = '1990-05-01'"},
+              {"code": "stock_summed", "level": "info", "table": "balances", "message": "存量跨日期求和",
+               "sql_excerpt": "SUM(balance)"}]
+    assert inquiry_mod._masked_checks(checks, secrets, {"birth_date"}, "sqlite") == [
+        {"code": "wrong_date_column", "level": "warning", "table": "customers", "column": "birth_date",
+         "message": message, "sql_excerpt": "birth_date = '已遮罩'"},
+        {"code": "stock_summed", "level": "info", "table": "balances", "message": "存量跨日期求和",
+         "sql_excerpt": "SUM(balance)"}]
 
 
 def test_report_values_that_happen_to_be_masked_values_are_shown():

@@ -2189,16 +2189,28 @@ async def inquiry_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
     recorded = next((q["sql"] for d in referenced for q in d.get("queries") or []
                      if isinstance(q, dict) and q.get("artifact") == artifact_id and isinstance(q.get("sql"), str)),
                     None)
+    compared, kind = plan.tainted.get(artifact_id, set()), plan.kinds.get(str(content.get("source") or ""))
     if recorded is not None:
         shown = {**shown, "sql": recorded}
     elif isinstance(shown.get("sql"), str):
-        name = str(content.get("source") or "")
-        shown = {**shown, "sql": _scrub_sql(shown["sql"], plan.secrets, plan.tainted.get(artifact_id, set()),
-                                            plan.kinds.get(name))}
+        shown = {**shown, "sql": _scrub_sql(shown["sql"], plan.secrets, compared, kind)}
+    if "checks" in shown:
+        shown = {**shown, "checks": _masked_checks(shown["checks"], plan.secrets, compared, kind)}
     out: dict[str, Any] = {"id": artifact_id, "content": shown, "masked": plan.masked[artifact_id]}
     if gone := plan.gone.get(artifact_id):
         out["mask_note"] = SOURCE_GONE.format(source="、".join(gone))
     return out
+
+
+def _masked_checks(checks: Any, secrets: _Secrets, compared: set[str], kind: str | None) -> list[dict[str, Any]]:
+    """快照里记下的 SQL 检查结果（数据源查询工具对照数据目录查出的问题）交给质询工件的样子：字段照证据面板
+    （_query_checks），给模型的那句改法不交出去——它照抄了 SQL 片段；SQL 片段（sql_excerpt）摘自同一条 SQL，照查询
+    清单的 SQL 换掉遮罩值（_scrub_sql）：SQL 换了、片段没换，等于把换掉的值从旁边露出来。"""
+    from app.api.evidence import _query_checks
+
+    return [{**check, "sql_excerpt": _scrub_sql(check["sql_excerpt"], secrets, compared, kind)}
+            if isinstance(check.get("sql_excerpt"), str) else check
+            for check in _query_checks({"checks": checks})]
 
 
 __all__ = [
