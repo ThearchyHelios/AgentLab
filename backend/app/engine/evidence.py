@@ -1811,8 +1811,24 @@ _UNIT_KINDS = frozenset({"m", "i", "v"})
 #: 渲染结果末尾的单位：最后一个数字后面的字（12,345人次 → 人次，4.57万元 → 万元，12.5% → %）
 _UNIT_TAIL = re.compile(r"\d([^\d\s][^\d]*)$")
 _BLANK = " \t\u3000"
-_SEE_RUN = re.compile(r"\[\[" + _MARKER_GUARD + r"[ \t]*see[ \t]*:[^\[\]\n]*?\]\]"
-                      r"(?:[" + _BLANK + r"]*\[\[" + _MARKER_GUARD + r"[ \t]*see[ \t]*:[^\[\]\n]*?\]\])*")
+#: 依据标记 [[see:…]]（同 MARKER_RE，只认 MARKER_MAX 以内的）
+_SEE_MARK = r"\[\[" + _MARKER_GUARD + r"[ \t]*see[ \t]*:[^\[\]\n]*?\]\]"
+#: 括号：全角、半角（模型偶尔一对里混用，也算一对）
+_OPEN, _CLOSE = frozenset("（("), frozenset("）)")
+#: 依据和括号、依据和依据之间的分隔标点（「（[[see:Q3]]，原报告…）」「[[see:Q1]]、[[see:Q2]]」）
+_SEPS = "，、；,;：:"
+_SEP = frozenset(_SEPS)
+#: 其中的停顿标点（不含冒号）：依据挂在它后面、紧接着就到句末时，它悬在句末（「华南居首，。」）。冒号后面另起一行
+#: 常常是它引出的表格、列表，不动
+_PAUSE = _SEP - frozenset("：:")
+#: 句末标点：停顿标点悬在它前面时去掉（还有换行、全文结尾）。半角句点不算：后面跟着数字时它是小数点
+_ENDING = frozenset("。！？!?")
+#: 依据周围、渲染后会挤在一起的字：空白和分隔标点
+_GAP = frozenset(_BLANK) | _SEP
+#: 连着写的几个依据：中间只隔着空白、分隔标点
+_SEE_GROUP = re.compile(_SEE_MARK + r"(?:[" + _BLANK + _SEPS + r"]*" + _SEE_MARK + r")*")
+#: 其中只隔着空白的一段（两边都是字时，依据之间的分隔标点可能就是分句的标点，按它断开各算各的）
+_SEE_RUN = re.compile(_SEE_MARK + r"(?:[" + _BLANK + r"]*" + _SEE_MARK + r")*")
 
 
 def _rendered_unit(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots,
@@ -1830,8 +1846,8 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
     - 数字标记后面重复写的单位去掉。[[m:visits]] 渲染出来已经带单位（12,345人次），写作者常常
       还跟着写一遍（[[m:visits]] 人次），读者看到的是「12,345人次 人次」。单字的单位后面紧跟着字时
       不动：写作者写的可能是另一个单位（口径卡是「人」，正文写「人次」），硬删会把不一致藏起来；
-    - [[see:…]] 前面的空白去掉。see 渲染成空，「最高月份 [[see:Q2]]。」会剩下「最高月份 。」。
-      see 后面紧跟着字、要靠这个空白隔开的（「A [[see:Q1]]B」）留着；行首的缩进不动。
+    - [[see:…]] 渲染成空，它周围留下的空白、括号、标点去掉（_see_cuts）：「最高月份 [[see:Q2]]。」会剩下
+      「最高月份 。」，「结果一致（[[see:Q3]]，原报告…）」会剩下「结果一致（，原报告…）」。
 
     prev 是这段文字前面那个字（流式渲染分块时用），判断空白是不是在行首。
     """
@@ -1847,27 +1863,94 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
             after = text[hit.end():hit.end() + 1]
             if len(unit) > 1 or not after.isalnum():
                 cuts.append((marker["end"], hit.end()))
-    for run in _SEE_RUN.finditer(text):
-        start = run.start()
-        while start > 0 and text[start - 1] in _BLANK:
-            start -= 1
-        before = text[start - 1] if start > 0 else prev
-        after = text[run.end():run.end() + 1]
-        # 几个 see 之间的空白也一样渲染成多余的空格
-        parts = list(MARKER_RE.finditer(text, run.start(), run.end()))
-        cuts.extend((m.end(), n.start()) for m, n in zip(parts, parts[1:]) if m.end() < n.start())
-        if start < run.start() and before not in ("", "\n") and not (after.isalnum() or after == "["):
-            cuts.append((start, run.start()))
+    for group in _SEE_GROUP.finditer(text):
+        cuts.extend(_see_cuts(text, group.start(), group.end(), prev))
     if not cuts:
         return text
+    # 几处要去掉的字可能重叠（依据前面的空白、它和括号之间的标点）：按并集去掉
     out, last = [], 0
     for a, b in sorted(cuts):
-        if a < last:
-            continue
-        out.append(text[last:a])
-        last = b
+        if a >= last:
+            out.append(text[last:a])
+            last = b
+        else:
+            last = max(last, b)
     out.append(text[last:])
     return "".join(out)
+
+
+def _see_cuts(text: str, start: int, end: int, prev: str) -> list[tuple[int, int]]:
+    """一组依据（_SEE_GROUP，text[start:end]）渲染成空之后，周围要一起去掉的字。标记本身留着：组装文档时句子靠它挂
+    依据（unit.see），渲染时它本来就不显示。
+
+    - 括号里只有依据的（「合计 6,635.68（[[see:Q1]]）。」），连括号一起去掉，括号前的空白照依据前的空白处理
+    - 依据在括号开头（「（[[see:Q3]]，原报告…）」）：它和括号之间、它后面的标点和空白；在括号末尾（「（同 SQL，
+      [[see:Q2]]）」）同理
+    - 后面就到句末（句末标点、换行、全文结尾），依据前面、几个依据之间有停顿标点的（「华南居首，[[see:Q1]]。」）：
+      这些停顿标点（前面是冒号的留着：它引出的可能是下一行的表格、列表）
+    - 以上几种里，几个依据之间的空白、分隔标点一并去掉（「（[[see:Q1]]、[[see:Q2]]）」）
+    - 两边都是字的，依据之间的分隔标点可能就是分句的标点：按它断开，每段照 _run_cuts
+
+    不含依据的括号、标点一个字不动。要看的只有依据前后连着的空白、括号、分隔标点，外加再往外的一个字：流式渲染把
+    这些字攒到后面的字来了才放（_TRAILING_SEE），分块渲染和整篇渲染判得一样。prev 是这段文字前面那个字。
+    """
+    marks = list(MARKER_RE.finditer(text, start, end))
+    gaps = [(m.end(), n.start()) for m, n in zip(marks, marks[1:]) if m.end() < n.start()]
+    lo, hi = start, end
+    while lo > 0 and text[lo - 1] in _GAP:
+        lo -= 1
+    while hi < len(text) and text[hi] in _GAP:
+        hi += 1
+    opener = text[lo - 1] if lo > 0 else prev
+    closer = text[hi] if hi < len(text) else ""
+    left, right = text[lo:start], text[end:hi]
+    if opener in _OPEN and closer in _CLOSE:
+        # 括号里只有依据：连括号一起去掉
+        return [(lo - 1, start), *gaps, (end, hi + 1), *_blank_cut(text, lo - 1, hi + 1, prev)]
+    if opener in _OPEN:
+        return [(lo, start), *gaps, (end, hi)]
+    if closer in _CLOSE:
+        # 和括号之间只有空白的，照依据前的空白处理（行首的缩进不动）
+        return [*gaps, (end, hi), *([(lo, start)] if _SEP & set(left) else _blank_cut(text, start, end, prev))]
+    if (closer in _ENDING or closer in ("", "\n")) and _PAUSE & set(left + "".join(text[a:b] for a, b in gaps)):
+        # 依据后面、句末前面的停顿标点是写作者自己的（「增长 [[see:Q1]]，」），不是依据留下的，不动；只剩空白的去掉
+        return [*gaps, *([] if _SEP & set(right) else [(end, hi)]),
+                *([(lo, start)] if _PAUSE & set(left) else _blank_cut(text, start, end, prev))]
+    return [cut for run in _SEE_RUN.finditer(text, start, end) for cut in _run_cuts(text, run.start(), run.end(), prev)]
+
+
+def _run_cuts(text: str, start: int, end: int, prev: str) -> list[tuple[int, int]]:
+    """两边都是字的一段依据（_SEE_RUN，中间只隔着空白）：
+
+    - 几个依据之间的空白，和依据前面的空白（_blank_cut）
+    - 夹在两个分隔标点中间（「结果一致，[[see:Q1]]，原报告…」）：去掉后面那个（连同它前面的空白，后面的空白留着
+      隔开下文：「a, [[see:Q1]], b」→「a, b」）
+    """
+    marks = list(MARKER_RE.finditer(text, start, end))
+    cuts = [(m.end(), n.start()) for m, n in zip(marks, marks[1:]) if m.end() < n.start()]
+    cuts += _blank_cut(text, start, end, prev)
+    lo, hi = start, end
+    while lo > 0 and text[lo - 1] in _GAP:
+        lo -= 1
+    while hi < len(text) and text[hi] in _GAP:
+        hi += 1
+    right = text[end:hi]
+    if _SEP & set(text[lo:start]) and _SEP & set(right):
+        cuts.append((end, end + max(i for i, ch in enumerate(right) if ch in _SEP) + 1))
+    return cuts
+
+
+def _blank_cut(text: str, start: int, end: int, prev: str) -> list[tuple[int, int]]:
+    """text[start:end]（依据，或者只装着依据的一对括号）渲染成空，它前面的空白去掉：「最高月份 [[see:Q2]]。」会剩下
+    「最高月份 。」。后面紧跟着字、要靠这个空白隔开的（「A [[see:Q1]]B」）留着；行首的缩进不动。"""
+    blank = start
+    while blank > 0 and text[blank - 1] in _BLANK:
+        blank -= 1
+    before = text[blank - 1] if blank > 0 else prev
+    after = text[end:end + 1]
+    if blank < start and before not in ("", "\n") and not (after.isalnum() or after == "["):
+        return [(blank, start)]
+    return []
 
 
 def _render(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, prev: str = "") -> str:
@@ -1893,8 +1976,9 @@ def render_markers(text: str, catalog: dict[str, Any], *, cells_allowed: bool = 
 # 流式渲染：让 llm.token 里出现的就是最终的数字
 # --------------------------------------------------------------------------
 
-#: 文字末尾的空白和 [[see:…]]：流式渲染先攒着，等后面的字来了再一起交给 _tidy
-_TRAILING_SEE = re.compile(r"(?:[" + _BLANK + r"]|\[\[" + _MARKER_GUARD + r"[ \t]*see[ \t]*:[^\[\]\n]*?\]\])+$")
+#: 文字末尾的空白、括号、分隔标点和 [[see:…]]：流式渲染先攒着，等后面的字来了再一起交给 _tidy（依据周围的这些字
+#: 去不去掉，要看再往后的那个字，见 _see_cuts）
+_TRAILING_SEE = re.compile(r"(?:[" + _BLANK + "（()）" + _SEPS + r"]|" + _SEE_MARK + r")+$")
 
 
 def _safe_cut(text: str, has_unit: Callable[[dict[str, Any]], bool] | None = None) -> int:
@@ -1905,7 +1989,7 @@ def _safe_cut(text: str, has_unit: Callable[[dict[str, Any]], bool] | None = Non
     开头可能是另一个 [。
 
     整表标记闭合了也先不放：它展开时要看紧跟在后面的那个字（是不是换行），那个字还没到。
-    _tidy 要往后看的也先不放：末尾的空白和 [[see:…]]（后面来的字决定空白去不去掉），
+    _tidy 要往后看的也先不放：末尾的空白、括号、分隔标点和 [[see:…]]（后面来的字决定它们去不去掉），
     以及后面还没攒够 UNIT_LOOKAHEAD 个字的数字标记（后面可能是重复的单位）。has_unit 判断一个
     标记渲染出来带不带单位，不带的（运行输入里的周次、没有单位的格）不用攒；不给就都攒。
     """
@@ -3055,7 +3139,6 @@ SEE_AND_CODE_RULES = (
 #: 句中的 [[see:]]：前面是介词、后面接着句子的写法（「以 [[see:Q1]] 为依据」「根据 [[see:Q1]]，」「详见 [[see:Q1]]」）。
 #: 只认这几种拿得准的：「以」前面是「所、可、加……」的是另一个词（所以、可以），不算；「依据 [[see:…]]。」可能是
 #: 「这是结论的依据」，不算。认出来就交回写作者重写（report.REWRITE_ONLY：重写不好也不判失败）
-_SEE_MARK = r"\[\[" + _MARKER_GUARD + r"[ \t]*see[ \t]*:[^\[\]\n]*?\]\]"
 _INLINE_SEE = re.compile(
     r"(?<![所可加予得难足用是何之])以[ \t\u3000]*" + _SEE_MARK + r"[ \t\u3000]*为"
     r"|(?:根据|按照|基于|参见|详见)[ \t\u3000]*" + _SEE_MARK
