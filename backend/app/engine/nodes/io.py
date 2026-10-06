@@ -501,20 +501,37 @@ _CJK_RUN = re.compile(r"[\u4e00-\u9fff]{6,}")
 #: 英文的词串：单词之间只隔空格、逗号。五个以上的单词紧跟句末标点算一句（_en_sentence）
 _EN_RUN = re.compile(r"[A-Za-z]+(?:[ ,]+[A-Za-z]+)*")
 _EN_WORD = re.compile(r"[A-Za-z]+")
-#: Markdown 标题：正文里的标题切块时记为 heading，从不算结论句（evidence._scan_blocks），代码块里的也不算在写正文
-_HEADING = re.compile(r"\s*#{1,6}\s")
-#: 整行是注释（-- // # /* */ 开头；# 开头的 Markdown 标题本来也不是句子），和行尾隔着空白的注释：写着中文句子也是
-#: 代码的一部分
+#: 整行是注释（-- // # /* */ 开头），和行尾隔着空白的注释：写着中文句子也是代码的一部分。# 开头的 Markdown 标题本来
+#: 也不算结论句（evidence._scan_blocks 把它切成 heading）
 _COMMENT_LINE = re.compile(r"\s*(?:--|//|#|/\*|\*/)")
 _TRAILING_COMMENT = re.compile(r"\s(?:--|//|#).*")
+#: 看得出是代码的行里，-- // 紧挨着前面的字也是注释（SELECT SUM(amount)--按区域汇总）：字符串已经先去掉了
+_CODE_COMMENT = re.compile(r"(?:--|//|\s#).*")
+#: 写明是文字的块里顶格写的 Markdown 标题：标题前后是两段（_code_lines）
+_MD_HEADING = re.compile(r"#{1,6}\s")
 #: 代码里的字符串字面量（'…'、"…"，可带 f、r、b、u、N 这类前缀）：里面的中文标点是数据。引号前面紧挨着字母、数字的
 #: 不算开头（英文的 it's、don't）
 _STRING_LITERAL = re.compile(r"(?<![A-Za-z0-9_])[rRbBuUfFnN]{0,2}(?:'[^'\n]*'|\"[^\"\n]*\")")
-#: 看得出是代码的行：SQL、Python 的开头，YAML 的键（「columns:」「- name: 退款占比」）。YAML 的键只认小写开头的：
-#: 正文里的「Note:」「Q1:」是标签
-_CODE_LINE = re.compile(r"\s*(?:select|with|from|where|join|group\s+by|order\s+by|having|union|insert|update"
-                        r"|delete|create|def|class|import|return)\b", re.IGNORECASE)
+#: 可以跨行的块注释、多行字符串：开头的写法，和它对应的收尾
+_SPAN_OPEN = re.compile(r"/\*|\"\"\"|'''")
+_SPAN_CLOSE = {"/*": "*/", '"""': '"""', "'''": "'''"}
+#: SQL、Python 语句的开头。SQL 的关键字只认全小写、全大写的写法：「From 数据看……」「Update ……」这类首字母大写的是
+#: 正文里的英文词；def、class 要写成定义的样子（def 名字(、class 名字: ），「class A 门店……」说的是门店的分类
+_CODE_LINE = re.compile(r"\s*(?:(?:select|with|from|where|join|group\s+by|order\s+by|having|union|insert|update|delete"
+                        r"|create|import|return|SELECT|WITH|FROM|WHERE|JOIN|GROUP\s+BY|ORDER\s+BY|HAVING|UNION|INSERT"
+                        r"|UPDATE|DELETE|CREATE)\b|(?:def|class)\s+[A-Za-z_]\w*\s*[(:])")
+#: YAML 的键（「columns:」「- name: 退款占比」），只认小写开头的：正文里的「Note:」「Q1:」是标签。值为空、下面缩进着
+#: 列表或子键的另记一种（_YAML_NEST）
 _YAML_KEY = re.compile(r"\s*(?:-\s+)?[a-z_][\w.-]*:(?:\s|$)")
+_YAML_NEST = re.compile(r"\s*(?:-\s+)?[a-z_][\w.-]*:\s*$")
+#: 块里再嵌的代码块：~~~ 或三个以上反引号开头。compose_doc 只认整行三个反引号的围栏，那样的一行外层就收了，块里剩下的
+#: 嵌套写法是 ~~~sql、````sql 这些
+_NESTED_FENCE = re.compile(r"\s*(`{3,}|~{3,})(.*)")
+#: 像数据、公式的一行：前面有字的等号（公式、赋值、比较）和箭头（连起的流程），画目录树的制表符，JSON 的对象、数组开头
+#: （{"、["）和「"键":」，函数调用（print(、groupby(），带扩展名的文件名（周报.xlsx）。行首的「→ 」「=> 」是列表的
+#: 记号，不算
+_DATA_LINE = re.compile(r"\S\s*(?:[=＝→⟶⇒]|->)|[\u2500-\u257f]|^\s*[\[{]\s*[\"'\[{]|[\"']\s*:"
+                        r"|(?<![\w.])[A-Za-z_][\w.]*\(|(?<=[^\s.])\.[A-Za-z][A-Za-z0-9]{1,4}(?![\w.])")
 
 
 def _en_sentence(line: str) -> bool:
@@ -543,41 +560,116 @@ def _concluding(line: str) -> bool:
 
 
 def _written(line: str) -> bool:
-    """信息串写明是文字（markdown、text 这类）、里面也看不出是代码的块里，这一行在写正文：成句、按正文的规矩会算结论，
-    或者一行里连着六个以上汉字。不看列表标记：标记的写法太多（- 1. 1、 一、 （1） · ●，也常不带标记），补一种漏一种；
-    也不当代码看，# -- 和半角引号都是正文里的符号。标题不算。"""
-    if _HEADING.match(line):
+    """信息串写明是文字（markdown、text 这类）的块里，不是代码的这一行在写正文：成句、按正文的规矩会算结论，或者一行里
+    连着六个以上汉字。不看列表标记：标记的写法太多（- + 1. 1、 一、 （1） · ●，也常不带标记），补一种漏一种；也不去
+    字符串、行尾注释，# -- 和半角引号都是正文里的符号。整行是注释、标题的不算。"""
+    if _COMMENT_LINE.match(line):
         return False
     return _sentence(line) or _CJK_RUN.search(line) is not None or _concluding(line)
 
 
-def _code_like(lines: list[str]) -> bool:
-    """块里看得出是代码：有 SQL、Python 开头的行（_CODE_LINE）、YAML 的键（_YAML_KEY），或者整块是 diff（有 + 开头的
-    行也有 - 开头的行，其余是空格开头的上下文行、@@ 开头的块头）。"""
-    if any(_CODE_LINE.match(line) or _YAML_KEY.match(line) for line in lines):
-        return True
-    heads = {line[:1] for line in lines if line.strip()}
-    return {"+", "-"} <= heads <= {"+", "-", " ", "@"}
-
-
 def _prose_line(line: str, *, code: bool) -> bool:
-    """信息串为空、或者看得出是代码的块里，这一行在写正文：去掉字符串字面量和行尾注释之后成句；整块看不出是代码时，
-    按正文的规矩会算结论的也算（不带句读的列表项、不带标记的行）。不带句读、也不像结论的不算：YAML 里的列名、diff 里
-    改的口径和列表项没有分别。整行是注释的不算。"""
+    """代码的行（code），或者信息串为空的块里的行，在写正文：去掉字符串字面量和行尾注释之后成句；不是代码的行另认按正文
+    的规矩会算结论的（不带句读的列表项、不带标记的行）。不带句读、也不像结论的不算：YAML 里的列名、diff 里改的口径和
+    列表项没有分别。整行是注释的不算。"""
     if _COMMENT_LINE.match(line):
         return False
-    line = _TRAILING_COMMENT.sub("", _STRING_LITERAL.sub(" ", line), count=1)
+    line = (_CODE_COMMENT if code else _TRAILING_COMMENT).sub("", _STRING_LITERAL.sub(" ", line), count=1)
     return _sentence(line) or (not code and _concluding(line))
 
 
-def _drop_block_comments(text: str) -> str:
-    """去掉 /* … */（可以跨行）：块注释里的中文句子也是代码的一部分。没收尾的不去，开头那一行照注释行跳过。"""
-    kept: list[str] = []
+def _blank_spans(text: str) -> str:
+    """块注释（/* … */）、三个引号括起的多行字符串涂成空格，换行留着，块里还是原来那几行：里面写着中文句子也是代码的
+    一部分。没收尾的不动，开头那一行照注释行跳过。"""
+    out: list[str] = []
     at = 0
-    while (start := text.find("/*", at)) != -1 and (end := text.find("*/", start + 2)) != -1:
-        kept += [text[at:start], "\n"]
-        at = end + 2
-    return "".join(kept) + text[at:]
+    while (start := _SPAN_OPEN.search(text, at)) is not None:
+        end = text.find(_SPAN_CLOSE[start.group()], start.end())
+        if end == -1:
+            break
+        stop = end + len(_SPAN_CLOSE[start.group()])
+        out += [text[at:start.start()], "\n".join(" " * len(part) for part in text[start.start():stop].split("\n"))]
+        at = stop
+    return "".join(out) + text[at:]
+
+
+def _diff(lines: list[str], *, labelled: bool) -> bool:
+    """整块是 diff：有 - 开头的行也有 + 开头的行，其余是空格开头的上下文行、@@ 开头的块头。diff 里一处改动先列删掉的行、
+    再列加上的行，第一个改动行就是 + 的，是 + / - 开头的正负面要点（有 @@ 块头的照旧算 diff）。信息串写明是文字的块里，
+    + - 后面空一格的是 Markdown 的列表项，只有紧挨着字写的（-按下单日期统计）才是 diff。"""
+    heads = [line[:1] for line in lines if line.strip()]
+    if not {"+", "-"} <= set(heads) <= {"+", "-", " ", "@"}:
+        return False
+    if labelled and any(line[:2] in ("+ ", "- ") for line in lines):
+        return False
+    return "@" in heads or next(h for h in heads if h in ("+", "-")) == "-"
+
+
+def _data_like(line: str) -> bool:
+    """像数据、公式的一行（_DATA_LINE），或者逗号隔开的一行表头、数据（两个以上半角逗号，逗号后面都不空格）。"""
+    return _DATA_LINE.search(line) is not None or (line.count(",") >= 2 and ", " not in line)
+
+
+def _yaml(lines: list[str], *, labelled: bool) -> bool:
+    """一段是 YAML：第一行是小写开头的键，其余每一行都是键或者缩进的行（键下面的列表项、子键），注释行不看。写明是文字的
+    块里另要有值为空、往下缩进的键：一行一个「键: 一句话」的（「- note: 华南销售额超过华北」）多半是正文里的标签。"""
+    body = [line for line in lines if line.strip() and not _COMMENT_LINE.match(line)]
+    if not body or not _YAML_KEY.match(body[0]):
+        return False
+    if not all(_YAML_KEY.match(line) or line[:1].isspace() for line in body[1:]):
+        return False
+    return not labelled or any(_YAML_NEST.match(line) for line in body)
+
+
+def _bare_fence(line: str) -> str:
+    """整行只写着围栏（``` 或 ~~~，不带信息串）的，返回这串围栏，能给块里再嵌的代码块收尾；别的行返回空串。"""
+    fence = _NESTED_FENCE.match(line)
+    return fence.group(1) if fence and not fence.group(2).strip() else ""
+
+
+def _code_lines(lines: list[str], raw: list[str], *, labelled: bool) -> list[bool]:
+    """逐行标出哪些是代码：块里再嵌的代码块（~~~sql），SQL、Python 的语句（从开头那一行到这一段结束，续行也算；前面的
+    注释行本来就不算正文），整段是 YAML 的（_yaml），像数据、公式的行（_data_like）。
+
+    lines 是涂掉块注释、多行字符串之后的行，raw 是原样的行：一段到空行为止，只写着注释的行不算空行；写明是文字的块里，
+    顶格的标题也另起一段。不把整块当代码：正文里另贴一段 SQL、嵌一个 ~~~sql，或者有一行像 YAML 的键，别的行照样按正文认。
+    再嵌的代码块要收得了才算（后面有同一种符号、不比开头短的收尾），开了没收的那一行照普通的行看。"""
+    code = [False] * len(lines)
+    paragraph: list[int] = []
+    fence = ""
+    # 每一行后面最长的收尾围栏（整行只有 ``` 或 ~~~），按符号分开记：开了收不了的围栏不算，照普通的行看，免得后面的
+    # 正文都被当成代码
+    reach = {"`": [0] * (len(lines) + 1), "~": [0] * (len(lines) + 1)}
+    for k in range(len(lines) - 1, -1, -1):
+        for after in reach.values():
+            after[k] = after[k + 1]
+        if bare := _bare_fence(lines[k]):
+            reach[bare[0]][k] = max(reach[bare[0]][k], len(bare))
+
+    def close() -> None:
+        statement = _yaml([lines[k] for k in paragraph], labelled=labelled)
+        for k in paragraph:
+            statement = statement or _CODE_LINE.match(lines[k]) is not None
+            code[k] = statement or _data_like(lines[k])
+        paragraph.clear()
+
+    for k, line in enumerate(lines):
+        if fence:
+            code[k] = True
+            closing = _bare_fence(line)
+            if closing[:1] == fence[0] and len(closing) >= len(fence):
+                fence = ""
+            continue
+        if (opening := _NESTED_FENCE.match(line)) and reach[opening.group(1)[0]][k + 1] >= len(opening.group(1)):
+            close()
+            fence, code[k] = opening.group(1), True
+            continue
+        if not raw[k].strip() or (labelled and _MD_HEADING.match(line)):
+            close()
+            continue
+        paragraph.append(k)
+    close()
+    return code
 
 
 def _fenced_body(doc: dict[str, Any]) -> bool:
@@ -588,9 +680,10 @@ def _fenced_body(doc: dict[str, Any]) -> bool:
     text 的原样交给 compose_doc：整段正文落在代码块里，切不出结论句，裁判没有句子可判、反方审稿记 no_claims，没挂依据
     的、证据相矛盾的结论句都数出 0 句，出具就成了完整出具。有一句结论的不算：正文没被整个藏起来，结论句照常核对。
 
-    在不在写正文逐行看：信息串写明是文字、里面也看不出是代码的按 _written。信息串为空的块里也常是 SQL、Python、YAML、
-    diff，信息串写成 text 的也偶尔是代码，这些按 _prose_line：注释、字符串字面量里的中文句子不算；整块看得出是代码
-    （_code_like）的只认成句的，以 * + - 开头的 SQL 续行、中文别名里的「最高」这类词都不算。"""
+    在不在写正文逐行看。先标出哪些行是代码（_code_lines；信息串为空、整块是 diff 的全是代码），代码的行只认去掉注释、
+    字符串之后成句的（_prose_line），中文别名、YAML 的值、公式里的「最高」「占比」这类词都不算。其余的行：信息串写明
+    是文字的按 _written，信息串为空的块里也常是代码，去掉注释、字符串之后再看（_prose_line）。一块里只要有一行在写正文
+    就算，所以宁可把拿不准的行当代码：藏起来的正文总有别的行认得出，贴的一段代码、公式里却一行认错就会记错缺口。"""
     from app.engine.evidence import iter_units
 
     units = list(iter_units(doc))
@@ -603,14 +696,13 @@ def _fenced_body(doc: dict[str, Any]) -> bool:
         segments = [s for s in unit.get("segments") or [] if isinstance(s, dict)]
         if unit.get("see") or any(s.get("ref") for s in segments):
             return True
-        # 围栏那两行是挂在块上的结构片段，不是块里写的内容：整块是不是 diff 要看里面每一行的开头
+        # 围栏那两行是挂在块上的结构片段，不是块里写的内容：算进来的话，开头那行 ```markdown 会被当成块里再嵌的代码块，
+        # 整块是不是 diff 也看不准
         text = "".join(str(s.get("text") or "") for s in segments if s.get("kind") != "structural")
-        lines = _drop_block_comments(text).split("\n")
-        code = _code_like(lines)
-        if lang and not code:
-            if any(_written(line) for line in text.split("\n")):
-                return True
-        elif any(_prose_line(line, code=code) for line in lines):
+        raw, lines = text.split("\n"), _blank_spans(text).split("\n")
+        code = [True] * len(lines) if _diff(raw, labelled=bool(lang)) else _code_lines(lines, raw, labelled=bool(lang))
+        if any(_written(line) if lang and not is_code else _prose_line(line, code=is_code)
+               for line, is_code in zip(lines, code)):
             return True
     return False
 
