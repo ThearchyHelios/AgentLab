@@ -20,7 +20,7 @@ from app.api.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
 from app.api.copilot_context import DATASOURCE_BUDGET_CHARS as _DATASOURCE_BUDGET_CHARS  # noqa: F401
 from app.api.copilot_context import DETAIL_TABLE_LIMIT as _DETAIL_TABLE_LIMIT  # noqa: F401
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
-from app.core.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
+from app.core.errors import explain as explain_error, graph_error, raw as raw_error
 from app.data.sqlcheck import CHECK_CODES
 from app.db.base import get_session
 from app.db.models import Workflow
@@ -567,7 +567,10 @@ async def set_copilot_model(
 
 
 def _unconfigured(e: ProviderNotConfigured) -> str:
-    return f"助手使用的模型尚未配置完成：{not_configured(e, with_hint=False)}。请到「设置 → 模型接入」检查"
+    # 点名的接入不存在、已停用照实说是哪个、去哪里改，其余说「尚未配置完成」（表格导入、数据目录的 AI 起草同一句）
+    from app.providers.factory import assistant_unavailable
+
+    return assistant_unavailable(e)
 
 
 class GenerateOut(BaseModel):

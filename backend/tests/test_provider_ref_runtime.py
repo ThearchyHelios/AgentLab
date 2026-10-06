@@ -3,9 +3,10 @@
 以前点名的接入不存在时 get_chat_model 悄悄换成演示模型（mock-fast）：报告由它写成假文本，双盲复算、反方审稿、审批
 质询由它来「核查」，正式运行照样出具。现在（providers/factory.named_provider）：
 
-- 模型调用、Agent、报告撰写、多 Agent 协作、让模型分类的条件分支：节点失败，报错带原因和去哪里改，一次模型调用都不发；
+- 模型调用、Agent、报告撰写、多 Agent 协作、让模型分类的条件分支、让模型修复的结构校验：节点失败，报错带原因和去哪里改，
+  一次模型调用都不发；让模型重排的知识检索：不重排，降级日志写明原因；
 - 双盲复算：该指标无法复算，原因「核查模型不可用（…）」，记缺口；反方审稿：这几句未能反查，原因同上；
-- 审批质询：回答 ok 为假，error 说明原因；结论句裁判：按「裁判模型不可用」照实记未裁判和缺口；
+- 审批质询：回答 ok 为假，error 说明原因；结论句裁判（运行中、按需）：按「裁判模型不可用」照实记未裁判和缺口；
 - 助手：报错给用户，查当前用哪个模型的接口照常返回、写明原因；门控模型：转人工审批、写明原因；
 - 定时任务发起的正式运行：运行失败，通知照常推送。
 
@@ -171,6 +172,9 @@ NODES = {
                                    agents=[{"name": "分析师", "system": "你是销售分析师"}]),
     "branch": lambda ref: node("ask", "branch", "分流", mode="llm", provider=ref,
                                cases=[{"key": "follow", "label": "需要跟进"}]),
+    # 输入不是 JSON：第一次校验不通过，要让模型修复时才取模型
+    "validate": lambda ref: node("ask", "validate", "校验", provider=ref, source="门店甲本周销售平稳",
+                                 schema={"type": "object", "required": ["区域"]}),
 }
 
 
@@ -191,6 +195,36 @@ async def test_a_node_naming_a_broken_provider_fails_and_says_why(monkeypatch, k
     assert failed.node_id == "ask" and REASONS[ref] in failed.data["error"] and HINTS[ref] in failed.data["error"]
     assert not [e for e in evs if e.type in ("llm.start", "llm.end")] and called == []
     no_mock(evs, run.output, run.error)
+
+
+@pytest.mark.parametrize("ref", [MISSING, DISABLED])
+async def test_a_retrieve_reranked_by_a_broken_provider_keeps_its_hits_and_says_why(monkeypatch, ref):
+    """让模型重排的知识检索：接入取不到就不重排、照初筛的顺序给命中，降级日志写明原因（不悄悄让演示模型去排）。"""
+    from app.db.models import Document
+    from app.memory import kb
+
+    called = script(monkeypatch)
+    collection = f"k1_{uuid.uuid4().hex[:8]}"
+    async with SessionLocal() as session:
+        await kb.ingest_document(session, collection=collection, title="门店巡检规范",
+                                 content="门店巡检每周一次，巡检结果当天上报区域经理。")
+    try:
+        spec = chain(node("start", "input"),
+                     node("look", "retrieve", "检索", query="门店巡检多久一次", collection=collection, rerank="model",
+                          provider=ref),
+                     node("out", "output", fields=[{"name": "结论", "value": "见检索结果"}]))
+        run = await start(spec)
+        assert run.status == "succeeded", run.error
+        evs = await events(run.id)
+        assert output_of(evs, "look")["count"] >= 1
+        said = [d["message"] for d in logs(evs, "retrieve_degraded")]
+        assert any(m.startswith("重排不可用：") and REASONS[ref] in m and HINTS[ref] in m for m in said), said
+        assert called == [] and not [e for e in evs if e.type in ("llm.start", "llm.end")]
+        no_mock(evs, run.output)
+    finally:
+        async with SessionLocal() as session:
+            for doc in list((await session.execute(select(Document).where(Document.collection == collection))).scalars()):
+                await kb.delete_document(session, doc.id)
 
 
 # --------------------------------------------------------------------------
@@ -281,11 +315,14 @@ def report_graph(source: str, *between) -> dict:
     )
 
 
+@pytest.mark.parametrize("where", ["settings", "node"])
 @pytest.mark.parametrize("ref", [MISSING, DISABLED])
-async def test_challenge_with_a_broken_verify_provider_reviews_no_claim_and_says_why(monkeypatch, sales, ref):
+async def test_challenge_with_a_broken_verify_provider_reviews_no_claim_and_says_why(monkeypatch, sales, ref, where):
     called = script(monkeypatch, writer=TEXT)
-    await put_setting("verify", {"provider": ref})
-    run = await start(report_graph(sales, node("chal", "challenge", "审稿", report="write")), run_class="formal")
+    if where == "settings":
+        await put_setting("verify", {"provider": ref})
+    chal = node("chal", "challenge", "审稿", report="write", **({"provider": ref} if where == "node" else {}))
+    run = await start(report_graph(sales, chal), run_class="formal")
     assert run.status == "succeeded", run.error
     evs = await events(run.id)
     out = output_of(evs, "chal")
@@ -343,7 +380,8 @@ def weekly(**report) -> dict:
     )
 
 
-@pytest.mark.parametrize("where,ref", [("node", MISSING), ("settings", DISABLED)])
+@pytest.mark.parametrize("where", ["node", "settings"])
+@pytest.mark.parametrize("ref", [MISSING, DISABLED])
 async def test_a_broken_judge_provider_leaves_the_claims_unjudged_and_says_why(monkeypatch, where, ref):
     called = script(monkeypatch, writer=JUDGED)
     if where == "settings":
@@ -364,25 +402,78 @@ async def test_a_broken_judge_provider_leaves_the_claims_unjudged_and_says_why(m
     no_mock(evs, run.output, doc)
 
 
+@pytest.mark.parametrize("ref", [MISSING, DISABLED])
+async def test_judging_on_demand_with_a_broken_judge_provider_says_why(monkeypatch, client, ref):
+    """探索运行里按需裁判几句（POST /evidence/judge）：设置里的裁判接入取不到，照「裁判模型不可用」说清，句子仍是未裁判，
+    不调用模型、不记判定。"""
+    called = script(monkeypatch, writer=JUDGED)
+    run = await start(weekly(claims="require_citation"))
+    assert run.status == "succeeded", run.error
+    evs = await events(run.id)
+    [checked] = [e for e in evs if e.type == "report.checked"]
+    doc = artifact_store.load(checked.data["doc_artifact"])
+    units = [u["id"] for _, u in iter_units(doc)]
+    await put_setting("judge", {"provider": ref})
+    r = await client.post(f"/api/runs/{run.id}/evidence/judge", json={"units": units})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["judged"] == [] and body["calls"] == 0 and body["event"] is None
+    assert body["gaps"] and all("裁判模型不可用" in g and REASONS[ref] in g for g in body["gaps"]), body["gaps"]
+    assert body["message"].startswith("结论句裁判未完成：") and REASONS[ref] in body["message"]
+    assert all(v["status"] == "unjudged" for v in body["verdicts"].values()) and body["verdicts"]
+    assert called == [WRITER_MODEL]
+    no_mock(await events(run.id), body)
+
+
 # --------------------------------------------------------------------------
 # 助手、门控模型
 # --------------------------------------------------------------------------
 
 
-async def test_the_assistant_with_a_broken_provider_tells_the_user(monkeypatch, client):
+#: 助手报给人的那一句：照实说是哪个接入、在设置里能做什么，或者给助手换一个模型（不再说「尚未配置完成」）
+SAID = {MISSING: f"助手使用的{REASONS[MISSING]}。请在「设置 → 模型接入」中核对名称，或为助手换一个模型",
+        DISABLED: f"助手使用的{REASONS[DISABLED]}。请在「设置 → 模型接入」中启用它，或为助手换一个模型"}
+
+
+@pytest.mark.parametrize("ref", [MISSING, DISABLED])
+async def test_the_assistant_with_a_broken_provider_tells_the_user(monkeypatch, client, ref):
     called = script(monkeypatch)
-    await put_setting("copilot", {"provider": MISSING, "model": ""})
+    await put_setting("copilot", {"provider": ref, "model": ""})
     r = await client.post("/api/copilot/generate", json={"instruction": "做一张门店周报"})
     assert r.status_code == 400
-    assert r.json()["detail"] == f"助手使用的模型尚未配置完成：{REASONS[MISSING]}。请到「设置 → 模型接入」检查"
+    assert r.json()["detail"] == SAID[ref]
     assert called == []
     # 查当前用哪个模型：照常返回，不 500，写明为什么用不了
     got = await client.get("/api/copilot/model")
     assert got.status_code == 200, got.text
     body = got.json()
-    assert (body["configured"], body["provider"]) == (True, MISSING)
+    assert (body["configured"], body["provider"]) == (True, ref)
     assert body["effective_provider"] is None and body["effective_model"] is None
-    assert REASONS[MISSING] in body["error"]
+    assert body["error"] == SAID[ref]
+    no_mock([], r.json(), body)
+
+
+async def test_the_assistant_model_lookup_survives_a_name_that_is_not_text(client):
+    """设置里存进了不是字符串的接入名（以前经设置接口就能写进来）：照常返回、说清用不了，不 500。"""
+    await put_setting("copilot", {"provider": 123, "model": ""})
+    got = await client.get("/api/copilot/model")
+    assert got.status_code == 200, got.text
+    assert got.json()["effective_provider"] is None and "模型接入「123」不存在" in got.json()["error"]
+
+
+async def test_drafting_with_the_assistant_model_says_which_provider_is_broken(monkeypatch):
+    """表格导入、数据目录的 AI 起草也用助手的模型：说法和助手同一句（以前停用的接入说「尚未配置完成」）。"""
+    from app.data import catalog, recipe_ai
+
+    called = script(monkeypatch)
+    for ref in (MISSING, DISABLED):
+        await put_setting("copilot", {"provider": ref, "model": ""})
+        async with SessionLocal() as session:
+            assert (await recipe_ai.ai_availability(session)).reason == SAID[ref]
+            with pytest.raises(catalog.CatalogModelUnavailable) as e:
+                await catalog.resolve_draft_model(session)
+        assert str(e.value) == SAID[ref]
+    assert called == []
 
 
 async def test_the_assistant_model_lookup_survives_a_model_whose_provider_is_disabled(client):
@@ -430,7 +521,8 @@ NINE = datetime(2026, 10, 5, 1, 0, tzinfo=UTC)
 HOOK = "https://hooks.example.com/agentlab/inbox-k1"
 
 
-async def test_a_scheduled_formal_run_naming_a_broken_provider_fails_and_is_still_notified(monkeypatch):
+@pytest.mark.parametrize("ref", [MISSING, DISABLED])
+async def test_a_scheduled_formal_run_naming_a_broken_provider_fails_and_is_still_notified(monkeypatch, ref):
     from app.scheduler import loop, webhook
 
     called = script(monkeypatch)
@@ -442,7 +534,7 @@ async def test_a_scheduled_formal_run_naming_a_broken_provider_fails_and_is_stil
 
     monkeypatch.setattr(webhook, "_transport", httpx.MockTransport(receive))
     monkeypatch.setattr(webhook, "RETRY_DELAYS", (0, 0, 0))
-    spec = chain(node("start", "input"), node("ask", "llm", "写日报", provider=MISSING, prompt="写今天的门店日报"),
+    spec = chain(node("start", "input"), node("ask", "llm", "写日报", provider=ref, prompt="写今天的门店日报"),
                  node("out", "output", fields=[{"name": "日报", "value": "{{ last_message }}"}]))
     async with SessionLocal() as session:
         wf = Workflow(name=f"门店日报-{uuid.uuid4().hex[:6]}", graph=spec, status="published", published_version=1)
@@ -463,7 +555,7 @@ async def test_a_scheduled_formal_run_naming_a_broken_provider_fails_and_is_stil
         assert fire.status == "started" and fire.run_id
         run = await wait(fire.run_id, ("succeeded", "failed", "cancelled"))
         assert run.status == "failed" and run.run_class == "formal"
-        assert REASONS[MISSING] in run.error and HINTS[MISSING] in run.error, run.error
+        assert REASONS[ref] in run.error and HINTS[ref] in run.error, run.error
         assert await webhook.notify_due(datetime.now(UTC) + timedelta(seconds=webhook.SEAL_WAIT_S + 5)) == 1
         [body] = sent
         assert (body["event"], body["status"], body["run_id"]) == ("failed", "failed", run.id)

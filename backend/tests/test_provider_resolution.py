@@ -178,3 +178,33 @@ async def test_get_chat_model_builds_the_named_provider(session, monkeypatch):
     monkeypatch.setattr(factory, "build_chat_model", spy)
     _, model_id = await get_chat_model(session, ModelSpec(provider="乙接入", model="m-b"))
     assert built == [(target.id, "m-b")] and model_id == "m-b"
+
+
+async def test_a_name_that_is_not_text_counts_as_named_and_missing(session):
+    """接口写进设置里的数字一类：以前 resolve_provider 在这里抛 AttributeError（查助手模型的接口跟着 500），
+    再往前是当成没给、悄悄回退。现在按点名了一个不存在的接入报。"""
+    await add(session, "云端接入")
+    for ref in (123, 0):
+        with pytest.raises(ProviderNotConfigured) as e:
+            await resolve_provider(session, ref)      # type: ignore[arg-type]
+        assert e.value.code == "missing" and e.value.reason == f"模型接入「{ref}」不存在"
+
+
+async def test_the_assistant_is_told_which_provider_is_broken(session):
+    """助手（改图、表格导入、数据目录起草）用的模型取不到时的那句话：点名的接入不存在、已停用，按模型名找到的接入
+    已停用，照实说是哪个、在设置里能做什么；接入本身没配完（缺 key）仍说「尚未配置完成」。"""
+    from app.providers.factory import assistant_unavailable
+
+    await add(session, "停用接入", models=("m-off",), enabled=False)
+    said = {}
+    for case, ref, model in (("missing", "甲接人", None), ("disabled", "停用接入", None), ("by_model", None, "m-off")):
+        with pytest.raises(ProviderNotConfigured) as e:
+            await resolve_provider(session, ref, model)
+        said[case] = assistant_unavailable(e.value)
+    assert said["missing"] == "助手使用的模型接入「甲接人」不存在。请在「设置 → 模型接入」中核对名称，或为助手换一个模型"
+    assert said["disabled"] == "助手使用的模型接入「停用接入」已停用。请在「设置 → 模型接入」中启用它，或为助手换一个模型"
+    assert said["by_model"] == ("助手使用的模型「m-off」所属的模型接入「停用接入」已停用。"
+                                "请在「设置 → 模型接入」中启用它，或为助手换一个模型")
+    keyless = ProviderNotConfigured("模型接入「云端接入」没有配置 API Key", "请在接入中填写", code="missing_key")
+    assert assistant_unavailable(keyless) == (
+        "助手使用的模型尚未配置完成：模型接入「云端接入」没有配置 API Key。请到「设置 → 模型接入」检查")

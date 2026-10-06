@@ -14,6 +14,7 @@ from app.data.catalog_impact import catalog_drift, catalog_versions_for, recorde
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import publish_issues
+from app.engine.provider_refs import CODES as PROVIDER_CODES, load_issues, load_providers
 from app.engine.schema import GraphSpec, NodeType, validate_graph
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
@@ -21,8 +22,9 @@ router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 _GONE = "工作流不存在，可能已被删除"
 _LEVELS = ("published", "governed")
 _BAD_LEVEL = "发布级别只能是「已发布」或「受管」"
-#: 自动修复之后剩下的只有点名接入的问题、人又要交给助手时的说明
-PROVIDER_LEFT = "剩下的问题是节点指定的模型接入不存在或已停用，助手无法代为处理：请在「设置 → 模型接入」中核对，或在节点中换一个接入"
+#: 剩下的挡住发布的只有点名接入的问题、人又要交给助手时的说明：换成哪个接入要人拿主意，每一处都有自己的修复
+PROVIDER_LEFT = ("剩下的问题是指定的模型接入不存在或已停用，需要你决定改用哪个接入：请在每一处的修复中选择，"
+                 "或在「设置 → 模型接入」中核对")
 
 
 class WorkflowIn(BaseModel):
@@ -336,8 +338,8 @@ async def publish_workflow(
         return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
 
     checkers = await _sql_checkers(session, spec)
-    issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers)]
-    issues += await _provider_issues(session, spec, level="error")
+    issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers,
+                                                     providers=await _providers(session, spec))]
     if any(i["level"] == "error" for i in issues):
         return {"ok": False, "level": payload.level, "version": version, "issues": issues}
 
@@ -424,20 +426,11 @@ async def _sql_checkers(session: AsyncSession, spec: GraphSpec) -> dict[str, Any
     return await load_checkers_by_name(session, graph_sources(spec.nodes))
 
 
-async def _provider_issues(session: AsyncSession, spec: GraphSpec, *, level: str) -> list[dict[str, Any]]:
-    """节点点名的模型接入不存在或已停用（engine/provider_refs.py）：画布校验给 warning，发布、发布前检查、自动修复的
-    复核给 error、挡住发布。要读接入表，和 _sql_checkers 一样由接口这一层查，门禁本身不查库。没有对应的修复。"""
-    from app.engine.provider_refs import load_issues
-
-    return [i.model_dump() for i in await load_issues(session, spec, level=level)]
-
-
-def _with_provider_issues(out: dict[str, Any], issues: list[dict[str, Any]], key: str) -> dict[str, Any]:
-    """发布前检查（issues）、自动修复（remaining）的结果补上点名接入的问题：都是 error，有就不能发布。"""
-    if issues:
-        out[key] = [*out[key], *issues]
-        out["ok"] = False
-    return out
+async def _providers(session: AsyncSession, spec: GraphSpec) -> list[Any]:
+    """模型接入表：节点点名的接入不存在或已停用时，发布、发布前检查、自动修复的复核给 error、挡住发布，修复从启用的
+    接入里列候选（engine/provider_refs.py、autofix 的 provider.*）。和 _sql_checkers 一样由接口这一层读好交给门禁，
+    门禁本身不查库；三处传同一份。图里没点名任何接入时不读库。"""
+    return await load_providers(session, spec)
 
 
 def _unreadable(level: str, e: Exception) -> dict[str, Any]:
@@ -462,8 +455,8 @@ async def publish_check(
     except Exception as e:  # noqa: BLE001
         return _unreadable(payload.level, e)
     versions, cards = await _gate_context(session, spec)
-    out = check(spec, level=payload.level, versions=versions, cards=cards, checkers=await _sql_checkers(session, spec))
-    return _with_provider_issues(out, await _provider_issues(session, spec, level="error"), "issues")
+    return check(spec, level=payload.level, versions=versions, cards=cards, checkers=await _sql_checkers(session, spec),
+                 providers=await _providers(session, spec))
 
 
 @router.post("/{workflow_id}/autofix")
@@ -488,17 +481,19 @@ async def autofix(
             "remaining": bad["issues"], "fixes": [], "handoff": [], "assist": None, "ok": False}
     versions, cards = await _gate_context(session, spec)
     checkers = await _sql_checkers(session, spec)
+    providers = await _providers(session, spec)
     out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards,
-                      checkers=checkers)
+                      checkers=checkers, providers=providers)
     out["assist"] = None
     # 人在选项里选了「交给 Copilot」（handoff），和点「交给 Copilot」是一回事
     if payload.assist or out["handoff"]:
         if out["ok"]:
-            # 剩下的只有点名接入的问题时不这么说：助手改不了接入表，也不知道该换成哪个接入
-            lost = await _provider_issues(session, GraphSpec.model_validate(out["graph"]), level="error")
-            out["assist"] = {"ok": not lost, "summary": PROVIDER_LEFT if lost else "修复后已没有阻止发布的错误，未再交给助手",
-                             "questions": []}
-            return _with_provider_issues(out, lost, "remaining")
+            out["assist"] = {"ok": True, "summary": "修复后已没有阻止发布的错误，未再交给助手", "questions": []}
+            return out
+        if all(i.get("code") in PROVIDER_CODES for i in out["remaining"] if i["level"] == "error"):
+            # 剩下的只有点名接入的问题：换成哪个接入要人拿主意（助手的自查也不看接入表），不交给助手
+            out["assist"] = {"ok": False, "summary": PROVIDER_LEFT, "questions": []}
+            return out
         from app.api.copilot import assist_publish_fix
 
         helped = await assist_publish_fix(session, out["graph"], level=payload.level,
@@ -509,13 +504,14 @@ async def autofix(
             out["changes"] += diff_changes(out["graph"], fixed, fix_id="assist", label="助手的修改")
             out["ops"] += helped["ops"]
             out["applied"].append("assist")
+            fixed_spec = GraphSpec.model_validate(fixed)
             after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards,
-                                checkers=await _sql_checkers(session, GraphSpec.model_validate(fixed)))
+                                checkers=await _sql_checkers(session, fixed_spec),
+                                providers=await _providers(session, fixed_spec))
             out.update(graph=fixed, remaining=after["remaining"], fixes=after["fixes"], ok=after["ok"])
         elif helped["reason"]:
             out["rejected"].append({"fix_id": "assist", "reason": helped["reason"]})
-    return _with_provider_issues(out, await _provider_issues(session, GraphSpec.model_validate(out["graph"]),
-                                                             level="error"), "remaining")
+    return out
 
 
 class ValidateIn(BaseModel):
@@ -532,7 +528,7 @@ async def validate(payload: ValidateIn, session: AsyncSession = Depends(get_sess
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
     result = validate_graph(spec).model_dump()
-    result["issues"] += await _provider_issues(session, spec, level="warning")
+    result["issues"] += [i.model_dump() for i in await load_issues(session, spec, level="warning")]
     return result
 
 

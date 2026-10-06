@@ -745,12 +745,18 @@ async def _provider_problem(session: AsyncSession, values: dict[str, Any]) -> tu
 
     以前点名的接入不存在时运行悄悄换成演示模型，名字写错一个字就由演示模型写报告、做核查，现在运行时照实报错；保存时
     先拦一道。留空照旧表示沿用上一级。只查这次改了的：存着的值没改（写好之后接入才被删、停用）不挡这次保存别的项——
-    设置页标着「不存在」，运行时照实报错，同设置页「只校验改过的」的做法。名字不是字符串这类格式问题由各组自己的
-    检查先报。"""
+    设置页在那一项下标着「不存在」「已停用」，运行时照实报错，同设置页「只校验改过的」的做法。
+
+    名字不是字符串（接口写进来的数字一类）：核查、裁判两组自己的格式检查在前面先报；门控、助手两组没有自己的检查，
+    在这里报，免得存下去之后读它的地方（查助手当前用哪个模型）出错。"""
     providers = None
     for (group, key), (label, blank) in _provider_fields().items():
         sent = values.get(group)
-        if not isinstance(sent, dict) or (name := _model_text(sent.get(key))) is None:
+        if not isinstance(sent, dict):
+            continue
+        if (raw := sent.get(key)) is not None and not isinstance(raw, str):
+            return f"{group}.{key}", f"「{label}」需要填写模型接入的名称，{blank}，当前为「{raw}」"
+        if (name := _model_text(raw)) is None:
             continue
         row = await session.get(Setting, group)
         saved = row.value if row is not None and isinstance(row.value, dict) else {}

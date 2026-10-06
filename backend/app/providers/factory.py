@@ -48,20 +48,37 @@ async def list_providers(session: AsyncSession) -> list[Provider]:
     return list(rows.scalars())
 
 
-def named_provider(providers: list[Provider], ref: str) -> Provider:
+#: 点名的接入不存在、已停用时，提示的前半句：在设置里能做什么。后半句（去哪里换一个接入）看场合：运行时报错、
+#: 设置页写「或换一个接入」；画布校验、发布前检查按这一处在界面上能不能改另写（engine/provider_refs.py）
+NAMED_FIX = {"missing": "请在「设置 → 模型接入」中核对名称", "disabled": "请在「设置 → 模型接入」中启用它"}
+
+
+def named_provider(providers: list[Provider], ref: Any) -> Provider:
     """按名称或 id 找显式点名的接入（providers 是 list_providers 的结果）。找不到、找到的已停用都抛
     ProviderNotConfigured：点名了就只用它，不换别家。运行时取模型、设置和画布校验都按这一处认，说法一致。
-    名称两边的空白不算。"""
-    key = ref.strip()
+    名称两边的空白不算；不是字符串的（接口写进来的数字一类）当作点了一个不存在的名字。"""
+    key = ref.strip() if isinstance(ref, str) else str(ref)
     found = next((p for p in providers if key in (p.id, p.name)), None) \
         or next((p for p in providers if (p.name or "").strip() == key), None)
     if found is None:
-        raise ProviderNotConfigured(f"模型接入「{key}」不存在",
-                                    "请在「设置 → 模型接入」中核对名称，或换一个接入", code="missing")
+        raise ProviderNotConfigured(f"模型接入「{key}」不存在", f"{NAMED_FIX['missing']}，或换一个接入", code="missing")
     if not found.enabled:
-        raise ProviderNotConfigured(f"模型接入「{found.name}」已停用",
-                                    "请在「设置 → 模型接入」中启用它，或换一个接入", code="disabled")
+        raise ProviderNotConfigured(f"模型接入「{found.name}」已停用", f"{NAMED_FIX['disabled']}，或换一个接入",
+                                    code="disabled")
     return found
+
+
+def assistant_unavailable(e: BaseException) -> str:
+    """助手（画布上改图、表格导入与数据目录的 AI 起草）用的模型取不到时给人看的那句话。
+
+    点名的接入不存在、已停用（按模型名找到的接入已停用也算）照实说是哪个接入、在设置里能做什么，或者给助手换一个
+    模型；以前这几种要么悄悄换成演示模型，要么各处自己判停用。其余（缺 key、没有模型……）是接入本身没配完。"""
+    from app.core.errors import not_configured
+
+    code = getattr(e, "code", "")
+    if code in NAMED_FIX:
+        return f"助手使用的{getattr(e, 'reason', '') or e}。{NAMED_FIX[code]}，或为助手换一个模型"
+    return f"助手使用的模型尚未配置完成：{not_configured(e, with_hint=False)}。请到「设置 → 模型接入」检查"
 
 
 async def resolve_provider(
@@ -77,12 +94,13 @@ async def resolve_provider(
     get_chat_model 把它当成「一个接入都没配」，悄悄换成演示模型：名字写错一个字、接入改了名或删了，
     报告就由演示模型写成假文本，核查也由它来「核」，运行照样成功。停用的照常返回、照常调用，
     又和下面「按模型名找到的接入已停用就报错」对不上。
-    返回 None 只剩一种情况：没给 ref（只有空白的也算没给），而一个启用的接入都没有。
+    返回 None 只剩一种情况：没给 ref（只有空白的也算没给），而一个启用的接入都没有。不是字符串的 ref（接口写进
+    设置里的数字一类）按点名了一个不存在的接入报，不当成没给。
     """
     providers = await list_providers(session)
     enabled = [p for p in providers if p.enabled]
 
-    if ref and ref.strip():
+    if ref is not None and (not isinstance(ref, str) or ref.strip()):
         return named_provider(providers, ref)
 
     if model:

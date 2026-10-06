@@ -4,7 +4,10 @@
   code 和设置页上的叫法；一组出错整次不落库。留空照旧表示沿用上一级；存着的值没改（写好之后接入才被删、停用）不挡
   这次保存别的项——设置页标着「不存在」，运行时照实报错；
 - 画布校验：节点点名的接入不存在或已停用给警告，说清哪个节点、哪个接入；发布前检查、发布、自动修复的复核给错误，
-  挡住发布。只查执行时真会去取模型的那几处（分支「让模型分类」、校验「让模型修复」、检索「让模型重排」时才算）。
+  挡住发布。只查执行时真会去取模型的那几处（分支「让模型分类」、校验「让模型修复」且允许重试、检索「让模型重排」
+  时才算；核查节点自己的开关关着不算）；报告没写裁判配置时查全图默认里的那一份；
+- 提示按这一处在界面上能不能改：检查器里有接入下拉框的说「在节点中换一个接入」，别处说「在发布前检查中改用」；
+- 发布前检查给每一处配一条要人选的修复：改用一个启用的接入，或不指定接入。
 
 接入名、节点名都是虚构的。
 """
@@ -250,7 +253,8 @@ async def test_publish_check_and_publish_stop_at_a_broken_provider(client, level
     assert r.status_code == 200, r.text
     check = r.json()
     [issue] = provider_issues(check)
-    assert issue["level"] == "error" and issue["node_id"] == "write" and issue["fix"] is None
+    assert issue["level"] == "error" and issue["node_id"] == "write"
+    assert issue["fix"] == "provider.missing:write:provider"
     assert check["ok"] is False
     r = await client.post(f"/api/workflows/{wf}/publish", json={"level": level})
     body = r.json()
@@ -295,3 +299,189 @@ async def test_publishing_a_clean_graph_is_unaffected(client):
     wf = await _workflow(writer(LIVE))
     r = await client.post(f"/api/workflows/{wf}/publish", json={"level": "published"})
     assert r.json()["ok"] is True, r.text
+
+
+@pytest.mark.parametrize("group,key,label", [("run", "tool_gate_provider", "门控模型 · 接入"),
+                                             ("copilot", "provider", "助手模型 · 接入")])
+async def test_a_provider_name_that_is_not_text_is_refused_with_the_field(client, group, key, label):
+    """门控、助手两组没有自己的格式检查：名字写成数字一类以前照样存下，查助手当前用哪个模型时就出错。"""
+    r = await client.put("/api/settings", json={"values": {group: {key: 123}}})
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["code"] == "settings_provider_invalid" and body["field"] == f"{group}.{key}"
+    assert body["detail"].startswith(f"「{label}」需要填写模型接入的名称，留空表示"), body["detail"]
+    assert body["detail"].endswith("当前为「123」")
+    assert await stored(group) is None
+
+
+# --------------------------------------------------------------------------
+# 只查真会取模型的地方（续）、报告的裁判取自全图默认、提示指到能改的地方
+# --------------------------------------------------------------------------
+
+
+async def test_a_switched_off_verify_node_or_a_validate_without_retries_is_not_checked(client):
+    """核查节点自己的开关关着时执行器直接跳过、不取模型；结构校验不许重试（max_retries 为 0）时一次都不修。它们点名的
+    接入写错了不提、不挡发布。开关打开、允许重试就照查。"""
+    graph = chain(
+        node("start", "input"),
+        node("write", "report", "写周报", instructions="写周报", provider=LIVE),
+        node("dual", "dual_check", "复核销售额", enabled=False, provider=GONE),
+        node("chal", "challenge", "审稿", report="write", enabled=False, provider=OFF),
+        node("check", "validate", "校验", max_retries=0, provider=GONE, schema={"type": "object"}),
+        node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
+    )
+    wf = await _workflow(graph)
+    r = await client.post(f"/api/workflows/{wf}/publish-check", json={"level": "published", "graph": graph})
+    assert provider_issues(r.json()) == []
+    r = await client.post("/api/workflows/validate", json={"graph": graph})
+    assert provider_issues(r.json()) == []
+    graph["nodes"][2]["data"]["config"]["enabled"] = True
+    del graph["nodes"][3]["data"]["config"]["enabled"]           # 没写开关：跟随设置，照查
+    graph["nodes"][4]["data"]["config"]["max_retries"] = 1
+    r = await client.post(f"/api/workflows/{wf}/publish-check", json={"level": "published", "graph": graph})
+    assert {i["node_id"] for i in provider_issues(r.json())} == {"dual", "chal", "check"}
+
+
+async def test_a_report_judged_with_the_graph_default_judge_checks_that_provider_once(client):
+    """报告没写自己的裁判配置时执行用全图默认里的那一份（report_judge）：它点名的接入记在全图默认上，几个报告共用
+    时只记一条；写了自己的裁判配置的报告不受它影响；不交给模型裁判的报告用不上它。"""
+    graph = chain(
+        node("start", "input"),
+        node("a", "report", "写周报", instructions="写周报", provider=LIVE),             # claims 取全图默认的 judge
+        node("b", "report", "写月报", instructions="写月报", provider=LIVE),
+        node("c", "report", "写年报", instructions="写年报", provider=LIVE, judge={"provider": LIVE}),
+        node("d", "report", "写日报", instructions="写日报", provider=LIVE, claims="off"),
+        node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.a.text }}"}]),
+        defaults={"claims": "judge", "judge": {"provider": GONE}},
+    )
+    r = await client.post("/api/workflows/validate", json={"graph": graph})
+    [issue] = provider_issues(r.json())
+    assert (issue["node_id"], issue["field"], issue["code"]) == (None, "defaults.judge.provider", "provider.missing")
+    assert issue["message"].startswith(f"工作流默认设置中的结论句裁判指定的模型接入「{GONE}」不存在。"), issue["message"]
+    wf = await _workflow(graph)
+    r = await client.post(f"/api/workflows/{wf}/publish-check", json={"level": "published", "graph": graph})
+    check = r.json()
+    assert check["ok"] is False
+    assert [i["fix"] for i in provider_issues(check)] == ["provider.missing:graph:defaults.judge.provider"]
+
+
+async def test_the_hint_points_to_where_the_provider_can_actually_be_changed(client):
+    """检查器里有接入下拉框的（双盲复算、反方审稿、报告自己的结论句裁判）说「在节点中换一个接入」；节点自己的接入、
+    协作成员、全图默认在界面上没有下拉框，说「在发布前检查中改用」——那里有这一处的修复。"""
+    graph = chain(
+        node("start", "input"),
+        node("ask", "llm", "提问", provider=GONE, prompt="总结"),
+        node("write", "report", "写周报", instructions="写周报", provider=LIVE, claims="judge", judge={"provider": OFF}),
+        node("dual", "dual_check", "复核销售额", provider=GONE),
+        node("team", "supervisor", "协作", provider=LIVE, agents=[{"name": "分析师", "provider": OFF, "system": "分析"}]),
+        node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
+    )
+    r = await client.post("/api/workflows/validate", json={"graph": graph})
+    got = {(i["node_id"], i["field"]): i["message"] for i in provider_issues(r.json())}
+    in_node, in_check = "或在节点中换一个接入", "或在「发布前检查」中改用其他接入"
+    assert got[("ask", "provider")].endswith(f"。请在「设置 → 模型接入」中核对名称，{in_check}"), got
+    assert got[("dual", "provider")].endswith(f"。请在「设置 → 模型接入」中核对名称，{in_node}"), got
+    assert got[("write", "judge.provider")].endswith(f"。请在「设置 → 模型接入」中启用它，{in_node}"), got
+    assert got[("team", "agents[0].provider")].endswith(f"。请在「设置 → 模型接入」中启用它，{in_check}"), got
+
+
+# --------------------------------------------------------------------------
+# 发布前检查的修复：改用一个启用的接入，或不指定接入
+# --------------------------------------------------------------------------
+
+
+async def _fix(client, wf: str, graph: dict, fix_id: str, value) -> dict:
+    r = await client.post(f"/api/workflows/{wf}/autofix", json={"level": "published", "graph": graph,
+                                                                "apply": [fix_id], "choices": {fix_id: value}})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def config_of(graph: dict, node_id: str) -> dict:
+    return next(n for n in graph["nodes"] if n["id"] == node_id)["data"]["config"]
+
+
+async def test_each_broken_provider_gets_a_choice_to_switch_or_stop_naming_one(client):
+    """多数节点的检查器里没有接入下拉框：发布前检查里的这条修复是界面上唯一能改它的地方。候选只列启用的接入，不替人选；
+    选的接入不提供这一处写着的模型时，模型一并去掉（拿 A 家的模型名去调 B 家必然失败），候选的说明里写清。"""
+    graph = writer(GONE, model="核对旧模型")
+    wf = await _workflow(graph)
+    r = await client.post(f"/api/workflows/{wf}/publish-check", json={"level": "published", "graph": graph})
+    check = r.json()
+    [issue] = provider_issues(check)
+    [fix] = [f for f in check["fixes"] if f["id"] == issue["fix"]]
+    assert (fix["kind"], fix["node_id"], fix["field"]) == ("choice", "write", "provider")
+    assert fix["label"] == "选择「写周报」（模型调用）改用的模型接入"
+    assert "default" not in fix and not any(k.startswith("_") for k in fix)
+    values = [o["value"] for o in fix["options"]]
+    assert values[0] == "" and fix["options"][0]["label"] == "不指定接入"
+    assert LIVE in values and OFF not in values and GONE not in values
+    live = next(o for o in fix["options"] if o["value"] == LIVE)
+    assert "不提供模型「核对旧模型」，将改用它的默认模型「核对模型」" in live["hint"] and "演示用" in live["hint"]
+
+    out = await _fix(client, wf, graph, fix["id"], LIVE)
+    assert out["applied"] == [fix["id"]] and out["rejected"] == [] and out["ok"] is True, out["rejected"]
+    assert config_of(out["graph"], "write")["provider"] == LIVE and "model" not in config_of(out["graph"], "write")
+    assert [(c["node_id"], c["field"], c["before"], c["after"]) for c in out["changes"]] == [
+        ("write", "provider", GONE, LIVE), ("write", "model", "核对旧模型", None)]
+    assert provider_issues({"issues": out["remaining"]}) == []
+
+    out = await _fix(client, wf, graph, fix["id"], "")
+    assert out["applied"] == [fix["id"]] and out["ok"] is True, out["rejected"]
+    config = config_of(out["graph"], "write")
+    assert "provider" not in config and config["model"] == "核对旧模型"
+    assert [(c["field"], c["before"], c["after"]) for c in out["changes"]] == [("provider", GONE, None)]
+
+
+async def test_a_team_node_and_its_member_are_fixed_one_place_at_a_time(client):
+    """同一个协作节点上自己的接入和成员的接入各有一条修复：只修成员那一处时，节点自己那一处还在不算没修好。"""
+    graph = chain(
+        node("start", "input"),
+        node("team", "supervisor", "协作", provider=GONE, goal="分析本周销售",
+             agents=[{"name": "分析师", "provider": GONE, "system": "分析"}]),
+        node("out", "output", fields=[{"name": "结论", "value": "{{ last_message }}"}]),
+    )
+    wf = await _workflow(graph)
+    r = await client.post(f"/api/workflows/{wf}/publish-check", json={"level": "published", "graph": graph})
+    issues = provider_issues(r.json())
+    member = "provider.missing:team:agents[0].provider"
+    assert [(i["field"], i["fix"]) for i in issues] == [("provider", "provider.missing:team:provider"),
+                                                        ("agents[0].provider", member)]
+    assert {f["id"] for f in r.json()["fixes"]} >= {"provider.missing:team:provider", member}
+    out = await _fix(client, wf, graph, member, LIVE)
+    assert out["applied"] == [member], out["rejected"]
+    config = config_of(out["graph"], "team")
+    assert config["agents"][0]["provider"] == LIVE and config["provider"] == GONE
+    assert [i["field"] for i in provider_issues({"issues": out["remaining"]})] == ["provider"]
+    assert out["ok"] is False
+
+
+async def test_the_graph_default_provider_has_its_own_fix(client):
+    graph = chain(node("start", "input"), node("ask", "llm", "提问", prompt="总结"),
+                  node("out", "output", fields=[{"name": "结论", "value": "{{ last_message }}"}]),
+                  defaults={"provider": OFF, "model": "核对停用模型"})
+    wf = await _workflow(graph)
+    r = await client.post(f"/api/workflows/{wf}/publish-check", json={"level": "published", "graph": graph})
+    [issue] = provider_issues(r.json())
+    assert (issue["node_id"], issue["code"], issue["fix"]) == (
+        None, "provider.disabled", "provider.disabled:graph:defaults.provider")
+    out = await _fix(client, wf, graph, issue["fix"], LIVE)
+    assert out["applied"] == [issue["fix"]] and out["ok"] is True, out["rejected"]
+    assert out["graph"]["defaults"] == {"provider": LIVE}
+    assert [(c["node_id"], c["field"], c["before"], c["after"]) for c in out["changes"]] == [
+        (None, "defaults.provider", OFF, LIVE), (None, "defaults.model", "核对停用模型", None)]
+
+
+async def test_stop_naming_a_provider_is_refused_when_the_graph_default_is_broken_too(client):
+    """节点不再指定接入就改取全图默认：全图默认的接入也坏了，修完冒出新问题，这一项不采用并说清原因。"""
+    graph = chain(node("start", "input"), node("ask", "llm", "提问", provider=GONE, prompt="总结"),
+                  node("out", "output", fields=[{"name": "结论", "value": "{{ last_message }}"}]),
+                  defaults={"provider": OFF})
+    wf = await _workflow(graph)
+    r = await client.post(f"/api/workflows/{wf}/publish-check", json={"level": "published", "graph": graph})
+    [issue] = provider_issues(r.json())          # 唯一的节点写了自己的接入，全图默认的没人用，不提
+    out = await _fix(client, wf, graph, issue["fix"], "")
+    assert out["applied"] == []
+    [(fid, reason)] = [(x["fix_id"], x["reason"]) for x in out["rejected"]]
+    assert fid == issue["fix"] and reason.startswith("修改后出现了新的问题：工作流默认设置指定的模型接入"), reason
+    assert config_of(out["graph"], "ask")["provider"] == GONE and out["changes"] == []

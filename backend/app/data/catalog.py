@@ -1509,34 +1509,30 @@ async def resolve_draft_model(session: AsyncSession) -> tuple[Any, str]:
     起草出来的目录会被当成真的写进库里。数据层不导入接口层，设置键取 recipe_ai 里那份（与助手的同值，
     那边有测试核对）。
     """
-    from app.core.errors import not_configured
     from app.data.recipe_ai import COPILOT_SETTING_KEY
     from app.db.models import Setting
-    from app.providers.factory import ModelSpec, ProviderNotConfigured, build_chat_model, resolve_provider
+    from app.providers.factory import (
+        ModelSpec, ProviderNotConfigured, assistant_unavailable, build_chat_model, resolve_provider,
+    )
 
     row = await session.get(Setting, COPILOT_SETTING_KEY)
     saved = (row.value if row else None) or {}
     spec = ModelSpec(provider=saved.get("provider") or None, model=saved.get("model") or None,
                      max_tokens=MODEL_MAX_TOKENS, temperature=0, thinking="off")
-    unconfigured = "助手使用的模型尚未配置完成：{reason}。请到「设置 → 模型接入」检查"
     try:
+        # 存的接入名不存在、已停用，只存了模型名、提供它的接入已停用：resolve_provider 都会报出来
         provider = await resolve_provider(session, spec.provider, spec.model)
     except ProviderNotConfigured as e:
-        raise CatalogModelUnavailable(unconfigured.format(reason=not_configured(e, with_hint=False))) from e
+        raise CatalogModelUnavailable(assistant_unavailable(e)) from e
     if provider is None:
-        if spec.provider:
-            raise CatalogModelUnavailable(f"助手设置里的模型接入「{spec.provider}」不存在。请到「设置 → 模型接入」检查")
         raise CatalogModelUnavailable("未配置模型接入，无法由助手起草数据目录。请到「设置 → 模型接入」添加")
     if provider.kind == "mock":
         raise CatalogModelUnavailable("当前只有演示用的模型接入，无法用于起草数据目录。"
                                       "请到「设置 → 模型接入」添加真实的模型接入")
-    if not provider.enabled:
-        raise CatalogModelUnavailable(f"助手使用的模型接入「{provider.name}」已停用。"
-                                      "请到「设置 → 模型接入」启用它，或为助手换一个模型")
     try:
         model = build_chat_model(provider, spec)
     except ProviderNotConfigured as e:
-        raise CatalogModelUnavailable(unconfigured.format(reason=not_configured(e, with_hint=False))) from e
+        raise CatalogModelUnavailable(assistant_unavailable(e)) from e
     return model, spec.model or provider.default_model or ""
 
 
