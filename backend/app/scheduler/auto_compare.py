@@ -10,7 +10,8 @@
   运行详情「与上一次对比」的默认基准用的是同一个函数：触发历史和运行详情里两个同名的入口必须比同一对运行。失败的那次
   不当基准：拿它当基准，每个指标都成了「新增」。按发起先后挑，不按结束时间：老的失败运行事后被接着跑完，结束得比
   后一次晚，它的上一次仍是它前面那次。紧挨着的上一次不是成功的（失败、取消、还没结束）时 previous 为 False，通知和
-  触发历史写明比的是哪一次。这个任务的第一次不比（不像运行详情那样退回同一工作流的别的运行：那不是「上一次」）
+  触发历史写明比的是哪一次；中间那次事后接着运行成功了，上一次成功的就成了它，触发历史不再给当时那一份（outdated）。
+  这个任务的第一次不比（不像运行详情那样退回同一工作流的别的运行：那不是「上一次」）
 - 和封存绑定：运行的封存要盖住它最后一条结束事件才算封存完（sealed_now）。runner 先写终态、再另起会话封存，失败后
   接着跑完的运行在两步之间还带着失败时的清单哈希，拿它去比只比得到旧封存范围里的事件。结果里记下两边的清单哈希：
   哪一边后来变了，触发历史就不再给这份对比（api/schedules._fire_outs）；对比途中变了，结果不记
@@ -247,6 +248,30 @@ def brief_of(artifact: str) -> dict[str, Any] | None:
         return None
     _remember(artifact, brief)
     return _copy(brief)
+
+
+async def outdated(session: Any, known: dict[str, dict[str, Any]]) -> set[str]:
+    """known（对比工件 id → 摘要）里基准已经不是现在挑出来的那一次的：返回这些工件的 id。
+
+    只有基准当时就不是紧挨着的上一次（previous 为 False）的会这样：中间隔着的那几次（失败、还没结束的）事后接着运行
+    成功、封存了，这次之前同一定时任务上一次成功的就成了它。运行详情「与上一次对比」的默认基准（pick_base）比的是它，
+    触发历史要是还给当时那一份，两个同名入口比的就不是同一对运行，计数也对不上。紧挨着的上一次不会这样：两次之间插不进
+    新的运行（发起时间只会往后排），两边自己被继续执行、重新封存另有核对（api/schedules._fire_outs）。这类对比本来就少，
+    逐个现挑一遍不费什么"""
+    from app.api import compare as compare_api
+
+    wanted = {artifact: brief for artifact, brief in known.items() if not brief["previous"]}
+    if not wanted:
+        return set()
+    targets = {run.id: run for run in (await session.execute(
+        select(Run).where(Run.id.in_({brief["target_run_id"] for brief in wanted.values()})))).scalars()}
+    stale = set()
+    for artifact, brief in wanted.items():
+        target = targets.get(brief["target_run_id"])
+        found = await compare_api.pick_base(session, target, schedule_only=True) if target is not None else None
+        if found is None or found.run.id != brief["base_run_id"]:
+            stale.add(artifact)
+    return stale
 
 
 async def briefs(artifacts: list[str]) -> dict[str, dict[str, Any]]:

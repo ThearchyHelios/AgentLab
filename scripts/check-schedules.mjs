@@ -1509,7 +1509,8 @@ await section('详情：触发历史里的「与上一次对比」', async () =>
 
 await section('详情：触发历史和运行详情的「与上一次对比」拿同一个基准', async () => {
   // f10 的上一次（f11）失败了，服务端两处都挑再往前成功的 f12：自动对比和运行详情的默认基准用的是同一个函数
-  // （api/compare.py 的 pick_base）。这里守前端：两个入口都原样用服务端给的基准，打开同一对运行、写同一句来历
+  // （api/compare.py 的 pick_base），基准事后变了的旧对比触发历史不再给，这些由 backend/tests/test_scheduler_compare.py
+  // 守。这里守前端：两个入口都原样用服务端给的基准，打开同一对运行、写同一句来历
   const runOf = (id, at) => ({ ...RUNS[0], id, started_by: '定时任务：门店周报 · 每周', created_at: iso(at), started_at: iso(at),
     finished_at: iso(at + 4200), manifest_hash: 'ab'.repeat(32), manifest_seq: 2 })
   const f10 = runOf('run-f10', nextMonday9(-11))

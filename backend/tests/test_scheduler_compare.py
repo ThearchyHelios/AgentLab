@@ -9,7 +9,8 @@
   记录的 compare_artifact。这个任务的第一次（只有同一工作流别的运行可比）、还没封存时不比；对比出错（基准的封存核对
   不一致、意外的异常）只记日志，通知照常推送、不带对比
 - 接口：Fire 多一个 compare: {base_run_id, summary, previous} 或 null，summary 同对比接口的计数，previous 说基准是不是
-  紧挨着的上一次；基准被删、被继续执行（不在终态）时为 null（对比页只认封存的运行）
+  紧挨着的上一次；基准被删、被继续执行（不在终态）时为 null（对比页只认封存的运行）；基准不再是现在挑出来的那一次
+  （中间失败的那次事后被接着运行成功）时也为 null（运行详情里同名的入口比的已是另一次）
 - 通知：结束的通知多一行「与上一次相比：只数据变 2 个、口径与数据都变 0 个、SQL 结构变 0 个」，配了对外访问地址时附
   对比页链接（/runs/compare?target=…&base=…）；只给个数，报告、指标、查询里的具体数字一个不出现
 
@@ -325,9 +326,21 @@ async def test_after_a_failed_run_the_base_is_the_last_successful_one(recorder, 
     assert (base["base_run_id"], base["reason"]) == (first, "same_schedule")
 
 
+async def fires_of(client, sid: str) -> dict[str, dict]:
+    return {f["id"]: f for f in (await client.get(f"/api/schedules/{sid}/fires")).json()["items"]}
+
+
+async def default_base_of(client, run_id: str) -> tuple[str, str]:
+    body = (await client.get(f"/api/runs/{run_id}/compare/base")).json()
+    return body["base_run_id"], body["reason"]
+
+
 async def test_base_follows_launch_order_not_finish_time(recorder, client):
     """第 2 周失败、第 3 周照常成功之后，有人把第 2 周接着跑完：它结束得比第 3 周晚，但它的上一次仍是第 1 周。以前
-    按结束时间挑，拿后一次触发的第 3 周当基准，「与上一次相比」的变化方向是反的。第 3 周已经比过的那一份不受影响"""
+    按结束时间挑，拿后一次触发的第 3 周当基准，「与上一次相比」的变化方向是反的。
+
+    第 3 周存下的那一份不改，但触发历史不再给它：第 3 周之前同一定时任务上一次成功的已经是第 2 周，运行详情「与上一次
+    对比」比的是第 2 周。还给第 1 周那一份，两个同名入口就比的不是同一对运行，计数也对不上"""
     workflow = await new_workflow()
     sid = await new_schedule(workflow, url=None)
     first = await persist(week("r1"), workflow, finished=T0, schedule_id=sid)
@@ -339,6 +352,9 @@ async def test_base_follows_launch_order_not_finish_time(recorder, client):
     await webhook.notify_due()
     third_artifact = (await fire_row(third_fire)).compare_artifact
     assert load(third_artifact)["result"]["base"]["id"] == first
+    assert (await fires_of(client, sid))[third_fire]["compare"] == {"base_run_id": first, "summary": SUMMARY,
+                                                                     "previous": False}
+    assert await default_base_of(client, third) == (first, "same_schedule")
 
     await reseal(second, week("r2", NEXT_ROWS), status="succeeded", finished=T0 + 2 * WEEK + timedelta(days=1))
     await webhook.notify_due()
@@ -346,8 +362,40 @@ async def test_base_follows_launch_order_not_finish_time(recorder, client):
     assert stored["result"]["base"]["id"] == first and stored["previous"] is True
     assert (await fire_row(third_fire)).compare_artifact == third_artifact
     # 运行详情里的默认基准同样按发起先后：接着跑完的第 2 周，上一次仍是第 1 周
-    base = (await client.get(f"/api/runs/{second}/compare/base")).json()
-    assert (base["base_run_id"], base["reason"]) == (first, "same_schedule")
+    assert await default_base_of(client, second) == (first, "same_schedule")
+    items = await fires_of(client, sid)
+    assert (items[second_fire]["compare"]["base_run_id"], items[second_fire]["compare"]["previous"]) == (first, True)
+    # 第 3 周：运行详情比的是第 2 周了，触发历史不再给比第 1 周的那一份（不给链接、不给旧计数）
+    assert await default_base_of(client, third) == (second, "same_schedule")
+    assert items[third_fire]["compare"] is None
+    [listed] = [s for s in (await client.get("/api/schedules")).json()["items"] if s["id"] == sid]
+    assert listed["last_fire"]["id"] == third_fire and listed["last_fire"]["compare"] is None
+
+
+async def test_a_stored_compare_stays_while_its_base_is_still_the_pick(recorder, client):
+    """基准当时就不是紧挨着的上一次、现在仍是挑出来的那一次：照旧给出。中间那次还停着没结束、后来失败了、被删掉了，
+    第 3 周之前同一定时任务上一次成功的都还是第 1 周，运行详情比的也是它。删掉之后它其实成了紧挨着的上一次，previous
+    仍照当时记下的给：「与上一次成功的运行对比」照样属实，通知里当时也是这么说的"""
+    workflow = await new_workflow()
+    sid = await new_schedule(workflow, url=None)
+    first = await persist(week("r1"), workflow, finished=T0, schedule_id=sid)
+    await fire_for(sid, first, T0 - timedelta(minutes=2), notified="succeeded")
+    second = await persist(failed_week("r2"), workflow, finished=T0 + WEEK, schedule_id=sid, status="running",
+                           seal=False)
+    await fire_for(sid, second, T0 + WEEK - timedelta(minutes=2), notified="running")
+    third = await persist(week("r3", NEXT_ROWS), workflow, finished=T0 + 2 * WEEK, schedule_id=sid)
+    third_fire = await fire_for(sid, third, T0 + 2 * WEEK - timedelta(minutes=2))
+    await webhook.notify_due()
+    shown = {"base_run_id": first, "summary": SUMMARY, "previous": False}
+    assert (await fires_of(client, sid))[third_fire]["compare"] == shown
+    assert await default_base_of(client, third) == (first, "same_schedule")
+    await set_run(second, status="failed")
+    await seal(second)
+    assert (await fires_of(client, sid))[third_fire]["compare"] == shown
+    assert await default_base_of(client, third) == (first, "same_schedule")
+    assert (await client.delete(f"/api/runs/{second}", params={"force": "true"})).status_code == 204
+    assert (await fires_of(client, sid))[third_fire]["compare"] == shown
+    assert await default_base_of(client, third) == (first, "same_schedule")
 
 
 async def test_without_an_earlier_success_there_is_no_base(recorder, client):

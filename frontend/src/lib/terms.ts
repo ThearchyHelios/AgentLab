@@ -3085,13 +3085,14 @@ export const SCHEDULE_TEXT = {
 
   // ---- 触发历史里的对比：运行成功结束后，服务端自动和同一定时任务上一次成功的运行比一次
   /**
-   * 和运行详情「更多」菜单里的入口是同一件事（服务端用同一个函数挑基准，两处比的是同一对运行），用同一个叫法。
-   * RUN_COMPARE_TEXT 定义在本对象之后，模块初始化时还取不到，写成 getter 用到时再取
+   * 和运行详情「更多」菜单里的入口是同一件事（服务端用同一个函数挑基准，两处比的是同一对运行），基准就是紧挨着的上一次
+   * 时用同一个叫法。RUN_COMPARE_TEXT 定义在本对象之后，模块初始化时还取不到，写成 getter 用到时再取
    */
   get compareLink() { return RUN_COMPARE_TEXT.menu },
   /**
    * 基准不是紧挨着的上一次（上一次失败了、取消了，比的是再往前成功的那一次）时链接上看得见的叫法：触屏没有悬停，
-   * 键盘聚焦时也不显示 title，只在悬停里说明会让人以为比的就是上一次
+   * 键盘聚焦时也不显示 title，只在悬停里说明会让人以为比的就是上一次。运行详情「更多」里的菜单项点之前还不知道基准
+   * 是哪一次，这时仍叫「与上一次对比」，两处叫法不同；进了对比页都写「默认基准：同一定时任务上一次成功的运行」
    */
   compareLinkLastOk: '与上一次成功的运行对比',
   /**
@@ -3189,7 +3190,8 @@ export const RUN_COMPARE_TEXT = {
     same_workflow: '默认基准：同一工作流、同一运行类别上一次成功的运行',
   } as Record<string, string>,
   pickBase: '更换基准',
-  pickHint: '同一工作流最近的运行，未封存的不能作为基准',
+  /** 默认基准只取成功结束的运行（pick_base），手动选不限：失败、取消的也能选，下拉和基准卡上写明它的状态 */
+  pickHint: '同一工作流最近的运行，未封存的不能作为基准；默认基准只取成功结束的运行',
   pickLoading: '正在读取同一工作流的运行…',
   pickFailed: '无法读取同一工作流的运行',
   pickNone: '同一工作流没有其他运行',
@@ -3197,9 +3199,12 @@ export const RUN_COMPARE_TEXT = {
   pickTargetGone: '本次运行的记录不存在，无法列出同一工作流的运行',
   pickUnsaved: '工作流未保存或已删除，没有可对比的运行',
   pickPlaceholder: '选择一次运行作为基准',
-  /** 下拉里的一次运行：时间 · 类别和版本 · 短 id，没封存的另标 */
-  pickOption: (time: string, cls: string, id: string, sealed: boolean) =>
-    `${time} · ${cls} · ${id}${sealed ? '' : '（未封存）'}`,
+  /**
+   * 下拉里的一次运行：时间 · 类别和版本 · 短 id，没有成功结束的写上状态（失败、已取消），没封存的另标。默认基准跳过的
+   * 正是这几种，手动挑时也得看得出哪次没成功
+   */
+  pickOption: (time: string, cls: string, id: string, sealed: boolean, status?: string | null) =>
+    `${time} · ${cls} · ${id}${status ? ` · ${status}` : ''}${sealed ? '' : '（未封存）'}`,
   /** 当前的基准读不到时下拉里的那一项（短 id）：如实显示选的是哪一次 */
   pickGone: (id: string, missing: boolean) => `${id}（${missing ? '记录不存在' : '无法读取'}）`,
   // 页面状态
@@ -3222,7 +3227,11 @@ export const RUN_COMPARE_TEXT = {
   errMissingHint: '链接可能已失效，请从记录页重新打开',
   /** 本次的记录读得到、对比却回 404：缺的是基准 */
   errBaseMissingHint: '可在上方选择另一次运行作为基准',
-  errNoBase: '未找到可作为基准的运行',
+  /**
+   * 找不到默认基准：标题只说没有默认基准，原因（服务端的 NO_BASE_TEXT：没有找到上一次成功的运行、要什么条件）跟在后面。
+   * 不能写成「没有可作为基准的运行」：失败、取消但封存了的运行不当默认基准，却照样能在上方手动选
+   */
+  errNoBase: '没有默认基准',
   errNoBaseHint: '可在上方选择同一工作流的其他运行作为基准',
   /** 下拉里一次能选的都没有（只有本次、或者都没封存） */
   errNoBaseNone: '同一工作流还没有其他已封存的运行',

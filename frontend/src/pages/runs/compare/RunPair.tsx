@@ -1,8 +1,9 @@
 import { useId, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { ArrowLeftRight, CalendarClock, RotateCw } from 'lucide-react'
-import { Skeleton, useTicker } from '../../../components/ui'
+import { Skeleton, StatusPill, useTicker } from '../../../components/ui'
 import { formatDateTime, formatTime, shortId } from '../../../lib/format'
+import { statusLabel } from '../../../lib/status'
 import { RUN_COMPARE_TEXT as T, runClassLabel, runName } from '../../../lib/terms'
 import type { RunWithSchedule } from '../../../types'
 import { ClassChip as RunClassChip } from '../parts'
@@ -11,7 +12,8 @@ import { isGone } from './model'
 
 /**
  * 顶部的两次运行：左边基准、右边本次（窄屏上下排），中间「互换」。每张卡写名字、时间、类别和版本，点名字进各自的
- * 运行详情；没封存的标出来（对比会因此被拒）。基准卡底下是换基准的下拉：同一工作流最近的运行，没封存的不能选。
+ * 运行详情；没封存的标出来（对比会因此被拒），失败、取消的标出状态。基准卡底下是换基准的下拉：同一工作流最近的运行，
+ * 没封存的不能选。
  */
 export function RunPair({ target, base, targetRun, baseRun, candidates, unsaved, reason, onPick, onSwap }: {
   target: string
@@ -49,6 +51,12 @@ export function RunPair({ target, base, targetRun, baseRun, candidates, unsaved,
   )
 }
 
+/**
+ * 封存了、却没有成功结束的（失败、已取消）：能手动选作基准，默认基准却跳过它（拿它当基准，口径卡没执行的指标都成了
+ * 「新增」「移除」）。下拉和卡上写明状态，人读懂「上一次成功的运行」之后自己挑得出成功的那一次
+ */
+const unsuccessful = (status: string | null | undefined) => status === 'failed' || status === 'cancelled'
+
 function RunCard({ role, id, run, children }: {
   role: 'base' | 'target'; id: string | null; run: Loaded<RunWithSchedule>; children?: ReactNode
 }) {
@@ -62,6 +70,9 @@ function RunCard({ role, id, run, children }: {
         <span className="font-medium text-faint">{role === 'base' ? T.base : T.target}</span>
         {r?.schedule_id && (
           <span className="chip" title={T.scheduled}><CalendarClock size={10} aria-hidden /> {T.scheduled}</span>
+        )}
+        {r && unsuccessful(r.status) && (
+          <span className="inline-flex" data-compare-run-status={r.status}><StatusPill status={r.status} /></span>
         )}
         {r && !r.manifest_hash && (
           <span className="chip" title={T.unsealedHint} data-compare-unsealed=""
@@ -113,7 +124,8 @@ function RetryButton({ onClick }: { onClick: () => void }) {
 }
 
 /**
- * 换基准。列的是运行列表接口按工作流取回的最近几次（新的在前），去掉本次；没封存的列出来但不能选，写明原因。
+ * 换基准。列的是运行列表接口按工作流取回的最近几次（新的在前），去掉本次；没封存的列出来但不能选，写明原因；失败、
+ * 取消的能选，写明状态（默认基准不取它们）。
  *
  * 当前的基准不在这几次里（更早、属于别的工作流、读不到）时也单列一项：受控的下拉值对不上任何选项时浏览器会选中
  * 第一项，看着像另一次运行被选中，而原生下拉再选当前显示的那一项不触发 change，最自然的补救点了没反应。读不到的
@@ -146,7 +158,7 @@ function BasePicker({ target, base, baseRun, targetRun, candidates, unsaved, onP
   const list = (candidates.data ?? []).filter((r) => r.id !== target)
   if (!loading && !list.length) return <p className="mt-2 text-2xs text-faint" data-compare-pick-note="none">{T.pickNone}</p>
   const label = (r: RunWithSchedule) => T.pickOption(formatTime(r.started_at ?? r.created_at ?? null, new Date(now)),
-    runClassLabel(r.run_class, r.version), shortId(r.id), !!r.manifest_hash)
+    runClassLabel(r.run_class, r.version), shortId(r.id), !!r.manifest_hash, unsuccessful(r.status) ? statusLabel(r.status) : null)
   const current = base && !list.some((r) => r.id === base) ? base : null
   const currentLabel = (b: string) => (baseRun.data ? label(baseRun.data)
     : baseRun.state === 'error' ? T.pickGone(shortId(b), isGone(baseRun.error)) : shortId(b))
