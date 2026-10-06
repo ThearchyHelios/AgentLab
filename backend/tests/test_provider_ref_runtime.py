@@ -281,9 +281,10 @@ def report_graph(source: str, *between) -> dict:
     )
 
 
-async def test_challenge_with_a_broken_verify_provider_reviews_no_claim_and_says_why(monkeypatch, sales):
+@pytest.mark.parametrize("ref", [MISSING, DISABLED])
+async def test_challenge_with_a_broken_verify_provider_reviews_no_claim_and_says_why(monkeypatch, sales, ref):
     called = script(monkeypatch, writer=TEXT)
-    await put_setting("verify", {"provider": MISSING})
+    await put_setting("verify", {"provider": ref})
     run = await start(report_graph(sales, node("chal", "challenge", "审稿", report="write")), run_class="formal")
     assert run.status == "succeeded", run.error
     evs = await events(run.id)
@@ -291,17 +292,18 @@ async def test_challenge_with_a_broken_verify_provider_reviews_no_claim_and_says
     assert out["counts"]["inconclusive"] == out["unreviewed"] == 2
     assert out["counts"]["refuted"] == out["counts"]["stands"] == 0
     [said] = logs(evs, "challenge_unreviewed")
-    assert said["reason"].startswith("核查模型不可用") and REASONS[MISSING] in said["reason"], said["reason"]
+    assert said["reason"].startswith("核查模型不可用") and REASONS[ref] in said["reason"], said["reason"]
     record = artifact_store.load(out["challenge_artifact"])
-    assert all(REASONS[MISSING] in c["rationale"] for c in record["claims"])
+    assert all(REASONS[ref] in c["rationale"] for c in record["claims"])
     # 只有写作者调用了模型
     assert called == [WRITER_MODEL]
     no_mock(evs, run.output, out, record)
 
 
-async def test_an_inquiry_with_a_broken_verify_provider_answers_with_the_reason(monkeypatch, sales, client):
+@pytest.mark.parametrize("ref", [MISSING, DISABLED])
+async def test_an_inquiry_with_a_broken_verify_provider_answers_with_the_reason(monkeypatch, sales, client, ref):
     called = script(monkeypatch, writer=TEXT)
-    await put_setting("verify", {"provider": DISABLED})
+    await put_setting("verify", {"provider": ref})
     paused = await start(report_graph(sales, node("gate", "human", mode="approve", title="周报可以出具吗")),
                          statuses=("interrupted",))
     async with SessionLocal() as session:
@@ -314,7 +316,7 @@ async def test_an_inquiry_with_a_broken_verify_provider_answers_with_the_reason(
     inquiry = r.json()["inquiry"]
     answer = inquiry["answer"]
     assert answer["ok"] is False and answer["text"] == ""
-    assert answer["error"].startswith("核查模型不可用") and REASONS[DISABLED] in answer["error"], answer["error"]
+    assert answer["error"].startswith("核查模型不可用") and REASONS[ref] in answer["error"], answer["error"]
     assert inquiry["model"] is None and inquiry["usage"]["calls"] == 0
     evs = await events(paused.id)
     [event] = [e for e in evs if e.type == "approval.inquiry"]
@@ -400,13 +402,14 @@ async def test_the_assistant_model_lookup_reports_no_error_when_it_works(client)
     assert body["error"] is None
 
 
-async def test_a_broken_gate_provider_hands_the_call_to_a_person_and_says_why(monkeypatch):
+@pytest.mark.parametrize("ref", [MISSING, DISABLED])
+async def test_a_broken_gate_provider_hands_the_call_to_a_person_and_says_why(monkeypatch, ref):
     from langchain_core.tools import StructuredTool
 
     from app.tools.trust import ask_gate
 
     called = script(monkeypatch)
-    await put_setting("run", {"tool_gate_provider": MISSING})
+    await put_setting("run", {"tool_gate_provider": ref})
 
     def lookup(name: str) -> str:
         return name
@@ -414,7 +417,7 @@ async def test_a_broken_gate_provider_hands_the_call_to_a_person_and_says_why(mo
     tool = StructuredTool.from_function(lookup, name="crm_lookup", description="按客户名称查询客户档案")
     verdict = await ask_gate(tool=tool, args={"name": "甲公司"}, node_title="查客户", task="查甲公司的档案")
     assert verdict.allowed is False
-    assert verdict.reason.startswith("门控模型未给出判断") and REASONS[MISSING] in verdict.reason, verdict.reason
+    assert verdict.reason.startswith("门控模型未给出判断") and REASONS[ref] in verdict.reason, verdict.reason
     assert verdict.model == "" and called == []
 
 

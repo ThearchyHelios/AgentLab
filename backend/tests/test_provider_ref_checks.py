@@ -275,6 +275,22 @@ async def test_publish_check_reads_the_unsaved_canvas_and_autofix_keeps_the_prob
     assert provider_issues(r.json()) == [] and r.json()["ok"] is True
 
 
+async def test_handing_only_a_provider_problem_to_the_assistant_says_it_cannot_help(client):
+    """修复之后门禁不再拦、只剩点名接入的问题：不说「已没有阻止发布的错误」，说清助手处理不了、该去哪里改。"""
+    from app.api.workflows import PROVIDER_LEFT
+
+    wf = await _workflow(writer(None))
+    r = await client.post(f"/api/workflows/{wf}/autofix", json={"level": "published", "graph": writer(GONE),
+                                                                "assist": True})
+    out = r.json()
+    assert out["assist"] == {"ok": False, "summary": PROVIDER_LEFT, "questions": []}
+    assert out["ok"] is False and [i["code"] for i in provider_issues({"issues": out["remaining"]})] == [
+        "provider.missing"]
+    r = await client.post(f"/api/workflows/{wf}/autofix", json={"level": "published", "graph": writer(LIVE),
+                                                                "assist": True})
+    assert r.json()["assist"]["summary"] == "修复后已没有阻止发布的错误，未再交给助手" and r.json()["ok"] is True
+
+
 async def test_publishing_a_clean_graph_is_unaffected(client):
     wf = await _workflow(writer(LIVE))
     r = await client.post(f"/api/workflows/{wf}/publish", json={"level": "published"})
