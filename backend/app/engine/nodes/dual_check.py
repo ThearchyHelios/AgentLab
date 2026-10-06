@@ -69,7 +69,7 @@ from app.db.models import DataSource
 from app.engine import deadline, recompute
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
-from app.engine.dual_check_facts import preview, preview_joint, record_choices
+from app.engine.dual_check_facts import preview, preview_joint, record_choices, upload_dates
 from app.engine.evidence import build_catalog, is_number, next_exec
 from app.engine.expressions import ExpressionError, _cell_call, _chain_root, cell_value, column_kind, numeric_text, \
     parse_expression
@@ -1126,6 +1126,7 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
         facts[row["metric_id"]] = {
             "metric_id": row["metric_id"], "metric": row["name"], "source": first.get("source"),
             "dialect": info.get("kind"), "uploaded": bool(info.get("uploaded")),
+            "upload_dates": info.get("upload_dates") or {},
             "sql": {"a": single[0], "b": single[1]} if single else {},
             "diff": {"equivalent": merged["equivalent"], "fallback": merged["fallback"] or single is None,
                      "items": merged["items"]},
@@ -1165,19 +1166,22 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
 
 async def _source_info(sources: _Sources, name: str) -> dict[str, Any]:
     """比较两条 SQL、预告目录写入要用的：方言、表结构、列的中文名、整份数据目录，以及是不是上传表格建的数据源
-    （uploaded：导入时日期一律存成文字，业务日期不记时原因照实说，见 dual_check_facts._dated_problem）。数据源没了就
-    都不给，照样比原文。"""
+    （uploaded：导入时日期一律存成文字）和它导入时认作日期的列（upload_dates，按当前版本的配方读，见
+    dual_check_facts.upload_dates）——业务日期据此认上传表格的日期列，认不出的原因照实说（_dated_problem）。两项都进
+    候选：审批卡的预告和裁决后的真写认的是发起审批时读的这一份。数据源没了就都不给，照样比原文。"""
     from app.data import catalog
     from app.data.sql_semantics import catalog_labels
 
     row = await sources.source(name)
     if row is None:
-        return {"kind": None, "schema": None, "names": {}, "notes": {}, "uploaded": False}
+        return {"kind": None, "schema": None, "names": {}, "notes": {}, "uploaded": False, "upload_dates": {}}
     async with SessionLocal() as session:
         entries = await catalog.read_catalog(session, row.id)
+        dates = await upload_dates(session, row)
     notes = {table: entry.notes for table, entry in entries.items()}
     return {"kind": row.kind, "schema": row.schema_cache if isinstance(row.schema_cache, dict) else None,
-            "names": catalog_labels(notes), "notes": notes, "uploaded": (row.origin or "manual") == "upload"}
+            "names": catalog_labels(notes), "notes": notes, "uploaded": (row.origin or "manual") == "upload",
+            "upload_dates": dates}
 
 
 async def _explain(original: Any, blind: Any, info: dict[str, Any]) -> dict[str, Any]:

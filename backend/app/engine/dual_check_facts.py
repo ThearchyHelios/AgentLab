@@ -9,8 +9,9 @@
   文本列（SQLite 常把日期存成文字）、整数列（Unix 秒、20260901 这类日期键）、名字带 time 的时长列都可能被说成「按它筛
   时间」，认不准存的是不是日期，不记。只有时刻的 TIME 也不记：一天里的几点几分（MySQL 还常拿它存时长）不是日期，和
   catalog.is_date_column（剖析和 SQL 检查共用的日期列判断）同一个口径——记成业务日期，SQL 检查会对按真实日期列统计的
-  查询一直报错误级。上传表格建的数据源，导入时日期一律按文字保存，这一条门槛下它们的业务日期都不由这里记（原因照实说
-  是上传的表格按文字保存，不说成用户声明了 TEXT）
+  查询一直报错误级。上传表格建的数据源，导入时日期一律按文字保存，表结构里总是 TEXT：这样的列看导入时配方里记的逻辑
+  类型（upload_dates，导入确认时界面上标的「日期」就是它），是日期的算日期列；配方读不出来（简单导入没有配方、配方
+  记录坏了）或者配方里不是日期的，照旧不记，原因照实说是上传的表格按文字保存，不说成用户声明了 TEXT
 - 一边多一个排除无效记录的条件 → 有效记录条件（valid_filter）：被采纳的一边有这个条件才记，记的就是这个条件
 - 聚合只差去不去重、被采纳的一边去重 → 去重规则（dedup）。采纳了不去重的一边不记：那是这个指标自己的算法（数行），
   写成表的「不去重」会把别的指标带偏
@@ -144,11 +145,13 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
     """一个候选（审核人在某个指标上选了 a 或 b）→ (要写的目录项, None) 或 (None, 为什么不写)。
 
     candidate：{metric 指标名, choice "a" | "b", source 数据源名, dialect, sql: {a, b}（比较的两条 SQL）, diff:
-    {equivalent, fallback, items: [FacetDiff.as_dict()]}, scope: {texts, columns}, uploaded}。scope 是这个指标自己的
-    范围：texts 是口径说明、所在分组的取值、本次运行的输入（指标名称总算在内），columns 是分组的列；有效记录条件用它
-    排除指标自己的筛选范围。uploaded 为真是上传表格建的数据源：业务日期不记时，文本列的原因照实说是上传的表格按文字
-    保存日期。schema_cache 是数据源的表结构：认表，业务日期还要看两边的列声明的类型。notes 是这个数据源的目录
-    （{表名: notes}），认码值的意思用。只看差异说明，不重新比 SQL：审核人看到的就是这份说明。
+    {equivalent, fallback, items: [FacetDiff.as_dict()]}, scope: {texts, columns}, uploaded, upload_dates}。scope 是
+    这个指标自己的范围：texts 是口径说明、所在分组的取值、本次运行的输入（指标名称总算在内），columns 是分组的列；有效
+    记录条件用它排除指标自己的筛选范围。uploaded 为真是上传表格建的数据源，upload_dates 是它导入时认作日期的列
+    （{表名: [列名]}，由 upload_dates 从配方读出）：按文字保存的列在这里面的算日期列，不在的业务日期不记、原因照实说
+    是上传的表格按文字保存日期。两项都由节点发起审批时备好、放进候选：预告和审批之后的真写认的是同一份。schema_cache
+    是数据源的表结构：认表，业务日期还要看两边的列声明的类型。notes 是这个数据源的目录（{表名: notes}），认码值的意思
+    用。只看差异说明，不重新比 SQL：审核人看到的就是这份说明。
     """
     name = str(candidate.get("metric") or "")
     side = candidate.get("choice")
@@ -164,7 +167,9 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
     item = items[0]
     aspect = str(item.get("aspect") or "")
     if aspect == "time":
-        fact, why = _business_date(item, side, schema_cache, uploaded=candidate.get("uploaded") is True)
+        dates = candidate.get("upload_dates")
+        fact, why = _business_date(item, side, schema_cache, uploaded=candidate.get("uploaded") is True,
+                                   dates=dates if isinstance(dates, Mapping) else None)
     elif aspect == "filter":
         fact, why = _valid_filter(item, side, candidate, schema_cache, notes or {})
     elif aspect == "aggregate":
@@ -187,11 +192,12 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
 
 
 def _business_date(item: Mapping[str, Any], side: str, schema_cache: Mapping[str, Any] | None, *,
-                   uploaded: bool = False) -> tuple[tuple[str, str, Any] | None, str | None]:
+                   uploaded: bool = False, dates: Mapping[str, Any] | None = None
+                   ) -> tuple[tuple[str, str, Any] | None, str | None]:
     """两边按不同的列筛时间、被采纳的一边按哪一列：(表, business_date, {column}) 或 (None, 为什么不记)。两边的列都要在
-    表结构里声明为带日期的类型（_dated_problem），被采纳的一边先看：它有问题说它；没问题再看未被采纳的一边，另说清为什么
-    也要看它（审核人看到的是自己选的那一列，不说就看不懂另一列为什么要紧）。数据源还没有可用的表结构时（没探查、探查
-    失败）只说表结构不可用：那时并不知道有没有这一列，说「不在表结构里」是在误导。"""
+    表结构里声明为带日期的类型、或者是上传表格导入时认作日期的列（_dated_problem），被采纳的一边先看：它有问题说它；没
+    问题再看未被采纳的一边，另说清为什么也要看它（审核人看到的是自己选的那一列，不说就看不懂另一列为什么要紧）。数据源
+    还没有可用的表结构时（没探查、探查失败）只说表结构不可用：那时并不知道有没有这一列，说「不在表结构里」是在误导。"""
     other = "b" if side == "a" else "a"
     detail = item.get("detail") if isinstance(item.get("detail"), Mapping) else {}
 
@@ -212,7 +218,7 @@ def _business_date(item: Mapping[str, Any], side: str, schema_cache: Mapping[str
     if not isinstance(tables, Mapping) or not tables:
         return None, "所在数据源还没有可用的表结构（尚未探查或探查失败），无法确认两边按时间筛的列存的是日期"
     for adopted, ref in ((True, mine[0]), (False, theirs[0])):
-        if (problem := _dated_problem(tables, ref, uploaded)) is None:
+        if (problem := _dated_problem(tables, ref, uploaded, dates)) is None:
             continue
         said = f"按时间筛的列「{ref['table']}.{ref['column']}」{problem}"
         if adopted:
@@ -221,15 +227,20 @@ def _business_date(item: Mapping[str, Any], side: str, schema_cache: Mapping[str
     return (str(mine[0]["table"]), "business_date", {"column": str(mine[0]["column"])}), None
 
 
-def _dated_problem(tables: Mapping[str, Any], ref: Mapping[str, Any], uploaded: bool) -> str | None:
+def _dated_problem(tables: Mapping[str, Any], ref: Mapping[str, Any], uploaded: bool,
+                   dates: Mapping[str, Any] | None = None) -> str | None:
     """按时间筛的这一列在表结构里是不是声明成了带日期的类型（_DATED_TYPE）：是的为 None，不是的交回它怎么了（查不到、没
     声明类型、只有时刻、声明成了别的类型）连同结论，接在「按时间筛的列「表.列」」后面读。
 
     表按 catalog.resolve_table_name 认，列先按原样、再按 name_key 认（差异说明里的名字是规范化过的，SQLite 不加引号的
     名字一律小写）。按 name_key 认出好几列的说对应好几列：哪一列是它说不准。类型照表结构里记的说（「类型是」，不说
     「声明为」）：introspect 记的是 SQLAlchemy 反射出来的类型，SQLite 里写成 TIMESTAMPTZ 的列反射出来是 NUMERIC；没写
-    类型的列反射出来是 NullType，记成「NULL」，按没有声明类型说。上传表格建的数据源（uploaded）日期一律存成文字，文字
-    类型不说「类型是 TEXT」：那不是用户声明的，导入确认时这一列标的还是「日期」，表结构也改不了。"""
+    类型的列反射出来是 NullType，记成「NULL」，按没有声明类型说。
+
+    上传表格建的数据源（uploaded）日期一律存成文字，表结构改不了，类型只能看导入时配方里记的（dates，见 upload_dates）：
+    按文字保存的列在里面的就是日期列（按表结构里认出的表名、列名去对，大小写不论）。不在里面的（配方读不出来、配方里
+    不是日期）不说「类型是 TEXT」：那不是用户声明的，说清是上传的表格按文字保存。声明成别的类型的列照常说类型，只认
+    文字类型：配方里的日期列只会存成文字，别的类型的列存的就不是配方里那一列。"""
     found_table = catalog.resolve_table_name({"tables": tables}, str(ref["table"]))
     meta = tables.get(found_table) if found_table is not None else None
     columns = [c for c in meta.get("columns") or [] if isinstance(c, Mapping) and c.get("name")] \
@@ -249,8 +260,77 @@ def _dated_problem(tables: Mapping[str, Any], ref: Mapping[str, Any], uploaded: 
     if _TIME_ONLY_TYPE.fullmatch(declared):
         return f"在表结构里的类型是 {declared}，只有时刻，不含日期"
     if uploaded and any(word in declared.upper() for word in catalog._TEXT_TYPES):
+        if _imported_as_date(dates, str(found_table), str(found[0]["name"])):
+            return None
         return "来自上传的表格，表格里的日期一律按文字保存，无法确认存的是日期"
     return f"在表结构里的类型是 {declared}，无法确认存的是日期"
+
+
+def _imported_as_date(dates: Mapping[str, Any] | None, table: str, column: str) -> bool:
+    """表结构里的这一列是不是上传表格导入时认作日期的列（dates：{表名: [列名]}）。表、列都先按原样、再按 name_key 对：
+    名字出自同一份配方，本来一字不差；按 name_key 对上好几个的不算，说不准是哪一个。"""
+    if not isinstance(dates, Mapping):
+        return False
+
+    def one(names: Any, wanted: str) -> str | None:
+        names = [str(n) for n in names if isinstance(n, str)]
+        if wanted in names:
+            return wanted
+        loose = [n for n in names if name_key(n) == name_key(wanted)]
+        return loose[0] if len(loose) == 1 else None
+
+    key = one(list(dates), table)
+    columns = dates.get(key) if key is not None else None
+    return isinstance(columns, (list, tuple)) and one(columns, column) is not None
+
+
+# ---- 上传表格导入时认作日期的列：配方里记的逻辑类型
+
+def recipe_dates(recipe: Any) -> dict[str, list[str]]:
+    """一份配方（recipe_types.Recipe）里逻辑类型是日期的列：{表名: [列名]}，没有日期列的表不列。
+
+    就是导入确认时界面上标「日期」的那些（recipe_notes 给列写日期格式说明认的也是这两种）：交叉表的日期轴（Axis.type 恒为
+    日期），列表块里类型记为 DATE 的列。执行器把它们一律存成 YYYY-MM-DD 的文字，表结构里只剩 TEXT。哪张表有哪几列按
+    recipe_types.derive_tables 推（建表用的同一份）：日期轴写进它各分段的表，列表合计行另存的表只有合计项和数字列。
+    列表的类型按 _DATED_TYPE 认，配方以后添了日期时间也算；只有时刻的不算。"""
+    from app.data.recipe_types import ListBlock, derive_tables
+
+    tables, _ = derive_tables(recipe)
+    listed = {(block.table, column.name) for sheet in recipe.sheets for block in sheet.blocks
+              if isinstance(block, ListBlock) for column in block.columns if _DATED_TYPE.fullmatch(column.type)}
+    out: dict[str, list[str]] = {}
+    for table, columns in tables.items():
+        names = [c.name for c in columns if c.role == "axis" or (table, c.name) in listed]
+        if names:
+            out[table] = list(dict.fromkeys(names))
+    return out
+
+
+async def upload_dates(session: Any, row: DataSource | None) -> dict[str, list[str]]:
+    """上传表格建的数据源当前版本里，导入时认作日期的列：{表名: [列名]}（recipe_dates）。只读，不碰导入流程。
+
+    按当前快照找它的配方（source_versions.snapshot_recipe_id：快照记着按哪一版配方建的表，期 3 之前的快照取最后一期导入
+    的）：数据源的表结构（schema_cache）也出自当前快照，两者是同一个版本。读不出来的一律给空——手工登记的源、简单导入
+    （没有配方，回执里只有存储类型）、快照或配方记录不在了、配方解析不了：业务日期照旧不记，原因说按文字保存。"""
+    from app.data.recipe_types import Recipe
+    from app.data.source_versions import snapshot_recipe_id
+    from app.db.models import SourceSnapshot, TableImport, TableRecipe
+
+    if row is None or (row.origin or "manual") != "upload" or not row.current_snapshot_id:
+        return {}
+    snap = await session.get(SourceSnapshot, row.current_snapshot_id)
+    if snap is None or snap.source_id != row.id:
+        return {}
+    last = await session.get(TableImport, str(snap.imports[-1])) if snap.imports else None
+    recipe_id = snapshot_recipe_id(snap, {last.id: last} if last is not None else {})
+    record = await session.get(TableRecipe, recipe_id) if recipe_id else None
+    if record is None or record.source_id != row.id:
+        return {}
+    try:
+        return recipe_dates(Recipe.model_validate(record.recipe))
+    except ValueError:
+        logger.warning("上传表格的配方记录解析不了，业务日期按文字保存处理：source=%s recipe=%s", row.id, recipe_id)
+        return {}
 
 
 def _valid_filter(item: Mapping[str, Any], side: str, candidate: Mapping[str, Any],
@@ -980,4 +1060,5 @@ async def _write(session: Any, row: DataSource, fact: Fact, *, run_id: str, node
     return None, [*reasons, f"「{fact.table}」的数据目录正被修改，{label}未能写入，请稍后在数据目录中确认"]
 
 
-__all__ = ["FACT_ITEMS", "JOINT_LIMIT", "Fact", "derive", "note_of", "preview", "preview_joint", "record_choices"]
+__all__ = ["FACT_ITEMS", "JOINT_LIMIT", "Fact", "derive", "note_of", "preview", "preview_joint", "recipe_dates",
+           "record_choices", "upload_dates"]
