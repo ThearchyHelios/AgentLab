@@ -3,7 +3,8 @@ import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
   ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
-  CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, NODE_TYPE_LABEL,
+  CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, NODE_TYPE_LABEL,
+  VERIFY_TRUNCATED_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -765,17 +766,19 @@ function gateTitle(tool: string, verdict: 'allow' | 'escalate' | 'team', reason:
  * 双盲复算、反方审稿的日志代码（期 3 前后端共用的约定）。这几条按 code 和结构化字段解读，不看原话；后端发成 info 的
  * （一致、裁决、记入数据目录、审稿完成）也上时间线，不然这两种节点就是一个跑了几十秒、什么都没说的黑盒。
  * 无法复算（dual_check_unchecked）、未能反查（challenge_unreviewed）、只查了部分数据源（challenge_sources_lost）是
- * 期 4 补上的：以前认不得，只能照原话显示
+ * 期 4 补上的：以前认不得，只能照原话显示。核查模型的输出到了上限被截断（verify_truncated，两种节点共用的核查 Agent 发）
+ * 是期 5 验收前补上的
  */
 const VERIFY_LOG_CODES = new Set([
   'dual_check_skipped', 'dual_check_same_model', 'dual_check_agreed', 'dual_check_disagreed', 'dual_check_resolved',
   'dual_check_catalog', 'dual_check_limit', 'dual_check_unchecked',
   'challenge_skipped', 'challenge_same_model', 'challenge_done', 'challenge_refuted', 'challenge_limit',
-  'challenge_unreviewed', 'challenge_sources_lost',
+  'challenge_unreviewed', 'challenge_sources_lost', 'verify_truncated',
 ])
 
 const DC = DUAL_CHECK_TEXT
 const CL = CHALLENGE_TEXT.log
+const VT = VERIFY_TRUNCATED_TEXT
 
 /**
  * 出具缺口里哪几条是双盲复算、反方审稿报上来的：出具契约给上游节点报的缺口加了「节点类型「节点名」：」的前缀
@@ -1010,6 +1013,15 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         fix: 'canvas',
       }
     }
+    case 'judge_truncated': {
+      // 裁判模型的输出到了上限被截断（judge.py run_request）：max_tokens 是那次调用的额度，unjudged 是因此未裁判的句数。
+      // 读结构化字段，不从原话里认；缺了字段只给不带数的标题。下一步指到换模型：同一个模型重新运行多半还是截断
+      const limit = typeof d.max_tokens === 'number' && d.max_tokens > 0 ? d.max_tokens : undefined
+      const n = typeof d.unjudged === 'number' && d.unjudged > 0 ? Math.round(d.unjudged) : undefined
+      return {
+        title: JUDGE_TRUNCATED_TEXT.title(limit, n), next: JUDGE_TRUNCATED_TEXT.next, fix: 'canvas', fixField: 'judge',
+      }
+    }
     case 'judge_failed': {
       // 「结论句裁判没跑完：有 2 句结论没裁判：裁判调用失败（…）」
       return {
@@ -1211,6 +1223,19 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         title: CL.sourcesLost(countOf(d.claims) || undefined),
         sub: names.length ? CL.sourcesLostSub(names) : undefined,
         next: CL.sourcesLostNext,
+        level: 'warn',
+      }
+    }
+    case 'verify_truncated': {
+      // 核查 Agent 的输出到了上限被截断（verify_agent.py）：max_tokens 是那次调用的输出额度。截断的回复一律不采信，这次核查
+      // 没有结果。读结构化字段，不从原话里认；缺了字段（别的服务端版本）只给不带数的标题。入口落到节点的模型：该换的是模型
+      const limit = typeof d.max_tokens === 'number' && d.max_tokens > 0 ? d.max_tokens : undefined
+      return {
+        title: VT.title(limit),
+        sub: VT.sub,
+        next: VT.next,
+        fix: 'canvas',
+        fixField: 'model',
         level: 'warn',
       }
     }
@@ -1912,9 +1937,11 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
         }
         if (d.purpose === 'judge' && d.error) {
-          // 裁判没跑成（超时、调用失败）：这一批记为未裁判、报告照常交——同样是提醒，不是失败
+          // 裁判没跑成（超时、调用失败）：这一批记为未裁判、报告照常交——同样是提醒，不是失败。输出到了上限被截断的
+          // 照实说是截断（不是「未能执行」：接入是好的，该换的是模型，下一步见 judge_truncated 那一行）
+          const cap = num(d.max_tokens)
           step.level = 'warn'
-          step.title = JUDGE_FAILED_TITLE
+          step.title = d.truncated === true ? JUDGE_TRUNCATED_TEXT.call(cap && cap > 0 ? cap : undefined) : JUDGE_FAILED_TITLE
           step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
         }
         pendingLlm.delete(nodeId ?? '_')

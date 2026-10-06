@@ -25,6 +25,15 @@ query_artifact 和 role: verify——随运行封存、证据面板能下钻。�
 每日上限不传就按设置里的「核查每日金额上限」，明确传 None 才是不限。模型不在价格目录里时估不出金额，金额上限
 对它无效，照裁判的说法记一条说明。每次调用都记进核查的每日账（engine/spend.py）。
 
+**输出额度。** 经 OpenAI 兼容接入的推理模型收不到 thinking=off，思考也算在输出额度里：额度按 spec（缺省 judge.MAX_TOKENS），
+服务方嫌大时（或者 anthropic SDK 在本地就拒了）退回 judge.FALLBACK_MAX_TOKENS 再试一次，之后工具循环、收尾都用小的；
+同一接入、模型被嫌大过，之后的核查一开始就用小的（providers/budget.py）。每次调用都看有没有到了上限被截断，截断的回复
+一律不采信：工具循环里截断的回复不算模型自己停下，带着的工具调用是写到一半的（Anthropic 的 tool_use 截在半路时 input
+是空的，有的网关给半截对象），不执行；截断前查到过东西的也不收尾——同时长到点一样算半路被掐断，按截断前查到的收尾
+交出去的结果说不清完整不完整，还会照常参与比对和处置。收尾的强制工具调用被截断时，解析出来的空对象、半截对象都不算
+交了结果，也不再退回普通调用多花一次额度。因为截断没交成结果的，error 照实说是输出额度（TRUNCATED_ERROR），不说成
+「没查到」「没按结构交」；节点里调用时另记一条 verify_truncated。
+
 永远不抛：模型没配好、调用失败、格式不对、触顶、库写不进去，都落在返回值里（error / limit）。模型调用都经
 get_chat_model，测试换成剧本。
 """
@@ -49,11 +58,12 @@ from app.db.base import SessionLocal
 from app.engine import spend
 from app.engine.evidence import build_catalog, cell_eid, compose_doc, query_entry_fields, schema_ledger_entry
 from app.engine.expressions import CellError, column_kind, locate_cell, numeric_text
-from app.engine.judge import _json_in, _tokens, _usd
+from app.engine.judge import FALLBACK_MAX_TOKENS, MAX_TOKENS, _json_in, _tokens, _usd
 from app.engine.nodes.llm import _DIGEST_BUDGET, _digest, _split_structured, _typed, explain_model_error
 from app.engine.state import message_text
 from app.engine.toolcalls import ToolTimeout, limit_fields, limit_of, run_bounded
 from app.providers import catalog as pricing
+from app.providers.budget import BudgetFallback, budget_refused, cut_off, cut_words, error_usage, truncated_error
 from app.providers.factory import ModelSpec, ProviderNotConfigured, bind_tools_safely, get_chat_model
 from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX, build_datasource_tools
 from app.tools.registry import ToolArgsError, ToolContext, Versions, args_model_of, prepare_args
@@ -79,6 +89,14 @@ _REF_DEPTH = 8
 RATIONALE = "rationale"
 #: 触顶原因
 LIMITS = ("max_queries", "timeout_s", "max_cost_usd", "daily_max_usd", "max_steps")
+#: 核查模型的输出到了上限被截断、没交成结果时给人看的话：双盲复算的无法复算、反方审稿的「反查未完成」、质询的报错都照
+#: 它说，也是 verify_truncated 日志的原话。cut 是 budget.cut_words 的「核查模型的输出达到上限（N token）被截断」。开头只说
+#: 「未能给出结果」：质询里提问人看到的就是这句，它问的是问题，不是在核查
+TRUNCATED_ERROR = "{cut}，未能给出结果。{advice}"
+#: 截断的建议：该换的是模型。节点里（双盲复算、反方审稿）节点上指定的模型优先于设置（api/settings.py 的
+#: verify_model_spec），两处都说，和时间线上的下一步一致；不在节点里（审批质询）核查模型只看设置
+TRUNCATED_ADVICE = "通常是推理占满了输出额度。请在节点上指定不带推理的模型，或在「设置 → 偏好设置 → 核查」中更换核查模型"
+TRUNCATED_ADVICE_SETTINGS = "通常是推理占满了输出额度。请在「设置 → 偏好设置 → 核查」中换用不带推理的核查模型"
 
 VERIFY_SYSTEM = (
     "你是数据核查员：只读地查库，用查询结果完成交给你的任务。\n"
@@ -129,7 +147,8 @@ class VerifyOutcome:
     source, tool, call_id}。
     rationale：理由组装成的报告文档（evidence.compose_doc 的形状，violations 里有裸数字）。usage：{input_tokens,
     output_tokens, total_tokens, cost_usd, calls, unpriced_calls}。limit：触顶原因（LIMITS 之一），没触顶为 None。
-    answered：模型是不是自己停下来的（没被上限掐断）。
+    answered：模型是不是自己停下来的（没被上限掐断，也没因为输出到了上限被截断）。被截断的一律没有结果，error 是
+    TRUNCATED_ERROR。
     """
 
     result: dict[str, Any] | None
@@ -686,13 +705,16 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
     def left() -> float | None:
         return None if deadline is None else deadline - time.monotonic()
 
-    # ---- 模型
+    # ---- 模型。额度没写的按 MAX_TOKENS：推理模型的思考算在输出额度里，4096 常常想完就没额度发查询、交结果了
+    spec = spec.model_copy(update={"max_tokens": spec.max_tokens or MAX_TOKENS})
+    small = FALLBACK_MAX_TOKENS if spec.max_tokens > FALLBACK_MAX_TOKENS else None
     try:
         async with SessionLocal() as session:
-            base_model, model_id = await get_chat_model(session, spec)
+            first, model_id = await get_chat_model(session, spec)
     except Exception as e:  # noqa: BLE001 - 核查模型没配好：这回核不了，照实交回
         why = not_configured(e) if isinstance(e, ProviderNotConfigured) else describe_exception(e)
         return outcome(error=f"核查模型不可用（{why}）")
+    base_model = _with_fallback(first, spec, small, model_id)
     state.model = model_id
     if daily_max_usd is Default.SETTINGS:
         from app.api.settings import verify_settings   # 在这里导入：api.settings 导入了 engine 里的模块
@@ -743,7 +765,8 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
             raw = got if isinstance(got, BaseMessage) else _split_structured(got)[0]
         except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001 - 调用失败落在返回值里
             failure = e
-        inp, out = _usage(raw)
+        # openai 的结构化输出被截断时抛异常，用量在异常里：额度是真花出去了
+        inp, out = _usage(raw) if raw is not None else error_usage(failure)
         cost = await budget.settle(day, estimate, inp, out)
         usage["input_tokens"] += inp
         usage["output_tokens"] += out
@@ -756,8 +779,22 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
         if failure is not None:
             end["error"] = "超过核查的时长上限，已放弃这次调用" if isinstance(failure, asyncio.TimeoutError) \
                 else explain_model_error(failure, model_id)
+        if truncated_error(failure) or cut_off(raw):
+            # 到了上限被截断：不是「调用失败，请稍后重试」，重试解决不了额度问题
+            limit = base_model.max_tokens
+            end.update(truncated=True, max_tokens=limit, error=cut_words("核查模型", limit))
         await _announce(emit, EventType.LLM_END, **end)
         return got, raw, failure
+
+    # 截断的建议按模型从哪来的说：节点里节点上指定的优先，不在节点里（质询）只看设置
+    advice = TRUNCATED_ADVICE if node_id else TRUNCATED_ADVICE_SETTINGS
+
+    async def report_cut(purpose: str, limit: int | None) -> VerifyOutcome:
+        """被截断、没交成结果：记一条 verify_truncated（purpose 是哪一步，limit 是那次的额度），原因照截断说。查过的照记。"""
+        text = TRUNCATED_ERROR.format(cut=cut_words("核查模型", limit), advice=advice)
+        await _announce(emit, EventType.LOG, level="warn", code="verify_truncated", purpose=purpose, max_tokens=limit,
+                        message=text)
+        return outcome(limit=stopped, answered=answered, error=text)
 
     # ---- 查库的循环
     stopped: str | None = None
@@ -781,6 +818,12 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
         if isinstance(failure, asyncio.TimeoutError):
             stopped = "timeout_s"
             break
+        if truncated_error(failure) or cut_off(response):
+            # 到了上限被截断（推理模型想完了额度也用完了）：话没说完，不是模型自己停下来的；带着的工具调用是写到一半的
+            # （Anthropic 的 tool_use 截在半路时 input 是空的，有的网关给半截的 SQL），不执行。也不收尾：一条都没查到的，
+            # 收尾只能交「查不到」（双盲复算会记成「盲算没有查到这个数」）；查到过的，截断前查到的不一定是要的那个数
+            # （模型可能正想改查询），同时长到点一样算半路被掐断。收尾那次多半同样被推理占满，也不为它多花一次额度
+            return await report_cut("verify", base_model.max_tokens)
         if failure is not None or not isinstance(response, BaseMessage):
             return outcome(error=explain_model_error(failure, model_id) if failure else "核查模型没有给出回复")
         messages.append(response)
@@ -850,12 +893,15 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
         await _announce(emit, EventType.LOG, level="warn", code="verify_limit", limit=stopped,
                         message=f"核查已达上限（{words}），已停止查询，按已有结果收尾")
 
-    # ---- 收尾：按结构交结果。关掉 thinking：结构化输出靠强制工具调用，和思考模式不兼容
+    # ---- 收尾：按结构交结果。关掉 thinking：结构化输出靠强制工具调用，和思考模式不兼容（经 OpenAI 兼容接入的推理模型
+    # 关不掉，所以额度和工具循环一样，退回小额度也和工具循环共用一个开关）
+    settle_spec = spec.model_copy(update={"thinking": "off"})
     try:
         async with SessionLocal() as session:
-            settler, _ = await get_chat_model(session, spec.model_copy(update={"thinking": "off"}))
+            settle_model, _ = await get_chat_model(session, settle_spec)
     except Exception as e:  # noqa: BLE001
         return outcome(limit=stopped, answered=answered, error=f"核查模型不可用（{describe_exception(e)}）")
+    settler = _with_fallback(settle_model, settle_spec, small, model_id, shared_with=base_model)
     final = _final_messages(head, task, queries, said, words)
     try:
         structured = settler.with_structured_output(schema, include_raw=True)
@@ -870,21 +916,27 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
 
     parsed: dict[str, Any] | None = None
     failure: BaseException | None = None
+    settle_cut = False                  # 收尾那次到了上限被截断
     if structured is not None:
         estimate = budget.estimate(_text_of(final) + schema_text, _OUT_FINAL)
         day, refused = await budget.reserve(estimate, kept=kept)
         if refused:
             return outcome(limit=stopped or refused, answered=answered, error=f"已达{words_of(refused)}，没能交结果")
         got, raw, failure = await ask(final, structured.ainvoke, estimate, day or "", "verify_result", until_finish())
-        parsed = None if failure is not None else _parsed(_split_structured(got)[1])
-        if parsed is None and raw is not None:
-            # 有的网关把 JSON 写在正文里、或者塞进了一个没按结构解析出来的工具调用
-            for candidate in [message_text(raw), *(c.get("args") for c in getattr(raw, "tool_calls", None) or [])]:
-                if (parsed := _parsed(candidate)) is not None:
-                    break
-    if parsed is None and not isinstance(failure, asyncio.TimeoutError):
+        # 强制工具调用写到一半到了上限：Anthropic 截在 tool_use 里时 input 是空的，有的网关给半截对象（反方审稿的结论
+        # 写完了、理由写到一半）。解析出来的、能从回复里抠出来的都说不清写完了没有，一律不采信
+        settle_cut = truncated_error(failure) or bool(cut_off(raw))
+        if failure is None and not settle_cut:
+            parsed = _parsed(_split_structured(got)[1])
+            if parsed is None and raw is not None:
+                # 有的网关把 JSON 写在正文里、或者塞进了一个没按结构解析出来的工具调用
+                for candidate in [message_text(raw), *(c.get("args") for c in getattr(raw, "tool_calls", None) or [])]:
+                    if (parsed := _parsed(candidate)) is not None:
+                        break
+    if parsed is None and not isinstance(failure, asyncio.TimeoutError) and not settle_cut:
         # 不支持结构化输出的模型：普通调用一次，结构写进消息，从回复里把 JSON 抠出来。结构化那次已经做过的，
-        # 这一次是补救，照常按上限拦；没做过的，这一次就是收尾，循环里留过钱
+        # 这一次是补救，照常按上限拦；没做过的，这一次就是收尾，循环里留过钱。结构化那次是被截断的不补救：
+        # 推理占满额度时普通调用多半一样被截断，白花一次额度
         plain = _plain_messages(final, schema)
         remaining = until_finish()
         if remaining is None or remaining > 0:
@@ -895,8 +947,13 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
                                error=f"已达{words_of(refused)}，没能交结果")
             if not refused:
                 got, _, failure = await ask(plain, settler.ainvoke, estimate, day or "", "verify_result", remaining)
-                parsed = None if failure is not None else _parsed(message_text(got) if got is not None else None)
+                # 同上：截断的回复里就算抠得出一段 JSON，后面还在写，说不清写完了没有
+                settle_cut = truncated_error(failure) or bool(cut_off(got))
+                if failure is None and not settle_cut:
+                    parsed = _parsed(message_text(got) if got is not None else None)
     if parsed is None:
+        if settle_cut:
+            return await report_cut("verify_result", settler.max_tokens)
         why = "收尾时超过时长上限，没能交结果" if isinstance(failure, asyncio.TimeoutError) else \
             f"核查模型没有按结构交结果（{explain_model_error(failure, model_id)}）" if failure is not None else \
             "核查模型没有按结构交结果"
@@ -917,6 +974,22 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
         doc = compose_doc(rationale, build_catalog(nodes={}, ledger=ledger), node_id=owner, run_id=run_id or None)
     result[RATIONALE] = doc["markdown"] if doc else ""
     return outcome(result=result, cells=cells.cells, rationale=doc, limit=stopped, answered=answered)
+
+
+def _with_fallback(model: Any, spec: ModelSpec, small: int | None, model_id: str, *,
+                   shared_with: BudgetFallback | None = None) -> BudgetFallback:
+    """按 spec 建好的模型包一层：服务方嫌额度大（或者 SDK 在本地拒了）时按 small 重建一个再调，要退回时才建，平常一个
+    都不多建。small 为 None 是额度本来就不比它大，没有可退的。被嫌大过的按 (接入, 模型, 额度) 记在进程里，证据裁判
+    （judge._with_fallback）用的是同一种记法：同一个模型在那边被嫌大过，这边也直接用小的。经本模块的 get_chat_model
+    建，测试换成剧本时小额度的那个也是剧本。"""
+
+    async def build() -> Any:
+        async with SessionLocal() as session:
+            return (await get_chat_model(session, spec.model_copy(update={"max_tokens": small})))[0]
+
+    return BudgetFallback(model, build=build if small else None, limits=(spec.max_tokens, small or spec.max_tokens),
+                          shared_with=shared_with, rejected=budget_refused,
+                          key=(spec.provider, model_id, spec.max_tokens))
 
 
 async def _run_tool(tool: Any, name: str, args: dict[str, Any], call_id: str, remaining: float | None,

@@ -6,7 +6,7 @@
 - 一份报告合并成一次调用（超过每批的句数就分批），每句给 supported / partial / contradicted / insufficient /
   not_a_claim
 - 模型不支持结构化输出、或者给的不是合法结构时退回 JSON 解析，再失败就记「未裁判」，不编判定
-- 裁判模型关掉 thinking，max_tokens 4096
+- 裁判模型关掉 thinking，输出额度 16384（推理模型的思考也算在里面）；服务方嫌大时退回 4096，截断照实说（见 test_judge_truncation）
 - 预算（每份报告的句数、金额、时长，全局每日金额）每一项都能写 null 表示不限；触顶就停、已判的保留、
   没判的记未裁判并说明是哪个上限——不报错、不让报告失败。金额超了按优先级截断：先判挂了依据的，
   再判有方向词、因果词的
@@ -207,7 +207,7 @@ async def test_the_judge_model_runs_without_thinking(monkeypatch, stored):
                                                                        max_tokens=64000),
                     budget=Budget(max_claims=None, max_cost_usd=None, timeout_s=30, daily_max_usd=None))
     [spec] = judge.specs
-    assert spec.thinking == "off" and spec.max_tokens == MAX_TOKENS == 4096
+    assert spec.thinking == "off" and spec.max_tokens == MAX_TOKENS == 16384
     assert spec.model == PRICED and spec.timeout and spec.timeout <= 30
 
 

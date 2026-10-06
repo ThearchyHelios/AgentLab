@@ -2319,6 +2319,103 @@ await section('核查类日志与出具缺口（期 4）：无法复算、未能
     rows.map((r) => `${r?.title}|${r?.sub ?? ''}`).join(' ; '))
 })
 
+await section('核查模型的输出到了上限被截断（verify_truncated）：说清额度、这次核查没有结果，下一步指到换模型', async () => {
+  // 推理模型的思考也算在输出额度里：核查 Agent 的一次调用 finish_reason=length、没有工具调用也没有 JSON 时，以前双盲复算
+  // 记成「盲算没有查到这个数」、反方审稿记成「核查模型没有按结构交结果」。现在截断的回复一律不采信，核查 Agent 另发
+  // verify_truncated（max_tokens、purpose），时间线按结构化字段说人话，原话留在展开区。先核对后端源码还是这么发的
+  const verifyPy = readFileSync(`${root}backend/app/engine/verify_agent.py`, 'utf8')
+  check('后端发截断日志的格式还是夹具里这一种', verifyPy.includes('code="verify_truncated"') && verifyPy.includes('max_tokens=limit')
+    && verifyPy.includes('purpose=purpose') && !verifyPy.includes('delivered=')
+    && verifyPy.includes('TRUNCATED_ERROR = "{cut}，未能给出结果。{advice}"'),
+  '改了 verify_agent.py 的字段或说法就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const ADVICE = '通常是推理占满了输出额度。请在节点上指定不带推理的模型，或在「设置 → 偏好设置 → 核查」中更换核查模型'
+  const FAILED = `核查模型的输出达到上限（16384 token）被截断，未能给出结果。${ADVICE}`
+  const SMALL = `核查模型的输出达到上限（4096 token）被截断，未能给出结果。${ADVICE}`
+  const all = flatten(mod.decodeRun([
+    E(1, 'run.started', null, { total: 2 }),
+    E(2, 'node.started', 'dc', { node_type: 'dual_check', label: '复核销售额' }),
+    E(3, 'log', 'dc', { level: 'warn', code: 'verify_truncated', purpose: 'verify', max_tokens: 16384, message: FAILED }),
+    E(4, 'node.finished', 'dc', { duration_ms: 20 }),
+    E(5, 'node.started', 'ch', { node_type: 'challenge', label: '审月报' }),
+    // 退回小额度之后在收尾时被截断
+    E(6, 'log', 'ch', { level: 'warn', code: 'verify_truncated', purpose: 'verify_result', max_tokens: 4096, message: SMALL }),
+    // 缺字段、字段类型不对（别的服务端版本）：只给不带数的标题，不瞎填
+    E(7, 'log', 'ch', { level: 'warn', code: 'verify_truncated', max_tokens: '16384', message: FAILED }),
+    E(8, 'node.finished', 'ch', { duration_ms: 30 }),
+    E(9, 'run.finished', null, { status: 'succeeded' }),
+  ]))
+  const rows = all.filter((s) => s.code === 'verify_truncated')
+  const nodes = all.filter((s) => s.kind === 'node')
+  check('每条一行，挂在自己的节点下', rows.length === 3 && nodes.find((s) => s.nodeId === 'dc')?.children?.filter((x) => x.code === 'verify_truncated').length === 1
+    && nodes.find((s) => s.nodeId === 'ch')?.children?.filter((x) => x.code === 'verify_truncated').length === 2, `${rows.length} 行`)
+  const [failed, small, bare] = rows
+  check('标题说输出到了上限被截断、带额度，副标题说这次核查没有结果', failed?.title === '核查模型的输出达到上限（16,384 token）被截断'
+    && failed.sub === '这次核查未能给出结果', `${failed?.title} / ${failed?.sub}`)
+  check('额度照实写（退回小额度之后是 4,096）', small?.title === '核查模型的输出达到上限（4,096 token）被截断' && small.sub === '这次核查未能给出结果',
+    `${small?.title} / ${small?.sub}`)
+  check('……下一步指到换不带推理的模型（节点上指定的优先，设置里的也说），入口落到节点的模型，提醒色',
+    rows.every((s) => !!s.next?.includes('在节点上指定不带推理的模型') && s.next.includes('设置 → 偏好设置 → 核查')
+      && s.fix === 'canvas' && s.fixField === 'model' && s.level === 'warn'),
+  `${failed?.next} / ${failed?.fix} / ${failed?.fixField} / ${failed?.level}`)
+  check('……没有「已按截断前查到的结果收尾」这一说', !rows.some((s) => /收尾|可能不完整/.test(`${s.title}${s.sub ?? ''}`)))
+  check('……原话留在展开区', failed?.detail === FAILED && small?.detail === SMALL)
+  check('缺字段、类型不对：标题不带数，不出 undefined、NaN', bare?.title === '核查模型的输出达到上限被截断'
+    && !/undefined|NaN/.test(`${bare?.title}${bare?.sub ?? ''}${bare?.next ?? ''}`), `${bare?.title} / ${bare?.sub}`)
+  check('标题、副标题里没有内部代码', !rows.some((s) => /verify_truncated|max_tokens|purpose/.test(`${s.title}${s.sub ?? ''}${s.next ?? ''}`)))
+  check('节点照常完成', nodes.every((s) => s.status === 'done'))
+})
+
+await section('结论句裁判的输出到了上限被截断（judge_truncated）：调用那一行说截断，日志另起一行，下一步指到换模型', async () => {
+  // 以前截断的那一批只发 llm.end（标题沿用「结论句裁判未能执行」）和 judge_failed（下一步是「检查接入后重新运行」）：
+  // 截断时接入是好的，同一个模型重新运行多半还是截断。现在调用那一行照 truncated、max_tokens 说截断，另发 judge_truncated
+  // （max_tokens、unjudged），judge_failed 只说别的失败。先核对后端源码还是这么发的
+  const judgePy = readFileSync(`${root}backend/app/engine/judge.py`, 'utf8')
+  check('后端发裁判截断的格式还是夹具里这一种', judgePy.includes('code="judge_truncated", max_tokens=cut_limit')
+    && judgePy.includes('unjudged=outcome["unjudged"]["truncated"]') && judgePy.includes('truncated=True, max_tokens=cut_limit')
+    && judgePy.includes('r not in LIMITS and r != "truncated"'),
+  '改了 judge.py 的字段或说法就同步改 decode.ts 的 explainLog、llm.end 和这里的夹具')
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const CUT = '裁判模型的输出达到上限（16384 token）被截断'
+  const TRUNCATED = `结论句裁判未完成：有 4 句结论未裁判：${CUT}，通常是推理占满了输出额度，可换用不带推理的裁判模型`
+  const all = flatten(mod.decodeRun([
+    E(1, 'run.started', null, { total: 1 }),
+    E(2, 'node.started', 'write', { node_type: 'report', label: '写周报' }),
+    E(3, 'llm.start', 'write', { model: 'jm-r', structured: true, purpose: 'judge', message_count: 2, units: 4 }),
+    E(4, 'llm.end', 'write', { model: 'jm-r', purpose: 'judge', duration_ms: 41000, units: 4, input_tokens: 3000,
+      output_tokens: 16384, error: CUT, truncated: true, max_tokens: 16384 }),
+    E(5, 'log', 'write', { level: 'warn', code: 'judge_truncated', max_tokens: 16384, unjudged: 4, message: TRUNCATED }),
+    E(6, 'node.finished', 'write', { duration_ms: 43000 }),
+    E(7, 'run.finished', null, { status: 'succeeded' }),
+  ]))
+  const call = all.find((s) => s.kind === 'llm' && s.code === 'judge')
+  check('调用那一行：说输出到了上限被截断、带额度，不说「未能执行」；提醒色、照常完成，原话在展开区',
+    call?.title === '裁判模型的输出达到上限（16,384 token）被截断' && call.level === 'warn' && call.status === 'done'
+    && !!call.detail?.includes(CUT), `${call?.title} / ${call?.level} / ${call?.status}`)
+  const row = all.find((s) => s.code === 'judge_truncated')
+  check('judge_truncated：标题说截断、带额度和几句未裁判', row?.title === '裁判模型的输出达到上限（16,384 token）被截断，4 句结论未裁判',
+    row?.title)
+  check('……下一步指到换不带推理的裁判模型（节点的「结论句裁判」、设置都说），不说检查接入', !!row?.next?.includes('不带推理的裁判模型')
+    && row.next.includes('结论句裁判') && row.next.includes('设置 → 偏好设置 → 证据裁判') && !row.next.includes('接入')
+    && row.fix === 'canvas' && row.fixField === 'judge' && row.level === 'warn', `${row?.next} / ${row?.fix} / ${row?.fixField}`)
+  check('……原话留在展开区，标题里没有内部代码', row?.detail === TRUNCATED && !/judge_truncated|max_tokens|unjudged/.test(`${row?.title}${row?.next}`))
+  check('没有混出一条 judge_failed', !all.some((s) => s.code === 'judge_failed'))
+  // 没截断的失败照旧：「未能执行」那一行和 judge_failed 的说法不变
+  const other = flatten(mod.decodeRun([
+    E(1, 'node.started', 'write', { node_type: 'report' }),
+    E(2, 'llm.start', 'write', { model: 'jm-x', structured: true, purpose: 'judge', message_count: 2, units: 2 }),
+    E(3, 'llm.end', 'write', { model: 'jm-x', purpose: 'judge', duration_ms: 300, units: 2, error: 'ConnectError: 连不上' }),
+    E(4, 'node.finished', 'write', { duration_ms: 400 }),
+  ]))
+  check('没截断的调用失败照旧叫「结论句裁判未能执行」', other.find((s) => s.kind === 'llm')?.title === '结论句裁判未能执行',
+    other.find((s) => s.kind === 'llm')?.title)
+  const bare = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'judge_truncated', max_tokens: 'x', message: '裁判被截断了' })]))
+    .find((s) => s.code === 'judge_truncated')
+  check('缺字段、类型不对：标题不带数，不出 undefined、NaN', bare?.title === '裁判模型的输出达到上限被截断'
+    && !/undefined|NaN/.test(`${bare?.title}${bare?.next ?? ''}`), bare?.title)
+})
+
 await section('审批质询 approval.inquiry（期 4）：一行「审批人质询」，标题带问题前 40 字，副标题说回答是否完成、查了几次', async () => {
   // 前后端共用的约定：运行停在审批上时服务端追加 approval.inquiry，node_id 为空；data 里有问题、划选的原文、回答正文、
   // 回答文档、成没成、触顶原因、查询（queries 和 inquiry_artifacts 两份）。以前这类事件落进「未识别的事件」

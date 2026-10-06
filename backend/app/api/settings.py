@@ -549,7 +549,9 @@ async def verify_model_spec(session: AsyncSession, node_config: dict[str, Any] |
     """核查用哪个模型：节点配置里的 provider / model > 设置里的核查模型 > 证据裁判模型的取值链（裁判设置 >
     助手模型 > 默认接入，见 judge.judge_model_spec）。哪一级写了就整组用哪一级，不跨级拼接入和模型。
 
-    和裁判一样关掉 thinking、max_tokens 4096：核查最后要按结构交结果（强制工具调用），和思考模式不兼容。
+    和裁判一样关掉 thinking：核查最后要按结构交结果（强制工具调用），和思考模式不兼容。额度也和裁判一样（judge.MAX_TOKENS，
+    16384）：经 OpenAI 兼容接入的推理模型收不到 thinking=off，思考算在额度里，4096 常常想完就没额度查库、交结果了；
+    服务方嫌大时核查 agent 退回 judge.FALLBACK_MAX_TOKENS（engine/verify_agent.py）。
     建议和被核查的模型不同，否则等于自己核自己；比较、提醒由调用方做（它知道被核查的是哪个模型）。
     """
     node = node_config if isinstance(node_config, dict) else {}

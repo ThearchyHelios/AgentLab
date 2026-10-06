@@ -27,6 +27,10 @@ from app.db.models import Workflow
 from app.engine.layout import CORRIDOR_MIN, MIN_ROW_GAP, NODE_W, _height, auto_layout
 from app.engine.schema import GraphSpec, NodeType, ValidationIssue, text_parse_issues, validate_graph
 from app.engine.state import message_text
+# 额度用完的认法、退回小额度的做法挪到了 providers/budget.py（核查、证据裁判也用），这里留着老名字；
+# _BUDGET_WORDS 另有 data/recipe_ai.py 的测试拿来比对
+from app.providers.budget import BUDGET_WORDS as _BUDGET_WORDS  # noqa: F401
+from app.providers.budget import BudgetFallback as _BudgetFallback, cut_off as _cut_off
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
 from app.tools.registry import all_specs
 
@@ -1053,54 +1057,12 @@ class CopilotIncomplete(Exception):
         self.detail = detail
 
 
-def _cut_off(chunk: Any) -> str:
-    """这一块是不是在说「额度用完了」：OpenAI 系是 finish_reason=length，Anthropic 是 stop_reason=max_tokens。"""
-    meta = getattr(chunk, "response_metadata", None) or {}
-    reason = meta.get("finish_reason") or meta.get("stop_reason")
-    return str(reason) if reason in ("length", "max_tokens") else ""
-
-
 #: 流式改图的输出额度。会思考的模型（DeepSeek、Claude 的 adaptive thinking）思考也算在里面：
 #: 8192 时复杂的改图常常想完就没额度了，正文一个字没写（2026-09 部署实例上同类请求 5 轮坏了 4 轮）
 COPILOT_MAX_TOKENS = 32768
-#: 服务方不收大额度时退回这个（原来的默认值）
+#: 服务方不收大额度时退回这个（原来的默认值）。退回的做法（_BudgetFallback：只在还没吐出任何东西时重来，
+#: 之后的调用即自查修正轮都用小的）和截断的认法（_cut_off）在 providers/budget.py，核查、证据裁判也用它
 _FALLBACK_MAX_TOKENS = 8192
-#: 服务方嫌额度太大时报错里会出现的字样：超过模型的输出上限（DeepSeek chat 系只到 8K），
-#: 或者输入加额度超过上下文长度（本地 vLLM）
-_BUDGET_WORDS = ("max_tokens", "max_completion_tokens", "max_output_tokens", "maximum context length")
-
-
-def _budget_rejected(e: BaseException) -> bool:
-    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
-    return status in (400, 422) and any(w in str(e).lower() for w in _BUDGET_WORDS)
-
-
-class _BudgetFallback:
-    """先按大额度调；服务方一开口就嫌额度太大时按原来的额度重来，之后的调用（自查修正轮）都用小的。
-
-    只在还没吐出任何东西时重来：这类拒绝都发生在请求刚发出去的时候，重来不会重复输出。
-    """
-
-    def __init__(self, big: Any, small: Any) -> None:
-        self.model, self._small = big, small
-
-    @property
-    def max_tokens(self) -> Any:
-        return getattr(self.model, "max_tokens", None)
-
-    async def astream(self, messages: list[Any]):
-        started = False
-        try:
-            async for chunk in self.model.astream(messages):
-                started = True
-                yield chunk
-            return
-        except Exception as e:
-            if started or self.model is self._small or not _budget_rejected(e):
-                raise
-            self.model = self._small
-        async for chunk in self.model.astream(messages):
-            yield chunk
 
 
 async def _op_model(session: AsyncSession, payload: GenerateIn) -> tuple[Any, str]:
