@@ -106,6 +106,8 @@
     artifactUndecodable: '内容无法解码',
     artifactUnparsable: '哈希一致，但内容无法解析',
     masked: '含遮罩列，未随文件附带，只能核对到哈希',
+    maskedMismatch: '导出时服务端的这份文件与工件 id（哈希）不一致，可能被改过；按含遮罩列处理，未随文件附带',
+    maskedUnparsable: '导出时服务端的这份文件无法解析，认不出是否含遮罩列，按含遮罩列处理，未随文件附带',
     maskedOdd: '只有查询快照和口径卡会因遮罩不随文件附带，这份工件却标着遮罩：导出时不会出现这种情况，文件可能被改过',
     artifactMissing: '导出时服务端已没有这份工件的文件',
     artifactAbsent: '内容未随文件附带：导出时不会出现这种情况，文件可能被改过',
@@ -452,7 +454,7 @@
     out.manifest.push({ kind: 'shown', shown: shownSeal, result: shownSeal === seal ? PASS : FAIL,
       reason: shownSeal === seal ? T.shownOk : T.shownMismatch })
 
-    // ③ 工件。服务端给每份工件的是三样之一：原字节、遮罩（只有查询快照）、服务端已没有文件
+    // ③ 工件。服务端给每份工件的是三样之一：原字节、遮罩（查询快照、口径卡，可另带 mismatch、unparsable）、服务端已没有文件
     const arts = new Map()
     for (const a of Array.isArray(data.artifacts) ? data.artifacts.filter(isObj) : []) {
       const item = { a, result: NA, reason: '', json: null, loose: null, parsed: false }
@@ -485,12 +487,17 @@
           }
         }
       } else if (a.masked) {
-        // 查询快照带遮罩列；口径卡上有输入取自遮罩列（卡上记着输入的值和代入式）。两种都只给 id，报告文档不会
-        if (a.kind === 'query' || a.kind === 'metric_set') {
-          item.reason = T.masked
-        } else {
+        // 查询快照带遮罩列；口径卡上有输入取自遮罩列（卡上记着输入的值和代入式）。两种都只给 id，报告文档不会。
+        // 内容不随文件附带，浏览器算不出它对不对得上：导出时服务端看到自己的文件和 id 对不上（mismatch）、解析不出来
+        // （unparsable）的照实说，对不上的判不通过——不然被改过的文件看起来和正常的遮罩一样，篡改的证据就丢了
+        if (a.kind !== 'query' && a.kind !== 'metric_set') {
           item.result = FAIL
           item.reason = T.maskedOdd
+        } else if (a.mismatch) {
+          item.result = FAIL
+          item.reason = T.maskedMismatch
+        } else {
+          item.reason = a.unparsable ? T.maskedUnparsable : T.masked
         }
       } else if (a.missing) {
         item.reason = T.artifactMissing
@@ -617,7 +624,7 @@
     if (!art) return { ...info, result: FAIL, reason: T.numArtifactNotListed }
     if (art.result === FAIL) return { ...info, result: NA, reason: T.numArtifactFailed }
     if (art.result !== PASS) {
-      return { ...info, result: NA, reason: art.a.masked ? T.masked : art.a.missing ? T.artifactMissing : T.numArtifactUnparsable }
+      return { ...info, result: NA, reason: art.a.masked ? art.reason : art.a.missing ? T.artifactMissing : T.numArtifactUnparsable }
     }
     if (!chained.has(entry.artifact)) return { ...info, result: NA, reason: T.numNotChained }
     if (cite.kind === 'metric') {

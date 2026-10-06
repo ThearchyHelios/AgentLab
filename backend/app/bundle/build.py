@@ -11,7 +11,8 @@
   base64 嵌入，浏览器重算 sha256 和 id 比；带遮罩的快照不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，
   有输入取自遮罩列（cell() 的格、Agent 字段、按位置取的 vars.res.rows[0][2]）的整张卡同样只给 id，认法和证据
   面板、推演同一个（recompute.input_origin）；服务端文件被改过的卡照样按卡上记的输入认，解析不出一张卡的整张只给
-  id。没被报告引用的工件不嵌。
+  id。只给 id 的工件，服务端的文件和 id 对不上的另标 mismatch、解析不出来的另标 unparsable，核对页照实说（对不上的
+  判不通过）。没被报告引用的工件不嵌。
 - 封存之后追加的事件（按需裁判、审批质询这类批注）单列：类型、序号、内容摘要，不进清单。
 
 它只证明「内部一致」：数字、文档、运行记录彼此对得上，而且没被改过。真伪要拿页面上的封存哈希和系统里这次
@@ -337,6 +338,12 @@ class _Artifacts:
         elif (kind == "query" and self.store.masked(artifact)) \
                 or (kind == "metric_set" and self.store.card_masked(artifact, self.events)):
             item["masked"] = True
+            # 不嵌内容，浏览器就算不出这份文件对不对得上：服务端自己看到的照实带上，核对页据此判不通过、说清原因。
+            # 以前被改过的卡原样嵌进去，浏览器自己算出对不上；现在不嵌了，这个证据不能跟着丢
+            if not self.store.intact(artifact):
+                item["mismatch"] = True
+            if not isinstance(self.store.content(artifact), dict):
+                item["unparsable"] = True
         else:
             # 原样嵌入，不在这里复验哈希：被改过的文件照实交出去，浏览器自己算出对不上
             item["b64"] = base64.b64encode(bytes(raw)).decode("ascii")

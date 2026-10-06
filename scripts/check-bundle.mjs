@@ -17,7 +17,9 @@
 //   经继续运行跑到成功的早期运行、两条出具
 //   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列），逐份断言各项结果和原因文案；在上面篡改 ④
 //   引用链（换文档、拿掉报告、多一份没人引用的工件）、⑥ 运行信息（运行结果、类别、出具档位）、拿掉被引用的口径卡、把
-//   报告文档标成遮罩、只改页面顶部的封存哈希；宽屏点开表格里右对齐的数字不被面板盖住；不执行脚本时封存哈希、运行 ID 照样看得到，状态写「尚未核对」；
+//   报告文档标成遮罩、把遮罩卡标成服务端的文件与 id 不一致或解析不出来（服务端对被改过、解析不了的遮罩卡就这么标）、
+//   只改页面顶部的封存哈希；宽屏点开表格里右对齐的数字不被面板盖住；不执行脚本时封存哈希、运行 ID 照样看得到，状态写
+//   「尚未核对」；
 // - 记录页的导出按钮（预览用例 ?syn=bundle-provenance-*，page.route 假装导出接口）：已封存时可点、下载的文件名同服务端；
 //   未封存时不可点并说明原因（左边写着「已封存」却不能点时原因写在屏幕上）；服务端回 409 时提示原因；失败结束的运行
 //   提示之后继续运行会重新封存。
@@ -675,6 +677,39 @@ await section('样本页：篡改', async () => {
     doc.masked = true
     return '报告文档去掉内容、标遮罩'
   }, (s) => [...turnsRed('artifacts')(s), ['原因写明', hasItem(s, 'artifacts', 'fail', '只有查询快照和口径卡会因遮罩不随文件附带')]])
+  // 遮罩卡在服务端被改过时，服务端照样只给 id、另标 mismatch（tests/test_bundle_masked_cards.py 守着服务端这一边）：
+  // 不能因为不嵌内容就和正常的遮罩卡一样「可核对的项全部通过」
+  await tamper(samples['masked-card'], '遮罩卡标成服务端的文件与 id 不一致', (data) => {
+    byKind(data, 'metric_set').mismatch = true
+    return '口径卡加 mismatch'
+  }, (s) => {
+    const card = s.items.find((i) => i.check === 'artifacts' && i.text.includes('口径卡'))
+    const metricNumber = s.items.find((i) => i.check === 'numbers' && i.text.includes('销售额'))
+    return [
+      ...turnsRed('artifacts', ['events', 'manifest', 'chain'])(s),
+      ['口径卡写明导出时服务端的文件与 id 不一致、可能被改过、未随文件附带', card?.result === 'fail'
+        && card.text.includes('导出时服务端的这份文件与工件 id（哈希）不一致，可能被改过') && card.text.includes('未随文件附带'),
+      card?.text],
+      ['引用这张卡的数字无法核对，写明引用的工件没有通过核对', metricNumber?.result === 'na'
+        && metricNumber.text.includes('引用的工件没有通过核对'), metricNumber?.text],
+    ]
+  })
+  // 服务端标了解析不出来、哈希又对得上的遮罩卡：照实说认不出是否含遮罩列，是正常的无法核对（同哈希一致却解析不了的
+  // 嵌入工件），不说成「含遮罩列」
+  await tamper(samples['masked-card'], '遮罩卡标成服务端解析不出来', (data) => {
+    byKind(data, 'metric_set').unparsable = true
+    return '口径卡加 unparsable'
+  }, (s) => {
+    const card = s.items.find((i) => i.check === 'artifacts' && i.text.includes('口径卡'))
+    const metricNumber = s.items.find((i) => i.check === 'numbers' && i.text.includes('销售额'))
+    return [
+      ['口径卡无法核对，写明服务端的文件无法解析、认不出是否含遮罩列', card?.result === 'na'
+        && card.text.includes('导出时服务端的这份文件无法解析，认不出是否含遮罩列'), card?.text],
+      ['引用它的数字原因同上', metricNumber?.result === 'na' && metricNumber.text.includes('认不出是否含遮罩列'),
+        metricNumber?.text],
+      ['总览照常通过', s.overall === 'pass', `${s.overall}：${s.text}`],
+    ]
+  })
   await tamper(base, '报告文档的一个字节', (data) => flipByte(byKind(data, 'report_doc')), (s) => [
     ...turnsRed('artifacts')(s),
     ['数字不予核对', s.checks.numbers === 'na' && hasItem(s, 'numbers', 'na', '所在的报告文档没有通过核对')],
