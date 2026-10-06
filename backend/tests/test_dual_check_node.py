@@ -401,9 +401,14 @@ async def test_disagreement_pauses_with_the_agreed_payload_and_card(monkeypatch,
     assert set(orig) == {"path", "value", "sql", "source", "alias"}
     assert (orig["sql"], orig["value"], orig["source"], orig["alias"]) == (BY_ORDER_DATE, 310.0, name, "Q1")
     [mine] = metric["blind"]["inputs"]
-    assert set(mine) == {"path", "value", "sql", "source", "alias", "rationale"}
+    assert set(mine) == {"path", "value", "sql", "source", "alias", "rationale", "rationale_doc"}
     assert (mine["sql"], mine["value"], mine["source"], mine["alias"]) == (RIGHT, 330.0, name, "Q1")
     assert mine["path"] == orig["path"] == "cell(nodes.fetch, 0, 'gmv')" and "330" in mine["rationale"]
+    # 理由组装成的文档：正文同 rationale，数字挂着盲算自己那次查询的格子
+    doc = mine["rationale_doc"]
+    assert doc["markdown"] == mine["rationale"] and doc["violations"] == []
+    [cited] = [seg for block in doc["blocks"] for unit in block["units"] for seg in unit["segments"] if seg.get("cite")]
+    assert cited["text"] == "330" and cited["cite"]["alias"] == "Q1"
     assert metric["original"]["value"] == 310.0 and metric["blind"]["value"] == 330.0
     assert set(metric["diff"]) == {"equivalent", "items", "fallback", "text_diff"}
     assert metric["diff"]["equivalent"] is False and metric["diff"]["fallback"] is False
@@ -414,6 +419,19 @@ async def test_disagreement_pauses_with_the_agreed_payload_and_card(monkeypatch,
     [said] = logs(evs, "dual_check_disagreed")
     assert said["metrics"] == [{"id": "gmv", "name": "销售额"}] and said["card_artifact"] == payload["card_artifact"]
     assert len([e for e in evs if e.type == "human.requested"]) == 1
+
+
+async def test_a_bare_number_in_the_blind_rationale_is_marked(monkeypatch, shop):
+    """盲算的理由里写了没有出处的数（「比上周多 20」）：对照工件里的理由文档把它标成裸数字，审批卡据此醒目标出"""
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")}, rationale="按口径说明统计，结果是 {ref}，比上周多 20。")
+    run = await start(graph(name, BY_ORDER_DATE))
+    card = artifact_store.load((await pending(run.id)).payload["card_artifact"])
+    [mine] = card["metrics"][0]["blind"]["inputs"]
+    doc = mine["rationale_doc"]
+    bare = [seg["text"] for block in doc["blocks"] for unit in block["units"] for seg in unit["segments"]
+            if seg.get("issue") == "uncited_number"]
+    assert bare == ["20"] and mine["rationale"] == doc["markdown"]
 
 
 async def test_choosing_the_original_leaves_no_gap(monkeypatch, shop, client):
@@ -436,7 +454,8 @@ async def test_choosing_the_original_leaves_no_gap(monkeypatch, shop, client):
     assert item["value"] == {"column": "order_date"} and (item["source"], item["status"]) == ("human", "confirmed")
     assert run.id in item["note"] and "复核销售额" in item["note"] and "销售额" in item["note"]
     [wrote] = logs(evs, "dual_check_catalog")
-    assert wrote["written"] == [{"source": name, "table": "orders", "item": "business_date"}] and wrote["skipped"] == []
+    assert wrote["written"] == [{"source": name, "table": "orders", "item": "business_date",
+                                 "value": {"column": "order_date"}}] and wrote["skipped"] == []
 
 
 async def test_choosing_the_blind_result_degrades_and_writes_the_catalog(monkeypatch, shop, client):
@@ -446,11 +465,23 @@ async def test_choosing_the_blind_result_degrades_and_writes_the_catalog(monkeyp
     done = await decide(client, run.id, {"gmv": "b"})
     assert done.status == "succeeded", done.error
     out = dual_output(done, await events(run.id))
-    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人选择了盲算结果"]
+    assert out["issuance_gaps"] == ["指标「销售额」两路结果不一致，审核人选择了盲算结果"]
     issuance = done.output["_issuance"]
     assert issuance["tier"] == "degraded"
-    assert issuance["gaps"] == ["双盲复算「复核销售额」：指标「销售额」双盲复算不一致，审核人选择了盲算结果"]
+    assert issuance["gaps"] == ["双盲复算「复核销售额」：指标「销售额」两路结果不一致，审核人选择了盲算结果"]
     assert (await notes_of(source_id)).notes["business_date"]["value"] == {"column": "paid_date"}
+
+
+async def test_a_dual_check_named_after_its_type_is_named_once_in_the_gap(monkeypatch, shop, client):
+    """拖进画布没改名的双盲复算：缺口读成「双盲复算：指标「销售额」两路结果不一致……」，不写两遍「双盲复算」"""
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    spec = graph(name, BY_ORDER_DATE)
+    next(n for n in spec["nodes"] if n["id"] == "dual")["data"]["label"] = "双盲复算"
+    run = await start(spec)
+    done = await decide(client, run.id, {"gmv": "neither"})
+    assert done.status == "succeeded", done.error
+    assert done.output["_issuance"]["gaps"] == ["双盲复算：指标「销售额」两路结果不一致，审核人判断两边都不对"]
 
 
 async def test_neither_degrades_and_writes_nothing(monkeypatch, shop, client):
@@ -461,7 +492,7 @@ async def test_neither_degrades_and_writes_nothing(monkeypatch, shop, client):
     assert done.status == "succeeded", done.error
     evs = await events(run.id)
     out = dual_output(done, evs)
-    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人判断两边都不对"]
+    assert out["issuance_gaps"] == ["指标「销售额」两路结果不一致，审核人判断两边都不对"]
     assert done.output["_issuance"]["tier"] == "degraded"
     assert not logs(evs, "dual_check_catalog") and await notes_of(source_id) is None
 
@@ -476,7 +507,7 @@ async def test_a_missing_choice_is_recorded_as_no_choice(monkeypatch, shop, clie
     evs = await events(run.id)
     out = dual_output(done, evs)
     assert out["choices"] == {} and "choice" not in out["metrics"][0]
-    assert out["issuance_gaps"] == ["指标「销售额」双盲复算不一致，审核人没有作出选择"]
+    assert out["issuance_gaps"] == ["指标「销售额」两路结果不一致，审核人没有作出选择"]
     [resolved] = logs(evs, "dual_check_resolved")
     assert resolved["choices"] == {} and resolved["gaps"] == out["issuance_gaps"]
     assert "没有作出选择" in resolved["message"] and "两边都不对" not in resolved["message"]
@@ -505,7 +536,7 @@ async def test_on_reject_fail_stops_the_run(monkeypatch, shop, client):
     assert done.status == "failed" and "审核人没有采用原流程的结果" in (done.error or "") and "销售额" in done.error
     evs = await events(run.id)
     assert [d["gaps"] for d in logs(evs, "dual_check_resolved")] == [
-        ["指标「销售额」双盲复算不一致，审核人选择了盲算结果"]]
+        ["指标「销售额」两路结果不一致，审核人选择了盲算结果"]]
     # 审核人的选择照样写进了目录：那是对数据的判断，和运行停不停无关
     entry = await notes_of(source_id)
     assert entry.notes["business_date"]["value"] == {"column": "paid_date"} and entry.version == 1
@@ -581,9 +612,12 @@ async def test_a_confirmed_catalog_entry_is_not_overwritten(monkeypatch, shop, c
     preview = (await pending(run.id)).payload["summary"][0]["catalog"]
     assert preview["a"]["write"] is False and "无需重复写入" in preview["a"]["reason"]
     assert preview["b"]["write"] is False and "已有人工确认过的说法「order_date」" in preview["b"]["reason"]
+    # 认出了事实、只是被目录挡下：照样说写到哪张表的哪一项、本来要写什么
+    assert {k: preview["b"][k] for k in ("source", "table", "item", "value")} == \
+        {"source": name, "table": "orders", "item": "business_date", "value": {"column": "paid_date"}}
     done = await decide(client, run.id, {"gmv": "b"})
     [wrote] = logs(await events(done.id), "dual_check_catalog")
-    assert wrote["written"] == []
+    assert wrote["written"] == [] and [s["reason"] for s in wrote["skipped"]] == [preview["b"]["reason"]]
     assert "已有人工确认过的说法「order_date」" in wrote["skipped"][0]["reason"] and "paid_date" in wrote["skipped"][0]["reason"]
     entry = await notes_of(source_id)
     assert entry.version == 1 and entry.notes["business_date"]["value"] == {"column": "order_date"}
@@ -607,17 +641,93 @@ async def test_a_rejected_filter_is_not_written_back_along_with_another_metric(m
     Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv"), "订单金额": (no_test, "total")})
     run = await start(graph(name, original, metrics=[GMV, total], dual={"definitions": {}}))
     assert run.status == "interrupted", run.error
-    said = {s["metric_id"]: s["catalog"]["b"] for s in (await pending(run.id)).payload["summary"]}
+    payload = (await pending(run.id)).payload
+    said = {s["metric_id"]: s["catalog"]["b"] for s in payload["summary"]}
     assert said["gmv"]["write"] is False and "曾被人工驳回" in said["gmv"]["reason"]
     assert said["total"]["write"] is True and said["total"]["value"] == "is_test = 0"
-    done = await decide(client, run.id, {"gmv": "b", "total": "b"})
+    # 两个指标都落到有效记录条件上：合起来的结果另有预告，和真写一致
+    choices = {"gmv": "b", "total": "b"}
+    expected = card_said(payload, choices)
+    assert expected["gmv"]["write"] is False and expected["gmv"]["reason"] == said["gmv"]["reason"]
+    assert expected["total"] == {"write": True, "value": "is_test = 0", "item": "valid_filter"}
+    done = await decide(client, run.id, choices)
     assert done.status == "succeeded", done.error
     [wrote] = logs(await events(run.id), "dual_check_catalog")
-    assert wrote["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}]
+    assert wrote["written"] == [{"source": name, "table": "orders", "item": "valid_filter", "value": "is_test = 0"}]
     assert [s["reason"] for s in wrote["skipped"]] == [said["gmv"]["reason"]]
+    await assert_written_as_said(expected, wrote, source_id)
     item = (await notes_of(source_id)).notes["valid_filter"]
     assert item["value"] == said["total"]["value"] and (item["source"], item["status"]) == ("human", "confirmed")
     assert "「订单金额」" in item["note"] and "「销售额」" not in item["note"]
+
+
+def card_said(payload: dict, choices: dict) -> dict:
+    """审批卡按这组选择会怎么预告（DualCheckApproval 的认法）：选的那一边认出了写到哪，就看按当前的选择还有哪些指标
+    落到同一项上——只有它自己时照摘要里它的预告，几个时照对照工件 catalog_joint 里这几个成员的那一条。"""
+    summary = {s["metric_id"]: s["catalog"] for s in payload["summary"]}
+    joint = artifact_store.load(payload["card_artifact"]).get("catalog_joint") or []
+
+    def where(metric_id: str, choice: str):
+        side = summary[metric_id][choice]
+        return (side["source"], side["table"], side["item"]) if "table" in side else None
+
+    out = {}
+    for metric_id, choice in choices.items():
+        if choice not in ("a", "b"):
+            continue
+        target = where(metric_id, choice)
+        peers = sorted((m, c) for m, c in choices.items() if c in ("a", "b") and target and where(m, c) == target)
+        if len(peers) < 2:
+            out[metric_id] = summary[metric_id][choice]
+            continue
+        [entry] = [e for e in joint if sorted((m["metric_id"], m["choice"]) for m in e["members"]) == peers]
+        out[metric_id] = {**entry["outcomes"][metric_id], "item": entry["item"]}
+    return out
+
+
+async def assert_written_as_said(said: dict, wrote: dict, source_id: str) -> None:
+    """预告和真写逐字一致：说会记为什么的，目录里就是那个值、日志的 written 里有它；说不记的，原因就在日志的跳过原因里"""
+    entry = await notes_of(source_id)
+    for metric_id, side in said.items():
+        if side["write"]:
+            assert any(w["item"] == side["item"] and w["value"] == side["value"] for w in wrote["written"]), \
+                (metric_id, side, wrote)
+            assert entry.notes[side["item"]]["value"] == side["value"]
+        else:
+            assert side["reason"] in [s["reason"] for s in wrote["skipped"]], (metric_id, side, wrote)
+
+
+#: 两个指标取自同一条查询的两列，都是按下单日筛的：盲算按支付日算，两个指标都只差时间列，落到 orders 的业务日期上
+TWO_BY_ORDER_DATE = (f"SELECT SUM(amount) AS gmv, SUM(amount) AS total FROM orders "
+                     f"WHERE status <> 'refunded' AND order_date {WEEK}")
+TOTAL = {**GMV, "id": "total", "name": "订单金额", "expression": "cell(nodes.fetch, 0, 'total')"}
+
+
+@pytest.mark.parametrize("choices", [
+    {"gmv": "a", "total": "b"},        # 说法不同：两个都不写
+    {"gmv": "b", "total": "b"},        # 说法一样：写一次
+    {"gmv": "a", "total": "a"},
+    {"gmv": "b", "total": "neither"},  # 只有一个落到这一项上：照它自己的预告
+])
+async def test_the_card_preview_is_what_the_decision_writes(monkeypatch, shop, client, choices):
+    """图级：两个指标都只差时间列、落到数据目录的同一项上。审批卡按当前的选择预告的（摘要里各自的预告、对照工件里
+    合起来的预告），和裁决后真写进目录的逐字一致：写的值一样，不写的原因一句不差"""
+    name, source_id = shop
+    right_total = f"SELECT SUM(amount) AS total FROM orders WHERE status <> 'refunded' AND paid_date {WEEK}"
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv"), "订单金额": (right_total, "total")})
+    run = await start(graph(name, TWO_BY_ORDER_DATE, metrics=[GMV, TOTAL], dual={"definitions": {}}))
+    assert run.status == "interrupted", run.error
+    payload = (await pending(run.id)).payload
+    card = artifact_store.load(payload["card_artifact"])
+    assert len(card["catalog_joint"]) == 4, "两个指标两边都落在业务日期上：四种组合各预告一次"
+    said = card_said(payload, choices)
+    done = await decide(client, run.id, choices)
+    assert done.status == "succeeded", done.error
+    [wrote] = logs(await events(run.id), "dual_check_catalog")
+    await assert_written_as_said(said, wrote, source_id)
+    if choices == {"gmv": "a", "total": "b"}:
+        assert not said["gmv"]["write"] and said["gmv"] == {**said["total"], "item": "business_date"}
+        assert wrote["written"] == [] and "给出了不同的说法" in said["gmv"]["reason"]
 
 
 async def test_a_metric_scope_filter_is_not_written_as_a_valid_filter(monkeypatch, shop, client):

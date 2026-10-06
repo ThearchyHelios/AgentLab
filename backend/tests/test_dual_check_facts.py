@@ -252,7 +252,8 @@ async def test_a_choice_is_written_as_a_confirmed_human_item_with_its_origin(sho
     name, source_id = shop
     out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "b", source=name)], run_id="run-42",
                                node_title="复核销售额", actor="张三")
-    assert out == {"written": [{"source": name, "table": "orders", "item": "business_date"}], "skipped": []}
+    assert out == {"written": [{"source": name, "table": "orders", "item": "business_date",
+                                "value": {"column": "paid_date"}}], "skipped": []}
     entry = await entry_of(source_id)
     item = entry.notes["business_date"]
     assert item["value"] == {"column": "paid_date"} and (item["source"], item["status"]) == ("human", "confirmed")
@@ -290,7 +291,8 @@ async def test_an_inferred_condition_both_sides_use_is_extended(shop):
     base = f"SELECT SUM(amount) AS gmv FROM orders WHERE is_test = 0 AND paid_date {WEEK}"
     out = await record_choices([candidate(base, extra("status <> 'refunded'", base), "b", source=name)],
                                run_id="run-1", node_title="复核", actor=None)
-    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}], out
+    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter",
+                              "value": "is_test = 0 AND status <> 'refunded'"}], out
     item = (await entry_of(source_id)).notes["valid_filter"]
     assert item["value"] == "is_test = 0 AND status <> 'refunded'"
     assert (item["source"], item["status"]) == ("human", "confirmed")
@@ -327,7 +329,8 @@ async def test_an_inferred_same_condition_is_confirmed(shop):
     await seed(source_id, {"valid_filter": catalog.make_item("status <> 'refunded'", "llm")})
     out = await record_choices([candidate(WITH_REFUNDS, RIGHT, "b", source=name)], run_id="run-1",
                                node_title="复核", actor=None)
-    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}]
+    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter",
+                              "value": "status <> 'refunded'"}]
     item = (await entry_of(source_id)).notes["valid_filter"]
     assert item["value"] == "status <> 'refunded'" and (item["source"], item["status"]) == ("human", "confirmed")
 
@@ -348,7 +351,8 @@ async def test_the_same_column_inferred_is_confirmed_and_keeps_its_rule(shop):
         {"column": "paid_date", "rule": "按付款成功时间", "timezone": "Asia/Shanghai"}, "profile")})
     out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "b", source=name)], run_id="run-1",
                                node_title="复核", actor=None)
-    assert out["written"] == [{"source": name, "table": "orders", "item": "business_date"}]
+    assert out["written"] == [{"source": name, "table": "orders", "item": "business_date",
+                              "value": {"column": "paid_date", "rule": "按付款成功时间", "timezone": "Asia/Shanghai"}}]
     item = (await entry_of(source_id)).notes["business_date"]
     assert item["value"] == {"column": "paid_date", "rule": "按付款成功时间", "timezone": "Asia/Shanghai"}
     assert (item["source"], item["status"]) == ("human", "confirmed")
@@ -365,7 +369,8 @@ async def test_a_rejected_item_is_not_brought_back_but_a_rejected_other_value_do
 
     out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "a", source=name)], run_id="run-2",
                                node_title="复核", actor=None)
-    assert out["written"] == [{"source": name, "table": "orders", "item": "business_date"}]
+    assert out["written"] == [{"source": name, "table": "orders", "item": "business_date",
+                              "value": {"column": "order_date"}}]
     assert (await entry_of(source_id)).notes["business_date"]["value"] == {"column": "order_date"}
 
 
@@ -394,7 +399,8 @@ async def test_complementary_valid_filters_in_one_decision_are_combined(shop):
         # 第三个指标采纳的是和第一个一样的条件：合并时不重复
         candidate(COUNT_WEEK, extra("status <> 'refunded'", COUNT_WEEK), "b", metric="订单数", source=name),
     ], run_id="run-1", node_title="复核", actor=None)
-    assert out == {"written": [{"source": name, "table": "orders", "item": "valid_filter"}], "skipped": []}
+    assert out == {"written": [{"source": name, "table": "orders", "item": "valid_filter",
+                                "value": "status <> 'refunded' AND is_test = 0"}], "skipped": []}
     entry = await entry_of(source_id)
     item = entry.notes["valid_filter"]
     assert item["value"] == "status <> 'refunded' AND is_test = 0" and entry.version == 1
@@ -410,7 +416,8 @@ async def test_combined_filters_extend_an_inferred_condition_every_adopted_side_
     both = [candidate(base, extra("status <> 'refunded'", base), "b", metric="销售额", source=name),
             candidate(base, extra("is_test = 0", base), "b", metric="订单金额", source=name)]
     out = await record_choices(both, run_id="run-1", node_title="复核", actor=None)
-    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}], out
+    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter",
+                              "value": "channel <> 'test' AND status <> 'refunded' AND is_test = 0"}], out
     assert (await entry_of(source_id)).notes["valid_filter"]["value"] == \
         "channel <> 'test' AND status <> 'refunded' AND is_test = 0"
 
@@ -437,7 +444,8 @@ async def test_a_rejected_condition_is_not_written_back_through_a_combined_decis
     assert preview(refunds, SCHEMA, notes)["b"]["write"] is False
     assert preview(tests, SCHEMA, notes)["b"]["value"] == "is_test = 0"
     out = await record_choices([refunds, tests, counted], run_id="run-1", node_title="复核", actor=None)
-    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter"}], out
+    assert out["written"] == [{"source": name, "table": "orders", "item": "valid_filter",
+                              "value": "is_test = 0"}], out
     [skipped] = out["skipped"]
     assert "「status <> 'refunded'」曾被人工驳回" in skipped["reason"] and "「销售额」、「订单数」" in skipped["reason"]
     assert "订单金额" not in skipped["reason"]
@@ -498,7 +506,8 @@ async def test_combined_filters_do_not_repeat_a_condition_already_in_the_catalog
               candidate(base, extra("is_test = 0", base), "b", metric="订单金额", source=name)]
     said = preview(picked[1], SCHEMA, {"orders": (await entry_of(source_id)).notes})
     out = await record_choices(picked, run_id="run-1", node_title="复核", actor=None)
-    assert out == {"written": [{"source": name, "table": "orders", "item": "valid_filter"}], "skipped": []}
+    assert out == {"written": [{"source": name, "table": "orders", "item": "valid_filter",
+                                "value": "status <> 'refunded' AND is_test = 0"}], "skipped": []}
     item = (await entry_of(source_id)).notes["valid_filter"]
     assert item["value"] == said["b"]["value"] == "status <> 'refunded' AND is_test = 0"
 
@@ -532,7 +541,8 @@ async def test_the_same_choice_from_two_metrics_is_written_once(shop):
     out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "b", metric="销售额", source=name),
                                 candidate(BY_ORDER_DATE, RIGHT, "b", metric="订单金额", source=name)],
                                run_id="run-1", node_title="复核", actor=None)
-    assert out == {"written": [{"source": name, "table": "orders", "item": "business_date"}], "skipped": []}
+    assert out == {"written": [{"source": name, "table": "orders", "item": "business_date",
+                                "value": {"column": "paid_date"}}], "skipped": []}
     entry = await entry_of(source_id)
     assert entry.version == 1 and "「销售额」" in entry.notes["business_date"]["note"]
     assert "「订单金额」" in entry.notes["business_date"]["note"]
@@ -579,3 +589,156 @@ async def test_a_missing_source_or_an_unrecordable_choice_is_reported(shop):
     assert out["written"] == []
     assert "数据源「no_such_source」已不存在" in out["skipped"][0]["reason"]
     assert "不止差一个方面" in out["skipped"][1]["reason"]
+
+
+# --------------------------------------------------------------------------
+# 预告和真写逐字一致：挡下的一边也说写到哪、为什么；几个指标落到同一项上按合并后的结果预告
+# --------------------------------------------------------------------------
+
+
+def test_a_side_the_catalog_blocks_still_says_where_and_why():
+    """认出了事实、只是被目录挡下（已确认、驳回过、和已有条件合不起来）的一边：照样带上写到哪张表的哪一项、本来要写
+    什么，原因和真写时跳过的原因一字不差。认不出事实的一边只有原因"""
+    confirmed = {"orders": {"business_date": catalog.make_item({"column": "order_date"}, "human", "confirmed")}}
+    said = preview(candidate(BY_ORDER_DATE, RIGHT, "a"), SCHEMA, confirmed)
+    target = {"source": "shop", "table": "orders", "item": "business_date"}
+    assert said["a"] == {"write": False, **target, "value": {"column": "order_date"},
+                         "reason": "「orders」的业务日期已是人工确认过的「order_date」，无需重复写入"}
+    assert said["b"]["write"] is False and {k: said["b"][k] for k in target} == target
+    assert said["b"]["value"] == {"column": "paid_date"} and "已有人工确认过的说法「order_date」" in said["b"]["reason"]
+    # 认不出事实（采纳的一边没有这个条件）：没有写到哪，只有原因
+    said = preview(candidate(WITH_REFUNDS, RIGHT, "a"), SCHEMA, {})
+    assert set(said["a"]) == {"write", "reason"} and said["a"]["write"] is False
+
+
+def test_the_joint_preview_covers_every_way_two_metrics_land_on_one_item():
+    """两个指标都只差时间列：各自选原流程是 order_date、选盲算是 paid_date，落到同一张表的业务日期上。四种组合各预告
+    一次：说法一样的写，说法不同的两个都不写，原因是真写时那一句"""
+    from app.engine.dual_check_facts import preview_joint
+
+    picked = [{**candidate(BY_ORDER_DATE, RIGHT, "a", metric="销售额"), "metric_id": "gmv"},
+              {**candidate(BY_ORDER_DATE, RIGHT, "a", metric="订单金额"), "metric_id": "total"}]
+    joint = preview_joint(picked, {"shop": (SCHEMA, {})})
+    by = {tuple((m["metric_id"], m["choice"]) for m in e["members"]): e for e in joint}
+    assert set(by) == {(("gmv", a), ("total", b)) for a in "ab" for b in "ab"}
+    for entry in joint:
+        assert {k: entry[k] for k in ("source", "table", "item")} == \
+            {"source": "shop", "table": "orders", "item": "business_date"}
+    assert by[(("gmv", "b"), ("total", "b"))]["outcomes"] == {
+        "gmv": {"write": True, "value": {"column": "paid_date"}},
+        "total": {"write": True, "value": {"column": "paid_date"}}}
+    split = by[(("gmv", "a"), ("total", "b"))]["outcomes"]
+    assert split["gmv"] == split["total"] and split["gmv"]["write"] is False
+    assert "给出了不同的说法" in split["gmv"]["reason"] and "「销售额」" in split["gmv"]["reason"]
+
+
+def test_the_joint_preview_screens_out_a_rejected_condition_like_the_write():
+    """驳回过「status <> 'refunded'」：两个指标并成一项时，带回驳回说法的那个拿出来不写（原因同真写），另一个照写自己的"""
+    from app.engine.dual_check_facts import preview_joint
+
+    notes = {"orders": {"valid_filter": catalog.make_item("status <> 'refunded'", "llm", "rejected")}}
+    picked = [{**candidate(SUM_WEEK, extra("status <> 'refunded'"), "b", metric="销售额"), "metric_id": "gmv"},
+              {**candidate(SUM_WEEK, extra("is_test = 0"), "b", metric="订单金额"), "metric_id": "total"}]
+    [entry] = preview_joint(picked, {"shop": (SCHEMA, notes)})
+    assert [(m["metric_id"], m["choice"]) for m in entry["members"]] == [("gmv", "b"), ("total", "b")]
+    assert entry["outcomes"]["total"] == {"write": True, "value": "is_test = 0"}
+    assert entry["outcomes"]["gmv"]["write"] is False and "曾被人工驳回" in entry["outcomes"]["gmv"]["reason"]
+
+
+def test_too_many_combinations_are_left_to_the_timeline():
+    """几个指标落到同一项上的组合太多（每个两边都落在这一项上，3 的指标数次方）：这一项不预告，审批卡回到有条件地说"""
+    from app.engine import dual_check_facts as facts
+
+    picked = [{**candidate(BY_ORDER_DATE, RIGHT, "a", metric=f"指标{i}"), "metric_id": f"m{i}"} for i in range(6)]
+    assert facts.preview_joint(picked, {"shop": (SCHEMA, {})}) == []
+    assert len(facts.preview_joint(picked[:3], {"shop": (SCHEMA, {})})) == 3 ** 3 - 1 - 3 * 2
+
+
+def test_combinations_are_counted_before_they_are_listed(monkeypatch):
+    """二十个指标都落到同一项上：组合数是 3 的二十次方量级，得先算出个数、超了就跳过，不能先列出来再比上限——
+    列一遍就要几十 GB 内存，在服务进程里算（asyncio.to_thread）会把整个服务拖死。预告时从 itertools.product 取了
+    多少个组合记下来：这一项不预告，取的不该超过上限"""
+    import itertools
+
+    from app.engine import dual_check_facts as facts
+
+    drawn = 0
+    real = itertools.product
+
+    def guarded(*iterables, **kw):
+        nonlocal drawn
+        for combo in real(*iterables, **kw):
+            drawn += 1
+            # 红的时候不至于真把内存吃光：取得比上限多出一截就停
+            assert drawn <= facts.JOINT_LIMIT + 64, "列出的组合远多于上限：没有先算个数"
+            yield combo
+
+    stem = candidate(BY_ORDER_DATE, RIGHT, "a")
+    picked = [{**stem, "metric": f"指标{i}", "metric_id": f"m{i}"} for i in range(20)]
+    monkeypatch.setattr(itertools, "product", guarded)
+    assert facts.preview_joint(picked, {"shop": (SCHEMA, {})}) == []
+    assert drawn <= facts.JOINT_LIMIT
+
+
+def test_each_item_has_its_own_limit():
+    """上限按每一项算，不是几项共用一份额度：两个数据源的业务日期各有四个指标落上来（各 72 种组合），两项都预告。
+    以前共用 JOINT_LIMIT 的额度，前一项用掉 72 种，后一项明明没超上限也被悄悄跳过"""
+    from app.engine import dual_check_facts as facts
+
+    picked = [{**candidate(BY_ORDER_DATE, RIGHT, "a", metric=f"指标{i}", source=source), "metric_id": f"{source}-{i}"}
+              for source in ("shop", "outlet") for i in range(4)]
+    joint = facts.preview_joint(picked, {"shop": (SCHEMA, {}), "outlet": (SCHEMA, {})})
+    per = 3 ** 4 - 1 - 4 * 2
+    assert per <= facts.JOINT_LIMIT < 2 * per
+    assert sorted({e["source"] for e in joint}) == ["outlet", "shop"]
+    assert len(joint) == 2 * per
+
+
+@pytest.mark.parametrize("choices", [("a", "b"), ("b", "b"), ("b", "a"), ("a", None)])
+async def test_the_joint_preview_is_what_gets_written(shop, choices):
+    """预告和真写逐字一致：按这组选择，各指标的预告（单独落一项的看 preview，几个落到同一项的看 preview_joint）说写的，
+    目录里就是那个值；说不写的，原因就在真写跳过的原因里"""
+    from app.engine.dual_check_facts import preview_joint
+
+    name, source_id = shop
+    await seed(source_id, {"valid_filter": catalog.make_item("is_test = 0", "llm")})
+    base = f"SELECT SUM(amount) AS gmv FROM orders WHERE is_test = 0 AND paid_date {WEEK}"
+    picked = [{**candidate(base, extra("status <> 'refunded'", base), "a", metric="销售额", source=name),
+               "metric_id": "gmv"},
+              {**candidate(base, extra("channel <> 'test'", base), "a", metric="订单金额", source=name),
+               "metric_id": "total"}]
+    notes = {"orders": (await entry_of(source_id)).notes}
+    singles = {c["metric_id"]: preview(c, SCHEMA, notes) for c in picked}
+    joint = preview_joint(picked, {name: (SCHEMA, notes)})
+    chosen = {c["metric_id"]: choice for c, choice in zip(picked, choices) if choice}
+    expected = said_for(chosen, singles, joint)
+    out = await record_choices([{**c, "choice": chosen[c["metric_id"]]} for c in picked if c["metric_id"] in chosen],
+                               run_id="run-1", node_title="复核", actor=None)
+    entry = await entry_of(source_id)
+    for metric_id, said in expected.items():
+        if said["write"]:
+            assert {"source": name, "table": "orders", "item": said["item"], "value": said["value"]} in out["written"]
+            assert entry.notes[said["item"]]["value"] == said["value"]
+        else:
+            assert said["reason"] in [s["reason"] for s in out["skipped"]], (metric_id, said, out)
+
+
+def said_for(chosen: dict, singles: dict, joint: list) -> dict:
+    """审批卡的认法：一个指标选的那一边认出了写到哪，就看按当前的选择还有谁落到同一项上——只有它自己时照单个指标的
+    预告，几个时照 preview_joint 里这几个成员的那一条"""
+    out = {}
+    for metric_id, choice in chosen.items():
+        side = singles[metric_id][choice]
+        if "table" not in side:
+            out[metric_id] = side
+            continue
+        where = (side["source"], side["table"], side["item"])
+        peers = sorted((m, c) for m, c in chosen.items()
+                       if "table" in singles[m][c] and (singles[m][c]["source"], singles[m][c]["table"],
+                                                        singles[m][c]["item"]) == where)
+        if len(peers) == 1:
+            out[metric_id] = side
+            continue
+        [entry] = [e for e in joint if sorted((m["metric_id"], m["choice"]) for m in e["members"]) == peers]
+        out[metric_id] = {**entry["outcomes"][metric_id], "item": entry["item"]}
+    return out

@@ -93,3 +93,9 @@ async def test_without_issuance_gaps_nothing_changes():
     issuance = row.output["_issuance"]
     assert issuance["tier"] == "formal"
     assert issuance["gaps"] == []
+
+
+async def test_a_node_named_after_its_type_is_named_once():
+    """节点名就是类型的叫法（拖进画布没改名的）：前缀只写一次「数据整形：」，不写成「数据整形「数据整形」：」"""
+    row = await finish(graph(gaps_node("recheck", "数据整形", ["两路结果不一致"])))
+    assert row.output["_issuance"]["gaps"] == ["数据整形：两路结果不一致"]

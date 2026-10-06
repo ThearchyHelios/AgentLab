@@ -10,7 +10,7 @@ import { NODE_DEFS, sourceHandles } from './nodeDefs'
 import { DENSE_EXITS, NODE_WIDTH } from './routing'
 import { LiveClock, stillClock, TeamMatrix, teamBrief, type TeamEnding } from './TeamMatrix'
 import { edgeKey, topology } from '../run/derive'
-import { exhaustedOf } from '../run/decode'
+import { exhaustedOf, splitIssuanceGaps } from '../run/decode'
 import { api } from '../api/client'
 import { isComposing, StatusBadge, toast } from '../components/ui'
 import { claimCountsOf, matchedSource } from '../lib/evidence'
@@ -898,10 +898,14 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const tier = view.at != null && issuedAt != null && view.at < issuedAt ? undefined : issuance?.tier
   const tierClass = tier === 'formal' ? 'is-formal' : tier === 'degraded' ? 'is-degraded' : tier === 'withheld' ? 'is-withheld' : ''
   const detail = issuanceDetail?.tier ? issuanceDetail : undefined
-  const gaps: string[] = Array.isArray(detail?.gaps) ? detail.gaps.map(String) : []
+  // 双盲复算、反方审稿报上来的缺口和「校验没跑全」分开说，再分查出了问题（两路不一致、结论被推翻）和没核成（无法复算）
+  const { failed: verifyFailed, unfinished: verifyUnfinished, other: gaps } =
+    splitIssuanceGaps(Array.isArray(detail?.gaps) ? detail.gaps.map(String) : [])
   const stampTitle = tier ? [
     `出具判定：${issuanceLabel(tier)}`,
     detail ? `可追溯 ${detail.matched_numbers ?? 0} 个数字 / 核对 ${detail.metrics_checked ?? 0} 个指标` : '',
+    verifyFailed.length ? `${DUAL_CHECK_TEXT.verifyGaps.failed}：${verifyFailed.join('；')}` : '',
+    verifyUnfinished.length ? `${DUAL_CHECK_TEXT.verifyGaps.unfinished}：${verifyUnfinished.join('；')}` : '',
     // 降档常常不是数字对不上，而是校验根本没跑全（叙述模板渲染为空、指标集为空）：
     // 不写出来，悬停在一个「降档出具」上看不到任何理由
     gaps.length ? `校验未全部完成：${gaps.join('；')}` : '',

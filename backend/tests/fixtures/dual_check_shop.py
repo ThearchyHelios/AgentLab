@@ -87,10 +87,11 @@ class Blind:
     没对上指标名的盲算交 null。不是盲算的调用（报告撰写）返回 writer 的正文并记下收到的消息。
     calls 记下每次盲算调用（step / final），tasks 记下盲算收到的任务原文（几个盲算同时进行时也是每个任务一条）。
     on_query：盲算第一次查库之前调用一次（比如往库里插一行，造出「两次取数之间数据变了」）。
+    rationale：盲算交的理由，{ref} 换成交的那一格的引用（缺省「按口径说明统计，结果是 {ref}。」）。
     """
 
     def __init__(self, monkeypatch, source: str, plans: dict, *, writer: str = "本周销售额见口径卡。", row: int = 0,
-                 on_query=None):
+                 on_query=None, rationale: str = "按口径说明统计，结果是 {ref}。"):
         from app.providers import mock_model
 
         self.source = source
@@ -98,6 +99,7 @@ class Blind:
         self.writer = writer
         self.row = row
         self.on_query = on_query
+        self.rationale = rationale
         self.calls: list[str] = []
         self.tasks: list[str] = []
         self.writer_prompts: list[str] = []
@@ -114,7 +116,7 @@ class Blind:
                 _, column = plan
                 alias = f"Q{len(blind.sqls(plan))}"
                 body = {"value": {"alias": alias, "row": blind.row, "column": column},
-                        "rationale": f"按口径说明统计，结果是 [[v:{alias}.r{blind.row}.{column}]]。"}
+                        "rationale": blind.rationale.format(ref=f"[[v:{alias}.r{blind.row}.{column}]]")}
                 return AIMessage(content=json.dumps(body, ensure_ascii=False))
             if model.tools:
                 blind.calls.append("step")

@@ -15,8 +15,17 @@
 //   （mode 是 input，通用那套会把一个字符串当 value 发出去），认不出指标时另给「驳回并终止」；后果按运行类别和节点的
 //   「未采用原流程时」说（payload 带了实际生效的处置就照它说，老服务端从运行的图快照里读），探索运行不提出具，读不到
 //   节点设置时有条件地说；
+// - 审批卡（期 4）：预告逐条说「会记为……」或「不会记入：原因」，原因是服务端的原话；被目录挡下的一边照样说写到哪；
+//   几个指标落到同一项上时照完整对照里服务端算好的合并预告（catalog_joint）说，和真写的一字不差（夹具的 merges 是服务端
+//   真写一遍的结果）；没有合并预告时按其余指标当前的选择推，被目录挡下的同项指标也算进来（说法不同就说都不记，说不准的
+//   只说可能），结尾换成以时间线上的记录为准；盲算的理由按核查 agent 组装的理由文档画，有出处的数字画实线、裸数字醒目
+//   标出，老工件照旧纯文本；
+// - 出具缺口：证据页（真的 EvidencePane）和成果节点印章的悬停说明把双盲复算、反方审稿报上来的缺口另起「核查未通过」
+//   「核查未完成」两组，不放在「校验未全部完成」下；
+// - 记录页的工件列表：双盲复算对照、反方审稿记录两种工件有名字和说明，不露键名；
 // - 检查器：口径卡、指标、口径说明、盲算模型、相对误差、未采用原流程时、启用，每一项都真的写进节点配置；字段的
-//   叫法和服务端校验报错里的（schema.py 的 DUAL_CHECK_FIELD_LABEL，合入后）一字不差；盲算模型不藏在高级选项里
+//   叫法和服务端校验报错里的（engine/labels.py 的 DUAL_CHECK_FIELD_LABEL）一字不差；选口径卡、盲算模型、启用三态用的是
+//   和反方审稿共用的控件（verifyFields.tsx）；盲算模型不藏在高级选项里
 //   （时间线「模型相同」那一行要能定位过来）；上游有好几张口径卡时写明必须选；「跟随设置」的当前值每次打开都重取；
 //   节点卡片的摘要写出复算哪张口径卡、几个指标；
 // - 设置页「核查」一节：读回各项，改了之后整组写 verify（不限存 null），叫法和服务端 VERIFY_SETTING_LABEL 一字不差；
@@ -24,7 +33,8 @@
 //
 // 页面都跑在预览页（/preview.html?syn=…，用例在 frontend/src/dev/fixtures/dual_check.tsx，夹具 dual_check.json 两边
 // 共用）和设置页上，接口一律 page.route 伪造：完整对照的工件、审批回复、设置的读写都在浏览器里答，别的非 GET 拦掉，
-// 不碰真实的写接口。文案对照那一节不开浏览器：读 backend/app/api/settings.py，terms.ts 借 vite 转译后直接 import。
+// 不碰真实的写接口。文案对照那一节不开浏览器：读 backend/app/api/settings.py、backend/app/engine/labels.py，terms.ts 借 vite
+// 转译后直接 import。
 //
 //   node scripts/check-verify.mjs
 // 对别的实例跑时带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-verify.mjs
@@ -126,26 +136,23 @@ await section('核查设置的叫法和服务端一字不差', async () => {
 })
 
 await section('双盲复算检查器的叫法和服务端校验报错一致', async () => {
-  // 校验问题挂在字段下方、出现在问题面板里时，报错引用的是 schema.py 的 DUAL_CHECK_FIELD_LABEL：检查器上得是同一个名字，
-  // 人才找得到是哪一项。处置的取值：报错里用短说法，下拉的选项以它开头、后面可以带一句用途（labels.py 的约定）
+  // 校验问题挂在字段下方、出现在问题面板里时，报错引用的是 labels.py 的 DUAL_CHECK_FIELD_LABEL（期 4 从 schema.py 挪过去，
+  // field_label 按节点类型也说这一套）：检查器上得是同一个名字，人才找得到是哪一项。处置的取值：报错里用短说法，下拉的
+  // 选项以它开头、后面可以带一句用途（labels.py 的约定）
   const { DUAL_CHECK_TEXT: D } = await import(await load('/src/lib/terms.ts'))
   const KEYS = ['card', 'metrics', 'definitions', 'provider', 'model', 'tolerance', 'on_reject', 'enabled']
   check('检查器的字段名按配置键放在 DUAL_CHECK_TEXT.field', KEYS.every((k) => typeof D.field?.[k] === 'string' && D.field[k]),
     KEYS.filter((k) => !D.field?.[k]).join('、'))
   check('……模型的两项照「裁判模型 · 接入」「裁判模型」的叫法', D.field.provider === '盲算模型 · 接入' && D.field.model === '盲算模型',
     `${D.field.provider} / ${D.field.model}`)
-  const py = readFileSync(`${root}backend/app/engine/schema.py`, 'utf8')
-  const block = py.match(/^DUAL_CHECK_FIELD_LABEL = \{([\s\S]*?)^\}/m)?.[1]
-  if (block == null) {
-    // 双盲复算的服务端在另一个工作包里，合入之前 schema.py 还没有这一组：合入后这一节就逐项比对
-    check('schema.py 还没有 DUAL_CHECK_FIELD_LABEL（双盲复算服务端合入后逐项比对）', true)
-    return
-  }
-  const labels = Object.fromEntries([...block.matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
+  const py = readFileSync(`${root}backend/app/engine/labels.py`, 'utf8')
+  const block = py.match(/^DUAL_CHECK_FIELD_LABEL: dict\[str, str\] = \{([\s\S]*?)^\}/m)?.[1]
+  check('从 labels.py 读出了 DUAL_CHECK_FIELD_LABEL', block != null)
+  const labels = Object.fromEntries([...(block ?? '').matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
   const wrong = KEYS.filter((k) => labels[k] !== D.field[k])
   check('每个字段的叫法和 DUAL_CHECK_FIELD_LABEL 一字不差', !wrong.length && Object.keys(labels).length === KEYS.length,
     wrong.map((k) => `${k}：${D.field[k]} ≠ ${labels[k]}`).join('；'))
-  const opts = py.match(/^DUAL_CHECK_ON_REJECT_LABEL = \{([^}]*)\}/m)?.[1] ?? ''
+  const opts = py.match(/^DUAL_CHECK_ON_REJECT_LABEL: dict\[str, str\] = \{([^}]*)\}/m)?.[1] ?? ''
   const short = Object.fromEntries([...opts.matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
   check('「未采用原流程时」的选项以服务端的短说法开头', Object.keys(short).length === 2
     && Object.entries(short).every(([k, v]) => D.onReject?.[k]?.startsWith(v)), JSON.stringify(short))
@@ -305,7 +312,22 @@ await section('审批卡：并排对照与高亮（服务端真实的差异输�
   const no = await gmv.locator('[data-dual-norm="original"]').boundingBox()
   const nb = await gmv.locator('[data-dual-norm="blind"]').boundingBox()
   check('……规范化后的两栏也左右并排', !!no && !!nb && Math.abs(no.y - nb.y) < 2 && nb.x >= no.x + no.width - 1, JSON.stringify({ no, nb }))
-  check('盲算的说明', (await text(gmv.locator('[data-dual-rationale]'))).includes('销售额按下单时间统计本周全部订单金额之和'))
+  // 盲算的说明按核查 agent 组装的理由文档画（夹具里是 compose_doc 的真实输出）：有出处的数字照证据画实线、挂盲算自己的
+  // 查询编号，裸数字画点状线、句末挂「无证据」，下面再醒目地说一句；退款率的输入是老工件，没有理由文档，照旧纯文本
+  const why = gmv.locator('[data-dual-rationale="doc"]')
+  check('盲算的说明按理由文档画', await why.count() === 1 && (await text(why)).includes('销售额按下单时间 created_at 归属到当周')
+    && (await text(why)).includes('51,388.3'), await text(why))
+  const cite = why.locator('[data-challenge-cite="Q1"]')
+  check('……有出处的数字画实线、挂查询编号，不是按钮（没有可跳的查询）', await cite.count() === 1
+    && (await cite.getAttribute('data-ev-line')) === 'solid' && (await cite.evaluate((el) => el.tagName)) === 'SPAN'
+    && (await cite.locator('sup').innerText()).trim() === 'Q1' && (await cite.getAttribute('title') ?? '').includes('Q1'), await cite.getAttribute('title'))
+  const bare = await why.locator('.ev-mark[data-ev-state="none"]').allInnerTexts()
+  check('……裸数字画点状线、挂「无证据」', JSON.stringify(bare.map((t) => t.replace(/\s*（无证据）$/, ''))) === '["1200"]'
+    && (await why.locator('[data-ev-tag="none"]').innerText()).includes('无证据'), JSON.stringify(bare))
+  check('……下面醒目地说一句没有出处', (await text(why.locator('[data-dual-rationale-bare]'))) === '理由中标出的数字没有引用盲算自己的查询结果，无法核对出处')
+  const plain = metric(page, 'refund_rate').locator('[data-dual-rationale="text"]')
+  check('老工件没有理由文档：照旧显示纯文本', await plain.count() === 1 && (await text(plain)) === '盲算的说明：退款笔数：订单表中能找到对应订单的退款记录数',
+    await plain.count() ? await text(plain) : '没有')
   check('输入取值：路径、两边的值', (await text(gmv.locator('[data-dual-input="vars.kpi.gmv"]'))).includes('45,678.5')
     && (await text(gmv.locator('[data-dual-input="vars.kpi.gmv"]'))).includes('51,388.3'))
   const rr = metric(page, 'refund_rate')
@@ -438,14 +460,26 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
 })
 
 /**
- * 一块里预告的三句：{a, b, neither} → {text, write, current, conflict, joined}。conflict：同一次裁决里别的指标对同一项
- * 说法不同、都不记；joined：有效记录条件要和别的指标的合成一句
+ * 一块里预告的三条：{a, b, neither} → {text, write, current, reason, joint, together, conflict, joined, pending, inferred}。
+ * reason：不写、照服务端的原话说原因；joint：照完整对照里服务端算好的合并预告说；together：和别的指标一起记入；
+ * conflict、joined、pending：没有合并预告时按其余指标当前的选择推的（说法不同都不记、有效记录条件合成一句、同项上有
+ * 被挡下的指标说不准只说可能）；inferred：这一条是推出来的
  */
 const previewClauses = (loc) => loc.evaluate((el) => Object.fromEntries([...el.querySelectorAll('[data-dual-catalog="preview"] [data-dual-catalog-side]')]
   .map((s) => [s.dataset.dualCatalogSide, {
     text: s.textContent.trim(), write: s.dataset.write != null, current: s.dataset.current != null, weight: Number(getComputedStyle(s).fontWeight),
-    conflict: s.dataset.conflict != null, joined: s.dataset.joined != null,
+    reason: s.dataset.reason != null, joint: s.dataset.joint != null, together: s.dataset.together != null,
+    conflict: s.dataset.conflict != null, joined: s.dataset.joined != null, pending: s.dataset.pending != null,
+    inferred: s.dataset.inferred != null,
   }])))
+/** 一块预告的结尾：{kind: exact（照服务端算好的说）| inferred（有推出来的）, text} */
+const previewTail = async (loc) => {
+  const tail = loc.locator('[data-dual-catalog-tail]')
+  return { kind: await tail.getAttribute('data-dual-catalog-tail'), text: await text(tail) }
+}
+/** 不写的一条：选择的叫法加服务端的原话 */
+const blockedText = (label, reason) => `${label}时不会记入：${reason}`
+const CHOICE_LABEL = { a: '采用原流程的结果', b: '采用盲算的结果', neither: '两边都不对' }
 
 await section('审批卡：服务端预告了写目录时照它说，当前选的那一句加重', async () => {
   // payload.summary[].catalog（约定之外、服务端另带的）：采用原流程、采用盲算各会往数据目录里写什么，和裁决后真写的
@@ -463,9 +497,10 @@ await section('审批卡：服务端预告了写目录时照它说，当前选�
   const gmv = metric(base.page, 'gmv')
   check('完整对照还没到：已照预告说', (await base.page.locator('[data-dual-check]').getAttribute('data-state')) === 'loading')
   let c = await previewClauses(gmv)
-  check('两边换了时间列：采用原流程记原流程那一列', c.a?.text === '采用原流程的结果时，「orders」（shop）的业务日期记为「paid_at」' && c.a.write, c.a?.text)
-  check('……采用盲算记盲算那一列（同一项，省掉哪张表的哪一项）', c.b?.text === '采用盲算的结果时记为「created_at」' && c.b.write, c.b?.text)
+  check('两边换了时间列：采用原流程会记为原流程那一列', c.a?.text === '采用原流程的结果时，「orders」（shop）的业务日期会记为「paid_at」' && c.a.write, c.a?.text)
+  check('……采用盲算会记为盲算那一列（同一项，省掉哪张表的哪一项）', c.b?.text === '采用盲算的结果时会记为「created_at」' && c.b.write, c.b?.text)
   check('……两边都不对时不记', c.neither?.text === '两边都不对时不记' && !c.neither.write, c.neither?.text)
+  check('……三个选择逐条分行列出', await gmv.locator('[data-dual-catalog="preview"] li[data-dual-catalog-side]').count() === 3)
   const said = await text(gmv.locator('[data-dual-catalog]'))
   check('……开头说记入数据目录，结尾说以时间线为准，不再用有条件的说法', said.startsWith('记入数据目录：') && said.includes('人工确认')
     && said.includes('时间线') && !said.includes('仅当'), said)
@@ -499,18 +534,19 @@ await section('审批卡：服务端预告了写目录时照它说，当前选�
     } else {
       const got = await previewClauses(m)
       const ok = ['a', 'b'].every((s) => (expect[s].write
-        ? got[s]?.write && got[s].text.includes(LABEL[expect[s].item]) && got[s].text.includes(`记为「${previewValue(expect[s].value)}」`)
-        : !got[s]?.write && got[s]?.text.endsWith('时不记')))
-      check(`${what}：写的一边说清写到哪、写成什么，不写的一边说不记`, ok, `${got.a?.text} ‖ ${got.b?.text}`)
+        ? got[s]?.write && got[s].text.includes(LABEL[expect[s].item]) && got[s].text.includes(`会记为「${previewValue(expect[s].value)}」`)
+        : !got[s]?.write && got[s]?.reason && got[s].text === blockedText(CHOICE_LABEL[s], expect[s].reason)))
+      check(`${what}：写的一边说清写到哪、会记为什么，不写的一边照服务端的原话说不会记入的原因`, ok, `${got.a?.text} ‖ ${got.b?.text}`)
       if (name === 'dedup') {
         // 采用去重的原流程记去重规则，采用不去重的盲算不记：两种选择分别看加重的那一句
         await m.locator('label', { hasText: '采用原流程的结果' }).click()
         let cur = await previewClauses(m)
-        check('只差去不去重，选原流程（去重）：加重的那一句说记为去重规则', cur.a.current
-          && cur.a.text === '采用原流程的结果时，「orders」（shop）的去重规则记为「对 user_id 计数时去重」', cur.a.text)
+        check('只差去不去重，选原流程（去重）：加重的那一条说会记为去重规则', cur.a.current
+          && cur.a.text === '采用原流程的结果时，「orders」（shop）的去重规则会记为「对 user_id 计数时去重」', cur.a.text)
         await m.locator('label', { hasText: '采用盲算的结果' }).click()
         cur = await previewClauses(m)
-        check('……选盲算（不去重）：加重的那一句说不记', cur.b.current && cur.b.text === '采用盲算的结果时不记' && !cur.a.current, cur.b.text)
+        check('……选盲算（不去重）：加重的那一条说不会记入、为什么', cur.b.current && cur.b.reason
+          && cur.b.text === blockedText('采用盲算的结果', expect.b.reason) && cur.b.text.includes('不去重是这个指标自己的算法') && !cur.a.current, cur.b.text)
       }
     }
     check(`${what}：页面没有报错`, errors.length === 0, errors.join('；'))
@@ -558,12 +594,43 @@ await section('审批卡：服务端预告了写目录时照它说，当前选�
   }
 })
 
-await section('审批卡：同一次裁决里几个指标落到数据目录的同一项上，按其余指标当前的选择说', async () => {
+await section('审批卡：被数据目录挡下的一边照样说写到哪、不会记入的原因照服务端的原话说', async () => {
+  // 目录里已有人工确认的业务日期（夹具 catalog_blocked：服务端按那时的目录算的真实预告）：两边都认出了事实、都被目录
+  // 挡下。以前预告只给 {write: false}，卡上一句「不记」，看不出是因为目录里已经有了；现在逐条说「不会记入：原因」，
+  // 原因和裁决后时间线上跳过的原因一字不差（test_dual_check_node 的图级测试核对）
+  const said = fx.catalog_blocked.catalog
+  check('夹具：两边都被挡下，各带写到哪和原因', ['a', 'b'].every((s) => said[s].write === false && said[s].table === 'orders'
+    && said[s].item === 'business_date' && !!said[s].reason), JSON.stringify(said))
+  const { page, errors } = await preview('dual-check-approval', { query: 'catalog=blocked' })
+  await page.waitForSelector('[data-dual-check][data-state="ready"]')
+  const gmv = metric(page, 'gmv')
+  const c = await previewClauses(gmv)
+  check('采用原流程：说不会记入，原因是服务端的原话（已是人工确认过的同一列）', c.a?.text === blockedText(CHOICE_LABEL.a, said.a.reason)
+    && c.a.reason && !c.a.write && c.a.text.includes('无需重复写入'), c.a?.text)
+  check('……采用盲算：同样照原话说（已有不同的说法，未覆盖）', c.b?.text === blockedText(CHOICE_LABEL.b, said.b.reason)
+    && c.b.reason && !c.b.write && c.b.text.includes('未覆盖'), c.b?.text)
+  check('……两边都不对时不记', c.neither?.text === '两边都不对时不记' && !c.neither.write, c.neither?.text)
+  check('……三条都没有「会记为」', !Object.values(c).some((x) => x.text.includes('会记为')), JSON.stringify(c))
+  await gmv.locator('label', { hasText: '采用盲算的结果' }).click()
+  const cur = await previewClauses(gmv)
+  check('选盲算：加重的是「不会记入」那一条', cur.b?.current && cur.b.weight >= 500 && !cur.a.current, JSON.stringify(cur.b))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+  for (const theme of ['dark', 'light']) {
+    const narrow = await preview('dual-check-approval', { query: 'catalog=blocked', width: 390, height: 844, theme })
+    await narrow.page.waitForSelector('[data-dual-check][data-state="ready"]')
+    const w = await narrow.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    check(`390px（${theme}）：原因很长也不横向溢出`, w <= 0, `${w}px`)
+    await shot(narrow.page, `approval-blocked-narrow-${theme}`)
+  }
+})
+
+await section('审批卡：几个指标落到同一项上、工件里没有合并预告（老服务端）时，按其余指标当前的选择推', async () => {
   // 预告是每个指标单独算的，服务端写目录前却把同一次裁决里落到同一张表同一项上的说法归拢（dual_check_facts._merged）：
   // 业务日期、去重规则说法不同的一项都不写，有效记录条件用 AND 合成一句写。两个指标分开选时卡上要是各自加粗说
   // 「记为……」，审核人会以为同一张表要记两个业务日期，可能为了避开它把本该分开的选择改成一致（2026-10 第 3 轮复核）。
   // 卡上按其余指标当前的选择说，选择变了说法跟着变。夹具 merges 是这几种组合在服务端真写一遍的结果
-  // （test_dual_check_fixture.py 用 record_choices 核对），peers 换掉「退款率」，和「销售额」落到同一项上
+  // （test_dual_check_fixture.py 用 record_choices 核对），peers 换掉「退款率」，和「销售额」落到同一项上。这一节的工件
+  // 不带服务端算好的合并预告（catalog_joint，期 4 起才有）：卡上照旧规矩推；带了的见下一节
   const LABEL = { a: '采用原流程的结果', b: '采用盲算的结果', neither: '两边都不对' }
   const open = async (name, opts = {}) => {
     const m = fx.merges[name]
@@ -584,11 +651,11 @@ await section('审批卡：同一次裁决里几个指标落到数据目录的�
   check('夹具：分开选时服务端一项都不写（record_choices 的真实结果）', fx.merges.time_split.written.length === 0)
   const { page, errors } = await open('time_split')
   let g = await previewClauses(metric(page, 'gmv'))
-  check('还没选：退款率没有选择，销售额照自己的预告说', g.a?.text === '采用原流程的结果时，「orders」（shop）的业务日期记为「paid_at」'
+  check('还没选：退款率没有选择，销售额照自己的预告说', g.a?.text === '采用原流程的结果时，「orders」（shop）的业务日期会记为「paid_at」'
     && g.a.write && !g.a.conflict, g.a?.text)
   await choose(page, 'gmv', 'a')
   let r = await previewClauses(metric(page, 'refund_rate'))
-  check('销售额选了原流程：退款率选原流程（同一列）照常记', r.a?.text === '采用原流程的结果时，「orders」（shop）的业务日期记为「paid_at」'
+  check('销售额选了原流程：退款率选原流程（同一列）照常记', r.a?.text === '采用原流程的结果时，「orders」（shop）的业务日期会记为「paid_at」'
     && r.a.write && !r.a.conflict, r.a?.text)
   check('……退款率选盲算（另一列）说清和销售额说法不同、都不记，不再说「记为」', !!r.b?.conflict && !r.b.write
     && r.b.text.includes('「销售额」') && r.b.text.endsWith('都不记') && !r.b.text.includes('记为'), r.b?.text)
@@ -601,11 +668,15 @@ await section('审批卡：同一次裁决里几个指标落到数据目录的�
   check('……退款率那一句是同一项，不再重复写表名', cur.refund_rate?.text === '采用盲算的结果时与「销售额」的选择说法不同，都不记',
     cur.refund_rate?.text)
   g = await previewClauses(metric(page, 'gmv'))
-  check('……销售额那一块里，改选盲算（和退款率同一列）的那一句照常说记', g.b?.text === '采用盲算的结果时记为「created_at」'
+  check('……销售额那一块里，改选盲算（和退款率同一列）的那一句照常说记', g.b?.text === '采用盲算的结果时会记为「created_at」'
     && g.b.write && !g.b.conflict, g.b?.text)
   const note = await text(metric(page, 'gmv').locator('[data-dual-catalog]'))
   check('……结尾说清预告按各指标当前的选择算，「人工确认」说的是写入的项', note.includes('各指标当前的选择')
     && note.includes('写入的项记为人工确认的事实') && !note.includes('不记。记为'), note)
+  const tail = await previewTail(metric(page, 'gmv'))
+  check('……推出来的：结尾不说只有目录被改了才会不一致，说实际写入以时间线上的记录为准', tail.kind === 'inferred'
+    && tail.text.includes('推断') && tail.text.endsWith('实际写入以时间线上的记录为准') && !tail.text.includes('审批期间数据目录有改动时'),
+    `${tail.kind} / ${tail.text}`)
   // 退款率改选两边都不对：不再落到同一项上，销售额照常记
   await choose(page, 'refund_rate', 'neither')
   g = await previewClauses(metric(page, 'gmv'))
@@ -638,9 +709,45 @@ await section('审批卡：同一次裁决里几个指标落到数据目录的�
   const merged = fx.merges.filters.written[0]?.value ?? ''
   check('夹具：服务端把两边的条件合成一句写', own.gmv !== own.refund_rate && merged.includes(own.gmv) && merged.includes(own.refund_rate), merged)
   check('有效记录条件不同：两边加粗的那一句都说记、并和另一个指标采用的条件合成一句',
-    cur.gmv?.text === `采用原流程的结果时，「orders」（shop）的有效记录条件记为「${own.gmv}」，与「退款率」采用的条件用 AND 合成一句`
-    && cur.refund_rate?.text === `采用原流程的结果时，「orders」（shop）的有效记录条件记为「${own.refund_rate}」，与「销售额」采用的条件用 AND 合成一句`
+    cur.gmv?.text === `采用原流程的结果时，「orders」（shop）的有效记录条件会记为「${own.gmv}」，与「退款率」采用的条件用 AND 合成一句`
+    && cur.refund_rate?.text === `采用原流程的结果时，「orders」（shop）的有效记录条件会记为「${own.refund_rate}」，与「销售额」采用的条件用 AND 合成一句`
     && cur.gmv.write && cur.gmv.joined && cur.refund_rate.write && cur.refund_rate.joined, `${cur.gmv?.text} ‖ ${cur.refund_rate?.text}`)
+
+  // 被目录挡下的同项指标也算进来（2026-10 复核）：目录里人工驳回过业务日期 created_at（夹具 time_rejected）。销售额采用
+  // 原流程（paid_at，单独看会写），退款率采用盲算（created_at，单独看被驳回挡下，但带着写到哪）。服务端先归拢：说法不同，
+  // 一项都不写，轮不到对目录。以前只看会写的同伴，销售额照样加粗说「会记为 paid_at」
+  const tr = fx.merges.time_rejected
+  check('夹具：退款率那一边被驳回挡下、带着写到哪，销售额那一边单独看会写，服务端一项都不写',
+    tr.catalog.refund_rate.b.write === false && tr.catalog.refund_rate.b.table === 'orders' && tr.catalog.gmv.a.write === true
+    && tr.written.length === 0, JSON.stringify(tr.catalog))
+  const rj = await preview('dual-check-approval', {
+    query: `merge=time_rejected&peer=${tr.refund_rate}`, artifact: cardWith(tr.gmv, { peer: tr.refund_rate }),
+  })
+  await rj.page.waitForSelector('[data-dual-check][data-state="ready"]')
+  await chooseAll(rj.page, 'time_rejected')
+  cur = await current(rj.page)
+  check('……两边加粗的那一句都说说法不同、都不记，销售额不再说「会记为」', ['gmv', 'refund_rate'].every((id) => cur[id]?.conflict
+    && !cur[id].write && cur[id].inferred && !cur[id].text.includes('会记为')), JSON.stringify(cur))
+  check('……退款率被挡下的那一句照归拢的结果说（和销售额说法不同），不照它单独的驳回原因说',
+    cur.refund_rate?.text === '采用盲算的结果时与「销售额」的选择说法不同，都不记', cur.refund_rate?.text)
+  const rjTail = await previewTail(metric(rj.page, 'gmv'))
+  check('……结尾换成实际写入以时间线上的记录为准', rjTail.kind === 'inferred' && rjTail.text.endsWith('实际写入以时间线上的记录为准'), rjTail.text)
+
+  // 有效记录条件、同项上有被挡下的指标（夹具 filters_rejected：销售额采纳的条件曾被驳回）：挡下它的若是驳回，服务端
+  // 拿掉它、退款率照写；若是别的原因（和已有条件合不起来），退款率也一起挡下。卡上认不出是哪一种，退款率那一句只说可能
+  const fr = fx.merges.filters_rejected
+  const fp = await preview('dual-check-approval', {
+    query: `merge=filters_rejected&peer=${fr.refund_rate}&variant=${fr.gmv}`, artifact: cardWith(fr.gmv, { peer: fr.refund_rate }),
+  })
+  await fp.page.waitForSelector('[data-dual-check][data-state="ready"]')
+  await chooseAll(fp.page, 'filters_rejected')
+  cur = await current(fp.page)
+  check('有效记录条件、同项上有被挡下的：退款率说可能记为自己的条件、也可能不记，不说定了「会记为」', !!cur.refund_rate?.pending
+    && !cur.refund_rate.write && cur.refund_rate.inferred && cur.refund_rate.text === '采用原流程的结果时，「orders」（shop）的有效记录条件'
+      + `可能记为「${fr.catalog.refund_rate.a.value}」，也可能不记：要与「销售额」的选择合起来才能确定`, cur.refund_rate?.text)
+  check('……销售额（被驳回挡下）照它的原因说不会记入，和服务端一致（确实没写）', !!cur.gmv?.reason && !cur.gmv.write
+    && cur.gmv.text === blockedText(CHOICE_LABEL.a, fr.catalog.gmv.a.reason)
+    && !fr.written.some((w) => w.value === fr.catalog.gmv.a.value), cur.gmv?.text)
 
   // 窄屏：说法不同的那一句更长，也不撑宽
   for (const theme of ['dark', 'light']) {
@@ -649,6 +756,118 @@ await section('审批卡：同一次裁决里几个指标落到数据目录的�
     const w = await narrow.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
     check(`390px（${theme}）：说法不同的那一句不横向溢出`, w <= 0, `${w}px`)
     await shot(narrow.page, `approval-merge-narrow-${theme}`)
+  }
+})
+
+await section('审批卡：几个指标落到同一项上时，照完整对照里服务端算好的合并预告说，和真写的一字不差', async () => {
+  // 期 4：服务端把同一次裁决里落到同一项上的每种选择组合按真写的办法算好（dual_check_facts.preview_joint：归拢、拿掉
+  // 驳回过的、对目录），放进完整对照的 catalog_joint。卡上按各指标当前的选择取对应的那一条：会写的说合起来的值、和哪几个
+  // 指标一起记入，不写的照服务端的原话说原因。夹具 merges 的 catalog、joint 是服务端按那一组合的目录算的真实输出，
+  // written 是服务端按那一组选择真写一遍（record_choices）的结果，test_dual_check_fixture.py 核对两者逐字一致
+  const open = async (name, opts = {}) => {
+    const m = fx.merges[name]
+    const query = [`merge=${name}`, `peer=${m.refund_rate}`, ...(m.gmv ? [`variant=${m.gmv}`] : [])].join('&')
+    const base = cardWith(m.gmv, { peer: m.refund_rate })
+    const artifact = async () => {
+      const out = await base()
+      out.json.content.catalog_joint = m.joint
+      return out
+    }
+    const out = await preview('dual-check-approval', { query, artifact, ...opts })
+    await out.page.waitForSelector('[data-dual-check][data-state="ready"]')
+    return out
+  }
+  const choose = (page, id, c) => metric(page, id).locator('label', { hasText: CHOICE_LABEL[c] }).click()
+  const NAME = { gmv: '销售额', refund_rate: '退款率' }
+  const current = async (page) => Object.fromEntries(await Promise.all(['gmv', 'refund_rate'].map(async (id) => (
+    [id, Object.values(await previewClauses(metric(page, id))).find((x) => x.current) ?? null]))))
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+
+  for (const [name, m] of Object.entries(fx.merges)) {
+    const { page, errors } = await open(name)
+    for (const [id, c] of Object.entries(m.choices)) await choose(page, id, c)
+    const cur = await current(page)
+    const [entry] = m.joint.filter((e) => e.members.length === 2 && e.members.every((x) => m.choices[x.metric_id] === x.choice))
+    const wrong = []
+    for (const id of ['gmv', 'refund_rate']) {
+      const said = entry?.outcomes?.[id]
+      const c = cur[id]
+      const other = NAME[id === 'gmv' ? 'refund_rate' : 'gmv']
+      const ok = !!said && !!c?.joint && !c.conflict && !c.joined && c.weight >= 500 && (said.write
+        // 会写的：值是合起来的那个，就是真写进去的；另一个指标也写时说一起记入
+        ? c.write && c.text.includes(`会记为「${previewValue(said.value)}」`)
+          && m.written.some((w) => w.item === entry.item && same(w.value, said.value))
+          && (entry.outcomes[id === 'gmv' ? 'refund_rate' : 'gmv'].write
+            ? c.together && c.text.endsWith(`，与「${other}」的选择一起记入`) : !c.together)
+        // 不写的：照服务端的原话说原因，也确实没写进去
+        : !c.write && c.reason && c.text === blockedText(CHOICE_LABEL[m.choices[id]], said.reason)
+          && !m.written.some((w) => w.item === entry.item && same(w.value, said.value)))
+      if (!ok) wrong.push(`${id}：${c?.text}（服务端 ${JSON.stringify(said)}）`)
+    }
+    check(`${name}：两个指标当前的那一条和服务端算好的合并结果、真写的结果一致`, !!entry && !wrong.length, wrong.join('；'))
+    // 反过来：真写进去的每一项，卡上都有指标说「会记为」它
+    const told = Object.values(cur).filter((c) => c?.write).map((c) => c.text)
+    check(`${name}：真写进去的每一项卡上都说了会记为什么`, m.written.every((w) => told.some((t) => t.includes(`会记为「${previewValue(w.value)}」`))),
+      `${JSON.stringify(m.written)} ‖ ${told.join(' ‖ ')}`)
+    check(`${name}：页面没有报错`, errors.length === 0, errors.join('；'))
+  }
+
+  // 分开选（业务日期说法不同）：两边都照服务端的原话说不会记入；选择一变，说法跟着换成那一组合的结果
+  const { page, errors } = await open('time_split')
+  for (const [id, c] of Object.entries(fx.merges.time_split.choices)) await choose(page, id, c)
+  let cur = await current(page)
+  const exact = await previewTail(metric(page, 'gmv'))
+  check('照服务端算好的合并结果说：结尾只说审批期间目录有改动时以时间线为准，不说是推断的', exact.kind === 'exact'
+    && exact.text.includes('审批期间数据目录有改动时') && !exact.text.includes('推断')
+    && !Object.values(cur).some((c) => c?.inferred), `${exact.kind} / ${exact.text}`)
+  check('分开选：两边都说不会记入、写明给出了不同的说法', ['gmv', 'refund_rate'].every((id) => cur[id]?.reason
+    && cur[id].text.includes('给出了不同的说法') && cur[id].text.includes('都未写入数据目录')), JSON.stringify(cur))
+  await choose(page, 'refund_rate', 'a')
+  cur = await current(page)
+  check('退款率改选原流程（同一列）：两边都说会记为「paid_at」，并和对方一起记入',
+    cur.gmv?.text === '采用原流程的结果时，「orders」（shop）的业务日期会记为「paid_at」，与「退款率」的选择一起记入'
+    && cur.refund_rate?.text === '采用原流程的结果时，「orders」（shop）的业务日期会记为「paid_at」，与「销售额」的选择一起记入',
+    `${cur.gmv?.text} ‖ ${cur.refund_rate?.text}`)
+  const all = await previewClauses(metric(page, 'gmv'))
+  check('……没选的那一条（销售额采用盲算）按那一组合说：和退款率说法不同，不会记入', all.b?.joint && all.b.reason && !all.b.write
+    && all.b.text.startsWith('采用盲算的结果时不会记入：') && all.b.text.includes('给出了不同的说法'), all.b?.text)
+  await choose(page, 'refund_rate', 'neither')
+  cur = await current(page)
+  check('退款率改选两边都不对：不再落到同一项上，销售额回到自己的预告', cur.gmv?.write && !cur.gmv.joint && !cur.gmv.together
+    && cur.gmv.text === '采用原流程的结果时，「orders」（shop）的业务日期会记为「paid_at」', cur.gmv?.text)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+
+  // 驳回过的说法：拿出来不写，另一个指标照写，各自照服务端的结果说
+  const rej = await open('filters_rejected')
+  for (const [id, c] of Object.entries(fx.merges.filters_rejected.choices)) await choose(rej.page, id, c)
+  cur = await current(rej.page)
+  check('驳回过的条件：销售额说不会记入（曾被人工驳回），退款率说会记为自己的条件、不说一起记入',
+    !!cur.gmv?.reason && cur.gmv.text.includes('曾被人工驳回') && cur.refund_rate?.write && !cur.refund_rate.together
+    && cur.refund_rate.text === `采用原流程的结果时，「orders」（shop）的有效记录条件会记为「${fx.merges.filters_rejected.written[0]?.value}」`,
+    `${cur.gmv?.text} ‖ ${cur.refund_rate?.text}`)
+
+  // 工件里的合并预告认不出：这一项回到按其余指标的选择推，不替服务端编
+  const broken = await preview('dual-check-approval', {
+    query: `merge=time_split&peer=${fx.merges.time_split.refund_rate}`,
+    artifact: async () => {
+      const out = await cardWith(null, { peer: fx.merges.time_split.refund_rate })()
+      out.json.content.catalog_joint = [{ table: 'orders', item: 'business_date', members: [{ metric_id: 'gmv' }], outcomes: 'x' }]
+      return out
+    },
+  })
+  await broken.page.waitForSelector('[data-dual-check][data-state="ready"]')
+  for (const [id, c] of Object.entries(fx.merges.time_split.choices)) await choose(broken.page, id, c)
+  cur = await current(broken.page)
+  check('合并预告认不出：回到按其余指标的选择推（说法不同、都不记）', !!cur.gmv?.conflict && !cur.gmv.joint && !!cur.refund_rate?.conflict,
+    `${cur.gmv?.text} ‖ ${cur.refund_rate?.text}`)
+  check('……页面没有报错', broken.errors.length === 0, broken.errors.join('；'))
+
+  for (const theme of ['dark', 'light']) {
+    const narrow = await open('time_split', { width: 390, height: 844, theme })
+    for (const [id, c] of Object.entries(fx.merges.time_split.choices)) await choose(narrow.page, id, c)
+    const w = await narrow.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    check(`390px（${theme}）：合并预告的原因很长也不横向溢出`, w <= 0, `${w}px`)
+    await shot(narrow.page, `approval-joint-narrow-${theme}`)
   }
 })
 
@@ -879,6 +1098,87 @@ await section('审批卡：390px 不横向溢出、窄栏里上下排、深浅�
   await shot(rail.page, 'approval-rail-dark')
 })
 
+await section('出具缺口：证据页、成果节点的印章把核查报上来的缺口另起两组，不放在「校验未全部完成」下', async () => {
+  // 双盲复算、反方审稿报上来的缺口（出具契约加了「双盲复算「节点名」：」「反方审稿：」的前缀）以前和「叙述模板渲染为空」
+  // 一起列在「校验未全部完成」下。证据页（真的 EvidencePane）在出具横幅下面另起「核查未通过」（两路不一致、结论被推翻）
+  // 「核查未完成」（无法复算）两组，横幅里只留校验没做完的；成果节点印章的悬停说明同样分组、同样的先后。用例
+  // verify-gaps（dev/fixtures/dual_check.tsx）：缺口的先后照服务端，核查的和别的混在一起；证据图、审计接口在这里伪造
+  const RUN = 'run-verify-gaps'
+  const FAILED = ['双盲复算「复核周报口径」：指标「销售额」两路结果不一致，审核人选择了盲算结果', '反方审稿：推翻了 1 句结论：「东区增长主要来自新客」']
+  const UNFINISHED = ['双盲复算「复核周报口径」：指标「订单数」无法复算：输入来自合并查询，无法单独复算']
+  const OTHER = ['叙述模板渲染为空（路径可能有误）']
+  const extra = async (req, url) => {
+    if (url.pathname === `/api/runs/${RUN}/evidence`) {
+      return { json: { run_id: RUN, mode: 'none', note: '这次运行没有报告文档', seal: { sealed: true, ok: true, manifest_seq: 7 } } }
+    }
+    if (url.pathname === `/api/runs/${RUN}/evidence/audit`) return { status: 404, json: { detail: 'Not Found' } }
+    return null
+  }
+  const items = (els) => els.map((el) => el.textContent.replace(/^·\s*/, '').trim())
+  for (const [width, theme] of [[1280, 'dark'], [390, 'dark'], [390, 'light']]) {
+    const what = `${width}px（${theme}）`
+    const { page, errors } = await preview('verify-gaps', { extra, width, height: 900, theme })
+    await page.waitForSelector('[data-evidence-verify-gaps]')
+    const groups = await page.evaluate(() => [...document.querySelectorAll('[data-evidence-verify-group]')].map((g) => ({
+      kind: g.dataset.evidenceVerifyGroup, head: g.firstElementChild?.textContent.trim(),
+      items: [...g.querySelectorAll('li')].map((li) => li.textContent.replace(/^·\s*/, '').trim()),
+    })))
+    check(`${what} 证据页：横幅下面另起两组，先「核查未通过」（两路不一致、被推翻），再「核查未完成」（无法复算）`,
+      JSON.stringify(groups) === JSON.stringify([{ kind: 'failed', head: '核查未通过', items: FAILED },
+        { kind: 'unfinished', head: '核查未完成', items: UNFINISHED }]), JSON.stringify(groups))
+    const banner = await page.locator('[data-evidence-issuance] [data-issuance-gaps] li').evaluateAll(items)
+    check(`${what} ……横幅的「校验未全部完成」里只剩校验没做完的那条`, JSON.stringify(banner) === JSON.stringify(OTHER)
+      && (await text(page.locator('[data-evidence-issuance] [data-issuance-gaps]'))).startsWith('校验未全部完成'), JSON.stringify(banner))
+    // 成果节点的印章：悬停说明里核查的两组排在「校验未全部完成」前面，各组只列自己的
+    const stamp = page.locator('.react-flow__node[data-id="done"] .nc-stamp')
+    await stamp.waitFor()
+    const lines = ((await stamp.getAttribute('title')) ?? '').split('\n')
+    const at = (head) => lines.findIndex((l) => l.startsWith(head))
+    check(`${what} 成果节点印章：悬停说明先「核查未通过」、再「核查未完成」、最后「校验未全部完成」，各列各的`,
+      lines[at('核查未通过：')] === `核查未通过：${FAILED.join('；')}` && lines[at('核查未完成：')] === `核查未完成：${UNFINISHED.join('；')}`
+      && lines[at('校验未全部完成：')] === `校验未全部完成：${OTHER.join('；')}`
+      && at('核查未通过：') < at('核查未完成：') && at('核查未完成：') < at('校验未全部完成：'), lines.join(' / '))
+    const w = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    check(`${what}：证据页不横向溢出`, w <= 0, `${w}px`)
+    const c = await page.evaluate(() => {
+      const box = document.querySelector('[data-evidence-verify-gaps]')
+      const bgOf = (el) => {
+        for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
+          const v = getComputedStyle(n).backgroundColor
+          if (v !== 'rgba(0, 0, 0, 0)' && v !== 'transparent') return v
+        }
+        return 'rgba(0, 0, 0, 0)'
+      }
+      return { fg: getComputedStyle(box).color, bg: bgOf(box), base: getComputedStyle(document.body).backgroundColor }
+    })
+    const ratio = contrast(c.fg, c.bg, c.base)
+    check(`${what}：核查那两组的字对比度 ≥ 4.5`, ratio >= 4.5, `${ratio.toFixed(2)}（${c.fg} on ${c.bg}）`)
+    await shot(page, `verify-gaps-${width}-${theme}`)
+    check(`${what}：页面没有报错`, errors.length === 0, errors.join('；'))
+  }
+})
+
+await section('记录页的工件列表：双盲复算对照、反方审稿记录有名字', async () => {
+  // 工件列表按 pages/runs/model.ts 的 ARTIFACT_KIND_LABEL 写种类：期 3 新加的两种工件没登记时，列表里露出的是键名
+  // dual_check、challenge，说明一栏只有一句「工件」。按页面自己加载的那一份取（同 check-evidence 的工件一节）
+  const { page, errors } = await preview('dual-check-approval')
+  const got = await page.evaluate(async () => {
+    const m = await import('/src/pages/runs/model.ts')
+    return {
+      dual: m.artifactKindLabel('dual_check'), challenge: m.artifactKindLabel('challenge'),
+      dualDesc: m.artifactDescription('dual_check', { metrics: 2 }), dualBare: m.artifactDescription('dual_check', null),
+      challengeDesc: m.artifactDescription('challenge', { report: 'report' }),
+      evidence: m.isEvidence('dual_check') && m.isEvidence('challenge'),
+    }
+  })
+  check('种类：双盲复算对照、反方审稿记录，不露键名', got.dual === '双盲复算对照' && got.challenge === '反方审稿记录', JSON.stringify(got))
+  check('……说明写清装的是什么：双盲复算带指标个数，没有 meta 的老数据也有一句', got.dualDesc === '双盲复算：2 个指标两边的 SQL、取值与差异说明'
+    && got.dualBare === '双盲复算：两边的 SQL、取值与差异说明' && got.challengeDesc === '反方审稿：每句结论的判断、理由和反方执行的查询',
+  JSON.stringify(got))
+  check('……两种都算证据（列表里醒目）', got.evidence)
+  check('……页面没有报错', errors.length === 0, errors.join('；'))
+})
+
 // ---------------------------------------------------------------- 检查器与节点卡片
 
 /**
@@ -931,11 +1231,32 @@ await section('检查器：每一项都写进节点配置，节点卡片的摘�
   check('……标签指向这个下拉', await page.locator('[data-field="card"] label').getAttribute('for') === await card.getAttribute('id'))
   await card.selectOption('card2')
   check('选另一张：写进 card', (await config(page)).card === 'card2', JSON.stringify(await config(page)))
-  check('……不在上游的照实提醒', (await text(page.locator('[data-dual-card-warn]'))).includes('不在本节点上游'))
+  check('……不在上游的照实提醒', (await text(page.locator('[data-node-pick-hint="notUpstream"]'))).includes('不在本节点上游'))
   const swapped = await summaryBecomes(page, '复算「月报口径卡」 · 全部 1 个指标')
   check('……摘要换成这张卡', swapped.ok, swapped.seen)
   await card.selectOption('')
   check('选回默认：card 去掉，不留空串', !('card' in (await config(page))) || (await config(page)).card === undefined, JSON.stringify(await config(page)))
+  // 选口径卡用的是和反方审稿共用的控件（verifyFields.tsx 的 NodePick）：写着的卡被删了、写的不是口径卡（助手改图、导入
+  // JSON 会写出这种配置）都照实列在下拉里（选不回去）、下面说一句，不让它看着像「默认」
+  const setCard = (value) => page.evaluate((v) => {
+    const s = window.__studio.getState()
+    const n = s.nodes.find((x) => x.id === 'dc')
+    s.updateNode('dc', { config: { ...n.data.config, card: v } })
+  }, value)
+  const selected = () => card.evaluate((el) => el.options[el.selectedIndex]?.textContent)
+  await setCard('ghost')
+  await page.waitForTimeout(100)
+  check('写着的卡已不在画布上：下拉照实标出，下面说一句', await selected() === 'ghost（不在画布上）'
+    && (await text(page.locator('[data-node-pick-hint="missing"]'))) === '所选口径卡已不在画布上，请重新选择', await selected())
+  await setCard('fetch')
+  await page.waitForTimeout(100)
+  const wrongType = page.locator('[data-node-pick-hint="wrongType"]')
+  check('写的不是口径卡：下拉标「不是口径卡」，提示说清它是哪类节点，不说成不在画布上', await selected() === '取数（不是口径卡）'
+    && await wrongType.count() === 1 && (await text(wrongType)).startsWith('所选节点是「') && (await text(wrongType)).endsWith('」节点，不是口径卡，请重新选择')
+    && await page.locator('[data-node-pick-hint="missing"]').count() === 0, `${await selected()} · ${await wrongType.count() ? await text(wrongType) : '没有提示'}`)
+  await card.selectOption('')
+  check('……选回默认：提示收起、card 去掉', await page.locator('[data-node-pick-hint]').count() === 0 && (await config(page)).card === undefined,
+    JSON.stringify(await config(page)))
 
   // 指标：逐个勾；全部勾着是缺省，不写；最后一个不让取消
   const opts = page.locator('[data-dual-metric-option]')
@@ -973,16 +1294,18 @@ await section('检查器：每一项都写进节点配置，节点卡片的摘�
 
   // 启用：跟随设置 / 开启 / 关闭
   const enabled = page.locator('[data-field="enabled"] [role="radiogroup"]')
+  check('启用用的是和反方审稿共用的三态控件，组名是字段名', (await enabled.getAttribute('data-tri-state')) === 'follow'
+    && (await enabled.getAttribute('aria-label')) === D.field.enabled)
   check('启用：三态，跟随设置写出设置里眼下是开着的', (await enabled.locator('[role="radio"]').allInnerTexts()).join('|') === '跟随设置（当前开启）|开启|关闭'
-    && await enabled.locator('[role="radio"][aria-checked="true"]').getAttribute('data-value') === 'follow')
-  await enabled.locator('[data-value="off"]').click()
+    && await enabled.locator('[role="radio"][aria-checked="true"]').getAttribute('data-tri') === 'follow')
+  await enabled.locator('[data-tri="off"]').click()
   const off = await summaryBecomes(page, { suffix: ' · 已关闭' })
   check('关闭：enabled 为 false，摘要标「已关闭」', (await config(page)).enabled === false && off.ok, off.seen)
-  await enabled.locator('[data-value="off"]').focus()
+  await enabled.locator('[data-tri="off"]').focus()
   await page.keyboard.press('ArrowLeft')
   check('键盘方向键换选项：开启是 true', (await config(page)).enabled === true
-    && await page.evaluate(() => document.activeElement?.getAttribute('data-value')) === 'on')
-  await enabled.locator('[data-value="follow"]').click()
+    && await page.evaluate(() => document.activeElement?.getAttribute('data-tri')) === 'on')
+  await enabled.locator('[data-tri="follow"]').click()
   check('跟随设置：enabled 去掉，不留 null', (await config(page)).enabled === undefined, JSON.stringify(await config(page)))
 
   // 未采用原流程时
@@ -1007,7 +1330,7 @@ await section('检查器：每一项都写进节点配置，节点卡片的摘�
   check('模型：写进 model', (await config(page)).model === 'model-b')
   await provider.selectOption('')
   check('只填了模型：接入留空那一项改叫「按模型名找接入」，写明按模型名用哪个接入', (await provider.locator('option').first().innerText()) === '按模型名找接入'
-    && (await text(page.locator('[data-dual-by-model]'))).includes('将按模型名使用接入「云端接入」') && (await config(page)).provider === undefined)
+    && (await text(page.locator('[data-verify-by-model]'))).includes('将按模型名使用接入「云端接入」') && (await config(page)).provider === undefined)
   const tol = page.locator('[data-field="tolerance"] input')
   check('允许的相对误差：占位写出设置里的值', await tol.getAttribute('placeholder') === '跟随设置（0.000001）', await tol.getAttribute('placeholder'))
   await tol.fill('0.001')
@@ -1035,20 +1358,20 @@ await section('检查器：上游有几张口径卡时必须选；「跟随设�
   await page.waitForFunction(() => document.querySelector('[data-field="card"] select option')?.textContent?.includes('2 张'))
   check('上游两张：留空那一项写明要选，不说「建议」', (await card.locator('option').first().innerText()) === '请选择要复算的口径卡（上游有 2 张）'
     && !(await text(page.locator('[data-field="card"]'))).includes('建议'), await card.locator('option').first().innerText())
-  check('……下面用提醒色写明必须选一张', (await text(page.locator('[data-dual-card-warn]'))) === '上游有 2 张口径卡，请选择要复算的那一张')
+  check('……下面用提醒色写明必须选一张', (await text(page.locator('[data-node-pick-hint="many"]'))) === '上游有 2 张口径卡，请选择要复算的那一张')
   const many = await summaryBecomes(page, '复算上游的口径卡 · 上游有 2 张，请指定')
   check('……节点卡片的摘要也这么说', many.ok, many.seen)
   await card.selectOption('card')
-  check('……选了一张：提醒收起', await page.locator('[data-dual-card-warn]').count() === 0 && (await config(page)).card === 'card')
+  check('……选了一张：提醒收起', await page.locator('[data-node-pick-hint]').count() === 0 && (await config(page)).card === 'card')
 
   // 去设置里关掉双盲复算、改了相对误差，再回到画布打开这个节点：「跟随设置」写的是新的值
-  const enabled = page.locator('[data-field="enabled"] [role="radio"][data-value="follow"]')
+  const enabled = page.locator('[data-field="enabled"] [role="radio"][data-tri="follow"]')
   check('打开时：跟随设置（当前开启）', (await text(enabled)) === '跟随设置（当前开启）', await text(enabled))
   verifyNow = { ...fx.verify, dual_check: { ...fx.verify.dual_check, enabled: false, tolerance: 0.01 } }
   await page.evaluate(() => window.__studio.setState({ selectedId: null }))
   await page.waitForSelector('[data-field="enabled"]', { state: 'detached' })
   await page.evaluate(() => window.__studio.setState({ selectedId: 'dc' }))
-  await page.waitForFunction(() => document.querySelector('[data-field="enabled"] [data-value="follow"]')?.textContent === '跟随设置（当前关闭）', null, { timeout: 3000 })
+  await page.waitForFunction(() => document.querySelector('[data-field="enabled"] [data-tri="follow"]')?.textContent === '跟随设置（当前关闭）', null, { timeout: 3000 })
     .catch(() => {})
   check('再打开：重取设置，写当前关闭', (await text(enabled)) === '跟随设置（当前关闭）', await text(enabled))
   await page.locator('button', { hasText: '高级选项' }).click()
@@ -1071,7 +1394,7 @@ await section('检查器：360px 栏、390px 窄屏不横向溢出，深浅色�
     check(`${width}px（${theme}）：检查器不横向溢出`, w.page <= 0 && w.panel <= 0 && w.body <= 0, JSON.stringify(w))
     const c = await page.evaluate(() => {
       const base = getComputedStyle(document.querySelector('[data-dual-inspector]')).backgroundColor
-      const el = document.querySelector('[data-dual-by-model]')
+      const el = document.querySelector('[data-verify-by-model]')
       const radio = document.querySelector('[data-field="enabled"] [role="radio"][aria-checked="true"]')
       return { base, hint: el && getComputedStyle(el).color, radio: radio && getComputedStyle(radio).color,
         radioBg: radio && getComputedStyle(radio).backgroundColor }

@@ -12,7 +12,11 @@
   "exploreFlag": "run-chal-explore-flag",
   "runfail": "run-chal-runfail",
   "dup": "run-chal-dup",
-  "norecord": "run-chal-norecord"
+  "norecord": "run-chal-norecord",
+  "unreviewed": "run-chal-unreviewed",
+  "offpath": "run-chal-offpath",
+  "over": "run-chal-over",
+  "given": "run-chal-given"
  },
  "report": {
   "node_id": "write",

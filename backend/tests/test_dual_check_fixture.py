@@ -16,11 +16,17 @@ variants 和 peers 各自的 catalog）也是服务端的真实输出：按下�
 服务端合入之前没有这个模块，逐项比对那几项跳过，形状和门槛照样查。
 
 **同一次裁决里几个指标落到同一项上。** 预告是每个指标单独算的，服务端写目录前却要把同一次裁决里落到同一张表同一项上的
-说法归拢（业务日期、去重规则说法不同的一项都不写，有效记录条件合成一句写），卡上按其余指标当前的选择补上这一层
-（2026-10 第 3 轮复核：两个指标分开选，卡上各自说「记为……」，服务端一项都不写）。peers 是换掉「退款率」对不上的那个
-输入的几对 SQL，和「销售额」（或换上的变体）落到数据目录的同一项上；merges 是检查脚本看的几种组合，written 是服务端
-按这几种选择真写一遍（record_choices，空目录、临时数据源）的结果。它要建数据源，regenerate 不生成：测试报不一致时，
-照报出的实际结果改 written，再看审批卡的说法要不要跟着改。
+说法归拢（业务日期、去重规则说法不同的一项都不写，有效记录条件合成一句写，驳回过的拿出来不写）。服务端把每种组合按
+真写的办法算好放进对照工件（dual_check_facts.preview_joint → catalog_joint），卡上按各指标当前的选择取；工件里没有时
+卡上按其余指标当前的选择有条件地推。peers 是换掉「退款率」对不上的那个输入的几对 SQL，和「销售额」（或换上的变体）
+落到数据目录的同一项上；merges 是检查脚本看的几种组合：notes 是这一组合发起审批时的目录（不写就是空目录），catalog
+是两个指标按它各自的预告，joint 是 preview_joint 的真实输出（这两项 regenerate 重新生成），written 是服务端按这几种
+选择真写一遍（record_choices，临时数据源）的结果——它要建数据源，regenerate 不生成：测试报不一致时，照报出的实际结果
+改 written，再看审批卡的说法要不要跟着改。joint 里按这一组合的选择取出的那一条，和 written 一字不差（会写的值、不写的
+原因）。
+
+**挡下的一边。** catalog_blocked 是「销售额」那一对 SQL 在目录里已有人工确认的业务日期时的预告（notes 是那时的目录）：
+两边都认出了事实、都被目录挡下，照样带着写到哪和原因，审批卡逐条说「不会记入：原因」。
 
 重新生成夹具里的差异说明和预告（只改 diff、摘要的 diff 和 fallback、预告，其余原样；没有预告的模块时预告不动）：
     cd backend && PYTHONPATH=. python tests/test_dual_check_fixture.py
@@ -136,11 +142,9 @@ def _merge_metrics(fx: dict[str, Any], case: dict[str, Any]) -> list[tuple[str, 
             ("refund_rate", PEER_METRIC, tuple(peer["sql"]), peer["catalog"])]
 
 
-def _shown(side: dict[str, Any]) -> dict[str, Any]:
-    """一边的预告里审批卡用得到的：写不写，写的话写到哪、写成什么。不写的原因只在时间线上给人看，措辞不比。"""
-    if side.get("write") is True:
-        return {k: side.get(k) for k in ("write", "source", "table", "item", "value")}
-    return {"write": side.get("write")}
+def _merge_candidates(fx: dict[str, Any], case: dict[str, Any]) -> list[dict[str, Any]]:
+    """merges 里一种组合交给服务端的候选（不带 choice）：两个指标各自的那一对 SQL，带上指标 id（preview_joint 按它说结果）。"""
+    return [{**_candidate(metric, *sql), "metric_id": metric_id} for metric_id, metric, sql, _ in _merge_metrics(fx, case)]
 
 
 def _server(name: str) -> Any:
@@ -209,14 +213,41 @@ def test_catalog_previews_have_the_server_shape():
 
 
 def test_catalog_previews_follow_the_server():
-    """预告里审批卡用得到的部分（写不写、写到哪、写成什么）和服务端（dual_check_facts.preview）一致：服务端改了写目录
-    的规则，这里先变红——审批卡上照预告说的、检查脚本按预告核对的有条件说法都要跟着看一遍。"""
+    """预告和服务端（dual_check_facts.preview）一字不差：写不写、写到哪、写成什么，不写的原因（审批卡逐条照原话说「不会
+    记入：原因」）。服务端改了写目录的规则或说法，这里先变红——审批卡上照预告说的、检查脚本按预告核对的说法都要跟着看一遍。"""
     preview = _server("preview")
     if preview is None:
         pytest.skip("双盲复算的服务端（dual_check_facts.preview）还没合入")
     for name, metric, original, blind, _, expected in _preview_cases(_load()):
-        got = preview(_candidate(metric, original, blind), SCHEMA, {})
-        assert {s: _shown(got[s]) for s in ("a", "b")} == {s: _shown(expected[s]) for s in ("a", "b")}, name
+        assert preview(_candidate(metric, original, blind), SCHEMA, {}) == expected, name
+
+
+def test_a_blocked_side_still_says_where_it_would_write():
+    """目录里已有人工确认的业务日期：两边都认出了事实、都被挡下——照样带着写到哪、本来要写什么和原因，和服务端一字不差"""
+    preview = _server("preview")
+    if preview is None:
+        pytest.skip("双盲复算的服务端（dual_check_facts.preview）还没合入")
+    fx = _load()
+    blocked = fx["catalog_blocked"]
+    gmv = fx["card"]["metrics"][0]
+    (a, b), = _differing(gmv)
+    assert preview(_candidate(gmv["name"], a["sql"], b["sql"]), SCHEMA, blocked["notes"]) == blocked["catalog"]
+    for side in ("a", "b"):
+        said = blocked["catalog"][side]
+        assert said["write"] is False and said["reason"] and said["table"] == "orders" and said["item"] == "business_date"
+
+
+def test_merges_carry_the_server_joint_preview():
+    """merges 里每一种组合：两个指标各自的预告（catalog）和合起来的预告（joint）都是服务端按这一组合的目录算出来的"""
+    preview, preview_joint = _server("preview"), _server("preview_joint")
+    if preview is None or preview_joint is None:
+        pytest.skip("双盲复算的服务端（dual_check_facts.preview_joint）还没合入")
+    fx = _load()
+    for name, case in fx["merges"].items():
+        notes = case.get("notes") or {}
+        candidates = _merge_candidates(fx, case)
+        assert case["catalog"] == {c["metric_id"]: preview(c, SCHEMA, notes) for c in candidates}, name
+        assert case["joint"] == preview_joint(candidates, {SOURCE: (SCHEMA, notes)}), name
 
 
 def test_merges_put_two_metrics_on_the_same_item():
@@ -226,8 +257,9 @@ def test_merges_put_two_metrics_on_the_same_item():
     fx = _load()
     assert fx["merges"]
     for name, case in fx["merges"].items():
-        sides = [said[case["choices"][metric_id]] for metric_id, _, _, said in _merge_metrics(fx, case)]
-        assert all(s["write"] is True for s in sides), name
+        sides = [case["catalog"][metric_id][case["choices"][metric_id]] for metric_id, _, _, _ in _merge_metrics(fx, case)]
+        # 落到同一项上的：会写的、被目录挡下的都算（都带着写到哪），服务端照样把它们归拢成一项
+        assert all("table" in s for s in sides), name
         targets = {(s["source"], s["table"], s["item"]) for s in sides}
         assert len(targets) == 1, name
         assert all((SOURCE, w["table"], w["item"]) in targets for w in case["written"]), name
@@ -263,15 +295,27 @@ async def test_merged_choices_follow_the_server(make_source):
     fx = _load()
     for name, case in fx["merges"].items():
         source, source_id = await make_source()
-        candidates = [{**_candidate(metric, *sql), "source": source, "choice": case["choices"][metric_id]}
-                      for metric_id, metric, sql, _ in _merge_metrics(fx, case)]
+        for table, notes in (case.get("notes") or {}).items():
+            async with SessionLocal() as session:
+                await catalog.write_entry(session, source_id, table, notes, if_version=0, actor="数据组")
+        candidates = [{**c, "source": source, "choice": case["choices"][c["metric_id"]]}
+                      for c in _merge_candidates(fx, case)]
         out = await record(candidates, run_id="run-dc-0001", node_title="复核周报口径", actor=None)
         written = []
         async with SessionLocal() as session:
             for w in out["written"]:
                 entry = await catalog.read_entry(session, source_id, w["table"])
+                assert w["value"] == entry.notes[w["item"]]["value"], name
                 written.append({"table": w["table"], "item": w["item"], "value": entry.notes[w["item"]]["value"]})
         assert written == case["written"], (name, out["skipped"])
+        # 审批卡按这一组合的选择从 joint 里取的那一条，就是真写的结果：会写的值、不写的原因一字不差
+        chosen = {c["metric_id"]: case["choices"][c["metric_id"]] for c in candidates}
+        [entry] = [e for e in case["joint"] if {m["metric_id"]: m["choice"] for m in e["members"]} == chosen]
+        for metric_id, said in entry["outcomes"].items():
+            if said["write"]:
+                assert {"table": entry["table"], "item": entry["item"], "value": said["value"]} in written, (name, metric_id)
+            else:
+                assert said["reason"] in [s["reason"] for s in out["skipped"]], (name, metric_id, out["skipped"])
 
 
 def regenerate() -> None:
@@ -294,6 +338,16 @@ def regenerate() -> None:
         for group, metric_name in SWAPS.items():
             for swap in fx[group].values():
                 swap["catalog"] = preview(_candidate(metric_name, *swap["sql"]), SCHEMA, {})
+        gmv = fx["card"]["metrics"][0]
+        (a, b), = _differing(gmv)
+        blocked = fx["catalog_blocked"]
+        blocked["catalog"] = preview(_candidate(gmv["name"], a["sql"], b["sql"]), SCHEMA, blocked["notes"])
+    if (preview_joint := _server("preview_joint")) is not None:
+        for case in fx["merges"].values():
+            notes = case.get("notes") or {}
+            candidates = _merge_candidates(fx, case)
+            case["catalog"] = {c["metric_id"]: preview(c, SCHEMA, notes) for c in candidates}
+            case["joint"] = preview_joint(candidates, {SOURCE: (SCHEMA, notes)})
     FIXTURE.write_text(json.dumps(fx, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 

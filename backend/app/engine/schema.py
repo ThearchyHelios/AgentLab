@@ -9,6 +9,13 @@ from typing import Any, Iterable, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.engine.labels import TYPE_LABEL, field_label, judge_label, option_label, q, type_label  # noqa: F401
+# 双盲复算、反方审稿的叫法在 labels.py；校验、执行器和老的调用方照旧从这里取
+from app.engine.labels import (  # noqa: F401
+    CHALLENGE_LABEL,
+    CHALLENGE_ON_REFUTED_LABEL,
+    DUAL_CHECK_FIELD_LABEL,
+    DUAL_CHECK_ON_REJECT_LABEL,
+)
 
 
 class NodeType(StrEnum):
@@ -425,15 +432,9 @@ def _check_report_sources(node: GraphNode, spec: GraphSpec, result: ValidationRe
                        node_id=node.id, field="metrics_from", code=code)
 
 
-#: 双盲复算节点各配置项在检查器上的叫法（前端 nodeDefs 的 dual_check 字段）。按 labels.py 的规矩应放在那里，
-#: 那个文件不归双盲复算的工作包，先放在校验旁边，节点执行时报错也从这里取
-DUAL_CHECK_FIELD_LABEL = {
-    "card": "口径卡", "metrics": "复算的指标", "definitions": "口径说明", "provider": "盲算模型 · 接入",
-    "model": "盲算模型", "tolerance": "允许的相对误差", "on_reject": "未采用原流程时", "enabled": "启用双盲复算",
-}
-#: 审核人没有采用原流程的结果（选了盲算，或者判断两边都不对）时：degrade 计入缺口、出具降档（默认）/ fail 判为失败
+#: 审核人没有采用原流程的结果（选了盲算，或者判断两边都不对）时：degrade 计入缺口、出具降档（默认）/ fail 判为失败。
+#: 各配置项和这两个取值的叫法（DUAL_CHECK_FIELD_LABEL、DUAL_CHECK_ON_REJECT_LABEL）在 labels.py
 DUAL_CHECK_ON_REJECT = ("degrade", "fail")
-DUAL_CHECK_ON_REJECT_LABEL = {"degrade": "计入缺口、出具降档", "fail": "判为失败"}
 
 
 def dual_check_card(spec: GraphSpec, node: GraphNode) -> tuple[str | None, str | None]:
@@ -721,17 +722,9 @@ def _check_report_from(node: GraphNode, report_from: Any, spec: GraphSpec,
 # 反方审稿节点（engine/nodes/challenge.py）：审哪份报告、各项配置
 # --------------------------------------------------------------------------
 
-#: 反方审稿节点各项配置在界面上的叫法：报错写叫法，不写键名
-CHALLENGE_LABEL = {
-    "report": "要审的报告", "max_claims": "最多审几句", "max_queries": "每句最多查询次数",
-    "timeout_s": "每句时长上限（秒）", "provider": "反方模型 · 接入", "model": "反方模型",
-    "on_refuted": "结论被推翻时", "enabled": "启用",
-}
-#: 结论被推翻时怎么办：degrade 计入出具缺口、出具降档（默认）/ flag 只标注 / fail 判节点失败、运行停止
+#: 结论被推翻时怎么办：degrade 计入出具缺口、出具降档（默认）/ flag 只标注 / fail 判节点失败、运行停止。
+#: 各项配置和这三个取值在界面上的叫法（CHALLENGE_LABEL、CHALLENGE_ON_REFUTED_LABEL）在 labels.py：报错写叫法，不写键名
 CHALLENGE_ON_REFUTED = ("degrade", "flag", "fail")
-#: 选项的叫法和检查器下拉一致（lib/terms.ts 的 CHALLENGE_TEXT.onRefuted），只去掉「（默认）」：报错让人去改某一项时，
-#: 人在下拉里找得到这个名字
-CHALLENGE_ON_REFUTED_LABEL = {"degrade": "出具降档", "flag": "只标注", "fail": "报错并停止运行"}
 
 
 def _challenge_field(key: str) -> str:

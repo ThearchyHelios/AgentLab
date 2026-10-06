@@ -1,62 +1,41 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import type { ReactNode } from 'react'
 import { X } from 'lucide-react'
 import clsx from 'clsx'
-import { api } from '../api/client'
 import { useStudio } from '../store/studio'
-import { modelOptions, providerOfModel, useCatalog } from '../store/catalog'
-import { useRadioGroup } from '../components/ui'
 import { DUAL_CHECK_TEXT } from '../lib/terms'
-import type { VerifySettings } from '../types'
 import type { FieldRenderProps, NodeSummaryContext } from './nodeDefs'
+import {
+  ModelInput, NodePick, ProviderPick, TriState, resolvePick, upstreamOf, useVerifyDefaults,
+  type CanvasEdge, type CanvasNode, type NodePickText, type TriStateText, type VerifyModelText,
+} from './verifyFields'
 
 /*
  * 双盲复算节点的检查器控件（nodeDefs 里 dual_check 各字段的 render）和节点卡片的摘要。
  *
- * 口径卡、要复算的指标、口径说明都得看画布上别的节点：从 studio store 读，不往检查器的 props 里加字段。
- * 每个控件只写自己那个键（FieldRenderProps.onChange）；写回 undefined 就是「留空 = 跟随默认」，配置里不留空值。
- * 后端认的键和缺省见 types.ts 的 DualCheckConfig
+ * 选口径卡、盲算模型、启用三态用核查类节点共用的控件（verifyFields.tsx，反方审稿也用它们），这里只给文案；双盲复算
+ * 特有的选指标、口径说明、相对误差在这里。口径卡、要复算的指标、口径说明都得看画布上别的节点：从 studio store 读，
+ * 不往检查器的 props 里加字段。每个控件只写自己那个键（FieldRenderProps.onChange）；写回 undefined 就是「留空 = 跟随
+ * 默认」，配置里不留空值。后端认的键和缺省见 types.ts 的 DualCheckConfig
  */
 
 const T = DUAL_CHECK_TEXT
 
-type CanvasNode = NodeSummaryContext['nodes'][number]
-type CanvasEdge = NodeSummaryContext['edges'][number]
-
 const isRecord = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v)
 const ids = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && !!x) : [])
 
-/** 某个节点的全部上游（沿连线往回走），不含它自己 */
-function upstreamOf(id: string, edges: readonly CanvasEdge[]): Set<string> {
-  const parents = new Map<string, string[]>()
-  for (const e of edges) parents.set(e.target, [...(parents.get(e.target) ?? []), e.source])
-  const seen = new Set<string>()
-  const stack = [...(parents.get(id) ?? [])]
-  while (stack.length) {
-    const cur = stack.pop()!
-    if (seen.has(cur) || cur === id) continue
-    seen.add(cur)
-    stack.push(...(parents.get(cur) ?? []))
-  }
-  return seen
-}
-
-/** 画布上的口径卡：本节点上游的在前（复算只能复算它们），其余的另列 */
-function cardsOf(id: string, nodes: readonly CanvasNode[], edges: readonly CanvasEdge[]) {
-  const up = upstreamOf(id, edges)
-  const cards = nodes.filter((n) => n.data.nodeType === 'metrics')
-  return { upstream: cards.filter((n) => up.has(n.id)), other: cards.filter((n) => !up.has(n.id)) }
-}
-
 /**
- * 实际复算哪张卡：写了 card 就是它（不在画布上时 node 为 null）；没写取上游的口径卡，上游只有一张时就是它，
- * 好几张时说不准，node 为 null、由调用方照实说
+ * 实际复算哪张卡：写了 card 就是它（不在画布上、不是口径卡时 node 为 null；不在上游也照样是它，指标照列，选卡的地方
+ * 另外提醒）；没写取上游的口径卡（schema.dual_check_card 的认法），上游只有一张时就是它，好几张时说不准，node 为 null、
+ * 由调用方照实说
  */
 function targetOf(config: Record<string, any>, id: string, nodes: readonly CanvasNode[], edges: readonly CanvasEdge[]) {
-  const { upstream } = cardsOf(id, nodes, edges)
+  const up = upstreamOf(id, edges)
+  const upstream = nodes.filter((n) => up.has(n.id) && n.data.nodeType === 'metrics')
   const card = typeof config.card === 'string' && config.card ? config.card : ''
-  if (card) return { node: nodes.find((n) => n.id === card && n.data.nodeType === 'metrics') ?? null, card, upstream }
-  return { node: upstream.length === 1 ? upstream[0] : null, card: '', upstream }
+  const pick = resolvePick(id, card, 'metrics', 'upstream', nodes, edges)
+  const node = pick.kind === 'target' || pick.kind === 'notUpstream' ? pick.node : null
+  return { node, card, upstream }
 }
 
 /** 一张口径卡在摘要里的名字：节点名，没起名的用口径名，再没有用 id */
@@ -92,33 +71,7 @@ export function dualCheckSummary({ id, config, nodes, edges }: NodeSummaryContex
   return config.enabled === false ? `${text} · ${S.off}` : text
 }
 
-// ---------------------------------------------------------------- 设置里的默认值
-
-/**
- * 设置里核查一组的值：相对误差、启用的「跟随设置」要写出现在是多少。每次打开检查器都重取一次——去设置页关掉双盲
- * 复算、改了误差再回到画布，这里得是新值（不同于检查器的运行默认值，核查开关是常改的）。先用上次取到的画，免得
- * 闪一下；同一次打开里的几个字段共用一个请求；取不到就沿用上次的（没有就不写），不挡编辑
- */
-let verifyPending: Promise<VerifySettings | null> | null = null
-let verifyValue: VerifySettings | null | undefined
-function fetchVerify(): Promise<VerifySettings | null> {
-  verifyPending ??= api.settings.get().then(
-    (s) => (verifyValue = isRecord(s?.verify) ? s.verify as VerifySettings : null),
-    () => verifyValue ?? null,
-  ).finally(() => { verifyPending = null })
-  return verifyPending
-}
-function useVerifyDefaults(): VerifySettings | null {
-  const [value, setValue] = useState<VerifySettings | null>(verifyValue ?? null)
-  useEffect(() => {
-    let alive = true
-    void fetchVerify().then((v) => { if (alive) setValue(v) })
-    return () => { alive = false }
-  }, [])
-  return value
-}
-
-/** 字段下面的一行提醒（所选口径卡不在上游之类），提醒色 */
+/** 字段下面的一行提醒（写了说明的指标不在复算范围里之类），提醒色 */
 function Warn({ children, attr }: { children: ReactNode; attr: string }) {
   return (
     <div className="mt-1 text-2xs leading-snug" style={{ color: 'var(--st-waiting)' }} {...{ [attr]: '' }}>{children}</div>
@@ -127,33 +80,23 @@ function Warn({ children, attr }: { children: ReactNode; attr: string }) {
 
 // ---------------------------------------------------------------- 各字段
 
-/** 要复算的口径卡：下拉选画布上的口径卡，上游的一组、其余的一组；留空取上游的口径卡 */
-function CardField({ id, nodeId, value, invalid, describedBy, onChange }: FieldRenderProps) {
-  const nodes = useStudio((s) => s.nodes)
-  const edges = useStudio((s) => s.edges)
-  const { upstream, other } = useMemo(() => cardsOf(nodeId, nodes, edges), [nodeId, nodes, edges])
-  const current = typeof value === 'string' ? value : ''
-  const known = [...upstream, ...other].some((n) => n.id === current)
-  const option = (n: CanvasNode) => (
-    <option key={n.id} value={n.id}>{T.cardOption(String(n.data.label || n.id), n.data.config?.caliber)}</option>
-  )
-  return (
-    <>
-      <select id={id} className="field" value={current} aria-invalid={invalid || undefined} aria-describedby={describedBy}
-              data-dual-field="card" onChange={(e) => onChange(e.target.value || undefined)}>
-        <option value="">{T.cardDefault(upstream.length === 1 ? cardName(upstream[0]) : null, upstream.length)}</option>
-        {upstream.length > 0 && <optgroup label={T.cardUpstream}>{upstream.map(option)}</optgroup>}
-        {other.length > 0 && <optgroup label={T.cardOther}>{other.map(option)}</optgroup>}
-        {/* 写着的卡已经不在画布上：照实列出来（不让它看着像「默认」），下面再说一句 */}
-        {current && !known && <option value={current}>{T.cardGone(current)}</option>}
-      </select>
-      {/* 上游有好几张又没选：服务端校验会挡住发起运行，用提醒色写明要选 */}
-      {!current && upstream.length > 1 && <Warn attr="data-dual-card-warn">{T.cardChoose(upstream.length)}</Warn>}
-      {current && known && !upstream.some((n) => n.id === current) && <Warn attr="data-dual-card-warn">{T.cardNotUpstream}</Warn>}
-      {current && !known && <Warn attr="data-dual-card-warn">{T.cardMissing(current)}</Warn>}
-    </>
-  )
+/**
+ * 要复算的口径卡（共用的 NodePick）：上游的一组、其余的一组（选了不在上游的，提醒把它连到上游）；留空取上游的口径卡，
+ * 上游有好几张又没选时写明要选（服务端校验会挡住发起运行）；写着的卡不在画布上、不是口径卡时照实列出来、说一句
+ */
+const CARD_TEXT: NodePickText = {
+  auto: (only, count) => T.cardDefault(only, count),
+  many: (n) => T.cardChoose(n),
+  missing: (id) => T.cardGone(id),
+  notUpstream: (label) => label,
+  wrongType: (label) => T.cardWrongType(label),
+  missingHint: T.cardMissingHint,
+  notUpstreamHint: T.cardNotUpstream,
+  wrongTypeHint: (type) => T.cardWrongTypeHint(type),
+  groups: { upstream: T.cardUpstream, other: T.cardOther },
 }
+/** 一张口径卡在下拉里的叫法：节点名，口径名不同时附在后面 */
+const cardOption = (n: CanvasNode) => T.cardOption(String(n.data.label || n.id), n.data.config?.caliber)
 
 /**
  * 复算的指标：所选口径卡的指标逐个勾。没写（全部勾着）是缺省——复算输入来自查询的全部指标；全部勾回来时写回
@@ -280,52 +223,12 @@ function DefinitionsField({ id, nodeId, value, config, describedBy, onChange }: 
 }
 
 /**
- * 盲算模型 · 接入。照报告节点「结论句裁判」的写法：留空跟随设置；只填了模型时接入按模型名找，留空那一项改叫
- * 「按模型名找接入」（verify_model_spec 哪一级写了就整组用哪一级，不跨级拼）
+ * 盲算模型（共用的 ProviderPick、ModelInput）：留空跟随设置；只填了模型时接入按模型名找，留空那一项改叫「按模型名找
+ * 接入」，并写明实际用哪个接入（verify_model_spec 哪一级写了就整组用哪一级，不跨级拼）。取值链的说明在字段的帮助里
  */
-function ProviderField({ id, value, config, invalid, describedBy, onChange }: FieldRenderProps) {
-  const providers = useCatalog((s) => s.providers)
-  const provider = typeof value === 'string' ? value : ''
-  const known = providers.some((p) => p.name === provider)
-  const byModel = !provider && typeof config.model === 'string' && !!config.model.trim()
-  return (
-    <select id={id} className="field" value={provider} aria-invalid={invalid || undefined} aria-describedby={describedBy}
-            data-dual-field="provider" onChange={(e) => onChange(e.target.value || undefined)}>
-      <option value="">{byModel ? T.providerFromModel : T.providerFollow}</option>
-      {provider && !known && providers.length > 0 && <option value={provider}>{T.providerGone(provider)}</option>}
-      {providers.map((p) => <option key={p.id} value={p.name}>{p.name}{p.enabled ? '' : T.providerOff}</option>)}
-    </select>
-  )
-}
-
-/** 盲算模型 · 模型：可以手填，下拉给所选接入（没选接入时给全部启用接入）的模型；只填了模型时写明实际用哪个接入 */
-function ModelField({ id, value, config, invalid, describedBy, onChange }: FieldRenderProps) {
-  const providers = useCatalog((s) => s.providers)
-  const provider = typeof config.provider === 'string' ? config.provider : ''
-  const pv = provider ? providers.find((p) => p.name === provider) : undefined
-  const model = typeof value === 'string' ? value : ''
-  const byModel = !provider && !!model.trim()
-  const owner = byModel ? providerOfModel(providers, model.trim()) : undefined
-  const enabled = providers.filter((p) => p.enabled)
-  const fallback = enabled.find((p) => p.kind !== 'mock') ?? enabled[0]
-  const hint = byModel && providers.length > 0
-    ? T.byModel(model.trim(), owner && { name: owner.provider.name, enabled: owner.enabled }, fallback?.name) : ''
-  const models = pv ? (pv.models ?? []).map((m) => m.id) : [...new Set(modelOptions(providers).map((o) => o.value))]
-  return (
-    <>
-      <input id={id} className="field mono text-xs" list={`${id}-models`} value={model} spellCheck={false}
-             placeholder={provider ? T.modelOfProvider : T.modelFollow} aria-invalid={invalid || undefined}
-             aria-describedby={describedBy} data-dual-field="model"
-             onChange={(e) => onChange(e.target.value.trim() ? e.target.value : undefined)} />
-      <datalist id={`${id}-models`}>{models.map((m) => <option key={m} value={m} />)}</datalist>
-      {hint && (
-        <div className="mt-1 text-2xs leading-snug" data-dual-by-model={owner ? (owner.enabled ? 'found' : 'disabled') : 'default'}
-             style={owner?.enabled ? undefined : { color: 'var(--st-waiting)' }}>
-          <span className={owner?.enabled ? 'text-faint' : undefined}>{hint}</span>
-        </div>
-      )}
-    </>
-  )
+const MODEL_TEXT: VerifyModelText = {
+  providerFollow: T.providerFollow, providerFromModel: T.providerFromModel, providerMissing: T.providerGone,
+  providerDisabled: T.providerOff, modelFollow: T.modelFollow, modelDefault: T.modelOfProvider, byModel: T.byModel,
 }
 
 /** 允许的相对误差：留空跟随设置，占位里写出设置里眼下是多少；负数标出来（服务端也不收） */
@@ -344,39 +247,25 @@ function ToleranceField({ id, value, invalid, describedBy, onChange }: FieldRend
   )
 }
 
-const ENABLED = ['follow', 'on', 'off'] as const
-type Enabled = typeof ENABLED[number]
-
-/** 启用：跟随设置 / 开启 / 关闭三态（null 或不写、true、false）。跟随设置时写回 undefined，不在配置里留 null */
-function EnabledField({ id, value, describedBy, onChange }: FieldRenderProps) {
-  const settings = useVerifyDefaults()
-  const current: Enabled = value === true ? 'on' : value === false ? 'off' : 'follow'
-  const pick = (v: Enabled) => onChange(v === 'on' ? true : v === 'off' ? false : undefined)
-  const radio = useRadioGroup(ENABLED, current, pick)
-  return (
-    <div id={id} role="radiogroup" aria-label={T.field.enabled} aria-describedby={describedBy}
-         className="flex flex-wrap gap-0.5 rounded border p-0.5" data-dual-field="enabled">
-      {ENABLED.map((v) => (
-        <button key={v} type="button" {...radio(v)} data-value={v}
-                // 按字数分宽度、不折行：「跟随设置（当前开启）」比「开启」长得多，平分会把它挤成两行；太窄时整段换到下一行
-                className={clsx('flex-auto whitespace-nowrap rounded px-2 py-1 text-2xs transition-colors',
-                  current === v ? 'font-medium text-fg' : 'text-dim hover:bg-hover')}
-                style={current === v ? { background: 'var(--accent-soft)', boxShadow: 'inset 0 0 0 1px var(--accent)' } : undefined}
-                onClick={() => pick(v)}>
-          {v === 'follow' ? T.enabledFollow(settings?.dual_check?.enabled) : T.enabled[v]}
-        </button>
-      ))}
-    </div>
-  )
+/**
+ * 启用（共用的 TriState）：跟随设置 / 开启 / 关闭三态（null 或不写、true、false）。跟随设置时写回 undefined，不在配置里
+ * 留 null；「跟随设置」后面写出设置里现在是开是关（每次打开检查器都重取）。各态的说明在字段的帮助里
+ */
+const ENABLED_TEXT: TriStateText = {
+  follow: T.enabled.follow, on: T.enabled.on, off: T.enabled.off, followNow: (on) => T.enabledFollow(on),
 }
 
 /** nodeDefs 里 dual_check 各字段的 render */
 export const dualCheckFields = {
-  card: (p: FieldRenderProps) => <CardField {...p} />,
+  card: (p: FieldRenderProps) => (
+    <NodePick p={p} fieldKey="card" nodeType="metrics" rule="upstream" text={CARD_TEXT} optionLabel={cardOption} nameOf={cardName} />
+  ),
   metrics: (p: FieldRenderProps) => <MetricsField {...p} />,
   definitions: (p: FieldRenderProps) => <DefinitionsField {...p} />,
-  provider: (p: FieldRenderProps) => <ProviderField {...p} />,
-  model: (p: FieldRenderProps) => <ModelField {...p} />,
+  provider: (p: FieldRenderProps) => <ProviderPick p={p} text={MODEL_TEXT} />,
+  model: (p: FieldRenderProps) => <ModelInput p={p} fieldKey="model" text={MODEL_TEXT} />,
   tolerance: (p: FieldRenderProps) => <ToleranceField {...p} />,
-  enabled: (p: FieldRenderProps) => <EnabledField {...p} />,
+  enabled: (p: FieldRenderProps) => (
+    <TriState p={p} label={T.field.enabled} text={ENABLED_TEXT} setting={(v) => v.dual_check?.enabled} />
+  ),
 }
