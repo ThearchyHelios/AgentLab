@@ -2020,8 +2020,9 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
     - 列名不换（模型自己写的，换了它引用的列名就对不上）；结果里一列都没取自遮罩列、也没有可按值换的原样交回：数值的
       汇总、只数个数的查询不受影响
 
-    交回的 secrets 只有这份结果里的遮罩值（known 调用方自己有）。分析本身出了意外，整份结果的列都遮：这一步挡在模型
-    前面，分析的缺陷不能把原值放过去（宁可多遮）。"""
+    交回的 secrets 只有这份结果里的遮罩值（known 调用方自己有）。分析本身出了意外（认列、认标签、逐格换值哪一步都算），
+    整份结果的每一格都遮、全部的列记成查询时遮掉的（_masked_whole）：这一步挡在模型前面，分析的缺陷不能把原值放过去
+    （宁可多遮）。"""
     base = {str(c).strip().lower() for c in masked if str(c).strip()}
     columns = [str(c) for c in payload.get("columns") or []]
     given = known is not None and bool(known.strong)
@@ -2046,9 +2047,23 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
         view, _ = _masked_view(payload, hidden, pool, embedded=True, rename=False)
     except Exception:  # noqa: BLE001 - 认不准就整份遮掉，原值不交给模型
         logger.warning("核查查询的遮罩分析出错，整份结果按遮罩处理", exc_info=True)
-        hidden, own = {c.lower() for c in columns}, _Secrets()
-        view, _ = _masked_view(payload, hidden, own, rename=False)
+        return QueryMask(_masked_whole(payload), columns, _Secrets())
     return QueryMask(view, [c for c in columns if c.lower() in hidden], own)
+
+
+def _masked_whole(payload: dict[str, Any]) -> dict[str, Any]:
+    """整份结果的每一格都换成「已遮罩」、类型都记成文本：遮罩分析出了意外时的兜底。不经 _masked_view——出意外的可能
+    就是它，兜底跟着出意外，原值就挡不住了。列名、SQL 是模型自己写的，照原样。"""
+    word = _masked_word()
+    rows: list[Any] = []
+    for row in payload.get("rows") or []:
+        if isinstance(row, list):
+            rows.append([word] * len(row))
+        elif isinstance(row, dict):
+            rows.append(dict.fromkeys(row, word))
+        else:
+            rows.append(word)
+    return {**payload, "rows": rows, "column_types": {str(c): "text" for c in payload.get("columns") or []}}
 
 
 #: 查询报错里引号括起来的一段（Postgres、DuckDB、MySQL 把转换失败的值写在引号里：invalid input syntax for type
