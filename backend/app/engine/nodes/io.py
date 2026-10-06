@@ -496,11 +496,13 @@ _PROSE_FENCES = frozenset({"", "markdown", "md", "text", "plaintext", "txt", "pl
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 #: 中文的句读：一行里有汉字、又有它们的，是在写句子（SQL 里的中文列名、别名不带这些）
 _CJK_PUNCT = re.compile(r"[，。！？；：]")
+#: 一行里连着六个以上汉字：信息串写明是文字的块里，这就是在写中文。表格的列名、地区名、门店名这类标签多在五个字以内
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]{6,}")
 #: 英文的词串：单词之间只隔空格、逗号。五个以上的单词紧跟句末标点算一句（_en_sentence）
 _EN_RUN = re.compile(r"[A-Za-z]+(?:[ ,]+[A-Za-z]+)*")
 _EN_WORD = re.compile(r"[A-Za-z]+")
-#: 列表项：- * + • 或「1.」「1)」开头。中文报告的列表项常不带句读，后面有两个以上汉字就算在写句子
-_LIST_ITEM = re.compile(r"\s*(?:[-*+•]|\d+[.)])\s+(.*)")
+#: Markdown 标题：正文里的标题切块时记为 heading，从不算结论句（evidence._scan_blocks），代码块里的也不算在写正文
+_HEADING = re.compile(r"\s*#{1,6}\s")
 #: 整行是注释（-- // # /* */ 开头；# 开头的 Markdown 标题本来也不是句子），和行尾隔着空白的注释：写着中文句子也是
 #: 代码的一部分
 _COMMENT_LINE = re.compile(r"\s*(?:--|//|#|/\*|\*/)")
@@ -508,10 +510,11 @@ _TRAILING_COMMENT = re.compile(r"\s(?:--|//|#).*")
 #: 代码里的字符串字面量（'…'、"…"，可带 f、r、b、u、N 这类前缀）：里面的中文标点是数据。引号前面紧挨着字母、数字的
 #: 不算开头（英文的 it's、don't）
 _STRING_LITERAL = re.compile(r"(?<![A-Za-z0-9_])[rRbBuUfFnN]{0,2}(?:'[^'\n]*'|\"[^\"\n]*\")")
-#: 看得出是 SQL、Python 的行。信息串为空的代码块里有这样的行时，以 * + - 开头的是运算的续行（「* 数量 AS 金额」），
-#: 不当列表项
+#: 看得出是代码的行：SQL、Python 的开头，YAML 的键（「columns:」「- name: 退款占比」）。YAML 的键只认小写开头的：
+#: 正文里的「Note:」「Q1:」是标签
 _CODE_LINE = re.compile(r"\s*(?:select|with|from|where|join|group\s+by|order\s+by|having|union|insert|update"
                         r"|delete|create|def|class|import|return)\b", re.IGNORECASE)
+_YAML_KEY = re.compile(r"\s*(?:-\s+)?[a-z_][\w.-]*:(?:\s|$)")
 
 
 def _en_sentence(line: str) -> bool:
@@ -525,16 +528,46 @@ def _en_sentence(line: str) -> bool:
     return False
 
 
-def _prose_line(line: str, *, lists: bool = True) -> bool:
-    """这一行是不是在写句子：去掉字符串字面量和行尾注释之后，有两个以上汉字又有中文句读，或者是一句英文；lists 为真时，
-    列表项后面有两个以上汉字也算。整行是注释的不算。"""
+def _sentence(line: str) -> bool:
+    """成句：两个以上汉字又有中文句读，或者是一句英文。"""
+    return (len(_CJK.findall(line)) >= 2 and _CJK_PUNCT.search(line) is not None) or _en_sentence(line)
+
+
+def _concluding(line: str) -> bool:
+    """按正文的规矩这一行会算一句结论（evidence._classify 认文字结论的那条）：带方向词、因果词，又不只是在下定义。
+    只认有两个以上汉字的行：drop、rise 这类英文词在代码里也常见。数字不看，代码块里的数字报告节点按裸数字查。"""
+    from app.engine.evidence import _CAUSAL, _DEFINITION, _DIRECTIONAL
+
+    return len(_CJK.findall(line)) >= 2 and _DIRECTIONAL.search(line) is not None \
+        and not (_DEFINITION.search(line) is not None and _CAUSAL.search(line) is None)
+
+
+def _written(line: str) -> bool:
+    """信息串写明是文字（markdown、text 这类）、里面也看不出是代码的块里，这一行在写正文：成句、按正文的规矩会算结论，
+    或者一行里连着六个以上汉字。不看列表标记：标记的写法太多（- 1. 1、 一、 （1） · ●，也常不带标记），补一种漏一种；
+    也不当代码看，# -- 和半角引号都是正文里的符号。标题不算。"""
+    if _HEADING.match(line):
+        return False
+    return _sentence(line) or _CJK_RUN.search(line) is not None or _concluding(line)
+
+
+def _code_like(lines: list[str]) -> bool:
+    """块里看得出是代码：有 SQL、Python 开头的行（_CODE_LINE）、YAML 的键（_YAML_KEY），或者整块是 diff（有 + 开头的
+    行也有 - 开头的行，其余是空格开头的上下文行、@@ 开头的块头）。"""
+    if any(_CODE_LINE.match(line) or _YAML_KEY.match(line) for line in lines):
+        return True
+    heads = {line[:1] for line in lines if line.strip()}
+    return {"+", "-"} <= heads <= {"+", "-", " ", "@"}
+
+
+def _prose_line(line: str, *, code: bool) -> bool:
+    """信息串为空、或者看得出是代码的块里，这一行在写正文：去掉字符串字面量和行尾注释之后成句；整块看不出是代码时，
+    按正文的规矩会算结论的也算（不带句读的列表项、不带标记的行）。不带句读、也不像结论的不算：YAML 里的列名、diff 里
+    改的口径和列表项没有分别。整行是注释的不算。"""
     if _COMMENT_LINE.match(line):
         return False
     line = _TRAILING_COMMENT.sub("", _STRING_LITERAL.sub(" ", line), count=1)
-    if (len(_CJK.findall(line)) >= 2 and _CJK_PUNCT.search(line) is not None) or _en_sentence(line):
-        return True
-    item = _LIST_ITEM.match(line) if lists else None
-    return item is not None and len(_CJK.findall(item.group(1))) >= 2
+    return _sentence(line) or (not code and _concluding(line))
 
 
 def _drop_block_comments(text: str) -> str:
@@ -549,13 +582,15 @@ def _drop_block_comments(text: str) -> str:
 
 def _fenced_body(doc: dict[str, Any]) -> bool:
     """报告的正文写在代码块里：文档里一句结论都没有，却有写文字的代码块（_PROSE_FENCES），里面写着引用（片段里的
-    [[m:…]] 这类标记、句子上挂的 [[see:…]] 依据，代码里不会这样写）或者成句的文字（_prose_line）。
+    [[m:…]] 这类标记、句子上挂的 [[see:…]] 依据，代码里不会这样写）或者在写正文。
 
     报告节点只在整篇正好是一个代码块时去掉外层围栏（report._unfenced），围栏外有前言、只有开头没有收尾、信息串写成
     text 的原样交给 compose_doc：整段正文落在代码块里，切不出结论句，裁判没有句子可判、反方审稿记 no_claims，没挂依据
     的、证据相矛盾的结论句都数出 0 句，出具就成了完整出具。有一句结论的不算：正文没被整个藏起来，结论句照常核对。
-    信息串为空的代码块里也常是 SQL、Python：看内容是不是成句，注释、字符串字面量里的中文句子不算；整块看得出是代码
-    （_CODE_LINE）的，以 * + - 开头的行是运算的续行，不当列表项。"""
+
+    在不在写正文逐行看：信息串写明是文字、里面也看不出是代码的按 _written。信息串为空的块里也常是 SQL、Python、YAML、
+    diff，信息串写成 text 的也偶尔是代码，这些按 _prose_line：注释、字符串字面量里的中文句子不算；整块看得出是代码
+    （_code_like）的只认成句的，以 * + - 开头的 SQL 续行、中文别名里的「最高」这类词都不算。"""
     from app.engine.evidence import iter_units
 
     units = list(iter_units(doc))
@@ -568,9 +603,14 @@ def _fenced_body(doc: dict[str, Any]) -> bool:
         segments = [s for s in unit.get("segments") or [] if isinstance(s, dict)]
         if unit.get("see") or any(s.get("ref") for s in segments):
             return True
-        lines = _drop_block_comments("".join(str(s.get("text") or "") for s in segments)).split("\n")
-        lists = bool(lang) or not any(_CODE_LINE.match(line) for line in lines)
-        if any(_prose_line(line, lists=lists) for line in lines):
+        # 围栏那两行是挂在块上的结构片段，不是块里写的内容：整块是不是 diff 要看里面每一行的开头
+        text = "".join(str(s.get("text") or "") for s in segments if s.get("kind") != "structural")
+        lines = _drop_block_comments(text).split("\n")
+        code = _code_like(lines)
+        if lang and not code:
+            if any(_written(line) for line in text.split("\n")):
+                return True
+        elif any(_prose_line(line, code=code) for line in lines):
             return True
     return False
 
