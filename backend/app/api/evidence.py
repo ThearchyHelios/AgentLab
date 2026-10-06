@@ -108,7 +108,7 @@ from app.engine.evidence import (
 )
 from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candidates, outdated
 from app.engine.merge_query import MERGE_SOURCE, trace_cell
-from app.engine.schema import GraphSpec, challenge_report, dual_check_card
+from app.engine.schema import CLAIMS_JUDGE, GraphSpec, challenge_report, dual_check_card
 from app.engine.toolcalls import QUERY_PREFIX
 
 router = APIRouter(prefix="/api/runs", tags=["evidence"])
@@ -750,7 +750,7 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
                  **({"verdict": verdict} if verdict is not None else {}),
                  # 期 4：反方审稿对这一句的判断，没审到这一句的没有这个键
                  **({"challenge": challenged} if challenged is not None else {}),
-                 "on_demand": _on_demand(sealed, doc, str(unit.get("id")), verdict)},
+                 "on_demand": _on_demand(sealed, doc, str(unit.get("id")), verdict, chosen.claims)},
         "block": {"id": block.get("id"), "type": block.get("type")},
         "chain": chain,
         "note": _note(seg, unit),
@@ -2281,6 +2281,10 @@ JUDGE_MAX_UNITS = 200
 _TERMINAL = ("succeeded", "failed", "cancelled")
 
 FORMAL_JUDGED = "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+#: 正式运行、报告没开结论句裁判（结论句策略是不裁判或只要求附依据，升级前的运行也一样）：节点里没判过，照实说
+FORMAL_NO_JUDGE = "这份报告没有开启结论句裁判，正式运行的结论句不能按需裁判"
+#: 正式运行、开了裁判节点里却没判：报告没通过核对、节点按设置紧接着判失败时，不再花钱裁判
+FORMAL_UNJUDGED = "这份报告开启了结论句裁判，但报告未通过核对，结论句没有在报告撰写节点内完成裁判；正式运行的结论句不能按需裁判"
 UNSEALED_JUDGE = "运行尚未结束并封存（仍在运行、停在人工审批或正在继续运行），请在运行结束后再请模型裁判"
 LEGACY_JUDGE = "这次运行发起时系统尚未记录证据，不支持按需裁判"
 BROKEN_JUDGE = "封存核对未通过：封存后有事件被修改、删除或插入，报告和证据已不可信，无法再请模型裁判"
@@ -2374,17 +2378,21 @@ def _judge_meta(report: _Report, sealed: _Sealed) -> dict[str, Any] | None:
             "priced": data.get("priced") if isinstance(data.get("priced"), bool) else None, "writer_model": writer}
 
 
-def _on_demand(sealed: _Sealed, doc: dict[str, Any], uid: str, verdict: dict[str, Any] | None) -> dict[str, Any]:
-    """这句能不能「请模型判断」：{available, reason, message}。和 POST …/evidence/judge 同一套条件。"""
+def _on_demand(sealed: _Sealed, doc: dict[str, Any], uid: str, verdict: dict[str, Any] | None,
+               claims: str | None = None) -> dict[str, Any]:
+    """这句能不能「请模型判断」：{available, reason, message}。和 POST …/evidence/judge 同一套条件。
+
+    claims 是写这份报告时的结论句策略（_Report.claims）。不是结论句的先说：标题、连接性文字不论哪类运行都无需裁判。
+    以前正式运行一律先答「已在节点内完成裁判」，标题、没开裁判的报告也这么说（_formal_message）。"""
     def no(reason: str, message: str) -> dict[str, Any]:
         return {"available": False, "reason": reason, "message": message}
 
-    if sealed.run_class == "formal":
-        return no("formal", FORMAL_JUDGED)
-    if not sealed.ledger_on:
-        return no("legacy", LEGACY_JUDGE)
     if not candidates(doc, [uid]):
         return no("not_a_claim", f"这句{NOT_A_CLAIM}")
+    if sealed.run_class == "formal":
+        return no("formal", _formal_message(doc, claims))
+    if not sealed.ledger_on:
+        return no("legacy", LEGACY_JUDGE)
     stale = _stale(verdict)
     if isinstance(verdict, dict) and verdict.get("status") in SETTLED and not stale:
         return no("judged", JUDGED_ALREADY)
@@ -2402,6 +2410,27 @@ def _stale(verdict: Any) -> bool:
 
     封存的判定（文档里的，post_seal 为 False）不在此列：追加的判定盖不掉它，版本再旧也不重开。"""
     return isinstance(verdict, dict) and bool(verdict.get("post_seal")) and outdated(verdict)
+
+
+def _formal_message(doc: dict[str, Any] | None, claims: str | None) -> str:
+    """正式运行为什么不能按需裁判，照实说节点里判没判过：文档里有当场裁判的摘要（mode inline）才是判过了；开了裁判却
+    没有摘要的，是报告没通过核对、节点紧接着判失败，不再花钱裁判；别的是没开结论句裁判（策略为不裁判、只要求附依据，
+    升级前的运行没记策略，也没有裁判摘要）。"""
+    judge = (doc or {}).get("judge")
+    if isinstance(judge, dict) and judge.get("mode") == "inline":
+        return FORMAL_JUDGED
+    return FORMAL_UNJUDGED if claims == CLAIMS_JUDGE else FORMAL_NO_JUDGE
+
+
+def _formal_refusal(sealed: _Sealed, wanted: str | None) -> str:
+    """按需裁判接口拒绝正式运行时的那句话，和片段接口说的一致：按请求要的那份报告（没指定取成果里标注的那一份）说。
+    选不出报告、文档读不出来的，按没有裁判摘要说。"""
+    reports = _reports(sealed)
+    try:
+        chosen = _choose(reports, wanted, sealed) if reports else None
+    except CodedHTTPException:
+        chosen = None
+    return _formal_message(chosen.doc if chosen else None, chosen.claims if chosen else None)
 
 
 def _sealed_loader(sealed: _Sealed, *, chain: bool = False) -> Callable[[str], Any]:
@@ -2515,7 +2544,7 @@ async def judge_units(run_id: str, payload: Any = Body(None), report: str | None
     async with _JUDGING.hold(run_id):
         sealed = await _sealed(run_id)
         if sealed.run_class == "formal":
-            raise CodedHTTPException(409, FORMAL_JUDGED, JUDGE_FORMAL)
+            raise CodedHTTPException(409, _formal_refusal(sealed, wanted), JUDGE_FORMAL)
         if not sealed.ledger_on:
             raise CodedHTTPException(409, LEGACY_JUDGE, JUDGE_LEGACY)
         if not sealed.sealed or sealed.status not in _TERMINAL:
