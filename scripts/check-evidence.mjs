@@ -3489,7 +3489,8 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
   check('输入来源：没遮罩的字段照旧', verified.includes('与快照一致') && !verified.includes('遮罩'), verified.replace(/\s+/g, ' '))
   await q.ctx.close()
 
-  // ---- 反方审稿：整句面板、片段面板都看得到这一句的判断。复用审批卡的展示，概况是整份报告的真实计数，不预告出具
+  // ---- 反方审稿：整句面板、片段面板都看得到这一句的判断。用审批卡那一块的单句展示：只画这一句的判断，不画报告级的
+  // 标题和计数，不预告出具
   const u = fxj.formal.units
   const challenge = (verdict) => ({ verdict, node_id: 'chal', artifact: CH_ART, on_refuted: 'degrade', report_label: '写周报',
     counts: CH_COUNTS })
@@ -3528,10 +3529,12 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
     await c.page.waitForSelector('[data-evidence-panel] [data-ev-challenge] [data-challenge-item]', { timeout: 4000 }).catch(() => {})
     const text = await blockText()
     if (w === 1280) {
-      check('整句面板：反方审稿的判断（被推翻）挂在这一句下，写明是哪份报告的审稿', await block.getAttribute('data-ev-challenge', { timeout: 3000 }).catch(() => null) === 'refuted'
-        && text.includes('报告「写周报」的反方审稿') && text.includes('被推翻') && text.includes('新客首单'), text)
-      check('……概况是整份报告的真实计数（服务端给的），不凭这一句拼', text.includes('经受住 3 句') && text.includes('被削弱 1 句')
-        && text.includes('被推翻 2 句') && text.includes('无法判断 0 句') && await block.locator('[data-challenge-more="5"]').count() === 1, text)
+      check('整句面板：「反方审稿」一节写这一句的判断（被推翻），用单句展示', await block.getAttribute('data-ev-challenge', { timeout: 3000 }).catch(() => null) === 'refuted'
+        && text.startsWith('反方审稿') && await block.locator('[data-challenge-scope="claim"]').count() === 1
+        && (await block.locator('[data-challenge-tag="refuted"]').innerText().catch(() => '')).trim() === '被推翻', text)
+      check('……单句只画这一句：不画报告级的标题、四种判断的计数、别的句子，也不再抄一遍这一句的原文',
+        await block.locator('[data-challenge-counts], [data-challenge-items], [data-challenge-more], [data-challenge-show-all]').count() === 0
+        && !text.includes('报告「写周报」的反方审稿') && !/\d+ 句/.test(text) && !text.includes('增长主要来自新客首单'), text)
       check('……运行已经结束：不预告「出具会降档」，降没降档看报告的出具横幅', await block.locator(ISSUANCE_LINES).count() === 0
         && !text.includes('降档'), text)
       check('……判断由反方模型给出，并非系统核对', text.includes('并非系统核对'), text)
@@ -3539,12 +3542,12 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
       await c.page.waitForSelector('[data-evidence-panel] [data-challenge-detail-state="ok"]', { timeout: 4000 }).catch(() => {})
       const why = await block.locator('[data-challenge-rationale]').innerText().catch(() => '')
       check('……点开看得到反方的理由（按审稿记录取）', why.includes(CH_RATIONALE) && artifactHits.length === 1, why)
-      // 被削弱的那一句：概况照样是整份报告的数，不出现凭这一句拼的「被推翻 0 句」
+      // 被削弱的那一句：只写它自己的判断，不写整份报告的计数（以前借报告级的展示，读着像这一句「被推翻 0 句」）
       await badge(c.page, J, u.ok).click()
       await c.page.waitForSelector('[data-evidence-panel] [data-ev-challenge="weakened"]', { timeout: 4000 }).catch(() => {})
       const weak = await blockText()
-      check('被削弱的那一句：概况写整份报告的计数（被推翻 2 句），不写凭这一句拼的「被推翻 0 句」', weak.includes('被推翻 2 句')
-        && !weak.includes('被推翻 0 句') && !weak.includes('被削弱 1 句 · 被推翻 0 句'), weak)
+      check('被削弱的那一句：只写这一句的判断（被削弱），不写整份报告的计数', weak.includes('被削弱') && !weak.includes('被推翻')
+        && !/\d+ 句/.test(weak), weak)
       // 片段面板：点这一句里的数字，同样看得到判断；正式运行里双盲复算记的是出具缺口
       await c.page.locator(`${J} [data-seg="s6"]`).click()
       await c.page.waitForSelector('[data-evidence-panel] [data-ev-challenge="weakened"]', { timeout: 4000 }).catch(() => {})
@@ -3567,7 +3570,7 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
       await c.page.locator(`${JP} [data-seg="s14"]`).click()
       await c.page.waitForSelector('[data-evidence-panel] [data-ev-challenge]', { timeout: 4000 }).catch(() => {})
       check('没开结论句裁判的报告：点句中的数字看得到反方审稿判断', await block.getAttribute('data-ev-challenge', { timeout: 3000 }).catch(() => null) === 'refuted'
-        && (await blockText()).includes('退款 29 单'), await blockText())
+        && (await block.locator('[data-challenge-tag="refuted"]').count()) === 1, await blockText())
     } else {
       const wide = await c.page.evaluate(() => {
         const el = document.querySelector('[data-evidence-panel]')

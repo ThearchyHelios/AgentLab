@@ -11,58 +11,73 @@ import type {
 import { BlockView, CopyChip, Markdown, StyledSlice, inlineStyles, numericColumns } from './Markdown'
 
 export interface ChallengeSummaryProps {
-  /** 这张审批卡审的报告（payload.reports，和 ApprovalReports 拿到的是同一份） */
+  /**
+   * 审的报告：审批卡是 payload.reports（和 ApprovalReports 拿到的是同一份）；证据面板是按片段接口的 unit.challenge 拼的
+   * 一份，条目只有这一句
+   */
   reports: ApprovalReport[]
-  runId: string
+  /** 运行 id：要谈出具、又没给 runClass 时按它取一次运行类别 */
+  runId?: string
   /**
    * 这次运行的类别（审批自带的 approval.run_class，同 ApprovalReports 的 runClass）。给了就照它说、不再另取；没给
    * （老服务端的审批没有这一项）才按运行 id 取一次
    */
   runClass?: string | null
+  /**
+   * report（默认）：报告级的一块，审批卡用——标题、四种判断各几句、逐句列出、点开一句看理由和查询。
+   * claim：单句，证据面板用——只有这一句的判断、它可能没反查成的说明、展开看理由和查询，不画报告级的标题、计数和别的句子
+   * （面板里这一句就在正文上方；计数说的是整份报告，放在一句话的面板里读着像这一句的结果）。只取条目里的第一条
+   */
+  scope?: 'report' | 'claim'
+  /**
+   * 谈不谈出具（「出具会降档」、只标注、不在出具路径上）。默认谈：审批卡上运行还没出具，预告有用。证据面板看的是已经结束
+   * 的运行，降没降档、出没出具以报告的出具横幅（封存的出具判定）为准，再说一遍将来时的预告只会和横幅对不上（驳回了、
+   * 不予出具、反方审稿不在成果节点上游……）：传 false，一句和出具有关的话都不说，也不为此去取运行类别
+   */
+  issuance?: boolean
 }
 
 /**
- * 审批卡里反方审稿的摘要，紧跟在报告核对概况（ApprovalReports）后面：一行概况（四种判断各几句），出具相关的那一句，
- * 有句子反查没完成时再说一行「N 句未能反查」，逐句列出结论原文和判断，点开一句再按 challenge_artifact 取完整内容，看反方
- * 的理由和它执行过的查询。审稿记录没存上（没有工件）时只列判断、不能点开，整块说一次。
+ * 反方审稿的摘要。两种摆法：
+ * - 审批卡（scope 为 report），紧跟在报告核对概况（ApprovalReports）后面：一行概况（四种判断各几句），出具相关的那一句，
+ *   有句子反查没完成时再说一行「N 句未能反查」，逐句列出结论原文和判断，点开一句再按 challenge_artifact 取完整内容，看
+ *   反方的理由和它执行过的查询。审稿记录没存上（没有工件）时只列判断、不能点开，整块说一次。
+ * - 证据面板（scope 为 claim、issuance 为 false）：一句话的判断，展开同样按 challenge_artifact 取这一句的理由和查询。
  *
  * 判断是反方模型给的，不是系统核对：颜色照结论句裁判的那一套，「经受住」也不用确定性的绿。
- * 「出具会降档」只在正式运行、有被推翻的结论、被推翻的真会让出具降档时才写：服务端给了 degrades 就照它（按降档处置、又接
- * 在带出具契约的成果节点上游才为真），老服务端没给时按「没写只标注」算。只标注的写一句不影响出具，按降档处置却不在出具
- * 路径上的写一句为什么不影响；探索运行不出具，和出具有关的话一句不说。运行类别照审批卡给的（runClass，审批自带的那一项，
- * 卡顶写的也是它）；没给时按运行 id 从证据 store 取（loadRunClass），取到之前、取不到时都不说和出具有关的话（窗口重新
- * 拿到焦点时再取）。
+ * 「出具会降档」只在谈出具（issuance）、正式运行、有被推翻的结论、被推翻的真会让出具降档时才写：服务端给了 degrades 就照它
+ * （按降档处置、又接在带出具契约的成果节点上游才为真），老服务端没给时按「没写只标注」算。只标注的写一句不影响出具，按降档
+ * 处置却不在出具路径上的写一句为什么不影响；探索运行不出具，和出具有关的话一句不说。运行类别照审批卡给的（runClass，审批
+ * 自带的那一项，卡顶写的也是它）；没给时按运行 id 从证据 store 取（loadRunClass），取到之前、取不到时都不说和出具有关的话
+ * （窗口重新拿到焦点时再取）。
  *
  * 审的报告都没有经过反方审稿时什么都不画，也不发任何请求，卡片和以前一样。
  */
-/**
- * 审批卡上的反方审稿概况，约定之外服务端另带两项（期 4）：unreviewed 未能反查的句数，degrades 被推翻的会不会让出具降档。
- * 老服务端都不给
- */
-type Challenge = ApprovalChallenge & { unreviewed?: number; degrades?: boolean }
 type RunClass = 'formal' | 'exploratory'
 const runClassOf = (v: unknown): RunClass | null => (v === 'formal' || v === 'exploratory' ? v : null)
 
-export function ChallengeSummary({ reports, runId, runClass }: ChallengeSummaryProps) {
+export function ChallengeSummary({ reports, runId = '', runClass, scope = 'report', issuance = true }: ChallengeSummaryProps) {
   const reviewed = useMemo(() => reports.flatMap((r) => {
     const challenge = challengeOf(r)
     return challenge ? [{ report: r, challenge }] : []
   }), [reports])
   if (!reviewed.length) return null
-  return <ChallengeList reviewed={reviewed} runId={runId} given={runClassOf(runClass)} />
+  return <ChallengeList reviewed={reviewed} runId={runId} given={runClassOf(runClass)} scope={scope} issuance={issuance} />
 }
 
-function ChallengeList({ reviewed, runId, given }: {
-  reviewed: { report: ApprovalReport; challenge: Challenge }[]; runId: string; given: RunClass | null
+function ChallengeList({ reviewed, runId, given, scope, issuance }: {
+  reviewed: { report: ApprovalReport; challenge: ApprovalChallenge }[]; runId: string; given: RunClass | null
+  scope: 'report' | 'claim'; issuance: boolean
 }) {
-  // 审批卡给了运行类别就照它，不另取：另取的那一次失败了，正式运行里的「出具会降档」会无端消失，而卡顶照样写着正式运行
-  const fetched = useRunClass(given ? '' : runId)
-  const run = given ?? fetched
+  // 审批卡给了运行类别就照它，不另取：另取的那一次失败了，正式运行里的「出具会降档」会无端消失，而卡顶照样写着正式运行。
+  // 不谈出具的连取都不取：运行类别只用来决定说不说出具
+  const fetched = useRunClass(given || !issuance ? '' : runId)
+  const run = issuance ? given ?? fetched : null
   return (
     <>
-      {reviewed.map(({ report, challenge }) => (
-        <ChallengeBlock key={report.node_id} report={report} challenge={challenge} run={run} />
-      ))}
+      {reviewed.map(({ report, challenge }) => (scope === 'claim'
+        ? <ClaimBlock key={report.node_id} report={report} challenge={challenge} run={run} />
+        : <ChallengeBlock key={report.node_id} report={report} challenge={challenge} run={run} />))}
     </>
   )
 }
@@ -92,7 +107,7 @@ const count = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v 
  * payload.reports[i].challenge 认不认得：要么有计数、要么有条目。计数缺了按条目数（条目最多 10 条，计数才是全部）；
  * 条目缺了 unit 的留空（行的键带序号，区分得开），不补假的：补出来的键会被当成真的 unit 去和工件里的句子比
  */
-function challengeOf(report: ApprovalReport): Challenge | null {
+function challengeOf(report: ApprovalReport): ApprovalChallenge | null {
   const raw = report.challenge as unknown
   if (!raw || typeof raw !== 'object') return null
   const c = raw as Record<string, unknown>
@@ -111,6 +126,19 @@ function challengeOf(report: ApprovalReport): Challenge | null {
     ...(unreviewed !== undefined ? { unreviewed } : {}),
     ...(typeof c.degrades === 'boolean' ? { degrades: c.degrades } : {}),
   }
+}
+
+/**
+ * 出具相关的那一句说什么（run 为 null——不谈出具、不是正式运行、类别还不知道——时一句都不说）：
+ * degrade 会降档（写「出具会降档」和原因）；off 按降档处置却不在出具路径上（写为什么不影响）；flag 只标注（写不影响出具档位）
+ */
+type Issuance = 'degrade' | 'off' | 'flag' | null
+function issuanceOf(challenge: ApprovalChallenge, run: RunClass | null): Issuance {
+  if (run !== 'formal' || challenge.counts.refuted <= 0) return null
+  // 没给 on_refuted（老服务端）按降档；报错的节点到不了审批，不会是 fail
+  if (challenge.on_refuted === 'flag') return 'flag'
+  // 被推翻的真会让出具降档：服务端给了就照它，老服务端没给时按「不是只标注」算
+  return (challenge.degrades ?? true) ? 'degrade' : 'off'
 }
 
 /**
@@ -222,7 +250,7 @@ const focusLost = () => !document.activeElement || document.activeElement === do
 // ---------------------------------------------------------------- 卡片
 
 function ChallengeBlock({ report, challenge, run }: {
-  report: ApprovalReport; challenge: Challenge; run: RunClass | null
+  report: ApprovalReport; challenge: ApprovalChallenge; run: RunClass | null
 }) {
   const [open, setOpen] = useState<Set<string>>(() => new Set())
   const [all, setAll] = useState(false)
@@ -231,11 +259,7 @@ function ChallengeBlock({ report, challenge, run }: {
   const total = VERDICTS.reduce((n, v) => n + counts[v], 0)
   // 审批里没带工件：服务端保存审稿记录失败了。每句都看不了理由和查询，不画成能点开的样子，整块说一次
   const noRecord = !challenge.artifact
-  const refuted = counts.refuted > 0 && run === 'formal'
-  // 没给 on_refuted（老服务端）按降档；报错的节点到不了审批，不会是 fail
-  const flagged = challenge.on_refuted === 'flag'
-  // 被推翻的真会让出具降档：服务端给了就照它，老服务端没给时按「不是只标注」算
-  const degrades = challenge.degrades ?? !flagged
+  const said = issuanceOf(challenge, run)
   // 未能反查的每一句都记为无法判断（服务端的约定），不会多于概况里的「无法判断」：对不上时按概况的数说，两个数不打架
   const unreviewed = Math.min(challenge.unreviewed ?? 0, counts.inconclusive)
   // 条目之外的几句（条目最多 10 条）：要看全部时从工件里补上，排在后面，顺序照工件
@@ -284,27 +308,14 @@ function ChallengeBlock({ report, challenge, run }: {
               </span>
             </Fragment>
           ))}
-          {refuted && !flagged && degrades && (
-            <span className="chip shrink-0 font-semibold" data-challenge-degrade=""
-                  style={{ color: 'var(--st-failed)', borderColor: 'var(--st-failed)' }}>
-              <AlertTriangle size={11} aria-hidden /> {CHALLENGE_TEXT.degrade}
-            </span>
-          )}
+          {said === 'degrade' && <DegradeChip />}
         </div>
       ) : (
         <div className="text-2xs text-dim" data-challenge-empty="">{CHALLENGE_TEXT.none}</div>
       )}
       {/* 降档的原因常显，不放在悬停提示里：触屏、键盘用户也得看得到为什么、会怎样（只标注那一档同样常显一行）。
           紧跟在概况那一行（「出具会降档」的标记）下面，中间不插别的话 */}
-      {refuted && !flagged && degrades && (
-        <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-degrade-note="">{CHALLENGE_TEXT.degradeHint}</div>
-      )}
-      {refuted && !flagged && !degrades && (
-        <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-degrade-off="">{CHALLENGE_TEXT.degradeOff}</div>
-      )}
-      {refuted && flagged && (
-        <div className="mt-0.5 text-2xs leading-relaxed text-dim" data-challenge-flag="">{CHALLENGE_TEXT.flagNote}</div>
-      )}
+      <IssuanceNote said={said} />
       {/* 反查没完成的几句：「无法判断」里分不出查了数据不够和反查没做完，单独说一次 */}
       {unreviewed > 0 && (
         <p className="mt-0.5 text-2xs leading-relaxed" data-challenge-unreviewed={unreviewed}>
@@ -361,6 +372,79 @@ function ChallengeBlock({ report, challenge, run }: {
           {CHALLENGE_TEXT.judgedBy(detail.data?.model ?? null)}
         </p>
       )}
+    </div>
+  )
+}
+
+/** 「出具会降档」的醒目标记：跟在概况（单句时跟在判断）后面，原因由 IssuanceNote 常显在下一行 */
+function DegradeChip() {
+  return (
+    <span className="chip shrink-0 font-semibold" data-challenge-degrade=""
+          style={{ color: 'var(--st-failed)', borderColor: 'var(--st-failed)' }}>
+      <AlertTriangle size={11} aria-hidden /> {CHALLENGE_TEXT.degrade}
+    </span>
+  )
+}
+
+/** 出具相关的那一行：会降档的原因、不在出具路径上为什么不影响、只标注不影响出具档位。不谈出具时什么都不画 */
+function IssuanceNote({ said }: { said: Issuance }) {
+  const note = 'mt-0.5 text-2xs leading-relaxed text-dim'
+  if (said === 'degrade') return <div className={note} data-challenge-degrade-note="">{CHALLENGE_TEXT.degradeHint}</div>
+  if (said === 'off') return <div className={note} data-challenge-degrade-off="">{CHALLENGE_TEXT.degradeOff}</div>
+  if (said === 'flag') return <div className={note} data-challenge-flag="">{CHALLENGE_TEXT.flagNote}</div>
+  return null
+}
+
+/**
+ * 单句（证据面板）：这一句的判断；判为无法判断、这份报告又有句子未能反查时说一句它（可能）没反查成；展开看反方的理由和
+ * 它执行过的查询（按 challenge_artifact 取，和审批卡共用一份缓存）；最后写明判断出自反方模型。不画报告级的标题、四种
+ * 判断的计数和别的句子，也不列这一句的原文（面板上方就是这一句）。审稿记录没存上时不给展开，说一次为什么
+ */
+function ClaimBlock({ report, challenge, run }: {
+  report: ApprovalReport; challenge: ApprovalChallenge; run: RunClass | null
+}) {
+  const [open, setOpen] = useState(false)
+  const detail = useChallengeArtifact(challenge.artifact ?? '', open)
+  const detailId = useId()
+  const item = challenge.items[0]
+  if (!item) return null
+  const noRecord = !challenge.artifact
+  const said = issuanceOf(challenge, run)
+  // 未能反查的每一句都记为无法判断（服务端的约定）：这一句判为无法判断、报告里又有没反查成的，才可能是它。无法判断的
+  // 句子全是没反查成的（未能反查的不少于无法判断的），那就一定是它；还有查过了、数据不够的，说不准，照实说「可能」
+  const unreviewed = item.verdict === 'inconclusive' ? Math.min(challenge.unreviewed ?? 0, challenge.counts.inconclusive) : 0
+  const surely = unreviewed > 0 && unreviewed >= challenge.counts.inconclusive
+  return (
+    <div className="min-w-0 space-y-1 text-2xs leading-relaxed" data-challenge={report.node_id} data-challenge-scope="claim"
+         data-challenge-verdict={item.verdict}>
+      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+        <VerdictTag verdict={item.verdict} />
+        {said === 'degrade' && <DegradeChip />}
+        {!noRecord && (
+          <button type="button" className="btn btn-xs" aria-expanded={open} aria-controls={open ? detailId : undefined}
+                  data-challenge-toggle="" onClick={() => setOpen((v) => !v)}>
+            <ChevronRight size={11} aria-hidden style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }} />
+            {CHALLENGE_TEXT.claimDetail}
+          </button>
+        )}
+      </div>
+      <IssuanceNote said={said} />
+      {unreviewed > 0 && (
+        <p data-challenge-unreviewed={surely ? 'claim' : 'maybe'}>
+          <span className="font-medium" style={{ color: 'var(--st-waiting)' }}>
+            {surely ? CHALLENGE_TEXT.claimUnreviewed : CHALLENGE_TEXT.claimMaybeUnreviewed(unreviewed)}
+          </span>
+          <span className="text-dim">。{CHALLENGE_TEXT.unreviewedHint}</span>
+        </p>
+      )}
+      {open && (
+        <div id={detailId} className="min-w-0 space-y-2 rounded border p-2" data-challenge-detail={item.unit}>
+          <ClaimDetail item={item} detail={detail} />
+        </div>
+      )}
+      {noRecord && <p style={{ color: 'var(--st-waiting)' }} data-challenge-norecord="">{CHALLENGE_TEXT.noRecord}</p>}
+      {/* 判断标签看着像结论，得说清是谁判的：展开取到审稿记录之后带上模型名 */}
+      <p className="text-faint" data-challenge-judged="">{CHALLENGE_TEXT.judgedBy(detail.data?.model ?? null)}</p>
     </div>
   )
 }

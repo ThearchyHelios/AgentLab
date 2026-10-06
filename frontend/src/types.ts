@@ -2037,7 +2037,12 @@ export interface EvidenceGraph {
               /** 封存的裁判摘要（文档的 judge） */
               judge?: EvidenceJudgeSummary | null
               /** 最近一次按需裁判用的模型：和写作模型相同没有、在不在价格表里 */
-              judge_meta?: EvidenceJudgeMeta | null }[]
+              judge_meta?: EvidenceJudgeMeta | null
+              /**
+               * 期 4：被反方审过的句子 → 判断（_challenge_verdicts，和片段接口的 unit.challenge 同一个读法，每句的判断
+               * 一字不差）。正文据此给被审过的句子挂句末标记、点开整句面板。一句都没审、文档读不出来、老服务端都没有这个键
+               */
+              challenge_verdicts?: Record<string, ChallengeVerdict | (string & {})> }[]
   evidence?: { alias?: string; eid?: string; kind?: string; label?: string; node_id?: string; artifact?: string
                sealed?: boolean; cited_by?: string[]; report?: string }[]
   edges?: { from: string; to: string; rel: string }[]
@@ -2090,6 +2095,59 @@ export interface EvidenceInput {
   cell?: string
   /** agent 的数组字段：引用的行段到了截断查询结果的末行，后面还有没取回的行（query 步骤上是快照本身截断了） */
   truncated?: boolean | null
+  /**
+   * 期 4：取自数据源设置了遮罩的列（_withheld）：服务端已把值换成「已遮罩」、拿掉 model_value / snapshot_value，这里写明
+   * 是哪几列。没遮的没有这个键
+   */
+  masked?: string[]
+  /**
+   * 期 4：遮没遮核对不了（查询快照、取值链上的产出读不出来）：值同样换成「已遮罩」，这是原因（人话，服务端写好的一句）。
+   * 不进 masked：面板底下「这些列设置了遮罩」不把它们算进去
+   */
+  mask_unverified?: string
+}
+
+// ---------------------------------------------------------------------------
+// 期 4：证据接口里的核查状态（api/evidence.py）。是核查，不是证据：没核查过的指标、句子不带这些键。形状照服务端的
+// 真实输出逐字核对过，前端认的时候仍按「认不出就不画」写（run/EvidencePanel.tsx 的 dualCheckOf / challengeOf）
+// ---------------------------------------------------------------------------
+
+/** 双盲复算跳过一个指标的原因（_not_checked）：关闭了；这个指标没有来自查询的输入；不在复算范围内（或值不是数） */
+export type EvidenceDualCheckSkip = 'disabled' | 'no_inputs' | 'not_targeted'
+
+/**
+ * 指标步骤上的双盲复算状态（_dual_check_of / _dual_status）。没有双盲复算复核过这份指标集时指标步骤没有 dual_check。
+ * 产出读不出来、退回台账条目时只有 status、node_id 和 choice
+ */
+export interface EvidenceDualCheck {
+  /** agreed 与盲算一致；disagreed 不一致；unchecked 未能完成（盲算触顶、出错，或输入没法单独复算）；skipped 没复算这个指标 */
+  status: 'agreed' | 'disagreed' | 'unchecked' | 'skipped'
+  /** 双盲复算节点 */
+  node_id: string
+  /** 只有 disagreed：审核人的选择（a 采用原流程、b 采用盲算、neither 两边都不对）。没选的没有 */
+  choice?: DualCheckChoice
+  /** 只有 agreed / disagreed：盲算值，服务端按口径卡的格式渲染好的 */
+  blind_rendered?: string
+  /** unchecked：给人看的原因；skipped：EvidenceDualCheckSkip 里的代码（界面认不出的代码不显示） */
+  reason?: string
+}
+
+/** 句子上的反方审稿判断（_challenge_of）：片段接口答的 unit.challenge。没被反方审过的句子没有这个键 */
+export interface EvidenceUnitChallenge {
+  /** 这一句的判断（反方模型给的，不是系统核对） */
+  verdict: ChallengeVerdict | (string & {})
+  /** 反方审稿节点（几个都审了这一句时取最后跑完的那个） */
+  node_id: string
+  /** 审稿记录（challenge_artifact）。服务端保存失败时为 null：判断照样有，理由和查询看不了 */
+  artifact: string | null
+  /** 实际生效的处置：degrade 被推翻的计入出具缺口；flag 只标注；fail 节点报错、运行停了 */
+  on_refuted: 'degrade' | 'flag' | 'fail'
+  /** 报告撰写节点的名字（画布上的标题，取不到时是节点 id） */
+  report_label: string
+  /** 这次审稿四种判断各几句：整份报告的（节点产出里的那一份），不是这一句的 */
+  counts: ChallengeCounts
+  /** 没能反查的句数（都记为无法判断，不会多于 counts.inconclusive）。节点产出里有才带 */
+  unreviewed?: number
 }
 
 /** 口径卡钉在另一个已发布工作流某个版本里的口径卡上 */
@@ -2213,6 +2271,8 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   sql_check_failed?: boolean
   /** metric：没通过的原因（人话，「所依据的查询未通过 SQL 检查（…），结果不可靠」） */
   sql_check_reason?: string
+  /** metric（期 4）：这个指标的双盲复算状态。没有双盲复算复核过这份指标集时没有这个键 */
+  dual_check?: EvidenceDualCheck
   /** query：这次查询对照数据目录查出的问题。没查出问题时没有这个键 */
   checks?: SqlCheckItem[]
   /** query：查询当时冻结的表结构快照（工件 id）。合并查询、老快照没有 */
@@ -2366,7 +2426,9 @@ export interface EvidenceSegmentDetail {
           /** 这一句的判定：封存的文档里的，或者按最新的 evidence.judged 叠上的（post_seal） */
           verdict?: EvidenceVerdict
           /** 这一句能不能请模型判断、不能的话为什么 */
-          on_demand?: EvidenceOnDemand }
+          on_demand?: EvidenceOnDemand
+          /** 期 4：反方审稿对这一句的判断。没审到这一句的没有这个键 */
+          challenge?: EvidenceUnitChallenge }
   block?: { id?: string; type?: string }
   chain?: EvidenceStep[]
   /** 片段为什么是现在这个状态，一句人话 */
@@ -3666,6 +3728,13 @@ export interface ApprovalChallenge {
   /** challenge_artifact 工件 id。服务端保存审稿记录失败时为 null：判断照样有，理由和查询看不了 */
   artifact: string | null
   on_refuted?: 'degrade' | 'flag' | (string & {})
+  /** 期 4（nodes/challenge.challenge_summary）：没能反查的句数，都记为无法判断。升级前的产出、老服务端没有 */
+  unreviewed?: number
+  /**
+   * 期 4：被推翻的会不会让出具降档（按降档处置、又接在带出具契约的成果节点上游才为真）。升级前的产出、老服务端没有，
+   * 审批卡按「没写只标注就降档」的旧规则说
+   */
+  degrades?: boolean
 }
 
 /**

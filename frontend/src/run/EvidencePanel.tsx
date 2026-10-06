@@ -19,14 +19,15 @@ import {
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
 import {
-  ABSENCE_CLAIM_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT,
-  nodeTypeLabel,
+  ABSENCE_CLAIM_TEXT, CHALLENGE_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT,
+  SQL_CHECK_TEXT, nodeTypeLabel,
 } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
-  ApprovalReport, ChallengeCounts, EvidenceBlock, EvidenceDocData, EvidenceInput, EvidenceMerge, EvidenceOnDemand,
-  EvidenceQuoteSource, EvidenceSeal, EvidenceSegment, EvidenceStep, EvidenceUnit, EvidenceVerdict, EvidenceViolation,
+  ApprovalReport, EvidenceBlock, EvidenceDocData, EvidenceDualCheck, EvidenceInput, EvidenceMerge, EvidenceOnDemand,
+  EvidenceQuoteSource, EvidenceSeal, EvidenceSegment, EvidenceSegmentDetail, EvidenceStep, EvidenceUnit, EvidenceUnitChallenge,
+  EvidenceVerdict, EvidenceViolation,
 } from '../types'
 import { ArtifactViewer, ResultTable } from './AssistantStream'
 import { ChallengeSummary } from './ChallengeSummary'
@@ -76,10 +77,12 @@ import {
  * 表格底下带着推演结果。
  *
  * 核查状态（期 4）：指标步骤多一行双盲复算的结果（一致、不一致和审核人选了什么、未能完成、已跳过），选了盲算、两边都
- * 不对、没选、未能完成的写明报告里的数没换、已记为缺口；句子被反方审过的（点开整句、点开句中的数字都一样）多一块反方
- * 审稿，复用审批卡上的展示（run/ChallengeSummary），概况是整份报告真实的计数，点开这一句看反方的理由和查询，不说出具会
- * 不会降档（运行已经结束，看报告的出具横幅）。取自遮罩列的输入，服务端已把值换成「已遮罩」，标签照样写「已遮罩」，输入
- * 来源里只说核对结果、不写值；遮没遮核对不了的（快照读不出来）同样不显示值，写明原因。
+ * 不对、没选、未能完成的写明报告里的数没换、已记为缺口；句子被反方审过的（点开整句、点开句中的数字都一样）多一节反方
+ * 审稿，用审批卡那一块的单句展示（run/ChallengeSummary 的 scope="claim"）：这一句的判断、它可能没反查成的说明，展开看
+ * 反方的理由和查询，不画报告级的标题和计数，不说出具会不会降档（运行已经结束，看报告的出具横幅）。正文里被审过的句子
+ * 挂句末标记（run/EvidenceDoc），点开就是整句面板。取自遮罩列的输入，服务端已把值换成「已遮罩」，标签照样写「已遮罩」，
+ * 输入来源里只说核对结果、不写值；遮没遮核对不了的（快照读不出来）同样不显示值，写明原因。类型都在 types.ts
+ * （EvidenceDualCheck、EvidenceUnitChallenge、EvidenceInput 的 masked / mask_unverified）。
  *
  * 四种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
  * 画布右栏里直接栏内展开，dock 放进页面给的一块常驻位置（记录页的「证据」页签）。
@@ -87,51 +90,24 @@ import {
  */
 
 /**
- * 期 4：证据接口在指标步骤上给的双盲复算状态（api/evidence.py 的 _dual_check_of）。没有双盲复算复核过这份指标集时
- * 没有这个键。只有证据面板读它，类型就近写在这里
+ * 期 4：证据接口在指标步骤上给的双盲复算状态（类型 EvidenceDualCheck，照 api/evidence.py 的 _dual_check_of）。没有双盲
+ * 复算复核过这份指标集时没有这个键；状态不是一个词的不认
  */
-interface DualCheckState {
-  status: 'agreed' | 'disagreed' | 'unchecked' | 'skipped' | (string & {})
-  node_id?: string
-  /** 不一致时审核人的选择：a 采用原流程、b 采用盲算、neither 两边都不对。没选的没有 */
-  choice?: string
-  /** 一致、不一致时的盲算值，服务端按口径卡的格式渲染好的 */
-  blind_rendered?: string
-  /** 未能完成（unchecked）：原因（人话）；已跳过：disabled / no_inputs / not_targeted（按这个指标说），认不出的代码不显示 */
-  reason?: string
-}
-
-/** 期 4：证据接口在句子上给的反方审稿判断（api/evidence.py 的 _challenge_of）。没审到这一句时没有这个键 */
-interface UnitChallenge {
-  verdict: string
-  node_id?: string
-  /** 审稿记录（challenge_artifact）。服务端保存失败时为 null：判断照样有，理由和查询看不了 */
-  artifact?: string | null
-  /** 实际生效的处置：degrade 被推翻的计入出具缺口；flag 只标注；fail 节点报错、运行停了 */
-  on_refuted?: string
-  /** 报告撰写节点的名字 */
-  report_label?: string
-  /** 整份报告的审稿计数（节点产出里的那一份），不是这一句的 */
-  counts: ChallengeCounts
-  /** 没能反查的句数（期 4 起的产出才有） */
-  unreviewed?: number
-}
-
-function dualCheckOf(step?: EvidenceStep): DualCheckState | null {
-  const raw = (step as (EvidenceStep & { dual_check?: unknown }) | undefined)?.dual_check
-  return raw && typeof raw === 'object' && typeof (raw as DualCheckState).status === 'string' ? raw as DualCheckState : null
+function dualCheckOf(step?: EvidenceStep): EvidenceDualCheck | null {
+  const raw: unknown = step?.dual_check
+  return raw && typeof raw === 'object' && typeof (raw as EvidenceDualCheck).status === 'string' ? raw as EvidenceDualCheck : null
 }
 
 const CHALLENGE_VERDICTS = ['stands', 'weakened', 'refuted', 'inconclusive'] as const
 
 /**
- * 句子上的反方审稿判断认不认得：判断是一个词，计数四项都是数。没有计数的不画——审批卡的展示缺了计数会按列出的这一句
- * 拼一个「被推翻 1 句、其余 0 句」，读着像整份报告的结果
+ * 句子上的反方审稿判断（类型 EvidenceUnitChallenge，照 _challenge_of）认不认得：判断是一个词，计数四项都是数。单句展示
+ * 不画计数，可要拿它和 unreviewed 对一下「无法判断」是不是没反查成；缺了计数不是服务端的形状，宁可不画也不半截地画
  */
-function challengeOf(unit: unknown): UnitChallenge | null {
-  const raw = unit && typeof unit === 'object' ? (unit as { challenge?: unknown }).challenge : undefined
+function challengeOf(unit: EvidenceSegmentDetail['unit']): EvidenceUnitChallenge | null {
+  const raw: unknown = unit?.challenge
   if (!raw || typeof raw !== 'object') return null
-  const c = raw as UnitChallenge
+  const c = raw as EvidenceUnitChallenge
   const counts = c.counts && typeof c.counts === 'object' ? c.counts : null
   if (typeof c.verdict !== 'string' || !c.verdict || !counts
     || !CHALLENGE_VERDICTS.every((v) => typeof counts[v] === 'number' && Number.isFinite(counts[v]))) return null
@@ -140,13 +116,13 @@ function challengeOf(unit: unknown): UnitChallenge | null {
 
 /** 取自遮罩列的输入：服务端把值换成「已遮罩」，masked 写明是哪几列 */
 function maskedOf(input: EvidenceInput): string[] {
-  const raw = (input as EvidenceInput & { masked?: unknown }).masked
+  const raw: unknown = input.masked
   return Array.isArray(raw) ? raw.filter((c): c is string => typeof c === 'string' && !!c) : []
 }
 
 /** 遮没遮核对不了的输入（快照、取值链上的产出读不出来）：值同样换成「已遮罩」，mask_unverified 是原因 */
 function unverifiedOf(input: EvidenceInput): string {
-  const raw = (input as EvidenceInput & { mask_unverified?: unknown }).mask_unverified
+  const raw: unknown = input.mask_unverified
   return typeof raw === 'string' ? raw : ''
 }
 
@@ -660,28 +636,27 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block }: {
 }
 
 /**
- * 反方审稿对这一句的判断（期 4），整句面板、片段面板共用。复用审批卡上的展示（run/ChallengeSummary，只读它的导出）：
- * 那一块是报告级的——标题写报告名，概况是整份报告四种判断各几句（服务端给的真实计数，不凭这一句拼），条目只列这一句，
- * 点开看反方的理由和它执行的查询，「显示全部」补出这份报告别的句子。判断是反方模型给的，那一块自己写明。
+ * 反方审稿对这一句的判断（期 4），整句面板、片段面板共用。用审批卡那一块的单句展示（ChallengeSummary 的 scope="claim"）：
+ * 只画这一句的判断、它可能没反查成的说明（透传 unreviewed，和整份报告的计数对一下），展开看反方的理由和它执行的查询；
+ * 不画报告级的标题、四种判断的计数和别的句子。判断是反方模型给的，那一块自己写明。
  *
- * 不给运行 id：ChallengeSummary 只拿它查运行类别，好在审批卡上预告「出具会降档」。证据面板看的是已经结束的运行，降没
- * 降档、出没出具以报告的出具横幅（封存的出具判定）为准，这里再说一遍将来时的预告只会和横幅对不上（驳回了、不予出具、
- * 反方审稿不在成果节点上游……）。ChallengeSummary 取不到运行类别时一句和出具有关的话都不说。等它有了单句的展示
- * （只画这一句的判断和理由，不画报告级的标题、计数），换用那个
+ * 不谈出具（issuance={false}，也不传 degrades）：审批卡上预告「出具会降档」，是因为那时运行还没出具。证据面板看的是已经
+ * 结束的运行，降没降档、出没出具以报告的出具横幅（封存的出具判定）为准，再说一遍将来时的预告只会和横幅对不上（驳回了、
+ * 不予出具、反方审稿不在成果节点上游……）
  */
-function ChallengePart({ challenge, unit, report }: { challenge: UnitChallenge; unit: EvidenceUnit; report?: string }) {
+function ChallengePart({ challenge, unit, report }: { challenge: EvidenceUnitChallenge; unit: EvidenceUnit; report?: string }) {
   const reports = useMemo<ApprovalReport[]>(() => [{
     node_id: report ?? '', label: challenge.report_label || report || '',
     challenge: {
       counts: challenge.counts, items: [{ unit: unit.id, text: unitText(unit).trim(), verdict: challenge.verdict }],
       artifact: challenge.artifact ?? null, on_refuted: challenge.on_refuted,
       ...(typeof challenge.unreviewed === 'number' ? { unreviewed: challenge.unreviewed } : {}),
-    } as ApprovalReport['challenge'],
+    },
   }], [challenge, unit, report])
   return (
-    <div data-ev-challenge={challenge.verdict}>
-      <ChallengeSummary reports={reports} runId="" />
-    </div>
+    <Part title={CHALLENGE_TEXT.claimTitle} data-ev-challenge={challenge.verdict}>
+      <ChallengeSummary reports={reports} scope="claim" issuance={false} />
+    </Part>
   )
 }
 
@@ -1380,12 +1355,12 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
  * 不一致而审核人采用了原流程用提醒色，采用盲算、两边都不对、没有选的用失败色（记了缺口）；未能完成用提醒色（同样记了
  * 缺口）；跳过的中性色。认不出的跳过原因不写原因代码
  */
-function DualCheckLine({ check, formal }: { check: DualCheckState; formal: boolean }) {
+function DualCheckLine({ check, formal }: { check: EvidenceDualCheck; formal: boolean }) {
   const T = EVIDENCE_TEXT.dualCheck
   const host = useEvidenceHost()
   const { status } = check
   const blind = (status === 'agreed' || status === 'disagreed') && check.blind_rendered ? T.blind(check.blind_rendered) : ''
-  const picked = check.choice ? DUAL_CHECK_TEXT.approval.choices[check.choice as 'a' | 'b' | 'neither'] : undefined
+  const picked = check.choice ? DUAL_CHECK_TEXT.approval.choices[check.choice] : undefined
   const detail = status === 'disagreed' ? (picked ? T.choice(picked) : T.noChoice)
     : status === 'skipped' ? (check.reason ? T.skip[check.reason] ?? '' : '')
       : status === 'unchecked' ? check.reason ?? '' : ''
