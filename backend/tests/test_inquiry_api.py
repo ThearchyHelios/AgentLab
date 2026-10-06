@@ -12,9 +12,14 @@
   事件里记的报告文档不是这次运行的 422；输入不合法 422，指明是哪一项
 - 回答：先给结论，数字只能引用自己查询的格子或报告已有的指标，裸数字被标出（提问人自己写的数不标）；遮罩列（起了
   别名的、和 * 写在一起没起别名的表达式也算）的格子渲染成「已遮罩」，回答正文、查询清单、事件、质询工件里都不出现
-  遮罩列的值；换着写法找某一个客户（简单 CASE、IN (VALUES …)、两头相同的范围、行值、选出列里写着同一个号码……）
-  也一样；遮罩值不误伤阈值、天数、LIMIT（长的数也一样）、提问人自己写的数、报告口径卡里的指标；SQL 里照原样留着的
-  阈值只在回答正文里不遮，格子照旧按值遮，回答和质询工件对得上；质询工件按值遮只出现在报告快照里的遮罩值
+  遮罩列的值；换着写法找某一个客户（简单 CASE、IN (VALUES …)、两头相同的范围、行值、选出列里写着同一个号码，两半
+  拆到 ON 和 WHERE、WHERE 和 HAVING、INTERSECT 两支、CTE 里，边界、等值写成算式，两头不是整数，范围再排除一头，
+  号码前面补零……）也一样，年龄这类短的值换着写法找（套了 CAST、汇总值两头相同、补零、取模和整数相除算出来的边界……）
+  SQL 里也遮；遮罩值不误伤阈值、天数、LIMIT（长的数也一样）、提问人自己写的数、报告口径卡里的指标，分档共用的边界、
+  和日期、天数修饰、标签里写着的同一个数也不牵连阈值，分档的文字标签不当遮罩值（当分组键的档位列照常显示），改了
+  名字的遮罩列、UNION 另一支取的遮罩列撞上标签照样遮；SQL 里照原样留着的阈值只在回答正文里不遮，格子照旧按值遮，
+  回答和质询工件对得上；质询工件按值遮只出现在报告快照里的遮罩值；一格文字里夹着遮罩值时回答整份不交，质询工件里
+  只换掉那一截；质询工件里 SQL 检查结果的片段、说明照整条 SQL 换（短的数也换），给模型的那句改法不交出去
 - 接线：设置里的上限、运行固定的数据版本交到 agent 手里（上传表格重传之后查的仍是运行固定的那一版）；同名重建的
   数据源、没固定过版本的上传表格不查
 - 触顶、失败照样记一条事件，说法给提问人看得懂、说下一步；轮数用完不算查询次数到顶，查询失败、引用解析不了在末尾注明
@@ -989,6 +994,180 @@ async def test_numbers_that_merely_match_a_short_masked_value_are_left_alone(mon
         await engines.invalidate(source_id)
 
 
+async def test_a_threshold_matching_numbers_left_alone_elsewhere_is_sealed_as_written(monkeypatch, tmp_path, client):
+    """遮罩列是年龄：阈值 30、31 和天数修饰、日期、年龄段标签里写着的同一个数撞在一起。那些地方一个字没换，阈值也
+    照原样封存（回答正文本来就写着「30 岁」），质询工件的 SQL 和事件里一字不差；找某一个年龄的等值照样遮，同一条
+    SQL 里的阈值也跟着遮——留着就把等值里换掉的露了。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "age"}, script=AGED)
+    graph = chain(node("start", "input"),
+                  node("fetch", "tool", tool=f"db_query__{name}",
+                       args={"sql": "SELECT region AS 区域, age, amount AS 金额 FROM sales ORDER BY id"}),
+                  node("write", "report", "写周报", instructions="写周报"),
+                  node("gate", "human", mode="approve", title="周报可以出具吗"),
+                  node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
+    recent = "SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 30 AND paid_on >= DATE('2026-02-03', '-30 days')"
+    older = "SELECT COUNT(*) AS 人数 FROM sales WHERE age > 31 AND paid_on <= '2026-01-31'"
+    # 规格原句：按年龄分档的标签里写着同样的 30。标签是 agent 写在 SQL 里的字，不是遮罩值，阈值和标签都照原样
+    bands = ("SELECT CASE WHEN age < 30 THEN '30岁以下' ELSE '30岁及以上' END AS 年龄段, COUNT(*) AS 人数 FROM sales "
+             "GROUP BY 1 ORDER BY 1")
+    exact = "SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 30 AND age = 30"
+    plays = {"年龄大的": Play([recent, older, bands, exact],
+                            "近 30 天、30 岁及以上的有 [[v:Q1.r0.人数]] 人，31 岁以上、1 月 31 日前付款的有 "
+                            "[[v:Q2.r0.人数]] 人；[[v:Q3.r0.年龄段]]的有 [[v:Q3.r0.人数]] 人。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=graph)
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="近期年龄大的客户多不多？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert item["answer"]["text"] == ("近 30 天、30 岁及以上的有 2 人，31 岁以上、1 月 31 日前付款的有 0 人；"
+                                          "30岁以下的有 2 人。")
+        sealed = [recent, older, bands, "SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 已遮罩 AND age = 已遮罩"]
+        assert [q["sql"] for q in item["queries"]] == sealed
+        [event] = await events(paused.id, "approval.inquiry")
+        assert [q["sql"] for q in event.data["queries"]] == sealed
+        for query, sql in zip(item["queries"], sealed):
+            got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+            assert got.status_code == 200 and got.json()["content"]["sql"] == sql, "质询工件的 SQL 和事件里的一字不差"
+    finally:
+        await engines.invalidate(source_id)
+
+
+@pytest.mark.parametrize("sql, sealed", [
+    pytest.param("SELECT COUNT(*) AS 人数 FROM sales WHERE CAST(age AS INTEGER) = 25",
+                 "SELECT COUNT(*) AS 人数 FROM sales WHERE CAST(age AS INTEGER) = 已遮罩", id="套了 CAST"),
+    pytest.param("SELECT COUNT(*) AS 人数 FROM sales GROUP BY age HAVING MAX(age) BETWEEN 25 AND 25",
+                 "SELECT COUNT(*) AS 人数 FROM sales GROUP BY age HAVING MAX(age) BETWEEN 已遮罩 AND 已遮罩",
+                 id="汇总值两头相同"),
+    pytest.param("SELECT COUNT(*) AS 人数 FROM sales WHERE age = 25.0",
+                 "SELECT COUNT(*) AS 人数 FROM sales WHERE age = 已遮罩", id="补零的写法"),
+    pytest.param("SELECT COUNT(*) AS 人数 FROM sales WHERE age > 24.5 AND age < 25.5",
+                 "SELECT COUNT(*) AS 人数 FROM sales WHERE age > 已遮罩 AND age < 已遮罩", id="两头不是整数"),
+    pytest.param("SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 25 AND age <= 26 AND age <> 26",
+                 "SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 已遮罩 AND age <= 26 AND age <> 已遮罩",
+                 id="范围再排除一头"),
+    pytest.param("SELECT COUNT(*) AS 人数 FROM sales WHERE age BETWEEN 20 + 5 AND 30 - 5",
+                 "SELECT COUNT(*) AS 人数 FROM sales WHERE age BETWEEN 已遮罩 + 已遮罩 AND 已遮罩 - 已遮罩",
+                 id="算出来的边界"),
+    # 第 3 轮复核：取模、整数相除（SQLite 里只留整数部分）算出来的边界
+    pytest.param("SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 25 AND age <= 125 % 100",
+                 "SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 已遮罩 AND age <= 已遮罩 % 已遮罩",
+                 id="取模算出来的边界"),
+    pytest.param("SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 25 AND age < 53 / 2",
+                 "SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 已遮罩 AND age < 已遮罩 / 已遮罩",
+                 id="整数相除算出来的边界"),
+])
+async def test_a_short_masked_value_looked_up_in_other_shapes_is_sealed_masked(monkeypatch, tmp_path, client, sql,
+                                                                                 sealed):
+    """年龄设了遮罩，agent 换着写法找某一个年龄（套了 CAST、汇总值两头相同、补零、两头不是整数、范围再排除一头、
+    算出来的边界，取模、整数相除算出来的边界）：第 2、3 轮复核时都照原样封存。现在查询清单、事件、质询工件里的 SQL
+    都换掉这个年龄，三处一字不差。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "age"}, script=AGED)
+    graph = chain(node("start", "input"),
+                  node("fetch", "tool", tool=f"db_query__{name}",
+                       args={"sql": "SELECT region AS 区域, age, amount AS 金额 FROM sales ORDER BY id"}),
+                  node("write", "report", "写周报", instructions="写周报"),
+                  node("gate", "human", mode="approve", title="周报可以出具吗"),
+                  node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
+    plays = {"这个年龄": Play([sql], "这个年龄的有 [[v:Q1.r0.人数]] 人。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=graph)
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="这个年龄的客户有几位？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (True, "这个年龄的有 1 人。")
+        [query] = item["queries"]
+        assert query["sql"] == sealed
+        [event] = await events(paused.id, "approval.inquiry")
+        assert event.data["queries"][0]["sql"] == sealed
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+        assert got.status_code == 200 and got.json()["content"]["sql"] == sealed, "质询工件的 SQL 和事件里的一字不差"
+    finally:
+        await engines.invalidate(source_id)
+
+
+#: 会员等级设了遮罩：等级是 1、2、3 这样的短码值，正好撞上按条件数个数写的 THEN 1 ELSE 0
+LEVELS = ("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, vip_level INTEGER, amount INTEGER);"
+          "INSERT INTO sales VALUES (1, '华东', 1, 1200), (2, '华东', 2, 300), (3, '华南', 3, 900),"
+          " (4, '华北', 1, 1500);")
+
+
+async def test_a_renamed_masked_column_keeps_values_that_match_labels_written_elsewhere(monkeypatch, tmp_path, client):
+    """第 2 轮复核：先按等级数大单（vip_level AS 等级，SUM(CASE … THEN 1 ELSE 0 END)），再找等级为 1、2 的。以前分档标签
+    1、0 不收进遮罩值，改了名字的等级列也跟着不收，WHERE vip_level = 1 照原样封存，= 2 却遮了。现在只有只装着标签的
+    列不收，两条都遮；按等级数大单的那份快照里，等级整列遮，大单数照常显示。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "vip_level"}, script=LEVELS)
+    by_level = ("SELECT vip_level AS 等级, SUM(CASE WHEN amount > 1000 THEN 1 ELSE 0 END) AS 大单数 FROM sales "
+                "GROUP BY vip_level ORDER BY vip_level")
+    first, second = (f"SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = {level}" for level in (1, 2))
+    plays = {"各等级": Play([by_level, first, second],
+                         "大单最多的等级有 [[v:Q1.r0.大单数]] 笔大单；问到的两个等级各有 [[v:Q2.r0.人数]] 人、"
+                         "[[v:Q3.r0.人数]] 人。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=fetching(name, AMOUNTS))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="各等级的大单多不多？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (
+            True, "大单最多的等级有 2 笔大单；问到的两个等级各有 2 人、1 人。")
+        sealed = [by_level, *["SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = 已遮罩"] * 2]
+        assert [q["sql"] for q in item["queries"]] == sealed
+        [event] = await events(paused.id, "approval.inquiry")
+        assert [q["sql"] for q in event.data["queries"]] == sealed
+        for query, sql in zip(item["queries"], sealed):
+            got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+            assert got.status_code == 200 and got.json()["content"]["sql"] == sql, "质询工件的 SQL 和事件里的一字不差"
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{item['queries'][0]['artifact']}")
+        assert got.json()["content"]["rows"] == [["已遮罩", 2], ["已遮罩", 0], ["已遮罩", 0]]
+        assert got.json()["masked"] == ["等级"]
+    finally:
+        await engines.invalidate(source_id)
+
+
+@pytest.mark.parametrize("mixed", [
+    pytest.param("SELECT CASE WHEN amount > 1000 THEN 1 ELSE 0 END AS 等级 FROM sales UNION ALL "
+                 "SELECT vip_level FROM sales", id="标签在前、遮罩列在后"),
+    pytest.param("SELECT CASE WHEN amount > 1000 THEN 1 ELSE 0 END AS 等级 FROM sales UNION ALL "
+                 "SELECT b.vip_level AS 等级 FROM (SELECT vip_level FROM sales) b", id="遮罩列经子查询按原名传出"),
+])
+async def test_a_masked_column_after_a_label_in_a_union_keeps_its_values(monkeypatch, tmp_path, client, mixed):
+    """第 3 轮复核：UNION 的第一支是按条件数大单的标签（THEN 1 ELSE 0），另一支取的是等级（遮罩列原样选出，或者经按
+    原名选出的子查询、以标签的别名传出）。以前这一列被当成只装着标签，等级 1 撞上标签 1 不收，之后 WHERE vip_level = 1
+    在查询清单、事件、质询工件里都照原样，= 2 却遮了。现在这一列在一支里取的是遮罩列，就照收，两条都遮。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "vip_level"}, script=LEVELS)
+    first, second = (f"SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = {level}" for level in (1, 2))
+    plays = {"各等级": Play([mixed, first, second],
+                         "问到的两个等级各有 [[v:Q2.r0.人数]] 人、[[v:Q3.r0.人数]] 人。[[see:Q2]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=fetching(name, AMOUNTS))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="各等级的客户有几位？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (True, "问到的两个等级各有 2 人、1 人。")
+        sealed = [mixed, *["SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = 已遮罩"] * 2]
+        assert [q["sql"] for q in item["queries"]] == sealed
+        [event] = await events(paused.id, "approval.inquiry")
+        assert [q["sql"] for q in event.data["queries"]] == sealed
+        for query, sql in zip(item["queries"], sealed):
+            got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+            assert got.status_code == 200 and got.json()["content"]["sql"] == sql, "质询工件的 SQL 和事件里的一字不差"
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{item['queries'][0]['artifact']}")
+        assert {cell for [cell] in got.json()["content"]["rows"]} == {"已遮罩"} and got.json()["masked"] == ["等级"]
+    finally:
+        await engines.invalidate(source_id)
+
+
 STAR_TAIL = "SELECT *, SUBSTR(buyer_phone, 4) FROM sales ORDER BY amount DESC LIMIT 1"
 
 
@@ -1116,6 +1295,53 @@ async def test_a_metric_from_the_report_that_equals_a_masked_value_can_be_cited(
     assert got.json()["content"]["rows"] == [["已遮罩"]] and got.json()["masked"] == ["金额"]
 
 
+#: 规格原句：按金额分档的文字标签，两个 WHEN 分支共用边界 20000
+BANDS = "CASE WHEN amount BETWEEN 0 AND 20000 THEN '小单' WHEN amount BETWEEN 20000 AND 60000 THEN '大单' END"
+
+
+@pytest.mark.parametrize("sql, answer, text, rows, masked", [
+    # 档位当分组键（每一档一行）：标签是 agent 写在 SQL 里的字，不是遮罩值，格子照常显示，正文、SQL 里照原样
+    pytest.param(f"SELECT {BANDS} AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 1 ORDER BY 1",
+                 "以 20000 元为界，[[v:Q1.r0.档位]] [[v:Q1.r0.笔数]] 笔，[[v:Q1.r1.档位]] [[v:Q1.r1.笔数]] 笔，"
+                 "小单更多。[[see:Q1]]",
+                 "以 20000 元为界，大单 2 笔，小单 3 笔，小单更多。", [["大单", 2], ["小单", 3]], [], id="两个 WHEN 分支"),
+    pytest.param("SELECT COUNT(CASE WHEN amount <= 20000 THEN 1 END) AS 小单, "
+                 "COUNT(CASE WHEN amount >= 20000 THEN 1 END) AS 大单 FROM sales",
+                 "不超过 20000 元的有 [[v:Q1.r0.小单]] 笔，不低于 20000 元的有 [[v:Q1.r0.大单]] 笔。[[see:Q1]]",
+                 "不超过 20000 元的有 3 笔，不低于 20000 元的有 3 笔。", [[3, 3]], [], id="两个选出列"),
+    # 规格原句的 SUM(CASE …)：边界照原样封存、正文里不遮；汇总的是写死的 1 和 0，就是按条件数个数（同 COUNT），
+    # 格子照常显示
+    pytest.param("SELECT SUM(CASE WHEN amount <= 20000 THEN 1 ELSE 0 END) AS 小单, "
+                 "SUM(CASE WHEN amount >= 20000 THEN 1 ELSE 0 END) AS 大单 FROM sales",
+                 "以 20000 元为界：不超过的 [[v:Q1.r0.小单]] 笔，不低于的 [[v:Q1.r0.大单]] 笔。[[see:Q1]]",
+                 "以 20000 元为界：不超过的 3 笔，不低于的 3 笔。", [[3, 3]], [], id="两个 SUM(CASE…) 选出列"),
+    pytest.param("SELECT '小单' AS 档位, COUNT(*) AS 笔数 FROM sales WHERE amount <= 20000 "
+                 "UNION ALL SELECT '大单', COUNT(*) FROM sales WHERE amount >= 20000",
+                 "不超过 20000 元的有 [[v:Q1.r0.笔数]] 笔，不低于 20000 元的有 [[v:Q1.r1.笔数]] 笔。[[see:Q1]]",
+                 "不超过 20000 元的有 3 笔，不低于 20000 元的有 3 笔。", [["小单", 3], ["大单", 3]], [], id="UNION 两支"),
+])
+async def test_band_edges_shared_by_separate_conditions_are_sealed_and_shown_as_written(
+        monkeypatch, big_shop, client, sql, answer, text, rows, masked):
+    """金额设了遮罩，分档的边界 20000 正好是某一笔的金额：两个 WHEN 分支、两个选出列、UNION 两支各写一边，各是各的
+    条件，没有夹住哪一笔。SQL 照原样封存，回答正文里复述的边界、档位标签也不遮，质询工件的 SQL 和事件里一字不差。"""
+    plays = {"两万元上下": Play([sql], answer)}
+    Models(monkeypatch, big_shop, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    paused = await pause(big_shop, graph=fetching(big_shop, AMOUNTS))
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="两万元上下各有几笔？",
+                  approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    item = r.json()["inquiry"]
+    assert (item["answer"]["ok"], item["answer"]["text"]) == (True, text)
+    [query] = item["queries"]
+    assert query["sql"] == sql
+    [event] = await events(paused.id, "approval.inquiry")
+    assert event.data["queries"][0]["sql"] == sql
+    got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+    assert got.status_code == 200 and got.json()["content"]["sql"] == sql, "质询工件的 SQL 和事件里的一字不差"
+    assert (got.json()["content"]["rows"], got.json()["masked"]) == (rows, masked)
+
+
 async def test_a_masked_value_the_asker_wrote_stays_in_the_sql(monkeypatch, tmp_path, client):
     """提问人自己写的数恰好是遮罩列里的值（金额设了遮罩，问的就是 300 那一笔）：问题里原样写着，SQL 里和金额做等值
     比较也不换，事件、质询工件里封存的就是实际执行的那条。"""
@@ -1170,6 +1396,114 @@ async def test_a_value_seen_only_in_the_reports_snapshot_is_masked_in_the_artifa
         await engines.invalidate(source_id)
 
 
+#: 另有一张回访记录：备注里写着手机号，备注这一列没设遮罩
+CALLBACKS = SALES + ("CREATE TABLE callbacks (id INTEGER PRIMARY KEY, region TEXT, note TEXT);"
+                     "INSERT INTO callbacks VALUES (1, '华东', '客户13900000001来电改址'), (2, '华南', '例行回访');")
+#: 回答中含有遮罩值、整份不交时给提问人的说法
+LEAKED = "回答中含有设了遮罩的值，无法遮住，已不予展示，请换个问法重新提问"
+
+
+async def test_a_masked_value_inside_a_text_cell_is_cut_out_of_the_artifact(monkeypatch, tmp_path, client):
+    """备注里写着手机号（备注没设遮罩，手机号设了遮罩、被报告取数选中）：agent 引用这一格，回答照旧整份不交；
+    质询工件里这份快照照样记着、点得开，那一格里的号码换成「已遮罩」，别的字、别的格子照原样，不然「不予展示」
+    旁边一点就能看到原值。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=CALLBACKS)
+    notes = "SELECT region AS 区域, note AS 备注 FROM callbacks ORDER BY id"
+    plays = {"回访": Play([notes], "华东的回访备注是 [[v:Q1.r0.备注]]。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="金额最高的一笔 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        report_sql = "SELECT buyer_phone, amount AS 金额 FROM sales ORDER BY amount DESC"
+        paused = await pause(name, graph=fetching(name, report_sql))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="华东的回访说了什么？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        assert "1390000000" not in r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"], item["answer"]["doc_artifact"]) == (False, "", None)
+        assert item["answer"]["error"] == LEAKED
+        [query] = item["queries"]
+        assert query["sql"] == notes
+        [event] = await events(paused.id, "approval.inquiry")
+        assert event.data["inquiry_artifacts"] == [query["artifact"]]
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+        assert got.status_code == 200, got.text
+        assert got.json()["content"]["rows"] == [["华东", "客户已遮罩来电改址"], ["华南", "例行回访"]]
+        assert got.json()["masked"] == [] and "1390000000" not in got.text
+    finally:
+        await engines.invalidate(source_id)
+
+
+async def test_sql_check_excerpts_in_the_artifact_are_masked_like_the_sql(monkeypatch, masked_shop, client):
+    """agent 的查询带着 SQL 检查结果（对照数据目录查出的问题，片段摘自这条 SQL）：质询工件里片段照查询清单的 SQL
+    换掉遮罩值，给模型的那句改法照抄了片段，不交出去（同证据面板）。"""
+    from app.tools import datasource
+
+    excerpt = "buyer_phone = '13900000001'"
+
+    async def flagged(checker, sql):
+        return [{"code": "wrong_date_column", "level": "warning", "table": "sales", "column": "buyer_phone",
+                 "message": "查询按「买家手机号」筛选", "for_model": f"这条 SQL 按 {excerpt} 筛选",
+                 "sql_excerpt": excerpt}] if excerpt in sql else []
+
+    monkeypatch.setattr(datasource, "_sql_checks", flagged)
+    plays = {"买得最多": Play([TOP_BUYER, BUYER_ORDERS], "这位客户共 [[v:Q2.r0.笔数]] 笔。[[see:Q2]]")}
+    Models(monkeypatch, masked_shop, plays=plays)
+    paused = await pause(masked_shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="买得最多的客户买过几笔？",
+                  approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    _, orders = r.json()["inquiry"]["queries"]
+    got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{orders['artifact']}")
+    assert got.status_code == 200, got.text
+    assert got.json()["content"]["checks"] == [
+        {"code": "wrong_date_column", "level": "warning", "table": "sales", "column": "buyer_phone",
+         "message": "查询按「买家手机号」筛选", "sql_excerpt": "buyer_phone = '已遮罩'"}]
+    assert got.json()["content"]["sql"] == orders["sql"] and "1390000000" not in got.text
+
+
+async def test_sql_check_results_in_the_artifact_do_not_show_short_masked_values(monkeypatch, tmp_path, client):
+    """检查结果的片段是检查器按语法树重新写出的一段表达式，单独拿出来认不出在找哪一个值；说明里还照引 SQL 写的取值
+    （「没有码值「25」」）。年龄设了遮罩：整条 SQL 里换掉的 25，片段、说明里一样换掉，码值表里列出的照原样。"""
+    from app.tools import datasource
+
+    name, source_id = await _source(tmp_path, options={"mask_columns": "age"}, script=AGED)
+    graph = chain(node("start", "input"),
+                  node("fetch", "tool", tool=f"db_query__{name}",
+                       args={"sql": "SELECT region AS 区域, age, amount AS 金额 FROM sales ORDER BY id"}),
+                  node("write", "report", "写周报", instructions="写周报"),
+                  node("gate", "human", mode="approve", title="周报可以出具吗"),
+                  node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
+    pinned = "SELECT COUNT(*) AS 人数 FROM sales WHERE age BETWEEN 25 AND 25"
+    listed = "（数据目录中已列出的全部码值：18=成年、60=退休）。请核对筛选条件里的取值"
+
+    async def flagged(checker, sql):
+        return [{"code": "unknown_code", "level": "warning", "table": "sales", "column": "age",
+                 "message": f"「订单」的「年龄」没有码值「25」{listed}", "for_model": "SQL 里写的 25 不在其中",
+                 "sql_excerpt": "age BETWEEN 25 AND 25"}] if "BETWEEN" in sql else []
+
+    monkeypatch.setattr(datasource, "_sql_checks", flagged)
+    plays = {"这个年龄": Play([pinned], "这个年龄的有 [[v:Q1.r0.人数]] 人。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=graph)
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="这个年龄的客户有几位？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        [query] = r.json()["inquiry"]["queries"]
+        assert query["sql"] == "SELECT COUNT(*) AS 人数 FROM sales WHERE age BETWEEN 已遮罩 AND 已遮罩"
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+        assert got.status_code == 200, got.text
+        assert got.json()["content"]["checks"] == [
+            {"code": "unknown_code", "level": "warning", "table": "sales", "column": "age",
+             "message": f"「订单」的「年龄」没有码值「已遮罩」{listed}", "sql_excerpt": "age BETWEEN 已遮罩 AND 已遮罩"}]
+        assert got.json()["content"]["sql"] == query["sql"]
+    finally:
+        await engines.invalidate(source_id)
+
+
 #: 同样的四笔订单，手机号存成整数：遮罩值在 SQL 里写成数字
 PHONES = ("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, buyer_phone INTEGER, amount INTEGER, is_test INTEGER);"
           "INSERT INTO sales VALUES (1, '华东', 13900000001, 1200, 0), (2, '华东', 13900000002, 300, 1),"
@@ -1180,7 +1514,7 @@ _COUNT = "SELECT COUNT(*) AS 笔数 FROM sales WHERE "
 
 
 @pytest.mark.parametrize("script, sql, sealed", [
-    # 数个数用 COUNT：SUM(CASE buyer_phone …) 的结果取自遮罩列，整列按列遮
+    # 简单 CASE 里找某一个号码，只数个数（COUNT，或者 SUM 套写死的 1）：号码换掉，笔数照常显示
     pytest.param(PHONES, "SELECT COUNT(CASE buyer_phone WHEN 13900000001 THEN 1 END) AS 笔数 FROM sales",
                  "SELECT COUNT(CASE buyer_phone WHEN 已遮罩 THEN 1 END) AS 笔数 FROM sales", id="简单 CASE"),
     pytest.param(PHONES, _COUNT + "buyer_phone IN (VALUES (13900000001))", _COUNT + "buyer_phone IN (VALUES (已遮罩))",
@@ -1193,6 +1527,11 @@ _COUNT = "SELECT COUNT(*) AS 笔数 FROM sales WHERE "
                  _COUNT + "NOT (buyer_phone > 已遮罩 OR buyer_phone < 已遮罩)", id="既不大于也不小于"),
     pytest.param(PHONES, _COUNT + "buyer_phone >= 13900000001 AND buyer_phone < 13900000002",
                  _COUNT + "buyer_phone >= 已遮罩 AND buyer_phone < 已遮罩", id="整数的半开区间"),
+    # 两头都不是那个号码，夹住的是中间那一个：留着 13900000000 就等于写出了号码
+    pytest.param(PHONES, _COUNT + "buyer_phone > 13900000000 AND buyer_phone < 13900000002",
+                 _COUNT + "buyer_phone > 已遮罩 AND buyer_phone < 已遮罩", id="整数的开区间"),
+    pytest.param(PHONES, _COUNT + "region = '华东' AND buyer_phone >= 13900000001 AND buyer_phone <= 13900000001",
+                 _COUNT + "region = '华东' AND buyer_phone >= 已遮罩 AND buyer_phone <= 已遮罩", id="同一条件里还有别的条件"),
     pytest.param(PHONES, _COUNT + "(buyer_phone, region) = (13900000001, '华东')",
                  _COUNT + "(buyer_phone, region) = (已遮罩, '华东')", id="行值"),
     pytest.param(PHONES, _COUNT + "buyer_phone IS NOT DISTINCT FROM 13900000001",
@@ -1204,6 +1543,41 @@ _COUNT = "SELECT COUNT(*) AS 笔数 FROM sales WHERE "
                  _COUNT + "buyer_phone >= '已遮罩' AND buyer_phone <= '已遮罩'", id="字符串范围两头相同"),
     pytest.param(SALES, _COUNT + "buyer_phone BETWEEN '13900000001' AND '13900000001'",
                  _COUNT + "buyer_phone BETWEEN '已遮罩' AND '已遮罩'", id="字符串 BETWEEN 两头相同"),
+    # 两半拆到同一行集的不同地方：第 4 轮只在同一个条件里认，号码照原样封存，回答正文里也露了出来
+    pytest.param(PHONES, "SELECT COUNT(*) AS 笔数 FROM sales s JOIN sales b ON b.id = s.id "
+                 "AND b.buyer_phone >= 13900000001 WHERE b.buyer_phone <= 13900000001",
+                 "SELECT COUNT(*) AS 笔数 FROM sales s JOIN sales b ON b.id = s.id "
+                 "AND b.buyer_phone >= 已遮罩 WHERE b.buyer_phone <= 已遮罩", id="ON 和 WHERE 各写一边"),
+    pytest.param(PHONES, _COUNT + "buyer_phone >= 13900000001 GROUP BY buyer_phone HAVING buyer_phone <= 13900000001",
+                 _COUNT + "buyer_phone >= 已遮罩 GROUP BY buyer_phone HAVING buyer_phone <= 已遮罩",
+                 id="WHERE 和 HAVING 各写一边"),
+    pytest.param(PHONES, "SELECT COUNT(*) AS 笔数 FROM (SELECT id FROM sales WHERE buyer_phone >= 13900000001 "
+                 "INTERSECT SELECT id FROM sales WHERE buyer_phone <= 13900000001) t",
+                 "SELECT COUNT(*) AS 笔数 FROM (SELECT id FROM sales WHERE buyer_phone >= 已遮罩 "
+                 "INTERSECT SELECT id FROM sales WHERE buyer_phone <= 已遮罩) t", id="INTERSECT 两支"),
+    pytest.param(PHONES, _COUNT + "buyer_phone >= 13900000001 AND CASE WHEN buyer_phone <= 13900000001 THEN 1 "
+                 "ELSE 0 END = 1",
+                 _COUNT + "buyer_phone >= 已遮罩 AND CASE WHEN buyer_phone <= 已遮罩 THEN 1 ELSE 0 END = 1",
+                 id="一半包在 CASE 里"),
+    pytest.param(PHONES, "WITH a AS (SELECT * FROM sales WHERE buyer_phone >= 13900000001) "
+                 "SELECT COUNT(*) AS 笔数 FROM a WHERE buyer_phone <= 13900000001",
+                 "WITH a AS (SELECT * FROM sales WHERE buyer_phone >= 已遮罩) "
+                 "SELECT COUNT(*) AS 笔数 FROM a WHERE buyer_phone <= 已遮罩", id="拆进 CTE"),
+    # 整数上相邻的两头把中间那一个隔开
+    pytest.param(PHONES, _COUNT + "NOT (buyer_phone <= 13900000000 OR buyer_phone >= 13900000002)",
+                 _COUNT + "NOT (buyer_phone <= 已遮罩 OR buyer_phone >= 已遮罩)", id="相邻的整数隔开"),
+    # 第 2 轮复核：一头是算式、等值的值是算式、两头不是整数、范围再用不等去掉一头、前面补零的号码。以前都照原样
+    # 封存，后两种的号码还被当成阈值，回答正文跟着不遮
+    pytest.param(PHONES, _COUNT + "buyer_phone BETWEEN 13900000000 + 1 AND 13900000009 - 8",
+                 _COUNT + "buyer_phone BETWEEN 已遮罩 + 已遮罩 AND 已遮罩 - 已遮罩", id="算出来的边界"),
+    pytest.param(PHONES, _COUNT + "buyer_phone = 13900000000 + 1", _COUNT + "buyer_phone = 已遮罩 + 已遮罩",
+                 id="算出来的等值"),
+    pytest.param(PHONES, _COUNT + "buyer_phone > 13900000000.5 AND buyer_phone < 13900000001.5",
+                 _COUNT + "buyer_phone > 已遮罩 AND buyer_phone < 已遮罩", id="两头不是整数"),
+    pytest.param(PHONES, _COUNT + "buyer_phone >= 13900000001 AND buyer_phone <= 13900000002 "
+                 "AND buyer_phone <> 13900000002",
+                 _COUNT + "buyer_phone >= 已遮罩 AND buyer_phone <= 已遮罩 AND buyer_phone <> 已遮罩", id="范围再排除一头"),
+    pytest.param(PHONES, _COUNT + "buyer_phone = 013900000001", _COUNT + "buyer_phone = 已遮罩", id="前面补零的号码"),
 ])
 async def test_a_customer_looked_up_in_any_shape_never_shows(monkeypatch, tmp_path, client, script, sql, sealed):
     """agent 换着写法找某一个客户（简单 CASE、IN (VALUES …)、两头相同的范围、行值、选出列里写着同一个号码……），回答里
