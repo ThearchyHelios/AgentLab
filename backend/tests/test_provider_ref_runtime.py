@@ -3,7 +3,7 @@
 以前点名的接入不存在时 get_chat_model 悄悄换成演示模型（mock-fast）：报告由它写成假文本，双盲复算、反方审稿、审批
 质询由它来「核查」，正式运行照样出具。现在（providers/factory.named_provider）：
 
-- 模型调用、Agent、报告撰写节点：节点失败，报错带原因和去哪里改，一次模型调用都不发；
+- 模型调用、Agent、报告撰写、多 Agent 协作、让模型分类的条件分支：节点失败，报错带原因和去哪里改，一次模型调用都不发；
 - 双盲复算：该指标无法复算，原因「核查模型不可用（…）」，记缺口；反方审稿：这几句未能反查，原因同上；
 - 审批质询：回答 ok 为假，error 说明原因；结论句裁判：按「裁判模型不可用」照实记未裁判和缺口；
 - 助手：报错给用户，查当前用哪个模型的接口照常返回、写明原因；门控模型：转人工审批、写明原因；
@@ -458,7 +458,8 @@ async def test_a_scheduled_formal_run_naming_a_broken_provider_fails_and_is_stil
     try:
         await loop.fire_due(NINE + timedelta(seconds=5))
         async with SessionLocal() as session:
-            [fire] = list((await session.execute(select(ScheduleFire).where(ScheduleFire.schedule_id == sid))).scalars())
+            fired = await session.execute(select(ScheduleFire).where(ScheduleFire.schedule_id == sid))
+            [fire] = list(fired.scalars())
         assert fire.status == "started" and fire.run_id
         run = await wait(fire.run_id, ("succeeded", "failed", "cancelled"))
         assert run.status == "failed" and run.run_class == "formal"
