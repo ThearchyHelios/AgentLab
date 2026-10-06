@@ -9,7 +9,11 @@
    取自的查询算，合并查询按它合并的那几个源算）；这句没挂依据，就在这份报告引用的数据源里查。任务里给这句结论
    和它挂的证据摘录（judge.prepare，数据源遮罩的列照旧不给；摘录里原报告的编号都标成「原报告 Qn」，和 agent 自己
    的 Q1 分开），要它先想清楚「如果这句不成立，数据里会看到什么」，写只读查询去找，最后交结论（经受住 / 被削弱 /
-   被推翻 / 无法判断）和理由。理由里的数字只能引用它自己查询的格子，裸数字由 compose_doc 标出来
+   被推翻 / 无法判断）和理由。理由里的数字只能引用它自己查询的格子，裸数字由 compose_doc 标出来。
+   遮罩：agent 的查询结果在工具边界就遮好了；这份报告引用的查询快照里的遮罩值（按 SQL 认出改了名字的遮罩列，同审批
+   质询）反查之前就交给查询工具，agent 查到写着同一个号码的别的表时也看不到。摘录按列名遮，改了名字的遮罩列原值
+   agent 看得到，会照着写进理由：理由正文和理由文档按值换成「已遮罩」（换了写法的号码也认），这句结论原文里写着的
+   不换（_masked_rationale）
 3. 出处：一条查询都没执行成功的，判什么都记为无法判断；判「被推翻」的，理由里还得引用到自己的查询结果——它要让
    正式出具降档，审稿记录里得查得到凭什么。不采信时系统写明原因，反方原本的结论和理由照录在后面（纯文字：解析
    不了的引用写成「（引用无效）」，裸数字注明「（无出处）」）。这句该查的数据源都不存在或已停用、核查模型本身用
@@ -44,8 +48,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Callable, Collection, Iterable
+from dataclasses import replace
 from typing import Any
 
 from langgraph.func import task
@@ -372,6 +378,54 @@ def _claim_of(cand: judging.Candidate, outcome: VerifyOutcome) -> tuple[dict[str
     return _claim(cand, verdict, rationale, doc=outcome.rationale, queries=outcome.queries, usage=outcome.usage), None
 
 
+def _spared(seed: Any, claim: str) -> Any:
+    """报告快照里的遮罩值（seed）去掉这句结论原文里写着的，交给这一句的反查。seed 本身不动（下一句另算）。"""
+    known = seed.copy()
+    known.protect([claim])
+    return known
+
+
+def _masked_rationale(outcome: VerifyOutcome, secrets: Any, *, given: Iterable[str | None]) -> VerifyOutcome:
+    """反方的理由里的遮罩值换成「已遮罩」，换了写法的号码也认（199-1474-2785、+86 …）。值是这份报告引用的查询快照里的
+    （secrets，反查之前就交给了查询工具），加上 agent 查询时在工具边界遮掉的（outcome.masked_values）；被审的那句结论
+    原文里写着的（given）已经摆在读者眼前，不换。反方 agent 的查询结果在工具边界就遮好了，可证据摘录按列名遮，改了名字
+    的遮罩列（buyer_phone AS 手机号）的原值它看得到，会写进理由。
+    换的办法同审批质询的回答（_scrubbed_source）：原文里的值先换掉，再照原来的目录重新组装理由文档；引用到的格子按
+    遮好的快照渲染（文字格里夹着的遮罩值换掉那一截）。理由里认不出遮罩值的原样交回。"""
+    from app.engine.evidence import compose_doc
+    from app.engine.masking import _masked_view, _scrubbed_source, _Secrets
+
+    doc, result = outcome.rationale, outcome.result
+    # agent 查询时遮掉的值先收（masked_values 里已经排在报告的值前面）：报告的值收满了上限 SECRETS_MAX，也不丢 agent 查到的
+    pool = _Secrets()
+    pool.merge(outcome.masked_values)
+    pool.merge(secrets)
+    pool.protect(given)
+    if result is None or not isinstance(doc, dict) or not pool.strong:
+        return outcome
+    pool.prepare()
+    source = str(doc.get("source") or "")
+    if not (pool.spans(str(doc.get("markdown") or ""), prose=True) or pool.spans(source, prose=True)):
+        return outcome
+    views: dict[str, Any] = {}
+    fetch = _fetcher()
+    for query in outcome.queries:
+        snapshot = fetch(query.get("artifact"))
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("rows"), list):
+            views[str(query["artifact"])] = _masked_view(snapshot, set(), pool, embedded=True)[0]
+    def load(artifact: str) -> Any:
+        return views[artifact] if artifact in views else artifact_store.load(artifact)
+
+    try:
+        again = compose_doc(_scrubbed_source(source, pool), doc.get("catalog") or {},
+                            node_id=str(doc.get("node_id") or ""), run_id=doc.get("run_id"), loader=load)
+    except Exception:  # noqa: BLE001 - 重新组装出了意外，值也不能留着
+        # 正文按值换掉，理由文档不要了（界面照正文显示；判「被推翻」的因此查不到出处，按无法判断记）
+        said = pool.scrub(str(doc.get("markdown") or ""), prose=True)
+        return replace(outcome, rationale=None, result={**result, RATIONALE: said})
+    return replace(outcome, rationale=again, result={**result, RATIONALE: again["markdown"]})
+
+
 def _cites(doc: dict[str, Any] | None) -> bool:
     """理由文档里有没有一处引用解析到了 agent 自己的查询结果（compose_doc 只把解析成功的引用记进 unit.cites）。"""
     return isinstance(doc, dict) and any(unit.get("cites") for _, unit in iter_units(doc))
@@ -566,6 +620,9 @@ class _Review:
         # 这句没挂依据时在整份报告引用的数据源里查：写作者看得到的就是这几个库
         everywhere = claim_sources(self.catalog, self.catalog, self.fetch)
         usable = await _usable_sources(everywhere)
+        # 报告引用的查询快照里遮罩列的值：反查之前交给查询工具（agent 查到写着同一个号码的别的表时看不到），反查之后
+        # 据此换掉理由里的遮罩值（_masked_rationale）
+        seed = await self._seed()
         claims: list[dict[str, Any]] = []
         usage = _zero_usage()
         model: str | None = None
@@ -629,11 +686,14 @@ class _Review:
             if allot.tightened:
                 self.run_seconds = allot.seconds
             # 收紧过的：核查 agent 到点自己发的 verify_limit 改说运行时长上限将至（deadline.relabel），不写收紧后的秒数
+            # 这句结论原文里写着的值已经摆在读者眼前，不当遮罩值。上万个值过一遍要几十毫秒，放进线程
+            known = await asyncio.to_thread(_spared, seed, cand.text)
             outcome = await run_verify_agent(
                 spec=self.spec, system=CHALLENGE_SYSTEM, task=task_text, sources=live,
                 output_schema=CHALLENGE_SCHEMA, max_queries=self.max_queries, timeout_s=allot.timeout_s,
                 daily_max_usd=self.daily_max_usd, emit=deadline.relabel(ctx.emit, allot), run_id=ctx.run.run_id,
-                node_id=ctx.node.id, data_versions=run_versions(ctx.run))
+                node_id=ctx.node.id, data_versions=run_versions(ctx.run), masked_values=known)
+            outcome = await asyncio.to_thread(_masked_rationale, outcome, known, given=[cand.text])
             if outcome.error and not outcome.model:
                 broken = outcome.error      # 连模型都没建成（没配好、接入出错）：换一句也一样
             model = model or outcome.model
@@ -708,6 +768,14 @@ class _Review:
                      message=_refuted_words(refuted))
         return {"artifact": artifact, "counts": counts, "usage": usage, "unreviewed": missed,
                 "claims": [{k: c[k] for k in ("unit", "text", "verdict")} for c in claims]}
+
+    async def _seed(self) -> Any:
+        """这份报告目录里的查询快照里遮罩列的值（engine/masking 的 _Secrets）。收法同审批质询收报告快照
+        （inquiry.snapshot_secrets：按 SQL 认出改了名字的遮罩列，查询当时记下的遮罩加上数据源现在设的）。"""
+        from app.engine.inquiry import snapshot_secrets   # inquiry 导入了这个模块，用到时再导入
+
+        return await snapshot_secrets(self.fetch(entry.get("artifact")) for entry in self.catalog.values()
+                                      if isinstance(entry, dict) and entry.get("kind") == "query")
 
     async def _store(self, record: dict[str, Any]) -> str | None:
         try:

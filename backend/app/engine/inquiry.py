@@ -12,7 +12,14 @@
    上传表格不算，见 _usable_sources）；上限按设置（每次的查询次数、时长，全局每日金额）。回答先给结论，数字只能引用 agent
    自己查询的格子，或者报告里已有的指标、运行输入；回答文档由 compose_doc 组装，裸数字被标出来（提问人自己写的数除外）。
    封存之后的追问查的是数据源现在的数据，任务里给报告生成的时间，回答末尾注明；触顶、查询失败、引用解析不了也在末尾注明
-3. 遮罩（_plan）：哪些列要遮照证据面板的规则（查询当时记下的，加上数据源现在设的），另按 SQL 认出改了名字的遮罩列
+3. 遮罩（_plan）：agent 的查询结果在核查 agent 的工具边界就遮好了（engine/masking.py 的 mask_query_result）：取自
+   遮罩列的格子交给模型、落进快照之前就是「已遮罩」，模型看不到遮罩值。报告自己快照里的遮罩值在派 agent 之前就交给
+   查询工具（snapshot_secrets → run_verify_agent 的 masked_values），agent 前面的查询遮掉的值也一样：后面查到的备注、
+   别的表里写着同一个号码的，交给模型、落库之前就按值换掉。这里是第二道防线：查询时遮掉的值由 verify_agent 交回
+   （masked_values，只在内存里），连同报告自己快照里的遮罩值，照下面的办法按值遮。事后取质询工件时内存里的值已经
+   不在：回答时只靠它们才换掉的地方（先查备注、后查出号码的那份备注快照）记成位置写进事件（REPLAY_KEY，不含值，
+   masking.view_edits），取工件时照着再换一遍；SQL 检查结果照事件里记下的 SQL 换（_recorded_swaps）。
+   哪些列要遮照证据面板的规则（查询当时记下的，加上数据源现在设的），另按 SQL 认出改了名字的遮罩列
    （起别名、套函数、经子查询转一道、和 * 写在同一支里，_derived_hidden；认不出落在哪一列的，整份快照遮掉；按遮罩列
    分档、当分组键或套在汇总里数个数的不算，_band_only）；快照按列遮，再按值遮（别的列里写着遮罩值的格子，_masked_view；质询
    工件里，文字格里夹着的遮罩值另按子串换）。回答正文、查询清单里的遮罩值换成「已遮罩」（_Secrets、_scrub_sql）：
@@ -20,15 +27,18 @@
    认用在哪（_literal_uses），数字照原样留着的只有范围比较的边界（没把某一个值夹住的，_pinned）和 LIMIT 的行数，而且
    同一个数在这条 SQL 别处没被换掉，封存的是实际执行的语句；在找某一个值的（等值、IN、简单 CASE、夹住某一个值的
    范围……，值换个写法、写成几个数的算式也认）和别处够长的遮罩值都换。已经摆在读者眼前的值不换：问题和选中原文里的、
-   报告列出的指标和运行输入的值；SQL 里照原样留着的阈值只在回答正文里不换，格子照旧换。组装之后还认得出遮罩值的，
-   这份回答不交出去
+   报告列出的指标和运行输入的值（agent 后面的查询遮掉的值照样免遮，_Secrets.protected）；SQL 里照原样留着的阈值只在
+   回答正文里不换，格子照旧换。回答正文、质询工件的文字格、SQL 的字符串、带引号的名字和注释里，换了写法的长号码
+   （199-1474-2785、(199)1474-2785、+86 199 1474 2785、全角数字、不换行空格或减号隔开的）按纯数字写法认（masking 的
+   _Secrets.loose_spans）。组装之后还认得出遮罩值的（换了写法的也算），这份回答不交出去
 4. 写入（_record）：一条 approval.inquiry 事件，node_id 为空，用量写在数据的 usage 里（计进运行用量，见 runner 的
    _usage_of_events）。质询的查询快照只放在 inquiry_artifacts / queries 里，绝不放在 query_artifact 下：证据接口按那个键
    收集封存的查询，会把质询的查询当成报告的证据。回答期间运行状态变了（被批准、被放弃、继续运行之后重新封存），
    append_events 不写，回答照样交回给提问的人，说明没有写进运行记录（这样的回答在进程里留一阵，_HELD）。触顶、失败
    照样记一条
 5. 读取：列表读 approval.inquiry 事件（封存前后的都算，按先后）；质询工件只认质询引用过的（查询快照、回答文档、回答里
-   引用的报告口径卡），遮罩照回答时的办法，快照里 SQL 检查结果的片段、说明照整条 SQL 的换法换（_masked_checks）
+   引用的报告口径卡），先照事件里记下的位置重放回答时换掉的地方，再照回答时的办法遮，快照里 SQL 检查结果的片段、说明
+   照整条 SQL 的换法换（_masked_checks）
 
 不发 tool.start、llm.start 这类事件（run_verify_agent 不传 emit）：界面从接口的返回取回答；runner 的 _stale_replay
 只看 tool.start，质询不影响恢复后的重放。
@@ -40,14 +50,39 @@
   正好等于某一笔金额）也遮掉。这是产品取舍，不按上下文去猜
 - 遮罩数值列的 SUM / AVG / MIN / MAX 算派生自遮罩列，整列遮（COUNT 不算，见 _value_columns），CASE 里有一支取的是
   遮罩列的也算：MIN / MAX 就是某一行的原值，只有一行的分组 SUM / AVG 也是，按列认不出哪些汇总值安全，宁可多遮。
-  汇总里套着结果全是写死常量的 CASE（SUM(CASE WHEN amount <= 20000 THEN 1 ELSE 0 END)）只是按条件数个数，同 COUNT
+  核查 agent 的查询在工具边界照这个办法遮，所以这样的指标双盲复算不了（原 SQL 里认得出的，派盲算之前就记为无法
+  复算），反方审稿核对这类汇总数的结论也拿不到数。汇总里套着结果全是写死常量的 CASE（SUM(CASE WHEN amount <= 20000
+  THEN 1 ELSE 0 END)）只是按条件数个数，同 COUNT；汇总里的 CASE 只在条件里用到遮罩列的（SUM(CASE WHEN buyer_phone
+  IS NOT NULL THEN amount ELSE 0 END)）同写在 WHERE 里，不算
+- FROM、JOIN、LATERAL 里的表值函数（json_each、json_tree、unnest、jsonb_each_text、JSON_TABLE、LATERAL VALUES）拆开
+  遮罩列的，按出列名认它出的列（常见函数的出列名、写的列名表、别名、函数名，_function_columns），同名的别的列一并遮
+  （多遮）；不认得的函数又没写列名表的，整份快照都遮。函数参数里没写表名的 col->'path'（JSON 箭头，解析器当成以 col
+  为参数的 lambda）按 col 认，真的 lambda（transform(arr, x -> …)）的参数和遮罩列同名时也算（多遮）
+- * 把遮罩列带进别的列名（WITH t(a, b, …) AS (SELECT * …) 这类列名表、表的列名表 FROM sales AS s(i, r, p)、UNION 后一支
+  的 *、TABLE x、标量子查询里的 *）：只展开一个来源、那里每一列都数得清的，按位置只遮取自遮罩列的那几列——子查询按它的
+  选出项数，数据源里的表按查询当时冻结的表结构数（几张列一样的月度表 SELECT * 连起来汇总，金额照常）。表结构里查不到
+  这张表（写了库名的按「库名.表名」查：另一个库里的同名表 archive.sales 不按探查的 sales 数，探查时没设 schema、查询
+  又写了库名的也一样）、数出来的列数和实际展开的对不上（UNION 第一支的 * 按表结构数出的列名，后面每一支都要一样宽才用；
+  Postgres 的列名表只写前几列、后面的照原名时也对不上），或者 * 连着几个来源的，* 展开落到的那一段整段遮，同一段里的
+  金额这类别的列一并遮（多遮）。表结构过期、列数没变却换了次序或改了名的，可能数错（同按表结构认标签列）；没写库名的表
+  按探查的那张数，探查的不是默认的库、默认的库里又有一张列序不同的同名表时也会数错。标量子查询里的 * 展开数据源里的表
+  一律算取自遮罩列。EXCEPT 后一支只用来去掉行，也照 UNION 的后一支算（多遮）
+- 整行和函数参数里的 *（Postgres 的 row_to_json(s)、json_agg(t)、SELECT s、s::text、to_json(s.*)、concat_ws(',', s.*)，
+  Oracle 的 JSON_OBJECT(*)）按 * 展开的来源算：取自子查询、CTE 的看它选出的列，取自数据源里的表的一律算取自遮罩列（整列
+  遮）。Postgres 先按列认：表结构里查得到和表同名的列（visits 表的 visits 列）才当列，查不到时按整行算（多遮）。PIVOT、
+  UNPIVOT、MATCH_RECOGNIZE 读到遮罩列的，整份快照的列都遮（多遮）。SQL 解析不了的只看文字：写着遮罩列、*（COUNT(*) 除外）、
+  TABLE x 的整份遮，整行引用这类不写列名的写法认不出
 - 按遮罩列分档的标签（CASE、IIF 的结果全是写死的常量）：标签文字是 agent 写在 SQL 里的，不当遮罩值，SQL、回答正文里
   照原样；标签列当分组键（每一档一行）照常显示，不分组的逐行标签列整列遮（格子里看不出某一笔落在哪一档），可 agent
   在正文里写出「这一笔是大单」遮不住，按 id 分组再按档数个数也看得出（同按阈值查出某几行）。只有只装着标签的列不收：
   结果的这一列在 UNION 的每一支里都是这样的 CASE / IIF，或者按作用域认得出取自子查询、CTE 里只装着标签的一列；有一支
   取自数据源里的表（遮罩列原样选出、经子查询按原名传出，哪怕起了标签的名字）就照收。认不准的也照收（多遮），比如
-  按这一列 USING、NATURAL 合成的同名列，递归的 CTE，UNION 里落在某一支 * 里的列，写死的字符串、和列一起算的值。
-  标签恰好和别的列里的遮罩值相同时，正文里的档名、SQL 里写成字符串的标签也换（多遮）
+  按这一列 USING、NATURAL 合成的同名列，递归的 CTE，UNION 里落在某一支 * 里的列，写死的字符串、和列一起算的值；
+  派生来源里同名的几列（SQLite 都留着，外层按名字取排在最前面的那一列）：标签前面有 * 带得出这一列（* 展开了数据源里
+  的表、冻结的表结构里查不到这张表或者它有同名的列，就算带得出），或者有没起别名、套了括号或 COLLATE 的同名列
+  （(vip_level)、vip_level COLLATE NOCASE），都不算只装着标签（_block_label_of、_star_label）。* 展开的表在表结构里
+  查得到、又没有同名的列时，照常按派生来源认标签（_table_lacks）。标签恰好和别的列里的遮罩值相同时，正文里的档名、
+  SQL 里写成字符串的标签也换（多遮）
 - 「夹住某一个值」（_pinned）：范围比较在整条 SQL 里配对，只有 CASE 的不同分支、SELECT 里不筛行的不同项（选出列、
   GROUP BY、ORDER BY）、UNION 的不同支各算各的，两头误差都有：把找值拆进这几处（CASE WHEN age > 25 THEN … ELSE CASE
   WHEN age >= 25 …，两个选出列 SUM(age >= 25)、SUM(age > 25) 再自己相减）认不出，边界照原样留着，正文里复述也不遮；
@@ -64,27 +99,38 @@
   两个整数相除照数据源的算法，SQLite、Postgres 里 53 / 2 是 26，MySQL 里是 26.5）。更绕的写法认不出：值藏进和列
   一起算的算式（age - 25 = 0、buyer_phone - 1 = 13900000000）、位运算（24 | 1）、拼接（'1390' || '0000001'）、
   函数拼出来的值（REPLACE、SUBSTR、POWER）、CAST 改了值的（CAST(25.6 AS INTEGER) 按 25.6 认，CAST(53 AS REAL) / 2
-  按整数相除算），短的值照原样封存，长号码只在整个写出来时按值换
+  按整数相除算），SQLite 里带小数的取模（它先把两边取整再算：25.9 % 26 是 25，这里照小数算成 25.9，认不出在找
+  25），短的值照原样封存，长号码只在整个写出来时按值换
 - 质询工件里 SQL 检查结果的片段是检查器按语法树重新写出来的，按整条 SQL 里整个换掉了的字面量照值换：同一个值在
   片段里别处出现也换（多遮，算式里换掉的 0、1 这类也是）；截断处半截的值去掉（停在字符串、带引号的名字、注释里的，
   从开头的引号、注释起整个去掉）。说明里码值表列出的码值和别的字一样按值换，恰好是遮罩值的码值也换（多遮）
-- 运行详情的「工件」页签、通用的工件接口按工件原样给：质询的查询快照记在这次运行名下（同报告自己的查询快照），从
-  那里打开不经这里的遮罩
-- 遮罩值最多收 SECRETS_MAX 种写法，再多的按值认不出（按列遮照旧）
+- 运行详情的「工件」页签、通用的工件接口按工件原样给：质询的查询快照落库时就遮好了（工具边界先遮），取自遮罩列的值、
+  报告快照里的遮罩值、agent 前面的查询里遮掉的值都看不到。只有一种照原样：先查了写着号码的备注（那时还不知道这个号码
+  是遮罩值），后来才查出号码——备注快照落库时原样，从通用接口打开照原样，质询工件接口照事件里记下的位置换。报告自己
+  的查询快照（写作时的查询）仍原样存着，从那里打开不经这里的遮罩
+- 遮罩值最多收 SECRETS_MAX 种写法，再多的按值认不出（按列遮照旧）。agent 自己查到的值先收，报告快照里的后收：核查
+  agent 把两份分开记（masking.SeenValues），查询时按值遮、交回调用方、回答时合起来，都是 agent 查到的在前
+- 换了写法的号码只认数字之间夹着一到四个分隔符（空格、制表符、全角空格、不换行空格、窄空格这类空白，连字符、减号、
+  点、括号，含全角），带 +86 / 0086 / 86 前缀、全角数字：写成汉字（一三九……）、中间夹着别的字、拆成几处写的、跨行
+  写的认不出；和别的数字只隔着一个连字符或点连着的（13900000001-2、19914.74）不算号码；SQL 里不带引号的数不这样认
+  （199-1474-2785 在 SQL 里是三个数相减），字符串、带引号的名字、注释里照样认
+- 质询 agent 的任务里的证据摘录照 judge.prepare 按列名遮：报告取数把遮罩列改了名字选出来（buyer_phone AS 手机号）时，
+  摘录里有原值，agent 看得到；它写进回答、SQL 的，按值认得出的照样换掉（报告快照里的值都收了），封存的是换过的。摘录
+  按 SQL 认改了名字的遮罩列要改 judge.py，另行处理
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import itertools
-import json
 import logging
 import operator
 import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
@@ -99,9 +145,18 @@ from app.data.provenance_types import DOC_PROVENANCE
 from app.db.base import SessionLocal
 from app.db.models import Approval, Artifact, DataSource, Run, RunEvent
 from app.engine import judge as judging
-from app.engine.evidence import MARKER_RE, RenderError, compose_doc, iter_segments, iter_units, render_cell
-from app.engine.expressions import numeric_text
+from app.engine.evidence import compose_doc, iter_segments, iter_units
 from app.engine.issuance import extract_numbers
+# 认遮罩列、遮罩值的共用部分在 engine/masking.py。名字照旧从这里导出：nodes/dual_check、测试按 inquiry 的名字引用
+from app.engine.masking import (  # noqa: F401
+    SECRETS_MAX, SECRET_DIGITS, SECRET_MIN, _ABSENT, _DIGITS, _EXPONENT_MAX, _LabelMemo, _NUMERIC, _PLAIN_NUMBER,
+    _PREFIX, _Secrets, _WORD, _WORDS, _all_labels, _arithmetic, _band_only, _block_label, _block_label_of, _blocks,
+    _branch_results, _branches, _canonical, _constant, _constants, _decimal, _derived_block, _derived_hidden,
+    _digits_of, _fixed, _forms, _from_sources, _is_star, _item_label, _label_columns, _leaves, _literal_types,
+    _masked_view, _masked_word, _mentions, _merging, _numeric, _output_name, _pattern, _places, _plain_text,
+    _point_text, _query_shaped, _result_label, _scrubbed_source, _snapshot_labels, _source_label, _source_names,
+    _star_label, _strong, _tainted, _value_columns, _worked_out, replay_edits, view_edits,
+)
 from app.engine.merge_query import MERGE_SOURCE
 from app.engine.nodes.challenge import mark_original, with_note
 from app.engine.run_append import append_events
@@ -133,6 +188,9 @@ LIMITS = ("max_queries", "timeout_s", "max_cost_usd", "daily_max_usd")
 USAGE_KEYS = ("input_tokens", "output_tokens", "cost_usd", "calls", "unpriced_calls")
 #: 查询清单每条给的几项：没有行，查询结果只在快照里（取的时候按遮罩遮好）
 QUERY_KEYS = ("alias", "artifact", "sql", "row_count", "truncated", "source")
+#: 质询事件数据里记「回答时只靠 agent 查询时遮掉的值才换掉的位置」的键：{快照工件: masking.view_edits 的形状}。
+#: 不含值；事后取质询工件时内存里的值已经不在，照着位置再换一遍（inquiry_artifact）
+REPLAY_KEY = "masked_cells"
 #: 回答文档存成工件时的种类；工件引用的 meta 里记下问题的前这么多字，运行的工件列表据此认得出是哪个问题的回答
 ANSWER_KIND = "inquiry_answer"
 QUESTION_BRIEF = 40
@@ -142,13 +200,6 @@ REPORT_CHARS = 4000
 REFS_MAX = 40
 #: 被问的是表格里的一格时，交给 agent 的表格最多几行（不含表头）
 TABLE_ROWS = 20
-#: 按值认遮罩值的门槛：文字至少这么多字（一个字的「是」「男」换掉，会把不相干的词也换得面目全非）；纯数字至少这么多位
-#: （年龄、等级、小额金额这类短的数和阈值、天数、日期、LIMIT 里的数太容易撞上，按值换会把实际执行的 SQL、提问人自己
-#: 的条件改得面目全非。它们只在 SQL 里和遮罩列做等值一类比较时才换，见 _scrub_sql；引用到的格子照旧按列遮）
-SECRET_MIN = 2
-SECRET_DIGITS = 5
-#: 遮罩列的值最多收这么多种写法（一份快照最多上千行）：再多就按已经收到的换
-SECRETS_MAX = 20_000
 #: 没写进运行记录的回答在进程里留多久、最多留几条：这段时间里质询工件接口照样认它引用的工件
 HELD_TTL_S = 3600
 HELD_MAX = 200
@@ -158,8 +209,6 @@ _TERMINAL = ("succeeded", "failed", "cancelled")
 #: 比较；找两个条件的公共祖先，一步是往上走一层）：几百个分档边界连成一长串时，挨个细看要算上好几秒。超出之后两边
 #: 都隔开的一律按夹住算（宁可多换），分档很多时会成批多遮
 PIN_WORK = 100_000
-#: 按词边界认值的字符：值的头尾是这样的字时，前后不能紧挨着同类的字（13900000001 不换掉 139000000012 的一截）
-_WORD = re.compile(r"[0-9A-Za-z_]")
 
 INQUIRY_SYSTEM = (
     "你在帮人核对一份报告：提问人针对报告里的一句话提了问题，你查库作答。你不写报告，也不改报告。\n"
@@ -648,12 +697,8 @@ def _task(op: _Opening, ask: Ask, target: _Target | None, excerpts: list[str], r
 
 
 # --------------------------------------------------------------------------
-# 遮罩：哪些列
+# 遮罩（哪些列、哪些值的认法在 engine/masking.py）
 # --------------------------------------------------------------------------
-
-
-def _query_shaped(content: Any) -> bool:
-    return isinstance(content, dict) and isinstance(content.get("rows"), list)
 
 
 async def _hidden_columns(snapshot: dict[str, Any], masks: Any) -> tuple[set[str], list[str]]:
@@ -665,816 +710,6 @@ async def _hidden_columns(snapshot: dict[str, Any], masks: Any) -> tuple[set[str
         return await _merge_masks(snapshot, masks)
     cols, found = await masks.of(snapshot.get("source"))
     return cols | _recorded_masks(snapshot), ([] if found or not snapshot.get("source") else [str(snapshot["source"])])
-
-
-def _masked_word() -> str:
-    from app.api.evidence import MASKED
-
-    return MASKED
-
-
-def _value_columns(node: Any) -> set[str]:
-    """一个选出列的值取自哪些列（列名小写）。COUNT 里的只数个数，窗口的分区键、排序键只决定次序，结果全是写死常量的
-    分档（_band_only：当分组键，或者套在汇总里按条件数个数）只决定一行落在哪一档，都带不出值，不算；套在里面的子查询
-    只看它选出来的列（它的条件、连接里写的列带不出值）。"""
-    from sqlglot import exp
-
-    out: set[str] = set()
-    stack = [node]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, exp.Column):
-            if not isinstance(item.this, exp.Star) and item.name:
-                out.add(item.name.lower())
-        elif isinstance(item, exp.Count) or (isinstance(item, (exp.Case, exp.If)) and _band_only(item)):
-            continue
-        elif isinstance(item, exp.Window):
-            stack.append(item.this)
-        elif isinstance(item, exp.Select):
-            stack.extend(item.expressions)
-        else:
-            stack.extend(item.iter_expressions())
-    return out
-
-
-def _branch_results(node: Any) -> list[Any] | None:
-    """CASE 的各个结果（每个 THEN，加上 ELSE；没写 ELSE 记 None，就是 NULL）、IIF / IF 的真假两支；别的写法为 None。
-    CASE 里的每个 WHEN … THEN 在语法树里也是 If，不单算。"""
-    from sqlglot import exp
-
-    if isinstance(node, exp.Case):
-        return [branch.args.get("true") for branch in node.args.get("ifs") or []] + [node.args.get("default")]
-    if isinstance(node, exp.If) and not isinstance(node.parent, exp.Case):
-        return [node.args.get("true"), node.args.get("false")]
-    return None
-
-
-def _fixed(node: Any) -> bool:
-    """写死的结果：字面量（几个数算出来的也算）、NULL、TRUE / FALSE、没写的 ELSE。"""
-    from sqlglot import exp
-
-    return node is None or isinstance(node, (exp.Null, exp.Boolean)) or _constant(node) is not None
-
-
-def _band_only(node: Any) -> bool:
-    """按遮罩列分档、只带出档位或个数的 CASE / IIF：结果全是写死的常量（标签、档位编号、1 和 0），而且
-    - 它本身就是一个选出列（起不起别名都行），又是这个 SELECT 的分组键（GROUP BY 按位置、按别名、照原样再写一遍都算）：
-      每一档一行，这一列只说这一行是哪一档；
-    - 或者套在汇总里（SUM(CASE WHEN amount <= 20000 THEN 1 ELSE 0 END)、AVG(IIF(…, 1.0, 0))）：按条件数个数、算占比，
-      同 COUNT。
-    都带不出遮罩列的值，同按阈值数个数（col >= v 的 COUNT）。不分组、不汇总的逐行标签照旧算派生值，那是每一笔各落在
-    哪一档；汇总遮罩列的值本身（SUM(amount)、CASE 里有一支取 amount 的）也照旧算。"""
-    from sqlglot import exp
-
-    results = _branch_results(node)
-    if results is None or not all(_fixed(r) for r in results):
-        return False
-    parent = node.parent
-    while parent is not None and not isinstance(parent, (exp.Select, exp.Subquery)):
-        if isinstance(parent, exp.AggFunc):
-            return True
-        parent = parent.parent
-    item = node
-    while isinstance(item.parent, (exp.Paren, exp.Alias)) and item.arg_key == "this":
-        item = item.parent
-    select = item.parent
-    if not isinstance(select, exp.Select) or item.arg_key != "expressions" or select.args.get("group") is None:
-        return False
-    place = next((str(i + 1) for i, e in enumerate(select.expressions) if e is item), None)
-    alias = item.alias.lower() if isinstance(item, exp.Alias) and item.alias else None
-    for key in select.args["group"].expressions:
-        while isinstance(key, exp.Paren):
-            key = key.this
-        if (isinstance(key, exp.Literal) and not key.is_string and key.this == place) or key == node or (
-                alias and isinstance(key, exp.Column) and not key.table and key.name.lower() == alias):
-            return True
-    return False
-
-
-def _label_columns(sql: Any, kind: str | None, columns: list[str]) -> dict[str, set[str]]:
-    """结果里只装着分档标签的列：列名（小写）→ 标签在格子里的写法。标签（CASE、IIF 写死的结果，分档的名字、档位编号）
-    是 agent 自己写在 SQL 里的字，不是数据源里的值：这几列派生自遮罩列也不收进遮罩值（_Secrets.add），不然 SQL 里的
-    标签、回答正文里的档名都会被换成「已遮罩」。
-    只装着标签：结果的这一列在 UNION 这类的每一支里，都是结果全为写死常量的 CASE / IIF，或者取自派生来源（子查询、
-    CTE、LATERAL）里只装着标签的一列（_item_label）。一项取自哪个来源按作用域认，不按名字猜：按名字认时，遮罩列原样
-    选出（SELECT vip_level）的名字就是它自己，永远算只装着标签，UNION 另一支、子查询里的遮罩列流进标签列也认不出，
-    等级 1 撞上 THEN 1 就不收。取自数据源里的表的（哪怕和标签同名）、有一支装着别的、认不准的（说不清取自哪个来源、
-    递归的 CTE、几支的 * 展开在哪说不清）都不算，照收（宁可多遮）；同名的几列有一列不算就都不算。解析不了的一个都
-    不算。"""
-    from app.data.sql_semantics import _parse, _read
-
-    try:
-        root, _ = _parse(sql, _read(kind))
-    except Exception:  # noqa: BLE001 - 解析器的意外按解析不了处理（标签照旧当遮罩值，宁可多遮）
-        root = None
-    if root is None:
-        return {}
-    try:
-        result = next((top for top, role, _listed in _blocks(root) if role == "result"), None)
-        if result is None:
-            return {}
-        memo: _LabelMemo = {}
-        found: dict[str, list[set[str] | None]] = {}
-        for place, column in enumerate(columns):
-            name = column.lower()
-            found.setdefault(name, []).append(_result_label(result, place, name, len(columns), memo))
-        return {name: texts for name, parts in found.items() if (texts := _all_labels(parts)) is not None}
-    except Exception:  # noqa: BLE001 - 分析本身的缺陷不能让回答出错：一个都不算（宁可多遮）
-        logger.warning("质询的 SQL 标签列分析失败", exc_info=True)
-        return {}
-
-
-#: 标签列分析里「这个来源不出这一列」（_block_label、_source_label）：和 None（出这一列，但装着别的、认不准）分开
-_ABSENT: Any = object()
-#: 标签列分析记下的结果：(id(那块查询), 列名) → 标签的写法、None 或 _ABSENT
-_LabelMemo = dict[tuple[int, str], Any]
-
-
-def _result_label(top: Any, place: int, name: str, width: int, memo: _LabelMemo) -> set[str] | None:
-    """结果（width 列）的第 place 列（列名 name）只装着标签时标签的写法，不然为 None：UNION 这类的每一支，那一项都要
-    只装着标签。落在 * 里的（认不出是哪一项）按列名经 * 往下找，只有一支时才找（几支的 * 各展开成什么说不清）。"""
-    from sqlglot import exp
-
-    leaves = _leaves(top)
-    if not all(isinstance(leaf, exp.Select) for leaf in leaves):
-        return None
-    out: set[str] = set()
-    for select in leaves:
-        items = list(select.expressions)
-        item = next((i for i, p in zip(items, _places(items, width)) if p == place), None)
-        if item is not None:
-            texts = _item_label(item, select, memo)
-        elif len(leaves) == 1:
-            texts = _star_label(select, name, memo)
-        else:
-            return None
-        if texts is None or texts is _ABSENT:
-            return None
-        out |= texts
-    return out
-
-
-def _item_label(item: Any, select: Any, memo: _LabelMemo) -> set[str] | None:
-    """select 的一个选出项只装着标签时，标签在格子里的写法：结果全为写死常量的 CASE / IIF 取它的各个结果（数按两种
-    写法：25、25.0）；单独一列取它在 FROM 里取自的那一列的（_source_label）；别的为 None。"""
-    from sqlglot import exp
-
-    node = item
-    while isinstance(node, (exp.Alias, exp.Paren)):
-        node = node.this
-    results = _branch_results(node)
-    if results is not None:
-        if not all(_fixed(r) for r in results):
-            return None
-        out: set[str] = set()
-        for result in results:
-            value = _constant(result) if result is not None else None
-            if isinstance(value, Decimal):
-                out |= {_point_text(value), format(value, "f")}
-            elif value is not None:
-                out.add(_plain_text(value))
-        return out
-    if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star) and node.name:
-        texts = _source_label(select, node.table.lower() or None, node.name.lower(), memo)
-        return None if texts is _ABSENT else texts
-    return None
-
-
-def _star_label(select: Any, name: str, memo: _LabelMemo) -> Any:
-    """select 经 *（t.* 只看 t）带出的 name 这一列只装着标签时标签的写法；没有 *、* 带不出这一列为 _ABSENT，带出来的
-    装着别的、认不准为 None。"""
-    from sqlglot import exp
-
-    out: set[str] = set()
-    seen = False
-    for item in select.expressions:
-        if not _is_star(item):
-            continue
-        qualifier = (item.table.lower() or None) if isinstance(item, exp.Column) else None
-        texts = _source_label(select, qualifier, name, memo)
-        if texts is None:
-            return None
-        if texts is not _ABSENT:
-            out |= texts
-            seen = True
-    return out if seen else _ABSENT
-
-
-def _source_label(select: Any, qualifier: str | None, name: str, memo: _LabelMemo) -> Any:
-    """select 的 FROM、JOIN 里读到的那一列（qualifier 是写的表名或别名，没写为 None）只装着标签时标签的写法；没有哪个
-    来源出这一列为 _ABSENT，出这一列但装着别的、认不准为 None。
-    - 写了表名的只看那个来源（对不上的是外层的表，认不准）；
-    - 没写的看所有来源：派生来源出这一列的就是它——SQL 执行过，别的来源就没有同名的列，不然会报列名有歧义。按这一列
-      连起来的（USING 里写着它、NATURAL）例外：几个来源的这一列合成一列，外连接时取的可能是另一边的值；
-    - 数据源里的表一律不算（遮罩列本身、别的列原样选出来，哪怕和标签同名），VALUES、函数这类来源也认不准。"""
-    sources = _from_sources(select)
-    if qualifier is not None:
-        sources = [(alias, source) for alias, source in sources if alias == qualifier]
-        if len(sources) != 1:
-            return None
-    found: list[set[str]] = []
-    opaque = False
-    for _alias, source in sources:
-        derived = _derived_block(source)
-        if derived is None:
-            opaque = True
-            continue
-        texts = _block_label(derived[0], derived[1], name, memo)
-        if texts is None:
-            return None
-        if texts is not _ABSENT:
-            found.append(texts)
-    if not found:
-        return None if opaque else _ABSENT
-    if opaque and _merging(select, name):
-        return None
-    return set().union(*found)
-
-
-def _block_label(block: Any, listed: list[str] | None, name: str, memo: _LabelMemo) -> Any:
-    """派生来源的那块查询（listed 是写的列名表）出的 name 这一列只装着标签时标签的写法；不出这一列为 _ABSENT，出这一列
-    但装着别的、认不准为 None。一条 SELECT 按选出项的名字找，没有的经 * 往下找；UNION 这类按位置看每一支，列名取写的
-    列名表，没写的取第一支的。"""
-    key = (id(block), name)
-    if key not in memo:
-        # 先记成 None：递归的 CTE 绕回自己时按认不准算
-        memo[key] = None
-        memo[key] = _block_label_of(block, listed, name, memo)
-    return memo[key]
-
-
-def _block_label_of(block: Any, listed: list[str] | None, name: str, memo: _LabelMemo) -> Any:
-    """_block_label 真去找的那一步（不看记下的结果）。"""
-    from sqlglot import exp
-
-    leaves = _leaves(block)
-    if not all(isinstance(leaf, exp.Select) for leaf in leaves):
-        return None
-    if listed is None and len(leaves) == 1:
-        named = [item for item in leaves[0].expressions if _output_name(item) == name]
-        if not named:
-            return _star_label(leaves[0], name, memo)
-        return _all_labels([_item_label(item, leaves[0], memo) for item in named])
-    width: int | None = None
-    if listed is not None:
-        if name not in listed:
-            return _ABSENT
-        place, width = (listed.index(name) if listed.count(name) == 1 else None), len(listed)
-    else:
-        first = list(leaves[0].expressions)
-        places = [p for item, p in zip(first, _places(first, None)) if _output_name(item) == name]
-        if not places:
-            # 第一支没明写这一列：有 * 时说不清它在不在、在哪个位置
-            return None if any(_is_star(item) for item in first) else _ABSENT
-        place = places[0] if len(places) == 1 else None
-    if place is None:
-        return None
-    texts: list[set[str] | None] = []
-    for select in leaves:
-        items = list(select.expressions)
-        item = next((i for i, p in zip(items, _places(items, width)) if p == place), None)
-        texts.append(_item_label(item, select, memo) if item is not None else None)
-    return _all_labels(texts)
-
-
-def _all_labels(texts: list[set[str] | None]) -> set[str] | None:
-    """几项都只装着标签时，标签的写法合起来；有一项不是为 None。"""
-    return set().union(*texts) if all(t is not None for t in texts) else None
-
-
-def _from_sources(select: Any) -> list[tuple[str, Any]]:
-    """一条 SELECT 的 FROM、JOIN 里的来源：(名字, 来源节点)，名字是别名，没起别名的是表名（小写）。"""
-    from_ = select.args.get("from_")
-    nodes = [from_.this] if from_ is not None and from_.this is not None else []
-    nodes += [join.this for join in select.args.get("joins") or [] if join.this is not None]
-    return [((node.alias_or_name or "").lower(), node) for node in nodes]
-
-
-def _derived_block(source: Any) -> tuple[Any, list[str] | None] | None:
-    """FROM、JOIN 里的一个来源 → (它的那块查询, 写的列名表)：FROM 里的子查询、LATERAL、指向 WITH 里一段的表名。数据源里
-    的表、VALUES、函数这类为 None（出哪些列、装着什么，SQL 里看不出）。"""
-    from sqlglot import exp
-
-    from app.data.sql_semantics import _visible_ctes
-
-    node, alias = source, None
-    if isinstance(node, exp.Lateral):
-        node, alias = node.this, node.args.get("alias")
-    if isinstance(node, exp.Table):
-        if node.args.get("db") or node.args.get("catalog") or not isinstance(node.this, exp.Identifier):
-            return None
-        cte = _visible_ctes(node).get(node.name.lower())
-        if cte is None:
-            return None
-        node, alias = cte.this, cte.args.get("alias")
-    while isinstance(node, exp.Subquery):
-        alias = alias or node.args.get("alias")
-        node = node.this
-    if not isinstance(node, (exp.Select, exp.SetOperation)):
-        return None
-    return node, ([c.name.lower() for c in alias.columns] if alias is not None and alias.columns else None)
-
-
-def _merging(select: Any, name: str) -> bool:
-    """FROM 里按同名的 name 这一列连起来（USING 里写着它，或者 NATURAL）：几个来源的这一列合成一列。"""
-    return any(str(join.args.get("method") or "").upper() == "NATURAL"
-               or any(str(getattr(u, "name", "")).lower() == name for u in join.args.get("using") or [])
-               for join in select.args.get("joins") or [])
-
-
-def _is_star(item: Any) -> bool:
-    from sqlglot import exp
-
-    return isinstance(item, exp.Star) or (isinstance(item, exp.Column) and isinstance(item.this, exp.Star))
-
-
-def _leaves(root: Any) -> list[Any]:
-    """一块查询的每一支：UNION 这类连起来的按先后摊开，套在外面的括号去掉。一般是 SELECT，也可能是 VALUES 这类。"""
-    from sqlglot import exp
-
-    out: list[Any] = []
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, exp.Subquery):
-            stack.append(node.this)
-        elif isinstance(node, exp.SetOperation):
-            stack.extend((node.expression, node.this))
-        else:
-            out.append(node)
-    return out
-
-
-def _branches(root: Any) -> list[list[Any]]:
-    """一块查询选出的列：一条 SELECT 一支，UNION 这类的每一支各一支（结果的第 i 列来自每一支的第 i 项）。"""
-    from sqlglot import exp
-
-    return [list(node.expressions) for node in _leaves(root) if isinstance(node, exp.Select)]
-
-
-def _output_name(item: Any) -> str | None:
-    """一个选出项在结果里的列名（小写）：起了别名的是别名，直接选一列的是列名。别的表达式（函数、运算、CAST、括号、
-    子查询）的列名各数据库起法不同（SQLite 照写法原样记「SUBSTR(buyer_phone, 4)」，Postgres 记函数名或 ?column?），
-    认不准，返回 None。"""
-    from sqlglot import exp
-
-    if isinstance(item, exp.Alias):
-        return item.alias.lower() or None
-    if isinstance(item, exp.Column) and not isinstance(item.this, exp.Star):
-        return item.name.lower() or None
-    return None
-
-
-def _places(branch: list[Any], width: int | None) -> list[int | None]:
-    """一支里每一项落在结果的第几列。没有 * 的一一对上；有 * 的，第一个 * 前面的从头数，最后一个 * 后面的从结果末尾
-    倒着数（width 是结果的列数，不知道就数不了）；两个 * 之间的、* 本身认不出位置（None）。"""
-    stars = [i for i, item in enumerate(branch) if _is_star(item)]
-    if not stars:
-        return list(range(len(branch)))
-    first, last = stars[0], stars[-1]
-    tail = len(branch) - 1 - last
-    # * 至少展开成 0 列：倒着数要是数到了 * 前面那几项的位置上，列数对不上，后面的一项都不认
-    countable = width is not None and width - tail >= first
-    return [i if i < first else width - (len(branch) - i) if i > last and countable else None
-            for i in range(len(branch))]
-
-
-def _blocks(root: Any) -> list[tuple[Any, str, list[str] | None]]:
-    """SQL 里的每一块查询（一条 SELECT，或者 UNION 这类连起来的一串）和它的结果流到哪：
-    - "result"：最外层，结果就是快照的列；
-    - "source"：当成一张表用的——WITH 里的一段、FROM / JOIN 里的子查询、LATERAL，外层按列名取它的列，* 会把它的列
-      全带出去。写了列名表的（t(p)）带上列名表；
-    - "other"：标量子查询、IN / EXISTS 里的，值经外层的表达式带出（_value_columns 已经算上），列名无关紧要。
-    套在外面的括号（可能好几层）不改变结果流到哪：先越过它们再看。UNION 里的一支不另算，整串按一块。"""
-    from sqlglot import exp
-
-    out: list[tuple[Any, str, list[str] | None]] = []
-    for node in root.find_all(exp.Select, exp.SetOperation):
-        wrappers: list[Any] = []
-        outer = node
-        while isinstance(outer.parent, exp.Subquery):
-            outer = outer.parent
-            wrappers.append(outer)
-        parent = outer.parent
-        if isinstance(parent, exp.SetOperation):
-            continue
-        if parent is None:
-            out.append((node, "result", None))
-        elif isinstance(parent, (exp.CTE, exp.Lateral)) or (wrappers and isinstance(parent, (exp.From, exp.Join))):
-            # 别名（和列名表）记在 WITH 的那一段、LATERAL 上，FROM 里的子查询记在带别名的那层括号上
-            alias = next((h.args["alias"] for h in [parent, *reversed(wrappers)] if h.args.get("alias")), None)
-            listed = [c.name.lower() for c in alias.columns] if alias is not None and alias.columns else None
-            out.append((node, "source", listed))
-        else:
-            out.append((node, "other", None))
-    return out
-
-
-def _source_names(top: Any, listed: list[str] | None, names: set[str]) -> tuple[set[str], bool]:
-    """派生来源的结果里值取自遮罩列的那几列的名字，以及有没有认不出名字的（没起别名的表达式、两个 * 之间的项）。
-    写了列名表的按位置对上列名表；没写的，单独一条 SELECT 取各项自己的列名，UNION 这类按位置对上第一支的列名。"""
-    branches = _branches(top)
-    found: set[str] = set()
-    unknown = False
-
-    def take(name: str | None) -> None:
-        nonlocal unknown
-        if name is None:
-            unknown = True
-        else:
-            found.add(name)
-
-    if listed is not None:
-        for branch in branches:
-            for item, place in zip(branch, _places(branch, len(listed))):
-                if names & _value_columns(item):
-                    take(listed[place] if place is not None and place < len(listed) else None)
-        return found, unknown
-    first = branches[0] if branches else []
-    for item in first:
-        if names & _value_columns(item):
-            take(_output_name(item))
-    if len(branches) > 1:
-        # 每一支一样宽：拿一支没有 * 的定宽度，* 后面的项才数得出位置
-        width = next((len(b) for b in branches if not any(_is_star(i) for i in b)), None)
-        heads = {place: _output_name(item) for item, place in zip(first, _places(first, width)) if place is not None}
-        for branch in branches[1:]:
-            for item, place in zip(branch, _places(branch, width)):
-                if names & _value_columns(item):
-                    take(heads.get(place) if place is not None else None)
-    return found, unknown
-
-
-def _tainted(sql: str, kind: str | None, masked: set[str], width: int) -> tuple[set[str], set[int]] | None:
-    """SQL 里指代遮罩列的名字（小写），和结果（width 列）里值取自遮罩列的那几列的位置。解析不了返回 None。
-
-    名字从遮罩列本身起，一层层传下去：选出列的值取自这些名字的（buyer_phone AS 手机号、UPPER(buyer_phone) AS x），它的
-    名字也算；派生来源（子查询、WITH 里的一段）按位置对上列名表、UNION 第一支的列名，也算，直到不再多出名字。同名
-    不同层的也一并算上（宁可多遮）。
-    位置是给没起别名的表达式用的（UPPER(buyer_phone) 的结果列名对不上任何名字）：和 * 写在同一支里的，* 前面的从头数、
-    后面的从末尾倒着数。认不出的——两个 * 之间的项、派生来源里没起别名的表达式（外层的 * 会把它原样带出来，列名
-    又认不准）——整份快照的列都算（同解析不了）。"""
-    from sqlglot import exp
-
-    from app.data.sql_semantics import _parse, _read
-
-    try:
-        root, _ = _parse(sql, _read(kind))
-    except Exception:  # noqa: BLE001 - 解析器的意外按解析不了处理
-        root = None
-    if root is None:
-        return None
-    try:
-        names = set(masked)
-        selects = list(root.find_all(exp.Select))
-        blocks = _blocks(root)
-        sources = [(top, listed) for top, role, listed in blocks if role == "source"]
-        for _ in range(len(selects) + len(sources) + 1):
-            before = len(names)
-            for select_ in selects:
-                for item in select_.expressions:
-                    name = item.alias_or_name.lower()
-                    if name and name not in names and names & _value_columns(item):
-                        names.add(name)
-            for top, listed in sources:
-                names |= _source_names(top, listed, names)[0]
-            if len(names) == before:
-                break
-        everything = any(_source_names(top, listed, names)[1] for top, listed in sources)
-        positions: set[int] = set()
-        for top, role, _listed in blocks:
-            if role != "result":
-                continue
-            for branch in _branches(top):
-                for item, place in zip(branch, _places(branch, width)):
-                    if names & _value_columns(item):
-                        if place is None or place >= width:
-                            everything = True
-                        else:
-                            positions.add(place)
-        return names, set(range(width)) if everything else positions
-    except Exception:  # noqa: BLE001 - 分析本身的缺陷不能让回答出错：按解析不了处理（宁可多遮）
-        logger.warning("质询的 SQL 遮罩分析失败", exc_info=True)
-        return None
-
-
-def _mentions(sql: str, names: Iterable[str]) -> bool:
-    return any(re.search(rf"(?<![0-9A-Za-z_]){re.escape(n)}(?![0-9A-Za-z_])", sql, re.I) for n in names if n)
-
-
-def _derived_hidden(snapshot: dict[str, Any], hidden: set[str], kind: str | None) -> tuple[set[str], set[str]]:
-    """(这份快照要遮的列, SQL 里指代遮罩列的名字)，都是小写。
-
-    证据面板只按列名遮（hidden）；agent 的查询起了别名、套了函数，结果列名就对不上。本仓库的查询惯例是起中文别名
-    （region AS 区域），所以按 SQL 认出改了名字的遮罩列（_tainted）。SQL 解析不了、里面又写着遮罩列的，整份快照的
-    列都遮掉；合并查询的快照不看 SQL，它记着自己的来历（_hidden_columns 已按 _merge_masks 遮好）。"""
-    base = set(hidden)
-    sql = snapshot.get("sql")
-    if not base or not isinstance(sql, str) or not sql.strip() or snapshot.get("source") == MERGE_SOURCE:
-        return base, base
-    columns = [str(c) for c in snapshot.get("columns") or []]
-    found = _tainted(sql, kind, base, len(columns))
-    if found is None:
-        return (base | {c.lower() for c in columns}, base) if _mentions(sql, base) else (base, base)
-    names, positions = found
-    return names | {columns[i].lower() for i in positions if i < len(columns)}, names
-
-
-# --------------------------------------------------------------------------
-# 遮罩：哪些值
-# --------------------------------------------------------------------------
-
-#: 一个数的写法：可带正负号、千分位、小数、百分号
-_NUMERIC = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?")
-#: 正文里一个个「词」：字母数字下划线连成的一串。头尾都是这种字的遮罩值，只能整个对上这样一串
-_WORDS = re.compile(r"[0-9A-Za-z_]+")
-#: 正文里的一串数（可带千分位、小数）：带千分位的遮罩值按去掉逗号的样子比
-_DIGITS = re.compile(r"\d[\d,]*(?:\.\d+)?")
-#: 中文这类遮罩值按开头几个字分桶找（_Secrets._partition）
-_PREFIX = 8
-
-
-def _plain_text(value: Any) -> str:
-    text = json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _numeric(value: Any) -> bool:
-    if isinstance(value, bool):
-        return False
-    return isinstance(value, (int, float)) or (isinstance(value, str) and numeric_text(value) is not None)
-
-
-def _forms(value: Any) -> set[str]:
-    """一格的值在正文里可能的写法：原样（压成一行），是数的再加上千分位的写法（13,900,000,001）。"""
-    text = _plain_text(value)
-    forms = {text} if text else set()
-    if _numeric(value):
-        with contextlib.suppress(RenderError, ValueError, ArithmeticError):
-            forms.add(render_cell(value))
-    return forms
-
-
-def _strong(form: str) -> bool:
-    """按值认得出的写法（见 SECRET_MIN、SECRET_DIGITS）。"""
-    if _NUMERIC.fullmatch(form):
-        return sum(c.isdigit() for c in form) >= SECRET_DIGITS
-    return len(form) >= SECRET_MIN
-
-
-def _digits_of(form: str) -> str:
-    return form.replace(",", "").lstrip("+-").rstrip("%")
-
-
-def _pattern(value: str) -> str:
-    """一个值的正则：头尾是字母数字的按词边界认；数字还不能是更长的数、日期、时间的一截（12.5 里的 2.5、2026-01-25 里的
-    25、12:30 里的 30），也不能是千分位写法里的一组（1,390 里的 390）。逗号隔开的一串长号码（13900000001,13900000002）
-    各自照认：千分位一组只有三位。"""
-    head = tail = ""
-    if _WORD.match(value[0]):
-        head = r"(?<![0-9A-Za-z_])"
-        if value[0].isdigit():
-            head += r"(?<!\d[.:/-])" + (r"(?<!\d,)" if len(re.match(r"\d*", value).group()) == 3 else "")
-    if _WORD.match(value[-1]):
-        tail = r"(?![0-9A-Za-z_])"
-        if value[-1].isdigit():
-            tail += r"(?![.:/-]\d)(?!,\d{3}(?!\d))"
-    return head + re.escape(value) + tail
-
-
-@dataclass
-class _Secrets:
-    """遮罩列里出现过的值。模型看得到原始的查询结果（工具交回的是原样），回答里照着复述、或者把值写进查询条件，
-    都会把它带进回答正文和查询清单；按值找出来换成「已遮罩」。这只减少暴露，不是安全边界（同证据面板的遮罩）。
-
-    strong 是按值认得出的写法（够长的数、两个字以上的文字），正文、SQL 里的字面量、名字和注释、别的列里的格子、列名都按
-    它换；weak 是遮罩列里的全部写法（含短的数），只用在 SQL 里和遮罩列做等值比较的字面量上；shown 是 SQL 里照原样
-    留着的阈值、行数（去掉千分位、正负号的数字），只在回答正文里不换（scrub 的 prose）。换的时候先按词、按开头两个
-    字筛出正文里真有的那几个值，再拿它们现编正则：遮罩值上万个时，现编一个上万分支的正则要一秒上下，每次都卡住整个进程。"""
-
-    strong: set[str] = field(default_factory=set)
-    weak: set[str] = field(default_factory=set)
-    shown: set[str] = field(default_factory=set)
-    _index: Any = field(default=None, repr=False, compare=False)
-    _compiled: dict[frozenset[str], re.Pattern[str]] = field(default_factory=dict, repr=False, compare=False)
-
-    def add(self, snapshot: Any, hidden: set[str], *, labels: dict[str, set[str]] | None = None,
-            base: Iterable[str] = ()) -> None:
-        """收一份快照里要遮的列（hidden，小写）的值。labels 是这份快照里只装着分档标签的列（_label_columns）：这几列的
-        格子等于标签的不收；改了名字的遮罩列、别的派生列照收，base（数据源设了遮罩的列，小写）自己选出来的值也照收。"""
-        if not _query_shaped(snapshot) or not hidden:
-            return
-        own = set(base)
-        written = {name: texts for name, texts in (labels or {}).items() if name not in own}
-        columns = [str(c) for c in snapshot.get("columns") or []]
-        index = [i for i, c in enumerate(columns) if c.lower() in hidden]
-        for row in snapshot["rows"]:
-            if len(self.weak) >= SECRETS_MAX:
-                break
-            if isinstance(row, list):
-                cells = [(columns[i].lower(), row[i]) for i in index if i < len(row)]
-            elif isinstance(row, dict):
-                cells = [(str(k).lower(), v) for k, v in row.items() if str(k).lower() in hidden]
-            else:
-                continue
-            for name, value in cells:
-                if value is None or isinstance(value, bool):
-                    continue
-                forms = _forms(value)
-                if forms & written.get(name, set()):
-                    continue
-                for form in forms:
-                    self.weak.add(form)
-                    if _strong(form):
-                        self.strong.add(form)
-        self._index = None
-
-    def protect(self, texts: Iterable[str | None]) -> None:
-        """已经摆在读者眼前的值不换：提问人自己写进问题、选中原文里的（「13900000001 这位客户」「排除 300 以下的」），
-        报告里列出的指标、运行输入的值——换了只会让回答、查询对不上问题和报告。正文、格子、SQL 里都不换。"""
-        given = " ".join(t for t in texts if t)
-        if not given:
-            return
-        numbers = {_digits_of(n) for n in _DIGITS.findall(given)}
-
-        def asked(form: str) -> bool:
-            return _digits_of(form) in numbers if _NUMERIC.fullmatch(form) else form in given
-
-        self.strong = {f for f in self.strong if not asked(f)}
-        self.weak = {f for f in self.weak if not asked(f)}
-        self._index, self._compiled = None, {}
-
-    def show(self, numbers: Iterable[str]) -> None:
-        """SQL 里照原样留着的阈值、行数（_shown_literals）：回答正文里复述它们不换（「金额不低于 30000 元」），换了只会
-        让回答和 SQL 对不上。只免正文：格子、列名、SQL 里照旧按值换——格子里的值正好是这个数，可能就是那个人
-        （col >= v 再按 col 排序取第一行，查出来的就是 v）。"""
-        self.shown = set(numbers)
-
-    def is_shown(self, form: str) -> bool:
-        return bool(_NUMERIC.fullmatch(form)) and _digits_of(form) in self.shown
-
-    def hit(self, value: Any) -> bool:
-        """一格（或 SQL 里一个字面量）的值是不是按值认得出的遮罩值。短的数不算（见 SECRET_DIGITS）。"""
-        if value is None or isinstance(value, bool) or not self.strong:
-            return False
-        text = _plain_text(value)
-        if text in self.strong:
-            return True
-        if _numeric(value) and sum(c.isdigit() for c in text) >= SECRET_DIGITS:
-            with contextlib.suppress(RenderError, ValueError, ArithmeticError):
-                return render_cell(value) in self.strong
-        return False
-
-    def weak_hit(self, text: str) -> bool:
-        """SQL 里一个字面量是不是遮罩列里出现过的值（短的数也算）。"""
-        return _plain_text(text) in self.weak
-
-    def scrub(self, text: str, *, prose: bool = False) -> str:
-        """text 里的遮罩值换成「已遮罩」。prose：这是回答正文，SQL 里照原样留着的阈值、行数不换（show）。"""
-        if not text or not self.strong:
-            return text
-        pattern = self.pattern(text, prose=prose)
-        return pattern.sub(_masked_word(), text) if pattern is not None else text
-
-    def pattern(self, text: str, *, prose: bool = False) -> re.Pattern[str] | None:
-        """认 text 里出现的遮罩值的正则；一个都没有时为 None。prose 同 scrub。"""
-        found = self._found(text) if text and self.strong else set()
-        if prose and self.shown:
-            found = {v for v in found if not self.is_shown(v)}
-        if not found:
-            return None
-        key = frozenset(found)
-        if key not in self._compiled:
-            if len(self._compiled) > 64:
-                self._compiled = {}
-            # 长的在前：13900000001 先于它的一截被认出来
-            self._compiled[key] = re.compile("|".join(_pattern(v) for v in sorted(found, key=lambda v: (-len(v), v))))
-        return self._compiled[key]
-
-    def _found(self, text: str) -> set[str]:
-        words, numbers, others = self._partition()
-        found = {w for w in _WORDS.findall(text) if w in words}
-        if numbers:
-            for run in _DIGITS.findall(text):
-                found |= numbers.get(_digits_of(run), set())
-        for i in range(len(text) - 1) if others else ():
-            for size, buckets in others.items():
-                for length, values in buckets.get(text[i:i + size], {}).items():
-                    if (piece := text[i:i + length]) in values:
-                        found.add(piece)
-        return found
-
-    def prepare(self) -> None:
-        """先把索引建好（收完值、去掉提问人写的之后）：上万个值建一次要几十毫秒，放在线程里建，别等到事件循环里第一次换。"""
-        self._partition()
-
-    def _partition(self) -> tuple[set[str], dict[str, set[str]], dict[int, dict[str, dict[int, set[str]]]]]:
-        """strong 分成三类：只有字母数字的（按词比）、带千分位小数的数（按去掉逗号的数比）、其余的（中文、日期、
-        邮箱）。其余的按开头至多 _PREFIX 个字分桶、桶里再按长短分：同一个市区的上万个地址开头七八个字都一样，只按开头
-        分的话，正文里每碰到一次那几个字都要逐个比；再按长短分，碰到一次只是按几种长短各查一下。三类各自只在正文里
-        真出现时才进正则。"""
-        if self._index is None:
-            words: set[str] = set()
-            numbers: dict[str, set[str]] = {}
-            others: dict[int, dict[str, dict[int, set[str]]]] = {}
-            for value in self.strong:
-                if _WORDS.fullmatch(value):
-                    words.add(value)
-                elif _NUMERIC.fullmatch(value):
-                    numbers.setdefault(_digits_of(value), set()).add(value)
-                else:
-                    size = min(len(value), _PREFIX)
-                    others.setdefault(size, {}).setdefault(value[:size], {}).setdefault(len(value), set()).add(value)
-            self._index = (words, numbers, others)
-        return self._index
-
-
-#: 单元格引用的前一截（Q1.r0.）：后面才是列名
-_CELL_HEAD = re.compile(r"^\s*[QK]\d+\.r\d+\.")
-
-
-def _scrubbed_source(text: str, secrets: _Secrets) -> str:
-    """回答原文里的遮罩值换成「已遮罩」：标记之外按正文的办法换（SQL 里照原样留着的阈值不换）；标记里的按段换（| 隔开
-    的几段各自换），单元格引用只换列名那一截——编号、行号换不出东西，整段换的话「r0.」会让列名开头的长号码看着像小数
-    的一截，反而认不出来。列名照快照、SQL 里的名字那样换（阈值也换），换得一样才对得上。
-    标记里写着遮罩值的引用换完多半解析不了（列名里写着遮罩值的除外：快照的列名也换过了，正好对上），宁可弄坏一个
-    引用，也不让值留在存下的原文、片段里，或者从解析不了的占位里露出来。"""
-    if not text or not secrets.strong:
-        return text
-    out: list[str] = []
-    last = 0
-    for m in MARKER_RE.finditer(text):
-        out.append(secrets.scrub(text[last:m.start()], prose=True))
-        start, end = m.span("body")
-        parts = text[start:end].split("|")
-        head = _CELL_HEAD.match(parts[0]) if m.group("kind").strip() == "v" else None
-        first = parts[0][:head.end()] + secrets.scrub(parts[0][head.end():]) if head \
-            else secrets.scrub(parts[0], prose=True)
-        parts = [first, *(secrets.scrub(p, prose=True) for p in parts[1:])]
-        out.append(text[m.start():start] + "|".join(parts) + text[end:m.end()])
-        last = m.end()
-    out.append(secrets.scrub(text[last:], prose=True))
-    return "".join(out)
-
-
-def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, *, embedded: bool = False
-                 ) -> tuple[dict[str, Any], list[str]]:
-    """一份查询快照遮好的样子和遮掉的列：要遮的列（hidden，小写）每一格都换成「已遮罩」、类型记成文本（渲染时不当数）；
-    别的列里写着按值认得出的遮罩值的格子也换（另一张表里没设遮罩的同一个手机号、改了名字没认出来的遮罩列）。
-    列名里写着遮罩值的（agent 把遮罩值写进了别名，「13900000001 的单」），列名也换（同 SQL 里的名字，_scrub_sql）。
-    原快照不动；没有要遮的返回原快照。
-
-    embedded 只给质询工件用：别的列里一格文字夹着遮罩值（备注里写着手机号），把那一截换成「已遮罩」，这一格别的字
-    照原样，门槛同整格（_Secrets.scrub）；这一列不记进遮掉的列——界面把记进去的列整列画成「已遮罩」，这一列在数据源
-    里也没设遮罩。回答一路不这样换：渲染出来露了就整份不交（_leaked），不然回答被问的那一格看着像查到了别的东西。"""
-    columns = [str(c) for c in snapshot.get("columns") or []]
-    index = {i for i, c in enumerate(columns) if c.lower() in hidden}
-    by_value = bool(secrets.strong)
-    if not index and not by_value:
-        return snapshot, []
-    word = _masked_word()
-    touched = set(index)
-    edited = False
-    position = {c: i for i, c in enumerate(columns)}
-    names = [secrets.scrub(c) for c in columns] if by_value else columns
-
-    def cell(i: int | None, value: Any) -> Any:
-        nonlocal edited
-        if i in index:
-            return word
-        if by_value and secrets.hit(value):
-            if i is not None:
-                touched.add(i)
-            return word
-        if embedded and by_value and isinstance(value, (str, dict, list)):
-            # JSON 列（对象、数组）按界面画出来的样子换，换过的照文字给
-            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-            if (scrubbed := secrets.scrub(text)) != text:
-                edited = True
-                return scrubbed
-        return value
-
-    def key(k: Any) -> Any:
-        i = position.get(str(k))
-        return names[i] if i is not None else k
-
-    rows: list[Any] = []
-    for row in snapshot["rows"]:
-        if isinstance(row, list):
-            rows.append([cell(i, v) for i, v in enumerate(row)])
-        elif isinstance(row, dict):
-            rows.append({key(k): word if str(k).lower() in hidden else cell(position.get(str(k)), v)
-                         for k, v in row.items()})
-        else:
-            rows.append(row)
-    renamed = names != columns
-    if not touched and not renamed and not edited:
-        return snapshot, []
-    types = {key(k): v for k, v in snapshot["column_types"].items()} \
-        if isinstance(snapshot.get("column_types"), dict) else {}
-    types.update({names[i]: "text" for i in index})
-    view = {**snapshot, "rows": rows, "column_types": types, **({"columns": names} if renamed else {})}
-    return view, [names[i] for i in sorted(touched)]
 
 
 #: 按词认在找某一个值的比较（SQL 解析不了时的退路，见 _context）：col = 'x'、col <> 'x'、col LIKE 'x'、SQLite 的
@@ -1491,8 +726,6 @@ _VALUE_ENDS = frozenset({"NUMBER", "VAR", "IDENTIFIER", "R_PAREN", "R_BRACKET", 
 _KEPT = frozenset({"range", "limit"})
 #: 字面量写在左边时运算符翻过来：25 < age 就是 age > 25（等值一类翻过来还是它自己）
 _FLIP = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "=": "=", "<>": "<>"}
-#: 一个纯粹的数（可带正负号、小数）：范围边界按数比大小，写成字符串的也一样
-_PLAIN_NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
 
 def _is_literal(kind: str) -> bool:
@@ -1657,91 +890,6 @@ def _exact_ops() -> dict[Any, str]:
     return {exp.EQ: "=", exp.NullSafeEQ: "=", exp.Is: "=", exp.NEQ: "<>", exp.NullSafeNEQ: "<>"}
 
 
-def _arithmetic() -> tuple[Any, ...]:
-    """加减乘除、取模（%、MOD）、整除（MySQL 的 DIV、DuckDB 的 //）：几个写死的数算出来的整个算式按算出来的那一个值认
-    （13900000000 + 1 就是 13900000001，125 % 100 就是 25）。"""
-    from sqlglot import exp
-
-    return exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv
-
-
-#: 数的写法里指数最大多少（1e999999 这样的写法不按数认，免得展开成上百万位）
-_EXPONENT_MAX = 40
-
-
-def _decimal(text: str) -> Decimal | None:
-    """一段字按数读（025、2.5e1、13900000001.0 都认）；读不了、不是有限的数、指数太大为 None。"""
-    try:
-        value = Decimal(text.strip())
-    except (ArithmeticError, ValueError):
-        return None
-    return value if value.is_finite() and abs(value.adjusted()) <= _EXPONENT_MAX else None
-
-
-def _canonical(text: str) -> str | None:
-    """一个数的规范写法（_point_text）：25.0、025、2.5e1 都是 25，13900000001.0 是 13900000001。SQL 里换个写法写同一个
-    数，照样认得出是不是遮罩值（_swap_literal）。不是数为 None。"""
-    value = _decimal(text)
-    return _point_text(value) if value is not None else None
-
-
-def _constant(node: Any) -> Any:
-    """写死的值：数按数（几个数加减乘除算出来的也算，13900000002 - 1；025、2.5e1 这样的写法也按数），字符串按原文
-    （纯粹的数照样按数）；别的为 None。"""
-    return _constants(node).get(id(node)) if node is not None else None
-
-
-def _constants(root: Any) -> dict[int, Any]:
-    """一棵语法树里每个写死的值（_constant）：id(节点) → 值。从下往上一层层算（广度优先的倒序，孩子总在父亲前面），
-    不递归：上千项的连加（1+1+…）会超过递归深度，以前整条 SQL 因此退回按词认，同一句里夹住的值就认不出了。"""
-    from sqlglot import exp
-
-    out: dict[int, Any] = {}
-    for node in reversed(list(root.walk())):
-        value: Any = None
-        if isinstance(node, exp.Neg):
-            inner = out.get(id(node.this))
-            value = -inner if isinstance(inner, Decimal) else None
-        elif isinstance(node, (exp.Paren, exp.Cast, exp.Collate)):
-            value = out.get(id(node.this))
-        elif isinstance(node, exp.Introducer):
-            value = out.get(id(node.expression))
-        elif isinstance(node, _literal_types()):
-            text = str(node.this).strip()
-            number = Decimal(text) if _PLAIN_NUMBER.fullmatch(text) else (
-                _decimal(text) if isinstance(node, exp.Literal) and not node.is_string else None)
-            value = number if number is not None else text
-        elif isinstance(node, _arithmetic()):
-            value = _worked_out(node, out.get(id(node.this)), out.get(id(node.expression)))
-        if value is not None:
-            out[id(node)] = value
-    return out
-
-
-def _worked_out(node: Any, a: Any, b: Any) -> Decimal | None:
-    """一步加减乘除、取模、整除的结果；不是两个数、除以零、结果太大为 None。取模、整除照 SQL 往零取整（-7 % 2 是 -1，
-    -7 DIV 2 是 -3，同 Decimal 的 % 和 //）。/ 在 SQLite、Postgres 这类方言里两个整数相除只留整数部分（解析时记在
-    typed 上：53 / 2 是 26），写成小数的（53.0 / 2）、别的方言照小数算。以前一律按小数算，SQLite 里 age >= 25 AND
-    age < 53 / 2 夹住了 25 却认不出。"""
-    from sqlglot import exp
-
-    if not (isinstance(a, Decimal) and isinstance(b, Decimal)):
-        return None
-    try:
-        if isinstance(node, (exp.Div, exp.IntDiv, exp.Mod)):
-            if not b:
-                return None
-            # 写成整数的数（和它们加减乘出来的）指数正好是 0；53.0、1e1 这样写的在 SQL 里不是整数
-            whole = isinstance(node, exp.IntDiv) or (
-                node.args.get("typed") and a.as_tuple().exponent == 0 and b.as_tuple().exponent == 0)
-            value = a % b if isinstance(node, exp.Mod) else a // b if whole else a / b
-        else:
-            value = a + b if isinstance(node, exp.Add) else a - b if isinstance(node, exp.Sub) else a * b
-    except ArithmeticError:
-        return None
-    return value if value.is_finite() and abs(value.adjusted()) <= _EXPONENT_MAX else None
-
-
 def _lifts(root: Any, values: dict[int, Any]) -> dict[int, Any]:
     """写死的值往上能越过的外壳和算式：id(节点) → 越过之后走到的那一层（13900000000 + 1 里的两个数都走到整个算式，
     (25) 里的 25 走到括号）。先父亲后孩子（广度优先）地记，每个字面量直接跳到那一层，上千项的连加不必每个数都一层层
@@ -1814,13 +962,6 @@ def _key_of(node: Any) -> str:
     while isinstance(node, exp.Paren):
         node = node.this
     return "\0" + (node.sql() if node is not None else "")
-
-
-def _literal_types() -> tuple[Any, ...]:
-    """语法树里的字面量：数字、字符串，以及字符串带前缀的几种变体（N'…'、$$…$$、U&'…'、E'…'、X'…'、B'…'）。"""
-    from sqlglot import exp
-
-    return (exp.Literal, exp.National, exp.RawString, exp.UnicodeString, exp.ByteString, exp.HexString, exp.BitString)
 
 
 def _logic() -> tuple[Any, ...]:
@@ -2144,13 +1285,6 @@ def _sign(a: Any, b: Any) -> int:
     return (a > b) - (a < b)
 
 
-def _point_text(point: Any) -> str:
-    """夹住的值写成格子里的样子（25、13900000001、12.5），拿去和遮罩列里的值比（_swap_literal）。"""
-    if isinstance(point, Decimal):
-        return format(point.to_integral_value() if point == point.to_integral_value() else point.normalize(), "f")
-    return str(point)
-
-
 #: SQL 里一个字面量用在哪：(用法, 被比较的一边取自哪些列, 认它时一并看的值)，见 _literal_uses
 _Use = tuple[str, frozenset[str], tuple[str, ...]]
 
@@ -2278,9 +1412,12 @@ def _swap_literal(raw: str, text: str, kind: str, use: _Use, secrets: _Secrets, 
       手机号）。数换个写法照样认（25.0、025、2.5e1 按 25 认，_canonical）；夹住某一个值的范围按夹住的值认（age > 24
       AND age < 26 的两头都按 25 认），算式里的数按算出来的值认，同一个数在别处换掉了的阈值、行数也按等值认（见
       _literals）；
-    - 字符串在哪都按值换里面的遮罩值（范围边界也一样：写成字符串的长号码做边界，多半是在找那一个人）；
+    - 字符串在哪都按值换里面的遮罩值（范围边界也一样：写成字符串的长号码做边界，多半是在找那一个人），换了写法的号码
+      也认（LIKE '%199-1474-2785%'：字符串里的 199-1474-2785 不是算式）；换掉的号码按纯数字写法记，同一个数写成阈值的
+      据此不留；
     - 别的数：范围比较的边界、LIMIT / OFFSET 的行数照原样（agent 自己定的阈值，换了封存的就不是实际执行的语句）；
-      别处（选出列、函数参数、算式）认不准是不是在找某一个值，够长的遮罩值整个换（算出来的值是也换）。"""
+      别处（选出列、函数参数、算式）认不准是不是在找某一个值，够长的遮罩值整个换（算出来的值是也换）。不带引号的数
+      不按换了写法认：199-1474-2785 在 SQL 里是三个数相减。"""
     how, columns, points = use
     word = _masked_word()
     canonical = _canonical(text)
@@ -2292,11 +1429,9 @@ def _swap_literal(raw: str, text: str, kind: str, use: _Use, secrets: _Secrets, 
         found: list[str] = []
 
         def scrub(inner: str) -> str:
-            pattern = secrets.pattern(inner)
-            if pattern is None:
-                return inner
-            found.extend(m.group() for m in pattern.finditer(inner))
-            return pattern.sub(word, inner)
+            out, swapped = secrets.swap(inner, loose=True)
+            found.extend(swapped)
+            return out
 
         return _requote(raw, scrub), _number_forms(found)
     if how not in _KEPT and any(secrets.hit(v) for v in looked):
@@ -2327,7 +1462,9 @@ def _scrub_sql(sql: str, secrets: _Secrets, compared: set[str], kind: str | None
 
 def _rebuild(sql: str, tokens: list[Any], kinds: list[str], secrets: _Secrets, literal: Callable[[int, str], str]
              ) -> str:
-    """按词重写一段 SQL：字面量交给 literal（第几个词、原文）定换成什么，名字（带不带引号）、注释和别的字按值换。"""
+    """按词重写一段 SQL：字面量交给 literal（第几个词、原文）定换成什么，名字（带不带引号）、注释和别的字按值换。
+    词与词之间只有空白和注释，名字里的数也不是算式：都按文字的办法换（换了写法的号码也认，/* 客户 199-1474-2785 */、
+    AS "199-1474-2785 的备注"）。"""
     out: list[str] = []
     last = 0
     for i, token in enumerate(tokens):
@@ -2335,16 +1472,16 @@ def _rebuild(sql: str, tokens: list[Any], kinds: list[str], secrets: _Secrets, l
         if start < last or end > len(sql):
             continue
         gap = sql[last:start]
-        out.append(secrets.scrub(gap) if gap.strip() else gap)
+        out.append(secrets.scrub(gap, loose=True) if gap.strip() else gap)
         raw = sql[start:end]
         if _is_literal(kinds[i]):
             raw = literal(i, raw)
         elif kinds[i] in _NAME_TOKENS:
-            raw = _requote(raw, secrets.scrub)
+            raw = _requote(raw, lambda inner: secrets.scrub(inner, loose=True))
         out.append(raw)
         last = end
     rest = sql[last:]
-    out.append(secrets.scrub(rest) if rest.strip() else rest)
+    out.append(secrets.scrub(rest, loose=True) if rest.strip() else rest)
     return "".join(out)
 
 
@@ -2389,7 +1526,7 @@ def _scrub_excerpt(text: str, whole: set[str] | None, secrets: _Secrets, kind: s
         def literal(i: int, raw: str) -> str:
             if tokens[i].text in whole:
                 return word if kinds[i] == "NUMBER" else _requote(raw, lambda _: word)
-            return raw if kinds[i] == "NUMBER" else _requote(raw, secrets.scrub)
+            return raw if kinds[i] == "NUMBER" else _requote(raw, lambda inner: secrets.scrub(inner, loose=True))
 
         out = _rebuild(body, tokens, kinds, secrets, literal)
     return out + "…" if cut else out
@@ -2477,7 +1614,8 @@ def _shown_literals(sqls: Iterable[tuple[str, str | None, set[str]]], secrets: _
 class _Plan:
     """一次回答（或一次取质询工件）的遮罩：agent 每份查询快照遮好的样子（views）和遮掉的列（masked）、SQL 里指代
     遮罩列的名字（tainted）、数据源的类型（kinds，SQL 按它的方言分词）、遮罩列里出现过的值（secrets），以及已经不在的
-    数据源（gone，按查询当时记下的遮罩处理）。"""
+    数据源（gone，按查询当时记下的遮罩处理）。replay：回答时只靠 agent 查询时遮掉的值（seen，只在内存里）才换掉的
+    地方，按快照记成位置（masking.view_edits），写进质询事件，事后取质询工件照着再换一遍；取工件时为空。"""
 
     views: dict[str, dict[str, Any]]
     masked: dict[str, list[str]]
@@ -2485,6 +1623,7 @@ class _Plan:
     kinds: dict[str, str | None]
     secrets: _Secrets
     gone: dict[str, list[str]]
+    replay: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 async def _source_kinds(names: Iterable[str]) -> dict[str, str | None]:
@@ -2499,13 +1638,15 @@ async def _source_kinds(names: Iterable[str]) -> dict[str, str | None]:
 
 async def _plan(own: dict[str, dict[str, Any]], others: list[dict[str, Any]], given: list[str | None],
                 shown: list[tuple[str, str, str]] | None = None, live: dict[str, list[str]] | None = None, *,
-                embedded: frozenset[str] = frozenset()) -> _Plan:
+                embedded: frozenset[str] = frozenset(), seen: _Secrets | None = None) -> _Plan:
     """own：agent 自己的查询快照（工件 id → 内容）；others：报告自己的查询快照（被问的那句可能直接写着遮罩列的值，
     agent 会照着复述、写进查询条件）；given：问题、选中的原文、报告里列出的指标和运行输入的值（都已经摆在读者眼前，
     里面的值哪里都不换）；shown：agent 执行的查询，(SQL, 数据源名, 快照工件 id)（照原样留在 SQL 里的阈值、LIMIT，
     回答正文里不换，见 _Secrets.show；取质询工件不用：快照里的格子照旧按值遮）；live：用得上的数据源现在设的遮罩列
     （快照没取到的查询按它认 SQL 里的比较，见 _compared）；embedded：这几份快照的文字格里夹着的遮罩值也按子串换
-    （只给要取的那份质询工件，见 _masked_view）。
+    （只给要取的那份质询工件，见 _masked_view）；seen：agent 查询时在工具边界遮掉的值（verify_agent 交回的
+    masked_values，只在内存里）。agent 自己的快照查询时就遮好了，遮罩列里收不到值；模型照着别处看到的号码写进回答、
+    查询条件时，按值遮要靠它认出来。
 
     查数据源的遮罩要读库，在这里读；解析 SQL、收上万个值、逐格比对是纯计算，放进线程：放在事件循环里会挡住同一进程
     里别的运行（同 tools/datasource 的 _sql_checks）。"""
@@ -2517,13 +1658,13 @@ async def _plan(own: dict[str, dict[str, Any]], others: list[dict[str, Any]], gi
     based = [(snapshot, (await _hidden_columns(snapshot, masks))[0]) for snapshot in others]
     kinds = await _source_kinds([*(str(s.get("source") or "") for s in [*own.values(), *others]),
                                  *(name for _, name, _ in shown)])
-    return await asyncio.to_thread(_settle_plan, own, named, based, kinds, given, shown, live or {}, embedded)
+    return await asyncio.to_thread(_settle_plan, own, named, based, kinds, given, shown, live or {}, embedded, seen)
 
 
 def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str], list[str]]],
                  based: list[tuple[dict[str, Any], set[str]]], kinds: dict[str, str | None],
                  given: list[str | None], shown: list[tuple[str, str, str]], live: dict[str, list[str]],
-                 embedded: frozenset[str]) -> _Plan:
+                 embedded: frozenset[str], seen: _Secrets | None = None) -> _Plan:
     secrets = _Secrets()
     hidden: dict[str, set[str]] = {}
     tainted: dict[str, set[str]] = {}
@@ -2531,29 +1672,57 @@ def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str]
         kind, base = kinds.get(str(snapshot.get("source") or "")), named[artifact][0]
         hidden[artifact], tainted[artifact] = _derived_hidden(snapshot, base, kind)
         secrets.add(snapshot, hidden[artifact], labels=_snapshot_labels(snapshot, kind), base=base)
-    for snapshot, base in based:
-        kind = kinds.get(str(snapshot.get("source") or ""))
-        secrets.add(snapshot, _derived_hidden(snapshot, base, kind)[0], labels=_snapshot_labels(snapshot, kind),
-                    base=base)
-    secrets.protect(given)
+    # agent 查询时遮掉的值先收（报告快照里的值收满了上限 SECRETS_MAX，也不丢 agent 自己查到的）；不带它们的一份另算，
+    # 比出事后取质询工件时认不出、要照位置重放的地方
+    baseline = secrets.copy() if seen is not None and seen.strong else None
+    secrets.merge(seen)
+    for target in (secrets, baseline):
+        if target is not None:
+            _add_based(target, based, kinds)
+            target.protect(given)
     secrets.show(_shown_literals([(sql, kinds.get(name), _compared(tainted, artifact, live, name))
                                   for sql, name, artifact in shown], secrets))
     secrets.prepare()
     views: dict[str, dict[str, Any]] = {}
     masked: dict[str, list[str]] = {}
+    replay: dict[str, dict[str, Any]] = {}
     for artifact, snapshot in own.items():
         views[artifact], masked[artifact] = _masked_view(snapshot, hidden[artifact], secrets,
                                                          embedded=artifact in embedded)
+        if baseline is not None and (edits := view_edits(snapshot, hidden[artifact], secrets, baseline)):
+            replay[artifact] = edits
     return _Plan(views=views, masked=masked, tainted=tainted, kinds=kinds, secrets=secrets,
-                 gone={artifact: named[artifact][1] for artifact in own})
+                 gone={artifact: named[artifact][1] for artifact in own}, replay=replay)
 
 
-def _snapshot_labels(snapshot: dict[str, Any], kind: str | None) -> dict[str, set[str]]:
-    """一份快照里只装着分档标签的列（_label_columns）。没有 SQL 的（合并查询）一个都不算。"""
-    sql = snapshot.get("sql")
-    if not isinstance(sql, str) or not sql.strip():
-        return {}
-    return _label_columns(sql, kind, [str(c) for c in snapshot.get("columns") or []])
+def _add_based(secrets: _Secrets, based: list[tuple[dict[str, Any], set[str]]], kinds: dict[str, str | None]) -> None:
+    """收报告自己的查询快照里遮罩列的值（based：快照和它要遮的列），按 SQL 认出改了名字的遮罩列（_derived_hidden）。"""
+    for snapshot, base in based:
+        kind = kinds.get(str(snapshot.get("source") or ""))
+        secrets.add(snapshot, _derived_hidden(snapshot, base, kind)[0], labels=_snapshot_labels(snapshot, kind),
+                    base=base)
+
+
+async def snapshot_secrets(snapshots: Iterable[Any], given: Iterable[str | None] = ()) -> _Secrets:
+    """几份查询快照（报告自己的）里遮罩列的值，收法同回答时收报告快照（_plan），去掉已经摆在读者眼前的（given）。
+    审批质询、反方审稿在派核查 agent 之前交给它的查询工具（run_verify_agent 的 masked_values）：agent 查到的别的表、
+    备注里写着同一个号码时，交给模型之前就换掉，模型看不到。"""
+    from app.api.evidence import _Masks
+
+    masks = _Masks()
+    based = [(snapshot, (await _hidden_columns(snapshot, masks))[0]) for snapshot in snapshots
+             if _query_shaped(snapshot)]
+    kinds = await _source_kinds(str(snapshot.get("source") or "") for snapshot, _ in based)
+    asked = list(given)
+
+    def collect() -> _Secrets:
+        secrets = _Secrets()
+        _add_based(secrets, based, kinds)
+        secrets.protect(asked)
+        secrets.prepare()
+        return secrets
+
+    return await asyncio.to_thread(collect)
 
 
 def _compared(tainted: dict[str, set[str]], artifact: str, live: dict[str, list[str]], name: str) -> set[str]:
@@ -2639,22 +1808,26 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
     part = settings.get("inquiry") if isinstance(settings.get("inquiry"), dict) else {}
     async with SessionLocal() as session:
         spec = await verify_model_spec(session, None, settings=settings)
+    # 报告自己的查询快照：被问的那句可能直接写着遮罩列的值，agent 会照着复述；里面的遮罩值在派 agent 之前就交给它的
+    # 查询工具（masked_values），agent 查到写着同一个号码的备注、别的表时，交给模型之前就换掉
+    given = [ask.question, ask.quote, *_ref_values(refs)]
+    others = [snapshot for entry in catalog.values() if isinstance(entry, dict) and entry.get("kind") == "query"
+              and _query_shaped(snapshot := _quiet_load(op.loader, entry.get("artifact")))]
     outcome = await run_verify_agent(
         spec=spec, system=INQUIRY_SYSTEM, task=_task(op, ask, target, excerpts, refs, live, lost), sources=list(live),
         output_schema=INQUIRY_SCHEMA, max_queries=part.get("max_queries"), timeout_s=part.get("timeout_s"),
-        daily_max_usd=settings.get("daily_max_usd"), run_id=op.run_id, data_versions=op.versions)
+        daily_max_usd=settings.get("daily_max_usd"), run_id=op.run_id, data_versions=op.versions,
+        masked_values=await snapshot_secrets(others, given))
 
-    # 遮罩：agent 自己的查询快照、报告自己的查询快照（被问的那句可能直接写着遮罩列的值，agent 会照着复述）
+    # 遮罩：agent 自己的查询快照（查询时就遮好了，遮掉的值在 outcome.masked_values 里）、报告自己的查询快照
     own: dict[str, dict[str, Any]] = {}
     for query in outcome.queries:
         snapshot = _quiet_load(artifact_store.load, query.get("artifact"))
         if _query_shaped(snapshot):
             own[str(query["artifact"])] = snapshot
-    others = [snapshot for entry in catalog.values() if isinstance(entry, dict) and entry.get("kind") == "query"
-              and _query_shaped(snapshot := _quiet_load(op.loader, entry.get("artifact")))]
-    plan = await _plan(own, others, [ask.question, ask.quote, *_ref_values(refs)],
+    plan = await _plan(own, others, given,
                        [(str(q.get("sql") or ""), str(q.get("source") or ""), str(q.get("artifact") or ""))
-                        for q in outcome.queries], live)
+                        for q in outcome.queries], live, seen=outcome.masked_values)
 
     text, doc_id, failed = "", None, None
     source = (outcome.rationale or {}).get("source") if outcome.result is not None else None
@@ -2686,6 +1859,8 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
         "inquiry_artifacts": list(dict.fromkeys(q["artifact"] for q in queries if q.get("artifact"))),
         "queries": queries,
         "model": outcome.model, "usage": {k: outcome.usage.get(k, 0) for k in USAGE_KEYS},
+        # 只靠内存里的遮罩值才换掉的位置（不含值），质询工件照着再换一遍；没有就不加这个键，事件和以前一字不差
+        **({REPLAY_KEY: plan.replay} if plan.replay else {}),
     }
 
 
@@ -2727,21 +1902,24 @@ def _compose(source: str, catalog: dict[str, Any], *, run_id: str, views: dict[s
 
 
 def _leaked(doc: dict[str, Any], secrets: _Secrets) -> bool:
-    """组装出来的正文里还认得出遮罩值。SQL 里照原样留着的阈值写在正文里不算（_Secrets.show），渲染进单元格引用里的
-    算：格子已经按值遮过，遮完还认得出，就是一格文字里夹着这个数，渲染出来才露。"""
+    """组装出来的正文里还认得出遮罩值，换了写法的长号码也算（199-1474-2785、+86 …、全角数字，_Secrets.loose_spans）。
+    SQL 里照原样留着的阈值写在正文里不算（_Secrets.show），渲染进单元格引用里的算：格子已经按值遮过，遮完还认得出，
+    就是一格文字里夹着这个数，渲染出来才露。"""
     markdown = str(doc.get("markdown") or "")
     pattern = secrets.pattern(markdown)
-    if pattern is None:
+    hits = [(m.start(), m.end(), secrets.is_shown(m.group())) for m in pattern.finditer(markdown)] if pattern else []
+    hits += [(start, end, key in secrets.shown) for start, end, key in secrets.loose_spans(markdown)]
+    if not hits:
         return False
     cells = [seg["span"] for seg in iter_segments(doc) if str(seg.get("ref") or "").startswith("v:")]
-    return any(not secrets.is_shown(m.group()) or any(a < m.end() and m.start() < b for a, b in cells)
-               for m in pattern.finditer(markdown))
+    return any(not shown or any(a < end and start < b for a, b in cells) for start, end, shown in hits)
 
 
 def _renamed_entry(entry: Any, secrets: _Secrets) -> Any:
     if not (isinstance(entry, dict) and entry.get("kind") == "query" and isinstance(entry.get("columns"), list)):
         return entry
-    names = [secrets.scrub(str(c)) for c in entry["columns"]]
+    # 同快照的列名一样换（_masked_view）：换了写法的号码也认
+    names = [secrets.scrub(str(c), loose=True) for c in entry["columns"]]
     return {**entry, "columns": names} if names != [str(c) for c in entry["columns"]] else entry
 
 
@@ -2924,11 +2102,15 @@ async def inquiry_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
         raise InquiryRefused(404, "无法读取这件工件，可能已被删除", code=ARTIFACT_NOT_FOUND)
     if not _query_shaped(content):
         return {"id": artifact_id, "content": content, "masked": []}
-    # 遮罩值照回答时收：引用它的那几条质询各自查到的全部快照（查询条件里写着的值，不一定在这一份的结果里），加上报告
-    # 自己的查询快照；免遮的也照回答时：提问人自己写的、报告里列出的指标和运行输入的值。SQL 里照原样留着的阈值只在
-    # 回答正文里不遮，格子照旧按值遮，这里不用。文字格里夹着的遮罩值按子串换（embedded）：回答那边渲染出来露了就整份
-    # 不交，这份快照却照样记在事件里、点得开，不换就等于在「不予展示」旁边把原值摆出来
-    own: dict[str, dict[str, Any]] = {artifact_id: content}
+    # agent 自己查询里遮掉的值事后已经不在（查询时就遮好了，快照里收不到）：回答时只靠它们才换掉的地方记在事件里
+    # （REPLAY_KEY，只记位置），先照着再换一遍。先查号码、后查备注的，备注查询时就遮好了，用不着这一步
+    edits = [e for d in referenced if isinstance(d.get(REPLAY_KEY), dict) and (e := d[REPLAY_KEY].get(artifact_id))]
+    replayed = replay_edits(content, edits) if edits else content
+    # 再照回答时的办法遮。遮罩值照回答时收：引用它的那几条质询各自查到的全部快照（查询条件里写着的值，不一定在这一份
+    # 的结果里），加上报告自己的查询快照；免遮的也照回答时：提问人自己写的、报告里列出的指标和运行输入的值。SQL 里照原样
+    # 留着的阈值只在回答正文里不遮，格子照旧按值遮，这里不用。文字格里夹着的遮罩值按子串换（embedded）：回答那边渲染
+    # 出来露了就整份不交，这份快照却照样记在事件里、点得开，不换就等于在「不予展示」旁边把原值摆出来
+    own: dict[str, dict[str, Any]] = {artifact_id: replayed}
     for data in referenced:
         for other in dict.fromkeys(str(a) for a in data.get("inquiry_artifacts") or []):
             if other not in own and _query_shaped(snapshot := _quiet_load(artifact_store.load, other)):
@@ -2937,6 +2119,9 @@ async def inquiry_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
     asked = [t for d in referenced for t in (d.get("question"), d.get("quote")) if isinstance(t, str)]
     plan = await _plan(own, others, [*asked, *values], embedded=frozenset({artifact_id}))
     shown = plan.views[artifact_id]
+    masked = list(dict.fromkeys([*plan.masked[artifact_id],
+                                 *(m for e in edits if isinstance(e, dict) for m in e.get("masked") or []
+                                   if isinstance(m, str))]))
     recorded = next((q["sql"] for d in referenced for q in d.get("queries") or []
                      if isinstance(q, dict) and q.get("artifact") == artifact_id and isinstance(q.get("sql"), str)),
                     None)
@@ -2946,22 +2131,57 @@ async def inquiry_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
     elif isinstance(shown.get("sql"), str):
         shown = {**shown, "sql": _scrub_sql(shown["sql"], plan.secrets, compared, kind)}
     if "checks" in shown:
-        shown = {**shown, "checks": _masked_checks(shown["checks"], content.get("sql"), plan.secrets, compared, kind)}
-    out: dict[str, Any] = {"id": artifact_id, "content": shown, "masked": plan.masked[artifact_id]}
+        whole, pieces = _recorded_swaps(content.get("sql"), recorded, kind) if recorded is not None else (set(), set())
+        shown = {**shown, "checks": _masked_checks(shown["checks"], content.get("sql"), plan.secrets, compared, kind,
+                                                   swapped=whole, pieces=pieces)}
+    out: dict[str, Any] = {"id": artifact_id, "content": shown, "masked": masked}
     if gone := plan.gone.get(artifact_id):
         out["mask_note"] = SOURCE_GONE.format(source="、".join(gone))
     return out
 
 
-def _masked_checks(checks: Any, sql: Any, secrets: _Secrets, compared: set[str], kind: str | None
+def _recorded_swaps(sql: Any, recorded: str, kind: str | None) -> tuple[set[str], set[str]]:
+    """回答时这条 SQL 里换掉的值：快照里原样的那条和事件里记下的那条（_scrub_sql 换过的）逐词对，原样那条里的字面量
+    到了记下的那条里整个换成了「已遮罩」的（第一项，字面量的字），或者其中一截换成了「已遮罩」的（第二项，那一截，
+    LIKE '%13900000001%' 这类）。_scrub_sql 只换字面量、名字和注释里的值，一个词换成一个词，两条分出来的词一一对得上；
+    对不上（分词出错这类）、没有记下的那条时，什么都不认。"""
+    if not isinstance(sql, str) or not sql.strip() or not recorded or sql == recorded:
+        return set(), set()
+    before, after = _sql_tokens(sql, kind), _sql_tokens(recorded, kind)
+    if before is None or after is None or len(before[0]) != len(after[0]):
+        return set(), set()
+    word = _masked_word()
+    whole: set[str] = set()
+    pieces: set[str] = set()
+    for old, kind_of, new in zip(before[0], before[1], after[0]):
+        if not _is_literal(kind_of) or old.text == new.text or word not in new.text:
+            continue
+        if new.text == word:
+            whole.add(old.text)
+            continue
+        for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old.text, new.text, autojunk=False).get_opcodes():
+            if op == "replace" and new.text[j1:j2] == word and old.text[i1:i2].strip():
+                pieces.add(old.text[i1:i2])
+    return whole, pieces
+
+
+def _masked_checks(checks: Any, sql: Any, secrets: _Secrets, compared: set[str], kind: str | None, *,
+                   swapped: set[str] | frozenset[str] = frozenset(), pieces: set[str] | frozenset[str] = frozenset()
                    ) -> list[dict[str, Any]]:
     """快照里记下的 SQL 检查结果（数据源查询工具对照数据目录查出的问题）交给质询工件的样子：字段照证据面板
     （_query_checks），给模型的那句改法不交出去——它照抄了 SQL 片段。片段（sql_excerpt）、说明（message）摘自、照引
     同一条 SQL（快照里原样的那条），照它在查询清单里的换法换掉遮罩值（_literal_swaps）：SQL 换了、片段和说明没换，
-    等于把换掉的值从旁边露出来；片段单拿出来认不出在找哪一个值，不能自己另认一遍。"""
+    等于把换掉的值从旁边露出来；片段单拿出来认不出在找哪一个值，不能自己另认一遍。
+    swapped / pieces：回答时这条 SQL 里整个换掉的字面量、换掉的一截（_recorded_swaps，照事件里记下的那条认）。回答时
+    agent 自己查询里遮掉的值还在内存里，事后取工件时已经不在了（快照查询时就遮好了，收不到值），照记下的 SQL 补上。"""
     from app.api.evidence import _query_checks
 
     whole = _literal_swaps(sql, secrets, compared, kind)
+    if swapped:
+        whole = (whole or set()) | set(swapped)
+    if pieces:
+        secrets = replace(secrets, strong=secrets.strong | set(pieces), weak=secrets.weak | set(pieces), _index=None,
+                          _compiled={})
     out: list[dict[str, Any]] = []
     for check in _query_checks({"checks": checks}):
         if isinstance(check.get("sql_excerpt"), str):
