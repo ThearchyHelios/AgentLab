@@ -247,6 +247,7 @@
           ],
           "fallback": false,
           "text_diff": [
+            "  WHERE",
             "-   orders.paid_at >= '2026-09-01'",
             "+   orders.created_at >= '2026-09-01'",
             "-   AND orders.paid_at < '2026-09-08'",
@@ -311,8 +312,10 @@
           ],
           "fallback": true,
           "text_diff": [
+            "  WHERE",
             "-   EXISTS(",
             "+   refunds.order_id IN (",
+            "      SELECT",
             "-       1",
             "+       \"orders@1\".id",
             "-     WHERE",
@@ -583,6 +586,7 @@
         ],
         "fallback": false,
         "text_diff": [
+          "  WHERE",
           "-   orders.created_at >= '2026-09-01'",
           "+   orders.paid_at >= '2026-09-01'",
           "-   AND orders.created_at < '2026-09-08'",
@@ -754,11 +758,10 @@
         ],
         "fallback": false,
         "text_diff": [
+          "- FROM orders AS orders",
+          "- LEFT JOIN refunds AS refunds ON",
           "+ FROM orders AS orders, refunds AS refunds",
           "+ WHERE",
-          "- FROM orders AS orders",
-          "- LEFT JOIN refunds AS refunds",
-          "-   ON",
           "-     orders.id = refunds.order_id",
           "+   orders.id = refunds.order_id"
         ]
@@ -771,6 +774,36 @@
         "b": {
           "write": false,
           "reason": "指标「销售额」两边差在关联，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        }
+      }
+    },
+    "join_condition": {
+      "sql": [
+        "SELECT COUNT(*) AS lines\nFROM orders o\nLEFT JOIN refunds r ON r.order_id = o.id\n  AND r.amount > 0",
+        "SELECT COUNT(*) AS lines\nFROM orders o\nLEFT JOIN refunds r ON r.order_id = o.id"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "other",
+            "text": "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文"
+          }
+        ],
+        "fallback": true,
+        "text_diff": [
+          "  LEFT JOIN refunds AS refunds ON",
+          "-     AND refunds.amount > 0"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
         }
       }
     },
@@ -789,6 +822,7 @@
         ],
         "fallback": false,
         "text_diff": [
+          "  SELECT",
           "-   COUNT(DISTINCT orders.user_id)",
           "+   COUNT(orders.user_id)"
         ]
@@ -822,6 +856,7 @@
         ],
         "fallback": true,
         "text_diff": [
+          "  WHERE",
           "-   AND orders.paid_at < '2026-09-08'",
           "+   AND orders.paid_at < '2026-09-09'"
         ]
@@ -881,6 +916,7 @@
         ],
         "fallback": false,
         "text_diff": [
+          "  WHERE",
           "-   AND orders.paid_at >= '2026-09-01'",
           "+   AND orders.created_at >= '2026-09-01'",
           "-   AND orders.paid_at < '2026-09-08'",
@@ -923,6 +959,7 @@
         ],
         "fallback": false,
         "text_diff": [
+          "  SELECT",
           "-   COUNT(DISTINCT orders.id)",
           "+   COUNT(orders.id)"
         ]
@@ -956,6 +993,7 @@
         ],
         "fallback": false,
         "text_diff": [
+          "  WHERE",
           "-   AND orders.status <> 'cancelled'"
         ]
       },

@@ -3865,6 +3865,8 @@ export const DUAL_CHECK_TEXT = {
     source: (s: string) => `数据源 ${s}`,
     inputs: '输入取值',
     textDiff: '规范化后不同的行',
+    /** 不同的行前面带着淡色的上级行（服务端 text_diff 里「  」开头的行）时，接在 textDiff 后面，也是那几行的悬停说明 */
+    textDiffContext: '淡色的行两边相同，标出所在的子句',
     textDiffNone: '这一边没有不同的行',
     rationale: '盲算的说明',
     /** 理由文档里有没有出处的数字时，理由下面那一句提醒 */

@@ -3656,7 +3656,10 @@ export interface DualCheckDiff {
   items: { aspect: string; text: string }[]
   /** 用了兜底说明（一条具体说法都没有，或者具体说法只覆盖了一部分） */
   fallback: boolean
-  /** 规范化之后两条 SQL 不同的行：「- 」开头是原流程的，「+ 」开头是盲算的 */
+  /**
+   * 规范化之后两条 SQL 不同的行：「- 」开头是原流程的，「+ 」开头是盲算的；「  」开头的是两边相同的上级行，只为标出
+   * 不同的行在哪个子句里（老工件里没有）
+   */
   text_diff: string[]
 }
 

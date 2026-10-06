@@ -12,8 +12,9 @@ check-verify 在夹具上能过，真实数据上却一处都不高亮（2026-10
 **变体。** variants 换掉「销售额」的那一对 SQL，挑的是收尾版差异说明（只说时间列、多出来的筛选、聚合与去重、关联
 四类，别的只给兜底）下各有代表性的几种：按哪一列筛时间不同（time_column，两列都声明为日期类型，预告写业务日期）、
 只有一边按时间筛、一边多出来的筛选（排除无效记录的 filter_extra 预告写有效记录条件，指标自己范围的 filter_scope 不写）、
-差两个筛选条件、关联方式、聚合只差去重（dedup，预告写去重规则）、说不清的（fallback：同一列上的时间范围不同，只给兜底，
-审批卡默认展开逐行对照）、一边解析失败。
+差两个筛选条件、关联方式、只差一个关联条件（join_condition：LEFT JOIN 的 ON 里多一个条件，只给兜底，逐行对照里那一行
+条件前面带着它所在的 JOIN）、聚合只差去重（dedup，预告写去重规则）、说不清的（fallback：同一列上的时间范围不同，只给
+兜底，审批卡默认展开逐行对照）、一边解析失败。
 
 **写目录的预告。** 服务端在摘要里另带每个指标的 catalog（采用原流程、采用盲算各会往数据目录里写什么，
 dual_check_facts.preview，约定之外另加的），审批卡照它说；老服务端没有时卡上按差异的形状有条件地说，两种说法都按
@@ -197,6 +198,7 @@ REPRESENTATIVE = {
     "filter_extra": (["filter"], {"a": "valid_filter"}),
     "dedup": (["aggregate"], {"a": "dedup"}),
     "fallback": (["other"], {}),
+    "join_condition": (["other"], {}),
 }
 
 
@@ -211,6 +213,9 @@ def test_variants_keep_their_representative_shapes():
         assert {side: said["item"] for side, said in swap["catalog"].items() if said["write"]} == writes, name
     fallback = fx["variants"]["fallback"]["diff"]
     assert fallback["fallback"] is True and fallback["text_diff"], fallback
+    # 只差一个关联条件：那一行条件前面带着它所在的 JOIN（两边相同的上级行，审批卡淡色画），检查脚本拿它看上级行怎么画
+    on = fx["variants"]["join_condition"]["diff"]["text_diff"]
+    assert [line[:2] for line in on] == ["  ", "- "] and on[0].startswith("  LEFT JOIN ") and on[0].endswith(" ON"), on
 
 
 def test_text_diff_is_not_the_raw_text():

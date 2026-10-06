@@ -149,8 +149,8 @@ WHERE / GROUP BY 里用列别名的），而且只说四类：
 
 **兜底。** 规范形式不一致、一条具体说法都没有时，给一条 aspect="other" 的「两条 SQL 的写法不同，未能归纳成具体差异，
 请对照原文」；具体说法只覆盖了一部分时追加「另有未能归纳的差异，请对照原文」；fallback 为真。text_diff 给出规范化后
-不同的行（difflib 比两边 sqlglot pretty 的输出，WHERE、ON、HAVING 的合取式每个条件一行，最多 40 行，见 _text_diff）；
-有一边没有规范形式（保真守卫拦下的）时给原文的逐行对照。
+不同的行（difflib 比两边 sqlglot pretty 的输出，WHERE、ON、HAVING 的合取式每个条件一行，不同的行前面带上标出所在子句的
+上级行，最多 40 行，见 _text_diff）；有一边没有规范形式（保真守卫拦下的）时给原文的逐行对照。
 
 仍做不到的（只给兜底说明，或者认不出等价）：
 - 认不出的等价改写：要靠约束才成立的（主键不为空时的 COUNT(主键) 和 COUNT(*)、按主键关联又没用到的 LEFT JOIN、带
@@ -5924,7 +5924,8 @@ class SqlDiff:
     items：具体差异，等价时为空；不等价时一定不为空——归纳不出具体差异时是一条 aspect="other" 的兜底说明。
     fallback：用了兜底说明（一条具体说法都没有，或者具体说法只覆盖了一部分）。
     text_diff：规范化之后两条 SQL 不同的行（difflib 比两边 sqlglot pretty 的输出，WHERE、ON、HAVING 的合取式每个条件
-    一行，「- 」开头是 A 的、「+ 」开头是 B 的，最多 40 行，见 _text_diff），给界面高亮；等价时为空。"""
+    一行，「- 」开头是 A 的、「+ 」开头是 B 的；不同的行前面带上它的各级上级行，「  」开头、两边相同，只为标出不同的行
+    在哪个子句里；最多 40 行，见 _text_diff），给界面高亮；等价时为空。"""
 
     equivalent: bool
     items: list[FacetDiff] = field(default_factory=list)
@@ -7770,31 +7771,80 @@ def _text_diff(a: _Form | None, b: _Form | None, read: str | None) -> tuple[str,
     两边按同一套排版写（_diff_lines）：WHERE、ON、HAVING 的合取式每个条件一行。sqlglot 的 pretty 按宽度决定换不换行，
     两个条件放得下就排在一行、三个就拆开，同一个条件在两边落在不同的行上，就被当成「不同的行」（2026-10 验收：两边完全
     相同的日期区间被标成了差异，审核人会以为统计期也不一样）。比的时候不看条件前面的 AND：一边多出来的条件排在最前面
-    时，另一边同一个条件只差在前面有没有 AND。列出来的仍是各自原样的行。只动排版，判不判等价、差异说明都不看这里。"""
+    时，另一边同一个条件只差在前面有没有 AND。列出来的仍是各自原样的行。只动排版，判不判等价、差异说明都不看这里。
+
+    不同的行前面带上它的各级上级行（_ancestors：排在前面、缩进比它浅的最近一行，一层层数到顶格），两边相同的那几行以
+    「  」开头列出，只为标出不同的行在哪个子句里——哪个 WHERE、哪个 JOIN 的 ON、哪层子查询。只列不同的行时，只差一个
+    关联条件的那一边只剩一行「AND 条件」，看不出是哪个 JOIN 的关联条件、还是筛选条件（2026-10 复核）。上级行在两边只差
+    前面有没有 AND 时，列不带 AND 的写法（两边共同的部分）。上级行本身不同的，照样是「- 」「+ 」行。"""
     import difflib
 
     if a is None or b is None:
         return ()
     la, lb = _diff_lines(a, read), _diff_lines(b, read)
-    out: list[str] = []
+    ka, kb = [_LEADING_AND.sub(r"\1", x) for x in la], [_LEADING_AND.sub(r"\1", x) for x in lb]
+    # (标记, A 的行号, B 的行号)：ndiff 按顺序走完两边，「  」两边各进一行，「- 」「+ 」各进自己那边一行，「? 」是行内
+    # 提示、不占行
+    rows: list[tuple[str, int, int]] = []
     i = j = 0
-    # ndiff 按顺序走完两边：「  」两边各进一行，「- 」「+ 」各进自己那边一行，「? 」是行内提示、不占行
-    for line in difflib.ndiff([_LEADING_AND.sub(r"\1", x) for x in la], [_LEADING_AND.sub(r"\1", x) for x in lb]):
+    for line in difflib.ndiff(ka, kb):
         tag = line[:2]
         if tag == "  ":
+            rows.append((tag, i, j))
             i, j = i + 1, j + 1
         elif tag == "- ":
-            out.append(f"- {la[i]}")
+            rows.append((tag, i, -1))
             i += 1
         elif tag == "+ ":
-            out.append(f"+ {lb[j]}")
+            rows.append((tag, -1, j))
             j += 1
-    return tuple(out[:_MAX_DIFF_LINES])
+    need_a = _ancestors(la, [i for tag, i, _ in rows if tag == "- "])
+    need_b = _ancestors(lb, [j for tag, _, j in rows if tag == "+ "])
+    out: list[str] = []
+    for tag, i, j in rows:
+        if tag == "- ":
+            out.append(f"- {la[i]}")
+        elif tag == "+ ":
+            out.append(f"+ {lb[j]}")
+        elif i in need_a or j in need_b:
+            out.append(f"  {la[i] if la[i] == lb[j] else ka[i]}")
+    out = out[:_MAX_DIFF_LINES]
+    # 截到 40 行时末尾剩下的上级行后面已经没有不同的行，不留：上级行只跟着不同的行出现
+    while out and out[-1].startswith("  "):
+        out.pop()
+    return tuple(out)
+
+
+def _ancestors(lines: list[str], changed: list[int]) -> set[int]:
+    """changed 这些行的各级上级行的行号：排在前面、缩进比它浅的最近一行是它的上级，一层层往上数到顶格。sqlglot 的
+    pretty 里子句的内容缩在子句名下面（WHERE 下的条件、JOIN … ON 下的关联条件、EXISTS( 下的子查询），所以数出来的就是
+    它所在的各层子句。空白行不当上级。"""
+    def depth(line: str) -> int:
+        return len(line) - len(line.lstrip(" "))
+
+    parent = [-1] * len(lines)
+    # 往上数时还可能当上级的行：从上往下缩进一行比一行深，比当前行深或一样深的都不是它的上级
+    stack: list[int] = []
+    for n, line in enumerate(lines):
+        if not line.strip():
+            continue
+        while stack and depth(lines[stack[-1]]) >= depth(line):
+            stack.pop()
+        parent[n] = stack[-1] if stack else -1
+        stack.append(n)
+    out: set[int] = set()
+    for n in changed:
+        k = parent[n]
+        # 已经在里面的，它往上的各级也已经在里面了
+        while k >= 0 and k not in out:
+            out.add(k)
+            k = parent[k]
+    return out
 
 
 def _diff_lines(form: _Form, read: str | None) -> list[str]:
-    """逐行对照用的写法：sqlglot pretty，WHERE、HAVING、ON 的合取式每个条件一行（见 _line_generator）。生成不了就退回
-    普通的 pretty，再不行用规范形式的原文。"""
+    """逐行对照用的写法：sqlglot pretty，WHERE、HAVING、ON 的合取式每个条件一行，ON 挂在 JOIN 那一行的末尾（见
+    _line_generator）。生成不了就退回普通的 pretty，再不行用规范形式的原文。"""
     try:
         text = _line_generator(read).generate(form.tree)
     except Exception:  # noqa: BLE001 - 只是给人看的排版，出错不能连累差异说明
@@ -7818,13 +7868,15 @@ def _condition_root(node: Any) -> str | None:
 
 
 def _line_generator(read: str | None) -> Any:
-    """这种方言的 sqlglot 生成器（pretty、不带注释），只改一处：WHERE、HAVING、ON 的整个条件按 AND 拆开，每个条件一行，
-    第二个起前面写 AND（各层子查询里的也一样）。别的照 sqlglot 原样：条件本身太长时照样折行，两边同一个条件折得一样。
+    """这种方言的 sqlglot 生成器（pretty、不带注释），只改条件的排法：WHERE、HAVING、ON 的整个条件按 AND 拆开，每个条件
+    一行，第二个起前面写 AND（各层子查询里的也一样），ON 挂在 JOIN 那一行的末尾。别的照 sqlglot 原样：条件本身太长时
+    照样折行，两边同一个条件折得一样。
 
     - 条件本身是 OR（XOR）连起来的一律加括号：和别的条件并列时本来就要加，单独一个时不加的话，同一个条件两边写法不同。
       条件外面多余的括号、AND 套 AND 的括号去掉（_conjuncts），不改意思。
-    - ON 照 WHERE 的样子单独一行、条件缩进在下面：写在 ON 后面的话，第一个条件和后面的差在「ON」「AND」上，换个先后
-      就对不上；缩进比 WHERE 的条件深一级，ON 里和 WHERE 里的同一个条件不会被当成同一行。
+    - ON 挂在 JOIN 那一行的末尾（表名、子查询的右括号后面），条件各占一行缩在下面：写在 ON 后面的话，第一个条件和后面
+      的差在「ON」「AND」上，换个先后就对不上；缩进比 WHERE 的条件深一级，ON 里和 WHERE 里的同一个条件不会被当成同一
+      行。ON 不单独占一行：那样两边 JOIN 的表不同时，两边都有的「ON」被当成相同的行，条件前面就没了 ON（2026-10 复核）。
     """
     from sqlglot import exp
     from sqlglot.dialects.dialect import Dialect
@@ -7841,8 +7893,15 @@ def _line_generator(read: str | None) -> Any:
                     return super().sql(expression, key, comment)
                 lines = [self._one_condition(c) for c in conds]
                 text = "\n".join([lines[0], *(f"AND {line}" for line in lines[1:])])
-                # ON：join_sql 拼成「ON <条件>」并给条件的各行加一级缩进，开头换行就是 ON 单独一行、条件在下面
+                # ON：join_sql 拼成「ON <条件>」并给条件的各行加一级缩进，开头换行就是条件都在 ON 下面；单独一行的 ON
+                # 再由下面的 join_sql 挂到上一行末尾
                 return "\n" + self.indent(text) if root == "on" else text
+
+            def join_sql(self, expression: Any) -> str:
+                # sqlglot 拼出来是换行、缩进一级、「ON 」再换行（ON 单独一行，条件在下面）：把这个 ON 接到上一行（表名、
+                # 子查询的右括号）末尾。只认这一层的：子查询里、条件里套着的 JOIN 都缩得更深，对不上
+                pad = " " * self.pad
+                return super().join_sql(expression).replace(f"\n{pad}ON \n", " ON\n", 1)
 
             def _one_condition(self, node: Any) -> str:
                 # 只有一个条件时它就是整个条件，再走 self.sql 又会被认成整个条件、绕不出来：这一层直接用 sqlglot 原来的

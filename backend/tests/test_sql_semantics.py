@@ -340,7 +340,9 @@ def check_shape(diff: SqlDiff) -> None:
         assert diff.items == [] and not diff.fallback and diff.text_diff == ()
         return
     assert diff.items and diff.text_diff and len(diff.text_diff) <= 40
-    assert all(line[:2] in ("- ", "+ ") for line in diff.text_diff)
+    # 「- 」是 A 的行、「+ 」是 B 的行；「  」开头的是两边相同、标出不同的行在哪个子句里的上级行，只跟着不同的行出现
+    assert all(line[:2] in ("- ", "+ ", "  ") for line in diff.text_diff)
+    assert diff.text_diff[-1][:2] in ("- ", "+ ")
     if diff.fallback:
         assert diff.items[-1].aspect == "other" and diff.items[-1].text in (FALLBACK, FALLBACK_REST)
     else:
