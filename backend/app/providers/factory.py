@@ -34,7 +34,7 @@ class ModelSpec(BaseModel):
 class ProviderNotConfigured(RuntimeError):
     """模型接入没配好。reason 说缺了什么，hint 说去哪里补；str(e) 是两句连起来的整句，
     运行失败原因直接用它。设置页的测试弹窗本来就在接入的编辑框里，只取 reason、另给自己的 hint。
-    code 给调用方按类别分支：disabled / no_model / missing_key / missing_base_url。"""
+    code 给调用方按类别分支：missing（点名的接入不存在）/ disabled / no_model / missing_key / missing_base_url。"""
 
     def __init__(self, reason: str, hint: str = "", code: str = "") -> None:
         super().__init__(f"{reason}。{hint}" if hint else reason)
@@ -48,6 +48,22 @@ async def list_providers(session: AsyncSession) -> list[Provider]:
     return list(rows.scalars())
 
 
+def named_provider(providers: list[Provider], ref: str) -> Provider:
+    """按名称或 id 找显式点名的接入（providers 是 list_providers 的结果）。找不到、找到的已停用都抛
+    ProviderNotConfigured：点名了就只用它，不换别家。运行时取模型、设置和画布校验都按这一处认，说法一致。
+    名称两边的空白不算。"""
+    key = ref.strip()
+    found = next((p for p in providers if key in (p.id, p.name)), None) \
+        or next((p for p in providers if (p.name or "").strip() == key), None)
+    if found is None:
+        raise ProviderNotConfigured(f"模型接入「{key}」不存在",
+                                    "请在「设置 → 模型接入」中核对名称，或换一个接入", code="missing")
+    if not found.enabled:
+        raise ProviderNotConfigured(f"模型接入「{found.name}」已停用",
+                                    "请在「设置 → 模型接入」中启用它，或换一个接入", code="disabled")
+    return found
+
+
 async def resolve_provider(
     session: AsyncSession, ref: str | None, model: str | None = None
 ) -> Provider | None:
@@ -56,15 +72,18 @@ async def resolve_provider(
     顺序很关键：显式指定的 ref 最优先；其次按模型名反查 —— 节点上通常只选了
     模型（比如 mock-fast），没选 provider，这时必须找到真正提供该模型的那一个，
     否则会拿着 A 家的模型名去调 B 家的接口。最后才回退到默认 provider。
+
+    显式给了 ref 却不存在或已停用，抛 ProviderNotConfigured（named_provider）。以前不存在时返回 None，
+    get_chat_model 把它当成「一个接入都没配」，悄悄换成演示模型：名字写错一个字、接入改了名或删了，
+    报告就由演示模型写成假文本，核查也由它来「核」，运行照样成功。停用的照常返回、照常调用，
+    又和下面「按模型名找到的接入已停用就报错」对不上。
+    返回 None 只剩一种情况：没给 ref（只有空白的也算没给），而一个启用的接入都没有。
     """
     providers = await list_providers(session)
     enabled = [p for p in providers if p.enabled]
 
-    if ref:
-        for p in providers:
-            if p.name == ref or p.id == ref:
-                return p
-        return None
+    if ref and ref.strip():
+        return named_provider(providers, ref)
 
     if model:
         for p in enabled:
@@ -362,8 +381,11 @@ def bind_tools_safely(model: BaseChatModel, tools: list[Any], *, parallel: bool)
 
 
 async def get_chat_model(session: AsyncSession, spec: ModelSpec) -> tuple[BaseChatModel, str]:
-    """返回 (模型, 实际使用的模型 id)。找不到任何 provider 时回退到 mock，
-    保证一张图在没配 key 的机器上也能跑完。"""
+    """返回 (模型, 实际使用的模型 id)。
+
+    只有没点名接入、而一个启用的接入都没有时才回退到演示模型，保证一张图在没配 key 的机器上也能执行完。
+    点名的接入不存在或已停用、按模型名找到的接入已停用、接入缺 key 这些都抛 ProviderNotConfigured，
+    由调用方照实报给人（节点失败、核查记缺口……），不换成演示模型。"""
     provider = await resolve_provider(session, spec.provider, spec.model)
     if provider is None:
         return MockChatModel(model_name="mock-fast"), "mock-fast"
