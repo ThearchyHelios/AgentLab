@@ -1,9 +1,10 @@
 """定时任务通知（app/scheduler/webhook.py）的两条规则：
 
 - 失败通知的「处理」行不许诺能继续运行：服务重启时还在排队、从没开始执行的运行（被改成失败、没有开始时间）没有
-  断点，「修正后可继续运行」是错的。按有没有开始执行分开写——没开始的另写一行原因（没有可继续的进度），处理一律是
-  中性的「请在运行记录中查看原因」；任务还在排期上时补一句「下一次触发会照常发起」：失败的运行不挡之后的触发，
-  和挂起的那种（之后的触发都会跳过）说清区别
+  断点，「修正后可继续运行」是错的。按有没有开始执行分开写——没开始的另写一行原因（没有可继续的进度），处理行不再
+  让人去「查看原因」（原因刚写过），任务还在排期上时只写「下一次触发会照常发起」，不在排期上时写怎么重新发起；开始
+  执行过的写「请在 AgentLab 的「记录」中查看失败原因」（和挂起那句一样指到导航里的「记录」），任务还在排期上时补
+  「下一次触发会照常发起」：失败的运行不挡之后的触发，和挂起的那种（之后的触发都会跳过）说清区别
 - 扫描窗口（SCAN_DAYS）之外的触发：停在审批、有待审批的运行不受窗口限制——创建 30 天以后才停到审批上的照样推送
   「等待审批」；运行记录在窗口内有变化的（等了一个多月的审批批完、跑完）照样推送结束。早就结束、记录多日没有变化
   的旧触发仍不扫
@@ -27,6 +28,8 @@ from app.scheduler import webhook
 UTC = timezone.utc
 GENERIC = "https://hooks.example.com/agentlab/inbox-3e9d"
 NOT_STARTED = "运行在开始执行前就已中止（通常是服务重启时仍在排队），没有可继续的进度"
+LOOK = "请在 AgentLab 的「记录」中查看失败原因"
+RERUN = "如需重新发起，请在 AgentLab 的「定时任务」中点击「立即运行」"
 
 
 class Recorder:
@@ -106,12 +109,15 @@ async def notified(fire_id: str) -> str | None:
 
 
 def test_a_run_that_never_started_is_not_promised_a_continue():
-    """服务重启时还在排队的运行没有断点：不写「修正后可继续运行」，另写一行原因说没有可继续的进度"""
+    """服务重启时还在排队的运行没有断点：不写「修正后可继续运行」，另写一行原因说没有可继续的进度。处理行不再让人
+    去「查看原因」（原因刚写过）：还在排期上的只说下一次照常，不在排期上的说怎么重新发起"""
     _, lines, _ = webhook.message(notice(started_at=None, next_fire=True))
     shown = dict(lines)
     assert shown["原因"] == NOT_STARTED
-    assert shown["处理"] == "请在 AgentLab 的运行记录中查看原因；下一次触发会照常发起"
-    assert not any("继续运行" in value for _, value in lines), lines
+    assert shown["处理"] == "下一次触发会照常发起"
+    assert not any("继续运行" in value or "查看" in value for _, value in lines), lines
+    _, lines, _ = webhook.message(notice(started_at=None, next_fire=False))
+    assert dict(lines)["处理"] == RERUN
 
 
 def test_a_failed_run_gets_a_neutral_action_without_promising_a_continue():
@@ -120,14 +126,14 @@ def test_a_failed_run_gets_a_neutral_action_without_promising_a_continue():
     _, lines, _ = webhook.message(notice(error_node="汇总库存", next_fire=True))
     shown = dict(lines)
     assert shown["失败节点"] == "「汇总库存」" and "原因" not in shown
-    assert shown["处理"] == "请在 AgentLab 的运行记录中查看原因；下一次触发会照常发起"
+    assert shown["处理"] == f"{LOOK}；下一次触发会照常发起"
     assert "修正后可继续运行" not in webhook._text(notice(error_node="汇总库存"))
 
 
 def test_next_fire_is_only_promised_while_the_schedule_is_on():
     """任务已暂停（或往后不再触发）时不说「下一次触发会照常发起」"""
     _, lines, _ = webhook.message(notice(next_fire=False))
-    assert dict(lines)["处理"] == "请在 AgentLab 的运行记录中查看原因"
+    assert dict(lines)["处理"] == LOOK
 
 
 async def test_restart_failure_notice_end_to_end(recorder):
@@ -140,12 +146,12 @@ async def test_restart_failure_notice_end_to_end(recorder):
     by_fire = {b["fire_id"]: b for b in recorder.bodies()}
     on, off = by_fire[on_fire], by_fire[off_fire]
     assert (on["event"], on["status"], on["reason"]) == ("failed", "failed", NOT_STARTED)
-    assert "处理：请在 AgentLab 的运行记录中查看原因；下一次触发会照常发起" in on["text"]
-    assert "处理：请在 AgentLab 的运行记录中查看原因\n" in off["text"] + "\n" and "照常发起" not in off["text"]
+    assert "处理：下一次触发会照常发起" in on["text"]
+    assert f"处理：{RERUN}" in off["text"] and "照常发起" not in off["text"]
     for body in (on, off):
         assert "继续运行" not in body["text"], body["text"]
         # 运行记录上的原始报错不进通知
-        assert "请重新发起运行" not in body["text"]
+        assert "没有可恢复的进度" not in body["text"]
 
 
 # --------------------------------------------------------------------------

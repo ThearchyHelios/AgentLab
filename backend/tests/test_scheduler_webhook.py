@@ -179,7 +179,7 @@ def test_failed_run_text_points_to_the_node_without_repeating_itself():
     shown = dict(lines)
     assert title.endswith("运行失败") and shown["状态"] == "失败"
     # 处理只说去哪里看，不许诺能继续运行（没有断点的运行续不了，见 test_scheduler_notice_rules.py）
-    assert shown["失败节点"] == "「查询门店销售」" and shown["处理"] == "请在 AgentLab 的运行记录中查看原因"
+    assert shown["失败节点"] == "「查询门店销售」" and shown["处理"] == "请在 AgentLab 的「记录」中查看失败原因"
     # 不再写「原因：运行失败，详情请查看运行记录」这种同义反复
     assert "原因" not in shown
 

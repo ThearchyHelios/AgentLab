@@ -9,8 +9,8 @@ Webhook 地址本身就是凭证（企业微信的 key、钉钉的 access_token 
 一个过滤器把推送期间的那几行换成主机名。
 
 通知里只有任务名、状态、出具档位、缺口条数、运行链接、封存哈希（界面上叫清单哈希）前 12 位和起止时间，失败时
-另写失败节点的名字和去哪里查看（不许诺能继续运行）；运行结束后和同一任务上一次的对比（auto_compare）只写各类
-指标的个数和对比页链接。不放报告里的具体数字，也不放失败时的原始报错——报错里可能带着查询到的数据，Webhook
+另写失败节点的名字和下一步（不许诺能继续运行）；运行成功结束后和同一任务上一次成功的运行的对比（auto_compare）只写
+各类指标的个数和对比页链接。不放报告里的具体数字，也不放失败时的原始报错——报错里可能带着查询到的数据，Webhook
 推去的群不一定有权看。
 
 三个平台出错时都回 HTTP 200、错误码放在响应体里，所以送没送达要看响应体：按地址的主机认平台，不看选的格式——
@@ -67,14 +67,17 @@ _STATUS_LABEL = {"succeeded": "已完成", "failed": "失败", "cancelled": "已
 #: 挂起的运行要人去处理：不处理，这个任务之后的触发都按「上一次还没结束」跳过
 SUSPENDED_REASON = "运行停在断点上、没有待审批，通常是服务重启所致"
 SUSPENDED_ACTION = "请在 AgentLab 的「记录」中继续运行或放弃这次运行；它结束之前，这个定时任务之后的触发都会跳过"
-#: 失败的运行怎么处理：不许诺「修正后可继续运行」。没开始执行的没有断点；开始执行过的也可能没有（执行第一个节点前就
-#: 失败）或已不兼容（系统升级），能不能继续以记录页的提示为准
-FAILED_ACTION = "请在 AgentLab 的运行记录中查看原因"
+#: 失败的运行怎么处理：不许诺「修正后可继续运行」。开始执行过的也可能没有断点（执行第一个节点前就失败）或已不兼容
+#: （系统升级），能不能继续以记录页的提示为准。「记录」是导航里那一页的名字，和挂起那句一致
+FAILED_ACTION = "请在 AgentLab 的「记录」中查看失败原因"
 #: 从没开始执行就失败的（服务重启时还在排队，被改成失败、没有开始时间）：没有可继续的进度。不照抄运行记录上的报错——
 #: 通知一律不放原始报错，这一句是按「没有开始时间」认出来的，自己写
 NOT_STARTED_REASON = "运行在开始执行前就已中止（通常是服务重启时仍在排队），没有可继续的进度"
 #: 失败的运行不挡之后的触发（挂起的才挡）：任务还在排期上时补这一句，免得人以为这个定时任务就此停了
 NEXT_AS_USUAL = "下一次触发会照常发起"
+#: 从没开始执行、任务又不在排期上（停用了）：原因刚写过，记录页上也没有更多可看的，下一步是重新发起。「立即运行」
+#: 是定时任务页上那个按钮的名字，停用的任务也能点
+RERUN_ACTION = "如需重新发起，请在 AgentLab 的「定时任务」中点击「立即运行」"
 
 
 # --------------------------------------------------------------------------
@@ -228,7 +231,8 @@ class Notice:
 
     suspended：运行停在断点上、没有待审批（通常是服务重启挂起的），按 failed 事件推。error_node：失败节点的名字。
     next_fire：任务启用着、往后还会触发（失败通知据此补「下一次触发会照常发起」）。
-    compare：和同一定时任务上一次的对比摘要 {base_run_id, summary}（只有个数），compare_url：对比页的链接。
+    compare：和同一定时任务上一次成功的运行的对比摘要（auto_compare.compare_fire 的返回：基准是哪一次、只有个数的
+    summary、基准是不是紧挨着的上一次、基准开始的时间），compare_url：对比页的链接。
     fmt、signed 只给测试消息用：说明里只说这条消息证明得了的事。"""
 
     event: str
@@ -293,7 +297,7 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
         lines.append(("出具档位", f"{ISSUANCE_LABEL.get(notice.tier, notice.tier)}{gaps}"))
     if notice.compare:
         # 只给各类指标的个数：具体的数在对比页上，跟着运行的权限走，不随消息推进群里
-        lines.append(("与上一次相比", auto_compare.summary_text(notice.compare.get("summary") or {})))
+        lines.append((_compare_head(notice), auto_compare.summary_text(notice.compare.get("summary") or {})))
     if notice.pending_approvals:
         lines.append(("待审批", f"{notice.pending_approvals} 项，请到 AgentLab 处理；运行结束之前，"
                                 "这个定时任务之后的触发都会跳过"))
@@ -302,12 +306,14 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
     elif notice.suspended:
         lines += [("原因", SUSPENDED_REASON), ("处理", SUSPENDED_ACTION)]
     elif notice.status == "failed":
-        # 不写原始报错（可能带着查询到的数据），写失败节点的名字和去哪里处理
+        # 不写原始报错（可能带着查询到的数据），写失败节点的名字和下一步
         if notice.error_node:
             lines.append(("失败节点", f"「{notice.error_node}」"))
         if notice.never_started:
-            lines.append(("原因", NOT_STARTED_REASON))
-        lines.append(("处理", f"{FAILED_ACTION}；{NEXT_AS_USUAL}" if notice.next_fire else FAILED_ACTION))
+            # 原因刚写过，也没有断点可续：不再让人去查看原因，说下一次照常，不在排期上的说怎么重新发起
+            lines += [("原因", NOT_STARTED_REASON), ("处理", NEXT_AS_USUAL if notice.next_fire else RERUN_ACTION)]
+        else:
+            lines.append(("处理", f"{FAILED_ACTION}；{NEXT_AS_USUAL}" if notice.next_fire else FAILED_ACTION))
     if notice.fire_at is not None:
         when = f"{_local(notice.fire_at, notice.timezone, seconds=False)}（{notice.timezone}）"
         # 立即运行不写「计划触发」：群里的人会以为报告按时出了
@@ -327,6 +333,27 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
         # 和界面上的短编号一样写（#前 6 位）；完整 id 在运行链接里
         lines.append(("运行", f"#{notice.run_id[:6]}"))
     return title, lines, notice.run_url
+
+
+def _compare_head(notice: Notice) -> str:
+    """对比那一行的项名。基准是紧挨着的上一次时写「与上一次相比」；不是（上一次失败了、取消了）时写明比的是哪一次：
+    短编号（同界面，#前 6 位）和开始的日期（按定时任务的时区）。"""
+    compare = notice.compare or {}
+    if compare.get("previous", True):
+        return "与上一次相比"
+    when = _date_of(compare.get("base_started_at"), notice.timezone)
+    return f"与上一次成功的运行（#{str(compare.get('base_run_id') or '')[:6]}{f'，{when}' if when else ''}）相比"
+
+
+def _date_of(text: Any, tz: str) -> str | None:
+    """ISO 时间（对比结果里运行的开始时间）按定时任务的时区写成日期，读不出来的返回 None。"""
+    try:
+        moment = datetime.fromisoformat(str(text))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (_local(moment, tz, seconds=False) or "")[:10] or None
 
 
 def _status_label(notice: Notice) -> str:
@@ -406,9 +433,10 @@ def _generic(notice: Notice, now: datetime) -> dict[str, Any]:
                    else f"{SUSPENDED_REASON}。{SUSPENDED_ACTION}" if notice.suspended
                    else NOT_STARTED_REASON if notice.never_started else None),
         "error_node": notice.error_node,
-        # 对比只给基准是哪一次、各类指标的个数和对比页链接
+        # 对比只给基准是哪一次（是不是紧挨着的上一次）、各类指标的个数和对比页链接
         "compare": ({"base_run_id": notice.compare.get("base_run_id"),
-                     "summary": dict(notice.compare.get("summary") or {}), "url": notice.compare_url}
+                     "summary": dict(notice.compare.get("summary") or {}),
+                     "previous": notice.compare.get("previous", True) is not False, "url": notice.compare_url}
                     if notice.compare else None),
         "sent_at": _iso(now),
     }
@@ -592,12 +620,16 @@ class _Job:
 
 @dataclass
 class _Due:
-    """认领到的一次状态变化接下来要做的事：运行进入终态时和上一次比一次（compare_run），订阅了这个事件时推一条
-    （job）。两样都在锁外做：对比要读快照、重算，推送要等接收端，都不能挡着发起。"""
+    """挑出来的一次状态变化接下来要做的事：运行成功结束时和上一次成功的运行比一次（compare_run），按条件 UPDATE
+    认领（把 notified_status 从 old 改成 state），认领到了、订阅了这个事件时推一条（job）。都在锁外做：对比要读快照、
+    重算，推送要等接收端，都不能挡着发起。pushed：认领到了、发出了推送（含失败的）。"""
 
     fire_id: str
+    old: str | None
+    state: str
     compare_run: str | None
     job: _Job | None
+    pushed: bool = False
 
 
 async def notify_due(now: datetime | None = None) -> int:
@@ -607,8 +639,11 @@ async def notify_due(now: datetime | None = None) -> int:
     推一次。没订阅这个事件、任务没配 Webhook 的也记下已处理——之后再配上 Webhook，不会把旧的补推一遍。
     停在断点上的运行每一拍都要重新看（见 _state_of）：它的已处理状态带着第几段执行，和运行状态本身对不上。
 
-    运行进入终态的那一次，推送之前先和同一定时任务的上一次比一次（auto_compare），结束、失败的通知带上计数摘要和
-    对比页链接。没配 Webhook 的也比：触发历史里要用。比不了、出错不影响推送。
+    运行成功结束、封存完的那一次，认领之前先和同一定时任务上一次成功的运行比一次（auto_compare），结束的通知带上计数
+    摘要和对比页链接。没配 Webhook 的也比：触发历史里要用。对比在锁外、认领之前做，最多等 auto_compare.WAIT_S 秒，
+    过了就不带对比推送：一次慢的对比最多让这一拍晚这么久，不会把之后所有的通知一直压着，也不拖着发起用的锁。比到一半
+    扫描被取消（停机只等通知扫描一个宽限），这次触发还没认领，下次照常比、照常推——以前先认领、后比，取消之后这条
+    通知再也不会推。比不了、出错不影响推送。
     """
     now = now or utcnow()
     dues: list[_Due] = []
@@ -617,7 +652,9 @@ async def notify_due(now: datetime | None = None) -> int:
     # 扫描窗口按触发记录的创建时间算，两种例外：运行记录窗口内有过变化（运行状态一变 updated_at 就跟着变），以及
     # 停在审批上、有待审批的——以前只看触发记录，创建 30 天以后才停到审批上的运行收不到「等待审批」
     waiting = select(Approval.id).where(Approval.run_id == Run.id, Approval.status == "pending").exists()
-    # 和发起共用一把锁：发起时先记一条「未能发起」再发起运行、成功了才改成 started，扫描不能撞在这中间
+    # 和发起共用一把锁：发起时先记一条「未能发起」再发起运行、成功了才改成 started，扫描不能撞在这中间。锁里只挑出
+    # 状态有变化的、拼好要推的消息；认领在锁外按条件 UPDATE 做，挑出来的是锁里看到的状态，和别的扫描撞上也只有一个
+    # 认领得到
     async with service.launch_lock():
         async with SessionLocal() as session:
             rows = (await session.execute(
@@ -636,39 +673,52 @@ async def notify_due(now: datetime | None = None) -> int:
 
                 base_url = (await notify_settings(session))["public_base_url"]
             for fire, run in rows:
-                state, event, pending = await _state_of(session, fire, run, now)
-                if state is None or state == fire.notified_status \
-                        or not await _mark(fire.id, fire.notified_status, state):
+                seen = await _state_of(session, fire, run, now)
+                if seen.state is None or seen.state == fire.notified_status:
                     continue
-                compare_run = run.id if run is not None and run.status in auto_compare.TERMINAL else None
                 schedule = await session.get(Schedule, fire.schedule_id)
                 url = decrypt(schedule.webhook_url) if schedule and schedule.webhook_url else None
                 job = None
-                if event and url and schedule.webhook_format in FORMATS and event in (schedule.webhook_events or []):
-                    notice = await _notice(session, schedule, fire, run, event, base_url, pending)
+                if seen.event and url and schedule.webhook_format in FORMATS \
+                        and seen.event in (schedule.webhook_events or []):
+                    notice = await _notice(session, schedule, fire, run, seen, base_url)
                     job = _Job(schedule.webhook_format, url, decrypt(schedule.webhook_secret), notice)
-                if compare_run or job:
-                    dues.append(_Due(fire.id, compare_run, job))
+                # 只比成功结束、封存完的（见 auto_compare）：失败、取消的指标不全，等不来新封存的比了也是旧的
+                compare_run = run.id if run is not None and run.status == "succeeded" and seen.sealed else None
+                dues.append(_Due(fire.id, fire.notified_status, seen.state, compare_run, job))
     if dues:
         await asyncio.gather(*(_follow_up(due, base_url) for due in dues))
-    return sum(1 for due in dues if due.job is not None)
+    return sum(1 for due in dues if due.pushed)
 
 
 async def _follow_up(due: _Due, base_url: str | None) -> None:
-    """先比（需要的话），再推：对比摘要要写进这条通知。对比自己兜住了异常，出什么事都不挡推送。"""
-    if due.compare_run:
-        brief = await auto_compare.compare_fire(due.fire_id, due.compare_run)
-        if brief is not None and due.job is not None:
-            due.job.notice.compare = brief
-            if base_url:
-                due.job.notice.compare_url = auto_compare.page_url(base_url, due.compare_run, brief["base_run_id"])
-    if due.job is not None:
-        await _deliver(due.job)
+    """先比（需要的话），再认领，认领到了再推：对比摘要要写进这条通知；认领放在对比之后，比到一半被取消时这次触发
+    还没认领。对比自己兜住了超时和异常，出什么事都不挡推送。"""
+    brief = await auto_compare.compare_fire(due.fire_id, due.compare_run) if due.compare_run else None
+    if not await _mark(due.fire_id, due.old, due.state) or due.job is None:
+        return
+    if brief is not None:
+        due.job.notice.compare = brief
+        if base_url:
+            due.job.notice.compare_url = auto_compare.page_url(base_url, due.compare_run, brief["base_run_id"])
+    due.pushed = True
+    await _deliver(due.job)
 
 
-async def _state_of(session: Any, fire: ScheduleFire, run: Run | None,
-                    now: datetime) -> tuple[str | None, str | None, int]:
-    """(要记下的已处理状态, 要推送的事件, 待审批数)。还不能下结论（没封存、审批刚批完还没接着执行）时状态为 None。
+@dataclass
+class _Seen:
+    """_state_of 的结论。state：要记下的已处理状态，还不能下结论时为 None；event：要推送的事件；pending：待审批数；
+    sealed：终态的运行封存完了（封存盖住了这一次的结束事件，见 auto_compare.sealed_now），只有这时才比、通知里才写
+    清单哈希。"""
+
+    state: str | None
+    event: str | None = None
+    pending: int = 0
+    sealed: bool = False
+
+
+async def _state_of(session: Any, fire: ScheduleFire, run: Run | None, now: datetime) -> _Seen:
+    """这次触发现在该记成什么状态、推什么。还不能下结论（没封存、审批刚批完还没接着执行）时状态为 None。
 
     停在断点上（interrupted）的分两种，各推一次：
     - 有待审批：停在审批，推 awaiting_approval。批完接着执行、又停在下一个审批点时要再推，所以已处理状态里带着这是
@@ -678,18 +728,21 @@ async def _state_of(session: Any, fire: ScheduleFire, run: Run | None,
     审批批完到运行改回 running 之间，审批是 answered、还没有 resolved：那不是挂起，等下一拍。
     """
     if fire.status == "failed_to_start":
-        return "failed_to_start", "failed", 0
+        return _Seen("failed_to_start", "failed")
     if run is None:
-        return None, None, 0
+        return _Seen(None)
     if run.status in ("succeeded", "failed", "cancelled"):
-        # runner 先写终态和结束时间、再封存，两步之间被这一拍撞上就等。没有结束时间的（服务重启时还在排队、被改成
-        # failed 的）永远不会封存：按它最后一次更新的时间等，以前按「现在」等，每一拍都等、永远不推
+        # runner 先写终态和结束时间、再另起会话封存，两步之间被这一拍撞上就等。失败后接着跑完的运行这时还带着失败时
+        # 的清单哈希，不能只看有没有哈希，要看封存盖没盖住这一次的结束事件。没有结束时间的（服务重启时还在排队、被改
+        # 成 failed 的）永远不会封存：按它最后一次更新的时间等，以前按「现在」等，每一拍都等、永远不推。等过时限仍没
+        # 封存完的照常推，只是不比、不写清单哈希
+        sealed = await auto_compare.sealed_now(session, run)
         since = run.finished_at or run.updated_at or fire.created_at
-        if not run.manifest_hash and (now - service.as_utc(since)).total_seconds() < SEAL_WAIT_S:
-            return None, None, 0
-        return run.status, _EVENT_OF[run.status], 0
+        if not sealed and (now - service.as_utc(since)).total_seconds() < SEAL_WAIT_S:
+            return _Seen(None)
+        return _Seen(run.status, _EVENT_OF[run.status], sealed=sealed)
     if run.status != "interrupted":
-        return None, None, 0
+        return _Seen(None)
     counts = dict((await session.execute(
         select(Approval.status, func.count()).where(
             Approval.run_id == run.id, Approval.status.in_(("pending", "answered")))
@@ -697,10 +750,10 @@ async def _state_of(session: Any, fire: ScheduleFire, run: Run | None,
     segment = await session.scalar(select(func.count()).select_from(RunEvent).where(
         RunEvent.run_id == run.id, RunEvent.type == EventType.RUN_STARTED.value)) or 0
     if counts.get("pending"):
-        return f"interrupted:approval:{segment}", "awaiting_approval", counts["pending"]
+        return _Seen(f"interrupted:approval:{segment}", "awaiting_approval", counts["pending"])
     if counts.get("answered"):
-        return None, None, 0
-    return f"interrupted:held:{segment}", "failed", 0
+        return _Seen(None)
+    return _Seen(f"interrupted:held:{segment}", "failed")
 
 
 async def _mark(fire_id: str, old: str | None, state: str) -> bool:
@@ -712,17 +765,19 @@ async def _mark(fire_id: str, old: str | None, state: str) -> bool:
         return result.rowcount == 1
 
 
-async def _notice(session: Any, schedule: Schedule, fire: ScheduleFire, run: Run | None, event: str,
-                  base_url: str | None, pending: int) -> Notice:
+async def _notice(session: Any, schedule: Schedule, fire: ScheduleFire, run: Run | None, seen: _Seen,
+                  base_url: str | None) -> Notice:
     tier, gaps = await _issuance_of(session, run) if run is not None else (None, None)
+    pending = seen.pending
     return Notice(
-        event=event, schedule_id=schedule.id, schedule_name=schedule.name, timezone=schedule.timezone,
+        event=seen.event or "", schedule_id=schedule.id, schedule_name=schedule.name, timezone=schedule.timezone,
         fire_id=fire.id, fire_at=fire.fire_at, fire_kind=fire.kind,
         run_id=run.id if run else None,
         status=run.status if run else fire.status,
         tier=tier, gaps=gaps,
         run_url=f"{base_url}/runs/{run.id}" if base_url and run else None,
-        manifest_hash=run.manifest_hash if run else None,
+        # 只写这一次结束时封的：停在审批上、封存还没补上的运行，身上可能还留着上一次失败时的清单哈希
+        manifest_hash=run.manifest_hash if run is not None and seen.sealed else None,
         started_at=run.started_at if run else None,
         finished_at=run.finished_at if run else None,
         reason=fire.reason if fire.status == "failed_to_start" else None,

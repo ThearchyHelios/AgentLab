@@ -1,17 +1,20 @@
-"""定时运行结束后的自动对比（app/scheduler/auto_compare.py，由通知扫描 webhook.notify_due 在推送之前触发）：
+"""定时运行结束后的自动对比（app/scheduler/auto_compare.py，由通知扫描 webhook.notify_due 在认领、推送之前触发）：
 
-- 运行进入终态且已封存、同一定时任务有更早的已封存运行时，用运行对比的现成函数（api/compare.py 的 default_base、
-  compare_runs）和它比一次，整份结果存成工件（kind=run_compare，不挂在运行名下、不进运行的工件列表），工件 id 记进
-  触发记录的 compare_artifact。基准是同一定时任务的上一次：同一工作流更近的手动运行、别的定时任务的运行都不算
-- 这个任务的第一次（只有同一工作流别的运行可比）、还没封存时不比；对比出错（基准的封存核对不一致、意外的异常）只记
-  日志，通知照常推送、不带对比
-- 接口：Fire 多一个 compare: {base_run_id, summary} 或 null，summary 同对比接口的计数；运行又被继续执行、不在终态
-  时为 null（对比页只认封存的运行）
-- 通知：结束、失败的通知多一行「与上一次相比：只数据变 2 个、口径与数据都变 0 个、SQL 结构变 0 个」，配了对外访问
-  地址时附对比页链接（/runs/compare?target=…&base=…）；只给个数，报告、指标、查询里的具体数字一个不出现
+- 只比成功结束并封存的运行：失败、取消的指标不全，和上一次比只会得出「移除 N 个」，误导收到通知的人
+- 基准是同一定时任务、同一工作流、比这次先发起的运行里成功结束并封存的最近一次：同一工作流更近的手动运行、别的
+  定时任务的运行都不算；失败的那一次不当基准（拿它当基准每个指标都成了「新增」）；按发起先后挑，不按结束时间——
+  老的失败运行事后被接着跑完，结束得比后一次晚，它的上一次仍是它前面那次。紧挨着的上一次不是成功的时，通知和触发
+  历史写明比的是哪一次
+- 整份结果连同两边的清单哈希存成工件（kind=run_compare，不挂在运行名下、不进运行的工件列表），工件 id 记进触发
+  记录的 compare_artifact。这个任务的第一次（只有同一工作流别的运行可比）、还没封存时不比；对比出错（基准的封存核对
+  不一致、意外的异常）只记日志，通知照常推送、不带对比
+- 接口：Fire 多一个 compare: {base_run_id, summary, previous} 或 null，summary 同对比接口的计数，previous 说基准是不是
+  紧挨着的上一次；基准被删、被继续执行（不在终态）时为 null（对比页只认封存的运行）
+- 通知：结束的通知多一行「与上一次相比：只数据变 2 个、口径与数据都变 0 个、SQL 结构变 0 个」，配了对外访问地址时附
+  对比页链接（/runs/compare?target=…&base=…）；只给个数，报告、指标、查询里的具体数字一个不出现
 
-两次周报运行用 tests/fixtures/compare_runs.py 的虚构运行（区域、金额、日期都是编的），按 runner 的算法封存，不真的
-执行；Webhook 用 httpx.MockTransport 接住，不连外网。
+封存绑定、时限、取消这几道保护另见 test_scheduler_compare_guards.py。两次周报运行用 tests/fixtures/compare_runs.py 的
+虚构运行（区域、金额、日期都是编的），按 runner 的算法封存，不真的执行；Webhook 用 httpx.MockTransport 接住，不连外网。
 """
 from __future__ import annotations
 
@@ -32,7 +35,7 @@ from app.db.base import SessionLocal
 from app.db.models import Artifact, Run, RunEvent, Schedule, ScheduleFire, Setting, Workflow
 from app.main import app
 from app.scheduler import auto_compare, webhook
-from tests.fixtures.compare_runs import NEXT_ROWS, Fake, week
+from tests.fixtures.compare_runs import NEXT_ROWS, Fake, region_sql, week
 
 UTC = timezone.utc
 T0 = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
@@ -111,8 +114,9 @@ async def new_schedule(workflow_id: str, *, fmt: str = "generic", url: str | Non
 
 
 async def persist(fake: Fake, workflow_id: str, *, finished: datetime, schedule_id: str | None = None,
-                  status: str = "succeeded", seal: bool = True) -> str:
-    """把一次虚构运行落库：工件进工件库，事件进运行记录，按 runner 的算法封存（同 test_compare_api.py）。"""
+                  status: str = "succeeded", seal: bool = True, seal_upto: int | None = None) -> str:
+    """把一次虚构运行落库：工件进工件库，事件进运行记录，按 runner 的算法封存（同 test_compare_api.py）。
+    seal_upto 只封到第几条事件：失败时封存过、接着跑完又写下了终态，新的封存还没补上的那一刻。"""
     for content in fake.store.values():
         await put_json(content, kind="compare_fixture")
     async with SessionLocal() as session:
@@ -128,9 +132,37 @@ async def persist(fake: Fake, workflow_id: str, *, finished: datetime, schedule_
             rows.append((seq, etype, node_id, data))
         run.last_seq = len(rows)
         if seal:
-            run.manifest_hash, run.manifest_seq = manifest_hash(rows), rows[-1][0]
+            covered = [r for r in rows if seal_upto is None or r[0] <= seal_upto]
+            run.manifest_hash, run.manifest_seq = manifest_hash(covered), covered[-1][0]
         await session.commit()
         return run.id
+
+
+async def reseal(run_id: str, fake: Fake, *, status: str, finished: datetime) -> None:
+    """一次运行被接着跑完（或者被重新封存）：事件换成 fake 的那一份，按新的事件封存，状态、结束时间一并改。"""
+    for content in fake.store.values():
+        await put_json(content, kind="compare_fixture")
+    async with SessionLocal() as session:
+        await session.execute(delete(RunEvent).where(RunEvent.run_id == run_id))
+        rows = []
+        for seq, etype, node_id, data in fake.events:
+            session.add(RunEvent(run_id=run_id, seq=seq, type=etype, node_id=node_id, ts=float(seq), data=data))
+            rows.append((seq, etype, node_id, data))
+        run = await session.get(Run, run_id)
+        run.last_seq = len(rows)
+        run.manifest_hash, run.manifest_seq = manifest_hash(rows), rows[-1][0]
+        run.status, run.finished_at = status, finished
+        await session.commit()
+
+
+def failed_week(run_id: str, rows=NEXT_ROWS) -> Fake:
+    """在 Agent 节点失败的一次周报：取数做完了，Agent 没交回结果，口径卡没有执行，一个指标都没有。"""
+    run = Fake(run_id)
+    run.tool("fetch", region_sql(), rows=rows)
+    run.add("node.started", "bot", {"node_type": "agent"})
+    run.add("node.failed", "bot", {"error": "模型接入超时"})
+    run.add("run.failed", None, {"error": "节点「区域分析」失败"})
+    return run
 
 
 async def seal(run_id: str) -> None:
@@ -206,8 +238,14 @@ async def test_finished_run_is_compared_with_the_previous_run_of_its_schedule(re
     from app.api.compare import compare_runs
 
     stored = load(artifact)
-    assert stored == json.loads(canonical_json(await compare_runs(target_id, base_id)))
-    assert stored["base"]["id"] == base_id and stored["summary"] == SUMMARY
+    # 整份对比结果，连同比的时候两边的清单哈希（封存变了，这份结果就不再作数）
+    assert stored["result"] == json.loads(canonical_json(await compare_runs(target_id, base_id)))
+    assert stored["result"]["base"]["id"] == base_id and stored["result"]["summary"] == SUMMARY
+    async with SessionLocal() as session:
+        runs = await session.scalars(select(Run).where(Run.id.in_((target_id, base_id))))
+        seals = {r.id: r.manifest_hash for r in runs}
+    assert (stored["target_manifest"], stored["base_manifest"], stored["previous"]) == (
+        seals[target_id], seals[base_id], True)
     async with SessionLocal() as session:
         rows = list((await session.execute(select(Artifact).where(Artifact.id == artifact))).scalars())
     # 对比结果不是运行产出的：不挂在运行名下，不进这次运行的工件列表
@@ -215,7 +253,7 @@ async def test_finished_run_is_compared_with_the_previous_run_of_its_schedule(re
     assert artifact not in [a["id"] for a in (await client.get(f"/api/runs/{target_id}/artifacts")).json()]
 
     items = {f["id"]: f for f in (await client.get(f"/api/schedules/{sid}/fires")).json()["items"]}
-    assert items[fire_id]["compare"] == {"base_run_id": base_id, "summary": SUMMARY}
+    assert items[fire_id]["compare"] == {"base_run_id": base_id, "summary": SUMMARY, "previous": True}
     assert items[base_fire]["compare"] is None
     [listed] = [s for s in (await client.get("/api/schedules")).json()["items"] if s["id"] == sid]
     assert listed["last_fire"]["id"] == fire_id and listed["last_fire"]["compare"]["base_run_id"] == base_id
@@ -223,7 +261,7 @@ async def test_finished_run_is_compared_with_the_previous_run_of_its_schedule(re
     [body] = recorder.bodies()
     link = f"{BASE_URL}/runs/compare?target={target_id}&base={base_id}"
     assert body["event"] == "finished" and LINE in body["text"] and f"查看对比：{link}" in body["text"]
-    assert body["compare"] == {"base_run_id": base_id, "summary": SUMMARY, "url": link}
+    assert body["compare"] == {"base_run_id": base_id, "summary": SUMMARY, "previous": True, "url": link}
     query = parse_qs(urlsplit(body["compare"]["url"]).query)
     assert query == {"target": [target_id], "base": [base_id]}
     assert no_numbers(recorder.requests[0].content.decode()) == []
@@ -231,25 +269,79 @@ async def test_finished_run_is_compared_with_the_previous_run_of_its_schedule(re
     assert await webhook.notify_due() == 0 and (await fire_row(fire_id)).compare_artifact == artifact
 
 
-@pytest.mark.parametrize("fmt, url", [("feishu", FEISHU), ("generic", GENERIC)])
-async def test_failed_run_notice_carries_the_counts_too(recorder, fmt, url):
-    """失败的运行也封存：和上一次比一次，失败通知同样带计数摘要"""
+@pytest.mark.parametrize("status, fmt, url", [("failed", "feishu", FEISHU), ("failed", "generic", GENERIC),
+                                              ("cancelled", "generic", GENERIC)])
+async def test_failed_or_cancelled_run_is_not_compared(recorder, client, status, fmt, url):
+    """失败、取消的运行指标不全（这次在 Agent 节点失败，口径卡没有执行）：和上一次比只会得出「移除 2 个」，收到通知
+    的人会以为报告删了两个指标。不比：触发记录上没有对比，失败通知不带计数那一行和对比页链接"""
     await public_address()
-    _, base_id, target_id, fire_id = await weekly_pair(target_status="failed", fmt=fmt, url=url)
-    assert await webhook.notify_due() == 1
-    assert (await fire_row(fire_id)).compare_artifact
-    raw = recorder.requests[0].content.decode()
-    text = json.loads(raw)["content"]["text"] if fmt == "feishu" else json.loads(raw)["text"]
-    assert "运行失败" in text and LINE in text and f"base={base_id}" in text and f"target={target_id}" in text
-    assert no_numbers(raw) == []
-
-
-async def test_cancelled_run_is_compared_but_not_pushed(recorder, client):
-    """取消的运行不推送（有人手动停的），对比照样算：触发历史里一样能点「对比上一次」"""
-    sid, base_id, _, fire_id = await weekly_pair(target_status="cancelled")
-    assert await webhook.notify_due() == 0 and recorder.requests == []
+    workflow = await new_workflow()
+    sid = await new_schedule(workflow, fmt=fmt, url=url)
+    base_id = await persist(week("r1"), workflow, finished=T0, schedule_id=sid)
+    await fire_for(sid, base_id, T0 - timedelta(minutes=2), notified="succeeded")
+    target_id = await persist(failed_week("r2"), workflow, finished=T0 + WEEK, schedule_id=sid, status=status)
+    fire_id = await fire_for(sid, target_id, T0 + WEEK - timedelta(minutes=2))
+    # 取消的不推送（有人手动停的）
+    assert await webhook.notify_due() == (1 if status == "failed" else 0)
+    assert (await fire_row(fire_id)).compare_artifact is None
     items = {f["id"]: f for f in (await client.get(f"/api/schedules/{sid}/fires")).json()["items"]}
-    assert items[fire_id]["compare"]["base_run_id"] == base_id
+    assert items[fire_id]["compare"] is None
+    if status == "failed":
+        raw = recorder.requests[0].content.decode()
+        text = json.loads(raw)["content"]["text"] if fmt == "feishu" else json.loads(raw)["text"]
+        assert "运行失败" in text and f"{BASE_URL}/runs/{target_id}" in text
+        for absent in ("相比", "移除", "查看对比", "/runs/compare"):
+            assert absent not in text, text
+        if fmt == "generic":
+            assert json.loads(raw)["compare"] is None
+
+
+async def test_after_a_failed_run_the_base_is_the_last_successful_one(recorder, client):
+    """上一次失败了：基准取再往前、成功的那一次——拿失败的那次当基准，每个指标都成了「新增」。紧挨着的上一次不是
+    它，通知和触发历史写明比的是哪一次（短编号和发起的日期，按定时任务的时区）"""
+    await public_address()
+    workflow = await new_workflow()
+    sid = await new_schedule(workflow)
+    first = await persist(week("r1"), workflow, finished=T0, schedule_id=sid)
+    await fire_for(sid, first, T0 - timedelta(minutes=2), notified="succeeded")
+    failed = await persist(failed_week("r2"), workflow, finished=T0 + WEEK, schedule_id=sid, status="failed")
+    await fire_for(sid, failed, T0 + WEEK - timedelta(minutes=2), notified="failed")
+    target_id = await persist(week("r3", NEXT_ROWS), workflow, finished=T0 + 2 * WEEK, schedule_id=sid)
+    fire_id = await fire_for(sid, target_id, T0 + 2 * WEEK - timedelta(minutes=2))
+
+    assert await webhook.notify_due() == 1
+    stored = load((await fire_row(fire_id)).compare_artifact)
+    assert stored["result"]["base"]["id"] == first and stored["previous"] is False
+    [body] = recorder.bodies()
+    # 第一次发起于北京时间 2026-09-07 08:58
+    line = f"与上一次成功的运行（#{first[:6]}，2026-09-07）相比：只数据变 2 个、口径与数据都变 0 个、SQL 结构变 0 个"
+    assert line in body["text"] and "新增" not in body["text"], body["text"]
+    assert f"base={first}" in body["text"] and failed not in body["text"]
+    assert (body["compare"]["base_run_id"], body["compare"]["previous"]) == (first, False)
+    items = {f["id"]: f for f in (await client.get(f"/api/schedules/{sid}/fires")).json()["items"]}
+    assert items[fire_id]["compare"] == {"base_run_id": first, "summary": SUMMARY, "previous": False}
+
+
+async def test_base_follows_launch_order_not_finish_time(recorder):
+    """第 2 周失败、第 3 周照常成功之后，有人把第 2 周接着跑完：它结束得比第 3 周晚，但它的上一次仍是第 1 周。以前
+    按结束时间挑，拿后一次触发的第 3 周当基准，「与上一次相比」的变化方向是反的。第 3 周已经比过的那一份不受影响"""
+    workflow = await new_workflow()
+    sid = await new_schedule(workflow, url=None)
+    first = await persist(week("r1"), workflow, finished=T0, schedule_id=sid)
+    await fire_for(sid, first, T0 - timedelta(minutes=2), notified="succeeded")
+    second = await persist(failed_week("r2"), workflow, finished=T0 + WEEK, schedule_id=sid, status="failed")
+    second_fire = await fire_for(sid, second, T0 + WEEK - timedelta(minutes=2))
+    third = await persist(week("r3", NEXT_ROWS), workflow, finished=T0 + 2 * WEEK, schedule_id=sid)
+    third_fire = await fire_for(sid, third, T0 + 2 * WEEK - timedelta(minutes=2))
+    await webhook.notify_due()
+    third_artifact = (await fire_row(third_fire)).compare_artifact
+    assert load(third_artifact)["result"]["base"]["id"] == first
+
+    await reseal(second, week("r2", NEXT_ROWS), status="succeeded", finished=T0 + 2 * WEEK + timedelta(days=1))
+    await webhook.notify_due()
+    stored = load((await fire_row(second_fire)).compare_artifact)
+    assert stored["result"]["base"]["id"] == first and stored["previous"] is True
+    assert (await fire_row(third_fire)).compare_artifact == third_artifact
 
 
 async def test_first_run_of_a_schedule_has_no_compare(recorder, client):
@@ -276,7 +368,7 @@ async def test_waits_for_the_seal_before_comparing(recorder):
     assert (await fire_row(fire_id)).compare_artifact is None and recorder.requests == []
     await seal(target_id)
     assert await webhook.notify_due() == 1
-    assert load((await fire_row(fire_id)).compare_artifact)["base"]["id"] == base_id
+    assert load((await fire_row(fire_id)).compare_artifact)["result"]["base"]["id"] == base_id
     assert LINE in recorder.bodies()[0]["text"]
 
 
@@ -327,18 +419,28 @@ async def test_compare_failure_only_logs_and_the_notice_still_goes_out(recorder,
         assert "封存核对不一致" in caplog.text
 
 
-async def test_compare_is_hidden_once_the_run_is_running_again(client):
-    """失败后被继续执行（不在终态）：对比页只认封存的运行，接口不给 compare；再次结束时重新比"""
-    sid, base_id, target_id, fire_id = await weekly_pair(target_status="failed", url=None)
+async def test_a_failed_run_is_compared_once_it_is_continued_to_success(client):
+    """失败时不比；接着跑（不在终态）时也没有；跑完、成功并重新封存之后按新的封存比一次"""
+    workflow = await new_workflow()
+    sid = await new_schedule(workflow, url=None)
+    base_id = await persist(week("r1"), workflow, finished=T0, schedule_id=sid)
+    await fire_for(sid, base_id, T0 - timedelta(minutes=2), notified="succeeded")
+    target_id = await persist(failed_week("r2"), workflow, finished=T0 + WEEK, schedule_id=sid, status="failed")
+    fire_id = await fire_for(sid, target_id, T0 + WEEK - timedelta(minutes=2))
+
+    async def shown():
+        items = (await client.get(f"/api/schedules/{sid}/fires")).json()["items"]
+        return {f["id"]: f for f in items}[fire_id]
+
     await webhook.notify_due()
-    assert (await fire_row(fire_id)).compare_artifact
+    assert (await fire_row(fire_id)).compare_artifact is None and (await shown())["compare"] is None
     await set_run(target_id, status="running")
-    [item] = [f for f in (await client.get(f"/api/schedules/{sid}/fires")).json()["items"] if f["id"] == fire_id]
-    assert item["run_status"] == "running" and item["compare"] is None
-    await set_run(target_id, status="succeeded", finished_at=T0 + WEEK + timedelta(hours=1))
     await webhook.notify_due()
-    [item] = [f for f in (await client.get(f"/api/schedules/{sid}/fires")).json()["items"] if f["id"] == fire_id]
-    assert item["compare"] == {"base_run_id": base_id, "summary": SUMMARY}
+    item = await shown()
+    assert item["run_status"] == "running" and item["compare"] is None
+    await reseal(target_id, week("r2", NEXT_ROWS), status="succeeded", finished=T0 + WEEK + timedelta(hours=1))
+    await webhook.notify_due()
+    assert (await shown())["compare"] == {"base_run_id": base_id, "summary": SUMMARY, "previous": True}
 
 
 async def test_compare_is_hidden_once_the_base_run_is_gone_or_running(client):
