@@ -1028,9 +1028,10 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
         why = "收尾时超过时长上限，没能交结果" if timed_out else \
             f"核查模型没有按结构交结果（{explain_model_error(failure, model_id)}）" if failure is not None else \
             "核查模型没有按结构交结果"
-        # 收尾超时也是触了时长上限：模型自己停了查询（stopped 为 None）时照实记 timeout_s，和原因对得上（质询的报错说
-        # 时长上限，界面按 limit 标「已达时长上限」）。循环里先撞上的上限照旧优先，同上面金额被拒的收尾
-        return outcome(limit=stopped or ("timeout_s" if timed_out else None), answered=answered, error=why)
+        # 收尾超时：没交成结果是因为时长上限，limit 照实记 timeout_s，和原因对得上——模型自己停了查询（stopped 为 None）
+        # 时以前记成没触顶，质询的报错说时长上限、界面却没有「已达时长上限」；循环里先查满了次数的，记成查询次数上限
+        # 会让双盲复算、反方审稿说错原因（查满了照样能交结果）。上面金额被拒的收尾仍报循环里先撞上的那个
+        return outcome(limit="timeout_s" if timed_out else stopped, answered=answered, error=why)
     declared = list((resolved.get("properties") or {}) if _is_object(resolved) else {})
     if declared and not any(k in parsed for k in declared):
         # 一个要求的字段都没交：不是「查不到」，是没按结构交。不这么分，字段名对不上的回复会被当成什么都没查到

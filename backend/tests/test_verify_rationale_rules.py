@@ -111,16 +111,19 @@ async def test_a_final_call_that_runs_out_of_time_records_the_time_limit(monkeyp
     assert out.limit == "timeout_s"
 
 
-async def test_a_limit_hit_in_the_loop_is_still_the_one_reported(monkeypatch, shop):
-    """循环先撞上查询次数上限、收尾又超时：触顶原因照旧报先撞上的那个（同金额被拒的收尾，见 test_verify_truncation）。"""
+async def test_a_final_call_that_runs_out_of_time_after_the_query_limit_records_the_time_limit(monkeypatch, shop):
+    """循环先撞上查询次数上限、收尾又超时：没交成结果是因为超时，limit 记 timeout_s，和原因一致——记成查询次数上限的话，
+    质询会显示「未能回答（已达查询次数上限）：回答超过时长上限…」，双盲复算会说盲算查满了次数（查满了照样能交结果）。
+    金额被拒的收尾照旧报循环里先撞上的那个（见 test_verify_truncation）。"""
     name, _ = shop
     monkeypatch.setattr(verify_agent, "SETTLE_GRACE_S", 0.3)
     Script(monkeypatch, [q(name, VALID_SUM, "c1"), q(name, "SELECT COUNT(*) AS n FROM orders", "c2")],
            {**FOUND, "rationale": "x"})
     slow_final(monkeypatch)
     out = await run(name, timeout_s=0.5, max_queries=1)
+    assert [qd["alias"] for qd in out.queries] == ["Q1"], "查满了一次"
     assert out.result is None and out.error == "收尾时超过时长上限，没能交结果"
-    assert out.limit == "max_queries"
+    assert out.limit == "timeout_s"
 
 
 # --------------------------------------------------------------------------
