@@ -6,6 +6,13 @@
 **只读。** 工具只建给定数据源的 db_schema / db_query，建的时候 force_readonly：可写源上的写语句也被守卫拒绝
 （tools/datasource.py）。这一路没有审批关卡，不能指望人在半路拦下一条 DELETE。
 
+**先遮再交。** 建查询工具时还打开遮罩开关（tools/datasource 的 mask_results）：数据源设了遮罩时，取自遮罩列的格子
+（按 SQL 认，起别名、套函数、经子查询或 WITH 转一道、SELECT * 都算）在交给模型、落进查询快照之前就换成「已遮罩」，
+同一份结果里别的文字格夹着的遮罩值也换掉（engine/masking.py 的 mask_query_result）。模型看不到遮罩值，就不会把它
+写进回答、理由、SQL；以前是事后按值认，每一轮复核都找到新的漏法。快照里的 masked_at_query 记下查询时就遮了的列，
+格子引用指到这几列的不采信。遮掉的值只在内存里交回调用方（VerifyOutcome.masked_values，审批质询按值遮的第二道防线
+用），不进快照、不交给模型、不进 as_dict。
+
 **数从快照取。** 每次成功的查询是一份查询快照（工具自己落的 put_json），按这个 agent 自己的顺序编 Q1、Q2…。
 最后交结果时，调用方结构里的数值字段一律改成格子引用 {alias, row, column}，由代码按引用从快照里取值：模型自己
 写的数字不采信，取不到就是 None，不兜底成 0。数值字段的各种写法都认（type 列表、anyOf 里的数、$ref 引用进来的、
@@ -45,7 +52,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -59,13 +66,14 @@ from app.engine import spend
 from app.engine.evidence import build_catalog, cell_eid, compose_doc, query_entry_fields, schema_ledger_entry
 from app.engine.expressions import CellError, column_kind, locate_cell, numeric_text
 from app.engine.judge import FALLBACK_MAX_TOKENS, MAX_TOKENS, _json_in, _tokens, _usd
+from app.engine.masking import _Secrets
 from app.engine.nodes.llm import _DIGEST_BUDGET, _digest, _split_structured, _typed, explain_model_error
 from app.engine.state import message_text
 from app.engine.toolcalls import ToolTimeout, limit_fields, limit_of, run_bounded
 from app.providers import catalog as pricing
 from app.providers.budget import BudgetFallback, budget_refused, cut_off, cut_words, error_usage, truncated_error
 from app.providers.factory import ModelSpec, ProviderNotConfigured, bind_tools_safely, get_chat_model
-from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX, build_datasource_tools
+from app.tools.datasource import MASKED_VALUES_KEY, QUERY_PREFIX, SCHEMA_PREFIX, build_datasource_tools
 from app.tools.registry import ToolArgsError, ToolContext, Versions, args_model_of, prepare_args
 
 logger = logging.getLogger(__name__)
@@ -103,6 +111,8 @@ VERIFY_SYSTEM = (
     "- 先用 db_schema 工具看表结构，确认表名、字段名，再用 db_query 工具写只读 SQL。不能改数据，写语句会被拒绝\n"
     "- 每次成功的查询前面都标着编号【证据 Qn】，最后交结果时用它说明每个数取自哪次查询的哪一格\n"
     "- {limit}先想清楚要查什么，不要重复同样的查询\n"
+    "- 数据源设了遮罩的列（手机号、姓名这类），查询结果里显示为「已遮罩」：不要设法绕过，交结果、写理由时也不要引用"
+    "这些格子\n"
     "- 不要编造数字，查不到就照实说"
 )
 VERIFY_FINAL_PROMPT = (
@@ -149,6 +159,8 @@ class VerifyOutcome:
     output_tokens, total_tokens, cost_usd, calls, unpriced_calls}。limit：触顶原因（LIMITS 之一），没触顶为 None。
     answered：模型是不是自己停下来的（没被上限掐断，也没因为输出到了上限被截断）。被截断的一律没有结果，error 是
     TRUNCATED_ERROR。
+    masked_values：查询时在工具边界遮掉的值（engine/masking 的 _Secrets）。只在内存里交给调用方按值遮（审批质询的回答），
+    不进 as_dict、不往外交。
     """
 
     result: dict[str, Any] | None
@@ -162,9 +174,12 @@ class VerifyOutcome:
     answered: bool = False
     notes: list[str] = field(default_factory=list)
     duration_ms: int = 0
+    masked_values: Any = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(replace(self, masked_values=None))
+        out.pop("masked_values", None)
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -407,6 +422,12 @@ class _Cells:
             self.cells.append({"path": path, "status": "unresolved", "alias": alias, "artifact": query["artifact"],
                                "reason": f"{alias} {e}"})
             return None
+        if str(name).lower() in _masked_at_query(content):
+            # 查询时就遮了的列：格子里是「已遮罩」，不是数据源里的值。照实说是遮罩列，不说成「不是数值」
+            self.cells.append({"path": path, "status": "unresolved", "ref": f"{alias}.r{row}.{name}", "alias": alias,
+                               "row": row, "column": name, "artifact": query["artifact"],
+                               "reason": f"{alias} 的「{name}」取自设置了遮罩的列，查询时已遮罩，不采信"})
+            return None
         truth = _typed(raw, {"type": sorted(types)}, column_kind(content, name))
         cited = {"ref": f"{alias}.r{row}.{name}", "alias": alias, "row": row, "column": name,
                  "artifact": query["artifact"], "eid": cell_eid(query["artifact"], row, name), "value": truth}
@@ -500,6 +521,12 @@ class _Cells:
         if isinstance(value, list):
             return [self.scrub({}, v, f"{path}[{i}]") for i, v in enumerate(value)]
         return None
+
+
+def _masked_at_query(content: Any) -> set[str]:
+    """查询快照里查询时就整列遮掉的列（小写，tools/datasource 记下的 masked_at_query）。"""
+    listed = content.get("masked_at_query") if isinstance(content, dict) else None
+    return {c.lower() for c in listed if isinstance(c, str)} if isinstance(listed, list) else set()
 
 
 # --------------------------------------------------------------------------
@@ -636,6 +663,8 @@ class _State:
     queries: list[dict[str, Any]] = field(default_factory=list)
     ledger: list[dict[str, Any]] = field(default_factory=list)
     model: str | None = None
+    #: 查询工具在工具边界遮掉的值（经 ToolContext.extra 并进来，只在内存里）
+    seen: _Secrets = field(default_factory=_Secrets)
 
     def outcome(self, **fields: Any) -> VerifyOutcome:
         usage = self.usage
@@ -645,7 +674,8 @@ class _State:
                  for q in self.queries]
         base: dict[str, Any] = {"result": None, "cells": [], "queries": shown, "rationale": None, "usage": usage,
                                 "notes": self.notes, "model": self.model,
-                                "duration_ms": int((time.monotonic() - self.started) * 1000)}
+                                "duration_ms": int((time.monotonic() - self.started) * 1000),
+                                "masked_values": self.seen}
         return VerifyOutcome(**{**base, **fields})
 
 
@@ -728,12 +758,13 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
         notes.append(note)
         await _announce(emit, EventType.LOG, level="warn", code="verify_unpriced", message=note)
 
-    # ---- 工具：只读的 db_schema / db_query
+    # ---- 工具：只读的 db_schema / db_query，查询结果先遮再交给模型（遮掉的值并进 state.seen）
     wanted = list(dict.fromkeys(s for s in sources if isinstance(s, str) and s))
-    ctx = ToolContext(run_id=run_id, node_id=node_id, data_versions=data_versions, emit=emit)
+    ctx = ToolContext(run_id=run_id, node_id=node_id, data_versions=data_versions, emit=emit,
+                      extra={MASKED_VALUES_KEY: state.seen})
     async with SessionLocal() as session:
         tools = await build_datasource_tools([f"{p}{s}" for s in wanted for p in (SCHEMA_PREFIX, QUERY_PREFIX)], ctx,
-                                             session, force_readonly=True)
+                                             session, force_readonly=True, mask_results=True)
     tool_map = {t.name: t for t in tools}
     if lost := [s for s in wanted if f"{QUERY_PREFIX}{s}" not in tool_map]:
         notes.append("数据源" + "、".join(f"「{s}」" for s in lost) + "不存在或已停用，核查没有查它")

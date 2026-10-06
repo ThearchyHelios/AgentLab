@@ -1102,6 +1102,32 @@ async def test_the_task_gives_the_claim_its_evidence_and_only_its_sources(monkey
         await engines.invalidate(source_id)
 
 
+async def test_the_challenge_agent_never_sees_masked_values(monkeypatch, tmp_path):
+    """反查 agent 自己的查询选出了遮罩列（起了别名）：交给它的工具结果、它的查询快照里都是「已遮罩」，理由里引用到那一格
+    渲染出来也是「已遮罩」；审稿记录、运行事件里都没有原值。以前查询结果原样交给模型、原样存下，理由也原样渲染。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": ["buyer_phone"]})
+    try:
+        top = "SELECT buyer_phone AS 电话, amount AS 金额 FROM sales WHERE region = '华东' ORDER BY amount DESC"
+        plays = {"居各区域之首": Play([top], "stands", "华东最大一笔来自 [[v:Q1.r0.电话]]，金额 [[v:Q1.r0.金额]]。[[see:Q1]]")}
+        models = Models(monkeypatch, name, plays=plays)
+        row = await finish(graph(name), run_class="exploratory")
+        assert row.status == "succeeded", row.error
+        seen = [str(m.content) for _, key, messages in models.calls if key == "居各区域之首"
+                for m in messages if isinstance(m, ToolMessage)]
+        assert seen and any("已遮罩" in s for s in seen) and all("1390000000" not in s for s in seen)
+        record = artifact_store.load((await output_of(row.id, "chal"))["challenge_artifact"])
+        [claim] = [c for c in record["claims"] if "居各区域之首" in c["text"]]
+        assert claim["verdict"] == "stands" and claim["rationale"] == "华东最大一笔来自 已遮罩，金额 1,200。"
+        snapshot = artifact_store.load(claim["queries"][0]["artifact"])
+        assert {r[0] for r in snapshot["rows"]} == {"已遮罩"} and snapshot["masked_at_query"] == ["电话"]
+        assert "1390000000" not in json.dumps(record, ensure_ascii=False)
+        async with SessionLocal() as session:
+            evs = (await session.execute(select(RunEvent).where(RunEvent.run_id == row.id))).scalars().all()
+        assert evs and all("1390000000" not in json.dumps(e.data, ensure_ascii=False) for e in evs)
+    finally:
+        await engines.invalidate(source_id)
+
+
 async def test_a_metric_excerpt_marks_the_report_query_numbers_too(monkeypatch, shop):
     """句子挂的是口径卡指标（正式报告的主路径「取数 → 口径卡 → 报告」）：摘录正文里「取自查询 Q1」「查询 Q1 的 SQL」
     也标成原报告的编号，和反查 agent 自己的 Q1 分开；工具按指标的输入取自的查询找源。"""

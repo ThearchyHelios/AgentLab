@@ -1034,6 +1034,27 @@ async def test_a_blind_cell_on_a_masked_column_is_not_used(monkeypatch, masked_s
     assert "30.25" not in json.dumps(out, ensure_ascii=False)
 
 
+async def test_a_renamed_masked_column_in_the_blind_query_is_masked_before_the_blind_agent_sees_it(
+        monkeypatch, masked_shop):
+    """盲算的查询选出了改了名字的遮罩列（region AS 区域）：交给盲算模型、落进盲算快照之前就是「已遮罩」，快照记下查询
+    时遮了哪一列；没碰遮罩列的那一列（销售额）照常取值、照常比对。"""
+    name, _ = masked_shop
+    east = {**GMV, "id": "east", "name": "华东销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    renamed = (f"SELECT region AS 区域, SUM(amount) AS gmv FROM orders WHERE status <> 'refunded' AND paid_date {WEEK} "
+               "GROUP BY region ORDER BY region")
+    Blind(monkeypatch, name, {"华东销售额": (renamed, "gmv")})
+    run = await start(graph(name, BY_REGION, metrics=[east], dual={"definitions": {}}))
+    assert run.status == "succeeded", run.error
+    evs = await events(run.id)
+    out = dual_output(run, evs)
+    assert out["status"] == "agreed" and out["metrics"][0]["status"] == "agreed"
+    [end] = [e.data for e in evs if e.type == "tool.end" and e.node_id == "dual" and e.data.get("query_artifact")]
+    snapshot = artifact_store.load(end["query_artifact"])
+    assert {row[0] for row in snapshot["rows"]} == {"已遮罩"} and snapshot["masked_at_query"] == ["区域"]
+    shown = json.loads(end["preview"].split("\n", 1)[1])
+    assert {row[0] for row in shown["rows"]} == {"已遮罩"}, "交给盲算模型的结果里也是「已遮罩」"
+
+
 async def test_masked_group_columns_are_not_shown_to_the_blind_agent(monkeypatch, masked_shop):
     name, _ = masked_shop
     first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}

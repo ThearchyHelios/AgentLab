@@ -53,6 +53,9 @@ RUN_VERSIONS_KEY = "data_versions"
 DATA_UNAVAILABLE = "查询失败（数据不可用）："
 #: 运行中途补固定一个源时发的那条日志事件的 code（_pin_late）
 LATE_PIN_CODE = "data_version_pinned"
+#: ToolContext.extra 里放「查询时遮掉的值」的键（engine/masking 的 _Secrets）：核查 agent（engine/verify_agent.py）放进去，
+#: 打开了遮罩开关的查询工具把每次遮掉的值并进去。只在内存里给调用方按值遮用，不进快照、不交给模型
+MASKED_VALUES_KEY = "masked_values"
 
 #: 每次查询之后基于数据目录的 SQL 检查最多等这么久。正常一条 SQL 几毫秒；等不到就放弃这一次检查，
 #: 查询结果照常交回——检查是附加的，不能拖慢查询
@@ -199,7 +202,8 @@ def _query_description(source: Any, *, readonly: bool | None = None) -> str:
 
 
 async def build_datasource_tools(
-    names: list[str], ctx: ToolContext, session: AsyncSession, *, force_readonly: bool = False
+    names: list[str], ctx: ToolContext, session: AsyncSession, *, force_readonly: bool = False,
+    mask_results: bool = False,
 ) -> list[StructuredTool]:
     """按工具名反查数据源并构造工具。build_tools 的第四个来源。
 
@@ -209,6 +213,9 @@ async def build_datasource_tools(
 
     force_readonly：查询工具一律按只读守卫检查，可写源上的写语句也拒绝（见 _make_query_tool）。
     核查（engine/verify_agent.py）建工具时传它：那一路没有审批关卡，绝不能写。
+
+    mask_results：查询结果交给模型、落进快照之前先遮（见 _make_query_tool）。核查建工具时也传它：模型看不到遮罩列的
+    值，就不会把它们写进回答、理由。缺省关着：Agent 节点、调用工具节点的查询照旧原样。
     """
     wanted: dict[str, list[str]] = {}
     for name in names:
@@ -238,7 +245,8 @@ async def build_datasource_tools(
         entries = await _catalog_of(row)
         for prefix in prefixes:
             if prefix == QUERY_PREFIX:
-                tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries, force_readonly=force_readonly))
+                tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries, force_readonly=force_readonly,
+                                              mask_results=mask_results))
             else:
                 tools.append(_make_schema_tool(source, fixed=fixed, catalog=entries))
     return tools
@@ -450,7 +458,7 @@ def _unavailable_tool(row: DataSource, prefix: str, reason: str) -> StructuredTo
 
 def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
                      catalog: Mapping[str, data_catalog.CatalogEntry] | None = None,
-                     force_readonly: bool = False) -> StructuredTool:
+                     force_readonly: bool = False, mask_results: bool = False) -> StructuredTool:
     """source 是手工源的 DataSource，或上传源绑定快照的 SourceView（字段同名）。
 
     fixed：上传源的版本是这次运行固定的（找不到时的说法不同）。
@@ -458,6 +466,8 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
     force_readonly：不管源可不可写，一律按只读守卫检查，写语句交回 FORCED_READONLY、不执行。只靠守卫这一道：
     连接池按源缓存、不分只读与否（engine.cache_key），可写源借不到连接层只读的连接——别为此另起一个只读池，
     缓存键相同，会把这个源平时用的可写连接也换成只读的。
+    mask_results：数据源设了遮罩时，取自遮罩列的格子（按 SQL 认，改了名字的也算）在交给模型、落进快照之前就换成
+    「已遮罩」，见 engine/masking.py 的 mask_query_result；这一次遮掉的值并进 ctx.extra[MASKED_VALUES_KEY]（有的话）。
     """
     # 数据源在 options.query_timeout_s 里配了就用它，否则取缺省。数据库按它停下语句，
     # 引擎按它告诉界面上限是多少（metadata["timeout_s"]）
@@ -505,6 +515,17 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
 
         payload = result.to_payload()
         payload["source"] = source.name
+        mask = masked_columns(source.options)
+        # 查询时就整列遮掉的结果列；没开遮罩开关、数据源没设遮罩时为 None（快照和原来一字不差）
+        masked_now: list[str] | None = None
+        if mask_results and mask:
+            from app.engine.masking import mask_query_result
+
+            # 按 SQL 认列、逐格比对是纯计算，放进线程（同 _sql_checks）
+            done = await asyncio.to_thread(mask_query_result, payload, mask, source.kind)
+            payload, masked_now = done.payload, done.columns
+            if (sink := ctx.extra.get(MASKED_VALUES_KEY)) is not None:
+                sink.merge(done.secrets)
         # 对照数据目录检查这条 SQL（一对多关联后重复计算、存量跨期求和……）。结果交给模型（Agent 据此改写），
         # 也随查询快照存下：证据面板看得到，口径卡据此给指标标「存疑」、出具降档。没查出问题不加这个键，
         # 快照和以前一字不差
@@ -518,14 +539,19 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
         try:
             from app.core.artifact_store import put_json
 
-            # 只进快照、不进交给模型的结果的两样（模型看到多余的字段只会误会：以为数据被遮了，
+            # 只进快照、不进交给模型的结果的几样（模型看到多余的字段只会误会：以为数据被遮了，
             # 或者把一串十六进制抄进报告）：
-            # - 查询当时数据源设的遮罩列：数据源事后改名、删掉，证据面板仍按当时的遮；
+            # - 查询当时数据源设的遮罩列：数据源事后改名、删掉，证据面板仍按当时的遮。查询时就遮了的结果列（改了名字的
+            #   也算）一并记进去，证据面板、质询工件按这个键把它们画成遮罩列；
+            # - masked_at_query：开了遮罩开关时，查询时就整列遮掉的结果列（这几列的格子是「已遮罩」，不是数据源里的值）；
             # - data_version：上传表格查的是哪个快照，事后据此认得出这个数出自哪一版数据。
             # 手工源、没设遮罩的，快照和原来一字不差
             extra: dict[str, Any] = {}
-            if mask := masked_columns(source.options):
-                extra["mask_columns"] = mask
+            if mask:
+                own = {m.lower() for m in mask}
+                extra["mask_columns"] = [*mask, *(c for c in masked_now or [] if c.lower() not in own)]
+            if masked_now is not None:
+                extra["masked_at_query"] = masked_now
             if version := getattr(source, "snapshot_id", None):
                 extra["data_version"] = version
             # 工件引用的 meta 记下源和 SQL 里用到的表：数据目录按它数每张表被运行查询过几次

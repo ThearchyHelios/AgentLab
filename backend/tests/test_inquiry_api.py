@@ -904,6 +904,35 @@ async def test_resuming_after_an_inquiry_does_not_repeat_the_nodes(monkeypatch, 
 ALIASED = "SELECT buyer_phone AS 手机号, amount AS 金额 FROM sales ORDER BY amount DESC LIMIT 1"
 
 
+async def test_the_inquiry_agent_sees_and_stores_its_queries_masked(monkeypatch, masked_shop, client):
+    """质询 agent 的查询结果在交给模型之前就遮好了（核查 agent 建查询工具时打开遮罩开关）：模型看到的工具结果、落库的
+    查询快照、运行详情「工件」页签走的通用工件接口里，遮罩列（起了别名的也算）都是「已遮罩」。以前快照原样存着，模型
+    看得到原值，通用接口也原样给出。回答照常按值遮（查询时遮掉的值只在内存里交回来）。"""
+    plays = {"买得最多": Play([ALIASED], "这一笔来自 [[v:Q1.r0.手机号]]（13900000001），金额 [[v:Q1.r0.金额]]。[[see:Q1]]")}
+    Models(monkeypatch, masked_shop, plays=plays)
+    seen: list[str] = []
+    answering = MockChatModel._decide
+
+    def spy(model, messages):
+        seen.extend(str(m.content) for m in messages if isinstance(m, ToolMessage))
+        return answering(model, messages)
+
+    monkeypatch.setattr(MockChatModel, "_decide", spy)
+    paused = await pause(masked_shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="买得最多的是哪位客户？",
+                  approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    assert r.json()["inquiry"]["answer"]["text"] == "这一笔来自 已遮罩（已遮罩），金额 1,200。"
+    [query] = r.json()["inquiry"]["queries"]
+    assert seen and any("已遮罩" in s for s in seen) and all("1390000000" not in s for s in seen)
+    got = await client.get(f"/api/artifacts/{query['artifact']}")
+    assert got.status_code == 200 and "1390000000" not in got.text
+    content = got.json()["content"]
+    assert content["rows"] == [["已遮罩", 1200]] and content["masked_at_query"] == ["手机号"]
+    assert content == artifact_store.load(query["artifact"])
+
+
 async def test_a_masked_column_under_another_name_is_masked_everywhere(monkeypatch, masked_shop, client):
     """遮罩列起了中文别名（本仓库查询的惯例）：回答里引用到的格子、事件、回答文档、质询工件里都不露出原值。
     报告自己的查询没选手机号，原值哪里都认不出来，只能按 SQL 认出「手机号」就是 buyer_phone。"""

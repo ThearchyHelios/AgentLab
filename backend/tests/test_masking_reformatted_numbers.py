@@ -59,6 +59,17 @@ def test_a_long_number_in_another_shape_is_masked_in_prose(stored, written):
     assert secrets.scrub(f"客户{written}来电", prose=True) == f"客户{MASKED}来电"
 
 
+@pytest.mark.parametrize("text, shown", [
+    ("来自（19914742785），共 3 笔", f"来自（{MASKED}），共 3 笔"),
+    ("来自(+86 199 1474 2785)，共 3 笔", f"来自({MASKED})，共 3 笔"),
+    ("电话（+86）199 1474 2785。", f"电话{MASKED}。"),
+    ("（电话 199-1474-2785）", f"（电话 {MASKED}）"),
+])
+def test_brackets_around_a_number_are_kept_and_brackets_inside_it_are_replaced(text, shown):
+    """整个号码外面套着的一对括号是标点，留着；号码里的括号（区号、国家码）和号码一起换掉。"""
+    assert secrets_of([PHONE]).scrub(text, prose=True) == shown
+
+
 @pytest.mark.parametrize("text", [
     # 日期、时间、小数、千分位、更长的数里的一截、连字符连着的编号、别的号码
     "2026-10-06 19:14 下单", "金额 19914.74 元", "共 1,991,474 笔", "号码 1991474278512", "批次 19914742785-2",

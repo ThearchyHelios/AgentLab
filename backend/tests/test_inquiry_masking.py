@@ -1197,6 +1197,27 @@ def test_sql_check_excerpts_in_the_artifact_are_masked_like_the_sql():
          "sql_excerpt": "SUM(balance)"}]
 
 
+def test_check_excerpts_follow_the_sql_recorded_at_answer_time():
+    """agent 自己的查询快照查询时就遮好了，事后取质询工件时收不到遮罩列里的值：片段、说明照事件里记下的那条 SQL（回答时
+    按内存里的遮罩值换过）换——那条里整个换成「已遮罩」的字面量、换掉的那一截（LIKE 的 %…%），片段、说明里一样换。"""
+    sql = ("SELECT COUNT(*) AS 笔数 FROM sales WHERE buyer_phone = '13900000001' AND age = 25 "
+           "AND note LIKE '%13900000002%'")
+    recorded = "SELECT COUNT(*) AS 笔数 FROM sales WHERE buyer_phone = '已遮罩' AND age = 已遮罩 AND note LIKE '%已遮罩%'"
+    assert inquiry_mod._recorded_swaps(sql, recorded, "sqlite") == ({"13900000001", "25"}, {"13900000002"})
+    assert inquiry_mod._recorded_swaps(sql, sql, "sqlite") == (set(), set())
+    assert inquiry_mod._recorded_swaps(sql, recorded + " LIMIT 5", "sqlite") == (set(), set()), "对不上就不认"
+    checks = [{"code": "c1", "level": "warning", "table": "sales", "message": "没有码值「25」",
+               "sql_excerpt": "buyer_phone = '13900000001' AND age = 25"},
+              {"code": "c2", "level": "info", "table": "sales", "message": "按备注筛选",
+               "sql_excerpt": "note LIKE '%13900000002%'"}]
+    whole, pieces = inquiry_mod._recorded_swaps(sql, recorded, "sqlite")
+    assert inquiry_mod._masked_checks(checks, sql, inquiry_mod._Secrets(), set(), "sqlite", swapped=whole,
+                                      pieces=pieces) == [
+        {"code": "c1", "level": "warning", "table": "sales", "message": "没有码值「已遮罩」",
+         "sql_excerpt": "buyer_phone = '已遮罩' AND age = 已遮罩"},
+        {"code": "c2", "level": "info", "table": "sales", "message": "按备注筛选", "sql_excerpt": "note LIKE '%已遮罩%'"}]
+
+
 @pytest.mark.parametrize("sql, excerpt, shown", [
     # 片段只是一段表达式，单独拿出来认不出在找哪一个值：按整条 SQL 里换掉的字面量换
     ("SELECT SUM(CASE age WHEN 25 THEN balance END) AS 余额 FROM accounts",

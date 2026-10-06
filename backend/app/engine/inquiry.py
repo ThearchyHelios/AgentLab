@@ -12,7 +12,11 @@
    上传表格不算，见 _usable_sources）；上限按设置（每次的查询次数、时长，全局每日金额）。回答先给结论，数字只能引用 agent
    自己查询的格子，或者报告里已有的指标、运行输入；回答文档由 compose_doc 组装，裸数字被标出来（提问人自己写的数除外）。
    封存之后的追问查的是数据源现在的数据，任务里给报告生成的时间，回答末尾注明；触顶、查询失败、引用解析不了也在末尾注明
-3. 遮罩（_plan）：哪些列要遮照证据面板的规则（查询当时记下的，加上数据源现在设的），另按 SQL 认出改了名字的遮罩列
+3. 遮罩（_plan）：agent 的查询结果在核查 agent 的工具边界就遮好了（engine/masking.py 的 mask_query_result）：取自
+   遮罩列的格子交给模型、落进快照之前就是「已遮罩」，模型看不到遮罩值。这里是第二道防线：查询时遮掉的值由 verify_agent
+   交回（masked_values，只在内存里），连同报告自己快照里的遮罩值，照下面的办法按值遮；事后取质询工件时内存里的值已经
+   不在，SQL 检查结果照事件里记下的 SQL 换（_recorded_swaps）。
+   哪些列要遮照证据面板的规则（查询当时记下的，加上数据源现在设的），另按 SQL 认出改了名字的遮罩列
    （起别名、套函数、经子查询转一道、和 * 写在同一支里，_derived_hidden；认不出落在哪一列的，整份快照遮掉；按遮罩列
    分档、当分组键或套在汇总里数个数的不算，_band_only）；快照按列遮，再按值遮（别的列里写着遮罩值的格子，_masked_view；质询
    工件里，文字格里夹着的遮罩值另按子串换）。回答正文、查询清单里的遮罩值换成「已遮罩」（_Secrets、_scrub_sql）：
@@ -73,8 +77,10 @@
 - 质询工件里 SQL 检查结果的片段是检查器按语法树重新写出来的，按整条 SQL 里整个换掉了的字面量照值换：同一个值在
   片段里别处出现也换（多遮，算式里换掉的 0、1 这类也是）；截断处半截的值去掉（停在字符串、带引号的名字、注释里的，
   从开头的引号、注释起整个去掉）。说明里码值表列出的码值和别的字一样按值换，恰好是遮罩值的码值也换（多遮）
-- 运行详情的「工件」页签、通用的工件接口按工件原样给：质询的查询快照记在这次运行名下（同报告自己的查询快照），从
-  那里打开不经这里的遮罩
+- 运行详情的「工件」页签、通用的工件接口按工件原样给：质询的查询快照落库时就遮好了（工具边界先遮），从那里打开也
+  看不到取自遮罩列的值；但工具边界只认这份结果里的遮罩值，别的查询、报告快照里遮罩列的值写在这份结果没设遮罩的列里时
+  （没设遮罩的联系方式列、备注），从那里打开照原样（质询工件接口按回答时的办法换）。报告自己的查询快照（写作时的查询）
+  仍原样存着，从那里打开不经这里的遮罩
 - 遮罩值最多收 SECRETS_MAX 种写法，再多的按值认不出（按列遮照旧）
 - 换了写法的号码只认数字之间夹着一到三个空格、连字符、点、括号（含全角），带 +86 / 0086 / 86 前缀、全角数字：写成
   汉字（一三九……）、中间夹着别的字、拆成几处写的认不出；和别的数字只隔着一个连字符或点连着的（13900000001-2、
@@ -84,6 +90,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import itertools
 import logging
 import operator
@@ -91,7 +98,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
@@ -1618,13 +1625,15 @@ async def _source_kinds(names: Iterable[str]) -> dict[str, str | None]:
 
 async def _plan(own: dict[str, dict[str, Any]], others: list[dict[str, Any]], given: list[str | None],
                 shown: list[tuple[str, str, str]] | None = None, live: dict[str, list[str]] | None = None, *,
-                embedded: frozenset[str] = frozenset()) -> _Plan:
+                embedded: frozenset[str] = frozenset(), seen: _Secrets | None = None) -> _Plan:
     """own：agent 自己的查询快照（工件 id → 内容）；others：报告自己的查询快照（被问的那句可能直接写着遮罩列的值，
     agent 会照着复述、写进查询条件）；given：问题、选中的原文、报告里列出的指标和运行输入的值（都已经摆在读者眼前，
     里面的值哪里都不换）；shown：agent 执行的查询，(SQL, 数据源名, 快照工件 id)（照原样留在 SQL 里的阈值、LIMIT，
     回答正文里不换，见 _Secrets.show；取质询工件不用：快照里的格子照旧按值遮）；live：用得上的数据源现在设的遮罩列
     （快照没取到的查询按它认 SQL 里的比较，见 _compared）；embedded：这几份快照的文字格里夹着的遮罩值也按子串换
-    （只给要取的那份质询工件，见 _masked_view）。
+    （只给要取的那份质询工件，见 _masked_view）；seen：agent 查询时在工具边界遮掉的值（verify_agent 交回的
+    masked_values，只在内存里）。agent 自己的快照查询时就遮好了，遮罩列里收不到值；模型照着别处看到的号码写进回答、
+    查询条件时，按值遮要靠它认出来。
 
     查数据源的遮罩要读库，在这里读；解析 SQL、收上万个值、逐格比对是纯计算，放进线程：放在事件循环里会挡住同一进程
     里别的运行（同 tools/datasource 的 _sql_checks）。"""
@@ -1636,13 +1645,13 @@ async def _plan(own: dict[str, dict[str, Any]], others: list[dict[str, Any]], gi
     based = [(snapshot, (await _hidden_columns(snapshot, masks))[0]) for snapshot in others]
     kinds = await _source_kinds([*(str(s.get("source") or "") for s in [*own.values(), *others]),
                                  *(name for _, name, _ in shown)])
-    return await asyncio.to_thread(_settle_plan, own, named, based, kinds, given, shown, live or {}, embedded)
+    return await asyncio.to_thread(_settle_plan, own, named, based, kinds, given, shown, live or {}, embedded, seen)
 
 
 def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str], list[str]]],
                  based: list[tuple[dict[str, Any], set[str]]], kinds: dict[str, str | None],
                  given: list[str | None], shown: list[tuple[str, str, str]], live: dict[str, list[str]],
-                 embedded: frozenset[str]) -> _Plan:
+                 embedded: frozenset[str], seen: _Secrets | None = None) -> _Plan:
     secrets = _Secrets()
     hidden: dict[str, set[str]] = {}
     tainted: dict[str, set[str]] = {}
@@ -1654,6 +1663,7 @@ def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str]
         kind = kinds.get(str(snapshot.get("source") or ""))
         secrets.add(snapshot, _derived_hidden(snapshot, base, kind)[0], labels=_snapshot_labels(snapshot, kind),
                     base=base)
+    secrets.merge(seen)
     secrets.protect(given)
     secrets.show(_shown_literals([(sql, kinds.get(name), _compared(tainted, artifact, live, name))
                                   for sql, name, artifact in shown], secrets))
@@ -1755,7 +1765,8 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
         output_schema=INQUIRY_SCHEMA, max_queries=part.get("max_queries"), timeout_s=part.get("timeout_s"),
         daily_max_usd=settings.get("daily_max_usd"), run_id=op.run_id, data_versions=op.versions)
 
-    # 遮罩：agent 自己的查询快照、报告自己的查询快照（被问的那句可能直接写着遮罩列的值，agent 会照着复述）
+    # 遮罩：agent 自己的查询快照（查询时就遮好了，遮掉的值在 outcome.masked_values 里）、报告自己的查询快照（被问的
+    # 那句可能直接写着遮罩列的值，agent 会照着复述）
     own: dict[str, dict[str, Any]] = {}
     for query in outcome.queries:
         snapshot = _quiet_load(artifact_store.load, query.get("artifact"))
@@ -1765,7 +1776,7 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
               and _query_shaped(snapshot := _quiet_load(op.loader, entry.get("artifact")))]
     plan = await _plan(own, others, [ask.question, ask.quote, *_ref_values(refs)],
                        [(str(q.get("sql") or ""), str(q.get("source") or ""), str(q.get("artifact") or ""))
-                        for q in outcome.queries], live)
+                        for q in outcome.queries], live, seen=outcome.masked_values)
 
     text, doc_id, failed = "", None, None
     source = (outcome.rationale or {}).get("source") if outcome.result is not None else None
@@ -2059,22 +2070,57 @@ async def inquiry_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
     elif isinstance(shown.get("sql"), str):
         shown = {**shown, "sql": _scrub_sql(shown["sql"], plan.secrets, compared, kind)}
     if "checks" in shown:
-        shown = {**shown, "checks": _masked_checks(shown["checks"], content.get("sql"), plan.secrets, compared, kind)}
+        whole, pieces = _recorded_swaps(content.get("sql"), recorded, kind) if recorded is not None else (set(), set())
+        shown = {**shown, "checks": _masked_checks(shown["checks"], content.get("sql"), plan.secrets, compared, kind,
+                                                   swapped=whole, pieces=pieces)}
     out: dict[str, Any] = {"id": artifact_id, "content": shown, "masked": plan.masked[artifact_id]}
     if gone := plan.gone.get(artifact_id):
         out["mask_note"] = SOURCE_GONE.format(source="、".join(gone))
     return out
 
 
-def _masked_checks(checks: Any, sql: Any, secrets: _Secrets, compared: set[str], kind: str | None
+def _recorded_swaps(sql: Any, recorded: str, kind: str | None) -> tuple[set[str], set[str]]:
+    """回答时这条 SQL 里换掉的值：快照里原样的那条和事件里记下的那条（_scrub_sql 换过的）逐词对，原样那条里的字面量
+    到了记下的那条里整个换成了「已遮罩」的（第一项，字面量的字），或者其中一截换成了「已遮罩」的（第二项，那一截，
+    LIKE '%13900000001%' 这类）。_scrub_sql 只换字面量、名字和注释里的值，一个词换成一个词，两条分出来的词一一对得上；
+    对不上（分词出错这类）、没有记下的那条时，什么都不认。"""
+    if not isinstance(sql, str) or not sql.strip() or not recorded or sql == recorded:
+        return set(), set()
+    before, after = _sql_tokens(sql, kind), _sql_tokens(recorded, kind)
+    if before is None or after is None or len(before[0]) != len(after[0]):
+        return set(), set()
+    word = _masked_word()
+    whole: set[str] = set()
+    pieces: set[str] = set()
+    for old, kind_of, new in zip(before[0], before[1], after[0]):
+        if not _is_literal(kind_of) or old.text == new.text or word not in new.text:
+            continue
+        if new.text == word:
+            whole.add(old.text)
+            continue
+        for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old.text, new.text, autojunk=False).get_opcodes():
+            if op == "replace" and new.text[j1:j2] == word and old.text[i1:i2].strip():
+                pieces.add(old.text[i1:i2])
+    return whole, pieces
+
+
+def _masked_checks(checks: Any, sql: Any, secrets: _Secrets, compared: set[str], kind: str | None, *,
+                   swapped: set[str] | frozenset[str] = frozenset(), pieces: set[str] | frozenset[str] = frozenset()
                    ) -> list[dict[str, Any]]:
     """快照里记下的 SQL 检查结果（数据源查询工具对照数据目录查出的问题）交给质询工件的样子：字段照证据面板
     （_query_checks），给模型的那句改法不交出去——它照抄了 SQL 片段。片段（sql_excerpt）、说明（message）摘自、照引
     同一条 SQL（快照里原样的那条），照它在查询清单里的换法换掉遮罩值（_literal_swaps）：SQL 换了、片段和说明没换，
-    等于把换掉的值从旁边露出来；片段单拿出来认不出在找哪一个值，不能自己另认一遍。"""
+    等于把换掉的值从旁边露出来；片段单拿出来认不出在找哪一个值，不能自己另认一遍。
+    swapped / pieces：回答时这条 SQL 里整个换掉的字面量、换掉的一截（_recorded_swaps，照事件里记下的那条认）。回答时
+    agent 自己查询里遮掉的值还在内存里，事后取工件时已经不在了（快照查询时就遮好了，收不到值），照记下的 SQL 补上。"""
     from app.api.evidence import _query_checks
 
     whole = _literal_swaps(sql, secrets, compared, kind)
+    if swapped:
+        whole = (whole or set()) | set(swapped)
+    if pieces:
+        secrets = replace(secrets, strong=secrets.strong | set(pieces), weak=secrets.weak | set(pieces), _index=None,
+                          _compiled={})
     out: list[dict[str, Any]] = []
     for check in _query_checks({"checks": checks}):
         if isinstance(check.get("sql_excerpt"), str):

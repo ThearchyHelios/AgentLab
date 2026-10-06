@@ -2,18 +2,24 @@
 
 数据源在 options.mask_columns 里设了遮罩的列（手机号、姓名这类），证据面板按列名遮（api/evidence.py）。核查 agent
 （engine/verify_agent.py：双盲复算、反方审稿、审批质询共用）自己写 SQL，起别名、套函数、经子查询转一道，结果列名就
-对不上遮罩列；按值认又有门槛和写法的问题。认法集中在这里，审批质询（engine/inquiry.py）、双盲复算（nodes/dual_check.py，
-经 inquiry 的同名导出）共用：
+对不上遮罩列；按值认又有门槛和写法的问题。认法集中在这里，核查 agent 的查询工具（tools/datasource 的遮罩开关）、审批
+质询（engine/inquiry.py）、双盲复算（nodes/dual_check.py，经 inquiry 的同名导出）共用：
+
+- 工具边界先遮（mask_query_result）：核查 agent 的查询结果交给模型、落进快照之前，取自遮罩列的格子换成「已遮罩」，
+  同一份结果里别的文字格夹着的遮罩值也换掉。模型看不到遮罩值，就不会把它写进回答、理由、SQL——事后按值认每一轮
+  复核都找到新的漏法，根治靠这一步；审批质询回答里的按值遮降为第二道防线
 
 - 哪些列（_derived_hidden）：从遮罩列本身起，按 SQL 一层层认出值取自遮罩列的结果列（别名、函数、子查询、WITH、UNION 的
   另一支、和 * 写在同一支里没起别名的表达式）；COUNT 只数个数、窗口的分区键只决定次序、按遮罩列分档又当分组键或套在
   汇总里数个数的不算（_value_columns、_band_only）。认不出落在哪一列的、SQL 解析不了又写着遮罩列的，整份快照的列都算
 - 只装着分档标签的列（_label_columns）：标签是 agent 写在 SQL 里的字，不当遮罩值
 - 哪些值（_Secrets）：遮罩列里出现过的值，按值认有门槛（SECRET_MIN、SECRET_DIGITS），换的时候先按词、按开头几个字筛出
-  正文里真有的那几个值，不现编上万个分支的正则
+  正文里真有的那几个值，不现编上万个分支的正则；正文、文字格里换了写法的长号码（199-1474-2785、+86 …、全角数字）按
+  纯数字写法在集合里查（loose_spans）
 - 快照遮好的样子（_masked_view）
 
-这里的函数原来都在 engine/inquiry.py 里，名字不变，inquiry 照旧导出（别处按 inquiry 的名字引用）。
+除 mask_query_result、换了写法的号码之外，这里的函数原来都在 engine/inquiry.py 里，名字不变，inquiry 照旧导出（别处按
+inquiry 的名字引用）。
 """
 from __future__ import annotations
 
@@ -810,19 +816,17 @@ def _loose_whole(text: str, run: re.Match[str], groups: list[tuple[int, int, str
 
 
 def _loose_span(text: str, run: re.Match[str], groups: list[tuple[int, int, str]], i: int, j: int) -> tuple[int, int]:
-    """第 i 到第 j 截这个号码在 text 里换掉的那一段：从第一截到最后一截，从这一串开头起的连同前面的 + 和括号。括号配成
-    对：号码里有落单的左括号，紧跟着的右括号一起换掉；配不上的落单左括号留着不换（「（电话 199-1474-2785）」两个括号
-    都留着）；落单的右括号，紧挨在前面的左括号一起换掉（(199)1474-2785 从第二截起认出来时）。"""
+    """第 i 到第 j 截这个号码在 text 里换掉的那一段：从第一截到最后一截，紧挨在前面的 + 一起换。括号只换号码里的：号码
+    里有落单的右括号（(199)1474-2785、(+86)199…），把前面配对的左括号一起换掉；落单的左括号，把后面紧跟着的右括号一起
+    换掉。整个号码外面套着的一对括号是标点（「来自（13900000001）」），留着不换。"""
     start, end = groups[i][0], groups[j][1]
-    if i == 0:
-        start = run.start()
+    if i == 0 and start > run.start() and text[start - 1] in "+＋":
+        start -= 1
     depth = sum((c in _OPENS) - (c in _CLOSES) for c in text[start:end])
-    while depth > 0 and end < len(text) and text[end] in _CLOSES:
-        end, depth = end + 1, depth - 1
-    while depth > 0 and text[start] in _OPENS:
-        start, depth = start + 1, depth - 1
     while depth < 0 and start > 0 and text[start - 1] in _OPENS:
         start, depth = start - 1, depth + 1
+    while depth > 0 and end < len(text) and text[end] in _CLOSES:
+        end, depth = end + 1, depth - 1
     return start, end
 
 
@@ -844,8 +848,9 @@ def _pattern(value: str) -> str:
 
 @dataclass
 class _Secrets:
-    """遮罩列里出现过的值。模型看得到原始的查询结果（工具交回的是原样），回答里照着复述、或者把值写进查询条件，
-    都会把它带进回答正文和查询清单；按值找出来换成「已遮罩」。这只减少暴露，不是安全边界（同证据面板的遮罩）。
+    """遮罩列里出现过的值。模型照着报告正文、提问、别处的文字格里看到的值复述、或者把值写进查询条件，都会把它带进
+    回答正文和查询清单；按值找出来换成「已遮罩」。核查 agent 自己的查询结果在工具边界就遮好了（mask_query_result），
+    这里是第二道防线。这只减少暴露，不是安全边界（同证据面板的遮罩）。
 
     strong 是按值认得出的写法（够长的数、两个字以上的文字），正文、SQL 里的字面量、名字和注释、别的列里的格子、列名都按
     它换；weak 是遮罩列里的全部写法（含短的数），只用在 SQL 里和遮罩列做等值比较的字面量上；shown 是 SQL 里照原样
@@ -870,6 +875,8 @@ class _Secrets:
         written = {name: texts for name, texts in (labels or {}).items() if name not in own}
         columns = [str(c) for c in snapshot.get("columns") or []]
         index = [i for i, c in enumerate(columns) if c.lower() in hidden]
+        # 核查 agent 的查询快照在工具边界就遮好了（mask_query_result）：遮罩列的格子是「已遮罩」，不是遮罩值
+        word = _masked_word()
         for row in snapshot["rows"]:
             if len(self.weak) >= SECRETS_MAX:
                 break
@@ -880,7 +887,7 @@ class _Secrets:
             else:
                 continue
             for name, value in cells:
-                if value is None or isinstance(value, bool):
+                if value is None or isinstance(value, bool) or value == word:
                     continue
                 forms = _forms(value)
                 if forms & written.get(name, set()):
@@ -890,6 +897,18 @@ class _Secrets:
                     if _strong(form):
                         self.strong.add(form)
         self._index = None
+
+    def merge(self, other: _Secrets | None) -> None:
+        """并进另一份收好的遮罩值（核查 agent 查询时在工具边界遮掉的，见 mask_query_result）。合起来最多 SECRETS_MAX 种。"""
+        if other is None or not other.weak:
+            return
+        for form in other.weak:
+            if len(self.weak) >= SECRETS_MAX:
+                break
+            self.weak.add(form)
+            if form in other.strong:
+                self.strong.add(form)
+        self._index, self._compiled = None, {}
 
     def protect(self, texts: Iterable[str | None]) -> None:
         """已经摆在读者眼前的值不换：提问人自己写进问题、选中原文里的（「13900000001 这位客户」「排除 300 以下的」），
@@ -1039,8 +1058,8 @@ class _Secrets:
         return self._index
 
 
-def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, *, embedded: bool = False
-                 ) -> tuple[dict[str, Any], list[str]]:
+def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, *, embedded: bool = False,
+                 rename: bool = True) -> tuple[dict[str, Any], list[str]]:
     """一份查询快照遮好的样子和遮掉的列：要遮的列（hidden，小写）每一格都换成「已遮罩」、类型记成文本（渲染时不当数）；
     别的列里写着按值认得出的遮罩值的格子也换（另一张表里没设遮罩的同一个手机号、改了名字没认出来的遮罩列）。
     列名里写着遮罩值的（agent 把遮罩值写进了别名，「13900000001 的单」），列名也换（同 SQL 里的名字，_scrub_sql）。
@@ -1048,7 +1067,8 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
 
     embedded 只给质询工件用：别的列里一格文字夹着遮罩值（备注里写着手机号，换了写法的也算），把那一截换成「已遮罩」，
     这一格别的字照原样，门槛同整格（_Secrets.scrub）；这一列不记进遮掉的列——界面把记进去的列整列画成「已遮罩」，这一列在数据源
-    里也没设遮罩。回答一路不这样换：渲染出来露了就整份不交（_leaked），不然回答被问的那一格看着像查到了别的东西。"""
+    里也没设遮罩。回答一路不这样换：渲染出来露了就整份不交（_leaked），不然回答被问的那一格看着像查到了别的东西。
+    rename 为假时列名不换（工具边界先遮时：列名是模型自己写的，换了它引用的列名就对不上）。"""
     columns = [str(c) for c in snapshot.get("columns") or []]
     index = {i for i, c in enumerate(columns) if c.lower() in hidden}
     by_value = bool(secrets.strong)
@@ -1058,7 +1078,7 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     touched = set(index)
     edited = False
     position = {c: i for i, c in enumerate(columns)}
-    names = [secrets.scrub(c) for c in columns] if by_value else columns
+    names = [secrets.scrub(c) for c in columns] if by_value and rename else columns
 
     def cell(i: int | None, value: Any) -> Any:
         nonlocal edited
@@ -1097,3 +1117,53 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     types.update({names[i]: "text" for i in index})
     view = {**snapshot, "rows": rows, "column_types": types, **({"columns": names} if renamed else {})}
     return view, [names[i] for i in sorted(touched)]
+
+
+# --------------------------------------------------------------------------
+# 工具边界：查询结果交给核查 agent 之前先遮
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class QueryMask:
+    """一份查询结果在工具边界遮好的样子（mask_query_result）。
+
+    payload：遮好的结果，交给模型的、落进快照的都是它。columns：查询时就整列遮掉的结果列（结果里的列名，按先后）。
+    secrets：这份结果里遮掉的值，只在内存里交给调用方（审批质询按值遮的第二道防线：模型照着别处看到的号码写进回答、
+    查询条件时认得出），不进快照、不交给模型。"""
+
+    payload: dict[str, Any]
+    columns: list[str]
+    secrets: _Secrets
+
+
+def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str | None) -> QueryMask:
+    """一份查询结果（tools/datasource 的查询工具交回的样子：columns / rows / column_types / sql）在交给核查 agent、落进
+    快照之前先遮。masked 是数据源设了遮罩的列，kind 是数据源的类型（SQL 按它的方言解析）。
+
+    - 整列遮：列名直接对上遮罩列的，加上按 SQL 认出值取自遮罩列的（_derived_hidden：别名、函数、子查询、WITH、
+      SELECT *；COUNT、只在条件里用到、分档当分组键的不算）；SQL 解析不了、又写着遮罩列的，整份结果的列都遮。这几列的
+      格子换成「已遮罩」，类型记成文本
+    - 别的列：整格就是这份结果里某个遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，_Secrets.loose_spans）；
+      门槛同按值遮（SECRET_DIGITS、SECRET_MIN），只装着分档标签的列里的标签不算遮罩值
+    - 列名不换（模型自己写的，换了它引用的列名就对不上）；结果里一列都没取自遮罩列的原样交回：数值的汇总、只数个数的
+      查询不受影响
+
+    分析本身出了意外，整份结果的列都遮：这一步挡在模型前面，分析的缺陷不能把原值放过去（宁可多遮）。"""
+    base = {str(c).strip().lower() for c in masked if str(c).strip()}
+    columns = [str(c) for c in payload.get("columns") or []]
+    if not base or not columns or not _query_shaped(payload):
+        return QueryMask(payload, [], _Secrets())
+    try:
+        hidden, _ = _derived_hidden(payload, base, kind)
+        if not any(c.lower() in hidden for c in columns):
+            return QueryMask(payload, [], _Secrets())
+        secrets = _Secrets()
+        secrets.add(payload, hidden, labels=_snapshot_labels(payload, kind), base=base)
+        secrets.prepare()
+        view, _ = _masked_view(payload, hidden, secrets, embedded=True, rename=False)
+    except Exception:  # noqa: BLE001 - 认不准就整份遮掉，原值不交给模型
+        logger.warning("核查查询的遮罩分析出错，整份结果按遮罩处理", exc_info=True)
+        hidden, secrets = {c.lower() for c in columns}, _Secrets()
+        view, _ = _masked_view(payload, hidden, secrets, rename=False)
+    return QueryMask(view, [c for c in columns if c.lower() in hidden], secrets)
