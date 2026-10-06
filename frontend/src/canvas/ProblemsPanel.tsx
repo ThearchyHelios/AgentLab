@@ -13,7 +13,7 @@ import {
 import { PublishPreflightPane } from './PublishDialog'
 import { humanizeError } from '../lib/errors'
 import { formatShortcut } from '../lib/keys'
-import { PUBLISH_FIX_TEXT, UPGRADE_TEXT } from '../lib/terms'
+import { PROVIDER_REF_TEXT, PUBLISH_FIX_TEXT, UPGRADE_TEXT } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { EDIT_LOCK_TEXT, upgradeUnsaved, useEditLock, useStudio, type UpgradeFlow } from '../store/studio'
 import { Spinner, useRadioGroup } from '../components/ui'
@@ -232,7 +232,7 @@ function ProblemRow({ problem: p, active, onLocate, onDeleteEdge }: {
               aria-label={err ? '错误' : '提示'} />
         <span className={clsx('min-w-0 flex-1', err ? 'text-fg' : 'text-dim')}>{p.message}</span>
         {where && (
-          <span className="flex shrink-0 items-center gap-0.5 text-faint">
+          <span className="flex shrink-0 items-center gap-0.5 text-faint" data-problem-field="">
             <CornerDownRight size={9} aria-hidden />{where}
           </span>
         )}
@@ -615,13 +615,17 @@ function UpgradeValue({ value, field, nameOf, className, ...data }: {
   )
 }
 
-const SUB_LABEL: Record<string, string> = { condition: '的条件', key: '的标识', tools: '的工具', system: '的系统提示' }
+const SUB_LABEL: Record<string, string> = {
+  condition: '的条件', key: '的标识', tools: '的工具', system: '的系统提示', provider: PROVIDER_REF_TEXT.memberField,
+}
+/** 节点定义里没有、问题却会落上去的字段：点名的模型接入（多数节点的检查器里没有这一栏）。不写的话露出键名 */
+const FIELD_FALLBACK: Record<string, string> = { provider: PROVIDER_REF_TEXT.field }
 
 function fieldLabel(field: FieldRef | null | undefined, type?: string, config?: Record<string, any>): string {
   if (!field) return ''
   if (field.key === 'label') return '节点名称'
   const def = type ? NODE_DEFS[type as keyof typeof NODE_DEFS] : undefined
-  const base = def?.fields.find((f) => f.key === field.key)?.label ?? field.key
+  const base = def?.fields.find((f) => f.key === field.key)?.label ?? FIELD_FALLBACK[field.key] ?? field.key
   if (field.index == null) return base
   const sub = (field.sub && SUB_LABEL[field.sub]) || ''
   // 成员有名字就叫名字：「第 2 个成员」还得数，「成员 writer」一眼就知道是谁

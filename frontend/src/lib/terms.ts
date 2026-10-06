@@ -920,6 +920,26 @@ export const PUBLISH_FIX_TEXT = {
 } as const
 
 /**
+ * 点名的模型接入不存在或已停用（后端 providers/factory.named_provider、engine/provider_refs.py）。以前点名的接入不存在时
+ * 运行悄悄换成演示模型、点名停用的照常调用；现在运行照实报错，设置页、画布校验、发布前检查都提前说出来
+ */
+export const PROVIDER_REF_TEXT = {
+  /** 节点配置里 provider 这一项的叫法：多数节点的检查器里没有这一栏，问题面板、修复预览里照样要写得出来 */
+  field: '模型接入',
+  /** 协作成员、修复预览里点号后面那一段：「成员「分析师」的模型接入」「工作流默认设置 · 模型接入」 */
+  memberField: '的模型接入',
+  model: '模型',
+  judge: '结论句裁判',
+  /** 设置页那一格下面：存着的接入不存在、已停用时先说状态，再说这一项因此会怎样（各组自己的后果） */
+  missing: (name: string) => `模型接入「${name}」不存在`,
+  disabled: (name: string) => `模型接入「${name}」已停用`,
+  gateBroken: '门控模型无法调用，所有工具调用将转为人工审批',
+  judgeBroken: '裁判调用将失败，所有结论句记为未裁判',
+  // 和核查一组「不存在」那句（VERIFY_SETTING_TEXT.section.providerGone）同一个后果
+  verifyBroken: '核查调用将失败',
+} as const
+
+/**
  * 一键升级为可追溯结构（问题面板的快速修复、记录页的横幅）。和发布前修复同一套规矩：
  * 只出预览，人点「应用」才走现有的保存存成草稿；不发布
  */

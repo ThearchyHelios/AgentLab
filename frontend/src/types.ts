@@ -1384,6 +1384,8 @@ export interface PublishFix {
   code: string
   kind: 'auto' | 'choice' | 'assist'
   node_id?: string | null
+  /** 这条修复落在哪个字段：点名的模型接入一处一条（同一节点上的几处按它区分） */
+  field?: string | null
   label: string
   preview?: { field?: string | null; before?: unknown; after?: unknown } | null
   /** handoff：选了这一项就是「交给 Copilot」（G4 的「它在做计算」）。只认这个标记，不认值——

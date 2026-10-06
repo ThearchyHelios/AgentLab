@@ -272,12 +272,13 @@ const unsavedApply = (a: ApplyState) => a.status === 'failed' || (a.status === '
 const unsavedFix = (pf: PreflightState) => !!pf.apply && unsavedApply(pf.apply)
 
 /**
- * 节点 id → 名字和类型。跟着 issues 换新（改名、改配置之后校验都会重跑），不订阅 nodes：
- * 问题面板开着时拖一下节点，这一整块不必跟着每帧重渲染
+ * 节点 id → 名字、类型和配置。跟着 issues 换新（改名、改配置之后校验都会重跑），不订阅 nodes：
+ * 问题面板开着时拖一下节点，这一整块不必跟着每帧重渲染。配置给修复预览认列表里的那一项（成员「分析师」）
  */
-function useNodeLookup(): (id: string) => { label: string; type: string } | undefined {
+function useNodeLookup(): (id: string) => { label: string; type: string; config?: Record<string, any> } | undefined {
   const tick = useStudio((s) => s.issues)
-  const map = useMemo(() => new Map(useStudio.getState().nodes.map((n) => [n.id, { label: n.data.label, type: n.data.nodeType }])),
+  const map = useMemo(() => new Map(useStudio.getState().nodes.map((n) => [n.id,
+    { label: n.data.label, type: n.data.nodeType, config: n.data.config }])),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tick])
   return useCallback((id: string) => map.get(id), [map])
@@ -544,7 +545,8 @@ export function Preflight({ pf, gate, onLocate, stale }: {
       )}
 
       {pf.preview && <FixPreview pf={pf} labelOf={labelOf} nameOf={nameOf}
-                                 typeOf={(id) => (id ? nodeOf(id)?.type : undefined)} />}
+                                 typeOf={(id) => (id ? nodeOf(id)?.type : undefined)}
+                                 configOf={(id) => (id ? nodeOf(id)?.config : undefined)} />}
       {/* 修复落到画布上却没存上，预览又已经收起了（换过等级）：「重试保存」照样得在 */}
       {pf.preview?.status !== 'ready' && unsavedFix(pf) && <SaveTrouble pf={pf} />}
 
@@ -656,9 +658,11 @@ function FixControl({ fix, pf }: { fix: PublishFix; pf: PreflightState }) {
 }
 
 /** 修复预览：逐项「节点 · 字段：原值 → 新值」，没采用的写原因，Copilot 的问题原样摆出来 */
-function FixPreview({ pf, labelOf, nameOf, typeOf }: {
+function FixPreview({ pf, labelOf, nameOf, typeOf, configOf }: {
   pf: PreflightState; labelOf: (id?: string | null) => string; nameOf: NodeNameOf
   typeOf: (id?: string | null) => string | undefined
+  /** 列表里的某一项（agents[0]、fields[1]）写那一项的名字，不写「第 1 项」 */
+  configOf?: (id?: string | null) => Record<string, any> | undefined
 }) {
   const dirty = useStudio((s) => s.dirty)
   const p = pf.preview!
@@ -703,7 +707,7 @@ function FixPreview({ pf, labelOf, nameOf, typeOf }: {
         <ul className="space-y-1" data-fix-changes="">
           {result.changes.map((c, i) => {
             const where = c.node_title || labelOf(c.node_id) || T.whole
-            const field = fixFieldLabel(c.field, typeOf(c.node_id))
+            const field = fixFieldLabel(c.field, typeOf(c.node_id), configOf?.(c.node_id))
             return (
               <li key={i} className="leading-snug" data-fix-change={c.fix_id}>
                 <span className="[overflow-wrap:anywhere]">

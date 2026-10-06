@@ -1447,7 +1447,8 @@ await section('studio', '报告撰写节点：画布认得、检查器能配（R
   check('……null 写「不限」（没写才是「（空）」）、金额带单位', previews[1] === '不限' && previews[2] === '0.05 美元', JSON.stringify(previews.slice(1, 3)))
   check('……补预算按整份 judge 记时一键一行', previews[3] === '裁判模型：x；金额上限（美元）：不限', previews[3])
   check('……证据相矛盾时写选项文字', previews[4] === '不予出具', previews[4])
-  check('……别处的 model 不借用裁判的叫法', previews[5] === '工作流默认设置 · model', previews[5])
+  // 不借「裁判模型」，写通用的「模型」（以前露键名 model；点名接入的修复会清掉全图默认里的模型，预览里要写得出叫法）
+  check('……别处的 model 不借用裁判的叫法', previews[5] === '工作流默认设置 · 模型', previews[5])
   if (SHOTS) {
     await jf.scrollIntoViewIfNeeded()
     for (const theme of ['dark', 'light']) {
