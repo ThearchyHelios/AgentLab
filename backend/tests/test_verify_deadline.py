@@ -5,6 +5,10 @@
   运行时长上限将至，不说「每句时长上限 90 秒」；接着运行时取 checkpoint 里的审稿，不重审
 - 双盲复算：同理，没来得及开始的盲算按无法复算记（照现有的路径记缺口）；收紧过的时长到点也按无法复算记，不发提醒
   调高上限的 dual_check_limit；审批恢复后重放，盲算不再执行、哪几项没来得及照旧
+- 因运行时长上限将至没核成的，时间线另起一条、带 cause: run_deadline 和这一段的总时长（run_seconds）：界面据此说清
+  原因、给对的下一步（调高核查自己的上限只会更快撞线，检查模型、数据源也无济于事），不和别的原因混在一条里、被「等」
+  盖掉；收紧过的核查 agent 自己发的 verify_limit 也改说运行时长上限将至
+- 下游还有写报告这类要调模型的节点时，核查给它们多留一份余量：双盲复算后面接着写报告，运行不在写报告时被中止
 - 时间充裕时（默认 600 秒的一段）时长上限照传原值：和没有这道检查时一样
 
 两种钟：精确的计数用假的钟（每派出一项就把 allot() 看到的钟往前拨若干秒，真实只过去几毫秒，runner 的 asyncio.timeout
@@ -24,10 +28,11 @@ from app.core import artifact_store
 from app.core.config import settings
 from app.db.base import SessionLocal
 from app.db.models import Approval, Run
-from app.engine import deadline, verify_agent
+from app.engine import compiler, deadline, verify_agent
 from app.engine.nodes import challenge as challenge_mod
 from app.engine.nodes import dual_check as dual_check_mod
 from app.engine.runner import run_manager, verify_manifest
+from app.engine.schema import NodeType
 from app.main import app
 from app.providers.mock_model import MockChatModel
 from tests.fixtures.dual_check_shop import WEEK, Blind, add_source, build
@@ -116,6 +121,7 @@ async def test_five_claims_with_time_for_two_review_two(monkeypatch, shop):
 
     [warn] = await logs(row.id, "challenge_unreviewed")
     assert warn["claims_skipped"] == 3 and warn["reason"] == LATE_REST
+    assert warn["cause"] == deadline.RUN_DEADLINE and warn["run_seconds"] == 600, "界面按 cause 说原因、给下一步"
     assert warn["message"] == f"反方审稿有 3 句结论未能反查，已记为无法判断：{LATE_REST}"
     assert await logs(row.id, "challenge_limit") == [], "没有哪一句触了自己的上限"
     [done] = await logs(row.id, "challenge_done")
@@ -137,13 +143,52 @@ async def test_a_claim_squeezed_by_the_deadline_says_so(monkeypatch, shop):
 
     [limit] = await logs(row.id, "challenge_limit")
     assert limit["limit"] == "timeout_s" and limit["claims_skipped"] == 0
+    assert limit["cause"] == deadline.RUN_DEADLINE and limit["run_seconds"] == 600 and limit["claims"] == 1, \
+        "界面认 cause：不叫人调高每句的上限"
     assert "本次运行即将达到 600 秒的时长上限" in limit["message"] and "收紧" in limit["message"]
     assert "每句时长上限" not in limit["message"]
     out = await output_of(row.id, "chal")
     assert out["counts"]["refuted"] == 1, "收紧后按查到的结果收尾：反方给的结论照常采信"
     assert out["unreviewed"] == 3
     [warn] = await logs(row.id, "challenge_unreviewed")
-    assert warn["claims_skipped"] == 3
+    assert warn["claims_skipped"] == 3 and warn["cause"] == deadline.RUN_DEADLINE
+
+
+async def test_the_run_deadline_gets_its_own_line(monkeypatch, shop):
+    """第 1 句反查一条查询都没执行成功（另一个原因），第 3 句起来不及审：时间线两条 challenge_unreviewed，各说各的原因。
+    运行时长上限将至的那条带 cause，不被前一句的原因盖掉、藏进「等」里——界面也就不会为了它叫人去查模型和数据源。"""
+    plays = dict(FIVE_PLAYS)
+    plays["居各区域之首"] = Play([], "weakened", "没有查询。")
+    models = Models(monkeypatch, shop, writer=(FIVE,), plays=plays)
+    Ticker(monkeypatch, challenge_mod, step=250)
+    row = await finish(graph(shop))
+    assert row.status == "succeeded", row.error
+    assert models.reviewed() == ORDER[:2]
+    out = await output_of(row.id, "chal")
+    assert out["unreviewed"] == 4 and out["counts"]["inconclusive"] == 4
+
+    other, late = await logs(row.id, "challenge_unreviewed")
+    assert other["claims_skipped"] == 1 and other["reason"] == "反查没有执行成功任何查询" and "cause" not in other
+    assert other["message"] == "反方审稿有 1 句结论未能反查，已记为无法判断：反查没有执行成功任何查询"
+    assert late["claims_skipped"] == 3 and late["reason"] == LATE_REST
+    assert late["cause"] == deadline.RUN_DEADLINE and late["run_seconds"] == 600
+    assert late["message"] == f"反方审稿有 3 句结论未能反查，已记为无法判断：{LATE_REST}"
+
+
+async def test_its_own_limit_and_the_run_deadline_are_told_apart(monkeypatch, shop):
+    """第 1 句触了自己的每句时长上限（90 秒，没收紧），第 2 句的时长按剩余时间收紧后也到了点：两条 challenge_limit 都是
+    timeout_s，只有收紧的那条带 cause——时间线上不是两行一样的「反方审稿已达时长上限」，叫人调高每句上限的只有第 1 条。"""
+    Models(monkeypatch, shop, writer=(FIVE,), plays=FIVE_PLAYS)
+    ticker = Ticker(monkeypatch, challenge_mod, step=440, hit=lambda timeout: True)
+    row = await finish(graph(shop))
+    assert row.status == "succeeded", row.error
+    first, second = ticker.timeouts
+    assert first == 90 and second < 90, ticker.timeouts
+    own, squeezed = await logs(row.id, "challenge_limit")
+    assert own["limit"] == squeezed["limit"] == "timeout_s"
+    assert "cause" not in own and "每句时长上限 90 秒" in own["message"]
+    assert squeezed["cause"] == deadline.RUN_DEADLINE and squeezed["run_seconds"] == 600 and squeezed["claims"] == 1
+    assert "每句时长上限" not in squeezed["message"]
 
 
 async def test_no_time_at_all_reviews_nothing_but_finishes(monkeypatch, shop):
@@ -156,7 +201,7 @@ async def test_no_time_at_all_reviews_nothing_but_finishes(monkeypatch, shop):
     out = await output_of(row.id, "chal")
     assert out["counts"] == {"stands": 0, "weakened": 0, "refuted": 0, "inconclusive": 5} and out["unreviewed"] == 5
     [warn] = await logs(row.id, "challenge_unreviewed")
-    assert warn["claims_skipped"] == 5 and "剩下 5 句未审" in warn["reason"]
+    assert warn["claims_skipped"] == 5 and "剩下 5 句未审" in warn["reason"] and warn["cause"] == deadline.RUN_DEADLINE
     assert row.output["_issuance"]["tier"] == "formal"
 
 
@@ -215,7 +260,13 @@ async def test_a_slow_review_no_longer_aborts_the_run(monkeypatch, shop):
     assert out["unreviewed"] == len(late)
     [warn] = await logs(row.id, "challenge_unreviewed")
     assert warn["claims_skipped"] == len(late) and f"剩下 {len(late)} 句未审" in warn["reason"]
-    assert "本次运行即将达到 7 秒的时长上限" in warn["reason"]
+    assert "本次运行即将达到 7 秒的时长上限" in warn["reason"] and warn["cause"] == deadline.RUN_DEADLINE
+    # 核查 agent 到点自己也发 verify_limit：时长收紧过的那几句说运行时长上限将至，写的秒数不会是一个和设置对不上的数
+    for said in await logs(row.id, "verify_limit"):
+        if said.get("cause") == deadline.RUN_DEADLINE:
+            assert "本次运行即将达到 7 秒的时长上限，时长已按剩余时间收紧到" in said["message"] and said["run_seconds"] == 7
+        else:
+            assert "时长上限 1.5 秒" in said["message"] or said["limit"] != "timeout_s", said
 
 
 # --------------------------------------------------------------------------
@@ -289,8 +340,29 @@ async def test_five_metrics_with_time_for_two_check_two(monkeypatch, orders):
 
     [unchecked] = await logs(row.id, "dual_check_unchecked")
     assert unchecked["metrics"] == [{"id": m, "name": NAMES[m], "reason": LATE_BLIND} for m in ("buyers", "top", "low")]
+    assert unchecked["cause"] == deadline.RUN_DEADLINE and unchecked["run_seconds"] == 600, "界面按 cause 说原因、给下一步"
+    assert unchecked["message"] == ("本次运行即将达到 600 秒的时长上限，为保证运行按时完成，双盲复算有 3 个指标未能复算："
+                                    "「付款客户数」「最大单笔」「最小单笔」，按无法复算计入缺口")
     assert await logs(row.id, "dual_check_limit") == []
     assert (await verify_manifest(row.id))["ok"] is True
+
+
+async def test_blind_checks_cut_by_the_deadline_get_their_own_line(monkeypatch, orders):
+    """「订单数」的盲算没查到这个数（另一个原因），后 3 项来不及开始：时间线两条 dual_check_unchecked。运行时长上限将至的
+    那条带 cause、只列那 3 项，界面据此说原因、给下一步；另一条照旧，不带 cause。"""
+    Blind(monkeypatch, orders, {name: plan for name, plan in PLANS.items() if name != "订单数"})
+    Ticker(monkeypatch, verify_agent, step=260)
+    row = await dual_run(dual_graph(orders))
+    assert row.status == "succeeded", row.error
+    out = await output_of(row.id, "dual")
+    assert unchecked_reasons(out) == {"orders": "盲算没有查到这个数", "buyers": LATE_BLIND, "top": LATE_BLIND,
+                                      "low": LATE_BLIND}
+    other, late = await logs(row.id, "dual_check_unchecked")
+    assert other["metrics"] == [{"id": "orders", "name": "订单数", "reason": "盲算没有查到这个数"}] and "cause" not in other
+    assert other["message"] == "双盲复算未能核对 1 个指标：「订单数」（盲算没有查到这个数），按无法复算计入缺口"
+    assert late["cause"] == deadline.RUN_DEADLINE and late["run_seconds"] == 600
+    assert [m["id"] for m in late["metrics"]] == ["buyers", "top", "low"]
+    assert all(m["reason"] == LATE_BLIND for m in late["metrics"])
 
 
 async def test_no_time_for_even_the_first_blind_check(monkeypatch, orders):
@@ -323,6 +395,28 @@ async def test_a_blind_check_squeezed_by_the_deadline_says_so(monkeypatch, order
     assert "每项时长上限" not in reasons["orders"]
     assert {reasons[m] for m in ("buyers", "top", "low")} == {LATE_BLIND}
     assert await logs(row.id, "dual_check_limit") == []
+    [unchecked] = await logs(row.id, "dual_check_unchecked")
+    assert unchecked["cause"] == deadline.RUN_DEADLINE and [m["id"] for m in unchecked["metrics"]] == \
+        ["orders", "buyers", "top", "low"], "收紧后到点的和没来得及开始的是同一个原因：一条说完"
+
+
+def dual_report_graph(source: str) -> dict:
+    """取数 → 口径卡 → 双盲复算 → 写报告 → 成果：Copilot 指南里的惯常接法，双盲复算下游还有一次写报告的模型调用。"""
+    nodes = dual_graph(source)["nodes"]
+    nodes.insert(4, node("write", "report", "写周报", instructions="写周报"))
+    return {"nodes": nodes, "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}
+
+
+@pytest.mark.parametrize("build, low, high", [(dual_graph, 100, 110), (dual_report_graph, 40, 50)])
+async def test_a_report_downstream_gets_its_share(monkeypatch, orders, build, low, high):
+    """第 3 项开始时只剩约 200 秒：下游只有成果节点时留 60 秒余量，这一项还能查 110 秒左右；下游还要写报告时再给它留
+    60 秒，这一项只查 50 秒左右——双盲复算用到最后一刻的话，写报告那次模型调用一慢，整次运行照样被中止。"""
+    Blind(monkeypatch, orders, PLANS)
+    ticker = Ticker(monkeypatch, verify_agent, step=200)
+    row = await dual_run(build(orders))
+    assert row.status == "succeeded", row.error
+    first, second, third = ticker.timeouts
+    assert first == second == 120 and low < third < high, ticker.timeouts
 
 
 async def test_resuming_after_the_review_replays_the_blind_checks(monkeypatch, orders):
@@ -383,3 +477,36 @@ async def test_slow_blind_checks_no_longer_abort_the_run(monkeypatch, orders):
         "一项接一项：来得及的在前"
     [unchecked] = await logs(row.id, "dual_check_unchecked")
     assert {m["id"] for m in unchecked["metrics"]} == set(reasons)
+
+
+async def test_a_slow_report_after_the_blind_checks_still_finishes(monkeypatch, orders):
+    """真的钟：双盲复算 → 写报告 → 成果，这一段只有 10 秒。盲算一项接一项，每项都查到时长用完（查不完的查询）；写报告要
+    3 秒。双盲复算给下游的写报告多留了一份余量（4 秒），收尾之后报告写得完，运行照常完成——只留一份（2 秒）的话，盲算
+    用到最后，报告写到一半整次运行就被中止。几项来得及随机器快慢变，只断言不变的。"""
+    monkeypatch.setattr(settings, "max_run_seconds", 10)
+    monkeypatch.setattr(deadline, "RESERVE_S", 2.0)
+    monkeypatch.setattr(verify_agent, "SETTLE_GRACE_S", 0.4)
+    monkeypatch.setattr(dual_check_mod, "BLIND_CONCURRENCY", 1)
+
+    async def slow_model(session, spec):
+        return MockChatModel(model_name="slow-verify", latency=0.1), "slow-verify"
+
+    monkeypatch.setattr(verify_agent, "get_chat_model", slow_model)
+    endless = [f"SELECT COUNT(*) AS blind_v FROM orders WHERE id > {i}" for i in range(300)]
+    Blind(monkeypatch, orders, {name: (endless, "blind_v") for name in NAMES.values()})
+    wrote: list[float] = []
+
+    async def slow_report(state, ctx):
+        await asyncio.sleep(3.0)
+        wrote.append(asyncio.get_running_loop().time())
+        return {}
+
+    monkeypatch.setitem(compiler.RUNNERS, NodeType.REPORT, slow_report)
+    row = await dual_run(dual_report_graph(orders),
+                         options={"verify": {"dual_check": {"timeout_s": 3, "max_queries": None}}})
+    assert row.status == "succeeded", row.error
+    assert "时长上限，已中止" not in (row.error or "")
+    assert len(wrote) == 1, "报告写完了"
+    out = await output_of(row.id, "dual")
+    reasons = unchecked_reasons(out)
+    assert any("本次运行即将达到 10 秒的时长上限" in why for why in reasons.values()), reasons
