@@ -16,11 +16,12 @@
    （起别名、套函数、经子查询转一道、和 * 写在同一支里，_derived_hidden；认不出落在哪一列的，整份快照遮掉；按遮罩列
    分档、当分组键或套在汇总里数个数的不算，_band_only）；快照按列遮，再按值遮（别的列里写着遮罩值的格子，_masked_view；质询
    工件里，文字格里夹着的遮罩值另按子串换）。回答正文、查询清单里的遮罩值换成「已遮罩」（_Secrets、_scrub_sql）：
-   按值认有门槛，agent 写在 SQL 里的分档标签不算遮罩值（_written_labels）；SQL 里的字面量按语法树认用在哪
-   （_literal_uses），数字照原样留着的只有范围比较的边界（没把某一个值夹住的，_pinned）和 LIMIT 的行数，而且同一个数
-   在这条 SQL 别处没被换掉，封存的是实际执行的语句；在找某一个值的（等值、IN、简单 CASE、夹住某一个值的范围……）和
-   别处够长的遮罩值都换。已经摆在读者眼前的值不换：问题和选中原文里的、报告列出的指标和运行输入的值；SQL 里照原样
-   留着的阈值只在回答正文里不换，格子照旧换。组装之后还认得出遮罩值的，这份回答不交出去
+   按值认有门槛，只装着分档标签的列（agent 写在 SQL 里的标签）不收进遮罩值（_label_columns）；SQL 里的字面量按语法树
+   认用在哪（_literal_uses），数字照原样留着的只有范围比较的边界（没把某一个值夹住的，_pinned）和 LIMIT 的行数，而且
+   同一个数在这条 SQL 别处没被换掉，封存的是实际执行的语句；在找某一个值的（等值、IN、简单 CASE、夹住某一个值的
+   范围……，值换个写法、写成几个数的算式也认）和别处够长的遮罩值都换。已经摆在读者眼前的值不换：问题和选中原文里的、
+   报告列出的指标和运行输入的值；SQL 里照原样留着的阈值只在回答正文里不换，格子照旧换。组装之后还认得出遮罩值的，
+   这份回答不交出去
 4. 写入（_record）：一条 approval.inquiry 事件，node_id 为空，用量写在数据的 usage 里（计进运行用量，见 runner 的
    _usage_of_events）。质询的查询快照只放在 inquiry_artifacts / queries 里，绝不放在 query_artifact 下：证据接口按那个键
    收集封存的查询，会把质询的查询当成报告的证据。回答期间运行状态变了（被批准、被放弃、继续运行之后重新封存），
@@ -42,16 +43,27 @@
   汇总里套着结果全是写死常量的 CASE（SUM(CASE WHEN amount <= 20000 THEN 1 ELSE 0 END)）只是按条件数个数，同 COUNT
 - 按遮罩列分档的标签（CASE、IIF 的结果全是写死的常量）：标签文字是 agent 写在 SQL 里的，不当遮罩值，SQL、回答正文里
   照原样；标签列当分组键（每一档一行）照常显示，不分组的逐行标签列整列遮（格子里看不出某一笔落在哪一档），可 agent
-  在正文里写出「这一笔是大单」遮不住，按 id 分组再按档数个数也看得出（同按阈值查出某几行）
-- 「夹住某一个值」（_pinned）在整条 SQL 里认，只有 CASE 的不同分支、SELECT 里不筛行的不同项（选出列、GROUP BY、
-  ORDER BY）、UNION 的不同支各算各的，两头误差都有：把找值拆进这几处（CASE WHEN age > 25 THEN … ELSE CASE WHEN
-  age >= 25 …，两个选出列 SUM(age >= 25)、SUM(age > 25) 再自己相减）认不出，边界照原样留着，正文里复述也不遮；反过来，
-  不在同一个条件里的两边只要不是这几处就按夹住算，分档写成两个 CTE、FROM 里的两个子查询再连起来，或者同一个选出列
-  里把两档的汇总值算在一起（小单数 / 大单数）时，共用的边界会多遮。同一个条件里细看合起来的真假，整数上的半开、开区间
-  （col >= v AND col < v + 1）只在整个条件只认 v 时算，被更宽的范围吸收、和相邻的分档连成一段的不算；细看的步数有
-  上限（PIN_WORK），超出之后两边都隔开的一律按夹住算，分档很多时会成批多遮
+  在正文里写出「这一笔是大单」遮不住，按 id 分组再按档数个数也看得出（同按阈值查出某几行）。只有只装着标签的列不收
+  （选出项本身就是这样的 CASE / IIF，或者经别名、子查询原样传下去的），同一个名字在哪一处装着别的就照收；标签恰好和
+  别的列里的遮罩值相同时，正文里的档名、SQL 里写成字符串的标签也换（多遮）
+- 「夹住某一个值」（_pinned）：范围比较在整条 SQL 里配对，只有 CASE 的不同分支、SELECT 里不筛行的不同项（选出列、
+  GROUP BY、ORDER BY）、UNION 的不同支各算各的，两头误差都有：把找值拆进这几处（CASE WHEN age > 25 THEN … ELSE CASE
+  WHEN age >= 25 …，两个选出列 SUM(age >= 25)、SUM(age > 25) 再自己相减）认不出，边界照原样留着，正文里复述也不遮；
+  反过来，不在同一个条件里的两边只要不是这几处就按夹住算，分档写成两个 CTE、FROM 里的两个子查询再连起来，或者同一个
+  选出列里把两档的汇总值算在一起（小单数 / 大单数）时，共用的边界会多遮。同一个条件里细看合起来的真假，整数上的半开、
+  开区间（col >= v AND col < v + 1）、两头不是整数的（col > v - 0.5 AND col < v + 0.5）只在整个条件只认 v 时算，被
+  更宽的范围吸收、和相邻的分档连成一段的不算。不等、NOT IN 只在同一个条件里和范围合起来看（age >= 25 AND age <= 26
+  AND age <> 26 只认 25；age <= 30 时 27 也成立，不算），拆进别的条件（子查询、HAVING）认不出；整数上紧挨着 v 的一串
+  被排除的数最多越过 PAIR_MAX 个，再多就按夹住算（多遮）。细看的步数有上限（PIN_WORK），超出之后两边都有范围比较
+  隔开的一律按夹住算，分档很多时会成批多遮
+- 找某一个值的写法按语法树认常见的几种：等值、IN、简单 CASE、把它夹住的范围，被比较的一边套了 CAST、函数、汇总
+  （CAST(age AS INTEGER) = 25、HAVING MAX(age) BETWEEN 25 AND 25），值换个写法（25.0、025、2.5e1）、写成几个数的
+  算式（13900000000 + 1、BETWEEN 20 + 5 AND 30 - 5，算式里的数都换）。更绕的写法认不出：值藏进和列一起算的算式
+  （age - 25 = 0、buyer_phone - 1 = 13900000000）、拼接（'1390' || '0000001'）、函数拼出来的值（REPLACE、SUBSTR），
+  短的值照原样封存，长号码只在整个写出来时按值换
 - 质询工件里 SQL 检查结果的片段是检查器按语法树重新写出来的，按整条 SQL 里整个换掉了的字面量照值换：同一个值在
-  片段里别处出现也换（多遮）；截断处半截的值去掉
+  片段里别处出现也换（多遮，算式里换掉的 0、1 这类也是）；截断处半截的值去掉（停在字符串、带引号的名字、注释里的，
+  从开头的引号、注释起整个去掉）。说明里码值表列出的码值和别的字一样按值换，恰好是遮罩值的码值也换（多遮）
 - 运行详情的「工件」页签、通用的工件接口按工件原样给：质询的查询快照记在这次运行名下（同报告自己的查询快照），从
   那里打开不经这里的遮罩
 - 遮罩值最多收 SECRETS_MAX 种写法，再多的按值认不出（按列遮照旧）
@@ -70,7 +82,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 from sqlalchemy import func, select
@@ -735,10 +747,14 @@ def _band_only(node: Any) -> bool:
     return False
 
 
-def _written_labels(sql: Any, kind: str | None) -> set[str]:
-    """SQL 里 CASE、IIF 写死的结果（分档的标签、档位编号）在格子里的写法。它们是 agent 自己写在 SQL 里的字，不是数据源
-    里的值：派生列里出现了也不当遮罩值（_Secrets.add），不然 SQL 里的标签、回答正文里的档名都会被换成「已遮罩」。
-    解析不了的一个都不算。"""
+def _label_columns(sql: Any, kind: str | None, columns: list[str]) -> dict[str, set[str]]:
+    """结果里只装着分档标签的列：列名（小写）→ 标签在格子里的写法。标签（CASE、IIF 写死的结果，分档的名字、档位编号）
+    是 agent 自己写在 SQL 里的字，不是数据源里的值：这几列派生自遮罩列也不收进遮罩值（_Secrets.add），不然 SQL 里的
+    标签、回答正文里的档名都会被换成「已遮罩」。
+    只装着标签：这一列的选出项本身是结果全为写死常量的 CASE / IIF，或者经别名、子查询、CTE 原样传下去的这样一列
+    （_label_texts）；同一个名字在哪一处装着别的（vip_level AS 等级、UNION 另一支取的是遮罩列），就不算——改了名字的
+    遮罩列的 1、2、3 撞上同一条 SQL 里按条件数个数的 THEN 1 ELSE 0，照样是遮罩值。没起别名的标签列按位置认（每一支的
+    那一项都是标签）。解析不了的一个都不算（标签照旧当遮罩值，宁可多遮）。"""
     from sqlglot import exp
 
     from app.data.sql_semantics import _parse, _read
@@ -748,16 +764,69 @@ def _written_labels(sql: Any, kind: str | None) -> set[str]:
     except Exception:  # noqa: BLE001 - 解析器的意外按解析不了处理（标签照旧当遮罩值，宁可多遮）
         root = None
     if root is None:
-        return set()
-    out: set[str] = set()
-    for node in root.find_all(exp.Case, exp.If):
-        for result in _branch_results(node) or []:
+        return {}
+    try:
+        items = [item for select in root.find_all(exp.Select) for item in select.expressions]
+        # 先当每个名字都只装着标签，再去掉装着别的，直到不再变：名字一层层往下传，先认哪一层说不准
+        known: dict[str, set[str]] = {name: set() for item in items if (name := _output_name(item))}
+        for _ in range(len(items) + 2):
+            found: dict[str, set[str]] = {}
+            spoiled: set[str] = set()
+            for item in items:
+                if not (name := _output_name(item)):
+                    continue
+                texts = _label_texts(item, known)
+                if texts is None:
+                    spoiled.add(name)
+                else:
+                    found.setdefault(name, set()).update(texts)
+            found = {name: texts for name, texts in found.items() if name not in spoiled}
+            if found == known:
+                break
+            known = found
+        out = {c.lower(): known[c.lower()] for c in columns if c.lower() in known}
+        width = len(columns)
+        for top, role, _listed in _blocks(root):
+            if role != "result":
+                continue
+            branches = _branches(top)
+            seen: dict[int, list[set[str] | None]] = {}
+            for branch in branches:
+                for item, place in zip(branch, _places(branch, width)):
+                    if place is not None and place < width:
+                        seen.setdefault(place, []).append(_label_texts(item, known))
+            for place, texts in seen.items():
+                if len(texts) == len(branches) and all(t is not None for t in texts):
+                    out.setdefault(columns[place].lower(), set()).update(*texts)
+        return out
+    except Exception:  # noqa: BLE001 - 分析本身的缺陷不能让回答出错：一个都不算（宁可多遮）
+        logger.warning("质询的 SQL 标签列分析失败", exc_info=True)
+        return {}
+
+
+def _label_texts(item: Any, known: dict[str, set[str]]) -> set[str] | None:
+    """一个选出项只装着标签时，标签在格子里的写法：结果全为写死常量的 CASE / IIF 取它的各个结果（数按两种写法：25、
+    25.0），单独一列、名字在 known 里（经别名、子查询传下来的标签列）取那一列的；不是为 None。"""
+    from sqlglot import exp
+
+    node = item
+    while isinstance(node, (exp.Alias, exp.Paren)):
+        node = node.this
+    results = _branch_results(node)
+    if results is not None:
+        if not all(_fixed(r) for r in results):
+            return None
+        out: set[str] = set()
+        for result in results:
             value = _constant(result) if result is not None else None
             if isinstance(value, Decimal):
                 out |= {_point_text(value), format(value, "f")}
             elif value is not None:
                 out.add(_plain_text(value))
-    return out
+        return out
+    if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star) and node.name.lower() in known:
+        return known[node.name.lower()]
+    return None
 
 
 def _is_star(item: Any) -> bool:
@@ -1029,13 +1098,14 @@ class _Secrets:
     _index: Any = field(default=None, repr=False, compare=False)
     _compiled: dict[frozenset[str], re.Pattern[str]] = field(default_factory=dict, repr=False, compare=False)
 
-    def add(self, snapshot: Any, hidden: set[str], *, labels: Iterable[str] = (), base: Iterable[str] = ()) -> None:
-        """收一份快照里要遮的列（hidden，小写）的值。labels 是这份快照的 SQL 里写死的分档标签（_written_labels）：派生
-        列（hidden 里不在 base 的，base 是数据源设了遮罩的列）里的标签不收，遮罩列自己选出来的值照收。"""
+    def add(self, snapshot: Any, hidden: set[str], *, labels: dict[str, set[str]] | None = None,
+            base: Iterable[str] = ()) -> None:
+        """收一份快照里要遮的列（hidden，小写）的值。labels 是这份快照里只装着分档标签的列（_label_columns）：这几列的
+        格子等于标签的不收；改了名字的遮罩列、别的派生列照收，base（数据源设了遮罩的列，小写）自己选出来的值也照收。"""
         if not _query_shaped(snapshot) or not hidden:
             return
-        written = set(labels)
-        derived = set(hidden) - set(base) if written else set()
+        own = set(base)
+        written = {name: texts for name, texts in (labels or {}).items() if name not in own}
         columns = [str(c) for c in snapshot.get("columns") or []]
         index = [i for i, c in enumerate(columns) if c.lower() in hidden]
         for row in snapshot["rows"]:
@@ -1051,7 +1121,7 @@ class _Secrets:
                 if value is None or isinstance(value, bool):
                     continue
                 forms = _forms(value)
-                if name in derived and forms & written:
+                if forms & written.get(name, set()):
                     continue
                 for form in forms:
                     self.weak.add(form)
@@ -1259,8 +1329,8 @@ _LEADS = frozenset({"DASH", "PLUS", "INTRODUCER"})
 _VALUE_ENDS = frozenset({"NUMBER", "VAR", "IDENTIFIER", "R_PAREN", "R_BRACKET", "NULL", "TRUE", "FALSE"})
 #: 数字照原样留在 SQL 里的两种用法（_literal_uses）：范围比较的边界、LIMIT 这类的行数
 _KEPT = frozenset({"range", "limit"})
-#: 字面量写在左边时运算符翻过来：25 < age 就是 age > 25
-_FLIP = {">": "<", ">=": "<=", "<": ">", "<=": ">="}
+#: 字面量写在左边时运算符翻过来：25 < age 就是 age > 25（等值一类翻过来还是它自己）
+_FLIP = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "=": "=", "<>": "<>"}
 #: 一个纯粹的数（可带正负号、小数）：范围边界按数比大小，写成字符串的也一样
 _PLAIN_NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
@@ -1321,25 +1391,51 @@ def _column_of(node: Any, index: int | None) -> str | None:
     """比较另一边的列名（小写、不带表名）；另一边是行值时取第 index 项。不是单独一列（函数、算式、子查询）时为 None。"""
     from sqlglot import exp
 
-    if index is not None and isinstance(node, exp.Tuple):
-        items = node.expressions
-        node = items[index] if index < len(items) else None
-    while isinstance(node, exp.Paren):
-        node = node.this
+    node = _item_of(node, index)
     if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
         return node.name.lower() or None
     return None
 
 
-def _use_of(node: Any) -> tuple[str, str | None]:
-    """语法树里一个字面量用在哪：(用法, 列名)，用法见 _literal_uses。
-
-    先往上越过不改变「找的是哪个值」的外壳：括号、负号、CAST、字符集前缀、COLLATE；行值、VALUES、ARRAY、ANY / ALL
-    也越过，记下「在一组值里」（行值另记下是第几项）。再看外壳的上一层：等值一类、IN、简单 CASE 的 WHEN 是在找这个值；
-    范围比较、LIMIT 一类只认单独一个值（一组值里的、算式里的都不算）。"""
+def _item_of(node: Any, index: int | None) -> Any:
+    """比较的另一边去掉括号；是行值时取第 index 项（没有这一项为 None）。"""
     from sqlglot import exp
 
-    child, parent = node, node.parent
+    if index is not None and isinstance(node, exp.Tuple):
+        items = node.expressions
+        node = items[index] if index < len(items) else None
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return node
+
+
+def _columns_of(node: Any, index: int | None) -> frozenset[str]:
+    """比较另一边的值取自哪些列（小写、不带表名）：单独一列就是它；套了 CAST、函数、汇总、算式的，按值取自哪些列算
+    （_value_columns：CAST(age AS INTEGER)、MAX(age) 取的还是年龄；COUNT 只数个数，不算）。和遮罩列比较的字面量，
+    短的数也按遮罩列里的值认（_swap_literal）。"""
+    from sqlglot import exp
+
+    node = _item_of(node, index)
+    if node is None:
+        return frozenset()
+    if isinstance(node, exp.Column):
+        name = None if isinstance(node.this, exp.Star) else node.name.lower()
+        return frozenset({name} if name else ())
+    return frozenset(_value_columns(node))
+
+
+def _use_of(node: Any, values: dict[int, Any], lifts: dict[int, Any]) -> tuple[str, frozenset[str], Any]:
+    """语法树里一个字面量用在哪：(用法, 被比较的一边取自哪些列, 算出来的值)，用法见 _literal_uses。
+
+    先往上越过不改变「找的是哪个值」的外壳：括号、负号、CAST、字符集前缀、COLLATE，以及几个写死的数的加减乘除——
+    整个算式按算出来的那一个值认（_lifts，第三项交回走到的那一层的值，什么都没越过为 None）；行值、VALUES、ARRAY、ANY / ALL 也
+    越过，记下「在一组值里」（行值另记下是第几项）。再看外壳的上一层：等值一类、IN、简单 CASE 的 WHEN 是在找这个值；
+    范围比较、LIMIT 一类只认单独一个值（一组值里的、和列一起算的算式里的都不算）。"""
+    from sqlglot import exp
+
+    top = lifts.get(id(node), node)
+    computed = values.get(id(top)) if top is not node else None
+    child, parent = top, top.parent
     index, grouped = None, False
     while parent is not None:
         if isinstance(parent, exp.Tuple):
@@ -1356,23 +1452,23 @@ def _use_of(node: Any) -> tuple[str, str | None]:
         child, parent = parent, parent.parent
     if isinstance(parent, (exp.EQ, exp.NEQ, exp.NullSafeEQ, exp.NullSafeNEQ, exp.Is, exp.Like, exp.ILike, exp.Glob,
                            exp.RegexpLike, exp.SimilarTo)):
-        return "equal", _column_of(parent.expression if child is parent.this else parent.this, index)
+        return "equal", _columns_of(parent.expression if child is parent.this else parent.this, index), computed
     if isinstance(parent, exp.In):
-        return "equal", None if child is parent.this else _column_of(parent.this, index)
+        return "equal", frozenset() if child is parent.this else _columns_of(parent.this, index), computed
     if isinstance(parent, exp.If) and child is parent.this and isinstance(parent.parent, exp.Case) \
             and parent.parent.this is not None:
         # 简单 CASE：CASE buyer_phone WHEN 13900000001 THEN …（CASE WHEN col = v 的写法走上面的等值）
-        return "equal", _column_of(parent.parent.this, index)
+        return "equal", _columns_of(parent.parent.this, index), computed
     if grouped:
-        return "other", None
+        return "other", frozenset(), computed
     if type(parent) in _range_ops() and (child is parent.this or child is parent.expression):
-        return "range", _column_of(parent.expression if child is parent.this else parent.this, None)
+        return "range", _columns_of(parent.expression if child is parent.this else parent.this, None), computed
     if isinstance(parent, exp.Between) and child is not parent.this:
-        return "range", _column_of(parent.this, None)
+        return "range", _columns_of(parent.this, None), computed
     if (isinstance(parent, (exp.Limit, exp.Offset)) and child is parent.expression) or (
             isinstance(parent, exp.Fetch) and child is parent.args.get("count")):
-        return "limit", None
-    return "other", None
+        return "limit", frozenset(), computed
+    return "other", frozenset(), computed
 
 
 def _wraps(parent: Any, child: Any) -> bool:
@@ -1391,71 +1487,149 @@ def _range_ops() -> dict[Any, str]:
     return {exp.GT: ">", exp.GTE: ">=", exp.LT: "<", exp.LTE: "<="}
 
 
+def _exact_ops() -> dict[Any, str]:
+    """等值一类的语法树节点 → 运算符：=、IS NOT DISTINCT FROM、SQLite 的 IS 是「=」，<>、IS DISTINCT FROM 是「<>」。
+    IN 另外认（一串「=」的「或」）。它们和范围比较合起来也能夹住一个值（age >= 25 AND age <= 26 AND age <> 26），
+    只在同一个条件里算（_pinned）。"""
+    from sqlglot import exp
+
+    return {exp.EQ: "=", exp.NullSafeEQ: "=", exp.Is: "=", exp.NEQ: "<>", exp.NullSafeNEQ: "<>"}
+
+
+def _arithmetic() -> tuple[Any, ...]:
+    """加减乘除：几个写死的数算出来的整个算式按算出来的那一个值认（13900000000 + 1 就是 13900000001）。"""
+    from sqlglot import exp
+
+    return exp.Add, exp.Sub, exp.Mul, exp.Div
+
+
+#: 数的写法里指数最大多少（1e999999 这样的写法不按数认，免得展开成上百万位）
+_EXPONENT_MAX = 40
+
+
+def _decimal(text: str) -> Decimal | None:
+    """一段字按数读（025、2.5e1、13900000001.0 都认）；读不了、不是有限的数、指数太大为 None。"""
+    try:
+        value = Decimal(text.strip())
+    except (ArithmeticError, ValueError):
+        return None
+    return value if value.is_finite() and abs(value.adjusted()) <= _EXPONENT_MAX else None
+
+
+def _canonical(text: str) -> str | None:
+    """一个数的规范写法（_point_text）：25.0、025、2.5e1 都是 25，13900000001.0 是 13900000001。SQL 里换个写法写同一个
+    数，照样认得出是不是遮罩值（_swap_literal）。不是数为 None。"""
+    value = _decimal(text)
+    return _point_text(value) if value is not None else None
+
+
 def _constant(node: Any) -> Any:
-    """写死的值：数按数（几个数加减乘除算出来的也算，13900000002 - 1），字符串按原文（纯粹的数照样按数）；别的为 None。"""
+    """写死的值：数按数（几个数加减乘除算出来的也算，13900000002 - 1；025、2.5e1 这样的写法也按数），字符串按原文
+    （纯粹的数照样按数）；别的为 None。"""
+    return _constants(node).get(id(node)) if node is not None else None
+
+
+def _constants(root: Any) -> dict[int, Any]:
+    """一棵语法树里每个写死的值（_constant）：id(节点) → 值。从下往上一层层算（广度优先的倒序，孩子总在父亲前面），
+    不递归：上千项的连加（1+1+…）会超过递归深度，以前整条 SQL 因此退回按词认，同一句里夹住的值就认不出了。"""
     from sqlglot import exp
 
-    if isinstance(node, exp.Neg):
-        value = _constant(node.this)
-        return -value if isinstance(value, Decimal) else None
-    if isinstance(node, (exp.Paren, exp.Cast, exp.Collate)):
-        return _constant(node.this)
-    if isinstance(node, exp.Introducer):
-        return _constant(node.expression)
-    if isinstance(node, _literal_types()):
-        text = str(node.this).strip()
-        return Decimal(text) if _PLAIN_NUMBER.fullmatch(text) else text
-    if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
-        a, b = _constant(node.this), _constant(node.expression)
-        if not (isinstance(a, Decimal) and isinstance(b, Decimal)):
-            return None
-        if isinstance(node, exp.Div):
-            return a / b if b else None
-        return a + b if isinstance(node, exp.Add) else a - b if isinstance(node, exp.Sub) else a * b
-    return None
-
-
-def _bare_literal(node: Any) -> Any:
-    """边界本身就是一个字面量（套了括号、负号、CAST 的也算）时交回那个字面量，否则 None。"""
-    from sqlglot import exp
-
-    while node is not None and not isinstance(node, _literal_types()):
-        if isinstance(node, (exp.Paren, exp.Neg, exp.Cast, exp.Collate)):
-            node = node.this
+    out: dict[int, Any] = {}
+    for node in reversed(list(root.walk())):
+        value: Any = None
+        if isinstance(node, exp.Neg):
+            inner = out.get(id(node.this))
+            value = -inner if isinstance(inner, Decimal) else None
+        elif isinstance(node, (exp.Paren, exp.Cast, exp.Collate)):
+            value = out.get(id(node.this))
         elif isinstance(node, exp.Introducer):
-            node = node.expression
+            value = out.get(id(node.expression))
+        elif isinstance(node, _literal_types()):
+            text = str(node.this).strip()
+            number = Decimal(text) if _PLAIN_NUMBER.fullmatch(text) else (
+                _decimal(text) if isinstance(node, exp.Literal) and not node.is_string else None)
+            value = number if number is not None else text
+        elif isinstance(node, _arithmetic()):
+            value = _worked_out(node, out.get(id(node.this)), out.get(id(node.expression)))
+        if value is not None:
+            out[id(node)] = value
+    return out
+
+
+def _worked_out(node: Any, a: Any, b: Any) -> Decimal | None:
+    """一步加减乘除的结果；不是两个数、除以零、结果太大为 None。"""
+    from sqlglot import exp
+
+    if not (isinstance(a, Decimal) and isinstance(b, Decimal)):
+        return None
+    try:
+        if isinstance(node, exp.Div):
+            value = a / b if b else None
         else:
-            return None
-    return node
+            value = a + b if isinstance(node, exp.Add) else a - b if isinstance(node, exp.Sub) else a * b
+    except ArithmeticError:
+        return None
+    return value if value is not None and value.is_finite() and abs(value.adjusted()) <= _EXPONENT_MAX else None
 
 
-#: 范围比较的一半：(字面量节点, 另一边的键, 写死的值, 「键 运算符 值」的运算符)。边界是几个数算出来的
-#: （13900000002 - 1），字面量节点记 None：它照样能夹住另一头的值，换的是另一头的字面量
-_Half = tuple[Any, str, Any, str]
+def _lifts(root: Any, values: dict[int, Any]) -> dict[int, Any]:
+    """写死的值往上能越过的外壳和算式：id(节点) → 越过之后走到的那一层（13900000000 + 1 里的两个数都走到整个算式，
+    (25) 里的 25 走到括号）。先父亲后孩子（广度优先）地记，每个字面量直接跳到那一层，上千项的连加不必每个数都一层层
+    往上走。"""
+    out: dict[int, Any] = {}
+    for node in root.walk():
+        if id(node) not in values:
+            continue
+        parent = node.parent
+        lifted = parent is not None and id(parent) in values and (
+            isinstance(parent, _arithmetic()) or _wraps(parent, node))
+        out[id(node)] = out[id(parent)] if lifted else node
+    return out
 
 
-def _halves(node: Any) -> list[_Half | None]:
-    """一个范围比较拆成的几半：BETWEEN 是两半的「且」（不低于下界、不高于上界），> >= < <= 是一半。边界不是写死的值
-    （另一列、子查询）或者两边都写死了的，这一半记 None：它的真假跟哪一列的取值都对不上，当成不知道真假。"""
+#: 一个比较的一半：(算出边界的那几个字面量, 另一边的键, 写死的值, 「键 运算符 值」的运算符)。边界是几个数算出来的
+#: （13900000002 - 1），算式里的字面量都记下：夹住了某一个值，留着哪一个都可能算得出它，都换
+_Half = tuple[tuple[Any, ...], str, Any, str]
+#: 一个比较拆成的几半，加上几半怎么连（False：且，BETWEEN；True：或，IN）、是不是等值一类（不等、IN）
+_Leaf = tuple[list[_Half | None], bool, bool]
+
+
+def _halves(node: Any, values: dict[int, Any]) -> list[_Half | None]:
+    """一个比较拆成的几半（values 是 _constants 算好的写死的值）：BETWEEN 是两半的「且」（不低于下界、不高于上界），
+    > >= < <= 是一半，= <> 这类是一半，IN 是一串「=」的「或」。边界不是写死的值（另一列、子查询）或者两边都写死了的，
+    这一半记 None：它的真假跟哪一列的取值都对不上，当成不知道真假。"""
     from sqlglot import exp
 
     if isinstance(node, exp.Between):
         sides = [(node.args.get("low"), node.this, ">="), (node.args.get("high"), node.this, "<=")]
-    else:
-        op = _range_ops()[type(node)]
-        right, left = _constant(node.expression), _constant(node.this)
-        if (right is None) == (left is None):
+    elif isinstance(node, exp.In):
+        if node.args.get("query") or node.args.get("unnest") or node.args.get("field") or id(node.this) in values:
             return [None]
-        sides = [(node.expression, node.this, op)] if right is not None else [(node.this, node.expression, _FLIP[op])]
+        sides = [(item, node.this, "=") for item in node.expressions]
+    else:
+        op = _op_of(node)
+        right, left = id(node.expression) in values, id(node.this) in values
+        if op is None or right == left:
+            return [None]
+        sides = [(node.expression, node.this, op)] if right else [(node.this, node.expression, _FLIP[op])]
     out: list[_Half | None] = []
     for operand, other, op in sides:
-        value = _constant(operand) if operand is not None else None
-        out.append((_bare_literal(operand), _key_of(other), value, op) if value is not None else None)
+        value = values.get(id(operand)) if operand is not None else None
+        out.append((tuple(operand.find_all(*_literal_types())), _key_of(other), value, op)
+                   if value is not None else None)
     return out
 
 
+def _op_of(node: Any) -> str | None:
+    """范围比较、等值一类的运算符（「列 运算符 值」方向）；别的为 None。"""
+    for kind, op in (*_range_ops().items(), *_exact_ops().items()):
+        if isinstance(node, kind):
+            return op
+    return None
+
+
 def _key_of(node: Any) -> str:
-    """范围比较另一边的键：单独一列取列名（小写、不带表名，同 _column_of）；别的表达式（SUM(amount)、函数、算式）取
+    """比较另一边的键：单独一列取列名（小写、不带表名，同 _column_of）；别的表达式（SUM(amount)、函数、算式）取
     整个写法，只和写得一样的表达式算同一个——SUM(amount) <= v 和 amount >= v 说的不是一回事。前面垫一个列名里不会
     有的字，免得和列名撞上。"""
     from sqlglot import exp
@@ -1532,51 +1706,75 @@ def _apart(a: Any, b: Any, paths: dict[int, dict[int, Any]]) -> tuple[bool, int]
 
 def _marks(value: Any, op: str) -> list[tuple[Any, int]]:
     """一个边界从哪边隔开了哪个值：(值, 0) 是从下面隔开（它和比它小一点的值结果不同：>= v、< v），(值, 1) 是从上面
-    隔开（和比它大一点的值结果不同：<= v、> v）。整数上还隔开了相邻的那一个：> v、<= v 从下面隔开 v + 1（v 不成立、
-    v + 1 成立，或者反过来），< v、>= v 从上面隔开 v - 1——age <= 24 OR age >= 26 就是 age <> 25。"""
-    whole = isinstance(value, Decimal) and value == value.to_integral_value()
-    above = [(value + 1, 0)] if whole else []
-    below = [(value - 1, 1)] if whole else []
-    return {">=": [(value, 0), *below], "<=": [(value, 1), *above],
-            ">": [(value, 1), *above], "<": [(value, 0), *below]}[op]
+    隔开（和比它大一点的值结果不同：<= v、> v）；= v、<> v 从两边隔开 v。整数上还隔开了相邻的那一个：> v、<= v 从下面
+    隔开 v + 1（v 不成立、v + 1 成立，或者反过来），< v、>= v 从上面隔开 v - 1——age <= 24 OR age >= 26 就是
+    age <> 25；= v、<> v 从上面隔开 v - 1、从下面隔开 v + 1。边界不是整数的，整数上隔开的是它两边紧挨着的两个整数
+    （age > 24.5 就是 age >= 25）。"""
+    if not isinstance(value, Decimal):
+        return {">=": [(value, 0)], "<=": [(value, 1)], ">": [(value, 1)], "<": [(value, 0)],
+                "=": [(value, 0), (value, 1)], "<>": [(value, 0), (value, 1)]}[op]
+    if value == value.to_integral_value():
+        above, below = [(value + 1, 0)], [(value - 1, 1)]
+        return {">=": [(value, 0), *below], "<=": [(value, 1), *above], ">": [(value, 1), *above],
+                "<": [(value, 0), *below], "=": [(value, 0), (value, 1), *below, *above],
+                "<>": [(value, 0), (value, 1), *below, *above]}[op]
+    # 不是整数：整数上 = v 永远不成立、<> v 永远成立，隔不开谁
+    if op in ("=", "<>"):
+        return [(value, 0), (value, 1)]
+    steps = [(value.to_integral_value(rounding=ROUND_CEILING), 0), (value.to_integral_value(rounding=ROUND_FLOOR), 1)]
+    return [(value, 0 if op in (">=", "<") else 1), *steps]
 
 
-def _pinned(root: Any) -> dict[int, tuple[str, ...]]:
-    """范围比较里把某一个值夹住了的边界字面量：id(字面量节点) → 夹住的值（_point_text 的写法）。
+def _pinned(root: Any, values: dict[int, Any]) -> dict[int, tuple[str, ...]]:
+    """把某一个值夹住了的边界字面量：id(字面量节点) → 夹住的值（_point_text 的写法）。values 是 _constants 算好的
+    写死的值。
 
-    一个值 v 两边都被隔开（_marks），条件才可能只认 v 这一个值。在整条 SQL 里配对，只有分档的几种写法各算各的
-    （_apart：CASE 的不同分支、SELECT 里不筛行的不同项、UNION 的不同支），它们共用的边界是分档的界，不是在找哪一个
-    值；别处筛的是同一批行（ON 和 WHERE、WHERE 和 HAVING、INTERSECT 两支、包在 CASE / 函数 / 算式里的一半、子查询、
-    CTE），两边一隔开就按夹住算——只在同一个条件里配对的话，把找值拆到这些地方，号码就照原样留在 SQL 里，回答正文
-    也跟着不遮。同一个条件里的再细看合起来的真假（_isolated）：col >= v AND col <= v、BETWEEN v AND v、
-    col > v OR col < v（就是 col <> v）、整数的 col >= v AND col < v + 1、col > v - 1 AND col < v + 1 是在找 v，
-    和等值比较一样换；col > 31 AND col <= 25 AND col NOT BETWEEN 25 AND 31 这样谁也找不着的、col <= v OR col >= v
-    这样全都要的不是。另一边不是单独一列的（SUM(amount) >= 900）只和写得一样的表达式配（_key_of）。夹住了就把隔开 v
-    的边界都记下：两头都不是 v 的（col > 24 AND col < 26）也换，留着就等于写出了 v。
-    细看、找公共祖先走的步数有上限（PIN_WORK），超出之后两边都隔开的一律按夹住算。"""
+    一个值 v 两边都被隔开（_marks），条件才可能只认 v 这一个值。范围比较在整条 SQL 里配对，只有分档的几种写法各算
+    各的（_apart：CASE 的不同分支、SELECT 里不筛行的不同项、UNION 的不同支），它们共用的边界是分档的界，不是在找哪
+    一个值；别处筛的是同一批行（ON 和 WHERE、WHERE 和 HAVING、INTERSECT 两支、包在 CASE / 函数 / 算式里的一半、
+    子查询、CTE），两边一隔开就按夹住算——只在同一个条件里配对的话，把找值拆到这些地方，号码就照原样留在 SQL 里，
+    回答正文也跟着不遮。同一个条件里的再细看合起来的真假（_isolated）：col >= v AND col <= v、BETWEEN v AND v、
+    col > v OR col < v（就是 col <> v）、整数的 col >= v AND col < v + 1、col > v - 1 AND col < v + 1、两头不是整数的
+    col > v - 0.5 AND col < v + 0.5 是在找 v，和等值比较一样换；范围再用不等、NOT IN 去掉一头的（age >= 25 AND
+    age <= 26 AND age <> 26）也是，不等、IN 只在同一个条件里和范围合起来看（跨条件配对只看范围比较：选出列里
+    CASE WHEN age = 26 和 WHERE age >= 25 说不上在找谁）；col > 31 AND col <= 25 AND col NOT BETWEEN 25 AND 31 这样
+    谁也找不着的、col <= v OR col >= v 这样全都要的不是。另一边不是单独一列的（SUM(amount) >= 900）只和写得一样的
+    表达式配（_key_of）。夹住了就把隔开 v 的边界都记下：两头都不是 v 的（col > 24 AND col < 26）、边界是算式的
+    （col <= 25 + 0），算式里的数都换，留着就等于写出了 v。
+    细看、找公共祖先走的步数有上限（PIN_WORK），超出之后两边都有范围比较隔开的一律按夹住算。"""
     from sqlglot import exp
 
+    exact_types = (*_exact_ops(), exp.In)
     tops: dict[int, Any] = {}
-    within: dict[int, dict[int, list[_Half | None]]] = {}
-    sides: dict[tuple[str, Any], tuple[dict[int, list[Any]], dict[int, list[Any]]]] = {}
-    for node in root.find_all(exp.Between, *_range_ops()):
+    within: dict[int, dict[int, _Leaf]] = {}
+    # 范围比较隔开的、等值一类（不等、IN）隔开的分开记：(键, 值) → (从下面隔开的, 从上面隔开的)，各按条件分组
+    ranged: dict[tuple[str, Any], tuple[dict[int, list[Any]], dict[int, list[Any]]]] = {}
+    exact: dict[tuple[str, Any], tuple[dict[int, list[Any]], dict[int, list[Any]]]] = {}
+    # 同一个条件里等值一类写着的数（按条件、键）：整数上细看时，紧挨着的这些数要越过去再看（_window）
+    nearby: dict[tuple[int, str], set[Decimal]] = {}
+    for node in root.find_all(exp.Between, *_range_ops(), *exact_types):
+        is_exact = isinstance(node, exact_types)
+        parts = _halves(node, values)
+        if is_exact and all(h is None for h in parts):
+            continue  # 连接条件（两边都是列）这类：和夹住哪个值无关
         top = _condition_root(node)
         tops[id(top)] = top
-        parts = _halves(node)
-        within.setdefault(id(top), {})[id(node)] = parts
-        for literal, key, value, op in (h for h in parts if h is not None):
+        within.setdefault(id(top), {})[id(node)] = (parts, isinstance(node, exp.In), is_exact)
+        marks = exact if is_exact else ranged
+        for literals, key, value, op in (h for h in parts if h is not None):
+            if is_exact and isinstance(value, Decimal):
+                nearby.setdefault((id(top), key), set()).add(value)
             for point, side in _marks(value, op):
-                sides.setdefault((key, point), ({}, {}))[side].setdefault(id(top), []).append(literal)
+                marks.setdefault((key, point), ({}, {}))[side].setdefault(id(top), []).extend(literals)
     budget = PIN_WORK
     orders: dict[int, list[tuple[Any, list[Any]]]] = {}
     apart: dict[tuple[int, int], bool] = {}
     paths: dict[int, dict[int, Any]] = {}
     out: dict[int, set[str]] = {}
-    for (key, point), (below, above) in sides.items():
-        if not (below and above):
-            continue
+    for (key, point), (below, above) in ranged.items():
+        low_exact, high_exact = exact.get((key, point), ({}, {}))
         marked: list[Any] = []
-        # 不在同一个条件里的两边：不是各算各的，就按夹住算
+        # 不在同一个条件里的两边（只看范围比较）：不是各算各的，就按夹住算
         for low, lows in below.items():
             for high, highs in above.items():
                 if low == high:
@@ -1587,18 +1785,22 @@ def _pinned(root: Any) -> dict[int, tuple[str, ...]]:
                     budget -= steps
                 if not apart[pair]:
                     marked += lows + highs
-        # 同一个条件里的两边：细看合起来的真假
-        for top in below.keys() & above.keys():
+        # 同一个条件里的两边（至少一边是范围比较）：细看合起来的真假
+        for top in below.keys() | above.keys():
+            lows = below.get(top, []) + low_exact.get(top, [])
+            highs = above.get(top, []) + high_exact.get(top, [])
+            if not (lows and highs):
+                continue
             if top not in orders:
                 orders[top] = _logic_order(tops[top])
             if len(orders[top]) <= budget:
                 budget -= len(orders[top])
-                if not _isolated(orders[top], within[top], key, point):
-                    continue
-            marked += below[top] + above[top]
+                if _isolated(orders[top], within[top], key, point, nearby.get((top, key), set())):
+                    marked += lows + highs
+            elif top in below and top in above:
+                marked += below[top] + above[top]
         for literal in marked:
-            if literal is not None:
-                out.setdefault(id(literal), set()).add(_point_text(point))
+            out.setdefault(id(literal), set()).add(_point_text(point))
     return {literal: tuple(sorted(points)) for literal, points in out.items()}
 
 
@@ -1607,25 +1809,50 @@ _EITHER = frozenset({(False, False, False), (True, True, True)})
 #: 只认中间那一个值（或者只排除它）：(比它小一点, 它, 比它大一点) 的真假
 _ISOLATED = frozenset({(False, True, False), (True, False, True)})
 _HOLDS: dict[str, Callable[[int], bool]] = {
-    ">=": lambda s: s >= 0, ">": lambda s: s > 0, "<=": lambda s: s <= 0, "<": lambda s: s < 0}
-#: 且、或连起来的一串里，两两细看的项最多这么多（随这一列取值变真假的项）：再多就按夹住算
+    ">=": lambda s: s >= 0, ">": lambda s: s > 0, "<=": lambda s: s <= 0, "<": lambda s: s < 0,
+    "=": lambda s: s == 0, "<>": lambda s: s != 0}
+#: 且、或连起来的一串里，两两细看的项最多这么多（随这一列取值变真假的项）：再多就按夹住算。整数上细看时，紧挨着
+#: 的一串不等、IN 写着的数最多越过这么多个（_window）
 PAIR_MAX = 64
 
 
-def _isolated(order: list[tuple[Any, list[Any]]], halves: dict[int, list[_Half | None]], key: str, point: Any
-              ) -> bool:
+def _isolated(order: list[tuple[Any, list[Any]]], halves: dict[int, _Leaf], key: str, point: Any,
+              nearby: set[Decimal] | frozenset[Decimal] = frozenset()) -> bool:
     """这个条件（order 是它的各层，_logic_order）里 key 取 point 时夹没夹住，两种都算：
     - 整个条件只认 point 这一个值，或者只排除它（真假和它两边都不一样）。数按两种看：连续的（紧挨着 point 两边的值）
-      和整数的（point - 1、point + 1，col >= v AND col < v + 1 只在整数上夹住 v）；
+      和整数的（point - 1、point + 1，col >= v AND col < v + 1 只在整数上夹住 v）。整数上紧挨着的是同一个条件里
+      不等、IN 写着的数（nearby）时越过去接着看（_window）：age >= 25 AND age <= 30 AND age <> 26 里 26 被去掉了，
+      27 照样成立，不只认 25；age <= 26 时 27 不成立，就只认 25；
     - 条件里哪一层（一个比较、括号、非、异或，且 / 或连起来的一串里的任意一项、任意两项）不论整数都只认 point：
       BETWEEN v AND v、>= v AND <= v、> v OR < v 本身就写出了 v，旁边的条件把它吸收了（OR 一个更宽的范围）、和它
-      矛盾了也算，隔着别的条件写也一样。整数上的半开、开区间不这样一层层看：一长串相邻的分档（age >= 0 AND age < 1
-      OR age >= 1 AND age < 2 …）每一档单拿出来都只认一个整数，连起来谁也没找。
+      矛盾了也算，隔着别的条件写也一样。不等、IN 不这样一层层看（单拿出来本来就只认、只排除写着的值，它们自己的
+      字面量照等值比较换），整数上的半开、开区间也不：一长串相邻的分档（age >= 0 AND age < 1 OR age >= 1 AND
+      age < 2 …）每一档单拿出来都只认一个整数，连起来谁也没找。
     条件里和这一列无关的部分当成不知道真假，只要有一种取法夹住了就算（宁可多换）。"""
-    if _outcomes(order, halves, key, point, False, signals=True)[1]:
+    if _outcomes(order, halves, key, point, None, signals=True)[1]:
         return True
-    whole = isinstance(point, Decimal) and point == point.to_integral_value()
-    return whole and bool(_ISOLATED & _outcomes(order, halves, key, point, True)[0])
+    if not (isinstance(point, Decimal) and point == point.to_integral_value()):
+        return False
+    offsets = _window(point, nearby)
+    if offsets is None:
+        return True
+    lone = tuple(o == 0 for o in offsets)
+    return bool({lone, tuple(not x for x in lone)} & _outcomes(order, halves, key, point, offsets)[0])
+
+
+def _window(point: Decimal, nearby: set[Decimal] | frozenset[Decimal]) -> tuple[int, ...] | None:
+    """整数上细看 point 时看哪几个整数（相对 point 的偏移）：两边各看一个；紧挨着的是不等、IN 写着的数，越过它们再
+    多看一个。一边要越过的超过 PAIR_MAX 个时为 None（看不过来，按夹住算）。"""
+    below = above = 0
+    while point - below - 1 in nearby:
+        below += 1
+        if below > PAIR_MAX:
+            return None
+    while point + above + 1 in nearby:
+        above += 1
+        if above > PAIR_MAX:
+            return None
+    return tuple(range(-below - 1, above + 2))
 
 
 def _logic_children(node: Any) -> list[Any]:
@@ -1667,13 +1894,14 @@ def _logic_order(top: Any) -> list[tuple[Any, list[Any]]]:
     return order
 
 
-def _outcomes(order: list[tuple[Any, list[Any]]], halves: dict[int, list[_Half | None]], key: str, point: Any,
-              steps: bool, *, signals: bool = False) -> tuple[set[tuple[bool, ...]], bool]:
-    """条件（各层见 _logic_order）在 key 取 point 和它两边时可能的真假组合：(比它小一点, point, 比它大一点)。steps
-    为真按整数看两边（point - 1、point + 1），否则按紧挨着的值。signals 为真时另交回条件里有没有哪一层、且 / 或连起来
-    的哪一两项单拿出来就只认 point（_isolated）。"""
+def _outcomes(order: list[tuple[Any, list[Any]]], halves: dict[int, _Leaf], key: str, point: Any,
+              offsets: tuple[int, ...] | None, *, signals: bool = False) -> tuple[set[tuple[bool, ...]], bool]:
+    """条件（各层见 _logic_order）在 key 取 point 和它两边时可能的真假组合。offsets 是整数上看的那几个偏移
+    （_window），为 None 时按紧挨着的值看 (比它小一点, point, 比它大一点)。signals 为真时另交回条件里有没有哪一层、
+    且 / 或连起来的哪一两项单拿出来就只认 point（_isolated，只按紧挨着的值看）。"""
     from sqlglot import exp
 
+    either = _either(3 if offsets is None else len(offsets))
     done: dict[int, set[tuple[bool, ...]]] = {}
     found = False
     for node, kids in order:
@@ -1690,14 +1918,19 @@ def _outcomes(order: list[tuple[Any, list[Any]]], halves: dict[int, list[_Half |
                 out = _joined(join, out, part)
             if signals and not found and len(parts) > 2:
                 # 一串里随这一列取值变真假的项两两细看（两项的串就是它自己，下面照常看）
-                varying = [part for part in parts if not part <= _EITHER]
+                varying = [part for part in parts if not part <= either]
                 found = len(varying) > PAIR_MAX or any(
                     _ISOLATED & _joined(join, s, t) for s, t in itertools.combinations(varying, 2))
         else:
-            out = _leaf_outcomes(halves.get(id(node)), key, point, steps)
+            out = _leaf_outcomes(halves.get(id(node)), key, point, offsets)
         found = found or (signals and bool(_ISOLATED & out))
         done[id(node)] = out
     return out, found
+
+
+def _either(width: int) -> frozenset[tuple[bool, ...]]:
+    """和这一列无关的部分在 width 个取值上的真假：全真或全假（_EITHER 是三个取值的）。"""
+    return _EITHER if width == 3 else frozenset({(False,) * width, (True,) * width})
 
 
 def _joined(join: Callable[[bool, bool], bool], left: set[tuple[bool, ...]], right: set[tuple[bool, ...]]
@@ -1705,23 +1938,28 @@ def _joined(join: Callable[[bool, bool], bool], left: set[tuple[bool, ...]], rig
     return {tuple(join(x, y) for x, y in zip(s, t)) for s in left for t in right}
 
 
-def _leaf_outcomes(parts: list[_Half | None] | None, key: str, point: Any, steps: bool) -> set[tuple[bool, ...]]:
-    """一个比较（几半的「且」）可能的真假组合；不是范围比较的（别的条件）当成不知道真假。"""
-    if parts is None:
-        return set(_EITHER)
-    out: set[tuple[bool, ...]] = {(True, True, True)}
+def _leaf_outcomes(leaf: _Leaf | None, key: str, point: Any, offsets: tuple[int, ...] | None
+                   ) -> set[tuple[bool, ...]]:
+    """一个比较（几半的「且」，IN 是几半的「或」）可能的真假组合；别的条件当成不知道真假。不等、IN 只在整数上细看
+    时算（offsets 不为 None），按紧挨着的值看时也当成不知道真假，见 _isolated。"""
+    either = _either(3 if offsets is None else len(offsets))
+    if leaf is None or (leaf[2] and offsets is None):
+        return set(either)
+    parts, any_, _ = leaf
+    out: set[tuple[bool, ...]] = {(not any_,) * len(next(iter(either)))}
+    join = operator.or_ if any_ else operator.and_
     for half in parts:
-        cell = {_truth(half, point, steps)} if half is not None and half[1] == key and (
-            isinstance(half[2], Decimal) == isinstance(point, Decimal)) else _EITHER
-        out = {tuple(x and y for x, y in zip(s, t)) for s in out for t in cell}
+        cell = {_truth(half, point, offsets)} if half is not None and half[1] == key and (
+            isinstance(half[2], Decimal) == isinstance(point, Decimal)) else either
+        out = _joined(join, out, cell)
     return out
 
 
-def _truth(half: _Half, point: Any, steps: bool) -> tuple[bool, ...]:
-    """一半范围比较在 point 和它两边的真假（steps 同 _outcomes）。"""
+def _truth(half: _Half, point: Any, offsets: tuple[int, ...] | None) -> tuple[bool, ...]:
+    """一半比较在 point 和它两边的真假（offsets 同 _outcomes）。"""
     _, _, bound, op = half
-    if steps:
-        signs = [_sign(point + step, bound) for step in (-1, 0, 1)]
+    if offsets is not None:
+        signs = [_sign(point + step, bound) for step in offsets]
     else:
         at = _sign(point, bound)
         signs = [at or -1, at, at or 1]
@@ -1739,20 +1977,21 @@ def _point_text(point: Any) -> str:
     return str(point)
 
 
-#: SQL 里一个字面量用在哪：(用法, 被比较的列名, 夹住的值)，见 _literal_uses
-_Use = tuple[str, str | None, tuple[str, ...]]
+#: SQL 里一个字面量用在哪：(用法, 被比较的一边取自哪些列, 认它时一并看的值)，见 _literal_uses
+_Use = tuple[str, frozenset[str], tuple[str, ...]]
 
 
 def _literal_uses(sql: str, kind: str | None) -> dict[int, _Use] | None:
     """SQL 里每个字面量（按它在原文里的起始位置）用在哪，按语法树认（写法怎么变都认得出）：
-    - ("equal", 列名, 夹住的值)：在找某一个值——等值、不等、IN（含 VALUES、行值）、LIKE 一类、IS [NOT] DISTINCT FROM、
-      简单 CASE 的 WHEN、= ANY(ARRAY[…])，套了括号、负号、CAST 的照认；同一个条件里把某一个值夹住的范围（_pinned）
-      也算，夹住的值记在第三项（换不换按它认：整数的 age > 24 AND age < 26 找的是 25），别的写法第三项为空。列名是
-      被比较的那一列（小写、不带表名），另一边不是单独一列时为 None；
-    - ("range", 列名, ())：范围比较（> >= < <=、BETWEEN）的边界，是 agent 定的阈值；
-    - ("limit", None, ())：LIMIT / OFFSET / FETCH / TOP 的行数；
-    - ("other", None, ())：别的——选出列、函数参数、算式、THEN 后面的值、子查询里选出的值。
-    解析不了返回 None。"""
+    - ("equal", 列, 值)：在找某一个值——等值、不等、IN（含 VALUES、行值）、LIKE 一类、IS [NOT] DISTINCT FROM、
+      简单 CASE 的 WHEN、= ANY(ARRAY[…])，套了括号、负号、CAST 的照认；把某一个值夹住的范围（_pinned）也算，夹住的
+      值记在第三项（换不换按它认：整数的 age > 24 AND age < 26 找的是 25）；
+    - ("range", 列, 值)：范围比较（> >= < <=、BETWEEN）的边界，是 agent 定的阈值；
+    - ("limit", 空, 值)：LIMIT / OFFSET / FETCH / TOP 的行数；
+    - ("other", 空, 值)：别的——选出列、函数参数、和列一起算的算式、THEN 后面的值、子查询里选出的值。
+    列是被比较的一边取自哪些列（小写、不带表名，_columns_of：age、CAST(age AS INTEGER)、MAX(age) 都是 age）。
+    字面量是几个写死的数算出来的算式的一截（13900000000 + 1）时，算出来的值也记在第三项：整个算式按它认，用法看
+    算式摆在哪。解析不了返回 None。"""
     from app.data.sql_semantics import _parse, _read
 
     try:
@@ -1765,14 +2004,18 @@ def _literal_uses(sql: str, kind: str | None) -> dict[int, _Use] | None:
     offset = len(sql) - len(sql.lstrip())
     uses: dict[int, _Use] = {}
     try:
-        literals = {id(n): n for n in root.walk() if isinstance(n, _literal_types())}
-        pinned = _pinned(root)
-        for key, node in literals.items():
-            start = (node.meta or {}).get("start")
-            if isinstance(start, int):
-                use, column = _use_of(node)
-                points = pinned.get(key) if use == "range" else None
-                uses[start + offset] = ("equal", column, points) if points else (use, column, ())
+        values = _constants(root)
+        lifts = _lifts(root, values)
+        pinned = _pinned(root, values)
+        for node in root.walk():
+            start = (node.meta or {}).get("start") if isinstance(node, _literal_types()) else None
+            if not isinstance(start, int):
+                continue
+            use, columns, computed = _use_of(node, values, lifts)
+            extra = (_point_text(computed),) if computed is not None else ()
+            points = pinned.get(id(node))
+            uses[start + offset] = ("equal", columns, tuple(dict.fromkeys((*points, *extra)))) if points \
+                else (use, columns, extra)
     except Exception:  # noqa: BLE001 - 分析本身的缺陷不能让回答出错：按解析不了处理（认不准的地方不免）
         logger.warning("质询的 SQL 字面量分析失败", exc_info=True)
         return None
@@ -1808,8 +2051,9 @@ def _literals(sql: str, kind: str | None, secrets: _Secrets, compared: set[str]
     不了时只按词认简单的等值比较（_context），别的一律 "other"——认不准的地方不免。分词出错返回 None。
 
     照原样留着的数还得在这条 SQL 里没有别处被换掉：同一个数在别的字面量里（等值比较、算式、字符串、夹住的范围）
-    确实被换掉了，这里留着就把它露了（BETWEEN 13900000001 AND 13900000001 + 0、age >= 30 AND age = 30），所以这里改记
-    成在找这个值，再照等值的办法换：阈值也和遮罩列比较的（短的数也换）、数够长的换；别的列上的短阈值、LIMIT 的行数
+    确实被换掉了，这里留着就把它露了（buyer_phone >= 13900000001 AND buyer_phone - 13900000001 < 5、age >= 30 AND
+    age = 30；边界是算式的，算出来的值被换掉了也算：amount >= 15000 + 15000 OR amount = 30000），所以这里改记成在找
+    这个值，再照等值的办法换：阈值也和遮罩列比较的（短的数也换）、数够长的换；别的列上的短阈值、LIMIT 的行数
     （age = 30 AND visits >= 30、LIMIT 30）换不掉，照原样——短的数本来就不按值遮（SECRET_DIGITS），撞上同一个数只是
     巧合，一律换会把阈值、行数改得面目全非（见模块说明的已知局限）。
     换没换照 _swap_literal 认，和真去换的是同一套判断：只是写在日期、天数修饰、标签里（'2026-01-31'、'-30 days'、
@@ -1825,15 +2069,17 @@ def _literals(sql: str, kind: str | None, secrets: _Secrets, compared: set[str]
         if not _is_literal(kinds[i]):
             continue
         if uses is not None:
-            found[i] = uses.get(token.start, ("other", None, ()))
+            found[i] = uses.get(token.start, ("other", frozenset(), ()))
         else:
             use, column = _context(tokens, kinds, i)
-            found[i] = (use, column, ()) if use == "equal" else ("other", None, ())
+            found[i] = (use, frozenset({column} if column else ()), ()) if use == "equal" \
+                else ("other", frozenset(), ())
     kept = {i for i, (use, _, _) in found.items() if kinds[i] == "NUMBER" and use in _KEPT}
     swapped = _swapped(sql, tokens, kinds, found, kept, secrets, compared)
     for i in kept:
-        if _digits_of(tokens[i].text) in swapped:
-            found[i] = ("equal", found[i][1], ())
+        _, columns, points = found[i]
+        if any(_digits_of(v) in swapped for v in (tokens[i].text, *points)):
+            found[i] = ("equal", columns, points)
     return tokens, kinds, found
 
 
@@ -1853,17 +2099,20 @@ def _swap_literal(raw: str, text: str, kind: str, use: _Use, secrets: _Secrets, 
     """SQL 里一个字面量（原文 raw、分出来的字 text、词的种类 kind）换成什么样，和换掉了哪些遮罩数（去掉千分位、正负号）。
     _scrub_sql 照它换，_literals 照它认别处确实换掉的数，两处是同一套判断：
 
-    - 在找某一个值的（equal）：和遮罩列（或它的别名，compared）比较的，是遮罩列里出现过的值就整个换，短的数也换
-      （age = 25）；和别的列比较的，够长的遮罩值也换（另一张表里没设遮罩的同一个手机号）。夹住某一个值的范围按夹住
-      的值认（age > 24 AND age < 26 的两头都按 25 认），同一个数在别处换掉了的阈值、行数也按等值认（见 _literals）；
+    - 在找某一个值的（equal）：和遮罩列（或它的别名，compared；套了 CAST、汇总的也算，见 _columns_of）比较的，是遮罩
+      列里出现过的值就整个换，短的数也换（age = 25）；和别的列比较的，够长的遮罩值也换（另一张表里没设遮罩的同一个
+      手机号）。数换个写法照样认（25.0、025、2.5e1 按 25 认，_canonical）；夹住某一个值的范围按夹住的值认（age > 24
+      AND age < 26 的两头都按 25 认），算式里的数按算出来的值认，同一个数在别处换掉了的阈值、行数也按等值认（见
+      _literals）；
     - 字符串在哪都按值换里面的遮罩值（范围边界也一样：写成字符串的长号码做边界，多半是在找那一个人）；
     - 别的数：范围比较的边界、LIMIT / OFFSET 的行数照原样（agent 自己定的阈值，换了封存的就不是实际执行的语句）；
-      别处（选出列、函数参数、算式）认不准是不是在找某一个值，够长的遮罩值整个换。"""
-    how, column, points = use
+      别处（选出列、函数参数、算式）认不准是不是在找某一个值，够长的遮罩值整个换（算出来的值是也换）。"""
+    how, columns, points = use
     word = _masked_word()
+    canonical = _canonical(text)
+    looked = [text, *([canonical] if canonical not in (None, text) else []), *points]
     if how == "equal":
-        looked = [text, *points]
-        if any((column in compared and secrets.weak_hit(v)) or secrets.hit(v) for v in looked):
+        if any((columns & compared and secrets.weak_hit(v)) or secrets.hit(v) for v in looked):
             return _requote(raw, lambda _: word), _number_forms(looked)
     if kind != "NUMBER":
         found: list[str] = []
@@ -1876,8 +2125,8 @@ def _swap_literal(raw: str, text: str, kind: str, use: _Use, secrets: _Secrets, 
             return pattern.sub(word, inner)
 
         return _requote(raw, scrub), _number_forms(found)
-    if how not in _KEPT and secrets.hit(text):
-        return word, _number_forms([text])
+    if how not in _KEPT and any(secrets.hit(v) for v in looked):
+        return word, _number_forms(looked)
     return raw, set()
 
 
@@ -1950,9 +2199,9 @@ def _scrub_excerpt(text: str, whole: set[str] | None, secrets: _Secrets, kind: s
     """SQL 检查结果的片段：检查器按语法树重新写出的一段表达式（最长 160 字，再长截断加「…」），单独拿出来认不出在找
     哪一个值、哪个数是阈值，照整条 SQL 的认法换：整条 SQL 里整个换掉了的字面量（whole），片段里写着同样的字面量也换
     （同一个值在片段里别处出现也换，宁可多换）；整条 SQL 里照原样留着的阈值，片段里也照原样；字符串、名字、注释按值
-    换（同 _scrub_sql）。截断处可能正好截在一个值中间（'1390000…），那半截按值认不出，去掉。"""
+    换（同 _scrub_sql）。截断处可能正好截在一个值中间（'1390000…），那半截按值认不出，去掉（_cut_tail）。"""
     cut = text.endswith("…")
-    body = re.sub(r"\S*$", "", text[:-1]) if cut else text
+    body = _cut_tail(text[:-1]) if cut else text
     split = _sql_tokens(body, kind) if whole is not None and body.strip() else None
     word = _masked_word()
     if split is None:
@@ -1972,14 +2221,47 @@ def _scrub_excerpt(text: str, whole: set[str] | None, secrets: _Secrets, kind: s
     return out + "…" if cut else out
 
 
+def _cut_tail(body: str) -> str:
+    """截断的片段去掉截断处半截的值：停在没闭合的字符串、带引号的名字、注释里的，从开头的引号、注释起整个去掉（地址
+    这类遮罩值中间有空格，只去掉最后一段还会留下前半截），紧贴在引号前的前缀（N'、E'、U&'）一起去掉；停在不带引号
+    的词中间的，去掉那半个词。"""
+    opened = _unclosed(body)
+    if opened is not None:
+        return re.sub(r"[0-9A-Za-z_&]*$", "", body[:opened])
+    return re.sub(r"\S*$", "", body)
+
+
+def _unclosed(text: str) -> int | None:
+    """text 停在没闭合的字符串、带引号的名字（'…、"…、`…）或注释（/* …、-- …）里时，交回它开头的位置；不然为 None。
+    引号里两个引号连写是引号本身。"""
+    i = 0
+    while i < len(text):
+        if text.startswith(("/*", "--"), i):
+            end = text.find("*/" if text[i] == "/" else "\n", i + 2)
+            if end < 0:
+                return i
+            i = end + 2 if text[i] == "/" else end + 1
+        elif (quote := text[i]) in "'\"`":
+            end = i + 1
+            while (end := text.find(quote, end)) >= 0 and text.startswith(quote * 2, end):
+                end += 2
+            if end < 0:
+                return i
+            i = end + 1
+        else:
+            i += 1
+    return None
+
+
 #: SQL 检查结果的说明里照引的取值：「…」括起来
 _QUOTED = re.compile(r"「([^「」]*)」")
 
 
 def _scrub_message(text: str, whole: set[str] | None, secrets: _Secrets) -> str:
     """SQL 检查结果的说明：照引 SQL 里写的取值（码值表已列全时「没有码值「3」」），整条 SQL 里整个换掉了的（whole），
-    这里一样换成「已遮罩」，负数照留负号（同 SQL 里）；别的字按值换。码值表里列出的码值是数据目录写明的，不在引号
-    里，照原样。"""
+    这里一样换成「已遮罩」，负数照留负号（同 SQL 里）；别的字按值换。码值表里列出的码值（「已列出的全部码值：
+    线上直销=…」）是数据目录写明的，不从 SQL 摘，也不另外免遮：和别的字一样按值换，恰好是按值认得出的遮罩值的码值
+    （两个字以上的文字、够长的数）换成「已遮罩」，多遮，不漏；短的码值照原样。"""
     word = _masked_word()
 
     def quoted(m: re.Match[str]) -> str:
@@ -1995,8 +2277,9 @@ def _scrub_message(text: str, whole: set[str] | None, secrets: _Secrets) -> str:
 
 def _shown_literals(sqls: Iterable[tuple[str, str | None, set[str]]], secrets: _Secrets) -> set[str]:
     """几条 SQL（各自数据源的类型、SQL 里认哪些名字是遮罩列，见 _compared）里照原样留着的数，去掉千分位、正负号：
-    范围比较的边界、LIMIT / OFFSET 的行数（_scrub_sql 不换的那两种）。它们随 SQL 摆在读者眼前，回答正文里复述（「金额
-    不低于 30000 元」）再遮也遮不住什么，只会让回答和 SQL 对不上（_Secrets.show）。同一个数在别的查询里确实被换掉了
+    范围比较的边界、LIMIT / OFFSET 的行数（_scrub_sql 不换的那两种；边界是算式的，算出来的值也算：20000 * 1.5 就是
+    30000）。它们随 SQL 摆在读者眼前，回答正文里复述（「金额不低于 30000 元」）再遮也遮不住什么，只会让回答和 SQL
+    对不上（_Secrets.show）。同一个数在别的查询里确实被换掉了
     也不算（同一条里的 _literals 已经不留）：正文写出来就把那里换掉的值露了；只是写在日期、批次号、标签里没换的不牵连。
     分词都分不了的整条按值换（同 _scrub_sql），换掉的数也算。"""
     kept: set[str] = set()
@@ -2011,7 +2294,7 @@ def _shown_literals(sqls: Iterable[tuple[str, str | None, set[str]]], secrets: _
             continue
         tokens, kinds, uses = split
         keep = {i for i, (use, _, _) in uses.items() if kinds[i] == "NUMBER" and use in _KEPT}
-        kept |= {_digits_of(tokens[i].text) for i in keep}
+        kept |= {_digits_of(v) for i in keep for v in (tokens[i].text, *uses[i][2])}
         swapped |= _swapped(sql, tokens, kinds, uses, keep, secrets, compared)
     return kept - swapped
 
@@ -2073,11 +2356,11 @@ def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str]
     for artifact, snapshot in own.items():
         kind, base = kinds.get(str(snapshot.get("source") or "")), named[artifact][0]
         hidden[artifact], tainted[artifact] = _derived_hidden(snapshot, base, kind)
-        secrets.add(snapshot, hidden[artifact], labels=_written_labels(snapshot.get("sql"), kind), base=base)
+        secrets.add(snapshot, hidden[artifact], labels=_snapshot_labels(snapshot, kind), base=base)
     for snapshot, base in based:
         kind = kinds.get(str(snapshot.get("source") or ""))
-        secrets.add(snapshot, _derived_hidden(snapshot, base, kind)[0],
-                    labels=_written_labels(snapshot.get("sql"), kind), base=base)
+        secrets.add(snapshot, _derived_hidden(snapshot, base, kind)[0], labels=_snapshot_labels(snapshot, kind),
+                    base=base)
     secrets.protect(given)
     secrets.show(_shown_literals([(sql, kinds.get(name), _compared(tainted, artifact, live, name))
                                   for sql, name, artifact in shown], secrets))
@@ -2089,6 +2372,14 @@ def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str]
                                                          embedded=artifact in embedded)
     return _Plan(views=views, masked=masked, tainted=tainted, kinds=kinds, secrets=secrets,
                  gone={artifact: named[artifact][1] for artifact in own})
+
+
+def _snapshot_labels(snapshot: dict[str, Any], kind: str | None) -> dict[str, set[str]]:
+    """一份快照里只装着分档标签的列（_label_columns）。没有 SQL 的（合并查询）一个都不算。"""
+    sql = snapshot.get("sql")
+    if not isinstance(sql, str) or not sql.strip():
+        return {}
+    return _label_columns(sql, kind, [str(c) for c in snapshot.get("columns") or []])
 
 
 def _compared(tainted: dict[str, set[str]], artifact: str, live: dict[str, list[str]], name: str) -> set[str]:
