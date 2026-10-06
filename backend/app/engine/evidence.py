@@ -2497,12 +2497,15 @@ def compose_doc(
     loader: Loader | None = None,
     entities: bool = True,
     absence: bool = False,
+    masked: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """模型写的原文（带标记）→ 报告文档：渲染后的 markdown、块、句、片段、统计、违规。
 
     entities=False（报告节点 entities: off）：表名、字段名整层不管——不链接、不核对反引号，
     [[t:]] / [[c:]] 解析不了，原因是 ENTITIES_OFF_REASON。
     absence=True（写作目录有省略）：另查缺失断言（absence_claims），和句中的 [[see:]] 一样只在组装时查。
+    masked（{查询快照工件: 取自遮罩列的结果列}，报告节点按数据源的遮罩算好交进来）：另查直接引用了这些列的格子
+    （masked_cells），同样只在组装时查。没给的和以前一字不差。
 
     stats / violations 由 verify_doc 算出，和出口契约复核用的是同一个函数。
     整表标记先展开成每格一个 [[v:]] 的 Markdown 表，之后和模型自己写的表格走同一条路；
@@ -2661,9 +2664,11 @@ def compose_doc(
     }
     checked = verify_doc(doc, catalog, allow_numbers=allow_numbers, cells_allowed=cells_allowed, loader=snaps)
     # 句中的 [[see:]]、目录有省略时的缺失断言只在组装时查（交回写作者重写）：出口复核看的是数字和出处，
-    # 句子通不通、结论有没有越过证据不影响出具
+    # 句子通不通、结论有没有越过证据不影响出具。引用了遮罩列的格子也在这里查：遮罩设在数据源上，出口复核按目录
+    # 重建、查不了库；仍不改的由报告节点写进出具缺口
     doc["stats"], doc["violations"] = checked["stats"], \
-        checked["violations"] + inline_see(source) + (absence_claims(doc) if absence else [])
+        checked["violations"] + inline_see(source) + (absence_claims(doc) if absence else []) \
+        + masked_cells(doc, catalog, masked)
     return doc
 
 
@@ -3122,6 +3127,45 @@ def absence_claims(doc: dict[str, Any]) -> list[dict[str, Any]]:
                 found.append(_violation("absence_claim", ABSENCE_MESSAGE, text=m.group(0),
                                         span=[at, span[0] + m.end()], context=sentence.strip()[:120],
                                         segment=seg.get("id") if seg else None, unit=unit.get("id")))
+    return found
+
+
+def _masked_cell_message(ref: str, column: str) -> _Reason:
+    return _Reason(
+        f"引用了取自遮罩列的格子 [[{ref}]]：列「{column}」取自数据源中设置了遮罩的列，值不应写进报告",
+        f"[[{ref}]] 引用的列「{column}」取自数据源中设置了遮罩的列（手机号、姓名这类），值不能写进报告：删掉这处引用，"
+        "或者换成不含这一列的写法；整表引用时用 cols= 只列别的列",
+    )
+
+
+def masked_cells(doc: dict[str, Any], catalog: dict[str, Any], masked: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """正文直接引用了取自遮罩列的格子（[[v:Q2.r0.tel]]，整表展开出来的格也算），每格一条违规 masked_cell。
+
+    masked 是 {查询快照工件: 取自遮罩列的结果列}，由报告节点按证据面板同一个函数算好交进来（api/evidence.py 的
+    _snapshot_masks：查询当时记下的、数据源现在设的、SQL 里给遮罩列起了别名套了函数的都算）：遮罩设在数据源上，这里
+    只认文档和目录，查不了库。写作目录不遮罩（写作者要看得到数据），所以拦在自查：和没有出处的数字一样交回写作者重写，
+    仍不改的按「违规处置」办（report.py）。
+
+    违规不带那一格的值（不写 text、context）：它会进 report.checked、重写的日志、出具缺口，这些地方不能再露一次。带着
+    ref、列名、span 和所在片段：证据面板能定位，写作者知道要去掉哪一处。"""
+    if not masked:
+        return []
+    hidden = {str(a): {str(c).lower() for c in cols} for a, cols in masked.items() if cols}
+    found: list[dict[str, Any]] = []
+    for _, unit in iter_units(doc):
+        for seg in unit.get("segments") or []:
+            cite = seg.get("cite") or {}
+            if cite.get("kind") != "cell" or cite.get("status") != "resolved":
+                continue
+            artifact = str((catalog.get(cite.get("alias")) or {}).get("artifact") or "")
+            column = str((cite.get("locator") or {}).get("column") or "")
+            if not column or column.lower() not in hidden.get(artifact, ()):
+                continue
+            ref = str(seg.get("ref") or f"v:{cite.get('ref')}")
+            span = seg.get("span")
+            found.append(_violation("masked_cell", _masked_cell_message(ref, column), ref=ref, column=column,
+                                    span=list(span) if isinstance(span, list) else None, segment=seg.get("id"),
+                                    unit=unit.get("id")))
     return found
 
 

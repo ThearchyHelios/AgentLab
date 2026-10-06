@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from collections import Counter
@@ -318,6 +319,31 @@ class _RenderedStream:
             self._ctx.emit(EventType.LLM_TOKEN, delta=tail)
 
 
+async def _masked_columns(catalog: dict[str, Any]) -> dict[str, set[str]]:
+    """写作目录里每份查询快照（工件 id）取自遮罩列的结果列（小写），交给 compose_doc 的 masked。认法和证据面板的查询
+    步骤是同一个函数（api/evidence.py 的 _snapshot_masks）：查询当时记下的、数据源现在设的，SQL 里给遮罩列起了别名、
+    套了函数、经子查询转一道的也算，合并查询按逐格来历认。没有一列遮着的不列；读不出来的快照不列：引用它的格子本来就
+    解析不了。快照可能有好几份、每份几 MB，读盘复验哈希放进线程。"""
+    from app.api.evidence import _Masks, _snapshot_masks
+    from app.core.artifact_store import load
+
+    masks = _Masks()
+    out: dict[str, set[str]] = {}
+    seen: set[str] = set()
+    for entry in catalog.values():
+        artifact = entry.get("artifact") if isinstance(entry, dict) and entry.get("kind") == "query" else None
+        if not isinstance(artifact, str) or not artifact or artifact in seen:
+            continue
+        seen.add(artifact)
+        try:
+            snap = await asyncio.to_thread(load, artifact)
+        except ValueError:
+            continue
+        if isinstance(snap, dict) and (hidden := (await _snapshot_masks(snap, entry.get("source"), masks))[0]):
+            out[artifact] = hidden
+    return out
+
+
 async def _run_class(run_id: str) -> str | None:
     """按运行记录上的 run_class 取：子图、审批之后续跑都是另起的执行上下文，只有运行记录靠得住。"""
     from app.db.models import Run
@@ -523,6 +549,9 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     spec = ctx.run.spec
     catalog = report_catalog(state, spec, ctx.node)
+    # 目录里取自遮罩列的结果列：正文引用了这些列的格子，自查记一条违规（evidence.masked_cells），和没有出处的数字一样
+    # 交回写作者重写。写作目录本身不遮（写作者要看得到数据），只拦写进报告的那几格
+    masked = await _masked_columns(catalog)
     allow = report_allowance(spec, ctx.node)
     cells = True
     # 结论句策略只对升级后发起的运行生效：升级前的运行（图里也不会有 claims）事件、产出一个字不加
@@ -576,7 +605,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 第一稿、重写稿、裁判退回的改写稿都从这里过：整篇包在代码块里的先去掉外层围栏。文档的 source 记的是去掉
         # 围栏之后的正文——markdown 由它渲染，出口契约复核取回的也是这份文档
         return compose_doc(_unfenced(raw), catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
-                           cells_allowed=cells, entities=entities, absence=writer.trimmed)
+                           cells_allowed=cells, entities=entities, absence=writer.trimmed, masked=masked)
 
     response, raw = await draft(messages)
     doc = compose(raw)
@@ -616,6 +645,18 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         ctx.emit(EventType.LOG, level="warn", code="report_absence_claim", count=len(absent), texts=texts,
                  message=f"报告在证据目录有省略时写了 {len(absent)} 处缺失断言（{_named(absent)}），{tried}："
                          "被省略的查询仍在证据台账里，这类结论依据不足，应写作本报告未覆盖。报告照常产出，这几处已标注")
+    gaps: list[str] = []
+    hits = [v for v in doc["violations"] if v.get("code") == "masked_cell"]
+    if hits and not (_fatal(blocking) and on_violation == "fail"):
+        # 重写之后还引用着遮罩列（「违规处置」为标注，照常产出）：时间线上单独一行说清，节点产出里写一条出具缺口，
+        # 出口照单收下、降档（io._upstream_issuance_gaps）。只点名引用，不写那几格的值
+        tried = f"已要求模型重写 {repairs} 次仍未改掉" if repairs else "未要求重写"
+        refs = list(dict.fromkeys(str(v.get("ref") or "") for v in hits))
+        gaps.append(f"报告引用了 {len(hits)} 处取自遮罩列的格子（{_named(hits)}），{tried}，这些值会随报告出具")
+        ctx.emit(EventType.LOG, level="warn", code="report_masked_cell", count=len(hits), refs=refs,
+                 columns=list(dict.fromkeys(str(v.get("column") or "") for v in hits)),
+                 message=f"{gaps[0]}。报告照常产出，这几处已标注：数据源设置了遮罩的列不应写进报告，"
+                         "请在报告撰写节点的指令中去掉对这些列的引用")
     doc_artifact = await _store(doc, ctx)
     ctx.emit(EventType.REPORT_CHECKED, doc_artifact=doc_artifact, ok=not doc["violations"],
              stats=doc["stats"], violations=doc["violations"][:20], repairs=repairs,
@@ -646,6 +687,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "duration_ms": int((time.perf_counter() - started) * 1000),
         **({"claims": claims} if evidence_on else {}),
         **({"judge": judgement} if judgement is not None else {}),
+        # 出口契约照单收下的缺口（只在有的时候带这个键：别的报告产出和以前一字不差）
+        **({"issuance_gaps": gaps} if gaps else {}),
     }
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}, "usage": usage}
     if ctx.cfg("emit_message", True):
