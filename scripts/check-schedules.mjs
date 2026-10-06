@@ -578,12 +578,15 @@ async function reply(state, method, path, url, body) {
       return { json: { fire: f, run_id: 'run-new-1' } }
     }
     if (method === 'GET' && rest === '/fires') {
+      // 游标照服务端的写法：最后一条的记录时间，UTC 写成 Z 结尾；legacyCursor 时写成老服务端的 +00:00（「+」不编码
+      // 放进查询串会被解成空格，页面得照样翻得过去）
+      const cursor = (f) => (state.legacyCursor ? f.created_at.replace(/Z$/, '+00:00') : f.created_at)
       const limit = Number(url.searchParams.get('limit') ?? 20)
       const before = url.searchParams.get('before')
-      const start = before ? state.fires.findIndex((f) => f.fire_at === before) + 1 : 0
+      const start = before ? state.fires.findIndex((f) => cursor(f) === before) + 1 : 0
       const items = state.fires.slice(start, start + limit)
       const more = start + limit < state.fires.length
-      return { json: { items, next_before: more ? items.at(-1).fire_at : null } }
+      return { json: { items, next_before: more ? cursor(items.at(-1)) : null } }
     }
     if (method === 'POST' && rest === '/webhook/test') return { json: state.webhookTest ?? WEBHOOK_TEST_OK }
   }
@@ -1438,6 +1441,19 @@ await section('详情：触发历史分页', async () => {
   check('直接打开触发历史：不先把表单的预览请求一遍', !sent.slice(0, sent.findIndex((x) => x.key === 'GET /schedules/s-weekly/fires') + 1)
     .some((x) => x.key === 'POST /schedules/preview'))
   check('没有页面报错', !errors.length, errors.join(' ｜ '))
+
+  // 老服务端给的游标带 +00:00：页面照样编码成 %2B 传回去，第二页接得上、不重复
+  const legacy = await open('/schedules/s-weekly?tab=history', { state: freshState({ legacyCursor: true }) })
+  await legacy.page.locator('[data-fire-id]').first().waitFor()
+  await legacy.page.locator('[data-fire-more]').click()
+  await until(async () => (await legacy.page.locator('[data-fire-id]').count()) === 25)
+  const old = legacy.sent.filter((s) => s.key === 'GET /schedules/s-weekly/fires').at(-1)
+  const want = makeFires()[19].created_at.replace(/Z$/, '+00:00')
+  check('老服务端的 +00:00 游标：编码后原样传回（「+」写成 %2B）', (old?.search ?? '').includes('%2B')
+    && new URLSearchParams(old?.search ?? '').get('before') === want, old?.search ?? '')
+  check('……接在后面，共 25 条、没有重复的行', new Set(await legacy.page.locator('[data-fire-id]')
+    .evaluateAll((els) => els.map((e) => e.getAttribute('data-fire-id')))).size === 25)
+  check('……没有页面报错', !legacy.errors.length, legacy.errors.join(' ｜ '))
 
   const none = freshState({ fires: [] })
   const e = await open('/schedules/s-stock?tab=history', { state: none })
