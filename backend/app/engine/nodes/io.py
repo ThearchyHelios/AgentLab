@@ -488,6 +488,50 @@ _ON_UNSUPPORTED = ("degrade", "withhold")
 #: 要求结论句挂依据的策略：judge 在这一点上和 require_citation 一样严，另外再按裁判的判定判档
 _CITING = ("require_citation", "judge")
 
+#: 报告的正文写在代码块里、一句结论都没切出来时的缺口（_fenced_body）。不带核查节点的前缀：界面归在「校验未全部完成」下
+GAP_FENCED_BODY = "报告「{title}」的正文写在代码块里，结论句未能核对"
+#: 写的是文字的代码块：信息串为空、markdown、md（报告节点去整篇外层围栏时认的那几个，report._PROSE_INFO），另加 text。
+#: sql、python、json 这类是模型真要贴的代码
+_PROSE_FENCES = frozenset({"", "markdown", "md", "text"})
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+#: 中文的句读：一行里有汉字、又有它们的，是在写句子（SQL 里的中文列名、别名不带这些）
+_CJK_PUNCT = re.compile(r"[，。！？；：]")
+#: 英文句子：五个以上的单词，以句末标点收尾
+_EN_SENTENCE = re.compile(r"[A-Za-z]+(?:[ ,]+[A-Za-z]+){4,}[.!?](?=\s|$)")
+#: 代码里的注释行：写着中文句子也是代码的一部分
+_CODE_COMMENT = re.compile(r"\s*(?:--|//|/\*|\*/)")
+
+
+def _prose_line(line: str) -> bool:
+    if _CODE_COMMENT.match(line):
+        return False
+    return (len(_CJK.findall(line)) >= 2 and _CJK_PUNCT.search(line) is not None) \
+        or _EN_SENTENCE.search(line) is not None
+
+
+def _fenced_body(doc: dict[str, Any]) -> bool:
+    """报告的正文写在代码块里：文档里一句结论都没有，却有信息串为空 / markdown / md / text 的代码块，里面是成句的文字
+    （_prose_line）或者写着引用（[[m:…]] 这类标记，代码里不会这样写）。
+
+    报告节点只在整篇正好是一个代码块时去掉外层围栏（report._unfenced），围栏外有前言、只有开头没有收尾、信息串写成
+    text 的原样交给 compose_doc：整段正文落在代码块里，切不出结论句，裁判没有句子可判、反方审稿记 no_claims，没挂依据
+    的、证据相矛盾的结论句都数出 0 句，出具就成了完整出具。有一句结论的不算：正文没被整个藏起来，结论句照常核对。
+    信息串为空的代码块里也常是 SQL：看内容是不是成句，代码注释里的中文句子不算。"""
+    from app.engine.evidence import iter_units
+
+    units = list(iter_units(doc))
+    if any(unit.get("kind") == "claim" for _, unit in units):
+        return False
+    for block, unit in units:
+        if block.get("type") != "code" or str(block.get("lang") or "").lower() not in _PROSE_FENCES:
+            continue
+        segments = [s for s in unit.get("segments") or [] if isinstance(s, dict)]
+        if any(s.get("ref") for s in segments):
+            return True
+        if any(_prose_line(line) for line in "".join(str(s.get("text") or "") for s in segments).split("\n")):
+            return True
+    return False
+
 
 def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, Any], *, evidence_on: bool,
             governed: bool = False, uncited: list[dict[str, Any]], doc: dict[str, Any] | None = None,
@@ -507,6 +551,9 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
 
     数的是这里重新核对出来的 uncited，不信文档里记的 cites。升级前写的报告（节点产出里没有 claims 这个键，
     包括跨着升级还没跑完的运行）一律不管，契约写了也只记一条缺口：报告生成于升级前，结论句未核对。
+
+    要核对结论句、正文却写在代码块里（一句结论都没切出来，_fenced_body）的，另记一条缺口：数出 0 句不是「核对过、
+    没问题」。
     """
     written = payload.get("claims") if isinstance(payload, dict) else None
     # 报告节点升级后才在产出里记 claims（off 也记）：没有这个键就是升级前写的报告
@@ -526,6 +573,9 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
         out["gaps"].append(f"出具契约要求结论句由模型裁判，但报告「{title}」未开启模型裁判，结论句未裁判")
     if not asks:
         return
+    if doc is not None and _fenced_body(doc):
+        # 正文在代码块里，一句结论都没切出来：没挂依据的、证据相矛盾的都是 0 句，不能当成「核对过、没问题」
+        out["gaps"].append(GAP_FENCED_BODY.format(title=title))
     on_uncited = max(asks, key=_ON_UNCITED.index)
     if governed and on_uncited == "ignore":
         on_uncited = "degrade"
