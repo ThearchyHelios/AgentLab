@@ -3398,6 +3398,34 @@ export const RUN_COMPARE_TEXT = {
 }
 
 /**
+ * 运行详情「工件」页签（pages/runs/ArtifactsPane.tsx）：这次运行按内容校验值存下的每一件东西，按节点分组。筛选按
+ * pages/runs/model.ts 的 artifactGroup 分三组：证据快照是结论里数字的出处；核查记录是双盲复算、反方审稿、审批质询对
+ * 结论的核查与问答，单独一组，不和数字的出处混在一起；节点产出是过程里的中间值。各种工件的名字和说明在 model.ts，
+ * 后来新加的放在这里（质询回答的在 INQUIRY_TEXT）
+ */
+export const RUN_ARTIFACTS_TEXT = {
+  filterGroup: '按类型筛选工件',
+  filter: { all: '全部', evidence: '证据快照', verify: '核查记录', output: '节点产出' } as Record<string, string>,
+  /** 筛选按钮的悬停：这一组装的是什么。核查时执行的查询按种类仍是查询快照，归在证据快照里，要说一声 */
+  filterHint: {
+    evidence: '查询、工具调用、知识检索的原始结果，以及口径卡、报告文档和查询时的表结构：结论里的数字从这里来',
+    verify: '双盲复算的对照、反方审稿的记录、审批质询的回答：对结论的核查与问答。核查时执行的查询，快照归在证据快照里',
+    output: '每个节点每执行一次的产出：循环里每一轮都有一件',
+  } as Record<string, string>,
+  /** 同一个节点同一类的第几件：循环里几十件节点产出要分得开 */
+  nth: (n: number) => `#${n}`,
+  attempt: (n: number) => `第 ${n} 次尝试`,
+  /** 打开一件的悬停写全说明：窄屏、长问题的说明在行上会截断 */
+  openTitle: (kind: string, about: string) => `打开${kind}：${about}（读取时按内容校验值重新校验）`,
+  /**
+   * 口径卡里容器型变量（vars.*）输入的完整值（engine/nodes/metrics.py 的 metric_input，工件行的 meta 里有 {path}）：
+   * 推演时拿它还原输入。和口径卡一样归在证据快照
+   */
+  kindMetricInput: '指标输入',
+  aboutMetricInput: (path?: string | null) => (path ? `口径卡输入「${path}」的完整值` : '口径卡输入的完整值'),
+}
+
+/**
  * 可验证报告：把一次已封存运行的报告导出成一个 HTML 文件，收件人不连服务也能在浏览器里核对。
  * 入口在记录页的封存凭证条上；页面本身的文案在服务端 bundle/verifier.js 里（它是离开系统独立打开的文件）
  */
