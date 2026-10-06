@@ -1601,6 +1601,42 @@ await section('设置页「核查」一节：老服务端没有这一组时不�
   }
 })
 
+await section('设置页「核查」一节：双盲复算、反方审稿的时长设成不限时，写明仍受单次运行时限约束；审批质询的照旧', async () => {
+  // 双盲复算、反方审稿在运行里执行：一段执行有单次运行时限，时限将至时每项、每句的时长按剩余时间缩短（服务端
+  // engine/deadline.py），设成不限也一样。以前这里写「仅受模型接口自身的超时约束」，管理员会以为设成不限就能查到底。
+  // 审批质询不在运行的那一段里执行，不受单次运行时限约束，照旧
+  const off = (part) => ({ ...fx.verify[part], timeout_s: null })
+  const { page, errors } = await settingsPage({ verify: { ...fx.verify, dual_check: off('dual_check'), challenge: off('challenge'), inquiry: off('inquiry') } })
+  await page.waitForSelector('[data-verify-settings]')
+  const note = (k) => text(page.locator(`[data-verify-limit="${k}"] [data-verify-unlimited]`))
+  const RUN = '不设上限，时长仍受单次运行时限约束，时限将至时按剩余时间缩短'
+  check('双盲复算、反方审稿：说仍受单次运行时限约束', await note('dual_check.timeout_s') === RUN && await note('challenge.timeout_s') === RUN,
+    `${await note('dual_check.timeout_s')} / ${await note('challenge.timeout_s')}`)
+  check('审批质询：照旧只受模型接口自身的超时约束', await note('inquiry.timeout_s') === '不设上限，时长仅受模型接口自身的超时约束',
+    await note('inquiry.timeout_s'))
+  check('没有运行时报错', errors.length === 0, errors.join('；'))
+  // 这句比原来长：390px 下照样折行、不横向溢出，深浅色都读得清
+  for (const theme of ['dark', 'light']) {
+    const narrow = await settingsPage({ width: 390, height: 844, theme,
+      verify: { ...fx.verify, dual_check: off('dual_check'), challenge: off('challenge') } })
+    await narrow.page.waitForSelector('[data-verify-settings]')
+    await narrow.page.locator('[data-verify-limit="challenge.timeout_s"]').scrollIntoViewIfNeeded()
+    const w = await narrow.page.evaluate(() => {
+      const box = document.querySelector('[data-verify-settings]')
+      const vw = document.documentElement.clientWidth
+      const right = Math.max(...[box, ...box.querySelectorAll('*')].map((e) => e.getBoundingClientRect().right))
+      const hint = document.querySelector('[data-verify-limit="challenge.timeout_s"] [data-verify-unlimited]')
+      return { box: box.scrollWidth - box.clientWidth, beyond: Math.round(right - vw), color: hint && getComputedStyle(hint).color,
+        base: getComputedStyle(document.body).backgroundColor }
+    })
+    const ratio = contrast(w.color, w.base, w.base)
+    check(`390px（${theme}）：这句说明折行、不横向溢出，对比度 ≥ 4.5`, w.box <= 0 && w.beyond <= 0 && ratio >= 4.5,
+      `${JSON.stringify({ box: w.box, beyond: w.beyond })} · ${ratio.toFixed(2)}`)
+    await shot(narrow.page, `settings-run-timeout-${theme}`)
+    check(`390px（${theme}）：没有运行时报错`, narrow.errors.length === 0, narrow.errors.join('；'))
+  }
+})
+
 await browser.close()
 console.log(failed ? `\n✗ 双盲复算与反方审稿：${failed} 项未通过` : '\n✓ 双盲复算与反方审稿：全部通过')
 process.exit(failed ? 1 : 0)

@@ -3782,6 +3782,12 @@ export const DUAL_CHECK_TEXT = {
   } as Record<string, string>,
   limitAny: '上限',
   limitDailyNext: '今日核查费用已达上限。请在「设置 → 偏好设置 → 核查」中调高每日金额上限，或等到次日再运行',
+  /**
+   * 单次运行时限将至（日志带 cause: run_deadline，服务端 engine/deadline.py）：一段执行（两次人工审批之间）有单次运行
+   * 时限，核查节点为后续节点预留时间，剩下的时间不够就不再开始新的一项，开始了的按剩余时间缩短时长。双盲复算、反方审稿
+   * 这几行共用这句副标题，seconds 是单次运行时限（设置页「运行环境」里的叫法）
+   */
+  deadlineSub: (seconds: number) => `单次运行时限为 ${formatNumber(seconds)} 秒，已为后续节点预留时间`,
   log: {
     skippedDisabled: '双盲复算未启用，已跳过',
     skippedDisabledNext: '如需复算，请在节点的「启用双盲复算」中选择「开启」，或在「设置 → 偏好设置 → 核查」中启用双盲复算',
@@ -3823,6 +3829,14 @@ export const DUAL_CHECK_TEXT = {
     unchecked: (n?: number) => (n ? `双盲复算有 ${formatNumber(n)} 个指标无法复算，已记为缺口`
       : '双盲复算有指标无法复算，已记为缺口'),
     uncheckedNext: '无法复算的原因见展开内容。来自合并查询、遮罩列的输入无法单独复算；盲算触顶、出错的，可调高「设置 → 偏好设置 → 核查」中的上限后重新运行',
+    /**
+     * dual_check_unchecked 带 cause: run_deadline：单次运行时限将至，没来得及盲算、缩短时长后到时没算完的指标（服务端
+     * 另起这一条，原因都一样，副标题只点名）。调高每项的上限只会更快撞线，检查模型、数据源也无济于事：下一步说怎么腾出时间
+     */
+    deadline: (n?: number) => (n ? `运行时限将至，双盲复算有 ${formatNumber(n)} 个指标未能复算，已记为缺口`
+      : '运行时限将至，双盲复算有指标未能复算，已记为缺口'),
+    deadlineNext: '如需全部复算，可在节点的「复算的指标」中减少指标，或在双盲复算前加人工审批（时限按审批前后分段计算）；'
+      + '确需更长时间，请联系管理员调大单次运行时限（AGENTLAB_MAX_RUN_SECONDS）',
   },
   /**
    * 出具缺口里双盲复算、反方审稿报上来的那几条（缺口以「双盲复算「节点名」：」「反方审稿：」开头）：时间线、成果卡片、
@@ -3980,6 +3994,19 @@ export const CHALLENGE_TEXT = {
     unreviewed: (n?: number) => (n ? `反方审稿有 ${formatNumber(n)} 句结论未能反查，已记为无法判断`
       : '反方审稿有结论未能反查，已记为无法判断'),
     unreviewedNext: '原因见展开内容。请检查核查模型和数据源是否可用，修正后重新运行；报告未引用数据库查询的结论无法反查',
+    /**
+     * 带 cause: run_deadline 的两条（服务端 engine/deadline.py）：单次运行时限将至，反方审稿为后续节点预留时间。
+     * challenge_unreviewed 是剩下的句子不再反查；challenge_limit 是开始了的句子按剩余时间缩短了反查时长、到时按查到的结果
+     * 收尾（n：这样的句数，skipped：其中未能给出判断的）。调高每句的上限只会更快撞线，检查模型、数据源也无济于事
+     */
+    deadline: (n?: number) => (n ? `运行时限将至，反方审稿有 ${formatNumber(n)} 句结论未反查，已记为无法判断`
+      : '运行时限将至，反方审稿有结论未反查，已记为无法判断'),
+    deadlineLimit: (n?: number, skipped?: number) => {
+      const head = n ? `运行时限将至，反方审稿缩短了 ${formatNumber(n)} 句结论的反查时长` : '运行时限将至，反方审稿缩短了反查时长'
+      return skipped ? `${head}，其中 ${formatNumber(skipped)} 句未能给出判断` : `${head}，已按查到的结果给出判断`
+    },
+    deadlineNext: '如需全部审完，可在节点或「设置 → 偏好设置 → 核查」中减少每份报告审的句数，或在反方审稿前加人工审批'
+      + '（时限按审批前后分段计算）；确需更长时间，请联系管理员调大单次运行时限（AGENTLAB_MAX_RUN_SECONDS）',
     /** challenge_sources_lost：反查了，但该查的数据源有停用了的，判断不含它们的数据 */
     sourcesLost: (n?: number) => (n ? `反方审稿有 ${formatNumber(n)} 句结论只查了部分数据源` : '反方审稿有结论只查了部分数据源'),
     sourcesLostSub: (names: string[]) => `未能查询：${names.map((x) => `「${x}」`).join('、')}（已不存在或已停用），判断不含其中的数据`,
@@ -4043,9 +4070,14 @@ export const VERIFY_SETTING_TEXT = {
     } as Record<string, string>,
     toleranceHint: '两边的值相差不超过这个比例时算一致，例如 0.000001 表示百万分之一，0 表示必须完全相同',
     unlimited: '不限',
-    /** 某项设成不限时写明它还受什么约束，不要悄悄生效。by：眼下还设着上限的相关项 */
-    unlimitedNote: (kind: 'queries' | 'claims' | 'timeout' | 'daily', by: string[]) => {
+    /**
+     * 某项设成不限时写明它还受什么约束，不要悄悄生效。by：眼下还设着上限的相关项。runTimeout 是双盲复算、反方审稿的
+     * 时长：它们在运行里执行，一段执行有单次运行时限，时限将至时按剩余时间缩短（服务端 engine/deadline.py），设成不限
+     * 也一样；timeout 是审批质询的，不在运行的那一段里执行
+     */
+    unlimitedNote: (kind: 'queries' | 'claims' | 'timeout' | 'runTimeout' | 'daily', by: string[]) => {
       if (kind === 'timeout') return '不设上限，时长仅受模型接口自身的超时约束'
+      if (kind === 'runTimeout') return '不设上限，时长仍受单次运行时限约束，时限将至时按剩余时间缩短'
       const what = kind === 'queries' ? '查询次数' : kind === 'claims' ? '句数' : '每日核查费用'
       return by.length ? `不设上限，${what}仅受${by.join('、')}约束` : `不设上限，${what}不受其他上限约束`
     },

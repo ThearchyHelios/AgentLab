@@ -2396,5 +2396,92 @@ await section('审批质询 approval.inquiry（期 4）：一行「审批人质�
   check('……有回答、没写成没成：只说已回答，不说完成', oddRows[4]?.sub === '已回答' && oddRows[4].level === 'info', `${oddRows[4]?.sub} / ${oddRows[4]?.level}`)
 })
 
+await section('单次运行时限将至（cause: run_deadline）：核查没做完的那几行说时限，下一步不叫人调高上限、不叫人查模型和数据源', async () => {
+  // 一段执行（两次人工审批之间）有单次运行时限。双盲复算、反方审稿为后续节点预留时间：剩下的时间不够就不再开始，开始了的
+  // 按剩余时间缩短时长（服务端 engine/deadline.py）。以前这几项照常记成「已达时长上限」「未能反查」「无法复算」，下一步叫人
+  // 调高每句、每项的上限（调高了只会更快撞线），或者去查核查模型和数据源（它们本来就没问题）。现在服务端另起一条、带
+  // cause: run_deadline 和 run_seconds，界面照它说。先核对后端还是这么发的
+  const dlPy = readFileSync(`${root}backend/app/engine/deadline.py`, 'utf8')
+  const chPy = readFileSync(`${root}backend/app/engine/nodes/challenge.py`, 'utf8')
+  const dcPy = readFileSync(`${root}backend/app/engine/nodes/dual_check.py`, 'utf8')
+  check('后端发的还是这几种形状', dlPy.includes('RUN_DEADLINE = "run_deadline"')
+    && chPy.includes('code="challenge_unreviewed", cause=deadline.RUN_DEADLINE')
+    && chPy.includes('{"cause": deadline.RUN_DEADLINE, "run_seconds": self.run_seconds, "claims": touched}')
+    && dcPy.includes('code="dual_check_unchecked", cause=late[0]["cause"], run_seconds=seconds'),
+  '改了 deadline.py、challenge.py、dual_check.py 里这几条日志的字段，就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const LATE = '本次运行即将达到 600 秒的时长上限，为保证运行按时完成，剩下 3 句未审'
+  const BLIND = '本次运行即将达到 600 秒的时长上限，为保证运行按时完成，未进行盲算'
+  const events = [
+    E(1, 'run.started', null, { total: 3 }),
+    E(2, 'node.started', 'dc', { node_type: 'dual_check', label: '复核五个指标' }),
+    // 同一节点里别的原因照旧一条，时限将至的另起一条
+    E(3, 'log', 'dc', { level: 'warn', code: 'dual_check_unchecked', message: '双盲复算未能核对 1 个指标：「订单数」（盲算没有查到这个数），按无法复算计入缺口',
+      metrics: [{ id: 'orders', name: '订单数', reason: '盲算没有查到这个数' }] }),
+    E(4, 'log', 'dc', { level: 'warn', code: 'dual_check_unchecked', cause: 'run_deadline', run_seconds: 600,
+      message: `本次运行即将达到 600 秒的时长上限，为保证运行按时完成，双盲复算有 3 个指标未能复算：「付款客户数」「最大单笔」「low」，按无法复算计入缺口`,
+      metrics: [{ id: 'buyers', name: '付款客户数', reason: BLIND }, { id: 'top', name: '最大单笔', reason: BLIND }, { id: 'low', name: '', reason: BLIND }] }),
+    E(5, 'node.finished', 'dc', { duration_ms: 20 }),
+    E(6, 'node.started', 'ch', { node_type: 'challenge', label: '审周报' }),
+    // 第 1 句触了自己的每句时长上限，第 2 句的时长缩短过、到时没给出判断：两条都是 limit: timeout_s
+    E(7, 'log', 'ch', { level: 'warn', code: 'challenge_limit', limit: 'timeout_s', claims_skipped: 0,
+      message: '有 1 句反查已达上限（每句时长上限 90 秒），已按查到的结果收尾' }),
+    E(8, 'log', 'ch', { level: 'warn', code: 'challenge_limit', limit: 'timeout_s', claims_skipped: 1, cause: 'run_deadline', run_seconds: 600, claims: 1,
+      message: '有 1 句反查已达上限（本次运行即将达到 600 秒的时长上限，反查时长已按剩余时间收紧），已按查到的结果收尾，其中 1 句未能给出结论' }),
+    E(9, 'log', 'ch', { level: 'warn', code: 'challenge_unreviewed', claims_skipped: 1, reason: '反查没有执行成功任何查询',
+      message: '反方审稿有 1 句结论未能反查，已记为无法判断：反查没有执行成功任何查询' }),
+    E(10, 'log', 'ch', { level: 'warn', code: 'challenge_unreviewed', cause: 'run_deadline', run_seconds: 600, claims_skipped: 3, reason: LATE,
+      message: `反方审稿有 3 句结论未能反查，已记为无法判断：${LATE}` }),
+    E(11, 'node.finished', 'ch', { duration_ms: 30 }),
+    E(12, 'run.finished', null, { status: 'succeeded' }),
+  ]
+  const all = flatten(mod.decodeRun(events))
+  const rows = (code) => all.filter((s) => s.code === code)
+  const [dcOther, dcLate] = rows('dual_check_unchecked')
+  const [ownLimit, lateLimit] = rows('challenge_limit')
+  const [chOther, chLate] = rows('challenge_unreviewed')
+  const late = [dcLate, lateLimit, chLate]
+  check('每条一行，挂在自己的节点下', all.find((s) => s.nodeId === 'dc' && s.kind === 'node')?.children?.filter((x) => x.code === 'dual_check_unchecked').length === 2
+    && all.find((s) => s.nodeId === 'ch' && s.kind === 'node')?.children?.filter((x) => /^challenge_/.test(x.code ?? '')).length === 4,
+  all.map((s) => s.code).filter(Boolean).join('、'))
+  check('dual_check_unchecked：标题说运行时限将至，副标题只点名（没名字的写 id）、带上时限', dcLate?.title === '运行时限将至，双盲复算有 3 个指标未能复算，已记为缺口'
+    && dcLate.sub === '「付款客户数」、「最大单笔」、「low」；单次运行时限为 600 秒，已为后续节点预留时间' && dcLate.level === 'warn', `${dcLate?.title} / ${dcLate?.sub}`)
+  check('challenge_limit：缩短过的那条不说「已达时长上限」，说几句缩短了、几句没给出判断', lateLimit?.title === '运行时限将至，反方审稿缩短了 1 句结论的反查时长，其中 1 句未能给出判断'
+    && lateLimit.sub === '单次运行时限为 600 秒，已为后续节点预留时间' && lateLimit.level === 'warn', `${lateLimit?.title} / ${lateLimit?.sub}`)
+  check('challenge_unreviewed：标题说几句未反查、记为无法判断，副标题说时限', chLate?.title === '运行时限将至，反方审稿有 3 句结论未反查，已记为无法判断'
+    && chLate.sub === '单次运行时限为 600 秒，已为后续节点预留时间' && chLate.level === 'warn', `${chLate?.title} / ${chLate?.sub}`)
+  check('……三行的下一步都说怎么腾出时间：减少句数或指标、在核查前加人工审批、请管理员调大单次运行时限', late.every((s) => !!s?.next?.includes('人工审批')
+    && s.next.includes('单次运行时限') && s.next.includes('AGENTLAB_MAX_RUN_SECONDS'))
+    && dcLate?.next?.includes('「复算的指标」') && !!chLate?.next?.includes('句数') && lateLimit?.next === chLate?.next, late.map((s) => s?.next).join(' / '))
+  check('……不叫人调高核查的上限，也不叫人去查核查模型和数据源', late.every((s) => !/调高|核查模型|数据源是否/.test(`${s?.title}${s?.sub ?? ''}${s?.next ?? ''}`)),
+    late.map((s) => s?.next).join(' / '))
+  check('……原话留在展开区，标题、副标题、下一步里没有内部代码', late.every((s, i) => s?.detail === events[[3, 7, 9][i]].data.message
+    && !/run_deadline|cause|run_seconds|timeout_s/.test(`${s.title}${s.sub ?? ''}${s.next ?? ''}`)))
+  // 别的原因照旧：同一节点里的两条分得开，不是两行一样的「已达时长上限」
+  check('别的原因那几行照旧：触了自己的上限仍叫人调高上限，未能反查、无法复算仍按原因说', ownLimit?.title === '反方审稿已达时长上限'
+    && !!ownLimit.next?.includes('调高') && ownLimit.title !== lateLimit?.title
+    && chOther?.title === '反方审稿有 1 句结论未能反查，已记为无法判断' && chOther.sub === '反查没有执行成功任何查询' && !!chOther.next?.includes('核查模型')
+    && dcOther?.title === '双盲复算有 1 个指标无法复算，已记为缺口' && dcOther.sub === '「订单数」：盲算没有查到这个数' && !!dcOther.next?.includes('合并查询'),
+  [ownLimit, chOther, dcOther].map((s) => `${s?.title}|${s?.sub ?? ''}`).join(' / '))
+
+  // 都缩短了、都给出了判断；缺字段、类型不对（别的服务端版本）：不崩，不出 undefined、NaN、[object Object]，不瞎填数
+  const odd = flatten(mod.decodeRun([
+    E(1, 'node.started', 'ch', { node_type: 'challenge' }),
+    E(2, 'log', 'ch', { level: 'warn', code: 'challenge_limit', limit: 'timeout_s', claims_skipped: 0, cause: 'run_deadline', run_seconds: 1800, claims: 2, message: 'x' }),
+    E(3, 'log', 'ch', { level: 'warn', code: 'challenge_limit', limit: 'timeout_s', cause: 'run_deadline', run_seconds: 'x', claims: 'y', message: 'x' }),
+    E(4, 'log', 'ch', { level: 'warn', code: 'challenge_unreviewed', cause: 'run_deadline', claims_skipped: 'x', reason: LATE, message: 'x' }),
+    E(5, 'log', 'ch', { level: 'warn', code: 'dual_check_unchecked', cause: 'run_deadline', run_seconds: -1, metrics: 'x', message: 'x' }),
+    E(6, 'node.finished', 'ch', {}),
+  ])).filter((s) => s.code && s.kind !== 'node')
+  const [settled, bareLimit, bareUnreviewed, bareUnchecked] = odd
+  check('都给出了判断：说按查到的结果给出判断，时限照写（大于 1,000 用千分位）', settled?.title === '运行时限将至，反方审稿缩短了 2 句结论的反查时长，已按查到的结果给出判断'
+    && settled.sub === '单次运行时限为 1,800 秒，已为后续节点预留时间', `${settled?.title} / ${settled?.sub}`)
+  check('缺字段：标题不带数，没给时限就不写那句副标题（未能反查的退回原因）', bareLimit?.title === '运行时限将至，反方审稿缩短了反查时长，已按查到的结果给出判断'
+    && bareLimit.sub === undefined && bareUnreviewed?.title === '运行时限将至，反方审稿有结论未反查，已记为无法判断' && bareUnreviewed.sub === LATE
+    && bareUnchecked?.title === '运行时限将至，双盲复算有指标未能复算，已记为缺口' && bareUnchecked.sub === undefined,
+  odd.map((s) => `${s.title}|${s.sub ?? ''}`).join(' ; '))
+  check('……不出 undefined、NaN、[object Object]', !odd.some((s) => /undefined|NaN|object Object/.test(`${s.title}${s.sub ?? ''}${s.next ?? ''}`)))
+})
+
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')
 process.exit(failed ? 1 : 0)
