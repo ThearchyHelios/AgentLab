@@ -199,6 +199,20 @@ const PROV_MODEL = {
   ],
   edges: chain('in', 'look', 'team', 'done'),
 }
+/**
+ * 一处给不出修复（K1b）：协作节点点名的接入不存在，成员「研究员」跟随节点的接入、自己只写了停用的 demo-off 提供的模型——
+ * 节点换成哪家、去掉接入，研究员都落不稳，这一处没有修复，提示也不指到发布前检查；成员「分析师」自己点名的接入不存在，
+ * 改用 demo-main 落得稳，有修复。两条同编号、同节点：前一条不能借后一条的修复
+ */
+const PROV_NOFIX = {
+  nodes: [
+    node('in', 'input', 0, '入口', { fields: [{ name: 'week', required: true }] }),
+    node('team', 'supervisor', 240, '协作', { goal: '复核', provider: 'demo-old',
+      agents: [{ name: '分析师', provider: 'demo-old', tools: [] }, { name: '研究员', model: 'tiny-1', tools: [] }] }),
+    node('done', 'output', 480, '成果', { fields: [{ name: 'report', value: '{{ last_message }}' }] }),
+  ],
+  edges: chain('in', 'team', 'done'),
+}
 const PROVIDERS = [
   { id: 'pv-main', name: 'demo-main', kind: 'openai_compatible', base_url: 'https://example.com/v1', default_model: 'big-model',
     models: [{ id: 'big-model' }], enabled: true, extra: {}, api_key_masked: '', has_key: true },
@@ -226,6 +240,7 @@ const FAKES = {
   'pf-prov': wf('pf-prov', '__publish_check_provider__', PROV),
   'pf-provok': wf('pf-provok', '__publish_check_provider_ok__', PROV_OK),
   'pf-provmodel': wf('pf-provmodel', '__publish_check_provider_model__', PROV_MODEL),
+  'pf-provnofix': wf('pf-provnofix', '__publish_check_provider_nofix__', PROV_NOFIX),
 }
 
 const clone = (x) => JSON.parse(JSON.stringify(x))
@@ -234,11 +249,12 @@ const who = (n) => `「${n.data.label}」`
 const metricOptions = (m) => m.data.config.metrics.map((x) => ({ value: x.id, label: `${x.name}（${x.id}）`, hint: `口径卡「${m.data.label}」` }))
 
 /**
- * 伪造的点名接入检查，形状照后端 engine/provider_refs.py 与 autofix._plan_provider：一处一条问题（字段 provider、
+ * 伪造的点名接入检查，形状照后端 engine/provider_refs.py 与 autofix.provider_choice：一处一条问题（字段 provider、
  * agents[i].provider），门禁里是 error、带一条要人选的修复（id 是 code:节点:字段）；画布校验里是 warning、没有修复。
- * 候选照后端按执行时的取法算去掉、换掉以后落到哪里（只覆盖这两张图用到的情形，图里没有全图默认）：节点去掉接入落到
+ * 候选照后端按执行时的取法算去掉、换掉以后落到哪里（只覆盖这几张图用到的情形，图里没有全图默认）：节点去掉接入落到
  * 第一个可用的接入；成员去掉接入跟随节点自己的接入，那个接入停用了就不给这一项；落到的接入不提供同一处写着的模型时
- * 模型一并去掉（_drops 记哪几个候选要去掉，应用时用，前端收不到）
+ * 模型一并去掉（_drops 记哪几个候选要去掉，应用时用，前端收不到）。协作节点换掉、去掉接入时，跟着它的成员自己写着
+ * 没有启用接入提供的模型，一个候选都落不稳：没有修复，提示不写「或在「发布前检查」中改用其他接入」
  */
 function providerLint(graph, providers, level) {
   const issues = []
@@ -261,26 +277,29 @@ function providerLint(graph, providers, level) {
     const code = p ? 'provider.disabled' : 'provider.missing'
     const id = `${code}:${r.n.id}:${r.field}`
     const gate = level === 'error'
-    issues.push({ level, node_id: r.n.id, field: r.field, code, fix: gate ? id : null,
-      message: `${r.who}指定的模型接入「${r.name}」${p ? '已停用' : '不存在'}。请在「设置 → 模型接入」中${p ? '启用它' : '核对名称'}，`
-        + '或在「发布前检查」中改用其他接入' })
-    if (!gate) continue
     const model = r.holder.model
     const options = []
     const drops = []
     const up = r.team && r.n.data.config.provider ? providers.find((x) => x.name === r.n.data.config.provider) : enabled[0]
-    if (up?.enabled) {
+    const stuck = !r.team && (r.n.data.config.agents ?? []).some((a) => !a.provider && a.model && !enabled.some((x) => serves(x, a.model)))
+    if (up?.enabled && !stuck) {
       const drop = !!model && !serves(up, model)
       if (drop) drops.push('')
       options.push({ value: '', label: '不指定接入', hint: `去掉这一处指定的接入${drop ? `和模型「${model}」` : ''}，执行时改用`
         + (r.team && r.n.data.config.provider ? `${r.team}指定的接入「${up.name}」` : `第一个可用的模型接入「${up.name}」`) })
     }
-    for (const x of enabled) {
+    for (const x of stuck ? [] : enabled) {
       const drop = !!model && !serves(x, model)
       if (drop) drops.push(x.name)
       options.push({ value: x.name, label: x.name, hint: drop ? `不提供模型「${model}」，将改用它的默认模型「${x.default_model}」` : null })
     }
-    fixes.push({ id, code, node_id: r.n.id, field: r.field, kind: 'choice', label: `选择${r.who}改用的模型接入`, options, _drops: drops })
+    const fixable = options.length > 0
+    issues.push({ level, node_id: r.n.id, field: r.field, code, fix: gate && fixable ? id : null,
+      message: `${r.who}指定的模型接入「${r.name}」${p ? '已停用' : '不存在'}。请在「设置 → 模型接入」中${p ? '启用它' : '核对名称'}`
+        + (fixable ? '，或在「发布前检查」中改用其他接入' : '') })
+    if (gate && fixable) {
+      fixes.push({ id, code, node_id: r.n.id, field: r.field, kind: 'choice', label: `选择${r.who}改用的模型接入`, options, _drops: drops })
+    }
   }
   // 哪一级都没写接入、只写了模型：按模型名找，只有停用的接入提供它时同样是问题，落在写模型的那一处。修复是「不指定
   // 模型」（落到第一个可用的接入）或改用一个启用的接入（写在模型旁边，模型去掉）
@@ -619,7 +638,7 @@ async function open({ id = 'pf-hard', width = 1440, height = 900, backend = 'new
   const state = { checks: [], autofixes: [], patches: [], publishes: [], upgrades: [], version: FAKES[id].version, graph: clone(FAKES[id].graph), save, backend, upgrade,
     validate: 'ok', validates: 0, deleted: [] }
   // 点名接入、只写了模型的那几张图：接入表伪造，校验、门禁、修复都按它现算
-  const providers = ['pf-prov', 'pf-provok', 'pf-provmodel'].includes(id) ? clone(PROVIDERS) : null
+  const providers = ['pf-prov', 'pf-provok', 'pf-provmodel', 'pf-provnofix'].includes(id) ? clone(PROVIDERS) : null
   state.providers = providers
 
   await page.route(/\/api\//, (route) => {
@@ -1718,6 +1737,25 @@ await section('点名的模型接入：一处一行、各有一组要人选的�
   await waitFor(page, async () => (await dialog(page).locator('[data-preflight-issue^="provider."]').count()) === 2)
   check('……重查之后剩两处', await dialog(page).locator('[data-preflight-issue^="provider."]').count() === 2)
   await shoot(page, 'publish-provider-fix', dialog(page))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+await section('点名的模型接入：给不出修复的那一处不借同节点别处的修复，提示也不指到发布前检查', async () => {
+  const { page, errors } = await open({ id: 'pf-provnofix' })
+  await openDialog(page)
+  await waitFor(page, async () => (await dialog(page).locator('[data-preflight-issue^="provider."]').count()) === 2)
+  const rows = dialog(page).locator('[data-preflight-issue^="provider."]')
+  const own = rows.nth(0)
+  const member = rows.nth(1)
+  const ownText = await own.innerText().catch(() => '')
+  check('协作节点自己的接入：一行，没有修复（选项、预览按钮都没有）', await own.locator('[data-fix-choice]').count() === 0
+    && await own.getAttribute('data-fix-kind') === null, ownText.replace(/\s+/g, ' ').slice(0, 100))
+  check('……提示只说去设置里核对，不指到发布前检查', ownText.includes('指定的模型接入「demo-old」不存在。请在「设置 → 模型接入」中核对名称')
+    && !ownText.includes('发布前检查'), ownText.replace(/\s+/g, ' ').slice(0, 120))
+  check('成员「分析师」那一处：自己的修复画在自己这一行', await member.locator('[data-fix-choice="provider.missing:team:agents[0].provider"]').count() === 1
+    && (await member.innerText()).includes('或在「发布前检查」中改用其他接入'))
+  check('整个弹窗里只有这一组接入的修复', await dialog(page).locator('[data-fix-choice^="provider."]').count() === 1)
+  await shoot(page, 'publish-provider-nofix', dialog(page))
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 })
 

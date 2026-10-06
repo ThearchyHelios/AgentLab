@@ -920,6 +920,12 @@ export const PUBLISH_FIX_TEXT = {
 } as const
 
 /**
+ * 停用一个接入的后果。不只是下拉里看不到：点名它（或只写了它的模型）的节点、门控 / 裁判 / 核查设置，运行时都照实报错，
+ * 由定时任务发起的正式运行直接失败（后端 providers/factory.named_provider）
+ */
+const PROVIDER_DISABLED_EFFECT = '该接入的模型不再出现在下拉列表中；指定该接入或其模型的节点和设置将无法调用，运行时报错'
+
+/**
  * 点名的模型接入不存在或已停用（后端 providers/factory.named_provider、engine/provider_refs.py）。以前点名的接入不存在时
  * 运行悄悄换成演示模型、点名停用的照常调用；现在运行照实报错，设置页、画布校验、发布前检查都提前说出来
  */
@@ -942,6 +948,45 @@ export const PROVIDER_REF_TEXT = {
   judgeBroken: '裁判调用将失败，所有结论句记为未裁判',
   // 和核查一组「不存在」那句（VERIFY_SETTING_TEXT.section.providerGone）同一个后果
   verifyBroken: '核查调用将失败',
+  /**
+   * 存着的接入名恰好是某个启用接入的模型（多半是把模型名填进了接入那一栏）：照「启用它」去做，启用的是那条旧接入。
+   * 和服务端保存时 422 的那一句（factory.model_note）一字不差；两栏写这一组的叫法（「门控模型 · 模型」「门控模型 · 接入」）
+   */
+  modelNote: (name: string, owner: string, modelField: string, providerField: string) =>
+    `「${name}」是接入「${owner}」的模型：如需使用该模型，请在「${modelField}」中填写，「${providerField}」留空或选择「${owner}」`,
+  /** 接入编辑框「启用」旁的说明、接入卡片上「已停用」的悬停说明 */
+  enabledHint: `停用后，${PROVIDER_DISABLED_EFFECT}`,
+  disabledChip: `已停用：${PROVIDER_DISABLED_EFFECT}`,
+  /**
+   * 检查器模型一栏的空选项：节点（没写就是全图默认）点名了接入时，留空用的是那个接入的默认模型，照实说是哪个；那个接入
+   * 不存在、已停用时说状态（检查器顶上另有接入那条问题），不说「使用」。和画布校验那条「没有指定模型，将使用接入「X」的
+   * 默认模型」同一个说法（后端 schema.MODEL_UNSET）
+   */
+  modelBlank: (named: string | null, state: 'ok' | 'missing' | 'disabled') => (!named ? '默认（使用第一个可用的模型接入）'
+    : state === 'missing' ? `默认（模型接入「${named}」不存在）`
+      : state === 'disabled' ? `默认（模型接入「${named}」已停用）` : `默认（使用接入「${named}」的默认模型）`),
+  /** 同一栏下面的说明（没点名接入时用节点定义里的那句）；点名的接入不存在、已停用时不写，免得和接入那条问题打架 */
+  modelHelp: (named: string) => `留空则使用接入「${named}」的默认模型`,
+} as const
+
+/**
+ * 「编排」页助手栏里「助手使用的模型」那一格（run/Composer.tsx）。服务端报助手的模型取不到时，指的就是这里
+ * （providers/factory.ASSISTANT_REPICK）：设置页没有助手的接入这一项，存着的接入失效了只能在这里重新选
+ */
+export const ASSISTANT_MODEL_TEXT = {
+  /** 和服务端 factory.ASSISTANT_MODEL_FIELD 一字不差：报错里让人去「助手使用的模型」中重新选择 */
+  label: '助手使用的模型',
+  follow: '跟随默认',
+  current: (model: string) => `（当前：${model}）`,
+  /**
+   * 存着的设定下拉里列不出来（点名了接入——下拉只选模型；或者模型不在可选列表中）：照实列成一项并选中它。否则下拉停在
+   * 「跟随默认」，看着一切正常，再选「跟随默认」也不算改动、清不掉存着的接入
+   */
+  saved: (provider: string | null, model: string | null) => (provider
+    ? (model ? `${model}（模型接入「${provider}」）` : `模型接入「${provider}」的默认模型`) : (model ?? '')),
+  note: '仅影响助手，不改变节点使用的模型。助手需要严格按格式输出，指令遵循能力较弱的模型可能无法生成工作流。',
+  /** 存着的设定用不了时，齿轮按钮的悬停说明（按钮上另有一个红点） */
+  broken: '助手使用的模型当前无法调用，点击查看原因',
 } as const
 
 /**

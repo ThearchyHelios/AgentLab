@@ -186,7 +186,7 @@ function ProviderCard({ provider: p, kindLabel, onEdit, onRemove }: {
         <span className="text-sm font-medium">{p.name}</span>
         <span className="chip">{kindLabel}</span>
         {p.default_model && <span className="chip mono" title="默认模型">{p.default_model}</span>}
-        {!p.enabled && <span className="chip" title="停用的接入不会出现在模型下拉里">已停用</span>}
+        {!p.enabled && <span className="chip" title={PROVIDER_REF_TEXT.disabledChip}>已停用</span>}
         <span className="flex-1" />
         <HealthPill record={record} checkingSince={checkingSince} />
         <div className="flex items-center gap-1">
@@ -577,7 +577,7 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
 
         <label className="flex items-center gap-2 text-xs">
           <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
-          启用<span className="text-2xs text-faint">停用后，该接入的模型不会出现在节点的模型下拉列表中</span>
+          启用<span className="text-2xs text-faint" data-provider-enabled-hint="">{PROVIDER_REF_TEXT.enabledHint}</span>
         </label>
 
         {blocked && <p className="text-2xs text-faint">还缺：{missing.join('、')}</p>}
@@ -803,13 +803,18 @@ function PrefsTab() {
   const collectionMissing = !collectionNames.includes(cur.collection)
   /**
    * 接入那一格下面的报错：服务端按这一项拒收的话照它的整句；否则存着（或选着）的接入不存在、已停用时说清这一项会怎样。
-   * 只在接入表取到了时判「不存在」：表还没取回来，什么都找不到
+   * 只在接入表取到了时判「不存在」：表还没取回来，什么都找不到。labels 是这一组接入、模型两栏的叫法：名字恰好是某个
+   * 启用接入的模型时（多半是把模型名填进了接入一栏）补一句怎么用它，同服务端保存时那句，免得照「启用」去启用那条旧接入
    */
-  const providerError = (field: string, name: string, found: Provider | undefined, broken: string): string | undefined => {
+  const providerError = (field: string, name: string, found: Provider | undefined, broken: string,
+    labels: { provider: string; model: string }): string | undefined => {
     if (fieldError?.field === field) return fieldError.message
     if (!name || !providers.length) return undefined
-    if (!found) return `${PROVIDER_REF_TEXT.missing(name)}：${broken}`
-    return found.enabled ? undefined : `${PROVIDER_REF_TEXT.disabled(name)}：${broken}`
+    if (found?.enabled) return undefined
+    const state = found ? PROVIDER_REF_TEXT.disabled(name) : PROVIDER_REF_TEXT.missing(name)
+    const owner = providerOfModel(providers, name)
+    const note = owner?.enabled ? `。${PROVIDER_REF_TEXT.modelNote(name, owner.provider.name, labels.model, labels.provider)}` : ''
+    return `${state}：${broken}${note}`
   }
   // 门控模型留空时后端的挑法（resolve_provider）：第一个启用的真实接入，没有就第一个启用的
   const enabledProviders = providers.filter((p) => p.enabled)
@@ -817,13 +822,15 @@ function PrefsTab() {
   const gateProvider = cur.gateProvider ? providers.find((p) => p.name === cur.gateProvider) : defaultProvider
   const gateProviderMissing = !!cur.gateProvider && providers.length > 0 && !gateProvider
   // 点名的接入不存在、已停用都调不了（停用的以前照常调用，现在运行时照实报错）：两种都在这一格下面说
-  const gateProviderError = providerError('run.tool_gate_provider', cur.gateProvider, gateProvider, PROVIDER_REF_TEXT.gateBroken)
+  const gateProviderError = providerError('run.tool_gate_provider', cur.gateProvider, gateProvider, PROVIDER_REF_TEXT.gateBroken,
+    TOOL_GATE_TEXT)
   const gateModels = (gateProvider?.models ?? []).map((m) => m.id)
   // 裁判模型的接入：接入和模型都留空时后端依次用 Copilot 的模型、默认接入（judge_model_spec）。只填了模型时
   // 这一级写了就整组用这一级，按模型名找接入（resolve_provider）——不再跟随 Copilot，留空那一项不能还叫「跟随 Copilot」
   const judgeProvider = cur.judgeProvider ? providers.find((p) => p.name === cur.judgeProvider) : undefined
   const judgeProviderMissing = !!cur.judgeProvider && providers.length > 0 && !judgeProvider
-  const judgeProviderError = providerError('judge.provider', cur.judgeProvider, judgeProvider, PROVIDER_REF_TEXT.judgeBroken)
+  const judgeProviderError = providerError('judge.provider', cur.judgeProvider, judgeProvider, PROVIDER_REF_TEXT.judgeBroken,
+    JUDGE_SETTING_TEXT)
   const judgeModelName = cur.judgeModel.trim()
   const judgeByModel = !cur.judgeProvider && !!judgeModelName
   // 裁判模型没有单独配置（接入、模型都留空）：后端依次用助手的模型、默认接入

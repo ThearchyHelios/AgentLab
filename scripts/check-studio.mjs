@@ -2607,6 +2607,194 @@ await section('合并查询：节点库认得、卡片摘要、检查器从上�
   await ctx.close()
 })
 
+// ================================================================ 点名的模型接入（K1b）
+// 接入表、画布校验、助手的模型设定都是伪造的（一家启用、一家停用，名字都是通用名）。校验按伪造的接入表现算，形状照
+// 后端：点名的接入不存在、已停用给接入那一条（provider.*）；点名的接入好好的、没写模型给「将使用接入「X」的默认模型」；
+// 接入那一条在时不再给「没有指定模型」（provider_refs.quiet_unset_model）
+const MODEL_PROVIDERS = [
+  { id: 'pv-main', name: 'demo-main', kind: 'openai_compatible', base_url: 'https://example.com/v1', default_model: 'big-model',
+    models: [{ id: 'big-model' }, { id: 'small-model' }], enabled: true, extra: {}, api_key_masked: '', has_key: true },
+  { id: 'pv-off', name: 'demo-off', kind: 'openai_compatible', base_url: 'https://example.com/v1', default_model: 'tiny-1',
+    models: [{ id: 'tiny-1' }], enabled: false, extra: {}, api_key_masked: '', has_key: true },
+]
+const MODEL_GRAPH = {
+  nodes: [
+    node('start', 'input', 0, 300, '输入', { fields: [{ name: 'q', required: true }] }),
+    node('named', 'llm', 300, 60, '点名接入', { prompt: '{{ input.q }}', provider: 'demo-main' }),
+    node('gone', 'llm', 300, 220, '接入已删', { prompt: '{{ input.q }}', provider: 'demo-gone' }),
+    node('off', 'agent', 300, 380, '接入已停用', { prompt: '{{ input.q }}', provider: 'demo-off' }),
+    node('plain', 'llm', 300, 540, '没点名', { prompt: '{{ input.q }}' }),
+    node('done', 'output', 640, 300, '成果', { fields: [{ name: 'a', value: '{{ last_message }}' }] }),
+  ],
+  edges: [edge('start', 'named'), edge('start', 'gone'), edge('start', 'off'), edge('start', 'plain'),
+    edge('named', 'done'), edge('gone', 'done'), edge('off', 'done'), edge('plain', 'done')],
+}
+/** 伪造的画布校验：只管模型这一栏和点名的接入 */
+const modelLint = (graph) => {
+  const issues = []
+  for (const n of graph.nodes ?? []) {
+    if (!['llm', 'agent'].includes(n.type)) continue
+    const c = n.data?.config ?? {}
+    const named = (c.provider || graph.defaults?.provider || '').trim()
+    const p = MODEL_PROVIDERS.find((x) => x.name === named)
+    const own = c.provider ? n.id : null
+    if (named && !p?.enabled) {
+      issues.push({ level: 'warning', node_id: own, field: own ? 'provider' : 'defaults.provider', code: p ? 'provider.disabled' : 'provider.missing',
+        message: `「${n.data.label}」指定的模型接入「${named}」${p ? '已停用' : '不存在'}。请在「设置 → 模型接入」中${p ? '启用它' : '核对名称'}` })
+      continue
+    }
+    if (!c.model) {
+      issues.push({ level: 'warning', node_id: n.id, field: 'model', code: 'model.unset',
+        message: named ? `没有指定模型，将使用接入「${named}」的默认模型` : '没有指定模型，将使用默认模型' })
+    }
+  }
+  return { ok: true, issues }
+}
+const ASSISTANT_BROKEN = '助手使用的模型接入「demo-gone」不存在。请在「设置 → 模型接入」中核对名称，或在「编排」页助手栏的「助手使用的模型」中重新选择'
+
+await section('点名的模型接入：检查器模型一栏说清留空用哪个接入；助手栏照实显示存着的设定、能重新选「跟随默认」', async () => {
+  FAKES['st-model'] = wf('st-model', { name: '__studio_check_model__', graph: MODEL_GRAPH, version: 1 })
+  FAKES['st-modeldef'] = wf('st-modeldef', { name: '__studio_check_model_defaults__', graph: { ...MODEL_GRAPH, defaults: { provider: 'demo-main' } }, version: 1 })
+  // 助手的模型设定：存着一个已删掉的接入，GET 照后端说明用不了；PUT 记下请求、清掉存着的接入
+  const copilot = { saved: { configured: true, provider: 'demo-gone', model: null, effective_provider: null, effective_model: null, error: ASSISTANT_BROKEN }, puts: [] }
+  const before = async (page) => {
+    const json = (route, body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
+    await page.route(/\/api\/providers(\?.*)?$/, (route) => (route.request().method() === 'GET' ? json(route, MODEL_PROVIDERS) : route.fallback()))
+    await page.route(/\/api\/workflows\/validate$/, (route) => json(route, modelLint(route.request().postDataJSON()?.graph ?? {})))
+    await page.route(/\/api\/copilot\/model$/, (route) => {
+      if (route.request().method() === 'PUT') {
+        copilot.puts.push(route.request().postDataJSON())
+        copilot.saved = { configured: false, provider: null, model: null, effective_provider: 'demo-main', effective_model: 'big-model', error: null }
+      }
+      return json(route, copilot.saved)
+    })
+  }
+  try {
+    const { ctx, page, state, errors } = await open({ path: '/studio/st-model', before, stream: [{ op: 'done', explanation: '好' }] })
+    const field = page.locator('[data-inspector-sheet] [data-field="model"]')
+    const look = async (id) => {
+      await S(page, (x) => window.__studio.getState().select(x), id)
+      await field.waitFor({ timeout: 4000 })
+      await page.waitForTimeout(150)
+      return {
+        blank: (await field.locator('select option[value=""]').innerText()).trim(),
+        help: await field.locator('[data-field-help]').count() ? (await field.locator('[data-field-help]').innerText()).trim() : null,
+        text: await field.innerText(),
+        sheet: await page.locator('[data-inspector-sheet]').innerText(),
+      }
+    }
+    await waitAnalysis(page)
+    const named = await look('named')
+    check('点名了启用的接入、没写模型：空选项写「使用接入「demo-main」的默认模型」', named.blank === '默认（使用接入「demo-main」的默认模型）', named.blank)
+    check('……下面的说明同样写这个接入', named.help === '留空则使用接入「demo-main」的默认模型', named.help)
+    check('……校验那条也照实写接入', named.text.includes('没有指定模型，将使用接入「demo-main」的默认模型'), named.text.slice(0, 120))
+    const gone = await look('gone')
+    check('点名的接入不存在：空选项说状态，不说「使用」', gone.blank === '默认（模型接入「demo-gone」不存在）', gone.blank)
+    check('……模型一栏下面不再写说明，也没有「没有指定模型」那条', gone.help === null && !gone.text.includes('没有指定模型'), gone.text.slice(0, 120))
+    check('……接入那条问题在检查器顶上', gone.sheet.includes('指定的模型接入「demo-gone」不存在'), gone.sheet.slice(0, 160))
+    const off = await look('off')
+    check('点名的接入已停用：空选项写「已停用」，没有说明', off.blank === '默认（模型接入「demo-off」已停用）' && off.help === null, `${off.blank} · ${off.help}`)
+    const plain = await look('plain')
+    check('没点名接入：照旧写第一个可用的模型接入', plain.blank === '默认（使用第一个可用的模型接入）' && plain.help === '留空则使用默认模型接入',
+      `${plain.blank} · ${plain.help}`)
+    if (SHOTS) {
+      await look('gone')
+      for (const theme of ['dark', 'light']) {
+        await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+        await page.waitForTimeout(200)
+        await page.locator('[data-inspector-sheet]').screenshot({ path: `${SHOTS}/studio-model-inspector-${theme}.png` })
+      }
+      await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+    }
+
+    // 助手栏：存着的接入失效了，齿轮上有红点；展开后下拉照实停在存着的那一项，下面写原因
+    await S(page, () => window.__studio.getState().select(null))
+    const gear = page.getByRole('button', { name: '助手使用的模型' })
+    await gear.waitFor({ timeout: 4000 })
+    await page.waitForFunction(() => !!document.querySelector('[data-copilot-model-broken]'), null, { timeout: 4000 }).catch(() => {})
+    check('存着的接入用不了：齿轮上有标记，悬停写明', await page.locator('[data-copilot-model-broken]').count() === 1
+      && (await gear.getAttribute('title')) === '助手使用的模型当前无法调用，点击查看原因', await gear.getAttribute('title'))
+    await gear.click()
+    const select = page.locator('#copilot-model')
+    await select.waitFor({ timeout: 3000 })
+    const picked = await select.evaluate((el) => el.options[el.selectedIndex]?.textContent ?? '')
+    check('下拉停在存着的设定上，不显示成「跟随默认」', picked === '模型接入「demo-gone」的默认模型', picked)
+    check('……「跟随默认」不带「当前」：选它以后用哪个要服务端说了算', (await select.locator('option[value=""]').innerText()).trim() === '跟随默认')
+    const said = await page.locator('[data-copilot-model-error]').innerText().catch(() => '')
+    check('下拉下面照实写原因（和发出一句话后报的同一句）', said === ASSISTANT_BROKEN && await select.getAttribute('aria-invalid') === 'true', said)
+    if (SHOTS) {
+      for (const theme of ['dark', 'light']) {
+        await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+        await page.waitForTimeout(200)
+        await page.locator('#copilot-model').locator('xpath=ancestor::div[contains(@class, "rounded-lg")][1]')
+          .screenshot({ path: `${SHOTS}/studio-copilot-model-${theme}.png` })
+      }
+      await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+    }
+    // 存着的设定列不出来时发一句话：不带模型，服务端按存着的整组取（带了模型会绕过存着的接入）
+    const box = page.getByLabel('描述要生成或修改的工作流')
+    await box.fill('把回答改短一些')
+    await box.press('Enter')
+    await until(() => state.bodies.length > 0, 3000)
+    check('……发出的请求不带模型', state.bodies.length === 1 && !('model' in state.bodies[0] && state.bodies[0].model), JSON.stringify(state.bodies[0] ?? {}).slice(0, 100))
+    await page.waitForFunction(() => !window.__studio.getState().copilot.active, null, { timeout: 4000 }).catch(() => {})
+
+    await select.selectOption('')
+    await until(() => copilot.puts.length > 0, 3000)
+    check('重新选「跟随默认」算一次改动：存成不指定接入和模型', copilot.puts.length === 1 && copilot.puts[0].model === null
+      && !copilot.puts[0].provider, JSON.stringify(copilot.puts))
+    await page.waitForFunction(() => !document.querySelector('[data-copilot-model-error]'), null, { timeout: 3000 }).catch(() => {})
+    check('……原因和齿轮上的标记一起消失，「跟随默认」写出当前用的模型', await page.locator('[data-copilot-model-error]').count() === 0
+      && await page.locator('[data-copilot-model-broken]').count() === 0
+      && (await select.locator('option[value=""]').innerText()).trim() === '跟随默认（当前：big-model）')
+    check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+    await ctx.close()
+
+    // 全图默认点名的接入：没写自己接入的节点跟着它
+    const second = await open({ path: '/studio/st-modeldef', before })
+    await S(second.page, () => window.__studio.getState().select('plain'))
+    const defField = second.page.locator('[data-inspector-sheet] [data-field="model"]')
+    await defField.waitFor({ timeout: 4000 })
+    const defBlank = (await defField.locator('select option[value=""]').innerText()).trim()
+    check('全图默认点名了接入：没写自己接入的节点写「使用接入「demo-main」的默认模型」', defBlank === '默认（使用接入「demo-main」的默认模型）', defBlank)
+    check('没有运行时报错', second.errors.length === 0, second.errors.slice(0, 2).join(' | '))
+    await second.ctx.close()
+
+    // 390 宽：助手栏浮在画布上，展开「助手使用的模型」、原因那一长句照样折行，不把页面撑出横向滚动
+    copilot.saved = { configured: true, provider: 'demo-gone', model: null, effective_provider: null, effective_model: null, error: ASSISTANT_BROKEN }
+    const narrow = await open({ path: '/studio/st-model', before, width: 390, height: 844 })
+    await blur(narrow.page)
+    await narrow.page.keyboard.press('Alt+KeyA')
+    const narrowGear = narrow.page.getByRole('button', { name: '助手使用的模型' })
+    await narrowGear.waitFor({ timeout: 4000 })
+    // 编排页在 390 宽时工具栏本身就比视口宽（与这一块无关）：比的是展开前后，展开这一块不能再多撑出横向溢出
+    const overflow = () => narrow.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    const base = await overflow()
+    await narrowGear.click()
+    await narrow.page.locator('[data-copilot-model-error]').waitFor({ timeout: 3000 })
+    const fit = await narrow.page.evaluate(() => {
+      const err = document.querySelector('[data-copilot-model-error]').getBoundingClientRect()
+      const sel = document.getElementById('copilot-model').getBoundingClientRect()
+      return { over: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        right: Math.round(Math.max(err.right, sel.right)), vw: window.innerWidth }
+    })
+    check('390 宽：原因折行显示，下拉和原因都在视口里，展开这一块不多撑出横向溢出', fit.over <= base && fit.right <= fit.vw,
+      JSON.stringify({ ...fit, base }))
+    if (SHOTS) {
+      for (const theme of ['dark', 'light']) {
+        await narrow.page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+        await narrow.page.waitForTimeout(200)
+        await narrow.page.screenshot({ path: `${SHOTS}/studio-copilot-model-390-${theme}.png` })
+      }
+    }
+    check('没有运行时报错', narrow.errors.length === 0, narrow.errors.slice(0, 2).join(' | '))
+    await narrow.ctx.close()
+  } finally {
+    delete FAKES['st-model']
+    delete FAKES['st-modeldef']
+  }
+})
+
 check('整个检查没有弹出原生 confirm / prompt', dialogs === 0, `${dialogs} 次`)
 check('检查没有写库（兜底拦下的写请求）', writes.length === 0, writes.slice(0, 4).join('、'))
 

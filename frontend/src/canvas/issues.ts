@@ -321,16 +321,18 @@ export function isMissingEndpoint(e: unknown): boolean {
  * 这条问题的修复：后端点了 fix id 就按 id 找；没点的（/publish 被拦时的回包只有 code）按 code + 节点认。
  * 认不出时和后端 autofix.annotate 同一个退路：图级问题（没有节点，比如「没有带契约的出口」，
  * 修复却落在唯一的出口上）认同一编号的第一条修复；图级修复（改的是全图默认，不落在任何节点上）
- * 认同一编号的每一条问题。再认不出就没有
+ * 认同一编号的每一条问题。再认不出就没有。点名的模型接入不走退路（同 annotate）
  */
 export function fixFor(issue: ValidationIssue, fixes: PublishFix[]): PublishFix | undefined {
   if (issue.fix) return fixes.find((f) => f.id === issue.fix)
   if (!issue.code) return undefined
   const same = fixes.filter((f) => f.code === issue.code)
-  // 点名的接入一处一条修复：同一节点上的几处按字段认
-  const exact = (isProviderRefCode(issue.code)
-    ? same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null) && (f.field ?? null) === (issue.field ?? null))
-    : undefined) ?? same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null))
+  if (isProviderRefCode(issue.code)) {
+    // 点名的接入一处一条修复，只认节点、字段都对得上的那一条（同一节点上的几处按字段分）。没有就是这一处没有修复
+    //（一个候选都落不稳），不退到同节点、同编号别处的修复上——退过去，这一处的问题下面就画着另一处的选项
+    return same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null) && (f.field ?? null) === (issue.field ?? null))
+  }
+  const exact = same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null))
   if (exact) return exact
   return issue.node_id == null ? same[0] : same.find((f) => f.node_id == null)
 }
