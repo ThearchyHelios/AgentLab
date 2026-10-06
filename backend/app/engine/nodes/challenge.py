@@ -24,9 +24,9 @@
    出具降档（nodes/io.py 的 _upstream_issuance_gaps，所以反方审稿要接在成果节点上游，画布校验会提醒）；fail 判节点
    失败；flag 只记录。产出和审批卡里的 on_refuted 是实际生效的那一种（只有 degrade / flag，见 _finish）；degrades
    说被推翻的到底会不会让出具降档（按降档处置、又接在带出具契约的成果节点上游），unreviewed 是未能反查的句数（核查
-   模型不可用、触顶没给出结论、数据源不在了、报告没有引用数据库查询……这几句记为无法判断，但反查没有完成，触顶的
-   可能已经查过几次）。每一句都记为无法判断，所以 unreviewed 不会大于 counts 里的 inconclusive。审批卡（human.py 的
-   _reviewed_reports）附上审稿概况，据这两项说「出具会降档」「N 句未能反查」
+   模型不可用、触顶没给出结论、数据源不在了、报告没有引用数据库查询、运行时长上限将至没来得及审……这几句记为无法
+   判断，但反查没有完成，触顶的可能已经查过几次）。每一句都记为无法判断，所以 unreviewed 不会大于 counts 里的
+   inconclusive。审批卡（human.py 的 _reviewed_reports）附上审稿概况，据这两项说「出具会降档」「N 句未能反查」
 
 上限：句数、每句查询次数、每句时长、全局每日金额（核查和裁判各记各的账，engine/spend.py）。都按发起时快照的核查
 设置（run.options["verify"]），节点上写了的盖过它：审批停下期间改了设置，恢复、接着跑仍按发起时的那份。没有快照
@@ -34,6 +34,10 @@
 可审的结论句、报告文档读不到时也直通（都记一条 challenge_skipped）。
 
 逐句串行反查：并行的话几句的工具调用在时间线上交错，看不出哪条查询在审哪一句；每日余额按先后扣，结果也才确定。
+串行就可能撞上运行的时长上限（默认 5 句、每句 90 秒再加 30 秒收尾宽限，最坏 600 秒，正好是一段执行的上限），整次运行
+被中止。所以每句开始之前看这一段执行还剩多少时间（engine/deadline.py）：给下游留出余量后不够再审一句，这句和后面的
+都不再开始，记为未能反查（challenge_unreviewed 写明运行时长上限将至），节点照常收尾；够的话这句的时长上限按剩余时间
+收紧，到点照样按查到的结果收尾。
 整个反查连同存审稿记录、发日志都在一个 @task 里：接着跑时取 checkpoint 里的结果，不重复查库、不重复记账，时间线
 上也不再发一遍。结果带着输入指纹，接着跑时改了审稿本身的配置就重审；同一次执行里的重试沿用已经审完的（见 _reviewed）。
 """
@@ -52,6 +56,7 @@ from app.core.errors import describe_exception
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import DataSource
+from app.engine import deadline, verify_agent
 from app.engine import judge as judging
 from app.engine.context import NodeContext, NodeError
 from app.engine.evidence import ENTITY_KINDS, iter_units, ledger_enabled, next_exec
@@ -89,6 +94,12 @@ _PLACEHOLDER = re.compile(r" ?⟦\?[^⟧]*⟧ ?")
 _STALE_LIMIT = 16
 #: 同一次执行里审完的结果放在 RunContext.extra 的这个键下：{(节点, 第几次执行, 输入指纹): 审稿结果}。重试沿用它
 _REVIEWS_KEY = "challenge_reviews"
+#: 运行时长上限将至、不再开始的句子（engine/deadline.py）：每句的理由，时间线上的原因（这句和后面的一共几句）
+_LATE_CLAIM = "本次运行即将达到 {seconds:g} 秒的时长上限，为保证运行按时完成，这句未反查"
+_LATE_REST = "本次运行即将达到 {seconds:g} 秒的时长上限，为保证运行按时完成，剩下 {count} 句未审"
+#: 时长按剩余时间收紧过的句子触了时长上限：单记一类（_limit_words 说运行时长上限将至，不说「每句时长上限 90 秒」——
+#: 那会叫人调大每句的上限，调大了只会更快撞线），challenge_limit 照记 timeout_s，界面认得
+_SQUEEZED = "squeezed"
 
 CHALLENGE_SYSTEM = (
     "你是反方审稿人：报告已经写完，你站在反方，专门找其中一句结论的反例。你不写报告，也不改报告。\n"
@@ -507,6 +518,8 @@ class _Review:
             max_claims, max_queries, timeout_s, daily_max_usd
         self.spec, self.masks, self.writer_model = spec, masks, writer_model
         self.fetch = _fetcher()
+        #: 这一段执行的总时长（engine/deadline.py）：有句子的时长按剩余时间收紧过时记下，那几句触顶时说明里写
+        self.run_seconds: float | None = None
         #: 这份报告目录里的查询编号：摘录里指向它们的写法标上「原报告」（mark_original）
         self.queries = {a for a, e in catalog.items() if isinstance(e, dict) and e.get("kind") == "query"}
         self.key = content_hash(canonical_json({
@@ -517,6 +530,8 @@ class _Review:
     def _limit_words(self, limit: str) -> str:
         if limit == "max_claims":
             return f"每份报告最多审 {self.max_claims} 句"
+        if limit == _SQUEEZED:
+            return f"本次运行即将达到 {self.run_seconds:g} 秒的时长上限，反查时长已按剩余时间收紧"
         if limit == "max_queries":
             return f"每句最多查询 {self.max_queries} 次"
         if limit == "timeout_s":
@@ -559,18 +574,22 @@ class _Review:
         broken: str | None = None            # 核查模型本身用不了：后面的句子照这个原因记，不再逐句去建模型
         unreviewed: list[str] = []           # 没能反查的句子各自的原因（触顶的由 challenge_limit 说，不在这里）
         partial: list[list[str]] = []        # 反查了、但该查的源有停用了的句子：各自没查成的源
+        late: tuple[str, str] | None = None  # 运行时长上限将至：(每句的理由, 时间线上的原因)，后面的句子都照这个记
 
         def unreached(cand: judging.Candidate, rationale: str, why: str) -> None:
             claims.append(_claim(cand, "inconclusive", rationale))
             unreviewed.append(why)
 
-        for cand in self.picked:
+        for at, cand in enumerate(self.picked):
             if broke:
                 hit["daily_max_usd"][1] += 1
                 claims.append(_claim(cand, "inconclusive", self._capped()))
                 continue
             if broken is not None:
                 unreached(cand, f"反查未完成：{broken}", broken)
+                continue
+            if late is not None:
+                unreached(cand, *late)
                 continue
             try:
                 own = claim_sources(cand.aliases, self.catalog, self.fetch)
@@ -592,9 +611,19 @@ class _Review:
                 why = f"数据源{_quoted(sources)}已不存在或已停用"
                 unreached(cand, f"{where}{why}，没有可以反查的数据源，这句未反查", why)
                 continue
+            # 派出去之前看这一段执行还剩多少时间：给下游留出余量后不够再审一句，这句和后面的都不再开始、记为未能反查，
+            # 节点照常收尾，运行不被中止；够的话这句的时长上限按剩余时间收紧。在 @task 里定，接着运行时不再重新定
+            allot = deadline.allot(self.timeout_s, grace=verify_agent.SETTLE_GRACE_S)
+            if not allot.start:
+                late = (_LATE_CLAIM.format(seconds=allot.seconds),
+                        _LATE_REST.format(seconds=allot.seconds, count=len(self.picked) - at))
+                unreached(cand, *late)
+                continue
+            if allot.tightened:
+                self.run_seconds = allot.seconds
             outcome = await run_verify_agent(
                 spec=self.spec, system=CHALLENGE_SYSTEM, task=task_text, sources=live,
-                output_schema=CHALLENGE_SCHEMA, max_queries=self.max_queries, timeout_s=self.timeout_s,
+                output_schema=CHALLENGE_SCHEMA, max_queries=self.max_queries, timeout_s=allot.timeout_s,
                 daily_max_usd=self.daily_max_usd, emit=ctx.emit, run_id=ctx.run.run_id, node_id=ctx.node.id,
                 data_versions=run_versions(ctx.run))
             if outcome.error and not outcome.model:
@@ -617,7 +646,8 @@ class _Review:
             claims.append(claim)
             usage = _add_usage(usage, outcome.usage)
             if outcome.limit in _CLAIM_LIMITS:
-                counted = hit.setdefault(outcome.limit, [0, 0])
+                squeezed = outcome.limit == "timeout_s" and allot.tightened
+                counted = hit.setdefault(_SQUEEZED if squeezed else outcome.limit, [0, 0])
                 counted[0] += 1
                 counted[1] += why is not None
                 broke = outcome.limit == "daily_max_usd"
@@ -635,8 +665,8 @@ class _Review:
             message = f"已达上限（{words}），{skipped} 句未反查" if limit == "daily_max_usd" else \
                 f"有 {touched} 句反查已达上限（{words}），已按查到的结果收尾" + \
                 (f"，其中 {skipped} 句未能给出结论" if skipped else "")
-            ctx.emit(EventType.LOG, level="warn", code="challenge_limit", limit=limit, claims_skipped=skipped,
-                     message=message)
+            ctx.emit(EventType.LOG, level="warn", code="challenge_limit",
+                     limit="timeout_s" if limit == _SQUEEZED else limit, claims_skipped=skipped, message=message)
         if unreviewed:
             more = "等" if len(set(unreviewed)) > 1 else ""
             ctx.emit(EventType.LOG, level="warn", code="challenge_unreviewed", claims_skipped=len(unreviewed),
