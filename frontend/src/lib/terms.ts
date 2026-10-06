@@ -3350,9 +3350,8 @@ export const DUAL_CHECK_TEXT = {
 
   // ---- 检查器（nodeDefs 的 dual_check、canvas/DualCheckFields.tsx）
   /**
-   * 字段名，键就是配置键。服务端校验和报错引用的是同一套叫法（schema.py 的 DUAL_CHECK_FIELD_LABEL，check-verify 在
-   * 服务端合入后逐项比对）：问题挂在字段下面、出现在问题面板里时，人才找得到是哪一项。模型两项照「裁判模型 · 接入」
-   * 「裁判模型」的写法
+   * 字段名，键就是配置键。服务端校验和报错引用的是同一套叫法（engine/labels.py 的 DUAL_CHECK_FIELD_LABEL，check-verify
+   * 逐项比对）：问题挂在字段下面、出现在问题面板里时，人才找得到是哪一项。模型两项照「裁判模型 · 接入」「裁判模型」的写法
    */
   field: {
     card: '口径卡',
@@ -3388,7 +3387,10 @@ export const DUAL_CHECK_TEXT = {
   cardOption: (label: string, caliber?: string | null) => (caliber && caliber !== label ? `${label}（${caliber}）` : label),
   cardGone: (id: string) => `${id}（不在画布上）`,
   cardNotUpstream: '所选口径卡不在本节点上游，运行到本节点时还没有它的结果。请把它连接到本节点之前',
-  cardMissing: (id: string) => `口径卡「${id}」不在画布上，请重新选择`,
+  cardMissingHint: '所选口径卡已不在画布上，请重新选择',
+  /** 选中的节点在画布上，但不是口径卡（助手改图、导入 JSON 会写出这种配置）：下拉里那一项、下面那句提示 */
+  cardWrongType: (label: string) => `${label}（不是口径卡）`,
+  cardWrongTypeHint: (type: string) => `所选节点是「${type}」节点，不是口径卡，请重新选择`,
   metricsAll: '全部指标',
   metricsDefault: '未指定：复算全部输入来自查询的指标',
   metricsPicked: (n: number, total: number) => `已选 ${n} / ${total} 个指标`,
@@ -3422,7 +3424,7 @@ export const DUAL_CHECK_TEXT = {
   },
   tolerancePlaceholder: (v: number | null | undefined) => (v == null ? '跟随设置' : `跟随设置（${v}）`),
   toleranceInvalid: '请填写不小于 0 的数',
-  /** 选项以服务端报错里的短说法（schema.py 的 DUAL_CHECK_ON_REJECT_LABEL）开头，后面可以带一句用途 */
+  /** 选项以服务端报错里的短说法（engine/labels.py 的 DUAL_CHECK_ON_REJECT_LABEL）开头，后面可以带一句用途 */
   onReject: { degrade: '计入缺口、出具降档（默认）', fail: '判为失败，运行终止' } as Record<string, string>,
   onRejectUnknown: (v: string) => `${v}：无法识别的值，请从上方选项中选择`,
   enabled: { follow: '跟随设置', on: '开启', off: '关闭' },

@@ -24,7 +24,8 @@
 //
 // 页面都跑在预览页（/preview.html?syn=…，用例在 frontend/src/dev/fixtures/dual_check.tsx，夹具 dual_check.json 两边
 // 共用）和设置页上，接口一律 page.route 伪造：完整对照的工件、审批回复、设置的读写都在浏览器里答，别的非 GET 拦掉，
-// 不碰真实的写接口。文案对照那一节不开浏览器：读 backend/app/api/settings.py，terms.ts 借 vite 转译后直接 import。
+// 不碰真实的写接口。文案对照那一节不开浏览器：读 backend/app/api/settings.py、backend/app/engine/labels.py，terms.ts 借 vite
+// 转译后直接 import。
 //
 //   node scripts/check-verify.mjs
 // 对别的实例跑时带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-verify.mjs
@@ -126,26 +127,23 @@ await section('核查设置的叫法和服务端一字不差', async () => {
 })
 
 await section('双盲复算检查器的叫法和服务端校验报错一致', async () => {
-  // 校验问题挂在字段下方、出现在问题面板里时，报错引用的是 schema.py 的 DUAL_CHECK_FIELD_LABEL：检查器上得是同一个名字，
-  // 人才找得到是哪一项。处置的取值：报错里用短说法，下拉的选项以它开头、后面可以带一句用途（labels.py 的约定）
+  // 校验问题挂在字段下方、出现在问题面板里时，报错引用的是 labels.py 的 DUAL_CHECK_FIELD_LABEL（期 4 从 schema.py 挪过去，
+  // field_label 按节点类型也说这一套）：检查器上得是同一个名字，人才找得到是哪一项。处置的取值：报错里用短说法，下拉的
+  // 选项以它开头、后面可以带一句用途（labels.py 的约定）
   const { DUAL_CHECK_TEXT: D } = await import(await load('/src/lib/terms.ts'))
   const KEYS = ['card', 'metrics', 'definitions', 'provider', 'model', 'tolerance', 'on_reject', 'enabled']
   check('检查器的字段名按配置键放在 DUAL_CHECK_TEXT.field', KEYS.every((k) => typeof D.field?.[k] === 'string' && D.field[k]),
     KEYS.filter((k) => !D.field?.[k]).join('、'))
   check('……模型的两项照「裁判模型 · 接入」「裁判模型」的叫法', D.field.provider === '盲算模型 · 接入' && D.field.model === '盲算模型',
     `${D.field.provider} / ${D.field.model}`)
-  const py = readFileSync(`${root}backend/app/engine/schema.py`, 'utf8')
-  const block = py.match(/^DUAL_CHECK_FIELD_LABEL = \{([\s\S]*?)^\}/m)?.[1]
-  if (block == null) {
-    // 双盲复算的服务端在另一个工作包里，合入之前 schema.py 还没有这一组：合入后这一节就逐项比对
-    check('schema.py 还没有 DUAL_CHECK_FIELD_LABEL（双盲复算服务端合入后逐项比对）', true)
-    return
-  }
-  const labels = Object.fromEntries([...block.matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
+  const py = readFileSync(`${root}backend/app/engine/labels.py`, 'utf8')
+  const block = py.match(/^DUAL_CHECK_FIELD_LABEL: dict\[str, str\] = \{([\s\S]*?)^\}/m)?.[1]
+  check('从 labels.py 读出了 DUAL_CHECK_FIELD_LABEL', block != null)
+  const labels = Object.fromEntries([...(block ?? '').matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
   const wrong = KEYS.filter((k) => labels[k] !== D.field[k])
   check('每个字段的叫法和 DUAL_CHECK_FIELD_LABEL 一字不差', !wrong.length && Object.keys(labels).length === KEYS.length,
     wrong.map((k) => `${k}：${D.field[k]} ≠ ${labels[k]}`).join('；'))
-  const opts = py.match(/^DUAL_CHECK_ON_REJECT_LABEL = \{([^}]*)\}/m)?.[1] ?? ''
+  const opts = py.match(/^DUAL_CHECK_ON_REJECT_LABEL: dict\[str, str\] = \{([^}]*)\}/m)?.[1] ?? ''
   const short = Object.fromEntries([...opts.matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
   check('「未采用原流程时」的选项以服务端的短说法开头', Object.keys(short).length === 2
     && Object.entries(short).every(([k, v]) => D.onReject?.[k]?.startsWith(v)), JSON.stringify(short))
@@ -931,11 +929,32 @@ await section('检查器：每一项都写进节点配置，节点卡片的摘�
   check('……标签指向这个下拉', await page.locator('[data-field="card"] label').getAttribute('for') === await card.getAttribute('id'))
   await card.selectOption('card2')
   check('选另一张：写进 card', (await config(page)).card === 'card2', JSON.stringify(await config(page)))
-  check('……不在上游的照实提醒', (await text(page.locator('[data-dual-card-warn]'))).includes('不在本节点上游'))
+  check('……不在上游的照实提醒', (await text(page.locator('[data-node-pick-hint="notUpstream"]'))).includes('不在本节点上游'))
   const swapped = await summaryBecomes(page, '复算「月报口径卡」 · 全部 1 个指标')
   check('……摘要换成这张卡', swapped.ok, swapped.seen)
   await card.selectOption('')
   check('选回默认：card 去掉，不留空串', !('card' in (await config(page))) || (await config(page)).card === undefined, JSON.stringify(await config(page)))
+  // 选口径卡用的是和反方审稿共用的控件（verifyFields.tsx 的 NodePick）：写着的卡被删了、写的不是口径卡（助手改图、导入
+  // JSON 会写出这种配置）都照实列在下拉里（选不回去）、下面说一句，不让它看着像「默认」
+  const setCard = (value) => page.evaluate((v) => {
+    const s = window.__studio.getState()
+    const n = s.nodes.find((x) => x.id === 'dc')
+    s.updateNode('dc', { config: { ...n.data.config, card: v } })
+  }, value)
+  const selected = () => card.evaluate((el) => el.options[el.selectedIndex]?.textContent)
+  await setCard('ghost')
+  await page.waitForTimeout(100)
+  check('写着的卡已不在画布上：下拉照实标出，下面说一句', await selected() === 'ghost（不在画布上）'
+    && (await text(page.locator('[data-node-pick-hint="missing"]'))) === '所选口径卡已不在画布上，请重新选择', await selected())
+  await setCard('fetch')
+  await page.waitForTimeout(100)
+  const wrongType = page.locator('[data-node-pick-hint="wrongType"]')
+  check('写的不是口径卡：下拉标「不是口径卡」，提示说清它是哪类节点，不说成不在画布上', await selected() === '取数（不是口径卡）'
+    && await wrongType.count() === 1 && (await text(wrongType)).startsWith('所选节点是「') && (await text(wrongType)).endsWith('」节点，不是口径卡，请重新选择')
+    && await page.locator('[data-node-pick-hint="missing"]').count() === 0, `${await selected()} · ${await wrongType.count() ? await text(wrongType) : '没有提示'}`)
+  await card.selectOption('')
+  check('……选回默认：提示收起、card 去掉', await page.locator('[data-node-pick-hint]').count() === 0 && (await config(page)).card === undefined,
+    JSON.stringify(await config(page)))
 
   // 指标：逐个勾；全部勾着是缺省，不写；最后一个不让取消
   const opts = page.locator('[data-dual-metric-option]')
@@ -973,16 +992,18 @@ await section('检查器：每一项都写进节点配置，节点卡片的摘�
 
   // 启用：跟随设置 / 开启 / 关闭
   const enabled = page.locator('[data-field="enabled"] [role="radiogroup"]')
+  check('启用用的是和反方审稿共用的三态控件，组名是字段名', (await enabled.getAttribute('data-tri-state')) === 'follow'
+    && (await enabled.getAttribute('aria-label')) === D.field.enabled)
   check('启用：三态，跟随设置写出设置里眼下是开着的', (await enabled.locator('[role="radio"]').allInnerTexts()).join('|') === '跟随设置（当前开启）|开启|关闭'
-    && await enabled.locator('[role="radio"][aria-checked="true"]').getAttribute('data-value') === 'follow')
-  await enabled.locator('[data-value="off"]').click()
+    && await enabled.locator('[role="radio"][aria-checked="true"]').getAttribute('data-tri') === 'follow')
+  await enabled.locator('[data-tri="off"]').click()
   const off = await summaryBecomes(page, { suffix: ' · 已关闭' })
   check('关闭：enabled 为 false，摘要标「已关闭」', (await config(page)).enabled === false && off.ok, off.seen)
-  await enabled.locator('[data-value="off"]').focus()
+  await enabled.locator('[data-tri="off"]').focus()
   await page.keyboard.press('ArrowLeft')
   check('键盘方向键换选项：开启是 true', (await config(page)).enabled === true
-    && await page.evaluate(() => document.activeElement?.getAttribute('data-value')) === 'on')
-  await enabled.locator('[data-value="follow"]').click()
+    && await page.evaluate(() => document.activeElement?.getAttribute('data-tri')) === 'on')
+  await enabled.locator('[data-tri="follow"]').click()
   check('跟随设置：enabled 去掉，不留 null', (await config(page)).enabled === undefined, JSON.stringify(await config(page)))
 
   // 未采用原流程时
@@ -1007,7 +1028,7 @@ await section('检查器：每一项都写进节点配置，节点卡片的摘�
   check('模型：写进 model', (await config(page)).model === 'model-b')
   await provider.selectOption('')
   check('只填了模型：接入留空那一项改叫「按模型名找接入」，写明按模型名用哪个接入', (await provider.locator('option').first().innerText()) === '按模型名找接入'
-    && (await text(page.locator('[data-dual-by-model]'))).includes('将按模型名使用接入「云端接入」') && (await config(page)).provider === undefined)
+    && (await text(page.locator('[data-verify-by-model]'))).includes('将按模型名使用接入「云端接入」') && (await config(page)).provider === undefined)
   const tol = page.locator('[data-field="tolerance"] input')
   check('允许的相对误差：占位写出设置里的值', await tol.getAttribute('placeholder') === '跟随设置（0.000001）', await tol.getAttribute('placeholder'))
   await tol.fill('0.001')
@@ -1035,20 +1056,20 @@ await section('检查器：上游有几张口径卡时必须选；「跟随设�
   await page.waitForFunction(() => document.querySelector('[data-field="card"] select option')?.textContent?.includes('2 张'))
   check('上游两张：留空那一项写明要选，不说「建议」', (await card.locator('option').first().innerText()) === '请选择要复算的口径卡（上游有 2 张）'
     && !(await text(page.locator('[data-field="card"]'))).includes('建议'), await card.locator('option').first().innerText())
-  check('……下面用提醒色写明必须选一张', (await text(page.locator('[data-dual-card-warn]'))) === '上游有 2 张口径卡，请选择要复算的那一张')
+  check('……下面用提醒色写明必须选一张', (await text(page.locator('[data-node-pick-hint="many"]'))) === '上游有 2 张口径卡，请选择要复算的那一张')
   const many = await summaryBecomes(page, '复算上游的口径卡 · 上游有 2 张，请指定')
   check('……节点卡片的摘要也这么说', many.ok, many.seen)
   await card.selectOption('card')
-  check('……选了一张：提醒收起', await page.locator('[data-dual-card-warn]').count() === 0 && (await config(page)).card === 'card')
+  check('……选了一张：提醒收起', await page.locator('[data-node-pick-hint]').count() === 0 && (await config(page)).card === 'card')
 
   // 去设置里关掉双盲复算、改了相对误差，再回到画布打开这个节点：「跟随设置」写的是新的值
-  const enabled = page.locator('[data-field="enabled"] [role="radio"][data-value="follow"]')
+  const enabled = page.locator('[data-field="enabled"] [role="radio"][data-tri="follow"]')
   check('打开时：跟随设置（当前开启）', (await text(enabled)) === '跟随设置（当前开启）', await text(enabled))
   verifyNow = { ...fx.verify, dual_check: { ...fx.verify.dual_check, enabled: false, tolerance: 0.01 } }
   await page.evaluate(() => window.__studio.setState({ selectedId: null }))
   await page.waitForSelector('[data-field="enabled"]', { state: 'detached' })
   await page.evaluate(() => window.__studio.setState({ selectedId: 'dc' }))
-  await page.waitForFunction(() => document.querySelector('[data-field="enabled"] [data-value="follow"]')?.textContent === '跟随设置（当前关闭）', null, { timeout: 3000 })
+  await page.waitForFunction(() => document.querySelector('[data-field="enabled"] [data-tri="follow"]')?.textContent === '跟随设置（当前关闭）', null, { timeout: 3000 })
     .catch(() => {})
   check('再打开：重取设置，写当前关闭', (await text(enabled)) === '跟随设置（当前关闭）', await text(enabled))
   await page.locator('button', { hasText: '高级选项' }).click()
@@ -1071,7 +1092,7 @@ await section('检查器：360px 栏、390px 窄屏不横向溢出，深浅色�
     check(`${width}px（${theme}）：检查器不横向溢出`, w.page <= 0 && w.panel <= 0 && w.body <= 0, JSON.stringify(w))
     const c = await page.evaluate(() => {
       const base = getComputedStyle(document.querySelector('[data-dual-inspector]')).backgroundColor
-      const el = document.querySelector('[data-dual-by-model]')
+      const el = document.querySelector('[data-verify-by-model]')
       const radio = document.querySelector('[data-field="enabled"] [role="radio"][aria-checked="true"]')
       return { base, hint: el && getComputedStyle(el).color, radio: radio && getComputedStyle(radio).color,
         radioBg: radio && getComputedStyle(radio).backgroundColor }
