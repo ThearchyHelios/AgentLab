@@ -395,9 +395,9 @@ def _star_reaches(node: Any, memo: dict[int, bool]) -> bool:
 
 def _contained(node: Any) -> bool:
     """展开出来的列只按名字往外传的 *：它就是一条 SELECT 的选出项本身（不套在表达式里），这条 SELECT 不在 UNION 这类
-    里，而且是 FROM / JOIN 里的派生来源、LATERAL、WITH 里的一段（外层只能按名字取它的列：写到遮罩列的名字原文里就有，
-    再经 * 展开它又会被那个 * 认出来），或者 EXISTS / IN 里的子查询（只决定有没有、在不在）。最外层的 *（结果就是它
-    展开的列）、UNION 里的、标量子查询里的都不算。"""
+    里，而且是 FROM / JOIN 里的派生来源、LATERAL、WITH 里的一段，或者 EXISTS / IN 里的子查询（只决定有没有、在不在）。
+    派生来源的列外层只能按名字取（取到遮罩列，名字就写在 SQL 里），或者再用一个 * 展开（那个 * 照样要过这一关）。
+    最外层的 *（结果就是它展开的列）、UNION 里的、标量子查询里的都不算。"""
     from sqlglot import exp
 
     select = node.parent
