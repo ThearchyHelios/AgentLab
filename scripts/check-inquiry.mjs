@@ -11,8 +11,8 @@
 // 不醒目、409 / 422 不照服务端的中文说明显示（或者问题文字丢了）、Esc 关不掉提问框（或者连带收起了别的、焦点掉到页面上）、
 // 已处理的审批和封存了的正式运行还给入口、封存了的探索运行反而没有；同一次运行的几处问答串要对的审批不同、审批列表
 // 取不到时后一处一直不列别的审批里问的（头上写着次数，下面一条没有），或者把没能确认的说成「报告其他版本」、不给重试；
-// 工件页签里质询的回答只写英文的种类名、截断截在空格上的问题摘要不补省略号、封存后追加的工件给一个跳到运行结束之后的
-// 航迹时刻；窄屏（390px）被撑出横向滚动、浅色主题下看不清。
+// 工件页签里质询的回答只写英文的种类名、不归在「核查记录」、截断截在空格上的问题摘要不补省略号、悬停里没有整句说明、
+// 封存后追加的工件给一个跳到运行结束之后的航迹时刻；窄屏（390px）被撑出横向滚动、浅色主题下看不清。
 //
 // 跑在预览页上：/preview.html?syn=inquiry-*（用例见 frontend/src/dev/fixtures/inquiry.tsx）。夹具在
 // frontend/src/dev/fixtures/inquiry.json，报告文档和回答文档是后端 build_catalog + compose_doc 真实组装的（虚构的数据）。
@@ -835,12 +835,12 @@ await section('运行详情「证据」页签：封存了的探索运行有入�
 await section('运行详情「工件」页签：质询的回答有名字和说明，不出现英文的工件种类名；封存后追加的不给航迹跳转', async () => {
   const { ctx, page, errors } = await open('inquiry-run-artifacts')
   await page.locator('[data-run-artifacts] [data-artifact-id]').first().waitFor()
-  // 每一行：种类（行首的标签）、说明（同一种类有几件时末尾带「#n」，去掉再比）、悬停
+  // 每一行：种类（行首的标签）、说明（同一种类有几件时的「#n」另在截断范围外，不在说明里）、悬停、分组
   const rows = await page.locator('[data-artifact-id]').evaluateAll((els) => els.map((el) => {
     const open = el.querySelector('[data-action="artifact-open"]')
-    const spans = open ? [...open.children] : []
-    return { id: el.getAttribute('data-artifact-id'), kind: spans[0]?.textContent?.trim() ?? '',
-      about: (spans[1]?.textContent ?? '').replace(/\s*#\d+$/, '').trim(), title: open?.getAttribute('title') ?? '' }
+    return { id: el.getAttribute('data-artifact-id'), kind: el.querySelector('[data-artifact-kind-label]')?.textContent?.trim() ?? '',
+      about: el.querySelector('[data-artifact-about]')?.textContent?.trim() ?? '', title: open?.getAttribute('title') ?? '',
+      group: el.getAttribute('data-artifact-class') }
   }))
   const answers = fx.run_artifacts.filter((a) => a.kind === 'inquiry_answer').map((a) => rows.find((r) => r.id === a.id))
   check('质询的回答：种类写「质询回答」', answers.length === 4 && answers.every((r) => r?.kind === '质询回答'), JSON.stringify(answers))
@@ -864,7 +864,9 @@ await section('运行详情「工件」页签：质询的回答有名字和说�
   await page.locator(`[data-artifact-id="${doc.id}"] [data-action="artifact-moment"]`).click()
   const jumped = await page.locator('[data-fixture="inquiry-run-artifacts"]').getAttribute('data-fixture-moment')
   check('……点报告文档的跳转：到它产出的那一刻', Number(jumped) === Date.parse(`${doc.created_at}Z`), jumped)
-  check('悬停写「打开质询回答」', answers.every((r) => r?.title.startsWith('打开质询回答')), answers.map((r) => r?.title).join(' / '))
+  check('悬停写「打开质询回答」，接着是整句说明（行上截断了也看得全）', answers.every((r) => r?.title.startsWith(`打开质询回答：${r.about}`)),
+    answers.map((r) => r?.title).join(' / '))
+  check('质询回答归在「核查记录」，不算证据快照', answers.every((r) => r?.group === 'verify'), answers.map((r) => r?.group).join('、'))
   const pane = await text(page.locator('[data-run-artifacts]'))
   check('工件页签里不出现英文的工件种类名', !/inquiry_answer|report_doc|query_snapshot/.test(pane) && rows.every((r) => !/[a-z_]{4,}/.test(r.kind)),
     rows.map((r) => r.kind).join('、'))
@@ -1531,7 +1533,7 @@ await section('窄屏与深浅色', async () => {
     const row = `[data-artifact-id="${long.id}"] [data-action="artifact-open"]`
     await page.locator(row).waitFor()
     const o = await overflow(page, '[data-run-artifacts]')
-    const ratios = { kind: await ratioOf(page, `${row} > span:nth-child(1)`), about: await ratioOf(page, `${row} > span:nth-child(2)`) }
+    const ratios = { kind: await ratioOf(page, `${row} [data-artifact-kind-label]`), about: await ratioOf(page, `${row} [data-artifact-about]`) }
     check(`390px 工件页签（${theme}）：质询回答的长说明截断、不横向溢出，种类和说明对比度 ≥ 4.5`,
       o.page <= 0 && o.box <= 0 && ratios.kind >= 4.5 && ratios.about >= 4.5,
       JSON.stringify({ o, kind: Number(ratios.kind.toFixed(2)), about: Number(ratios.about.toFixed(2)) }))

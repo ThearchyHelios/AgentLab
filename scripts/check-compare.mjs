@@ -11,8 +11,11 @@
 // 都不能出现对比页）。下一步的提示要和页面上真能做的事对得上：下拉里没有能换的运行就不叫人去上方换，本次的记录
 // 不存在时不给注定失败的「重试」。默认基准的说法照服务端的挑法（api/compare.py 的 pick_base）写「上一次成功的运行」
 // ——上一次失败了，基准是再往前成功的那一次；定时任务触发历史里的「与上一次对比」和运行详情里的同名入口打开同一对
-// 运行、写同一句来历，基准不是紧挨着的上一次时触发历史上看得见的字写明「上一次成功的运行」；找不到默认基准时标题不说
-// 「没有可作为基准的运行」（失败、取消的照样能手动选），换基准的下拉和基准卡写明哪次失败、取消了。
+// 运行、写同一句来历，基准不是紧挨着的上一次时两处看得见的字都写明「与上一次成功的运行对比」（运行详情一打开就预先问
+// 默认基准，问到之前菜单项不给点，不先写一个叫法再换成另一个；预先问出错、卡着不回时到点不提示，叫法退回、点了照常
+// 再问；问到没有默认基准时写「选择基准对比…」，点了直接去对比页手动选；切回这一页时再问一次，问的期间叫法不变）；
+// 运行详情「工件」页签的悬停写上证据快照、核查记录和节点产出三组；找不到默认基准时
+// 标题不说「没有可作为基准的运行」（失败、取消的照样能手动选），换基准的下拉和基准卡写明哪次失败、取消了。
 //
 // 全部用 page.route 假接口：虚构的「区域销售周报」三次已封存的正式运行和一次没封存的，运行详情、运行列表、
 // compare/base、compare、定时任务列表、发起它们的定时任务和触发历史都在浏览器层答掉，别的 GET 放行（外壳要的工作流、
@@ -193,6 +196,13 @@ const FINDING = '正在查找上一次成功的运行'
 const NO_OTHER = '同一工作流没有其他可换作基准的已封存运行'
 /** 服务端（api/compare.py 的 NO_BASE_TEXT）找不到默认基准时的原话 */
 const NO_BASE_SERVER = '没有找到上一次成功的运行：需要同一工作流、同一运行类别里比这次先发起、成功结束并已封存的运行'
+/** 运行详情「更多」里对比入口的两种叫法，和触发历史里的链接一致：基准是紧挨着的上一次时、不是时（上一次失败了） */
+const MENU = '与上一次对比'
+const MENU_LAST_OK = '与上一次成功的运行对比'
+/** 预先问到没有默认基准时的叫法：点了直接去只带本次的对比页手动选 */
+const MENU_PICK = '选择基准对比…'
+/** 预先问默认基准最多等这么久（同 pages/runs/compare/entry.tsx 的 ASK_TIMEOUT_MS），到点按没问到算 */
+const ASK_TIMEOUT_MS = 5000
 
 /**
  * 发起本次和基准的定时任务（RUNS 里的 schedule_id）和它的触发历史：本次那一行带服务端自动对比的计数，基准是 B、不是
@@ -211,6 +221,11 @@ const FIRES = [{
   id: FIRE_T, fire_at: day('10-05'), kind: 'scheduled', status: 'started', run_id: T, run_status: 'succeeded', reason: null,
   notified: [], created_at: day('10-05'), compare: { base_run_id: B, previous: false, summary: SUMMARY },
 }]
+/**
+ * compare/base 给本次的答复：基准是 B，不是紧挨着的上一次（previous: false），同触发历史那一行的假定。服务端两处用
+ * 同一个函数挑（api/compare.py 的 pick_base），运行详情「更多」里的入口据此和触发历史写同一个叫法
+ */
+const BASE_OF_T = { base_run_id: B, reason: 'same_schedule', base: refOf(B), previous: false }
 
 // ---------------------------------------------------------------- 假接口
 
@@ -234,7 +249,7 @@ const RECORD_GONE = { status: 404, json: { detail: '运行记录不存在' } }
 /**
  * 默认的假接口。opts.base(runId) / opts.compare(target, base, n) / opts.run(runId, n) / opts.list(workflowId) 可以换掉
  * 对应接口的答复（返回 null 的照默认答），返回 {status, json, wait}（wait 是一个 Promise：等它落定再答，用来压住
- * 某一次请求）。不在夹具里的运行一律答 404，不放行到服务端
+ * 某一次请求）；opts.fires 换掉触发历史。不在夹具里的运行一律答 404，不放行到服务端
  */
 function defaults(opts) {
   return async (method, url, n) => {
@@ -251,8 +266,7 @@ function defaults(opts) {
     let m = p.match(/^\/api\/runs\/([^/]+)\/compare\/base$/)
     if (m) {
       if (opts.base) return opts.base(m[1])
-      return m[1] === T ? { json: { base_run_id: B, reason: 'same_schedule', base: refOf(B) } }
-        : { status: 404, json: { detail: NO_BASE_SERVER, code: 'compare_no_base' } }
+      return m[1] === T ? { json: BASE_OF_T } : { status: 404, json: { detail: NO_BASE_SERVER, code: 'compare_no_base' } }
     }
     m = p.match(/^\/api\/runs\/([^/]+)\/compare$/)
     if (m) {
@@ -275,7 +289,7 @@ function defaults(opts) {
     if (p === '/api/approvals' && url.searchParams.get('run_id')) return { json: [] }
     // 发起本次的定时任务和它的触发历史（只有直接打开那个定时任务的页面时才用到）
     if (p === `/api/schedules/${SCHEDULE_ID}`) return { json: SCHEDULE }
-    if (p === `/api/schedules/${SCHEDULE_ID}/fires`) return { json: { items: FIRES, next_before: null } }
+    if (p === `/api/schedules/${SCHEDULE_ID}/fires`) return { json: { items: opts.fires ?? FIRES, next_before: null } }
     // 查找基准期间离开运行详情去的那一页（定时任务列表）：给空的列表，页面落定不靠服务端里有什么
     if (p === '/api/schedules') return { json: { items: [] } }
     return null
@@ -363,31 +377,61 @@ const shot = async (page, name) => {
 
 // ---------------------------------------------------------------- 检查
 
+/** 运行详情里问了几次默认基准 */
+const askedBase = (log, run = T) => log.filter((k) => k === `GET /api/runs/${run}/compare/base`).length
+
 await section('从运行详情进入', async () => {
   const { page, log, blocked, errors } = await open(`/runs/${T}`)
   await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
   // 走过的地址（含 pushState / replaceState）：菜单要先问到基准再跳，不能先跳到只带本次的地址、再让对比页去找
   const visited = []
   page.on('framenavigated', (f) => { if (f === page.mainFrame()) visited.push(f.url()) })
-  await page.getByRole('button', { name: '更多操作' }).click()
+  const more = page.getByRole('button', { name: '更多操作' })
+  await more.click()
   const item = page.locator('[data-menu=compare]')
-  check('「更多」菜单里有「与上一次对比」，可点', await item.count() === 1 && (await item.innerText()).includes('与上一次对比')
-    && !(await item.isDisabled()))
+  await until(async () => await item.count() === 1 && !(await item.isDisabled()), 3000)
+  // 菜单开合几次：叫法已经定了，不再一开菜单就问一遍
+  await page.keyboard.press('Escape')
+  await more.click()
+  await page.waitForTimeout(300)
+  check('打开运行详情就预先问一次默认基准（定菜单的叫法），菜单开合不再问', askedBase(log) === 1, `${askedBase(log)} 次`)
+  const label = (await item.innerText()).trim()
+  check('「更多」菜单里有对比入口，可点；基准不是紧挨着的上一次，写「与上一次成功的运行对比」',
+    await item.count() === 1 && label === MENU_LAST_OK && !(await item.isDisabled()), label)
+  const clickAt = log.length
   await item.click()
   await page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
   await settled(page)
   const url = new URL(page.url())
   check('跳到 /runs/compare，带着本次和基准', url.searchParams.get('target') === T && url.searchParams.get('base') === B, url.search)
-  const iBase = log.indexOf(`GET /api/runs/${T}/compare/base`)
-  const iCmp = log.indexOf(`GET /api/runs/${T}/compare?base=${B}`)
-  check('先请求 compare/base，再请求 compare', iBase >= 0 && iCmp > iBase, `${iBase} → ${iCmp}`)
-  check('compare/base 只请求一次（页面不再自己找一遍）', log.filter((k) => k.startsWith(`GET /api/runs/${T}/compare/base`)).length === 1)
+  // 点了之后再问一次：详情页可能开了很久，预先问到的基准不一定还是现在的
+  const after = log.slice(clickAt)
+  const iBase = after.indexOf(`GET /api/runs/${T}/compare/base`)
+  const iCmp = after.indexOf(`GET /api/runs/${T}/compare?base=${B}`)
+  check('点了之后先请求 compare/base，再请求 compare', iBase >= 0 && iCmp > iBase, `${iBase} → ${iCmp}`)
+  check('点了之后 compare/base 只请求一次（对比页不再自己找一遍）', askedBase(after) === 1, `${askedBase(after)} 次`)
   const compareUrls = visited.map((u) => new URL(u)).filter((u) => u.pathname === '/runs/compare')
   check('菜单问到基准之后才跳，一步到带基准的地址', compareUrls.length >= 1 && compareUrls.every((u) => u.searchParams.get('base') === B),
     compareUrls.map((u) => u.search).join(' → '))
   check('写明基准是怎么选的', (await text(page, '[data-compare-reason]')).trim() === REASON, await text(page, '[data-compare-reason]').catch(() => ''))
   check('跳过去之后「正在查找」的提示收起', await until(async () => await page.locator('[data-toast]', { hasText: FINDING }).count() === 0))
   check('没有发出写请求', blocked.length === 0, blocked.join('；'))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('运行详情「工件」页签的悬停：写上证据快照、核查记录和节点产出', async () => {
+  // 工件页签按证据快照、核查记录、节点产出分三组（pages/runs/ArtifactsPane.tsx），页签头上的悬停是人先看到的那句说明，
+  // 不能还只写「原始结果和节点产出」。这里顺带查：本脚本本来就用假接口打开真的运行详情
+  const { page, errors } = await open(`/runs/${T}`)
+  await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+  const tab = page.locator(`[data-run-detail="${T}"] [role=tab][data-tab=artifacts]`)
+  // 工件清单取回来之后悬停里才有件数
+  const title = await until(async () => {
+    const t = (await tab.getAttribute('title').catch(() => null)) ?? ''
+    return /^\d+ 件/.test(t) ? t : null
+  }, 3000) ?? (await tab.getAttribute('title').catch(() => null)) ?? ''
+  check('「工件」页签的悬停写上件数和三组：证据快照、核查记录、每个节点的产出', /^\d+ 件/.test(title)
+    && ['证据快照', '核查记录', '产出'].every((w) => title.includes(w)), title)
   check('页面没有报错', errors.length === 0, errors.join('；'))
 })
 
@@ -398,18 +442,20 @@ const awaySettled = (page) => page.locator('[data-schedules-page="list"] [data-s
 const NO_BASE = '同一工作流没有其他已封存的正式运行'
 
 /**
- * 在运行详情里点「与上一次对比」，compare/base 的答复（answer，默认找到 B）先压住不放。交回页面、放行的函数、这一请求
- * 了结的 Promise（答完或者被取消，交回那个请求）、点了之后有没有挂出「正在查找」的提示，和点了之后走过的路径
- * （framenavigated 连 pushState、replaceState 都算）：晚到的答复哪怕只让页面在对比页一闪而过、又被别的跳转盖掉，
+ * 在运行详情里点「与上一次对比」，点了之后那一次 compare/base 的答复（answer，默认找到 B）先压住不放；打开详情时预先
+ * 问的那一次照常答、找到了 B（点了再问时找不到，是这期间基准那一次被删了），菜单项才可点。交回页面、放行的函数、点了
+ * 之后那一请求了结的 Promise（答完或者被取消，交回那个请求）、点了之后有没有挂出「正在查找」的提示，和点了之后走过的
+ * 路径（framenavigated 连 pushState、replaceState 都算）：晚到的答复哪怕只让页面在对比页一闪而过、又被别的跳转盖掉，
  * 走过的路径里也留着
  */
-async function findingBase(answer = { json: { base_run_id: B, reason: 'same_schedule', base: refOf(B) } }) {
+async function findingBase(answer = { json: BASE_OF_T }) {
   let release
   const gate = new Promise((r) => { release = r })
-  const opened_ = await open(`/runs/${T}`, { base: () => ({ ...answer, wait: gate }) })
+  let clicked = false
+  const opened_ = await open(`/runs/${T}`, { base: () => (clicked ? { ...answer, wait: gate } : { json: BASE_OF_T }) })
   const { page, log } = opened_
   const ended = new Promise((resolve) => {
-    const done = (req) => { if (new URL(req.url()).pathname.endsWith('/compare/base')) resolve(req) }
+    const done = (req) => { if (clicked && new URL(req.url()).pathname.endsWith('/compare/base')) resolve(req) }
     page.on('requestfinished', done)
     page.on('requestfailed', done)
   })
@@ -417,10 +463,15 @@ async function findingBase(answer = { json: { base_run_id: B, reason: 'same_sche
   const visited = []
   page.on('framenavigated', (f) => { if (f === page.mainFrame()) visited.push(new URL(f.url()).pathname) })
   await page.getByRole('button', { name: '更多操作' }).click()
-  await page.locator('[data-menu=compare]').click()
+  const item = page.locator('[data-menu=compare]')
+  // 预先问的那一次答完，菜单项才可点
+  await until(async () => !(await item.isDisabled()), 3000)
+  const asked = askedBase(log)
+  clicked = true
+  await item.click()
   // 菜单点完就收起了：查找期间要有一条看得见的提示，接口慢的时候不像点了没反应
   const noted = await until(async () => await page.locator('[data-toast]', { hasText: FINDING }).count() === 1, 3000)
-  await until(async () => log.includes(`GET /api/runs/${T}/compare/base`), 3000)
+  await until(async () => askedBase(log) > asked, 3000)
   return { ...opened_, release, ended, noted, visited }
 }
 
@@ -505,19 +556,26 @@ await section('未封存的运行：入口不可点并说明原因', async () =>
   }
 })
 
-/** 在运行详情里点「更多」→「与上一次对比」，等对比页落定 */
+/**
+ * 在运行详情里点「更多」→ 对比入口，等对比页落定。交回点之前菜单项上看得见的字（预先问到默认基准、可点之后的叫法），
+ * 和这期间菜单项上出现过的每一种「可点 + 字」（菜单开着时叫法换没换过）
+ */
 async function viaMenu(page) {
   await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
   await page.getByRole('button', { name: '更多操作' }).click()
-  await page.locator('[data-menu=compare]').click()
+  const item = page.locator('[data-menu=compare]')
+  await until(async () => !(await item.isDisabled()), 3000)
+  const label = (await item.innerText()).trim()
+  await item.click()
   await page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
   await settled(page)
+  return label
 }
 
 await section('默认基准的说法：上一次成功的运行', async () => {
   // 服务端只挑比本次先发起、成功结束并封存的运行：上一次失败、取消了时基准是再往前成功的那一次，「上一次运行」是错的
   for (const [reason, want] of [['same_schedule', REASON], ['same_workflow', REASON_WORKFLOW]]) {
-    const base = () => ({ json: { base_run_id: B, reason, base: refOf(B) } })
+    const base = () => ({ json: { ...BASE_OF_T, reason } })
     const menu = await open(`/runs/${T}`, { base })
     await viaMenu(menu.page)
     const fromMenu = (await maybeText(menu.page.locator('[data-compare-reason]'))).trim()
@@ -533,31 +591,222 @@ await section('默认基准的说法：上一次成功的运行', async () => {
   }
 })
 
-await section('运行详情与触发历史的「与上一次对比」：同一个基准、同一句来历', async () => {
-  // 两处的基准由服务端用同一个函数挑（api/compare.py 的 pick_base）：上一次失败了，两处都是再往前成功的 B。两处真的
-  // 一致由 backend/tests/test_scheduler_compare.py 守，这里守前端两个入口都原样用服务端给的基准
-  const menu = await open(`/runs/${T}`)
-  await viaMenu(menu.page)
-  const hist = await open(`/schedules/${SCHEDULE_ID}?tab=history`)
-  const link = hist.page.locator(`[data-fire-id="${FIRE_T}"] [data-fire-compare]`)
-  await link.waitFor({ timeout: 10000 })
-  const label = (await link.locator('[data-fire-compare-label]').innerText()).trim()
-  check('触发历史：基准不是紧挨着的上一次，链接上看得见的字写「与上一次成功的运行对比」', label === '与上一次成功的运行对比', label)
-  await link.click()
-  await hist.page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
-  await settled(hist.page)
-  const [a, b] = [new URL(menu.page.url()), new URL(hist.page.url())]
-  check('两个入口打开的是同一对运行（本次和基准都一样）', a.searchParams.get('target') === T && b.searchParams.get('target') === T
-    && a.searchParams.get('base') === B && b.searchParams.get('base') === B, `${a.search} | ${b.search}`)
-  const [ra, rb] = [(await maybeText(menu.page.locator('[data-compare-reason]'))).trim(),
-    (await maybeText(hist.page.locator('[data-compare-reason]'))).trim()]
-  check('两个入口写的默认基准一字不差：同一定时任务上一次成功的运行', ra === REASON && rb === REASON, `${ra} | ${rb}`)
-  const tiles = (page) => page.locator('[data-compare-summary] [data-compare-class]').evaluateAll((els) =>
-    els.map((e) => `${e.getAttribute('data-compare-class')}=${e.querySelector('[data-compare-count]')?.textContent?.trim()}`).join(' '))
-  const [ta, tb] = [await tiles(menu.page), await tiles(hist.page)]
-  check('两边的变化摘要一致', !!ta && ta === tb, `${ta} | ${tb}`)
-  check('没有发出写请求', ![...menu.blocked, ...hist.blocked].length, [...menu.blocked, ...hist.blocked].join('；'))
-  check('页面没有报错', ![...menu.errors, ...hist.errors].length, [...menu.errors, ...hist.errors].join('；'))
+await section('运行详情与触发历史的「与上一次对比」：同一个基准、同一个叫法、同一句来历', async () => {
+  // 两处的基准和 previous 由服务端用同一个函数挑（api/compare.py 的 pick_base）：上一次失败了，两处都是再往前成功的 B、
+  // 都不是紧挨着的上一次。两处真的一致由 backend/tests/test_scheduler_compare.py 守，这里守前端两个入口都原样用服务端
+  // 给的基准和 previous：看得见的叫法一样，点进去比的是同一对运行
+  for (const [what, previous, want] of [['上一次失败了', false, MENU_LAST_OK], ['上一次就是成功的', true, MENU]]) {
+    const base = () => ({ json: { ...BASE_OF_T, previous } })
+    const fires = FIRES.map((f) => ({ ...f, compare: { ...f.compare, previous } }))
+    const menu = await open(`/runs/${T}`, { base, fires })
+    const menuLabel = await viaMenu(menu.page)
+    const hist = await open(`/schedules/${SCHEDULE_ID}?tab=history`, { base, fires })
+    const link = hist.page.locator(`[data-fire-id="${FIRE_T}"] [data-fire-compare]`)
+    await link.waitFor({ timeout: 10000 })
+    const label = (await link.locator('[data-fire-compare-label]').innerText()).trim()
+    check(`${what}：运行详情「更多」里的入口和触发历史的链接叫法一致，都写「${want}」`, menuLabel === want && label === want,
+      `${menuLabel} | ${label}`)
+    await link.click()
+    await hist.page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
+    await settled(hist.page)
+    const [a, b] = [new URL(menu.page.url()), new URL(hist.page.url())]
+    check(`${what}：两个入口打开的是同一对运行（本次和基准都一样）`, a.searchParams.get('target') === T
+      && b.searchParams.get('target') === T && a.searchParams.get('base') === B && b.searchParams.get('base') === B,
+      `${a.search} | ${b.search}`)
+    const [ra, rb] = [(await maybeText(menu.page.locator('[data-compare-reason]'))).trim(),
+      (await maybeText(hist.page.locator('[data-compare-reason]'))).trim()]
+    check(`${what}：两个入口写的默认基准一字不差：同一定时任务上一次成功的运行`, ra === REASON && rb === REASON, `${ra} | ${rb}`)
+    const tiles = (page) => page.locator('[data-compare-summary] [data-compare-class]').evaluateAll((els) =>
+      els.map((e) => `${e.getAttribute('data-compare-class')}=${e.querySelector('[data-compare-count]')?.textContent?.trim()}`).join(' '))
+    const [ta, tb] = [await tiles(menu.page), await tiles(hist.page)]
+    check(`${what}：两边的变化摘要一致`, !!ta && ta === tb, `${ta} | ${tb}`)
+    check(`${what}：没有发出写请求`, ![...menu.blocked, ...hist.blocked].length, [...menu.blocked, ...hist.blocked].join('；'))
+    check(`${what}：页面没有报错`, ![...menu.errors, ...hist.errors].length, [...menu.errors, ...hist.errors].join('；'))
+    for (const c of opened) await c.close().catch(() => {})
+    opened.clear()
+  }
+})
+
+/**
+ * 菜单项上出现过的每一种状态（可点与否 + 看得见的字），按先后、去掉相邻重复的。挂在页面上，菜单开合、叫法换了都记下：
+ * 「先写一个叫法、问到了再换成另一个」要从这里看出来
+ */
+async function watchItem(page) {
+  await page.evaluate(() => {
+    const seen = []
+    window.__compareItem = seen
+    const look = () => {
+      const el = document.querySelector('[data-menu=compare]')
+      if (!el) return
+      const state = `${el.disabled ? '不可点' : '可点'}：${el.innerText.replace(/\s+/g, ' ').trim()}`
+      if (seen[seen.length - 1] !== state) seen.push(state)
+    }
+    new MutationObserver(look).observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true })
+    look()
+  })
+  return () => page.evaluate(() => window.__compareItem ?? [])
+}
+
+await section('菜单的叫法：问到默认基准之前不给点，不先写一个叫法再换成另一个', async () => {
+  // 预先问的那一次压住：菜单开着时等它，问到之前这一项只写「正在查找」、不给点，问到了直接是最终的叫法
+  let release
+  const gate = new Promise((r) => { release = r })
+  const { page, log, errors } = await open(`/runs/${T}`, { base: () => ({ json: BASE_OF_T, wait: gate }), waitUntil: 'load' })
+  await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+  await until(async () => askedBase(log) === 1, 3000)
+  const states = await watchItem(page)
+  await page.getByRole('button', { name: '更多操作' }).click()
+  const item = page.locator('[data-menu=compare]')
+  await item.waitFor()
+  const waiting = (await item.innerText()).replace(/\s+/g, ' ').trim()
+  check('问到之前打开菜单：这一项不可点，只写正在查找上一次成功的运行，不先写一个叫法', await item.isDisabled()
+    && waiting.startsWith(FINDING) && !waiting.includes(MENU) && !waiting.includes(MENU_LAST_OK), waiting)
+  release()
+  await until(async () => !(await item.isDisabled()), 3000)
+  const label = (await item.innerText()).trim()
+  check('问到之后：可点，直接是照基准定的叫法（上一次失败了：「与上一次成功的运行对比」）', label === MENU_LAST_OK, label)
+  // 菜单开着的整个过程：除了「正在查找」，只出现过最终的叫法，而且出现时就可点
+  const seen = await states()
+  const named = seen.filter((t) => !t.includes(FINDING))
+  check('菜单开着的整个过程里叫法没有换过：除了「正在查找」只出现过最终的叫法', named.length === 1
+    && named[0] === `可点：${MENU_LAST_OK}`, seen.join(' → '))
+  check('预先问只问了一次', askedBase(log) === 1, `${askedBase(log)} 次`)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('预先问出错、超时：不提示，叫法退回「与上一次对比」、可点，点了照常再问', async () => {
+  // 服务端出错：打开详情时不弹报错（人还没点），点了再问一次，这次问到了就照常跳
+  {
+    let n = 0
+    const { page, log, errors } = await open(`/runs/${T}`, { base: () => (++n === 1
+      ? { status: 500, json: { detail: '读取运行记录时出错' } } : { json: BASE_OF_T }) })
+    await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+    await page.getByRole('button', { name: '更多操作' }).click()
+    const item = page.locator('[data-menu=compare]')
+    await until(async () => !(await item.isDisabled()), 3000)
+    const label = (await item.innerText()).trim()
+    check('预先问出错：不弹报错，入口可点，叫法退回「与上一次对比」', label === MENU
+      && await page.locator('[data-toast]', { hasText: '读取运行记录时出错' }).count() === 0, label)
+    await item.click()
+    await page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
+    await settled(page)
+    check('……点了再问一次，问到了照常跳到对比页', new URL(page.url()).searchParams.get('base') === B && askedBase(log) === 2,
+      `${page.url()}；问了 ${askedBase(log)} 次`)
+    check('……页面没有报错', errors.length === 0, errors.join('；'))
+  }
+  // 连得上却卡着不回（代理、网络卡住）：预先问的那一次压住不答。到点按没问到算，入口不能一直停在不可点的「正在查找」
+  {
+    let n = 0
+    let release
+    const gate = new Promise((r) => { release = r })
+    // 不等 networkidle：压住的那一次要到点才了结，等它就看不到到点之前的样子了
+    const { page, log, errors } = await open(`/runs/${T}`, { base: () => (++n === 1 ? { json: BASE_OF_T, wait: gate } : { json: BASE_OF_T }),
+      waitUntil: 'load' })
+    try {
+      await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+      await until(async () => askedBase(log) === 1, 3000)
+      const states = await watchItem(page)
+      await page.getByRole('button', { name: '更多操作' }).click()
+      const item = page.locator('[data-menu=compare]')
+      await item.waitFor()
+      const waiting = await item.isDisabled()
+      const freed = await until(async () => !(await item.isDisabled()), ASK_TIMEOUT_MS + 4000)
+      const label = (await item.innerText()).trim()
+      check(`预先问卡着不回：先不可点、写正在查找，${ASK_TIMEOUT_MS / 1000} 秒后按没问到算，入口可点、叫法退回「与上一次对比」`,
+        waiting && !!freed && label === MENU, `${(await states()).join(' → ')}`)
+      check('……不弹报错', await page.locator('[data-toast]').count() === 0,
+        (await page.locator('[data-toast]').allInnerTexts()).join('；'))
+      await item.click()
+      await page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
+      await settled(page)
+      check('……点了再问一次，问到了照常跳到对比页', new URL(page.url()).searchParams.get('base') === B && askedBase(log) === 2,
+        `${page.url()}；问了 ${askedBase(log)} 次`)
+      check('……页面没有报错', errors.length === 0, errors.join('；'))
+    } finally {
+      release()
+    }
+  }
+})
+
+await section('预先问到没有默认基准：叫法写「选择基准对比…」，点了直接去对比页手动选', async () => {
+  // 没有默认基准（多为工作流的第一次运行）时还写「与上一次对比」，会让人以为有上一次可比。预先问已经知道没有：叫法照实
+  // 写，点了不再问一遍、弹提示，直接去只带本次的对比页——那里自己再找一次（这期间有了就用上），找不到写「没有默认基准」，
+  // 在上方手动选
+  const { page, log, errors } = await open(`/runs/${T}`, { base: () => ({ status: 404, json: { detail: NO_BASE_SERVER, code: 'compare_no_base' } }) })
+  await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+  await until(async () => askedBase(log) === 1, 3000)
+  await page.waitForTimeout(300)
+  const toast = page.locator('[data-toast]', { hasText: NO_BASE_SERVER })
+  const quiet = await toast.count() === 0
+  await page.getByRole('button', { name: '更多操作' }).click()
+  const item = page.locator('[data-menu=compare]')
+  await until(async () => !(await item.isDisabled()), 3000)
+  const label = (await item.innerText()).trim()
+  check('打开详情时不提示；入口可点，叫法写「选择基准对比…」，不写「与上一次对比」', quiet && label === MENU_PICK, label)
+  const clickAt = log.length
+  await item.click()
+  await page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
+  await settled(page, 'error')
+  const u = new URL(page.url())
+  check('……点了直接去对比页，只带本次，不弹「没有找到上一次成功的运行」的提示', u.searchParams.get('target') === T
+    && !u.searchParams.get('base') && await toast.count() === 0, `${u.search}；提示 ${await toast.count()} 条`)
+  const noBase = page.locator('[data-compare-error="no-base"]')
+  check('……对比页写「没有默认基准」和服务端的原因，下拉可以手动选', await noBase.count() === 1
+    && (await noBase.innerText()).includes(NO_BASE_SERVER) && await page.locator('select[data-compare-base-picker]').isEnabled(),
+  (await maybeText(noBase)).replace(/\s+/g, ' '))
+  check('……点了之后只有对比页自己找了一次默认基准，菜单没有先问一遍', askedBase(log.slice(clickAt)) === 1,
+    `点了之后问了 ${askedBase(log.slice(clickAt))} 次`)
+  check('……页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('回到这一页时再问一次默认基准：再问期间叫法不变、可点，问到不一样才换', async () => {
+  // 详情页可能开了很久，这期间在别处删掉、接着运行完了哪一次，基准跟着变。切去别的标签页、窗口再切回来时再问一次；
+  // 浏览器切标签页时改 visibilityState、发 visibilitychange，这里照样改、照样发
+  let answer = { json: { ...BASE_OF_T, previous: true } }
+  const { page, log, errors } = await open(`/runs/${T}`, { base: () => answer })
+  const flip = (state) => page.evaluate((s) => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => s })
+    document.dispatchEvent(new Event('visibilitychange'))
+  }, state)
+  await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+  const more = page.getByRole('button', { name: '更多操作' })
+  const item = page.locator('[data-menu=compare]')
+  await more.click()
+  await until(async () => !(await item.isDisabled()), 3000)
+  const first = (await item.innerText()).trim()
+  check('先问到的是紧挨着的上一次：写「与上一次对比」', first === MENU, first)
+  await page.keyboard.press('Escape')
+  await flip('hidden')
+  await page.waitForTimeout(300)
+  check('切走时不问', askedBase(log) === 1, `问了 ${askedBase(log)} 次`)
+  // 这期间上一次改成了失败的（基准成了再往前的那一次）。再问的那一次压住：菜单开着看，叫法还是原来的、可点
+  let release
+  const gate = new Promise((r) => { release = r })
+  answer = { json: BASE_OF_T, wait: gate }
+  await flip('visible')
+  const again = await until(async () => askedBase(log) === 2, 3000)
+  await more.click()
+  await item.waitFor()
+  const during = `${(await item.isDisabled()) ? '不可点' : '可点'}：${(await item.innerText()).trim()}`
+  check('切回来再问一次；问的期间叫法还是原来的、可点，不退回「正在查找」', again && during === `可点：${MENU}`, during)
+  const states = await watchItem(page)
+  release()
+  const after = await until(async () => ((await item.innerText()).trim() === MENU_LAST_OK ? MENU_LAST_OK : null), 3000)
+  check('问到不一样了：换成「与上一次成功的运行对比」，照样可点', after === MENU_LAST_OK && !(await item.isDisabled()),
+    (await states()).join(' → '))
+  // 再问出错（或者超时）：不改已经问到的叫法，也不弹报错
+  answer = { status: 500, json: { detail: '读取运行记录时出错' } }
+  await page.keyboard.press('Escape')
+  await flip('hidden')
+  await flip('visible')
+  await until(async () => askedBase(log) === 3, 3000)
+  await page.waitForTimeout(400)
+  await more.click()
+  await item.waitFor()
+  const kept = `${(await item.isDisabled()) ? '不可点' : '可点'}：${(await item.innerText()).trim()}`
+  check('再问出错：保留已经问到的叫法、可点，不弹报错', askedBase(log) === 3 && kept === `可点：${MENU_LAST_OK}`
+    && await page.locator('[data-toast]', { hasText: '读取运行记录时出错' }).count() === 0, `${kept}；问了 ${askedBase(log)} 次`)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
 })
 
 await section('两次运行与摘要', async () => {
@@ -1046,14 +1295,25 @@ await section('出错与找不到基准', async () => {
   check('只带本次：自己找到基准、补进地址', new URL(auto.page.url()).searchParams.get('base') === B
     && (await text(auto.page, '[data-compare-reason]')).trim() === REASON)
 
-  // 运行详情里找不到基准：提示原因，给「手动选择基准」
-  const menu = await open(`/runs/${T}`, { base: () => ({ status: 404, json: { detail: '同一工作流没有其他已封存的正式运行' } }) })
+  // 运行详情里预先问到了基准，点了再问时却找不到（这期间基准那一次被删了）：提示原因，给「手动选择基准」；再打开菜单，
+  // 叫法照这一次的答复写「选择基准对比…」。服务端的 404 不带机读码时也算找不到默认基准（同对比页的 compareErrorKind）
+  let menuAsks = 0
+  const menu = await open(`/runs/${T}`, { base: () => (++menuAsks === 1 ? { json: BASE_OF_T }
+    : { status: 404, json: { detail: '同一工作流没有其他已封存的正式运行' } }) })
   await menu.page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
   await menu.page.getByRole('button', { name: '更多操作' }).click()
   await menu.page.locator('[data-menu=compare]').click()
   const toast = menu.page.locator('[data-toast]', { hasText: '同一工作流没有其他已封存的正式运行' })
-  check('运行详情里找不到基准：提示原因、留在原页', await until(() => toast.count().then((c) => c === 1))
+  check('运行详情里点了之后找不到基准：提示原因、留在原页', await until(() => toast.count().then((c) => c === 1))
     && new URL(menu.page.url()).pathname === `/runs/${T}`)
+  await menu.page.getByRole('button', { name: '更多操作' }).click()
+  const relabel = await until(async () => {
+    const t = (await maybeText(menu.page.locator('[data-menu=compare]'))).trim()
+    return t === MENU_PICK ? t : null
+  }, 3000)
+  check('……再打开菜单：叫法照这一次的答复写「选择基准对比…」', relabel === MENU_PICK,
+    (await maybeText(menu.page.locator('[data-menu=compare]'))).trim())
+  await menu.page.keyboard.press('Escape')
   await toast.getByRole('button', { name: '手动选择基准' }).click()
   await menu.page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
   check('「手动选择基准」去到对比页，只带本次', new URL(menu.page.url()).searchParams.get('target') === T
@@ -1061,7 +1321,10 @@ await section('出错与找不到基准', async () => {
 
   const none = await open('/runs/compare')
   await settled(none.page, 'no-target')
-  check('什么都没带：说明从哪里进来', (await text(none.page, '[data-compare-page]')).includes('与上一次对比'))
+  // 说明不逐个列菜单项的叫法（有三种），只说从「更多」菜单打开、默认基准是上一次成功的运行；一句话不超过 40 字
+  const howTo = (await text(none.page, '[data-compare-page]')).split('\n').map((l) => l.trim()).find((l) => l.includes('「更多」')) ?? ''
+  check('什么都没带：说明从「更多」菜单打开、默认以上一次成功的运行为基准，不超过 40 字', howTo.includes('上一次成功的运行')
+    && [...howTo].length <= 40 && !howTo.includes(`「${MENU}」`), `${[...howTo].length} 字：${howTo}`)
 })
 
 await section('基准运行读不到（删了、链接过期）', async () => {

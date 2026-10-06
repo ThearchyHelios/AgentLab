@@ -10,7 +10,7 @@ import {
   RUN_STATUS_ORDER, STATUS, resolveStatus, serverStatusOf, type StatusCode,
 } from '../../lib/status'
 import { formatSpan, parseServerTime } from '../../lib/format'
-import { INQUIRY_TEXT } from '../../lib/terms'
+import { INQUIRY_TEXT, RUN_ARTIFACTS_TEXT } from '../../lib/terms'
 import { hasPendingApproval } from '../../store/catalog'
 
 // -------------------------------------------------------------------------
@@ -336,6 +336,7 @@ export const ARTIFACT_KIND_LABEL: Record<string, string> = {
   dual_check: '双盲复算对照',
   challenge: '反方审稿记录',
   inquiry_answer: INQUIRY_TEXT.artifactKind,
+  metric_input: RUN_ARTIFACTS_TEXT.kindMetricInput,
 }
 export const artifactKindLabel = (kind: string): string => ARTIFACT_KIND_LABEL[kind] ?? kind
 
@@ -361,12 +362,25 @@ export function artifactDescription(kind: string, meta?: Record<string, any> | n
     // 审批质询的回答文档（工件行的 meta 里有 {report, unit, question: 问题的前 40 字}）：不挂在节点上，靠问题认出是哪一条
     case 'inquiry_answer': return typeof meta?.question === 'string' && meta.question.trim()
       ? INQUIRY_TEXT.artifactAbout(meta.question) : INQUIRY_TEXT.artifactAboutNone
+    // 口径卡里容器型变量输入的完整值（工件行的 meta 里有 {path}）
+    case 'metric_input': return RUN_ARTIFACTS_TEXT.aboutMetricInput(typeof meta?.path === 'string' ? meta.path : null)
     default: return '工件'
   }
 }
 
-/** 证据：查询、工具、检索的快照。节点产出是过程里的中间值，一次循环就是几十件 */
-export const isEvidence = (kind: string): boolean => kind !== 'node_output'
+/**
+ * 工件页签上的三组：evidence 证据快照（查询、工具、检索的快照，口径卡、报告文档、表结构）；verify 核查记录（双盲复算、
+ * 反方审稿、审批质询对结论的核查与问答：以前混在证据快照里，和「原始结果」的说明对不上）；output 节点产出（过程里的
+ * 中间值，一次循环就是几十件）。按种类分：核查、质询时执行的查询种类仍是查询快照，归在证据快照（两组的悬停说明都写明
+ * 了）；认不出的种类也算证据快照，宁可醒目
+ */
+export type ArtifactGroup = 'evidence' | 'verify' | 'output'
+const VERIFY_KINDS: ReadonlySet<string> = new Set(['dual_check', 'challenge', 'inquiry_answer'])
+export const artifactGroup = (kind: string): ArtifactGroup =>
+  kind === 'node_output' ? 'output' : VERIFY_KINDS.has(kind) ? 'verify' : 'evidence'
+
+/** 证据快照这一组的（见 artifactGroup） */
+export const isEvidence = (kind: string): boolean => artifactGroup(kind) === 'evidence'
 
 /** 三种时长写进 title：「总时长 1 分 27 秒 · 执行时长 7.6 s · 等待审批 1 分 14 秒」 */
 export function timingTitle(t: RunTiming): string {

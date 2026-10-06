@@ -12,8 +12,8 @@ const run = (id: string) => `/runs/${encodeURIComponent(id)}`
 
 export const compare = {
   /**
-   * 默认的基准：同一定时任务的上一次运行，没有就同一工作流、同一运行类别的上一次。找不到时回 404，ApiError 的
-   * message 是给人看的原因
+   * 默认的基准：同一定时任务上一次成功并封存的运行，没有就同一工作流、同一运行类别的上一次。previous 说它是不是紧挨着
+   * 的上一次（运行详情的菜单项按它定叫法）。找不到时回 404，ApiError 的 message 是给人看的原因
    */
   base: (runId: string, opts?: RequestOptions) => get<RunCompareBase>(`${run(runId)}/compare/base`, opts),
   /**

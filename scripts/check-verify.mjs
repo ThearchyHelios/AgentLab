@@ -22,7 +22,10 @@
 //   标出，老工件照旧纯文本；
 // - 出具缺口：证据页的出具横幅（真的 EvidencePane 里那一个 IssuanceBanner，和问数据、画布右栏同一个）和成果节点印章的
 //   悬停说明把双盲复算、反方审稿报上来的缺口另起「核查未通过」「核查未完成」两组，不放在「校验未全部完成」下；
-// - 记录页的工件列表：双盲复算对照、反方审稿记录两种工件有名字和说明，不露键名；
+// - 记录页的工件列表：双盲复算对照、反方审稿记录两种工件有名字和说明，不露键名；和质询回答一起归在「核查记录」一组，
+//   不再算进说明写着「原始结果」的「证据快照」，筛选的件数、悬停说明跟着改（核查、质询时执行的查询仍在证据快照，两组的
+//   悬停都写明）；390px 窄屏上说明换到第二行（以前挤在一行里只剩三个字），第几件、第几次尝试在截断范围外看得见，悬停
+//   写全说明；320px 时校验值和大小不被拆开，每行仍是两行；
 // - 检查器：口径卡、指标、口径说明、盲算模型、相对误差、未采用原流程时、启用，每一项都真的写进节点配置；字段的
 //   叫法和服务端校验报错里的（engine/labels.py 的 DUAL_CHECK_FIELD_LABEL）一字不差；选口径卡、盲算模型、启用三态用的是
 //   和反方审稿共用的控件（verifyFields.tsx）；盲算模型不藏在高级选项里
@@ -32,8 +35,8 @@
 // - 390px 窄屏不横向溢出，深浅色都读得清，键盘能操作。
 //
 // 页面都跑在预览页（/preview.html?syn=…，用例在 frontend/src/dev/fixtures/dual_check.tsx，夹具 dual_check.json 两边
-// 共用）和设置页上，接口一律 page.route 伪造：完整对照的工件、审批回复、设置的读写都在浏览器里答，别的非 GET 拦掉，
-// 不碰真实的写接口。文案对照那一节不开浏览器：读 backend/app/api/settings.py、backend/app/engine/labels.py，terms.ts 借 vite
+// 共用；工件页签的用例在 run_artifacts.tsx，工件列表直接交给页签）和设置页上，接口一律 page.route 伪造：完整对照的工件、
+// 审批回复、设置的读写都在浏览器里答，别的非 GET 拦掉，不碰真实的写接口。文案对照那一节不开浏览器：读 backend/app/api/settings.py、backend/app/engine/labels.py，terms.ts 借 vite
 // 转译后直接 import。
 //
 //   node scripts/check-verify.mjs
@@ -1203,19 +1206,207 @@ await section('记录页的工件列表：双盲复算对照、反方审稿记�
   const { page, errors } = await preview('dual-check-approval')
   const got = await page.evaluate(async () => {
     const m = await import('/src/pages/runs/model.ts')
+    const kinds = ['dual_check', 'challenge', 'inquiry_answer', 'query_snapshot', 'tool_snapshot', 'retrieval_snapshot',
+      'metric_set', 'metric_input', 'report_doc', 'schema_snapshot', 'node_output', 'some_future_kind']
     return {
       dual: m.artifactKindLabel('dual_check'), challenge: m.artifactKindLabel('challenge'),
       dualDesc: m.artifactDescription('dual_check', { metrics: 2 }), dualBare: m.artifactDescription('dual_check', null),
       challengeDesc: m.artifactDescription('challenge', { report: 'report' }),
-      evidence: m.isEvidence('dual_check') && m.isEvidence('challenge'),
+      input: m.artifactKindLabel('metric_input'), inputDesc: m.artifactDescription('metric_input', { path: 'vars.region_rows' }),
+      inputBare: m.artifactDescription('metric_input', null),
+      groups: Object.fromEntries(kinds.map((k) => [k, m.artifactGroup(k)])),
+      evidence: Object.fromEntries(kinds.map((k) => [k, m.isEvidence(k)])),
     }
   })
   check('种类：双盲复算对照、反方审稿记录，不露键名', got.dual === '双盲复算对照' && got.challenge === '反方审稿记录', JSON.stringify(got))
   check('……说明写清装的是什么：双盲复算带指标个数，没有 meta 的老数据也有一句', got.dualDesc === '双盲复算：2 个指标两边的 SQL、取值与差异说明'
     && got.dualBare === '双盲复算：两边的 SQL、取值与差异说明' && got.challengeDesc === '反方审稿：每句结论的判断、理由和反方执行的查询',
   JSON.stringify(got))
-  check('……两种都算证据（列表里醒目）', got.evidence)
+  // 核查记录：双盲复算、反方审稿、审批质询对结论的核查与问答。以前算进「证据快照」，那一组的说明写的是「查询、工具调用、
+  // 知识检索的原始结果」，和装的东西对不上。别的种类的归类不变：核查时执行的查询仍是查询快照，认不出的种类宁可醒目
+  const want = { dual_check: 'verify', challenge: 'verify', inquiry_answer: 'verify', node_output: 'output' }
+  const wrong = Object.entries(got.groups).filter(([k, g]) => g !== (want[k] ?? 'evidence'))
+  check('……双盲复算对照、反方审稿记录、质询回答归在「核查记录」；查询、工具、检索的快照，口径卡、报告文档、表结构仍是证据快照',
+    wrong.length === 0, JSON.stringify(wrong))
+  check('……isEvidence 只认证据快照这一组', Object.entries(got.evidence).every(([k, v]) => v === ((want[k] ?? 'evidence') === 'evidence')),
+    JSON.stringify(got.evidence))
+  check('……口径卡里容器型变量输入的完整值（metric_input）也有名字和说明，不露键名', got.input === '指标输入'
+    && got.inputDesc === '口径卡输入「vars.region_rows」的完整值' && got.inputBare === '口径卡输入的完整值', JSON.stringify(got))
   check('……页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+/** 工件页签里每一行：种类、说明、第几件、悬停、分组，和种类标签、说明、第几件、时刻各自的位置 */
+const artifactRows = (page) => page.locator('[data-run-artifacts] [data-artifact-id]').evaluateAll((els) => els.map((el) => {
+  const rect = (n) => {
+    if (!n) return null
+    const r = n.getBoundingClientRect()
+    return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width }
+  }
+  const box = (sel) => rect(el.querySelector(sel))
+  const about = el.querySelector('[data-artifact-about]')
+  return {
+    id: el.getAttribute('data-artifact-id'), group: el.getAttribute('data-artifact-class'),
+    kind: el.querySelector('[data-artifact-kind-label]')?.textContent?.trim() ?? '',
+    about: about?.textContent?.trim() ?? '', nth: el.querySelector('[data-artifact-nth]')?.textContent?.trim() ?? '',
+    title: el.querySelector('[data-action="artifact-open"]')?.getAttribute('title') ?? '',
+    // 说明看得见的宽度、是否被截断（scrollWidth 比看得见的宽）
+    visible: about ? Math.round(about.getBoundingClientRect().width) : 0, cut: about ? about.scrollWidth > about.clientWidth + 1 : false,
+    row: rect(el), chip: box('[data-artifact-kind-label]'), line: box('[data-artifact-about-line]'),
+    nthBox: box('[data-artifact-nth]'), hash: box('[title^="内容校验值"]'), size: box('[data-artifact-size]'),
+    when: box('[data-action="artifact-moment"]') ?? box('[data-artifact-time]'),
+  }
+}))
+
+await section('记录页的工件页签：核查记录单独一组，筛选的件数和说明跟着改', async () => {
+  // 夹具（frontend/src/dev/fixtures/run_artifacts.tsx）：22 件，证据快照 10 件（查询快照 6、表结构、指标输入、口径卡、
+  // 报告文档），核查记录 4 件（双盲复算对照、反方审稿记录、两条质询回答），节点产出 8 件
+  const { page, errors } = await preview('run-artifacts')
+  await page.locator('[data-run-artifacts] [data-artifact-id]').first().waitFor()
+  const filters = await page.locator('[data-run-artifacts] [data-artifact-kind]').evaluateAll((els) => els.map((el) => ({
+    key: el.getAttribute('data-artifact-kind'), text: el.textContent.replace(/\s+/g, ' ').trim(), title: el.getAttribute('title') ?? '',
+  })))
+  check('筛选：全部、证据快照、核查记录、节点产出四档，件数对得上', JSON.stringify(filters.map((f) => f.text))
+    === JSON.stringify(['全部 22', '证据快照 10', '核查记录 4', '节点产出 8']), filters.map((f) => f.text).join('、'))
+  const hint = Object.fromEntries(filters.map((f) => [f.key, f.title]))
+  // 归类按种类：双盲复算、反方审稿、审批质询执行的查询仍是查询快照，归在证据快照（夹具里 6 件查询快照有 4 件是这样来的）。
+  // 两组的悬停都得说清，证据快照不能说成「结论里的数字从这里来」，核查记录要指明其间执行的查询在哪一组
+  check('「核查记录」的悬停说清装的是双盲复算对照、反方审稿记录、质询回答，其间执行的查询见「证据快照」',
+    ['双盲复算对照', '反方审稿记录', '质询回答', '「证据快照」'].every((w) => hint.verify?.includes(w)), hint.verify)
+  check('「证据快照」的悬停：原始结果之外写上口径卡、报告文档、表结构，并点明含核查、质询时执行的查询，不说结论的数字都从这里来',
+    ['查询', '口径卡', '报告文档', '表结构', '核查', '质询', '执行的查询'].every((w) => hint.evidence?.includes(w))
+    && !(hint.evidence ?? '').includes('结论里的数字'), hint.evidence)
+  const long = Object.entries(hint).filter(([, t]) => [...(t ?? '')].length > 45)
+  check('三组的悬停都在 45 字以内（用语规范：说明约 40 字）', long.length === 0,
+    long.map(([k, t]) => `${k} ${[...t].length} 字`).join('、'))
+  const all = await artifactRows(page)
+  check('「全部」列出 22 件，每件都标了分组', all.length === 22 && all.every((r) => ['evidence', 'verify', 'output'].includes(r.group)),
+    `${all.length} 件`)
+  check('种类都是中文，不露键名（metric_input 写「指标输入」）', all.every((r) => r.kind && !/[a-z_]{4,}/.test(r.kind)),
+    [...new Set(all.map((r) => r.kind))].join('、'))
+  await page.locator('[data-run-artifacts] [data-artifact-kind="verify"]').click()
+  const verify = await artifactRows(page)
+  check('点「核查记录」：只剩双盲复算对照、反方审稿记录、质询回答 4 件', verify.length === 4 && verify.every((r) => r.group === 'verify')
+    && JSON.stringify([...new Set(verify.map((r) => r.kind))].sort()) === JSON.stringify(['双盲复算对照', '反方审稿记录', '质询回答'].sort()),
+    verify.map((r) => r.kind).join('、'))
+  check('……按节点分组：双盲复算、反方审稿各一组，质询回答在「不属于某个节点」', JSON.stringify(await page.locator('[data-run-artifacts] [data-artifact-group]')
+    .evaluateAll((els) => els.map((e) => e.getAttribute('data-artifact-group')))) === JSON.stringify(['dual', 'review', '']))
+  await page.locator('[data-run-artifacts] [data-artifact-kind="evidence"]').click()
+  const evidence = await artifactRows(page)
+  check('点「证据快照」：10 件，没有核查记录混在里面（核查时执行的查询快照照旧在这里）', evidence.length === 10
+    && evidence.every((r) => r.group === 'evidence') && !evidence.some((r) => /双盲复算对照|反方审稿记录|质询回答/.test(r.kind))
+    && evidence.filter((r) => r.kind === '查询快照').length === 6, evidence.map((r) => r.kind).join('、'))
+  await page.locator('[data-run-artifacts] [data-artifact-kind="output"]').click()
+  const output = await artifactRows(page)
+  check('点「节点产出」：8 件，都是节点产出', output.length === 8 && output.every((r) => r.group === 'output' && r.kind === '节点产出'),
+    output.map((r) => r.kind).join('、'))
+  await page.locator('[data-run-artifacts] [data-artifact-kind="all"]').click()
+  // 宽屏一行排下：说明和种类在同一行，第几件紧跟说明
+  const wide = await artifactRows(page)
+  const looped = wide.filter((r) => r.nth)
+  check('宽屏（1280）：说明和种类在同一行', wide.every((r) => r.line && r.chip && Math.abs(r.line.top - r.chip.top) < 8),
+    JSON.stringify(wide.filter((r) => !(r.line && r.chip && Math.abs(r.line.top - r.chip.top) < 8)).map((r) => r.kind)))
+  check('宽屏：逐区汇总的三次产出编了号，重试的那次写明第 2 次尝试', JSON.stringify(looped.filter((r) => r.kind === '节点产出').map((r) => r.nth))
+    === JSON.stringify(['#1', '#2 · 第 2 次尝试', '#3']), looped.map((r) => `${r.kind}${r.nth}`).join('、'))
+  check('宽屏：短的说明不截断', wide.filter((r) => [...r.about].length <= 20).every((r) => !r.cut),
+    wide.filter((r) => [...r.about].length <= 20 && r.cut).map((r) => r.about).join('、'))
+  check('悬停写全说明（打开哪一种、装的是什么、第几件）', wide.every((r) => r.title.startsWith(`打开${r.kind}：${r.about}`)
+    && (!r.nth || r.title.includes(r.nth))), wide.find((r) => !r.title.startsWith(`打开${r.kind}：${r.about}`))?.title)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('记录页的工件页签：390px、320px 说明换到第二行，第几件在截断范围外，不横向溢出、深浅色可读', async () => {
+  for (const theme of ['dark', 'light']) {
+    const { page, errors } = await preview('run-artifacts', { width: 390, height: 844, theme })
+    await page.locator('[data-run-artifacts] [data-artifact-id]').first().waitFor()
+    const rows = await artifactRows(page)
+    const o = await page.evaluate(() => {
+      const doc = document.documentElement
+      const pane = document.querySelector('[data-run-artifacts]')
+      const scroller = pane?.querySelector('.overflow-y-auto')
+      return { page: doc.scrollWidth - doc.clientWidth, pane: pane ? pane.scrollWidth - pane.clientWidth : -1,
+        list: scroller ? scroller.scrollWidth - scroller.clientWidth : -1 }
+    })
+    check(`390px（${theme}）：页签不横向溢出`, o.page <= 0 && o.pane <= 0 && o.list <= 0, JSON.stringify(o))
+    // 说明在种类下面另起一行；以前和种类、校验值、大小、时刻挤在一行，只剩三个字宽（约 35px）
+    const below = rows.filter((r) => r.line && r.chip && r.line.top >= r.chip.bottom - 1)
+    check(`390px（${theme}）：每一行的说明都换到种类下面的第二行`, below.length === rows.length,
+      rows.filter((r) => !below.includes(r)).map((r) => r.kind).join('、'))
+    const widths = rows.map((r) => r.visible)
+    const narrowest = rows.filter((r) => r.cut).reduce((m, r) => Math.min(m, r.visible), Infinity)
+    check(`390px（${theme}）：说明看得见的宽度：被截断的至少 200px，其余整句看得全`,
+      rows.every((r) => !r.cut || r.visible >= 200), `截断的最窄 ${narrowest === Infinity ? '—' : `${narrowest}px`}；各行 ${widths.join('/')}`)
+    const long = rows.find((r) => r.kind === '质询回答' && r.about.endsWith('…」的回答'))
+    check(`390px（${theme}）：长问题的质询回答截断了，悬停里是整句说明`, !!long && long.cut && long.title.includes(long.about),
+      long ? `${long.visible}px · ${long.title}` : '没找到长问题的那一条')
+    // 第几件：放在截断范围外，整个落在这一行里、看得见
+    const numbered = rows.filter((r) => r.nth)
+    check(`390px（${theme}）：第几件、第几次尝试都看得见（不在被截断的说明里，不出这一行）`, numbered.length >= 5
+      && numbered.every((r) => r.nthBox && r.nthBox.width > 0 && r.nthBox.right <= r.row.right + 0.5 && r.nthBox.left >= r.row.left),
+    numbered.map((r) => `${r.kind}${r.nth}`).join('、'))
+    // 第一行：种类、校验值、大小，时刻（或时间）和它们在同一行
+    check(`390px（${theme}）：时刻（或时间）留在第一行，和种类对齐`, rows.every((r) => r.when && r.chip
+      && Math.abs((r.when.top + r.when.bottom) / 2 - (r.chip.top + r.chip.bottom) / 2) <= 4),
+    JSON.stringify(rows.filter((r) => !(r.when && r.chip && Math.abs((r.when.top + r.when.bottom) / 2 - (r.chip.top + r.chip.bottom) / 2) <= 4))
+      .map((r) => [r.kind, r.when, r.chip]).slice(0, 2)))
+    check(`390px（${theme}）：内容校验值还在第一行`, rows.every((r) => r.hash && r.chip && r.hash.bottom <= r.line.top + 1))
+    const c = await page.evaluate(() => {
+      const base = getComputedStyle(document.body).backgroundColor
+      const pick = (sel) => {
+        const el = document.querySelector(sel)
+        if (!el) return null
+        let bg = 'rgba(0, 0, 0, 0)'
+        for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
+          const v = getComputedStyle(n).backgroundColor
+          if (v !== 'rgba(0, 0, 0, 0)' && v !== 'transparent') { bg = v; break }
+        }
+        return { fg: getComputedStyle(el).color, bg }
+      }
+      return { base, kind: pick('[data-artifact-class="verify"] [data-artifact-kind-label]'),
+        about: pick('[data-artifact-class="verify"] [data-artifact-about]'), nth: pick('[data-artifact-nth]'),
+        filter: pick('[data-artifact-kind="verify"]') }
+    })
+    for (const key of ['kind', 'about', 'nth', 'filter']) {
+      const v = c[key]
+      const ratio = v ? contrast(v.fg, v.bg, c.base) : 0
+      check(`${theme}：${({ kind: '种类', about: '说明', nth: '第几件', filter: '「核查记录」筛选' })[key]}对比度 ≥ 4.5`, ratio >= 4.5,
+        `${ratio.toFixed(2)}（${v?.fg} on ${v?.bg}）`)
+    }
+    const bar = await page.locator('[data-run-artifacts] [data-artifact-kind]').evaluateAll((els) =>
+      els.every((el) => { const r = el.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth && r.width > 0 }))
+    check(`390px（${theme}）：四个筛选按钮都在屏幕里`, bar)
+    await shot(page, `run-artifacts-narrow-${theme}`)
+    check(`390px（${theme}）：页面没有报错`, errors.length === 0, errors.join('；'))
+  }
+  // 再窄（320px 的小屏手机）：第一行放不下种类、校验值、大小时，以前大小单独折到种类下面、校验值留在右边，行成了三行。
+  // 校验值和大小一起排；这一栏窄于 22rem 时收起校验值（打开后的查看器里写着），每行仍是两行：种类、大小、时刻在第一行，
+  // 说明在第二行
+  {
+    const { page, errors } = await preview('run-artifacts', { width: 320, height: 720, theme: 'dark' })
+    await page.locator('[data-run-artifacts] [data-artifact-id]').first().waitFor()
+    const rows = await artifactRows(page)
+    const o = await page.evaluate(() => {
+      const doc = document.documentElement
+      const scroller = document.querySelector('[data-run-artifacts] .overflow-y-auto')
+      return { page: doc.scrollWidth - doc.clientWidth, list: scroller ? scroller.scrollWidth - scroller.clientWidth : -1 }
+    })
+    check('320px：页签不横向溢出', o.page <= 0 && o.list <= 0, JSON.stringify(o))
+    const mid = (b) => (b.top + b.bottom) / 2
+    const split = rows.filter((r) => !(r.size && r.chip && r.size.width > 0 && Math.abs(mid(r.size) - mid(r.chip)) <= 4))
+    check('320px：大小留在第一行、和种类对齐，不单独折到种类下面', split.length === 0,
+      split.map((r) => `${r.kind}（大小 ${JSON.stringify(r.size)}，种类 ${JSON.stringify(r.chip)}）`).slice(0, 3).join('；'))
+    const apart = rows.filter((r) => r.hash && r.hash.width > 0 && r.size && Math.abs(mid(r.hash) - mid(r.size)) > 4)
+    check('320px：校验值和大小不被拆开（收起，或者同在一行）', apart.length === 0, apart.map((r) => r.kind).join('、'))
+    const below = rows.filter((r) => r.line && r.chip && r.line.top >= r.chip.bottom - 1)
+    check('320px：说明在种类下面的第二行', below.length === rows.length, rows.filter((r) => !below.includes(r)).map((r) => r.kind).join('、'))
+    const narrowest = rows.filter((r) => r.cut).reduce((m, r) => Math.min(m, r.visible), Infinity)
+    check('320px：被截断的说明看得见的宽度至少 150px', rows.every((r) => !r.cut || r.visible >= 150),
+      `截断的最窄 ${narrowest === Infinity ? '—' : `${narrowest}px`}`)
+    await shot(page, 'run-artifacts-320-dark')
+    check('320px：页面没有报错', errors.length === 0, errors.join('；'))
+  }
+  const wide = await preview('run-artifacts', { width: 1280, height: 900, theme: 'light' })
+  await wide.page.locator('[data-run-artifacts] [data-artifact-id]').first().waitFor()
+  await shot(wide.page, 'run-artifacts-wide-light')
 })
 
 // ---------------------------------------------------------------- 检查器与节点卡片

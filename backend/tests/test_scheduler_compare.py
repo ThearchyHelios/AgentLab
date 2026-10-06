@@ -256,6 +256,9 @@ async def test_finished_run_is_compared_with_the_previous_run_of_its_schedule(re
     items = {f["id"]: f for f in (await client.get(f"/api/schedules/{sid}/fires")).json()["items"]}
     assert items[fire_id]["compare"] == {"base_run_id": base_id, "summary": SUMMARY, "previous": True}
     assert items[base_fire]["compare"] is None
+    # 运行详情的默认基准：同一次、同样是紧挨着的上一次（中间手动的、别的定时任务的两次不在同一定时任务的范围里）
+    base = (await client.get(f"/api/runs/{target_id}/compare/base")).json()
+    assert (base["base_run_id"], base["previous"]) == (base_id, True)
     [listed] = [s for s in (await client.get("/api/schedules")).json()["items"] if s["id"] == sid]
     assert listed["last_fire"]["id"] == fire_id and listed["last_fire"]["compare"]["base_run_id"] == base_id
 
@@ -321,9 +324,10 @@ async def test_after_a_failed_run_the_base_is_the_last_successful_one(recorder, 
     assert (body["compare"]["base_run_id"], body["compare"]["previous"]) == (first, False)
     items = {f["id"]: f for f in (await client.get(f"/api/schedules/{sid}/fires")).json()["items"]}
     assert items[fire_id]["compare"] == {"base_run_id": first, "summary": SUMMARY, "previous": False}
-    # 运行详情「与上一次对比」的默认基准挑的是同一次（同一个函数）：两个同名入口比的是同一对运行、计数一致
+    # 运行详情「与上一次对比」的默认基准挑的是同一次（同一个函数）：两个同名入口比的是同一对运行、计数一致；
+    # previous 也一样，运行详情的菜单项和触发历史的链接都写「与上一次成功的运行对比」
     base = (await client.get(f"/api/runs/{target_id}/compare/base")).json()
-    assert (base["base_run_id"], base["reason"]) == (first, "same_schedule")
+    assert (base["base_run_id"], base["reason"], base["previous"]) == (first, "same_schedule", False)
 
 
 async def fires_of(client, sid: str) -> dict[str, dict]:
@@ -396,6 +400,9 @@ async def test_a_stored_compare_stays_while_its_base_is_still_the_pick(recorder,
     assert (await client.delete(f"/api/runs/{second}", params={"force": "true"})).status_code == 204
     assert (await fires_of(client, sid))[third_fire]["compare"] == shown
     assert await default_base_of(client, third) == (first, "same_schedule")
+    # 运行详情的默认基准按现在的运行记录算：中间那次删掉了，第 1 周就是紧挨着的上一次（菜单写「与上一次对比」，
+    # 触发历史照当时记下的写「与上一次成功的运行对比」，两句都属实，比的是同一对运行）
+    assert (await client.get(f"/api/runs/{third}/compare/base")).json()["previous"] is True
 
 
 async def test_without_an_earlier_success_there_is_no_base(recorder, client):

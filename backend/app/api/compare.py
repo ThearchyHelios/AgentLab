@@ -1,11 +1,12 @@
 """运行对比：同一个工作流的两次运行按「变化三分法」对照——数据变了、口径变了、还是模板 / SQL 变了（engine/compare.py）。
 
-GET /api/runs/{run_id}/compare/base：默认拿哪一次来比，{base_run_id, reason, base}。规则在 pick_base，定时任务结束后
-的自动对比（scheduler/auto_compare.py）用的是同一个函数——触发历史里的「与上一次对比」和运行详情里的同名入口必须拿到
-同一个基准，计数才对得上；触发历史里存着的那一份，事后基准不再是这里挑出来的那一次（中间失败的那次被接着运行成功
-了）就不再给出（auto_compare.outdated）。这次运行是定时任务发起的，取同一定时任务、同一工作流、比它先发起的运行里
+GET /api/runs/{run_id}/compare/base：默认拿哪一次来比，{base_run_id, reason, base, previous}。规则在 pick_base，定时
+任务结束后的自动对比（scheduler/auto_compare.py）用的是同一个函数——触发历史里的「与上一次对比」和运行详情里的同名入口
+必须拿到同一个基准，计数才对得上；触发历史里存着的那一份，事后基准不再是这里挑出来的那一次（中间失败的那次被接着运行
+成功了）就不再给出（auto_compare.outdated）。这次运行是定时任务发起的，取同一定时任务、同一工作流、比它先发起的运行里
 成功结束并封存的最近一次（reason: same_schedule）；不是、或者同一任务之前没有成功的，取同一工作流、同一运行类别里
-同样条件的最近一次（reason: same_workflow）。找不到 404。
+同样条件的最近一次（reason: same_workflow）。previous 说基准是不是紧挨着的上一次（同自动对比记下的 previous）：不是时
+两个入口都写「与上一次成功的运行对比」。找不到 404。
 
 GET /api/runs/{run_id}/compare?base={base_id}：{target, base, summary, template, metrics, queries, notes}，每个字段
 的形状见 engine/compare.py。两次运行都必须已结束、封存且封存核对一致，封存判定照搬证据接口（api/evidence._sealed）：
@@ -62,11 +63,13 @@ BASE = "作为基准的运行"
 
 @router.get("/{run_id}/compare/base")
 async def compare_base(run_id: str) -> dict[str, Any]:
-    """默认拿来对比的那一次运行：{base_run_id, reason: same_schedule | same_workflow, base}。"""
+    """默认拿来对比的那一次运行：{base_run_id, reason: same_schedule | same_workflow, base, previous}。previous 是
+    pick_base 算的「是不是紧挨着的上一次」：运行详情「更多」里的入口按它定叫法（不是时写「与上一次成功的运行对比」），
+    和触发历史里同名的链接（自动对比记下的 previous）说法一致。"""
     found = await default_base(run_id)
     if found is None:
         raise CodedHTTPException(404, NO_BASE_TEXT, NO_BASE)
-    return {"base_run_id": found.run.id, "reason": found.reason, "base": run_ref(found.run)}
+    return {"base_run_id": found.run.id, "reason": found.reason, "base": run_ref(found.run), "previous": found.previous}
 
 
 @router.get("/{run_id}/compare")

@@ -4,12 +4,12 @@ import clsx from 'clsx'
 import { api } from '../../api/client'
 import { EmptyState, ErrorState, Skeleton, StatusBadge } from '../../components/ui'
 import { formatBytes, formatClock, formatDateTime, formatNumber, formatTime, parseServerTime } from '../../lib/format'
-import { nodeTypeLabel } from '../../lib/terms'
+import { RUN_ARTIFACTS_TEXT as T, nodeTypeLabel } from '../../lib/terms'
 import { ArtifactViewer } from '../../run/AssistantStream'
 import { topology } from '../../run/derive'
 import type { Trace } from '../../run/trace'
 import type { GraphSpec } from '../../types'
-import { artifactDescription, artifactKindLabel, isEvidence, type RunArtifact } from './model'
+import { artifactDescription, artifactGroup, artifactKindLabel, type ArtifactGroup, type RunArtifact } from './model'
 
 // -------------------------------------------------------------------------
 // 数据
@@ -65,22 +65,23 @@ export function useRunArtifacts(runId: string, refreshKey: string): ArtifactList
 // 页签
 // -------------------------------------------------------------------------
 
-type KindFilter = 'all' | 'evidence' | 'output'
-const FILTER_LABEL: Record<KindFilter, string> = { all: '全部', evidence: '证据快照', output: '节点产出' }
-const FILTER_HINT: Record<KindFilter, string> = {
-  all: '',
-  evidence: '查询、工具调用、知识检索的原始结果：结论里的数字从这里来',
-  output: '每个节点每执行一次的产出：循环里每一轮都有一件',
-}
+/** 筛选：全部，或者 model.ts 的三组之一（证据快照、核查记录、节点产出） */
+type KindFilter = 'all' | ArtifactGroup
+const FILTERS: readonly KindFilter[] = ['all', 'evidence', 'verify', 'output']
 /** 一次循环能有上千件：先列这么多，其余点了再展开 */
 const FIRST_ROWS = 300
 
 /**
- * 工件：这次运行按内容哈希存下来的每一件东西——查询和工具调用的原始结果、每个
- * 节点每一次的产出。审阅出具物时从这里下钻到证据；打开时按哈希复验。
+ * 工件：这次运行按内容哈希存下来的每一件东西——查询和工具调用的原始结果、核查留下的
+ * 记录、每个节点每一次的产出。审阅出具物时从这里下钻到证据；打开时按哈希复验。
  *
  * 按节点分组、按执行顺序排，和航迹的泳道同一个顺序。能对上时刻的，一键跳到
  * 航迹里它产出的那一刻。
+ *
+ * 每一行按列表这一栏自己的宽度排（容器查询，不看视口：详情区在宽屏上也可能很窄）。窄时
+ * 说明换到第二行占满整行，第一行留种类、校验值、大小和时刻；以前挤在一行里，390px
+ * 宽时说明只剩三个字。序号和第几次尝试放在截断的范围外，按钮的悬停写全说明。再窄
+ * （320px 的手机）时收起校验值，每行仍是两行。
  */
 export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
   list: ArtifactList
@@ -96,17 +97,17 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
   const items = list.items
 
   const counts = useMemo(() => {
-    const c: Record<KindFilter, number> = { all: 0, evidence: 0, output: 0 }
+    const c: Record<KindFilter, number> = { all: 0, evidence: 0, verify: 0, output: 0 }
     for (const a of items ?? []) {
       c.all += 1
-      c[isEvidence(a.kind) ? 'evidence' : 'output'] += 1
+      c[artifactGroup(a.kind)] += 1
     }
     return c
   }, [items])
   const bytes = useMemo(() => (items ?? []).reduce((n, a) => n + (a.size ?? 0), 0), [items])
 
   const groups = useMemo(() => {
-    const shown = (items ?? []).filter((a) => filter === 'all' || (filter === 'evidence') === isEvidence(a.kind))
+    const shown = (items ?? []).filter((a) => filter === 'all' || artifactGroup(a.kind) === filter)
     const order = graph ? topology(graph).order : []
     const rank = new Map(order.map((id, i) => [id, i]))
     const byNode = new Map<string, RunArtifact[]>()
@@ -144,14 +145,14 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
   return (
     <div className="flex h-full min-h-0 flex-col" data-run-artifacts="">
       <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-1.5 text-2xs text-faint">
-        <div className="flex gap-0.5" role="group" aria-label="按类型筛选工件">
-          {(Object.keys(FILTER_LABEL) as KindFilter[]).map((k) => (
+        <div className="flex flex-wrap gap-0.5" role="group" aria-label={T.filterGroup}>
+          {FILTERS.map((k) => (
             <button
               key={k}
               type="button"
               aria-pressed={filter === k}
               disabled={k !== 'all' && !counts[k]}
-              title={FILTER_HINT[k] || undefined}
+              title={T.filterHint[k]}
               onClick={() => setFilter(k)}
               data-artifact-kind={k}
               className={clsx(
@@ -159,7 +160,7 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
                 filter === k ? 'border-[var(--border-strong)] bg-hover text-fg' : 'border-transparent hover:bg-hover hover:text-dim',
               )}
             >
-              {FILTER_LABEL[k]} <span className="tnum">{counts[k]}</span>
+              {T.filter[k]} <span className="tnum">{counts[k]}</span>
             </button>
           ))}
         </div>
@@ -169,7 +170,9 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
         </span>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      {/* 行按这一栏的宽度排（容器查询）。容器设在列表上、不设在整个页签上：查看工件的弹窗挂在页签里、是 fixed 定位，
+          早期实现容器查询的浏览器给容器加布局隔离，会把它当成 fixed 元素的定位参照，弹窗就只盖住这一栏 */}
+      <div className="@container min-h-0 flex-1 overflow-y-auto">
         {groups.map(([nodeId, rows]) => {
           if (budget <= 0) return null
           const take = rows.slice(0, budget)
@@ -219,7 +222,8 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, t1, onOpen, onM
               style={{ background: node ? `var(--nt-${node.type}, var(--text-faint))` : 'var(--text-faint)' }} />
         <span className="min-w-0 truncate font-medium text-fg">{label}</span>
         {node && <span className="shrink-0 text-faint">{nodeTypeLabel(node.type)}</span>}
-        {nodeId && label !== nodeId && <span className="mono shrink-0 text-faint">{nodeId}</span>}
+        {/* 窄时让给名字：节点 id 是给对照画布用的，名字和类型已经认得出是哪个节点 */}
+        {nodeId && label !== nodeId && <span className="mono shrink-0 text-faint @max-[35rem]:hidden">{nodeId}</span>}
         {state && <StatusBadge status={state} size={11} animate={false} />}
         <span className="flex-1" />
         <span className="tnum shrink-0 text-faint">{total} 件</span>
@@ -228,33 +232,42 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, t1, onOpen, onM
         const n = (ordinal.get(a.kind) ?? 0) + 1
         ordinal.set(a.kind, n)
         const kind = artifactKindLabel(a.kind)
+        const group = artifactGroup(a.kind)
+        const about = artifactDescription(a.kind, a.meta)
         const attempt = Number(a.meta?.attempt)
         const created = parseServerTime(a.created_at ?? null)?.getTime()
         const at = t0 != null && created != null && created >= t0 && (t1 == null || created <= t1) ? created : null
         const numbered = (perKind.get(a.kind) ?? 0) > 1
         const title = `${label} · ${kind}${numbered ? ` #${n}` : ''}`
+        // 第几件、第几次尝试：说明再长、截得再短也要看得见，放在截断的范围外
+        const extra = [numbered ? T.nth(n) : '', attempt > 1 ? T.attempt(attempt) : ''].filter(Boolean).join(' · ')
         return (
-          <div key={a.id} className="flex items-center gap-2 border-b px-4 py-1 last:border-0 hover:bg-hover"
-               data-artifact-id={a.id}>
+          <div key={a.id} className="flex items-center gap-2 border-b px-4 py-1 last:border-0 hover:bg-hover @max-[35rem]:items-start"
+               data-artifact-id={a.id} data-artifact-class={group}>
             <button
               type="button"
-              className="flex min-w-0 flex-1 items-center gap-2 rounded py-0.5 text-left outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)]"
+              className="flex min-w-0 flex-1 items-center gap-2 rounded py-0.5 text-left outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)] @max-[35rem]:flex-wrap @max-[35rem]:gap-y-0.5"
               onClick={() => onOpen({ id: a.id, title })}
-              title={`打开${kind}（读取时按内容校验值重新校验）`}
+              title={T.openTitle(kind, extra ? `${about} ${extra}` : about)}
               data-action="artifact-open"
             >
-              <span className={clsx('chip shrink-0', isEvidence(a.kind) && 'text-fg')}
-                    style={isEvidence(a.kind) ? { borderColor: 'var(--border-strong)' } : undefined}>
+              <span className={clsx('chip shrink-0', group !== 'output' && 'text-fg')}
+                    style={group !== 'output' ? { borderColor: 'var(--border-strong)' } : undefined}
+                    data-artifact-kind-label="">
                 {kind}
               </span>
-              <span className="min-w-0 truncate text-xs text-dim">
-                {artifactDescription(a.kind, a.meta)}
-                {numbered && <span className="tnum text-faint"> #{n}</span>}
-                {attempt > 1 && <span className="text-faint"> · 第 {attempt} 次尝试</span>}
+              {/* 宽时排在种类后面、占满中间；窄时换到第二行占满整行（order-last + basis-full），第一行留种类、校验值和大小 */}
+              <span className="flex min-w-0 flex-1 items-baseline gap-1 text-xs text-dim @max-[35rem]:order-last @max-[35rem]:basis-full"
+                    data-artifact-about-line="">
+                <span className="min-w-0 truncate" data-artifact-about="">{about}</span>
+                {extra && <span className="tnum shrink-0 text-faint" data-artifact-nth="">{extra}</span>}
               </span>
-              <span className="flex-1" />
-              <span className="mono shrink-0 text-2xs text-faint" title={`内容校验值 ${a.id}`}>{a.id.slice(0, 8)}</span>
-              <span className="tnum w-16 shrink-0 text-right text-2xs text-faint">{formatBytes(a.size)}</span>
+              {/* 校验值和大小一起排、一起折行：分开时更窄的屏上大小会单独折到种类下面、校验值留在右边。窄于 22rem（320px
+                  的手机）时收起校验值，第一行才放得下种类和大小；打开后的查看器里写着校验值 */}
+              <span className="flex shrink-0 items-center gap-2 @max-[35rem]:ml-auto">
+                <span className="mono text-2xs text-faint @max-[22rem]:hidden" title={`内容校验值 ${a.id}`}>{a.id.slice(0, 8)}</span>
+                <span className="tnum w-16 text-right text-2xs text-faint" data-artifact-size="">{formatBytes(a.size)}</span>
+              </span>
             </button>
             {at != null && onMoment ? (
               <button type="button" className="btn btn-xs btn-ghost tnum w-[86px] shrink-0 justify-end"
@@ -263,7 +276,8 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, t1, onOpen, onM
                 <History size={11} aria-hidden /> T+{formatClock(Math.round(at - t0!))}
               </button>
             ) : (
-              <span className="tnum w-[86px] shrink-0 text-right text-2xs text-faint" title={formatDateTime(a.created_at ?? null)}>
+              <span className="tnum w-[86px] shrink-0 text-right text-2xs text-faint @max-[35rem]:mt-1"
+                    title={formatDateTime(a.created_at ?? null)} data-artifact-time="">
                 {formatTime(a.created_at ?? null)}
               </span>
             )}

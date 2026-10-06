@@ -7,7 +7,8 @@
 - 对比只读：两次运行的 last_seq、事件、工件引用、工件文件一样不多
 - 遮罩列（查询当时记下的、数据源现在设的）的值不出现在结果里
 - 默认基准：同一定时任务优先，否则同一工作流、同一运行类别；只挑比这次先发起、成功结束并封存的运行，按发起先后取
-  最近一次（失败、取消的跳过，和定时任务的自动对比挑的是同一次，见 test_scheduler_compare.py）
+  最近一次（失败、取消的跳过，和定时任务的自动对比挑的是同一次，见 test_scheduler_compare.py）；previous 说它是不是
+  紧挨着的上一次
 - 真跑：同一条 SQL 数据变了是 data_only；只是代进去的日期不同是 params_only，图一样
 """
 from __future__ import annotations
@@ -333,6 +334,49 @@ async def test_the_default_base_follows_launch_order(client):
     assert (body["base_run_id"], body["reason"]) == (resumed, "same_workflow")
     waiting = await bare(workflow, T0 + 20 * day, status="interrupted", created=t + 4 * hour)
     assert (await get(client, f"/api/runs/{waiting}/compare/base"))["base_run_id"] == later
+
+
+async def test_the_default_base_says_whether_it_is_the_previous_run(client):
+    """previous：基准是不是紧挨着的上一次，语义同 pick_base——同一范围（同一定时任务，或同一工作流、同一运行类别）里比
+    这次先发起、比基准后发起的运行一次都没有。失败、取消、还没结束、没封存的都算隔着；别的运行类别、别的定时任务（这次
+    是定时任务发起的）、比这次晚发起的不在范围里，不算。运行详情「更多」里的入口按它写「与上一次对比」还是「与上一次
+    成功的运行对比」，和触发历史里同名的链接一个说法"""
+    day = timedelta(days=1)
+
+    async def pick(run_id: str) -> tuple[str, str, bool]:
+        body = await get(client, f"/api/runs/{run_id}/compare/base")
+        return body["base_run_id"], body["reason"], body["previous"]
+
+    # 同一定时任务：紧挨着的上一次就是成功的
+    workflow = await new_workflow()
+    first = await bare(workflow, T0, schedule_id="sched-weekly")
+    await bare(workflow, T0 + day)                                       # 手动发起的：不在同一定时任务的范围里
+    await bare(workflow, T0 + day, schedule_id="sched-daily", status="failed")  # 别的定时任务失败的：同上
+    second = await bare(workflow, T0 + 2 * day, schedule_id="sched-weekly")
+    await bare(workflow, T0 + 3 * day, schedule_id="sched-weekly", status="failed")  # 比 second 晚发起
+    assert await pick(second) == (first, "same_schedule", True)
+
+    # 中间隔着一次没成功的（失败、取消、还没结束、结束了没封存）：基准是再往前成功的那一次，不是紧挨着的上一次
+    for between in ({"status": "failed"}, {"status": "cancelled"}, {"status": "running", "sealed": False},
+                    {"status": "interrupted", "sealed": False}, {"sealed": False}):
+        workflow = await new_workflow()
+        first = await bare(workflow, T0, schedule_id="sched-weekly")
+        await bare(workflow, T0 + day, schedule_id="sched-weekly", **between)
+        current = await bare(workflow, T0 + 2 * day, schedule_id="sched-weekly")
+        assert await pick(current) == (first, "same_schedule", False), between
+
+    # 同一工作流、同一运行类别（手动发起的）：别的运行类别不算隔着，同一类别里定时任务发起的失败的那次算
+    workflow = await new_workflow()
+    first = await bare(workflow, T0)
+    await bare(workflow, T0 + day, run_class="exploratory", status="failed")
+    second = await bare(workflow, T0 + 2 * day)
+    assert await pick(second) == (first, "same_workflow", True)
+    await bare(workflow, T0 + 3 * day, schedule_id="sched-weekly", status="failed")
+    third = await bare(workflow, T0 + 4 * day)
+    assert await pick(third) == (second, "same_workflow", False)
+    # 定时任务的第一次退回同一工作流：隔没隔着按退回的那个范围算
+    lone = await bare(workflow, T0 + 5 * day, schedule_id="sched-monthly")
+    assert await pick(lone) == (third, "same_workflow", True)
 
 
 # --------------------------------------------------------------------------

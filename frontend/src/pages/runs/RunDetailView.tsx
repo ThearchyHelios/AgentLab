@@ -25,7 +25,7 @@ import {
 } from './model'
 import { ArtifactsPane, useRunArtifacts } from './ArtifactsPane'
 import { EvidencePane } from './EvidencePane'
-import { EVIDENCE_AUDIT_TEXT } from '../../lib/terms'
+import { EVIDENCE_AUDIT_TEXT, RUN_ARTIFACTS_TEXT } from '../../lib/terms'
 import { ClassChip, MoreMenu, RunTabs, TierChip, copyText, type MenuItem, type TabItem } from './parts'
 import { ProvenanceBar, Telemetry, runClocks } from './Telemetry'
 import { TracePane } from './TracePane'
@@ -63,8 +63,9 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const [feedback, setFeedback] = useState<Feedback | null>(null)
   const streamBox = useRef<HTMLDivElement>(null)
   const now = useTicker(60_000)
-  // 「更多」里的「与上一次对比」：查找基准时的状态在这里挂着，菜单项等拿到运行之后再造（下面有提前返回）
-  const compareEntry = useCompareEntry()
+  // 「更多」里的「与上一次对比」：拿到能对比的运行就预先问默认基准（叫法看它是不是紧挨着的上一次），预先查找和点了
+  // 之后查找中的状态都在这里挂着，所以放在下面的提前返回之前。live 同下面的 live
+  const compareItem = useCompareEntry(d.run, d.streaming || isLiveRun(d.run?.status))
 
   useEffect(() => {
     if (d.state !== 'missing') return
@@ -464,7 +465,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       key: 'copy-link', label: '复制链接', icon: <Link2 size={12} />,
       onSelect: () => void copyText(`${location.origin}/runs/${run.id}`, '链接'),
     },
-    compareEntry(run, live),
+    compareItem,
     {
       key: 'delete', label: '删除记录…', icon: <Trash2 size={12} />, danger: true, onSelect: () => void remove(),
       disabled: live || busy === 'delete',
@@ -537,7 +538,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     { key: 'evidence', label: EVIDENCE_AUDIT_TEXT.tab, title: EVIDENCE_AUDIT_TEXT.tabTitle },
     {
       key: 'artifacts', label: '工件', count: artifactCount, unit: '件', tone: 'quiet',
-      title: artifactCount == null ? '本次运行保存的证据和产出' : `${artifactCount} 件：查询和工具调用的原始结果、每个节点每一次的产出`,
+      title: RUN_ARTIFACTS_TEXT.tabTitle(artifactCount),
     },
   ]
 

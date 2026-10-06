@@ -3202,10 +3202,10 @@ export const SCHEDULE_TEXT = {
   get compareLink() { return RUN_COMPARE_TEXT.menu },
   /**
    * 基准不是紧挨着的上一次（上一次失败了、取消了，比的是再往前成功的那一次）时链接上看得见的叫法：触屏没有悬停，
-   * 键盘聚焦时也不显示 title，只在悬停里说明会让人以为比的就是上一次。运行详情「更多」里的菜单项点之前还不知道基准
-   * 是哪一次，这时仍叫「与上一次对比」，两处叫法不同；进了对比页都写「默认基准：同一定时任务上一次成功的运行」
+   * 键盘聚焦时也不显示 title，只在悬停里说明会让人以为比的就是上一次。运行详情「更多」里的菜单项按服务端给的 previous
+   * 用同一个叫法（同为 getter）；进了对比页都写「默认基准：同一定时任务上一次成功的运行」
    */
-  compareLinkLastOk: '与上一次成功的运行对比',
+  get compareLinkLastOk() { return RUN_COMPARE_TEXT.menuLastOk },
   /**
    * 悬停写各类指标的个数，和 Webhook 通知里那一行同一个写法（服务端 scheduler/auto_compare.py 的 summary_text）：
    * 变化三分法的三类总写上，0 个也写；其余各类有才写，次序同对比页；两边都没有指标时不写一串 0 个。只有个数，
@@ -3272,8 +3272,13 @@ export const SCHEDULE_TEXT = {
 export const RUN_COMPARE_TEXT = {
   title: '运行对比',
   hint: '把两次运行的指标变化拆成数据、口径、模板与 SQL 三类',
-  // 入口：运行详情的「更多」菜单
+  // 入口：运行详情的「更多」菜单。叫法看服务端给的 previous（基准是不是紧挨着的上一次），和定时任务触发历史里的同名
+  // 链接一个说法（SCHEDULE_TEXT.compareLink、compareLinkLastOk 取的就是这两条）
   menu: '与上一次对比',
+  /** 上一次失败、取消、还没结束：基准是再往前成功的那一次，不能说成「上一次」 */
+  menuLastOk: '与上一次成功的运行对比',
+  /** 没有默认基准（多为工作流的第一次运行）：没有「上一次」可比，点了去对比页手动选 */
+  menuPick: '选择基准对比…',
   menuSealedOnly: '运行结束并封存后才能对比',
   /** 没有 workflow_id 的运行：画布、问数据里没保存就运行的，或者工作流删掉之后被置空的。服务端只比同一个已保存的工作流 */
   menuNoWorkflow: '工作流未保存或已删除，无法对比',
@@ -3320,7 +3325,8 @@ export const RUN_COMPARE_TEXT = {
   pickGone: (id: string, missing: boolean) => `${id}（${missing ? '记录不存在' : '无法读取'}）`,
   // 页面状态
   noTarget: '未指定要对比的运行',
-  noTargetHint: '在运行详情的「更多」菜单中选择「与上一次对比」，即可对照本次与上一次成功的运行',
+  /** 不逐个列菜单项的叫法（看有没有默认基准、是不是紧挨着的上一次，有三种），只说在哪里打开、默认比的是哪一次 */
+  noTargetHint: '可从运行详情的「更多」菜单打开对比，默认以上一次成功的运行为基准',
   toRuns: '前往记录',
   finding: '正在查找基准运行…',
   loading: '正在对比两次运行…',
@@ -3475,6 +3481,41 @@ export const RUN_COMPARE_TEXT = {
   keys: '配置项',
   // 说明
   notes: '说明',
+}
+
+/**
+ * 运行详情「工件」页签（pages/runs/ArtifactsPane.tsx）：这次运行按内容校验值存下的每一件东西，按节点分组。筛选按
+ * pages/runs/model.ts 的 artifactGroup 分三组：证据快照是取数、检索的原始结果和口径卡、报告文档、表结构；核查记录是
+ * 双盲复算、反方审稿、审批质询对结论的核查与问答，单独一组；节点产出是过程里的中间值。按种类归组：核查、质询时执行的
+ * 查询仍是查询快照，在证据快照里（一次运行里这类查询可能比流程本身的还多），所以证据快照不能说成「结论里的数字都从
+ * 这里来」。各种工件的名字和说明在 model.ts，后来新加的放在这里（质询回答的在 INQUIRY_TEXT）
+ */
+export const RUN_ARTIFACTS_TEXT = {
+  /** 运行详情「工件」页签头上的悬停：人先看到的这句要和页签里的三组对得上。清单还没取回来时不写件数 */
+  tabTitle: (n?: number | null) =>
+    (n == null ? '本次运行保存的证据、核查记录和产出' : `${n} 件：证据快照、核查记录和每个节点每一次的产出`),
+  filterGroup: '按类型筛选工件',
+  filter: { all: '全部', evidence: '证据快照', verify: '核查记录', output: '节点产出' } as Record<string, string>,
+  /**
+   * 筛选按钮的悬停：这一组装的是什么。核查、质询时执行的查询按种类仍是查询快照、在证据快照里，两组都要说一声；
+   * 核查记录这一组列的是行上的种类名（双盲复算对照、反方审稿记录、质询回答）
+   */
+  filterHint: {
+    evidence: '查询、工具调用、知识检索的原始结果，口径卡、报告文档和表结构；含核查、质询时执行的查询',
+    verify: '对结论的核查与问答：双盲复算对照、反方审稿记录、质询回答；其间执行的查询见「证据快照」',
+    output: '每个节点每执行一次的产出：循环里每一轮都有一件',
+  } as Record<string, string>,
+  /** 同一个节点同一类的第几件：循环里几十件节点产出要分得开 */
+  nth: (n: number) => `#${n}`,
+  attempt: (n: number) => `第 ${n} 次尝试`,
+  /** 打开一件的悬停写全说明：窄屏、长问题的说明在行上会截断 */
+  openTitle: (kind: string, about: string) => `打开${kind}：${about}（读取时按内容校验值重新校验）`,
+  /**
+   * 口径卡里容器型变量（vars.*）输入的完整值（engine/nodes/metrics.py 的 metric_input，工件行的 meta 里有 {path}）：
+   * 推演时拿它还原输入。和口径卡一样归在证据快照
+   */
+  kindMetricInput: '指标输入',
+  aboutMetricInput: (path?: string | null) => (path ? `口径卡输入「${path}」的完整值` : '口径卡输入的完整值'),
 }
 
 /**
