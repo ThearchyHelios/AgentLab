@@ -309,27 +309,21 @@ def recipe_dates(recipe: Any) -> dict[str, list[str]]:
 async def upload_dates(session: Any, row: DataSource | None) -> dict[str, list[str]]:
     """上传表格建的数据源当前版本里，导入时认作日期的列：{表名: [列名]}（recipe_dates）。只读，不碰导入流程。
 
-    按当前快照找它的配方（source_versions.snapshot_recipe_id：快照记着按哪一版配方建的表，期 3 之前的快照取最后一期导入
-    的）：数据源的表结构（schema_cache）也出自当前快照，两者是同一个版本。读不出来的一律给空——手工登记的源、简单导入
-    （没有配方，回执里只有存储类型）、快照或配方记录不在了、配方解析不了：业务日期照旧不记，原因说按文字保存。"""
+    配方取现行的那一版（current_recipe_id）：发布、启用旧版本时它和当前快照、表结构（schema_cache）一起换
+    （table_versions.activate_snapshot），配方和表结构出自同一个版本。读不出来的一律给空——手工登记的源、简单导入
+    （没有配方，构建回执里只有存储类型）、配方记录不在了、配方解析不了：业务日期照旧不记，原因说按文字保存。"""
     from app.data.recipe_types import Recipe
-    from app.data.source_versions import snapshot_recipe_id
-    from app.db.models import SourceSnapshot, TableImport, TableRecipe
+    from app.db.models import TableRecipe
 
-    if row is None or (row.origin or "manual") != "upload" or not row.current_snapshot_id:
+    if row is None or (row.origin or "manual") != "upload" or not row.current_recipe_id:
         return {}
-    snap = await session.get(SourceSnapshot, row.current_snapshot_id)
-    if snap is None or snap.source_id != row.id:
-        return {}
-    last = await session.get(TableImport, str(snap.imports[-1])) if snap.imports else None
-    recipe_id = snapshot_recipe_id(snap, {last.id: last} if last is not None else {})
-    record = await session.get(TableRecipe, recipe_id) if recipe_id else None
+    record = await session.get(TableRecipe, row.current_recipe_id)
     if record is None or record.source_id != row.id:
         return {}
     try:
         return recipe_dates(Recipe.model_validate(record.recipe))
     except ValueError:
-        logger.warning("上传表格的配方记录解析不了，业务日期按文字保存处理：source=%s recipe=%s", row.id, recipe_id)
+        logger.warning("上传表格的配方记录解析不了，业务日期按文字保存处理：source=%s recipe=%s", row.id, record.id)
         return {}
 
 

@@ -92,13 +92,8 @@ def list_recipe(*, ordered: str = "DATE", paid: str = "DATE") -> dict:
             "tables": [{"name": TABLE, "grain": ["订单号"]}]}
 
 
-async def recipe_import(client, recipe: dict) -> tuple[str, str]:
-    """按配方导入：暂存 → 换成给定的配方 → 试运行 → 勾全部确认项提交。返回 (数据源名, id)。"""
-    name = f"dc_upload_{uuid.uuid4().hex[:8]}"
-    r = await client.post(f"{API}/imports/stage", files={"file": (f"{SHEET}_2026-09.xlsx", workbook(), XLSX)},
-                          data={"name": name})
-    assert r.status_code == 201, r.text
-    staging = r.json()["id"]
+async def commit_recipe(client, staging: str, recipe: dict) -> dict:
+    """暂存区换成给定的配方 → 试运行 → 勾全部确认项提交。返回提交的响应。"""
     r = await client.put(f"{API}/imports/{staging}/recipe", json={"recipe": recipe})
     assert r.status_code == 200 and r.json()["recipe_problems"] == [], r.text
     r = await client.post(f"{API}/imports/{staging}/trial", json={})
@@ -108,7 +103,17 @@ async def recipe_import(client, recipe: dict) -> tuple[str, str]:
     r = await client.post(f"{API}/imports/{staging}/commit", json={
         "trial_id": trial["trial_id"], "confirmations": [i["id"] for i in trial.get("confirm_items") or []]})
     assert r.status_code == 201, r.text
-    return name, r.json()["source"]["id"]
+    return r.json()
+
+
+async def recipe_import(client, recipe: dict) -> tuple[str, str]:
+    """按配方导入：暂存 → 换成给定的配方 → 试运行 → 提交。返回 (数据源名, id)。"""
+    name = f"dc_upload_{uuid.uuid4().hex[:8]}"
+    r = await client.post(f"{API}/imports/stage", files={"file": (f"{SHEET}_2026-09.xlsx", workbook(), XLSX)},
+                          data={"name": name})
+    assert r.status_code == 201, r.text
+    out = await commit_recipe(client, r.json()["id"], recipe)
+    return name, out["source"]["id"]
 
 
 async def simple_import(client) -> tuple[str, str]:
@@ -127,11 +132,11 @@ async def dates_of(source_id: str) -> dict:
 
 
 async def break_recipe(source_id: str) -> None:
-    """把数据源当前版本的配方记录改坏（造「配方读不出来」）。"""
+    """把数据源当前版本的配方记录改坏（造「配方读不出来」）。当前快照记的就是这一版。"""
     async with SessionLocal() as session:
         row = await session.get(DataSource, source_id)
-        snap = await session.get(SourceSnapshot, row.current_snapshot_id)
-        record = await session.get(TableRecipe, snap.recipe_id)
+        assert (await session.get(SourceSnapshot, row.current_snapshot_id)).recipe_id == row.current_recipe_id
+        record = await session.get(TableRecipe, row.current_recipe_id)
         record.recipe = {"recipe_format": "agentlab-recipe/0"}
         await session.commit()
 
@@ -191,6 +196,29 @@ async def test_an_upload_source_reads_the_date_columns_from_its_current_recipe(c
     assert (types["下单日期"], types["支付日期"]) == ("TEXT", "TEXT"), "背景：导入时日期一律按文字保存"
     assert await dates_of(dated[1]) == {TABLE: ["下单日期", "支付日期"]}
     assert await dates_of(paid_as_text[1]) == {TABLE: ["下单日期"]}
+
+
+async def current_snapshot(source_id: str) -> str:
+    async with SessionLocal() as session:
+        return (await session.get(DataSource, source_id)).current_snapshot_id
+
+
+async def test_the_dates_follow_the_current_version_of_the_source(client, dated):
+    """只认数据源当前版本的配方（表结构出自同一个版本）：修改配方把支付日期改成「文字」、提交之后只剩下单日期；回滚到
+    旧版本，两列又都是日期。"""
+    _, source_id = dated
+    first = await current_snapshot(source_id)
+    r = await client.post(f"{API}/{source_id}/redraft", json={})
+    assert r.status_code == 201, r.text
+    await commit_recipe(client, r.json()["id"], list_recipe(paid="TEXT"))
+    second = await current_snapshot(source_id)
+    assert second != first
+    assert await dates_of(source_id) == {TABLE: ["下单日期"]}
+    r = await client.post(f"{API}/{source_id}/snapshots/{first}/activate",
+                          json={"confirm": True, "expected_current_snapshot_id": second})
+    assert r.status_code == 200, r.text
+    assert await current_snapshot(source_id) == first
+    assert await dates_of(source_id) == {TABLE: ["下单日期", "支付日期"]}
 
 
 async def test_without_a_readable_recipe_no_column_is_taken_as_a_date(client, dated, tmp_path):
