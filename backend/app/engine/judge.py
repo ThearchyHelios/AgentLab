@@ -1070,6 +1070,10 @@ def _items_of(value: Any) -> list[Any] | None:
     return value if isinstance(value, list) else None
 
 
+#: _ask 交回的没成的原因：输出到了上限被截断
+_TRUNCATED = "truncated"
+
+
 async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | None, list[BaseMessage], str | None,
                                                                   int]:
     """问一次裁判：(判定清单, 模型的原始回复, 没成的原因, 调了几次模型)。
@@ -1109,10 +1113,6 @@ async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | Non
     if items is None and cut_off(reply):
         return None, raws, _TRUNCATED, 2
     return items, raws, None if items is not None else "format", 2
-
-
-#: _ask 交回的没成的原因：输出到了上限被截断
-_TRUNCATED = "truncated"
 
 
 def _spent(error: BaseException) -> list[BaseMessage]:

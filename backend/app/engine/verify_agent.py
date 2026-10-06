@@ -963,8 +963,8 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
     declared = list((resolved.get("properties") or {}) if _is_object(resolved) else {})
     if declared and not any(k in parsed for k in declared):
         # 一个要求的字段都没交：不是「查不到」，是没按结构交。不这么分，字段名对不上的回复会被当成什么都没查到
-        return await give_up("核查模型没有按结构交结果（交回的内容里没有要求的字段："
-                             + "、".join(declared[:8]) + ("等" if len(declared) > 8 else "") + "）")
+        return await give_up("核查模型没有按结构交结果（交回的内容里没有要求的字段：" + "、".join(declared[:8])
+                             + ("等" if len(declared) > 8 else "") + "）")
 
     # ---- 取值、组装理由
     cells = _Cells(queries)
