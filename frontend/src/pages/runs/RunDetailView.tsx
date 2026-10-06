@@ -25,7 +25,7 @@ import {
 } from './model'
 import { ArtifactsPane, useRunArtifacts } from './ArtifactsPane'
 import { EvidencePane } from './EvidencePane'
-import { EVIDENCE_AUDIT_TEXT } from '../../lib/terms'
+import { EVIDENCE_AUDIT_TEXT, RUN_ARTIFACTS_TEXT } from '../../lib/terms'
 import { ClassChip, MoreMenu, RunTabs, TierChip, copyText, type MenuItem, type TabItem } from './parts'
 import { ProvenanceBar, Telemetry, runClocks } from './Telemetry'
 import { TracePane } from './TracePane'
@@ -538,7 +538,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     { key: 'evidence', label: EVIDENCE_AUDIT_TEXT.tab, title: EVIDENCE_AUDIT_TEXT.tabTitle },
     {
       key: 'artifacts', label: '工件', count: artifactCount, unit: '件', tone: 'quiet',
-      title: artifactCount == null ? '本次运行保存的证据和产出' : `${artifactCount} 件：查询和工具调用的原始结果、每个节点每一次的产出`,
+      title: RUN_ARTIFACTS_TEXT.tabTitle(artifactCount),
     },
   ]
 

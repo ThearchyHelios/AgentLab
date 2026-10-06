@@ -80,7 +80,8 @@ const FIRST_ROWS = 300
  *
  * 每一行按列表这一栏自己的宽度排（容器查询，不看视口：详情区在宽屏上也可能很窄）。窄时
  * 说明换到第二行占满整行，第一行留种类、校验值、大小和时刻；以前挤在一行里，390px
- * 宽时说明只剩三个字。序号和第几次尝试放在截断的范围外，按钮的悬停写全说明。
+ * 宽时说明只剩三个字。序号和第几次尝试放在截断的范围外，按钮的悬停写全说明。再窄
+ * （320px 的手机）时收起校验值，每行仍是两行。
  */
 export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
   list: ArtifactList
@@ -261,8 +262,12 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, t1, onOpen, onM
                 <span className="min-w-0 truncate" data-artifact-about="">{about}</span>
                 {extra && <span className="tnum shrink-0 text-faint" data-artifact-nth="">{extra}</span>}
               </span>
-              <span className="mono shrink-0 text-2xs text-faint @max-[35rem]:ml-auto" title={`内容校验值 ${a.id}`}>{a.id.slice(0, 8)}</span>
-              <span className="tnum w-16 shrink-0 text-right text-2xs text-faint">{formatBytes(a.size)}</span>
+              {/* 校验值和大小一起排、一起折行：分开时更窄的屏上大小会单独折到种类下面、校验值留在右边。窄于 22rem（320px
+                  的手机）时收起校验值，第一行才放得下种类和大小；打开后的查看器里写着校验值 */}
+              <span className="flex shrink-0 items-center gap-2 @max-[35rem]:ml-auto">
+                <span className="mono text-2xs text-faint @max-[22rem]:hidden" title={`内容校验值 ${a.id}`}>{a.id.slice(0, 8)}</span>
+                <span className="tnum w-16 text-right text-2xs text-faint" data-artifact-size="">{formatBytes(a.size)}</span>
+              </span>
             </button>
             {at != null && onMoment ? (
               <button type="button" className="btn btn-xs btn-ghost tnum w-[86px] shrink-0 justify-end"

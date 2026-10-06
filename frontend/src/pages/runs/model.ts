@@ -369,10 +369,10 @@ export function artifactDescription(kind: string, meta?: Record<string, any> | n
 }
 
 /**
- * 工件页签上的三组：evidence 证据快照（查询、工具、检索的快照，口径卡、报告文档、表结构，结论里的数字从这里来）；
- * verify 核查记录（双盲复算、反方审稿、审批质询对结论的核查与问答：不是数字的出处，以前混在证据快照里，和「原始结果」
- * 的说明对不上）；output 节点产出（过程里的中间值，一次循环就是几十件）。按种类分：核查时执行的查询种类仍是查询快照，
- * 归在证据快照；认不出的种类也算证据快照，宁可醒目
+ * 工件页签上的三组：evidence 证据快照（查询、工具、检索的快照，口径卡、报告文档、表结构）；verify 核查记录（双盲复算、
+ * 反方审稿、审批质询对结论的核查与问答：以前混在证据快照里，和「原始结果」的说明对不上）；output 节点产出（过程里的
+ * 中间值，一次循环就是几十件）。按种类分：核查、质询时执行的查询种类仍是查询快照，归在证据快照（两组的悬停说明都写明
+ * 了）；认不出的种类也算证据快照，宁可醒目
  */
 export type ArtifactGroup = 'evidence' | 'verify' | 'output'
 const VERIFY_KINDS: ReadonlySet<string> = new Set(['dual_check', 'challenge', 'inquiry_answer'])

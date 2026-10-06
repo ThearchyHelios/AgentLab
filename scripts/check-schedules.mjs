@@ -1519,7 +1519,10 @@ await section('详情：触发历史和运行详情的「与上一次对比」�
     started_at: r.started_at, finished_at: r.finished_at, schedule_id: r.schedule_id })
   const compareApi = (method, path, body, url) => {
     if (method !== 'GET') return null
-    if (path === '/runs/run-f10/compare/base') return { json: { base_run_id: 'run-f12', reason: 'same_schedule', base: ref(f12) } }
+    // previous 同服务端 pick_base：上一次（f11）失败了，基准不是紧挨着的上一次，同触发历史里 f10 那一行（COMPARE_F10）
+    if (path === '/runs/run-f10/compare/base') {
+      return { json: { base_run_id: 'run-f12', reason: 'same_schedule', base: ref(f12), previous: COMPARE_F10.previous } }
+    }
     if (path === '/runs/run-f10/compare' && url.searchParams.get('base') === 'run-f12') {
       return { json: { target: ref(f10), base: ref(f12), summary: COMPARE_F10.summary, metrics: [], queries: [], notes: [],
         template: { base_version: 3, target_version: 3, same_graph: true, nodes: [] } } }
@@ -1536,7 +1539,11 @@ await section('详情：触发历史和运行详情的「与上一次对比」�
   const menu = await open('/runs/run-f10', { state: stateOf() })
   await menu.page.locator('[data-run-detail="run-f10"]').waitFor({ timeout: 10000 })
   await menu.page.getByRole('button', { name: '更多操作' }).click()
-  await menu.page.locator('[data-menu=compare]').click()
+  // 菜单项等预先问到默认基准才可点，叫法照它的 previous 定
+  const item = menu.page.locator('[data-menu=compare]')
+  await until(async () => !(await item.isDisabled().catch(() => true)))
+  const menuLabel = (await item.innerText().catch(() => '')).trim()
+  await item.click()
   const a = await landed(menu.page)
   const hist = await open('/schedules/s-weekly?tab=history', { state: stateOf() })
   const link = hist.page.locator('[data-fire-id="f10"] [data-fire-compare]')
@@ -1550,6 +1557,7 @@ await section('详情：触发历史和运行详情的「与上一次对比」�
   const [ra, rb] = [await reasonOf(menu.page), await reasonOf(hist.page)]
   check('……两处写的默认基准一字不差：同一定时任务上一次成功的运行', ra === REASON_SCHEDULE && rb === REASON_SCHEDULE, `${ra} | ${rb}`)
   check('……触发历史上看得见的字说明比的是上一次成功的运行', label === '与上一次成功的运行对比', label)
+  check('……运行详情「更多」里的入口和触发历史的链接叫法一字不差', menuLabel === label, `${menuLabel} | ${label}`)
   const tiles = (page) => until(async () => (await page.locator('[data-compare-summary] [data-compare-class]').evaluateAll((els) =>
     els.map((e) => `${e.getAttribute('data-compare-class')}=${e.querySelector('[data-compare-count]')?.textContent?.trim()}`))).join(' '))
   const [ta, tb] = [await tiles(menu.page), await tiles(hist.page)]
