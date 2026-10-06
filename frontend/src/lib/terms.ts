@@ -3309,6 +3309,8 @@ export const INQUIRY_TEXT = {
   // ---- 报告上的入口（EvidenceDoc）：句末的「质询」、划选原文时浮出的「质询」 ----
   ask: '质询',
   askUnit: (text: string) => `质询这句：${text}`,
+  /** 句末「质询」图标的悬停说明 */
+  askTitle: '质询这一句',
   askSelection: '就选中的原文质询',
   /** 读屏摘要里接在按键说明后面 */
   keysHint: '每句结论后有「质询」按钮：方向键走到这一句，再按 Tab 到达；没有可点内容的句子，方向键直接走到它的「质询」',
@@ -3316,11 +3318,18 @@ export const INQUIRY_TEXT = {
   // ---- 问答串（ReportInquiry） ----
   headCount: (n: number) => `${formatNumber(n)} 次`,
   askReport: '就整份报告提问',
-  intro: '展开逐段证据后，悬停一句结论或划选一段原文，点「质询」即可就该处提问',
-  introRun: '悬停一句结论或划选一段原文，点「质询」即可就该处提问',
+  intro: '展开逐段证据后，点句末的「质询」图标或划选一段原文，即可就该处提问',
+  introRun: '点句末的「质询」图标或划选一段原文，即可就该处提问',
+  /** 报告没有逐段证据（没有报告文档）：句子、原文上都没有入口 */
+  introNoDoc: '这份报告没有逐段证据，可以就整份报告提问',
+  /** 设置里关了审批质询：不给入口，已有的问答照列 */
+  disabled: '审批质询已在设置中关闭',
   wholeReport: '整份报告',
   /** 报告文档取不到，写不出问的是哪一句 */
   unitMissing: '报告中的一句',
+  /** 之前几轮审批里问的、报告后来改写过（句子编号对不上），或者对不上是哪一稿：单独一组 */
+  otherDoc: '报告其他版本上的质询',
+  otherDocHint: '提问时的报告与当前显示的版本不同，或无法确认是否相同，所以不挂到当前报告的句子下面',
   loadFailed: '无法读取之前的质询记录',
   retry: '重试',
   q: '问',
@@ -3330,8 +3339,18 @@ export const INQUIRY_TEXT = {
   quoteLine: (quote: string) => `原文「${quote}」`,
   notRecorded: '这次问答没有写入运行记录',
   notRecordedHint: '它只显示在当前页面，刷新后不再显示，也不会随运行封存',
-  /** 屏幕阅读器：回答回来了 */
-  arrived: '已收到回答',
+  /** 屏幕阅读器：回答回来了（带上问题的开头，连着几次回答各报一遍） */
+  arrived: (question: string) => {
+    const chars = [...question.trim()]
+    return `已收到回答：${chars.length > 20 ? `${chars.slice(0, 20).join('')}…` : chars.join('')}`
+  },
+  /** 同一张审批卡同时挂在两处（画布的审批浮层和右栏）：提问框只在打开它的那一处 */
+  elsewhere: '提问框已在另一处打开',
+  moveHere: '在这里继续',
+  /** 回答期间另开了提问框，正在回答的那一条却没问成：原来的问题和原因留在它那一句下面 */
+  askFailed: (message: string) => `没有问成：${message}`,
+  reask: '放回提问框',
+  dismiss: '忽略',
 
   // ---- 提问框 ----
   target: { unit: '就这句提问', quote: '就选中的原文提问', report: '就整份报告提问' } as Record<'unit' | 'quote' | 'report', string>,
@@ -3362,9 +3381,14 @@ export const INQUIRY_TEXT = {
   /** 回答里有出处的数字：读屏听到「数字，出处：查询 Q1 · 第 1 行 · amount」，点一下展开那次查询的结果 */
   cited: (text: string, source: string) => `${text}，出处：${source}，查看这次查询的结果`,
   citedReport: (text: string, source: string) => `${text}，出处：${source}，在报告中查看证据`,
+  /** 问的是报告的另一稿：引用的是那一稿里的出处，不在当前这一稿里找 */
+  citedOther: (text: string, source: string) => `${text}，出处：${source}（提问时那一版报告中的出处）`,
   /** 引用的是报告已有的出处，报告里却找不到引用它的地方：照回答文档记下的出处说一句 */
   reportSource: (source: string) => `出处：${source}（报告已有的出处，报告中没有引用它的地方）`,
+  reportSourceOther: (source: string) => `出处：${source}（提问时那一版报告中的出处）`,
   queriesHead: (n: number) => `核查模型执行的查询（${formatNumber(n)} 次）`,
+  /** 查询列表收着时也写：截断直接关系到回答靠不靠得住 */
+  queriesTruncated: (n: number) => `其中 ${formatNumber(n)} 次结果已截断`,
   noQueries: '核查模型没有执行查询',
   rows: (n: number) => `${formatNumber(n)} 行`,
   truncated: '结果已截断，数据库中还有更多数据',

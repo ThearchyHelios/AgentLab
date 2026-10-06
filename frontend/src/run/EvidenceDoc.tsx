@@ -62,9 +62,12 @@ const unitOfKey = (key: string) => (key.startsWith('claim:') ? key.slice(6) : nu
 const askKey = (unit: string) => `ask:${unit}`
 const unitOfAsk = (key: string) => (key.startsWith('ask:') ? key.slice(4) : null)
 
-/** 哪些句子挂「质询」：结论句（老文档没有 kind 的按有字的句子），标题、代码块里的不挂 */
+/**
+ * 哪些句子挂「质询」：结论句（老文档没有 kind 的按有字的句子），标题、代码块里的不挂。表格里的格子也不挂：每格一个
+ * 图标会把列撑宽、满表都是图标；问表里的数可以划选那一格，或者就整份报告提问
+ */
 const askable = (unit: EvidenceUnit, block: EvidenceBlock) =>
-  (unit.kind ? unit.kind === 'claim' : !!unitText(unit).trim()) && !['heading', 'code', 'hr'].includes(block.type)
+  (unit.kind ? unit.kind === 'claim' : !!unitText(unit).trim()) && !['heading', 'code', 'hr', 'table'].includes(block.type)
 
 interface Badge { unit: EvidenceUnit; block: number; verdict: EvidenceVerdict; state: EvidenceStateCode }
 
@@ -946,7 +949,9 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }
     </>
   )
   if (!ask) return body
-  // 「质询」跟在句末：平时不占地方（宽度为 0、透明），悬停这一句、焦点落在这一句上时出现；触屏没有悬停，一直显示。
+  // 「质询」跟在句末，是一个固定宽度的小图标：平时淡淡的，悬停这一句、焦点落在这一句上时显出来（强调色、描边）。
+  // 显没显出来只换颜色，宽度一直是那么宽——悬停时撑开的话，后面的字整体右移，鼠标底下的数字跟着挪走，点不到。
+  // 触屏没有悬停，一直显出来，并写上「质询」两个字。
   // 跟随的那种只在焦点在这一句上时进 Tab 顺序，整份报告不因此多出一串 Tab 位
   const here = current != null && (current === key || current === askKey(unit.id)
     || (unit.segments ?? []).some((sg) => sg.id === current))
@@ -954,16 +959,15 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }
     <span className="group/evu" data-ev-unit={unit.id}>
       {body}
       <button type="button" data-inquiry-ask={unit.id} tabIndex={here ? 0 : -1}
-              aria-label={INQUIRY_TEXT.askUnit(unitText(unit).trim())}
-              className={'group/ask inline-flex w-0 select-none overflow-hidden align-middle opacity-0 outline-none focus:w-auto focus:opacity-100 '
-                + 'group-hover/evu:w-auto group-hover/evu:opacity-100 group-focus-within/evu:w-auto group-focus-within/evu:opacity-100 '
-                + 'pointer-coarse:w-auto pointer-coarse:opacity-100'}>
-        <span aria-hidden="true"
-              className={'my-px ml-1 inline-flex items-center gap-0.5 whitespace-nowrap rounded border px-1 text-[10px] font-medium leading-[1.4] '
-                + 'text-[color:var(--accent)] hover:bg-hover group-focus-visible/ask:outline group-focus-visible/ask:outline-2 '
-                + 'group-focus-visible/ask:outline-offset-1 group-focus-visible/ask:outline-[color:var(--accent)]'}>
-          <MessageCircleQuestion size={10} aria-hidden /> {INQUIRY_TEXT.ask}
-        </span>
+              aria-label={INQUIRY_TEXT.askUnit(unitText(unit).trim())} title={INQUIRY_TEXT.askTitle}
+              className={'ml-1 inline-flex select-none items-center gap-0.5 whitespace-nowrap rounded border border-transparent px-[3px] '
+                + 'align-middle text-[10px] font-medium leading-[1.4] text-faint opacity-60 outline-none '
+                + 'hover:bg-hover group-hover/evu:border-[color:var(--border)] group-hover/evu:text-[color:var(--accent)] group-hover/evu:opacity-100 '
+                + 'group-focus-within/evu:border-[color:var(--border)] group-focus-within/evu:text-[color:var(--accent)] group-focus-within/evu:opacity-100 '
+                + 'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[color:var(--accent)] '
+                + 'pointer-coarse:border-[color:var(--border)] pointer-coarse:text-[color:var(--accent)] pointer-coarse:opacity-100'}>
+        <MessageCircleQuestion size={11} aria-hidden />
+        <span aria-hidden="true" className="hidden pointer-coarse:inline">{INQUIRY_TEXT.ask}</span>
       </button>
     </span>
   )

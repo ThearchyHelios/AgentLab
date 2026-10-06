@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type Ref } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type Ref } from 'react'
 import { ChevronRight, ShieldCheck } from 'lucide-react'
 import { EVIDENCE_STATE, claimCountsOf, claimProblems, statsTally } from '../lib/evidence'
 import { formatNumber } from '../lib/format'
@@ -6,7 +6,7 @@ import { APPROVAL_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, evidenceTally, runClassLabel 
 import { useEvidence } from '../store/evidence'
 import type { ApprovalReport, EvidenceSegment } from '../types'
 import { EvidenceDoc, type EvidenceDocHandle } from './EvidenceDoc'
-import { ReportInquiry, reportSegmentFor, type InquiryAccess } from './Inquiry'
+import { ReportInquiry, reportSegmentFor, useInquiryAccess, type InquiryAccess } from './Inquiry'
 
 type RunClass = 'formal' | 'exploratory' | null | undefined
 
@@ -54,27 +54,33 @@ function claimsLine(report: ApprovalReport, runClass: RunClass): { text: string;
  *
  * 真实运行里报告有一句结论和证据相矛盾，审批人批准时完全不知道：卡上只有正文
  */
-export function ApprovalReports({ reports, runId, runClass, approvalId }: {
+export function ApprovalReports({ reports, runId, runClass, approvalId, askable = false }: {
   reports: ApprovalReport[]
   runId: string
   runClass: RunClass
-  /**
-   * 运行停在的这张审批（待处理的才给）。有它，审批人可以就报告提出质询：报告上的句子、划选的原文挂「质询」，
-   * 核对概况下面是问答串和提问框（run/Inquiry.tsx）
-   */
+  /** 这张审批卡的审批（处理过的也给）：问答串据此认哪几条问的就是卡上这一稿报告 */
   approvalId?: string
+  /**
+   * 审批待处理：审批人可以就报告提出质询——报告上的句子、划选的原文挂「质询」，核对概况下面是问答串和提问框
+   * （run/Inquiry.tsx）。设置里关了审批质询时照样不给
+   */
+  askable?: boolean
 }) {
-  const access = useMemo<InquiryAccess | null>(() => (approvalId ? { approvalId } : null), [approvalId])
+  const { access, disabled } = useInquiryAccess(askable && !!approvalId, approvalId ?? null)
   if (!reports.length) return null
   return (
     <>
-      {reports.map((r) => <ReportCheck key={r.node_id} report={r} runId={runId} runClass={runClass} access={access} />)}
+      {reports.map((r) => (
+        <ReportCheck key={r.node_id} report={r} runId={runId} runClass={runClass} access={access} disabled={disabled}
+                     approvalId={approvalId ?? null} />
+      ))}
     </>
   )
 }
 
-function ReportCheck({ report, runId, runClass, access }: {
-  report: ApprovalReport; runId: string; runClass: RunClass; access: InquiryAccess | null
+function ReportCheck({ report, runId, runClass, access, disabled, approvalId }: {
+  report: ApprovalReport; runId: string; runClass: RunClass; access: InquiryAccess | null; disabled: boolean
+  approvalId: string | null
 }) {
   const [open, setOpen] = useState(false)
   // 回答里引用了报告已有的出处：在逐段证据里打开那一处的证据面板。逐段证据收着的先展开，挂上之后再打开
@@ -137,7 +143,8 @@ function ReportCheck({ report, runId, runClass, access }: {
         </>
       )}
       {/* 审批质询：问答串（进入审批卡时按列表接口恢复）、提问框和「就整份报告提问」 */}
-      <ReportInquiry runId={runId} report={report.node_id} docArtifact={report.doc_artifact} access={access} onLocate={locate} />
+      <ReportInquiry runId={runId} report={report.node_id} docArtifact={report.doc_artifact} access={access} disabled={disabled}
+                     cardId={approvalId} onLocate={locate} />
     </div>
   )
 }

@@ -16,7 +16,7 @@ import { EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
 import { IssuanceBanner } from '../../run/AssistantStream'
 import { EvidenceDoc, type EvidenceDocHandle } from '../../run/EvidenceDoc'
 import { EvidenceGuessView } from '../../run/EvidenceGuess'
-import { NO_APPROVAL, ReportInquiry, inquiryOpen, locateIn } from '../../run/Inquiry'
+import { ReportInquiry, inquiryOpen, locateIn, useInquiryAccess } from '../../run/Inquiry'
 import { Markdown, inlineStyles } from '../../run/Markdown'
 import { useEvidence } from '../../store/evidence'
 import { useCatalog } from '../../store/catalog'
@@ -125,8 +125,10 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
 
   const mode = graph?.mode ?? audit.data?.mode
   const seal = audit.data?.seal ?? graph?.seal
-  // 审批质询：封存了的探索运行可以接着就报告提问（追加在封存之后）；正式运行封存后不再开放
+  // 审批质询：封存了的探索运行可以接着就报告提问（追加在封存之后）；正式运行封存后不再开放。问答串每次运行都挂（只读）：
+  // 审批时问过什么、怎么答的、查了什么随运行封存，审批处理掉以后也得在报告旁边看得到
   const asking = inquiryOpen(run)
+  const { access: inquiry, disabled: inquiryOff } = useInquiryAccess(asking, null)
 
   if (!graph && graphSlot?.status !== 'error') {
     return (
@@ -171,11 +173,10 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
                                  runId={run.id} runClass={run.run_class} label={r.fields?.join('、') || r.node_id} tally
                                  tier={typeof output?._issuance?.tier === 'string' ? output._issuance.tier : undefined}
                                  panel={wide ? 'dock' : 'auto'} dock={dock} onView={(o) => onView(r.node_id!, o)}
-                                 inquiry={asking ? NO_APPROVAL : null} />
-                    {asking && (
-                      <ReportInquiry runId={run.id} report={r.node_id!} docArtifact={r.doc_artifact} access={NO_APPROVAL} postSeal
-                                     onLocate={(seg) => locateIn(handles.current.get(r.node_id!), doc, seg)} />
-                    )}
+                                 inquiry={inquiry} />
+                    <ReportInquiry runId={run.id} report={r.node_id!} docArtifact={r.doc_artifact} access={inquiry}
+                                   disabled={inquiryOff} postSeal={asking}
+                                   onLocate={(seg) => locateIn(handles.current.get(r.node_id!), doc, seg)} />
                   </>
                 ) : slot?.status === 'error' ? (
                   <p className="text-2xs" style={{ color: 'var(--st-failed)' }}>{T.docGone(labelOf(r.node_id) ?? r.node_id ?? '')}</p>

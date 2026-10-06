@@ -9,8 +9,9 @@ import { Spinner, isComposing, useTicker } from '../components/ui'
 import { EVIDENCE_STATE, segmentLabel, segmentState, sourceOf, unitText, type EvidenceStateCode } from '../lib/evidence'
 import { humanizeError } from '../lib/errors'
 import { formatCost, formatDateTime, formatTime, parseServerTime } from '../lib/format'
-import { EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT } from '../lib/terms'
+import { COST_TEXT, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT, runCostText } from '../lib/terms'
 import { useEvidence } from '../store/evidence'
+import { useStudio } from '../store/studio'
 import type {
   EvidenceBlock, EvidenceDocData, EvidenceSegment, EvidenceUnit, Inquiry, InquiryQuery, InquiryRequest, InquirySnapshot, Run,
 } from '../types'
@@ -31,19 +32,24 @@ import { BlockView, CopyChip, Markdown, StyledSlice, inlineStyles, numericColumn
  *
  * 一次运行同一时刻只有一条在回答（服务端回 409 inquiry_busy）：请求挂在 store 上，不随组件卸载作废，回答回来时
  * 卡片收起了也照样记进问答串。没写进运行记录的（recorded 为假）醒目地说，它只留在这一页里。
+ *
+ * 同一份报告可能同时挂在两处（编排页里画布的审批浮层和右栏是同一张卡），也可能先后挂上几张审批（两级审批审同一份
+ * 报告、驳回改写后再审）：提问框只画在打开它的那一处（InquiryAccess.host），只认打开它时的那张审批；问答串按每条
+ * 问的是哪一稿报告分开——不是眼前这一稿的不按句子编号往句子下面挂（编号是位置序号，改写之后对不上）
  */
 
 /** 问题、原文的长度上限（同服务端，按字数） */
 export const QUESTION_MAX = 1000
 export const QUOTE_MAX = 500
 
-/** 页面传给报告文档、问答串的「能不能问」：给了就是能问；approvalId 是运行停在的那张审批（封存后的探索运行为 null） */
+/**
+ * 页面传给报告文档、问答串的「能不能问」：给了就是能问。approvalId 是运行停在的那张审批（封存后的探索运行为
+ * null）；host 标明是哪一处（useInquiryAccess 生成），同一份报告同时挂在两处时提问框只画在打开它的那一处
+ */
 export interface InquiryAccess {
   approvalId: string | null
+  host: string
 }
-
-/** 封存了的探索运行：能问，不带审批（同一个对象，报告文档不因此重画） */
-export const NO_APPROVAL: InquiryAccess = Object.freeze({ approvalId: null })
 
 /** 要问的是哪儿：一句（unit）、划选的原文（quote，同时带上它起头的那一句），或者整份报告（两个都是 null） */
 export interface InquiryTarget {
@@ -128,6 +134,43 @@ function problemOf(e: unknown): Problem {
   return { message: humanizeError(e).title || INQUIRY_TEXT.submitFailed, code: 'client' }
 }
 
+// ---------------------------------------------------------------- 设置里开没开
+
+/**
+ * 设置里的审批质询开没开（verify.inquiry.enabled）。关了就不给入口——写完问题才收到 409 inquiry_disabled 太晚了。
+ * 取不到（老服务端、断网）按开着算：服务端关了照样会拒绝。各处共用一次请求，半分钟内不重取
+ */
+let enabledValue: boolean | null = null
+let enabledAt = 0
+let enabledPending: Promise<boolean | null> | null = null
+const ENABLED_TTL = 30_000
+
+function fetchEnabled(): Promise<boolean | null> {
+  if (enabledPending) return enabledPending
+  if (enabledAt && Date.now() - enabledAt < ENABLED_TTL) return Promise.resolve(enabledValue)
+  enabledPending = api.settings.get().then(
+    (s) => {
+      const part = s?.verify?.inquiry
+      enabledValue = !(part && typeof part === 'object' && part.enabled === false)
+      enabledAt = Date.now()
+      return enabledValue
+    },
+    () => enabledValue,
+  ).finally(() => { enabledPending = null })
+  return enabledPending
+}
+
+function useInquiryEnabled(active: boolean): boolean | null {
+  const [value, setValue] = useState<boolean | null>(enabledValue)
+  useEffect(() => {
+    if (!active) return
+    let alive = true
+    void fetchEnabled().then((v) => { if (alive) setValue(v) })
+    return () => { alive = false }
+  }, [active])
+  return value
+}
+
 // ---------------------------------------------------------------- store
 
 interface Problem { message: string; code: string; field?: string }
@@ -141,6 +184,16 @@ export interface InquiryEntry {
   note: string | null
 }
 
+/** 回答期间另开了提问框、正在回答的那一条却没问成：问题和原因挂在它那一句下面，不覆盖新开的提问框 */
+interface Failure {
+  target: InquiryTarget
+  question: string
+  error: Problem
+  approvalId: string | null
+  /** 在哪一处问的：只有那一处用 role=alert 报出来，另一处同样显示、不重复播报 */
+  host: string
+}
+
 interface Thread {
   status: 'loading' | 'ok' | 'error'
   /** 服务端列出来的 */
@@ -148,14 +201,24 @@ interface Thread {
   /** 这一页里问过的（列表重新取回来之后，写进运行记录的按序号去重，没写进的一直留在这里） */
   local: InquiryEntry[]
   error?: Problem
+  failed?: Failure
 }
 
 interface Draft {
   target: InquiryTarget
+  /**
+   * 打开它时停在的那张审批（封存了的探索运行为 null）。提问框只在同一张审批的地方出现：换了审批（同一份报告的下一级
+   * 审批、驳回改写后再审），这一份就不再显示，下次点「质询」从头写
+   */
   approvalId: string | null
+  /**
+   * 打开它的那一处（InquiryAccess.host）：同一份报告同时挂在两处时，提问框只画在这里，焦点也只进这里。那一处卸掉了
+   * （浮层关了）为 null，由还挂着的、同一张审批的另一处接过去
+   */
+  host: string | null
   question: string
   error: Problem | null
-  /** 每次点「质询」加一：提问框据此把焦点送进输入框，换了一句也一样 */
+  /** 每次点「质询」都换一个（全局递增，关掉再开也不重复）：提问框据此把焦点送进输入框，换了一句也一样 */
   nonce: number
 }
 
@@ -164,6 +227,16 @@ interface Pending {
   target: InquiryTarget
   question: string
   startedAt: number
+  /** 在哪一处问的：焦点交接、「已收到回答」的播报只在这一处 */
+  host: string
+}
+
+/** 一次运行里每张审批审的是哪一稿报告：审批 id → { 报告节点: 文档工件 } */
+interface ApprovalDocs {
+  status: 'loading' | 'ok' | 'error'
+  map: Record<string, Record<string, string>>
+  /** 为哪几张审批取过：取回来列表里也没有的（审批记录没了）不再为它重取 */
+  asked: string[]
 }
 
 interface InquiryState {
@@ -172,30 +245,53 @@ interface InquiryState {
   drafts: Record<string, Draft | undefined>
   /** 正在回答的，按运行：一次运行同一时刻只有一条 */
   pending: Record<string, Pending | undefined>
+  /** 按运行：问答串据此分辨之前几轮审批里问的是不是眼前这一稿 */
+  approvalDocs: Record<string, ApprovalDocs | undefined>
+  /** 这一页里写进了运行记录的问答各几条（按运行）：运行详情据此补拉事件，时间线才出现「审批人质询」 */
+  recorded: Record<string, number>
   load: (runId: string, report: string) => Promise<void>
-  compose: (runId: string, report: string, target: InquiryTarget, approvalId: string | null) => void
+  loadApprovalDocs: (runId: string, ids: string[]) => Promise<void>
+  compose: (runId: string, report: string, target: InquiryTarget, access: InquiryAccess) => void
   edit: (key: string, question: string) => void
   close: (key: string) => void
-  submit: (runId: string, report: string) => Promise<void>
+  /** 接过没有主人的提问框（打开它的那一处卸掉了） */
+  adopt: (key: string, access: InquiryAccess) => void
+  /** 这一处卸掉了：它开着的提问框交出去 */
+  release: (key: string, host: string) => void
+  /** 提问框在另一处开着，审批人要在这里接着写 */
+  move: (key: string, access: InquiryAccess) => void
+  submit: (runId: string, report: string, access: InquiryAccess) => Promise<void>
+  /** 没问成的那一条重新放进提问框 */
+  reask: (runId: string, report: string, access: InquiryAccess) => void
+  dismissFailed: (key: string) => void
 }
 
 export const inquiryKey = (runId: string, report: string) => `${runId}@${report}`
 
 /** 打开提问框的那个元素（句末的「质询」、划选浮出的按钮已经没了时退回整份报告那个）：Esc、取消之后焦点回到这里 */
 const openers = new Map<string, HTMLElement>()
+/** 挂着的问答串（`报告键|那一处`）：没问成、提问框要重新打开时，打开它的那一处已经卸掉了就不认它 */
+const liveHosts = new Set<string>()
+/** 提问框已经把焦点送进去过的 nonce：别处接过提问框（浮层关了、右栏接着显示）不算点了「质询」，不抢焦点 */
+const focusedNonce = new Map<string, number>()
+let nonceSeq = 0
 let localSeq = 0
+
+const emptyThread = (): Thread => ({ status: 'ok', listed: [], local: [] })
 
 export const useInquiry = create<InquiryState>((set, get) => ({
   threads: {},
   drafts: {},
   pending: {},
+  approvalDocs: {},
+  recorded: {},
 
   load: async (runId, report) => {
     const key = inquiryKey(runId, report)
     if (get().threads[key]?.status === 'loading') return
     set((s) => {
       const cur = s.threads[key]
-      return { threads: { ...s.threads, [key]: { listed: cur?.listed ?? [], local: cur?.local ?? [], status: 'loading' } } }
+      return { threads: { ...s.threads, [key]: { ...cur, listed: cur?.listed ?? [], local: cur?.local ?? [], status: 'loading' } } }
     })
     try {
       const res = await api.inquiry.list(runId, { report })
@@ -211,13 +307,39 @@ export const useInquiry = create<InquiryState>((set, get) => ({
     }
   },
 
-  compose: (runId, report, target, approvalId) => {
+  loadApprovalDocs: async (runId, ids) => {
+    if (get().approvalDocs[runId]?.status === 'loading') return
+    set((s) => {
+      const cur = s.approvalDocs[runId]
+      return { approvalDocs: { ...s.approvalDocs, [runId]: {
+        status: 'loading', map: cur?.map ?? {}, asked: [...new Set([...(cur?.asked ?? []), ...ids])],
+      } } }
+    })
+    try {
+      const list = await api.approvals.list({ run_id: runId, status: 'all', limit: 500 })
+      const map: Record<string, Record<string, string>> = {}
+      for (const a of Array.isArray(list) ? list : []) {
+        if (!a || typeof a.id !== 'string' || a.run_id !== runId) continue
+        const docs: Record<string, string> = {}
+        for (const r of Array.isArray(a.payload?.reports) ? a.payload.reports : []) {
+          if (r && typeof r.node_id === 'string' && typeof r.doc_artifact === 'string' && r.doc_artifact) docs[r.node_id] = r.doc_artifact
+        }
+        map[a.id] = docs
+      }
+      set((s) => ({ approvalDocs: { ...s.approvalDocs, [runId]: { ...s.approvalDocs[runId]!, status: 'ok', map } } }))
+    } catch {
+      set((s) => ({ approvalDocs: { ...s.approvalDocs, [runId]: { ...s.approvalDocs[runId]!, status: 'error' } } }))
+    }
+  },
+
+  compose: (runId, report, target, access) => {
     const key = inquiryKey(runId, report)
     set((s) => {
       const cur = s.drafts[key]
-      // 换了一句：问题留着（多半是同一个问题挪个地方问），上一次的报错不留
+      // 换了一句：问题留着（多半是同一个问题挪个地方问），上一次的报错不留。换了审批的从头写：那一份是就上一张审批问的
+      const question = cur && cur.approvalId === access.approvalId ? cur.question : ''
       return { drafts: { ...s.drafts, [key]: {
-        target, approvalId, question: cur?.question ?? '', error: null, nonce: (cur?.nonce ?? 0) + 1,
+        target, approvalId: access.approvalId, host: access.host, question, error: null, nonce: ++nonceSeq,
       } } }
     })
   },
@@ -229,7 +351,24 @@ export const useInquiry = create<InquiryState>((set, get) => ({
 
   close: (key) => set((s) => ({ drafts: { ...s.drafts, [key]: undefined } })),
 
-  submit: async (runId, report) => {
+  adopt: (key, access) => set((s) => {
+    const d = s.drafts[key]
+    return d && d.approvalId === access.approvalId && d.host == null
+      ? { drafts: { ...s.drafts, [key]: { ...d, host: access.host } } } : s
+  }),
+
+  release: (key, host) => set((s) => {
+    const d = s.drafts[key]
+    return d?.host === host ? { drafts: { ...s.drafts, [key]: { ...d, host: null } } } : s
+  }),
+
+  move: (key, access) => set((s) => {
+    const d = s.drafts[key]
+    return d && d.approvalId === access.approvalId
+      ? { drafts: { ...s.drafts, [key]: { ...d, host: access.host, nonce: ++nonceSeq } } } : s
+  }),
+
+  submit: async (runId, report, access) => {
     const key = inquiryKey(runId, report)
     const draft = get().drafts[key]
     if (!draft) return
@@ -239,38 +378,82 @@ export const useInquiry = create<InquiryState>((set, get) => ({
     if ([...question].length > QUESTION_MAX) return fail({ message: INQUIRY_TEXT.tooLong(QUESTION_MAX), code: 'local', field: 'question' })
     if (get().pending[runId]) return fail({ message: INQUIRY_TEXT.busyOther, code: 'local' })
     const quote = draft.target.quote ? [...draft.target.quote].slice(0, QUOTE_MAX).join('') : ''
-    // 约定：unit 可为 null；quote 可选，没划选就不带；approval_id 只在运行停在审批上时带
+    // 约定：unit 可为 null；quote 可选，没划选就不带；approval_id 只在运行停在审批上时带。带的是页面此刻给的那张审批，
+    // 不是草稿里记着的：提问框只在同一张审批的地方出现，两者本来一致，换了审批的草稿根本画不出来
     const body: InquiryRequest = {
       report, unit: draft.target.unit, ...(quote ? { quote } : {}), question,
-      ...(draft.approvalId ? { approval_id: draft.approvalId } : {}),
+      ...(access.approvalId ? { approval_id: access.approvalId } : {}),
     }
     set((s) => ({
       drafts: { ...s.drafts, [key]: undefined },
-      pending: { ...s.pending, [runId]: { key, target: draft.target, question, startedAt: Date.now() } },
+      pending: { ...s.pending, [runId]: { key, target: draft.target, question, startedAt: Date.now(), host: access.host } },
     }))
     try {
       const res = await api.inquiry.ask(runId, body)
-      const inquiry = asInquiry(res?.inquiry) ?? asInquiry({ ...body, answer: {} })!
+      const got = asInquiry(res?.inquiry) ?? asInquiry({ ...body, answer: {} })!
+      // 服务端没回 approval_id 的照请求补上：问答串按它分辨这一条问的是不是眼前这一稿报告
+      const inquiry: Inquiry = { ...got, report: got.report || report, approval_id: got.approval_id ?? body.approval_id ?? null }
       const entry: InquiryEntry = {
-        id: inquiry.seq != null ? `s${inquiry.seq}` : `l${++localSeq}`, inquiry: { ...inquiry, report: inquiry.report || report },
+        id: inquiry.seq != null ? `s${inquiry.seq}` : `l${++localSeq}`, inquiry,
         recorded: res?.recorded !== false, note: str(res?.note) || null,
       }
       set((s) => {
-        const cur = s.threads[key] ?? { status: 'ok' as const, listed: [], local: [] }
+        const cur = s.threads[key] ?? emptyThread()
         return {
           threads: { ...s.threads, [key]: { ...cur, local: [...cur.local, entry] } },
           pending: { ...s.pending, [runId]: undefined },
+          ...(entry.recorded ? { recorded: { ...s.recorded, [runId]: (s.recorded[runId] ?? 0) + 1 } } : {}),
         }
       })
+      if (entry.recorded) followRun(runId)
     } catch (e) {
-      // 没问成（409 / 422 / 连不上）：提问框带着原来的问题重新打开，照服务端的说明显示原因
-      set((s) => ({
-        pending: { ...s.pending, [runId]: undefined },
-        drafts: { ...s.drafts, [key]: { ...draft, question: draft.question, error: problemOf(e), nonce: draft.nonce + 1 } },
-      }))
+      const error = problemOf(e)
+      set((s) => {
+        const pending = { ...s.pending, [runId]: undefined }
+        // 回答期间另开了提问框（换了一句、写着下一个问题）：那一份原样留着，没问成的这一条连同原因挂在它那一句下面
+        if (s.drafts[key]) {
+          const cur = s.threads[key] ?? emptyThread()
+          return { pending, threads: { ...s.threads, [key]: { ...cur, failed: {
+            target: draft.target, question: draft.question, error, approvalId: access.approvalId, host: access.host,
+          } } } }
+        }
+        // 没另开：提问框带着原来的问题重新打开，照服务端的说明显示原因。问的那一处已经卸掉了（浮层关了）就交出去，
+        // 由还挂着的、同一张审批的那一处接过去
+        return { pending, drafts: { ...s.drafts, [key]: {
+          ...draft, approvalId: access.approvalId, host: liveHosts.has(`${key}|${access.host}`) ? access.host : null,
+          error, nonce: ++nonceSeq,
+        } } }
+      })
     }
   },
+
+  reask: (runId, report, access) => set((s) => {
+    const key = inquiryKey(runId, report)
+    const f = s.threads[key]?.failed
+    if (!f) return s
+    return {
+      drafts: { ...s.drafts, [key]: {
+        target: f.target, approvalId: access.approvalId, host: access.host, question: f.question, error: null, nonce: ++nonceSeq,
+      } },
+      threads: { ...s.threads, [key]: { ...s.threads[key]!, failed: undefined } },
+    }
+  }),
+
+  dismissFailed: (key) => set((s) => (s.threads[key]?.failed
+    ? { threads: { ...s.threads, [key]: { ...s.threads[key]!, failed: undefined } } } : s)),
 }))
+
+/**
+ * 写进了运行记录的问答（approval.inquiry）：画布正显示这次运行、却没在接流（停在审批上、已经结束时，流在补完历史
+ * 之后就收了尾）时，按手上已有的最大序号补接一次，时间线才出现「审批人质询」这一行。运行详情读 useInquiryRecorded
+ */
+function followRun(runId: string) {
+  const studio = useStudio.getState()
+  if (studio.run?.id === runId && !studio.streaming) void studio.attachRun(runId).catch(() => undefined)
+}
+
+/** 这一页里有几条问答写进了这次运行的记录：变了就补拉事件（运行详情的时间线） */
+export const useInquiryRecorded = (runId: string): number => useInquiry((s) => s.recorded[runId] ?? 0)
 
 /**
  * 句末的「质询」、划选浮出的「质询」点下去：打开这份报告的提问框。opener 是点下去的那个元素，Esc、取消之后焦点回到它
@@ -279,12 +462,24 @@ export function askAbout(runId: string, report: string, access: InquiryAccess, t
   const key = inquiryKey(runId, report)
   if (opener) openers.set(key, opener)
   else openers.delete(key)
-  useInquiry.getState().compose(runId, report, target, access.approvalId)
+  useInquiry.getState().compose(runId, report, target, access)
 }
 
 /** 这次运行是不是有一条质询正在回答：审批卡据此暂停批准 / 驳回（服务端这时也回 409） */
 export const useInquiryBusy = (runId: string | null | undefined): boolean =>
   useInquiry((s) => !!runId && !!s.pending[runId])
+
+/**
+ * 页面给报告文档和问答串的「能不能问」。open 是按运行状态能不能问（审批卡：审批待处理；运行详情：封存了的探索运行），
+ * 设置里关了审批质询时 access 为 null、disabled 为真。host 每一处各一个：同一张审批卡同时挂在两处时靠它分开
+ */
+export function useInquiryAccess(open: boolean, approvalId: string | null): { access: InquiryAccess | null; disabled: boolean } {
+  const host = useId()
+  const enabled = useInquiryEnabled(open)
+  const access = useMemo<InquiryAccess | null>(() => (open && enabled !== false ? { approvalId, host } : null),
+    [open, enabled, approvalId, host])
+  return { access, disabled: open && enabled === false }
+}
 
 /** 问答串：服务端列出来的，加上这一页里问过、列表里还没有的（没写进运行记录的一直只在这里），按提问时间排 */
 function entriesOf(thread: Thread | undefined): InquiryEntry[] {
@@ -306,6 +501,9 @@ function entriesOf(thread: Thread | undefined): InquiryEntry[] {
 const groupKey = (t: { unit: string | null; quote: string | null }) =>
   t.unit ? `u:${t.unit}` : t.quote ? `q:${t.quote}` : 'report'
 
+/** 问的不是眼前这一稿报告的那几条：单独一组，排在最后 */
+const OTHER = 'other'
+
 interface Group {
   key: string
   unit: string | null
@@ -325,30 +523,59 @@ const FOCUS_RING = 'rounded-sm focus:outline-none focus-visible:outline focus-vi
  * access 为空时只读：只列已有的问答，不给提问（没有问答时什么都不画）。onLocate：回答里引用了报告已有出处的数字，
  * 交给页面在报告里打开那一处的证据面板，找不到时返回 false，这里照文档记下的出处说一句
  */
-export function ReportInquiry({ runId, report, docArtifact, access, onLocate, postSeal = false }: {
+export function ReportInquiry({ runId, report, docArtifact, access, cardId = null, disabled = false, onLocate, postSeal = false }: {
   runId: string
   report: string
   /** 报告文档的工件 id：问答串的句子取原文 */
   docArtifact?: string | null
   access: InquiryAccess | null
+  /**
+   * 页面上这一稿报告是哪张审批审的（审批卡：这张卡的审批 id，处理过的卡也给）。运行详情不给：显示的是封存的那一稿，
+   * 封存之后问的（approval_id 为空）就是问它。别的审批里问的，按那张审批审的文档对上了才挂到句子下面
+   */
+  cardId?: string | null
+  /** 设置里关了审批质询：不给入口，已有的问答照列，写明关了 */
+  disabled?: boolean
   onLocate?: (seg: EvidenceSegment, doc: EvidenceDocData) => boolean
   /** 运行已封存（运行详情）：提问框写明问答追加在封存之后 */
   postSeal?: boolean
 }) {
   const key = inquiryKey(runId, report)
+  const host = access?.host ?? null
   const thread = useInquiry((s) => s.threads[key])
-  const draft = useInquiry((s) => s.drafts[key])
+  const draftAny = useInquiry((s) => s.drafts[key])
   const pending = useInquiry((s) => s.pending[runId])
   const load = useInquiry((s) => s.load)
+  const adopt = useInquiry((s) => s.adopt)
+  const release = useInquiry((s) => s.release)
+  const move = useInquiry((s) => s.move)
+  const reask = useInquiry((s) => s.reask)
+  const dismissFailed = useInquiry((s) => s.dismissFailed)
   useEffect(() => { void load(runId, report) }, [runId, report, load])
   const entries = useMemo(() => entriesOf(thread), [thread])
   const mine = pending?.key === key ? pending : undefined
+
+  // 提问框只认打开它时的那张审批：换了审批（上一张批掉了、驳回改写后再审）就不在这里出现；同一张审批的，只画在打开它
+  // 的那一处，另一处写一句、给个「在这里继续」
+  const draft = access && draftAny && draftAny.approvalId === access.approvalId ? draftAny : undefined
+  const ownDraft = draft && draft.host === host ? draft : undefined
+  const otherDraft = draft && draft.host && draft.host !== host ? draft : undefined
+  useEffect(() => {
+    if (!host) return
+    liveHosts.add(`${key}|${host}`)
+    return () => {
+      liveHosts.delete(`${key}|${host}`)
+      release(key, host)
+    }
+  }, [key, host, release])
+  useEffect(() => { if (access && draft && draft.host == null) adopt(key, access) }, [access, draft, key, adopt])
+  const failed = access && thread?.failed && thread.failed.approvalId === access.approvalId ? thread.failed : undefined
 
   // 句子的原文从报告文档取（审批卡上逐段证据没展开时也要取：问答串得写出问的是哪一句；回答引用了报告已有的出处时，
   // 也要靠它在报告里找到那一处）。文档按工件 id 缓存，同一份只取一次
   const docSlot = useEvidence((s) => (docArtifact ? s.docs[docArtifact] : undefined))
   const loadDoc = useEvidence((s) => s.loadDoc)
-  const needDoc = !!docArtifact && (entries.length > 0 || !!draft || !!mine)
+  const needDoc = !!docArtifact && (entries.length > 0 || !!draft || !!mine || !!failed)
   useEffect(() => { if (needDoc && docArtifact) void loadDoc(docArtifact) }, [needDoc, docArtifact, loadDoc])
   const units = useMemo(() => {
     const map = new Map<string, string>()
@@ -357,6 +584,23 @@ export function ReportInquiry({ runId, report, docArtifact, access, onLocate, po
     return map
   }, [docSlot])
 
+  // 每条问的是哪一稿：和页面上这一稿同一张审批的（运行详情：封存之后问的）直接认；别的审批里问的，按那张审批审的
+  // 文档对一下（审批列表里带着），对上了才按句子编号挂——编号是位置序号，驳回改写之后同一个编号是另一句话
+  const docsSlot = useInquiry((s) => s.approvalDocs[runId])
+  const loadApprovalDocs = useInquiry((s) => s.loadApprovalDocs)
+  const foreign = useMemo(() => [...new Set(entries.map((e) => e.inquiry.approval_id)
+    .filter((a): a is string => !!a && a !== cardId))].sort(), [entries, cardId])
+  // 还没为它取过审批列表的（列表里取回来也没有的不再重取：审批记录没了，再取也一样）
+  const unknown = foreign.filter((a) => !(docsSlot && (a in docsSlot.map || docsSlot.asked.includes(a)))).join(',')
+  useEffect(() => { if (unknown && docArtifact) void loadApprovalDocs(runId, unknown.split(',')) }, [unknown, docArtifact, runId, loadApprovalDocs])
+  // 对不上之前先不画别的审批里问的那几条，免得先挂在一处、取回来再挪
+  const settled = !foreign.length || !docArtifact || (!unknown && docsSlot?.status !== 'loading')
+  const sameDoc = useCallback((x: Inquiry) => {
+    const a = x.approval_id ?? null
+    if (a === (cardId ?? null)) return true
+    return !!a && !!docArtifact && docsSlot?.map[a]?.[report] === docArtifact
+  }, [cardId, docArtifact, docsSlot, report])
+
   const groups = useMemo(() => {
     const out = new Map<string, Group>()
     const add = (unit: string | null, quote: string | null) => {
@@ -364,39 +608,51 @@ export function ReportInquiry({ runId, report, docArtifact, access, onLocate, po
       if (!out.has(k)) out.set(k, { key: k, unit, quote, entries: [] })
       return out.get(k)!
     }
-    for (const e of entries) add(e.inquiry.unit, e.inquiry.quote).entries.push(e)
-    // 正在回答的、开着的提问框挂在它们问的那一句下面：那句还没有问答时另起一组，排在最后
+    const others: InquiryEntry[] = []
+    for (const e of entries) {
+      if (sameDoc(e.inquiry)) add(e.inquiry.unit, e.inquiry.quote).entries.push(e)
+      else if (settled) others.push(e)
+    }
+    // 正在回答的、没问成的、开着的提问框挂在它们问的那一句下面（按先后）：那句还没有问答时另起一组
     if (mine) add(mine.target.unit, mine.target.quote)
+    if (failed) add(failed.target.unit, failed.target.quote)
     if (draft) add(draft.target.unit, draft.target.quote)
-    return [...out.values()]
-  }, [entries, mine, draft])
+    const list = [...out.values()]
+    if (others.length) list.push({ key: OTHER, unit: null, quote: null, entries: others })
+    return list
+  }, [entries, sameDoc, settled, mine, draft, failed])
 
   // 提交之后提问框拿掉了，焦点接到「正在回答」那一条上；回答回来那一条换掉了，再接到回答上。焦点已经去了别处的不抢；
-  // 没问成（提问框带着报错重新打开）时焦点由提问框自己接
+  // 没问成（提问框带着报错重新打开）时焦点由提问框自己接。都只在问的那一处：同一张卡挂在两处时另一处不动
   const pendingRef = useRef<HTMLElement | null>(null)
   const lastRef = useRef<HTMLElement | null>(null)
   const count = entries.length
   const [heard, setHeard] = useState('')
-  const asking = useRef<{ count: number; held: boolean } | null>(null)
+  const asking = useRef<{ count: number; held: boolean; ours: boolean; question: string } | null>(null)
   useLayoutEffect(() => {
     if (mine) {
       if (!asking.current) {
-        const held = focusLost()
+        const ours = !!host && mine.host === host
+        const held = ours && focusLost()
         if (held) pendingRef.current?.focus({ preventScroll: true })
-        asking.current = { count, held }
+        asking.current = { count, held, ours, question: mine.question }
       }
       return
     }
     const was = asking.current
     asking.current = null
-    if (!was || count <= was.count) return
-    setHeard(INQUIRY_TEXT.arrived)
+    if (!was?.ours || count <= was.count) return
+    // 先清空再写：连着两次回答说的是同一句时，读屏也得再报一遍
+    setHeard('')
+    requestAnimationFrame(() => setHeard(INQUIRY_TEXT.arrived(was.question)))
     if (was.held && focusLost()) lastRef.current?.focus({ preventScroll: true })
-  }, [mine, count])
+  }, [mine, count, host])
 
   const reportBtn = useRef<HTMLButtonElement>(null)
   if (!access && !entries.length && thread?.status !== 'error') return null
   const latest = entries[entries.length - 1]?.id
+  // 列表还没取回来时不说「还没有问答、可以这样问」：取回来有问答，这一句又得撤掉
+  const fresh = !count && !mine && !draft && !failed && thread?.status === 'ok'
 
   return (
     <section className="mt-2 min-w-0 border-t pt-2" data-inquiry={report} aria-label={INQUIRY_TEXT.title}>
@@ -406,16 +662,18 @@ export function ReportInquiry({ runId, report, docArtifact, access, onLocate, po
           {count > 0 && <span className="tnum font-normal" data-inquiry-count={count}>· {INQUIRY_TEXT.headCount(count)}</span>}
         </span>
         <span className="flex-1" />
-        {access && (
+        {access ? (
           <button ref={reportBtn} type="button" className="btn btn-xs" data-inquiry-ask-report=""
                   onClick={(e) => askAbout(runId, report, access, { unit: null, quote: null, text: '' }, e.currentTarget)}>
             <MessageCircleQuestion size={11} aria-hidden /> {INQUIRY_TEXT.askReport}
           </button>
+        ) : disabled && (
+          <span className="text-2xs text-faint" data-inquiry-disabled="">{INQUIRY_TEXT.disabled}</span>
         )}
       </div>
-      {access && !count && !mine && !draft && (
+      {access && fresh && (
         <p className="mt-1 text-2xs leading-relaxed text-dim" data-inquiry-intro="">
-          {postSeal ? INQUIRY_TEXT.introRun : INQUIRY_TEXT.intro}
+          {!docArtifact ? INQUIRY_TEXT.introNoDoc : postSeal ? INQUIRY_TEXT.introRun : INQUIRY_TEXT.intro}
         </p>
       )}
       {thread?.status === 'error' && (
@@ -424,23 +682,42 @@ export function ReportInquiry({ runId, report, docArtifact, access, onLocate, po
           <button type="button" className="btn btn-xs" onClick={() => void load(runId, report)}>{INQUIRY_TEXT.retry}</button>
         </div>
       )}
-      <div className="sr-only" aria-live="polite" aria-atomic="true">{heard}</div>
+      <div className="sr-only" aria-live="polite" aria-atomic="true" data-inquiry-live="">{heard}</div>
       {groups.length > 0 && (
         <div className="mt-1.5 space-y-2">
           {groups.map((g) => (
-            <div key={g.key} className="min-w-0" data-inquiry-group={g.unit ?? (g.quote ? 'quote' : 'report')}>
+            <div key={g.key} className="min-w-0"
+                 data-inquiry-group={g.key === OTHER ? OTHER : g.unit ?? (g.quote ? 'quote' : 'report')}>
               <GroupHead group={g} units={units} />
               <div className="mt-1 space-y-2 border-l pl-2">
                 {g.entries.map((e) => (
-                  <EntryView key={e.id} runId={runId} entry={e} groupQuote={g.unit ? null : g.quote} onLocate={onLocate}
+                  <EntryView key={e.id} runId={runId} entry={e} groupQuote={g.unit ? null : g.quote}
+                             otherDoc={g.key === OTHER} onLocate={g.key === OTHER ? undefined : onLocate}
                              focusRef={e.id === latest ? (el) => { lastRef.current = el } : undefined} />
                 ))}
-                {mine && groupKey(mine.target) === g.key && (
-                  <PendingView pending={mine} focusRef={(el) => { pendingRef.current = el }} />
-                )}
-                {draft && groupKey(draft.target) === g.key && (
-                  <Composer runId={runId} report={report} draft={draft} busy={!!pending} postSeal={postSeal}
-                            fallback={reportBtn} />
+                {g.key !== OTHER && (
+                  <>
+                    {mine && groupKey(mine.target) === g.key && (
+                      <PendingView pending={mine} focusRef={(el) => { pendingRef.current = el }} />
+                    )}
+                    {failed && groupKey(failed.target) === g.key && (
+                      <FailedView failed={failed} alert={failed.host === host} canReask={!draft}
+                                  onReask={() => { openers.delete(key); reask(runId, report, access!) }}
+                                  onDismiss={() => dismissFailed(key)} />
+                    )}
+                    {ownDraft && access && groupKey(ownDraft.target) === g.key && (
+                      <Composer runId={runId} report={report} access={access} draft={ownDraft} busy={!!pending} postSeal={postSeal}
+                                fallback={reportBtn} />
+                    )}
+                    {otherDraft && access && groupKey(otherDraft.target) === g.key && (
+                      <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-2xs text-dim" data-inquiry-draft-elsewhere="">
+                        <span>{INQUIRY_TEXT.elsewhere}</span>
+                        <button type="button" className="btn btn-xs" onClick={() => { openers.delete(key); move(key, access) }}>
+                          {INQUIRY_TEXT.moveHere}
+                        </button>
+                      </p>
+                    )}
+                  </>
                 )}
               </div>
             </div>
@@ -451,8 +728,19 @@ export function ReportInquiry({ runId, report, docArtifact, access, onLocate, po
   )
 }
 
-/** 一组的抬头：问的是哪一句（原文从报告文档取，取不到写「报告中的一句」）、哪段原文，或者整份报告 */
+/**
+ * 一组的抬头：问的是哪一句（原文从报告文档取，取不到写「报告中的一句」）、哪段原文，或者整份报告。问的不是眼前这一稿的
+ * 那一组只写明这一点：句子编号对不上，不去取原文
+ */
 function GroupHead({ group, units }: { group: Group; units: Map<string, string> }) {
+  if (group.key === OTHER) {
+    return (
+      <div className="min-w-0 text-2xs leading-relaxed" data-inquiry-about="">
+        <span className="font-medium text-dim" data-inquiry-about-text="">{INQUIRY_TEXT.otherDoc}</span>
+        <span className="block text-faint">{INQUIRY_TEXT.otherDocHint}</span>
+      </div>
+    )
+  }
   const text = group.unit ? units.get(group.unit) || group.entries.find((e) => e.inquiry.quote)?.inquiry.quote || ''
     : group.quote ?? ''
   return (
@@ -473,12 +761,26 @@ function Tag({ children }: { children: ReactNode }) {
   return <span className="chip shrink-0 px-1.5 py-0 font-medium leading-relaxed" aria-hidden>{children}</span>
 }
 
+/** 回答的花费：调用过模型才写；模型不在价格目录里的估不出金额，不写「$0」（同运行的金额，见 runCostText） */
+function costOf(usage: Inquiry['usage']): { text: string; title?: string } | null {
+  const calls = typeof usage?.calls === 'number' ? usage.calls : 0
+  const unpriced = typeof usage?.unpriced_calls === 'number' ? usage.unpriced_calls : 0
+  const usd = typeof usage?.cost_usd === 'number' ? usage.cost_usd : null
+  // 一次模型调用都没有（没配好模型、当日金额已到上限）就不写花费，写「$0」像是调用过
+  if (!calls && !unpriced && !(usd != null && usd > 0)) return null
+  const text = runCostText(usd, unpriced)
+  if (!text) return null
+  return { text: text === COST_TEXT.unpriced ? text : INQUIRY_TEXT.cost(text), title: unpriced > 0 ? COST_TEXT.unpricedTitle(unpriced) : undefined }
+}
+
 /** 一问一答 */
-function EntryView({ runId, entry, groupQuote, onLocate, focusRef }: {
+function EntryView({ runId, entry, groupQuote, otherDoc, onLocate, focusRef }: {
   runId: string
   entry: InquiryEntry
   /** 组抬头已经写着这段原文：问题下面不再写一遍 */
   groupQuote: string | null
+  /** 问的不是眼前这一稿报告：回答引用报告已有的出处时，不在眼前这一稿里找 */
+  otherDoc: boolean
   onLocate?: (seg: EvidenceSegment, doc: EvidenceDocData) => boolean
   focusRef?: (el: HTMLElement | null) => void
 }) {
@@ -518,9 +820,7 @@ function EntryView({ runId, entry, groupQuote, onLocate, focusRef }: {
   const answer = inquiry.answer
   const limit = answer.limit ? INQUIRY_TEXT.limit[answer.limit] ?? INQUIRY_TEXT.limitOther : ''
   const quote = inquiry.quote && inquiry.quote !== groupQuote ? inquiry.quote : null
-  // 一次模型调用都没有（没配好模型、当日金额已到上限）就不写花费，写「$0」像是调用过
-  const calls = typeof inquiry.usage?.calls === 'number' ? inquiry.usage.calls : null
-  const cost = typeof inquiry.usage?.cost_usd === 'number' && (inquiry.usage.cost_usd > 0 || !!calls) ? inquiry.usage.cost_usd : null
+  const cost = costOf(inquiry.usage)
   const answered = !!answer.text || !!answer.doc_artifact
   return (
     <article ref={focusRef} tabIndex={-1} className={`min-w-0 space-y-1 text-2xs leading-relaxed ${FOCUS_RING}`}
@@ -553,9 +853,11 @@ function EntryView({ runId, entry, groupQuote, onLocate, focusRef }: {
       <div className="flex min-w-0 items-start gap-1.5">
         <Tag>{INQUIRY_TEXT.a}</Tag>
         <div className="min-w-0 flex-1 space-y-1">
-          <AnswerBody inquiry={inquiry} onCite={onCite} />
+          <AnswerBody inquiry={inquiry} otherDoc={otherDoc} onCite={onCite} />
           {elsewhere != null && (
-            <p className="text-dim" data-inquiry-elsewhere="">{INQUIRY_TEXT.reportSource(elsewhere)}</p>
+            <p className="text-dim" data-inquiry-elsewhere="">
+              {otherDoc ? INQUIRY_TEXT.reportSourceOther(elsewhere) : INQUIRY_TEXT.reportSource(elsewhere)}
+            </p>
           )}
           {answer.ok && limit && (
             <p style={{ color: 'var(--st-waiting)' }} data-inquiry-limit={answer.limit}>{INQUIRY_TEXT.answerIncomplete(limit)}</p>
@@ -578,14 +880,17 @@ function EntryView({ runId, entry, groupQuote, onLocate, focusRef }: {
       {answered && (
         <p className="text-faint" data-inquiry-judged="">
           {INQUIRY_TEXT.answeredBy(inquiry.model)}
-          {cost != null && <span className="tnum"> · {INQUIRY_TEXT.cost(formatCost(cost))}</span>}
+          {cost && <span className="tnum" title={cost.title} data-inquiry-cost=""> · {cost.text}</span>}
         </p>
       )}
     </article>
   )
 }
 
-/** 正在回答的那一条：问题、转圈和等了多久。回答期间审批卡的批准 / 驳回暂停（审批卡读 useInquiryBusy） */
+/**
+ * 正在回答的那一条：问题、转圈和等了多久。回答期间审批卡的批准 / 驳回暂停（审批卡读 useInquiryBusy）。
+ * 播报区只放不变的那句：等了几秒每秒一变，放在里面读屏会每秒重读一遍
+ */
 function PendingView({ pending, focusRef }: { pending: Pending; focusRef: (el: HTMLElement | null) => void }) {
   const now = useTicker(1000)
   const waited = Math.max(0, Math.floor((now - pending.startedAt) / 1000))
@@ -596,11 +901,38 @@ function PendingView({ pending, focusRef }: { pending: Pending; focusRef: (el: H
         <Tag>{INQUIRY_TEXT.q}</Tag>
         <p className="min-w-0 flex-1 whitespace-pre-wrap font-medium text-fg [overflow-wrap:anywhere]">{pending.question}</p>
       </div>
-      <p className="flex items-center gap-1.5 text-dim" role="status">
+      <p className="flex flex-wrap items-center gap-x-1.5 text-dim">
         <Spinner size={11} />
-        <span>{INQUIRY_TEXT.pending}</span>
-        {waited >= 3 && <span className="tnum text-faint">· {INQUIRY_TEXT.waited(waited)}</span>}
+        <span role="status">{INQUIRY_TEXT.pending}</span>
+        {waited >= 3 && <span className="tnum text-faint" aria-hidden="true" data-inquiry-waited="">· {INQUIRY_TEXT.waited(waited)}</span>}
       </p>
+    </div>
+  )
+}
+
+/**
+ * 回答期间另开了提问框、正在回答的那一条却没问成：问题和原因照原样留着（提问框里新写的不动）。提问框关着时可以把它
+ * 放回提问框重问
+ */
+function FailedView({ failed, alert, canReask, onReask, onDismiss }: {
+  failed: Failure; alert: boolean; canReask: boolean; onReask: () => void; onDismiss: () => void
+}) {
+  return (
+    <div className="min-w-0 space-y-1 text-2xs leading-relaxed" data-inquiry-failed-ask="">
+      <div className="flex min-w-0 items-start gap-1.5">
+        <Tag>{INQUIRY_TEXT.q}</Tag>
+        <p className="min-w-0 flex-1 whitespace-pre-wrap font-medium text-fg [overflow-wrap:anywhere]" data-inquiry-question="">
+          {failed.question}
+        </p>
+      </div>
+      <p role={alert ? 'alert' : undefined} className="[overflow-wrap:anywhere]" style={{ color: 'var(--st-failed)' }}
+         data-inquiry-error={failed.error.code}>
+        {INQUIRY_TEXT.askFailed(failed.error.message)}
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        {canReask && <button type="button" className="btn btn-xs" onClick={onReask} data-inquiry-reask="">{INQUIRY_TEXT.reask}</button>}
+        <button type="button" className="btn btn-xs btn-ghost" onClick={onDismiss}>{INQUIRY_TEXT.dismiss}</button>
+      </div>
     </div>
   )
 }
@@ -609,9 +941,10 @@ function PendingView({ pending, focusRef }: { pending: Pending; focusRef: (el: H
  * 提问框：问的是哪一句（或哪段原文、整份报告）、问题、提交。Esc 关掉、焦点回到点开它的那个「质询」；Ctrl / ⌘ + 回车提交。
  * 字数超了、空着不让提交；这次运行另有一条在回答时也不让（服务端同样会拒绝）
  */
-function Composer({ runId, report, draft, busy, postSeal, fallback }: {
+function Composer({ runId, report, access, draft, busy, postSeal, fallback }: {
   runId: string
   report: string
+  access: InquiryAccess
   draft: Draft
   busy: boolean
   postSeal: boolean
@@ -624,11 +957,14 @@ function Composer({ runId, report, draft, busy, postSeal, fallback }: {
   const id = useId()
   const area = useRef<HTMLTextAreaElement>(null)
   const form = useRef<HTMLFormElement>(null)
-  // 每点一次「质询」（换了一句也算）都把焦点送进输入框，并把提问框滚进视野
+  // 每点一次「质询」（换了一句也算）都把焦点送进输入框，并把提问框滚进视野。只认点出来的：浮层关了、提问框挪到右栏
+  // 接着显示时不抢焦点
   useEffect(() => {
+    if (focusedNonce.get(key) === draft.nonce) return
+    focusedNonce.set(key, draft.nonce)
     area.current?.focus({ preventScroll: true })
     form.current?.scrollIntoView({ block: 'nearest' })
-  }, [draft.nonce])
+  }, [key, draft.nonce])
   const chars = [...draft.question].length
   const over = chars > QUESTION_MAX
   const empty = !draft.question.trim()
@@ -640,10 +976,14 @@ function Composer({ runId, report, draft, busy, postSeal, fallback }: {
     const back = openers.get(key)
     openers.delete(key)
     requestAnimationFrame(() => {
-      if (back?.isConnected) back.focus({ preventScroll: true })
-      else fallback.current?.focus({ preventScroll: true })
+      const el = back?.isConnected ? back : fallback.current
+      if (!el) return
+      // 焦点回去的地方可能已经滚出视野（提问框滚进来时把它挤上去了，或者在限高的报告框里）：滚回来，键盘用户看得见
+      el.focus({ preventScroll: true })
+      el.scrollIntoView({ block: 'nearest', inline: 'nearest' })
     })
   }
+  const send = () => { if (!empty && !over && !busy) void submit(runId, report, access) }
   const onKeyDown = (e: ReactKeyboardEvent) => {
     if (isComposing(e)) return
     if (e.key === 'Escape') {
@@ -653,13 +993,13 @@ function Composer({ runId, report, draft, busy, postSeal, fallback }: {
       dismiss()
     } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault()
-      if (!empty && !over && !busy) void submit(runId, report)
+      send()
     }
   }
   const problem = draft.error
   return (
     <form ref={form} className="min-w-0 space-y-1.5 rounded border bg-panel p-2" data-inquiry-composer={target}
-          onKeyDown={onKeyDown} onSubmit={(e) => { e.preventDefault(); if (!empty && !over && !busy) void submit(runId, report) }}>
+          onKeyDown={onKeyDown} onSubmit={(e) => { e.preventDefault(); send() }}>
       <div className="text-2xs font-medium text-faint" id={`${id}-target`}>{INQUIRY_TEXT.target[target]}</div>
       {shown && (
         <blockquote className="line-clamp-3 border-l-2 pl-2 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]"
@@ -711,7 +1051,7 @@ type Cite =
  * 回答正文。有回答文档时按文档画：数字的出处照报告里的样子（有出处的实线、裸数字点状线加「无证据」）；文档取到之前、
  * 取不到时按渲染后的正文显示，数字照写，只是不标出处
  */
-function AnswerBody({ inquiry, onCite }: { inquiry: Inquiry; onCite: (c: Cite) => void }) {
+function AnswerBody({ inquiry, otherDoc, onCite }: { inquiry: Inquiry; otherDoc: boolean; onCite: (c: Cite) => void }) {
   const artifact = inquiry.answer.doc_artifact ?? ''
   const slot = useEvidence((s) => (artifact ? s.docs[artifact] : undefined))
   const loadDoc = useEvidence((s) => s.loadDoc)
@@ -724,7 +1064,7 @@ function AnswerBody({ inquiry, onCite }: { inquiry: Inquiry; onCite: (c: Cite) =
     return map
   }, [inquiry.queries])
   if (doc && (doc.blocks ?? []).length) {
-    return <AnswerDoc doc={doc} own={own} onCite={onCite} />
+    return <AnswerDoc doc={doc} own={own} otherDoc={otherDoc} onCite={onCite} />
   }
   if (inquiry.answer.text) {
     return <div className="min-w-0 text-[11.5px]" data-inquiry-answer-text=""><Markdown text={inquiry.answer.text} dense /></div>
@@ -737,22 +1077,21 @@ function AnswerBody({ inquiry, onCite }: { inquiry: Inquiry; onCite: (c: Cite) =
 /** 列表项从哪一个片段开始：同 EvidenceDoc（行首的「- 」「1. 」是结构片段） */
 const ITEM_START = /(^|\n)[ \t]*([-*+]|\d+[.)])[ \t]+$/
 
-function AnswerDoc({ doc, own, onCite }: {
-  doc: EvidenceDocData; own: Map<string, InquiryQuery>; onCite: (c: Cite) => void
-}) {
+interface AnswerCtx { doc: EvidenceDocData; own: Map<string, InquiryQuery>; otherDoc: boolean; onCite: (c: Cite) => void }
+
+function AnswerDoc({ doc, own, otherDoc, onCite }: AnswerCtx) {
+  const ctx = useMemo(() => ({ doc, own, otherDoc, onCite }), [doc, own, otherDoc, onCite])
   return (
     <div className="min-w-0 space-y-1.5 text-[11.5px] leading-relaxed" data-inquiry-answer-doc="">
-      {doc.blocks.map((block, b) => <AnswerBlock key={block.id ?? b} block={block} doc={doc} own={own} onCite={onCite} />)}
+      {doc.blocks.map((block, b) => <AnswerBlock key={block.id ?? b} block={block} ctx={ctx} />)}
     </div>
   )
 }
 
 /** 一块：外观借 Markdown 的 BlockView，和报告文档、普通答案长得一样（块的分法同 EvidenceDoc 的 DocBlock） */
-function AnswerBlock({ block, doc, own, onCite }: {
-  block: EvidenceBlock; doc: EvidenceDocData; own: Map<string, InquiryQuery>; onCite: (c: Cite) => void
-}) {
+function AnswerBlock({ block, ctx }: { block: EvidenceBlock; ctx: AnswerCtx }) {
   const units = block.units ?? []
-  const unit = (u: EvidenceUnit, code = false) => <AnswerUnit key={u.id} unit={u} doc={doc} own={own} code={code} onCite={onCite} />
+  const unit = (u: EvidenceUnit, code = false) => <AnswerUnit key={u.id} unit={u} ctx={ctx} code={code} />
   switch (block.type) {
     case 'heading':
       return <BlockView dense shape={{ kind: 'h', level: block.level ?? 3, body: units.map((u) => unit(u)) }} />
@@ -812,6 +1151,9 @@ const evStyle = (state: EvidenceStateCode) => ({
   '--ev-line': EVIDENCE_STATE[state].decoration, '--ev-soft': EVIDENCE_STATE[state].soft,
 }) as CSSProperties
 
+/** 句末挂小标签的几种（同报告文档）：无证据、疑似不存在的名称 */
+const TAGGED = new Set<EvidenceStateCode>(['none', 'suspect'])
+
 /**
  * 回答里有出处的一个数字指向哪：引用的是质询自己某次查询里的一格（目录条目的工件就是那次查询的快照，工件缺的按别名
  * 认），还是报告已有的出处（口径卡上的指标、报告的查询……）
@@ -833,12 +1175,12 @@ function citeOf(seg: EvidenceSegment, doc: EvidenceDocData, own: Map<string, Inq
 
 /**
  * 一句话：文字按行内 Markdown 渲染（整句算一次样式，同 EvidenceDoc 的 UnitView）。有出处的数字是按钮：质询自己查询里的
- * 后面挂查询编号，点一下展开那次查询的结果、标出那一格；报告已有的出处点一下在报告里打开它的证据。裸数字、疑似不存在的
- * 名称画点状线，句末挂「无证据」「疑似不存在的名称」
+ * 后面挂查询编号，点一下展开那次查询的结果、标出那一格；报告已有的出处点一下在报告里打开它的证据。别的有状态的片段照
+ * 报告里的线型画（裸数字、疑似不存在、核对不了的名称、猜测的来源是点状线，句末挂「无证据」「疑似不存在的名称」），
+ * 不能和核对过的字长得一样
  */
-function AnswerUnit({ unit, doc, own, code, onCite }: {
-  unit: EvidenceUnit; doc: EvidenceDocData; own: Map<string, InquiryQuery>; code: boolean; onCite: (c: Cite) => void
-}) {
+function AnswerUnit({ unit, ctx, code }: { unit: EvidenceUnit; ctx: AnswerCtx; code: boolean }) {
+  const { doc, own, otherDoc, onCite } = ctx
   const segs = (unit.segments ?? []).filter((s) => s.kind !== 'structural')
   const whole = segs.map((s) => s.text).join('')
   const styles = useMemo(() => (code ? null : inlineStyles(whole)), [whole, code])
@@ -855,7 +1197,8 @@ function AnswerUnit({ unit, doc, own, code, onCite }: {
       return (
         <button key={s.id} type="button" className="ev-seg" data-ev-state="deterministic" data-ev-line="solid"
                 data-inquiry-cite={cite.kind === 'query' ? cite.alias : 'report'} style={evStyle('deterministic')} title={source}
-                aria-label={cite.kind === 'query' ? INQUIRY_TEXT.cited(s.text, source) : INQUIRY_TEXT.citedReport(s.text, source)}
+                aria-label={cite.kind === 'query' ? INQUIRY_TEXT.cited(s.text, source)
+                  : otherDoc ? INQUIRY_TEXT.citedOther(s.text, source) : INQUIRY_TEXT.citedReport(s.text, source)}
                 onClick={() => onCite(cite)}>
           {body}
           {cite.kind === 'query' && (
@@ -865,12 +1208,14 @@ function AnswerUnit({ unit, doc, own, code, onCite }: {
         </button>
       )
     }
-    if (state === 'none' || state === 'suspect') {
-      alerts.add(state)
+    const meta = state ? EVIDENCE_STATE[state] : null
+    if (state && meta && (meta.line === 'solid' || meta.line === 'dotted')) {
+      if (TAGGED.has(state)) alerts.add(state)
       return (
-        <span key={s.id} className="ev-mark" data-ev-state={state} data-ev-line="dotted" style={evStyle(state)}
-              title={segmentLabel(s, doc)}>
-          {body}<span className="sr-only">（{EVIDENCE_STATE_LABEL[state]}）</span>
+        <span key={s.id} className="ev-mark" data-ev-state={state} data-ev-line={meta.line} title={segmentLabel(s, doc)}
+              style={{ ...evStyle(state), ...(meta.line === 'solid' ? { textDecorationStyle: 'solid' } : {}) }}>
+          {s.strong ? <strong className="font-semibold">{body}</strong> : body}
+          {state !== 'deterministic' && <span className="sr-only">（{EVIDENCE_STATE_LABEL[state]}）</span>}
         </span>
       )
     }
@@ -881,7 +1226,7 @@ function AnswerUnit({ unit, doc, own, code, onCite }: {
       {nodes}
       {!code && [...alerts].map((state) => (
         <span key={state} className="ev-tag" aria-hidden="true" title={EVIDENCE_STATE[state].hint} data-ev-tag={state}>
-          {EVIDENCE_STATE[state].glyph}{EVIDENCE_STATE_LABEL[state]}
+          {EVIDENCE_STATE[state].glyph}{state === 'suspect' ? EVIDENCE_TEXT.suspectTag : EVIDENCE_STATE_LABEL[state]}
         </span>
       ))}
     </>
@@ -890,7 +1235,10 @@ function AnswerUnit({ unit, doc, own, code, onCite }: {
 
 // ---------------------------------------------------------------- 查询
 
-/** 核查模型执行过的查询：SQL、行数、截断；每次可以展开结果（按质询工件接口取快照，遮罩列已遮掉） */
+/**
+ * 核查模型执行过的查询：SQL、行数、截断；每次可以展开结果（按质询工件接口取快照，遮罩列已遮掉）。列表收着时也写明有几次
+ * 结果被截断——截断直接关系到回答靠不靠得住，不能要展开才看得到
+ */
 function QueryList({ runId, baseId, queries, shown, open, onOpen, onToggle }: {
   runId: string
   baseId: string
@@ -902,14 +1250,22 @@ function QueryList({ runId, baseId, queries, shown, open, onOpen, onToggle }: {
 }) {
   const listId = useId()
   if (!queries.length) return <p className="text-faint" data-inquiry-queries="0">{INQUIRY_TEXT.noQueries}</p>
+  const cut = queries.filter((q) => q.truncated).length
   return (
     <section className="min-w-0" data-inquiry-queries={queries.length}>
-      <button type="button" className="flex items-center gap-1 rounded text-faint hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--accent)]"
-              aria-expanded={open} aria-controls={open ? listId : undefined} onClick={() => onOpen(!open)}
-              data-inquiry-queries-toggle="">
-        <ChevronRight size={11} aria-hidden style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }} />
-        {INQUIRY_TEXT.queriesHead(queries.length)}
-      </button>
+      <div className="flex min-w-0 flex-wrap items-center gap-x-1.5">
+        <button type="button" className="flex items-center gap-1 rounded text-faint hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--accent)]"
+                aria-expanded={open} aria-controls={open ? listId : undefined} onClick={() => onOpen(!open)}
+                data-inquiry-queries-toggle="">
+          <ChevronRight size={11} aria-hidden style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }} />
+          {INQUIRY_TEXT.queriesHead(queries.length)}
+        </button>
+        {cut > 0 && (
+          <span className="tnum" style={{ color: 'var(--st-waiting)' }} data-inquiry-queries-truncated={cut}>
+            · {INQUIRY_TEXT.queriesTruncated(cut)}
+          </span>
+        )}
+      </div>
       {open && (
         <div id={listId} className="mt-1 space-y-1.5">
           {queries.map((q, i) => (

@@ -5,7 +5,7 @@ import { api } from '../api/client'
 import { useStudio } from '../store/studio'
 import { useCatalog } from '../store/catalog'
 import { NODE_DEFS } from '../canvas/nodeDefs'
-import { StatusDot, useToast } from '../components/ui'
+import { Spinner, StatusDot, useToast } from '../components/ui'
 import { useLocalActor } from '../lib/actor'
 import { formatDateTime, formatSpan, formatTime, parseServerTime } from '../lib/format'
 import { INQUIRY_TEXT, runClassLabel, runName, TOOL_TRUST_TEXT } from '../lib/terms'
@@ -156,7 +156,7 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
       {dualCheck && <DualCheckApproval approval={approval} onResolved={onResolved} />}
 
       <ApprovalReports reports={reports} runId={approval.run_id} runClass={approval.run_class}
-                       approvalId={approval.status === 'pending' ? approval.id : undefined} />
+                       approvalId={approval.id} askable={approval.status === 'pending'} />
       <ChallengeSummary reports={reports} runId={approval.run_id} />
 
       {payload.tool && (
@@ -212,9 +212,11 @@ export function ApprovalCard({ approval, onResolved, showWorkflow = true }: {
           </button>
         </div>
         {inquiring && (
-          <div className="mt-1.5 text-2xs font-medium leading-relaxed" role="status" data-approval-inquiry-busy=""
-               style={{ color: 'var(--st-waiting)' }}>
-            {INQUIRY_TEXT.decideBlocked}
+          // 字用正文色：审批卡铺着一层提醒色的底，提醒色的字在浅色主题下对比度不够；提醒色交给转圈的图标
+          <div className="mt-1.5 flex items-start gap-1 text-2xs font-medium leading-relaxed text-fg" role="status"
+               data-approval-inquiry-busy="">
+            <span className="mt-[3px] shrink-0" style={{ color: 'var(--st-waiting)' }}><Spinner size={11} /></span>
+            <span>{INQUIRY_TEXT.decideBlocked}</span>
           </div>
         )}
         {/* 批了会怎样，常显而不是藏在 hover 里：审批人得在按下去之前知道 */}
