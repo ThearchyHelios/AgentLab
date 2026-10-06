@@ -10,7 +10,8 @@
 - 工件：每份报告文档（各报告节点最后一次自查记下的 doc_artifact）、它引用到的口径卡和查询快照，按原字节
   base64 嵌入，浏览器重算 sha256 和 id 比；带遮罩的快照不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，
   有输入取自遮罩列（cell() 的格、Agent 字段、按位置取的 vars.res.rows[0][2]）的整张卡同样只给 id，认法和证据
-  面板、推演同一个（recompute.input_origin）。没被报告引用的工件不嵌。
+  面板、推演同一个（recompute.input_origin）；服务端文件被改过的卡照样按卡上记的输入认，解析不出一张卡的整张只给
+  id。没被报告引用的工件不嵌。
 - 封存之后追加的事件（按需裁判、审批质询这类批注）单列：类型、序号、内容摘要，不进清单。
 
 它只证明「内部一致」：数字、文档、运行记录彼此对得上，而且没被改过。真伪要拿页面上的封存哈希和系统里这次
@@ -116,17 +117,24 @@ class _Store:
         认哪个输入取自哪份查询结果的哪几列，和证据面板、推演同一个认法（recompute.input_origin）；按位置取的一格顺着
         取值链从写变量的节点在口径卡算这一次之前的产出起走。核对不了的宁可多挡：快照读不出来、取值链上的产出读不出来、
         那份结果没存快照只带着数据源名、定位里没写列。认得出、可结果既没带快照的 id 也没带数据源名的（数据整形改过形状）
-        认不出出处，不算。读不出来的卡本来就不嵌，这里不管。"""
+        认不出出处，不算。
+
+        卡本身按解析出来的内容认，不看哈希（同 content）：服务端的文件被改过，嵌进页面的照样是这份原字节，卡上记着的号码
+        也照样在里面。读得出字节、解析不出一张卡的（截断的 JSON、不是对象）认不出有哪些输入，整张按带遮罩算，和读不出来的
+        快照按带遮罩算（_snapshot_masked）是同一个道理。字节都读不出来的卡本来就不嵌（只给 id、标缺失），这里不管。"""
         key = f"card:{artifact}"
         if key not in self._masked:
-            card = self.content(artifact) if self.intact(artifact) else None
-            outputs = _card_outputs(events, artifact) if isinstance(card, dict) else {}
+            card = self.content(artifact)
+            if not isinstance(card, dict):
+                self._masked[key] = self.raw(artifact) is not None
+                return self._masked[key]
+            outputs = _card_outputs(events, artifact)
 
             def output(node_id: Any) -> Any:
                 found = outputs.get(str(node_id or ""))
                 return self.content(found) if found and self.intact(found) else None
 
-            items = [item for metric in (card or {}).get("metrics") or [] if isinstance(metric, dict)
+            items = [item for metric in card.get("metrics") or [] if isinstance(metric, dict)
                      for item in metric.get("inputs") or [] if isinstance(item, dict)]
             self._masked[key] = any(self._input_masked(item, output) for item in items)
         return self._masked[key]
