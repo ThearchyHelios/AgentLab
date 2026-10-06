@@ -565,3 +565,44 @@ async def test_a_scheduled_formal_run_naming_a_broken_provider_fails_and_is_stil
         async with SessionLocal() as session:
             await session.execute(delete(Schedule).where(Schedule.id == sid))
             await session.commit()
+
+
+# --------------------------------------------------------------------------
+# 发布前检查里修好的图，正式运行不再失败在那一处
+# --------------------------------------------------------------------------
+
+
+async def test_after_the_publish_fix_stops_naming_a_disabled_provider_the_formal_run_succeeds(monkeypatch, client):
+    """复核发现的原样：节点点名停用的接入、模型写它家的。以前发布前检查里选「不指定接入」只去掉接入，检查、保存、发布都
+    通过，正式运行按模型名找到的还是那个停用的接入，照样失败。现在模型一并去掉，候选说明写清执行时改用哪个接入，正式
+    运行就用它。"""
+    called = script(monkeypatch)
+    spec = chain(node("start", "input"),
+                 node("ask", "llm", "写日报", provider=DISABLED, model="停用演示模型", prompt="写今天的门店日报"),
+                 node("out", "output", fields=[{"name": "日报", "value": "{{ last_message }}"}]))
+    async with SessionLocal() as session:
+        wf = Workflow(name=f"门店日报-{uuid.uuid4().hex[:6]}", graph=spec, version=1)
+        session.add(wf)
+        await session.flush()
+        session.add(WorkflowVersion(workflow_id=wf.id, version=1, graph=spec))
+        await session.commit()
+        wid = wf.id
+    r = await client.post(f"/api/workflows/{wid}/publish-check", json={"level": "published"})
+    [issue] = [i for i in r.json()["issues"] if i.get("code") == "provider.disabled"]
+    [fix] = [f for f in r.json()["fixes"] if f["id"] == issue["fix"]]
+    [clear] = [o for o in fix["options"] if o["value"] == ""]
+    # 没点名接入、也没写模型时落到第一个可用的接入：本文件只建了一个启用的接入
+    assert clear["hint"] == f"去掉这一处指定的接入和模型「停用演示模型」，执行时改用第一个可用的模型接入「{WRITER_PROVIDER}」"
+    r = await client.post(f"/api/workflows/{wid}/autofix", json={"level": "published", "apply": [fix["id"]],
+                                                                 "choices": {fix["id"]: ""}})
+    fixed = r.json()
+    assert fixed["applied"] == [fix["id"]] and fixed["ok"] is True, fixed["rejected"]
+    assert (await client.patch(f"/api/workflows/{wid}", json={"graph": fixed["graph"]})).status_code == 200
+    r = await client.post(f"/api/workflows/{wid}/publish", json={"level": "published"})
+    assert r.json()["ok"] is True, r.text
+    r = await client.post("/api/runs", json={"workflow_id": wid, "run_class": "formal"})
+    assert r.status_code == 201, r.text
+    run = await wait(r.json()["id"])
+    assert run.status == "succeeded" and run.run_class == "formal", run.error
+    assert called == [WRITER_MODEL]
+    no_mock(await events(run.id), run.output)

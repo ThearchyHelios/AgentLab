@@ -462,7 +462,7 @@ def _plan_not_object(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -
     return _assist(f"「{_title(node)}」的出具契约不是一个 JSON 对象", "contract")
 
 
-#: 「不指定接入」那个候选的值：去掉这一处点名的接入
+#: 「不指定接入」（只写了模型的那一处是「不指定模型」）那个候选的值：去掉这一处写的接入（模型）
 PROVIDER_CLEAR = ""
 
 
@@ -506,44 +506,109 @@ def _model_path(path: str) -> str:
     return path[: -len("provider")] + "model"
 
 
-def _serves(provider: Any, model: str) -> bool:
-    models = [m.get("id") for m in getattr(provider, "models", None) or [] if isinstance(m, dict)]
-    return model in models or model == getattr(provider, "default_model", None)
+def _landing_text(landed: list[tuple[Any, Any]]) -> str:
+    """修完以后执行时改用哪里（provider_refs.land 的说法）：各处落到同一处只说一次，落到不同处逐处说。"""
+    groups: dict[str, list[str]] = {}
+    for use, landing in landed:
+        groups.setdefault(landing.where, []).append(use.who)
+    if len(groups) == 1:
+        return f"改用{next(iter(groups))}"
+    return "；".join(f"{'、'.join(whos)}改用{where}" for where, whos in groups.items())
 
 
 def _plan_provider(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
-    """点名的模型接入不存在或已停用（engine/provider_refs.py）：改用一个启用的接入，或者不再指定。
+    """执行时取不到模型的那一处（engine/provider_refs.py）：改用一个启用的接入，或者不再指定。点名的接入不存在、已停用
+    的，候选是「不指定接入」和各个启用的接入；只写了模型、提供它的接入已停用的，是「不指定模型」和各个启用的接入
+    （写在模型旁边的接入上）。
 
     要人选、不给默认：换成哪个接入只有人知道（同一个模型可能有两家提供，价格、配额都不同）。多数节点的检查器里没有
-    接入下拉框（只能选模型），全图默认、协作成员也没有，这里是界面上唯一能改它的地方。同一处写着模型、选的接入
-    又不提供它时，模型一并去掉、改用那个接入的默认模型——拿 A 家的模型名去调 B 家必然失败（设置页换接入时同一个
-    做法），候选的说明里写清。一处一条（plan_fixes 的 id 带字段）：协作节点自己的接入和成员的接入各修各的。
+    接入下拉框（只能选模型），全图默认、协作成员也没有，这里是界面上唯一能改它的地方。一处一条（plan_fixes 的 id
+    带字段）：协作节点自己的接入和成员的接入各修各的。
+
+    每个候选先在副本上改，按执行时的取法（provider_refs.land）算出改动波及的每一处落到哪里：去掉以后成员跟随节点、
+    节点跟随全图默认，都没写按模型名找；协作节点、全图默认换了接入，没写自己接入的成员、节点跟着换。落到的接入不提供
+    那一处的模型、按模型名落到停用的接入或认不出的模型时，同一级写着的模型一并去掉再算——拿 A 家的模型名去调 B 家
+    必然失败（设置页换接入时同一个做法）；还落不稳的候选不给，修完了运行照样失败的修复不能交给人。候选的说明写清执行
+    时改用哪里、模型去没去掉。复核（judge）另把一道关：门禁同样查只写了模型、提供它的接入已停用的那一处。
     """
-    from app.engine.provider_refs import provider_refs
+    from app.engine.provider_refs import land, provider_refs, uses
+    from app.providers.factory import serves
 
     field = str(issue.get("field") or "")
     ref = next((r for r in provider_refs(ctx.spec) if r.node_id == issue.get("node_id") and r.field == field), None)
     if ref is None:
         return None
     path = field.removeprefix("defaults.") if ref.node_id is None else field
+    if ref.kind == "model":
+        model_path, provider_path = path, path[: -len("model")] + "provider"
+    else:
+        provider_path, model_path = path, _model_path(path)
+    prefix = "defaults." if ref.node_id is None else ""
     root = ctx.spec.defaults if ref.node_id is None else (node.config if node is not None else {})
-    model = _read_path(root, _model_path(path))
+    model = _read_path(root, model_path)
     model = model.strip() if isinstance(model, str) and model.strip() else None
-    options: list[dict[str, Any]] = [{"value": PROVIDER_CLEAR, "label": "不指定接入",
-                                      "hint": "去掉这一处指定的接入，按上一级的设置或模型名找接入"}]
-    drop: list[str] = []
+    before = {use.key: use for use in uses(ctx.spec)}
+
+    def trial(edits: list[tuple[str, Any]]) -> list[tuple[Any, Any]] | None:
+        """在副本上改，改动波及的每一处（取法变了的）执行时落到哪里；有一处落不稳返回 None。"""
+        spec = ctx.spec.model_copy(deep=True)
+        target = spec.defaults if ref.node_id is None else spec.node_map()[ref.node_id].config
+        for at, value in edits:
+            _put_path(target, at, value)
+        landed = []
+        for use in uses(spec):
+            if before.get(use.key) == use:
+                continue
+            if not (landing := land(use, ctx.providers)).ok:
+                return None
+            landed.append((use, landing))
+        return landed
+
+    def settle(edits: list[tuple[str, Any]]) -> tuple[list[tuple[str, Any]], list[tuple[Any, Any]]] | None:
+        """先只改这一处；落不稳而同一级写着模型时，连模型一并去掉再试。返回（改法，波及的各处落到哪里），还落不稳为 None。"""
+        if (landed := trial(edits)) is not None:
+            return edits, landed
+        if model and all(at != model_path for at, _ in edits):
+            edits = [*edits, (model_path, None)]
+            if (landed := trial(edits)) is not None:
+                return edits, landed
+        return None
+
+    options: list[dict[str, Any]] = []
+    plans: dict[str, list[tuple[str, Any]]] = {}
+    if (got := settle([(model_path if ref.kind == "model" else provider_path, None)])) is not None:
+        edits, landed = got
+        what = "模型" if ref.kind == "model" else "接入" + (f"和模型「{model}」" if len(edits) > 1 else "")
+        options.append({"value": PROVIDER_CLEAR, "label": f"不指定{'模型' if ref.kind == 'model' else '接入'}",
+                        "hint": f"去掉这一处指定的{what}，执行时{_landing_text(landed)}"})
+        plans[PROVIDER_CLEAR] = edits
     for p in ctx.providers:
-        if not getattr(p, "enabled", False) or not getattr(p, "name", None):
+        if not getattr(p, "enabled", False) or not getattr(p, "name", None) or p.name in plans:
             continue
+        if (got := settle([(provider_path, p.name)])) is None:
+            continue
+        edits, landed = got
         notes = []
-        if model and not _serves(p, model):
-            drop.append(p.name)
-            default = getattr(p, "default_model", None)
-            notes.append(f"不提供模型「{model}」，将改用它的默认模型" + (f"「{default}」" if default else ""))
+        if len(edits) > 1:
+            # 这一处原来用的就是去掉的那个模型：换上的接入实际用哪个模型（多半是它的默认模型，上一级写了模型就是那个）
+            mine = {landing.model for use, landing in landed
+                    if (was := before.get(use.key)) is not None and was.model is not None
+                    and (was.model.node_id, was.model.field) == (ref.node_id, prefix + model_path)}
+            used = next(iter(mine)) if len(mine) == 1 else None
+            said = [f"不提供模型「{model}」" if not serves(p, model) else f"模型「{model}」一并去掉"]
+            if used:
+                said.append(f"将改用{'它的默认模型' if used == p.default_model else '模型'}「{used}」")
+            elif not serves(p, model):
+                said.append("这一处的模型一并去掉")
+            notes.append("，".join(said))
         if getattr(p, "kind", None) == "mock":
             notes.append("演示用的模型接入，不调用真实模型")
         options.append({"value": p.name, "label": p.name, "hint": "；".join(notes) or None})
-    return _choice(f"选择{ref.who}改用的模型接入", field, options, _path=path, _drop_model=drop)
+        plans[p.name] = edits
+    if not options:
+        # 一个都落不稳（比如一个启用的接入都没有）：不给修复，问题照样拦着发布，说明里写了去设置里启用
+        return None
+    return _choice(f"选择{ref.who}改用的模型接入", field, options, _edits=plans)
 
 
 _PLANNERS: dict[str, Callable[[_Ctx, dict[str, Any], GraphNode | None], dict[str, Any] | None]] = {
@@ -759,8 +824,8 @@ def _edit_judge_budget(graph: dict[str, Any], fix: dict[str, Any], value: Any) -
 
 
 def _edit_provider(graph: dict[str, Any], fix: dict[str, Any], value: Any) -> list[tuple[str | None, str, Any, Any]]:
-    """点名的模型接入（provider.*）：落在节点上改节点配置，落在全图默认上改 defaults（节点 id 记 None，字段写全路径
-    defaults.x）。选「不指定接入」去掉这一项；选的接入不提供同一处写着的模型时，模型一并去掉。"""
+    """点名的模型接入（provider.*）：照规划时为选中的候选算好的改法写（_plan_provider 的 _edits：写上或去掉接入、
+    连带去掉的模型）。落在节点上改节点配置，落在全图默认上改 defaults（节点 id 记 None，字段写全路径 defaults.x）。"""
     if fix["node_id"] is None:
         if not isinstance(graph.get("defaults"), dict):
             graph["defaults"] = {}
@@ -770,12 +835,11 @@ def _edit_provider(graph: dict[str, Any], fix: dict[str, Any], value: Any) -> li
         if node is None:
             return []
         root, prefix = _config(node), ""
-    path = str(fix.get("_path") or "")
-    after = value if isinstance(value, str) and value != PROVIDER_CLEAR else None
-    edits: list[tuple[str | None, str, Any, Any]] = [(fix["node_id"], prefix + path, _put_path(root, path, after), after)]
-    if after is not None and after in (fix.get("_drop_model") or ()):
-        if (model := _put_path(root, _model_path(path), None)) is not None:
-            edits.append((fix["node_id"], prefix + _model_path(path), model, None))
+    edits: list[tuple[str | None, str, Any, Any]] = []
+    for path, after in (fix.get("_edits") or {}).get(value) or ():
+        before = _put_path(root, path, after)
+        if before is not None or after is not None:
+            edits.append((fix["node_id"], prefix + path, before, copy.deepcopy(after)))
     return edits
 
 

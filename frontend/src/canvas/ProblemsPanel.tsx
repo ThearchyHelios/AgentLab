@@ -617,9 +617,13 @@ function UpgradeValue({ value, field, nameOf, className, ...data }: {
 
 const SUB_LABEL: Record<string, string> = {
   condition: '的条件', key: '的标识', tools: '的工具', system: '的系统提示', provider: PROVIDER_REF_TEXT.memberField,
+  model: PROVIDER_REF_TEXT.memberModel,
 }
-/** 节点定义里没有、问题却会落上去的字段：点名的模型接入（多数节点的检查器里没有这一栏）。不写的话露出键名 */
-const FIELD_FALLBACK: Record<string, string> = { provider: PROVIDER_REF_TEXT.field }
+/**
+ * 节点定义里没有、问题却会落上去的字段：点名的模型接入（多数节点的检查器里没有这一栏），以及只写了模型、提供它的接入
+ * 已停用时的模型（知识检索、结构校验的检查器里没有模型这一栏）。不写的话露出键名
+ */
+const FIELD_FALLBACK: Record<string, string> = { provider: PROVIDER_REF_TEXT.field, model: PROVIDER_REF_TEXT.model }
 
 function fieldLabel(field: FieldRef | null | undefined, type?: string, config?: Record<string, any>): string {
   if (!field) return ''

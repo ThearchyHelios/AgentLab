@@ -68,6 +68,38 @@ def named_provider(providers: list[Provider], ref: Any) -> Provider:
     return found
 
 
+def serves(provider: Any, model: str) -> bool:
+    """这个接入提供不提供这个模型：模型列表里有，或者是它的默认模型（按模型名找接入的同一个认法）。"""
+    return any((m or {}).get("id") == model for m in (provider.models or [])) or provider.default_model == model
+
+
+def provider_for_model(providers: list[Provider], model: str) -> Provider | None:
+    """没点名接入时按模型名找提供它的接入（providers 是 list_providers 的结果）：先认模型列表、再认默认模型，只看启用的。
+
+    只有停用的接入提供它时抛 ProviderNotConfigured（disabled）——这时候不能默默换一家：拿着 A 家的模型名去调 B 家，
+    必然 404，而且报错完全指不到真正的原因。认不出来的模型名返回 None：用户可能手填了一个目录里还没有的新模型，由
+    调用方退回 fallback_provider。运行时取模型（resolve_provider）和画布校验、发布前检查（engine/provider_refs.py）
+    按这一处认，说法一致。"""
+    enabled = [p for p in providers if p.enabled]
+    found = next((p for p in enabled if any((m or {}).get("id") == model for m in (p.models or []))), None) \
+        or next((p for p in enabled if p.default_model == model), None)
+    if found is not None:
+        return found
+    off = next((p for p in providers if not p.enabled and serves(p, model)), None)
+    if off is not None:
+        raise ProviderNotConfigured(f"模型「{model}」所属的模型接入「{off.name}」已停用",
+                                    "请在「设置 → 模型接入」中启用它，或为节点换一个模型", code="disabled")
+    return None
+
+
+def fallback_provider(providers: list[Provider]) -> Provider | None:
+    """没点名接入、也没写模型（或模型名认不出来）时用哪个：第一个启用的真实接入，没有就第一个启用的演示接入；一个启用
+    的都没有返回 None（get_chat_model 换成内置演示模型）。"""
+    enabled = [p for p in providers if p.enabled]
+    real = [p for p in enabled if p.kind != "mock"]
+    return (real or enabled or [None])[0]
+
+
 def assistant_unavailable(e: BaseException) -> str:
     """助手（画布上改图、表格导入与数据目录的 AI 起草）用的模型取不到时给人看的那句话。
 
@@ -98,33 +130,14 @@ async def resolve_provider(
     设置里的数字一类）按点名了一个不存在的接入报，不当成没给。
     """
     providers = await list_providers(session)
-    enabled = [p for p in providers if p.enabled]
 
     if ref is not None and (not isinstance(ref, str) or ref.strip()):
         return named_provider(providers, ref)
 
-    if model:
-        for p in enabled:
-            if any((m or {}).get("id") == model for m in (p.models or [])):
-                return p
-        for p in enabled:
-            if p.default_model == model:
-                return p
-        # 模型认得出来，但它所属的 provider 被停用了。这时候不能默默换一家 ——
-        # 拿着 A 家的模型名去调 B 家，必然 404，而且报错完全指不到真正的原因。
-        for p in providers:
-            if not p.enabled and (
-                any((m or {}).get("id") == model for m in (p.models or []))
-                or p.default_model == model
-            ):
-                raise ProviderNotConfigured(
-                    f"模型「{model}」所属的模型接入「{p.name}」已停用",
-                    "请在「设置 → 模型接入」中启用它，或为节点换一个模型", code="disabled",
-                )
-        # 认不出来的模型名就放行：用户可能手填了一个目录里还没有的新模型
-
-    real = [p for p in enabled if p.kind != "mock"]
-    return (real or enabled or [None])[0]
+    # 模型认得出来、所属的接入却停用了：provider_for_model 照实报错，不默默换一家。认不出来的模型名放行
+    if model and (found := provider_for_model(providers, model)) is not None:
+        return found
+    return fallback_provider(providers)
 
 
 def _resolve_key(provider: Provider) -> str | None:

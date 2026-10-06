@@ -427,9 +427,9 @@ async def _sql_checkers(session: AsyncSession, spec: GraphSpec) -> dict[str, Any
 
 
 async def _providers(session: AsyncSession, spec: GraphSpec) -> list[Any]:
-    """模型接入表：节点点名的接入不存在或已停用时，发布、发布前检查、自动修复的复核给 error、挡住发布，修复从启用的
-    接入里列候选（engine/provider_refs.py、autofix 的 provider.*）。和 _sql_checkers 一样由接口这一层读好交给门禁，
-    门禁本身不查库；三处传同一份。图里没点名任何接入时不读库。"""
+    """模型接入表：节点点名的接入不存在或已停用、只写了模型而提供它的接入已停用时，发布、发布前检查、自动修复的复核
+    给 error、挡住发布，修复从启用的接入里列候选（engine/provider_refs.py、autofix 的 provider.*）。和 _sql_checkers
+    一样由接口这一层读好交给门禁，门禁本身不查库；三处传同一份。图里取模型的几处都没写接入和模型时不读库。"""
     return await load_providers(session, spec)
 
 
@@ -522,7 +522,8 @@ class ValidateIn(BaseModel):
 async def validate(payload: ValidateIn, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """画布上的实时校验。前端每次改动都会调它来标红。
 
-    点名的模型接入不存在或已停用只给警告：探索运行仍可发起，执行到那个节点时照实报错；发布时才挡住。"""
+    点名的模型接入不存在或已停用（只写了模型、提供它的接入已停用也算）只给警告：探索运行仍可发起，执行到那个节点时
+    照实报错；发布时才挡住。"""
     try:
         spec = GraphSpec.model_validate(payload.graph)
     except Exception as e:  # noqa: BLE001

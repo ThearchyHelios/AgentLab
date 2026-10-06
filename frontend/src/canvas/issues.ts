@@ -247,8 +247,8 @@ function normalizeIssue(raw: any): ValidationIssue | null {
 }
 
 /**
- * 点名的模型接入不存在或已停用（后端 engine/provider_refs.py）。一处一条问题、一条修复：同一个协作节点上自己的接入和
- * 成员的接入是两处，合并、找修复都要连字段一起认
+ * 点名的模型接入不存在或已停用，或者只写了模型、提供它的接入已停用（后端 engine/provider_refs.py）。一处一条问题、
+ * 一条修复：同一个协作节点上自己的接入和成员的接入是两处，合并、找修复都要连字段一起认
  */
 export const isProviderRefCode = (code?: string | null): boolean => code === 'provider.missing' || code === 'provider.disabled'
 
@@ -397,8 +397,9 @@ const CONTRACT_KEYS: Record<string, string> = {
 /** 不在节点定义的字段表里、由检查器自己画的几项（子工作流钉的版本、升版处置），以及图级的全图默认 */
 const EXTRA_FIELDS: Record<string, string> = {
   workflow_version: '固定版本', upgrade_policy: '上游发布新版本时', defaults: '工作流默认设置',
-  // 多数节点的检查器里没有接入这一栏（只有双盲复算、反方审稿有），修复点名接入时照样要写得出叫法
-  provider: PROVIDER_REF_TEXT.field,
+  // 多数节点的检查器里没有接入这一栏（只有双盲复算、反方审稿有），修复点名接入时照样要写得出叫法；修复连带去掉的
+  // 模型也一样（知识检索、结构校验的检查器里没有模型这一栏）
+  provider: PROVIDER_REF_TEXT.field, model: PROVIDER_REF_TEXT.model,
 }
 /** 点号后面那一段的叫法：契约里的键，全图默认里的审批策略，列表项里的名称、取值、表达式 */
 const SUB_KEYS: Record<string, string> = {

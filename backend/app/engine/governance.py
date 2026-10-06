@@ -45,8 +45,8 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
     门禁本身不查库。给了的话，调用工具节点里写死的 SQL 对照目录查一遍（_lint_sql）。
 
     providers 是模型接入表（provider_refs.load_providers），同样由调用方读好传进来。给了的话，节点点名的接入
-    不存在或已停用的每一处一条 error（provider.missing / provider.disabled），两档都挡：正式运行到那里一定失败，
-    或者少一块核查。不给（一键升级、助手自查这类只看图本身的地方）就不查。
+    不存在或已停用、只写了模型而提供它的接入已停用的每一处一条 error（provider.missing / provider.disabled），
+    两档都挡：正式运行到那里一定失败，或者少一块核查。不给（一键升级、助手自查这类只看图本身的地方）就不查。
     """
     result = ValidationResult()
     strict = level == "governed"

@@ -7,7 +7,8 @@
   挡住发布。只查执行时真会去取模型的那几处（分支「让模型分类」、校验「让模型修复」且允许重试、检索「让模型重排」
   时才算；核查节点自己的开关关着不算）；报告没写裁判配置时查全图默认里的那一份；
 - 提示按这一处在界面上能不能改：检查器里有接入下拉框的说「在节点中换一个接入」，别处说「在发布前检查中改用」；
-- 发布前检查给每一处配一条要人选的修复：改用一个启用的接入，或不指定接入。
+- 发布前检查给每一处配一条要人选的修复：改用一个启用的接入，或不指定接入（修完以后执行时落到哪里、只写了模型而
+  提供它的接入已停用的那一处，见 test_provider_ref_landing）。
 
 接入名、节点名都是虚构的。
 """
@@ -426,11 +427,16 @@ async def test_each_broken_provider_gets_a_choice_to_switch_or_stop_naming_one(c
         ("write", "provider", GONE, LIVE), ("write", "model", "核对旧模型", None)]
     assert provider_issues({"issues": out["remaining"]}) == []
 
+    # 不指定接入：哪一级都没写接入，按模型名找；「核对旧模型」没有哪个接入提供，执行时会落到第一个可用的接入去调它，
+    # 所以模型一并去掉，说明里写清改用哪里（详见 test_provider_ref_landing）
+    clear = fix["options"][0]
+    assert clear["hint"].startswith("去掉这一处指定的接入和模型「核对旧模型」，执行时改用第一个可用的模型接入「"), clear
     out = await _fix(client, wf, graph, fix["id"], "")
     assert out["applied"] == [fix["id"]] and out["ok"] is True, out["rejected"]
     config = config_of(out["graph"], "write")
-    assert "provider" not in config and config["model"] == "核对旧模型"
-    assert [(c["field"], c["before"], c["after"]) for c in out["changes"]] == [("provider", GONE, None)]
+    assert "provider" not in config and "model" not in config
+    assert [(c["field"], c["before"], c["after"]) for c in out["changes"]] == [("provider", GONE, None),
+                                                                              ("model", "核对旧模型", None)]
 
 
 async def test_a_team_node_and_its_member_are_fixed_one_place_at_a_time(client):
@@ -472,16 +478,18 @@ async def test_the_graph_default_provider_has_its_own_fix(client):
         (None, "defaults.provider", OFF, LIVE), (None, "defaults.model", "核对停用模型", None)]
 
 
-async def test_stop_naming_a_provider_is_refused_when_the_graph_default_is_broken_too(client):
-    """节点不再指定接入就改取全图默认：全图默认的接入也坏了，修完冒出新问题，这一项不采用并说清原因。"""
+async def test_stop_naming_a_provider_is_not_offered_when_the_graph_default_is_broken_too(client):
+    """节点不再指定接入就改取全图默认：全图默认的接入也坏了，修完照样失败，「不指定接入」这一项不给；直接把这个值发给
+    接口也不采用。换成启用的接入照常给。"""
     graph = chain(node("start", "input"), node("ask", "llm", "提问", provider=GONE, prompt="总结"),
                   node("out", "output", fields=[{"name": "结论", "value": "{{ last_message }}"}]),
                   defaults={"provider": OFF})
     wf = await _workflow(graph)
     r = await client.post(f"/api/workflows/{wf}/publish-check", json={"level": "published", "graph": graph})
     [issue] = provider_issues(r.json())          # 唯一的节点写了自己的接入，全图默认的没人用，不提
+    [fix] = [f for f in r.json()["fixes"] if f["id"] == issue["fix"]]
+    values = [o["value"] for o in fix["options"]]
+    assert "" not in values and LIVE in values, values
     out = await _fix(client, wf, graph, issue["fix"], "")
-    assert out["applied"] == []
-    [(fid, reason)] = [(x["fix_id"], x["reason"]) for x in out["rejected"]]
-    assert fid == issue["fix"] and reason.startswith("修改后出现了新的问题：工作流默认设置指定的模型接入"), reason
+    assert out["applied"] == [] and [x["fix_id"] for x in out["rejected"]] == [issue["fix"]]
     assert config_of(out["graph"], "ask")["provider"] == GONE and out["changes"] == []
