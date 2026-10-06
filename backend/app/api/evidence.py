@@ -2348,6 +2348,8 @@ FORMAL_JUDGED = "正式运行的结论句已在报告撰写节点内完成裁判
 FORMAL_NO_JUDGE = "这份报告没有开启结论句裁判，正式运行的结论句不能按需裁判"
 #: 正式运行、开了裁判节点里却没判：报告没通过核对、节点按设置紧接着判失败时，不再花钱裁判
 FORMAL_UNJUDGED = "这份报告开启了结论句裁判，但报告未通过核对，结论句没有在报告撰写节点内完成裁判；正式运行的结论句不能按需裁判"
+#: 按需裁判接口认不出是哪份报告（没有封存的报告、点名的不是报告撰写节点、文档读不出来）：不替它说判没判过
+FORMAL_ONLY = "正式运行的结论句只在报告撰写节点内裁判，不能按需裁判"
 UNSEALED_JUDGE = "运行尚未结束并封存（仍在运行、停在人工审批或正在继续运行），请在运行结束后再请模型裁判"
 LEGACY_JUDGE = "这次运行发起时系统尚未记录证据，不支持按需裁判"
 BROKEN_JUDGE = "封存核对未通过：封存后有事件被修改、删除或插入，报告和证据已不可信，无法再请模型裁判"
@@ -2478,8 +2480,10 @@ def _stale(verdict: Any) -> bool:
 def _formal_message(doc: dict[str, Any] | None, claims: str | None) -> str:
     """正式运行为什么不能按需裁判，照实说节点里判没判过：文档里有当场裁判的摘要（mode inline）才是判过了；开了裁判却
     没有摘要的，是报告没通过核对、节点紧接着判失败，不再花钱裁判；别的是没开结论句裁判（策略为不裁判、只要求附依据，
-    升级前的运行没记策略，也没有裁判摘要）。"""
-    judge = (doc or {}).get("judge")
+    升级前的运行没记策略，也没有裁判摘要）。没有文档（认不出是哪份报告）的不替它说判没判过。"""
+    if doc is None:
+        return FORMAL_ONLY
+    judge = doc.get("judge")
     if isinstance(judge, dict) and judge.get("mode") == "inline":
         return FORMAL_JUDGED
     return FORMAL_UNJUDGED if claims == CLAIMS_JUDGE else FORMAL_NO_JUDGE
@@ -2487,7 +2491,7 @@ def _formal_message(doc: dict[str, Any] | None, claims: str | None) -> str:
 
 def _formal_refusal(sealed: _Sealed, wanted: str | None) -> str:
     """按需裁判接口拒绝正式运行时的那句话，和片段接口说的一致：按请求要的那份报告（没指定取成果里标注的那一份）说。
-    选不出报告、文档读不出来的，按没有裁判摘要说。"""
+    选不出报告、文档读不出来的，只说正式运行不能按需裁判（FORMAL_ONLY）。"""
     reports = _reports(sealed)
     try:
         chosen = _choose(reports, wanted, sealed) if reports else None

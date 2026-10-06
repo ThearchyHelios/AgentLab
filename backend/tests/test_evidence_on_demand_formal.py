@@ -160,6 +160,10 @@ async def test_the_judge_endpoint_says_the_same_for_a_formal_report_without_judg
     detail = res.json()["detail"]
     assert JUDGED_WORDS not in detail and "没有开启结论句裁判" in detail, detail
     assert detail == (await on_demand(client, row, CAUSAL))["message"]
+    # 点名的不是报告撰写节点：认不出是哪份报告，不替它说判没判过，只说正式运行不能按需裁判
+    res = await client.post(f"/api/runs/{row.id}/evidence/judge", json={"units": ["u1"], "report": "caliber"})
+    assert res.status_code == 409 and res.json()["code"] == "evidence_judge_formal", res.text
+    assert res.json()["detail"] == "正式运行的结论句只在报告撰写节点内裁判，不能按需裁判"
 
 
 # --------------------------------------------------------------------------
