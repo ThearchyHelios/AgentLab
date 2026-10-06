@@ -490,45 +490,87 @@ _CITING = ("require_citation", "judge")
 
 #: 报告的正文写在代码块里、一句结论都没切出来时的缺口（_fenced_body）。不带核查节点的前缀：界面归在「校验未全部完成」下
 GAP_FENCED_BODY = "报告「{title}」的正文写在代码块里，结论句未能核对"
-#: 写的是文字的代码块：信息串为空、markdown、md（报告节点去整篇外层围栏时认的那几个，report._PROSE_INFO），另加 text。
-#: sql、python、json 这类是模型真要贴的代码
-_PROSE_FENCES = frozenset({"", "markdown", "md", "text"})
+#: 写的是文字的代码块：信息串为空、markdown、md（报告节点去整篇外层围栏时认的那几个，report._PROSE_INFO），另加 text、
+#: plaintext、txt、plain 这几种纯文字的写法。sql、python、json 这类是模型真要贴的代码
+_PROSE_FENCES = frozenset({"", "markdown", "md", "text", "plaintext", "txt", "plain"})
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 #: 中文的句读：一行里有汉字、又有它们的，是在写句子（SQL 里的中文列名、别名不带这些）
 _CJK_PUNCT = re.compile(r"[，。！？；：]")
-#: 英文句子：五个以上的单词，以句末标点收尾
-_EN_SENTENCE = re.compile(r"[A-Za-z]+(?:[ ,]+[A-Za-z]+){4,}[.!?](?=\s|$)")
-#: 代码里的注释行：写着中文句子也是代码的一部分
-_CODE_COMMENT = re.compile(r"\s*(?:--|//|/\*|\*/)")
+#: 英文的词串：单词之间只隔空格、逗号。五个以上的单词紧跟句末标点算一句（_en_sentence）
+_EN_RUN = re.compile(r"[A-Za-z]+(?:[ ,]+[A-Za-z]+)*")
+_EN_WORD = re.compile(r"[A-Za-z]+")
+#: 列表项：- * + • 或「1.」「1)」开头。中文报告的列表项常不带句读，后面有两个以上汉字就算在写句子
+_LIST_ITEM = re.compile(r"\s*(?:[-*+•]|\d+[.)])\s+(.*)")
+#: 整行是注释（-- // # /* */ 开头；# 开头的 Markdown 标题本来也不是句子），和行尾隔着空白的注释：写着中文句子也是
+#: 代码的一部分
+_COMMENT_LINE = re.compile(r"\s*(?:--|//|#|/\*|\*/)")
+_TRAILING_COMMENT = re.compile(r"\s(?:--|//|#).*")
+#: 代码里的字符串字面量（'…'、"…"，可带 f、r、b、u、N 这类前缀）：里面的中文标点是数据。引号前面紧挨着字母、数字的
+#: 不算开头（英文的 it's、don't）
+_STRING_LITERAL = re.compile(r"(?<![A-Za-z0-9_])[rRbBuUfFnN]{0,2}(?:'[^'\n]*'|\"[^\"\n]*\")")
+#: 看得出是 SQL、Python 的行。信息串为空的代码块里有这样的行时，以 * + - 开头的是运算的续行（「* 数量 AS 金额」），
+#: 不当列表项
+_CODE_LINE = re.compile(r"\s*(?:select|with|from|where|join|group\s+by|order\s+by|having|union|insert|update"
+                        r"|delete|create|def|class|import|return)\b", re.IGNORECASE)
 
 
-def _prose_line(line: str) -> bool:
-    if _CODE_COMMENT.match(line):
+def _en_sentence(line: str) -> bool:
+    """一句英文：五个以上的单词（之间只隔空格、逗号）紧跟句末标点，后面是空白或行尾。按词串逐个数，不靠正则回溯：
+    回溯的写法遇上很长、不带句末标点的一行，耗时随行长平方增长，出口复核又是在事件循环上同步执行的。"""
+    for run in _EN_RUN.finditer(line):
+        end = run.end()
+        if line[end:end + 1] in (".", "!", "?") and (end + 1 == len(line) or line[end + 1].isspace()) \
+                and len(_EN_WORD.findall(run.group())) >= 5:
+            return True
+    return False
+
+
+def _prose_line(line: str, *, lists: bool = True) -> bool:
+    """这一行是不是在写句子：去掉字符串字面量和行尾注释之后，有两个以上汉字又有中文句读，或者是一句英文；lists 为真时，
+    列表项后面有两个以上汉字也算。整行是注释的不算。"""
+    if _COMMENT_LINE.match(line):
         return False
-    return (len(_CJK.findall(line)) >= 2 and _CJK_PUNCT.search(line) is not None) \
-        or _EN_SENTENCE.search(line) is not None
+    line = _TRAILING_COMMENT.sub("", _STRING_LITERAL.sub(" ", line), count=1)
+    if (len(_CJK.findall(line)) >= 2 and _CJK_PUNCT.search(line) is not None) or _en_sentence(line):
+        return True
+    item = _LIST_ITEM.match(line) if lists else None
+    return item is not None and len(_CJK.findall(item.group(1))) >= 2
+
+
+def _drop_block_comments(text: str) -> str:
+    """去掉 /* … */（可以跨行）：块注释里的中文句子也是代码的一部分。没收尾的不去，开头那一行照注释行跳过。"""
+    kept: list[str] = []
+    at = 0
+    while (start := text.find("/*", at)) != -1 and (end := text.find("*/", start + 2)) != -1:
+        kept += [text[at:start], "\n"]
+        at = end + 2
+    return "".join(kept) + text[at:]
 
 
 def _fenced_body(doc: dict[str, Any]) -> bool:
-    """报告的正文写在代码块里：文档里一句结论都没有，却有信息串为空 / markdown / md / text 的代码块，里面是成句的文字
-    （_prose_line）或者写着引用（[[m:…]] 这类标记，代码里不会这样写）。
+    """报告的正文写在代码块里：文档里一句结论都没有，却有写文字的代码块（_PROSE_FENCES），里面写着引用（片段里的
+    [[m:…]] 这类标记、句子上挂的 [[see:…]] 依据，代码里不会这样写）或者成句的文字（_prose_line）。
 
     报告节点只在整篇正好是一个代码块时去掉外层围栏（report._unfenced），围栏外有前言、只有开头没有收尾、信息串写成
     text 的原样交给 compose_doc：整段正文落在代码块里，切不出结论句，裁判没有句子可判、反方审稿记 no_claims，没挂依据
     的、证据相矛盾的结论句都数出 0 句，出具就成了完整出具。有一句结论的不算：正文没被整个藏起来，结论句照常核对。
-    信息串为空的代码块里也常是 SQL：看内容是不是成句，代码注释里的中文句子不算。"""
+    信息串为空的代码块里也常是 SQL、Python：看内容是不是成句，注释、字符串字面量里的中文句子不算；整块看得出是代码
+    （_CODE_LINE）的，以 * + - 开头的行是运算的续行，不当列表项。"""
     from app.engine.evidence import iter_units
 
     units = list(iter_units(doc))
     if any(unit.get("kind") == "claim" for _, unit in units):
         return False
     for block, unit in units:
-        if block.get("type") != "code" or str(block.get("lang") or "").lower() not in _PROSE_FENCES:
+        lang = str(block.get("lang") or "").lower()
+        if block.get("type") != "code" or lang not in _PROSE_FENCES:
             continue
         segments = [s for s in unit.get("segments") or [] if isinstance(s, dict)]
-        if any(s.get("ref") for s in segments):
+        if unit.get("see") or any(s.get("ref") for s in segments):
             return True
-        if any(_prose_line(line) for line in "".join(str(s.get("text") or "") for s in segments).split("\n")):
+        lines = _drop_block_comments("".join(str(s.get("text") or "") for s in segments)).split("\n")
+        lists = bool(lang) or not any(_CODE_LINE.match(line) for line in lines)
+        if any(_prose_line(line, lists=lists) for line in lines):
             return True
     return False
 

@@ -5,14 +5,17 @@ K5 让报告节点去掉整篇外层的 markdown 围栏（report._unfenced），
 照样完整出具，读的人以为结论都核对过。
 
 - 结论句策略为 judge 或 require_citation（报告节点的，或出具契约自己写的）、结论句 0 句、又有信息串为空 / markdown /
-  md / text 的代码块，里面是成句的文字或写着引用：记一条缺口，降档。缺口不带核查节点的前缀，界面上归在「校验未全部
-  完成」下（run/decode.ts 的 splitIssuanceGaps）
-- 行为不变：有正常结论句的；代码块是 sql、python 这类代码的（信息串为空、里面是代码的也算，代码注释里的中文句子不算）；
-  结论句策略为 off 的
+  md / text / plaintext / txt / plain 的代码块，里面是成句的文字（带句读的中文、成句的英文、不带句读的列表项）或写着
+  引用（片段里的引用、只挂依据的 [[see:]]）：记一条缺口，降档。缺口不带核查节点的前缀，界面上归在「校验未全部完成」
+  下（run/decode.ts 的 splitIssuanceGaps）
+- 行为不变：有正常结论句的；代码块是 sql、python 这类代码的（信息串为空、里面是代码的也算：注释、字符串里的中文标点
+  不算句子，SQL 以 * + - 开头的续行不算列表项）；结论句策略为 off 的
 
 模型一律是 MockChatModel 剧本，数据源是现造的 SQLite 文件，区域、金额都是虚构的。
 """
 from __future__ import annotations
+
+import time
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -42,8 +45,14 @@ from tests.test_report_fenced import (  # noqa: F401 - engine_up、shop 是夹�
 PREAMBLE = f"以下是本周的销售报告：\n\n{fenced(TEXT)}"
 UNCLOSED = f"```markdown\n{TEXT}"
 AS_TEXT = fenced(TEXT, "text")
+#: 只用 [[see:]] 挂依据的列表：依据记在句子上（unit 的 see），片段里没有引用；列表项也不带句读
+SEE_LIST = "## 本周结论\n\n- 华东销售额居各区域之首 [[see:Q1]]\n- 华南销售额超过华北 [[see:Q1]]"
+#: 不带句读、也没挂依据的列表：中文报告的列表项常这样写
+BARE_LIST = "## 本周结论\n\n- 华东销售额居各区域之首\n- 华南销售额超过华北"
 HIDDEN = [pytest.param(PREAMBLE, id="preamble"), pytest.param(UNCLOSED, id="unclosed"),
-          pytest.param(AS_TEXT, id="text")]
+          pytest.param(AS_TEXT, id="text"), pytest.param(fenced(TEXT, "plaintext"), id="plaintext"),
+          pytest.param(f"以下是本周周报：\n\n{fenced(SEE_LIST)}", id="see-only-list"),
+          pytest.param(f"以下是本周周报：\n\n{fenced(BARE_LIST)}", id="list-without-punctuation")]
 
 
 def doc_of(raw: str) -> dict:
@@ -62,8 +71,22 @@ def doc_of(raw: str) -> dict:
     pytest.param("```\n华东销售额 1500，居各区域之首。\n```", id="no-info"),
     pytest.param("```MD\n华东销售额 1500，居各区域之首。\n```", id="upper-md"),
     pytest.param("```markdown\nEast region sales rose sharply this week.\n```", id="english"),
+    pytest.param("```markdown\nEast region's sales rose sharply this week.\n```", id="english-apostrophe"),
+    # 正文里用半角引号括起一个词：去掉代码字符串的那一步不能把句子吃掉
+    pytest.param('```markdown\n华东的"销售额"居各区域之首，华南次之。\n```', id="quoted-word"),
+    # 纯文字的另几种写法
+    pytest.param("```plaintext\n华东销售额 1500，居各区域之首。\n```", id="plaintext"),
+    pytest.param("```txt\n华东销售额 1500，居各区域之首。\n```", id="txt"),
+    pytest.param("```Plain\n华东销售额 1500，居各区域之首。\n```", id="plain"),
     # 只有列表、没有句读，可写着报告的引用：代码里不会这样写
     pytest.param("以下是周报：\n\n```markdown\n- 华东销售额 [[m:gmv]]\n- 华南销售额 [[m:gmv_s]]\n```", id="markers"),
+    # 只挂了依据（[[see:]] 记在句子上，片段里没有引用），列表项短得不成句也认
+    pytest.param("以下是周报：\n\n```markdown\n- East [[see:m:gmv]]\n- South [[see:m:gmv]]\n```", id="see-only"),
+    # 不带句读的列表项：标记后面有两个以上汉字
+    pytest.param("以下是周报：\n\n```markdown\n## 本周结论\n\n- 华东销售额居各区域之首\n- 华南销售额超过华北\n```",
+                 id="bullets"),
+    pytest.param("```text\n1. 华东销售额居各区域之首\n2) 华南销售额超过华北\n```", id="numbered"),
+    pytest.param("```\n* 华东销售额居各区域之首\n+ 华南销售额超过华北\n• 华北销售额持平\n```", id="bare-bullets"),
 ])
 def test_a_report_body_in_a_prose_code_block_is_recognised(raw):
     doc = doc_of(raw)
@@ -81,6 +104,20 @@ def test_a_report_body_in_a_prose_code_block_is_recognised(raw):
     pytest.param("```\nSELECT region, SUM(amount) FROM orders GROUP BY region\n```", id="bare-sql"),
     pytest.param("```\n-- 按支付日统计，排除退款。\nSELECT SUM(amount) FROM orders\n```", id="sql-comment"),
     pytest.param("```\n/* 按支付日统计，排除退款。 */\nSELECT SUM(amount) FROM orders\n```", id="block-comment"),
+    pytest.param("```\n/*\n * 按支付日统计，排除退款。\n 已退款的单不计入：见口径说明。\n */\nSELECT SUM(amount) FROM orders\n```",
+                 id="multi-line-comment"),
+    # 行尾注释（-- // #）、# 开头的注释行，里面写着中文句子也是代码的一部分
+    pytest.param("```\nSELECT region, SUM(amount) AS gmv FROM orders GROUP BY region -- 按区域汇总，排除退款\n```",
+                 id="trailing-sql-comment"),
+    pytest.param("```\n# 按区域汇总，排除退款。\ntotal = sum(rows)  # 单位：元，不含税\n```", id="hash-comments"),
+    pytest.param("```\nconst total = sum(rows); // 按区域汇总，排除退款\n```", id="trailing-slash-comment"),
+    # 字符串字面量里的中文标点是数据（带 f、N 这类前缀的也是）
+    pytest.param('```\nprint("销售额：", total)\nprint(f"订单数：{n}，客单价：{avg}")\n```', id="string-literals"),
+    pytest.param("```\nSELECT * FROM orders WHERE note = '已退款，不计入：测试' OR memo = N'作废，重开'\n```",
+                 id="sql-strings"),
+    # 信息串为空、看得出是 SQL 的块：以 * + - 开头的是运算的续行，后面是中文列名也不是列表项
+    pytest.param("```\nSELECT 单价\n     * 数量 AS 金额\n     + 运费 AS 合计\n     - 折扣金额 AS 实付\nFROM 订单\n```",
+                 id="sql-continuation"),
     pytest.param("```text\n区域  销售额\n华东  1500\n华南  900\n```", id="table-of-numbers"),
     # 有正常的结论句：正文没被藏起来
     pytest.param("华东销售额超过华南。\n\n```markdown\n华东销售额 1500，居各区域之首。\n```", id="claims-outside"),
@@ -89,6 +126,17 @@ def test_a_report_body_in_a_prose_code_block_is_recognised(raw):
 ])
 def test_code_or_a_report_with_claims_is_not_taken_for_a_hidden_body(raw):
     assert _fenced_body(doc_of(raw)) is False
+
+
+def test_a_long_line_without_a_full_stop_takes_linear_time():
+    """很长、不带句末标点的一行英文单词：逐串数单词，耗时随行长线性增长。按正则回溯认英文句子时，四万多字的一行要十几
+    秒（行长翻倍、耗时翻四倍），出口复核在事件循环上同步执行，整个服务都会卡住。"""
+    line = "alpha beta " * 4000
+    doc = {"blocks": [{"type": "code", "lang": "", "units": [
+        {"kind": "code", "see": [], "segments": [{"kind": "text", "text": line}]}]}]}
+    started = time.perf_counter()
+    assert _fenced_body(doc) is False
+    assert time.perf_counter() - started < 1.0
 
 
 # --------------------------------------------------------------------------
@@ -172,6 +220,17 @@ async def test_require_citation_records_the_gap_too(monkeypatch, claims, contrac
     issuance = row.output["_issuance"]
     assert issuance["tier"] == "degraded" and issuance["gaps"] == [gap()], issuance
     assert issuance["claims"]["uncited_claims"] == 0
+
+
+async def test_sql_with_a_trailing_comment_is_issued_as_before(monkeypatch):
+    """一句结论都没有的报告（只有口径说明）贴了一段不带信息串的 SQL，行尾注释里写着中文句子：那是代码，不是藏起来的
+    正文，照常完整出具，不记这条缺口。"""
+    writer(monkeypatch, "## 口径说明\n\n本周报告按支付日期统计。\n\n```\n"
+                        "SELECT region, SUM(amount) AS gmv FROM orders GROUP BY region -- 按区域汇总，排除退款\n```")
+    row = await finish(weekly(claims="require_citation"))
+    assert row.status == "succeeded", row.error
+    issuance = row.output["_issuance"]
+    assert issuance["tier"] == "formal" and issuance["gaps"] == [], issuance
 
 
 async def test_without_a_claims_policy_nothing_changes(monkeypatch):

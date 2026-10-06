@@ -2280,6 +2280,17 @@ await section('核查类日志与出具缺口（期 4）：无法复算、未能
   check('……两路不一致（选了盲算、两边都不对、没作出选择）和被推翻的归「核查未通过」，无法复算的归「核查未完成」',
     served.failed.length === 4 && served.unfinished.length === 1 && served.unfinished[0].startsWith('双盲复算：指标「订单数」无法复算：')
     && served.other.length === 0, JSON.stringify(served))
+  // 出口契约自己报的「正文写在代码块里、结论句未能核对」（nodes/io.py 的 GAP_FENCED_BODY）不是核查节点报的：不带核查
+  // 节点的前缀，横幅归「校验未全部完成」、时间线归「校验不完整」。服务端改了说法、加了前缀，或者这边改了分组，这里先变红
+  const fencedGap = ioPy.match(/^GAP_FENCED_BODY = "([^"]+)"$/m)?.[1]?.replace('{title}', '写周报')
+  const fencedRow = flatten(mod.decodeRun([
+    E(1, 'node.started', 'done', { node_type: 'output', label: '成果' }),
+    E(2, 'issuance', 'done', { tier: 'degraded', missing_required: [], missing_expected: [], unmatched: 0, gaps: [fencedGap] }),
+    E(3, 'node.finished', 'done', { duration_ms: 5 }),
+  ])).find((s) => s.kind === 'issuance')
+  check('出口契约报的「正文写在代码块里」：读出了服务端的写法，归「校验不完整」，不进核查的两组', !!fencedGap
+    && JSON.stringify(mod.splitIssuanceGaps([fencedGap])) === JSON.stringify({ failed: [], unfinished: [], other: [fencedGap] })
+    && fencedRow?.title === `降档出具：校验不完整：${fencedGap}`, `${fencedGap} / ${fencedRow?.title}`)
 
   // dual_check_catalog 的 written 带了写进去的值（期 4）：时间线写「…记为「值」」，值的写法和审批卡上的「会记为「值」」
   // 同一个函数（catalogPatch 的 patchValueText），两处一字不差
