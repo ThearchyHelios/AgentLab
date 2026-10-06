@@ -9,6 +9,10 @@
 - 付款客户数（按支付日、排除退款）：按行计数 3，去重计数 2
 
 另有渠道（channel）和测试单标记（is_test，都是 0）两列：写数据目录的测试拿它们凑「指标自己的筛选范围」和标记列。
+
+下单日、支付日两列声明为 DATE（SQLite 照样存成文字，按字符串比的先后和按日期比的一样）：双盲复算只在两边的时间列都
+声明为带日期的类型时才把选择记成业务日期。build(date_type="TEXT") 建一份声明成文本的、build(date_type="") 建一份
+不写类型的，看不记的那几种。
 """
 from __future__ import annotations
 
@@ -50,11 +54,11 @@ BY_REGION = (f"SELECT region, SUM(amount) AS gmv FROM orders WHERE status <> 're
 DEFINITION = "已支付订单的金额合计：按支付日期（paid_date）归属到当周，不含退款"
 
 
-def build(path: Path) -> Path:
+def build(path: Path, *, date_type: str = "DATE") -> Path:
     db = sqlite3.connect(path)
     db.executescript(
         "CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT, customer_id INTEGER, amount REAL, status TEXT, "
-        "order_date TEXT, paid_date TEXT, channel TEXT, is_test INTEGER);")
+        f"order_date {date_type}, paid_date {date_type}, channel TEXT, is_test INTEGER);")
     db.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ROWS)
     db.commit()
     db.close()

@@ -2,8 +2,13 @@
 
 - 只差一个方面、又对得上目录事实时才写：两边按不同的时间列筛 → 业务日期，一边多一个排除无效记录的条件 → 有效记录
   条件，聚合只差去不去重、被采纳的一边去重 → 去重规则；按被采纳那一边的写法记
+- 业务日期只在两边的列都在表结构里声明为带日期的类型（DATE、DATETIME、TIMESTAMP，带精度、带时区的写法也算）时才写：
+  文本、整数（Unix 秒、20260901 这类日期键）、只有时刻的 TIME、表结构里查不到、没声明类型（SQLite 探出来是 NULL）的
+  不写，原因说清是哪一列、哪一边（未被采纳的那一边另说清为什么也要看它）；上传表格建的数据源说清日期是按文字保存的；
+  数据源还没有可用的表结构时说表结构不可用
 - 差了不止一处、有兜底说明、两条 SQL 规范化后一致、差在别的方面、被采纳的一边没有可记的写法、只有一边按时间筛：不写，
-  照实说原因
+  照实说原因。同一列上的时间范围不同、跨两张表的条件，差异说明只给兜底，同样不写；说明以后真把跨两张表的条件说成一条
+  筛选条件，derive 自己那道「只涉及一张表」的检查也拦得下
 - 指标自己的筛选范围（只看华东、只看线上）不是有效记录条件：取值出现在指标名称、口径说明、所在分组、运行输入里的，
   条件用到分组的列的，不是在排除退款、作废、测试这类无效记录的，都不写
 - 写的是人工填写、已确认，备注写明运行、节点、指标；同样的说法已确认过就不再写（不升版本），确认过的不同说法不覆盖；
@@ -22,6 +27,7 @@ import pytest
 from app.data import catalog
 from app.data.sql_semantics import explain_sql_diff
 from app.db.base import SessionLocal
+from app.db.models import DataSource
 from app.engine.dual_check_facts import derive, preview, record_choices
 from tests.fixtures.dual_check_shop import (
     BOTH_WRONG,
@@ -40,8 +46,8 @@ SCHEMA = {"tables": {
     "orders": {"name": "orders", "columns": [
         {"name": "id", "type": "INTEGER"}, {"name": "region", "type": "TEXT"},
         {"name": "customer_id", "type": "INTEGER"}, {"name": "amount", "type": "REAL"},
-        {"name": "status", "type": "TEXT"}, {"name": "order_date", "type": "TEXT"},
-        {"name": "paid_date", "type": "TEXT"}, {"name": "channel", "type": "TEXT"},
+        {"name": "status", "type": "TEXT"}, {"name": "order_date", "type": "DATE"},
+        {"name": "paid_date", "type": "DATE"}, {"name": "channel", "type": "TEXT"},
         {"name": "is_test", "type": "INTEGER"}], "primary_key": ["id"]},
     "customers": {"name": "customers", "columns": [
         {"name": "id", "type": "INTEGER"}, {"name": "level", "type": "TEXT"}, {"name": "status", "type": "TEXT"}],
@@ -169,13 +175,33 @@ def test_table_names_are_dropped_from_the_recorded_filter():
     assert why is None and fact.value == "status <> 'refunded'"
 
 
+#: 订单关联客户；盲算另多一个比较两张表的列的条件
+JOINED = (f"SELECT SUM(o.amount) AS gmv FROM orders o JOIN customers c ON o.customer_id = c.id "
+          f"WHERE o.paid_date {WEEK}")
+
+
 def test_a_condition_across_two_tables_is_not_recorded():
-    joined = (f"SELECT SUM(o.amount) AS gmv FROM orders o JOIN customers c ON o.customer_id = c.id "
-              f"WHERE o.paid_date {WEEK}")
-    picked = candidate(joined, f"{joined} AND o.status <> c.status", "b")
-    assert [i["aspect"] for i in picked["diff"]["items"]] == ["filter"]
+    """几张表交错的条件，差异说明只给兜底（归纳不成具体差异）：审核人选的是整体哪边对，不写。"""
+    picked = candidate(JOINED, f"{JOINED} AND o.status <> c.status", "b")
+    assert picked["diff"]["fallback"] is True and [i["aspect"] for i in picked["diff"]["items"]] == ["other"]
     fact, why = derive(picked, SCHEMA)
-    assert fact is None and "不是只涉及一张表的列" in why
+    assert fact is None and "未能归纳" in why and "销售额" in why
+
+
+def test_a_filter_spanning_two_tables_is_not_a_valid_filter():
+    """差异说明真把跨两张表的条件说成一条筛选条件（以后说明放宽了、或者别的来源交来的说明）：derive 自己也拦得下——
+    有效记录条件记在一张表名下，用到两张表的列的写进哪张都不对。差异说明直接构造：从 SQL 走现在只有兜底。"""
+    picked = candidate(JOINED, f"{JOINED} AND o.status <> c.status", "b")
+    picked["diff"] = {"equivalent": False, "fallback": False, "items": [{
+        "aspect": "filter", "a": None, "b": "o.status <> c.status",
+        "text": "盲算只保留 o.status <> c.status 的行，原流程没有这个条件",
+        "detail": {"columns": [{"table": "customers", "column": "status"}, {"table": "orders", "column": "status"}]},
+    }]}
+    fact, why = derive(picked, SCHEMA)
+    assert fact is None and "不是只涉及一张表的列" in why and "销售额" in why
+    # 同样的条件只涉及一张表时这道检查放行（后面照常看是不是在排除无效记录）：拦下它的确实是「两张表」
+    picked["diff"]["items"][0]["detail"] = {"columns": [{"table": "orders", "column": "status"}]}
+    assert "不是只涉及一张表的列" not in (derive(picked, SCHEMA)[1] or "")
 
 
 def test_counting_distinct_becomes_the_dedup_rule():
@@ -207,16 +233,153 @@ def test_equivalent_sql_or_fallback_or_other_aspects_are_not_recorded():
     assert [i["aspect"] for i in joined["diff"]["items"]] == ["aggregate"]
     assert "不只是去不去重" in derive(joined, SCHEMA)[1]
 
+    # 同一列上的时间范围不同：差异说明只给兜底（说不清差的是哪一段），不写
     ranged = candidate(RIGHT, RIGHT.replace("'2026-09-07'", "'2026-09-06'"), "b")
-    assert [i["aspect"] for i in ranged["diff"]["items"]] == ["time_range"]
-    assert "时间范围" in derive(ranged, SCHEMA)[1]
+    assert ranged["diff"]["fallback"] is True and [i["aspect"] for i in ranged["diff"]["items"]] == ["other"]
+    assert "未能归纳" in derive(ranged, SCHEMA)[1]
+
+    # 只差一个方面、可那个方面对不上目录里的三项（关联方式）：不写，原因说清差在哪
+    left = (f"SELECT SUM(o.amount) AS gmv FROM orders o LEFT JOIN customers c ON c.id = o.customer_id "
+            f"WHERE o.paid_date {WEEK}")
+    joins = candidate(left, left.replace("LEFT JOIN", "JOIN"), "b")
+    assert joins["diff"]["fallback"] is False and [i["aspect"] for i in joins["diff"]["items"]] == ["join"]
+    fact, why = derive(joins, SCHEMA)
+    assert fact is None and "两边差在关联" in why and "对不上数据目录里的业务日期、有效记录条件或去重规则" in why
 
     assert "没有采用任何一边" in derive({**candidate(BY_ORDER_DATE, RIGHT, "b"), "choice": "neither"}, SCHEMA)[1]
 
 
 def test_a_table_missing_from_the_schema_is_not_recorded():
-    fact, why = derive(candidate(BY_ORDER_DATE, RIGHT, "b"), {"tables": {"refunds": {"columns": []}}})
-    assert fact is None and "不在数据源的表结构里" in why
+    """认出了事实（排除退款的有效记录条件），表却不在数据源的表结构里：不写。"""
+    fact, why = derive(candidate(WITH_REFUNDS, RIGHT, "b"), {"tables": {"refunds": {"columns": []}}})
+    assert fact is None and "涉及的表「orders」不在数据源的表结构里" in why
+
+
+def schema_with(**types: str | None) -> dict:
+    """SCHEMA 的订单表里几列换成给定的声明类型；给 None 的列从表结构里拿掉。"""
+    orders = SCHEMA["tables"]["orders"]
+    columns = [{**c, "type": types[c["name"]]} if c["name"] in types else c
+               for c in orders["columns"] if not (c["name"] in types and types[c["name"]] is None)]
+    return {"tables": {**SCHEMA["tables"], "orders": {**orders, "columns": columns}}}
+
+
+@pytest.mark.parametrize("order_date, paid_date", [
+    ("DATE", "DATE"),
+    ("TIMESTAMP", "TIMESTAMP"),
+    ("datetime", "DateTime(6)"),
+    ("TIMESTAMPTZ", "timestamp(3) with time zone"),
+    ("TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP(6) WITH LOCAL TIME ZONE"),
+])
+def test_a_business_date_is_written_when_both_columns_are_declared_as_dates(order_date, paid_date):
+    """两边的列都在表结构里声明为带日期的类型（日期、日期时间、时间戳，带精度、带时区、大小写不同都认）：照常记被采纳的
+    那一列。"""
+    fact, why = derive(candidate(BY_ORDER_DATE, RIGHT, "b"), schema_with(order_date=order_date, paid_date=paid_date))
+    assert why is None and (fact.item, fact.value) == ("business_date", {"column": "paid_date"})
+
+
+#: 未被采纳的一边的列有问题时，说清为什么也要看它
+BOTH_DATES = "两边都是日期列时，审核人选的才是业务日期按哪一列"
+
+
+@pytest.mark.parametrize("types, column, said", [
+    # SQLite 常把日期存成文字：认不准存的是不是日期
+    ({"paid_date": "TEXT"}, "orders.paid_date", "在表结构里的类型是 TEXT，无法确认存的是日期"),
+    ({"paid_date": "VARCHAR(10)"}, "orders.paid_date", "在表结构里的类型是 VARCHAR(10)，无法确认存的是日期"),
+    # 没被采纳的一边也得是：它要是按 Unix 秒、20260901 这类整数筛的，审核人并没有在两个日期列之间选
+    ({"order_date": "INTEGER"}, "orders.order_date", "在表结构里的类型是 INTEGER，无法确认存的是日期"),
+    ({"order_date": "BIGINT"}, "orders.order_date", "在表结构里的类型是 BIGINT，无法确认存的是日期"),
+    # 名字里带着 date、time 的别的类型也不算
+    ({"paid_date": "DATE_KEY"}, "orders.paid_date", "在表结构里的类型是 DATE_KEY，无法确认存的是日期"),
+    ({"paid_date": "INTERVAL"}, "orders.paid_date", "在表结构里的类型是 INTERVAL，无法确认存的是日期"),
+    # 只有时刻的 TIME：一天里的几点几分（MySQL 里还常拿它存时长）不是日期，和 catalog.is_date_column 同一个口径
+    ({"paid_date": "TIME"}, "orders.paid_date", "在表结构里的类型是 TIME，只有时刻，不含日期"),
+    ({"order_date": "time with time zone"}, "orders.order_date",
+     "在表结构里的类型是 time with time zone，只有时刻，不含日期"),
+    ({"paid_date": "TIMETZ"}, "orders.paid_date", "在表结构里的类型是 TIMETZ，只有时刻，不含日期"),
+    ({"paid_date": "TIME(3)"}, "orders.paid_date", "在表结构里的类型是 TIME(3)，只有时刻，不含日期"),
+    ({"paid_date": ""}, "orders.paid_date", "在表结构里没有声明类型，无法确认存的是日期"),
+    # SQLite 里没写类型的列，SQLAlchemy 探出来是 NullType，表结构里记的是「NULL」：同样是没有声明类型
+    ({"paid_date": "NULL"}, "orders.paid_date", "在表结构里没有声明类型，无法确认存的是日期"),
+    ({"paid_date": None}, "orders.paid_date", "不在数据源的表结构里，无法确认存的是日期"),
+])
+def test_a_business_date_is_not_written_unless_both_columns_are_dates(types, column, said):
+    """任一边的列不是带日期的声明类型（文本、整数、只有时刻、查不到、没声明类型）：不写，原因说清是哪一列。被采纳的那一边
+    有问题说它；被采纳的一边没问题，就说未被采纳的那一边，另说清为什么也要看它。order_date 是原流程（a）的列，
+    paid_date 是盲算（b）的。"""
+    owner = "a" if column == "orders.order_date" else "b"
+    label = {"a": "原流程", "b": "盲算"}[owner]
+    for choice in ("a", "b"):
+        fact, why = derive(candidate(BY_ORDER_DATE, RIGHT, choice), schema_with(**types))
+        assert fact is None, (types, choice)
+        if choice == owner:
+            assert why == f"指标「销售额」被采纳的{label}按时间筛的列「{column}」{said}，不写入数据目录", why
+        else:
+            assert why == f"指标「销售额」未被采纳的{label}按时间筛的列「{column}」{said}：{BOTH_DATES}，不写入数据目录", why
+
+
+@pytest.mark.parametrize("schema", [None, {}, {"tables": {}}, {"tables": {}, "failed": True, "error": "timeout"}])
+def test_a_business_date_is_not_written_without_the_table_structure(schema):
+    """数据源还没有可用的表结构（还没探查、探查失败）：两列的类型无从确认，不写。原因说表结构不可用，不说这一列不在表结构
+    里——那时并不知道有没有这一列。"""
+    fact, why = derive(candidate(BY_ORDER_DATE, RIGHT, "b"), schema)
+    assert fact is None
+    assert why == ("指标「销售额」所在数据源还没有可用的表结构（尚未探查或探查失败），无法确认两边按时间筛的列存的是日期，"
+                   "不写入数据目录"), why
+
+
+def test_a_table_missing_from_an_available_table_structure_is_said_to_be_missing():
+    """表结构是有的，里面只是没有这张表：照实说这一列不在表结构里。"""
+    fact, why = derive(candidate(BY_ORDER_DATE, RIGHT, "b"), {"tables": {"customers": SCHEMA["tables"]["customers"]}})
+    assert fact is None
+    assert why == "指标「销售额」被采纳的盲算按时间筛的列「orders.paid_date」不在数据源的表结构里，无法确认存的是日期，不写入数据目录"
+
+
+def test_the_type_check_follows_the_names_in_the_table_structure():
+    """差异说明里的表名、列名是规范化过的（小写）：表结构里写成大写的照样认得出，类型照它声明的看。"""
+    upper = {"tables": {"ORDERS": {"name": "ORDERS", "columns": [
+        {"name": "STATUS", "type": "TEXT"}, {"name": "ORDER_DATE", "type": "DATE"}, {"name": "PAID_DATE", "type": "TEXT"},
+        {"name": "AMOUNT", "type": "REAL"}]}}}
+    fact, why = derive(candidate(BY_ORDER_DATE, RIGHT, "a"), upper)
+    assert fact is None and "「orders.paid_date」在表结构里的类型是 TEXT" in why
+
+
+def test_the_preview_follows_the_type_check():
+    """审批卡上的预告和真写同一套判断：一边的列是文本，选哪一边都预告不写（认不出事实，不带写到哪），原因同 derive。"""
+    schema = schema_with(paid_date="TEXT")
+    said = preview(candidate(BY_ORDER_DATE, RIGHT, "a"), schema, {})
+    for side in ("a", "b"):
+        assert said[side] == {"write": False, "reason": derive(candidate(BY_ORDER_DATE, RIGHT, side), schema)[1]}
+        assert "「orders.paid_date」在表结构里的类型是 TEXT" in said[side]["reason"]
+
+
+def test_an_uploaded_table_says_its_dates_are_stored_as_text():
+    """上传表格建的数据源（候选带 uploaded）：导入时日期一律按文字保存，表结构里的类型总是 TEXT。照样不写（认不准存的是
+    不是日期），可原因不说「类型是 TEXT」——那不是用户声明的，导入确认时这一列标的还是「日期」，表结构也改不了——说清
+    是上传的表格按文字保存日期。整数列照常说类型；不是上传的数据源，同样的文本列也照常说类型。"""
+    texts = schema_with(order_date="TEXT", paid_date="TEXT")
+    for choice, label, column in (("a", "原流程", "order_date"), ("b", "盲算", "paid_date")):
+        fact, why = derive({**candidate(BY_ORDER_DATE, RIGHT, choice), "uploaded": True}, texts)
+        assert fact is None and why == (f"指标「销售额」被采纳的{label}按时间筛的列「orders.{column}」来自上传的表格，"
+                                        "表格里的日期一律按文字保存，无法确认存的是日期，不写入数据目录"), why
+    fact, why = derive({**candidate(BY_ORDER_DATE, RIGHT, "b"), "uploaded": True}, schema_with(order_date="INTEGER"))
+    assert fact is None and "未被采纳的原流程按时间筛的列「orders.order_date」在表结构里的类型是 INTEGER" in why
+    assert "被采纳的盲算按时间筛的列「orders.paid_date」在表结构里的类型是 TEXT" in derive(
+        candidate(BY_ORDER_DATE, RIGHT, "b"), texts)[1]
+
+
+async def test_an_undeclared_column_read_from_a_real_database_is_said_to_have_no_type(tmp_path):
+    """真探查一个 SQLite 库（introspect 存的是 str(列的类型)）：没写类型的列记成「NULL」（SQLAlchemy 的 NullType），
+    说成没有声明类型，不说「类型是 NULL」。"""
+    name, source_id = await add_source(build(tmp_path / "untyped.db", date_type=""))
+    try:
+        async with SessionLocal() as session:
+            schema = (await session.get(DataSource, source_id)).schema_cache
+        assert {c["name"]: c["type"] for c in schema["tables"]["orders"]["columns"]}["paid_date"] == "NULL"
+        fact, why = derive(candidate(BY_ORDER_DATE, RIGHT, "b"), schema)
+        assert fact is None and why == ("指标「销售额」被采纳的盲算按时间筛的列「orders.paid_date」在表结构里没有声明类型，"
+                                        "无法确认存的是日期，不写入数据目录"), why
+    finally:
+        await drop_source(source_id)
 
 
 # --------------------------------------------------------------------------

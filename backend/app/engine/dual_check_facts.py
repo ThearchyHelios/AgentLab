@@ -4,7 +4,13 @@
 对得上的事实只有三种（data/catalog.py 的表级项）：
 
 - 两边按不同的时间列筛时间 → 业务日期（business_date）：被采纳的一边按哪一列筛，业务日期就记哪一列。只有一边按时间
-  筛的不算：审核人判断的是要不要限定时间，没在两列之间选过
+  筛的不算：审核人判断的是要不要限定时间，没在两列之间选过。两边的列都得在表结构里声明为带日期的类型（DATE、
+  DATETIME、TIMESTAMP、TIMESTAMPTZ，带精度、带时区的写法也算）：差异说明认时间列只看列名和常量像不像日期，
+  文本列（SQLite 常把日期存成文字）、整数列（Unix 秒、20260901 这类日期键）、名字带 time 的时长列都可能被说成「按它筛
+  时间」，认不准存的是不是日期，不记。只有时刻的 TIME 也不记：一天里的几点几分（MySQL 还常拿它存时长）不是日期，和
+  catalog.is_date_column（剖析和 SQL 检查共用的日期列判断）同一个口径——记成业务日期，SQL 检查会对按真实日期列统计的
+  查询一直报错误级。上传表格建的数据源，导入时日期一律按文字保存，这一条门槛下它们的业务日期都不由这里记（原因照实说
+  是上传的表格按文字保存，不说成用户声明了 TEXT）
 - 一边多一个排除无效记录的条件 → 有效记录条件（valid_filter）：被采纳的一边有这个条件才记，记的就是这个条件
 - 聚合只差去不去重、被采纳的一边去重 → 去重规则（dedup）。采纳了不去重的一边不记：那是这个指标自己的算法（数行），
   写成表的「不去重」会把别的指标带偏
@@ -55,6 +61,7 @@ from typing import Any
 from sqlalchemy import select
 
 from app.data import catalog
+from app.data.names import name_key
 from app.db.base import SessionLocal
 from app.db.models import DataSource
 
@@ -92,6 +99,14 @@ _MARKS_INVALID = _INVALID_WORDS | {"del", "removed", "hidden", "archived", "inte
 _MARKS_VALID = frozenset({"valid", "enabled", "active", "effective"})
 #: 取值和指标名称、口径说明比对时，数字至少这么长才比（0、1 这种标记值到处都是）
 _SCOPE_DIGITS = 2
+#: 表结构里声明的带日期的类型（业务日期只记这样的列）：DATE、DATETIME、TIMESTAMP、TIMESTAMPTZ，可以带精度
+#: （TIMESTAMP(3)、DATETIME(6)）、带时区（TIMESTAMP WITH TIME ZONE、Oracle 的 WITH LOCAL TIME ZONE），大小写不论。整个
+#: 类型名都得是这个样子：DATE_KEY、INTERVAL 这类名字里带着 date、time 的不算
+_DATED_TYPE = re.compile(r"(?:date|datetime|timestamp|timestamptz)(?:\s*\(\s*\d+\s*\))?"
+                         r"(?:\s+with(?:out)?\s+(?:local\s+)?time\s+zone)?", re.IGNORECASE)
+#: 只有时刻的类型（TIME、TIMETZ、TIME(3)、TIME WITH TIME ZONE）：不记，原因另说「只有时刻」
+_TIME_ONLY_TYPE = re.compile(r"(?:time|timetz)(?:\s*\(\s*\d+\s*\))?(?:\s+with(?:out)?\s+time\s+zone)?",
+                             re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -129,10 +144,11 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
     """一个候选（审核人在某个指标上选了 a 或 b）→ (要写的目录项, None) 或 (None, 为什么不写)。
 
     candidate：{metric 指标名, choice "a" | "b", source 数据源名, dialect, sql: {a, b}（比较的两条 SQL）, diff:
-    {equivalent, fallback, items: [FacetDiff.as_dict()]}, scope: {texts, columns}}。scope 是这个指标自己的范围：
-    texts 是口径说明、所在分组的取值、本次运行的输入（指标名称总算在内），columns 是分组的列；有效记录条件用它排除
-    指标自己的筛选范围。notes 是这个数据源的目录（{表名: notes}），认码值的意思用。只看差异说明，不重新比 SQL：审核人
-    看到的就是这份说明。
+    {equivalent, fallback, items: [FacetDiff.as_dict()]}, scope: {texts, columns}, uploaded}。scope 是这个指标自己的
+    范围：texts 是口径说明、所在分组的取值、本次运行的输入（指标名称总算在内），columns 是分组的列；有效记录条件用它
+    排除指标自己的筛选范围。uploaded 为真是上传表格建的数据源：业务日期不记时，文本列的原因照实说是上传的表格按文字
+    保存日期。schema_cache 是数据源的表结构：认表，业务日期还要看两边的列声明的类型。notes 是这个数据源的目录
+    （{表名: notes}），认码值的意思用。只看差异说明，不重新比 SQL：审核人看到的就是这份说明。
     """
     name = str(candidate.get("metric") or "")
     side = candidate.get("choice")
@@ -148,7 +164,7 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
     item = items[0]
     aspect = str(item.get("aspect") or "")
     if aspect == "time":
-        fact, why = _business_date(item, side)
+        fact, why = _business_date(item, side, schema_cache, uploaded=candidate.get("uploaded") is True)
     elif aspect == "filter":
         fact, why = _valid_filter(item, side, candidate, schema_cache, notes or {})
     elif aspect == "aggregate":
@@ -170,7 +186,12 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
                 metric_id=str(candidate.get("metric_id") or "")), None
 
 
-def _business_date(item: Mapping[str, Any], side: str) -> tuple[tuple[str, str, Any] | None, str | None]:
+def _business_date(item: Mapping[str, Any], side: str, schema_cache: Mapping[str, Any] | None, *,
+                   uploaded: bool = False) -> tuple[tuple[str, str, Any] | None, str | None]:
+    """两边按不同的列筛时间、被采纳的一边按哪一列：(表, business_date, {column}) 或 (None, 为什么不记)。两边的列都要在
+    表结构里声明为带日期的类型（_dated_problem），被采纳的一边先看：它有问题说它；没问题再看未被采纳的一边，另说清为什么
+    也要看它（审核人看到的是自己选的那一列，不说就看不懂另一列为什么要紧）。数据源还没有可用的表结构时（没探查、探查
+    失败）只说表结构不可用：那时并不知道有没有这一列，说「不在表结构里」是在误导。"""
     other = "b" if side == "a" else "a"
     detail = item.get("detail") if isinstance(item.get("detail"), Mapping) else {}
 
@@ -187,7 +208,49 @@ def _business_date(item: Mapping[str, Any], side: str) -> tuple[tuple[str, str, 
         return None, "有一边按好几列筛时间，无法确定业务日期按哪一列"
     if (mine[0]["table"], mine[0]["column"]) == (theirs[0]["table"], theirs[0]["column"]):
         return None, "两边按同一列筛时间，没有可记的业务日期"
+    tables = schema_cache.get("tables") if isinstance(schema_cache, Mapping) else None
+    if not isinstance(tables, Mapping) or not tables:
+        return None, "所在数据源还没有可用的表结构（尚未探查或探查失败），无法确认两边按时间筛的列存的是日期"
+    for adopted, ref in ((True, mine[0]), (False, theirs[0])):
+        if (problem := _dated_problem(tables, ref, uploaded)) is None:
+            continue
+        said = f"按时间筛的列「{ref['table']}.{ref['column']}」{problem}"
+        if adopted:
+            return None, f"被采纳的{SIDE_LABEL[side]}{said}"
+        return None, f"未被采纳的{SIDE_LABEL[other]}{said}：两边都是日期列时，审核人选的才是业务日期按哪一列"
     return (str(mine[0]["table"]), "business_date", {"column": str(mine[0]["column"])}), None
+
+
+def _dated_problem(tables: Mapping[str, Any], ref: Mapping[str, Any], uploaded: bool) -> str | None:
+    """按时间筛的这一列在表结构里是不是声明成了带日期的类型（_DATED_TYPE）：是的为 None，不是的交回它怎么了（查不到、没
+    声明类型、只有时刻、声明成了别的类型）连同结论，接在「按时间筛的列「表.列」」后面读。
+
+    表按 catalog.resolve_table_name 认，列先按原样、再按 name_key 认（差异说明里的名字是规范化过的，SQLite 不加引号的
+    名字一律小写）。按 name_key 认出好几列的说对应好几列：哪一列是它说不准。类型照表结构里记的说（「类型是」，不说
+    「声明为」）：introspect 记的是 SQLAlchemy 反射出来的类型，SQLite 里写成 TIMESTAMPTZ 的列反射出来是 NUMERIC；没写
+    类型的列反射出来是 NullType，记成「NULL」，按没有声明类型说。上传表格建的数据源（uploaded）日期一律存成文字，文字
+    类型不说「类型是 TEXT」：那不是用户声明的，导入确认时这一列标的还是「日期」，表结构也改不了。"""
+    found_table = catalog.resolve_table_name({"tables": tables}, str(ref["table"]))
+    meta = tables.get(found_table) if found_table is not None else None
+    columns = [c for c in meta.get("columns") or [] if isinstance(c, Mapping) and c.get("name")] \
+        if isinstance(meta, Mapping) else []
+    column = str(ref["column"])
+    found = [c for c in columns if str(c["name"]) == column] \
+        or [c for c in columns if name_key(str(c["name"])) == name_key(column)]
+    if not found:
+        return "不在数据源的表结构里，无法确认存的是日期"
+    if len(found) > 1:
+        return "在表结构里对应好几列，无法确认存的是日期"
+    declared = " ".join(str(found[0].get("type") or "").split())
+    if not declared or declared.upper() == "NULL":
+        return "在表结构里没有声明类型，无法确认存的是日期"
+    if _DATED_TYPE.fullmatch(declared):
+        return None
+    if _TIME_ONLY_TYPE.fullmatch(declared):
+        return f"在表结构里的类型是 {declared}，只有时刻，不含日期"
+    if uploaded and any(word in declared.upper() for word in catalog._TEXT_TYPES):
+        return "来自上传的表格，表格里的日期一律按文字保存，无法确认存的是日期"
+    return f"在表结构里的类型是 {declared}，无法确认存的是日期"
 
 
 def _valid_filter(item: Mapping[str, Any], side: str, candidate: Mapping[str, Any],

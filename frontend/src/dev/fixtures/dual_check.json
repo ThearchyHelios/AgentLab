@@ -565,33 +565,43 @@
     "daily_max_usd": 2.0
   },
   "variants": {
-    "time_range": {
+    "time_column": {
       "sql": [
-        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'",
-        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-09'"
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE created_at >= '2026-09-01'\n  AND created_at < '2026-09-08'",
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'"
       ],
       "diff": {
         "equivalent": false,
         "items": [
           {
-            "aspect": "time_range",
-            "text": "原流程的时间范围是 paid_at >= '2026-09-01' AND paid_at < '2026-09-08'，盲算是 paid_at >= '2026-09-01' AND paid_at < '2026-09-09'"
+            "aspect": "time",
+            "text": "原流程按 created_at 筛时间，盲算按 paid_at"
           }
         ],
         "fallback": false,
         "text_diff": [
-          "-   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'",
-          "+   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-09'"
+          "-   orders.created_at >= '2026-09-01' AND orders.created_at < '2026-09-08'",
+          "+   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'"
         ]
       },
       "catalog": {
         "a": {
-          "write": false,
-          "reason": "指标「销售额」两边差在时间范围，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "created_at"
+          }
         },
         "b": {
-          "write": false,
-          "reason": "指标「销售额」两边差在时间范围，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "paid_at"
+          }
         }
       }
     },
@@ -635,7 +645,7 @@
         "items": [
           {
             "aspect": "filter",
-            "text": "原流程排除了 status = 'test' 的行，盲算没有"
+            "text": "原流程排除了 status = 'test' 的行和 status 为空的行，盲算没有"
           }
         ],
         "fallback": false,
@@ -702,7 +712,7 @@
           },
           {
             "aspect": "filter",
-            "text": "原流程排除了 status = 'refunded' 的行，盲算没有"
+            "text": "原流程排除了 status = 'refunded' 的行和 status 为空的行，盲算没有"
           }
         ],
         "fallback": false,
@@ -786,6 +796,36 @@
         "b": {
           "write": false,
           "reason": "指标「销售额」被采纳的盲算没有去重：不去重是这个指标自己的算法，不是表的去重规则，不写入数据目录"
+        }
+      }
+    },
+    "fallback": {
+      "sql": [
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'",
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-09'"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "other",
+            "text": "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文"
+          }
+        ],
+        "fallback": true,
+        "text_diff": [
+          "-   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'",
+          "+   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-09'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
         }
       }
     },
@@ -903,7 +943,7 @@
         "items": [
           {
             "aspect": "filter",
-            "text": "原流程排除了 orders.status = 'cancelled' 的行，盲算没有"
+            "text": "原流程排除了 orders.status = 'cancelled' 的行和 orders.status 为空的行，盲算没有"
           }
         ],
         "fallback": false,
