@@ -7,6 +7,10 @@
 - 截断的那次调用花掉的用量从异常里取得到（额度是真花出去了）
 - BudgetFallback：先按大额度调，被嫌大时按小额度重来一次，之后的调用都用小的；流式、非流式都认；bind_tools、
   with_structured_output 包出来的和原来的共用同一个开关；只在还没吐出任何东西时重来；小额度的模型要退回时才建
+- 核查、证据裁判另认两种「额度被挡下」（budget_refused）：自建服务（text-generation-inference 一类）说的
+  max_new_tokens，和 anthropic SDK 在本地就拒的额度（请求没发出去）；助手改图的认法（budget_rejected）不变
+- 给了 key（接入、模型、大额度）的，被嫌大一次就记在进程里：之后新建的调用直接用小的，不再每次先撞一次；没给 key 的
+  （助手改图）不记也不查
 
 模型都是剧本，不碰真接口。
 """
@@ -18,15 +22,25 @@ from openai import LengthFinishReasonError
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletion
 
+from app.providers import budget
 from app.providers.budget import (
     BUDGET_WORDS,
     BudgetFallback,
+    budget_refused,
     budget_rejected,
     cut_off,
     cut_words,
     error_usage,
     truncated_error,
 )
+
+
+@pytest.fixture(autouse=True)
+def forget_rejections():
+    """被嫌大过的接入记在进程里：每个测试从没记过开始，也不留给后面的测试。"""
+    budget._REJECTED.clear()
+    yield
+    budget._REJECTED.clear()
 
 
 def length_error(prompt: int = 9000, completion: int = 16384) -> LengthFinishReasonError:
@@ -45,6 +59,12 @@ class Rejected(Exception):
 
 
 TOO_LARGE = "max_tokens: 16384 > 8192, which is the maximum allowed number of output tokens"
+#: text-generation-inference 的 OpenAI 兼容接口：输入加额度超过 max_total_tokens 时的 422（原话的样子）
+TGI_TOO_LARGE = ("Input validation error: `inputs` tokens + `max_new_tokens` must be <= 8192. "
+                 "Given: 1200 `inputs` tokens and 16384 `max_new_tokens`")
+#: anthropic SDK 在本地拒绝时的原话：没设超时的客户端非流式调用、额度超过这个模型不流式能给的上限
+SDK_REFUSED = ("Streaming is required for operations that may take longer than 10 minutes. See "
+               "https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/python#long-requests for more details")
 
 
 class Model:
@@ -122,6 +142,25 @@ def test_other_rejections_are_not_a_budget_problem():
     assert not budget_rejected(Rejected(TOO_LARGE, status_code=500)), "服务方自己出错不是嫌额度大"
     assert not budget_rejected(RuntimeError(TOO_LARGE)), "没有状态码的不认"
     assert "max_tokens" in BUDGET_WORDS
+
+
+def test_verify_and_judge_also_recognise_tgi_and_a_local_sdk_refusal():
+    """核查、证据裁判的额度从 4096 提到了 16384，才撞得上这两种：自建服务说的是 max_new_tokens；Bearer 鉴权的 Anthropic
+    接入（客户端没设超时）调 Opus 4、4.1 这一代时，SDK 嫌 16384 太大、请求没发出去就抛 ValueError。"""
+    assert budget_refused(Rejected(TGI_TOO_LARGE, status_code=422))
+    assert budget_refused(ValueError(SDK_REFUSED))
+    assert budget_refused(Rejected(TOO_LARGE)), "原来认的照样认"
+    assert not budget_refused(ValueError("别的本地错误"))
+    assert not budget_refused(RuntimeError(SDK_REFUSED)), "只认 SDK 抛的 ValueError"
+    assert not budget_refused(Rejected("model 'no-such-model' does not exist"))
+    assert not budget_refused(Rejected(TGI_TOO_LARGE, status_code=500))
+
+
+def test_the_copilot_wording_list_stays_as_it_was():
+    """助手改图按 budget_rejected 认（流式调用，SDK 不在本地拦）：认法不变，data/recipe_ai.py 的测试拿 BUDGET_WORDS 比对。"""
+    assert BUDGET_WORDS == ("max_tokens", "max_completion_tokens", "max_output_tokens", "maximum context length")
+    assert not budget_rejected(Rejected(TGI_TOO_LARGE, status_code=422))
+    assert not budget_rejected(ValueError(SDK_REFUSED))
 
 
 def test_the_tokens_spent_by_a_cut_off_call_come_from_the_error():
@@ -242,3 +281,64 @@ async def test_without_limits_max_tokens_reads_the_current_model():
     assert model.max_tokens == 32768
     await model.ainvoke(["问"])
     assert model.max_tokens == 8192
+
+
+async def test_a_wider_check_can_be_given():
+    """核查、证据裁判按 budget_refused 认：服务方说的是 max_new_tokens 也退回小额度。缺省（助手改图）不认。"""
+    tgi = Rejected(TGI_TOO_LARGE, status_code=422)
+    model = BudgetFallback(Model("big", fail=tgi), Model("small"), rejected=budget_refused)
+    assert (await model.ainvoke(["问"])).content == "small"
+    with pytest.raises(Rejected):
+        await BudgetFallback(Model("big", fail=tgi), Model("small")).ainvoke(["问"])
+    local = BudgetFallback(Model("big", fail=ValueError(SDK_REFUSED)), Model("small"), rejected=budget_refused)
+    structured = local.with_structured_output({"type": "object"})
+    assert (await structured.ainvoke(["交结果"])).content == "small", "包出来的视图照样按这个认"
+
+
+async def test_a_rejection_is_remembered_for_later_calls_to_the_same_model():
+    """双盲复算的几路盲算、反方审稿的每一句、每次质询、每次点击裁判，各是一组新建的调用：同一接入、模型、额度被嫌大
+    过一次，之后新建的直接用小的，不再先撞一次。别的模型、别的额度照旧先按大的试。"""
+    built: list[str] = []
+
+    def builder(name: str):
+        async def build():
+            built.append(name)
+            return Model(name)
+        return build
+
+    key = ("gw", "reasoner-x", 16384)
+    first = BudgetFallback(Model("big", fail=Rejected(TOO_LARGE)), build=builder("small-1"), limits=(16384, 4096),
+                           key=key)
+    assert first.max_tokens == 16384
+    assert (await first.ainvoke(["问"])).content == "small-1"
+    later_big = Model("big", fail=Rejected(TOO_LARGE))
+    later = BudgetFallback(later_big, build=builder("small-2"), limits=(16384, 4096), key=key)
+    assert later.max_tokens == 4096, "还没调用就知道要用小的：截断时报的额度对得上"
+    assert (await later.bind_tools(["db_query"]).ainvoke(["再问"])).content == "small-2"
+    assert later_big.calls == [], "不再先按大额度撞一次"
+    other = Model("other-big")
+    assert (await BudgetFallback(other, build=builder("x"), key=("gw", "other", 16384)).ainvoke(["问"])).content \
+        == "other-big"
+    bigger = Model("bigger")
+    assert (await BudgetFallback(bigger, build=builder("y"), key=("gw", "reasoner-x", 32768)).ainvoke(["问"])).content \
+        == "bigger"
+    assert built == ["small-1", "small-2"]
+
+
+async def test_without_a_key_nothing_is_remembered():
+    """助手改图不给 key：每次改图照旧先按大额度试（行为和挪过来之前一样）。"""
+    await BudgetFallback(Model("big", fail=Rejected(TOO_LARGE)), Model("small")).ainvoke(["问"])
+    assert budget._REJECTED == set()
+    fresh = Model("big")
+    assert (await BudgetFallback(fresh, Model("small")).ainvoke(["问"])).content == "big"
+
+
+async def test_a_streaming_rejection_is_remembered_too():
+    key = ("gw", "streamer", 16384)
+    big = Model("big", fail=Rejected(TOO_LARGE), stream=[])
+    model = BudgetFallback(big, Model("small", stream=[AIMessageChunk(content="a")]), key=key)
+    assert [c.content async for c in model.astream(["问"])] == ["a"]
+    again = Model("big", stream=[AIMessageChunk(content="b")])
+    assert [c.content async for c in BudgetFallback(again, Model("small", stream=[AIMessageChunk(content="c")]),
+                                                    key=key).astream(["问"])] == ["c"]
+    assert again.calls == []
