@@ -9,13 +9,18 @@
   日期时间按文档记下的显示规则版本；服务端渲染不出来的，浏览器也不给出一个字。本页没有移植的写法（对象、列表、非 ASCII
   数字）一律渲染不出来，判无法核对，不会给出一串不一样的字；
 - 整份核对（verify）：compose_doc 真实组装的报告原样通过；只改一个数字或取值的显示文字、重算全部哈希的伪造页，
-  ①–④ 照样对得上，⑤ 里那一项不通过，原因点名「正文显示「X」，引用的值是「Y」」；认不出的换算判无法核对，不判通过。
+  ①–④ 照样对得上，⑤ 里那一项不通过，原因点名「正文显示「X」，引用的值是「Y」」；认不出的换算判无法核对，不判通过；
+- 口径卡单位前后带空白（「元 」，服务端照原样接）：两边都只去首尾空白，原样导出照样通过；运行输入照旧无法核对，显示
+  文字拿引用的值核对，只改显示文字的不通过；出处面板里数字文本照原文写；
+- 正文的排法：核对通过的字要原样显示——伪造的链接藏不起它（整句按原文显示），正文里不显示的判不通过，紧挨着补数字、
+  负号、方向控制字符的判无法核对，区间、日期这类真报告里的写法照常通过。
 
 数据全是虚构的。
 """
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import random
@@ -66,8 +71,11 @@ async function main() {
   return {
     events: results(out.events), manifest: results(out.manifest), artifacts: results(out.artifacts),
     chain: results(out.chain), meta: results(out.meta),
+    // shownOk：显示文字核对过、对上了；truthText：出处面板「快照里的值」写的字（数字文本照原文）；onPage：正文里这处
+    // 可点的数字上读的人看到的字（没有显示成可点的数字是 null）
     numbers: out.numbers.map((n) => ({ key: n.key, ref: n.seg.ref ?? null, text: String(n.seg.text ?? ''),
-      result: n.result, reason: n.reason || '', expected: n.expected ?? null })),
+      result: n.result, reason: n.reason || '', expected: n.expected ?? null, shownOk: !!n.shownOk,
+      truthText: n.truthText ?? null, onPage: n.onPage ?? null })),
   }
 }
 main().then((r) => process.stdout.write(JSON.stringify(r)), (e) => {
@@ -99,7 +107,8 @@ NUMBERS: list[Any] = [
 FORMATS = [None, "thousands", "plain", "percent_of_ratio", "bogus"]
 DECIMALS = ["null", "0", "1", "2", "4", "-2", "6", "100", "101", "-101", "true", "2.0", "\"2\""]
 CONVS = [None, "", "万", "亿", "pct", "int", ".0", ".3", ".6", ".7", "千", "PCT"]
-UNITS = ["", "元", "美元", "%", "％", "人次"]
+#: 单位照口径卡上写的原样接在后面：前后带空白（含全角空格）的也照接，服务端不去空白
+UNITS = ["", "元", "美元", "%", "％", "人次", "元 ", "元\u3000", " 元"]
 
 
 def py_number(value: Any, unit: str, decimals: Any, fmt: Any, conv: Any) -> str | None:
@@ -250,12 +259,12 @@ def reseal(bundle: dict[str, Any], art: dict[str, Any], doc: dict[str, Any]) -> 
     return bundle
 
 
-def forged(ref: str, text: str, **cite: Any) -> dict[str, Any]:
-    """经营月报样本里一个片段的显示文字改成 text（cite.value 不动，cite.rendered 跟着改，cite 另改 cite 里给的几项），
-    重算全部哈希。"""
+def forged(ref: str, text: str, bundle: dict[str, Any] | None = None, **cite: Any) -> dict[str, Any]:
+    """经营月报样本（或给的 bundle）里一个片段的显示文字改成 text（cite.value 不动，cite.rendered 跟着改，cite 另改
+    cite 里给的几项），重算全部哈希。"""
     from tests.bundle_samples import formats_bundle
 
-    bundle = formats_bundle()
+    bundle = bundle or formats_bundle()
     art, doc = doc_of(bundle)
     seg = segment(doc, ref)
     seg["text"] = text
@@ -263,8 +272,23 @@ def forged(ref: str, text: str, **cite: Any) -> dict[str, Any]:
     return reseal(bundle, art, doc)
 
 
+def rewritten(bundle: dict[str, Any], change: Any) -> dict[str, Any]:
+    """change(文档) 就地改报告文档，再重算全部哈希（同 reseal）。"""
+    art, doc = doc_of(bundle)
+    change(doc)
+    return reseal(bundle, art, doc)
+
+
+def by_id(doc: dict[str, Any], seg_id: str) -> dict[str, Any]:
+    return next(s for b in doc["blocks"] for u in b["units"] for s in u["segments"] if s.get("id") == seg_id)
+
+
 def verdicts(bundle: dict[str, Any]) -> dict[str, Any]:
     return node("verify", data=bundle, seal=bundle["meta"]["manifest_hash"])
+
+
+def item(got: dict[str, Any], ref: str) -> dict[str, Any]:
+    return next(n for n in got["numbers"] if n["ref"] == ref)
 
 
 def test_every_format_in_the_monthly_sample_passes_as_exported():
@@ -366,8 +390,9 @@ def test_a_browser_without_bigint_cannot_check_numbers_but_still_checks_the_rest
     assert all(r == "pass" for key in ("events", "manifest", "artifacts", "chain", "meta") for r in got[key])
     texts = {"v:Q1.r0.region", "v:Q1.r1.region", "v:Q1.r0.paid_at"}
     assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"] in texts)
-    assert all(n["result"] == "na" and n["reason"] == "无法核对显示文字：这个浏览器不支持按系统的显示规则重新渲染（缺少 BigInt 或 "
-               "Unicode 正则）" for n in got["numbers"] if n["ref"] not in texts)
+    # 原因写给读报告的人：说清该怎么办，不提 BigInt、正则这类实现细节
+    assert all(n["result"] == "na" and n["reason"] == "无法核对显示文字：这个浏览器版本较旧，请用新版浏览器打开本文件"
+               for n in got["numbers"] if n["ref"] not in texts)
 
 
 def test_every_sample_page_still_passes_its_display_check():
@@ -379,3 +404,258 @@ def test_every_sample_page_still_passes_its_display_check():
         got = verdicts(bundle)
         assert not [n for n in got["numbers"] if n["reason"].startswith(("正文显示", "无法核对显示文字"))], name
         assert all(n["expected"] == n["text"] for n in got["numbers"] if n["result"] == "pass"), name
+
+
+# --------------------------------------------------------------------------
+# 单位前后带空白：服务端照原样接在数后面，只去首尾空白时两边一样去
+# --------------------------------------------------------------------------
+
+
+def card_with_unit(unit: str) -> dict[str, Any]:
+    """经营月报的口径卡，销售额的单位换成 unit。"""
+    from tests.bundle_samples import FORMATS_CARD
+
+    card = copy.deepcopy(FORMATS_CARD)
+    card["metrics"][0]["unit"] = unit
+    return card
+
+
+@pytest.mark.parametrize("unit", ["元 ", "元\u3000", " 元", "元 \u3000"])
+def test_a_unit_with_surrounding_blanks_passes_as_exported(unit):
+    """单位输入框不去空白，指标节点照存：服务端把「元 」原样接在数后面，正文显示「74,613.65元 」。只去掉首尾空白时
+    两边一样去：原样导出的销售额和换算成万的那处都通过，不会被说成文件被改过。"""
+    from tests.bundle_samples import formats_bundle
+
+    got = verdicts(formats_bundle(card=card_with_unit(unit)))
+    for ref in ("m:gmv", "m:gmv|万"):
+        hit = item(got, ref)
+        assert hit["result"] == "pass" and hit["shownOk"] and hit["expected"] == hit["text"], hit
+    assert all(n["result"] == "pass" for n in got["numbers"]), [n for n in got["numbers"] if n["result"] != "pass"]
+
+
+@pytest.mark.parametrize("unit", ["元 ", "元\u3000"])
+@pytest.mark.parametrize("ref, digits", [("m:gmv", "84,613.65"), ("m:gmv|万", "8.46万")])
+def test_a_unit_with_trailing_blanks_still_catches_a_changed_digit(unit, ref, digits):
+    """单位带尾随空白时，改了一位数字照样不通过，原因点名改过的字。"""
+    from tests.bundle_samples import formats_bundle
+
+    text = f"{digits}{unit}"
+    hit = item(verdicts(forged(ref, text, formats_bundle(card=card_with_unit(unit)))), ref)
+    assert hit["result"] == "fail" and hit["reason"].startswith(f"正文显示「{text}」，引用的值是「74613.65」"), hit
+
+
+# --------------------------------------------------------------------------
+# 运行输入：输入本身不随文件附带，显示文字照样拿引用的值核对
+# --------------------------------------------------------------------------
+
+INPUTS = {"week_start": "2026-09-01", "target": 50000, "region": "华南", "rate": 0.125, "reviewed": True}
+INPUT_TEXT = ("## 周报\n\n统计周期自 [[i:week_start]] 起，目标 [[i:target]]（约 [[i:target|万]]），重点地区 [[i:region]]，"
+              "达成率 [[i:rate|pct]]，已复核：[[i:reviewed]]。")
+
+
+def test_input_citations_check_their_shown_text():
+    """运行输入不随文件附带，引用的值核对不了（照旧无法核对，原因不变）；正文显示的字照样拿引用的值按服务端的写法
+    （不分组、不接单位，可带换算）重新渲染比对：原样导出时对得上，出处面板注明一致。"""
+    from tests.bundle_samples import formats_bundle
+
+    got = verdicts(formats_bundle(text=INPUT_TEXT, inputs=INPUTS))
+    inputs = [n for n in got["numbers"] if n["ref"].startswith("i:")]
+    assert {n["ref"]: n["text"] for n in inputs} == {
+        "i:week_start": "2026-09-01", "i:target": "50000", "i:target|万": "5万", "i:region": "华南",
+        "i:rate|pct": "12.5%", "i:reviewed": "是"}
+    assert all(n["result"] == "na" and n["reason"] == "引用的是运行输入，运行输入未随文件附带" and n["shownOk"]
+               for n in inputs), inputs
+
+
+@pytest.mark.parametrize("ref, text, cited, expected", [
+    ("i:week_start", "2026-09-08", "2026-09-01", None),          # 改了统计周期（文字取值）
+    ("i:region", "华东", "华南", None),
+    ("i:target", "60000", "50000", None),
+    ("i:target|万", "6万", "50000", "5万"),
+    ("i:rate|pct", "21.5%", "0.125", "12.5%"),
+])
+def test_changing_only_the_shown_text_of_an_input_fails(ref, text, cited, expected):
+    """只改运行输入的显示文字（引用的值不动）、重算全部哈希：不通过，原因点名正文显示的字和引用的值。"""
+    from tests.bundle_samples import formats_bundle
+
+    hit = item(verdicts(forged(ref, text, formats_bundle(text=INPUT_TEXT, inputs=INPUTS))), ref)
+    assert hit["result"] == "fail" and hit["reason"].startswith(f"正文显示「{text}」，引用的值是「{cited}」"), hit
+    if expected:
+        assert hit["reason"].endswith(f"，按显示规则应显示为「{expected}」"), hit
+
+
+# --------------------------------------------------------------------------
+# 出处面板：落成数字文本的值照原文写
+# --------------------------------------------------------------------------
+
+
+def test_numeric_text_cells_show_their_own_digits_in_the_panel():
+    """DECIMAL(20,0) 落成数字文本的订单号：按数比对时读成 double 会丢位，出处面板「快照里的值」照快照的原文写，
+    和「引用的值」一位不差；45678.50 这类也照原文写。"""
+    from tests.bundle_samples import LEDGER, formats_bundle
+
+    table = copy.deepcopy(LEDGER)
+    table["rows"][0][2] = "202609071234567891"
+    got = verdicts(formats_bundle(table=table))
+    order = item(got, "v:Q1.r0.order_no")
+    assert order["result"] == "pass" and order["text"] == "202,609,071,234,567,891", order
+    assert order["truthText"] == "202609071234567891", order
+    assert item(got, "v:Q1.r0.gmv")["truthText"] == "45678.50"
+    # 不是数字文本的格子不另写原文：照旧按值写
+    assert item(got, "v:Q1.r1.gmv")["truthText"] is None and item(got, "v:Q1.r0.region")["truthText"] is None
+
+
+# --------------------------------------------------------------------------
+# 正文的排法：核对通过的字要原样显示，旁边的字不能把它改读成别的数
+# --------------------------------------------------------------------------
+
+
+def test_every_checked_value_is_shown_on_the_page_as_checked():
+    """原样导出：每个数字和取值都显示成可点的数字，读的人看到的字就是核对过的字。"""
+    from tests.bundle_samples import formats_bundle
+
+    got = verdicts(formats_bundle())
+    assert all(n["onPage"] == n["text"] for n in got["numbers"]), [n for n in got["numbers"] if n["onPage"] != n["text"]]
+
+
+def test_inline_markup_cannot_hide_a_checked_value():
+    """伪造的链接把核对通过的数字、取值塞进链接地址（链接只显示文字、不显示地址），链接文字写成别的数：这一句改按
+    未排版的原文显示，核对过的字一个不少地露出来，读的人看得到两个数。"""
+    from tests.bundle_samples import formats_bundle
+
+    def change(doc: dict[str, Any]) -> None:
+        by_id(doc, "s3")["text"] += "[84,613.65元](x "          # 本月销售额 [84,613.65元](x 74,613.65元)（约 …
+        by_id(doc, "s5")["text"] = ")" + by_id(doc, "s5")["text"]
+        by_id(doc, "s36")["text"] += "[华南](x "                 # ），[华南](x 华东)冲减 …
+        by_id(doc, "s38")["text"] = ")" + by_id(doc, "s38")["text"]
+
+    got = verdicts(rewritten(formats_bundle(), change))
+    for ref, text in (("m:gmv", "74,613.65元"), ("v:Q1.r1.region", "华东")):
+        hit = item(got, ref)
+        assert hit["result"] == "pass" and hit["onPage"] == text, hit
+
+
+GLUED = "无法核对显示文字：紧挨着的正文里还有数字或负号，读起来和核对过的不是同一个值"
+
+
+def _glue_before(seg_id: str, extra: str, after: str = ""):
+    def change(doc: dict[str, Any]) -> None:
+        by_id(doc, seg_id)["text"] += extra
+        if after:
+            nxt = by_id(doc, f"s{int(seg_id[1:]) + 2}")
+            nxt["text"] = after + nxt["text"]
+    return change
+
+
+def _glue_after(seg_id: str, extra: str):
+    def change(doc: dict[str, Any]) -> None:
+        by_id(doc, seg_id)["text"] = extra + by_id(doc, seg_id)["text"]
+    return change
+
+
+@pytest.mark.parametrize("ref, change", [
+    ("m:gmv", _glue_before("s3", "1")),                      # 前面多一位：174,613.65元
+    ("m:gmv", _glue_before("s3", "1\u200b")),               # 隔着看不见的零宽空格
+    ("m:gmv", _glue_before("s3", "1**", after="**")),        # 隔着排版时藏起来的粗体标记
+    ("m:gmv", _glue_before("s3", chr(0x1D7F7))),             # 数学字母区的数字 1（占两个 UTF-16 单元）
+    ("v:Q1.r0.gmv", _glue_after("s34", "0")),                # 后面多一位：45,678.50
+    ("v:Q1.r0.gmv", _glue_after("s34", ".5")),               # 后面接小数：45,678.5.5
+    ("m:conv_rate", _glue_before("s12", "-")),               # 前面加负号：-2.35%
+    ("m:conv_rate", _glue_before("s12", "\uff0d")),         # 全角负号
+    ("m:refund", _glue_before("s9", "-")),                   # 负数前面再加负号：--3,120.50元
+    ("v:Q1.r0.paid_at", _glue_after("s45", "5")),            # 取值以数字结尾：2026-09-07 08:21:395
+])
+def test_digits_glued_to_a_checked_value_cannot_pass(ref, change):
+    """伪造者在相邻的文字片段里补一位数、一个负号（隔着零宽空格、藏起来的粗体标记也算紧挨着）：显示出来的数不止
+    核对过的这几位，这一项判无法核对、写明原因；别的照常通过。"""
+    from tests.bundle_samples import formats_bundle
+
+    got = verdicts(rewritten(formats_bundle(), change))
+    hit = item(got, ref)
+    assert hit["result"] == "na" and hit["reason"] == GLUED and hit["shownOk"], hit
+    assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"] != ref)
+
+
+def test_direction_controls_next_to_checked_values_cannot_pass():
+    """文字方向控制字符（从右往左覆盖）能把后面的一位数挪到数字前面显示，按字的先后看不出紧挨着：同一句里出现在
+    别的片段里，这一句的数字、取值判无法核对；别的段照常通过。"""
+    from tests.bundle_samples import formats_bundle
+
+    def change(doc: dict[str, Any]) -> None:
+        by_id(doc, "s5")["text"] = chr(0x202E) + by_id(doc, "s5")["text"]
+
+    got = verdicts(rewritten(formats_bundle(), change))
+    first = {"m:gmv", "m:gmv|万", "m:annual|亿", "m:refund", "m:conv_rate", "m:growth", "m:orders", "m:avg",
+             "m:avg|.3", "m:avg|int", "m:share|pct", "m:export"}
+    for n in got["numbers"]:
+        if n["ref"] in first:
+            assert n["result"] == "na" and n["reason"] == ("无法核对显示文字：这一句里有改变文字方向的控制字符，"
+                                                           "显示出来的顺序可能和核对过的不一样"), n
+        else:
+            assert n["result"] == "pass", n
+
+
+def test_ranges_dates_and_signs_written_by_the_system_still_pass():
+    """真报告里常见的写法不算紧挨着：两个数之间的连字符（区间）、日期和数字之间隔着字或空白、负数自己的负号。"""
+    from tests.bundle_samples import formats_bundle
+
+    text = ("## 区间\n\n销售额区间 [[m:gmv]]-[[m:export]]，流水区间 [[v:Q1.r0.gmv]]-[[v:Q1.r1.gmv]]。"
+            "截至2026年9月[[m:orders]]，2026-09-07 当天客单价 [[m:avg]]，环比 [[m:growth]]。")
+    got = verdicts(formats_bundle(text=text))
+    assert len(got["numbers"]) == 7
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), got["numbers"]
+
+
+NOT_SHOWN = "正文里没有显示这一处：导出时不会出现这种情况，文件可能被改过"
+
+
+def test_a_checked_value_in_a_block_the_page_does_not_show_fails():
+    """分隔线不显示句子：把一段改成分隔线，这一段里核对通过的数字、取值读的人都看不到（伪造的字可以写在别处），
+    服务端导出时不会出现，判不通过；别的段照常通过。"""
+    from tests.bundle_samples import formats_bundle
+
+    def change(doc: dict[str, Any]) -> None:
+        doc["blocks"][2]["type"] = "hr"
+
+    got = verdicts(rewritten(formats_bundle(), change))
+    second = {"v:Q1.r0.region", "v:Q1.r0.gmv", "v:Q1.r0.gmv|万", "v:Q1.r1.region", "v:Q1.r1.gmv",
+              "v:Q1.r0.order_no", "v:Q1.r0.paid_at"}
+    for n in got["numbers"]:
+        if n["ref"] in second:
+            assert n["result"] == "fail" and n["reason"] == NOT_SHOWN and n["onPage"] is None, n
+        else:
+            assert n["result"] == "pass" and n["onPage"] == n["text"], n
+
+
+def test_a_table_cell_outside_the_rows_and_columns_fails():
+    """表格只显示表头和各行各列上的格：把一格的位置改成第 1.5 列，读的人看不到它，判不通过。原样导出时表格里每一格都
+    显示成可点的数字。"""
+    from tests.bundle_samples import FORMATS, formats_bundle
+
+    bundle = formats_bundle(text=FORMATS + "\n\n[[table:Q1 cols=region,gmv rows=0-1]]")
+    got = verdicts(bundle)
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"])
+    moved: list[str] = []
+
+    def change(doc: dict[str, Any]) -> None:
+        table = next(b for b in doc["blocks"] if b["type"] == "table")
+        unit = next(u for u in table["units"] if u.get("loc") == {"row": 1, "col": 1})
+        unit["loc"] = {"row": 1, "col": 1.5}
+        moved.extend(f"write|{s['id']}" for s in unit["segments"] if s["kind"] in ("number", "value"))
+
+    got = verdicts(rewritten(bundle, change))
+    assert len(moved) == 1
+    for n in got["numbers"]:
+        if n["key"] in moved:
+            assert n["result"] == "fail" and n["reason"] == NOT_SHOWN, n
+        else:
+            assert n["result"] == "pass", n
+
+
+def test_reasons_for_readers_do_not_name_implementation_details():
+    """核对页是发给业务读者的文件：「无法核对显示文字」的原因说清是什么情况、该怎么办，不提 BigInt、正则、ASCII。"""
+    source = VERIFIER.read_text(encoding="utf-8")
+    start = source.index("const T = {")
+    block = source[start:source.index("\n  }\n", start)]
+    for word in ("BigInt", "Unicode", "ASCII", "正则", "重新渲染时出错"):
+        assert word not in block, word

@@ -27,6 +27,8 @@
   小数位与 |.N / |int、pct；流水快照里的文字取值（地区）、DECIMAL 落成的数字文本、负数、换算成万、超过 2^53 的订单号、
   ISO 日期时间（文档记下 2 版显示规则）。check-bundle 在它上面只改显示文字做伪造，tests/test_bundle_shown.py 在 node 里
   逐个格式核一遍
+- formats-unit：同经营月报，销售额的单位带尾随空白（「元 」：单位输入框不去空白，指标节点照存），正文显示「74,613.65元 」，
+  原样导出照样全部通过
 """
 from __future__ import annotations
 
@@ -79,6 +81,9 @@ FORMATS_CARD = {"kind": "metric_set", "caliber": "经营月报口径", "caliber_
     {"id": "share", "name": "线上占比", "value": 0.346, "unit": "", "decimals": None, "format": "thousands"},
     {"id": "export", "name": "出口额", "value": 15230.4, "unit": "美元", "decimals": 1, "format": "thousands"},
 ]}
+#: 同上，销售额的单位带尾随空白：服务端照原样接在数后面
+FORMATS_UNIT_CARD = {**FORMATS_CARD, "metrics": [{**FORMATS_CARD["metrics"][0], "unit": "元 "},
+                                                 *FORMATS_CARD["metrics"][1:]]}
 #: 经营流水：地区是文字，金额一格是 DECIMAL 落成的数字文本、一格是负数，订单号超过 2^53，付款时间是 ISO 日期时间
 LEDGER = {"columns": ["region", "gmv", "order_no", "paid_at"],
           "column_types": {"region": "text", "gmv": "number", "order_no": "number", "paid_at": "datetime"},
@@ -123,10 +128,12 @@ def masked_card(crm_id: str) -> dict[str, Any]:
 
 class Sample:
     """一次虚构的已封存运行：工件（原字节）、证据目录、报告文档、事件。masked=True 时口径卡带着取自遮罩列的输入；
-    regions=True 时会员库另有一次按地区汇总的查询（目录里排在 Q3）。card、table 换掉口径卡和门店流水的快照（经营月报）。"""
+    regions=True 时会员库另有一次按地区汇总的查询（目录里排在 Q3）。card、table 换掉口径卡和门店流水的快照（经营月报）；
+    inputs 是运行输入（报告里写 [[i:字段]] 引用）。"""
 
     def __init__(self, *, nan: bool = False, masked: bool = False, regions: bool = False,
-                 card: dict[str, Any] | None = None, table: dict[str, Any] | None = None) -> None:
+                 card: dict[str, Any] | None = None, table: dict[str, Any] | None = None,
+                 inputs: dict[str, Any] | None = None) -> None:
         self.files: dict[str, bytes] = {}
         snapshot = table or shop(nan)
         self.shop_id = self.put(snapshot)
@@ -147,7 +154,7 @@ class Sample:
                                        "columns": REGIONS["columns"], "rows": len(REGIONS["rows"]), "truncated": False}
         self.entries["card"] = {"kind": "metric_set", "node_id": "card", "artifact": self.card_id}
         self.ledger = list(self.entries.values())
-        self.catalog = build_catalog(nodes={"card": self.card}, ledger=self.ledger)
+        self.catalog = build_catalog(nodes={"card": self.card}, ledger=self.ledger, inputs=inputs)
 
     def put(self, obj: Any) -> str:
         artifact, raw = stored(obj)
@@ -230,10 +237,12 @@ def build(sample: Sample, events: list[tuple[int, str, str | None, Any]], bound:
                         exported_at=EXPORTED_AT, legacy=legacy, graph=GRAPH, source_masks=source_masks or {})
 
 
-def formats_bundle() -> dict[str, Any]:
-    """经营月报（formats）的页面数据：每种显示格式各引用一处。"""
-    f = Sample(card=FORMATS_CARD, table=LEDGER)
-    events, bound = f.events({"write": f.doc(FORMATS, "write")})
+def formats_bundle(*, card: dict[str, Any] = FORMATS_CARD, table: dict[str, Any] = LEDGER, text: str = FORMATS,
+                   inputs: dict[str, Any] | None = None) -> dict[str, Any]:
+    """经营月报（formats）的页面数据：每种显示格式各引用一处。tests/test_bundle_shown.py 换掉口径卡、流水、正文或者
+    加上运行输入，组装别的写法。"""
+    f = Sample(card=card, table=table, inputs=inputs)
+    events, bound = f.events({"write": f.doc(text, "write")})
     return build(f, events, bound)
 
 
@@ -282,6 +291,7 @@ def bundles() -> dict[str, dict[str, Any]]:
     out["masked-source"] = build(r, events, bound, source_masks={"crm": ["phone"]})
 
     out["formats"] = formats_bundle()
+    out["formats-unit"] = formats_bundle(card=FORMATS_UNIT_CARD)
     return out
 
 
