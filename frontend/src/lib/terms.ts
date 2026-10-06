@@ -3240,7 +3240,8 @@ export const RUN_COMPARE_TEXT = {
   pickGone: (id: string, missing: boolean) => `${id}（${missing ? '记录不存在' : '无法读取'}）`,
   // 页面状态
   noTarget: '未指定要对比的运行',
-  noTargetHint: '在运行详情的「更多」菜单中选择「与上一次对比」，即可对照本次与上一次成功的运行',
+  /** 菜单项的两种叫法都写上：上一次没有成功时，菜单里写的是「与上一次成功的运行对比」 */
+  noTargetHint: '在运行详情的「更多」菜单中选择「与上一次对比」或「与上一次成功的运行对比」，即可对照本次与上一次成功的运行',
   toRuns: '前往记录',
   finding: '正在查找基准运行…',
   loading: '正在对比两次运行…',

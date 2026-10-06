@@ -1192,7 +1192,8 @@ await section('出错与找不到基准', async () => {
 
   const none = await open('/runs/compare')
   await settled(none.page, 'no-target')
-  check('什么都没带：说明从哪里进来', (await text(none.page, '[data-compare-page]')).includes('与上一次对比'))
+  const howTo = await text(none.page, '[data-compare-page]')
+  check('什么都没带：说明从哪里进来，菜单项的两种叫法都写上', howTo.includes(`「${MENU}」`) && howTo.includes(`「${MENU_LAST_OK}」`), howTo)
 })
 
 await section('基准运行读不到（删了、链接过期）', async () => {
