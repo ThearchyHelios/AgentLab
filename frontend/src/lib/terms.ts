@@ -1040,6 +1040,19 @@ export const AGENT_GUARD_TEXT = {
 } as const
 
 /**
+ * 时间线上「核查模型的输出到了上限被截断」那一行（engine/verify_agent.py 的 verify_truncated 日志，双盲复算、反方审稿的
+ * 核查 Agent 发）。推理模型的思考也算在输出额度里，额度用完时回复是空的或只写了一半：照实说是输出额度不够，不说成
+ * 「没查到」「格式不对」，下一步指到换模型。delivered：截断发生在查询过程中、已按截断前查到的结果收尾（结果可能不完整）；
+ * undelivered：这次核查没有给出结果，节点按无法复算、未能反查处理
+ */
+export const VERIFY_TRUNCATED_TEXT = {
+  title: (maxTokens?: number) => `核查模型的输出达到上限${maxTokens ? `（${formatNumber(maxTokens)} token）` : ''}被截断`,
+  delivered: '已按截断前查到的结果收尾，结果可能不完整',
+  undelivered: '这次核查未能完成',
+  next: '通常是推理占满了输出额度。请在节点上指定不带推理的模型，或在「设置 → 偏好设置 → 核查」中更换核查模型',
+} as const
+
+/**
  * 上传表格：数据页「表格」标签的上传弹窗、导入回执和卡片。种类的说法和后端 data/tabular.py 的
  * CONVERSION_KINDS、SHAPE_KINDS 对得上；后端以后多出来的种类，界面上只显示它给的那句话
  */

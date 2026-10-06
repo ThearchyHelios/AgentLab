@@ -128,6 +128,9 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # 核查 agent 自己触顶、按已有结果收尾：多半和节点自己的 *_limit 说的是同一次触顶，照样是缺口，记成它自己的 kind，
     # 不落成笼统的 warn——步数上限（max_steps）只有它说
     "verify_limit": ("verify_limit", DEGRADED),
+    # 核查 agent 的输出到了上限被截断（推理模型的思考也算在额度里）：没交成结果的由节点按无法复算、未能反查记缺口，交了的
+    # 可能不完整。同 verify_limit，是缺口不是断裂，记成它自己的 kind：说得清是输出额度的问题，换个模型就好
+    "verify_truncated": ("verify_truncated", DEGRADED),
 }
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。

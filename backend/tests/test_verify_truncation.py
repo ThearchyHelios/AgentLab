@@ -27,6 +27,7 @@ from openai.types.chat import ChatCompletion
 
 from app.core.events import EventType
 from app.engine import judge as judging
+from app.engine import review as rv
 from app.engine import verify_agent
 from app.engine.inquiry import _error_words
 from app.engine.nodes.challenge import _claim_of
@@ -328,6 +329,16 @@ async def test_the_reason_reaches_dual_check_challenge_and_inquiry(monkeypatch, 
     assert claim["verdict"] == "inconclusive" and claim["rationale"] == f"反查未完成：{expected}" and why == expected
     # 审批质询：提问人看到的报错照原话
     assert _error_words(out, timeout_s=60, daily_max_usd=1.0) == expected
+
+
+def test_the_review_layer_knows_the_truncation_log():
+    """跑完之后的复核层（engine/review.py）认得 verify_truncated：同 verify_limit，是缺口不是断裂，kind 是它自己，
+    不落成笼统的 warn；不触发「重跑一次大概率能好」——同样的模型再跑一遍还是撞同一堵墙。"""
+    assert rv.WARN_CODES["verify_truncated"] == ("verify_truncated", rv.DEGRADED)
+    event = {"type": str(EventType.LOG), "node_id": "dc",
+             "data": {"level": "warn", "code": "verify_truncated", "message": f"{CUT_16K}，核查未能完成。{ADVICE}"}}
+    [signal] = rv.scan([event], {"结论": "本周订单 120 单。"})
+    assert (signal.kind, signal.severity) == ("verify_truncated", rv.DEGRADED) and not rv.should_retry([signal])
 
 
 def test_the_reply_shapes_used_here_are_messages():
