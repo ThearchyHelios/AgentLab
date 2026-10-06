@@ -231,3 +231,186 @@ async def test_the_whatif_withholds_a_masked_scalar_taken_by_position(client, mo
     res = await client.post(f"/api/runs/{row.id}/evidence/whatif",
                             json={"card": "card", "metric": "plen2", "overrides": {"inputs": {FIRST_PHONE: 1}}})
     assert res.status_code == 422 and "遮罩" in res.json()["detail"]
+
+
+# --------------------------------------------------------------------------
+# 手搭的封存范围：模型报的值、快照里的值，以及遮没遮核对不了的几种
+# --------------------------------------------------------------------------
+
+#: 一份带遮罩的快照：phone 在查询当时就设了遮罩（记在快照里）。数据源名是编的，库里没有这个数据源（现在的遮罩为空）
+GHOST = "ghost_mask_src"
+PHONE_SNAP = {"columns": ["id", "phone"], "rows": [[1, "139-0000-0009"]], "source": GHOST,
+              "sql": "SELECT id, phone FROM members", "mask_columns": ["phone"]}
+#: 这几条用例里出现过的号码，答复里一个都不能有
+SECRETS = ["139-0000-0009", "139-0000-0008", "139-0000-0007", "139-0000-0006", "139-0000-0005", "139-0000-0004"]
+CELL = "cell(nodes.fetch, 0, 'phone')"
+
+
+def card_metric(mid, expression, substituted, inputs, value=13):
+    return {"id": mid, "name": mid, "unit": "位", "value": value, "rendered": f"{value}位", "format": "thousands",
+            "expression": expression, "substituted": substituted, "recompute_ok": True, "inputs": inputs,
+            "status": "ok"}
+
+
+async def hand_chain(metrics, *, queries=(), outputs=None, metric_id=None):
+    """手搭一次封存了的运行（取数 → 数据整形 → 口径卡），直接走指标步骤（evidence._metric_chain）。queries 是封存范围内
+    交回过的查询快照，outputs 是口径卡算之前各节点的产出工件。"""
+    from app.api import evidence
+    from app.core.artifact_store import put_json
+    from app.engine.evidence import make_eid
+
+    card = await put_json({"kind": "metric_set", "caliber": "遮罩口径", "caliber_version": "v1", "metrics": metrics},
+                          kind="metric_set")
+    events = [(i + 1, "node.finished", nid, {"artifact": art}) for i, (nid, art) in enumerate((outputs or {}).items())]
+    events += [(len(events) + 1, "node.started", "card", {}),
+               (len(events) + 2, "node.finished", "card", {"evidence": [
+                   {"kind": "metric_set", "node_id": "card", "artifact": card}]})]
+    sealed = evidence._Sealed(run_id="syn-mask", graph=graph(), events=events,
+                              seal={"sealed": True, "ok": True, "manifest_seq": len(events), "legacy": False})
+    sealed.queries = {a: {"node_id": "fetch", "tool": f"db_query__{GHOST}", "source": GHOST} for a in queries}
+    sealed.ledger = {("card", card)}
+    mid = metric_id or metrics[0]["id"]
+    eid = make_eid("metric", card, {"metric": mid})
+    cite = {"alias": f"m:{mid}", "kind": "metric", "locator": {"metric": mid}, "status": "resolved", "eid": eid}
+    entry = {"alias": f"m:{mid}", "kind": "metric", "artifact": card, "node_id": "card", "locator": {"metric": mid},
+             "eid": eid}
+    seg = {"id": "s1", "kind": "number", "text": "13位", "state": "deterministic", "cite": cite}
+    return await evidence._metric_chain(seg, cite, entry, {"catalog": {f"m:{mid}": entry}}, sealed, evidence._Masks())
+
+
+def said(chain) -> list[str]:
+    raw = json.dumps(chain, ensure_ascii=False)
+    return [p for p in SECRETS if p in raw]
+
+
+async def test_what_the_model_reported_and_what_the_snapshot_held_are_withheld_too():
+    """对不上的输入另记着两边的值：Agent 字段的 model_value（模型报的）、cell() 的 snapshot_value（快照里的）。取自遮罩列
+    时一并拿掉——界面上不显示它们，接口答复里同样不能带着。"""
+    from app.core.artifact_store import put_json
+
+    snap = await put_json(PHONE_SNAP, kind="query")
+    cell = card_metric("plen", f"len({CELL})", "len('139-0000-0008')", [
+        {"path": CELL, "value": "139-0000-0008", "node_id": "fetch", "via": "tool_cell", "artifact": snap,
+         "locator": {"row": 0, "column": "phone"}, "status": "mismatch", "snapshot_value": "139-0000-0009"}])
+    agent = card_metric("alen", "len(vars.kpi.phone)", "len('139-0000-0009')", [
+        {"path": "vars.kpi.phone", "value": "139-0000-0009", "node_id": "bot", "via": "agent_field", "field": "phone",
+         "artifact": snap, "locator": {"row": 0, "column": "phone"}, "status": "mismatch",
+         "model_value": "139-0000-0007"}])
+    for metric in (cell, agent):
+        chain = await hand_chain([metric], queries=[snap])
+        [step] = [s for s in chain if s["step"] == "input"]
+        assert step["value"] == "已遮罩" and step["masked"] == ["phone"], metric["id"]
+        assert "model_value" not in step and "snapshot_value" not in step, metric["id"]
+        assert chain[0]["substituted"] == "len(已遮罩)" and said(chain) == [], (metric["id"], said(chain))
+
+
+async def test_a_substituted_expression_that_does_not_reproduce_is_not_shown():
+    """卡上记的代入式和按卡上的输入重新代出来的对不上（老卡、卡上记的不是原值）：整条代入式不给，宁可不显示，也不能让
+    遮着的值从对不上的那一处漏出来。"""
+    from app.core.artifact_store import put_json
+    from app.engine import recompute
+
+    snap = await put_json(PHONE_SNAP, kind="query")
+    odd = card_metric("odd", f"len({CELL})", "len('139-0000-0006')", [
+        {"path": CELL, "value": "139-0000-0005", "node_id": "fetch", "via": "tool_cell", "artifact": snap,
+         "locator": {"row": 0, "column": "phone"}, "status": "verified"}])
+    assert recompute.substituted_without(odd, {CELL}, "已遮罩") is None
+    chain = await hand_chain([odd], queries=[snap])
+    assert chain[0]["substituted"] is None and said(chain) == [], said(chain)
+    # 对得上的照常换掉那一处
+    assert recompute.substituted_without({**odd, "substituted": "len('139-0000-0005')"}, {CELL}, "已遮罩") == "len(已遮罩)"
+
+
+async def test_a_cell_on_a_snapshot_that_cannot_be_read_is_withheld():
+    """cell() 落在的快照读不出来（文件不在了）：数据源现在没遮这一列，可查询当时记下的遮罩在快照里，遮没遮核对不了——
+    宁可多遮，和推演一致。说法另写，不说「这一列设置了遮罩」（不进 masked）。"""
+    gone = "dd" * 32
+    metric = card_metric("plen", f"len({CELL})", "len('139-0000-0004')", [
+        {"path": CELL, "value": "139-0000-0004", "node_id": "fetch", "via": "tool_cell", "artifact": gone,
+         "locator": {"row": 0, "column": "phone"}, "status": "verified"}])
+    chain = await hand_chain([metric], queries=[gone])
+    [step] = [s for s in chain if s["step"] == "input"]
+    assert step["value"] == "已遮罩" and "masked" not in step
+    assert step["mask_unverified"] == "查询快照无法读取，核对不了这一格是否取自设置了遮罩的列"
+    assert chain[0]["substituted"] == "len(已遮罩)" and said(chain) == []
+
+
+PARSED = {"columns": ["id", "phone"], "rows": [[1, "139-0000-0004"]]}
+POSITIONAL = "vars.res.rows[0][1]"
+
+
+@pytest.mark.parametrize("parsed, why", [
+    # 写变量的节点的产出读不出来：取值链走不通，那一格取自哪一列核对不了
+    (None, "查询结果无法读取，核对不了这一格是否取自设置了遮罩的列"),
+    # 结果没存快照、只带着数据源名：查询当时记下的遮罩在快照里，核对不了
+    ({**PARSED, "source": GHOST}, "查询结果没有保存快照，核对不了这一格是否取自设置了遮罩的列"),
+])
+async def test_a_positional_cell_that_cannot_be_traced_is_withheld(parsed, why):
+    from app.core.artifact_store import put_json
+
+    out = await put_json(parsed, kind="node_output") if parsed is not None else "ee" * 32
+    metric = card_metric("plen2", f"len({POSITIONAL}) * 2", "len('139-0000-0004') * 2", [
+        {"path": POSITIONAL, "value": "139-0000-0004", "node_id": "parse", "via": "transform", "field": "rows[0][1]",
+         "status": "ok"}], value=26)
+    chain = await hand_chain([metric], outputs={"parse": out})
+    [step] = [s for s in chain if s["step"] == "input"]
+    assert step["value"] == "已遮罩" and step["mask_unverified"] == why and "masked" not in step
+    assert chain[0]["substituted"] == "len(已遮罩) * 2" and said(chain) == []
+
+
+async def test_a_reshaped_result_without_a_snapshot_or_a_source_is_shown_as_is():
+    """数据整形改过形状的结果（既没带快照的 id，也没带数据源名）认不出出处：照常显示。已知的缺口，写在交付说明里。"""
+    from app.core.artifact_store import put_json
+
+    out = await put_json(PARSED, kind="node_output")
+    metric = card_metric("plen2", f"len({POSITIONAL}) * 2", "len('139-0000-0004') * 2", [
+        {"path": POSITIONAL, "value": "139-0000-0004", "node_id": "parse", "via": "transform", "field": "rows[0][1]",
+         "status": "ok"}], value=26)
+    chain = await hand_chain([metric], outputs={"parse": out})
+    [step] = [s for s in chain if s["step"] == "input"]
+    assert step["value"] == "139-0000-0004" and "mask_unverified" not in step and "masked" not in step
+
+
+@pytest.mark.parametrize("parsed, withheld", [
+    (None, True),
+    ({**PARSED, "source": GHOST}, True),
+    (PARSED, False),
+])
+def test_the_whatif_withholds_the_same_untraceable_cells(parsed, withheld):
+    """推演同一个认法：取值链走不通、结果没存快照的那一格不给值、不推演；认不出出处的照常推演。"""
+    from app.engine import recompute
+
+    store = {"out": parsed}
+    metric = card_metric("plen2", f"len({POSITIONAL}) * 2", "len('139-0000-0004') * 2", [
+        {"path": POSITIONAL, "value": "139-0000-0004", "node_id": "parse", "via": "transform", "field": "rows[0][1]",
+         "status": "ok"}], value=26)
+    sources = recompute.Sources(load=store.get, outputs={"parse": "out"} if parsed is not None else {})
+    [result] = recompute.whatif({"metrics": [metric]}, recompute.Changes(), sources)["metrics"]
+    [inp] = result["inputs"]
+    if withheld:
+        assert inp["old"] is None and inp.get("withheld") is True and result["status"] == "unsupported"
+        assert result["substituted"] is None and "139-0000-0004" not in json.dumps(result, ensure_ascii=False)
+    else:
+        assert inp["old"] == "139-0000-0004" and result["status"] == "unchanged"
+
+
+async def test_the_writer_output_is_read_once_for_all_cells_taken_by_position(monkeypatch):
+    """一个指标按位置取了好几格：写变量的节点的产出（可能是几 MB 的查询结果）一次请求里只读一次，快照也只读一次。"""
+    from app.api import evidence
+    from app.core.artifact_store import put_json
+
+    snap = await put_json({**PHONE_SNAP, "rows": [[1, "139-0000-0009"], [2, "139-0000-0008"]]}, kind="query")
+    out = await put_json({"columns": ["id", "phone"], "rows": [[1, "139-0000-0009"], [2, "139-0000-0008"]],
+                          "artifact": snap, "source": GHOST}, kind="node_output")
+    paths = ["vars.res.rows[0][1]", "vars.res.rows[1][1]", "vars.res.rows[0][0]"]
+    metric = card_metric("many", " + ".join(f"len(str({p}))" for p in paths), "len('139-0000-0009') + 0", [
+        {"path": p, "value": v, "node_id": "parse", "via": "transform", "field": p[9:], "status": "ok"}
+        for p, v in zip(paths, ["139-0000-0009", "139-0000-0008", 1])], value=27)
+    reads: list[str] = []
+    real = evidence.load
+    monkeypatch.setattr(evidence, "load", lambda artifact: (reads.append(artifact), real(artifact))[1])
+    chain = await hand_chain([metric], outputs={"parse": out})
+    inputs = {s["path"]: s for s in chain if s["step"] == "input"}
+    assert inputs[paths[0]]["masked"] == ["phone"] and inputs[paths[1]]["masked"] == ["phone"]
+    assert inputs[paths[2]]["value"] == 1 and "masked" not in inputs[paths[2]]
+    assert reads.count(out) == 1 and reads.count(snap) == 1, reads

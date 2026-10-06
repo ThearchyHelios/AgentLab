@@ -29,6 +29,9 @@ BOT_OUT = "d4" * 32
 FETCH_OUT = "e5" * 32
 ITEMS_VALUE = "f6" * 32
 RES_ROWS = "a7" * 32
+#: 数据整形节点 parse 解析好的 S1（数据源工具交回的结果原样解析，带着快照的 id）：vars.res 就是它。按位置取的
+#: vars.res.rows[0][1] 顺着它认得出取自 S1 的 amount 列；没有这份产出时那一格遮没遮核对不了，推演不给值
+PARSE_OUT = "c9" * 32
 STORE = {
     **SNAPSHOTS,
     BOT_OUT: {"text": "四个区域合计 340", "data": {"amounts": [120.5, 80.0, 99.5, 40.0]},
@@ -37,6 +40,7 @@ STORE = {
     FETCH_OUT: {"items": ["甲", "乙", "丙"], "k": 2},
     ITEMS_VALUE: {"path": "vars.kpi.items", "value": ["甲", "乙", "丙"]},
     RES_ROWS: {"path": "vars.res.rows", "value": SNAPSHOTS[S1]["rows"]},
+    PARSE_OUT: {**SNAPSHOTS[S1], "artifact": S1},
 }
 
 
@@ -47,7 +51,7 @@ def load(artifact):
 
 
 def sources(**kw):
-    base = {"load": load, "queries": (S1, S2, BAD), "outputs": {"bot": BOT_OUT, "fetch": FETCH_OUT},
+    base = {"load": load, "queries": (S1, S2, BAD), "outputs": {"bot": BOT_OUT, "fetch": FETCH_OUT, "parse": PARSE_OUT},
             "masked": {S2: frozenset({"phone"})}}
     return Sources(**{**base, **kw})
 

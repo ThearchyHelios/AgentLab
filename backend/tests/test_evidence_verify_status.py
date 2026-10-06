@@ -1,11 +1,15 @@
 """证据接口的核查状态（期 4 I2a）：口径卡指标那一步带双盲复算的结果，句子带反方审稿的判断。
 
 - 指标步骤 dual_check：{status, node_id, choice?, blind_rendered?, reason?}。status 是一致（agreed）、不一致（disagreed，
-  带审核人的选择，没选的不带）、无法复算（unchecked，带原因）、跳过（skipped：节点直通时 reason 是 disabled / no_inputs，
-  节点跑了、这个指标不在复算范围里时是 not_targeted）。读双盲复算节点封存的产出和它的台账条目，按台账里记的指标集工件
-  认它复算的是口径卡的哪一次结果；直通的没有台账条目，按画布上它复算的卡、和它跑完之前那张卡最后一次的结果认
-- 句子 unit.challenge：{verdict, node_id, artifact, on_refuted, report_label}。读反方审稿节点的产出和审稿记录，只认审的
-  就是这一份报告文档的；记录没存上时按画布上审的报告、和它跑完之前那份报告最后一次自查的文档认，判断取产出里列的那几句
+  带审核人的选择，没选的不带）、无法复算（unchecked，带原因）、跳过（skipped）。跳过的原因按这个指标自己说：关闭了
+  （disabled）；不在节点配置的「复算的指标」里、或值不是数（not_targeted）；这个指标没有来自查询的输入（no_inputs）——
+  节点直通时产出里的 no_inputs 说的是整张卡，卡上确有来自查询的指标、只是没被选上的不能也说成没有。读双盲复算节点封存的
+  产出和它的台账条目，按台账里记的指标集工件认它复算的是口径卡的哪一次结果；直通的没有台账条目，按画布上它复算的卡、
+  和它跑完之前那张卡最后一次的结果认
+- 句子 unit.challenge：{verdict, node_id, artifact, on_refuted, report_label, counts, unreviewed?}。读反方审稿节点的产出
+  和审稿记录，只认审的就是这一份报告文档的；记录没存上时按画布上审的报告、和它跑完之前那份报告最后一次自查的文档认，
+  判断取产出里列的那几句。counts 是整份报告的审稿计数（节点产出里的那一份），证据面板借审批卡的展示画这一句时，概况那
+  一行不能凭这一句拼。节点设为「报错并停止运行」、句子被推翻、运行因此失败时，按审完那一刻的日志认
 - 没有双盲复算、反方审稿的运行，答复里没有这两个键（老运行和以前一字不差）
 
 双盲复算、反方审稿各真跑一遍图（虚构的 SQLite 库，模型是 MockChatModel 剧本）；认「哪一次」的边界情形用手写的封存事件。
@@ -161,9 +165,21 @@ async def test_an_agreeing_dual_check_shows_on_the_metric_step(client, monkeypat
     step = (await segment(client, run.id, "330.0元"))["chain"][0]
     assert step["step"] == "metric" and step["metric"] == "gmv"
     assert step["dual_check"] == {"status": "agreed", "node_id": "dual", "blind_rendered": "330.0元"}
-    # 节点跑了、这个指标不在复算范围里（没有来自查询的输入）：照实说没复算，不是缺省
+    # 节点跑了、这个指标没复算（它没有来自查询的输入）：照实说没复算、为什么，不是缺省
     days = (await segment(client, run.id, "7天"))["chain"][0]
-    assert days["dual_check"] == {"status": "skipped", "node_id": "dual", "reason": "not_targeted"}
+    assert days["dual_check"] == {"status": "skipped", "node_id": "dual", "reason": "no_inputs"}
+
+
+async def test_a_metric_left_out_of_the_subset_is_not_said_to_lack_query_inputs(client, monkeypatch, shop):
+    """「复算的指标」只选了统计天数：它没有来自查询的输入，节点以 no_inputs 直通。销售额明明取自查询，只是没被选上——
+    它的说法是不在复算范围内，不能套用节点那句「没有来自查询的输入」。"""
+    Blind(monkeypatch, shop, {}, writer=WRITER)
+    run = await start(dual_graph(shop, metrics=["days"]))
+    assert run.status == "succeeded", run.error
+    gmv = (await segment(client, run.id, "330.0元"))["chain"][0]["dual_check"]
+    assert gmv == {"status": "skipped", "node_id": "dual", "reason": "not_targeted"}
+    days = (await segment(client, run.id, "7天"))["chain"][0]["dual_check"]
+    assert days == {"status": "skipped", "node_id": "dual", "reason": "no_inputs"}
 
 
 @pytest.mark.parametrize("choice", ["b", None])
@@ -291,13 +307,16 @@ async def test_a_challenged_sentence_carries_the_verdict(client, monkeypatch, sa
     reviewer(monkeypatch, sales)
     run = await start(challenge_graph(sales), run_class="formal")
     assert run.status == "succeeded", run.error
-    record = (await challenge_output(run.id))["challenge_artifact"]
+    output = await challenge_output(run.id)
+    record = output["challenge_artifact"]
     south = (await sentence(client, run.id, SOUTH))["unit"]["challenge"]
+    # counts 是整份报告的审稿计数（节点产出里的那一份）：一句被推翻、一句被削弱，不是只数这一句
     assert south == {"verdict": "refuted", "node_id": "chal", "artifact": record, "on_refuted": "degrade",
-                     "report_label": "写周报"}
+                     "report_label": "写周报", "counts": {"stands": 0, "weakened": 1, "refuted": 1, "inconclusive": 0}}
+    assert south["counts"] == output["counts"]
     # 点开句子里的数字，片段接口答的这一句同样带着判断
     east = (await segment(client, run.id, "1,500"))["unit"]["challenge"]
-    assert east["verdict"] == "weakened" and east["artifact"] == record
+    assert east["verdict"] == "weakened" and east["artifact"] == record and east["counts"] == output["counts"]
     # 反方没审的（标题不是结论）：没有这个键
     heading = await sentence(client, run.id, kind="heading")
     assert heading["unit"]["kind"] == "heading" and "challenge" not in heading["unit"]
@@ -315,7 +334,22 @@ async def test_a_lost_review_record_still_shows_the_listed_verdicts(client, monk
     assert (await challenge_output(run.id))["challenge_artifact"] is None
     south = (await sentence(client, run.id, SOUTH))["unit"]["challenge"]
     assert south == {"verdict": "refuted", "node_id": "chal", "artifact": None, "on_refuted": "degrade",
-                     "report_label": "写周报"}
+                     "report_label": "写周报", "counts": {"stands": 0, "weakened": 1, "refuted": 1, "inconclusive": 0}}
+
+
+async def test_a_review_that_stopped_the_run_still_marks_its_sentences(client, monkeypatch, sales):
+    """「结论被推翻时」设为报错并停止运行：节点报错、没有 node.finished，运行失败。被推翻的是哪几句、反方凭什么，
+    证据面板里照样要看得到——按审完那一刻的日志（challenge_done）认审稿记录，处置写 fail。"""
+    reviewer(monkeypatch, sales)
+    graph = challenge_graph(sales)
+    next(n for n in graph["nodes"] if n["id"] == "chal")["data"]["config"]["on_refuted"] = "fail"
+    run = await start(graph, run_class="formal")
+    assert run.status == "failed" and "推翻" in (run.error or ""), run.error
+    south = (await sentence(client, run.id, SOUTH))["unit"]["challenge"]
+    assert south["verdict"] == "refuted" and south["on_refuted"] == "fail" and south["node_id"] == "chal"
+    assert south["artifact"] and south["counts"] == {"stands": 0, "weakened": 1, "refuted": 1, "inconclusive": 0}
+    east = (await segment(client, run.id, "1,500"))["unit"]["challenge"]
+    assert east["verdict"] == "weakened" and east["artifact"] == south["artifact"]
 
 
 async def test_reports_without_a_challenge_have_no_verdicts(client, monkeypatch, sales):
@@ -417,6 +451,54 @@ async def test_a_review_of_an_earlier_draft_does_not_mark_the_rewritten_report(s
     ]
     sealed = sealed_of(graph, events)
     assert evidence._challenge_of(sealed, report(draft), "u1") == {
-        "verdict": "refuted", "node_id": "chal", "artifact": record, "on_refuted": "flag", "report_label": "写周报"}
+        "verdict": "refuted", "node_id": "chal", "artifact": record, "on_refuted": "flag", "report_label": "写周报",
+        "counts": {"stands": 0, "weakened": 0, "refuted": 1, "inconclusive": 0}}
     assert evidence._challenge_of(sealed, report(final), "u1") is None
     assert evidence._challenge_of(sealed, report(draft), "u2") is None
+
+
+async def test_the_counts_are_the_whole_reviews_and_unreviewed_rides_along():
+    """counts 照产出（整份报告审了 12 句），没能反查的句数产出里有就带上；产出里的计数认不出来时按审稿记录数。"""
+    doc = await put_json({"markdown": "周报", "n": 3}, kind="report_doc")
+    claims = [{"unit": "u1", "text": "华南销售额超过华东。", "verdict": "weakened"},
+              {"unit": "u2", "text": "华北持平。", "verdict": "stands"}]
+    record = await put_json({"report": "write", "doc_artifact": doc, "model": "mock",
+                             "claims": [{**c, "rationale": "", "rationale_doc": None, "queries": []} for c in claims]},
+                            kind="challenge")
+    graph = chain(node("write", "report", "写周报"), node("chal", "challenge", "审稿", report="write"))
+
+    async def answer(output: dict) -> dict:
+        out = await put_json({"challenge_artifact": record, "items": claims, "on_refuted": "degrade", **output},
+                             kind="node_output")
+        events = [(1, "report.checked", "write", {"doc_artifact": doc, "ok": True}),
+                  (2, "node.finished", "chal", {"artifact": out})]
+        return evidence._challenge_of(sealed_of(graph, events), report(doc), "u1")
+
+    got = await answer({"counts": {"stands": 7, "weakened": 3, "refuted": 2, "inconclusive": 0}, "unreviewed": 1})
+    assert got["counts"] == {"stands": 7, "weakened": 3, "refuted": 2, "inconclusive": 0} and got["unreviewed"] == 1
+    # 计数格式不对（一个数都认不出来）：按审稿记录里的句子数，不写四个 0
+    got = await answer({"counts": {"stands": "7"}, "unreviewed": True})
+    assert got["counts"] == {"stands": 1, "weakened": 1, "refuted": 0, "inconclusive": 0} and "unreviewed" not in got
+
+
+async def test_a_review_that_failed_the_node_needs_its_record():
+    """节点报错：认审完那一刻的日志。重跑（node.started）之后没再审完的不算；日志里没有审稿记录（保存失败）认不出审的
+    是哪一稿，也不算。"""
+    doc = await put_json({"markdown": "周报", "n": 4}, kind="report_doc")
+    claims = [{"unit": "u1", "text": "华南销售额超过华东。", "verdict": "refuted", "rationale": "", "rationale_doc": None,
+               "queries": []}]
+    record = await put_json({"report": "write", "doc_artifact": doc, "model": "mock", "claims": claims},
+                            kind="challenge")
+    graph = chain(node("write", "report", "写周报"), node("chal", "challenge", "审稿", report="write",
+                                                       on_refuted="fail"))
+    counts = {"stands": 0, "weakened": 0, "refuted": 1, "inconclusive": 0}
+    head = [(1, "report.checked", "write", {"doc_artifact": doc, "ok": True}), (2, "node.started", "chal", {})]
+    done = (3, "log", "chal", {"code": "challenge_done", "counts": counts, "artifact": record})
+    failed = (4, "node.failed", "chal", {"error": "反方审稿推翻了 1 句结论"})
+    got = evidence._challenge_of(sealed_of(graph, [*head, done, failed]), report(doc), "u1")
+    assert got == {"verdict": "refuted", "node_id": "chal", "artifact": record, "on_refuted": "fail",
+                   "report_label": "写周报", "counts": counts}
+    retried = [*head, done, (4, "node.started", "chal", {}), (5, "node.failed", "chal", {"error": "模型不可用"})]
+    assert evidence._challenge_of(sealed_of(graph, retried), report(doc), "u1") is None
+    lost = [*head, (3, "log", "chal", {"code": "challenge_done", "counts": counts, "artifact": None}), failed]
+    assert evidence._challenge_of(sealed_of(graph, lost), report(doc), "u1") is None

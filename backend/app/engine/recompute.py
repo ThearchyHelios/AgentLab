@@ -61,6 +61,13 @@ NOT_RESTORABLE = "这类输入当时没有保存完整值"
 MASKED_INPUT = "这一列在数据源中设置了遮罩，不能用于推演"
 MASKED_TABLE = "这份查询结果里有设置了遮罩的列，不能用于推演"
 MASKED_METRIC = "这个指标用到了设置了遮罩的列，不能推演"
+#: 按位置取自查询结果的一格（vars.res.rows[0][2]）遮没遮核对不了：取值链上节点的产出读不出来，或者那份结果没存快照、
+#: 只带着数据源名（查询当时记下的遮罩在快照里）。和读不出来的快照一样宁可多遮（_positional）
+POSITION_UNREADABLE = "查询结果无法读取，核对不了这一格是否取自设置了遮罩的列"
+POSITION_NO_SNAPSHOT = "查询结果没有保存快照，核对不了这一格是否取自设置了遮罩的列"
+#: recompute（双盲复算的预检、盲值）里整个指标重算不了的说法：同 _Plan.blocked，只是不说「推演」——那里不是推演
+NO_LINEAGE_PLAIN = "这个指标生成于系统升级前，口径卡没有记录输入"
+MASKED_PLAIN = "这个指标用到了设置了遮罩的列"
 SELECTOR = "这个输入决定取哪一行、哪一项，修改它需要重新取数，不能推演"
 EXCLUDED = "排除后无法计算"
 UNREADABLE = "查询快照无法读取"
@@ -170,6 +177,8 @@ class _Plan:
     tops: list[str] = field(default_factory=list)
     inputs: dict[str, _Input] = field(default_factory=dict)
     problem: str | None = None
+    #: problem 不说「推演」的说法（recompute 给双盲复算用）；和 problem 一样时不填
+    plain: str | None = None
     #: 嵌在别的引用里的输入 → 包着它的最外层引用（_refs）
     within: dict[str, set[str]] = field(default_factory=dict)
 
@@ -199,6 +208,20 @@ class _Plan:
             if problem := self.inputs[path].problem:
                 return "unsupported", f"无法推演：{path}（{problem}）"
         return None
+
+    @property
+    def stuck(self) -> str | None:
+        """blocked 的原因换成不说「推演」的说法：recompute 交给双盲复算的预检、盲值，那里说「不能推演」驴唇不对马嘴。
+        判断和先后与 blocked 一字不差，只换措辞；推演得了的是 None。"""
+        blocked = self.blocked
+        if blocked is None:
+            return None
+        if self.problem:
+            return self.plain or self.problem
+        if blocked[0] == "masked":
+            return MASKED_PLAIN
+        path = next(p for p in self.tops if self.inputs[p].problem)
+        return f"输入 {path} 无法还原（{self.inputs[path].problem}）"
 
 
 # --------------------------------------------------------------------------
@@ -232,8 +255,14 @@ def whatif(card: dict[str, Any], changes: Changes, sources: Sources, *, metric: 
 
 
 def recompute(metric: dict[str, Any], changes: Changes, sources: Sources) -> dict[str, Any]:
-    """重算一个指标，不管改动碰没碰到它，也不校验改动。核对还原是否忠实时用：什么都不改，重算出来应当和卡上记的一样。"""
-    return _outcome(_plan(metric, _Store(sources)), changes, sources, force=True)[0]
+    """重算一个指标，不管改动碰没碰到它，也不校验改动。核对还原是否忠实时用：什么都不改，重算出来应当和卡上记的一样。
+
+    调用方是双盲复算（预检、按盲算的输入代回原式），不是推演：整个指标重算不了时原因不说「推演」（_Plan.stuck）。"""
+    plan = _plan(metric, _Store(sources))
+    result = _outcome(plan, changes, sources, force=True)[0]
+    if (plain := plan.stuck) is not None:
+        result["reason"] = plain
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -245,7 +274,7 @@ def _plan(metric: dict[str, Any], store: _Store) -> _Plan:
     expr = str(metric.get("expression") or "").strip()
     items = metric.get("inputs")
     if not expr or not isinstance(items, list):
-        return _Plan(metric, problem=NO_LINEAGE)
+        return _Plan(metric, problem=NO_LINEAGE, plain=NO_LINEAGE_PLAIN)
     try:
         tree, _, _ = parse_expression(expr)
     except ExpressionError as e:
@@ -258,7 +287,8 @@ def _plan(metric: dict[str, Any], store: _Store) -> _Plan:
             inputs[item["path"]] = _restore(item, remaining, set(within), store)
     plan = _Plan(metric, tree, tops, inputs, within=within)
     if lost := [p for p in tops if p not in inputs]:
-        plan.problem = f"口径卡缺少输入 {'、'.join(lost[:3])} 的记录，不能推演"
+        plan.plain = f"口径卡缺少输入 {'、'.join(lost[:3])} 的记录"
+        plan.problem = f"{plan.plain}，不能推演"
     return plan
 
 
@@ -335,7 +365,9 @@ def _restore(item: dict[str, Any], remaining: set[str], nested: set[str], store:
             # 也不拿来推演。数据源现在设的遮罩照样认（_masked），认出来了就按遮罩说
             inp.unreadable = True
             inp.problem = inp.problem or (TAMPERED if trouble == "tampered" else UNREADABLE)
-    inp.masked = _masked(inp, locator, store) or _positional_masked(inp, store)
+    inp.masked = _masked(inp, locator, store)
+    if not inp.masked:
+        _positional(inp, store)
     return inp
 
 
@@ -417,14 +449,56 @@ def _masked(inp: _Input, locator: dict[str, Any], store: _Store) -> bool:
     return any(isinstance(c, str) and c.lower() in hidden for c in columns)
 
 
-def _positional_masked(inp: _Input, store: _Store) -> bool:
-    """按位置取自查询结果的一格（vars.res.rows[0][2]）落在遮罩列上：卡上没记定位，顺着取值链找到那份结果、认出是哪一列。
-    认不出来的（结果里没带快照的 id、取值链走不通）不算：和以前一样照常推演。"""
+def _positional(inp: _Input, store: _Store) -> None:
+    """按位置取自查询结果的一格（vars.res.rows[0][2]）：卡上没记定位，顺着取值链找到那份结果、认出是哪一列（input_origin）。
+
+    落在遮罩列上的按遮罩（masked）。遮没遮核对不了的——取值链上节点的产出读不出来，或者那份结果没存快照、只带着数据源名
+    ——和读不出来的快照同一个处理：值不给、也不拿来推演（unreadable，原因记在 problem），宁可多遮。认得出、可那份结果
+    既没带快照的 id 也没带数据源名的（数据整形改过形状的结果）认不出出处，照常推演，见模块说明。"""
     if inp.snapshot is not None or inp.shape != "scalar" or inp.item.get("via") in ("tool_cell", "agent_field"):
-        return False
-    found = positional_cell(inp.path, inp.item.get("node_id"), lambda node_id: store.output(node_id)[0])
-    hidden = store.sources.masked.get(found["artifact"]) if found and found["artifact"] else None
-    return bool(hidden) and isinstance(found["column"], str) and found["column"].lower() in hidden
+        return
+    origin = input_origin(inp.item, lambda node_id: store.output(node_id)[0])
+    if origin is None:
+        return
+    if origin.unverified is None and origin.artifact:
+        hidden = store.sources.masked.get(origin.artifact)
+        inp.masked = bool(hidden) and any(c.lower() in hidden for c in origin.columns)
+        return
+    if origin.unverified is not None or origin.source:
+        inp.unreadable = True
+        inp.problem = inp.problem or origin.unverified or POSITION_NO_SNAPSHOT
+
+
+@dataclass(frozen=True)
+class Origin:
+    """一个输入取自哪份查询结果的哪几列（input_origin）。
+
+    - artifact、source：那份查询结果的快照 id 和数据源名，结果里没带的是 None
+    - columns：用到的列（列名照原样）。按位置取的一格、取值链上的产出读不出来时认不出是哪一列，为空
+    - unverified：遮没遮核对不了的原因（取值链上节点的产出读不出来）；核对得了的是 None
+    """
+
+    artifact: str | None
+    source: str | None
+    columns: tuple[str, ...]
+    unverified: str | None = None
+
+
+def input_origin(item: dict[str, Any], output: Callable[[Any], Any]) -> Origin | None:
+    """卡上的一个输入取自哪份查询结果的哪几列，遮罩按列认时用（推演、证据面板的指标步骤、可验证报告是同一个认法）。
+
+    cell() 的格、Agent 交来的字段按定位里的列认；vars.res.rows[0][2] 这种按位置取的一格顺着取值链认（positional_cell，
+    output 同它）。不是取自查询结果的格（常量、运行输入、Agent 没按出处交的字段、加工过的数）是 None。"""
+    if item.get("via") in ("tool_cell", "agent_field") and isinstance(item.get("artifact"), str) and item["artifact"]:
+        locator = item.get("locator") if isinstance(item.get("locator"), dict) else {}
+        columns = [locator.get("column")] if locator.get("column") else list((locator.get("columns") or {}).values())
+        return Origin(item["artifact"], None, tuple(c for c in columns if isinstance(c, str) and c))
+    found = positional_cell(str(item.get("path") or ""), item.get("node_id"), output)
+    if found is None:
+        return None
+    if found.get("unreadable"):
+        return Origin(None, None, (), POSITION_UNREADABLE)
+    return Origin(found["artifact"], found["source"], (found["column"],))
 
 
 #: 取值链没走通
@@ -441,6 +515,10 @@ def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any]) -> di
     output(节点 id) 交回那个节点当时的产出（读不出来给 None）。nodes.X 的根就是 X 的产出；vars.X 是写它的节点（输入记着
     的 node_id）交给变量的那个值——数据整形、合并查询交的是产出本身，Agent、LLM、代码节点交的是产出里的 data，工具节点
     交的是 JSON 文本，都试一遍，取值链走得通的那个就是。下标得是字面量：rows[vars.i] 要另取一个值才知道是哪一行，不认。
+
+    路径就是按位置取一格的样子（以 .rows[行号][列] 结尾），可那个节点的产出读不出来（文件不在、与哈希不一致、不知道是
+    谁写的）时返回 {"unreadable": True}：这一格取自哪一列核对不了，调用方宁可多遮。卡上记着这个输入的值，算的时候
+    取值链是走得通的，现在读不出来只能是产出丢了或被改了。
     """
     try:
         tree = ast.parse(path, mode="eval").body
@@ -461,6 +539,9 @@ def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any]) -> di
             or not isinstance(keys[0], str):
         return None
     base = output(keys[0] if tree.id == "nodes" else node_id)
+    if base is None:
+        positional = keys[-3] == "rows" and isinstance(keys[-2], int) and isinstance(keys[-1], (int, str))
+        return {"unreadable": True} if positional else None
     candidates = [base]
     if isinstance(base, dict) and "data" in base:
         candidates.append(base["data"])
