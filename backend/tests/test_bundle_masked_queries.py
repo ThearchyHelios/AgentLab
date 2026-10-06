@@ -150,6 +150,16 @@ def test_an_aggregate_by_region_on_a_masked_source_is_embedded(masks, recorded):
     # 括号括起来的一组连接，按名字取列
     ("SELECT m.region, SUM(o.amount) AS spend FROM (members m JOIN orders o ON o.member_id = m.id) GROUP BY m.region",
      ["region", "spend"], [["华东", 508.5]]),
+    # 派生来源明写出了叫 max 的列：t.max 是那一列，不是函数记法的 max(t)
+    ("SELECT t.region, t.max AS spend FROM (SELECT region, MAX(spend) AS max FROM members GROUP BY region) t",
+     ["region", "spend"], [["华东", 508.5]]),
+    # 表函数的参数没写表名、和它自己的别名同名：排在它前面的派生来源明写出了这一列，是列不是整行引用
+    ("SELECT p.region, SUM(p.spend) AS spend FROM (SELECT region, spend, attrs FROM members) p, "
+     "jsonb_each_text(attrs) AS attrs WHERE attrs.key = 'vip' GROUP BY p.region", ["region", "spend"],
+     [["华东", 508.5]]),
+    # Oracle 的 sys.dual 不是 MySQL sys 库里记着别的会话 SQL 的视图
+    ("SELECT region, SUM(spend) AS spend FROM members CROSS JOIN sys.dual GROUP BY region", ["region", "spend"],
+     [["华东", 508.5]]),
 ])
 def test_queries_that_only_read_unmasked_columns_are_embedded(sql, columns, rows):
     bundle, entry = bundle_of(snapshot(sql, columns, rows))
@@ -233,9 +243,22 @@ def test_queries_that_use_a_masked_column_ship_only_their_id(sql, columns):
     # WITH 里的 * 只按名字往外传，可外层把那一段整行交给了表函数
     ("WITH c AS (SELECT * FROM members) SELECT region, value AS spend FROM c, json_each_text(row_to_json(c))",
      ["region", "spend"]),
-    # 函数记法：m.to_jsonb 就是 to_jsonb(m)
+    # 函数记法：m.to_jsonb 就是 to_jsonb(m)。整行的文字、二进制写法（record_out、record_send），汇总函数也能这么写
+    # （any_value、*_agg_strict，max、min 交回最大、最小的那一整行）；WITH 里的 * 只按名字往外传，可外层整行交了出去
     ("SELECT m.to_jsonb AS spend FROM members m", ["spend"]),
     ("SELECT m.row_to_json AS spend FROM members m", ["spend"]),
+    ("SELECT m.record_out AS spend FROM members m", ["spend"]),
+    ("SELECT m.record_send AS spend FROM members m", ["spend"]),
+    ("SELECT m.any_value AS spend FROM members m", ["spend"]),
+    ("SELECT m.json_agg_strict AS spend FROM members m", ["spend"]),
+    ("SELECT m.jsonb_agg_strict AS spend FROM members m", ["spend"]),
+    ("SELECT m.max AS spend FROM members m", ["spend"]),
+    ("SELECT region, m.min AS spend FROM members m GROUP BY region", ["region", "spend"]),
+    ("WITH c AS (SELECT * FROM members) SELECT region, c.record_out AS spend FROM c", ["region", "spend"]),
+    # 表函数只看得见排在它前面的来源：后面那个派生来源里叫 m 的列它看不见，m 还是整行
+    ("SELECT value AS spend FROM members m, jsonb_each_text(to_jsonb(m)), (SELECT 1 AS m) s", ["spend"]),
+    ("SELECT value AS spend FROM (members m CROSS JOIN jsonb_each_text(to_jsonb(m))) AS x, (SELECT 1 AS m) s",
+     ["spend"]),
     # 列名表按位置给列改名（Postgres 的表别名、子查询、WITH 都能写）
     ("SELECT c AS spend FROM members AS m(a, b, c)", ["spend"]),
     ("WITH t(a, b) AS (SELECT * FROM members2) SELECT b AS spend FROM t", ["spend"]),
@@ -285,6 +308,31 @@ def test_profiling_every_column_of_a_masked_table_ships_only_its_id():
     ("SELECT LOAD_FILE('/var/lib/mysql/crm/members.ibd') AS spend", ["spend"]),
     ("SELECT data AS spend FROM pg_logical_slot_peek_changes('cdc', NULL, NULL)", ["spend"]),
     ("SELECT argument AS spend FROM mysql.general_log", ["spend"]),
+    # 别的会话执行过的 SQL 原文的另几种写法：Postgres 里 pg_stat_activity 背后的函数和按会话取的那一个、
+    # pg_stat_statements、本连接预备过的语句（连接池里的连接留着前几次查询的原文）；MySQL sys 库建在
+    # performance_schema 上的视图（带 x$ 的是不排版的那一份）、企业版的审计日志；Oracle 打开着的游标和审计记录
+    ("SELECT query AS spend FROM pg_stat_get_activity(NULL)", ["spend"]),
+    ("SELECT pg_stat_get_backend_activity(1) AS spend", ["spend"]),
+    ("SELECT query AS spend FROM pg_stat_statements", ["spend"]),
+    ("SELECT statement AS spend FROM pg_prepared_statements", ["spend"]),
+    ("SELECT last_statement AS spend FROM sys.session", ["spend"]),
+    ("SELECT current_statement AS spend FROM sys.x$processlist", ["spend"]),
+    ("SELECT `last_statement` AS spend FROM `sys`.`x$session`", ["spend"]),
+    ("SELECT waiting_query AS spend FROM sys.innodb_lock_waits", ["spend"]),
+    ("SELECT waiting_query AS spend FROM sys.x$schema_table_lock_waits", ["spend"]),
+    ("SELECT audit_log_read() AS spend", ["spend"]),
+    ("SELECT sql_text AS spend FROM v$open_cursor", ["spend"]),
+    ("SELECT sql_text AS spend FROM dba_audit_trail", ["spend"]),
+    ("SELECT sql_text AS spend FROM unified_audit_trail", ["spend"]),
+    ("SELECT lsqltext AS spend FROM sys.fga_log$", ["spend"]),
+    # 按页、按日志、按文件读的另几种写法：pageinspect 按索引名读 B 树页，pg_walinspect 读 WAL 里的块，SQLite 的
+    # readfile；统计信息的另几处：Oracle 直方图和列统计的底表，MariaDB 的 column_stats
+    ("SELECT data AS spend FROM bt_page_items('members_phone_idx', 1)", ["spend"]),
+    ("SELECT block_data AS spend FROM pg_get_wal_block_info('0/0', '0/FFFFFFFF')", ["spend"]),
+    ("SELECT readfile('crm.db') AS spend", ["spend"]),
+    ("SELECT epvalue AS spend FROM sys.histgrm$", ["spend"]),
+    ("SELECT lowval AS spend FROM sys.hist_head$", ["spend"]),
+    ("SELECT min_value AS spend FROM mysql.column_stats WHERE table_name = 'members'", ["spend"]),
     # 系统 schema
     ("SELECT relname AS region, reltuples AS spend FROM pg_catalog.pg_class", ["region", "spend"]),
 ])

@@ -120,6 +120,9 @@ def test_a_card_reading_a_renamed_masked_column_ships_only_its_id(sql):
     # 不点列名也读得出表里内容；语法树认不准数据库实际执行什么
     "SELECT name, table_to_xml('members', true, false, '')::text AS tel, spend FROM members",
     "SELECT name, /*!50000 phone AS */ tel, spend FROM members",
+    # 函数记法交出整行的文字写法；表函数看不见排在它后面的派生来源里叫 m 的列，m 还是整行
+    "SELECT name, m.record_out AS tel, spend FROM members m",
+    "SELECT name, value AS tel, spend FROM members m, jsonb_each_text(to_jsonb(m)), (SELECT 1 AS m) s",
 ])
 def test_a_card_reading_a_column_whose_origin_the_sql_hides_ships_only_its_id(sql):
     """快照的 SQL 认不出结果里哪一列取自哪一列（快照本身因此只给哈希）：卡上取的 tel 可能就是号码，整份快照的列都按
@@ -131,6 +134,32 @@ def test_a_card_reading_a_column_whose_origin_the_sql_hides_ships_only_its_id(sq
                               files_changed={snap_id: raw})
     assert entry.get("masked") is True and "b64" not in entry, sql
     assert PHONE not in render_html(bundle)
+
+
+@pytest.mark.parametrize("sql", [
+    # 每种读法都解析不了：PG17 起的 JSON_QUERY … WITH WRAPPER（这里把整行装进了 tel）、ORDER BY … USING
+    "SELECT name, JSON_QUERY(to_jsonb(m), '$.*' WITH WRAPPER) AS tel, spend FROM members m",
+    "SELECT name, value AS tel, spend FROM members m, jsonb_each_text(to_jsonb(m)) ORDER BY value USING <",
+    "SELECT name, tel, spend FROM (SELECT * FROM members) AS x(name, tel, spend) ORDER BY spend USING <",
+    # 没有 SQL（数据源查询工具落的快照都带着）、SQL 是空的
+    None,
+    "",
+])
+def test_a_card_reading_a_snapshot_whose_sql_does_not_parse_ships_only_its_id(sql):
+    """快照的 SQL 每种读法都解析不了（或者根本没有）：快照本身只给哈希（_untouched），认不出结果里哪一列取自哪一列，
+    卡上取自这份快照任一列的输入都按遮罩列算，整张卡只给 id——和快照同一个结论。以前这条路退回按 SQL 认遮罩列的那一套，
+    解析不了时它只看 SQL 里写没写着 phone：没写就只认 phone 本身，卡上取的 tel 是整行、号码原样进了文件。"""
+    snap = {**SNAP_MASKED, "columns": ["name", "tel", "spend"], "sql": sql}
+    if sql is None:
+        del snap["sql"]
+    snap_id, raw = stored(snap)
+    for column, value in (("tel", PHONE), ("spend", 320.0)):
+        item = {**cell_input(column, value), "artifact": snap_id, "path": f"cell(nodes.members, 0, '{column}')"}
+        bundle, entry = bundle_of(card_with([item], substituted=repr(value),
+                                            expression=f"len(cell(nodes.members, 0, '{column}'))"),
+                                  files_changed={snap_id: raw})
+        assert entry.get("masked") is True and "b64" not in entry, (sql, column)
+        assert PHONE not in render_html(bundle)
 
 
 @pytest.mark.parametrize("sql, columns", [

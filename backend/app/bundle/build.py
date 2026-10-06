@@ -125,7 +125,7 @@ class _Store:
 
     def hidden(self, artifact: str) -> set[str]:
         """一份读得出来的查询快照里值取自遮罩列的列（小写）：查询当时记下的、数据源现在设的遮罩列，加上 SQL 里给它们
-        改了名字的；SQL 认不出结果里哪一列取自哪一列的，整份的列（_derived_columns）。"""
+        改了名字的；SQL 认不出结果里哪一列取自哪一列的（解析不了的也算），整份的列（_derived_columns）。"""
         if artifact not in self._hidden:
             content = self.content(artifact)
             base = _snapshot_hidden(content, self._source_masks) if isinstance(content, dict) else set()
@@ -156,9 +156,9 @@ class _Store:
         认哪个输入取自哪份查询结果的哪几列，和证据面板、推演同一个认法（recompute.input_origin）；按位置取的一格顺着
         取值链从写变量的节点在口径卡算这一次之前的产出起走。那几列算不算遮罩列，除了列名对上的，SQL 里给遮罩列起了别名、
         套了函数、经子查询或 WITH 转了一道的也算（hidden，同质询、双盲复算的认法）；SQL 认不出结果里哪一列取自哪一列的
-        （列名表、整行引用这类，快照本身因此只给哈希），整份快照的列都算，两条路的判断一致。核对不了的宁可多挡：快照读不出来、
-        取值链上的产出读不出来、那份结果没存快照只带着数据源名、定位里没写列。认得出、可结果既没带快照的 id 也没带数据源名
-        的（数据整形改过形状）认不出出处，不算。
+        （解析不了、列名表、整行引用这类，快照本身因此只给哈希），整份快照的列都算，两条路的判断一致。核对不了的宁可多挡：
+        快照读不出来、取值链上的产出读不出来、那份结果没存快照只带着数据源名、定位里没写列。认得出、可结果既没带快照的 id
+        也没带数据源名的（数据整形改过形状）认不出出处，不算。
 
         卡本身按解析出来的内容认，不看哈希（同 content）：服务端的文件被改过，嵌进页面的照样是这份原字节，卡上记着的号码
         也照样在里面。读得出字节、解析不出一张卡的（截断的 JSON、不是对象）认不出有哪些输入，整张按带遮罩算，和读不出来的
@@ -241,27 +241,41 @@ _INDIRECT_READS = re.compile(r"(?<![0-9A-Za-z_$])(?:(?:" + "|".join((
     # dblink，Oracle 的 XMLTYPE、XQuery（XMLQUERY、XMLTABLE）
     r"(?:query|table|cursor|schema|database)_to_xml\w*", r"ts_stat", r"crosstab\d*", r"connectby", r"dblink\w*",
     r"xmltype", r"xmlquery", r"xmltable",
-    # 按页、按文件、按日志读出的原始数据：Postgres 的 pageinspect、服务器文件、逻辑解码，MySQL 的 LOAD_FILE，Oracle 的
-    # BFILENAME
-    r"get_raw_page", r"pg_read_(?:binary_)?file", r"pg_logical_slot_\w+", r"load_file", r"bfilename",
+    # 按页、按文件、按日志读出的原始数据：Postgres 的 pageinspect（按索引名读 B 树页的 bt_page_items 也算）、服务器文件、
+    # 逻辑解码、pg_walinspect 读出的 WAL 块，MySQL 的 LOAD_FILE，Oracle 的 BFILENAME，SQLite 的 readfile
+    r"get_raw_page", r"bt_page_items", r"pg_read_(?:binary_)?file", r"pg_logical_slot_\w+", r"pg_get_wal_block_info",
+    r"load_file", r"bfilename", r"readfile",
+    # 别的会话执行过的 SQL 原文：Postgres 的 pg_stat_activity 背后的函数和按会话取的那一个，MySQL 企业版的审计日志
+    r"pg_stat_get_(?:backend_)?activity", r"audit_log_read",
 )) + r")[\"`]?\s*\(|(?:" + "|".join((
     # Oracle 的 DBMS_XMLGEN 这一族（包名后面跟着点），XQuery 里的 ora:view 和 oradb: 表
     r"dbms_xml\w*", r"ora:view", r"oradb",
     # 统计信息里的采样值、全文索引里的词：Postgres 的 pg_stats、pg_statistic 一族，SQLite 的 sqlite_stat*，MySQL 的
-    # column_statistics、innodb_ft_*，Oracle 的直方图、列统计和记着最小最大值的 *_tab_columns
-    r"pg_stat(?:s|istic)\w*", r"sqlite_stat\d", r"column_statistics", r"innodb_ft_\w+",
-    r"(?:all|dba|user|cdb)_(?:\w+_)?(?:histograms|col_statistics|tab_cols|tab_columns)",
-    # 别的会话执行过的 SQL 原文（写入语句里就是值）：Postgres 的 pg_stat_activity，MySQL 的 general_log、slow_log，
-    # Oracle 的 V$SQL 一族
-    r"pg_stat_activity", r"general_log", r"slow_log", r"g?v\$sql\w*", r"(?:dba|cdb)_hist_sql\w*",
+    # column_statistics、innodb_ft_*，MariaDB 的 column_stats，Oracle 的直方图、列统计和记着最小最大值的 *_tab_columns，
+    # 以及它们的底表 histgrm$、hist_head$
+    r"pg_stat(?:s|istic)\w*", r"sqlite_stat\d", r"column_statistics", r"innodb_ft_\w+", r"column_stats",
+    r"(?:all|dba|user|cdb)_(?:\w+_)?(?:histograms|col_statistics|tab_cols|tab_columns)", r"(?:histgrm|hist_head)\$",
+    # 别的会话执行过的 SQL 原文（写入语句里就是值）：Postgres 的 pg_stat_activity、pg_stat_statements，本连接预备过的
+    # 语句（连接池里的连接留着前几次查询的原文）；MySQL 的 general_log、slow_log，sys 库里建在 performance_schema 上的
+    # 会话、锁等待视图（带 x$ 的是不排版的那一份；只认这几张，Oracle 常写的 sys.dual 不算）；Oracle 的 V$SQL 一族、
+    # 打开着的游标、审计记录
+    r"pg_stat_activity", r"pg_stat_statements", r"pg_prepared_statements", r"general_log", r"slow_log",
+    r"sys[\"`]?\s*\.\s*[\"`]?(?:x\$)?(?:session|processlist|innodb_lock_waits|schema_table_lock_waits)",
+    r"g?v\$sql\w*", r"(?:dba|cdb)_hist_sql\w*", r"g?v\$open_cursor",
+    r"(?:dba|cdb|user)_(?:\w+_)?audit_trail", r"unified_audit_trail", r"aud\$\w*", r"fga_log\$",
     # SQLite 按页读出的原始数据
     r"sqlite_dbpage",
     # 系统 schema：哪几张表采样了列值、记着别的会话的 SQL，一张张数靠不住，整个不认
     r"pg_catalog", r"information_schema", r"performance_schema",
 )) + r")(?![0-9A-Za-z_$]))", re.I)
-#: Postgres 的函数记法（m.to_jsonb 就是 to_jsonb(m)）下能把一整行交出来的内置函数（_whole_row）。自己建的函数这里不知道
+#: Postgres 的函数记法（m.to_jsonb 就是 to_jsonb(m)）下能把一整行交出来的内置函数（_whole_row）：只收一个参数、收得下
+#: 整行（record、anyelement、"any" 这类），交回的值里带着整行。汇总函数也能这么写：any_value、*_agg 交回整行，max、min
+#: 交回最大、最小的那一整行。照 PG 18 的 pg_proc 逐个对过：只交回个数、大小、类型、哈希的不算，这么写会报错的（伪类型的
+#: 输出函数、要成对参数的 json_build_object、要 WITHIN GROUP 的 mode）也不算；扩展里的只认 hstore，自己建的函数这里不知道
 _ROW_FUNCTIONS = frozenset({"to_json", "to_jsonb", "row_to_json", "hstore", "quote_literal", "quote_nullable",
-                            "concat", "json_build_array", "jsonb_build_array", "array_agg", "json_agg", "jsonb_agg"})
+                            "concat", "json_build_array", "jsonb_build_array", "record_out", "record_send",
+                            "array_agg", "json_agg", "jsonb_agg", "json_agg_strict", "jsonb_agg_strict", "any_value",
+                            "max", "min"})
 
 
 def _untouched(snapshot: dict[str, Any], hidden: set[str], seen: Callable[[], Any] | None = None) -> bool:
@@ -307,10 +321,11 @@ def _untouched(snapshot: dict[str, Any], hidden: set[str], seen: Callable[[], An
 
 def _derived_columns(snapshot: dict[str, Any], base: set[str]) -> set[str]:
     """一份快照里值取自遮罩列的结果列（小写）：遮罩列本身（base），加上 SQL 里给它们起别名、套函数、经子查询或 WITH
-    转一道得来的（inquiry._derived_hidden，质询、双盲复算同一个认法）。SQL 按每种读得通的读法各认一遍、合起来；都读不通
-    的照那一套的办法，写着遮罩列就整份的列都算。认不出结果里哪一列取自哪一列的，整份的列都算：语法树认不准、不点列名也
-    读得出表里内容的写法（_OPAQUE_SQL、_INDIRECT_READS），以及哪一种读法下有列名表、整行引用、不照原名展开的 *、吃进
-    遮罩列的表函数的（_renamed）——快照本身因此只给哈希，口径卡上取自它的值也一样。合并查询照那一套的办法不看 SQL。
+    转一道得来的（inquiry._derived_hidden，质询、双盲复算同一个认法）。SQL 按每种读得通的读法各认一遍、合起来。认不出
+    结果里哪一列取自哪一列的，整份的列都算：每种读法都解析不了、没有 SQL 的，语法树认不准、不点列名也读得出表里内容的
+    写法（_OPAQUE_SQL、_INDIRECT_READS），以及哪一种读法下有列名表、整行引用、不照原名展开的 *、吃进遮罩列的表函数的
+    （_renamed）——快照本身因此只给哈希，口径卡上取自它的值也一样。解析不了的不退回那一套：它解析不了时只看 SQL 里写没
+    写着遮罩列，没写就只认遮罩列本身，卡上取自整行的值认不出。合并查询照那一套的办法不看 SQL（它记着自己的来历）。
     出错时整份的列都算（宁可多挡）。"""
     columns = snapshot.get("columns")
     every = set(base) | ({str(c).lower() for c in columns} if isinstance(columns, list) else set())
@@ -318,16 +333,18 @@ def _derived_columns(snapshot: dict[str, Any], base: set[str]) -> set[str]:
         from app.data.sql_semantics import _parse, _read
         from app.engine.inquiry import _derived_hidden
 
+        if snapshot.get("source") == MERGE_SOURCE:
+            return set(base) | {c.lower() for c in _derived_hidden(dict(snapshot), set(base), None)[0]}
         sql = snapshot.get("sql")
-        own = isinstance(sql, str) and snapshot.get("source") != MERGE_SOURCE
-        if own and (_OPAQUE_SQL.search(sql) or _INDIRECT_READS.search(sql)):
+        if not isinstance(sql, str) or _OPAQUE_SQL.search(sql) or _INDIRECT_READS.search(sql):
             return every
-        readings = [(kind, tree) for kind in _READINGS for tree in [_parse(sql, _read(kind))[0] if own else None]
-                    if tree is not None]
+        readings = [(kind, tree) for kind in _READINGS for tree in [_parse(sql, _read(kind))[0]] if tree is not None]
+        if not readings:
+            return every
         out = set(base)
-        for kind, tree in readings or [(None, None)]:
+        for kind, tree in readings:
             found, names = _derived_hidden(dict(snapshot), set(base), kind)
-            if tree is not None and _renamed(tree, {n.lower() for n in names}):
+            if _renamed(tree, {n.lower() for n in names}):
                 return every
             out |= {c.lower() for c in found}
         return out
@@ -467,11 +484,14 @@ def _whole_row(column: Any) -> bool:
     """一个名字是不是整行引用（Postgres 的 SELECT m、to_json(m)，函数记法的 m.to_jsonb：一整行装进一列）。
 
     没写表名的，Postgres 先按列认：所在 SELECT 的派生来源明写出了叫这个名字的列，就是那一列；不然对上它看得见的某个来源
-    的名字（别名、表名、WITH 里的一段）就算。写了表名的，列名是 _ROW_FUNCTIONS 里的、表名对上看得见的来源才算。
+    的名字（别名、表名、WITH 里的一段）就算。名字写在 FROM、JOIN 里的表函数的参数里时，只有排在这个表函数前面的派生
+    来源算数：它看不见后面的来源，(SELECT 1 AS m) s 排在后面，m 还是整行（_holder）。写了表名的，列名是 _ROW_FUNCTIONS
+    里的、表名对上看得见的来源才算，同样先按列认：那个来源是明写出了这一列的派生来源，t.max 就是那一列，不是 max(t)。
     看得见的是所在 SELECT 和外层 SELECT 的 FROM、JOIN 里的来源。FROM、JOIN 里的表函数（UNNEST、ROWS FROM 这类）和
     LATERAL 看得见同一层的来源：Postgres 的函数不写 LATERAL 也看得见（逗号、CROSS JOIN、JOIN … ON TRUE 都一样），整行
     交给 jsonb_each_text 这类就一列列竖着摊开了；括号括起来的一组连接按同一层算（_sources 摊开）。FROM、JOIN 里的子查询
-    不写 LATERAL 看不见，WITH 里的一段也看不见。数据源里的表有哪些列这里不知道：碰巧和表、别名同名的列也算（宁可多挡）。"""
+    不写 LATERAL 看不见，WITH 里的一段也看不见。数据源里的表有哪些列这里不知道：碰巧和表、别名同名的列，碰巧叫 max、min
+    这类名字的列也算（宁可多挡）。"""
     from sqlglot import exp
 
     select = column.find_ancestor(exp.Select)
@@ -480,25 +500,46 @@ def _whole_row(column: Any) -> bool:
     if column.table:
         if column.name.lower() not in _ROW_FUNCTIONS:
             return False
-        name = column.table.lower()
+        name, field = column.table.lower(), column.name.lower()
     else:
-        name = column.name.lower()
-        for body in filter(None, map(_derived, _sources(select))):
-            first = _leaves(body)[0]
-            if isinstance(first, exp.Select) and any(
-                    isinstance(item, (exp.Alias, exp.Column)) and not isinstance(item.this, exp.Star)
-                    and item.alias_or_name.lower() == name for item in first.expressions):
-                return False
+        name, field = column.name.lower(), None
+        sources = _sources(select)
+        if any(_names_column(_derived(source), name) for source in sources[:_holder(column, select, sources)]):
+            return False
     child, node = column, column.parent
     while node is not None:
         # FROM、JOIN 里真的子查询（括号里是一条查询，不是一组连接）看不见同一层，WITH 里的一段也看不见
         subquery = isinstance(child.this, exp.Subquery) and _derived(child.this) is not None
         sees = child.arg_key != "with_" and not (child.arg_key in ("from_", "joins") and subquery)
-        if isinstance(node, exp.Select) and sees \
-                and any((source.alias_or_name or "").lower() == name for source in _sources(node)):
-            return True
+        found = [source for source in _sources(node) if (source.alias_or_name or "").lower() == name] \
+            if isinstance(node, exp.Select) and sees else []
+        if found:
+            return field is None or not any(_names_column(_derived(source), field) for source in found)
         child, node = node, node.parent
     return False
+
+
+def _holder(column: Any, select: Any, sources: list[Any]) -> int | None:
+    """名字写在所在 SELECT 的哪一个表函数（_table_function）的参数里：交回它在 sources 里的位置；写在选出项、条件、
+    ON 里的是 None（同一层的来源都看得见）。"""
+    places = {id(source): place for place, source in enumerate(sources) if _table_function(source)}
+    node = column.parent
+    while node is not None and node is not select:
+        if id(node) in places:
+            return places[id(node)]
+        node = node.parent
+    return None
+
+
+def _names_column(block: Any, name: str) -> bool:
+    """一个派生来源（_derived 交回的那块查询，None 是数据源里的表这类）明写出了叫这个名字的列：第一支的选出项里起了
+    这个别名、或者直接写着这一列（* 不算，展开出哪些列这里看不出）。"""
+    from sqlglot import exp
+
+    first = _leaves(block)[0] if block is not None else None
+    return isinstance(first, exp.Select) and any(
+        isinstance(item, (exp.Alias, exp.Column)) and not isinstance(item.this, exp.Star)
+        and item.alias_or_name.lower() == name for item in first.expressions)
 
 
 def _stars(tree: Any) -> list[Any]:
