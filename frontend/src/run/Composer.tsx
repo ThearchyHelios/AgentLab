@@ -49,6 +49,8 @@ export function Composer({ hero, onFocusChange }: {
   const [saveFailed, setSaveFailed] = useState(false)
   // 只认最后一次选择的回包：连着选两次时，先发的那次晚回来也不能盖掉后一次
   const picks = useRef(0)
+  // 服务端最后一次认下的设定：没存上时退回它。不能退回选之前显示的样子——连着选几次时，那可能是前一次还没存上的乐观值
+  const confirmed = useRef<CopilotModel | null>(null)
   const [useBase, setUseBase] = useState(true)
   const ref = useRef<HTMLTextAreaElement>(null)
 
@@ -59,7 +61,10 @@ export function Composer({ hero, onFocusChange }: {
     let alive = true
     setSaveFailed(false)
     const seq = picks.current
-    void api.copilot.getModel().then((m) => { if (alive && seq === picks.current) setSaved(m) }).catch(() => undefined)
+    void api.copilot.getModel().then((m) => {
+      confirmed.current = m
+      if (alive && seq === picks.current) setSaved(m)
+    }).catch(() => undefined)
     return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [opts])
@@ -94,11 +99,19 @@ export function Composer({ hero, onFocusChange }: {
     // 哪个模型由服务端说了算，回来之前不写「当前」
     setSaved({ configured: !!value, provider: null, model: value || null, effective_provider: null,
       effective_model: value || null, error: null, panel_error: null })
-    void api.copilot.setModel({ model: value || null }).then((m) => { if (seq === picks.current) setSaved(m) }).catch(() => {
+    void api.copilot.setModel({ model: value || null }).then((m) => {
+      confirmed.current = m
+      if (seq === picks.current) setSaved(m)
+    }).catch(() => {
       if (seq !== picks.current) return
-      // 没存上：服务端存着的还是原来那一组，退回选之前的样子（原因、齿轮上的红点照旧），并说明保存失败
-      setSaved(before)
+      // 没存上：服务端存着的还是最后一次认下的那一组，退回它（原因、齿轮上的红点照旧），并说明保存失败；再取一次，以服务端
+      // 现在存着的为准（先发的那次可能晚到地存上了）
+      setSaved(confirmed.current ?? before)
       setSaveFailed(true)
+      void api.copilot.getModel().then((m) => {
+        confirmed.current = m
+        if (seq === picks.current) setSaved(m)
+      }).catch(() => undefined)
     })
   }
 

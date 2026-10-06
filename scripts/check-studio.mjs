@@ -2666,15 +2666,17 @@ await section('点名的模型接入：检查器模型一栏说清留空用哪�
   // 那样看着一切正常，发出去还会带上模型、绕过存着的接入
   const BROKEN = { configured: true, provider: 'demo-gone', model: 'big-model', effective_provider: null, effective_model: null,
     error: ASSISTANT_BROKEN, panel_error: ASSISTANT_PANEL }
-  const copilot = { saved: BROKEN, puts: [], fail: false }
+  // gate 是一个 Promise 时，保存要等它放行才答复：用来造「先发的那次还没回来就又选了一次」
+  const copilot = { saved: BROKEN, puts: [], fail: false, gate: null }
   const before = async (page) => {
     const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
     await page.route(/\/api\/providers(\?.*)?$/, (route) => (route.request().method() === 'GET' ? json(route, MODEL_PROVIDERS) : route.fallback()))
     await page.route(/\/api\/workflows\/validate$/, (route) => json(route, modelLint(route.request().postDataJSON()?.graph ?? {})))
-    await page.route(/\/api\/copilot\/model$/, (route) => {
+    await page.route(/\/api\/copilot\/model$/, async (route) => {
       if (route.request().method() === 'PUT') {
         const body = route.request().postDataJSON()
         copilot.puts.push(body)
+        if (copilot.gate) await copilot.gate
         if (copilot.fail) return json(route, { detail: '数据库已锁定，请稍后重试' }, 500)
         copilot.saved = body.model
           ? { configured: true, provider: null, model: body.model, effective_provider: 'demo-main', effective_model: body.model, error: null, panel_error: null }
@@ -2767,6 +2769,24 @@ await section('点名的模型接入：检查器模型一栏说清留空用哪�
     check('……下拉退回存着的那一项，原因和齿轮上的红点照旧', await pickedText() === 'big-model（模型接入「demo-gone」）'
       && await page.locator('[data-copilot-model-error]').innerText().catch(() => '') === ASSISTANT_PANEL
       && await page.locator('[data-copilot-model-broken]').count() === 1, await pickedText())
+    // 连着选两次、两次都没存上（先发的那次还没回来就又选了一次）：退回服务端存着的那一项，不是第一次选的、从没存上的
+    // 模型；原因、齿轮上的红点照旧，并说明没改成
+    let release
+    copilot.gate = new Promise((resolve) => { release = resolve })
+    const sent = copilot.puts.length
+    await select.selectOption('small-model')
+    await until(() => copilot.puts.length > sent, 3000)
+    await select.selectOption('')
+    await until(() => copilot.puts.length > sent + 1, 3000)
+    release()
+    copilot.gate = null
+    await page.locator('[data-copilot-model-save-failed]').waitFor({ timeout: 3000 }).catch(() => {})
+    await page.waitForTimeout(300)
+    check('连着选两次都没存上：下拉退回服务端存着的那一项，原因、红点照旧，说明没改成', copilot.puts.length === sent + 2
+      && await pickedText() === 'big-model（模型接入「demo-gone」）'
+      && await page.locator('[data-copilot-model-error]').innerText().catch(() => '') === ASSISTANT_PANEL
+      && await page.locator('[data-copilot-model-broken]').count() === 1
+      && (await page.locator('[data-copilot-model-save-failed]').innerText().catch(() => '')) === '保存失败，助手使用的模型未更改', await pickedText())
     // 收起再展开：重新取回的就是服务端现在存着的，上一次「保存失败」的说明不再留着，原因照旧
     await gear.click()
     await gear.click()
@@ -2776,10 +2796,11 @@ await section('点名的模型接入：检查器模型一栏说清留空用哪�
       && await page.locator('[data-copilot-model-error]').innerText().catch(() => '') === ASSISTANT_PANEL)
     copilot.fail = false
 
+    const n0 = copilot.puts.length
     await select.selectOption('')
-    await until(() => copilot.puts.length > 1, 3000)
-    check('重新选「跟随默认」算一次改动：存成不指定接入和模型', copilot.puts.length === 2 && copilot.puts[1].model === null
-      && !copilot.puts[1].provider, JSON.stringify(copilot.puts))
+    await until(() => copilot.puts.length > n0, 3000)
+    check('重新选「跟随默认」算一次改动：存成不指定接入和模型', copilot.puts.length === n0 + 1 && copilot.puts[n0].model === null
+      && !copilot.puts[n0].provider, JSON.stringify(copilot.puts))
     await page.waitForFunction(() => !document.querySelector('[data-copilot-model-error]'), null, { timeout: 3000 }).catch(() => {})
     check('……原因、保存失败的说明、齿轮上的标记一起消失，「跟随默认」写出当前用的模型', await page.locator('[data-copilot-model-error]').count() === 0
       && await page.locator('[data-copilot-model-save-failed]').count() === 0
@@ -2787,9 +2808,9 @@ await section('点名的模型接入：检查器模型一栏说清留空用哪�
       && await followText() === '跟随默认（当前：big-model）', await followText())
     // 选了一个模型：服务端回来的「当前」就是这个模型，不能写到「跟随默认」上（跟随默认用的是 demo-main 的 big-model）
     await select.selectOption('small-model')
-    await until(() => copilot.puts.length > 2, 3000)
+    await until(() => copilot.puts.length > n0 + 1, 3000)
     await page.waitForTimeout(200)
-    check('选了具体模型：「跟随默认」不写「当前」', copilot.puts[2]?.model === 'small-model' && await followText() === '跟随默认'
+    check('选了具体模型：「跟随默认」不写「当前」', copilot.puts[n0 + 1]?.model === 'small-model' && await followText() === '跟随默认'
       && await select.inputValue() === 'small-model', await followText())
     check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
     await ctx.close()
