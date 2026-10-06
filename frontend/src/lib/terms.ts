@@ -1039,16 +1039,17 @@ export const AGENT_GUARD_TEXT = {
   unlimitedShort: '不限',
 } as const
 
+/** 「（16,384 token）」：输出额度，没给就不写 */
+const tokenCap = (maxTokens?: number) => (maxTokens ? `（${formatNumber(maxTokens)} token）` : '')
+
 /**
  * 时间线上「核查模型的输出到了上限被截断」那一行（engine/verify_agent.py 的 verify_truncated 日志，双盲复算、反方审稿的
  * 核查 Agent 发）。推理模型的思考也算在输出额度里，额度用完时回复是空的或只写了一半：照实说是输出额度不够，不说成
- * 「没查到」「格式不对」，下一步指到换模型。delivered：截断发生在查询过程中、已按截断前查到的结果收尾（结果可能不完整）；
- * undelivered：这次核查没有给出结果，节点按无法复算、未能反查处理
+ * 「没查到」「格式不对」，下一步指到换模型。截断的回复一律不采信，这次核查没有结果，节点按无法复算、未能反查记缺口
  */
 export const VERIFY_TRUNCATED_TEXT = {
-  title: (maxTokens?: number) => `核查模型的输出达到上限${maxTokens ? `（${formatNumber(maxTokens)} token）` : ''}被截断`,
-  delivered: '已按截断前查到的结果收尾，结果可能不完整',
-  undelivered: '这次核查未能完成',
+  title: (maxTokens?: number) => `核查模型的输出达到上限${tokenCap(maxTokens)}被截断`,
+  sub: '这次核查未能给出结果',
   next: '通常是推理占满了输出额度。请在节点上指定不带推理的模型，或在「设置 → 偏好设置 → 核查」中更换核查模型',
 } as const
 

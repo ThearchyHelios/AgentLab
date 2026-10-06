@@ -2319,29 +2319,29 @@ await section('核查类日志与出具缺口（期 4）：无法复算、未能
     rows.map((r) => `${r?.title}|${r?.sub ?? ''}`).join(' ; '))
 })
 
-await section('核查模型的输出到了上限被截断（verify_truncated）：说清额度、交没交出结果，下一步指到换模型', async () => {
+await section('核查模型的输出到了上限被截断（verify_truncated）：说清额度、这次核查没有结果，下一步指到换模型', async () => {
   // 推理模型的思考也算在输出额度里：核查 Agent 的一次调用 finish_reason=length、没有工具调用也没有 JSON 时，以前双盲复算
-  // 记成「盲算没有查到这个数」、反方审稿记成「核查模型没有按结构交结果」。现在核查 Agent 另发 verify_truncated（max_tokens、
-  // delivered、purpose），时间线按结构化字段说人话，原话留在展开区。先核对后端源码还是这么发的
+  // 记成「盲算没有查到这个数」、反方审稿记成「核查模型没有按结构交结果」。现在截断的回复一律不采信，核查 Agent 另发
+  // verify_truncated（max_tokens、purpose），时间线按结构化字段说人话，原话留在展开区。先核对后端源码还是这么发的
   const verifyPy = readFileSync(`${root}backend/app/engine/verify_agent.py`, 'utf8')
   check('后端发截断日志的格式还是夹具里这一种', verifyPy.includes('code="verify_truncated"') && verifyPy.includes('max_tokens=limit')
-    && verifyPy.includes('delivered=delivered') && verifyPy.includes('purpose=purpose')
-    && verifyPy.includes('TRUNCATED_ERROR = "{cut}，核查未能完成。{advice}"'),
+    && verifyPy.includes('purpose=purpose') && !verifyPy.includes('delivered=')
+    && verifyPy.includes('TRUNCATED_ERROR = "{cut}，未能给出结果。{advice}"'),
   '改了 verify_agent.py 的字段或说法就同步改 decode.ts 的 explainLog 和这里的夹具')
   const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
-  const ADVICE = '通常是推理占满了输出额度，可在「设置 → 偏好设置 → 核查」中换用不带推理的模型'
-  const FAILED = `核查模型的输出达到上限（16384 token）被截断，核查未能完成。${ADVICE}`
-  const SETTLED = `核查模型的输出达到上限（16384 token）被截断，已按截断前查到的结果收尾，结果可能不完整。${ADVICE}`
+  const ADVICE = '通常是推理占满了输出额度。请在节点上指定不带推理的模型，或在「设置 → 偏好设置 → 核查」中更换核查模型'
+  const FAILED = `核查模型的输出达到上限（16384 token）被截断，未能给出结果。${ADVICE}`
+  const SMALL = `核查模型的输出达到上限（4096 token）被截断，未能给出结果。${ADVICE}`
   const all = flatten(mod.decodeRun([
     E(1, 'run.started', null, { total: 2 }),
     E(2, 'node.started', 'dc', { node_type: 'dual_check', label: '复核销售额' }),
-    E(3, 'log', 'dc', { level: 'warn', code: 'verify_truncated', purpose: 'verify', max_tokens: 16384, delivered: false, message: FAILED }),
+    E(3, 'log', 'dc', { level: 'warn', code: 'verify_truncated', purpose: 'verify', max_tokens: 16384, message: FAILED }),
     E(4, 'node.finished', 'dc', { duration_ms: 20 }),
     E(5, 'node.started', 'ch', { node_type: 'challenge', label: '审月报' }),
-    E(6, 'log', 'ch', { level: 'warn', code: 'verify_truncated', purpose: 'verify_result', max_tokens: 4096, delivered: true,
-      message: SETTLED }),
+    // 退回小额度之后在收尾时被截断
+    E(6, 'log', 'ch', { level: 'warn', code: 'verify_truncated', purpose: 'verify_result', max_tokens: 4096, message: SMALL }),
     // 缺字段、字段类型不对（别的服务端版本）：只给不带数的标题，不瞎填
-    E(7, 'log', 'ch', { level: 'warn', code: 'verify_truncated', max_tokens: '16384', delivered: 'no', message: FAILED }),
+    E(7, 'log', 'ch', { level: 'warn', code: 'verify_truncated', max_tokens: '16384', message: FAILED }),
     E(8, 'node.finished', 'ch', { duration_ms: 30 }),
     E(9, 'run.finished', null, { status: 'succeeded' }),
   ]))
@@ -2349,19 +2349,20 @@ await section('核查模型的输出到了上限被截断（verify_truncated）�
   const nodes = all.filter((s) => s.kind === 'node')
   check('每条一行，挂在自己的节点下', rows.length === 3 && nodes.find((s) => s.nodeId === 'dc')?.children?.filter((x) => x.code === 'verify_truncated').length === 1
     && nodes.find((s) => s.nodeId === 'ch')?.children?.filter((x) => x.code === 'verify_truncated').length === 2, `${rows.length} 行`)
-  const [failed, settled, bare] = rows
-  check('没交出结果：标题说输出到了上限被截断、带额度，副标题说核查未能完成', failed?.title === '核查模型的输出达到上限（16,384 token）被截断'
-    && failed.sub === '这次核查未能完成', `${failed?.title} / ${failed?.sub}`)
-  check('交了结果：额度照实写（退回小额度之后是 4,096），副标题说按截断前查到的结果收尾、可能不完整',
-    settled?.title === '核查模型的输出达到上限（4,096 token）被截断' && settled.sub === '已按截断前查到的结果收尾，结果可能不完整',
-    `${settled?.title} / ${settled?.sub}`)
-  check('……下一步指到换不带推理的模型，入口落到节点的模型，提醒色', rows.every((s) => !!s.next?.includes('不带推理的模型')
-    && s.next.includes('设置 → 偏好设置 → 核查') && s.fix === 'canvas' && s.fixField === 'model' && s.level === 'warn'),
+  const [failed, small, bare] = rows
+  check('标题说输出到了上限被截断、带额度，副标题说这次核查没有结果', failed?.title === '核查模型的输出达到上限（16,384 token）被截断'
+    && failed.sub === '这次核查未能给出结果', `${failed?.title} / ${failed?.sub}`)
+  check('额度照实写（退回小额度之后是 4,096）', small?.title === '核查模型的输出达到上限（4,096 token）被截断' && small.sub === '这次核查未能给出结果',
+    `${small?.title} / ${small?.sub}`)
+  check('……下一步指到换不带推理的模型（节点上指定的优先，设置里的也说），入口落到节点的模型，提醒色',
+    rows.every((s) => !!s.next?.includes('在节点上指定不带推理的模型') && s.next.includes('设置 → 偏好设置 → 核查')
+      && s.fix === 'canvas' && s.fixField === 'model' && s.level === 'warn'),
   `${failed?.next} / ${failed?.fix} / ${failed?.fixField} / ${failed?.level}`)
-  check('……原话留在展开区', failed?.detail === FAILED && settled?.detail === SETTLED)
-  check('缺字段、类型不对：标题不带数，不写副标题，不出 undefined、NaN', bare?.title === '核查模型的输出达到上限被截断' && bare.sub === undefined
-    && !/undefined|NaN/.test(`${bare?.title}${bare?.next ?? ''}`), `${bare?.title} / ${bare?.sub}`)
-  check('标题、副标题里没有内部代码', !rows.some((s) => /verify_truncated|max_tokens|delivered/.test(`${s.title}${s.sub ?? ''}${s.next ?? ''}`)))
+  check('……没有「已按截断前查到的结果收尾」这一说', !rows.some((s) => /收尾|可能不完整/.test(`${s.title}${s.sub ?? ''}`)))
+  check('……原话留在展开区', failed?.detail === FAILED && small?.detail === SMALL)
+  check('缺字段、类型不对：标题不带数，不出 undefined、NaN', bare?.title === '核查模型的输出达到上限被截断'
+    && !/undefined|NaN/.test(`${bare?.title}${bare?.sub ?? ''}${bare?.next ?? ''}`), `${bare?.title} / ${bare?.sub}`)
+  check('标题、副标题里没有内部代码', !rows.some((s) => /verify_truncated|max_tokens|purpose/.test(`${s.title}${s.sub ?? ''}${s.next ?? ''}`)))
   check('节点照常完成', nodes.every((s) => s.status === 'done'))
 })
 

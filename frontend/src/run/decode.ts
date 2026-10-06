@@ -1217,12 +1217,12 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       }
     }
     case 'verify_truncated': {
-      // 核查 Agent 的输出到了上限被截断（verify_agent.py）：max_tokens 是那次调用的输出额度，delivered 说截断之后还交没交出
-      // 结果。读结构化字段，不从原话里认；缺了字段（别的服务端版本）只给不带数的标题。入口落到节点的模型：该换的是模型
+      // 核查 Agent 的输出到了上限被截断（verify_agent.py）：max_tokens 是那次调用的输出额度。截断的回复一律不采信，这次核查
+      // 没有结果。读结构化字段，不从原话里认；缺了字段（别的服务端版本）只给不带数的标题。入口落到节点的模型：该换的是模型
       const limit = typeof d.max_tokens === 'number' && d.max_tokens > 0 ? d.max_tokens : undefined
       return {
         title: VT.title(limit),
-        sub: d.delivered === true ? VT.delivered : d.delivered === false ? VT.undelivered : undefined,
+        sub: VT.sub,
         next: VT.next,
         fix: 'canvas',
         fixField: 'model',
