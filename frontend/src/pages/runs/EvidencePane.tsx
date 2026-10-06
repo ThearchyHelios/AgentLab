@@ -12,9 +12,8 @@ import {
   issuanceMarks, segmentState, unitVerdict, verdictState, type AuditFilter, type AuditGroup, type AuditRow,
 } from '../../lib/evidence'
 import { formatNumber } from '../../lib/format'
-import { DUAL_CHECK_TEXT, EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
+import { EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
 import { IssuanceBanner } from '../../run/AssistantStream'
-import { splitIssuanceGaps } from '../../run/decode'
 import { EvidenceDoc, type EvidenceDocHandle } from '../../run/EvidenceDoc'
 import { EvidenceGuessView } from '../../run/EvidenceGuess'
 import { ReportInquiry, inquiryOpen, locateIn, useInquiryAccess } from '../../run/Inquiry'
@@ -49,12 +48,40 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
   const loadGraph = useEvidence((s) => s.loadGraph)
   const reloadGraph = useEvidence((s) => s.reloadGraph)
   const first = useRef(true)
+  // 报告正文（审批卡里展开的、成果区的）有运行就先取过证据图，取的时候运行可能还停在审批上（之后报告又改写过）、刚收尾还没
+  // 封存，也可能是接着跑之前封存的那一版。挂上时手里那份不是「封存了、封存的就是这一版」就重取一次，不看运行停在哪：之后
+  // 没有新事件，refreshKey 不再变，过期的那份会一直留着。别处正在取的那份取回来再看一眼（recheck）。
+  // 重取回来之前先占位（renewing），不画手里那份：画出来的是旧稿，审计表却是挂上时新取的，点一行会按片段 id 打开旧稿里同号
+  // 的片段。第一次渲染就按挂上那一刻手里的那份定，不先画一帧旧稿再收起来；换下来的判据是 store 里那一格不再是它
+  const [held] = useState(() => useEvidence.getState().graphs[run.id])
+  const [renewing, setRenewing] = useState(() => staleHeld(held, run.manifest_seq))
+  const recheck = useRef(false)
   useEffect(() => {
-    if (first.current) { first.current = false; void loadGraph(run.id); return }
+    if (first.current) {
+      first.current = false
+      if (!staleHeld(held, run.manifest_seq)) void loadGraph(run.id)
+      else if (held?.status === 'loading') recheck.current = true
+      else void reloadGraph(run.id)
+      return
+    }
     void reloadGraph(run.id)
-  }, [run.id, refreshKey, loadGraph, reloadGraph])
+    // held 是挂上那一刻的，之后不变
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run.id, run.status, run.manifest_seq, refreshKey, loadGraph, reloadGraph])
+  useEffect(() => {
+    // 挂上时那一份还没换下来（重取还没发出、还没回来），或者正在取：接着等
+    if (!renewing || graphSlot === held || graphSlot?.status === 'loading') return
+    if (recheck.current) {
+      recheck.current = false
+      if (graphSlot?.status === 'ok' && !sealedNow(graphSlot.data, run.manifest_seq)) {
+        void reloadGraph(run.id)
+        return
+      }
+    }
+    setRenewing(false)
+  }, [renewing, graphSlot, held, run.id, run.manifest_seq, reloadGraph])
   const audit = useAudit(run.id, refreshKey)
-  const graph = graphSlot?.data
+  const graph = renewing ? undefined : graphSlot?.data
 
   const [root, setRoot] = useState<HTMLDivElement | null>(null)
   const wide = useWide(root, 880)
@@ -150,8 +177,13 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
                       reports={graph.reports ?? []} labelOf={labelOf} />
           <UpgradeBanner run={run} mode={mode} />
           {/* 出具档位和降档原因写在报告上方：降档时只在侧栏小标签里写「SQL 检查未通过」，报告上却是绿色的
-              「10 个数字都有出处」，读的人会以为一切正常。SQL 检查导致的降档在横幅里单列一块 */}
-          {!!output?._issuance?.tier && <IssuanceWithChecks issuance={output._issuance} runClass={run.run_class} />}
+              「10 个数字都有出处」，读的人会以为一切正常。SQL 检查导致的降档在横幅里单列一块，双盲复算、反方审稿报上来的
+              缺口分「核查未通过」「核查未完成」两组（和问数据、画布右栏同一个横幅） */}
+          {!!output?._issuance?.tier && (
+            <div data-evidence-issuance="">
+              <IssuanceBanner issuance={output._issuance} runClass={run.run_class} />
+            </div>
+          )}
 
           {mode === 'cited' && reports.map((r) => {
             const doc = docOf(r.node_id)
@@ -219,6 +251,17 @@ const openKey = (row: AuditRow): string | undefined =>
 
 /** 已经收尾的运行：还在跑、停在审批上的，报告可能还没写，说「这次的报告没有逐段证据」太早 */
 const SETTLED = new Set(['succeeded', 'failed', 'cancelled'])
+
+/**
+ * 手里这份证据图能不能直接用：封存了，而且封存的就是运行现在这一版（失败后接着跑的运行会重新封存，manifest_seq 跟着变）。
+ * 运行记录上没有 manifest_seq（老运行）、老服务端的证据图没给时只看封没封存
+ */
+const sealedNow = (graph: EvidenceGraph | undefined, seq: number | null | undefined) =>
+  !!graph?.seal?.sealed && (seq == null || graph.seal.manifest_seq == null || graph.seal.manifest_seq === seq)
+
+/** 证据页挂上时手里那份（别处取的）要不要重取：正在取的取回来再看；取到了的不是封存的这一版就重取。没有、取失败的照常取 */
+const staleHeld = (held: { status: string; data?: EvidenceGraph } | undefined, seq: number | null | undefined) =>
+  held?.status === 'loading' || (held?.status === 'ok' && !sealedNow(held.data, seq))
 
 /**
  * 工作流现在的图能不能一键升级：拿它去校验，看有没有 evidence.upgrade_available 这条建议。老后端不给
@@ -320,38 +363,6 @@ function useAudit(runId: string, key: string): AuditState {
     return () => ctrl.abort()
   }, [runId, key])
   return state
-}
-
-/**
- * 出具横幅，外加双盲复算、反方审稿报上来的缺口另起的两组：「核查未通过」（两路结果不一致、结论被推翻）、「核查未完成」
- * （指标无法复算）。横幅把缺口都列在「校验未全部完成」下，读起来像是校验没做完：这里从横幅里拿出来，紧跟在它下面单列，
- * 颜色和横幅里的缺口一样（分组见 run/decode.ts 的 splitIssuanceGaps）。导出给预览用例（dev/fixtures/dual_check.tsx）
- */
-export function IssuanceWithChecks({ issuance, runClass }: { issuance: Record<string, any>; runClass?: string }) {
-  const { failed, unfinished, other } = useMemo(
-    () => splitIssuanceGaps(Array.isArray(issuance.gaps) ? issuance.gaps.map(String) : []), [issuance])
-  const verify = failed.length + unfinished.length > 0
-  const shown = useMemo(() => (verify ? { ...issuance, gaps: other } : issuance), [issuance, verify, other])
-  const group = (kind: 'failed' | 'unfinished', gaps: string[]) => gaps.length > 0 && (
-    <div data-evidence-verify-group={kind}>
-      <div className="font-medium">{DUAL_CHECK_TEXT.verifyGaps[kind]}</div>
-      <ul className="mt-0.5 space-y-0.5 pl-2 [overflow-wrap:anywhere]">
-        {gaps.map((g) => <li key={g}>· {g}</li>)}
-      </ul>
-    </div>
-  )
-  return (
-    <div className="space-y-1.5" data-evidence-issuance="">
-      <IssuanceBanner issuance={shown} runClass={runClass} />
-      {verify && (
-        <div className="space-y-1 rounded-lg border px-2 py-1.5 text-2xs leading-relaxed"
-             style={{ borderColor: 'var(--st-waiting)', color: 'var(--st-waiting)' }} data-evidence-verify-gaps="">
-          {group('failed', failed)}
-          {group('unfinished', unfinished)}
-        </div>
-      )}
-    </div>
-  )
 }
 
 /** 顶上一行：这次运行按哪种方式展示证据、封存核对的结果、每份报告文档的哈希 */

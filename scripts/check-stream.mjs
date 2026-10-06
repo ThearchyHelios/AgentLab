@@ -1411,6 +1411,47 @@ await section('放弃、结构化的报错、恢复的轮次、出具横幅（RE
   await one.page.close()
 })
 
+await section('出具横幅：核查报上来的缺口另起「核查未通过」「核查未完成」，不归在「校验未全部完成」下，先后同时间线', async () => {
+  // 双盲复算、反方审稿报上来的缺口（出具契约加了「双盲复算「节点名」：」「反方审稿：」的前缀）以前全列在「校验未全部
+  // 完成」下：两路结果不一致、结论被推翻读着像校验没做完。时间线、证据页、成果节点的印章早就分成「核查未通过」「核查未
+  // 完成」「校验未全部完成」三组（印章的悬停说明最后一行还指向成果区），运行面板成果区、问数据回答的横幅得同样分、同样的
+  // 先后。用例 issued-verify（dev/fixtures/issuance.tsx）：缺口的先后照服务端，核查的和别的混在一起，另有一条没通过
+  // SQL 检查的（横幅单列）
+  for (const [w, label] of [[1100, '宽栏'], [390, '390px']]) {
+    const { page, errors } = await open('syn=issued-verify', { w, h: 900, name: w === 1100 ? 'issued-verify' : undefined })
+    const V = await page.evaluate(async () => (await import('/src/dev/fixtures/issuance.tsx')).ISSUED_VERIFY)
+    const banner = page.locator('[data-issuance-banner=degraded]')
+    await banner.waitFor()
+    const blocks = await banner.evaluate((el) => [...el.querySelectorAll('[data-issuance-verify-gaps], [data-issuance-gaps]')]
+      .map((g) => ({
+        kind: g.getAttribute('data-issuance-verify-gaps') ?? 'other', head: g.firstElementChild?.textContent.trim(),
+        items: [...g.querySelectorAll('li')].map((li) => li.textContent.replace(/^·\s*/, '').trim()),
+      })))
+    const want = [{ kind: 'failed', head: '核查未通过：', items: V.failed }, { kind: 'unfinished', head: '核查未完成：', items: V.unfinished },
+      { kind: 'other', head: '校验未全部完成：', items: V.other }]
+    check(`${label}：横幅里先「核查未通过」、再「核查未完成」、最后「校验未全部完成」，各列各的`,
+      JSON.stringify(blocks) === JSON.stringify(want), JSON.stringify(blocks))
+    const rest = (await banner.locator('[data-issuance-gaps]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check(`${label}：……核查报上来的缺口一条都不在「校验未全部完成」下`,
+      ![...V.failed, ...V.unfinished].some((g) => rest.includes(g)) && !/双盲复算|反方审稿/.test(rest), rest)
+    const sql = (await banner.locator('[data-issuance-sql-checks]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check(`${label}：……没通过 SQL 检查的那条照旧单列在最前，不在三组里重复`, sql.includes('查询「取门店流水」（Q1）')
+      && !blocks.some((b) => b.items.includes(V.sql)), sql)
+    // 时间线上出具那一行：展开后按同样的先后列三组（时间线把「校验未全部完成」那一组叫「校验不完整」）
+    const row = page.locator('[data-turn] [data-step-status]').filter({ hasText: '降档出具' }).first()
+    await row.locator('button').first().click()
+    await page.waitForTimeout(150)
+    const line = (await row.innerText()).replace(/\s+/g, ' ')
+    const at = (s) => line.indexOf(s)
+    check(`${label}：……三组的先后和时间线上出具那一行一致`, at('核查未通过') >= 0 && at('核查未通过') < at('核查未完成')
+      && at('核查未完成') < at('校验不完整'), line)
+    const over = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    check(`${label}：页面不横向溢出`, over <= 0, `${over}px`)
+    check(`${label}：没有运行时报错`, errors.length === 0, errors.join(' | '))
+    await page.close()
+  }
+})
+
 await section('吸顶的轮次头贴着顶边（REQ-8）', async () => {
   for (const [q, w, h, label] of [['syn=mixed', 1024, 768, '宽栏 1024'], ['syn=mixed', 1180, 800, '宽栏 1180'],
                                   ['syn=mixed&dense=1', 380, 700, '窄栏']]) {

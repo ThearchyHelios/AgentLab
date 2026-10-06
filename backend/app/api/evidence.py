@@ -23,6 +23,8 @@ options.mask_columns 里的列换成「已遮罩」——在有身份体系之�
 
 期 4 的核查状态同样只读封存范围内的东西：指标步骤带双盲复算的结果（_dual_check_of，读双盲复算节点的产出和台账
 条目），句子带反方审稿的判断（_challenge_of，读反方审稿节点的产出和审稿记录）。它们是核查，不是证据：没有就不带这两个键。
+证据图的每份报告另带一张被反方审过的句子 → 判断的表（_challenge_verdicts，和 _challenge_of 同一个读法），正文据此挂
+句末标记，不用逐句请求片段接口。
 
 结论句的判定（四期）是模型给的，不是证据：正式运行的判定在报告文档里、随文档封存；探索运行
 按需裁判（POST …/evidence/judge），判定作为 evidence.judged 事件追加在封存之后，只填补没判过的
@@ -38,7 +40,7 @@ import logging
 import re
 import sqlite3
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, get_args
@@ -362,11 +364,14 @@ async def evidence_graph(run_id: str) -> dict[str, Any]:
 
     inputs = _input_payloads(sealed)
     for report in reports:
+        # 期 4：被反方审过的句子 → 判断，正文据此给它们挂句末标记。文档读不出来的不给；一句都没审的没有这个键
+        marks = _challenge_verdicts(sealed, report) if report.doc is not None else {}
         body["reports"].append({
             "node_id": report.node_id, "doc_artifact": report.doc_artifact,
             "doc_sealed": sealed.trusted, "hash_ok": report.hash_ok, "ok": report.ok,
             "repairs": report.repairs, "fields": report.fields, "stats": report.stats,
             **_judgement_of(report, sealed),
+            **({"challenge_verdicts": marks} if marks else {}),
         })
         if report.doc is not None:
             evidence, edges = _graph_of(report, sealed, inputs)
@@ -1151,32 +1156,29 @@ def _dual_status(node_id: str, output: dict[str, Any], entry: dict[str, Any] | N
 _CHALLENGE_VERDICTS = ("stands", "weakened", "refuted", "inconclusive")
 
 
-def _challenge_of(sealed: _Sealed, report: _Report, unit_id: str) -> dict[str, Any] | None:
-    """这一句的反方审稿判断：{verdict, node_id, artifact, on_refuted, report_label, counts, unreviewed?}。没审到这一句的
-    是 None。
+def _reviews(sealed: _Sealed, report: _Report
+             ) -> Iterator[tuple[str, dict[str, Any], str | None, list[dict[str, Any]]]]:
+    """审的就是正文这一份报告文档的每一次反方审稿，按跑完的先后：(节点, 产出, 审稿记录工件, 逐句的判断)。逐句判断的
+    每一项至少是个 dict，unit、verdict 认不认得由调用方看。片段接口的 unit.challenge（_challenge_of）和证据图的
+    challenge_verdicts（_challenge_verdicts）都从这里读，两边说的一定是同一次审稿。
 
-    只认审的就是正文这一份报告文档的：审稿记录（challenge_artifact）里记着它审的报告节点和文档工件，和这份对上才算——
+    只认审的就是这一份文档的：审稿记录（challenge_artifact）里记着它审的报告节点和文档工件，和这份对上才算——
     报告在审稿之后又重写了（循环、接着跑），同一个句子编号在新的一稿里说的可能是另一句话。记录没存上（产出里的
     challenge_artifact 为空）或读不出来时，按画布上它审的报告、和它跑完之前那份报告最后一次自查记下的文档认，判断取
-    产出里列的那几句（最多 10 句，被推翻、被削弱的排在前面），artifact 照产出写（没存上的为空）。几个反方审稿审了同一
-    份文档时取最后跑完、审到了这一句的那个。on_refuted 是实际生效的处置，report_label 是报告节点的名字。
-
-    counts 是这次审稿四种判断各几句——整份报告的，取节点产出里的那一份；unreviewed 是没能反查的句数，产出里有才带。
-    证据面板借审批卡上的展示画这一句，那一块的概况得是这份报告真实的数，不能凭这一句拼出一个「被推翻 0 句」。
+    产出里列的那几句（最多 10 句，被推翻、被削弱的排在前面），审稿记录工件照产出写（没存上的为空）。
 
     节点设为「报错并停止运行」、又有句子被推翻时，节点报错、没有 node.finished：审完那一刻的 challenge_done 日志记着
-    审稿记录和计数，按它认（只认审稿记录存上了的），on_refuted 为 fail。运行因此失败了，被推翻的是哪几句、反方凭什么，
-    证据面板里照样看得到。
+    审稿记录和计数，按它认（只认审稿记录存上了的），产出拼成 {challenge_artifact, counts, on_refuted: fail}。运行因此
+    失败了，被推翻的是哪几句、反方凭什么，证据面板里照样看得到。
     """
     reviewers = set(sealed.nodes_of("challenge"))
-    if not reviewers or not unit_id:
-        return None
+    if not reviewers:
+        return
     spec: GraphSpec | None = None
     #: 报告节点 → 到这一刻为止它最后一次自查记下的文档
     drafts: dict[str, str] = {}
     #: 反方审稿节点 → 这一次执行里审完时的日志：节点报错时它就是审稿结果
     done: dict[str, dict[str, Any]] = {}
-    found: dict[str, Any] | None = None
     for _, etype, node_id, data in sealed.events:
         if not node_id or not isinstance(data, dict):
             continue
@@ -1218,9 +1220,30 @@ def _challenge_of(sealed: _Sealed, report: _Report, unit_id: str) -> dict[str, A
             if target != report.node_id or drafts.get(target) != report.doc_artifact:
                 continue
             claims = output.get("items")
-        claims = [c for c in claims or [] if isinstance(c, dict)]
-        verdict = next((c.get("verdict") for c in claims if c.get("unit") == unit_id), None)
-        if not isinstance(verdict, str) or not verdict:
+        yield node_id, output, artifact, [c for c in claims or [] if isinstance(c, dict)]
+
+
+def _verdict_in(claims: list[dict[str, Any]], unit_id: str) -> str | None:
+    """一次审稿里这一句的判断：取列着这一句的第一条，判断不是一个词（缺了、空的、不是字符串）时这次审稿不算审到它。"""
+    verdict = next((c.get("verdict") for c in claims if c.get("unit") == unit_id), None)
+    return verdict if isinstance(verdict, str) and verdict else None
+
+
+def _challenge_of(sealed: _Sealed, report: _Report, unit_id: str) -> dict[str, Any] | None:
+    """这一句的反方审稿判断：{verdict, node_id, artifact, on_refuted, report_label, counts, unreviewed?}。没审到这一句的
+    是 None。认哪一次审稿见 _reviews；几个反方审稿审了同一份文档时取最后跑完、审到了这一句的那个。artifact 是审稿记录
+    （没存上的为空），on_refuted 是实际生效的处置（节点报错停止运行的是 fail），report_label 是报告节点的名字。
+
+    counts 是这次审稿四种判断各几句——整份报告的，取节点产出里的那一份；unreviewed 是没能反查的句数，产出里有才带。
+    证据面板单句展示时不画报告级的计数，可「无法判断」是不是因为反查没完成，得拿这两个数对一下。
+    """
+    if not unit_id:
+        return None
+    found: dict[str, Any] | None = None
+    spec: GraphSpec | None = None
+    for node_id, output, artifact, claims in _reviews(sealed, report):
+        verdict = _verdict_in(claims, unit_id)
+        if verdict is None:
             continue
         spec = spec or _spec_of(sealed)
         writer = spec.node_map().get(report.node_id) if spec else None
@@ -1232,6 +1255,20 @@ def _challenge_of(sealed: _Sealed, report: _Report, unit_id: str) -> dict[str, A
                  **({"unreviewed": unreviewed} if isinstance(unreviewed, int) and not isinstance(unreviewed, bool)
                     and unreviewed >= 0 else {})}
     return found
+
+
+def _challenge_verdicts(sealed: _Sealed, report: _Report) -> dict[str, str]:
+    """这份报告里被反方审过的句子 → 判断（证据图 reports[] 的 challenge_verdicts）。正文据此给被审过的句子挂句末标记、
+    点开整句面板：有的被审句子既没有可点的片段、也没有裁判判定，不靠这张表就打不开；也不用为了认出它们逐句请求片段接口。
+
+    读法和 _challenge_of 一字不差（同一个 _reviews、同一个 _verdict_in）：每一句取最后跑完、审到了它的那次审稿，所以表里
+    每一句的判断就是点开它时片段接口答的 unit.challenge.verdict。只有被审过的句子；一句都没审的是空表。
+    """
+    out: dict[str, str] = {}
+    for _, _, _, claims in _reviews(sealed, report):
+        units = dict.fromkeys(c.get("unit") for c in claims if isinstance(c.get("unit"), str) and c.get("unit"))
+        out.update({uid: verdict for uid in units if (verdict := _verdict_in(claims, uid)) is not None})
+    return out
 
 
 def _challenge_counts(raw: Any, claims: list[dict[str, Any]]) -> dict[str, int]:

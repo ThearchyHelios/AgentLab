@@ -4,7 +4,9 @@ import {
   type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type RefObject,
 } from 'react'
 import { createPortal } from 'react-dom'
-import { ListChecks, MessageCircleQuestion } from 'lucide-react'
+import {
+  ListChecks, MessageCircleQuestion, ShieldAlert, ShieldCheck, ShieldEllipsis, ShieldMinus, ShieldX, type LucideIcon,
+} from 'lucide-react'
 import clsx from 'clsx'
 import { rovingTarget } from '../components/ui'
 import {
@@ -13,9 +15,15 @@ import {
   type EvidenceStateCode, type EvidenceTally as Tally,
 } from '../lib/evidence'
 import { formatNumber } from '../lib/format'
-import { EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT, JUDGE_TEXT, claimTally, evidenceTally, type ClaimTallyCounts } from '../lib/terms'
-import { useEvidence, useVerdicts } from '../store/evidence'
-import type { EvidenceBlock, EvidenceDocData, EvidenceSegment, EvidenceUnit, EvidenceVerdict } from '../types'
+import {
+  CHALLENGE_TEXT, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT, JUDGE_TEXT, claimTally, evidenceTally,
+  type ClaimTallyCounts,
+} from '../lib/terms'
+import { useEvidence, useVerdicts, type Slot } from '../store/evidence'
+import type {
+  ChallengeVerdict, EvidenceBlock, EvidenceChallengeVerdicts, EvidenceDocData, EvidenceGraph, EvidenceSegment, EvidenceUnit,
+  EvidenceVerdict,
+} from '../types'
 import { EvidencePanel, type PanelMode, type PanelView } from './EvidencePanel'
 import { askAbout, type InquiryAccess } from './Inquiry'
 import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type InlineStyles } from './Markdown'
@@ -30,6 +38,9 @@ import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type In
  *
  * 结论句的判定（四期）只在句末挂一枚小徽标（◆ ◇ ! ○ ?），整句不画线；证据相矛盾（和旧的证据不支持）的整句
  * 铺一层浅底。徽标也是按钮：点开是这一句的「模型的解释」。判定是模型给的，颜色一律不用确定性的绿。
+ * 被反方审过的句子（期 4，证据图的 reports[].challenge_verdicts）同样在句末挂标记：被推翻、被削弱带字、醒目，经受住、
+ * 无法判断只有淡色图标；有判定的句子并在同一枚徽标里。点开都是整句面板，没有可点片段的句子也打得开。证据图有运行就取
+ * 一次；手里那份是别处早先取的、已经过期（报告改写过、运行收尾之前取的）时重取一次，见 useRunGraph。
  *
  * 键盘：整份报告只占一个 Tab 位（roving tabindex）。←/→ 在有状态的片段、句末徽标间走，↑/↓ 按
  * 句子走（表格里按列走到上一行 / 下一行，出了表格接着按句子走），n / N 跳到下一处 /
@@ -69,7 +80,15 @@ const unitOfAsk = (key: string) => (key.startsWith('ask:') ? key.slice(4) : null
 const askable = (unit: EvidenceUnit, block: EvidenceBlock) =>
   (unit.kind ? unit.kind === 'claim' : !!unitText(unit).trim()) && !['heading', 'code', 'hr', 'table'].includes(block.type)
 
-interface Badge { unit: EvidenceUnit; block: number; verdict: EvidenceVerdict; state: EvidenceStateCode }
+/**
+ * 句末徽标：结论句裁判的判定（verdict、state），和 / 或反方审稿的判断（challenge）。两样都有的并在一个徽标里，不挂两个；
+ * 只被反方审过的句子（没开裁判的报告、裁判没送的句子）只有 challenge
+ */
+interface Badge {
+  unit: EvidenceUnit; block: number
+  verdict?: EvidenceVerdict; state?: EvidenceStateCode
+  challenge?: string
+}
 
 interface Model {
   /** 可点的片段和句末徽标，按正文顺序 */
@@ -98,7 +117,8 @@ interface Model {
   grid: Map<string, string>
 }
 
-function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVerdict>, ask = false): Model {
+function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVerdict>, ask = false,
+  marks?: Record<string, string>): Model {
   const order: string[] = []
   const index = new Map<string, number>()
   const seg = new Map<string, { seg: EvidenceSegment; unit: EvidenceUnit; block: number }>()
@@ -132,12 +152,15 @@ function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVe
           if (!grid.has(key)) grid.set(key, s.id)
         }
       }
-      // 句末徽标排在这一句的片段后面：←/→ 走到句尾就是它，证据相矛盾、部分有依据、证据不足的也进 n / N
+      // 句末徽标排在这一句的片段后面：←/→ 走到句尾就是它，证据相矛盾、部分有依据、证据不足的也进 n / N。被反方审过的
+      // 句子同样挂（和裁判的判定并在一个徽标里）：没有可点的片段、也没有判定的句子靠它才打开得了整句面板。n / N 只按
+      // 裁判的判定走——横幅、证据条的「定位下一处」只数证据和判定的问题，反方的判断在面板和审批卡里看
       const verdict = unitVerdict(unit, overlay)
       const state = verdictState(verdict)
-      if (verdict && state) {
+      const challenge = marks?.[unit.id]
+      if ((verdict && state) || challenge) {
         const key = badgeKey(unit.id)
-        badge.set(key, { unit, block: b, verdict, state })
+        badge.set(key, { unit, block: b, ...(verdict && state ? { verdict, state } : {}), ...(challenge ? { challenge } : {}) })
         index.set(key, order.length)
         order.push(key)
         if (first) { unitFirst.push(key); first = false }
@@ -198,6 +221,84 @@ function verticalTarget(model: Model, id: string, down: boolean): string | null 
   return model.unitFirst[(u + (down ? 1 : -1) + n) % n] ?? null
 }
 
+type GraphReport = NonNullable<EvidenceGraph['reports']>[number]
+
+/**
+ * 证据图里的这一项说的是不是正文这一份：同一个报告节点，封存的就是这一稿（工件 id 对得上）。证据图说的是这个报告节点最后
+ * 写的那一稿，正文是另一稿时同一个句子编号说的可能是别的话。正文没记报告节点、没给工件 id 的（预览、老文档）不按它比
+ */
+const sameReport = (r: GraphReport | undefined, report: string | undefined, artifact: string | undefined) =>
+  (!report || !r?.node_id || r.node_id === report) && (!artifact || r?.doc_artifact === artifact)
+
+/**
+ * 这次运行的证据图（正文的反方标记、按需判过的句子都从这里来）：有运行就取一次，同一次运行只取一回，不逐句请求。
+ *
+ * 挂上（或换了一稿）那一刻手里已经有的那一份是别处早先取的，可能过期了。审批卡里展开过报告，取的就是运行停在审批上那一刻
+ * 的图：之后报告改写了（第二次审批、同一张卡换稿），正文这一稿在那份图里找不到，一个标记都挂不上；正文是运行的成果
+ * （settled）而那份图没封存，审批之后才审完的反方审稿不在里面。这两种按（运行、报告、工件）重取一次，重取回来还是这样
+ * 就作罢（正文是改写前的原件时本来就对不上），不反复请求。挂上时还没有、正在取的那一份是这时候取的，不算过期。证据页自己
+ * 管重取（pages/runs/EvidencePane）
+ */
+function useRunGraph(runId: string | undefined, report: string | undefined, artifact: string | undefined, settled: boolean):
+  EvidenceGraph | undefined {
+  const slot = useEvidence((s) => (runId ? s.graphs[runId] : undefined))
+  const loadGraph = useEvidence((s) => s.loadGraph)
+  const reloadGraph = useEvidence((s) => s.reloadGraph)
+  const key = runId ? `${runId}\u0000${report ?? ''}\u0000${artifact ?? ''}` : ''
+  // 挂上、换了一稿那一刻手里已经取到的那一份：只有它可能过期，看过一次就放下
+  const held = useRef<{ key: string; slot: Slot<EvidenceGraph> | null }>({ key: '', slot: null })
+  useEffect(() => {
+    if (!runId || held.current.key === key) return
+    const cur = useEvidence.getState().graphs[runId]
+    held.current = { key, slot: cur?.status === 'ok' ? cur : null }
+    void loadGraph(runId)
+  }, [runId, key, loadGraph])
+  useEffect(() => {
+    const h = held.current
+    if (!runId || h.key !== key || !h.slot || slot !== h.slot) return
+    h.slot = null
+    const graph = slot.data
+    const mine = (graph?.reports ?? []).some((r) => sameReport(r, report, artifact))
+    if (!mine || (settled && !graph?.seal?.sealed)) void reloadGraph(runId)
+  }, [runId, key, slot, report, artifact, settled, reloadGraph])
+  return slot?.data
+}
+
+/**
+ * 这份报告里被反方审过的句子 → 判断（证据图 reports[].challenge_verdicts），只认说的就是正文这一份的那一项（sameReport）。
+ * 没有运行、证据图还没取到（或取不到）、一句都没审、老服务端都是 undefined
+ */
+function challengeMarks(graph: EvidenceGraph | undefined, report: string | undefined, artifact: string | undefined):
+  EvidenceChallengeVerdicts | undefined {
+  const hit = (graph?.reports ?? []).find((r) => sameReport(r, report, artifact))
+  const raw: unknown = hit?.challenge_verdicts
+  if (!raw || typeof raw !== 'object') return undefined
+  const marks = Object.fromEntries(Object.entries(raw as Record<string, unknown>)
+    .filter((e): e is [string, string] => !!e[0] && typeof e[1] === 'string' && !!e[1]))
+  return Object.keys(marks).length ? marks : undefined
+}
+
+/** 句末标记读屏念的那一句：截到 40 字（同 lib/evidence 的 claimLabel） */
+const markSentence = (unit: EvidenceUnit) => {
+  const text = unitText(unit).trim()
+  return text.length > 40 ? `${text.slice(0, 39)}…` : text
+}
+
+/** 反方审稿判断的叫法：认不出的照写原值（同审批卡） */
+const challengeLabel = (v: string) => (Object.hasOwn(CHALLENGE_TEXT.verdict, v)
+  ? CHALLENGE_TEXT.verdict[v as keyof typeof CHALLENGE_TEXT.verdict] : CHALLENGE_TEXT.verdictUnknown(v))
+
+/**
+ * 句末徽标的读屏名：有判定的照裁判的说法（claimLabel），被反方审过的接着说反方审稿的判断；只被反方审过的
+ * 说「结论句「…」，反方审稿：被推翻」
+ */
+function badgeLabel(badge: Badge): string {
+  const said = badge.challenge ? CHALLENGE_TEXT.markLabel(challengeLabel(badge.challenge)) : ''
+  if (!badge.verdict) return JUDGE_TEXT.badgeLabel(markSentence(badge.unit), said, false)
+  const judged = claimLabel(badge.unit, badge.verdict)
+  return said ? `${judged}，${said}` : judged
+}
+
 /** 片段的外观：线型走 data 属性（CSS 里只管线型），颜色写成变量交给 index.css（引文前的引号用 --ev-glyph） */
 function segStyle(state: EvidenceStateCode): CSSProperties {
   const meta = EVIDENCE_STATE[state]
@@ -244,27 +345,33 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
    */
   tier?: string
   /**
+   * 正文是运行的成果（成果区、问数据的回答，EvidenceField 给）：运行已经结束。手里那份证据图要是没封存，就是收尾之前取的
+   * （比如审批卡里展开报告时），重取一次，见 useRunGraph
+   */
+  settled?: boolean
+  /**
    * 审批质询（期 4）：给了就在每句结论后面挂「质询」（悬停、焦点在这一句上时出现），划选原文时浮出「质询」，点了打开
    * 这份报告的提问框。能不能问由页面按运行状态定（审批卡：运行停在审批上；运行详情：封存了的探索运行），approvalId 是
    * 运行停在的那张审批。给了它，页面上要同时挂这份报告的 ReportInquiry（问答串和提问框在那里）
    */
   inquiry?: InquiryAccess | null
 }>(function EvidenceDoc({ doc, artifact, runId, dense = false, label, panel = 'auto', dock, onView, tally = false, runClass,
-  tier, inquiry }, ref) {
+  tier, settled = false, inquiry }, ref) {
   const blocks = useMemo(() => doc.blocks ?? [], [doc])
   const report = doc.node_id || undefined
   // 质询要知道是哪次运行的哪份报告：两样缺一样就不挂入口
   const ask = !!inquiry && !!runId && !!report
   // 封存之后按需追加的判定：盖过文档里的「未裁判 · 按需」。只换句末徽标，封存的文档一个字不改
   const overlay = useVerdicts(runId, report)
-  const model = useMemo(() => buildModel(blocks, overlay, ask), [blocks, overlay, ask])
+  // 有运行就取这次运行的证据图（同一次运行只取一次，不逐句请求；过期了重取一次）：它带着被反方审过的句子
+  // （reports[].challenge_verdicts，正式、探索运行都可能有，反方审稿在报告写完之后才审，文档里没有这份记录），探索运行的
+  // 报告还带着之前按需判过的句子（reports[].post_seal_verdicts，useVerdicts 读），重新打开页面时标记、徽标都还在
+  const graph = useRunGraph(runId, report, artifact, settled)
+  // 被反方审过的句子：句末挂标记（和裁判的判定并在一个徽标里），点开是整句面板
+  const marks = useMemo(() => challengeMarks(graph, report, artifact), [graph, report, artifact])
+  const model = useMemo(() => buildModel(blocks, overlay, ask, marks), [blocks, overlay, ask, marks])
   const counts = useMemo(() => docTally(doc), [doc])
   const claims = useMemo(() => claimCounts(doc, overlay), [doc, overlay])
-  // 探索运行的报告（开了裁判的按需文档，或调用方说了是探索运行）：证据图带着这次运行里之前按需判过的句子
-  // （reports[].post_seal_verdicts），取一次，重新打开页面时徽标还在。别的报告不多发这个请求
-  const loadGraph = useEvidence((s) => s.loadGraph)
-  const lateOnes = doc.judge?.mode === 'on_demand' || (runClass === 'exploratory' && doc.judge?.mode !== 'inline')
-  useEffect(() => { if (lateOnes && runId) void loadGraph(runId) }, [lateOnes, runId, loadGraph])
   const rootRef = useRef<HTMLDivElement>(null)
   const instance = useId()
   const panelId = `${instance}-panel`
@@ -283,9 +390,10 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     setView(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [blocks])
-  // 拿着 Tab 位的徽标没了（判成「不是结论句」）：Tab 位交回第一个，整份报告不能一个 Tab 位都没有
+  // 拿着 Tab 位的徽标没了（判成「不是结论句」），或者挂上时一个键盘目标都没有（没有可点片段、没开裁判、没给质询）、
+  // 反方标记随证据图后来才到：Tab 位交给第一个，整份报告不能一个 Tab 位都没有
   useEffect(() => {
-    if (current && !model.index.has(current)) setCurrent(model.order[0] ?? null)
+    if (current ? !model.index.has(current) : model.order.length > 0) setCurrent(model.order[0] ?? null)
   }, [model, current])
 
   // 同一时刻只开一个面板：另一份报告打开了自己的面板，这边的就收起
@@ -341,7 +449,8 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     if (badge) {
       claim(instance)
       setView({ kind: 'unit', id: badge.unit.id })
-      setAnnounce(`${JUDGE_TEXT.section}：${claimLabel(badge.unit, badge.verdict)}`)
+      // 只有反方标记的句子：读屏名本身就说了「反方审稿：被推翻」，前面不再加一个标题，免得「反方审稿」念两遍
+      setAnnounce(badge.verdict ? `${JUDGE_TEXT.section}：${badgeLabel(badge)}` : badgeLabel(badge))
       return
     }
     const hit = model.seg.get(id)
@@ -490,6 +599,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
       artifact={artifact}
       runId={runId}
       runClass={runClass}
+      marks={marks}
       view={view}
       onClose={() => close()}
       onLocate={(id) => { focusSeg(id, { flash: true }); openSeg(id) }}
@@ -860,10 +970,51 @@ const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, ac
   }
 })
 
+/** 反方审稿的判断在句末徽标里的样子。soft 是悬停、展开时铺的浅底，醒目的那两种不铺（见 LOUD_RING） */
+interface MarkLook { icon: LucideIcon; color: string; soft: string; loud: boolean }
+
+/**
+ * 被推翻、被削弱醒目：盾牌图标加判断两个字，用失败色、提醒色；经受住、无法判断低调：只有淡色的盾牌图标（悬停、读屏照样
+ * 说得出是哪一种）。四种图标各不相同，去掉颜色也分得开：无法判断用省略号不用问号——句末常常已经有裁判的「?」（未裁判、
+ * 证据不足）和「质询」的问号，再添一个问号就分不清了，和经受住的勾也更好分。判断是反方模型给的，经受住也不用确定性的绿。
+ * 认不出的判断按低调画
+ */
+const MARK_LOOK: Record<ChallengeVerdict, MarkLook> = {
+  refuted: { icon: ShieldX, color: 'var(--st-failed)', soft: 'transparent', loud: true },
+  weakened: { icon: ShieldMinus, color: 'var(--st-waiting)', soft: 'transparent', loud: true },
+  stands: { icon: ShieldCheck, color: 'var(--text-faint)', soft: 'var(--st-idle-soft)', loud: false },
+  inconclusive: { icon: ShieldEllipsis, color: 'var(--text-faint)', soft: 'var(--st-idle-soft)', loud: false },
+}
+const markLook = (verdict: string): MarkLook => (Object.hasOwn(MARK_LOOK, verdict) ? MARK_LOOK[verdict as ChallengeVerdict]
+  : { icon: ShieldAlert, color: 'var(--text-faint)', soft: 'var(--st-idle-soft)', loud: false })
+
+/**
+ * 带字的醒目标记悬停、展开时不铺浅底（index.css 的 .ev-badge 按 --ev-soft 铺），改描一圈细边：10px 的失败色、提醒色字叠在
+ * 14% 的浅底上，浅色主题里对比度只有 4.0 左右（页面底色上），面板开着时这枚标记一直是展开态。和裁判徽标并在一起的同样
+ * 不铺（浅底是裁判判定的颜色，字是反方的颜色）。细边用徽标的字色，和焦点环（2px 强调色、外扩）分得开
+ */
+const LOUD_RING = 'hover:shadow-[inset_0_0_0_1px_currentColor] aria-expanded:shadow-[inset_0_0_0_1px_currentColor]'
+
+/**
+ * 句末徽标里反方审稿的那一截。和裁判的字形并在一个徽标里时跟在字形后面（after）。醒目的那两种连字一起写：字号定成
+ * 10px（同句末的「无证据」小标签），窄栏里 0.72em 的上标只有 8px，汉字认不清
+ */
+function ChallengeMark({ verdict, look, after }: { verdict: string; look: MarkLook; after: boolean }) {
+  const Icon = look.icon
+  return (
+    <span aria-hidden="true" className={clsx('inline-flex items-center gap-px whitespace-nowrap', after && 'ml-0.5')}
+          style={{ color: look.color }} data-ev-challenge-look={look.loud ? 'loud' : 'quiet'}>
+      <Icon size={10} strokeWidth={2.25} className="shrink-0" />
+      {look.loud && <span className="text-[10px]">{challengeLabel(verdict)}</span>}
+    </span>
+  )
+}
+
 /**
  * 一句话：文字按行内 Markdown 渲染（整句算一次样式，跨片段的 `code`、**粗体** 不会
  * 被切坏），有状态的片段包成按钮。含无证据片段的句子末尾挂「? 无证据」；有判定的结论句末尾挂
- * 一枚徽标（也是按钮），证据相矛盾（和旧的证据不支持）的整句铺浅底——字本身不画线
+ * 一枚徽标（也是按钮），证据相矛盾（和旧的证据不支持）的整句铺浅底——字本身不画线。被反方审过的
+ * 句子同样挂徽标（和判定并在一起），点开都是整句面板
  */
 function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }: {
   unit: EvidenceUnit; doc: EvidenceDocData; current: string | null; active: string | null; panelId: string
@@ -911,8 +1062,21 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }
     )
   })
   const key = badge ? badgeKey(unit.id) : ''
-  const meta = badge ? EVIDENCE_STATE[badge.state] : null
+  const meta = badge?.state ? EVIDENCE_STATE[badge.state] : null
   const open = !!badge && active === key
+  const verdict = badge?.verdict
+  // 模型判过的写明谁判的、非确定（证据不足的接着写缺什么）；模型没判过的（按需还没点、到上限、没跑成）只说
+  // 这是什么状态——到上限没判的也记着裁判模型，但不能写成「（模型 · 非确定）」，像是它判过一样
+  const judgedTitle = !verdict || !meta ? ''
+    : isJudged(verdict)
+      ? `${meta.label}${verdict.post_seal ? ` · ${JUDGE_TEXT.postSeal}` : ''}（${verdict.judge || JUDGE_TEXT.judgeModel} · 非确定）${
+        verdictMissing(verdict) ? `。${JUDGE_TEXT.missing(verdictMissing(verdict))}` : ''}`
+      : limitOf(verdict) ? `${meta.label}：${JUDGE_TEXT.limitNotJudged}` : `${meta.label}：${meta.hint}`
+  // 无法判断的句子可能根本没反查成（服务端按规则记的无法判断，反方模型没看过），正文里分不出是哪一种：不说成反方模型的判断
+  const challengeTitle = !badge?.challenge ? ''
+    : badge.challenge === 'inconclusive' ? CHALLENGE_TEXT.markTitleUnsure(challengeLabel(badge.challenge))
+    : CHALLENGE_TEXT.markTitle(challengeLabel(badge.challenge))
+  const look = badge?.challenge ? markLook(badge.challenge) : null
   const body = (
     <>
       {conflicting(badge?.state)
@@ -924,32 +1088,34 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }
           {EVIDENCE_STATE[state].glyph}{TAG_TEXT[state]}
         </span>
       ))}
-      {badge && meta && (
+      {badge && (meta || look) && (
         <button
           type="button"
-          className="ev-badge"
+          className={clsx('ev-badge', look?.loud && LOUD_RING)}
           data-ev-claim={unit.id}
           data-ev-verdict={badge.state}
-          data-ev-post-seal={badge.verdict.post_seal ? '' : undefined}
+          data-ev-post-seal={verdict?.post_seal ? '' : undefined}
+          data-ev-challenge-mark={badge.challenge}
           tabIndex={current === key ? 0 : -1}
-          aria-label={claimLabel(unit, badge.verdict)}
+          aria-label={badgeLabel(badge)}
           aria-expanded={open}
           aria-controls={open ? panelId : undefined}
-          // 模型判过的写明谁判的、非确定（证据不足的接着写缺什么）；模型没判过的（按需还没点、到上限、没跑成）只说
-          // 这是什么状态——到上限没判的也记着裁判模型，但不能写成「（模型 · 非确定）」，像是它判过一样
-          title={isJudged(badge.verdict)
-            ? `${meta.label}${badge.verdict.post_seal ? ` · ${JUDGE_TEXT.postSeal}` : ''}（${badge.verdict.judge || JUDGE_TEXT.judgeModel} · 非确定）${
-              verdictMissing(badge.verdict) ? `。${JUDGE_TEXT.missing(verdictMissing(badge.verdict))}` : ''}`
-            : limitOf(badge.verdict) ? `${meta.label}：${JUDGE_TEXT.limitNotJudged}` : `${meta.label}：${meta.hint}`}
-          style={segStyle(badge.state)}
+          title={[judgedTitle, challengeTitle].filter(Boolean).join('。')}
+          // 字形的颜色照裁判的判定；只被反方审过的照反方的判断（悬停的浅底同理）。带着醒目的反方标记时不铺浅底（LOUD_RING）
+          style={meta ? { ...segStyle(badge.state!), ...(look?.loud ? { '--ev-soft': 'transparent' } : {}) } as CSSProperties
+            : { '--ev-glyph': look!.color, '--ev-soft': look!.soft } as CSSProperties}
         >
-          <span aria-hidden="true">{meta.glyph}</span>
+          {meta && <span aria-hidden="true">{meta.glyph}</span>}
+          {look && <ChallengeMark verdict={badge.challenge!} look={look} after={!!meta} />}
         </button>
       )}
     </>
   )
   if (!ask) return body
   // 「质询」跟在句末，是一个固定宽度的小图标：平时淡淡的，悬停这一句、焦点落在这一句上时显出来（强调色、描边）。
+  // 平时也得看得清它是个可点的东西（WCAG 1.4.11 要求界面组件对背景 ≥ 3:1）：最淡的字色再压到 60% 不透明，深色约 2.75、
+  // 浅色约 2.33，看不出来。改用次一级的暗字色压到 70%：深浅两套、报告摆在页面底色或面板底色上都在 3.3 以上，仍比正文
+  // 淡得多；不透明度留在 0.75 以下，和悬停、聚焦时显出来（不透明、强调色）分得开。
   // 显没显出来只换颜色，宽度一直是那么宽——悬停时撑开的话，后面的字整体右移，鼠标底下的数字跟着挪走，点不到。
   // 触屏没有悬停，一直显出来，并写上「质询」两个字。
   // 跟随的那种只在焦点在这一句上时进 Tab 顺序，整份报告不因此多出一串 Tab 位
@@ -961,7 +1127,7 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }
       <button type="button" data-inquiry-ask={unit.id} tabIndex={here ? 0 : -1}
               aria-label={INQUIRY_TEXT.askUnit(unitText(unit).trim())} title={INQUIRY_TEXT.askTitle}
               className={'ml-1 inline-flex select-none items-center gap-0.5 whitespace-nowrap rounded border border-transparent px-[3px] '
-                + 'align-middle text-[10px] font-medium leading-[1.4] text-faint opacity-60 outline-none '
+                + 'align-middle text-[10px] font-medium leading-[1.4] text-dim opacity-70 outline-none '
                 + 'hover:bg-hover group-hover/evu:border-[color:var(--border)] group-hover/evu:text-[color:var(--accent)] group-hover/evu:opacity-100 '
                 + 'group-focus-within/evu:border-[color:var(--border)] group-focus-within/evu:text-[color:var(--accent)] group-focus-within/evu:opacity-100 '
                 + 'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[color:var(--accent)] '
@@ -996,8 +1162,9 @@ export const EvidenceField = forwardRef<EvidenceDocHandle, {
   const counted = useMemo(() => (usable ? withVerdicts(usable, overlay) : null), [usable, overlay])
   useEffect(() => { onDoc?.(counted) }, [counted, onDoc])
   if (usable) {
+    // 成果只在运行结束之后才有：手里那份证据图要是没封存，就是收尾之前取的（settled，见 useRunGraph）
     return <EvidenceDoc ref={ref} doc={usable} artifact={artifact} runId={runId} dense={dense} label={label} tally={tally}
-                        runClass={runClass} />
+                        runClass={runClass} settled />
   }
   const note = slot?.status === 'error' ? EVIDENCE_TEXT.docMissing
     : otherRun ? EVIDENCE_TEXT.docOtherRun : mismatch ? EVIDENCE_TEXT.docMismatch : ''
