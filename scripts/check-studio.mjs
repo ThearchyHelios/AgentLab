@@ -2655,8 +2655,10 @@ const ASSISTANT_BROKEN = '助手使用的模型接入「demo-gone」不存在。
 await section('点名的模型接入：检查器模型一栏说清留空用哪个接入；助手栏照实显示存着的设定、能重新选「跟随默认」', async () => {
   FAKES['st-model'] = wf('st-model', { name: '__studio_check_model__', graph: MODEL_GRAPH, version: 1 })
   FAKES['st-modeldef'] = wf('st-modeldef', { name: '__studio_check_model_defaults__', graph: { ...MODEL_GRAPH, defaults: { provider: 'demo-main' } }, version: 1 })
-  // 助手的模型设定：存着一个已删掉的接入，GET 照后端说明用不了；PUT 记下请求、清掉存着的接入
-  const copilot = { saved: { configured: true, provider: 'demo-gone', model: null, effective_provider: null, effective_model: null, error: ASSISTANT_BROKEN }, puts: [] }
+  // 助手的模型设定：存着一个已删掉的接入和一个下拉里列得出的模型（big-model），GET 照后端说明用不了；PUT 记下请求、
+  // 清掉存着的接入。模型列得出也不能直接选中它：那样看着一切正常，发出去还会带上模型、绕过存着的接入
+  const BROKEN = { configured: true, provider: 'demo-gone', model: 'big-model', effective_provider: null, effective_model: null, error: ASSISTANT_BROKEN }
+  const copilot = { saved: BROKEN, puts: [] }
   const before = async (page) => {
     const json = (route, body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
     await page.route(/\/api\/providers(\?.*)?$/, (route) => (route.request().method() === 'GET' ? json(route, MODEL_PROVIDERS) : route.fallback()))
@@ -2718,7 +2720,8 @@ await section('点名的模型接入：检查器模型一栏说清留空用哪�
     const select = page.locator('#copilot-model')
     await select.waitFor({ timeout: 3000 })
     const picked = await select.evaluate((el) => el.options[el.selectedIndex]?.textContent ?? '')
-    check('下拉停在存着的设定上，不显示成「跟随默认」', picked === '模型接入「demo-gone」的默认模型', picked)
+    check('下拉停在存着的设定上（接入连同模型），不显示成「跟随默认」，也不只选中同名的模型', picked === 'big-model（模型接入「demo-gone」）'
+      && await select.inputValue() !== '' && await select.inputValue() !== 'big-model', picked)
     check('……「跟随默认」不带「当前」：选它以后用哪个要服务端说了算', (await select.locator('option[value=""]').innerText()).trim() === '跟随默认')
     const said = await page.locator('[data-copilot-model-error]').innerText().catch(() => '')
     check('下拉下面照实写原因（和发出一句话后报的同一句）', said === ASSISTANT_BROKEN && await select.getAttribute('aria-invalid') === 'true', said)
@@ -2761,7 +2764,7 @@ await section('点名的模型接入：检查器模型一栏说清留空用哪�
     await second.ctx.close()
 
     // 390 宽：助手栏浮在画布上，展开「助手使用的模型」、原因那一长句照样折行，不把页面撑出横向滚动
-    copilot.saved = { configured: true, provider: 'demo-gone', model: null, effective_provider: null, effective_model: null, error: ASSISTANT_BROKEN }
+    copilot.saved = BROKEN
     const narrow = await open({ path: '/studio/st-model', before, width: 390, height: 844 })
     await blur(narrow.page)
     await narrow.page.keyboard.press('Alt+KeyA')
