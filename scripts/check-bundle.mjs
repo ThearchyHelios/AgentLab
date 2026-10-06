@@ -635,10 +635,14 @@ await section('样本页：各种形状', async () => {
       phoneCited?.text)
     check('masked-source：总览通过（可核对的项全部通过），没有一项不通过', s.overall === 'pass'
       && s.text === '可核对的项全部通过' && !s.items.some((i) => i.result === 'fail'), `${s.overall}：${s.text}`)
-    // 点开地区汇总的第一个数字：出处面板里有这条查询的 SQL 和被引用的那一行
-    await page.locator('button.num[data-result="pass"]').first().click()
-    await page.locator('#detail').waitFor({ state: 'visible', timeout: 5000 })
-    const detail = await page.locator('#detail').innerText()
+    // 点开地区汇总的第一个数字：出处面板里有这条查询的 SQL 和被引用的那一行。先看有没有核对通过的数字，没有就照实记一笔、
+    // 不去点：点空了要等满时限才抛错，同一节后面的样本（连同下面这一项）就都不跑了
+    const passed = page.locator('button.num[data-result="pass"]')
+    let detail = '页面上没有核对通过的数字'
+    if (await passed.count()) {
+      await passed.first().click({ timeout: 5000 })
+      detail = await appears(page.locator('#detail')) ? await page.locator('#detail').innerText() : '点开后没有出处面板'
+    }
     check('masked-source：点开数字看得到汇总查询的 SQL 和被引用的那一行', detail.includes('SUM(spend)')
       && detail.includes('快照第 1 行') && detail.includes('华东'), detail.replace(/\s+/g, ' ').slice(0, 120))
     const html = await page.content()

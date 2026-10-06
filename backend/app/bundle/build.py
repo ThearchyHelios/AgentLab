@@ -10,10 +10,10 @@
 - 工件：每份报告文档（各报告节点最后一次自查记下的 doc_artifact）、它引用到的口径卡和查询快照，按原字节
   base64 嵌入，浏览器重算 sha256 和 id 比。数据源设了遮罩的查询快照，能证明这条查询没碰遮罩列的（_untouched）照常
   嵌入，别的不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，有输入取自遮罩列（cell() 的格、Agent 字段、按位置
-  取的 vars.res.rows[0][2]，SQL 里改了名字的遮罩列也算）的整张卡同样只给 id，认法和证据面板、推演同一个
-  （recompute.input_origin）；服务端文件被改过的卡照样按卡上记的输入认，解析不出一张卡的整张只给 id。只给 id 的工件，
-  服务端的文件和 id 对不上的另标 mismatch、解析不出来的另标 unparsable，核对页照实说（对不上的判不通过）。没被报告
-  引用的工件不嵌。
+  取的 vars.res.rows[0][2]，SQL 里改了名字的遮罩列也算，SQL 认不出结果里哪一列取自哪一列的整份快照的列都算）的整张卡
+  同样只给 id，认法和证据面板、推演同一个（recompute.input_origin）；服务端文件被改过的卡照样按卡上记的输入认，解析
+  不出一张卡的整张只给 id。只给 id 的工件，服务端的文件和 id 对不上的另标 mismatch、解析不出来的另标 unparsable，
+  核对页照实说（对不上的判不通过）。没被报告引用的工件不嵌。
 - 封存之后追加的事件（按需裁判、审批质询这类批注）单列：类型、序号、内容摘要，不进清单。
 
 它只证明「内部一致」：数字、文档、运行记录彼此对得上，而且没被改过。真伪要拿页面上的封存哈希和系统里这次
@@ -75,15 +75,19 @@ Reader = Callable[[str], "bytes | None"]
 
 
 class _Store:
-    """这一次构建里读过的工件：原字节、解析出来的内容、查询快照带不带遮罩。每份只读一次盘。"""
+    """这一次构建里读过的工件：原字节、解析出来的内容、查询快照带不带遮罩。每份只读一次盘。events 是封存范围内的
+    事件（认这次运行里查到过哪些遮罩值，seen）。"""
 
-    def __init__(self, read: Reader, source_masks: Mapping[str, Any]) -> None:
+    def __init__(self, read: Reader, source_masks: Mapping[str, Any],
+                 events: Sequence[tuple[int, str, str | None, Any]] = ()) -> None:
         self._read = read
         self._source_masks = source_masks
+        self._events = events
         self._raw: dict[str, bytes | None] = {}
         self._json: dict[str, Any] = {}
         self._masked: dict[str, bool] = {}
         self._hidden: dict[str, set[str]] = {}
+        self._seen: Any = None
 
     def raw(self, artifact: str) -> bytes | None:
         if artifact not in self._raw:
@@ -116,17 +120,34 @@ class _Store:
         也按带遮罩算。"""
         if artifact not in self._masked:
             self._masked[artifact] = _snapshot_masked(self.content(artifact), self._source_masks,
-                                                      intact=self.intact(artifact))
+                                                      intact=self.intact(artifact), seen=self.seen)
         return self._masked[artifact]
 
     def hidden(self, artifact: str) -> set[str]:
         """一份读得出来的查询快照里值取自遮罩列的列（小写）：查询当时记下的、数据源现在设的遮罩列，加上 SQL 里给它们
-        改了名字的（_derived_columns）。"""
+        改了名字的；SQL 认不出结果里哪一列取自哪一列的，整份的列（_derived_columns）。"""
         if artifact not in self._hidden:
             content = self.content(artifact)
             base = _snapshot_hidden(content, self._source_masks) if isinstance(content, dict) else set()
             self._hidden[artifact] = _derived_columns(content, base) if base else set()
         return self._hidden[artifact]
+
+    def seen(self) -> Any:
+        """这次运行里查到过的遮罩值（inquiry._Secrets，只用按值认得出的写法：够长的数、两个字以上的文字）：封存范围内
+        每份查询快照里值取自遮罩列的那几列（hidden）的格子。模型拿在遮罩查询里看到的号码去查别的表时，SQL 里没写遮罩列，
+        字面量却就是号码（_untouched）。认不出哪一列取自哪一列的快照（整行摊开的画像查询）整份的格子都算：同一次运行里
+        别的查询的字面量碰上其中哪个值，也只给哈希（宁可多挡）。这次运行里没查到过的（提问人写进问题的、别的运行里看到的）
+        认不出。只收一次。"""
+        if self._seen is None:
+            from app.engine.inquiry import _Secrets   # inquiry 导入了 engine.nodes 里的模块：用到时再导入
+
+            seen = _Secrets()
+            for artifact in _run_queries(self._events, self):
+                content = self.content(artifact)
+                if isinstance(content, dict) and (hidden := self.hidden(artifact)):
+                    seen.add(content, hidden)
+            self._seen = seen
+        return self._seen
 
     def card_masked(self, artifact: str, events: Sequence[tuple[int, str, str | None, Any]]) -> bool:
         """这张口径卡算不算带遮罩：卡上有一个输入取自遮罩列，或者遮没遮核对不了。卡上记着每个输入的值（cell() 取的格、
@@ -134,7 +155,8 @@ class _Store:
 
         认哪个输入取自哪份查询结果的哪几列，和证据面板、推演同一个认法（recompute.input_origin）；按位置取的一格顺着
         取值链从写变量的节点在口径卡算这一次之前的产出起走。那几列算不算遮罩列，除了列名对上的，SQL 里给遮罩列起了别名、
-        套了函数、经子查询或 WITH 转了一道的也算（hidden，同质询、双盲复算的认法）。核对不了的宁可多挡：快照读不出来、
+        套了函数、经子查询或 WITH 转了一道的也算（hidden，同质询、双盲复算的认法）；SQL 认不出结果里哪一列取自哪一列的
+        （列名表、整行引用这类，快照本身因此只给哈希），整份快照的列都算，两条路的判断一致。核对不了的宁可多挡：快照读不出来、
         取值链上的产出读不出来、那份结果没存快照只带着数据源名、定位里没写列。认得出、可结果既没带快照的 id 也没带数据源名
         的（数据整形改过形状）认不出出处，不算。
 
@@ -175,7 +197,8 @@ class _Store:
         return any(c.lower() in hidden for c in origin.columns)
 
 
-def _snapshot_masked(content: Any, source_masks: Mapping[str, Any], *, intact: bool) -> bool:
+def _snapshot_masked(content: Any, source_masks: Mapping[str, Any], *, intact: bool,
+                     seen: Callable[[], Any] | None = None) -> bool:
     if not isinstance(content, dict):
         return True
     recorded = content.get("mask_columns")
@@ -183,7 +206,7 @@ def _snapshot_masked(content: Any, source_masks: Mapping[str, Any], *, intact: b
     if not (isinstance(recorded, list) and any(isinstance(c, str) and c.strip() for c in recorded)) \
             and not any(source_masks.get(str(name or "")) for name in sources or []):
         return False
-    return not (intact and _untouched(content, _snapshot_hidden(content, source_masks)))
+    return not (intact and _untouched(content, _snapshot_hidden(content, source_masks), seen))
 
 
 def _snapshot_hidden(content: dict[str, Any], source_masks: Mapping[str, Any]) -> set[str]:
@@ -208,24 +231,56 @@ _QUERY_KEYS = frozenset({"columns", "rows", "row_count", "truncated", "elapsed_m
 #: 导出时只知道数据源设的遮罩、不知道是哪种库：SQL 按每种支持的库的读法各解析一遍（None 是 sqlglot 的通用读法），
 #: 至少一种读得通，读得通的每一种都要过关
 _READINGS = (None, "sqlite", "mysql", "postgres", "oracle")
-#: 语法树和数据库实际执行的对不上的写法：MySQL 会执行的注释（/*! … */，解析器当注释扔掉），Postgres 按 Unicode 转义
-#: 写的名字（U&"…"，原文里看不出是哪一列）
-_OPAQUE_SQL = re.compile(r'/\*!|u&"', re.I)
+#: 语法树和数据库实际执行的对不上的写法：MySQL、MariaDB 会执行的注释（/*! … */、/*M! … */，解析器当注释扔掉），
+#: Postgres 按 Unicode 转义写的名字（U&"…"，原文里看不出是哪一列）
+_OPAQUE_SQL = re.compile(r'/\*m?!|u&"', re.I)
+#: 不点列名也读得出表里内容的写法。SQL 原文里出现就按碰了遮罩列算，写在字符串里的也算（宁可多挡）。函数要跟着左括号
+#: 才算（列名碰巧叫 crosstab 的不算），表、视图、schema 按名字认
+_INDIRECT_READS = re.compile(r"(?<![0-9A-Za-z_$])(?:(?:" + "|".join((
+    # 表名、SQL 写在字符串里交给函数执行或整表导出：Postgres 的 XML 一族、ts_stat、tablefunc 的 crosstab / connectby、
+    # dblink，Oracle 的 XMLTYPE、XQuery（XMLQUERY、XMLTABLE）
+    r"(?:query|table|cursor|schema|database)_to_xml\w*", r"ts_stat", r"crosstab\d*", r"connectby", r"dblink\w*",
+    r"xmltype", r"xmlquery", r"xmltable",
+    # 按页、按文件、按日志读出的原始数据：Postgres 的 pageinspect、服务器文件、逻辑解码，MySQL 的 LOAD_FILE，Oracle 的
+    # BFILENAME
+    r"get_raw_page", r"pg_read_(?:binary_)?file", r"pg_logical_slot_\w+", r"load_file", r"bfilename",
+)) + r")[\"`]?\s*\(|(?:" + "|".join((
+    # Oracle 的 DBMS_XMLGEN 这一族（包名后面跟着点），XQuery 里的 ora:view 和 oradb: 表
+    r"dbms_xml\w*", r"ora:view", r"oradb",
+    # 统计信息里的采样值、全文索引里的词：Postgres 的 pg_stats、pg_statistic 一族，SQLite 的 sqlite_stat*，MySQL 的
+    # column_statistics、innodb_ft_*，Oracle 的直方图、列统计和记着最小最大值的 *_tab_columns
+    r"pg_stat(?:s|istic)\w*", r"sqlite_stat\d", r"column_statistics", r"innodb_ft_\w+",
+    r"(?:all|dba|user|cdb)_(?:\w+_)?(?:histograms|col_statistics|tab_cols|tab_columns)",
+    # 别的会话执行过的 SQL 原文（写入语句里就是值）：Postgres 的 pg_stat_activity，MySQL 的 general_log、slow_log，
+    # Oracle 的 V$SQL 一族
+    r"pg_stat_activity", r"general_log", r"slow_log", r"g?v\$sql\w*", r"(?:dba|cdb)_hist_sql\w*",
+    # SQLite 按页读出的原始数据
+    r"sqlite_dbpage",
+    # 系统 schema：哪几张表采样了列值、记着别的会话的 SQL，一张张数靠不住，整个不认
+    r"pg_catalog", r"information_schema", r"performance_schema",
+)) + r")(?![0-9A-Za-z_$]))", re.I)
+#: Postgres 的函数记法（m.to_jsonb 就是 to_jsonb(m)）下能把一整行交出来的内置函数（_whole_row）。自己建的函数这里不知道
+_ROW_FUNCTIONS = frozenset({"to_json", "to_jsonb", "row_to_json", "hstore", "quote_literal", "quote_nullable",
+                            "concat", "json_build_array", "jsonb_build_array", "array_agg", "json_agg", "jsonb_agg"})
 
 
-def _untouched(snapshot: dict[str, Any], hidden: set[str]) -> bool:
+def _untouched(snapshot: dict[str, Any], hidden: set[str], seen: Callable[[], Any] | None = None) -> bool:
     """数据源设了遮罩的一份查询快照，能不能证明这条查询没碰遮罩列（快照里不会有遮罩值）。全部满足才算，能证明的照常
     随文件附带：
     - 认得这份快照：数据源查询工具落的那种（不是合并查询，没有不认识的键），SQL、列名、行都在；
     - 结果的列名对不上遮罩列（按数据库交回的列名，不论大小写）；
-    - SQL 原文里没写到遮罩列，条件里、COUNT 里也不行：SQL 随快照一起附带，WHERE phone = '…' 的字面量就是遮罩值。
-      连字符串、注释里写到的也算（宁可多挡）；语法树认不准的写法（_OPAQUE_SQL）也不行；
-    - SQL 解析得了；每种读得通的读法下，没有认不出结果里哪一列取自哪一列的写法（_stray_columns：列名表、整行引用、
-      可能展开出遮罩列的 *），按 SQL 认遮罩列的那一套（inquiry._derived_hidden，双盲复算、审批质询用的同一个）也认不出
-      哪个结果列取自遮罩列。SQL 里没写到遮罩列时它本来就认不出，这一条是同一套认法的第二道关，那一套以后认得更多时
-      跟着收紧。
-    判断过程出错按碰了算。和证据面板一样只按列名认遮罩：视图里换了名字的遮罩列认不出（遮罩只减少暴露，不是安全边界）。
-    hidden 是要遮的列（小写，_snapshot_hidden）。"""
+    - SQL 原文里没写到遮罩列，条件里、COUNT 里也不行：SQL 随快照一起附带，WHERE phone = '…' 的字面量就是遮罩值；
+      FROM 里的表函数吃进遮罩列时（unnest(ARRAY[phone])），它交出的列取自哪一列也认不出。这一条比「按 SQL 认不出结果列
+      取自遮罩列」更严，有意的：COUNT(DISTINCT phone) 这类结果里没有号码的也只给哈希。连字符串、注释里写到的也算（宁可
+      多挡）；
+    - 没有语法树认不准的写法（_OPAQUE_SQL），也没有不点列名也读得出表里内容的写法（_INDIRECT_READS）；
+    - SQL 解析得了；字面量里没写着这次运行里查到过的遮罩值（seen，_quotes）；每种读得通的读法下，没有认不出结果里哪一列
+      取自哪一列的写法（_stray_columns：列名表、整行引用、可能展开出遮罩列的 *），按 SQL 认遮罩列的那一套
+      （inquiry._derived_hidden，双盲复算、审批质询用的同一个）也认不出哪个结果列取自遮罩列。SQL 里没写到遮罩列时它本来
+      就认不出，这一条是同一套认法的第二道关，那一套以后认得更多时跟着收紧。
+    判断过程出错按碰了算。和证据面板一样只按列名认遮罩：视图、别的表里换了名字存着的遮罩列，自己建的函数，都认不出
+    （遮罩只减少暴露，不是安全边界）。hidden 是要遮的列（小写，_snapshot_hidden）；seen 交回这次运行里查到过的遮罩值
+    （_Store.seen）。"""
     names = {name.strip() for name in hidden if name.strip()}
     sql, columns = snapshot.get("sql"), snapshot.get("columns")
     if not names or snapshot.get("source") == MERGE_SOURCE or not set(snapshot) <= _QUERY_KEYS \
@@ -233,14 +288,16 @@ def _untouched(snapshot: dict[str, Any], hidden: set[str]) -> bool:
             or not isinstance(columns, list) or not all(isinstance(c, str) for c in columns):
         return False
     result = {c.strip().lower() for c in columns}
-    if result & names or _writes_any(sql, names) or _OPAQUE_SQL.search(sql):
+    if result & names or _writes_any(sql, names) or _OPAQUE_SQL.search(sql) or _INDIRECT_READS.search(sql):
         return False
     try:
         from app.data.sql_semantics import _parse, _read
         from app.engine.inquiry import _derived_hidden   # inquiry 导入了 engine.nodes 里的模块：用到时再导入
 
         readings = [(kind, tree) for kind in _READINGS for tree in [_parse(sql, _read(kind))[0]] if tree is not None]
-        return bool(readings) and not any(
+        if not readings or (seen is not None and _quotes([tree for _, tree in readings], seen())):
+            return False
+        return not any(
             _stray_columns(tree) or result & {c.lower() for c in _derived_hidden(dict(snapshot), set(names), kind)[0]}
             for kind, tree in readings)
     except Exception:  # noqa: BLE001 - 解析器、认遮罩列的那一套出了意外：按碰了遮罩列算（宁可多挡）
@@ -251,22 +308,32 @@ def _untouched(snapshot: dict[str, Any], hidden: set[str]) -> bool:
 def _derived_columns(snapshot: dict[str, Any], base: set[str]) -> set[str]:
     """一份快照里值取自遮罩列的结果列（小写）：遮罩列本身（base），加上 SQL 里给它们起别名、套函数、经子查询或 WITH
     转一道得来的（inquiry._derived_hidden，质询、双盲复算同一个认法）。SQL 按每种读得通的读法各认一遍、合起来；都读不通
-    的照那一套的办法，写着遮罩列就整份的列都算。出错时整份的列都算（宁可多挡）。"""
+    的照那一套的办法，写着遮罩列就整份的列都算。认不出结果里哪一列取自哪一列的，整份的列都算：语法树认不准、不点列名也
+    读得出表里内容的写法（_OPAQUE_SQL、_INDIRECT_READS），以及哪一种读法下有列名表、整行引用、不照原名展开的 *、吃进
+    遮罩列的表函数的（_renamed）——快照本身因此只给哈希，口径卡上取自它的值也一样。合并查询照那一套的办法不看 SQL。
+    出错时整份的列都算（宁可多挡）。"""
+    columns = snapshot.get("columns")
+    every = set(base) | ({str(c).lower() for c in columns} if isinstance(columns, list) else set())
     try:
         from app.data.sql_semantics import _parse, _read
         from app.engine.inquiry import _derived_hidden
 
         sql = snapshot.get("sql")
-        kinds = [kind for kind in _READINGS
-                 if isinstance(sql, str) and _parse(sql, _read(kind))[0] is not None] or [None]
+        own = isinstance(sql, str) and snapshot.get("source") != MERGE_SOURCE
+        if own and (_OPAQUE_SQL.search(sql) or _INDIRECT_READS.search(sql)):
+            return every
+        readings = [(kind, tree) for kind in _READINGS for tree in [_parse(sql, _read(kind))[0] if own else None]
+                    if tree is not None]
         out = set(base)
-        for kind in kinds:
-            out |= {c.lower() for c in _derived_hidden(dict(snapshot), set(base), kind)[0]}
+        for kind, tree in readings or [(None, None)]:
+            found, names = _derived_hidden(dict(snapshot), set(base), kind)
+            if tree is not None and _renamed(tree, {n.lower() for n in names}):
+                return every
+            out |= {c.lower() for c in found}
         return out
     except Exception:  # noqa: BLE001 - 认遮罩列的那一套出了意外：整份的列都按遮罩算
         logger.warning("可验证报告：按 SQL 认改了名字的遮罩列时出错，整份快照的列都按遮罩处理", exc_info=True)
-        columns = snapshot.get("columns")
-        return set(base) | ({str(c).lower() for c in columns} if isinstance(columns, list) else set())
+        return every
 
 
 def _writes_any(sql: str, names: Iterable[str]) -> bool:
@@ -274,28 +341,85 @@ def _writes_any(sql: str, names: Iterable[str]) -> bool:
     return any(re.search(rf"(?<![0-9A-Za-z_]){re.escape(n)}(?![0-9A-Za-z_])", sql, re.I) for n in names if n)
 
 
+def _quotes(trees: Iterable[Any], secrets: Any) -> bool:
+    """SQL 的字面量（'…'、数、$$…$$、E'…'、N'…'、U&'…'，MySQL 读法下的 "…"）里有没有写着按值认得出的遮罩值（secrets
+    是 inquiry._Secrets）。只看字面量：守卫已经去掉了注释；表名、列名碰巧和哪个值一样不算（整行摊开的画像查询把列名
+    当值交了出来，那些列名会出现在别的 SQL 里）。trees 是各种读法解析出来的语法树，字面量合起来看。"""
+    from sqlglot import exp
+
+    kinds = (exp.Literal, exp.RawString, exp.National, exp.UnicodeString, exp.ByteString)
+    texts = {node.this for tree in trees for node in tree.walk()
+             if isinstance(node, kinds) and isinstance(node.this, str)}
+    for text in texts:
+        pattern = secrets.pattern(text)
+        if pattern is not None and pattern.search(text):
+            return True
+    return False
+
+
 def _stray_columns(tree: Any) -> bool:
     """语法树里有没有认不出结果里哪一列取自哪一列的写法。有的话，就算 SQL 里没写到遮罩列、结果的列名也对不上，结果里
     照样可能是遮罩列的值：
-    - 列名表（members AS m(a, b, c)、(…) AS t(a, b)、WITH t(a, b)）：按位置给列改了名；
-    - 整行引用（Postgres 的 SELECT m、to_json(m)，_whole_row）：一整行装进一列；
+    - 列名表、整行引用（_listed_or_whole）；
     - 可能展开出遮罩列的 *：展开了数据源里的表（隔着几层派生来源也算，_star_reaches），又不是只按名字往外传的那几种
       （_contained）。COUNT(*) 只数个数，不算。"""
-    from sqlglot import exp
-
-    if any(alias.columns for alias in tree.find_all(exp.TableAlias)):
-        return True
-    if any(_whole_row(column) for column in tree.find_all(exp.Column)):
+    if _listed_or_whole(tree):
         return True
     memo: dict[int, bool] = {}
     return any(_star_reaches(node, memo) and not _contained(node) for node in _stars(tree))
 
 
+def _renamed(tree: Any, names: set[str]) -> bool:
+    """结果里可能有遮罩列的值、列名却和 SQL 里认得出的名字对不上的写法（口径卡按列名认遮罩列，这几种认不出）：
+    - 列名表、整行引用（_listed_or_whole）；
+    - 不照原名展开的 *：UNION 这类里按位置对上第一支列名的，套在表达式、标量子查询里装进一列的。最外层直接写的 *、
+      只按名字往外传的（_contained）照原名展开，遮罩列在结果里还叫原来的名字；
+    - FROM、JOIN 里的表函数（UNNEST、ROWS FROM 这类，_table_function）吃进了遮罩列（names：SQL 里指代遮罩列的名字，
+      小写）：它交出的列叫什么、装着什么，SQL 里看不出。"""
+    from sqlglot import exp
+
+    if _listed_or_whole(tree) or any(not (_contained(node) or _outermost(node)) for node in _stars(tree)):
+        return True
+    return any(_table_function(source) and names & {c.name.lower() for c in source.find_all(exp.Column)}
+               for select in tree.find_all(exp.Select) for source in _sources(select))
+
+
+def _listed_or_whole(tree: Any) -> bool:
+    """有没有列名表（members AS m(a, b, c)、(…) AS t(a, b)、WITH t(a, b)：按位置给列改了名），或者整行引用
+    （Postgres 的 SELECT m、to_json(m)，_whole_row：一整行装进一列）。"""
+    from sqlglot import exp
+
+    return any(alias.columns for alias in tree.find_all(exp.TableAlias)) \
+        or any(_whole_row(column) for column in tree.find_all(exp.Column))
+
+
 def _sources(select: Any) -> list[Any]:
-    """一条 SELECT 的 FROM、JOIN 里的来源节点。"""
+    """一条 SELECT 的 FROM、JOIN 里的来源节点。括号括起来的一组连接（(members m JOIN orders o ON …)）摊开，里面每个
+    来源也算：组里的表函数看得见组里前面的来源，外层也看得见组里的名字（组写了别名时 Postgres 外层只认别名，这里宁可
+    多认）。"""
     from_ = select.args.get("from_")
-    out = [from_.this] if from_ is not None and from_.this is not None else []
-    return out + [join.this for join in select.args.get("joins") or [] if join.this is not None]
+    pending = ([from_.this] if from_ is not None and from_.this is not None else []) \
+        + [join.this for join in select.args.get("joins") or [] if join.this is not None]
+    out: list[Any] = []
+    while pending:
+        source = pending.pop(0)
+        out.append(source)
+        head = _join_group(source)
+        if head is not None:
+            if head is not source:
+                out.append(head)
+            pending[:0] = [join.this for join in head.args["joins"] if join.this is not None]
+    return out
+
+
+def _join_group(source: Any) -> Any:
+    """括号括起来的一组连接里打头的那个来源（语法树里是一层括号包着一张带 joins 的表）；别的来源是 None。"""
+    from sqlglot import exp
+
+    node = source
+    while isinstance(node, exp.Subquery):
+        node = node.this
+    return node if isinstance(node, exp.Table) and node.args.get("joins") else None
 
 
 def _derived(source: Any) -> Any:
@@ -318,6 +442,16 @@ def _derived(source: Any) -> Any:
     return node if isinstance(node, (exp.Select, exp.SetOperation)) else None
 
 
+def _table_function(source: Any) -> bool:
+    """FROM、JOIN 里的一个来源是不是表函数这类（函数调用、UNNEST、ROWS FROM、VALUES，写没写 LATERAL 都一样）：既不是
+    数据源里的表，也不是派生来源。"""
+    from sqlglot import exp
+
+    if (isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier)) or _join_group(source) is not None:
+        return False
+    return _derived(source) is None
+
+
 def _leaves(block: Any) -> list[Any]:
     """一块查询的每一支，按先后：UNION 这类摊开，套在外面的括号去掉。"""
     from sqlglot import exp
@@ -330,25 +464,36 @@ def _leaves(block: Any) -> list[Any]:
 
 
 def _whole_row(column: Any) -> bool:
-    """一个没写表名的名字是不是整行引用（Postgres 的 SELECT m、to_json(m)：一整行装进一列）。Postgres 先按列认：所在
-    SELECT 的派生来源明写出了叫这个名字的列，就是那一列；不然对上它看得见的某个来源的名字（别名、表名、WITH 里的一段）
-    就算。看得见的是所在 SELECT 和外层 SELECT 的 FROM、JOIN 里的来源；WITH 里的一段、FROM 里的子查询看不见同一层的来源
-    （LATERAL 看得见）。数据源里的表有哪些列这里不知道：碰巧和表、别名同名的列也算（宁可多挡）。"""
+    """一个名字是不是整行引用（Postgres 的 SELECT m、to_json(m)，函数记法的 m.to_jsonb：一整行装进一列）。
+
+    没写表名的，Postgres 先按列认：所在 SELECT 的派生来源明写出了叫这个名字的列，就是那一列；不然对上它看得见的某个来源
+    的名字（别名、表名、WITH 里的一段）就算。写了表名的，列名是 _ROW_FUNCTIONS 里的、表名对上看得见的来源才算。
+    看得见的是所在 SELECT 和外层 SELECT 的 FROM、JOIN 里的来源。FROM、JOIN 里的表函数（UNNEST、ROWS FROM 这类）和
+    LATERAL 看得见同一层的来源：Postgres 的函数不写 LATERAL 也看得见（逗号、CROSS JOIN、JOIN … ON TRUE 都一样），整行
+    交给 jsonb_each_text 这类就一列列竖着摊开了；括号括起来的一组连接按同一层算（_sources 摊开）。FROM、JOIN 里的子查询
+    不写 LATERAL 看不见，WITH 里的一段也看不见。数据源里的表有哪些列这里不知道：碰巧和表、别名同名的列也算（宁可多挡）。"""
     from sqlglot import exp
 
-    name = column.name.lower()
     select = column.find_ancestor(exp.Select)
-    if column.table or isinstance(column.this, exp.Star) or not name or select is None:
+    if isinstance(column.this, exp.Star) or not column.name or select is None:
         return False
-    for body in filter(None, map(_derived, _sources(select))):
-        first = _leaves(body)[0]
-        if isinstance(first, exp.Select) and any(
-                isinstance(item, (exp.Alias, exp.Column)) and not isinstance(item.this, exp.Star)
-                and item.alias_or_name.lower() == name for item in first.expressions):
+    if column.table:
+        if column.name.lower() not in _ROW_FUNCTIONS:
             return False
+        name = column.table.lower()
+    else:
+        name = column.name.lower()
+        for body in filter(None, map(_derived, _sources(select))):
+            first = _leaves(body)[0]
+            if isinstance(first, exp.Select) and any(
+                    isinstance(item, (exp.Alias, exp.Column)) and not isinstance(item.this, exp.Star)
+                    and item.alias_or_name.lower() == name for item in first.expressions):
+                return False
     child, node = column, column.parent
     while node is not None:
-        sees = child.arg_key not in ("with_", "from_", "joins") or isinstance(child.this, exp.Lateral)
+        # FROM、JOIN 里真的子查询（括号里是一条查询，不是一组连接）看不见同一层，WITH 里的一段也看不见
+        subquery = isinstance(child.this, exp.Subquery) and _derived(child.this) is not None
+        sees = child.arg_key != "with_" and not (child.arg_key in ("from_", "joins") and subquery)
         if isinstance(node, exp.Select) and sees \
                 and any((source.alias_or_name or "").lower() == name for source in _sources(node)):
             return True
@@ -396,8 +541,8 @@ def _star_reaches(node: Any, memo: dict[int, bool]) -> bool:
 def _contained(node: Any) -> bool:
     """展开出来的列只按名字往外传的 *：它就是一条 SELECT 的选出项本身（不套在表达式里），这条 SELECT 不在 UNION 这类
     里，而且是 FROM / JOIN 里的派生来源、LATERAL、WITH 里的一段，或者 EXISTS / IN 里的子查询（只决定有没有、在不在）。
-    派生来源的列外层只能按名字取（取到遮罩列，名字就写在 SQL 里），或者再用一个 * 展开（那个 * 照样要过这一关）。
-    最外层的 *（结果就是它展开的列）、UNION 里的、标量子查询里的都不算。"""
+    派生来源的列外层只能按名字取（取到遮罩列，名字就写在 SQL 里），或者再用一个 * 展开（那个 * 照样要过这一关），
+    或者整行交出去（整行引用另认，_whole_row）。最外层的 *（结果就是它展开的列）、UNION 里的、标量子查询里的都不算。"""
     from sqlglot import exp
 
     select = node.parent
@@ -412,6 +557,20 @@ def _contained(node: Any) -> bool:
     if isinstance(parent, (exp.From, exp.Join)):
         return outer is not select
     return isinstance(parent, exp.In) and outer.arg_key == "query"
+
+
+def _outermost(node: Any) -> bool:
+    """这个 * 是不是最外层那条 SELECT 的选出项本身（不套在表达式里，这条 SELECT 也不在 UNION 这类里）：展开的列照原来
+    的名字落进结果。"""
+    from sqlglot import exp
+
+    select = node.parent
+    if not isinstance(select, exp.Select) or node.arg_key != "expressions":
+        return False
+    outer = select
+    while isinstance(outer.parent, exp.Subquery):
+        outer = outer.parent
+    return outer.parent is None
 
 
 def _card_outputs(events: Sequence[tuple[int, str, str | None, Any]], card: str) -> dict[str, str]:
@@ -488,6 +647,18 @@ def _query_returned(data: Mapping[str, Any], store: _Store) -> tuple[str, str | 
     if isinstance(returned, dict) and "rows" not in returned:
         return "none", None
     return "unknown", None
+
+
+def _run_queries(events: Sequence[tuple[int, str, str | None, Any]], store: _Store) -> list[str]:
+    """封存范围内查到过的查询快照：_query_artifacts 之外，升级前的运行从工具快照、预览里认出来的（_query_returned）。"""
+    out = _query_artifacts(events)
+    for _, etype, _, data in events:
+        if etype == EventType.TOOL_END and isinstance(data, dict) \
+                and str(data.get("tool") or "").startswith(QUERY_PREFIX):
+            artifact = _query_returned(data, store)[1]
+            if artifact:
+                out.append(artifact)
+    return list(dict.fromkeys(out))
 
 
 def _masked_run(events: Sequence[tuple[int, str, str | None, Any]], store: _Store, cited: Iterable[str],
@@ -704,7 +875,7 @@ def build_bundle(
 
     sealed = [e for e in events if e[0] <= manifest_seq]
     later = [e for e in events if e[0] > manifest_seq]
-    store = _Store(read, source_masks or {})
+    store = _Store(read, source_masks or {}, sealed)
 
     artifacts = _Artifacts(store, sealed)
     reports = _report_events(sealed)

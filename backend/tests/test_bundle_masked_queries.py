@@ -4,9 +4,11 @@
 地区汇总了金额。数据源里只要有一列设了遮罩（会员手机号），报告里引用查询格子的数字就全成了「无法核对」。
 
 现在全部满足才嵌入（build._untouched）：认得这份快照（数据源查询工具落的那种、哈希对得上）；结果的列名对不上遮罩列；
-SQL 原文里没写到遮罩列（连条件里也不行：SQL 随快照一起附带，WHERE phone = '…' 的字面量就是遮罩值）；SQL 解析得了，
-没有认不出取自哪一列的写法（列名表、整行引用、可能展开出遮罩列的 *），按 SQL 认遮罩列的那一套（inquiry._derived_hidden）
-也认不出哪个结果列取自遮罩列。任何一条不满足、判断过程出错，照旧只给哈希。
+SQL 原文里没写到遮罩列（连条件里也不行：SQL 随快照一起附带，WHERE phone = '…' 的字面量就是遮罩值），也没写着这次运行
+别的查询里查到过的遮罩值；没有不点列名也读得出表里内容的写法（字符串里的 SQL 交给函数执行、统计信息里的采样值、
+系统 schema）；SQL 解析得了，没有认不出取自哪一列的写法（列名表、整行引用——FROM 里的表函数不写 LATERAL 也看得见前面的
+来源、可能展开出遮罩列的 *），按 SQL 认遮罩列的那一套（inquiry._derived_hidden）也认不出哪个结果列取自遮罩列。任何一条
+不满足、判断过程出错，照旧只给哈希。
 
 工件、事件都是手搭的（会员、号码、地区、金额都是编的），照 tests/test_bundle_build.py 的样子。
 """
@@ -44,9 +46,10 @@ def cite(value, row: int, column: str) -> dict:
 
 
 def bundle_of(snap: dict, *, value=508.5, row: int = 0, column: str = "spend", masks=MASKS, raw: bytes | None = None,
-              artifact: str | None = None):
+              artifact: str | None = None, others: tuple[dict, ...] = ()):
     """一次手搭的运行：会员库一次查询 → 报告引用快照里的一格（默认第 0 行的 spend）。raw 给了就把服务端的快照文件换成
-    这份字节；artifact 给了就用它当快照的 id（文件被改过、哈希对不上）。"""
+    这份字节；artifact 给了就用它当快照的 id（文件被改过、哈希对不上）。others 是同一次运行里另外几次会员库的查询
+    （门店流水节点查的，报告没引用），排在这次查询之后。"""
     snap_id, snap_raw = stored(snap)
     snap_id, snap_raw = artifact or snap_id, raw if raw is not None else snap_raw
     doc = {"schema": "agentlab.report/1", "run_id": RUN["id"], "node_id": "write", "markdown": "…",
@@ -56,18 +59,27 @@ def bundle_of(snap: dict, *, value=508.5, row: int = 0, column: str = "spend", m
                "segments": [{"id": "s0", "kind": "number", "text": str(value), "state": "deterministic",
                              "cite": cite(value, row, column)}]}]}]}
     doc_id, doc_raw = stored(doc)
-    events = [
-        (1, "run.started", None, {"nodes": 3}),
-        (2, "tool.end", "members", {"tool": "db_query__crm", "query_artifact": snap_id,
-                                    "preview": json.dumps(snap["rows"][:1], ensure_ascii=False)}),
-        (3, "node.finished", "members", {"evidence": [{"kind": "query", "node_id": "members", "artifact": snap_id}]}),
-        (4, "report.checked", "write", {"doc_artifact": doc_id, "ok": True}),
-        (5, "node.finished", "write", {"preview": {"text": "…", "doc_artifact": doc_id}}),
-        (6, "run.finished", None, {"output": {}}),
-    ]
     files = {snap_id: snap_raw, doc_id: doc_raw}
-    bundle = build_bundle(RUN, events, manifest_seq=6, manifest_hash="0" * 64, graph=GRAPH, source_masks=masks,
-                          read=files.get, exported_at="2026-10-06T08:00:00+00:00")
+    later = []
+    for other in others:
+        other_id, other_raw = stored(other)
+        files[other_id] = other_raw
+        later += [("tool.end", "fetch", {"tool": "db_query__crm", "query_artifact": other_id,
+                                         "preview": json.dumps(other["rows"][:1], ensure_ascii=False)}),
+                  ("node.finished", "fetch",
+                   {"evidence": [{"kind": "query", "node_id": "fetch", "artifact": other_id}]})]
+    events = [(seq, *event) for seq, event in enumerate([
+        ("run.started", None, {"nodes": 3}),
+        ("tool.end", "members", {"tool": "db_query__crm", "query_artifact": snap_id,
+                                 "preview": json.dumps(snap["rows"][:1], ensure_ascii=False)}),
+        ("node.finished", "members", {"evidence": [{"kind": "query", "node_id": "members", "artifact": snap_id}]}),
+        *later,
+        ("report.checked", "write", {"doc_artifact": doc_id, "ok": True}),
+        ("node.finished", "write", {"preview": {"text": "…", "doc_artifact": doc_id}}),
+        ("run.finished", None, {"output": {}}),
+    ], start=1)]
+    bundle = build_bundle(RUN, events, manifest_seq=len(events), manifest_hash="0" * 64, graph=GRAPH,
+                          source_masks=masks, read=files.get, exported_at="2026-10-06T08:00:00+00:00")
     return bundle, next(a for a in bundle["artifacts"] if a["id"] == snap_id)
 
 
@@ -130,6 +142,14 @@ def test_an_aggregate_by_region_on_a_masked_source_is_embedded(masks, recorded):
     # 列和 WITH 里的那一段同名：那一段明写出了这一列，是列不是整行引用
     ("WITH spend AS (SELECT region, SUM(spend) AS spend FROM members GROUP BY region) "
      "SELECT region, spend FROM spend ORDER BY spend DESC", ["region", "spend"], [["华东", 508.5]]),
+    # 列名碰巧像统计视图、导出函数的名字（不跟左括号的不是函数），FROM 里的表函数吃的是没设遮罩的列
+    ("SELECT region, SUM(spend) AS spend FROM members WHERE pg_status = 'paid' AND crosstab IS NULL GROUP BY region",
+     ["region", "spend"], [["华东", 508.5]]),
+    ("SELECT m.region, SUM(m.spend) AS spend FROM members m, json_each_text(m.extra) j WHERE j.key = 'vip' "
+     "GROUP BY m.region", ["region", "spend"], [["华东", 508.5]]),
+    # 括号括起来的一组连接，按名字取列
+    ("SELECT m.region, SUM(o.amount) AS spend FROM (members m JOIN orders o ON o.member_id = m.id) GROUP BY m.region",
+     ["region", "spend"], [["华东", 508.5]]),
 ])
 def test_queries_that_only_read_unmasked_columns_are_embedded(sql, columns, rows):
     bundle, entry = bundle_of(snapshot(sql, columns, rows))
@@ -157,8 +177,10 @@ MASKED_SHAPES = [
     ("SELECT UPPER(phone), spend FROM members", ["UPPER(phone)", "spend"]),
     # 遮罩列只在条件里：SQL 随快照一起附带，条件里的号码就是遮罩值
     ("SELECT region, SUM(spend) AS spend FROM members WHERE phone = '000-0001' GROUP BY region", ["region", "spend"]),
-    # 汇总里数遮罩列的个数：也算碰了（宁可多挡）
+    # 汇总里数遮罩列的个数、只在 IS NOT NULL 里：结果里没有号码，也算碰了。有意比「按 SQL 认不出结果列取自遮罩列」
+    # 更严：FROM 里的表函数吃进遮罩列（unnest(ARRAY[phone])）时，它交出的列取自哪一列认不出，只能看 SQL 写没写到
     ("SELECT region, COUNT(DISTINCT phone) AS spend FROM members GROUP BY region", ["region", "spend"]),
+    ("SELECT unnest AS spend FROM members, unnest(ARRAY[phone])", ["spend"]),
     # 换个大小写、加引号照样认得出
     ('SELECT region, SUM(spend) AS spend FROM members WHERE "PHONE" IS NOT NULL GROUP BY region', ["region", "spend"]),
 ]
@@ -191,21 +213,122 @@ def test_queries_that_use_a_masked_column_ship_only_their_id(sql, columns):
     ("SELECT m AS spend FROM members m", ["spend"]),
     ("SELECT (SELECT to_json(m) FROM orders o WHERE o.member_id = m.id) AS spend FROM members m", ["spend"]),
     ("SELECT row_to_json(members) AS spend FROM members", ["spend"]),
+    # FROM、JOIN 里的表函数（Postgres）不写 LATERAL 也看得见前面的来源：整行交给它，一列列竖着摊开（逐列做数据画像的
+    # 常见写法，结果的 key、value 里就是 phone 和号码）。逗号、CROSS JOIN、JOIN … ON TRUE、LEFT JOIN、ROWS FROM、
+    # 不带别名的 UNNEST、套在 FROM 的子查询里都一样
+    ("SELECT key, value, COUNT(*) AS n FROM members m, jsonb_each_text(to_jsonb(m)) GROUP BY key, value "
+     "ORDER BY n DESC LIMIT 20", ["key", "value", "n"]),
+    ("SELECT j.key AS k, j.value AS spend FROM members m CROSS JOIN jsonb_each_text(to_jsonb(m)) j", ["k", "spend"]),
+    ("SELECT j.value AS spend FROM members m JOIN jsonb_each_text(row_to_json(m)::jsonb) j ON TRUE", ["spend"]),
+    ("SELECT r.value AS spend FROM members m LEFT JOIN jsonb_each_text(to_jsonb(m)) r ON TRUE", ["spend"]),
+    ("SELECT value AS spend FROM members m, ROWS FROM (jsonb_each_text(to_jsonb(m)))", ["spend"]),
+    ("SELECT value AS spend FROM members m, each(hstore(m))", ["spend"]),
+    ("SELECT value AS spend FROM members, json_each_text(row_to_json(members))", ["spend"]),
+    ("SELECT unnest AS spend FROM members m, unnest(ARRAY[to_jsonb(m)])", ["spend"]),
+    ("SELECT v AS spend FROM (SELECT value AS v FROM members m, jsonb_each_text(to_jsonb(m))) t", ["spend"]),
+    # 括号括起来的一组连接：组里的表函数看得见组里前面的来源，外层也看得见组里的名字
+    ("SELECT value AS spend FROM (members m CROSS JOIN jsonb_each_text(to_jsonb(m))) AS x", ["spend"]),
+    ("SELECT value AS spend FROM members m JOIN (orders o CROSS JOIN jsonb_each_text(to_jsonb(m))) ON TRUE", ["spend"]),
+    ("SELECT to_json(m) AS spend FROM (members m JOIN orders o ON o.member_id = m.id)", ["spend"]),
+    # WITH 里的 * 只按名字往外传，可外层把那一段整行交给了表函数
+    ("WITH c AS (SELECT * FROM members) SELECT region, value AS spend FROM c, json_each_text(row_to_json(c))",
+     ["region", "spend"]),
+    # 函数记法：m.to_jsonb 就是 to_jsonb(m)
+    ("SELECT m.to_jsonb AS spend FROM members m", ["spend"]),
+    ("SELECT m.row_to_json AS spend FROM members m", ["spend"]),
     # 列名表按位置给列改名（Postgres 的表别名、子查询、WITH 都能写）
     ("SELECT c AS spend FROM members AS m(a, b, c)", ["spend"]),
     ("WITH t(a, b) AS (SELECT * FROM members2) SELECT b AS spend FROM t", ["spend"]),
-    # 语法树认不准数据库实际执行什么：MySQL 会执行的注释、Postgres 的 Unicode 转义名字
+    # 语法树认不准数据库实际执行什么：MySQL、MariaDB 会执行的注释，Postgres 的 Unicode 转义名字
     ("SELECT region /*! , SUM(spend) */ AS spend FROM members GROUP BY region", ["region", "spend"]),
+    ("SELECT region, c AS spend FROM (SELECT 1 AS region, 2 AS c /*M! UNION ALL SELECT * FROM contacts */) t",
+     ["region", "spend"]),
     ('SELECT U&"\\0073pend" AS spend FROM members', ["spend"]),
 ])
 def test_shapes_that_could_hide_a_masked_column_ship_only_their_id(sql, columns):
-    """SQL 里没写到遮罩列、结果的列名也对不上，可认不出结果里哪一列取自哪一列：照样只给哈希。"""
+    """SQL 里没写到遮罩列、结果的列名也对不上，可认不出结果里哪一列取自哪一列：照样只给哈希，查询事件也只给哈希。"""
     bundle, entry = bundle_of(snapshot(sql, columns, [[508.5] * len(columns)]), column=columns[-1])
     assert entry.get("masked") is True and "b64" not in entry, sql
+    assert not shown(bundle, 2)
 
 
-def test_result_columns_named_like_a_masked_column_ship_only_their_id():
-    """结果的列名按数据库交回的认（大小写不论）：SQL 里看不出来，列名对上遮罩列也只给哈希。"""
+def test_profiling_every_column_of_a_masked_table_ships_only_its_id():
+    """逐列做数据画像（整行摊成键值、按值数个数）：结果里就是 phone 和号码。快照、查询事件都只给哈希，页面里找不到号码。
+    以前 FROM 里的表函数按看不见前面的来源算，整行引用认不出，快照和事件的预览原样带出了号码。"""
+    sql = ("SELECT key, value, COUNT(*) AS n FROM members m, jsonb_each_text(to_jsonb(m)) GROUP BY key, value "
+           "ORDER BY n DESC LIMIT 20")
+    snap = snapshot(sql, ["key", "value", "n"], [["phone", PHONES[0], 3], ["region", "华东", 2]])
+    bundle, entry = bundle_of(snap, value=3, column="n")
+    assert entry.get("masked") is True and "b64" not in entry
+    assert not shown(bundle, 2)
+    assert PHONES[0] not in render_html(bundle)
+
+
+@pytest.mark.parametrize("sql, columns", [
+    # 表名、SQL 写在字符串里交给函数执行、整表导出：语法树里看不到 *，也看不到遮罩列（Postgres 的 XML 一族、ts_stat，
+    # Oracle 的 DBMS_XMLGEN）
+    ("SELECT table_to_xml('members', true, false, '') AS x, 3 AS spend", ["x", "spend"]),
+    ("SELECT query_to_xml('select * from members', true, false, '') AS spend", ["spend"]),
+    ("SELECT DBMS_XMLGEN.GETXML('SELECT * FROM members') AS spend FROM dual", ["spend"]),
+    ("SELECT word AS region, ndoc AS spend FROM ts_stat('SELECT search_text FROM members')", ["region", "spend"]),
+    # 统计信息里的采样值（Postgres 的 pg_stats、SQLite 的 sqlite_stat4、MySQL 的 column_statistics、Oracle 的直方图和
+    # 列统计）
+    ("SELECT attname AS region, most_common_vals::text AS vals, n_distinct AS spend FROM pg_stats "
+     "WHERE tablename = 'members'", ["region", "vals", "spend"]),
+    ("SELECT tbl AS region, sample AS spend FROM sqlite_stat4", ["region", "spend"]),
+    ("SELECT histogram AS spend FROM information_schema.column_statistics WHERE table_name = 'members'", ["spend"]),
+    ("SELECT endpoint_actual_value AS spend FROM all_tab_histograms WHERE table_name = 'MEMBERS'", ["spend"]),
+    ("SELECT low_value AS spend FROM user_tab_columns WHERE table_name = 'MEMBERS'", ["spend"]),
+    # 按页、按文件、按日志读出的原始数据；别的会话执行过的 SQL 原文（写入语句里就是值）
+    ("SELECT get_raw_page('members', 0) AS spend", ["spend"]),
+    ("SELECT pg_read_file('base/16384/16385') AS spend", ["spend"]),
+    ("SELECT LOAD_FILE('/var/lib/mysql/crm/members.ibd') AS spend", ["spend"]),
+    ("SELECT data AS spend FROM pg_logical_slot_peek_changes('cdc', NULL, NULL)", ["spend"]),
+    ("SELECT argument AS spend FROM mysql.general_log", ["spend"]),
+    # 系统 schema
+    ("SELECT relname AS region, reltuples AS spend FROM pg_catalog.pg_class", ["region", "spend"]),
+])
+def test_reads_that_name_no_column_ship_only_their_id(sql, columns):
+    """不点列名也读得出表里内容的写法：SQL 里没写到遮罩列、结果的列名也对不上、语法树里也没有 * 和整行引用，结果里照样
+    可能是号码。照样只给哈希。"""
+    bundle, entry = bundle_of(snapshot(sql, columns, [[508.5] * len(columns)]), column=columns[-1])
+    assert entry.get("masked") is True and "b64" not in entry, sql
+    assert not shown(bundle, 2)
+
+
+#: 同一次运行里先查过号码的那份快照（模型在这里看到了号码）
+LOOKUP = snapshot("SELECT name, phone FROM members ORDER BY id", ["name", "phone"],
+                  [["林一", PHONES[0]], ["周二", PHONES[1]]])
+
+
+def test_a_query_quoting_a_masked_value_seen_in_the_run_ships_only_its_id():
+    """模型拿在遮罩查询里看到的号码去查别的表：SQL 里没写遮罩列，可字面量就是号码，SQL 随快照附带就带出了它。这次运行里
+    查到过的遮罩值写在 SQL 里的，只给哈希，查询事件也只给哈希。"""
+    sql = (f"SELECT region, SUM(spend) AS spend FROM members WHERE id IN "
+           f"(SELECT member_id FROM tickets WHERE caller = '{PHONES[1]}') GROUP BY region")
+    bundle, entry = bundle_of(snapshot(sql, ["region", "spend"], [["华东", 508.5]]), others=(LOOKUP,))
+    assert entry.get("masked") is True and "b64" not in entry
+    assert not shown(bundle, 2)
+    assert PHONES[1] not in render_html(bundle)
+
+
+def test_a_literal_that_is_not_a_masked_value_is_still_embedded():
+    """同一次运行里查过号码，可这条 SQL 的字面量不是其中哪一个（地区名、别的号码）：照常附带。"""
+    sql = ("SELECT region, SUM(spend) AS spend FROM members WHERE id IN "
+           "(SELECT member_id FROM tickets WHERE caller = '000-0009') AND region = '华东' GROUP BY region")
+    bundle, entry = bundle_of(snapshot(sql, ["region", "spend"], [["华东", 508.5]]), others=(LOOKUP,))
+    assert "masked" not in entry and "b64" in entry
+    assert browser_would_pass(bundle, entry)
+
+
+@pytest.mark.parametrize("parsed", [True, False])
+def test_result_columns_named_like_a_masked_column_ship_only_their_id(parsed, monkeypatch):
+    """结果的列名按数据库交回的认（大小写不论）：SQL 里看不出来，列名对上遮罩列也只给哈希。这一条不靠按 SQL 认遮罩列的
+    那一套（它认出的名字里本来就有遮罩列本身）：那一套什么都没认出来时照样拦得住。"""
+    if not parsed:
+        from app.engine import inquiry
+
+        monkeypatch.setattr(inquiry, "_derived_hidden", lambda *_args: (set(), set()))
     snap = snapshot("SELECT region, contact FROM member_view", ["region", "Phone"], [["华东", 508.5]])
     _, entry = bundle_of(snap, column="Phone")
     assert entry.get("masked") is True and "b64" not in entry
@@ -247,10 +370,16 @@ def test_a_snapshot_with_keys_the_bundle_does_not_know_ships_only_its_id():
     assert entry.get("masked") is True and "b64" not in entry
 
 
-def test_a_merged_snapshot_from_a_masked_source_ships_only_its_id():
-    """合并查询的快照没有一条 SQL 可看（记着的是各输入和来历）：照旧只给哈希。"""
-    merged = {"columns": ["region", "spend"], "rows": [["华东", 508.5]], "source": MERGE_SOURCE, "sources": ["crm"],
-              "sql": AGGREGATE, "mask_columns": ["phone"]}
+@pytest.mark.parametrize("merged", [
+    # 合并查询节点落的样子：另记着各输入和来历（inputs、sources 这几个键本身就不在认得的范围里）
+    {"columns": ["region", "spend"], "rows": [["华东", 508.5]], "source": MERGE_SOURCE, "sources": ["crm"],
+     "sql": AGGREGATE, "mask_columns": ["phone"]},
+    # 只剩数据源查询工具也会落的键：单凭来源是合并查询就不认
+    {"columns": ["region", "spend"], "rows": [["华东", 508.5]], "row_count": 1, "truncated": False,
+     "source": MERGE_SOURCE, "sql": AGGREGATE, "mask_columns": ["phone"]},
+])
+def test_a_merged_snapshot_from_a_masked_source_ships_only_its_id(merged):
+    """合并查询的 SQL 查的是各输入的结果在内存里落成的表，遮罩要按各输入的来历算，这里不认：照旧只给哈希。"""
     _, entry = bundle_of(merged)
     assert entry.get("masked") is True and "b64" not in entry
 

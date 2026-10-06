@@ -107,9 +107,40 @@ def test_a_card_reading_a_renamed_masked_column_ships_only_its_id(sql):
     assert PHONE not in render_html(bundle)
 
 
-def test_a_card_reading_an_unrenamed_column_of_that_query_is_embedded():
-    """同一条起了别名的查询，卡上取的是消费额（不取自号码）：照常嵌入。"""
-    snap = {**SNAP_MASKED, "columns": ["name", "tel", "spend"], "sql": "SELECT name, phone AS tel, spend FROM members"}
+@pytest.mark.parametrize("sql", [
+    # 列名表按位置改了名
+    "SELECT name, c AS tel, spend FROM members AS m(a, b, c)",
+    # 整行引用：FROM 里的表函数不写 LATERAL 也看得见前面的来源，整行一列列摊开；直接把整行转成文字
+    "SELECT name, j.value AS tel, spend FROM members m, jsonb_each_text(to_jsonb(m)) j",
+    "SELECT name, to_json(m)::text AS tel, spend FROM members m",
+    # UNION 一支里的 * 按位置对上第一支的列名
+    "SELECT name, tel, spend FROM (SELECT 'x' AS name, 'y' AS tel, 0 AS spend UNION ALL SELECT * FROM members) t",
+    # FROM 里的表函数吃进遮罩列，交出的列叫别的名字
+    "SELECT name, value AS tel, spend FROM members m, json_each_text(json_build_object('p', phone)) j",
+    # 不点列名也读得出表里内容；语法树认不准数据库实际执行什么
+    "SELECT name, table_to_xml('members', true, false, '')::text AS tel, spend FROM members",
+    "SELECT name, /*!50000 phone AS */ tel, spend FROM members",
+])
+def test_a_card_reading_a_column_whose_origin_the_sql_hides_ships_only_its_id(sql):
+    """快照的 SQL 认不出结果里哪一列取自哪一列（快照本身因此只给哈希）：卡上取的 tel 可能就是号码，整份快照的列都按
+    遮罩列算，整张卡只给 id。以前这条路只按列名和改了名字的遮罩列认，快照只给哈希，卡上记着的号码却原样进了文件。"""
+    snap = {**SNAP_MASKED, "columns": ["name", "tel", "spend"], "sql": sql}
+    snap_id, raw = stored(snap)
+    item = {**cell_input("tel", PHONE), "artifact": snap_id, "path": "cell(nodes.members, 0, 'tel')"}
+    bundle, entry = bundle_of(card_with([item], expression="len(cell(nodes.members, 0, 'tel'))"),
+                              files_changed={snap_id: raw})
+    assert entry.get("masked") is True and "b64" not in entry, sql
+    assert PHONE not in render_html(bundle)
+
+
+@pytest.mark.parametrize("sql, columns", [
+    ("SELECT name, phone AS tel, spend FROM members", ["name", "tel", "spend"]),
+    # 最外层的 * 照原来的名字展开：号码还在 phone 那一列
+    ("SELECT * FROM members", ["name", "phone", "spend"]),
+])
+def test_a_card_reading_an_unrenamed_column_of_that_query_is_embedded(sql, columns):
+    """同一条查询，卡上取的是消费额（不取自号码）：照常嵌入。"""
+    snap = {**SNAP_MASKED, "columns": columns, "sql": sql}
     snap_id, raw = stored(snap)
     item = {**cell_input("spend", 320.0), "artifact": snap_id}
     card = card_with([item], substituted="320.0", expression="cell(nodes.members, 0, 'spend')")
