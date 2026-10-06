@@ -67,8 +67,16 @@ export interface CompareErrorContext {
   /** 本次、基准的运行记录是不是 404 */
   targetGone: boolean
   baseGone: boolean
-  /** 换基准的下拉里有没有能选的运行（已封存、不是本次）；还不知道（在读、读失败）时为 null */
+  /** 换基准的下拉里有没有能换的运行（已封存、不是本次、也不是当前的基准）；还不知道（在读、读失败）时为 null */
   pickable: boolean | null
+}
+
+/**
+ * 「可在上方选择」这类下一步只在下拉里真有能换的运行时说：一次都没有时照实说没有（找默认基准时说「还没有」，换基准时说
+ * 「没有其他可换的」），还不知道（在读、读失败）时先不说
+ */
+function pickHint(ctx: CompareErrorContext, hint: string, none: string): string | null {
+  return ctx.pickable == null ? null : ctx.pickable ? hint : none
 }
 
 /**
@@ -80,6 +88,7 @@ export interface CompareErrorContext {
  * - 404：缺的是本次（targetGone）才是链接失效；缺的是基准（基准的记录 404，或者本次的记录读得到）就在上方另选；
  *   还不知道是哪一边时先不说；
  * - 找不到默认基准：本次不属于已保存的工作流同 422；下拉里有能选的才说可以在上方选，一次都没有就照实说
+ * 叫人去上方换基准的几句（409、422、缺基准的 404、找不到默认基准）都先看下拉里有没有能换的（pickHint）
  */
 function errorCopy(kind: Exclude<CompareErrorKind, 'other'>, error: unknown, targetGone: boolean, ctx: CompareErrorContext): {
   title: string; hint: string | null
@@ -88,18 +97,20 @@ function errorCopy(kind: Exclude<CompareErrorKind, 'other'>, error: unknown, tar
   switch (kind) {
     case '409': {
       const title = code === SEAL_BROKEN ? T.errSealBroken : code === UNSEALED ? T.errUnsealed : T.errSealed
-      return { title, hint: code === UNSEALED && ctx.targetUnsealed ? null : T.errSealedHint }
+      return { title, hint: code === UNSEALED && ctx.targetUnsealed ? null : pickHint(ctx, T.errSealedHint, T.errNoOtherBase) }
     }
     case '422':
-      return ctx.targetUnsaved ? { title: T.errUnsaved, hint: null } : { title: T.errMismatch, hint: T.errMismatchHint }
+      return ctx.targetUnsaved ? { title: T.errUnsaved, hint: null }
+        : { title: T.errMismatch, hint: pickHint(ctx, T.errMismatchHint, T.errNoOtherBase) }
     case '404':
       return {
         title: T.errMissing,
-        hint: targetGone ? T.errMissingHint : ctx.baseGone || ctx.targetKnown ? T.errBaseMissingHint : null,
+        hint: targetGone ? T.errMissingHint
+          : ctx.baseGone || ctx.targetKnown ? pickHint(ctx, T.errBaseMissingHint, T.errNoOtherBase) : null,
       }
     case 'no-base':
       if (ctx.targetUnsaved) return { title: T.errUnsaved, hint: null }
-      return { title: T.errNoBase, hint: ctx.pickable == null ? null : ctx.pickable ? T.errNoBaseHint : T.errNoBaseNone }
+      return { title: T.errNoBase, hint: pickHint(ctx, T.errNoBaseHint, T.errNoBaseNone) }
   }
 }
 

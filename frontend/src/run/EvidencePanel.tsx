@@ -18,14 +18,18 @@ import {
 } from '../lib/evidence'
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
-import { ABSENCE_CLAIM_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, nodeTypeLabel } from '../lib/terms'
+import {
+  ABSENCE_CLAIM_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT,
+  nodeTypeLabel,
+} from '../lib/terms'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
-  EvidenceBlock, EvidenceDocData, EvidenceInput, EvidenceMerge, EvidenceOnDemand, EvidenceQuoteSource, EvidenceSeal,
-  EvidenceSegment, EvidenceStep, EvidenceUnit, EvidenceVerdict, EvidenceViolation,
+  ApprovalReport, ChallengeCounts, EvidenceBlock, EvidenceDocData, EvidenceInput, EvidenceMerge, EvidenceOnDemand,
+  EvidenceQuoteSource, EvidenceSeal, EvidenceSegment, EvidenceStep, EvidenceUnit, EvidenceVerdict, EvidenceViolation,
 } from '../types'
 import { ArtifactViewer, ResultTable } from './AssistantStream'
+import { ChallengeSummary } from './ChallengeSummary'
 import { useEvidenceHost } from './evidenceHost'
 import { EvidenceProvenance } from './EvidenceProvenance'
 import { CopyChip } from './Markdown'
@@ -71,10 +75,80 @@ import {
  * 多少。推演不是出具，不写运行记录、不改报告。勾选框只在推演时出现在查询步骤的结果窗口里，只有这个指标用到的行能勾，
  * 表格底下带着推演结果。
  *
+ * 核查状态（期 4）：指标步骤多一行双盲复算的结果（一致、不一致和审核人选了什么、未能完成、已跳过），选了盲算、两边都
+ * 不对、没选、未能完成的写明报告里的数没换、已记为缺口；句子被反方审过的（点开整句、点开句中的数字都一样）多一块反方
+ * 审稿，复用审批卡上的展示（run/ChallengeSummary），概况是整份报告真实的计数，点开这一句看反方的理由和查询，不说出具会
+ * 不会降档（运行已经结束，看报告的出具横幅）。取自遮罩列的输入，服务端已把值换成「已遮罩」，标签照样写「已遮罩」，输入
+ * 来源里只说核对结果、不写值；遮没遮核对不了的（快照读不出来）同样不显示值，写明原因。
+ *
  * 四种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
  * 画布右栏里直接栏内展开，dock 放进页面给的一块常驻位置（记录页的「证据」页签）。
  * 都不是模态的：开着面板照样能在正文里走。
  */
+
+/**
+ * 期 4：证据接口在指标步骤上给的双盲复算状态（api/evidence.py 的 _dual_check_of）。没有双盲复算复核过这份指标集时
+ * 没有这个键。只有证据面板读它，类型就近写在这里
+ */
+interface DualCheckState {
+  status: 'agreed' | 'disagreed' | 'unchecked' | 'skipped' | (string & {})
+  node_id?: string
+  /** 不一致时审核人的选择：a 采用原流程、b 采用盲算、neither 两边都不对。没选的没有 */
+  choice?: string
+  /** 一致、不一致时的盲算值，服务端按口径卡的格式渲染好的 */
+  blind_rendered?: string
+  /** 未能完成（unchecked）：原因（人话）；已跳过：disabled / no_inputs / not_targeted（按这个指标说），认不出的代码不显示 */
+  reason?: string
+}
+
+/** 期 4：证据接口在句子上给的反方审稿判断（api/evidence.py 的 _challenge_of）。没审到这一句时没有这个键 */
+interface UnitChallenge {
+  verdict: string
+  node_id?: string
+  /** 审稿记录（challenge_artifact）。服务端保存失败时为 null：判断照样有，理由和查询看不了 */
+  artifact?: string | null
+  /** 实际生效的处置：degrade 被推翻的计入出具缺口；flag 只标注；fail 节点报错、运行停了 */
+  on_refuted?: string
+  /** 报告撰写节点的名字 */
+  report_label?: string
+  /** 整份报告的审稿计数（节点产出里的那一份），不是这一句的 */
+  counts: ChallengeCounts
+  /** 没能反查的句数（期 4 起的产出才有） */
+  unreviewed?: number
+}
+
+function dualCheckOf(step?: EvidenceStep): DualCheckState | null {
+  const raw = (step as (EvidenceStep & { dual_check?: unknown }) | undefined)?.dual_check
+  return raw && typeof raw === 'object' && typeof (raw as DualCheckState).status === 'string' ? raw as DualCheckState : null
+}
+
+const CHALLENGE_VERDICTS = ['stands', 'weakened', 'refuted', 'inconclusive'] as const
+
+/**
+ * 句子上的反方审稿判断认不认得：判断是一个词，计数四项都是数。没有计数的不画——审批卡的展示缺了计数会按列出的这一句
+ * 拼一个「被推翻 1 句、其余 0 句」，读着像整份报告的结果
+ */
+function challengeOf(unit: unknown): UnitChallenge | null {
+  const raw = unit && typeof unit === 'object' ? (unit as { challenge?: unknown }).challenge : undefined
+  if (!raw || typeof raw !== 'object') return null
+  const c = raw as UnitChallenge
+  const counts = c.counts && typeof c.counts === 'object' ? c.counts : null
+  if (typeof c.verdict !== 'string' || !c.verdict || !counts
+    || !CHALLENGE_VERDICTS.every((v) => typeof counts[v] === 'number' && Number.isFinite(counts[v]))) return null
+  return c
+}
+
+/** 取自遮罩列的输入：服务端把值换成「已遮罩」，masked 写明是哪几列 */
+function maskedOf(input: EvidenceInput): string[] {
+  const raw = (input as EvidenceInput & { masked?: unknown }).masked
+  return Array.isArray(raw) ? raw.filter((c): c is string => typeof c === 'string' && !!c) : []
+}
+
+/** 遮没遮核对不了的输入（快照、取值链上的产出读不出来）：值同样换成「已遮罩」，mask_unverified 是原因 */
+function unverifiedOf(input: EvidenceInput): string {
+  const raw = (input as EvidenceInput & { mask_unverified?: unknown }).mask_unverified
+  return typeof raw === 'string' ? raw : ''
+}
 
 export type PanelMode = 'side' | 'drawer' | 'inline' | 'dock'
 export type PanelView = { kind: 'seg'; id: string } | { kind: 'unit'; id: string } | { kind: 'violations' }
@@ -343,6 +417,7 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
   const chainFailed = !runId ? EVIDENCE_TEXT.noRun
     : docIssue ? EVIDENCE_TEXT.chainForeign
     : slot?.status === 'error' ? EVIDENCE_TEXT.chainMissing : ''
+  const segChallenge = docIssue ? null : challengeOf(detail?.unit)
 
   return (
     <>
@@ -399,7 +474,7 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
       )}
 
       {isMetric && (
-        <MetricPart step={metricStep} entry={entry} inputs={inputs} runId={runId} seal={seal}
+        <MetricPart step={metricStep} entry={entry} inputs={inputs} runId={runId} runClass={runClass} seal={seal}
                     pending={pending}
                     failed={chainFailed}
                     resolved={state === 'deterministic'}
@@ -458,6 +533,10 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
 
       <JudgePart doc={doc} unit={unit} block={block} runId={runId} runClass={runClass}
                  onDemand={detail?.unit?.on_demand} answered={detail?.unit?.verdict} pending={pending} />
+
+      {/* 反方审稿对这一句的判断：点句中的数字也看得到（没开结论句裁判的报告没有句末徽标，这里常是唯一的入口）。
+          正文不是封存的那一份时不用：服务端认的是封存的那份文档 */}
+      {segChallenge && <ChallengePart challenge={segChallenge} unit={unit} report={report} />}
 
       {host.onNode && (trace.producers.length > 0 || trace.consumers.length > 0) && (
         // 画布右栏：这段证据经过的节点，点一下在画布上选中并对准
@@ -537,6 +616,8 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block }: {
   const cites = (unit.cites ?? []).map((alias) => ({ alias, label: doc.catalog?.[alias]?.label as string | undefined }))
   // 讲方法、讲结构的句子：SQL 和字段清单直接列在挂的依据下面。正文不是封存的那份时不列（链是另一份报告的）
   const basis = useMemo(() => (foreign ? null : claimBasis(unit, doc)), [foreign, unit, doc])
+  // 反方审稿对这一句的判断：服务端只认审的就是封存的这一份文档；正文不是那一份时不用
+  const challenge = foreign ? null : challengeOf(answered?.unit)
   return (
     <>
       {foreign && (
@@ -550,6 +631,7 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block }: {
                  onDemand={foreign ? undefined : answered?.unit?.on_demand}
                  answered={foreign ? undefined : answered?.unit?.verdict}
                  pending={!!runId && !!first && (!slot || slot.status === 'loading')} />
+      {challenge && <ChallengePart challenge={challenge} unit={unit} report={report} />}
       <Part title={JUDGE_TEXT.cites} data-ev-cites="">
         {cites.length ? (
           <ul className="space-y-0.5">
@@ -574,6 +656,32 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block }: {
         )}
       </Part>
     </>
+  )
+}
+
+/**
+ * 反方审稿对这一句的判断（期 4），整句面板、片段面板共用。复用审批卡上的展示（run/ChallengeSummary，只读它的导出）：
+ * 那一块是报告级的——标题写报告名，概况是整份报告四种判断各几句（服务端给的真实计数，不凭这一句拼），条目只列这一句，
+ * 点开看反方的理由和它执行的查询，「显示全部」补出这份报告别的句子。判断是反方模型给的，那一块自己写明。
+ *
+ * 不给运行 id：ChallengeSummary 只拿它查运行类别，好在审批卡上预告「出具会降档」。证据面板看的是已经结束的运行，降没
+ * 降档、出没出具以报告的出具横幅（封存的出具判定）为准，这里再说一遍将来时的预告只会和横幅对不上（驳回了、不予出具、
+ * 反方审稿不在成果节点上游……）。ChallengeSummary 取不到运行类别时一句和出具有关的话都不说。等它有了单句的展示
+ * （只画这一句的判断和理由，不画报告级的标题、计数），换用那个
+ */
+function ChallengePart({ challenge, unit, report }: { challenge: UnitChallenge; unit: EvidenceUnit; report?: string }) {
+  const reports = useMemo<ApprovalReport[]>(() => [{
+    node_id: report ?? '', label: challenge.report_label || report || '',
+    challenge: {
+      counts: challenge.counts, items: [{ unit: unit.id, text: unitText(unit).trim(), verdict: challenge.verdict }],
+      artifact: challenge.artifact ?? null, on_refuted: challenge.on_refuted,
+      ...(typeof challenge.unreviewed === 'number' ? { unreviewed: challenge.unreviewed } : {}),
+    } as ApprovalReport['challenge'],
+  }], [challenge, unit, report])
+  return (
+    <div data-ev-challenge={challenge.verdict}>
+      <ChallengeSummary reports={reports} runId="" />
+    </div>
   )
 }
 
@@ -1125,11 +1233,13 @@ function Sentence({ unit, active }: { unit: EvidenceUnit; active: string }) {
 }
 
 /** 指标步骤：名称、值、口径与版本（来源、升版处置）、原式、代入式（输入标签）、复算；可以展开数字推演 */
-function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolved, linkOf, workflowName, whatif, children }: {
+function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, failed, resolved, linkOf, workflowName, whatif, children }: {
   step?: EvidenceStep
   entry?: Record<string, any>
   inputs: EvidenceInput[]
   runId?: string
+  /** 运行类别：双盲复算记的缺口，正式运行叫出具缺口 */
+  runClass?: string
   /** 封存状态：逐项复核里「在不在封存范围内」只在封存完好时单独报 */
   seal?: EvidenceSeal
   pending: boolean
@@ -1168,6 +1278,8 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
   // 所依据的查询对照数据目录查出了错误级的问题：值照算，结果不可靠，出具同样按缺口降档。问题和改法在查询步骤里
   const sqlFailed = step?.sql_check_failed === true || entry?.sql_check_failed === true
   const sqlReason = step?.sql_check_reason || entry?.sql_check_reason || EVIDENCE_TEXT.sqlCheckFallback
+  // 期 4：双盲复算复核过这个指标才有
+  const dualCheck = dualCheckOf(step)
 
   return (
     <Part title={EVIDENCE_TEXT.metric} data-ev-metric="">
@@ -1200,6 +1312,7 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
       {upgrade && (
         <p className="mt-0.5 text-2xs" style={{ color: 'var(--st-waiting)' }} data-ev-caliber-upgrade="">{upgrade}</p>
       )}
+      {dualCheck && <DualCheckLine check={dualCheck} formal={runClass === 'formal'} />}
       <Integrity step={step} seal={seal} />
       {missing && <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-missing="">{EVIDENCE_TEXT.missingValue}</p>}
       {incomplete && (
@@ -1256,6 +1369,47 @@ function MetricPart({ step, entry, inputs, runId, seal, pending, failed, resolve
 }
 
 /**
+ * 这个指标的双盲复算结果（期 4），一行：与盲算结果一致（带盲算值）、不一致（带盲算值和审核人选了什么）、未能完成（带原因）、
+ * 已跳过（带原因）。状态词和同一节里按代入式重算的「复算」分开说：那是同一组输入再算一遍，这是另起一路独立取数，
+ * 标签上悬停、读屏都说得出是什么。
+ *
+ * 选了盲算、两边都不对、没选、未能完成的，写明后果：报告里的数没换（仍取自原流程），节点把它记成了缺口——只看上面
+ * 那个数，会以为已经换成了盲算值。运行已经结束，只说节点做了什么，降没降档看报告的出具横幅。
+ *
+ * 结果都写成字，颜色只表达要不要多看一眼：一致用确定的绿（盲值是代码按原式代回算的、和原值比对的，不是模型的判断）；
+ * 不一致而审核人采用了原流程用提醒色，采用盲算、两边都不对、没有选的用失败色（记了缺口）；未能完成用提醒色（同样记了
+ * 缺口）；跳过的中性色。认不出的跳过原因不写原因代码
+ */
+function DualCheckLine({ check, formal }: { check: DualCheckState; formal: boolean }) {
+  const T = EVIDENCE_TEXT.dualCheck
+  const host = useEvidenceHost()
+  const { status } = check
+  const blind = (status === 'agreed' || status === 'disagreed') && check.blind_rendered ? T.blind(check.blind_rendered) : ''
+  const picked = check.choice ? DUAL_CHECK_TEXT.approval.choices[check.choice as 'a' | 'b' | 'neither'] : undefined
+  const detail = status === 'disagreed' ? (picked ? T.choice(picked) : T.noChoice)
+    : status === 'skipped' ? (check.reason ? T.skip[check.reason] ?? '' : '')
+      : status === 'unchecked' ? check.reason ?? '' : ''
+  const kept = status === 'disagreed' && check.choice !== 'a'
+  const after = kept ? T.kept(formal) : status === 'unchecked' ? T.gap(formal) : ''
+  const color = status === 'agreed' ? 'var(--st-done)'
+    : status === 'disagreed' ? (check.choice === 'a' ? 'var(--st-waiting)' : 'var(--st-failed)')
+      : status === 'unchecked' ? 'var(--st-waiting)' : 'var(--text-dim)'
+  return (
+    <p className="mt-1 text-2xs leading-relaxed [overflow-wrap:anywhere]" data-ev-dual-check={status}
+       data-ev-dual-check-choice={status === 'disagreed' ? check.choice ?? 'none' : undefined}>
+      <span className="text-faint" title={DUAL_CHECK_TEXT.description} data-ev-dual-check-label="">
+        {T.label}<span className="sr-only">（{DUAL_CHECK_TEXT.description}）</span>：
+      </span>
+      <span className="font-medium" style={{ color }}>{T.status[status] ?? T.unknown(String(status))}</span>
+      {blind && <span className="tnum text-dim">（{blind}）</span>}
+      {detail && <span className="text-dim">，{detail}</span>}
+      {after && <span className="text-dim" data-ev-dual-check-after="">。{after}</span>}
+      {host.onNode && check.node_id && <> <NodeChip id={check.node_id} /></>}
+    </p>
+  )
+}
+
+/**
  * 证据接口逐项复核的结果：eid 能重算、工件哈希复验、重新渲染一致、在封存范围内。
  * 全过的时候不说（正常态安静）；哪一项明确没过就用失败色写出来——这时候这件证据
  * 不能信，比「有出处」三个字重要得多。「不在封存范围内」只在封存完好时报：没封存、
@@ -1283,27 +1437,38 @@ function IntegrityList({ code, items }: { code: string; items: string[] }) {
 function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) {
   const host = useEvidenceHost()
   const missing = input.status === 'missing' || input.value == null
+  // 取自遮罩列（期 4）：服务端已把值换成「已遮罩」，这里照查询表格里遮罩格的样子写，读着不像一个真值。遮没遮核对不了的
+  // （快照读不出来）一样不显示值，悬停说明原因
+  const unverified = unverifiedOf(input)
+  const masked = !missing && (maskedOf(input).length > 0 || !!unverified)
   // Agent 交来、被截断切开的数组字段：对它计数、求和只算到了取回的那部分
   const cut = !missing && input.truncated === true
   const node = input.node_id ? host.nodeLabel?.(input.node_id) || input.node_id : ''
   const via = input.via ? VIA_TEXT[input.via] ?? nodeTypeLabel(input.via) : ''
   const from = [node && `来自节点「${node}」`, via && `（${via}）`, input.role && ` · ${ROLE_TEXT[input.role] ?? input.role}`,
-    cut && ` · ${EVIDENCE_TEXT.inputTruncated}`].filter(Boolean).join('')
+    cut && ` · ${EVIDENCE_TEXT.inputTruncated}`,
+    masked && ` · ${unverified ? EVIDENCE_TEXT.unverifiedInput(unverified) : EVIDENCE_TEXT.maskedInput}`].filter(Boolean).join('')
   const style = missing || cut ? { color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' } : { color: 'var(--text)' }
+  const shown = masked ? EVIDENCE_TEXT.masked : valueText(input.value)
   const body = (
-    <span className="truncate">{valueText(input.value)} ← {input.path ?? NONE}{missing ? '（缺失）' : cut ? '（已截断）' : ''}</span>
+    <span className="truncate">
+      {masked ? <span className="font-sans italic text-faint">{shown}</span> : shown} ← {input.path ?? NONE}
+      {missing ? '（缺失）' : cut ? '（已截断）' : ''}
+    </span>
   )
   return (
     <li className="max-w-full">
       {link ? (
         <button type="button" className="chip mono tnum max-w-full transition-colors hover:bg-hover" style={style}
-                data-ev-input={input.path ?? ''} title={`${from ? `${from} · ` : ''}${EVIDENCE_TEXT.gotoQuery(link.alias)}`}
-                aria-label={`${valueText(input.value)} ← ${input.path ?? NONE}，${EVIDENCE_TEXT.gotoQuery(link.alias)}`}
+                data-ev-input={input.path ?? ''} data-ev-input-masked={masked ? '' : undefined}
+                title={`${from ? `${from} · ` : ''}${EVIDENCE_TEXT.gotoQuery(link.alias)}`}
+                aria-label={`${shown} ← ${input.path ?? NONE}，${EVIDENCE_TEXT.gotoQuery(link.alias)}`}
                 onClick={link.go}>
           {body}<CornerDownRight size={9} className="shrink-0 opacity-60" aria-hidden />
         </button>
       ) : (
-        <span className="chip mono tnum max-w-full" data-ev-input={input.path ?? ''} style={style} title={from || undefined}>
+        <span className="chip mono tnum max-w-full" data-ev-input={input.path ?? ''} data-ev-input-masked={masked ? '' : undefined}
+              style={style} title={from || undefined}>
           {body}
         </span>
       )}
@@ -1333,7 +1498,7 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
     <Part title={EVIDENCE_TEXT.sources} data-ev-sources="">
       <ul className="space-y-1.5">
         {inputs.map((inp, i) => {
-          const said = inputSource(inp)
+          const said = maskedOf(inp).length || unverifiedOf(inp) ? maskedSource(inp) : inputSource(inp)
           const tone = TONE[said.tone]
           const link = linkOf(inp)
           // 查询编号写报告目录里的全局编号（接口补的 query、对上的查询步骤）；agent 字段自己的 ref 是
@@ -1370,6 +1535,18 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
       </ul>
     </Part>
   )
+}
+
+/**
+ * 取自遮罩列的输入在「输入来源」里怎么说（期 4）：核对结果照说，只是不写值——核对不一致时 inputSource 会把两边的值都写
+ * 出来。另附一句为什么不显示值。遮没遮核对不了的（快照读不出来）直接说原因：卡上记的核对结果对着的那份快照已经读不出来了
+ */
+function maskedSource(inp: EvidenceInput): { tone: SourceTone; text: string; reason?: string } {
+  const unverified = unverifiedOf(inp)
+  if (unverified) return { tone: 'warn', text: EVIDENCE_TEXT.unverifiedInput(unverified) }
+  if (inp.status === 'mismatch') return { tone: 'warn', text: EVIDENCE_TEXT.maskedMismatch }
+  const said = inputSource(inp)
+  return { ...said, reason: said.reason ? `${said.reason}；${EVIDENCE_TEXT.maskedInput}` : EVIDENCE_TEXT.maskedInput }
 }
 
 /**

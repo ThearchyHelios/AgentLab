@@ -8,7 +8,9 @@
   浏览器先核它的哈希，再从里面读出报告文档、口径卡、查询快照的 id。其余事件只给哈希：工具返回、节点产出的
   预览里可能有遮罩列的原值和提示词。
 - 工件：每份报告文档（各报告节点最后一次自查记下的 doc_artifact）、它引用到的口径卡和查询快照，按原字节
-  base64 嵌入，浏览器重算 sha256 和 id 比；带遮罩的快照不嵌内容、只给 id。没被报告引用的工件不嵌。
+  base64 嵌入，浏览器重算 sha256 和 id 比；带遮罩的快照不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，
+  有输入取自遮罩列（cell() 的格、Agent 字段、按位置取的 vars.res.rows[0][2]）的整张卡同样只给 id，认法和证据
+  面板、推演同一个（recompute.input_origin）。没被报告引用的工件不嵌。
 - 封存之后追加的事件（按需裁判、审批质询这类批注）单列：类型、序号、内容摘要，不进清单。
 
 它只证明「内部一致」：数字、文档、运行记录彼此对得上，而且没被改过。真伪要拿页面上的封存哈希和系统里这次
@@ -34,6 +36,7 @@ from app.core.artifact_store import canonical_json, content_hash
 from app.core.events import EventType
 from app.engine.evidence import iter_units, query_entry_fields
 from app.engine.merge_query import MERGE_SOURCE
+from app.engine.recompute import input_origin
 from app.engine.schema import NodeType
 from app.engine.toolcalls import QUERY_PREFIX
 
@@ -106,6 +109,44 @@ class _Store:
             self._masked[artifact] = _snapshot_masked(self.content(artifact), self._source_masks)
         return self._masked[artifact]
 
+    def card_masked(self, artifact: str, events: Sequence[tuple[int, str, str | None, Any]]) -> bool:
+        """这张口径卡算不算带遮罩：卡上有一个输入取自遮罩列，或者遮没遮核对不了。卡上记着每个输入的值（cell() 取的格、
+        Agent 字段、按位置取的 vars.res.rows[0][2]）和代入式，整张卡不随文件附带——没法只拿掉几个值，拿掉了哈希就对不上。
+
+        认哪个输入取自哪份查询结果的哪几列，和证据面板、推演同一个认法（recompute.input_origin）；按位置取的一格顺着
+        取值链从写变量的节点在口径卡算这一次之前的产出起走。核对不了的宁可多挡：快照读不出来、取值链上的产出读不出来、
+        那份结果没存快照只带着数据源名、定位里没写列。认得出、可结果既没带快照的 id 也没带数据源名的（数据整形改过形状）
+        认不出出处，不算。读不出来的卡本来就不嵌，这里不管。"""
+        key = f"card:{artifact}"
+        if key not in self._masked:
+            card = self.content(artifact) if self.intact(artifact) else None
+            outputs = _card_outputs(events, artifact) if isinstance(card, dict) else {}
+
+            def output(node_id: Any) -> Any:
+                found = outputs.get(str(node_id or ""))
+                return self.content(found) if found and self.intact(found) else None
+
+            items = [item for metric in (card or {}).get("metrics") or [] if isinstance(metric, dict)
+                     for item in metric.get("inputs") or [] if isinstance(item, dict)]
+            self._masked[key] = any(self._input_masked(item, output) for item in items)
+        return self._masked[key]
+
+    def _input_masked(self, item: dict[str, Any], output: Callable[[Any], Any]) -> bool:
+        origin = input_origin(item, output)
+        if origin is None:
+            return False
+        if origin.unverified is not None:
+            return True
+        if origin.artifact is None:
+            return origin.source is not None     # 没存快照：查询当时记下的遮罩无从核对
+        content = self.content(origin.artifact)
+        if not self.intact(origin.artifact) or not isinstance(content, dict):
+            return True
+        if not origin.columns:
+            return self.masked(origin.artifact)
+        hidden = _snapshot_hidden(content, self._source_masks)
+        return any(c.lower() in hidden for c in origin.columns)
+
 
 def _snapshot_masked(content: Any, source_masks: Mapping[str, Any]) -> bool:
     if not isinstance(content, dict):
@@ -115,6 +156,37 @@ def _snapshot_masked(content: Any, source_masks: Mapping[str, Any]) -> bool:
         return True
     sources = content.get("sources") if content.get("source") == MERGE_SOURCE else [content.get("source")]
     return any(source_masks.get(str(name or "")) for name in sources or [])
+
+
+def _snapshot_hidden(content: dict[str, Any], source_masks: Mapping[str, Any]) -> set[str]:
+    """一份读得出来的快照要遮的列（小写）：查询当时记下的，加上它的数据源（合并查询看它合并的那几个）现在设的。"""
+    recorded = content.get("mask_columns")
+    hidden = {c.lower() for c in recorded if isinstance(c, str)} if isinstance(recorded, list) else set()
+    sources = content.get("sources") if content.get("source") == MERGE_SOURCE else [content.get("source")]
+    for name in sources if isinstance(sources, list) else []:
+        now = source_masks.get(str(name or ""))
+        hidden |= {str(c).lower() for c in now} if isinstance(now, (list, tuple, set, frozenset)) else set()
+    return hidden
+
+
+def _card_outputs(events: Sequence[tuple[int, str, str | None, Any]], card: str) -> dict[str, str]:
+    """算出这份指标集的那一次口径卡执行开始之前，每个节点最后一次的产出工件：卡上 vars.*、nodes.* 取到的就是它们
+    （和证据接口 api/evidence._card_outputs 同一个认法）。认不出是哪一次执行时取封存范围内每个节点最后一次的产出。"""
+    found = next(((seq, node_id) for seq, etype, node_id, data in events
+                  if etype == EventType.NODE_FINISHED and isinstance(data, dict)
+                  and any(isinstance(e, dict) and e.get("kind") == "metric_set" and e.get("artifact") == card
+                          for e in data.get("evidence") or [])), None)
+    bound = None
+    if found is not None:
+        bound = max((seq for seq, etype, node_id, _ in events
+                     if etype == EventType.NODE_STARTED and node_id == found[1] and seq < found[0]), default=found[0])
+    out: dict[str, str] = {}
+    for seq, etype, node_id, data in events:
+        if bound is not None and seq >= bound:
+            break
+        if etype == EventType.NODE_FINISHED and node_id and isinstance(data, dict) and data.get("artifact"):
+            out[node_id] = str(data["artifact"])
+    return out
 
 
 def _query_artifacts(events: Iterable[tuple[int, str, str | None, Any]]) -> list[str]:
@@ -234,10 +306,12 @@ def _cited_artifacts(doc: dict[str, Any]) -> list[tuple[str, str, str | None]]:
 
 
 class _Artifacts:
-    """嵌进页面的工件清单，按先后：报告文档在前，接着是它引用到的。同一份只列一次。"""
+    """嵌进页面的工件清单，按先后：报告文档在前，接着是它引用到的。同一份只列一次。events 是封存范围内的事件
+    （认口径卡带不带遮罩时找写变量的节点当时的产出）。"""
 
-    def __init__(self, store: _Store) -> None:
+    def __init__(self, store: _Store, events: Sequence[tuple[int, str, str | None, Any]] = ()) -> None:
         self.store = store
+        self.events = events
         self.items: list[dict[str, Any]] = []
         self._seen: set[str] = set()
 
@@ -252,7 +326,8 @@ class _Artifacts:
         if raw is None:
             # 服务端的文件不在了：只给 id，浏览器照实说核对不了
             item["missing"] = True
-        elif kind == "query" and self.store.masked(artifact):
+        elif (kind == "query" and self.store.masked(artifact)) \
+                or (kind == "metric_set" and self.store.card_masked(artifact, self.events)):
             item["masked"] = True
         else:
             # 原样嵌入，不在这里复验哈希：被改过的文件照实交出去，浏览器自己算出对不上
@@ -380,7 +455,7 @@ def build_bundle(
     later = [e for e in events if e[0] > manifest_seq]
     store = _Store(read, source_masks or {})
 
-    artifacts = _Artifacts(store)
+    artifacts = _Artifacts(store, sealed)
     reports = _report_events(sealed)
     cited_queries: list[str] = []
     for report in reports:

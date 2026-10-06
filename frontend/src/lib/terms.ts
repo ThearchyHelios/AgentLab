@@ -473,6 +473,39 @@ export const EVIDENCE_TEXT = {
     loading: '正在推断来源…',
     failed: '未能获取推断的来源',
   },
+
+  // ---- 期 4：核查状态。指标步骤上的双盲复算、取自遮罩列的输入（反方审稿的判断复用审批卡的 CHALLENGE_TEXT）----
+  /**
+   * 指标步骤上的一行：「双盲复算：状态（盲算 值），审核人的选择。后果」。状态词和同一节里按代入式重算的「复算一致 /
+   * 无法复算」分开说（两件事），用时间线上的说法（与盲算结果一致 / 不一致）；选项名照审批卡的 choices 原样加引号。
+   * 运行已经结束：后果只说节点已经做了什么（记为缺口），降没降档看报告的出具横幅，这里不预告
+   */
+  dualCheck: {
+    label: '双盲复算',
+    status: { agreed: '与盲算结果一致', disagreed: '与盲算结果不一致', unchecked: '未能完成', skipped: '已跳过' } as Record<string, string>,
+    /** 服务端给了一个界面不认识的状态：照写原值，不归到哪一类 */
+    unknown: (status: string) => `未知状态「${status}」`,
+    /** 盲算的值，服务端按口径卡的格式渲染好的 */
+    blind: (value: string) => `盲算 ${value}`,
+    /** choice 是审批卡上那个选项的原名（DUAL_CHECK_TEXT.approval.choices） */
+    choice: (choice: string) => `审核人选择「${choice}」`,
+    noChoice: '审核人没有作出选择',
+    /** 采用盲算、两边都不对、没选：报告里的数没换，节点把它记成了缺口。正式运行叫出具缺口，探索运行不出具 */
+    kept: (formal: boolean) => `报告中的数仍取自原流程，这个指标已记为${formal ? '出具缺口' : '缺口'}`,
+    /** 未能完成：同样记了缺口 */
+    gap: (formal: boolean) => `这个指标已记为${formal ? '出具缺口' : '缺口'}`,
+    /** 跳过的原因，按这个指标说；认不出的原因代码不写 */
+    skip: {
+      disabled: '节点或设置中已关闭',
+      no_inputs: '这个指标没有来自查询的输入',
+      not_targeted: '这个指标不在复算范围内',
+    } as Record<string, string>,
+  },
+  /** 指标的输入取自数据源设置了遮罩的列：标签和代入式里不显示值 */
+  maskedInput: '取自设置了遮罩的列，不显示值',
+  /** 遮没遮核对不了（快照、取值链上的产出读不出来）：原因是服务端写好的一句 */
+  unverifiedInput: (why: string) => `${why}，不显示值`,
+  maskedMismatch: '与快照不一致；取自设置了遮罩的列，不显示值',
 } as const
 
 /**
@@ -3151,6 +3184,8 @@ export const RUN_COMPARE_TEXT = {
   pickLoading: '正在读取同一工作流的运行…',
   pickFailed: '无法读取同一工作流的运行',
   pickNone: '同一工作流没有其他运行',
+  /** 本次的运行记录不存在：不知道是哪个工作流，列不出候选，重试也是一样 */
+  pickTargetGone: '本次运行的记录不存在，无法列出同一工作流的运行',
   pickUnsaved: '工作流未保存或已删除，没有可对比的运行',
   pickPlaceholder: '选择一次运行作为基准',
   /** 下拉里的一次运行：时间 · 类别和版本 · 短 id，没封存的另标 */
@@ -3182,6 +3217,8 @@ export const RUN_COMPARE_TEXT = {
   errNoBaseHint: '可在上方选择同一工作流的其他运行作为基准',
   /** 下拉里一次能选的都没有（只有本次、或者都没封存） */
   errNoBaseNone: '同一工作流还没有其他已封存的运行',
+  /** 409、422、404 时下拉里除了本次和当前的基准，没有别的已封存的运行：换基准这条路走不通，照实说 */
+  errNoOtherBase: '同一工作流没有其他可换作基准的已封存运行',
   viewBase: '查看基准运行',
   viewTarget: '查看本次运行',
   // 摘要
