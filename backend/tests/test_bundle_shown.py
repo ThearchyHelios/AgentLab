@@ -33,16 +33,17 @@ from app.engine.evidence import RenderError, _Snapshots, render_cell, render_num
 NODE = shutil.which("node")
 VERIFIER = Path(app.bundle.__file__).parent / "verifier.js"
 
-pytestmark = pytest.mark.skipif(NODE is None, reason="没有 node，跑不了页面上的核对脚本")
+pytestmark = pytest.mark.skipif(NODE is None, reason="没有 node，无法执行页面上的核对脚本")
 
-#: 载入 verifier.js（在 node 里没有 document，它把核对用的纯函数交给 module.exports），按 stdin 交来的任务算
+#: 载入 verifier.js（在 node 里没有 document，它把核对用的纯函数交给 module.exports），按 stdin 交来的任务算。
+#: noBigInt：载入时把 BigInt 遮掉，当作较早的浏览器
 HARNESS = r"""
 const fs = require('fs')
 const { createHash } = require('crypto')
-const mod = { exports: {} }
-new Function('module', fs.readFileSync(process.argv[1], 'utf8'))(mod)
-const v = mod.exports
 const input = JSON.parse(fs.readFileSync(0, 'utf8'))
+const mod = { exports: {} }
+new Function('module', 'BigInt', fs.readFileSync(process.argv[1], 'utf8'))(mod, input.noBigInt ? undefined : BigInt)
+const v = mod.exports
 
 function render(c) {
   try {
@@ -354,6 +355,19 @@ def test_an_unknown_cell_display_version_cannot_pass():
     cells = [n for n in got["numbers"] if n["ref"].startswith("v:")]
     assert cells and all(n["result"] == "na" and n["reason"].startswith("无法核对显示文字：") for n in cells)
     assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"].startswith("m:"))
+
+
+def test_a_browser_without_bigint_cannot_check_numbers_but_still_checks_the_rest():
+    """较早的浏览器没有 BigInt：数字的显示文字判无法核对（写明原因），文字取值照常核对，别的核对项不受影响，脚本不出错。"""
+    from tests.bundle_samples import formats_bundle
+
+    bundle = formats_bundle()
+    got = node("verify", data=bundle, seal=bundle["meta"]["manifest_hash"], noBigInt=True)
+    assert all(r == "pass" for key in ("events", "manifest", "artifacts", "chain", "meta") for r in got[key])
+    texts = {"v:Q1.r0.region", "v:Q1.r1.region", "v:Q1.r0.paid_at"}
+    assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"] in texts)
+    assert all(n["result"] == "na" and n["reason"] == "无法核对显示文字：这个浏览器不支持按系统的显示规则重新渲染（缺少 BigInt 或 "
+               "Unicode 正则）" for n in got["numbers"] if n["ref"] not in texts)
 
 
 def test_every_sample_page_still_passes_its_display_check():
