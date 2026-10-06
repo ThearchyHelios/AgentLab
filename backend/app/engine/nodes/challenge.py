@@ -817,15 +817,11 @@ class _Review:
                                       if isinstance(entry, dict) and entry.get("kind") == "query")
 
     async def _kinds(self, names: Iterable[str]) -> dict[str, Any]:
-        """这几个数据源的类型（摘录按 SQL 认改了名字的遮罩列时用）。快照记的数据源也算上（旧台账条目没记数据源）。"""
+        """这几个数据源的类型（摘录按 SQL 认改了名字的遮罩列时按它的方言解析）。names 是整份报告用到的数据源
+        （claim_sources：查询的、合并查询合并的、指标输入取自的、表和字段的）。"""
         from app.engine.inquiry import _source_kinds   # inquiry 导入了这个模块，用到时再导入
 
-        wanted = set(names)
-        for entry in self.catalog.values():
-            snapshot = self.fetch(entry.get("artifact")) if isinstance(entry, dict) else None
-            if isinstance(snapshot, dict) and snapshot.get("source"):
-                wanted.add(str(snapshot["source"]))
-        return await _source_kinds(wanted)
+        return await _source_kinds(names)
 
     async def _store(self, record: dict[str, Any]) -> str | None:
         try:
