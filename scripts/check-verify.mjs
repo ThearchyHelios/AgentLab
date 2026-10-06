@@ -382,12 +382,14 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
   // 不写。卡上不能说得比服务端宽——每句只说必要条件（「仅当」开头），这几种不写的照实说，免得审核人为了不让目录被写错
   // 而避开本来对的一边。变体的 catalog 是服务端对这一对 SQL 的真实预告，按它核对
   const { CATALOG_TABLE_FIELD_LABEL: LABEL } = await import(await load('/src/lib/terms.ts'))
-  // [变体, 说明, 服务端不写的那一种卡上照实说的那句（只在卡上提数据目录时有）]
+  // [变体, 说明, 服务端不写的那一种卡上照实说的那句（只在卡上提数据目录时有）]。变体挑的是收尾版差异说明下各有代表性
+  // 的几种（backend/tests/test_dual_check_fixture.py 的模块说明）：同一列上的时间范围不同只给兜底（fallback）
   const cases = [
-    ['time_range', '只差时间范围（不是换了时间列）'],
+    ['fallback', '说不清的（同一列上的时间范围不同，只给兜底）'],
     ['two_filters', '差两个筛选条件'],
     ['join', '差在关联方式'],
     ['parse', '一边解析失败'],
+    ['time_column', '换了时间列（两列都声明为日期类型）', '只有一边按时间筛时不记'],
     ['time_one_side', '只有一边按时间筛', '只有一边按时间筛时不记'],
     ['filter_extra', '只多一个排除测试单的条件', '只看某个地区、某个渠道这类限定指标范围的条件不记'],
     ['filter_scope', '只多一个渠道条件', '只看某个地区、某个渠道这类限定指标范围的条件不记'],
@@ -412,10 +414,21 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
       // 「不记」后面紧跟一句「记为人工确认的事实」，读起来像在说不记的那一项
       check('……「人工确认」说的是写入的项', note.includes('写入的项记为人工确认的事实') && !note.includes('不记。记为'), note)
     }
-    if (name === 'time_one_side' || name === 'dedup') {
+    if (name === 'time_column' || name === 'time_one_side' || name === 'dedup') {
       // 同一次裁决里几个指标给同一张表记的业务日期、去重规则不同时，服务端一项都不写（有效记录条件是合成一句写）。
       // 没有预告时卡上看不出别的指标落到哪一项上，照实说这一条
       check('……同一次裁决里几个指标给同一张表记的说法不同时都不记', note.includes('同一次裁决里') && note.includes('不同时都不记'), note)
+    }
+    if (name === 'time_column') {
+      // 服务端两边都会写（各记被采纳那一边的列）：卡上的必要条件说的就是按不同的列筛时间
+      check('……两边按不同的列筛时间，采用的一边所用的时间列才记为业务日期', writes.length === 2
+        && note.includes('按不同的列筛时间') && note.includes('采用的一边所用的时间列'), note)
+    }
+    if (name === 'fallback') {
+      // 收尾版差异说明归纳不了同一列上的时间范围：卡上写那句固定的兜底说明，默认展开对照，审核人逐行对照两条 SQL
+      check('……写那句固定的兜底说明，不当成一条具体差异', (await text(gmv.locator('[data-dual-fallback]'))) === '两条 SQL 的写法不同，未能归纳成具体差异'
+        && await gmv.locator('[data-dual-diff-item]').count() === 0, await text(gmv.locator('[data-dual-fallback]')))
+      check('……默认展开对照', (await gmv.locator('[data-dual-compare-toggle]').getAttribute('aria-expanded')) === 'true')
     }
     if (name === 'time_one_side') {
       // 正上方那条差异说「盲算没有按时间筛选」：卡上不能再说两边只差在按哪一列筛时间
@@ -436,7 +449,9 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
     }
     const diff = fx.variants[name].diff
     if (diff.text_diff.length) {
-      await gmv.locator('[data-dual-compare-toggle]').click()
+      // 只有兜底说明时对照默认就展开着：再点一下就收起来了
+      const toggle = gmv.locator('[data-dual-compare-toggle]')
+      if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click()
       const m = await marksIn(gmv)
       const real = sidesOf(diff)
       check(`……规范化后的行按真实输出分两栏高亮（${real.del.length} + ${real.add.length} 行）`,
@@ -449,7 +464,7 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
   }
 
   // 几个输入都差在时间列：节点把两处的差异合成一份（每条前面写明是哪个输入），不止一条，不写目录
-  const t = fx.variants.time_range.diff.items[0]
+  const t = fx.variants.time_column.diff.items[0]
   const merged = {
     equivalent: false, fallback: false, text_diff: fx.card.metrics[0].diff.text_diff,
     items: [{ aspect: 'time', text: `输入「gmv_web」：${fx.card.metrics[0].diff.items[0].text}` }, { aspect: 'time', text: `输入「gmv_app」：${t.text}` }],
@@ -520,23 +535,39 @@ await section('审批卡：服务端预告了写目录时照它说，当前选�
   await shot(base.page, 'approval-preview-dark')
 
   // 几个变体：预告说两边都不写的，卡上就不提（没有预告时这几种会有条件地提）；写的那一边说清写到哪、写成什么
-  for (const [name, what] of [['time_one_side', '只有一边按时间筛'], ['filter_scope', '只多一个渠道条件'], ['filter_extra', '只多一个排除测试单的条件'],
-    ['dedup', '只差去不去重'], ['time_range', '只差时间范围']]) {
+  for (const [name, what] of [['time_column', '换了时间列'], ['time_one_side', '只有一边按时间筛'], ['filter_scope', '只多一个渠道条件'],
+    ['filter_extra', '只多一个排除测试单的条件'], ['dedup', '只差去不去重'], ['fallback', '说不清的（只给兜底）']]) {
     const { page, errors } = await preview('dual-check-approval', { query: `variant=${name}&catalog=1`, artifact: cardWith(name) })
     await page.waitForSelector('[data-dual-check][data-state="ready"]')
     const m = metric(page, 'gmv')
     const expect = fx.variants[name].catalog
     const writes = ['a', 'b'].filter((s) => expect[s].write)
-    check(`${what}（变体）：摘要换成这一对 SQL 的差异`, (await text(m.locator('[data-dual-diff-item]'))) === fx.variants[name].diff.items[0].text,
-      await text(m.locator('[data-dual-diff-item]')))
+    if (fx.variants[name].diff.items.some((i) => i.aspect !== 'other' && i.aspect !== 'parse')) {
+      check(`${what}（变体）：摘要换成这一对 SQL 的差异`, (await text(m.locator('[data-dual-diff-item]'))) === fx.variants[name].diff.items[0].text,
+        await text(m.locator('[data-dual-diff-item]')))
+    } else {
+      check(`${what}（变体）：摘要换成兜底说明，不当成一条具体差异`, (await text(m.locator('[data-dual-fallback]'))) === '两条 SQL 的写法不同，未能归纳成具体差异'
+        && await m.locator('[data-dual-diff-item]').count() === 0, await text(m.locator('[data-dual-fallback]')))
+    }
     if (!writes.length) {
       check(`${what}：服务端两边都不写，卡上不提数据目录`, await m.locator('[data-dual-catalog]').count() === 0, await text(m.locator('[data-dual-catalog]')))
     } else {
       const got = await previewClauses(m)
+      // 两边都写、写的是同一张表的同一项（换了时间列：同一张表的业务日期）时，后一条省掉哪张表的哪一项
+      const same = writes.length === 2 && ['source', 'table', 'item'].every((k) => expect.a[k] === expect.b[k])
       const ok = ['a', 'b'].every((s) => (expect[s].write
-        ? got[s]?.write && got[s].text.includes(LABEL[expect[s].item]) && got[s].text.includes(`会记为「${previewValue(expect[s].value)}」`)
+        ? got[s]?.write && got[s].text.includes(`会记为「${previewValue(expect[s].value)}」`)
+          && (s === 'b' && same ? got[s].text === `${CHOICE_LABEL.b}时会记为「${previewValue(expect.b.value)}」` : got[s].text.includes(LABEL[expect[s].item]))
         : !got[s]?.write && got[s]?.reason && got[s].text === blockedText(CHOICE_LABEL[s], expect[s].reason)))
       check(`${what}：写的一边说清写到哪、会记为什么，不写的一边照服务端的原话说不会记入的原因`, ok, `${got.a?.text} ‖ ${got.b?.text}`)
+      if (name === 'time_column') {
+        // 两列都声明为日期类型：选哪一边都记被采纳那一边的列，加重的那一条跟着选择走
+        await m.locator('label', { hasText: '采用盲算的结果' }).click()
+        const cur = await previewClauses(m)
+        check('换了时间列，选盲算：加重的那一条说业务日期会记为盲算那一列', cur.b?.current && cur.b.write && !cur.a.current
+          && cur.b.text === `采用盲算的结果时会记为「${previewValue(expect.b.value)}」`
+          && cur.a.text === `采用原流程的结果时，「orders」（shop）的业务日期会记为「${previewValue(expect.a.value)}」`, `${cur.a?.text} ‖ ${cur.b?.text}`)
+      }
       if (name === 'dedup') {
         // 采用去重的原流程记去重规则，采用不去重的盲算不记：两种选择分别看加重的那一句
         await m.locator('label', { hasText: '采用原流程的结果' }).click()

@@ -9,11 +9,18 @@ check-verify 在夹具上能过，真实数据上却一处都不高亮（2026-10
 差异都没有」，delta_pct 是 (盲算值 − 原流程值) ÷ |原流程值| × 100 保留两位。夹具的数据源当 SQLite 比（方言 sqlite），
 两边的叫法是「原流程」「盲算」，同节点调用时一样。
 
+**变体。** variants 换掉「销售额」的那一对 SQL，挑的是收尾版差异说明（只说时间列、多出来的筛选、聚合与去重、关联
+四类，别的只给兜底）下各有代表性的几种：按哪一列筛时间不同（time_column，两列都声明为日期类型，预告写业务日期）、
+只有一边按时间筛、一边多出来的筛选（排除无效记录的 filter_extra 预告写有效记录条件，指标自己范围的 filter_scope 不写）、
+差两个筛选条件、关联方式、聚合只差去重（dedup，预告写去重规则）、说不清的（fallback：同一列上的时间范围不同，只给兜底，
+审批卡默认展开逐行对照）、一边解析失败。
+
 **写目录的预告。** 服务端在摘要里另带每个指标的 catalog（采用原流程、采用盲算各会往数据目录里写什么，
 dual_check_facts.preview，约定之外另加的），审批卡照它说；老服务端没有时卡上按差异的形状有条件地说，两种说法都按
 「服务端到底写不写」核对（2026-10 复核：卡上说会记入、服务端却不写的有好几种）。夹具里的预告（catalog_preview 按指标、
-variants 和 peers 各自的 catalog）也是服务端的真实输出：按下面的 SCHEMA、空目录、指标自己的范围留空算。双盲复算的
-服务端合入之前没有这个模块，逐项比对那几项跳过，形状和门槛照样查。
+variants 和 peers 各自的 catalog）也是服务端的真实输出：按下面的 SCHEMA、空目录、指标自己的范围留空算。SCHEMA 里
+paid_at、created_at 声明为 TIMESTAMP：业务日期只在两边的时间列都声明为日期 / 时间类型时才写。双盲复算的服务端合入之前
+没有这个模块，逐项比对那几项跳过，形状和门槛照样查。
 
 **同一次裁决里几个指标落到同一项上。** 预告是每个指标单独算的，服务端写目录前却要把同一次裁决里落到同一张表同一项上的
 说法归拢（业务日期、去重规则说法不同的一项都不写，有效记录条件合成一句写，驳回过的拿出来不写）。服务端把每种组合按
@@ -54,16 +61,17 @@ DIALECT = "sqlite"
 LABELS = ("原流程", "盲算")
 #: 摘要里每个指标最多列几条差异（同双盲复算节点的 SUMMARY_DIFFS）
 SUMMARY_DIFFS = 3
-#: 预告用的数据源名和表结构（虚构）：服务端要认得出表、认得出聚合的列属于哪张表，才会预告写哪一项
+#: 预告用的数据源名和表结构（虚构）：服务端要认得出表、认得出聚合的列属于哪张表，才会预告写哪一项；时间列声明为
+#: TIMESTAMP，业务日期才会预告写（文本、整数的时间列不记）
 SOURCE = "shop"
 SCHEMA: dict[str, Any] = {"tables": {
     "orders": {"name": "orders", "columns": [
         {"name": "id", "type": "INTEGER"}, {"name": "user_id", "type": "INTEGER"}, {"name": "amount", "type": "REAL"},
-        {"name": "status", "type": "TEXT"}, {"name": "channel", "type": "TEXT"}, {"name": "paid_at", "type": "TEXT"},
-        {"name": "created_at", "type": "TEXT"}], "primary_key": ["id"]},
+        {"name": "status", "type": "TEXT"}, {"name": "channel", "type": "TEXT"}, {"name": "paid_at", "type": "TIMESTAMP"},
+        {"name": "created_at", "type": "TIMESTAMP"}], "primary_key": ["id"]},
     "refunds": {"name": "refunds", "columns": [
         {"name": "id", "type": "INTEGER"}, {"name": "order_id", "type": "INTEGER"}, {"name": "amount", "type": "REAL"},
-        {"name": "created_at", "type": "TEXT"}], "primary_key": ["id"]},
+        {"name": "created_at", "type": "TIMESTAMP"}], "primary_key": ["id"]},
 }}
 #: 写目录时认得出的三项（dual_check_facts.FACT_ITEMS）
 FACT_ITEMS = ("business_date", "valid_filter", "dedup")
@@ -181,6 +189,28 @@ def test_variants_carry_the_real_diff():
         for name, swap in fx[group].items():
             original, blind = swap["sql"]
             assert swap["diff"] == _diff(original, blind), f"{group}.{name}"
+
+
+#: 变体里各有代表性的几种（见模块说明「变体」）：名字 → (差异条目的方面, 预告会写的边和项)
+REPRESENTATIVE = {
+    "time_column": (["time"], {"a": "business_date", "b": "business_date"}),
+    "filter_extra": (["filter"], {"a": "valid_filter"}),
+    "dedup": (["aggregate"], {"a": "dedup"}),
+    "fallback": (["other"], {}),
+}
+
+
+def test_variants_keep_their_representative_shapes():
+    """检查脚本拿这几种变体看卡上怎么说。差异说明或写目录的规则一改，变体可能悄悄变成别的形状（换了时间列却只给兜底、
+    预告不再写业务日期），那几项检查就什么也没测：这里守住每种的方面和预告会写的项，说不清的那种还得有逐行对照。不依赖
+    服务端的模块，一直查。"""
+    fx = _load()
+    for name, (aspects, writes) in REPRESENTATIVE.items():
+        swap = fx["variants"][name]
+        assert [i["aspect"] for i in swap["diff"]["items"]] == aspects, name
+        assert {side: said["item"] for side, said in swap["catalog"].items() if said["write"]} == writes, name
+    fallback = fx["variants"]["fallback"]["diff"]
+    assert fallback["fallback"] is True and fallback["text_diff"], fallback
 
 
 def test_text_diff_is_not_the_raw_text():
