@@ -40,7 +40,8 @@
   安全，宁可多遮；数个数要用 COUNT。按遮罩列分档的 CASE（CASE WHEN age < 30 THEN '30岁以下' …）同理，标签列整列遮，
   标签文字也成了遮罩值，SQL 和回答正文里写着的同样的字一并换掉（换掉的标签不是数，不牵连阈值）
 - 「夹住某一个值」只在同一个条件里认（_pinned）：把找值拆进子查询、CTE 的写法（WHERE age >= 25 AND id IN
-  (SELECT id FROM t WHERE age <= 25)）认不出，两个边界都当阈值照原样留着
+  (SELECT id FROM t WHERE age <= 25)）认不出，两个边界都当阈值照原样留着；反过来，条件长到细看不过来（PIN_WORK）时，
+  两边都隔开的一律按夹住算，会多遮几个阈值
 - 遮罩值最多收 SECRETS_MAX 种写法，再多的按值认不出（按列遮照旧）
 """
 from __future__ import annotations

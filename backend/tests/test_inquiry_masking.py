@@ -356,8 +356,8 @@ def test_a_range_that_pins_a_single_value_is_a_lookup(phones, sql, shown):
      "SELECT COUNT(*) FROM sales WHERE age >= 已遮罩 XOR age > 已遮罩"),
 ])
 def test_a_value_pinned_within_one_condition_is_still_a_lookup(phones, kind, sql, shown):
-    """「夹住某一个值」只在同一个条件里认（从比较往上只越过且、或、非、括号），同一个条件里夹住的照样换：旁边还有
-    别的条件、写在 CASE WHEN 或 HAVING 里、整数的开区间。"""
+    """「夹住某一个值」只在同一个条件里认（从比较往上只越过且、或、非、异或、括号），同一个条件里夹住的照样换：旁边
+    还有别的条件、写在 CASE WHEN 里、整数的开区间、XOR。"""
     assert inquiry_mod._scrub_sql(sql, phones, {"buyer_phone", "age"}, kind) == shown
 
 
@@ -411,6 +411,7 @@ def ages() -> inquiry_mod._Secrets:
      "COUNT(*) AS 人数 FROM sales GROUP BY 1", {"18", "30", "45"}),
 ])
 def test_overlapping_age_bands_are_thresholds(ages, sql, shown):
+    """年龄段的两个 WHEN 分支共用边界 30：同上，是分档的界。"""
     assert inquiry_mod._scrub_sql(sql, ages, {"age"}, "sqlite") == sql
     assert inquiry_mod._shown_literals([(sql, "sqlite", {"age"})], ages) == shown
 
