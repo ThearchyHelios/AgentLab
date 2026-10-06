@@ -1168,6 +1168,48 @@ async def test_a_masked_column_after_a_label_in_a_union_keeps_its_values(monkeyp
         await engines.invalidate(source_id)
 
 
+_BIG_ONE = "CASE WHEN amount > 1000 THEN 1 ELSE 0 END"
+
+
+@pytest.mark.parametrize("shadowed", [
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT *, {_BIG_ONE} AS vip_level FROM sales) t", id="* 在前"),
+    pytest.param(f"SELECT x.vip_level AS 档 FROM (SELECT * FROM sales s JOIN (SELECT id AS bid, {_BIG_ONE} AS vip_level "
+                 "FROM sales) b ON s.id = b.bid) x", id="JOIN 子查询 * 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT (vip_level), {_BIG_ONE} AS vip_level FROM sales) t",
+                 id="(col) 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT vip_level COLLATE NOCASE, {_BIG_ONE} AS vip_level FROM sales) t",
+                 id="COLLATE 在前"),
+])
+async def test_a_masked_column_shadowing_a_label_keeps_its_values(monkeypatch, tmp_path, client, shadowed):
+    """第 3 轮复验（J2 留下的缺口）：派生来源里 * 带出的等级、套了括号或 COLLATE 的等级排在同名的标签前面，SQLite 交回
+    的是真实等级。以前这一列被当成只装着标签，等级 1 撞上标签 1 不收，之后 WHERE vip_level = 1 在查询清单、事件、质询
+    工件里都照原样。现在不算只装着标签的列，两条都遮。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "vip_level"}, script=LEVELS)
+    first, second = (f"SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = {level}" for level in (1, 2))
+    plays = {"各等级": Play([shadowed, first, second],
+                         "问到的两个等级各有 [[v:Q2.r0.人数]] 人、[[v:Q3.r0.人数]] 人。[[see:Q2]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=fetching(name, AMOUNTS))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="各等级的客户有几位？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (True, "问到的两个等级各有 2 人、1 人。")
+        sealed = [shadowed, *["SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = 已遮罩"] * 2]
+        assert [q["sql"] for q in item["queries"]] == sealed
+        [event] = await events(paused.id, "approval.inquiry")
+        assert [q["sql"] for q in event.data["queries"]] == sealed
+        for query, sql in zip(item["queries"], sealed):
+            got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+            assert got.status_code == 200 and got.json()["content"]["sql"] == sql, "质询工件的 SQL 和事件里的一字不差"
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{item['queries'][0]['artifact']}")
+        assert {cell for [cell] in got.json()["content"]["rows"]} == {"已遮罩"} and got.json()["masked"] == ["档"]
+    finally:
+        await engines.invalidate(source_id)
+
+
 STAR_TAIL = "SELECT *, SUBSTR(buyer_phone, 4) FROM sales ORDER BY amount DESC LIMIT 1"
 
 

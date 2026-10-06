@@ -349,6 +349,59 @@ def test_label_columns_are_traced_to_where_they_are_written(sql, columns, texts)
     assert inquiry_mod._label_columns(sql, "sqlite", columns) == {"档位": texts}
 
 
+#: 派生来源里排在标签前面、和标签同名的列：SQLite 让同名的几列都留着，外层按名字取的是排在前面的那一列（真实等级）
+SHADOWED = [
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT *, {BIG_ONE} AS vip_level FROM sales) t", id="* 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT s.*, {BIG_ONE} AS vip_level FROM sales s) t", id="t.* 在前"),
+    pytest.param(f"WITH t AS (SELECT *, {BIG_ONE} AS vip_level FROM sales) SELECT vip_level AS 档 FROM t",
+                 id="CTE 里 * 在前"),
+    pytest.param(f"SELECT x.vip_level AS 档 FROM (SELECT * FROM sales s JOIN (SELECT id AS bid, {BIG_ONE} AS vip_level "
+                 "FROM sales) b ON s.id = b.bid) x", id="JOIN 子查询 * 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT *, b.lbl AS vip_level FROM sales s JOIN (SELECT id AS bid, "
+                 f"{BIG_ONE} AS lbl FROM sales) b ON s.id = b.bid) t", id="JOIN 之后 * 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT (vip_level), {BIG_ONE} AS vip_level FROM sales) t",
+                 id="(col) 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT ((vip_level)), {BIG_ONE} AS vip_level FROM sales) t",
+                 id="((col)) 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT vip_level COLLATE NOCASE, {BIG_ONE} AS vip_level FROM sales) t",
+                 id="COLLATE 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT (vip_level) COLLATE BINARY, {BIG_ONE} AS vip_level "
+                 "FROM sales) t", id="(col) COLLATE 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT (vip_level), {BIG_ONE} AS vip_level FROM sales UNION ALL "
+                 f"SELECT vip_level, {BIG_ONE} FROM sales) t", id="多支的第一支 (col) 在前"),
+    pytest.param(f"SELECT vip_level AS 档 FROM (SELECT vip_level COLLATE NOCASE, {BIG_ONE} AS vip_level FROM sales "
+                 f"UNION ALL SELECT vip_level, {BIG_ONE} FROM sales) t", id="多支的第一支 COLLATE 在前"),
+]
+
+
+@pytest.mark.parametrize("sql", SHADOWED)
+def test_a_masked_column_shadowing_a_label_in_a_derived_source_is_not_a_label_column(sql):
+    """第 3 轮复验（J2 留下的缺口）：派生来源里 * 带出的遮罩列、没起别名但套了括号或 COLLATE 的遮罩列排在同名的标签
+    前面，SQLite 交回的是真实等级（1、2、3），以前却按标签认、短码值不收，之后 WHERE vip_level = 1 照原样封存。现在
+    第一个同名项前面有 * 带出这一列（或说不清带不带）、有去掉括号和 COLLATE 后同名的项，都不算只装着标签的列。"""
+    plan = plan_of({"source": "shop", "sql": sql, "columns": ["档"], "rows": [[1], [2], [3]]}, {"vip_level"})
+    assert inquiry_mod._label_columns(sql, "sqlite", ["档"]) == {}
+    assert {"1", "2", "3"} <= plan.secrets.weak
+    for level in (1, 2, 3):
+        assert inquiry_mod._scrub_sql(f"SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = {level}", plan.secrets,
+                                      plan.tainted["a1"], "sqlite") == (
+            "SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = 已遮罩")
+
+
+@pytest.mark.parametrize("sql", [
+    # 标签排在 * 前面：SQLite 取的是排在前面的标签
+    f"SELECT vip_level AS 档 FROM (SELECT {BIG_ONE} AS vip_level, * FROM sales) t",
+    # * 只带出另一个派生来源（写了表名）：那里只有标签
+    f"SELECT x.vip_level AS 档 FROM (SELECT b.* FROM sales s JOIN (SELECT id AS bid, {BIG_ONE} AS vip_level "
+    "FROM sales) b ON s.id = b.bid) x",
+    # * 只展开 CTE 里的标签
+    f"WITH b AS (SELECT {BIG_ONE} AS vip_level FROM sales) SELECT vip_level AS 档 FROM (SELECT * FROM b) t",
+])
+def test_a_label_ahead_of_a_star_or_alone_behind_one_is_still_a_label_column(sql):
+    """收紧之后，标签排在前面、* 只带出派生来源里的标签的，照旧算只装着标签的列。"""
+    assert inquiry_mod._label_columns(sql, "sqlite", ["档"]) == {"档": {"0", "1"}}
+
+
 # --------------------------------------------------------------------------
 # 按值认：门槛、边界
 # --------------------------------------------------------------------------

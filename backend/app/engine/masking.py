@@ -228,17 +228,21 @@ def _item_label(item: Any, select: Any, memo: _LabelMemo) -> set[str] | None:
     return None
 
 
-def _star_label(select: Any, name: str, memo: _LabelMemo) -> Any:
+def _star_label(select: Any, name: str, memo: _LabelMemo, *, before: int | None = None) -> Any:
     """select 经 *（t.* 只看 t）带出的 name 这一列只装着标签时标签的写法；没有 *、* 带不出这一列为 _ABSENT，带出来的
-    装着别的、认不准为 None。"""
+    装着别的、认不准为 None。before 给了只看排在它前面的那几项（_block_label_of 看同名项前面有没有 *）。
+    没写表名的 * 展开了数据源里的表（或 VALUES、函数这类说不清出哪些列的来源）为 None：表里可能就有这一列，* 照样把它
+    带出来，不像直接写列名那样会报列名有歧义，_source_label 那条「派生来源出这一列的就是它」在这里不成立。"""
     from sqlglot import exp
 
     out: set[str] = set()
     seen = False
-    for item in select.expressions:
+    for item in select.expressions[:before]:
         if not _is_star(item):
             continue
         qualifier = (item.table.lower() or None) if isinstance(item, exp.Column) else None
+        if qualifier is None and any(_derived_block(source) is None for _, source in _from_sources(select)):
+            return None
         texts = _source_label(select, qualifier, name, memo)
         if texts is None:
             return None
@@ -299,10 +303,15 @@ def _block_label_of(block: Any, listed: list[str] | None, name: str, memo: _Labe
     if not all(isinstance(leaf, exp.Select) for leaf in leaves):
         return None
     if listed is None and len(leaves) == 1:
-        named = [item for item in leaves[0].expressions if _output_name(item) == name]
+        items = list(leaves[0].expressions)
+        named = [i for i, item in enumerate(items) if _same_name(item, name)]
         if not named:
             return _star_label(leaves[0], name, memo)
-        return _all_labels([_item_label(item, leaves[0], memo) for item in named])
+        # SQLite 让同名的几列都留着，外层按名字取的是排在最前面的那一列：第一个同名项前面的 * 带得出这一列（或说不清带
+        # 不带），取到的就是 * 里的那一列（SELECT *, CASE … END AS vip_level 交回的是真实等级）
+        if _star_label(leaves[0], name, memo, before=named[0]) is not _ABSENT:
+            return None
+        return _all_labels([_item_label(items[i], leaves[0], memo) for i in named])
     width: int | None = None
     if listed is not None:
         if name not in listed:
@@ -310,7 +319,7 @@ def _block_label_of(block: Any, listed: list[str] | None, name: str, memo: _Labe
         place, width = (listed.index(name) if listed.count(name) == 1 else None), len(listed)
     else:
         first = list(leaves[0].expressions)
-        places = [p for item, p in zip(first, _places(first, None)) if _output_name(item) == name]
+        places = [p for item, p in zip(first, _places(first, None)) if _same_name(item, name)]
         if not places:
             # 第一支没明写这一列：有 * 时说不清它在不在、在哪个位置
             return None if any(_is_star(item) for item in first) else _ABSENT
@@ -398,6 +407,21 @@ def _branches(root: Any) -> list[list[Any]]:
     from sqlglot import exp
 
     return [list(node.expressions) for node in _leaves(root) if isinstance(node, exp.Select)]
+
+
+def _same_name(item: Any, name: str) -> bool:
+    """一个选出项在派生来源的结果里是不是叫 name（小写）：起了别名的、直接选一列的按 _output_name；没起别名、套了括号
+    或 COLLATE 的一列（(vip_level)、vip_level COLLATE NOCASE）也算——SQLite 给子查询的结果列起名时去掉括号和 COLLATE，
+    外层按 vip_level 取得到它。只在认标签列时用：_output_name 别处照旧认不准这种写法（那边认不准就整份遮）。"""
+    from sqlglot import exp
+
+    if _output_name(item) == name:
+        return True
+    node = item
+    while isinstance(node, (exp.Paren, exp.Collate)):
+        node = node.this
+    return node is not item and isinstance(node, exp.Column) and not isinstance(node.this, exp.Star) \
+        and node.name.lower() == name
 
 
 def _output_name(item: Any) -> str | None:
@@ -650,7 +674,8 @@ def _worked_out(node: Any, a: Any, b: Any) -> Decimal | None:
     """一步加减乘除、取模、整除的结果；不是两个数、除以零、结果太大为 None。取模、整除照 SQL 往零取整（-7 % 2 是 -1，
     -7 DIV 2 是 -3，同 Decimal 的 % 和 //）。/ 在 SQLite、Postgres 这类方言里两个整数相除只留整数部分（解析时记在
     typed 上：53 / 2 是 26），写成小数的（53.0 / 2）、别的方言照小数算。以前一律按小数算，SQLite 里 age >= 25 AND
-    age < 53 / 2 夹住了 25 却认不出。"""
+    age < 53 / 2 夹住了 25 却认不出。已知局限：SQLite 的取模先把两边取整再算（25.9 % 26 是 25），这里照小数算
+    （25.9），这样写的值认不出。"""
     from sqlglot import exp
 
     if not (isinstance(a, Decimal) and isinstance(b, Decimal)):
