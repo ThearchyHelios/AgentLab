@@ -1,19 +1,21 @@
 """审批质询的遮罩（engine/inquiry.py）：回答正文、查询清单、质询工件里都不露出数据源遮罩列的值，也不误伤别的数。
 
-- 改了名字的遮罩列（起别名、套函数、经子查询或 CTE 转一道、UNION 的另一支）照样遮；COUNT 只数个数、窗口的分区键
-  只决定次序，不遮；解析不了、SQL 里又写着遮罩列的，整份快照遮掉
+- 改了名字的遮罩列（起别名、套函数、经子查询或 CTE 转一道、UNION 的另一支、和 * 写在同一支里没起别名的表达式）
+  照样遮；COUNT 只数个数、窗口的分区键只决定次序，不遮；认不出落在哪一列的（两个 * 之间、子查询里没起别名的表达式）、
+  解析不了又写着遮罩列的，整份快照遮掉
 - 按值认的遮罩值有门槛：纯数字够长（SECRET_DIGITS 位）、文字至少两个字；日期、小数、千分位里的一截不算；提问人自己
-  写进问题、选中原文里的不换
-- SQL 只换字面量（和注释）里的遮罩值：直接和遮罩列比较的字面量是遮罩列出现过的值就换，短的数也换；LIMIT、日期、
-  别的列的条件照原样
-- 快照按列遮，另按值遮：别的列里写着遮罩值的格子也换成「已遮罩」
-- 组装回答两遍之后正文里还认得出遮罩值的，不交出去
+  写进问题、选中原文里的，报告列出的指标和运行输入的值，SQL 里照原样留着的阈值，都不换
+- SQL 只换在找某一个值的字面量（等值、IN、LIKE，带前缀的字符串也算）和注释、名字里的遮罩值：和遮罩列比较的字面量是
+  遮罩列出现过的值就换，短的数也换；范围比较的边界、BETWEEN、LIMIT、日期、别的列的范围条件照原样
+- 快照按列遮，另按值遮：别的列里写着遮罩值的格子也换成「已遮罩」；列名里写着遮罩值的，列名也换
+- 组装回答之后正文里还认得出遮罩值的，不交出去
 - 遮罩值上万个时换一遍也不卡：不现编上万个分支的正则
 
-数据都是虚构的：手机号、年龄、区域、金额。
+数据都是虚构的：手机号、姓名、年龄、区域、金额。
 """
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -34,9 +36,10 @@ def secrets_of(snapshot: dict, hidden: set[str]) -> inquiry_mod._Secrets:
 # --------------------------------------------------------------------------
 
 
-def hidden_of(sql: str, columns: list[str], masked: set[str] = frozenset({"buyer_phone"})) -> set[str]:
+def hidden_of(sql: str, columns: list[str], masked: set[str] = frozenset({"buyer_phone"}), kind: str = "sqlite"
+              ) -> set[str]:
     snapshot = {"source": "shop", "sql": sql, "columns": columns, "rows": []}
-    return inquiry_mod._derived_hidden(snapshot, set(masked), "sqlite")[0]
+    return inquiry_mod._derived_hidden(snapshot, set(masked), kind)[0]
 
 
 @pytest.mark.parametrize("sql, columns, hidden", [
@@ -54,12 +57,70 @@ def test_a_masked_column_under_another_name_is_masked(sql, columns, hidden):
     assert hidden_of(sql, columns) == hidden
 
 
+SALES_COLUMNS = ["id", "region", "buyer_phone", "amount", "is_test"]
+
+
+@pytest.mark.parametrize("sql, columns, hidden", [
+    # * 后面没起别名的表达式：从结果末尾倒着数（SQLite 照写法原样给列名，起不出能往下传的名字）
+    ("SELECT *, SUBSTR(buyer_phone, 4) FROM sales ORDER BY amount DESC LIMIT 1",
+     [*SALES_COLUMNS, "SUBSTR(buyer_phone, 4)"], {"buyer_phone", "substr(buyer_phone, 4)"}),
+    ("SELECT s.*, buyer_phone || '-x' FROM sales s", [*SALES_COLUMNS, "buyer_phone || '-x'"],
+     {"buyer_phone", "buyer_phone || '-x'"}),
+    # sqlglot 给 CAST 记的名字是里面的列名，结果的列名却是整个写法：照样按位置认
+    ("SELECT *, CAST(buyer_phone AS TEXT) FROM sales", [*SALES_COLUMNS, "CAST(buyer_phone AS TEXT)"],
+     {"buyer_phone", "cast(buyer_phone as text)"}),
+    # * 前面的从头数，* 后面不是遮罩列的不遮
+    ("SELECT UPPER(buyer_phone), s.*, amount * 2 FROM sales s", ["UPPER(buyer_phone)", *SALES_COLUMNS, "amount * 2"],
+     {"buyer_phone", "upper(buyer_phone)"}),
+    # 派生来源里 UNION 的另一支：结果的列名取第一支的
+    ("SELECT * FROM (SELECT region FROM sales UNION ALL SELECT buyer_phone FROM sales) t", ["region"],
+     {"buyer_phone", "region"}),
+    ("WITH t(p) AS (SELECT region FROM sales UNION ALL SELECT buyer_phone FROM sales) SELECT p FROM t", ["p"],
+     {"buyer_phone", "p"}),
+    ("SELECT * FROM (SELECT *, buyer_phone AS p FROM sales) t", [*SALES_COLUMNS, "p"], {"buyer_phone", "p"}),
+    # 多套几层括号不改变结果流到哪
+    ("((SELECT UPPER(buyer_phone) FROM sales))", ["UPPER(buyer_phone)"], {"buyer_phone", "upper(buyer_phone)"}),
+    ("SELECT * FROM ((SELECT buyer_phone AS p FROM sales)) t", ["p"], {"buyer_phone", "p"}),
+])
+def test_an_unnamed_expression_next_to_a_star_or_under_a_union_is_masked(sql, columns, hidden):
+    assert hidden_of(sql, columns) == hidden
+
+
+@pytest.mark.parametrize("sql, columns", [
+    # 两个 * 之间：前后都数不出位置
+    ("SELECT a.*, SUBSTR(a.buyer_phone, 4), b.* FROM sales a JOIN sales b ON a.id = b.id",
+     [*SALES_COLUMNS, "SUBSTR(a.buyer_phone, 4)", *SALES_COLUMNS]),
+    # 子查询里没起别名的表达式：外层的 * 原样带出来，列名各数据库起法不同，认不准
+    ("SELECT * FROM (SELECT SUBSTR(buyer_phone, 4), amount FROM sales) t", ["SUBSTR(buyer_phone, 4)", "amount"]),
+    ("SELECT * FROM (SELECT SUBSTR(buyer_phone, 4) FROM sales)", ["SUBSTR(buyer_phone, 4)"]),
+    ("WITH t AS ((SELECT SUBSTR(buyer_phone, 4) FROM sales)) SELECT * FROM t", ["SUBSTR(buyer_phone, 4)"]),
+    # UNION 第一支是 *：另一支的遮罩列落在哪个名字上说不清
+    ("SELECT * FROM (SELECT * FROM sales UNION ALL SELECT id, region, SUBSTR(buyer_phone, 4), amount, is_test "
+     "FROM sales) t", SALES_COLUMNS),
+])
+def test_a_masked_expression_that_cannot_be_placed_hides_the_whole_snapshot(sql, columns):
+    assert hidden_of(sql, columns) == {"buyer_phone", *(c.lower() for c in columns)}
+
+
+def test_a_lateral_subquery_is_read_like_a_derived_table():
+    """Postgres 的 LATERAL：别名记在 LATERAL 上，起了别名的照名字传，没起别名的整份遮。"""
+    assert hidden_of("SELECT x.* FROM sales s CROSS JOIN LATERAL (SELECT s.buyer_phone AS p) x", ["p"],
+                     kind="postgresql") == {"buyer_phone", "p"}
+    columns = [*SALES_COLUMNS, "substr"]
+    assert hidden_of("SELECT * FROM sales s CROSS JOIN LATERAL (SELECT SUBSTR(s.buyer_phone, 4)) x", columns,
+                     kind="postgresql") == {*columns}
+
+
 @pytest.mark.parametrize("sql, columns", [
     ("SELECT region AS 区域, COUNT(DISTINCT buyer_phone) AS 买家数 FROM sales GROUP BY region", ["区域", "买家数"]),
     ("SELECT region AS 区域, SUM(amount) AS 销售额 FROM sales WHERE buyer_phone = '13900000001' GROUP BY region",
      ["区域", "销售额"]),
     ("SELECT ROW_NUMBER() OVER (PARTITION BY buyer_phone ORDER BY amount) AS 序号 FROM sales", ["序号"]),
     ("SELECT (SELECT COUNT(*) FROM sales s2 WHERE s2.buyer_phone = s.buyer_phone) AS 笔数 FROM sales s", ["笔数"]),
+    # 子查询里只数个数、条件里的子查询：值带不出来，外层的 * 也不怕
+    ("SELECT * FROM (SELECT region, COUNT(DISTINCT buyer_phone) FROM sales GROUP BY region) t",
+     ["region", "COUNT(DISTINCT buyer_phone)"]),
+    ("SELECT region FROM sales WHERE amount > (SELECT AVG(LENGTH(buyer_phone)) FROM sales)", ["region"]),
 ])
 def test_counting_filtering_and_ordering_by_a_masked_column_shows_nothing(sql, columns):
     assert hidden_of(sql, columns) == {"buyer_phone"}
@@ -144,7 +205,7 @@ def people() -> inquiry_mod._Secrets:
     ("SELECT COUNT(*) AS 笔数 FROM sales WHERE buyer_phone = '13900000001'",
      "SELECT COUNT(*) AS 笔数 FROM sales WHERE buyer_phone = '已遮罩'"),
     ("SELECT COUNT(*) FROM sales s WHERE s.buyer_phone IN ('13900000001', '13900000003') AND age BETWEEN 25 AND 31",
-     "SELECT COUNT(*) FROM sales s WHERE s.buyer_phone IN ('已遮罩', '已遮罩') AND age BETWEEN 已遮罩 AND 已遮罩"),
+     "SELECT COUNT(*) FROM sales s WHERE s.buyer_phone IN ('已遮罩', '已遮罩') AND age BETWEEN 25 AND 31"),
     ("SELECT COUNT(*) FROM sales WHERE age = 25 AND amount > 25 AND paid_on >= '2026-01-25' LIMIT 25",
      "SELECT COUNT(*) FROM sales WHERE age = 已遮罩 AND amount > 25 AND paid_on >= '2026-01-25' LIMIT 25"),
     ("SELECT COUNT(*) FROM sales WHERE 25 = age AND note LIKE '%13900000003%' -- 13900000001 的单\nLIMIT 20",
@@ -152,9 +213,74 @@ def people() -> inquiry_mod._Secrets:
     ("SELECT region FROM sales WHERE buyer_phone NOT IN ('13900000009') AND age <> 40",
      "SELECT region FROM sales WHERE buyer_phone NOT IN ('13900000009') AND age <> 40"),
     ("SELECT amount FROM sales WHERE amount = 13900000001", "SELECT amount FROM sales WHERE amount = 已遮罩"),
+    # 和遮罩列做范围比较：边界是阈值，不是在找某个人，照原样
+    ("SELECT COUNT(*) FROM sales WHERE age > 31 AND age <= 25 AND 25 < age AND age NOT BETWEEN 25 AND 31",
+     "SELECT COUNT(*) FROM sales WHERE age > 31 AND age <= 25 AND 25 < age AND age NOT BETWEEN 25 AND 31"),
+    # 不等、SQLite 的 IS、NOT LIKE 也是在找某一个值
+    ("SELECT COUNT(*) FROM sales WHERE age != 25 AND age IS NOT 31 AND buyer_phone NOT LIKE '13900000001'",
+     "SELECT COUNT(*) FROM sales WHERE age != 已遮罩 AND age IS NOT 已遮罩 AND buyer_phone NOT LIKE '已遮罩'"),
 ])
 def test_sql_keeps_everything_but_the_masked_values(people, sql, shown):
     assert inquiry_mod._scrub_sql(sql, people, {"buyer_phone", "age"}, "sqlite") == shown
+
+
+@pytest.fixture
+def amounts() -> inquiry_mod._Secrets:
+    """金额设了遮罩，金额都是五位数：和阈值、LIMIT、别的列的条件撞在一起。"""
+    return secrets_of({"columns": ["amount"], "rows": [[10000], [12000], [20000], [30000], [50000]]}, {"amount"})
+
+
+@pytest.mark.parametrize("sql, shown", [
+    # 范围比较、LIMIT / OFFSET、选出列里的数：长的数也照原样
+    ("SELECT COUNT(*) FROM sales WHERE visits > 20000 AND amount >= 30000 AND amount BETWEEN 10000 AND 50000 "
+     "LIMIT 10000 OFFSET 12000",
+     "SELECT COUNT(*) FROM sales WHERE visits > 20000 AND amount >= 30000 AND amount BETWEEN 10000 AND 50000 "
+     "LIMIT 10000 OFFSET 12000"),
+    ("SELECT 20000 AS 门槛, amount - 10000 AS 差额 FROM sales", "SELECT 20000 AS 门槛, amount - 10000 AS 差额 FROM sales"),
+    # 等值、IN：和遮罩列比较的换，和别的列比较的、够长的遮罩值也换
+    ("SELECT COUNT(*) FROM sales WHERE amount = 30000 OR amount IN (10000, -12000) OR visits = 20000",
+     "SELECT COUNT(*) FROM sales WHERE amount = 已遮罩 OR amount IN (已遮罩, -已遮罩) OR visits = 已遮罩"),
+])
+def test_long_masked_numbers_are_only_masked_where_a_value_is_looked_up(amounts, sql, shown):
+    assert inquiry_mod._scrub_sql(sql, amounts, {"amount"}, "sqlite") == shown
+
+
+@pytest.mark.parametrize("kind, sql, shown", [
+    ("oracle", "SELECT COUNT(*) FROM sales WHERE buyer_phone = N'13900000001'",
+     "SELECT COUNT(*) FROM sales WHERE buyer_phone = N'已遮罩'"),
+    ("postgresql", "SELECT COUNT(*) FROM sales WHERE buyer_phone = E'13900000001' OR note = $$13900000003$$ "
+     "OR note = $t$13900000001$t$ OR buyer_phone = U&'13900000003'",
+     "SELECT COUNT(*) FROM sales WHERE buyer_phone = E'已遮罩' OR note = $$已遮罩$$ "
+     "OR note = $t$已遮罩$t$ OR buyer_phone = U&'已遮罩'"),
+    # 名字里写着遮罩值：带引号的、不带引号的（SQLite 的中文名字可以不加引号）
+    ("postgresql", 'SELECT COUNT(*) AS "13900000001 的单" FROM sales',
+     'SELECT COUNT(*) AS "已遮罩 的单" FROM sales'),
+    ("mysql", "SELECT COUNT(*) AS `13900000001 的单` FROM sales", "SELECT COUNT(*) AS `已遮罩 的单` FROM sales"),
+])
+def test_prefixed_strings_and_names_are_scrubbed_too(people, kind, sql, shown):
+    assert inquiry_mod._scrub_sql(sql, people, {"buyer_phone", "age"}, kind) == shown
+
+
+def test_a_name_written_into_an_unquoted_alias_is_scrubbed():
+    secrets = secrets_of({"columns": ["buyer_name"], "rows": [["张伟"], ["李娜"]]}, {"buyer_name"})
+    assert inquiry_mod._scrub_sql("SELECT COUNT(*) AS 张伟的单数 FROM sales WHERE buyer_name = '张伟'", secrets,
+                                  {"buyer_name"}, "sqlite") == (
+        "SELECT COUNT(*) AS 已遮罩的单数 FROM sales WHERE buyer_name = '已遮罩'")
+
+
+def test_numbers_left_as_written_in_the_sql_are_not_masked_in_the_answer(amounts):
+    """范围比较的边界、LIMIT 照原样留在 SQL 里，回答正文里同样的数再遮也遮不住什么，只会和 SQL 对不上；等值比较
+    里换掉的照旧遮。"""
+    sql = "SELECT COUNT(*) FROM sales WHERE amount >= 30000 AND amount <> 50000 LIMIT 10000"
+    assert inquiry_mod._shown_literals(sql, "sqlite") == ["30000", "10000"]
+    amounts.protect(inquiry_mod._shown_literals(sql, "sqlite"), strong_only=True)
+    assert amounts.scrub("金额不低于 30000 元、不是 50000 元的，取前 10000 条") == (
+        "金额不低于 30000 元、不是 已遮罩 元的，取前 10000 条")
+    assert inquiry_mod._scrub_sql(sql, amounts, {"amount"}, "sqlite") == (
+        "SELECT COUNT(*) FROM sales WHERE amount >= 30000 AND amount <> 已遮罩 LIMIT 10000")
+    assert inquiry_mod._scrub_sql("SELECT COUNT(*) FROM sales WHERE amount = 30000", amounts, {"amount"},
+                                  "sqlite") == "SELECT COUNT(*) FROM sales WHERE amount = 已遮罩", \
+        "只免了正文里的：和遮罩列做等值比较的照旧换"
 
 
 def test_a_comparison_with_a_renamed_masked_column_is_masked_too(people):
@@ -173,16 +299,57 @@ def test_sql_that_cannot_be_split_into_words_is_scrubbed_like_text(people):
 # --------------------------------------------------------------------------
 
 
+def query_entry(columns: list[str]) -> dict:
+    return {"alias": "Q1", "kind": "query", "artifact": "a1", "source": "shop", "columns": columns, "rows": 1,
+            "truncated": False}
+
+
 def test_an_answer_still_showing_a_masked_value_is_not_handed_out():
-    """运行输入里恰好是一个遮罩值（报告目录里的 i: 条目）：标记里看不出来，渲染出来才露，连标记一起换也换不掉——
-    宁可不交这份回答。"""
+    """别的列里一格文字夹着遮罩值（备注里写着手机号）：按整格比认不出来，标记里也看不出来，渲染出来才露——宁可不交
+    这份回答。"""
     secrets = secrets_of({"columns": ["phone"], "rows": [["13900000001"]]}, {"phone"})
-    catalog = {"i:客户": {"alias": "i:客户", "kind": "input", "eid": "input:客户", "locator": {"field": "客户"},
-                         "value": "13900000001", "label": "客户 = 13900000001"}}
+    snapshot = {"columns": ["备注"], "rows": [["客户13900000001来电改址"]]}
+    views = {"a1": inquiry_mod._masked_view(snapshot, set(), secrets)[0]}
+    assert views["a1"]["rows"] == [["客户13900000001来电改址"]]
+    catalog = {"Q1": query_entry(["备注"])}
     with pytest.raises(inquiry_mod._Leak):
-        inquiry_mod._compose("这位客户是 [[i:客户]]。", catalog, run_id="r1", views={}, secrets=secrets, allow=[])
-    doc = inquiry_mod._compose("没有遮罩值。", catalog, run_id="r1", views={}, secrets=secrets, allow=[])
+        inquiry_mod._compose("备注是 [[v:Q1.r0.备注]]。", catalog, run_id="r1", views=views, secrets=secrets, allow=[])
+    doc = inquiry_mod._compose("没有遮罩值。", catalog, run_id="r1", views=views, secrets=secrets, allow=[])
     assert doc["markdown"] == "没有遮罩值。"
+
+
+def test_report_values_that_happen_to_be_masked_values_are_shown():
+    """报告口径卡里的指标恰好和遮罩列里的某个值一样（单笔目标 20000，金额也有 20000 的单）：报告里本来就看得到，
+    引用它的回答照常交出去。"""
+    secrets = secrets_of({"columns": ["amount"], "rows": [[20000], [35000]]}, {"amount"})
+    catalog = {"m:target": {"alias": "m:target", "kind": "metric", "eid": "metric:c1:target", "artifact": "c1",
+                            "locator": {"metric": "target"}, "value": 20000, "rendered": "20,000",
+                            "label": "单笔目标 = 20,000"}}
+    with pytest.raises(inquiry_mod._Leak):
+        inquiry_mod._compose("单笔目标为 [[m:target]]。", catalog, run_id="r1", views={}, secrets=secrets, allow=[])
+    secrets.protect(inquiry_mod._ref_values(inquiry_mod._report_refs(catalog)))
+    doc = inquiry_mod._compose("单笔目标为 [[m:target]]，有一笔 35000 元。", catalog, run_id="r1", views={},
+                               secrets=secrets, allow=[])
+    assert doc["markdown"] == "单笔目标为 20,000，有一笔 已遮罩 元。"
+
+
+def test_a_column_named_after_a_masked_value_is_renamed():
+    """agent 把遮罩值写进了别名（「13900000001 的单」）：快照、回答文档里的列名同样换掉。回答引用了原列名的，标记里
+    的列名照样换，正好对上换过的列名，引用照样解析得了。"""
+    secrets = secrets_of({"columns": ["phone"], "rows": [["13900000001"]]}, {"phone"})
+    snapshot = {"columns": ["13900000001 的单", "金额"], "column_types": {"13900000001 的单": "number"},
+                "rows": [[2, 1200]]}
+    shown, masked = inquiry_mod._masked_view(snapshot, set(), secrets)
+    assert shown["columns"] == ["已遮罩 的单", "金额"] and shown["rows"] == [[2, 1200]]
+    assert shown["column_types"] == {"已遮罩 的单": "number"} and masked == []
+    assert snapshot["columns"][0] == "13900000001 的单", "原快照不动"
+    rows_as_dicts = {**snapshot, "rows": [{"13900000001 的单": 2, "金额": 1200}]}
+    assert inquiry_mod._masked_view(rows_as_dicts, set(), secrets)[0]["rows"] == [{"已遮罩 的单": 2, "金额": 1200}]
+
+    doc = inquiry_mod._compose("这位客户共 [[v:Q1.r0.13900000001 的单]] 笔。", {"Q1": query_entry(snapshot["columns"])},
+                               run_id="r1", views={"a1": shown}, secrets=secrets, allow=[])
+    assert doc["markdown"] == "这位客户共 2 笔。"
+    assert "13900000001" not in json.dumps(doc, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------

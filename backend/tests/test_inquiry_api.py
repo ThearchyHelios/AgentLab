@@ -11,8 +11,9 @@
   设置里关了 409；没停在那张审批卡上、还在执行（按情形说下一步）、封存核对不通过、开放途中运行被继续了都 409；
   事件里记的报告文档不是这次运行的 422；输入不合法 422，指明是哪一项
 - 回答：先给结论，数字只能引用自己查询的格子或报告已有的指标，裸数字被标出（提问人自己写的数不标）；遮罩列（起了
-  别名的也算）的格子渲染成「已遮罩」，回答正文、查询清单、事件、质询工件里都不出现遮罩列的值；短的遮罩值不误伤阈值、
-  天数、LIMIT
+  别名的、和 * 写在一起没起别名的表达式也算）的格子渲染成「已遮罩」，回答正文、查询清单、事件、质询工件里都不出现
+  遮罩列的值；遮罩值不误伤阈值、天数、LIMIT（长的数也一样）、提问人自己写的数、报告口径卡里的指标；质询工件按值遮
+  只出现在报告快照里的遮罩值
 - 接线：设置里的上限、运行固定的数据版本交到 agent 手里（上传表格重传之后查的仍是运行固定的那一版）；同名重建的
   数据源、没固定过版本的上传表格不查
 - 触顶、失败照样记一条事件，说法给提问人看得懂、说下一步；轮数用完不算查询次数到顶，查询失败、引用解析不了在末尾注明
@@ -160,6 +161,14 @@ def gated(source: str, *, gate: bool = True) -> dict:
         *([node("gate", "human", mode="approve", title="周报可以出具吗")] if gate else []),
         node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
     )
+
+
+def fetching(source: str, sql: str) -> dict:
+    """取数（给定的 SQL）→ 报告 → 人工审批 → 成果。"""
+    return chain(node("start", "input"), node("fetch", "tool", tool=f"db_query__{source}", args={"sql": sql}),
+                 node("write", "report", "写周报", instructions="写周报"),
+                 node("gate", "human", mode="approve", title="周报可以出具吗"),
+                 node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
 
 
 @dataclass
@@ -975,6 +984,154 @@ async def test_numbers_that_merely_match_a_short_masked_value_are_left_alone(mon
         assert [s["text"] for s in iter_segments(doc) if s.get("issue") == "uncited_number"] == ["30"], \
             "问题里的 300 是提问人给的，不标；30 没有出处，照标"
         assert [q["sql"] for q in item["queries"]] == [recent, "SELECT COUNT(*) AS 人数 FROM sales WHERE age = 已遮罩"]
+    finally:
+        await engines.invalidate(source_id)
+
+
+STAR_TAIL = "SELECT *, SUBSTR(buyer_phone, 4) FROM sales ORDER BY amount DESC LIMIT 1"
+
+
+async def test_an_unnamed_expression_next_to_a_star_is_masked_everywhere(monkeypatch, masked_shop, client):
+    """和 * 写在同一支里、没起别名的表达式（取手机号的后几位）：结果的列名对不上任何名字，按位置认（从末尾倒着数）。
+    回答、事件、回答文档、质询工件里都不露出原值的任何一截。"""
+    plays = {"买得最多": Play([STAR_TAIL], "金额最高的一笔来自尾号 [[v:Q1.r0.SUBSTR(buyer_phone, 4)]] 的客户，"
+                                         "金额 [[v:Q1.r0.amount]]。[[see:Q1]]")}
+    Models(monkeypatch, masked_shop, plays=plays)
+    paused = await pause(masked_shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="买得最多的是哪位客户？",
+                  approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    item = r.json()["inquiry"]
+    assert item["answer"]["text"] == "金额最高的一笔来自尾号 已遮罩 的客户，金额 1,200。"
+    [query] = item["queries"]
+    assert query["sql"] == STAR_TAIL
+    [event] = await events(paused.id, "approval.inquiry")
+    doc = artifact_store.load(item["answer"]["doc_artifact"])
+    got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+    assert got.status_code == 200, got.text
+    for shown in (r.text, json.dumps(event.data, ensure_ascii=False), json.dumps(doc, ensure_ascii=False), got.text):
+        assert "00000001" not in shown and "1390000000" not in shown
+    assert got.json()["content"]["rows"] == [[1, "华东", "已遮罩", 1200, 0, "已遮罩"]]
+    assert got.json()["masked"] == ["buyer_phone", "SUBSTR(buyer_phone, 4)"]
+
+
+#: 金额设了遮罩的大单：金额都是五位数，和阈值、LIMIT、访问次数的条件撞在一起
+BIG = ("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER, visits INTEGER);"
+       "INSERT INTO sales VALUES (1, '华东', 10000, 25000), (2, '华东', 12000, 18000), (3, '华南', 20000, 30000),"
+       " (4, '华南', 30000, 22000), (5, '华北', 50000, 9000);")
+#: 报告取数选了金额：金额列里的值都算遮罩值
+AMOUNTS = "SELECT region AS 区域, amount AS 金额 FROM sales ORDER BY id"
+
+
+@pytest.fixture
+async def big_shop(tmp_path):
+    name, source_id = await _source(tmp_path, options={"mask_columns": "amount"}, script=BIG)
+    yield name
+    await engines.invalidate(source_id)
+
+
+async def test_thresholds_and_limits_are_sealed_as_written_even_when_they_match_masked_values(
+        monkeypatch, big_shop, client):
+    """遮罩列的值都是五位数：范围比较的边界（和金额比的、和访问次数比的）、LIMIT 撞上遮罩值也照原样封存，回答正文里
+    复述它们也不遮——它们就摆在 SQL 里。在找某一笔的（amount = 50000）照旧遮。"""
+    large = "SELECT COUNT(*) AS 笔数 FROM sales WHERE amount >= 30000 AND visits > 20000 LIMIT 10000"
+    exact = "SELECT COUNT(*) AS 笔数 FROM sales WHERE amount = 50000"
+    plays = {"大单": Play([large, exact], "金额不低于 30000 元、访问超过 20000 次的大单有 [[v:Q1.r0.笔数]] 笔，"
+                                         "恰好 50000 元的有 [[v:Q2.r0.笔数]] 笔。[[see:Q1]]")}
+    Models(monkeypatch, big_shop, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    paused = await pause(big_shop, graph=fetching(big_shop, AMOUNTS))
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="3 万元以上的大单有几笔？",
+                  approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    item = r.json()["inquiry"]
+    assert item["answer"]["text"] == "金额不低于 30000 元、访问超过 20000 次的大单有 1 笔，恰好 已遮罩 元的有 1 笔。"
+    sealed = [large, "SELECT COUNT(*) AS 笔数 FROM sales WHERE amount = 已遮罩"]
+    assert [q["sql"] for q in item["queries"]] == sealed
+    [event] = await events(paused.id, "approval.inquiry")
+    assert [q["sql"] for q in event.data["queries"]] == sealed
+    got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{item['queries'][0]['artifact']}")
+    assert got.status_code == 200 and got.json()["content"]["sql"] == large
+    doc = artifact_store.load(item["answer"]["doc_artifact"])
+    assert [s["text"] for s in iter_segments(doc) if s.get("issue") == "uncited_number"] == ["30000", "20000"], \
+        "不遮不等于有出处：agent 自己定的阈值照样标「无出处」"
+
+
+async def test_a_metric_from_the_report_that_equals_a_masked_value_can_be_cited(monkeypatch, big_shop, client):
+    """报告口径卡里的指标（单笔目标 20000）恰好和遮罩列里的某一笔一样：报告里本来就看得到，引用它的回答照常交出去，
+    换个问法也不会被拦。"""
+    metrics = [{"id": "target", "name": "单笔目标", "unit": "元", "expression": "vars.kpi.target"}]
+    graph = chain(node("start", "input"),
+                  node("fetch", "tool", tool=f"db_query__{big_shop}", args={"sql": AMOUNTS}),
+                  node("calc", "transform", mode="expression", expression="{'target': 20000}", assign_to="kpi"),
+                  node("caliber", "metrics", caliber="大单口径", caliber_version="v1", metrics=metrics),
+                  node("write", "report", "写周报", instructions="写周报"),
+                  node("gate", "human", mode="approve", title="周报可以出具吗"),
+                  node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
+    smallest = "SELECT amount AS 金额 FROM sales WHERE amount > 15000 ORDER BY amount LIMIT 1"
+    plays = {"定得高不高": Play([smallest], "单笔目标为 [[m:target]]，达标的最小一笔是 [[v:Q1.r0.金额]]。[[see:Q1]]")}
+    Models(monkeypatch, big_shop, writer="单笔目标 [[m:target]]。[[see:m:target]]", plays=plays)
+    paused = await pause(big_shop, graph=graph)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="单笔目标定得高不高？",
+                  approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    answer = r.json()["inquiry"]["answer"]
+    assert (answer["ok"], answer["error"]) == (True, None)
+    assert answer["text"] == "单笔目标为 20,000元，达标的最小一笔是 已遮罩。"
+
+
+async def test_a_masked_value_the_asker_wrote_stays_in_the_sql(monkeypatch, tmp_path, client):
+    """提问人自己写的数恰好是遮罩列里的值（金额设了遮罩，问的就是 300 那一笔）：问题里原样写着，SQL 里和金额做等值
+    比较也不换，事件、质询工件里封存的就是实际执行的那条。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "amount"})
+    without = "SELECT COUNT(*) AS 笔数 FROM sales WHERE amount <> 300"
+    plays = {"300 的那笔": Play([without], "去掉金额为 300 的那笔后还剩 [[v:Q1.r0.笔数]] 笔。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=fetching(name, AMOUNTS))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="去掉金额为 300 的那笔会怎样？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert item["answer"]["text"] == "去掉金额为 300 的那笔后还剩 3 笔。"
+        [query] = item["queries"]
+        assert query["sql"] == without
+        [event] = await events(paused.id, "approval.inquiry")
+        assert event.data["queries"][0]["sql"] == without
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+        assert got.status_code == 200 and got.json()["content"]["sql"] == without
+    finally:
+        await engines.invalidate(source_id)
+
+
+#: 另有一张联系方式表：同一个手机号写在没设遮罩的列里
+CONTACTS = SALES + ("CREATE TABLE contacts (id INTEGER PRIMARY KEY, phone_num TEXT, visits INTEGER);"
+                    "INSERT INTO contacts VALUES (1, '13900000001', 5), (2, '13900000003', 2);")
+
+
+async def test_a_value_seen_only_in_the_reports_snapshot_is_masked_in_the_artifact_too(monkeypatch, tmp_path, client):
+    """agent 查的表没设遮罩，里面却写着报告快照里遮罩列的值（另一张表里的同一个手机号）：质询工件照回答时的办法收
+    遮罩值，报告自己的查询快照也算，按值遮掉。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=CONTACTS)
+    visits = "SELECT phone_num AS 号码, visits AS 次数 FROM contacts ORDER BY id"
+    plays = {"常来": Play([visits], "最常来的客户来过 [[v:Q1.r0.次数]] 次。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="金额最高的一笔 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        report_sql = "SELECT buyer_phone, amount AS 金额 FROM sales ORDER BY amount DESC"
+        paused = await pause(name, graph=fetching(name, report_sql))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="常来的客户来过几次？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        assert r.json()["inquiry"]["answer"]["text"] == "最常来的客户来过 5 次。"
+        [query] = r.json()["inquiry"]["queries"]
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+        assert got.status_code == 200, got.text
+        assert got.json()["content"]["rows"] == [["已遮罩", 5], ["已遮罩", 2]]
+        assert got.json()["masked"] == ["号码"] and "1390000000" not in got.text
     finally:
         await engines.invalidate(source_id)
 
