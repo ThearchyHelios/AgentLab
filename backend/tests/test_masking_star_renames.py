@@ -249,3 +249,130 @@ async def test_a_snapshot_is_read_with_its_frozen_schema(months):
     assert masking._derived_hidden(snapshot, {"buyer_phone"}, "sqlite")[0] == {"buyer_phone"}
     assert masking.derived_columns({**snapshot, "schema_artifact": "missing"}, {"buyer_phone"}, "sqlite") == {
         "region", "合计"}
+
+
+# --------------------------------------------------------------------------
+# 写了库名的表、过期的表结构（复核第 3 轮）
+# --------------------------------------------------------------------------
+
+
+#: 同名的两张表：主库的 sales 和另一个库（archive）里的 sales，号码、区域换了次序。表结构探查的是主库
+TWO_SALES = ("CREATE TABLE sales (id INTEGER, region TEXT, buyer_phone TEXT, buyer_name TEXT, amount INTEGER, "
+             "note TEXT);"
+             "INSERT INTO sales VALUES (1, '华东', '13900000001', '张伟', 1200, '改址');"
+             "CREATE TABLE archive.sales (id INTEGER, buyer_phone TEXT, region TEXT, buyer_name TEXT, amount INTEGER, "
+             "note TEXT);"
+             "INSERT INTO archive.sales VALUES (7, '13900000007', '华北', '王芳', 500, '回访');")
+SALES_LAYOUT = ["id", "region", "buyer_phone", "buyer_name", "amount", "note"]
+
+
+@pytest.fixture
+def two_sales():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("ATTACH DATABASE ':memory:' AS archive")
+    conn.executescript(TWO_SALES)
+    yield conn
+    conn.close()
+
+
+def probed(schema: str | None = None) -> dict:
+    """探查主库得到的表结构（schema_cache 的样子）：没设 schema 的探查当前库，qualified 就是表名。"""
+    meta = {"qualified": f"{schema}.sales" if schema else "sales", "schema": schema,
+            "columns": [{"name": c} for c in SALES_LAYOUT]}
+    return {"tables": {"sales": meta}, "schema": schema}
+
+
+def run_two(conn, sql: str, schema: dict | None) -> masking.QueryMask:
+    cursor = conn.execute(sql)
+    payload = {"columns": [d[0] for d in cursor.description], "rows": [list(r) for r in cursor.fetchall()], "sql": sql}
+    return masking.mask_query_result(payload, MASKED, "sqlite", schema=schema)
+
+
+@pytest.mark.parametrize("sql", [
+    pytest.param("WITH t(a, b, c, d, e, f) AS (SELECT * FROM archive.sales) SELECT b AS j, a AS n FROM t",
+                 id="列名表套 * 展开另一个库里的同名表"),
+    pytest.param("SELECT 0 AS a, '' AS b, '' AS c, '' AS d, 0 AS e, '' AS f WHERE 0 UNION ALL "
+                 "SELECT * FROM archive.sales", id="UNION 后一支的 * 展开另一个库里的同名表"),
+    pytest.param("WITH t AS (SELECT * FROM sales UNION ALL SELECT * FROM archive.sales) SELECT region AS 区域 FROM t",
+                 id="派生来源里 UNION 后一支展开另一个库里的同名表"),
+])
+def test_a_table_in_another_schema_is_not_counted_by_the_probed_one(two_sales, sql):
+    """表结构探查的是主库：查询写了别的库名的同名表（archive.sales，号码排在第二列），不能按主库那张表的列序数位置，
+    按数不清处理，* 展开落到的那一段整段遮。以前按表名查表结构，号码落进的那一列被当成区域，原样交给模型、落库。"""
+    done = run_two(two_sales, sql, probed())
+    assert not _leaks(done), done.payload["rows"]
+
+
+def test_a_table_named_with_its_probed_schema_is_still_counted(two_sales):
+    """库名和表结构记下的对得上（探查时设了 schema、qualified 带着它）：照样按表结构数位置，只遮号码那一列。没写库名的
+    照旧按表名查。库名对不上表结构记下的（这里探查时没设 schema，查询写了 main.）按数不清处理，整段遮（多遮）。"""
+    precise = "WITH t(a, b, c, d, e, f) AS (SELECT * FROM {}) SELECT c AS j, a AS n FROM t"
+    assert run_two(two_sales, precise.format("main.sales"), probed("main")).columns == ["j"]
+    assert run_two(two_sales, precise.format("sales"), probed()).columns == ["j"]
+    assert set(run_two(two_sales, precise.format("main.sales"), probed()).columns) == {"j", "n"}
+
+
+def test_schema_columns_are_also_keyed_by_the_probed_schema():
+    """表结构按「库名.表名」另记一份（库名取 schema、qualified 的前缀）；写了别的库名的查不到。"""
+    tables = masking._schema_columns(probed("public"))
+    assert tables["sales"] == tables["public.sales"] == SALES_LAYOUT and "archive.sales" not in tables
+    assert "public.sales" not in masking._schema_columns(probed())
+    assert "archive.sales" not in (masking._schema_tables(probed("public")) or {})
+
+
+#: 一月的表结构是早先探查的（那时还没有 extra 这一列），表里现在多了一列，排在第二；二月那张号码排在第二列
+STALE = ("CREATE TABLE jan (id INTEGER, extra TEXT, region TEXT, buyer_phone TEXT, amount INTEGER);"
+         "CREATE TABLE feb (id INTEGER, buyer_phone TEXT, region TEXT, amount INTEGER, extra TEXT);"
+         "INSERT INTO jan VALUES (1, '加急', '华东', '13900000001', 1200);"
+         "INSERT INTO feb VALUES (2, '13900000002', '华南', 300, '普通');")
+
+
+@pytest.fixture
+def stale():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(STALE)
+    yield conn
+    conn.close()
+
+
+def layout(**tables: list[str]) -> dict:
+    return {"tables": {name: {"qualified": name, "columns": [{"name": c} for c in columns]}
+                       for name, columns in tables.items()}}
+
+
+#: 过期的表结构：一月那张少了 extra（列数和表里实际的不一样）
+OLD_JAN = layout(jan=["id", "region", "buyer_phone", "amount"], feb=["id", "buyer_phone", "region", "amount", "extra"])
+#: 准的表结构
+NOW = layout(jan=["id", "extra", "region", "buyer_phone", "amount"],
+             feb=["id", "buyer_phone", "region", "amount", "extra"])
+
+
+@pytest.mark.parametrize("sql", [
+    pytest.param("WITH t AS (SELECT * FROM jan UNION ALL SELECT id, buyer_phone, region, amount, extra FROM feb) "
+                 "SELECT extra AS 备注 FROM t", id="后一支明写各列"),
+    pytest.param("WITH t AS (SELECT * FROM jan UNION ALL SELECT * FROM feb) SELECT extra AS 备注 FROM t",
+                 id="后一支也是 *"),
+])
+def test_a_first_branch_counted_by_a_stale_schema_is_not_trusted(stale, sql):
+    """UNION 第一支是 *、按表结构数出的列名（表结构过期了，少一列）和后一支的列数对不上：不按它对列名，* 所在的位置按认不出
+    算，整份遮。以前照过期的列名表对，二月的号码落进的「extra」没认出来，原样交回。"""
+    cursor = stale.execute(sql)
+    payload = {"columns": [d[0] for d in cursor.description], "rows": [list(r) for r in cursor.fetchall()], "sql": sql}
+    for schema in (OLD_JAN, None, NOW):
+        done = masking.mask_query_result(payload, ["buyer_phone"], "sqlite", schema=schema)
+        assert done.columns == ["备注"] and not _leaks(done), (schema, done.payload["rows"])
+
+
+def test_a_first_branch_counted_by_an_accurate_schema_still_places_the_values(stale):
+    """表结构准、每一支数得出的列数都对得上：照样按第一支的列名对上位置，只遮号码落进的那一列，金额照常。"""
+    sql = ("WITH t AS (SELECT * FROM jan UNION ALL SELECT id, buyer_phone, region, buyer_phone, amount FROM feb) "
+           "SELECT region AS 区域, amount AS 金额 FROM t")
+    cursor = stale.execute(sql)
+    payload = {"columns": [d[0] for d in cursor.description], "rows": [list(r) for r in cursor.fetchall()], "sql": sql}
+    assert masking.mask_query_result(payload, ["buyer_phone"], "sqlite", schema=NOW).columns == []
+    moved = sql.replace("SELECT id, buyer_phone, region,", "SELECT id, region, buyer_phone,")
+    cursor = stale.execute(moved)
+    payload = {"columns": [d[0] for d in cursor.description], "rows": [list(r) for r in cursor.fetchall()],
+               "sql": moved}
+    done = masking.mask_query_result(payload, ["buyer_phone"], "sqlite", schema=NOW)
+    assert done.columns == ["区域"] and [row[1] for row in done.payload["rows"]] == [1200, 300]

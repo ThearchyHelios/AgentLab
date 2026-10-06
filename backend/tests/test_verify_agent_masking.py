@@ -490,3 +490,136 @@ async def test_a_union_of_monthly_tables_is_counted_with_the_sources_schema(monk
         assert rows["masked_at_query"] == ["buyer_phone"] and _cells(rows, "amount") == [1200, 300, 900]
     finally:
         await engines.invalidate(source_id)
+
+
+# --------------------------------------------------------------------------
+# 过期的表结构、写了库名的表、整行与列名表（复核第 3 轮）
+# --------------------------------------------------------------------------
+
+
+#: 一月那张表后来多了一列 extra（排在第二），数据源的表结构是那之前探查的；二月那张号码排在第二列
+REBUILT = ("CREATE TABLE jan (id INTEGER PRIMARY KEY, extra TEXT, region TEXT, buyer_phone TEXT, amount INTEGER);"
+           "CREATE TABLE feb (id INTEGER PRIMARY KEY, buyer_phone TEXT, region TEXT, amount INTEGER, extra TEXT);"
+           "INSERT INTO jan VALUES (1, '加急', '华东', '13900000001', 1200);"
+           "INSERT INTO feb VALUES (2, '13900000002', '华南', 300, '普通');")
+
+
+async def test_a_stale_schema_does_not_place_masked_values_by_its_old_layout(monkeypatch, tmp_path):
+    """数据源的表结构过期了（一月那张少了 extra）：UNION 第一支的 * 按它数出的列名和后一支的列数对不上，不按它对位置，整份
+    遮。以前照过期的列名对，二月的号码落进的「extra」认不出，原样交给模型、落库。"""
+    name, source_id = await _source(tmp_path, {"mask_columns": "buyer_phone"}, script=REBUILT)
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, source_id)
+        cache = dict(row.schema_cache)
+        jan = dict(cache["tables"]["jan"])
+        jan["columns"] = [c for c in jan["columns"] if c["name"] != "extra"]
+        row.schema_cache = {**cache, "tables": {**cache["tables"], "jan": jan}}
+        await session.commit()
+    try:
+        sql = ("WITH t AS (SELECT * FROM jan UNION ALL SELECT id, buyer_phone, region, amount, extra FROM feb) "
+               "SELECT extra AS 备注, id AS n FROM t ORDER BY id")
+        script = Script(monkeypatch, [q(name, sql, "c1")], {"value": {"alias": "Q1", "row": 0, "column": "n"},
+                                                            "rationale": "x"})
+        out, _ = await ask(name)
+        seen = script.tool_results()["c1"]
+        assert MASKED in seen and _clean(seen), seen
+        snapshot = artifact_store.load(out.queries[0]["artifact"])
+        assert "备注" in snapshot["masked_at_query"] and _clean(json.dumps(snapshot, ensure_ascii=False))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            got = await client.get(f"/api/artifacts/{out.queries[0]['artifact']}")
+        assert got.status_code == 200 and _clean(got.text)
+    finally:
+        await engines.invalidate(source_id)
+
+
+#: 造出来的 Postgres、Oracle 数据源的表结构：探查的是当前库（没设 schema），sales 一张表
+PG_LAYOUT = ["id", "region", "buyer_phone", "buyer_name", "amount", "note"]
+PG_SCHEMA = {"tables": {"sales": {"qualified": "sales", "schema": None,
+                                  "columns": [{"name": c, "type": "TEXT"} for c in PG_LAYOUT]}}, "schema": None}
+PG_ROWS = [[1, "华东", "13900000001", "张伟", 1200, "改址"], [2, "华南", "13900000002", "李娜", 300, "回访"]]
+
+
+def _json_row(row: list) -> str:
+    return json.dumps(dict(zip(PG_LAYOUT, row)), ensure_ascii=False)
+
+
+#: (数据源类型, SQL, 数据库交回的行, 查询时就整列遮掉的列, 编号那一格取到的值)。结果列按 SQL 里起的别名（j、n）。行照
+#: 驱动交回的样子造：JSON 是字符串，记录转成文字；archive.sales 是另一个库里的同名表，号码排在第二列。表的列名表只写了
+#: 前几列（Postgres 后面的列照原名）、另一个库里的同名表：说不清号码改叫了哪个名字，那一段整段遮，编号也遮
+DRIVER_CASES = [
+    ("postgresql", "SELECT json_agg(t) AS j, 1 AS n FROM (SELECT id, buyer_phone FROM sales) t",
+     [[json.dumps([{"id": r[0], "buyer_phone": r[2]} for r in PG_ROWS]), 1]], ["j"], 1),
+    ("postgresql", "SELECT row_to_json(s) AS j, s.id AS n FROM sales s ORDER BY s.id",
+     [[_json_row(r), r[0]] for r in PG_ROWS], ["j"], 1),
+    ("postgresql", "SELECT to_json(s.*) AS j, s.id AS n FROM sales s ORDER BY s.id",
+     [[_json_row(r), r[0]] for r in PG_ROWS], ["j"], 1),
+    ("postgresql", "SELECT s AS j, s.id AS n FROM sales s ORDER BY s.id",
+     [["(" + ",".join(map(str, r)) + ")", r[0]] for r in PG_ROWS], ["j"], 1),
+    ("postgresql", "SELECT p AS j, i AS n FROM sales AS s(i, r, p) ORDER BY i", [[r[2], r[0]] for r in PG_ROWS],
+     ["j", "n"], None),
+    ("postgresql", "WITH t(a, b, c, d, e, f) AS (TABLE sales) SELECT c AS j, a AS n FROM t ORDER BY a",
+     [[r[2], r[0]] for r in PG_ROWS], ["j"], 1),
+    ("postgresql", "WITH t(a, b, c, d, e, f) AS (SELECT * FROM archive.sales) SELECT b AS j, a AS n FROM t",
+     [["13900000007", 7]], ["j", "n"], None),
+    ("postgresql", "WITH t(a, b, c, d, e, f) AS (SELECT * FROM sales) SELECT c AS j, a AS n FROM t ORDER BY a",
+     [[r[2], r[0]] for r in PG_ROWS], ["j"], 1),
+    ("oracle", "SELECT JSON_OBJECT(*) AS j, id AS n FROM sales ORDER BY id", [[_json_row(r), r[0]] for r in PG_ROWS],
+     ["j"], 1),
+    ("oracle", "SELECT id AS n, val AS j FROM sales UNPIVOT (val FOR col IN (buyer_phone, region)) ORDER BY id",
+     [[1, "13900000001"], [1, "华东"], [2, "13900000002"], [2, "华南"]], ["n", "j"], None),
+]
+
+
+@pytest.fixture
+async def driver_shop():
+    """造一个 Postgres / Oracle 数据源（查询交给下面换掉的 run_query，不连库）：买家手机号、姓名设了遮罩。返回建源的函数。"""
+    made: list[int] = []
+
+    async def make(kind: str) -> str:
+        name = f"pg_{uuid.uuid4().hex[:8]}"
+        async with SessionLocal() as session:
+            row = DataSource(name=name, kind=kind, host="127.0.0.1", port=5432, username="probe", database="shop",
+                             readonly=True, enabled=True, options={"mask_columns": "buyer_phone, buyer_name"},
+                             schema_cache=PG_SCHEMA)
+            session.add(row)
+            await session.commit()
+            made.append(row.id)
+        return name
+
+    yield make
+    for source_id in made:
+        await engines.invalidate(source_id)
+
+
+@pytest.mark.parametrize("kind, sql, rows, masked, value", DRIVER_CASES,
+                         ids=["json_agg(t)", "row_to_json(s)", "to_json(s.*)", "SELECT s", "表的列名表", "CTE 里的 TABLE",
+                              "另一个库里的同名表", "本库的表按位置数", "JSON_OBJECT(*)", "UNPIVOT"])
+async def test_whole_rows_and_renamed_columns_from_other_databases_are_masked(monkeypatch, driver_shop, kind, sql,
+                                                                              rows, masked, value):
+    """Postgres 的整行（json_agg(t)、row_to_json(s)、to_json(s.*)、SELECT s）、表的列名表、CTE 里的 TABLE sales、另一个库里的
+    同名表，Oracle 的 JSON_OBJECT(*)、UNPIVOT：交给模型的、落库的、通用接口给的都是遮好的，编号照常（认不出位置的整份遮）。
+    以前这些写法 masked_at_query 是空的，号码、姓名原样交给模型、落库。"""
+    from app.data.engine import QueryResult
+    from app.tools import datasource
+
+    async def driver(source, statement, **kwargs):
+        assert statement == sql
+        columns = ["n", "j"] if statement.startswith("SELECT id AS n") else ["j", "n"]
+        return QueryResult(columns=columns, rows=[list(r) for r in rows], row_count=len(rows), truncated=False,
+                           elapsed_ms=1, sql=statement)
+
+    monkeypatch.setattr(datasource, "run_query", driver)
+    name = await driver_shop(kind)
+    script = Script(monkeypatch, [q(name, sql, "c1")], {"value": {"alias": "Q1", "row": 0, "column": "n"},
+                                                        "rationale": "x"})
+    out, events = await ask(name)
+    seen = script.tool_results()["c1"]
+    assert MASKED in seen and _clean(seen), seen
+    snapshot = artifact_store.load(out.queries[0]["artifact"])
+    assert snapshot["masked_at_query"] == masked and _clean(json.dumps(snapshot, ensure_ascii=False))
+    assert out.result["value"] == value
+    [end] = [d for k, d in events if k == EventType.TOOL_END]
+    assert _clean(end["preview"])
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        got = await client.get(f"/api/artifacts/{out.queries[0]['artifact']}")
+    assert got.status_code == 200 and _clean(got.text)
