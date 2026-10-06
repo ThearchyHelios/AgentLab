@@ -161,7 +161,6 @@ function CompareLink({ runId, compare }: { runId: string; compare: ScheduleFireC
       state={via}
       title={T.compareTitle(compare.summary, previous ? null : shortId(compare.base_run_id))}
       data-fire-compare={compare.base_run_id}
-      data-fire-compare-previous={previous ? '1' : '0'}
       className="inline-flex shrink-0 items-center gap-1 rounded-sm text-2xs text-dim outline-none hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
     >
       <GitCompareArrows size={11} aria-hidden />

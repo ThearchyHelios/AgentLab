@@ -1071,7 +1071,7 @@ await section('不属于已保存工作流的运行：对比页的说明前后�
   try {
     // 只带本次：服务端找不到基准（这种运行没有可比的）
     const lone = await open(comparePath(T), { base: () => ({ status: 404, json: {
-      detail: '没有找到可以对比的上一次运行：需要同一工作流、同一运行类别（定时任务发起的优先找同一定时任务）、更早结束并已封存的运行',
+      detail: '没有找到可以对比的上一次成功的运行：需要同一工作流、同一运行类别（定时任务发起的优先找同一定时任务）、比这次先发起、成功结束并已封存的运行',
       code: 'compare_no_base' } }) })
     await settled(lone.page, 'error')
     await until(async () => (await lone.page.locator('[data-compare-run="base"]').innerText()).includes('未保存或已删除'), 3000)
