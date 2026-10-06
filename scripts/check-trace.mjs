@@ -195,6 +195,59 @@ await section('墙钟 / 执行 / 等人', async () => {
     project(t, ts('run.interrupted') + 1).nodes.h?.state === 'waiting')
 })
 
+await section('等待审批时来了一条质询（approval.inquiry）', async () => {
+  // 审批人在批准前就报告提问：服务端在运行停在审批上时追加一条 approval.inquiry（node_id 为空），运行本身没动。
+  // 它不能把相位从等待里带出来（标题变成「正在执行」、工具栏挂出必然 409 的「停止」），也不能把等待的节点、
+  // 等待的那段时长收掉；恢复之后照常接着走
+  const e = fixtures.human
+  const before = upto(e, 6)
+  const last = before[before.length - 1]
+  const inquiry = {
+    seq: last.seq + 1, type: 'approval.inquiry', node_id: null, ts: last.ts + 0.5,
+    data: { question: '本月销售额是否扣除了退款？', quote: null, report: 'write', unit: 'u3', approval_id: 'ap-1',
+            answer_text: '已扣除退款。', answer_doc: null, ok: true, limit: null, error: null,
+            inquiry_artifacts: ['a'.repeat(64)], queries: [{ alias: 'Q1', artifact: 'a'.repeat(64), sql: 'SELECT 1', row_count: 1,
+            truncated: false, source: 'shop' }], model: 'verify-mini', usage: { calls: 2 } },
+  }
+  const asked = [...before, inquiry]
+  const t = run(asked, G.human)
+  check('相位仍是 waiting，等的还是 h', t.phase === 'waiting' && t.waitingNodeId === 'h' && t.nodes.h?.state === 'waiting',
+    `${t.phase} · ${t.waitingNodeId} · ${t.nodes.h?.state}`)
+  check('decodePhase 同样是 waiting', decode.decodePhase(asked) === 'waiting', decode.decodePhase(asked))
+  check('等待那一段没有被收掉', t.nodes.h?.segments.map((s) => `${s.kind}:${s.end == null ? 'open' : 'closed'}`).join(',') === 'run:closed,wait:open',
+    t.nodes.h?.segments.map((s) => `${s.kind}:${s.status}`).join(','))
+  check('等待节点的入边仍是闸门、没有光点', activeEdgesOf(t, G.human).length === 0 && heldEdgesOf(t, G.human).join(' ') === 'in|h|',
+    `流动 ${activeEdgesOf(t, G.human).join(' ')} · 闸门 ${heldEdgesOf(t, G.human).join(' ')}`)
+  const later = project(t, inquiry.ts * 1000 + 5000)
+  check('质询不算执行：之后墙钟和等待一起涨，执行时长不涨',
+    later.waitMs >= 5000 && later.elapsedMs - later.waitMs < 50,
+    `墙钟 ${ms(later.elapsedMs)} · 等待 ${ms(later.waitMs)} · 执行 ${ms(later.activeMs)}`)
+  const steps = decode.decodeRun(asked)
+  check('右栏：审批那一行仍在等待', decode.isAwaitingHuman(steps)
+    && flat(steps).some((s) => s.kind === 'human' && s.nodeId === 'h' && s.status === 'waiting'),
+    flat(steps).map((s) => `${s.kind}:${s.status}`).join(','))
+  check('右栏：质询单独成一行，挂在顶层，不当成未识别的事件', steps.some((s) => s.code === 'approval_inquiry' && s.status === 'done')
+    && !flat(steps).some((s) => s.title === '未识别的事件'), steps.map((s) => s.title).join(' | '))
+  // 恢复之后：后面的事件序号往后挪一位，接在质询后面
+  const resumed = [...asked, ...e.filter((x) => x.seq > 6).map((x) => ({ ...x, seq: x.seq + 1 }))]
+  const done = run(resumed, G.human)
+  check('恢复后照常跑完：h 只执行一次，一行三段（跑 → 等 → 接着跑）', done.phase === 'succeeded' && done.nodes.h?.count === 1
+    && done.nodes.h.segments.map((s) => s.kind).join(',') === 'run,wait,run',
+  `${done.phase} · ×${done.nodes.h?.count} · ${done.nodes.h?.segments.map((s) => s.kind).join(',')}`)
+  const p = project(done, LATER)
+  const wait = (e.find((x) => x.type === 'run.resumed').ts - e.find((x) => x.type === 'run.interrupted').ts) * 1000
+  check('等待时长照旧是中断到恢复（质询那一刻不切断等待）', Math.abs(p.waitMs - wait) < 1, `${ms(p.waitMs)} vs ${ms(wait)}`)
+  let same = true
+  let where = ''
+  let tt = emptyTrace()
+  for (let i = 0; i < resumed.length; i++) {
+    tt = foldEvent(tt, resumed[i])
+    const expect = decode.decodePhase(resumed.slice(0, i + 1))
+    if (tt.phase !== expect) { same = false; where = `#${resumed[i].seq}: ${tt.phase} vs ${expect}` }
+  }
+  check('每个前缀上 trace.phase === decodePhase（含质询那一条）', same, where)
+})
+
 await section('循环轮次', async () => {
   const e = fixtures.think
   const t = run(e, G.think)

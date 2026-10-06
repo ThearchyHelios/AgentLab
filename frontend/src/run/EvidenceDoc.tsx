@@ -1,10 +1,10 @@
 import {
   Fragment, forwardRef, memo, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo,
   useRef, useState, type CSSProperties, type FocusEvent as ReactFocusEvent,
-  type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent,
+  type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type RefObject,
 } from 'react'
 import { createPortal } from 'react-dom'
-import { ListChecks } from 'lucide-react'
+import { ListChecks, MessageCircleQuestion } from 'lucide-react'
 import clsx from 'clsx'
 import { rovingTarget } from '../components/ui'
 import {
@@ -13,10 +13,11 @@ import {
   type EvidenceStateCode, type EvidenceTally as Tally,
 } from '../lib/evidence'
 import { formatNumber } from '../lib/format'
-import { EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, JUDGE_TEXT, claimTally, evidenceTally, type ClaimTallyCounts } from '../lib/terms'
+import { EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT, JUDGE_TEXT, claimTally, evidenceTally, type ClaimTallyCounts } from '../lib/terms'
 import { useEvidence, useVerdicts } from '../store/evidence'
 import type { EvidenceBlock, EvidenceDocData, EvidenceSegment, EvidenceUnit, EvidenceVerdict } from '../types'
 import { EvidencePanel, type PanelMode, type PanelView } from './EvidencePanel'
+import { askAbout, type InquiryAccess } from './Inquiry'
 import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type InlineStyles } from './Markdown'
 
 /**
@@ -54,6 +55,19 @@ const TEXT_CAP = 3000
 /** 句末徽标在键盘顺序里的键：片段 id 是 s0…，不会撞 */
 const badgeKey = (unit: string) => `claim:${unit}`
 const unitOfKey = (key: string) => (key.startsWith('claim:') ? key.slice(6) : null)
+/**
+ * 审批质询的「质询」在键盘顺序里的键。只有没有可点片段、也没有徽标的句子，「质询」本身进键盘顺序（方向键走得到这一句）；
+ * 别的句子的「质询」跟在这一句后面，焦点在这一句上时按 Tab 到达，不多占键盘顺序
+ */
+const askKey = (unit: string) => `ask:${unit}`
+const unitOfAsk = (key: string) => (key.startsWith('ask:') ? key.slice(4) : null)
+
+/**
+ * 哪些句子挂「质询」：结论句（老文档没有 kind 的按有字的句子），标题、代码块里的不挂。表格里的格子也不挂：每格一个
+ * 图标会把列撑宽、满表都是图标；问表里的数可以划选那一格，或者就整份报告提问
+ */
+const askable = (unit: EvidenceUnit, block: EvidenceBlock) =>
+  (unit.kind ? unit.kind === 'claim' : !!unitText(unit).trim()) && !['heading', 'code', 'hr', 'table'].includes(block.type)
 
 interface Badge { unit: EvidenceUnit; block: number; verdict: EvidenceVerdict; state: EvidenceStateCode }
 
@@ -64,6 +78,8 @@ interface Model {
   seg: Map<string, { seg: EvidenceSegment; unit: EvidenceUnit; block: number }>
   /** 句末徽标：键是 claim:<unit>，带着这一句眼下的判定 */
   badge: Map<string, Badge>
+  /** 进了键盘顺序的「质询」（审批质询）：键是 ask:<unit> */
+  ask: Map<string, { unit: EvidenceUnit; block: number }>
   /** 每个有可点片段的句子里第一个可点片段，按正文顺序（↑/↓ 用） */
   unitFirst: string[]
   unitOf: Map<string, number>
@@ -82,11 +98,12 @@ interface Model {
   grid: Map<string, string>
 }
 
-function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVerdict>): Model {
+function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVerdict>, ask = false): Model {
   const order: string[] = []
   const index = new Map<string, number>()
   const seg = new Map<string, { seg: EvidenceSegment; unit: EvidenceUnit; block: number }>()
   const badge = new Map<string, Badge>()
+  const asks = new Map<string, { unit: EvidenceUnit; block: number }>()
   const unitFirst: string[] = []
   const unitOf = new Map<string, number>()
   const tiered: [string, 1 | 2][] = []
@@ -128,18 +145,27 @@ function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVe
         const t = alertTier(state)
         if (t) tiered.push([key, t])
       }
+      // 审批质询：一个可点的都没有的结论句，「质询」本身进键盘顺序，不然键盘用户问不了这一句
+      if (ask && first && askable(unit, block)) {
+        const key = askKey(unit.id)
+        asks.set(key, { unit, block: b })
+        index.set(key, order.length)
+        order.push(key)
+        unitFirst.push(key)
+        unitOf.set(key, unitFirst.length - 1)
+      }
     }
     chars.push(total)
   })
   // 按（轮次、正文顺序）排：tiered 本来就是正文顺序，稳定排序只按轮次挪
   const sorted = [...tiered].sort((a, b) => a[1] - b[1])
-  return { order, index, seg, badge, unitFirst, unitOf, alerts: sorted.map(([k]) => k), tier: new Map(sorted), chars, cell,
-           grid }
+  return { order, index, seg, badge, ask: asks, unitFirst, unitOf, alerts: sorted.map(([k]) => k), tier: new Map(sorted), chars,
+           cell, grid }
 }
 
 /** 片段或徽标在第几块 */
 const blockOf = (model: Model, key: string | null | undefined): number =>
-  (key ? model.seg.get(key)?.block ?? model.badge.get(key)?.block : undefined) ?? -1
+  (key ? model.seg.get(key)?.block ?? model.badge.get(key)?.block ?? model.ask.get(key)?.block : undefined) ?? -1
 
 /**
  * ↑/↓ 该去哪。表格里按列走：下一行同一列（那一格空着就找这一行离它最近的一格）；
@@ -217,13 +243,21 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
    * 数字的出处都对得上，档位却因为别的原因（比如查询没通过 SQL 检查）降了
    */
   tier?: string
+  /**
+   * 审批质询（期 4）：给了就在每句结论后面挂「质询」（悬停、焦点在这一句上时出现），划选原文时浮出「质询」，点了打开
+   * 这份报告的提问框。能不能问由页面按运行状态定（审批卡：运行停在审批上；运行详情：封存了的探索运行），approvalId 是
+   * 运行停在的那张审批。给了它，页面上要同时挂这份报告的 ReportInquiry（问答串和提问框在那里）
+   */
+  inquiry?: InquiryAccess | null
 }>(function EvidenceDoc({ doc, artifact, runId, dense = false, label, panel = 'auto', dock, onView, tally = false, runClass,
-  tier }, ref) {
+  tier, inquiry }, ref) {
   const blocks = useMemo(() => doc.blocks ?? [], [doc])
   const report = doc.node_id || undefined
+  // 质询要知道是哪次运行的哪份报告：两样缺一样就不挂入口
+  const ask = !!inquiry && !!runId && !!report
   // 封存之后按需追加的判定：盖过文档里的「未裁判 · 按需」。只换句末徽标，封存的文档一个字不改
   const overlay = useVerdicts(runId, report)
-  const model = useMemo(() => buildModel(blocks, overlay), [blocks, overlay])
+  const model = useMemo(() => buildModel(blocks, overlay, ask), [blocks, overlay, ask])
   const counts = useMemo(() => docTally(doc), [doc])
   const claims = useMemo(() => claimCounts(doc, overlay), [doc, overlay])
   // 探索运行的报告（开了裁判的按需文档，或调用方说了是探索运行）：证据图带着这次运行里之前按需判过的句子
@@ -272,7 +306,9 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
 
   const segEl = useCallback((id: string) => {
     const unit = unitOfKey(id)
-    const sel = unit ? `[data-ev-claim="${CSS.escape(unit)}"]` : `[data-seg="${CSS.escape(id)}"]`
+    const asked = unitOfAsk(id)
+    const sel = unit ? `[data-ev-claim="${CSS.escape(unit)}"]`
+      : asked ? `[data-inquiry-ask="${CSS.escape(asked)}"]` : `[data-seg="${CSS.escape(id)}"]`
     return rootRef.current?.querySelector<HTMLElement>(sel) ?? null
   }, [])
 
@@ -373,13 +409,29 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     },
   }), [step, model, viewKey, current, focusSeg, openSeg, openViolations, doc])
 
-  // 事件委托：片段只带 data-seg、句末徽标只带 data-ev-claim，点击和按键都在容器上认
+  // 事件委托：片段只带 data-seg、句末徽标只带 data-ev-claim，点击和按键都在容器上认。「质询」只有进了键盘顺序的才算
+  // （跟在有可点片段的句子后面的那种不算：方向键在它上面不动，Tab 照常离开）
   const segOf = (target: EventTarget | null): string | null => {
-    const el = (target as HTMLElement | null)?.closest?.<HTMLElement>('[data-seg], [data-ev-claim]')
+    const el = (target as HTMLElement | null)?.closest?.<HTMLElement>('[data-seg], [data-ev-claim], [data-inquiry-ask]')
     if (!el || !rootRef.current?.contains(el)) return null
+    if (el.dataset.inquiryAsk) return model.index.has(askKey(el.dataset.inquiryAsk)) ? askKey(el.dataset.inquiryAsk) : null
     return el.dataset.seg ?? (el.dataset.evClaim ? badgeKey(el.dataset.evClaim) : null)
   }
+  /** 点了句末的「质询」：打开这份报告的提问框，问的是这一句 */
+  const askUnit = (el: HTMLElement) => {
+    const id = el.dataset.inquiryAsk
+    if (!id || !inquiry || !runId || !report) return
+    const unit = blocks.flatMap((b) => b.units ?? []).find((u) => u.id === id)
+    if (model.index.has(askKey(id))) setCurrent(askKey(id))
+    askAbout(runId, report, inquiry, { unit: id, quote: null, text: unit ? unitText(unit).trim() : '' }, el)
+  }
   const onClick = (e: ReactMouseEvent) => {
+    const asking = (e.target as HTMLElement | null)?.closest?.<HTMLElement>('[data-inquiry-ask]')
+    if (asking && rootRef.current?.contains(asking)) {
+      e.preventDefault()
+      askUnit(asking)
+      return
+    }
     const id = segOf(e.target)
     if (!id) return
     e.preventDefault()
@@ -445,11 +497,40 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     />
   )
 
+  // 审批质询：划选一段原文，浮出「质询」，问的是选中的这段（带上它起头的那一句）
+  const pickAnchor = useRef<HTMLDivElement>(null)
+  const [pick, dropPick] = useSelectionPick(rootRef, pickAnchor, ask)
+  const askPick = () => {
+    if (!pick || !inquiry || !runId || !report) return
+    // 浮出的按钮点完就没了：Esc 之后焦点回到那一句的「质询」
+    const back = pick.unit ? rootRef.current?.querySelector<HTMLElement>(`[data-inquiry-ask="${CSS.escape(pick.unit)}"]`) : null
+    document.getSelection()?.removeAllRanges()
+    dropPick()
+    askAbout(runId, report, inquiry, { unit: pick.unit, quote: pick.quote, text: pick.quote }, back)
+  }
+
   // 画不了线的两种分开说：列表序号、代码块标签里的数字，和正文里根本没有对应字的（句末依据里的引用）
-  const summary = tallySummary({ ...counts, claims }, model.order.length > 0)
+  const summary = [tallySummary({ ...counts, claims }, model.order.length > 0), ask ? INQUIRY_TEXT.keysHint : '']
+    .filter(Boolean).join('。')
 
   return (
     <div ref={rootRef} data-evidence-doc="" className="min-w-0">
+      {ask && (
+        // 划选原文浮出的「质询」挂在文档里（高度为 0 的定位锚点下面，按锚点算坐标），不挂到页面末尾：画布上的审批浮层
+        // 按下在它外面就收起，挂在外面的按钮一按，浮层连同报告一起收掉。也因此会被报告框裁切，位置按可见范围摆（见
+        // useSelectionPick）
+        <div ref={pickAnchor} className="relative" data-inquiry-pick-anchor="">
+          {pick && (
+            // 按下时不抢焦点、不清掉选区：点下去才读选区
+            <button type="button" className="btn btn-xs absolute z-20 whitespace-nowrap shadow-elev-3" data-inquiry-selection=""
+                    style={{ left: pick.left, top: pick.top }} aria-label={INQUIRY_TEXT.askSelection}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={(e) => { e.stopPropagation(); askPick() }}>
+              <MessageCircleQuestion size={11} aria-hidden /> {INQUIRY_TEXT.ask}
+            </button>
+          )}
+        </div>
+      )}
       <p id={summaryId} className="sr-only" data-evidence-summary="">{summary}</p>
       <div className="sr-only" aria-live="polite" aria-atomic="true">{announce}</div>
       {tally && (counts.total > 0 || counts.other > 0 || !!counts.suspect || !!claims?.total) && (
@@ -473,7 +554,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
             <DocBlock block={block} dense={dense} doc={doc} visual={visual}
                       current={b === currentBlock ? current : null}
                       active={b === activeBlock ? activeSeg : null}
-                      panelId={panelId} model={model} />
+                      panelId={panelId} model={model} ask={ask} />
             {mode === 'inline' && b === activeBlock && panelNode}
           </Fragment>
         ))}
@@ -497,6 +578,103 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     </div>
   )
 })
+
+/** 划选的一段原文：要问的字、它起头的那一句、浮出按钮的位置（相对定位锚点） */
+interface SelectionPick { quote: string; unit: string | null; left: number; top: number }
+/** 浮出按钮的大致尺寸（宁大勿小）：放在选区末尾下方，贴边时收进可见范围，下方放不下时放到选区上方 */
+const PICK_W = 64
+const PICK_H = 26
+/** 按钮和选区、和可见范围边上留的空 */
+const PICK_GAP = 6
+
+/**
+ * 一个元素眼下看得见的范围（视口坐标）：视口，再和每一层会裁切内容的祖先（overflow 不是 visible 的，比如审批卡里
+ * 限高滚动的报告框）取交集。浮出的按钮挂在文档里，超出这个范围的部分会被裁掉
+ */
+function visibleBox(el: Element): { top: number; bottom: number; left: number; right: number } {
+  const box = { top: 0, left: 0, bottom: window.innerHeight, right: window.innerWidth }
+  for (let p: Element | null = el; p && p !== document.documentElement; p = p.parentElement) {
+    const style = getComputedStyle(p)
+    if (style.overflowX === 'visible' && style.overflowY === 'visible') continue
+    const r = p.getBoundingClientRect()
+    box.top = Math.max(box.top, r.top)
+    box.left = Math.max(box.left, r.left)
+    box.bottom = Math.min(box.bottom, r.bottom)
+    box.right = Math.min(box.right, r.right)
+  }
+  return box
+}
+
+/**
+ * 报告正文里划选了一段原文：返回要问的字和浮出按钮的位置，选区收起、移出正文、滚出可见范围时为 null。只认报告正文
+ * 里的字——栏内展开的证据面板也在这个容器里，那里的字不算。要问的字按选区克隆出来算，去掉句末徽标、「无证据」小标签、
+ * 读屏文字和「质询」本身（它们在 DOM 里，却不是报告的原文）。
+ *
+ * 位置相对 anchor（文档里高度为 0 的定位锚点）算：按钮挂在文档里，会被限高滚动的报告框裁切，所以按可见范围摆——
+ * 默认在选区末尾下方，下方放不下放到选区上方，左右收进文档的宽度（不把报告框撑出横向滚动）和可见范围
+ */
+function useSelectionPick(root: RefObject<HTMLElement | null>, anchor: RefObject<HTMLElement | null>,
+  enabled: boolean): [SelectionPick | null, () => void] {
+  const [pick, setPick] = useState<SelectionPick | null>(null)
+  useEffect(() => {
+    if (!enabled) { setPick(null); return }
+    let frame = 0
+    const read = () => {
+      frame = 0
+      const el = root.current
+      const origin = anchor.current
+      const sel = document.getSelection()
+      if (!el || !origin || !sel || sel.isCollapsed || !sel.rangeCount) { setPick(null); return }
+      const range = sel.getRangeAt(0)
+      const at = (n: Node) => (n instanceof Element ? n : n.parentElement)
+      const inside = (x: Element | null) => !!x && el.contains(x) && !!x.closest('[data-block]') && !x.closest('[data-evidence-panel]')
+      const start = at(range.startContainer)
+      if (!inside(start) || !inside(at(range.endContainer))) { setPick(null); return }
+      const frag = range.cloneContents()
+      frag.querySelectorAll('[data-inquiry-ask], .ev-tag, .ev-badge, .sr-only').forEach((n) => n.remove())
+      const quote = (frag.textContent ?? '').replace(/\s+/g, ' ').trim()
+      if ([...quote].length < 2) { setPick(null); return }
+      const rects = range.getClientRects()
+      const last = rects[rects.length - 1] ?? range.getBoundingClientRect()
+      const first = rects[0] ?? last
+      const view = visibleBox(el)
+      // 选区整个滚出了可见范围：按钮也不留（滚回来再量出来）
+      if (last.bottom <= view.top || first.top >= view.bottom) { setPick(null); return }
+      const doc = el.getBoundingClientRect()
+      const lo = Math.max(doc.left, view.left)
+      const hi = Math.min(doc.right, view.right) - PICK_W
+      const x = Math.max(lo, Math.min(last.right - PICK_W / 2, hi))
+      const fitsBelow = last.bottom + PICK_GAP + PICK_H <= view.bottom
+      const fitsAbove = first.top - PICK_GAP - PICK_H >= view.top
+      const y = fitsBelow || !fitsAbove ? Math.min(last.bottom + PICK_GAP, Math.max(view.top, view.bottom - PICK_H))
+        : first.top - PICK_GAP - PICK_H
+      const o = origin.getBoundingClientRect()
+      const next: SelectionPick = {
+        quote, unit: start?.closest('[data-ev-unit]')?.getAttribute('data-ev-unit') ?? null,
+        left: Math.round(x - o.left), top: Math.round(y - o.top),
+      }
+      // 滚动时每一帧都会量一次：没变就不换对象，整份报告不跟着重画
+      setPick((cur) => (cur && cur.quote === next.quote && cur.unit === next.unit && cur.left === next.left && cur.top === next.top
+        ? cur : next))
+    }
+    // 选区一变、页面或报告框一滚、窗口一变都重新量：可见范围变了，按钮放上方还是下方跟着变。文档自己的尺寸变了也量：
+    // 悬停一句时它的「质询」出现、那一段多折一行，下面的字整体下移，既不滚动也不改选区，按钮却得跟着挪
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(read) }
+    document.addEventListener('selectionchange', schedule)
+    window.addEventListener('scroll', schedule, true)
+    window.addEventListener('resize', schedule)
+    const resized = typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null
+    if (root.current) resized?.observe(root.current)
+    return () => {
+      cancelAnimationFrame(frame)
+      document.removeEventListener('selectionchange', schedule)
+      window.removeEventListener('scroll', schedule, true)
+      window.removeEventListener('resize', schedule)
+      resized?.disconnect()
+    }
+  }, [root, anchor, enabled])
+  return [pick, useCallback(() => setPick(null), [])]
+}
 
 /** 定位到的片段描一下边（CSS 的 [data-flash]），同 AssistantStream 的 flash */
 function flashOnce(el: HTMLElement) {
@@ -590,12 +768,14 @@ export function ClaimTally({ claims, lead }: { claims: ClaimTallyCounts; lead: b
 /** 列表项的开头：结构片段里带着行首的 - / 1. 。列表项被分成几句时，后面几句接在同一项里 */
 const ITEM_START = /(^|\n)[ \t]*([-*+]|\d+[.)])[ \t]+$/
 
-const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, active, panelId, model }: {
+const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, active, panelId, model, ask }: {
   block: EvidenceBlock
   dense: boolean
   doc: EvidenceDocData
   /** 句末徽标从这里取：这一句眼下的判定（封存后追加的盖过文档里的） */
   model: Model
+  /** 审批质询：结论句后面挂「质询」 */
+  ask: boolean
   /**
    * 长文档：块上加 content-visibility，屏幕外的块不排版不绘制。短文档不加：它自带 paint
    * containment，贴着块边的片段的焦点描边会被裁掉一截，而短文档本来就不慢
@@ -614,7 +794,8 @@ const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, ac
   }
   const unit = (u: EvidenceUnit, opts?: { code?: boolean; tag?: boolean }) => (
     <UnitView key={u.id} unit={u} doc={doc} current={current} active={active} panelId={panelId}
-              code={opts?.code} tag={opts?.tag ?? true} badge={model.badge.get(badgeKey(u.id))} />
+              code={opts?.code} tag={opts?.tag ?? true} badge={model.badge.get(badgeKey(u.id))}
+              ask={ask && askable(u, block) ? (model.ask.has(askKey(u.id)) ? 'roving' : 'follow') : undefined} />
   )
 
   switch (block.type) {
@@ -684,9 +865,14 @@ const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, ac
  * 被切坏），有状态的片段包成按钮。含无证据片段的句子末尾挂「? 无证据」；有判定的结论句末尾挂
  * 一枚徽标（也是按钮），证据相矛盾（和旧的证据不支持）的整句铺浅底——字本身不画线
  */
-function UnitView({ unit, doc, current, active, panelId, code, tag, badge }: {
+function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }: {
   unit: EvidenceUnit; doc: EvidenceDocData; current: string | null; active: string | null; panelId: string
   code?: boolean; tag: boolean; badge?: Badge
+  /**
+   * 审批质询的「质询」：roving 是这一句一个可点的都没有，「质询」本身进键盘顺序；follow 跟在这一句后面，焦点在这一句上时
+   * 按 Tab 到达
+   */
+  ask?: 'roving' | 'follow'
 }) {
   const segs = (unit.segments ?? []).filter((s) => s.kind !== 'structural')
   const text = segs.map((s) => s.text).join('')
@@ -727,7 +913,7 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge }: {
   const key = badge ? badgeKey(unit.id) : ''
   const meta = badge ? EVIDENCE_STATE[badge.state] : null
   const open = !!badge && active === key
-  return (
+  const body = (
     <>
       {conflicting(badge?.state)
         // 证据相矛盾（和旧的证据不支持）：整句铺一层浅底（折行时每行各自带圆角），字色、字重都不动，也不画线
@@ -761,6 +947,29 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge }: {
         </button>
       )}
     </>
+  )
+  if (!ask) return body
+  // 「质询」跟在句末，是一个固定宽度的小图标：平时淡淡的，悬停这一句、焦点落在这一句上时显出来（强调色、描边）。
+  // 显没显出来只换颜色，宽度一直是那么宽——悬停时撑开的话，后面的字整体右移，鼠标底下的数字跟着挪走，点不到。
+  // 触屏没有悬停，一直显出来，并写上「质询」两个字。
+  // 跟随的那种只在焦点在这一句上时进 Tab 顺序，整份报告不因此多出一串 Tab 位
+  const here = current != null && (current === key || current === askKey(unit.id)
+    || (unit.segments ?? []).some((sg) => sg.id === current))
+  return (
+    <span className="group/evu" data-ev-unit={unit.id}>
+      {body}
+      <button type="button" data-inquiry-ask={unit.id} tabIndex={here ? 0 : -1}
+              aria-label={INQUIRY_TEXT.askUnit(unitText(unit).trim())} title={INQUIRY_TEXT.askTitle}
+              className={'ml-1 inline-flex select-none items-center gap-0.5 whitespace-nowrap rounded border border-transparent px-[3px] '
+                + 'align-middle text-[10px] font-medium leading-[1.4] text-faint opacity-60 outline-none '
+                + 'hover:bg-hover group-hover/evu:border-[color:var(--border)] group-hover/evu:text-[color:var(--accent)] group-hover/evu:opacity-100 '
+                + 'group-focus-within/evu:border-[color:var(--border)] group-focus-within/evu:text-[color:var(--accent)] group-focus-within/evu:opacity-100 '
+                + 'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[color:var(--accent)] '
+                + 'pointer-coarse:border-[color:var(--border)] pointer-coarse:text-[color:var(--accent)] pointer-coarse:opacity-100'}>
+        <MessageCircleQuestion size={11} aria-hidden />
+        <span aria-hidden="true" className="hidden pointer-coarse:inline">{INQUIRY_TEXT.ask}</span>
+      </button>
+    </span>
   )
 }
 

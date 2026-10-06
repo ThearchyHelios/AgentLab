@@ -3709,3 +3709,108 @@ export interface ChallengeArtifact {
   claims: ChallengeClaim[]
   model: string | null
 }
+
+// ---------------------------------------------------------------------------
+// 审批质询：审批人就待审的报告提问，核查模型只读查库作答。形状照前后端共用的接口约定（F5a / F5b 同一份），字段名一个
+// 不改；回答正文、行数、触顶原因都是服务端给的，界面只排版
+// ---------------------------------------------------------------------------
+
+/** 回答停在哪个上限上：每次最多查询次数、时长、这一次的金额、核查的每日金额 */
+export type InquiryLimit = 'max_queries' | 'timeout_s' | 'max_cost_usd' | 'daily_max_usd'
+
+/** 质询的回答 */
+export interface InquiryAnswer {
+  /** 渲染后的正文（数字已按出处换好） */
+  text: string
+  /** compose_doc 组装的文档工件：有它，正文里的数字可以点开看出处；没有（组装失败）只显示 text */
+  doc_artifact: string | null
+  ok: boolean
+  limit: InquiryLimit | (string & {}) | null
+  /** 没答成时的中文说明 */
+  error: string | null
+}
+
+/** 核查模型为回答执行的一次只读查询。编号是这次质询自己的，快照按质询工件接口取（遮罩列已遮掉） */
+export interface InquiryQuery {
+  alias: string
+  artifact: string
+  sql: string
+  row_count: number | null
+  truncated: boolean
+  /** 数据源名 */
+  source: string | null
+}
+
+export interface InquiryUsage {
+  input_tokens?: number
+  output_tokens?: number
+  cost_usd?: number | null
+  calls?: number
+  unpriced_calls?: number
+}
+
+/** 一次质询：问的是哪份报告的哪一句（或划选的哪段原文）、问了什么、怎么答的、查了什么 */
+export interface Inquiry {
+  /** 运行记录里那条 approval.inquiry 事件的序号；没写进运行记录时为 null */
+  seq: number | null
+  /** 什么时候问的（ISO 时间或秒级时间戳） */
+  at: string | number | null
+  /** 提问人的署名；没署名时为 null */
+  actor: string | null
+  /** 报告撰写节点 id */
+  report: string
+  /** 句子单元 id（如 u12）；就整份报告提问时为 null */
+  unit: string | null
+  /** 划选的原文 */
+  quote: string | null
+  question: string
+  answer: InquiryAnswer
+  queries: InquiryQuery[]
+  /** 作答的核查模型 */
+  model: string | null
+  usage: InquiryUsage
+  /** 运行封存之后才问的（只有探索运行可以） */
+  post_seal: boolean
+  /** 提问时停在的那张审批；封存之后问的为 null */
+  approval_id: string | null
+}
+
+/** POST /runs/{id}/inquiries 的请求体 */
+export interface InquiryRequest {
+  report: string
+  unit: string | null
+  quote?: string | null
+  question: string
+  /** 运行停在审批上时必填：指明是哪一张 */
+  approval_id?: string
+}
+
+/** POST /runs/{id}/inquiries 的答复 */
+export interface InquiryResponse {
+  inquiry: Inquiry
+  /** 是否写进了运行记录 */
+  recorded: boolean
+  /** 没写进运行记录时的中文说明，否则为 null */
+  note: string | null
+}
+
+/** GET /runs/{id}/inquiries 的答复 */
+export interface InquiryList {
+  items: Inquiry[]
+}
+
+/**
+ * GET /runs/{id}/inquiries/artifacts/{artifact}：质询引用过的查询快照，遮罩列照证据面板的规则遮掉（值写「已遮罩」）。
+ * 约定只说了是快照：可能是快照本身，也可能包在 {id, content} 里（同工件接口），界面两种都认
+ */
+export interface InquirySnapshot {
+  columns: string[]
+  rows: unknown[][]
+  sql: string | null
+  truncated: boolean
+  /** 结果一共几行（快照的 row_count / total_rows），不给时按 rows 的长度 */
+  total: number | null
+  /** 遮掉的列 */
+  masked: string[]
+  source: string | null
+}

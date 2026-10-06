@@ -1,11 +1,12 @@
-import { useEffect, useId, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type Ref } from 'react'
 import { ChevronRight, ShieldCheck } from 'lucide-react'
 import { EVIDENCE_STATE, claimCountsOf, claimProblems, statsTally } from '../lib/evidence'
 import { formatNumber } from '../lib/format'
 import { APPROVAL_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, evidenceTally, runClassLabel } from '../lib/terms'
 import { useEvidence } from '../store/evidence'
-import type { ApprovalReport } from '../types'
-import { EvidenceDoc } from './EvidenceDoc'
+import type { ApprovalReport, EvidenceSegment } from '../types'
+import { EvidenceDoc, type EvidenceDocHandle } from './EvidenceDoc'
+import { ReportInquiry, reportSegmentFor, useInquiryAccess, type InquiryAccess } from './Inquiry'
 
 type RunClass = 'formal' | 'exploratory' | null | undefined
 
@@ -53,21 +54,52 @@ function claimsLine(report: ApprovalReport, runClass: RunClass): { text: string;
  *
  * 真实运行里报告有一句结论和证据相矛盾，审批人批准时完全不知道：卡上只有正文
  */
-export function ApprovalReports({ reports, runId, runClass }: {
+export function ApprovalReports({ reports, runId, runClass, approvalId, askable = false }: {
   reports: ApprovalReport[]
   runId: string
   runClass: RunClass
+  /** 这张审批卡的审批（处理过的也给）：问答串据此认哪几条问的就是卡上这一稿报告 */
+  approvalId?: string
+  /**
+   * 审批待处理：审批人可以就报告提出质询——报告上的句子、划选的原文挂「质询」，核对概况下面是问答串和提问框
+   * （run/Inquiry.tsx）。设置里关了审批质询时照样不给
+   */
+  askable?: boolean
 }) {
+  const { access, disabled } = useInquiryAccess(askable && !!approvalId, approvalId ?? null)
   if (!reports.length) return null
   return (
     <>
-      {reports.map((r) => <ReportCheck key={r.node_id} report={r} runId={runId} runClass={runClass} />)}
+      {reports.map((r) => (
+        <ReportCheck key={r.node_id} report={r} runId={runId} runClass={runClass} access={access} disabled={disabled}
+                     approvalId={approvalId ?? null} />
+      ))}
     </>
   )
 }
 
-function ReportCheck({ report, runId, runClass }: { report: ApprovalReport; runId: string; runClass: RunClass }) {
+function ReportCheck({ report, runId, runClass, access, disabled, approvalId }: {
+  report: ApprovalReport; runId: string; runClass: RunClass; access: InquiryAccess | null; disabled: boolean
+  approvalId: string | null
+}) {
   const [open, setOpen] = useState(false)
+  // 回答里引用了报告已有的出处：在逐段证据里打开那一处的证据面板。逐段证据收着的先展开，挂上之后再打开
+  const docRef = useRef<EvidenceDocHandle>(null)
+  const opening = useRef<string | null>(null)
+  const docSlot = useEvidence((s) => (report.doc_artifact ? s.docs[report.doc_artifact] : undefined))
+  const locate = useCallback((seg: EvidenceSegment) => {
+    const id = reportSegmentFor(docSlot?.status === 'ok' ? docSlot.data : null, seg)
+    if (!id) return false
+    if (open && docRef.current) return docRef.current.open(id, { focus: true })
+    opening.current = id
+    setOpen(true)
+    return true
+  }, [docSlot, open])
+  useEffect(() => {
+    if (!open || !opening.current || !docRef.current) return
+    docRef.current.open(opening.current, { focus: true })
+    opening.current = null
+  })
   const docId = useId()
   const counts = statsTally(report.stats)
   const suspect = typeof report.stats?.unknown_entities === 'number' ? report.stats.unknown_entities : 0
@@ -105,17 +137,25 @@ function ReportCheck({ report, runId, runClass }: { report: ApprovalReport; runI
           </button>
           {open && (
             <div id={docId} className="mt-1.5">
-              <ReportDoc artifact={report.doc_artifact} runId={runId} runClass={runClass} />
+              <ReportDoc artifact={report.doc_artifact} runId={runId} runClass={runClass} inquiry={access} handle={docRef} />
             </div>
           )}
         </>
       )}
+      {/* 审批质询：问答串（进入审批卡时按列表接口恢复）、提问框和「就整份报告提问」 */}
+      <ReportInquiry runId={runId} report={report.node_id} docArtifact={report.doc_artifact} access={access} disabled={disabled}
+                     cardId={approvalId} onLocate={locate} />
     </div>
   )
 }
 
 /** 报告文档：和成果里同一份可逐段点开的文档，自带证据条（定位下一处、违规清单），点开的证据面板在卡内展开 */
-function ReportDoc({ artifact, runId, runClass }: { artifact: string; runId: string; runClass: RunClass }) {
+function ReportDoc({ artifact, runId, runClass, inquiry, handle }: {
+  artifact: string; runId: string; runClass: RunClass
+  /** 审批质询：句子、划选的原文上挂「质询」 */
+  inquiry: InquiryAccess | null
+  handle: Ref<EvidenceDocHandle>
+}) {
   const slot = useEvidence((s) => s.docs[artifact])
   const loadDoc = useEvidence((s) => s.loadDoc)
   useEffect(() => { void loadDoc(artifact) }, [artifact, loadDoc])
@@ -124,7 +164,8 @@ function ReportDoc({ artifact, runId, runClass }: { artifact: string; runId: str
   if (!doc) return <div className="text-2xs text-faint">{APPROVAL_TEXT.docLoading}</div>
   return (
     <div className="max-h-96 overflow-y-auto rounded border p-2" data-approval-evidence-doc="">
-      <EvidenceDoc doc={doc} artifact={artifact} runId={runId} dense tally runClass={runClass ?? undefined} />
+      <EvidenceDoc ref={handle} doc={doc} artifact={artifact} runId={runId} dense tally runClass={runClass ?? undefined}
+                   inquiry={inquiry} />
     </div>
   )
 }
