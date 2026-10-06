@@ -6,7 +6,8 @@
 
 1. 建目录：收齐上游口径卡的指标和运行输入，编成 [[m:gmv]]、[[i:week]] 这样的引用
 2. 流式写作：模型写标记，StreamRenderer 边收边换成真值，流里看到的就是最终的数字
-3. 核对：compose_doc 切块、分句、切片段，找出裸数字和解析不了的引用
+3. 核对：compose_doc 切块、分句、切片段，找出裸数字和解析不了的引用。模型把整篇包在一个 ```markdown 代码块
+   里的，先去掉外层围栏（_unfenced）：不然整篇是一个代码块，一句结论都切不出来
 4. 修复：有违规就把清单交回去重写，最多 max_repairs 次
 5. 收尾：文档落成 report_doc 工件，report.checked 事件进封存；仍然违规时按
    on_violation 失败（fail）或者照常产出、把违规片段标出来（flag）
@@ -30,6 +31,7 @@
 """
 from __future__ import annotations
 
+import re
 import time
 from collections import Counter
 from typing import Any
@@ -437,6 +439,38 @@ def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims
     ]
 
 
+#: 整篇报告外面包的那层代码块（_unfenced）。第一行：围栏（三个以上反引号或波浪号）加信息串
+_OPEN_FENCE = re.compile(r"(`{3,}|~{3,})[ \t]*([^\s`]*)[ \t]*")
+#: 最后一行：行首最多缩进三格（同 CommonMark），缩进四格的是一行缩进代码，不算收尾
+_CLOSE_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+#: 正文里像围栏的行：行首空白不讲究，前端和 compose_doc 的切块（evidence._FENCE）就是这样认 ``` 的
+_INNER_FENCE = re.compile(r"\s*(`{3,}|~{3,})")
+#: 信息串只认这几个（大小写不敏感）：写成 sql、json 的是模型真要贴一段代码
+_PROSE_INFO = frozenset({"", "markdown", "md"})
+
+
+def _unfenced(raw: str) -> str:
+    """模型把整篇报告包成一个代码块（```markdown … ```）时去掉外层围栏，返回里面的正文；别的一律原样返回。
+
+    不去的话整篇在 compose_doc 里是一个代码块：裸数字照样标出，可一句结论都切不出来，裁判、反方审稿没有句子可审，
+    界面上整篇显示成代码。只在拿得准的时候去：去掉首尾空白后，第一行是围栏、信息串为空或 markdown / md，最后一行
+    是同一道围栏（同种符号、同样长、不带信息串），中间没有哪一行像同种、不比它短的围栏。有这样一行，就是好几个代码块，
+    或者分不清哪一行才是收尾（前端和 compose_doc 的切块见到 ``` 就收）；正文自己的代码块要套在里面，外层得用更长的
+    围栏或者换一种符号。sql、json 这类信息串、围栏外还有前言结语的，都不是整篇报告被包了起来，原样交给 compose_doc。
+    """
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = text.split("\n")
+    head = _OPEN_FENCE.fullmatch(lines[0])
+    tail = _CLOSE_FENCE.fullmatch(lines[-1]) if len(lines) > 1 else None
+    if head is None or tail is None or head.group(2).lower() not in _PROSE_INFO or tail.group(1) != head.group(1):
+        return raw
+    fence = head.group(1)
+    if any((inner := _INNER_FENCE.match(line)) and inner.group(1)[0] == fence[0] and len(inner.group(1)) >= len(fence)
+           for line in lines[1:-1]):
+        return raw
+    return "\n".join(lines[1:-1])
+
+
 async def _store(doc: dict[str, Any], ctx: NodeContext) -> str | None:
     from app.core.artifact_store import put_json
 
@@ -515,7 +549,9 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     entities = report_entities(spec, ctx.node) == "link"
 
     def compose(raw: str) -> dict[str, Any]:
-        return compose_doc(raw, catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
+        # 第一稿、重写稿、裁判退回的改写稿都从这里过：整篇包在代码块里的先去掉外层围栏。文档的 source 记的是去掉
+        # 围栏之后的正文——markdown 由它渲染，出口契约复核取回的也是这份文档
+        return compose_doc(_unfenced(raw), catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
                            cells_allowed=cells, entities=entities, absence=writer.trimmed)
 
     response, raw = await draft(messages)
