@@ -10,18 +10,21 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
+from app.api.coded import CodedHTTPException
 from app.core.errors import explain, not_configured, raw
 from app.core.config import settings as app_settings
 from app.core.crypto import encrypt, mask
 from app.db.base import get_session
 from app.db.models import Provider, Setting
 from app.engine.judge import JUDGE_DEFAULTS, MAX_TOKENS as JUDGE_MAX_TOKENS
-from app.engine.judge import SETTING_GROUP as JUDGE_GROUP, SPEND_KEY as JUDGE_SPEND
+from app.engine.judge import SETTING_GROUP as JUDGE_GROUP, SETTING_LABEL as JUDGE_LABEL, SPEND_KEY as JUDGE_SPEND
 from app.engine.judge import daily_spend, judge_model_spec, judge_settings
 from app.engine.judge import sanitize_settings as judge_values, settings_problem as judge_problem
 from app.engine.spend import SPEND_KEY as VERIFY_SPEND, daily_spend as verify_daily_spend
 from app.providers import catalog
-from app.providers.factory import ModelSpec, ProviderNotConfigured, _resolve_key, build_chat_model
+from app.providers.factory import (
+    ModelSpec, ProviderNotConfigured, _resolve_key, build_chat_model, list_providers as all_providers, named_provider,
+)
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -719,6 +722,49 @@ class SettingsIn(BaseModel):
     values: dict[str, Any]
 
 
+#: 点名的模型接入不存在或已停用时 PUT /api/settings 回 422 的机读码，field 是出错的那一项（verify.provider……）
+PROVIDER_INVALID = "settings_provider_invalid"
+
+
+def _provider_fields() -> dict[tuple[str, str], tuple[str, str]]:
+    """设置里点名模型接入的项：(组, 键) → (设置页上的叫法, 留空时用什么)。门控、裁判、核查的叫法和设置页一致；助手的
+    模型由助手面板单独设定（PUT /api/copilot/model），这里只防经设置接口写进去的那一份。"""
+    from app.api.copilot import COPILOT_SETTING_KEY   # 在这里导入：copilot 模块很大，设置模块被引擎各处导入
+
+    return {
+        ("run", "tool_gate_provider"): ("门控模型 · 接入", "留空表示使用默认接入的默认模型"),
+        (JUDGE_GROUP, "provider"): (JUDGE_LABEL["provider"], "留空表示不指定"),
+        (VERIFY_GROUP, "provider"): (VERIFY_SETTING_LABEL["provider"], "留空表示沿用证据裁判模型"),
+        (COPILOT_SETTING_KEY, "provider"): ("助手模型 · 接入", "留空表示不指定"),
+    }
+
+
+async def _provider_problem(session: AsyncSession, values: dict[str, Any]) -> tuple[str, str] | None:
+    """这次写进来的设置里点名的模型接入有没有问题：(字段, 说明)，没问题返回 None。说明和运行时报的原因、提示同一句
+    （factory.named_provider）。
+
+    以前点名的接入不存在时运行悄悄换成演示模型，名字写错一个字就由演示模型写报告、做核查，现在运行时照实报错；保存时
+    先拦一道。留空照旧表示沿用上一级。只查这次改了的：存着的值没改（写好之后接入才被删、停用）不挡这次保存别的项——
+    设置页标着「不存在」，运行时照实报错，同设置页「只校验改过的」的做法。名字不是字符串这类格式问题由各组自己的
+    检查先报。"""
+    providers = None
+    for (group, key), (label, blank) in _provider_fields().items():
+        sent = values.get(group)
+        if not isinstance(sent, dict) or (name := _model_text(sent.get(key))) is None:
+            continue
+        row = await session.get(Setting, group)
+        saved = row.value if row is not None and isinstance(row.value, dict) else {}
+        if _model_text(saved.get(key)) == name:
+            continue
+        if providers is None:
+            providers = await all_providers(session)
+        try:
+            named_provider(providers, name)
+        except ProviderNotConfigured as e:
+            return f"{group}.{key}", f"「{label}」填写的{e.reason}。{e.hint}；{blank}"
+    return None
+
+
 @router.put("/settings")
 async def put_settings(
     payload: SettingsIn, session: AsyncSession = Depends(get_session)
@@ -735,6 +781,8 @@ async def put_settings(
             raise HTTPException(422, problem)
         # 存规范化之后的：末尾带 / 的地址拼链接会多出一个斜杠
         payload.values[NOTIFY_GROUP] = notify_values(payload.values[NOTIFY_GROUP])
+    if found := await _provider_problem(session, payload.values):
+        raise CodedHTTPException(422, found[1], PROVIDER_INVALID, field=found[0])
     for key, value in payload.values.items():
         if key in (TRUST_KEY, "limits", JUDGE_SPEND, VERIFY_SPEND):
             # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，

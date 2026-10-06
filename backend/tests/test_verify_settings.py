@@ -21,7 +21,7 @@ from app.api.settings import (
     verify_settings,
 )
 from app.db.base import SessionLocal
-from app.db.models import Setting
+from app.db.models import Provider, Setting
 from app.engine import spend
 from app.engine.judge import JUDGE_DEFAULTS, MAX_TOKENS
 from app.main import app
@@ -64,7 +64,20 @@ async def test_settings_expose_the_verify_group_with_defaults():
     assert spend.SPEND_KEY not in got
 
 
-async def test_a_full_group_round_trips_and_null_stays_unlimited():
+@pytest.fixture
+async def house():
+    """设置里点名的接入要真的存在、启用着（保存时会查）：建一个演示类的，用完删掉。"""
+    async with SessionLocal() as session:
+        session.add(Provider(name="house", kind="mock", models=[{"id": "verify-model"}], default_model="verify-model",
+                             enabled=True, extra={}))
+        await session.commit()
+    yield "house"
+    async with SessionLocal() as session:
+        await session.execute(delete(Provider).where(Provider.name == "house"))
+        await session.commit()
+
+
+async def test_a_full_group_round_trips_and_null_stays_unlimited(house):
     value = {
         "provider": "house", "model": "verify-model",
         "dual_check": {"enabled": False, "tolerance": 0, "max_queries": None, "timeout_s": None},
