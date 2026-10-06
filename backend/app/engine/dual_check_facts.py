@@ -47,7 +47,8 @@ is_test = 0、is_valid = 1、deleted_at IS NULL）；只涉及一张表。拿不
 哪一项、本来要写什么，卡上才认得出它和别的指标是不是落到同一项上。同一次裁决里几个指标落到同一项上时，写进去的是
 合起来的说法（上一段），单个指标的预告说不准：preview_joint 把这几个指标各自选哪一边的每种组合都按真写的办法算一遍
 （_merged 归拢、_screen 拿掉驳回的、_plan 对目录），卡上按各指标当前的选择取对应的那一种。和真写是同一套判断、同一句
-原因，只有审批停下期间目录被人改了时才会和最后写的不一样。组合太多的（JOINT_LIMIT）那一项不预告，卡上有条件地说。
+原因，只有审批停下期间目录被人改了、数据源换了版本时才会和最后写的不一样：真写按写入时的目录、表结构和导入时认作
+日期的列判断。组合太多的（JOINT_LIMIT）那一项不预告，卡上有条件地说。
 
 catalog.save_patch 不收备注，这里用它的同一套原料（read_entry、apply_patch、write_entry 的乐观锁）写，只多把备注放进项里。
 """
@@ -149,9 +150,10 @@ def derive(candidate: Mapping[str, Any], schema_cache: Mapping[str, Any] | None,
     这个指标自己的范围：texts 是口径说明、所在分组的取值、本次运行的输入（指标名称总算在内），columns 是分组的列；有效
     记录条件用它排除指标自己的筛选范围。uploaded 为真是上传表格建的数据源，upload_dates 是它导入时认作日期的列
     （{表名: [列名]}，由 upload_dates 从配方读出）：按文字保存的列在这里面的算日期列，不在的业务日期不记、原因照实说
-    是上传的表格按文字保存日期。两项都由节点发起审批时备好、放进候选：预告和审批之后的真写认的是同一份。schema_cache
-    是数据源的表结构：认表，业务日期还要看两边的列声明的类型。notes 是这个数据源的目录（{表名: notes}），认码值的意思
-    用。只看差异说明，不重新比 SQL：审核人看到的就是这份说明。
+    是上传的表格按文字保存日期。两项都由节点发起审批时备好、放进候选，审批卡上的预告按它；真写时 record_choices 按
+    写入时的版本重读 upload_dates，和它现读的表结构出自同一个版本。schema_cache 是数据源的表结构：认表，业务日期还要
+    看两边的列声明的类型。notes 是这个数据源的目录（{表名: notes}），认码值的意思用。只看差异说明，不重新比 SQL：
+    审核人看到的就是这份说明。
     """
     name = str(candidate.get("metric") or "")
     side = candidate.get("choice")
@@ -292,15 +294,21 @@ def recipe_dates(recipe: Any) -> dict[str, list[str]]:
     就是导入确认时界面上标「日期」的那些（recipe_notes 给列写日期格式说明认的也是这两种）：交叉表的日期轴（Axis.type 恒为
     日期），列表块里类型记为 DATE 的列。执行器把它们一律存成 YYYY-MM-DD 的文字，表结构里只剩 TEXT。哪张表有哪几列按
     recipe_types.derive_tables 推（建表用的同一份）：日期轴写进它各分段的表，列表合计行另存的表只有合计项和数字列。
-    列表的类型按 _DATED_TYPE 认，配方以后添了日期时间也算；只有时刻的不算。"""
+    列表的类型按 _DATED_TYPE 认，配方以后添了日期时间也算；只有时刻的不算。几个列表块写同一张表的，这一列每一块都
+    记为日期才算：日期和文字都存成 TEXT，建出的表形状一样，配方校验不拦，可按文字导入的那一块存的是单元格原文。"""
     from app.data.recipe_types import ListBlock, derive_tables
 
     tables, _ = derive_tables(recipe)
-    listed = {(block.table, column.name) for sheet in recipe.sheets for block in sheet.blocks
-              if isinstance(block, ListBlock) for column in block.columns if _DATED_TYPE.fullmatch(column.type)}
+    listed: dict[tuple[str, str], bool] = {}
+    for sheet in recipe.sheets:
+        for block in sheet.blocks:
+            if isinstance(block, ListBlock):
+                for column in block.columns:
+                    key = (block.table, column.name)
+                    listed[key] = listed.get(key, True) and _DATED_TYPE.fullmatch(column.type) is not None
     out: dict[str, list[str]] = {}
     for table, columns in tables.items():
-        names = [c.name for c in columns if c.role == "axis" or (table, c.name) in listed]
+        names = [c.name for c in columns if c.role == "axis" or listed.get((table, c.name), False)]
         if names:
             out[table] = list(dict.fromkeys(names))
     return out
@@ -806,7 +814,8 @@ async def record_choices(candidates: list[Mapping[str, Any]], *, run_id: str, no
     进去，都落在 skipped 里照实说。
 
     先把每个候选认成目录项，再按（数据源、表、项）归拢成一项（_merged：说法一样的、有效记录条件合起来写，说法
-    不同的整组不写），逐项写（_write：按读到的目录先拿掉各自带回驳回说法的指标，其余的照写）。"""
+    不同的整组不写），逐项写（_write：按读到的目录先拿掉各自带回驳回说法的指标，其余的照写）。认目录项用的表结构、
+    目录、上传表格导入时认作日期的列（upload_dates）都按写入时数据源的现状读。"""
     skipped: list[dict[str, Any]] = []
     facts: list[Fact] = []
     for candidate in candidates:
@@ -818,6 +827,11 @@ async def record_choices(candidates: list[Mapping[str, Any]], *, run_id: str, no
                     skipped.append({"reason": f"数据源「{name}」已不存在，指标「{candidate.get('metric')}」的选择未写入数据目录"})
                     continue
                 notes = {table: entry.notes for table, entry in (await catalog.read_catalog(session, row.id)).items()}
+                if "upload_dates" in candidate:
+                    # 表结构是这里现读的，导入时认作日期的列也按写入时的当前版本重读：审批停着时换了版本（日期列改成了
+                    # 文字），拿发起审批时读的那份去配新的表结构，会写出一条哪个版本单独看都不会给出的人工确认。候选里
+                    # 没有这一项的是升级前发起的审批，卡上预告的是不写，照旧不认
+                    candidate = {**candidate, "upload_dates": await upload_dates(session, row)}
                 fact, why = derive(candidate, row.schema_cache, notes)
         except Exception:  # noqa: BLE001 - 目录读不出来不能毁掉审批的结果：缺口照样按选择记
             logger.exception("双盲复算的选择核对数据目录失败（数据源 %s）", name)

@@ -1168,7 +1168,8 @@ async def _source_info(sources: _Sources, name: str) -> dict[str, Any]:
     """比较两条 SQL、预告目录写入要用的：方言、表结构、列的中文名、整份数据目录，以及是不是上传表格建的数据源
     （uploaded：导入时日期一律存成文字）和它导入时认作日期的列（upload_dates，按当前版本的配方读，见
     dual_check_facts.upload_dates）——业务日期据此认上传表格的日期列，认不出的原因照实说（_dated_problem）。两项都进
-    候选：审批卡的预告和裁决后的真写认的是发起审批时读的这一份。数据源没了就都不给，照样比原文。"""
+    候选：审批卡的预告按发起审批时读的这一份；裁决后的真写按写入时的版本重读 upload_dates，和现读的表结构一起以写入时
+    为准（dual_check_facts.record_choices）。数据源没了就都不给，照样比原文。"""
     from app.data import catalog
     from app.data.sql_semantics import catalog_labels
 

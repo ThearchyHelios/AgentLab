@@ -5,8 +5,10 @@
 
 - 配方里是日期的两列（列表块里类型为 DATE 的列、交叉表的日期轴）：审核人选了哪一边，业务日期就记哪一列；审批卡的预告
   和真写一字不差
-- 配方里是文字的列不写；配方读不出来（简单导入没有配方、配方记录坏了）的照旧不写，原因都照实说是上传的表格按文字保存
-- 只认数据源当前版本的配方：表结构出自同一个版本
+- 配方里是文字的列不写；配方读不出来（简单导入没有配方、配方记录坏了）的照旧不写，原因都照实说是上传的表格按文字保存；
+  几个列表块写同一张表的，这一列每一块都记为日期才算
+- 只认数据源当前版本的配方：表结构出自同一个版本。审批停着时数据源换了版本，真写按写入时的版本重读（和表结构一样以
+  写入时为准）；升级前发起的审批（候选里没有 upload_dates）不重读，照它审批卡上的预告不写
 
 数据源一律经真实的导入接口建（暂存 → 改配方 → 试运行 → 提交，或者简单导入），工作簿是现造的：表名、地区、金额都是
 虚构的。盲算模型是 MockChatModel 剧本（tests/fixtures/dual_check_shop.Blind）。
@@ -23,11 +25,12 @@ from httpx import ASGITransport, AsyncClient
 from openpyxl import Workbook
 from sqlalchemy import delete, select
 
-from app.data.recipe_types import Recipe
+from app.data.recipe_types import Recipe, derive_tables
+from app.data.sql_semantics import explain_sql_diff
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Setting, SourceSnapshot, TableRecipe
 from app.engine import spend
-from app.engine.dual_check_facts import recipe_dates, upload_dates
+from app.engine.dual_check_facts import recipe_dates, record_choices, upload_dates
 from app.engine.runner import run_manager
 from app.main import app
 from tests.fixtures.dual_check_shop import ROWS, Blind
@@ -174,6 +177,28 @@ def test_the_axis_of_a_crosstab_is_a_date_column_of_every_table_it_writes():
         "日客流": ["日期"], "时段客流": ["日期"], "时段客流_表内合计": ["日期"]}
 
 
+def test_a_column_two_lists_type_differently_is_not_a_date():
+    """两个工作表的列表块写同一张表，支付日期一块记为「日期」、一块记为「文字」：两块建出的表形状一样（日期也存成文字），
+    配方校验不拦，可按文字导入的那一块存的是单元格原文（「待定」这类），这一列并不都是日期。写这一列的块都记为日期
+    才算，拿不准就不认；两块都记为日期的下单日期照常认。"""
+    recipe = list_recipe()
+    february = json.loads(json.dumps(recipe["sheets"][0]))
+    february["id"], february["match"] = "s2", {"name": "二月"}
+    february["blocks"][0]["id"] = "orders_feb"
+    for column in february["blocks"][0]["columns"]:
+        if column["name"] == "支付日期":
+            column["type"] = "TEXT"
+    recipe["sheets"].append(february)
+    parsed = Recipe.model_validate(recipe)
+    assert derive_tables(parsed)[1] == [], "背景：两块写成的表形状一样，不报冲突"
+    assert recipe_dates(parsed) == {TABLE: ["下单日期"]}
+    # 两块都记为日期：照常认两列
+    both = list_recipe()
+    both["sheets"].append({**json.loads(json.dumps(both["sheets"][0])), "id": "s2", "match": {"name": "二月"}})
+    both["sheets"][1]["blocks"][0]["id"] = "orders_feb"
+    assert recipe_dates(Recipe.model_validate(both)) == {TABLE: ["下单日期", "支付日期"]}
+
+
 def test_a_list_total_kept_as_a_table_has_no_date_column():
     """列表的合计行另存成表时只有合计项和数字列：日期列不在里面。"""
     recipe = list_recipe()
@@ -313,3 +338,57 @@ async def test_without_a_readable_recipe_nothing_is_written(monkeypatch, client,
     [wrote] = logs(await events(run.id), "dual_check_catalog")
     assert wrote["written"] == [] and [s["reason"] for s in wrote["skipped"]] == [said["a"]["reason"]]
     assert await notes_of(source_id, TABLE) is None
+
+
+# --------------------------------------------------------------------------
+# 审批停着时数据源换了版本：真写按写入时的版本认
+# --------------------------------------------------------------------------
+
+
+async def test_a_new_version_while_waiting_is_what_the_write_reads(monkeypatch, client, dated):
+    """审批停着时修改配方、把支付日期改成「文字」并提交成新版本：真写时表结构是现读的，导入时认作日期的列也按写入时的
+    当前版本重读，两者出自同一个版本。审批卡上预告会记「支付日期」，裁决后照实说按文字保存、不写——不拿发起审批时读的
+    配方去配新版本的表结构，写出一条哪个版本单独看都不会给出的人工确认。"""
+    name, source_id = dated
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(upload_graph(name, BY_ORDER_DATE))
+    assert run.status == "interrupted", run.error
+    [item] = (await pending(run.id)).payload["summary"]
+    assert item["catalog"]["b"]["write"] is True, "背景：发起审批时两列在配方里都是日期"
+    r = await client.post(f"{API}/{source_id}/redraft", json={})
+    assert r.status_code == 201, r.text
+    await commit_recipe(client, r.json()["id"], list_recipe(paid="TEXT"))
+    assert await dates_of(source_id) == {TABLE: ["下单日期"]}
+    done = await decide(client, run.id, {"gmv": "b"})
+    assert done.status == "succeeded", done.error
+    [wrote] = logs(await events(run.id), "dual_check_catalog")
+    assert wrote["written"] == []
+    assert [s["reason"] for s in wrote["skipped"]] == [
+        f"指标「销售额」被采纳的盲算按时间筛的列「{TABLE}.支付日期」{STORED_AS_TEXT}，不写入数据目录"]
+    assert await notes_of(source_id, TABLE) is None
+
+
+async def candidate_of(name: str, source_id: str, choice: str) -> dict:
+    """真写收到的候选（节点从 checkpoint 里取出、加上审核人的选择）：差异说明按数据源的表结构真算。"""
+    async with SessionLocal() as session:
+        schema = (await session.get(DataSource, source_id)).schema_cache
+    diff = explain_sql_diff(BY_ORDER_DATE, RIGHT, "sqlite", schema=schema, labels=("原流程", "盲算")).as_dict()
+    return {"metric_id": "gmv", "metric": "销售额", "source": name, "dialect": "sqlite", "uploaded": True,
+            "sql": {"a": BY_ORDER_DATE, "b": RIGHT}, "diff": diff, "choice": choice}
+
+
+async def test_a_checkpoint_without_the_dates_is_written_as_its_card_said(client, dated):
+    """升级前发起的审批，checkpoint 的候选里没有 upload_dates：它的审批卡预告的是按文字保存、不写，真写不重读配方，照旧
+    不写，和那张卡说的一致。候选里带着这一项的（升级后发起的）按写入时的版本重读：发起审批时读出来是空的，写入时配方里
+    两列都是日期，照写——和表结构、目录在审批期间变了一样，以写入时为准。"""
+    name, source_id = dated
+    old = await candidate_of(name, source_id, "b")
+    assert [i["aspect"] for i in old["diff"]["items"]] == ["time"], "背景：两边只差按哪一列筛时间"
+    result = await record_choices([old], run_id="run_old", node_title="复核", actor=None)
+    assert result["written"] == []
+    assert [s["reason"] for s in result["skipped"]] == [
+        f"指标「销售额」被采纳的盲算按时间筛的列「{TABLE}.支付日期」{STORED_AS_TEXT}，不写入数据目录"]
+    result = await record_choices([{**old, "upload_dates": {}}], run_id="run_new", node_title="复核", actor=None)
+    assert result["skipped"] == []
+    assert result["written"] == [
+        {"source": name, "table": TABLE, "item": "business_date", "value": {"column": "支付日期"}}]
