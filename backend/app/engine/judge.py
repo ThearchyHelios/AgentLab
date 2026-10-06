@@ -39,7 +39,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from sqlalchemy import select
 
 from app.core.artifact_store import canonical_json, content_hash
@@ -70,6 +70,7 @@ from app.engine.merge_query import MERGE_SOURCE
 from app.engine.nodes.llm import _split_structured, _usage_of
 from app.engine.state import message_text
 from app.providers import catalog as pricing
+from app.providers.budget import BudgetFallback, cut_off, cut_words, error_usage, truncated_error
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
 
 logger = logging.getLogger(__name__)
@@ -131,9 +132,12 @@ SHORT_CHARS = 6
 _OUT_PER_UNIT = 120
 _OUT_BASE = 20
 
-#: 未裁判的原因。前四个是上限，报告里写「已到上限」
+#: 未裁判的原因。前四个是上限，报告里写「已到上限」；truncated 是裁判模型的输出到了上限被截断（推理模型的思考也算在
+#: 额度里），和格式不对分开记：说成「格式有误」，人会去查提示词，真正该换的是模型
 LIMITS = ("max_claims", "max_cost_usd", "daily_max_usd", "timeout_s")
-REASONS = (*LIMITS, "error", "format", "missing", "on_demand")
+REASONS = (*LIMITS, "error", "format", "truncated", "missing", "on_demand")
+#: 输出被截断时给人看的建议，接在 budget.cut_words 的「裁判模型的输出达到上限（N token）被截断」后面
+TRUNCATED_ADVICE = "通常是推理占满了输出额度，可换用不带推理的裁判模型"
 
 JUDGE_ROLE = "你是报告核查员：逐句判断报告里的话，能不能被它挂的证据支持。你不写报告，也不改报告。"
 
@@ -1071,7 +1075,10 @@ async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | Non
     """问一次裁判：(判定清单, 模型的原始回复, 没成的原因, 调了几次模型)。
 
     先走结构化输出；不成（模型不支持、给的不是合法结构）先从原始回复里找 JSON，再退回纯文本调用、
-    从回复里抠 JSON。原因以 error: 开头的是调用本身失败，format 是格式不对。超时由调用方掐。
+    从回复里抠 JSON。原因以 error: 开头的是调用本身失败，format 是格式不对，truncated 是输出到了上限被截断
+    （Anthropic 的 stop_reason=max_tokens、OpenAI 系的 finish_reason=length，以及 openai 结构化输出抛的
+    LengthFinishReasonError）。结构化调用被截断的不再退回纯文本：推理占满额度时纯文本调用多半一样被截断，白花一次
+    额度。超时由调用方掐。
     """
     raws: list[BaseMessage] = []
     try:
@@ -1086,15 +1093,45 @@ async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | Non
             for found in [message_text(raw), *(c.get("args") for c in getattr(raw, "tool_calls", None) or [])]:
                 if (items := _items_of(found)) is not None:
                     return items, raws, None, 1
-    except Exception:  # noqa: BLE001 - 不支持结构化输出的模型退回文本解析
-        pass
+            if cut_off(raw):
+                return None, raws, _TRUNCATED, 1
+    except Exception as e:  # noqa: BLE001 - 不支持结构化输出的模型退回文本解析
+        if truncated_error(e):
+            return None, [*raws, *_spent(e)], _TRUNCATED, 1
     try:
         reply = await model.ainvoke(messages)
     except Exception as e:  # noqa: BLE001
+        if truncated_error(e):
+            return None, [*raws, *_spent(e)], _TRUNCATED, 2
         return None, raws, f"error:{describe_exception(e)}", 2
     raws.append(reply)
     items = _items_of(message_text(reply))
+    if items is None and cut_off(reply):
+        return None, raws, _TRUNCATED, 2
     return items, raws, None if items is not None else "format", 2
+
+
+#: _ask 交回的没成的原因：输出到了上限被截断
+_TRUNCATED = "truncated"
+
+
+def _spent(error: BaseException) -> list[BaseMessage]:
+    """截断时 openai 的异常带着这次的用量：折成一条空回复交给记账（额度是真花出去了，每日上限不能漏掉它）。"""
+    inp, out = error_usage(error)
+    if not (inp or out):
+        return []
+    return [AIMessage(content="", usage_metadata={"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out})]
+
+
+def _with_fallback(model: Any, spec: ModelSpec) -> BudgetFallback:
+    """裁判模型包一层：服务方嫌 MAX_TOKENS 太大时按 FALLBACK_MAX_TOKENS 重建一个再问（要退回时才建，平常不多建），之后
+    各批都用小的。经本模块的 get_chat_model 建：测试换成剧本时，小额度的那个也是剧本。"""
+
+    async def build() -> Any:
+        async with SessionLocal() as session:
+            return (await get_chat_model(session, spec.model_copy(update={"max_tokens": FALLBACK_MAX_TOKENS})))[0]
+
+    return BudgetFallback(model, build=build, limits=(spec.max_tokens, FALLBACK_MAX_TOKENS))
 
 
 def _unjudged(reason: str, rationale: str, *, judge: str | None, post_seal: bool) -> dict[str, Any]:
@@ -1124,6 +1161,8 @@ def _why_unjudged(reason: str, budget: Budget, detail: str = "", *, click: bool 
         return f"裁判失败：{detail}"[:120]
     if reason == "format":
         return detail or "裁判返回的结果格式有误，这句未裁判"
+    if reason == "truncated":
+        return f"{detail or cut_words('裁判模型', None)}，这句未裁判。{TRUNCATED_ADVICE}"
     if reason == "missing":
         return "裁判未对这句给出判定"
     return "探索运行按需裁判：点开这句并请模型判断后才会裁判"
@@ -1157,6 +1196,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
     try:
         async with SessionLocal() as session:
             model, model_id = await get_chat_model(session, spec)
+        model = _with_fallback(model, spec)
     except Exception as e:  # noqa: BLE001 - 裁判模型没配好：这回判不了，报告照常
         why = not_configured(e) if isinstance(e, ProviderNotConfigured) else describe_exception(e)
         details["error"] = f"裁判模型不可用（{why}）"
@@ -1269,6 +1309,14 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
             end = {"model": model_id, "purpose": "judge", "duration_ms": int((time.perf_counter() - began) * 1000),
                    "input_tokens": inp, "output_tokens": out, "total_tokens": inp + out,
                    "cost_usd": round(actual, 6), "calls": calls, "units": len(batch)}
+            if problem == _TRUNCATED:
+                # 输出到了上限被截断：这一批记未裁判，原因照实说是额度，不说「格式有误」「调用失败」。别的批照常问
+                # （同格式不对）：截断取决于这一批要想多久，不像鉴权、网关出错那样后面几批多半一样
+                limit = model.max_tokens
+                details["truncated"] = cut_words("裁判模型", limit)
+                emit(EventType.LLM_END, **end, error=details["truncated"], truncated=True, max_tokens=limit)
+                stop(batch, "truncated", details["truncated"])
+                continue
             if problem is not None and problem != "format":
                 reason = "timeout_s" if problem == "timeout_s" else "error"
                 detail = problem.partition(":")[2]
@@ -1402,6 +1450,8 @@ def _outcome(request: JudgeRequest, verdicts: dict[str, dict[str, Any]], budget:
             text = f"有 {n} 句结论未裁判：裁判调用失败（{details.get('error') or '原因不明'}）"
         elif reason == "format":
             text = f"有 {n} 句结论未裁判：裁判返回的结果格式有误"
+        elif reason == "truncated":
+            text = f"有 {n} 句结论未裁判：{details.get('truncated') or cut_words('裁判模型', None)}，{TRUNCATED_ADVICE}"
         else:
             text = f"有 {n} 句结论未获得裁判结果"
         gaps.append((reason, text))
