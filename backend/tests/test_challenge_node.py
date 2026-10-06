@@ -1128,6 +1128,88 @@ async def test_the_challenge_agent_never_sees_masked_values(monkeypatch, tmp_pat
         await engines.invalidate(source_id)
 
 
+async def test_masked_values_written_into_the_rationale_are_masked_in_any_shape(monkeypatch, tmp_path):
+    """复核第 1 轮：报告取数把遮罩列改了名字选出来（buyer_phone AS 手机号），摘录按列名遮不住，反方 agent 看得到号码，
+    把它换个写法写进理由（139-0000-0001、+86 139 0000 0002）。审稿记录里的理由正文、理由文档都换成「已遮罩」：值从这句
+    挂的报告快照里按 SQL 认出来收（和审批质询收报告快照的办法一样），连同 agent 查询时在工具边界遮掉的值；同时报告
+    快照里的值在反查之前就交给查询工具，agent 查到写着同一个号码的别的表时也看不到。以前理由原样存下、随运行封存。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": ["buyer_phone"]})
+    try:
+        sql = "SELECT region AS 区域, buyer_phone AS 手机号, amount AS 金额 FROM sales ORDER BY id"
+        said = "来自 139-0000-0001 号码的那笔属实，另有 +86 139 0000 0002 的一笔。"
+        plays = {"华东有一笔": Play(["SELECT COUNT(*) AS 笔数 FROM sales WHERE region = '华东'"], "stands", said)}
+        Models(monkeypatch, name, writer=("华东有一笔 [[v:Q1.r0.金额]] 的订单。[[see:Q1]]",), plays=plays)
+        row = await finish(graph(name, sql=sql), run_class="exploratory")
+        assert row.status == "succeeded", row.error
+        record = artifact_store.load((await output_of(row.id, "chal"))["challenge_artifact"])
+        [claim] = [c for c in record["claims"] if "华东有一笔" in c["text"]]
+        assert claim["verdict"] == "stands"
+        assert claim["rationale"] == "来自 已遮罩 号码的那笔属实，另有 已遮罩 的一笔。"
+        assert claim["rationale_doc"]["markdown"] == claim["rationale"]
+        assert claim["rationale_doc"]["source"] == claim["rationale"], "存下的原文也换掉"
+        shown = json.dumps(record, ensure_ascii=False)
+        assert "0000-0001" not in shown and "0000 0002" not in shown
+    finally:
+        await engines.invalidate(source_id)
+
+
+async def test_the_challenge_agent_does_not_see_report_values_in_other_tables(monkeypatch, tmp_path):
+    """报告取数选了手机号（遮罩列）；反方 agent 去查回访记录，备注里写着同一个号码（备注没设遮罩）。报告快照里的遮罩值
+    在反查之前就交给了查询工具：交给模型的备注里那一截已经是「已遮罩」，它的查询快照里也是。以前原样交给模型。"""
+    path = tmp_path / f"{uuid.uuid4().hex[:8]}.db"
+    db = sqlite3.connect(path)
+    db.executescript(
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, buyer_phone TEXT, amount INTEGER, refunded INTEGER);"
+        "INSERT INTO sales VALUES (1, '华东', '13900000001', 1200, 0), (2, '华南', '13900000003', 900, 0);"
+        "CREATE TABLE callbacks (id INTEGER PRIMARY KEY, region TEXT, note TEXT);"
+        "INSERT INTO callbacks VALUES (1, '华东', '客户 139-0000-0001 来电改址'), (2, '华南', '例行回访');")
+    db.commit()
+    db.close()
+    name = f"shop_{uuid.uuid4().hex[:8]}"
+    async with SessionLocal() as session:
+        row = DataSource(name=name, kind="sqlite", database=str(path), readonly=True, enabled=True,
+                         options={"mask_columns": ["buyer_phone"]})
+        session.add(row)
+        await session.flush()
+        row.schema_cache = await introspect.introspect(row)
+        await session.commit()
+        source_id = row.id
+    try:
+        sql = "SELECT region AS 区域, buyer_phone, amount AS 金额 FROM sales ORDER BY id"
+        notes = "SELECT region AS 区域, note AS 备注 FROM callbacks ORDER BY id"
+        plays = {"华东有一笔": Play([notes], "stands", "回访记录里有 [[v:Q1.r0.备注]]。[[see:Q1]]")}
+        models = Models(monkeypatch, name, writer=("华东有一笔 [[v:Q1.r0.金额]] 的订单。[[see:Q1]]",), plays=plays)
+        row = await finish(graph(name, sql=sql), run_class="exploratory")
+        assert row.status == "succeeded", row.error
+        seen = [str(m.content) for _, key, messages in models.calls if key == "华东有一笔"
+                for m in messages if isinstance(m, ToolMessage)]
+        assert any("客户 已遮罩 来电改址" in s for s in seen) and all("0000-0001" not in s for s in seen)
+        record = artifact_store.load((await output_of(row.id, "chal"))["challenge_artifact"])
+        [claim] = [c for c in record["claims"] if "华东有一笔" in c["text"]]
+        assert claim["rationale"] == "回访记录里有 客户 已遮罩 来电改址。"
+        snapshot = artifact_store.load(claim["queries"][0]["artifact"])
+        assert snapshot["rows"] == [["华东", "客户 已遮罩 来电改址"], ["华南", "例行回访"]]
+    finally:
+        await engines.invalidate(source_id)
+
+
+def test_values_written_in_the_claim_itself_are_kept_in_the_rationale():
+    """被审的那句结论原文里写着的号码已经摆在读者眼前：理由里复述它不换，别的号码照换。"""
+    from app.engine.evidence import compose_doc
+    from app.engine.masking import _Secrets
+    from app.engine.verify_agent import VerifyOutcome
+
+    secrets = _Secrets()
+    secrets.add({"columns": ["p"], "rows": [["13900000001"], ["13900000003"]]}, {"p"})
+    doc = compose_doc("号码 13900000003 的客户在华南，139-0000-0001 不在。", {}, node_id="chal", run_id="r1")
+    outcome = VerifyOutcome(result={"verdict": "stands", "rationale": doc["markdown"]}, cells=[], queries=[],
+                            rationale=doc, usage={})
+    masked = challenge_mod._masked_rationale(outcome, secrets, given=["号码 13900000003 的客户在华南。"])
+    assert masked.result["rationale"] == "号码 13900000003 的客户在华南，已遮罩 不在。"
+    assert masked.rationale["markdown"] == masked.result["rationale"] and masked.rationale["node_id"] == "chal"
+    assert challenge_mod._masked_rationale(outcome, _Secrets(), given=[]) is outcome, "没有遮罩值时原样"
+
+
 async def test_a_metric_excerpt_marks_the_report_query_numbers_too(monkeypatch, shop):
     """句子挂的是口径卡指标（正式报告的主路径「取数 → 口径卡 → 报告」）：摘录正文里「取自查询 Q1」「查询 Q1 的 SQL」
     也标成原报告的编号，和反查 agent 自己的 Q1 分开；工具按指标的输入取自的查询找源。"""

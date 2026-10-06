@@ -6,24 +6,29 @@
 质询（engine/inquiry.py）、双盲复算（nodes/dual_check.py，经 inquiry 的同名导出）共用：
 
 - 工具边界先遮（mask_query_result）：核查 agent 的查询结果交给模型、落进快照之前，取自遮罩列的格子换成「已遮罩」，
-  同一份结果里别的文字格夹着的遮罩值也换掉。模型看不到遮罩值，就不会把它写进回答、理由、SQL——事后按值认每一轮
-  复核都找到新的漏法，根治靠这一步；审批质询回答里的按值遮降为第二道防线
+  别的格子按值换：这份结果里的遮罩值，加上这个 agent 前面的查询遮掉的、调用方交进来的（报告快照里的）。模型看不到
+  遮罩值，就不会把它写进回答、理由、SQL——事后按值认每一轮复核都找到新的漏法，根治靠这一步；审批质询回答、反方
+  审稿理由里的按值遮降为第二道防线。查询失败时报错原话里的值也换（mask_error_text）
 
 - 哪些列（_derived_hidden）：从遮罩列本身起，按 SQL 一层层认出值取自遮罩列的结果列（别名、函数、子查询、WITH、UNION 的
-  另一支、和 * 写在同一支里没起别名的表达式）；COUNT 只数个数、窗口的分区键只决定次序、按遮罩列分档又当分组键或套在
-  汇总里数个数的不算（_value_columns、_band_only）。认不出落在哪一列的、SQL 解析不了又写着遮罩列的，整份快照的列都算
-- 只装着分档标签的列（_label_columns）：标签是 agent 写在 SQL 里的字，不当遮罩值
+  另一支、和 * 写在同一支里没起别名的表达式、FROM 里拆开遮罩列的表值函数）；COUNT 只数个数、窗口的分区键只决定次序、
+  按遮罩列分档又当分组键或套在汇总里数个数的、汇总里的 CASE 只在条件里用到的不算（_value_columns、_band_only）。认不出
+  落在哪一列的、SQL 解析不了又写着遮罩列的，整份快照的列都算。双盲复算按同一套认法在派盲算之前挡下取自遮罩列的指标
+  （derived_columns）
+- 只装着分档标签的列（_label_columns）：标签是 agent 写在 SQL 里的字，不当遮罩值；* 展开数据源里的表时按冻结的表结构
+  认它带不带同名的列（_schema_tables）
 - 哪些值（_Secrets）：遮罩列里出现过的值，按值认有门槛（SECRET_MIN、SECRET_DIGITS），换的时候先按词、按开头几个字筛出
-  正文里真有的那几个值，不现编上万个分支的正则；正文、文字格里换了写法的长号码（199-1474-2785、+86 …、全角数字）按
-  纯数字写法在集合里查（loose_spans）
-- 快照遮好的样子（_masked_view）
+  正文里真有的那几个值，不现编上万个分支的正则；正文、文字格、SQL 的字符串和注释里换了写法的长号码（199-1474-2785、
+  +86 …、全角数字）按纯数字写法在集合里查（loose_spans）；已经摆在读者眼前的值免遮，之后并进来的照样免（protected）
+- 快照遮好的样子（_masked_view），回答时才认得出、事后要照位置重放的地方（view_edits、replay_edits）
 
-除 mask_query_result、换了写法的号码之外，这里的函数原来都在 engine/inquiry.py 里，名字不变，inquiry 照旧导出（别处按
-inquiry 的名字引用）。
+除 mask_query_result、换了写法的号码和这一轮新加的几样之外，这里的函数原来都在 engine/inquiry.py 里，名字不变，
+inquiry 照旧导出（别处按 inquiry 的名字引用）。
 """
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import re
@@ -32,7 +37,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from app.engine.evidence import RenderError, render_cell
+from app.engine.evidence import MARKER_RE, RenderError, render_cell
 from app.engine.expressions import numeric_text
 from app.engine.merge_query import MERGE_SOURCE
 
@@ -70,7 +75,9 @@ def _masked_word() -> str:
 def _value_columns(node: Any) -> set[str]:
     """一个选出列的值取自哪些列（列名小写）。COUNT 里的只数个数，窗口的分区键、排序键只决定次序，结果全是写死常量的
     分档（_band_only：当分组键，或者套在汇总里按条件数个数）只决定一行落在哪一档，都带不出值，不算；套在里面的子查询
-    只看它选出来的列（它的条件、连接里写的列带不出值）。"""
+    只看它选出来的列（它的条件、连接里写的列带不出值）。汇总里的 CASE / IIF 只看各个结果：条件只决定这一行算不算进来，
+    同写在 WHERE 里（SUM(CASE WHEN buyer_phone IS NOT NULL THEN amount ELSE 0 END) 的值全部来自金额）；不汇总的逐行
+    CASE 照旧连条件一起算（每一行落在哪一支本身就是这一行的信息）。"""
     from sqlglot import exp
 
     out: set[str] = set()
@@ -82,6 +89,9 @@ def _value_columns(node: Any) -> set[str]:
                 out.add(item.name.lower())
         elif isinstance(item, exp.Count) or (isinstance(item, (exp.Case, exp.If)) and _band_only(item)):
             continue
+        elif isinstance(item, (exp.Case, exp.If)) and (results := _branch_results(item)) is not None \
+                and _aggregated(item):
+            stack.extend(r for r in results if r is not None)
         elif isinstance(item, exp.Window):
             stack.append(item.this)
         elif isinstance(item, exp.Select):
@@ -89,6 +99,18 @@ def _value_columns(node: Any) -> set[str]:
         else:
             stack.extend(item.iter_expressions())
     return out
+
+
+def _aggregated(node: Any) -> bool:
+    """node 套在同一层 SELECT 的汇总函数里（SUM(…)、AVG(…) OVER (…) 也算）。"""
+    from sqlglot import exp
+
+    parent = node.parent
+    while parent is not None and not isinstance(parent, (exp.Select, exp.Subquery)):
+        if isinstance(parent, exp.AggFunc):
+            return True
+        parent = parent.parent
+    return False
 
 
 def _branch_results(node: Any) -> list[Any] | None:
@@ -123,11 +145,8 @@ def _band_only(node: Any) -> bool:
     results = _branch_results(node)
     if results is None or not all(_fixed(r) for r in results):
         return False
-    parent = node.parent
-    while parent is not None and not isinstance(parent, (exp.Select, exp.Subquery)):
-        if isinstance(parent, exp.AggFunc):
-            return True
-        parent = parent.parent
+    if _aggregated(node):
+        return True
     item = node
     while isinstance(item.parent, (exp.Paren, exp.Alias)) and item.arg_key == "this":
         item = item.parent
@@ -145,7 +164,8 @@ def _band_only(node: Any) -> bool:
     return False
 
 
-def _label_columns(sql: Any, kind: str | None, columns: list[str]) -> dict[str, set[str]]:
+def _label_columns(sql: Any, kind: str | None, columns: list[str], tables: dict[str, set[str]] | None = None
+                   ) -> dict[str, set[str]]:
     """结果里只装着分档标签的列：列名（小写）→ 标签在格子里的写法。标签（CASE、IIF 写死的结果，分档的名字、档位编号）
     是 agent 自己写在 SQL 里的字，不是数据源里的值：这几列派生自遮罩列也不收进遮罩值（_Secrets.add），不然 SQL 里的
     标签、回答正文里的档名都会被换成「已遮罩」。
@@ -154,7 +174,8 @@ def _label_columns(sql: Any, kind: str | None, columns: list[str]) -> dict[str, 
     选出（SELECT vip_level）的名字就是它自己，永远算只装着标签，UNION 另一支、子查询里的遮罩列流进标签列也认不出，
     等级 1 撞上 THEN 1 就不收。取自数据源里的表的（哪怕和标签同名）、有一支装着别的、认不准的（说不清取自哪个来源、
     递归的 CTE、几支的 * 展开在哪说不清）都不算，照收（宁可多遮）；同名的几列有一列不算就都不算。解析不了的一个都
-    不算。"""
+    不算。tables 是查询当时冻结的表结构里每张表的列名（_schema_tables）：没写表名的 * 展开的表查得到、又没有同名的列
+    时，这张表带不出这一列（_table_lacks），不再因为它不算。"""
     from app.data.sql_semantics import _parse, _read
 
     try:
@@ -167,7 +188,8 @@ def _label_columns(sql: Any, kind: str | None, columns: list[str]) -> dict[str, 
         result = next((top for top, role, _listed in _blocks(root) if role == "result"), None)
         if result is None:
             return {}
-        memo: _LabelMemo = {}
+        memo = _LabelMemo()
+        memo.tables = tables
         found: dict[str, list[set[str] | None]] = {}
         for place, column in enumerate(columns):
             name = column.lower()
@@ -180,8 +202,42 @@ def _label_columns(sql: Any, kind: str | None, columns: list[str]) -> dict[str, 
 
 #: 标签列分析里「这个来源不出这一列」（_block_label、_source_label）：和 None（出这一列，但装着别的、认不准）分开
 _ABSENT: Any = object()
-#: 标签列分析记下的结果：(id(那块查询), 列名) → 标签的写法、None 或 _ABSENT
-_LabelMemo = dict[tuple[int, str], Any]
+
+
+class _LabelMemo(dict):  # type: ignore[type-arg]
+    """标签列分析记下的结果：(id(那块查询), 列名) → 标签的写法、None 或 _ABSENT。tables 是冻结的表结构里每张表的列名
+    （小写，_schema_tables），没有为 None。"""
+
+    tables: dict[str, set[str]] | None = None
+
+
+def _schema_tables(schema: Any) -> dict[str, set[str]] | None:
+    """冻结的表结构（数据源的 schema_cache、表结构快照的内容：{"tables": {表名: {"columns": [{"name": …}]}}}）→
+    {表名（小写）: 列名（小写）}，按登记的名字和不带库名的表名各记一份（几个库里同名的表合起来算，宁可多遮）。表结构
+    里没列出的表不记（截断了的表结构也一样），查不到就当说不清；整份拿不到的为 None。"""
+    tables = schema.get("tables") if isinstance(schema, dict) else None
+    if not isinstance(tables, dict):
+        return None
+    out: dict[str, set[str]] = {}
+    for key, meta in tables.items():
+        columns = meta.get("columns") if isinstance(meta, dict) else None
+        if not isinstance(columns, list):
+            continue
+        names = {str(c["name"]).lower() for c in columns if isinstance(c, dict) and c.get("name") is not None}
+        for name in {str(key).lower(), str(key).lower().rsplit(".", 1)[-1],
+                     str(meta.get("qualified") or key).lower().rsplit(".", 1)[-1]}:
+            out.setdefault(name, set()).update(names)
+    return out
+
+
+def _table_lacks(source: Any, name: str, memo: _LabelMemo) -> bool:
+    """FROM 里的这个来源是数据源里的一张表，冻结的表结构里查得到它、又没有 name 这一列：* 展开它带不出 name。"""
+    from sqlglot import exp
+
+    if not memo.tables or not isinstance(source, exp.Table) or not isinstance(source.this, exp.Identifier):
+        return False
+    columns = memo.tables.get(source.name.lower())
+    return columns is not None and name not in columns
 
 
 def _result_label(top: Any, place: int, name: str, width: int, memo: _LabelMemo) -> set[str] | None:
@@ -247,7 +303,8 @@ def _star_label(select: Any, name: str, memo: _LabelMemo, *, before: int | None 
         if not _is_star(item):
             continue
         qualifier = (item.table.lower() or None) if isinstance(item, exp.Column) else None
-        if qualifier is None and any(_derived_block(source) is None for _, source in _from_sources(select)):
+        if qualifier is None and any(_derived_block(source) is None and not _table_lacks(source, name, memo)
+                                     for _, source in _from_sources(select)):
             return None
         texts = _source_label(select, qualifier, name, memo)
         if texts is None:
@@ -275,7 +332,8 @@ def _source_label(select: Any, qualifier: str | None, name: str, memo: _LabelMem
     for _alias, source in sources:
         derived = _derived_block(source)
         if derived is None:
-            opaque = True
+            # 冻结的表结构里这张表没有这一列：它不出这一列，不算认不准
+            opaque = opaque or not _table_lacks(source, name, memo)
             continue
         texts = _block_label(derived[0], derived[1], name, memo)
         if texts is None:
@@ -376,6 +434,68 @@ def _derived_block(source: Any) -> tuple[Any, list[str] | None] | None:
     if not isinstance(node, (exp.Select, exp.SetOperation)):
         return None
     return node, ([c.name.lower() for c in alias.columns] if alias is not None and alias.columns else None)
+
+
+#: 表值函数常见的出列名：SQLite 的 json_each / json_tree（key、value、atom、fullkey、path），Postgres 的 jsonb_each
+#: （key、value），Spark 的 explode / posexplode（col、pos），Snowflake 的 FLATTEN（key、value、path、index、this）。
+#: 结构性的几列（id、parent、type）带不出值，不算——算上的话，同一条 SQL 里别的 id 列都会被遮
+_FUNCTION_COLUMNS = frozenset({"key", "value", "atom", "fullkey", "path", "col", "pos", "index", "this"})
+#: 出列名认得全的表值函数：出的是上面那几列，或者一列、名字就是别名（没起别名的是函数名）
+_TABLE_FUNCTIONS = frozenset({
+    "json_each", "json_tree", "jsonb_each", "jsonb_each_text", "json_each_text", "json_array_elements",
+    "json_array_elements_text", "jsonb_array_elements", "jsonb_array_elements_text", "json_object_keys",
+    "jsonb_object_keys", "unnest", "explode", "explode_outer", "posexplode", "regexp_split_to_table",
+    "string_to_table", "string_split", "openjson", "flatten",
+})
+
+
+def _function_sources(select: Any) -> list[Any]:
+    """一条 SELECT 的 FROM、JOIN、LATERAL VIEW 里说不清出哪些列、装着什么的来源：不是数据源里的表（含指向 WITH 的名字），
+    也不是子查询这类派生来源——表值函数（json_each、unnest、JSON_TABLE）、LATERAL 函数、VALUES。"""
+    from sqlglot import exp
+
+    sources = [source for _, source in _from_sources(select)] + list(select.args.get("laterals") or [])
+    out: list[Any] = []
+    for source in sources:
+        if _derived_block(source) is not None:
+            continue
+        node = source.this if isinstance(source, exp.Lateral) else source
+        if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier):
+            continue
+        out.append(source)
+    return out
+
+
+def _function_columns(source: Any) -> set[str] | None:
+    """表值函数这类来源出的列名（小写）：写的列名表、别名（Postgres 里一列的函数出的列就叫别名，没起别名的叫函数名）、
+    函数名、常见的出列名（_FUNCTION_COLUMNS）；JSON_TABLE 按 COLUMNS 里写的，VALUES 按 column1、column2…。不认得的函数
+    又没写列名表的，说不清出哪几列，为 None。"""
+    from sqlglot import exp
+
+    node = source.this if isinstance(source, exp.Lateral) else source
+    alias = source.args.get("alias") or (node.args.get("alias") if node is not source else None)
+    names: set[str] = set(_FUNCTION_COLUMNS)
+    listed: list[str] = []
+    if alias is not None:
+        if alias.name:
+            names.add(alias.name.lower())
+        listed = [c.name.lower() for c in alias.args.get("columns") or [] if c.name]
+        names |= set(listed)
+    func = node.this if isinstance(node, exp.Table) else node
+    while isinstance(func, exp.Subquery):
+        func = func.this
+    if isinstance(func, exp.JSONTable):
+        schema = func.args.get("schema")
+        defined = [str(c.name).lower() for c in (schema.expressions if schema is not None else []) if c.name]
+        return names | set(defined) if defined or listed else None
+    if isinstance(func, exp.Values):
+        width = max((len(row.expressions) for row in func.expressions if isinstance(row, exp.Tuple)), default=1)
+        return names | {f"column{i}" for i in range(1, width + 1)}
+    name = (func.name if isinstance(func, exp.Anonymous) else func.sql_name() if isinstance(func, exp.Func)
+            else "").lower()
+    if name:
+        names.add(name)
+    return names if listed or name in _TABLE_FUNCTIONS else None
 
 
 def _merging(select: Any, name: str) -> bool:
@@ -531,7 +651,9 @@ def _tainted(sql: str, kind: str | None, masked: set[str], width: int) -> tuple[
     不同层的也一并算上（宁可多遮）。
     位置是给没起别名的表达式用的（UPPER(buyer_phone) 的结果列名对不上任何名字）：和 * 写在同一支里的，* 前面的从头数、
     后面的从末尾倒着数。认不出的——两个 * 之间的项、派生来源里没起别名的表达式（外层的 * 会把它原样带出来，列名
-    又认不准）——整份快照的列都算（同解析不了）。"""
+    又认不准）——整份快照的列都算（同解析不了）。
+    FROM、JOIN、LATERAL 里的表值函数（json_each、unnest、JSON_TABLE、LATERAL VALUES）参数里写着这些名字的，它出的列
+    都算（_function_columns）：遮罩列是 JSON 时，json_each 拆开是最自然的写法。出哪几列说不清的整份快照都算。"""
     from sqlglot import exp
 
     from app.data.sql_semantics import _parse, _read
@@ -547,7 +669,9 @@ def _tainted(sql: str, kind: str | None, masked: set[str], width: int) -> tuple[
         selects = list(root.find_all(exp.Select))
         blocks = _blocks(root)
         sources = [(top, listed) for top, role, listed in blocks if role == "source"]
-        for _ in range(len(selects) + len(sources) + 1):
+        functions = [source for select_ in selects for source in _function_sources(select_)]
+        unreadable = False
+        for _ in range(len(selects) + len(sources) + len(functions) + 1):
             before = len(names)
             for select_ in selects:
                 for item in select_.expressions:
@@ -556,9 +680,14 @@ def _tainted(sql: str, kind: str | None, masked: set[str], width: int) -> tuple[
                         names.add(name)
             for top, listed in sources:
                 names |= _source_names(top, listed, names)[0]
+            for source in functions:
+                if names & _value_columns(source):
+                    columns = _function_columns(source)
+                    unreadable = unreadable or columns is None
+                    names |= columns or set()
             if len(names) == before:
                 break
-        everything = any(_source_names(top, listed, names)[1] for top, listed in sources)
+        everything = unreadable or any(_source_names(top, listed, names)[1] for top, listed in sources)
         positions: set[int] = set()
         for top, role, _listed in blocks:
             if role != "result":
@@ -598,12 +727,41 @@ def _derived_hidden(snapshot: dict[str, Any], hidden: set[str], kind: str | None
     return names | {columns[i].lower() for i in positions if i < len(columns)}, names
 
 
-def _snapshot_labels(snapshot: dict[str, Any], kind: str | None) -> dict[str, set[str]]:
-    """一份快照里只装着分档标签的列（_label_columns）。没有 SQL 的（合并查询）一个都不算。"""
+def derived_columns(snapshot: dict[str, Any], hidden: set[str], kind: str | None) -> set[str] | None:
+    """按 SQL 认出值取自遮罩列（hidden，小写）的结果列（小写，列名直接对上的也算）。SQL 解析不了、合并查询的快照（不看
+    SQL）为 None：认不准，宽严由调用方定（_derived_hidden 整份遮；双盲复算照常派盲算，由盲算自己的查询去认）。"""
+    sql = snapshot.get("sql")
+    if not hidden or not isinstance(sql, str) or not sql.strip() or snapshot.get("source") == MERGE_SOURCE:
+        return None
+    columns = [str(c) for c in snapshot.get("columns") or []]
+    found = _tainted(sql, kind, set(hidden), len(columns))
+    if found is None:
+        return None
+    names, positions = found
+    return {c.lower() for i, c in enumerate(columns) if c.lower() in names or i in positions}
+
+
+def _snapshot_labels(snapshot: dict[str, Any], kind: str | None, tables: dict[str, set[str]] | None = None
+                     ) -> dict[str, set[str]]:
+    """一份快照里只装着分档标签的列（_label_columns）。没有 SQL 的（合并查询）一个都不算。tables 没给的，按快照记着
+    的表结构快照（schema_artifact，查询当时冻结的）认。"""
     sql = snapshot.get("sql")
     if not isinstance(sql, str) or not sql.strip():
         return {}
-    return _label_columns(sql, kind, [str(c) for c in snapshot.get("columns") or []])
+    if tables is None and isinstance(snapshot.get("schema_artifact"), str):
+        tables = _frozen_tables(snapshot["schema_artifact"])
+    return _label_columns(sql, kind, [str(c) for c in snapshot.get("columns") or []], tables)
+
+
+@functools.lru_cache(maxsize=64)
+def _frozen_tables(artifact: str) -> dict[str, set[str]] | None:
+    """表结构快照工件里每张表的列名（_schema_tables）。工件按内容寻址、不会变，记下来；取不到、被改过的为 None。"""
+    from app.core import artifact_store
+
+    try:
+        return _schema_tables(artifact_store.load(artifact))
+    except Exception:  # noqa: BLE001 - 取不到就当不知道表结构（标签照旧当遮罩值，宁可多遮）
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -728,13 +886,17 @@ _WORDS = re.compile(r"[0-9A-Za-z_]+")
 _DIGITS = re.compile(r"\d[\d,]*(?:\.\d+)?")
 #: 中文这类遮罩值按开头几个字分桶找（_Secrets._partition）
 _PREFIX = 8
-#: 正文里一串允许夹分隔符的数字（换了写法的号码，见 _Secrets.loose_spans）：数字（含全角）之间夹着一到三个空格、连字符、
-#: 点、括号（含全角），开头可以带 + 和括号。逗号不算分隔符（千分位按 _DIGITS 认），冒号、斜杠也不算（时间、日期），不跨行
-_LOOSE_RUN = re.compile(r"[(（]?[+＋]?[(（]?[0-9０-９]+(?:[ \u3000\-‐‑‒–—－.．·・()（）]{1,3}[0-9０-９]+)*[)）]?")
+#: 正文里一串允许夹分隔符的数字（换了写法的号码，见 _Secrets.loose_spans）：数字（含全角）之间夹着一到四个分隔符，开头
+#: 可以带 + 和括号。分隔符是同一行里的各种空白（空格、制表符、全角空格、不换行空格，以及窄空格、细空格这类 U+2000 至
+#: U+200B、U+202F、U+205F）、连字符和减号（含全角、U+2010 至 U+2015、U+2212）、点（含全角、间隔号）、括号（含全角）。
+#: 逗号不算分隔符（千分位按 _DIGITS 认），冒号、斜杠也不算（时间、日期），不跨行
+_LOOSE_SEPARATORS = (" \t\u00a0\u2000-\u200b\u202f\u205f\u3000"
+                     "\\-\u2010-\u2015\u2212\uff0d.\uff0e\u00b7\u30fb()\uff08\uff09")
+_LOOSE_RUN = re.compile(rf"[(（]?[+＋]?[(（]?[0-9０-９]+(?:[{_LOOSE_SEPARATORS}]{{1,4}}[0-9０-９]+)*[)）]?")
 _LOOSE_DIGITS = re.compile(r"[0-9０-９]+")
 #: 两截数字之间只隔着这样一个字（不带空格）：是更长的编号、小数、日期的两截（13900000001-2、13900000001.5），号码到这里
-#: 不算完——同 _pattern 里「前后不能是 [.:/-] 加数字」
-_JOINERS = frozenset("-‐‑‒–—－.．")
+#: 不算完——同 _pattern 里「前后不能是 [.:/-] 加数字」。减号（U+2212）、全角连字符同连字符
+_JOINERS = frozenset("-\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d.\uff0e")
 _POINTS = frozenset(".．")
 #: 去掉国家码（0086、86）之后至少还要有这么多位才算号码（固话号码最短 7 位）：86 开头的短数不拆
 _LOCAL_MIN = 7
@@ -857,11 +1019,13 @@ class _Secrets:
     留着的阈值、行数（去掉千分位、正负号的数字），只在回答正文里不换（scrub 的 prose）。换的时候先按词、按开头两个
     字筛出正文里真有的那几个值，再拿它们现编正则：遮罩值上万个时，现编一个上万分支的正则要一秒上下，每次都卡住整个进程。
     正文、文字格里另认换了写法的长号码（199-1474-2785、+86 199 1474 2785、全角数字，见 loose_spans）：按纯数字写法
-    在集合里查，不进正则。"""
+    在集合里查，不进正则。protected 是 protect 收下的、已经摆在读者眼前的文字：之后并进来的值（核查 agent 后面的
+    查询遮掉的）照样按它们免遮。"""
 
     strong: set[str] = field(default_factory=set)
     weak: set[str] = field(default_factory=set)
     shown: set[str] = field(default_factory=set)
+    protected: tuple[str, ...] = ()
     _index: Any = field(default=None, repr=False, compare=False)
     _compiled: dict[frozenset[str], re.Pattern[str]] = field(default_factory=dict, repr=False, compare=False)
 
@@ -899,8 +1063,10 @@ class _Secrets:
         self._index = None
 
     def merge(self, other: _Secrets | None) -> None:
-        """并进另一份收好的遮罩值（核查 agent 查询时在工具边界遮掉的，见 mask_query_result）。合起来最多 SECRETS_MAX 种。"""
-        if other is None or not other.weak:
+        """并进另一份收好的遮罩值（核查 agent 查询时在工具边界遮掉的，见 mask_query_result）。合起来最多 SECRETS_MAX 种。
+        两边免遮的文字合起来，并进来的值照样按它们免遮：报告的指标正好等于某一笔金额时，agent 查出了那一笔，别的查询里
+        正好是这个数的格子也不遮。"""
+        if other is None:
             return
         for form in other.weak:
             if len(self.weak) >= SECRETS_MAX:
@@ -908,14 +1074,23 @@ class _Secrets:
             self.weak.add(form)
             if form in other.strong:
                 self.strong.add(form)
+        self.protected = tuple(dict.fromkeys((*self.protected, *other.protected)))
         self._index, self._compiled = None, {}
+        if self.protected:
+            self._spare(" ".join(self.protected))
 
     def protect(self, texts: Iterable[str | None]) -> None:
         """已经摆在读者眼前的值不换：提问人自己写进问题、选中原文里的（「13900000001 这位客户」「排除 300 以下的」），
-        报告里列出的指标、运行输入的值——换了只会让回答、查询对不上问题和报告。正文、格子、SQL 里都不换。"""
+        报告里列出的指标、运行输入的值——换了只会让回答、查询对不上问题和报告。正文、格子、SQL 里都不换。文字记下来，
+        之后并进来的值照样免遮（merge）。"""
         given = " ".join(t for t in texts if t)
         if not given:
             return
+        self.protected = tuple(dict.fromkeys((*self.protected, given)))
+        self._spare(given)
+
+    def _spare(self, given: str) -> None:
+        """去掉 given（几段免遮的文字）里写着的值。"""
         numbers = {_digits_of(n) for n in _DIGITS.findall(given)}
         # 换了写法写进来的号码（「199-1474-2785 这位客户」）按纯数字写法认
         reformatted = {key for _, _, key in self.loose_spans(given)}
@@ -958,15 +1133,40 @@ class _Secrets:
 
     def scrub(self, text: str, *, prose: bool = False, loose: bool | None = None) -> str:
         """text 里的遮罩值换成「已遮罩」。prose：这是回答正文，SQL 里照原样留着的阈值、行数不换（show）。loose：换了写法
-        的长号码也换（loose_spans），缺省同 prose——只在正文、文字格里这样认，SQL 里的 199-1474-2785 是一个算式。"""
+        的长号码也换（loose_spans），缺省同 prose——正文、文字格、SQL 的字符串和注释里这样认，SQL 里不带引号的
+        199-1474-2785 是一个算式。"""
+        return self.swap(text, prose=prose, loose=loose)[0]
+
+    def swap(self, text: str, *, prose: bool = False, loose: bool | None = None) -> tuple[str, list[str]]:
+        """scrub，另交回换掉了哪些值：按值认出的照原文的写法，换了写法的号码交它的纯数字写法（SQL 里同一个数写成阈值的
+        据此不留，见 inquiry._swap_literal）。"""
+        hits = self._hits(text, prose=prose, loose=loose)
+        word = _masked_word()
+        for start, end, _ in reversed(hits):
+            text = text[:start] + word + text[end:]
+        return text, [value for _, _, value in hits]
+
+    def spans(self, text: str, *, prose: bool = False, loose: bool | None = None) -> list[tuple[int, int]]:
+        """scrub 会换掉的那几段（起, 止），按先后、不重叠。质询工件按位置重放回答时换掉的地方（view_edits）。"""
+        return [(start, end) for start, end, _ in self._hits(text, prose=prose, loose=loose)]
+
+    def _hits(self, text: str, *, prose: bool, loose: bool | None) -> list[tuple[int, int, str]]:
+        """text 里要换掉的遮罩值：(起, 止, 值)，按先后、不重叠。换了写法的号码先认（+86 19914742785 整个换掉，不留下
+        一截「+86」），按值认的落在它们里面的不再算。"""
         if not text or not self.strong:
-            return text
-        if prose if loose is None else loose:
-            # 先换换了写法的：+86 19914742785 整个换掉，不留下一截「+86」
-            for start, end, _ in reversed(self.loose_spans(text, prose=prose)):
-                text = text[:start] + _masked_word() + text[end:]
+            return []
+        hits = [(start, end, key) for start, end, key in self.loose_spans(text, prose=prose)] \
+            if (prose if loose is None else loose) else []
         pattern = self.pattern(text, prose=prose)
-        return pattern.sub(_masked_word(), text) if pattern is not None else text
+        if pattern is not None:
+            taken = list(hits)
+            hits += [(m.start(), m.end(), m.group()) for m in pattern.finditer(text)
+                     if not any(m.start() < end and start < m.end() for start, end, _ in taken)]
+        return sorted(hits)
+
+    def copy(self) -> _Secrets:
+        """另一份一样的遮罩值（改它不影响这一份）：交给线程、按句另加免遮的值时用。"""
+        return _Secrets(strong=set(self.strong), weak=set(self.weak), shown=set(self.shown), protected=self.protected)
 
     def loose_spans(self, text: str, *, prose: bool = False) -> list[tuple[int, int, str]]:
         """text 里换了写法的长号码（199-1474-2785、(199)1474-2785、+86 199 1474 2785、全角数字……）：(起, 止, 纯数字
@@ -1058,6 +1258,34 @@ class _Secrets:
         return self._index
 
 
+#: 单元格引用的前一截（Q1.r0.）：后面才是列名
+_CELL_HEAD = re.compile(r"^\s*[QK]\d+\.r\d+\.")
+
+
+def _scrubbed_source(text: str, secrets: _Secrets) -> str:
+    """回答原文里的遮罩值换成「已遮罩」：标记之外按正文的办法换（SQL 里照原样留着的阈值不换）；标记里的按段换（| 隔开
+    的几段各自换），单元格引用只换列名那一截——编号、行号换不出东西，整段换的话「r0.」会让列名开头的长号码看着像小数
+    的一截，反而认不出来。列名照快照、SQL 里的名字那样换（阈值也换，换了写法的号码也认），换得一样才对得上。
+    标记里写着遮罩值的引用换完多半解析不了（列名里写着遮罩值的除外：快照的列名也换过了，正好对上），宁可弄坏一个
+    引用，也不让值留在存下的原文、片段里，或者从解析不了的占位里露出来。"""
+    if not text or not secrets.strong:
+        return text
+    out: list[str] = []
+    last = 0
+    for m in MARKER_RE.finditer(text):
+        out.append(secrets.scrub(text[last:m.start()], prose=True))
+        start, end = m.span("body")
+        parts = text[start:end].split("|")
+        head = _CELL_HEAD.match(parts[0]) if m.group("kind").strip() == "v" else None
+        first = parts[0][:head.end()] + secrets.scrub(parts[0][head.end():], loose=True) if head \
+            else secrets.scrub(parts[0], prose=True)
+        parts = [first, *(secrets.scrub(p, prose=True) for p in parts[1:])]
+        out.append(text[m.start():start] + "|".join(parts) + text[end:m.end()])
+        last = m.end()
+    out.append(secrets.scrub(text[last:], prose=True))
+    return "".join(out)
+
+
 def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, *, embedded: bool = False,
                  rename: bool = True) -> tuple[dict[str, Any], list[str]]:
     """一份查询快照遮好的样子和遮掉的列：要遮的列（hidden，小写）每一格都换成「已遮罩」、类型记成文本（渲染时不当数）；
@@ -1068,22 +1296,30 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     embedded 只给质询工件用：别的列里一格文字夹着遮罩值（备注里写着手机号，换了写法的也算），把那一截换成「已遮罩」，
     这一格别的字照原样，门槛同整格（_Secrets.scrub）；这一列不记进遮掉的列——界面把记进去的列整列画成「已遮罩」，这一列在数据源
     里也没设遮罩。回答一路不这样换：渲染出来露了就整份不交（_leaked），不然回答被问的那一格看着像查到了别的东西。
-    rename 为假时列名不换（工具边界先遮时：列名是模型自己写的，换了它引用的列名就对不上）。"""
+    rename 为假时列名不换（工具边界先遮时：列名是模型自己写的，换了它引用的列名就对不上）。列名按文字的办法换（换了写法的
+    号码也认，同 SQL 里带引号的名字）。
+    工具边界遮过的快照（记着 masked_at_query）里，整格就是「已遮罩」的是查询时按值换掉的：这一列照样记进遮掉的列，和回答时
+    按值换掉的一样画。"""
     columns = [str(c) for c in snapshot.get("columns") or []]
     index = {i for i, c in enumerate(columns) if c.lower() in hidden}
     by_value = bool(secrets.strong)
-    if not index and not by_value:
+    premasked = "masked_at_query" in snapshot
+    if not index and not by_value and not premasked:
         return snapshot, []
     word = _masked_word()
     touched = set(index)
     edited = False
     position = {c: i for i, c in enumerate(columns)}
-    names = [secrets.scrub(c) for c in columns] if by_value and rename else columns
+    names = [secrets.scrub(c, loose=True) for c in columns] if by_value and rename else columns
 
     def cell(i: int | None, value: Any) -> Any:
         nonlocal edited
         if i in index:
             return word
+        if premasked and value == word:
+            if i is not None:
+                touched.add(i)
+            return value
         if by_value and secrets.hit(value):
             if i is not None:
                 touched.add(i)
@@ -1119,6 +1355,122 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     return view, [names[i] for i in sorted(touched)]
 
 
+def _cell_text(value: Any) -> str | None:
+    """一格按文字换的样子（_masked_view 的 embedded）：文字照原样，JSON（对象、数组）按界面画出来的样子；别的为 None。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return None
+
+
+def view_edits(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, baseline: _Secrets
+               ) -> dict[str, Any] | None:
+    """质询工件按回答时的办法遮（_masked_view 的 embedded）时，secrets 比 baseline 多换掉的地方，相对原快照记成位置，
+    不含值：{"cells": [[行, 列], …]（整格换成「已遮罩」）, "spans": [[行, 列, 起, 止], …]（文字格里换掉的那一截，起止按
+    这一格的文字算）, "names": [[列, 起, 止], …]（列名里换掉的那一截）, "masked": [列名, …]（因此画成遮罩列的）}；没有
+    多换的为 None。
+    agent 先查了备注（那时还不知道备注里的号码是遮罩值，原样交回、原样存下），后来又查出了手机号（查询时遮掉，值只在
+    内存里）：回答时按内存里的值（secrets）认得出，事后取质询工件时只剩 baseline 认得出的。这份位置记进质询事件，
+    事后照着再换一遍（replay_edits）。行是字典的快照不记（核查的查询快照都是行列表）。"""
+    full, full_masked = _masked_view(snapshot, hidden, secrets, embedded=True)
+    base, base_masked = _masked_view(snapshot, hidden, baseline, embedded=True)
+    if full is base:
+        return None
+    word = _masked_word()
+    cells: list[list[int]] = []
+    spans: list[list[int]] = []
+    for r, (row, shown, plain) in enumerate(zip(snapshot.get("rows") or [], full["rows"], base["rows"])):
+        if not (isinstance(row, list) and isinstance(shown, list) and isinstance(plain, list)):
+            continue
+        for c, (value, now, before) in enumerate(zip(row, shown, plain)):
+            if now == before:
+                continue
+            if now == word:
+                cells.append([r, c])
+            elif (text := _cell_text(value)) is not None:
+                spans += [[r, c, start, end] for start, end in secrets.spans(text, loose=True)]
+    columns = [str(c) for c in snapshot.get("columns") or []]
+    full_names, base_names = full.get("columns", columns), base.get("columns", columns)
+    names = [[i, start, end] for i, (column, now, before) in enumerate(zip(columns, full_names, base_names))
+             if now != before for start, end in secrets.spans(column, loose=True)]
+    # 按位置比：同一列在两边可能叫不同的名字（列名里的值只有一边换了）
+    already = {i for i, name in enumerate(base_names) if name in base_masked}
+    masked = [name for i, name in enumerate(full_names) if name in full_masked and i not in already]
+    if not (cells or spans or names or masked):
+        return None
+    return {"cells": cells, "spans": spans, "names": names, "masked": masked}
+
+
+def replay_edits(snapshot: dict[str, Any], edits: Iterable[Any]) -> dict[str, Any]:
+    """照记下的位置（view_edits，可能有好几份：同一份快照被几条质询引用）把回答时换掉的地方再换一遍。位置对不上的
+    （行、列越界，起止不合理，形状不对）跳过：记录是封存的事件，坏了也不能让取工件出错。没有可换的返回原快照。"""
+    rows = snapshot.get("rows")
+    columns = [str(c) for c in snapshot.get("columns") or []]
+    if not isinstance(rows, list):
+        return snapshot
+
+    def ints(entry: Any, size: int) -> list[int] | None:
+        ok = isinstance(entry, list) and len(entry) == size and all(
+            isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in entry)
+        return entry if ok else None
+
+    whole: set[tuple[int, int]] = set()
+    parts: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    heads: dict[int, list[tuple[int, int]]] = {}
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+        for entry in edit.get("cells") or []:
+            if (at := ints(entry, 2)) is not None:
+                whole.add((at[0], at[1]))
+        for entry in edit.get("spans") or []:
+            if (at := ints(entry, 4)) is not None and at[2] < at[3]:
+                parts.setdefault((at[0], at[1]), []).append((at[2], at[3]))
+        for entry in edit.get("names") or []:
+            if (at := ints(entry, 3)) is not None and at[1] < at[2]:
+                heads.setdefault(at[0], []).append((at[1], at[2]))
+    word = _masked_word()
+
+    def swapped(text: str, cuts: list[tuple[int, int]]) -> str:
+        merged: list[list[int]] = []
+        for start, end in sorted(cuts):
+            if end > len(text):
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        for start, end in reversed(merged):
+            text = text[:start] + word + text[end:]
+        return text
+
+    out_rows: list[Any] = []
+    changed = False
+    for r, row in enumerate(rows):
+        if not isinstance(row, list):
+            out_rows.append(row)
+            continue
+        new_row = list(row)
+        for c, value in enumerate(row):
+            if (r, c) in whole:
+                new_row[c] = word
+            elif (r, c) in parts and (text := _cell_text(value)) is not None:
+                new_row[c] = swapped(text, parts[(r, c)])
+        changed = changed or new_row != row
+        out_rows.append(new_row)
+    names = [swapped(name, heads[i]) if i in heads else name for i, name in enumerate(columns)]
+    if not changed and names == columns:
+        return snapshot
+    view = {**snapshot, "rows": out_rows}
+    if names != columns:
+        view["columns"] = names
+        if isinstance(snapshot.get("column_types"), dict):
+            rename = dict(zip(columns, names))
+            view["column_types"] = {rename.get(str(k), k): v for k, v in snapshot["column_types"].items()}
+    return view
+
+
 # --------------------------------------------------------------------------
 # 工具边界：查询结果交给核查 agent 之前先遮
 # --------------------------------------------------------------------------
@@ -1137,33 +1489,77 @@ class QueryMask:
     secrets: _Secrets
 
 
-def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str | None) -> QueryMask:
+def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str | None,
+                      known: _Secrets | None = None, *, schema: Any = None) -> QueryMask:
     """一份查询结果（tools/datasource 的查询工具交回的样子：columns / rows / column_types / sql）在交给核查 agent、落进
-    快照之前先遮。masked 是数据源设了遮罩的列，kind 是数据源的类型（SQL 按它的方言解析）。
+    快照之前先遮。masked 是数据源设了遮罩的列，kind 是数据源的类型（SQL 按它的方言解析）。known 是此前已经认出的遮罩值：
+    这个 agent 前面的查询遮掉的，加上调用方交进来的（审批质询、反方审稿收的报告快照里的值）。schema 是数据源的表结构
+    （schema_cache，和随快照冻结的是同一份），认分档标签时用（_label_columns 的 tables）。
 
     - 整列遮：列名直接对上遮罩列的，加上按 SQL 认出值取自遮罩列的（_derived_hidden：别名、函数、子查询、WITH、
-      SELECT *；COUNT、只在条件里用到、分档当分组键的不算）；SQL 解析不了、又写着遮罩列的，整份结果的列都遮。这几列的
-      格子换成「已遮罩」，类型记成文本
-    - 别的列：整格就是这份结果里某个遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，_Secrets.loose_spans）；
-      门槛同按值遮（SECRET_DIGITS、SECRET_MIN），只装着分档标签的列里的标签不算遮罩值
-    - 列名不换（模型自己写的，换了它引用的列名就对不上）；结果里一列都没取自遮罩列的原样交回：数值的汇总、只数个数的
-      查询不受影响
+      SELECT *、表值函数；COUNT、只在条件里用到、分档当分组键的不算）；SQL 解析不了、又写着遮罩列的，整份结果的列都遮。
+      这几列的格子换成「已遮罩」，类型记成文本
+    - 别的列按值换：整格就是遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，_Secrets.loose_spans）。遮罩值
+      是这份结果里的加上 known：先查号码、再查写着号码的备注、没设遮罩的联系方式表（别的库里的也一样）时，后一份同样
+      遮好。门槛同按值遮（SECRET_DIGITS、SECRET_MIN）；只装着分档标签的列里的标签不算遮罩值，这份结果自己写的标签也不
+      按 known 换（前面的查询认不准、当遮罩值收了的同名标签，不能把这一份的档位列换掉）
+    - 列名不换（模型自己写的，换了它引用的列名就对不上）；结果里一列都没取自遮罩列、也没有可按值换的原样交回：数值的
+      汇总、只数个数的查询不受影响
 
-    分析本身出了意外，整份结果的列都遮：这一步挡在模型前面，分析的缺陷不能把原值放过去（宁可多遮）。"""
+    交回的 secrets 只有这份结果里的遮罩值（known 调用方自己有）。分析本身出了意外，整份结果的列都遮：这一步挡在模型
+    前面，分析的缺陷不能把原值放过去（宁可多遮）。"""
     base = {str(c).strip().lower() for c in masked if str(c).strip()}
     columns = [str(c) for c in payload.get("columns") or []]
-    if not base or not columns or not _query_shaped(payload):
+    given = known is not None and bool(known.strong)
+    if not (base or given) or not columns or not _query_shaped(payload):
         return QueryMask(payload, [], _Secrets())
     try:
-        hidden, _ = _derived_hidden(payload, base, kind)
-        if not any(c.lower() in hidden for c in columns):
-            return QueryMask(payload, [], _Secrets())
-        secrets = _Secrets()
-        secrets.add(payload, hidden, labels=_snapshot_labels(payload, kind), base=base)
-        secrets.prepare()
-        view, _ = _masked_view(payload, hidden, secrets, embedded=True, rename=False)
+        hidden = _derived_hidden(payload, base, kind)[0] if base else set()
+        own = _Secrets()
+        labels = _snapshot_labels(payload, kind, _schema_tables(schema))
+        if any(c.lower() in hidden for c in columns):
+            own.add(payload, hidden, labels=labels, base=base)
+        pool = own
+        if given:
+            pool = own.copy()
+            pool.merge(known)
+            # 这份结果自己写的标签（CASE 写死的档名）不当遮罩值，哪怕前面的查询把同名的字收了
+            if written := [text for name, texts in labels.items() if name not in base for text in texts]:
+                pool.protect(written)
+        if not pool.strong and not any(c.lower() in hidden for c in columns):
+            return QueryMask(payload, [], own)
+        pool.prepare()
+        view, _ = _masked_view(payload, hidden, pool, embedded=True, rename=False)
     except Exception:  # noqa: BLE001 - 认不准就整份遮掉，原值不交给模型
         logger.warning("核查查询的遮罩分析出错，整份结果按遮罩处理", exc_info=True)
-        hidden, secrets = {c.lower() for c in columns}, _Secrets()
-        view, _ = _masked_view(payload, hidden, secrets, rename=False)
-    return QueryMask(view, [c for c in columns if c.lower() in hidden], secrets)
+        hidden, own = {c.lower() for c in columns}, _Secrets()
+        view, _ = _masked_view(payload, hidden, own, rename=False)
+    return QueryMask(view, [c for c in columns if c.lower() in hidden], own)
+
+
+#: 查询报错里引号括起来的一段（Postgres、DuckDB、MySQL 把转换失败的值写在引号里：invalid input syntax for type
+#: bigint: "139-0000-0001"）。引号前后紧挨着字母数字的不算（can't、isn't 里的撇号）
+_QUOTED_ERROR = re.compile(r"(?<![0-9A-Za-z_])(\"[^\"\n]*\"|'[^'\n]*')(?![0-9A-Za-z_])")
+#: 报错里不带引号的长数（DuckDB：Type INT64 with value 13900000001 can't be cast）
+_ERROR_NUMBER = re.compile(r"(?<![0-9A-Za-z_.])\d{%d,}(?![0-9A-Za-z_])" % SECRET_DIGITS)
+
+
+def mask_error_text(message: str, sql: str, known: _Secrets | None = None) -> str:
+    """查询失败时交给核查 agent、写进 tool.end 的报错原话。驱动的原话是模型改写 SQL 的线索，可数据库会在报错里带上
+    数据里的值（类型转换失败、越界），数据源设了遮罩时交出去之前先换：引号里的一段、不带引号的长数，SQL 里没写着的
+    换成「已遮罩」——SQL 里写着的是模型自己写的表名、列名、字面量，照留，它要靠这些改写；此前查询遮掉的值（known）
+    按值换。不认得是不是数据的也换（多遮）：报错只是线索，说不全也不耽误改写。"""
+    if not message:
+        return message
+    word = _masked_word()
+    lowered = sql.lower()
+
+    def quoted(m: re.Match[str]) -> str:
+        inner = m.group(1)[1:-1]
+        if not inner.strip() or inner.lower() in lowered:
+            return m.group()
+        return m.group(1)[0] + word + m.group(1)[-1]
+
+    out = _QUOTED_ERROR.sub(quoted, message)
+    out = _ERROR_NUMBER.sub(lambda m: m.group() if m.group() in sql else word, out)
+    return known.scrub(out, loose=True) if known is not None and known.strong else out

@@ -137,3 +137,73 @@ def test_many_masked_numbers_are_matched_without_stalling():
     out = secrets.scrub(text, prose=True)
     assert time.perf_counter() - began < 2.0
     assert "199-0000" not in out and out.count(MASKED) == text.count("199-0000")
+
+
+#: 复核第 1 轮：别的空白、减号作分隔符的写法（模型输出里不换行空格、窄空格并不少见）
+OTHER_SEPARATORS = [
+    pytest.param("199 1474 2785", id="不换行空格"),
+    pytest.param("199 1474 2785", id="窄不换行空格"),
+    pytest.param("199 1474 2785", id="细空格"),
+    pytest.param("199 1474 2785", id="发丝空格"),
+    pytest.param("199\t1474\t2785", id="制表符"),
+    pytest.param("199−1474−2785", id="减号"),
+    pytest.param("199    1474    2785", id="四个空格"),
+    pytest.param("199 - 1474 - 2785", id="连字符两边带空格"),
+    pytest.param("+86 199 1474 2785", id="+86 加不换行空格"),
+]
+
+
+@pytest.mark.parametrize("written", OTHER_SEPARATORS)
+def test_numbers_split_by_other_spaces_and_minus_signs_are_masked_too(written):
+    secrets = secrets_of([PHONE])
+    assert secrets.scrub(f"客户 {written} 来电", prose=True) == f"客户 {MASKED} 来电"
+    assert inquiry_mod._leaked({"markdown": f"来电的是 {written}。", "blocks": []}, secrets)
+    assert secrets.hit(written), "整格就是这个号码的，格子按值认"
+
+
+def test_a_line_break_still_ends_a_number():
+    """不跨行：两行各写一截的不拼成一个号码。"""
+    secrets = secrets_of([PHONE])
+    assert secrets.scrub("编号 199\n1474 2785", prose=True) == "编号 199\n1474 2785"
+
+
+@pytest.mark.parametrize("sql, sealed", [
+    pytest.param("SELECT COUNT(*) AS 笔数 FROM callbacks WHERE note LIKE '%199-1474-2785%'",
+                 f"SELECT COUNT(*) AS 笔数 FROM callbacks WHERE note LIKE '%{MASKED}%'", id="LIKE 里的一截"),
+    pytest.param("SELECT COUNT(*) AS 笔数 FROM callbacks WHERE note = '客户 199 1474 2785 来电'",
+                 f"SELECT COUNT(*) AS 笔数 FROM callbacks WHERE note = '客户 {MASKED} 来电'", id="字符串里夹着"),
+    pytest.param('SELECT note AS "199-1474-2785 的备注" FROM callbacks',
+                 f'SELECT note AS "{MASKED} 的备注" FROM callbacks', id="带引号的列名"),
+    pytest.param("SELECT COUNT(*) AS 笔数 FROM callbacks /* 客户 199-1474-2785 */",
+                 f"SELECT COUNT(*) AS 笔数 FROM callbacks /* 客户 {MASKED} */", id="块注释"),
+    pytest.param("SELECT COUNT(*) AS 笔数 FROM callbacks -- 客户 199 1474 2785\n WHERE id = 1",
+                 f"SELECT COUNT(*) AS 笔数 FROM callbacks -- 客户 {MASKED}\n WHERE id = 1", id="行注释"),
+])
+def test_a_reformatted_number_in_sql_strings_names_and_comments_is_masked(sql, sealed):
+    """SQL 里字符串、带引号的名字、注释里换了写法的号码也认（以前只有整个字面量就是号码的才换）。"""
+    assert inquiry_mod._scrub_sql(sql, secrets_of([PHONE]), set(), "sqlite") == sealed
+
+
+def test_a_bare_number_expression_in_sql_is_still_left_alone():
+    """不带引号的 199-1474-2785 在 SQL 里是一个算式（三个数相减），照旧不按号码认。"""
+    sql = "SELECT 199-1474-2785 AS x FROM callbacks"
+    assert inquiry_mod._scrub_sql(sql, secrets_of([PHONE]), set(), "sqlite") == sql
+
+
+def test_a_threshold_matching_a_number_swapped_in_a_string_is_not_kept():
+    """字符串里按换了写法认出、换掉的号码，同一条 SQL 里写成阈值的同一个数也不留（不然阈值把它露了）。"""
+    sql = f"SELECT COUNT(*) AS 笔数 FROM callbacks WHERE note LIKE '%199-1474-2785%' AND phone_no >= {PHONE}"
+    sealed = inquiry_mod._scrub_sql(sql, secrets_of([PHONE]), set(), "sqlite")
+    assert PHONE not in sealed and "1474" not in sealed
+
+
+def test_a_reformatted_number_in_a_column_name_is_masked_like_the_sql():
+    """agent 把换了写法的号码写进列名（AS "139-0000-0001 的单"）：质询工件的列名、回答里引用这一列的标记照 SQL 里带引号
+    的名字一样换，三处对得上。"""
+    secrets = secrets_of(["13900000001"])
+    snapshot = {"columns": ["139-0000-0001 的单"], "rows": [[3]]}
+    view, _ = _masked_view(snapshot, set(), secrets)
+    assert view["columns"] == [f"{MASKED} 的单"]
+    assert inquiry_mod._scrub_sql('SELECT COUNT(*) AS "139-0000-0001 的单" FROM sales', secrets, set(), "sqlite") == (
+        f'SELECT COUNT(*) AS "{MASKED} 的单" FROM sales')
+    assert inquiry_mod._scrubbed_source("共 [[v:Q1.r0.139-0000-0001 的单]] 单。", secrets) == f"共 [[v:Q1.r0.{MASKED} 的单]] 单。"

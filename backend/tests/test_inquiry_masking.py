@@ -402,6 +402,66 @@ def test_a_label_ahead_of_a_star_or_alone_behind_one_is_still_a_label_column(sql
     assert inquiry_mod._label_columns(sql, "sqlite", ["档"]) == {"档": {"0", "1"}}
 
 
+#: 没写表名的 * 连着数据源里的表和装着标签的派生来源
+STAR_JOIN = ("SELECT * FROM sales s JOIN (SELECT id AS bid, CASE WHEN amount > 1000 THEN '大单' ELSE '小单' END AS 档 "
+             "FROM sales) b ON s.id = b.bid")
+STAR_COLUMNS = ["id", "region", "amount", "bid", "档"]
+
+
+def test_a_star_over_a_table_known_to_lack_the_column_keeps_the_label():
+    """复核第 1 轮（收紧之后的多遮）：没写表名的 * 展开数据源里的表，以前一律算「说不清带不带这一列」，标签照收成
+    遮罩值，回答里的「大单」、SQL 里的 '大单' 都换成「已遮罩」。冻结的表结构里查得到这张表、又没有同名的列时，照旧
+    按派生来源认标签；表里有同名的列、查不到表结构的，照旧不算（宁可多遮）。"""
+    from app.engine import masking
+
+    lacking = {"tables": {"sales": {"columns": [{"name": "id"}, {"name": "region"}, {"name": "amount"}]}}}
+    holding = {"tables": {"sales": {"columns": [{"name": "id"}, {"name": "档"}, {"name": "amount"}]}}}
+    assert masking._label_columns(STAR_JOIN, "sqlite", STAR_COLUMNS, masking._schema_tables(lacking)) == {
+        "档": {"大单", "小单"}}
+    assert masking._label_columns(STAR_JOIN, "sqlite", STAR_COLUMNS, masking._schema_tables(holding)) == {}
+    assert masking._label_columns(STAR_JOIN, "sqlite", STAR_COLUMNS) == {}
+    truncated = {"tables": {"orders": {"columns": [{"name": "id"}]}}, "truncated": True}
+    assert masking._label_columns(STAR_JOIN, "sqlite", STAR_COLUMNS, masking._schema_tables(truncated)) == {}
+    # 写了表名的 s.* 展开的是数据源里的表：同样按表结构认它带不带这一列
+    nested = ("SELECT x.档 FROM (SELECT s.*, b.* FROM sales s JOIN (SELECT id AS bid, CASE WHEN amount > 1000 "
+              "THEN '大单' ELSE '小单' END AS 档 FROM sales) b ON s.id = b.bid) x")
+    assert masking._label_columns(nested, "sqlite", ["档"], masking._schema_tables(lacking)) == {"档": {"大单", "小单"}}
+    assert masking._label_columns(nested, "sqlite", ["档"], masking._schema_tables(holding)) == {}
+    assert masking._label_columns(nested, "sqlite", ["档"]) == {}
+
+
+async def test_a_snapshot_reads_labels_with_its_frozen_schema():
+    """快照记着查询当时冻结的表结构（schema_artifact）：按它认，* 连着的表没有同名的列时标签不当遮罩值，回答正文、
+    SQL 里的档名照原样；表结构取不到的照旧不算。"""
+    from app.core import artifact_store
+    from app.engine import masking
+
+    lacking = {"source": "shop", "tables": {"sales": {"columns": [{"name": "id"}, {"name": "region"},
+                                                                  {"name": "amount"}]}}}
+    schema = await artifact_store.put_json(lacking, kind="schema_snapshot", run_id="r-labels", node_id="n1")
+    snapshot = {"source": "shop", "sql": STAR_JOIN, "columns": STAR_COLUMNS, "schema_artifact": schema,
+                "rows": [[1, "华东", 1200, 1, "大单"], [2, "华南", 300, 2, "小单"]]}
+    assert masking._snapshot_labels(snapshot, "sqlite") == {"档": {"大单", "小单"}}
+    plan = plan_of(snapshot, {"amount"})
+    assert plan.secrets.scrub("这一笔属于大单") == "这一笔属于大单"
+    sql = "SELECT COUNT(*) FROM (SELECT CASE WHEN amount > 1000 THEN '大单' ELSE '小单' END AS 档 FROM sales) WHERE 档 = '大单'"
+    assert inquiry_mod._scrub_sql(sql, plan.secrets, plan.tainted["a1"], "sqlite") == sql
+    assert masking._snapshot_labels({**snapshot, "schema_artifact": "missing"}, "sqlite") == {}
+
+
+def test_the_tool_boundary_reads_labels_with_the_sources_frozen_schema():
+    """工具边界按数据源的表结构认标签：* 连着的表没有同名的列，标签不收成遮罩值，同一份结果里别的文字格里的「大单」照常。"""
+    from app.engine import masking
+
+    payload = {"sql": STAR_JOIN, "columns": [*STAR_COLUMNS, "备注"],
+               "rows": [[1, "华东", 1200, 1, "大单", "大单客户"], [2, "华南", 300, 2, "小单", "例行回访"]]}
+    schema = {"tables": {"sales": {"columns": [{"name": "id"}, {"name": "region"}, {"name": "amount"},
+                                               {"name": "备注"}]}}}
+    done = masking.mask_query_result(payload, ["amount"], "sqlite", schema=schema)
+    assert done.columns == ["amount", "档"] and not {"大单", "小单"} & done.secrets.strong
+    assert [row[-1] for row in done.payload["rows"]] == ["大单客户", "例行回访"]
+
+
 # --------------------------------------------------------------------------
 # 按值认：门槛、边界
 # --------------------------------------------------------------------------
@@ -1373,3 +1433,56 @@ def test_hundreds_of_band_edges_are_read_within_a_budget():
     assert "已遮罩" in inquiry_mod._scrub_sql(bins(600), every, {"age"}, "sqlite")
     elapsed = time.perf_counter() - started
     assert elapsed < 5, f"用了 {elapsed:.2f} 秒"
+
+
+# --------------------------------------------------------------------------
+# 回答时才认得出的值：记下位置，事后取质询工件时照着再换一遍
+# --------------------------------------------------------------------------
+
+
+def test_values_known_only_at_answer_time_are_recorded_as_positions_and_replayed():
+    """agent 先查了备注（那时还不知道备注里的号码是遮罩值，查询时原样交回、原样存下），后来又查出了手机号（查询时
+    遮掉，值只在内存里）。回答时按内存里的值换掉的地方记成位置（不含值）；事后取质询工件时内存里的值已经不在，照着
+    位置再换一遍，和回答时看到的一样。"""
+    from app.engine import masking
+
+    note = "客户13900000001来电改址，备用 139-0000-0001"
+    snapshot = {"columns": ["区域", "备注", "号码", "13900000001 的单"],
+                "rows": [["华东", note, "13900000001", 1], ["华南", "例行回访", "13800000000", 2]]}
+    seen = secrets_of({"columns": ["phone"], "rows": [["13900000001"]]}, {"phone"})
+    edits = masking.view_edits(snapshot, set(), seen, inquiry_mod._Secrets())
+    first, second = note.index("13900000001"), note.index("139-0000-0001")
+    assert edits == {"cells": [[0, 2]], "spans": [[0, 1, first, first + 11], [0, 1, second, second + 13]],
+                     "names": [[3, 0, 11]], "masked": ["号码"]}
+    assert "1390000000" not in json.dumps(edits, ensure_ascii=False), "只记位置，不记值"
+    replayed = masking.replay_edits(snapshot, [edits])
+    assert replayed["columns"] == ["区域", "备注", "号码", f"{MASKED} 的单"]
+    assert replayed["rows"] == [["华东", f"客户{MASKED}来电改址，备用 {MASKED}", MASKED, 1],
+                                ["华南", "例行回访", "13800000000", 2]]
+    # 不靠内存里的值也认得出的（报告快照里就有），事后照样认得出，不记
+    assert masking.view_edits(snapshot, set(), seen, seen) is None
+    # 记下的位置对不上（越界、坏形状）的跳过，不出错
+    broken = {"cells": [[9, 9], "x"], "spans": [[0, 1, 50, 60], [0, 9, 0, 1]], "names": [[7, 0, 1]], "masked": [3]}
+    assert masking.replay_edits(snapshot, [broken, None, "x"]) == snapshot
+
+
+def test_the_plan_records_what_only_the_values_seen_by_the_agent_masked():
+    """_settle_plan 带上 agent 查询时遮掉的值（seen）时，另记下只靠它们才换掉的位置（replay）；不带 seen 的（事后取
+    质询工件）不记。"""
+    notes = {"source": "shop", "sql": "SELECT region AS 区域, note AS 备注 FROM callbacks", "columns": ["区域", "备注"],
+             "rows": [["华东", "客户13900000001来电改址"], ["华南", "例行回访"]]}
+    seen = secrets_of({"columns": ["phone"], "rows": [["13900000001"]]}, {"phone"})
+    plan = inquiry_mod._settle_plan({"a1": notes}, {"a1": ({"buyer_phone"}, [])}, [], {"shop": "sqlite"}, [], [], {},
+                                    frozenset(), seen)
+    assert plan.replay == {"a1": {"cells": [], "spans": [[0, 1, 2, 13]], "names": [], "masked": []}}
+    later = inquiry_mod._settle_plan({"a1": notes}, {"a1": ({"buyer_phone"}, [])}, [], {"shop": "sqlite"}, [], [], {},
+                                     frozenset({"a1"}))
+    assert later.replay == {} and later.views["a1"]["rows"][0][1] == "客户13900000001来电改址"
+
+
+def test_values_the_agent_saw_survive_a_report_that_fills_the_cap():
+    """报告快照里的遮罩值收满了上限（SECRETS_MAX）：agent 查询时遮掉的值先收，照样认得出（以前先收报告的，满了就丢）。"""
+    report = {"columns": ["buyer_phone"], "rows": [[str(13800000000 + i)] for i in range(inquiry_mod.SECRETS_MAX)]}
+    seen = secrets_of({"columns": ["phone"], "rows": [["19914742785"]]}, {"phone"})
+    plan = inquiry_mod._settle_plan({}, {}, [(report, {"buyer_phone"})], {}, [], [], {}, frozenset(), seen)
+    assert plan.secrets.hit("19914742785")

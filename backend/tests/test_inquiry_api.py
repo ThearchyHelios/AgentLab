@@ -1474,14 +1474,22 @@ CALLBACKS = SALES + ("CREATE TABLE callbacks (id INTEGER PRIMARY KEY, region TEX
 LEAKED = "回答中含有设了遮罩的值，无法遮住，已不予展示，请换个问法重新提问"
 
 
-async def test_a_masked_value_inside_a_text_cell_is_cut_out_of_the_artifact(monkeypatch, tmp_path, client):
-    """备注里写着手机号（备注没设遮罩，手机号设了遮罩、被报告取数选中）：agent 引用这一格，回答照旧整份不交；
-    质询工件里这份快照照样记着、点得开，那一格里的号码换成「已遮罩」，别的字、别的格子照原样，不然「不予展示」
-    旁边一点就能看到原值。"""
+async def test_a_masked_value_inside_a_text_cell_is_cut_out_before_the_agent_sees_it(monkeypatch, tmp_path, client):
+    """备注里写着手机号（备注没设遮罩，手机号设了遮罩、被报告取数选中）：报告快照里的遮罩值在开始回答之前就交给核查
+    agent 的查询工具，agent 查备注时那一截就换成「已遮罩」，模型看不到；它引用这一格，回答照常给出，渲染出来也是遮好的。
+    质询工件、通用工件接口里这份快照同样遮好，别的字、别的格子照原样。以前模型看得到原值，回答整份不交。"""
     name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=CALLBACKS)
     notes = "SELECT region AS 区域, note AS 备注 FROM callbacks ORDER BY id"
     plays = {"回访": Play([notes], "华东的回访备注是 [[v:Q1.r0.备注]]。[[see:Q1]]")}
     Models(monkeypatch, name, writer="金额最高的一笔 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    seen: list[str] = []
+    answering = MockChatModel._decide
+
+    def spy(model, messages):
+        seen.extend(str(m.content) for m in messages if isinstance(m, ToolMessage))
+        return answering(model, messages)
+
+    monkeypatch.setattr(MockChatModel, "_decide", spy)
     try:
         report_sql = "SELECT buyer_phone, amount AS 金额 FROM sales ORDER BY amount DESC"
         paused = await pause(name, graph=fetching(name, report_sql))
@@ -1491,18 +1499,112 @@ async def test_a_masked_value_inside_a_text_cell_is_cut_out_of_the_artifact(monk
         assert r.status_code == 200, r.text
         assert "1390000000" not in r.text
         item = r.json()["inquiry"]
-        assert (item["answer"]["ok"], item["answer"]["text"], item["answer"]["doc_artifact"]) == (False, "", None)
-        assert item["answer"]["error"] == LEAKED
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (True, "华东的回访备注是 客户已遮罩来电改址。")
         [query] = item["queries"]
         assert query["sql"] == notes
         [event] = await events(paused.id, "approval.inquiry")
         assert event.data["inquiry_artifacts"] == [query["artifact"]]
-        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
-        assert got.status_code == 200, got.text
-        assert got.json()["content"]["rows"] == [["华东", "客户已遮罩来电改址"], ["华南", "例行回访"]]
-        assert got.json()["masked"] == [] and "1390000000" not in got.text
+        assert any("客户已遮罩来电改址" in s for s in seen) and all("1390000000" not in s for s in seen), \
+            "交给模型的查询结果里就是遮好的"
+        for url in (f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}",
+                    f"/api/artifacts/{query['artifact']}"):
+            got = await client.get(url)
+            assert got.status_code == 200, got.text
+            assert got.json()["content"]["rows"] == [["华东", "客户已遮罩来电改址"], ["华南", "例行回访"]]
+            assert "1390000000" not in got.text
+            assert got.json().get("masked", []) == [], "备注只换了一截，不画成遮罩列"
     finally:
         await engines.invalidate(source_id)
+
+
+#: 质询 agent 的两条查询：一条选出手机号（查询时遮掉），一条查回访备注（备注没设遮罩，里面写着手机号）
+PHONES_EAST = "SELECT buyer_phone AS 号码, amount AS 金额 FROM sales WHERE region = '华东' ORDER BY amount DESC"
+NOTES = "SELECT region AS 区域, note AS 备注 FROM callbacks ORDER BY id"
+
+
+async def test_a_number_from_the_agents_other_query_is_masked_when_the_number_came_first(monkeypatch, tmp_path, client):
+    """复核第 1 轮（对基线回退）：报告取数没选手机号，号码只出现在 agent 自己的另一次查询里。先查号码、后查备注：号码
+    查询时就遮掉、值并进内存，后面那次查询的备注在交给模型、落库之前就按值换掉，回答照常给出；质询工件、通用工件接口
+    给的都是遮好的。以前事后取质询工件时收不到这个号码，备注原样给出。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=CALLBACKS)
+    plays = {"回访": Play([PHONES_EAST, NOTES], "华东的回访备注是 [[v:Q2.r0.备注]]。[[see:Q2]]")}
+    Models(monkeypatch, name, writer="华东销售额 [[v:Q1.r0.销售额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=fetching(name, QUERY))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="华东的回访说了什么？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (True, "华东的回访备注是 客户已遮罩来电改址。")
+        phones, notes = item["queries"]
+        for url in (f"/api/runs/{paused.id}/inquiries/artifacts/{notes['artifact']}",
+                    f"/api/artifacts/{notes['artifact']}"):
+            got = await client.get(url)
+            assert got.status_code == 200, got.text
+            assert got.json()["content"]["rows"] == [["华东", "客户已遮罩来电改址"], ["华南", "例行回访"]]
+            assert "1390000000" not in got.text
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{phones['artifact']}")
+        assert got.json()["content"]["rows"] == [["已遮罩", 1200], ["已遮罩", 300]] and got.json()["masked"] == ["号码"]
+        [event] = await events(paused.id, "approval.inquiry")
+        assert "1390000000" not in json.dumps(event.data, ensure_ascii=False)
+    finally:
+        await engines.invalidate(source_id)
+
+
+async def test_a_number_from_the_agents_other_query_is_masked_when_the_number_came_last(monkeypatch, tmp_path, client):
+    """先查备注、后查号码：查备注时还不知道里面写着遮罩值，原样交给模型、原样存下；回答引用这一格，渲染出来才露，整份
+    不交。回答时按内存里的值换掉的位置记进事件（不含值），事后取质询工件照着再换一遍：质询工件里那一截是「已遮罩」，
+    和回答时一样。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=CALLBACKS)
+    plays = {"回访": Play([NOTES, PHONES_EAST], "华东的回访备注是 [[v:Q1.r0.备注]]。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东销售额 [[v:Q1.r0.销售额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=fetching(name, QUERY))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="华东的回访说了什么？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        assert "1390000000" not in r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["error"]) == (False, LEAKED)
+        notes, phones = item["queries"]
+        [event] = await events(paused.id, "approval.inquiry")
+        assert "1390000000" not in json.dumps(event.data, ensure_ascii=False)
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{notes['artifact']}")
+        assert got.status_code == 200, got.text
+        assert got.json()["content"]["rows"] == [["华东", "客户已遮罩来电改址"], ["华南", "例行回访"]]
+        assert "1390000000" not in got.text
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{phones['artifact']}")
+        assert got.json()["content"]["rows"] == [["已遮罩", 1200], ["已遮罩", 300]]
+    finally:
+        await engines.invalidate(source_id)
+
+
+async def test_a_number_written_in_another_table_is_masked_whichever_query_came_first(monkeypatch, tmp_path, client):
+    """另一张表（联系方式）的号码列没设遮罩，存的是同一批号码：先查手机号的，查询时就按值换；后查的，事后取质询工件
+    照回答时记下的位置换。两种先后都整列画成遮罩列。"""
+    phones = "SELECT buyer_phone AS 手机号, amount AS 金额 FROM sales ORDER BY id"
+    visits = "SELECT phone_num AS 号码, visits AS 次数 FROM contacts ORDER BY id"
+    for order in ([phones, visits], [visits, phones]):
+        name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=CONTACTS)
+        at = order.index(visits) + 1
+        plays = {"常来": Play(order, f"最常来的客户来过 [[v:Q{at}.r0.次数]] 次。[[see:Q{at}]]")}
+        Models(monkeypatch, name, writer="华东销售额 [[v:Q1.r0.销售额]]。[[see:Q1]]", plays=plays)
+        try:
+            paused = await pause(name, graph=fetching(name, QUERY))
+            [approval] = await pending(paused.id)
+            r = await ask(client, paused.id, report="write", unit=None, question="常来的客户来过几次？",
+                          approval_id=approval.id)
+            assert r.status_code == 200, r.text
+            assert r.json()["inquiry"]["answer"]["text"] == "最常来的客户来过 5 次。"
+            query = r.json()["inquiry"]["queries"][at - 1]
+            got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+            assert got.status_code == 200, got.text
+            assert got.json()["content"]["rows"] == [["已遮罩", 5], ["已遮罩", 2]]
+            assert got.json()["masked"] == ["号码"] and "1390000000" not in got.text
+        finally:
+            await engines.invalidate(source_id)
 
 
 async def test_sql_check_excerpts_in_the_artifact_are_masked_like_the_sql(monkeypatch, masked_shop, client):
@@ -1727,8 +1829,10 @@ REWRITTEN_CALLBACKS = SALES + ("CREATE TABLE callbacks (id INTEGER PRIMARY KEY, 
                                "(2, '华南', '例行回访');")
 
 
-async def test_a_reformatted_number_inside_a_text_cell_stops_the_answer(monkeypatch, tmp_path, client):
-    """备注里夹着换了写法的号码，agent 引用这一格：渲染出来才露，最后一道关认得出，回答整份不交；质询工件里只换掉那一截。"""
+async def test_a_reformatted_number_inside_a_text_cell_is_cut_out_before_the_agent_sees_it(monkeypatch, tmp_path,
+                                                                                          client):
+    """备注里夹着换了写法的号码（报告取数选了手机号）：开始回答之前就认得出，agent 查备注时那一截已经换掉，引用这一格
+    回答照常给出；质询工件里同样只换掉那一截。"""
     name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=REWRITTEN_CALLBACKS)
     notes = "SELECT region AS 区域, note AS 备注 FROM callbacks ORDER BY id"
     plays = {"回访": Play([notes], "华东的回访备注是 [[v:Q1.r0.备注]]。[[see:Q1]]")}
@@ -1740,12 +1844,12 @@ async def test_a_reformatted_number_inside_a_text_cell_stops_the_answer(monkeypa
                       approval_id=approval.id)
         assert r.status_code == 200, r.text
         item = r.json()["inquiry"]
-        assert (item["answer"]["ok"], item["answer"]["error"]) == (False, LEAKED)
+        assert (item["answer"]["ok"], item["answer"]["text"]) == (True, "华东的回访备注是 客户 已遮罩 来电改址。")
         [query] = item["queries"]
         got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
         assert got.status_code == 200, got.text
         assert got.json()["content"]["rows"] == [["华东", "客户 已遮罩 来电改址"], ["华南", "例行回访"]]
-        assert "0000-0001" not in got.text
+        assert "0000-0001" not in got.text and "0000-0001" not in r.text
     finally:
         await engines.invalidate(source_id)
 

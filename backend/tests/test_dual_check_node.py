@@ -1055,6 +1055,38 @@ async def test_a_renamed_masked_column_in_the_blind_query_is_masked_before_the_b
     assert {row[0] for row in shown["rows"]} == {"已遮罩"}, "交给盲算模型的结果里也是「已遮罩」"
 
 
+async def test_a_metric_summed_over_a_masked_column_is_not_blind_computed(monkeypatch, tmp_path):
+    """复核第 1 轮：金额这一列设了遮罩，指标是 SUM(amount)。核查 agent 的查询结果在工具边界遮好，汇总遮罩列的值也遮
+    （只有一行的汇总就是那一行的原值），盲算交回的格子注定取不到。所以派出盲算之前按 SQL 认出这一列由遮罩列算出，
+    直接按无法复算记、说清原因，不白花一次盲算的钱。以前只按列名认，gmv 认不出，盲算照样派出去，最后才在格子引用上
+    被拒，原因说成「盲算交回的格子引用不可用」。"""
+    name, source_id = await add_source(build(tmp_path / "amount_masked.db"), options={"mask_columns": "amount"})
+    try:
+        blind = Blind(monkeypatch, name, {"销售额": (BLIND_TOTAL, "blind_total")})
+        run = await start(graph(name, RIGHT))
+        evs = await events(run.id)
+        out = dual_output(run, evs)
+        [row] = out["metrics"]
+        assert row["status"] == "unchecked" and blind.runs == 0, "没派盲算"
+        assert row["reason"] == ("输入 cell(nodes.fetch, 0, 'gmv') 由设置了遮罩的列算出（经改名、函数或汇总），"
+                                 "盲算时会被遮罩，不能用于复算")
+        assert not [e for e in evs if e.type == "tool.end" and e.node_id == "dual"]
+    finally:
+        await drop_source(source_id)
+
+
+async def test_a_metric_filtered_by_a_masked_column_inside_its_sum_is_still_blind_computed(monkeypatch, masked_shop):
+    """遮罩列（区域）只在汇总的 CASE 条件里（SUM(CASE WHEN region = '华东' THEN amount ELSE 0 END)）：同写在 WHERE 里，
+    值全部来自金额，原 SQL 和盲算的查询都不遮，照常比对。"""
+    name, _ = masked_shop
+    east = (f"SELECT SUM(CASE WHEN region = '华东' THEN amount ELSE 0 END) AS gmv FROM orders "
+            f"WHERE status <> 'refunded' AND paid_date {WEEK}")
+    blind = Blind(monkeypatch, name, {"销售额": (east, "gmv")})
+    run = await start(graph(name, east))
+    out = dual_output(run, await events(run.id))
+    assert blind.runs == 1 and out["metrics"][0]["status"] == "agreed", out["metrics"][0]
+
+
 async def test_masked_group_columns_are_not_shown_to_the_blind_agent(monkeypatch, masked_shop):
     name, _ = masked_shop
     first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}

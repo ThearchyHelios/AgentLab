@@ -13,7 +13,9 @@
 连取值也不给；遮罩列不给。计算式只有一项来自查询、或者写了口径说明时不给列名；几项都来自查询又没写口径说明的，列名
 里看不出日期、口径的取舍时才给，好让它分得清哪一项是哪一项。
 
-**遮罩列上的输入不复算。** cell() 取自遮罩列的输入不能单独复算；别的输入（计算式里写成当时代进去的值）里按位置取自
+**遮罩列上的输入不复算。** cell() 取自遮罩列的输入不能单独复算，改了名字、套了函数或汇总的遮罩列（SUM(amount) AS
+gmv，amount 设了遮罩）按 SQL 认出来也一样（engine/masking.derived_columns）：盲算的查询在工具边界按同一套认法遮掉，
+派出去也取不到数，不白花一次盲算。别的输入（计算式里写成当时代进去的值）里按位置取自
 查询结果的一格（vars.res.rows[0][2]），顺着取值链认出它取自哪份快照的哪一列（recompute.input_origin，证据面板、推演、
 可验证报告同一个认法），按需算那份快照要遮的列（和证据面板同一套，见 _Sources.hidden）——它不一定是 cell() 用到的
 那几份。取自遮罩列、遮没遮核对不了的，整个指标按无法复算记：遮罩值不能当字面量写进交给盲算的计算式。伸进查询结果的行、
@@ -75,6 +77,7 @@ from app.engine.expressions import ExpressionError, _cell_call, _chain_root, cel
     parse_expression
 from app.engine.replay import _in_graph, ask, once
 from app.engine.labels import DUAL_CHECK_FIELD_LABEL, DUAL_CHECK_ON_REJECT_LABEL
+from app.engine.masking import derived_columns
 from app.engine.schema import DUAL_CHECK_ON_REJECT, NodeType, dual_check_card
 from app.engine.state import GraphState
 
@@ -613,9 +616,15 @@ async def _query_input(item: dict[str, Any], sources: _Sources, aliases: dict[st
     value = cell_value(item.get("value"))
     if not _number(value):
         return {}, f"输入 {item['path']} 不是数值"
-    if column.lower() in await sources.hidden(artifact):
+    hidden = await sources.hidden(artifact)
+    if column.lower() in hidden:
         return {}, f"输入 {item['path']} 取自设置了遮罩的列，不能用于复算"
     found = await sources.source(source)
+    derived = derived_columns(snap, set(hidden), found.kind if found is not None else None) if hidden else None
+    if derived and column.lower() in derived:
+        # 改了名字、套了函数或汇总的遮罩列（SUM(amount) AS gmv）：盲算的查询在工具边界按同一套认法遮掉（engine/masking），
+        # 交回的格子注定取不到，不白派一次盲算。SQL 解析不了的认不准，照常派
+        return {}, f"输入 {item['path']} 由设置了遮罩的列算出（经改名、函数或汇总），盲算时会被遮罩，不能用于复算"
     if found is None or not found.enabled:
         return {}, f"数据源「{source}」不存在或已停用"
     return {"path": item["path"], "key": f"{artifact}|{row}|{column}", "value": value,

@@ -468,6 +468,8 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
     缓存键相同，会把这个源平时用的可写连接也换成只读的。
     mask_results：数据源设了遮罩时，取自遮罩列的格子（按 SQL 认，改了名字的也算）在交给模型、落进快照之前就换成
     「已遮罩」，见 engine/masking.py 的 mask_query_result；这一次遮掉的值并进 ctx.extra[MASKED_VALUES_KEY]（有的话）。
+    那里已经有的值（这个 agent 前面的查询遮掉的、调用方交进来的）这一次也按值换，数据源没设遮罩也一样：先查号码、
+    再查写着号码的备注或别的库，后一份同样遮好。查询失败时报错原话里的值也换（masking.mask_error_text）。
     """
     # 数据源在 options.query_timeout_s 里配了就用它，否则取缺省。数据库按它停下语句，
     # 引擎按它告诉界面上限是多少（metadata["timeout_s"]）
@@ -495,6 +497,10 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
             if is_write(statement, dialect=(source.kind or "").lower()):
                 return f"SQL 被拒绝：{FORCED_READONLY}"
         limits = QueryLimits(timeout_seconds=seconds, **({"max_rows": int(limit)} if limit else {}))
+        mask = masked_columns(source.options)
+        # 此前认出的遮罩值：交给线程的是一份拷贝，线程里读的时候这边不会再往里并
+        sink = ctx.extra.get(MASKED_VALUES_KEY) if mask_results else None
+        known = sink.copy() if sink is not None and sink.strong else None
         try:
             result = await run_query(source, sql, limits=limits)
         except SqlRejected as e:
@@ -511,21 +517,29 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
 
             # 驱动的原话留着（"no such table: x" 正是模型改写 SQL 要的线索），
             # 类名和 SQLAlchemy 的包装前缀去掉：这一行也会原样出现在运行面板上
-            return f"查询失败：{first_line(e) or explain(e)[0]}"
+            said = first_line(e) or explain(e)[0]
+            if mask_results and (mask or known is not None):
+                from app.engine.masking import mask_error_text
+
+                # 数据库会把转换失败的值写进报错（invalid input syntax for type bigint: "139-0000-0001"）
+                said = mask_error_text(said, sql, known)
+            return f"查询失败：{said}"
 
         payload = result.to_payload()
         payload["source"] = source.name
-        mask = masked_columns(source.options)
-        # 查询时就整列遮掉的结果列；没开遮罩开关、数据源没设遮罩时为 None（快照和原来一字不差）
+        # 查询时就整列遮掉的结果列；没开遮罩开关、数据源没设遮罩又没有可按值换的时为 None（快照和原来一字不差）
         masked_now: list[str] | None = None
-        if mask_results and mask:
+        if mask_results and (mask or known is not None):
             from app.engine.masking import mask_query_result
 
             # 按 SQL 认列、逐格比对是纯计算，放进线程（同 _sql_checks）
-            done = await asyncio.to_thread(mask_query_result, payload, mask, source.kind)
-            payload, masked_now = done.payload, done.columns
-            if (sink := ctx.extra.get(MASKED_VALUES_KEY)) is not None:
-                sink.merge(done.secrets)
+            done = await asyncio.to_thread(mask_query_result, payload, mask, source.kind, known,
+                                           schema=source.schema_cache)
+            if mask or done.payload is not payload:
+                payload, masked_now = done.payload, done.columns
+            if sink is not None:
+                # 上万个值并一遍要几十毫秒（免遮的文字要重新过一遍），也放进线程
+                await asyncio.to_thread(sink.merge, done.secrets)
         # 对照数据目录检查这条 SQL（一对多关联后重复计算、存量跨期求和……）。结果交给模型（Agent 据此改写），
         # 也随查询快照存下：证据面板看得到，口径卡据此给指标标「存疑」、出具降档。没查出问题不加这个键，
         # 快照和以前一字不差
@@ -541,15 +555,15 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
 
             # 只进快照、不进交给模型的结果的几样（模型看到多余的字段只会误会：以为数据被遮了，
             # 或者把一串十六进制抄进报告）：
-            # - 查询当时数据源设的遮罩列：数据源事后改名、删掉，证据面板仍按当时的遮。查询时就遮了的结果列（改了名字的
-            #   也算）一并记进去，证据面板、质询工件按这个键把它们画成遮罩列；
-            # - masked_at_query：开了遮罩开关时，查询时就整列遮掉的结果列（这几列的格子是「已遮罩」，不是数据源里的值）；
+            # - 查询当时数据源设的遮罩列：数据源事后改名、删掉，证据面板仍按当时的遮。只记数据源设的列名——证据面板把
+            #   同源各份快照记的这一项并起来，从表的字段清单里去掉，混进结果列的别名会把同名的真实字段也去掉；
+            # - masked_at_query：开了遮罩开关时，查询时就整列遮掉的结果列（这几列的格子是「已遮罩」，不是数据源里的值，
+            #   改了名字的也在这里）。有这一项的快照，别的格子整格是「已遮罩」的是查询时按值换掉的；
             # - data_version：上传表格查的是哪个快照，事后据此认得出这个数出自哪一版数据。
             # 手工源、没设遮罩的，快照和原来一字不差
             extra: dict[str, Any] = {}
             if mask:
-                own = {m.lower() for m in mask}
-                extra["mask_columns"] = [*mask, *(c for c in masked_now or [] if c.lower() not in own)]
+                extra["mask_columns"] = mask
             if masked_now is not None:
                 extra["masked_at_query"] = masked_now
             if version := getattr(source, "snapshot_id", None):
