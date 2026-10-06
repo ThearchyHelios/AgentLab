@@ -297,7 +297,7 @@ await section('审批卡：并排对照与高亮（服务端真实的差异输�
   const blind = gmv.locator('[data-dual-sql="blind"]')
   check('两条 SQL 都在，各标是哪一边', (await text(orig)).includes('paid_at') && (await text(blind)).includes('created_at')
     && (await text(gmv.locator('[data-dual-pair]'))).includes('原流程的 SQL') && (await text(gmv.locator('[data-dual-pair]'))).includes('盲算的 SQL'))
-  // 夹具的 text_diff 是 explain_sql_diff 的真实输出：规范化后列名带表名、两个条件并成一行，和原文的任何一行都对不上
+  // 夹具的 text_diff 是 explain_sql_diff 的真实输出：规范化后列名带表名、每个条件一行，和原文的任何一行都对不上
   const real = sidesOf(fx.card.metrics[0].diff)
   const rawLines = new Set(fx.card.metrics[0].original.inputs[0].sql.split('\n').map((l) => l.trim()))
   check('（夹具）text_diff 是规范化后的行，和原文逐行对不上', real.del.length > 0 && !real.del.some((l) => rawLines.has(l)), real.del.join(' | '))
@@ -461,6 +461,18 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
         m.normDel.join('|') === real.del.join('|') && m.normAdd.join('|') === real.add.join('|'), `${m.normDel.join('|')} ‖ ${m.normAdd.join('|')}`)
       if (!real.add.length) {
         check('……一边没有不同的行时照实说', (await text(gmv.locator('[data-dual-norm="blind"]'))).includes('没有不同的行'))
+      }
+      // 规范化后每个条件一行（2026-10 验收：两个条件排在一行、三个拆成三行，两边相同的日期条件因为换行的位置不同被
+      // 标成了差异）。只差结束日期时，两边一样的开始日期不标，只标结束日期那一行
+      if (name === 'fallback') {
+        const marked = [...m.normDel, ...m.normAdd]
+        check('……两边相同的条件（开始日期）不标，只标不同的那一行', m.normDel.length === 1 && m.normAdd.length === 1
+          && !marked.some((l) => l.includes(">= '2026-09-01'"))
+          && marked.every((l) => l.includes("orders.paid_at < '2026-09-")), marked.join(' ‖ '))
+      }
+      if (name === 'two_filters') {
+        check('……一边多出的两个条件各占一行', m.normDel.includes("orders.channel = 'web'")
+          && m.normDel.includes("AND orders.status <> 'refunded'"), m.normDel.join(' | '))
       }
     }
     check(`${what}：页面没有报错`, errors.length === 0, errors.join('；'))

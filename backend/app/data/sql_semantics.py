@@ -149,8 +149,8 @@ WHERE / GROUP BY 里用列别名的），而且只说四类：
 
 **兜底。** 规范形式不一致、一条具体说法都没有时，给一条 aspect="other" 的「两条 SQL 的写法不同，未能归纳成具体差异，
 请对照原文」；具体说法只覆盖了一部分时追加「另有未能归纳的差异，请对照原文」；fallback 为真。text_diff 给出规范化后
-不同的行（difflib 比两边 sqlglot pretty 的输出，最多 40 行）；有一边没有规范形式（保真守卫拦下的）时给原文的逐行
-对照。
+不同的行（difflib 比两边 sqlglot pretty 的输出，WHERE、ON、HAVING 的合取式每个条件一行，最多 40 行，见 _text_diff）；
+有一边没有规范形式（保真守卫拦下的）时给原文的逐行对照。
 
 仍做不到的（只给兜底说明，或者认不出等价）：
 - 认不出的等价改写：要靠约束才成立的（主键不为空时的 COUNT(主键) 和 COUNT(*)、按主键关联又没用到的 LEFT JOIN、带
@@ -5923,8 +5923,8 @@ class SqlDiff:
     equivalent：两边经过只保持语义的变换之后，规范形式一字不差（level 是哪一级的规范形式，见 _canonical_forms）。
     items：具体差异，等价时为空；不等价时一定不为空——归纳不出具体差异时是一条 aspect="other" 的兜底说明。
     fallback：用了兜底说明（一条具体说法都没有，或者具体说法只覆盖了一部分）。
-    text_diff：规范化之后两条 SQL 不同的行（difflib 比两边 sqlglot pretty 的输出，「- 」开头是 A 的、「+ 」开头是
-    B 的，最多 40 行），给界面高亮；等价时为空。"""
+    text_diff：规范化之后两条 SQL 不同的行（difflib 比两边 sqlglot pretty 的输出，WHERE、ON、HAVING 的合取式每个条件
+    一行，「- 」开头是 A 的、「+ 」开头是 B 的，最多 40 行，见 _text_diff），给界面高亮；等价时为空。"""
 
     equivalent: bool
     items: list[FacetDiff] = field(default_factory=list)
@@ -5942,6 +5942,10 @@ _FALLBACK = "两条 SQL 的写法不同，未能归纳成具体差异，请对�
 _FALLBACK_REST = "另有未能归纳的差异，请对照原文"
 #: text_diff 最多列几行
 _MAX_DIFF_LINES = 40
+#: 逐行比较时不看的、条件前面的 AND（见 _text_diff）
+_LEADING_AND = re.compile(r"^(\s*)AND ")
+#: 各方言「每个条件一行」的生成器类，按 sqlglot 的生成器类缓存（见 _line_generator）
+_LINE_GENERATORS: dict[type, type] = {}
 
 _CJK_PUNCT = frozenset("，。；：、！？「」『』（）《》【】…—")
 #: 聚合函数的说法
@@ -7761,19 +7765,97 @@ def _by_bound(conds: list[Any]) -> list[Any]:
 
 def _text_diff(a: _Form | None, b: _Form | None, read: str | None) -> tuple[str, ...]:
     """规范化之后两条 SQL 不同的行：difflib 比两边 sqlglot pretty 的输出，「- 」是 A 的、「+ 」是 B 的。只有一边有这一级
-    的规范形式时不比（只列一边的行读起来像另一边是空的），返回空的，调用方改给原文的逐行对照（见 _raw_diff）。"""
-    import difflib
+    的规范形式时不比（只列一边的行读起来像另一边是空的），返回空的，调用方改给原文的逐行对照（见 _raw_diff）。
 
-    def lines(form: _Form) -> list[str]:
-        try:
-            return form.tree.sql(dialect=read, pretty=True, comments=False).splitlines()
-        except Exception:  # noqa: BLE001
-            return form.text.splitlines()
+    两边按同一套排版写（_diff_lines）：WHERE、ON、HAVING 的合取式每个条件一行。sqlglot 的 pretty 按宽度决定换不换行，
+    两个条件放得下就排在一行、三个就拆开，同一个条件在两边落在不同的行上，就被当成「不同的行」（2026-10 验收：两边完全
+    相同的日期区间被标成了差异，审核人会以为统计期也不一样）。比的时候不看条件前面的 AND：一边多出来的条件排在最前面
+    时，另一边同一个条件只差在前面有没有 AND。列出来的仍是各自原样的行。只动排版，判不判等价、差异说明都不看这里。"""
+    import difflib
 
     if a is None or b is None:
         return ()
-    out = [line for line in difflib.ndiff(lines(a), lines(b)) if line[:2] in ("- ", "+ ")]
+    la, lb = _diff_lines(a, read), _diff_lines(b, read)
+    out: list[str] = []
+    i = j = 0
+    # ndiff 按顺序走完两边：「  」两边各进一行，「- 」「+ 」各进自己那边一行，「? 」是行内提示、不占行
+    for line in difflib.ndiff([_LEADING_AND.sub(r"\1", x) for x in la], [_LEADING_AND.sub(r"\1", x) for x in lb]):
+        tag = line[:2]
+        if tag == "  ":
+            i, j = i + 1, j + 1
+        elif tag == "- ":
+            out.append(f"- {la[i]}")
+            i += 1
+        elif tag == "+ ":
+            out.append(f"+ {lb[j]}")
+            j += 1
     return tuple(out[:_MAX_DIFF_LINES])
+
+
+def _diff_lines(form: _Form, read: str | None) -> list[str]:
+    """逐行对照用的写法：sqlglot pretty，WHERE、HAVING、ON 的合取式每个条件一行（见 _line_generator）。生成不了就退回
+    普通的 pretty，再不行用规范形式的原文。"""
+    try:
+        text = _line_generator(read).generate(form.tree)
+    except Exception:  # noqa: BLE001 - 只是给人看的排版，出错不能连累差异说明
+        try:
+            text = form.tree.sql(dialect=read, pretty=True, comments=False)
+        except Exception:  # noqa: BLE001
+            text = form.text
+    return [line.rstrip() for line in text.splitlines()]
+
+
+def _condition_root(node: Any) -> str | None:
+    """node 是 WHERE、HAVING 的整个条件（"clause"）、JOIN 的 ON 条件（"on"），还是别处的（None）。"""
+    from sqlglot import exp
+
+    parent = node.parent
+    if isinstance(parent, (exp.Where, exp.Having)) and node.arg_key == "this":
+        return "clause"
+    if isinstance(parent, exp.Join) and node.arg_key == "on":
+        return "on"
+    return None
+
+
+def _line_generator(read: str | None) -> Any:
+    """这种方言的 sqlglot 生成器（pretty、不带注释），只改一处：WHERE、HAVING、ON 的整个条件按 AND 拆开，每个条件一行，
+    第二个起前面写 AND（各层子查询里的也一样）。别的照 sqlglot 原样：条件本身太长时照样折行，两边同一个条件折得一样。
+
+    - 条件本身是 OR（XOR）连起来的一律加括号：和别的条件并列时本来就要加，单独一个时不加的话，同一个条件两边写法不同。
+      条件外面多余的括号、AND 套 AND 的括号去掉（_conjuncts），不改意思。
+    - ON 照 WHERE 的样子单独一行、条件缩进在下面：写在 ON 后面的话，第一个条件和后面的差在「ON」「AND」上，换个先后
+      就对不上；缩进比 WHERE 的条件深一级，ON 里和 WHERE 里的同一个条件不会被当成同一行。
+    """
+    from sqlglot import exp
+    from sqlglot.dialects.dialect import Dialect
+
+    dialect = Dialect.get_or_raise(read)
+    base = dialect.generator_class
+    cls = _LINE_GENERATORS.get(base)
+    if cls is None:
+        class _ConditionLines(base):  # type: ignore[misc, valid-type]
+            def sql(self, expression: Any, key: str | None = None, comment: bool = True) -> str:
+                root = _condition_root(expression) if key is None and isinstance(expression, exp.Expr) else None
+                conds = _conjuncts(expression) if root else []
+                if not conds:
+                    return super().sql(expression, key, comment)
+                lines = [self._one_condition(c) for c in conds]
+                text = "\n".join([lines[0], *(f"AND {line}" for line in lines[1:])])
+                # ON：join_sql 拼成「ON <条件>」并给条件的各行加一级缩进，开头换行就是 ON 单独一行、条件在下面
+                return "\n" + self.indent(text) if root == "on" else text
+
+            def _one_condition(self, node: Any) -> str:
+                # 只有一个条件时它就是整个条件，再走 self.sql 又会被认成整个条件、绕不出来：这一层直接用 sqlglot 原来的
+                # 写法（里面各层子查询的条件照样经过上面的 sql）
+                text = super().sql(node)
+                if not isinstance(node, exp.Connector):
+                    return text
+                if "\n" not in text:
+                    return f"({text})"
+                return f"({self.seg(self.indent(text), sep='')}{self.seg(')', sep='')}"
+
+        cls = _LINE_GENERATORS[base] = _ConditionLines
+    return cls(dialect=dialect, pretty=True, comments=False)
 
 
 def _raw_diff(a: str, b: str) -> tuple[str, ...]:

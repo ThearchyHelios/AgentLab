@@ -247,8 +247,10 @@
           ],
           "fallback": false,
           "text_diff": [
-            "-   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'",
-            "+   orders.created_at >= '2026-09-01' AND orders.created_at < '2026-09-08'"
+            "-   orders.paid_at >= '2026-09-01'",
+            "+   orders.created_at >= '2026-09-01'",
+            "-   AND orders.paid_at < '2026-09-08'",
+            "+   AND orders.created_at < '2026-09-08'"
           ]
         }
       },
@@ -314,7 +316,8 @@
             "-       1",
             "+       \"orders@1\".id",
             "-     WHERE",
-            "-       \"orders@1\".id = refunds.order_id AND \"orders@1\".status <> 'test'"
+            "-       \"orders@1\".id = refunds.order_id",
+            "-       AND \"orders@1\".status <> 'test'"
           ]
         }
       }
@@ -580,8 +583,10 @@
         ],
         "fallback": false,
         "text_diff": [
-          "-   orders.created_at >= '2026-09-01' AND orders.created_at < '2026-09-08'",
-          "+   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'"
+          "-   orders.created_at >= '2026-09-01'",
+          "+   orders.paid_at >= '2026-09-01'",
+          "-   AND orders.created_at < '2026-09-08'",
+          "+   AND orders.paid_at < '2026-09-08'"
         ]
       },
       "catalog": {
@@ -621,7 +626,8 @@
         "fallback": false,
         "text_diff": [
           "- WHERE",
-          "-   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'"
+          "-   orders.paid_at >= '2026-09-01'",
+          "-   AND orders.paid_at < '2026-09-08'"
         ]
       },
       "catalog": {
@@ -718,7 +724,8 @@
         "fallback": false,
         "text_diff": [
           "- WHERE",
-          "-   orders.channel = 'web' AND orders.status <> 'refunded'"
+          "-   orders.channel = 'web'",
+          "-   AND orders.status <> 'refunded'"
         ]
       },
       "catalog": {
@@ -747,11 +754,12 @@
         ],
         "fallback": false,
         "text_diff": [
-          "- FROM orders AS orders",
-          "- LEFT JOIN refunds AS refunds",
           "+ FROM orders AS orders, refunds AS refunds",
           "+ WHERE",
-          "-   ON orders.id = refunds.order_id",
+          "- FROM orders AS orders",
+          "- LEFT JOIN refunds AS refunds",
+          "-   ON",
+          "-     orders.id = refunds.order_id",
           "+   orders.id = refunds.order_id"
         ]
       },
@@ -814,8 +822,8 @@
         ],
         "fallback": true,
         "text_diff": [
-          "-   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-08'",
-          "+   orders.paid_at >= '2026-09-01' AND orders.paid_at < '2026-09-09'"
+          "-   AND orders.paid_at < '2026-09-08'",
+          "+   AND orders.paid_at < '2026-09-09'"
         ]
       },
       "catalog": {
@@ -948,8 +956,7 @@
         ],
         "fallback": false,
         "text_diff": [
-          "-   orders.id = refunds.order_id AND orders.status <> 'cancelled'",
-          "+   orders.id = refunds.order_id"
+          "-   AND orders.status <> 'cancelled'"
         ]
       },
       "catalog": {
