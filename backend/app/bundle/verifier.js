@@ -8,8 +8,10 @@
  *   ③ 每份嵌入的工件：sha256(原字节) 等于工件 id；
  *   ④ 引用链：报告文档的 id 是这个报告节点最后一次自查事件（已核对）记下的那份，文档记的运行、节点对得上；
  *      口径卡和快照的 id 出现在已核对的事件内容里，或者已核对的报告文档的证据目录里；
- *   ⑤ 报告里的每个数字和取值：引用的值等于口径卡里那个指标的值，或者快照里那一格的值。判等照搬服务端
- *      engine/expressions.py 的 cell_value / same_value；数字怎么显示是服务端渲染好的，这里不重新排版；
+ *   ⑤ 报告里的每个数字和取值：引用的值等于口径卡里那个指标的值，或者快照里那一格的值（判等照搬服务端
+ *      engine/expressions.py 的 cell_value / same_value）；正文显示的字等于按服务端的显示规则（engine/evidence.py 的
+ *      render_number / render_cell：千分位、小数位、单位、万 / 亿换算、百分数，文字压成一行）把那个值渲染出来的字，
+ *      只去掉首尾空白。本页渲染不出来的写法判无法核对，不判通过；
  *   ⑥ 运行信息：运行结果、运行类别、出具档位拿封存范围内已核对的事件对照。工作流名、版本、起止时间、节点名称
  *      绑不进封存，页面上写明它们取自运行记录。
  * 每项给出通过 / 不通过 / 无法核对和原因。服务端导出时不会出现的状态（被引用的工件不在清单里、报告文档标着遮罩）
@@ -148,6 +150,26 @@
     numMetricDiffers: '引用的值与口径卡里的值不一致',
     numNoCell: (why) => `快照里找不到这一格：${why}`,
     numCellDiffers: '引用的值与快照里那一格的值不一致',
+    /** cited 已经加好引号（空值写「空值（NULL）」）；expected 和引用的值写法一样时不写（文字取值） */
+    numShownDiffers: (shown, cited, expected) => `正文显示「${shown}」，引用的值是${cited}`
+      + (expected == null ? '' : `，按显示规则应显示为「${expected}」`),
+    numShownUnknown: (why) => `无法核对显示文字：${why}`,
+    shownFormat: (fmt) => `显示格式「${fmt}」无法识别`,
+    shownConv: (conv) => `换算「${conv}」无法识别`,
+    shownTextConv: (conv) => `文字不能换算为「${conv}」`,
+    shownRatioScale: (conv) => `比率不能换算为「${conv}」`,
+    shownPctUnit: '单位已是百分号，不能再换算为百分数',
+    shownDecimals: (d) => `小数位「${d}」无法识别`,
+    shownZero: '按显示规则会显示为 0',
+    shownTooLong: '数值位数超出可显示的范围',
+    shownNotFinite: '不是有限的数值',
+    shownInexact: '数值超出浏览器能精确表示的范围，文件里也找不到它的原文',
+    shownUnit: '口径卡记下的单位不是文字',
+    shownShape: '值是对象或列表，本页无法按系统的显示规则重新渲染',
+    shownDigits: '数字文本中含非 ASCII 数字，本页无法按系统的显示规则重新渲染',
+    shownDisplay: (v) => `报告文档记下的单元格显示规则版本「${v}」无法识别`,
+    shownOld: '这个浏览器不支持按系统的显示规则重新渲染（缺少 BigInt 或 Unicode 正则）',
+    shownBroken: '重新渲染时出错',
     numAria: (kind, text, result) => `${kind === 'value' ? '取值' : '数字'} ${text}，${result}，查看出处`,
     statusOk: (seq, what) => `与第 ${seq} 条事件（${what}）一致`,
     statusMismatch: (claim, seq, what) => `文件里写的是「${claim}」，与封存范围内最后一条结束类事件（第 ${seq} 条，${what}）不符`,
@@ -168,14 +190,16 @@
     tierAbsent: (seq) => `第 ${seq} 条事件（出具判定）的内容未随文件附带：导出时不会出现这种情况，文件可能被改过`,
     metaNeedsManifest: '封存清单没有通过核对，事件的类型和序号不可信，无法对照',
     dResult: '核对结果', dSource: '出处', dNode: '来源节点', dCaliber: '口径', dCited: '引用的值', dCard: '口径卡里的值',
-    dCell: '快照里的值', dShown: '正文显示', dShownNote: '显示格式由服务端渲染', dArtifact: '所在工件', dReport: '所在报告',
+    dCell: '快照里的值', dShown: '正文显示', dShownSame: '与按显示规则渲染的结果一致', dExpected: '按显示规则应为',
+    dArtifact: '所在工件', dReport: '所在报告',
     dSql: 'SQL', dRow: (row) => `快照第 ${row + 1} 行`,
     nullValue: '空值（NULL）',
     appendedNote: '这些事件追加在封存之后，不在封存范围内，不参与清单核对，也不能当作证据。',
     appendedTag: '封存之后追加，不在封存范围内',
     shaSubtle: 'SHA-256 由浏览器内置实现计算（crypto.subtle）',
     shaJs: 'SHA-256 由本页内置的实现计算（浏览器未提供 crypto.subtle），结果与浏览器内置实现一致',
-    renderNote: '数字的显示格式（千分位、单位、小数位）由服务端渲染；本页核对的是引用的值，不重新排版。',
+    renderNote: '正文里带出处的数字和取值，本页按系统的显示规则（千分位、小数位、单位、万 / 亿换算、百分数，文字压成一行）'
+      + '把口径卡或快照里的值重新渲染一遍，与显示的文字逐字比对。',
     schema: (s) => `文件格式 ${s}`,
   }
 
@@ -348,7 +372,7 @@
     return textOf(m).replace(/\s+/g, ' ').trim() === textOf(t).replace(/\s+/g, ' ').trim()
   }
 
-  /** locate_cell：(那一格的原值, 列名)。列号换成列名；行是对象时按键取 */
+  /** locate_cell：(那一格的原值, 列名, 这一格在行里的下标或键)。列号换成列名；行是对象时按键取 */
   function locateCell(table, row, column) {
     if (!isObj(table) || !Array.isArray(table.rows)) throw new Error('快照里没有表格数据')
     const rows = table.rows
@@ -367,17 +391,287 @@
     }
     if (isObj(record)) {
       if (!Object.prototype.hasOwnProperty.call(record, name)) throw new Error(`没有列「${name}」`)
-      return [record[name], name]
+      return [record[name], name, name]
     }
     const index = columns.indexOf(name)
     if (index < 0) throw new Error(`没有列「${name}」`)
     if (!Array.isArray(record) || index >= record.length) throw new Error(`第 ${row} 行中没有「${name}」对应的单元格`)
-    return [record[index], name]
+    return [record[index], name, index]
   }
 
   function columnKind(table, column) {
     const kind = own(own(table, 'column_types'), column)
     return typeof kind === 'string' ? kind : null
+  }
+
+  // ------------------------------------------------------------------ 显示规则：照搬 engine/evidence.py
+  //
+  // 正文里带出处的数字和取值，字是服务端按引用的值渲染的（render_number / render_cell）。这里按同样的规则把口径卡、快照里
+  // 的值再渲染一遍，和正文显示的字逐字比对：只改显示文字、重算全部哈希的伪造（74,613.65元 改成 84,613.65元、华南改成
+  // 华东）在这里露馅。数照 Python 的 Decimal 算：系数用 BigInt 存，位数照原样记，四舍五入是 ROUND_HALF_UP（一半远离 0）；
+  // 浮点取 repr 的那串字（和 JS 的 String 同一个最短写法），整数取 JSON 原文（超过 2^53 的，JSON.parse 读成 double 会丢位）。
+  // 服务端渲染不出来的（引用就算解析不了，正常导出不会出现）和本页没有移植的写法一律抛 Unshown：核对结果是「无法核对」，
+  // 不是通过
+
+  /** 显示文字核对不了：不认识的格式、本页没有移植的写法 */
+  class Unshown extends Error {}
+
+  const FORMATS = ['plain', 'thousands', 'percent_of_ratio']
+  const MISSING = '—'
+  /** 换算成万、亿：小数点左移几位 */
+  const CONV_SCALE = { '万': 4, '亿': 8 }
+  const CONV_PLACES = /^\.([0-6])$/
+  const MAX_PLACES = 100
+  const MAX_DIGITS = 1000
+  /** Python 的 int() 最多认这么多位：更长的整数文本 cell_value 照文本 */
+  const INT_DIGITS = 4300
+  /** Python 的空白（str.isspace()，re 的 \s 同一套）：比 JS 的 \s 多 \x1c–\x1f、\x85，少 U+FEFF */
+  const PY_SPACE = '\\t\\n\\v\\f\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000'
+  const PY_RUNS = new RegExp(`[${PY_SPACE}]+`, 'g')
+  const PY_EDGES = new RegExp(`^[${PY_SPACE}]+|[${PY_SPACE}]+$`, 'g')
+  // 较早的浏览器没有 BigInt、不认 \p{…}：只是显示文字核对不了（判无法核对），整段脚本不能因此出错，别的照常核对
+  const BIG = typeof BigInt === 'function' ? BigInt : null
+  const unicode = (source) => {
+    try {
+      return new RegExp(source, 'u')
+    } catch (e) {
+      return null
+    }
+  }
+  // Python 的 \d 认所有 Unicode 十进制数字：_NUMERIC_TEXT、_ISO_DATETIME 照这个认
+  const PY_NUMERIC = unicode(`^[${PY_SPACE}]*-?(?:0|[1-9]\\p{Nd}*)(?:\\.\\p{Nd}+)?(?:E[+-]?\\p{Nd}+)?[${PY_SPACE}]*$`)
+  const ISO_DATETIME = unicode('^(\\p{Nd}{4}-\\p{Nd}{2}-\\p{Nd}{2})T(\\p{Nd}{2}:\\p{Nd}{2}(?::\\p{Nd}{2}(?:\\.\\p{Nd}+)?)?'
+    + '(?:Z|[+-]\\p{Nd}{2}:?\\p{Nd}{2})?)$')
+
+  const pyStrip = (text) => text.replace(PY_EDGES, '')
+  /** _clean：文本值压成一行 */
+  const pyClean = (text) => pyStrip(text.replace(PY_RUNS, ' '))
+
+  /** 十进制数 { neg, coef, exp }：(−1)^neg × coef × 10^exp，coef 是非负的 BigInt。text 是 JSON 的数、数字文本或 String(数) */
+  function decimalOf(text) {
+    if (!BIG) throw new Unshown(T.shownOld)
+    const m = /^(-?)(\d+)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text)
+    if (!m) throw new Unshown(T.shownBroken)
+    const frac = m[3] || ''
+    return { neg: m[1] === '-', coef: BIG(m[2] + frac), exp: Number(m[4] || 0) - frac.length }
+  }
+
+  const isZero = (d) => d.coef === BIG(0)
+  const width = (coef) => coef.toString().length
+
+  /** Decimal.adjusted()：最高位的指数 */
+  const adjusted = (d) => (isZero(d) ? d.exp : width(d.coef) - 1 + d.exp)
+
+  /** Decimal.quantize：舍入到 10^exp 这一位，ROUND_HALF_UP（一半远离 0） */
+  function quantize(d, exp) {
+    if (d.exp >= exp) return { neg: d.neg, coef: d.coef * BIG(10) ** BIG(d.exp - exp), exp }
+    const shift = exp - d.exp
+    // 要舍掉的位数比系数还多：不到一半，舍成 0（不必真去算 10 的几万次方）
+    if (shift > width(d.coef)) return { neg: d.neg, coef: BIG(0), exp }
+    const unit = BIG(10) ** BIG(shift)
+    const up = (d.coef % unit) * BIG(2) >= unit ? BIG(1) : BIG(0)
+    return { neg: d.neg, coef: d.coef / unit + up, exp }
+  }
+
+  /** Decimal.normalize：去掉尾零，0 写成 0E0 */
+  function normalize(d) {
+    if (isZero(d)) return { neg: d.neg, coef: d.coef, exp: 0 }
+    let { coef, exp } = d
+    while (coef % BIG(10) === BIG(0)) {
+      coef /= BIG(10)
+      exp++
+    }
+    return { neg: d.neg, coef, exp }
+  }
+
+  /** format(Decimal, ',f')：定点写法，group 时整数部分千分位。0 不带负号（服务端 copy_abs），正指数的 0 写成「0」 */
+  function fixed(d, group) {
+    const exp = isZero(d) && d.exp > 0 ? 0 : d.exp
+    let digits = d.coef.toString()
+    let int = digits
+    let frac = ''
+    if (exp > 0) int = digits + '0'.repeat(exp)
+    else if (exp < 0) {
+      digits = digits.padStart(1 - exp, '0')
+      int = digits.slice(0, digits.length + exp)
+      frac = digits.slice(digits.length + exp)
+    }
+    if (group) {
+      let out = ''
+      for (let end = int.length; end > 0; end -= 3) out = int.slice(Math.max(0, end - 3), end) + (out ? `,${out}` : '')
+      int = out
+    }
+    return (d.neg && !isZero(d) ? '-' : '') + int + (frac ? `.${frac}` : '')
+  }
+
+  /** _digits：按小数位四舍五入后写出来。不是 0 的值写出来成了 0，服务端不写（引用算解析不了） */
+  function digitsOf(d, places, group, strip) {
+    const q = quantize(d, places == null ? -10 : -places)
+    if (isZero(q) && !isZero(d)) throw new Unshown(T.shownZero)
+    return fixed(places == null || strip ? normalize(q) : q, group)
+  }
+
+  const shifted = (d, k) => ({ neg: d.neg, coef: d.coef, exp: d.exp + k })
+
+  /** _render_numeric：万 / 亿留两位、去尾零，单位接在后面；pct、比率乘 100 加 %（不接单位）；int、.N 改小数位 */
+  function renderNumeric(d, unit, decimals, fmt, conv) {
+    if (adjusted(d) >= MAX_DIGITS) throw new Unshown(T.shownTooLong)
+    const ratio = fmt === 'percent_of_ratio'
+    const group = fmt !== 'plain'
+    if (typeof conv === 'string' && Object.prototype.hasOwnProperty.call(CONV_SCALE, conv)) {
+      if (ratio) throw new Unshown(T.shownRatioScale(conv))
+      return digitsOf(shifted(d, -CONV_SCALE[conv]), 2, true, true) + conv + unit
+    }
+    if (conv === 'pct') {
+      if (unit.includes('%') || unit.includes('％')) throw new Unshown(T.shownPctUnit)
+      return `${digitsOf(shifted(d, 2), decimals != null ? Math.max(decimals - 2, 0) : 1, group, false)}%`
+    }
+    let places
+    if (conv === 'int') places = 0
+    else if (typeof conv === 'string' && CONV_PLACES.test(conv)) places = Number(conv.slice(1))
+    else if (conv) throw new Unshown(T.shownConv(conv))
+    else places = decimals == null ? null : ratio ? Math.max(decimals - 2, 0) : decimals
+    if (ratio) return `${digitsOf(shifted(d, 2), places, group, false)}%`
+    return digitsOf(d, places, group, false) + unit
+  }
+
+  /** _decimal：JSON 里的数 → 十进制数。token 是它在 JSON 里的原文：整数按原文取精确值，浮点按 repr 的那串字 */
+  function pyDecimal(value, token) {
+    if (typeof token === 'string' && /^-?\d+$/.test(token)) return decimalOf(token)
+    if (!Number.isFinite(value)) throw new Unshown(T.shownNotFinite)
+    // 没有原文（找不到它在文件里的位置）：浮点和 2^53 以内的整数，String 就是 Python 的写法；更大的整数不知道原来的位
+    if (typeof token !== 'string' && Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new Unshown(T.shownInexact)
+    }
+    return decimalOf(String(value))
+  }
+
+  /**
+   * render_number：口径卡里的指标按卡上的格式渲染（单元格也走这里，格式是千分位）。token 是值在 JSON 里的原文（数才有），
+   * decimalsToken 是小数位的原文：写成 2.0 的在 Python 里是浮点，服务端不认
+   */
+  function renderNumber(value, token, { unit = '', decimals = null, decimalsToken = null, fmt = null, conv = null } = {}) {
+    const format = fmt || 'thousands'
+    if (!FORMATS.includes(format)) throw new Unshown(T.shownFormat(format))
+    if (value == null) return MISSING
+    if (typeof value !== 'number') {
+      if (conv) throw new Unshown(T.shownTextConv(conv))
+      if (typeof value === 'boolean') return value ? '是' : '否'
+      if (typeof value === 'string') return pyClean(value)
+      throw new Unshown(T.shownShape)
+    }
+    if (decimals != null && (typeof decimals !== 'number' || !Number.isInteger(decimals) || Math.abs(decimals) > MAX_PLACES
+      || (typeof decimalsToken === 'string' && !/^-?\d+$/.test(decimalsToken)))) {
+      throw new Unshown(T.shownDecimals(decimalsToken ?? decimals))
+    }
+    return renderNumeric(pyDecimal(value, token), unit, decimals, format, conv)
+  }
+
+  /**
+   * render_cell(shown(raw))：快照里的一格。kind 是查询时记下的列类型，display 是报告文档记下的单元格显示规则版本
+   * （2 版起 ISO 日期时间的 T 换成空格）。DECIMAL 落成的数字文本按数渲染、不经 float；文字压成一行，竖线换成 ¦
+   */
+  function renderCell(raw, token, conv, kind, display) {
+    if (display !== 1 && display !== 2) throw new Unshown(T.shownDisplay(display))
+    if (!PY_NUMERIC || !ISO_DATETIME) throw new Unshown(T.shownOld)
+    let value = raw
+    if (display >= 2 && typeof raw === 'string') {
+      const m = ISO_DATETIME.exec(pyStrip(raw))
+      if (m) value = `${m[1]} ${m[2]}`
+    }
+    if (typeof value === 'string' && kind !== 'text' && PY_NUMERIC.test(value)) {
+      const text = pyStrip(value)
+      // Python 把全角、阿拉伯文这些数字也当数（int('1٢٣') 是 123），本页只照 ASCII 算
+      if (/[^\x00-\x7f]/.test(text)) throw new Unshown(T.shownDigits)
+      if (!/^-?\d+$/.test(text) || text.replace('-', '').length <= INT_DIGITS) {
+        return renderNumeric(decimalOf(text), '', null, 'thousands', conv)
+      }
+    }
+    // 对象、列表：服务端按 Python 的 json.dumps 写（键的先后、浮点的写法），本页没有移植
+    if (isObj(value) || Array.isArray(value)) throw new Unshown(T.shownShape)
+    return renderNumber(value, token, { conv }).replace(/\|/g, '¦')
+  }
+
+  /**
+   * JSON 文本里每个数的原文。交回和 JSON.parse 同形状的一棵树：对象是 Map（键重复时后面的算，同 JSON.parse），数组是
+   * 数组，数是它的原文，别的值是 null。Python 写出的裸 NaN、Infinity、-Infinity 也认（同 parseJson）。读不了抛错
+   */
+  function numberTokens(text) {
+    const NUMBER = /-?(?:Infinity|(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)|NaN/y
+    const WORD = /true|false|null/y
+    let at = 0
+    const fail = () => {
+      throw new Error('JSON 格式有误')
+    }
+    const skip = () => {
+      while (at < text.length && ' \t\n\r'.includes(text[at])) at++
+    }
+    const string = () => {
+      const from = at++
+      while (at < text.length && text[at] !== '"') at += text[at] === '\\' ? 2 : 1
+      if (at >= text.length) fail()
+      at++
+      return text.slice(from, at)
+    }
+    const value = () => {
+      skip()
+      const c = text[at]
+      if (c === '{' || c === '[') {
+        const object = c === '{'
+        const close = object ? '}' : ']'
+        const out = object ? new Map() : []
+        at++
+        skip()
+        if (text[at] === close) {
+          at++
+          return out
+        }
+        for (;;) {
+          if (object) {
+            skip()
+            if (text[at] !== '"') fail()
+            const key = JSON.parse(string())
+            skip()
+            if (text[at++] !== ':') fail()
+            out.set(key, value())
+          } else {
+            out.push(value())
+          }
+          skip()
+          const next = text[at++]
+          if (next === close) return out
+          if (next !== ',') fail()
+        }
+      }
+      if (c === '"') {
+        string()
+        return null
+      }
+      for (const re of [NUMBER, WORD]) {
+        re.lastIndex = at
+        const m = re.exec(text)
+        if (m) {
+          at = re.lastIndex
+          return re === NUMBER ? m[0] : null
+        }
+      }
+      return fail()
+    }
+    const tree = value()
+    skip()
+    if (at !== text.length) fail()
+    return tree
+  }
+
+  /** numberTokens 的树里一处的原文：path 是一串键和下标。不是数、找不到都是 null */
+  function tokenAt(tree, path) {
+    let node = tree
+    for (const key of path) {
+      if (node instanceof Map) node = node.has(key) ? node.get(key) : null
+      else if (Array.isArray(node) && Number.isInteger(key)) node = key >= 0 && key < node.length ? node[key] : null
+      else return null
+    }
+    return typeof node === 'string' ? node : null
   }
 
   // ------------------------------------------------------------------ 核对
@@ -399,14 +693,28 @@
     return found
   }
 
+  /** 文档里的每个片段和它在文档 JSON 里的位置（引用的值按原文取，见 numberTokens） */
   function* segmentsOf(doc) {
-    for (const block of Array.isArray(doc.blocks) ? doc.blocks : []) {
-      for (const unit of isObj(block) && Array.isArray(block.units) ? block.units : []) {
-        for (const seg of isObj(unit) && Array.isArray(unit.segments) ? unit.segments : []) {
-          if (isObj(seg)) yield seg
+    const list = (holder, key) => (isObj(holder) && Array.isArray(holder[key]) ? holder[key] : [])
+    for (const [b, block] of list(doc, 'blocks').entries()) {
+      for (const [u, unit] of list(block, 'units').entries()) {
+        for (const [s, seg] of list(unit, 'segments').entries()) {
+          if (isObj(seg)) yield [seg, ['blocks', b, 'units', u, 'segments', s]]
         }
       }
     }
+  }
+
+  /** 一份嵌入工件里每个数的原文（numberTokens）：用到时才算，只算一次；算不出来是 null */
+  function tokensOf(item) {
+    if (item.tokens === undefined) {
+      try {
+        item.tokens = numberTokens(decoder.decode(fromBase64(item.a.b64)))
+      } catch (e) {
+        item.tokens = null
+      }
+    }
+    return item.tokens
   }
 
   /** shownSeal：页面顶部直接写出的封存哈希（服务端渲染进模板，不执行脚本也看得到的那一份） */
@@ -581,9 +889,11 @@
       const doc = trusted.get(report) || (art && art.parsed && isObj(art.loose) ? art.loose : null)
       out.docs.push({ report, art, link, doc, trusted: trusted.has(report) })
       if (!doc) continue
-      for (const seg of segmentsOf(doc)) {
+      for (const [seg, path] of segmentsOf(doc)) {
         if (seg.kind !== 'number' && seg.kind !== 'value') continue
-        const check = trusted.has(report) ? checkNumber(seg, doc, arts, chained)
+        // 引用的值在文档 JSON 里的原文：超过 2^53 的整数照原文写进原因和出处面板
+        const citedToken = () => tokenAt(tokensOf(art), [...path, 'cite', 'value'])
+        const check = trusted.has(report) ? checkNumber(seg, doc, arts, chained, citedToken)
           : { result: NA, reason: T.numDocUntrusted, source: describe(seg, doc) }
         out.numbers.push({ ...check, seg, report, key: `${report.node_id}|${seg.id}` })
       }
@@ -608,7 +918,11 @@
     return T.srcOther
   }
 
-  function checkNumber(seg, doc, arts, chained) {
+  /**
+   * citedToken() 交回引用的值在文档 JSON 里的原文（数才有）。引用的值对上了，再核正文显示的字（checkShown）：两样都对上
+   * 才算通过
+   */
+  function checkNumber(seg, doc, arts, chained, citedToken = () => null) {
     const cite = isObj(seg.cite) ? seg.cite : null
     const source = describe(seg, doc)
     if (!cite) return { result: NA, reason: T.numUncited, source }
@@ -631,26 +945,76 @@
       return { ...info, result: NA, reason: art.a.masked ? art.reason : art.a.missing ? T.artifactMissing : T.numArtifactUnparsable }
     }
     if (!chained.has(entry.artifact)) return { ...info, result: NA, reason: T.numNotChained }
+    info.citedToken = citedToken()
     if (cite.kind === 'metric') {
       const metricId = own(cite.locator, 'metric') ?? own(entry.locator, 'metric')
       const metrics = Array.isArray(art.json.metrics) ? art.json.metrics : []
-      const metric = metrics.find((m) => isObj(m) && m.id === metricId)
+      const at = metrics.findIndex((m) => isObj(m) && m.id === metricId)
+      const metric = metrics[at]
       info.card = art.json
       if (!metric) return { ...info, result: FAIL, reason: T.numNoMetric }
       info.truth = metric.value
-      return sameValue(cite.value, metric.value) ? { ...info, result: PASS } : { ...info, result: FAIL, reason: T.numMetricDiffers }
+      info.truthToken = tokenAt(tokensOf(art), ['metrics', at, 'value'])
+      if (!sameValue(cite.value, metric.value)) return { ...info, result: FAIL, reason: T.numMetricDiffers }
+      // 口径卡上记着这个指标的单位、小数位、显示格式，报告里另写的换算记在引用上
+      return checkShown(info, seg, () => renderNumber(metric.value, info.truthToken, {
+        unit: unitOf(metric.unit), decimals: metric.decimals,
+        decimalsToken: tokenAt(tokensOf(art), ['metrics', at, 'decimals']), fmt: metric.format, conv: convOf(cite) }))
     }
     const loc = isObj(cite.locator) ? cite.locator : {}
     info.snapshot = art.json
+    let cell
     try {
-      const [raw, column] = locateCell(art.json, loc.row, loc.column)
+      const [raw, column, key] = locateCell(art.json, loc.row, loc.column)
       info.row = loc.row
       info.column = column
       info.truth = cellValue(raw, columnKind(art.json, column))
+      info.truthToken = tokenAt(tokensOf(art), ['rows', loc.row, key])
+      cell = { raw, column }
     } catch (e) {
       return { ...info, result: FAIL, reason: T.numNoCell(e.message) }
     }
-    return sameValue(cite.value, info.truth) ? { ...info, result: PASS } : { ...info, result: FAIL, reason: T.numCellDiffers }
+    if (!sameValue(cite.value, info.truth)) return { ...info, result: FAIL, reason: T.numCellDiffers }
+    const display = Object.prototype.hasOwnProperty.call(doc, 'cell_display') ? doc.cell_display : 1
+    return checkShown(info, seg, () => renderCell(cell.raw, info.truthToken, convOf(cite),
+      columnKind(art.json, cell.column), display))
+  }
+
+  /** 引用上记的换算（|万、|pct 这类），没写是 null */
+  const convOf = (cite) => (own(cite, 'conv') === undefined ? null : cite.conv)
+
+  /** 口径卡的单位：服务端是 str(unit or "")，不是文字的本页不认 */
+  function unitOf(unit) {
+    if (!unit) return ''
+    if (typeof unit !== 'string') throw new Unshown(T.shownUnit)
+    return unit
+  }
+
+  /** 数的写法：超过 2^53 的整数照 JSON 原文（String 会丢位），别的同 String */
+  const numberText = (value, token) => (typeof token === 'string' && /^-?\d+$/.test(token) && !Number.isSafeInteger(value)
+    ? token : String(value))
+
+  /** 出处面板里的值：数同 numberText，别的同 valueText */
+  const exactText = (value, token) => (typeof value === 'number' ? numberText(value, token) : valueText(value))
+
+  /**
+   * 正文显示的字和按显示规则渲染出来的字逐字比对，只去掉首尾空白。渲染不出来的判无法核对：不认识的格式不能当成核对过了。
+   * 对不上的点名两样：正文显示的字、引用的值（加上按显示规则应显示的字，和引用的值写法一样时不写）
+   */
+  function checkShown(info, seg, render) {
+    let expected
+    try {
+      expected = render()
+    } catch (e) {
+      return { ...info, result: NA, reason: T.numShownUnknown(e instanceof Unshown ? e.message : T.shownBroken) }
+    }
+    info.expected = expected
+    const shown = String(seg.text ?? '')
+    if (pyStrip(shown) === expected) return { ...info, result: PASS }
+    const value = info.cite.value
+    const cited = typeof value === 'number' ? numberText(value, info.citedToken) : value == null ? null : textOf(value)
+    return { ...info, result: FAIL, reason: T.numShownDiffers(shown, cited == null ? T.nullValue : `「${cited}」`,
+      expected === cited ? null : expected) }
   }
 
   /**
@@ -966,16 +1330,19 @@
   function detailOf(number) {
     const cite = isObj(number.seg.cite) ? number.seg.cite : null
     const card = number.card
-    // 只有带出处的数字是服务端按引用的值渲染的；模型自己写的数、表格里的文字取值都是原文
-    const rendered = number.seg.kind === 'number' && cite && cite.status === 'resolved'
+    // 显示文字核对过的（引用的值对上了，按显示规则渲染得出来）：一致时注明，对不上时另列应显示的字。没有出处的数、
+    // 核对不了的引用不写：那些字没人重新渲染过
+    const checked = typeof number.expected === 'string'
+    const same = checked && number.result === PASS
     const rows = [
       [T.dResult, [badge(number.result), number.reason ? ` ${number.reason}` : '']],
       [T.dSource, number.source],
       number.node ? [T.dNode, nodeLabel(number.node)] : null,
       card ? [T.dCaliber, [card.caliber || '—', card.caliber_version ? ` ${card.caliber_version}` : ''].join('')] : null,
-      cite && cite.status === 'resolved' && 'value' in cite ? [T.dCited, valueText(cite.value)] : null,
-      'truth' in number ? [number.kind === 'metric' ? T.dCard : T.dCell, valueText(number.truth)] : null,
-      [T.dShown, [String(number.seg.text ?? ''), rendered ? h('span', { class: 'muted' }, `（${T.dShownNote}）`) : null]],
+      cite && cite.status === 'resolved' && 'value' in cite ? [T.dCited, exactText(cite.value, number.citedToken)] : null,
+      'truth' in number ? [number.kind === 'metric' ? T.dCard : T.dCell, exactText(number.truth, number.truthToken)] : null,
+      checked && !same ? [T.dExpected, number.expected] : null,
+      [T.dShown, [String(number.seg.text ?? ''), same ? h('span', { class: 'muted' }, `（${T.dShownSame}）`) : null]],
       number.artifact ? [T.dArtifact, [h('code', {}, short(number.artifact)), artifactState(number.artifact)]] : null,
       [T.dReport, nodeLabel(number.report.node_id)],
     ]
@@ -1229,6 +1596,14 @@
     $('detail-close').addEventListener('click', closeDetail)
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDetail() })
     document.documentElement.setAttribute('data-verified', '')
+  }
+
+  // 在 node 里载入（tests/test_bundle_shown.py 拿服务端的渲染逐条对照、整份核对）：没有页面，交出核对用的纯函数就停
+  if (typeof document === 'undefined') {
+    if (typeof module === 'object' && module) {
+      module.exports = { verify, renderNumber, renderCell, numberTokens, tokenAt, parseJson, Unshown }
+    }
+    return
   }
 
   // 脚本在 head 里：一开始执行就标上 data-js，样式表据此把「尚未核对」换成「正在核对」；文档解析完再核对

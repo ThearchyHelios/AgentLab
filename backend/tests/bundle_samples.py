@@ -23,6 +23,10 @@
   快照随文件附带，数字核对得过）和选出了号码的那份会员消费（只给哈希）
 - nan：运行开始事件和门店流水快照里有 json.dumps 写出的裸 NaN（快照里那一列报告没有引用）
 - stray：报告自查记下的文档是另一次运行写的
+- formats：经营月报，每种显示格式各引用一处：口径卡的千分位加货币单位、换算成万 / 亿、比率显示成百分数、负数、不分组、
+  小数位与 |.N / |int、pct；流水快照里的文字取值（地区）、DECIMAL 落成的数字文本、负数、换算成万、超过 2^53 的订单号、
+  ISO 日期时间（文档记下 2 版显示规则）。check-bundle 在它上面只改显示文字做伪造，tests/test_bundle_shown.py 在 node 里
+  逐个格式核一遍
 """
 from __future__ import annotations
 
@@ -62,6 +66,31 @@ WEEKLY = ("## 门店周报\n\n本周销售额 [[m:gmv]]，*按发生周统计*�
           "**会员消费** [[v:Q2.r0.spend]]，另有 42 笔退款待入账。[[see:Q1]]\n\n- 云岭店流水最高\n- 枫桥店流水最低\n\n"
           "[[table:Q1 cols=store,amount rows=0-7]]")
 MONTHLY = "## 门店月报\n\n本月销售额 [[m:gmv]]，青石店流水 [[v:Q1.r0.amount]]。[[see:Q1]]"
+
+#: 经营月报的口径卡：每个指标一种显示格式（千分位加货币单位、不分组、比率显示成百分数、负数、小数位、不写小数位）
+FORMATS_CARD = {"kind": "metric_set", "caliber": "经营月报口径", "caliber_version": "v1", "metrics": [
+    {"id": "gmv", "name": "销售额", "value": 74613.65, "unit": "元", "decimals": 2, "format": "thousands"},
+    {"id": "annual", "name": "年度销售额", "value": 1234567890.5, "unit": "元", "decimals": 2, "format": "thousands"},
+    {"id": "refund", "name": "退款", "value": -3120.5, "unit": "元", "decimals": 2, "format": "thousands"},
+    {"id": "conv_rate", "name": "转化率", "value": 0.0235, "unit": "", "decimals": 4, "format": "percent_of_ratio"},
+    {"id": "growth", "name": "环比", "value": -0.0815, "unit": "", "decimals": 3, "format": "percent_of_ratio"},
+    {"id": "orders", "name": "订单数", "value": 12840, "unit": "单", "decimals": 0, "format": "plain"},
+    {"id": "avg", "name": "客单价", "value": 5.8113, "unit": "元", "decimals": 2, "format": "thousands"},
+    {"id": "share", "name": "线上占比", "value": 0.346, "unit": "", "decimals": None, "format": "thousands"},
+    {"id": "export", "name": "出口额", "value": 15230.4, "unit": "美元", "decimals": 1, "format": "thousands"},
+]}
+#: 经营流水：地区是文字，金额一格是 DECIMAL 落成的数字文本、一格是负数，订单号超过 2^53，付款时间是 ISO 日期时间
+LEDGER = {"columns": ["region", "gmv", "order_no", "paid_at"],
+          "column_types": {"region": "text", "gmv": "number", "order_no": "number", "paid_at": "datetime"},
+          "rows": [["华南", "45678.50", 202609071234567890, "2026-09-07T08:21:39"],
+                   ["华东", -1200.75, 202609071234567891, "2026-09-08T19:02:11"]],
+          "source": "shop", "sql": "SELECT region, gmv, order_no, paid_at FROM ledger ORDER BY region DESC",
+          "truncated": False}
+FORMATS = ("## 经营月报\n\n本月销售额 [[m:gmv]]（约 [[m:gmv|万]]），年度累计 [[m:annual|亿]]，退款 [[m:refund]]。"
+           "转化率 [[m:conv_rate]]，环比 [[m:growth]]，订单 [[m:orders]]。客单价 [[m:avg]]，精确些是 [[m:avg|.3]]，"
+           "取整是 [[m:avg|int]]；线上占比 [[m:share|pct]]，出口额 [[m:export]]。\n\n"
+           "[[v:Q1.r0.region]]流水 [[v:Q1.r0.gmv]]（约 [[v:Q1.r0.gmv|万]]），[[v:Q1.r1.region]]冲减 [[v:Q1.r1.gmv]]。"
+           "最大一单的订单号 [[v:Q1.r0.order_no]]，付款时间 [[v:Q1.r0.paid_at]]。[[see:Q1]]")
 #: 会员周报：Q3 是会员按地区汇总（没碰遮罩列），Q2 是选出了号码的会员消费
 MEMBERS = ("## 会员周报\n\n华东会员消费 [[v:Q3.r0.spend]]，华南 [[v:Q3.r1.spend]]。[[see:Q3]]\n\n"
            "会员林一消费 [[v:Q2.r0.spend]]。")
@@ -94,18 +123,20 @@ def masked_card(crm_id: str) -> dict[str, Any]:
 
 class Sample:
     """一次虚构的已封存运行：工件（原字节）、证据目录、报告文档、事件。masked=True 时口径卡带着取自遮罩列的输入；
-    regions=True 时会员库另有一次按地区汇总的查询（目录里排在 Q3）。"""
+    regions=True 时会员库另有一次按地区汇总的查询（目录里排在 Q3）。card、table 换掉口径卡和门店流水的快照（经营月报）。"""
 
-    def __init__(self, *, nan: bool = False, masked: bool = False, regions: bool = False) -> None:
+    def __init__(self, *, nan: bool = False, masked: bool = False, regions: bool = False,
+                 card: dict[str, Any] | None = None, table: dict[str, Any] | None = None) -> None:
         self.files: dict[str, bytes] = {}
-        self.shop_id = self.put(shop(nan))
+        snapshot = table or shop(nan)
+        self.shop_id = self.put(snapshot)
         self.crm_id = self.put(CRM)
-        self.card = masked_card(self.crm_id) if masked else CARD
+        self.card = card or (masked_card(self.crm_id) if masked else CARD)
         self.card_id = self.put(self.card)
         self.entries = {
             "fetch": {"kind": "query", "node_id": "fetch", "exec": 1, "artifact": self.shop_id,
-                      "tool": "db_query__shop", "source": "shop", "columns": ["store", "amount", "ratio"],
-                      "rows": len(STORES), "truncated": False},
+                      "tool": "db_query__shop", "source": "shop", "columns": snapshot["columns"],
+                      "rows": len(snapshot["rows"]), "truncated": False},
             "members": {"kind": "query", "node_id": "members", "exec": 1, "artifact": self.crm_id,
                         "tool": "db_query__crm", "source": "crm", "columns": CRM["columns"], "rows": len(CRM["rows"]),
                         "truncated": False},
@@ -189,60 +220,74 @@ class Sample:
         return rows, bound
 
 
-def render(sample: Sample, events: list[tuple[int, str, str | None, Any]], bound: int, *, run: dict[str, Any] | None = None,
-           legacy: bool = False, drop: tuple[str, ...] = (), source_masks: dict[str, list[str]] | None = None) -> str:
-    """真实封存哈希的页面。drop：导出时服务端已没有文件的工件；source_masks：数据源现在设的遮罩。"""
+def build(sample: Sample, events: list[tuple[int, str, str | None, Any]], bound: int, *,
+          run: dict[str, Any] | None = None, legacy: bool = False, drop: tuple[str, ...] = (),
+          source_masks: dict[str, list[str]] | None = None) -> dict[str, Any]:
+    """真实封存哈希的页面数据（bundle-data）。drop：导出时服务端已没有文件的工件；source_masks：数据源现在设的遮罩。"""
     sealed = [e for e in events if e[0] <= bound]
     files = {k: v for k, v in sample.files.items() if k not in drop}
-    bundle = build_bundle(run or RUN, events, manifest_seq=bound, manifest_hash=manifest_hash(sealed), read=files.get,
-                          exported_at=EXPORTED_AT, legacy=legacy, graph=GRAPH, source_masks=source_masks or {})
-    return render_html(bundle)
+    return build_bundle(run or RUN, events, manifest_seq=bound, manifest_hash=manifest_hash(sealed), read=files.get,
+                        exported_at=EXPORTED_AT, legacy=legacy, graph=GRAPH, source_masks=source_masks or {})
 
 
-def pages() -> dict[str, str]:
-    """{页面名: HTML}"""
-    out: dict[str, str] = {}
+def formats_bundle() -> dict[str, Any]:
+    """经营月报（formats）的页面数据：每种显示格式各引用一处。"""
+    f = Sample(card=FORMATS_CARD, table=LEDGER)
+    events, bound = f.events({"write": f.doc(FORMATS, "write")})
+    return build(f, events, bound)
+
+
+def bundles() -> dict[str, dict[str, Any]]:
+    """{页面名: 页面数据}"""
+    out: dict[str, dict[str, Any]] = {}
     s = Sample()
     weekly = s.doc(WEEKLY, "write")
     events, bound = s.events({"write": weekly})
-    out["base"] = render(s, events, bound)
-    out["missing-doc"] = render(s, events, bound, drop=(weekly,))
-    out["missing-card"] = render(s, events, bound, drop=(s.card_id,))
+    out["base"] = build(s, events, bound)
+    out["missing-doc"] = build(s, events, bound, drop=(weekly,))
+    out["missing-card"] = build(s, events, bound, drop=(s.card_id,))
     # 早期运行：运行结束事件落库之前封存，范围到它前一条为止（runner.verify_manifest 的老口径）
     finished = next(seq for seq, etype, _, _ in events if etype == "run.finished")
-    out["legacy"] = render(s, events, finished - 1, legacy=True)
+    out["legacy"] = build(s, events, finished - 1, legacy=True)
 
     monthly = s.doc(MONTHLY, "monthly")
     events, bound = s.events({"write": weekly, "monthly": monthly})
-    out["two-reports"] = render(s, events, bound)
+    out["two-reports"] = build(s, events, bound)
 
     events, bound = s.events({"write": weekly}, ending="failed")
-    out["failed"] = render(s, events, bound, run={**RUN, "status": "failed"})
+    out["failed"] = build(s, events, bound, run={**RUN, "status": "failed"})
 
     # 早期运行先失败、经继续运行跑到成功：封存范围同样按结束事件推算，到成功结束的前一条为止
     events, _ = s.events({"write": weekly}, ending="continued")
     finished = next(seq for seq, etype, _, _ in events if etype == "run.finished")
-    out["continued"] = render(s, events, finished - 1, legacy=True)
+    out["continued"] = build(s, events, finished - 1, legacy=True)
 
     events, bound = s.events({"write": weekly}, tiers=("formal", "degraded"))
-    out["degraded"] = render(s, events, bound)
+    out["degraded"] = build(s, events, bound)
 
     stray = s.doc(WEEKLY, "write", run_id="another-run-0000")
     events, bound = s.events({"write": stray})
-    out["stray"] = render(s, events, bound)
+    out["stray"] = build(s, events, bound)
 
     n = Sample(nan=True)
     events, bound = n.events({"write": n.doc(WEEKLY, "write")}, nan=True)
-    out["nan"] = render(n, events, bound)
+    out["nan"] = build(n, events, bound)
 
     m = Sample(masked=True)
     events, bound = m.events({"write": m.doc(WEEKLY, "write")})
-    out["masked-card"] = render(m, events, bound)
+    out["masked-card"] = build(m, events, bound)
 
     r = Sample(regions=True)
     events, bound = r.events({"write": r.doc(MEMBERS, "write")})
-    out["masked-source"] = render(r, events, bound, source_masks={"crm": ["phone"]})
+    out["masked-source"] = build(r, events, bound, source_masks={"crm": ["phone"]})
+
+    out["formats"] = formats_bundle()
     return out
+
+
+def pages() -> dict[str, str]:
+    """{页面名: HTML}"""
+    return {name: render_html(bundle) for name, bundle in bundles().items()}
 
 
 def main(argv: list[str]) -> int:
