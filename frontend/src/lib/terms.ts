@@ -3119,10 +3119,10 @@ export const SCHEDULE_TEXT = {
   get compareLink() { return RUN_COMPARE_TEXT.menu },
   /**
    * 基准不是紧挨着的上一次（上一次失败了、取消了，比的是再往前成功的那一次）时链接上看得见的叫法：触屏没有悬停，
-   * 键盘聚焦时也不显示 title，只在悬停里说明会让人以为比的就是上一次。运行详情「更多」里的菜单项点之前还不知道基准
-   * 是哪一次，这时仍叫「与上一次对比」，两处叫法不同；进了对比页都写「默认基准：同一定时任务上一次成功的运行」
+   * 键盘聚焦时也不显示 title，只在悬停里说明会让人以为比的就是上一次。运行详情「更多」里的菜单项按服务端给的 previous
+   * 用同一个叫法（同为 getter）；进了对比页都写「默认基准：同一定时任务上一次成功的运行」
    */
-  compareLinkLastOk: '与上一次成功的运行对比',
+  get compareLinkLastOk() { return RUN_COMPARE_TEXT.menuLastOk },
   /**
    * 悬停写各类指标的个数，和 Webhook 通知里那一行同一个写法（服务端 scheduler/auto_compare.py 的 summary_text）：
    * 变化三分法的三类总写上，0 个也写；其余各类有才写，次序同对比页；两边都没有指标时不写一串 0 个。只有个数，
@@ -3189,8 +3189,11 @@ export const SCHEDULE_TEXT = {
 export const RUN_COMPARE_TEXT = {
   title: '运行对比',
   hint: '把两次运行的指标变化拆成数据、口径、模板与 SQL 三类',
-  // 入口：运行详情的「更多」菜单
+  // 入口：运行详情的「更多」菜单。叫法看服务端给的 previous（基准是不是紧挨着的上一次），和定时任务触发历史里的同名
+  // 链接一个说法（SCHEDULE_TEXT.compareLink、compareLinkLastOk 取的就是这两条）
   menu: '与上一次对比',
+  /** 上一次失败、取消、还没结束：基准是再往前成功的那一次，不能说成「上一次」 */
+  menuLastOk: '与上一次成功的运行对比',
   menuSealedOnly: '运行结束并封存后才能对比',
   /** 没有 workflow_id 的运行：画布、问数据里没保存就运行的，或者工作流删掉之后被置空的。服务端只比同一个已保存的工作流 */
   menuNoWorkflow: '工作流未保存或已删除，无法对比',

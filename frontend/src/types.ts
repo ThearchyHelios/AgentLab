@@ -3436,6 +3436,11 @@ export interface RunCompareBase {
   base_run_id: string
   reason: RunCompareBaseReason | (string & {})
   base: RunCompareRef
+  /**
+   * 基准是不是紧挨着的上一次（服务端 pick_base 算的，同触发历史里自动对比的 previous）：上一次失败、取消、还没结束时
+   * 为 false，运行详情「更多」里的入口据此写「与上一次成功的运行对比」。老服务端不给，按 true 算
+   */
+  previous?: boolean
 }
 
 /**
