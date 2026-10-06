@@ -15,9 +15,9 @@
 // - 深浅色、窄屏：390 宽不横向溢出，点开的数字面板在窄屏上从底部抽出，深色下底是深的、字是浅的；
 // - 样本页：tests/bundle_samples.py 用虚构数据真实生成的几份页面（遮罩快照、两份报告、早期运行、失败结束、先失败后
 //   经继续运行跑到成功的早期运行、两条出具
-//   判定、服务端缺文件、裸 NaN、别的运行的文档），逐份断言各项结果和原因文案；在上面篡改 ④ 引用链（换文档、拿掉报告、
-//   多一份没人引用的工件）、⑥ 运行信息（运行结果、类别、出具档位）、拿掉被引用的口径卡、把口径卡标成遮罩、只改页面顶部
-//   的封存哈希；宽屏点开表格里右对齐的数字不被面板盖住；不执行脚本时封存哈希、运行 ID 照样看得到，状态写「尚未核对」；
+//   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列），逐份断言各项结果和原因文案；在上面篡改 ④
+//   引用链（换文档、拿掉报告、多一份没人引用的工件）、⑥ 运行信息（运行结果、类别、出具档位）、拿掉被引用的口径卡、把
+//   报告文档标成遮罩、只改页面顶部的封存哈希；宽屏点开表格里右对齐的数字不被面板盖住；不执行脚本时封存哈希、运行 ID 照样看得到，状态写「尚未核对」；
 // - 记录页的导出按钮（预览用例 ?syn=bundle-provenance-*，page.route 假装导出接口）：已封存时可点、下载的文件名同服务端；
 //   未封存时不可点并说明原因（左边写着「已封存」却不能点时原因写在屏幕上）；服务端回 409 时提示原因；失败结束的运行
 //   提示之后继续运行会重新封存。
@@ -487,7 +487,7 @@ await section('样本页：各种形状', async () => {
     check('生成样本页（tests/bundle_samples.py）', false, String(e?.message ?? e))
     return
   }
-  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 10, Object.keys(samples).join('、'))
+  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 11, Object.keys(samples).join('、'))
 
   await sample('base', async (s, page) => {
     check('base：总览通过，有无法核对的项时写「可核对的项全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过',
@@ -601,6 +601,19 @@ await section('样本页：各种形状', async () => {
     check('missing-card：引用口径卡的数字无法核对，写明服务端已没有文件', hasItem(s, 'numbers', 'na', '导出时服务端已没有这份工件的文件'))
     check('missing-card：服务端缺文件是正常的无法核对，总览通过', s.overall === 'pass', `${s.overall}：${s.text}`)
   })
+  // 口径卡上有输入取自遮罩列（会员号码）：卡上记着号码原值和代入式，整张卡只给 id。这是正常的无法核对，不是被改过
+  await sample('masked-card', async (s, page) => {
+    const card = s.items.find((i) => i.check === 'artifacts' && i.text.includes('口径卡'))
+    check('masked-card：口径卡在 ③ 无法核对，写明「含遮罩列，未随文件附带，只能核对到哈希」，不判不通过',
+      card?.result === 'na' && card.text.includes('含遮罩列，未随文件附带，只能核对到哈希'), card?.text)
+    const metricNumber = s.items.find((i) => i.check === 'numbers' && i.text.includes('销售额'))
+    check('masked-card：引用这张卡的数字无法核对，原因同上', metricNumber?.result === 'na'
+      && metricNumber.text.includes('含遮罩列'), metricNumber?.text)
+    check('masked-card：总览通过（可核对的项全部通过），没有一项不通过', s.overall === 'pass' && s.text === '可核对的项全部通过'
+      && !s.items.some((i) => i.result === 'fail'), `${s.overall}：${s.text}`)
+    const html = await page.content()
+    check('masked-card：页面里找不到卡上那个遮罩列的号码', !html.includes('000-0001') && !html.includes('000-0002'))
+  })
   await sample('nan', async (s) => {
     check('nan：内容里有裸 NaN 的事件和工件照常通过', s.overall === 'pass' && s.checks.events === 'pass'
       && !s.items.some((i) => i.result === 'fail'), describe(s))
@@ -655,12 +668,13 @@ await section('样本页：篡改', async () => {
     data.artifacts = data.artifacts.filter((a) => a.kind !== 'metric_set')
     return '删掉口径卡条目'
   }, (s) => [...turnsRed('numbers')(s), ['原因写明', hasItem(s, 'numbers', 'fail', '引用的工件不在文件的工件清单里')]])
-  await tamper(base, '口径卡标成遮罩', (data) => {
-    const card = byKind(data, 'metric_set')
-    delete card.b64
-    card.masked = true
-    return '口径卡去掉内容、标遮罩'
-  }, (s) => [...turnsRed('artifacts')(s), ['原因写明', hasItem(s, 'artifacts', 'fail', '只有查询快照会因遮罩不随文件附带')]])
+  // 口径卡有输入取自遮罩列时服务端照样只给 id（见样本页 masked-card），报告文档从来不会：把它标成遮罩只能是改过
+  await tamper(base, '报告文档标成遮罩', (data) => {
+    const doc = byKind(data, 'report_doc')
+    delete doc.b64
+    doc.masked = true
+    return '报告文档去掉内容、标遮罩'
+  }, (s) => [...turnsRed('artifacts')(s), ['原因写明', hasItem(s, 'artifacts', 'fail', '只有查询快照和口径卡会因遮罩不随文件附带')]])
   await tamper(base, '报告文档的一个字节', (data) => flipByte(byKind(data, 'report_doc')), (s) => [
     ...turnsRed('artifacts')(s),
     ['数字不予核对', s.checks.numbers === 'na' && hasItem(s, 'numbers', 'na', '所在的报告文档没有通过核对')],

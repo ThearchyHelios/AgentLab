@@ -106,7 +106,7 @@
     artifactUndecodable: '内容无法解码',
     artifactUnparsable: '哈希一致，但内容无法解析',
     masked: '含遮罩列，未随文件附带，只能核对到哈希',
-    maskedOdd: '只有查询快照会因遮罩不随文件附带，这份工件却标着遮罩：导出时不会出现这种情况，文件可能被改过',
+    maskedOdd: '只有查询快照和口径卡会因遮罩不随文件附带，这份工件却标着遮罩：导出时不会出现这种情况，文件可能被改过',
     artifactMissing: '导出时服务端已没有这份工件的文件',
     artifactAbsent: '内容未随文件附带：导出时不会出现这种情况，文件可能被改过',
     chainDoc: (label) => `报告「${label}」的文档`,
@@ -485,7 +485,8 @@
           }
         }
       } else if (a.masked) {
-        if (a.kind === 'query') {
+        // 查询快照带遮罩列；口径卡上有输入取自遮罩列（卡上记着输入的值和代入式）。两种都只给 id，报告文档不会
+        if (a.kind === 'query' || a.kind === 'metric_set') {
           item.reason = T.masked
         } else {
           item.result = FAIL

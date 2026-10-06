@@ -463,7 +463,7 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
 
     got = {name: json.loads(data_block(page)) for name, page in pages().items()}
     assert set(got) == {"base", "two-reports", "legacy", "failed", "continued", "degraded", "missing-doc",
-                        "missing-card", "nan", "stray"}
+                        "missing-card", "nan", "stray", "masked-card"}
     for name, bundle in got.items():
         assert browser_manifest(bundle["events"]) == bundle["meta"]["manifest_hash"], name
 
@@ -499,6 +499,9 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     issuances = [e["seq"] for e in got["degraded"]["events"] if e["type"] == "issuance"]
     assert len(issuances) == 2 and got["degraded"]["meta"]["tier"] == {"value": "degraded", "seq": issuances[-1]}
     assert [a["kind"] for a in got["stray"]["artifacts"]] == ["report_doc"]
+    # 口径卡上有输入取自遮罩列：整张卡只给 id，页面里找不到那个号码
+    card = next(a for a in got["masked-card"]["artifacts"] if a["kind"] == "metric_set")
+    assert card.get("masked") is True and "b64" not in card
     nan = got["nan"]
     assert "NaN" in next(e["canonical"] for e in nan["events"] if e["type"] == "run.started")
     assert b"NaN" in base64.b64decode(next(a["b64"] for a in nan["artifacts"] if a.get("node_id") == "fetch"))

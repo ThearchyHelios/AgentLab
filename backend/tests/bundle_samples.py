@@ -17,6 +17,8 @@
 - continued：早期运行先失败、经继续运行跑到成功：范围里有那条运行失败，之后运行又继续了，成功结束的那条在范围外
 - degraded：两条出具判定，先完整出具、后降档出具，认最后一条
 - missing-doc / missing-card：导出时服务端已没有报告文档 / 口径卡的文件
+- masked-card：口径卡上一个指标的输入取自会员消费的号码列（设了遮罩），卡上记着号码原值：整张卡只给 id，引用它的
+  数字无法核对
 - nan：运行开始事件和门店流水快照里有 json.dumps 写出的裸 NaN（快照里那一列报告没有引用）
 - stray：报告自查记下的文档是另一次运行写的
 """
@@ -70,14 +72,25 @@ def shop(nan: bool = False) -> dict[str, Any]:
             "sql": "SELECT store, amount, ratio FROM orders ORDER BY id", "truncated": False}
 
 
-class Sample:
-    """一次虚构的已封存运行：工件（原字节）、证据目录、报告文档、事件。"""
+def masked_card(crm_id: str) -> dict[str, Any]:
+    """口径卡多一个指标：联系电话位数，输入是会员消费第 0 行的号码（phone 设了遮罩），卡上记着号码原值和代入式。"""
+    cell = "cell(nodes.members, 0, 'phone')"
+    contact = {"id": "contact", "name": "联系电话位数", "value": 8, "unit": "位", "decimals": 0, "format": "thousands",
+               "expression": f"len({cell})", "substituted": f"len('{CRM['rows'][0][1]}')",
+               "inputs": [{"path": cell, "value": CRM["rows"][0][1], "node_id": "members", "via": "tool_cell",
+                           "artifact": crm_id, "locator": {"row": 0, "column": "phone"}, "status": "verified"}]}
+    return {**CARD, "metrics": [*CARD["metrics"], contact]}
 
-    def __init__(self, *, nan: bool = False) -> None:
+
+class Sample:
+    """一次虚构的已封存运行：工件（原字节）、证据目录、报告文档、事件。masked=True 时口径卡带着取自遮罩列的输入。"""
+
+    def __init__(self, *, nan: bool = False, masked: bool = False) -> None:
         self.files: dict[str, bytes] = {}
         self.shop_id = self.put(shop(nan))
         self.crm_id = self.put(CRM)
-        self.card_id = self.put(CARD)
+        self.card = masked_card(self.crm_id) if masked else CARD
+        self.card_id = self.put(self.card)
         self.ledger = [
             {"kind": "query", "node_id": "fetch", "exec": 1, "artifact": self.shop_id, "tool": "db_query__shop",
              "source": "shop", "columns": ["store", "amount", "ratio"], "rows": len(STORES), "truncated": False},
@@ -85,7 +98,7 @@ class Sample:
              "source": "crm", "columns": CRM["columns"], "rows": len(CRM["rows"]), "truncated": False},
             {"kind": "metric_set", "node_id": "card", "artifact": self.card_id},
         ]
-        self.catalog = build_catalog(nodes={"card": CARD}, ledger=self.ledger)
+        self.catalog = build_catalog(nodes={"card": self.card}, ledger=self.ledger)
 
     def put(self, obj: Any) -> str:
         artifact, raw = stored(obj)
@@ -198,6 +211,10 @@ def pages() -> dict[str, str]:
     n = Sample(nan=True)
     events, bound = n.events({"write": n.doc(WEEKLY, "write")}, nan=True)
     out["nan"] = render(n, events, bound)
+
+    m = Sample(masked=True)
+    events, bound = m.events({"write": m.doc(WEEKLY, "write")})
+    out["masked-card"] = render(m, events, bound)
     return out
 
 
