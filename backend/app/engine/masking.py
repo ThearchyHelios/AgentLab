@@ -21,7 +21,8 @@
   不算（_value_columns、_band_only）。认不出落在哪一列的（PIVOT、UNPIVOT 这类也算）、SQL 解析不了又写着遮罩列（或者 *、
   TABLE x）的，整份快照的列都算。双盲复算按同一套认法在派盲算之前挡下取自遮罩列的指标（derived_columns）
 - 只装着分档标签的列（_label_columns）：标签是 agent 写在 SQL 里的字，不当遮罩值；* 展开数据源里的表时按冻结的表结构
-  认它带不带同名的列（_schema_tables）
+  认它带不带同名的列（_schema_tables），不知道表结构的按带得出算（多遮）。分档写在派生来源里、外层按它分组的（一档
+  一行，_grouped_labels）同当分组键的 CASE 一样照常显示（_shown_labels）
 - 哪些值（_Secrets）：遮罩列里出现过的值，按值认有门槛（SECRET_MIN、SECRET_DIGITS），占位的写法（PLACEHOLDERS：未知、
   暂无……）不收；换的时候先按词、按开头几个字筛出
   正文里真有的那几个值，不现编上万个分支的正则；正文、文字格、SQL 的字符串和注释里换了写法的长号码（199-1474-2785、
@@ -494,6 +495,191 @@ def _block_label_of(block: Any, listed: list[str] | None, name: str, memo: _Labe
 def _all_labels(texts: list[set[str] | None]) -> set[str] | None:
     """几项都只装着标签时，标签的写法合起来；有一项不是为 None。"""
     return set().union(*texts) if all(t is not None for t in texts) else None
+
+
+def _grouped_labels(sql: Any, kind: str | None, columns: list[str], labels: dict[str, set[str]],
+                    tables: dict[str, set[str]] | None) -> set[str]:
+    """结果里只装着分档标签（labels，_label_columns 认出的）、又是一档一行的列（列名小写）：标签列当分组键照常显示，同
+    _band_only，只是分档写在派生来源里、外层才按它分组（SELECT 档位, COUNT(*) FROM (SELECT *, CASE … END AS 档位 FROM
+    sales) GROUP BY 档位、WITH 里的一段算档位、外层分组）。一档一行：结果的这一列在每一支里都是那一层 SELECT 的分组键，
+    或者取自派生来源里一档一行的那一列（_item_grouped）。同名的几列都要是。解析不了、认不准的一个都不算（照旧整列遮）。"""
+    from app.data.sql_semantics import _parse, _read
+
+    if not labels:
+        return set()
+    try:
+        root, _ = _parse(sql, _read(kind))
+        if root is None:
+            return set()
+        _normalized(root, _read(kind), None)
+        result = next((top for top, role, _listed in _blocks(root) if role == "result"), None)
+        if result is None:
+            return set()
+        memo = _LabelMemo()
+        memo.tables = tables
+        out: set[str] = set()
+        for name in labels:
+            places = [i for i, c in enumerate(columns) if c.lower() == name]
+            if places and all(_result_grouped(result, place, name, len(columns), memo) for place in places):
+                out.add(name)
+        return out
+    except Exception:  # noqa: BLE001 - 分析本身的缺陷：一个都不算（照旧整列遮，宁可多遮）
+        logger.warning("核查查询的分档标签分组分析失败", exc_info=True)
+        return set()
+
+
+def _result_grouped(top: Any, place: int, name: str, width: int, memo: _LabelMemo) -> bool:
+    """结果（width 列）的第 place 列（列名 name）是不是一档一行：UNION 这类的每一支都是。落在 * 里的按列名经 * 往下找，
+    只有一支时才找（同 _result_label）。"""
+    from sqlglot import exp
+
+    leaves = _leaves(top)
+    if not all(isinstance(leaf, exp.Select) for leaf in leaves):
+        return False
+    for select in leaves:
+        items = list(select.expressions)
+        item = next((i for i, p in zip(items, _places(items, width)) if p == place), None)
+        if item is not None:
+            grouped = _item_grouped(item, select, memo)
+        elif len(leaves) == 1:
+            grouped = _star_grouped(select, name, memo) is True
+        else:
+            return False
+        if not grouped:
+            return False
+    return True
+
+
+def _item_grouped(item: Any, select: Any, memo: _LabelMemo) -> bool:
+    """select 的一个选出项一档一行：它就是这一层的分组键（_group_key），或者是单独一列、取自 FROM 里派生来源中一档一行的
+    那一列（_source_grouped）。"""
+    from sqlglot import exp
+
+    if _group_key(select, item):
+        return True
+    node = item
+    while isinstance(node, (exp.Alias, exp.Paren)):
+        node = node.this
+    if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star) and node.name:
+        return _source_grouped(select, node.table.lower() or None, node.name.lower(), memo) is True
+    return False
+
+
+def _group_key(select: Any, item: Any) -> bool:
+    """select 的选出项 item 是它 GROUP BY 的一个键：按位置、按别名、照原样再写一遍（同一列写不写表名都算，FROM 里只有
+    一个来源时）。ROLLUP、GROUPING SETS 这类不认。"""
+    from sqlglot import exp
+
+    group = select.args.get("group")
+    if group is None:
+        return False
+    node = item
+    while isinstance(node, (exp.Alias, exp.Paren)):
+        node = node.this
+    place = next((str(i + 1) for i, e in enumerate(select.expressions) if e is item), None)
+    alias = item.alias.lower() if isinstance(item, exp.Alias) and item.alias else None
+    single = len(_from_sources(select)) == 1
+    for key in group.expressions:
+        while isinstance(key, exp.Paren):
+            key = key.this
+        if (isinstance(key, exp.Literal) and not key.is_string and key.this == place) or key == node:
+            return True
+        if not isinstance(key, exp.Column) or isinstance(key.this, exp.Star):
+            continue
+        if alias and not key.table and key.name.lower() == alias:
+            return True
+        if isinstance(node, exp.Column) and key.name.lower() == node.name.lower() and (
+                key.table.lower() == node.table.lower() or (single and not (key.table and node.table))):
+            return True
+    return False
+
+
+def _source_grouped(select: Any, qualifier: str | None, name: str, memo: _LabelMemo) -> Any:
+    """select 的 FROM、JOIN 里读到的那一列（qualifier 同 _source_label）是不是一档一行：取自派生来源、那里一档一行的为
+    True；没有哪个来源出这一列为 None；别的（数据源里的表可能出这一列、按这一列 USING / NATURAL 连起来、派生来源里不是
+    一档一行）为 False。"""
+    sources = _from_sources(select)
+    if qualifier is not None:
+        sources = [(alias, source) for alias, source in sources if alias == qualifier]
+        if len(sources) != 1:
+            return False
+    found = False
+    for _alias, source in sources:
+        derived = _derived_block(source)
+        if derived is None:
+            if not _table_lacks(source, name, memo):
+                return False
+            continue
+        grouped = _block_grouped(derived[0], derived[1], name, memo)
+        if grouped is None:
+            continue
+        if not grouped:
+            return False
+        found = True
+    if not found:
+        return None
+    return False if _merging(select, name) else True
+
+
+def _block_grouped(block: Any, listed: list[str] | None, name: str, memo: _LabelMemo) -> Any:
+    """派生来源的那块查询（listed 是写的列名表）出的 name 这一列是不是一档一行；不出这一列为 None。查法同 _block_label_of：
+    一条 SELECT 按选出项的名字找，没有的经 * 往下找；UNION 这类按位置看每一支。"""
+    from sqlglot import exp
+
+    key = ("grouped", id(block), name)
+    if key in memo:
+        return memo[key]
+    # 先记成 False：递归的 CTE 绕回自己时按不是算
+    memo[key] = False
+    leaves = _leaves(block)
+    result: Any = False
+    if all(isinstance(leaf, exp.Select) for leaf in leaves):
+        if listed is None and len(leaves) == 1:
+            items = list(leaves[0].expressions)
+            named = [i for i, item in enumerate(items) if _same_name(item, name)]
+            if not named:
+                result = _star_grouped(leaves[0], name, memo)
+            elif _star_grouped(leaves[0], name, memo, before=named[0]) is None:
+                result = all(_item_grouped(items[i], leaves[0], memo) for i in named)
+        else:
+            width: int | None = None
+            place: int | None = None
+            if listed is not None:
+                if name not in listed:
+                    result = None
+                elif listed.count(name) == 1:
+                    place, width = listed.index(name), len(listed)
+            else:
+                first = list(leaves[0].expressions)
+                places = [p for item, p in zip(first, _places(first, None)) if _same_name(item, name)]
+                if not places and not any(_is_star(item) for item in first):
+                    result = None
+                elif len(places) == 1:
+                    place = places[0]
+            if place is not None:
+                picked = [next((i for i, p in zip(list(s.expressions), _places(list(s.expressions), width))
+                                if p == place), None) for s in leaves]
+                result = all(i is not None and _item_grouped(i, s, memo) for i, s in zip(picked, leaves))
+    memo[key] = result
+    return result
+
+
+def _star_grouped(select: Any, name: str, memo: _LabelMemo, *, before: int | None = None) -> Any:
+    """select 经 *（t.* 只看 t）带出的 name 这一列是不是一档一行；没有 * 带出这一列为 None。before 同 _star_label。"""
+    from sqlglot import exp
+
+    found = False
+    for item in select.expressions[:before]:
+        if not _is_star(item):
+            continue
+        qualifier = (item.table.lower() or None) if isinstance(item, exp.Column) else None
+        grouped = _source_grouped(select, qualifier, name, memo)
+        if grouped is None:
+            continue
+        if not grouped:
+            return False
+        found = True
+    return True if found else None
 
 
 def _from_sources(select: Any) -> list[tuple[str, Any]]:
@@ -1090,8 +1276,9 @@ def _source_names(top: Any, listed: list[str] | None, names: set[str],
 
 
 def _tainted(sql: str, kind: str | None, masked: set[str], width: int, tables: dict[str, list[str]] | None = None
-             ) -> tuple[set[str], set[int]] | None:
-    """SQL 里指代遮罩列的名字（小写），和结果（width 列）里值取自遮罩列的那几列的位置。解析不了返回 None。
+             ) -> tuple[set[str], set[int], bool] | None:
+    """SQL 里指代遮罩列的名字（小写）、结果（width 列）里值取自遮罩列的那几列的位置，以及是不是认不出、整份都算（这时
+    位置是全部的列）。解析不了返回 None。
 
     名字从遮罩列本身起，一层层传下去：选出列的值取自这些名字的（buyer_phone AS 手机号、UPPER(buyer_phone) AS x），它的
     名字也算；派生来源（子查询、WITH 里的一段）按位置对上列名表、UNION 第一支的列名，也算，直到不再多出名字。同名
@@ -1162,7 +1349,7 @@ def _tainted(sql: str, kind: str | None, masked: set[str], width: int, tables: d
                     everything = True
                 else:
                     positions |= spread
-        return names, set(range(width)) if everything else positions
+        return names, set(range(width)) if everything else positions, everything
     except Exception:  # noqa: BLE001 - 分析本身的缺陷不能让回答出错：按解析不了处理（宁可多遮）
         logger.warning("质询的 SQL 遮罩分析失败", exc_info=True)
         return None
@@ -1186,14 +1373,17 @@ def _implicit(sql: str) -> bool:
 
 
 def _derived_hidden(snapshot: dict[str, Any], hidden: set[str], kind: str | None,
-                    tables: dict[str, list[str]] | None = None) -> tuple[set[str], set[str]]:
+                    tables: dict[str, list[str]] | None = None, *, labels: dict[str, set[str]] | None = None
+                    ) -> tuple[set[str], set[str]]:
     """(这份快照要遮的列, SQL 里指代遮罩列的名字)，都是小写。tables 是查询当时冻结的表结构（_schema_columns），* 展开
     数据源里的表时按它数位置；没给的按快照记着的表结构快照（schema_artifact）认，和工具边界遮的时候是同一份。
 
     证据面板只按列名遮（hidden）；agent 的查询起了别名、套了函数，结果列名就对不上。本仓库的查询惯例是起中文别名
     （region AS 区域），所以按 SQL 认出改了名字的遮罩列（_tainted）。SQL 解析不了、里面又写着遮罩列的（*、TABLE x 不写
     列名也会把遮罩列带进别的列名，同样算，_implicit），整份快照的列都遮掉；合并查询的快照不看 SQL，它记着自己的来历
-    （_hidden_columns 已按 _merge_masks 遮好）。"""
+    （_hidden_columns 已按 _merge_masks 遮好）。
+    分档写在派生来源里、外层按它分组的标签列（一档一行，_grouped_labels）照常显示，同 _band_only；格子里装着标签以外的、
+    和遮罩列同名的照旧遮（_shown_labels）。labels 是调用方已经认好的标签列（_label_columns），没给的按快照认。"""
     base = set(hidden)
     sql = snapshot.get("sql")
     if not base or not isinstance(sql, str) or not sql.strip() or snapshot.get("source") == MERGE_SOURCE:
@@ -1203,8 +1393,36 @@ def _derived_hidden(snapshot: dict[str, Any], hidden: set[str], kind: str | None
     if found is None:
         hides = _mentions(sql, base) or _implicit(sql)
         return (base | {c.lower() for c in columns}, base) if hides else (base, base)
-    names, positions = found
-    return names | {columns[i].lower() for i in positions if i < len(columns)}, names
+    names, positions, everything = found
+    out = names | {columns[i].lower() for i in positions if i < len(columns)}
+    if not everything and out & {c.lower() for c in columns}:
+        out -= _shown_labels(snapshot, kind, columns, base, tables, labels)
+    return out, names
+
+
+def _shown_labels(snapshot: dict[str, Any], kind: str | None, columns: list[str], base: set[str],
+                  tables: dict[str, list[str]] | None, labels: dict[str, set[str]] | None) -> set[str]:
+    """派生自遮罩列、却当分组键照常显示的标签列（列名小写，_grouped_labels）：只装着标签（labels，没给的按快照认）、和
+    数据源设的遮罩列不同名、格子里只有标签（数的写法对不上的、查询时已经遮掉的都不算）、一档一行。表结构给了 tables 的
+    按它，没给的按快照记着的表结构快照。"""
+    sets = {name: set(cols) for name, cols in tables.items()} if tables is not None else (
+        _frozen_tables(snapshot["schema_artifact"]) if isinstance(snapshot.get("schema_artifact"), str) else None)
+    if labels is None:
+        labels = _snapshot_labels(snapshot, kind, sets)
+    wanted = {name: texts for name, texts in labels.items() if name not in base and _only_labels(snapshot, name, texts)}
+    return _grouped_labels(snapshot["sql"], kind, columns, wanted, sets) if wanted else set()
+
+
+def _only_labels(snapshot: dict[str, Any], name: str, texts: set[str]) -> bool:
+    """快照里叫 name 的列，格子不是空就是标签的一种写法（_forms 对得上 texts）。"""
+    columns = [str(c).lower() for c in snapshot.get("columns") or []]
+    index = [i for i, c in enumerate(columns) if c == name]
+    for row in snapshot.get("rows") or []:
+        cells = [row[i] for i in index if i < len(row)] if isinstance(row, list) else (
+            [v for k, v in row.items() if str(k).lower() == name] if isinstance(row, dict) else [row])
+        if any(v is not None and not (_forms(v) & texts) for v in cells):
+            return False
+    return True
 
 
 def derived_columns(snapshot: dict[str, Any], hidden: set[str], kind: str | None) -> set[str] | None:
@@ -1218,7 +1436,7 @@ def derived_columns(snapshot: dict[str, Any], hidden: set[str], kind: str | None
     found = _tainted(sql, kind, set(hidden), len(columns), _snapshot_columns(snapshot))
     if found is None:
         return None
-    names, positions = found
+    names, positions, _everything = found
     return {c.lower() for i, c in enumerate(columns) if c.lower() in names or i in positions}
 
 
@@ -2059,9 +2277,9 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
     if not (base or given) or not columns or not _query_shaped(payload):
         return QueryMask(payload, [], _Secrets())
     try:
-        hidden = _derived_hidden(payload, base, kind, _schema_columns(schema))[0] if base else set()
-        own = _Secrets()
         labels = _snapshot_labels(payload, kind, _schema_tables(schema))
+        hidden = _derived_hidden(payload, base, kind, _schema_columns(schema), labels=labels)[0] if base else set()
+        own = _Secrets()
         if any(c.lower() in hidden for c in columns):
             own.add(payload, hidden, labels=labels, base=base)
         pool = own

@@ -182,3 +182,74 @@ def test_placeholders_are_never_collected():
     secrets.add({"columns": ["name"], "rows": [["未知"], ["N/A"], ["暂无"], ["张伟"], ["NULL"]]}, {"name"})
     assert secrets.strong == {"张伟"} and secrets.weak == {"张伟"}
     assert secrets.scrub("原因未知，暂无记录，N/A，张伟") == f"原因未知，暂无记录，N/A，{MASKED}"
+
+
+# --------------------------------------------------------------------------
+# 分档写在派生来源里、外层按它分组：标签列照常显示，标签不当遮罩值
+# --------------------------------------------------------------------------
+
+
+LAYOUT = ["id", "region", "amount", "visits"]
+#: 探查得到的表结构：sales 里没有「档位」这一列
+SCHEMA = {"tables": {"sales": {"qualified": "sales", "schema": None, "columns": [{"name": c} for c in LAYOUT]}}}
+BAND = "CASE WHEN amount >= 20000 THEN '大单' ELSE '小单' END"
+GROUPED = [
+    pytest.param(f"SELECT 档位, COUNT(*) AS 笔数 FROM (SELECT *, {BAND} AS 档位 FROM sales) GROUP BY 档位 ORDER BY 档位",
+                 id="子查询里 * 加分档"),
+    pytest.param(f"SELECT 档位, COUNT(*) AS 笔数 FROM (SELECT s.*, {BAND} AS 档位 FROM sales s) t GROUP BY 档位 "
+                 "ORDER BY 档位", id="子查询里 s.* 加分档"),
+    pytest.param(f"WITH b AS (SELECT *, {BAND} AS 档位 FROM sales) SELECT 档位, COUNT(*) AS 笔数 FROM b GROUP BY 档位 "
+                 "ORDER BY 档位", id="WITH 里 * 加分档"),
+    pytest.param(f"WITH b AS (SELECT {BAND} AS 档位 FROM sales) SELECT 档位, COUNT(*) AS 笔数 FROM b GROUP BY 档位 "
+                 "ORDER BY 档位", id="WITH 里只有分档"),
+    pytest.param(f"WITH b AS (SELECT {BAND} AS 档位 FROM sales) SELECT b.档位, COUNT(*) AS 笔数 FROM b GROUP BY 1 "
+                 "ORDER BY 1", id="按位置分组"),
+    pytest.param(f"WITH b AS (SELECT {BAND} AS 档位 FROM sales), c AS (SELECT 档位, COUNT(*) AS 笔数 FROM b "
+                 "GROUP BY 档位) SELECT * FROM c ORDER BY 档位", id="分组在中间一层"),
+]
+ROWS = [["大单", 3], ["小单", 2]]
+
+
+@pytest.mark.parametrize("sql", GROUPED)
+def test_a_band_grouped_outside_its_derived_source_is_shown(sql):
+    """分档（按遮罩的金额写死的标签）写在子查询、WITH 里，外层按它分组：每档一行，档位列照常显示，标签不当遮罩值收；
+    以前整列遮成「已遮罩」，模型分不清哪个数属于哪一档。"""
+    payload = {"sql": sql, "columns": ["档位", "笔数"], "rows": [list(r) for r in ROWS],
+               "column_types": {"档位": "text", "笔数": "number"}}
+    done = masking.mask_query_result(payload, ["amount"], "sqlite", schema=SCHEMA)
+    assert done.payload["rows"] == ROWS and done.columns == []
+    assert not done.secrets.strong
+    hidden, names = masking._derived_hidden({**payload, "rows": ROWS}, {"amount"}, "sqlite",
+                                            masking._schema_columns(SCHEMA))
+    assert "档位" not in hidden and "档位" in names, "SQL 里照旧认得出它取自金额"
+
+
+@pytest.mark.parametrize("sql", [
+    pytest.param(f"SELECT id, 档位 FROM (SELECT id, {BAND} AS 档位 FROM sales) ORDER BY id", id="逐行的档位"),
+    pytest.param(f"SELECT 档位, COUNT(*) AS 笔数 FROM (SELECT {BAND} AS 档位 FROM sales UNION ALL "
+                 "SELECT region FROM sales) GROUP BY 档位", id="另一支是区域"),
+    pytest.param(f"SELECT 档位, COUNT(*) AS 笔数 FROM (SELECT id, {BAND} AS 档位 FROM sales) x "
+                 "FULL JOIN (SELECT id, amount AS 档位 FROM sales) y USING (档位) GROUP BY 档位", id="按档位连起来"),
+])
+def test_a_band_that_is_not_one_row_per_band_is_still_masked(sql):
+    """逐行的档位（看得出每一笔落在哪一档）、和别的值混在一列里、按它连起来又不写表名的（外连接时取的可能是另一边的
+    金额），照旧整列遮。"""
+    payload = {"sql": sql, "columns": ["档位", "笔数"] if "笔数" in sql else ["id", "档位"],
+               "rows": [["大单", 3], ["小单", 2]] if "笔数" in sql else [[1, "小单"], [3, "大单"]]}
+    done = masking.mask_query_result(payload, ["amount"], "sqlite", schema=SCHEMA)
+    assert "档位" in done.columns
+
+
+def test_a_grouped_band_with_cells_other_than_its_labels_is_still_masked():
+    """格子里有标签以外的值（认错了、数的写法对不上）：照旧整列遮。"""
+    sql = GROUPED[3].values[0]
+    payload = {"sql": sql, "columns": ["档位", "笔数"], "rows": [["大单", 3], ["13900000001", 2]]}
+    assert masking.mask_query_result(payload, ["amount"], "sqlite", schema=SCHEMA).columns == ["档位"]
+
+
+def test_without_a_schema_a_star_next_to_the_band_is_still_masked():
+    """不知道表结构时，* 展开的表可能就有「档位」这一列（外层取到的是它）：照旧整列遮，标签照收（多遮）。"""
+    sql = GROUPED[0].values[0]
+    payload = {"sql": sql, "columns": ["档位", "笔数"], "rows": [list(r) for r in ROWS]}
+    done = masking.mask_query_result(payload, ["amount"], "sqlite")
+    assert done.columns == ["档位"] and done.payload["rows"] == [[MASKED, 3], [MASKED, 2]]
