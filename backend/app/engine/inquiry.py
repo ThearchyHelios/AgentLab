@@ -43,9 +43,11 @@
   汇总里套着结果全是写死常量的 CASE（SUM(CASE WHEN amount <= 20000 THEN 1 ELSE 0 END)）只是按条件数个数，同 COUNT
 - 按遮罩列分档的标签（CASE、IIF 的结果全是写死的常量）：标签文字是 agent 写在 SQL 里的，不当遮罩值，SQL、回答正文里
   照原样；标签列当分组键（每一档一行）照常显示，不分组的逐行标签列整列遮（格子里看不出某一笔落在哪一档），可 agent
-  在正文里写出「这一笔是大单」遮不住，按 id 分组再按档数个数也看得出（同按阈值查出某几行）。只有只装着标签的列不收
-  （选出项本身就是这样的 CASE / IIF，或者经别名、子查询原样传下去的），同一个名字在哪一处装着别的就照收；标签恰好和
-  别的列里的遮罩值相同时，正文里的档名、SQL 里写成字符串的标签也换（多遮）
+  在正文里写出「这一笔是大单」遮不住，按 id 分组再按档数个数也看得出（同按阈值查出某几行）。只有只装着标签的列不收：
+  结果的这一列在 UNION 的每一支里都是这样的 CASE / IIF，或者按作用域认得出取自子查询、CTE 里只装着标签的一列；有一支
+  取自数据源里的表（遮罩列原样选出、经子查询按原名传出，哪怕起了标签的名字）就照收。认不准的也照收（多遮），比如
+  按这一列 USING、NATURAL 合成的同名列，递归的 CTE，UNION 里落在某一支 * 里的列，写死的字符串、和列一起算的值。
+  标签恰好和别的列里的遮罩值相同时，正文里的档名、SQL 里写成字符串的标签也换（多遮）
 - 「夹住某一个值」（_pinned）：范围比较在整条 SQL 里配对，只有 CASE 的不同分支、SELECT 里不筛行的不同项（选出列、
   GROUP BY、ORDER BY）、UNION 的不同支各算各的，两头误差都有：把找值拆进这几处（CASE WHEN age > 25 THEN … ELSE CASE
   WHEN age >= 25 …，两个选出列 SUM(age >= 25)、SUM(age > 25) 再自己相减）认不出，边界照原样留着，正文里复述也不遮；
@@ -58,9 +60,11 @@
   隔开的一律按夹住算，分档很多时会成批多遮
 - 找某一个值的写法按语法树认常见的几种：等值、IN、简单 CASE、把它夹住的范围，被比较的一边套了 CAST、函数、汇总
   （CAST(age AS INTEGER) = 25、HAVING MAX(age) BETWEEN 25 AND 25），值换个写法（25.0、025、2.5e1）、写成几个数的
-  算式（13900000000 + 1、BETWEEN 20 + 5 AND 30 - 5，算式里的数都换）。更绕的写法认不出：值藏进和列一起算的算式
-  （age - 25 = 0、buyer_phone - 1 = 13900000000）、拼接（'1390' || '0000001'）、函数拼出来的值（REPLACE、SUBSTR），
-  短的值照原样封存，长号码只在整个写出来时按值换
+  算式（加减乘除、取模、整除：13900000000 + 1、BETWEEN 20 + 5 AND 30 - 5、125 % 100、50 DIV 2，算式里的数都换；
+  两个整数相除照数据源的算法，SQLite、Postgres 里 53 / 2 是 26，MySQL 里是 26.5）。更绕的写法认不出：值藏进和列
+  一起算的算式（age - 25 = 0、buyer_phone - 1 = 13900000000）、位运算（24 | 1）、拼接（'1390' || '0000001'）、
+  函数拼出来的值（REPLACE、SUBSTR、POWER）、CAST 改了值的（CAST(25.6 AS INTEGER) 按 25.6 认，CAST(53 AS REAL) / 2
+  按整数相除算），短的值照原样封存，长号码只在整个写出来时按值换
 - 质询工件里 SQL 检查结果的片段是检查器按语法树重新写出来的，按整条 SQL 里整个换掉了的字面量照值换：同一个值在
   片段里别处出现也换（多遮，算式里换掉的 0、1 这类也是）；截断处半截的值去掉（停在字符串、带引号的名字、注释里的，
   从开头的引号、注释起整个去掉）。说明里码值表列出的码值和别的字一样按值换，恰好是遮罩值的码值也换（多遮）
@@ -751,12 +755,12 @@ def _label_columns(sql: Any, kind: str | None, columns: list[str]) -> dict[str, 
     """结果里只装着分档标签的列：列名（小写）→ 标签在格子里的写法。标签（CASE、IIF 写死的结果，分档的名字、档位编号）
     是 agent 自己写在 SQL 里的字，不是数据源里的值：这几列派生自遮罩列也不收进遮罩值（_Secrets.add），不然 SQL 里的
     标签、回答正文里的档名都会被换成「已遮罩」。
-    只装着标签：这一列的选出项本身是结果全为写死常量的 CASE / IIF，或者经别名、子查询、CTE 原样传下去的这样一列
-    （_label_texts）；同一个名字在哪一处装着别的（vip_level AS 等级、UNION 另一支取的是遮罩列），就不算——改了名字的
-    遮罩列的 1、2、3 撞上同一条 SQL 里按条件数个数的 THEN 1 ELSE 0，照样是遮罩值。没起别名的标签列按位置认（每一支的
-    那一项都是标签）。解析不了的一个都不算（标签照旧当遮罩值，宁可多遮）。"""
-    from sqlglot import exp
-
+    只装着标签：结果的这一列在 UNION 这类的每一支里，都是结果全为写死常量的 CASE / IIF，或者取自派生来源（子查询、
+    CTE、LATERAL）里只装着标签的一列（_item_label）。一项取自哪个来源按作用域认，不按名字猜：按名字认时，遮罩列原样
+    选出（SELECT vip_level）的名字就是它自己，永远算只装着标签，UNION 另一支、子查询里的遮罩列流进标签列也认不出，
+    等级 1 撞上 THEN 1 就不收。取自数据源里的表的（哪怕和标签同名）、有一支装着别的、认不准的（说不清取自哪个来源、
+    递归的 CTE、几支的 * 展开在哪说不清）都不算，照收（宁可多遮）；同名的几列有一列不算就都不算。解析不了的一个都
+    不算。"""
     from app.data.sql_semantics import _parse, _read
 
     try:
@@ -766,47 +770,53 @@ def _label_columns(sql: Any, kind: str | None, columns: list[str]) -> dict[str, 
     if root is None:
         return {}
     try:
-        items = [item for select in root.find_all(exp.Select) for item in select.expressions]
-        # 先当每个名字都只装着标签，再去掉装着别的，直到不再变：名字一层层往下传，先认哪一层说不准
-        known: dict[str, set[str]] = {name: set() for item in items if (name := _output_name(item))}
-        for _ in range(len(items) + 2):
-            found: dict[str, set[str]] = {}
-            spoiled: set[str] = set()
-            for item in items:
-                if not (name := _output_name(item)):
-                    continue
-                texts = _label_texts(item, known)
-                if texts is None:
-                    spoiled.add(name)
-                else:
-                    found.setdefault(name, set()).update(texts)
-            found = {name: texts for name, texts in found.items() if name not in spoiled}
-            if found == known:
-                break
-            known = found
-        out = {c.lower(): known[c.lower()] for c in columns if c.lower() in known}
-        width = len(columns)
-        for top, role, _listed in _blocks(root):
-            if role != "result":
-                continue
-            branches = _branches(top)
-            seen: dict[int, list[set[str] | None]] = {}
-            for branch in branches:
-                for item, place in zip(branch, _places(branch, width)):
-                    if place is not None and place < width:
-                        seen.setdefault(place, []).append(_label_texts(item, known))
-            for place, texts in seen.items():
-                if len(texts) == len(branches) and all(t is not None for t in texts):
-                    out.setdefault(columns[place].lower(), set()).update(*texts)
-        return out
+        result = next((top for top, role, _listed in _blocks(root) if role == "result"), None)
+        if result is None:
+            return {}
+        memo: _LabelMemo = {}
+        found: dict[str, list[set[str] | None]] = {}
+        for place, column in enumerate(columns):
+            name = column.lower()
+            found.setdefault(name, []).append(_result_label(result, place, name, len(columns), memo))
+        return {name: texts for name, parts in found.items() if (texts := _all_labels(parts)) is not None}
     except Exception:  # noqa: BLE001 - 分析本身的缺陷不能让回答出错：一个都不算（宁可多遮）
         logger.warning("质询的 SQL 标签列分析失败", exc_info=True)
         return {}
 
 
-def _label_texts(item: Any, known: dict[str, set[str]]) -> set[str] | None:
-    """一个选出项只装着标签时，标签在格子里的写法：结果全为写死常量的 CASE / IIF 取它的各个结果（数按两种写法：25、
-    25.0），单独一列、名字在 known 里（经别名、子查询传下来的标签列）取那一列的；不是为 None。"""
+#: 标签列分析里「这个来源不出这一列」（_block_label、_source_label）：和 None（出这一列，但装着别的、认不准）分开
+_ABSENT: Any = object()
+#: 标签列分析记下的结果：(id(那块查询), 列名) → 标签的写法、None 或 _ABSENT
+_LabelMemo = dict[tuple[int, str], Any]
+
+
+def _result_label(top: Any, place: int, name: str, width: int, memo: _LabelMemo) -> set[str] | None:
+    """结果（width 列）的第 place 列（列名 name）只装着标签时标签的写法，不然为 None：UNION 这类的每一支，那一项都要
+    只装着标签。落在 * 里的（认不出是哪一项）按列名经 * 往下找，只有一支时才找（几支的 * 各展开成什么说不清）。"""
+    from sqlglot import exp
+
+    leaves = _leaves(top)
+    if not all(isinstance(leaf, exp.Select) for leaf in leaves):
+        return None
+    out: set[str] = set()
+    for select in leaves:
+        items = list(select.expressions)
+        item = next((i for i, p in zip(items, _places(items, width)) if p == place), None)
+        if item is not None:
+            texts = _item_label(item, select, memo)
+        elif len(leaves) == 1:
+            texts = _star_label(select, name, memo)
+        else:
+            return None
+        if texts is None or texts is _ABSENT:
+            return None
+        out |= texts
+    return out
+
+
+def _item_label(item: Any, select: Any, memo: _LabelMemo) -> set[str] | None:
+    """select 的一个选出项只装着标签时，标签在格子里的写法：结果全为写死常量的 CASE / IIF 取它的各个结果（数按两种
+    写法：25、25.0）；单独一列取它在 FROM 里取自的那一列的（_source_label）；别的为 None。"""
     from sqlglot import exp
 
     node = item
@@ -824,9 +834,152 @@ def _label_texts(item: Any, known: dict[str, set[str]]) -> set[str] | None:
             elif value is not None:
                 out.add(_plain_text(value))
         return out
-    if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star) and node.name.lower() in known:
-        return known[node.name.lower()]
+    if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star) and node.name:
+        texts = _source_label(select, node.table.lower() or None, node.name.lower(), memo)
+        return None if texts is _ABSENT else texts
     return None
+
+
+def _star_label(select: Any, name: str, memo: _LabelMemo) -> Any:
+    """select 经 *（t.* 只看 t）带出的 name 这一列只装着标签时标签的写法；没有 *、* 带不出这一列为 _ABSENT，带出来的
+    装着别的、认不准为 None。"""
+    from sqlglot import exp
+
+    out: set[str] = set()
+    seen = False
+    for item in select.expressions:
+        if not _is_star(item):
+            continue
+        qualifier = (item.table.lower() or None) if isinstance(item, exp.Column) else None
+        texts = _source_label(select, qualifier, name, memo)
+        if texts is None:
+            return None
+        if texts is not _ABSENT:
+            out |= texts
+            seen = True
+    return out if seen else _ABSENT
+
+
+def _source_label(select: Any, qualifier: str | None, name: str, memo: _LabelMemo) -> Any:
+    """select 的 FROM、JOIN 里读到的那一列（qualifier 是写的表名或别名，没写为 None）只装着标签时标签的写法；没有哪个
+    来源出这一列为 _ABSENT，出这一列但装着别的、认不准为 None。
+    - 写了表名的只看那个来源（对不上的是外层的表，认不准）；
+    - 没写的看所有来源：派生来源出这一列的就是它——SQL 执行过，别的来源就没有同名的列，不然会报列名有歧义。按这一列
+      连起来的（USING 里写着它、NATURAL）例外：几个来源的这一列合成一列，外连接时取的可能是另一边的值；
+    - 数据源里的表一律不算（遮罩列本身、别的列原样选出来，哪怕和标签同名），VALUES、函数这类来源也认不准。"""
+    sources = _from_sources(select)
+    if qualifier is not None:
+        sources = [(alias, source) for alias, source in sources if alias == qualifier]
+        if len(sources) != 1:
+            return None
+    found: list[set[str]] = []
+    opaque = False
+    for _alias, source in sources:
+        derived = _derived_block(source)
+        if derived is None:
+            opaque = True
+            continue
+        texts = _block_label(derived[0], derived[1], name, memo)
+        if texts is None:
+            return None
+        if texts is not _ABSENT:
+            found.append(texts)
+    if not found:
+        return None if opaque else _ABSENT
+    if opaque and _merging(select, name):
+        return None
+    return set().union(*found)
+
+
+def _block_label(block: Any, listed: list[str] | None, name: str, memo: _LabelMemo) -> Any:
+    """派生来源的那块查询（listed 是写的列名表）出的 name 这一列只装着标签时标签的写法；不出这一列为 _ABSENT，出这一列
+    但装着别的、认不准为 None。一条 SELECT 按选出项的名字找，没有的经 * 往下找；UNION 这类按位置看每一支，列名取写的
+    列名表，没写的取第一支的。"""
+    key = (id(block), name)
+    if key not in memo:
+        # 先记成 None：递归的 CTE 绕回自己时按认不准算
+        memo[key] = None
+        memo[key] = _block_label_of(block, listed, name, memo)
+    return memo[key]
+
+
+def _block_label_of(block: Any, listed: list[str] | None, name: str, memo: _LabelMemo) -> Any:
+    """_block_label 真去找的那一步（不看记下的结果）。"""
+    from sqlglot import exp
+
+    leaves = _leaves(block)
+    if not all(isinstance(leaf, exp.Select) for leaf in leaves):
+        return None
+    if listed is None and len(leaves) == 1:
+        named = [item for item in leaves[0].expressions if _output_name(item) == name]
+        if not named:
+            return _star_label(leaves[0], name, memo)
+        return _all_labels([_item_label(item, leaves[0], memo) for item in named])
+    width: int | None = None
+    if listed is not None:
+        if name not in listed:
+            return _ABSENT
+        place, width = (listed.index(name) if listed.count(name) == 1 else None), len(listed)
+    else:
+        first = list(leaves[0].expressions)
+        places = [p for item, p in zip(first, _places(first, None)) if _output_name(item) == name]
+        if not places:
+            # 第一支没明写这一列：有 * 时说不清它在不在、在哪个位置
+            return None if any(_is_star(item) for item in first) else _ABSENT
+        place = places[0] if len(places) == 1 else None
+    if place is None:
+        return None
+    texts: list[set[str] | None] = []
+    for select in leaves:
+        items = list(select.expressions)
+        item = next((i for i, p in zip(items, _places(items, width)) if p == place), None)
+        texts.append(_item_label(item, select, memo) if item is not None else None)
+    return _all_labels(texts)
+
+
+def _all_labels(texts: list[set[str] | None]) -> set[str] | None:
+    """几项都只装着标签时，标签的写法合起来；有一项不是为 None。"""
+    return set().union(*texts) if all(t is not None for t in texts) else None
+
+
+def _from_sources(select: Any) -> list[tuple[str, Any]]:
+    """一条 SELECT 的 FROM、JOIN 里的来源：(名字, 来源节点)，名字是别名，没起别名的是表名（小写）。"""
+    from_ = select.args.get("from_")
+    nodes = [from_.this] if from_ is not None and from_.this is not None else []
+    nodes += [join.this for join in select.args.get("joins") or [] if join.this is not None]
+    return [((node.alias_or_name or "").lower(), node) for node in nodes]
+
+
+def _derived_block(source: Any) -> tuple[Any, list[str] | None] | None:
+    """FROM、JOIN 里的一个来源 → (它的那块查询, 写的列名表)：FROM 里的子查询、LATERAL、指向 WITH 里一段的表名。数据源里
+    的表、VALUES、函数这类为 None（出哪些列、装着什么，SQL 里看不出）。"""
+    from sqlglot import exp
+
+    from app.data.sql_semantics import _visible_ctes
+
+    node, alias = source, None
+    if isinstance(node, exp.Lateral):
+        node, alias = node.this, node.args.get("alias")
+    if isinstance(node, exp.Table):
+        if node.args.get("db") or node.args.get("catalog") or not isinstance(node.this, exp.Identifier):
+            return None
+        cte = _visible_ctes(node).get(node.name.lower())
+        if cte is None:
+            return None
+        node, alias = cte.this, cte.args.get("alias")
+    while isinstance(node, exp.Subquery):
+        alias = alias or node.args.get("alias")
+        node = node.this
+    if not isinstance(node, (exp.Select, exp.SetOperation)):
+        return None
+    return node, ([c.name.lower() for c in alias.columns] if alias is not None and alias.columns else None)
+
+
+def _merging(select: Any, name: str) -> bool:
+    """FROM 里按同名的 name 这一列连起来（USING 里写着它，或者 NATURAL）：几个来源的这一列合成一列。"""
+    return any(str(join.args.get("method") or "").upper() == "NATURAL"
+               or any(str(getattr(u, "name", "")).lower() == name for u in join.args.get("using") or [])
+               for join in select.args.get("joins") or [])
 
 
 def _is_star(item: Any) -> bool:
@@ -835,11 +988,11 @@ def _is_star(item: Any) -> bool:
     return isinstance(item, exp.Star) or (isinstance(item, exp.Column) and isinstance(item.this, exp.Star))
 
 
-def _branches(root: Any) -> list[list[Any]]:
-    """一块查询选出的列：一条 SELECT 一支，UNION 这类的每一支各一支（结果的第 i 列来自每一支的第 i 项）。"""
+def _leaves(root: Any) -> list[Any]:
+    """一块查询的每一支：UNION 这类连起来的按先后摊开，套在外面的括号去掉。一般是 SELECT，也可能是 VALUES 这类。"""
     from sqlglot import exp
 
-    out: list[list[Any]] = []
+    out: list[Any] = []
     stack = [root]
     while stack:
         node = stack.pop()
@@ -847,9 +1000,16 @@ def _branches(root: Any) -> list[list[Any]]:
             stack.append(node.this)
         elif isinstance(node, exp.SetOperation):
             stack.extend((node.expression, node.this))
-        elif isinstance(node, exp.Select):
-            out.append(list(node.expressions))
+        else:
+            out.append(node)
     return out
+
+
+def _branches(root: Any) -> list[list[Any]]:
+    """一块查询选出的列：一条 SELECT 一支，UNION 这类的每一支各一支（结果的第 i 列来自每一支的第 i 项）。"""
+    from sqlglot import exp
+
+    return [list(node.expressions) for node in _leaves(root) if isinstance(node, exp.Select)]
 
 
 def _output_name(item: Any) -> str | None:
@@ -1472,10 +1632,11 @@ def _use_of(node: Any, values: dict[int, Any], lifts: dict[int, Any]) -> tuple[s
 
 
 def _wraps(parent: Any, child: Any) -> bool:
-    """parent 只是 child 的外壳，不改变它是哪个值：括号、负号、CAST、字符集前缀（_utf8mb4'x'）、COLLATE。"""
+    """parent 只是 child 的外壳，不改变它是哪个值：括号、负号、CAST（只算被转换的那个值，类型参数、DEFAULT 后面的值
+    不算）、字符集前缀（_utf8mb4'x'）、COLLATE。"""
     from sqlglot import exp
 
-    return isinstance(parent, (exp.Paren, exp.Neg, exp.Cast)) or (
+    return (isinstance(parent, (exp.Paren, exp.Neg, exp.Cast)) and child is parent.this) or (
         isinstance(parent, exp.Introducer) and child is parent.expression) or (
         isinstance(parent, exp.Collate) and child is parent.this)
 
@@ -1497,10 +1658,11 @@ def _exact_ops() -> dict[Any, str]:
 
 
 def _arithmetic() -> tuple[Any, ...]:
-    """加减乘除：几个写死的数算出来的整个算式按算出来的那一个值认（13900000000 + 1 就是 13900000001）。"""
+    """加减乘除、取模（%、MOD）、整除（MySQL 的 DIV、DuckDB 的 //）：几个写死的数算出来的整个算式按算出来的那一个值认
+    （13900000000 + 1 就是 13900000001，125 % 100 就是 25）。"""
     from sqlglot import exp
 
-    return exp.Add, exp.Sub, exp.Mul, exp.Div
+    return exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv
 
 
 #: 数的写法里指数最大多少（1e999999 这样的写法不按数认，免得展开成上百万位）
@@ -1557,19 +1719,27 @@ def _constants(root: Any) -> dict[int, Any]:
 
 
 def _worked_out(node: Any, a: Any, b: Any) -> Decimal | None:
-    """一步加减乘除的结果；不是两个数、除以零、结果太大为 None。"""
+    """一步加减乘除、取模、整除的结果；不是两个数、除以零、结果太大为 None。取模、整除照 SQL 往零取整（-7 % 2 是 -1，
+    -7 DIV 2 是 -3，同 Decimal 的 % 和 //）。/ 在 SQLite、Postgres 这类方言里两个整数相除只留整数部分（解析时记在
+    typed 上：53 / 2 是 26），写成小数的（53.0 / 2）、别的方言照小数算。以前一律按小数算，SQLite 里 age >= 25 AND
+    age < 53 / 2 夹住了 25 却认不出。"""
     from sqlglot import exp
 
     if not (isinstance(a, Decimal) and isinstance(b, Decimal)):
         return None
     try:
-        if isinstance(node, exp.Div):
-            value = a / b if b else None
+        if isinstance(node, (exp.Div, exp.IntDiv, exp.Mod)):
+            if not b:
+                return None
+            # 写成整数的数（和它们加减乘出来的）指数正好是 0；53.0、1e1 这样写的在 SQL 里不是整数
+            whole = isinstance(node, exp.IntDiv) or (
+                node.args.get("typed") and a.as_tuple().exponent == 0 and b.as_tuple().exponent == 0)
+            value = a % b if isinstance(node, exp.Mod) else a // b if whole else a / b
         else:
             value = a + b if isinstance(node, exp.Add) else a - b if isinstance(node, exp.Sub) else a * b
     except ArithmeticError:
         return None
-    return value if value is not None and value.is_finite() and abs(value.adjusted()) <= _EXPONENT_MAX else None
+    return value if value.is_finite() and abs(value.adjusted()) <= _EXPONENT_MAX else None
 
 
 def _lifts(root: Any, values: dict[int, Any]) -> dict[int, Any]:
@@ -1588,16 +1758,19 @@ def _lifts(root: Any, values: dict[int, Any]) -> dict[int, Any]:
 
 
 #: 一个比较的一半：(算出边界的那几个字面量, 另一边的键, 写死的值, 「键 运算符 值」的运算符)。边界是几个数算出来的
-#: （13900000002 - 1），算式里的字面量都记下：夹住了某一个值，留着哪一个都可能算得出它，都换
+#: （13900000002 - 1），算式里的字面量都记下：夹住了某一个值，留着哪一个都可能算得出它，都换。不参与算值的字面量
+#: （CAST(30000 AS DECIMAL(10, 2)) 的类型参数 10、2）不记，见 _halves
 _Half = tuple[tuple[Any, ...], str, Any, str]
 #: 一个比较拆成的几半，加上几半怎么连（False：且，BETWEEN；True：或，IN）、是不是等值一类（不等、IN）
 _Leaf = tuple[list[_Half | None], bool, bool]
 
 
-def _halves(node: Any, values: dict[int, Any]) -> list[_Half | None]:
-    """一个比较拆成的几半（values 是 _constants 算好的写死的值）：BETWEEN 是两半的「且」（不低于下界、不高于上界），
-    > >= < <= 是一半，= <> 这类是一半，IN 是一串「=」的「或」。边界不是写死的值（另一列、子查询）或者两边都写死了的，
-    这一半记 None：它的真假跟哪一列的取值都对不上，当成不知道真假。"""
+def _halves(node: Any, values: dict[int, Any], lifts: dict[int, Any]) -> list[_Half | None]:
+    """一个比较拆成的几半（values 是 _constants 算好的写死的值，lifts 见 _lifts）：BETWEEN 是两半的「且」（不低于下界、
+    不高于上界），> >= < <= 是一半，= <> 这类是一半，IN 是一串「=」的「或」。边界不是写死的值（另一列、子查询）或者
+    两边都写死了的，这一半记 None：它的真假跟哪一列的取值都对不上，当成不知道真假。算出边界的字面量是往上走得到这一边
+    的那几个（_lifts）：CAST(30000 AS DECIMAL(10, 2)) 里只有 30000，类型参数 10、2 不算出值，换了只会让封存的 SQL 难读，
+    SQL 检查结果的片段里别处的 10、2 也会跟着换。"""
     from sqlglot import exp
 
     if isinstance(node, exp.Between):
@@ -1615,8 +1788,9 @@ def _halves(node: Any, values: dict[int, Any]) -> list[_Half | None]:
     out: list[_Half | None] = []
     for operand, other, op in sides:
         value = values.get(id(operand)) if operand is not None else None
-        out.append((tuple(operand.find_all(*_literal_types())), _key_of(other), value, op)
-                   if value is not None else None)
+        literals = () if value is None else tuple(
+            literal for literal in operand.find_all(*_literal_types()) if lifts.get(id(literal)) is operand)
+        out.append((literals, _key_of(other), value, op) if value is not None else None)
     return out
 
 
@@ -1725,9 +1899,9 @@ def _marks(value: Any, op: str) -> list[tuple[Any, int]]:
     return [(value, 0 if op in (">=", "<") else 1), *steps]
 
 
-def _pinned(root: Any, values: dict[int, Any]) -> dict[int, tuple[str, ...]]:
+def _pinned(root: Any, values: dict[int, Any], lifts: dict[int, Any]) -> dict[int, tuple[str, ...]]:
     """把某一个值夹住了的边界字面量：id(字面量节点) → 夹住的值（_point_text 的写法）。values 是 _constants 算好的
-    写死的值。
+    写死的值，lifts 见 _lifts。
 
     一个值 v 两边都被隔开（_marks），条件才可能只认 v 这一个值。范围比较在整条 SQL 里配对，只有分档的几种写法各算
     各的（_apart：CASE 的不同分支、SELECT 里不筛行的不同项、UNION 的不同支），它们共用的边界是分档的界，不是在找哪
@@ -1754,7 +1928,7 @@ def _pinned(root: Any, values: dict[int, Any]) -> dict[int, tuple[str, ...]]:
     nearby: dict[tuple[int, str], set[Decimal]] = {}
     for node in root.find_all(exp.Between, *_range_ops(), *exact_types):
         is_exact = isinstance(node, exact_types)
-        parts = _halves(node, values)
+        parts = _halves(node, values, lifts)
         if is_exact and all(h is None for h in parts):
             continue  # 连接条件（两边都是列）这类：和夹住哪个值无关
         top = _condition_root(node)
@@ -2006,7 +2180,7 @@ def _literal_uses(sql: str, kind: str | None) -> dict[int, _Use] | None:
     try:
         values = _constants(root)
         lifts = _lifts(root, values)
-        pinned = _pinned(root, values)
+        pinned = _pinned(root, values, lifts)
         for node in root.walk():
             start = (node.meta or {}).get("start") if isinstance(node, _literal_types()) else None
             if not isinstance(start, int):

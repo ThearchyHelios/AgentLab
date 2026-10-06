@@ -9,8 +9,9 @@
 - SQL 里数字照原样留着的只有范围比较的边界（没把某一个值夹住的）和 LIMIT / OFFSET 的行数；在找某一个值的（等值、IN、
   LIKE、简单 CASE、IS [NOT] DISTINCT FROM，套了括号、写成行值、VALUES、ARRAY 的也算，还有 BETWEEN v AND v、
   >= v AND <= v 这类夹住某一个值的范围）和遮罩列比较时短的数也换，被比较的一边套了 CAST、汇总也算；同一个数换个
-  写法（25.0、025、2.5e1）、写成几个数的算式（25 + 0、13900000000 + 1）照样认，算式里的数都换；选出列、函数参数、
-  算式里够长的遮罩值也换；字符串（范围边界也一样）、注释、名字按值换；SQL 解析不了时认不准哪个是阈值，一律不免
+  写法（25.0、025、2.5e1）、写成几个数的算式（25 + 0、13900000000 + 1、125 % 100、50 DIV 2，整数相除照数据源的算法）
+  照样认，算式里的数都换（CAST 的类型参数不算）；选出列、函数参数、算式里够长的遮罩值也换；字符串（范围边界也一样）、
+  注释、名字按值换；SQL 解析不了时认不准哪个是阈值，一律不免
 - 「夹住某一个值」在整条 SQL 里认，只有分档的几种写法各算各的：CASE 的不同分支、不同的选出列（连同 GROUP BY、
   ORDER BY）、UNION 的不同支，共用的边界是阈值；同一行集上的条件（ON 和 WHERE、WHERE 和 HAVING、INTERSECT 两支、
   包在 CASE / 函数 / 算式里的一半、子查询、CTE）照样认得出在找哪一个值。同一个条件里按合起来的真假认（旁边的别的
@@ -22,8 +23,9 @@
   同一个短的数，没设遮罩的列上的等值，都不牵连阈值；不留的照等值的办法换，别的列上的短阈值、LIMIT 撞上别处换掉的
   短的数照原样（已知局限）
 - 按遮罩列分档的标签（CASE、IIF 的结果都是写死的常量）是 agent 自己写在 SQL 里的，不当遮罩值：SQL、回答正文里照原样；
-  当分组键的（每一档一行）不算派生值，格子照常显示，逐行的标签列照旧整列遮。只有只装着标签的列不收（经别名、子查询
-  传下去、没起别名的也算），改了名字的遮罩列撞上同一条 SQL 里的 THEN 1 ELSE 0 照收
+  当分组键的（每一档一行）不算派生值，格子照常显示，逐行的标签列照旧整列遮。只有只装着标签的列不收（按作用域认取自
+  哪个来源：经别名、子查询、CTE 传下去、没起别名的也算），改了名字的遮罩列撞上同一条 SQL 里的 THEN 1 ELSE 0 照收，
+  UNION 另一支、子查询里的遮罩列流进标签列也照收
 - 快照按列遮，另按值遮：别的列里写着遮罩值的格子也换成「已遮罩」；列名里写着遮罩值的，列名也换；质询工件里，
   没设遮罩的列里一格文字夹着的遮罩值按子串换（回答一路照旧整份不交），SQL 检查结果的片段、说明照整条 SQL 换（截断的
   片段从没闭合的引号、注释起去掉，说明里的码值表和别的字一样按值换）
@@ -278,6 +280,75 @@ def test_labels_passed_on_under_their_own_name_are_still_not_masked_values(sql, 
     assert plan.secrets.scrub("小单 3 笔、大单 2 笔") == "小单 3 笔、大单 2 笔"
 
 
+#: 按条件数大单写的 1、0：和会员等级（1、2、3）撞在一起
+BIG_ONE = "CASE WHEN amount > 1000 THEN 1 ELSE 0 END"
+#: 标签那一支的 1、0 在前，等级 1、2、3 在后
+LEVEL_ROWS = [[1], [0], [0], [1], [1], [2], [3], [1]]
+
+
+@pytest.mark.parametrize("sql, columns, rows", [
+    # UNION 标签在前、遮罩列在后：遮罩列没起别名，或者起了别的名字
+    (f"SELECT {BIG_ONE} AS 等级 FROM sales UNION ALL SELECT vip_level FROM sales", ["等级"], LEVEL_ROWS),
+    (f"SELECT {BIG_ONE} AS 等级 FROM sales UNION ALL SELECT vip_level AS lv FROM sales", ["等级"], LEVEL_ROWS),
+    # 子查询里的 UNION，外层按名字取；写了列名表的 CTE 里的 UNION
+    (f"SELECT 等级, COUNT(*) AS 人数 FROM (SELECT {BIG_ONE} AS 等级 FROM sales UNION ALL SELECT vip_level FROM sales) t "
+     "GROUP BY 等级", ["等级", "人数"], [[0, 2], [1, 4], [2, 1], [3, 1]]),
+    (f"WITH t(lv) AS (SELECT {BIG_ONE} FROM sales UNION ALL SELECT vip_level FROM sales) SELECT lv AS 等级 FROM t",
+     ["等级"], LEVEL_ROWS),
+    # 标签写在 CTE 里，结果的 UNION 另一支取遮罩列
+    (f"WITH b AS (SELECT {BIG_ONE} AS lvl FROM sales) SELECT lvl FROM b UNION ALL SELECT vip_level FROM sales",
+     ["lvl"], LEVEL_ROWS),
+    # 遮罩列经按原名选出的子查询、以标签的别名传出
+    (f"SELECT {BIG_ONE} AS 档 FROM sales UNION ALL SELECT b.vip_level AS 档 FROM (SELECT vip_level FROM sales) b",
+     ["档"], LEVEL_ROWS),
+    # 不用 UNION：两个子查询连起来，一边是标签，一边是改了名字的遮罩列，名字相同
+    (f"SELECT y.档 AS 档 FROM (SELECT id, {BIG_ONE} AS 档 FROM sales) x "
+     "JOIN (SELECT id, vip_level AS 档 FROM (SELECT id, vip_level FROM sales) z) y ON x.id = y.id", ["档"],
+     [[1], [2], [3], [1]]),
+    # USING 连起来的同名列：右连接时，左边没对上的行取的是右边那张表里的值
+    (f"WITH b AS (SELECT id, {BIG_ONE} AS vip_level FROM sales) SELECT vip_level AS 等级 FROM b "
+     "RIGHT JOIN members USING (vip_level)", ["等级"], [[1], [2], [3]]),
+])
+def test_a_column_that_also_carries_the_masked_column_is_not_a_label_column(sql, columns, rows):
+    """第 3 轮复核：只装着标签的列以前按名字认，从「所有名字都只装着标签」起往下剔，遮罩列原样选出（SELECT vip_level）
+    时名字就是它自己，永远剔不掉；结果的 UNION 按位置那一遍只往里加标签，另一支取的是遮罩列也不剔，派生来源里的
+    UNION 根本不按位置看。于是标签在前、遮罩列在后时，等级 1 撞上 THEN 1 就不收，之后 WHERE vip_level = 1 照原样
+    封存。现在按作用域认每一项取自哪个来源，结果的这一列在每一支里都只装着标签才算，取自数据源里的表的一律不算。"""
+    plan = plan_of({"source": "shop", "sql": sql, "columns": columns, "rows": rows}, {"vip_level"})
+    assert inquiry_mod._label_columns(sql, "sqlite", columns) == {}
+    assert {"1", "2", "3"} <= plan.secrets.weak
+    for level in (1, 2, 3):
+        assert inquiry_mod._scrub_sql(f"SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = {level}", plan.secrets,
+                                      plan.tainted["a1"], "sqlite") == (
+            "SELECT COUNT(*) AS 人数 FROM sales WHERE vip_level = 已遮罩")
+
+
+_EXTRA = "CASE WHEN amount > 60000 THEN '特大单' END"
+
+
+@pytest.mark.parametrize("sql, columns, texts", [
+    # CTE 里分档，外层连上数据源里的表、按档位汇总：档位没写表名也认得出取自 CTE（SQL 能执行，别的表就没有同名的列，
+    # 不然会报列名有歧义）
+    (f"WITH banded AS (SELECT id, {BANDS} AS 档位 FROM sales) SELECT 档位, SUM(s.visits) AS 访问 FROM banded b "
+     "JOIN sales s ON s.id = b.id GROUP BY 档位", ["档位", "访问"], {"小单", "大单"}),
+    # 按别的列连起来（USING (id)）：档位没合成一列，照样取自 CTE
+    (f"WITH banded AS (SELECT id, {BANDS} AS 档位 FROM sales) SELECT 档位, SUM(o.amount) AS 金额 FROM banded "
+     "JOIN orders o USING (id) GROUP BY 档位", ["档位", "金额"], {"小单", "大单"}),
+    # 写了表名、经两层子查询传下来
+    (f"SELECT t.档位 FROM (SELECT b.档位 FROM (SELECT {BANDS} AS 档位 FROM sales) b) t", ["档位"], {"小单", "大单"}),
+    # UNION 两支都是标签（第二支没写 ELSE、没起别名）：两支的标签都算
+    (f"SELECT {BANDS} AS 档位 FROM sales UNION ALL SELECT {_EXTRA} FROM sales", ["档位"], {"小单", "大单", "特大单"}),
+    # 派生来源里的 UNION 两支都是标签，外层经 * 带出来
+    (f"SELECT * FROM (SELECT {BANDS} AS 档位 FROM sales UNION ALL SELECT {_EXTRA} FROM sales) t", ["档位"],
+     {"小单", "大单", "特大单"}),
+])
+def test_label_columns_are_traced_to_where_they_are_written(sql, columns, texts):
+    """改成按作用域认之后，写在别处、原样传下来的标签照样认得出：外层连上数据源里的表没写表名、按别的列 USING、写了
+    表名经两层子查询；UNION 两支都是标签的，每一支的标签都算（以前派生来源里的 UNION 按名字认，只算起了这个名字的
+    第一支）。"""
+    assert inquiry_mod._label_columns(sql, "sqlite", columns) == {"档位": texts}
+
+
 # --------------------------------------------------------------------------
 # 按值认：门槛、边界
 # --------------------------------------------------------------------------
@@ -503,6 +574,55 @@ def test_a_threshold_worked_out_from_several_numbers_is_kept_like_one_number(amo
     assert inquiry_mod._scrub_sql(swapped, amounts, {"amount"}, "sqlite") == (
         "SELECT COUNT(*) FROM sales WHERE amount >= 已遮罩 + 已遮罩 OR amount = 已遮罩")
     assert inquiry_mod._shown_literals([(swapped, "sqlite", {"amount"})], amounts) == set()
+
+
+@pytest.mark.parametrize("kind, sql, sealed", [
+    # 取模、整除算出来的边界和等值：125 % 100、MOD(125, 100) 是 25，50 DIV 2、51 // 2 也是
+    ("sqlite", "SELECT COUNT(*) FROM sales WHERE age >= 25 AND age <= 125 % 100",
+     "SELECT COUNT(*) FROM sales WHERE age >= 已遮罩 AND age <= 已遮罩 % 已遮罩"),
+    ("postgresql", "SELECT COUNT(*) FROM sales WHERE age = MOD(125, 100)",
+     "SELECT COUNT(*) FROM sales WHERE age = MOD(已遮罩, 已遮罩)"),
+    ("mysql", "SELECT COUNT(*) FROM sales WHERE age >= 25 AND age <= 50 DIV 2",
+     "SELECT COUNT(*) FROM sales WHERE age >= 已遮罩 AND age <= 已遮罩 DIV 已遮罩"),
+    ("duckdb", "SELECT COUNT(*) FROM sales WHERE age >= 25 AND age <= 51 // 2",
+     "SELECT COUNT(*) FROM sales WHERE age >= 已遮罩 AND age <= 已遮罩 // 已遮罩"),
+    # SQLite、Postgres 里两个整数相除只留整数部分：53 / 2 是 26，age < 26 和 age >= 25 夹住 25
+    ("sqlite", "SELECT COUNT(*) FROM sales WHERE age >= 25 AND age < 53 / 2",
+     "SELECT COUNT(*) FROM sales WHERE age >= 已遮罩 AND age < 已遮罩 / 已遮罩"),
+    ("postgresql", "SELECT COUNT(*) FROM sales WHERE buyer_phone >= 13900000001 AND buyer_phone < 27800000005 / 2",
+     "SELECT COUNT(*) FROM sales WHERE buyer_phone >= 已遮罩 AND buyer_phone < 已遮罩 / 已遮罩"),
+])
+def test_a_value_worked_out_with_remainders_or_whole_division_is_read_as_that_value(phones, kind, sql, sealed):
+    """第 3 轮复核：取模（%、MOD）、整除（MySQL 的 DIV、DuckDB 的 //）写成的算式以前不按算出来的值认，age >= 25 AND
+    age <= 125 % 100 照原样封存；整数相除在 SQLite、Postgres 里只留整数部分，以前按小数算（53 / 2 算成 26.5），
+    夹住的值也认不出。现在都按数据源算出来的那一个值认，算式里的数都换，正文里也不免遮。"""
+    assert inquiry_mod._scrub_sql(sql, phones, {"buyer_phone", "age"}, kind) == sealed
+    assert not inquiry_mod._shown_literals([(sql, kind, {"buyer_phone", "age"})], phones) & {"25", "13900000001"}
+
+
+@pytest.mark.parametrize("kind, divided", [("mysql", "53 / 2"), ("duckdb", "53 / 2"), ("sqlite", "53.0 / 2")])
+def test_division_that_keeps_the_fraction_is_read_as_written(phones, kind, divided):
+    """MySQL、DuckDB 的 / 照小数算，SQLite 里写成小数的也是：53 / 2、53.0 / 2 是 26.5，age >= 25 AND age < 26.5 里
+    25、26 都成立，没夹住，照原样。"""
+    sql = f"SELECT COUNT(*) FROM sales WHERE age >= 25 AND age < {divided}"
+    assert inquiry_mod._scrub_sql(sql, phones, {"buyer_phone", "age"}, kind) == sql
+
+
+def test_type_parameters_of_a_cast_bound_are_left_alone(amounts):
+    """第 3 轮复核：夹住某一个值的边界写成 CAST(v AS DECIMAL(10, 2)) 时，类型参数 10、2 以前也当成算出边界的数换掉，
+    封存的 SQL 成了 DECIMAL(已遮罩, 已遮罩)，SQL 检查结果的片段里别处的 10、2 也跟着换。只换算出边界的那个数；Oracle
+    的 CAST … DEFAULT 0 ON CONVERSION ERROR 里的 0 也不算出值，照原样。"""
+    sql = ("SELECT COUNT(*) FROM sales WHERE amount >= CAST(30000 AS DECIMAL(10, 2)) "
+           "AND amount <= CAST(30000 AS DECIMAL(10, 2))")
+    assert inquiry_mod._scrub_sql(sql, amounts, {"amount"}, "sqlite") == sql.replace("30000", MASKED)
+    assert inquiry_mod._literal_swaps(sql, amounts, {"amount"}, "sqlite") == {"30000"}
+    checks = [{"code": "stock_summed", "level": "warning", "table": "sales", "message": "存量跨日期求和",
+               "sql_excerpt": "ROUND(SUM(amount), 2) >= 10"}]
+    [check] = inquiry_mod._masked_checks(checks, sql, amounts, {"amount"}, "sqlite")
+    assert check["sql_excerpt"] == "ROUND(SUM(amount), 2) >= 10"
+    fallback = ("SELECT COUNT(*) FROM sales WHERE amount >= CAST('30000' AS NUMBER DEFAULT 0 ON CONVERSION ERROR) "
+                "AND amount <= CAST('30000' AS NUMBER DEFAULT 0 ON CONVERSION ERROR)")
+    assert inquiry_mod._scrub_sql(fallback, amounts, {"amount"}, "oracle") == fallback.replace("30000", MASKED)
 
 
 @pytest.mark.parametrize("sql, sealed", [
