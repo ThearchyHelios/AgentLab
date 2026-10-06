@@ -606,6 +606,19 @@ JUDGE_KEYS = ("provider", "model", "max_claims", "max_cost_usd", "timeout_s", "r
 #: 证据相矛盾时正式运行怎么判档：degrade 降档（默认）/ withhold 不予出具。探索运行只标注
 JUDGE_ON_UNSUPPORTED = ("degrade", "withhold")
 
+#: 「没有指定模型」那条提示的编号。节点（或全图默认）点名了接入、而那个接入本身不存在或已停用时，它和接入那条问题
+#: 互相矛盾（一条说照常执行、一条说会失败），接口层读了接入表以后按编号去掉它（provider_refs.quiet_unset_model）
+MODEL_UNSET = "model.unset"
+
+
+def _named_provider_of(spec: GraphSpec, node: GraphNode) -> str | None:
+    """节点执行时点名的接入名：节点上没写（None、空串）就取全图默认，同 NodeContext.cfg；只有空白、不是字符串的不算
+    点了名（同 provider_refs._name）。"""
+    value = node.config.get("provider")
+    if value in (None, ""):
+        value = spec.defaults.get("provider")
+    return value.strip() or None if isinstance(value, str) else None
+
 
 def claims_problem(value: Any) -> str | None:
     """claims 的取值有什么问题，没问题返回 None。校验和报告撰写节点执行时报的是同一句话。"""
@@ -929,11 +942,15 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
 
         if node.type in (NodeType.LLM, NodeType.AGENT, NodeType.SUPERVISOR, NodeType.REPORT):
             if not (cfg.get("model") or spec.defaults.get("model")):
+                # 点名了接入就用那个接入的默认模型，照实说是哪个：检查器、问题面板里只写「默认模型」，人会以为是第一个
+                # 可用的接入。那个接入本身不存在或已停用时，接口层去掉这一条，只留接入的问题（MODEL_UNSET）
+                named = _named_provider_of(spec, node)
                 result.add(
-                    "没有指定模型，将使用默认模型",
+                    f"没有指定模型，将使用接入「{named}」的默认模型" if named else "没有指定模型，将使用默认模型",
                     level="warning",
                     node_id=node.id,
                     field="model",
+                    code=MODEL_UNSET,
                 )
 
     # 表达式：用运行时同一个 parse_expression 先解析一遍。以前写错了只有跑到那一步

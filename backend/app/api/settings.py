@@ -23,7 +23,8 @@ from app.engine.judge import sanitize_settings as judge_values, settings_problem
 from app.engine.spend import SPEND_KEY as VERIFY_SPEND, daily_spend as verify_daily_spend
 from app.providers import catalog
 from app.providers.factory import (
-    ModelSpec, ProviderNotConfigured, _resolve_key, build_chat_model, list_providers as all_providers, named_provider,
+    ModelSpec, ProviderNotConfigured, _resolve_key, assistant_model_note, build_chat_model,
+    list_providers as all_providers, model_note, named_provider,
 )
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -500,7 +501,8 @@ def verify_problem(value: Any) -> str | None:
         label = VERIFY_SETTING_LABEL[key]
         if key in ("provider", "model"):
             if item is not None and not isinstance(item, str):
-                return f"「{label}」需要填写模型接入的名称或模型 ID，留空表示沿用证据裁判模型，当前为「{item}」"
+                # 「跟随证据裁判模型」是设置页接入下拉框空选项的原话
+                return f"「{label}」需要填写模型接入的名称或模型 ID，留空表示跟随证据裁判模型，当前为「{item}」"
         elif key == "daily_max_usd":
             if not _positive(item, whole=False):
                 return f"「{label}」需要填写大于 0 的金额（美元），留空表示不限，当前为「{item}」"
@@ -728,36 +730,40 @@ class SettingsIn(BaseModel):
 PROVIDER_INVALID = "settings_provider_invalid"
 
 
-def _provider_fields() -> dict[tuple[str, str], tuple[str, str]]:
-    """设置里点名模型接入的项：(组, 键) → (设置页上的叫法, 留空时用什么)。门控、裁判、核查的叫法和设置页一致；助手的
-    模型由助手面板单独设定（PUT /api/copilot/model），这里只防经设置接口写进去的那一份。"""
+def _provider_fields() -> dict[tuple[str, str], tuple[str, str | None]]:
+    """设置里点名模型接入的项：(组, 键) → (这一项在界面上的叫法, 同一组模型那一项的叫法)。门控、裁判、核查的叫法和
+    设置页一致；助手的模型由「编排」页助手栏的「助手使用的模型」单独设定（PUT /api/copilot/model），只有这一个下拉框，
+    这里只防经设置接口写进去的那一份。"""
     from app.api.copilot import COPILOT_SETTING_KEY   # 在这里导入：copilot 模块很大，设置模块被引擎各处导入
+    from app.providers.factory import ASSISTANT_MODEL_FIELD
 
     return {
-        ("run", "tool_gate_provider"): ("门控模型 · 接入", "留空表示使用默认接入的默认模型"),
-        (JUDGE_GROUP, "provider"): (JUDGE_LABEL["provider"], "留空表示不指定"),
-        (VERIFY_GROUP, "provider"): (VERIFY_SETTING_LABEL["provider"], "留空表示沿用证据裁判模型"),
-        (COPILOT_SETTING_KEY, "provider"): ("助手模型 · 接入", "留空表示不指定"),
+        ("run", "tool_gate_provider"): ("门控模型 · 接入", "门控模型 · 模型"),
+        (JUDGE_GROUP, "provider"): (JUDGE_LABEL["provider"], JUDGE_LABEL["model"]),
+        (VERIFY_GROUP, "provider"): (VERIFY_SETTING_LABEL["provider"], VERIFY_SETTING_LABEL["model"]),
+        (COPILOT_SETTING_KEY, "provider"): (ASSISTANT_MODEL_FIELD, None),
     }
 
 
 async def _provider_problem(session: AsyncSession, values: dict[str, Any]) -> tuple[str, str] | None:
     """这次写进来的设置里点名的模型接入有没有问题：(字段, 说明)，没问题返回 None。说明和运行时报的原因、提示同一句
-    （factory.named_provider）。
+    （factory.named_provider），主语写这一项在设置页上的叫法；下拉框里选的，写「指定的」。
 
     以前点名的接入不存在时运行悄悄换成演示模型，名字写错一个字就由演示模型写报告、做核查，现在运行时照实报错；保存时
-    先拦一道。留空照旧表示沿用上一级。只查这次改了的：存着的值没改（写好之后接入才被删、停用）不挡这次保存别的项——
-    设置页在那一项下标着「不存在」「已停用」，运行时照实报错，同设置页「只校验改过的」的做法。
+    先拦一道。留空照旧表示沿用上一级——说明里不再讲留空是什么意思：设置页那一格的空选项写着（「默认接入」「跟随助手
+    的模型」「跟随证据裁判模型」……），这里另写一遍只会对不上。只查这次改了的：存着的值没改（写好之后接入才被删、
+    停用）不挡这次保存别的项——设置页在那一项下标着「不存在」「已停用」，运行时照实报错，同设置页「只校验改过的」。
+    点名的名字恰好是某个启用接入的模型时，补一句在这一组的哪一栏用它（factory.model_note）。
 
     名字不是字符串（接口写进来的数字一类）：核查、裁判两组自己的格式检查在前面先报；门控、助手两组没有自己的检查，
     在这里报，免得存下去之后读它的地方（查助手当前用哪个模型）出错。"""
     providers = None
-    for (group, key), (label, blank) in _provider_fields().items():
+    for (group, key), (label, model_label) in _provider_fields().items():
         sent = values.get(group)
         if not isinstance(sent, dict):
             continue
         if (raw := sent.get(key)) is not None and not isinstance(raw, str):
-            return f"{group}.{key}", f"「{label}」需要填写模型接入的名称，{blank}，当前为「{raw}」"
+            return f"{group}.{key}", f"「{label}」需要填写模型接入的名称，当前为「{raw}」"
         if (name := _model_text(raw)) is None:
             continue
         row = await session.get(Setting, group)
@@ -769,7 +775,12 @@ async def _provider_problem(session: AsyncSession, values: dict[str, Any]) -> tu
         try:
             named_provider(providers, name)
         except ProviderNotConfigured as e:
-            return f"{group}.{key}", f"「{label}」填写的{e.reason}。{e.hint}；{blank}"
+            said = f"「{label}」指定的{e.reason}。{e.hint}"
+            if e.model_owner:
+                note = model_note(e.name, e.model_owner, f"「{model_label}」", f"「{label}」") if model_label \
+                    else assistant_model_note(e.name, e.model_owner)
+                said += f"。{note}"
+            return f"{group}.{key}", said
     return None
 
 

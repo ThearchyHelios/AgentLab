@@ -111,9 +111,9 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
     _lint_evidence(spec, flag, strict=strict)
     _lint_sql(spec, flag, checkers)
     if providers is not None:
-        from app.engine.provider_refs import issues as provider_issues, provider_refs
+        from app.engine.provider_refs import issues as provider_issues
 
-        for issue in provider_issues(provider_refs(spec), providers, level="error"):
+        for issue in provider_issues(spec, providers, level="error"):
             result.add(issue.message, level="error", node_id=issue.node_id, field=issue.field, code=issue.code)
 
     if strict and not has_contract_output:
@@ -164,7 +164,11 @@ def _not_repeated(issues: list[Any], gate: list[Any], spec: GraphSpec) -> list[A
 
     G5 落在 agent 上，validate 那条也落在 agent 上；G4 落在喂数的沙箱代码上，validate 那条落在口径卡读它的
     那条指标上，按口径卡的输入对回去。没被门禁覆盖的（比如不给口径卡供数的 agent）照旧提示。
+    节点点名的接入不存在或已停用（门禁的 provider.*）时，validate 那条「没有指定模型，将使用接入「X」的默认模型」
+    和它矛盾，同样不列（provider_refs.quiet_unset_model）。
     """
+    from app.engine.provider_refs import quiet_unset_model
+
     cited = {i.node_id for i in gate if i.code == "governed.caliber_agent_cite_fields"}
     compute = {i.node_id for i in gate if i.code == "governed.caliber_compute_input"}
     covered = {("evidence.cite_fields_off", nid, "output_schema") for nid in cited}
@@ -172,7 +176,8 @@ def _not_repeated(issues: list[Any], gate: list[Any], spec: GraphSpec) -> list[A
         if card.type == NodeType.METRICS and compute:
             covered |= {("evidence.caliber_compute_input", card.id, f"metrics[{i}].expression")
                         for i, producer in _caliber_inputs(card, spec) if producer.id in compute}
-    return [i for i in issues if i.code not in _REPEATS or (i.code, i.node_id, i.field) not in covered]
+    kept = [i for i in issues if i.code not in _REPEATS or (i.code, i.node_id, i.field) not in covered]
+    return quiet_unset_model(spec, kept, gate)
 
 
 def _lint_contract(

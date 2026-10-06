@@ -517,9 +517,20 @@ def _landing_text(landed: list[tuple[Any, Any]]) -> str:
 
 
 def _plan_provider(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
-    """执行时取不到模型的那一处（engine/provider_refs.py）：改用一个启用的接入，或者不再指定。点名的接入不存在、已停用
-    的，候选是「不指定接入」和各个启用的接入；只写了模型、提供它的接入已停用的，是「不指定模型」和各个启用的接入
-    （写在模型旁边的接入上）。
+    """执行时取不到模型的那一处（engine/provider_refs.py）：改用一个启用的接入，或者不再指定（provider_choice）。"""
+    from app.engine.provider_refs import provider_refs
+
+    field = str(issue.get("field") or "")
+    ref = next((r for r in provider_refs(ctx.spec) if r.node_id == issue.get("node_id") and r.field == field), None)
+    return provider_choice(ctx.spec, ref, ctx.providers) if ref is not None else None
+
+
+def provider_choice(spec: GraphSpec, ref: Any, providers: list[Any]) -> dict[str, Any] | None:
+    """图里一处点名的接入（provider_refs.ProviderRef）的修复：要人选的 choice（_edits 记每个候选怎么改），一个候选都
+    落不稳时为 None。provider_refs 拿它判断问题的提示指不指到发布前检查——给不出修复就别让人去那里找。
+
+    点名的接入不存在、已停用的，候选是「不指定接入」和各个启用的接入；只写了模型、提供它的接入已停用的，是「不指定
+    模型」和各个启用的接入（写在模型旁边的接入上）。
 
     要人选、不给默认：换成哪个接入只有人知道（同一个模型可能有两家提供，价格、配额都不同）。多数节点的检查器里没有
     接入下拉框（只能选模型），全图默认、协作成员也没有，这里是界面上唯一能改它的地方。一处一条（plan_fixes 的 id
@@ -529,40 +540,57 @@ def _plan_provider(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> 
     节点跟随全图默认，都没写按模型名找；协作节点、全图默认换了接入，没写自己接入的成员、节点跟着换。落到的接入不提供
     那一处的模型、按模型名落到停用的接入或认不出的模型时，同一级写着的模型一并去掉再算——拿 A 家的模型名去调 B 家
     必然失败（设置页换接入时同一个做法）；还落不稳的候选不给，修完了运行照样失败的修复不能交给人。候选的说明写清执行
-    时改用哪里、模型去没去掉。复核（judge）另把一道关：门禁同样查只写了模型、提供它的接入已停用的那一处。
-    """
-    from app.engine.provider_refs import land, provider_refs, uses
-    from app.providers.factory import serves
+    时改用哪里、模型去没去掉，落到演示类接入的照实说。复核（judge）另把一道关：门禁同样查只写了模型、提供它的接入
+    已停用的那一处。
 
-    field = str(issue.get("field") or "")
-    ref = next((r for r in provider_refs(ctx.spec) if r.node_id == issue.get("node_id") and r.field == field), None)
-    if ref is None:
-        return None
+    只否决这次改动造成的失败：改动波及的一处要是点名的接入没变、而那个接入本来就不存在或已停用（比如节点点名的接入
+    写错了，这次改的是它跟随的全图默认模型），它落不稳不是这次改动的事，它自己那条问题照样在、照样拦着发布。拿它否决
+    的话，两处互相牵连时谁都给不出修复，规划器自己卡住。
+    """
+    from app.engine.provider_refs import land, uses
+    from app.providers.factory import ProviderNotConfigured, named_provider, serves
+
+    field = ref.field
+    node = spec.node_map().get(ref.node_id) if ref.node_id is not None else None
     path = field.removeprefix("defaults.") if ref.node_id is None else field
     if ref.kind == "model":
         model_path, provider_path = path, path[: -len("model")] + "provider"
     else:
         provider_path, model_path = path, _model_path(path)
     prefix = "defaults." if ref.node_id is None else ""
-    root = ctx.spec.defaults if ref.node_id is None else (node.config if node is not None else {})
+    root = spec.defaults if ref.node_id is None else (node.config if node is not None else {})
     model = _read_path(root, model_path)
     model = model.strip() if isinstance(model, str) and model.strip() else None
-    before = {use.key: use for use in uses(ctx.spec)}
+    before = {use.key: use for use in uses(spec)}
+
+    def broken_before(use: Any) -> bool:
+        """这一处点名的接入改动前后没变，而它本来就不存在或已停用：落不稳不是这次改动造成的。"""
+        was = before.get(use.key)
+        if was is None or use.provider is None or use.provider != was.provider:
+            return False
+        try:
+            named_provider(providers, use.provider.name)
+        except ProviderNotConfigured:
+            return True
+        return False
 
     def trial(edits: list[tuple[str, Any]]) -> list[tuple[Any, Any]] | None:
-        """在副本上改，改动波及的每一处（取法变了的）执行时落到哪里；有一处落不稳返回 None。"""
-        spec = ctx.spec.model_copy(deep=True)
-        target = spec.defaults if ref.node_id is None else spec.node_map()[ref.node_id].config
+        """在副本上改，改动波及的每一处（取法变了的）执行时落到哪里；有一处因这次改动落不稳返回 None。"""
+        copied = spec.model_copy(deep=True)
+        target = copied.defaults if ref.node_id is None else copied.node_map()[ref.node_id].config
         for at, value in edits:
             _put_path(target, at, value)
         landed = []
-        for use in uses(spec):
+        for use in uses(copied):
             if before.get(use.key) == use:
                 continue
-            if not (landing := land(use, ctx.providers)).ok:
+            if not (landing := land(use, providers)).ok:
+                if broken_before(use):
+                    continue
                 return None
             landed.append((use, landing))
-        return landed
+        # 改完没有一处落到新地方：这一处没修好（比如它跟随的那一级也坏着、原因还一样）
+        return landed or None
 
     def settle(edits: list[tuple[str, Any]]) -> tuple[list[tuple[str, Any]], list[tuple[Any, Any]]] | None:
         """先只改这一处；落不稳而同一级写着模型时，连模型一并去掉再试。返回（改法，波及的各处落到哪里），还落不稳为 None。"""
@@ -582,7 +610,7 @@ def _plan_provider(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> 
         options.append({"value": PROVIDER_CLEAR, "label": f"不指定{'模型' if ref.kind == 'model' else '接入'}",
                         "hint": f"去掉这一处指定的{what}，执行时{_landing_text(landed)}"})
         plans[PROVIDER_CLEAR] = edits
-    for p in ctx.providers:
+    for p in providers:
         if not getattr(p, "enabled", False) or not getattr(p, "name", None) or p.name in plans:
             continue
         if (got := settle([(provider_path, p.name)])) is None:
@@ -602,13 +630,17 @@ def _plan_provider(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> 
                 said.append("这一处的模型一并去掉")
             notes.append("，".join(said))
         if getattr(p, "kind", None) == "mock":
-            notes.append("演示用的模型接入，不调用真实模型")
+            notes.append(DEMO_PROVIDER)
         options.append({"value": p.name, "label": p.name, "hint": "；".join(notes) or None})
         plans[p.name] = edits
     if not options:
-        # 一个都落不稳（比如一个启用的接入都没有）：不给修复，问题照样拦着发布，说明里写了去设置里启用
+        # 一个都落不稳（比如一个启用的接入都没有）：不给修复，问题照样拦着发布，提示里只说去设置里核对、启用
         return None
     return _choice(f"选择{ref.who}改用的模型接入", field, options, _edits=plans)
+
+
+#: 候选本身是演示类接入（kind 为 mock）时的说明。「不指定」落到演示类接入时说明里另带 provider_refs.DEMO_LANDING
+DEMO_PROVIDER = "演示用的模型接入，不调用真实模型"
 
 
 _PLANNERS: dict[str, Callable[[_Ctx, dict[str, Any], GraphNode | None], dict[str, Any] | None]] = {
@@ -698,9 +730,11 @@ def public(fix: dict[str, Any]) -> dict[str, Any]:
 def annotate(issues: list[Any], fixes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """问题的字典形状，带上对应的修复 id（fix）。validate 和门禁报的同一处问题指向同一个修复。
 
-    先按（编号、节点）认（点名的模型接入一处一条，同一节点上可能有几条，再带上字段）；认不出时，图级问题（没有节点）
-    认同一编号的第一条修复，图级修复（不落在节点上，比如改全图默认）认同一编号的每一条问题。前端 canvas/issues.fixFor
-    是同一个退路。
+    先按（编号、节点）认；认不出时，图级问题（没有节点）认同一编号的第一条修复，图级修复（不落在节点上，比如改全图
+    默认）认同一编号的每一条问题。前端 canvas/issues.fixFor 是同一个退路。
+
+    点名的模型接入（_PER_FIELD）一处一条修复，只认（编号、节点、字段）都对得上的那一条，没有就是没有：这一处一个
+    候选都落不稳时修复为空，退到同一节点、同一编号别处的修复上，接口里的 fix 就指到了另一处的修复。
     """
     exact = {(f["code"], f["node_id"], f.get("field")): f["id"] for f in fixes if f["code"] in _PER_FIELD}
     by_node = {(f["code"], f["node_id"]): f["id"] for f in fixes}
@@ -713,8 +747,10 @@ def annotate(issues: list[Any], fixes: list[dict[str, Any]]) -> list[dict[str, A
     out = []
     for issue in map(_as_dict, issues):
         code = issue.get("code")
-        fid = exact.get((code, issue.get("node_id"), issue.get("field"))) if code else None
-        fid = fid or (by_node.get((code, issue.get("node_id"))) if code else None)
+        if code in _PER_FIELD:
+            out.append({**issue, "fix": exact.get((code, issue.get("node_id"), issue.get("field")))})
+            continue
+        fid = by_node.get((code, issue.get("node_id"))) if code else None
         if fid is None and code:
             fid = by_code.get(code) if issue.get("node_id") is None else by_graph.get(code)
         out.append({**issue, "fix": fid})
