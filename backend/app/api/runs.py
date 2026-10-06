@@ -15,6 +15,7 @@ from app.api.coded import CodedHTTPException
 from app.core.bus import bus
 from app.db.base import SessionLocal, get_session
 from app.db.models import Approval, Artifact, Run, RunEvent
+from app.engine.inquiry import BUSY_CONTINUE, BUSY_DECIDE, INQUIRY_BUSY, inquiry_busy
 # 发起规则和发起前检查绑定的工具搬到了 engine/launch.py。这几个名字以前从这里导入，照旧可用
 from app.engine.launch import (  # noqa: F401
     TOOL_MISSING, LaunchRefused, launch_run, missing_tools, node_setting, tool_bindings,
@@ -261,10 +262,18 @@ def _missing(e: KeyError) -> HTTPException:
     return HTTPException(404, str(e.args[0]) if e.args else "运行记录不存在")
 
 
+def _not_while_inquiring(run_id: str, detail: str) -> None:
+    """这次运行正在回答审批质询（engine/inquiry.py 的进程内登记）时，审批回复和继续运行一律 409：问答要写进
+    运行停着的这一段，运行先往下走了，审批人看着回答再批的那份依据就落了空。"""
+    if inquiry_busy(run_id):
+        raise CodedHTTPException(409, detail, INQUIRY_BUSY)
+
+
 @router.post("/{run_id}/resume", response_model=RunOut)
 async def resume_run(
     run_id: str, payload: ResumeIn, x_actor: str | None = Header(default=None)
 ) -> Run:
+    _not_while_inquiring(run_id, BUSY_DECIDE)
     try:
         # approval_id 以前定义了却从没传下去——一次运行里有多条待审批时，
         # 引擎无从知道这次回复的是哪一条
@@ -296,6 +305,7 @@ async def continue_run(
     一行状态判定，而 checkpoint 一直都在——改个模型 id 就得把前面两分钟的取数
     重跑一遍，纯属白等。
     """
+    _not_while_inquiring(run_id, BUSY_CONTINUE)
     try:
         return await run_manager.continue_failed(
             run_id, graph=payload.graph, actor=actor_of(x_actor),
@@ -593,6 +603,8 @@ async def decide(
         raise HTTPException(404, "审批记录不存在，所属的运行可能已被删除")
     if approval.status != "pending":
         raise HTTPException(409, "这条审批已处理过，请刷新页面查看最新状态")
+    # 在落签批人之前拦：拒掉的批准不该留下「谁试图批的」
+    _not_while_inquiring(approval.run_id, BUSY_DECIDE)
 
     # 责任归属先落库再恢复执行——恢复失败也要留下"谁试图批的"
     approval.resolved_by = actor_of(x_actor)
