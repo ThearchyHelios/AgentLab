@@ -3465,6 +3465,8 @@ export const DUAL_CHECK_TEXT = {
     textDiff: '规范化后不同的行',
     textDiffNone: '这一边没有不同的行',
     rationale: '盲算的说明',
+    /** 理由文档里有没有出处的数字时，理由下面那一句提醒 */
+    rationaleBare: '理由中标出的数字没有引用盲算自己的查询结果，无法核对出处',
     /**
      * 服务端没有预告（老服务端，见 catalogPreview）、两边又只差一处时，提交前说清选择可能被记进数据目录。卡上只看得到
      * 差异的方面，看不到服务端写目录的其余条件（dual_check_facts.derive：只有一边按时间筛的不记，多出的条件得在排除
@@ -3483,21 +3485,27 @@ export const DUAL_CHECK_TEXT = {
       tail: '。写入的项记为人工确认的事实；选「两边都不对」时不记，数据目录中已有人工确认的不同说法时不覆盖，是否记入以时间线上的记录为准',
     },
     /**
-     * 服务端预告了采用哪一边会往数据目录里写什么（payload.summary[].catalog）时照它说：三个选择各一句，写的说哪张表的
-     * 哪一项记成什么，不写的只说不记（原因在裁决后的时间线上）。两边都不写时卡上不提数据目录。卡上是
-     * 「head + 三句（；分隔）+ tail」，审核人当前选的那一句加重。
+     * 服务端预告了采用哪一边会往数据目录里写什么（payload.summary[].catalog）时照它说：三个选择逐条一句，会写的说哪张表
+     * 的哪一项会记为什么，不写的说不会记入和原因（服务端的原话，和裁决后时间线上跳过的原因一字不差）。两边都认不出
+     * 可记的事实（都没有写到哪）时卡上不提数据目录。卡上是「head + 三条 + tail」，审核人当前选的那一条加重。
      *
-     * 预告是每个指标单独算的，服务端写目录前却把同一次裁决里落到同一张表同一项上的说法归拢（dual_check_facts._merged）：
-     * 业务日期、去重规则说法不同的一项都不写（conflict），有效记录条件用 AND 合成一句写（joined）。卡上按其余指标当前的
-     * 选择补上这一层，tail 里说明预告是按当前的选择算的
+     * 同一次裁决里几个指标按当前的选择落到同一张表同一项上时，服务端写目录前把它们归拢（dual_check_facts._merged）：
+     * 说法相同的写一次，有效记录条件用 AND 合成一句，业务日期、去重规则说法不同的都不写，驳回过的拿出来不写。对照工件
+     * 里有服务端把每种组合算好的结果（catalog_joint）时照它说：会写的是合起来的那个值，并写明和哪几个指标一起记
+     * （together）；没有时（老服务端、组合太多、工件还没取到）按其余指标当前的选择有条件地说（conflict、joined），
+     * tail 里说明预告是按当前的选择算的
      */
     catalogPreview: {
       head: '记入数据目录：',
       /** where 同时间线（log.catalogItem）：「orders」（shop）的业务日期；value 是要写进去的说法 */
-      write: (choice: string, where: string, value: string) => `${choice}时，${where}记为「${value}」`,
+      write: (choice: string, where: string, value: string) => `${choice}时，${where}会记为「${value}」`,
       /** 两边写的是同一张表的同一项、只差取值时，后一边省掉「哪张表的哪一项」 */
-      writeSame: (choice: string, value: string) => `${choice}时记为「${value}」`,
+      writeSame: (choice: string, value: string) => `${choice}时会记为「${value}」`,
+      /** reason 是服务端的原话 */
+      blocked: (choice: string, reason: string) => `${choice}时不会记入：${reason}`,
       skip: (choice: string) => `${choice}时不记`,
+      /** 接在 write / writeSame 后面：和这些指标按当前的选择一起记入同一项（服务端算好的结果） */
+      together: (metrics: string) => `，与${metrics}的选择一起记入`,
       /** metrics 是 metricNames 写好的、和这一边说法不同的指标（按它们当前的选择） */
       conflict: (choice: string, where: string, metrics: string) => `${choice}时，${where}与${metrics}的选择说法不同，都不记`,
       /** 同 writeSame：两边写的是同一项时，后一边省掉「哪张表的哪一项」 */
@@ -3507,7 +3515,7 @@ export const DUAL_CHECK_TEXT = {
       /** 「退款率」、「订单数」；多于 3 个只列前 3 个 */
       metricNames: (names: string[]) => names.slice(0, 3).map((n) => `「${n}」`).join('、')
         + (names.length > 3 ? `等 ${names.length} 个指标` : ''),
-      tail: '。写入的项记为人工确认的事实；以上按发起审批时的数据目录和各指标当前的选择预告，实际写入以时间线上的记录为准',
+      tail: '写入的项记为人工确认的事实。以上按发起审批时的数据目录和各指标当前的选择预告，审批期间数据目录有改动时，以时间线上的记录为准',
     },
     choices: { a: '采用原流程的结果', b: '采用盲算的结果', neither: '两边都不对' } as Record<'a' | 'b' | 'neither', string>,
     choiceGroup: (name: string) => `「${name}」采用哪一边的结果`,

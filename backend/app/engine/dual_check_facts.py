@@ -869,7 +869,7 @@ def preview_joint(candidates: Sequence[Mapping[str, Any]],
 
 
 async def _write(session: Any, row: DataSource, fact: Fact, *, run_id: str, node_title: str,
-                 actor: str | None) -> tuple[bool, list[str]]:
+                 actor: str | None) -> tuple[Any, list[str]]:
     """写一项：(写进去的说法，没写为 None, 没写的原因)。几个指标并成的一项先按读到的目录拿掉各自带回驳回说法的指标
     （_screen），写什么、写不写再由 _plan 定；备注只列真写进去的指标。版本对不上（别人刚改过）重读再来。"""
     label = catalog.TABLE_FIELD_LABEL.get(fact.item, fact.item)

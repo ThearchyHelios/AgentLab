@@ -28,7 +28,10 @@ import data from './dual_check.json'
  * - peer=<名字>：「退款率」的摘要同样换成 peers 里那一对 SQL 的。peers 和「销售额」（或换上的变体）落到数据目录的
  *   同一项上，看同一次裁决里几个指标说法不同、要合写时卡上怎么说（夹具的 merges）
  * - catalog=1：摘要里每个指标带上服务端预告的「采用哪一边会往数据目录里写什么」（catalog_preview；换了变体、peers 的
- *   指标用它们自己的 catalog）。catalog=bad：「销售额」带一份认不出的预告
+ *   指标用它们自己的 catalog）。catalog=bad：「销售额」带一份认不出的预告。catalog=blocked：「销售额」带目录里已有人工
+ *   确认的业务日期时的预告（catalog_blocked：两边都被挡下，各带写到哪和原因）
+ * - merge=<名字>：两个指标的预告换成 merges 里那一种组合按它的目录算的（catalog；和 variant、peer 一起用，换上的 SQL
+ *   照它的 gmv、refund_rate 写）。合起来的预告（joint）在完整对照里，由检查脚本按同一种组合伪造工件
  * - on_reject=<值>：payload 带上节点实际生效的「未采用原流程时」
  */
 const approval = (patch: Partial<Approval> = {}): Approval => ({
@@ -44,6 +47,7 @@ function approvalOf(search: string): Approval {
   const variant = (data.variants as unknown as Record<string, Variant>)[q.get('variant') ?? '']
   const peer = (data.peers as unknown as Record<string, Variant>)[q.get('peer') ?? '']
   const catalog = q.get('catalog')
+  const merge = (data.merges as unknown as Record<string, { catalog?: Record<string, unknown> }>)[q.get('merge') ?? '']
   const onReject = q.get('on_reject')
   const previews = data.catalog_preview as unknown as Record<string, unknown>
   const summary = data.approval.payload.summary.map((s) => {
@@ -54,6 +58,8 @@ function approvalOf(search: string): Approval {
       ...(items ? { diff: items.slice(0, 3).map((i) => i.text), fallback: !items.some((i) => i.aspect !== 'other' && i.aspect !== 'parse') } : {}),
       ...(catalog === '1' ? { catalog: swapped ? swapped.catalog : previews[s.metric_id] } : {}),
       ...(catalog === 'bad' && s.metric_id === 'gmv' ? { catalog: { a: { write: true, table: 'orders' }, b: { write: false } } } : {}),
+      ...(catalog === 'blocked' && s.metric_id === 'gmv' ? { catalog: data.catalog_blocked.catalog } : {}),
+      ...(merge?.catalog?.[s.metric_id] ? { catalog: merge.catalog[s.metric_id] } : {}),
     }
   })
   return approval({ payload: { ...data.approval.payload, summary, ...(onReject ? { on_reject: onReject } : {}) } })

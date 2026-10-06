@@ -1,17 +1,20 @@
-import { Fragment, useEffect, useId, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { AlertTriangle, Ban, Check, ChevronRight } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
+import { asDoc } from '../store/evidence'
 import { useStudio } from '../store/studio'
 import { Spinner, useToast } from '../components/ui'
+import { segmentState } from '../lib/evidence'
 import { NONE } from '../lib/format'
 import { CATALOG_TABLE_FIELD_LABEL, DUAL_CHECK_TEXT } from '../lib/terms'
 import { patchValueText } from './catalogPatch'
+import { RationaleDoc } from './ChallengeSummary'
 import type {
   Approval, DualCheckBlindInput, DualCheckCard, DualCheckChoice, DualCheckInput, DualCheckMetric, DualCheckReply,
-  DualCheckSummaryItem,
+  DualCheckSummaryItem, EvidenceDocData,
 } from '../types'
 
 const T = DUAL_CHECK_TEXT.approval
@@ -59,24 +62,36 @@ interface MetricView {
   full: DualCheckMetric | null
 }
 
+/** 盲算一边的输入，约定之外服务端另带核查 agent 组装的理由文档（期 4；老工件没有） */
+type BlindInput = DualCheckBlindInput & { rationale_doc?: unknown }
+/** 完整对照，约定之外服务端另带几个指标落到同一项上时每种选择组合的预告（期 4；老工件没有） */
+type Card = DualCheckCard & { catalog_joint?: unknown }
+
 /**
- * 服务端预告的一边：写的话写到哪（where 是 「orders」（shop）的业务日期 这样的说法）、写成什么（value 是给人看的
- * 写法，raw 是原样的取值，和别的指标的说法比是不是同一个时用）
+ * 写到数据目录的哪一项：数据源、表、目录项（business_date / valid_filter / dedup）。服务端写目录前按这三样归拢同一次
+ * 裁决里的几个指标；where 是给人看的说法（「orders」（shop）的业务日期）
+ */
+interface Target { table: string; source: string | null; item: string; where: string }
+
+/**
+ * 服务端预告的一边。写的：写到哪、写成什么（value 是给人看的写法，raw 是原样的取值，和别的指标的说法比是不是同一个时
+ * 用）。不写的：reason 是服务端的原话；认出了事实、只是被目录挡下的（已确认、驳回过、和已有条件合不起来）另带 target
+ * 和本来要写的 raw——服务端照样会把它和落到同一项上的别的指标归拢，卡上据此认同一项上有谁
  */
 type PreviewSide =
-  | { write: true; table: string; source: string | null; item: string; where: string; value: string; raw: unknown }
-  | { write: false }
-type WritingSide = Extract<PreviewSide, { write: true }>
+  | { write: true; target: Target; value: string; raw: unknown }
+  | { write: false; target: Target | null; reason: string | null; raw?: unknown }
 interface CatalogPreview { a: PreviewSide; b: PreviewSide }
 
 /**
- * 同一次裁决里，别的指标按当前的选择落到同一项上（同一数据源、同一张表、同一项）的：differ 是说法和这一边不同的指标名
- * ——业务日期、去重规则说法不同时服务端一项都不写；joined 是条件和这一边不同的指标名——有效记录条件用 AND 合成一句写
+ * 对照工件里的 catalog_joint（dual_check_facts.preview_joint）：几个指标按各自的选择落到同一项上时，服务端按真写的办法
+ * 算好的每个指标的结果。members 是落到这一项上的指标和各自的选择，outcomes 按指标 id 给结果
  */
-interface Peers { differ: string[]; joined: string[] }
-type PreviewPeers = Partial<Record<'a' | 'b', Peers>>
+interface JointOutcome { write: boolean; raw?: unknown; reason?: string | null }
+interface JointEntry { source: string | null; table: string; item: string; members: Map<string, DualCheckChoice>; outcomes: Map<string, JointOutcome> }
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
+const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
 const hasSql = (v: unknown): boolean => typeof v === 'string' && !!v.trim()
 
@@ -88,9 +103,9 @@ function summaryOf(raw: unknown): DualCheckSummaryItem[] {
 }
 
 /** 工件内容像不像一份对照：至少得有 metrics 数组，里面的项带 metric_id */
-function cardOf(content: unknown): DualCheckCard | null {
-  if (!content || typeof content !== 'object' || !Array.isArray((content as DualCheckCard).metrics)) return null
-  const card = content as DualCheckCard
+function cardOf(content: unknown): Card | null {
+  if (!content || typeof content !== 'object' || !Array.isArray((content as Card).metrics)) return null
+  const card = content as Card
   return { ...card, metrics: card.metrics.filter((m) => !!m && typeof m === 'object' && typeof m.metric_id === 'string') }
 }
 
@@ -117,22 +132,23 @@ function catalogOf(metric: DualCheckMetric, items: { aspect: string; text: strin
   return CATALOG_ASPECTS.has(items[0].aspect) ? items[0].aspect as CatalogAspect : null
 }
 
-/** 预告的一边：写的得有表、认得出的目录项和取值；认不出返回 undefined */
-function previewSideOf(raw: unknown): PreviewSide | undefined {
-  if (!raw || typeof raw !== 'object') return undefined
-  const s = raw as Record<string, unknown>
-  if (s.write === false) return { write: false }
+/** 预告里写到哪：得有表、认得出的目录项；认不出为 null */
+function targetOf(s: Record<string, unknown>): Target | null {
   const table = str(s.table)
   const item = str(s.item)
-  if (s.write !== true || !table || !item || !Object.hasOwn(CATALOG_TABLE_FIELD_LABEL, item) || s.value == null || s.value === '') {
-    return undefined
-  }
+  if (!table || !item || !Object.hasOwn(CATALOG_TABLE_FIELD_LABEL, item)) return null
   const source = str(s.source) ?? null
   const label = CATALOG_TABLE_FIELD_LABEL[item as keyof typeof CATALOG_TABLE_FIELD_LABEL]
-  return {
-    write: true, table, source, item,
-    where: DUAL_CHECK_TEXT.log.catalogItem(table, source ?? undefined, label), value: patchValueText(item, s.value), raw: s.value,
-  }
+  return { table, source, item, where: DUAL_CHECK_TEXT.log.catalogItem(table, source ?? undefined, label) }
+}
+
+/** 预告的一边：写的得有写到哪和取值；不写的有没有写到哪都认（老服务端只给原因）；认不出返回 undefined */
+function previewSideOf(raw: unknown): PreviewSide | undefined {
+  if (!isRecord(raw)) return undefined
+  if (raw.write === false) return { write: false, target: targetOf(raw), reason: str(raw.reason) ?? null, raw: raw.value }
+  const target = targetOf(raw)
+  if (raw.write !== true || !target || raw.value == null || raw.value === '') return undefined
+  return { write: true, target, value: patchValueText(target.item, raw.value), raw: raw.value }
 }
 
 /**
@@ -146,11 +162,37 @@ function previewOf(raw: unknown): CatalogPreview | null {
   return a && b ? { a, b } : null
 }
 
-/** 两边写的是不是同一个数据源、同一张表的同一项（服务端写目录前按这三样归拢） */
-const sameTarget = (a: PreviewSide, b: PreviewSide): boolean =>
-  a.write && b.write && a.table === b.table && a.source === b.source && a.item === b.item
+/** 是不是同一个数据源、同一张表的同一项（服务端写目录前按这三样归拢） */
+const sameTarget = (a: Pick<Target, 'table' | 'source' | 'item'> | null | undefined,
+  b: Pick<Target, 'table' | 'source' | 'item'> | null | undefined): boolean =>
+  !!a && !!b && a.table === b.table && a.source === b.source && a.item === b.item
 
-const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
+/**
+ * 对照工件里的 catalog_joint：认不出的条目跳过（宁可这一项回到有条件地说，不替服务端编）。每条要有写到哪、至少两个
+ * 成员、每个成员都有结果
+ */
+function jointOf(card: Card | null): JointEntry[] {
+  const raw = card?.catalog_joint
+  if (!Array.isArray(raw)) return []
+  const out: JointEntry[] = []
+  for (const e of raw) {
+    if (!isRecord(e) || !Array.isArray(e.members) || !isRecord(e.outcomes)) continue
+    const table = str(e.table)
+    const item = str(e.item)
+    if (!table || !item) continue
+    const members = new Map<string, DualCheckChoice>()
+    for (const m of e.members) {
+      if (isRecord(m) && str(m.metric_id) && (m.choice === 'a' || m.choice === 'b')) members.set(m.metric_id as string, m.choice)
+    }
+    const outcomes = new Map<string, JointOutcome>()
+    for (const [id, o] of Object.entries(e.outcomes)) {
+      if (isRecord(o) && typeof o.write === 'boolean') outcomes.set(id, { write: o.write, raw: o.value, reason: str(o.reason) ?? null })
+    }
+    if (members.size < 2 || [...members.keys()].some((id) => !outcomes.has(id))) continue
+    out.push({ source: str(e.source) ?? null, table, item, members, outcomes })
+  }
+  return out
+}
 /** 同一项的两个说法是不是同一个（同服务端的 _same_fact）：业务日期只看哪一列，其余是文字、压掉多余的空白比 */
 function sameFact(item: string, a: unknown, b: unknown): boolean {
   if (item === 'business_date') return isRecord(a) && isRecord(b) && a.column === b.column
@@ -158,36 +200,87 @@ function sameFact(item: string, a: unknown, b: unknown): boolean {
   return typeof a === 'string' && typeof b === 'string' && flat(a) === flat(b)
 }
 
+/** 预告里的一条：说什么、这一选会不会写，以及是怎么说出来的（data-* 标记，检查脚本据此核对） */
+interface Clause {
+  side: DualCheckChoice
+  text: string
+  write: boolean
+  /** 句子里写明了是哪张表的哪一项：同一项的下一条可以省掉 */
+  where: boolean
+  /** 服务端说不写、给了原因 */
+  reason: boolean
+  /** 照服务端算好的合并结果说（catalog_joint） */
+  joint: boolean
+  /** 合并结果里和别的指标一起记入 */
+  together: boolean
+  /** 没有算好的合并结果、按其余指标当前的选择推的：说法不同都不记（conflict）、有效记录条件合写（joined） */
+  conflict: boolean
+  joined: boolean
+}
+
 /**
- * 每个指标的预告是单独算的，服务端写目录前却把同一次裁决里落到同一张表同一项上的说法归拢成一项
- * （dual_check_facts._merged）：业务日期一张表只有一个、去重规则说的未必是同一件事，说法不同就一项都不写；有效记录
- * 条件都在排除无效记录，用 AND 合成一句写。这里按其余指标当前的选择，给每个指标的两种选择各找出落到同一项上的指标
- * （见 Peers），卡上照它说。只看预告会写的一边：选「两边都不对」、还没选的，服务端不会并进来；预告说不写的，多半是
- * 差异对不上目录项，服务端同样不并。少数是因为目录里已有的说法才不写，服务端仍会把它并进来、可能让这一项都不写，
- * 可预告里没有它落到哪一项，卡上看不出，所以结尾说以时间线上的记录为准
+ * 每个指标三个选择各一条预告。预告是每个指标单独算的，服务端写目录前却把同一次裁决里落到同一张表同一项上的说法归拢成
+ * 一项（dual_check_facts._merged、_screen、_plan）。按其余指标当前的选择，找出这一选落到同一项上的指标（选了 a、b，
+ * 那一边认出了写到哪的；被目录挡下的也算——服务端照样并进来）：
+ * - 只有它自己：照它自己的预告说，会写的说会记为什么，不写的说原因；
+ * - 还有别的：照对照工件里服务端为这几个成员算好的那一条（catalog_joint）说，会写的是合起来的值、写明和谁一起记，
+ *   不写的照原因说；工件里没有（老服务端、组合太多、工件还没取到）时按旧办法推：会写的一边，业务日期、去重规则说法
+ *   不同说都不记，有效记录条件说合成一句，结尾说以时间线上的记录为准
  */
-function peersOf(views: MetricView[], choices: Record<string, DualCheckChoice>): Map<string, PreviewPeers> {
-  const adopted: { id: string; name: string; side: WritingSide }[] = []
-  for (const v of views) {
-    const c = choices[v.id]
-    const side = c === 'a' || c === 'b' ? v.preview?.[c] : undefined
-    if (side?.write) adopted.push({ id: v.id, name: v.name, side })
-  }
-  const out = new Map<string, PreviewPeers>()
-  for (const v of views) {
-    const peers: PreviewPeers = {}
-    for (const c of ['a', 'b'] as const) {
-      const mine = v.preview?.[c]
-      if (!mine?.write) continue
-      // 说法和这一边不同的指标：业务日期、去重规则让整组都不写，有效记录条件要合成一句
-      const names = [...new Set(adopted
-        .filter((o) => o.id !== v.id && sameTarget(o.side, mine) && !sameFact(mine.item, o.side.raw, mine.raw))
-        .map((o) => o.name))]
-      if (!names.length) continue
-      peers[c] = mine.item === 'valid_filter' ? { differ: [], joined: names } : { differ: names, joined: [] }
+function clausesOf(view: MetricView, views: MetricView[], choices: Record<string, DualCheckChoice>, joint: JointEntry[]): Clause[] {
+  const P = T.catalogPreview
+  const blank = { write: false, where: false, reason: false, joint: false, together: false, conflict: false, joined: false }
+  const skip = (side: DualCheckChoice): Clause => ({ side, text: P.skip(T.choices[side]), ...blank })
+  const out: Clause[] = []
+  for (const side of ['a', 'b'] as const) {
+    const mine = view.preview?.[side]
+    if (!mine) { out.push(skip(side)); continue }
+    const blocked = (reason: string | null | undefined): Clause =>
+      (reason ? { side, text: P.blocked(T.choices[side], reason), ...blank, reason: true } : skip(side))
+    // 前一条已经写明了是哪张表的哪一项，这一条省掉
+    const short = side === 'b' && !!out[0]?.where && sameTarget(view.preview?.a.target, mine.target)
+    const writing = (value: string, extra: Partial<Clause> = {}, tail = ''): Clause => ({
+      side, ...blank, write: true, where: !short, ...extra,
+      text: (short ? P.writeSame(T.choices[side], value) : P.write(T.choices[side], mine.target!.where, value)) + tail,
+    })
+    const peers = mine.target ? views.filter((o) => {
+      const c = choices[o.id]
+      return o.id !== view.id && (c === 'a' || c === 'b') && sameTarget(o.preview?.[c]?.target, mine.target)
+    }) : []
+    if (!peers.length) {
+      out.push(mine.write ? writing(mine.value) : blocked(mine.reason))
+      continue
     }
-    out.set(v.id, peers)
+    const members = new Map<string, DualCheckChoice>([[view.id, side], ...peers.map((o) => [o.id, choices[o.id]] as [string, DualCheckChoice])])
+    const entry = joint.find((e) => sameTarget(e, mine.target)
+      && e.members.size === members.size && [...members].every(([id, c]) => e.members.get(id) === c))
+    const outcome = entry?.outcomes.get(view.id)
+    if (entry && outcome) {
+      if (!outcome.write || outcome.raw == null || outcome.raw === '') {
+        out.push({ ...blocked(outcome.reason), joint: true })
+        continue
+      }
+      // 一起记入的：结果也是写的那几个成员（拿掉驳回的、没写进去的不算）
+      const with_ = peers.filter((o) => entry.outcomes.get(o.id)?.write).map((o) => o.name)
+      out.push(writing(patchValueText(entry.item, outcome.raw), { joint: true, together: with_.length > 0 },
+        with_.length ? P.together(P.metricNames(with_)) : ''))
+      continue
+    }
+    if (!mine.write) { out.push(blocked(mine.reason)); continue }
+    // 没有算好的合并结果：照服务端归拢的规矩推。只看会写的那几个（挡下的说不准会怎样）
+    const differ = [...new Set(peers.filter((o) => {
+      const theirs = o.preview?.[choices[o.id] as 'a' | 'b']
+      return theirs?.write && !sameFact(mine.target!.item, theirs.raw, mine.raw)
+    }).map((o) => o.name))]
+    if (differ.length && mine.target!.item !== 'valid_filter') {
+      const names = P.metricNames(differ)
+      out.push({ side, ...blank, conflict: true, where: !short,
+        text: short ? P.conflictSame(T.choices.b, names) : P.conflict(T.choices[side], mine.target!.where, names) })
+      continue
+    }
+    out.push(differ.length ? writing(mine.value, { joined: true }, P.joined(P.metricNames(differ))) : writing(mine.value))
   }
+  out.push(skip('neither'))
   return out
 }
 
@@ -302,7 +395,7 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
   const cardId = str(payload.card_artifact) ?? ''
   const onReject = useOnReject(approval.run_id, str(payload.node_id) ?? str(approval.node_id), payload.on_reject)
 
-  const [card, setCard] = useState<{ id: string; data?: DualCheckCard | null } | null>(null)
+  const [card, setCard] = useState<{ id: string; data?: Card | null } | null>(null)
   useEffect(() => {
     if (!cardId) return
     let alive = true
@@ -324,8 +417,10 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const pending = views.filter((v) => !choices[v.id]).length
-  // 预告要按其余指标当前的选择补上「同一项上说法不同」「合成一句」：选择一变，各块的说法跟着变
-  const peers = useMemo(() => peersOf(views, choices), [views, choices])
+  // 预告要按其余指标当前的选择算：几个指标落到同一项上时照完整对照里服务端算好的合并结果说，选择一变，各块跟着变
+  const joint = useMemo(() => jointOf(data), [data])
+  const clauses = useMemo(() => new Map(views.map((v) => [v.id, clausesOf(v, views, choices, joint)])),
+    [views, choices, joint])
 
   /** 提交裁决（approved 为真，value 是 {choices, note}）或驳回（认不出指标时的出口） */
   const send = async (approved: boolean) => {
@@ -397,7 +492,7 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
       ) : (
         <>
           {views.map((v) => (
-            <MetricBlock key={v.id} view={v} name={`${uid}-${v.id}`} choice={choices[v.id]} peers={peers.get(v.id)}
+            <MetricBlock key={v.id} view={v} name={`${uid}-${v.id}`} choice={choices[v.id]} clauses={clauses.get(v.id) ?? []}
                          onChoose={(c) => setChoices((cur) => ({ ...cur, [v.id]: c }))} />
           ))}
 
@@ -423,8 +518,8 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
 }
 
 /** 一个不一致的指标：名字、两个值、相差多少、差异说明、对照两条 SQL、三选一 */
-function MetricBlock({ view, name, choice, peers, onChoose }: {
-  view: MetricView; name: string; choice?: DualCheckChoice; peers?: PreviewPeers; onChoose: (c: DualCheckChoice) => void
+function MetricBlock({ view, name, choice, clauses, onChoose }: {
+  view: MetricView; name: string; choice?: DualCheckChoice; clauses: Clause[]; onChoose: (c: DualCheckChoice) => void
 }) {
   const uid = useId()
   // 只有兜底说明（或只有解析失败）时默认展开：一条具体说法都没有，审核人只能对照原文判断
@@ -484,7 +579,8 @@ function MetricBlock({ view, name, choice, peers, onChoose }: {
       {expanded && view.full && <Compare id={`${uid}-cmp`} metric={view.full} />}
       {view.preview ? (
         // 服务端预告了：两边都不写就不提数据目录
-        (view.preview.a.write || view.preview.b.write) && <CatalogPreviewNote preview={view.preview} peers={peers} choice={choice} />
+        // 服务端预告了：两边都认不出可记的事实（都没有写到哪）就不提数据目录
+        (view.preview.a.target || view.preview.b.target) && <CatalogPreviewNote clauses={clauses} choice={choice} />
       ) : view.catalog && (
         <p className="mt-1.5 text-2xs leading-relaxed text-dim" data-dual-catalog={view.catalog}>{T.catalog[view.catalog]}{T.catalog.tail}</p>
       )}
@@ -509,50 +605,27 @@ function MetricBlock({ view, name, choice, peers, onChoose }: {
   )
 }
 
-/** 预告里的一句：说什么、这一选会不会写（说法不同、都不写的不算）、是不是说法不同、是不是要和别的条件合写 */
-interface Clause { side: DualCheckChoice; text: string; write: boolean; conflict: boolean; joined: boolean }
-
 /**
- * 服务端预告的「记入数据目录」：三个选择各一句，审核人当前选的那一句加重——选之前三句都看得到，选了之后一眼看出这一选
- * 会往目录里写什么。两边写的是同一项（只差取值，比如业务日期按哪一列）时，后一句省掉「哪张表的哪一项」。
- * peers 是同一次裁决里别的指标按当前的选择落到同一项上的（peersOf）：说法不同的这一句改说都不记，有效记录条件补一句
- * 合写；选择变了跟着变
+ * 服务端预告的「记入数据目录」：三个选择逐条一句（clausesOf），审核人当前选的那一条加重——选之前三条都看得到，选了之后
+ * 一眼看出这一选会往目录里写什么、不写的为什么。不写的原因是服务端的原话，往往不短，逐条分行写，不挤在一句里
  */
-function CatalogPreviewNote({ preview, peers, choice }: { preview: CatalogPreview; peers?: PreviewPeers; choice?: DualCheckChoice }) {
+function CatalogPreviewNote({ clauses, choice }: { clauses: Clause[]; choice?: DualCheckChoice }) {
   const P = T.catalogPreview
-  const skip = (side: DualCheckChoice): Clause => ({ side, text: P.skip(T.choices[side]), write: false, conflict: false, joined: false })
-  const clause = (side: 'a' | 'b'): Clause => {
-    const s = preview[side]
-    if (!s.write) return skip(side)
-    // 前一句已经写明了是哪张表的哪一项（说法不同的那句也写），这一句省掉
-    const short = side === 'b' && sameTarget(preview.a, s)
-    const { differ = [], joined = [] } = peers?.[side] ?? {}
-    if (differ.length) {
-      const names = P.metricNames(differ)
-      const text = short ? P.conflictSame(T.choices.b, names) : P.conflict(T.choices[side], s.where, names)
-      return { side, text, write: false, conflict: true, joined: false }
-    }
-    const text = short ? P.writeSame(T.choices.b, s.value) : P.write(T.choices[side], s.where, s.value)
-    return joined.length
-      ? { side, text: text + P.joined(P.metricNames(joined)), write: true, conflict: false, joined: true }
-      : { side, text, write: true, conflict: false, joined: false }
-  }
-  const clauses = [clause('a'), clause('b'), skip('neither')]
   return (
-    <p className="mt-1.5 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-catalog="preview">
-      {P.head}
-      {clauses.map(({ side, text, write, conflict, joined }, i) => (
-        <Fragment key={side}>
-          {i > 0 && '；'}
-          <span className={clsx(choice === side && 'font-medium')} style={choice === side ? { color: 'var(--text)' } : undefined}
-                data-dual-catalog-side={side} data-write={write ? '' : undefined} data-current={choice === side ? '' : undefined}
-                data-conflict={conflict ? '' : undefined} data-joined={joined ? '' : undefined}>
-            {text}
-          </span>
-        </Fragment>
-      ))}
-      {P.tail}
-    </p>
+    <div className="mt-1.5 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-catalog="preview">
+      <div>{P.head}</div>
+      <ul className="mt-0.5 list-disc space-y-0.5 pl-4">
+        {clauses.map((c) => (
+          <li key={c.side} className={clsx(choice === c.side && 'font-medium')} style={choice === c.side ? { color: 'var(--text)' } : undefined}
+              data-dual-catalog-side={c.side} data-write={c.write ? '' : undefined} data-current={choice === c.side ? '' : undefined}
+              data-reason={c.reason ? '' : undefined} data-joint={c.joint ? '' : undefined} data-together={c.together ? '' : undefined}
+              data-conflict={c.conflict ? '' : undefined} data-joined={c.joined ? '' : undefined}>
+            {c.text}
+          </li>
+        ))}
+      </ul>
+      <p className="mt-0.5" data-dual-catalog-tail="">{P.tail}</p>
+    </div>
   )
 }
 
@@ -560,7 +633,7 @@ function CatalogPreviewNote({ preview, peers, choice }: { preview: CatalogPrevie
 interface Pair {
   path: string
   original?: DualCheckInput
-  blind?: DualCheckBlindInput
+  blind?: BlindInput
   source: string | null
   /** SQL 或取到的值不同 */
   differs: boolean
@@ -576,7 +649,7 @@ const sameValue = (a: unknown, b: unknown): boolean => {
 }
 
 function pairsOf(metric: DualCheckMetric): Pair[] {
-  const byPath = new Map<string, { original?: DualCheckInput; blind?: DualCheckBlindInput }>()
+  const byPath = new Map<string, { original?: DualCheckInput; blind?: BlindInput }>()
   const valid = (i: unknown): i is DualCheckInput => !!i && typeof i === 'object' && typeof (i as DualCheckInput).path === 'string'
   for (const i of (Array.isArray(metric.original?.inputs) ? metric.original.inputs : []).filter(valid)) {
     byPath.set(i.path, { ...byPath.get(i.path), original: i })
@@ -710,12 +783,44 @@ function PairSql({ pair }: { pair: Pair }) {
         <SqlPane side="original" label={T.sqlOriginal} lines={a} marks={diff?.a} />
         <SqlPane side="blind" label={T.sqlBlind} lines={b} marks={diff?.b} />
       </div>
-      {str(pair.blind?.rationale) && (
-        <p className="mt-1 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-rationale="">
-          <span className="text-faint">{T.rationale}：</span>{pair.blind!.rationale}
-        </p>
-      )}
+      <BlindRationale input={pair.blind} />
     </div>
+  )
+}
+
+/** 理由文档里有没有没出处的数字（evidence.compose_doc 标出的裸数字，状态是「无证据」） */
+const hasBare = (doc: EvidenceDocData): boolean =>
+  (doc.blocks ?? []).some((b) => (b.units ?? []).some((u) => (u.segments ?? []).some((seg) => segmentState(seg) === 'none')))
+
+/**
+ * 盲算的说明。工件带了核查 agent 组装的理由文档（rationale_doc）时按文档画，和反方审稿的理由同一种画法：数字有出处的
+ * 画实线、挂盲算自己的查询编号（悬停看出处），裸数字画点状线、句末挂「无证据」，下面再醒目地说一句。老工件只有渲染后的
+ * 正文，照旧显示纯文本
+ */
+function BlindRationale({ input }: { input?: BlindInput }) {
+  const doc = useMemo(() => {
+    const raw = input?.rationale_doc
+    const parsed = raw && typeof raw === 'object' ? asDoc(raw) : null
+    return parsed && (parsed.blocks ?? []).length ? parsed : null
+  }, [input?.rationale_doc])
+  if (doc) {
+    return (
+      <div className="mt-1 min-w-0 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-rationale="doc">
+        <div className="text-faint">{T.rationale}</div>
+        <RationaleDoc doc={doc} />
+        {hasBare(doc) && (
+          <p className="mt-0.5 flex items-start gap-1 font-medium" style={{ color: 'var(--st-waiting)' }} data-dual-rationale-bare="">
+            <AlertTriangle size={11} aria-hidden className="mt-[3px] shrink-0" /> {T.rationaleBare}
+          </p>
+        )}
+      </div>
+    )
+  }
+  if (!str(input?.rationale)) return null
+  return (
+    <p className="mt-1 text-2xs leading-relaxed text-dim [overflow-wrap:anywhere]" data-dual-rationale="text">
+      <span className="text-faint">{T.rationale}：</span>{input!.rationale}
+    </p>
   )
 }
 
