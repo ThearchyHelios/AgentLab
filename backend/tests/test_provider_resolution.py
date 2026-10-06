@@ -87,7 +87,7 @@ async def test_a_named_provider_that_does_not_exist_is_an_error_not_the_mock(ses
 
 
 async def test_a_named_provider_is_missing_even_when_no_provider_exists_at_all(session):
-    """一个接入都没有、却点了名：点名的那个照样不存在，不能因为「什么都没配」就退回演示模型。"""
+    """一个接入都没有、却点了名：点名的那个仍然不存在，不能因为「什么都没配」就退回演示模型。"""
     with pytest.raises(ProviderNotConfigured) as e:
         await get_chat_model(session, ModelSpec(provider="已删除的接入"))
     assert e.value.code == "missing" and "已删除的接入" in str(e.value)

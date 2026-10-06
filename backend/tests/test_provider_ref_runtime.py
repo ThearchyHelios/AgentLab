@@ -166,6 +166,11 @@ NODES = {
     "llm": lambda ref: node("ask", "llm", "提问", provider=ref, prompt="总结本周情况"),
     "agent": lambda ref: node("ask", "agent", "查数作答", provider=ref, prompt="回答问题"),
     "report": lambda ref: node("ask", "report", "写周报", provider=ref, instructions="写周报"),
+    # 下面两种的执行器不自己接这个错，由编排层按「执行出错：原因」报出，原因和提示一样都在
+    "supervisor": lambda ref: node("ask", "supervisor", "协作", provider=ref, goal="分析本周销售",
+                                   agents=[{"name": "分析师", "system": "你是销售分析师"}]),
+    "branch": lambda ref: node("ask", "branch", "分流", mode="llm", provider=ref,
+                               cases=[{"key": "follow", "label": "需要跟进"}]),
 }
 
 
@@ -173,8 +178,11 @@ NODES = {
 @pytest.mark.parametrize("kind", list(NODES))
 async def test_a_node_naming_a_broken_provider_fails_and_says_why(monkeypatch, kind, ref):
     called = script(monkeypatch)
-    spec = chain(node("start", "input"), NODES[kind](ref),
-                 node("out", "output", fields=[{"name": "结果", "value": "{{ last_message }}"}]))
+    out = node("out", "output", fields=[{"name": "结果", "value": "{{ last_message }}"}])
+    spec = chain(node("start", "input"), NODES[kind](ref), out)
+    if kind == "branch":
+        spec["edges"][1]["sourceHandle"] = "follow"
+        spec["edges"].append({"source": "ask", "target": "out", "sourceHandle": "default"})
     run = await start(spec)
     assert run.status == "failed"
     assert REASONS[ref] in run.error and HINTS[ref] in run.error, run.error
