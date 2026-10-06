@@ -20,7 +20,7 @@ from app.api.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
 from app.api.copilot_context import DATASOURCE_BUDGET_CHARS as _DATASOURCE_BUDGET_CHARS  # noqa: F401
 from app.api.copilot_context import DETAIL_TABLE_LIMIT as _DETAIL_TABLE_LIMIT  # noqa: F401
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
-from app.core.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
+from app.core.errors import explain as explain_error, graph_error, raw as raw_error
 from app.data.sqlcheck import CHECK_CODES
 from app.db.base import get_session
 from app.db.models import Workflow
@@ -522,20 +522,29 @@ async def copilot_model_spec(
 
 @router.get("/model")
 async def get_copilot_model(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """当前 Copilot 会用哪个模型，以及是显式配的还是兜底来的。"""
+    """当前 Copilot 会用哪个模型，以及是显式配的还是兜底来的。
+
+    存的接入不存在、已停用（或者只存了模型名、提供它的接入已停用）时实际什么都用不了：effective_* 为空，
+    error 写明原因（和生成时报的同一句），能用时 error 为 None。"""
     from app.db.models import Setting
     from app.providers.factory import resolve_provider
 
     row = await session.get(Setting, COPILOT_SETTING_KEY)
     saved = row.value if row else {}
     configured = bool(saved.get("provider") or saved.get("model"))
-    resolved = await resolve_provider(session, saved.get("provider"), saved.get("model"))
+    try:
+        resolved = await resolve_provider(session, saved.get("provider"), saved.get("model"))
+    except ProviderNotConfigured as e:
+        return {"configured": configured, "provider": saved.get("provider") or None,
+                "model": saved.get("model") or None, "effective_provider": None, "effective_model": None,
+                "error": _unconfigured(e)}
     return {
         "configured": configured,
         "provider": saved.get("provider") or None,
         "model": saved.get("model") or None,
         "effective_provider": resolved.name if resolved else None,
         "effective_model": saved.get("model") or (resolved.default_model if resolved else None),
+        "error": None,
     }
 
 
@@ -562,7 +571,10 @@ async def set_copilot_model(
 
 
 def _unconfigured(e: ProviderNotConfigured) -> str:
-    return f"助手使用的模型尚未配置完成：{not_configured(e, with_hint=False)}。请到「设置 → 模型接入」检查"
+    # 点名的接入不存在、已停用照实说是哪个、去哪里改，其余说「尚未配置完成」（表格导入、数据目录的 AI 起草同一句）
+    from app.providers.factory import assistant_unavailable
+
+    return assistant_unavailable(e)
 
 
 class GenerateOut(BaseModel):

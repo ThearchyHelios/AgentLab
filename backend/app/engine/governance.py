@@ -30,7 +30,8 @@ UPGRADE_POLICIES = {"recompute", "dual", "incomparable"}
 UPGRADE_POLICY_LABELS = {k: option_label("upgrade_policy", k) for k in ("recompute", "dual", "incomparable")}
 
 
-def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any] | None = None) -> ValidationResult:
+def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any] | None = None,
+                     providers: list[Any] | None = None) -> ValidationResult:
     """发布门禁。
 
     published：基础可运行性之外只给警告。
@@ -42,6 +43,10 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
 
     checkers 是各数据源基于数据目录的 SQL 检查器（data/sqlcheck.load_checkers_by_name），由调用方读好传进来：
     门禁本身不查库。给了的话，调用工具节点里写死的 SQL 对照目录查一遍（_lint_sql）。
+
+    providers 是模型接入表（provider_refs.load_providers），同样由调用方读好传进来。给了的话，节点点名的接入
+    不存在或已停用、只写了模型而提供它的接入已停用的每一处一条 error（provider.missing / provider.disabled），
+    两档都挡：正式运行到那里一定失败，或者少一块核查。不给（一键升级、助手自查这类只看图本身的地方）就不查。
     """
     result = ValidationResult()
     strict = level == "governed"
@@ -105,6 +110,11 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
 
     _lint_evidence(spec, flag, strict=strict)
     _lint_sql(spec, flag, checkers)
+    if providers is not None:
+        from app.engine.provider_refs import issues as provider_issues, provider_refs
+
+        for issue in provider_issues(provider_refs(spec), providers, level="error"):
+            result.add(issue.message, level="error", node_id=issue.node_id, field=issue.field, code=issue.code)
 
     if strict and not has_contract_output:
         result.add(
@@ -114,13 +124,14 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
     return result
 
 
-def publish_issues(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any] | None = None) -> list[Any]:
+def publish_issues(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any] | None = None,
+                   providers: list[Any] | None = None) -> list[Any]:
     """发布时拦的全部问题：validate_graph 和 lint_for_publish 的并集，顺序也照发布接口。
 
-    发布、发布前检查、自动修复复核都走这一个口径——检查说能发的，真发布时不会被拦。checkers 见 lint_for_publish：
-    这几处都要传同一份，否则检查和发布对 SQL 的判断不一致。
+    发布、发布前检查、自动修复复核都走这一个口径——检查说能发的，真发布时不会被拦。checkers、providers 见
+    lint_for_publish：这几处都要传同一份，否则检查和发布对 SQL、对模型接入的判断不一致。
     """
-    gate = lint_for_publish(spec, level=level, checkers=checkers).issues
+    gate = lint_for_publish(spec, level=level, checkers=checkers, providers=providers).issues
     return [*_not_repeated(validate_graph(spec).issues, gate, spec), *gate]
 
 

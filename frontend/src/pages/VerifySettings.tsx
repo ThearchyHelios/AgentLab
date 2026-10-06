@@ -4,8 +4,8 @@ import { AlertTriangle } from 'lucide-react'
 import { get } from '../api/http'
 import { modelOptions, providerOfModel, useCatalog } from '../store/catalog'
 import { Field, SectionBar } from '../components/ui'
-import { VERIFY_SETTING_TEXT } from '../lib/terms'
-import type { VerifySpend } from '../types'
+import { PROVIDER_REF_TEXT, VERIFY_SETTING_TEXT } from '../lib/terms'
+import type { Provider, VerifySpend } from '../types'
 
 /*
  * 设置页「偏好设置」里「核查」一节：双盲复算、反方审稿、审批质询共用的核查模型、各自的开关和上限、每日金额上限
@@ -163,6 +163,10 @@ export function VerifySection({ cur, errors, onEdit, refresh }: {
   const defaultProvider = enabledProviders.find((p) => p.kind !== 'mock') ?? enabledProviders[0]
   const provider = cur.provider ? providers.find((p) => p.name === cur.provider) : undefined
   const providerMissing = !!cur.provider && providers.length > 0 && !provider
+  // 点名停用的接入以前照常调用，现在核查时照实报「已停用」、记缺口：和「不存在」一样在这一格下面说。服务端按这一项
+  // 拒收时（errors.provider，设置页从 422 的 field 落过来）照它的整句
+  const providerError = errors.provider ?? (providerMissing ? S.providerGone(cur.provider)
+    : provider && !provider.enabled ? `${PROVIDER_REF_TEXT.disabled(cur.provider)}：${PROVIDER_REF_TEXT.verifyBroken}` : undefined)
   const modelName = cur.model.trim()
   const byModel = !cur.provider && !!modelName
   const notSet = !cur.provider && !modelName
@@ -222,8 +226,7 @@ export function VerifySection({ cur, errors, onEdit, refresh }: {
           <p id="pref-verify-model-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{S.differ}</p>
         )}
         <div className="grid grid-cols-2 gap-3 max-sm:grid-cols-1">
-          <Field label={T.provider} htmlFor={fieldId('provider')}
-                 error={providerMissing ? S.providerGone(cur.provider) : undefined}
+          <Field label={T.provider} htmlFor={fieldId('provider')} error={providerError}
                  hint={byModelHint ? (
                    <span data-verify-by-model={owner ? (owner.enabled ? 'found' : 'disabled') : 'default'}
                          style={owner?.enabled ? undefined : { color: 'var(--st-waiting)' }}>{byModelHint}</span>
@@ -232,11 +235,12 @@ export function VerifySection({ cur, errors, onEdit, refresh }: {
               <select {...p} className="field" value={cur.provider} onChange={(e) => pickProvider(e.target.value)}>
                 <option value="">{byModel ? S.providerFromModel : S.providerDefault}</option>
                 {providerMissing && <option value={cur.provider}>{S.providerGoneOption(cur.provider)}</option>}
-                {providers.map((pv) => <option key={pv.id} value={pv.name}>{pv.name}{pv.enabled ? '' : S.providerOff}</option>)}
+                <ProviderOptions providers={providers} current={cur.provider} />
               </select>
             )}
           </Field>
-          <Field label={T.model} htmlFor={fieldId('model')} hint={provider?.default_model ? S.modelOf(provider.default_model) : undefined}>
+          <Field label={T.model} htmlFor={fieldId('model')}
+                 hint={provider?.enabled && provider.default_model ? S.modelOf(provider.default_model) : undefined}>
             {(p) => (
               <>
                 <input {...p} className="field mono text-xs" value={cur.model} list="pref-verify-models" spellCheck={false}
@@ -288,6 +292,22 @@ export function VerifySection({ cur, errors, onEdit, refresh }: {
         ))}
       </div>
     </section>
+  )
+}
+
+/**
+ * 接入下拉里的各家。停用的照列（带「已停用」），但选不了：选了运行时也调不了，保存时服务端同样会拒收。
+ * 已经选着的那一个（存着的值后来被停用了）照常显示，下面那一格写明它用不了
+ */
+export function ProviderOptions({ providers, current }: { providers: Provider[]; current: string }) {
+  return (
+    <>
+      {providers.map((pv) => (
+        <option key={pv.id} value={pv.name} disabled={!pv.enabled && pv.name !== current}>
+          {pv.name}{pv.enabled ? '' : S.providerOff}
+        </option>
+      ))}
+    </>
   )
 }
 

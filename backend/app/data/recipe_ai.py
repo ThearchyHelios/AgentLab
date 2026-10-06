@@ -253,10 +253,10 @@ class _BudgetFallback:
 
 
 def _unconfigured(e: BaseException) -> str:
-    """写法照 copilot._unconfigured。"""
-    from app.core.errors import not_configured
+    """和 copilot._unconfigured 同一句（providers/factory.assistant_unavailable）。"""
+    from app.providers.factory import assistant_unavailable
 
-    return f"助手使用的模型尚未配置完成：{not_configured(e, with_hint=False)}。请到「设置 → 模型接入」检查"
+    return assistant_unavailable(e)
 
 
 async def resolve_draft_model(session: AsyncSession) -> tuple[Any | None, str, AiAvailability]:
@@ -271,21 +271,13 @@ async def resolve_draft_model(session: AsyncSession) -> tuple[Any | None, str, A
     try:
         provider = await resolve_provider(session, spec.provider, spec.model)
     except ProviderNotConfigured as e:
-        # 只存了模型名、提供它的接入已停用：resolve_provider 自己会报出来
+        # 存的接入名不存在、已停用，只存了模型名、提供它的接入已停用：resolve_provider 都会报出来
         return None, "", AiAvailability(False, reason=_unconfigured(e))
     if provider is None:
-        if spec.provider:
-            reason = f"助手设置里的模型接入「{spec.provider}」不存在。请到「设置 → 模型接入」检查"
-        else:
-            reason = "未配置模型接入，无法使用 AI 起草。请到「设置 → 模型接入」添加"
-        return None, "", AiAvailability(False, reason=reason)
+        return None, "", AiAvailability(False, reason="未配置模型接入，无法使用 AI 起草。请到「设置 → 模型接入」添加")
     if provider.kind == "mock":
         return None, "", AiAvailability(False, reason="当前只有演示用的模型接入，无法用于 AI 起草。"
                                                       "请到「设置 → 模型接入」添加真实的模型接入")
-    if not provider.enabled:
-        # 存的是接入名时 resolve_provider 会把停用的接入原样返回，build_chat_model 也不查 enabled
-        return None, "", AiAvailability(False, reason=f"助手使用的模型接入「{provider.name}」已停用。"
-                                                      "请到「设置 → 模型接入」启用它，或为助手换一个模型")
     try:
         big = build_chat_model(provider, spec)
         small = build_chat_model(provider, spec.model_copy(update={"max_tokens": AI_FALLBACK_MAX_TOKENS}))

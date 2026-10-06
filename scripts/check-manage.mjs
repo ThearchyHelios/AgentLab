@@ -589,6 +589,70 @@ await section('设置 · 门控模型', async () => {
   await old.close()
 })
 
+await section('设置 · 点名的接入已停用或不存在', async () => {
+  // 点名停用的接入以前照常调用，现在运行时照实报错（K1）：存着的值后来被停用了，那一格下面要说；别的停用接入列着但选不了；
+  // 服务端按项拒收（422 带 field）时整句落到那一格下面、焦点移过去，保存条上原因不截断。接入表、设置读写都是假的
+  const PROVIDERS = [
+    { id: 'check-ref-p1', name: 'demo-main', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'big-model',
+      models: [{ id: 'big-model' }], enabled: true, extra: {}, api_key_masked: '', has_key: true },
+    { id: 'check-ref-p2', name: 'demo-off', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'off-model',
+      models: [{ id: 'off-model' }], enabled: false, extra: {}, api_key_masked: '', has_key: true },
+    { id: 'check-ref-p3', name: 'demo-spare', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'spare-1',
+      models: [{ id: 'spare-1' }], enabled: false, extra: {}, api_key_masked: '', has_key: true },
+  ]
+  let stored = await get('/settings')
+  stored = {
+    ...stored,
+    run: { ...(stored.run ?? {}), tool_gate_provider: 'demo-off', tool_gate_model: null },
+    judge: { ...(stored.judge ?? {}), provider: 'demo-off', model: null },
+    verify: { ...(stored.verify ?? {}), provider: 'demo-off', model: null },
+  }
+  const REFUSED = '「门控模型 · 接入」填写的模型接入「demo-main」已停用。请在「设置 → 模型接入」中启用它，或换一个接入；留空表示使用默认接入的默认模型'
+  let refuse = true
+  const { page, sent, errors, close } = await open('/settings/prefs', {
+    handlers: [
+      [/^GET \/settings$/, (route) => json(stored)(route)],
+      [/^PUT \/settings$/, (route, { body }) => {
+        if (refuse) {
+          refuse = false
+          return route.fulfill({ status: 422, contentType: 'application/json',
+            body: JSON.stringify({ detail: REFUSED, code: 'settings_provider_invalid', field: 'run.tool_gate_provider' }) })
+        }
+        stored = { ...stored, ...body.values }
+        return json(stored)(route)
+      }],
+      [/^GET \/providers$/, json(PROVIDERS)],
+    ],
+  })
+  const said = async (id) => page.locator(`#${id}-error`).innerText().catch(() => '')
+  check('门控模型：存着的接入已停用，那一格下面说清', (await said('pref-gate-provider')).includes('模型接入「demo-off」已停用：门控模型无法调用，所有工具调用将转为人工审批'),
+    await said('pref-gate-provider'))
+  check('证据裁判：同样说清', (await said('pref-judge-provider')).includes('模型接入「demo-off」已停用：裁判调用将失败'), await said('pref-judge-provider'))
+  check('核查模型：同样说清', (await said('pref-verify-provider')).includes('模型接入「demo-off」已停用：核查调用将失败'), await said('pref-verify-provider'))
+  check('……模型那一格不再写「留空则使用 off-model」', !(await page.locator('[data-gate-model]').innerText()).includes('off-model'))
+  const gate = page.locator('#pref-gate-provider')
+  const off = (name) => gate.locator(`option[value="${name}"]`).evaluate((o) => o.disabled)
+  check('下拉：选着的停用接入照常显示，别的停用接入列着但选不了', !(await off('demo-off')) && await off('demo-spare') && !(await off('demo-main')))
+  await shot(page, 'prefs-provider-disabled')
+  await gate.selectOption('demo-main')
+  check('换成启用的接入：那一格的说明消失，刚才那个停用接入也选不回去了', !(await said('pref-gate-provider')) && await off('demo-off'))
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForTimeout(500)
+  check('服务端按项拒收：整句落到那一格下面', (await said('pref-gate-provider')) === REFUSED, await said('pref-gate-provider'))
+  check('……焦点移到那一格', await gate.evaluate((el) => el === document.activeElement))
+  const bar = await page.locator('[data-prefs-save-error]').innerText().catch(() => '')
+  check('……保存条写到原因，不截在第一句', bar.startsWith('保存失败：') && bar.includes('请在「设置 → 模型接入」中启用它'), bar)
+  await gate.selectOption('')
+  check('再改这一项：服务端那句说明收起', !(await said('pref-gate-provider')))
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForTimeout(500)
+  const put = sent.filter((x) => x.key === 'PUT /settings').at(-1)?.body?.values?.run ?? {}
+  check('……再保存：照常写进去', put.tool_gate_provider === null && (await page.locator('[data-prefs-save-error]').count()) === 0,
+    `provider=${JSON.stringify(put.tool_gate_provider)}`)
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
 await section('设置 · 智能体护栏', async () => {
   // 默认步数、token 预算、金额预算（后端 engine/guards.py）。预算留空 = 不限，存 null
   let stored = await get('/settings')

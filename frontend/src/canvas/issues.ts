@@ -11,7 +11,9 @@
  * 那一栏，定位落到工具上（见 toolBindingOf）。
  */
 import { ApiError } from '../api/client'
-import { APPROVAL_POLICY_LABEL, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL, UPGRADE_TEXT, nodeTypeLabel } from '../lib/terms'
+import {
+  APPROVAL_POLICY_LABEL, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL, PROVIDER_REF_TEXT, UPGRADE_TEXT, nodeTypeLabel,
+} from '../lib/terms'
 import { NODE_DEFS } from './nodeDefs'
 import type { FlowNode } from '../store/studio'
 import type {
@@ -244,6 +246,12 @@ function normalizeIssue(raw: any): ValidationIssue | null {
   }
 }
 
+/**
+ * 点名的模型接入不存在或已停用，或者只写了模型、提供它的接入已停用（后端 engine/provider_refs.py）。一处一条问题、
+ * 一条修复：同一个协作节点上自己的接入和成员的接入是两处，合并、找修复都要连字段一起认
+ */
+export const isProviderRefCode = (code?: string | null): boolean => code === 'provider.missing' || code === 'provider.disabled'
+
 function normalizeFix(raw: any): PublishFix | null {
   if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !raw.id) return null
   const kind = raw.kind === 'choice' || raw.kind === 'assist' ? raw.kind : raw.kind === 'auto' ? 'auto' : null
@@ -259,6 +267,7 @@ function normalizeFix(raw: any): PublishFix | null {
     code: asText(raw.code),
     kind,
     node_id: raw.node_id ?? null,
+    ...(typeof raw.field === 'string' && raw.field ? { field: raw.field } : {}),
     label: asText(raw.label) || raw.id,
     preview: raw.preview && typeof raw.preview === 'object' ? raw.preview : null,
     options,
@@ -318,7 +327,10 @@ export function fixFor(issue: ValidationIssue, fixes: PublishFix[]): PublishFix 
   if (issue.fix) return fixes.find((f) => f.id === issue.fix)
   if (!issue.code) return undefined
   const same = fixes.filter((f) => f.code === issue.code)
-  const exact = same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null))
+  // 点名的接入一处一条修复：同一节点上的几处按字段认
+  const exact = (isProviderRefCode(issue.code)
+    ? same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null) && (f.field ?? null) === (issue.field ?? null))
+    : undefined) ?? same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null))
   if (exact) return exact
   return issue.node_id == null ? same[0] : same.find((f) => f.node_id == null)
 }
@@ -326,13 +338,16 @@ export function fixFor(issue: ValidationIssue, fixes: PublishFix[]): PublishFix 
 /**
  * 同一处问题只列一行：validate 和门禁常对同一处各报一条（同 code、同节点，说法不同），
  * 列两行就是两组一样的修复控件、「会被拦下 2 处」。合成的那一行取最重的级别、第一条 error 的说法，
- * 其余说法收进 others（悬停可见）。没有 code 的认不出是不是同一处，照原样各列一行
+ * 其余说法收进 others（悬停可见）。没有 code 的认不出是不是同一处，照原样各列一行。
+ * 点名的模型接入连字段一起认：协作节点自己的接入和成员的接入是两处问题、各有各的修复，不合成一行
  */
 export function mergeIssues(issues: ValidationIssue[]): { issue: ValidationIssue; others: string[] }[] {
   const out: { issue: ValidationIssue; others: string[] }[] = []
   const at = new Map<string, number>()
   for (const issue of issues) {
-    const key = issue.code ? `${issue.code}\u0000${issue.node_id ?? ''}` : null
+    const key = issue.code
+      ? `${issue.code}\u0000${issue.node_id ?? ''}${isProviderRefCode(issue.code) ? `\u0000${issue.field ?? ''}` : ''}`
+      : null
     const i = key != null ? at.get(key) : undefined
     if (i == null) {
       if (key != null) at.set(key, out.length)
@@ -382,11 +397,16 @@ const CONTRACT_KEYS: Record<string, string> = {
 /** 不在节点定义的字段表里、由检查器自己画的几项（子工作流钉的版本、升版处置），以及图级的全图默认 */
 const EXTRA_FIELDS: Record<string, string> = {
   workflow_version: '固定版本', upgrade_policy: '上游发布新版本时', defaults: '工作流默认设置',
+  // 多数节点的检查器里没有接入这一栏（只有双盲复算、反方审稿有），修复点名接入时照样要写得出叫法；修复连带去掉的
+  // 模型也一样（知识检索、结构校验的检查器里没有模型这一栏）
+  provider: PROVIDER_REF_TEXT.field, model: PROVIDER_REF_TEXT.model,
 }
 /** 点号后面那一段的叫法：契约里的键，全图默认里的审批策略，列表项里的名称、取值、表达式 */
 const SUB_KEYS: Record<string, string> = {
   ...CONTRACT_KEYS, approval: '审批策略', claims: '未附依据的结论句', on_uncited: '未附依据时',
   name: '名称', value: '取值', expression: '表达式',
+  // 点名的接入：成员的、全图默认里的（连同全图默认里结论句裁判的那一份）
+  provider: PROVIDER_REF_TEXT.field, model: PROVIDER_REF_TEXT.model, judge: PROVIDER_REF_TEXT.judge,
 }
 /** 契约 claims 的 on_uncited：没挂依据的结论句怎么算 */
 const ON_UNCITED_LABEL: Record<string, string> = {
