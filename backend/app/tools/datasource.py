@@ -470,7 +470,8 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
     mask_results：数据源设了遮罩时，取自遮罩列的格子（按 SQL 认，改了名字的也算）在交给模型、落进快照之前就换成
     「已遮罩」，见 engine/masking.py 的 mask_query_result；这一次遮掉的值并进 ctx.extra[MASKED_VALUES_KEY]（有的话）。
     那里已经有的值（这个 agent 前面的查询遮掉的、调用方交进来的）这一次也按值换，数据源没设遮罩也一样：先查号码、
-    再查写着号码的备注或别的库，后一份同样遮好。查询失败时报错原话里的值也换（masking.mask_error_text）。
+    再查写着号码的备注或别的库，后一份同样遮好。按值换只换文字格，数值格照原样（存下的是证据）。查询失败时报错原话里
+    的值也换（masking.mask_error_text）。
     """
     # 数据源在 options.query_timeout_s 里配了就用它，否则取缺省。数据库按它停下语句，
     # 引擎按它告诉界面上限是多少（metadata["timeout_s"]）
@@ -530,8 +531,10 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
 
         payload = result.to_payload()
         payload["source"] = source.name
-        # 查询时就整列遮掉的结果列；没开遮罩开关、数据源没设遮罩又没有可按值换的时为 None（快照和原来一字不差）
+        # 查询时就整列遮掉的结果列；没开遮罩开关、数据源没设遮罩又没有可按值换的时为 None（快照和原来一字不差）。
+        # 别的列里按值换过的格子另记（masked_cells），没有就不记
         masked_now: list[str] | None = None
+        masked_cells: list[list[int]] = []
         if mask_results and (mask or known is not None):
             from app.engine.masking import mask_query_result
 
@@ -539,7 +542,7 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
             done = await asyncio.to_thread(mask_query_result, payload, mask, source.kind, known,
                                            schema=source.schema_cache)
             if mask or done.payload is not payload:
-                payload, masked_now = done.payload, done.columns
+                payload, masked_now, masked_cells = done.payload, done.columns, done.cells
             if sink is not None:
                 # 并进 agent 查到的那一份（不和调用方交进来的混在一起，上限收满了也不丢），也放进线程
                 await asyncio.to_thread(sink.add, done.secrets)
@@ -562,6 +565,8 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
             #   同源各份快照记的这一项并起来，从表的字段清单里去掉，混进结果列的别名会把同名的真实字段也去掉；
             # - masked_at_query：开了遮罩开关时，查询时就整列遮掉的结果列（这几列的格子是「已遮罩」，不是数据源里的值，
             #   改了名字的也在这里）。有这一项的快照，别的格子整格是「已遮罩」的是查询时按值换掉的；
+            # - masked_cells：别的列里查询时按值换过的文字格 [行, 列号]（整格换的、换掉一截的），格子引用指到它们时照实
+            #   说是遮罩。数值格不按值换，存下的数和数据库里的一样；
             # - data_version：上传表格查的是哪个快照，事后据此认得出这个数出自哪一版数据。
             # 手工源、没设遮罩的，快照和原来一字不差
             extra: dict[str, Any] = {}
@@ -569,6 +574,8 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
                 extra["mask_columns"] = mask
             if masked_now is not None:
                 extra["masked_at_query"] = masked_now
+            if masked_cells:
+                extra["masked_cells"] = masked_cells
             if version := getattr(source, "snapshot_id", None):
                 extra["data_version"] = version
             # 工件引用的 meta 记下源和 SQL 里用到的表：数据目录按它数每张表被运行查询过几次

@@ -90,3 +90,95 @@ async def test_the_model_and_the_snapshot_see_only_masks_when_the_analysis_fails
     assert got.status_code == 200 and _clean(got.text) and "1200" not in got.text
     assert out.result["value"] is None
     assert out.cells[0]["reason"] == "Q1 的「amount」取自设置了遮罩的列，查询时已遮罩，不采信"
+
+
+# --------------------------------------------------------------------------
+# 多遮不改写没设遮罩的数值证据；占位的短词不当遮罩值
+# --------------------------------------------------------------------------
+
+
+#: 金额设了遮罩，都是五位数；访问次数没设遮罩，第二、三单正好等于别的订单的金额（20000、30000）。联系表的访问次数存成
+#: 文字（'20000'），客户名设了遮罩、里面有占位的「未知」，区域和备注里也写着「未知」
+BIG = ("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER, visits INTEGER, buyer_name TEXT,"
+       " note TEXT);"
+       "INSERT INTO sales VALUES (1, '华东', 10000, 25000, '张伟', '原因未知'), (2, '华东', 12000, 20000, '未知', ''),"
+       " (3, '华南', 20000, 30000, '李娜', '客户未知来源'), (4, '未知', 30000, 22000, '王芳', ''),"
+       " (5, '华北', 50000, 9000, '刘洋', '');"
+       "CREATE TABLE contacts (id INTEGER PRIMARY KEY, visits_text TEXT, remark TEXT);"
+       "INSERT INTO contacts VALUES (1, '20000', '上月消费 30000 元'), (2, '8', '例行回访');")
+
+
+@pytest.fixture
+async def big_shop(tmp_path):
+    name, source_id = await _source(tmp_path, {"mask_columns": "amount, buyer_name"}, script=BIG)
+    yield name
+    await engines.invalidate(source_id)
+
+
+async def test_an_unmasked_numeric_column_is_kept_even_when_it_equals_a_masked_value(monkeypatch, big_shop):
+    """访问次数没设遮罩，第二、三单正好等于别的订单被遮的金额：交给模型的、落库的都是数据库里的原数，类型照旧是数，
+    引用它照常取值（双盲复算取得到 20000）。以前按值整格换成「已遮罩」，快照里不留记录，引用时说成「不是数值」。"""
+    name = big_shop
+    sql = "SELECT id, amount, visits FROM sales ORDER BY id"
+    script = Script(monkeypatch, [q(name, sql, "c1")], {"value": {"alias": "Q1", "row": 1, "column": "visits"},
+                                                        "rationale": "x"})
+    out, _ = await ask(name)
+    seen = json.loads(script.tool_results()["c1"].split("\n", 1)[1])
+    assert seen["rows"] == [[1, MASKED, 25000], [2, MASKED, 20000], [3, MASKED, 30000], [4, MASKED, 22000],
+                            [5, MASKED, 9000]]
+    snapshot = artifact_store.load(out.queries[0]["artifact"])
+    assert snapshot["rows"] == seen["rows"] and snapshot["column_types"]["visits"] == "number"
+    assert snapshot["masked_at_query"] == ["amount"] and "masked_cells" not in snapshot
+    assert out.result["value"] == 20000 and out.cells[0]["status"] == "resolved"
+
+
+async def test_text_cells_masked_by_value_are_recorded_and_cited_as_masked(monkeypatch, big_shop):
+    """存成文字的数（'20000'）、备注里夹着的金额（30000）照样按值换：交给模型的、落库的都换掉，换过的格子记进快照
+    （masked_cells），引用到它们照实说是遮罩，不说成「不是数值」。"""
+    name = big_shop
+    steps = [q(name, "SELECT amount FROM sales ORDER BY id", "c1"),
+             q(name, "SELECT id, visits_text, remark FROM contacts ORDER BY id", "c2")]
+    script = Script(monkeypatch, steps, lambda messages: {"value": {"alias": "Q2", "row": 0, "column": "visits_text"},
+                                                          "rationale": "x"})
+    out, _ = await ask(name)
+    seen = json.loads(script.tool_results()["c2"].split("\n", 1)[1])
+    assert seen["rows"] == [[1, MASKED, f"上月消费 {MASKED} 元"], [2, "8", "例行回访"]]
+    assert "masked_cells" not in seen, "记录只在快照里，不交给模型"
+    snapshot = artifact_store.load(out.queries[1]["artifact"])
+    assert snapshot["rows"] == seen["rows"] and snapshot["masked_cells"] == [[0, 1], [0, 2]]
+    assert snapshot["masked_at_query"] == []
+    assert out.result["value"] is None
+    assert out.cells[0]["reason"] == "Q2 第 0 行「visits_text」与设置了遮罩的值相同，查询时已遮罩，不采信"
+
+
+async def test_a_partly_masked_text_cell_is_cited_as_masked(monkeypatch, big_shop):
+    """引用指到文字里换掉了一截的格子：同样照实说是遮罩。"""
+    name = big_shop
+    steps = [q(name, "SELECT amount FROM sales ORDER BY id", "c1"),
+             q(name, "SELECT id, remark FROM contacts ORDER BY id", "c2")]
+    Script(monkeypatch, steps, {"value": {"alias": "Q2", "row": 0, "column": "remark"}, "rationale": "x"})
+    out, _ = await ask(name)
+    assert out.result["value"] is None
+    assert out.cells[0]["reason"] == "Q2 第 0 行「remark」里有与设置了遮罩的值相同的部分，查询时已遮罩，不采信"
+
+
+async def test_placeholder_words_are_not_masked_elsewhere(monkeypatch, big_shop):
+    """客户名设了遮罩，里面有占位的「未知」：客户名整列照旧遮；没设遮罩的区域里的「未知」、备注里的「原因未知」「客户
+    未知来源」照原样。以前「未知」当遮罩值收了，这几格都被换掉。"""
+    name = big_shop
+    sql = "SELECT id, buyer_name, region, note FROM sales ORDER BY id"
+    script = Script(monkeypatch, [q(name, sql, "c1")], {"value": {"alias": "Q1", "row": 0, "column": "id"},
+                                                        "rationale": "x"})
+    out, _ = await ask(name)
+    seen = json.loads(script.tool_results()["c1"].split("\n", 1)[1])
+    assert [row[1] for row in seen["rows"]] == [MASKED] * 5
+    assert [row[2:] for row in seen["rows"]] == [["华东", "原因未知"], ["华东", ""], ["华南", "客户未知来源"],
+                                                 ["未知", ""], ["华北", ""]]
+    assert out.masked_values.hit("张伟") and not out.masked_values.hit("未知")
+
+
+def test_placeholders_are_never_collected():
+    secrets = masking._Secrets()
+    secrets.add({"columns": ["name"], "rows": [["未知"], ["N/A"], ["暂无"], ["张伟"], ["NULL"]]}, {"name"})
+    assert secrets.strong == {"张伟"} and secrets.weak == {"张伟"}
+    assert secrets.scrub("原因未知，暂无记录，N/A，张伟") == f"原因未知，暂无记录，N/A，{MASKED}"

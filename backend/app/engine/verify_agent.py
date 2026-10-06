@@ -8,11 +8,12 @@
 
 **先遮再交。** 建查询工具时还打开遮罩开关（tools/datasource 的 mask_results）：数据源设了遮罩时，取自遮罩列的格子
 （按 SQL 认，起别名、套函数、经子查询或 WITH 转一道、SELECT *（展开的列换了名字的也算）、表值函数拆开的都算）在交给
-模型、落进查询快照之前就换成「已遮罩」，别的格子按值换：这份结果里的遮罩值、前面的查询遮掉的、调用方交进来的
+模型、落进查询快照之前就换成「已遮罩」，别的文字格按值换：这份结果里的遮罩值、前面的查询遮掉的、调用方交进来的
 （masked_values：审批质询、反方审稿收的报告快照里的值），文字格里夹着的换那一截（engine/masking.py 的
-mask_query_result）；查询失败时报错原话里的值也换。模型看不到遮罩值，就不会把它写进回答、理由、SQL；以前是事后
-按值认，每一轮复核都找到新的漏法。快照里的 masked_at_query 记下查询时就遮了的列，格子引用指到这几列、指到按值换掉
-的格子的都不采信。遮掉的值只在内存里交回调用方（VerifyOutcome.masked_values，审批质询、反方审稿按值遮的第二道防线
+mask_query_result）；数值格不按值换（存下的是证据，没设遮罩的访问次数正好等于某一笔被遮的金额也照原样）；查询失败时
+报错原话里的值也换。模型看不到遮罩值，就不会把它写进回答、理由、SQL；以前是事后按值认，每一轮复核都找到新的漏法。
+快照里的 masked_at_query 记下查询时就遮了的列，masked_cells 记下按值换过的格子，格子引用指到这几列、这几格的都不采信，
+照实说是遮罩。遮掉的值只在内存里交回调用方（VerifyOutcome.masked_values，审批质询、反方审稿按值遮的第二道防线
 用），不进快照、不交给模型、不进 as_dict。调用方交进来的和查询时遮掉的分开记（masking.SeenValues），合起来时 agent
 查到的在前：合起来到了上限 SECRETS_MAX，挤掉的是报告里的值。
 
@@ -438,6 +439,13 @@ class _Cells:
                                "row": row, "column": name, "artifact": query["artifact"],
                                "reason": f"{alias} 第 {row} 行「{name}」与设置了遮罩的值相同，查询时已遮罩，不采信"})
             return None
+        if _masked_cell(content, row, name):
+            # 文字里有一截查询时按值换掉了（快照的 masked_cells 记着）：这一格不是数据库里的原样，同样照实说
+            self.cells.append({"path": path, "status": "unresolved", "ref": f"{alias}.r{row}.{name}", "alias": alias,
+                               "row": row, "column": name, "artifact": query["artifact"],
+                               "reason": f"{alias} 第 {row} 行「{name}」里有与设置了遮罩的值相同的部分，查询时已遮罩，"
+                                         "不采信"})
+            return None
         truth = _typed(raw, {"type": sorted(types)}, column_kind(content, name))
         cited = {"ref": f"{alias}.r{row}.{name}", "alias": alias, "row": row, "column": name,
                  "artifact": query["artifact"], "eid": cell_eid(query["artifact"], row, name), "value": truth}
@@ -537,6 +545,16 @@ def _masked_at_query(content: Any) -> set[str]:
     """查询快照里查询时就整列遮掉的列（小写，tools/datasource 记下的 masked_at_query）。"""
     listed = content.get("masked_at_query") if isinstance(content, dict) else None
     return {c.lower() for c in listed if isinstance(c, str)} if isinstance(listed, list) else set()
+
+
+def _masked_cell(content: Any, row: Any, name: str) -> bool:
+    """查询快照里第 row 行、name 这一列的格子查询时按值换过（tools/datasource 记下的 masked_cells：[行, 列号]）。列名
+    同名的按第一列算，同 locate_cell。"""
+    listed = content.get("masked_cells") if isinstance(content, dict) else None
+    columns = [str(c) for c in content.get("columns") or []] if isinstance(content, dict) else []
+    if not isinstance(listed, list) or name not in columns:
+        return False
+    return [row, columns.index(name)] in listed
 
 
 # --------------------------------------------------------------------------

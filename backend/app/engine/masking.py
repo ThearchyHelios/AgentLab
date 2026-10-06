@@ -6,9 +6,10 @@
 质询（engine/inquiry.py）、双盲复算（nodes/dual_check.py，经 inquiry 的同名导出）共用：
 
 - 工具边界先遮（mask_query_result）：核查 agent 的查询结果交给模型、落进快照之前，取自遮罩列的格子换成「已遮罩」，
-  别的格子按值换：这份结果里的遮罩值，加上这个 agent 前面的查询遮掉的、调用方交进来的（报告快照里的）。模型看不到
+  别的文字格按值换：这份结果里的遮罩值，加上这个 agent 前面的查询遮掉的、调用方交进来的（报告快照里的）。模型看不到
   遮罩值，就不会把它写进回答、理由、SQL——事后按值认每一轮复核都找到新的漏法，根治靠这一步；审批质询回答、反方
-  审稿理由里的按值遮降为第二道防线。查询失败时报错原话里的值也换（mask_error_text）
+  审稿理由里的按值遮降为第二道防线。宁可多遮，但不改写没设遮罩的数值证据：数值格不按值换，按值换过的文字格记进
+  快照（masked_cells）。查询失败时报错原话里的值也换（mask_error_text）。分析本身出了意外，整份遮（_masked_whole）
 
 - 哪些列（_derived_hidden）：从遮罩列本身起，按 SQL 一层层认出值取自遮罩列的结果列（别名、函数、子查询、WITH、UNION 的
   另一支、和 * 写在同一支里没起别名的表达式、FROM 里拆开遮罩列的表值函数、函数参数里的 JSON 箭头 col->'path'）；* 把
@@ -21,7 +22,8 @@
   TABLE x）的，整份快照的列都算。双盲复算按同一套认法在派盲算之前挡下取自遮罩列的指标（derived_columns）
 - 只装着分档标签的列（_label_columns）：标签是 agent 写在 SQL 里的字，不当遮罩值；* 展开数据源里的表时按冻结的表结构
   认它带不带同名的列（_schema_tables）
-- 哪些值（_Secrets）：遮罩列里出现过的值，按值认有门槛（SECRET_MIN、SECRET_DIGITS），换的时候先按词、按开头几个字筛出
+- 哪些值（_Secrets）：遮罩列里出现过的值，按值认有门槛（SECRET_MIN、SECRET_DIGITS），占位的写法（PLACEHOLDERS：未知、
+  暂无……）不收；换的时候先按词、按开头几个字筛出
   正文里真有的那几个值，不现编上万个分支的正则；正文、文字格、SQL 的字符串和注释里换了写法的长号码（199-1474-2785、
   +86 …、全角数字）按纯数字写法在集合里查（loose_spans）；已经摆在读者眼前的值免遮，之后并进来的照样免（protected）
 - 快照遮好的样子（_masked_view），回答时才认得出、事后要照位置重放的地方（view_edits、replay_edits）
@@ -56,6 +58,12 @@ SECRET_MIN = 2
 SECRET_DIGITS = 5
 #: 遮罩列的值最多收这么多种写法（一份快照最多上千行）：再多就按已经收到的换
 SECRETS_MAX = 20_000
+#: 占位的写法：遮罩列里没填的格子常这样写，不是哪个人的信息。当遮罩值收了的话，没设遮罩的列、备注里同一个词都会被换掉
+#: （区域「未知」、「原因未知」变成「原因已遮罩」），一个都不收（不分大小写）
+PLACEHOLDERS = frozenset({
+    "未知", "暂无", "不详", "不明", "无", "空", "未填", "未填写", "未提供", "待定", "待补充", "暂缺", "缺失", "没有",
+    "其他", "其它", "保密", "匿名", "未登记", "未记录", "无数据", "null", "none", "nil", "nan", "n/a", "na", "-", "--",
+})
 
 
 #: 按词边界认值的字符：值的头尾是这样的字时，前后不能紧挨着同类的字（13900000001 不换掉 139000000012 的一截）
@@ -1415,6 +1423,11 @@ def _forms(value: Any) -> set[str]:
     return forms
 
 
+def _placeholder(value: Any) -> bool:
+    """一格是占位的写法（PLACEHOLDERS：未知、暂无、N/A……），不当遮罩值收。"""
+    return isinstance(value, str) and _plain_text(value).lower() in PLACEHOLDERS
+
+
 def _strong(form: str) -> bool:
     """按值认得出的写法（见 SECRET_MIN、SECRET_DIGITS）。"""
     if _NUMERIC.fullmatch(form):
@@ -1522,7 +1535,8 @@ class _Secrets:
     def add(self, snapshot: Any, hidden: set[str], *, labels: dict[str, set[str]] | None = None,
             base: Iterable[str] = ()) -> None:
         """收一份快照里要遮的列（hidden，小写）的值。labels 是这份快照里只装着分档标签的列（_label_columns）：这几列的
-        格子等于标签的不收；改了名字的遮罩列、别的派生列照收，base（数据源设了遮罩的列，小写）自己选出来的值也照收。"""
+        格子等于标签的不收；改了名字的遮罩列、别的派生列照收，base（数据源设了遮罩的列，小写）自己选出来的值也照收。
+        占位的写法（PLACEHOLDERS：未知、暂无……）不收。"""
         if not _query_shaped(snapshot) or not hidden:
             return
         own = set(base)
@@ -1541,7 +1555,7 @@ class _Secrets:
             else:
                 continue
             for name, value in cells:
-                if value is None or isinstance(value, bool) or value == word:
+                if value is None or isinstance(value, bool) or value == word or _placeholder(value):
                     continue
                 forms = _forms(value)
                 if forms & written.get(name, set()):
@@ -1777,7 +1791,8 @@ def _scrubbed_source(text: str, secrets: _Secrets) -> str:
 
 
 def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, *, embedded: bool = False,
-                 rename: bool = True) -> tuple[dict[str, Any], list[str]]:
+                 rename: bool = True, numbers: bool = True, changed: list[list[int]] | None = None
+                 ) -> tuple[dict[str, Any], list[str]]:
     """一份查询快照遮好的样子和遮掉的列：要遮的列（hidden，小写）每一格都换成「已遮罩」、类型记成文本（渲染时不当数）；
     别的列里写着按值认得出的遮罩值的格子也换（另一张表里没设遮罩的同一个手机号、改了名字没认出来的遮罩列）。
     列名里写着遮罩值的（agent 把遮罩值写进了别名，「13900000001 的单」），列名也换（同 SQL 里的名字，_scrub_sql）。
@@ -1788,6 +1803,9 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     里也没设遮罩。回答一路不这样换：渲染出来露了就整份不交（_leaked），不然回答被问的那一格看着像查到了别的东西。
     rename 为假时列名不换（工具边界先遮时：列名是模型自己写的，换了它引用的列名就对不上）。列名按文字的办法换（换了写法的
     号码也认，同 SQL 里带引号的名字）。
+    numbers 为假时数值格（数、列类型记成 number 的格子）不按值换，只换文字格（工具边界先遮时：存下的就是证据，访问次数
+    正好等于某一笔被遮的金额，换掉就改写了没设遮罩的数，双盲复算也取不到它）；要遮的列照旧整列换。changed 给了的话，按值
+    换过的格子（整格换的、文字里换掉一截的）按 [行, 列] 记进去，要遮的列里的不记。
     工具边界遮过的快照（记着 masked_at_query）里，整格就是「已遮罩」的是查询时按值换掉的：这一列照样记进遮掉的列，和回答时
     按值换掉的一样画。"""
     columns = [str(c) for c in snapshot.get("columns") or []]
@@ -1801,8 +1819,10 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     edited = False
     position = {c: i for i, c in enumerate(columns)}
     names = [secrets.scrub(c, loose=True) for c in columns] if by_value and rename else columns
+    kinds = snapshot.get("column_types") if isinstance(snapshot.get("column_types"), dict) else {}
+    counted = {i for i, c in enumerate(columns) if kinds.get(c) == "number"} if not numbers else set()
 
-    def cell(i: int | None, value: Any) -> Any:
+    def cell(r: int, i: int | None, value: Any) -> Any:
         nonlocal edited
         if i in index:
             return word
@@ -1810,15 +1830,21 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
             if i is not None:
                 touched.add(i)
             return value
+        if not numbers and (i in counted or (isinstance(value, (int, float)) and not isinstance(value, bool))):
+            return value
         if by_value and secrets.hit(value):
             if i is not None:
                 touched.add(i)
+                if changed is not None:
+                    changed.append([r, i])
             return word
         if embedded and by_value and isinstance(value, (str, dict, list)):
             # JSON 列（对象、数组）按界面画出来的样子换，换过的照文字给
             text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
             if (scrubbed := secrets.scrub(text, loose=True)) != text:
                 edited = True
+                if changed is not None and i is not None:
+                    changed.append([r, i])
                 return scrubbed
         return value
 
@@ -1827,11 +1853,11 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
         return names[i] if i is not None else k
 
     rows: list[Any] = []
-    for row in snapshot["rows"]:
+    for r, row in enumerate(snapshot["rows"]):
         if isinstance(row, list):
-            rows.append([cell(i, v) for i, v in enumerate(row)])
+            rows.append([cell(r, i, v) for i, v in enumerate(row)])
         elif isinstance(row, dict):
-            rows.append({key(k): word if str(k).lower() in hidden else cell(position.get(str(k)), v)
+            rows.append({key(k): word if str(k).lower() in hidden else cell(r, position.get(str(k)), v)
                          for k, v in row.items()})
         else:
             rows.append(row)
@@ -1972,11 +1998,13 @@ class QueryMask:
 
     payload：遮好的结果，交给模型的、落进快照的都是它。columns：查询时就整列遮掉的结果列（结果里的列名，按先后）。
     secrets：这份结果里遮掉的值，只在内存里交给调用方（审批质询按值遮的第二道防线：模型照着别处看到的号码写进回答、
-    查询条件时认得出），不进快照、不交给模型。"""
+    查询条件时认得出），不进快照、不交给模型。cells：别的列里按值换过的格子 [行, 列]（整格换的、文字里换掉一截的），
+    随快照存下（masked_cells），格子引用指到它们照实说是遮罩，不说成「不是数值」。"""
 
     payload: dict[str, Any]
     columns: list[str]
     secrets: _Secrets
+    cells: list[list[int]] = field(default_factory=list)
 
 
 @dataclass
@@ -2013,10 +2041,12 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
       SELECT *（展开的列换了名字的也算）、表值函数、整行引用和函数参数里的 *、列名表、TABLE x；COUNT、只在条件里用到、
       分档当分组键的不算）；SQL 解析不了、又写着遮罩列（或者 *、TABLE x）的，整份结果的列都遮。这几列的格子换成
       「已遮罩」，类型记成文本
-    - 别的列按值换：整格就是遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，_Secrets.loose_spans）。遮罩值
-      是这份结果里的加上 known：先查号码、再查写着号码的备注、没设遮罩的联系方式表（别的库里的也一样）时，后一份同样
-      遮好。门槛同按值遮（SECRET_DIGITS、SECRET_MIN）；只装着分档标签的列里的标签不算遮罩值，这份结果自己写的标签也不
-      按 known 换（前面的查询认不准、当遮罩值收了的同名标签，不能把这一份的档位列换掉）
+    - 别的列按值换，只换文字格：整格就是遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，
+      _Secrets.loose_spans），换过的格子记下来（QueryMask.cells）。遮罩值是这份结果里的加上 known：先查号码、再查写着
+      号码的备注、没设遮罩的联系方式表（别的库里的也一样）时，后一份同样遮好。门槛同按值遮（SECRET_DIGITS、SECRET_MIN）；
+      只装着分档标签的列里的标签不算遮罩值，这份结果自己写的标签也不按 known 换（前面的查询认不准、当遮罩值收了的同名
+      标签，不能把这一份的档位列换掉）。数值格（数、列类型是 number 的格子）不按值换：存下的快照就是证据，没设遮罩的
+      数值列（访问次数正好等于某一笔被遮的金额）换掉就改写了证据，双盲复算也取不到它
     - 列名不换（模型自己写的，换了它引用的列名就对不上）；结果里一列都没取自遮罩列、也没有可按值换的原样交回：数值的
       汇总、只数个数的查询不受影响
 
@@ -2044,11 +2074,12 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
         if not pool.strong and not any(c.lower() in hidden for c in columns):
             return QueryMask(payload, [], own)
         pool.prepare()
-        view, _ = _masked_view(payload, hidden, pool, embedded=True, rename=False)
+        cells: list[list[int]] = []
+        view, _ = _masked_view(payload, hidden, pool, embedded=True, rename=False, numbers=False, changed=cells)
     except Exception:  # noqa: BLE001 - 认不准就整份遮掉，原值不交给模型
         logger.warning("核查查询的遮罩分析出错，整份结果按遮罩处理", exc_info=True)
         return QueryMask(_masked_whole(payload), columns, _Secrets())
-    return QueryMask(view, [c for c in columns if c.lower() in hidden], own)
+    return QueryMask(view, [c for c in columns if c.lower() in hidden], own, cells)
 
 
 def _masked_whole(payload: dict[str, Any]) -> dict[str, Any]:
