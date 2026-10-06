@@ -14,7 +14,8 @@ const PAGE = 20
 /**
  * 触发历史：每次触发一行，新的在前，20 条一页、「加载更多」往后接。计划时间按定时任务的时区写；跳过、发起失败
  * 写原因；发起了的链到那次运行、写运行现在的状态；运行成功结束后服务端和同一任务上一次成功的运行比过的，另给
- * 「与上一次对比」；发出去的通知逐条写结果。refreshKey 变了（立即运行之后）从头重取
+ * 「与上一次对比」（基准不是紧挨着的上一次时写「与上一次成功的运行对比」）；发出去的通知逐条写结果。refreshKey 变了
+ * （立即运行之后）从头重取
  */
 export function FireHistory({ schedule, refreshKey }: { schedule: Schedule; refreshKey: number }) {
   const [items, setItems] = useState<ScheduleFire[] | null>(null)
@@ -142,14 +143,17 @@ function FireRow({ fire: f, tz, now }: { fire: ScheduleFire; tz: string; now: nu
 }
 
 /**
- * 「与上一次对比」：去对比页，本次是这次触发的运行、基准是服务端自动对比时取的同一任务上一次成功的运行。旁边写有几个
- * 指标有变化（触屏没有悬停，键盘聚焦也不显示悬停），悬停写各类指标的个数（和通知里那一行同一个写法），读屏把它当
- * 说明念。基准就是紧挨着的上一次时带上来历，对比页据此写「默认基准：同一定时任务的上一次运行」；不是（上一次失败了、
- * 取消了）时不带，免得说错，悬停写明比的是哪一次
+ * 「与上一次对比」：去对比页，本次是这次触发的运行、基准是服务端自动对比时取的同一任务上一次成功的运行——和运行详情
+ * 「更多」里同名入口的默认基准是同一个挑法（服务端 api/compare.py 的 pick_base），两处进去比的是同一对运行。旁边写有
+ * 几个指标有变化（触屏没有悬停，键盘聚焦也不显示悬停），悬停写各类指标的个数（和通知里那一行同一个写法），读屏把它
+ * 当说明念。
+ *
+ * 基准不是紧挨着的上一次（上一次失败了、取消了）时，链接上看得见的字就写「与上一次成功的运行对比」，悬停另写是哪一次。
+ * 两种都带上来历：对比页据此写「默认基准：同一定时任务上一次成功的运行」，和从运行详情进去时一字不差
  */
 function CompareLink({ runId, compare }: { runId: string; compare: ScheduleFireCompare }) {
   const previous = compare.previous !== false
-  const via: CompareVia | undefined = previous ? { base: compare.base_run_id, reason: 'same_schedule' } : undefined
+  const via: CompareVia = { base: compare.base_run_id, reason: 'same_schedule' }
   const count = T.compareCount(compare.summary)
   return (
     <Link
@@ -157,10 +161,11 @@ function CompareLink({ runId, compare }: { runId: string; compare: ScheduleFireC
       state={via}
       title={T.compareTitle(compare.summary, previous ? null : shortId(compare.base_run_id))}
       data-fire-compare={compare.base_run_id}
+      data-fire-compare-previous={previous ? '1' : '0'}
       className="inline-flex shrink-0 items-center gap-1 rounded-sm text-2xs text-dim outline-none hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
     >
       <GitCompareArrows size={11} aria-hidden />
-      <span data-fire-compare-label="">{T.compareLink}</span>
+      <span data-fire-compare-label="">{previous ? T.compareLink : T.compareLinkLastOk}</span>
       {count && (
         <>
           <span aria-hidden>·</span>

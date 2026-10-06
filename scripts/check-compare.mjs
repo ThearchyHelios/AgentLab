@@ -9,10 +9,13 @@
 // 同一节点两条查询的 (node_id, ordinal) 相同；一边的 SQL 是 null；基准运行读不到；本次的记录读不到；不属于已保存
 // 工作流的运行；查找基准期间离开运行详情（新页面画好之后、或者地址刚换新页面还没画出来时答复才回来，走过的地址里
 // 都不能出现对比页）。下一步的提示要和页面上真能做的事对得上：下拉里没有能换的运行就不叫人去上方换，本次的记录
-// 不存在时不给注定失败的「重试」。
+// 不存在时不给注定失败的「重试」。默认基准的说法照服务端的挑法（api/compare.py 的 pick_base）写「上一次成功的运行」
+// ——上一次失败了，基准是再往前成功的那一次；定时任务触发历史里的「与上一次对比」和运行详情里的同名入口打开同一对
+// 运行、写同一句来历，基准不是紧挨着的上一次时触发历史上看得见的字写明「上一次成功的运行」。
 //
 // 全部用 page.route 假接口：虚构的「区域销售周报」三次已封存的正式运行和一次没封存的，运行详情、运行列表、
-// compare/base、compare、定时任务列表都在浏览器层答掉，别的 GET 放行（外壳要的工作流、待审批），非 GET 一律拦掉。
+// compare/base、compare、定时任务列表、发起它们的定时任务和触发历史都在浏览器层答掉，别的 GET 放行（外壳要的工作流、
+// 待审批），非 GET 一律拦掉。
 // 运行对比的两个接口只读，这里的假答复严格照接口约定的字段名和形状。
 //
 //   node scripts/check-compare.mjs
@@ -181,10 +184,30 @@ function comparison(target, base) {
 const LABEL = { unchanged: '未变', data_only: '只数据变', caliber_and_data: '口径与数据都变', sql_changed: 'SQL 结构变',
   params_only: '只参数变', added: '新增', removed: '移除', incomparable: '无法比较' }
 const ORDER = ['data_only', 'caliber_and_data', 'sql_changed', 'params_only', 'added', 'removed', 'incomparable', 'unchanged']
-const REASON = '默认基准：同一定时任务的上一次运行'
-const FINDING = '正在查找上一次运行'
+// 默认基准只挑比本次先发起、成功结束并封存的运行（服务端 api/compare.py 的 pick_base）：说法里都是「上一次成功的运行」
+const REASON = '默认基准：同一定时任务上一次成功的运行'
+const REASON_WORKFLOW = '默认基准：同一工作流、同一运行类别上一次成功的运行'
+const FINDING = '正在查找上一次成功的运行'
 /** 409、422、缺基准的 404 时下拉里没有能换的运行：不叫人去上方换，照实说 */
 const NO_OTHER = '同一工作流没有其他可换作基准的已封存运行'
+
+/**
+ * 发起本次和基准的定时任务（RUNS 里的 schedule_id）和它的触发历史：本次那一行带服务端自动对比的计数，基准是 B、不是
+ * 紧挨着的上一次（previous: false，假定 B 之后同一定时任务还有一次失败的；那一次不进 RUNS，换基准的下拉照旧）。
+ * 只给「两个入口拿同一个基准」那一段用：触发历史和运行详情「更多」里的同名入口，服务端用同一个函数挑基准
+ */
+const SCHEDULE_ID = 'sch0weekly'
+const SCHEDULE = {
+  id: SCHEDULE_ID, name: '区域销售周报 · 每周', workflow_id: WF, workflow_name: NAME, cron: '0 9 * * 1', timezone: 'Asia/Shanghai',
+  run_class: 'formal', input_template: {}, enabled: true, overlap: 'skip', misfire_grace_s: 3600, webhook: null,
+  next_run_at: '2026-10-12T01:00:00Z', last_fire: null, description_text: '每周一 09:00（Asia/Shanghai）', created_by: '值班分析员',
+  created_at: day('09-01'), updated_at: day('09-01'), version: 2,
+}
+const FIRE_T = 'fire0target'
+const FIRES = [{
+  id: FIRE_T, fire_at: day('10-05'), kind: 'scheduled', status: 'started', run_id: T, run_status: 'succeeded', reason: null,
+  notified: [], created_at: day('10-05'), compare: { base_run_id: B, previous: false, summary: SUMMARY },
+}]
 
 // ---------------------------------------------------------------- 假接口
 
@@ -247,6 +270,9 @@ function defaults(opts) {
       if (m[2] === '/artifacts') return { json: [] }
     }
     if (p === '/api/approvals' && url.searchParams.get('run_id')) return { json: [] }
+    // 发起本次的定时任务和它的触发历史（只有直接打开那个定时任务的页面时才用到）
+    if (p === `/api/schedules/${SCHEDULE_ID}`) return { json: SCHEDULE }
+    if (p === `/api/schedules/${SCHEDULE_ID}/fires`) return { json: { items: FIRES, next_before: null } }
     // 查找基准期间离开运行详情去的那一页（定时任务列表）：给空的列表，页面落定不靠服务端里有什么
     if (p === '/api/schedules') return { json: { items: [] } }
     return null
@@ -397,7 +423,7 @@ async function findingBase(answer = { json: { base_run_id: B, reason: 'same_sche
 
 await section('查找基准期间：看得见在做事，离开之后不再跳走', async () => {
   const { page, release, ended, noted, visited, errors } = await findingBase()
-  check('点了之后有「正在查找上一次运行」的提示', noted)
+  check('点了之后有「正在查找上一次成功的运行」的提示', noted)
   // 改主意去了别的页面。等那一页画好、运行详情卸下之后再放行：答复晚到也不能把人拽回对比页
   await page.evaluate((to) => { history.pushState({}, '', to); dispatchEvent(new PopStateEvent('popstate')) }, AWAY)
   await awaySettled(page)
@@ -474,6 +500,60 @@ await section('未封存的运行：入口不可点并说明原因', async () =>
   } finally {
     RUNS[T] = saved
   }
+})
+
+/** 在运行详情里点「更多」→「与上一次对比」，等对比页落定 */
+async function viaMenu(page) {
+  await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+  await page.getByRole('button', { name: '更多操作' }).click()
+  await page.locator('[data-menu=compare]').click()
+  await page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
+  await settled(page)
+}
+
+await section('默认基准的说法：上一次成功的运行', async () => {
+  // 服务端只挑比本次先发起、成功结束并封存的运行：上一次失败、取消了时基准是再往前成功的那一次，「上一次运行」是错的
+  for (const [reason, want] of [['same_schedule', REASON], ['same_workflow', REASON_WORKFLOW]]) {
+    const base = () => ({ json: { base_run_id: B, reason, base: refOf(B) } })
+    const menu = await open(`/runs/${T}`, { base })
+    await viaMenu(menu.page)
+    const fromMenu = (await maybeText(menu.page.locator('[data-compare-reason]'))).trim()
+    const self = await open(comparePath(T), { base })
+    await settled(self.page)
+    const fromPage = (await maybeText(self.page.locator('[data-compare-reason]'))).trim()
+    check(`${reason}：从运行详情进入、只带本次打开，都写「${want}」`, fromMenu === want && fromPage === want, `${fromMenu} | ${fromPage}`)
+    const pages = [await menu.page.locator('[data-compare-page]').innerText(), await self.page.locator('[data-compare-page]').innerText()]
+    check(`${reason}：页面上不出现「上一次运行」这类不分成败的说法`, pages.every((t) => !t.includes('上一次运行')))
+    check(`${reason}：页面没有报错`, ![...menu.errors, ...self.errors].length, [...menu.errors, ...self.errors].join('；'))
+    for (const c of opened) await c.close().catch(() => {})
+    opened.clear()
+  }
+})
+
+await section('运行详情与触发历史的「与上一次对比」：同一个基准、同一句来历', async () => {
+  // 两处的基准由服务端用同一个函数挑（api/compare.py 的 pick_base）：上一次失败了，两处都是再往前成功的 B
+  const menu = await open(`/runs/${T}`)
+  await viaMenu(menu.page)
+  const hist = await open(`/schedules/${SCHEDULE_ID}?tab=history`)
+  const link = hist.page.locator(`[data-fire-id="${FIRE_T}"] [data-fire-compare]`)
+  await link.waitFor({ timeout: 10000 })
+  const label = (await link.locator('[data-fire-compare-label]').innerText()).trim()
+  check('触发历史：基准不是紧挨着的上一次，链接上看得见的字写「与上一次成功的运行对比」', label === '与上一次成功的运行对比', label)
+  await link.click()
+  await hist.page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
+  await settled(hist.page)
+  const [a, b] = [new URL(menu.page.url()), new URL(hist.page.url())]
+  check('两个入口打开的是同一对运行（本次和基准都一样）', a.searchParams.get('target') === T && b.searchParams.get('target') === T
+    && a.searchParams.get('base') === B && b.searchParams.get('base') === B, `${a.search} | ${b.search}`)
+  const [ra, rb] = [(await maybeText(menu.page.locator('[data-compare-reason]'))).trim(),
+    (await maybeText(hist.page.locator('[data-compare-reason]'))).trim()]
+  check('两个入口写的默认基准一字不差：同一定时任务上一次成功的运行', ra === REASON && rb === REASON, `${ra} | ${rb}`)
+  const tiles = (page) => page.locator('[data-compare-summary] [data-compare-class]').evaluateAll((els) =>
+    els.map((e) => `${e.getAttribute('data-compare-class')}=${e.querySelector('[data-compare-count]')?.textContent?.trim()}`).join(' '))
+  const [ta, tb] = [await tiles(menu.page), await tiles(hist.page)]
+  check('两边的变化摘要一致', !!ta && ta === tb, `${ta} | ${tb}`)
+  check('没有发出写请求', ![...menu.blocked, ...hist.blocked].length, [...menu.blocked, ...hist.blocked].join('；'))
+  check('页面没有报错', ![...menu.errors, ...hist.errors].length, [...menu.errors, ...hist.errors].join('；'))
 })
 
 await section('两次运行与摘要', async () => {
