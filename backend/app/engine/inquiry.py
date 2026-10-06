@@ -14,12 +14,12 @@
    封存之后的追问查的是数据源现在的数据，任务里给报告生成的时间，回答末尾注明；触顶、查询失败、引用解析不了也在末尾注明
 3. 遮罩（_plan）：哪些列要遮照证据面板的规则（查询当时记下的，加上数据源现在设的），另按 SQL 认出改了名字的遮罩列
    （起别名、套函数、经子查询转一道、和 * 写在同一支里，_derived_hidden；认不出落在哪一列的，整份快照遮掉）；快照按列
-   遮，再按值遮（别的列里写着遮罩值的格子，_masked_view）。回答正文、查询清单里的遮罩值换成「已遮罩」（_Secrets、
-   _scrub_sql）：按值认有门槛；SQL 里的字面量按语法树认用在哪（_literal_uses），数字照原样留着的只有范围比较的边界
-   （同一个条件里没把某一个值夹住的，_pinned）和 LIMIT 的行数，而且同一个数在这条 SQL 别处没被换掉，封存的是实际
-   执行的语句；在找某一个值的（等值、IN、简单 CASE……）和别处够长的遮罩值都换。已经摆在读者眼前的值不换：问题和
-   选中原文里的、报告列出的指标和运行输入的值；SQL 里照原样留着的阈值只在回答正文里不换，格子照旧换。组装之后还
-   认得出遮罩值的，这份回答不交出去
+   遮，再按值遮（别的列里写着遮罩值的格子，_masked_view；质询工件里，文字格里夹着的遮罩值另按子串换）。回答正文、
+   查询清单里的遮罩值换成「已遮罩」（_Secrets、_scrub_sql）：按值认有门槛；SQL 里的字面量按语法树认用在哪
+   （_literal_uses），数字照原样留着的只有范围比较的边界（同一个条件里没把某一个值夹住的，_pinned）和 LIMIT 的行数，
+   而且同一个数在这条 SQL 别处没被换掉，封存的是实际执行的语句；在找某一个值的（等值、IN、简单 CASE……）和别处够长的
+   遮罩值都换。已经摆在读者眼前的值不换：问题和选中原文里的、报告列出的指标和运行输入的值；SQL 里照原样留着的阈值
+   只在回答正文里不换，格子照旧换。组装之后还认得出遮罩值的，这份回答不交出去
 4. 写入（_record）：一条 approval.inquiry 事件，node_id 为空，用量写在数据的 usage 里（计进运行用量，见 runner 的
    _usage_of_events）。质询的查询快照只放在 inquiry_artifacts / queries 里，绝不放在 query_artifact 下：证据接口按那个键
    收集封存的查询，会把质询的查询当成报告的证据。回答期间运行状态变了（被批准、被放弃、继续运行之后重新封存），
@@ -1085,11 +1085,16 @@ def _scrubbed_source(text: str, secrets: _Secrets) -> str:
     return "".join(out)
 
 
-def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets) -> tuple[dict[str, Any], list[str]]:
+def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, *, embedded: bool = False
+                 ) -> tuple[dict[str, Any], list[str]]:
     """一份查询快照遮好的样子和遮掉的列：要遮的列（hidden，小写）每一格都换成「已遮罩」、类型记成文本（渲染时不当数）；
     别的列里写着按值认得出的遮罩值的格子也换（另一张表里没设遮罩的同一个手机号、改了名字没认出来的遮罩列）。
     列名里写着遮罩值的（agent 把遮罩值写进了别名，「13900000001 的单」），列名也换（同 SQL 里的名字，_scrub_sql）。
-    原快照不动；没有要遮的返回原快照。"""
+    原快照不动；没有要遮的返回原快照。
+
+    embedded 只给质询工件用：别的列里一格文字夹着遮罩值（备注里写着手机号），把那一截换成「已遮罩」，这一格别的字
+    照原样，门槛同整格（_Secrets.scrub）；这一列不记进遮掉的列——界面把记进去的列整列画成「已遮罩」，这一列在数据源
+    里也没设遮罩。回答一路不这样换：渲染出来露了就整份不交（_leaked），不然回答被问的那一格看着像查到了别的东西。"""
     columns = [str(c) for c in snapshot.get("columns") or []]
     index = {i for i, c in enumerate(columns) if c.lower() in hidden}
     by_value = bool(secrets.strong)
@@ -1097,16 +1102,24 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets) 
         return snapshot, []
     word = _masked_word()
     touched = set(index)
+    edited = False
     position = {c: i for i, c in enumerate(columns)}
     names = [secrets.scrub(c) for c in columns] if by_value else columns
 
     def cell(i: int | None, value: Any) -> Any:
+        nonlocal edited
         if i in index:
             return word
         if by_value and secrets.hit(value):
             if i is not None:
                 touched.add(i)
             return word
+        if embedded and by_value and isinstance(value, (str, dict, list)):
+            # JSON 列（对象、数组）按界面画出来的样子换，换过的照文字给
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+            if (scrubbed := secrets.scrub(text)) != text:
+                edited = True
+                return scrubbed
         return value
 
     def key(k: Any) -> Any:
@@ -1123,7 +1136,7 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets) 
         else:
             rows.append(row)
     renamed = names != columns
-    if not touched and not renamed:
+    if not touched and not renamed and not edited:
         return snapshot, []
     types = {key(k): v for k, v in snapshot["column_types"].items()} \
         if isinstance(snapshot.get("column_types"), dict) else {}
@@ -1745,12 +1758,14 @@ async def _source_kinds(names: Iterable[str]) -> dict[str, str | None]:
 
 
 async def _plan(own: dict[str, dict[str, Any]], others: list[dict[str, Any]], given: list[str | None],
-                shown: list[tuple[str, str, str]] | None = None, live: dict[str, list[str]] | None = None) -> _Plan:
+                shown: list[tuple[str, str, str]] | None = None, live: dict[str, list[str]] | None = None, *,
+                embedded: frozenset[str] = frozenset()) -> _Plan:
     """own：agent 自己的查询快照（工件 id → 内容）；others：报告自己的查询快照（被问的那句可能直接写着遮罩列的值，
     agent 会照着复述、写进查询条件）；given：问题、选中的原文、报告里列出的指标和运行输入的值（都已经摆在读者眼前，
     里面的值哪里都不换）；shown：agent 执行的查询，(SQL, 数据源名, 快照工件 id)（照原样留在 SQL 里的阈值、LIMIT，
     回答正文里不换，见 _Secrets.show；取质询工件不用：快照里的格子照旧按值遮）；live：用得上的数据源现在设的遮罩列
-    （快照没取到的查询按它认 SQL 里的比较，见 _compared）。
+    （快照没取到的查询按它认 SQL 里的比较，见 _compared）；embedded：这几份快照的文字格里夹着的遮罩值也按子串换
+    （只给要取的那份质询工件，见 _masked_view）。
 
     查数据源的遮罩要读库，在这里读；解析 SQL、收上万个值、逐格比对是纯计算，放进线程：放在事件循环里会挡住同一进程
     里别的运行（同 tools/datasource 的 _sql_checks）。"""
@@ -1762,12 +1777,13 @@ async def _plan(own: dict[str, dict[str, Any]], others: list[dict[str, Any]], gi
     based = [(snapshot, (await _hidden_columns(snapshot, masks))[0]) for snapshot in others]
     kinds = await _source_kinds([*(str(s.get("source") or "") for s in [*own.values(), *others]),
                                  *(name for _, name, _ in shown)])
-    return await asyncio.to_thread(_settle_plan, own, named, based, kinds, given, shown, live or {})
+    return await asyncio.to_thread(_settle_plan, own, named, based, kinds, given, shown, live or {}, embedded)
 
 
 def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str], list[str]]],
                  based: list[tuple[dict[str, Any], set[str]]], kinds: dict[str, str | None],
-                 given: list[str | None], shown: list[tuple[str, str, str]], live: dict[str, list[str]]) -> _Plan:
+                 given: list[str | None], shown: list[tuple[str, str, str]], live: dict[str, list[str]],
+                 embedded: frozenset[str]) -> _Plan:
     secrets = _Secrets()
     hidden: dict[str, set[str]] = {}
     tainted: dict[str, set[str]] = {}
@@ -1784,7 +1800,8 @@ def _settle_plan(own: dict[str, dict[str, Any]], named: dict[str, tuple[set[str]
     views: dict[str, dict[str, Any]] = {}
     masked: dict[str, list[str]] = {}
     for artifact, snapshot in own.items():
-        views[artifact], masked[artifact] = _masked_view(snapshot, hidden[artifact], secrets)
+        views[artifact], masked[artifact] = _masked_view(snapshot, hidden[artifact], secrets,
+                                                         embedded=artifact in embedded)
     return _Plan(views=views, masked=masked, tainted=tainted, kinds=kinds, secrets=secrets,
                  gone={artifact: named[artifact][1] for artifact in own})
 
@@ -2135,8 +2152,8 @@ async def _report_material(run_id: str, reports: Iterable[Any]) -> tuple[list[di
 
 
 async def inquiry_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
-    """质询引用过的工件：查询快照（遮罩照回答时的办法，SQL 用事件里记下的那条，两处一字不差）、回答文档（组装时就遮好
-    了）、回答里引用的报告口径卡。{id, content, masked[, mask_note]}。
+    """质询引用过的工件：查询快照（遮罩照回答时的办法，另把文字格里夹着的遮罩值按子串换掉；SQL 用事件里记下的那条，
+    两处一字不差）、回答文档（组装时就遮好了）、回答里引用的报告口径卡。{id, content, masked[, mask_note]}。
 
     认的是这次运行的质询事件引用过的，加上没写进运行记录、还留在进程里的回答（_HELD）引用过的；别的一律 404。"""
     from app.api.evidence import SOURCE_GONE
@@ -2158,7 +2175,8 @@ async def inquiry_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
         return {"id": artifact_id, "content": content, "masked": []}
     # 遮罩值照回答时收：引用它的那几条质询各自查到的全部快照（查询条件里写着的值，不一定在这一份的结果里），加上报告
     # 自己的查询快照；免遮的也照回答时：提问人自己写的、报告里列出的指标和运行输入的值。SQL 里照原样留着的阈值只在
-    # 回答正文里不遮，格子照旧按值遮，这里不用
+    # 回答正文里不遮，格子照旧按值遮，这里不用。文字格里夹着的遮罩值按子串换（embedded）：回答那边渲染出来露了就整份
+    # 不交，这份快照却照样记在事件里、点得开，不换就等于在「不予展示」旁边把原值摆出来
     own: dict[str, dict[str, Any]] = {artifact_id: content}
     for data in referenced:
         for other in dict.fromkeys(str(a) for a in data.get("inquiry_artifacts") or []):
@@ -2166,7 +2184,7 @@ async def inquiry_artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
                 own[other] = snapshot
     others, values = await _report_material(run_id, (d.get("report") for d in referenced))
     asked = [t for d in referenced for t in (d.get("question"), d.get("quote")) if isinstance(t, str)]
-    plan = await _plan(own, others, [*asked, *values])
+    plan = await _plan(own, others, [*asked, *values], embedded=frozenset({artifact_id}))
     shown = plan.views[artifact_id]
     recorded = next((q["sql"] for d in referenced for q in d.get("queries") or []
                      if isinstance(q, dict) and q.get("artifact") == artifact_id and isinstance(q.get("sql"), str)),

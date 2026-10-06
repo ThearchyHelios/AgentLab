@@ -14,7 +14,8 @@
   两个选出列、UNION 两支、WHERE 和 HAVING 各写一边共用的边界是阈值；列名认不出的只和写得一样的表达式配
 - 阈值只在同一个数在这条 SQL 别处确实被换掉时才不留（换不换和 SQL 里换字面量是同一套判断）：日期、天数、标签里写着
   同一个短的数，没设遮罩的列上的等值，都不牵连阈值
-- 快照按列遮，另按值遮：别的列里写着遮罩值的格子也换成「已遮罩」；列名里写着遮罩值的，列名也换
+- 快照按列遮，另按值遮：别的列里写着遮罩值的格子也换成「已遮罩」；列名里写着遮罩值的，列名也换；质询工件里，
+  没设遮罩的列里一格文字夹着的遮罩值按子串换（回答一路照旧整份不交）
 - 组装回答之后还认得出遮罩值的（正文里复述的阈值除外），不交出去
 - 遮罩值上万个时换一遍也不卡：不现编上万个分支的正则；上千个条件连成一长串照样按结构认，成百个分档边界看不过来的
   按夹住算，也不卡
@@ -640,6 +641,32 @@ def test_an_answer_still_showing_a_masked_value_is_not_handed_out():
         inquiry_mod._compose("备注是 [[v:Q1.r0.备注]]。", catalog, run_id="r1", views=views, secrets=secrets, allow=[])
     doc = inquiry_mod._compose("没有遮罩值。", catalog, run_id="r1", views=views, secrets=secrets, allow=[])
     assert doc["markdown"] == "没有遮罩值。"
+
+
+def test_a_masked_value_inside_a_text_cell_is_cut_out_of_the_artifact_view():
+    """质询工件这一路（embedded）：没设遮罩的列里一格文字夹着遮罩值，把那一截换成「已遮罩」，这一格别的字、别的格子
+    照原样；这一列不记进 masked（界面会把记进去的列整列画成「已遮罩」，这一列在数据源里也没设遮罩）。门槛同回答
+    一路：短的数不按值换。回答一路不这样换，渲染出来露了就整份不交（上一条测试）。"""
+    secrets = secrets_of({"columns": ["phone", "age"], "rows": [["13900000001", 25]]}, {"phone", "age"})
+    snapshot = {"columns": ["区域", "备注", "金额"], "column_types": {"金额": "number"},
+                "rows": [["华东", "客户13900000001来电改址", 1200], ["华南", "例行回访，25 岁", 900]]}
+    view, masked = inquiry_mod._masked_view(snapshot, set(), secrets, embedded=True)
+    assert view["rows"] == [["华东", "客户已遮罩来电改址", 1200], ["华南", "例行回访，25 岁", 900]]
+    assert masked == [] and view["column_types"] == {"金额": "number"}
+    assert snapshot["rows"][0][1] == "客户13900000001来电改址", "原快照不动"
+    as_dicts = {**snapshot, "rows": [{"区域": "华东", "备注": "客户13900000001来电改址", "金额": 1200}]}
+    assert inquiry_mod._masked_view(as_dicts, set(), secrets, embedded=True)[0]["rows"] == [
+        {"区域": "华东", "备注": "客户已遮罩来电改址", "金额": 1200}]
+    # JSON 列（对象）按界面画出来的样子换，换过的照文字给
+    nested = {"columns": ["联系人"], "rows": [[{"电话": "13900000001", "年龄": 25}]]}
+    assert inquiry_mod._masked_view(nested, set(), secrets, embedded=True)[0]["rows"] == [
+        ['{"电话": "已遮罩", "年龄": 25}']]
+    # 整格就是遮罩值的照旧整格换、记进 masked；按列遮的照旧
+    whole = {"columns": ["联系方式", "备注"], "rows": [["13900000001", "回电 13900000001"]]}
+    view, masked = inquiry_mod._masked_view(whole, set(), secrets, embedded=True)
+    assert view["rows"] == [[MASKED, "回电 已遮罩"]] and masked == ["联系方式"]
+    # 回答一路照旧：文字格不动，交给最后一道关
+    assert inquiry_mod._masked_view(snapshot, set(), secrets)[0] is snapshot
 
 
 def test_report_values_that_happen_to_be_masked_values_are_shown():

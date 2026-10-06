@@ -15,7 +15,8 @@
   遮罩列的值；换着写法找某一个客户（简单 CASE、IN (VALUES …)、两头相同的范围、行值、选出列里写着同一个号码……）
   也一样；遮罩值不误伤阈值、天数、LIMIT（长的数也一样）、提问人自己写的数、报告口径卡里的指标，分档共用的边界、
   和日期、天数修饰、标签里写着的同一个数也不牵连阈值；SQL 里照原样留着的阈值只在回答正文里不遮，格子照旧按值遮，
-  回答和质询工件对得上；质询工件按值遮只出现在报告快照里的遮罩值
+  回答和质询工件对得上；质询工件按值遮只出现在报告快照里的遮罩值；一格文字里夹着遮罩值时回答整份不交，质询工件里
+  只换掉那一截
 - 接线：设置里的上限、运行固定的数据版本交到 agent 手里（上传表格重传之后查的仍是运行固定的那一版）；同名重建的
   数据源、没固定过版本的上传表格不查
 - 触顶、失败照样记一条事件，说法给提问人看得懂、说下一步；轮数用完不算查询次数到顶，查询失败、引用解析不了在末尾注明
@@ -1243,6 +1244,44 @@ async def test_a_value_seen_only_in_the_reports_snapshot_is_masked_in_the_artifa
         assert got.status_code == 200, got.text
         assert got.json()["content"]["rows"] == [["已遮罩", 5], ["已遮罩", 2]]
         assert got.json()["masked"] == ["号码"] and "1390000000" not in got.text
+    finally:
+        await engines.invalidate(source_id)
+
+
+#: 另有一张回访记录：备注里写着手机号，备注这一列没设遮罩
+CALLBACKS = SALES + ("CREATE TABLE callbacks (id INTEGER PRIMARY KEY, region TEXT, note TEXT);"
+                     "INSERT INTO callbacks VALUES (1, '华东', '客户13900000001来电改址'), (2, '华南', '例行回访');")
+#: 回答中含有遮罩值、整份不交时给提问人的说法
+LEAKED = "回答中含有设了遮罩的值，无法遮住，已不予展示，请换个问法重新提问"
+
+
+async def test_a_masked_value_inside_a_text_cell_is_cut_out_of_the_artifact(monkeypatch, tmp_path, client):
+    """备注里写着手机号（备注没设遮罩，手机号设了遮罩、被报告取数选中）：agent 引用这一格，回答照旧整份不交；
+    质询工件里这份快照照样记着、点得开，那一格里的号码换成「已遮罩」，别的字、别的格子照原样，不然「不予展示」
+    旁边一点就能看到原值。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "buyer_phone"}, script=CALLBACKS)
+    notes = "SELECT region AS 区域, note AS 备注 FROM callbacks ORDER BY id"
+    plays = {"回访": Play([notes], "华东的回访备注是 [[v:Q1.r0.备注]]。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="金额最高的一笔 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        report_sql = "SELECT buyer_phone, amount AS 金额 FROM sales ORDER BY amount DESC"
+        paused = await pause(name, graph=fetching(name, report_sql))
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="华东的回访说了什么？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        assert "1390000000" not in r.text
+        item = r.json()["inquiry"]
+        assert (item["answer"]["ok"], item["answer"]["text"], item["answer"]["doc_artifact"]) == (False, "", None)
+        assert item["answer"]["error"] == LEAKED
+        [query] = item["queries"]
+        assert query["sql"] == notes
+        [event] = await events(paused.id, "approval.inquiry")
+        assert event.data["inquiry_artifacts"] == [query["artifact"]]
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+        assert got.status_code == 200, got.text
+        assert got.json()["content"]["rows"] == [["华东", "客户已遮罩来电改址"], ["华南", "例行回访"]]
+        assert got.json()["masked"] == [] and "1390000000" not in got.text
     finally:
         await engines.invalidate(source_id)
 
