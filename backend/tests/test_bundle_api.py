@@ -5,7 +5,8 @@
 
 - 只给已封存且封存核对一致的运行：没封存、封存后被改过都回 409；
 - 导出的数据里，事件行按浏览器的拼法重算等于运行记下的 manifest_hash；
-- 遮罩库的快照只有 id 没有内容，它的查询事件只有哈希；运行之后才设的遮罩同样生效；
+- 遮罩库上选出了号码的快照只有 id 没有内容，它的查询事件只有哈希；运行之后才设的遮罩同样生效；同一个库上只汇总消费额
+  （没碰号码列）的那次查询，快照照常随文件附带；
 - 附件名是「<运行名>-可验证报告.html」，中文名按 RFC 5987 编码；
 - 只读：导出前后运行记录、事件一条不多一条不少。
 
@@ -91,11 +92,12 @@ def node(nid, ntype, **config):
     return {"id": nid, "type": ntype, "position": {"x": 0, "y": 0}, "data": {"label": nid, "config": config}}
 
 
-def weekly(text_nodes=()):
+def weekly(text_nodes=(), queries=()):
     nodes = [
         node("start", "input"),
         node("fetch", "tool", tool="db_query__bundle_shop", args={"sql": SHOP_SQL}),
         node("members", "tool", tool="db_query__bundle_crm", args={"sql": CRM_SQL}),
+        *queries,
         node("card", "metrics", caliber="周报口径", caliber_version="v2", metrics=[
             {"id": "gmv", "name": "销售额", "unit": "元", "decimals": 1, "format": "thousands",
              "expression": "cell(nodes.fetch, 0, 'amount')"}]),
@@ -194,6 +196,33 @@ async def test_the_masked_source_ships_only_hashes(client, monkeypatch):
     out = next(e for e in bundle["events"] if e["type"] == "node.finished" and e["node_id"] == "out")
     finished = next(e for e in bundle["events"] if e["type"] == "run.finished")
     assert "canonical" not in out and "canonical" not in finished
+    assert "000-0001" not in json.dumps(bundle, ensure_ascii=False)
+
+
+async def test_an_aggregate_on_the_masked_source_ships_its_snapshot(client, monkeypatch):
+    """会员库设了号码遮罩，另一次查询只汇总了消费额（没碰号码列）：数据源查询工具真落的快照随文件附带，原字节和服务端的
+    文件一致，查询事件带规范字符串，报告里引用它的数字和快照里那一格对得上；选出了号码的那份照旧只给 id。"""
+    script(monkeypatch, "会员消费合计 [[v:Q3.r0.spend]]，会员林一 [[v:Q2.r0.spend]]。[[see:Q3]]")
+    total = node("total", "tool", tool="db_query__bundle_crm",
+                 args={"sql": "SELECT COUNT(*) AS members, SUM(spend) AS spend FROM members"})
+    row = await wait((await run_manager.start(graph=weekly(queries=[total]), input_payload={})).id)
+    assert row.status == "succeeded", row.error
+    crm, summed = await query_artifact(row.id, "members"), await query_artifact(row.id, "total")
+    assert json.loads(file_of(summed).read_bytes())["mask_columns"] == ["phone"]
+
+    bundle = data_of((await client.get(f"/api/runs/{row.id}/bundle.html")).text)
+    by_id = {a["id"]: a for a in bundle["artifacts"]}
+    assert base64.b64decode(by_id[summed]["b64"]) == file_of(summed).read_bytes()
+    assert by_id[crm] == {"id": crm, "kind": "query", "node_id": "members", "masked": True}
+    ends = {e["node_id"]: e for e in bundle["events"] if e["type"] == "tool.end"}
+    assert "canonical" in ends["total"] and "canonical" not in ends["members"]
+
+    doc = json.loads(base64.b64decode(next(a["b64"] for a in bundle["artifacts"] if a["kind"] == "report_doc")))
+    assert doc["catalog"]["Q3"]["artifact"] == summed
+    [seg] = [s for b in doc["blocks"] for u in b["units"] for s in u["segments"]
+             if (s.get("cite") or {}).get("alias") == "Q3"]
+    snapshot = json.loads(base64.b64decode(by_id[summed]["b64"]))
+    assert seg["cite"]["status"] == "resolved" and seg["cite"]["value"] == snapshot["rows"][0][1] == 508.5
     assert "000-0001" not in json.dumps(bundle, ensure_ascii=False)
 
 
