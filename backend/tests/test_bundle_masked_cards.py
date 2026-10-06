@@ -2,7 +2,8 @@
 
 以前只有查询快照会因遮罩不随文件附带，口径卡一律原样嵌入：证据面板上已经遮住的号码（cell() 取的遮罩格、按位置取的
 vars.res.rows[0][1]），在这份要发给别人的文件里照样看得到。认哪个输入取自哪份查询结果的哪几列，和证据面板、推演同一个
-认法（recompute.input_origin）；核对不了的宁可多挡。
+认法（recompute.input_origin）；核对不了的宁可多挡。那几列算不算遮罩列，除了列名对上的，SQL 里给遮罩列起了别名、套了函数、
+经子查询或 WITH 转了一道的也算（同质询、双盲复算的 inquiry._derived_hidden）：卡上取的 tel 可能就是 phone AS tel。
 
 服务端的卡文件被改过（哈希对不上）也照卡上记的输入认：嵌进去的是原字节，号码照样在里面。读得出字节、却解析不出一张卡
 （截断的 JSON、不是对象）的，认不出输入，整张按带遮罩算、不嵌：和读不出来的快照按带遮罩算是同一个道理。
@@ -87,6 +88,106 @@ def test_a_card_reading_only_unmasked_columns_is_embedded():
     card = card_with([cell_input("spend", 320.0)], substituted="320.0", expression="cell(nodes.members, 0, 'spend')")
     _, entry = bundle_of(card)
     assert "masked" not in entry and base64.b64decode(entry["b64"]) == stored(card)[1]
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT name, phone AS tel, spend FROM members",
+    "SELECT name, tel, spend FROM (SELECT name, phone AS tel, spend FROM members) t",
+    "WITH c AS (SELECT name, SUBSTR(phone, 1) AS tel, spend FROM members) SELECT name, tel, spend FROM c",
+])
+def test_a_card_reading_a_renamed_masked_column_ships_only_its_id(sql):
+    """查询给号码起了别名、经子查询或 WITH 转了一道：卡上取的 tel 那一格就是号码。改了名字的遮罩列按 SQL 认（同质询、
+    双盲复算的 inquiry._derived_hidden），整张卡只给 id。以前只按列名认，号码原样进了文件。"""
+    snap = {**SNAP_MASKED, "columns": ["name", "tel", "spend"], "sql": sql}
+    snap_id, raw = stored(snap)
+    item = {**cell_input("tel", PHONE), "artifact": snap_id, "path": "cell(nodes.members, 0, 'tel')"}
+    bundle, entry = bundle_of(card_with([item], expression="len(cell(nodes.members, 0, 'tel'))"),
+                              files_changed={snap_id: raw})
+    assert entry.get("masked") is True and "b64" not in entry
+    assert PHONE not in render_html(bundle)
+
+
+@pytest.mark.parametrize("sql", [
+    # 列名表按位置改了名
+    "SELECT name, c AS tel, spend FROM members AS m(a, b, c)",
+    # 整行引用：FROM 里的表函数不写 LATERAL 也看得见前面的来源，整行一列列摊开；直接把整行转成文字
+    "SELECT name, j.value AS tel, spend FROM members m, jsonb_each_text(to_jsonb(m)) j",
+    "SELECT name, to_json(m)::text AS tel, spend FROM members m",
+    # UNION 一支里的 * 按位置对上第一支的列名
+    "SELECT name, tel, spend FROM (SELECT 'x' AS name, 'y' AS tel, 0 AS spend UNION ALL SELECT * FROM members) t",
+    # FROM 里的表函数吃进遮罩列，交出的列叫别的名字
+    "SELECT name, value AS tel, spend FROM members m, json_each_text(json_build_object('p', phone)) j",
+    # 不点列名也读得出表里内容；语法树认不准数据库实际执行什么
+    "SELECT name, table_to_xml('members', true, false, '')::text AS tel, spend FROM members",
+    "SELECT name, /*!50000 phone AS */ tel, spend FROM members",
+    # 函数记法交出整行的文字写法；表函数看不见排在它后面的派生来源里叫 m 的列，m 还是整行
+    "SELECT name, m.record_out AS tel, spend FROM members m",
+    "SELECT name, value AS tel, spend FROM members m, jsonb_each_text(to_jsonb(m)), (SELECT 1 AS m) s",
+])
+def test_a_card_reading_a_column_whose_origin_the_sql_hides_ships_only_its_id(sql):
+    """快照的 SQL 认不出结果里哪一列取自哪一列（快照本身因此只给哈希）：卡上取的 tel 可能就是号码，整份快照的列都按
+    遮罩列算，整张卡只给 id。以前这条路只按列名和改了名字的遮罩列认，快照只给哈希，卡上记着的号码却原样进了文件。"""
+    snap = {**SNAP_MASKED, "columns": ["name", "tel", "spend"], "sql": sql}
+    snap_id, raw = stored(snap)
+    item = {**cell_input("tel", PHONE), "artifact": snap_id, "path": "cell(nodes.members, 0, 'tel')"}
+    bundle, entry = bundle_of(card_with([item], expression="len(cell(nodes.members, 0, 'tel'))"),
+                              files_changed={snap_id: raw})
+    assert entry.get("masked") is True and "b64" not in entry, sql
+    assert PHONE not in render_html(bundle)
+
+
+@pytest.mark.parametrize("sql", [
+    # 每种读法都解析不了：PG17 起的 JSON_QUERY … WITH WRAPPER（这里把整行装进了 tel）、ORDER BY … USING
+    "SELECT name, JSON_QUERY(to_jsonb(m), '$.*' WITH WRAPPER) AS tel, spend FROM members m",
+    "SELECT name, value AS tel, spend FROM members m, jsonb_each_text(to_jsonb(m)) ORDER BY value USING <",
+    "SELECT name, tel, spend FROM (SELECT * FROM members) AS x(name, tel, spend) ORDER BY spend USING <",
+    # 没有 SQL（数据源查询工具落的快照都带着）、SQL 是空的
+    None,
+    "",
+])
+def test_a_card_reading_a_snapshot_whose_sql_does_not_parse_ships_only_its_id(sql):
+    """快照的 SQL 每种读法都解析不了（或者根本没有）：快照本身只给哈希（_untouched），认不出结果里哪一列取自哪一列，
+    卡上取自这份快照任一列的输入都按遮罩列算，整张卡只给 id——和快照同一个结论。以前这条路退回按 SQL 认遮罩列的那一套，
+    解析不了时它只看 SQL 里写没写着 phone：没写就只认 phone 本身，卡上取的 tel 是整行、号码原样进了文件。"""
+    snap = {**SNAP_MASKED, "columns": ["name", "tel", "spend"], "sql": sql}
+    if sql is None:
+        del snap["sql"]
+    snap_id, raw = stored(snap)
+    for column, value in (("tel", PHONE), ("spend", 320.0)):
+        item = {**cell_input(column, value), "artifact": snap_id, "path": f"cell(nodes.members, 0, '{column}')"}
+        bundle, entry = bundle_of(card_with([item], substituted=repr(value),
+                                            expression=f"len(cell(nodes.members, 0, '{column}'))"),
+                                  files_changed={snap_id: raw})
+        assert entry.get("masked") is True and "b64" not in entry, (sql, column)
+        assert PHONE not in render_html(bundle)
+
+
+@pytest.mark.parametrize("sql, columns", [
+    ("SELECT name, phone AS tel, spend FROM members", ["name", "tel", "spend"]),
+    # 最外层的 * 照原来的名字展开：号码还在 phone 那一列
+    ("SELECT * FROM members", ["name", "phone", "spend"]),
+])
+def test_a_card_reading_an_unrenamed_column_of_that_query_is_embedded(sql, columns):
+    """同一条查询，卡上取的是消费额（不取自号码）：照常嵌入。"""
+    snap = {**SNAP_MASKED, "columns": columns, "sql": sql}
+    snap_id, raw = stored(snap)
+    item = {**cell_input("spend", 320.0), "artifact": snap_id}
+    card = card_with([item], substituted="320.0", expression="cell(nodes.members, 0, 'spend')")
+    _, entry = bundle_of(card, files_changed={snap_id: raw})
+    assert "masked" not in entry and base64.b64decode(entry["b64"]) == stored(card)[1]
+
+
+def test_an_error_while_finding_renamed_columns_masks_the_whole_snapshot(monkeypatch):
+    """按 SQL 认改了名字的遮罩列时出了意外：认不出哪几列取自遮罩列，整份快照的列都按遮罩算，卡上取消费额也只给 id。"""
+    from app.engine import inquiry
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("解析器坏了")
+
+    monkeypatch.setattr(inquiry, "_derived_hidden", broken)
+    card = card_with([cell_input("spend", 320.0)], substituted="320.0", expression="cell(nodes.members, 0, 'spend')")
+    _, entry = bundle_of(card)
+    assert entry.get("masked") is True and "b64" not in entry
 
 
 def test_a_mask_set_on_the_source_now_counts_too():
