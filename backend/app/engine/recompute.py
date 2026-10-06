@@ -15,7 +15,9 @@
   - vars.*：有 value_artifact（口径卡当时另存的完整值）才还原得出来；老运行照实说当时没有保存
   - 容器本身是一份查询结果（带 artifact 的 {columns, rows}，或者和某份快照的 rows 一模一样的列表）：排除行就去掉那几行
 - 遮罩列取来的输入不给值、也不拿来推演：改一个输入、排除一行，新值和原值一比就能算出遮住的那一格。vars.res.rows[0][2]
-  这种按位置取自查询结果的标量没有定位，顺着取值链认出是哪一列（positional_cell，证据面板的指标步骤用同一个认法）
+  这种按位置取自查询结果的标量没有定位，顺着取值链认出是哪一列（positional_cell，证据面板的指标步骤用同一个认法）。
+  用到了遮罩列的指标，它本身的原值同样写「已遮罩」（hides_value，证据面板指标步骤的值同一个判断）：指标的值可能就是
+  那一格，输入里拿掉了、指标上照给，等于没遮
 - 落在读不出来（文件不在、与哈希不一致）的查询快照上的输入同样不给值、不推演：那一格遮没遮核对不了，宁可多遮
 
 有的指标不论改什么都推演不了（_Plan.blocked）：卡上没记全输入、用到了遮罩列、最外层的输入还原不了（容器的完整值
@@ -208,6 +210,13 @@ class _Plan:
             if problem := self.inputs[path].problem:
                 return "unsupported", f"无法推演：{path}（{problem}）"
         return None
+
+    @property
+    def hides(self) -> bool:
+        """指标的原值也不给（hides_value 同一个判断）：用到了遮罩列，或者最外层的输入遮没遮核对不了。成立时一定推演
+        不了（blocked 不为 None），新值本来就是空的。"""
+        return _hides(self.tops, [p for p, i in self.inputs.items() if i.masked],
+                      [p for p, i in self.inputs.items() if i.unreadable])
 
     @property
     def stuck(self) -> str | None:
@@ -872,7 +881,7 @@ def _result(plan: _Plan, status: str, new: Any, reason: str | None, values: dict
         else substitute(plan.tree, values) if status == "ok" and plan.tree is not None else None
     if any(inp.masked or inp.unreadable for inp in plan.inputs.values()):
         substituted = None      # 代入式里代进去的就是遮罩列（或者遮没遮核对不了）的那一格
-    return {
+    out = {
         "id": metric.get("id"), "name": metric.get("name") or metric.get("id"), "unit": metric.get("unit") or "",
         "decimals": metric.get("decimals"), "format": metric.get("format") or DEFAULT_FORMAT,
         "old": _finite(old), "new": _finite(new), "delta": delta,
@@ -882,6 +891,13 @@ def _result(plan: _Plan, status: str, new: Any, reason: str | None, values: dict
         "status": status, "reason": reason, "substituted": substituted,
         "inputs": [_input_view(inp, values, notes, blocked=blocked) for inp in plan.inputs.values()],
     }
+    if plan.hides:
+        # 指标的值就是（或者算自）遮罩列的那一格：原值同样写「已遮罩」。以前输入里拿掉了、指标的 old 照给，同一个号码
+        # 换个地方照样看得到；原因在 reason 里（推演不了的原因）。本来就没有值的照旧是空的，缺输入还得看得出来
+        out["withheld"] = True
+        if old is not None:
+            out["old"] = out["rendered_old"] = _masked_word()
+    return out
 
 
 def _render(metric: dict[str, Any], value: Any, conv: str | None = None) -> str:
@@ -1026,6 +1042,35 @@ def _fixed(inp: _Input) -> str | None:
     return None if value is None or is_number(value) else NOT_NUMBER
 
 
+def hides_value(metric: dict[str, Any], masked: Iterable[str], unverified: Iterable[str] = ()) -> bool:
+    """指标本身的值要不要一并不给（推演的原值、证据面板指标步骤的值）：masked、unverified 是取自遮罩列、遮没遮核对不了
+    的输入的路径。
+
+    - 有输入取自遮罩列：不给，哪怕它只嵌在下标里（推演把整个指标按遮罩处理，_Plan.blocked）。指标的值可能就是那一格
+      （cell(nodes.q, 0, 'phone')），也可能是算出来的数，宁可多遮：改一个别的输入、拿指标的值一减，就能算出遮住的那一格
+    - 最外层的输入遮没遮核对不了：不给，它的值就在指标值里。只嵌在下标里的不算：它只决定取哪一格，取到的值卡上另记着
+    认不出最外层引用（表达式有误）时，有一个遮没遮核对不了就不给。"""
+    masked, unverified = set(masked), set(unverified)
+    if masked or not unverified:
+        return bool(masked)
+    try:
+        tops, _ = _refs(parse_expression(str(metric.get("expression") or ""))[0])
+    except ExpressionError:
+        return True
+    return _hides(tops, masked, unverified)
+
+
+def _hides(tops: Iterable[str], masked: Iterable[str], unverified: Iterable[str]) -> bool:
+    return any(True for _ in masked) or bool(set(unverified) & set(tops))
+
+
+def _masked_word() -> str:
+    """「已遮罩」：证据面板、推演同一个说法。api.evidence 导入了这个模块，用到时再导入。"""
+    from app.api.evidence import MASKED
+
+    return MASKED
+
+
 def substituted_without(metric: dict[str, Any], paths: Iterable[str], token: str) -> str | None:
     """卡上的代入式，只把 paths 这几个输入代成 token（证据面板给取自遮罩列的输入写「已遮罩」），别的照卡上代。
 
@@ -1062,6 +1107,7 @@ def report_segments(reports: Iterable[tuple[str, dict[str, Any]]], *, card_node:
     只认指向这张卡这一份指标集的引用（目录条目的 node_id、artifact）：循环里同一张卡算过几次，报告引用的是哪一次
     就是哪一次。新值按片段自己的换算（|万、|pct……）渲染，和报告里的字同一套规则。指标推演不了（unsupported、masked）
     时 rendered_new、changed 为 None：不知道会变成什么。缺输入、当时就显示「—」的引用也列上：推演里补上了值，它会变。
+    原值不给的指标（withheld），rendered_old 同样写「已遮罩」。
     """
     by_id = {str(r.get("id")): r for r in results}
     out: list[dict[str, Any]] = []
@@ -1078,8 +1124,10 @@ def report_segments(reports: Iterable[tuple[str, dict[str, Any]]], *, card_node:
                 if result is None:
                     continue
                 new = None if result.get("rendered_new") is None else _render(result, result.get("new"), cite.get("conv"))
+                # 原值不给的指标（_Plan.hides）：报告里引用它的地方同样写「已遮罩」，推演的答复里不出现它的值
+                old = _masked_word() if result.get("withheld") and result.get("old") is not None else seg.get("text")
                 out.append({"report": report_node, "unit": unit.get("id"), "sid": seg.get("id"), "metric": result["id"],
-                            "rendered_old": seg.get("text"), "rendered_new": new,
+                            "rendered_old": old, "rendered_new": new,
                             "changed": None if new is None else new != seg.get("text")})
     return out
 

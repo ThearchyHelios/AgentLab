@@ -127,7 +127,8 @@ NONE_NOTE = "本次运行没有报告文档，也没有出具契约，没有可�
 NO_DOC_NOTE = "本次运行的出具契约采用引用模式核对，但报告没有产出可核对的文档"
 
 MASKED = "已遮罩"
-MASK_NOTE = "这些列在数据源中设置了遮罩，面板上不显示原值。遮罩只减少暴露，不是安全边界"
+#: 面板底下的遮罩说明。遮的列可能是遮罩列本身，也可能是 SQL 里给它起了别名、套了函数得来的结果列（c.phone AS tel）
+MASK_NOTE = "这些列取自数据源中设置了遮罩的列，面板上不显示原值。遮罩只减少暴露，不是安全边界"
 #: 查询条目的数据源现在找不到了（改名或删掉了）：只能按快照里记下的、查询当时的遮罩来遮
 SOURCE_GONE = "数据源「{source}」已不存在（可能已改名或删除），按查询时记录的遮罩处理"
 #: 查询步骤给被引用的行前后各带几行
@@ -878,6 +879,7 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     wanted: dict[str, list[tuple[Any, Any]]] = {}
     hide = _InputMasks(sealed, masks, str(entry.get("node_id") or ""), artifact)
     withheld: set[str] = set()
+    unverified: set[str] = set()
     for item in (metric or {}).get("inputs") or []:
         one = {"step": "input", **item}
         artifact_of = item.get("artifact")
@@ -889,10 +891,16 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         if (hidden := await hide.check(item)) is not None:
             one = _withheld(one, *hidden)
             withheld.add(str(item.get("path")))
+            if hidden[1] is not None:
+                unverified.add(str(item.get("path")))
         inputs.append(one)
     if withheld:
         # 代入式里那几处同样写「已遮罩」：不然标签里遮着、代入式里亮着，同一个值换个地方照样看得到
         step["substituted"] = recompute.substituted_without(metric or {}, withheld, MASKED)
+    if step["value"] is not None and recompute.hides_value(metric or {}, withheld - unverified, unverified):
+        # 指标的值本身也不给，和推演的原值同一个判断：指标可能就是遮罩列的那一格（cell(nodes.q, 0, 'phone')），输入里
+        # 遮着、这里亮着等于没遮。报告上的字（rendered）是读者已经看到的，照旧
+        step["value"] = MASKED
     queries = [s for a, cells in wanted.items() for s in await _query_steps(a, cells, doc, sealed, masks)]
     return [step, *inputs, *queries]
 
@@ -916,8 +924,8 @@ SNAPSHOT_UNVERIFIED = "查询快照无法读取，核对不了这一格是否取
 
 
 class _InputMasks:
-    """一个指标的输入里哪些不能给值。遮的列和查询步骤同一套（_query_step）：查询当时记下的加数据源现在设的，合并查询按它
-    合并的那几个数据源算。
+    """一个指标的输入里哪些不能给值。遮的列和查询步骤同一套（_snapshot_masks）：查询当时记下的加数据源现在设的，按 SQL
+    认出改了名字的（c.phone AS tel 的 tel）也算，合并查询按它合并的那几个数据源和逐格来历算。
 
     取自哪份查询结果的哪几列按 recompute.input_origin 认，推演、可验证报告是同一个认法：cell() 的格、Agent 交来的字段按
     定位里的列认；vars.res.rows[0][2] 这种按位置取的一格卡上没记定位，顺着取值链认，从写变量的节点在口径卡算这一次之前
@@ -975,13 +983,8 @@ class _InputMasks:
     async def _hidden(self, artifact: str | None, source: str | None, snap: dict[str, Any] | None) -> set[str]:
         key = (artifact, source)
         if key not in self._memo:
-            if snap is not None and snap.get("source") == MERGE_SOURCE:
-                hidden, _ = await _merge_masks(snap, self._masks)
-            else:
-                info = self._sealed.queries.get(artifact) if artifact else None
-                current, _ = await self._masks.of((info or {}).get("source") or source or (snap or {}).get("source"))
-                hidden = set(current) | (_recorded_masks(snap) if snap is not None else set())
-            self._memo[key] = hidden
+            info = self._sealed.queries.get(artifact) if artifact else None
+            self._memo[key], _ = await _snapshot_masks(snap, (info or {}).get("source") or source, self._masks)
         return self._memo[key]
 
 
@@ -1283,10 +1286,12 @@ def _challenge_counts(raw: Any, claims: list[dict[str, Any]]) -> dict[str, int]:
 
 
 class _Masks:
-    """一次请求里查过的数据源遮罩：数据源名 → (要遮的列（小写）, 数据源现在还在不在)。"""
+    """一次请求里查过的数据源遮罩：数据源名 → (要遮的列（小写）, 数据源现在还在不在)。顺带记下数据源的类型（kind），
+    按 SQL 认改了名字的遮罩列时照它的方言解析（_snapshot_masks）；数据源不在了的按通用读法。"""
 
     def __init__(self) -> None:
         self._memo: dict[str, tuple[set[str], bool]] = {}
+        self._kinds: dict[str, str | None] = {}
 
     async def of(self, source: Any) -> tuple[set[str], bool]:
         name = str(source or "")
@@ -1296,7 +1301,55 @@ class _Masks:
             async with SessionLocal() as session:
                 row = (await session.execute(select(DataSource).where(DataSource.name == name))).scalar_one_or_none()
             self._memo[name] = ({c.lower() for c in masked_columns(row.options if row else None)}, row is not None)
+            self._kinds[name] = row.kind if row is not None else None
         return self._memo[name]
+
+    async def kind(self, source: Any) -> str | None:
+        name = str(source or "")
+        if not name:
+            return None
+        await self.of(name)
+        return self._kinds.get(name)
+
+
+def _derived(snap: dict[str, Any], hidden: set[str], kind: str | None) -> set[str]:
+    """一份查询快照里值取自遮罩列（hidden，小写）的结果列（小写，含 hidden 本身）：除了列名对上的，SQL 里给遮罩列起了
+    别名、套了函数、经子查询或 WITH 转一道得来的也算。认法是 engine/masking.py 的 _derived_hidden，核查 agent 在工具边界
+    遮、可验证报告判快照附不附带用的同一套；SQL 解析不了、里面又写着遮罩列（或者 * 这类不写列名也会带出遮罩列的写法）
+    的，整份快照的列都算。合并查询的快照它不看 SQL，原样交回（合并的遮罩由 _merge_masks 按逐格来历算）。
+
+    分析本身出了意外：整份的列都算（宁可多遮）。纯计算，一条 SQL 不到 1 毫秒，在调用方的线程里算：推演在工作线程里
+    等事件循环查库（api/whatif.py 的 _Hidden），这里再开线程会和它争同一个线程池。"""
+    if not hidden:
+        return set()
+    try:
+        # masking 要用这里的说法（MASKED），也是用到时才导入：两边都不在模块顶上互相导入
+        from app.engine.masking import _derived_hidden
+
+        return set(hidden) | _derived_hidden(snap, set(hidden), kind)[0]
+    except Exception:  # noqa: BLE001 - 认不准就整份遮掉
+        logger.warning("证据面板：按 SQL 认改了名字的遮罩列时出错，整份快照的列都按遮罩处理", exc_info=True)
+        return set(hidden) | {str(c).lower() for c in snap.get("columns") or []}
+
+
+async def _snapshot_masks(snap: dict[str, Any] | None, source: Any, masks: _Masks, *,
+                          depth: int = 0) -> tuple[set[str], list[str]]:
+    """一份查询快照要遮的列（小写）和已经不在的数据源：证据面板的查询步骤、指标的输入、推演、报告自查（engine/nodes/
+    report.py）都按这一个函数认。
+
+    - 遮的是「查询当时记下的」和「数据源现在设的」两者之和：事后加的遮罩照样生效，数据源改名、删掉了也不会把当时遮着
+      的列亮出来；数据源不在了的，它的名字进第二项
+    - 列名对上的之外，按 SQL 认出改了名字的遮罩列（_derived）
+    - 合并查询不是数据源：按它合并的那几个数据源和逐格来历算（_merge_masks）
+    - snap 为 None（快照读不出来）：只能按 source 现在设的遮罩算，没有 SQL 可认"""
+    if snap is not None and snap.get("source") == MERGE_SOURCE:
+        return await _merge_masks(snap, masks, depth=depth)
+    name = source or (snap or {}).get("source")
+    hidden, found = await masks.of(name)
+    hidden = set(hidden) | (_recorded_masks(snap) if snap is not None else set())
+    if snap is not None and hidden:
+        hidden = _derived(snap, hidden, await masks.kind(name))
+    return hidden, ([] if found or not name else [str(name)])
 
 
 async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str, Any], sealed: _Sealed,
@@ -1343,22 +1396,15 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     rows = snap["rows"]
     step["source"] = step["source"] or snap.get("source")
     merged = snap.get("source") == MERGE_SOURCE
+    # 遮的列：查询当时记下的加数据源现在设的，按 SQL 认出改了名字的（c.phone AS tel）也遮。合并查询不是数据源，按它
+    # 合并的那几个数据源和逐格来历算，不能拿「合并查询」去找数据源，找不到再说它「已不存在」（_snapshot_masks）
+    hidden, gone = await _snapshot_masks(snap, step["source"], masks)
+    if gone:
+        step["mask_note"] = SOURCE_GONE.format(source="、".join(gone))
     if merged:
-        # 合并查询不是数据源：遮罩按它合并的那几个数据源算（_merge_masks），不能拿「合并查询」去找数据源，
-        # 找不到再说它「已不存在」
-        hidden, gone = await _merge_masks(snap, masks)
-        if gone:
-            step["mask_note"] = SOURCE_GONE.format(source="、".join(gone))
         step["merge"] = _merge_view(snap, cells, catalog, sealed)
         if hint and _leads_to_upload(snap, cells):
             step["provenance"] = True
-    else:
-        # 遮的是「查询当时记下的」和「数据源现在设的」两者之和：事后加的遮罩照样生效，数据源改名、
-        # 删掉了也不会把当时遮着的列亮出来
-        hidden, found = await masks.of(step["source"])
-        hidden = hidden | _recorded_masks(snap)
-        if not found:
-            step["mask_note"] = SOURCE_GONE.format(source=step["source"])
     masked = {i for i, c in enumerate(columns) if c.lower() in hidden}
     index = sorted({i for r in rows_hit for i in range(r - WINDOW, r + WINDOW + 1) if 0 <= i < len(rows)})
     step.update(sql=snap.get("sql"), columns=columns, total_rows=len(rows), truncated=bool(snap.get("truncated")),
@@ -1497,12 +1543,13 @@ def _input_checks(artifact: str) -> list[dict[str, Any]]:
     return _query_checks(snap) if isinstance(snap, dict) else []
 
 
-async def _merge_masks(snap: dict[str, Any], masks: _Masks) -> tuple[set[str], list[str]]:
+async def _merge_masks(snap: dict[str, Any], masks: _Masks, *, depth: int = 0) -> tuple[set[str], list[str]]:
     """合并结果要遮的列（小写）和已经不在的数据源：
 
     - 合并当时记下的（快照的 mask_columns：各输入当时的遮罩列，加上来自遮罩列、换了名字的结果列）；
     - 它合并的每个数据源现在设的（按列名）；
-    - 结果列有逐格来历、来自某个数据源现在遮着的列的，按来历遮（换了名字也遮住）。宁可多遮。"""
+    - 结果列有逐格来历的，按来历遮：来自的那一列在输入里要遮（_merge_input_masks：输入快照按查询步骤同一套认，数据源
+      现在设的、SQL 里改了名字的都算，输入本身是合并结果的再往下追），换了名字也遮住。宁可多遮。"""
     hidden = _recorded_masks(snap)
     gone: list[str] = []
     for name in snap.get("sources") or []:
@@ -1513,15 +1560,31 @@ async def _merge_masks(snap: dict[str, Any], masks: _Masks) -> tuple[set[str], l
     lineage = snap.get("lineage") if isinstance(snap.get("lineage"), dict) else {}
     origins = lineage.get("sources") or []
     by_alias = {str(i.get("alias")): i for i in snap.get("inputs") or [] if isinstance(i, dict)}
+    inputs: dict[str, set[str]] = {}
     for name, target in zip(snap.get("columns") or [], lineage.get("columns") or []):
         if not isinstance(target, dict) or not isinstance(target.get("source"), int) \
                 or not 0 <= target["source"] < len(origins):
             continue
         origin = origins[target["source"]] if isinstance(origins[target["source"]], dict) else {}
-        source = (by_alias.get(str(origin.get("input"))) or {}).get("source")
-        if source and source != MERGE_SOURCE and str(target.get("column") or "").lower() in (await masks.of(source))[0]:
+        alias = str(origin.get("input"))
+        if alias not in inputs:
+            inputs[alias] = await _merge_input_masks(by_alias.get(alias) or {}, masks, depth)
+        if str(target.get("column") or "").lower() in inputs[alias]:
             hidden.add(str(name).lower())
     return hidden, gone
+
+
+async def _merge_input_masks(item: dict[str, Any], masks: _Masks, depth: int) -> set[str]:
+    """合并的一个输入（快照 inputs 里的一项）的结果里要遮的列（小写）。读得出输入快照的按 _snapshot_masks 认（SQL 里给
+    遮罩列起了别名的也算）；读不出来、追得太深的，只能按它的数据源现在设的列名算。"""
+    source = item.get("source")
+    artifact = str(item.get("artifact") or "")
+    content, ok = _fetch(artifact) if artifact and depth < MERGE_DEPTH else (None, None)
+    if ok is True and isinstance(content, dict):
+        return (await _snapshot_masks(content, source, masks, depth=depth + 1))[0]
+    if source and source != MERGE_SOURCE:
+        return set((await masks.of(source))[0])
+    return set()
 
 
 def _leads_to_upload(snap: dict[str, Any], cells: list[tuple[Any, Any]], depth: int = 0) -> bool:
