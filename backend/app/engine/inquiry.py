@@ -71,9 +71,16 @@
   一律算取自遮罩列。EXCEPT 后一支只用来去掉行，也照 UNION 的后一支算（多遮）
 - 整行和函数参数里的 *（Postgres 的 row_to_json(s)、json_agg(t)、SELECT s、s::text、to_json(s.*)、concat_ws(',', s.*)，
   Oracle 的 JSON_OBJECT(*)）按 * 展开的来源算：取自子查询、CTE 的看它选出的列，取自数据源里的表的一律算取自遮罩列（整列
-  遮）。Postgres 先按列认：表结构里查得到和表同名的列（visits 表的 visits 列）才当列，查不到时按整行算（多遮）。PIVOT、
-  UNPIVOT、MATCH_RECOGNIZE 读到遮罩列的，整份快照的列都遮（多遮）。SQL 解析不了的只看文字：写着遮罩列、*（COUNT(*) 除外）、
-  TABLE x 的整份遮，整行引用这类不写列名的写法认不出
+  遮）。Postgres 先按列认：表结构里查得到和表同名的列（visits 表的 visits 列）才当列，查不到时按整行算（多遮）；LATERAL
+  里只看排在它前面的来源，它自己的结果列不算。PIVOT、UNPIVOT、MATCH_RECOGNIZE 读到遮罩列的，整份快照的列都遮（多遮）。
+  SQL 解析不了的只看文字：写着遮罩列、*（COUNT(*) 除外）、TABLE x、下面那几类函数和视图的整份遮，整行引用这类不写列名的
+  写法认不出
+- 认不全的写法整份遮（多遮，同一份里没碰遮罩列的编号、金额也遮）：(表达式).* 展开读到遮罩列的（复合类型的列
+  (p.profile).*、函数交回的记录 (jsonb_each_text(pj)).*、子查询里的 ROW (q.r).*，展开成几列、各叫什么 SQL 里看不出）；
+  表名、SQL 写在字符串里交给函数执行、整表导出的（query_to_xml、table_to_xml、cursor_to_xml、schema_to_xml、
+  database_to_xml 这一族，dblink、crosstab、ts_stat，Oracle 的 DBMS_XMLGEN、XMLTYPE，DuckDB 的 query，SQL Server 的
+  OPENQUERY）、按页按文件读原始数据的、统计信息和会话记录里存着值的（pg_stats、sqlite_stat4、pg_stat_statements），
+  按名字认（masking._INDIRECT），自己建的同类函数认不出；分析出了意外、一长串 CTE 超出工作量上限（ANALYSIS_STEPS）的
 - 按遮罩列分档的标签（CASE、IIF 的结果全是写死的常量）：标签文字是 agent 写在 SQL 里的，不当遮罩值，SQL、回答正文里
   照原样；标签列当分组键（每一档一行）照常显示，分档写在子查询、WITH 里、外层（或中间一层）按它分组的也算
   （masking._grouped_labels），不分组的逐行标签列整列遮（格子里看不出某一笔落在哪一档），可 agent
