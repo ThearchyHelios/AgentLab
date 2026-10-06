@@ -65,14 +65,28 @@ class WorkflowOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+async def _run_counts(session: AsyncSession, ids: list[str] | None = None) -> dict[str, int]:
+    """各工作流的运行次数 {工作流 id: 次数}，ids 为 None 时算全部。列表和单个工作流的接口都按它算：以前只有列表
+    计数，详情、保存、恢复的返回落在 WorkflowOut 的默认值 0 上，同一个工作流两处说的次数不一样。"""
+    stmt = select(Run.workflow_id, func.count(Run.id)).group_by(Run.workflow_id)
+    if ids is not None:
+        stmt = stmt.where(Run.workflow_id.in_(ids))
+    return dict((await session.execute(stmt)).all())
+
+
+async def _workflow_out(session: AsyncSession, workflow: Workflow) -> WorkflowOut:
+    """返回单个工作流的接口都走这里，run_count 和列表一致。"""
+    item = WorkflowOut.model_validate(workflow)
+    item.run_count = (await _run_counts(session, [workflow.id])).get(workflow.id, 0)
+    return item
+
+
 @router.get("", response_model=list[WorkflowOut])
 async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[WorkflowOut]:
     rows = list(
         (await session.execute(select(Workflow).order_by(Workflow.updated_at.desc()))).scalars()
     )
-    counts = dict(
-        (await session.execute(select(Run.workflow_id, func.count(Run.id)).group_by(Run.workflow_id))).all()
-    )
+    counts = await _run_counts(session)
     out: list[WorkflowOut] = []
     for row in rows:
         item = WorkflowOut.model_validate(row)
@@ -84,7 +98,7 @@ async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[W
 @router.post("", response_model=WorkflowOut, status_code=201)
 async def create_workflow(
     payload: WorkflowIn, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     workflow = Workflow(
         name=payload.name,
         description=payload.description,
@@ -99,23 +113,23 @@ async def create_workflow(
     )
     await session.commit()
     await session.refresh(workflow)
-    return workflow
+    return await _workflow_out(session, workflow)
 
 
 @router.get("/{workflow_id}", response_model=WorkflowOut)
 async def get_workflow(
     workflow_id: str, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
-    return workflow
+    return await _workflow_out(session, workflow)
 
 
 @router.patch("/{workflow_id}", response_model=WorkflowOut)
 async def update_workflow(
     workflow_id: str, payload: WorkflowPatch, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
@@ -146,7 +160,7 @@ async def update_workflow(
             workflow.status = "draft"
     await session.commit()
     await session.refresh(workflow)
-    return workflow
+    return await _workflow_out(session, workflow)
 
 
 @router.delete("/{workflow_id}", status_code=204)
@@ -172,7 +186,7 @@ async def delete_workflow(
 @router.post("/{workflow_id}/duplicate", response_model=WorkflowOut, status_code=201)
 async def duplicate_workflow(
     workflow_id: str, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     source = await session.get(Workflow, workflow_id)
     if not source:
         raise HTTPException(404, _GONE)
@@ -185,7 +199,7 @@ async def duplicate_workflow(
     session.add(copy)
     await session.commit()
     await session.refresh(copy)
-    return copy
+    return await _workflow_out(session, copy)
 
 
 class VersionOut(BaseModel):
@@ -267,7 +281,7 @@ async def get_version(
 @router.post("/{workflow_id}/versions/{version}/restore", response_model=WorkflowOut)
 async def restore_version(
     workflow_id: str, version: int, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
@@ -298,7 +312,7 @@ async def restore_version(
         workflow.status = "draft"
     await session.commit()
     await session.refresh(workflow)
-    return workflow
+    return await _workflow_out(session, workflow)
 
 
 class PublishIn(BaseModel):
