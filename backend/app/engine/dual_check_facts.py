@@ -74,8 +74,9 @@ ASPECT_LABEL = {
 _VERB = {"count": "计数", "sum": "求和", "avg": "求平均"}
 #: 写入时版本对不上（别人刚改过这张表）最多重试几次
 _RETRIES = 2
-#: 同一次裁决里几个指标落到同一项上时，最多预告多少种组合（preview_joint）。每个指标两边都落在这一项上时是
-#: 3 的指标数次方：四个指标 72 种还在里面，再多的那一项不预告，审批卡回到按其余指标当前的选择有条件地说
+#: 同一次裁决里几个指标落到同一项上时，这一项最多预告多少种组合（preview_joint，每一项各算各的，不共用额度）。
+#: 每个指标两边都落在这一项上时近于 3 的指标数次方：四个指标 72 种还在里面，再多的那一项不预告，审批卡回到按其余指标
+#: 当前的选择有条件地说。组合数先算出来再比（_combos），不把组合列出来比：二十个指标就是几十亿种
 JOINT_LIMIT = 128
 
 #: 无效记录的取值：被排除的取值（或码值表里它的意思）里有这些词，才算在排除无效记录
@@ -820,6 +821,18 @@ def _joint_outcome(notes: Mapping[str, Any], members: list[Fact], tables: Mappin
     return result
 
 
+def _combos(sides: Sequence[int], limit: int) -> int:
+    """几个指标落到同一项上时有几种组合（至少两个指标落上来的）：每个指标要么没落上来、要么落上来的那几边之一，
+    ∏(1 + k) − 1 − Σk（k 是这个指标落到这一项上的边数，减去一个都没有、只有一个的）。连乘到超过 limit 能确定的地方
+    就停，返回 limit + 1：只用来和上限比，不需要真算出几十亿。"""
+    total, cap = 1, limit + 1 + sum(sides)
+    for k in sides:
+        total *= 1 + k
+        if total > cap:
+            return limit + 1
+    return total - 1 - sum(sides)
+
+
 def preview_joint(candidates: Sequence[Mapping[str, Any]],
                   catalogs: Mapping[str, tuple[Mapping[str, Any] | None, Mapping[str, Mapping[str, Any]]]]
                   ) -> list[dict[str, Any]]:
@@ -829,8 +842,11 @@ def preview_joint(candidates: Sequence[Mapping[str, Any]],
 
     candidates 照节点交给真写的先后（不一致的指标的先后），带 metric_id，不带 choice；catalogs 是 {数据源名: (表结构,
     {表名: notes})}，同 preview 的两个参数。每个指标的两边先各按 derive 认出落到哪一项（同 preview），落到同一项上的
-    几个指标，每种「谁选了哪一边」的组合按 _joint_outcome 算一遍：真写时这几个指标就是这样被归拢、写或不写的。组合超过
-    JOINT_LIMIT 的那一项整项不预告。永远不抛：算不出来的那一项不预告。"""
+    几个指标，每种「谁选了哪一边」的组合按 _joint_outcome 算一遍：真写时这几个指标就是这样被归拢、写或不写的。
+
+    上限按每一项算：一项的组合数（_combos，先算个数，不先列出来）超过 JOINT_LIMIT 的，这一项整项不预告，别的项照常
+    预告，几项之间不共用额度。一项不超过 JOINT_LIMIT 种、每个指标最多落到两项上，总的计算量和指标数成正比。
+    永远不抛：算不出来的那一项不预告。"""
     from itertools import product
 
     landed: dict[tuple[str, str, str], dict[int, list[tuple[str, Fact]]]] = {}
@@ -844,16 +860,12 @@ def preview_joint(candidates: Sequence[Mapping[str, Any]],
             if fact is not None:
                 landed.setdefault((fact.source, fact.table, fact.item), {}).setdefault(index, []).append((side, fact))
     out: list[dict[str, Any]] = []
-    budget = JOINT_LIMIT
     for (source, table, item), by_metric in landed.items():
-        if len(by_metric) < 2:
+        if len(by_metric) < 2 or _combos([len(sides) for sides in by_metric.values()], JOINT_LIMIT) > JOINT_LIMIT:
             continue
         options = [[None, *sides] for _, sides in sorted(by_metric.items())]
         combos = [[c for c in combo if c is not None] for combo in product(*options)]
         combos = [c for c in combos if len(c) >= 2]
-        if len(combos) > budget:
-            continue
-        budget -= len(combos)
         schema, notes = catalogs.get(source, (None, {}))
         tables = schema.get("tables") if isinstance(schema, Mapping) else None
         try:

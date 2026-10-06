@@ -1471,6 +1471,176 @@
           }
         }
       ]
+    },
+    "time_rejected": {
+      "gmv": null,
+      "refund_rate": "time",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "b"
+      },
+      "notes": {
+        "orders": {
+          "business_date": {
+            "value": {
+              "column": "created_at"
+            },
+            "source": "llm",
+            "status": "rejected"
+          }
+        }
+      },
+      "written": [],
+      "catalog": {
+        "gmv": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "paid_at"
+            }
+          },
+          "b": {
+            "write": false,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "created_at"
+            },
+            "reason": "「orders」的业务日期「created_at」曾被人工驳回，与这次指标「销售额」的选择相反，未写入。如需更改，请到数据目录中修改"
+          }
+        },
+        "refund_rate": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "paid_at"
+            }
+          },
+          "b": {
+            "write": false,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "created_at"
+            },
+            "reason": "「orders」的业务日期「created_at」曾被人工驳回，与这次指标「退款率」的选择相反，未写入。如需更改，请到数据目录中修改"
+          }
+        }
+      },
+      "joint": [
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": true,
+              "value": {
+                "column": "paid_at"
+              }
+            },
+            "refund_rate": {
+              "write": true,
+              "value": {
+                "column": "paid_at"
+              }
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "b"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「paid_at」；指标「退款率」采纳的是「created_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「paid_at」；指标「退款率」采纳的是「created_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "b"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「created_at」；指标「退款率」采纳的是「paid_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「created_at」；指标「退款率」采纳的是「paid_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "b"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "b"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "「orders」的业务日期「created_at」曾被人工驳回，与这次指标「销售额」、「退款率」的选择相反，未写入。如需更改，请到数据目录中修改"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "「orders」的业务日期「created_at」曾被人工驳回，与这次指标「销售额」、「退款率」的选择相反，未写入。如需更改，请到数据目录中修改"
+            }
+          }
+        }
+      ]
     }
   },
   "catalog_blocked": {

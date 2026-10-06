@@ -654,6 +654,46 @@ def test_too_many_combinations_are_left_to_the_timeline():
     assert len(facts.preview_joint(picked[:3], {"shop": (SCHEMA, {})})) == 3 ** 3 - 1 - 3 * 2
 
 
+def test_combinations_are_counted_before_they_are_listed(monkeypatch):
+    """二十个指标都落到同一项上：组合数是 3 的二十次方量级，得先算出个数、超了就跳过，不能先列出来再比上限——
+    列一遍就要几十 GB 内存，在服务进程里算（asyncio.to_thread）会把整个服务拖死。预告时从 itertools.product 取了
+    多少个组合记下来：这一项不预告，取的不该超过上限"""
+    import itertools
+
+    from app.engine import dual_check_facts as facts
+
+    drawn = 0
+    real = itertools.product
+
+    def guarded(*iterables, **kw):
+        nonlocal drawn
+        for combo in real(*iterables, **kw):
+            drawn += 1
+            # 红的时候不至于真把内存吃光：取得比上限多出一截就停
+            assert drawn <= facts.JOINT_LIMIT + 64, "列出的组合远多于上限：没有先算个数"
+            yield combo
+
+    stem = candidate(BY_ORDER_DATE, RIGHT, "a")
+    picked = [{**stem, "metric": f"指标{i}", "metric_id": f"m{i}"} for i in range(20)]
+    monkeypatch.setattr(itertools, "product", guarded)
+    assert facts.preview_joint(picked, {"shop": (SCHEMA, {})}) == []
+    assert drawn <= facts.JOINT_LIMIT
+
+
+def test_each_item_has_its_own_limit():
+    """上限按每一项算，不是几项共用一份额度：两个数据源的业务日期各有四个指标落上来（各 72 种组合），两项都预告。
+    以前共用 JOINT_LIMIT 的额度，前一项用掉 72 种，后一项明明没超上限也被悄悄跳过"""
+    from app.engine import dual_check_facts as facts
+
+    picked = [{**candidate(BY_ORDER_DATE, RIGHT, "a", metric=f"指标{i}", source=source), "metric_id": f"{source}-{i}"}
+              for source in ("shop", "outlet") for i in range(4)]
+    joint = facts.preview_joint(picked, {"shop": (SCHEMA, {}), "outlet": (SCHEMA, {})})
+    per = 3 ** 4 - 1 - 4 * 2
+    assert per <= facts.JOINT_LIMIT < 2 * per
+    assert sorted({e["source"] for e in joint}) == ["outlet", "shop"]
+    assert len(joint) == 2 * per
+
+
 @pytest.mark.parametrize("choices", [("a", "b"), ("b", "b"), ("b", "a"), ("a", None)])
 async def test_the_joint_preview_is_what_gets_written(shop, choices):
     """预告和真写逐字一致：按这组选择，各指标的预告（单独落一项的看 preview，几个落到同一项的看 preview_joint）说写的，

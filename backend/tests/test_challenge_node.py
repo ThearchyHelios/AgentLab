@@ -411,7 +411,8 @@ async def test_a_verdict_without_any_query_is_not_taken(monkeypatch, shop):
     assert east["verdict"] == "inconclusive" and "「经受住」" in east["rationale"]
     [warn] = await logs(row.id, "challenge_unreviewed")
     assert warn["claims_skipped"] == 2 and "没有执行成功任何查询" in warn["reason"]
-    assert out["unreviewed"] == 2, "一条查询都没执行成功：两句都是没能反查，不是查过了判断不了"
+    assert out["unreviewed"] == 2, "一条查询都没执行成功：两句都是未能反查，不是查过了判断不了"
+    assert out["unreviewed"] <= out["counts"]["inconclusive"], "未能反查的每一句都记为无法判断，审批卡上两个数对得上"
 
 
 async def test_a_refutation_that_cites_none_of_its_queries_is_not_taken(monkeypatch, shop):
@@ -428,7 +429,7 @@ async def test_a_refutation_that_cites_none_of_its_queries_is_not_taken(monkeypa
     assert south["verdict"] == "inconclusive" and len(south["queries"]) == 1 and south["rationale_doc"] is None
     assert "没有引用" in south["rationale"] and "扣除退款后华南仍低于华东。" in south["rationale"]
     assert east["verdict"] == "stands", "「经受住」不要求引用：它不改变出具"
-    assert await logs(row.id, "challenge_unreviewed") == [], "查过了，不算没能反查"
+    assert await logs(row.id, "challenge_unreviewed") == [], "查过了，不算未能反查"
     assert out["unreviewed"] == 0
 
 
@@ -537,7 +538,7 @@ async def test_a_claim_with_part_of_its_sources_gone_says_so(monkeypatch, tmp_pa
         [lost] = await logs(row.id, "challenge_sources_lost")
         assert lost["level"] == "warn" and lost["claims"] == 2 and lost["sources"] == [other]
         assert f"「{other}」" in lost["message"] and "2 句" in lost["message"]
-        assert await logs(row.id, "challenge_unreviewed") == [], "两句都查过了，不算没能反查"
+        assert await logs(row.id, "challenge_unreviewed") == [], "两句都查过了，不算未能反查"
     finally:
         await engines.invalidate(other_id)
 
@@ -671,8 +672,9 @@ async def test_the_time_limit_applies_to_each_claim_and_still_settles(monkeypatc
     assert south["verdict"] == "inconclusive" and 1 <= len(south["queries"]) < 20
     limits = await logs(row.id, "challenge_limit")
     assert [(lm["limit"], lm["claims_skipped"]) for lm in limits] == [("timeout_s", 0)]
-    # 触顶但按查到的结果收了尾的那句，判断是反方自己给的，不算没能反查；另一句一条查询都没执行，算
-    assert (await output_of(row.id, "chal"))["unreviewed"] == 1
+    # 触顶但按查到的结果收了尾的那句，判断是反方自己给的，不算未能反查；另一句一条查询都没执行，算
+    out = await output_of(row.id, "chal")
+    assert out["unreviewed"] == 1 and out["counts"]["inconclusive"] == 2
 
 
 async def test_the_daily_cap_stops_the_remaining_claims(monkeypatch, shop):
@@ -692,7 +694,8 @@ async def test_the_daily_cap_stops_the_remaining_claims(monkeypatch, shop):
         "第一句派出去就撞上上限、一次模型都没调用，和后面不再派出的句子是同一回事，同一种说法"
     [limit] = await logs(row.id, "challenge_limit")
     assert limit["limit"] == "daily_max_usd" and limit["claims_skipped"] == 2
-    assert out["unreviewed"] == 2, "撞上每日金额上限没反查的，也是没能反查"
+    assert out["unreviewed"] == 2, "撞上每日金额上限没反查的，也是未能反查"
+    assert out["unreviewed"] <= out["counts"]["inconclusive"]
     assert len(await logs(row.id, "verify_limit")) == 1, "第一句撞上每日上限之后，后面的句子不再派 agent 去试"
     assert row.output["_issuance"]["tier"] == "formal"
 
@@ -1014,7 +1017,7 @@ async def test_an_unavailable_model_leaves_the_claims_inconclusive(monkeypatch, 
     # 时间线上看得出根本没审成：不是只有一条「审了 2 句」
     [warn] = await logs(row.id, "challenge_unreviewed")
     assert warn["level"] == "warn" and warn["claims_skipped"] == 2 and "核查模型不可用" in warn["reason"]
-    assert out["unreviewed"] == 2
+    assert out["unreviewed"] == 2 and out["unreviewed"] <= out["counts"]["inconclusive"]
     [done] = await logs(row.id, "challenge_done")
     assert "2 句未能反查" in done["message"]
 

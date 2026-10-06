@@ -114,6 +114,8 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # 双盲复算、反方审稿的核查模型和被核查的模型相同：同 judge_same_model，只关乎独立性，结论本身没受影响
     "dual_check_same_model": ("dual_check_same_model", BENIGN),
     "challenge_same_model": ("challenge_same_model", BENIGN),
+    # 核查 agent（engine/verify_agent.py，双盲复算、反方审稿共用）估不出金额：同 judge_unpriced，配置上的提醒
+    "verify_unpriced": ("verify_unpriced", BENIGN),
     # 核查没做完、没通过：盲算触顶、两路不一致、指标无法复算；反方审稿触顶、推翻了结论、有句子没能反查、只查了
     # 部分数据源。答案照常交付（出具契约另按缺口降档），是缺口不是断裂，按各自的 kind 记，界面说得清是哪一种
     "dual_check_limit": ("dual_check_limit", DEGRADED),
@@ -123,6 +125,9 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "challenge_refuted": ("challenge_refuted", DEGRADED),
     "challenge_unreviewed": ("challenge_unreviewed", DEGRADED),
     "challenge_sources_lost": ("challenge_sources_lost", DEGRADED),
+    # 核查 agent 自己触顶、按已有结果收尾：多半和节点自己的 *_limit 说的是同一次触顶，照样是缺口，记成它自己的 kind，
+    # 不落成笼统的 warn——步数上限（max_steps）只有它说
+    "verify_limit": ("verify_limit", DEGRADED),
 }
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。
