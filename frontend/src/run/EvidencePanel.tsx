@@ -19,7 +19,7 @@ import {
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
 import {
-  ABSENCE_CLAIM_TEXT, CHALLENGE_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT,
+  ABSENCE_CLAIM_TEXT, CHALLENGE_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MASKED_CELL_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT,
   SQL_CHECK_TEXT, nodeTypeLabel,
 } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
@@ -1835,6 +1835,7 @@ const CODE_LABEL: Record<string, string> = {
   unknown_entity: '疑似不存在的名称',
   unverified_entity: '无法核实的名称',
   absence_claim: ABSENCE_CLAIM_TEXT.label,
+  masked_cell: MASKED_CELL_TEXT.label,
 }
 
 /** 违规清单：报告撰写节点核对出来的全部问题，画得出线的能定位，画不出的说清在哪 */

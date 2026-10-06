@@ -3,7 +3,7 @@ import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
   ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
-  CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, NODE_TYPE_LABEL,
+  CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, MASKED_CELL_TEXT, NODE_TYPE_LABEL,
   VERIFY_TRUNCATED_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
@@ -871,6 +871,17 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         title: ABSENCE_CLAIM_TEXT.title(n),
         sub: texts.length ? texts.map((t) => `「${t}」`).join('、') : undefined,
         next: ABSENCE_CLAIM_TEXT.next,
+      }
+    }
+    case 'report_masked_cell': {
+      // 报告引用了取自遮罩列的格子，重写后仍在、照常产出（report.py）：读结构化字段 count、refs，副标题只点名引用，
+      // 不写那几格的值（后端也没给）
+      const n = typeof d.count === 'number' && d.count > 0 ? d.count : undefined
+      const refs = strs(d.refs)
+      return {
+        title: MASKED_CELL_TEXT.title(n),
+        sub: refs.length ? refs.map((r) => `[[${r}]]`).join('、') : undefined,
+        next: MASKED_CELL_TEXT.next,
       }
     }
     case 'report_catalog_trimmed': {

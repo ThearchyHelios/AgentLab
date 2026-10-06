@@ -1377,6 +1377,38 @@ await section('报告核对 report.checked、口径卡的台账（可点击证�
     && !!rcAbsent?.detail?.includes('缺失断言') && !!rcAbsent?.detail?.includes('依据不足'), `${rcAbsent?.status} ${rcAbsent?.detail}`)
 })
 
+await section('报告引用了取自遮罩列的格子（report_masked_cell）：标题说几处、已标注，副标题点名引用，不写那几格的值', async () => {
+  // 契约：data = {level: warn, code: report_masked_cell, message, count, refs, columns}，重写后仍在、「违规处置」为标注时才发
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const reportPy = readFileSync(`${root}backend/app/engine/nodes/report.py`, 'utf8')
+  check('后端发引用了遮罩列的警告，带着 count、refs、columns', reportPy.includes('code="report_masked_cell"')
+    && reportPy.includes('count=len(hits), refs=refs') && reportPy.includes('columns=list(dict.fromkeys('),
+    '改了 report.py 的字段就同步改 decode.ts 的 explainLog 和这里的夹具')
+  const MASKED = '报告引用了 2 处取自遮罩列的格子（「v:Q2.r0.tel」、「v:Q2.r1.tel」），已要求模型重写 1 次仍未改掉，这些值会随报告出具。'
+    + '报告照常产出，这几处已标注：数据源设置了遮罩的列不应写进报告，请在报告撰写节点的指令中去掉对这些列的引用'
+  const steps = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'report_masked_cell', message: MASKED, count: 2,
+      refs: ['v:Q2.r0.tel', 'v:Q2.r1.tel'], columns: ['tel'] }),
+    E(3, 'report.checked', 'w', { doc_artifact: 'abc', repairs: 1, ok: false, on_violation: 'flag', failed: false,
+      stats: { numbers: 1, numbers_cited: 1, uncited_numbers: 0, unresolved: 0 },
+      violations: [{ code: 'masked_cell', ref: 'v:Q2.r0.tel', column: 'tel',
+        message: '引用了取自遮罩列的格子 [[v:Q2.r0.tel]]：列「tel」取自数据源中设置了遮罩的列，值不应写进报告' }] }),
+  ]))
+  const mc = steps.find((s) => s.code === 'report_masked_cell')
+  check('标题说几处引用了遮罩列、已标注', mc?.title === '报告引用了 2 处取自遮罩列的格子，已标注', mc?.title)
+  check('……副标题点名那几处引用（不写值）', mc?.sub === '[[v:Q2.r0.tel]]、[[v:Q2.r1.tel]]', mc?.sub)
+  check('……下一步说遮罩列不应写进报告、出具已降档、去改指令；是提醒（warn），原话留在展开区',
+    !!mc?.next?.includes('不应写进报告') && !!mc?.next?.includes('降档') && !!mc?.next?.includes('指令')
+    && mc?.level === 'warn' && mc?.detail === MASKED, mc?.next)
+  const rc = steps.find((s) => s.code === 'report_checked')
+  check('……核对那一行照常完成（标注，不判失败），违规清单里写着这一条的说明', rc?.status === 'done'
+    && !!rc?.detail?.includes('取自数据源中设置了遮罩的列'), `${rc?.status} ${rc?.detail}`)
+  const bare = flatten(mod.decodeRun([E(1, 'log', 'w', { level: 'warn', code: 'report_masked_cell', message: '报告引用了遮罩列' })]))
+    .find((s) => s.code === 'report_masked_cell')
+  check('……缺字段时标题照样说人话，不出 undefined', bare?.title === '报告引用了取自遮罩列的格子，已标注'
+    && bare?.sub === undefined, `${bare?.title} / ${bare?.sub}`)
+})
+
 await section('工具门控 tool.gated（工具信任三档）', async () => {
   // 契约：data = {tool, verdict: allow|escalate, reason, model, duration_ms, call_id?, agent?}，node_id 是所在节点
   const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })

@@ -247,6 +247,17 @@ export const ABSENCE_CLAIM_TEXT = {
     + '或换用上下文窗口更大的写作模型后重新运行',
 }
 
+/**
+ * 报告直接引用了取自遮罩列的格子（报告自查的 masked_cell；c.phone AS tel 这种改了名字的也算），重写后仍在、
+ * 「违规处置」为标注时照常产出：时间线上那一行（日志 report_masked_cell）和证据面板违规清单里的叫法
+ */
+export const MASKED_CELL_TEXT = {
+  label: '引用了遮罩列',
+  title: (n?: number) => `报告引用了${n ? ` ${formatNumber(n)} 处` : ''}取自遮罩列的格子，已标注`,
+  next: '数据源设置了遮罩的列不应写进报告，这几处的值会随报告出具，出具已按缺口降档。'
+    + '请在报告撰写节点的指令中去掉对这些列的引用后重新运行',
+}
+
 /** 证据面板和证据条的文案 */
 export const EVIDENCE_TEXT = {
   allCited: (n: number) => `${formatNumber(n)} 个数字都有出处`,
