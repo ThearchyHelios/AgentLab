@@ -555,7 +555,8 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
               <ClassChip runClass={run.run_class} version={run.version} always />
               <TierChip tier={(run.output as any)?._issuance?.tier} />
             </div>
-            <div className="mt-0.5 flex min-w-0 items-center gap-1 text-2xs text-faint">
+            {/* 窄时换行：不换行时这一行只有定时任务链接能缩，会被挤成 0 宽，其余各项被压成竖排 */}
+            <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-2xs text-faint">
               <span className="mono">{shortId(run.id)}</span>
               <span>·</span>
               <time className="tnum" title={`发起于 ${formatDateTime(run.created_at ?? null)}`}>

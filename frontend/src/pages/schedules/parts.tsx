@@ -223,6 +223,11 @@ export const isUnsupported = (e: unknown) => e instanceof ApiError && e.status =
  * 不认识的 id 再取一次列表（一分钟内最多一次）。取不到（老服务端、暂时连不上）不要紧，标记照样显示，只是不写名字
  */
 const names = new Map<string, string>()
+/**
+ * 已删除的定时任务：取回的列表里没有的（列表是全部定时任务，服务端不分页），或者刚在本页删掉的。运行详情页头据此不再
+ * 链过去。列表没取到时谁都不算删除：只是不知道
+ */
+const missing = new Set<string>()
 let fetchedAt = 0
 let inflight: Promise<void> | null = null
 let namesVersion = 0
@@ -236,22 +241,39 @@ const emitNames = () => {
 
 /** 记下读到的定时任务名字（gone 里的是刚删掉的） */
 export function rememberScheduleNames(items: Pick<Schedule, 'id' | 'name'>[], gone: string[] = []) {
-  for (const s of items) names.set(s.id, s.name)
-  for (const id of gone) names.delete(id)
+  for (const s of items) {
+    names.set(s.id, s.name)
+    missing.delete(s.id)
+  }
+  for (const id of gone) {
+    names.delete(id)
+    missing.add(id)
+  }
   emitNames()
 }
 
 function ensureNames(ids: string[]) {
-  if (inflight || !ids.some((id) => !names.has(id)) || Date.now() - fetchedAt < NAMES_RETRY_MS) return
+  if (inflight || !ids.some((id) => !names.has(id) && !missing.has(id)) || Date.now() - fetchedAt < NAMES_RETRY_MS) return
   inflight = api.schedules.list({ timeoutMs: 10_000 })
-    .then((r) => { for (const s of r.items ?? []) names.set(s.id, s.name) })
-    .catch(() => { /* 取不到就不写名字 */ })
+    .then((r) => {
+      const items = r.items ?? []
+      for (const s of items) {
+        names.set(s.id, s.name)
+        missing.delete(s.id)
+      }
+      const listed = new Set(items.map((s) => s.id))
+      for (const id of ids) if (!listed.has(id)) missing.add(id)
+    })
+    .catch(() => { /* 取不到就不写名字，也不算删除 */ })
     .finally(() => {
       inflight = null
       fetchedAt = Date.now()
       emitNames()
     })
 }
+
+/** 这个定时任务已删除（取回的列表里没有它、或者刚在本页删掉）。和 useScheduleNames 一起用：取回来后会重渲染 */
+export const scheduleGone = (id: string) => missing.has(id)
 
 /** 这些定时任务的名字（id → 名字）。没记过的去取一次，取回来后重渲染 */
 export function useScheduleNames(ids: (string | null | undefined)[]): ReadonlyMap<string, string> {
@@ -302,29 +324,44 @@ export function ScheduleTag({ scheduleId, name }: { scheduleId: string; name?: s
  *
  * 到点发起的运行（以及没有署名的立即运行）记在「定时任务：X」名下：原来那句「定时任务：X 发起」整句换成这条链接，
  * 不写两遍。有人署名点「立即运行」的，署名照写，后面接「来自定时任务「X」」。名字取定时任务现在的名字（改过名的写
- * 新名字），取不到时用署名里记的那个，再没有就不写名字。页头窄时链接截断，全名在悬停里
+ * 新名字），取不到时用署名里记的那个，再没有就不写名字。
+ *
+ * 前面带和「定时」标记一样的日历图标：页头这一行都是灰字，不带记号看不出这一段能点。页头窄时这一行换行，链接至少留
+ * 几个字宽（以前这一行不换行，只有链接能缩，窄窗口里被挤成 0 宽，Tab 停在一个看不见的链接上），再长截断，全名在悬停里。
+ * 定时任务已经删除的写成纯文本（链过去只有「不存在」页），同一行的「工作流已删除」也是这样
  */
 export function RunScheduleSource({ scheduleId, startedBy }: { scheduleId: string; startedBy?: string | null }) {
   const names = useScheduleNames([scheduleId])
   const recorded = startedBy?.startsWith(T.actorPrefix) ? startedBy.slice(T.actorPrefix.length).trim() : null
   const auto = !startedBy || recorded != null
   const name = names.get(scheduleId) || recorded || null
-  const link = (
+  const body = (text: string) => (
+    <>
+      <CalendarClock size={10} aria-hidden className="shrink-0" />
+      <span className="min-w-0 truncate">{text}</span>
+    </>
+  )
+  const source = scheduleGone(scheduleId) ? (
+    <span title={T.runSourceGoneTitle} data-run-schedule-gone={scheduleId}
+          className="inline-flex min-w-[7em] max-w-full items-center gap-1">
+      {body(auto ? T.runSourceGone(name) : T.runSourceManualGone(name))}
+    </span>
+  ) : (
     <Link
       to={`/schedules/${encodeURIComponent(scheduleId)}`}
       title={T.runSourceTitle(name)}
       data-run-schedule-link={scheduleId}
-      className="min-w-0 truncate rounded-sm text-dim outline-none hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+      className="inline-flex min-w-[7em] max-w-full items-center gap-1 rounded-sm text-dim outline-none hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
     >
-      {auto ? T.runSource(name) : T.runSourceManual(name)}
+      {body(auto ? T.runSource(name) : T.runSourceManual(name))}
     </Link>
   )
-  if (auto || !startedBy) return link
+  if (auto || !startedBy) return source
   return (
     <>
       <span className="shrink-0">{T.runStarter(startedBy)}</span>
       <span>·</span>
-      {link}
+      {source}
     </>
   )
 }
