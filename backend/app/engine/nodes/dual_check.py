@@ -16,12 +16,16 @@
 **遮罩列上的输入不复算。** cell() 取自遮罩列的输入不能单独复算；别的输入（计算式里写成当时代进去的值）里按位置取自
 查询结果的一格（vars.res.rows[0][2]），顺着取值链认出它取自哪份快照的哪一列（recompute.input_origin，证据面板、推演、
 可验证报告同一个认法），按需算那份快照要遮的列（和证据面板同一套，见 _Sources.hidden）——它不一定是 cell() 用到的
-那几份。取自遮罩列、遮没遮核对不了的，整个指标按无法复算记：遮罩值不能当字面量写进交给盲算的计算式。
+那几份。取自遮罩列、遮没遮核对不了的，整个指标按无法复算记：遮罩值不能当字面量写进交给盲算的计算式。伸进查询结果的行、
+却认不出取自哪一列的（下标不是字面量、数据整形改过形状的结果没带快照的 id 和数据源名），计算式里写成「其他输入」。
+交给盲算的分组取值同样按 SQL 认出取自遮罩列的结果列（region AS area、子查询里改了名的），和审批质询同一个认法
+（_value_hidden）。
 
 **一致就放行，不一致交给人。** 不一致时逐个对不上的输入说清两条 SQL 差在哪（data/sql_semantics.explain_sql_diff）：
 两边先收窄到这一格（只留算出这一列的那一项；分组的按这一行的分组值改成等值条件，HAVING 一并去掉），一条查询算好几列、
 分组后取一行时才不会混进「选出的列」「分组」这类和这一格无关的差别。分组的列设了遮罩时不收窄：这一行的分组值写进
-SQL，就跟着差异说明进了审批卡、对照工件和目录日志。完整对照落成一件工件（审批 payload 经 runner._safe 会截断，
+SQL，就跟着差异说明进了审批卡、对照工件和目录日志；遮罩列改了名再分组的（region AS area，在子查询、WITH 里改的也算）
+按 SQL 认出来（_value_hidden），一样不收窄。完整对照落成一件工件（审批 payload 经 runner._safe 会截断，
 长 SQL 放不下），用 replay.ask 挂起。审核人逐个指标选采用原流程（a）、采用盲算（b）或两边都不对（neither）：a 没有
 缺口；b、neither、没选的写进产出的 issuance_gaps，成果节点的出具契约据此降档（on_reject 为 fail 时节点直接失败）。
 两边只差一个方面、又对得上数据目录事实的，选择写进数据目录（engine/dual_check_facts.py，指标自己的筛选范围不写）。
@@ -420,10 +424,9 @@ async def _check(state: GraphState, ctx: NodeContext, targets: list[dict[str, An
         job["metrics"] = sharers[key]
     results, model, same, usage = await _blind(ctx, jobs, options, settings, _producer_models(state, rows))
     for row, metric in zip(rows, targets):
+        masks, queries = row.pop("_masks")
         if row["status"] != UNCHECKED:
-            _compare(row, metric, results, options, load, outputs, row.pop("_masks"))
-        else:
-            row.pop("_masks", None)
+            _compare(row, metric, results, options, load, outputs, masks, queries)
     agreed = sum(1 for r in rows if r["status"] == SAME)
     if agreed and not any(r["status"] == DIFFERENT for r in rows):
         ctx.emit(EventType.LOG, level="info", code="dual_check_agreed", metrics=agreed,
@@ -471,36 +474,46 @@ async def _plan_metric(state: GraphState, metric: dict[str, Any], options: _Opti
         "blind": {"value": None, "rendered": None}, "delta_pct": None, "inputs": [], "differing": [],
     }
     tops = _tops(metric)
+    # masks 是每份用到的快照要遮的列（cell() 的、按位置取的格落在的），queries 只是 cell() 用到的那几份：重算时容器
+    # 输入按内容对快照只对这几份。按位置取的格落在的快照算遮罩只为认这一格，不当成指标用到的结果——放进去的话，同一个
+    # 指标里装着它整份行的容器（计算式里写成「其他输入」，值不交给盲算）会对上它，它有一列遮罩就整个挡下
     masks: dict[str, frozenset[str]] = {}
+    queries: list[str] = []
+    withheld: set[str] = set()
     problem: str | None = None
     for item in metric.get("inputs") or []:
         if not _from_query(item):
             if isinstance(item, dict):
-                problem = problem or await _positional_masks(item, sources, load, outputs, masks)
+                why, shown = await _positional_masks(item, sources, load, outputs, masks)
+                problem = problem or why
+                if not shown:
+                    withheld.add(str(item.get("path")))
             continue
         info, why = await _query_input(item, sources, aliases, tops)
         masks[item["artifact"]] = await sources.hidden(item["artifact"])
+        queries.append(item["artifact"])
         if why:
             problem = problem or why
             continue
         row["inputs"].append(info)
-    row["_masks"] = masks
+    row["_masks"] = (masks, tuple(dict.fromkeys(queries)))
     if problem is None:
         # 什么都不改先重算一遍：和卡上记的对不上（输入还原不了、用到了遮罩列），换了盲算的输入也算不准
         check = recompute.recompute(metric, recompute.Changes(), recompute.Sources(
-            load=load, outputs=outputs, masked=masks, queries=tuple(dict.fromkeys(masks))))
+            load=load, outputs=outputs, masked=masks, queries=row["_masks"][1]))
         if check["status"] != "ok" or check["changed"]:
             problem = f"无法按原表达式重算这个指标（{check.get('reason') or '重算结果与口径卡不一致'}）"
     if problem:
         row.update(status=UNCHECKED, reason=problem)
         return row, {}
     labels = {inp["path"]: f"输入{i}" for i, inp in enumerate(row["inputs"], 1)}
-    formula = _formula(metric, labels)
+    formula = _formula(metric, labels, withheld)
     definition = options.definitions.get(row["metric_id"]) or ""
     jobs: dict[str, dict[str, Any]] = {}
     for inp in row["inputs"]:
         snap, _ = sources.snapshot(inp["artifact"])
-        hidden = (masks.get(inp["artifact"]) or frozenset()) | await _constant_columns(snap or {}, sources)
+        hidden = await _value_hidden(snap or {}, masks.get(inp["artifact"]) or frozenset(), sources) \
+            | await _constant_columns(snap or {}, sources)
         # 列名是原流程的取舍：只有一项来自查询、或者写了口径说明时用不着；几项又没口径说明的，看不出取舍才给
         hint = inp["column"] if len(row["inputs"]) > 1 and not definition and _neutral(inp["column"]) else None
         jobs[inp["key"]] = {
@@ -512,27 +525,52 @@ async def _plan_metric(state: GraphState, metric: dict[str, Any], options: _Opti
 
 
 async def _positional_masks(item: dict[str, Any], sources: _Sources, load: Callable[[str], Any],
-                            outputs: dict[str, str], masks: dict[str, frozenset[str]]) -> str | None:
-    """不是 cell()、Agent 字段的输入里，按位置取自一份查询结果的一格（vars.res.rows[0][2]）：认出它取自哪份快照的哪一列
-    （recompute.input_origin，证据面板、推演、可验证报告同一个认法），把那份快照要遮的列记进 masks，重算的预检据此认出它
-    取自遮罩列、按遮罩说（同一份快照上的那种一样）。只算 cell() 用到的几份快照时，这一格落在另一份快照上就认不出，遮罩值
-    会当字面量写进交给盲算的计算式。
+                            outputs: dict[str, str], masks: dict[str, frozenset[str]]) -> tuple[str | None, bool]:
+    """不是 cell()、Agent 字段的输入里，按位置取自一份查询结果的一格（vars.res.rows[0][2]）：(为什么不能复算, 卡上记的值
+    能不能写进交给盲算的计算式)。认出它取自哪份快照的哪一列（recompute.input_origin，证据面板、推演、可验证报告同一个
+    认法），按需算那份快照要遮的列记进 masks。只算 cell() 用到的几份快照时，这一格落在另一份快照上就认不出，遮罩值会当
+    字面量写进交给盲算的计算式。
 
-    那份快照读不出来、数据源现在设的遮罩又没遮这一列时，查询当时记下的遮罩无从核对：交回原因，按无法复算记，宁可多遮。
-    取值链上的产出读不出来、那份结果没存快照的（遮没遮核对不了），重算的预检自己会拦下，这里不管。"""
+    取自遮罩列的直接交回点名的原因，和 cell() 取自遮罩列的说法一致（指标有好几个输入时审核人才找得到是哪一格）。那份
+    快照读不出来、数据源现在设的遮罩又没遮这一列时，查询当时记下的遮罩无从核对：交回原因，按无法复算记，宁可多遮。
+    取值链上的产出读不出来、那份结果没存快照只带着数据源名的（遮没遮核对不了），重算的预检自己会拦下，这里不管。
+    伸进查询结果的行、却认不出取自哪一列的（下标不是字面量；数据整形改过形状，结果既没带快照的 id 也没带数据源名），
+    照常复算，只是值不写进计算式（写成「其他输入」）：认不出就核对不了遮没遮。"""
     def output(node_id: Any) -> Any:
         key = outputs.get(str(node_id or ""))
         return load(key) if key else None
 
+    path = str(item.get("path") or "")
     origin = recompute.input_origin(item, output)
-    if origin is None or origin.unverified is not None or not origin.artifact:
-        return None
+    if origin is None:
+        return None, not _reaches_rows(path)
+    if origin.unverified is not None or not origin.artifact:
+        return None, False
     hidden = await sources.hidden(origin.artifact, origin.source)
     masks[origin.artifact] = hidden
     if any(c.lower() in hidden for c in origin.columns):
-        return None
+        return f"输入 {path} 取自设置了遮罩的列，不能用于复算", False
     _, why = sources.snapshot(origin.artifact)
-    return f"输入 {item.get('path')} 所在的{why}，核对不了这一格是否取自设置了遮罩的列" if why else None
+    if why:
+        return f"输入 {path} 所在的{why}，无法核对这一格是否取自设置了遮罩的列", False
+    return None, True
+
+
+def _reaches_rows(path: str) -> bool:
+    """取值路径伸进了一份查询结果的行（vars.res.rows[vars.i][0]、nodes.parse['rows'][1]）：按位置取的一格。"""
+    try:
+        node = ast.parse(path, mode="eval").body
+    except SyntaxError:
+        return False
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        inner = node.value
+        if isinstance(node, ast.Subscript) and (
+                (isinstance(inner, ast.Attribute) and inner.attr == "rows")
+                or (isinstance(inner, ast.Subscript) and isinstance(inner.slice, ast.Constant)
+                    and inner.slice.value == "rows")):
+            return True
+        node = inner
+    return False
 
 
 async def _query_input(item: dict[str, Any], sources: _Sources, aliases: dict[str, str], tops: list[str]
@@ -599,9 +637,10 @@ class _Swap(ast.NodeTransformer):
     visit_Attribute = visit_Subscript = visit_Name = _chain
 
 
-def _formula(metric: dict[str, Any], labels: dict[str, str]) -> str:
+def _formula(metric: dict[str, Any], labels: dict[str, str], withheld: set[str] | frozenset[str] = frozenset()) -> str:
     """交给盲算 agent 的计算式：来自查询的输入写成「输入1」「输入2」，别的输入写当时代进去的值（容器写「其他输入」）。
-    不露出取数节点的 id、cell() 的行列：那是原流程的取法，不是业务定义。"""
+    不露出取数节点的 id、cell() 的行列：那是原流程的取法，不是业务定义。withheld 里的输入（按位置取的一格认不出取自哪
+    一列，遮没遮核对不了，见 _positional_masks）也写「其他输入」。"""
     expr = str(metric.get("expression") or "")
     try:
         tree, _, _ = parse_expression(expr)
@@ -612,6 +651,8 @@ def _formula(metric: dict[str, Any], labels: dict[str, str]) -> str:
     def shown(path: str) -> ast.AST | None:
         if path in labels:
             return ast.Name(id=labels[path], ctx=ast.Load())
+        if path in withheld:
+            return ast.Name(id="其他输入", ctx=ast.Load())
         value = values.get(path)
         if value is None or isinstance(value, (bool, int, float)) or (
                 isinstance(value, str) and len(value) <= _DIM_CHARS and not _BRIEF.match(value)):
@@ -644,7 +685,8 @@ def _row_pairs(snapshot: Mapping[str, Any], row: int, column: str) -> list[tuple
 
 def _dims(snapshot: Mapping[str, Any], row: int, column: str, hidden: frozenset[str]) -> list[str]:
     """结果分了组时，交给盲算 agent 的这一行的分组取值（地区、日期这类维度）：它要知道算的是哪一组。只给取值、不给
-    列名（原流程按哪一列分的组正是要它自己判断的），遮罩列、原 SQL 里写死的文字列（hidden，小写）不给。"""
+    列名（原流程按哪一列分的组正是要它自己判断的），取自遮罩列的结果列（_value_hidden）、原 SQL 里写死的文字列（hidden，
+    小写）不给。"""
     out: list[str] = []
     for name, value in _row_pairs(snapshot, row, column):
         if name.lower() in hidden:
@@ -668,6 +710,21 @@ def _neutral(column: str) -> bool:
     """原流程结果的列名看不出取舍（按哪天归属、排没排除、去没去重）：可以交给盲算区分计算式里的几项。"""
     lowered = column.lower()
     return bool(column.strip()) and not any(word in lowered for word in _LOADED_NAME)
+
+
+async def _value_hidden(snapshot: Mapping[str, Any], hidden: frozenset[str], sources: _Sources) -> frozenset[str]:
+    """这份快照里取值来自遮罩列的名字（小写）：遮罩列本身，加上 SQL 里由它改名、套函数、经子查询或 WITH 转一道得来的
+    结果列和 SQL 里的名字（region AS area 的 area）。按列名遮只认得出前一种，后一种的取值照样是遮罩列的：交给盲算的
+    分组取值（_dims）、收窄时补的等值条件（_narrowed）都按这一组挡。和审批质询认改了名的遮罩列同一个认法
+    （inquiry._derived_hidden）：SQL 解析不了、里面又写着遮罩列的，整份快照的列都算。hidden 为空（没设遮罩）时为空。"""
+    from app.engine.inquiry import _derived_hidden   # inquiry 导入了 engine.nodes 里的模块
+
+    if not hidden:
+        return frozenset()
+    name = snapshot.get("source")
+    found = await sources.source(name) if isinstance(name, str) and name else None
+    columns, names = _derived_hidden(dict(snapshot), set(hidden), found.kind if found is not None else None)
+    return frozenset(hidden) | frozenset(c.lower() for c in (*columns, *names))
 
 
 async def _constant_columns(snapshot: Mapping[str, Any], sources: _Sources) -> frozenset[str]:
@@ -908,8 +965,9 @@ def _delta_pct(original: Any, blind: Any) -> float | None:
 
 
 def _compare(row: dict[str, Any], metric: dict[str, Any], results: dict[str, Any], options: _Options,
-             load: Callable[[str], Any], outputs: dict[str, str], masks: dict[str, frozenset[str]]) -> None:
-    """盲算的输入代回原式，和原值比。row 就地改成一致 / 不一致 / 无法复算。"""
+             load: Callable[[str], Any], outputs: dict[str, str], masks: dict[str, frozenset[str]],
+             queries: tuple[str, ...]) -> None:
+    """盲算的输入代回原式，和原值比。row 就地改成一致 / 不一致 / 无法复算。masks、queries 同预检（_plan_metric）。"""
     values: dict[str, Any] = {}
     for inp in row["inputs"]:
         found = results.get(inp["key"])
@@ -924,7 +982,7 @@ def _compare(row: dict[str, Any], metric: dict[str, Any], results: dict[str, Any
             return
         values[inp["path"]] = found["value"]
     outcome = recompute.recompute(metric, recompute.Changes(inputs=values), recompute.Sources(
-        load=load, outputs=outputs, masked=masks, queries=tuple(dict.fromkeys(masks))))
+        load=load, outputs=outputs, masked=masks, queries=queries))
     if outcome["status"] != "ok":
         row.update(status=UNCHECKED, reason=f"用盲算的输入按原表达式算不出结果（{outcome.get('reason') or '无法计算'}）")
         return
@@ -992,10 +1050,13 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
                 continue
             blind_snap, _ = sources.snapshot(str(blind["artifact"])) if blind.get("artifact") else (None, None)
             blind_hidden = await sources.hidden(str(blind["artifact"])) if blind.get("artifact") else frozenset()
-            a_sql = _narrowed(inp["sql"], inp["column"], _record(original_snap, inp["row"]), kind,
-                              await sources.hidden(inp["artifact"])) or inp["sql"]
+            # 收窄按取值来自遮罩列的名字挡（含改了名的）：分组值写进 SQL 就跟着差异说明进了审批卡
+            a_hidden = await _value_hidden(original_snap or {}, await sources.hidden(inp["artifact"]), sources)
+            b_hidden = await _value_hidden(blind_snap or {}, blind_hidden, sources)
+            a_sql = _narrowed(inp["sql"], inp["column"], _record(original_snap, inp["row"]), kind, a_hidden) \
+                or inp["sql"]
             b_sql = _narrowed(blind.get("sql"), blind.get("column"), _record(blind_snap, blind.get("row")), kind,
-                              blind_hidden) or blind.get("sql")
+                              b_hidden) or blind.get("sql")
             diff = await _explain(a_sql, b_sql, infos[inp["source"]])
             per_input.append((inp, blind, diff))
             compared.append((a_sql, str(b_sql or "")))
@@ -1021,7 +1082,7 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
         info = infos.get(str(first.get("source"))) or {}
         facts[row["metric_id"]] = {
             "metric_id": row["metric_id"], "metric": row["name"], "source": first.get("source"),
-            "dialect": info.get("kind"),
+            "dialect": info.get("kind"), "uploaded": bool(info.get("uploaded")),
             "sql": {"a": single[0], "b": single[1]} if single else {},
             "diff": {"equivalent": merged["equivalent"], "fallback": merged["fallback"] or single is None,
                      "items": merged["items"]},
@@ -1060,18 +1121,20 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
 
 
 async def _source_info(sources: _Sources, name: str) -> dict[str, Any]:
-    """比较两条 SQL、预告目录写入要用的：方言、表结构、列的中文名和整份数据目录。数据源没了就都不给，照样比原文。"""
+    """比较两条 SQL、预告目录写入要用的：方言、表结构、列的中文名、整份数据目录，以及是不是上传表格建的数据源
+    （uploaded：导入时日期一律存成文字，业务日期不记时原因照实说，见 dual_check_facts._dated_problem）。数据源没了就
+    都不给，照样比原文。"""
     from app.data import catalog
     from app.data.sql_semantics import catalog_labels
 
     row = await sources.source(name)
     if row is None:
-        return {"kind": None, "schema": None, "names": {}, "notes": {}}
+        return {"kind": None, "schema": None, "names": {}, "notes": {}, "uploaded": False}
     async with SessionLocal() as session:
         entries = await catalog.read_catalog(session, row.id)
     notes = {table: entry.notes for table, entry in entries.items()}
     return {"kind": row.kind, "schema": row.schema_cache if isinstance(row.schema_cache, dict) else None,
-            "names": catalog_labels(notes), "notes": notes}
+            "names": catalog_labels(notes), "notes": notes, "uploaded": (row.origin or "manual") == "upload"}
 
 
 async def _explain(original: Any, blind: Any, info: dict[str, Any]) -> dict[str, Any]:
@@ -1161,9 +1224,10 @@ def _narrowed(sql: Any, column: Any, record: Mapping[str, Any] | None, kind: str
     满足 HAVING，留着只会多出一条和这一格无关的差异。
 
     差异说明拿收窄后的两条比，才只说这一格是怎么算出来的。认不准的（SELECT *、DISTINCT、窗口函数、集合运算、分组键
-    对不上结果列、这一行没有分组值）返回 None，调用方照整条比。hidden 是这份快照要遮的列（小写）：分组键的结果列、
-    或者它用到的列在里面时也返回 None——分组值写进 SQL 就跟着差异说明进了审批卡、对照工件和目录日志，遮罩列的值
-    不能出现在那些地方。"""
+    对不上结果列、这一行没有分组值）返回 None，调用方照整条比。hidden 是这份快照里取值来自遮罩列的名字（小写，
+    _value_hidden：遮罩列，加上 SQL 里由它改名、经子查询或 WITH 转一道得来的）：分组键的结果列、或者它用到的列在里面
+    时也返回 None——分组值写进 SQL 就跟着差异说明进了审批卡、对照工件和目录日志，遮罩列的值不能出现在那些地方。只按
+    遮罩列名比的话，FROM (SELECT region AS area …) GROUP BY area 外层只看得到 area，差异说明还会把别名还原成遮罩列名。"""
     import sqlglot
     from sqlglot import exp
 

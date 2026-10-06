@@ -7,13 +7,16 @@
 - 不一致：挂起，审批 payload 和对照工件按约定，payload 另带实际生效的 on_reject、摘要里每个指标带选 a、选 b 各会往
   数据目录里写什么的预告；a / b / neither 三种选择的产出和缺口，没选的照实记，驳回、on_reject 为 fail 时失败
 - 差异说明只比这一格所在的那一列（一条查询算好几列、分组后取一行的，收窄了再比，HAVING 一并去掉）；分组的列设了
-  遮罩时（改了名再分组的也算）不收窄、照整条比，遮罩列的取值不进审批卡、对照工件、产出和事件
+  遮罩时（改了名再分组的、在子查询或 WITH 里改了名的也算）不收窄、照整条比，遮罩列的取值不进审批卡、对照工件、产出、
+  事件和盲算的任务
 - 只差一个方面时写数据目录（业务日期、有效记录条件），差了不止一处不写，人工确认过的不同说法不覆盖，指标自己的
   筛选范围（取值在运行输入里、用到分组的列）不写，两条 SQL 规范化后一致的不写；人工驳回过的条件不会借着和别的
-  指标并成一项写回去，真写的和审批卡上的预告一致；时间列在表结构里声明成文本的不记成业务日期，预告照实说
+  指标并成一项写回去，真写的和审批卡上的预告一致；时间列在表结构里声明成文本的不记成业务日期，预告照实说（上传表格
+  建的数据源说清日期是按文字保存的）
 - 全局关闭直通、节点覆盖；设置按发起时的快照；重放时盲算不再执行、事件不重复；报告的写作目录不含盲算的查询
-- 触顶、分组结果的维度（只给取值、遮罩列不给）、带着取舍的列名不交给盲算、两个指标用到同一格只盲算一次、遮罩列上的
-  盲算结果不采用；按位置取自另一份快照遮罩列的输入（cell() 取 A、vars.res.rows[0][0] 取 B）按无法复算记，不盲算
+- 触顶、分组结果的维度（只给取值、取自遮罩列的不给）、带着取舍的列名不交给盲算、两个指标用到同一格只盲算一次、遮罩列
+  上的盲算结果不采用；按位置取自另一份快照遮罩列的输入（cell() 取 A、vars.res.rows[0][0] 取 B）按无法复算记、原因点名
+  是哪个输入，不盲算；认不出取自哪一列的按位置取的格不写进计算式；按位置取的格不改变容器输入的判法
 """
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ from sqlalchemy import delete, select
 from app.core import artifact_store
 from app.data import catalog
 from app.db.base import SessionLocal
-from app.db.models import Approval, Run, RunEvent, Setting
+from app.db.models import Approval, DataSource, Run, RunEvent, Setting
 from app.engine import spend
 from app.engine.launch import launch_run
 from app.engine.nodes.dual_check import GAP_UNCHECKED
@@ -589,14 +592,55 @@ async def test_time_columns_declared_as_text_are_not_written_as_the_business_dat
     said = item["catalog"]
     # 两列都是文本：各说被采纳的那一边的列
     for side, label, column in (("a", "原流程", "order_date"), ("b", "盲算", "paid_date")):
-        assert set(said[side]) == {"write", "reason"} and said[side]["write"] is False, said[side]
-        assert f"{label}按时间筛的列「orders.{column}」在表结构里声明为 TEXT，无法确认是日期 / 时间类型" \
-            in said[side]["reason"]
+        assert said[side] == {"write": False, "reason": f"指标「销售额」被采纳的{label}按时间筛的列「orders.{column}」"
+                                                         "在表结构里的类型是 TEXT，无法确认存的是日期，不写入数据目录"}
     done = await decide(client, run.id, {"gmv": "b"})
     assert done.status == "succeeded", done.error
     [wrote] = logs(await events(run.id), "dual_check_catalog")
     assert wrote["written"] == [] and [s["reason"] for s in wrote["skipped"]] == [said["b"]["reason"]]
     assert await notes_of(source_id) is None
+
+
+async def test_an_uploaded_source_says_its_dates_are_stored_as_text(monkeypatch, text_dated_shop, client):
+    """上传表格建的数据源（origin=upload），导入时日期一律存成文字：审批卡的预告和裁决后时间线上跳过的原因，都说上传的
+    表格按文字保存日期，不说「类型是 TEXT」（那不是用户声明的，导入确认时这一列标的是「日期」）。上传源的查询要走版本
+    快照，这里只把节点认数据源来历的那一步（_source_info）换成上传源，查询照手工源走；_source_info 自己认 origin 的那一步
+    另见下一个用例。"""
+    from app.engine.nodes import dual_check
+
+    name, source_id = text_dated_shop
+    real = dual_check._source_info
+
+    async def uploaded(sources, source):
+        return {**await real(sources, source), "uploaded": True}
+
+    monkeypatch.setattr(dual_check, "_source_info", uploaded)
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    assert run.status == "interrupted", run.error
+    [item] = (await pending(run.id)).payload["summary"]
+    said = item["catalog"]
+    for side, label, column in (("a", "原流程", "order_date"), ("b", "盲算", "paid_date")):
+        assert said[side] == {"write": False, "reason": f"指标「销售额」被采纳的{label}按时间筛的列「orders.{column}」"
+                                                         "来自上传的表格，表格里的日期一律按文字保存，无法确认存的是"
+                                                         "日期，不写入数据目录"}
+    done = await decide(client, run.id, {"gmv": "b"})
+    assert done.status == "succeeded", done.error
+    [wrote] = logs(await events(run.id), "dual_check_catalog")
+    assert wrote["written"] == [] and [s["reason"] for s in wrote["skipped"]] == [said["b"]["reason"]]
+    assert await notes_of(source_id) is None
+
+
+async def test_the_source_info_knows_an_uploaded_source(shop):
+    from app.engine.nodes.dual_check import _source_info, _Sources
+
+    name, source_id = shop
+    assert (await _source_info(_Sources(), name))["uploaded"] is False
+    async with SessionLocal() as session:
+        (await session.get(DataSource, source_id)).origin = "upload"
+        await session.commit()
+    assert (await _source_info(_Sources(), name))["uploaded"] is True
+    assert (await _source_info(_Sources(), "dc_no_such_source"))["uploaded"] is False
 
 
 async def test_a_refund_filter_becomes_the_valid_row_filter(monkeypatch, shop, client):
@@ -1031,7 +1075,7 @@ async def test_a_renamed_masked_group_column_is_not_narrowed_either(monkeypatch,
     renamed = (f"SELECT region AS area, SUM(amount) AS gmv FROM orders WHERE status <> 'refunded' "
                f"AND paid_date {WEEK} GROUP BY region ORDER BY region")
     first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
-    Blind(monkeypatch, name, {"首组销售额": (BY_ORDER_DATE, "gmv")})
+    blind = Blind(monkeypatch, name, {"首组销售额": (BY_ORDER_DATE, "gmv")})
     run = await start(graph(name, renamed, metrics=[first], dual={"definitions": {}}))
     assert run.status == "interrupted", run.error
     payload = (await pending(run.id)).payload
@@ -1042,6 +1086,47 @@ async def test_a_renamed_masked_group_column_is_not_narrowed_either(monkeypatch,
     assert done.status == "succeeded", done.error
     _no_masked_value(payload, card, done, await events(run.id))
     _compared_whole(payload, card)
+    # 交给盲算的这一行的分组取值也不给：结果列 area 的值取自遮罩列 region（以前 _dims 只按结果列名认遮罩）
+    [task] = blind.tasks
+    assert "华东" not in task, task
+
+
+#: 外层按 area 分组、取每组的销售额
+_BY_AREA = f"SELECT area, SUM(amount) AS gmv FROM {{}} WHERE status <> 'refunded' AND paid_date {WEEK} GROUP BY area ORDER BY area"
+#: 遮罩列在子查询、WITH 里改了名（直接起别名、套函数、写在列名表里、隔了两层），外层再按新名字分组：外层的分组键 area
+#: 看不出取自遮罩列 region
+RENAMED_INSIDE = {
+    "subquery": _BY_AREA.format("(SELECT region AS area, amount, status, paid_date FROM orders) t"),
+    "cte": "WITH t AS (SELECT region AS area, amount, status, paid_date FROM orders) " + _BY_AREA.format("t"),
+    "function": "WITH t AS (SELECT UPPER(region) AS area, amount, status, paid_date FROM orders) " + _BY_AREA.format("t"),
+    "column_list": ("WITH t(area, amount, status, paid_date) AS (SELECT region, amount, status, paid_date FROM orders) "
+                    + _BY_AREA.format("t")),
+    "nested": _BY_AREA.format("(SELECT area, amount, status, paid_date FROM (SELECT region AS area, amount, status, "
+                              "paid_date FROM orders) a) b"),
+}
+
+
+@pytest.mark.parametrize("shape", list(RENAMED_INSIDE))
+async def test_a_masked_group_column_renamed_inside_is_not_narrowed_or_shown(monkeypatch, masked_shop, client, shape):
+    """遮罩列在子查询或 WITH 里改了名（region AS area），外层按 area 分组：外层只看得到 area，以前照常拿这一行的分组值
+    补上「area = '华东'」，差异说明把别名还原成「region = '华东'」，进了审批卡、对照工件和目录日志；交给盲算的这一行的
+    分组取值里也有「华东」。现在按 SQL 认出取值来自遮罩列的名字（同审批质询认改了名的遮罩列）：不收窄、照整条比，
+    盲算任务里也不给这一组的取值。"""
+    name, _ = masked_shop
+    first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    blind = Blind(monkeypatch, name, {"首组销售额": (BY_ORDER_DATE, "gmv")})
+    run = await start(graph(name, RENAMED_INSIDE[shape], metrics=[first], dual={"definitions": {}}))
+    assert run.status == "interrupted", run.error
+    payload = (await pending(run.id)).payload
+    [item] = payload["summary"]
+    assert item["original_rendered"].startswith("300") and item["blind_rendered"].startswith("310")
+    card = artifact_store.load(payload["card_artifact"])
+    done = await decide(client, run.id, {"first": "a"})
+    assert done.status == "succeeded", done.error
+    evs = await events(run.id)
+    _no_masked_value(payload, card, done, evs)
+    [task] = blind.tasks
+    assert "华东" not in task, task
 
 
 def _compared_whole(payload: dict, card: dict) -> None:
@@ -1071,6 +1156,24 @@ async def test_a_masked_group_column_of_the_blind_query_is_not_narrowed_either(m
     _no_masked_value(payload, card, done, await events(run.id))
 
 
+async def test_a_with_clause_that_does_not_touch_masked_columns_is_still_narrowed(monkeypatch, masked_shop):
+    """数据源设了遮罩，原流程的 WITH 里却没用到遮罩列、按渠道分组：照常收窄到这一行（补上 channel = 'offline'），差异
+    说明说得出这个条件。认改了名的遮罩列是按 SQL 追到底的，不是见到子查询、WITH 就一律不收窄。"""
+    name, _ = masked_shop
+    by_channel = (f"WITH t AS (SELECT channel, amount, status, paid_date FROM orders) SELECT channel, SUM(amount) AS gmv "
+                  f"FROM t WHERE status <> 'refunded' AND paid_date {WEEK} GROUP BY channel ORDER BY channel")
+    first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
+    blind = Blind(monkeypatch, name, {"首组销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, by_channel, metrics=[first], dual={"definitions": {}}))
+    assert run.status == "interrupted", run.error
+    [item] = (await pending(run.id)).payload["summary"]
+    assert item["original_rendered"].startswith("230") and item["blind_rendered"].startswith("330")
+    assert any("channel = 'offline'" in d for d in item["diff"]), item["diff"]
+    # 渠道不是遮罩列：交给盲算的这一行的分组取值照给
+    [task] = blind.tasks
+    assert "「offline」" in task, task
+
+
 #: 销售额（第一份快照的一格）加上首组地区名的字数（第二份快照按位置取的一格）
 MIX = {"id": "mix", "name": "销售额加首组名称字数", "unit": "元", "decimals": 1, "format": "thousands",
        "expression": "cell(nodes.fetch, 0, 'gmv') + len(vars.res.rows[0][0])"}
@@ -1098,7 +1201,8 @@ async def test_a_masked_cell_read_by_position_from_another_snapshot_is_not_blind
     out = dual_output(run, evs)
     [row] = out["metrics"]
     assert row["metric_id"] == "mix" and row["status"] == "unchecked", row
-    assert "遮罩" in row["reason"] and "推演" not in row["reason"], row["reason"]
+    # 和 cell() 取自遮罩列的说法一致，点名是哪个输入：指标有好几个输入时审核人才找得到是哪一格
+    assert row["reason"] == "输入 vars.res.rows[0][0] 取自设置了遮罩的列，不能用于复算", row["reason"]
     assert out["status"] == "unchecked" and out["issuance_gaps"] == [GAP_UNCHECKED.format(name=MIX["name"],
                                                                                           reason=row["reason"])]
     assert blind.tasks == [] and blind.runs == 0, blind.tasks
@@ -1135,15 +1239,61 @@ async def test_a_cell_read_by_position_from_an_unreadable_snapshot_is_not_truste
     from app.engine.nodes.dual_check import _positional_masks, _Sources
 
     name, _ = masked_shop
-    for source, expected in ((name, None), ("dc_no_such_source", "输入 vars.res.rows[0][0] 所在的查询快照与哈希不一致，"
-                                                                "疑似被修改，核对不了这一格是否取自设置了遮罩的列")):
+    for source, expected in ((name, "输入 vars.res.rows[0][0] 取自设置了遮罩的列，不能用于复算"),
+                             ("dc_no_such_source", "输入 vars.res.rows[0][0] 所在的查询快照与哈希不一致，疑似被修改，"
+                                                   "无法核对这一格是否取自设置了遮罩的列")):
         sources = _Sources()
         sources.snapshots[LOST] = (None, "查询快照与哈希不一致，疑似被修改")
         masks: dict = {}
         state = {"state:parse": parsed_regions(source)}
-        why = await _positional_masks(POSITIONAL, sources, state.get, {"parse": "state:parse"}, masks)
-        assert why == expected, source
+        why, shown = await _positional_masks(POSITIONAL, sources, state.get, {"parse": "state:parse"}, masks)
+        assert (why, shown) == (expected, False), source
         assert ("region" in masks[LOST]) is (source == name), masks
+
+
+async def test_a_cell_whose_origin_cannot_be_told_is_not_written_into_the_formula(masked_shop):
+    """按位置取的一格认不出取自哪份结果的哪一列——下标不是字面量（rows[vars.i]）、数据整形改过形状的结果既没带快照的 id
+    也没带数据源名——遮没遮无从核对：计算式里写成「其他输入」，不把卡上记的值交给盲算模型。认得出、又没遮的照常写值；
+    不伸进查询结果的行的输入（运行输入、常量）也照常写。"""
+    from app.engine.nodes.dual_check import _formula, _positional_masks, _Sources
+
+    name, _ = masked_shop
+    reshaped = {"columns": ["region", "gmv"], "rows": [["华东", 300.0], ["华北", 30.0]]}
+    cases = [
+        ({"path": "vars.res.rows[vars.i][0]", "value": "华东", "node_id": "parse", "via": "transform"},
+         {**reshaped, "artifact": LOST, "source": name}, False),
+        ({**POSITIONAL}, reshaped, False),
+        ({"path": "vars.limit", "value": 3, "node_id": "parse", "via": "transform"}, reshaped, True),
+    ]
+    for item, parsed, expected in cases:
+        state = {"state:parse": parsed}
+        why, shown = await _positional_masks(item, _Sources(), state.get, {"parse": "state:parse"}, {})
+        assert (why, shown) == (None, expected), item["path"]
+    metric = {"expression": "cell(nodes.fetch, 0, 'gmv') + len(vars.res.rows[vars.i][0]) + vars.limit",
+              "inputs": [{"path": "cell(nodes.fetch, 0, 'gmv')", "value": 330.0},
+                         {"path": "vars.res.rows[vars.i][0]", "value": "华东"}, {"path": "vars.i", "value": 0},
+                         {"path": "vars.limit", "value": 3}]}
+    formula = _formula(metric, {"cell(nodes.fetch, 0, 'gmv')": "输入1"}, {"vars.res.rows[vars.i][0]"})
+    assert formula == "输入1 + len(其他输入) + 3", formula
+
+
+#: 销售额，加上第二份快照的行数（容器）和首组的销售额（按位置取的一格，不在遮罩列上）
+MIX_COUNTS = {"id": "mix", "name": "销售额加地区数和首组销售额", "unit": "元", "decimals": 1, "format": "thousands",
+              "expression": "cell(nodes.fetch, 0, 'gmv') + len(vars.res.rows) + vars.res.rows[0][1]"}
+
+
+async def test_reading_a_cell_by_position_does_not_change_how_a_container_input_is_judged(monkeypatch, masked_shop):
+    """按位置取的那一格在第二份快照（B）的没遮的列上，同一个指标另用了 B 的行数（容器，计算式里写成「其他输入」，值不交给
+    盲算）。按位置取的那一格只为认遮罩算 B 的遮罩，不把 B 当成 cell() 用到的快照：以前 B 因此进了重算的快照清单，容器的
+    完整值对上了 B，B 有一列遮罩就整个按「用到了遮罩列」挡下——只写 len(vars.res.rows) 能核、加上这一格就不能核了。"""
+    name, _ = masked_shop
+    blind = Blind(monkeypatch, name, {MIX_COUNTS["name"]: (RIGHT, "gmv")})
+    run = await start(with_regions(graph(name, RIGHT, metrics=[MIX_COUNTS], dual={"definitions": {}}), name))
+    assert run.status == "succeeded", run.error
+    out = dual_output(run, await events(run.id))
+    assert out["status"] == "agreed" and out["metrics"][0]["status"] == "agreed", out
+    [task] = blind.tasks
+    assert "len(其他输入) + 300.0" in task and "华东" not in task, task
 
 
 def _no_masked_value(payload: dict, card: dict, done: Run, evs: list[RunEvent], value: str = "华东") -> None:

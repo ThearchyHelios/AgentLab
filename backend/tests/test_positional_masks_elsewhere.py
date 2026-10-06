@@ -54,7 +54,7 @@ async def dual_output(run_id: str) -> dict:
 
 async def test_the_dual_check_does_not_blind_compute_a_metric_reading_a_masked_cell_by_position(shop):
     """mix = round(cell(nodes.fetch, 1, 'amount') + len(vars.res.rows[1][2]), 1)：cell() 那一格不在遮罩列上，按位置取的
-    号码在。预检判它用到了遮罩列，按无法复算记缺口，原因不说「推演」；没遮罩时预检照常通过、指标进入盲算。"""
+    号码在。认出它取自遮罩列，按无法复算记缺口，原因点名是哪个输入、不说「推演」；没遮罩时预检照常通过、指标进入盲算。"""
     import asyncio
 
     from app.db.base import SessionLocal
@@ -76,7 +76,7 @@ async def test_the_dual_check_does_not_blind_compute_a_metric_reading_a_masked_c
     masked = await run({"mask_columns": ["phone"]})
     [mix] = masked["metrics"]
     assert mix["metric_id"] == "mix" and mix["status"] == "unchecked"
-    assert mix["reason"] == "无法按原表达式重算这个指标（这个指标用到了设置了遮罩的列）"
+    assert mix["reason"] == "输入 vars.res.rows[1][2] 取自设置了遮罩的列，不能用于复算"
     assert "推演" not in json.dumps(masked, ensure_ascii=False)
     assert not [p for p in PHONES if p in json.dumps(masked, ensure_ascii=False)]
     assert any("遮罩" in gap for gap in masked["issuance_gaps"])
