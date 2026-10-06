@@ -1,0 +1,76 @@
+"""审批质询的回答：依据写进括号不再断句，收尾超时记时长上限，占位词不当回答（期 5 真实模型验收 M1）。
+
+真实模型验收里，质询 agent 写的「结果一致（[[see:Q3]]，原报告 SQL 未按 status 过滤）」「合计 [[v:Q1.r1.金额合计]]
+（[[see:Q1]]）」渲染成「（，原报告…）」「（）」，随正式运行封存；另一次回答查完了，收尾那次调用超过时长上限，报错写着
+「回答超过时长上限（180 秒）」，answer.limit 却是 null，界面上缺了「已达时长上限」。
+
+模型一律是 MockChatModel 剧本，区域、金额都是虚构的。
+"""
+from __future__ import annotations
+
+from app.core import artifact_store
+from app.engine import verify_agent
+from app.engine.inquiry import NO_ANSWER
+from tests.test_inquiry_api import (  # noqa: F401 - 夹具按名字引入
+    NO_TEST,
+    QUESTION,
+    Models,
+    Play,
+    ask,
+    client,
+    engine_up,
+    events,
+    pause,
+    pending,
+    set_verify,
+    shop,
+)
+from tests.test_verify_rationale_rules import slow_final
+
+#: 依据写进了括号：开头跟着逗号的、只有依据的
+BRACKETED = ("仍居各区域之首（[[see:Q1]]，已排除测试账号）：华东为 [[v:Q1.r0.销售额]]（[[see:Q1]]），"
+             "华南为 [[v:Q1.r1.销售额]]（同口径，[[see:Q1]]）。")
+BRACKETED_TEXT = "仍居各区域之首（已排除测试账号）：华东为 1,200，华南为 900（同口径）。"
+
+
+async def _asked(client, shop) -> tuple[dict, list]:
+    paused = await pause(shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question=QUESTION, approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    return r.json()["inquiry"], await events(paused.id, "approval.inquiry")
+
+
+async def test_see_in_brackets_does_not_break_the_answer(monkeypatch, shop, client):
+    Models(monkeypatch, shop, plays={"排除测试账号": Play([NO_TEST], BRACKETED)})
+    item, [event] = await _asked(client, shop)
+    answer = item["answer"]
+    assert answer["ok"] is True and answer["text"] == BRACKETED_TEXT
+    doc = artifact_store.load(answer["doc_artifact"])
+    assert doc["markdown"] == BRACKETED_TEXT and doc["source"] == BRACKETED
+    assert doc["violations"] == []
+    assert event.data["answer_text"] == BRACKETED_TEXT
+
+
+async def test_a_final_answer_that_runs_out_of_time_reports_the_time_limit(monkeypatch, shop, client):
+    """质询 agent 查完了、自己停下，交回答那次调用超过时长上限：报错说时长上限，limit 也是 timeout_s（事件里同样）。"""
+    await set_verify({"inquiry": {"timeout_s": 0.5}})
+    monkeypatch.setattr(verify_agent, "SETTLE_GRACE_S", 0.3)
+    models = Models(monkeypatch, shop)
+    slow_final(monkeypatch)
+    item, [event] = await _asked(client, shop)
+    answer = item["answer"]
+    assert answer["ok"] is False and answer["text"] == "" and answer["doc_artifact"] is None
+    assert answer["error"] == "回答超过时长上限（0.5 秒），未能给出回答，可缩小问题范围后重新提问"
+    assert answer["limit"] == "timeout_s"
+    assert [q["sql"] for q in item["queries"]] == [NO_TEST], "查到的照记"
+    assert (event.data["limit"], event.data["error"]) == ("timeout_s", answer["error"])
+    assert models.finals == [], "交回答那次没等到回复"
+
+
+async def test_a_placeholder_answer_is_no_answer(monkeypatch, shop, client):
+    Models(monkeypatch, shop, plays={"排除测试账号": Play([NO_TEST], "placeholder")})
+    item, _ = await _asked(client, shop)
+    answer = item["answer"]
+    assert (answer["ok"], answer["text"], answer["limit"]) == (False, "", None)
+    assert answer["error"] == NO_ANSWER

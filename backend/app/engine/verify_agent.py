@@ -124,7 +124,10 @@ VERIFY_FINAL_PROMPT = (
     "row 是行号（从 0 数），column 是列名。系统按引用从查询结果里取值，你自己写的数字不会被采用；查不到就写 null，"
     "不要估算\n"
     "- rationale 写理由，简短说清依据。理由里出现的每个数字都写成 [[v:Q1.r0.列名]] 这样的引用，系统会换成查询结果"
-    "里的值；不要直接写数字，提到某次查询时写 [[see:Q1]]\n"
+    "里的值；不要直接写数字\n"
+    "- 要指明一句话依据的是哪次查询，在这句的句末写 [[see:Q1]]，比如「……结果一致。[[see:Q3]]」。[[see:…]] 渲染后"
+    "不显示，只能挂在句末：不要放进括号，也不要写进句子中间、写在「依据」「见」「取自」这类字后面，否则会留下「（）」"
+    "「（，」「依据。」这样的断句\n"
     "- 其余字段按各自的说明填写"
 )
 _CELL_REF: dict[str, Any] = {
@@ -662,6 +665,20 @@ def _parsed(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+#: 只是占位词的理由（只留字母、数字和汉字，不分大小写）：模型照着结构填了个字面的 placeholder、N/A，等于没给理由
+_PLACEHOLDERS = frozenset({"placeholder", "todo", "tbd", "na", "none", "null", "nil", "rationale", "reason",
+                           "无", "暂无", "略", "理由"})
+
+
+def _no_rationale(value: Any) -> bool:
+    """交回的理由等于没给：不是文字、空的、只有标点，或者只是一个占位词。当没给理由处理（理由为空、没有理由文档），
+    审批卡照「没有给出理由」说，不把占位词当理由展示。"""
+    if not isinstance(value, str):
+        return True
+    word = "".join(ch for ch in value if ch.isalnum()).casefold()
+    return not word or word in _PLACEHOLDERS
+
+
 @dataclass
 class _State:
     """一次核查过程中攒下的东西：出意外时也照这些交回，用了多少、查了什么不丢。"""
@@ -1007,10 +1024,13 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
     if parsed is None:
         if settle_cut:
             return await report_cut("verify_result", settler.max_tokens)
-        why = "收尾时超过时长上限，没能交结果" if isinstance(failure, asyncio.TimeoutError) else \
+        timed_out = isinstance(failure, asyncio.TimeoutError)
+        why = "收尾时超过时长上限，没能交结果" if timed_out else \
             f"核查模型没有按结构交结果（{explain_model_error(failure, model_id)}）" if failure is not None else \
             "核查模型没有按结构交结果"
-        return outcome(limit=stopped, answered=answered, error=why)
+        # 收尾超时也是触了时长上限：模型自己停了查询（stopped 为 None）时照实记 timeout_s，和原因对得上（质询的报错说
+        # 时长上限，界面按 limit 标「已达时长上限」）。循环里先撞上的上限照旧优先，同上面金额被拒的收尾
+        return outcome(limit=stopped or ("timeout_s" if timed_out else None), answered=answered, error=why)
     declared = list((resolved.get("properties") or {}) if _is_object(resolved) else {})
     if declared and not any(k in parsed for k in declared):
         # 一个要求的字段都没交：不是「查不到」，是没按结构交。不这么分，字段名对不上的回复会被当成什么都没查到
@@ -1023,7 +1043,7 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
     result = cells.walk(resolved, parsed) if _is_object(resolved) else {}
     rationale = parsed.get(RATIONALE)
     doc = None
-    if isinstance(rationale, str) and rationale.strip():
+    if not _no_rationale(rationale):
         doc = compose_doc(rationale, build_catalog(nodes={}, ledger=ledger), node_id=owner, run_id=run_id or None)
     result[RATIONALE] = doc["markdown"] if doc else ""
     return outcome(result=result, cells=cells.cells, rationale=doc, limit=stopped, answered=answered)

@@ -117,7 +117,7 @@ CHALLENGE_SYSTEM = (
     "原因说过了头；refuted 查到的数据和这句结论相矛盾；inconclusive 查不到判断所需的数据\n"
     "- 没有找到反例不等于结论被推翻：只有数据和结论冲突时才判 refuted\n"
     "- 结论要有出处：一条查询都没执行成功时，判什么都不会被采信；判 refuted 时，理由里至少要引用一处你自己查询的"
-    "结果（[[v:Qn.rX.列名]] 或 [[see:Qn]]），否则同样不会被采信"
+    "结果：写 [[v:Qn.rX.列名]] 引用一格，或者在那句的句末写 [[see:Qn]]，否则同样不会被采信"
 )
 CHALLENGE_TASK_PROMPT = (
     "要审的结论（报告「{report}」中的一句{section}）：\n「{claim}」\n\n"
