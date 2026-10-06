@@ -8,11 +8,12 @@
   浏览器先核它的哈希，再从里面读出报告文档、口径卡、查询快照的 id。其余事件只给哈希：工具返回、节点产出的
   预览里可能有遮罩列的原值和提示词。
 - 工件：每份报告文档（各报告节点最后一次自查记下的 doc_artifact）、它引用到的口径卡和查询快照，按原字节
-  base64 嵌入，浏览器重算 sha256 和 id 比；带遮罩的快照不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，
-  有输入取自遮罩列（cell() 的格、Agent 字段、按位置取的 vars.res.rows[0][2]）的整张卡同样只给 id，认法和证据
-  面板、推演同一个（recompute.input_origin）；服务端文件被改过的卡照样按卡上记的输入认，解析不出一张卡的整张只给
-  id。只给 id 的工件，服务端的文件和 id 对不上的另标 mismatch、解析不出来的另标 unparsable，核对页照实说（对不上的
-  判不通过）。没被报告引用的工件不嵌。
+  base64 嵌入，浏览器重算 sha256 和 id 比。数据源设了遮罩的查询快照，能证明这条查询没碰遮罩列的（_untouched）照常
+  嵌入，别的不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，有输入取自遮罩列（cell() 的格、Agent 字段、按位置
+  取的 vars.res.rows[0][2]，SQL 里改了名字的遮罩列也算）的整张卡同样只给 id，认法和证据面板、推演同一个
+  （recompute.input_origin）；服务端文件被改过的卡照样按卡上记的输入认，解析不出一张卡的整张只给 id。只给 id 的工件，
+  服务端的文件和 id 对不上的另标 mismatch、解析不出来的另标 unparsable，核对页照实说（对不上的判不通过）。没被报告
+  引用的工件不嵌。
 - 封存之后追加的事件（按需裁判、审批质询这类批注）单列：类型、序号、内容摘要，不进清单。
 
 它只证明「内部一致」：数字、文档、运行记录彼此对得上，而且没被改过。真伪要拿页面上的封存哈希和系统里这次
@@ -26,6 +27,7 @@ import base64
 import hashlib
 import html
 import json
+import logging
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
@@ -41,6 +43,8 @@ from app.engine.merge_query import MERGE_SOURCE
 from app.engine.recompute import input_origin
 from app.engine.schema import NodeType
 from app.engine.toolcalls import QUERY_PREFIX
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = "agentlab.bundle/1"
 
@@ -104,11 +108,14 @@ class _Store:
         return raw is not None and content_hash(bytes(raw)) == artifact
 
     def masked(self, artifact: str) -> bool:
-        """这份查询快照算不算带遮罩：查询当时记下了遮罩列（mask_columns），或者它的数据源现在设了遮罩
-        （合并查询看它合并的那几个数据源）。比证据面板粗：面板只遮那几列，这里整份不随文件附带——文件会
-        离开系统，遮罩只减少暴露，宁可多挡。读不出来的快照不知道带没带遮罩，按带遮罩算。"""
+        """这份查询快照算不算带遮罩（整份不随文件附带、只给 id）：查询当时记下了遮罩列（mask_columns），或者它的数据源
+        现在设了遮罩（合并查询看它合并的那几个数据源），而且证明不了这条查询没碰遮罩列（_untouched）。比证据面板粗：
+        面板只遮那几列，这里要么原字节整份附带、要么只给 id——拿掉几格哈希就对不上了；文件会离开系统，遮罩只减少暴露，
+        宁可多挡。读不出来的快照不知道带没带遮罩，按带遮罩算；服务端的文件和 id 对不上的，里面的 SQL、列名都不可信，
+        也按带遮罩算。"""
         if artifact not in self._masked:
-            self._masked[artifact] = _snapshot_masked(self.content(artifact), self._source_masks)
+            self._masked[artifact] = _snapshot_masked(self.content(artifact), self._source_masks,
+                                                      intact=self.intact(artifact))
         return self._masked[artifact]
 
     def card_masked(self, artifact: str, events: Sequence[tuple[int, str, str | None, Any]]) -> bool:
@@ -157,14 +164,15 @@ class _Store:
         return any(c.lower() in hidden for c in origin.columns)
 
 
-def _snapshot_masked(content: Any, source_masks: Mapping[str, Any]) -> bool:
+def _snapshot_masked(content: Any, source_masks: Mapping[str, Any], *, intact: bool) -> bool:
     if not isinstance(content, dict):
         return True
     recorded = content.get("mask_columns")
-    if isinstance(recorded, list) and any(isinstance(c, str) and c.strip() for c in recorded):
-        return True
     sources = content.get("sources") if content.get("source") == MERGE_SOURCE else [content.get("source")]
-    return any(source_masks.get(str(name or "")) for name in sources or [])
+    if not (isinstance(recorded, list) and any(isinstance(c, str) and c.strip() for c in recorded)) \
+            and not any(source_masks.get(str(name or "")) for name in sources or []):
+        return False
+    return not (intact and _untouched(content, _snapshot_hidden(content, source_masks)))
 
 
 def _snapshot_hidden(content: dict[str, Any], source_masks: Mapping[str, Any]) -> set[str]:
@@ -176,6 +184,202 @@ def _snapshot_hidden(content: dict[str, Any], source_masks: Mapping[str, Any]) -
         now = source_masks.get(str(name or ""))
         hidden |= {str(c).lower() for c in now} if isinstance(now, (list, tuple, set, frozenset)) else set()
     return hidden
+
+
+# --------------------------------------------------------------------------
+# 设了遮罩的数据源上的查询：能不能证明没碰遮罩列
+# --------------------------------------------------------------------------
+
+#: 数据源查询工具（tools/datasource.py）落的查询快照里会有的键。有别的键的（比如核查 agent 在查询时就把遮罩列换成
+#: 「已遮罩」、另记下了遮了哪些列）不知道它记着什么，照现有规则只给 id
+_QUERY_KEYS = frozenset({"columns", "rows", "row_count", "truncated", "elapsed_ms", "sql", "column_types", "source",
+                         "checks", "schema_artifact", "mask_columns", "data_version"})
+#: 导出时只知道数据源设的遮罩、不知道是哪种库：SQL 按每种支持的库的读法各解析一遍（None 是 sqlglot 的通用读法），
+#: 至少一种读得通，读得通的每一种都要过关
+_READINGS = (None, "sqlite", "mysql", "postgres", "oracle")
+#: 语法树和数据库实际执行的对不上的写法：MySQL 会执行的注释（/*! … */，解析器当注释扔掉），Postgres 按 Unicode 转义
+#: 写的名字（U&"…"，原文里看不出是哪一列）
+_OPAQUE_SQL = re.compile(r'/\*!|u&"', re.I)
+
+
+def _untouched(snapshot: dict[str, Any], hidden: set[str]) -> bool:
+    """数据源设了遮罩的一份查询快照，能不能证明这条查询没碰遮罩列（快照里不会有遮罩值）。全部满足才算，能证明的照常
+    随文件附带：
+    - 认得这份快照：数据源查询工具落的那种（不是合并查询，没有不认识的键），SQL、列名、行都在；
+    - 结果的列名对不上遮罩列（按数据库交回的列名，不论大小写）；
+    - SQL 原文里没写到遮罩列，条件里、COUNT 里也不行：SQL 随快照一起附带，WHERE phone = '…' 的字面量就是遮罩值。
+      连字符串、注释里写到的也算（宁可多挡）；语法树认不准的写法（_OPAQUE_SQL）也不行；
+    - SQL 解析得了；每种读得通的读法下，没有认不出结果里哪一列取自哪一列的写法（_stray_columns：列名表、整行引用、
+      可能展开出遮罩列的 *），按 SQL 认遮罩列的那一套（inquiry._derived_hidden，双盲复算、审批质询用的同一个）也认不出
+      哪个结果列取自遮罩列。SQL 里没写到遮罩列时它本来就认不出，这一条是同一套认法的第二道关，那一套以后认得更多时
+      跟着收紧。
+    判断过程出错按碰了算。和证据面板一样只按列名认遮罩：视图里换了名字的遮罩列认不出（遮罩只减少暴露，不是安全边界）。
+    hidden 是要遮的列（小写，_snapshot_hidden）。"""
+    names = {name.strip() for name in hidden if name.strip()}
+    sql, columns = snapshot.get("sql"), snapshot.get("columns")
+    if not names or snapshot.get("source") == MERGE_SOURCE or not set(snapshot) <= _QUERY_KEYS \
+            or not isinstance(sql, str) or not sql.strip() or not isinstance(snapshot.get("rows"), list) \
+            or not isinstance(columns, list) or not all(isinstance(c, str) for c in columns):
+        return False
+    result = {c.strip().lower() for c in columns}
+    if result & names or _writes_any(sql, names) or _OPAQUE_SQL.search(sql):
+        return False
+    try:
+        from app.data.sql_semantics import _parse, _read
+        from app.engine.inquiry import _derived_hidden   # inquiry 导入了 engine.nodes 里的模块：用到时再导入
+
+        readings = [(kind, tree) for kind in _READINGS for tree in [_parse(sql, _read(kind))[0]] if tree is not None]
+        return bool(readings) and not any(
+            _stray_columns(tree) or result & {c.lower() for c in _derived_hidden(dict(snapshot), set(names), kind)[0]}
+            for kind, tree in readings)
+    except Exception:  # noqa: BLE001 - 解析器、认遮罩列的那一套出了意外：按碰了遮罩列算（宁可多挡）
+        logger.warning("可验证报告：判断查询快照有没有碰遮罩列时出错，按碰了处理", exc_info=True)
+        return False
+
+
+def _writes_any(sql: str, names: Iterable[str]) -> bool:
+    """SQL 原文里有没有写到这些名字：不论大小写，前后不是字母、数字、下划线（引号、括号、点都算隔开）。"""
+    return any(re.search(rf"(?<![0-9A-Za-z_]){re.escape(n)}(?![0-9A-Za-z_])", sql, re.I) for n in names if n)
+
+
+def _stray_columns(tree: Any) -> bool:
+    """语法树里有没有认不出结果里哪一列取自哪一列的写法。有的话，就算 SQL 里没写到遮罩列、结果的列名也对不上，结果里
+    照样可能是遮罩列的值：
+    - 列名表（members AS m(a, b, c)、(…) AS t(a, b)、WITH t(a, b)）：按位置给列改了名；
+    - 整行引用（Postgres 的 SELECT m、to_json(m)，_whole_row）：一整行装进一列；
+    - 可能展开出遮罩列的 *：展开了数据源里的表（隔着几层派生来源也算，_star_reaches），又不是只按名字往外传的那几种
+      （_contained）。COUNT(*) 只数个数，不算。"""
+    from sqlglot import exp
+
+    if any(alias.columns for alias in tree.find_all(exp.TableAlias)):
+        return True
+    if any(_whole_row(column) for column in tree.find_all(exp.Column)):
+        return True
+    memo: dict[int, bool] = {}
+    return any(_star_reaches(node, memo) and not _contained(node) for node in _stars(tree))
+
+
+def _sources(select: Any) -> list[Any]:
+    """一条 SELECT 的 FROM、JOIN 里的来源节点。"""
+    from_ = select.args.get("from_")
+    out = [from_.this] if from_ is not None and from_.this is not None else []
+    return out + [join.this for join in select.args.get("joins") or [] if join.this is not None]
+
+
+def _derived(source: Any) -> Any:
+    """FROM、JOIN 里的一个来源是派生来源（子查询、LATERAL、指向 WITH 里一段的名字）时，它的那块查询；数据源里的表、表函数、
+    VALUES 这类是 None（有哪些列、装着什么，SQL 里看不出）。"""
+    from sqlglot import exp
+
+    from app.data.sql_semantics import _visible_ctes
+
+    node = source.this if isinstance(source, exp.Lateral) else source
+    if isinstance(node, exp.Table):
+        if node.args.get("db") or node.args.get("catalog") or not isinstance(node.this, exp.Identifier):
+            return None
+        cte = _visible_ctes(node).get(node.name.lower())
+        if cte is None:
+            return None
+        node = cte.this
+    while isinstance(node, exp.Subquery):
+        node = node.this
+    return node if isinstance(node, (exp.Select, exp.SetOperation)) else None
+
+
+def _leaves(block: Any) -> list[Any]:
+    """一块查询的每一支，按先后：UNION 这类摊开，套在外面的括号去掉。"""
+    from sqlglot import exp
+
+    if isinstance(block, exp.Subquery):
+        return _leaves(block.this)
+    if isinstance(block, exp.SetOperation):
+        return _leaves(block.this) + _leaves(block.expression)
+    return [block]
+
+
+def _whole_row(column: Any) -> bool:
+    """一个没写表名的名字是不是整行引用（Postgres 的 SELECT m、to_json(m)：一整行装进一列）。Postgres 先按列认：所在
+    SELECT 的派生来源明写出了叫这个名字的列，就是那一列；不然对上它看得见的某个来源的名字（别名、表名、WITH 里的一段）
+    就算。看得见的是所在 SELECT 和外层 SELECT 的 FROM、JOIN 里的来源；WITH 里的一段、FROM 里的子查询看不见同一层的来源
+    （LATERAL 看得见）。数据源里的表有哪些列这里不知道：碰巧和表、别名同名的列也算（宁可多挡）。"""
+    from sqlglot import exp
+
+    name = column.name.lower()
+    select = column.find_ancestor(exp.Select)
+    if column.table or isinstance(column.this, exp.Star) or not name or select is None:
+        return False
+    for body in filter(None, map(_derived, _sources(select))):
+        first = _leaves(body)[0]
+        if isinstance(first, exp.Select) and any(
+                isinstance(item, (exp.Alias, exp.Column)) and not isinstance(item.this, exp.Star)
+                and item.alias_or_name.lower() == name for item in first.expressions):
+            return False
+    child, node = column, column.parent
+    while node is not None:
+        sees = child.arg_key not in ("with_", "from_", "joins") or isinstance(child.this, exp.Lateral)
+        if isinstance(node, exp.Select) and sees \
+                and any((source.alias_or_name or "").lower() == name for source in _sources(node)):
+            return True
+        child, node = node, node.parent
+    return False
+
+
+def _stars(tree: Any) -> list[Any]:
+    """语法树里的 *（t.* 取包着它的 Column），COUNT(*)、COUNT(t.*) 不算：只数个数。"""
+    from sqlglot import exp
+
+    nodes = [star.parent if isinstance(star.parent, exp.Column) else star for star in tree.find_all(exp.Star)]
+    return [node for node in nodes if not isinstance(node.parent, exp.Count)]
+
+
+def _star_reaches(node: Any, memo: dict[int, bool]) -> bool:
+    """这个 *（t.* 是 Column 包着的 *）展开了数据源里的表没有：t.* 看 FROM、JOIN 里叫 t 的那一个来源，单独的 * 看所在
+    SELECT 的全部来源。数据源里的表、表函数、VALUES 这类来源都算展开了；派生来源看它每一支选出项里的 * 展开了没有
+    （隔几层都一样）。t 对不上任何来源（外层的别名）、找不到所在的 SELECT，按展开了算。"""
+    from sqlglot import exp
+
+    select = node.find_ancestor(exp.Select)
+    if select is None:
+        return True
+    sources = _sources(select)
+    if isinstance(node, exp.Column):
+        sources = [s for s in sources if (s.alias_or_name or "").lower() == node.table.lower()]
+        if not sources:
+            return True
+    for source in sources:
+        block = _derived(source)
+        if block is None:
+            return True
+        if id(block) not in memo:
+            # 先记成展开了：递归的 WITH 绕回自己时按展开了算
+            memo[id(block)] = True
+            memo[id(block)] = any(not isinstance(leaf, exp.Select) or any(
+                _star_reaches(star, memo) for item in leaf.expressions for star in _stars(item))
+                for leaf in _leaves(block))
+        if memo[id(block)]:
+            return True
+    return False
+
+
+def _contained(node: Any) -> bool:
+    """展开出来的列只按名字往外传的 *：它就是一条 SELECT 的选出项本身（不套在表达式里），这条 SELECT 不在 UNION 这类
+    里，而且是 FROM / JOIN 里的派生来源、LATERAL、WITH 里的一段（外层只能按名字取它的列：写到遮罩列的名字原文里就有，
+    再经 * 展开它又会被那个 * 认出来），或者 EXISTS / IN 里的子查询（只决定有没有、在不在）。最外层的 *（结果就是它
+    展开的列）、UNION 里的、标量子查询里的都不算。"""
+    from sqlglot import exp
+
+    select = node.parent
+    if not isinstance(select, exp.Select) or node.arg_key != "expressions":
+        return False
+    outer = select
+    while isinstance(outer.parent, exp.Subquery):
+        outer = outer.parent
+    parent = outer.parent
+    if isinstance(parent, (exp.CTE, exp.Lateral, exp.Exists)):
+        return True
+    if isinstance(parent, (exp.From, exp.Join)):
+        return outer is not select
+    return isinstance(parent, exp.In) and outer.arg_key == "query"
 
 
 def _card_outputs(events: Sequence[tuple[int, str, str | None, Any]], card: str) -> dict[str, str]:
