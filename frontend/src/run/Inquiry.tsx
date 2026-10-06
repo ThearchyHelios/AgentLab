@@ -513,6 +513,13 @@ const groupKey = (t: { unit: string | null; quote: string | null }) =>
 
 /** 问的不是眼前这一稿报告的那几条：单独一组，排在最后 */
 const OTHER = 'other'
+/** 别的审批里问的、审批列表又没取到，不知道是不是眼前这一稿：也单独一组，排在最后，给重试 */
+const UNSURE = 'unsure'
+/**
+ * 不按句子挂的两组：句子编号对不上（或者不知道对不对得上），回答引用报告已有的出处时不在眼前这一稿里找；正在回答的、
+ * 提问框也不挂进来
+ */
+const offDoc = (key: string) => key === OTHER || key === UNSURE
 
 interface Group {
   key: string
@@ -610,6 +617,10 @@ export function ReportInquiry({ runId, report, docArtifact, access, cardId = nul
     if (a === (cardId ?? null)) return true
     return !!a && !!docArtifact && docsSlot?.map[a]?.[report] === docArtifact
   }, [cardId, docArtifact, docsSlot, report])
+  // 审批列表没取到时，别的审批里问的、那张审批又不在之前取到的列表里：不知道是不是眼前这一稿，不能算「其他版本」。
+  // 取到了列表却没有那张审批的（审批记录没了）、这份报告没有报告文档（拿什么都对不上）的，重取也一样，照旧算对不上
+  const unsure = useCallback((x: Inquiry) => !!docArtifact && docsSlot?.status === 'error' && !!x.approval_id
+    && !(x.approval_id in docsSlot.map), [docArtifact, docsSlot])
 
   const groups = useMemo(() => {
     const out = new Map<string, Group>()
@@ -619,9 +630,10 @@ export function ReportInquiry({ runId, report, docArtifact, access, cardId = nul
       return out.get(k)!
     }
     const others: InquiryEntry[] = []
+    const unsures: InquiryEntry[] = []
     for (const e of entries) {
       if (sameDoc(e.inquiry)) add(e.inquiry.unit, e.inquiry.quote).entries.push(e)
-      else if (settled) others.push(e)
+      else if (settled) (unsure(e.inquiry) ? unsures : others).push(e)
     }
     // 正在回答的、没问成的、开着的提问框挂在它们问的那一句下面（按先后）：那句还没有问答时另起一组
     if (mine) add(mine.target.unit, mine.target.quote)
@@ -629,8 +641,11 @@ export function ReportInquiry({ runId, report, docArtifact, access, cardId = nul
     if (draft) add(draft.target.unit, draft.target.quote)
     const list = [...out.values()]
     if (others.length) list.push({ key: OTHER, unit: null, quote: null, entries: others })
+    if (unsures.length) list.push({ key: UNSURE, unit: null, quote: null, entries: unsures })
     return list
-  }, [entries, sameDoc, settled, mine, draft, failed])
+  }, [entries, sameDoc, unsure, settled, mine, draft, failed])
+  // 重取审批列表：列表按运行取，一份里各张审批都有。取的时候这两组先收起（同第一次取），取回来按结果重新归拢
+  const retryDocs = useCallback(() => { void loadApprovalDocs(runId, foreign) }, [loadApprovalDocs, runId, foreign])
 
   // 提交之后提问框拿掉了，焦点接到「正在回答」那一条上；回答回来那一条换掉了，再接到回答上。焦点已经去了别处的不抢；
   // 没问成（提问框带着报错重新打开）时焦点由提问框自己接。都只在问的那一处：同一张卡挂在两处时另一处不动
@@ -697,15 +712,15 @@ export function ReportInquiry({ runId, report, docArtifact, access, cardId = nul
         <div className="mt-1.5 space-y-2">
           {groups.map((g) => (
             <div key={g.key} className="min-w-0"
-                 data-inquiry-group={g.key === OTHER ? OTHER : g.unit ?? (g.quote ? 'quote' : 'report')}>
-              <GroupHead group={g} units={units} />
+                 data-inquiry-group={offDoc(g.key) ? g.key : g.unit ?? (g.quote ? 'quote' : 'report')}>
+              <GroupHead group={g} units={units} onRetry={retryDocs} />
               <div className="mt-1 space-y-2 border-l pl-2">
                 {g.entries.map((e) => (
                   <EntryView key={e.id} runId={runId} entry={e} groupQuote={g.unit ? null : g.quote}
-                             otherDoc={g.key === OTHER} onLocate={g.key === OTHER ? undefined : onLocate}
+                             otherDoc={offDoc(g.key)} onLocate={offDoc(g.key) ? undefined : onLocate}
                              focusRef={e.id === latest ? (el) => { lastRef.current = el } : undefined} />
                 ))}
-                {g.key !== OTHER && (
+                {!offDoc(g.key) && (
                   <>
                     {mine && groupKey(mine.target) === g.key && (
                       <PendingView pending={mine} focusRef={(el) => { pendingRef.current = el }} />
@@ -740,14 +755,25 @@ export function ReportInquiry({ runId, report, docArtifact, access, cardId = nul
 
 /**
  * 一组的抬头：问的是哪一句（原文从报告文档取，取不到写「报告中的一句」）、哪段原文，或者整份报告。问的不是眼前这一稿的
- * 那一组只写明这一点：句子编号对不上，不去取原文
+ * 那一组只写明这一点：句子编号对不上，不去取原文。审批列表没取到、不知道是哪一稿的那一组照实说，给重试（onRetry）
  */
-function GroupHead({ group, units }: { group: Group; units: Map<string, string> }) {
+function GroupHead({ group, units, onRetry }: { group: Group; units: Map<string, string>; onRetry: () => void }) {
   if (group.key === OTHER) {
     return (
       <div className="min-w-0 text-2xs leading-relaxed" data-inquiry-about="">
         <span className="font-medium text-dim" data-inquiry-about-text="">{INQUIRY_TEXT.otherDoc}</span>
         <span className="block text-faint">{INQUIRY_TEXT.otherDocHint}</span>
+      </div>
+    )
+  }
+  if (group.key === UNSURE) {
+    return (
+      <div className="flex min-w-0 flex-wrap items-start gap-x-2 gap-y-1 text-2xs leading-relaxed" data-inquiry-about="">
+        <span className="min-w-0 flex-1">
+          <span className="font-medium" style={{ color: 'var(--st-waiting)' }} data-inquiry-about-text="">{INQUIRY_TEXT.unsureDoc}</span>
+          <span className="block text-faint">{INQUIRY_TEXT.unsureDocHint}</span>
+        </span>
+        <button type="button" className="btn btn-xs shrink-0" data-inquiry-docs-retry="" onClick={onRetry}>{INQUIRY_TEXT.retry}</button>
       </div>
     )
   }

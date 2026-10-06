@@ -4329,6 +4329,18 @@
     "unit": "u2"
    },
    "created_at": "2026-10-05T06:58:00"
+  },
+  {
+   "id": "ab8f8dbfb139d3be461bd9b5f4024cc161be5588a2eea9275a47eac160bfc885",
+   "kind": "inquiry_answer",
+   "node_id": null,
+   "size": 2380,
+   "meta": {
+    "report": "write",
+    "unit": "u3",
+    "question": "本周枫岭片区 GMV 环比下降了多少？下降的主要原因是不是 SKU 结构的变化 "
+   },
+   "created_at": "2026-10-05T07:04:00"
   }
  ],
  "card_artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e"

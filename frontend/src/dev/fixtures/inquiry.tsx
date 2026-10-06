@@ -1,5 +1,6 @@
 import { useMemo, useState, type JSX } from 'react'
 import { createPortal } from 'react-dom'
+import { parseServerTime } from '../../lib/format'
 import { ArtifactsPane, useRunArtifacts } from '../../pages/runs/ArtifactsPane'
 import { EvidencePane } from '../../pages/runs/EvidencePane'
 import { ApprovalCard } from '../../run/RunPanel'
@@ -29,7 +30,8 @@ import fx from './inquiry.json'
  * - ?syn=inquiry-run-formal：封存了的正式运行，不给入口，审批时问过的照列
  * - ?syn=inquiry-run-waiting：停在审批上的运行，同运行详情直接打开「证据」页签：时间线里的待审批卡和证据页签同时挂着
  *   同一份报告的问答串（卡上这张审批里问的直接认，证据页签哪张审批都要对一下）
- * - ?syn=inquiry-run-artifacts：运行详情的「工件」页签（pages/runs/ArtifactsPane），工件列表里有质询的回答
+ * - ?syn=inquiry-run-artifacts：运行详情的「工件」页签（pages/runs/ArtifactsPane），工件列表里有封存后追加的质询回答
+ *   （运行期间产出的能跳到航迹，封存后追加的不能）
  *
  * 列表、提问、质询工件、报告文档、证据图、审批列表、工件列表、设置都由检查脚本用 page.route 伪造；直接打开时问答串照实说
  * 无法读取。
@@ -141,13 +143,22 @@ function Waiting({ approval, run }: { approval: Approval; run: Run }) {
   )
 }
 
-/** 运行详情的「工件」页签：工件列表由检查脚本按 inquiry.json 的 run_artifacts 答 */
+/**
+ * 运行详情的「工件」页签：工件列表由检查脚本按 inquiry.json 的 run_artifacts 答。航迹的起止照这次运行的开始、结束时间
+ * 给（同运行详情）：运行期间产出的工件能跳到航迹里那一刻，封存后追加的质询回答和它的查询快照不给跳转。点过的跳转记在
+ * data-fixture-moment 上
+ */
 function RunArtifacts({ run }: { run: Run }) {
   const list = useRunArtifacts(run.id, '0')
-  const trace = useMemo(() => emptyTrace(), [])
+  const trace = useMemo(() => ({
+    ...emptyTrace(), phase: 'succeeded' as const,
+    startedAt: parseServerTime(run.started_at ?? null)?.getTime(), endedAt: parseServerTime(run.finished_at ?? null)?.getTime(),
+  }), [run.started_at, run.finished_at])
+  const [moment, setMoment] = useState<number | null>(null)
   return (
-    <div className="h-screen min-w-0" data-fixture="inquiry-run-artifacts">
-      <ArtifactsPane list={list} graph={null} trace={trace} labelOf={(id) => (id ? LABELS[id] : undefined)} />
+    <div className="h-screen min-w-0" data-fixture="inquiry-run-artifacts" data-fixture-moment={moment ?? ''}>
+      <ArtifactsPane list={list} graph={null} trace={trace} labelOf={(id) => (id ? LABELS[id] : undefined)}
+                     onMoment={(at) => setMoment(at)} />
     </div>
   )
 }

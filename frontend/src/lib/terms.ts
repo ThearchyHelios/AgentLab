@@ -3442,6 +3442,12 @@ export const INQUIRY_TEXT = {
   /** 之前几轮审批里问的、报告后来改写过（句子编号对不上），或者对不上是哪一稿：单独一组 */
   otherDoc: '报告其他版本上的质询',
   otherDocHint: '提问时的报告与当前显示的版本不同，或无法确认是否相同，所以不挂到当前报告的句子下面',
+  /**
+   * 别的审批里问的、审批列表又没取到：不知道提问时审的是哪一稿，不能说成「其他版本」（审批人会以为报告换过稿）。
+   * 单独一组照实说没能确认，给重试
+   */
+  unsureDoc: '无法确认提问时的报告版本',
+  unsureDocHint: '审批记录读取失败，暂不挂到当前报告的句子下面',
   loadFailed: '无法读取之前的质询记录',
   retry: '重试',
   q: '问',
@@ -3514,12 +3520,11 @@ export const INQUIRY_TEXT = {
   artifactKind: '质询回答',
   /**
    * 服务端在工件的 meta 里只记问题的前 40 字（engine/inquiry.py 的 QUESTION_BRIEF）：满 40 字的多半截断过，末尾补省略号，
-   * 免得半句话读成整个问题
+   * 免得半句话读成整个问题。字数按原样数、显示时才去掉首尾空白：服务端截之前已经去过整个问题的首尾空白，摘要以空格、
+   * 换行结尾只会是截断截在了空白上，先去空白再数就少了一个字、漏掉省略号
    */
-  artifactAbout: (question: string) => {
-    const chars = [...question.trim()]
-    return `质询「${chars.join('')}${chars.length >= 40 ? '…' : ''}」的回答`
-  },
+  artifactAbout: (question: string) =>
+    `质询「${question.trim()}${[...question].length >= 40 ? '…' : ''}」的回答`,
   /** meta 里没有问题摘要时的说法（服务端照理都会记，这里兜底）：照报告文档那一句写装的是什么 */
   artifactAboutNone: '审批质询的回答：逐段的片段和每个数字的出处',
 }
