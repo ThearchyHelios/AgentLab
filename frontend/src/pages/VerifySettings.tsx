@@ -179,7 +179,8 @@ export function VerifySection({ cur, errors, onEdit, refresh }: {
 
   /** 某项设成不限时，它还受哪些眼下设着的上限约束 */
   const note = (k: LimitKey): string => {
-    if (TIMEOUTS.has(k)) return S.unlimitedNote('timeout', [])
+    // 审批质询不在运行的那一段里执行，只受模型接口的超时约束；双盲复算、反方审稿还受单次运行时限约束
+    if (TIMEOUTS.has(k)) return S.unlimitedNote(k === 'inquiry.timeout_s' ? 'timeout' : 'runTimeout', [])
     if (k === 'challenge.max_claims') return S.unlimitedNote('claims', [S.bound.claims])
     if (k === 'daily_max_usd') {
       const counts = [...COUNTS].some((c) => cur[c] !== null)

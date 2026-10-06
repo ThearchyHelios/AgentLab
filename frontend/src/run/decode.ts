@@ -807,6 +807,14 @@ const cjkText = (v: unknown): string | undefined => (typeof v === 'string' && /[
 /** 个数：给的是数就取整，给的是清单就数一下，别的（缺了、写坏了）当不知道 */
 const countOf = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v)
   : Array.isArray(v) ? v.length : undefined)
+/**
+ * 核查类日志的 cause：单次运行时限将至（服务端 engine/deadline.py）。核查节点为后续节点预留时间，没开始的、缩短时长后
+ * 到时没做完的另起一条带上它。这几行不叫人调高核查的上限（只会更快撞线），也不叫人去查模型和数据源
+ */
+const RUN_DEADLINE = 'run_deadline'
+/** run_seconds（单次运行时限）→ 那句副标题；不是正数（缺了、写坏了）就不写 */
+const deadlineSub = (v: unknown): string | undefined =>
+  (typeof v === 'number' && Number.isFinite(v) && v > 0 ? DC.deadlineSub(v) : undefined)
 
 /**
  * 几种「看着跑完了、其实没做成」的状况（NI-3/4/5）。后端这几条日志是写给排查的，原样
@@ -1148,17 +1156,20 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       }
     }
     case 'dual_check_unchecked': {
-      // metrics 是 [{id, name, reason}]：副标题点名、说原因（没起名字的写 id）
+      // metrics 是 [{id, name, reason}]：副标题点名、说原因（没起名字的写 id）。带 cause: run_deadline 的是单次运行时限
+      // 将至没核成的那几个（服务端另起这一条，原因都一样）：副标题只点名、带上时限，下一步说怎么腾出时间
       const list = Array.isArray(d.metrics) ? d.metrics.filter(isRecord) : []
+      const late = d.cause === RUN_DEADLINE
       const parts = list.map((m) => {
         const name = str(m.name) ?? str(m.id)
-        const why = cjkText(m.reason)
+        const why = late ? undefined : cjkText(m.reason)
         return name ? `「${name}」${why ? `：${why}` : ''}` : ''
       }).filter(Boolean)
+      const sub = late ? [parts.join('、'), deadlineSub(d.run_seconds)].filter(Boolean).join('；') : parts.join('；')
       return {
-        title: DC.log.unchecked(list.length || undefined),
-        sub: parts.length ? parts.join('；') : undefined,
-        next: DC.log.uncheckedNext,
+        title: (late ? DC.log.deadline : DC.log.unchecked)(list.length || undefined),
+        sub: sub || undefined,
+        next: late ? DC.log.deadlineNext : DC.log.uncheckedNext,
         level: 'warn',
       }
     }
@@ -1201,6 +1212,16 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
     case 'challenge_limit': {
       const which = str(d.limit)
       const skipped = countOf(d.claims_skipped)
+      if (d.cause === RUN_DEADLINE) {
+        // 时长按剩余时间缩短过的那几句到了时（limit 照旧是 timeout_s，服务端单起这一条）：不说「已达时长上限」，不叫人
+        // 调高每句的上限。claims：这样的句数
+        return {
+          title: CL.deadlineLimit(countOf(d.claims) || undefined, skipped || undefined),
+          sub: deadlineSub(d.run_seconds),
+          next: CL.deadlineNext,
+          level: 'warn',
+        }
+      }
       return {
         title: CL.limit((which && DC.limitLabel[which]) || DC.limitAny, skipped || undefined),
         next: which === 'daily_max_usd' ? DC.limitDailyNext : CL.limitNext,
@@ -1208,7 +1229,16 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       }
     }
     case 'challenge_unreviewed': {
-      // claims_skipped：未能反查的句数；reason：第一句未能反查的原因（一句中文）
+      // claims_skipped：未能反查的句数；reason：第一句未能反查的原因（一句中文）。带 cause: run_deadline 的是单次运行
+      // 时限将至、剩下没开始的句子（服务端另起这一条）：副标题说时限，下一步说怎么腾出时间，不叫人去查模型和数据源
+      if (d.cause === RUN_DEADLINE) {
+        return {
+          title: CL.deadline(countOf(d.claims_skipped) || undefined),
+          sub: deadlineSub(d.run_seconds) ?? cjkText(d.reason),
+          next: CL.deadlineNext,
+          level: 'warn',
+        }
+      }
       return {
         title: CL.unreviewed(countOf(d.claims_skipped) || undefined),
         sub: cjkText(d.reason),

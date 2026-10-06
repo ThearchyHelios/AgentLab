@@ -24,6 +24,7 @@ from app.db.models import Approval, Run, RunEvent, Workflow
 from app.engine.approval import read_decision
 from app.engine.compiler import compile_graph, initial_state
 from app.engine.context import NodeError, RunContext
+from app.engine.deadline import segment
 from app.engine.replay import PROTOCOL, PROTOCOL_KEY, protocol_of
 from app.engine.schema import GraphSpec, NodeType, loop_steps, topology_of, validate_graph
 from app.tools.datasource import RUN_VERSIONS_KEY
@@ -714,7 +715,8 @@ class RunManager:
                 # 代码执行它——一个挂住的模型或工具能把运行和它占着的并发名额一直拖着。
                 # 按"这一段执行"计：等人工审批时 _drive 已经结束，那段时间不算。
                 deadline = asyncio.timeout(settings.max_run_seconds)
-                async with deadline:
+                # 截止时刻同时交给节点（engine/deadline.py）：核查节点据此在上限之内收尾，不把整次运行拖到被中止
+                async with deadline, segment(deadline.when(), settings.max_run_seconds):
                     async for mode, chunk in app.astream(
                         payload, config=config, stream_mode=["custom", "updates"]
                     ):
