@@ -2506,7 +2506,7 @@ def compose_doc(
 
     stats / violations 由 verify_doc 算出，和出口契约复核用的是同一个函数。
     整表标记先展开成每格一个 [[v:]] 的 Markdown 表，之后和模型自己写的表格走同一条路；
-    doc["source"] 仍是模型的原文。
+    doc["source"] 是调用方交来的原文（报告节点交来前去掉了整篇外层围栏，见 report._unfenced）。
     """
     source = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     snaps = _Snapshots(loader, entities=entities)

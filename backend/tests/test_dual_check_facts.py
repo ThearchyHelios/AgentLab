@@ -4,8 +4,9 @@
   条件，聚合只差去不去重、被采纳的一边去重 → 去重规则；按被采纳那一边的写法记
 - 业务日期只在两边的列都在表结构里声明为带日期的类型（DATE、DATETIME、TIMESTAMP，带精度、带时区的写法也算）时才写：
   文本、整数（Unix 秒、20260901 这类日期键）、只有时刻的 TIME、表结构里查不到、没声明类型（SQLite 探出来是 NULL）的
-  不写，原因说清是哪一列、哪一边（未被采纳的那一边另说清为什么也要看它）；上传表格建的数据源说清日期是按文字保存的；
-  数据源还没有可用的表结构时说表结构不可用
+  不写，原因说清是哪一列、哪一边（未被采纳的那一边另说清为什么也要看它）；上传表格建的数据源，按文字保存的列看导入时
+  配方里认作日期的列（候选的 upload_dates）：是的算日期列，不是的、读不出配方的说清日期是按文字保存的；数据源还没有
+  可用的表结构时说表结构不可用
 - 差了不止一处、有兜底说明、两条 SQL 规范化后一致、差在别的方面、被采纳的一边没有可记的写法、只有一边按时间筛：不写，
   照实说原因。同一列上的时间范围不同、跨两张表的条件，差异说明只给兜底，同样不写；说明以后真把跨两张表的条件说成一条
   筛选条件，derive 自己那道「只涉及一张表」的检查也拦得下
@@ -365,6 +366,99 @@ def test_an_uploaded_table_says_its_dates_are_stored_as_text():
     assert fact is None and "未被采纳的原流程按时间筛的列「orders.order_date」在表结构里的类型是 INTEGER" in why
     assert "被采纳的盲算按时间筛的列「orders.paid_date」在表结构里的类型是 TEXT" in derive(
         candidate(BY_ORDER_DATE, RIGHT, "b"), texts)[1]
+
+
+#: 上传表格的列按文字保存、配方里又没认作日期时的原因（同上一个用例）
+STORED_AS_TEXT = "来自上传的表格，表格里的日期一律按文字保存，无法确认存的是日期"
+
+
+def uploaded(original: str, blind: str, choice: str, dates: dict | None) -> dict:
+    """上传表格建的数据源的候选：upload_dates 是节点从当前版本的配方读出的、导入时认作日期的列（{表: [列]}）。"""
+    return {**candidate(original, blind, choice), "uploaded": True,
+            **({"upload_dates": dates} if dates is not None else {})}
+
+
+def test_an_uploaded_column_the_import_took_as_a_date_is_a_date():
+    """上传表格建的数据源，表结构里的日期列总是 TEXT（导入时一律按文字保存），可导入时配方里这两列的类型是「日期」（候选的
+    upload_dates）：照常记成业务日期，采纳哪一边记哪一列，预告是同一套判断。"""
+    texts = schema_with(order_date="TEXT", paid_date="TEXT")
+    both = {"orders": ["order_date", "paid_date"]}
+    for choice, column in (("a", "order_date"), ("b", "paid_date")):
+        fact, why = derive(uploaded(BY_ORDER_DATE, RIGHT, choice, both), texts)
+        assert why is None, why
+        assert (fact.table, fact.item, fact.value, fact.choice) == \
+            ("orders", "business_date", {"column": column}, choice)
+        said = preview(uploaded(BY_ORDER_DATE, RIGHT, choice, both), texts, {})
+        assert said[choice] == {"write": True, "source": "shop", "table": "orders", "item": "business_date",
+                                "value": {"column": column}}
+
+
+@pytest.mark.parametrize("dates, column, owner", [
+    # 配方读不出来（简单导入没有配方、配方记录坏了）：两列都照旧说按文字保存
+    (None, "orders.paid_date", "b"),
+    ({}, "orders.paid_date", "b"),
+    # 配方里只有一列是日期，另一列是文字：没认作日期的那一列照旧说
+    ({"orders": ["paid_date"]}, "orders.order_date", "a"),
+    ({"orders": ["order_date"]}, "orders.paid_date", "b"),
+    # 认作日期的是别的表的同名列：对不上这一列
+    ({"customers": ["order_date", "paid_date"]}, "orders.paid_date", "b"),
+])
+def test_an_uploaded_column_the_import_did_not_take_as_a_date_keeps_the_reason(dates, column, owner):
+    """配方里不是日期、或者读不出配方的列：照现在的原因不写（说按文字保存，不说「类型是 TEXT」），被采纳的一边先说；
+    被采纳的一边是日期、未被采纳的不是的，说未被采纳的那一边、另说清为什么也要看它。"""
+    texts = schema_with(order_date="TEXT", paid_date="TEXT")
+    fact, why = derive(uploaded(BY_ORDER_DATE, RIGHT, "b", dates), texts)
+    assert fact is None
+    if owner == "b":
+        assert why == f"指标「销售额」被采纳的盲算按时间筛的列「{column}」{STORED_AS_TEXT}，不写入数据目录", why
+    else:
+        assert why == (f"指标「销售额」未被采纳的原流程按时间筛的列「{column}」{STORED_AS_TEXT}：{BOTH_DATES}，"
+                       "不写入数据目录"), why
+    assert preview(uploaded(BY_ORDER_DATE, RIGHT, "b", dates), texts, {})["b"] == {"write": False, "reason": why}
+
+
+def test_the_import_dates_only_speak_for_text_columns_of_an_uploaded_source():
+    """upload_dates 只回答「按文字保存的这一列，导入时是不是日期」：
+    - 不是上传源（手工登记的库）的文本列照旧说类型，候选里带着 upload_dates 也不认
+    - 上传源里声明成别的类型的列（整数）照旧说类型；只有时刻的仍不算日期"""
+    texts = schema_with(order_date="TEXT", paid_date="TEXT")
+    both = {"orders": ["order_date", "paid_date"]}
+    fact, why = derive({**candidate(BY_ORDER_DATE, RIGHT, "b"), "upload_dates": both}, texts)
+    assert fact is None and "「orders.paid_date」在表结构里的类型是 TEXT，无法确认存的是日期" in why
+    fact, why = derive(uploaded(BY_ORDER_DATE, RIGHT, "b", both), schema_with(order_date="INTEGER", paid_date="TEXT"))
+    assert fact is None and "未被采纳的原流程按时间筛的列「orders.order_date」在表结构里的类型是 INTEGER" in why
+    fact, why = derive(uploaded(BY_ORDER_DATE, RIGHT, "b", both), schema_with(order_date="TEXT", paid_date="TIME"))
+    assert fact is None and "「orders.paid_date」在表结构里的类型是 TIME，只有时刻，不含日期" in why
+
+
+def test_the_import_dates_follow_the_names_in_the_table_structure():
+    """差异说明里的名字是规范化过的（不加引号的一律小写），配方里、表结构里的写法可能带大写：按表结构认出的那一列去对
+    upload_dates，大小写不同照样对得上。"""
+    upper = {"tables": {"Orders": {"name": "Orders", "columns": [
+        {"name": "Status", "type": "TEXT"}, {"name": "Order_Date", "type": "TEXT"},
+        {"name": "Paid_Date", "type": "TEXT"}, {"name": "Amount", "type": "REAL"}]}}}
+    fact, why = derive(uploaded(BY_ORDER_DATE, RIGHT, "b", {"Orders": ["Order_Date", "Paid_Date"]}), upper)
+    assert why is None and (fact.table, fact.value) == ("Orders", {"column": "paid_date"})
+    fact, why = derive(uploaded(BY_ORDER_DATE, RIGHT, "b", {"orders": ["order_date", "paid_date"]}), upper)
+    assert why is None and (fact.table, fact.value) == ("Orders", {"column": "paid_date"})
+
+
+def test_the_joint_preview_reads_the_import_dates_too():
+    """几个指标落到同一张上传表的业务日期上：preview_joint 和单个指标的预告、真写一样从候选认 upload_dates。"""
+    from app.engine.dual_check_facts import preview_joint
+
+    texts = schema_with(order_date="TEXT", paid_date="TEXT")
+    both = {"orders": ["order_date", "paid_date"]}
+    picked = [{**uploaded(BY_ORDER_DATE, RIGHT, "a", both), "metric": "销售额", "metric_id": "gmv"},
+              {**uploaded(BY_ORDER_DATE, RIGHT, "a", both), "metric": "订单金额", "metric_id": "total"}]
+    by = {tuple((m["metric_id"], m["choice"]) for m in e["members"]): e
+          for e in preview_joint(picked, {"shop": (texts, {})})}
+    assert by[(("gmv", "b"), ("total", "b"))]["outcomes"] == {
+        "gmv": {"write": True, "value": {"column": "paid_date"}},
+        "total": {"write": True, "value": {"column": "paid_date"}}}
+    # 配方读不出来的同一组候选：一项都认不出，没有可预告的组合
+    plain = [{**c, "upload_dates": {}} for c in picked]
+    assert preview_joint(plain, {"shop": (texts, {})}) == []
 
 
 async def test_an_undeclared_column_read_from_a_real_database_is_said_to_have_no_type(tmp_path):
