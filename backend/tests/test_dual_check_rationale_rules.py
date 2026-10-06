@@ -40,3 +40,12 @@ async def test_a_placeholder_rationale_is_not_shown_as_the_explanation(monkeypat
     mine = await _blind_input(monkeypatch, shop, "placeholder")
     assert mine["value"] == 330.0, "数照样采用"
     assert (mine["rationale"], mine["rationale_doc"]) == ("", None)
+
+
+async def test_a_rationale_that_shows_nothing_is_not_kept(monkeypatch, shop):
+    """只写了依据（显示出来是空的），或者占位词后面挂着依据：说明为空、不留文档。以前文档照样记下，审批卡按文档画出
+    「理由」两个字，后面什么都没有。"""
+    for said in ("（[[see:Q1]]）", "placeholder。[[see:Q1]]"):
+        mine = await _blind_input(monkeypatch, shop, said)
+        assert mine["value"] == 330.0, "数照样采用"
+        assert (mine["rationale"], mine["rationale_doc"]) == ("", None), said

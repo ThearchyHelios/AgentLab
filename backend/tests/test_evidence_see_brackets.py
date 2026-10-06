@@ -4,20 +4,27 @@
 [[see:Q1]]」，模型就把它写进括号、句中：「结果一致（[[see:Q3]]，原报告 SQL 未按 status 过滤）」「合计
 [[v:Q1.r1.金额合计]]（[[see:Q1]]）」，渲染后剩下「（，原报告…）」「（）」，正式运行里随封存永久留着。
 
-- 括号（全角、半角，一对里混用也算）里只有依据的，连括号一起去掉，括号前的空白照 see 前的空白处理
+- 括号（全角、半角，一对里混用也算）里只有依据的，连括号一起去掉；去掉之后整对括号当一个依据，外面照下面几条再收拾
+  一遍（括号前悬着的停顿标点、括号前后的空白）
+- 去掉括号之后两边的数字、字母会粘成一串的（「4,919.5（[[see:Q1]]）2 月」），括号换成一个空格：粘起来读成另一个数，
+  哪项核对都查不出来；半角逗号夹着依据、去掉后一个之后同理（「212,[[see:Q1]],5」→「212, 5」）
 - 依据在括号开头、后面跟着「，」「、」「；」「：」的，标点一起去掉；在括号末尾、前面紧挨着标点的同理
-- 依据夹在两个分隔标点中间的，去掉后一个；后面就到句末（句号、换行、全文结尾）、前面或几个依据之间有「，」「、」
-  「；」的，去掉这些标点；依据后面、句末前面的标点是写作者自己的，不动
+- 依据夹在两个分隔标点中间的，去掉后一个；后面就到句末（句末标点、全文结尾）、前面或几个依据之间有「，」「、」
+  「；」的，去掉这些标点，到句末只隔着空白的去掉空白；依据后面、句末前面的标点是写作者自己的，不动
+- 换行不算句末：列表项末尾的「；」、软换行处的「，」是写作者自己的，依据挂在它后面正合「挂在句末」的规矩，照旧留着
 - 括号里、句末前几个依据之间的分隔标点一并去掉；两边都是字时，依据之间的标点可能是分句的标点，照旧留着
 - 依据标记本身留在原文里：句子照旧挂着这条依据（see、cites），只是不显示
 - 不含依据的括号、没有依据的文档一个字不动：内容哈希和改动之前一样
 - 流式渲染分块输出拼起来仍然等于整篇渲染
+- 已知限制：依据写在「依据」「见」「取自」「来源」这类引出语后面时，引出语悬空（「依据。」「（来源）」）。渲染时去不掉，
+  靠核查 agent 的提示词避免，模型不照做时核查 agent 记一条日志（test_verify_rationale_rules）
 
 数字、表名、地名都是虚构的。
 """
 from __future__ import annotations
 
 import random
+import re
 
 import pytest
 
@@ -116,13 +123,16 @@ def test_punctuation_next_to_see_inside_a_bracket_goes_with_it(catalog, raw, sho
     ("口径相同（按支付日，[[see:Q1]]，不含退款）。", "口径相同（按支付日，不含退款）。"),
     ("结果一致，[[see:Q1]]，原报告未过滤。", "结果一致，原报告未过滤。"),
     ("a, [[see:Q1]], b", "a, b"),
+    ("a,[[see:Q1]],b", "a, b"),                                       # 半角逗号后面照排版习惯隔一个空格
     # 前面是分隔标点、后面就到句末：去掉前面那个
     ("华南居首，[[see:Q1]]。", "华南居首。"),
-    ("华南居首、华东第二；[[see:Q1]]\n下一行", "华南居首、华东第二\n下一行"),
     ("华南居首，[[see:Q1]]", "华南居首"),
     ("华南居首，[[see:Q1]] 。", "华南居首。"),
     # 几个依据之间的分隔标点
     ("华南居首 [[see:Q1]]，[[see:m:gmv]]。", "华南居首。"),
+    # 后面就到句末、中间只隔着空白：空白一起去掉，不剩「华南居首 。」
+    ("华南居首 [[see:Q1]] 。", "华南居首。"),
+    ("华南居首 [[see:Q1]] [[see:m:gmv]] 。", "华南居首。"),
 ])
 def test_punctuation_left_dangling_by_see_is_dropped(catalog, raw, shown):
     assert render(raw, catalog) == shown
@@ -130,18 +140,90 @@ def test_punctuation_left_dangling_by_see_is_dropped(catalog, raw, shown):
 
 
 @pytest.mark.parametrize(("raw", "shown"), [
+    # 括号前悬着的停顿标点：去掉括号之后和没写括号的「华南居首，[[see:Q1]]。」一样收拾
+    ("华南居首，（[[see:Q1]]）。", "华南居首。"),
+    ("华南居首、([[see:Q1]])", "华南居首"),
+    ("华南居首 （[[see:Q1]]） 。", "华南居首。"),
+    ("华南居首，（[[see:Q1]]），华东第二。", "华南居首，华东第二。"),       # 夹在两个逗号中间：去掉后一个
+    ("华南居首（（[[see:Q1]]））。", "华南居首。"),                          # 套着的两层只装着依据，一起去掉
+    # 换行不算句末：括号里外一样留着写作者的标点
+    ("华南居首、（[[see:Q1]]）\n下一行", "华南居首、\n下一行"),
+])
+def test_a_dropped_bracket_is_tidied_like_a_bare_see(catalog, raw, shown):
+    assert render(raw, catalog) == shown
+    assert compose(raw, catalog)["markdown"] == shown
+
+
+@pytest.mark.parametrize(("raw", "shown"), [
+    # 括号是两边唯一的分隔：去掉之后数字会粘成另一个数，换成一个空格
+    ("华东 [[v:Q1.r0.销售额]]（[[see:Q1]]）2 月起持续下滑。", "华东 4,919.5 2 月起持续下滑。"),
+    ("合计 [[v:Q1.r0.销售额]]（[[see:Q1]]）2026 年同比持平。", "合计 4,919.5 2026 年同比持平。"),
+    ("订单 [[v:Q1.r0.订单数]]([[see:Q1]])2 个区域。", "订单 212 2 个区域。"),
+    ("增幅 [[m:yoy]]（[[see:m:yoy]]）3 个区域。", "增幅 12.5% 3 个区域。"),
+    ("合计 [[v:Q1.r0.销售额]]（[[see:Q1]]）[[v:Q1.r0.订单数]] 笔。", "合计 4,919.5 212 笔。"),   # 后面的标记渲染出数字
+    ("合计 [[v:Q1.r0.销售额]]（[[see:Q1]]）[[see:m:gmv]]2 月。", "合计 4,919.5 2 月。"),       # 越过不显示的依据看
+    ("编号 Q1（[[see:Q1]]）x", "编号 Q1 x"),
+    ("212,（[[see:Q1]]）5 个区域", "212, 5 个区域"),
+    # 半角逗号夹着依据：去掉后一个之后，前一个不能直接贴着数字
+    ("212,[[see:Q1]],5 个区域", "212, 5 个区域"),
+    # 不会粘的照旧去掉：中文和数字之间、括号前已有空白、后面是中文、隔着全角逗号
+    ("居首（[[see:Q1]]）2 月起", "居首2 月起"),
+    ("合计 [[v:Q1.r0.销售额]] （[[see:Q1]]）2 月起", "合计 4,919.5 2 月起"),
+    ("合计 [[v:Q1.r0.销售额]]（[[see:Q1]]）元", "合计 4,919.5元"),
+    ("华南（[[see:Q1]]）居首", "华南居首"),
+    ("212，[[see:Q1]]，5 个区域", "212，5 个区域"),
+])
+def test_dropping_a_bracket_does_not_glue_numbers_together(catalog, raw, shown):
+    assert render(raw, catalog) == shown
+    assert compose(raw, catalog)["markdown"] == shown
+
+
+def test_a_glued_number_would_have_slipped_through_the_checks(catalog):
+    """粘起来的数没有哪项核对查得出：片段本身对（4,919.5 后面是另一段文字），月份不算裸数字。所以只能在渲染时不粘。"""
+    doc = compose("华东 [[v:Q1.r0.销售额]]（[[see:Q1]]）2 月起持续下滑。", catalog)
+    assert doc["markdown"] == "华东 4,919.5 2 月起持续下滑。" and doc["violations"] == []
+    assert verify_doc(doc, catalog, loader=LOADER)["violations"] == []
+    [unit] = [unit for _, unit in iter_units(doc)]
+    assert [s["alias"] for s in unit["see"]] == ["Q1"]
+
+
+@pytest.mark.parametrize(("raw", "shown"), [
     ("华南居首。[[see:Q1]]", "华南居首。"),
     ("华南居首 [[see:Q1]]，华东第二。", "华南居首，华东第二。"),
     # 两个依据中间的逗号后面接着字：它是分句的逗号，不是依据之间的分隔，照旧留着
     ("华南居首 [[see:Q1]]，[[see:m:gmv]]华东第二。", "华南居首，华东第二。"),
-    ("华南居首 [[see:Q1]] [[see:m:gmv]] 。", "华南居首 。"),            # 没有悬空的标点：照旧只去掉依据前的空白
     ("华南居首 [[see:Q1]]，", "华南居首，"),                            # 依据后面的逗号是写作者自己的，不动
     ("数据如下：[[see:Q1]]\n| 区域 | 销售额 |", "数据如下：\n| 区域 | 销售额 |"),    # 冒号引出的是下一行
-    ("结果见：[[see:Q1]]。", "结果见：。"),          # 冒号前的引出语去不掉：靠提示词让模型写在句末
-    ("依据 [[see:Q1]]。", "依据。"),
+    # 换行不算句末：列表项末尾的「；」、软换行处连着两个分句的「，」是写作者自己的
+    ("1. 华东居首；[[see:Q1]]\n2. 华南第二；[[see:Q1]]\n3. 华北第三。[[see:Q1]]",
+     "1. 华东居首；\n2. 华南第二；\n3. 华北第三。"),
+    ("华东居首，[[see:Q1]]\n华南第二。", "华东居首，\n华南第二。"),
+    ("华南居首、华东第二；[[see:Q1]]\n下一行", "华南居首、华东第二；\n下一行"),
+    ("- 华东居首；（[[see:Q1]]）\n- 华南第二。", "- 华东居首；\n- 华南第二。"),
 ])
-def test_see_outside_brackets_without_dangling_pauses_renders_as_before(catalog, raw, shown):
+def test_punctuation_the_writer_put_there_is_kept(catalog, raw, shown):
     assert render(raw, catalog) == shown
+    assert compose(raw, catalog)["markdown"] == shown
+
+
+#: 引出语悬空：「依据」「见」「取自」「来源」「出处」后面（可能隔着冒号、空白）紧跟着句末、停顿标点或括号
+_DANGLING = re.compile(r"(?:依据|见|取自|来源|出处)[：:]?[ \t]*(?:[。，、；）)！？,;]|$)")
+
+
+@pytest.mark.xfail(strict=True, reason="已知限制：依据写在引出语后面时，渲染后引出语悬空。引出语在依据前面，渲染时要去掉"
+                                       "它，流式渲染得先攒住每个可能是引出语的字；目前靠核查 agent 的提示词避免这种写法，模型"
+                                       "不照做时记一条日志（verify_agent._LEAD_IN_SEE）")
+@pytest.mark.parametrize("raw", [
+    "结果见：[[see:Q1]]。",
+    "依据 [[see:Q1]]。",
+    "数据取自 [[see:Q1]]。",
+    "结果取自 [[see:Q1]]，完整未截断。",
+    "按支付日统计（见 [[see:Q1]]）。",
+    "按支付日统计（来源：[[see:Q1]]）。",
+    "按状态拆开（status 取值见 [[see:Q1]]）。",
+])
+def test_see_after_a_lead_in_word_leaves_it_dangling(catalog, raw):
+    assert not _DANGLING.search(render(raw, catalog)), render(raw, catalog)
 
 
 @pytest.mark.parametrize("raw", [
@@ -214,6 +296,9 @@ def _stream(catalog, raw: str, sizes: list[int]) -> list[str]:
     "结果一致（[[see:Q1]]，原报告未按状态过滤），合计 [[v:Q1.r0.销售额]]（[[see:Q1]]）。下一句",
     "前一句 （[[see:Q1]]）后一句，复算原查询（同 SQL，[[see:Q1]]）：华南居首，[[see:Q1]]。",
     "口径相同（按支付日，[[see:Q1]]，不含退款）。a, [[see:Q1]], b\n华南、[[see:Q1]]\n末尾（[[see:Q1]]）",
+    "华东 [[v:Q1.r0.销售额]]（[[see:Q1]]）2 月，合计 [[v:Q1.r0.销售额]]（[[see:Q1]]）[[see:m:gmv]][[v:Q1.r0.订单数]] 笔"
+    "，212,[[see:Q1]],5 个",
+    "华南居首，（[[see:Q1]]）。华南居首 [[see:Q1]] 。1. 华东居首；[[see:Q1]]\n2. 华南第二，（[[see:Q1]]），华东第二",
 ])
 @pytest.mark.parametrize("size", range(1, 9))
 def test_stream_tidies_see_in_brackets_like_the_full_render(catalog, raw, size):
@@ -225,7 +310,7 @@ def test_stream_tidies_see_in_brackets_like_the_full_render(catalog, raw, size):
 def _corpus(n: int) -> list[str]:
     rng = random.Random(20261006)
     pieces = ["[[see:Q1]]", "[[see:m:gmv]]", "[[v:Q1.r0.销售额]]", "[[m:gmv]]", "（", "）", "(", ")", "，", "、",
-              "；", "：", ",", ";", " ", "　", "。", "\n", "文字", "元", "[[", "]]", "["]
+              "；", "：", ",", ";", " ", "　", "。", "\n", "文字", "元", "[[", "]]", "[", "2", "x", "%", "！"]
     return ["".join(rng.choice(pieces) for _ in range(rng.randint(1, 18))) for _ in range(n)]
 
 

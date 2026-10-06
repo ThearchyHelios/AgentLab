@@ -53,6 +53,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, replace
@@ -100,6 +101,9 @@ _REF_DEPTH = 8
 RATIONALE = "rationale"
 #: 触顶原因
 LIMITS = ("max_queries", "timeout_s", "max_cost_usd", "daily_max_usd", "max_steps")
+#: 收尾那次调用超过时长上限、没交成结果时的原话（limit 记 timeout_s）。是内部的说法，给人看时调用方换成自己的话：质询的
+#: _error_words、反方审稿的「反查未完成：已达上限（…）」、双盲复算按 limit 写的无法复算原因
+SETTLE_TIMEOUT = "收尾时超过时长上限，没能交结果"
 #: 核查模型的输出到了上限被截断、没交成结果时给人看的话：双盲复算的无法复算、反方审稿的「反查未完成」、质询的报错都照
 #: 它说，也是 verify_truncated 日志的原话。cut 是 budget.cut_words 的「核查模型的输出达到上限（N token）被截断」。开头只说
 #: 「未能给出结果」：质询里提问人看到的就是这句，它问的是问题，不是在核查
@@ -666,17 +670,23 @@ def _parsed(value: Any) -> dict[str, Any] | None:
 
 
 #: 只是占位词的理由（只留字母、数字和汉字，不分大小写）：模型照着结构填了个字面的 placeholder、N/A，等于没给理由
-_PLACEHOLDERS = frozenset({"placeholder", "todo", "tbd", "na", "none", "null", "nil", "rationale", "reason",
-                           "无", "暂无", "略", "理由"})
+_PLACEHOLDERS = frozenset({"placeholder", "todo", "tbd", "na", "null", "nil", "rationale", "reason", "略", "理由"})
+#: 说「没有」的词：理由是另一个结果的说明时（双盲复算的数、反方审稿的结论），它等于没给理由；理由就是结果本身时（审批
+#: 质询，结构里只有理由一项）它可能就是回答——问「有没有测试账号」，答「无。」
+_NOTHING = frozenset({"none", "无", "暂无"})
+#: 依据写在引出语后面（「依据 [[see:Q1]]。」「结果见：[[see:Q1]]」「（来源：[[see:Q1]]）」）：依据渲染后不显示，引出语悬在
+#: 那里（「依据。」），渲染时去不掉（evidence._see_cuts 只收拾依据周围的空白、括号和标点）。交结果的提示要求写在句末，
+#: 模型不照做时记一条日志，验收时查得到
+_LEAD_IN_SEE = re.compile(r"(?:依据|见|取自|来源|出处)[ \t\u3000]*[：:]?[ \t\u3000]*\[\[[ \t]*see[ \t]*:[^\[\]\n]*\]\]")
 
 
-def _no_rationale(value: Any) -> bool:
-    """交回的理由等于没给：不是文字、空的、只有标点，或者只是一个占位词。当没给理由处理（理由为空、没有理由文档），
-    审批卡照「没有给出理由」说，不把占位词当理由展示。"""
-    if not isinstance(value, str):
-        return True
-    word = "".join(ch for ch in value if ch.isalnum()).casefold()
-    return not word or word in _PLACEHOLDERS
+def _no_rationale(shown: str, *, answer: bool = False) -> bool:
+    """渲染出来的理由等于没给：空的、只有标点（只写了依据：[[see:Q1]]、「（[[see:Q1]]）」渲染出来是空的），或者只是一个
+    占位词（「placeholder。[[see:Q1]]」渲染出来只剩占位词）。按渲染后的正文判，不按原文：标记里的字（see、Q1）不显示。
+    answer：理由就是交回的结果本身（审批质询的回答），说「没有」的词不算。当没给理由处理（理由为空、没有理由文档），
+    审批卡照「没有给出理由」说，不把占位词当理由展示，判「被推翻」的也不当有出处。"""
+    word = "".join(ch for ch in shown if ch.isalnum()).casefold()
+    return not word or word in _PLACEHOLDERS or (not answer and word in _NOTHING)
 
 
 @dataclass
@@ -1025,7 +1035,7 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
         if settle_cut:
             return await report_cut("verify_result", settler.max_tokens)
         timed_out = isinstance(failure, asyncio.TimeoutError)
-        why = "收尾时超过时长上限，没能交结果" if timed_out else \
+        why = SETTLE_TIMEOUT if timed_out else \
             f"核查模型没有按结构交结果（{explain_model_error(failure, model_id)}）" if failure is not None else \
             "核查模型没有按结构交结果"
         # 收尾超时：没交成结果是因为时长上限，limit 照实记 timeout_s，和原因对得上——模型自己停了查询（stopped 为 None）
@@ -1044,8 +1054,15 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
     result = cells.walk(resolved, parsed) if _is_object(resolved) else {}
     rationale = parsed.get(RATIONALE)
     doc = None
-    if not _no_rationale(rationale):
+    if isinstance(rationale, str) and rationale.strip():
         doc = compose_doc(rationale, build_catalog(nodes={}, ledger=ledger), node_id=owner, run_id=run_id or None)
+        if hits := _LEAD_IN_SEE.findall(rationale):
+            logger.warning("核查 agent 的理由里依据写在了引出语后面，渲染后引出语会悬空（运行 %s，节点 %s）：%s",
+                           run_id or "-", owner, "、".join(hits[:5]))
+        # 按渲染出来的判：只写了依据的、占位词后面挂着依据的，原文里有字，显示出来没有理由。结构里只有理由一项（审批
+        # 质询）时理由就是回答，「无」是一个回答
+        if _no_rationale(doc["markdown"], answer=declared == [RATIONALE]):
+            doc = None
     result[RATIONALE] = doc["markdown"] if doc else ""
     return outcome(result=result, cells=cells.cells, rationale=doc, limit=stopped, answered=answered)
 
@@ -1126,4 +1143,5 @@ async def _run_tool(tool: Any, name: str, args: dict[str, Any], call_id: str, re
     return content
 
 
-__all__ = ["LIMITS", "RATIONALE", "SETTLE_GRACE_S", "Default", "VerifyOutcome", "result_schema", "run_verify_agent"]
+__all__ = ["LIMITS", "RATIONALE", "SETTLE_GRACE_S", "SETTLE_TIMEOUT", "Default", "VerifyOutcome", "result_schema",
+           "run_verify_agent"]

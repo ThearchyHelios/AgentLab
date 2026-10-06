@@ -4,6 +4,9 @@
 （[[see:Q1]]）」渲染成「（，原报告…）」「（）」，随正式运行封存；另一次回答查完了，收尾那次调用超过时长上限，报错写着
 「回答超过时长上限（180 秒）」，answer.limit 却是 null，界面上缺了「已达时长上限」。
 
+回答只写了依据（「（[[see:Q1]]）」）时显示出来是空的：以前照样交回，封存之后的追问末尾补上「注：以上回答依据的是数据源
+当前的数据…」，回答正文只剩这句系统说明、却记成回答成功。现在按没给回答记。回答就是一个「无。」的，照常是回答。
+
 模型一律是 MockChatModel 剧本，区域、金额都是虚构的。
 """
 from __future__ import annotations
@@ -12,6 +15,7 @@ from app.core import artifact_store
 from app.engine import verify_agent
 from app.engine.inquiry import NO_ANSWER
 from tests.test_inquiry_api import (  # noqa: F401 - 夹具按名字引入
+    EAST,
     NO_TEST,
     QUESTION,
     Models,
@@ -20,10 +24,13 @@ from tests.test_inquiry_api import (  # noqa: F401 - 夹具按名字引入
     client,
     engine_up,
     events,
+    finish,
     pause,
     pending,
+    report_doc,
     set_verify,
     shop,
+    unit_of,
 )
 from tests.test_verify_rationale_rules import slow_final
 
@@ -74,3 +81,25 @@ async def test_a_placeholder_answer_is_no_answer(monkeypatch, shop, client):
     answer = item["answer"]
     assert (answer["ok"], answer["text"], answer["limit"]) == (False, "", None)
     assert answer["error"] == NO_ANSWER
+
+
+async def test_an_answer_that_shows_nothing_is_no_answer_even_after_the_seal(monkeypatch, shop, client):
+    """封存之后的追问：回答只写了依据，显示出来是空的。以前回答文档照样组装，末尾补上「查的是现在的数据」那句说明，
+    回答正文只剩系统说明、却记成回答成功。"""
+    Models(monkeypatch, shop, plays={"排除测试账号": Play([NO_TEST], "（[[see:Q1]]）")})
+    done = await finish(shop)
+    assert done.status == "succeeded", done.error
+    r = await ask(client, done.id, report="write", unit=unit_of(await report_doc(done.id), EAST), question=QUESTION)
+    assert r.status_code == 200, r.text
+    answer = r.json()["inquiry"]["answer"]
+    assert (answer["ok"], answer["text"], answer["doc_artifact"]) == (False, "", None)
+    assert answer["error"] == NO_ANSWER
+
+
+async def test_a_one_word_answer_is_an_answer(monkeypatch, shop, client):
+    """问的是「有没有」，答「无。」：这是回答，不是占位词，不能报「模型没有给出回答内容」让提问人重问、再花一次钱。"""
+    Models(monkeypatch, shop, plays={"排除测试账号": Play([NO_TEST], "无。[[see:Q1]]")})
+    item, [event] = await _asked(client, shop)
+    answer = item["answer"]
+    assert (answer["ok"], answer["text"], answer["error"]) == (True, "无。", None)
+    assert event.data["answer_text"] == "无。"

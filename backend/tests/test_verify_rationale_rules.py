@@ -6,13 +6,17 @@
 - 写进了括号的依据，理由文档里照样渲染干净（evidence._tidy），这句仍挂着那条依据
 - 模型自己停了工具调用、收尾那次调用超过了时长上限：limit 照实记 timeout_s。以前是 None——质询的报错写着「回答超过
   时长上限（180 秒）」，limit 却是空的，界面上缺了「已达时长上限」。不走结构化输出的模型（普通调用收尾）也一样
-- 交回的理由是空的、只有标点，或者只是一个占位词（字面的 placeholder、N/A）：当作没给理由，不把占位词当理由展示
+- 交回的理由是空的、只有标点，或者只是一个占位词（字面的 placeholder、N/A）：当作没给理由，不把占位词当理由展示。
+  按渲染出来的正文判：只写了依据的（[[see:Q1]]、「（[[see:Q1]]）」）显示出来是空的，占位词后面挂着依据的显示出来只剩
+  占位词，都算没给。理由就是结果本身时（审批质询，结构里只有理由一项），「无」「none」是回答，不算占位
+- 依据写在「依据」「见」「取自」这类引出语后面（渲染时去不掉，引出语悬空）：记一条日志，验收时查得到
 
 模型一律是 MockChatModel 剧本，数据源是现造的 SQLite 文件，数字都是虚构的。
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 
@@ -20,7 +24,7 @@ import pytest
 
 from app.engine import verify_agent
 from app.engine.evidence import iter_units
-from app.engine.inquiry import INQUIRY_SYSTEM, INQUIRY_TASK_PROMPT
+from app.engine.inquiry import INQUIRY_SCHEMA, INQUIRY_SYSTEM, INQUIRY_TASK_PROMPT
 from app.engine.nodes.challenge import CHALLENGE_SYSTEM, CHALLENGE_TASK_PROMPT
 from app.engine.nodes.dual_check import BLIND_SYSTEM, BLIND_TASK_PROMPT
 from app.engine.verify_agent import VERIFY_FINAL_PROMPT, VERIFY_SYSTEM
@@ -130,7 +134,8 @@ async def test_a_final_call_that_runs_out_of_time_after_the_query_limit_records_
 # 占位词当理由
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("said", ["placeholder", "PLACEHOLDER", "  ", "N/A", "（略）", "…", "<rationale>", "TODO"])
+@pytest.mark.parametrize("said", ["placeholder", "PLACEHOLDER", "  ", "N/A", "（略）", "…", "<rationale>", "TODO", "无",
+                                  "暂无。", "None"])
 async def test_a_placeholder_rationale_counts_as_none(monkeypatch, shop, said):
     name, _ = shop
     Script(monkeypatch, [q(name, VALID_SUM, "c1")], {**FOUND, "rationale": said})
@@ -139,9 +144,67 @@ async def test_a_placeholder_rationale_counts_as_none(monkeypatch, shop, said):
     assert out.result["rationale"] == "" and out.rationale is None
 
 
-@pytest.mark.parametrize("said", ["无异常。", "见 [[v:Q1.r0.total]]。", "略高于上周。"])
+@pytest.mark.parametrize("said", ["[[see:Q1]]", "（[[see:Q1]]）", " [[see:Q1]]。", "placeholder。[[see:Q1]]",
+                                  "N/A（[[see:Q1]]）", "TODO [[see:Q1]]"])
+async def test_a_rationale_that_shows_nothing_counts_as_none(monkeypatch, shop, said):
+    """只写了依据、或者占位词后面挂着依据：原文里看着有字，显示出来没有理由。以前按原文判，标记里的字（see、Q1）也算，
+    理由文档照样交回——审批卡按文档画出一片空白，判「被推翻」的还因为引用到了 Q1 被当成有出处。"""
+    name, _ = shop
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], {**FOUND, "rationale": said})
+    out = await run(name)
+    assert out.result["value"] == 230, "数照样取"
+    assert out.result["rationale"] == "" and out.rationale is None
+
+
+@pytest.mark.parametrize("said", ["无异常。", "见 [[v:Q1.r0.total]]。", "略高于上周。", "[[v:Q1.r0.total]]",
+                                  "一致。[[see:Q1]]"])
 async def test_a_short_real_rationale_is_kept(monkeypatch, shop, said):
     name, _ = shop
     Script(monkeypatch, [q(name, VALID_SUM, "c1")], {**FOUND, "rationale": said})
     out = await run(name)
     assert out.result["rationale"] and out.rationale is not None
+
+
+@pytest.mark.parametrize(("said", "shown"), [("无。", "无。"), ("None.", "None."), ("暂无。[[see:Q1]]", "暂无。")])
+async def test_nothing_is_an_answer_when_the_rationale_is_the_answer(monkeypatch, shop, said, shown):
+    """结构里只有理由一项（审批质询）：理由就是回答。问「有没有测试账号」，答「无。」是一个回答，不能当成没给、让提问人
+    重新提问再花一次钱。"""
+    name, _ = shop
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], {"rationale": said})
+    out = await run(name, output_schema=INQUIRY_SCHEMA)
+    assert out.result["rationale"] == shown and out.rationale["markdown"] == shown
+
+
+@pytest.mark.parametrize("said", ["placeholder", "null", "[[see:Q1]]", "N/A。[[see:Q1]]"])
+async def test_a_placeholder_answer_still_counts_as_none(monkeypatch, shop, said):
+    name, _ = shop
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], {"rationale": said})
+    out = await run(name, output_schema=INQUIRY_SCHEMA)
+    assert out.result["rationale"] == "" and out.rationale is None
+
+
+# --------------------------------------------------------------------------
+# 依据写在引出语后面
+# --------------------------------------------------------------------------
+
+async def test_see_after_a_lead_in_word_is_logged(monkeypatch, shop, caplog):
+    """「依据 [[see:Q1]]。」「（来源：[[see:Q1]]）」渲染后引出语悬空，渲染时去不掉（见 test_evidence_see_brackets 的已知
+    限制）：记一条日志，写明是哪几处，验收时查得到。只记标记和引出语，不记数。"""
+    name, _ = shop
+    said = "合计 [[v:Q1.r0.total]]，依据 [[see:Q1]]。口径一致（来源：[[see:Q1]]）。"
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], {**FOUND, "rationale": said})
+    with caplog.at_level(logging.WARNING, logger="app.engine.verify_agent"):
+        out = await run(name, node_id="chal", run_id="run-1")
+    assert out.rationale is not None, "照常交回"
+    [record] = [r for r in caplog.records if "引出语" in r.getMessage()]
+    message = record.getMessage()
+    assert "依据 [[see:Q1]]" in message and "来源：[[see:Q1]]" in message and "run-1" in message
+    assert "230" not in message
+
+
+async def test_see_at_the_end_of_the_sentence_is_not_logged(monkeypatch, shop, caplog):
+    name, _ = shop
+    Script(monkeypatch, [q(name, VALID_SUM, "c1")], {**FOUND, "rationale": "合计 [[v:Q1.r0.total]]，结果一致。[[see:Q1]]"})
+    with caplog.at_level(logging.WARNING, logger="app.engine.verify_agent"):
+        await run(name)
+    assert not [r for r in caplog.records if "引出语" in r.getMessage()]

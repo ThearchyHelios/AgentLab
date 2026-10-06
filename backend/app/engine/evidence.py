@@ -1818,11 +1818,17 @@ _OPEN, _CLOSE = frozenset("（("), frozenset("）)")
 #: 依据和括号、依据和依据之间的分隔标点（「（[[see:Q3]]，原报告…）」「[[see:Q1]]、[[see:Q2]]」）
 _SEPS = "，、；,;：:"
 _SEP = frozenset(_SEPS)
+#: 其中的半角标点：按排版习惯后面隔一个空格。两个夹着依据的去掉后一个时，前一个不能直接贴着下文（「212,5」读成一个数）
+_HALF = frozenset(",;:")
 #: 其中的停顿标点（不含冒号）：依据挂在它后面、紧接着就到句末时，它悬在句末（「华南居首，。」）。冒号后面另起一行
 #: 常常是它引出的表格、列表，不动
 _PAUSE = _SEP - frozenset("：:")
-#: 句末标点：停顿标点悬在它前面时去掉（还有换行、全文结尾）。半角句点不算：后面跟着数字时它是小数点
+#: 句末标点：停顿标点悬在它前面时去掉（还有全文结尾）。半角句点不算：后面跟着数字时它是小数点。换行不算：列表项末尾
+#: 的「；」、软换行处连着两个分句的「，」是写作者自己的，依据挂在它后面正合「挂在句末」的规矩
 _ENDING = frozenset("。！？!?")
+#: 去掉一对括号之后会粘成一串的字：前面是数字、字母（或者标记的结尾、百分号、半角的逗号和小数点），后面是数字、字母
+#: （或者一个渲染出字的标记）。中文和数字之间不加空格也读得对，不算
+_NUMBERISH = frozenset("]%‰.,")
 #: 依据周围、渲染后会挤在一起的字：空白和分隔标点
 _GAP = frozenset(_BLANK) | _SEP
 #: 连着写的几个依据：中间只隔着空白、分隔标点
@@ -1847,11 +1853,12 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
       还跟着写一遍（[[m:visits]] 人次），读者看到的是「12,345人次 人次」。单字的单位后面紧跟着字时
       不动：写作者写的可能是另一个单位（口径卡是「人」，正文写「人次」），硬删会把不一致藏起来；
     - [[see:…]] 渲染成空，它周围留下的空白、括号、标点去掉（_see_cuts）：「最高月份 [[see:Q2]]。」会剩下
-      「最高月份 。」，「结果一致（[[see:Q3]]，原报告…）」会剩下「结果一致（，原报告…）」。
+      「最高月份 。」，「结果一致（[[see:Q3]]，原报告…）」会剩下「结果一致（，原报告…）」。去掉之后两边的数字、字母
+      会粘成一串的，换成一个空格（_glued）。
 
     prev 是这段文字前面那个字（流式渲染分块时用），判断空白是不是在行首。
     """
-    cuts: list[tuple[int, int]] = []
+    cuts: list[tuple[int, ...]] = []
     for marker in parse_markers(text):
         if marker["kind"] not in _UNIT_KINDS:
             continue
@@ -1867,34 +1874,43 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
         cuts.extend(_see_cuts(text, group.start(), group.end(), prev))
     if not cuts:
         return text
-    # 几处要去掉的字可能重叠（依据前面的空白、它和括号之间的标点）：按并集去掉
-    out, last = [], 0
-    for a, b in sorted(cuts):
-        if a >= last:
-            out.append(text[last:a])
-            last = b
+    # 几处要去掉的字可能重叠（依据前面的空白、它和括号之间的标点）：按并集去掉。带着替换的（第三项，去掉之后两边会
+    # 粘在一起，换成一个空格）连成一片时整片换成它
+    merged: list[list[Any]] = []
+    for a, b, *rep in sorted(cuts):
+        if merged and a < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+            merged[-1][2] = merged[-1][2] or "".join(rep)
         else:
-            last = max(last, b)
+            merged.append([a, b, "".join(rep)])
+    out, last = [], 0
+    for a, b, rep in merged:
+        out += [text[last:a], rep]
+        last = b
     out.append(text[last:])
     return "".join(out)
 
 
-def _see_cuts(text: str, start: int, end: int, prev: str) -> list[tuple[int, int]]:
+def _see_cuts(text: str, start: int, end: int, prev: str, *, whole: bool = False) -> list[tuple[int, ...]]:
     """一组依据（_SEE_GROUP，text[start:end]）渲染成空之后，周围要一起去掉的字。标记本身留着：组装文档时句子靠它挂
     依据（unit.see），渲染时它本来就不显示。
 
-    - 括号里只有依据的（「合计 6,635.68（[[see:Q1]]）。」），连括号一起去掉，括号前的空白照依据前的空白处理
+    - 括号里只有依据的（「合计 6,635.68（[[see:Q1]]）。」），连括号一起去掉；去掉之后整对括号当一个依据，外面照下面
+      几条再收拾一遍（「华南居首，（[[see:Q1]]）。」的逗号）。括号两边的数字、字母会粘成一串的，括号换成一个空格
+      （「4,919.5（[[see:Q1]]）2 月」不剩「4,919.52 月」，_glued）
     - 依据在括号开头（「（[[see:Q3]]，原报告…）」）：它和括号之间、它后面的标点和空白；在括号末尾（「（同 SQL，
       [[see:Q2]]）」）同理
-    - 后面就到句末（句末标点、换行、全文结尾），依据前面、几个依据之间有停顿标点的（「华南居首，[[see:Q1]]。」）：
-      这些停顿标点（前面是冒号的留着：它引出的可能是下一行的表格、列表）
+    - 后面就到句末（句末标点、全文结尾），依据前面、几个依据之间有停顿标点的（「华南居首，[[see:Q1]]。」）：
+      这些停顿标点（前面是冒号的留着：它引出的可能是下一行的表格、列表）；没有停顿标点、到句末只隔着空白的，空白去掉
+      （「华南居首 [[see:Q1]] 。」）
     - 以上几种里，几个依据之间的空白、分隔标点一并去掉（「（[[see:Q1]]、[[see:Q2]]）」）
     - 两边都是字的，依据之间的分隔标点可能就是分句的标点：按它断开，每段照 _run_cuts
 
     不含依据的括号、标点一个字不动。要看的只有依据前后连着的空白、括号、分隔标点，外加再往外的一个字：流式渲染把
     这些字攒到后面的字来了才放（_TRAILING_SEE），分块渲染和整篇渲染判得一样。prev 是这段文字前面那个字。
+    whole：text[start:end] 是一对只装着依据的括号（括号本身已经记了去掉），当一个依据看它外面。
     """
-    marks = list(MARKER_RE.finditer(text, start, end))
+    marks = [] if whole else list(MARKER_RE.finditer(text, start, end))
     gaps = [(m.end(), n.start()) for m, n in zip(marks, marks[1:]) if m.end() < n.start()]
     lo, hi = start, end
     while lo > 0 and text[lo - 1] in _GAP:
@@ -1904,39 +1920,70 @@ def _see_cuts(text: str, start: int, end: int, prev: str) -> list[tuple[int, int
     opener = text[lo - 1] if lo > 0 else prev
     closer = text[hi] if hi < len(text) else ""
     left, right = text[lo:start], text[end:hi]
-    if opener in _OPEN and closer in _CLOSE:
+    if lo > 0 and opener in _OPEN and closer in _CLOSE:
         # 括号里只有依据：连括号一起去掉
-        return [(lo - 1, start), *gaps, (end, hi + 1), *_blank_cut(text, lo - 1, hi + 1, prev)]
+        glue = " " if _glued(text, lo - 1, hi + 1, prev) else ""
+        return [(lo - 1, start), *gaps, (end, hi + 1, glue), *_see_cuts(text, lo - 1, hi + 1, prev, whole=True)]
     if opener in _OPEN:
         return [(lo, start), *gaps, (end, hi)]
     if closer in _CLOSE:
         # 和括号之间只有空白的，照依据前的空白处理（行首的缩进不动）
         return [*gaps, (end, hi), *([(lo, start)] if _SEP & set(left) else _blank_cut(text, start, end, prev))]
-    if (closer in _ENDING or closer in ("", "\n")) and _PAUSE & set(left + "".join(text[a:b] for a, b in gaps)):
-        # 依据后面、句末前面的停顿标点是写作者自己的（「增长 [[see:Q1]]，」），不是依据留下的，不动；只剩空白的去掉
-        return [*gaps, *([] if _SEP & set(right) else [(end, hi)]),
-                *([(lo, start)] if _PAUSE & set(left) else _blank_cut(text, start, end, prev))]
-    return [cut for run in _SEE_RUN.finditer(text, start, end) for cut in _run_cuts(text, run.start(), run.end(), prev)]
+    tail: list[tuple[int, ...]] = []
+    if closer in _ENDING or closer == "":
+        if _PAUSE & set(left + "".join(text[a:b] for a, b in gaps)):
+            # 依据后面、句末前面的停顿标点是写作者自己的（「增长 [[see:Q1]]，」），不是依据留下的，不动；只剩空白的去掉
+            return [*gaps, *([] if _SEP & set(right) else [(end, hi)]),
+                    *([(lo, start)] if _PAUSE & set(left) else _blank_cut(text, start, end, prev))]
+        if not _SEP & set(right):
+            tail = [(end, hi)]
+    runs = [(start, end)] if whole else [(run.start(), run.end()) for run in _SEE_RUN.finditer(text, start, end)]
+    return [*tail, *(cut for a, b in runs for cut in _run_cuts(text, a, b, prev))]
 
 
-def _run_cuts(text: str, start: int, end: int, prev: str) -> list[tuple[int, int]]:
-    """两边都是字的一段依据（_SEE_RUN，中间只隔着空白）：
+def _glued(text: str, start: int, end: int, prev: str) -> bool:
+    """去掉 text[start:end]（一对只装着依据的括号）之后，两边的字会不会粘成一串：前面是数字、字母（或者标记的结尾、
+    百分号、半角的逗号和小数点，_NUMBERISH），后面紧跟着数字、字母，或者一个渲染出字的标记。「[[v:Q1.r0.销售额]]
+    （[[see:Q1]]）2 月」去掉括号读成「4,919.52 月」，是另一个数，而且哪项核对都查不出来。括号前有空白的不会粘：
+    空白照 _blank_cut 留着。紧跟在括号后面的依据也不显示，越过它看下一个字（流式渲染把它和括号一起攒着）。"""
+    before = text[start - 1] if start > 0 else prev
+    if not (_wordish(before) or before in _NUMBERISH):
+        return False
+    while (marker := MARKER_RE.match(text, end)) is not None and marker.group("kind") == "see":
+        end = marker.end()
+    after = text[end:end + 1]
+    if after == "[":
+        return MARKER_RE.match(text, end) is not None
+    return _wordish(after)
+
+
+def _wordish(ch: str) -> bool:
+    """数字（全角的也算）或者半角字母：两个挨在一起读成一个数、一个词。"""
+    return ch.isdecimal() or (ch.isascii() and ch.isalnum())
+
+
+def _run_cuts(text: str, start: int, end: int, prev: str) -> list[tuple[int, ...]]:
+    """两边都是字的一段依据（_SEE_RUN，中间只隔着空白；或者一对只装着依据的括号）：
 
     - 几个依据之间的空白，和依据前面的空白（_blank_cut）
     - 夹在两个分隔标点中间（「结果一致，[[see:Q1]]，原报告…」）：去掉后面那个（连同它前面的空白，后面的空白留着
-      隔开下文：「a, [[see:Q1]], b」→「a, b」）
+      隔开下文：「a, [[see:Q1]], b」→「a, b」）。前面那个是半角标点、后面紧跟着字的，换成一个空格：「212,[[see:Q1]],5」
+      不剩「212,5」
     """
     marks = list(MARKER_RE.finditer(text, start, end))
-    cuts = [(m.end(), n.start()) for m, n in zip(marks, marks[1:]) if m.end() < n.start()]
+    cuts: list[tuple[int, ...]] = [(m.end(), n.start()) for m, n in zip(marks, marks[1:]) if m.end() < n.start()]
     cuts += _blank_cut(text, start, end, prev)
     lo, hi = start, end
     while lo > 0 and text[lo - 1] in _GAP:
         lo -= 1
     while hi < len(text) and text[hi] in _GAP:
         hi += 1
-    right = text[end:hi]
-    if _SEP & set(text[lo:start]) and _SEP & set(right):
-        cuts.append((end, end + max(i for i, ch in enumerate(right) if ch in _SEP) + 1))
+    left, right = text[lo:start], text[end:hi]
+    if _SEP & set(left) and _SEP & set(right):
+        cut = end + max(i for i, ch in enumerate(right) if ch in _SEP) + 1
+        after = text[cut:cut + 1]
+        spaced = left.rstrip(_BLANK)[-1] in _HALF and after not in ("", "\n") and after not in _BLANK
+        cuts.append((end, cut, " " if spaced else ""))
     return cuts
 
 

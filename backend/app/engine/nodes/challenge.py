@@ -703,9 +703,17 @@ class _Review:
                          message=f"反方模型与报告的写作模型相同（「{outcome.model}」），难以发现写作模型自身的错误。"
                                  f"请在设置的「核查」一节选择另一个模型，或在节点的「{CHALLENGE_LABEL['model']}」中指定")
             claim, why = _claim_of(cand, outcome)
+            # 触顶的计在哪一组：时长按剩余时间收紧过的另算一组（_SQUEEZED），说运行时长上限将至
+            group = _SQUEEZED if outcome.limit == "timeout_s" and allot.tightened else outcome.limit
             if outcome.limit == "daily_max_usd" and outcome.result is None and not outcome.usage.get("calls"):
                 # 派出去就撞上每日金额上限、一次模型都没调用：和后面不再派出的句子是同一回事，同一种说法
                 claim = _claim(cand, "inconclusive", self._capped(), queries=outcome.queries, usage=outcome.usage)
+            elif outcome.result is None and outcome.error == verify_agent.SETTLE_TIMEOUT:
+                # 查完了、交结论那次超过时长上限：照上限说，和时间线上的 challenge_limit 一致。核查 agent 的原话（「收尾时
+                # 超过时长上限，没能交结果」）是内部的说法，不摆上审批卡
+                words = self._limit_words(_SQUEEZED if allot.tightened else "timeout_s")
+                claim = _claim(cand, "inconclusive", f"反查未完成：已达上限（{words}）", queries=outcome.queries,
+                               usage=outcome.usage)
             elif lost and why is None:
                 # 反查了，可该查的源有停用了的：判断照常采信，理由末尾写明哪几个没查（只写在任务里的话，审稿记录和
                 # 审批卡上的「经受住」看着就像每个源都查过了）
@@ -714,8 +722,7 @@ class _Review:
             claims.append(claim)
             usage = _add_usage(usage, outcome.usage)
             if outcome.limit in _CLAIM_LIMITS:
-                squeezed = outcome.limit == "timeout_s" and allot.tightened
-                counted = hit.setdefault(_SQUEEZED if squeezed else outcome.limit, [0, 0])
+                counted = hit.setdefault(group, [0, 0])
                 counted[0] += 1
                 counted[1] += why is not None
                 broke = outcome.limit == "daily_max_usd"

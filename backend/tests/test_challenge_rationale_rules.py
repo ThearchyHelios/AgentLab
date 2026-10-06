@@ -62,3 +62,24 @@ async def test_a_placeholder_rationale_is_recorded_as_no_rationale(monkeypatch, 
     assert second["rationale"] == "理由没有引用到任何查询结果，反方给出的「被推翻」不予采信，记为无法判断。反方没有给出理由"
     assert "placeholder" not in str(record)
     assert issuance["tier"] == "formal"
+
+
+async def test_a_rationale_that_shows_nothing_is_recorded_as_no_rationale(monkeypatch, shop):
+    """反方的理由只写了依据：显示出来是空的。以前按原文判，理由文档照样记下——审批卡按文档画出一片空白，不说「反方没有
+    给出理由」；判「被推翻」的因为引用到了 Q1 被当成有出处，照常采信、出具降档。"""
+    plays = {"华南销售额超过华东": Play([NET], "refuted", "[[see:Q1]]"),
+             "居各区域之首": Play([REFUNDS], "stands", "（[[see:Q1]]）")}
+    record, issuance = await _record(monkeypatch, shop, plays)
+    first, second = record["claims"]
+    assert (first["verdict"], first["rationale"], first["rationale_doc"]) == ("stands", "", None)
+    assert second["verdict"] == "inconclusive" and second["rationale_doc"] is None
+    assert second["rationale"].endswith("反方给出的「被推翻」不予采信，记为无法判断。反方没有给出理由")
+    assert issuance["tier"] == "formal", "没有理由的「被推翻」不能让出具降档"
+
+
+async def test_a_placeholder_with_a_see_is_still_a_placeholder(monkeypatch, shop):
+    plays = {"华南销售额超过华东": Play([NET], "stands", "placeholder。[[see:Q1]]"),
+             "居各区域之首": Play([REFUNDS], "stands", "无。")}
+    record, _ = await _record(monkeypatch, shop, plays)
+    assert [(c["rationale"], c["rationale_doc"]) for c in record["claims"]] == [("", None), ("", None)]
+    assert "placeholder" not in str(record)
