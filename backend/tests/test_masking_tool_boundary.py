@@ -21,11 +21,8 @@ from app.data.engine import engines
 from app.engine import masking
 from app.main import app
 from tests.test_verify_agent import Script, q
-from tests.test_verify_agent_masking import (  # noqa: F401 - clean_spend 是自动用上的夹具
+from tests.test_verify_agent_masking import (  # noqa: F401 - clean_spend 是自动用上的夹具，masked_shop 是夹具
     MASKED,
-    SALES,
-    VALUE_SCHEMA,
-    _cells,
     _clean,
     _source,
     ask,
