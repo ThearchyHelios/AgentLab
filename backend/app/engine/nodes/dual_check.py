@@ -23,7 +23,8 @@ SQL，就跟着差异说明进了审批卡、对照工件和目录日志。完�
 选了会怎样要在卡上看得出：payload 在约定的几项之外带上实际生效的 on_reject，摘要里每个指标带 catalog——选 a、选 b
 按发起审批时的目录各会往目录里写什么、不写的为什么（dual_check_facts.preview，和真写同一套判断）；几个指标落到目录
 同一项上时每种选择组合合起来会怎样写（preview_joint），放在对照工件的 catalog_joint 里。
-盲算触顶、出错、交不出数，或者输入本身没法单独复算的指标按「无法复算」记缺口，发 dual_check_unchecked。
+盲算触顶、出错、交不出数，或者输入本身没法单独复算的指标按「无法复算」记缺口，发 dual_check_unchecked。运行这一段的
+时长上限将至时不再开始新的盲算、开始的按剩余时间收紧时长（engine/deadline.py），没来得及的照此记，运行不被中止。
 
 **产出的状态。** 全部一致是 agreed；没有不一致、但有无法复算的：一个都没核成是 unchecked，核成了一部分是 partial；
 有不一致、人裁决过的是 resolved。产出和台账都带 counts（一致、不一致、无法复算各几个）。
@@ -55,7 +56,7 @@ from app.core.errors import describe_exception
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import DataSource
-from app.engine import recompute
+from app.engine import deadline, recompute
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
 from app.engine.dual_check_facts import preview, preview_joint, record_choices
@@ -117,6 +118,9 @@ GAP_BLIND = "指标「{name}」两路结果不一致，审核人选择了盲算�
 GAP_NEITHER = "指标「{name}」两路结果不一致，审核人判断两边都不对"
 GAP_UNANSWERED = "指标「{name}」两路结果不一致，审核人没有作出选择"
 GAP_UNCHECKED = "指标「{name}」无法复算：{reason}"
+#: 运行时长上限将至（engine/deadline.py）：没来得及开始的盲算、时长按剩余时间收紧后到了点的盲算，都按无法复算记
+LATE = "本次运行即将达到 {seconds:g} 秒的时长上限，为保证运行按时完成，未进行盲算"
+SQUEEZED = "本次运行即将达到 {seconds:g} 秒的时长上限，盲算时长已按剩余时间收紧，到时未能完成"
 
 BLIND_SYSTEM = (
     "你在做双盲复算：另一条流程已经算出了口径卡上的一个指标，你要在看不到它的 SQL 和结果的情况下，按业务定义独立算出"
@@ -706,10 +710,12 @@ async def _blind(ctx: NodeContext, jobs: dict[str, dict[str, Any]], options: _Op
 
     先单独做第一个：核查模型本身用不了（没配好、接入出错）时，后面的一样用不了，照这一次的原因记，不再一个个去试。
     其余的同时进行，最多 BLIND_CONCURRENCY 个：串行时几个慢的输入（每个最多 timeout_s 加收尾的宽限）就能把运行这一段
-    的时长上限耗光，整段盲算没有 checkpoint，接着运行时全部重做、再花一次钱。结果按格子写回，日志按任务的先后发，
-    和完成的先后无关。"""
+    的时长上限耗光，整段盲算没有 checkpoint，接着运行时全部重做、再花一次钱。指标多了并行也一样耗得光，所以每项开始
+    之前还要看这一段还剩多少时间（engine/deadline.py）：不够就不再开始、按无法复算记，够的话时长上限按剩余时间收紧。
+    结果按格子写回，日志按任务的先后发，和完成的先后无关。"""
     from app.api.settings import verify_model_spec
-    from app.engine.verify_agent import run_verify_agent
+    from app.engine import verify_agent
+    from app.engine.verify_agent import VerifyOutcome, run_verify_agent
     from app.tools.datasource import run_versions
 
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "calls": 0}
@@ -723,11 +729,21 @@ async def _blind(ctx: NodeContext, jobs: dict[str, dict[str, Any]], options: _Op
         if job["source"] not in catalogs:
             catalogs[job["source"]] = await _catalog_text(sources, job["source"])
     outcomes: dict[str, Any] = {}
+    squeezed: dict[str, float] = {}     # 时长按剩余时间收紧过的盲算 → 这一段执行的总时长（到了点时说明里写）
 
     async def one(key: str, job: dict[str, Any]) -> None:
+        # 给下游留出余量后不够再做一项：不再开始，交回一个没有模型的结果，按无法复算记——第一项就不够时，和核查模型
+        # 用不了一样，后面的不再一个个去试。在 @task 里定，重放时不再重新定
+        allot = deadline.allot(options.timeout_s, grace=verify_agent.SETTLE_GRACE_S)
+        if not allot.start:
+            outcomes[key] = VerifyOutcome(result=None, cells=[], queries=[], rationale=None, usage={},
+                                          error=LATE.format(seconds=allot.seconds))
+            return
+        if allot.tightened:
+            squeezed[key] = allot.seconds
         outcomes[key] = await run_verify_agent(
             spec=spec, system=BLIND_SYSTEM, task=_task_text(job, catalogs[job["source"]]), sources=[job["source"]],
-            output_schema=BLIND_SCHEMA, max_queries=options.max_queries, timeout_s=options.timeout_s,
+            output_schema=BLIND_SCHEMA, max_queries=options.max_queries, timeout_s=allot.timeout_s,
             daily_max_usd=options.daily_max_usd, emit=ctx.emit, run_id=ctx.run.run_id, node_id=ctx.node.id,
             data_versions=run_versions(ctx.run))
 
@@ -751,6 +767,10 @@ async def _blind(ctx: NodeContext, jobs: dict[str, dict[str, Any]], options: _Op
             results[key] = dict(results[keys[0]])
             continue
         results[key] = _slim(outcome)
+        if key in squeezed and results[key]["limit"] == "timeout_s":
+            # 收紧过的时长到了点：照样按无法复算记（同触了每项时长上限），原因说运行时长上限将至。不留 limit，免得发
+            # dual_check_limit——它叫人调高每项的上限，调高了只会更快撞线
+            results[key].update(value=None, limit=None, reason=SQUEEZED.format(seconds=squeezed[key]))
         for k in usage:
             usage[k] += outcome.usage.get(k) or 0
         if outcome.model and model is None:

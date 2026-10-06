@@ -1,11 +1,13 @@
-"""核查节点在运行时长上限内收尾（engine/deadline.py）：反方审稿逐句开始之前，看这一段执行还剩多少时间。
+"""核查节点在运行时长上限内收尾（engine/deadline.py）：反方审稿逐句、双盲复算逐项开始之前，看这一段执行还剩多少时间。
 
 - 反方审稿：5 句、截止时刻只够审 2 句 → 审 2 句，其余 3 句记为未能反查（理由、时间线写明运行时长上限将至），运行
   成功、不被中止，日志和产出的 unreviewed 对得上；剩下的时间不够整段时这句的时长收紧，到点按查到的结果收尾，说的是
   运行时长上限将至，不说「每句时长上限 90 秒」；接着运行时取 checkpoint 里的审稿，不重审
+- 双盲复算：同理，没来得及开始的盲算按无法复算记（照现有的路径记缺口）；收紧过的时长到点也按无法复算记，不发提醒
+  调高上限的 dual_check_limit；审批恢复后重放，盲算不再执行、哪几项没来得及照旧
 - 时间充裕时（默认 600 秒的一段）时长上限照传原值：和没有这道检查时一样
 
-两种钟：精确的计数用假的钟（每派出一句就把 allot() 看到的钟往前拨若干秒，真实只过去几毫秒，runner 的 asyncio.timeout
+两种钟：精确的计数用假的钟（每派出一项就把 allot() 看到的钟往前拨若干秒，真实只过去几毫秒，runner 的 asyncio.timeout
 远远不到）；「运行不被中止」用真的钟、真的短时长上限和真的慢 agent，只断言不随机器快慢变的事。模型都是 MockChatModel
 剧本，数据源是现造的 SQLite 文件，区域、金额都是虚构的。
 """
@@ -14,11 +16,22 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 
+import pytest
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
+
 from app.core import artifact_store
 from app.core.config import settings
+from app.db.base import SessionLocal
+from app.db.models import Approval, Run
 from app.engine import deadline, verify_agent
 from app.engine.nodes import challenge as challenge_mod
+from app.engine.nodes import dual_check as dual_check_mod
 from app.engine.runner import run_manager, verify_manifest
+from app.main import app
+from app.providers.mock_model import MockChatModel
+from tests.fixtures.dual_check_shop import WEEK, Blind, add_source, build
+from tests.fixtures.sources import drop_source
 from tests.test_challenge_node import (  # noqa: F401 - engine_up、shop 是夹具，按名字引入
     NET,
     REFUNDS,
@@ -203,3 +216,170 @@ async def test_a_slow_review_no_longer_aborts_the_run(monkeypatch, shop):
     [warn] = await logs(row.id, "challenge_unreviewed")
     assert warn["claims_skipped"] == len(late) and f"剩下 {len(late)} 句未审" in warn["reason"]
     assert "本次运行即将达到 7 秒的时长上限" in warn["reason"]
+
+
+# --------------------------------------------------------------------------
+# 双盲复算
+# --------------------------------------------------------------------------
+
+#: 一条查询算出五个指标（按支付日、排除退款）：销售额 330.0、订单数 3、付款客户数 2、最大单笔 200.0、最小单笔 30.0
+FIVE_SQL = (f"SELECT SUM(amount) AS gmv, COUNT(*) AS orders, COUNT(DISTINCT customer_id) AS buyers, "
+            f"MAX(amount) AS top, MIN(amount) AS low FROM orders WHERE status <> 'refunded' AND paid_date {WEEK}")
+NAMES = {"gmv": "销售额", "orders": "订单数", "buyers": "付款客户数", "top": "最大单笔", "low": "最小单笔"}
+AGGS = {"gmv": "SUM(amount)", "orders": "COUNT(*)", "buyers": "COUNT(DISTINCT customer_id)", "top": "MAX(amount)",
+        "low": "MIN(amount)"}
+METRICS = [{"id": mid, "name": name, "expression": f"cell(nodes.fetch, 0, '{mid}')"} for mid, name in NAMES.items()]
+#: 盲算各自写一条只算这一个数的 SQL：和原流程的结果一致
+PLANS = {name: (f"SELECT {AGGS[mid]} AS blind_v FROM orders WHERE status <> 'refunded' AND paid_date {WEEK}", "blind_v")
+         for mid, name in NAMES.items()}
+#: 没来得及开始的盲算（默认 600 秒的一段）：指标的原因、出具缺口
+LATE_BLIND = "本次运行即将达到 600 秒的时长上限，为保证运行按时完成，未进行盲算"
+
+
+def node(nid, ntype, label=None, **config):
+    return {"id": nid, "type": ntype, "position": {"x": 0, "y": 0}, "data": {"label": label or nid, "config": config}}
+
+
+def dual_graph(source: str, **dual) -> dict:
+    """取数 → 口径卡（五个指标）→ 双盲复算 → 成果。成果的叙述里没有数字：没有缺口时是完整出具。"""
+    nodes = [
+        node("start", "input"),
+        node("fetch", "tool", tool=f"db_query__{source}", args={"sql": FIVE_SQL}),
+        node("card", "metrics", caliber="销售口径", caliber_version="v1", metrics=METRICS),
+        node("dual", "dual_check", "复核五个指标", **dual),
+        node("out", "output", fields=[{"name": "结论", "value": "本周指标见口径卡"}],
+             contract={"metrics_from": "card", "narrative": "本周指标见口径卡"}),
+    ]
+    return {"nodes": nodes, "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}
+
+
+@pytest.fixture
+async def orders(tmp_path):
+    name, source_id = await add_source(build(tmp_path / "orders.db"))
+    yield name
+    await drop_source(source_id)
+
+
+async def dual_run(spec: dict, **kwargs) -> Run:
+    run = await run_manager.start(graph=spec, input_payload={}, run_class="formal", **kwargs)
+    return await wait(run.id, ("succeeded", "failed", "interrupted"))
+
+
+def unchecked_reasons(out: dict) -> dict[str, str]:
+    return {m["metric_id"]: m["reason"] for m in out["metrics"] if m["status"] == "unchecked"}
+
+
+async def test_five_metrics_with_time_for_two_check_two(monkeypatch, orders):
+    """截止时刻只够盲算 2 项（每项像花了 260 秒）：前 2 项照常盲算、一致，后 3 项不再开始，按无法复算记缺口；运行成功、
+    出具降档。时间线上 dual_check_unchecked 点名这 3 项和原因，不发提醒调高上限的 dual_check_limit。"""
+    blind = Blind(monkeypatch, orders, PLANS)
+    ticker = Ticker(monkeypatch, verify_agent, step=260)
+    row = await dual_run(dual_graph(orders))
+    assert row.status == "succeeded", row.error
+    assert blind.runs == 2 and ticker.timeouts == [120, 120], "时间充裕的两项照传每项时长上限，不收紧"
+
+    out = await output_of(row.id, "dual")
+    assert out["status"] == "partial" and out["counts"] == {"agreed": 2, "disagreed": 0, "unchecked": 3}
+    assert [m["status"] for m in out["metrics"]] == ["agreed", "agreed", "unchecked", "unchecked", "unchecked"]
+    assert unchecked_reasons(out) == {"buyers": LATE_BLIND, "top": LATE_BLIND, "low": LATE_BLIND}
+    gaps = [f"指标「{NAMES[m]}」无法复算：{LATE_BLIND}" for m in ("buyers", "top", "low")]
+    assert out["issuance_gaps"] == gaps
+    assert row.output["_issuance"]["tier"] == "degraded"
+    assert row.output["_issuance"]["gaps"] == [f"双盲复算「复核五个指标」：{gap}" for gap in gaps]
+
+    [unchecked] = await logs(row.id, "dual_check_unchecked")
+    assert unchecked["metrics"] == [{"id": m, "name": NAMES[m], "reason": LATE_BLIND} for m in ("buyers", "top", "low")]
+    assert await logs(row.id, "dual_check_limit") == []
+    assert (await verify_manifest(row.id))["ok"] is True
+
+
+async def test_no_time_for_even_the_first_blind_check(monkeypatch, orders):
+    """一开始就只剩 40 秒：第一项都不开始（后面的也就不再一个个去试），五项都按无法复算记，节点状态是一个都没核成。"""
+    blind = Blind(monkeypatch, orders, PLANS)
+    ticker = Ticker(monkeypatch, verify_agent, step=0, start=560)
+    row = await dual_run(dual_graph(orders))
+    assert row.status == "succeeded", row.error
+    assert blind.calls == [] and ticker.timeouts == []
+    out = await output_of(row.id, "dual")
+    assert out["status"] == "unchecked" and out["counts"] == {"agreed": 0, "disagreed": 0, "unchecked": 5}
+    assert set(unchecked_reasons(out).values()) == {LATE_BLIND}
+    assert len(out["issuance_gaps"]) == 5
+
+
+async def test_a_blind_check_squeezed_by_the_deadline_says_so(monkeypatch, orders):
+    """第 2 项开始前只剩约 150 秒：时长收紧到 60 秒以内；它到点时按无法复算记，原因说运行时长上限将至、时长已收紧，
+    不说「已达每项时长上限（120 秒）」，也不发叫人调大上限的 dual_check_limit。"""
+    blind = Blind(monkeypatch, orders, PLANS)
+    ticker = Ticker(monkeypatch, verify_agent, step=450, hit=lambda timeout: timeout < 120)
+    row = await dual_run(dual_graph(orders))
+    assert row.status == "succeeded", row.error
+    assert blind.runs == 2
+    first, second = ticker.timeouts
+    assert first == 120 and 50 < second < 60, ticker.timeouts
+    out = await output_of(row.id, "dual")
+    reasons = unchecked_reasons(out)
+    assert set(reasons) == {"orders", "buyers", "top", "low"}
+    assert "本次运行即将达到 600 秒的时长上限" in reasons["orders"] and "收紧" in reasons["orders"]
+    assert "每项时长上限" not in reasons["orders"]
+    assert {reasons[m] for m in ("buyers", "top", "low")} == {LATE_BLIND}
+    assert await logs(row.id, "dual_check_limit") == []
+
+
+async def test_resuming_after_the_review_replays_the_blind_checks(monkeypatch, orders):
+    """销售额两路不一致、挂起等审核人裁决；后 3 项没来得及。审批恢复后节点从头重放：盲算取 checkpoint 里的，不再执行，
+    没来得及的 3 项照旧——不看恢复后这一段还剩多少时间。"""
+    plans = dict(PLANS)
+    plans["销售额"] = (f"SELECT SUM(amount) AS blind_v FROM orders WHERE paid_date {WEEK}", "blind_v")   # 没排除退款：380.0
+    blind = Blind(monkeypatch, orders, plans)
+    ticker = Ticker(monkeypatch, verify_agent, step=260)
+    row = await dual_run(dual_graph(orders))
+    assert row.status == "interrupted", row.error
+    calls, timeouts = list(blind.calls), list(ticker.timeouts)
+    assert blind.runs == 2
+
+    ticker.offset = 0          # 恢复后的一段：时间又充裕了，重做的话五项都会盲算
+    async with SessionLocal() as session:
+        approval = (await session.execute(select(Approval).where(
+            Approval.run_id == row.id, Approval.status == "pending"))).scalar_one()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(f"/api/approvals/{approval.id}/decide",
+                                json={"approved": True, "value": {"choices": {"gmv": "a"}, "note": ""}})
+    assert res.status_code == 200, res.text
+    row = await wait(row.id)
+    assert row.status == "succeeded", row.error
+    assert blind.calls == calls and ticker.timeouts == timeouts, "恢复后盲算又执行了：没取 checkpoint"
+    out = await output_of(row.id, "dual")
+    assert out["status"] == "resolved" and out["choices"] == {"gmv": "a"}
+    assert [m["status"] for m in out["metrics"]] == ["disagreed", "agreed", "unchecked", "unchecked", "unchecked"]
+    assert set(unchecked_reasons(out).values()) == {LATE_BLIND}
+    assert len(await logs(row.id, "dual_check_unchecked")) == 1, "盲算那一步的日志只发一次"
+
+
+async def test_slow_blind_checks_no_longer_abort_the_run(monkeypatch, orders):
+    """真的钟：这一段只有 5 秒，五项盲算一项接一项（并行数 1），每项约 1 秒（模型每次调用 0.3 秒，每项 3 次），合起来
+    超过 5 秒——以前整次运行在盲算到一半时被中止。现在时间不够就不再开始、开始的按剩余时间收紧，没来得及的按无法复算
+    记，运行成功。每项时长上限 3 秒，一项自己用不完：无法复算的只会是因为运行时长上限将至。几项来得及随机器快慢变，
+    只断言不变的。"""
+    monkeypatch.setattr(settings, "max_run_seconds", 5)
+    monkeypatch.setattr(deadline, "RESERVE_S", 1.2)
+    monkeypatch.setattr(verify_agent, "SETTLE_GRACE_S", 0.4)
+    monkeypatch.setattr(dual_check_mod, "BLIND_CONCURRENCY", 1)
+
+    async def slow_model(session, spec):
+        return MockChatModel(model_name="slow-verify", latency=0.3), "slow-verify"
+
+    monkeypatch.setattr(verify_agent, "get_chat_model", slow_model)
+    Blind(monkeypatch, orders, PLANS)
+    row = await dual_run(dual_graph(orders), options={"verify": {"dual_check": {"timeout_s": 3}}})
+    assert row.status == "succeeded", row.error
+    assert "时长上限，已中止" not in (row.error or "")
+
+    out = await output_of(row.id, "dual")
+    reasons = unchecked_reasons(out)
+    assert out["counts"]["agreed"] >= 1 and reasons, out["metrics"]
+    assert out["counts"]["agreed"] + len(reasons) == 5 and out["counts"]["disagreed"] == 0
+    assert all("本次运行即将达到 5 秒的时长上限" in why for why in reasons.values()), reasons
+    assert [m["status"] for m in out["metrics"]][:out["counts"]["agreed"]] == ["agreed"] * out["counts"]["agreed"], \
+        "一项接一项：来得及的在前"
+    [unchecked] = await logs(row.id, "dual_check_unchecked")
+    assert {m["id"] for m in unchecked["metrics"]} == set(reasons)
