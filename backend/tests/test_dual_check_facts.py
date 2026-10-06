@@ -386,7 +386,8 @@ def test_an_uploaded_column_the_import_took_as_a_date_is_a_date():
     for choice, column in (("a", "order_date"), ("b", "paid_date")):
         fact, why = derive(uploaded(BY_ORDER_DATE, RIGHT, choice, both), texts)
         assert why is None, why
-        assert (fact.table, fact.item, fact.value, fact.choice) == ("orders", "business_date", {"column": column}, choice)
+        assert (fact.table, fact.item, fact.value, fact.choice) == \
+            ("orders", "business_date", {"column": column}, choice)
         said = preview(uploaded(BY_ORDER_DATE, RIGHT, choice, both), texts, {})
         assert said[choice] == {"write": True, "source": "shop", "table": "orders", "item": "business_date",
                                 "value": {"column": column}}
@@ -434,8 +435,8 @@ def test_the_import_dates_follow_the_names_in_the_table_structure():
     """差异说明里的名字是规范化过的（不加引号的一律小写），配方里、表结构里的写法可能带大写：按表结构认出的那一列去对
     upload_dates，大小写不同照样对得上。"""
     upper = {"tables": {"Orders": {"name": "Orders", "columns": [
-        {"name": "Status", "type": "TEXT"}, {"name": "Order_Date", "type": "TEXT"}, {"name": "Paid_Date", "type": "TEXT"},
-        {"name": "Amount", "type": "REAL"}]}}}
+        {"name": "Status", "type": "TEXT"}, {"name": "Order_Date", "type": "TEXT"},
+        {"name": "Paid_Date", "type": "TEXT"}, {"name": "Amount", "type": "REAL"}]}}}
     fact, why = derive(uploaded(BY_ORDER_DATE, RIGHT, "b", {"Orders": ["Order_Date", "Paid_Date"]}), upper)
     assert why is None and (fact.table, fact.value) == ("Orders", {"column": "paid_date"})
     fact, why = derive(uploaded(BY_ORDER_DATE, RIGHT, "b", {"orders": ["order_date", "paid_date"]}), upper)

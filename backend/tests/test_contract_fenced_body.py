@@ -73,7 +73,8 @@ def test_a_report_body_in_a_prose_code_block_is_recognised(raw):
 
 @pytest.mark.parametrize("raw", [
     # 代码：信息串写明了语言
-    pytest.param("```sql\nSELECT region, SUM(amount) AS gmv FROM orders WHERE amount > 100 GROUP BY region\n```", id="sql"),
+    pytest.param("```sql\nSELECT region, SUM(amount) AS gmv FROM orders WHERE amount > 100 GROUP BY region\n```",
+                 id="sql"),
     pytest.param("```python\nprint('华东销售额最高，华南次之。')\n```", id="python"),
     pytest.param('```json\n{"区域": "华东，华南"}\n```', id="json"),
     # 信息串为空、里面是代码：没有成句的文字；代码注释里的中文句子不算
