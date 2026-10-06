@@ -4,7 +4,7 @@
 - 基准是同一定时任务、同一工作流、比这次先发起的运行里成功结束并封存的最近一次：同一工作流更近的手动运行、别的
   定时任务的运行都不算；失败的那一次不当基准（拿它当基准每个指标都成了「新增」）；按发起先后挑，不按结束时间——
   老的失败运行事后被接着跑完，结束得比后一次晚，它的上一次仍是它前面那次。紧挨着的上一次不是成功的时，通知和触发
-  历史写明比的是哪一次
+  历史写明比的是哪一次。运行详情「与上一次对比」的默认基准（api/compare.py 的 pick_base）和这里挑的是同一次
 - 整份结果连同两边的清单哈希存成工件（kind=run_compare，不挂在运行名下、不进运行的工件列表），工件 id 记进触发
   记录的 compare_artifact。这个任务的第一次（只有同一工作流别的运行可比）、还没封存时不比；对比出错（基准的封存核对
   不一致、意外的异常）只记日志，通知照常推送、不带对比
@@ -320,9 +320,12 @@ async def test_after_a_failed_run_the_base_is_the_last_successful_one(recorder, 
     assert (body["compare"]["base_run_id"], body["compare"]["previous"]) == (first, False)
     items = {f["id"]: f for f in (await client.get(f"/api/schedules/{sid}/fires")).json()["items"]}
     assert items[fire_id]["compare"] == {"base_run_id": first, "summary": SUMMARY, "previous": False}
+    # 运行详情「与上一次对比」的默认基准挑的是同一次（同一个函数）：两个同名入口比的是同一对运行、计数一致
+    base = (await client.get(f"/api/runs/{target_id}/compare/base")).json()
+    assert (base["base_run_id"], base["reason"]) == (first, "same_schedule")
 
 
-async def test_base_follows_launch_order_not_finish_time(recorder):
+async def test_base_follows_launch_order_not_finish_time(recorder, client):
     """第 2 周失败、第 3 周照常成功之后，有人把第 2 周接着跑完：它结束得比第 3 周晚，但它的上一次仍是第 1 周。以前
     按结束时间挑，拿后一次触发的第 3 周当基准，「与上一次相比」的变化方向是反的。第 3 周已经比过的那一份不受影响"""
     workflow = await new_workflow()
@@ -342,6 +345,24 @@ async def test_base_follows_launch_order_not_finish_time(recorder):
     stored = load((await fire_row(second_fire)).compare_artifact)
     assert stored["result"]["base"]["id"] == first and stored["previous"] is True
     assert (await fire_row(third_fire)).compare_artifact == third_artifact
+    # 运行详情里的默认基准同样按发起先后：接着跑完的第 2 周，上一次仍是第 1 周
+    base = (await client.get(f"/api/runs/{second}/compare/base")).json()
+    assert (base["base_run_id"], base["reason"]) == (first, "same_schedule")
+
+
+async def test_without_an_earlier_success_there_is_no_base(recorder, client):
+    """同一定时任务之前只有失败的那次：不自动对比；运行详情里的默认基准也不拿它（同一工作流、同一类别里也没有成功的），
+    回 404 说清找不到，不给一个比出来全是「新增」的基准"""
+    workflow = await new_workflow()
+    sid = await new_schedule(workflow, url=None)
+    failed = await persist(failed_week("r1"), workflow, finished=T0, schedule_id=sid, status="failed")
+    await fire_for(sid, failed, T0 - timedelta(minutes=2), notified="failed")
+    target_id = await persist(week("r2", NEXT_ROWS), workflow, finished=T0 + WEEK, schedule_id=sid)
+    fire_id = await fire_for(sid, target_id, T0 + WEEK - timedelta(minutes=2))
+    await webhook.notify_due()
+    assert (await fire_row(fire_id)).compare_artifact is None
+    resp = await client.get(f"/api/runs/{target_id}/compare/base")
+    assert resp.status_code == 404 and resp.json()["code"] == "compare_no_base", resp.text
 
 
 async def test_first_run_of_a_schedule_has_no_compare(recorder, client):

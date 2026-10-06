@@ -6,10 +6,11 @@
 
 - 比哪些：成功结束、封存完的运行。失败、取消的运行指标不全（口径卡常常没执行），和上一次比只会得出「移除 N 个」，
   收到通知的人会以为报告删了指标
-- 跟谁比：同一定时任务、同一工作流、比这次先发起的运行里成功结束并封存的最近一次（_previous）。失败的那次不当基准：
-  拿它当基准，每个指标都成了「新增」。按发起先后挑，不按结束时间：老的失败运行事后被接着跑完，结束得比后一次晚，
-  它的上一次仍是它前面那次。紧挨着的上一次不是成功的（失败、取消、还没结束）时 previous 为 False，通知和触发历史
-  写明比的是哪一次
+- 跟谁比：同一定时任务、同一工作流、比这次先发起的运行里成功结束并封存的最近一次。规则在对比接口的 pick_base，
+  运行详情「与上一次对比」的默认基准用的是同一个函数：触发历史和运行详情里两个同名的入口必须比同一对运行。失败的那次
+  不当基准：拿它当基准，每个指标都成了「新增」。按发起先后挑，不按结束时间：老的失败运行事后被接着跑完，结束得比
+  后一次晚，它的上一次仍是它前面那次。紧挨着的上一次不是成功的（失败、取消、还没结束）时 previous 为 False，通知和
+  触发历史写明比的是哪一次。这个任务的第一次不比（不像运行详情那样退回同一工作流的别的运行：那不是「上一次」）
 - 和封存绑定：运行的封存要盖住它最后一条结束事件才算封存完（sealed_now）。runner 先写终态、再另起会话封存，失败后
   接着跑完的运行在两步之间还带着失败时的清单哈希，拿它去比只比得到旧封存范围里的事件。结果里记下两边的清单哈希：
   哪一边后来变了，触发历史就不再给这份对比（api/schedules._fire_outs）；对比途中变了，结果不记
@@ -125,7 +126,8 @@ async def compare_fire(fire_id: str, run_id: str) -> dict[str, Any] | None:
 
 
 async def _compare(fire_id: str, run_id: str) -> dict[str, Any] | None:
-    # 现成的对比函数在用到时才导入：api/compare.py 连带证据、推演接口，调度模块被导入时不必一起加载
+    # 挑基准、对比都用对比接口现成的函数，在用到时才导入：api/compare.py 连带证据、推演接口，调度模块被导入时不必
+    # 一起加载
     from app.api import compare as compare_api
 
     # 挑基准、核对封存、看有没有比过都只是读库，不占对比的空位：前面排着慢的对比时，第一次运行这类没什么可比的
@@ -136,10 +138,10 @@ async def _compare(fire_id: str, run_id: str) -> dict[str, Any] | None:
         if target is None or target.status != "succeeded" or not target.schedule_id or not target.workflow_id \
                 or not await sealed_now(session, target):
             return None
-        found = await _previous(session, target)
+        found = await compare_api.pick_base(session, target, schedule_only=True)
         if found is None:
             return None
-        base, previous = found
+        base, previous = found.run, found.previous
         if not await sealed_now(session, base):
             # 基准正好处在写完终态、还没封存的那一刻，或者封存没补上就停了机：拿它比只比得到旧封存里的事件
             logger.warning("作为基准的运行 %s 还没有封存到它的结束事件，运行 %s 这次不比", base.id, run_id)
@@ -165,23 +167,6 @@ async def _compare(fire_id: str, run_id: str) -> dict[str, Any] | None:
         return None
     _remember(artifact, brief)
     return _copy(brief)
-
-
-async def _previous(session: Any, target: Run) -> tuple[Run, bool] | None:
-    """(基准, 是不是紧挨着的上一次)：同一定时任务、同一工作流、比这次先发起的运行里成功结束并封存的最近一次。
-
-    按发起先后挑（created_at），不按结束时间；同一工作流才比得了（任务改过工作流的，之前那个工作流的运行不算）。
-    中间隔着别的运行（失败、取消、还没结束的）时第二项为 False。"""
-    earlier = (Run.schedule_id == target.schedule_id, Run.workflow_id == target.workflow_id, Run.id != target.id,
-               Run.created_at < target.created_at)
-    base = (await session.execute(
-        select(Run).where(*earlier, Run.status == "succeeded", Run.manifest_hash.is_not(None))
-        .order_by(Run.created_at.desc()).limit(1))).scalars().first()
-    if base is None:
-        return None
-    between = await session.scalar(select(func.count()).select_from(Run).where(
-        *earlier, Run.created_at > base.created_at))
-    return base, not between
 
 
 def _slots() -> asyncio.Semaphore:
