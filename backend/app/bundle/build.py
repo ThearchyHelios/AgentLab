@@ -83,6 +83,7 @@ class _Store:
         self._raw: dict[str, bytes | None] = {}
         self._json: dict[str, Any] = {}
         self._masked: dict[str, bool] = {}
+        self._hidden: dict[str, set[str]] = {}
 
     def raw(self, artifact: str) -> bytes | None:
         if artifact not in self._raw:
@@ -118,14 +119,24 @@ class _Store:
                                                       intact=self.intact(artifact))
         return self._masked[artifact]
 
+    def hidden(self, artifact: str) -> set[str]:
+        """一份读得出来的查询快照里值取自遮罩列的列（小写）：查询当时记下的、数据源现在设的遮罩列，加上 SQL 里给它们
+        改了名字的（_derived_columns）。"""
+        if artifact not in self._hidden:
+            content = self.content(artifact)
+            base = _snapshot_hidden(content, self._source_masks) if isinstance(content, dict) else set()
+            self._hidden[artifact] = _derived_columns(content, base) if base else set()
+        return self._hidden[artifact]
+
     def card_masked(self, artifact: str, events: Sequence[tuple[int, str, str | None, Any]]) -> bool:
         """这张口径卡算不算带遮罩：卡上有一个输入取自遮罩列，或者遮没遮核对不了。卡上记着每个输入的值（cell() 取的格、
         Agent 字段、按位置取的 vars.res.rows[0][2]）和代入式，整张卡不随文件附带——没法只拿掉几个值，拿掉了哈希就对不上。
 
         认哪个输入取自哪份查询结果的哪几列，和证据面板、推演同一个认法（recompute.input_origin）；按位置取的一格顺着
-        取值链从写变量的节点在口径卡算这一次之前的产出起走。核对不了的宁可多挡：快照读不出来、取值链上的产出读不出来、
-        那份结果没存快照只带着数据源名、定位里没写列。认得出、可结果既没带快照的 id 也没带数据源名的（数据整形改过形状）
-        认不出出处，不算。
+        取值链从写变量的节点在口径卡算这一次之前的产出起走。那几列算不算遮罩列，除了列名对上的，SQL 里给遮罩列起了别名、
+        套了函数、经子查询或 WITH 转了一道的也算（hidden，同质询、双盲复算的认法）。核对不了的宁可多挡：快照读不出来、
+        取值链上的产出读不出来、那份结果没存快照只带着数据源名、定位里没写列。认得出、可结果既没带快照的 id 也没带数据源名
+        的（数据整形改过形状）认不出出处，不算。
 
         卡本身按解析出来的内容认，不看哈希（同 content）：服务端的文件被改过，嵌进页面的照样是这份原字节，卡上记着的号码
         也照样在里面。读得出字节、解析不出一张卡的（截断的 JSON、不是对象）认不出有哪些输入，整张按带遮罩算，和读不出来的
@@ -160,7 +171,7 @@ class _Store:
             return True
         if not origin.columns:
             return self.masked(origin.artifact)
-        hidden = _snapshot_hidden(content, self._source_masks)
+        hidden = self.hidden(origin.artifact)
         return any(c.lower() in hidden for c in origin.columns)
 
 
@@ -235,6 +246,27 @@ def _untouched(snapshot: dict[str, Any], hidden: set[str]) -> bool:
     except Exception:  # noqa: BLE001 - 解析器、认遮罩列的那一套出了意外：按碰了遮罩列算（宁可多挡）
         logger.warning("可验证报告：判断查询快照有没有碰遮罩列时出错，按碰了处理", exc_info=True)
         return False
+
+
+def _derived_columns(snapshot: dict[str, Any], base: set[str]) -> set[str]:
+    """一份快照里值取自遮罩列的结果列（小写）：遮罩列本身（base），加上 SQL 里给它们起别名、套函数、经子查询或 WITH
+    转一道得来的（inquiry._derived_hidden，质询、双盲复算同一个认法）。SQL 按每种读得通的读法各认一遍、合起来；都读不通
+    的照那一套的办法，写着遮罩列就整份的列都算。出错时整份的列都算（宁可多挡）。"""
+    try:
+        from app.data.sql_semantics import _parse, _read
+        from app.engine.inquiry import _derived_hidden
+
+        sql = snapshot.get("sql")
+        kinds = [kind for kind in _READINGS
+                 if isinstance(sql, str) and _parse(sql, _read(kind))[0] is not None] or [None]
+        out = set(base)
+        for kind in kinds:
+            out |= {c.lower() for c in _derived_hidden(dict(snapshot), set(base), kind)[0]}
+        return out
+    except Exception:  # noqa: BLE001 - 认遮罩列的那一套出了意外：整份的列都按遮罩算
+        logger.warning("可验证报告：按 SQL 认改了名字的遮罩列时出错，整份快照的列都按遮罩处理", exc_info=True)
+        columns = snapshot.get("columns")
+        return set(base) | ({str(c).lower() for c in columns} if isinstance(columns, list) else set())
 
 
 def _writes_any(sql: str, names: Iterable[str]) -> bool:
