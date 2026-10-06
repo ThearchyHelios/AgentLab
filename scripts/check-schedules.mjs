@@ -5,9 +5,10 @@
 // 立即运行之后没有下文、触发历史只有一页、保存过的 Webhook 地址又被原样显示出来、改了别的字段却把地址清掉、
 // 记录页看不出哪些运行来自定时任务、390px 窄屏被表单撑出横向滚动。运行成功结束后的自动对比：触发历史里「与上一次
 // 对比」（和运行详情「更多」菜单同一个叫法）链到对比页，旁边写有几个指标有变化，悬停只写各类指标的个数，基准不是
-// 紧挨着的上一次时写明是哪一次、不带「默认基准」的来历；运行详情页头的「由定时任务「X」发起」是键盘到得了的真链接
-// （记录页的「定时」标记在整行按钮里，只能鼠标点），带日历图标，窄窗口里（768、820、900 宽，探索运行多一个「提取为
-// 草稿」）不被挤没，定时任务删掉之后写成纯文本。
+// 紧挨着的上一次时链接上看得见的字写「与上一次成功的运行对比」、悬停写明是哪一次；两种都带「默认基准：同一定时任务
+// 上一次成功的运行」的来历，和运行详情「更多」里的同名入口打开同一对运行（服务端用同一个函数挑基准）。运行详情页头的
+// 「由定时任务「X」发起」是键盘到得了的真链接（记录页的「定时」标记在整行按钮里，只能鼠标点），带日历图标，窄窗口里
+// （768、820、900 宽，探索运行多一个「提取为草稿」）不被挤没，定时任务删掉之后写成纯文本。
 // 还有几处时序和口径：晚到的刷新把刚切换的开关盖回去、先开触发历史再开设置时带着旧版本撞假的 409、保存途中又改了
 // 别的字段时替换过的地址明文留在框里、服务端会拒的组合（未发布 + 正式运行、必填没填、已发布版本里没有的字段）
 // 照样放行、测试消息的结果把服务端的整句又套一层、错过已跳过的那条悬停另说一个原因（和本条记的原因对不上）。
@@ -267,9 +268,15 @@ await section('纯函数：服务端会拒的组合、保存回来怎么接、�
   check(`测试结果：服务端给整句、给补充说明都只说一遍（${tests.length} 种）`, !wrong.length, wrong.map(([r]) => t(r)).join('；'))
 })
 
+/** 对比页写的默认基准来历（定时任务发起的）：只挑比本次先发起、成功结束并封存的运行，服务端 api/compare.py 的 pick_base */
+const REASON_SCHEDULE = '默认基准：同一定时任务上一次成功的运行'
+
 await section('纯函数：触发历史对比的文案', async () => {
   const { SCHEDULE_TEXT: T, RUN_COMPARE_TEXT: C } = await import(await load('/src/lib/terms.ts'))
   check('「与上一次对比」和运行详情「更多」菜单同一个叫法', T.compareLink === C.menu && T.compareLink === '与上一次对比', T.compareLink)
+  check('基准不是紧挨着的上一次时的叫法：与上一次成功的运行对比', T.compareLinkLastOk === '与上一次成功的运行对比', T.compareLinkLastOk)
+  check('默认基准的来历照服务端的挑法写「上一次成功的运行」', C.reason.same_schedule === REASON_SCHEDULE
+    && C.reason.same_workflow === '默认基准：同一工作流、同一运行类别上一次成功的运行', JSON.stringify(C.reason))
   const zero = { unchanged: 0, data_only: 0, caliber_and_data: 0, sql_changed: 0, params_only: 0, added: 0, removed: 0, incomparable: 0 }
   const cases = [
     ['有变化的几类合起来', { ...zero, data_only: 3, caliber_and_data: 1, params_only: 2, unchanged: 4 }, '6 个指标有变化'],
@@ -1462,6 +1469,11 @@ await section('详情：触发历史里的「与上一次对比」', async () =>
   const f10 = row('f10').locator('[data-fire-compare]')
   const t10 = (await f10.getAttribute('title').catch(() => '')) ?? ''
   check('上一次失败了、基准是再往前成功的那次：悬停写明是哪一次', t10.startsWith('与上一次成功的运行（#run-f1）相比：只数据变 1 个'), t10)
+  // 触屏没有悬停、键盘聚焦也不显示 title：比的不是上一次这件事得写在看得见的字里
+  const l10 = f10.locator('[data-fire-compare-label]')
+  check('……链接上看得见的字写「与上一次成功的运行对比」，不只靠悬停', (await l10.innerText().catch(() => '')).trim() === '与上一次成功的运行对比'
+    && await l10.isVisible(), (await l10.innerText().catch(() => '没有')).trim())
+  check('……紧挨着的上一次那一行照旧写「与上一次对比」', (await row('f00').locator('[data-fire-compare-label]').innerText()).trim() === '与上一次对比')
   const linked = await page.locator('[data-fire-compare]').evaluateAll((els) => els.map((e) => e.closest('[data-fire-id]')?.getAttribute('data-fire-id')))
   check('没有对比的（compare 为 null、老服务端不给、没有运行）不给链接', JSON.stringify(linked) === '["f00","f08","f10"]', JSON.stringify(linked))
   check('运行链接照旧在', await row('f00').locator('a[href="/runs/run-f00"]').count() === 1)
@@ -1475,19 +1487,76 @@ await section('详情：触发历史里的「与上一次对比」', async () =>
   })
   check('……回车打开对比页，带着本次和基准', !!url && url.searchParams.get('target') === 'run-f00'
     && url.searchParams.get('base') === 'run-f02', page.url())
-  // 来历跟着这一次跳转走（路由的 state），对比页据此写「默认基准：同一定时任务的上一次运行」
+  // 来历跟着这一次跳转走（路由的 state），对比页据此写「默认基准：同一定时任务上一次成功的运行」
   const via = await page.evaluate(() => history.state?.usr ?? null)
   check('……紧挨着的上一次：带上「同一定时任务」的来历', via?.reason === 'same_schedule' && via?.base === 'run-f02', JSON.stringify(via))
 
+  // 基准不是紧挨着的上一次：来历照样带上。对比页写的是「上一次成功的运行」，比的正是这一次，和从运行详情进去一字不差
   const second = await open('/schedules/s-weekly?tab=history')
-  await second.page.locator('[data-fire-id="f10"] [data-fire-compare]').click()
+  await second.page.locator('[data-fire-id="f10"] [data-fire-compare]').focus()
+  const focusedLabel = await second.page.evaluate(() => document.activeElement?.querySelector('[data-fire-compare-label]')?.textContent?.trim() ?? '')
+  check('……键盘聚焦在那一行的链接上时，看得见的字就是「与上一次成功的运行对比」', focusedLabel === '与上一次成功的运行对比', focusedLabel)
+  await second.page.keyboard.press('Enter')
   await until(() => new URL(second.page.url()).pathname === '/runs/compare')
   const via10 = await second.page.evaluate(() => history.state?.usr ?? null)
-  check('……基准不是紧挨着的上一次：不带来历，对比页不说「上一次」', new URL(second.page.url()).searchParams.get('base') === 'run-f12'
-    && via10 == null, JSON.stringify(via10))
+  const reason10 = await until(async () => (await second.page.locator('[data-compare-reason]').innerText().catch(() => '')).trim())
+  check('……基准不是紧挨着的上一次：带上来历，对比页写「同一定时任务上一次成功的运行」', new URL(second.page.url()).searchParams.get('base') === 'run-f12'
+    && via10?.reason === 'same_schedule' && via10?.base === 'run-f12' && reason10 === REASON_SCHEDULE, `${JSON.stringify(via10)} ${reason10}`)
   const real = [...writes(sent, /./), ...writes(second.sent, /./)].filter((x) => x.key !== 'POST /schedules/preview')
   check('只读：没有写请求', real.length === 0, real.map((x) => x.key).join('、'))
   check('没有页面报错', ![...errors, ...second.errors].length, [...errors, ...second.errors].join(' ｜ '))
+})
+
+await section('详情：触发历史和运行详情的「与上一次对比」拿同一个基准', async () => {
+  // f10 的上一次（f11）失败了，服务端两处都挑再往前成功的 f12：自动对比和运行详情的默认基准用的是同一个函数
+  // （api/compare.py 的 pick_base），基准事后变了的旧对比触发历史不再给，这些由 backend/tests/test_scheduler_compare.py
+  // 守。这里守前端：两个入口都原样用服务端给的基准，打开同一对运行、写同一句来历
+  const runOf = (id, at) => ({ ...RUNS[0], id, started_by: '定时任务：门店周报 · 每周', created_at: iso(at), started_at: iso(at),
+    finished_at: iso(at + 4200), manifest_hash: 'ab'.repeat(32), manifest_seq: 2 })
+  const f10 = runOf('run-f10', nextMonday9(-11))
+  const f12 = runOf('run-f12', nextMonday9(-13))
+  const ref = (r) => ({ id: r.id, workflow_name: r.workflow_name, version: r.version, run_class: r.run_class,
+    started_at: r.started_at, finished_at: r.finished_at, schedule_id: r.schedule_id })
+  const compareApi = (method, path, body, url) => {
+    if (method !== 'GET') return null
+    if (path === '/runs/run-f10/compare/base') return { json: { base_run_id: 'run-f12', reason: 'same_schedule', base: ref(f12) } }
+    if (path === '/runs/run-f10/compare' && url.searchParams.get('base') === 'run-f12') {
+      return { json: { target: ref(f10), base: ref(f12), summary: COMPARE_F10.summary, metrics: [], queries: [], notes: [],
+        template: { base_version: 3, target_version: 3, same_graph: true, nodes: [] } } }
+    }
+    return null
+  }
+  const stateOf = () => ({ ...freshState({ runs: [...RUNS, f10, f12] }), override: compareApi })
+  const landed = (page) => until(() => {
+    const u = new URL(page.url())
+    return u.pathname === '/runs/compare' ? u : null
+  })
+  const reasonOf = (page) => until(async () => (await page.locator('[data-compare-reason]').innerText().catch(() => '')).trim())
+
+  const menu = await open('/runs/run-f10', { state: stateOf() })
+  await menu.page.locator('[data-run-detail="run-f10"]').waitFor({ timeout: 10000 })
+  await menu.page.getByRole('button', { name: '更多操作' }).click()
+  await menu.page.locator('[data-menu=compare]').click()
+  const a = await landed(menu.page)
+  const hist = await open('/schedules/s-weekly?tab=history', { state: stateOf() })
+  const link = hist.page.locator('[data-fire-id="f10"] [data-fire-compare]')
+  await link.waitFor()
+  const label = (await link.locator('[data-fire-compare-label]').innerText()).trim()
+  await link.click()
+  const b = await landed(hist.page)
+  check('运行详情「更多」和触发历史两个入口：打开同一对运行（本次 run-f10，基准是跳过失败那次的 run-f12）',
+    !!a && !!b && a.searchParams.get('target') === 'run-f10' && b.searchParams.get('target') === 'run-f10'
+    && a.searchParams.get('base') === 'run-f12' && b.searchParams.get('base') === 'run-f12', `${a?.search} | ${b?.search}`)
+  const [ra, rb] = [await reasonOf(menu.page), await reasonOf(hist.page)]
+  check('……两处写的默认基准一字不差：同一定时任务上一次成功的运行', ra === REASON_SCHEDULE && rb === REASON_SCHEDULE, `${ra} | ${rb}`)
+  check('……触发历史上看得见的字说明比的是上一次成功的运行', label === '与上一次成功的运行对比', label)
+  const tiles = (page) => until(async () => (await page.locator('[data-compare-summary] [data-compare-class]').evaluateAll((els) =>
+    els.map((e) => `${e.getAttribute('data-compare-class')}=${e.querySelector('[data-compare-count]')?.textContent?.trim()}`))).join(' '))
+  const [ta, tb] = [await tiles(menu.page), await tiles(hist.page)]
+  check('……两边的变化摘要一致', !!ta && ta === tb, `${ta} | ${tb}`)
+  const real = [...writes(menu.sent, /./), ...writes(hist.sent, /./)]
+  check('只读：没有写请求', real.length === 0, real.map((x) => x.key).join('、'))
+  check('没有页面报错', ![...menu.errors, ...hist.errors].length, [...menu.errors, ...hist.errors].join(' ｜ '))
 })
 
 // ---------------------------------------------------------------- 运行详情
@@ -1739,6 +1808,8 @@ await section('窄屏 390px 与浅色', async () => {
     check(`${theme}：触发历史不横向溢出`, await overflow(hist.page) <= 1, `${await overflow(hist.page)}px`)
     check(`${theme}：「与上一次对比」和旁边的计数在屏幕里`, await inViewX(hist.page, '[data-fire-id="f00"] [data-fire-compare]')
       && await inViewX(hist.page, '[data-fire-id="f00"] [data-fire-compare-count]'))
+    check(`${theme}：更长的「与上一次成功的运行对比」连同计数也在屏幕里`, await inViewX(hist.page, '[data-fire-id="f10"] [data-fire-compare]')
+      && await inViewX(hist.page, '[data-fire-id="f10"] [data-fire-compare-count]'))
     const cmp = await readable(hist.page, '[data-fire-id="f00"] [data-fire-compare]')
     check(`${theme}：「与上一次对比」对比度 ≥ 4.5`, !!cmp && cmp.ratio >= 4.5, JSON.stringify(cmp))
     const cnt = await readable(hist.page, '[data-fire-id="f00"] [data-fire-compare-count]')

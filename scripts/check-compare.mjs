@@ -9,10 +9,14 @@
 // 同一节点两条查询的 (node_id, ordinal) 相同；一边的 SQL 是 null；基准运行读不到；本次的记录读不到；不属于已保存
 // 工作流的运行；查找基准期间离开运行详情（新页面画好之后、或者地址刚换新页面还没画出来时答复才回来，走过的地址里
 // 都不能出现对比页）。下一步的提示要和页面上真能做的事对得上：下拉里没有能换的运行就不叫人去上方换，本次的记录
-// 不存在时不给注定失败的「重试」。
+// 不存在时不给注定失败的「重试」。默认基准的说法照服务端的挑法（api/compare.py 的 pick_base）写「上一次成功的运行」
+// ——上一次失败了，基准是再往前成功的那一次；定时任务触发历史里的「与上一次对比」和运行详情里的同名入口打开同一对
+// 运行、写同一句来历，基准不是紧挨着的上一次时触发历史上看得见的字写明「上一次成功的运行」；找不到默认基准时标题不说
+// 「没有可作为基准的运行」（失败、取消的照样能手动选），换基准的下拉和基准卡写明哪次失败、取消了。
 //
 // 全部用 page.route 假接口：虚构的「区域销售周报」三次已封存的正式运行和一次没封存的，运行详情、运行列表、
-// compare/base、compare、定时任务列表都在浏览器层答掉，别的 GET 放行（外壳要的工作流、待审批），非 GET 一律拦掉。
+// compare/base、compare、定时任务列表、发起它们的定时任务和触发历史都在浏览器层答掉，别的 GET 放行（外壳要的工作流、
+// 待审批），非 GET 一律拦掉。
 // 运行对比的两个接口只读，这里的假答复严格照接口约定的字段名和形状。
 //
 //   node scripts/check-compare.mjs
@@ -181,10 +185,32 @@ function comparison(target, base) {
 const LABEL = { unchanged: '未变', data_only: '只数据变', caliber_and_data: '口径与数据都变', sql_changed: 'SQL 结构变',
   params_only: '只参数变', added: '新增', removed: '移除', incomparable: '无法比较' }
 const ORDER = ['data_only', 'caliber_and_data', 'sql_changed', 'params_only', 'added', 'removed', 'incomparable', 'unchanged']
-const REASON = '默认基准：同一定时任务的上一次运行'
-const FINDING = '正在查找上一次运行'
+// 默认基准只挑比本次先发起、成功结束并封存的运行（服务端 api/compare.py 的 pick_base）：说法里都是「上一次成功的运行」
+const REASON = '默认基准：同一定时任务上一次成功的运行'
+const REASON_WORKFLOW = '默认基准：同一工作流、同一运行类别上一次成功的运行'
+const FINDING = '正在查找上一次成功的运行'
 /** 409、422、缺基准的 404 时下拉里没有能换的运行：不叫人去上方换，照实说 */
 const NO_OTHER = '同一工作流没有其他可换作基准的已封存运行'
+/** 服务端（api/compare.py 的 NO_BASE_TEXT）找不到默认基准时的原话 */
+const NO_BASE_SERVER = '没有找到上一次成功的运行：需要同一工作流、同一运行类别里比这次先发起、成功结束并已封存的运行'
+
+/**
+ * 发起本次和基准的定时任务（RUNS 里的 schedule_id）和它的触发历史：本次那一行带服务端自动对比的计数，基准是 B、不是
+ * 紧挨着的上一次（previous: false，假定 B 之后同一定时任务还有一次失败的；那一次不进 RUNS，换基准的下拉照旧）。
+ * 只给「两个入口拿同一个基准」那一段用：触发历史和运行详情「更多」里的同名入口，服务端用同一个函数挑基准
+ */
+const SCHEDULE_ID = 'sch0weekly'
+const SCHEDULE = {
+  id: SCHEDULE_ID, name: '区域销售周报 · 每周', workflow_id: WF, workflow_name: NAME, cron: '0 9 * * 1', timezone: 'Asia/Shanghai',
+  run_class: 'formal', input_template: {}, enabled: true, overlap: 'skip', misfire_grace_s: 3600, webhook: null,
+  next_run_at: '2026-10-12T01:00:00Z', last_fire: null, description_text: '每周一 09:00（Asia/Shanghai）', created_by: '值班分析员',
+  created_at: day('09-01'), updated_at: day('09-01'), version: 2,
+}
+const FIRE_T = 'fire0target'
+const FIRES = [{
+  id: FIRE_T, fire_at: day('10-05'), kind: 'scheduled', status: 'started', run_id: T, run_status: 'succeeded', reason: null,
+  notified: [], created_at: day('10-05'), compare: { base_run_id: B, previous: false, summary: SUMMARY },
+}]
 
 // ---------------------------------------------------------------- 假接口
 
@@ -226,7 +252,7 @@ function defaults(opts) {
     if (m) {
       if (opts.base) return opts.base(m[1])
       return m[1] === T ? { json: { base_run_id: B, reason: 'same_schedule', base: refOf(B) } }
-        : { status: 404, json: { detail: '没有找到可作为基准的运行' } }
+        : { status: 404, json: { detail: NO_BASE_SERVER, code: 'compare_no_base' } }
     }
     m = p.match(/^\/api\/runs\/([^/]+)\/compare$/)
     if (m) {
@@ -247,6 +273,9 @@ function defaults(opts) {
       if (m[2] === '/artifacts') return { json: [] }
     }
     if (p === '/api/approvals' && url.searchParams.get('run_id')) return { json: [] }
+    // 发起本次的定时任务和它的触发历史（只有直接打开那个定时任务的页面时才用到）
+    if (p === `/api/schedules/${SCHEDULE_ID}`) return { json: SCHEDULE }
+    if (p === `/api/schedules/${SCHEDULE_ID}/fires`) return { json: { items: FIRES, next_before: null } }
     // 查找基准期间离开运行详情去的那一页（定时任务列表）：给空的列表，页面落定不靠服务端里有什么
     if (p === '/api/schedules') return { json: { items: [] } }
     return null
@@ -397,7 +426,7 @@ async function findingBase(answer = { json: { base_run_id: B, reason: 'same_sche
 
 await section('查找基准期间：看得见在做事，离开之后不再跳走', async () => {
   const { page, release, ended, noted, visited, errors } = await findingBase()
-  check('点了之后有「正在查找上一次运行」的提示', noted)
+  check('点了之后有「正在查找上一次成功的运行」的提示', noted)
   // 改主意去了别的页面。等那一页画好、运行详情卸下之后再放行：答复晚到也不能把人拽回对比页
   await page.evaluate((to) => { history.pushState({}, '', to); dispatchEvent(new PopStateEvent('popstate')) }, AWAY)
   await awaySettled(page)
@@ -474,6 +503,61 @@ await section('未封存的运行：入口不可点并说明原因', async () =>
   } finally {
     RUNS[T] = saved
   }
+})
+
+/** 在运行详情里点「更多」→「与上一次对比」，等对比页落定 */
+async function viaMenu(page) {
+  await page.locator(`[data-run-detail="${T}"]`).waitFor({ timeout: 10000 })
+  await page.getByRole('button', { name: '更多操作' }).click()
+  await page.locator('[data-menu=compare]').click()
+  await page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
+  await settled(page)
+}
+
+await section('默认基准的说法：上一次成功的运行', async () => {
+  // 服务端只挑比本次先发起、成功结束并封存的运行：上一次失败、取消了时基准是再往前成功的那一次，「上一次运行」是错的
+  for (const [reason, want] of [['same_schedule', REASON], ['same_workflow', REASON_WORKFLOW]]) {
+    const base = () => ({ json: { base_run_id: B, reason, base: refOf(B) } })
+    const menu = await open(`/runs/${T}`, { base })
+    await viaMenu(menu.page)
+    const fromMenu = (await maybeText(menu.page.locator('[data-compare-reason]'))).trim()
+    const self = await open(comparePath(T), { base })
+    await settled(self.page)
+    const fromPage = (await maybeText(self.page.locator('[data-compare-reason]'))).trim()
+    check(`${reason}：从运行详情进入、只带本次打开，都写「${want}」`, fromMenu === want && fromPage === want, `${fromMenu} | ${fromPage}`)
+    const pages = [await menu.page.locator('[data-compare-page]').innerText(), await self.page.locator('[data-compare-page]').innerText()]
+    check(`${reason}：页面上不出现「上一次运行」这类不分成败的说法`, pages.every((t) => !t.includes('上一次运行')))
+    check(`${reason}：页面没有报错`, ![...menu.errors, ...self.errors].length, [...menu.errors, ...self.errors].join('；'))
+    for (const c of opened) await c.close().catch(() => {})
+    opened.clear()
+  }
+})
+
+await section('运行详情与触发历史的「与上一次对比」：同一个基准、同一句来历', async () => {
+  // 两处的基准由服务端用同一个函数挑（api/compare.py 的 pick_base）：上一次失败了，两处都是再往前成功的 B。两处真的
+  // 一致由 backend/tests/test_scheduler_compare.py 守，这里守前端两个入口都原样用服务端给的基准
+  const menu = await open(`/runs/${T}`)
+  await viaMenu(menu.page)
+  const hist = await open(`/schedules/${SCHEDULE_ID}?tab=history`)
+  const link = hist.page.locator(`[data-fire-id="${FIRE_T}"] [data-fire-compare]`)
+  await link.waitFor({ timeout: 10000 })
+  const label = (await link.locator('[data-fire-compare-label]').innerText()).trim()
+  check('触发历史：基准不是紧挨着的上一次，链接上看得见的字写「与上一次成功的运行对比」', label === '与上一次成功的运行对比', label)
+  await link.click()
+  await hist.page.waitForURL((u) => u.pathname === '/runs/compare', { timeout: 8000 })
+  await settled(hist.page)
+  const [a, b] = [new URL(menu.page.url()), new URL(hist.page.url())]
+  check('两个入口打开的是同一对运行（本次和基准都一样）', a.searchParams.get('target') === T && b.searchParams.get('target') === T
+    && a.searchParams.get('base') === B && b.searchParams.get('base') === B, `${a.search} | ${b.search}`)
+  const [ra, rb] = [(await maybeText(menu.page.locator('[data-compare-reason]'))).trim(),
+    (await maybeText(hist.page.locator('[data-compare-reason]'))).trim()]
+  check('两个入口写的默认基准一字不差：同一定时任务上一次成功的运行', ra === REASON && rb === REASON, `${ra} | ${rb}`)
+  const tiles = (page) => page.locator('[data-compare-summary] [data-compare-class]').evaluateAll((els) =>
+    els.map((e) => `${e.getAttribute('data-compare-class')}=${e.querySelector('[data-compare-count]')?.textContent?.trim()}`).join(' '))
+  const [ta, tb] = [await tiles(menu.page), await tiles(hist.page)]
+  check('两边的变化摘要一致', !!ta && ta === tb, `${ta} | ${tb}`)
+  check('没有发出写请求', ![...menu.blocked, ...hist.blocked].length, [...menu.blocked, ...hist.blocked].join('；'))
+  check('页面没有报错', ![...menu.errors, ...hist.errors].length, [...menu.errors, ...hist.errors].join('；'))
 })
 
 await section('两次运行与摘要', async () => {
@@ -791,6 +875,41 @@ await section('换基准、互换', async () => {
     `${listsBefore} → ${lists()}`)
 })
 
+await section('换基准：失败、取消的运行写明状态，默认基准只取成功结束的', async () => {
+  // 默认基准跳过失败、取消的运行（服务端 pick_base），手动选不限：下拉和基准卡上得看得出哪次没成功，人读懂「上一次成功的
+  // 运行」之后才挑得出成功的那一次。两次都封存过，都能选
+  const F = 'c0ffee0failed0000000000000000005'
+  const C = 'c0ffee0cancel0000000000000000006'
+  RUNS[F] = runOf(F, { status: 'failed', version: 3, created_at: day('10-01'), started_at: day('10-01'), finished_at: '2026-10-01T01:01:00Z' })
+  RUNS[C] = runOf(C, { status: 'cancelled', version: 3, created_at: day('10-02'), started_at: day('10-02'), finished_at: '2026-10-02T01:01:00Z' })
+  try {
+    const { page, errors } = await open(comparePath(T, F))
+    await settled(page)
+    const picker = page.locator('select[data-compare-base-picker]')
+    await until(async () => (await picker.locator('option').count()) > 2)
+    const options = Object.fromEntries(await picker.locator('option').evaluateAll((els) =>
+      els.map((o) => [o.value, { text: o.textContent ?? '', disabled: o.disabled }])))
+    check('下拉：失败的那次写「失败」，照样能选', !!options[F]?.text.includes('· 失败') && !options[F].disabled, JSON.stringify(options[F]))
+    check('下拉：取消的那次写「已取消」，照样能选', !!options[C]?.text.includes('· 已取消') && !options[C].disabled, JSON.stringify(options[C]))
+    check('下拉：成功结束的不另写状态', !!options[B] && !/失败|已取消|已完成/.test(options[B].text), options[B]?.text)
+    const card = page.locator('[data-compare-run="base"]')
+    check('下拉下面的说明写明默认基准只取成功结束的运行', (await card.innerText()).includes('默认基准只取成功结束的运行'),
+      (await card.innerText()).replace(/\s+/g, ' '))
+    const status = card.locator('[data-compare-run-status]')
+    check('基准卡：失败的那次标出「失败」', await status.count() === 1 && (await status.innerText()).trim() === '失败',
+      await status.innerText().catch(() => '没有'))
+    check('本次卡：成功结束的不标状态', await page.locator('[data-compare-run="target"] [data-compare-run-status]').count() === 0)
+    await picker.selectOption(B)
+    await until(async () => new URL(page.url()).searchParams.get('base') === B)
+    await settled(page)
+    check('换成成功结束的那次：基准卡不再标状态', await until(async () => await card.locator('[data-compare-run-status]').count() === 0))
+    check('页面没有报错', errors.length === 0, errors.join('；'))
+  } finally {
+    delete RUNS[F]
+    delete RUNS[C]
+  }
+})
+
 await section('过时的答复不盖掉新的', async () => {
   let release
   const gate = new Promise((r) => { release = r })
@@ -878,14 +997,17 @@ await section('出错与找不到基准', async () => {
   await settled(flaky.page)
   check('其他错误：给「重试」，重试后正常显示', await flaky.page.locator('tr[data-compare-metric]').count() === METRICS.length)
 
-  // 只带本次：页面自己找基准，找不到时写原因，下拉照样能选
-  const lone = await open(comparePath(T), { base: () => ({ status: 404, json: { detail: '同一工作流没有其他已封存的正式运行' } }) })
+  // 只带本次：页面自己找基准，找不到时写原因，下拉照样能选。标题只说没有默认基准：失败、取消但封存了的运行不当默认
+  // 基准，却照样能手动选，写成「没有可作为基准的运行」就和下面「可在上方选择」打架
+  const lone = await open(comparePath(T), { base: () => ({ status: 404, json: { detail: NO_BASE_SERVER, code: 'compare_no_base' } }) })
   await settled(lone.page, 'error')
   const noBase = lone.page.locator('[data-compare-error="no-base"]')
-  check('找不到基准：写明原因', (await noBase.locator('[data-compare-error-title]').innerText()).includes('未找到可作为基准的运行')
-    && (await noBase.innerText()).includes('同一工作流没有其他已封存的正式运行'))
+  check('找不到基准：标题写「没有默认基准」，后面跟服务端的原因', (await noBase.locator('[data-compare-error-title]').innerText()).trim() === '没有默认基准'
+    && (await noBase.innerText()).includes(NO_BASE_SERVER), (await noBase.innerText()).replace(/\s+/g, ' '))
   check('找不到基准：仍能手动选', await lone.page.locator('select[data-compare-base-picker]').isEnabled())
   check('找不到基准、下拉里有能选的：说可在上方选', await until(async () => (await noBase.innerText()).includes('可在上方选择')),
+    (await noBase.innerText()).replace(/\s+/g, ' '))
+  check('找不到基准：不说「没有可作为基准的运行」这类和「可在上方选择」矛盾的话', !/可作为基准的运行|没有可以对比/.test(await noBase.innerText()),
     (await noBase.innerText()).replace(/\s+/g, ' '))
   // 同一工作流只有一次没封存的：下拉里没有能选的，不能再叫人去上方选
   const bare = await open(comparePath(T), { base: () => ({ status: 404, json: { detail: '同一工作流没有其他已封存的正式运行', code: 'compare_no_base' } }),
@@ -991,8 +1113,7 @@ await section('不属于已保存工作流的运行：对比页的说明前后�
   try {
     // 只带本次：服务端找不到基准（这种运行没有可比的）
     const lone = await open(comparePath(T), { base: () => ({ status: 404, json: {
-      detail: '没有找到可以对比的上一次运行：需要同一工作流、同一运行类别（定时任务发起的优先找同一定时任务）、更早结束并已封存的运行',
-      code: 'compare_no_base' } }) })
+      detail: NO_BASE_SERVER, code: 'compare_no_base' } }) })
     await settled(lone.page, 'error')
     await until(async () => (await lone.page.locator('[data-compare-run="base"]').innerText()).includes('未保存或已删除'), 3000)
     const card = (await lone.page.locator('[data-compare-run="base"]').innerText()).replace(/\s+/g, ' ')

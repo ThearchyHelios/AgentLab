@@ -3085,10 +3085,16 @@ export const SCHEDULE_TEXT = {
 
   // ---- 触发历史里的对比：运行成功结束后，服务端自动和同一定时任务上一次成功的运行比一次
   /**
-   * 和运行详情「更多」菜单里的入口是同一件事，用同一个叫法。RUN_COMPARE_TEXT 定义在本对象之后，模块初始化时还取不到，
-   * 写成 getter 用到时再取
+   * 和运行详情「更多」菜单里的入口是同一件事（服务端用同一个函数挑基准，两处比的是同一对运行），基准就是紧挨着的上一次
+   * 时用同一个叫法。RUN_COMPARE_TEXT 定义在本对象之后，模块初始化时还取不到，写成 getter 用到时再取
    */
   get compareLink() { return RUN_COMPARE_TEXT.menu },
+  /**
+   * 基准不是紧挨着的上一次（上一次失败了、取消了，比的是再往前成功的那一次）时链接上看得见的叫法：触屏没有悬停，
+   * 键盘聚焦时也不显示 title，只在悬停里说明会让人以为比的就是上一次。运行详情「更多」里的菜单项点之前还不知道基准
+   * 是哪一次，这时仍叫「与上一次对比」，两处叫法不同；进了对比页都写「默认基准：同一定时任务上一次成功的运行」
+   */
+  compareLinkLastOk: '与上一次成功的运行对比',
   /**
    * 悬停写各类指标的个数，和 Webhook 通知里那一行同一个写法（服务端 scheduler/auto_compare.py 的 summary_text）：
    * 变化三分法的三类总写上，0 个也写；其余各类有才写，次序同对比页；两边都没有指标时不写一串 0 个。只有个数，
@@ -3160,7 +3166,7 @@ export const RUN_COMPARE_TEXT = {
   menuSealedOnly: '运行结束并封存后才能对比',
   /** 没有 workflow_id 的运行：画布、问数据里没保存就运行的，或者工作流删掉之后被置空的。服务端只比同一个已保存的工作流 */
   menuNoWorkflow: '工作流未保存或已删除，无法对比',
-  menuFinding: '正在查找上一次运行…',
+  menuFinding: '正在查找上一次成功的运行…',
   pickManually: '手动选择基准',
   retry: '重试',
   // 顶部的两次运行
@@ -3175,12 +3181,17 @@ export const RUN_COMPARE_TEXT = {
   runFailed: '无法读取这次运行',
   runMissing: '运行记录不存在',
   noBase: '未选择',
+  /**
+   * 默认基准是怎么选的，照服务端（api/compare.py 的 pick_base）的规则写：只挑比本次先发起、成功结束并封存的运行。
+   * 上一次失败、取消了时基准是再往前成功的那一次，所以不能写成「上一次运行」
+   */
   reason: {
-    same_schedule: '默认基准：同一定时任务的上一次运行',
-    same_workflow: '默认基准：同一工作流、同一运行类别的上一次运行',
+    same_schedule: '默认基准：同一定时任务上一次成功的运行',
+    same_workflow: '默认基准：同一工作流、同一运行类别上一次成功的运行',
   } as Record<string, string>,
   pickBase: '更换基准',
-  pickHint: '同一工作流最近的运行，未封存的不能作为基准',
+  /** 默认基准只取成功结束的运行（pick_base），手动选不限：失败、取消的也能选，下拉和基准卡上写明它的状态 */
+  pickHint: '同一工作流最近的运行，未封存的不能作为基准；默认基准只取成功结束的运行',
   pickLoading: '正在读取同一工作流的运行…',
   pickFailed: '无法读取同一工作流的运行',
   pickNone: '同一工作流没有其他运行',
@@ -3188,14 +3199,17 @@ export const RUN_COMPARE_TEXT = {
   pickTargetGone: '本次运行的记录不存在，无法列出同一工作流的运行',
   pickUnsaved: '工作流未保存或已删除，没有可对比的运行',
   pickPlaceholder: '选择一次运行作为基准',
-  /** 下拉里的一次运行：时间 · 类别和版本 · 短 id，没封存的另标 */
-  pickOption: (time: string, cls: string, id: string, sealed: boolean) =>
-    `${time} · ${cls} · ${id}${sealed ? '' : '（未封存）'}`,
+  /**
+   * 下拉里的一次运行：时间 · 类别和版本 · 短 id，没有成功结束的写上状态（失败、已取消），没封存的另标。默认基准跳过的
+   * 正是这几种，手动挑时也得看得出哪次没成功
+   */
+  pickOption: (time: string, cls: string, id: string, sealed: boolean, status?: string | null) =>
+    `${time} · ${cls} · ${id}${status ? ` · ${status}` : ''}${sealed ? '' : '（未封存）'}`,
   /** 当前的基准读不到时下拉里的那一项（短 id）：如实显示选的是哪一次 */
   pickGone: (id: string, missing: boolean) => `${id}（${missing ? '记录不存在' : '无法读取'}）`,
   // 页面状态
   noTarget: '未指定要对比的运行',
-  noTargetHint: '在运行详情的「更多」菜单中选择「与上一次对比」，即可对照本次与上一次运行',
+  noTargetHint: '在运行详情的「更多」菜单中选择「与上一次对比」，即可对照本次与上一次成功的运行',
   toRuns: '前往记录',
   finding: '正在查找基准运行…',
   loading: '正在对比两次运行…',
@@ -3213,7 +3227,11 @@ export const RUN_COMPARE_TEXT = {
   errMissingHint: '链接可能已失效，请从记录页重新打开',
   /** 本次的记录读得到、对比却回 404：缺的是基准 */
   errBaseMissingHint: '可在上方选择另一次运行作为基准',
-  errNoBase: '未找到可作为基准的运行',
+  /**
+   * 找不到默认基准：标题只说没有默认基准，原因（服务端的 NO_BASE_TEXT：没有找到上一次成功的运行、要什么条件）跟在后面。
+   * 不能写成「没有可作为基准的运行」：失败、取消但封存了的运行不当默认基准，却照样能在上方手动选
+   */
+  errNoBase: '没有默认基准',
   errNoBaseHint: '可在上方选择同一工作流的其他运行作为基准',
   /** 下拉里一次能选的都没有（只有本次、或者都没封存） */
   errNoBaseNone: '同一工作流还没有其他已封存的运行',
@@ -3424,6 +3442,12 @@ export const INQUIRY_TEXT = {
   /** 之前几轮审批里问的、报告后来改写过（句子编号对不上），或者对不上是哪一稿：单独一组 */
   otherDoc: '报告其他版本上的质询',
   otherDocHint: '提问时的报告与当前显示的版本不同，或无法确认是否相同，所以不挂到当前报告的句子下面',
+  /**
+   * 别的审批里问的、审批列表又没取到：不知道提问时审的是哪一稿，不能说成「其他版本」（审批人会以为报告换过稿）。
+   * 单独一组照实说没能确认，给重试
+   */
+  unsureDoc: '无法确认提问时的报告版本',
+  unsureDocHint: '审批记录读取失败，暂不挂到当前报告的句子下面',
   loadFailed: '无法读取之前的质询记录',
   retry: '重试',
   q: '问',
@@ -3491,6 +3515,18 @@ export const INQUIRY_TEXT = {
   snapshotLoading: '正在读取查询结果…',
   snapshotFailed: '无法读取这次查询的结果',
   masked: (columns: string) => `${columns} 在数据源中设置了遮罩，不显示原值`,
+
+  // ---- 运行详情「工件」页签：回答文档按工件种类 inquiry_answer 记在运行名下（pages/runs/model.ts 的工件名和说明） ----
+  artifactKind: '质询回答',
+  /**
+   * 服务端在工件的 meta 里只记问题的前 40 字（engine/inquiry.py 的 QUESTION_BRIEF）：满 40 字的多半截断过，末尾补省略号，
+   * 免得半句话读成整个问题。字数按原样数、显示时才去掉首尾空白：服务端截之前已经去过整个问题的首尾空白，摘要以空格、
+   * 换行结尾只会是截断截在了空白上，先去空白再数就少了一个字、漏掉省略号
+   */
+  artifactAbout: (question: string) =>
+    `质询「${question.trim()}${[...question].length >= 40 ? '…' : ''}」的回答`,
+  /** meta 里没有问题摘要时的说法（服务端照理都会记，这里兜底）：照报告文档那一句写装的是什么 */
+  artifactAboutNone: '审批质询的回答：逐段的片段和每个数字的出处',
 }
 
 /**

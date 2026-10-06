@@ -1,9 +1,11 @@
 """运行对比：同一个工作流的两次运行按「变化三分法」对照——数据变了、口径变了、还是模板 / SQL 变了（engine/compare.py）。
 
-GET /api/runs/{run_id}/compare/base：默认拿哪一次来比，{base_run_id, reason, base}。这次运行是定时任务发起的，取同一
-定时任务、结束得比它早的最近一次终态运行（reason: same_schedule）；不是、或者同一任务还没有更早的，取同一工作流、
-同一运行类别、结束得比它早的最近一次终态运行（reason: same_workflow）。只挑封存过的：没封存的拿来也比不了。
-找不到 404。
+GET /api/runs/{run_id}/compare/base：默认拿哪一次来比，{base_run_id, reason, base}。规则在 pick_base，定时任务结束后
+的自动对比（scheduler/auto_compare.py）用的是同一个函数——触发历史里的「与上一次对比」和运行详情里的同名入口必须拿到
+同一个基准，计数才对得上；触发历史里存着的那一份，事后基准不再是这里挑出来的那一次（中间失败的那次被接着运行成功
+了）就不再给出（auto_compare.outdated）。这次运行是定时任务发起的，取同一定时任务、同一工作流、比它先发起的运行里
+成功结束并封存的最近一次（reason: same_schedule）；不是、或者同一任务之前没有成功的，取同一工作流、同一运行类别里
+同样条件的最近一次（reason: same_workflow）。找不到 404。
 
 GET /api/runs/{run_id}/compare?base={base_id}：{target, base, summary, template, metrics, queries, notes}，每个字段
 的形状见 engine/compare.py。两次运行都必须已结束、封存且封存核对一致，封存判定照搬证据接口（api/evidence._sealed）：
@@ -15,16 +17,16 @@ GET /api/runs/{run_id}/compare?base={base_id}：{target, base, summary, template
 结果里。读工件、比 SQL、重算都在线程里做：快照大的时候不挡住同一进程里别的请求。
 
 路径挂在 /api/runs/{run_id}/… 下面；这个路由登记在 runs.router 之前，以后加 /api/runs/compare 这类固定路径也不会
-被 /{run_id} 吃掉。定时任务结束后自动对比（期 4）直接调 default_base、compare_runs。
+被 /{run_id} 吃掉。定时任务结束后自动对比（期 4）直接调 pick_base、compare_runs。
 """
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastapi import APIRouter
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.coded import CodedHTTPException
 from app.api.evidence import _TERMINAL, RUN_NOT_FOUND, _Masks, _Sealed, _sealed, _sealed_cards
@@ -51,8 +53,9 @@ UNSEALED_TEXT = "{who}尚未结束并封存：对比只用封存的运行记录�
 #: 已经结束、只是没有封存清单（封存上线前结束的、结束时没封上的）：再等也等不来封存，不能说「运行结束后才能对比」
 NO_MANIFEST_TEXT = "{who}没有封存清单，不能用于对比"
 SEAL_BROKEN_TEXT = "{who}的封存核对不一致：封存后有事件被修改、删除或插入，不能用于对比。可在记录页点「核对」查看核对结果"
-NO_BASE_TEXT = ("没有找到可以对比的上一次运行：需要同一工作流、同一运行类别（定时任务发起的优先找同一定时任务）、"
-                "更早结束并已封存的运行")
+#: 找不到默认基准。运行详情的「与上一次对比」把它原样弹给人看，对比页把它跟在标题「没有默认基准」后面：自己得说清
+#: 找的是什么、没找到。定时任务发起的先找同一定时任务、再找同一工作流，两档都落空才到这里，条件只写后一档的
+NO_BASE_TEXT = "没有找到上一次成功的运行：需要同一工作流、同一运行类别里比这次先发起、成功结束并已封存的运行"
 TARGET = "这次运行"
 BASE = "作为基准的运行"
 
@@ -63,8 +66,7 @@ async def compare_base(run_id: str) -> dict[str, Any]:
     found = await default_base(run_id)
     if found is None:
         raise CodedHTTPException(404, NO_BASE_TEXT, NO_BASE)
-    run, reason = found
-    return {"base_run_id": run.id, "reason": reason, "base": run_ref(run)}
+    return {"base_run_id": found.run.id, "reason": found.reason, "base": run_ref(found.run)}
 
 
 @router.get("/{run_id}/compare")
@@ -75,29 +77,53 @@ async def compare_with(run_id: str, base: str | None = None) -> dict[str, Any]:
     return await compare_runs(run_id, base.strip())
 
 
-async def default_base(run_id: str) -> tuple[Run, str] | None:
-    """(默认的基准运行, 怎么选的)；找不到返回 None，这次运行本身不存在 404。
+class Pick(NamedTuple):
+    """挑出来的基准：哪一次、怎么选的（same_schedule | same_workflow）、是不是紧挨着的上一次（同一范围里两次之间没有
+    隔着别的运行——失败、取消、还没结束的都算隔着）。"""
+    run: Run
+    reason: str
+    previous: bool
 
-    「早」按结束时间比：这次运行还没结束（还在跑、停在审批）的按开始时间。只挑终态、封存过的运行——没封存的拿来
-    对比只会得到 409。定时任务发起的先找同一定时任务（同一个工作流）的；它是这个任务的第一次时，退回同一工作流、
-    同一运行类别。没挂在已保存的工作流上的运行（画布上没保存就运行的图）没有可比的。"""
+
+async def default_base(run_id: str) -> Pick | None:
+    """这次运行默认拿哪一次来比（pick_base）；找不到返回 None，这次运行本身不存在 404。"""
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if run is None:
             raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND)
-        if not run.workflow_id:
-            return None
-        before = run.finished_at or run.started_at or run.created_at
-        query = (select(Run)
-                 .where(Run.id != run.id, Run.workflow_id == run.workflow_id, Run.status.in_(_TERMINAL),
-                        Run.manifest_hash.is_not(None), Run.finished_at.is_not(None), Run.finished_at < before)
-                 .order_by(Run.finished_at.desc(), Run.created_at.desc()).limit(1))
-        if run.schedule_id:
-            found = (await session.execute(query.where(Run.schedule_id == run.schedule_id))).scalars().first()
-            if found is not None:
-                return found, "same_schedule"
-        found = (await session.execute(query.where(Run.run_class == run.run_class))).scalars().first()
-    return (found, "same_workflow") if found is not None else None
+        return await pick_base(session, run)
+
+
+async def pick_base(session: Any, target: Run, *, schedule_only: bool = False) -> Pick | None:
+    """target 的基准：比它先发起的运行里成功结束并封存的最近一次。运行详情「与上一次对比」（default_base）和定时任务
+    结束后的自动对比（scheduler/auto_compare.py，schedule_only=True）都调这一个函数：两个同名入口拿到的必须是同一个
+    基准，不然计数对不上。
+
+    - 定时任务发起的先在同一定时任务里找（same_schedule）；它是这个任务的第一次、或者之前的都没成功时，退回同一工作流、
+      同一运行类别（same_workflow）。schedule_only 时不退：自动对比要比的是「同一定时任务的上一次」，别的运行不算
+    - 只挑成功结束并封存的：失败、取消的运行口径卡常常没执行，拿它当基准每个指标都成了「新增」「移除」；没封存的
+      拿来对比只会得到 409
+    - 按发起先后挑（created_at），不按结束时间：老的失败运行事后被接着运行完，结束得比后一次晚，它的上一次仍是它前面
+      那次；这次还没结束（还在运行、停在审批）的也一样按发起先后
+    - 都只看同一个工作流：没挂在已保存的工作流上的运行（画布上没保存就运行的图）没有可比的，定时任务改过工作流的，
+      之前那个工作流的运行也不算"""
+    if not target.workflow_id:
+        return None
+    scopes = [("same_schedule", Run.schedule_id == target.schedule_id)] if target.schedule_id else []
+    if not schedule_only:
+        scopes.append(("same_workflow", Run.run_class == target.run_class))
+    for reason, scope in scopes:
+        earlier = (scope, Run.workflow_id == target.workflow_id, Run.id != target.id,
+                   Run.created_at < target.created_at)
+        base = (await session.execute(
+            select(Run).where(*earlier, Run.status == "succeeded", Run.manifest_hash.is_not(None))
+            .order_by(Run.created_at.desc()).limit(1))).scalars().first()
+        if base is None:
+            continue
+        between = await session.scalar(select(func.count()).select_from(Run).where(
+            *earlier, Run.created_at > base.created_at))
+        return Pick(base, reason, not between)
+    return None
 
 
 async def compare_runs(run_id: str, base_id: str) -> dict[str, Any]:

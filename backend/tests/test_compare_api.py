@@ -6,7 +6,8 @@
   同一次运行回 422；运行不存在 404
 - 对比只读：两次运行的 last_seq、事件、工件引用、工件文件一样不多
 - 遮罩列（查询当时记下的、数据源现在设的）的值不出现在结果里
-- 默认基准：同一定时任务优先，否则同一工作流、同一运行类别；只挑更早结束、封存过的终态运行
+- 默认基准：同一定时任务优先，否则同一工作流、同一运行类别；只挑比这次先发起、成功结束并封存的运行，按发起先后取
+  最近一次（失败、取消的跳过，和定时任务的自动对比挑的是同一次，见 test_scheduler_compare.py）
 - 真跑：同一条 SQL 数据变了是 data_only；只是代进去的日期不同是 params_only，图一样
 """
 from __future__ import annotations
@@ -236,14 +237,15 @@ async def test_masked_columns_never_leave_the_server(client):
 
 
 async def bare(workflow_id, finished, *, status="succeeded", run_class="formal", schedule_id=None, sealed=True,
-               resumed=False) -> str:
+               resumed=False, created=None) -> str:
     """只为挑基准用的运行记录：挑基准只看运行记录上的几列。resumed：结束、封存过又被接着运行（状态已回到运行中，
-    结束时间和封存还没清掉），只能靠状态把它挡在外面。"""
+    结束时间和封存还没清掉），只能靠状态把它挡在外面。created：发起时间，默认在结束前 3 分钟（发起先后和结束先后
+    一致）；要让两者错开的用例另给。"""
     done = status in ("succeeded", "failed", "cancelled") or resumed
     async with SessionLocal() as session:
         run = Run(workflow_id=workflow_id, workflow_name="区域周报", status=status, run_class=run_class,
-                  schedule_id=schedule_id, started_at=finished - timedelta(minutes=2),
-                  finished_at=finished if done else None,
+                  schedule_id=schedule_id, created_at=created or finished - timedelta(minutes=3),
+                  started_at=finished - timedelta(minutes=2), finished_at=finished if done else None,
                   manifest_hash="ab" * 32 if sealed else None, manifest_seq=1 if sealed else None)
         session.add(run)
         await session.commit()
@@ -279,18 +281,58 @@ async def test_the_default_base_skips_what_cannot_be_compared(client):
     await bare(workflow, T0 + 2 * day, status="running", resumed=True)  # 结束过、又被接着运行
     await bare(workflow, T0 + 3 * day, run_class="exploratory")        # 别的运行类别
     await bare(await new_workflow("另一个周报"), T0 + 4 * day)          # 别的工作流
+    await bare(workflow, T0 + 4 * day, status="failed")                # 失败的（封存过）
+    await bare(workflow, T0 + 4 * day + timedelta(hours=1), status="cancelled")  # 取消的（封存过）
     current = await bare(workflow, T0 + 5 * day)
-    await bare(workflow, T0 + 6 * day)                                 # 比它晚结束
+    await bare(workflow, T0 + 6 * day)                                 # 比它晚发起
     body = await get(client, f"/api/runs/{current}/compare/base")
     assert (body["base_run_id"], body["reason"]) == (good, "same_workflow")
-    # 失败、取消的终态运行也算（封存过）
-    failed = await bare(workflow, T0 + 5 * day - timedelta(hours=1), status="failed")
-    assert (await get(client, f"/api/runs/{current}/compare/base"))["base_run_id"] == failed
     # 第一次运行、没保存的工作流：没有可比的
     body = await get(client, f"/api/runs/{good}/compare/base", 404)
-    assert body["code"] == "compare_no_base" and "上一次运行" in body["detail"]
+    assert body["code"] == "compare_no_base" and "上一次成功的运行" in body["detail"]
     await get(client, f"/api/runs/{await bare(None, T0)}/compare/base", 404)
     await get(client, "/api/runs/no-such-run/compare/base", 404)
+
+
+async def test_the_default_base_is_the_last_successful_run(client):
+    """失败、取消的不当默认基准：拿它当基准，口径卡没执行的指标都成了「新增」「移除」。同一定时任务里跳过它们，取再往前
+    成功的那一次（和定时任务的自动对比同一个规则）；同一工作流的退路也一样；之前一次成功的都没有就是没有基准"""
+    workflow = await new_workflow()
+    day = timedelta(days=1)
+    first = await bare(workflow, T0, schedule_id="sched-weekly")
+    await bare(workflow, T0 + day, schedule_id="sched-weekly", status="failed")
+    await bare(workflow, T0 + 2 * day, schedule_id="sched-weekly", status="cancelled")
+    current = await bare(workflow, T0 + 3 * day, schedule_id="sched-weekly")
+    body = await get(client, f"/api/runs/{current}/compare/base")
+    assert (body["base_run_id"], body["reason"]) == (first, "same_schedule")
+    # 手动发起的：同一工作流、同一运行类别里成功的最近一次（定时的也算），中间失败的跳过
+    await bare(workflow, T0 + 4 * day, status="failed")
+    manual = await bare(workflow, T0 + 5 * day)
+    body = await get(client, f"/api/runs/{manual}/compare/base")
+    assert (body["base_run_id"], body["reason"]) == (current, "same_workflow")
+    # 之前只有失败、取消的：没有基准，原因写明要成功结束的
+    lonely = await new_workflow("门店日报")
+    await bare(lonely, T0, status="failed")
+    await bare(lonely, T0 + day, status="cancelled", schedule_id="sched-daily")
+    alone = await bare(lonely, T0 + 2 * day, schedule_id="sched-daily")
+    body = await get(client, f"/api/runs/{alone}/compare/base", 404)
+    assert body["code"] == "compare_no_base" and "成功结束" in body["detail"]
+
+
+async def test_the_default_base_follows_launch_order(client):
+    """按发起先后挑，不按结束时间：先发起、后来才结束的那次（失败后被接着运行完）仍排在这次前面；比这次晚发起的，
+    结束得再早也不算。这次还没结束（停在审批上）的也按发起先后"""
+    workflow = await new_workflow()
+    t = datetime(2026, 9, 1, 1, 0, tzinfo=timezone.utc)
+    hour, day = timedelta(hours=1), timedelta(days=1)
+    await bare(workflow, T0, created=t)
+    resumed = await bare(workflow, T0 + 10 * day, created=t + hour)     # 比这次先发起，结束得最晚
+    current = await bare(workflow, T0 + 5 * day, created=t + 2 * hour)
+    later = await bare(workflow, T0 + 4 * day, created=t + 3 * hour)    # 比这次晚发起，结束得比它早
+    body = await get(client, f"/api/runs/{current}/compare/base")
+    assert (body["base_run_id"], body["reason"]) == (resumed, "same_workflow")
+    waiting = await bare(workflow, T0 + 20 * day, status="interrupted", created=t + 4 * hour)
+    assert (await get(client, f"/api/runs/{waiting}/compare/base"))["base_run_id"] == later
 
 
 # --------------------------------------------------------------------------

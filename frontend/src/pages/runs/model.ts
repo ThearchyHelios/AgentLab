@@ -10,6 +10,7 @@ import {
   RUN_STATUS_ORDER, STATUS, resolveStatus, serverStatusOf, type StatusCode,
 } from '../../lib/status'
 import { formatSpan, parseServerTime } from '../../lib/format'
+import { INQUIRY_TEXT } from '../../lib/terms'
 import { hasPendingApproval } from '../../store/catalog'
 
 // -------------------------------------------------------------------------
@@ -334,6 +335,7 @@ export const ARTIFACT_KIND_LABEL: Record<string, string> = {
   schema_snapshot: '表结构快照',
   dual_check: '双盲复算对照',
   challenge: '反方审稿记录',
+  inquiry_answer: INQUIRY_TEXT.artifactKind,
 }
 export const artifactKindLabel = (kind: string): string => ARTIFACT_KIND_LABEL[kind] ?? kind
 
@@ -356,6 +358,9 @@ export function artifactDescription(kind: string, meta?: Record<string, any> | n
       ? `双盲复算：${meta.metrics} 个指标两边的 SQL、取值与差异说明` : '双盲复算：两边的 SQL、取值与差异说明'
     // 反方审稿的完整记录（工件行的 meta 里有 {report: 审的报告节点}）
     case 'challenge': return '反方审稿：每句结论的判断、理由和反方执行的查询'
+    // 审批质询的回答文档（工件行的 meta 里有 {report, unit, question: 问题的前 40 字}）：不挂在节点上，靠问题认出是哪一条
+    case 'inquiry_answer': return typeof meta?.question === 'string' && meta.question.trim()
+      ? INQUIRY_TEXT.artifactAbout(meta.question) : INQUIRY_TEXT.artifactAboutNone
     default: return '工件'
   }
 }

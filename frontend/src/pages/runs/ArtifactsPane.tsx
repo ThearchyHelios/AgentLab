@@ -136,6 +136,8 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
   }
 
   const t0 = trace.timed ? trace.startedAt : undefined
+  // 运行结束之后才写下的（封存后追加的质询回答和它查询的快照）：航迹里没有那一刻，不给跳转，只写时间
+  const t1 = trace.timed ? trace.endedAt : undefined
   let budget = all ? Infinity : FIRST_ROWS
   const hidden = Math.max(0, groups.reduce((n, [, g]) => n + g.length, 0) - FIRST_ROWS)
 
@@ -174,7 +176,7 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
           budget -= take.length
           return (
             <Group key={nodeId || '—'} nodeId={nodeId} rows={take} total={rows.length} graph={graph} trace={trace}
-                   labelOf={labelOf} t0={t0} onOpen={setOpen} onMoment={onMoment} />
+                   labelOf={labelOf} t0={t0} t1={t1} onOpen={setOpen} onMoment={onMoment} />
           )
         })}
         {!all && hidden > 0 && (
@@ -190,7 +192,7 @@ export function ArtifactsPane({ list, graph, trace, labelOf, onMoment }: {
   )
 }
 
-function Group({ nodeId, rows, total, graph, trace, labelOf, t0, onOpen, onMoment }: {
+function Group({ nodeId, rows, total, graph, trace, labelOf, t0, t1, onOpen, onMoment }: {
   nodeId: string
   rows: RunArtifact[]
   total: number
@@ -198,6 +200,8 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, onOpen, onMomen
   trace: Trace
   labelOf: (id?: string | null) => string | undefined
   t0?: number
+  /** 运行结束的时刻（还没结束的为空）：晚于它的工件不给跳转 */
+  t1?: number
   onOpen: (v: { id: string; title: string }) => void
   onMoment?: (at: number, nodeId: string | null) => void
 }) {
@@ -226,7 +230,7 @@ function Group({ nodeId, rows, total, graph, trace, labelOf, t0, onOpen, onMomen
         const kind = artifactKindLabel(a.kind)
         const attempt = Number(a.meta?.attempt)
         const created = parseServerTime(a.created_at ?? null)?.getTime()
-        const at = t0 != null && created != null && created >= t0 ? created : null
+        const at = t0 != null && created != null && created >= t0 && (t1 == null || created <= t1) ? created : null
         const numbered = (perKind.get(a.kind) ?? 0) > 1
         const title = `${label} · ${kind}${numbered ? ` #${n}` : ''}`
         return (

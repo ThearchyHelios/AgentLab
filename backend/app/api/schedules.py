@@ -285,17 +285,20 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
 
     对比和比的时候两边的封存绑定（auto_compare）：哪一边现在不在终态（被继续执行）、被删掉、清单哈希和比的时候不一样
     （重新封存过）都给 null——对比页按现在的封存现算，记下的计数和点进去看到的会对不上，或者干脆比不了。工件读不出来、
-    被改过的同样给 null。"""
+    被改过的同样给 null。基准已经不是现在挑出来的那一次（auto_compare.outdated：中间隔着的运行事后接着运行成功了）也
+    给 null：运行详情里同名的入口比的是另一次。"""
     compared = {f.id: f.compare_artifact for f in fires if f.compare_artifact and f.run_id}
     compares = await auto_compare.briefs(list(compared.values()))
+    stale = await auto_compare.outdated(session, compares)
     run_ids = {f.run_id for f in fires if f.run_id} | {brief["base_run_id"] for brief in compares.values()}
     # 运行现在的状态和清单哈希：run_status 照写，对比按它核对两边的封存
     current = {run_id: (status, seal) for run_id, status, seal in (await session.execute(
         select(Run.id, Run.status, Run.manifest_hash).where(Run.id.in_(run_ids)))).all()} if run_ids else {}
 
     def compare_of(f: ScheduleFire) -> dict[str, Any] | None:
-        brief = compares.get(compared.get(f.id) or "")
-        if brief is None or brief["target_run_id"] != f.run_id:
+        artifact = compared.get(f.id) or ""
+        brief = compares.get(artifact)
+        if brief is None or brief["target_run_id"] != f.run_id or artifact in stale:
             return None
         for run_id, seal in ((brief["target_run_id"], brief["target_manifest"]),
                              (brief["base_run_id"], brief["base_manifest"])):

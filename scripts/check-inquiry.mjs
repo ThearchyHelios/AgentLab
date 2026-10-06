@@ -1,6 +1,7 @@
 // 审批质询的回归检查：报告上的入口（run/EvidenceDoc.tsx 的句末「质询」、划选原文浮出的「质询」）、问答串和提问框
 // （run/Inquiry.tsx）、审批卡上的挂法（run/ApprovalReport.tsx、run/RunPanel.tsx）、运行详情「证据」页签的挂法
-// （pages/runs/EvidencePane.tsx）。
+// （pages/runs/EvidencePane.tsx），以及运行详情「工件」页签里质询回答的名字（pages/runs/model.ts）和航迹跳转
+// （pages/runs/ArtifactsPane.tsx）。
 //
 // 守的是这些「看着没坏、其实用不了」的地方：悬停、键盘聚焦一句都不出「质询」（或者出了 Tab 却到不了、整份报告多出一串
 // Tab 位）、没有可点内容的句子键盘走不到、划选原文不浮出入口（或者带上的原文混进了徽标和「质询」本身）、提交的请求体
@@ -8,11 +9,15 @@
 // 进入审批卡时问答串没有恢复、问答串写不出问的是哪一句、回答里的数字点了不去取质询工件（或者每点一次取一次、标不出
 // 那一格）、引用报告已有出处的数字点了没反应、查询的 SQL / 行数 / 截断 / 遮罩不显示、触顶和没答成不说、recorded 为假
 // 不醒目、409 / 422 不照服务端的中文说明显示（或者问题文字丢了）、Esc 关不掉提问框（或者连带收起了别的、焦点掉到页面上）、
-// 已处理的审批和封存了的正式运行还给入口、封存了的探索运行反而没有；窄屏（390px）被撑出横向滚动、浅色主题下看不清。
+// 已处理的审批和封存了的正式运行还给入口、封存了的探索运行反而没有；同一次运行的几处问答串要对的审批不同、审批列表
+// 取不到时后一处一直不列别的审批里问的（头上写着次数，下面一条没有），或者把没能确认的说成「报告其他版本」、不给重试；
+// 工件页签里质询的回答只写英文的种类名、截断截在空格上的问题摘要不补省略号、封存后追加的工件给一个跳到运行结束之后的
+// 航迹时刻；窄屏（390px）被撑出横向滚动、浅色主题下看不清。
 //
 // 跑在预览页上：/preview.html?syn=inquiry-*（用例见 frontend/src/dev/fixtures/inquiry.tsx）。夹具在
 // frontend/src/dev/fixtures/inquiry.json，报告文档和回答文档是后端 build_catalog + compose_doc 真实组装的（虚构的数据）。
-// 质询的三个接口、工件、证据图、片段接口都在这里伪造；别的写请求一律拦掉并记下来，别的 GET 答 404，不碰真实服务。
+// 质询的三个接口、工件、证据图、片段接口、审批列表、运行的工件列表都在这里伪造；别的写请求一律拦掉并记下来，别的 GET
+// 答 404，不碰真实服务。
 //
 //   node scripts/check-inquiry.mjs
 // 对别的实例跑时带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-inquiry.mjs
@@ -66,8 +71,9 @@ const answerFor = (body, extra = {}) => ({
 /**
  * 开一个预览用例。列表按运行答夹具里的问答（state.lists 可改），提问按 state.reply 答（{status, json} 或按请求体算的函数；
  * state.gate 是个没兑现的 Promise 时先挂着，测「回答期间」；state.listGate 同样挂着列表）。审批列表按 state.approvals
- * （运行 → 审批数组）答，设置按 state.settings 答；state.docs、state.snaps 盖过夹具里的文档、快照。setup 在打开页面之前
- * 改 state（进入时就要取的列表、设置得先备好）；ws 接管运行的事件流。记下列表、提问、取快照、取工件、取审批列表的请求和拦下的写请求
+ * （运行 → 审批数组）答，没有的答 404，state.approvalsGate 同样先挂着；设置按 state.settings 答；state.docs、state.snaps
+ * 盖过夹具里的文档、快照；运行的工件列表答夹具里的 run_artifacts（探索运行）。setup 在打开页面之前改 state（进入时就要
+ * 取的列表、设置得先备好）；ws 接管运行的事件流。记下列表、提问、取快照、取工件、取审批列表的请求和拦下的写请求
  */
 async function open(syn, { width = 1100, height = 900, theme = 'dark', setup, ws, waitUntil = 'networkidle' } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
@@ -79,6 +85,7 @@ async function open(syn, { width = 1100, height = 900, theme = 'dark', setup, ws
     reply: (body) => ({ status: 200, json: answerFor(body) }),
     gate: null,
     listGate: null,
+    approvalsGate: null,
     approvals: {},
     settings: {},
     docs: {},
@@ -114,6 +121,7 @@ async function open(syn, { width = 1100, height = 900, theme = 'dark', setup, ws
     if (path === '/api/approvals') {
       const run = url.searchParams.get('run_id')
       hits.approvals.push({ run, status: url.searchParams.get('status') })
+      if (state.approvalsGate) await state.approvalsGate
       const list = state.approvals[run]
       return list ? route.fulfill({ json: list }) : route.fulfill({ status: 404, json: { detail: '检查脚本没有伪造这个接口' } })
     }
@@ -141,6 +149,8 @@ async function open(syn, { width = 1100, height = 900, theme = 'dark', setup, ws
       hits.segments.push(decodeURIComponent(seg[2]))
       return route.fulfill({ json: {} })
     }
+    const arts = path.match(/^\/api\/runs\/([^/]+)\/artifacts$/)
+    if (arts) return route.fulfill({ json: decodeURIComponent(arts[1]) === RUNS.explore ? fx.run_artifacts : [] })
     const graph = path.match(/^\/api\/runs\/([^/]+)\/evidence$/)
     if (graph) {
       const run = decodeURIComponent(graph[1])
@@ -822,6 +832,53 @@ await section('运行详情「证据」页签：封存了的探索运行有入�
   }
 })
 
+await section('运行详情「工件」页签：质询的回答有名字和说明，不出现英文的工件种类名；封存后追加的不给航迹跳转', async () => {
+  const { ctx, page, errors } = await open('inquiry-run-artifacts')
+  await page.locator('[data-run-artifacts] [data-artifact-id]').first().waitFor()
+  // 每一行：种类（行首的标签）、说明（同一种类有几件时末尾带「#n」，去掉再比）、悬停
+  const rows = await page.locator('[data-artifact-id]').evaluateAll((els) => els.map((el) => {
+    const open = el.querySelector('[data-action="artifact-open"]')
+    const spans = open ? [...open.children] : []
+    return { id: el.getAttribute('data-artifact-id'), kind: spans[0]?.textContent?.trim() ?? '',
+      about: (spans[1]?.textContent ?? '').replace(/\s*#\d+$/, '').trim(), title: open?.getAttribute('title') ?? '' }
+  }))
+  const answers = fx.run_artifacts.filter((a) => a.kind === 'inquiry_answer').map((a) => rows.find((r) => r.id === a.id))
+  check('质询的回答：种类写「质询回答」', answers.length === 4 && answers.every((r) => r?.kind === '质询回答'), JSON.stringify(answers))
+  check('有问题摘要的：说明写「质询「问题」的回答」', answers[0]?.about === '质询「退款率怎么算的？」的回答', answers[0]?.about)
+  check('问题摘要满 40 字（服务端只记前 40 字）：末尾补省略号',
+    answers[1]?.about === '质询「枫岭区的销售额是否包含线上订单？如果包含，线上订单按下单门店还是按收货地址归到片…」的回答', answers[1]?.about)
+  check('没有问题摘要的：也有一句说明', answers[2]?.about === '审批质询的回答：逐段的片段和每个数字的出处', answers[2]?.about)
+  // 第 40 个字是空格：服务端截下来的摘要以空格结尾（截之前整个问题已经去过首尾空白），去掉空白再数只有 39 字
+  check('截断截在空格上的摘要：照样补省略号，不当成完整的问题',
+    answers[3]?.about === '质询「本周枫岭片区 GMV 环比下降了多少？下降的主要原因是不是 SKU 结构的变化…」的回答', answers[3]?.about)
+  // 航迹跳转：运行期间产出的报告文档能跳到航迹里那一刻；封存后追加的质询回答和它查询的快照晚于运行结束，航迹里没有
+  // 那一刻（以前给「T+」几十分钟、几天的跳转，点了把航迹拖到运行早就结束之后），只写时间
+  const moments = Object.fromEntries(await page.locator('[data-artifact-id]').evaluateAll((els) => els.map((el) =>
+    [el.getAttribute('data-artifact-id'), el.querySelector('[data-action="artifact-moment"]')?.textContent?.trim() ?? null])))
+  const doc = fx.run_artifacts.find((a) => a.kind === 'report_doc')
+  const late = fx.run_artifacts.filter((a) => a.kind !== 'report_doc')
+  check('运行期间产出的报告文档：给航迹跳转', /^T\+/.test(moments[doc.id] ?? ''), moments[doc.id])
+  check('封存后追加的质询回答、它查询的快照：不给航迹跳转，只写时间', late.every((a) => moments[a.id] === null)
+    && (await page.locator(`[data-artifact-id="${late[0].id}"] > span`).last().innerText()).trim() !== '',
+    JSON.stringify(late.map((a) => moments[a.id])))
+  await page.locator(`[data-artifact-id="${doc.id}"] [data-action="artifact-moment"]`).click()
+  const jumped = await page.locator('[data-fixture="inquiry-run-artifacts"]').getAttribute('data-fixture-moment')
+  check('……点报告文档的跳转：到它产出的那一刻', Number(jumped) === Date.parse(`${doc.created_at}Z`), jumped)
+  check('悬停写「打开质询回答」', answers.every((r) => r?.title.startsWith('打开质询回答')), answers.map((r) => r?.title).join(' / '))
+  const pane = await text(page.locator('[data-run-artifacts]'))
+  check('工件页签里不出现英文的工件种类名', !/inquiry_answer|report_doc|query_snapshot/.test(pane) && rows.every((r) => !/[a-z_]{4,}/.test(r.kind)),
+    rows.map((r) => r.kind).join('、'))
+  check('不挂在节点上的写「不属于某个节点」', (await text(page.locator('[data-artifact-group=""] h3'))).startsWith('不属于某个节点'))
+  // 打开一件：弹窗标题也是中文的种类名
+  await page.locator(`[data-artifact-id="${answers[0]?.id}"] [data-action="artifact-open"]`).click()
+  const dialog = page.getByRole('dialog')
+  await dialog.waitFor()
+  const head = await text(dialog.locator('h2').first())
+  check('打开的弹窗标题写「质询回答」，不写英文', head.includes('质询回答') && !head.includes('inquiry_answer'), head)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+  await ctx.close()
+})
+
 await section('有表格的报告：悬停句子、表格的格子都不挪动排版；表格的格子不挂「质询」', async () => {
   // 报告文档换成带表格的那份（run/__tests__/evidence-doc.json）：表里带出处的格子也是结论句
   const ev = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-doc.json`, 'utf8'))
@@ -1026,12 +1083,18 @@ await section('之前几轮审批里问的：报告改写过的不按句子编�
   check('页面没有报错', errors.length === 0, errors.join('；'))
   await ctx.close()
   {
-    // 审批列表取不到：别的审批里问的一律单独一组（宁可不挂，不挂错）
-    const { ctx, page, errors } = await open('inquiry-approval', { setup: (s) => { s.lists[RUNS.approve] = [prev, level, ...fx.items] } })
+    // 审批列表取不到：别的审批里问的一律单独一组（宁可不挂，不挂错）。不知道是哪一稿，不能说成「其他版本」（审批人会以为
+    // 报告换过稿）：写明没能确认、给重试。这里用浅色主题量那句的颜色（深色在下一段量）
+    const { ctx, page, errors } = await open('inquiry-approval', { theme: 'light', setup: (s) => { s.lists[RUNS.approve] = [prev, level, ...fx.items] } })
     await entry(page, 12).waitFor()
     const g = await groupsOf(page)
-    check('审批列表取不到：别的审批里问的都单独一组', JSON.stringify(g.at(-1)) !== undefined && g.at(-1).unit === 'other'
+    check('审批列表取不到：别的审批里问的都单独一组', JSON.stringify(g.at(-1)) !== undefined && g.at(-1).unit === 'unsure'
       && JSON.stringify(g.at(-1).entries) === JSON.stringify(['12', '20']), JSON.stringify(g.map((x) => [x.unit, x.entries])))
+    check('审批列表取不到：那一组写「无法确认提问时的报告版本」，不说「其他版本」，给重试',
+      g.at(-1)?.about.startsWith('无法确认提问时的报告版本') && !g.at(-1)?.about.includes('其他版本')
+      && await group(page, 'unsure').locator('[data-inquiry-docs-retry]').count() === 1, g.at(-1)?.about)
+    const unsureRatio = await ratioOf(page, '[data-inquiry-group="unsure"] [data-inquiry-about-text]')
+    check('审批列表取不到（浅色）：那一句对比度 ≥ 4.5', unsureRatio >= 4.5, unsureRatio.toFixed(2))
     check('审批列表取不到：页面没有报错', errors.length === 0, errors.join('；'))
     await ctx.close()
   }
@@ -1049,6 +1112,96 @@ await section('之前几轮审批里问的：报告改写过的不按句子编�
     check('运行详情：封存之后问的、最后一轮审批时问的挂句子下面，改写前那一稿上问的单独一组',
       JSON.stringify(g.map((x) => [x.unit, x.entries])) === JSON.stringify([['u3', ['30']], ['u2', ['58']], ['other', ['14']]]),
       JSON.stringify(g.map((x) => [x.unit, x.entries])))
+    check('运行详情：页面没有报错', errors.length === 0, errors.join('；'))
+    await ctx.close()
+  }
+})
+
+/** 一处问答串：抬头写的次数、实际列出的条数 */
+const tally = async (page, scope) => ({
+  head: (await page.locator(`${scope} [data-inquiry-count]`).getAttribute('data-inquiry-count').catch(() => null)) ?? '',
+  shown: await page.locator(`${scope} [data-inquiry-entry]`).count(),
+})
+
+await section('两处要对的审批不同、审批列表取不到：两处的问答都列出来，次数和条数一致，写明没能确认、重试取到后各归其位', async () => {
+  // 一张卡审两份报告：写月报上有 ap-x 里问的，写周报上有 ap-y 里问的，两份报告的问答串共用这次运行的审批列表。先发的那一处
+  // 请求还在路上时，后一处要对的审批也得记上：不然请求回来（这里是 404）之后后一处一直等着，头上写「· 1 次」，下面一条没有
+  const x = { ...clone(fx.items[0]), seq: 41, approval_id: 'ap-x', question: '写月报上一轮问的：退款率怎么算？', at: '2026-10-05T05:30:00Z' }
+  const y = { ...clone(fx.items[1]), seq: 42, report: 'write2', approval_id: 'ap-y', question: '写周报上一轮问的：新客怎么界定？',
+    at: '2026-10-05T05:35:00Z' }
+  let release
+  // 审批列表压着，页面等不到网络空闲：打开到 load 就往下走
+  const { ctx, page, hits, errors } = await open('inquiry-approval-two', { waitUntil: 'load', setup: (s) => {
+    s.lists[RUNS.approve] = [x, y]
+    s.approvalsGate = new Promise((r) => { release = r })
+  } })
+  // 两份报告的问答串都取回来了（头上写着次数），审批列表的请求还压着
+  await page.locator('[data-inquiry="write"] [data-inquiry-count]').waitFor()
+  await page.locator('[data-inquiry="write2"] [data-inquiry-count]').waitFor()
+  await until(() => hits.approvals.length >= 1)
+  await page.waitForTimeout(200)
+  release()
+  const both = await until(async () => (await tally(page, '[data-inquiry="write"]')).shown === 1
+    && (await tally(page, '[data-inquiry="write2"]')).shown === 1)
+  const [gw, gw2] = [await groupsOf(page, '[data-inquiry="write"]'), await groupsOf(page, '[data-inquiry="write2"]')]
+  check('写月报：审批列表没取到，那张审批里问的单独一组（没能确认）', JSON.stringify(gw.map((g) => [g.unit, g.entries])) === JSON.stringify([['unsure', ['41']]]),
+    JSON.stringify(gw.map((g) => [g.unit, g.entries])))
+  check('写周报：请求是另一处先发的，回来之后照样列出、单独一组', both
+    && JSON.stringify(gw2.map((g) => [g.unit, g.entries])) === JSON.stringify([['unsure', ['42']]]), JSON.stringify(gw2.map((g) => [g.unit, g.entries])))
+  const [tw, tw2] = [await tally(page, '[data-inquiry="write"]'), await tally(page, '[data-inquiry="write2"]')]
+  check('两份报告头上的次数都和列出的条数一致', tw.head === '1' && tw.shown === 1 && tw2.head === '1' && tw2.shown === 1,
+    JSON.stringify({ tw, tw2 }))
+  check('按运行只取一次审批列表（一份列表里各张审批都有）', hits.approvals.length === 1, JSON.stringify(hits.approvals))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+  await ctx.close()
+  {
+    // 运行详情直接打开「证据」页签、运行停在审批上：时间线里的待审批卡只为更早那一轮（ap-inq-0）取审批列表，证据页签不认
+    // 任何审批，ap-inq-0 和这张卡的 ap-inq-1 都要对。卡那一处先发了请求，证据页签那一处的条目在请求回来之后也得列出来
+    const early = { ...clone(fx.items[0]), seq: 12, approval_id: 'ap-inq-0', question: '上一轮：退款率 3.5% 是怎么算的？', at: '2026-10-05T05:40:00Z' }
+    const { ctx, page, hits, state, errors } = await open('inquiry-run-waiting', { waitUntil: 'load', setup: (s) => {
+      s.lists[RUNS.approve] = [early, clone(fx.items[1])]
+      s.approvalsGate = new Promise((r) => { release = r })
+    } })
+    const card = '[data-fixture-card] [data-inquiry="write"]'
+    const pane = '[data-fixture-evidence] [data-inquiry="write"]'
+    await page.locator(`${card} [data-inquiry-count]`).waitFor()
+    await page.locator(`${pane} [data-inquiry-count]`).waitFor()
+    await until(() => hits.approvals.length >= 1)
+    await page.waitForTimeout(200)
+    release()
+    const listed = await until(async () => (await tally(page, card)).shown === 2 && (await tally(page, pane)).shown === 2)
+    const [gc, gp] = [await groupsOf(page, card), await groupsOf(page, pane)]
+    check('待审批卡：这张审批里问的挂句子下面，没能确认的那一轮单独一组',
+      JSON.stringify(gc.map((g) => [g.unit, g.entries])) === JSON.stringify([['u3', ['34']], ['unsure', ['12']]]),
+      JSON.stringify(gc.map((g) => [g.unit, g.entries])))
+    check('证据页签：两条都列出来，没能确认的单独一组（不再一直等着）', listed
+      && JSON.stringify(gp.map((g) => [g.unit, g.entries])) === JSON.stringify([['unsure', ['12', '34']]]), JSON.stringify(gp.map((g) => [g.unit, g.entries])))
+    const [tc, tp] = [await tally(page, card), await tally(page, pane)]
+    check('两处头上的次数都和列出的条数一致', tc.head === '2' && tc.shown === 2 && tp.head === '2' && tp.shown === 2, JSON.stringify({ tc, tp }))
+    check('运行详情：按运行只取一次审批列表', hits.approvals.length === 1, JSON.stringify(hits.approvals))
+    // 没读到审批记录不能说成「其他版本」：卡上同一条挂在句子下面，下面证据页签却说是别的版本，审批人会以为报告换过稿
+    const heads = (await page.locator('[data-inquiry-group="unsure"] [data-inquiry-about-text]').allInnerTexts()).map((t) => t.trim())
+    check('没能确认的那一组（两处）：写「无法确认提问时的报告版本」，不说「其他版本」',
+      heads.length === 2 && heads.every((t) => t === '无法确认提问时的报告版本'), heads.join(' | '))
+    check('……两处都给「重试」', await page.locator(`${card} [data-inquiry-group="unsure"] [data-inquiry-docs-retry]`).count() === 1
+      && await page.locator(`${pane} [data-inquiry-group="unsure"] [data-inquiry-docs-retry]`).count() === 1)
+    const unsureRatio = await ratioOf(page, `${pane} [data-inquiry-group="unsure"] [data-inquiry-about-text]`)
+    check('……那一句（深色）对比度 ≥ 4.5', unsureRatio >= 4.5, unsureRatio.toFixed(2))
+    // 重试，这回取得到：这张审批审的就是眼前这一稿，更早那一轮审的是另一稿
+    state.approvals[RUNS.approve] = [approvalRow(fx.approval_id, RUNS.approve, fx.reports.approve.doc_artifact),
+      approvalRow('ap-inq-0', RUNS.approve, '0'.repeat(64))]
+    await page.locator(`${pane} [data-inquiry-docs-retry]`).click()
+    const want = JSON.stringify([['u3', ['34']], ['other', ['12']]])
+    const placed = await until(async () => JSON.stringify((await groupsOf(page, pane)).map((g) => [g.unit, g.entries])) === want
+      && JSON.stringify((await groupsOf(page, card)).map((g) => [g.unit, g.entries])) === want)
+    const [gc2, gp2] = [await groupsOf(page, card), await groupsOf(page, pane)]
+    check('重试取到之后（证据页签）：这张审批里问的回到句子下面，更早那一轮算报告其他版本', placed
+      && JSON.stringify(gp2.map((g) => [g.unit, g.entries])) === want, JSON.stringify(gp2.map((g) => [g.unit, g.entries])))
+    check('重试取到之后（待审批卡）：更早那一轮也改写成报告其他版本', JSON.stringify(gc2.map((g) => [g.unit, g.entries])) === want
+      && gc2.at(-1)?.about.startsWith('报告其他版本上的质询'), JSON.stringify(gc2.map((g) => [g.unit, g.about.slice(0, 12)])))
+    check('……重试只再取一次审批列表，两处共用', hits.approvals.length === 2, JSON.stringify(hits.approvals))
+    const [tc2, tp2] = [await tally(page, card), await tally(page, pane)]
+    check('……两处的次数仍和条数一致', tc2.head === '2' && tc2.shown === 2 && tp2.head === '2' && tp2.shown === 2, JSON.stringify({ tc2, tp2 }))
     check('运行详情：页面没有报错', errors.length === 0, errors.join('；'))
     await ctx.close()
   }
@@ -1273,18 +1426,23 @@ function contrast(fg, bg, base) {
   return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05)
 }
 
-/** 某个元素的字色对它所在那一块底色的对比度：底色往上找第一个不透明的，最底下是 body */
-const ratioOf = (page, sel) => page.evaluate((s) => {
-  const el = document.querySelector(s)
-  if (!el) return null
-  let bgEl = el
-  let bg = 'rgba(0, 0, 0, 0)'
-  while (bgEl && /rgba\(0, 0, 0, 0\)|transparent/.test(bg)) {
-    bg = getComputedStyle(bgEl).backgroundColor
-    bgEl = bgEl.parentElement
-  }
-  return { fg: getComputedStyle(el).color, bg, base: getComputedStyle(document.body).backgroundColor }
-}, sel).then((c) => (c ? contrast(c.fg, c.bg, c.base) : 0))
+/**
+ * 某个元素的字色对它所在那一块底色的对比度：底色往上找第一个不透明的，最底下是 body。写成函数声明：前面几段（审批列表
+ * 取不到的那一组）也要用
+ */
+function ratioOf(page, sel) {
+  return page.evaluate((s) => {
+    const el = document.querySelector(s)
+    if (!el) return null
+    let bgEl = el
+    let bg = 'rgba(0, 0, 0, 0)'
+    while (bgEl && /rgba\(0, 0, 0, 0\)|transparent/.test(bg)) {
+      bg = getComputedStyle(bgEl).backgroundColor
+      bgEl = bgEl.parentElement
+    }
+    return { fg: getComputedStyle(el).color, bg, base: getComputedStyle(document.body).backgroundColor }
+  }, sel).then((c) => (c ? contrast(c.fg, c.bg, c.base) : 0))
+}
 
 await section('窄屏与深浅色', async () => {
   for (const theme of ['dark', 'light']) {
@@ -1364,6 +1522,21 @@ await section('窄屏与深浅色', async () => {
     check('390px 运行详情（light）：报告和问答串不横向溢出', o.page <= 0 && o.box <= 0, JSON.stringify(o))
     await shot(page, 'run-explore-narrow-light')
     check('390px 运行详情：页面没有报错', errors.length === 0, errors.join('；'))
+    await ctx.close()
+  }
+  for (const theme of ['dark', 'light']) {
+    // 运行详情「工件」页签：质询回答的说明可能很长（问题的前 40 字），窄屏上截断、不撑宽；种类和说明深浅色都看得清
+    const { ctx, page, errors } = await open('inquiry-run-artifacts', { width: 390, height: 844, theme })
+    const long = fx.run_artifacts.find((a) => a.kind === 'inquiry_answer' && [...(a.meta.question ?? '')].length >= 40)
+    const row = `[data-artifact-id="${long.id}"] [data-action="artifact-open"]`
+    await page.locator(row).waitFor()
+    const o = await overflow(page, '[data-run-artifacts]')
+    const ratios = { kind: await ratioOf(page, `${row} > span:nth-child(1)`), about: await ratioOf(page, `${row} > span:nth-child(2)`) }
+    check(`390px 工件页签（${theme}）：质询回答的长说明截断、不横向溢出，种类和说明对比度 ≥ 4.5`,
+      o.page <= 0 && o.box <= 0 && ratios.kind >= 4.5 && ratios.about >= 4.5,
+      JSON.stringify({ o, kind: Number(ratios.kind.toFixed(2)), about: Number(ratios.about.toFixed(2)) }))
+    await shot(page, `run-artifacts-narrow-${theme}`)
+    check(`390px 工件页签（${theme}）：页面没有报错`, errors.length === 0, errors.join('；'))
     await ctx.close()
   }
 })
