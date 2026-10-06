@@ -37,6 +37,10 @@ import fx from './challenge.json'
  * - ?syn=challenge-approval-dup：同 many，工件里补出来的一句和条目里的一句原文相同、unit 不同（工件由检查脚本合成）
  * - ?syn=challenge-approval-norecord：同 many，审稿记录没存上（artifact 为 null）
  *
+ * 证据面板的单句展示（scope="claim"）：
+ * - ?syn=challenge-claim-quiet：被推翻的那一句，「不谈出具」（issuance={false}）。给了正式运行、运行 id，服务端也说被推翻的
+ *   会降档（degrades）——审批卡上这几样凑齐就写「出具会降档」；这里一句和出具有关的话都不说，也不为此取运行类别
+ *
  * 运行类别（GET /api/runs/{id}）、工件（GET /api/artifacts/{id}）都由检查脚本用 page.route 伪造；直接打开时取不到，
  * 卡上照实不说降档、点开一句说无法获取。
  *
@@ -252,6 +256,12 @@ export const cases: Record<string, () => JSX.Element> = {
   'challenge-approval-offpath': () => (
     <Card name="challenge-approval-offpath"
           approval={approvalOf('ap-chal-15', RUNS.offpath, 'formal', withChallenge({ on_refuted: 'degrade', degrades: false, unreviewed: 0 }))} />
+  ),
+  'challenge-claim-quiet': () => (
+    <div className="mx-auto max-w-md p-4" data-fixture="challenge-claim-quiet">
+      <ChallengeSummary reports={[withChallenge({ degrades: true, items: challenge.items.filter((it) => it.verdict === 'refuted') })]}
+                        runId={RUNS.formal} runClass="formal" scope="claim" issuance={false} />
+    </div>
   ),
   'challenge-inspector': () => <InspectorCase name="challenge-inspector" workflow={WORKFLOW} />,
   'challenge-inspector-chain': () => <InspectorCase name="challenge-inspector-chain" workflow={CHAIN} />,

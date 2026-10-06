@@ -439,6 +439,25 @@ await section('整张审批卡：把审批带着的运行类别交给反方审�
   await ctx.close()
 })
 
+await section('证据面板的单句展示、不谈出具：给了正式运行、服务端说会降档，也一句和出具有关的话都不说，不为此取运行类别', async () => {
+  // 证据面板看的是已经结束的运行，降没降档以报告的出具横幅为准，单句那一块传 issuance={false}。以前证据面板既不传运行 id
+  // 也不传运行类别，这个开关在哪个用例里都观察不到：改成忽略它，「出具会降档」悄悄回到单句面板也没有检查会发现。用例
+  // challenge-claim-quiet 把审批卡上写降档要的几样（正式运行、运行 id、被推翻、degrades）都给齐了；那次运行的类别要是
+  // 去取，答的是正式运行
+  const { ctx, page, hits, errors } = await open('challenge-claim-quiet')
+  const block = page.locator('[data-challenge="write"][data-challenge-scope="claim"]')
+  await block.waitFor()
+  await page.waitForTimeout(500)
+  const all = await text(block)
+  check('单句：只画这一句的判断（被推翻），不画报告级的标题和计数', (await text(block.locator('[data-challenge-tag]'))) === '被推翻'
+    && await page.locator('[data-challenge-counts], [data-challenge-items]').count() === 0, all)
+  check('……不谈出具：不写降档、不在出具路径上、只标注', await page.locator('[data-challenge-degrade], [data-challenge-degrade-note], '
+    + '[data-challenge-degrade-off], [data-challenge-flag]').count() === 0 && !all.includes('降档') && !all.includes('出具'), all)
+  check('……也不为此取这次运行的类别', !hits.runs.includes(RUNS.formal), hits.runs.join('、') || '一次都没取')
+  check('……页面没有报错', errors.length === 0, errors.join('；'))
+  await ctx.close()
+})
+
 await section('有句子反查没完成：单独说一行，不混在「无法判断」里，不插在降档标记和它的说明中间', async () => {
   // 服务端的 unreviewed：核查模型不可用、触顶没给出结论、数据源不在了……这几句记为无法判断，可反查没有完成。「无法判断
   // 3 句」分不出是查了、数据不够，还是没查成，审批卡单独说。未能反查的每一句都记为无法判断，unreviewed 不会多于它

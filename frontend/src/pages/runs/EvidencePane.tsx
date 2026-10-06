@@ -48,20 +48,40 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
   const loadGraph = useEvidence((s) => s.loadGraph)
   const reloadGraph = useEvidence((s) => s.reloadGraph)
   const first = useRef(true)
+  // 报告正文（审批卡里展开的、成果区的）有运行就先取过证据图，取的时候运行可能还停在审批上（之后报告又改写过）、刚收尾还没
+  // 封存，也可能是接着跑之前封存的那一版。挂上时手里那份不是「封存了、封存的就是这一版」就重取一次，不看运行停在哪：之后
+  // 没有新事件，refreshKey 不再变，过期的那份会一直留着。别处正在取的那份取回来再看一眼（recheck）。
+  // 重取回来之前先占位（renewing），不画手里那份：画出来的是旧稿，审计表却是挂上时新取的，点一行会按片段 id 打开旧稿里同号
+  // 的片段。第一次渲染就按挂上那一刻手里的那份定，不先画一帧旧稿再收起来；换下来的判据是 store 里那一格不再是它
+  const [held] = useState(() => useEvidence.getState().graphs[run.id])
+  const [renewing, setRenewing] = useState(() => staleHeld(held, run.manifest_seq))
+  const recheck = useRef(false)
   useEffect(() => {
     if (first.current) {
       first.current = false
-      // 报告正文（成果区、审批卡里展开的那份）有运行就先取过证据图，取的时候运行可能还停在审批上、刚收尾还没封存：
-      // 运行已经结束、手里那份却说没封存时重取一次，不然这一页顶上一直写着尚未封存（之后没有新事件，refreshKey 不再变）
-      const held = useEvidence.getState().graphs[run.id]
-      if (held?.status === 'ok' && SETTLED.has(run.status) && !held.data?.seal?.sealed) void reloadGraph(run.id)
-      else void loadGraph(run.id)
+      if (!staleHeld(held, run.manifest_seq)) void loadGraph(run.id)
+      else if (held?.status === 'loading') recheck.current = true
+      else void reloadGraph(run.id)
       return
     }
     void reloadGraph(run.id)
-  }, [run.id, run.status, refreshKey, loadGraph, reloadGraph])
+    // held 是挂上那一刻的，之后不变
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run.id, run.status, run.manifest_seq, refreshKey, loadGraph, reloadGraph])
+  useEffect(() => {
+    // 挂上时那一份还没换下来（重取还没发出、还没回来），或者正在取：接着等
+    if (!renewing || graphSlot === held || graphSlot?.status === 'loading') return
+    if (recheck.current) {
+      recheck.current = false
+      if (graphSlot?.status === 'ok' && !sealedNow(graphSlot.data, run.manifest_seq)) {
+        void reloadGraph(run.id)
+        return
+      }
+    }
+    setRenewing(false)
+  }, [renewing, graphSlot, held, run.id, run.manifest_seq, reloadGraph])
   const audit = useAudit(run.id, refreshKey)
-  const graph = graphSlot?.data
+  const graph = renewing ? undefined : graphSlot?.data
 
   const [root, setRoot] = useState<HTMLDivElement | null>(null)
   const wide = useWide(root, 880)
@@ -231,6 +251,17 @@ const openKey = (row: AuditRow): string | undefined =>
 
 /** 已经收尾的运行：还在跑、停在审批上的，报告可能还没写，说「这次的报告没有逐段证据」太早 */
 const SETTLED = new Set(['succeeded', 'failed', 'cancelled'])
+
+/**
+ * 手里这份证据图能不能直接用：封存了，而且封存的就是运行现在这一版（失败后接着跑的运行会重新封存，manifest_seq 跟着变）。
+ * 运行记录上没有 manifest_seq（老运行）、老服务端的证据图没给时只看封没封存
+ */
+const sealedNow = (graph: EvidenceGraph | undefined, seq: number | null | undefined) =>
+  !!graph?.seal?.sealed && (seq == null || graph.seal.manifest_seq == null || graph.seal.manifest_seq === seq)
+
+/** 证据页挂上时手里那份（别处取的）要不要重取：正在取的取回来再看；取到了的不是封存的这一版就重取。没有、取失败的照常取 */
+const staleHeld = (held: { status: string; data?: EvidenceGraph } | undefined, seq: number | null | undefined) =>
+  held?.status === 'loading' || (held?.status === 'ok' && !sealedNow(held.data, seq))
 
 /**
  * 工作流现在的图能不能一键升级：拿它去校验，看有没有 evidence.upgrade_available 这条建议。老后端不给

@@ -42,7 +42,8 @@ export interface ChallengeSummaryProps {
  * - 审批卡（scope 为 report），紧跟在报告核对概况（ApprovalReports）后面：一行概况（四种判断各几句），出具相关的那一句，
  *   有句子反查没完成时再说一行「N 句未能反查」，逐句列出结论原文和判断，点开一句再按 challenge_artifact 取完整内容，看
  *   反方的理由和它执行过的查询。审稿记录没存上（没有工件）时只列判断、不能点开，整块说一次。
- * - 证据面板（scope 为 claim、issuance 为 false）：一句话的判断，展开同样按 challenge_artifact 取这一句的理由和查询。
+ * - 证据面板（scope 为 claim、issuance 为 false）：一句话的判断，展开同样按 challenge_artifact 取这一句的理由和查询。片段
+ *   接口还没答回来、答不了时，由 ClaimVerdictPending 先按正文标记（证据图）写出判断，说清在等什么、给重试。
  *
  * 判断是反方模型给的，不是系统核对：颜色照结论句裁判的那一套，「经受住」也不用确定性的绿。
  * 「出具会降档」只在谈出具（issuance）、正式运行、有被推翻的结论、被推翻的真会让出具降档时才写：服务端给了 degrades 就照它
@@ -443,8 +444,45 @@ function ClaimBlock({ report, challenge, run }: {
         </div>
       )}
       {noRecord && <p style={{ color: 'var(--st-waiting)' }} data-challenge-norecord="">{CHALLENGE_TEXT.noRecord}</p>}
-      {/* 判断标签看着像结论，得说清是谁判的：展开取到审稿记录之后带上模型名 */}
-      <p className="text-faint" data-challenge-judged="">{CHALLENGE_TEXT.judgedBy(detail.data?.model ?? null)}</p>
+      {/* 判断标签看着像结论，得说清是谁判的：展开取到审稿记录之后带上模型名。这一句一定没反查成（surely）的不写：那是
+          服务端按规则记的无法判断，反方模型没看过这一句，上面一行已经说了。说不准的（maybe）照旧写 */}
+      {!surely && <p className="text-faint" data-challenge-judged="">{CHALLENGE_TEXT.judgedBy(detail.data?.model ?? null)}</p>}
+    </div>
+  )
+}
+
+/** 证据面板先行版在等什么：片段接口还在取、取不到、答了却没有可用的 unit.challenge */
+export type ClaimWait = 'loading' | 'error' | 'missing'
+
+/**
+ * 单句展示的先行版（证据面板）：只知道这一句的判断（正文标记用的证据图 challenge_verdicts），审稿记录、整份报告的计数要等
+ * 片段接口的 unit.challenge。判断标签先画出来——用户是点着句末醒目的「被推翻」进来的，这一节不能空着；还在取时说正在获取，
+ * 取不到给重试（onRetry），答了却没有可用的内容时照实说看不了。拿到 unit.challenge 之后调用方换成完整的单句展示
+ * （ChallengeSummary 的 scope="claim"）。无法判断的说不准是不是根本没反查成（要整份报告的计数才分得出），落款不说成反方模型
+ * 的判断。不谈出具，同证据面板里的完整展示
+ */
+export function ClaimVerdictPending({ verdict, wait, onRetry }: { verdict: string; wait: ClaimWait; onRetry?: () => void }) {
+  return (
+    <div className="min-w-0 space-y-1 text-2xs leading-relaxed" data-challenge-scope="claim" data-challenge-verdict={verdict}
+         data-challenge-pending={wait}>
+      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+        <VerdictTag verdict={verdict} />
+      </div>
+      {wait === 'loading' ? (
+        <p className="text-faint" data-challenge-detail-state="loading">{CHALLENGE_TEXT.claimPending}</p>
+      ) : (
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1" data-challenge-detail-state={wait}>
+          <span role={wait === 'error' ? 'alert' : undefined} style={{ color: 'var(--st-waiting)' }}>
+            {wait === 'error' ? CHALLENGE_TEXT.claimFailed : CHALLENGE_TEXT.claimNoDetail}
+          </span>
+          {wait === 'error' && onRetry && (
+            <button type="button" className="btn btn-xs" data-challenge-retry="" onClick={onRetry}>{CHALLENGE_TEXT.retry}</button>
+          )}
+        </div>
+      )}
+      <p className="text-faint" data-challenge-judged="">
+        {verdict === 'inconclusive' ? CHALLENGE_TEXT.judgedUnsure : CHALLENGE_TEXT.judgedBy(null)}
+      </p>
     </div>
   )
 }

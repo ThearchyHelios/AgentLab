@@ -2042,7 +2042,7 @@ export interface EvidenceGraph {
                * 期 4：被反方审过的句子 → 判断（_challenge_verdicts，和片段接口的 unit.challenge 同一个读法，每句的判断
                * 一字不差）。正文据此给被审过的句子挂句末标记、点开整句面板。一句都没审、文档读不出来、老服务端都没有这个键
                */
-              challenge_verdicts?: Record<string, ChallengeVerdict | (string & {})> }[]
+              challenge_verdicts?: EvidenceChallengeVerdicts }[]
   evidence?: { alias?: string; eid?: string; kind?: string; label?: string; node_id?: string; artifact?: string
                sealed?: boolean; cited_by?: string[]; report?: string }[]
   edges?: { from: string; to: string; rel: string }[]
@@ -2131,6 +2131,12 @@ export interface EvidenceDualCheck {
   /** unchecked：给人看的原因；skipped：EvidenceDualCheckSkip 里的代码（界面认不出的代码不显示） */
   reason?: string
 }
+
+/**
+ * 一份报告里被反方审过的句子 → 判断（证据图 reports[].challenge_verdicts，_challenge_verdicts）。只有被审过的句子；判断和
+ * 点开这一句时片段接口答的 unit.challenge.verdict 一字不差。正文据此挂句末标记，证据面板在片段接口答回来之前先按它写判断
+ */
+export type EvidenceChallengeVerdicts = Record<string, ChallengeVerdict | (string & {})>
 
 /** 句子上的反方审稿判断（_challenge_of）：片段接口答的 unit.challenge。没被反方审过的句子没有这个键 */
 export interface EvidenceUnitChallenge {
