@@ -104,6 +104,9 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # 结论句裁判（claims: judge）：触顶、没跑成的句子记为未裁判，出具不能判完整——是缺口，要说明
     "judge_limit": ("judge_limit", DEGRADED),
     "judge_failed": ("judge_failed", DEGRADED),
+    # 裁判模型的输出到了上限被截断（推理模型的思考也算在额度里）：同 judge_failed 是缺口，记成它自己的 kind——说得清
+    # 是输出额度的问题，该换的是模型
+    "judge_truncated": ("judge_truncated", DEGRADED),
     # 证据不支持的句子交回写作者改过一次（和 report_repair 一样只记缺口）；改写稿冒出新问题没采用的，
     # 原稿里那几句仍是证据不支持
     "report_rewrite": ("report_rewrite", DEGRADED),

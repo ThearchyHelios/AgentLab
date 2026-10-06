@@ -2366,6 +2366,56 @@ await section('核查模型的输出到了上限被截断（verify_truncated）�
   check('节点照常完成', nodes.every((s) => s.status === 'done'))
 })
 
+await section('结论句裁判的输出到了上限被截断（judge_truncated）：调用那一行说截断，日志另起一行，下一步指到换模型', async () => {
+  // 以前截断的那一批只发 llm.end（标题沿用「结论句裁判未能执行」）和 judge_failed（下一步是「检查接入后重新运行」）：
+  // 截断时接入是好的，同一个模型重新运行多半还是截断。现在调用那一行照 truncated、max_tokens 说截断，另发 judge_truncated
+  // （max_tokens、unjudged），judge_failed 只说别的失败。先核对后端源码还是这么发的
+  const judgePy = readFileSync(`${root}backend/app/engine/judge.py`, 'utf8')
+  check('后端发裁判截断的格式还是夹具里这一种', judgePy.includes('code="judge_truncated", max_tokens=cut_limit')
+    && judgePy.includes('unjudged=outcome["unjudged"]["truncated"]') && judgePy.includes('truncated=True, max_tokens=cut_limit')
+    && judgePy.includes('r not in LIMITS and r != "truncated"'),
+  '改了 judge.py 的字段或说法就同步改 decode.ts 的 explainLog、llm.end 和这里的夹具')
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const CUT = '裁判模型的输出达到上限（16384 token）被截断'
+  const TRUNCATED = `结论句裁判未完成：有 4 句结论未裁判：${CUT}，通常是推理占满了输出额度，可换用不带推理的裁判模型`
+  const all = flatten(mod.decodeRun([
+    E(1, 'run.started', null, { total: 1 }),
+    E(2, 'node.started', 'write', { node_type: 'report', label: '写周报' }),
+    E(3, 'llm.start', 'write', { model: 'jm-r', structured: true, purpose: 'judge', message_count: 2, units: 4 }),
+    E(4, 'llm.end', 'write', { model: 'jm-r', purpose: 'judge', duration_ms: 41000, units: 4, input_tokens: 3000,
+      output_tokens: 16384, error: CUT, truncated: true, max_tokens: 16384 }),
+    E(5, 'log', 'write', { level: 'warn', code: 'judge_truncated', max_tokens: 16384, unjudged: 4, message: TRUNCATED }),
+    E(6, 'node.finished', 'write', { duration_ms: 43000 }),
+    E(7, 'run.finished', null, { status: 'succeeded' }),
+  ]))
+  const call = all.find((s) => s.kind === 'llm' && s.code === 'judge')
+  check('调用那一行：说输出到了上限被截断、带额度，不说「未能执行」；提醒色、照常完成，原话在展开区',
+    call?.title === '裁判模型的输出达到上限（16,384 token）被截断' && call.level === 'warn' && call.status === 'done'
+    && !!call.detail?.includes(CUT), `${call?.title} / ${call?.level} / ${call?.status}`)
+  const row = all.find((s) => s.code === 'judge_truncated')
+  check('judge_truncated：标题说截断、带额度和几句未裁判', row?.title === '裁判模型的输出达到上限（16,384 token）被截断，4 句结论未裁判',
+    row?.title)
+  check('……下一步指到换不带推理的裁判模型（节点的「结论句裁判」、设置都说），不说检查接入', !!row?.next?.includes('不带推理的裁判模型')
+    && row.next.includes('结论句裁判') && row.next.includes('设置 → 偏好设置 → 证据裁判') && !row.next.includes('接入')
+    && row.fix === 'canvas' && row.fixField === 'judge' && row.level === 'warn', `${row?.next} / ${row?.fix} / ${row?.fixField}`)
+  check('……原话留在展开区，标题里没有内部代码', row?.detail === TRUNCATED && !/judge_truncated|max_tokens|unjudged/.test(`${row?.title}${row?.next}`))
+  check('没有混出一条 judge_failed', !all.some((s) => s.code === 'judge_failed'))
+  // 没截断的失败照旧：「未能执行」那一行和 judge_failed 的说法不变
+  const other = flatten(mod.decodeRun([
+    E(1, 'node.started', 'write', { node_type: 'report' }),
+    E(2, 'llm.start', 'write', { model: 'jm-x', structured: true, purpose: 'judge', message_count: 2, units: 2 }),
+    E(3, 'llm.end', 'write', { model: 'jm-x', purpose: 'judge', duration_ms: 300, units: 2, error: 'ConnectError: 连不上' }),
+    E(4, 'node.finished', 'write', { duration_ms: 400 }),
+  ]))
+  check('没截断的调用失败照旧叫「结论句裁判未能执行」', other.find((s) => s.kind === 'llm')?.title === '结论句裁判未能执行',
+    other.find((s) => s.kind === 'llm')?.title)
+  const bare = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report' }),
+    E(2, 'log', 'w', { level: 'warn', code: 'judge_truncated', max_tokens: 'x', message: '裁判被截断了' })]))
+    .find((s) => s.code === 'judge_truncated')
+  check('缺字段、类型不对：标题不带数，不出 undefined、NaN', bare?.title === '裁判模型的输出达到上限被截断'
+    && !/undefined|NaN/.test(`${bare?.title}${bare?.next ?? ''}`), bare?.title)
+})
+
 await section('审批质询 approval.inquiry（期 4）：一行「审批人质询」，标题带问题前 40 字，副标题说回答是否完成、查了几次', async () => {
   // 前后端共用的约定：运行停在审批上时服务端追加 approval.inquiry，node_id 为空；data 里有问题、划选的原文、回答正文、
   // 回答文档、成没成、触顶原因、查询（queries 和 inquiry_artifacts 两份）。以前这类事件落进「未识别的事件」

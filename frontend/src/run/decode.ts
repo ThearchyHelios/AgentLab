@@ -3,7 +3,8 @@ import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
   ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
-  CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, NODE_TYPE_LABEL, VERIFY_TRUNCATED_TEXT,
+  CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, NODE_TYPE_LABEL,
+  VERIFY_TRUNCATED_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -1012,6 +1013,15 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         fix: 'canvas',
       }
     }
+    case 'judge_truncated': {
+      // 裁判模型的输出到了上限被截断（judge.py run_request）：max_tokens 是那次调用的额度，unjudged 是因此未裁判的句数。
+      // 读结构化字段，不从原话里认；缺了字段只给不带数的标题。下一步指到换模型：同一个模型重新运行多半还是截断
+      const limit = typeof d.max_tokens === 'number' && d.max_tokens > 0 ? d.max_tokens : undefined
+      const n = typeof d.unjudged === 'number' && d.unjudged > 0 ? Math.round(d.unjudged) : undefined
+      return {
+        title: JUDGE_TRUNCATED_TEXT.title(limit, n), next: JUDGE_TRUNCATED_TEXT.next, fix: 'canvas', fixField: 'judge',
+      }
+    }
     case 'judge_failed': {
       // 「结论句裁判没跑完：有 2 句结论没裁判：裁判调用失败（…）」
       return {
@@ -1927,9 +1937,11 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
         }
         if (d.purpose === 'judge' && d.error) {
-          // 裁判没跑成（超时、调用失败）：这一批记为未裁判、报告照常交——同样是提醒，不是失败
+          // 裁判没跑成（超时、调用失败）：这一批记为未裁判、报告照常交——同样是提醒，不是失败。输出到了上限被截断的
+          // 照实说是截断（不是「未能执行」：接入是好的，该换的是模型，下一步见 judge_truncated 那一行）
+          const cap = num(d.max_tokens)
           step.level = 'warn'
-          step.title = JUDGE_FAILED_TITLE
+          step.title = d.truncated === true ? JUDGE_TRUNCATED_TEXT.call(cap && cap > 0 ? cap : undefined) : JUDGE_FAILED_TITLE
           step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
         }
         pendingLlm.delete(nodeId ?? '_')

@@ -13,7 +13,8 @@
    查询在 SQL 之后另有来历行（来源、口径、已接受、区域外文字，_provenance_lines）
 3. 调用（judge_doc）：一份报告合并成一次调用，超过每批的句数就分批；结构化输出失败退回 JSON 解析，
    再失败就记未裁判。thinking 关掉，输出额度 MAX_TOKENS（推理模型的思考也算在里面），服务方嫌大时退回
-   FALLBACK_MAX_TOKENS；输出到了上限被截断的记未裁判（truncated），照实说是额度不够、不再退回纯文本多花一次
+   FALLBACK_MAX_TOKENS，被嫌大过的接入、模型之后直接用小的；输出到了上限被截断的整批记未裁判（truncated），
+   照实说是额度不够、不再退回纯文本多花一次，时间线上另记 judge_truncated
 4. 预算：每份报告的句数、金额、时长和全局每日金额，每一项都能是 None（不限）。调用前按目录价估算，
    超了按优先级截断；触顶就停，已判的保留，没判的记未裁判并说明是哪个上限——不报错
 5. 每日计数落在设置表（SPEND_KEY），按本地日期滚动。目录里没有价格的模型估不出金额，金额上限对它
@@ -70,7 +71,7 @@ from app.engine.merge_query import MERGE_SOURCE
 from app.engine.nodes.llm import _split_structured, _usage_of
 from app.engine.state import message_text
 from app.providers import catalog as pricing
-from app.providers.budget import BudgetFallback, cut_off, cut_words, error_usage, truncated_error
+from app.providers.budget import BudgetFallback, budget_refused, cut_off, cut_words, error_usage, truncated_error
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
 
 logger = logging.getLogger(__name__)
@@ -1081,8 +1082,9 @@ async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | Non
     先走结构化输出；不成（模型不支持、给的不是合法结构）先从原始回复里找 JSON，再退回纯文本调用、
     从回复里抠 JSON。原因以 error: 开头的是调用本身失败，format 是格式不对，truncated 是输出到了上限被截断
     （Anthropic 的 stop_reason=max_tokens、OpenAI 系的 finish_reason=length，以及 openai 结构化输出抛的
-    LengthFinishReasonError）。结构化调用被截断的不再退回纯文本：推理占满额度时纯文本调用多半一样被截断，白花一次
-    额度。超时由调用方掐。
+    LengthFinishReasonError）。截断的回复整批不采信：强制工具调用截在半路时 Anthropic 给的是空对象，有的网关给半截的
+    清单——最后一条可能只写了编号，也可能判定写完了、理由写到一半，分不清哪条是完整的。结构化调用被截断的不再退回
+    纯文本：推理占满额度时纯文本调用多半一样被截断，白花一次额度。超时由调用方掐。
     """
     raws: list[BaseMessage] = []
     try:
@@ -1090,6 +1092,8 @@ async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | Non
         raw, parsed = _split_structured(got)
         if raw is not None:
             raws.append(raw)
+        if cut_off(raw):
+            return None, raws, _TRUNCATED, 1
         if (items := _items_of(parsed)) is not None:
             return items, raws, None, 1
         if raw is not None:
@@ -1097,8 +1101,6 @@ async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | Non
             for found in [message_text(raw), *(c.get("args") for c in getattr(raw, "tool_calls", None) or [])]:
                 if (items := _items_of(found)) is not None:
                     return items, raws, None, 1
-            if cut_off(raw):
-                return None, raws, _TRUNCATED, 1
     except Exception as e:  # noqa: BLE001 - 不支持结构化输出的模型退回文本解析
         if truncated_error(e):
             return None, [*raws, *_spent(e)], _TRUNCATED, 1
@@ -1109,9 +1111,10 @@ async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | Non
             return None, [*raws, *_spent(e)], _TRUNCATED, 2
         return None, raws, f"error:{describe_exception(e)}", 2
     raws.append(reply)
-    items = _items_of(message_text(reply))
-    if items is None and cut_off(reply):
+    if cut_off(reply):
+        # 正文里就算抠得出一段清单，后面还在写，说不清写完了没有：同样整批不采信
         return None, raws, _TRUNCATED, 2
+    items = _items_of(message_text(reply))
     return items, raws, None if items is not None else "format", 2
 
 
@@ -1123,15 +1126,18 @@ def _spent(error: BaseException) -> list[BaseMessage]:
     return [AIMessage(content="", usage_metadata={"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out})]
 
 
-def _with_fallback(model: Any, spec: ModelSpec) -> BudgetFallback:
-    """裁判模型包一层：服务方嫌 MAX_TOKENS 太大时按 FALLBACK_MAX_TOKENS 重建一个再问（要退回时才建，平常不多建），之后
-    各批都用小的。经本模块的 get_chat_model 建：测试换成剧本时，小额度的那个也是剧本。"""
+def _with_fallback(model: Any, spec: ModelSpec, model_id: str) -> BudgetFallback:
+    """裁判模型包一层：服务方嫌 MAX_TOKENS 太大（或者 anthropic SDK 在本地就拒了）时按 FALLBACK_MAX_TOKENS 重建一个再问
+    （要退回时才建，平常不多建），之后各批都用小的。被嫌大过的按 (接入, 模型, 额度) 记在进程里：之后每份报告、每次
+    点击直接用小的，核查（verify_agent._with_fallback）同一种记法、互相认。经本模块的 get_chat_model 建：测试换成剧本
+    时，小额度的那个也是剧本。"""
 
     async def build() -> Any:
         async with SessionLocal() as session:
             return (await get_chat_model(session, spec.model_copy(update={"max_tokens": FALLBACK_MAX_TOKENS})))[0]
 
-    return BudgetFallback(model, build=build, limits=(spec.max_tokens, FALLBACK_MAX_TOKENS))
+    return BudgetFallback(model, build=build, limits=(spec.max_tokens, FALLBACK_MAX_TOKENS), rejected=budget_refused,
+                          key=(spec.provider, model_id, spec.max_tokens))
 
 
 def _unjudged(reason: str, rationale: str, *, judge: str | None, post_seal: bool) -> dict[str, Any]:
@@ -1196,7 +1202,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
     try:
         async with SessionLocal() as session:
             model, model_id = await get_chat_model(session, spec)
-        model = _with_fallback(model, spec)
+        model = _with_fallback(model, spec, model_id)
     except Exception as e:  # noqa: BLE001 - 裁判模型没配好：这回判不了，报告照常
         why = not_configured(e) if isinstance(e, ProviderNotConfigured) else describe_exception(e)
         details["error"] = f"裁判模型不可用（{why}）"
@@ -1233,6 +1239,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
 
     spent = 0.0
     width = 1
+    cut_limit: int | None = None        # 被截断的那次调用的额度：judge_truncated 日志照它写
     while pending:
         remaining = None if budget.timeout_s is None else budget.timeout_s - (time.monotonic() - started)
         if remaining is not None and remaining <= 0:
@@ -1312,9 +1319,9 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
             if problem == _TRUNCATED:
                 # 输出到了上限被截断：这一批记未裁判，原因照实说是额度，不说「格式有误」「调用失败」。别的批照常问
                 # （同格式不对）：截断取决于这一批要想多久，不像鉴权、网关出错那样后面几批多半一样
-                limit = model.max_tokens
-                details["truncated"] = cut_words("裁判模型", limit)
-                emit(EventType.LLM_END, **end, error=details["truncated"], truncated=True, max_tokens=limit)
+                cut_limit = model.max_tokens
+                details["truncated"] = cut_words("裁判模型", cut_limit)
+                emit(EventType.LLM_END, **end, error=details["truncated"], truncated=True, max_tokens=cut_limit)
                 stop(batch, "truncated", details["truncated"])
                 continue
             if problem is not None and problem != "format":
@@ -1353,7 +1360,12 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
         n = sum(outcome["unjudged"].get(r, 0) for r in hit)
         emit(EventType.LOG, level="warn", code="judge_limit", limits=hit, unjudged=n,
              message=f"结论句裁判已达上限（{labels}）：{n} 句未裁判，已裁判的结果保留")
-    if failed := [g for r, g in outcome["_gaps"] if r not in LIMITS]:
+    # 输出被截断单独记一条（带那次的额度、几句未裁判）：judge_failed 在时间线上的下一步是检查接入、重新运行，截断时接入
+    # 是好的，同一个模型重新运行多半还是截断，该换的是模型
+    if truncated := [g for r, g in outcome["_gaps"] if r == "truncated"]:
+        emit(EventType.LOG, level="warn", code="judge_truncated", max_tokens=cut_limit,
+             unjudged=outcome["unjudged"]["truncated"], message="结论句裁判未完成：" + "；".join(truncated))
+    if failed := [g for r, g in outcome["_gaps"] if r not in LIMITS and r != "truncated"]:
         emit(EventType.LOG, level="warn", code="judge_failed", message="结论句裁判未完成：" + "；".join(failed))
     outcome.pop("_gaps")
     return outcome
