@@ -10,12 +10,18 @@
   LIKE、简单 CASE、IS [NOT] DISTINCT FROM，套了括号、写成行值、VALUES、ARRAY 的也算，还有 BETWEEN v AND v、
   >= v AND <= v 这类夹住某一个值的范围）和遮罩列比较时短的数也换；选出列、函数参数、算式里够长的遮罩值也换；字符串
   （范围边界也一样）、注释、名字按值换；SQL 解析不了时认不准哪个是阈值，一律不免
-- 「夹住某一个值」只在同一个条件里认，按条件合起来的真假认（旁边的别的条件当成不知道真假）：分档的两个 WHEN 分支、
-  两个选出列、UNION 两支、WHERE 和 HAVING 各写一边共用的边界是阈值；列名认不出的只和写得一样的表达式配
+- 「夹住某一个值」在整条 SQL 里认，只有分档的几种写法各算各的：CASE 的不同分支、不同的选出列（连同 GROUP BY、
+  ORDER BY）、UNION 的不同支，共用的边界是阈值；同一行集上的条件（ON 和 WHERE、WHERE 和 HAVING、INTERSECT 两支、
+  包在 CASE / 函数 / 算式里的一半、子查询、CTE）照样认得出在找哪一个值。同一个条件里按合起来的真假认（旁边的别的
+  条件当成不知道真假），BETWEEN v AND v、>= v AND <= v 这类本身就只认一个值的，条件里哪一层都算；整数上 <= v、
+  >= v 也隔开了相邻的整数；列名认不出的只和写得一样的表达式配
 - 阈值只在同一个数在这条 SQL 别处确实被换掉时才不留（换不换和 SQL 里换字面量是同一套判断）：日期、天数、标签里写着
-  同一个短的数，没设遮罩的列上的等值，都不牵连阈值
+  同一个短的数，没设遮罩的列上的等值，都不牵连阈值；不留的照等值的办法换，别的列上的短阈值、LIMIT 撞上别处换掉的
+  短的数照原样（已知局限）
+- 按遮罩列分档的标签（CASE、IIF 的结果都是写死的常量）是 agent 自己写在 SQL 里的，不当遮罩值：SQL、回答正文里照原样；
+  当分组键的（每一档一行）不算派生值，格子照常显示，逐行的标签列照旧整列遮
 - 快照按列遮，另按值遮：别的列里写着遮罩值的格子也换成「已遮罩」；列名里写着遮罩值的，列名也换；质询工件里，
-  没设遮罩的列里一格文字夹着的遮罩值按子串换（回答一路照旧整份不交），SQL 检查结果的片段照 SQL 换
+  没设遮罩的列里一格文字夹着的遮罩值按子串换（回答一路照旧整份不交），SQL 检查结果的片段、说明照整条 SQL 换
 - 组装回答之后还认得出遮罩值的（正文里复述的阈值除外），不交出去
 - 遮罩值上万个时换一遍也不卡：不现编上万个分支的正则；上千个条件连成一长串照样按结构认，成百个分档边界看不过来的
   按夹住算，也不卡
@@ -130,9 +136,21 @@ def test_a_lateral_subquery_is_read_like_a_derived_table():
     ("SELECT * FROM (SELECT region, COUNT(DISTINCT buyer_phone) FROM sales GROUP BY region) t",
      ["region", "COUNT(DISTINCT buyer_phone)"]),
     ("SELECT region FROM sales WHERE amount > (SELECT AVG(LENGTH(buyer_phone)) FROM sales)", ["region"]),
+    # 汇总里套着结果全是写死的 CASE / IIF：按条件数个数、算占比，同 COUNT
+    ("SELECT SUM(CASE WHEN buyer_phone LIKE '139%' THEN 1 ELSE 0 END) AS 笔数 FROM sales", ["笔数"]),
+    ("SELECT region, AVG(IIF(buyer_phone LIKE '139%', 1.0, 0)) AS 占比 FROM sales GROUP BY region", ["region", "占比"]),
 ])
 def test_counting_filtering_and_ordering_by_a_masked_column_shows_nothing(sql, columns):
     assert hidden_of(sql, columns) == {"buyer_phone"}
+
+
+@pytest.mark.parametrize("sql, columns", [
+    # 汇总的是遮罩列的值本身（已知局限：SUM / AVG / MIN / MAX 算派生），CASE 里有一支取的是它也一样
+    ("SELECT region, MAX(buyer_phone) AS 最大号码 FROM sales GROUP BY region", ["region", "最大号码"]),
+    ("SELECT SUM(CASE WHEN region = '华东' THEN buyer_phone END) AS 合计 FROM sales", ["合计"]),
+])
+def test_aggregating_the_masked_values_themselves_is_still_derived(sql, columns):
+    assert hidden_of(sql, columns) >= {"buyer_phone", columns[-1].lower()}
 
 
 def test_sql_that_cannot_be_read_but_names_a_masked_column_hides_everything():
@@ -144,6 +162,74 @@ def test_names_that_point_at_a_masked_column_are_known_for_comparisons():
     snapshot = {"source": "shop", "sql": "SELECT p FROM (SELECT buyer_phone AS p FROM sales) t", "columns": ["p"],
                 "rows": []}
     assert inquiry_mod._derived_hidden(snapshot, {"buyer_phone"}, "sqlite")[1] == {"buyer_phone", "p"}
+
+
+BANDS = "CASE WHEN amount BETWEEN 0 AND 20000 THEN '小单' WHEN amount BETWEEN 20000 AND 60000 THEN '大单' END"
+
+
+@pytest.mark.parametrize("sql", [
+    # 按位置、按别名、照原样再写一遍分组
+    f"SELECT {BANDS} AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 1",
+    f"SELECT {BANDS} AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 档位",
+    f"SELECT {BANDS} AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY {BANDS}",
+    # 档位编号、没写 ELSE、ELSE NULL、IIF 的两个分支也是写死的
+    "SELECT CASE WHEN amount <= 20000 THEN 1 WHEN amount <= 60000 THEN 2 ELSE NULL END AS 档位, COUNT(*) AS 笔数 "
+    "FROM sales GROUP BY 1",
+    "SELECT IIF(amount > 20000, '大单', '小单') AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 1",
+])
+def test_a_band_label_used_as_the_group_key_is_not_a_masked_value(sql):
+    """按遮罩列分档、每一档一行（CASE、IIF 的结果全是写死的标签，又是分组键）：标签只说一行落在哪一档，带不出金额，
+    档位列不遮，才分得清哪一档是几笔。笔数照样只是计数。"""
+    assert hidden_of(sql, ["档位", "笔数"], {"amount"}) == {"amount"}
+
+
+@pytest.mark.parametrize("sql", [
+    # 不分组：每一行的档位就是这一笔落在哪一档
+    f"SELECT id, {BANDS} AS 档位, 1 AS 笔数 FROM sales",
+    # 结果里有一支取的是金额本身
+    "SELECT CASE WHEN amount > 20000 THEN amount ELSE 0 END AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 1",
+    # 分档写在子查询里，外层再分组：子查询里的档位逐行带出来，照旧算
+    f"SELECT 档位, COUNT(*) AS 笔数 FROM (SELECT {BANDS} AS 档位 FROM sales) t GROUP BY 档位",
+])
+def test_band_labels_row_by_row_still_count_as_derived(sql):
+    assert hidden_of(sql, ["档位", "笔数"], {"amount"}) >= {"amount", "档位"}
+
+
+def plan_of(snapshot: dict, base: set[str], kind: str = "sqlite") -> inquiry_mod._Plan:
+    """一份 agent 的查询快照按回答时的办法收遮罩值、遮好（数据源设了遮罩的列是 base）。"""
+    return inquiry_mod._settle_plan({"a1": snapshot}, {"a1": (base, [])}, [], {"shop": kind}, [], [], {},
+                                    frozenset())
+
+
+def test_band_labels_written_in_the_sql_are_not_masked_values():
+    """分档的标签是 agent 自己写在 SQL 里的字，不是数据源里的值：当分组键的整列照常显示；逐行的标签列照旧整列遮
+    （格子里看不出这一笔落在哪一档），但标签文字也不当遮罩值——SQL 里、回答正文里照原样，换掉了封存的就不是实际
+    执行的语句，「以 20000 元为界，小单 3 笔」也会变成满屏「已遮罩」。"""
+    grouped = {"source": "shop", "sql": f"SELECT {BANDS} AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 1 ORDER BY 1",
+               "columns": ["档位", "笔数"], "rows": [["大单", 2], ["小单", 3]]}
+    plan = plan_of(grouped, {"amount"})
+    assert plan.views["a1"]["rows"] == [["大单", 2], ["小单", 3]] and plan.masked["a1"] == []
+    assert plan.secrets.scrub("以 20000 元为界，小单 3 笔、大单 2 笔") == "以 20000 元为界，小单 3 笔、大单 2 笔"
+    assert inquiry_mod._scrub_sql(grouped["sql"], plan.secrets, plan.tainted["a1"], "sqlite") == grouped["sql"]
+
+    rows = {"source": "shop", "sql": "SELECT id, CASE WHEN age < 30 THEN '30岁以下' ELSE '30岁及以上' END AS 年龄段 "
+                                     "FROM sales ORDER BY id",
+            "columns": ["id", "年龄段"], "rows": [[1, "30岁以下"], [2, "30岁及以上"]]}
+    plan = plan_of(rows, {"age"})
+    assert plan.views["a1"]["rows"] == [[1, MASKED], [2, MASKED]] and plan.masked["a1"] == ["年龄段"]
+    assert plan.secrets.scrub("30岁以下的有 1 人") == "30岁以下的有 1 人"
+    assert inquiry_mod._scrub_sql(rows["sql"], plan.secrets, plan.tainted["a1"], "sqlite") == rows["sql"]
+    assert inquiry_mod._shown_literals([(rows["sql"], "sqlite", plan.tainted["a1"])], plan.secrets) == {"30"}
+
+
+def test_a_value_of_the_masked_column_itself_stays_masked_even_if_written_as_a_label():
+    """只有派生列里的标签不收：遮罩列自己选出来的值照收，哪怕 agent 在 SQL 里把同样的字写成了标签。"""
+    snapshot = {"source": "shop", "sql": "SELECT level, CASE WHEN level = 'VIP会员' THEN 'VIP会员' ELSE '普通会员' END "
+                                         "AS 等级 FROM customers",
+                "columns": ["level", "等级"], "rows": [["VIP会员", "VIP会员"], ["铂金会员", "普通会员"]]}
+    plan = plan_of(snapshot, {"level"})
+    assert plan.views["a1"]["rows"] == [[MASKED, MASKED], [MASKED, MASKED]]
+    assert plan.secrets.scrub("VIP会员、铂金会员、普通会员") == "已遮罩、已遮罩、普通会员"
 
 
 # --------------------------------------------------------------------------
@@ -356,8 +442,8 @@ def test_a_range_that_pins_a_single_value_is_a_lookup(phones, sql, shown):
      "SELECT COUNT(*) FROM sales WHERE age >= 已遮罩 XOR age > 已遮罩"),
 ])
 def test_a_value_pinned_within_one_condition_is_still_a_lookup(phones, kind, sql, shown):
-    """「夹住某一个值」只在同一个条件里认（从比较往上只越过且、或、非、异或、括号），同一个条件里夹住的照样换：旁边
-    还有别的条件、写在 CASE WHEN 里、整数的开区间、XOR。"""
+    """同一个条件里（从比较往上只越过且、或、非、异或、括号）夹住的，按条件合起来的真假认出来照样换：旁边还有别的
+    条件、写在 CASE WHEN 里、整数的开区间、XOR。"""
     assert inquiry_mod._scrub_sql(sql, phones, {"buyer_phone", "age"}, kind) == shown
 
 
@@ -374,17 +460,22 @@ def test_the_same_aggregate_pinned_from_both_sides_is_a_lookup(amounts, sql, sho
 
 @pytest.mark.parametrize("sql", [
     # 两个 WHEN 分支共用一个边界：各是各的条件，20000 只是分档的界
-    "SELECT CASE WHEN amount BETWEEN 0 AND 20000 THEN '小单' WHEN amount BETWEEN 20000 AND 60000 THEN '大单' END "
-    "AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 1",
-    # 两个选出列各按一边数
+    f"SELECT {BANDS} AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 1",
+    # 分组时把 CASE 原样再写一遍：选出列和 GROUP BY 是同一个算法的两处写法，都不筛行
+    f"SELECT {BANDS} AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY {BANDS}",
+    # 两个选出列各按一边数（写成汇总、写成标量子查询都一样）
     "SELECT SUM(CASE WHEN amount <= 20000 THEN 1 ELSE 0 END) AS 小单, "
     "SUM(CASE WHEN amount >= 20000 THEN 1 ELSE 0 END) AS 大单 FROM sales",
+    "SELECT (SELECT COUNT(*) FROM sales WHERE amount <= 20000) AS 小单, "
+    "(SELECT COUNT(*) FROM sales WHERE amount >= 20000) AS 大单",
     # UNION 的两支
     "SELECT '小单' AS 档位, COUNT(*) AS 笔数 FROM sales WHERE amount <= 20000 "
     "UNION ALL SELECT '大单', COUNT(*) FROM sales WHERE amount >= 20000",
-    # 不同子句：WHERE 里一笔的上限、HAVING 里汇总值的下限
+    # IIF 的两个分支：华东按一边数，别的区域按另一边数
+    "SELECT SUM(IIF(region = '华东', amount <= 20000, amount >= 20000)) AS 笔数 FROM sales",
+    # WHERE 里一笔的上限、HAVING 里汇总值的下限：比的不是同一个东西（列名认不出的只和写得一样的表达式配）
     "SELECT region, COUNT(*) AS 笔数 FROM sales WHERE amount <= 20000 GROUP BY region HAVING SUM(amount) >= 20000",
-    # 同一个条件里，算式不和金额这一列配（列名认不出的只和写得一样的表达式配）：金额在 15000 到 20000 之间
+    # 同一个条件里，算式不和金额这一列配：金额在 15000 到 20000 之间
     "SELECT COUNT(*) FROM sales WHERE amount <= 20000 AND amount + 5000 >= 20000",
     # 边界两边都有比较，可合起来不只认 20000 这一个值：不超过 20000 的，或 20000 以上访问又多的
     "SELECT COUNT(*) FROM sales WHERE amount <= 20000 OR (amount >= 20000 AND visits > 25000)",
@@ -395,6 +486,95 @@ def test_band_edges_shared_by_separate_conditions_are_thresholds(amounts, sql):
     这些都是阈值：照原样封存，正文里复述也不遮。"""
     assert inquiry_mod._scrub_sql(sql, amounts, {"amount"}, "sqlite") == sql
     assert "20000" in inquiry_mod._shown_literals([(sql, "sqlite", {"amount"})], amounts)
+
+
+_PHONE, _NEXT = "13900000001", "13900000002"
+
+
+@pytest.mark.parametrize("kind, sql", [
+    # 内连接的 ON 和 WHERE 筛的是同一批行：各写一边照样夹住
+    ("sqlite", "SELECT o.region FROM sales o JOIN buyers b ON b.id = o.bid AND b.buyer_phone >= {v} "
+               "WHERE b.buyer_phone <= {v}"),
+    # WHERE 和 HAVING 比的是同一列（分组的键）
+    ("sqlite", "SELECT buyer_phone, COUNT(*) FROM sales WHERE buyer_phone >= {v} GROUP BY buyer_phone "
+               "HAVING buyer_phone <= {v}"),
+    # INTERSECT 两支都要成立；EXCEPT 是前一支成立、后一支不成立（不低于 25 又不高于 25）
+    ("sqlite", "SELECT id FROM sales WHERE age >= {a} INTERSECT SELECT id FROM sales WHERE age <= {a}"),
+    ("sqlite", "SELECT id FROM sales WHERE age >= {a} EXCEPT SELECT id FROM sales WHERE age > {a}"),
+    # 一半包在 CASE、布尔比较、函数、算式里
+    ("sqlite", "SELECT COUNT(*) FROM sales WHERE age >= {a} AND CASE WHEN age <= {a} THEN 1 ELSE 0 END = 1"),
+    ("sqlite", "SELECT COUNT(*) FROM sales WHERE age >= {a} AND (age <= {a}) = TRUE"),
+    ("sqlite", "SELECT COUNT(*) FROM sales WHERE age >= {a} AND COALESCE(age <= {a}, 0)"),
+    ("sqlite", "SELECT COUNT(*) FROM sales WHERE IIF(age >= {a}, 1, 0) + IIF(age <= {a}, 1, 0) = 2"),
+    # 嵌套的 CASE：里层只在外层成立时才算
+    ("sqlite", "SELECT SUM(CASE WHEN age >= {a} THEN CASE WHEN age <= {a} THEN 1 END END) AS 人数 FROM sales"),
+    # 选出列里的 FILTER 数的是 WHERE 筛过的行
+    ("duckdb", "SELECT COUNT(*) FILTER (WHERE age >= {a}) AS 人数 FROM sales WHERE age <= {a}"),
+    # 两个汇总值相减：不低于 25 的减去高于 25 的，就是正好 25 的
+    ("sqlite", "SELECT SUM(age >= {a}) - SUM(age > {a}) AS 人数 FROM sales"),
+    # 拆进子查询、CTE
+    ("sqlite", "SELECT COUNT(*) FROM sales WHERE age >= {a} AND id IN (SELECT id FROM sales WHERE age <= {a})"),
+    ("sqlite", "WITH a AS (SELECT * FROM sales WHERE buyer_phone >= {v}) SELECT COUNT(*) FROM a "
+               "WHERE buyer_phone <= {v}"),
+])
+def test_a_lookup_split_across_clauses_is_still_a_lookup(phones, kind, sql):
+    """把找某一个值的两半拆到同一行集的不同地方（ON 和 WHERE、WHERE 和 HAVING、INTERSECT 两支、包在 CASE 或函数里、
+    子查询、CTE）：第 4 轮只在同一个条件里认，两半各自当阈值照原样留着，长的号码随即被当成「摆在读者眼前」，回答
+    正文里也不遮，最后一道关跟着放行。只有分档的几种写法（CASE 的不同分支、不同的选出列、UNION 的不同支）各算各的，
+    别的都按同一行集看：两半照样换掉，正文里也不免遮。"""
+    written = sql.format(v=_PHONE, a=25)
+    assert inquiry_mod._scrub_sql(written, phones, {"buyer_phone", "age"}, kind) == sql.format(v=MASKED, a=MASKED)
+    assert inquiry_mod._shown_literals([(written, kind, {"buyer_phone", "age"})], phones) == set()
+
+
+@pytest.mark.parametrize("sql, sealed", [
+    # 整数上 age <= 24 和 age < 25 一样，从下面把 25 隔开；age >= 26 和 age > 25 一样，从上面隔开
+    ("SELECT COUNT(*) FROM sales WHERE NOT (age <= 24 OR age >= 26)",
+     "SELECT COUNT(*) FROM sales WHERE NOT (age <= 已遮罩 OR age >= 已遮罩)"),
+    ("SELECT COUNT(*) FROM sales WHERE age >= 25 AND NOT age >= 26",
+     "SELECT COUNT(*) FROM sales WHERE age >= 已遮罩 AND NOT age >= 已遮罩"),
+    (f"SELECT COUNT(*) FROM sales WHERE buyer_phone >= {_PHONE} AND NOT buyer_phone >= {_NEXT}",
+     "SELECT COUNT(*) FROM sales WHERE buyer_phone >= 已遮罩 AND NOT buyer_phone >= 已遮罩"),
+    # 就是 age <> 25
+    ("SELECT COUNT(*) FROM sales WHERE age <= 24 OR age >= 26",
+     "SELECT COUNT(*) FROM sales WHERE age <= 已遮罩 OR age >= 已遮罩"),
+])
+def test_neighbouring_whole_numbers_pin_the_value_between_them(phones, sql, sealed):
+    assert inquiry_mod._scrub_sql(sql, phones, {"buyer_phone", "age"}, "sqlite") == sealed
+    assert inquiry_mod._shown_literals([(sql, "sqlite", {"buyer_phone", "age"})], phones) == set()
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT COUNT(*) FROM sales WHERE age >= 18 AND age <= 30",
+    "SELECT CASE WHEN age <= 24 THEN '24岁及以下' WHEN age >= 26 THEN '26岁及以上' END AS 年龄段, COUNT(*) AS 人数 "
+    "FROM sales GROUP BY 1",
+    "SELECT COUNT(*) FROM sales WHERE age BETWEEN 18 AND 24",
+])
+def test_ordinary_ranges_are_not_pinned_by_neighbouring_whole_numbers(phones, sql):
+    assert inquiry_mod._scrub_sql(sql, phones, {"buyer_phone", "age"}, "sqlite") == sql
+
+
+@pytest.mark.parametrize("sql, sealed", [
+    # 被更宽的范围吸收了，条件合起来不只认这一个号码，可 BETWEEN v AND v 本身就写出了它
+    (f"SELECT COUNT(*) FROM sales WHERE buyer_phone BETWEEN {_PHONE} AND {_PHONE} OR buyer_phone > 13000000000",
+     "SELECT COUNT(*) FROM sales WHERE buyer_phone BETWEEN 已遮罩 AND 已遮罩 OR buyer_phone > 13000000000"),
+    # 旁边还有矛盾的条件（谁也查不着）：两半紧挨着、隔着别的条件写都一样
+    (f"SELECT COUNT(*) FROM sales WHERE buyer_phone >= {_PHONE} AND buyer_phone <= {_PHONE} "
+     "AND buyer_phone > 13900000005",
+     "SELECT COUNT(*) FROM sales WHERE buyer_phone >= 已遮罩 AND buyer_phone <= 已遮罩 AND buyer_phone > 13900000005"),
+    (f"SELECT COUNT(*) FROM sales WHERE buyer_phone >= {_PHONE} AND buyer_phone > 13900000005 "
+     f"AND buyer_phone <= {_PHONE}",
+     "SELECT COUNT(*) FROM sales WHERE buyer_phone >= 已遮罩 AND buyer_phone > 13900000005 AND buyer_phone <= 已遮罩"),
+    # 大于或小于同一个值（就是不等于），旁边又或上一个更宽的范围
+    (f"SELECT COUNT(*) FROM sales WHERE buyer_phone > {_PHONE} OR buyer_phone > 13000000000 OR buyer_phone < {_PHONE}",
+     "SELECT COUNT(*) FROM sales WHERE buyer_phone > 已遮罩 OR buyer_phone > 13000000000 OR buyer_phone < 已遮罩"),
+])
+def test_a_range_that_names_one_value_is_a_lookup_whatever_surrounds_it(phones, sql, sealed):
+    """BETWEEN v AND v、>= v AND <= v、> v OR < v 不论整数都只认一个值：条件里哪一层这样写都算在找它，旁边的条件把它
+    吸收了、和它矛盾了也一样（规格要求这几种必须继续遮）。整数上的半开、开区间只看整个条件，和相邻的分档连成一段的
+    不算（见下面成百个分档的那条）。"""
+    assert inquiry_mod._scrub_sql(sql, phones, {"buyer_phone", "age"}, "sqlite") == sealed
+    assert _PHONE not in inquiry_mod._shown_literals([(sql, "sqlite", {"buyer_phone", "age"})], phones)
 
 
 @pytest.fixture
@@ -445,16 +625,6 @@ def test_a_threshold_stays_when_the_same_number_is_left_alone_elsewhere(ages, sq
     assert inquiry_mod._shown_literals([(sql, "sqlite", {"age"})], ages) == shown
 
 
-def test_a_masked_label_that_is_not_a_number_does_not_take_the_threshold_with_it(ages):
-    """按年龄分档算出来的标签算派生自遮罩列（已知局限），标签文字本身成了遮罩值，SQL 里照样按值换；换掉的是标签不是
-    数，阈值 30 照原样。"""
-    ages.add({"columns": ["年龄段"], "rows": [["30岁以下"], ["30岁及以上"]]}, {"年龄段"})
-    sql = "SELECT CASE WHEN age < 30 THEN '30岁以下' ELSE '30岁及以上' END AS 年龄段, COUNT(*) AS 人数 FROM sales GROUP BY 1"
-    assert inquiry_mod._scrub_sql(sql, ages, {"age", "年龄段"}, "sqlite") == (
-        "SELECT CASE WHEN age < 30 THEN '已遮罩' ELSE '已遮罩' END AS 年龄段, COUNT(*) AS 人数 FROM sales GROUP BY 1")
-    assert inquiry_mod._shown_literals([(sql, "sqlite", {"age", "年龄段"})], ages) == {"30"}
-
-
 @pytest.mark.parametrize("sql, sealed", [
     # 找某一个年龄的等值把 30 换掉了：阈值留着就把它露了
     ("SELECT COUNT(*) AS 人数 FROM sales WHERE age >= 30 AND age = 30",
@@ -463,6 +633,23 @@ def test_a_masked_label_that_is_not_a_number_does_not_take_the_threshold_with_it
      "SELECT COUNT(*) AS 人数 FROM sales WHERE age > 已遮罩 OR age IN ('已遮罩', '99')"),
 ])
 def test_a_threshold_goes_when_the_same_number_is_masked_elsewhere(ages, sql, sealed):
+    assert inquiry_mod._scrub_sql(sql, ages, {"age"}, "sqlite") == sealed
+    assert inquiry_mod._shown_literals([(sql, "sqlite", {"age"})], ages) == set()
+
+
+@pytest.mark.parametrize("sql, sealed", [
+    ("SELECT COUNT(*) AS 人数 FROM sales WHERE age = 30 AND visits >= 30",
+     "SELECT COUNT(*) AS 人数 FROM sales WHERE age = 已遮罩 AND visits >= 30"),
+    ("SELECT region FROM sales WHERE age IN (30, 31) AND visits > 30 LIMIT 31",
+     "SELECT region FROM sales WHERE age IN (已遮罩, 已遮罩) AND visits > 30 LIMIT 31"),
+    # 开区间夹住的 25 两头都换了，别的列上的 25 照原样
+    ("SELECT COUNT(*) AS 人数 FROM sales WHERE age > 24 AND age < 26 AND visits >= 25",
+     "SELECT COUNT(*) AS 人数 FROM sales WHERE age > 已遮罩 AND age < 已遮罩 AND visits >= 25"),
+])
+def test_a_short_number_masked_elsewhere_leaves_other_columns_and_limits_alone(ages, sql, sealed):
+    """同一个短的数在别处换掉了，别的列上的阈值、LIMIT 撞上它照原样（已知局限）：短的数本来就不按值遮，撞上只是巧合，
+    一律换会把阈值、行数改得面目全非（第 2 轮起「age = 25 AND amount > 25 … LIMIT 25」就照原样留着阈值和行数）。
+    正文里不免遮——反正短的数正文里也不按值遮。够长的数在别的列上照样换（visits = 20000 那条）。"""
     assert inquiry_mod._scrub_sql(sql, ages, {"age"}, "sqlite") == sealed
     assert inquiry_mod._shown_literals([(sql, "sqlite", {"age"})], ages) == set()
 
@@ -674,17 +861,62 @@ def test_sql_check_excerpts_in_the_artifact_are_masked_like_the_sql():
     """质询工件里快照记下的 SQL 检查结果：片段（sql_excerpt）摘自同一条 SQL，照查询清单的 SQL 换掉遮罩值（日期这样的
     字也认得出是在找哪一天）；给模型的那句改法（for_model）照抄了片段，不交出去（同证据面板）。"""
     secrets = secrets_of({"columns": ["birth_date"], "rows": [["1990-05-01"]]}, {"birth_date"})
+    sql = "SELECT SUM(balance) FROM customers c JOIN balances b ON b.cid = c.id WHERE birth_date = '1990-05-01'"
     message = "「客户」的业务日期按「注册日期」计，查询却按「生日」筛选"
     checks = [{"code": "wrong_date_column", "level": "warning", "table": "customers", "column": "birth_date",
                "message": message, "for_model": "这条 SQL 按 birth_date = '1990-05-01' 筛选",
                "sql_excerpt": "birth_date = '1990-05-01'"},
               {"code": "stock_summed", "level": "info", "table": "balances", "message": "存量跨日期求和",
                "sql_excerpt": "SUM(balance)"}]
-    assert inquiry_mod._masked_checks(checks, secrets, {"birth_date"}, "sqlite") == [
+    assert inquiry_mod._masked_checks(checks, sql, secrets, {"birth_date"}, "sqlite") == [
         {"code": "wrong_date_column", "level": "warning", "table": "customers", "column": "birth_date",
          "message": message, "sql_excerpt": "birth_date = '已遮罩'"},
         {"code": "stock_summed", "level": "info", "table": "balances", "message": "存量跨日期求和",
          "sql_excerpt": "SUM(balance)"}]
+
+
+@pytest.mark.parametrize("sql, excerpt, shown", [
+    # 片段只是一段表达式，单独拿出来认不出在找哪一个值：按整条 SQL 里换掉的字面量换
+    ("SELECT SUM(CASE age WHEN 25 THEN balance END) AS 余额 FROM accounts",
+     "SUM(CASE age WHEN 25 THEN balance END)", "SUM(CASE age WHEN 已遮罩 THEN balance END)"),
+    ("SELECT SUM(balance) AS 余额 FROM accounts WHERE (age, region) = (25, '华东')",
+     "(age, region) = (25, '华东')", "(age, region) = (已遮罩, '华东')"),
+    ("SELECT SUM(CASE WHEN age BETWEEN 25 AND 25 THEN balance END) AS 余额 FROM accounts",
+     "SUM(CASE WHEN age BETWEEN 25 AND 25 THEN balance END)",
+     "SUM(CASE WHEN age BETWEEN 已遮罩 AND 已遮罩 THEN balance END)"),
+    # 整条 SQL 里照原样留着的阈值，片段里也照原样
+    ("SELECT SUM(CASE WHEN amount >= 20000 THEN balance END) AS 余额 FROM accounts",
+     "SUM(CASE WHEN amount >= 20000 THEN balance END)", "SUM(CASE WHEN amount >= 20000 THEN balance END)"),
+    # 检查器截过的片段：截在号码中间，那半截按值认不出，去掉
+    ("SELECT SUM(balance) AS 余额 FROM accounts WHERE region = '华东' AND phone = '13900000001'",
+     "region = '华东' AND phone = '1390000…", "region = '华东' AND phone = …"),
+])
+def test_sql_check_excerpts_follow_what_the_whole_sql_masked(sql, excerpt, shown):
+    secrets = secrets_of({"columns": ["phone", "age", "amount"], "rows": [["13900000001", 25, 20000]]},
+                         {"phone", "age", "amount"})
+    checks = [{"code": "stock_summed", "level": "warning", "table": "accounts", "message": "存量跨日期求和",
+               "sql_excerpt": excerpt}]
+    [check] = inquiry_mod._masked_checks(checks, sql, secrets, {"phone", "age", "amount"}, "sqlite")
+    assert check["sql_excerpt"] == shown
+
+
+def test_sql_check_messages_do_not_quote_masked_values():
+    """检查结果的说明照引 SQL 里写的取值（码值表已列全时「没有码值「3」」）：整条 SQL 里换掉的取值，说明里一样换成
+    「已遮罩」，短的码值、文字码值都一样；码值表里列出的码值是数据目录写明的，照原样。"""
+    secrets = secrets_of({"columns": ["status", "channel_type"], "rows": [[3, "线下合作"], [1, "线上"]]},
+                         {"status", "channel_type"})
+    sql = ("SELECT COUNT(*) FROM visits v JOIN channels c ON c.id = v.cid WHERE status IN (3, -3) "
+           "AND channel_type = '线下合作'")
+    listed = "（数据目录中已列出的全部码值：1=有效、0=作废）。请核对筛选条件里的取值"
+    checks = [{"code": "unknown_code", "level": "warning", "table": "visits", "column": "status",
+               "message": f"「入园记录」的「检票状态」没有码值「3」、「-3」{listed}", "sql_excerpt": "status IN (3, -3)"},
+              {"code": "unknown_code", "level": "warning", "table": "channels", "column": "channel_type",
+               "message": f"「渠道」的「渠道类型」没有码值「线下合作」{listed}",
+               "sql_excerpt": "channel_type = '线下合作'"}]
+    out = inquiry_mod._masked_checks(checks, sql, secrets, {"status", "channel_type"}, "sqlite")
+    assert [c["message"] for c in out] == [f"「入园记录」的「检票状态」没有码值「已遮罩」、「-已遮罩」{listed}",
+                                           f"「渠道」的「渠道类型」没有码值「已遮罩」{listed}"]
+    assert [c["sql_excerpt"] for c in out] == ["status IN (已遮罩, -已遮罩)", "channel_type = '已遮罩'"]
 
 
 def test_report_values_that_happen_to_be_masked_values_are_shown():

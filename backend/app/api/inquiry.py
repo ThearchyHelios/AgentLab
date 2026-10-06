@@ -6,7 +6,8 @@
   查询快照（queries[].artifact）照回答时的办法遮好：遮罩列（含起了别名、套了函数的）整列遮，别的列里整格是遮罩值的
   格子也遮，masked 是有格子整格被遮掉的列名（界面把这几列整列画成「已遮罩」）；一格文字里夹着遮罩值的（备注里写着
   手机号），只把那一截换成「已遮罩」，这一列不记进 masked。content.sql 就是事件里记下的那条（遮罩值已换掉），两处
-  一字不差；content.checks（SQL 检查结果）的字段照证据面板，片段 sql_excerpt 里的遮罩值照 SQL 换掉。回答文档
+  一字不差；content.checks（SQL 检查结果）的字段照证据面板，片段 sql_excerpt、说明 message 里的遮罩值照整条 SQL
+  的换法换掉（截断处半截的值去掉）。回答文档
   （answer.doc_artifact）组装时就遮好了，原样给；回答里引用的报告指标（doc.catalog 里 m: 条目的 artifact，口径卡）
   也从这里取，界面一律按 doc.catalog[alias].artifact 取。没写进运行记录的回答（recorded 为假）在本进程里留一小时，
   这段时间里它引用的工件照样能取；之后、或者服务重启过，回 404。别的工件一律 404
