@@ -28,8 +28,9 @@
   认它带不带同名的列（_schema_tables），不知道表结构的按带得出算（多遮）。分档写在派生来源里、外层按它分组的（一档
   一行，_grouped_labels）同当分组键的 CASE 一样照常显示（_shown_labels）
 - 哪些值（_Secrets）：遮罩列里出现过的值，按值认有门槛（SECRET_MIN、SECRET_DIGITS），占位的写法（PLACEHOLDERS：未知、
-  暂无……）不收；换的时候先按词、按开头几个字筛出正文里真有的那几个值，不现编上万个分支的正则；正文、文字格、SQL 的字符串和注释里换了写法的长号码（199-1474-2785、
-  +86 …、全角数字）按纯数字写法在集合里查（loose_spans）；已经摆在读者眼前的值免遮，之后并进来的照样免（protected）
+  暂无……）不收；换的时候先按词、按开头几个字筛出正文里真有的那几个值，不现编上万个分支的正则；正文、文字格、SQL 的
+  字符串和注释里换了写法的长号码（199-1474-2785、+86 …、全角数字）按纯数字写法在集合里查（loose_spans）；已经摆在
+  读者眼前的值免遮，之后并进来的照样免（protected）
 - 快照遮好的样子（_masked_view），回答时才认得出、事后要照位置重放的地方（view_edits、replay_edits）
 - 一次核查里认出的遮罩值（SeenValues）：调用方交进来的和 agent 查询时遮掉的分开记，合起来时 agent 查到的在前
 
@@ -1263,9 +1264,9 @@ def _visible_sources(select: Any, node: Any) -> list[tuple[str, Any]]:
     from sqlglot import exp
 
     sources = _from_sources(select)
-    child = node
+    child, below = node, None
     while child.parent is not None and child.parent is not select:
-        child = child.parent
+        child, below = child.parent, child
     if child.parent is not select:
         return sources
     if isinstance(child, exp.From):
@@ -1273,7 +1274,10 @@ def _visible_sources(select: Any, node: Any) -> list[tuple[str, Any]]:
     if isinstance(child, exp.Join):
         joins = list(select.args.get("joins") or [])
         at = next((i for i, join in enumerate(joins) if join is child), None)
-        return sources[:1 + at] if at is not None else sources
+        if at is None:
+            return sources
+        # 在连接的来源本身里（LATERAL）只看得见前面的；在 ON 条件里连它自己也看得见
+        return sources[:1 + at] if below is child.this else sources[:2 + at]
     return sources
 
 
@@ -2403,8 +2407,9 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
 
     - 整列遮：列名直接对上遮罩列的，加上按 SQL 认出值取自遮罩列的（_derived_hidden：别名、函数、子查询、WITH、
       SELECT *（展开的列换了名字的也算）、表值函数、整行引用和函数参数里的 *、列名表、TABLE x；COUNT、只在条件里用到、
-      分档当分组键的不算）；SQL 解析不了、又写着遮罩列（或者 *、TABLE x）的，整份结果的列都遮。这几列的格子换成
-      「已遮罩」，类型记成文本
+      分档当分组键的不算，分档写在派生来源里、外层按它分组的也不算）；认不全的（SQL 解析不了又写着遮罩列、*、TABLE x，
+      (表达式).* 读到遮罩列，表名、SQL 写在字符串里交给函数，分析出意外、超出工作量上限）整份结果的列都遮。这几列的
+      格子换成「已遮罩」，类型记成文本
     - 别的列按值换，只换文字格：整格就是遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，
       _Secrets.loose_spans），换过的格子记下来（QueryMask.cells）。遮罩值是这份结果里的加上 known：先查号码、再查写着
       号码的备注、没设遮罩的联系方式表（别的库里的也一样）时，后一份同样遮好。门槛同按值遮（SECRET_DIGITS、SECRET_MIN）；
