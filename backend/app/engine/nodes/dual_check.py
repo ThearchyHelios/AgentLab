@@ -13,6 +13,11 @@
 连取值也不给；遮罩列不给。计算式只有一项来自查询、或者写了口径说明时不给列名；几项都来自查询又没写口径说明的，列名
 里看不出日期、口径的取舍时才给，好让它分得清哪一项是哪一项。
 
+**遮罩列上的输入不复算。** cell() 取自遮罩列的输入不能单独复算；别的输入（计算式里写成当时代进去的值）里按位置取自
+查询结果的一格（vars.res.rows[0][2]），顺着取值链认出它取自哪份快照的哪一列（recompute.input_origin，证据面板、推演、
+可验证报告同一个认法），按需算那份快照要遮的列（和证据面板同一套，见 _Sources.hidden）——它不一定是 cell() 用到的
+那几份。取自遮罩列、遮没遮核对不了的，整个指标按无法复算记：遮罩值不能当字面量写进交给盲算的计算式。
+
 **一致就放行，不一致交给人。** 不一致时逐个对不上的输入说清两条 SQL 差在哪（data/sql_semantics.explain_sql_diff）：
 两边先收窄到这一格（只留算出这一列的那一项；分组的按这一行的分组值改成等值条件，HAVING 一并去掉），一条查询算好几列、
 分组后取一行时才不会混进「选出的列」「分组」这类和这一格无关的差别。分组的列设了遮罩时不收窄：这一行的分组值写进
@@ -326,11 +331,13 @@ def _skipped(ctx: NodeContext, reason: str) -> dict[str, Any]:
 
 
 class _Sources:
-    """一次复算里要读的查询快照和数据源：同一份只读一次。"""
+    """一次复算里要读的查询快照、数据源和快照要遮的列：同一份只读一次、只算一次。"""
 
     def __init__(self) -> None:
         self.snapshots: dict[str, tuple[Any, str | None]] = {}
         self.rows: dict[str, DataSource | None] = {}
+        self.masks: dict[tuple[str, str | None], frozenset[str]] = {}
+        self._source_masks: Any = None
 
     def snapshot(self, artifact: str) -> tuple[dict[str, Any] | None, str | None]:
         if artifact not in self.snapshots:
@@ -351,18 +358,25 @@ class _Sources:
                     select(DataSource).where(DataSource.name == name))).scalar_one_or_none()
         return self.rows[name]
 
-    async def hidden(self, artifact: str) -> frozenset[str]:
-        """这份快照要遮的列（小写）：查询当时记下的，加上数据源现在设的。宁可多遮。"""
-        from app.data.engine import masked_columns
+    async def hidden(self, artifact: str, source: str | None = None) -> frozenset[str]:
+        """这份快照要遮的列（小写），和证据面板同一套（api/evidence.py 的 _InputMasks._hidden）：查询当时记下的，加上
+        数据源现在设的；合并查询按它合并的那几个数据源算，换了名字的结果列按来历遮。快照读不出来时按 source（取值链上
+        那份结果里带着的数据源名）现在设的算：遮罩不能因为快照坏了就失效。宁可多遮。"""
+        from app.api.evidence import _Masks, _merge_masks, _recorded_masks   # api.evidence 导入了 engine 里的模块
+        from app.engine.merge_query import MERGE_SOURCE
 
-        snap, _ = self.snapshot(artifact)
-        recorded = (snap or {}).get("mask_columns")
-        out = {c.lower() for c in recorded if isinstance(c, str)} if isinstance(recorded, list) else set()
-        name = (snap or {}).get("source")
-        if isinstance(name, str) and name:
-            row = await self.source(name)
-            out |= {c.lower() for c in masked_columns(row.options if row is not None else None)}
-        return frozenset(out)
+        key = (artifact, source)
+        if key not in self.masks:
+            if self._source_masks is None:
+                self._source_masks = _Masks()
+            snap, _ = self.snapshot(artifact)
+            if snap is not None and snap.get("source") == MERGE_SOURCE:
+                hidden, _ = await _merge_masks(snap, self._source_masks)
+            else:
+                current, _ = await self._source_masks.of((snap or {}).get("source") or source)
+                hidden = set(current) | (_recorded_masks(snap) if snap is not None else set())
+            self.masks[key] = frozenset(hidden)
+        return self.masks[key]
 
 
 def _loader(state: GraphState) -> tuple[Callable[[str], Any], dict[str, str]]:
@@ -461,6 +475,8 @@ async def _plan_metric(state: GraphState, metric: dict[str, Any], options: _Opti
     problem: str | None = None
     for item in metric.get("inputs") or []:
         if not _from_query(item):
+            if isinstance(item, dict):
+                problem = problem or await _positional_masks(item, sources, load, outputs, masks)
             continue
         info, why = await _query_input(item, sources, aliases, tops)
         masks[item["artifact"]] = await sources.hidden(item["artifact"])
@@ -493,6 +509,30 @@ async def _plan_metric(state: GraphState, metric: dict[str, Any], options: _Opti
             "source": inp["source"], "dims": _dims(snap or {}, inp["row"], inp["column"], hidden),
         }
     return row, jobs
+
+
+async def _positional_masks(item: dict[str, Any], sources: _Sources, load: Callable[[str], Any],
+                            outputs: dict[str, str], masks: dict[str, frozenset[str]]) -> str | None:
+    """不是 cell()、Agent 字段的输入里，按位置取自一份查询结果的一格（vars.res.rows[0][2]）：认出它取自哪份快照的哪一列
+    （recompute.input_origin，证据面板、推演、可验证报告同一个认法），把那份快照要遮的列记进 masks，重算的预检据此认出它
+    取自遮罩列、按遮罩说（同一份快照上的那种一样）。只算 cell() 用到的几份快照时，这一格落在另一份快照上就认不出，遮罩值
+    会当字面量写进交给盲算的计算式。
+
+    那份快照读不出来、数据源现在设的遮罩又没遮这一列时，查询当时记下的遮罩无从核对：交回原因，按无法复算记，宁可多遮。
+    取值链上的产出读不出来、那份结果没存快照的（遮没遮核对不了），重算的预检自己会拦下，这里不管。"""
+    def output(node_id: Any) -> Any:
+        key = outputs.get(str(node_id or ""))
+        return load(key) if key else None
+
+    origin = recompute.input_origin(item, output)
+    if origin is None or origin.unverified is not None or not origin.artifact:
+        return None
+    hidden = await sources.hidden(origin.artifact, origin.source)
+    masks[origin.artifact] = hidden
+    if any(c.lower() in hidden for c in origin.columns):
+        return None
+    _, why = sources.snapshot(origin.artifact)
+    return f"输入 {item.get('path')} 所在的{why}，核对不了这一格是否取自设置了遮罩的列" if why else None
 
 
 async def _query_input(item: dict[str, Any], sources: _Sources, aliases: dict[str, str], tops: list[str]

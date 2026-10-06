@@ -7,13 +7,13 @@
 - 不一致：挂起，审批 payload 和对照工件按约定，payload 另带实际生效的 on_reject、摘要里每个指标带选 a、选 b 各会往
   数据目录里写什么的预告；a / b / neither 三种选择的产出和缺口，没选的照实记，驳回、on_reject 为 fail 时失败
 - 差异说明只比这一格所在的那一列（一条查询算好几列、分组后取一行的，收窄了再比，HAVING 一并去掉）；分组的列设了
-  遮罩时（改了名再分组的也算）不收窄，遮罩列的取值不进审批卡、对照工件、产出和事件
+  遮罩时（改了名再分组的也算）不收窄、照整条比，遮罩列的取值不进审批卡、对照工件、产出和事件
 - 只差一个方面时写数据目录（业务日期、有效记录条件），差了不止一处不写，人工确认过的不同说法不覆盖，指标自己的
   筛选范围（取值在运行输入里、用到分组的列）不写，两条 SQL 规范化后一致的不写；人工驳回过的条件不会借着和别的
-  指标并成一项写回去，真写的和审批卡上的预告一致
+  指标并成一项写回去，真写的和审批卡上的预告一致；时间列在表结构里声明成文本的不记成业务日期，预告照实说
 - 全局关闭直通、节点覆盖；设置按发起时的快照；重放时盲算不再执行、事件不重复；报告的写作目录不含盲算的查询
 - 触顶、分组结果的维度（只给取值、遮罩列不给）、带着取舍的列名不交给盲算、两个指标用到同一格只盲算一次、遮罩列上的
-  盲算结果不采用
+  盲算结果不采用；按位置取自另一份快照遮罩列的输入（cell() 取 A、vars.res.rows[0][0] 取 B）按无法复算记，不盲算
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent, Setting
 from app.engine import spend
 from app.engine.launch import launch_run
+from app.engine.nodes.dual_check import GAP_UNCHECKED
 from app.engine.runner import run_manager
 from app.main import app
 from tests.fixtures.dual_check_shop import (
@@ -567,6 +568,37 @@ async def test_the_same_choice_twice_writes_the_catalog_once(monkeypatch, shop, 
 # --------------------------------------------------------------------------
 
 
+@pytest.fixture
+async def text_dated_shop(tmp_path):
+    """同一个库，只是下单日、支付日两列声明成文本（SQLite 常这样存日期）。"""
+    name, source_id = await add_source(build(tmp_path / "text_dated.db", date_type="TEXT"))
+    yield name, source_id
+    await drop_source(source_id)
+
+
+async def test_time_columns_declared_as_text_are_not_written_as_the_business_date(monkeypatch, text_dated_shop, client):
+    """两边按不同的列筛时间，可这两列在表结构里声明成文本：认不准存的是不是日期，选哪边都不记成业务日期。审批卡上的
+    预告照实说（认不出可记的事实，不带写到哪），裁决后时间线上跳过的原因和预告一字不差。声明成 DATE 的同一个库照常记
+    （test_choosing_the_blind_result_degrades_and_writes_the_catalog）。"""
+    name, source_id = text_dated_shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    run = await start(graph(name, BY_ORDER_DATE))
+    assert run.status == "interrupted", run.error
+    [item] = (await pending(run.id)).payload["summary"]
+    assert len(item["diff"]) == 1 and "order_date" in item["diff"][0] and "paid_date" in item["diff"][0]
+    said = item["catalog"]
+    # 两列都是文本：各说被采纳的那一边的列
+    for side, label, column in (("a", "原流程", "order_date"), ("b", "盲算", "paid_date")):
+        assert set(said[side]) == {"write", "reason"} and said[side]["write"] is False, said[side]
+        assert f"{label}按时间筛的列「orders.{column}」在表结构里声明为 TEXT，无法确认是日期 / 时间类型" \
+            in said[side]["reason"]
+    done = await decide(client, run.id, {"gmv": "b"})
+    assert done.status == "succeeded", done.error
+    [wrote] = logs(await events(run.id), "dual_check_catalog")
+    assert wrote["written"] == [] and [s["reason"] for s in wrote["skipped"]] == [said["b"]["reason"]]
+    assert await notes_of(source_id) is None
+
+
 async def test_a_refund_filter_becomes_the_valid_row_filter(monkeypatch, shop, client):
     name, source_id = shop
     Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
@@ -969,42 +1001,60 @@ async def test_masked_group_columns_are_not_shown_to_the_blind_agent(monkeypatch
 
 async def test_masked_group_values_stay_out_of_the_card_and_the_catalog_log(monkeypatch, masked_shop, client):
     """原流程按遮罩列（region）分组、口径卡取华东那一行：差异说明收窄到这一行时，不能拿这一行的分组值补等值条件——
-    那样「region = '华东'」就进了审批卡、对照工件、事件和目录日志。遮罩的分组列上不收窄，照整条比。"""
+    那样「region = '华东'」就进了审批卡、对照工件、事件和目录日志。遮罩的分组列上不收窄，照整条比。
+
+    盲算没分组、按下单日筛：收窄了的话，两边差在时间列和原流程多出来的「region = '华东'」，说明和对照里都带着这个取值；
+    照整条比，时间列照样说得出，原流程的分组、多选的列归纳不了（_compared_whole）。"""
     name, _ = masked_shop
     first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
-    Blind(monkeypatch, name, {"首组销售额": (RIGHT, "gmv")})
+    Blind(monkeypatch, name, {"首组销售额": (BY_ORDER_DATE, "gmv")})
     run = await start(graph(name, BY_REGION, metrics=[first], dual={"definitions": {}}))
     assert run.status == "interrupted", run.error
     payload = (await pending(run.id)).payload
+    [item] = payload["summary"]
+    assert item["original_rendered"].startswith("300") and item["blind_rendered"].startswith("310")
     card = artifact_store.load(payload["card_artifact"])
     done = await decide(client, run.id, {"first": "a"})
     assert done.status == "succeeded", done.error
     evs = await events(run.id)
     _no_masked_value(payload, card, done, evs)
-    # 照整条比：原流程分组、盲算没分组都列出来，不止差一个方面，选了也不写目录
-    assert len(payload["summary"][0]["diff"]) > 1
+    _compared_whole(payload, card)
+    # 差异说明里有未能归纳的部分：选了也不写目录
     [wrote] = logs(evs, "dual_check_catalog")
     assert wrote["written"] == [] and "不止差一个方面" in wrote["skipped"][0]["reason"]
 
 
 async def test_a_renamed_masked_group_column_is_not_narrowed_either(monkeypatch, masked_shop, client):
     """原流程把遮罩列改了名再分组（region AS area）：结果列名 area 不在遮罩里，分组值却还是 region 的取值。收窄时看的
-    是分组键用到的列，一样不拿这一行的分组值补等值条件，「华东」不进审批卡、对照工件、产出和事件。"""
+    是分组键用到的列，一样不拿这一行的分组值补等值条件，「华东」不进审批卡、对照工件、产出和事件，照整条比。"""
     name, _ = masked_shop
     renamed = (f"SELECT region AS area, SUM(amount) AS gmv FROM orders WHERE status <> 'refunded' "
                f"AND paid_date {WEEK} GROUP BY region ORDER BY region")
     first = {**GMV, "id": "first", "name": "首组销售额", "expression": "cell(nodes.fetch, 0, 'gmv')"}
-    Blind(monkeypatch, name, {"首组销售额": (RIGHT, "gmv")})
+    Blind(monkeypatch, name, {"首组销售额": (BY_ORDER_DATE, "gmv")})
     run = await start(graph(name, renamed, metrics=[first], dual={"definitions": {}}))
     assert run.status == "interrupted", run.error
     payload = (await pending(run.id)).payload
-    assert payload["summary"][0]["original_rendered"].startswith("300")
+    [item] = payload["summary"]
+    assert item["original_rendered"].startswith("300") and item["blind_rendered"].startswith("310")
     card = artifact_store.load(payload["card_artifact"])
     done = await decide(client, run.id, {"first": "a"})
     assert done.status == "succeeded", done.error
     _no_masked_value(payload, card, done, await events(run.id))
-    # 照整条比：原流程分组、盲算没分组都列出来
-    assert len(payload["summary"][0]["diff"]) > 1
+    _compared_whole(payload, card)
+
+
+def _compared_whole(payload: dict, card: dict) -> None:
+    """差异说明照整条比的痕迹（原流程按地区分组取一行，盲算没分组、按下单日筛）：时间列照样说得出；原流程的分组、多选的
+    地区列归纳不了，另起一条「另有未能归纳的差异」；规范化后的对照里还留着原流程的 GROUP BY。收窄了的话分组去掉、换成
+    等值条件，两边都是简单形状，说明里就是时间列和多出来的那个条件，这几样都不会有。"""
+    [metric] = card["metrics"]
+    diff = metric["diff"]
+    assert [i["aspect"] for i in diff["items"]] == ["time", "other"], diff["items"]
+    assert diff["fallback"] is True and any("GROUP BY" in line for line in diff["text_diff"]), diff["text_diff"]
+    [item] = payload["summary"]
+    assert len(item["diff"]) == 2 and "order_date" in item["diff"][0] and "另有未能归纳的差异" in item["diff"][1], item
+    assert item["fallback"] is False
 
 
 async def test_a_masked_group_column_of_the_blind_query_is_not_narrowed_either(monkeypatch, masked_shop, client):
@@ -1019,6 +1069,81 @@ async def test_a_masked_group_column_of_the_blind_query_is_not_narrowed_either(m
     done = await decide(client, run.id, {"gmv": "b"})
     assert done.status == "succeeded", done.error
     _no_masked_value(payload, card, done, await events(run.id))
+
+
+#: 销售额（第一份快照的一格）加上首组地区名的字数（第二份快照按位置取的一格）
+MIX = {"id": "mix", "name": "销售额加首组名称字数", "unit": "元", "decimals": 1, "format": "thousands",
+       "expression": "cell(nodes.fetch, 0, 'gmv') + len(vars.res.rows[0][0])"}
+
+
+def with_regions(spec: dict, source: str) -> dict:
+    """取数之后另查一次按地区分组的结果（第二份快照），数据整形把它解析进 vars.res：口径卡按位置取它的格。"""
+    nodes = list(spec["nodes"])
+    at = next(i for i, n in enumerate(nodes) if n["id"] == "fetch") + 1
+    nodes[at:at] = [node("regions", "tool", tool=f"db_query__{source}", args={"sql": BY_REGION}),
+                    node("parse", "transform", mode="json", template="{{ nodes.regions }}", assign_to="res")]
+    return {"nodes": nodes, "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}
+
+
+async def test_a_masked_cell_read_by_position_from_another_snapshot_is_not_blind_computed(monkeypatch, masked_shop):
+    """口径卡上一个指标：cell() 取第一次查询（A，不碰遮罩列）的销售额，另按位置取第二次查询（B，按遮罩列 region 分组）的
+    首组名称（vars.res.rows[0][0]）。B 不是 cell() 用到的快照：以前预检只为 A 算遮罩，认不出按位置取的那一格在遮罩列上，
+    指标照常盲算，「华东」作为字面量写进了交给盲算模型的计算式。现在按需算 B 的遮罩：这个指标按无法复算记缺口、不盲算，
+    遮罩列的取值不进盲算的任务、节点产出和节点发的事件。"""
+    name, _ = masked_shop
+    blind = Blind(monkeypatch, name, {"销售额加首组名称字数": (RIGHT, "gmv")})
+    run = await start(with_regions(graph(name, RIGHT, metrics=[MIX], dual={"definitions": {}}), name))
+    assert run.status == "succeeded", run.error
+    evs = await events(run.id)
+    out = dual_output(run, evs)
+    [row] = out["metrics"]
+    assert row["metric_id"] == "mix" and row["status"] == "unchecked", row
+    assert "遮罩" in row["reason"] and "推演" not in row["reason"], row["reason"]
+    assert out["status"] == "unchecked" and out["issuance_gaps"] == [GAP_UNCHECKED.format(name=MIX["name"],
+                                                                                          reason=row["reason"])]
+    assert blind.tasks == [] and blind.runs == 0, blind.tasks
+    assert "华东" not in json.dumps(out, ensure_ascii=False)
+    assert not [e.type for e in evs if e.node_id == "dual" and not e.type.startswith(("tool.", "llm."))
+                and "华东" in json.dumps(e.data, ensure_ascii=False)]
+
+
+async def test_an_unmasked_cell_read_by_position_from_another_snapshot_is_blind_computed(monkeypatch, shop):
+    """同样的图、数据源没设遮罩：预检照常通过，指标进入盲算（按位置取的那一格作为字面量写进计算式），两边一致。拦下上面
+    那个指标的确实是遮罩。"""
+    name, _ = shop
+    blind = Blind(monkeypatch, name, {"销售额加首组名称字数": (RIGHT, "gmv")})
+    run = await start(with_regions(graph(name, RIGHT, metrics=[MIX], dual={"definitions": {}}), name))
+    assert run.status == "succeeded", run.error
+    out = dual_output(run, await events(run.id))
+    assert out["status"] == "agreed" and out["metrics"][0]["status"] == "agreed", out
+    [task] = blind.tasks
+    assert "len('华东')" in task
+
+
+#: 按位置取的那一格：数据整形解析好的第二份查询结果（首组地区名），快照 id 是编的
+POSITIONAL = {"path": "vars.res.rows[0][0]", "value": "华东", "node_id": "parse", "via": "transform", "status": "ok"}
+LOST = "cd" * 32
+
+
+def parsed_regions(source: str) -> dict:
+    return {"columns": ["region", "gmv"], "rows": [["华东", 300.0], ["华北", 30.0]], "artifact": LOST, "source": source}
+
+
+async def test_a_cell_read_by_position_from_an_unreadable_snapshot_is_not_trusted(masked_shop):
+    """按位置取的那一格所在的快照读不出来（被改过、文件不在了）：查询当时记下的遮罩无从核对。数据源现在设的遮罩遮着这一列
+    的，照遮罩算（交给重算的预检按遮罩说）；没遮的也不当成没遮，按无法复算记、原因说清。"""
+    from app.engine.nodes.dual_check import _positional_masks, _Sources
+
+    name, _ = masked_shop
+    for source, expected in ((name, None), ("dc_no_such_source", "输入 vars.res.rows[0][0] 所在的查询快照与哈希不一致，"
+                                                                "疑似被修改，核对不了这一格是否取自设置了遮罩的列")):
+        sources = _Sources()
+        sources.snapshots[LOST] = (None, "查询快照与哈希不一致，疑似被修改")
+        masks: dict = {}
+        state = {"state:parse": parsed_regions(source)}
+        why = await _positional_masks(POSITIONAL, sources, state.get, {"parse": "state:parse"}, masks)
+        assert why == expected, source
+        assert ("region" in masks[LOST]) is (source == name), masks
 
 
 def _no_masked_value(payload: dict, card: dict, done: Run, evs: list[RunEvent], value: str = "华东") -> None:
