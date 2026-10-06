@@ -14,7 +14,7 @@ import json
 import pytest
 
 from app.core import artifact_store
-from tests.test_inquiry_api import (  # noqa: F401 - engine_up 是自动用上的夹具，client、big_shop 是夹具
+from tests.test_inquiry_api import (  # noqa: F401 - engine_up 是自动用上的夹具，client、big_shop、masked_shop 是夹具
     AMOUNTS,
     Models,
     Play,
@@ -24,8 +24,11 @@ from tests.test_inquiry_api import (  # noqa: F401 - engine_up 是自动用上�
     engine_up,
     events,
     fetching,
+    masked_shop,
     pause,
     pending,
+    report_doc,
+    unit_of,
 )
 
 BAND = "CASE WHEN amount >= 20000 THEN '大单' ELSE '小单' END"
@@ -61,3 +64,27 @@ async def test_a_band_grouped_outside_its_derived_source_reads_as_written(monkey
     got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
     assert got.status_code == 200, got.text
     assert (got.json()["content"]["rows"], got.json()["masked"]) == ([["大单", 3], ["小单", 2]], [])
+
+
+#: 报告取数：手机号改了名字选出来，按号码排序时把号码写进了 SQL
+RENAMED = "SELECT buyer_phone AS 手机号, amount AS 金额 FROM sales ORDER BY buyer_phone = '13900000001' DESC, amount DESC"
+
+
+async def test_the_excerpt_in_the_task_is_masked_before_the_agent_sees_it(monkeypatch, masked_shop, client):
+    """针对「金额最高的一笔 1,200。」发起质询：任务里这句挂的证据摘录不给改了名字的遮罩列（手机号），SQL 里写着的号码
+    换成「已遮罩」，金额照常。以前「列：金额 | 手机号」「r0：1,200 | 13900000001」…，四个号码都在。"""
+    models = Models(monkeypatch, masked_shop, writer="金额最高的一笔 [[v:Q1.r0.金额]]。[[see:Q1]]",
+                    plays={"这笔是谁买的": Play(["SELECT COUNT(*) AS 笔数 FROM sales"], "共 [[v:Q1.r0.笔数]] 笔。[[see:Q1]]")})
+    paused = await pause(masked_shop, graph=fetching(masked_shop, RENAMED))
+    [approval] = await pending(paused.id)
+    doc = await report_doc(paused.id)
+    r = await ask(client, paused.id, report="write", unit=unit_of(doc, "金额最高的一笔 1,200。"),
+                  question="这笔是谁买的？", approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    [task] = models.tasks
+    excerpt = task[task.index("【原报告 Q1】"):]
+    assert "1390000000" not in task, excerpt
+    columns = next(line for line in excerpt.splitlines() if line.startswith("列："))
+    assert "手机号" not in columns and "金额" in columns
+    assert "buyer_phone = '已遮罩'" in excerpt and "（有的列按数据源的设置遮罩了，没有给出）" in excerpt
+    assert r.json()["inquiry"]["answer"]["ok"] is True

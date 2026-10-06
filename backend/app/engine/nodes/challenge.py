@@ -11,9 +11,10 @@
    的 Q1 分开），要它先想清楚「如果这句不成立，数据里会看到什么」，写只读查询去找，最后交结论（经受住 / 被削弱 /
    被推翻 / 无法判断）和理由。理由里的数字只能引用它自己查询的格子，裸数字由 compose_doc 标出来。
    遮罩：agent 的查询结果在工具边界就遮好了；这份报告引用的查询快照里的遮罩值（按 SQL 认出改了名字的遮罩列，同审批
-   质询）反查之前就交给查询工具，agent 查到写着同一个号码的别的表时也看不到。摘录按列名遮，改了名字的遮罩列原值
-   agent 看得到，会照着写进理由：理由正文和理由文档按值换成「已遮罩」（换了写法的号码也认），这句结论原文里写着的
-   不换（_masked_rationale）
+   质询）反查之前就交给查询工具，agent 查到写着同一个号码的别的表时也看不到。任务里的证据摘录先遮：遮罩列、按 SQL
+   认出改了名字的遮罩列（buyer_phone AS 手机号）不给，别的列、SQL 里写着的遮罩值按值换（_task）。理由正文和理由文档
+   仍按值换成「已遮罩」（换了写法的号码也认，agent 查询时遮掉的值也算），这句结论原文里写着的不换（_masked_rationale）；
+   换完还认得出的，这句记为无法判断、理由不记（_kept，同审批质询的最后一道关）
 3. 出处：一条查询都没执行成功的，判什么都记为无法判断；判「被推翻」的，理由里还得引用到自己的查询结果——它要让
    正式出具降档，审稿记录里得查得到凭什么。不采信时系统写明原因，反方原本的结论和理由照录在后面（纯文字：解析
    不了的引用写成「（引用无效）」，裸数字注明「（无出处）」）。这句该查的数据源都不存在或已停用、核查模型本身用
@@ -49,6 +50,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import replace
@@ -76,8 +79,12 @@ from app.engine.state import GraphState
 from app.engine.verify_agent import RATIONALE, VerifyOutcome, run_verify_agent
 from app.tools.datasource import run_versions
 
+logger = logging.getLogger(__name__)
+
 #: 四种结论：经受住 / 被削弱 / 被推翻 / 无法判断。counts 的键照这个顺序
 VERDICTS = ("stands", "weakened", "refuted", "inconclusive")
+#: 理由按值遮之后还认得出遮罩值时，这句的理由换成这段系统说明（_kept）
+LEAKED = "反方的理由里有设置了遮罩的值，无法遮住，这句的结论不予采信，记为无法判断"
 #: 节点产出、审批卡里最多列几句（审稿记录里一句不少）
 ITEMS_MAX = 10
 #: 出具缺口、报错里最多点几句的原文，每句最多几个字
@@ -378,6 +385,12 @@ def _claim_of(cand: judging.Candidate, outcome: VerifyOutcome) -> tuple[dict[str
     return _claim(cand, verdict, rationale, doc=outcome.rationale, queries=outcome.queries, usage=outcome.usage), None
 
 
+def _scrubbed_excerpt(text: str, known: Any) -> str:
+    """证据摘录里的遮罩值换成「已遮罩」：别的列、SQL 里写着的（换了写法的号码也认），交给核查 agent 之前就换掉。值是
+    报告快照里的遮罩值去掉这句结论原文里写着的（_spared），同交给查询工具的那一份。"""
+    return known.scrub(text, loose=True) if known is not None and known.strong else text
+
+
 def _spared(seed: Any, claim: str) -> Any:
     """报告快照里的遮罩值（seed）去掉这句结论原文里写着的，交给这一句的反查。seed 本身不动（下一句另算）。"""
     known = seed.copy()
@@ -391,7 +404,7 @@ def _masked_rationale(outcome: VerifyOutcome, secrets: Any, *, given: Iterable[s
     原文里写着的（given）已经摆在读者眼前，不换。反方 agent 的查询结果在工具边界就遮好了，可证据摘录按列名遮，改了名字
     的遮罩列（buyer_phone AS 手机号）的原值它看得到，会写进理由。
     换的办法同审批质询的回答（_scrubbed_source）：原文里的值先换掉，再照原来的目录重新组装理由文档；引用到的格子按
-    遮好的快照渲染（文字格里夹着的遮罩值换掉那一截）。理由里认不出遮罩值的原样交回。"""
+    遮好的快照渲染（文字格里夹着的遮罩值换掉那一截）。理由里认不出遮罩值的原样交回。换完还认得出的过最后一道关（_kept）。"""
     from app.engine.evidence import compose_doc
     from app.engine.masking import _masked_view, _scrubbed_source, _Secrets
 
@@ -406,7 +419,7 @@ def _masked_rationale(outcome: VerifyOutcome, secrets: Any, *, given: Iterable[s
     pool.prepare()
     source = str(doc.get("source") or "")
     if not (pool.spans(str(doc.get("markdown") or ""), prose=True) or pool.spans(source, prose=True)):
-        return outcome
+        return _kept(outcome, pool)
     views: dict[str, Any] = {}
     fetch = _fetcher()
     for query in outcome.queries:
@@ -422,8 +435,23 @@ def _masked_rationale(outcome: VerifyOutcome, secrets: Any, *, given: Iterable[s
     except Exception:  # noqa: BLE001 - 重新组装出了意外，值也不能留着
         # 正文按值换掉，理由文档不要了（界面照正文显示；判「被推翻」的因此查不到出处，按无法判断记）
         said = pool.scrub(str(doc.get("markdown") or ""), prose=True)
-        return replace(outcome, rationale=None, result={**result, RATIONALE: said})
-    return replace(outcome, rationale=again, result={**result, RATIONALE: again["markdown"]})
+        return _kept(replace(outcome, rationale=None, result={**result, RATIONALE: said}), pool)
+    return _kept(replace(outcome, rationale=again, result={**result, RATIONALE: again["markdown"]}), pool)
+
+
+def _kept(outcome: VerifyOutcome, pool: Any) -> VerifyOutcome:
+    """最后一道关（同审批质询的 _leaked）：按值遮之后，理由正文、理由文档（正文、原文、目录里的列名）里还认得出遮罩值的
+    （换了写法的号码也算），这句的结论不采信、理由不记：记为无法判断，理由换成系统的说明（LEAKED）。遮不住的「被推翻」
+    不能让出具降档，也不能把号码存进审稿记录、随运行封存。"""
+    doc = outcome.rationale if isinstance(outcome.rationale, dict) else {}
+    texts = [str((outcome.result or {}).get(RATIONALE) or ""), str(doc.get("markdown") or ""),
+             str(doc.get("source") or ""),
+             json.dumps(doc.get("catalog") or {}, ensure_ascii=False, default=str)]
+    if not any(pool.spans(text, prose=True) for text in texts):
+        return outcome
+    logger.warning("反方审稿的理由里有遮罩值遮不住，这句记为无法判断（运行 %s）", doc.get("run_id"))
+    return replace(outcome, rationale=None, result={**(outcome.result or {}), "verdict": "inconclusive",
+                                                    RATIONALE: LEAKED})
 
 
 def _cites(doc: dict[str, Any] | None) -> bool:
@@ -573,6 +601,8 @@ class _Review:
             max_claims, max_queries, timeout_s, daily_max_usd
         self.spec, self.masks, self.writer_model = spec, masks, writer_model
         self.fetch = _fetcher()
+        #: 报告用到的数据源的类型（摘录按 SQL 认改了名字的遮罩列时按它的方言解析）。run() 里查好
+        self.kinds: dict[str, Any] = {}
         #: 这一段执行的总时长（engine/deadline.py）：有句子的时长按剩余时间收紧过、或者不再开始时记下，说明和日志里写
         self.run_seconds: float | None = None
         #: 这份报告目录里的查询编号：摘录里指向它们的写法标上「原报告」（mark_original）
@@ -597,13 +627,20 @@ class _Review:
         """当天的核查金额用完、这句一次模型都没调用时的理由：派出去就撞上的和后面不再派出的，是同一回事。"""
         return f"已达上限（{self._limit_words('daily_max_usd')}），这句未反查"
 
-    def _task(self, cand: judging.Candidate, sources: list[str], lost: list[str], *, own: bool) -> str:
-        """交给核查 agent 的任务：这句结论、它挂的证据摘录（遮罩照旧，原报告的编号标明，见 mark_original）、可以查的
-        数据源；该查的源有停用了的，也告诉它查不了哪几个，免得它把查不到当成没有反例。own：源是这句自己引用的，
-        不是没挂依据、按整份报告用到的源查的。"""
-        request = judging.prepare(self.doc, self.catalog, units=[cand.unit], loader=self.fetch, masked=self.masks)
+    def _task(self, cand: judging.Candidate, sources: list[str], lost: list[str], *, own: bool,
+              known: Any = None) -> str:
+        """交给核查 agent 的任务：这句结论、它挂的证据摘录（原报告的编号标明，见 mark_original）、可以查的数据源；该查的
+        源有停用了的，也告诉它查不了哪几个，免得它把查不到当成没有反例。own：源是这句自己引用的，不是没挂依据、按整份
+        报告用到的源查的。
+        摘录先遮，模型从任务里也看不到遮罩值：遮罩列不给，改了名字的（buyer_phone AS 手机号）按 SQL 认出来也不给
+        （judge.prepare 的 kinds，和工具边界同一套规则）；别的列、SQL 里写着的遮罩值按值换成「已遮罩」，换了写法的号码
+        也认（known：报告快照里的遮罩值去掉这句结论原文里写着的，同交给查询工具的那一份）。解析 SQL、按值换是纯计算，
+        在线程里做。"""
+        request = judging.prepare(self.doc, self.catalog, units=[cand.unit], loader=self.fetch, masked=self.masks,
+                                  kinds=self.kinds)
         aliases = dict.fromkeys(a for c in request.cands for a in c.aliases if a in request.excerpts)
-        evidence = "\n\n".join(mark_original(request.excerpts[a], a, self.queries) for a in aliases)
+        evidence = "\n\n".join(mark_original(_scrubbed_excerpt(request.excerpts[a], known), a, self.queries)
+                                 for a in aliases)
         gone = f"（{'这句还引用了' if own else '这份报告还用到了'}{_quoted(lost)}，已不存在或已停用，无法查询）" \
             if lost else ""
         return CHALLENGE_TASK_PROMPT.format(
@@ -620,6 +657,7 @@ class _Review:
         # 这句没挂依据时在整份报告引用的数据源里查：写作者看得到的就是这几个库
         everywhere = claim_sources(self.catalog, self.catalog, self.fetch)
         usable = await _usable_sources(everywhere)
+        self.kinds = await self._kinds(everywhere)
         # 报告引用的查询快照里遮罩列的值：反查之前交给查询工具（agent 查到写着同一个号码的别的表时看不到），反查之后
         # 据此换掉理由里的遮罩值（_masked_rationale）
         seed = await self._seed()
@@ -653,12 +691,15 @@ class _Review:
                 claims.append(_claim(cand, "inconclusive", late[0]))
                 overdue += 1
                 continue
+            # 这句结论原文里写着的值已经摆在读者眼前，不当遮罩值。上万个值过一遍要几十毫秒，放进线程
+            known = await asyncio.to_thread(_spared, seed, cand.text)
             try:
                 own = claim_sources(cand.aliases, self.catalog, self.fetch)
                 sources = own or everywhere
                 live = [s for s in sources if s in usable]
                 lost = [s for s in sources if s not in usable]
-                task_text = self._task(cand, live, lost, own=bool(own)) if live else ""
+                task_text = await asyncio.to_thread(self._task, cand, live, lost, own=bool(own), known=known) \
+                    if live else ""
             except Exception as e:  # noqa: BLE001 - 一句的摘录出了意外（坏形状的工件），只让这一句没审成
                 why = f"整理证据摘录时出错（{describe_exception(e)}）"
                 unreached(cand, f"反查未完成：{why}", why)
@@ -686,8 +727,6 @@ class _Review:
             if allot.tightened:
                 self.run_seconds = allot.seconds
             # 收紧过的：核查 agent 到点自己发的 verify_limit 改说运行时长上限将至（deadline.relabel），不写收紧后的秒数
-            # 这句结论原文里写着的值已经摆在读者眼前，不当遮罩值。上万个值过一遍要几十毫秒，放进线程
-            known = await asyncio.to_thread(_spared, seed, cand.text)
             outcome = await run_verify_agent(
                 spec=self.spec, system=CHALLENGE_SYSTEM, task=task_text, sources=live,
                 output_schema=CHALLENGE_SCHEMA, max_queries=self.max_queries, timeout_s=allot.timeout_s,
@@ -776,6 +815,17 @@ class _Review:
 
         return await snapshot_secrets(self.fetch(entry.get("artifact")) for entry in self.catalog.values()
                                       if isinstance(entry, dict) and entry.get("kind") == "query")
+
+    async def _kinds(self, names: Iterable[str]) -> dict[str, Any]:
+        """这几个数据源的类型（摘录按 SQL 认改了名字的遮罩列时用）。快照记的数据源也算上（旧台账条目没记数据源）。"""
+        from app.engine.inquiry import _source_kinds   # inquiry 导入了这个模块，用到时再导入
+
+        wanted = set(names)
+        for entry in self.catalog.values():
+            snapshot = self.fetch(entry.get("artifact")) if isinstance(entry, dict) else None
+            if isinstance(snapshot, dict) and snapshot.get("source"):
+                wanted.add(str(snapshot["source"]))
+        return await _source_kinds(wanted)
 
     async def _store(self, record: dict[str, Any]) -> str | None:
         try:

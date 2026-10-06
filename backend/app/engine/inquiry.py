@@ -7,8 +7,9 @@
    运行已经结束封存、核对一致、是探索运行——问答追加在封存之后（post_seal），是批注不是证据。正式运行封存之后不再追加
    （同按需裁判）；设置里关了「审批质询 · 启用」一律不答。同一次运行同时只答一条：进程内登记（_ANSWERING），登记期间
    这次运行的审批回复、继续运行也不受理（api/runs.py），免得运行往下走了、问答还在路上
-2. 回答（_answer）：交给 agent 被问的那句原文、它挂的证据摘录（照 judge.prepare 的办法取，数据源遮罩的列照旧不给，原报告
-   的编号标明「原报告」）、审批人选中的原文和问题；工具是这次运行用过的查询工具对应的数据源（同名重建的、没固定过版本的
+2. 回答（_answer）：交给 agent 被问的那句原文、它挂的证据摘录（照 judge.prepare 的办法取，原报告的编号标明「原报告」；
+   摘录先遮：遮罩列不给，改了名字的遮罩列按 SQL 认出来也不给，别的列、SQL 里写着的遮罩值按值换掉，见 _excerpts）、
+   审批人选中的原文和问题；工具是这次运行用过的查询工具对应的数据源（同名重建的、没固定过版本的
    上传表格不算，见 _usable_sources）；上限按设置（每次的查询次数、时长，全局每日金额）。回答先给结论，数字只能引用 agent
    自己查询的格子，或者报告里已有的指标、运行输入；回答文档由 compose_doc 组装，裸数字被标出来（提问人自己写的数除外）。
    封存之后的追问查的是数据源现在的数据，任务里给报告生成的时间，回答末尾注明；触顶、查询失败、引用解析不了也在末尾注明
@@ -125,9 +126,9 @@
   点、括号，含全角），带 +86 / 0086 / 86 前缀、全角数字：写成汉字（一三九……）、中间夹着别的字、拆成几处写的、跨行
   写的认不出；和别的数字只隔着一个连字符或点连着的（13900000001-2、19914.74）不算号码；SQL 里不带引号的数不这样认
   （199-1474-2785 在 SQL 里是三个数相减），字符串、带引号的名字、注释里照样认
-- 质询 agent 的任务里的证据摘录照 judge.prepare 按列名遮：报告取数把遮罩列改了名字选出来（buyer_phone AS 手机号）时，
-  摘录里有原值，agent 看得到；它写进回答、SQL 的，按值认得出的照样换掉（报告快照里的值都收了），封存的是换过的。摘录
-  按 SQL 认改了名字的遮罩列要改 judge.py，另行处理
+- 质询 agent 的任务里的证据摘录先遮（_excerpts）：遮罩列、按 SQL 认出改了名字的遮罩列（和工具边界同一套规则）不给，
+  别的列、SQL 里写着的遮罩值按值换（报告快照里的值），按值认的门槛同上：短的数（年龄、等级）写在 SQL 的条件里、别的列
+  里照原样。没指明是哪一句时任务里给的是报告正文，正文里写着的值照原样（读者本来就看得到）
 """
 from __future__ import annotations
 
@@ -582,9 +583,13 @@ def _table_text(block: dict[str, Any], markdown: str) -> str:
 
 
 def _excerpts(doc: dict[str, Any], catalog: dict[str, Any], cand: judging.Candidate, loader: Callable[[str], Any],
-              masked: dict[str, Any]) -> list[str]:
-    """这句挂的每件证据的摘录：和 judge.prepare 一样逐件摘（数据源遮罩的列不给，带期 4 标记的文档多来历行），
-    指向原报告编号的写法标上「原报告」——agent 自己的查询也编 Q1、Q2…，不分开的话会把它们混成一回事。"""
+              masked: dict[str, Any], kinds: dict[str, Any] | None = None, secrets: _Secrets | None = None
+              ) -> list[str]:
+    """这句挂的每件证据的摘录：和 judge.prepare 一样逐件摘（带期 4 标记的文档多来历行），指向原报告编号的写法标上
+    「原报告」——agent 自己的查询也编 Q1、Q2…，不分开的话会把它们混成一回事。
+    摘录先遮，模型从任务里也看不到遮罩值：数据源遮罩的列不给，改了名字的（buyer_phone AS 手机号）按 SQL 认出来也不给
+    （kinds：{数据源名: 类型}，和工具边界同一套规则，judge._derived）；别的列、SQL 里写着的遮罩值按值换成「已遮罩」，
+    换了写法的号码也认（secrets：报告快照里的遮罩值，同交给查询工具的那一份）。解析 SQL、按值换是纯计算，调用方放进线程。"""
     fetch = judging._Fetch(loader)
     provenance_on = doc.get("provenance") == DOC_PROVENANCE
     queries = {a for a, e in catalog.items() if isinstance(e, dict) and e.get("kind") == "query"}
@@ -592,7 +597,9 @@ def _excerpts(doc: dict[str, Any], catalog: dict[str, Any], cand: judging.Candid
     for alias in cand.aliases:
         entry = catalog.get(alias)
         if isinstance(entry, dict) and (text := judging._excerpt(alias, entry, [cand], fetch, masked, catalog,
-                                                                 provenance_on=provenance_on)):
+                                                                 provenance_on=provenance_on, kinds=kinds)):
+            if secrets is not None and secrets.strong:
+                text = secrets.scrub(text, loose=True)
             out.append(mark_original(text, alias, queries))
     return out
 
@@ -1811,7 +1818,6 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
     doc = op.doc
     catalog = doc.get("catalog") if isinstance(doc.get("catalog"), dict) else {}
     masked = await judging.source_masks(catalog, loader=op.loader)
-    excerpts = _excerpts(doc, catalog, target.cand, op.loader, masked) if target is not None else []
     refs = _report_refs(catalog)
     wanted = _run_sources(op.events)
     usable = await _usable_sources(op.run_id, wanted, op.versions)
@@ -1820,15 +1826,20 @@ async def _answer(op: _Opening, ask: Ask, target: _Target | None, settings: dict
     async with SessionLocal() as session:
         spec = await verify_model_spec(session, None, settings=settings)
     # 报告自己的查询快照：被问的那句可能直接写着遮罩列的值，agent 会照着复述；里面的遮罩值在派 agent 之前就交给它的
-    # 查询工具（masked_values），agent 查到写着同一个号码的备注、别的表时，交给模型之前就换掉
+    # 查询工具（masked_values），agent 查到写着同一个号码的备注、别的表时，交给模型之前就换掉；证据摘录也按它们先遮
     given = [ask.question, ask.quote, *_ref_values(refs)]
     others = [snapshot for entry in catalog.values() if isinstance(entry, dict) and entry.get("kind") == "query"
               and _query_shaped(snapshot := _quiet_load(op.loader, entry.get("artifact")))]
+    seed = await snapshot_secrets(others, given)
+    excerpts: list[str] = []
+    if target is not None:
+        kinds = await _source_kinds([*masked, *(str(s.get("source") or "") for s in others)])
+        excerpts = await asyncio.to_thread(_excerpts, doc, catalog, target.cand, op.loader, masked, kinds, seed)
     outcome = await run_verify_agent(
         spec=spec, system=INQUIRY_SYSTEM, task=_task(op, ask, target, excerpts, refs, live, lost), sources=list(live),
         output_schema=INQUIRY_SCHEMA, max_queries=part.get("max_queries"), timeout_s=part.get("timeout_s"),
         daily_max_usd=settings.get("daily_max_usd"), run_id=op.run_id, data_versions=op.versions,
-        masked_values=await snapshot_secrets(others, given))
+        masked_values=seed)
 
     # 遮罩：agent 自己的查询快照（查询时就遮好了，遮掉的值在 outcome.masked_values 里）、报告自己的查询快照
     own: dict[str, dict[str, Any]] = {}

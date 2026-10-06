@@ -342,6 +342,25 @@ def _hidden(snapshot: dict[str, Any], source: Any, masked: dict[str, Any] | None
     return names
 
 
+def _derived(snapshot: dict[str, Any], hidden: set[str], fetch: _Fetch, kinds: dict[str, Any] | None) -> set[str]:
+    """核查 agent 的摘录（kinds 给了：{数据源名: 类型}）要遮的列：按列名的（hidden），加上按 SQL 认出改了名字的遮罩列
+    （buyer_phone AS 手机号、套函数、经子查询转一道……），和核查 agent 的查询在工具边界遮的是同一套规则
+    （masking._derived_hidden，表结构按快照冻结的那份、经 fetch 取）。认的过程出了意外，整份快照的列都算（宁可多遮）。
+    kinds 为 None（结论句裁判自己的摘录）照旧只按列名，摘录、复用键都和以前一样。"""
+    if kinds is None or not hidden:
+        return hidden
+    from app.engine.masking import _derived_hidden, _schema_columns   # masking 导入了别的引擎模块：用到时再导入
+
+    try:
+        schema = fetch(snapshot.get("schema_artifact")) if snapshot.get("schema_artifact") else None
+        tables = _schema_columns(schema) if isinstance(schema, dict) else None
+        kind = kinds.get(str(snapshot.get("source") or ""))
+        return set(hidden) | _derived_hidden(dict(snapshot), set(hidden), kind, tables)[0]
+    except Exception:  # noqa: BLE001 - 认不准就整份遮：摘录少几列，不让遮罩值交给核查 agent
+        logger.warning("judge: 按 SQL 认摘录里改了名字的遮罩列时出错，整份快照的列都按遮罩处理", exc_info=True)
+        return set(hidden) | {str(c).lower() for c in snapshot.get("columns") or []}
+
+
 def _shown_columns(columns: list[str], cited: Iterable[str]) -> list[str]:
     """摘录给哪几列：被引用的列一律给（超过上限也给），再按原来的顺序用别的列补满到 EXCERPT_COLS 列。
 
@@ -354,11 +373,13 @@ def _shown_columns(columns: list[str], cited: Iterable[str]) -> list[str]:
 
 
 def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iterable[str], whole: bool,
-                   fetch: _Fetch, masked: dict[str, Any] | None, *, provenance_on: bool = False) -> str | None:
+                   fetch: _Fetch, masked: dict[str, Any] | None, *, provenance_on: bool = False,
+                   kinds: dict[str, Any] | None = None) -> str | None:
     """一条查询的摘录：头、SQL、（期 4）来历行、列、被引用的行。
 
     provenance_on：文档带期 4 标记时为真（prepare 算）。这时上传表格的查询快照（有 data_version）在 SQL 之后、「列：」
     之前多几行来历（_provenance_lines）；其余情况一个字都不多，期 4 之前的文档、手工源的摘录和以前逐字相同。
+    kinds：给核查 agent 的摘录才给，改了名字的遮罩列也不给（_derived）。
     """
     snapshot = fetch(entry.get("artifact"))
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("rows"), list):
@@ -372,7 +393,7 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     lines = [head, f"SQL：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}"]
     if snapshot.get("source") == MERGE_SOURCE:
         lines.append(_merge_line(snapshot))
-    hidden = _hidden(snapshot, source, masked)
+    hidden = _derived(snapshot, _hidden(snapshot, source, masked), fetch, kinds)
     if provenance_on and snapshot.get("data_version"):
         lines += _provenance_lines(snapshot, fetch, hidden)
     columns = [str(c) for c in snapshot.get("columns") or [] if str(c).lower() not in hidden]
@@ -483,7 +504,7 @@ def _cell_words(locator: dict[str, Any], hidden: set[str]) -> str:
 
 
 def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any],
-                   masked: dict[str, Any] | None) -> list[str]:
+                   masked: dict[str, Any] | None, kinds: dict[str, Any] | None = None) -> list[str]:
     """指标的输入取自哪次查询、哪一格，再附上那次查询的 SQL（截到 SQL_CHARS，最多 ENTITY_QUERIES 次）。
 
     「活跃用户按会员号去重」这种讲口径的句子，证据在取数的 SQL 里；只给原式，裁判只能判证据不足。
@@ -504,8 +525,8 @@ def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any
         snapshot = fetch(artifact)
         snap = snapshot if isinstance(snapshot, dict) else {}
         source = (catalog.get(alias) or {}).get("source") if alias else None
-        hidden = _source_hidden(source or snap.get("source"), catalog, fetch, masked) \
-            | _mask_names(snap.get("mask_columns"))
+        hidden = _derived(snap, _source_hidden(source or snap.get("source"), catalog, fetch, masked)
+                          | _mask_names(snap.get("mask_columns")), fetch, kinds)
         label = f"查询 {alias} " if alias else "一次查询（不在这份报告的证据目录中）"
         lines.append(f"输入 {path}：取自{label}的 {_cell_words(item.get('locator') or {}, hidden)}")
         sql = _clean(str(snap.get("sql") or ""))
@@ -518,7 +539,7 @@ def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any
 
 
 def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any],
-                    masked: dict[str, Any] | None) -> str:
+                    masked: dict[str, Any] | None, kinds: dict[str, Any] | None = None) -> str:
     name = entry.get("name") or (entry.get("locator") or {}).get("metric") or alias
     rendered = entry.get("rendered")
     where = " ".join(v for v in (f"口径「{entry['caliber']}」" if entry.get("caliber") else "",
@@ -533,7 +554,7 @@ def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch, catalog: d
     if metric is not None:
         if metric.get("expression"):
             lines.append(f"原式：{_clean(str(metric['expression']))}")
-        lines.extend(_metric_inputs(metric, fetch, catalog, masked))
+        lines.extend(_metric_inputs(metric, fetch, catalog, masked, kinds))
     return "\n".join(lines)
 
 
@@ -631,12 +652,13 @@ def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], who
 
 
 def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _Fetch,
-             masked: dict[str, Any] | None, catalog: dict[str, Any], *, provenance_on: bool = False) -> str | None:
+             masked: dict[str, Any] | None, catalog: dict[str, Any], *, provenance_on: bool = False,
+             kinds: dict[str, Any] | None = None) -> str | None:
     """一件证据的摘录。provenance_on 只交给查询摘录（_query_excerpt）：指标摘录里「输入取自查询 Qn」的那几行不加
-    来历（P4-SPEC 调整 1），表名、字段名的摘录照旧。"""
+    来历（P4-SPEC 调整 1），表名、字段名的摘录照旧。kinds 只给核查 agent 的摘录（见 _derived）。"""
     kind = entry.get("kind")
     if kind == "metric":
-        return _metric_excerpt(alias, entry, fetch, catalog, masked)
+        return _metric_excerpt(alias, entry, fetch, catalog, masked, kinds)
     if kind == "input":
         field_name = (entry.get("locator") or {}).get("field") or alias
         return f"【{alias}】运行输入：{field_name} = {entry.get('rendered')}"
@@ -644,7 +666,7 @@ def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _
         rows = {r for c in cands for a, r in c.rows if a == alias}
         cols = [col for c in cands for a, col in c.cols if a == alias]
         return _query_excerpt(alias, entry, rows, cols, any(alias in c.whole for c in cands), fetch, masked,
-                              provenance_on=provenance_on)
+                              provenance_on=provenance_on, kinds=kinds)
     if kind == "retrieval":
         picked = [h for c in cands for a, h in c.hits if a == alias]
         return _retrieval_excerpt(alias, entry, picked, any(alias in c.whole for c in cands), fetch)
@@ -739,10 +761,14 @@ class JudgeRequest:
 
 
 def prepare(doc: dict[str, Any], catalog: dict[str, Any] | None = None, *, units: Iterable[str] | None = None,
-            loader: Callable[[str], Any] | None = None, masked: dict[str, Any] | None = None) -> JudgeRequest:
+            loader: Callable[[str], Any] | None = None, masked: dict[str, Any] | None = None,
+            kinds: dict[str, Any] | None = None) -> JudgeRequest:
     """裁判的输入：候选句和证据摘录。纯函数（快照经 loader 取，缺省读工件库），不调模型。
 
     catalog 缺省用文档自己存的目录；masked = {数据源名: 要遮的列}，和快照里记下的 mask_columns 合在一起。
+    kinds = {数据源名: 类型} 只在给核查 agent（反方审稿、审批质询）准备摘录时给：查询摘录、指标输入里改了名字的遮罩列
+    （buyer_phone AS 手机号）按 SQL 认出来也不给，和核查 agent 的查询在工具边界遮的是同一套规则（_derived）。结论句裁判
+    自己的摘录不给它，和以前逐字相同。
 
     摘录按文档标记分版本（P4-SPEC 1.4、3.3）：带 `provenance: DOC_PROVENANCE` 的文档，上传表格的查询摘录多几行
     来历；没有标记的（期 4 之前组装的）和以前逐字相同，复用键、断点指纹都不变，已判过的句子照旧复用。
@@ -755,7 +781,7 @@ def prepare(doc: dict[str, Any], catalog: dict[str, Any] | None = None, *, units
     for alias in dict.fromkeys(a for c in cands for a in c.aliases):
         entry = catalog.get(alias)
         if isinstance(entry, dict) and (text := _excerpt(alias, entry, cands, fetch, masked, catalog,
-                                                         provenance_on=provenance_on)):
+                                                         provenance_on=provenance_on, kinds=kinds)):
             excerpts[alias] = text
     picked = {c.unit for c in cands}
     skipped: dict[str, str] = {}
