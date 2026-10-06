@@ -308,7 +308,17 @@ export const useInquiry = create<InquiryState>((set, get) => ({
   },
 
   loadApprovalDocs: async (runId, ids) => {
-    if (get().approvalDocs[runId]?.status === 'loading') return
+    const inflight = get().approvalDocs[runId]
+    if (inflight?.status === 'loading') {
+      // 别处已经在取（同一张卡审两份报告；运行详情的待审批卡和证据页签同时挂着，两处要对的审批不同）：不再另取，但这一处
+      // 要对的也记成取过——列表按运行取、不按审批，在路上的那一份本来就带着全部审批。只是提前返回的话，这一处的 unknown
+      // 在请求回来之后不变、effect 不再执行，settled 一直为假：头上写着「· N 次」，别的审批里问的那几条一直不显示
+      const asked = [...new Set([...inflight.asked, ...ids])]
+      if (asked.length > inflight.asked.length) {
+        set((s) => ({ approvalDocs: { ...s.approvalDocs, [runId]: { ...s.approvalDocs[runId]!, asked } } }))
+      }
+      return
+    }
     set((s) => {
       const cur = s.approvalDocs[runId]
       return { approvalDocs: { ...s.approvalDocs, [runId]: {

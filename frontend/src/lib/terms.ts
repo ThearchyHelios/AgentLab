@@ -3500,6 +3500,19 @@ export const INQUIRY_TEXT = {
   snapshotLoading: '正在读取查询结果…',
   snapshotFailed: '无法读取这次查询的结果',
   masked: (columns: string) => `${columns} 在数据源中设置了遮罩，不显示原值`,
+
+  // ---- 运行详情「工件」页签：回答文档按工件种类 inquiry_answer 记在运行名下（pages/runs/model.ts 的工件名和说明） ----
+  artifactKind: '质询回答',
+  /**
+   * 服务端在工件的 meta 里只记问题的前 40 字（engine/inquiry.py 的 QUESTION_BRIEF）：满 40 字的多半截断过，末尾补省略号，
+   * 免得半句话读成整个问题
+   */
+  artifactAbout: (question: string) => {
+    const chars = [...question.trim()]
+    return `质询「${chars.join('')}${chars.length >= 40 ? '…' : ''}」的回答`
+  },
+  /** 没记问题摘要的（这一版之前存的）：照报告文档的说法写装的是什么 */
+  artifactAboutNone: '审批质询的回答：逐段的片段和每个数字的出处',
 }
 
 /**
