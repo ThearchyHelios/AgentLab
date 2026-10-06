@@ -4,25 +4,32 @@
 - 停在审批时质询：事件 node_id 为空、数据按前后端约定的形状；质询的查询工件只在 inquiry_artifacts / queries 里，
   不在 query_artifact 下（证据接口不把它们当成报告的证据）；批准、运行结束封存之后 verify 一致，封存范围包含这条事件；
   用量计入运行用量
-- 回答期间运行被批准（竞态）：回答照样交回，recorded 为假、note 说明，事件不落库
+- 回答期间运行被批准（竞态）：回答照样交回，recorded 为假、note 说明，事件不落库，回答里的工件照样取得到；两道审批时
+  问的是第一张、回答途中运行停到了第二张上，也不写
 - 同一运行同时只答一条：第二条质询、审批回复（批准 / 驳回）、继续运行都回 409 inquiry_busy，拒掉的批准不留痕迹
-- 封存之后：探索运行可以追问（post_seal，落在封存之后，不计运行用量），正式运行 409；设置里关了 409；
-  没停在那张审批卡上、还在执行、封存核对不通过都 409；输入不合法 422，指明是哪一项
-- 回答：先给结论，数字只能引用自己查询的格子或报告已有的指标，裸数字被标出；遮罩列的格子渲染成「已遮罩」，
-  回答正文、查询清单、事件里都不出现遮罩列的值
-- 触顶、失败照样记一条事件
-- 读取：列表按报告、句子筛选，按时间排；质询工件只认质询引用过的，遮罩照证据面板
+- 封存之后：探索运行可以追问（post_seal，落在封存之后，不计运行用量，回答末尾注明查的是现在的数据），正式运行 409；
+  设置里关了 409；没停在那张审批卡上、还在执行（按情形说下一步）、封存核对不通过、开放途中运行被继续了都 409；
+  事件里记的报告文档不是这次运行的 422；输入不合法 422，指明是哪一项
+- 回答：先给结论，数字只能引用自己查询的格子或报告已有的指标，裸数字被标出（提问人自己写的数不标）；遮罩列（起了
+  别名的也算）的格子渲染成「已遮罩」，回答正文、查询清单、事件、质询工件里都不出现遮罩列的值；短的遮罩值不误伤阈值、
+  天数、LIMIT
+- 接线：设置里的上限、运行固定的数据版本交到 agent 手里（上传表格重传之后查的仍是运行固定的那一版）；同名重建的
+  数据源、没固定过版本的上传表格不查
+- 触顶、失败照样记一条事件，说法给提问人看得懂、说下一步；轮数用完不算查询次数到顶，查询失败、引用解析不了在末尾注明
+- 读取：列表按报告、句子筛选，按时间排；质询工件只认质询引用过的（含回答里引用的口径卡），遮罩照回答时的办法
 - 恢复后的重放不受影响：前面的节点不重复执行
 
-模型一律是 MockChatModel 剧本，数据源是现造的 SQLite 文件，区域、金额、手机号都是虚构的。
+模型一律是 MockChatModel 剧本，数据源是现造的 SQLite 文件和上传表格，区域、金额、手机号、年龄都是虚构的。
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
+from datetime import timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -30,10 +37,11 @@ from langchain_core.messages import AIMessage, ToolMessage
 from sqlalchemy import delete, select
 
 from app.core import artifact_store
-from app.data import introspect
+from app.core.config import settings
+from app.data import introspect, table_versions
 from app.data.engine import engines
 from app.db.base import SessionLocal
-from app.db.models import Approval, DataSource, Run, RunEvent, Setting
+from app.db.models import Approval, Artifact, DataSource, Run, RunEvent, Setting
 from app.engine import compiler
 from app.engine import inquiry as inquiry_mod
 from app.engine import spend, verify_agent
@@ -65,6 +73,12 @@ EVENT_KEYS = {"question", "quote", "report", "unit", "approval_id", "actor", "an
 QUERY_KEYS = {"alias", "artifact", "sql", "row_count", "truncated", "source"}
 NOT_RECORDED = "运行状态已经变化，这次质询的问答没有写入运行记录"
 BUSY_DECIDE = {"detail": "正在回答质询，回答完再批准或驳回", "code": "inquiry_busy"}
+#: 封存之后的追问查的是数据源现在的数据：回答末尾的说明
+LIVE_NOTE = "注：以上回答依据的是数据源当前的数据，晚于报告生成的时间；与报告不一致时，可能是报告生成之后数据有更新。"
+#: 模型用完了调用轮数、有查询执行失败、有引用解析不了：回答末尾的说明
+ROUNDS_NOTE = "注：调用模型的轮数已用完，以上回答只依据已经查到的结果，可能不完整。"
+FAILED_NOTE = "注：有 {n} 次查询执行失败（查询清单只列成功的查询），以上回答可能缺少依据。"
+UNRESOLVED_NOTE = "注：回答中有 {n} 处引用无法解析，相关的数没有出处。"
 
 
 async def _clean_settings() -> None:
@@ -90,16 +104,19 @@ async def client():
         yield c
 
 
-async def _source(tmp_path, *, options=None) -> tuple[str, int]:
+#: 四笔订单：华东两笔（其中一笔 300 是测试账号）、华南一笔 900、华北一笔 400
+SALES = ("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, buyer_phone TEXT, amount INTEGER, is_test INTEGER);"
+         "INSERT INTO sales VALUES (1, '华东', '13900000001', 1200, 0), (2, '华东', '13900000002', 300, 1),"
+         " (3, '华南', '13900000003', 900, 0), (4, '华北', '13900000004', 400, 0);")
+
+
+async def _source(tmp_path, *, options=None, name: str | None = None, script: str = SALES) -> tuple[str, int]:
     path = tmp_path / f"{uuid.uuid4().hex[:8]}.db"
     db = sqlite3.connect(path)
-    db.executescript(
-        "CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, buyer_phone TEXT, amount INTEGER, is_test INTEGER);"
-        "INSERT INTO sales VALUES (1, '华东', '13900000001', 1200, 0), (2, '华东', '13900000002', 300, 1),"
-        " (3, '华南', '13900000003', 900, 0), (4, '华北', '13900000004', 400, 0);")
+    db.executescript(script)
     db.commit()
     db.close()
-    name = f"shop_{uuid.uuid4().hex[:8]}"
+    name = name or f"shop_{uuid.uuid4().hex[:8]}"
     async with SessionLocal() as session:
         row = DataSource(name=name, kind="sqlite", database=str(path), readonly=True, enabled=True,
                          options=options or {})
@@ -147,10 +164,13 @@ def gated(source: str, *, gate: bool = True) -> dict:
 
 @dataclass
 class Play:
-    """质询 agent 对某个问题的剧本：依次执行的查询，最后交的回答。"""
+    """质询 agent 对某个问题的剧本：先看几次表结构（schema），再依次执行的查询，最后交的回答。final 给了就照它交
+    （模型不按结构交的样子），不给就交 {rationale: answer}。"""
 
     queries: list[str] = field(default_factory=list)
     answer: str = "查不到判断所需的数据。"
+    schema: int = 0
+    final: dict | None = None
 
 
 PLAYS = {"排除测试账号": Play([NO_TEST], NO_TEST_ANSWER)}
@@ -180,10 +200,16 @@ class Models:
                 play = which(task)
                 if model.response_format:
                     self.finals.append(list(messages))
-                    return AIMessage(content=json.dumps({"rationale": play.answer}, ensure_ascii=False))
+                    final = play.final if play.final is not None else {"rationale": play.answer}
+                    return AIMessage(content=json.dumps(final, ensure_ascii=False))
                 if not any(isinstance(m, ToolMessage) for m in messages):
                     self.tasks.append(task)
-                done = sum(1 for m in messages if isinstance(m, ToolMessage))
+                answered = [str(m.tool_call_id) for m in messages if isinstance(m, ToolMessage)]
+                looked = sum(1 for i in answered if i.startswith("is-"))
+                if looked < play.schema:
+                    call = {"name": f"db_schema__{source}", "args": {}, "id": f"is-{looked}"}
+                    return AIMessage(content="先看表结构。", tool_calls=[call])
+                done = sum(1 for i in answered if i.startswith("iq-"))
                 if done < len(play.queries):
                     call = {"name": f"db_query__{source}", "args": {"sql": play.queries[done]}, "id": f"iq-{done}"}
                     return AIMessage(content="查一下。", tool_calls=[call])
@@ -300,6 +326,10 @@ async def test_asking_while_waiting_is_recorded_and_sealed_with_the_run(monkeypa
     assert answer["text"] == NO_TEST_TEXT, "回答先给结论，数字按查询结果换好"
     answer_doc = artifact_store.load(answer["doc_artifact"])
     assert answer_doc["markdown"] == answer["text"] and answer_doc["violations"] == []
+    # 运行的工件列表里认得出是哪个问题的回答
+    async with SessionLocal() as session:
+        stored = await session.get(Artifact, (answer["doc_artifact"], paused.id))
+    assert stored.kind == "inquiry_answer" and stored.meta == {"report": "write", "unit": east, "question": QUESTION}
     cited = [s["cite"] for s in iter_segments(answer_doc) if s.get("cite")]
     assert [(c["alias"], c["locator"]["row"], c["value"]) for c in cited] == [("Q1", 0, 1200), ("Q1", 1, 900)]
     [query] = item["queries"]
@@ -373,6 +403,12 @@ async def test_an_approval_that_lands_while_answering_leaves_no_record(monkeypat
     assert body["recorded"] is False and body["note"] == NOT_RECORDED
     assert body["inquiry"]["seq"] is None and body["inquiry"]["answer"]["ok"] is True
     assert body["inquiry"]["answer"]["text"] == NO_TEST_TEXT
+    # 没写进记录，提问人手里的回答照样点得开：回答文档和查询快照都在质询工件接口上
+    [query] = body["inquiry"]["queries"]
+    for artifact in (body["inquiry"]["answer"]["doc_artifact"], query["artifact"]):
+        got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{artifact}")
+        assert got.status_code == 200, got.text
+    assert got.json()["content"]["sql"] == NO_TEST
 
     final = await wait(paused.id)
     assert final.status == "succeeded", final.error
@@ -431,7 +467,7 @@ async def test_while_answering_approving_resuming_and_continuing_are_refused(mon
 
 
 async def test_after_the_seal_only_exploratory_runs_take_inquiries(monkeypatch, shop, client):
-    Models(monkeypatch, shop)
+    models = Models(monkeypatch, shop)
     done = await finish(shop)
     assert done.status == "succeeded", done.error
     east = unit_of(await report_doc(done.id), EAST)
@@ -441,7 +477,12 @@ async def test_after_the_seal_only_exploratory_runs_take_inquiries(monkeypatch, 
     body = r.json()
     assert body["recorded"] is True and body["note"] is None
     item = body["inquiry"]
-    assert item["post_seal"] is True and item["approval_id"] is None and item["answer"]["text"] == NO_TEST_TEXT
+    assert item["post_seal"] is True and item["approval_id"] is None
+    assert item["answer"]["text"] == f"{NO_TEST_TEXT}\n\n{LIVE_NOTE}", "封存之后查的是现在的数据，回答里交代清楚"
+    [task] = models.tasks
+    ended = done.finished_at.astimezone(timezone.utc).replace(tzinfo=None) if done.finished_at.tzinfo \
+        else done.finished_at
+    assert f"报告生成于 {ended.isoformat(timespec='seconds')}（UTC）" in task
     [event] = await events(done.id, "approval.inquiry")
     assert event.data["post_seal"] is True and event.seq > done.manifest_seq
     after = await _row(done.id)
@@ -494,7 +535,8 @@ async def test_a_follow_up_is_not_written_once_the_run_is_continued(monkeypatch,
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["recorded"] is False and body["note"] == NOT_RECORDED
-    assert body["inquiry"]["post_seal"] is True and body["inquiry"]["answer"]["text"] == NO_TEST_TEXT
+    assert body["inquiry"]["post_seal"] is True
+    assert body["inquiry"]["answer"]["text"] == f"{NO_TEST_TEXT}\n\n{LIVE_NOTE}"
     final = await wait(failed.id)
     assert final.status == "succeeded", final.error
     assert await events(failed.id, "approval.inquiry") == []
@@ -620,7 +662,8 @@ async def test_bare_numbers_are_flagged_and_masked_values_never_show(monkeypatch
     assert r.status_code == 200, r.text
     assert r.json()["inquiry"]["unit"] is None, "不指明句子时写空串和写 null 一样"
     [task] = models.tasks
-    assert f"设了遮罩的列（回答里不要写出这些列的值）：「{masked_shop}」的 buyer_phone" in task
+    assert f"设了遮罩的列（查询里不要选出原值、不要起别名，回答里不要写出这些列的值）：「{masked_shop}」的 buyer_phone" \
+        in task
     assert "1390000000" not in r.text, "回答、查询清单里都不能出现遮罩列的值"
     item = r.json()["inquiry"]
     answer = item["answer"]
@@ -674,6 +717,11 @@ async def test_the_answer_may_cite_the_reports_own_metrics(monkeypatch, client):
     [task] = models.tasks
     assert "[[m:gmv]]" in task and "销售额 = 45,678.5元" in task
     assert r.json()["inquiry"]["queries"] == []
+    # 回答里的指标点得开：口径卡从质询工件接口取（界面按 doc.catalog[alias].artifact 取）
+    card = artifact_store.load(answer["doc_artifact"])["catalog"]["m:gmv"]["artifact"]
+    got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{card}")
+    assert got.status_code == 200, got.text
+    assert got.json()["content"]["metrics"][0]["id"] == "gmv" and got.json()["masked"] == []
 
 
 async def test_a_cell_in_a_table_comes_with_the_whole_table(monkeypatch, shop, client):
@@ -689,20 +737,6 @@ async def test_a_cell_in_a_table_comes_with_the_whole_table(monkeypatch, shop, c
     assert "「1,500」" in task and "区域 | 销售额\n华东 | 1,500\n华南 | 900\n华北 | 400" in task
     # 摘录照裁判的办法：被引用的列排在前面，只给被引用的那一行
     assert "【原报告 Q1】" in task and "列：销售额 | 区域\nr0：1,500 | 华东\n" in task
-
-
-def test_masked_values_are_matched_as_whole_values():
-    """遮罩列的值按整值认：更长的数里的一截、千分位写法里的一截不换；一个字的值不换（换了会把不相干的词弄坏）；
-    数按原样和千分位两种写法认。"""
-    secrets = inquiry_mod._Secrets()
-    snapshot = {"columns": ["phone", "name", "gender", "code", "salary", "region"],
-                "rows": [["13900000001", "张伟", "男", "390", 12000, "华东"]]}
-    secrets.add(snapshot, {"phone", "name", "gender", "code", "salary"})
-    scrub = secrets.scrubber()
-    assert scrub("客户 13900000001、139000000012、1,390 元、390 笔、张伟买了男装，月薪 12,000，另 12000.5") == (
-        "客户 已遮罩、139000000012、1,390 元、已遮罩 笔、已遮罩买了男装，月薪 已遮罩，另 12000.5")
-    assert scrub("华东") == "华东", "没遮的列不换"
-    assert inquiry_mod._Secrets().scrubber()("13900000001") == "13900000001"
 
 
 # --------------------------------------------------------------------------
@@ -776,7 +810,8 @@ async def test_the_daily_cap_is_recorded_as_a_limit(monkeypatch, shop, client):
     r = await ask(client, paused.id, report="write", unit=None, question=QUESTION, approval_id=approval.id)
     assert r.status_code == 200, r.text
     answer = r.json()["inquiry"]["answer"]
-    assert (answer["ok"], answer["limit"]) == (False, "daily_max_usd") and answer["error"]
+    assert (answer["ok"], answer["limit"]) == (False, "daily_max_usd")
+    assert answer["error"] == "今日核查花费已达上限（核查每日金额上限 $2.00），未能给出回答，可在设置的「核查」一节调高上限"
     assert models.finals == []
     [event] = await events(paused.id, "approval.inquiry")
     assert event.data["limit"] == "daily_max_usd"
@@ -845,3 +880,372 @@ async def test_resuming_after_an_inquiry_does_not_repeat_the_nodes(monkeypatch, 
         assert len(await events(paused.id, "node.started", node_id)) == 1, f"{node_id} 又执行了一遍"
     assert len(await events(paused.id, "tool.start", "fetch")) == 1
     assert models.writes == 1
+
+
+# --------------------------------------------------------------------------
+# 遮罩：改了名字的遮罩列、只出现在报告里的遮罩值、不误伤别的数
+# --------------------------------------------------------------------------
+
+ALIASED = "SELECT buyer_phone AS 手机号, amount AS 金额 FROM sales ORDER BY amount DESC LIMIT 1"
+
+
+async def test_a_masked_column_under_another_name_is_masked_everywhere(monkeypatch, masked_shop, client):
+    """遮罩列起了中文别名（本仓库查询的惯例）：回答里引用到的格子、事件、回答文档、质询工件里都不露出原值。
+    报告自己的查询没选手机号，原值哪里都认不出来，只能按 SQL 认出「手机号」就是 buyer_phone。"""
+    plays = {"买得最多": Play([ALIASED], "这一笔来自 [[v:Q1.r0.手机号]]，金额 [[v:Q1.r0.金额]]。[[see:Q1]]")}
+    models = Models(monkeypatch, masked_shop, plays=plays)
+    paused = await pause(masked_shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="买得最多的是哪位客户？",
+                  approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    assert "1390000000" not in r.text
+    item = r.json()["inquiry"]
+    assert item["answer"]["text"] == "这一笔来自 已遮罩，金额 1,200。"
+    [query] = item["queries"]
+    assert query["sql"] == ALIASED, "SQL 里没有遮罩值，原样"
+    [event] = await events(paused.id, "approval.inquiry")
+    assert "1390000000" not in json.dumps(event.data, ensure_ascii=False)
+    assert "1390000000" not in json.dumps(artifact_store.load(item["answer"]["doc_artifact"]), ensure_ascii=False)
+    got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+    assert got.status_code == 200 and "1390000000" not in got.text
+    assert got.json()["content"]["rows"] == [["已遮罩", 1200]] and got.json()["masked"] == ["手机号"]
+    [task] = models.tasks
+    assert "不要起别名" in task
+
+
+async def test_a_masked_value_seen_only_in_the_report_is_masked_alike_everywhere(monkeypatch, masked_shop, client):
+    """遮罩值只出现在报告自己的查询里（agent 照着它写了查询条件、在回答里复述）：回答、事件里的 SQL、质询工件里的
+    SQL 都换成「已遮罩」，两处给的 SQL 一字不差。"""
+    graph = chain(node("start", "input"),
+                  node("fetch", "tool", tool=f"db_query__{masked_shop}",
+                       args={"sql": "SELECT buyer_phone, amount AS 金额 FROM sales ORDER BY amount DESC"}),
+                  node("write", "report", "写周报", instructions="写周报"),
+                  node("gate", "human", mode="approve", title="周报可以出具吗"),
+                  node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
+    asked = "SELECT COUNT(*) AS 笔数 FROM sales WHERE buyer_phone = '13900000003'"
+    plays = {"这位客户": Play([asked], "号码 13900000003 的客户共 [[v:Q1.r0.笔数]] 笔。[[see:Q1]]")}
+    Models(monkeypatch, masked_shop, writer="金额最高的一笔 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    paused = await pause(masked_shop, graph=graph)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="这位客户还买过别的吗？",
+                  approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    assert "1390000000" not in r.text
+    item = r.json()["inquiry"]
+    assert item["answer"]["text"] == "号码 已遮罩 的客户共 1 笔。"
+    [query] = item["queries"]
+    assert query["sql"] == "SELECT COUNT(*) AS 笔数 FROM sales WHERE buyer_phone = '已遮罩'"
+    got = await client.get(f"/api/runs/{paused.id}/inquiries/artifacts/{query['artifact']}")
+    assert got.status_code == 200 and "1390000000" not in got.text
+    assert got.json()["content"]["sql"] == query["sql"], "质询工件给的 SQL 和事件里的一字不差"
+
+
+#: 年龄设了遮罩的订单：年龄都是两位数，和阈值、日期、LIMIT 里的数撞在一起
+AGED = ("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, age INTEGER, amount INTEGER, paid_on TEXT);"
+        "INSERT INTO sales VALUES (1, '华东', 25, 1200, '2026-01-25'), (2, '华东', 30, 300, '2026-01-20'),"
+        " (3, '华南', 20, 900, '2026-02-01'), (4, '华北', 31, 400, '2026-02-03');")
+
+
+async def test_numbers_that_merely_match_a_short_masked_value_are_left_alone(monkeypatch, tmp_path, client):
+    """遮罩列是年龄：阈值（300）、天数（30）、日期、LIMIT 里的数撞上年龄也不换，封存的 SQL 就是实际执行的那条；
+    直接和年龄比较的值照样遮。提问人自己写的阈值复述在回答里，不算没有出处。"""
+    name, source_id = await _source(tmp_path, options={"mask_columns": "age"}, script=AGED)
+    graph = chain(node("start", "input"),
+                  node("fetch", "tool", tool=f"db_query__{name}",
+                       args={"sql": "SELECT region AS 区域, age, amount AS 金额 FROM sales ORDER BY id"}),
+                  node("write", "report", "写周报", instructions="写周报"),
+                  node("gate", "human", mode="approve", title="周报可以出具吗"),
+                  node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
+    recent = "SELECT COUNT(*) AS 笔数 FROM sales WHERE amount > 300 AND paid_on >= '2026-01-25' LIMIT 20"
+    same_age = "SELECT COUNT(*) AS 人数 FROM sales WHERE age = 25"
+    plays = {"不超过 300": Play([recent, same_age],
+                                "排除金额不超过 300 元的订单后，近 30 天还剩 [[v:Q1.r0.笔数]] 笔，其中 [[v:Q2.r0.人数]] 笔"
+                                "来自同一年龄段。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="华东首单金额 [[v:Q1.r0.金额]]。[[see:Q1]]", plays=plays)
+    try:
+        paused = await pause(name, graph=graph)
+        [approval] = await pending(paused.id)
+        r = await ask(client, paused.id, report="write", unit=None, question="排除金额不超过 300 元的订单会怎样？",
+                      approval_id=approval.id)
+        assert r.status_code == 200, r.text
+        item = r.json()["inquiry"]
+        assert item["answer"]["text"] == "排除金额不超过 300 元的订单后，近 30 天还剩 3 笔，其中 1 笔来自同一年龄段。"
+        doc = artifact_store.load(item["answer"]["doc_artifact"])
+        assert [s["text"] for s in iter_segments(doc) if s.get("issue") == "uncited_number"] == ["30"], \
+            "问题里的 300 是提问人给的，不标；30 没有出处，照标"
+        assert [q["sql"] for q in item["queries"]] == [recent, "SELECT COUNT(*) AS 人数 FROM sales WHERE age = 已遮罩"]
+    finally:
+        await engines.invalidate(source_id)
+
+
+# --------------------------------------------------------------------------
+# 接线：两道审批的竞态、上传表格的版本、设置、开放之后状态又变了、张冠李戴的报告文档
+# --------------------------------------------------------------------------
+
+
+async def test_an_answer_about_the_first_of_two_approvals_is_not_written_into_the_second(monkeypatch, shop, client):
+    """问的是第一张审批卡，回答途中它被批掉、运行停到了第二张卡上：仍是「停在审批」，但问答不属于这一次停下，不写。"""
+    seen: dict = {}
+
+    async def approve_and_wait_for_the_next():
+        if seen.get("done"):
+            return
+        seen["done"] = True
+        await run_manager.resume(seen["run"], {"approved": True}, approval_id=seen["approval"])
+        for _ in range(600):
+            cards = await pending(seen["run"])
+            if cards and cards[0].id != seen["approval"] and (await _row(seen["run"])).status == "interrupted":
+                seen["next"] = cards[0].id
+                return
+            await asyncio.sleep(0.03)
+        raise AssertionError("运行没有停到第二道审批上")
+
+    Models(monkeypatch, shop, before=approve_and_wait_for_the_next)
+    graph = chain(node("start", "input"), node("fetch", "tool", tool=f"db_query__{shop}", args={"sql": QUERY}),
+                  node("write", "report", "写周报", instructions="写周报"),
+                  node("gate", "human", mode="approve", title="周报可以出具吗"),
+                  node("gate2", "human", mode="approve", title="再确认一次"),
+                  node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
+    paused = await pause(shop, graph=graph)
+    [first] = await pending(paused.id)
+    seen.update(run=paused.id, approval=first.id)
+    r = await ask(client, paused.id, report="write", unit=None, question=QUESTION, approval_id=first.id)
+    assert r.status_code == 200, r.text
+    assert r.json()["recorded"] is False and r.json()["note"] == NOT_RECORDED
+    assert (await _row(paused.id)).status == "interrupted", "运行停在第二道审批上"
+    assert await events(paused.id, "approval.inquiry") == []
+    r = await client.post(f"/api/approvals/{seen['next']}/decide", json={"approved": True})
+    assert r.status_code == 200, r.text
+    final = await wait(paused.id)
+    assert final.status == "succeeded" and (await verify_manifest(paused.id))["ok"] is True
+
+
+def _book(rows: list[list]) -> bytes:
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "明细"
+    for row in rows:
+        ws.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+async def _publish(name: str, rows: list[list]) -> tuple[str, str]:
+    """发布一版上传表格（一张「明细」），返回 (源 id, 快照 id)。源不存在就新建。"""
+    (settings.data_dir / "uploads").mkdir(parents=True, exist_ok=True)
+    async with SessionLocal() as session:
+        row = (await session.execute(select(DataSource).where(DataSource.name == name))).scalar_one_or_none()
+        if row is None:
+            row = DataSource(id=uuid.uuid4().hex, name=name, kind="sqlite", readonly=True, origin="upload")
+        result = await table_versions.publish_upload(session, row, _book(rows), "客流.xlsx", header_row=1,
+                                                     mixed="reject", raw_mode=False)
+        return row.id, result.snapshot_id
+
+
+async def test_an_uploaded_table_is_queried_at_the_version_the_run_pinned(monkeypatch, client):
+    """运行停在审批时上传表格重传了一版：质询查的仍是运行固定的那一版，和报告用的是同一份数据。"""
+    name = f"upload_{uuid.uuid4().hex[:8]}"
+    _, first = await _publish(name, [["区域", "数量"], ["分区甲", 1], ["分区乙", 2]])
+    plays = {"合计": Play(['SELECT SUM("数量") AS 合计 FROM "明细"'], "合计为 [[v:Q1.r0.合计]]。[[see:Q1]]")}
+    Models(monkeypatch, name, writer="数量合计 [[v:Q1.r0.total]]。[[see:Q1]]", plays=plays)
+    graph = chain(node("start", "input"),
+                  node("fetch", "tool", tool=f"db_query__{name}", args={"sql": 'SELECT SUM("数量") AS total FROM "明细"'}),
+                  node("write", "report", "写周报", instructions="写周报"),
+                  node("gate", "human", mode="approve", title="周报可以出具吗"),
+                  node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]))
+    paused = await pause(name, graph=graph)
+    await _publish(name, [["区域", "数量"], ["分区甲", 60], ["分区乙", 40]])
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question="数量合计是多少？", approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    item = r.json()["inquiry"]
+    assert item["answer"]["text"] == "合计为 3。", "按运行固定的那一版查，不是重传之后的"
+    [query] = item["queries"]
+    assert artifact_store.load(query["artifact"])["data_version"] == first
+    assert (await _row(paused.id)).data_versions == paused.data_versions
+
+
+async def test_the_settings_and_the_runs_pinned_versions_reach_the_agent(monkeypatch, shop, client):
+    await set_verify({"inquiry": {"max_queries": 3, "timeout_s": 45}, "daily_max_usd": 3.5})
+    seen: dict = {}
+    original = inquiry_mod.run_verify_agent
+
+    async def spy(**kwargs):
+        seen.update(kwargs)
+        return await original(**kwargs)
+
+    monkeypatch.setattr(inquiry_mod, "run_verify_agent", spy)
+    Models(monkeypatch, shop)
+    paused = await pause(shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question=QUESTION, approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    assert (seen["max_queries"], seen["timeout_s"], seen["daily_max_usd"]) == (3, 45, 3.5)
+    assert seen.get("data_versions") == paused.data_versions and seen["sources"] == [shop]
+    assert seen["run_id"] == paused.id and seen.get("emit") is None
+
+
+async def test_a_run_continued_while_the_inquiry_opens_is_refused(monkeypatch, shop, client):
+    """读完运行状态之后、核对封存之前，运行被继续了：记录上的封存是上一次结束时的，不开放（也不白问一次模型）。"""
+    from app.api import evidence
+
+    models = Models(monkeypatch, shop)
+    done = await finish(shop)
+    original = evidence._sealed
+
+    async def continued_meanwhile(run_id):
+        async with SessionLocal() as session:
+            row = await session.get(Run, run_id)
+            row.status = "running"
+            await session.commit()
+        return await original(run_id)
+
+    monkeypatch.setattr(evidence, "_sealed", continued_meanwhile)
+    r = await ask(client, done.id, report="write", unit=None, question=QUESTION)
+    assert r.status_code == 409 and r.json()["code"] == "inquiry_not_open"
+    assert models.tasks == [] and models.specs == []
+
+
+async def test_a_report_document_that_belongs_to_another_run_is_refused(monkeypatch, shop, client):
+    """事件里记的报告文档其实是另一次运行的（内容寻址只保证没被改，不保证没被张冠李戴）：不据此质询。"""
+    models = Models(monkeypatch, shop)
+    paused = await pause(shop)
+    other = await pause(shop)
+    [approval] = await pending(paused.id)
+    [checked] = await events(paused.id, "report.checked", "write")
+    [foreign] = await events(other.id, "report.checked", "write")
+    async with SessionLocal() as session:
+        stored = await session.get(RunEvent, checked.id)
+        stored.data = {**stored.data, "doc_artifact": foreign.data["doc_artifact"]}
+        await session.commit()
+    r = await ask(client, paused.id, report="write", unit=None, question=QUESTION, approval_id=approval.id)
+    assert r.status_code == 422 and r.json()["field"] == "report"
+    assert models.tasks == []
+
+
+# --------------------------------------------------------------------------
+# 数据源：同名重建的不查
+# --------------------------------------------------------------------------
+
+
+async def test_a_source_rebuilt_under_the_same_name_is_not_queried(monkeypatch, tmp_path, client):
+    """运行用过的数据源被删了、又用同一个名字新建（手工源、上传表格都算）：那已经不是这次运行查过的数据，不交给 agent；
+    上传表格也不会因此被补固定进运行记录。"""
+    name, source_id = await _source(tmp_path)
+    plays = {"华南为什么": Play([], "查不到判断所需的数据。")}
+    models = Models(monkeypatch, name, plays=plays)
+    done = await finish(name)
+    assert done.status == "succeeded", done.error
+
+    async def drop(sid) -> None:
+        async with SessionLocal() as session:
+            await session.delete(await session.get(DataSource, sid))
+            await session.commit()
+        await engines.invalidate(sid)
+
+    await drop(source_id)
+    _, rebuilt = await _source(tmp_path, name=name)
+    note = f"注：这次运行还用到了数据源「{name}」，已不存在、已停用或已被重建，未能查询，以上回答不含其中的数据。"
+    r = await ask(client, done.id, report="write", unit=None, question="华南为什么低？")
+    assert r.status_code == 200, r.text
+    assert r.json()["inquiry"]["answer"]["text"] == f"查不到判断所需的数据。\n\n{note}"
+    [task] = models.tasks
+    assert f"（这次运行还用到了「{name}」，已不存在、已停用或已被重建，无法查询）" in task
+
+    # 同名新建成上传表格。升级前的查询快照引用没记源 id（认不出是不是同一个源）：这次运行没固定过它的版本，照样不查
+    await drop(rebuilt)
+    await _publish(name, [["区域", "数量"], ["分区甲", 1]])
+    async with SessionLocal() as session:
+        for ref in (await session.execute(select(Artifact).where(Artifact.run_id == done.id))).scalars():
+            ref.meta = {}
+        await session.commit()
+    r = await ask(client, done.id, report="write", unit=None, question="华南为什么低？")
+    assert r.status_code == 200 and r.json()["inquiry"]["answer"]["text"].endswith(note)
+    assert (await _row(done.id)).data_versions == done.data_versions, "上传表格没有被补固定进已封存的运行"
+
+
+# --------------------------------------------------------------------------
+# 说法：触顶、失败、开放不了
+# --------------------------------------------------------------------------
+
+
+async def test_running_out_of_rounds_is_not_reported_as_the_query_limit(monkeypatch, shop, client):
+    """模型一直在看表结构、轮数用完了：没查过一次，不能说「查询次数到顶」；回答里的引用一个都解析不了，末尾说明。"""
+    await set_verify({"inquiry": {"max_queries": 1}})
+    plays = {"排除测试账号": Play([], "仍居首：华东为 [[v:Q1.r0.销售额]]。", schema=99)}
+    Models(monkeypatch, shop, plays=plays)
+    paused = await pause(shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question=QUESTION, approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    item = r.json()["inquiry"]
+    assert (item["answer"]["ok"], item["answer"]["limit"], item["queries"]) == (True, None, [])
+    assert item["answer"]["text"] == (f"仍居首：华东为 ⟦?v:Q1.r0.销售额⟧。\n\n{ROUNDS_NOTE}\n\n"
+                                      f"{UNRESOLVED_NOTE.format(n=1)}")
+
+
+async def test_failed_queries_are_explained(monkeypatch, shop, client):
+    """两次查询都执行失败、次数用完了：查询清单只列成功的，回答末尾说清有几次失败、几处引用解析不了。"""
+    await set_verify({"inquiry": {"max_queries": 2}})
+    plays = {"排除测试账号": Play(["SELECT nope FROM sales", "SELECT nothing FROM sales"], NO_TEST_ANSWER)}
+    Models(monkeypatch, shop, plays=plays)
+    paused = await pause(shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question=QUESTION, approval_id=approval.id)
+    assert r.status_code == 200, r.text
+    item = r.json()["inquiry"]
+    assert (item["answer"]["limit"], item["queries"]) == ("max_queries", [])
+    assert item["answer"]["text"] == ("仍居各区域之首：排除测试账号后华东为 ⟦?v:Q1.r0.销售额⟧，华南为 ⟦?v:Q1.r1.销售额⟧。\n\n"
+                                      f"{FAILED_NOTE.format(n=2)}\n\n{UNRESOLVED_NOTE.format(n=2)}")
+
+
+async def test_an_answer_not_given_in_the_asked_shape_says_what_to_do(monkeypatch, shop, client):
+    plays = {"排除测试账号": Play([NO_TEST], final={"answer": "华东仍居首"})}
+    Models(monkeypatch, shop, plays=plays)
+    paused = await pause(shop)
+    [approval] = await pending(paused.id)
+    r = await ask(client, paused.id, report="write", unit=None, question=QUESTION, approval_id=approval.id)
+    answer = r.json()["inquiry"]["answer"]
+    assert answer["ok"] is False
+    assert answer["error"] == "模型未能按要求给出回答，请重新提问；如反复出现，请在设置的「核查」一节更换核查模型"
+
+
+def test_internal_wording_from_the_agent_is_not_shown():
+    """核查 agent 的原话（「交结果」「按结构」、裸写的字段名）换成提问人看得懂的话，并说下一步。"""
+    def words(error, limit=None, result=None):
+        outcome = verify_agent.VerifyOutcome(result=result, cells=[], queries=[], rationale=None, usage={},
+                                             limit=limit, error=error)
+        return inquiry_mod._error_words(outcome, timeout_s=120, daily_max_usd=2.0)
+
+    assert words("收尾时超过时长上限，没能交结果", limit="timeout_s") == \
+        "回答超过时长上限（120 秒），未能给出回答，可缩小问题范围后重新提问"
+    assert words("已达全局每日核查金额上限 $2.00，没能交结果", limit="daily_max_usd") == \
+        "今日核查花费已达上限（核查每日金额上限 $2.00），未能给出回答，可在设置的「核查」一节调高上限"
+    assert words("核查模型没有按结构交结果（交回的内容里没有要求的字段：rationale）") == \
+        "模型未能按要求给出回答，请重新提问；如反复出现，请在设置的「核查」一节更换核查模型"
+    assert words("核查模型没有给出回复") == "模型没有给出回复，未能给出回答，请重新提问"
+    assert words("核查出错（磁盘已满）") == "回答时出错（磁盘已满），请重新提问"
+    assert words("核查模型不可用（没有配置模型接入）") == "核查模型不可用（没有配置模型接入）"
+    assert words(None) is None
+
+
+async def test_refusals_while_the_run_is_executing_say_what_to_do(monkeypatch, shop, client):
+    """运行在执行：带着审批卡来的多半是卡刚被别人批了，叫人刷新；没带卡的按运行类别说什么时候能问。"""
+    Models(monkeypatch, shop)
+    async with SessionLocal() as session:
+        exploring = Run(workflow_name="还在执行", status="running", graph={}, input={}, run_class="exploratory")
+        formal = Run(workflow_name="还在执行", status="queued", graph={}, input={}, run_class="formal")
+        session.add_all([exploring, formal])
+        await session.commit()
+        ids = exploring.id, formal.id
+    r = await ask(client, ids[0], report="write", unit=None, question=QUESTION, approval_id="card-1")
+    assert r.status_code == 409
+    assert r.json() == {"detail": "这张审批卡已处理，运行正在继续执行，请刷新页面查看最新状态", "code": "inquiry_not_open"}
+    r = await ask(client, ids[0], report="write", unit=None, question=QUESTION)
+    assert r.json()["detail"] == "运行仍在执行。停在人工审批时，或运行结束并封存后，才能质询"
+    r = await ask(client, ids[1], report="write", unit=None, question=QUESTION)
+    assert r.json()["detail"] == "运行仍在执行，停在人工审批时才能质询"
