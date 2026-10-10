@@ -20,6 +20,7 @@ import { compare } from './compare'
 import { inquiry } from './inquiry'
 import { schedules } from './schedules'
 import { whatif } from './whatif'
+import { reportExport } from './reportExport'
 
 // 请求层搬到了 http.ts（见那边的说明）。原先从这里导出的照旧从这里导出，调用方不用改；
 // 请求函数也一并转出，给不在 api/ 下、又想直接发请求的地方用。api/ 下的命名空间文件请直接从 http.ts 导入
@@ -754,6 +755,7 @@ export const api = {
   bundle,
   inquiry,
   whatif,
+  reportExport,
 }
 
 /**

@@ -463,8 +463,8 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
 
     rendered = pages()
     got = {name: json.loads(data_block(page)) for name, page in rendered.items()}
-    assert set(got) == {"base", "two-reports", "legacy", "failed", "continued", "degraded", "missing-doc",
-                        "missing-card", "nan", "stray", "masked-card", "masked-source"}
+    assert set(got) == {"base", "two-reports", "metric-only", "legacy", "failed", "continued", "degraded",
+                        "missing-doc", "missing-card", "nan", "stray", "masked-card", "masked-source"}
     for name, bundle in got.items():
         assert browser_manifest(bundle["events"]) == bundle["meta"]["manifest_hash"], name
 
@@ -488,6 +488,19 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     assert next(a for a in got["missing-card"]["artifacts"] if a["kind"] == "metric_set").get("missing") is True
     assert got["legacy"]["meta"]["legacy"] is True and "run.finished" in [a["type"] for a in got["legacy"]["appended"]]
     assert [r["node_id"] for r in got["two-reports"]["reports"]] == ["write", "monthly"] and segments(got["two-reports"], "monthly")
+    # 只引用指标的报告：门店流水没被正文引用，从口径卡的输入这一条路随文件附带（点开数字看得到 SQL 和被引用的行）；
+    # 会员消费谁都没引用，不嵌。口径卡带着原式、代入式、输入和复算
+    only = got["metric-only"]
+    shapes = {(a["kind"], a.get("node_id")): {k for k in a if k in ("b64", "masked", "missing")}
+              for a in only["artifacts"]}
+    assert shapes == {("report_doc", "write"): {"b64"}, ("metric_set", "card"): {"b64"}, ("query", "fetch"): {"b64"}}
+    card = json.loads(base64.b64decode(next(a["b64"] for a in only["artifacts"] if a["kind"] == "metric_set")))
+    [gmv] = card["metrics"]
+    from tests.bundle_samples import STORES
+
+    assert gmv["expression"].startswith("cell(nodes.fetch, 0, 'amount')") and "1280.5" in gmv["substituted"]
+    assert gmv["recompute_ok"] is True and len(gmv["inputs"]) == len(STORES)
+    assert [s["text"] for s in segments(only)] and not [s for s in segments(only) if s.get("cite", {}).get("kind") == "cell"]
     failed = got["failed"]
     assert failed["meta"]["status"] == "failed" and failed["meta"]["tier"] is None
     assert max(failed["events"], key=lambda e: e["seq"])["type"] == "run.failed"

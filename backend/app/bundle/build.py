@@ -12,8 +12,10 @@
   嵌入，别的不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，有输入取自遮罩列（cell() 的格、Agent 字段、按位置
   取的 vars.res.rows[0][2]，SQL 里改了名字的遮罩列也算，SQL 认不出结果里哪一列取自哪一列的整份快照的列都算）的整张卡
   同样只给 id，认法和证据面板、推演同一个（recompute.input_origin）；服务端文件被改过的卡照样按卡上记的输入认，解析
-  不出一张卡的整张只给 id。只给 id 的工件，服务端的文件和 id 对不上的另标 mismatch、解析不出来的另标 unparsable，
-  核对页照实说（对不上的判不通过）。没被报告引用的工件不嵌。
+  不出一张卡的整张只给 id。随文件附带的口径卡，它记着的输入指向的查询快照也一并附上（遮罩规则同上）：点开数字时
+  看得到每个输入的 SQL 和被引用的行，引用链（④）按「已核对的口径卡的输入」认它们。只给 id 的工件，服务端的文件和
+  id 对不上的另标 mismatch、解析不出来的另标 unparsable，核对页照实说（对不上的判不通过）。没被报告引用、也没被
+  附带的口径卡的输入引用的工件不嵌。
 - 封存之后追加的事件（按需裁判、审批质询这类批注）单列：类型、序号、内容摘要，不进清单。
 
 它只证明「内部一致」：数字、文档、运行记录彼此对得上，而且没被改过。真伪要拿页面上的封存哈希和系统里这次
@@ -762,6 +764,30 @@ def _cited_artifacts(doc: dict[str, Any]) -> list[tuple[str, str, str | None]]:
     return list(dict.fromkeys(out))
 
 
+def _card_input_queries(card: Any) -> list[tuple[str, str | None]]:
+    """口径卡记着的输入引用的查询快照：(工件 id, 输入来自的节点)，按先后、按工件去重。
+
+    只认 cell() 取的格、Agent 交来的字段这两类带着定位的输入（nodes.*、input.* 的取值不走查询快照）。
+    卡是调用方确认过随文件附带的那份（遮罩的、文件不在的不进来）：出处面板据此展示每个输入的 SQL 和被引用的行。"""
+    out: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    if not isinstance(card, dict):
+        return out
+    for metric in card.get("metrics") or []:
+        if not isinstance(metric, dict):
+            continue
+        for item in metric.get("inputs") or []:
+            if not isinstance(item, dict) or item.get("via") not in ("tool_cell", "agent_field"):
+                continue
+            artifact = item.get("artifact")
+            if not isinstance(artifact, str) or not artifact or artifact in seen:
+                continue
+            seen.add(artifact)
+            owner = item.get("node_id")
+            out.append((artifact, str(owner) if owner else None))
+    return out
+
+
 class _Artifacts:
     """嵌进页面的工件清单，按先后：报告文档在前，接着是它引用到的。同一份只列一次。events 是封存范围内的事件
     （认口径卡带不带遮罩时找写变量的节点当时的产出）。"""
@@ -770,11 +796,13 @@ class _Artifacts:
         self.store = store
         self.events = events
         self.items: list[dict[str, Any]] = []
+        self._by_id: dict[str, dict[str, Any]] = {}
         self._seen: set[str] = set()
 
-    def add(self, artifact: str, kind: str, node_id: str | None) -> None:
+    def add(self, artifact: str, kind: str, node_id: str | None) -> dict[str, Any] | None:
+        """列进清单的一份工件，交回它的条目（同一份只列一次，第二次交回第一次的）。"""
         if artifact in self._seen:
-            return
+            return self._by_id[artifact]
         self._seen.add(artifact)
         item: dict[str, Any] = {"id": artifact, "kind": kind}
         if node_id:
@@ -796,6 +824,8 @@ class _Artifacts:
             # 原样嵌入，不在这里复验哈希：被改过的文件照实交出去，浏览器自己算出对不上
             item["b64"] = base64.b64encode(bytes(raw)).decode("ascii")
         self.items.append(item)
+        self._by_id[artifact] = item
+        return item
 
 
 # --------------------------------------------------------------------------
@@ -930,9 +960,16 @@ def build_bundle(
         if not isinstance(doc, dict) or doc.get("run_id") != run.get("id") or doc.get("node_id") != node_id:
             continue
         for artifact, kind, owner in _cited_artifacts(doc):
-            artifacts.add(artifact, kind, owner)
+            item = artifacts.add(artifact, kind, owner)
             if kind == "query":
                 cited_queries.append(artifact)
+                continue
+            # 口径卡随文件附带了（没遮、文件在）：它记着的输入——哪个指标的值取自哪次查询的哪一格——
+            # 那几次查询的快照也一并附上（设了遮罩的照旧只给 id）。点开数字看得到输入的 SQL 和被引用的行；
+            # 引用链（④）按「已核对的口径卡的输入」认它们，被改过的卡（intact 不过）不带，免得替它圆
+            if kind == "metric_set" and item is not None and "b64" in item and store.intact(artifact):
+                for query, query_owner in _card_input_queries(store.content(artifact)):
+                    artifacts.add(query, "query", query_owner)
 
     masked_run = _masked_run(sealed, store, cited_queries, source_masks or {})
     shown_events = []

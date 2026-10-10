@@ -2,7 +2,6 @@
 
 一件证据可信，当且仅当它能从封存范围内的事件（seq ≤ manifest_seq）出发走到，
 并且取回时哈希复验通过：
-
 - 报告文档：report.checked 事件里的 doc_artifact
 - 口径卡的指标集：口径卡节点 node.finished 事件里的 evidence 台账
 - 查询快照：tool.end 事件里的 query_artifact，或者 node.finished.evidence 里的 query 条目
@@ -20,6 +19,10 @@ artifacts 表可以事后插行，run.output 是可以改写的一列，封存�
 查询步骤只给被引用的行和前后各 2 行，完整快照仍走 /api/artifacts/{id}。数据源
 options.mask_columns 里的列换成「已遮罩」——在有身份体系之前，这只减少暴露，不是
 安全边界：知道工件 id 的人照样能取到整份快照。
+
+报告导出（GET /api/runs/{run_id}/report.html，app/report_export）用的也是这套出处链：
+把选中的报告文档渲染成自包含的 HTML，每个数字点得开和网页上同一个拼法的面板
+（口径、来源、计算方式），同样的引用共用一条链。
 
 期 4 的核查状态同样只读封存范围内的东西：指标步骤带双盲复算的结果（_dual_check_of，读双盲复算节点的产出和台账
 条目），句子带反方审稿的判断（_challenge_of，读反方审稿节点的产出和审稿记录）。它们是核查，不是证据：没有就不带这两个键。
@@ -1566,6 +1569,99 @@ async def evidence_provenance(run_id: str, segment_id: str, report: str | None =
     chosen, (_block, _unit, seg) = _open_segment(sealed, report, segment_id)
     out = await segment_provenance(chosen, seg, sealed, masks=_Masks())
     return asdict(out)
+
+
+# --------------------------------------------------------------------------
+# GET /api/runs/{run_id}/report.html（报告导出：自包含的 HTML，数字点得开口径、来源、计算方式）
+# --------------------------------------------------------------------------
+
+
+def _export_cite_key(seg: dict[str, Any]) -> tuple | None:
+    """数字 / 取值片段的引用键：同一处引用（同一个指标、同一格、同样的换算）共用一条出处链。
+    别的片段（表名、引文）的链跟着片段走，不归并。"""
+    if seg.get("kind") not in ("number", "value"):
+        return None
+    cite = seg.get("cite")
+    if not isinstance(cite, dict):
+        return None
+    loc = cite.get("locator") if isinstance(cite.get("locator"), dict) else {}
+    return (cite.get("kind"), cite.get("alias"), cite.get("status"), cite.get("conv"),
+            loc.get("metric"), loc.get("row"), loc.get("column"), loc.get("field"), seg.get("issue"))
+
+
+@router.get("/{run_id}/report.html")
+async def export_report_html(run_id: str, report: str | None = None) -> Response:
+    """把一次运行的报告导出成一个自包含的 HTML 文件（app/report_export）。
+
+    正文由服务端按报告文档渲染（不执行脚本也读得到）；带出处链的数据嵌在页面里，执行脚本后每个数字、
+    无证据的数字、可疑的表名字段名都点得开——面板是网页上证据面板同一个拼法（_chain）：口径卡、口径与
+    版本、原式、代入式、输入、复算、SQL、被引用的行。封存状态逐项标明；没封存的运行照常导出（和网页上
+    读报告一个道理）。只读：不追加任何事件，不改运行记录。
+
+    一次运行里有好几份报告时用 ?report=<节点 id> 指定；不指定取成果里标注的那一份（和片段接口同一个选法）。
+    选报告、错误码和片段接口相同（run_not_found、evidence_report_not_found、evidence_doc_tampered、
+    evidence_doc_missing）。
+    """
+    from datetime import datetime, timezone
+
+    from app.report_export.build import (
+        attachment_name, build_report, content_disposition, render_html, segment_state,
+    )
+
+    sealed = await _sealed(run_id)
+    reports = _reports(sealed)
+    if not reports:
+        raise CodedHTTPException(404, "本次运行没有报告文档，没有可导出的报告", REPORT_NOT_FOUND)
+    chosen = _choose(reports, report, sealed)
+    if chosen.hash_ok is False:
+        raise CodedHTTPException(409, "报告文档与哈希不一致，疑似被修改，不能导出", DOC_TAMPERED)
+    if chosen.doc is None:
+        raise CodedHTTPException(404, "无法读取报告文档", DOC_MISSING)
+    doc = chosen.doc
+    nodes: dict[str, dict[str, str]] = {}
+    for item in sealed.graph.get("nodes") or []:
+        if isinstance(item, dict) and item.get("id"):
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            nodes[str(item["id"])] = {"label": str(data.get("label") or item["id"]),
+                                      "type": str(item.get("type") or "")}
+    # 每个有状态的片段一条出处链（和网页上点开的同一个 _chain）；同样的引用共用一条，别把整份快照抄几十遍
+    masks = _Masks()
+    chains: dict[str, list[dict[str, Any]]] = {}
+    refs: dict[str, str] = {}
+    notes: dict[str, str] = {}
+    memo: dict[tuple, str] = {}
+    for _, unit in iter_units(doc):
+        for seg in unit.get("segments") or []:
+            if not isinstance(seg, dict) or not seg.get("id") or segment_state(seg) is None:
+                continue
+            sid = str(seg["id"])
+            if note := _note(seg, unit):
+                notes[sid] = note
+            key: tuple | None = _export_cite_key(seg)
+            if key is not None and key in memo:
+                refs[sid] = memo[key]
+                continue
+            chain = await _chain(seg, doc, sealed, chosen.node_id)
+            ck = key if key is not None else (sid,)
+            chains[str(ck)] = chain
+            refs[sid] = str(ck)
+            if key is not None:
+                memo[key] = str(ck)
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        if run is None:      # 两次读之间被删掉了
+            raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND)
+        info = {"id": run.id, "workflow_id": run.workflow_id, "workflow_name": run.workflow_name,
+                "run_class": run.run_class, "status": run.status,
+                "started_at": run.started_at, "finished_at": run.finished_at}
+    data = build_report(info, report_node=chosen.node_id, doc_artifact=chosen.doc_artifact,
+                        doc_hash_ok=chosen.hash_ok, doc=doc, seal=sealed.seal, chains=chains, refs=refs,
+                        notes=notes, nodes=nodes, exported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    return Response(render_html(data, doc), media_type="text/html; charset=utf-8", headers={
+        "Content-Disposition": content_disposition(attachment_name(info), run_id=run_id),
+        # 导出的是这一刻的报告和出处，不该被哪一层缓存下来、换给下一个请求
+        "Cache-Control": "no-store",
+    })
 
 
 #: R14 之后（绑定快照、取引擎、编译核对、回查、行级核对）会抛的三类异常，按 _snapshot_failure 的顺序映射

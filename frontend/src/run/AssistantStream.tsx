@@ -10,7 +10,7 @@ import {
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
-import { ErrorNotice, Modal, Skeleton, StatusBadge } from '../components/ui'
+import { ErrorNotice, Modal, Skeleton, Spinner, StatusBadge, toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
@@ -2036,6 +2036,8 @@ function Output({ output, runClass, broken, question, onFollowUp, runId }: {
   // 成果（旧运行、没有报告节点的图）一个字段都不会进这里，渲染和以前完全一样
   const evidence = useMemo(() => evidenceFields(output), [output])
   const firstEvidence = entries.find(([k, v]) => evidence.has(k) && typeof v === 'string')?.[0]
+  // 第一份带证据的字段出自哪个报告节点：导出 HTML 时点名（服务端按它挑报告文档）
+  const reportNode = firstEvidence ? evidence.get(firstEvidence)?.report : undefined
   const docRef = useRef<EvidenceDocHandle>(null)
   // 第一份报告文档取到之后，出具横幅多一行「N/N 数字有出处 · 无证据 M」
   const [tallyDoc, setTallyDoc] = useState<EvidenceDocData | null>(null)
@@ -2070,7 +2072,8 @@ function Output({ output, runClass, broken, question, onFollowUp, runId }: {
       <div className={clsx('relative', broken && 'border-l-2 pl-2.5')}
            style={broken ? { borderColor: 'var(--st-failed)' } : undefined}>
         {entries.length > 0 && (
-          <AnswerActions entries={entries} question={question} issuance={issuance} />
+          <AnswerActions entries={entries} question={question} issuance={issuance}
+                         runId={firstEvidence ? runId : undefined} reportNode={reportNode} />
         )}
         <div className="space-y-2">
           {entries.map(([key, value]) => (
@@ -2134,23 +2137,65 @@ function answerMarkdown(entries: [string, any][], question?: string, issuance?: 
   return parts.join('\n\n')
 }
 
-/** 答案上的操作：复制、导出 Markdown。悬停时浮出，键盘聚焦时也出来 */
-function AnswerActions({ entries, question, issuance }: {
+/** 答案上的操作：复制、导出。悬停时浮出，键盘聚焦时也出来。
+ *
+ * 成果带逐段证据（报告文档）时，导出从服务端拿自包含的 HTML：正文里的数字点得开口径、来源和计算方式，
+ * 和网页上一样；Markdown 照旧保留一个小的（贴进周报的还是纯文本）。没有证据的成果（旧运行、没有报告节点
+ * 的图）照旧只导 Markdown。 */
+function AnswerActions({ entries, question, issuance, runId, reportNode }: {
   entries: [string, any][]; question?: string; issuance?: any
+  /** 这份成果出自哪次运行：带证据的报告从服务端导出成 HTML */
+  runId?: string
+  /** 报告撰写节点的 id（成果 _evidence 标注的那份）；没有时服务端自己挑成果标注的那一份 */
+  reportNode?: string
 }) {
   const md = () => answerMarkdown(entries, question, issuance)
+  const [exporting, setExporting] = useState(false)
+  const exportHtml = runId ? async () => {
+    setExporting(true)
+    try {
+      const { blob, name } = await api.reportExport.download(runId, reportNode)
+      const file = name ?? `${fileSafe(question ?? '报告')}-报告.html`
+      saveBlob(file, blob)
+      toast.ok(`已导出「${file}」`)
+    } catch (e) {
+      toast.error(e, { key: `report-export:${runId}` })
+    } finally {
+      setExporting(false)
+    }
+  } : null
   return (
     <div className="absolute right-0 top-0 z-[1] flex items-center gap-0.5 rounded opacity-0 shadow-elev-1 transition-opacity focus-within:opacity-100 group-hover/answer:opacity-100"
          style={{ background: 'var(--bg-panel)' }}>
       <CopyChip label="复制" text={md} />
+      {exportHtml ? (
+        <button type="button"
+                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-2xs text-dim transition-colors hover:bg-hover hover:text-fg"
+                title="导出为 HTML 文件：数字点得开口径、来源和计算方式（和网页上一样）"
+                disabled={exporting}
+                onClick={() => void exportHtml()} data-answer-export="html">
+          {exporting ? <Spinner size={10} aria-hidden /> : <FileDown size={11} aria-hidden />} 导出
+        </button>
+      ) : null}
       <button type="button"
               className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-2xs text-dim transition-colors hover:bg-hover hover:text-fg"
-              title="导出为 Markdown 文件"
-              onClick={() => download(`${fileSafe(question ?? '答案')}.md`, md(), 'text/markdown;charset=utf-8')}>
-        <FileDown size={11} aria-hidden /> 导出
+              title={exportHtml ? '导出为 Markdown 文件（纯文本，不带出处）' : '导出为 Markdown 文件'}
+              onClick={() => download(`${fileSafe(question ?? '答案')}.md`, md(), 'text/markdown;charset=utf-8')}
+              data-answer-export={exportHtml ? 'md' : undefined}>
+        {exportHtml ? 'MD' : (<><FileDown size={11} aria-hidden /> 导出</>)}
       </button>
     </div>
   )
+}
+
+/** 存成文件（Blob）：对象 URL 交给一个临时的链接点一下，稍后回收（同记录页可验证报告的下载写法） */
+function saveBlob(name: string, blob: Blob) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 /**

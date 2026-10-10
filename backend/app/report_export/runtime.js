@@ -1,0 +1,465 @@
+/*
+ * 报告导出的浏览器端：点开正文里的一个数字 / 名称 / 引文，展示它的出处链（口径、来源、计算方式）。
+ * 原生 JS，无依赖，不连网。正文是服务端按报告文档渲染好的 HTML，这里只做三件事：
+ *   ① 填页面头部（报告节点、文档工件、封存状态、运行信息）；
+ *   ② 给带状态的片段接上点击和键盘（事件委托在正文容器上），点开右侧的出处面板；
+ *   ③ 按数据块里的出处链渲染面板：指标步骤（口径卡、口径与版本、原式、代入式、输入、复算、双盲复算）、
+ *      输入步骤（值、来自哪个节点哪次查询的哪一格）、查询步骤（SQL、被引用的行、遮罩列、SQL 检查）、
+ *      运行输入、表名字段名、引文，和网页上的证据面板（api/evidence 的片段接口）同一个拼法。
+ * 链里的每一步带着导出那一刻的封存与哈希状态，照实标明；这份文件不是核对件（页脚写明）。
+ * 来自数据的文字一律经 textContent 写进页面，不拼 HTML。
+ */
+(() => {
+  'use strict'
+
+  // ------------------------------------------------------------------ 文案
+
+  const T = {
+    schema: (s) => `文件格式 ${s}`,
+    stateLabel: {
+      deterministic: '有出处', none: '无证据', suspect: '疑似不存在的名称', unverified: '无法核实',
+      unjudged: '未裁判', candidate: '猜测的来源',
+    },
+    kindLabel: { number: '数字', value: '取值', entity: '名称', quote: '引文' },
+    segTitle: (kind, text) => `${kind}「${text}」`,
+    metaRun: '运行 ID', metaClass: '运行类别', metaStatus: '运行状态', metaReport: '报告节点',
+    metaStarted: '开始', metaFinished: '结束', metaExported: '导出时间',
+    classLabel: { formal: '正式运行', exploratory: '探索运行' },
+    statusLabel: { succeeded: '已完成', failed: '已失败', cancelled: '已取消', running: '进行中', waiting: '等待审批' },
+    docHashBad: '这份报告文档与哈希不一致（疑似被修改），正文仅供参考，其中的口径和出处未经核对。',
+    sealNone: '这次运行导出时尚未封存：下列出处来自导出那一刻的系统记录，未经封存核对。',
+    sealOk: (hash) => `运行已封存，清单哈希 ${hash}。要向系统外的人证明文件未被修改，请导出「可验证报告」（记录页 · 凭证详情），拿封存哈希去系统对照。`,
+    sealBroken: '封存核对不一致：事件在封存后被修改、删除或插入，下列出处未经核对。',
+    noChain: '这一处没有可展示的出处链。',
+    // 指标步骤
+    metric: '口径卡指标', dName: '指标', dValue: '值', dCaliber: '口径', dExpression: '原式（计算方式）',
+    dSubstituted: '代入式（代入输入后的算式）', dInputs: '输入', dRecompute: '复算', dUnit: '单位',
+    dSource: '来源', dPinned: '口径来源', dUpgrade: '升版处置', dDual: '双盲复算', dArtifact: '工件',
+    dNode: '来源节点', dStatus: '状态', dDecimals: '小数位',
+    recomputeOk: '复算一致', recomputeBad: '复算不一致：代入式的计算结果与记录值不符', recomputeNone: '无法复算',
+    incomplete: '结果不完整', incompleteWhy: (t) => `基于被截断的查询结果计算，结果不完整${t ? `：${t}` : ''}`,
+    sqlCheckFailed: 'SQL 检查未通过', sqlCheckWhy: (t) => `所依据的查询未通过 SQL 检查，结果不可靠${t ? `：${t}` : ''}`,
+    missingValue: '缺少输入：口径卡本次未计算出该指标的值',
+    dualLabel: { agreed: '一致', disagreed: '不一致', unchecked: '无法复算', skipped: '未复算' },
+    dualMore: (t) => `（${t}）`,
+    // 输入步骤
+    input: '输入', dPath: '路径', dFrom: '取自', dQuery: '查询', dCell: '位置', dMasked: '已遮罩',
+    maskNote: '取自设置了遮罩的列，值不随文件显示。遮罩只减少暴露，不是安全边界',
+    maskUnverified: (t) => `遮没遮核对不了：${t}`,
+    truncated: '查询结果已截断，该字段只含取回的部分行',
+    // 查询步骤
+    query: '查询', dSql: 'SQL', dSourceName: '数据源', dTool: '工具', dRows: '被引用的行', dAllRows: (n) => `共 ${n} 行`,
+    dColumnsMasked: '遮罩列', dChecks: 'SQL 检查', windowCut: '被引用的行前后行数太多，只列出其中一部分',
+    truncatedRows: '查询结果被截断，取回的行不完整',
+    merge: '合并查询', mergeInputs: '合并的输入', mergeTraced: '被引用格的来历', mergeWarnings: '执行时的警告',
+    mergeNoLineage: '没有逐格来历',
+    dRowOf: (n) => `第 ${n + 1} 行`,
+    // 其余步骤
+    runInput: '运行输入', dField: '字段', entity: '表或字段', quote: '引文', dNameEntity: '名称',
+    dTable: '表', dColumn: '列', dFields: '字段', dFieldsMore: (n) => `另 ${n} 个字段`,
+    dQueries: '出现在哪几次查询', dChecked: '查过的地方', dClosest: '最接近的已知名称',
+    dContent: '原文', dMatch: '比对', dCollection: '知识库', dWhy: '原因',
+    present: '在', absent: '不在',
+    matchOk: '原文一致', matchBad: '与原文不一致', matchNone: '无法比对',
+    // 完整性（每一步都可带）
+    dIntegrity: '核对', sealedOk: '已封存 · 哈希核对一致', sealedNo: '不在封存范围内',
+    hashBad: '工件哈希核对失败', hashNone: '未能读取工件',
+    note: '说明',
+    close: '关闭', openAria: (text) => `查看出处：${text}`,
+  }
+
+  const MASKED = '已遮罩'
+  const NONE = '—'
+
+  // ------------------------------------------------------------------ 工具
+
+  const $ = (id) => document.getElementById(id)
+  const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
+  const own = (obj, key) => (isObj(obj) && typeof key === 'string' && Object.prototype.hasOwnProperty.call(obj, key)
+    ? obj[key] : undefined)
+  const textOf = (v) => (typeof v === 'string' ? v : isObj(v) || Array.isArray(v) ? JSON.stringify(v) : String(v))
+  const short = (id) => (typeof id === 'string' && id.length > 12 ? `${id.slice(0, 12)}…` : String(id ?? ''))
+  const pad = (n) => String(n).padStart(2, '0')
+
+  function h(tag, props, ...kids) {
+    const el = document.createElement(tag)
+    for (const [key, value] of Object.entries(props || {})) {
+      if (value == null || value === false) continue
+      if (key === 'class') el.className = value
+      else if (key.startsWith('on')) el.addEventListener(key.slice(2), value)
+      else el.setAttribute(key, value === true ? '' : String(value))
+    }
+    for (const kid of kids.flat(Infinity)) {
+      if (kid != null && kid !== false) el.append(kid instanceof Node ? kid : String(kid))
+    }
+    return el
+  }
+
+  /** 时间按读者所在时区显示（文件会被转给别的时区的人），后面注明时区 */
+  function when(iso) {
+    if (!iso) return NONE
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return String(iso)
+    const offset = -d.getTimezoneOffset()
+    const zone = `UTC${offset < 0 ? '-' : '+'}${Math.floor(Math.abs(offset) / 60)}${Math.abs(offset) % 60 ? `:${pad(Math.abs(offset) % 60)}` : ''}`
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}（${zone}）`
+  }
+
+  const valueText = (v) => (v == null ? '空值（NULL）' : typeof v === 'string' ? `「${v}」` : textOf(v))
+
+  function kv(rows) {
+    return h('dl', { class: 'kv' }, rows.filter(Boolean).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)]))
+  }
+
+  const badge = (kind, text) => h('span', { class: 'badge', 'data-kind': kind }, text)
+  const ok = (good) => (good === true ? badge('ok', '✓') : good === false ? badge('bad', '✗') : badge('na', '—'))
+
+  // ------------------------------------------------------------------ 数据
+
+  const view = { data: null, active: null, back: null }
+
+  function parseData() {
+    try {
+      const data = JSON.parse($('report-data').textContent)
+      if (isObj(data) && isObj(data.meta)) return data
+    } catch (e) {
+      // 数据块坏了：正文还在（服务端渲染），只是点不开出处
+    }
+    return null
+  }
+
+  // ------------------------------------------------------------------ 头部
+
+  function renderHead(data) {
+    const meta = data.meta
+    $('report-label').textContent = `报告节点「${meta.report?.label || meta.report?.node_id || NONE}」`
+    $('doc-id').textContent = meta.doc_artifact ? `文档 ${short(meta.doc_artifact)}` : ''
+    if (meta.doc_hash_ok === false) {
+      const warn = $('doc-warn')
+      warn.textContent = T.docHashBad
+      warn.hidden = false
+    }
+    const label = (map, value) => map[value] || (value ? String(value) : NONE)
+    $('meta').replaceChildren(...[...[
+      [T.metaRun, h('code', {}, String(meta.run_id || ''))],
+      [T.metaClass, label(T.classLabel, meta.run_class)],
+      [T.metaStatus, label(T.statusLabel, meta.status)],
+      [T.metaReport, String(meta.report?.label || meta.report?.node_id || NONE)],
+      [T.metaStarted, when(meta.started_at)],
+      [T.metaFinished, when(meta.finished_at)],
+      [T.metaExported, when(meta.exported_at)],
+    ].filter(Boolean).flatMap(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])])
+    const seal = meta.seal || {}
+    const box = $('seal-text')
+    if (!seal.sealed) box.textContent = T.sealNone
+    else if (seal.ok === false) box.textContent = T.sealBroken
+    else box.textContent = T.sealOk(String(seal.manifest_hash || ''))
+    $('foot-schema').textContent = T.schema(String(data.schema || ''))
+  }
+
+  // ------------------------------------------------------------------ 每一步的渲染
+
+  const nodeLabel = (id) => {
+    const node = own(view.data.nodes, id)
+    return isObj(node) && node.label ? String(node.label) : (id ? String(id) : NONE)
+  }
+
+  /** 指标步骤：名称、值、口径（口径卡、版本、钉住的来源、升版处置）、原式、代入式、输入、复算、双盲复算 */
+  function metricPart(step) {
+    const body = []
+    const rows = [
+      [T.dName, step.name || step.metric || NONE],
+      step.unit ? [T.dUnit, String(step.unit)] : null,
+      step.decimals != null ? [T.dDecimals, String(step.decimals)] : null,
+    ]
+    body.push(kv(rows))
+    // 口径：口径卡名 + 版本；钉在别的工作流上的写明来自哪一版
+    const caliber = [`${step.caliber || NONE}`, step.version ? ` ${step.version}` : ''].join('')
+    const source = isObj(step.source) ? step.source : null
+    body.push(kv([
+      [T.dCaliber, h('span', {}, `口径卡「${caliber}」`)],
+      source ? [T.dPinned, `工作流「${source.workflow_name || source.workflow_id}」的 ${source.caliber} @ ${source.caliber_version}`] : null,
+    ]))
+    if (source && isObj(step.caliber_upgrade)) {
+      body.push(h('p', { class: 'muted', style: 'font-size:12px;margin:6px 0 0' },
+        `${T.dUpgrade}：钉在 ${step.caliber_upgrade.pinned || NONE}，上游最新 ${step.caliber_upgrade.latest || NONE}，${step.caliber_upgrade.policy_label || step.caliber_upgrade.policy || NONE}`))
+    }
+    if (step.status === 'missing_input') body.push(h('p', { style: 'color: var(--wait); margin: 8px 0 0' }, T.missingValue))
+    if (step.incomplete) body.push(h('p', { style: 'color: var(--wait); margin: 8px 0 0' }, T.incompleteWhy(step.incomplete_reason)))
+    if (step.sql_check_failed) body.push(h('p', { style: 'color: var(--wait); margin: 8px 0 0' }, T.sqlCheckWhy(step.sql_check_reason)))
+    // 计算方式：原式 + 代入式
+    body.push(h('p', { class: 'sub' }, T.dExpression), h('pre', { class: 'sql' }, String(step.expression || NONE)))
+    body.push(h('p', { class: 'sub' }, T.dSubstituted), h('pre', { class: 'sql' }, String(step.substituted || NONE)))
+    body.push(h('div', {}, kv([
+      [T.dRecompute, step.recompute_ok == null ? T.recomputeNone
+        : step.recompute_ok ? T.recomputeOk : T.recomputeBad],
+    ])))
+    // 双盲复算（期 4）：复核过这个指标才有
+    if (isObj(step.dual_check)) {
+      const d = step.dual_check
+      const more = d.reason || (d.blind_rendered ? `盲算值 ${d.blind_rendered}` : '')
+      body.push(h('div', { style: 'margin-top:8px' }, kv([
+        [T.dDual, `${T.dualLabel[d.status] || d.status || NONE}${more ? T.dualMore(more) : ''}`],
+      ])))
+    }
+    return h('section', { class: 'part', 'data-step': 'metric' }, h('h3', {}, T.metric),
+      h('div', { class: 'part-body' }, ...body))
+  }
+
+  /** 输入步骤：路径、值（遮罩的写「已遮罩」）、取自哪个节点、哪次查询的哪一格 */
+  function inputPart(step) {
+    const masked = Array.isArray(step.masked) && step.masked.length
+    const rows = [
+      [T.dPath, h('code', {}, String(step.path || NONE))],
+      [T.dValue, step.value === MASKED ? T.dMasked : valueText(step.value)],
+      step.node_id ? [T.dNode, nodeLabel(step.node_id)] : null,
+      step.query ? [T.dQuery, String(step.query)] : null,
+      step.cell ? [T.dCell, String(step.cell)] : null,
+      step.via ? [T.dFrom, step.via === 'tool_cell' ? '查询结果的一格' : step.via === 'agent_field' ? 'Agent 交来的字段'
+        : step.via === 'position' ? '按位置取的一格' : String(step.via)] : null,
+    ]
+    const bits = []
+    if (masked) bits.push(badge('na', `${T.dColumnsMasked}：${step.masked.join('、')}`))
+    if (step.mask_unverified) bits.push(badge('na', T.maskUnverified(step.mask_unverified)))
+    if (step.status === 'truncated') bits.push(badge('wait', T.truncated))
+    return h('section', { class: 'part', 'data-step': 'input' },
+      h('h3', {}, `${T.input}「${step.path || NONE}」`),
+      h('div', { class: 'part-body' }, kv(rows),
+        masked ? h('p', { class: 'muted', style: 'font-size:12px;margin:6px 0 0' }, T.maskNote) : null,
+        bits.length ? h('div', { class: 'chips' }, ...bits) : null))
+  }
+
+  /** 查询步骤：SQL、数据源、被引用的行（高亮那一格）、遮罩列、SQL 检查、合并视图 */
+  function queryPart(step) {
+    const body = []
+    const rows = [
+      step.source ? [T.dSourceName, String(step.source)] : null,
+      step.tool ? [T.dTool, h('code', {}, String(step.tool))] : null,
+      step.node_id ? [T.dNode, nodeLabel(step.node_id)] : null,
+      step.alias ? [T.dQuery, String(step.alias)] : null,
+      step.total_rows != null ? [T.dAllRows, String(step.total_rows)] : null,
+    ]
+    body.push(kv(rows.filter(Boolean)))
+    if (typeof step.sql === 'string' && step.sql) body.push(h('p', { class: 'sub' }, T.dSql), h('pre', { class: 'sql' }, step.sql))
+    if (step.mask_note) body.push(h('p', { class: 'muted', style: 'font-size:12px;margin:6px 0 0' }, String(step.mask_note)))
+    if (step.note) body.push(h('p', { style: 'color: var(--wait); margin: 8px 0 0' }, String(step.note)))
+    // 被引用的行：前后各带几行，引用的那几格高亮；遮罩列写「已遮罩」
+    if (Array.isArray(step.rows) && step.rows.length && Array.isArray(step.columns)) {
+      const offset = Number.isInteger(step.row_offset) ? step.row_offset : 0
+      const index = Array.isArray(step.row_index) ? step.row_index : step.rows.map((_, i) => i + offset)
+      const cells = (step.highlight && Array.isArray(step.highlight.cells) ? step.highlight.cells : [])
+      const hit = new Set(cells.map((c) => `${c[0]}:${c[1]}`))
+      const hitCols = new Set(cells.map((c) => String(c[1])))
+      const masked = new Set((step.masked || []).map(String))
+      const table = h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, step.columns.map((c) => h('th', { class: hitCols.has(String(c)) ? 'hit' : null }, String(c))))),
+        h('tbody', {}, step.rows.map((row, i) => {
+          const r = index[i]
+          const record = Array.isArray(row) ? row : isObj(row) ? step.columns.map((c) => own(row, c)) : [row]
+          return h('tr', {}, record.map((v, j) => h('td', {
+            class: [hit.has(`${r}:${step.columns[j]}`) ? 'hit' : '', typeof v === 'number' ? 'n' : '']
+              .filter(Boolean).join(' ') || null,
+          }, masked.has(String(step.columns[j])) ? MASKED : v == null ? NONE : textOf(v))))
+        }))))
+      body.push(h('p', { class: 'sub' }, `${T.dRows}（${T.dRowOf(offset)} 起，引用的格高亮）`), table)
+      if (step.window_truncated) body.push(h('p', { class: 'muted', style: 'font-size:12px;margin:6px 0 0' }, T.windowCut))
+      if (step.truncated) body.push(h('p', { class: 'muted', style: 'font-size:12px;margin:6px 0 0' }, T.truncatedRows))
+    }
+    // SQL 检查（查出问题才有）
+    if (Array.isArray(step.checks) && step.checks.length) {
+      body.push(h('p', { class: 'sub' }, T.dChecks),
+        h('ul', { style: 'margin:4px 0 0;padding-left:1.2em;font-size:13px' },
+          step.checks.map((c) => h('li', {}, `${c.level || 'error'} · ${c.code || ''}：${c.message || ''}`))))
+    }
+    // 合并查询：输入、合并 SQL、逐格来历、警告
+    if (isObj(step.merge)) {
+      body.push(h('p', { class: 'sub' }, T.merge))
+      if (Array.isArray(step.merge.inputs) && step.merge.inputs.length) {
+        body.push(h('ul', { style: 'margin:4px 0 0;padding-left:1.2em;font-size:13px' },
+          step.merge.inputs.map((i) => h('li', {},
+            `${i.query || i.alias || NONE} · ${i.label || nodeLabel(i.node_id)} · ${i.rows ?? '?'} 行${i.sealed === false ? ' · 未封存' : ''}`))))
+      }
+      if (Array.isArray(step.merge.traced) && step.merge.traced.length) {
+        body.push(h('p', { class: 'sub' }, T.mergeTraced),
+          h('ul', { style: 'margin:4px 0 0;padding-left:1.2em;font-size:13px' },
+            step.merge.traced.map((t) => h('li', {}, t.input
+              ? `第 ${t.cell[0] + 1} 行「${t.cell[1]}」← ${t.query || t.input} 的 ${T.dRowOf(t.row)}「${t.column}」`
+              : `第 ${t.cell[0] + 1} 行「${t.cell[1]}」：${t.note || T.mergeNoLineage}`))))
+      }
+      if (Array.isArray(step.merge.warnings) && step.merge.warnings.length) {
+        body.push(h('p', { class: 'sub' }, T.mergeWarnings),
+          h('ul', { style: 'margin:4px 0 0;padding-left:1.2em;font-size:13px' },
+            step.merge.warnings.map((w) => h('li', {}, String(w.message || '')))))
+      }
+    }
+    const bits = []
+    if ('sealed' in step) bits.push(step.sealed ? badge('ok', T.sealedOk) : badge('na', T.sealedNo))
+    if (step.hash_ok === false) bits.push(badge('bad', T.hashBad))
+    if (bits.length) body.push(h('div', { class: 'chips' }, ...bits))
+    return h('section', { class: 'part', 'data-step': 'query' },
+      h('h3', {}, `${T.query}${step.alias ? ` ${step.alias}` : ''}`),
+      h('div', { class: 'part-body' }, ...body))
+  }
+
+  /** 运行输入步骤 */
+  function runInputPart(step) {
+    return h('section', { class: 'part', 'data-step': 'run_input' }, h('h3', {}, T.runInput),
+      h('div', { class: 'part-body' }, kv([
+        [T.dField, String(step.field || NONE)],
+        [T.dValue, valueText(step.value)],
+        step.node_id ? [T.dNode, nodeLabel(step.node_id)] : null,
+      ])))
+  }
+
+  /** 实体（表、字段）步骤：出现在哪几次查询、表结构快照、字段清单；可疑实体的查证和最接近的名字 */
+  function entityPart(step) {
+    const body = []
+    const rows = [
+      [T.dNameEntity, step.name || NONE],
+      step.table ? [T.dTable, String(step.table)] : null,
+      step.column ? [T.dColumn, String(step.column)] : null,
+    ]
+    body.push(kv(rows.filter(Boolean)))
+    if (step.reason) body.push(h('p', { style: 'color: var(--wait); margin: 8px 0 0' }, String(step.reason)))
+    if (Array.isArray(step.sources) && step.sources.length) {
+      body.push(h('p', { class: 'sub' }, T.dQueries),
+        h('ul', { style: 'margin:4px 0 0;padding-left:1.2em;font-size:13px' },
+          step.sources.map((s) => h('li', {},
+            `${s.kind === 'schema' ? '表结构快照' : '查询结果'} ${s.alias || short(s.artifact)} · ${s.sealed ? '已封存' : '未封存'}${s.hash_ok === false ? ' · 哈希核对失败' : ''}${s.present === false ? ` · 名字${T.absent}` : ''}`))))
+    }
+    if (Array.isArray(step.fields) && step.fields.length) {
+      body.push(h('p', { class: 'sub' }, T.dFields),
+        h('p', { style: 'margin:4px 0 0;font-size:13px' },
+          step.fields.map((f) => `${f.name}${f.type ? `（${f.type}）` : ''}`).join('、')
+          + (step.fields_more ? T.dFieldsMore(step.fields_more) : '')))
+    }
+    if (step.checked && (step.checked.schemas || step.checked.queries)) {
+      body.push(h('p', { class: 'muted', style: 'font-size:12px;margin:6px 0 0' },
+        `${T.dChecked}：表结构快照 ${step.checked.schemas} 份、查询 ${step.checked.queries} 次，都没有这个名字`))
+    }
+    if (Array.isArray(step.closest) && step.closest.length) {
+      body.push(h('p', { class: 'sub' }, T.dClosest),
+        h('ul', { style: 'margin:4px 0 0;padding-left:1.2em;font-size:13px' },
+          step.closest.map((c) => h('li', {}, `${c.name}${c.table ? `（表 ${c.table}）` : ''}`))))
+    }
+    return h('section', { class: 'part', 'data-step': 'entity' }, h('h3', {}, `${T.entity}「${step.name || NONE}」`),
+      h('div', { class: 'part-body' }, ...body))
+  }
+
+  /** 引文步骤：原话在哪次检索的哪条命中里，带上原文好高亮 */
+  function quotePart(step) {
+    const body = []
+    const rows = [
+      [T.dContent, String(step.text || NONE)],
+      step.collection ? [T.dCollection, String(step.collection)] : null,
+      step.query ? [T.dQuery, String(step.query)] : null,
+      step.node_id ? [T.dNode, nodeLabel(step.node_id)] : null,
+    ]
+    body.push(kv(rows.filter(Boolean)))
+    if (typeof step.content === 'string' && step.content) {
+      const match = isObj(step.match) ? step.match : {}
+      const start = Number.isInteger(match.start) ? match.start : null
+      const end = Number.isInteger(match.end) ? match.end : null
+      const frag = document.createDocumentFragment()
+      if (start != null && end != null && 0 <= start && start <= end && end <= step.content.length) {
+        frag.append(step.content.slice(0, start))
+        frag.append(h('mark', { class: 'hit', style: 'padding:0 1px;border-radius:3px' }, step.content.slice(start, end)))
+        frag.append(step.content.slice(end))
+      } else {
+        frag.append(step.content)
+      }
+      body.push(h('p', { class: 'sub' }, T.dContent), h('blockquote', { style: 'margin:4px 0 0' }, frag))
+    }
+    body.push(kv([[T.dMatch, step.match_ok === true ? T.matchOk : step.match_ok === false ? T.matchBad : T.matchNone]]))
+    if (step.note) body.push(h('p', { style: 'color: var(--wait); margin: 8px 0 0' }, String(step.note)))
+    const bits = []
+    if ('sealed' in step) bits.push(step.sealed ? badge('ok', T.sealedOk) : badge('na', T.sealedNo))
+    if (step.hash_ok === false) bits.push(badge('bad', T.hashBad))
+    if (bits.length) body.push(h('div', { class: 'chips' }, ...bits))
+    return h('section', { class: 'part', 'data-step': 'quote' }, h('h3', {}, `${T.quote}「${String(step.text || '').slice(0, 24)}…」`),
+      h('div', { class: 'part-body' }, ...body))
+  }
+
+  const PARTS = {
+    metric: metricPart, input: inputPart, query: queryPart, run_input: runInputPart,
+    entity: entityPart, quote: quotePart,
+  }
+
+  // ------------------------------------------------------------------ 面板
+
+  function detailOf(seg, chain, note) {
+    const kind = T.kindLabel[seg.dataset.kind] || '片段'
+    const state = seg.dataset.state || ''
+    const head = h('section', { class: 'part' }, h('h3', {}, `${kind}「${seg.textContent}」`),
+      h('div', { class: 'part-body' }, kv([
+        [T.dStatus, T.stateLabel[state] || state || NONE],
+        [T.dNode, nodeLabel((view.data.meta.report || {}).node_id)],
+      ])))
+    const parts = [head]
+    if (chain && chain.length) {
+      for (const step of chain) {
+        const render = PARTS[step.step]
+        if (render) parts.push(render(step))
+      }
+    } else {
+      parts.push(h('p', { class: 'muted' }, T.noChain))
+    }
+    if (note) parts.push(h('section', { class: 'part' }, h('h3', {}, T.note), h('div', { class: 'part-body' }, note)))
+    return parts
+  }
+
+  function openSeg(seg) {
+    const panel = $('detail')
+    if (panel.hidden) view.back = document.activeElement
+    if (view.active) view.active.classList.remove('is-active')
+    view.active = seg
+    seg.classList.add('is-active')
+    const chain = view.data ? (view.data.chains || {})[(view.data.refs || {})[seg.dataset.seg]] : undefined
+    const note = view.data ? (view.data.notes || {})[seg.dataset.seg] : undefined
+    $('detail-title').textContent = `${T.segTitle(T.kindLabel[seg.dataset.kind] || '片段', seg.textContent)}`
+    $('detail-body').replaceChildren(...detailOf(seg, Array.isArray(chain) ? chain : null, note))
+    panel.hidden = false
+    panel.setAttribute('data-open', seg.dataset.seg)
+    document.documentElement.classList.add('detail-open')
+    $('detail-close').focus({ preventScroll: true })
+    const sheet = panel.getBoundingClientRect()
+    const spot = seg.getBoundingClientRect()
+    if (sheet.top > 0) {
+      if (spot.bottom > sheet.top) window.scrollBy({ top: spot.top - Math.max(16, sheet.top / 3) })
+    } else {
+      seg.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    }
+  }
+
+  function closeDetail() {
+    const panel = $('detail')
+    if (panel.hidden) return
+    panel.hidden = true
+    panel.removeAttribute('data-open')
+    document.documentElement.classList.remove('detail-open')
+    if (view.active) view.active.classList.remove('is-active')
+    if (view.back && typeof view.back.focus === 'function') view.back.focus()
+    view.active = null
+  }
+
+  // ------------------------------------------------------------------ 启动
+
+  function main() {
+    const data = parseData()
+    if (data) {
+      view.data = data
+      renderHead(data)
+    }
+    const body = $('report')
+    body.addEventListener('click', (e) => {
+      const seg = e.target.closest('button[data-seg]')
+      if (seg) openSeg(seg)
+    })
+    $('detail-close').addEventListener('click', closeDetail)
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDetail() })
+    document.documentElement.setAttribute('data-js', '')
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', main, { once: true })
+  else main()
+})()
