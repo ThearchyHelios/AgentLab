@@ -21,7 +21,9 @@
 //   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列、设了遮罩的数据源上按地区汇总的查询、每种显示
 //   格式各引用一处的经营月报、单位带尾随空白的经营月报），逐份断言各项结果和原因文案；经营月报上只改文字取值、数字、
 //   换算成万的口径卡引用的显示文字并重算全部哈希，各自变红并点名；核对过的字不动、改它旁边的（链接地址藏起数字、前面
-//   补一位数、整段改成分隔线、文字片段冒用数字的 id），读的人看到的数要就是核对过的那个；在上面篡改 ④
+//   补一位数、隔着显示时不占位置的控制字符补一位数、长得像负号的连字符、叠在空格上的横线、从右往左书写的字母把一位数
+//   挪到数字前面、整段改成分隔线、文字片段冒用数字的 id），读的人看到的数要就是核对过的那个；列表缩进写成十万级或负数、
+//   表格的列号写成十万，核对通过的数字照样留在屏幕上（宽屏、窄屏都不横向溢出）；在上面篡改 ④
 //   引用链（换文档、拿掉报告、多一份没人引用的工件）、⑥ 运行信息（运行结果、类别、出具档位）、拿掉被引用的口径卡、把
 //   报告文档标成遮罩、把遮罩卡标成服务端的文件与 id 不一致或解析不出来（服务端对被改过、解析不了的遮罩卡就这么标）、
 //   遮罩源上随文件附带的汇总快照改一个字节、它的数字改引用值并重算全部哈希、
@@ -1017,6 +1019,117 @@ await section('样本页：篡改', async () => {
         && !s.buttons.some((b) => b.text.includes('84,613.65')), JSON.stringify(same)],
     ]
   }, { seal: true })
+  // 紧挨着的字（经营月报，重算全部哈希）：隔着显示时不占位置的控制字符补一位数、长得像负号的连字符、叠在空格上的横线、
+  // 从右往左书写的字母把一位数挪到数字前面——读起来都不是核对过的那个数，判无法核对并写明原因。字一律按码点写，脚本
+  // 里不出现看不见、改变方向的字
+  const cp = (...points) => String.fromCodePoint(...points)
+  const naBecause = (why) => (s, forged) => {
+    const btn = buttonOf(s, forged)
+    const item = s.items.find((i) => i.check === 'numbers' && i.result === 'na' && i.text.includes(why))
+    return [
+      ['那个数字判无法核对，不再标通过', btn?.result === 'na', JSON.stringify(btn)],
+      [`⑤ 写明「${why}」`, !!item, item?.text ?? '没有这一项'],
+      ['总览不再是「全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过', `${s.overall}：${s.text}`],
+    ]
+  }
+  const GLUED = '紧挨着的正文里还有数字或负号'
+  await tamper(samples.formats, '隔着显示时不占位置的控制字符补一位数', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's3').text += `1${cp(0x7f)}`
+    return { what: '销售额前面补「1」和一个 DEL', seg: segById(doc, 's4') }
+  }), naBecause(GLUED), { seal: true })
+  await tamper(samples.formats, '前面加一个长得像负号的连字符', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's12').text += cp(0x2010)
+    return { what: '转化率前面加 U+2010', seg: segById(doc, 's13') }
+  }), naBecause(GLUED), { seal: true })
+  await tamper(samples.formats, '叠在空格上的横线', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's3').text += cp(0x336)
+    return { what: '销售额前面的空格上叠一道长横线（U+0336）', seg: segById(doc, 's4') }
+  }), naBecause('紧挨着的正文里有看不见或在不同设备上显示不同的字'), { seal: true })
+  // 希伯来字母：逻辑上在销售额后面的「5」显示在销售额紧前面（读作 574,613.65元）。先量一下页面上确实这样显示，
+  // 说明这种伪造能把数读错
+  await tamper(samples.formats, '从右往左书写的字母把一位数挪到数字前面', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's3').text += cp(0x5d0)
+    segById(doc, 's5').text = `5${segById(doc, 's5').text}`
+    return { what: '销售额前面加一个希伯来字母、后面加「5」', seg: segById(doc, 's4') }
+  }), async (s, forged, page) => {
+    const gap = await page.evaluate((key) => {
+      const btn = document.querySelector(`button.num[data-num="${key}"]`)
+      const text = btn?.nextSibling?.firstChild
+      if (!btn || !text || text.nodeType !== 3 || !text.data.startsWith('5')) return null
+      const range = document.createRange()
+      range.setStart(text, 0)
+      range.setEnd(text, 1)
+      return Math.round(btn.getBoundingClientRect().left - range.getBoundingClientRect().right)
+    }, `${forged.node}|${forged.seg.id}`)
+    return [
+      ['页面上「5」显示在销售额紧前面', gap !== null && Math.abs(gap) <= 2, `间距 ${gap}px`],
+      ...naBecause('这一句里有从右往左书写的文字')(s, forged),
+    ]
+  }, { seal: true })
+  // 列表缩进写得极大或写成负数（服务端按原文的缩进算级数、没有上限）：最多缩进 8 级，列表里核对通过的数字都留在屏幕上、
+  // 照常通过，宽屏、窄屏都不横向溢出
+  for (const [label, depths] of [['列表缩进写成十万级', [100000, 3]], ['列表缩进写成负数', [-100000, -3]]]) {
+    const data = structuredClone(dataOf(samples.formats))
+    rewriteDoc(data, (doc) => {
+      const block = doc.blocks[2]
+      block.type = 'list'
+      block.units.forEach((unit, i) => {
+        unit.depth = depths[i]
+        if (i > 0) unit.segments.unshift({ kind: 'structural', id: `li${i}`, text: '\n- ' })
+      })
+      return { what: label }
+    })
+    for (const width of [1280, 390]) {
+      const opened = await openFile(writePage(`tampered-depth-${depths[0]}-${width}.html`,
+        withSeal(withData(samples.formats, data), data.meta.manifest_hash)), { width })
+      try {
+        const s = await stateOf(opened.page)
+        const boxes = await opened.page.evaluate(() => [...document.querySelectorAll('.doc li button.num')].map((b) => {
+          const r = b.getBoundingClientRect()
+          return [Math.round(r.left), Math.round(r.right)]
+        }))
+        check(`篡改${label}（${width} 宽）：列表里的数字都在屏幕上、照常通过，页面不横向溢出`,
+          boxes.length === 7 && boxes.every(([l, r]) => l >= 0 && r <= width) && s.overflow <= 0
+            && s.overall === 'pass' && s.text === '全部通过',
+          `${JSON.stringify(boxes)}；溢出 ${s.overflow}px；${s.overall}：${s.text}`)
+      } finally {
+        await opened.ctx.close()
+      }
+    }
+  }
+  // 表格里一格的列号写成十万：只排有格的列，那一格紧接着前一列显示，不会被几万个空列挤到表格右边，也不建几十万个空格
+  {
+    const data = structuredClone(dataOf(samples.base))
+    const done = rewriteDoc(data, (doc) => {
+      const table = doc.blocks.find((b) => b.type === 'table')
+      const unit = table?.units.find((u) => u.loc?.row === 0 && u.loc?.col === 1)
+      const seg = unit?.segments.find((x) => x.kind === 'number' || x.kind === 'value')
+      if (!seg) return null
+      unit.loc = { row: 0, col: 100000 }
+      return { what: '表格第一行第二格的列号改成 100000', seg }
+    })
+    if (!done) {
+      check('篡改表格的列号：样本页 base 里找不到表格第一行第二格的数字', false)
+    } else {
+      const opened = await openFile(writePage('tampered-table-col.html', withSeal(withData(samples.base, data),
+        data.meta.manifest_hash)))
+      try {
+        const got = await opened.page.evaluate((key) => {
+          const btn = document.querySelector(`button.num[data-num="${key}"]`)
+          const wrap = btn?.closest('.table-wrap')
+          if (!btn || !wrap) return null
+          const b = btn.getBoundingClientRect()
+          const w = wrap.getBoundingClientRect()
+          return { result: btn.dataset.result, visible: b.left >= w.left && b.right <= w.left + wrap.clientWidth,
+            cols: wrap.querySelectorAll('thead th').length, cells: wrap.querySelectorAll('td').length }
+        }, `${done.node}|${done.seg.id}`)
+        check('篡改表格的列号：那一格紧接着前一列显示、照常通过，表格只有 3 列',
+          got?.result === 'pass' && got.visible && got.cols === 3 && got.cells === 24, JSON.stringify(got))
+      } finally {
+        await opened.ctx.close()
+      }
+    }
+  }
 })
 
 // ---------------------------------------------------------------- 记录页的导出按钮

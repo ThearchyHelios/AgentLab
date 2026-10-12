@@ -13,7 +13,8 @@
  *      render_number / render_cell：千分位、小数位、单位、万 / 亿换算、百分数，文字压成一行）把那个值渲染出来的字，
  *      两边都只去掉首尾空白。本页渲染不出来的写法判无法核对，不判通过。运行输入不随文件附带，照旧无法核对，但显示的字
  *      照样拿引用的值核对，对不上判不通过。核对通过的字要原样显示在正文里（checkLayout）：正文里根本不显示的判不通过，
- *      紧挨着还有数字或负号、读起来不是这个值的判无法核对；
+ *      紧挨着还有数字、负号或显示成什么说不准的字，或者同一句里有改变文字方向的字，读起来可能不是这个值的判无法核对；
+ *      列表缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数；
  *   ⑥ 运行信息：运行结果、运行类别、出具档位拿封存范围内已核对的事件对照。工作流名、版本、起止时间、节点名称
  *      绑不进封存，页面上写明它们取自运行记录。
  * 每项给出通过 / 不通过 / 无法核对和原因。服务端导出时不会出现的状态（被引用的工件不在清单里、报告文档标着遮罩）
@@ -174,7 +175,8 @@
     shownBroken: '本页按系统的显示规则处理这个值时出错',
     /** 正文的排法（checkLayout）：显示文字核对过了，读起来却不是这个值 */
     shownGlued: '紧挨着的正文里还有数字或负号，读起来和核对过的不是同一个值',
-    shownTurned: '这一句里有改变文字方向的控制字符，显示出来的顺序可能和核对过的不一样',
+    shownBlurred: '紧挨着的正文里有看不见或在不同设备上显示不同的字，读起来可能和核对过的不是同一个值',
+    shownTurned: '这一句里有从右往左书写的文字或改变文字方向的控制字符，显示出来的顺序可能和核对过的不一样',
     numNotShown: '正文里没有显示这一处：导出时不会出现这种情况，文件可能被改过',
     numAria: (kind, text, result) => `${kind === 'value' ? '取值' : '数字'} ${text}，${result}，查看出处`,
     statusOk: (seq, what) => `与第 ${seq} 条事件（${what}）一致`,
@@ -206,7 +208,7 @@
     shaJs: 'SHA-256 由本页内置的实现计算（浏览器未提供 crypto.subtle），结果与浏览器内置实现一致',
     renderNote: '正文里带出处的数字和取值，本页按系统的显示规则（千分位、小数位、单位、万 / 亿换算、百分数，文字压成一行）'
       + '把口径卡或快照里的值（运行输入按引用的值）重新渲染一遍，与显示的文字逐字比对；核对通过的字在正文里原样显示，'
-      + '紧挨着它还有数字或负号的判无法核对。',
+      + '紧挨着它还有数字、负号或看不见的字，或者同一句里有改变文字方向的字，判无法核对。',
     schema: (s) => `文件格式 ${s}`,
   }
 
@@ -731,31 +733,41 @@
     return { hide, style }
   }
 
-  /** 列表的各项：一项从行首写着列表符号或序号的结构片段开始，后面的句子接在这一项里 */
+  // 列表最多显示这么多级缩进（每级 14px）。服务端按原文的缩进算级数（两个空格一级），没有上限：伪造的级数写成十万、
+  // 负数，那一项会被挤出屏幕或挤到左边看不见的地方，读的人看不到核对通过的数，页面却照样通过；窄屏上也会横向溢出
+  const MAX_DEPTH = 8
+
+  /** 列表的各项：一项从行首写着列表符号或序号的结构片段开始，后面的句子接在这一项里。depth 是显示的缩进级数 */
   function listItems(units) {
     const items = []
     for (const u of units) {
       const lead = Array.isArray(u.segments) ? u.segments[0] : null
       const starts = !items.length || (isObj(lead) && lead.kind === 'structural' && ITEM_START.test(String(lead.text ?? '')))
-      if (starts) items.push({ depth: Number(u.depth) || 0, units: [u] })
+      const depth = Math.min(Math.max(Math.floor(Number(u.depth)) || 0, 0), MAX_DEPTH)
+      if (starts) items.push({ depth, units: [u] })
       else items[items.length - 1].units.push(u)
     }
     return items
   }
 
-  /** 表格：{ cells（位置 → 句子，一格可能被分成几句，按位置归拢）, rows（表身各行的行号，表头是 -1，另算）, cols } */
+  /**
+   * 表格：{ cells（位置 → 句子，一格可能被分成几句，按位置归拢）, rows（表身各行的行号，表头是 -1，另算）, cols（有格的
+   * 列号，从小到大）}。服务端每行从第 0 列起一格不落，列号连着；只排有格的列：伪造的列号写成十万，那一格紧接着前一列
+   * 显示，不会被几万个空列挤到表格右边看不见的地方（也不会建出几十万个空格、拖垮页面）
+   */
   function tableCells(units) {
     const cells = new Map()
     const rows = []
-    let cols = 0
+    const cols = new Set()
     for (const u of units) {
       const loc = isObj(u.loc) ? u.loc : { row: 0, col: 0 }
       push(cells, `${loc.row}:${loc.col}`, u)
-      cols = Math.max(cols, (Number(loc.col) || 0) + 1)
+      const col = Number(loc.col)
+      if (Number.isInteger(col) && col >= 0) cols.add(col)
       if (loc.row >= 0 && !rows.includes(loc.row)) rows.push(loc.row)
     }
     rows.sort((a, b) => a - b)
-    return { cells, rows, cols }
+    return { cells, rows, cols: [...cols].sort((a, b) => a - b) }
   }
 
   /**
@@ -772,7 +784,7 @@
         return listItems(units).map((item) => item.units)
       case 'table': {
         const { cells, rows, cols } = tableCells(units)
-        return [-1, ...rows].flatMap((r) => Array.from({ length: cols }, (_, c) => cells.get(`${r}:${c}`) || []))
+        return [-1, ...rows].flatMap((r) => cols.map((c) => cells.get(`${r}:${c}`) || []))
       }
       default:
         return [units]
@@ -807,27 +819,72 @@
     return plan
   }
 
-  // 判断紧挨着的字：数字（Python 的 \d 认的全都算，全角的、数学字母区的也是）、负号（半角、全角、小号、数学减号）；
-  // 看不见的字（零宽空格这类格式字符、组合附加符号）跳过，隔着它们照样算紧挨着。改变文字方向的控制字符另算：它能把
-  // 后面的一位数挪到数字前面显示，按字的先后看不出来
+  // 紧挨着核对通过的数字、取值的字，按码点分几类（kindOf）：
+  // - digit：数字。Python 的 \d 认的全都算（全角的、数学字母区的、阿拉伯文的也是）；
+  // - minus：负号。横线类标点（连字符、各种破折号，全角的、小号的也算；波浪形的不算），减号类符号（数学减号、上下标
+  //   负号、修饰字母负号、粗减号），以及显示出来同样是一道横线的字：Unicode 易混字符表里映射到「-」「ー」的（汉字「一」、
+  //   假名长音、制表符的横线这类），和在 Chrome 的常用字体里逐个画出来看是一道横线、高度和负号相当的字；
+  // - sep：半角逗号、句点和长得一样的窄标点（低位单引号、单点前导符、小号的逗号句点这类，取自易混字符表）：「1,」后面
+  //   接着数字也算紧挨着。全角的「，」「．」不算：字宽，中文里两个数之间本来就常用「，」隔开；
+  // - skip：显示时不占位置的字（零宽空格、连接符、变体选择符、韩文填充符这类格式字符和默认不显示的字），隔着它们照样
+  //   算紧挨着；
+  // - blur：显示成什么说不准的字：控制字符（制表、换行这几个空白除外）、未分配和私用区的字、孤立的代理项、组合附加符号
+  //   （叠在前一个字上：叠在空格上能在数字前面画出一道横线）、可选连字符（在它那里换行时显示成连字符）、发丝空格、对象
+  //   替换符，以及在 Chrome 的常用字体里量出来几乎不占宽度的几个字。各家浏览器、字体把它们显示成数字、横线还是什么都
+  //   不显示说不准：隔着它们照样往外找数字、负号；找不到的也判无法核对，原因另写；
+  // - other：别的字（汉字、字母、空格、别的标点）把数字隔开。
+  // 改变文字方向的控制字符（BIDI）和从右往左书写的文字（RTL：希伯来文、阿拉伯文这类）另算：它们能把一位数挪到数字的
+  // 另一边显示（逻辑上在数字后面的「5」显示在数字前面），按字的先后看不出来，同一句里出现就判无法核对
   const DIGIT = unicode('^\\p{Nd}$') || /^[0-9\uff10-\uff19]$/
-  const MINUS = /^[-\u2212\ufe63\uff0d]$/
-  const INVISIBLE = unicode('^[\\p{Cf}\\p{Mn}\\p{Me}]$')
-    || /^[\u00ad\u0300-\u036f\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]$/
+  const DASH_LIKE = '\\u02d7\\u0c7c\\u1173\\u172d\\u174d\\u180a\\u1b78\\u1bc7\\u1bf3\\u1c7c\\u2043\\u207b\\u208b\\u2212'
+    + '\\u23af\\u23ba-\\u23bd\\u23e4\\u2500\\u2501\\u2504\\u2505\\u2508\\u2509\\u254c\\u254d\\u2550\\u2574\\u2576\\u2578'
+    + '\\u257a\\u257c\\u257e\\u2796\\u29ff\\u2cba\\u2cbb\\u2d67\\u2f00\\u30fc\\u3127\\u3161\\u3192\\u31d0\\u4e00\\ua7f7'
+    + '\\uaa7d\\uff70\\uffda'
+  const DASH_LIKE_ASTRAL = '\\u{10110}\\u{10191}\\u{11049}\\u{1104b}\\u{11052}\\u{110be}\\u{13404}\\u{1bc03}\\u{1bc08}'
+    + '\\u{1bc0d}\\u{1bc86}\\u{1d369}'
+  const MINUS = unicode(`^(?![\\u301c\\u3030])[\\p{Pd}${DASH_LIKE}${DASH_LIKE_ASTRAL}]$`)
+    || new RegExp(`^[-\\u2010-\\u2015\\u2e3a\\u2e3b\\ufe58\\ufe63\\uff0d${DASH_LIKE}]$`)
+  const SEP = unicode('^[.,\\u00b8\\u201a\\u2024\\u2e12\\ua4f8\\ua4f9\\ua60e\\uabec\\ufe50\\ufe52\\u{16f53}\\u{1d16d}]$')
+    || /^[.,\u00b8\u201a\u2024\u2e12\ua4f8\ua4f9\ua60e\uabec\ufe50\ufe52]$/
+  // 变体选择符只换前一个字的字形（文字样式还是表情样式），算 skip：表情后面常带一个，不能因此把数字判成核对不了
+  const VARIATION = unicode('^[\\u180b-\\u180d\\u180f\\ufe00-\\ufe0f\\u{e0100}-\\u{e01ef}]$')
+    || /^[\u180b-\u180d\u180f\ufe00-\ufe0f]$/
+  const BLUR_EXTRA = '\\u00ad\\u02dd\\u1843\\u1cd3\\u200a\\u2044\\ufffc'
+  const BLUR = unicode(`^(?![\\t\\n\\f\\r])[\\p{Cc}\\p{Cn}\\p{Co}\\p{Cs}\\p{Mn}\\p{Me}${BLUR_EXTRA}]$`)
+    || new RegExp('^(?![\\t\\n\\f\\r])[\\x00-\\x1f\\x7f-\\x9f\\u0300-\\u036f\\u0483-\\u0489\\u1ab0-\\u1aff\\u1dc0-\\u1dff'
+      + `\\u20d0-\\u20ff\\ud800-\\udfff\\ue000-\\uf8ff\\ufe20-\\ufe2f\\ufff0-\\ufff8${BLUR_EXTRA}]$`)
+  const SKIP = unicode('^[\\p{Cf}\\p{Default_Ignorable_Code_Point}]$')
+    || /^[\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\uffa0]$/
   const BIDI = /^[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]$/
+  const RTL = unicode('^[\\u0590-\\u08ff\\ufb1d-\\ufdff\\ufe70-\\ufefe\\u{10800}-\\u{10fff}\\u{1e800}-\\u{1efff}]$')
+    || /^[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefe]$/
+
+  /** 一个字（码点）算哪一类，见上 */
+  function kindOf(c) {
+    if (VARIATION.test(c)) return 'skip'
+    if (DIGIT.test(c)) return 'digit'
+    if (MINUS.test(c)) return 'minus'
+    if (SEP.test(c)) return 'sep'
+    if (BLUR.test(c)) return 'blur'
+    return SKIP.test(c) ? 'skip' : 'other'
+  }
+
+  const NOWHERE = { at: -1, kind: null, blurred: false }
 
   /**
    * ⑤ 的最后一步：核对通过的数字、取值，读的人在正文里看到的就该是核对过的那串字。items 是这份报告的 片段 → 核对结果，
    * 每一项记下正文里显示出来的字（onPage）。
    * - 正文里根本不显示它（分隔线里、表格里不在各行各列上的格）：伪造的字可以写在别处，读的人看不到核对过的那个数。
    *   服务端导出时不会出现（分隔线不带句子，表格的格都在行列上），判不通过；
-   * - 紧挨着的字里还有数字或负号（前面补一位、后面接一位或一段小数、前面加负号；隔着看不见的字、显示时藏起来的排版
-   *   标记也算紧挨着），或者同一句里有改变文字方向的控制字符：读起来的数不止核对过的这几位，判无法核对——真报告里
-   *   也可能有（放行的数字、日期紧贴着引用），不能说成被改过。两个数之间的连字符是区间，不算负号。
+   * - 紧挨着的字里还有数字或负号（前面补一位、后面接一位或一段小数、前面加负号；隔着不占位置的字、显示时藏起来的排版
+   *   标记也算紧挨着），紧挨着的是显示成什么说不准的字，或者同一句里有改变文字方向的字：读起来的数可能不止核对过的
+   *   这几位，判无法核对——真报告里也可能有（放行的数字、日期紧贴着引用），不能说成被改过。两个数之间的连字符是区间，
+   *   不算负号。
    * 代码块按原文显示、不标数字，照旧
    */
   function checkLayout(doc, items) {
     const numeric = (seg) => seg.kind === 'number' || seg.kind === 'value'
+    const soft = (kind) => kind === 'skip' || kind === 'blur'
     for (const block of Array.isArray(doc.blocks) ? doc.blocks.filter(isObj) : []) {
       if (block.type === 'code') {
         for (const unit of Array.isArray(block.units) ? block.units.filter(isObj) : []) {
@@ -836,43 +893,75 @@
         continue
       }
       for (const flow of flowsOf(block)) {
-        // 这一组显示出来的字（按码点：数学字母区的数字占两个 UTF-16 单元），逐个记下属于哪个片段：藏起来的不显示，
-        // 看不见的不参与判断。可点的数字自成一块，它里面的字改变不了外面的方向，只看别的片段里的方向控制字符
-        const chars = []
-        let turned = false
+        // 这一组显示出来的字（藏起来的排版标记不算），逐个记下属于哪个片段
+        const shownUnits = []
         for (const unit of flow) {
           const { segs, text, styles, at } = unitPlan(unit)
           segs.forEach((seg, i) => {
             let shown = ''
             for (let k = at[i][0]; k < at[i][1]; k++) {
               if (styles.hide[k]) continue
-              let c = text[k]
-              const code = text.charCodeAt(k)
-              if (code >= 0xd800 && code < 0xdc00 && k + 1 < at[i][1]) c = text.slice(k, ++k + 1)
-              shown += c
-              if (BIDI.test(c) && !items.has(seg)) turned = true
-              if (!INVISIBLE.test(c)) chars.push([c, seg])
+              shown += text[k]
+              shownUnits.push([text[k], seg])
             }
             if (items.has(seg)) items.get(seg).onPage = shown
           })
         }
-        const ch = (k) => (k >= 0 && k < chars.length ? chars[k][0] : '')
-        const digit = (k) => DIGIT.test(ch(k))
-        const inNumber = (k) => k >= 0 && k < chars.length && numeric(chars[k][1])
+        // 拼成码点：代理对的两半在页面上挨着就显示成一个字（数学字母区的数字这类），分在两个文字片段里、中间隔着
+        // 藏起来的排版标记也一样；不成对的半个单独算一个字（显示成替换字符），不和后面的字拼。可点的数字自成一块，它的
+        // 字不和外面的拼
+        const chars = []
+        for (let k = 0; k < shownUnits.length; k++) {
+          const [c, seg] = shownUnits[k]
+          const next = shownUnits[k + 1]
+          const paired = next && c >= '\ud800' && c < '\udc00' && next[0] >= '\udc00' && next[0] < '\ue000'
+            && (next[1] === seg || (!items.has(seg) && !items.has(next[1])))
+          chars.push(paired ? [c + shownUnits[++k][0], seg] : [c, seg])
+        }
+        // 可点的数字自成一块，它里面的字改变不了外面的方向：只看别的片段
+        const turned = chars.some(([c, seg]) => !items.has(seg) && (BIDI.test(c) || RTL.test(c)))
+        const kinds = chars.map(([c]) => kindOf(c))
         const spans = new Map()
         chars.forEach(([, seg], k) => {
           if (spans.has(seg)) spans.get(seg)[1] = k
           else spans.set(seg, [k, k])
         })
+        // 从 k 往 step 方向找下一个看得见的字：skip 跳过，blur 也越过去、记下来。{ at, kind, blurred }
+        const look = (k, step) => {
+          let blurred = false
+          for (let j = k + step; j >= 0 && j < chars.length; j += step) {
+            if (kinds[j] === 'skip') continue
+            if (kinds[j] === 'blur') {
+              blurred = true
+              continue
+            }
+            return { at: j, kind: kinds[j], blurred }
+          }
+          return { ...NOWHERE, blurred }
+        }
         for (const [seg, item] of items) {
           if (item.result !== PASS || !spans.has(seg)) continue
-          const [first, last] = spans.get(seg)
-          const before = digit(first) && (digit(first - 1) || (/^[.,]$/.test(ch(first - 1)) && digit(first - 2)))
-          const sign = (digit(first) || MINUS.test(ch(first))) && MINUS.test(ch(first - 1))
-            && !digit(first - 2) && !inNumber(first - 2)
-          const after = digit(last) && (digit(last + 1) || (/^[.,]$/.test(ch(last + 1)) && digit(last + 2)))
-          if (turned || before || sign || after) {
-            Object.assign(item, { result: NA, reason: T.numShownUnknown(turned ? T.shownTurned : T.shownGlued) })
+          const [s0, s1] = spans.get(seg)
+          // 片段自己的头一个、末一个字：越过它自己头尾不占位置、说不准的字（取值里本来就带的组合符号这类）
+          let first = s0
+          while (first < s1 && soft(kinds[first])) first++
+          let last = s1
+          while (last > first && soft(kinds[last])) last--
+          const lead = kinds[first] === 'digit' || kinds[first] === 'minus'
+          const tail = kinds[last] === 'digit'
+          const l1 = look(s0, -1)
+          const l2 = l1.at >= 0 ? look(l1.at, -1) : NOWHERE
+          const r1 = look(s1, 1)
+          const r2 = r1.at >= 0 ? look(r1.at, 1) : NOWHERE
+          const before = kinds[first] === 'digit' && (l1.kind === 'digit' || (l1.kind === 'sep' && l2.kind === 'digit'))
+          const sign = lead && l1.kind === 'minus' && l2.kind !== 'digit' && !(l2.at >= 0 && numeric(chars[l2.at][1]))
+          const after = tail && (r1.kind === 'digit' || (r1.kind === 'sep' && r2.kind === 'digit'))
+          // 数字头尾紧挨着（或隔着一个逗号、句点）的是说不准的字：它本身就可能显示成数字、负号
+          const near = (a, b) => a.blurred || (a.kind === 'sep' && b.blurred)
+          const blurred = (lead && near(l1, l2)) || (tail && near(r1, r2))
+          if (turned || before || sign || after || blurred) {
+            const why = turned ? T.shownTurned : before || sign || after ? T.shownGlued : T.shownBlurred
+            Object.assign(item, { result: NA, reason: T.numShownUnknown(why) })
           }
         }
       }
@@ -1436,15 +1525,15 @@
         // 表头 row = -1；一格可能被分成几句，按位置归拢（tableCells）
         const { cells, rows: rowIds, cols } = tableCells(units)
         const textAt = (r, c) => (cells.get(`${r}:${c}`) || []).map(unitText).join('').replace(/[*`]/g, '').trim()
-        const numeric = Array.from({ length: cols }, (_, c) => {
+        const numeric = new Set(cols.filter((c) => {
           const texts = rowIds.map((r) => textAt(r, c)).filter(Boolean)
           return texts.length > 0 && texts.every((t) => NUMERIC_CELL.test(t))
-        })
-        const cell = (tag, r, c) => h(tag, { class: tag === 'td' && numeric[c] ? 'n' : null },
+        }))
+        const cell = (tag, r, c) => h(tag, { class: tag === 'td' && numeric.has(c) ? 'n' : null },
           (cells.get(`${r}:${c}`) || []).map(inline))
         return h('div', { class: 'table-wrap' }, h('table', {},
-          h('thead', {}, h('tr', {}, Array.from({ length: cols }, (_, c) => cell('th', -1, c)))),
-          h('tbody', {}, rowIds.map((r) => h('tr', {}, Array.from({ length: cols }, (_, c) => cell('td', r, c)))))))
+          h('thead', {}, h('tr', {}, cols.map((c) => cell('th', -1, c)))),
+          h('tbody', {}, rowIds.map((r) => h('tr', {}, cols.map((c) => cell('td', r, c)))))))
       }
       default:
         return h('p', {}, units.map(inline))
@@ -1769,7 +1858,7 @@
   // 在 node 里载入（tests/test_bundle_shown.py 拿服务端的渲染逐条对照、整份核对）：没有页面，交出核对用的纯函数就停
   if (typeof document === 'undefined') {
     if (typeof module === 'object' && module) {
-      module.exports = { verify, renderNumber, renderCell, numberTokens, tokenAt, parseJson, Unshown }
+      module.exports = { verify, renderNumber, renderCell, numberTokens, tokenAt, parseJson, Unshown, listItems, tableCells }
     }
     return
   }

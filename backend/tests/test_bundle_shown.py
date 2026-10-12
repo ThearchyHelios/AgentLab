@@ -12,8 +12,10 @@
   ①–④ 照样对得上，⑤ 里那一项不通过，原因点名「正文显示「X」，引用的值是「Y」」；认不出的换算判无法核对，不判通过；
 - 口径卡单位前后带空白（「元 」，服务端照原样接）：两边都只去首尾空白，原样导出照样通过；运行输入照旧无法核对，显示
   文字拿引用的值核对，只改显示文字的不通过；出处面板里数字文本照原文写；
-- 正文的排法：核对通过的字要原样显示——伪造的链接藏不起它（整句按原文显示），正文里不显示的判不通过，紧挨着补数字、
-  负号、方向控制字符的判无法核对，区间、日期这类真报告里的写法照常通过。
+- 正文的排法：核对通过的字要原样显示——伪造的链接藏不起它（整句按原文显示），正文里不显示的判不通过；紧挨着补数字、
+  负号（长得像负号的横线也算，隔着不占位置的字也算），紧挨着显示成什么说不准的字（控制字符、组合符号这类），同一句里
+  有改变文字方向的字（方向控制字符、希伯来文和阿拉伯文这类从右往左书写的文字），判无法核对；区间、日期这类真报告里的
+  写法照常通过；列表缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数。
 
 数据全是虚构的。
 """
@@ -65,6 +67,11 @@ function render(c) {
 
 async function main() {
   if (input.task === 'render') return input.cases.map(render)
+  // 列表各项显示的缩进级数、表格排出来的列号（核对和显示共用的那两个函数）
+  if (input.task === 'layout') {
+    return input.blocks.map((b) => (b.type === 'list' ? v.listItems(b.units).map((i) => i.depth)
+      : v.tableCells(b.units).cols))
+  }
   const digest = async (bytes) => createHash('sha256').update(bytes).digest('hex')
   const out = await v.verify(input.data, digest, input.seal)
   const results = (items) => items.map((i) => i.result)
@@ -244,8 +251,12 @@ def segment(doc: dict[str, Any], ref: str) -> dict[str, Any]:
 
 def reseal(bundle: dict[str, Any], art: dict[str, Any], doc: dict[str, Any]) -> dict[str, Any]:
     """改过的文档重新落成工件：文档 id、引用它的事件（规范字符串和哈希）、封存清单哈希全部重算。和服务端写工件一样
-    用规范 JSON：① 到 ④ 都对得上，伪造只可能在 ⑤ 露馅。"""
-    raw = canonical_json(doc).encode()
+    用规范 JSON：① 到 ④ 都对得上，伪造只可能在 ⑤ 露馅。伪造者还能写进不成对的代理项（JSON 里的 \\ud835 转义），
+    规范 JSON 编不成 UTF-8：这时照 JSON 的转义写，页面只看字节的哈希，照样对得上。"""
+    try:
+        raw = canonical_json(doc).encode()
+    except UnicodeEncodeError:
+        raw = json.dumps(doc, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
     old, new = art["id"], sha(raw)
     art["id"], art["b64"] = new, base64.b64encode(raw).decode()
     for report in bundle["reports"]:
@@ -536,6 +547,11 @@ def test_inline_markup_cannot_hide_a_checked_value():
 
 
 GLUED = "无法核对显示文字：紧挨着的正文里还有数字或负号，读起来和核对过的不是同一个值"
+BLURRED = "无法核对显示文字：紧挨着的正文里有看不见或在不同设备上显示不同的字，读起来可能和核对过的不是同一个值"
+TURNED = "无法核对显示文字：这一句里有从右往左书写的文字或改变文字方向的控制字符，显示出来的顺序可能和核对过的不一样"
+#: 经营月报第一段里的数字（第二段是 Q1 的取值）
+FIRST = {"m:gmv", "m:gmv|万", "m:annual|亿", "m:refund", "m:conv_rate", "m:growth", "m:orders", "m:avg", "m:avg|.3",
+         "m:avg|int", "m:share|pct", "m:export"}
 
 
 def _glue_before(seg_id: str, extra: str, after: str = ""):
@@ -553,21 +569,51 @@ def _glue_after(seg_id: str, extra: str):
     return change
 
 
+def _split_pair(high: str, low: str):
+    """销售额前面插两个文字片段：前一个以代理对的前半结尾，后一个是后半。页面上两半挨着，拼成一个字显示。"""
+    def change(doc: dict[str, Any]) -> None:
+        unit = next(u for b in doc["blocks"] for u in b["units"] if any(s.get("id") == "s4" for s in u["segments"]))
+        at = next(i for i, s in enumerate(unit["segments"]) if s.get("id") == "s4")
+        by_id(doc, "s3")["text"] += high
+        unit["segments"].insert(at, {"kind": "text", "id": "s3b", "text": low, "state": "neutral"})
+    return change
+
+
 @pytest.mark.parametrize("ref, change", [
     ("m:gmv", _glue_before("s3", "1")),                      # 前面多一位：174,613.65元
-    ("m:gmv", _glue_before("s3", "1\u200b")),               # 隔着看不见的零宽空格
+    ("m:gmv", _glue_before("s3", "1" + chr(0x200B))),        # 隔着看不见的零宽空格
     ("m:gmv", _glue_before("s3", "1**", after="**")),        # 隔着排版时藏起来的粗体标记
     ("m:gmv", _glue_before("s3", chr(0x1D7F7))),             # 数学字母区的数字 1（占两个 UTF-16 单元）
+    # 隔着显示时不占位置的字（Chrome 里量过，宽 0 到 1px 不到）：控制字符 DEL、未分配的默认不显示字、韩文填充符、
+    # 对象替换符、发丝空格、蒙古文里一个宽 0 的字、叠在数字上的组合符号、变体选择符
+    ("m:gmv", _glue_before("s3", "1" + chr(0x7F))),
+    ("m:gmv", _glue_before("s3", "1" + chr(0xFFF0))),
+    ("m:gmv", _glue_before("s3", "1" + chr(0x115F))),
+    ("m:gmv", _glue_before("s3", "1" + chr(0xFFFC))),
+    ("m:gmv", _glue_before("s3", "1" + chr(0x200A))),
+    ("m:gmv", _glue_before("s3", "1" + chr(0x1843))),
+    ("m:gmv", _glue_before("s3", "1" + chr(0x0301))),
+    ("m:gmv", _glue_before("s3", "1" + chr(0xFE0F))),
+    ("m:gmv", _glue_before("s3", "1" + chr(0x201A))),        # 和半角逗号长得一样的低位单引号（U+201A）
+    ("m:gmv", _glue_before("s3", chr(0xD800) + "1")),        # 不成对的代理项不和后面的 1 拼成一个字
+    ("m:gmv", _split_pair(chr(0xD835), chr(0xDFF7))),        # 代理对分在两个文字片段里，页面上照样拼成数字 1
     ("v:Q1.r0.gmv", _glue_after("s34", "0")),                # 后面多一位：45,678.50
     ("v:Q1.r0.gmv", _glue_after("s34", ".5")),               # 后面接小数：45,678.5.5
+    ("v:Q1.r0.gmv", _glue_after("s34", chr(0x2024) + "5")),  # 和句点长得一样的单点前导符
     ("m:conv_rate", _glue_before("s12", "-")),               # 前面加负号：-2.35%
-    ("m:conv_rate", _glue_before("s12", "\uff0d")),         # 全角负号
+    ("m:conv_rate", _glue_before("s12", chr(0xFF0D))),       # 全角负号
+    # 长得像负号的横线：连字符、不断行连字符、数字宽的横线、短破折号、长破折号、修饰字母负号、粗减号、小号长破折号、
+    # 数学减号、上标负号，和显示出来同样是一道横线的汉字「一」、假名长音、制表符横线、罗马盎司符号（码点在两个
+    # UTF-16 单元里）
+    *[("m:conv_rate", _glue_before("s12", chr(cp))) for cp in (
+        0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x02D7, 0x2796, 0xFE58, 0x2212, 0x207B, 0x4E00, 0x30FC, 0x2500,
+        0x10191)],
     ("m:refund", _glue_before("s9", "-")),                   # 负数前面再加负号：--3,120.50元
     ("v:Q1.r0.paid_at", _glue_after("s45", "5")),            # 取值以数字结尾：2026-09-07 08:21:395
 ])
 def test_digits_glued_to_a_checked_value_cannot_pass(ref, change):
-    """伪造者在相邻的文字片段里补一位数、一个负号（隔着零宽空格、藏起来的粗体标记也算紧挨着）：显示出来的数不止
-    核对过的这几位，这一项判无法核对、写明原因；别的照常通过。"""
+    """伪造者在相邻的文字片段里补一位数、一个负号（隔着不占位置、显示成什么说不准的字，藏起来的粗体标记也算紧挨着；
+    长得像负号的横线也算负号）：显示出来的数不止核对过的这几位，这一项判无法核对、写明原因；别的照常通过。"""
     from tests.bundle_samples import formats_bundle
 
     got = verdicts(rewritten(formats_bundle(), change))
@@ -576,33 +622,75 @@ def test_digits_glued_to_a_checked_value_cannot_pass(ref, change):
     assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"] != ref)
 
 
-def test_direction_controls_next_to_checked_values_cannot_pass():
-    """文字方向控制字符（从右往左覆盖）能把后面的一位数挪到数字前面显示，按字的先后看不出紧挨着：同一句里出现在
-    别的片段里，这一句的数字、取值判无法核对；别的段照常通过。"""
+@pytest.mark.parametrize("ref, change", [
+    ("m:gmv", _glue_before("s3", chr(0x0336))),               # 叠在空格上的长横线：页面上像一个负号
+    ("m:gmv", _glue_before("s3", chr(0x82))),                 # 控制字符，Chrome 里画成一道短横
+    ("m:gmv", _glue_before("s3", chr(0x7F))),                 # 控制字符 DEL，什么都不显示
+    ("m:gmv", _glue_before("s3", chr(0xAD))),                 # 可选连字符：在它那里换行时显示成连字符
+    ("m:gmv", _glue_before("s3", chr(0xE000))),               # 私用区的字：各家字体画成什么都有
+    ("v:Q1.r0.gmv", _glue_after("s34", chr(0x0378))),         # 未分配的码点紧跟在数字后面
+    ("v:Q1.r0.gmv", _glue_after("s34", "." + chr(0x7F))),     # 隔着句点紧跟一个说不准的字
+])
+def test_characters_that_may_show_as_anything_next_to_a_value_cannot_pass(ref, change):
+    """紧挨着数字的是显示成什么说不准的字（控制字符、组合符号、可选连字符、私用区和未分配的字）：各家浏览器、字体
+    可能把它显示成数字、横线或者什么都不显示，判无法核对，原因说清是这类字；别的照常通过。"""
+    from tests.bundle_samples import formats_bundle
+
+    got = verdicts(rewritten(formats_bundle(), change))
+    hit = item(got, ref)
+    assert hit["result"] == "na" and hit["reason"] == BLURRED and hit["shownOk"], hit
+    assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"] != ref)
+
+
+def test_uncertain_characters_where_they_cannot_change_the_value_still_pass():
+    """说不准的字挨着的不是数字的头尾（销售额以「元」结尾，后面跟一个控制字符），表情后面的变体选择符，数字前面的波浪线，
+    都改不了读到的数：照常通过。"""
     from tests.bundle_samples import formats_bundle
 
     def change(doc: dict[str, Any]) -> None:
-        by_id(doc, "s5")["text"] = chr(0x202E) + by_id(doc, "s5")["text"]
+        by_id(doc, "s5")["text"] = chr(0x7F) + chr(0x0336) + by_id(doc, "s5")["text"]
+        by_id(doc, "s12")["text"] += chr(0x2705) + chr(0xFE0F)    # 转化率紧前面：对勾表情加上表情样式的变体选择符
+        by_id(doc, "s14")["text"] += chr(0x301C)                   # 环比紧前面：波浪线不是横线，不算负号
 
     got = verdicts(rewritten(formats_bundle(), change))
-    first = {"m:gmv", "m:gmv|万", "m:annual|亿", "m:refund", "m:conv_rate", "m:growth", "m:orders", "m:avg",
-             "m:avg|.3", "m:avg|int", "m:share|pct", "m:export"}
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), got["numbers"]
+
+
+@pytest.mark.parametrize("change, scope", [
+    (lambda doc: by_id(doc, "s5").update(text=chr(0x202E) + by_id(doc, "s5")["text"]), FIRST),   # 从右往左覆盖
+    # 希伯来字母：逻辑上在销售额后面的「5」显示在销售额前面（页面上读作 574,613.65元）
+    (lambda doc: (by_id(doc, "s3").update(text=by_id(doc, "s3")["text"] + chr(0x05D0)),
+                  by_id(doc, "s5").update(text="5" + by_id(doc, "s5")["text"])), FIRST),
+    # 希伯来字母后面的「5」显示在 45,678.50 紧后面（读作 45,678.505）；阿拉伯字母同样
+    (lambda doc: by_id(doc, "s34").update(text=chr(0x05D0) + "5" + by_id(doc, "s34")["text"]), None),
+    (lambda doc: by_id(doc, "s34").update(text=chr(0x0628) + "5" + by_id(doc, "s34")["text"]), None),
+    # 腓尼基字母（从右往左书写，码点在两个 UTF-16 单元里）
+    (lambda doc: by_id(doc, "s34").update(text=chr(0x10900) + "5" + by_id(doc, "s34")["text"]), None),
+])
+def test_text_that_changes_direction_next_to_checked_values_cannot_pass(change, scope):
+    """改变文字方向的控制字符、从右往左书写的文字（希伯来文、阿拉伯文这类）能把后面的一位数挪到数字的另一边显示，
+    按字的先后看不出紧挨着：同一段里出现在别的片段里，这一段的数字、取值判无法核对；别的段照常通过。scope 是受影响的
+    那一段（None：经营月报第二段，Q1 的取值）。"""
+    from tests.bundle_samples import formats_bundle
+
+    got = verdicts(rewritten(formats_bundle(), change))
     for n in got["numbers"]:
-        if n["ref"] in first:
-            assert n["result"] == "na" and n["reason"] == ("无法核对显示文字：这一句里有改变文字方向的控制字符，"
-                                                           "显示出来的顺序可能和核对过的不一样"), n
+        inside = n["ref"] in scope if scope is not None else n["ref"] not in FIRST
+        if inside:
+            assert n["result"] == "na" and n["reason"] == TURNED, n
         else:
             assert n["result"] == "pass", n
 
 
 def test_ranges_dates_and_signs_written_by_the_system_still_pass():
-    """真报告里常见的写法不算紧挨着：两个数之间的连字符（区间）、日期和数字之间隔着字或空白、负数自己的负号。"""
+    """真报告里常见的写法不算紧挨着：两个数之间的连字符、破折号（区间）、日期和数字之间隔着字或空白、负数自己的负号。"""
     from tests.bundle_samples import formats_bundle
 
     text = ("## 区间\n\n销售额区间 [[m:gmv]]-[[m:export]]，流水区间 [[v:Q1.r0.gmv]]-[[v:Q1.r1.gmv]]。"
-            "截至2026年9月[[m:orders]]，2026-09-07 当天客单价 [[m:avg]]，环比 [[m:growth]]。")
+            "截至2026年9月[[m:orders]]，2026-09-07 当天客单价 [[m:avg]]，环比 [[m:growth]]，"
+            "退款区间 [[m:refund]]" + chr(0x2014) + "[[m:annual|亿]]。")
     got = verdicts(formats_bundle(text=text))
-    assert len(got["numbers"]) == 7
+    assert len(got["numbers"]) == 9
     assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), got["numbers"]
 
 
@@ -650,6 +738,39 @@ def test_a_table_cell_outside_the_rows_and_columns_fails():
             assert n["result"] == "fail" and n["reason"] == NOT_SHOWN, n
         else:
             assert n["result"] == "pass", n
+
+
+def _list_unit(depth: Any) -> dict[str, Any]:
+    return {"segments": [{"kind": "structural", "text": "- "}, {"kind": "text", "text": "一项"}], "depth": depth}
+
+
+def test_list_indentation_is_capped_on_screen():
+    """列表照级数缩进（每级 14px），最多 8 级：服务端按原文的缩进算级数、没有上限，伪造的级数写成十万或负数，那一项
+    也留在屏幕上（读的人看得到核对过的数，窄屏不横向溢出）。核对和显示用的是同一份级数（listItems）。"""
+    depths = [0, 1, 3, 8, 9, 100000, -1, -100000, 2.7, "x", None, "4"]
+    got = node("layout", blocks=[{"type": "list", "units": [_list_unit(d) for d in depths]}])
+    assert got == [[0, 1, 3, 8, 8, 8, 0, 0, 2, 0, 0, 4]]
+
+
+def test_table_columns_without_cells_are_not_laid_out():
+    """表格只排有格的列：服务端每行从第 0 列起一格不落，列号连着；伪造的列号写成十万，那一格紧接着前一列显示，不会
+    被几万个空列挤到表格右边看不见的地方。列号不是非负整数的格照旧不排（判不通过，见上一条）。"""
+    units = [{"loc": {"row": r, "col": c}, "segments": []}
+             for r, c in [(-1, 0), (-1, 1), (0, 0), (0, 1), (0, 100000), (1, 1.5), (1, -1), (1, "x"), (1, "2")]]
+    assert node("layout", blocks=[{"type": "table", "units": units}]) == [[0, 1, 2, 100000]]
+
+
+def test_a_huge_column_number_neither_hides_nor_breaks_the_check():
+    """列号写成 2^32：以前按列号建空列，数组长度超出上限，整段核对出错；现在那一格紧接着显示、照常核对通过。"""
+    from tests.bundle_samples import FORMATS, formats_bundle
+
+    def change(doc: dict[str, Any]) -> None:
+        table = next(b for b in doc["blocks"] if b["type"] == "table")
+        unit = next(u for u in table["units"] if u.get("loc") == {"row": 1, "col": 1})
+        unit["loc"] = {"row": 1, "col": 2 ** 32}
+
+    got = verdicts(rewritten(formats_bundle(text=FORMATS + "\n\n[[table:Q1 cols=region,gmv rows=0-1]]"), change))
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), got["numbers"]
 
 
 def test_reasons_for_readers_do_not_name_implementation_details():
