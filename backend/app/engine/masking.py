@@ -14,22 +14,25 @@
 - 证据摘录（engine/inquiry.py 的 ExcerptMask，judge.prepare 按它逐段遮）：交给反方审稿、审批质询 agent 的报告摘录同一套
   口径，格子逐格遮（masked_cell），SQL 只换在找某一个值的字面量，阈值照原样
 - 哪些列（_derived_masks）：从遮罩列本身起，按 SQL 一层层认出值取自遮罩列的结果列（别名、函数、子查询、WITH、UNION 的
-  另一支、和 * 写在同一支里没起别名的表达式、FROM 里拆开遮罩列的表值函数、函数参数里的 JSON 箭头 col->'path'）；* 把
-  遮罩列带进别的列名的（写了列名表的派生来源、UNION 后一支的 *、标量子查询里的 *）按它展开落到的位置算（_star_places，
-  展开数据源里的表的按查询当时冻结的表结构数位置，_schema_columns；写了库名的表按「库名.表名」查，另一个库里的同名表
-  查不到）。整行和函数参数里的 *（Postgres 的 row_to_json(s)、SELECT s、to_json(s.*)，Oracle 的 JSON_OBJECT(*)）按 *
-  展开的来源算；表的列名表（FROM sales AS s(i, r, p)）、TABLE x、套了括号的 * 先改写成认得出的样子（_normalized）。
+  另一支、和 * 写在同一支里没起别名的表达式、FROM 里拆开遮罩列的表值函数、函数参数里的 JSON 箭头 col->'path'、Oracle
+  的 JSON 点号 t.col.path）；* 把遮罩列带进别的列名的（写了列名表的派生来源、UNION 后一支的 *、标量子查询里的 *）按它
+  展开落到的位置算（_star_places，展开数据源里的表的按查询当时冻结的表结构数位置，_schema_columns；写了库名的表按
+  「库名.表名」查，另一个库里的同名表查不到）。整行和函数参数里的 *（Postgres 的 row_to_json(s)、SELECT s、
+  to_json(s.*)，Oracle 的 JSON_OBJECT(*)）按 * 展开的来源算；表的列名表（FROM sales AS s(i, r, p)）、TABLE x、
+  套了括号的 * 先改写成认得出的样子（_normalized）。
   WITH 里的名字按作用域认（_scoped_cte）：不带 RECURSIVE 的一段看不见它自己和排在后面的段，同名的是数据源里的表。
   COUNT 只数个数、窗口的分区键只决定次序、按遮罩列分档又当分组键或套在汇总里数个数的、汇总里的 CASE 只在条件里用到的
   不算（_value_columns、_band_only）。认不全的写法整份快照的列都算，不再逐个形状补规则：认不出落在哪一列的（PIVOT、
   UNPIVOT 这类也算），(表达式).* 展开读到遮罩列的（复合类型的列、函数交回的记录，外面套了括号、起了别名的也算，展开成
-  几列、叫什么说不清），语法树和实际执行的对不上的（OPAQUE_SQL：MySQL 会执行的注释、U&"…"；没有 * 的一支选出项和结果
-  的列数对不上），表名、SQL 写在字符串里交给函数、统计信息和会话记录里存着值的（INDIRECT_FUNCTIONS、INDIRECT_NAMES：
-  query_to_xml 这一族、dblink、pg_stats、MySQL 的 column_statistics、Oracle 的直方图和 V$SQL……，可验证报告用的同一份），
-  SQL 解析不了又写着遮罩列（或者 *、TABLE x、上面那几类，或者是 Postgres 的）的，分析出了意外、超出工作量上限
-  （ANALYSIS_STEPS）的；这些只收确定取自遮罩列的那几列的值（_Masks.collect）。一次分析里派生来源对应的那块查询、一项
-  的值取自哪些列记下来（_analysis），一长串 CTE 不再卡住。双盲复算按同一套认法在派盲算之前挡下取自遮罩列的指标
-  （derived_columns）
+  几列、叫什么说不清；不只选出项，VALUES、行构造器、函数参数里的也算；Postgres 里 FROM 中可能交回复合类型的表值函数
+  同理，_spreads_record），语法树和实际执行的对不上的（OPAQUE_SQL：MySQL 会执行的注释、U&"…"；没有 * 的一支选出项
+  和结果的列数对不上），表名、SQL 写在字符串里交给函数、统计信息和会话记录里存着值的（INDIRECT_FUNCTIONS、
+  INDIRECT_NAMES：query_to_xml 这一族、dblink、pg_stats、MySQL 的 column_statistics、INNODB_TRX、Oracle 的直方图和
+  V$SQL……，可验证报告用的同一份），不只读表结构的 SHOW、EXPLAIN 一条语句（_reads_beyond：引擎状态、日志、出错信息、
+  视图定义里的原文，MySQL 把只有一行的表的值代进计划里的条件），SQL 解析不了又写着遮罩列（或者 *、TABLE x、上面那几类，
+  或者是 Postgres 的）的，分析出了意外、超出工作量上限（ANALYSIS_STEPS）的；这些只收确定取自遮罩列的那几列的值
+  （_Masks.collect）。一次分析里派生来源对应的那块查询、一项的值取自哪些列记下来（_analysis），一长串 CTE 不再卡住。
+  双盲复算按同一套认法在派盲算之前挡下取自遮罩列的指标（derived_columns）
 - 只装着分档标签的列（_label_columns）：标签是 agent 写在 SQL 里的字，不当遮罩值；* 展开数据源里的表时按冻结的表结构
   认它带不带同名的列（_schema_tables），不知道表结构的按带得出算（多遮）。分档写在派生来源里、外层按它分组的（一档
   一行，_grouped_labels）同当分组键的 CASE 一样照常显示（_shown_labels）
@@ -185,6 +188,17 @@ def _value_columns(node: Any) -> set[str]:
         elif isinstance(item, exp.Column):
             if item.name:
                 out.add(item.name.lower())
+            if item.args.get("db") is not None:
+                # 三段以上的名字（t.profile.tel）：Oracle 的 JSON 点号、对象类型的属性写法里中间几段才是列（t 是表的别名），
+                # 解析器读成「库 t、表 profile、列 tel」，只认 tel 时号码原样交了出去。前面几段都算（多遮：写了库名、表名
+                # 的列，库名、表名碰巧和遮罩列同名时也算）
+                out.update(part.name.lower() for key in ("catalog", "db", "table")
+                           if (part := item.args.get(key)) is not None and part.name)
+        elif isinstance(item, exp.Dot) and isinstance(item.expression, exp.Star):
+            # (表达式).*（VALUES、行构造器、函数参数里的）：展开的各个字段都取自那个表达式。这个 * 不是在展开 FROM 里的
+            # 来源，不按 _scoped_star_inputs 算（以前算了，没设遮罩的复合类型 (p.address).* 也因为 FROM 里有表被当成
+            # 取自遮罩列）。读到遮罩列的整份遮，见 _tainted_in
+            stack.append(item.this)
         elif isinstance(item, exp.Count) or (isinstance(item, (exp.Case, exp.If)) and _band_only(item)):
             continue
         elif isinstance(item, (exp.Case, exp.If)) and (results := _branch_results(item)) is not None \
@@ -880,6 +894,29 @@ def _function_columns(source: Any) -> set[str] | None:
     return names if listed or name in _TABLE_FUNCTIONS else None
 
 
+def _spreads_record(source: Any) -> bool:
+    """Postgres 里这个表值函数这类来源可能交回复合类型、展开成它的各个字段（字段名 SQL 里看不出，同 (表达式).*）：
+    - unnest：数组的元素是复合类型时展开成各个字段（unnest(ARRAY[p.card]) 出 addr、tel），元素是什么类型 SQL 里看不出；
+    - 不在 _TABLE_FUNCTIONS 里的函数写了只有名字、没写类型的列名表：交回复合类型的（jsonb_populate_record(NULL::contact,
+      …)）列名表只改前几列的名字，后面的字段照原名出（Postgres 18 实测，unnest 的列名表也一样）。
+    写了带类型的列定义（jsonb_to_record(…) AS r(tel text)）的出的就是这几列；VALUES、JSON_TABLE 的列写在 SQL 里。"""
+    from sqlglot import exp
+
+    node = source.this if isinstance(source, exp.Lateral) else source
+    alias = source.args.get("alias") or (node.args.get("alias") if node is not source else None)
+    func = node.this if isinstance(node, exp.Table) else node
+    while isinstance(func, exp.Subquery):
+        func = func.this
+    if isinstance(func, (exp.Values, exp.JSONTable)):
+        return False
+    name = (func.name if isinstance(func, exp.Anonymous) else func.sql_name() if isinstance(func, exp.Func)
+            else "").lower()
+    if name == "unnest":
+        return True
+    listed = list(alias.args.get("columns") or []) if alias is not None else []
+    return bool(listed) and name not in _TABLE_FUNCTIONS and not all(isinstance(c, exp.ColumnDef) for c in listed)
+
+
 def _merging(select: Any, name: str) -> bool:
     """FROM 里按同名的 name 这一列连起来（USING 里写着它，或者 NATURAL）：几个来源的这一列合成一列。"""
     return any(str(join.args.get("method") or "").upper() == "NATURAL"
@@ -1173,7 +1210,8 @@ def _normalized(root: Any, read: str | None, tables: dict[str, list[str]] | None
       套了括号、起了别名的 ((p.profile).*)、(p.profile).* AS x 也算，_unwrapped）：展开成几列、各叫什么（复合类型的字段名、
       函数的出列名）SQL 里看不出，改成一个对不上任何来源的 *（_star_sources 为 None），只用来数别的项的位置。表达式的值
       取自哪些列（_value_columns，整行引用已经改写过）记下来交回：读到遮罩列的，整份快照都算（_tainted）——以前只改成对
-      不上来源的 *，最外层、第一支、派生来源里没写列名表的 * 按「照原名带出」认，字段名和遮罩列对不上，号码原样交了出去
+      不上来源的 *，最外层、第一支、派生来源里没写列名表的 * 按「照原名带出」认，字段名和遮罩列对不上，号码原样交了出去。
+      选出项以外的（VALUES、行构造器、函数参数里的）不换，_tainted_in 按它的值取自哪些列认
     tables 是查询当时冻结的表结构（_schema_columns，按次序的列名），认整行引用时看来源出不出某一列；没有为 None。
     交回每个 (表达式).* 的值取自哪些列。"""
     from sqlglot import exp
@@ -1458,16 +1496,17 @@ def _tainted(sql: str, kind: str | None, masked: set[str], width: int, tables: d
     后面的从末尾倒着数。认不出的——两个 * 之间的项、派生来源里没起别名的表达式（外层的 * 会把它原样带出来，列名
     又认不准）——整份快照的列都算（同解析不了）。
     FROM、JOIN、LATERAL 里的表值函数（json_each、unnest、JSON_TABLE、LATERAL VALUES）参数里写着这些名字的，它出的列
-    都算（_function_columns）：遮罩列是 JSON 时，json_each 拆开是最自然的写法。出哪几列说不清的整份快照都算。
+    都算（_function_columns）：遮罩列是 JSON 时，json_each 拆开是最自然的写法。出哪几列说不清的整份快照都算，Postgres
+    里可能交回复合类型、展开成各个字段的（unnest、只写了列名的列名表，_spreads_record）也算。
     * 展开的列换了名字（写了列名表的派生来源、UNION 后一支的 *）：* 带出这些名字的值时，它展开落到的那几列照位置算
     （_star_places，展开数据源里的表的按 tables 数位置，数不清的整段算）；标量子查询里的 *、函数参数里的 *（to_json(s.*)、
     JSON_OBJECT(*)）、整行引用（row_to_json(s)）按 _value_columns 算进外层的表达式。表的列名表、TABLE x、套了括号的 *
     先改写成上面这些认得出的样子（_normalized）。
     PIVOT、UNPIVOT、MATCH_RECOGNIZE 读到这些名字的：值转进了它们自己起名的列（UNPIVOT 的值列、PIVOT 按 IN 里的值起名的列、
-    MEASURES），出的是哪几列不好认，整份快照的列都算。(表达式).* 读到这些名字的、OPAQUE_SQL 和 _INDIRECT 那几类写法
-    （_opaque）、结果的一支没有 * 而选出项和结果的列数对不上的（MySQL 会执行的注释里多写了几项这类，语法树和实际执行的
-    对不上）同样整份算。解析之后的分析出了意外、超出工作量上限（ANALYSIS_STEPS）的也整份算——不退回「解析不了」只看
-    文字：没写遮罩列、没有 * 的整行引用（SELECT s）那样就放过去了。"""
+    MEASURES），出的是哪几列不好认，整份快照的列都算。(表达式).* 读到这些名字的（树上任何位置的，VALUES 里的也算）、
+    OPAQUE_SQL 和 _INDIRECT 那几类写法（_opaque）、结果的一支没有 * 而选出项和结果的列数对不上的（MySQL 会执行的注释里
+    多写了几项这类，语法树和实际执行的对不上）同样整份算。解析之后的分析出了意外、超出工作量上限（ANALYSIS_STEPS）的
+    也整份算——不退回「解析不了」只看文字：没写遮罩列、没有 * 的整行引用（SELECT s）那样就放过去了。"""
     from app.data.sql_semantics import _parse, _read
 
     try:
@@ -1493,11 +1532,16 @@ def _tainted_in(root: Any, sql: str, kind: str | None, masked: set[str], width: 
     """_tainted 解析、改写（_normalized）之后真去认的那一步。opaque 是 (表达式).* 的值取自哪些列（_normalized 交回的）。"""
     from sqlglot import exp
 
+    from app.data.sql_semantics import _read
+
     names = set(masked)
     selects = list(root.find_all(exp.Select))
     blocks = _blocks(root)
     sources = [(top, listed) for top, role, listed in blocks if role == "source"]
     functions = [source for select_ in selects for source in _function_sources(select_)]
+    # Postgres 里可能交回复合类型、展开成各个字段的表值函数（_spreads_record）：读到遮罩列时出哪几列说不清，整份遮
+    spreading = {id(source) for source in functions if _spreads_record(source)} \
+        if _read(kind) in _ROW_DIALECTS else set()
     unreadable = False
     for _ in range(len(selects) + len(sources) + len(functions) + 1):
         before = len(names)
@@ -1510,17 +1554,24 @@ def _tainted_in(root: Any, sql: str, kind: str | None, masked: set[str], width: 
             names |= _source_names(top, listed, names, tables)[0]
         for source in functions:
             if _reads(names, _value_columns(source)):
-                columns = _function_columns(source)
+                columns = None if id(source) in spreading else _function_columns(source)
                 unreadable = unreadable or columns is None
                 names |= columns or set()
         if len(names) == before:
             break
     # 认不出的整份遮：表值函数出哪几列说不清、派生来源里有认不出名字的列、PIVOT 这类读到遮罩列，(表达式).* 读到遮罩列
     # （展开成几列、叫什么都说不清），语法树和实际执行的对不上、SQL 写在字符串里交给函数执行、整表导出、统计信息里的值
-    # （_opaque）
+    # （_opaque）。(表达式).* 不只看选出项（那几个 _normalized 已经换掉，值取自哪些列在 opaque 里）：VALUES 里同样展开成
+    # 好几列（Postgres 文档：选出列表、VALUES、行构造器里的 composite.* 都展开），VALUES 里的一项是 s.*、(s.*) 的也一样；
+    # LATERAL VALUES 按表值函数认时一个元组项只算一列，column2 起的号码原样交了出去。不逐个位置认：(表达式).* 在树上任何
+    # 位置（行构造器、函数参数里的不展开成几列，也一样，多遮）、VALUES 里的 *，读到遮罩列就整份遮
+    expanded = [node.this for node in root.find_all(exp.Dot) if isinstance(node.expression, exp.Star)]
+    expanded += [item for values in root.find_all(exp.Values) for row in values.expressions
+                 if isinstance(row, exp.Tuple) for item in row.expressions if _is_star(_unwrapped(item))]
     everything = unreadable or any(_source_names(top, listed, names, tables)[1] for top, listed in sources) \
         or any(_reads(names, _value_columns(node)) for node in root.find_all(exp.Pivot, exp.MatchRecognize)) \
-        or any(_reads(names, cols) for cols in opaque) or _opaque(sql, kind)
+        or any(_reads(names, cols) for cols in opaque) \
+        or any(_reads(names, _value_columns(node)) for node in expanded) or _opaque(sql, kind)
     positions: set[int] = set()
     for top, role, _listed in blocks:
         if role != "result":
@@ -1580,26 +1631,38 @@ INDIRECT_FUNCTIONS = (
     r"pg_stat_get_(?:backend_)?activity", r"audit_log_read",
 )
 #: 不点列名也读得出表里内容的表、视图、包（按名字认）：
-#: - Oracle 的 DBMS_XMLGEN 这一族（包名后面跟着点），XQuery 里的 ora:view 和 oradb: 表
+#: - Oracle 的 DBMS_XMLGEN 这一族（包名后面跟着点），XQuery 里的 ora:view 和 oradb: 表；读游标、出报告的包：DBMS_XPLAN 的
+#:   DISPLAY_CURSOR（带 PEEKED_BINDS 时有绑定变量的值）、DBMS_SQLTUNE、DBMS_SQL_MONITOR 的报告、DBMS_WORKLOAD_REPOSITORY
+#:   的 AWR 报告（排在前面的语句原文）
 #: - 统计信息里的采样值、全文索引里的词：Postgres 的 pg_stats、pg_statistic 一族，SQLite 的 sqlite_stat*，MySQL 的
 #:   column_statistics（直方图里是列的原值）、innodb_ft_*，MariaDB 的 column_stats，Oracle 的直方图、列统计和记着最小最大值
 #:   的 *_tab_columns、*_tab_cols（LOW_VALUE、HIGH_VALUE 按字节交回来就是号码、姓名的原文），以及它们的底表 histgrm$、
 #:   hist_head$
 #: - 别的会话执行过的 SQL 原文：Postgres 的 pg_stat_activity、pg_stat_statements、本连接预备过的语句；MySQL 的 general_log、
-#:   slow_log、PROCESSLIST、performance_schema（语句历史 events_statements_*、线程正在执行的 SQL），sys 库里建在
-#:   performance_schema 上的会话、锁等待视图（带 x$ 的是不排版的那一份；只认这几张，Oracle 常写的 sys.dual 不算）；Oracle 的
-#:   V$SQL 一族（含 v$sql_bind_capture）、打开着的游标、审计记录
+#:   slow_log、PROCESSLIST、正在执行的事务（information_schema.INNODB_TRX 的 trx_query）、performance_schema（语句历史
+#:   events_statements_*、线程正在执行的 SQL），sys 库里建在 performance_schema 上的会话、锁等待视图（只认这几张，Oracle
+#:   常写的 sys.dual 不算；带 x$ 的不排版的那一份按下面的 X$ 算）；MariaDB 的查询缓存（QUERY_CACHE_INFO）；Oracle 的动态视图
+#:   V$ / GV$ / X$ 一律算，不逐个认（V$SQL 一族、v$sql_bind_capture、打开着的游标、LogMiner 的 V$LOGMNR_CONTENTS、XML 的
+#:   审计记录都在里面），AWR 历史 DBA_HIST_*、审计记录，SQL 调优集里的语句和绑定变量（*_sqlset_*）、调优顾问记下的
+#:   （*_sqltune_*）、SQL Access Advisor 的工作负载（*_advisor_sqlw_*）、固定下来的执行计划和 SQL Profile、Patch
+#: - 被锁那一行、改动前后那一行的值：MariaDB（和 MySQL 5.7）的 INNODB_LOCKS 的 lock_data 是被锁那一行的键值；Oracle 的
+#:   闪回事务（FLASHBACK_TRANSACTION_QUERY 的 UNDO_SQL）、LogMiner（V$LOGMNR_CONTENTS 的 SQL_REDO / SQL_UNDO）写着整行的值
+#: - MySQL、MariaDB 的 OPTIMIZER_TRACE：同 EXPLAIN 一条语句（_reads_beyond），优化器把只有一行的表的值代进条件写在里面
+#:   （要开着优化器跟踪才有内容）
 #: - SQLite 按页读出的原始数据
 #: information_schema、pg_catalog 不整个收：大多只有表结构，核查 agent 查列名、类型时常用，里面存着值的那几张上面逐个列了
-#: （可验证报告那边宁可多挡，整个收，见 SYSTEM_SCHEMAS）
+#: （可验证报告那边宁可多挡，整个收，见 SYSTEM_SCHEMAS）。SHOW、EXPLAIN 这类不是查询的语句另按 _reads_beyond 认
 INDIRECT_NAMES = (
-    r"dbms_xml\w*", r"ora:view", r"oradb",
+    r"dbms_xml\w*", r"ora:view", r"oradb", r"dbms_(?:xplan|sqltune|sql_monitor|workload_repository)",
     r"pg_stat(?:s|istic)\w*", r"sqlite_stat\d", r"column_statistics", r"innodb_ft_\w+", r"column_stats",
     r"(?:all|dba|user|cdb)_(?:\w+_)?(?:histograms|col_statistics|tab_cols|tab_columns)", r"(?:histgrm|hist_head)\$",
     r"pg_stat_activity", r"pg_stat_statements", r"pg_prepared_statements", r"general_log", r"slow_log",
-    r"processlist", r"performance_schema", r"events_statements_\w+",
+    r"processlist", r"innodb_trx", r"innodb_locks", r"query_cache_info", r"optimizer_trace", r"performance_schema",
+    r"events_statements_\w+",
     r"sys[\"`]?\s*\.\s*[\"`]?(?:x\$)?(?:session|processlist|innodb_lock_waits|schema_table_lock_waits)",
-    r"g?v\$sql\w*", r"(?:dba|cdb)_hist_sql\w*", r"g?v\$open_cursor",
+    r"(?:g?v|x)\$\w+", r"(?:dba|cdb)_hist_\w+",
+    r"(?:all|dba|user|cdb)_(?:sqlset|sqltune|advisor_sqlw)_\w+", r"(?:dba|cdb)_sql_(?:plan_baselines|profiles|patches)",
+    r"flashback_transaction_query",
     r"(?:dba|cdb|user)_(?:\w+_)?audit_trail", r"unified_audit_trail", r"aud\$\w*", r"fga_log\$",
     r"sqlite_dbpage",
 )
@@ -1620,10 +1683,43 @@ def indirect_reads(*names: str) -> re.Pattern[str]:
 _INDIRECT = indirect_reads()
 
 
+#: 守卫放行的、不是查询的语句里只读得出表结构、库清单的几种（MySQL、MariaDB）：SHOW 表、列、索引、库、表状态、建库语句，
+#: DESCRIBE / EXPLAIN 一张表（看它的列，后面可以跟一个列名或通配的写法）。核查 agent 探查表结构靠它们，照常。
+#: SHOW CREATE TABLE 不在里面：对视图交回的是视图定义（MySQL 8.0 实测，同 SHOW CREATE VIEW，WHERE 里写死的号码原样），
+#: 建表语句里还有默认值、CHECK 约束、分区的取值；以前因为写着 TABLE x 就整份遮，现在照旧
+_STRUCTURE_ONLY = re.compile(
+    r"show\s+(?:(?:extended|full)\s+)*(?:tables|columns|fields|index|indexes|keys|databases|schemas|table\s+status"
+    r"|create\s+(?:database|schema))\b"
+    r"|(?:explain|describe|desc)\s+(?!(?:select|with|table|values|analyze|format|for|extended|partitions|plan|query"
+    r"|verbose)\b)[\w$`\".]+(?:\s+[\w$`\"'%.]+)?\s*;?\s*$",
+    re.I)
+#: 不是查询、读得出别的东西的语句：SHOW、EXPLAIN、DESCRIBE（EXPLAIN 一条语句也写作 DESCRIBE）
+_STATEMENT_VERBS = frozenset({"show", "explain", "describe", "desc"})
+
+
+def _reads_beyond(bare: str, kind: str | None) -> bool:
+    """去掉注释的 SQL（bare）是 SHOW、EXPLAIN 这类不是查询的语句，读的又不只是表结构（_STRUCTURE_ONLY 以外的）：
+    - SHOW ENGINE INNODB STATUS（最近的死锁、正在执行的事务带着别的会话的 SQL）、BINLOG / RELAYLOG EVENTS（语句格式的
+      日志就是 SQL 原文）、REPLICA STATUS 的出错信息、PROFILES、WARNINGS（EXPLAIN 之后改写过的语句里，只有一行的表的
+      每一列都代成了常量）、视图和触发器的定义、建表语句（对视图交回的是视图定义）、MariaDB 的 SHOW EXPLAIN FOR 别的
+      连接……交回的是原文，可能带着号码；
+    - EXPLAIN 一条语句：MySQL 优化时把只有一行的表（按主键取一行）读出来、把值当常量代进条件，FORMAT=TREE / JSON、
+      EXPLAIN ANALYZE 写出的条件里就是那一行的值（MySQL 8.0 实测）。FOR CONNECTION 看别的连接正在执行的语句，也算。
+    守卫放行所有 SHOW、EXPLAIN（只读），这里不逐个认哪一种带着值：只读表结构的几种以外一律整份遮。Postgres 解析不了的
+    本来就整份遮（_derived_masks），SQLite 的 EXPLAIN 只有字节码和语句里写的字面量，照常。首关键字的认法同守卫的
+    first_verb（括号开头的也认）。"""
+    text = bare.strip()
+    verb = re.match(r"[A-Za-z_]+", text.lstrip("(").lstrip())
+    if verb is None or verb.group(0).lower() not in _STATEMENT_VERBS or (kind or "").lower() == "sqlite":
+        return False
+    return not _STRUCTURE_ONLY.match(text)
+
+
 def _opaque(sql: str, kind: str | None) -> bool:
     """SQL 里有认不全的写法：OPAQUE_SQL（MySQL 会执行的注释、U&"…"），或者 _INDIRECT 那几类。按原文认（字符串、注释里
     写着的也算，多遮），再按去掉注释的认：函数名和括号之间夹着注释（query_to_xml/**/(…)、query_to_xml --换行(…)）解析得了，
-    语法树上又不认函数名，原文里名字后面不紧跟着括号，以前就放过去了。去注释照守卫按数据源的方言切（data/guard.py）。"""
+    语法树上又不认函数名，原文里名字后面不紧跟着括号，以前就放过去了。去注释照守卫按数据源的方言切（data/guard.py）。
+    不只读表结构的 SHOW、EXPLAIN 一条语句也算（_reads_beyond）。"""
     if OPAQUE_SQL.search(sql) or _INDIRECT.search(sql):
         return True
     from app.data.guard import strip_comments
@@ -1632,13 +1728,16 @@ def _opaque(sql: str, kind: str | None) -> bool:
         bare = strip_comments(sql, dialect=kind)
     except Exception:  # noqa: BLE001 - 守卫切不开的写法：认不准，按认不全算（宁可多遮）
         return True
-    return bare != sql and bool(_INDIRECT.search(bare))
+    return (bare != sql and bool(_INDIRECT.search(bare))) or _reads_beyond(bare, kind)
 
 
 def _implicit(sql: str, kind: str | None = None) -> bool:
     """解析不了的 SQL 里有没有不写列名也会带出遮罩列的写法（*、TABLE x，OPAQUE_SQL、_INDIRECT 那几类，_opaque）：它们能
     把遮罩列带进别的列名（列名表、UNION 的后一支）、整表交出来，同写着遮罩列一样整份遮（_derived_hidden）。只看文字，
-    字符串、注释里的也算（多遮）。"""
+    字符串、注释里的也算（多遮）。只读表结构的 SHOW、DESCRIBE（_STRUCTURE_ONLY）不按 *、TABLE x 认：SHOW TABLE STATUS
+    里的 TABLE 不是 TABLE x 语句，以前因此整份遮，表状态看不到（SHOW CREATE TABLE 照旧整份遮，见 _STRUCTURE_ONLY）。"""
+    if _STRUCTURE_ONLY.match(sql.strip()):
+        return _opaque(sql, kind)
     return bool(_IMPLICIT.search(_COUNT_STAR.sub("", sql))) or _opaque(sql, kind)
 
 
@@ -2607,9 +2706,10 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
     - 整列遮：列名直接对上遮罩列的，加上按 SQL 认出值取自遮罩列的（_derived_masks：别名、函数、子查询、WITH、
       SELECT *（展开的列换了名字的也算）、表值函数、整行引用和函数参数里的 *、列名表、TABLE x；COUNT、只在条件里用到、
       分档当分组键的不算，分档写在派生来源里、外层按它分组的也不算）；认不全的（SQL 解析不了又写着遮罩列、*、TABLE x，
-      或者是 Postgres 的；(表达式).* 读到遮罩列，MySQL 会执行的注释、U&"…"，表名、SQL 写在字符串里交给函数，统计信息、
-      会话记录里存着值的视图，选出项和结果的列数对不上，分析出意外、超出工作量上限）整份结果的列都遮（QueryMask.whole）。
-      这几列的格子换成「已遮罩」，类型记成文本
+      或者是 Postgres 的；(表达式).* 读到遮罩列（VALUES 里的也算）、Postgres 里可能交回复合类型的表值函数读到遮罩列，
+      MySQL 会执行的注释、U&"…"，表名、SQL 写在字符串里交给函数，统计信息、会话记录里存着值的视图，不只读表结构的
+      SHOW、EXPLAIN 一条语句，选出项和结果的列数对不上，分析出意外、超出工作量上限）整份结果的列都遮
+      （QueryMask.whole）。这几列的格子换成「已遮罩」，类型记成文本
     - 别的列按值换，只换文字格：整格就是遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，
       _Secrets.loose_spans），换过的格子记下来（QueryMask.cells）。遮罩值是这份结果里的加上 known：先查号码、再查写着
       号码的备注、没设遮罩的联系方式表（别的库里的也一样）时，后一份同样遮好。门槛同按值遮（SECRET_DIGITS、SECRET_MIN）；

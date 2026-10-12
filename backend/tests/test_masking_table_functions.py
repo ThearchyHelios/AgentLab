@@ -146,6 +146,27 @@ def test_a_json_arrow_over_an_unmasked_column_stays_visible():
     assert hidden_of("SELECT transform(scores, x -> x + 1) AS 分 FROM sales", ["分"], "postgres") == MASKED
 
 
+@pytest.mark.parametrize("sql, columns, shown", [
+    pytest.param("SELECT t.profile.tel AS 电话 FROM sales t", ["电话"], ["电话"], id="JSON 点号"),
+    pytest.param("SELECT t.profile.contact.tel FROM sales t", ["tel"], ["tel"], id="JSON 点号两层"),
+    pytest.param("SELECT UPPER(t.profile.tel) AS 电话, t.region FROM sales t", ["电话", "region"], ["电话"],
+                 id="套函数"),
+    pytest.param("SELECT x.电话 FROM (SELECT t.profile.tel AS 电话 FROM sales t) x", ["电话"], ["电话"],
+                 id="子查询里取出再选"),
+])
+def test_oracle_dot_notation_into_a_masked_json_column_is_read_as_that_column(sql, columns, shown):
+    """Oracle 的 JSON 点号、对象类型的属性写法（t.profile.tel）：解析器读成「库 t、表 profile、列 tel」，以前只认 tel，
+    取出来的号码原样交给模型、落库。中间几段也算列（多遮：写了库名、表名的列，表名碰巧和遮罩列同名时也算）。"""
+    hidden = hidden_of(sql, columns, "oracle")
+    assert {c.lower() for c in shown} <= hidden and "region" not in hidden
+
+
+def test_oracle_dot_notation_into_an_unmasked_column_stays_visible():
+    """点号取的不是遮罩列、写了库名表名的普通列：一列都不遮。"""
+    assert hidden_of("SELECT t.tags.name AS 标签 FROM sales t", ["标签"], "oracle") == MASKED
+    assert hidden_of("SELECT shop.sales.region FROM shop.sales", ["region"], "oracle") == MASKED
+
+
 def test_a_json_arrow_inside_json_each_is_masked_when_really_run():
     """SQLite 里真跑一遍：json_each(profile->'$.tels') 拆出来的号码在交给模型之前就遮掉。"""
     import sqlite3
@@ -159,3 +180,72 @@ def test_a_json_arrow_inside_json_each_is_masked_when_really_run():
     db.close()
     done = masking.mask_query_result(payload, ["profile"], "sqlite")
     assert done.columns == ["v"] and done.payload["rows"] == [["已遮罩"], ["已遮罩"]]
+
+
+# --------------------------------------------------------------------------
+# 交回复合类型的表值函数（K3b）：Postgres 把复合类型展开成它的各个字段
+# --------------------------------------------------------------------------
+
+
+#: people3.card 是设了遮罩的复合类型（addr, tel），people2.pj 是设了遮罩的 jsonb（照着 contact 类型拆），sales 是订单
+COMPOSITE_SCHEMA = {"tables": {
+    "people3": {"qualified": "people3", "schema": None, "columns": [{"name": c} for c in ["id", "card", "city"]]},
+    "people2": {"qualified": "people2", "schema": None, "columns": [{"name": c} for c in ["id", "pj"]]},
+    "sales": {"qualified": "sales", "schema": None, "columns": [{"name": c} for c in SALES]},
+}}
+COMPOSITE_MASKED = ["card", "pj", "buyer_phone"]
+
+
+def _boundary(sql: str, columns: list[str], row: list) -> masking.QueryMask:
+    payload = {"columns": columns, "rows": [list(row)], "sql": sql}
+    return masking.mask_query_result(payload, COMPOSITE_MASKED, "postgresql", schema=COMPOSITE_SCHEMA)
+
+
+#: (SQL, 结果列, 一行)：结果的样子照 Postgres 18 实测。unnest 的数组元素是复合类型时，FROM 里的 unnest 展开成复合类型的
+#: 各个字段（addr、tel），写了列名表也只改前几列的名字；交回复合类型的函数（jsonb_populate_record(NULL::contact, …)）
+#: 写了只有名字、没写类型的列名表时同样只改前几列，后面的字段照原名出
+COMPOSITE_RESULTS = [
+    pytest.param("SELECT v.* FROM people3 p, unnest(ARRAY[p.card]) v", ["addr", "tel"], ["某路 1 号", "13900000001"],
+                 id="unnest 复合类型的数组"),
+    pytest.param("SELECT * FROM unnest(ARRAY[(SELECT card FROM people3 WHERE id = 1)])", ["addr", "tel"],
+                 ["某路 1 号", "13900000001"], id="参数是子查询"),
+    pytest.param("SELECT v.tel FROM people3 p, LATERAL unnest(ARRAY[p.card]) v", ["tel"], ["13900000001"],
+                 id="LATERAL 取一个字段"),
+    pytest.param("SELECT * FROM people3 p, unnest(ARRAY[p.card]) AS u(a)", ["id", "card", "city", "a", "tel"],
+                 [1, "(某路 1 号,13900000001)", "杭州", "某路 1 号", "13900000001"], id="列名表比字段少"),
+    pytest.param("SELECT u.* FROM people3 p, unnest(ARRAY[p.card], ARRAY[p.city]) AS u", ["addr", "tel", "unnest"],
+                 ["某路 1 号", "13900000001", "杭州"], id="unnest 几个数组"),
+    pytest.param("SELECT u.* FROM people3 p, unnest(ARRAY[p.card]) WITH ORDINALITY AS u(a)",
+                 ["a", "tel", "ordinality"], ["某路 1 号", "13900000001", 1], id="WITH ORDINALITY"),
+    pytest.param("SELECT * FROM (SELECT p.card FROM people3 p) s, LATERAL unnest(ARRAY[s.card]) WITH ORDINALITY u",
+                 ["card", "addr", "tel", "ordinality"], ["(某路 1 号,13900000001)", "某路 1 号", "13900000001", 1],
+                 id="参数取自派生来源"),
+    pytest.param("SELECT r.* FROM people2 p, jsonb_populate_record(NULL::contact, p.pj) AS r(a)", ["a", "tel"],
+                 ["丙路", "13900000021"], id="populate_record 列名表比字段少"),
+    pytest.param("SELECT r.* FROM people2 p, LATERAL jsonb_populate_recordset(NULL::contact, jsonb_build_array(p.pj)) "
+                 "AS r(a)", ["a", "tel"], ["丙路", "13900000021"], id="populate_recordset 列名表比字段少"),
+]
+
+
+@pytest.mark.parametrize("sql, columns, row", COMPOSITE_RESULTS)
+def test_a_table_function_spreading_a_composite_masks_the_whole_result(sql, columns, row):
+    """FROM 里的函数交回复合类型、读到遮罩列：展开成哪几个字段、各叫什么 SQL 里看不出（同 (表达式).*），整份遮。以前
+    unnest 按「出一列，名字是别名或函数名」认，列名表按写全了认，tel 这一列的号码原样交给模型、落库。"""
+    done = _boundary(sql, columns, row)
+    assert done.whole and done.columns == columns
+    assert done.payload["rows"] == [["已遮罩"] * len(columns)]
+
+
+@pytest.mark.parametrize("sql, columns, row, hidden", [
+    pytest.param("SELECT r.* FROM people2 p, jsonb_to_record(p.pj) AS r(tel text, addr text)", ["tel", "addr"],
+                 ["13900000021", "丙路"], ["tel", "addr"], id="写了带类型的列定义"),
+    pytest.param("SELECT k, v FROM people2 p, jsonb_each_text(p.pj) AS x(k, v)", ["k", "v"], ["tel", "13900000021"],
+                 ["k", "v"], id="出列认得全的函数写了列名表"),
+    pytest.param("SELECT s.id, u FROM sales s, unnest(ARRAY[s.region]) AS u", ["id", "u"], [1, "华东"], [],
+                 id="unnest 没碰遮罩列"),
+])
+def test_a_table_function_whose_columns_are_spelled_out_is_read_as_before(sql, columns, row, hidden):
+    """列写全了的（带类型的列定义、出列认得全的函数）照旧按名字认，没碰遮罩列的照常。"""
+    done = _boundary(sql, columns, row)
+    assert not done.whole and done.columns == hidden
+    assert done.payload["rows"] == [["已遮罩" if c in hidden else v for c, v in zip(columns, row)]]

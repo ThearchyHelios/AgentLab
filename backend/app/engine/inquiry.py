@@ -63,8 +63,13 @@
   IS NOT NULL THEN amount ELSE 0 END)）同写在 WHERE 里，不算
 - FROM、JOIN、LATERAL 里的表值函数（json_each、json_tree、unnest、jsonb_each_text、JSON_TABLE、LATERAL VALUES）拆开
   遮罩列的，按出列名认它出的列（常见函数的出列名、写的列名表、别名、函数名，_function_columns），同名的别的列一并遮
-  （多遮）；不认得的函数又没写列名表的，整份快照都遮。函数参数里没写表名的 col->'path'（JSON 箭头，解析器当成以 col
-  为参数的 lambda）按 col 认，真的 lambda（transform(arr, x -> …)）的参数和遮罩列同名时也算（多遮）
+  （多遮）；不认得的函数又没写列名表的，整份快照都遮。Postgres 里可能交回复合类型、展开成各个字段的也整份遮
+  （masking._spreads_record）：unnest（数组的元素是复合类型时展开成 addr、tel 这些字段，写了列名表也只改前几列的
+  名字），不认得的函数只写了列名、没写类型的列名表（jsonb_populate_record(NULL::contact, …) AS r(a) 后面的字段
+  照原名出）；拆的是普通数组的 unnest 也一样整份遮（元素是什么类型 SQL 里看不出，多遮）。函数参数里没写表名的
+  col->'path'（JSON 箭头，解析器当成以 col 为参数的 lambda）按 col 认，真的 lambda（transform(arr, x -> …)）的参数
+  和遮罩列同名时也算（多遮）。三段以上的名字（Oracle 的 JSON 点号、对象类型的属性 t.profile.tel，解析器读成库、表、列）
+  前面几段也算列，写了库名、表名的列，库名、表名碰巧和遮罩列同名时也算（多遮）
 - * 把遮罩列带进别的列名（WITH t(a, b, …) AS (SELECT * …) 这类列名表、表的列名表 FROM sales AS s(i, r, p)、UNION 后一支
   的 *、TABLE x、标量子查询里的 *）：只展开一个来源、那里每一列都数得清的，按位置只遮取自遮罩列的那几列——子查询按它的
   选出项数，数据源里的表按查询当时冻结的表结构数（几张列一样的月度表 SELECT * 连起来汇总，金额照常）。表结构里查不到
@@ -85,18 +90,26 @@
   按看不见算（当成数据源里的表，多遮）
 - 认不全的写法整份遮（多遮，同一份里没碰遮罩列的编号、金额也遮）：(表达式).* 展开读到遮罩列的（复合类型的列
   (p.profile).*、函数交回的记录 (jsonb_each_text(pj)).*、子查询里的 ROW (q.r).*，外面套了括号、起了别名的也算，展开成
-  几列、各叫什么 SQL 里看不出）；语法树和实际执行的对不上的（MySQL、MariaDB 会执行的注释 /*! … */，Postgres 的
+  几列、各叫什么 SQL 里看不出；不只选出项，VALUES 里的、行构造器和函数参数里的也算），VALUES 里的 s.*、(s.*) 读到遮罩列
+  的（同样展开成好几列）；语法树和实际执行的对不上的（MySQL、MariaDB 会执行的注释 /*! … */，Postgres 的
   U&"…" 名字，没有 * 的一支选出项和结果的列数对不上）；表名、SQL 写在字符串里交给函数执行、整表导出的（query_to_xml、
   table_to_xml、cursor_to_xml、schema_to_xml、database_to_xml 这一族，dblink、crosstab、ts_stat，Oracle 的
-  DBMS_XMLGEN、XMLTYPE）、按页按文件按日志读原始数据的（pageinspect、逻辑解码、LOAD_FILE）、统计信息和会话记录里存着值
-  的（Postgres 的 pg_stats、pg_stat_statements、pg_stat_activity；SQLite 的 sqlite_stat4；MySQL 的 column_statistics、
-  general_log、PROCESSLIST、performance_schema；MariaDB 的 column_stats；Oracle 的直方图、记着最小最大值的
-  *_tab_columns、V$SQL 一族、审计记录），按名字认（masking 的 INDIRECT_FUNCTIONS、INDIRECT_NAMES，可验证报告用的同一份
-  名单），去掉注释再认一遍（函数名和括号之间夹着注释），自己建的同类函数、视图认不出；information_schema、pg_catalog 里
-  只有表结构的视图不算（核查 agent 查列名、类型常用）。只收支持的几种库的：DuckDB、SQL Server 的同类函数不收；分析出了
-  意外、一长串 CTE 超出工作量上限（ANALYSIS_STEPS）的。整份遮的只收确定取自遮罩列的那几列的值当遮罩值（别的列的值
-  本来就没交给模型，收了会把区域名、列名在同一次核查里处处换掉）；快照记下整份遮（masked_whole），格子引用指到它时照实
-  说写法认不全
+  DBMS_XMLGEN、XMLTYPE）、按页按文件按日志读原始数据的（pageinspect、逻辑解码、LOAD_FILE）、统计信息、会话记录、锁和
+  日志里存着值的（Postgres 的 pg_stats、pg_stat_statements、pg_stat_activity；SQLite 的 sqlite_stat4；MySQL 的
+  column_statistics、general_log、PROCESSLIST、INNODB_TRX、OPTIMIZER_TRACE、performance_schema；MariaDB 的
+  column_stats、INNODB_LOCKS、QUERY_CACHE_INFO；Oracle 的直方图、记着最小最大值的 *_tab_columns、V$SQL 一族、
+  SQL 调优集、固定下来的执行计划、闪回事务、LogMiner、审计记录），按名字认（masking 的 INDIRECT_FUNCTIONS、
+  INDIRECT_NAMES，可验证报告用的同一份名单），去掉注释再认一遍（函数名和括号之间夹着注释），自己建的同类函数、视图
+  认不出；information_schema、pg_catalog 里只有表结构的视图不算（核查 agent 查列名、类型常用）。不是查询的语句里，
+  只读表结构的 SHOW（表、列、索引、库、表状态、建库语句）、DESCRIBE 一张表照常，别的 SHOW（ENGINE INNODB STATUS、
+  BINLOG EVENTS、WARNINGS、CREATE TABLE / VIEW……）、EXPLAIN 一条语句（MySQL 把只有一行的表的值代进计划里的条件）
+  不逐个认，一律整份遮。只收支持的几种库的：DuckDB、SQL Server 的同类函数不收；分析出了意外、一长串 CTE 超出工作量
+  上限（ANALYSIS_STEPS）的。整份遮的只收确定取自遮罩列的那几列的值当遮罩值（别的列的值本来就没交给模型，收了会把区域
+  名、列名在同一次核查里处处换掉）；快照记下整份遮（masked_whole），格子引用指到它时照实说写法认不全
+- 定义里写死的字面量不认：视图、函数、触发器、约束、默认值的定义经 information_schema（views、routines、triggers、
+  columns 的默认值）、pg_views、pg_get_viewdef() 这类查出来照常交给 agent，写死在定义里的号码（排除测试账号的 WHERE）
+  只在已经认得的遮罩值里时按值换掉；SHOW CREATE TABLE（对视图交回的是视图定义）、SHOW CREATE VIEW、SHOW TRIGGERS 不在
+  只读表结构的几种里，跟着整份遮
 - 按遮罩列分档的标签（CASE、IIF 的结果全是写死的常量）：标签文字是 agent 写在 SQL 里的，不当遮罩值，SQL、回答正文里
   照原样；标签列当分组键（每一档一行）照常显示，分档写在子查询、WITH 里、外层（或中间一层）按它分组的也算
   （masking._grouped_labels），不分组的逐行标签列整列遮（格子里看不出某一笔落在哪一档），可 agent
