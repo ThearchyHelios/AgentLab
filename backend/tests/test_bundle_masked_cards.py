@@ -30,23 +30,28 @@ CELL = "cell(nodes.members, 0, 'phone')"
 
 
 def card_with(inputs, substituted="len('000-0001')", expression=f"len({CELL})"):
-    """会员号码位数一张卡：报告引用的是它（m:gmv 指过来）。"""
+    """会员号码位数一张卡：报告引用的是它（m:gmv 指过来）。卡上另有一个普通指标「会员数」（base，没有输入）：报告文档的
+    证据目录里 m:gmv 指的是它（见 bundle_of）。"""
     return {"kind": "metric_set", "caliber": "会员口径", "caliber_version": "v1", "metrics": [
         {"id": "gmv", "name": "号码位数", "value": 1280.5, "unit": "元", "decimals": 1, "expression": expression,
-         "substituted": substituted, "inputs": inputs}]}
+         "substituted": substituted, "inputs": inputs},
+        {"id": "base", "name": "会员数", "value": 2, "unit": "位", "decimals": 0}]}
 
 
 def bundle_of(card, *, outputs=None, source_masks=None, tamper=None, rehash=False, files_changed=None):
     """一次手搭的运行：会员查询（带遮罩的快照）→ 数据整形（outputs 里的产出）→ 口径卡 → 报告。tamper 给了就把服务端的
     卡文件换成 tamper(原字节)，id 照旧（文件被改过、哈希对不上）；rehash 为真时 id 按换过的字节算（服务端存的就是这一份，
-    哈希对得上）。files_changed 换掉服务端别的文件（{工件 id: 新字节}，id 照旧）。"""
+    哈希对得上）。files_changed 换掉服务端别的文件（{工件 id: 新字节}，id 照旧）。
+
+    报告文档的证据目录里 m:gmv 指的是卡上的普通指标「会员数」（base）：这几条只看卡本身给不给内容。目录里收着值不给的
+    指标的原值的老文档整份只给哈希、也不附带它引用的卡（tests/test_bundle_masked_metrics.py），那样就看不到卡了。"""
     card_id, card_raw = stored(card)
     if tamper is not None:
         card_raw = tamper(card_raw)
     if rehash:
         card_id = content_hash(card_raw)
     doc = doc_of(extra_catalog={"m:gmv": {"alias": "m:gmv", "kind": "metric", "artifact": card_id, "node_id": "card",
-                                          "locator": {"metric": "gmv"}, "value": 1280.5}})
+                                          "locator": {"metric": "base"}, "value": 2}})
     doc_id, doc_raw = stored(doc)
     files = {**STORE, card_id: card_raw, doc_id: doc_raw, **(files_changed or {})}
     events = [

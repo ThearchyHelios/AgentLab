@@ -17,8 +17,11 @@
 - continued：早期运行先失败、经继续运行跑到成功：范围里有那条运行失败，之后运行又继续了，成功结束的那条在范围外
 - degraded：两条出具判定，先完整出具、后降档出具，认最后一条
 - missing-doc / missing-card：导出时服务端已没有报告文档 / 口径卡的文件
-- masked-card：口径卡上一个指标的输入取自会员消费的号码列（设了遮罩），卡上记着号码原值：整张卡只给 id，引用它的
-  数字无法核对
+- masked-card：口径卡上两个指标的输入取自会员消费的号码列（设了遮罩）：联系电话位数、首位会员手机号（值就是号码），卡上
+  记着号码原值。整张卡只给 id，引用它的数字无法核对；卡的节点完成事件（预览里逐条写着「指标（名称）= 值」）只给哈希；
+  报告文档按现在的报告撰写节点写，证据目录里这两个指标写「已遮罩」，照常随文件附带
+- masked-old-doc：同一张卡，报告文档是之前的报告撰写节点写的，证据目录里这两个指标写着原值：整份文档只给哈希、不附带它
+  引用的工件，报告的节点完成事件也只给哈希，页面照实说明原因
 - masked-source：会员库设了号码遮罩（查询当时记下了，数据源现在也设着）。报告引用会员按地区汇总的查询（没碰遮罩列：
   快照随文件附带，数字核对得过）和选出了号码的那份会员消费（只给哈希）
 - nan：运行开始事件和门店流水快照里有 json.dumps 写出的裸 NaN（快照里那一列报告没有引用）
@@ -39,7 +42,7 @@ from typing import Any
 
 from app.bundle.build import build_bundle, render_html
 from app.core.artifact_store import canonical_json, content_hash, manifest_hash
-from app.engine.evidence import build_catalog, compose_doc
+from app.engine.evidence import build_catalog, compose_doc, withhold_metrics
 
 RUN_ID = "5a3c0f4b9d2e4e1f8b7a6c5d4e3f2a1b"
 RUN = {"id": RUN_ID, "workflow_id": "wf-sample-weekly", "workflow_name": "门店周报", "version": 3,
@@ -116,14 +119,34 @@ def shop(nan: bool = False) -> dict[str, Any]:
             "sql": "SELECT store, amount, ratio FROM orders ORDER BY id", "truncated": False}
 
 
+#: 报告撰写节点把值取自遮罩格的指标写成的字（同 api/evidence.py 的 MASKED）
+MASKED = "已遮罩"
+
+
 def masked_card(crm_id: str) -> dict[str, Any]:
-    """口径卡多一个指标：联系电话位数，输入是会员消费第 0 行的号码（phone 设了遮罩），卡上记着号码原值和代入式。"""
-    cell = "cell(nodes.members, 0, 'phone')"
+    """口径卡多两个指标：联系电话位数、首位会员手机号，输入都是会员消费第 0 行的号码（phone 设了遮罩），卡上记着号码原值
+    和代入式；首位会员手机号的值就是号码。"""
+    cell, phone = "cell(nodes.members, 0, 'phone')", CRM["rows"][0][1]
+    read = {"path": cell, "value": phone, "node_id": "members", "via": "tool_cell", "artifact": crm_id,
+            "locator": {"row": 0, "column": "phone"}, "status": "verified"}
     contact = {"id": "contact", "name": "联系电话位数", "value": 8, "unit": "位", "decimals": 0, "format": "thousands",
-               "expression": f"len({cell})", "substituted": f"len('{CRM['rows'][0][1]}')",
-               "inputs": [{"path": cell, "value": CRM["rows"][0][1], "node_id": "members", "via": "tool_cell",
-                           "artifact": crm_id, "locator": {"row": 0, "column": "phone"}, "status": "verified"}]}
-    return {**CARD, "metrics": [*CARD["metrics"], contact]}
+               "expression": f"len({cell})", "substituted": f"len('{phone}')", "inputs": [dict(read)]}
+    first = {"id": "phone_raw", "name": "首位会员手机号", "value": phone, "unit": "", "decimals": None, "format": "plain",
+             "expression": cell, "substituted": f"'{phone}'", "inputs": [dict(read)]}
+    return {**CARD, "metrics": [*CARD["metrics"], contact, first]}
+
+
+#: masked_card 上值不给的指标（和证据面板指标步骤的值同一个判断：输入取自遮罩格）
+MASKED_METRICS = ("m:contact", "m:phone_raw")
+
+
+def card_preview(card: dict[str, Any], artifact: str) -> dict[str, Any]:
+    """口径卡节点完成事件的预览，照 metrics 节点产出的样子（compiler._preview）：text 里逐条写着「指标（名称）= 值」。"""
+    lines = [f"- {m['id']}（{m['name']}）= {m['value']}{m.get('unit') or ''}" for m in card["metrics"]]
+    return {"kind": "metric_set", "caliber": card["caliber"], "caliber_version": card["caliber_version"],
+            "metrics": f"[{len(card['metrics'])} 项]",
+            "text": f"指标清单（口径 {card['caliber']} @ {card['caliber_version']}）：\n" + "\n".join(lines),
+            "artifact": artifact}
 
 
 class Sample:
@@ -165,8 +188,11 @@ class Sample:
         raw = self.files.get(artifact)
         return json.loads(raw) if raw is not None else None
 
-    def doc(self, text: str, node_id: str, run_id: str = RUN_ID) -> str:
-        return self.put(compose_doc(text, self.catalog, node_id=node_id, run_id=run_id, loader=self.load))
+    def doc(self, text: str, node_id: str, run_id: str = RUN_ID, *, masked: tuple[str, ...] = ()) -> str:
+        """组装一份报告文档。masked：值不给的指标，照现在的报告撰写节点写成「已遮罩」（withhold_metrics）；不给的是之前的
+        报告撰写节点写的样子（目录里原样写着值）。"""
+        catalog = withhold_metrics(self.catalog, masked, MASKED)
+        return self.put(compose_doc(text, catalog, node_id=node_id, run_id=run_id, loader=self.load))
 
     def events(self, reports: dict[str, str], *, ending: str = "finished", tiers: tuple[str, ...] = ("formal",),
                nan: bool = False) -> tuple[list[tuple[int, str, str | None, Any]], int]:
@@ -196,7 +222,7 @@ class Sample:
                                         "query_artifact": self.entries["regions"]["artifact"],
                                         "preview": json.dumps(REGIONS["rows"], ensure_ascii=False)})
             add("node.finished", "regions", {"duration_ms": 8, "attempt": 1, "evidence": [self.entries["regions"]]})
-        add("node.finished", "card", {"duration_ms": 3, "attempt": 1, "preview": {"kind": "metric_set"},
+        add("node.finished", "card", {"duration_ms": 3, "attempt": 1, "preview": card_preview(self.card, self.card_id),
                                       "evidence": [self.entries["card"]]})
         for node_id, doc_id in reports.items():
             add("llm.end", node_id, {"model": "mock", "output": "（写作草稿）"})
@@ -283,8 +309,10 @@ def bundles() -> dict[str, dict[str, Any]]:
     out["nan"] = build(n, events, bound)
 
     m = Sample(masked=True)
-    events, bound = m.events({"write": m.doc(WEEKLY, "write")})
+    events, bound = m.events({"write": m.doc(WEEKLY, "write", masked=MASKED_METRICS)})
     out["masked-card"] = build(m, events, bound)
+    events, bound = m.events({"write": m.doc(WEEKLY, "write")})
+    out["masked-old-doc"] = build(m, events, bound)
 
     r = Sample(regions=True)
     events, bound = r.events({"write": r.doc(MEMBERS, "write")})

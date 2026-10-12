@@ -18,14 +18,17 @@
 // - 深浅色、窄屏：390 宽不横向溢出，点开的数字面板在窄屏上从底部抽出，深色下底是深的、字是浅的；
 // - 样本页：tests/bundle_samples.py 用虚构数据真实生成的几份页面（遮罩快照、两份报告、早期运行、失败结束、先失败后
 //   经继续运行跑到成功的早期运行、两条出具
-//   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列、设了遮罩的数据源上按地区汇总的查询、每种显示
+//   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列（卡的节点完成事件只给哈希）、同一张卡配上证据
+//   目录里写着号码的老文档（文档只给哈希、页面写明原因）、设了遮罩的数据源上按地区汇总的查询、每种显示
 //   格式各引用一处的经营月报、单位带尾随空白的经营月报），逐份断言各项结果和原因文案；经营月报上只改文字取值、数字、
-//   换算成万的口径卡引用的显示文字并重算全部哈希，各自变红并点名；核对过的字不动、改它旁边的（链接地址藏起数字、前面
-//   补一位数、隔着显示时不占位置的控制字符补一位数、长得像负号的连字符、叠在空格上的横线、从右往左书写的字母把一位数
-//   挪到数字前面、整段改成分隔线、文字片段冒用数字的 id），读的人看到的数要就是核对过的那个；列表缩进写成十万级或负数、
+//   换算成万的口径卡引用的显示文字并重算全部哈希，各自变红并点名；核对过的字不动、改它旁边的（链接地址藏起数字、整段
+//   改成分隔线、文字片段冒用数字的 id；数字前面补一位数、加负号、后面接「0 万」，隔着显示时不占位置的控制字符补一位数、
+//   长得像负号的连字符，这几种变红并点名「正文里紧挨着这个数的字改变了读者看到的数」；叠在空格上的横线、从右往左书写的
+//   字母把一位数挪到数字前面判无法核对），读的人看到的数要就是核对过的那个；列表缩进写成十万级或负数、
 //   表格的列号写成十万，核对通过的数字照样留在屏幕上（宽屏、窄屏都不横向溢出）；在上面篡改 ④
 //   引用链（换文档、拿掉报告、多一份没人引用的工件）、⑥ 运行信息（运行结果、类别、出具档位）、拿掉被引用的口径卡、把
-//   报告文档标成遮罩、把遮罩卡标成服务端的文件与 id 不一致或解析不出来（服务端对被改过、解析不了的遮罩卡就这么标）、
+//   报告文档标成遮罩（总览不是绿的）、把遮罩卡标成服务端的文件与 id 不一致或解析不出来（服务端对被改过、解析不了的遮罩卡
+//   就这么标）、
 //   遮罩源上随文件附带的汇总快照改一个字节、它的数字改引用值并重算全部哈希、
 //   只改页面顶部的封存哈希；宽屏点开表格里右对齐的数字不被面板盖住；不执行脚本时封存哈希、运行 ID 照样看得到，状态写
 //   「尚未核对」；
@@ -580,7 +583,7 @@ await section('样本页：各种形状', async () => {
     check('生成样本页（tests/bundle_samples.py）', false, String(e?.message ?? e))
     return
   }
-  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 14, Object.keys(samples).join('、'))
+  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 15, Object.keys(samples).join('、'))
 
   await sample('base', async (s, page) => {
     check('base：总览通过，有无法核对的项时写「可核对的项全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过',
@@ -703,8 +706,31 @@ await section('样本页：各种形状', async () => {
       && metricNumber.text.includes('含遮罩列'), metricNumber?.text)
     check('masked-card：总览通过（可核对的项全部通过），没有一项不通过', s.overall === 'pass' && s.text === '可核对的项全部通过'
       && !s.items.some((i) => i.result === 'fail'), `${s.overall}：${s.text}`)
+    // 卡的节点完成事件预览里逐条写着「指标（名称）= 值」，号码那个指标也在里面：只给哈希，① 里不列它
+    const data = dataOf(samples['masked-card'])
+    const cardEvent = data.events.find((e) => e.type === 'node.finished' && e.node_id === 'card')
+    check('masked-card：口径卡的节点完成事件只给哈希，① 里不列它', !!cardEvent && !('canonical' in cardEvent)
+      && !s.items.some((i) => i.check === 'events' && i.text.includes(`第 ${cardEvent.seq} 条`)), cardEvent?.seq)
+    // 报告文档是现在的报告撰写节点写的：证据目录里号码那个指标写「已遮罩」，文档照常随文件附带、正文照常显示
+    check('masked-card：报告文档照常随文件附带，正文照常显示', s.reports[0]?.why === '' && s.reports[0]?.parts.includes('文档 通过'),
+      JSON.stringify(s.reports[0]))
     const html = await page.content()
     check('masked-card：页面里找不到卡上那个遮罩列的号码', !html.includes('000-0001') && !html.includes('000-0002'))
+  })
+  // 同一张卡，报告文档是之前的报告撰写节点写的（证据目录里写着号码）：整份只给哈希，页面写明原因；这份报告算未能核对，
+  // 总览不是绿的，但没有一项不通过（这是导出时就这样，不是被改过）
+  await sample('masked-old-doc', async (s, page) => {
+    const why = '证据目录里写着取自遮罩列的指标的值'
+    check('masked-old-doc：总览不是绿色的通过，写明有报告未能核对，没有一项不通过', s.overall === 'incomplete'
+      && s.text.includes('份报告未能核对') && !s.items.some((i) => i.result === 'fail'), `${s.overall}：${s.text}`)
+    check('masked-old-doc：报告处写明证据目录里写着取自遮罩列的指标的值、未随文件附带（中性色）', s.reports[0]?.why === 'masked'
+      && s.reports[0].warn.includes(why) && s.reports[0].warn.includes('未随文件附带'), s.reports[0]?.warn)
+    check('masked-old-doc：③ 报告文档无法核对、④ 无法确认它记下的运行和节点，原因写明', hasItem(s, 'artifacts', 'na', why)
+      && hasItem(s, 'chain', 'na', why))
+    check('masked-old-doc：报告文档不随文件附带，它引用的口径卡、快照也不附带', dataOf(samples['masked-old-doc']).artifacts
+      .every((a) => a.kind === 'report_doc' && a.masked === true && !('b64' in a)))
+    const html = await page.content()
+    check('masked-old-doc：页面里找不到号码', !html.includes('000-0001') && !html.includes('000-0002'))
   })
   // 会员库设了号码遮罩（查询当时记下了，数据源现在也设着）：按地区汇总的查询没碰号码列，快照随文件附带、数字核对得过；
   // 选出了号码的那份只给哈希，原因写明这条查询用到或可能用到设了遮罩的列
@@ -836,13 +862,38 @@ await section('样本页：篡改', async () => {
     data.artifacts = data.artifacts.filter((a) => a.kind !== 'metric_set')
     return '删掉口径卡条目'
   }, (s) => [...turnsRed('numbers')(s), ['原因写明', hasItem(s, 'numbers', 'fail', '引用的工件不在文件的工件清单里')]])
-  // 口径卡有输入取自遮罩列时服务端照样只给 id（见样本页 masked-card），报告文档从来不会：把它标成遮罩只能是改过
+  // 证据目录里写着取自遮罩列的指标的值的老文档，服务端只给哈希、不附带它引用的工件（见样本页 masked-old-doc）：伪造者把
+  // 一份好好的文档也标成遮罩，页面照服务端的说法写原因、正文不显示，可它引用的那几份工件还列着，已核对的事件和文档里却
+  // 没人引用它们，判不通过——藏不起一份报告还显示通过
   await tamper(base, '报告文档标成遮罩', (data) => {
     const doc = byKind(data, 'report_doc')
     delete doc.b64
     doc.masked = true
     return '报告文档去掉内容、标遮罩'
-  }, (s) => [...turnsRed('artifacts')(s), ['原因写明', hasItem(s, 'artifacts', 'fail', '只有查询快照和口径卡会因遮罩不随文件附带')]])
+  }, (s) => [
+    ['总览不通过', s.overall === 'fail', `${s.overall}：${s.text}`],
+    ['④ 它引用的工件没人引用，判不通过', hasItem(s, 'chain', 'fail', '已核对的事件和报告文档里都没有引用这份工件')],
+    ['报告处写明未随文件附带，正文不显示', s.reports[0]?.why === 'masked' && s.numbers === 0, JSON.stringify(s.reports[0])],
+  ])
+  // 只留报告文档、拿掉它引用的工件（和服务端只给哈希时一模一样）：没有正文可核，这份报告算未能核对，总览不是绿的
+  await tamper(base, '报告文档标成遮罩并拿掉它引用的工件', (data) => {
+    const doc = byKind(data, 'report_doc')
+    delete doc.b64
+    doc.masked = true
+    data.artifacts = [doc]
+    return '报告文档去掉内容、标遮罩，只留它一份'
+  }, (s) => [
+    ['总览不是绿色的通过，写明有报告未能核对', s.overall === 'incomplete' && s.text.includes('份报告未能核对'),
+      `${s.overall}：${s.text}`],
+    ['报告处写明未随文件附带，正文不显示', s.reports[0]?.why === 'masked' && s.numbers === 0, JSON.stringify(s.reports[0])],
+  ])
+  // 检索快照这类别的工件服务端从来不会因遮罩不随文件附带：标成遮罩只能是改过
+  await tamper(base, '查询快照以外的工件标成遮罩', (data) => {
+    const card = byKind(data, 'metric_set')
+    data.artifacts.push({ id: card.id.replace(/^./, (c) => (c === '0' ? '1' : '0')), kind: 'retrieval', masked: true })
+    return '多一份标着遮罩的检索快照'
+  }, (s) => [...turnsRed('artifacts')(s),
+    ['原因写明', hasItem(s, 'artifacts', 'fail', '只有查询快照、口径卡和报告文档会因遮罩不随文件附带')]])
   // 遮罩卡在服务端被改过时，服务端照样只给 id、另标 mismatch（tests/test_bundle_masked_cards.py 守着服务端这一边）：
   // 不能因为不嵌内容就和正常的遮罩卡一样「可核对的项全部通过」
   await tamper(samples['masked-card'], '遮罩卡标成服务端的文件与 id 不一致', (data) => {
@@ -986,19 +1037,33 @@ await section('样本页：篡改', async () => {
       ['这一句按原文显示，伪造的链接写法露在外面', sentence.includes('[84,613.65元](x 74,613.65元)'), sentence.slice(0, 80)],
     ]
   }, { seal: true })
-  // 前面补一位数：读起来是 174,613.65元，绿色下划线只在 74,613.65元 下面
-  await tamper(samples.formats, '核对通过的数字前面补一位数', (data) => rewriteDoc(data, (doc) => {
-    segById(doc, 's3').text += '1'
-    return { what: '本月销售额 174,613.65元', seg: segById(doc, 's4') }
-  }), (s, forged) => {
+  // 核对过的那段字不动，只改紧挨着它的普通正文，重算全部哈希（验收第二轮的绕过）：前面补一位数读作 174,613.65元，前面加
+  // 负号读作 -2.35%，后面接「0 万」读作 45,678.50 万。读者看到的是另一个数：那个数变红、点名原因，总览不通过。以前只判
+  // 无法核对，总览照样是绿的「可核对的项全部通过」
+  const GLUED = '正文里紧挨着这个数的字改变了读者看到的数'
+  const failsBecause = (why) => (s, forged) => {
     const btn = buttonOf(s, forged)
-    const item = s.items.find((i) => i.check === 'numbers' && i.result === 'na' && i.text.includes('紧挨着的正文里还有数字或负号'))
+    const item = s.items.find((i) => i.check === 'numbers' && i.result === 'fail' && !i.folded && i.text.includes(why))
     return [
-      ['销售额判无法核对，不再标通过', btn?.result === 'na', JSON.stringify(btn)],
-      ['⑤ 写明紧挨着的正文里还有数字或负号', !!item, item?.text ?? '没有这一项'],
-      ['总览不再是「全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过', `${s.overall}：${s.text}`],
+      ['那个数字变红，不再标通过', btn?.result === 'fail', JSON.stringify(btn)],
+      [`⑤ 点名「${why}」`, !!item, item?.text ?? '没有这一项'],
+      ['⑤ 里只有这一项不通过', s.items.filter((i) => i.check === 'numbers' && i.result === 'fail' && !i.folded).length === 1],
+      ['总览不通过', s.overall === 'fail' && s.checks.numbers === 'fail', `${s.overall}：${s.text}`],
+      ['①–④ 照样通过（伪造重算了全部哈希）', ['events', 'manifest', 'artifacts', 'chain'].every((k) => noFail(s.checks[k])),
+        describe(s)],
     ]
-  }, { seal: true })
+  }
+  const glued = [
+    ['核对通过的数字前面补一位数', 's3', (t) => `${t}1`, 's4', '本月销售额 174,613.65元'],
+    ['核对通过的数字前面加负号', 's12', (t) => `${t}-`, 's13', '转化率 -2.35%'],
+    ['核对通过的数字后面接「0 万」', 's34', (t) => `0 万${t}`, 's33', '流水 45,678.50 万'],
+  ]
+  for (const [label, at, change, target, what] of glued) {
+    await tamper(samples.formats, label, (data) => rewriteDoc(data, (doc) => {
+      segById(doc, at).text = change(segById(doc, at).text)
+      return { what, seg: segById(doc, target) }
+    }), failsBecause(GLUED), { seal: true })
+  }
   // 一段改成分隔线：分隔线不显示句子，这一段里核对通过的数字读的人看不到，导出时不会出现
   await tamper(samples.formats, '把一段改成分隔线', (data) => rewriteDoc(data, (doc) => {
     doc.blocks[2].type = 'hr'
@@ -1019,9 +1084,9 @@ await section('样本页：篡改', async () => {
         && !s.buttons.some((b) => b.text.includes('84,613.65')), JSON.stringify(same)],
     ]
   }, { seal: true })
-  // 紧挨着的字（经营月报，重算全部哈希）：隔着显示时不占位置的控制字符补一位数、长得像负号的连字符、叠在空格上的横线、
-  // 从右往左书写的字母把一位数挪到数字前面——读起来都不是核对过的那个数，判无法核对并写明原因。字一律按码点写，脚本
-  // 里不出现看不见、改变方向的字
+  // 紧挨着的字（经营月报，重算全部哈希）：隔着显示时不占位置的控制字符补一位数、长得像负号的连字符，读者看到的是另一个
+  // 数，判不通过；叠在空格上的横线、从右往左书写的字母把一位数挪到数字前面，读起来可能不是核对过的那个数，判无法核对。
+  // 原因各自写明。字一律按码点写，脚本里不出现看不见、改变方向的字
   const cp = (...points) => String.fromCodePoint(...points)
   const naBecause = (why) => (s, forged) => {
     const btn = buttonOf(s, forged)
@@ -1032,15 +1097,14 @@ await section('样本页：篡改', async () => {
       ['总览不再是「全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过', `${s.overall}：${s.text}`],
     ]
   }
-  const GLUED = '紧挨着的正文里还有数字或负号'
   await tamper(samples.formats, '隔着显示时不占位置的控制字符补一位数', (data) => rewriteDoc(data, (doc) => {
     segById(doc, 's3').text += `1${cp(0x7f)}`
     return { what: '销售额前面补「1」和一个 DEL', seg: segById(doc, 's4') }
-  }), naBecause(GLUED), { seal: true })
+  }), failsBecause(GLUED), { seal: true })
   await tamper(samples.formats, '前面加一个长得像负号的连字符', (data) => rewriteDoc(data, (doc) => {
     segById(doc, 's12').text += cp(0x2010)
     return { what: '转化率前面加 U+2010', seg: segById(doc, 's13') }
-  }), naBecause(GLUED), { seal: true })
+  }), failsBecause(GLUED), { seal: true })
   await tamper(samples.formats, '叠在空格上的横线', (data) => rewriteDoc(data, (doc) => {
     segById(doc, 's3').text += cp(0x336)
     return { what: '销售额前面的空格上叠一道长横线（U+0336）', seg: segById(doc, 's4') }

@@ -8,7 +8,8 @@
   （api/evidence.py 的 _counted），证据面板、推演照可验证报告的认法多遮（展示上多遮无妨）
 - 第 2 轮另按值认过正文里写着的遮罩值（照抄的号码、姓名，经指标带出来的值），第 3 轮去掉了：两个字的姓名会撞上「销售
   高峰」这类常用词，同名列的值会撞上门店名，正式运行因此判失败，代价远大于收益；照抄的号码本来就会被「数字没有出处」
-  拦下（test_report_masked_owners）。自查只查 [[v:]] 引用，这里留着不按值认的回归
+  拦下（test_report_masked_owners）。自查查 [[v:]] 引用，和值取自遮罩格的指标的 [[m:]] 引用（按出处认，和证据面板指标
+  步骤的值同一个判断），这里留着不按值认的回归
 
 真跑的部分用虚构的 SQLite 商城库（号码、姓名是编的），写作者是 MockChatModel 照剧本写。
 """
@@ -240,6 +241,8 @@ async def test_no_snapshot_is_read_without_a_cited_cell(engine_up, mall, monkeyp
 METRICS = [
     {"id": "phone_raw", "name": "首位客户手机号", "format": "plain", "expression": "cell(nodes.top, 0, 'tel')"},
     {"id": "id3", "name": "第三位客户编号", "format": "plain", "expression": "cell(nodes.top, 2, 'id')"},
+    # 写死在口径卡上的热线号码，碰巧和第三位客户的号码一样：不取自查询结果
+    {"id": "hotline", "name": "服务热线", "format": "plain", "expression": f"'{PHONES[2]}'"},
 ]
 
 
@@ -252,10 +255,13 @@ def card_graph(**report) -> dict:
                  node("out", "output", fields=[{"name": "报告", "value": "{{ nodes.write.text }}"}]))
 
 
-async def test_a_metric_reference_is_not_checked_by_value(monkeypatch, mall):
-    """自查只查 [[v:]] 引用：[[m:phone_raw]] 的值就是号码，自查不按值认（指标的值在证据面板、推演里另有判断，写「已遮罩」，
-    见 test_masked_metric_values）。违规即失败的运行照常成功，时间线上没有「引用了遮罩列」那一行。"""
+async def test_a_metric_reference_is_judged_by_where_its_value_comes_from(monkeypatch, mall):
+    """[[m:phone_raw]] 的值取自改了名字的遮罩列（phone AS tel）：和证据面板指标步骤的值同一个判断，写作目录、证据目录里写
+    「已遮罩」，引用了记 masked_cell，违规即失败的运行判失败（tests/test_report_masked_metrics.py）。这是按出处认，不是按值：
+    写死在卡上的热线号码碰巧和客户的号码一样，不取自查询结果，照常引用，运行照常成功、时间线上没有「引用了遮罩列」那一行。"""
     row = await finish(monkeypatch, card_graph(on_violation="fail"), "第三位客户编号 [[m:id3]]，首位客户电话 [[m:phone_raw]]。")
+    assert row.status == "failed" and "m:phone_raw" in (row.error or ""), row.error
+    row = await finish(monkeypatch, card_graph(on_violation="fail"), "第三位客户编号 [[m:id3]]，服务热线 [[m:hotline]]。")
     assert row.status == "succeeded", row.error
     rows = await events(row.id)
     checked = next(e.data for e in rows if e.type == "report.checked")

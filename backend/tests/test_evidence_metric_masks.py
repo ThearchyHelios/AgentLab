@@ -121,11 +121,13 @@ async def run_graph(monkeypatch) -> Run:
     raise AssertionError(f"运行 {run_id} 没跑完：{row.status}")
 
 
-async def segment(client, run_id: str, text: str) -> dict:
+async def segment(client, run_id: str, text: str | None = None, *, ref: str | None = None) -> dict:
+    """点开报告里的一处：按正文的字找，或者按引用找（ref）。运行之前就设了遮罩的，用到遮罩列的指标在报告里写「已遮罩」
+    （报告撰写节点按指标步骤同一个判断换掉，见 tests/test_report_masked_metrics.py），只能按引用找。"""
     graph_body = (await client.get(f"/api/runs/{run_id}/evidence")).json()
     [report] = graph_body["reports"]
     doc = artifact_store.load(report["doc_artifact"])
-    seg = next(s for s in iter_segments(doc) if s["text"] == text)
+    seg = next(s for s in iter_segments(doc) if (s.get("ref") == ref if ref else s["text"] == text))
     res = await client.get(f"/api/runs/{run_id}/evidence/segments/{seg['id']}")
     assert res.status_code == 200, res.text
     return res.json()
@@ -146,7 +148,7 @@ def leaks(body: dict) -> list[str]:
 async def test_a_masked_cell_is_hidden_from_the_input_label_and_the_substituted_expression(client, monkeypatch, shop):
     await set_source(shop, {"mask_columns": ["phone"]})
     row = await run_graph(monkeypatch)
-    body = await segment(client, row.id, "13位")
+    body = await segment(client, row.id, ref="m:plen")
     metric = body["chain"][0]
     assert metric["step"] == "metric" and metric["expression"] == f"len({PHONE_CELL})"
     assert metric["substituted"] == "len(已遮罩)"
@@ -163,7 +165,7 @@ async def test_a_scalar_taken_by_position_from_a_masked_column_is_hidden(client,
     """vars.res.rows[0][2]：没有 cell() 的定位，顺着取值链认出取自查询结果的 phone 列。"""
     await set_source(shop, {"mask_columns": ["phone"]})
     row = await run_graph(monkeypatch)
-    body = await segment(client, row.id, "26位")
+    body = await segment(client, row.id, ref="m:plen2")
     metric = body["chain"][0]
     assert metric["substituted"] == "len(已遮罩) * 2"
     [phone] = inputs_of(body).values()
@@ -175,7 +177,7 @@ async def test_a_scalar_taken_by_position_from_a_masked_column_is_hidden(client,
 async def test_only_the_masked_input_is_hidden_when_inputs_are_mixed(client, monkeypatch, shop):
     await set_source(shop, {"mask_columns": ["phone"]})
     row = await run_graph(monkeypatch)
-    body = await segment(client, row.id, "93.0分")
+    body = await segment(client, row.id, ref="m:mix")
     assert body["chain"][0]["substituted"] == "round(80.0 + len(已遮罩), 1)"
     inputs = inputs_of(body)
     amount = inputs["cell(nodes.fetch, 1, 'amount')"]
@@ -193,9 +195,9 @@ async def test_masks_recorded_at_query_time_stay_after_the_source_drops_them(cli
     await set_source(shop, {"mask_columns": ["phone"]})
     row = await run_graph(monkeypatch)
     await set_source(shop, {})
-    for text in ("13位", "26位", "93.0分"):
-        body = await segment(client, row.id, text)
-        assert "已遮罩" in body["chain"][0]["substituted"] and leaks(body) == [], text
+    for ref in ("m:plen", "m:plen2", "m:mix"):
+        body = await segment(client, row.id, ref=ref)
+        assert "已遮罩" in body["chain"][0]["substituted"] and leaks(body) == [], ref
 
 
 async def test_masks_added_after_the_run_apply_too(client, monkeypatch, shop):

@@ -13,12 +13,14 @@
  *      render_number / render_cell：千分位、小数位、单位、万 / 亿换算、百分数，文字压成一行）把那个值渲染出来的字，
  *      两边都只去掉首尾空白。本页渲染不出来的写法判无法核对，不判通过。运行输入不随文件附带，照旧无法核对，但显示的字
  *      照样拿引用的值核对，对不上判不通过。核对通过的字要原样显示在正文里（checkLayout）：正文里根本不显示的判不通过，
- *      紧挨着还有数字、负号或显示成什么说不准的字，或者同一句里有改变文字方向的字，读起来可能不是这个值的判无法核对；
- *      列表缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数；
+ *      紧挨着写着数字、负号、小数点（读者看到的是另一个数）的判不通过，紧挨着显示成什么说不准的字，或者同一句里有改变
+ *      文字方向的字，读起来可能不是这个值的判无法核对；列表缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数；
  *   ⑥ 运行信息：运行结果、运行类别、出具档位拿封存范围内已核对的事件对照。工作流名、版本、起止时间、节点名称
  *      绑不进封存，页面上写明它们取自运行记录。
- * 每项给出通过 / 不通过 / 无法核对和原因。服务端导出时不会出现的状态（被引用的工件不在清单里、报告文档标着遮罩）
- * 一律算不通过：只可能是文件被改过。这些只证明内部一致，真伪要拿封存哈希去系统里对照，页面上写明。
+ * 每项给出通过 / 不通过 / 无法核对和原因。服务端导出时不会出现的状态（被引用的工件不在清单里、检索快照这类工件标着
+ * 遮罩）一律算不通过：只可能是文件被改过。报告文档的证据目录里写着取自遮罩列的指标的值时，服务端只给它的哈希
+ * （升级前生成的文档，或者生成之后数据源才设的遮罩），页面照实说明，这份报告算未能核对。这些只证明内部一致，真伪要拿
+ * 封存哈希去系统里对照，页面上写明。
  *
  * SHA-256 优先用浏览器的 crypto.subtle；拿不到（非安全上下文、某些浏览器打开本地文件时）用下面的纯 JS 实现，
  * 两者结果一致。纯 JS 实现启动时先拿标准测试向量自检，自检不过就不下任何结论。
@@ -83,6 +85,8 @@
     docUntrusted: '这份报告文档没有通过核对（见核对明细 ③ ④），正文仅供参考，其中的数字不予核对。',
     docUnreadable: '这份报告文档的哈希一致，但内容无法解析，无法显示正文。',
     docMissing: '导出时服务端已没有这份报告文档，无法显示正文，其中的数字也无法核对。',
+    docMasked: '这份报告文档的证据目录里写着取自遮罩列的指标的值（生成时没有按遮罩换掉），未随文件附带，无法显示正文，'
+      + '其中的数字也无法核对。',
     docAbsent: '文件里没有附带这份报告文档。',
     checkEvents: '① 事件内容与哈希',
     checkManifest: '② 封存清单',
@@ -116,7 +120,9 @@
     masked: '含遮罩列，未随文件附带，只能核对到哈希',
     maskedMismatch: '导出时服务端的这份文件与工件 id（哈希）不一致，可能被改过；按含遮罩列处理，未随文件附带',
     maskedUnparsable: '导出时服务端的这份文件无法解析，认不出是否含遮罩列，按含遮罩列处理，未随文件附带',
-    maskedOdd: '只有查询快照和口径卡会因遮罩不随文件附带，这份工件却标着遮罩：导出时不会出现这种情况，文件可能被改过',
+    /** 报告文档只给哈希：证据目录里写着值取自遮罩列的指标的原值（升级前的报告撰写节点生成的，或者生成之后数据源才设的遮罩） */
+    maskedDoc: '证据目录里写着取自遮罩列的指标的值（生成时没有按遮罩换掉），未随文件附带，只能核对到哈希',
+    maskedOdd: '只有查询快照、口径卡和报告文档会因遮罩不随文件附带，这份工件却标着遮罩：导出时不会出现这种情况，文件可能被改过',
     artifactMissing: '导出时服务端已没有这份工件的文件',
     artifactAbsent: '内容未随文件附带：导出时不会出现这种情况，文件可能被改过',
     chainDoc: (label) => `报告「${label}」的文档`,
@@ -129,6 +135,7 @@
     chainDocNotListed: '文件的工件清单里没有这份报告文档：导出时不会出现这种情况，文件可能被改过',
     chainDocUnverified: '文档内容没有通过核对，无法确认它记下的运行和节点',
     chainDocMissing: '导出时服务端已没有这份报告文档，无法确认它记下的运行和节点',
+    chainDocMasked: '文档的证据目录里写着取自遮罩列的指标的值，未随文件附带，无法确认它记下的运行和节点',
     chainDocUnparsable: '文档的哈希一致，但内容无法解析，无法确认它记下的运行和节点',
     chainDocElsewhere: '文档记下的运行或节点与这次不符',
     chainDocLeftOut: '运行记录里有这个报告节点的自查事件，文件里却没有附带它的文档',
@@ -174,7 +181,7 @@
     shownOld: '这个浏览器版本较旧，请用新版浏览器打开本文件',
     shownBroken: '本页按系统的显示规则处理这个值时出错',
     /** 正文的排法（checkLayout）：显示文字核对过了，读起来却不是这个值 */
-    shownGlued: '紧挨着的正文里还有数字或负号，读起来和核对过的不是同一个值',
+    numGlued: '正文里紧挨着这个数的字改变了读者看到的数：前后紧挨着的数字、负号或小数点会和它连成另一个数',
     shownBlurred: '紧挨着的正文里有看不见或在不同设备上显示不同的字，读起来可能和核对过的不是同一个值',
     shownTurned: '这一句里有从右往左书写的文字或改变文字方向的控制字符，显示出来的顺序可能和核对过的不一样',
     numNotShown: '正文里没有显示这一处：导出时不会出现这种情况，文件可能被改过',
@@ -208,7 +215,7 @@
     shaJs: 'SHA-256 由本页内置的实现计算（浏览器未提供 crypto.subtle），结果与浏览器内置实现一致',
     renderNote: '正文里带出处的数字和取值，本页按系统的显示规则（千分位、小数位、单位、万 / 亿换算、百分数，文字压成一行）'
       + '把口径卡或快照里的值（运行输入按引用的值）重新渲染一遍，与显示的文字逐字比对；核对通过的字在正文里原样显示，'
-      + '紧挨着它还有数字、负号或看不见的字，或者同一句里有改变文字方向的字，判无法核对。',
+      + '紧挨着它写着数字、负号或小数点的判不通过，紧挨着看不见的字或者同一句里有改变文字方向的字的判无法核对。',
     schema: (s) => `文件格式 ${s}`,
   }
 
@@ -876,10 +883,12 @@
    * 每一项记下正文里显示出来的字（onPage）。
    * - 正文里根本不显示它（分隔线里、表格里不在各行各列上的格）：伪造的字可以写在别处，读的人看不到核对过的那个数。
    *   服务端导出时不会出现（分隔线不带句子，表格的格都在行列上），判不通过；
-   * - 紧挨着的字里还有数字或负号（前面补一位、后面接一位或一段小数、前面加负号；隔着不占位置的字、显示时藏起来的排版
-   *   标记也算紧挨着），紧挨着的是显示成什么说不准的字，或者同一句里有改变文字方向的字：读起来的数可能不止核对过的
-   *   这几位，判无法核对——真报告里也可能有（放行的数字、日期紧贴着引用），不能说成被改过。两个数之间的连字符是区间，
-   *   不算负号。
+   * - 紧挨着的字里写着数字、负号或小数点（前面补一位、后面接一位或一段小数、前面加负号；隔着不占位置、显示成什么说不准
+   *   的字，显示时藏起来的排版标记也算紧挨着）：读者看到的是另一个数，判不通过。伪造者不动核对过的那段字、只改旁边的
+   *   正文，重算全部哈希就做得到；以前判无法核对，总览照样写「可核对的项全部通过」。服务端组装的文档不这样排：两个数
+   *   之间补空格（evidence._glue），原样导出照样通过。两个数之间的连字符是区间，不算负号；
+   * - 紧挨着的是显示成什么说不准的字，或者同一句里有改变文字方向的字：读起来的数可能不止核对过的这几位，判无法核对——
+   *   真报告里也可能有，不能说成被改过。这两样不会把上一条的不通过降成无法核对。
    * 代码块按原文显示、不标数字，照旧
    */
   function checkLayout(doc, items) {
@@ -959,9 +968,13 @@
           // 数字头尾紧挨着（或隔着一个逗号、句点）的是说不准的字：它本身就可能显示成数字、负号
           const near = (a, b) => a.blurred || (a.kind === 'sep' && b.blurred)
           const blurred = (lead && near(l1, l2)) || (tail && near(r1, r2))
-          if (turned || before || sign || after || blurred) {
-            const why = turned ? T.shownTurned : before || sign || after ? T.shownGlued : T.shownBlurred
-            Object.assign(item, { result: NA, reason: T.numShownUnknown(why) })
+          if (before || sign || after) {
+            // 紧挨着写着数字、负号、小数点：读者看到的是另一个数（伪造者不动核对过的字、只改旁边的正文，重算全部哈希就
+            // 做得到），判不通过。服务端组装的文档不这样排：两个数之间补了空格（evidence._glue）。排在说不准的字、改变
+            // 方向的字前面判：伪造者在同一句里再放一个这种字，不能把不通过降成无法核对
+            Object.assign(item, { result: FAIL, reason: T.numGlued })
+          } else if (turned || blurred) {
+            Object.assign(item, { result: NA, reason: T.numShownUnknown(turned ? T.shownTurned : T.shownBlurred) })
           }
         }
       }
@@ -1095,18 +1108,22 @@
           }
         }
       } else if (a.masked) {
-        // 查询快照：这条查询用到或可能用到设了遮罩的列；口径卡：卡上有输入取自遮罩列（卡上记着输入的值和代入式）。
-        // 两种都只给 id，报告文档不会。
+        // 查询快照：这条查询用到或可能用到设了遮罩的列；口径卡：卡上有输入取自遮罩列（卡上记着输入的值和代入式）；
+        // 报告文档：证据目录里写着值取自遮罩列的指标的原值（升级前的报告撰写节点生成的，或者生成之后数据源才设的遮罩；
+        // 现在的报告撰写节点写成「已遮罩」）。
+        // 三种都只给 id，检索快照这类别的工件不会。
         // 内容不随文件附带，浏览器算不出它对不对得上：导出时服务端看到自己的文件和 id 对不上（mismatch）、解析不出来
-        // （unparsable）的照实说，对不上的判不通过——不然被改过的文件看起来和正常的遮罩一样，篡改的证据就丢了
-        if (a.kind !== 'query' && a.kind !== 'metric_set') {
+        // （unparsable）的照实说，对不上的判不通过——不然被改过的文件看起来和正常的遮罩一样，篡改的证据就丢了。报告文档
+        // 只给哈希时页面上没有正文可核，总览不是绿色的通过（renderOverall 按报告文档没核对上算）
+        if (a.kind !== 'query' && a.kind !== 'metric_set' && a.kind !== 'report_doc') {
           item.result = FAIL
           item.reason = T.maskedOdd
         } else if (a.mismatch) {
           item.result = FAIL
           item.reason = T.maskedMismatch
         } else {
-          item.reason = a.unparsable ? T.maskedUnparsable : a.kind === 'query' ? T.maskedQuery : T.masked
+          item.reason = a.unparsable ? T.maskedUnparsable : a.kind === 'query' ? T.maskedQuery
+            : a.kind === 'report_doc' ? T.maskedDoc : T.masked
         }
       } else if (a.missing) {
         item.reason = T.artifactMissing
@@ -1143,7 +1160,8 @@
       else if (!art) link.reason = T.chainDocNotListed
       else if (art.result === FAIL) Object.assign(link, { result: NA, reason: T.chainDocUnverified })
       else if (art.result !== PASS) {
-        Object.assign(link, { result: NA, reason: art.a.missing ? T.chainDocMissing : T.chainDocUnparsable })
+        Object.assign(link, { result: NA,
+          reason: art.a.masked ? T.chainDocMasked : art.a.missing ? T.chainDocMissing : T.chainDocUnparsable })
       } else if (own(art.json, 'run_id') !== meta.run_id || own(art.json, 'node_id') !== report.node_id) {
         link.reason = T.chainDocElsewhere
       } else link.result = PASS
@@ -1695,10 +1713,12 @@
     ]))
   }
 
-  /** 报告文档没核对上的原因：{ key, text }。key 进 data-why，服务端已没有文件、读不懂的用中性色，不是红的 */
+  /** 报告文档没核对上的原因：{ key, text }。key 进 data-why，服务端已没有文件、读不懂、因遮罩不随文件附带的用中性色，
+   *  不是红的 */
   function docWhy(item) {
     if (!item.art) return { key: 'absent', text: T.docAbsent }
     if (item.art.result === FAIL || (item.link && item.link.result === FAIL)) return { key: 'untrusted', text: T.docUntrusted }
+    if (item.art.a.masked) return { key: 'masked', text: T.docMasked }
     if (item.art.a.missing) return { key: 'missing', text: T.docMissing }
     return { key: 'unreadable', text: T.docUnreadable }
   }

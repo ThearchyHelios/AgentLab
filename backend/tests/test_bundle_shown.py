@@ -13,9 +13,10 @@
 - 口径卡单位前后带空白（「元 」，服务端照原样接）：两边都只去首尾空白，原样导出照样通过；运行输入照旧无法核对，显示
   文字拿引用的值核对，只改显示文字的不通过；出处面板里数字文本照原文写；
 - 正文的排法：核对通过的字要原样显示——伪造的链接藏不起它（整句按原文显示），正文里不显示的判不通过；紧挨着补数字、
-  负号（长得像负号的横线也算，隔着不占位置的字也算），紧挨着显示成什么说不准的字（控制字符、组合符号这类），同一句里
-  有改变文字方向的字（方向控制字符、希伯来文和阿拉伯文这类从右往左书写的文字），判无法核对；区间、日期这类真报告里的
-  写法照常通过；列表缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数。
+  负号、小数点（长得像负号的横线也算，隔着不占位置的字也算）判不通过：读者看到的是另一个数，以前只判无法核对，总览
+  照样是绿的；紧挨着显示成什么说不准的字（控制字符、组合符号这类），同一句里有改变文字方向的字（方向控制字符、希伯来文
+  和阿拉伯文这类从右往左书写的文字），判无法核对；区间、日期这类真报告里的写法照常通过；列表缩进有上限、表格只排有格
+  的列，伪造的缩进、列号挤不走核对过的数。
 
 数据全是虚构的。
 """
@@ -78,6 +79,10 @@ async function main() {
   return {
     events: results(out.events), manifest: results(out.manifest), artifacts: results(out.artifacts),
     chain: results(out.chain), meta: results(out.meta),
+    // 工件、引用链每一项的种类、结果和原因；每份报告的文档核对上了没有
+    why: { artifacts: out.artifacts.map((i) => ({ kind: i.a.kind, result: i.result, reason: i.reason || '' })),
+      chain: out.chain.map((c) => ({ kind: c.kind, result: c.result, reason: c.reason || '' })) },
+    docs: out.docs.map((d) => ({ node: d.report.node_id, trusted: d.trusted })),
     // shownOk：显示文字核对过、对上了；truthText：出处面板「快照里的值」写的字（数字文本照原文）；onPage：正文里这处
     // 可点的数字上读的人看到的字（没有显示成可点的数字是 null）
     numbers: out.numbers.map((n) => ({ key: n.key, ref: n.seg.ref ?? null, text: String(n.seg.text ?? ''),
@@ -546,7 +551,7 @@ def test_inline_markup_cannot_hide_a_checked_value():
         assert hit["result"] == "pass" and hit["onPage"] == text, hit
 
 
-GLUED = "无法核对显示文字：紧挨着的正文里还有数字或负号，读起来和核对过的不是同一个值"
+GLUED = "正文里紧挨着这个数的字改变了读者看到的数：前后紧挨着的数字、负号或小数点会和它连成另一个数"
 BLURRED = "无法核对显示文字：紧挨着的正文里有看不见或在不同设备上显示不同的字，读起来可能和核对过的不是同一个值"
 TURNED = "无法核对显示文字：这一句里有从右往左书写的文字或改变文字方向的控制字符，显示出来的顺序可能和核对过的不一样"
 #: 经营月报第一段里的数字（第二段是 Q1 的取值）
@@ -611,15 +616,32 @@ def _split_pair(high: str, low: str):
     ("m:refund", _glue_before("s9", "-")),                   # 负数前面再加负号：--3,120.50元
     ("v:Q1.r0.paid_at", _glue_after("s45", "5")),            # 取值以数字结尾：2026-09-07 08:21:395
 ])
-def test_digits_glued_to_a_checked_value_cannot_pass(ref, change):
-    """伪造者在相邻的文字片段里补一位数、一个负号（隔着不占位置、显示成什么说不准的字，藏起来的粗体标记也算紧挨着；
-    长得像负号的横线也算负号）：显示出来的数不止核对过的这几位，这一项判无法核对、写明原因；别的照常通过。"""
+def test_digits_glued_to_a_checked_value_fail(ref, change):
+    """伪造者不动核对过的那段字，只在相邻的文字片段里补一位数、一个负号、一段小数（隔着不占位置、显示成什么说不准的字，
+    藏起来的粗体标记也算紧挨着；长得像负号的横线也算负号），重算全部哈希：读者看到的是另一个数。这一项判不通过、点名
+    正文里紧挨着的字改变了读者看到的数——以前只判无法核对，总览照样写「可核对的项全部通过」。显示文字本身照旧核对过
+    （shownOk），别的照常通过。服务端组装的文档不会这样排（两个数之间补空格），原样导出照样通过（见下面几条）。"""
     from tests.bundle_samples import formats_bundle
 
     got = verdicts(rewritten(formats_bundle(), change))
     hit = item(got, ref)
-    assert hit["result"] == "na" and hit["reason"] == GLUED and hit["shownOk"], hit
+    assert hit["result"] == "fail" and hit["reason"] == GLUED and hit["shownOk"], hit
     assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"] != ref)
+
+
+@pytest.mark.parametrize("ref, change", [
+    # 改变文字方向的字不能把不通过降成无法核对：伪造者紧挨着补一位数，再在同一句里放一个方向控制字符、一个希伯来字母
+    ("m:gmv", lambda doc: (by_id(doc, "s3").update(text=by_id(doc, "s3")["text"] + "1"),
+                           by_id(doc, "s5").update(text=chr(0x202E) + by_id(doc, "s5")["text"]))),
+    ("m:gmv", lambda doc: (by_id(doc, "s3").update(text=chr(0x05D0) + by_id(doc, "s3")["text"] + "1"))),
+    # 说不准的字同理：紧挨着的是一位数，中间隔着叠在上面的组合符号
+    ("m:gmv", _glue_before("s3", "1" + chr(0x0336))),
+])
+def test_other_doubts_do_not_soften_a_glued_digit(ref, change):
+    from tests.bundle_samples import formats_bundle
+
+    hit = item(verdicts(rewritten(formats_bundle(), change)), ref)
+    assert hit["result"] == "fail" and hit["reason"] == GLUED, hit
 
 
 @pytest.mark.parametrize("ref, change", [

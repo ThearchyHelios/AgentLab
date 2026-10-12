@@ -20,7 +20,8 @@ artifacts 表可以事后插行，run.output 是可以改写的一列，封存�
 查询步骤只给被引用的行和前后各 2 行，完整快照仍走 /api/artifacts/{id}。数据源
 options.mask_columns 里的列换成「已遮罩」，SQL 里给它们起了别名、套了函数得来的结果列也换
 （_mask_sets，和可验证报告同一个函数，合并查询另按合并 SQL 认）；用到这些列的指标，指标步骤的值、
-证据图的标签也不给（_metric_masks，和推演同一个判断）；SQL、合并警告里写着的遮罩值（这次运行里确定取自遮罩列的值）
+证据图的标签也不给（_metric_masks，和推演同一个判断；报告撰写节点写作之前按同一个判断把这类指标在目录里写成「已遮罩」，
+withheld_metrics）；SQL、合并警告里写着的遮罩值（这次运行里确定取自遮罩列的值）
 展示时换掉。一份快照的遮罩分析、收到的值按快照工件记在进程里（_MEMO），之后的请求不再读盘、不再分析
 ——在有身份体系之前，这只减少暴露，不是安全边界：知道工件 id 的人照样能取到整份快照。
 
@@ -46,7 +47,7 @@ import re
 import sqlite3
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, get_args
@@ -877,8 +878,12 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     metric_id = (cite.get("locator") or {}).get("metric")
     card, hash_ok = _load_card(artifact) if artifact else (None, False)
     metric = _metric_in(card, metric_id)
+    # 报告撰写节点把这个指标的值换成了「已遮罩」（文档的证据目录里记着 masked）：正文写的就是目录里那个字，按它比渲染，
+    # 不拿卡上的原值去比（比了只会报渲染不一致）
+    written_masked = bool(entry.get("masked"))
     try:
-        rendered_now = render_metric(metric, cite.get("conv")) if metric else None
+        rendered_now = str(entry.get("rendered") or "") if written_masked \
+            else render_metric(metric, cite.get("conv")) if metric else None
     except RenderError:
         rendered_now = None
     source = metric or entry
@@ -928,10 +933,11 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         # 代入式里那几处同样写「已遮罩」（遮没遮核对不了的写「无法核对」）：不然标签里遮着、代入式里亮着，同一个值换个
         # 地方照样看得到。整份结果当输入的不换：代入式里本来就只留着它的路径
         step["substituted"] = recompute.substituted_without(metric or {}, withheld)
-    if step["value"] is not None and word is not None:
+    if step["value"] is not None and (word is not None or written_masked):
         # 指标的值本身也不给，和推演的原值同一个判断（_metric_masks）：指标可能就是遮罩列的那一格（cell(nodes.q, 0,
-        # 'phone')），输入里遮着、这里亮着等于没遮。报告上的字（rendered）是读者已经看到的，照旧
-        step["value"] = word
+        # 'phone')），输入里遮着、这里亮着等于没遮。报告上的字（rendered）是读者已经看到的，照旧——写作时就认出来的，
+        # 目录、正文里本来就是「已遮罩」。文档记着不给、这里却认不出的（数据源事后撤了遮罩），照文档不给
+        step["value"] = word or MASKED
     queries = [s for a, cells in wanted.items() for s in await _query_steps(a, cells, doc, sealed, masks)]
     return [step, *inputs, *queries]
 
@@ -973,17 +979,22 @@ def _held_word(held: _Held) -> str:
 
 
 async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, sealed: _Sealed,
-                        masks: _Masks) -> tuple[dict[str, _Held], str | None]:
+                        masks: _Masks, *, output: Callable[[Any], Any] | None = None, by_value: bool = True
+                        ) -> tuple[dict[str, _Held], str | None]:
     """一个指标的输入里哪些不给值（路径 → _Held），指标本身的值给不给（None 照给，否则是写在值那里的字：「已遮罩」
-    「无法核对」）。证据面板的指标步骤、证据图的标签都按这一个函数认，和推演同一套分类、同一个判断
-    （recompute.withheld_value）：
+    「无法核对」）。证据面板的指标步骤、证据图的标签、报告撰写节点的写作目录（withheld_metrics）都按这一个函数认，和推演
+    同一套分类、同一个判断（recompute.withheld_value）：
 
     - 输入取自哪份结果的哪几列按 _InputMasks 认（recompute.input_origin 的 wide：下标不是字面量的、整行、整份结果都认）
     - 认不出出处的输入（数据整形算出来再赋给变量的一格），值就是这次运行查到过的遮罩值的，按值认（masks.run_secrets）；
       运行输入是发起运行的人自己填的，不认
     - 指标的值：取自遮罩列的一格、一行的不给；最外层的输入遮没遮核对不了的写「无法核对」；整份结果当输入、有认不出出处
-      的输入的，值里有遮罩值才不给（len(vars.res.rows) 照给）"""
-    hide = _InputMasks(sealed, masks, card_node, artifact)
+      的输入的，值里有遮罩值才不给（len(vars.res.rows) 照给）
+
+    output（节点 id → 那个节点的产出）给了的，按位置取的一格顺着它走取值链，不去封存的事件里找口径卡算这一次之前的产出：
+    报告撰写节点写作时运行还没封存，产出就在运行状态里。by_value 为假（报告撰写节点的写作目录）：认不出出处的输入不按值认，
+    也不因此按值认指标的值——只按出处认，见 withheld_metrics。"""
+    hide = _InputMasks(sealed, masks, card_node, artifact, output=output)
     held: dict[str, _Held] = {}
     uncertain = False
     for item in metric.get("inputs") or []:
@@ -991,6 +1002,8 @@ async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, s
             continue
         path = str(item.get("path"))
         found, traced = await hide.check(item)
+        if found is None and not traced and not by_value:
+            continue
         if found is None and not traced:
             uncertain = True
             value = item.get("value")
@@ -1007,6 +1020,54 @@ async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, s
         unverified=[p for p, h in held.items() if h.kind == "unverified"], uncertain=uncertain,
         secrets=lambda: secrets)
     return held, {"masked": MASKED, "unverified": UNVERIFIED_VALUE}.get(word or "")
+
+
+async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], ledger: list[Any]) -> list[str]:
+    """报告撰写节点写作之前：目录里值取自遮罩格的指标（别名，按目录的先后），交给 evidence.withhold_metrics 换成「已遮罩」。
+
+    和证据面板指标步骤的值、推演的原值同一个判断（_metric_masks 判「已遮罩」的：cell() 取的遮罩格、取自改了名字的遮罩列、
+    按位置取自遮罩列的一格、一行，整份结果里带着遮罩列、值里就有这次运行查到过的遮罩值的）。以前写作目录、文档的证据目录
+    原样写着这些值，证据面板写「已遮罩」，同一个号码从报告正文和可验证报告里出去了。
+
+    只按出处认（by_value=False）：认不出出处的输入（写死的目标、数据整形算出来的数）不因为值碰巧等于遮罩列里的某一格就
+    算取自遮罩列。证据面板为了展示按值多遮一层，这里跟着多算，「单笔目标 20,000元」这种普通指标就在报告里成了「已遮罩」，
+    引用它的正式运行判失败、写作者也改不掉（报告自查第 3 轮去掉按值认是同一个道理）。数据整形把号码取出来再赋给变量的，
+    出处认不出，这里照给（已知的缺口，同证据面板对改过形状的结果）。这时运行还没封存，不看事件：
+    - 卡上的指标取自运行状态里口径卡节点的产出（nodes，和台账里那份指标集是同一份内容），按位置取的一格顺着运行状态里的
+      产出走取值链（口径卡算的时候读到的就是它们）
+    - 查询快照的数据源按证据台账认（ledger 的 query 条目），这次运行查到过的遮罩值从台账里的查询快照收
+    遮没遮核对不了的（「无法核对」）不算：写作时快照和产出刚落下，读不出来的只能是坏了的文件，宁可照给、不让写作者因此
+    改不掉；可验证报告那边另有兜底（bundle/build.py 只给哈希）。"""
+    queries = {str(e["artifact"]): {k: e[k] for k in ("node_id", "tool", "source", "via", "call_id", "exec")
+                                    if e.get(k) is not None}
+               for e in ledger if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact")}
+    view = _Sealed(run_id="", graph={}, events=[], queries=queries,
+                   seal={"sealed": False, "ok": None, "manifest_seq": None, "legacy": False})
+    masks = _Masks(view)
+    found: list[tuple[str, str, str, dict[str, Any]]] = []
+    for alias, entry in catalog.items():
+        if not isinstance(entry, dict) or entry.get("kind") != "metric" or entry.get("value") is None:
+            continue
+        card_node = str(entry.get("node_id") or "")
+        card = nodes.get(card_node)
+        metric = _metric_in(card if isinstance(card, dict) else None, (entry.get("locator") or {}).get("metric"))
+        if isinstance(metric, dict) and metric.get("inputs"):
+            found.append((alias, card_node, str(entry.get("artifact") or ""), metric))
+    if not found:
+        return []
+    # cell()、Agent 字段落在的快照先在线程里读好（读盘、复验哈希）：在运行里认，不占着事件循环
+    await masks.prefetch(str(item["artifact"]) for *_, metric in found for item in metric.get("inputs") or []
+                         if isinstance(item, dict) and isinstance(item.get("artifact"), str) and item["artifact"])
+
+    def output(node_id: Any) -> Any:
+        return nodes.get(str(node_id or ""))
+
+    out: list[str] = []
+    for alias, card_node, artifact, metric in found:
+        _, word = await _metric_masks(metric, card_node, artifact, view, masks, output=output, by_value=False)
+        if word == MASKED:
+            out.append(alias)
+    return out
 
 
 #: tool_cell、Agent 字段落在的查询快照读不出来：只知道数据源现在设的遮罩，查询当时记下的在快照里，遮没遮核对不了
@@ -1029,10 +1090,13 @@ class _InputMasks:
     节点那几 MB 的产出重读十几遍；证据图给每个指标认一遍输入，也不必把同一份快照反复读盘。
     """
 
-    def __init__(self, sealed: _Sealed, masks: _Masks, card_node: str, artifact: str) -> None:
+    def __init__(self, sealed: _Sealed, masks: _Masks, card_node: str, artifact: str, *,
+                 output: Callable[[Any], Any] | None = None) -> None:
         self._sealed, self._masks = sealed, masks
         self._card, self._artifact = card_node, artifact
         self._outputs: dict[str, str] | None = None
+        # 报告撰写节点写作时（withheld_metrics）：节点的产出就在运行状态里，不从封存的事件里找
+        self._given = output
 
     def _fetch(self, artifact: str) -> tuple[Any, bool | None]:
         return self._masks.fetch(artifact)
@@ -1060,6 +1124,8 @@ class _InputMasks:
         return None, True
 
     def _output(self, node_id: Any) -> Any:
+        if self._given is not None:
+            return self._given(node_id)
         if self._outputs is None:
             self._outputs = _card_outputs(self._sealed, self._card, self._artifact)
         artifact = self._outputs.get(str(node_id or ""))
@@ -1390,6 +1456,13 @@ class _Masks:
         if artifact not in self._read:
             self._read[artifact] = _fetch(artifact)
         return self._read[artifact]
+
+    async def prefetch(self, artifacts: Iterable[str]) -> None:
+        """先在线程里把这几件工件取回来（_fetch：读盘、复验哈希），之后 fetch 直接用。报告撰写节点在运行里认遮罩
+        （withheld_metrics），几 MB 的快照不该占着事件循环。"""
+        todo = [a for a in dict.fromkeys(artifacts) if a and a not in self._read]
+        if todo:
+            self._read.update(await asyncio.to_thread(lambda: {a: _fetch(a) for a in todo}))
 
     async def sets(self, artifact: str | None, source: Any, snap: dict[str, Any] | None) -> _MaskSets:
         """一份查询快照的遮罩（_mask_sets），一次请求里同一份（按工件和数据源认）只认一次。snap 是这件工件读出来的内容，

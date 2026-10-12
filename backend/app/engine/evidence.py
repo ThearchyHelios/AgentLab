@@ -48,7 +48,7 @@ import math
 import re
 import unicodedata
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any, Literal, TypedDict
@@ -974,6 +974,26 @@ def build_catalog(
     return catalog
 
 
+def withhold_metrics(catalog: dict[str, Any], aliases: Iterable[str], word: str) -> dict[str, Any]:
+    """目录里值不给的指标（aliases，指标的别名）：值、渲染、标签里的值都换成 word（「已遮罩」），另记 masked。交回一份新的
+    目录，原来那份不动；没有要换的原样交回。
+
+    哪几个不给由报告撰写节点按证据面板指标步骤的那一套认（api/evidence.py 的 withheld_metrics，只按出处认：cell() 取的
+    遮罩格、取自改了名字的遮罩列、按位置取自遮罩列的一格都算，值碰巧等于遮罩值的普通指标不算）。写作目录、存进报告文档的
+    证据目录都从这份目录来：目录收着上游口径卡的全部指标，
+    没被引用的也在里面，原值写着就随文档、可验证报告出去了。引用它的照样解析、正文写 word（resolve_marker），报告自查另记
+    一条违规（masked_metrics）。出口契约复核按报告节点产出里记下的同一份别名重建（report_catalog），渲染出来对得上。"""
+    hidden = [a for a in dict.fromkeys(aliases) if (catalog.get(a) or {}).get("kind") == "metric"]
+    if not hidden:
+        return catalog
+    out = dict(catalog)
+    for alias in hidden:
+        entry = catalog[alias]
+        name = entry.get("name") or (entry.get("locator") or {}).get("metric") or alias
+        out[alias] = {**entry, "value": word, "rendered": word, "label": f"{name} = {word}", "masked": True}
+    return out
+
+
 # --------------------------------------------------------------------------
 # 实体：表和字段
 # --------------------------------------------------------------------------
@@ -1592,13 +1612,18 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
         if alias is None:
             return _unresolved(marker, f"m:{ref}", ev_kind, why)
         entry = catalog[alias]
-        if entry.get("value") is None:
+        if entry.get("masked"):
+            # 值不给的指标（withhold_metrics）：照样解析，正文写目录里的那个字（「已遮罩」），换算不再算——它不是数，
+            # 换算了只会解析不了、原因说成「不是数值」。引用它本身由报告自查另记一条违规（masked_metrics）
+            rendered = str(entry.get("rendered") or "")
+        elif entry.get("value") is None:
             return _unresolved(marker, alias, ev_kind, f"指标「{entry.get('name') or ref}」本次没有值（缺少输入），"
                                "无法写入报告", rendered=MISSING)
-        try:
-            rendered = render_metric(entry, conv)
-        except RenderError as e:
-            return _unresolved(marker, alias, ev_kind, str(e))
+        else:
+            try:
+                rendered = render_metric(entry, conv)
+            except RenderError as e:
+                return _unresolved(marker, alias, ev_kind, str(e))
     else:
         ev_kind, alias = "input", f"i:{ref}"
         entry = catalog.get(alias)
@@ -2728,7 +2753,8 @@ def compose_doc(
     [[t:]] / [[c:]] 解析不了，原因是 ENTITIES_OFF_REASON。
     absence=True（写作目录有省略）：另查缺失断言（absence_claims），和句中的 [[see:]] 一样只在组装时查。
     masked（{查询快照工件: 取自遮罩列的结果列}，报告节点按数据源的遮罩算好交进来）：另查直接引用了这些列的格子
-    （masked_cells），同样只在组装时查。没给的和以前一字不差。
+    （masked_cells），同样只在组装时查。没给的和以前一字不差。目录里值不给的指标（withhold_metrics 记了 masked 的）被引用
+    时也在这里记违规（masked_metrics），不靠这个参数：目录本身说了哪几个不给。
 
     stats / violations 由 verify_doc 算出，和出口契约复核用的是同一个函数。
     整表标记先展开成每格一个 [[v:]] 的 Markdown 表，之后和模型自己写的表格走同一条路；
@@ -2887,11 +2913,11 @@ def compose_doc(
     }
     checked = verify_doc(doc, catalog, allow_numbers=allow_numbers, cells_allowed=cells_allowed, loader=snaps)
     # 句中的 [[see:]]、目录有省略时的缺失断言只在组装时查（交回写作者重写）：出口复核看的是数字和出处，
-    # 句子通不通、结论有没有越过证据不影响出具。引用了遮罩列的格子也在这里查：遮罩设在数据源上，出口复核按目录
-    # 重建、查不了库；仍不改的由报告节点写进出具缺口
+    # 句子通不通、结论有没有越过证据不影响出具。引用了遮罩列的格子、值不给的指标也在这里查：遮罩设在数据源上，出口复核
+    # 按目录重建、查不了库；仍不改的由报告节点写进出具缺口
     doc["stats"], doc["violations"] = checked["stats"], \
         checked["violations"] + inline_see(source) + (absence_claims(doc) if absence else []) \
-        + masked_cells(doc, catalog, masked)
+        + masked_metrics(doc, catalog) + masked_cells(doc, catalog, masked)
     return doc
 
 
@@ -3417,6 +3443,40 @@ def masked_cells(doc: dict[str, Any], catalog: dict[str, Any], masked: dict[str,
     return found
 
 
+def _masked_metric_message(ref: str, name: str) -> _Reason:
+    """引用了值不给的指标时违规 masked_cell 的说法：点名引用和指标，不写值。给写作者的那句同引用遮罩格：说清值不能以任何
+    写法写进报告，只说「删掉引用」的话写作者会把值照抄成文字（它在写作目录里本来就看不到原值）。"""
+    return _Reason(
+        f"引用了取自遮罩列的指标 [[{ref}]]：指标「{name}」的值取自设置了遮罩的列，值不应写进报告",
+        f"[[{ref}]] 引用的指标「{name}」的值取自设置了遮罩的列（证据目录里写着「已遮罩」）。设置了遮罩的列（手机号、"
+        "姓名这类）的值不能以任何形式写进报告，引用、数字、照抄的文字都不行：删掉这处引用和相应的内容",
+    )
+
+
+def masked_metrics(doc: dict[str, Any], catalog: dict[str, Any]) -> list[dict[str, Any]]:
+    """正文引用了值不给的指标（目录条目记着 masked，withhold_metrics）：每处一条违规 masked_cell，和引用遮罩格同一种违规、
+    同一套处置——交回写作者重写，仍不改的按「违规处置」办（report.py）。依据 [[see:m:…]] 不显示值，不算。
+
+    值不给的是值取自遮罩列一格的指标（cell() 取的遮罩格、取自改了名字的遮罩列），按出处认、和证据面板指标步骤的值同一套，
+    由报告撰写节点认好写进目录；这里只认目录，查不了库。违规带着引用、指标 id、span 和所在片段，不带值（正文里那一处已经写成
+    「已遮罩」，违规会进 report.checked、重写的日志和出具缺口）。"""
+    found: list[dict[str, Any]] = []
+    for _, unit in iter_units(doc):
+        for seg in unit.get("segments") or []:
+            cite = seg.get("cite") or {}
+            entry = catalog.get(cite.get("alias")) or {}
+            if cite.get("kind") != "metric" or cite.get("status") != "resolved" or entry.get("kind") != "metric" \
+                    or not entry.get("masked"):
+                continue
+            metric = str((entry.get("locator") or {}).get("metric") or cite.get("ref") or "")
+            ref = str(seg.get("ref") or f"m:{cite.get('ref')}")
+            span = seg.get("span")
+            found.append(_violation("masked_cell", _masked_metric_message(ref, str(entry.get("name") or metric)),
+                                    ref=ref, metric=metric, span=list(span) if isinstance(span, list) else None,
+                                    segment=seg.get("id"), unit=unit.get("id")))
+    return found
+
+
 #: 引用查询结果的写法。只跟着目录里的查询出现（catalog_prompt）：写作规则本身保持一期那份，升级前
 #: 发起的运行跑到报告节点时提示一字不差；只有口径卡的目录也不该教写作者去引用不存在的 Q1
 CELL_RULES = (
@@ -3605,7 +3665,10 @@ def _metric_prompt(catalog: dict[str, Any]) -> list[str]:
         title = " @ ".join(v for v in (caliber, version) if v) or node_id
         lines.append(f"\n口径卡「{title}」：")
         for e in entries:
-            if e.get("value") is None:
+            if e.get("masked"):
+                # 值取自遮罩列的一格（withhold_metrics）：写作者看到的就是「已遮罩」，引用了也只会交回重写
+                lines.append(f"- [[{e['alias']}]] {e.get('name')} = {e.get('rendered')}（取自设置了遮罩的列，不要引用）")
+            elif e.get("value") is None:
                 lines.append(f"- [[{e['alias']}]] {e.get('name')}：这次没有值，不要引用")
             elif e.get("rendered") == MISSING:
                 # 有值但按口径卡的格式显示不出来（太小、太大、不是有限的数）：引用了也是解析不了
