@@ -140,11 +140,12 @@ async def test_an_ordinary_card_keeps_its_event_and_its_numbers(client, monkeypa
 
 
 async def test_the_bundle_judges_metric_values_like_the_report_writer(client, monkeypatch, members):
-    """可验证报告认指标的值给不给，和报告撰写节点的写作目录同一个判断（证据面板指标步骤的那一套，只按出处认：
-    _metric_masks 的 by_value=False）：整份结果转成文字、整行、下标不是字面量的一格、cell() 取的号码都不给，数行数的、
-    取编号的照给（用例同 tests/test_masked_metric_values.py）。数据整形取出来再赋给变量的号码认不出出处，证据面板按值多遮
-    一层，这里照给（已知的缺口）。"""
-    from app.api.evidence import MASKED, _mask_fingerprint, _Masks, _metric_masks, _metric_in, _sealed
+    """可验证报告认指标的值给不给，和报告撰写节点的写作目录同一个判断（证据面板指标步骤的那一套，只按出处认、遮罩列只认
+    确定的：_metric_masks 的 by_value=False、sure；可验证报告认老文档用 metric_word 的 sure）：整份结果转成文字、整行、
+    下标不是字面量的一格、cell() 取的号码都不给，数行数的、取编号的照给（用例同 tests/test_masked_metric_values.py）。
+    认口径卡能不能附带的默认认法在这份 SQL 认得清的数据上结果一样。数据整形取出来再赋给变量的号码认不出出处，证据面板
+    按值多遮一层，这里照给（已知的缺口）。"""
+    from app.api.evidence import MASKED, _mask_fingerprint, _Masks, _metric_masks, _metric_in, _sealed, certain_masks
     from tests.test_masked_metric_values import TEXT, graph as members_graph
 
     script(monkeypatch, TEXT)
@@ -153,15 +154,20 @@ async def test_the_bundle_judges_metric_values_like_the_report_writer(client, mo
     sealed = await _sealed(row.id)
     entry = next(e for e in sealed.entries if e.get("kind") == "metric_set")
     card = json.loads(read_bytes(entry["artifact"], verify=False))
-    store = _Store(lambda a: read_bytes(a, verify=False), await _mask_fingerprint(), sealed.events)
-    writer, panel, bundle = {}, {}, {}
+    sure, secrets = await certain_masks(sealed, _Masks(sealed))
+    store = _Store(lambda a: read_bytes(a, verify=False), await _mask_fingerprint(), sealed.events,
+                   sure_columns=sure, sure_secrets=secrets)
+    writer, panel, bundle, card_word = {}, {}, {}, {}
     for metric in card["metrics"]:
-        _, word = await _metric_masks(metric, "card", entry["artifact"], sealed, _Masks(sealed), by_value=False)
+        _, word = await _metric_masks(metric, "card", entry["artifact"], sealed, _Masks(sealed), by_value=False,
+                                      sure=True)
         writer[metric["id"]] = {MASKED: "masked"}.get(word or "", word)
         _, word = await _metric_masks(metric, "card", entry["artifact"], sealed, _Masks(sealed))
         panel[metric["id"]] = {MASKED: "masked"}.get(word or "", word)
-        bundle[metric["id"]] = store.metric_word(entry["artifact"], _metric_in(card, metric["id"]), sealed.events)
-    assert writer == bundle, (writer, bundle)
+        bundle[metric["id"]] = store.metric_word(entry["artifact"], _metric_in(card, metric["id"]), sealed.events,
+                                                 sure=True)
+        card_word[metric["id"]] = store.metric_word(entry["artifact"], _metric_in(card, metric["id"]), sealed.events)
+    assert writer == bundle == card_word, (writer, bundle, card_word)
     assert bundle == {"n_cust": None, "dump": "masked", "row0": "masked", "last": "masked", "phone_var": None,
                       "phone_raw": "masked", "id0": None}
     assert {k: v for k, v in panel.items() if k != "phone_var"} == {k: v for k, v in bundle.items() if k != "phone_var"}

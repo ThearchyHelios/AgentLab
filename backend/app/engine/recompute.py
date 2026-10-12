@@ -575,6 +575,72 @@ _GONE = object()
 #: 下标不是字面量（rows[vars.i]、rows[len(vars.res.rows) - 1]）：wide 时认作「哪一行、哪一列说不准」
 _ANY = object()
 
+#: 转抄上游口径卡的取值链最多往上追几张卡（卡 3 抄卡 2、卡 2 抄卡 1……）：循环里一张卡抄自己上一轮的产出也就此打住。
+#: 追到头还没追完的宁可多遮，按取自遮罩格算
+CARD_DEPTH = 8
+#: 口径卡产出里不带指标值的字段：取这些的输入不算转抄了指标的值
+_CARD_PLAIN = frozenset({"kind", "caliber", "caliber_version", "artifact", "source"})
+#: 一个指标里不带值的字段（名称、单位、表达式、显示格式、状态这类）。值、渲染、输入、代入式都带着值
+_METRIC_PLAIN = frozenset({"id", "name", "unit", "expression", "decimals", "format", "status", "recompute_ok",
+                           "incomplete", "incomplete_reason", "sql_check_failed", "sql_check_reason"})
+
+
+@dataclass(frozen=True)
+class CardInput:
+    """卡上的一个输入转抄了上游口径卡的产出（card_input）：node_id 是那张卡的节点，card 是它当时的产出（指标集加清单
+    文字），picked 是这个输入带着值的那几个指标（在 card["metrics"] 里的位置）。whole：整张卡、整份指标列表、清单文字、
+    下标不是字面量的一个指标——不一定把哪个指标的值带进来，同整份查询结果（Origin.table）。"""
+
+    node_id: str
+    card: dict[str, Any]
+    picked: tuple[int, ...]
+    whole: bool
+
+
+def card_input(item: dict[str, Any], output: Callable[[Any], Any]) -> CardInput | None:
+    """卡上的一个输入是不是转抄上游口径卡的产出：nodes.<卡>.metrics[0].value、vars.<卡的 assign_to>.metrics[0].value、
+    nodes.<卡>.text（清单文字逐条写着「指标（名称）= 值」）、整张卡。是的话交回那张卡和带着值的那几个指标，值给不给按
+    那几个指标认（证据面板、写作目录、可验证报告同一个判断）：上游的指标取自遮罩格，转抄它的这个指标同样取自遮罩格。
+    以前这几种写法认不出出处，转抄来的号码照样进了写作目录、文档的证据目录和可验证报告。
+
+    output 同 input_origin：节点 id → 那个节点当时的产出；nodes.X 是 X 的产出，vars.X 是写它的节点（输入记着的 node_id）
+    的产出——口径卡的 assign_to 交给变量的就是它的产出本身。产出不是指标集的（别的节点）交回 None。只取口径名、版本、指标
+    的名称、单位这类不带值的字段的，也交回 None。"""
+    try:
+        tree = ast.parse(str(item.get("path") or ""), mode="eval").body
+    except SyntaxError:
+        return None
+    keys: list[Any] = []
+    while isinstance(tree, (ast.Attribute, ast.Subscript)):
+        if isinstance(tree, ast.Attribute):
+            keys.append(tree.attr)
+        else:
+            key = _literal_key(tree.slice)
+            keys.append(_ANY if key is _GONE else key)
+        tree = tree.value
+    keys.reverse()
+    if not isinstance(tree, ast.Name) or tree.id not in ("vars", "nodes") or not keys or not isinstance(keys[0], str):
+        return None
+    node_id = keys[0] if tree.id == "nodes" else item.get("node_id")
+    card = output(node_id) if node_id else None
+    if not (isinstance(card, dict) and card.get("kind") == "metric_set" and isinstance(card.get("metrics"), list)):
+        return None
+    metrics, rest = card["metrics"], keys[1:]
+    every = tuple(range(len(metrics)))
+    if not rest or rest[0] == "text" or rest[0] is _ANY or (rest[0] == "metrics" and len(rest) == 1):
+        return CardInput(str(node_id), card, every, True)
+    if rest[0] != "metrics":
+        # 口径名、版本、工件 id 这类，或者产出里本来没有的键：不带指标的值
+        return None
+    index = rest[1]
+    if index is _ANY:
+        return CardInput(str(node_id), card, every, True)
+    if not isinstance(index, int) or not -len(metrics) <= index < len(metrics):
+        return None
+    if len(rest) > 2 and isinstance(rest[2], str) and rest[2] in _METRIC_PLAIN:
+        return None
+    return CardInput(str(node_id), card, (index % len(metrics),), False)
+
 
 def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any], *, wide: bool = False) -> dict[str, Any] | None:
     """按位置取自一份查询结果的一格：vars.res.rows[0][2]、nodes.parse.rows[1]['amount'] 这种标量引用——查询结果经数据

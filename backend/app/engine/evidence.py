@@ -978,10 +978,10 @@ def withhold_metrics(catalog: dict[str, Any], aliases: Iterable[str], word: str)
     """目录里值不给的指标（aliases，指标的别名）：值、渲染、标签里的值都换成 word（「已遮罩」），另记 masked。交回一份新的
     目录，原来那份不动；没有要换的原样交回。
 
-    哪几个不给由报告撰写节点按证据面板指标步骤的那一套认（api/evidence.py 的 withheld_metrics，只按出处认：cell() 取的
-    遮罩格、取自改了名字的遮罩列、按位置取自遮罩列的一格都算，值碰巧等于遮罩值的普通指标不算）。写作目录、存进报告文档的
-    证据目录都从这份目录来：目录收着上游口径卡的全部指标，
-    没被引用的也在里面，原值写着就随文档、可验证报告出去了。引用它的照样解析、正文写 word（resolve_marker），报告自查另记
+    哪几个不给由报告撰写节点认（api/evidence.py 的 withheld_metrics，证据面板指标步骤的那一套，只按出处、只按确定取自
+    遮罩列的认，和单元格引用的自查同一个口径：cell() 取的遮罩格、取自改了名字的遮罩列、按位置取自遮罩列的一格、转抄上游
+    口径卡里这类指标的都算；值碰巧等于遮罩值的普通指标、SQL 认不准时没确定取自遮罩列的普通金额不算）。写作目录、存进报告
+    文档的证据目录都从这份目录来：目录收着上游口径卡的全部指标，没被引用的也在里面，原值写着就随文档、可验证报告出去了。引用它的照样解析、正文写 word（resolve_marker），报告自查另记
     一条违规（masked_metrics）。出口契约复核按报告节点产出里记下的同一份别名重建（report_catalog），渲染出来对得上。"""
     hidden = [a for a in dict.fromkeys(aliases) if (catalog.get(a) or {}).get("kind") == "metric"]
     if not hidden:
@@ -3457,8 +3457,8 @@ def masked_metrics(doc: dict[str, Any], catalog: dict[str, Any]) -> list[dict[st
     """正文引用了值不给的指标（目录条目记着 masked，withhold_metrics）：每处一条违规 masked_cell，和引用遮罩格同一种违规、
     同一套处置——交回写作者重写，仍不改的按「违规处置」办（report.py）。依据 [[see:m:…]] 不显示值，不算。
 
-    值不给的是值取自遮罩列一格的指标（cell() 取的遮罩格、取自改了名字的遮罩列），按出处认、和证据面板指标步骤的值同一套，
-    由报告撰写节点认好写进目录；这里只认目录，查不了库。违规带着引用、指标 id、span 和所在片段，不带值（正文里那一处已经写成
+    值不给的是值取自遮罩列一格的指标（cell() 取的遮罩格、取自改了名字的遮罩列、转抄上游口径卡里这类指标的），只按出处、
+    只按确定取自遮罩列的认（和单元格引用的自查同一个口径），由报告撰写节点认好写进目录；这里只认目录，查不了库。违规带着引用、指标 id、span 和所在片段，不带值（正文里那一处已经写成
     「已遮罩」，违规会进 report.checked、重写的日志和出具缺口）。"""
     found: list[dict[str, Any]] = []
     for _, unit in iter_units(doc):

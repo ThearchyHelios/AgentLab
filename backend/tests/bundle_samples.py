@@ -32,6 +32,8 @@
   逐个格式核一遍
 - formats-unit：同经营月报，销售额的单位带尾随空白（「元 」：单位输入框不去空白，指标节点照存），正文显示「74,613.65元 」，
   原样导出照样全部通过
+- prose：同经营月报的口径卡和流水，正文是写作者自己写在引用旁边的普通文字（「运费统一[[m:…]]」「合计——[[m:…]]」
+  「SKU-[[v:…]]」「共[[m:…]]家」这类）：原样导出全部通过、总览是绿的，紧挨着核对的规则不误判正常写法
 """
 from __future__ import annotations
 
@@ -99,6 +101,13 @@ FORMATS = ("## 经营月报\n\n本月销售额 [[m:gmv]]（约 [[m:gmv|万]]）�
            "取整是 [[m:avg|int]]；线上占比 [[m:share|pct]]，出口额 [[m:export]]。\n\n"
            "[[v:Q1.r0.region]]流水 [[v:Q1.r0.gmv]]（约 [[v:Q1.r0.gmv|万]]），[[v:Q1.r1.region]]冲减 [[v:Q1.r1.gmv]]。"
            "最大一单的订单号 [[v:Q1.r0.order_no]]，付款时间 [[v:Q1.r0.paid_at]]。[[see:Q1]]")
+#: 经营月报的另一种写法：写作者自己写在引用旁边的普通文字——「统一」后面紧跟数（汉字「一」不是负号）、破折号（——、—、
+#: –、―，小号的）后面紧跟数、编号「SKU-」「A-」后面紧跟数（连字符前面是字母，是编号的一部分）、「共…家」、全角括号、
+#: 「NO.」后面跟数、假名长音和制表符横线、粗体斜体包着的数。原样导出要全部通过、总览是绿的
+PROSE = ("## 正文\n\n全场运费统一[[m:orders]]，消费合计——[[m:gmv]]，退款—[[m:refund]]，转化率–[[m:conv_rate]]，"
+         "环比―[[m:growth]]，客单价\ufe58[[m:avg]]。\n\n"
+         "最大一单 SKU-[[v:Q1.r0.order_no]]，编号A-[[m:orders]]，共[[m:orders]]家，线上占比（[[m:share|pct]]），"
+         "排名NO.[[m:orders]]，出口额ー[[m:export]]，年度─[[m:annual|亿]]，**[[m:gmv]]**，*[[v:Q1.r0.gmv]]*。")
 #: 会员周报：Q3 是会员按地区汇总（没碰遮罩列），Q2 是选出了号码的会员消费
 MEMBERS = ("## 会员周报\n\n华东会员消费 [[v:Q3.r0.spend]]，华南 [[v:Q3.r1.spend]]。[[see:Q3]]\n\n"
            "会员林一消费 [[v:Q2.r0.spend]]。")
@@ -136,7 +145,7 @@ def masked_card(crm_id: str) -> dict[str, Any]:
     return {**CARD, "metrics": [*CARD["metrics"], contact, first]}
 
 
-#: masked_card 上值不给的指标（和证据面板指标步骤的值同一个判断：输入取自遮罩格）
+#: masked_card 上值不给的指标（和报告撰写节点的写作目录同一个判断：输入确定取自遮罩格）
 MASKED_METRICS = ("m:contact", "m:phone_raw")
 
 
@@ -320,6 +329,7 @@ def bundles() -> dict[str, dict[str, Any]]:
 
     out["formats"] = formats_bundle()
     out["formats-unit"] = formats_bundle(card=FORMATS_UNIT_CARD)
+    out["prose"] = formats_bundle(text=PROSE)
     return out
 
 

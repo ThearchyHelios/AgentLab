@@ -21,7 +21,8 @@ artifacts 表可以事后插行，run.output 是可以改写的一列，封存�
 options.mask_columns 里的列换成「已遮罩」，SQL 里给它们起了别名、套了函数得来的结果列也换
 （_mask_sets，和可验证报告同一个函数，合并查询另按合并 SQL 认）；用到这些列的指标，指标步骤的值、
 证据图的标签也不给（_metric_masks，和推演同一个判断；报告撰写节点写作之前按同一个判断把这类指标在目录里写成「已遮罩」，
-withheld_metrics）；SQL、合并警告里写着的遮罩值（这次运行里确定取自遮罩列的值）
+withheld_metrics，只是遮罩列只认确定的那一套，和单元格引用的自查同一个口径；可验证报告认老文档也按这个口径，
+certain_masks）；SQL、合并警告里写着的遮罩值（这次运行里确定取自遮罩列的值）
 展示时换掉。一份快照的遮罩分析、收到的值按快照工件记在进程里（_MEMO），之后的请求不再读盘、不再分析
 ——在有身份体系之前，这只减少暴露，不是安全边界：知道工件 id 的人照样能取到整份快照。
 
@@ -979,8 +980,8 @@ def _held_word(held: _Held) -> str:
 
 
 async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, sealed: _Sealed,
-                        masks: _Masks, *, output: Callable[[Any], Any] | None = None, by_value: bool = True
-                        ) -> tuple[dict[str, _Held], str | None]:
+                        masks: _Masks, *, output: Callable[[Any], Any] | None = None, by_value: bool = True,
+                        sure: bool = False, depth: int = 0) -> tuple[dict[str, _Held], str | None]:
     """一个指标的输入里哪些不给值（路径 → _Held），指标本身的值给不给（None 照给，否则是写在值那里的字：「已遮罩」
     「无法核对」）。证据面板的指标步骤、证据图的标签、报告撰写节点的写作目录（withheld_metrics）都按这一个函数认，和推演
     同一套分类、同一个判断（recompute.withheld_value）：
@@ -993,8 +994,12 @@ async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, s
 
     output（节点 id → 那个节点的产出）给了的，按位置取的一格顺着它走取值链，不去封存的事件里找口径卡算这一次之前的产出：
     报告撰写节点写作时运行还没封存，产出就在运行状态里。by_value 为假（报告撰写节点的写作目录）：认不出出处的输入不按值认，
-    也不因此按值认指标的值——只按出处认，见 withheld_metrics。"""
-    hide = _InputMasks(sealed, masks, card_node, artifact, output=output)
+    也不因此按值认指标的值——只按出处认，见 withheld_metrics。sure 为真（写作目录、可验证报告认老文档）：遮罩列只按确定的
+    那一套认（_InputMasks 的 sure），不跟着证据面板宁可多遮。
+
+    转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text，recompute.card_input）按上游那几个指标认，同一个
+    函数往上追（depth 记追了几张卡，最多 recompute.CARD_DEPTH）。"""
+    hide = _InputMasks(sealed, masks, card_node, artifact, output=output, by_value=by_value, sure=sure, depth=depth)
     held: dict[str, _Held] = {}
     uncertain = False
     for item in metric.get("inputs") or []:
@@ -1037,7 +1042,12 @@ async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], le
       产出走取值链（口径卡算的时候读到的就是它们）
     - 查询快照的数据源按证据台账认（ledger 的 query 条目），这次运行查到过的遮罩值从台账里的查询快照收
     遮没遮核对不了的（「无法核对」）不算：写作时快照和产出刚落下，读不出来的只能是坏了的文件，宁可照给、不让写作者因此
-    改不掉；可验证报告那边另有兜底（bundle/build.py 只给哈希）。"""
+    改不掉；可验证报告那边另有兜底（bundle/build.py 只给哈希）。
+
+    遮罩列只按确定的那一套认（sure，和单元格引用的自查同一个口径：_cited_masks）：SQL 认不准、证据面板整份遮的快照里，
+    没确定取自遮罩列的普通金额、计数、只装着分档标签的列照给。以前跟着证据面板宁可多遮，WITH 写了列名表、VALUES 当表的
+    销售额也成了「已遮罩」，正式运行引用它就判失败；同一格按 [[v:…]] 引用却不报违规。转抄上游口径卡的指标
+    （nodes.<卡>.metrics[0].value、nodes.<卡>.text）按上游那个指标认（_InputMasks._copied）。"""
     queries = {str(e["artifact"]): {k: e[k] for k in ("node_id", "tool", "source", "via", "call_id", "exec")
                                     if e.get(k) is not None}
                for e in ledger if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact")}
@@ -1055,8 +1065,12 @@ async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], le
             found.append((alias, card_node, str(entry.get("artifact") or ""), metric))
     if not found:
         return []
-    # cell()、Agent 字段落在的快照先在线程里读好（读盘、复验哈希）：在运行里认，不占着事件循环
-    await masks.prefetch(str(item["artifact"]) for *_, metric in found for item in metric.get("inputs") or []
+    # cell()、Agent 字段落在的快照先在线程里读好（读盘、复验哈希）：在运行里认，不占着事件循环。转抄上游口径卡的指标要顺着
+    # 上游卡的输入认，运行状态里每张口径卡的输入一并读好
+    cards = [card for card in nodes.values() if isinstance(card, dict) and card.get("kind") == "metric_set"]
+    await masks.prefetch(str(item["artifact"]) for metric in [*(m for *_, m in found),
+                                                              *(m for card in cards for m in card.get("metrics") or [])]
+                         if isinstance(metric, dict) for item in metric.get("inputs") or []
                          if isinstance(item, dict) and isinstance(item.get("artifact"), str) and item["artifact"])
 
     def output(node_id: Any) -> Any:
@@ -1064,14 +1078,35 @@ async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], le
 
     out: list[str] = []
     for alias, card_node, artifact, metric in found:
-        _, word = await _metric_masks(metric, card_node, artifact, view, masks, output=output, by_value=False)
+        _, word = await _metric_masks(metric, card_node, artifact, view, masks, output=output, by_value=False,
+                                      sure=True)
         if word == MASKED:
             out.append(alias)
     return out
 
 
+async def certain_masks(sealed: _Sealed, masks: _Masks) -> tuple[dict[str, frozenset[str]], Any]:
+    """可验证报告认老文档时用的遮罩（bundle/build.py 的 _Store.metric_word，sure）：(封存范围内每份读得出来的查询快照 →
+    确定取自遮罩列的结果列（小写，_cited_masks 的键，和写作目录同一个口径）, 这次运行查到过的遮罩值（run_secrets）)。
+
+    可验证报告在线程里构建、不查库，这几样按证据面板的那一套先在这里认好交进去：老文档整份只给哈希的判断和写作目录
+    逐个指标一样（SQL 认不准时不因此算遮罩列），不另写一套。读不出来、和哈希对不上的快照不在里面：可验证报告按它的数据源
+    现在设的遮罩认，同 _InputMasks。"""
+    await masks.prefetch(sealed.queries)
+    out: dict[str, frozenset[str]] = {}
+    for artifact, info in sealed.queries.items():
+        snap, ok = masks.fetch(artifact)
+        if ok is True and isinstance(snap, dict):
+            out[artifact] = frozenset(await masks.cited(artifact, (info or {}).get("source"), snap))
+    return out, await masks.run_secrets()
+
+
 #: tool_cell、Agent 字段落在的查询快照读不出来：只知道数据源现在设的遮罩，查询当时记下的在快照里，遮没遮核对不了
 SNAPSHOT_UNVERIFIED = "查询快照无法读取，核对不了这一格是否取自设置了遮罩的列"
+#: 转抄的上游口径卡指标遮没遮核对不了（它的输入落在读不出来的快照上这类）
+CARD_UNVERIFIED = "转抄的上游口径卡指标核对不了是否取自设置了遮罩的列"
+#: 口径卡一张抄一张，追了 recompute.CARD_DEPTH 张还没追到头（或者循环里抄自己上一轮的产出）：宁可多遮
+CARD_TOO_DEEP = f"转抄上游口径卡超过 {recompute.CARD_DEPTH} 层，追不到这个值最初取自哪里，按取自设置了遮罩的列处理"
 
 
 class _InputMasks:
@@ -1088,15 +1123,24 @@ class _InputMasks:
 
     一次请求里同一件工件只读一次、同一份快照的遮罩只认一次（记在 _Masks 上）：按位置取了十几格的指标，不必把写变量的
     节点那几 MB 的产出重读十几遍；证据图给每个指标认一遍输入，也不必把同一份快照反复读盘。
+
+    sure（写作目录、可验证报告认老文档）：遮罩列只按确定的那一套认——读得出来的快照按单元格引用自查的 _cited_masks（_mask_sets
+    的 sure，再按血缘排除值确实不取自遮罩列的），读不出来的按数据源现在设的列名。证据面板、推演照旧按 hidden 宁可多遮。
+
+    转抄上游口径卡的输入（recompute.card_input：nodes.<卡>.metrics[0].value、vars.<卡的 assign_to>.metrics[0].value、
+    nodes.<卡>.text）按上游那几个指标认（_copied，同一个 _metric_masks 往上追）：上游的指标取自遮罩格，转抄它的这个输入
+    同样不给值。整张卡、清单文字这种不一定把哪个指标的值带进来的，同整份查询结果（table），指标的值另按值认。
     """
 
     def __init__(self, sealed: _Sealed, masks: _Masks, card_node: str, artifact: str, *,
-                 output: Callable[[Any], Any] | None = None) -> None:
+                 output: Callable[[Any], Any] | None = None, by_value: bool = True, sure: bool = False,
+                 depth: int = 0) -> None:
         self._sealed, self._masks = sealed, masks
         self._card, self._artifact = card_node, artifact
         self._outputs: dict[str, str] | None = None
         # 报告撰写节点写作时（withheld_metrics）：节点的产出就在运行状态里，不从封存的事件里找
         self._given = output
+        self._by_value, self._sure, self._depth = by_value, sure, depth
 
     def _fetch(self, artifact: str) -> tuple[Any, bool | None]:
         return self._masks.fetch(artifact)
@@ -1106,7 +1150,8 @@ class _InputMasks:
         为假，值按值认（_metric_masks）。"""
         origin = recompute.input_origin(item, self._output, wide=True)
         if origin is None:
-            return None, False
+            copied = recompute.card_input(item, self._output)
+            return (await self._copied(copied), True) if copied is not None else (None, False)
         if origin.unverified is not None:
             return _Held("unverified", list(origin.columns), origin.unverified), True
         used = list(dict.fromkeys(origin.columns))
@@ -1134,7 +1179,37 @@ class _InputMasks:
 
     async def _hidden(self, artifact: str | None, source: str | None, snap: dict[str, Any] | None) -> set[str]:
         info = self._sealed.queries.get(artifact) if artifact else None
-        return (await self._masks.sets(artifact, (info or {}).get("source") or source, snap)).hidden
+        name = (info or {}).get("source") or source
+        if self._sure and snap is not None:
+            return await self._masks.cited(artifact, name, snap)
+        sets = await self._masks.sets(artifact, name, snap)
+        return sets.sure if self._sure else sets.hidden
+
+    async def _copied(self, copied: recompute.CardInput) -> _Held | None:
+        """转抄上游口径卡的输入不给值的原因：上游带着值的那几个指标里，有不给的（「已遮罩」）就不给，有遮没遮核对不了的
+        就核对不了；整张卡、清单文字（whole）同整份查询结果，记 table、指标的值另按值认。追得太深（卡抄卡超过
+        recompute.CARD_DEPTH 张，循环里一张卡抄自己上一轮的产出）的追不到最初取自哪里，宁可多遮，按取自遮罩格算：
+        核对不了的不给写作目录拦，号码就从这里出去了。"""
+        if self._depth >= recompute.CARD_DEPTH:
+            return _Held("masked", [], CARD_TOO_DEEP)
+        artifact = str(copied.card.get("artifact") or "")
+        words: list[str] = []
+        columns: list[str] = []
+        for index in copied.picked:
+            metric = copied.card["metrics"][index]
+            if not isinstance(metric, dict) or not metric.get("inputs"):
+                continue
+            held, word = await _metric_masks(metric, copied.node_id, artifact, self._sealed, self._masks,
+                                             output=self._given, by_value=self._by_value, sure=self._sure,
+                                             depth=self._depth + 1)
+            if word is not None:
+                words.append(word)
+                columns.extend(c for h in held.values() if h.reason is None for c in h.columns)
+        if MASKED in words:
+            return _Held("table" if copied.whole else "masked", list(dict.fromkeys(columns)))
+        if UNVERIFIED_VALUE in words:
+            return _Held("table" if copied.whole else "unverified", [], CARD_UNVERIFIED)
+        return None
 
 
 def _card_outputs(sealed: _Sealed, card_node: str, artifact: str) -> dict[str, str]:
@@ -1449,6 +1524,7 @@ class _Masks:
         self._collected = False
         self._read: dict[str, tuple[Any, bool | None]] = {}
         self._sets: dict[tuple[str | None, str], _MaskSets] = {}
+        self._cited: dict[tuple[str, str], set[str]] = {}
 
     def fetch(self, artifact: str) -> tuple[Any, bool | None]:
         """取回一件工件（_fetch）：一次请求里同一件只读一次。证据图要给每个指标认一遍输入，同一份快照、同一个节点的
@@ -1474,6 +1550,17 @@ class _Masks:
                 return found
             self._sets[key] = found
         return self._sets[key]
+
+    async def cited(self, artifact: str | None, source: Any, snap: dict[str, Any]) -> set[str]:
+        """一份读得出来的查询快照里确定取自遮罩列的结果列（小写，_cited_masks 的键：单元格引用的自查按它判违规），一次请求里
+        同一份只认一次（_owned_columns 要按 SQL 血缘认，指标一个个认输入时不必反复算）。调用方只读不改。"""
+        key = (str(artifact or ""), str(source or ""))
+        if not artifact or key not in self._cited:
+            found = set(await _cited_masks(snap, source, self, artifact))
+            if not artifact:
+                return found
+            self._cited[key] = found
+        return self._cited[key]
 
     async def of(self, source: Any) -> tuple[set[str], bool]:
         name = str(source or "")

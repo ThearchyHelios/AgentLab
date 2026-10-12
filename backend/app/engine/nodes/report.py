@@ -5,8 +5,8 @@
 挪到写的那一刻：
 
 1. 建目录：收齐上游口径卡的指标和运行输入，编成 [[m:gmv]]、[[i:week]] 这样的引用。值取自遮罩格的指标（cell() 取的
-   遮罩格、取自改了名字的遮罩列，和证据面板指标步骤的值同一个判断）在目录里写「已遮罩」：写作目录、存进文档的证据目录
-   都不写原值，引用了的照样交回重写（报告自查记 masked_cell）
+   遮罩格、取自改了名字的遮罩列、转抄上游口径卡里这类指标的；只按确定取自遮罩列的认，和单元格引用的自查同一个口径）
+   在目录里写「已遮罩」：写作目录、存进文档的证据目录都不写原值，引用了的照样交回重写（报告自查记 masked_cell）
 2. 流式写作：模型写标记，StreamRenderer 边收边换成真值，流里看到的就是最终的数字
 3. 核对：compose_doc 切块、分句、切片段，找出裸数字和解析不了的引用。模型把整篇包在一个 ```markdown 代码块
    里的，先去掉外层围栏（_unfenced）：不然整篇是一个代码块，一句结论都切不出来
@@ -629,8 +629,10 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # 目录按上游的产出建：这个节点自己上一次的产出（循环里重跑时）不算，它记下的 masked_metrics 这一次重新认
     upstream = {**state, "nodes": {k: v for k, v in (state.get("nodes") or {}).items() if k != ctx.node.id}}
     catalog = report_catalog(upstream, spec, ctx.node)  # type: ignore[arg-type]
-    # 值取自遮罩格的指标（cell() 取的遮罩格、取自改了名字的遮罩列）：写作目录、存进文档的证据目录里都写「已遮罩」，判断
-    # 和证据面板指标步骤的值同一个（api/evidence.py 的 withheld_metrics）。记进产出，出口契约复核按同一份重建目录
+    # 值取自遮罩格的指标（cell() 取的遮罩格、取自改了名字的遮罩列、转抄上游口径卡里这类指标的）：写作目录、存进文档的
+    # 证据目录里都写「已遮罩」。只按确定取自遮罩列的认，和单元格引用的自查同一个口径（api/evidence.py 的 withheld_metrics）：
+    # SQL 认不准时没确定取自遮罩列的普通金额照给，不然引用它的正式运行判失败、写作者也改不掉。记进产出，出口契约复核按
+    # 同一份重建目录
     from app.api.evidence import withheld_metrics
 
     withheld = await withheld_metrics(catalog, nodes=state.get("nodes") or {}, ledger=state.get("evidence") or [])

@@ -465,7 +465,7 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     got = {name: json.loads(data_block(page)) for name, page in rendered.items()}
     assert set(got) == {"base", "two-reports", "legacy", "failed", "continued", "degraded", "missing-doc",
                         "missing-card", "nan", "stray", "masked-card", "masked-old-doc", "masked-source", "formats",
-                        "formats-unit"}
+                        "formats-unit", "prose"}
     for name, bundle in got.items():
         assert browser_manifest(bundle["events"]) == bundle["meta"]["manifest_hash"], name
 

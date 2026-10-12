@@ -13,14 +13,17 @@
  *      render_number / render_cell：千分位、小数位、单位、万 / 亿换算、百分数，文字压成一行）把那个值渲染出来的字，
  *      两边都只去掉首尾空白。本页渲染不出来的写法判无法核对，不判通过。运行输入不随文件附带，照旧无法核对，但显示的字
  *      照样拿引用的值核对，对不上判不通过。核对通过的字要原样显示在正文里（checkLayout）：正文里根本不显示的判不通过，
- *      紧挨着写着数字、负号、小数点（读者看到的是另一个数）的判不通过，紧挨着显示成什么说不准的字，或者同一句里有改变
- *      文字方向的字，读起来可能不是这个值的判无法核对；列表缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数；
+ *      紧挨着写着数字、小数点、负号（读者看到的是另一个数）的判不通过；画着删除线、后面接着量级单位、紧挨着像负号的短横、
+ *      长得像数字的字母、显示成什么说不准的字，或者同一句里有改变文字方向的字，读起来可能不是这个值的判无法核对；列表
+ *      缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数；
  *   ⑥ 运行信息：运行结果、运行类别、出具档位拿封存范围内已核对的事件对照。工作流名、版本、起止时间、节点名称
  *      绑不进封存，页面上写明它们取自运行记录。
  * 每项给出通过 / 不通过 / 无法核对和原因。服务端导出时不会出现的状态（被引用的工件不在清单里、检索快照这类工件标着
  * 遮罩）一律算不通过：只可能是文件被改过。报告文档的证据目录里写着取自遮罩列的指标的值时，服务端只给它的哈希
- * （升级前生成的文档，或者生成之后数据源才设的遮罩），页面照实说明，这份报告算未能核对。这些只证明内部一致，真伪要拿
- * 封存哈希去系统里对照，页面上写明。
+ * （升级前生成的文档，或者生成之后数据源才设的遮罩），页面照实说明，这份报告算未能核对。总览只有一项无法核对都没有、
+ * 每份报告都核对上了才是绿色的通过（overallOf）：有无法核对的项写「可核对的项全部通过，另有 N 项无法核对」，用中性色，
+ * 无法核对的项里可能正藏着读者看到的另一个数。这些只证明内部一致，真伪要拿封存哈希去系统里对照，页面上写明；总览
+ * 不是绿色的通过时，总览下面另醒目地写一遍（运行 ID、/verify 接口、定时任务通知里的清单哈希前 12 位）。
  *
  * SHA-256 优先用浏览器的 crypto.subtle；拿不到（非安全上下文、某些浏览器打开本地文件时）用下面的纯 JS 实现，
  * 两者结果一致。纯 JS 实现启动时先拿标准测试向量自检，自检不过就不下任何结论。
@@ -62,9 +65,13 @@
   }
   const T = {
     allPass: '全部通过',
-    passWithNa: '可核对的项全部通过',
+    passWithNa: (n) => `可核对的项全部通过，另有 ${n} 项无法核对`,
     failed: (n) => `有 ${n} 项不通过`,
     incomplete: (n) => `有 ${n} 份报告未能核对`,
+    /** 总览不是绿色的通过时醒目地写在下面：这个文件核对不了真伪，真伪以系统里的封存核对为准 */
+    verifyHint: (run, prefix) => `这个文件只能核对内部是否一致，判断不了真伪：请在系统中打开运行 ${run}，确认清单哈希与上方`
+      + `一致并点「核对」（接口 GET /api/runs/${run}/verify），或与定时任务通知里的清单哈希前 12 位「${prefix}」对照，`
+      + '一致才说明这些记录出自系统、未被改过。',
     tally: (p, f, n) => `通过 ${p} 项 · 不通过 ${f} 项 · 无法核对 ${n} 项`,
     broken: '页面数据无法解析，无法核对',
     selfTestFailed: '本页的 SHA-256 实现在这个浏览器中自检未通过，不给出核对结论',
@@ -184,6 +191,10 @@
     numGlued: '正文里紧挨着这个数的字改变了读者看到的数：前后紧挨着的数字、负号或小数点会和它连成另一个数',
     shownBlurred: '紧挨着的正文里有看不见或在不同设备上显示不同的字，读起来可能和核对过的不是同一个值',
     shownTurned: '这一句里有从右往左书写的文字或改变文字方向的控制字符，显示出来的顺序可能和核对过的不一样',
+    shownStruck: '这个数画着删除线，或者紧挨着画了删除线的文字，读的人可能以为它已作废、以旁边的数为准',
+    shownScaled: '后面接着量级单位（万、亿、千、百、%、‰、k、M、B 这类）。系统显示这个数时不带它，读起来的数可能差了量级',
+    shownDash: '前面紧挨着一道像负号的短横，读起来可能是负数',
+    shownLookalike: '紧挨着长得像数字的字母或符号（l、I、O、上标数字、圈码这类），读起来可能多出一位',
     numNotShown: '正文里没有显示这一处：导出时不会出现这种情况，文件可能被改过',
     numAria: (kind, text, result) => `${kind === 'value' ? '取值' : '数字'} ${text}，${result}，查看出处`,
     statusOk: (seq, what) => `与第 ${seq} 条事件（${what}）一致`,
@@ -215,7 +226,8 @@
     shaJs: 'SHA-256 由本页内置的实现计算（浏览器未提供 crypto.subtle），结果与浏览器内置实现一致',
     renderNote: '正文里带出处的数字和取值，本页按系统的显示规则（千分位、小数位、单位、万 / 亿换算、百分数，文字压成一行）'
       + '把口径卡或快照里的值（运行输入按引用的值）重新渲染一遍，与显示的文字逐字比对；核对通过的字在正文里原样显示，'
-      + '紧挨着它写着数字、负号或小数点的判不通过，紧挨着看不见的字或者同一句里有改变文字方向的字的判无法核对。',
+      + '紧挨着它写着数字、负号或小数点的判不通过；画着删除线、后面接着量级单位、紧挨着像负号的短横、长得像数字的字母'
+      + '或看不见的字，或者同一句里有改变文字方向的字，判无法核对。有一项无法核对，总览就不是绿色的通过。',
     schema: (s) => `文件格式 ${s}`,
   }
 
@@ -828,31 +840,45 @@
 
   // 紧挨着核对通过的数字、取值的字，按码点分几类（kindOf）：
   // - digit：数字。Python 的 \d 认的全都算（全角的、数学字母区的、阿拉伯文的也是）；
-  // - minus：负号。横线类标点（连字符、各种破折号，全角的、小号的也算；波浪形的不算），减号类符号（数学减号、上下标
-  //   负号、修饰字母负号、粗减号），以及显示出来同样是一道横线的字：Unicode 易混字符表里映射到「-」「ー」的（汉字「一」、
-  //   假名长音、制表符的横线这类），和在 Chrome 的常用字体里逐个画出来看是一道横线、高度和负号相当的字；
+  // - minus：负号。只认真当负号用的三个：半角的连字符减号、数学减号「−」、全角的「－」；
+  // - dash：长得像负号、平时却不当负号用的短横：连字符、不断行连字符、数字宽的横线、小号的连字符减号、上下标负号、修饰
+  //   字母负号、粗减号、别的文字里的连字符。不判不通过：紧挨着数字开头、前面又不是字母数字时，读起来可能是负数，判无法
+  //   核对。破折号（——、—、–、―，小号的、竖排的）、波浪线、汉字「一」和显示出来同样是一道横线的字（假名长音、制表符
+  //   的横线、注音和谚文里的横这类）不在这里，是正文里的普通写法（「运费统一10元」「合计——7,036.50元」），当 other；
   // - sep：半角逗号、句点和长得一样的窄标点（低位单引号、单点前导符、小号的逗号句点这类，取自易混字符表）：「1,」后面
   //   接着数字也算紧挨着。全角的「，」「．」不算：字宽，中文里两个数之间本来就常用「，」隔开；
+  // - unit：量级单位（万、亿、千、百、兆，繁体的萬、億，%、‰、‱，k、K、M、B，全角写法也算）：接在数字后面，读者看到
+  //   的数差了量级。系统显示一个数时单位、万 / 亿换算都在核对过的那段字里，不会另接在后面，判无法核对；
+  // - look：长得像数字、却不是数字的字：拉丁字母 l、I、O（全角的也算），上下标数字、圈码、罗马数字、汉字「〇」这类数字
+  //   符号。紧挨着数字，读起来可能多出一位（「l74,613.65元」），判无法核对；
   // - skip：显示时不占位置的字（零宽空格、连接符、变体选择符、韩文填充符这类格式字符和默认不显示的字），隔着它们照样
   //   算紧挨着；
   // - blur：显示成什么说不准的字：控制字符（制表、换行这几个空白除外）、未分配和私用区的字、孤立的代理项、组合附加符号
   //   （叠在前一个字上：叠在空格上能在数字前面画出一道横线）、可选连字符（在它那里换行时显示成连字符）、发丝空格、对象
   //   替换符，以及在 Chrome 的常用字体里量出来几乎不占宽度的几个字。各家浏览器、字体把它们显示成数字、横线还是什么都
   //   不显示说不准：隔着它们照样往外找数字、负号；找不到的也判无法核对，原因另写；
-  // - other：别的字（汉字、字母、空格、别的标点）把数字隔开。
+  // - other：别的字（汉字、别的字母、空格、别的标点）把数字隔开。
   // 改变文字方向的控制字符（BIDI）和从右往左书写的文字（RTL：希伯来文、阿拉伯文这类）另算：它们能把一位数挪到数字的
   // 另一边显示（逻辑上在数字后面的「5」显示在数字前面），按字的先后看不出来，同一句里出现就判无法核对
   const DIGIT = unicode('^\\p{Nd}$') || /^[0-9\uff10-\uff19]$/
-  const DASH_LIKE = '\\u02d7\\u0c7c\\u1173\\u172d\\u174d\\u180a\\u1b78\\u1bc7\\u1bf3\\u1c7c\\u2043\\u207b\\u208b\\u2212'
-    + '\\u23af\\u23ba-\\u23bd\\u23e4\\u2500\\u2501\\u2504\\u2505\\u2508\\u2509\\u254c\\u254d\\u2550\\u2574\\u2576\\u2578'
-    + '\\u257a\\u257c\\u257e\\u2796\\u29ff\\u2cba\\u2cbb\\u2d67\\u2f00\\u30fc\\u3127\\u3161\\u3192\\u31d0\\u4e00\\ua7f7'
-    + '\\uaa7d\\uff70\\uffda'
-  const DASH_LIKE_ASTRAL = '\\u{10110}\\u{10191}\\u{11049}\\u{1104b}\\u{11052}\\u{110be}\\u{13404}\\u{1bc03}\\u{1bc08}'
-    + '\\u{1bc0d}\\u{1bc86}\\u{1d369}'
-  const MINUS = unicode(`^(?![\\u301c\\u3030])[\\p{Pd}${DASH_LIKE}${DASH_LIKE_ASTRAL}]$`)
-    || new RegExp(`^[-\\u2010-\\u2015\\u2e3a\\u2e3b\\ufe58\\ufe63\\uff0d${DASH_LIKE}]$`)
+  const MINUS = /^[-\u2212\uff0d]$/
+  // \p{Pd} 里去掉负号和正文里的破折号、波浪线（这几个另算），再加上码点不在 \p{Pd} 里的减号类符号
+  const DASH = unicode('^(?![-\\u2013-\\u2015\\u2e3a\\u2e3b\\u301c\\u3030\\ufe31\\ufe32\\ufe58\\uff0d])'
+    + '[\\p{Pd}\\u02d7\\u207b\\u208b\\u2043\\u2796]$')
+    || /^[\u058a\u1400\u1806\u2010-\u2012\u2e17\u2e1a\u2e40\u30a0\ufe63\u02d7\u207b\u208b\u2043\u2796]$/
   const SEP = unicode('^[.,\\u00b8\\u201a\\u2024\\u2e12\\ua4f8\\ua4f9\\ua60e\\uabec\\ufe50\\ufe52\\u{16f53}\\u{1d16d}]$')
     || /^[.,\u00b8\u201a\u2024\u2e12\ua4f8\ua4f9\ua60e\uabec\ufe50\ufe52]$/
+  const UNIT = /^[万亿千百兆萬億%\uff05\u2030\u2031kKMB\uff4b\uff2b\uff2d\uff22]$/
+  // 量级单位里本身就能接在数后面的那几个汉字：核对过的字以它们结尾（换算成万的「4.57万」），再接一个也差了量级（「4.57万亿」）
+  const UNIT_HAN = /^[万亿千百兆萬億]$/
+  const LOOK = unicode('^[lIO\\uff4c\\uff29\\uff2f\\p{No}\\p{Nl}]$')
+    || new RegExp('^[lIO\\uff4c\\uff29\\uff2f\\u00b2\\u00b3\\u00b9\\u00bc-\\u00be\\u2070-\\u2079\\u2080-\\u2089'
+      + '\\u2150-\\u2189\\u2460-\\u249b\\u24ea-\\u24ff\\u2776-\\u2793\\u3007\\u3021-\\u3029\\u3038-\\u303a]$')
+  // 连字符减号前面的字母数字（拉丁、希腊、西里尔字母，全角的也算）：「SKU-12」「A-3」是编号的一部分，不是负号
+  const WORDY = unicode('^[\\p{Script=Latin}\\p{Script=Greek}\\p{Script=Cyrillic}]$')
+    || /^[A-Za-z\u00c0-\u024f\u0370-\u03ff\u0400-\u04ff\uff21-\uff3a\uff41-\uff5a]$/
+  // 量级单位前面可以隔着的空白：「45,678.5 万」照样读作四亿多
+  const BLANK = /^[ \u00a0\u3000]$/
   // 变体选择符只换前一个字的字形（文字样式还是表情样式），算 skip：表情后面常带一个，不能因此把数字判成核对不了
   const VARIATION = unicode('^[\\u180b-\\u180d\\u180f\\ufe00-\\ufe0f\\u{e0100}-\\u{e01ef}]$')
     || /^[\u180b-\u180d\u180f\ufe00-\ufe0f]$/
@@ -871,7 +897,10 @@
     if (VARIATION.test(c)) return 'skip'
     if (DIGIT.test(c)) return 'digit'
     if (MINUS.test(c)) return 'minus'
+    if (DASH.test(c)) return 'dash'
     if (SEP.test(c)) return 'sep'
+    if (UNIT.test(c)) return 'unit'
+    if (LOOK.test(c)) return 'look'
     if (BLUR.test(c)) return 'blur'
     return SKIP.test(c) ? 'skip' : 'other'
   }
@@ -883,12 +912,15 @@
    * 每一项记下正文里显示出来的字（onPage）。
    * - 正文里根本不显示它（分隔线里、表格里不在各行各列上的格）：伪造的字可以写在别处，读的人看不到核对过的那个数。
    *   服务端导出时不会出现（分隔线不带句子，表格的格都在行列上），判不通过；
-   * - 紧挨着的字里写着数字、负号或小数点（前面补一位、后面接一位或一段小数、前面加负号；隔着不占位置、显示成什么说不准
-   *   的字，显示时藏起来的排版标记也算紧挨着）：读者看到的是另一个数，判不通过。伪造者不动核对过的那段字、只改旁边的
-   *   正文，重算全部哈希就做得到；以前判无法核对，总览照样写「可核对的项全部通过」。服务端组装的文档不这样排：两个数
-   *   之间补空格（evidence._glue），原样导出照样通过。两个数之间的连字符是区间，不算负号；
-   * - 紧挨着的是显示成什么说不准的字，或者同一句里有改变文字方向的字：读起来的数可能不止核对过的这几位，判无法核对——
-   *   真报告里也可能有，不能说成被改过。这两样不会把上一条的不通过降成无法核对。
+   * - 紧挨着的字里写着数字、小数点（前面补一位、后面接一位或一段小数；隔着不占位置、显示成什么说不准的字，显示时藏起来
+   *   的排版标记也算紧挨着），或者紧挨着数字开头的是负号、负号前面又不是字母数字（「SKU-12」的连字符是编号的一部分）：
+   *   读者看到的是另一个数，判不通过。伪造者不动核对过的那段字、只改旁边的正文，重算全部哈希就做得到。服务端组装的文档
+   *   不这样排：两个数之间补空格（evidence._glue），写作者自己写在引用前面的字（「统一」「——」「SKU-」）都不在这几样
+   *   里，原样导出照样通过。两个数之间的连字符是区间，不算负号；
+   * - 这一句里有改变文字方向的字；核对过的字画着删除线，或者紧挨着画了删除线的字；后面接着量级单位（中间隔着空格也算）；
+   *   前面紧挨着像负号的短横；紧挨着长得像数字的字母、数字符号；紧挨着显示成什么说不准的字：读起来可能不是核对过的那个
+   *   数，判无法核对，原因各自写明——真报告里也可能有，不能说成被改过。总览里有一项无法核对就不是绿色的通过
+   *   （overallOf）。这几样不会把上一条的不通过降成无法核对。
    * 代码块按原文显示、不标数字，照旧
    */
   function checkLayout(doc, items) {
@@ -902,7 +934,7 @@
         continue
       }
       for (const flow of flowsOf(block)) {
-        // 这一组显示出来的字（藏起来的排版标记不算），逐个记下属于哪个片段
+        // 这一组显示出来的字（藏起来的排版标记不算），逐个记下属于哪个片段、带着什么行内样式（删除线要看）
         const shownUnits = []
         for (const unit of flow) {
           const { segs, text, styles, at } = unitPlan(unit)
@@ -911,7 +943,7 @@
             for (let k = at[i][0]; k < at[i][1]; k++) {
               if (styles.hide[k]) continue
               shown += text[k]
-              shownUnits.push([text[k], seg])
+              shownUnits.push([text[k], seg, styles.style[k]])
             }
             if (items.has(seg)) items.get(seg).onPage = shown
           })
@@ -921,11 +953,11 @@
         // 字不和外面的拼
         const chars = []
         for (let k = 0; k < shownUnits.length; k++) {
-          const [c, seg] = shownUnits[k]
+          const [c, seg, style] = shownUnits[k]
           const next = shownUnits[k + 1]
           const paired = next && c >= '\ud800' && c < '\udc00' && next[0] >= '\udc00' && next[0] < '\ue000'
             && (next[1] === seg || (!items.has(seg) && !items.has(next[1])))
-          chars.push(paired ? [c + shownUnits[++k][0], seg] : [c, seg])
+          chars.push(paired ? [c + shownUnits[++k][0], seg, style] : [c, seg, style])
         }
         // 可点的数字自成一块，它里面的字改变不了外面的方向：只看别的片段
         const turned = chars.some(([c, seg]) => !items.has(seg) && (BIDI.test(c) || RTL.test(c)))
@@ -948,6 +980,9 @@
           }
           return { ...NOWHERE, blurred }
         }
+        const struck = (j) => j >= 0 && (chars[j][2] & BIT.strike) !== 0
+        // 前一个字算不算字母数字：负号前面是它的，是「SKU-12」这类编号的一部分
+        const wordy = (at) => at >= 0 && (kinds[at] === 'digit' || kinds[at] === 'look' || WORDY.test(chars[at][0]))
         for (const [seg, item] of items) {
           if (item.result !== PASS || !spans.has(seg)) continue
           const [s0, s1] = spans.get(seg)
@@ -963,18 +998,28 @@
           const r1 = look(s1, 1)
           const r2 = r1.at >= 0 ? look(r1.at, 1) : NOWHERE
           const before = kinds[first] === 'digit' && (l1.kind === 'digit' || (l1.kind === 'sep' && l2.kind === 'digit'))
-          const sign = lead && l1.kind === 'minus' && l2.kind !== 'digit' && !(l2.at >= 0 && numeric(chars[l2.at][1]))
+          // 负号、像负号的短横紧挨着数字开头，前面不是字母数字、也不是另一个数（两个数之间是区间）
+          const signed = lead && (l1.kind === 'minus' || l1.kind === 'dash') && !wordy(l2.at)
+            && !(l2.at >= 0 && numeric(chars[l2.at][1]))
           const after = tail && (r1.kind === 'digit' || (r1.kind === 'sep' && r2.kind === 'digit'))
+          // 后面的量级单位：中间隔着空格也算（「45,678.5 万」）
+          let ru = r1
+          while (ru.at >= 0 && BLANK.test(chars[ru.at][0])) ru = look(ru.at, 1)
+          const scaled = (tail || UNIT_HAN.test(chars[last][0])) && ru.kind === 'unit'
+          const crossed = chars.slice(s0, s1 + 1).some((_, j) => struck(s0 + j)) || struck(l1.at) || struck(r1.at)
+          const lookalike = (kinds[first] === 'digit' && l1.kind === 'look') || (tail && r1.kind === 'look')
           // 数字头尾紧挨着（或隔着一个逗号、句点）的是说不准的字：它本身就可能显示成数字、负号
           const near = (a, b) => a.blurred || (a.kind === 'sep' && b.blurred)
           const blurred = (lead && near(l1, l2)) || (tail && near(r1, r2))
-          if (before || sign || after) {
+          if (before || (signed && l1.kind === 'minus') || after) {
             // 紧挨着写着数字、负号、小数点：读者看到的是另一个数（伪造者不动核对过的字、只改旁边的正文，重算全部哈希就
-            // 做得到），判不通过。服务端组装的文档不这样排：两个数之间补了空格（evidence._glue）。排在说不准的字、改变
-            // 方向的字前面判：伪造者在同一句里再放一个这种字，不能把不通过降成无法核对
+            // 做得到），判不通过。排在下面那几样前面判：伪造者在同一句里再放一个说不准的字、改变方向的字，不能把不通过
+            // 降成无法核对
             Object.assign(item, { result: FAIL, reason: T.numGlued })
-          } else if (turned || blurred) {
-            Object.assign(item, { result: NA, reason: T.numShownUnknown(turned ? T.shownTurned : T.shownBlurred) })
+          } else {
+            const why = turned ? T.shownTurned : crossed ? T.shownStruck : scaled ? T.shownScaled
+              : signed ? T.shownDash : lookalike ? T.shownLookalike : blurred ? T.shownBlurred : null
+            if (why) Object.assign(item, { result: NA, reason: T.numShownUnknown(why) })
           }
         }
       }
@@ -982,6 +1027,23 @@
     for (const item of items.values()) {
       if (item.onPage === undefined && item.result === PASS) Object.assign(item, { result: FAIL, reason: T.numNotShown })
     }
+  }
+
+  /**
+   * 只看正文的排法（checkLayout）：文档里每个解析成功的数字、取值都当作核对通过，交回 [{ id, ref, result, reason }]。
+   * node 里用（tests/test_bundle_shown.py 拿各种写法逐条核；也拿开发数据里的报告文档扫一遍，看真报告会不会被误判）
+   */
+  function layoutOf(doc) {
+    const items = new Map()
+    for (const [seg] of segmentsOf(doc)) {
+      const cite = isObj(seg.cite) ? seg.cite : {}
+      if ((seg.kind === 'number' || seg.kind === 'value') && cite.status === 'resolved') {
+        items.set(seg, { result: PASS, reason: '' })
+      }
+    }
+    checkLayout(doc, items)
+    return [...items].map(([seg, item]) => ({ id: seg.id ?? null, ref: seg.ref ?? null, text: String(seg.text ?? ''),
+      result: item.result, reason: item.reason || '', onPage: item.onPage ?? null }))
   }
 
   // ------------------------------------------------------------------ 核对
@@ -1114,7 +1176,7 @@
         // 三种都只给 id，检索快照这类别的工件不会。
         // 内容不随文件附带，浏览器算不出它对不对得上：导出时服务端看到自己的文件和 id 对不上（mismatch）、解析不出来
         // （unparsable）的照实说，对不上的判不通过——不然被改过的文件看起来和正常的遮罩一样，篡改的证据就丢了。报告文档
-        // 只给哈希时页面上没有正文可核，总览不是绿色的通过（renderOverall 按报告文档没核对上算）
+        // 只给哈希时页面上没有正文可核，总览不是绿色的通过（overallOf 按报告文档没核对上算）
         if (a.kind !== 'query' && a.kind !== 'metric_set' && a.kind !== 'report_doc') {
           item.result = FAIL
           item.reason = T.maskedOdd
@@ -1818,18 +1880,34 @@
         h('span', { class: 'what' }, `${T.chainByEvent(ev.seq, eventWhat(ev))}${ev.summary ? `：${ev.summary}` : ''}`)))))
   }
 
-  function renderOverall(out) {
+  /**
+   * 总览：{ result, text, pass, fail, na }。result 是 pass（绿）、fail（红）、incomplete（有报告文档核对不了）、partial
+   * （可核对的都通过，另有几项无法核对）。只有一项都没有无法核对、每份报告都核对上了才是绿色的通过：无法核对的项里可能
+   * 正藏着读者看到的另一个数（紧挨着改的量级单位、删除线这类），以前照样给绿色的「可核对的项全部通过」。不是绿色的，
+   * 页面另醒目地写明真伪要去系统里核对封存（renderOverall）
+   */
+  function overallOf(out) {
     const all = [...out.events, ...out.manifest, ...out.artifacts, ...out.chain, ...out.numbers, ...out.meta]
     const count = (r) => all.filter((i) => i.result === r).length
     const [pass, fail, na] = [count(PASS), count(FAIL), count(NA)]
-    // 报告文档核对不了（导出时服务端已没有文件、读不懂）：页面上没有可核的正文，不能写成绿色的「通过」
+    // 报告文档核对不了（导出时服务端已没有文件、读不懂、因遮罩不随文件附带）：页面上没有可核的正文
     const unverified = out.docs.filter((d) => !d.trusted).length
-    const result = fail ? FAIL : unverified ? 'incomplete' : PASS
+    const result = fail ? FAIL : unverified ? 'incomplete' : na ? PARTIAL : PASS
+    const text = fail ? T.failed(fail) : unverified ? T.incomplete(unverified) : na ? T.passWithNa(na) : T.allPass
+    return { result, text, pass, fail, na }
+  }
+
+  function renderOverall(out, data) {
+    const { result, text, pass, fail, na } = overallOf(out)
     const box = $('overall')
     box.setAttribute('data-overall', result)
-    box.querySelector('.overall-mark').textContent = fail ? MARK.fail : unverified ? MARK.na : MARK.pass
-    $('overall-text').textContent = fail ? T.failed(fail) : unverified ? T.incomplete(unverified) : na ? T.passWithNa : T.allPass
+    box.querySelector('.overall-mark').textContent = MARK[result] || MARK.na
+    $('overall-text').textContent = text
     $('overall-sub').textContent = T.tally(pass, fail, na)
+    const hint = $('overall-hint')
+    const run = String(data.meta.run_id ?? '')
+    hint.textContent = result === PASS ? '' : T.verifyHint(run, String(data.meta.manifest_hash ?? '').slice(0, 12))
+    hint.hidden = result === PASS
   }
 
   function renderFoot(data, kind) {
@@ -1869,7 +1947,7 @@
     renderChecks(view.out)
     renderAppended(data)
     renderFoot(data, picked.kind)
-    renderOverall(view.out)
+    renderOverall(view.out, data)
     $('detail-close').addEventListener('click', closeDetail)
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDetail() })
     document.documentElement.setAttribute('data-verified', '')
@@ -1878,7 +1956,8 @@
   // 在 node 里载入（tests/test_bundle_shown.py 拿服务端的渲染逐条对照、整份核对）：没有页面，交出核对用的纯函数就停
   if (typeof document === 'undefined') {
     if (typeof module === 'object' && module) {
-      module.exports = { verify, renderNumber, renderCell, numberTokens, tokenAt, parseJson, Unshown, listItems, tableCells }
+      module.exports = { verify, renderNumber, renderCell, numberTokens, tokenAt, parseJson, Unshown, listItems, tableCells,
+        layoutOf, overallOf }
     }
     return
   }

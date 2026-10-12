@@ -37,9 +37,12 @@ h1 { margin: 2px 0 0; font-size: 24px; line-height: 1.35; }
   border: 1px solid var(--border); background: var(--panel); font-size: 18px; font-weight: 650; }
 .overall[data-overall="pass"] { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
 .overall[data-overall="fail"] { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
-.overall[data-overall="incomplete"] { color: var(--na); background: var(--na-soft); border-color: var(--na); }
+.overall[data-overall="incomplete"], .overall[data-overall="partial"] { color: var(--na); background: var(--na-soft); border-color: var(--na); }
 .overall-mark { font-size: 20px; line-height: 1; }
 .overall-sub { margin: 4px 2px 0; font-size: 13px; color: var(--dim); }
+/* 总览不是绿色的通过时：真伪以系统里的封存核对为准，写在总览正下方，比封存说明醒目 */
+.overall-hint { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid var(--accent); border-radius: 6px; background: var(--panel);
+  color: var(--fg); font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
 .seal { margin: 18px 0; padding: 14px 16px; border: 2px solid var(--accent); border-radius: 10px; }
 .seal h2 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--dim); }
 .hash { display: block; font-size: 15px; font-weight: 600; line-height: 1.5; word-break: break-all; color: var(--fg); }
@@ -154,6 +157,7 @@ details > summary { padding: 8px 12px; border-top: 1px solid var(--border); font
       <span class="overall-mark js-only" aria-hidden="true">…</span><span id="overall-text"><span class="js-only">正在核对…</span><span class="no-js">尚未核对：需要在浏览器中打开本文件，并允许执行其中的核对脚本</span></span>
     </div>
     <p id="overall-sub" class="overall-sub"></p>
+    <p id="overall-hint" class="overall-hint" role="note" hidden></p>
     <section class="seal" aria-labelledby="seal-label">
       <h2 id="seal-label">封存清单哈希</h2>
       <code id="seal-hash" class="hash">__BUNDLE_SEAL__</code>

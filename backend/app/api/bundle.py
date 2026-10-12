@@ -21,7 +21,7 @@ from fastapi.responses import Response
 from sqlalchemy import select
 
 from app.api.coded import CodedHTTPException
-from app.api.evidence import RUN_NOT_FOUND, _mask_fingerprint, _sealed
+from app.api.evidence import RUN_NOT_FOUND, _mask_fingerprint, _Masks, _sealed, certain_masks
 from app.bundle.build import attachment_name, build_bundle, content_disposition, render_html
 from app.core.artifact_store import read_bytes
 from app.db.base import SessionLocal
@@ -60,11 +60,15 @@ async def export_bundle(run_id: str) -> Response:
             .where(RunEvent.run_id == run_id, RunEvent.seq > bound).order_by(RunEvent.seq))]
     # 数据源现在设的遮罩：事后加的遮罩同样生效，和证据面板一个道理
     masks = await _mask_fingerprint()
+    # 每份查询快照里确定取自遮罩列的列、这次运行查到过的遮罩值：认老文档时指标的值给不给，和报告撰写节点的写作目录
+    # 同一个口径（SQL 认不准时不因此算遮罩列）。要查库、按 SQL 血缘认，在这里认好交进去
+    sure, secrets = await certain_masks(sealed, _Masks(sealed))
     exported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     # 读工件、算哈希、base64 是同步的活，快照大的时候不该占着事件循环
     page = await asyncio.to_thread(lambda: render_html(build_bundle(
         info, [*sealed.events, *later], manifest_seq=bound, manifest_hash=str(sealed.manifest_hash or ""),
         legacy=bool(sealed.seal.get("legacy")), graph=sealed.graph, source_masks=masks,
+        sure_columns=sure, sure_secrets=secrets,
         read=lambda artifact: read_bytes(artifact, verify=False), exported_at=exported_at)))
     return Response(page, media_type="text/html; charset=utf-8", headers={
         "Content-Disposition": content_disposition(attachment_name(info), run_id=run_id),

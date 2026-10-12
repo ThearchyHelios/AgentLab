@@ -13,10 +13,13 @@
 - 口径卡单位前后带空白（「元 」，服务端照原样接）：两边都只去首尾空白，原样导出照样通过；运行输入照旧无法核对，显示
   文字拿引用的值核对，只改显示文字的不通过；出处面板里数字文本照原文写；
 - 正文的排法：核对通过的字要原样显示——伪造的链接藏不起它（整句按原文显示），正文里不显示的判不通过；紧挨着补数字、
-  负号、小数点（长得像负号的横线也算，隔着不占位置的字也算）判不通过：读者看到的是另一个数，以前只判无法核对，总览
-  照样是绿的；紧挨着显示成什么说不准的字（控制字符、组合符号这类），同一句里有改变文字方向的字（方向控制字符、希伯来文
-  和阿拉伯文这类从右往左书写的文字），判无法核对；区间、日期这类真报告里的写法照常通过；列表缩进有上限、表格只排有格
-  的列，伪造的缩进、列号挤不走核对过的数。
+  小数点、负号（只认真当负号用的半角、数学减号、全角三个，前面是字母数字的是编号的一部分；隔着不占位置的字也算）判不
+  通过：读者看到的是另一个数，以前只判无法核对，总览照样是绿的；后面接着量级单位（万、亿、%、k 这类，隔着空格也算）、
+  画着删除线或紧挨着画了删除线的字、紧挨着像负号的短横（连字符、上标负号这类）、长得像数字的字母和数字符号（l、I、O、
+  上标数字、圈码）、显示成什么说不准的字（控制字符、组合符号这类），同一句里有改变文字方向的字（方向控制字符、希伯来文
+  和阿拉伯文这类从右往左书写的文字），判无法核对；写作者自己写在引用旁边的普通文字（「统一」「——」「SKU-」「共…家」）、
+  区间、日期照常通过；列表缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数；
+- 总览：一项无法核对都没有才是绿色的通过，有的是中性的「可核对的项全部通过，另有 N 项无法核对」（overallOf）。
 
 数据全是虚构的。
 """
@@ -73,6 +76,8 @@ async function main() {
     return input.blocks.map((b) => (b.type === 'list' ? v.listItems(b.units).map((i) => i.depth)
       : v.tableCells(b.units).cols))
   }
+  // 只看正文的排法：文档里每个解析成功的数字、取值当作核对通过，交回各自的结果
+  if (input.task === 'layoutOf') return input.docs.map((d) => v.layoutOf(d))
   const digest = async (bytes) => createHash('sha256').update(bytes).digest('hex')
   const out = await v.verify(input.data, digest, input.seal)
   const results = (items) => items.map((i) => i.result)
@@ -88,6 +93,8 @@ async function main() {
     numbers: out.numbers.map((n) => ({ key: n.key, ref: n.seg.ref ?? null, text: String(n.seg.text ?? ''),
       result: n.result, reason: n.reason || '', expected: n.expected ?? null, shownOk: !!n.shownOk,
       truthText: n.truthText ?? null, onPage: n.onPage ?? null })),
+    // 总览：结果（pass 绿 / fail 红 / incomplete、partial 中性）和那一句
+    overall: v.overallOf(out),
   }
 }
 main().then((r) => process.stdout.write(JSON.stringify(r)), (e) => {
@@ -607,20 +614,20 @@ def _split_pair(high: str, low: str):
     ("v:Q1.r0.gmv", _glue_after("s34", chr(0x2024) + "5")),  # 和句点长得一样的单点前导符
     ("m:conv_rate", _glue_before("s12", "-")),               # 前面加负号：-2.35%
     ("m:conv_rate", _glue_before("s12", chr(0xFF0D))),       # 全角负号
-    # 长得像负号的横线：连字符、不断行连字符、数字宽的横线、短破折号、长破折号、修饰字母负号、粗减号、小号长破折号、
-    # 数学减号、上标负号，和显示出来同样是一道横线的汉字「一」、假名长音、制表符横线、罗马盎司符号（码点在两个
-    # UTF-16 单元里）
-    *[("m:conv_rate", _glue_before("s12", chr(cp))) for cp in (
-        0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x02D7, 0x2796, 0xFE58, 0x2212, 0x207B, 0x4E00, 0x30FC, 0x2500,
-        0x10191)],
+    ("m:conv_rate", _glue_before("s12", chr(0x2212))),       # 数学减号
+    ("m:conv_rate", _glue_before("s12", "-" + chr(0x200B))),  # 隔着看不见的零宽空格
+    # 负号前面是汉字、括号：不是编号的一部分（「SKU-12」那种前面是字母数字的见下面照常通过的几条）
+    ("m:conv_rate", lambda doc: by_id(doc, "s12").update(text="转化率-")),
+    ("m:conv_rate", lambda doc: by_id(doc, "s12").update(text="转化率（-")),
     ("m:refund", _glue_before("s9", "-")),                   # 负数前面再加负号：--3,120.50元
     ("v:Q1.r0.paid_at", _glue_after("s45", "5")),            # 取值以数字结尾：2026-09-07 08:21:395
 ])
 def test_digits_glued_to_a_checked_value_fail(ref, change):
     """伪造者不动核对过的那段字，只在相邻的文字片段里补一位数、一个负号、一段小数（隔着不占位置、显示成什么说不准的字，
-    藏起来的粗体标记也算紧挨着；长得像负号的横线也算负号），重算全部哈希：读者看到的是另一个数。这一项判不通过、点名
-    正文里紧挨着的字改变了读者看到的数——以前只判无法核对，总览照样写「可核对的项全部通过」。显示文字本身照旧核对过
-    （shownOk），别的照常通过。服务端组装的文档不会这样排（两个数之间补空格），原样导出照样通过（见下面几条）。"""
+    藏起来的粗体标记也算紧挨着），重算全部哈希：读者看到的是另一个数。这一项判不通过、点名正文里紧挨着的字改变了读者
+    看到的数——以前只判无法核对，总览照样写「可核对的项全部通过」。负号只认真当负号用的三个（半角、数学减号、全角），
+    前面是字母数字的是编号的一部分（见下面照常通过的几条）。显示文字本身照旧核对过（shownOk），别的照常通过。服务端组装
+    的文档不会这样排（两个数之间补空格），原样导出照样通过（见下面几条）。"""
     from tests.bundle_samples import formats_bundle
 
     got = verdicts(rewritten(formats_bundle(), change))
@@ -714,6 +721,119 @@ def test_ranges_dates_and_signs_written_by_the_system_still_pass():
     got = verdicts(formats_bundle(text=text))
     assert len(got["numbers"]) == 9
     assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), got["numbers"]
+
+
+UNSURE = "无法核对显示文字："
+DASHED = UNSURE + "前面紧挨着一道像负号的短横，读起来可能是负数"
+SCALED = UNSURE + "后面接着量级单位（万、亿、千、百、%、‰、k、M、B 这类）。系统显示这个数时不带它，读起来的数可能差了量级"
+STRUCK = UNSURE + "这个数画着删除线，或者紧挨着画了删除线的文字，读的人可能以为它已作废、以旁边的数为准"
+LOOKALIKE = UNSURE + "紧挨着长得像数字的字母或符号（l、I、O、上标数字、圈码这类），读起来可能多出一位"
+
+
+def _only(ref: str, change: Any, result: str, reason: str) -> dict[str, Any]:
+    """改过的经营月报里只有 ref 这一项是 result（原因 reason），别的照常通过；交回核对结果。"""
+    from tests.bundle_samples import formats_bundle
+
+    got = verdicts(rewritten(formats_bundle(), change))
+    hit = item(got, ref)
+    assert hit["result"] == result and hit["reason"] == reason and hit["shownOk"], hit
+    assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"] != ref), \
+        [n for n in got["numbers"] if n["ref"] != ref and n["result"] != "pass"]
+    return got
+
+
+@pytest.mark.parametrize("cp", [0x2010, 0x2011, 0x2012, 0x02D7, 0x2796, 0x207B, 0x208B, 0xFE63, 0x058A])
+def test_a_short_dash_that_looks_like_a_minus_cannot_pass(cp):
+    """连字符、不断行连字符、数字宽的横线、修饰字母负号、粗减号、上下标负号、小号连字符减号、亚美尼亚连字符：平时不当负号
+    用，不判不通过；紧挨着数字开头、前面又不是字母数字时读起来像负数，判无法核对、原因说清。总览不是绿色的通过。"""
+    got = _only("m:conv_rate", _glue_before("s12", chr(cp)), "na", DASHED)
+    assert got["overall"]["result"] == "partial", got["overall"]
+
+
+@pytest.mark.parametrize("ref, change", [
+    ("v:Q1.r0.gmv", _glue_after("s34", "万")),                 # 45,678.5万：读作四亿多
+    ("v:Q1.r0.gmv", _glue_after("s34", " 万")),                # 中间隔着空格照样读作四亿多
+    ("v:Q1.r0.gmv", _glue_after("s34", "亿元")),
+    ("v:Q1.r0.gmv", _glue_after("s34", "%")),
+    ("v:Q1.r0.gmv", _glue_after("s34", "‰")),
+    ("v:Q1.r0.gmv", _glue_after("s34", chr(0xFF05))),          # 全角百分号
+    *[("v:Q1.r0.gmv", _glue_after("s34", c)) for c in ("k", "K", "M", "B", "千", "百", "萬", chr(0xFF2B))],
+    ("v:Q1.r0.gmv|万", _glue_after("s36", "亿")),              # 4.57万亿：核对过的字以「万」结尾，再接一个量级
+    ("v:Q1.r0.order_no", _glue_after("s43", "万")),            # 订单号后面接「万」
+    ("m:orders", _glue_after("s18", "")),                      # 对照组见下：以「单」结尾的不受影响
+])
+def test_a_magnitude_unit_after_a_checked_value_cannot_pass(ref, change):
+    """核对过的那段字不动，后面接上量级单位（万、亿、%、k 这类，隔着空格也算）：读者看到的数差了量级。系统显示一个数时
+    单位、万 / 亿换算都在核对过的那段字里，不会另接在后面，判无法核对、原因说清；总览不是绿色的通过。"""
+    if ref == "m:orders":
+        # 以「单」结尾的数后面接什么都不改变它的量级：照常通过
+        from tests.bundle_samples import formats_bundle
+
+        got = verdicts(rewritten(formats_bundle(), lambda doc: by_id(doc, "s18").update(text="万。")))
+        assert all(n["result"] == "pass" for n in got["numbers"]), got["numbers"]
+        return
+    got = _only(ref, change, "na", SCALED)
+    assert got["overall"]["result"] == "partial" and "另有 1 项无法核对" in got["overall"]["text"], got["overall"]
+
+
+@pytest.mark.parametrize("change", [
+    # 核对过的数整个画上删除线，旁边另写一个数（读的人以为它已作废）
+    lambda doc: (by_id(doc, "s3").update(text=by_id(doc, "s3")["text"] + "~~"),
+                 by_id(doc, "s5").update(text="~~ 84,613.65元" + by_id(doc, "s5")["text"])),
+    # 删除线只画在紧挨着它的字上
+    _glue_before("s3", "~~旧~~"),
+    _glue_after("s5", "~~作废~~"),
+])
+def test_a_struck_checked_value_cannot_pass(change):
+    """删除线画在核对过的数上，或者画在紧挨着它的字上：显示出来的字没变，读的人却可能以为它已作废、以旁边写的数为准，
+    判无法核对、原因说清。"""
+    ref = "m:gmv"
+    got = _only(ref, change, "na", STRUCK)
+    assert got["overall"]["result"] == "partial", got["overall"]
+
+
+@pytest.mark.parametrize("ref, change", [
+    ("m:gmv", _glue_before("s3", "l")),                       # 小写 L：读作 174,613.65元
+    ("m:gmv", _glue_before("s3", "I")),                       # 大写 i
+    ("m:gmv", _glue_before("s3", chr(0xFF29))),               # 全角大写 i
+    ("v:Q1.r0.gmv", _glue_after("s34", "O")),                 # 大写 o：读作 45,678.50
+    ("m:gmv", _glue_before("s3", chr(0xB9))),                 # 上标 1
+    ("m:gmv", _glue_before("s3", chr(0x2160))),               # 罗马数字 1
+    ("m:gmv", _glue_before("s3", chr(0x2460))),               # 圈码 1
+    ("v:Q1.r0.gmv", _glue_after("s34", chr(0x3007))),         # 汉字〇
+])
+def test_a_lookalike_digit_next_to_a_checked_value_cannot_pass(ref, change):
+    """紧挨着长得像数字的字母、数字符号（l、I、O、上标数字、罗马数字、圈码、汉字〇）：读起来可能多出一位，判无法核对、
+    原因说清。"""
+    got = _only(ref, change, "na", LOOKALIKE)
+    assert got["overall"]["result"] == "partial", got["overall"]
+
+
+def test_ordinary_writing_next_to_checked_values_still_passes_as_exported():
+    """正文里的普通写法照常通过，原样导出总览全绿：「统一」后面紧跟数（汉字「一」不是负号）、破折号（——、—、–、―，
+    小号的）后面紧跟数、编号「SKU-」「A-」后面紧跟数（连字符前面是字母，是编号的一部分）、「共…家」、全角括号、区间、
+    「NO.」后面跟数、数后面跟「元」「单」这类单位以外的字、假名长音和制表符横线、粗体和斜体包着的数。"""
+    from tests.bundle_samples import PROSE, formats_bundle
+
+    got = verdicts(formats_bundle(text=PROSE))
+    assert len(got["numbers"]) == 15, got["numbers"]
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), \
+        [n for n in got["numbers"] if n["result"] != "pass"]
+    assert got["overall"] == {"result": "pass", "text": "全部通过", "pass": got["overall"]["pass"], "fail": 0, "na": 0}
+
+
+def test_the_overview_is_green_only_without_anything_unverifiable():
+    """总览：原样导出、一项无法核对都没有的是绿色的「全部通过」；有一项无法核对就是中性的「可核对的项全部通过，另有
+    N 项无法核对」（以前照样是绿的）；有不通过的是红的。"""
+    from tests.bundle_samples import formats_bundle
+
+    assert verdicts(formats_bundle())["overall"]["result"] == "pass"
+    got = verdicts(rewritten(formats_bundle(), lambda doc: by_id(doc, "s5").update(
+        text=chr(0x202E) + by_id(doc, "s5")["text"])))
+    assert got["overall"]["result"] == "partial" and got["overall"]["fail"] == 0, got["overall"]
+    assert got["overall"]["text"] == f"可核对的项全部通过，另有 {got['overall']['na']} 项无法核对", got["overall"]
+    got = verdicts(rewritten(formats_bundle(), _glue_before("s3", "1")))
+    assert got["overall"]["result"] == "fail" and got["overall"]["text"] == "有 1 项不通过", got["overall"]
 
 
 NOT_SHOWN = "正文里没有显示这一处：导出时不会出现这种情况，文件可能被改过"
