@@ -54,6 +54,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, replace
@@ -101,6 +102,9 @@ _REF_DEPTH = 8
 RATIONALE = "rationale"
 #: 触顶原因
 LIMITS = ("max_queries", "timeout_s", "max_cost_usd", "daily_max_usd", "max_steps")
+#: 收尾那次调用超过时长上限、没交成结果时的原话（limit 记 timeout_s）。是内部的说法，给人看时调用方换成自己的话：质询的
+#: _error_words、反方审稿的「反查未完成：已达上限（…）」、双盲复算按 limit 写的无法复算原因
+SETTLE_TIMEOUT = "收尾时超过时长上限，没能交结果"
 #: 核查模型的输出到了上限被截断、没交成结果时给人看的话：双盲复算的无法复算、反方审稿的「反查未完成」、质询的报错都照
 #: 它说，也是 verify_truncated 日志的原话。cut 是 budget.cut_words 的「核查模型的输出达到上限（N token）被截断」。开头只说
 #: 「未能给出结果」：质询里提问人看到的就是这句，它问的是问题，不是在核查
@@ -125,7 +129,10 @@ VERIFY_FINAL_PROMPT = (
     "row 是行号（从 0 数），column 是列名。系统按引用从查询结果里取值，你自己写的数字不会被采用；查不到就写 null，"
     "不要估算\n"
     "- rationale 写理由，简短说清依据。理由里出现的每个数字都写成 [[v:Q1.r0.列名]] 这样的引用，系统会换成查询结果"
-    "里的值；不要直接写数字，提到某次查询时写 [[see:Q1]]\n"
+    "里的值；不要直接写数字\n"
+    "- 要指明一句话依据的是哪次查询，在这句的句末写 [[see:Q1]]，比如「……结果一致。[[see:Q3]]」。[[see:…]] 渲染后"
+    "不显示，只能挂在句末：不要放进括号，也不要写进句子中间、写在「依据」「见」「取自」这类字后面，否则会留下「（）」"
+    "「（，」「依据。」这样的断句\n"
     "- 其余字段按各自的说明填写"
 )
 _CELL_REF: dict[str, Any] = {
@@ -687,6 +694,26 @@ def _parsed(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+#: 只是占位词的理由（只留字母、数字和汉字，不分大小写）：模型照着结构填了个字面的 placeholder、N/A，等于没给理由
+_PLACEHOLDERS = frozenset({"placeholder", "todo", "tbd", "na", "null", "nil", "rationale", "reason", "略", "理由"})
+#: 说「没有」的词：理由是另一个结果的说明时（双盲复算的数、反方审稿的结论），它等于没给理由；理由就是结果本身时（审批
+#: 质询，结构里只有理由一项）它可能就是回答——问「有没有测试账号」，答「无。」
+_NOTHING = frozenset({"none", "无", "暂无"})
+#: 依据写在引出语后面（「依据 [[see:Q1]]。」「结果见：[[see:Q1]]」「（来源：[[see:Q1]]）」）：依据渲染后不显示，引出语悬在
+#: 那里（「依据。」），渲染时去不掉（evidence._see_cuts 只收拾依据周围的空白、括号和标点）。交结果的提示要求写在句末，
+#: 模型不照做时记一条日志，验收时查得到
+_LEAD_IN_SEE = re.compile(r"(?:依据|见|取自|来源|出处)[ \t\u3000]*[：:]?[ \t\u3000]*\[\[[ \t]*see[ \t]*:[^\[\]\n]*\]\]")
+
+
+def _no_rationale(shown: str, *, answer: bool = False) -> bool:
+    """渲染出来的理由等于没给：空的、只有标点（只写了依据：[[see:Q1]]、「（[[see:Q1]]）」渲染出来是空的），或者只是一个
+    占位词（「placeholder。[[see:Q1]]」渲染出来只剩占位词）。按渲染后的正文判，不按原文：标记里的字（see、Q1）不显示。
+    answer：理由就是交回的结果本身（审批质询的回答），说「没有」的词不算。当没给理由处理（理由为空、没有理由文档），
+    审批卡照「没有给出理由」说，不把占位词当理由展示，判「被推翻」的也不当有出处。"""
+    word = "".join(ch for ch in shown if ch.isalnum()).casefold()
+    return not word or word in _PLACEHOLDERS or (not answer and word in _NOTHING)
+
+
 @dataclass
 class _State:
     """一次核查过程中攒下的东西：出意外时也照这些交回，用了多少、查了什么不丢。"""
@@ -1032,10 +1059,14 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
     if parsed is None:
         if settle_cut:
             return await report_cut("verify_result", settler.max_tokens)
-        why = "收尾时超过时长上限，没能交结果" if isinstance(failure, asyncio.TimeoutError) else \
+        timed_out = isinstance(failure, asyncio.TimeoutError)
+        why = SETTLE_TIMEOUT if timed_out else \
             f"核查模型没有按结构交结果（{explain_model_error(failure, model_id)}）" if failure is not None else \
             "核查模型没有按结构交结果"
-        return outcome(limit=stopped, answered=answered, error=why)
+        # 收尾超时：没交成结果是因为时长上限，limit 照实记 timeout_s，和原因对得上——模型自己停了查询（stopped 为 None）
+        # 时以前记成没触顶，质询的报错说时长上限、界面却没有「已达时长上限」；循环里先查满了次数的，记成查询次数上限
+        # 会让双盲复算、反方审稿说错原因（查满了照样能交结果）。上面金额被拒的收尾仍报循环里先撞上的那个
+        return outcome(limit="timeout_s" if timed_out else stopped, answered=answered, error=why)
     declared = list((resolved.get("properties") or {}) if _is_object(resolved) else {})
     if declared and not any(k in parsed for k in declared):
         # 一个要求的字段都没交：不是「查不到」，是没按结构交。不这么分，字段名对不上的回复会被当成什么都没查到
@@ -1050,6 +1081,13 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
     doc = None
     if isinstance(rationale, str) and rationale.strip():
         doc = compose_doc(rationale, build_catalog(nodes={}, ledger=ledger), node_id=owner, run_id=run_id or None)
+        if hits := _LEAD_IN_SEE.findall(rationale):
+            logger.warning("核查 agent 的理由里依据写在了引出语后面，渲染后引出语会悬空（运行 %s，节点 %s）：%s",
+                           run_id or "-", owner, "、".join(hits[:5]))
+        # 按渲染出来的判：只写了依据的、占位词后面挂着依据的，原文里有字，显示出来没有理由。结构里只有理由一项（审批
+        # 质询）时理由就是回答，「无」是一个回答
+        if _no_rationale(doc["markdown"], answer=declared == [RATIONALE]):
+            doc = None
     result[RATIONALE] = doc["markdown"] if doc else ""
     return outcome(result=result, cells=cells.cells, rationale=doc, limit=stopped, answered=answered)
 
@@ -1130,4 +1168,5 @@ async def _run_tool(tool: Any, name: str, args: dict[str, Any], call_id: str, re
     return content
 
 
-__all__ = ["LIMITS", "RATIONALE", "SETTLE_GRACE_S", "Default", "VerifyOutcome", "result_schema", "run_verify_agent"]
+__all__ = ["LIMITS", "RATIONALE", "SETTLE_GRACE_S", "SETTLE_TIMEOUT", "Default", "VerifyOutcome", "result_schema",
+           "run_verify_agent"]
