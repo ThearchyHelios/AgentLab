@@ -180,13 +180,14 @@ async def test_the_metric_chain_masks_the_renamed_column_too(client, monkeypatch
 
 
 async def test_an_input_taken_from_a_renamed_masked_column_is_withheld(client, monkeypatch, mall):
-    """cell() 取 tel 那一格：输入不给值、写明取自哪一列，代入式里那一处写「已遮罩」，指标本身的值也不给。"""
+    """cell() 取 tel 那一格：输入不给值、写明取自哪一列，代入式里那一处写「已遮罩」，指标本身的值也不给。报告撰写节点写作时
+    按同一个判断把它在目录里换成了「已遮罩」，报告上的字也是（tests/test_report_masked_metrics.py），按引用找片段。"""
     await set_source(mall, {"mask_columns": ["phone"]})
     row = await run_graph(monkeypatch)
-    body = await segment(client, row.id, text="13位")
+    body = await segment(client, row.id, ref="m:tel_len")
     metric = body["chain"][0]
     assert metric["step"] == "metric" and metric["substituted"] == "len(已遮罩)"
-    assert metric["value"] == "已遮罩" and metric["rendered"] == "13位"
+    assert metric["value"] == "已遮罩" and metric["rendered"] == "已遮罩" and metric["render_ok"] is True
     [cell] = steps(body, "input")
     assert cell["value"] == "已遮罩" and cell["masked"] == ["tel"] and cell["path"] == TEL_CELL
     assert body["redacted"]["columns"] == ["tel"] and leaks(body) == []
@@ -196,7 +197,7 @@ async def test_a_scalar_taken_by_position_from_a_renamed_masked_column_is_withhe
     """vars.res.rows[0][1]：没有定位，顺着取值链认出取自查询结果的 tel 列，tel 又是 phone 改的名字。"""
     await set_source(mall, {"mask_columns": ["phone"]})
     row = await run_graph(monkeypatch)
-    body = await segment(client, row.id, text="26位")
+    body = await segment(client, row.id, ref="m:tel_pos2")
     assert body["chain"][0]["substituted"] == "len(已遮罩) * 2" and body["chain"][0]["value"] == "已遮罩"
     [pos] = steps(body, "input")
     assert pos["path"] == TEL_POS and pos["value"] == "已遮罩" and pos["masked"] == ["tel"]

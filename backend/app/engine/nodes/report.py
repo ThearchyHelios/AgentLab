@@ -4,7 +4,9 @@
 数值回头猜——同值的指标一多就猜错，模型顺手写的数也要到出口才被发现。这里把核对
 挪到写的那一刻：
 
-1. 建目录：收齐上游口径卡的指标和运行输入，编成 [[m:gmv]]、[[i:week]] 这样的引用
+1. 建目录：收齐上游口径卡的指标和运行输入，编成 [[m:gmv]]、[[i:week]] 这样的引用。值取自遮罩格的指标（cell() 取的
+   遮罩格、取自改了名字的遮罩列、转抄上游口径卡里这类指标的；只按确定取自遮罩列的认，和单元格引用的自查同一个口径）
+   在目录里写「已遮罩」：写作目录、存进文档的证据目录都不写原值，引用了的照样交回重写（报告自查记 masked_cell）
 2. 流式写作：模型写标记，StreamRenderer 边收边换成真值，流里看到的就是最终的数字
 3. 核对：compose_doc 切块、分句、切片段，找出裸数字和解析不了的引用。模型把整篇包在一个 ```markdown 代码块
    里的，先去掉外层围栏（_unfenced）：不然整篇是一个代码块，一句结论都切不出来
@@ -60,6 +62,7 @@ from app.engine.evidence import (
     compose_doc,
     describe_violations,
     ledger_enabled,
+    withhold_metrics,
     writer_catalog,
 )
 from app.engine.nodes.llm import _invoke_streaming, _model_spec, _report_call
@@ -126,6 +129,11 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
     出口契约复核必须用这一个函数重建：参数（metrics_from、evidence_from、祖先范围）
     差一点，alias 集合就不一样——同一个指标 id 在两张卡里时，只收一张写 m:gmv，
     全收就得写 m:east.gmv——复核会把一份好好的报告判成引用解析不了。
+
+    值取自遮罩格、写成「已遮罩」的指标（evidence.withhold_metrics）按这个报告节点产出里记下的认（masked_metrics）：报告
+    节点写作之前按证据面板的判断认好（api/evidence.py 的 withheld_metrics，要查库、读快照，这里做不了），随产出记下；
+    出口契约复核拿同一份重建，正文里的「已遮罩」才对得上，不算文档被改过。报告节点写作时交进来的状态里没有它自己的产出
+    （run_report），拿到的是原样的目录。
     """
     ledger = [e for e in state.get("evidence") or [] if isinstance(e, dict)]
     sources = _setting(spec, node, "evidence_from", "ancestors")
@@ -146,7 +154,18 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
     if report_entities(spec, node) == "off":
         # 目录里没有表和字段，写作目录也就不列；compose / verify 另传 entities=False，解析不了的原因照实说
         catalog = {alias: e for alias, e in catalog.items() if e.get("kind") not in ENTITY_KINDS}
+    recorded = (state.get("nodes") or {}).get(node.id)
+    withheld = recorded.get("masked_metrics") if isinstance(recorded, dict) else None
+    if isinstance(withheld, list) and withheld:
+        catalog = withhold_metrics(catalog, [str(a) for a in withheld], _masked_word())
     return catalog
+
+
+def _masked_word() -> str:
+    """「已遮罩」：证据面板、推演同一个说法。api.evidence 导入了引擎里的模块，用到时再导入。"""
+    from app.api.evidence import MASKED
+
+    return MASKED
 
 
 def report_fields(state: GraphState, spec: GraphSpec, node: GraphNode) -> list[dict[str, Any]]:
@@ -321,7 +340,9 @@ class _RenderedStream:
 
 class _MaskedCells:
     """报告自查：写作者引用了取自遮罩列的格子（[[v:Q2.r0.tel]]），记一条违规 masked_cell，和没有出处的数字一样交回写作者
-    重写（evidence.masked_cells）。写作目录本身不遮（写作者要看得到数据），只拦引用。
+    重写（evidence.masked_cells）。写作目录里的查询结果本身不遮（写作者要看得到数据），只拦引用；口径卡指标不一样，值取自
+    遮罩格的在目录里就写成了「已遮罩」（文档的证据目录收着全部指标，原值写着就随文档出去了），引用它的组装文档时就记了
+    违规（evidence.masked_metrics），不在这里。
 
     哪几列算按 api/evidence.py 的 _cited_masks 认：列名就是遮罩列的，SQL 里给遮罩列起了别名、套了函数、经子查询或 WITH
     转一道的（_mask_sets 的 sure，和证据面板同一个函数）；合并查询按逐格来历和合并 SQL 认。遮罩按列名在整个数据源上
@@ -374,9 +395,18 @@ class _MaskedCells:
 
 
 def _masked_said(hits: list[dict[str, Any]]) -> str:
-    """报告引用了遮罩列的那几处在缺口、日志里怎么说：「引用了 2 处取自遮罩列的格子（「v:Q2.r0.tel」、…）」。只点名引用，
-    不写值。"""
-    return f"引用了 {len(hits)} 处取自遮罩列的格子（{_named(hits)}）"
+    """报告引用了遮罩列的那几处在缺口、日志里怎么说：「引用了 2 处取自遮罩列的格子（「v:Q2.r0.tel」、…）」，引用了值取自
+    遮罩格的指标的另说「指标」（违规上记着 metric）。只点名引用，不写值。"""
+    metrics = sum(1 for v in hits if v.get("metric"))
+    parts = [f"{n} 处取自遮罩列的{what}" for n, what in ((len(hits) - metrics, "格子"), (metrics, "指标")) if n]
+    return f"引用了 {'、'.join(parts)}（{_named(hits)}）"
+
+
+def _masked_targets(hits: list[dict[str, Any]]) -> str:
+    """去改写作指令时要去掉的是什么：引用了格子说「这些列」，引用了指标说「这些指标」，都有的两样都说。"""
+    metrics = any(v.get("metric") for v in hits)
+    cells = any(not v.get("metric") for v in hits)
+    return "这些列、指标" if metrics and cells else "这些指标" if metrics else "这些列"
 
 
 async def _run_class(run_id: str) -> str | None:
@@ -444,11 +474,12 @@ def _fatal(blocking: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _fail_advice(fatal: list[dict[str, Any]]) -> str:
     """判失败时给人看的下一步。引用了遮罩列的格子多半是写作指令点名要的（「联系电话 [[v:Q2.r0.tel]]」），换模型没用；
     改成「标注」照常产出，遮罩列的值就随报告出去了——这两条都不建议，只说去改写作指令。别的违规照旧建议换模型、先标注。"""
-    masked = sum(1 for v in fatal if v.get("code") == "masked_cell")
-    if masked == len(fatal):
-        return "数据源设置了遮罩的列不应写进报告，请在报告撰写节点的指令中去掉对这些列的引用"
-    if masked:
-        return "引用了遮罩列的那几处，请在报告撰写节点的指令中去掉对这些列的引用；其余几处可换用指令遵循能力更强的模型"
+    hits = [v for v in fatal if v.get("code") == "masked_cell"]
+    if hits and len(hits) == len(fatal):
+        return f"数据源设置了遮罩的列不应写进报告，请在报告撰写节点的指令中去掉对{_masked_targets(hits)}的引用"
+    if hits:
+        return (f"引用了遮罩列的那几处，请在报告撰写节点的指令中去掉对{_masked_targets(hits)}的引用；"
+                "其余几处可换用指令遵循能力更强的模型")
     return (f"请换用指令遵循能力更强的模型，或先将「{field_label('on_violation')}」设为"
             f"「{option_label('on_violation', 'flag')}」，查看标注后再调整")
 
@@ -595,8 +626,19 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         window = await model_window(session, _model_spec(ctx), model_id)
 
     spec = ctx.run.spec
-    catalog = report_catalog(state, spec, ctx.node)
-    # 报告引用了取自遮罩列的格子：自查记一条违规，和没有出处的数字一样交回写作者重写（_MaskedCells）
+    # 目录按上游的产出建：这个节点自己上一次的产出（循环里重跑时）不算，它记下的 masked_metrics 这一次重新认
+    upstream = {**state, "nodes": {k: v for k, v in (state.get("nodes") or {}).items() if k != ctx.node.id}}
+    catalog = report_catalog(upstream, spec, ctx.node)  # type: ignore[arg-type]
+    # 值取自遮罩格的指标（cell() 取的遮罩格、取自改了名字的遮罩列、转抄上游口径卡里这类指标的）：写作目录、存进文档的
+    # 证据目录里都写「已遮罩」。只按确定取自遮罩列的认，和单元格引用的自查同一个口径（api/evidence.py 的 withheld_metrics）：
+    # SQL 认不准时没确定取自遮罩列的普通金额照给，不然引用它的正式运行判失败、写作者也改不掉。记进产出，出口契约复核按
+    # 同一份重建目录
+    from app.api.evidence import withheld_metrics
+
+    withheld = await withheld_metrics(catalog, nodes=state.get("nodes") or {}, ledger=state.get("evidence") or [])
+    catalog = withhold_metrics(catalog, withheld, _masked_word())
+    # 报告引用了取自遮罩列的格子：自查记一条违规，和没有出处的数字一样交回写作者重写（_MaskedCells）；引用了上面那几个
+    # 指标的，组装文档时就记了（evidence.masked_metrics）
     masked = _MaskedCells(catalog)
     allow = report_allowance(spec, ctx.node)
     cells = True
@@ -704,7 +746,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         gaps.append(f"报告{_masked_said(hits)}，{tried}：数据源设置了遮罩的列不应写进报告")
         ctx.emit(EventType.LOG, level="warn", code="report_masked_cell", count=len(hits), refs=refs,
                  columns=list(dict.fromkeys(str(v["column"]) for v in hits if v.get("column"))),
-                 message=f"{gaps[0]}。报告照常产出，这几处已标注，已记为缺口。请在报告撰写节点的指令中去掉对这些列的引用")
+                 message=f"{gaps[0]}。报告照常产出，这几处已标注，已记为缺口。"
+                         f"请在报告撰写节点的指令中去掉对{_masked_targets(hits)}的引用")
     doc_artifact = await _store(doc, ctx)
     ctx.emit(EventType.REPORT_CHECKED, doc_artifact=doc_artifact, ok=not doc["violations"],
              stats=doc["stats"], violations=doc["violations"][:20], repairs=repairs,
@@ -735,6 +778,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         **({"judge": judgement} if judgement is not None else {}),
         # 出口契约照单收下的缺口（只在有的时候带这个键：别的报告产出和以前一字不差）
         **({"issuance_gaps": gaps} if gaps else {}),
+        # 写成「已遮罩」的指标：出口契约复核按它重建目录（report_catalog）。同上，只在有的时候带
+        **({"masked_metrics": withheld} if withheld else {}),
     }
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}, "usage": usage}
     if ctx.cfg("emit_message", True):

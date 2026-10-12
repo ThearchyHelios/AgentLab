@@ -13,9 +13,13 @@
 - 口径卡单位前后带空白（「元 」，服务端照原样接）：两边都只去首尾空白，原样导出照样通过；运行输入照旧无法核对，显示
   文字拿引用的值核对，只改显示文字的不通过；出处面板里数字文本照原文写；
 - 正文的排法：核对通过的字要原样显示——伪造的链接藏不起它（整句按原文显示），正文里不显示的判不通过；紧挨着补数字、
-  负号（长得像负号的横线也算，隔着不占位置的字也算），紧挨着显示成什么说不准的字（控制字符、组合符号这类），同一句里
-  有改变文字方向的字（方向控制字符、希伯来文和阿拉伯文这类从右往左书写的文字），判无法核对；区间、日期这类真报告里的
-  写法照常通过；列表缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数。
+  小数点、负号（只认真当负号用的半角、数学减号、全角三个，前面是字母数字的是编号的一部分；隔着不占位置的字也算）判不
+  通过：读者看到的是另一个数，以前只判无法核对，总览照样是绿的；后面接着量级单位（万、亿、%、k 这类，隔着空格也算）、
+  画着删除线或紧挨着画了删除线的字、紧挨着像负号的短横（连字符、上标负号这类）、长得像数字的字母和数字符号（l、I、O、
+  上标数字、圈码）、显示成什么说不准的字（控制字符、组合符号这类），同一句里有改变文字方向的字（方向控制字符、希伯来文
+  和阿拉伯文这类从右往左书写的文字），判无法核对；写作者自己写在引用旁边的普通文字（「统一」「——」「SKU-」「共…家」）、
+  区间、日期照常通过；列表缩进有上限、表格只排有格的列，伪造的缩进、列号挤不走核对过的数；
+- 总览：一项无法核对都没有才是绿色的通过，有的是中性的「可核对的项全部通过，另有 N 项无法核对」（overallOf）。
 
 数据全是虚构的。
 """
@@ -72,17 +76,25 @@ async function main() {
     return input.blocks.map((b) => (b.type === 'list' ? v.listItems(b.units).map((i) => i.depth)
       : v.tableCells(b.units).cols))
   }
+  // 只看正文的排法：文档里每个解析成功的数字、取值当作核对通过，交回各自的结果
+  if (input.task === 'layoutOf') return input.docs.map((d) => v.layoutOf(d))
   const digest = async (bytes) => createHash('sha256').update(bytes).digest('hex')
   const out = await v.verify(input.data, digest, input.seal)
   const results = (items) => items.map((i) => i.result)
   return {
     events: results(out.events), manifest: results(out.manifest), artifacts: results(out.artifacts),
     chain: results(out.chain), meta: results(out.meta),
+    // 工件、引用链每一项的种类、结果和原因；每份报告的文档核对上了没有
+    why: { artifacts: out.artifacts.map((i) => ({ kind: i.a.kind, result: i.result, reason: i.reason || '' })),
+      chain: out.chain.map((c) => ({ kind: c.kind, result: c.result, reason: c.reason || '' })) },
+    docs: out.docs.map((d) => ({ node: d.report.node_id, trusted: d.trusted })),
     // shownOk：显示文字核对过、对上了；truthText：出处面板「快照里的值」写的字（数字文本照原文）；onPage：正文里这处
     // 可点的数字上读的人看到的字（没有显示成可点的数字是 null）
     numbers: out.numbers.map((n) => ({ key: n.key, ref: n.seg.ref ?? null, text: String(n.seg.text ?? ''),
       result: n.result, reason: n.reason || '', expected: n.expected ?? null, shownOk: !!n.shownOk,
       truthText: n.truthText ?? null, onPage: n.onPage ?? null })),
+    // 总览：结果（pass 绿 / fail 红 / incomplete、partial 中性）和那一句
+    overall: v.overallOf(out),
   }
 }
 main().then((r) => process.stdout.write(JSON.stringify(r)), (e) => {
@@ -546,7 +558,7 @@ def test_inline_markup_cannot_hide_a_checked_value():
         assert hit["result"] == "pass" and hit["onPage"] == text, hit
 
 
-GLUED = "无法核对显示文字：紧挨着的正文里还有数字或负号，读起来和核对过的不是同一个值"
+GLUED = "正文里紧挨着这个数的字改变了读者看到的数：前后紧挨着的数字、负号或小数点会和它连成另一个数"
 BLURRED = "无法核对显示文字：紧挨着的正文里有看不见或在不同设备上显示不同的字，读起来可能和核对过的不是同一个值"
 TURNED = "无法核对显示文字：这一句里有从右往左书写的文字或改变文字方向的控制字符，显示出来的顺序可能和核对过的不一样"
 #: 经营月报第一段里的数字（第二段是 Q1 的取值）
@@ -602,24 +614,41 @@ def _split_pair(high: str, low: str):
     ("v:Q1.r0.gmv", _glue_after("s34", chr(0x2024) + "5")),  # 和句点长得一样的单点前导符
     ("m:conv_rate", _glue_before("s12", "-")),               # 前面加负号：-2.35%
     ("m:conv_rate", _glue_before("s12", chr(0xFF0D))),       # 全角负号
-    # 长得像负号的横线：连字符、不断行连字符、数字宽的横线、短破折号、长破折号、修饰字母负号、粗减号、小号长破折号、
-    # 数学减号、上标负号，和显示出来同样是一道横线的汉字「一」、假名长音、制表符横线、罗马盎司符号（码点在两个
-    # UTF-16 单元里）
-    *[("m:conv_rate", _glue_before("s12", chr(cp))) for cp in (
-        0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x02D7, 0x2796, 0xFE58, 0x2212, 0x207B, 0x4E00, 0x30FC, 0x2500,
-        0x10191)],
+    ("m:conv_rate", _glue_before("s12", chr(0x2212))),       # 数学减号
+    ("m:conv_rate", _glue_before("s12", "-" + chr(0x200B))),  # 隔着看不见的零宽空格
+    # 负号前面是汉字、括号：不是编号的一部分（「SKU-12」那种前面是字母数字的见下面照常通过的几条）
+    ("m:conv_rate", lambda doc: by_id(doc, "s12").update(text="转化率-")),
+    ("m:conv_rate", lambda doc: by_id(doc, "s12").update(text="转化率（-")),
     ("m:refund", _glue_before("s9", "-")),                   # 负数前面再加负号：--3,120.50元
     ("v:Q1.r0.paid_at", _glue_after("s45", "5")),            # 取值以数字结尾：2026-09-07 08:21:395
 ])
-def test_digits_glued_to_a_checked_value_cannot_pass(ref, change):
-    """伪造者在相邻的文字片段里补一位数、一个负号（隔着不占位置、显示成什么说不准的字，藏起来的粗体标记也算紧挨着；
-    长得像负号的横线也算负号）：显示出来的数不止核对过的这几位，这一项判无法核对、写明原因；别的照常通过。"""
+def test_digits_glued_to_a_checked_value_fail(ref, change):
+    """伪造者不动核对过的那段字，只在相邻的文字片段里补一位数、一个负号、一段小数（隔着不占位置、显示成什么说不准的字，
+    藏起来的粗体标记也算紧挨着），重算全部哈希：读者看到的是另一个数。这一项判不通过、点名正文里紧挨着的字改变了读者
+    看到的数——以前只判无法核对，总览照样写「可核对的项全部通过」。负号只认真当负号用的三个（半角、数学减号、全角），
+    前面是字母数字的是编号的一部分（见下面照常通过的几条）。显示文字本身照旧核对过（shownOk），别的照常通过。服务端组装
+    的文档不会这样排（两个数之间补空格），原样导出照样通过（见下面几条）。"""
     from tests.bundle_samples import formats_bundle
 
     got = verdicts(rewritten(formats_bundle(), change))
     hit = item(got, ref)
-    assert hit["result"] == "na" and hit["reason"] == GLUED and hit["shownOk"], hit
+    assert hit["result"] == "fail" and hit["reason"] == GLUED and hit["shownOk"], hit
     assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"] != ref)
+
+
+@pytest.mark.parametrize("ref, change", [
+    # 改变文字方向的字不能把不通过降成无法核对：伪造者紧挨着补一位数，再在同一句里放一个方向控制字符、一个希伯来字母
+    ("m:gmv", lambda doc: (by_id(doc, "s3").update(text=by_id(doc, "s3")["text"] + "1"),
+                           by_id(doc, "s5").update(text=chr(0x202E) + by_id(doc, "s5")["text"]))),
+    ("m:gmv", lambda doc: (by_id(doc, "s3").update(text=chr(0x05D0) + by_id(doc, "s3")["text"] + "1"))),
+    # 说不准的字同理：紧挨着的是一位数，中间隔着叠在上面的组合符号
+    ("m:gmv", _glue_before("s3", "1" + chr(0x0336))),
+])
+def test_other_doubts_do_not_soften_a_glued_digit(ref, change):
+    from tests.bundle_samples import formats_bundle
+
+    hit = item(verdicts(rewritten(formats_bundle(), change)), ref)
+    assert hit["result"] == "fail" and hit["reason"] == GLUED, hit
 
 
 @pytest.mark.parametrize("ref, change", [
@@ -643,13 +672,13 @@ def test_characters_that_may_show_as_anything_next_to_a_value_cannot_pass(ref, c
 
 
 def test_uncertain_characters_where_they_cannot_change_the_value_still_pass():
-    """说不准的字挨着的不是数字的头尾（销售额以「元」结尾，后面跟一个控制字符），表情后面的变体选择符，数字前面的波浪线，
-    都改不了读到的数：照常通过。"""
+    """说不准的字挨着的不是数字的头尾（销售额以「元」结尾，后面跟一个控制字符），数字前面的波浪线，表情和数字之间隔着空格，
+    都改不了读到的数：照常通过。表情紧挨着数字的见下面「不在常见写法里」的几条。"""
     from tests.bundle_samples import formats_bundle
 
     def change(doc: dict[str, Any]) -> None:
         by_id(doc, "s5")["text"] = chr(0x7F) + chr(0x0336) + by_id(doc, "s5")["text"]
-        by_id(doc, "s12")["text"] += chr(0x2705) + chr(0xFE0F)    # 转化率紧前面：对勾表情加上表情样式的变体选择符
+        by_id(doc, "s12")["text"] += chr(0x2705) + chr(0xFE0F) + " "  # 转化率前面：对勾表情、变体选择符，再隔一个空格
         by_id(doc, "s14")["text"] += chr(0x301C)                   # 环比紧前面：波浪线不是横线，不算负号
 
     got = verdicts(rewritten(formats_bundle(), change))
@@ -692,6 +721,226 @@ def test_ranges_dates_and_signs_written_by_the_system_still_pass():
     got = verdicts(formats_bundle(text=text))
     assert len(got["numbers"]) == 9
     assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), got["numbers"]
+
+
+UNSURE = "无法核对显示文字："
+DASHED = UNSURE + "前面紧挨着一道像负号的短横，读起来可能是负数"
+SCALED = UNSURE + "后面接着量级单位（万、亿、千、百、%、‰、k、M、B 这类）。系统显示这个数时不带它，读起来的数可能差了量级"
+STRUCK = UNSURE + "这个数画着删除线，或者紧挨着画了删除线的文字，读的人可能以为它已作废、以旁边的数为准"
+LOOKALIKE = UNSURE + "紧挨着长得像数字的字母或符号（l、I、O、上标数字、圈码这类），读起来可能多出一位"
+
+
+def _only(ref: str, change: Any, result: str, reason: str) -> dict[str, Any]:
+    """改过的经营月报里只有 ref 这一项是 result（原因 reason），别的照常通过；交回核对结果。"""
+    from tests.bundle_samples import formats_bundle
+
+    got = verdicts(rewritten(formats_bundle(), change))
+    hit = item(got, ref)
+    assert hit["result"] == result and hit["reason"] == reason and hit["shownOk"], hit
+    assert all(n["result"] == "pass" for n in got["numbers"] if n["ref"] != ref), \
+        [n for n in got["numbers"] if n["ref"] != ref and n["result"] != "pass"]
+    return got
+
+
+@pytest.mark.parametrize("cp", [0x2010, 0x2011, 0x2012, 0x02D7, 0x2796, 0x207B, 0x208B, 0xFE63, 0x058A])
+def test_a_short_dash_that_looks_like_a_minus_cannot_pass(cp):
+    """连字符、不断行连字符、数字宽的横线、修饰字母负号、粗减号、上下标负号、小号连字符减号、亚美尼亚连字符：平时不当负号
+    用，不判不通过；紧挨着数字开头、前面又不是字母数字时读起来像负数，判无法核对、原因说清。总览不是绿色的通过。"""
+    got = _only("m:conv_rate", _glue_before("s12", chr(cp)), "na", DASHED)
+    assert got["overall"]["result"] == "partial", got["overall"]
+
+
+@pytest.mark.parametrize("ref, change", [
+    ("v:Q1.r0.gmv", _glue_after("s34", "万")),                 # 45,678.5万：读作四亿多
+    ("v:Q1.r0.gmv", _glue_after("s34", " 万")),                # 中间隔着空格照样读作四亿多
+    ("v:Q1.r0.gmv", _glue_after("s34", "亿元")),
+    ("v:Q1.r0.gmv", _glue_after("s34", "%")),
+    ("v:Q1.r0.gmv", _glue_after("s34", "‰")),
+    ("v:Q1.r0.gmv", _glue_after("s34", chr(0xFF05))),          # 全角百分号
+    *[("v:Q1.r0.gmv", _glue_after("s34", c)) for c in ("k", "K", "M", "B", "千", "百", "萬", chr(0xFF2B))],
+    ("v:Q1.r0.gmv|万", _glue_after("s36", "亿")),              # 4.57万亿：核对过的字以「万」结尾，再接一个量级
+    ("v:Q1.r0.order_no", _glue_after("s43", "万")),            # 订单号后面接「万」
+    ("m:orders", _glue_after("s18", "")),                      # 对照组见下：以「单」结尾的不受影响
+])
+def test_a_magnitude_unit_after_a_checked_value_cannot_pass(ref, change):
+    """核对过的那段字不动，后面接上量级单位（万、亿、%、k 这类，隔着空格也算）：读者看到的数差了量级。系统显示一个数时
+    单位、万 / 亿换算都在核对过的那段字里，不会另接在后面，判无法核对、原因说清；总览不是绿色的通过。"""
+    if ref == "m:orders":
+        # 以「单」结尾的数后面接什么都不改变它的量级：照常通过
+        from tests.bundle_samples import formats_bundle
+
+        got = verdicts(rewritten(formats_bundle(), lambda doc: by_id(doc, "s18").update(text="万。")))
+        assert all(n["result"] == "pass" for n in got["numbers"]), got["numbers"]
+        return
+    got = _only(ref, change, "na", SCALED)
+    assert got["overall"]["result"] == "partial" and "另有 1 项无法核对" in got["overall"]["text"], got["overall"]
+
+
+@pytest.mark.parametrize("change", [
+    # 核对过的数整个画上删除线，旁边另写一个数（读的人以为它已作废）
+    lambda doc: (by_id(doc, "s3").update(text=by_id(doc, "s3")["text"] + "~~"),
+                 by_id(doc, "s5").update(text="~~ 84,613.65元" + by_id(doc, "s5")["text"])),
+    # 删除线只画在紧挨着它的字上
+    _glue_before("s3", "~~旧~~"),
+    _glue_after("s5", "~~作废~~"),
+])
+def test_a_struck_checked_value_cannot_pass(change):
+    """删除线画在核对过的数上，或者画在紧挨着它的字上：显示出来的字没变，读的人却可能以为它已作废、以旁边写的数为准，
+    判无法核对、原因说清。"""
+    ref = "m:gmv"
+    got = _only(ref, change, "na", STRUCK)
+    assert got["overall"]["result"] == "partial", got["overall"]
+
+
+@pytest.mark.parametrize("ref, change", [
+    ("m:gmv", _glue_before("s3", "l")),                       # 小写 L：读作 174,613.65元
+    ("m:gmv", _glue_before("s3", "I")),                       # 大写 i
+    ("m:gmv", _glue_before("s3", chr(0xFF29))),               # 全角大写 i
+    ("v:Q1.r0.gmv", _glue_after("s34", "O")),                 # 大写 o：读作 45,678.50
+    ("m:gmv", _glue_before("s3", chr(0xB9))),                 # 上标 1
+    ("m:gmv", _glue_before("s3", chr(0x2160))),               # 罗马数字 1
+    ("m:gmv", _glue_before("s3", chr(0x2460))),               # 圈码 1
+    ("v:Q1.r0.gmv", _glue_after("s34", chr(0x3007))),         # 汉字〇
+])
+def test_a_lookalike_digit_next_to_a_checked_value_cannot_pass(ref, change):
+    """紧挨着长得像数字的字母、数字符号（l、I、O、上标数字、罗马数字、圈码、汉字〇）：读起来可能多出一位，判无法核对、
+    原因说清。"""
+    got = _only(ref, change, "na", LOOKALIKE)
+    assert got["overall"]["result"] == "partial", got["overall"]
+
+
+ODD = UNSURE + "紧挨着这个数的字不在常见写法里，无法确认读者看到的数"
+
+
+@pytest.mark.parametrize("ref, change, reason", [
+    # 长得像 l、I、1 的字放在销售额前面（复核第 2 轮的伪造写法）：西里尔、希腊、拉丁的竖线字母，ASCII 竖线，汉字「丨」，
+    # 全角竖线、竖排的破折号、制表符的竖线
+    *[("m:gmv", _glue_before("s3", chr(cp)), LOOKALIKE)
+      for cp in (0x0406, 0x0399, 0x04C0, 0x01C0, 0x7C, 0x4E28, 0xFF5C, 0xFE31, 0x2502)],
+    # 长得像 O、0 的字接在流水后面：西里尔、希腊的 O，空心圆，小写 o
+    *[("v:Q1.r0.gmv", _glue_after("s34", chr(cp)), LOOKALIKE) for cp in (0x041E, 0x039F, 0x25CB, 0x6F)],
+    # 名单以外的字：数学粗体 l、谚文的 ㅣ、全角拉丁字母、日文假名、表情（带变体选择符）、零宽空格、各种窄空格和不断行空格，
+    # 当笔画用的汉字（丶、丿、亅），前面不是字母的句点（读起来像小数点）
+    *[("m:gmv", _glue_before("s3", text), ODD)
+      for text in (chr(0x1D425), chr(0x3163), chr(0xFF21), chr(0x3042), chr(0x2705) + chr(0xFE0F), chr(0x200B),
+                   "1" + chr(0x2006), "1" + chr(0x2009), "1" + chr(0x2008), "1" + chr(0x202F), chr(0xA0), "\t",
+                   chr(0x4E36), chr(0x4E3F), chr(0x4E85), ".")],
+    # 量级单位的易混字接在流水后面：西里尔、希腊的 M、K、B，开尔文符号，小号百分号，谚文的 ㅇ
+    *[("v:Q1.r0.gmv", _glue_after("s34", chr(cp)), ODD)
+      for cp in (0x041C, 0x039C, 0x212A, 0x041A, 0x0392, 0xFE6A, 0x3147)],
+    # 隔着各种空白、左括号再接量级单位：换行、制表、em / en / thin 空格、全角空格、不断行空格，「（万元）」「十万」「w」
+    *[("v:Q1.r0.gmv", _glue_after("s34", text), SCALED)
+      for text in ("\n万", "\t万", chr(0x2003) + "万", chr(0x2002) + "万", chr(0x2009) + "万", chr(0x3000) + "万",
+                   chr(0xA0) + "万", "\n亿元", "（万元）", " (万)", "十万", "w", "W")],
+    # 负号前面是别的文字系统里长得像标点的字母，不是 ASCII 字母数字：照旧是负号
+    *[("m:conv_rate", lambda doc, t=text: by_id(doc, "s12").update(text=t), result)
+      for text, result in (("转化率\ua78f-", GLUED), ("转化率\u01c0-", GLUED), ("转化率\ua78c-", GLUED),
+                           ("转化率\ua78f\u2212", GLUED), ("转化率\u0410-", GLUED), ("转化率\ua78f\u2010", DASHED))],
+    # 科学记数法：后面接 e 和数字
+    ("v:Q1.r0.gmv", _glue_after("s34", "e3"), GLUED),
+    ("v:Q1.r0.gmv", _glue_after("s34", "e+3"), GLUED),
+])
+def test_a_character_outside_the_common_writing_next_to_a_value_is_not_green(ref, change, reason):
+    """紧挨着核对过的数字头尾的那一个字改成白名单（COMMON）：汉字、中文标点、半角和全角空格、ASCII 字母（l、I、O、o 照旧算
+    像数字的字母）、常用的半角标点和算式符号、上一轮放行的破折号写法以外的，一律判无法核对、写明原因，总览不再是绿色的
+    「全部通过」。复核第 2 轮用这些写法伪造（只改相邻的普通文字、重算全部哈希），以前全是绿的、提示也不显示。负号前面只认
+    ASCII 字母数字是编号；后面接 e 和数字的读作科学记数法，判不通过。"""
+    result = "fail" if reason == GLUED else "na"
+    got = _only(ref, change, result, reason)
+    assert got["overall"]["result"] == ("fail" if result == "fail" else "partial"), got["overall"]
+
+
+#: 后面紧接着乘号、乘方再接数字（×10⁴、*10^4）
+TIMES = UNSURE + "后面紧接着乘号或乘方和数字（×10⁴、*10^4 这类），读起来的数可能差了量级"
+#: 偏旁、部首形的汉字（刂冫氵亻阝扌忄犭礻衤讠钅饣纟丬）：刂 显示成两道竖线，读起来像「11」
+RADICALS = "\u5202\u51ab\u6c35\u4ebb\u961d\u6274\u5fc4\u72ad\u793b\u8864\u8ba0\u9485\u9963\u7e9f\u4e2c"
+
+
+@pytest.mark.parametrize("ref, change, reason", [
+    # 弯撇号当千分位补一位数：1’74,613.65元 读作 174,613.65元（半角撇号本来就判无法核对）
+    ("m:gmv", _glue_before("s3", "1\u2019"), ODD),
+    ("m:gmv", _glue_before("s3", "1\u2018"), ODD),
+    ("v:Q1.r0.gmv", _glue_after("s34", "\u20195"), ODD),
+    # 偏旁形的汉字、康熙部首、部首补充、扩展 B 区里像竖线的字：前面补一个，读起来多出一两位
+    *[("m:gmv", _glue_before("s3", c), ODD) for c in RADICALS],
+    *[("m:gmv", _glue_before("s3", chr(cp)), ODD) for cp in (0x2F01, 0x2F11, 0x2E88, 0x2E89, 0x2010C, 0x200D1)],
+    ("v:Q1.r0.gmv", _glue_after("s34", "\u51ab"), ODD),
+    # 乘号、乘方再接数字：45,678.5×10⁴ 读作四亿多
+    *[("v:Q1.r0.gmv", _glue_after("s34", t), TIMES) for t in ("\u00d710\u2074", "*10^4", "^2", "\u00d710")],
+    # 英文的量级写法：紧接着或隔着空白、左括号
+    *[("v:Q1.r0.gmv", _glue_after("s34", t), SCALED)
+      for t in ("T", "G", "m", "b", "bn", "Bn", "mn", "tn", " billion", " Billion", " million", " thousand",
+                " trillion", "（bn）")],
+    # en dash 紧挨在数字前面：转化率–2.35% 读作负数（前面是数字的区间见下面照常通过的一条）
+    ("m:conv_rate", lambda doc: by_id(doc, "s12").update(text="转化率\u2013"), DASHED),
+    ("m:conv_rate", _glue_before("s12", "\u2013"), DASHED),
+])
+def test_lookalikes_named_by_the_third_review_are_not_green(ref, change, reason):
+    """复核第 3 轮点名的几类：弯撇号（U+2018、U+2019）紧挨着数字、偏旁形的汉字（刂、冫、氵这类，康熙部首、部首补充两个区块，
+    扩展 B 区里像竖线的字）、后面紧接着乘号或乘方再接数字、后面接着英文的量级写法（T、G、bn、m、b、billion、million、
+    thousand 这类，隔着空白也算）、en dash 紧挨在数字前面。只改相邻的普通文字、重算全部哈希，以前都是绿色的「全部通过」、
+    提示也不显示；现在判无法核对、写明原因，总览中性。"""
+    got = _only(ref, change, "na", reason)
+    assert got["overall"]["result"] == "partial", got["overall"]
+
+
+def test_soft_breaks_currency_signs_formulas_and_ranges_still_pass():
+    """常见的正常写法照常通过、总览全绿：段内软换行紧挨着数字（页面上显示成一个空格）、数字前面的「￥」「¥」、两个核对过的数
+    相乘（乘号后面紧跟的是另一个核对过的数）、en dash 连着的区间（前面是数）、数字后面跟着 ms、GB 这类不是量级的单位。"""
+    from tests.bundle_samples import formats_bundle
+
+    text = ("## 写法\n\n本月销售额\n[[m:gmv]]，客单价 \uffe5[[m:avg]]，取整 \u00a5[[m:avg|int]]，"
+            "流水乘订单号 [[v:Q1.r0.gmv]]\u00d7[[v:Q1.r0.order_no]]、[[v:Q1.r0.gmv]]*[[v:Q1.r0.order_no]]，"
+            "订单 [[m:orders]]，区间 [[v:Q1.r1.gmv]]\u2013[[v:Q1.r0.gmv]]，耗时 [[v:Q1.r0.gmv]] ms、"
+            "容量 [[v:Q1.r0.gmv]]GB。")
+    got = verdicts(formats_bundle(text=text))
+    assert len(got["numbers"]) == 12, got["numbers"]
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), \
+        [n for n in got["numbers"] if n["result"] != "pass"]
+    assert got["overall"]["result"] == "pass", got["overall"]
+
+
+def test_common_punctuation_next_to_checked_values_still_passes():
+    """常见的写法照常通过：等号、半角括号和冒号、加号、斜杠、百分比前面的加号、半角逗号和句点结句、约等号和乘号、编号后面的
+    句点（NO.）、全角的冒号括号顿号。"""
+    from tests.bundle_samples import formats_bundle
+
+    text = ("## 算式\n\n客单价=[[m:avg]]，销售额:[[m:gmv]]，转化率(+[[m:conv_rate]])，订单 [[v:Q1.r0.order_no]], 另计。"
+            "流水约≈[[v:Q1.r0.gmv]]/月，退款×[[m:refund]]，编号No.[[m:orders]]，出口额：[[m:export]]、"
+            "年度（[[m:annual|亿]]）。合计 [[v:Q1.r1.gmv]].")
+    got = verdicts(formats_bundle(text=text))
+    assert len(got["numbers"]) == 10, got["numbers"]
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), \
+        [n for n in got["numbers"] if n["result"] != "pass"]
+    assert got["overall"]["result"] == "pass", got["overall"]
+
+
+def test_ordinary_writing_next_to_checked_values_still_passes_as_exported():
+    """正文里的普通写法照常通过，原样导出总览全绿：「统一」后面紧跟数（汉字「一」不是负号）、破折号（——、—、―，小号的）
+    后面紧跟数、段内软换行紧挨着数、金额前面的「￥」「¥」、编号「SKU-」「A-」后面紧跟数（连字符前面是字母，是编号的一部分）、
+    「共…家」、全角括号、区间、「NO.」后面跟数、数后面跟「元」「单」这类单位以外的字、假名长音和制表符横线、粗体和斜体包着
+    的数。"""
+    from tests.bundle_samples import PROSE, formats_bundle
+
+    got = verdicts(formats_bundle(text=PROSE))
+    assert len(got["numbers"]) == 17, got["numbers"]
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), \
+        [n for n in got["numbers"] if n["result"] != "pass"]
+    assert got["overall"] == {"result": "pass", "text": "全部通过", "pass": got["overall"]["pass"], "fail": 0, "na": 0}
+
+
+def test_the_overview_is_green_only_without_anything_unverifiable():
+    """总览：原样导出、一项无法核对都没有的是绿色的「全部通过」；有一项无法核对就是中性的「可核对的项全部通过，另有
+    N 项无法核对」（以前照样是绿的）；有不通过的是红的。"""
+    from tests.bundle_samples import formats_bundle
+
+    assert verdicts(formats_bundle())["overall"]["result"] == "pass"
+    got = verdicts(rewritten(formats_bundle(), lambda doc: by_id(doc, "s5").update(
+        text=chr(0x202E) + by_id(doc, "s5")["text"])))
+    assert got["overall"]["result"] == "partial" and got["overall"]["fail"] == 0, got["overall"]
+    assert got["overall"]["text"] == f"可核对的项全部通过，另有 {got['overall']['na']} 项无法核对", got["overall"]
+    got = verdicts(rewritten(formats_bundle(), _glue_before("s3", "1")))
+    assert got["overall"]["result"] == "fail" and got["overall"]["text"] == "有 1 项不通过", got["overall"]
 
 
 NOT_SHOWN = "正文里没有显示这一处：导出时不会出现这种情况，文件可能被改过"

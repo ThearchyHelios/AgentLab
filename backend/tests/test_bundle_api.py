@@ -268,11 +268,22 @@ async def test_a_mask_set_after_the_run_still_applies(client, monkeypatch):
     assert all("b64" in a for a in before["artifacts"])
     assert shown(before) == {"fetch": True, "members": True, "out": True, "finished": True}
 
-    await set_masks("bundle_shop", ["amount"])
+    # 门店名事后设了遮罩：报告引用的那份流水快照（选出了门店名）只给 id，查询事件、成果、运行结束事件只给哈希
+    await set_masks("bundle_shop", ["store"])
     after = data_of((await client.get(f"/api/runs/{row.id}/bundle.html")).text)
     assert next(a for a in after["artifacts"] if a["id"] == shop) == {
         "id": shop, "kind": "query", "node_id": "fetch", "masked": True}
     assert shown(after) == {"fetch": False, "members": True, "out": False, "finished": False}
+    assert "b64" in next(a for a in after["artifacts"] if a["kind"] == "report_doc")
+
+    # 金额事后设了遮罩：口径卡的销售额就是流水第一行的金额（cell(nodes.fetch, 0, 'amount')），写作时还没遮，报告文档的
+    # 证据目录里写着原值——和事后设的遮罩同样生效，整份文档只给哈希，正文的节点完成事件也只给哈希
+    await set_masks("bundle_shop", ["amount"])
+    late = data_of((await client.get(f"/api/runs/{row.id}/bundle.html")).text)
+    [doc] = [a for a in late["artifacts"] if a["kind"] == "report_doc"]
+    assert doc == {"id": doc["id"], "kind": "report_doc", "node_id": "write", "masked": True}, doc
+    write = next(e for e in late["events"] if e["type"] == "node.finished" and e["node_id"] == "write")
+    assert "canonical" not in write
 
 
 async def test_report_text_cannot_close_the_data_block(client, monkeypatch):

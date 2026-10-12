@@ -256,14 +256,16 @@ async def test_the_whatif_answer_carries_no_masked_value(client, monkeypatch, me
 
 
 async def test_the_evidence_panel_withholds_the_metric_value_by_the_same_rule(client, monkeypatch, members):
-    """证据面板的指标步骤：用到遮罩列的指标 value 写「已遮罩」，报告上的字照旧；没用到的照给。"""
+    """证据面板的指标步骤：用到遮罩列的指标 value 写「已遮罩」；报告撰写节点写作时按同一个判断把它在目录里换成了「已遮罩」，
+    报告上的字也是「已遮罩」（tests/test_report_masked_metrics.py），渲染一致。没用到的照给。"""
     row = await run_graph(monkeypatch)
     [report] = (await client.get(f"/api/runs/{row.id}/evidence")).json()["reports"]
     doc = artifact_store.load(report["doc_artifact"])
-    by_text = {s["text"]: s["id"] for s in iter_segments(doc) if s.get("ref")}
-    body = (await client.get(f"/api/runs/{row.id}/evidence/segments/{by_text['11位']}")).json()
+    by_ref = {s["ref"]: s["id"] for s in iter_segments(doc) if s.get("ref")}
+    body = (await client.get(f"/api/runs/{row.id}/evidence/segments/{by_ref['m:phone_pos_len']}")).json()
     metric = body["chain"][0]
-    assert (metric["step"], metric["value"], metric["rendered"]) == ("metric", "已遮罩", "11位")
+    assert (metric["step"], metric["value"], metric["rendered"], metric["render_ok"]) == \
+        ("metric", "已遮罩", "已遮罩", True), metric
     assert leaks(json.dumps(body, ensure_ascii=False)) == []
-    plain = (await client.get(f"/api/runs/{row.id}/evidence/segments/{by_text['1']}")).json()
+    plain = (await client.get(f"/api/runs/{row.id}/evidence/segments/{by_ref['m:id0']}")).json()
     assert plain["chain"][0]["value"] == 1

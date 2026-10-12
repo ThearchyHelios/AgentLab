@@ -6,20 +6,37 @@
   sha256(canonical_json(data))，和 runner 封存时算 manifest_hash 用的是同一个算法，浏览器按同样的拼法重算
   清单哈希、和封存哈希比。白名单里的事件另带服务端算好的规范字符串 canonical（逐字等于 canonical_json(data)），
   浏览器先核它的哈希，再从里面读出报告文档、口径卡、查询快照的 id。其余事件只给哈希：工具返回、节点产出的
-  预览里可能有遮罩列的原值和提示词。
+  预览里可能有遮罩列的原值和提示词。口径卡、报告的节点完成事件在白名单里，可它们的预览就是卡上每个指标的值、报告正文：
+  卡只给 id 的（和报告引不引用无关）、文档只给 id 的，这两条也只给哈希（_card_shown）。
 - 工件：每份报告文档（各报告节点最后一次自查记下的 doc_artifact）、它引用到的口径卡和查询快照，按原字节
   base64 嵌入，浏览器重算 sha256 和 id 比。数据源设了遮罩的查询快照，能证明这条查询没碰遮罩列的（_untouched）照常
   嵌入，别的不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，有输入取自遮罩列（cell() 的格、Agent 字段、按位置
   取的 vars.res.rows[0][2]，SQL 里改了名字的遮罩列也算，SQL 认不出结果里哪一列取自哪一列的整份快照的列都算）的整张卡
-  同样只给 id，认法和证据面板、推演同一个（recompute.input_origin）；服务端文件被改过的卡照样按卡上记的输入认，解析
-  不出一张卡的整张只给 id。只给 id 的工件，服务端的文件和 id 对不上的另标 mismatch、解析不出来的另标 unparsable，
-  核对页照实说（对不上的判不通过）。没被报告引用的工件不嵌。
+  同样只给 id，认法和证据面板、推演同一个（recompute.input_origin）；有指标的值不给的（metric_word：值取自遮罩列的
+  一格、一行，整行、下标不是字面量的、转抄的上游口径卡在任何一次执行里有这类指标的也算，转抄的在指标依赖图上一次认，
+  recompute.masked_closure；遮罩列按这份文件宁可多遮的认法）、卡上记着的转抄来的值带遮罩的（_copies_masked）也一样；服务端
+  文件被改过的卡照样按卡上记的输入认，解析不出一张卡的整张只给 id。报告文档的证据目录收着上游口径卡的全部指标，现在的
+  报告撰写节点把值不给的写成「已遮罩」；还写着原值的老文档（升级前生成的，或者生成之后数据源才设的遮罩）整份只给 id、
+  不附带它引用的工件——哪些指标的值不给和写作目录同一个判断（metric_word 的 sure：只按确定取自遮罩列的认，由调用方按
+  证据面板的那一套认好交进来，api/evidence.py 的 certain_masks），SQL 认不准时没确定取自遮罩列的普通金额照常附带。
+  文档里写成「已遮罩」的指标所在的口径卡一律只给 id。只给 id 的工件，服务端的文件和 id 对不上的另标 mismatch、解析
+  不出来的另标 unparsable，核对页照实说（对不上的判不通过）。没被报告引用的工件不嵌。
 - 封存之后追加的事件（按需裁判、审批质询这类批注）单列：类型、序号、内容摘要，不进清单。
 
 它只证明「内部一致」：数字、文档、运行记录彼此对得上，而且没被改过。真伪要拿页面上的封存哈希和系统里这次
 运行的封存核对（GET /api/runs/{id}/verify）对照，页面上醒目地写着这一点。
 
-主体是纯函数：不碰数据库，工件经 read 取原字节，数据源现在设的遮罩由调用方查好传进来（source_masks）。
+已知局限，同样以服务端封存的清单哈希为准：
+- 遮罩只减少暴露、不是安全边界。哪些列取自遮罩列按 SQL 和列名认，写法的长尾认不全（先给遮罩列起别名、外层再套没起别名的
+  表达式，+phone 这类认法本身漏掉的表达式，Postgres 给没起别名的表达式起的列名，视图、别的表里换了名字存着的遮罩列，
+  自己建的函数，数据整形取出来再赋给变量的号码）：取自它们的指标、快照在这份文件里照常附带，和证据面板、写作目录认法一致。
+  转抄上游口径卡的按整张卡认（转抄的那张卡在任何一次执行里有一个指标不给，转抄出来的就不给），宁可多挡
+- 显示文字的核对（verifier.js 的 checkLayout）只看紧挨着数字头尾的字：白名单、易混字的名单只是兜底，排版和易混字的花样
+  数不完（「（单位：万元）」这类隔着几个字的说明、x10 这类写法认不出）。核对页总览有一项无法核对就不是绿的，并写明去系统里
+  核对封存；全部通过也只说明文件内部一致
+
+主体是纯函数：不碰数据库，工件经 read 取原字节，数据源现在设的遮罩由调用方查好传进来（source_masks），每份查询快照
+里确定取自遮罩列的列、这次运行查到过的遮罩值也一样（sure_columns、sure_secrets）。
 """
 from __future__ import annotations
 
@@ -41,7 +58,15 @@ from app.core.events import EventType
 from app.engine.evidence import iter_units, query_entry_fields
 from app.engine.masking import OPAQUE_SQL, SYSTEM_SCHEMAS, indirect_reads
 from app.engine.merge_query import MERGE_SOURCE
-from app.engine.recompute import input_origin
+from app.engine.recompute import (
+    CopyEdge,
+    Judged,
+    MetricLinks,
+    card_input,
+    carries_masked,
+    input_origin,
+    masked_closure,
+)
 from app.engine.schema import NodeType
 from app.engine.toolcalls import QUERY_PREFIX
 
@@ -53,8 +78,8 @@ SCHEMA = "agentlab.bundle/1"
 #: 口径卡升版处置、出具判定（档位）
 _SHOWN_EVENTS = frozenset({EventType.RUN_STARTED, EventType.REPORT_CHECKED, EventType.CALIBER_UPGRADE,
                            EventType.ISSUANCE})
-#: node.finished 带规范字符串的节点：报告（预览就是嵌进来的那份文档的正文）、口径卡（指标集的 id 记在台账里）
-_SHOWN_NODES = frozenset({NodeType.REPORT, NodeType.METRICS})
+#: node.finished 带规范字符串的节点：报告（预览就是嵌进来的那份文档的正文，文档只给哈希的不带）、口径卡（指标集的 id
+#: 记在台账里；卡上有值不给的指标、有输入取自遮罩列的不带，见 _card_shown）。成果节点在运行里没有带遮罩的快照时带
 #: 目录条目的种类 → 嵌进来的工件种类。运行输入、检索、表和字段的条目不嵌：前者没有工件，后几样不在核对范围里
 _CITED_KINDS = {"metric": "metric_set", "query": "query"}
 
@@ -77,18 +102,31 @@ Reader = Callable[[str], "bytes | None"]
 
 class _Store:
     """这一次构建里读过的工件：原字节、解析出来的内容、查询快照带不带遮罩。每份只读一次盘。events 是封存范围内的
-    事件（认这次运行里查到过哪些遮罩值，seen）。"""
+    事件（认这次运行里查到过哪些遮罩值，seen）。
+
+    sure_columns、sure_secrets 由调用方按证据面板的那一套认好交进来（api/evidence.py 的 certain_masks）：每份查询快照里
+    确定取自遮罩列的结果列，和这次运行查到过的遮罩值（只收确定的那几列）。认老文档时指标的值给不给按它们认（metric_word
+    的 sure），和报告撰写节点的写作目录同一个口径；没交的（直接调用 build_bundle 的地方）按这份文件自己宁可多遮的认法。"""
 
     def __init__(self, read: Reader, source_masks: Mapping[str, Any],
-                 events: Sequence[tuple[int, str, str | None, Any]] = ()) -> None:
+                 events: Sequence[tuple[int, str, str | None, Any]] = (), *,
+                 sure_columns: Mapping[str, Iterable[str]] | None = None, sure_secrets: Any = None) -> None:
         self._read = read
         self._source_masks = source_masks
         self._events = events
+        self._sure_columns = sure_columns
+        self._sure_secrets = sure_secrets
         self._raw: dict[str, bytes | None] = {}
         self._json: dict[str, Any] = {}
         self._masked: dict[str, bool] = {}
         self._hidden: dict[str, set[str]] = {}
         self._seen: Any = None
+        self._graphs: dict[bool, _Graph] = {}
+        self._card_outputs: dict[str, dict[str, str]] = {}
+        self._docs: dict[str, bool] = {}
+        self._sources: dict[str, str] | None = None
+        self._runs: dict[str, list[str]] | None = None
+        self._owners: dict[str, str] = {}
 
     def raw(self, artifact: str) -> bytes | None:
         if artifact not in self._raw:
@@ -133,6 +171,17 @@ class _Store:
             self._hidden[artifact] = _derived_columns(content, base) if base else set()
         return self._hidden[artifact]
 
+    def sure(self, artifact: str) -> set[str]:
+        """一份读得出来的查询快照里确定取自遮罩列的列（小写），调用方交进来的（sure_columns，和报告撰写节点的写作目录同一个
+        口径）。没交、或者这份不在里面的，按 hidden 宁可多遮：认不准就当它取自遮罩列。"""
+        found = self._sure_columns.get(artifact) if self._sure_columns is not None else None
+        return {str(c).lower() for c in found} if found is not None else self.hidden(artifact)
+
+    def sure_seen(self) -> Any:
+        """这次运行查到过的遮罩值，只收确定取自遮罩列的那几列（调用方交进来的 sure_secrets，同证据面板的 run_secrets）。
+        没交 sure_columns 的按 seen。"""
+        return self._sure_secrets if self._sure_columns is not None else self.seen()
+
     def seen(self) -> Any:
         """这次运行里查到过的遮罩值（inquiry._Secrets，只用按值认得出的写法：够长的数、两个字以上的文字）：封存范围内
         每份查询快照里值取自遮罩列的那几列（hidden）的格子。模型拿在遮罩查询里看到的号码去查别的表时，SQL 里没写遮罩列，
@@ -170,16 +219,210 @@ class _Store:
             if not isinstance(card, dict):
                 self._masked[key] = self.raw(artifact) is not None
                 return self._masked[key]
-            outputs = _card_outputs(events, artifact)
-
-            def output(node_id: Any) -> Any:
-                found = outputs.get(str(node_id or ""))
-                return self.content(found) if found and self.intact(found) else None
-
-            items = [item for metric in card.get("metrics") or [] if isinstance(metric, dict)
-                     for item in metric.get("inputs") or [] if isinstance(item, dict)]
-            self._masked[key] = any(self._input_masked(item, output) for item in items)
+            output = self._outputs_of(artifact, events)
+            metrics = [metric for metric in card.get("metrics") or [] if isinstance(metric, dict)]
+            items = [item for metric in metrics for item in metric.get("inputs") or [] if isinstance(item, dict)]
+            # 另按指标认：值不给的指标（metric_word，遮罩列宁可多遮的那一套）——按位置取的整行、下标不是字面量的一格，整份
+            # 结果里带着遮罩列、值里就是号码的，转抄上游口径卡里这类指标的，上面只认字面量下标一格的那一套认不出，卡上记着的
+            # 值照样是号码。转抄来的输入另看一遍（_copies_masked）：卡上记着转抄来的值本身，指标的值照给时它也可能是号码
+            self._masked[key] = any(self._input_masked(item, output) for item in items) \
+                or any(self.metric_word(artifact, metric, events) is not None or self._copies_masked(artifact, metric)
+                       for metric in metrics)
         return self._masked[key]
+
+    def _copies_masked(self, card: str, metric: dict[str, Any]) -> bool:
+        """卡上这个指标转抄来的输入带不带遮罩（metric_word 认过之后才看得到）：转抄的那张卡有指标不给（哪种写法都一样，
+        recompute.CopyEdge.card）、读到的上游指标核对不了，卡上记着的就是转抄来的值（嵌在下标里、指标的值照给时也一样）；
+        整张卡、清单文字转抄、读到的产出里有指标核对不了的（table_unverified），记着的值（清单文字逐条写着「指标（名称）
+        = 值」）里有这次运行查到过的遮罩值才算，记成「[3 项]」这种大概的不算。"""
+        judged = self._graph(False).judged.get(_metric_key(card, metric, self.content(card)))
+        if judged is None:
+            return False
+        values = {str(i.get("path")): i.get("value") for i in metric.get("inputs") or [] if isinstance(i, dict)}
+        for path, (kind, _, _) in judged.copied.items():
+            if kind in ("masked", "unverified"):
+                return True
+            if kind is not None and carries_masked(values.get(path), self.seen()):
+                return True
+        return False
+
+    def metric_word(self, card: str, metric: dict[str, Any], events: Sequence[tuple[int, str, str | None, Any]], *,
+                    sure: bool = False) -> str | None:
+        """口径卡 card 上一个指标的值给不给：None 照给；"masked" 不给（值取自遮罩列的一格、一行，或者整份结果里带着遮罩列、
+        值里就有这次运行查到过的遮罩值）；"unverified" 遮没遮核对不了。和证据面板指标步骤的值同一个判断（api/evidence.py
+        的 _metric_masks，by_value=False：输入的出处按 recompute.input_origin 的 wide 认，转抄上游口径卡的按那张卡在依赖图上
+        认，recompute.masked_closure，最后交给 recompute.withheld_value）。只按出处认：认不出出处的输入（写死的
+        目标、数据整形算出来的数）值碰巧等于遮罩列里的某一格，不因此算——不然普通报告里的这种指标在文件里也核对不了，
+        老文档也整份只给哈希。
+
+        遮罩列两种认法：
+        - 默认（认口径卡能不能随文件附带，card_masked）：按这份文件自己的认法宁可多遮（hidden：SQL 认不准时整份的列都算；
+          快照读不出来、和 id 对不上的，按它的数据源现在设的遮罩），遮罩值用 seen。卡上记着输入的值，附带了就带出去了
+        - sure（认老文档，doc_withheld）：只按确定取自遮罩列的认（sure，调用方按写作目录的口径认好交进来），遮罩值用
+          sure_seen。和报告撰写节点写作时认的一样：现在的报告撰写节点照给的普通指标，老文档里写着它也照常附带
+
+        依赖图按 (指标集工件, 指标在卡上的位置) 认指标，两种认法各一张、构建里认过的记下来：卡转抄卡、循环里每一次执行都
+        转抄上一次的产出时，每个指标只认一次，和追了几层无关。转抄的保守规则按整张卡认（recompute.CopyEdge.card）：转抄的
+        那张卡在封存范围内的任何一次执行里有一个指标不给，转抄出来的就不给，同写作目录。"""
+        key = _metric_key(card, metric, self.content(card))
+        graph = self._graph(sure)
+        if key not in graph.judged:
+            fresh = self._build(graph, key, card, metric, events, sure)
+            graph.judged.update(masked_closure({k: graph.links[k] for k in fresh}, graph.judged,
+                                               self.sure_seen if sure else self.seen))
+        return graph.judged[key].word
+
+    def _graph(self, sure: bool) -> "_Graph":
+        if sure not in self._graphs:
+            self._graphs[sure] = _Graph()
+        return self._graphs[sure]
+
+    def _build(self, graph: "_Graph", key: Any, card: str, metric: dict[str, Any],
+               events: Sequence[tuple[int, str, str | None, Any]], sure: bool) -> list[Any]:
+        """认好 key 和顺着转抄的边够得着、还没认过的指标（转抄以外的输入），交回这一批新认的键，同 api/evidence.py 的
+        _CopyGraph._build。转抄一张卡时它在封存范围内每一次执行的每个指标都放进来（_executions）；上游的指标按上游那张卡
+        那一次执行之前的产出认（_card_outputs）；卡上没记输入的指标不放。"""
+        fresh: list[Any] = []
+        todo = [(key, card, metric, self._owner(card))]
+        while todo:
+            key, art, item_metric, owner = todo.pop()
+            if key in graph.links:
+                continue
+            output = self._outputs_of(art, events)
+            links = MetricLinks(item_metric, card=owner)
+            for item in item_metric.get("inputs") or []:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path"))
+                copied = card_input(item, output)
+                if copied is not None:
+                    upstream: list[Any] = []
+                    # 转抄的是哪张卡：按读到的产出上记着的指标集认（经数据整形赋给变量的也认得出），认不出的按取值链上的节点
+                    owner = copied.node_id
+                    if copied.card is not None:
+                        up_card = str(copied.card.get("artifact") or "")
+                        owner = self._owner(up_card) or copied.node_id
+                        for index in copied.picked:
+                            up_metric = copied.card["metrics"][index]
+                            if isinstance(up_metric, dict) and up_metric.get("inputs"):
+                                up = (up_card or ("node", copied.node_id, id(copied.card)), index)
+                                upstream.append(up)
+                                todo.append((up, up_card, up_metric, owner))
+                    for run_art in self._executions(owner):
+                        content = self.content(run_art)
+                        metrics = content.get("metrics") if isinstance(content, dict) else None
+                        for index, up_metric in enumerate(metrics if isinstance(metrics, list) else []):
+                            if isinstance(up_metric, dict) and up_metric.get("inputs"):
+                                todo.append(((run_art, index), run_art, up_metric, owner))
+                    links.copies.append(CopyEdge(path, tuple(upstream), copied.whole, copied.unreadable, card=owner))
+                    continue
+                kind = self._input_kind(item, output, sure=sure)
+                if kind is not None:
+                    links.direct[path] = (kind, ())
+            graph.links[key] = links
+            fresh.append(key)
+        return fresh
+
+    def _executions(self, node_id: str) -> list[str]:
+        """口径卡 node_id 在封存范围内每一次执行的指标集工件（node.finished 台账里的 metric_set 条目），按先后。转抄的保守
+        规则按整张卡、每一次执行认（recompute.CopyEdge.card）。按解析出来的内容认、不看哈希（同 card_masked）：被改过的文件
+        只会多认出不给的指标；读到的那一次产出读不出来另有 CardInput.unreadable 兜着。"""
+        self._index_runs()
+        return (self._runs or {}).get(str(node_id or ""), [])
+
+    def _owner(self, card: str) -> str | None:
+        """指标集工件 card 是哪张口径卡（节点 id）的产出，按封存范围内的台账认；认不出的是 None。"""
+        self._index_runs()
+        return self._owners.get(card)
+
+    def _index_runs(self) -> None:
+        if self._runs is not None:
+            return
+        runs: dict[str, list[str]] = {}
+        for _, etype, node_id, data in self._events:
+            if etype != EventType.NODE_FINISHED or not node_id or not isinstance(data, dict):
+                continue
+            for entry in data.get("evidence") or []:
+                if isinstance(entry, dict) and entry.get("kind") == "metric_set" \
+                        and isinstance(entry.get("artifact"), str) and entry["artifact"]:
+                    runs.setdefault(str(node_id), []).append(entry["artifact"])
+                    self._owners.setdefault(entry["artifact"], str(node_id))
+        self._runs = {node_id: list(dict.fromkeys(found)) for node_id, found in runs.items()}
+
+    def _outputs_of(self, card: str, events: Sequence[tuple[int, str, str | None, Any]]) -> Callable[[Any], Any]:
+        """口径卡 card 那一次执行之前每个节点的产出（_card_outputs）：节点 id → 读出来的内容，读不出来、和 id 对不上的是
+        None。同一张卡只找一次。"""
+        if card not in self._card_outputs:
+            self._card_outputs[card] = _card_outputs(events, card)
+        outputs = self._card_outputs[card]
+
+        def output(node_id: Any) -> Any:
+            found = outputs.get(str(node_id or ""))
+            return self.content(found) if found and self.intact(found) else None
+
+        return output
+
+    def _input_kind(self, item: dict[str, Any], output: Callable[[Any], Any], *, sure: bool = False) -> str | None:
+        """一个输入（转抄上游口径卡的除外）不给值的原因，同 api/evidence.py 的 _InputMasks.check：取自遮罩列的一格、一行是
+        "masked"，整份结果是 "table"（它不一定把哪一格带进指标，指标的值另按值认），遮没遮核对不了的是 "unverified"
+        （取值链上的产出读不出来、快照读不出来、结果没存快照只带着数据源名），给值的、认不出出处的（常量、运行输入、数据
+        整形算出来的一格）是 None。"""
+        origin = input_origin(item, output, wide=True)
+        if origin is None:
+            return None
+        if origin.unverified is not None:
+            return "unverified"
+        used = list(dict.fromkeys(origin.columns))
+        if not used:
+            return None
+        readable = bool(origin.artifact) and self.intact(str(origin.artifact)) \
+            and isinstance(self.content(str(origin.artifact)), dict)
+        if readable:
+            hidden = self.sure(str(origin.artifact)) if sure else self.hidden(str(origin.artifact))
+        else:
+            # 读不出来、和 id 对不上的快照：查询当时记下的遮罩在快照里，只能按它的数据源现在设的认
+            source = origin.source or (self.query_source(origin.artifact) if origin.artifact else None)
+            now = self._source_masks.get(str(source or ""))
+            hidden = {str(c).lower() for c in now} if isinstance(now, (list, tuple, set, frozenset)) else set()
+        if any(c.lower() in hidden for c in used):
+            return "table" if origin.table else "masked"
+        if (origin.artifact and not readable) or (not origin.artifact and origin.source):
+            return "table" if origin.table else "unverified"
+        return None
+
+    def query_source(self, artifact: str) -> str | None:
+        """一份查询快照的数据源名，按封存范围内的事件认（_query_sources）：快照读不出来时认它的数据源现在设的遮罩。"""
+        if self._sources is None:
+            self._sources = _query_sources(self._events)
+        return self._sources.get(artifact)
+
+    def doc_withheld(self, doc_id: str) -> bool:
+        """这份报告文档的证据目录里还带着值不给的指标的原值：升级前的报告撰写节点生成的老文档（或者生成之后数据源才设的
+        遮罩），目录收着上游口径卡的全部指标（没被引用的也收），值、渲染、标签原样写着，正文引用了的话正文里也是。整份只给
+        哈希、不嵌入，它的正文也不随节点完成事件带出去。现在的报告撰写节点把这些指标写成「已遮罩」、记 masked
+        （evidence.withhold_metrics），不算。
+
+        哪些指标的值不给按 metric_word 的 sure 认，只算「不给」（"masked"）的，和写作时报告撰写节点认的一样：SQL 认不准、
+        整份遮的快照里没确定取自遮罩列的普通金额，现在的报告撰写节点照给，老文档里写着它也照常附带。遮没遮核对不了的、
+        目录里的口径卡读不出来或找不到这个指标的，按值认：值就是这次运行查到过的遮罩值才算（sure_seen）。按解析出来的内容认，
+        不看哈希（同 card_masked）：服务端的文件被改过，嵌进页面的照样是这份原字节。"""
+        if doc_id not in self._docs:
+            doc = self.content(doc_id)
+            catalog = doc.get("catalog") if isinstance(doc, dict) else None
+            self._docs[doc_id] = isinstance(catalog, dict) and any(
+                self._carries_withheld(entry) for entry in catalog.values()
+                if isinstance(entry, dict) and entry.get("kind") == "metric" and not entry.get("masked")
+                and entry.get("value") is not None)
+        return self._docs[doc_id]
+
+    def _carries_withheld(self, entry: dict[str, Any]) -> bool:
+        artifact = entry.get("artifact")
+        card = self.content(artifact) if isinstance(artifact, str) and artifact else None
+        wanted = (entry.get("locator") or {}).get("metric") if isinstance(entry.get("locator"), dict) else None
+        metric = next((m for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id") == wanted), None) \
+            if isinstance(card, dict) else None
+        word = self.metric_word(str(artifact), metric, self._events, sure=True) if metric is not None else "unverified"
+        return word == "masked" or (word == "unverified" and carries_masked(entry.get("value"), self.sure_seen()))
 
     def _input_masked(self, item: dict[str, Any], output: Callable[[Any], Any]) -> bool:
         origin = input_origin(item, output)
@@ -196,6 +439,23 @@ class _Store:
             return self.masked(origin.artifact)
         hidden = self.hidden(origin.artifact)
         return any(c.lower() in hidden for c in origin.columns)
+
+
+class _Graph:
+    """一种认法下这次构建认过的指标依赖图（_Store.metric_word）：键 → 转抄以外的输入和转抄的边（MetricLinks）、认出来的
+    结论（Judged）。"""
+
+    def __init__(self) -> None:
+        self.links: dict[Any, MetricLinks] = {}
+        self.judged: dict[Any, Judged] = {}
+
+
+def _metric_key(card: str, metric: dict[str, Any], content: Any) -> Any:
+    """一个指标在依赖图上的键：(指标集工件, 指标在卡上的位置)，转抄的边按同样的键指到上游；不是这张卡上的那个指标对象的
+    （调用方另取来的）按对象本身认，不和别的指标混在一起，同 api/evidence.py 的 _metric_key。"""
+    metrics = content.get("metrics") if isinstance(content, dict) and isinstance(content.get("metrics"), list) else []
+    index = next((i for i, m in enumerate(metrics) if m is metric), None)
+    return (card, index) if index is not None and card else ("metric", id(metric))
 
 
 def _snapshot_masked(content: Any, source_masks: Mapping[str, Any], *, intact: bool,
@@ -604,6 +864,25 @@ def _card_outputs(events: Sequence[tuple[int, str, str | None, Any]], card: str)
     return out
 
 
+def _query_sources(events: Iterable[tuple[int, str, str | None, Any]]) -> dict[str, str]:
+    """封存范围内每份查询快照的数据源名：节点台账 query 条目记下的 source，数据源查询工具（db_query__<数据源>）交回的
+    快照按工具名认。快照读不出来时按它认数据源现在设的遮罩（同证据面板按台账认的 sealed.queries）。"""
+    out: dict[str, str] = {}
+    for _, etype, _, data in events:
+        if not isinstance(data, dict):
+            continue
+        if etype == EventType.TOOL_END and isinstance(data.get("query_artifact"), str):
+            tool = str(data.get("tool") or "")
+            if tool.startswith(QUERY_PREFIX) and tool[len(QUERY_PREFIX):]:
+                out.setdefault(data["query_artifact"], tool[len(QUERY_PREFIX):])
+        elif etype == EventType.NODE_FINISHED:
+            for entry in data.get("evidence") or []:
+                if isinstance(entry, dict) and entry.get("kind") == "query" and entry.get("artifact") \
+                        and isinstance(entry.get("source"), str) and entry["source"]:
+                    out[str(entry["artifact"])] = entry["source"]
+    return out
+
+
 def _query_artifacts(events: Iterable[tuple[int, str, str | None, Any]]) -> list[str]:
     """封存范围内交回过的查询快照：tool.end / merge.end 的 query_artifact，节点台账里的 query 条目。"""
     out: list[str] = []
@@ -742,7 +1021,9 @@ class _Artifacts:
         self.items: list[dict[str, Any]] = []
         self._seen: set[str] = set()
 
-    def add(self, artifact: str, kind: str, node_id: str | None) -> None:
+    def add(self, artifact: str, kind: str, node_id: str | None, *, masked: bool = False) -> None:
+        """masked：调用方另认出不能附带的（报告文档的证据目录里带着值不给的指标的原值；报告文档里写成「已遮罩」的指标
+        所在的口径卡），只给 id。"""
         if artifact in self._seen:
             return
         self._seen.add(artifact)
@@ -753,7 +1034,7 @@ class _Artifacts:
         if raw is None:
             # 服务端的文件不在了：只给 id，浏览器照实说核对不了
             item["missing"] = True
-        elif (kind == "query" and self.store.masked(artifact)) \
+        elif masked or (kind == "query" and self.store.masked(artifact)) \
                 or (kind == "metric_set" and self.store.card_masked(artifact, self.events)):
             item["masked"] = True
             # 不嵌内容，浏览器就算不出这份文件对不对得上：服务端自己看到的照实带上，核对页据此判不通过、说清原因。
@@ -774,8 +1055,11 @@ class _Artifacts:
 
 
 def _shows_content(etype: str, node_id: str | None, data: Any, node_types: Mapping[str, str], store: _Store,
-                   masked_run: bool) -> bool:
-    """这条封存范围内的事件带不带规范字符串（白名单）。"""
+                   masked_run: bool, events: Sequence[tuple[int, str, str | None, Any]] = (),
+                   withheld: frozenset[str] = frozenset(), forced: frozenset[str] = frozenset()) -> bool:
+    """这条封存范围内的事件带不带规范字符串（白名单）。events 是封存范围内的事件（认口径卡带不带遮罩时用），withheld
+    是最后一份文档只给哈希的报告节点（_Store.doc_withheld），forced 是报告文档里写成「已遮罩」的指标所在的口径卡
+    （_masked_cards）。"""
     if etype in _SHOWN_EVENTS:
         return True
     if etype == EventType.RUN_FINISHED:
@@ -783,12 +1067,52 @@ def _shows_content(etype: str, node_id: str | None, data: Any, node_types: Mappi
         return not masked_run
     if etype == EventType.NODE_FINISHED:
         kind = node_types.get(node_id or "")
-        return kind in _SHOWN_NODES or (kind == NodeType.OUTPUT and not masked_run)
+        if kind == NodeType.METRICS:
+            return _card_shown(data, store, masked_run, events, forced)
+        if kind == NodeType.REPORT:
+            # 预览就是那份文档正文的前一截：文档只给哈希的，这条也只给哈希
+            preview = data.get("preview") if isinstance(data, dict) else None
+            doc = preview.get("doc_artifact") if isinstance(preview, dict) else None
+            return not (store.doc_withheld(doc) if isinstance(doc, str) and doc else (node_id or "") in withheld)
+        return kind == NodeType.OUTPUT and not masked_run
     if etype == EventType.TOOL_END:
         # 查询类：把查询快照的 id 和运行记录连起来。预览里是查询结果的前一截，数据源带遮罩的只给哈希
         artifact = data.get("query_artifact") if isinstance(data, dict) else None
         return isinstance(artifact, str) and bool(artifact) and not store.masked(artifact)
     return False
+
+
+def _card_shown(data: Any, store: _Store, masked_run: bool, events: Sequence[tuple[int, str, str | None, Any]],
+                forced: frozenset[str] = frozenset()) -> bool:
+    """口径卡的节点完成事件带不带规范字符串。预览里逐条写着「指标（名称）= 值」（metrics 节点的 text），赋了变量的另有
+    变量的预览：卡上有值不给的指标、有输入取自遮罩列（card_masked，卡本身因此只给 id）的，这条也只给哈希——和报告引不
+    引用无关，没有报告的运行照样导出。指标集的 id 记在台账里（evidence 的 metric_set），升级前的运行没有台账，认预览里
+    记的 artifact，再没有就认节点产出工件（内容就是这张卡加上 text）。一张都读不出来的不知道带没带遮罩：运行里有带遮罩
+    的快照时只给哈希（同成果节点）。报告文档里写成「已遮罩」的指标所在的卡（forced）同样只给哈希：卡本身因此只给 id。
+    卡被报告引用时，报告文档的证据目录照样记着它的 id，引用链不靠这条事件。"""
+    if not isinstance(data, dict):
+        return not masked_run
+    cards = [str(e["artifact"]) for e in data.get("evidence") or []
+             if isinstance(e, dict) and e.get("kind") == "metric_set" and isinstance(e.get("artifact"), str)
+             and e["artifact"]]
+    preview = data.get("preview")
+    if not cards and isinstance(preview, dict) and isinstance(preview.get("artifact"), str) and preview["artifact"]:
+        cards = [preview["artifact"]]
+    if not cards and isinstance(data.get("artifact"), str) and data["artifact"]:
+        cards = [data["artifact"]]
+    if any(card in forced for card in cards):
+        return False
+    known = [card for card in dict.fromkeys(cards) if store.raw(card) is not None]
+    if not known:
+        return not masked_run
+    return not any(store.card_masked(card, events) for card in known)
+
+
+def _masked_cards(doc: dict[str, Any]) -> set[str]:
+    """报告文档的证据目录里写成「已遮罩」的指标（withhold_metrics 记了 masked）所在的口径卡。"""
+    catalog = doc.get("catalog") if isinstance(doc.get("catalog"), dict) else {}
+    return {str(e["artifact"]) for e in catalog.values() if isinstance(e, dict) and e.get("kind") == "metric"
+            and e.get("masked") and isinstance(e.get("artifact"), str) and e["artifact"]}
 
 
 def _clip(text: Any, limit: int = 60) -> str:
@@ -863,6 +1187,8 @@ def build_bundle(
     legacy: bool = False,
     graph: Mapping[str, Any] | None = None,
     source_masks: Mapping[str, Any] | None = None,
+    sure_columns: Mapping[str, Iterable[str]] | None = None,
+    sure_secrets: Any = None,
 ) -> dict[str, Any]:
     """一次已封存运行 → 页面里的数据（bundle-data）。
 
@@ -873,6 +1199,8 @@ def build_bundle(
     - manifest_seq / manifest_hash：封存范围（老运行是按结束事件推算的那个，legacy 为真）和封存哈希
     - read：工件 id → 原字节（不复验哈希），没有就是 None
     - source_masks：数据源名 → 它现在设的遮罩列（只列设了的）
+    - sure_columns、sure_secrets：每份查询快照里确定取自遮罩列的结果列、这次运行查到过的遮罩值（只收确定的那几列），
+      调用方按写作目录的口径认好交进来（api/evidence.py 的 certain_masks）：认老文档时按它们认，见 _Store.doc_withheld
     """
     graph = graph if isinstance(graph, Mapping) else {}
     node_types: dict[str, str] = {}
@@ -886,21 +1214,29 @@ def build_bundle(
 
     sealed = [e for e in events if e[0] <= manifest_seq]
     later = [e for e in events if e[0] > manifest_seq]
-    store = _Store(read, source_masks or {}, sealed)
+    store = _Store(read, source_masks or {}, sealed, sure_columns=sure_columns, sure_secrets=sure_secrets)
 
     artifacts = _Artifacts(store, sealed)
     reports = _report_events(sealed)
     cited_queries: list[str] = []
+    # 证据目录还带着值不给的指标原值的老文档只给哈希，也不顺着它的目录去附带它引用的口径卡和快照（附带了，浏览器在
+    # 已核对的事件和文档里都找不到谁引用了它们）
+    withheld = frozenset(r["node_id"] for r in reports if store.doc_withheld(r["doc_artifact"]))
+    docs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for report in reports:
-        doc_id, node_id = report["doc_artifact"], report["node_id"]
-        artifacts.add(doc_id, "report_doc", node_id)
-        doc = store.content(doc_id) if store.intact(doc_id) else None
+        doc = store.content(report["doc_artifact"]) if store.intact(report["doc_artifact"]) else None
         # 文档要真是这次运行里这个节点写的：内容寻址只保证没被改，不保证没被张冠李戴。对不上的照实嵌进去让
         # 浏览器标出来，但它的目录不可信，不顺着它去找别的工件
-        if not isinstance(doc, dict) or doc.get("run_id") != run.get("id") or doc.get("node_id") != node_id:
-            continue
-        for artifact, kind, owner in _cited_artifacts(doc):
-            artifacts.add(artifact, kind, owner)
+        if report["node_id"] not in withheld and isinstance(doc, dict) and doc.get("run_id") == run.get("id") \
+                and doc.get("node_id") == report["node_id"]:
+            docs.append((report, doc))
+    # 文档里写成「已遮罩」的指标所在的口径卡只给 id：报告撰写节点写作时认出值不给，这里的认法认不出的（数据源事后撤了
+    # 遮罩这类），卡上记着的原值也不该随文件出去
+    forced = frozenset().union(*(_masked_cards(doc) for _, doc in docs))
+    for report in reports:
+        artifacts.add(report["doc_artifact"], "report_doc", report["node_id"], masked=report["node_id"] in withheld)
+        for artifact, kind, owner in next((_cited_artifacts(doc) for r, doc in docs if r is report), []):
+            artifacts.add(artifact, kind, owner, masked=kind == "metric_set" and artifact in forced)
             if kind == "query":
                 cited_queries.append(artifact)
 
@@ -909,7 +1245,7 @@ def build_bundle(
     for seq, etype, node_id, data in sealed:
         text = canonical_json(data)
         item: dict[str, Any] = {"seq": seq, "type": etype, "node_id": node_id, "data_sha256": content_hash(text)}
-        if _shows_content(etype, node_id, data, node_types, store, masked_run):
+        if _shows_content(etype, node_id, data, node_types, store, masked_run, sealed, withheld, forced):
             item["canonical"] = text
         shown_events.append(item)
 

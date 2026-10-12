@@ -464,7 +464,8 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     rendered = pages()
     got = {name: json.loads(data_block(page)) for name, page in rendered.items()}
     assert set(got) == {"base", "two-reports", "legacy", "failed", "continued", "degraded", "missing-doc",
-                        "missing-card", "nan", "stray", "masked-card", "masked-source", "formats", "formats-unit"}
+                        "missing-card", "nan", "stray", "masked-card", "masked-old-doc", "masked-source", "formats",
+                        "formats-unit", "prose"}
     for name, bundle in got.items():
         assert browser_manifest(bundle["events"]) == bundle["meta"]["manifest_hash"], name
 
@@ -500,9 +501,27 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     issuances = [e["seq"] for e in got["degraded"]["events"] if e["type"] == "issuance"]
     assert len(issuances) == 2 and got["degraded"]["meta"]["tier"] == {"value": "degraded", "seq": issuances[-1]}
     assert [a["kind"] for a in got["stray"]["artifacts"]] == ["report_doc"]
-    # 口径卡上有输入取自遮罩列：整张卡只给 id，页面里找不到那个号码
+    # 口径卡上有输入取自遮罩列：整张卡只给 id，页面里找不到那个号码。卡的节点完成事件（预览里逐条写着指标的值）只给
+    # 哈希；普通的卡（base）照旧带规范字符串
+    def card_event(bundle):
+        return next(e for e in bundle["events"] if e["type"] == "node.finished" and e["node_id"] == "card")
+
     card = next(a for a in got["masked-card"]["artifacts"] if a["kind"] == "metric_set")
     assert card.get("masked") is True and "b64" not in card
+    assert "canonical" not in card_event(got["masked-card"]) and "canonical" in card_event(base)
+    masked_doc = json.loads(base64.b64decode(next(a["b64"] for a in got["masked-card"]["artifacts"]
+                                                  if a["kind"] == "report_doc")))
+    assert {a for a, e in masked_doc["catalog"].items() if e.get("masked")} == {"m:contact", "m:phone_raw"}
+    assert not any(phone in rendered["masked-card"] for phone in ("000-0001", "000-0002"))
+    # 同一张卡、之前的报告撰写节点写的文档（证据目录里写着号码）：整份只给哈希，不附带它引用的工件，报告的节点完成
+    # 事件只给哈希，报告自查事件照常带（引用链靠它认文档）
+    old_doc = got["masked-old-doc"]
+    assert [{k: v for k, v in a.items() if k != "id"} for a in old_doc["artifacts"]] == \
+        [{"kind": "report_doc", "node_id": "write", "masked": True}]
+    shown_types = {(e["type"], e["node_id"]) for e in old_doc["events"] if "canonical" in e}
+    assert ("report.checked", "write") in shown_types and ("node.finished", "write") not in shown_types
+    assert ("node.finished", "card") not in shown_types
+    assert not any(phone in rendered["masked-old-doc"] for phone in ("000-0001", "000-0002"))
     # 会员库设了号码遮罩：按地区汇总的那份没碰号码列，随文件附带；选出了号码的那份只给 id，页面里找不到号码
     source = got["masked-source"]
     shapes = {(a["kind"], a.get("node_id")): {k for k in a if k in ("b64", "masked", "missing")}
