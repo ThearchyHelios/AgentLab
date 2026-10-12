@@ -4,9 +4,10 @@
 nodes.card.text（清单文字逐条写着「指标（名称）= 值」），取值链认不出出处（recompute.input_origin 只认查询结果），只按出处认
 时直接照给：写作目录写着号码，文档的证据目录里值、渲染、标签都是号码，可验证报告里报告文档和卡 2 的节点完成事件都带着号码。
 
-现在转抄上游口径卡的输入按上游那几个指标认（recompute.card_input，api/evidence.py 的 _InputMasks._copied，bundle/build.py
-的 _Store._copied_kind）：上游的指标取自遮罩格，转抄它的这个指标同样写「已遮罩」；整张卡、清单文字同整份查询结果，值里有
-遮罩值才不给（数一数有几个指标的照给）。写作目录、报告自查、可验证报告同一个判断。
+现在转抄上游口径卡的输入按上游那几个指标认（recompute.card_input 认出转抄了哪张卡的哪几个指标，recompute.masked_closure
+在指标依赖图上一次认，api/evidence.py 的 _CopyGraph、bundle/build.py 的 _Store.metric_word 各自按自己的口径认好转抄以外的
+输入交进去）：上游的指标取自遮罩格，转抄它的这个指标同样写「已遮罩」；整张卡、清单文字同整份查询结果，值里有遮罩值才不给
+（数一数有几个指标的照给）。写作目录、报告自查、可验证报告同一个判断。
 
 真跑的部分用虚构的 SQLite 会员库（号码是编的），写作者是 MockChatModel 照剧本写。
 """
@@ -205,10 +206,10 @@ async def test_the_panel_withholds_the_copied_number(client, monkeypatch, vip):
 
 
 # --------------------------------------------------------------------------
-# 手搭：转抄追不到头
+# 手搭：认转抄、循环里抄自己上一轮的产出
 # --------------------------------------------------------------------------
 
-#: 一张卡转抄自己上一轮的产出（循环里写成这样）：顺着取值链永远追不到最初取自哪里
+#: 一张卡转抄自己上一轮的产出（循环里写成这样）：写作目录只有最后一次的产出，指回自己，是一个环
 LOOP_PATH = "nodes.loop_card.metrics[0].value"
 LOOPING = {"kind": "metric_set", "caliber": "循环口径", "caliber_version": "v1", "artifact": "c" * 64, "metrics": [
     {"id": "p", "name": "上一轮的号码", "value": PHONES[0], "format": "plain", "expression": LOOP_PATH,
@@ -217,15 +218,18 @@ LOOPING = {"kind": "metric_set", "caliber": "循环口径", "caliber_version": "
 
 def test_recognizing_which_card_metrics_an_input_copies():
     """认转抄：带值的字段（值、渲染、输入、整个指标）算转抄了那个指标；整张卡、清单文字、下标不是字面量的算整份；只取名称、
-    单位、口径名的不算；产出不是指标集的节点不算。"""
-    from app.engine.recompute import card_input
+    单位、口径名的不算；产出不是指标集的节点不算。卡上记着出自口径卡（via 为 metric）、转抄来了值，那张卡的产出却读不出来
+    的，交回读不出来的原因（unreadable）；转抄来的是空值（第一轮还没有上一轮）、不出自口径卡的不算。"""
+    from app.engine.recompute import CARD_UNREADABLE, card_input
 
     def output(node_id):
         return LOOPING if node_id == "loop_card" else {"rows": [[1]], "columns": ["a"]} if node_id == "q" else None
 
-    def picked(path, node_id=None):
-        got = card_input({"path": path, "node_id": node_id}, output)
-        return None if got is None else (got.picked, got.whole)
+    def picked(path, node_id=None, **item):
+        got = card_input({"path": path, "node_id": node_id, **item}, output)
+        if got is None:
+            return None
+        return (got.picked, got.whole) if got.unreadable is None else (got.unreadable, got.whole)
 
     assert picked("nodes.loop_card.metrics[0].value") == ((0,), False)
     assert picked("nodes.loop_card.metrics[-1]['rendered']") == ((0,), False)
@@ -240,25 +244,56 @@ def test_recognizing_which_card_metrics_an_input_copies():
     assert picked("nodes.loop_card.caliber") is None
     assert picked("nodes.loop_card.metrics[3].value") is None
     assert picked("nodes.q.rows[0][0]") is None
+    # 那张卡的产出读不出来
+    assert picked("nodes.gone.metrics[0].value", via="metric", value=PHONES[0]) == (CARD_UNREADABLE, False)
+    assert picked("vars.kpi.metrics[0].value", node_id="gone", via="metric", value=1) == (CARD_UNREADABLE, False)
+    assert picked("nodes.gone.text", via="metric", value="清单") == (CARD_UNREADABLE, True)
+    assert picked("nodes.gone.metrics[0].value", via="metric", value=None) is None
+    assert picked("nodes.gone.metrics[0].value", via="transform", value=1) is None
+    assert picked("nodes.gone.caliber", via="metric", value="口径") is None
+    assert picked("nodes.gone.metrics[0].name", via="metric", value="名称") is None
 
 
-async def test_a_copy_too_deep_to_follow_counts_as_masked():
-    """转抄追了 recompute.CARD_DEPTH 张还没追到头（这里是一张卡转抄自己上一轮的产出）：宁可多遮，按取自遮罩格算——写作目录
-    和可验证报告都不给值。核对不了就照给的话，号码就从这里出去了。"""
+def _looping(masked: bool) -> tuple[dict, dict[str, bytes], str | None]:
+    """循环里抄自己上一轮产出的卡；masked 时另有一个输入取自号码列（第一轮还没有上一轮时取它）。交回 (卡, 工件, 快照 id)。"""
+    from app.core.artifact_store import _path_of, canonical_json, content_hash
+
+    if not masked:
+        return LOOPING, {}, None
+    snap = {"columns": ["id", "phone"], "rows": [[1, PHONES[0]]], "sql": "SELECT id, phone FROM customers",
+            "mask_columns": ["phone"], "truncated": False}
+    text = canonical_json(snap)
+    snap_id = content_hash(text)
+    _path_of(snap_id).parent.mkdir(parents=True, exist_ok=True)
+    _path_of(snap_id).write_text(text, encoding="utf-8")
+    cell = "cell(nodes.q, 0, 'phone')"
+    metric = {**LOOPING["metrics"][0], "expression": f"{LOOP_PATH} if nodes.loop_card else {cell}", "inputs": [
+        *LOOPING["metrics"][0]["inputs"],
+        {"path": cell, "value": PHONES[0], "node_id": "q", "via": "tool_cell", "artifact": snap_id,
+         "locator": {"row": 0, "column": "phone"}, "status": "verified"}]}
+    return {**LOOPING, "metrics": [metric]}, {snap_id: text.encode()}, snap_id
+
+
+@pytest.mark.parametrize("masked", [False, True])
+async def test_a_card_copying_its_own_last_round_is_judged_on_the_cycle(masked):
+    """一张卡转抄自己上一轮的产出：写作目录（只有最后一次的产出，指回自己）和可验证报告（这里同样只有这一份产出）都在依赖
+    图上认这个环。环本身不带来遮罩：没有别的输入时照给（以前追够八层就按遮罩算）；另有一个输入取自号码列时，整个环都不给。"""
     from app.api.evidence import MASKED, _Masks, _metric_masks, _Sealed
     from app.bundle.build import _Store
     from app.core.artifact_store import canonical_json, content_hash
 
+    looping, files, _ = _looping(masked)
     view = _Sealed(run_id="", graph={}, events=[], seal={"sealed": False, "ok": None, "manifest_seq": None,
                                                           "legacy": False})
-    metric = LOOPING["metrics"][0]
-    _, word = await _metric_masks(metric, "loop_card", LOOPING["artifact"], view, _Masks(view),
-                                  output=lambda node_id: LOOPING if node_id == "loop_card" else None,
+    metric = looping["metrics"][0]
+    _, word = await _metric_masks(metric, "loop_card", looping["artifact"], view, _Masks(view), card=looping,
+                                  output=lambda node_id: looping if node_id == "loop_card" else None,
                                   by_value=False, sure=True)
-    assert word == MASKED
-    raw = canonical_json(LOOPING).encode()
+    assert word == (MASKED if masked else None)
+    raw = canonical_json(looping).encode()
     out_id = content_hash(raw)
-    store = _Store({out_id: raw}.get, {}, [(1, "node.finished", "loop_card", {"artifact": out_id})])
+    store = _Store({out_id: raw, **files}.get, {}, [(1, "node.finished", "loop_card", {"artifact": out_id})])
     card = store.content(out_id)
-    assert store.metric_word(LOOPING["artifact"], card["metrics"][0], store._events, sure=True) == "masked"
-    assert store.metric_word(LOOPING["artifact"], card["metrics"][0], store._events) == "masked"
+    assert store.metric_word(looping["artifact"], card["metrics"][0], store._events, sure=True) == \
+        ("masked" if masked else None)
+    assert store.metric_word(looping["artifact"], card["metrics"][0], store._events) == ("masked" if masked else None)

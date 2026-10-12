@@ -22,7 +22,8 @@ options.mask_columns 里的列换成「已遮罩」，SQL 里给它们起了别�
 （_mask_sets，和可验证报告同一个函数，合并查询另按合并 SQL 认）；用到这些列的指标，指标步骤的值、
 证据图的标签也不给（_metric_masks，和推演同一个判断；报告撰写节点写作之前按同一个判断把这类指标在目录里写成「已遮罩」，
 withheld_metrics，只是遮罩列只认确定的那一套，和单元格引用的自查同一个口径；可验证报告认老文档也按这个口径，
-certain_masks）；SQL、合并警告里写着的遮罩值（这次运行里确定取自遮罩列的值）
+certain_masks；转抄上游口径卡的指标在指标依赖图上一次认，_CopyGraph → recompute.masked_closure，推演的转抄输入按同一张图，
+copied_inputs）；SQL、合并警告里写着的遮罩值（这次运行里确定取自遮罩列的值）
 展示时换掉。一份快照的遮罩分析、收到的值按快照工件记在进程里（_MEMO），之后的请求不再读盘、不再分析
 ——在有身份体系之前，这只减少暴露，不是安全边界：知道工件 id 的人照样能取到整份快照。
 
@@ -413,7 +414,8 @@ async def _withheld_labels(evidence: list[dict[str, Any]], doc: dict[str, Any], 
         metric = _metric_in(cards[artifact], (entry.get("locator") or {}).get("metric"))
         if metric is None or metric.get("value") is None:
             continue
-        _, word = await _metric_masks(metric, str(entry.get("node_id") or ""), artifact, sealed, masks)
+        _, word = await _metric_masks(metric, str(entry.get("node_id") or ""), artifact, sealed, masks,
+                                      card=cards[artifact])
         if word is not None:
             item["label"] = f"{entry.get('name') or metric.get('name') or metric.get('id')} = {word}"
 
@@ -918,7 +920,7 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     inputs: list[dict[str, Any]] = []
     #: 输入指到的查询快照 → 被引用的格；同一份快照只给一个查询步骤，格合在一起高亮
     wanted: dict[str, list[tuple[Any, Any]]] = {}
-    held, word = await _metric_masks(metric or {}, str(entry.get("node_id") or ""), artifact, sealed, masks)
+    held, word = await _metric_masks(metric or {}, str(entry.get("node_id") or ""), artifact, sealed, masks, card=card)
     for item in (metric or {}).get("inputs") or []:
         one = {"step": "input", **item}
         artifact_of = item.get("artifact")
@@ -980,51 +982,153 @@ def _held_word(held: _Held) -> str:
 
 
 async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, sealed: _Sealed,
-                        masks: _Masks, *, output: Callable[[Any], Any] | None = None, by_value: bool = True,
-                        sure: bool = False, depth: int = 0) -> tuple[dict[str, _Held], str | None]:
+                        masks: _Masks, *, card: dict[str, Any] | None = None,
+                        output: Callable[[Any], Any] | None = None, by_value: bool = True, sure: bool = False
+                        ) -> tuple[dict[str, _Held], str | None]:
     """一个指标的输入里哪些不给值（路径 → _Held），指标本身的值给不给（None 照给，否则是写在值那里的字：「已遮罩」
-    「无法核对」）。证据面板的指标步骤、证据图的标签、报告撰写节点的写作目录（withheld_metrics）都按这一个函数认，和推演
-    同一套分类、同一个判断（recompute.withheld_value）：
+    「无法核对」）。证据面板的指标步骤、证据图的标签、报告撰写节点的写作目录（withheld_metrics）、推演里转抄的输入
+    （copied_inputs）都按这一个函数认，和推演同一套分类、同一个判断（recompute.withheld_value）：
 
     - 输入取自哪份结果的哪几列按 _InputMasks 认（recompute.input_origin 的 wide：下标不是字面量的、整行、整份结果都认）
     - 认不出出处的输入（数据整形算出来再赋给变量的一格），值就是这次运行查到过的遮罩值的，按值认（masks.run_secrets）；
       运行输入是发起运行的人自己填的，不认
+    - 转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text，recompute.card_input）按上游那几个指标认：
+      在这次请求的指标依赖图上一次算出（_CopyGraph → recompute.masked_closure），不逐个往上递归
     - 指标的值：取自遮罩列的一格、一行的不给；最外层的输入遮没遮核对不了的写「无法核对」；整份结果当输入、有认不出出处
       的输入的，值里有遮罩值才不给（len(vars.res.rows) 照给）
 
-    output（节点 id → 那个节点的产出）给了的，按位置取的一格顺着它走取值链，不去封存的事件里找口径卡算这一次之前的产出：
-    报告撰写节点写作时运行还没封存，产出就在运行状态里。by_value 为假（报告撰写节点的写作目录）：认不出出处的输入不按值认，
-    也不因此按值认指标的值——只按出处认，见 withheld_metrics。sure 为真（写作目录、可验证报告认老文档）：遮罩列只按确定的
-    那一套认（_InputMasks 的 sure），不跟着证据面板宁可多遮。
+    card 是指标所在的那张卡（认它在卡上的位置，依赖图按 (指标集工件, 位置) 认指标），没给的按这个指标对象本身认。
+    output（节点 id → 那个节点的产出）给了的，按位置取的一格、转抄的上游卡顺着它走取值链，不去封存的事件里找口径卡算这一次
+    之前的产出：报告撰写节点写作时运行还没封存，产出就在运行状态里。by_value 为假（报告撰写节点的写作目录）：认不出出处的
+    输入不按值认，也不因此按值认指标的值——只按出处认，见 withheld_metrics。sure 为真（写作目录、可验证报告认老文档）：
+    遮罩列只按确定的那一套认（_InputMasks 的 sure），不跟着证据面板宁可多遮。"""
+    graph = masks.copies(sealed, output=output, by_value=by_value, sure=sure)
+    judged = await graph.judged(card_node, artifact, metric, card)
+    held = dict(graph.held(card_node, artifact, metric, card))
+    for path, (kind, columns, reason) in judged.copied.items():
+        if kind is not None:
+            held[path] = _copied_held(kind, columns, reason)
+    return held, {"masked": MASKED, "unverified": UNVERIFIED_VALUE}.get(judged.word or "")
 
-    转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text，recompute.card_input）按上游那几个指标认，同一个
-    函数往上追（depth 记追了几张卡，最多 recompute.CARD_DEPTH）。"""
-    hide = _InputMasks(sealed, masks, card_node, artifact, output=output, by_value=by_value, sure=sure, depth=depth)
-    held: dict[str, _Held] = {}
-    uncertain = False
-    for item in metric.get("inputs") or []:
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path"))
-        found, traced = await hide.check(item)
-        if found is None and not traced and not by_value:
-            continue
-        if found is None and not traced:
-            uncertain = True
-            value = item.get("value")
-            if not path.startswith("input.") and recompute.maybe_masked_value(value) \
-                    and recompute.carries_masked(value, await masks.run_secrets()):
-                found = _Held("value", [], VALUE_MASKED)
-        if found is not None:
-            held[path] = found
-            uncertain = uncertain or found.kind == "table"
-    value = metric.get("value")
-    secrets = await masks.run_secrets() if uncertain and recompute.maybe_masked_value(value) else None
-    word = recompute.withheld_value(
-        metric, value, masked=[p for p, h in held.items() if h.kind in ("masked", "value")],
-        unverified=[p for p, h in held.items() if h.kind == "unverified"], uncertain=uncertain,
-        secrets=lambda: secrets)
-    return held, {"masked": MASKED, "unverified": UNVERIFIED_VALUE}.get(word or "")
+
+def _copied_held(kind: str, columns: tuple[str, ...], reason: str | None) -> _Held:
+    """转抄上游口径卡的输入不给值的原因（recompute.Judged.copied 的一项）：上游有指标不给的是 masked（整张卡转抄的是
+    table，指标的值另按值认），写上游让它不给的遮罩列；上游有指标核对不了的核对不了（整张卡转抄的同 table、带原因）。"""
+    if kind == "masked":
+        return _Held("masked", list(columns))
+    if kind == "table":
+        return _Held("table", list(columns))
+    if kind == "table_unverified":
+        return _Held("table", [], reason or CARD_UNVERIFIED)
+    return _Held("unverified", [], reason or CARD_UNVERIFIED)
+
+
+def _card_key(node_id: Any, card: dict[str, Any]) -> Any:
+    """一张口径卡在依赖图上的键：它的指标集工件（每次执行一份，内容寻址）；产出里没记工件的（落工件失败）按节点和这份
+    产出本身认。"""
+    return str(card.get("artifact") or "") or ("node", str(node_id or ""), id(card))
+
+
+def _metric_key(artifact: str, card_node: str, metric: dict[str, Any], card: dict[str, Any] | None) -> Any:
+    """一个指标在依赖图上的键：(指标集工件, 指标在卡上的位置)，转抄的边按同样的键指到上游。认不出位置的（没给卡，或者
+    调用方另取来的指标对象）按这个指标对象本身认，不和别的指标混在一起（依赖图留着它，对象 id 在这次请求里不会被复用）。"""
+    metrics = card.get("metrics") if isinstance(card, dict) and isinstance(card.get("metrics"), list) else []
+    index = next((i for i, m in enumerate(metrics) if m is metric), None)
+    if index is None:
+        return ("metric", id(metric))
+    return (artifact or _card_key(card_node, card), index)  # type: ignore[arg-type]
+
+
+def _needs_secrets(links: recompute.MetricLinks) -> bool:
+    """依赖图上这个指标可能要按值认（整份结果当输入、认不出出处的输入、整张卡转抄），值又可能是遮罩值：认之前先把这次运行
+    查到过的遮罩值收好（masked_closure 在同步代码里取）。"""
+    return recompute.maybe_masked_value(links.metric.get("value")) and (
+        links.uncertain or any(kind == "table" for kind, _ in links.direct.values())
+        or any(edge.whole for edge in links.copies))
+
+
+class _CopyGraph:
+    """一次请求里认指标的值给不给（_metric_masks）用的指标依赖图。键是 (指标集工件, 指标在卡上的位置)：转抄以外的输入按
+    _InputMasks 认（取自遮罩格的、核对不了的、按值认出来的），转抄上游口径卡的输入（recompute.card_input）连成边，交给
+    recompute.masked_closure 一次算出最小不动点。认过的指标记下来：证据图给每个指标认标签、同一次请求里别的指标转抄它，
+    都不再重认，工作量和图的大小成正比。
+
+    写作目录（output 给了：运行状态里每个节点最后一次的产出）里，循环中抄自己上一轮的卡指回自己，是一个环；封存之后
+    （output 没给）按每次执行认：卡在这次执行之前读到的是自己上一次执行的产出（_card_outputs），一次一次往回连，连到
+    第一次为止。两种都只按图算，不按追了几层算：以前追够八层就按遮罩算，没设遮罩的循环累加也成了「已遮罩」。"""
+
+    def __init__(self, sealed: _Sealed, masks: _Masks, *, output: Callable[[Any], Any] | None, by_value: bool,
+                 sure: bool) -> None:
+        self.sealed, self.masks = sealed, masks
+        self.given, self.by_value, self.sure = output, by_value, sure
+        self._links: dict[Any, recompute.MetricLinks] = {}
+        self._held: dict[Any, dict[str, _Held]] = {}
+        self._judged: dict[Any, recompute.Judged] = {}
+
+    def matches(self, sealed: _Sealed, output: Callable[[Any], Any] | None, by_value: bool, sure: bool) -> bool:
+        return self.sealed is sealed and self.given is output and self.by_value == by_value and self.sure == sure
+
+    def held(self, card_node: str, artifact: str, metric: dict[str, Any], card: dict[str, Any] | None
+             ) -> dict[str, _Held]:
+        """认过的指标里转抄以外不给值的输入（judged 之后才有）。"""
+        return self._held[_metric_key(artifact, card_node, metric, card)]
+
+    async def judged(self, card_node: str, artifact: str, metric: dict[str, Any], card: dict[str, Any] | None
+                     ) -> recompute.Judged:
+        key = _metric_key(artifact, card_node, metric, card)
+        if key not in self._judged:
+            fresh = await self._build(key, card_node, artifact, metric)
+            secrets = await self.masks.run_secrets() if any(_needs_secrets(self._links[k]) for k in fresh) else None
+            self._judged.update(recompute.masked_closure({k: self._links[k] for k in fresh}, self._judged,
+                                                         lambda: secrets))
+        return self._judged[key]
+
+    async def _build(self, key: Any, card_node: str, artifact: str, metric: dict[str, Any]) -> list[Any]:
+        """认好 key 和顺着转抄的边够得着、还没认过的指标（转抄以外的输入，_links、_held），交回这一批新认的键。上游的
+        指标按上游那张卡那一次执行的产出认（_InputMasks 按 _card_outputs 找它当时读到的产出）。卡上没记输入的上游指标
+        （写死的数、升级前的老卡）不连边：照给。"""
+        fresh: list[Any] = []
+        todo = [(key, card_node, artifact, metric)]
+        while todo:
+            key, node, art, item_metric = todo.pop()
+            if key in self._links:
+                continue
+            hide = _InputMasks(self.sealed, self.masks, node, art, output=self.given, sure=self.sure)
+            links = recompute.MetricLinks(item_metric)
+            held: dict[str, _Held] = {}
+            for item in item_metric.get("inputs") or []:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path"))
+                copied = hide.copied(item)
+                if copied is not None:
+                    upstream: list[Any] = []
+                    if copied.card is not None:
+                        for index in copied.picked:
+                            up_metric = copied.card["metrics"][index]
+                            if isinstance(up_metric, dict) and up_metric.get("inputs"):
+                                up = (_card_key(copied.node_id, copied.card), index)
+                                upstream.append(up)
+                                todo.append((up, copied.node_id, str(copied.card.get("artifact") or ""), up_metric))
+                    links.copies.append(recompute.CopyEdge(path, tuple(upstream), copied.whole, copied.unreadable))
+                    continue
+                found, traced = await hide.check(item)
+                if found is None and not traced:
+                    if not self.by_value:
+                        continue
+                    links.uncertain = True
+                    value = item.get("value")
+                    if not path.startswith("input.") and recompute.maybe_masked_value(value) \
+                            and recompute.carries_masked(value, await self.masks.run_secrets()):
+                        found = _Held("value", [], VALUE_MASKED)
+                if found is not None:
+                    held[path] = found
+                    # 遮罩列只在确实取自遮罩列时往下游传（核对不了的那几列不算）
+                    links.direct[path] = (found.kind, tuple(found.columns) if found.reason is None else ())
+            self._links[key] = links
+            self._held[key] = held
+            fresh.append(key)
+        return fresh
 
 
 async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], ledger: list[Any]) -> list[str]:
@@ -1047,14 +1151,15 @@ async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], le
     遮罩列只按确定的那一套认（sure，和单元格引用的自查同一个口径：_cited_masks）：SQL 认不准、证据面板整份遮的快照里，
     没确定取自遮罩列的普通金额、计数、只装着分档标签的列照给。以前跟着证据面板宁可多遮，WITH 写了列名表、VALUES 当表的
     销售额也成了「已遮罩」，正式运行引用它就判失败；同一格按 [[v:…]] 引用却不报违规。转抄上游口径卡的指标
-    （nodes.<卡>.metrics[0].value、nodes.<卡>.text）按上游那个指标认（_InputMasks._copied）。"""
+    （nodes.<卡>.metrics[0].value、nodes.<卡>.text）按上游那个指标认：运行状态里每张卡只有最后一次的产出，循环里抄自己
+    上一轮的卡指回自己，在依赖图上是一个环（_CopyGraph），环上没有别的输入取自遮罩格就照给。"""
     queries = {str(e["artifact"]): {k: e[k] for k in ("node_id", "tool", "source", "via", "call_id", "exec")
                                     if e.get(k) is not None}
                for e in ledger if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact")}
     view = _Sealed(run_id="", graph={}, events=[], queries=queries,
                    seal={"sealed": False, "ok": None, "manifest_seq": None, "legacy": False})
     masks = _Masks(view)
-    found: list[tuple[str, str, str, dict[str, Any]]] = []
+    found: list[tuple[str, str, str, dict[str, Any], dict[str, Any]]] = []
     for alias, entry in catalog.items():
         if not isinstance(entry, dict) or entry.get("kind") != "metric" or entry.get("value") is None:
             continue
@@ -1062,13 +1167,13 @@ async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], le
         card = nodes.get(card_node)
         metric = _metric_in(card if isinstance(card, dict) else None, (entry.get("locator") or {}).get("metric"))
         if isinstance(metric, dict) and metric.get("inputs"):
-            found.append((alias, card_node, str(entry.get("artifact") or ""), metric))
+            found.append((alias, card_node, str(entry.get("artifact") or ""), metric, card))
     if not found:
         return []
     # cell()、Agent 字段落在的快照先在线程里读好（读盘、复验哈希）：在运行里认，不占着事件循环。转抄上游口径卡的指标要顺着
     # 上游卡的输入认，运行状态里每张口径卡的输入一并读好
     cards = [card for card in nodes.values() if isinstance(card, dict) and card.get("kind") == "metric_set"]
-    await masks.prefetch(str(item["artifact"]) for metric in [*(m for *_, m in found),
+    await masks.prefetch(str(item["artifact"]) for metric in [*(m for *_, m, _ in found),
                                                               *(m for card in cards for m in card.get("metrics") or [])]
                          if isinstance(metric, dict) for item in metric.get("inputs") or []
                          if isinstance(item, dict) and isinstance(item.get("artifact"), str) and item["artifact"])
@@ -1077,9 +1182,9 @@ async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], le
         return nodes.get(str(node_id or ""))
 
     out: list[str] = []
-    for alias, card_node, artifact, metric in found:
-        _, word = await _metric_masks(metric, card_node, artifact, view, masks, output=output, by_value=False,
-                                      sure=True)
+    for alias, card_node, artifact, metric, card in found:
+        _, word = await _metric_masks(metric, card_node, artifact, view, masks, card=card, output=output,
+                                      by_value=False, sure=True)
         if word == MASKED:
             out.append(alias)
     return out
@@ -1101,12 +1206,29 @@ async def certain_masks(sealed: _Sealed, masks: _Masks) -> tuple[dict[str, froze
     return out, await masks.run_secrets()
 
 
+async def copied_inputs(sealed: _Sealed, card_node: str, artifact: str, card: dict[str, Any]
+                        ) -> dict[int, dict[str, tuple[str | None, str | None]]]:
+    """推演（api/whatif.py）用：这张卡上每个指标转抄上游口径卡的输入给不给值，{指标在卡上的位置: {输入路径: (种类, 原因)}}，
+    种类同 recompute.Judged.copied（None 照给）。和证据面板的指标步骤同一个判断、同一张依赖图（_metric_masks 的
+    _CopyGraph，宁可多遮的那一套）：推演据此不给转抄来的遮罩值、不让改，核对不了的不给，照给的照常推演。以前推演只按值认，
+    转抄来的值不是够长的号码（短编码、从遮罩格算出来的数）就照给、还能改。"""
+    masks = _Masks(sealed)
+    graph = masks.copies(sealed, output=None, by_value=True, sure=False)
+    out: dict[int, dict[str, tuple[str | None, str | None]]] = {}
+    for index, metric in enumerate(card.get("metrics") or []):
+        if isinstance(metric, dict) and metric.get("inputs"):
+            judged = await graph.judged(card_node, artifact, metric, card)
+            if judged.copied:
+                out[index] = {path: (kind, reason or (CARD_UNVERIFIED if kind in ("unverified", "table_unverified")
+                                                      else None))
+                              for path, (kind, _, reason) in judged.copied.items()}
+    return out
+
+
 #: tool_cell、Agent 字段落在的查询快照读不出来：只知道数据源现在设的遮罩，查询当时记下的在快照里，遮没遮核对不了
 SNAPSHOT_UNVERIFIED = "查询快照无法读取，核对不了这一格是否取自设置了遮罩的列"
 #: 转抄的上游口径卡指标遮没遮核对不了（它的输入落在读不出来的快照上这类）
 CARD_UNVERIFIED = "转抄的上游口径卡指标核对不了是否取自设置了遮罩的列"
-#: 口径卡一张抄一张，追了 recompute.CARD_DEPTH 张还没追到头（或者循环里抄自己上一轮的产出）：宁可多遮
-CARD_TOO_DEEP = f"转抄上游口径卡超过 {recompute.CARD_DEPTH} 层，追不到这个值最初取自哪里，按取自设置了遮罩的列处理"
 
 
 class _InputMasks:
@@ -1128,30 +1250,32 @@ class _InputMasks:
     的 sure，再按血缘排除值确实不取自遮罩列的），读不出来的按数据源现在设的列名。证据面板、推演照旧按 hidden 宁可多遮。
 
     转抄上游口径卡的输入（recompute.card_input：nodes.<卡>.metrics[0].value、vars.<卡的 assign_to>.metrics[0].value、
-    nodes.<卡>.text）按上游那几个指标认（_copied，同一个 _metric_masks 往上追）：上游的指标取自遮罩格，转抄它的这个输入
-    同样不给值。整张卡、清单文字这种不一定把哪个指标的值带进来的，同整份查询结果（table），指标的值另按值认。
+    nodes.<卡>.text）这里只认出转抄了哪张卡的哪几个指标（copied），给不给按上游那几个指标在依赖图上认（_CopyGraph）。
     """
 
     def __init__(self, sealed: _Sealed, masks: _Masks, card_node: str, artifact: str, *,
-                 output: Callable[[Any], Any] | None = None, by_value: bool = True, sure: bool = False,
-                 depth: int = 0) -> None:
+                 output: Callable[[Any], Any] | None = None, sure: bool = False) -> None:
         self._sealed, self._masks = sealed, masks
         self._card, self._artifact = card_node, artifact
         self._outputs: dict[str, str] | None = None
         # 报告撰写节点写作时（withheld_metrics）：节点的产出就在运行状态里，不从封存的事件里找
         self._given = output
-        self._by_value, self._sure, self._depth = by_value, sure, depth
+        self._sure = sure
 
     def _fetch(self, artifact: str) -> tuple[Any, bool | None]:
         return self._masks.fetch(artifact)
 
+    def copied(self, item: dict[str, Any]) -> recompute.CardInput | None:
+        """这个输入转抄了上游哪张口径卡的哪几个指标（recompute.card_input），不是转抄的为 None。卡当时的产出读不出来的
+        （文件不在、与哈希不一致）交回 unreadable：核对不了，宁可多遮。"""
+        return recompute.card_input(item, self._output)
+
     async def check(self, item: dict[str, Any]) -> tuple[_Held | None, bool]:
         """(不给值的原因, 认不认得出出处)：给值的原因为 None。认不出出处的（常量、运行输入、数据整形算出来的一格）第二项
-        为假，值按值认（_metric_masks）。"""
+        为假，值按值认（_metric_masks）。转抄上游口径卡的输入不在这里认（copied）。"""
         origin = recompute.input_origin(item, self._output, wide=True)
         if origin is None:
-            copied = recompute.card_input(item, self._output)
-            return (await self._copied(copied), True) if copied is not None else (None, False)
+            return None, False
         if origin.unverified is not None:
             return _Held("unverified", list(origin.columns), origin.unverified), True
         used = list(dict.fromkeys(origin.columns))
@@ -1172,7 +1296,7 @@ class _InputMasks:
         if self._given is not None:
             return self._given(node_id)
         if self._outputs is None:
-            self._outputs = _card_outputs(self._sealed, self._card, self._artifact)
+            self._outputs = self._masks.card_outputs(self._sealed, self._card, self._artifact)
         artifact = self._outputs.get(str(node_id or ""))
         content, ok = self._fetch(artifact) if artifact else (None, None)
         return content if ok is True else None
@@ -1184,32 +1308,6 @@ class _InputMasks:
             return await self._masks.cited(artifact, name, snap)
         sets = await self._masks.sets(artifact, name, snap)
         return sets.sure if self._sure else sets.hidden
-
-    async def _copied(self, copied: recompute.CardInput) -> _Held | None:
-        """转抄上游口径卡的输入不给值的原因：上游带着值的那几个指标里，有不给的（「已遮罩」）就不给，有遮没遮核对不了的
-        就核对不了；整张卡、清单文字（whole）同整份查询结果，记 table、指标的值另按值认。追得太深（卡抄卡超过
-        recompute.CARD_DEPTH 张，循环里一张卡抄自己上一轮的产出）的追不到最初取自哪里，宁可多遮，按取自遮罩格算：
-        核对不了的不给写作目录拦，号码就从这里出去了。"""
-        if self._depth >= recompute.CARD_DEPTH:
-            return _Held("masked", [], CARD_TOO_DEEP)
-        artifact = str(copied.card.get("artifact") or "")
-        words: list[str] = []
-        columns: list[str] = []
-        for index in copied.picked:
-            metric = copied.card["metrics"][index]
-            if not isinstance(metric, dict) or not metric.get("inputs"):
-                continue
-            held, word = await _metric_masks(metric, copied.node_id, artifact, self._sealed, self._masks,
-                                             output=self._given, by_value=self._by_value, sure=self._sure,
-                                             depth=self._depth + 1)
-            if word is not None:
-                words.append(word)
-                columns.extend(c for h in held.values() if h.reason is None for c in h.columns)
-        if MASKED in words:
-            return _Held("table" if copied.whole else "masked", list(dict.fromkeys(columns)))
-        if UNVERIFIED_VALUE in words:
-            return _Held("table" if copied.whole else "unverified", [], CARD_UNVERIFIED)
-        return None
 
 
 def _card_outputs(sealed: _Sealed, card_node: str, artifact: str) -> dict[str, str]:
@@ -1525,6 +1623,26 @@ class _Masks:
         self._read: dict[str, tuple[Any, bool | None]] = {}
         self._sets: dict[tuple[str | None, str], _MaskSets] = {}
         self._cited: dict[tuple[str, str], set[str]] = {}
+        self._graphs: list[_CopyGraph] = []
+        self._outputs: dict[tuple[int, str, str], dict[str, str]] = {}
+
+    def copies(self, sealed: _Sealed, *, output: Callable[[Any], Any] | None, by_value: bool, sure: bool) -> _CopyGraph:
+        """这次请求里认指标的值给不给用的指标依赖图（_CopyGraph），按认法（output、by_value、sure）各一张：证据图给每个
+        指标认标签、转抄同一个上游指标的几个指标，都在同一张图上认，认过的不再认。"""
+        for graph in self._graphs:
+            if graph.matches(sealed, output, by_value, sure):
+                return graph
+        graph = _CopyGraph(sealed, self, output=output, by_value=by_value, sure=sure)
+        self._graphs.append(graph)
+        return graph
+
+    def card_outputs(self, sealed: _Sealed, card_node: str, artifact: str) -> dict[str, str]:
+        """_card_outputs，一次请求里同一张卡的同一次执行只找一次：循环里每一次执行都转抄上一次的产出时，依赖图要逐次往回
+        认，每次都把整次运行的事件扫一遍就成了执行次数乘事件数。调用方只读不改。"""
+        key = (id(sealed), str(card_node), str(artifact))
+        if key not in self._outputs:
+            self._outputs[key] = _card_outputs(sealed, card_node, artifact)
+        return self._outputs[key]
 
     def fetch(self, artifact: str) -> tuple[Any, bool | None]:
         """取回一件工件（_fetch）：一次请求里同一件只读一次。证据图要给每个指标认一遍输入，同一份快照、同一个节点的
@@ -1831,7 +1949,9 @@ def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
     整份算，按位置认得出的列一个都收不到（合入 K3b 之后的复核）。
     只装着分档标签的列（CASE WHEN phone IS NULL THEN '未留' ELSE '已留' END）格子里是 SQL 写死的字，不算；只数个数的
     （COUNT(*) FILTER (WHERE phone IS NULL)、SUM(phone IS NULL)）先改写成那一套认得出的样子再认（_counted）。
-    出了意外只认列名对上的。"""
+    出了意外只认列名对上的。
+    整份算的快照里，列名本身就是取自遮罩列的表达式的（* 展开派生表、WITH 里没起别名的 UPPER(phone)）另按列名认
+    （_named_from_masks）：那一套整份算之前认不出它落在哪个位置，collect 里没有，指标、单元格引用照给了号码。"""
     columns = {str(c).lower() for c in snap.get("columns") or []}
     direct = set(base) & columns
     if not base or not columns:
@@ -1841,11 +1961,39 @@ def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
 
         found = _derived_masks(_counted(snap, kind), set(base), kind, tables)
         sure = ((found.collect if found.whole else found.hidden) & columns) | direct
+        if found.whole:
+            sure |= _named_from_masks(snap, base, kind)
         labels = _snapshot_labels(snap, kind)
         return sure - {name for name in labels if name not in base}, labels
     except Exception:  # noqa: BLE001 - 认不准：只认列名对上的
         logger.warning("报告自查：按 SQL 认取自遮罩列的结果列时出错，只认列名对上的", exc_info=True)
         return direct, {}
+
+
+def _named_from_masks(snap: dict[str, Any], base: set[str], kind: str | None) -> set[str]:
+    """SQL 认不准、整份算的快照里，列名本身就是一个取自遮罩列的表达式的结果列（小写，_sure）：没起别名的表达式，SQLite、
+    MySQL 拿表达式的原文当列名（UPPER(phone)、phone || ''、SUBSTR(phone, 1, 11)），* 展开派生表、WITH、UNION 的一支时原样
+    带出来。认遮罩列的那一套（masking._derived_masks）认不出 * 展开到了哪个位置，整份算、collect 里没有它：写作目录、
+    单元格引用的自查就照给了号码。
+
+    按列名拼一条只选这一项的 SQL，交给同一套认（同 _sure，只数个数的先改写，_counted）：认得出取自遮罩列、又不是只装着
+    分档标签的（masking._label_columns）才算；COUNT(phone)、COUNT(*) FILTER (WHERE phone IS NULL)、LOWER(name) 这类不算。
+    只认列名里写着遮罩列名字的（masking._mentions），别的列不拼。Postgres 给这种列起的名字是函数名（upper），认不出，
+    照旧只在证据面板、可验证报告那边宁可多遮。"""
+    from app.engine.masking import _derived_masks, _label_columns, _mentions
+
+    out: set[str] = set()
+    for column in snap.get("columns") or []:
+        name = str(column)
+        lowered = name.lower()
+        if lowered in base or not _mentions(name, base):
+            continue
+        probe = _counted({"sql": f"SELECT {name} FROM t", "columns": [name]}, kind)
+        found = _derived_masks(probe, set(base), kind)
+        if found.whole or lowered not in found.hidden or lowered in _label_columns(probe["sql"], kind, [name]):
+            continue
+        out.add(lowered)
+    return out
 
 
 def _counted(snap: dict[str, Any], kind: str | None) -> dict[str, Any]:

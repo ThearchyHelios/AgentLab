@@ -13,7 +13,8 @@
   嵌入，别的不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，有输入取自遮罩列（cell() 的格、Agent 字段、按位置
   取的 vars.res.rows[0][2]，SQL 里改了名字的遮罩列也算，SQL 认不出结果里哪一列取自哪一列的整份快照的列都算）的整张卡
   同样只给 id，认法和证据面板、推演同一个（recompute.input_origin）；有指标的值不给的（metric_word：值取自遮罩列的
-  一格、一行，整行、下标不是字面量的、转抄上游口径卡里这类指标的也算，遮罩列按这份文件宁可多遮的认法）也一样；服务端
+  一格、一行，整行、下标不是字面量的、转抄上游口径卡里这类指标的也算，转抄的在指标依赖图上一次认，recompute.masked_closure；
+  遮罩列按这份文件宁可多遮的认法）、卡上记着的转抄来的值带遮罩的（_copies_masked）也一样；服务端
   文件被改过的卡照样按卡上记的输入认，解析不出一张卡的整张只给 id。报告文档的证据目录收着上游口径卡的全部指标，现在的
   报告撰写节点把值不给的写成「已遮罩」；还写着原值的老文档（升级前生成的，或者生成之后数据源才设的遮罩）整份只给 id、
   不附带它引用的工件——哪些指标的值不给和写作目录同一个判断（metric_word 的 sure：只按确定取自遮罩列的认，由调用方按
@@ -48,7 +49,15 @@ from app.core.events import EventType
 from app.engine.evidence import iter_units, query_entry_fields
 from app.engine.masking import OPAQUE_SQL, SYSTEM_SCHEMAS, indirect_reads
 from app.engine.merge_query import MERGE_SOURCE
-from app.engine.recompute import CARD_DEPTH, CardInput, card_input, carries_masked, input_origin, withheld_value
+from app.engine.recompute import (
+    CopyEdge,
+    Judged,
+    MetricLinks,
+    card_input,
+    carries_masked,
+    input_origin,
+    masked_closure,
+)
 from app.engine.schema import NodeType
 from app.engine.toolcalls import QUERY_PREFIX
 
@@ -103,7 +112,8 @@ class _Store:
         self._masked: dict[str, bool] = {}
         self._hidden: dict[str, set[str]] = {}
         self._seen: Any = None
-        self._words: dict[tuple[str, int, bool], str | None] = {}
+        self._graphs: dict[bool, _Graph] = {}
+        self._card_outputs: dict[str, dict[str, str]] = {}
         self._docs: dict[str, bool] = {}
         self._sources: dict[str, str] | None = None
 
@@ -198,75 +208,124 @@ class _Store:
             if not isinstance(card, dict):
                 self._masked[key] = self.raw(artifact) is not None
                 return self._masked[key]
-            outputs = _card_outputs(events, artifact)
-
-            def output(node_id: Any) -> Any:
-                found = outputs.get(str(node_id or ""))
-                return self.content(found) if found and self.intact(found) else None
-
+            output = self._outputs_of(artifact, events)
             metrics = [metric for metric in card.get("metrics") or [] if isinstance(metric, dict)]
             items = [item for metric in metrics for item in metric.get("inputs") or [] if isinstance(item, dict)]
             # 另按指标认：值不给的指标（metric_word，遮罩列宁可多遮的那一套）——按位置取的整行、下标不是字面量的一格，整份
             # 结果里带着遮罩列、值里就是号码的，转抄上游口径卡里这类指标的，上面只认字面量下标一格的那一套认不出，卡上记着的
-            # 值照样是号码
+            # 值照样是号码。转抄来的输入另看一遍（_copies_masked）：卡上记着转抄来的值本身，指标的值照给时它也可能是号码
             self._masked[key] = any(self._input_masked(item, output) for item in items) \
-                or any(self.metric_word(artifact, metric, events) is not None for metric in metrics)
+                or any(self.metric_word(artifact, metric, events) is not None or self._copies_masked(artifact, metric)
+                       for metric in metrics)
         return self._masked[key]
 
+    def _copies_masked(self, card: str, metric: dict[str, Any]) -> bool:
+        """卡上这个指标转抄来的输入带不带遮罩（metric_word 认过之后才看得到）：转抄的是不给、核对不了的上游指标，卡上记着的
+        就是那个值（嵌在下标里、指标的值照给时也一样）；整张卡、清单文字转抄（table）的，记着的值（清单文字逐条写着「指标
+        （名称）= 值」）里有这次运行查到过的遮罩值才算，记成「[3 项]」这种大概的不算。"""
+        judged = self._graph(False).judged.get(_metric_key(card, metric, self.content(card)))
+        if judged is None:
+            return False
+        values = {str(i.get("path")): i.get("value") for i in metric.get("inputs") or [] if isinstance(i, dict)}
+        for path, (kind, _, _) in judged.copied.items():
+            if kind in ("masked", "unverified"):
+                return True
+            if kind is not None and carries_masked(values.get(path), self.seen()):
+                return True
+        return False
+
     def metric_word(self, card: str, metric: dict[str, Any], events: Sequence[tuple[int, str, str | None, Any]], *,
-                    sure: bool = False, depth: int = 0) -> str | None:
+                    sure: bool = False) -> str | None:
         """口径卡 card 上一个指标的值给不给：None 照给；"masked" 不给（值取自遮罩列的一格、一行，或者整份结果里带着遮罩列、
         值里就有这次运行查到过的遮罩值）；"unverified" 遮没遮核对不了。和证据面板指标步骤的值同一个判断（api/evidence.py
-        的 _metric_masks，by_value=False：输入的出处按 recompute.input_origin 的 wide 认，转抄上游口径卡的按上游那个指标认，
-        最后交给 recompute.withheld_value）。只按出处认：认不出出处的输入（写死的目标、数据整形算出来的数）值碰巧等于遮罩列
-        里的某一格，不因此算——不然普通报告里的这种指标在文件里也核对不了，老文档也整份只给哈希。
+        的 _metric_masks，by_value=False：输入的出处按 recompute.input_origin 的 wide 认，转抄上游口径卡的按上游那个指标
+        在依赖图上认，recompute.masked_closure，最后交给 recompute.withheld_value）。只按出处认：认不出出处的输入（写死的
+        目标、数据整形算出来的数）值碰巧等于遮罩列里的某一格，不因此算——不然普通报告里的这种指标在文件里也核对不了，
+        老文档也整份只给哈希。
 
         遮罩列两种认法：
         - 默认（认口径卡能不能随文件附带，card_masked）：按这份文件自己的认法宁可多遮（hidden：SQL 认不准时整份的列都算；
           快照读不出来、和 id 对不上的，按它的数据源现在设的遮罩），遮罩值用 seen。卡上记着输入的值，附带了就带出去了
         - sure（认老文档，doc_withheld）：只按确定取自遮罩列的认（sure，调用方按写作目录的口径认好交进来），遮罩值用
-          sure_seen。和报告撰写节点写作时认的一样：现在的报告撰写节点照给的普通指标，老文档里写着它也照常附带"""
-        key = (card, id(metric), sure)
-        if key not in self._words:
-            outputs = _card_outputs(events, card)
+          sure_seen。和报告撰写节点写作时认的一样：现在的报告撰写节点照给的普通指标，老文档里写着它也照常附带
 
-            def output(node_id: Any) -> Any:
-                found = outputs.get(str(node_id or ""))
-                return self.content(found) if found and self.intact(found) else None
+        依赖图按 (指标集工件, 指标在卡上的位置) 认指标，两种认法各一张、构建里认过的记下来：卡转抄卡、循环里每一次执行都
+        转抄上一次的产出时，每个指标只认一次，和追了几层无关。"""
+        key = _metric_key(card, metric, self.content(card))
+        graph = self._graph(sure)
+        if key not in graph.judged:
+            fresh = self._build(graph, key, card, metric, events, sure)
+            graph.judged.update(masked_closure({k: graph.links[k] for k in fresh}, graph.judged,
+                                               self.sure_seen if sure else self.seen))
+        return graph.judged[key].word
 
-            masked: list[str] = []
-            unverified: list[str] = []
-            uncertain = False
-            for item in metric.get("inputs") or []:
+    def _graph(self, sure: bool) -> "_Graph":
+        if sure not in self._graphs:
+            self._graphs[sure] = _Graph()
+        return self._graphs[sure]
+
+    def _build(self, graph: "_Graph", key: Any, card: str, metric: dict[str, Any],
+               events: Sequence[tuple[int, str, str | None, Any]], sure: bool) -> list[Any]:
+        """认好 key 和顺着转抄的边够得着、还没认过的指标（转抄以外的输入），交回这一批新认的键，同 api/evidence.py 的
+        _CopyGraph._build。上游的指标按上游那张卡那一次执行之前的产出认（_card_outputs）；卡上没记输入的上游指标不连边。"""
+        fresh: list[Any] = []
+        todo = [(key, card, metric)]
+        while todo:
+            key, art, item_metric = todo.pop()
+            if key in graph.links:
+                continue
+            output = self._outputs_of(art, events)
+            links = MetricLinks(item_metric)
+            for item in item_metric.get("inputs") or []:
                 if not isinstance(item, dict):
                     continue
                 path = str(item.get("path"))
-                kind, _ = self._input_kind(item, output, events, sure=sure, depth=depth)
-                if kind == "masked":
-                    masked.append(path)
-                elif kind == "unverified":
-                    unverified.append(path)
-                uncertain = uncertain or kind == "table"
-            self._words[key] = withheld_value(metric, metric.get("value"), masked=masked, unverified=unverified,
-                                              uncertain=uncertain, secrets=self.sure_seen if sure else self.seen)
-        return self._words[key]
+                copied = card_input(item, output)
+                if copied is not None:
+                    upstream: list[Any] = []
+                    if copied.card is not None:
+                        up_card = str(copied.card.get("artifact") or "")
+                        for index in copied.picked:
+                            up_metric = copied.card["metrics"][index]
+                            if isinstance(up_metric, dict) and up_metric.get("inputs"):
+                                up = (up_card or ("node", copied.node_id, id(copied.card)), index)
+                                upstream.append(up)
+                                todo.append((up, up_card, up_metric))
+                    links.copies.append(CopyEdge(path, tuple(upstream), copied.whole, copied.unreadable))
+                    continue
+                kind = self._input_kind(item, output, sure=sure)
+                if kind is not None:
+                    links.direct[path] = (kind, ())
+            graph.links[key] = links
+            fresh.append(key)
+        return fresh
 
-    def _input_kind(self, item: dict[str, Any], output: Callable[[Any], Any],
-                    events: Sequence[tuple[int, str, str | None, Any]] = (), *, sure: bool = False,
-                    depth: int = 0) -> tuple[str | None, bool]:
-        """(一个输入不给值的原因, 认不认得出出处)，同 api/evidence.py 的 _InputMasks.check：取自遮罩列的一格、一行是
+    def _outputs_of(self, card: str, events: Sequence[tuple[int, str, str | None, Any]]) -> Callable[[Any], Any]:
+        """口径卡 card 那一次执行之前每个节点的产出（_card_outputs）：节点 id → 读出来的内容，读不出来、和 id 对不上的是
+        None。同一张卡只找一次。"""
+        if card not in self._card_outputs:
+            self._card_outputs[card] = _card_outputs(events, card)
+        outputs = self._card_outputs[card]
+
+        def output(node_id: Any) -> Any:
+            found = outputs.get(str(node_id or ""))
+            return self.content(found) if found and self.intact(found) else None
+
+        return output
+
+    def _input_kind(self, item: dict[str, Any], output: Callable[[Any], Any], *, sure: bool = False) -> str | None:
+        """一个输入（转抄上游口径卡的除外）不给值的原因，同 api/evidence.py 的 _InputMasks.check：取自遮罩列的一格、一行是
         "masked"，整份结果是 "table"（它不一定把哪一格带进指标，指标的值另按值认），遮没遮核对不了的是 "unverified"
-        （取值链上的产出读不出来、快照读不出来、结果没存快照只带着数据源名），给值的是 None。认不出出处的（常量、运行输入、
-        数据整形算出来的一格）第二项为假。转抄上游口径卡的（recompute.card_input）按上游那几个指标认（_copied_kind）。"""
+        （取值链上的产出读不出来、快照读不出来、结果没存快照只带着数据源名），给值的、认不出出处的（常量、运行输入、数据
+        整形算出来的一格）是 None。"""
         origin = input_origin(item, output, wide=True)
         if origin is None:
-            copied = card_input(item, output)
-            return (self._copied_kind(copied, events, sure, depth), True) if copied is not None else (None, False)
+            return None
         if origin.unverified is not None:
-            return "unverified", True
+            return "unverified"
         used = list(dict.fromkeys(origin.columns))
         if not used:
-            return None, True
+            return None
         readable = bool(origin.artifact) and self.intact(str(origin.artifact)) \
             and isinstance(self.content(str(origin.artifact)), dict)
         if readable:
@@ -277,26 +336,9 @@ class _Store:
             now = self._source_masks.get(str(source or ""))
             hidden = {str(c).lower() for c in now} if isinstance(now, (list, tuple, set, frozenset)) else set()
         if any(c.lower() in hidden for c in used):
-            return ("table" if origin.table else "masked"), True
+            return "table" if origin.table else "masked"
         if (origin.artifact and not readable) or (not origin.artifact and origin.source):
-            return ("table" if origin.table else "unverified"), True
-        return None, True
-
-    def _copied_kind(self, copied: CardInput, events: Sequence[tuple[int, str, str | None, Any]], sure: bool,
-                     depth: int) -> str | None:
-        """转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text）不给值的原因，同 api/evidence.py 的
-        _InputMasks._copied：上游带着值的那几个指标有不给的就不给，有遮没遮核对不了的就核对不了；整张卡、清单文字同整份结果
-        （"table"）。追得太深（recompute.CARD_DEPTH）的追不到最初取自哪里，宁可多遮，按取自遮罩格算。"""
-        if depth >= CARD_DEPTH:
-            return "masked"
-        artifact = str(copied.card.get("artifact") or "")
-        words = [self.metric_word(artifact, metric, events, sure=sure, depth=depth + 1)
-                 for metric in (copied.card["metrics"][i] for i in copied.picked)
-                 if isinstance(metric, dict) and metric.get("inputs")]
-        if "masked" in words:
-            return "table" if copied.whole else "masked"
-        if "unverified" in words:
-            return "table" if copied.whole else "unverified"
+            return "table" if origin.table else "unverified"
         return None
 
     def query_source(self, artifact: str) -> str | None:
@@ -348,6 +390,23 @@ class _Store:
             return self.masked(origin.artifact)
         hidden = self.hidden(origin.artifact)
         return any(c.lower() in hidden for c in origin.columns)
+
+
+class _Graph:
+    """一种认法下这次构建认过的指标依赖图（_Store.metric_word）：键 → 转抄以外的输入和转抄的边（MetricLinks）、认出来的
+    结论（Judged）。"""
+
+    def __init__(self) -> None:
+        self.links: dict[Any, MetricLinks] = {}
+        self.judged: dict[Any, Judged] = {}
+
+
+def _metric_key(card: str, metric: dict[str, Any], content: Any) -> Any:
+    """一个指标在依赖图上的键：(指标集工件, 指标在卡上的位置)，转抄的边按同样的键指到上游；不是这张卡上的那个指标对象的
+    （调用方另取来的）按对象本身认，不和别的指标混在一起，同 api/evidence.py 的 _metric_key。"""
+    metrics = content.get("metrics") if isinstance(content, dict) and isinstance(content.get("metrics"), list) else []
+    index = next((i for i, m in enumerate(metrics) if m is metric), None)
+    return (card, index) if index is not None and card else ("metric", id(metric))
 
 
 def _snapshot_masked(content: Any, source_masks: Mapping[str, Any], *, intact: bool,

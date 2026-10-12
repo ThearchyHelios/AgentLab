@@ -17,6 +17,8 @@
 - 遮罩列取来的输入不给值、也不拿来推演：改一个输入、排除一行，新值和原值一比就能算出遮住的那一格。vars.res.rows[0][2]
   这种按位置取自查询结果的标量没有定位，顺着取值链认出是哪一列（positional_cell，证据面板的指标步骤用同一个认法）；
   下标不是字面量的（rows[vars.i][2]）按列认，整行（rows[0]）按整行的列认（wide）。
+  转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text）按上游那几个指标认：调用方在指标依赖图上一次
+  认好（masked_closure，证据面板、写作目录、可验证报告同一个函数），交进来（Sources.copied），转抄的是取自遮罩格的指标就不给。
   指标本身的原值给不给（withheld_value，证据面板指标步骤的值同一个判断）：用到了遮罩列的一格、一行，原值写「已遮罩」——
   指标的值可能就是那一格，输入里拿掉了、指标上照给，等于没遮；最外层的输入遮没遮核对不了，写「无法核对」。整份结果
   当输入（len(vars.res.rows)）、认不出出处的输入（数据整形算出来再赋给变量的一格），按值认：值里有这次运行查到过的
@@ -66,6 +68,8 @@ NOT_RESTORABLE = "这类输入当时没有保存完整值"
 MASKED_INPUT = "这一列在数据源中设置了遮罩，不能用于推演"
 MASKED_TABLE = "这份查询结果里有设置了遮罩的列，不能用于推演"
 MASKED_METRIC = "这个指标用到了设置了遮罩的列，不能推演"
+#: 转抄上游口径卡的输入，转抄的是取自遮罩列的指标（Sources.copied，和证据面板同一张依赖图）
+MASKED_COPY = "转抄的口径卡指标取自设置了遮罩的列，不能用于推演"
 #: 认不出出处的输入（数据整形算出来再赋给变量的一格），值和这次运行查到过的遮罩值一样（按值认，Sources.secrets）
 MASKED_VALUE_INPUT = "这个输入的值与设置了遮罩的列中的值相同，不能用于推演"
 MASKED_VALUE_METRIC = "这个指标的值或输入与设置了遮罩的列中的值相同，不能推演"
@@ -122,6 +126,9 @@ class Sources:
       排除行只可能影响在那份快照交回之后才算出来的值（_doubt）。不知道的一律当可能受影响
     - secrets：这次运行查到过的遮罩值（masking._Secrets，没有为 None），用到时才取：认不出出处的输入、整份结果当输入的
       指标，值给不给按它认（withheld_value）。没给的（双盲复算）不按值认
+    - copied：卡上转抄上游口径卡的输入给不给值，指标在卡上的位置 → 输入路径 → (种类, 原因)，种类同 Judged.copied。
+      调用方按证据面板同一张指标依赖图认好（api/evidence.py 的 copied_inputs → masked_closure）；没给的（双盲复算）当
+      认不出出处
     """
 
     load: Callable[[str], Any]
@@ -131,6 +138,7 @@ class Sources:
     returned: Mapping[str, int] = field(default_factory=dict)
     finished: Mapping[str, int] = field(default_factory=dict)
     secrets: Callable[[], Any] | None = None
+    copied: Mapping[int, Mapping[str, tuple[str | None, str | None]]] = field(default_factory=dict)
 
 
 class _Store:
@@ -182,9 +190,11 @@ class _Input:
     traced: bool = False
     #: 认不出出处，值里却有这次运行查到过的遮罩值（按值认的遮罩）
     by_value: bool = False
-    #: 遮着的是一整份结果（或者值里有遮罩值的容器）：整个指标推演不了，可它不一定把遮罩值带进指标的值，指标的原值
-    #: 按值认（len(vars.res.rows) 照给）
+    #: 遮着的是一整份结果（或者值里有遮罩值的容器、整张转抄的口径卡）：整个指标推演不了，可它不一定把遮罩值带进指标的值，
+    #: 指标的原值按值认（len(vars.res.rows) 照给）
     whole: bool = False
+    #: 转抄上游口径卡（Sources.copied 里有它）：给不给按依赖图认好了，不再按取值链、按值认
+    copy: bool = False
 
     @property
     def cell(self) -> bool:
@@ -274,12 +284,13 @@ def whatif(card: dict[str, Any], changes: Changes, sources: Sources, *, metric: 
     新值不知道）。推演不了的指标 changed 一律为 None，只看它分不出「什么都没改」。
     """
     store = _Store(sources)
-    metrics = [m for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id") is not None]
+    metrics = [(i, m) for i, m in enumerate(card.get("metrics") or [])
+               if isinstance(m, dict) and m.get("id") is not None]
     if metric is not None:
-        metrics = [m for m in metrics if str(m["id"]) == str(metric)]
+        metrics = [(i, m) for i, m in metrics if str(m["id"]) == str(metric)]
         if not metrics:
             raise WhatIfError(f"口径卡中没有指标「{metric}」")
-    plans = [_plan(m, store) for m in metrics]
+    plans = [_plan(m, store, copied=sources.copied.get(i)) for i, m in metrics]
     _check(changes, plans, store, metric=metric)
     outcomes = [_outcome(p, changes, sources) for p in plans]
     return {"metrics": [result for result, _ in outcomes], "unsupported": _unsupported(plans),
@@ -302,7 +313,8 @@ def recompute(metric: dict[str, Any], changes: Changes, sources: Sources) -> dic
 # --------------------------------------------------------------------------
 
 
-def _plan(metric: dict[str, Any], store: _Store) -> _Plan:
+def _plan(metric: dict[str, Any], store: _Store, *, copied: Mapping[str, tuple[str | None, str | None]] | None = None
+          ) -> _Plan:
     expr = str(metric.get("expression") or "").strip()
     items = metric.get("inputs")
     if not expr or not isinstance(items, list):
@@ -319,7 +331,7 @@ def _plan(metric: dict[str, Any], store: _Store) -> _Plan:
     inputs: dict[str, _Input] = {}
     for item in items:
         if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"] not in inputs:
-            inputs[item["path"]] = _restore(item, remaining, set(within), store)
+            inputs[item["path"]] = _restore(item, remaining, set(within), store, (copied or {}).get(item["path"]))
     plan = _Plan(metric, tree, tops, inputs, within=within)
     if lost := [p for p in tops if p not in inputs]:
         plan.plain = f"口径卡缺少输入 {'、'.join(lost[:3])} 的记录"
@@ -327,8 +339,8 @@ def _plan(metric: dict[str, Any], store: _Store) -> _Plan:
     # 指标的原值给不给：和证据面板的指标步骤同一个判断（withheld_value），输入按同一套分类交进去
     plan.held = withheld_value(
         metric, metric.get("value"), masked=[p for p, i in inputs.items() if i.cell],
-        unverified=[p for p, i in inputs.items() if i.unreadable],
-        uncertain=any((i.masked and not i.cell) or not i.traced for i in inputs.values()),
+        unverified=[p for p, i in inputs.items() if i.unreadable and not i.whole],
+        uncertain=any((i.masked and not i.cell) or (i.unreadable and i.whole) or not i.traced for i in inputs.values()),
         secrets=store.sources.secrets)
     return plan
 
@@ -379,7 +391,8 @@ def _remaining(substituted: Any, paths: list[str]) -> set[str]:
         return set(paths)
 
 
-def _restore(item: dict[str, Any], remaining: set[str], nested: set[str], store: _Store) -> _Input:
+def _restore(item: dict[str, Any], remaining: set[str], nested: set[str], store: _Store,
+             copied: tuple[str | None, str | None] | None = None) -> _Input:
     path = item["path"]
     inp = _Input(item=item, path=path, value=item.get("value"), selector=path in nested)
     locator = item.get("locator") if isinstance(item.get("locator"), dict) else {}
@@ -406,6 +419,9 @@ def _restore(item: dict[str, Any], remaining: set[str], nested: set[str], store:
             # 也不拿来推演。数据源现在设的遮罩照样认（_masked），认出来了就按遮罩说
             inp.unreadable = True
             inp.problem = inp.problem or (TAMPERED if trouble == "tampered" else UNREADABLE)
+    if copied is not None:
+        _copied(inp, *copied)
+        return inp
     inp.masked = _masked(inp, locator, store)
     inp.traced = inp.snapshot is not None or (item.get("via") in ("tool_cell", "agent_field") and artifact is not None)
     if not inp.masked:
@@ -413,6 +429,19 @@ def _restore(item: dict[str, Any], remaining: set[str], nested: set[str], store:
     if not inp.masked and not inp.traced:
         _by_value(inp, store)
     return inp
+
+
+def _copied(inp: _Input, kind: str | None, reason: str | None) -> None:
+    """转抄上游口径卡的输入（Sources.copied，和证据面板同一张依赖图认的）：转抄的是取自遮罩格的指标，不给值、不推演
+    （整张卡转抄的同整份结果，指标的原值另按值认）；上游指标核对不了的，同读不出来的快照，不给值、不推演（整张卡转抄的
+    指标的原值同样另按值认）；照给的照常推演。认得出出处，不再按值认：以前只按值认，转抄来的值不是够长的号码就照给、
+    还能改。"""
+    inp.traced = inp.copy = True
+    if kind in ("masked", "table"):
+        inp.masked, inp.whole = True, kind == "table"
+    elif kind in ("unverified", "table_unverified"):
+        inp.unreadable, inp.whole = True, kind == "table_unverified"
+        inp.problem = inp.problem or reason or CARD_UNREADABLE
 
 
 def _full_value(item: dict[str, Any], store: _Store) -> tuple[Any, str | None]:
@@ -575,37 +604,42 @@ _GONE = object()
 #: 下标不是字面量（rows[vars.i]、rows[len(vars.res.rows) - 1]）：wide 时认作「哪一行、哪一列说不准」
 _ANY = object()
 
-#: 转抄上游口径卡的取值链最多往上追几张卡（卡 3 抄卡 2、卡 2 抄卡 1……）：循环里一张卡抄自己上一轮的产出也就此打住。
-#: 追到头还没追完的宁可多遮，按取自遮罩格算
-CARD_DEPTH = 8
 #: 口径卡产出里不带指标值的字段：取这些的输入不算转抄了指标的值
 _CARD_PLAIN = frozenset({"kind", "caliber", "caliber_version", "artifact", "source"})
 #: 一个指标里不带值的字段（名称、单位、表达式、显示格式、状态这类）。值、渲染、输入、代入式都带着值
 _METRIC_PLAIN = frozenset({"id", "name", "unit", "expression", "decimals", "format", "status", "recompute_ok",
                            "incomplete", "incomplete_reason", "sql_check_failed", "sql_check_reason"})
+#: 转抄的上游口径卡当时的产出读不出来（文件不在、与哈希不一致、不知道是谁写的）：转抄来的是不是遮罩值核对不了
+CARD_UNREADABLE = "转抄的口径卡结果无法读取，核对不了这个值是否取自设置了遮罩的列"
 
 
 @dataclass(frozen=True)
 class CardInput:
     """卡上的一个输入转抄了上游口径卡的产出（card_input）：node_id 是那张卡的节点，card 是它当时的产出（指标集加清单
     文字），picked 是这个输入带着值的那几个指标（在 card["metrics"] 里的位置）。whole：整张卡、整份指标列表、清单文字、
-    下标不是字面量的一个指标——不一定把哪个指标的值带进来，同整份查询结果（Origin.table）。"""
+    下标不是字面量的一个指标——不一定把哪个指标的值带进来，同整份查询结果（Origin.table）。
+
+    unreadable：那张卡当时的产出现在读不出来，card 为 None、picked 为空，这里写原因。卡上记着这个输入转抄来了值（不是空的），
+    算的时候产出是在的，现在读不出来只能是产出丢了或被改了：同按位置取的一格取值链上的产出读不出来（positional_cell 的
+    unreadable），遮没遮核对不了，宁可多遮。以前当作认不出出处，只按出处认的写作目录、可验证报告照给，号码随卡出去了。"""
 
     node_id: str
-    card: dict[str, Any]
+    card: dict[str, Any] | None
     picked: tuple[int, ...]
     whole: bool
+    unreadable: str | None = None
 
 
 def card_input(item: dict[str, Any], output: Callable[[Any], Any]) -> CardInput | None:
     """卡上的一个输入是不是转抄上游口径卡的产出：nodes.<卡>.metrics[0].value、vars.<卡的 assign_to>.metrics[0].value、
     nodes.<卡>.text（清单文字逐条写着「指标（名称）= 值」）、整张卡。是的话交回那张卡和带着值的那几个指标，值给不给按
-    那几个指标认（证据面板、写作目录、可验证报告同一个判断）：上游的指标取自遮罩格，转抄它的这个指标同样取自遮罩格。
-    以前这几种写法认不出出处，转抄来的号码照样进了写作目录、文档的证据目录和可验证报告。
+    那几个指标认（masked_closure：证据面板、写作目录、推演、可验证报告同一个判断）：上游的指标取自遮罩格，转抄它的这个
+    指标同样取自遮罩格。
 
     output 同 input_origin：节点 id → 那个节点当时的产出；nodes.X 是 X 的产出，vars.X 是写它的节点（输入记着的 node_id）
-    的产出——口径卡的 assign_to 交给变量的就是它的产出本身。产出不是指标集的（别的节点）交回 None。只取口径名、版本、指标
-    的名称、单位这类不带值的字段的，也交回 None。"""
+    的产出——口径卡的 assign_to 交给变量的就是它的产出本身。产出不是指标集的（别的节点）交回 None；卡上记着这个输入出自
+    口径卡（via 为 metric）、转抄来了值，产出却读不出来的交回 unreadable（见 CardInput）。只取口径名、版本、指标的名称、
+    单位这类不带值的字段的，也交回 None。"""
     try:
         tree = ast.parse(str(item.get("path") or ""), mode="eval").body
     except SyntaxError:
@@ -622,24 +656,149 @@ def card_input(item: dict[str, Any], output: Callable[[Any], Any]) -> CardInput 
     if not isinstance(tree, ast.Name) or tree.id not in ("vars", "nodes") or not keys or not isinstance(keys[0], str):
         return None
     node_id = keys[0] if tree.id == "nodes" else item.get("node_id")
+    rest = keys[1:]
+    whole = not rest or rest[0] == "text" or rest[0] is _ANY \
+        or (rest[0] == "metrics" and (len(rest) == 1 or rest[1] is _ANY))
+    plain = len(rest) > 2 and isinstance(rest[2], str) and rest[2] in _METRIC_PLAIN
+    if not whole and (rest[0] != "metrics" or plain):
+        # 口径名、版本、工件 id，指标的名称、单位这类，或者产出里本来没有的键：不带指标的值
+        return None
     card = output(node_id) if node_id else None
     if not (isinstance(card, dict) and card.get("kind") == "metric_set" and isinstance(card.get("metrics"), list)):
+        if node_id and item.get("via") == "metric" and item.get("value") is not None:
+            return CardInput(str(node_id), None, (), whole, CARD_UNREADABLE)
         return None
-    metrics, rest = card["metrics"], keys[1:]
-    every = tuple(range(len(metrics)))
-    if not rest or rest[0] == "text" or rest[0] is _ANY or (rest[0] == "metrics" and len(rest) == 1):
-        return CardInput(str(node_id), card, every, True)
-    if rest[0] != "metrics":
-        # 口径名、版本、工件 id 这类，或者产出里本来没有的键：不带指标的值
-        return None
+    metrics = card["metrics"]
+    if whole:
+        return CardInput(str(node_id), card, tuple(range(len(metrics))), True)
     index = rest[1]
-    if index is _ANY:
-        return CardInput(str(node_id), card, every, True)
     if not isinstance(index, int) or not -len(metrics) <= index < len(metrics):
         return None
-    if len(rest) > 2 and isinstance(rest[2], str) and rest[2] in _METRIC_PLAIN:
-        return None
     return CardInput(str(node_id), card, (index % len(metrics),), False)
+
+
+@dataclass(frozen=True)
+class CopyEdge:
+    """指标依赖图上的一条转抄边（masked_closure）：卡上路径为 path 的输入转抄了上游 upstream 那几个指标（键由调用方定，
+    和 MetricLinks 的键同一套）。whole、unreadable 同 CardInput；读不出来的 upstream 为空。"""
+
+    path: str
+    upstream: tuple[Any, ...]
+    whole: bool
+    unreadable: str | None = None
+
+
+@dataclass
+class MetricLinks:
+    """指标依赖图上的一个指标（masked_closure 的输入）：metric 是卡上的那个指标（认表达式的最外层引用、值）；direct 是
+    转抄以外的输入里不给值的，路径 → (种类, 遮罩列)，种类同 api/evidence.py 的 _Held（masked、table、unverified、value）；
+    uncertain：有认不出出处、指标的值要按值认的输入；copies：转抄上游口径卡的输入。"""
+
+    metric: dict[str, Any]
+    direct: dict[str, tuple[str, tuple[str, ...]]] = field(default_factory=dict)
+    uncertain: bool = False
+    copies: list[CopyEdge] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Judged:
+    """masked_closure 认出来的一个指标：word 是指标的值给不给（None 照给，masked 不给，unverified 核对不了，同
+    withheld_value）；copied 是每个转抄的输入：路径 → (种类, 遮罩列, 原因)，种类 None 照给，masked、unverified 同直接的
+    输入，table 是整张卡转抄、上游有指标不给（同整份查询结果：指标的值另按值认），table_unverified 是整张卡转抄、上游有
+    指标核对不了，原因只在上游产出读不出来时有；columns 是让它不给的遮罩列，转抄它的输入上写这几列。"""
+
+    word: str | None
+    copied: Mapping[str, tuple[str | None, tuple[str, ...], str | None]] = field(default_factory=dict)
+    columns: tuple[str, ...] = ()
+
+
+#: 指标的值给不给，从松到严：照给、核对不了、不给
+_STRICTNESS = {None: 0, "unverified": 1, "masked": 2}
+
+
+def masked_closure(links: Mapping[Any, MetricLinks], known: Mapping[Any, Judged] | None = None,
+                   secrets: Callable[[], Any] | None = None) -> dict[Any, Judged]:
+    """转抄上游口径卡的指标值给不给：在指标依赖图上一次算出的最小不动点。证据面板、写作目录、推演、可验证报告都按这一个
+    函数认（各自按自己的口径认好转抄以外的输入，见 MetricLinks.direct），不各写一套。
+
+    先按转抄以外的输入认每个指标（取自遮罩格的、核对不了的），再沿转抄的边往下游传：上游有一个指标不给，转抄它的输入就是
+    masked（整张卡、清单文字、整份指标列表、下标不是字面量的是 table，指标的值另按值认）；上游只是核对不了的，转抄它的
+    输入核对不了。一直传到不再变化。环（循环里一张卡抄自己上一轮的产出、几张卡互相转抄）本身不带来遮罩：从「都照给」
+    起往上收，环上没有哪个指标别的输入取自遮罩格，整个环照给；有一个取自遮罩格，整个环都不给。以前逐个往上递归、追够
+    八层就按遮罩算：没设任何遮罩的工作流里，循环里累加上一轮结果的口径卡也成了「已遮罩」，引用它的正式运行判失败；
+    每个指标的护栏 nodes.acc 选中整张卡的全部指标，递归次数随指标个数指数增长，卡住事件循环。
+
+    links：这次要认的指标（键 → MetricLinks），转抄的边指到的上游要么也在里面，要么在 known 里（之前认好的，结果不再变），
+    都不在的（卡上没记输入的老指标、写死的数）照给。secrets 同 withheld_value，整张卡转抄、认不出出处的输入要按值认时才取。
+    每个指标的结论只会往严里变（最多两次），每变一次只重认转抄它的那几个：总的工作量和边数成正比。"""
+    known = known or {}
+    words: dict[Any, str | None] = {key: None for key in links}
+    columns: dict[Any, tuple[str, ...]] = {key: () for key in links}
+    below: dict[Any, set[Any]] = {}
+    for key, node in links.items():
+        for edge in node.copies:
+            for up in edge.upstream:
+                if up in links:
+                    below.setdefault(up, set()).add(key)
+
+    def state(key: Any) -> tuple[str | None, tuple[str, ...]]:
+        if key in links:
+            return words[key], columns[key]
+        found = known.get(key)
+        return (found.word, found.columns) if found is not None else (None, ())
+
+    def judge(key: Any) -> Judged:
+        node = links[key]
+        masked = [p for p, (kind, _) in node.direct.items() if kind in ("masked", "value")]
+        unverified = [p for p, (kind, _) in node.direct.items() if kind == "unverified"]
+        uncertain = node.uncertain or any(kind == "table" for kind, _ in node.direct.values())
+        because = [c for kind, cols in node.direct.values() if kind in ("masked", "table") for c in cols]
+        copied: dict[str, tuple[str | None, tuple[str, ...], str | None]] = {}
+        for edge in node.copies:
+            if edge.unreadable is not None:
+                copied[edge.path] = ("table_unverified" if edge.whole else "unverified", (), edge.unreadable)
+            else:
+                ups = [state(up) for up in edge.upstream]
+                if any(word == "masked" for word, _ in ups):
+                    cols = tuple(dict.fromkeys(c for word, cs in ups if word == "masked" for c in cs))
+                    copied[edge.path] = ("table" if edge.whole else "masked", cols, None)
+                elif any(word == "unverified" for word, _ in ups):
+                    copied[edge.path] = ("table_unverified" if edge.whole else "unverified", (), None)
+                else:
+                    copied[edge.path] = (None, (), None)
+            kind, cols, _ = copied[edge.path]
+            if kind == "masked":
+                masked.append(edge.path)
+            elif kind == "unverified":
+                unverified.append(edge.path)
+            elif kind is not None:
+                uncertain = True
+            if kind in ("masked", "table"):
+                because.extend(cols)
+        word = withheld_value(node.metric, node.metric.get("value"), masked=masked, unverified=unverified,
+                              uncertain=uncertain, secrets=secrets)
+        return Judged(word, copied, tuple(dict.fromkeys(because)) if word == "masked" else ())
+
+    queue = list(links)
+    waiting = set(queue)
+    while queue:
+        key = queue.pop()
+        waiting.discard(key)
+        got = judge(key)
+        # 只往严里收：withheld_value 先看取自遮罩格的、再看核对不了的，上游变严时这里也不会松回去
+        word = got.word if _STRICTNESS[got.word] >= _STRICTNESS[words[key]] else words[key]
+        cols = tuple(dict.fromkeys((*columns[key], *got.columns))) if word == "masked" else ()
+        if (word, cols) != (words[key], columns[key]):
+            words[key], columns[key] = word, cols
+            for down in below.get(key, ()):
+                if down not in waiting:
+                    waiting.add(down)
+                    queue.append(down)
+    out: dict[Any, Judged] = {}
+    for key in links:
+        got = judge(key)
+        out[key] = Judged(words[key], got.copied, columns[key])
+    return out
 
 
 def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any], *, wide: bool = False) -> dict[str, Any] | None:
@@ -1212,7 +1371,8 @@ def _unsupported(plans: list[_Plan]) -> list[dict[str, Any]]:
         for inp in plan.inputs.values():
             if blocked and not (inp.masked or inp.problem):
                 continue
-            reason = (MASKED_VALUE_INPUT if inp.by_value else MASKED_TABLE if inp.table else MASKED_INPUT) if inp.masked \
+            reason = (MASKED_VALUE_INPUT if inp.by_value else MASKED_COPY if inp.copy else MASKED_TABLE if inp.table
+                      else MASKED_INPUT) if inp.masked \
                 else f"无法推演：{inp.problem}" if inp.problem \
                 else SELECTOR if inp.selector else _fixed(inp)
             if reason:

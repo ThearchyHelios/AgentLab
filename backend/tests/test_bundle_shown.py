@@ -672,13 +672,13 @@ def test_characters_that_may_show_as_anything_next_to_a_value_cannot_pass(ref, c
 
 
 def test_uncertain_characters_where_they_cannot_change_the_value_still_pass():
-    """说不准的字挨着的不是数字的头尾（销售额以「元」结尾，后面跟一个控制字符），表情后面的变体选择符，数字前面的波浪线，
-    都改不了读到的数：照常通过。"""
+    """说不准的字挨着的不是数字的头尾（销售额以「元」结尾，后面跟一个控制字符），数字前面的波浪线，表情和数字之间隔着空格，
+    都改不了读到的数：照常通过。表情紧挨着数字的见下面「不在常见写法里」的几条。"""
     from tests.bundle_samples import formats_bundle
 
     def change(doc: dict[str, Any]) -> None:
         by_id(doc, "s5")["text"] = chr(0x7F) + chr(0x0336) + by_id(doc, "s5")["text"]
-        by_id(doc, "s12")["text"] += chr(0x2705) + chr(0xFE0F)    # 转化率紧前面：对勾表情加上表情样式的变体选择符
+        by_id(doc, "s12")["text"] += chr(0x2705) + chr(0xFE0F) + " "  # 转化率前面：对勾表情、变体选择符，再隔一个空格
         by_id(doc, "s14")["text"] += chr(0x301C)                   # 环比紧前面：波浪线不是横线，不算负号
 
     got = verdicts(rewritten(formats_bundle(), change))
@@ -807,6 +807,62 @@ def test_a_lookalike_digit_next_to_a_checked_value_cannot_pass(ref, change):
     原因说清。"""
     got = _only(ref, change, "na", LOOKALIKE)
     assert got["overall"]["result"] == "partial", got["overall"]
+
+
+ODD = UNSURE + "紧挨着这个数的字不在常见写法里，无法确认读者看到的数"
+
+
+@pytest.mark.parametrize("ref, change, reason", [
+    # 长得像 l、I、1 的字放在销售额前面（复核第 2 轮的伪造写法）：西里尔、希腊、拉丁的竖线字母，ASCII 竖线，汉字「丨」，
+    # 全角竖线、竖排的破折号、制表符的竖线
+    *[("m:gmv", _glue_before("s3", chr(cp)), LOOKALIKE)
+      for cp in (0x0406, 0x0399, 0x04C0, 0x01C0, 0x7C, 0x4E28, 0xFF5C, 0xFE31, 0x2502)],
+    # 长得像 O、0 的字接在流水后面：西里尔、希腊的 O，空心圆，小写 o
+    *[("v:Q1.r0.gmv", _glue_after("s34", chr(cp)), LOOKALIKE) for cp in (0x041E, 0x039F, 0x25CB, 0x6F)],
+    # 名单以外的字：数学粗体 l、谚文的 ㅣ、全角拉丁字母、日文假名、表情（带变体选择符）、零宽空格、各种窄空格和不断行空格，
+    # 当笔画用的汉字（丶、丿、亅），前面不是字母的句点（读起来像小数点）
+    *[("m:gmv", _glue_before("s3", text), ODD)
+      for text in (chr(0x1D425), chr(0x3163), chr(0xFF21), chr(0x3042), chr(0x2705) + chr(0xFE0F), chr(0x200B),
+                   "1" + chr(0x2006), "1" + chr(0x2009), "1" + chr(0x2008), "1" + chr(0x202F), chr(0xA0), "\t",
+                   chr(0x4E36), chr(0x4E3F), chr(0x4E85), ".")],
+    # 量级单位的易混字接在流水后面：西里尔、希腊的 M、K、B，开尔文符号，小号百分号，谚文的 ㅇ
+    *[("v:Q1.r0.gmv", _glue_after("s34", chr(cp)), ODD)
+      for cp in (0x041C, 0x039C, 0x212A, 0x041A, 0x0392, 0xFE6A, 0x3147)],
+    # 隔着各种空白、左括号再接量级单位：换行、制表、em / en / thin 空格、全角空格、不断行空格，「（万元）」「十万」「w」
+    *[("v:Q1.r0.gmv", _glue_after("s34", text), SCALED)
+      for text in ("\n万", "\t万", chr(0x2003) + "万", chr(0x2002) + "万", chr(0x2009) + "万", chr(0x3000) + "万",
+                   chr(0xA0) + "万", "\n亿元", "（万元）", " (万)", "十万", "w", "W")],
+    # 负号前面是别的文字系统里长得像标点的字母，不是 ASCII 字母数字：照旧是负号
+    *[("m:conv_rate", lambda doc, t=text: by_id(doc, "s12").update(text=t), result)
+      for text, result in (("转化率\ua78f-", GLUED), ("转化率\u01c0-", GLUED), ("转化率\ua78c-", GLUED),
+                           ("转化率\ua78f\u2212", GLUED), ("转化率\u0410-", GLUED), ("转化率\ua78f\u2010", DASHED))],
+    # 科学记数法：后面接 e 和数字
+    ("v:Q1.r0.gmv", _glue_after("s34", "e3"), GLUED),
+    ("v:Q1.r0.gmv", _glue_after("s34", "e+3"), GLUED),
+])
+def test_a_character_outside_the_common_writing_next_to_a_value_is_not_green(ref, change, reason):
+    """紧挨着核对过的数字头尾的那一个字改成白名单（COMMON）：汉字、中文标点、半角和全角空格、ASCII 字母（l、I、O、o 照旧算
+    像数字的字母）、常用的半角标点和算式符号、上一轮放行的破折号写法以外的，一律判无法核对、写明原因，总览不再是绿色的
+    「全部通过」。复核第 2 轮用这些写法伪造（只改相邻的普通文字、重算全部哈希），以前全是绿的、提示也不显示。负号前面只认
+    ASCII 字母数字是编号；后面接 e 和数字的读作科学记数法，判不通过。"""
+    result = "fail" if reason == GLUED else "na"
+    got = _only(ref, change, result, reason)
+    assert got["overall"]["result"] == ("fail" if result == "fail" else "partial"), got["overall"]
+
+
+def test_common_punctuation_next_to_checked_values_still_passes():
+    """常见的写法照常通过：等号、半角括号和冒号、加号、斜杠、百分比前面的加号、半角逗号和句点结句、约等号和乘号、编号后面的
+    句点（NO.）、全角的冒号括号顿号。"""
+    from tests.bundle_samples import formats_bundle
+
+    text = ("## 算式\n\n客单价=[[m:avg]]，销售额:[[m:gmv]]，转化率(+[[m:conv_rate]])，订单 [[v:Q1.r0.order_no]], 另计。"
+            "流水约≈[[v:Q1.r0.gmv]]/月，退款×[[m:refund]]，编号No.[[m:orders]]，出口额：[[m:export]]、"
+            "年度（[[m:annual|亿]]）。合计 [[v:Q1.r1.gmv]].")
+    got = verdicts(formats_bundle(text=text))
+    assert len(got["numbers"]) == 10, got["numbers"]
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), \
+        [n for n in got["numbers"] if n["result"] != "pass"]
+    assert got["overall"]["result"] == "pass", got["overall"]
 
 
 def test_ordinary_writing_next_to_checked_values_still_passes_as_exported():
