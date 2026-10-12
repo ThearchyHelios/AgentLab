@@ -1843,6 +1843,9 @@ await section('设置页「核查」一节：改了之后整组写 verify，不�
     daily_max_usd: 2,
   }
   check('……整组写（没改的项照原值），不限存 null，数存成数', JSON.stringify(put.verify) === JSON.stringify(want), JSON.stringify(put.verify))
+  // 存完之后页面另起一次请求取今日花费：检查并行跑、机器忙的时候它晚于「已保存」到达，轮询等它（最多 3 秒），
+  // 不在「已保存」出现的那一刻就判（单独跑总是通过，check-all 满并行时偶发 2 → 2）
+  for (let i = 0; i < 30 && spends() <= before; i++) await page.waitForTimeout(100)
   check('……存完再取一次今日花费', spends() > before, `${before} → ${spends()}`)
   check('……存完读回来的就是刚存的', await page.locator('#pref-verify-model').inputValue() === 'model-b'
     && !(await page.locator('[data-verify-toggle="challenge.enabled"]').isChecked()))
