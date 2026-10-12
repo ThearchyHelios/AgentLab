@@ -224,6 +224,20 @@ export function unitText(unit: Pick<EvidenceUnit, 'segments'>): string {
 }
 
 /**
+ * 整句面板「挂的依据」里一条依据的说明。证据图（/evidence）给的标签优先：服务端已把用到遮罩列的指标的值换成「已遮罩」
+ * （报告只把首位客户的手机号挂作依据、正文里没有号码时，号码也不该从这里露出来）。证据图还没回来、取不到时，有运行的
+ * 指标只写名字——文档目录里的标签是「名称 = 渲染值」，值可能就是遮罩列的那一格；没有运行的（预览）、别的依据照目录
+ */
+export function citeLabel(alias: string, doc: Pick<EvidenceDocData, 'catalog'>, graph: EvidenceGraph | undefined,
+  report: string | undefined, hasRun: boolean): string | undefined {
+  const sealed = graph?.evidence?.find((e) => e.alias === alias && (!report || !e.report || e.report === report))?.label
+  if (typeof sealed === 'string' && sealed) return sealed
+  const entry = doc.catalog?.[alias]
+  if (hasRun && entry?.kind === 'metric') return typeof entry.name === 'string' && entry.name ? entry.name : alias
+  return typeof entry?.label === 'string' ? entry.label : undefined
+}
+
+/**
  * 片段的来源说一句：「口径卡指标 环比增幅」「运行输入 week」「查询 Q3 · 第 6 行 · amount」。
  * 单元格先看 cite 的种类：查询条目在目录里是 query，引用它的一格是 cell
  */

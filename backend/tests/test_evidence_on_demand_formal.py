@@ -209,8 +209,12 @@ def test_an_inline_judged_report_that_did_not_judge_this_sentence_says_so(verdic
                      seal={"sealed": True, "ok": True, "manifest_seq": 3, "legacy": False})
     got = _on_demand(sealed, doc, first, verdict, claims="judge")
     assert got["available"] is False and got["reason"] == "formal", got
-    assert JUDGED_WORDS not in got["message"] and "这句没有判成" in got["message"], got["message"]
-    assert "原因见判定" in got["message"] and "不能按需裁判" in got["message"], got["message"]
+    assert JUDGED_WORDS not in got["message"] and "不能按需裁判" in got["message"], got["message"]
+    if verdict is None:
+        # 没有判定可看：不说「原因见判定」
+        assert "这句没有判定" in got["message"] and "原因见判定" not in got["message"], got["message"]
+    else:
+        assert "这句没有判成" in got["message"] and "原因见判定" in got["message"], got["message"]
     # 判过的那一句照旧说已完成裁判
     assert JUDGED_WORDS in _on_demand(sealed, doc, second, {"status": "supported"}, claims="judge")["message"]
     # 一次问几句（按需裁判接口）：有一句没判成就照实说

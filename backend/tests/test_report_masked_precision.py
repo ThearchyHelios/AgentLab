@@ -236,7 +236,8 @@ async def test_the_rewrite_request_says_the_value_must_not_be_written_in_any_for
 
 
 async def test_only_the_cited_snapshots_are_read_and_each_only_once(engine_up, mall, monkeypatch):
-    """组装好一稿之后只读正文引用到的那几份快照，重写的稿子不再读同一份；没引用到的、没设遮罩的一份都不读。"""
+    """组装好一稿之后才读：引用到的那几份、数据源现在设了遮罩的那几份（按值认要收里面的值），每份只读一次，重写的稿子
+    不再读；没设遮罩的数据源上的一份都不读（test_report_masked_values）。"""
     from app.core import artifact_store as store
     from app.engine.nodes.report import _MaskedCells
 
@@ -258,10 +259,10 @@ async def test_only_the_cited_snapshots_are_read_and_each_only_once(engine_up, m
     monkeypatch.setattr(store, "load", counting)
     check = _MaskedCells(catalog)
     first = await check(compose_doc("电话 [[v:Q1.r0.tel]]。", catalog, node_id="write", run_id="r1"))
-    assert masked_of(first["violations"]) == ["v:Q1.r0.tel"] and read == [cited], read
+    assert masked_of(first["violations"]) == ["v:Q1.r0.tel"] and sorted(read) == sorted([cited, other]), read
     second = await check(compose_doc("客户 [[v:Q1.r0.customer]]，电话 [[v:Q1.r0.tel]]。", catalog, node_id="write",
                                      run_id="r1"))
-    assert masked_of(second["violations"]) == ["v:Q1.r0.tel"] and read == [cited], "同一份快照不再读第二遍"
+    assert masked_of(second["violations"]) == ["v:Q1.r0.tel"] and len(read) == 2, "同一份快照不再读第二遍"
 
 
 # --------------------------------------------------------------------------
@@ -279,4 +280,4 @@ async def test_the_audit_lists_a_masked_cell_on_its_own_row(client, monkeypatch,
     # 这一行自己不写值（所在的句子是报告原文，标注之后照常产出，读者本来就看得到）
     assert leaks([flagged[0][k] for k in ("text", "ref", "note")]) == []
     csv = (await client.get(f"/api/runs/{row.id}/evidence/audit", params={"format": "csv"})).text
-    assert "引用了遮罩列" in csv
+    assert "写进了遮罩列的值" in csv

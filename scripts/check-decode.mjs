@@ -1377,12 +1377,14 @@ await section('报告核对 report.checked、口径卡的台账（可点击证�
     && !!rcAbsent?.detail?.includes('缺失断言') && !!rcAbsent?.detail?.includes('依据不足'), `${rcAbsent?.status} ${rcAbsent?.detail}`)
 })
 
-await section('报告引用了取自遮罩列的格子（report_masked_cell）：标题说几处、已标注，副标题点名引用，不写那几格的值', async () => {
-  // 契约：data = {level: warn, code: report_masked_cell, message, count, refs, columns}，重写后仍在、「违规处置」为标注时才发
+await section('报告写进了取自遮罩列的值（report_masked_cell）：标题说几处、已标注，副标题点名引用，不写那几格的值', async () => {
+  // 契约：data = {level: warn, code: report_masked_cell, message, count, refs, written, columns}，重写后仍在、「违规处置」
+  // 为标注时才发。written 是其中按值认出来的几处（正文里直接写着的、经指标带出来的，违规带 by_value）
   const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
   const reportPy = readFileSync(`${root}backend/app/engine/nodes/report.py`, 'utf8')
-  check('后端发引用了遮罩列的警告，带着 count、refs、columns', reportPy.includes('code="report_masked_cell"')
-    && reportPy.includes('count=len(hits), refs=refs') && reportPy.includes('columns=list(dict.fromkeys('),
+  check('后端发写进了遮罩列的值的警告，带着 count、refs、written、columns', reportPy.includes('code="report_masked_cell"')
+    && reportPy.includes('count=len(hits), refs=refs') && reportPy.includes('written=sum(')
+    && reportPy.includes('columns=list(dict.fromkeys('),
     '改了 report.py 的字段就同步改 decode.ts 的 explainLog 和这里的夹具')
   const MASKED = '报告引用了 2 处取自遮罩列的格子（「v:Q2.r0.tel」、「v:Q2.r1.tel」），已要求模型重写 1 次仍未改掉：'
     + '数据源设置了遮罩的列不应写进报告。报告照常产出，这几处已标注，已记为缺口。请在报告撰写节点的指令中去掉对这些列的引用'
@@ -1411,6 +1413,36 @@ await section('报告引用了取自遮罩列的格子（report_masked_cell）�
     .find((s) => s.code === 'report_masked_cell')
   check('……缺字段时标题照样说人话，不出 undefined', bare?.title === '报告引用了取自遮罩列的格子，已标注'
     && bare?.sub === undefined, `${bare?.title} / ${bare?.sub}`)
+  // 按值认出来的：正文里直接写着号码、姓名，或者经指标带了出来（[[m:phone_raw]]）。标题不说「引用了格子」
+  const titleOf = (data) => flatten(mod.decodeRun([E(1, 'log', 'w', { level: 'warn', code: 'report_masked_cell',
+    message: '报告写进了遮罩列的值', ...data })])).find((s) => s.code === 'report_masked_cell')
+  const onlyWritten = titleOf({ count: 1, written: 1, refs: [] })
+  check('……全是正文里直接写着的：标题说写进了几处遮罩列中的值，没有引用可点名就不写副标题',
+    onlyWritten?.title === '报告写进了 1 处设置了遮罩的列中的值，已标注' && onlyWritten?.sub === undefined,
+    `${onlyWritten?.title} / ${onlyWritten?.sub}`)
+  const viaMetric = titleOf({ count: 1, written: 1, refs: ['m:phone_raw'] })
+  check('……经指标带出来的：副标题点名那处引用', viaMetric?.sub === '[[m:phone_raw]]', viaMetric?.sub)
+  const both = titleOf({ count: 3, written: 1, refs: ['v:Q2.r0.tel', 'v:Q2.r1.tel'] })
+  check('……两样都有：标题说引用、写进了几处', both?.title === '报告引用、写进了 3 处取自遮罩列的值，已标注', both?.title)
+})
+
+await section('整句面板挂的依据：按证据图的标签写，不读文档目录里带值的标签（citeLabel）', async () => {
+  const ev = await import(await load('/src/lib/evidence.ts'))
+  const doc = { catalog: {
+    'm:phone_raw': { kind: 'metric', name: '首位客户手机号', label: '首位客户手机号 = 19900000301' },
+    Q1: { kind: 'query', label: 'db_query__shop · 3 行' },
+  } }
+  const graph = { evidence: [{ alias: 'm:phone_raw', report: 'write', label: '首位客户手机号 = 已遮罩' },
+    { alias: 'Q1', report: 'write', label: 'db_query__shop · 3 行' }] }
+  check('证据图有这条依据：用证据图的标签（服务端遮过）', ev.citeLabel('m:phone_raw', doc, graph, 'write', true)
+    === '首位客户手机号 = 已遮罩')
+  check('……证据图还没回来：指标只写名字，不写目录里的值', ev.citeLabel('m:phone_raw', doc, undefined, 'write', true)
+    === '首位客户手机号')
+  check('……查询这类不带值的依据照目录写', ev.citeLabel('Q1', doc, undefined, 'write', true) === 'db_query__shop · 3 行')
+  check('……证据图里是另一份报告的同名依据：不拿来用', ev.citeLabel('m:phone_raw', doc,
+    { evidence: [{ alias: 'm:phone_raw', report: 'other', label: '首位客户手机号 = 1' }] }, 'write', true) === '首位客户手机号')
+  check('……没有运行（预览）：照目录写', ev.citeLabel('m:phone_raw', doc, undefined, undefined, false)
+    === '首位客户手机号 = 19900000301')
 })
 
 await section('工具门控 tool.gated（工具信任三档）', async () => {

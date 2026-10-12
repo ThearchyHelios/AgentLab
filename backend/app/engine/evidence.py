@@ -3180,6 +3180,68 @@ def masked_cells(doc: dict[str, Any], catalog: dict[str, Any], masked: dict[str,
     return found
 
 
+def _masked_value_message(ref: str | None) -> _Reason:
+    """违规 masked_cell（按值认出来的，by_value）的说法。不点名列：按值认只知道这个值在写作目录的遮罩列里出现过。经引用
+    带出来的（指标的值就是那一格）点名那处引用；写在正文里的，交回写作者时另附那一句（context，值换成「已遮罩」）。"""
+    if ref:
+        return _Reason(
+            f"引用 [[{ref}]] 的值与设置了遮罩的列中的值相同，值不应写进报告",
+            f"[[{ref}]] 的值就是证据目录里取自遮罩列的值（手机号、姓名这类），这个值不能以任何形式写进报告，引用、数字、"
+            "照抄的文字都不行：删掉这处引用和相应的内容",
+        )
+    return _Reason(
+        "正文写着设置了遮罩的列中的值，值不应写进报告",
+        "正文里直接写着证据目录里取自遮罩列的值（手机号、姓名这类），这些值不能以任何形式写进报告，照抄的文字、数字都"
+        "不行：删掉这处文字，或者改成不含这个值的说法",
+    )
+
+
+def masked_values(doc: dict[str, Any], secrets: Any,
+                  skip: set[str] | frozenset[str] = frozenset()) -> list[dict[str, Any]]:
+    """正文里直接写着的遮罩值，每处一条违规 masked_cell（带 by_value）：写作者把号码、姓名照抄成文字、写成裸数字，或者
+    经指标、输入的引用带了出来（[[m:phone_raw]] 的值就是号码）。masked_cells 只认 [[v:]] 引用的格子，这几种它认不出；
+    数字核对管得到裸数字、管不到文字，「数字核对」关掉时数字也不管。
+
+    secrets 是写作目录里取自遮罩列的值（masking._Secrets），由报告节点按证据面板同一个函数算好交进来（report.py 的
+    _MaskedCells：只收确定取自遮罩列的列，运行输入里写着的免）；None 时一条都不记。skip 是已经按引用记过 masked_cell
+    的片段：同一处不记两条。按整句认：换了写法的长号码（199-0000-0702）组装时被拆成好几个数字片段，一个片段里认不全，
+    认出来的那一段落在哪几个片段上，就记在第一个上。
+
+    违规不带值：context 是那一句，值换成「已遮罩」——交回写作者时据此找到那一处，进事件、日志也不再露一次。"""
+    if secrets is None:
+        return []
+    skipped = {str(s) for s in skip}
+    found: list[dict[str, Any]] = []
+    for _, unit in iter_units(doc):
+        placed: list[tuple[int, int, dict[str, Any]]] = []
+        sentence = ""
+        for seg in unit.get("segments") or []:
+            text = seg.get("text") if isinstance(seg.get("text"), str) else ""
+            placed.append((len(sentence), len(sentence) + len(text), seg))
+            sentence += text
+        hits = secrets.spans(sentence, loose=True) if sentence else []
+        named: set[str] = set()
+        context: str | None = None
+        for start, end in hits:
+            owners = [(a, seg) for a, b, seg in placed if a < end and start < b]
+            if not owners or any(str(seg.get("id")) in skipped for _, seg in owners):
+                continue
+            first_at, first = owners[0]
+            if str(first.get("id")) in named:
+                continue
+            named.add(str(first.get("id")))
+            context = context or secrets.scrub(sentence, loose=True).strip()[:120]
+            ref = next((str(seg["ref"]) for _, seg in owners if seg.get("ref")), None)
+            last_at, last = owners[-1]
+            head, tail = first.get("span"), last.get("span")
+            where = None
+            if all(isinstance(s, list) and len(s) == 2 for s in (head, tail)):
+                where = [head[0] + max(start - first_at, 0), tail[0] + min(end - last_at, len(last.get("text") or ""))]
+            found.append(_violation("masked_cell", _masked_value_message(ref), ref=ref, by_value=True, context=context,
+                                    span=where, segment=first.get("id"), unit=unit.get("id")))
+    return found
+
+
 #: 引用查询结果的写法。只跟着目录里的查询出现（catalog_prompt）：写作规则本身保持一期那份，升级前
 #: 发起的运行跑到报告节点时提示一字不差；只有口径卡的目录也不该教写作者去引用不存在的 Q1
 CELL_RULES = (

@@ -169,6 +169,11 @@ async def test_a_value_carrying_a_masked_value_is_withheld_in_both_places(client
     m = (await whatif(client, run.id))[metric]
     assert m["status"] == "masked" and m["old"] == m["rendered_old"] == "已遮罩" and m["withheld"] is True, m
     assert all(i["old"] is None for i in m["inputs"]), m["inputs"]
+    if metric in ("row0", "last"):
+        # 整行、下标不是字面量的一格顺着取值链认得出取自遮罩列（不是按值猜的）：说用到了遮罩列
+        from app.engine.recompute import MASKED_METRIC
+
+        assert m["reason"] == MASKED_METRIC, m["reason"]
     step = await metric_step(client, run.id, metric)
     assert step["metric"]["value"] == "已遮罩", step["metric"]
     assert all(i["value"] == "已遮罩" for i in step["inputs"]), step["inputs"]

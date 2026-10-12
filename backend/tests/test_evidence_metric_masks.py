@@ -330,9 +330,10 @@ async def test_a_cell_on_a_snapshot_that_cannot_be_read_is_withheld():
          "locator": {"row": 0, "column": "phone"}, "status": "verified"}])
     chain = await hand_chain([metric], queries=[gone])
     [step] = [s for s in chain if s["step"] == "input"]
-    assert step["value"] == "已遮罩" and "masked" not in step
+    # 遮没遮核对不了：值写「无法核对」，不写「已遮罩」（数据源可能根本没设遮罩），代入式里那一处同样
+    assert step["value"] == "无法核对" and "masked" not in step
     assert step["mask_unverified"] == "查询快照无法读取，核对不了这一格是否取自设置了遮罩的列"
-    assert chain[0]["substituted"] == "len(已遮罩)" and said(chain) == []
+    assert chain[0]["substituted"] == "len(无法核对)" and said(chain) == []
 
 
 PARSED = {"columns": ["id", "phone"], "rows": [[1, "139-0000-0004"]]}
@@ -354,8 +355,8 @@ async def test_a_positional_cell_that_cannot_be_traced_is_withheld(parsed, why):
          "status": "ok"}], value=26)
     chain = await hand_chain([metric], outputs={"parse": out})
     [step] = [s for s in chain if s["step"] == "input"]
-    assert step["value"] == "已遮罩" and step["mask_unverified"] == why and "masked" not in step
-    assert chain[0]["substituted"] == "len(已遮罩) * 2" and said(chain) == []
+    assert step["value"] == "无法核对" and step["mask_unverified"] == why and "masked" not in step
+    assert chain[0]["substituted"] == "len(无法核对) * 2" and said(chain) == []
 
 
 async def test_a_reshaped_result_without_a_snapshot_or_a_source_is_shown_as_is():

@@ -181,7 +181,7 @@ async def test_the_query_step_and_the_rows_page_mask_a_column_derived_in_the_mer
     assert column in page["masked"] and leaks(page) == [], page["masked"]
 
 
-@pytest.mark.parametrize("cust_sql, merge_sql, column", CASES[:3])
+@pytest.mark.parametrize("cust_sql, merge_sql, column", CASES)
 async def test_the_self_check_flags_a_cell_derived_in_the_merge_sql(monkeypatch, mall, cust_sql, merge_sql, column):
     """写作者直接引用合并结果里取自遮罩列的那一格：自查记 masked_cell，别的格照常。"""
     row = await finish(monkeypatch, merge_graph(cust_sql, merge_sql),

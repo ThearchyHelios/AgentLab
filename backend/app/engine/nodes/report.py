@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from collections import Counter
@@ -320,28 +321,36 @@ class _RenderedStream:
 
 
 class _MaskedCells:
-    """报告自查：正文引用了取自遮罩列的格子（evidence.masked_cells），记一条违规，和没有出处的数字一样交回写作者重写。
-    写作目录本身不遮（写作者要看得到数据），只拦写进报告的那几格。
+    """报告自查：报告里写进了取自遮罩列的值，记一条违规 masked_cell，和没有出处的数字一样交回写作者重写。写作目录本身
+    不遮（写作者要看得到数据），只拦写进报告的。两种认法：
 
-    哪几列算：和证据面板同一个函数（api/evidence.py 的 _mask_sets）认出来的「确定取自遮罩列」的那几列（sure）——列名
-    就是遮罩列的，SQL 里给遮罩列起了别名、套了函数、经子查询或 WITH 转一道的，合并查询按逐格来历和合并 SQL 认。证据
-    面板为了展示宁可多遮（SQL 认不准时整份的列都遮），自查不跟着多算：多算一列就是一次判失败，写作者也改不掉。
+    - 引用（evidence.masked_cells）：[[v:Q2.r0.tel]] 引用的那一列取自遮罩列。哪几列算：和证据面板同一个函数（api/evidence.py
+      的 _mask_sets）认出来的「确定取自遮罩列」的那几列（sure）——列名就是遮罩列的，SQL 里给遮罩列起了别名、套了函数、经
+      子查询或 WITH 转一道的，合并查询按逐格来历和合并 SQL 认。证据面板为了展示宁可多遮（SQL 认不准时整份的列都遮），自查
+      不跟着多算：多算一列就是一次判失败，写作者也改不掉
+    - 按值（evidence.masked_values）：正文里直接写着这些列里的值——照抄成文字、写成数字，或者经指标带了出来（[[m:phone_raw]]
+      的值就是号码）。值从数据源现在设了遮罩的那几份查询快照里收，同样只收 sure 的列、不收只装着分档标签的格子；合并查询
+      的不收（它的值来自它的输入，输入是目录里另外几份快照）。protected 是运行输入（发起运行的人自己填的），里面写着的值
+      不算，和推演、证据面板一样
 
-    组装好一稿之后只给正文里引用到的那几份查询快照认（读盘复验哈希放进线程），认过的记下来，重写的稿子不再认。以前写作
-    之前就把目录里每份查询快照都读一遍，没设遮罩、没引用到的也一样。"""
+    组装好一稿之后才认：引用只读正文引用到的那几份快照，按值只读数据源现在设了遮罩的那几份（读盘复验哈希放进线程），都只读
+    一次，重写的稿子不再读。没设遮罩的运行一份都不读。以前写作之前就把目录里每份查询快照都读一遍。"""
 
-    def __init__(self, catalog: dict[str, Any]) -> None:
+    def __init__(self, catalog: dict[str, Any], protected: list[str] | tuple[str, ...] = ()) -> None:
         from app.api.evidence import _Masks
 
         self._catalog = catalog
         self._masks = _Masks()
+        self._protected = [str(t) for t in protected if t]
         self._memo: dict[str, dict[str, list[str]]] = {}
+        #: 按值认之前已经读过的快照（为了认引用）：收值时不再读第二遍，收完就放掉
+        self._loaded: dict[str, tuple[dict[str, Any], Any]] = {}
+        self._secrets: Any = None
+        self._collected = False
 
     async def __call__(self, doc: dict[str, Any]) -> dict[str, Any]:
-        """把这一稿引用了遮罩列的格子记进 doc 的违规（接在最后，和 compose_doc 给了 masked 时一样），交回同一份文档。"""
-        from app.api.evidence import _mask_sets
-        from app.core.artifact_store import load
-        from app.engine.evidence import iter_segments, masked_cells
+        """把这一稿写进了遮罩列的值的地方记进 doc 的违规（接在最后，和 compose_doc 给了 masked 时一样），交回同一份文档。"""
+        from app.engine.evidence import iter_segments, masked_cells, masked_values
 
         wanted: dict[str, Any] = {}
         for seg in iter_segments(doc):
@@ -352,15 +361,73 @@ class _MaskedCells:
                     and artifact and artifact not in self._memo:
                 wanted.setdefault(artifact, entry.get("source"))
         for artifact, source in wanted.items():
-            try:
-                snap = await asyncio.to_thread(load, artifact)
-            except ValueError:
-                snap = None
-            sets = await _mask_sets(snap, source, self._masks) if isinstance(snap, dict) else None
-            self._memo[artifact] = {c: sorted(sets.base) for c in sets.sure} if sets is not None else {}
-        doc["violations"] = [*doc["violations"],
-                             *masked_cells(doc, self._catalog, {a: m for a, m in self._memo.items() if m})]
+            await self._read(artifact, source)
+        cited = masked_cells(doc, self._catalog, {a: m for a, m in self._memo.items() if m})
+        written = masked_values(doc, await self._values(), {str(v.get("segment")) for v in cited})
+        doc["violations"] = [*doc["violations"], *cited, *written]
         return doc
+
+    async def _read(self, artifact: str, source: Any) -> tuple[dict[str, Any], Any] | None:
+        """读一份查询快照、认它的遮罩（_mask_sets），确定取自遮罩列的列记进 _memo。读不出来的为 None（引用它的格子本来就
+        解析不了）。"""
+        from app.api.evidence import _mask_sets
+        from app.core.artifact_store import load
+
+        try:
+            snap = await asyncio.to_thread(load, artifact)
+        except ValueError:
+            snap = None
+        if not isinstance(snap, dict):
+            self._memo[artifact] = {}
+            return None
+        sets = await _mask_sets(snap, source, self._masks)
+        self._memo[artifact] = {c: sorted(sets.base) for c in sets.sure}
+        if not self._collected:
+            self._loaded[artifact] = (snap, sets)
+        return snap, sets
+
+    async def _values(self) -> Any:
+        """写作目录里取自遮罩列的值（masking._Secrets），一个都没有为 None。只收一次。"""
+        if self._collected:
+            return self._secrets
+        self._collected = True
+        from app.engine.masking import _Secrets
+        from app.engine.merge_query import MERGE_SOURCE
+
+        secrets = _Secrets()
+        seen: set[str] = set()
+        for entry in self._catalog.values():
+            artifact = entry.get("artifact") if isinstance(entry, dict) and entry.get("kind") == "query" else None
+            source = entry.get("source") if isinstance(entry, dict) else None
+            if not isinstance(artifact, str) or not artifact or artifact in seen or not source \
+                    or source == MERGE_SOURCE or not (await self._masks.of(source))[0]:
+                continue
+            seen.add(artifact)
+            # 认引用时读过的不再读；读过、读不出来的（_memo 里有、_loaded 里没有）不再试
+            found = self._loaded.get(artifact)
+            if found is None and artifact not in self._memo:
+                found = await self._read(artifact, source)
+            if found is not None:
+                snap, sets = found
+                secrets.add(snap, sets.sure, labels=sets.labels, base=sets.base)
+        self._loaded.clear()
+        secrets.protect(self._protected)
+        if secrets.strong:
+            secrets.prepare()
+            self._secrets = secrets
+        return self._secrets
+
+
+def _masked_said(hits: list[dict[str, Any]]) -> str:
+    """报告写进了遮罩列的值的那几处在缺口、日志里怎么说：「引用了 2 处取自遮罩列的格子（「v:Q2.r0.tel」、…）」「写进了 1 处
+    设置了遮罩的列中的值」，两样都有时连起来。只点名引用，不写值。"""
+    cited = [v for v in hits if not v.get("by_value")]
+    written = [v for v in hits if v.get("by_value")]
+    parts = [f"引用了 {len(cited)} 处取自遮罩列的格子（{_named(cited)}）"] if cited else []
+    if written:
+        named = _named(written)
+        parts.append(f"写进了 {len(written)} 处设置了遮罩的列中的值" + (f"（{named}）" if named else ""))
+    return "，".join(parts)
 
 
 async def _run_class(run_id: str) -> str | None:
@@ -580,8 +647,9 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     spec = ctx.run.spec
     catalog = report_catalog(state, spec, ctx.node)
-    # 正文引用了取自遮罩列的格子：自查记一条违规，和没有出处的数字一样交回写作者重写（_MaskedCells）
-    masked = _MaskedCells(catalog)
+    # 报告写进了取自遮罩列的值（引用了那一格、照抄成正文）：自查记一条违规，和没有出处的数字一样交回写作者重写
+    # （_MaskedCells）。运行输入里写着的值是发起运行的人自己填的，不算
+    masked = _MaskedCells(catalog, protected=[json.dumps(state.get("input") or {}, ensure_ascii=False, default=str)])
     allow = report_allowance(spec, ctx.node)
     cells = True
     # 结论句策略只对升级后发起的运行生效：升级前的运行（图里也不会有 claims）事件、产出一个字不加
@@ -684,10 +752,12 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 设了出具契约、报告在它上游时照单收下、降档（io._upstream_issuance_gaps）。降不降档由出具那一行说：探索运行、
         # 没有契约的成果不出具，这里不预告。只点名引用，不写那几格的值
         tried = f"已要求模型重写 {repairs} 次仍未改掉" if repairs else "未要求重写"
-        refs = list(dict.fromkeys(str(v.get("ref") or "") for v in hits))
-        gaps.append(f"报告引用了 {len(hits)} 处取自遮罩列的格子（{_named(hits)}），{tried}：数据源设置了遮罩的列不应写进报告")
+        refs = list(dict.fromkeys(str(v["ref"]) for v in hits if v.get("ref")))
+        gaps.append(f"报告{_masked_said(hits)}，{tried}：数据源设置了遮罩的列不应写进报告")
+        # written：其中按值认出来的几处（正文里直接写着、经指标带出来的），时间线据此换说法
         ctx.emit(EventType.LOG, level="warn", code="report_masked_cell", count=len(hits), refs=refs,
-                 columns=list(dict.fromkeys(str(v.get("column") or "") for v in hits)),
+                 written=sum(1 for v in hits if v.get("by_value")),
+                 columns=list(dict.fromkeys(str(v["column"]) for v in hits if v.get("column"))),
                  message=f"{gaps[0]}。报告照常产出，这几处已标注，已记为缺口。请在报告撰写节点的指令中去掉对这些列的引用")
     doc_artifact = await _store(doc, ctx)
     ctx.emit(EventType.REPORT_CHECKED, doc_artifact=doc_artifact, ok=not doc["violations"],

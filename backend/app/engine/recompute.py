@@ -1230,8 +1230,10 @@ def _unverified_word() -> str:
     return UNVERIFIED_VALUE
 
 
-def substituted_without(metric: dict[str, Any], paths: Iterable[str], token: str) -> str | None:
-    """卡上的代入式，只把 paths 这几个输入代成 token（证据面板给取自遮罩列的输入写「已遮罩」），别的照卡上代。
+def substituted_without(metric: dict[str, Any], paths: Iterable[str] | Mapping[str, str],
+                        token: str = "") -> str | None:
+    """卡上的代入式，只把 paths 这几个输入代成 token（证据面板给取自遮罩列的输入写「已遮罩」），别的照卡上代。paths 也可以
+    是 {路径: 代成的字}，各写各的（遮没遮核对不了的那一处写「无法核对」）。
 
     按卡上记的输入值重新代一遍：先核对一个都不换时代出来的和卡上记的一字不差，对不上（卡上记的不是原值、老卡的写法）
     就整条不给，交回 None——宁可不显示代入式，也不能让遮着的值从对不上的那一处漏出来。卡上没代成字面量的（容器、太长的
@@ -1249,9 +1251,9 @@ def substituted_without(metric: dict[str, Any], paths: Iterable[str], token: str
               if isinstance(i, dict) and isinstance(i.get("path"), str) and i["path"] not in kept}
     if substitute(tree, values) != recorded:
         return None
-    hidden = set(paths)
-    swapped = ast.fix_missing_locations(_Bind({p: token for p in hidden}).visit(copy.deepcopy(tree)))
-    return substitute(swapped, {p: v for p, v in values.items() if p not in hidden})
+    tokens = dict(paths) if isinstance(paths, Mapping) else {p: token for p in paths}
+    swapped = ast.fix_missing_locations(_Bind(tokens).visit(copy.deepcopy(tree)))
+    return substitute(swapped, {p: v for p, v in values.items() if p not in tokens})
 
 
 # --------------------------------------------------------------------------

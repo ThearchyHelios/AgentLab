@@ -920,10 +920,10 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         if (found := held.get(str(item.get("path")))) is not None:
             one = _withheld(one, found)
         inputs.append(one)
-    if withheld := {path for path, found in held.items() if found.kind != "table"}:
-        # 代入式里那几处同样写「已遮罩」：不然标签里遮着、代入式里亮着，同一个值换个地方照样看得到。整份结果当输入的
-        # 不换：代入式里本来就只留着它的路径
-        step["substituted"] = recompute.substituted_without(metric or {}, withheld, MASKED)
+    if withheld := {path: _held_word(found) for path, found in held.items() if found.kind != "table"}:
+        # 代入式里那几处同样写「已遮罩」（遮没遮核对不了的写「无法核对」）：不然标签里遮着、代入式里亮着，同一个值换个
+        # 地方照样看得到。整份结果当输入的不换：代入式里本来就只留着它的路径
+        step["substituted"] = recompute.substituted_without(metric or {}, withheld)
     if step["value"] is not None and word is not None:
         # 指标的值本身也不给，和推演的原值同一个判断（_metric_masks）：指标可能就是遮罩列的那一格（cell(nodes.q, 0,
         # 'phone')），输入里遮着、这里亮着等于没遮。报告上的字（rendered）是读者已经看到的，照旧
@@ -948,17 +948,24 @@ class _Held:
 
 
 def _withheld(step: dict[str, Any], held: _Held) -> dict[str, Any]:
-    """不给值的输入：值写「已遮罩」（本来就没有值的照旧是空的，缺输入还得看得出来），模型报的值、快照里的值一并拿掉。
-    取自遮罩列的，masked 写明是哪几列；遮没遮核对不了的、按值认出来的（_InputMasks），mask_unverified 写原因、不进
-    masked——面板底下那句「这些列设置了遮罩」不能把它们也算进去。"""
+    """不给值的输入：值写「已遮罩」，遮没遮核对不了的写「无法核对」（_held_word；本来就没有值的照旧是空的，缺输入还得看得
+    出来），模型报的值、快照里的值一并拿掉。取自遮罩列的，masked 写明是哪几列；遮没遮核对不了的、按值认出来的
+    （_InputMasks），mask_unverified 写原因、不进 masked——面板底下那句「这些列设置了遮罩」不能把它们也算进去。"""
     out = {k: v for k, v in step.items() if k not in ("model_value", "snapshot_value")}
     if out.get("value") is not None:
-        out["value"] = MASKED
+        out["value"] = _held_word(held)
     if held.reason is None:
         out["masked"] = held.columns
     else:
         out["mask_unverified"] = held.reason
     return out
+
+
+def _held_word(held: _Held) -> str:
+    """不给值的输入写在值那里的字：遮没遮核对不了的（快照、取值链上的产出读不出来）写「无法核对」——数据源可能根本没设
+    遮罩，读的人不该以为这里遮着；别的（取自遮罩列的、按值认出来的）写「已遮罩」。代入式里那一处同一个字。"""
+    unverified = held.kind == "unverified" or (held.kind == "table" and held.reason is not None)
+    return UNVERIFIED_VALUE if unverified else MASKED
 
 
 async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, sealed: _Sealed,
@@ -1505,7 +1512,8 @@ def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
     SQL 里指代遮罩列的名字（c.phone AS tel 的 tel、UPPER(phone) AS p 的 p）的算。认不准时那一套把整份的列都算上（派生
     来源里没起别名的表达式、PIVOT、SQL 解析不了又写着遮罩列……）：要遮的列盖住了全部结果列、名字却对不上这么多的，只认
     名字对上的那几列——展示上多遮无妨，自查多算就是判失败，写作者也改不掉（最大的一笔订单金额被说成取自手机号）。
-    只装着分档标签的列（CASE WHEN phone IS NULL THEN '未留' ELSE '已留' END）格子里是 SQL 写死的字，不算。
+    只装着分档标签的列（CASE WHEN phone IS NULL THEN '未留' ELSE '已留' END）格子里是 SQL 写死的字，不算；只数个数的
+    （COUNT(*) FILTER (WHERE phone IS NULL)、SUM(phone IS NULL)）先改写成那一套认得出的样子再认（_counted）。
     出了意外只认列名对上的。"""
     columns = {str(c).lower() for c in snap.get("columns") or []}
     direct = set(base) & columns
@@ -1514,7 +1522,7 @@ def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
     try:
         from app.engine.masking import _derived_hidden, _snapshot_labels
 
-        found, names = _derived_hidden(snap, set(base), kind, tables)
+        found, names = _derived_hidden(_counted(snap, kind), set(base), kind, tables)
         found &= columns
         named = (names & columns) | direct
         sure = named if columns <= found and not columns <= named else found | direct
@@ -1523,6 +1531,45 @@ def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
     except Exception:  # noqa: BLE001 - 认不准：只认列名对上的
         logger.warning("报告自查：按 SQL 认取自遮罩列的结果列时出错，只认列名对上的", exc_info=True)
         return direct, {}
+
+
+def _counted(snap: dict[str, Any], kind: str | None) -> dict[str, Any]:
+    """报告自查认确定取自遮罩列的列之前（_sure），把只决定算不算进来的写法改写成认遮罩列的那一套认得出的样子：
+
+    - 汇总的 FILTER (WHERE …) 去掉：条件只决定这一行算不算进来，同写在 WHERE 里；
+    - 汇总里结果为真假的条件（SUM(phone IS NULL)、AVG(LENGTH(phone) = 11)、MAX(phone LIKE '199%')）改成
+      CASE WHEN … THEN 1 ELSE 0 END：那一套认它只数个数（masking._band_only）。
+
+    COUNT(*) FILTER (WHERE phone IS NULL) 数的是没留号码的人数，值里没有号码；那一套把 FILTER 的条件、汇总里的条件当成
+    值的来历，自查跟着判违规，正式运行就因为一个人数判失败。只改自查用的这一份：证据面板、推演照可验证报告的认法多遮
+    （展示上多遮无妨，可验证报告同样把它算作取自遮罩列），根上的改法在 masking 里。没有这些写法、改写不了的原样交回。"""
+    sql = snap.get("sql")
+    if not isinstance(sql, str) or not sql.strip():
+        return snap
+    try:
+        from sqlglot import exp
+
+        from app.data.sql_semantics import _parse, _read
+
+        root, _ = _parse(sql, _read(kind))
+        if root is None:
+            return snap
+        changed = False
+        for node in list(root.find_all(exp.Filter)):
+            node.replace(node.this)
+            changed = True
+        for agg in list(root.find_all(exp.AggFunc)):
+            arg = agg.this
+            while isinstance(arg, exp.Paren):
+                arg = arg.this
+            if not isinstance(agg, exp.Count) and isinstance(arg, (exp.Predicate, exp.Connector, exp.Not)):
+                agg.set("this", exp.Case(ifs=[exp.If(this=arg.copy(), true=exp.Literal.number(1))],
+                                         default=exp.Literal.number(0)))
+                changed = True
+        return {**snap, "sql": root.sql(dialect=_read(kind))} if changed else snap
+    except Exception:  # noqa: BLE001 - 改写不了就照原样认（多算的那一边）
+        logger.warning("报告自查：改写只数个数的写法时出错，照原样认", exc_info=True)
+        return snap
 
 
 async def _mask_sets(snap: dict[str, Any] | None, source: Any, masks: _Masks, *, depth: int = 0) -> _MaskSets:
@@ -2649,6 +2696,8 @@ FORMAL_UNJUDGED = "这份报告开启了结论句裁判，但报告未通过核�
 FORMAL_ONLY = "正式运行的结论句只在报告撰写节点内裁判，不能按需裁判"
 #: 正式运行在节点里当场裁判过，可这句没判成（触顶、出错、格式不对、被截断，原因记在这句的判定里）
 FORMAL_INLINE_MISSED = "这份报告在报告撰写节点内裁判时，这句没有判成（原因见判定）；正式运行的结论句不能按需裁判"
+#: 同上，可文档里压根没有这句的判定（没有原因可看）
+FORMAL_INLINE_NO_VERDICT = "这份报告在报告撰写节点内裁判过，但这句没有判定；正式运行的结论句不能按需裁判"
 #: 同上，按需裁判接口一次点了几句、其中有没判成的
 FORMAL_INLINE_MISSED_SOME = ("这份报告在报告撰写节点内裁判时，所选的句子有的没有判成（原因见各句的判定）；"
                              "正式运行的结论句不能按需裁判")
@@ -2789,7 +2838,10 @@ def _formal_message(doc: dict[str, Any] | None, claims: str | None, verdicts: li
     judge = doc.get("judge")
     if isinstance(judge, dict) and judge.get("mode") == "inline":
         if verdicts and any(not (isinstance(v, dict) and v.get("status") in SETTLED) for v in verdicts):
-            return FORMAL_INLINE_MISSED if len(verdicts) == 1 else FORMAL_INLINE_MISSED_SOME
+            if len(verdicts) > 1:
+                return FORMAL_INLINE_MISSED_SOME
+            # 文档里压根没记这句的判定：不说「原因见判定」，没有判定可看
+            return FORMAL_INLINE_MISSED if isinstance(verdicts[0], dict) else FORMAL_INLINE_NO_VERDICT
         return FORMAL_JUDGED
     return FORMAL_UNJUDGED if claims == CLAIMS_JUDGE else FORMAL_NO_JUDGE
 
@@ -3104,8 +3156,8 @@ GROUPS = (("cited", "有出处"), ("none", "无证据"), ("suspicious", "可疑�
 #: 文档本身对不上的违规：不管落在哪个片段上都单独列一行，不能被那个片段「有出处」的行盖住
 _INTEGRITY = frozenset({"bad_schema", "segment_mismatch", "structural_text", "render_mismatch", "eid_mismatch",
                         "state_mismatch"})
-#: 落在已经列出的片段上也单列一行的违规：文档对不上的，和引用了遮罩列的格子（masked_cell 落在的正是一个「有出处」的
-#: 单元格片段，不单列的话审计表、导出的 CSV 里只有一行普通的「有出处」）
+#: 落在已经列出的片段上也单列一行的违规：文档对不上的，和写进了遮罩列的值的（masked_cell：引用的那一格落在的正是一个
+#: 「有出处」的单元格片段，经指标带出来的落在指标片段上，不单列的话审计表、导出的 CSV 里只有一行普通的「有出处」）
 _LISTED_ALWAYS = _INTEGRITY | {"masked_cell"}
 UNCITED_CLAIM = "这句结论没有附依据（既没有引用，也没有注明依据）"
 UNCITED_CLAIM_COUNTED = "这句结论没有附依据。本报告要求结论句附依据，出具时计入缺口"
@@ -3145,7 +3197,7 @@ _CSV_LABELS: dict[str, dict[Any, str]] = {
     "issue": {"uncited_number": "没有出处的数字", "unresolved_ref": "引用无法解析", "unknown_entity": "疑似不存在的名称",
               "unverified_entity": "无法核实", "uncited_claim": "结论句未附依据", "no_candidate": "未找到候选",
               "contradicted_claim": "证据相矛盾", "insufficient_claim": "证据不足", "unsupported_claim": "证据不支持",
-              "masked_cell": "引用了遮罩列",
+              "masked_cell": "写进了遮罩列的值",
               **{code: "文档不一致" for code in _INTEGRITY}},
     "evidence_kind": {"metric": "口径卡指标", "cell": "查询单元格", "input": "运行输入", "table": "表", "column": "字段",
                       "quote": "知识库原话", "query": "查询结果"},
