@@ -1662,12 +1662,13 @@ def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
     """(能确定取自遮罩列的结果列, 只装着分档标签的列)，都是小写（_MaskSets.sure）：收遮罩值、交给裁判的摘录、报告自查
     都从前一项起。
 
-    按数据源自己的方言认（masking._derived_hidden，交回要遮的列和 SQL 里指代遮罩列的名字）：结果列名就是遮罩列、SQL 里
-    指代遮罩列的名字（c.phone AS tel 的 tel、UPPER(phone) AS p 的 p）、没起别名却按位置认得出取自遮罩列的
-    （SELECT UPPER(phone) FROM customers）都算。认不准时那一套把整份的列都算上（派生来源里没起别名的表达式、PIVOT、SQL
-    解析不了又写着遮罩列……）：这样整份算进来的（_whole），只认名字对上的那几列——展示上多遮无妨，这里多算，自查就判
-    失败、写作者也改不掉（最大的一笔订单金额被说成取自手机号），区域名、金额也被收成遮罩值。以前凡是要遮的列盖住了全部
-    结果列、名字又对不上的都当整份算，按位置认得出的那一列也丢了，一个值都收不到（复核第 4 轮）。
+    按数据源自己的方言认（masking._derived_masks，工具边界遮的那一套）：结果列名就是遮罩列、SQL 里指代遮罩列的名字
+    （c.phone AS tel 的 tel、UPPER(phone) AS p 的 p）、没起别名却按位置认得出取自遮罩列的（SELECT UPPER(phone) FROM
+    customers）都算。认不准时那一套整份遮（whole：派生来源里没起别名的表达式、PIVOT、SQL 解析不了又写着遮罩列……），
+    这时只认它的 collect——名字对上的、整份算之前已按位置认出的那几列。展示上多遮无妨，这里多算，自查就判失败、写作者
+    也改不掉（最大的一笔订单金额被说成取自手机号），区域名、金额也被收成遮罩值。整份算不算以那一套交回的 whole 为准：
+    以前在结果后面垫一列再认一遍来探测，那一套把「没有 * 的一支、列数和结果对不上」也判整份之后，垫过的每条 SQL 都成了
+    整份算，按位置认得出的列一个都收不到（合入 K3b 之后的复核）。
     只装着分档标签的列（CASE WHEN phone IS NULL THEN '未留' ELSE '已留' END）格子里是 SQL 写死的字，不算；只数个数的
     （COUNT(*) FILTER (WHERE phone IS NULL)、SUM(phone IS NULL)）先改写成那一套认得出的样子再认（_counted）。
     出了意外只认列名对上的。"""
@@ -1676,34 +1677,15 @@ def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
     if not base or not columns:
         return direct, {}
     try:
-        from app.engine.masking import _derived_hidden, _snapshot_labels
+        from app.engine.masking import _derived_masks, _snapshot_labels
 
-        counted = _counted(snap, kind)
-        found, names = _derived_hidden(counted, set(base), kind, tables)
-        found &= columns
-        named = (names & columns) | direct
-        whole = columns <= found and not columns <= named and _whole(counted, base, kind, tables)
-        sure = named if whole else found | direct
+        found = _derived_masks(_counted(snap, kind), set(base), kind, tables)
+        sure = ((found.collect if found.whole else found.hidden) & columns) | direct
         labels = _snapshot_labels(snap, kind)
         return sure - {name for name in labels if name not in base}, labels
     except Exception:  # noqa: BLE001 - 认不准：只认列名对上的
         logger.warning("报告自查：按 SQL 认取自遮罩列的结果列时出错，只认列名对上的", exc_info=True)
         return direct, {}
-
-
-#: _whole 垫在结果列后面的一列：SQL 里的名字不会是它
-_PAD_COLUMN = "\x00pad"
-
-
-def _whole(snap: dict[str, Any], base: set[str], kind: str | None, tables: dict[str, list[str]] | None) -> bool:
-    """要遮的列盖住了全部结果列时，是认不准、整份算进来的，还是每一列都真认得出取自遮罩列（_sure）。masking 那一套
-    认不准时交回全部的列，和每一列都按位置认出来的样子一样，所以结果后面垫一列再认一遍：认得出的列按 SQL 里的位置算，
-    垫的那一列没有哪一项落得上；整份算的连它一起算进来。"""
-    from app.engine.masking import _derived_hidden
-
-    padded = [*(str(c) for c in snap.get("columns") or []), _PAD_COLUMN]
-    found, _ = _derived_hidden({**snap, "columns": padded}, set(base), kind, tables)
-    return {c.lower() for c in padded} <= found
 
 
 def _counted(snap: dict[str, Any], kind: str | None) -> dict[str, Any]:
