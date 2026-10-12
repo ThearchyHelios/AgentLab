@@ -108,6 +108,21 @@ async def test_see_brackets_written_together_do_not_glue_two_numbers(monkeypatch
     assert out.rationale["violations"] == []
 
 
+async def test_a_bare_see_between_two_numbers_and_other_brackets_render_clean(monkeypatch, shop):
+    """依据直接夹在两个数之间（两边什么都没有）、写进方括号（复核第 3 轮）：两个数不能挨成一个（「2303 笔」），括号不能
+    剩下「［］」；两条依据照样挂在句子上。"""
+    name, _ = shop
+    said = "未作废订单合计 [[v:Q1.r0.total]][[see:Q1]][[v:Q2.r0.n]] 笔都已核对［[[see:Q2]]］。"
+    count = "SELECT COUNT(*) AS n FROM orders WHERE is_deleted = 0"
+    Script(monkeypatch, [q(name, VALID_SUM, "c1"), q(name, count, "c2")], {**FOUND, "rationale": said})
+    out = await run(name)
+    shown = "未作废订单合计 230 3 笔都已核对。"
+    assert out.result["rationale"] == shown and out.rationale["markdown"] == shown
+    [unit] = [unit for _, unit in iter_units(out.rationale)]
+    assert [s["alias"] for s in unit["see"]] == ["Q1", "Q2"]
+    assert out.rationale["violations"] == []
+
+
 # --------------------------------------------------------------------------
 # 收尾超时
 # --------------------------------------------------------------------------

@@ -45,6 +45,9 @@ BRACKETED_TEXT = "仍居各区域之首（已排除测试账号）：华东为 1
 TOGETHER = ("华东、华南分别为 **[[v:Q1.r0.销售额]]**（[[see:Q1]]）（[[see:Q1]]）[[v:Q1.r1.销售额]]，"
             "华东仍居各区域之首，（[[see:Q1]]）（[[see:Q1]]）。")
 TOGETHER_TEXT = "华东、华南分别为 1,200 900，华东仍居各区域之首。"
+#: 依据直接夹在两个数之间（两边什么都没有）、写进方头括号（复核第 3 轮）：两个数不能挨成一个，括号不能剩下「【】」
+BARE = "华东、华南分别为 [[v:Q1.r0.销售额]][[see:Q1]][[v:Q1.r1.销售额]]，华东仍居各区域之首【[[see:Q1]]】。"
+BARE_TEXT = "华东、华南分别为 1,200 900，华东仍居各区域之首。"
 
 
 async def _asked(client, shop) -> tuple[dict, list]:
@@ -55,8 +58,8 @@ async def _asked(client, shop) -> tuple[dict, list]:
     return r.json()["inquiry"], await events(paused.id, "approval.inquiry")
 
 
-@pytest.mark.parametrize(("said", "shown"), [(BRACKETED, BRACKETED_TEXT), (TOGETHER, TOGETHER_TEXT)],
-                         ids=["bracketed", "together"])
+@pytest.mark.parametrize(("said", "shown"), [(BRACKETED, BRACKETED_TEXT), (TOGETHER, TOGETHER_TEXT), (BARE, BARE_TEXT)],
+                         ids=["bracketed", "together", "bare"])
 async def test_see_in_brackets_does_not_break_the_answer(monkeypatch, shop, client, said, shown):
     Models(monkeypatch, shop, plays={"排除测试账号": Play([NO_TEST], said)})
     item, [event] = await _asked(client, shop)
