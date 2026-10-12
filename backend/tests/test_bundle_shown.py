@@ -850,6 +850,56 @@ def test_a_character_outside_the_common_writing_next_to_a_value_is_not_green(ref
     assert got["overall"]["result"] == ("fail" if result == "fail" else "partial"), got["overall"]
 
 
+#: 后面紧接着乘号、乘方再接数字（×10⁴、*10^4）
+TIMES = UNSURE + "后面紧接着乘号或乘方和数字（×10⁴、*10^4 这类），读起来的数可能差了量级"
+#: 偏旁、部首形的汉字（刂冫氵亻阝扌忄犭礻衤讠钅饣纟丬）：刂 显示成两道竖线，读起来像「11」
+RADICALS = "\u5202\u51ab\u6c35\u4ebb\u961d\u6274\u5fc4\u72ad\u793b\u8864\u8ba0\u9485\u9963\u7e9f\u4e2c"
+
+
+@pytest.mark.parametrize("ref, change, reason", [
+    # 弯撇号当千分位补一位数：1’74,613.65元 读作 174,613.65元（半角撇号本来就判无法核对）
+    ("m:gmv", _glue_before("s3", "1\u2019"), ODD),
+    ("m:gmv", _glue_before("s3", "1\u2018"), ODD),
+    ("v:Q1.r0.gmv", _glue_after("s34", "\u20195"), ODD),
+    # 偏旁形的汉字、康熙部首、部首补充、扩展 B 区里像竖线的字：前面补一个，读起来多出一两位
+    *[("m:gmv", _glue_before("s3", c), ODD) for c in RADICALS],
+    *[("m:gmv", _glue_before("s3", chr(cp)), ODD) for cp in (0x2F01, 0x2F11, 0x2E88, 0x2E89, 0x2010C, 0x200D1)],
+    ("v:Q1.r0.gmv", _glue_after("s34", "\u51ab"), ODD),
+    # 乘号、乘方再接数字：45,678.5×10⁴ 读作四亿多
+    *[("v:Q1.r0.gmv", _glue_after("s34", t), TIMES) for t in ("\u00d710\u2074", "*10^4", "^2", "\u00d710")],
+    # 英文的量级写法：紧接着或隔着空白、左括号
+    *[("v:Q1.r0.gmv", _glue_after("s34", t), SCALED)
+      for t in ("T", "G", "m", "b", "bn", "Bn", "mn", "tn", " billion", " Billion", " million", " thousand",
+                " trillion", "（bn）")],
+    # en dash 紧挨在数字前面：转化率–2.35% 读作负数（前面是数字的区间见下面照常通过的一条）
+    ("m:conv_rate", lambda doc: by_id(doc, "s12").update(text="转化率\u2013"), DASHED),
+    ("m:conv_rate", _glue_before("s12", "\u2013"), DASHED),
+])
+def test_lookalikes_named_by_the_third_review_are_not_green(ref, change, reason):
+    """复核第 3 轮点名的几类：弯撇号（U+2018、U+2019）紧挨着数字、偏旁形的汉字（刂、冫、氵这类，康熙部首、部首补充两个区块，
+    扩展 B 区里像竖线的字）、后面紧接着乘号或乘方再接数字、后面接着英文的量级写法（T、G、bn、m、b、billion、million、
+    thousand 这类，隔着空白也算）、en dash 紧挨在数字前面。只改相邻的普通文字、重算全部哈希，以前都是绿色的「全部通过」、
+    提示也不显示；现在判无法核对、写明原因，总览中性。"""
+    got = _only(ref, change, "na", reason)
+    assert got["overall"]["result"] == "partial", got["overall"]
+
+
+def test_soft_breaks_currency_signs_formulas_and_ranges_still_pass():
+    """常见的正常写法照常通过、总览全绿：段内软换行紧挨着数字（页面上显示成一个空格）、数字前面的「￥」「¥」、两个核对过的数
+    相乘（乘号后面紧跟的是另一个核对过的数）、en dash 连着的区间（前面是数）、数字后面跟着 ms、GB 这类不是量级的单位。"""
+    from tests.bundle_samples import formats_bundle
+
+    text = ("## 写法\n\n本月销售额\n[[m:gmv]]，客单价 \uffe5[[m:avg]]，取整 \u00a5[[m:avg|int]]，"
+            "流水乘订单号 [[v:Q1.r0.gmv]]\u00d7[[v:Q1.r0.order_no]]、[[v:Q1.r0.gmv]]*[[v:Q1.r0.order_no]]，"
+            "订单 [[m:orders]]，区间 [[v:Q1.r1.gmv]]\u2013[[v:Q1.r0.gmv]]，耗时 [[v:Q1.r0.gmv]] ms、"
+            "容量 [[v:Q1.r0.gmv]]GB。")
+    got = verdicts(formats_bundle(text=text))
+    assert len(got["numbers"]) == 12, got["numbers"]
+    assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), \
+        [n for n in got["numbers"] if n["result"] != "pass"]
+    assert got["overall"]["result"] == "pass", got["overall"]
+
+
 def test_common_punctuation_next_to_checked_values_still_passes():
     """常见的写法照常通过：等号、半角括号和冒号、加号、斜杠、百分比前面的加号、半角逗号和句点结句、约等号和乘号、编号后面的
     句点（NO.）、全角的冒号括号顿号。"""
@@ -866,13 +916,14 @@ def test_common_punctuation_next_to_checked_values_still_passes():
 
 
 def test_ordinary_writing_next_to_checked_values_still_passes_as_exported():
-    """正文里的普通写法照常通过，原样导出总览全绿：「统一」后面紧跟数（汉字「一」不是负号）、破折号（——、—、–、―，
-    小号的）后面紧跟数、编号「SKU-」「A-」后面紧跟数（连字符前面是字母，是编号的一部分）、「共…家」、全角括号、区间、
-    「NO.」后面跟数、数后面跟「元」「单」这类单位以外的字、假名长音和制表符横线、粗体和斜体包着的数。"""
+    """正文里的普通写法照常通过，原样导出总览全绿：「统一」后面紧跟数（汉字「一」不是负号）、破折号（——、—、―，小号的）
+    后面紧跟数、段内软换行紧挨着数、金额前面的「￥」「¥」、编号「SKU-」「A-」后面紧跟数（连字符前面是字母，是编号的一部分）、
+    「共…家」、全角括号、区间、「NO.」后面跟数、数后面跟「元」「单」这类单位以外的字、假名长音和制表符横线、粗体和斜体包着
+    的数。"""
     from tests.bundle_samples import PROSE, formats_bundle
 
     got = verdicts(formats_bundle(text=PROSE))
-    assert len(got["numbers"]) == 15, got["numbers"]
+    assert len(got["numbers"]) == 17, got["numbers"]
     assert all(n["result"] == "pass" and n["onPage"] == n["text"] for n in got["numbers"]), \
         [n for n in got["numbers"] if n["result"] != "pass"]
     assert got["overall"] == {"result": "pass", "text": "全部通过", "pass": got["overall"]["pass"], "fail": 0, "na": 0}

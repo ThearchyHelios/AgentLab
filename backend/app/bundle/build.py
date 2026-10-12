@@ -13,8 +13,8 @@
   嵌入，别的不嵌内容、只给 id。口径卡上记着每个输入的值和代入式，有输入取自遮罩列（cell() 的格、Agent 字段、按位置
   取的 vars.res.rows[0][2]，SQL 里改了名字的遮罩列也算，SQL 认不出结果里哪一列取自哪一列的整份快照的列都算）的整张卡
   同样只给 id，认法和证据面板、推演同一个（recompute.input_origin）；有指标的值不给的（metric_word：值取自遮罩列的
-  一格、一行，整行、下标不是字面量的、转抄上游口径卡里这类指标的也算，转抄的在指标依赖图上一次认，recompute.masked_closure；
-  遮罩列按这份文件宁可多遮的认法）、卡上记着的转抄来的值带遮罩的（_copies_masked）也一样；服务端
+  一格、一行，整行、下标不是字面量的、转抄的上游口径卡在任何一次执行里有这类指标的也算，转抄的在指标依赖图上一次认，
+  recompute.masked_closure；遮罩列按这份文件宁可多遮的认法）、卡上记着的转抄来的值带遮罩的（_copies_masked）也一样；服务端
   文件被改过的卡照样按卡上记的输入认，解析不出一张卡的整张只给 id。报告文档的证据目录收着上游口径卡的全部指标，现在的
   报告撰写节点把值不给的写成「已遮罩」；还写着原值的老文档（升级前生成的，或者生成之后数据源才设的遮罩）整份只给 id、
   不附带它引用的工件——哪些指标的值不给和写作目录同一个判断（metric_word 的 sure：只按确定取自遮罩列的认，由调用方按
@@ -25,6 +25,15 @@
 
 它只证明「内部一致」：数字、文档、运行记录彼此对得上，而且没被改过。真伪要拿页面上的封存哈希和系统里这次
 运行的封存核对（GET /api/runs/{id}/verify）对照，页面上醒目地写着这一点。
+
+已知局限，同样以服务端封存的清单哈希为准：
+- 遮罩只减少暴露、不是安全边界。哪些列取自遮罩列按 SQL 和列名认，写法的长尾认不全（先给遮罩列起别名、外层再套没起别名的
+  表达式，+phone 这类认法本身漏掉的表达式，Postgres 给没起别名的表达式起的列名，视图、别的表里换了名字存着的遮罩列，
+  自己建的函数，数据整形取出来再赋给变量的号码）：取自它们的指标、快照在这份文件里照常附带，和证据面板、写作目录认法一致。
+  转抄上游口径卡的按整张卡认（转抄的那张卡在任何一次执行里有一个指标不给，转抄出来的就不给），宁可多挡
+- 显示文字的核对（verifier.js 的 checkLayout）只看紧挨着数字头尾的字：白名单、易混字的名单只是兜底，排版和易混字的花样
+  数不完（「（单位：万元）」这类隔着几个字的说明、x10 这类写法认不出）。核对页总览有一项无法核对就不是绿的，并写明去系统里
+  核对封存；全部通过也只说明文件内部一致
 
 主体是纯函数：不碰数据库，工件经 read 取原字节，数据源现在设的遮罩由调用方查好传进来（source_masks），每份查询快照
 里确定取自遮罩列的列、这次运行查到过的遮罩值也一样（sure_columns、sure_secrets）。
@@ -116,6 +125,8 @@ class _Store:
         self._card_outputs: dict[str, dict[str, str]] = {}
         self._docs: dict[str, bool] = {}
         self._sources: dict[str, str] | None = None
+        self._runs: dict[str, list[str]] | None = None
+        self._owners: dict[str, str] = {}
 
     def raw(self, artifact: str) -> bytes | None:
         if artifact not in self._raw:
@@ -220,9 +231,10 @@ class _Store:
         return self._masked[key]
 
     def _copies_masked(self, card: str, metric: dict[str, Any]) -> bool:
-        """卡上这个指标转抄来的输入带不带遮罩（metric_word 认过之后才看得到）：转抄的是不给、核对不了的上游指标，卡上记着的
-        就是那个值（嵌在下标里、指标的值照给时也一样）；整张卡、清单文字转抄（table）的，记着的值（清单文字逐条写着「指标
-        （名称）= 值」）里有这次运行查到过的遮罩值才算，记成「[3 项]」这种大概的不算。"""
+        """卡上这个指标转抄来的输入带不带遮罩（metric_word 认过之后才看得到）：转抄的那张卡有指标不给（哪种写法都一样，
+        recompute.CopyEdge.card）、读到的上游指标核对不了，卡上记着的就是转抄来的值（嵌在下标里、指标的值照给时也一样）；
+        整张卡、清单文字转抄、读到的产出里有指标核对不了的（table_unverified），记着的值（清单文字逐条写着「指标（名称）
+        = 值」）里有这次运行查到过的遮罩值才算，记成「[3 项]」这种大概的不算。"""
         judged = self._graph(False).judged.get(_metric_key(card, metric, self.content(card)))
         if judged is None:
             return False
@@ -238,8 +250,8 @@ class _Store:
                     sure: bool = False) -> str | None:
         """口径卡 card 上一个指标的值给不给：None 照给；"masked" 不给（值取自遮罩列的一格、一行，或者整份结果里带着遮罩列、
         值里就有这次运行查到过的遮罩值）；"unverified" 遮没遮核对不了。和证据面板指标步骤的值同一个判断（api/evidence.py
-        的 _metric_masks，by_value=False：输入的出处按 recompute.input_origin 的 wide 认，转抄上游口径卡的按上游那个指标
-        在依赖图上认，recompute.masked_closure，最后交给 recompute.withheld_value）。只按出处认：认不出出处的输入（写死的
+        的 _metric_masks，by_value=False：输入的出处按 recompute.input_origin 的 wide 认，转抄上游口径卡的按那张卡在依赖图上
+        认，recompute.masked_closure，最后交给 recompute.withheld_value）。只按出处认：认不出出处的输入（写死的
         目标、数据整形算出来的数）值碰巧等于遮罩列里的某一格，不因此算——不然普通报告里的这种指标在文件里也核对不了，
         老文档也整份只给哈希。
 
@@ -250,7 +262,8 @@ class _Store:
           sure_seen。和报告撰写节点写作时认的一样：现在的报告撰写节点照给的普通指标，老文档里写着它也照常附带
 
         依赖图按 (指标集工件, 指标在卡上的位置) 认指标，两种认法各一张、构建里认过的记下来：卡转抄卡、循环里每一次执行都
-        转抄上一次的产出时，每个指标只认一次，和追了几层无关。"""
+        转抄上一次的产出时，每个指标只认一次，和追了几层无关。转抄的保守规则按整张卡认（recompute.CopyEdge.card）：转抄的
+        那张卡在封存范围内的任何一次执行里有一个指标不给，转抄出来的就不给，同写作目录。"""
         key = _metric_key(card, metric, self.content(card))
         graph = self._graph(sure)
         if key not in graph.judged:
@@ -267,15 +280,16 @@ class _Store:
     def _build(self, graph: "_Graph", key: Any, card: str, metric: dict[str, Any],
                events: Sequence[tuple[int, str, str | None, Any]], sure: bool) -> list[Any]:
         """认好 key 和顺着转抄的边够得着、还没认过的指标（转抄以外的输入），交回这一批新认的键，同 api/evidence.py 的
-        _CopyGraph._build。上游的指标按上游那张卡那一次执行之前的产出认（_card_outputs）；卡上没记输入的上游指标不连边。"""
+        _CopyGraph._build。转抄一张卡时它在封存范围内每一次执行的每个指标都放进来（_executions）；上游的指标按上游那张卡
+        那一次执行之前的产出认（_card_outputs）；卡上没记输入的指标不放。"""
         fresh: list[Any] = []
-        todo = [(key, card, metric)]
+        todo = [(key, card, metric, self._owner(card))]
         while todo:
-            key, art, item_metric = todo.pop()
+            key, art, item_metric, owner = todo.pop()
             if key in graph.links:
                 continue
             output = self._outputs_of(art, events)
-            links = MetricLinks(item_metric)
+            links = MetricLinks(item_metric, card=owner)
             for item in item_metric.get("inputs") or []:
                 if not isinstance(item, dict):
                     continue
@@ -283,15 +297,24 @@ class _Store:
                 copied = card_input(item, output)
                 if copied is not None:
                     upstream: list[Any] = []
+                    # 转抄的是哪张卡：按读到的产出上记着的指标集认（经数据整形赋给变量的也认得出），认不出的按取值链上的节点
+                    owner = copied.node_id
                     if copied.card is not None:
                         up_card = str(copied.card.get("artifact") or "")
+                        owner = self._owner(up_card) or copied.node_id
                         for index in copied.picked:
                             up_metric = copied.card["metrics"][index]
                             if isinstance(up_metric, dict) and up_metric.get("inputs"):
                                 up = (up_card or ("node", copied.node_id, id(copied.card)), index)
                                 upstream.append(up)
-                                todo.append((up, up_card, up_metric))
-                    links.copies.append(CopyEdge(path, tuple(upstream), copied.whole, copied.unreadable))
+                                todo.append((up, up_card, up_metric, owner))
+                    for run_art in self._executions(owner):
+                        content = self.content(run_art)
+                        metrics = content.get("metrics") if isinstance(content, dict) else None
+                        for index, up_metric in enumerate(metrics if isinstance(metrics, list) else []):
+                            if isinstance(up_metric, dict) and up_metric.get("inputs"):
+                                todo.append(((run_art, index), run_art, up_metric, owner))
+                    links.copies.append(CopyEdge(path, tuple(upstream), copied.whole, copied.unreadable, card=owner))
                     continue
                 kind = self._input_kind(item, output, sure=sure)
                 if kind is not None:
@@ -299,6 +322,32 @@ class _Store:
             graph.links[key] = links
             fresh.append(key)
         return fresh
+
+    def _executions(self, node_id: str) -> list[str]:
+        """口径卡 node_id 在封存范围内每一次执行的指标集工件（node.finished 台账里的 metric_set 条目），按先后。转抄的保守
+        规则按整张卡、每一次执行认（recompute.CopyEdge.card）。按解析出来的内容认、不看哈希（同 card_masked）：被改过的文件
+        只会多认出不给的指标；读到的那一次产出读不出来另有 CardInput.unreadable 兜着。"""
+        self._index_runs()
+        return (self._runs or {}).get(str(node_id or ""), [])
+
+    def _owner(self, card: str) -> str | None:
+        """指标集工件 card 是哪张口径卡（节点 id）的产出，按封存范围内的台账认；认不出的是 None。"""
+        self._index_runs()
+        return self._owners.get(card)
+
+    def _index_runs(self) -> None:
+        if self._runs is not None:
+            return
+        runs: dict[str, list[str]] = {}
+        for _, etype, node_id, data in self._events:
+            if etype != EventType.NODE_FINISHED or not node_id or not isinstance(data, dict):
+                continue
+            for entry in data.get("evidence") or []:
+                if isinstance(entry, dict) and entry.get("kind") == "metric_set" \
+                        and isinstance(entry.get("artifact"), str) and entry["artifact"]:
+                    runs.setdefault(str(node_id), []).append(entry["artifact"])
+                    self._owners.setdefault(entry["artifact"], str(node_id))
+        self._runs = {node_id: list(dict.fromkeys(found)) for node_id, found in runs.items()}
 
     def _outputs_of(self, card: str, events: Sequence[tuple[int, str, str | None, Any]]) -> Callable[[Any], Any]:
         """口径卡 card 那一次执行之前每个节点的产出（_card_outputs）：节点 id → 读出来的内容，读不出来、和 id 对不上的是

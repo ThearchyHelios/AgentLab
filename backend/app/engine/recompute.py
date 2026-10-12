@@ -17,8 +17,9 @@
 - 遮罩列取来的输入不给值、也不拿来推演：改一个输入、排除一行，新值和原值一比就能算出遮住的那一格。vars.res.rows[0][2]
   这种按位置取自查询结果的标量没有定位，顺着取值链认出是哪一列（positional_cell，证据面板的指标步骤用同一个认法）；
   下标不是字面量的（rows[vars.i][2]）按列认，整行（rows[0]）按整行的列认（wide）。
-  转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text）按上游那几个指标认：调用方在指标依赖图上一次
-  认好（masked_closure，证据面板、写作目录、可验证报告同一个函数），交进来（Sources.copied），转抄的是取自遮罩格的指标就不给。
+  转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text）按那张卡认：调用方在指标依赖图上一次认好
+  （masked_closure，证据面板、写作目录、可验证报告同一个函数），交进来（Sources.copied），转抄的那张卡在这次运行的任何一次
+  执行里有一个指标取自遮罩格就不给。
   指标本身的原值给不给（withheld_value，证据面板指标步骤的值同一个判断）：用到了遮罩列的一格、一行，原值写「已遮罩」——
   指标的值可能就是那一格，输入里拿掉了、指标上照给，等于没遮；最外层的输入遮没遮核对不了，写「无法核对」。整份结果
   当输入（len(vars.res.rows)）、认不出出处的输入（数据整形算出来再赋给变量的一格），按值认：值里有这次运行查到过的
@@ -190,8 +191,8 @@ class _Input:
     traced: bool = False
     #: 认不出出处，值里却有这次运行查到过的遮罩值（按值认的遮罩）
     by_value: bool = False
-    #: 遮着的是一整份结果（或者值里有遮罩值的容器、整张转抄的口径卡）：整个指标推演不了，可它不一定把遮罩值带进指标的值，
-    #: 指标的原值按值认（len(vars.res.rows) 照给）
+    #: 遮着的是一整份结果（或者值里有遮罩值的容器、整张转抄、读到的产出里有指标核对不了的口径卡）：整个指标推演不了，
+    #: 可它不一定把遮罩值带进指标的值，指标的原值按值认（len(vars.res.rows) 照给）
     whole: bool = False
     #: 转抄上游口径卡（Sources.copied 里有它）：给不给按依赖图认好了，不再按取值链、按值认
     copy: bool = False
@@ -432,13 +433,13 @@ def _restore(item: dict[str, Any], remaining: set[str], nested: set[str], store:
 
 
 def _copied(inp: _Input, kind: str | None, reason: str | None) -> None:
-    """转抄上游口径卡的输入（Sources.copied，和证据面板同一张依赖图认的）：转抄的是取自遮罩格的指标，不给值、不推演
-    （整张卡转抄的同整份结果，指标的原值另按值认）；上游指标核对不了的，同读不出来的快照，不给值、不推演（整张卡转抄的
-    指标的原值同样另按值认）；照给的照常推演。认得出出处，不再按值认：以前只按值认，转抄来的值不是够长的号码就照给、
-    还能改。"""
+    """转抄上游口径卡的输入（Sources.copied，和证据面板同一张依赖图认的）：转抄的那张卡有指标取自遮罩格（哪种写法都一样，
+    masked_closure 的 CopyEdge.card），不给值、不推演，指标的原值也不给；读到的上游指标核对不了的，同读不出来的快照，不给值、
+    不推演（整张卡转抄的指标的原值另按值认）；照给的照常推演。认得出出处，不再按值认：以前只按值认，转抄来的值不是够长的
+    号码就照给、还能改。"""
     inp.traced = inp.copy = True
-    if kind in ("masked", "table"):
-        inp.masked, inp.whole = True, kind == "table"
+    if kind == "masked":
+        inp.masked = True
     elif kind in ("unverified", "table_unverified"):
         inp.unreadable, inp.whole = True, kind == "table_unverified"
         inp.problem = inp.problem or reason or CARD_UNREADABLE
@@ -617,7 +618,8 @@ CARD_UNREADABLE = "转抄的口径卡结果无法读取，核对不了这个值�
 class CardInput:
     """卡上的一个输入转抄了上游口径卡的产出（card_input）：node_id 是那张卡的节点，card 是它当时的产出（指标集加清单
     文字），picked 是这个输入带着值的那几个指标（在 card["metrics"] 里的位置）。whole：整张卡、整份指标列表、清单文字、
-    下标不是字面量的一个指标——不一定把哪个指标的值带进来，同整份查询结果（Origin.table）。
+    下标不是字面量的一个指标——说不准把哪个指标的值带进来。给不给不按 picked 细分：那张卡在这次运行的任何一次执行里有一个
+    指标不给，转抄它的输入就不给（masked_closure 的 CopyEdge.card）。
 
     unreadable：那张卡当时的产出现在读不出来，card 为 None、picked 为空，这里写原因。卡上记着这个输入转抄来了值（不是空的），
     算的时候产出是在的，现在读不出来只能是产出丢了或被改了：同按位置取的一格取值链上的产出读不出来（positional_cell 的
@@ -633,8 +635,8 @@ class CardInput:
 def card_input(item: dict[str, Any], output: Callable[[Any], Any]) -> CardInput | None:
     """卡上的一个输入是不是转抄上游口径卡的产出：nodes.<卡>.metrics[0].value、vars.<卡的 assign_to>.metrics[0].value、
     nodes.<卡>.text（清单文字逐条写着「指标（名称）= 值」）、整张卡。是的话交回那张卡和带着值的那几个指标，值给不给按
-    那几个指标认（masked_closure：证据面板、写作目录、推演、可验证报告同一个判断）：上游的指标取自遮罩格，转抄它的这个
-    指标同样取自遮罩格。
+    那张卡认（masked_closure：证据面板、写作目录、推演、可验证报告同一个判断）：那张卡在这次运行里有一个指标取自遮罩格，
+    转抄它的这个指标同样不给。
 
     output 同 input_origin：节点 id → 那个节点当时的产出；nodes.X 是 X 的产出，vars.X 是写它的节点（输入记着的 node_id）
     的产出——口径卡的 assign_to 交给变量的就是它的产出本身。产出不是指标集的（别的节点）交回 None；卡上记着这个输入出自
@@ -679,37 +681,49 @@ def card_input(item: dict[str, Any], output: Callable[[Any], Any]) -> CardInput 
 
 @dataclass(frozen=True)
 class CopyEdge:
-    """指标依赖图上的一条转抄边（masked_closure）：卡上路径为 path 的输入转抄了上游 upstream 那几个指标（键由调用方定，
-    和 MetricLinks 的键同一套）。whole、unreadable 同 CardInput；读不出来的 upstream 为空。"""
+    """指标依赖图上的一条转抄边（masked_closure）：卡上路径为 path 的输入转抄了上游口径卡的产出，upstream 是它读到的那一次
+    产出里带着值的那几个指标（键由调用方定，和 MetricLinks 的键同一套）。whole、unreadable 同 CardInput；读不出来的
+    upstream 为空。
+
+    card：转抄的那张卡（节点 id）。转抄的保守规则按整张卡认：这张卡在这次运行的任何一次执行里有一个指标不给（调用方把它每一
+    次执行的每个指标都放进图里，MetricLinks.card 记着是哪张卡），转抄出来的这个输入就不给——不管下标是不是字面量、转抄的
+    是一个指标、整张卡还是清单文字，也不管读到的是哪一次执行的产出。以前按读到的那一次产出、带着值的那几个指标细分：写作
+    目录只有运行状态里最后一次的产出，循环里抄自己上一轮的卡最后一轮没碰号码列就照给，可它转抄来的正是第一轮的号码；整张
+    卡、清单文字只按值认，由遮罩格算出来的数（年薪 = 月薪 × 12）原样照给。没给 card 的只看 upstream。"""
 
     path: str
     upstream: tuple[Any, ...]
     whole: bool
     unreadable: str | None = None
+    card: Any = None
 
 
 @dataclass
 class MetricLinks:
     """指标依赖图上的一个指标（masked_closure 的输入）：metric 是卡上的那个指标（认表达式的最外层引用、值）；direct 是
     转抄以外的输入里不给值的，路径 → (种类, 遮罩列)，种类同 api/evidence.py 的 _Held（masked、table、unverified、value）；
-    uncertain：有认不出出处、指标的值要按值认的输入；copies：转抄上游口径卡的输入。"""
+    uncertain：有认不出出处、指标的值要按值认的输入；copies：转抄上游口径卡的输入；card：这个指标所在的口径卡（节点 id），
+    转抄这张卡的边按它认（CopyEdge.card）。"""
 
     metric: dict[str, Any]
     direct: dict[str, tuple[str, tuple[str, ...]]] = field(default_factory=dict)
     uncertain: bool = False
     copies: list[CopyEdge] = field(default_factory=list)
+    card: Any = None
 
 
 @dataclass(frozen=True)
 class Judged:
     """masked_closure 认出来的一个指标：word 是指标的值给不给（None 照给，masked 不给，unverified 核对不了，同
-    withheld_value）；copied 是每个转抄的输入：路径 → (种类, 遮罩列, 原因)，种类 None 照给，masked、unverified 同直接的
-    输入，table 是整张卡转抄、上游有指标不给（同整份查询结果：指标的值另按值认），table_unverified 是整张卡转抄、上游有
-    指标核对不了，原因只在上游产出读不出来时有；columns 是让它不给的遮罩列，转抄它的输入上写这几列。"""
+    withheld_value）；copied 是每个转抄的输入：路径 → (种类, 遮罩列, 原因)，种类 None 照给，masked 是转抄的那张卡有指标
+    不给（哪种写法都一样），unverified 是读到的那几个指标核对不了，table_unverified 是整张卡转抄、读到的那次产出里有指标
+    核对不了（同整份查询结果：指标的值另按值认），原因只在上游产出读不出来时有；columns 是让它不给的遮罩列，转抄它的输入上
+    写这几列；card 同 MetricLinks.card，之后再认的指标转抄这张卡时按它算进去。"""
 
     word: str | None
     copied: Mapping[str, tuple[str | None, tuple[str, ...], str | None]] = field(default_factory=dict)
     columns: tuple[str, ...] = ()
+    card: Any = None
 
 
 #: 指标的值给不给，从松到严：照给、核对不了、不给
@@ -721,25 +735,37 @@ def masked_closure(links: Mapping[Any, MetricLinks], known: Mapping[Any, Judged]
     """转抄上游口径卡的指标值给不给：在指标依赖图上一次算出的最小不动点。证据面板、写作目录、推演、可验证报告都按这一个
     函数认（各自按自己的口径认好转抄以外的输入，见 MetricLinks.direct），不各写一套。
 
-    先按转抄以外的输入认每个指标（取自遮罩格的、核对不了的），再沿转抄的边往下游传：上游有一个指标不给，转抄它的输入就是
-    masked（整张卡、清单文字、整份指标列表、下标不是字面量的是 table，指标的值另按值认）；上游只是核对不了的，转抄它的
-    输入核对不了。一直传到不再变化。环（循环里一张卡抄自己上一轮的产出、几张卡互相转抄）本身不带来遮罩：从「都照给」
-    起往上收，环上没有哪个指标别的输入取自遮罩格，整个环照给；有一个取自遮罩格，整个环都不给。以前逐个往上递归、追够
-    八层就按遮罩算：没设任何遮罩的工作流里，循环里累加上一轮结果的口径卡也成了「已遮罩」，引用它的正式运行判失败；
-    每个指标的护栏 nodes.acc 选中整张卡的全部指标，递归次数随指标个数指数增长，卡住事件循环。
+    先按转抄以外的输入认每个指标（取自遮罩格的、核对不了的），再沿转抄的边往下游传，一直传到不再变化：
+    - 转抄的保守规则（CopyEdge.card）：转抄的那张卡在这次运行的任何一次执行里有一个指标不给，转抄它的输入就是 masked，
+      字面量下标、下标不是字面量、整张卡、清单文字、整份指标列表都一样，读到的那次产出读不出来的也一样。那张卡一个不给的
+      指标都没有时照常
+    - 读到的那几个指标（upstream）有不给的，同样 masked；只是核对不了的，转抄它的输入核对不了（整张卡、清单文字这类是
+      table_unverified，指标的值另按值认）
+    环（循环里一张卡抄自己上一轮的产出、几张卡互相转抄）本身不带来遮罩：从「都照给」起往上收，环上没有哪个指标别的输入取自
+    遮罩格，整个环照给；有一个取自遮罩格，整个环都不给。以前逐个往上递归、追够八层就按遮罩算：没设任何遮罩的工作流里，
+    循环里累加上一轮结果的口径卡也成了「已遮罩」，引用它的正式运行判失败。
 
     links：这次要认的指标（键 → MetricLinks），转抄的边指到的上游要么也在里面，要么在 known 里（之前认好的，结果不再变），
-    都不在的（卡上没记输入的老指标、写死的数）照给。secrets 同 withheld_value，整张卡转抄、认不出出处的输入要按值认时才取。
-    每个指标的结论只会往严里变（最多两次），每变一次只重认转抄它的那几个：总的工作量和边数成正比。"""
+    都不在的（卡上没记输入的老指标、写死的数）照给；一张卡的指标可以一部分在 known 里、一部分在 links 里，按 card 合起来认。
+    secrets 同 withheld_value，整份结果当输入、认不出出处的输入要按值认时才取。每个指标的结论只会往严里变（最多两次），每张卡
+    「有指标不给」只会从无到有、遮罩列只增不减，每变一次只重认转抄它的那几个：总的工作量和边数成正比。"""
     known = known or {}
     words: dict[Any, str | None] = {key: None for key in links}
     columns: dict[Any, tuple[str, ...]] = {key: () for key in links}
     below: dict[Any, set[Any]] = {}
+    readers: dict[Any, set[Any]] = {}
     for key, node in links.items():
         for edge in node.copies:
             for up in edge.upstream:
                 if up in links:
                     below.setdefault(up, set()).add(key)
+            if edge.card is not None:
+                readers.setdefault(edge.card, set()).add(key)
+    # 被转抄的卡里有指标不给的：卡 → 让它们不给的遮罩列（没有不给的卡不在里面）。之前认好的先算进去
+    cards: dict[Any, tuple[str, ...]] = {}
+    for found in known.values():
+        if found.word == "masked" and found.card is not None and found.card in readers:
+            cards[found.card] = tuple(dict.fromkeys((*cards.get(found.card, ()), *found.columns)))
 
     def state(key: Any) -> tuple[str | None, tuple[str, ...]]:
         if key in links:
@@ -755,29 +781,27 @@ def masked_closure(links: Mapping[Any, MetricLinks], known: Mapping[Any, Judged]
         because = [c for kind, cols in node.direct.values() if kind in ("masked", "table") for c in cols]
         copied: dict[str, tuple[str | None, tuple[str, ...], str | None]] = {}
         for edge in node.copies:
-            if edge.unreadable is not None:
+            ups = [state(up) for up in edge.upstream]
+            if (edge.card is not None and edge.card in cards) or any(word == "masked" for word, _ in ups):
+                cols = (*cards.get(edge.card, ()), *(c for word, cs in ups if word == "masked" for c in cs))
+                copied[edge.path] = ("masked", tuple(dict.fromkeys(cols)), None)
+            elif edge.unreadable is not None:
                 copied[edge.path] = ("table_unverified" if edge.whole else "unverified", (), edge.unreadable)
+            elif any(word == "unverified" for word, _ in ups):
+                copied[edge.path] = ("table_unverified" if edge.whole else "unverified", (), None)
             else:
-                ups = [state(up) for up in edge.upstream]
-                if any(word == "masked" for word, _ in ups):
-                    cols = tuple(dict.fromkeys(c for word, cs in ups if word == "masked" for c in cs))
-                    copied[edge.path] = ("table" if edge.whole else "masked", cols, None)
-                elif any(word == "unverified" for word, _ in ups):
-                    copied[edge.path] = ("table_unverified" if edge.whole else "unverified", (), None)
-                else:
-                    copied[edge.path] = (None, (), None)
+                copied[edge.path] = (None, (), None)
             kind, cols, _ = copied[edge.path]
             if kind == "masked":
                 masked.append(edge.path)
+                because.extend(cols)
             elif kind == "unverified":
                 unverified.append(edge.path)
             elif kind is not None:
                 uncertain = True
-            if kind in ("masked", "table"):
-                because.extend(cols)
         word = withheld_value(node.metric, node.metric.get("value"), masked=masked, unverified=unverified,
                               uncertain=uncertain, secrets=secrets)
-        return Judged(word, copied, tuple(dict.fromkeys(because)) if word == "masked" else ())
+        return Judged(word, copied, tuple(dict.fromkeys(because)) if word == "masked" else (), node.card)
 
     queue = list(links)
     waiting = set(queue)
@@ -788,16 +812,24 @@ def masked_closure(links: Mapping[Any, MetricLinks], known: Mapping[Any, Judged]
         # 只往严里收：withheld_value 先看取自遮罩格的、再看核对不了的，上游变严时这里也不会松回去
         word = got.word if _STRICTNESS[got.word] >= _STRICTNESS[words[key]] else words[key]
         cols = tuple(dict.fromkeys((*columns[key], *got.columns))) if word == "masked" else ()
-        if (word, cols) != (words[key], columns[key]):
-            words[key], columns[key] = word, cols
-            for down in below.get(key, ()):
-                if down not in waiting:
-                    waiting.add(down)
-                    queue.append(down)
+        if (word, cols) == (words[key], columns[key]):
+            continue
+        words[key], columns[key] = word, cols
+        downs = set(below.get(key, ()))
+        card = links[key].card
+        if word == "masked" and card is not None and card in readers:
+            merged = tuple(dict.fromkeys((*cards.get(card, ()), *cols)))
+            if card not in cards or cards[card] != merged:
+                cards[card] = merged
+                downs |= readers[card]
+        for down in downs:
+            if down not in waiting:
+                waiting.add(down)
+                queue.append(down)
     out: dict[Any, Judged] = {}
     for key in links:
         got = judge(key)
-        out[key] = Judged(words[key], got.copied, columns[key])
+        out[key] = Judged(words[key], got.copied, columns[key], links[key].card)
     return out
 
 

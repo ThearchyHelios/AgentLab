@@ -22,10 +22,17 @@ options.mask_columns 里的列换成「已遮罩」，SQL 里给它们起了别�
 （_mask_sets，和可验证报告同一个函数，合并查询另按合并 SQL 认）；用到这些列的指标，指标步骤的值、
 证据图的标签也不给（_metric_masks，和推演同一个判断；报告撰写节点写作之前按同一个判断把这类指标在目录里写成「已遮罩」，
 withheld_metrics，只是遮罩列只认确定的那一套，和单元格引用的自查同一个口径；可验证报告认老文档也按这个口径，
-certain_masks；转抄上游口径卡的指标在指标依赖图上一次认，_CopyGraph → recompute.masked_closure，推演的转抄输入按同一张图，
-copied_inputs）；SQL、合并警告里写着的遮罩值（这次运行里确定取自遮罩列的值）
+certain_masks；转抄上游口径卡的指标在指标依赖图上一次认，_CopyGraph → recompute.masked_closure，按整张卡认：转抄的那张卡
+在这次运行的任何一次执行里有一个指标取自遮罩格，转抄出来的就不给，推演的转抄输入按同一张图，copied_inputs）；SQL、合并
+警告里写着的遮罩值（这次运行里确定取自遮罩列的值）
 展示时换掉。一份快照的遮罩分析、收到的值按快照工件记在进程里（_MEMO），之后的请求不再读盘、不再分析
 ——在有身份体系之前，这只减少暴露，不是安全边界：知道工件 id 的人照样能取到整份快照。
+
+已知局限（遮罩只减少暴露、不是安全边界，可验证报告的真伪以服务端封存的清单哈希为准）：认遮罩列只按 SQL 和列名认，写法的
+长尾认不全，取自那些列的指标、单元格在写作目录、报告文档、成果和可验证报告里照给。已知的有：先给遮罩列起别名、外层再套
+没起别名的表达式（SELECT * FROM (SELECT UPPER(p) FROM (SELECT phone AS p …))，列名「UPPER(p)」里没有遮罩列的名字）、
+一元加号这类认法本身漏掉的表达式（+phone，masking._derived_masks 的缺口）、Postgres 给没起别名的表达式起的列名（upper、
+?column?）、视图和别的表里换了名字存着的遮罩列、自己建的函数，以及数据整形把号码取出来再赋给变量（出处认不出）。
 
 期 4 的核查状态同样只读封存范围内的东西：指标步骤带双盲复算的结果（_dual_check_of，读双盲复算节点的产出和台账
 条目），句子带反方审稿的判断（_challenge_of，读反方审稿节点的产出和审稿记录）。它们是核查，不是证据：没有就不带这两个键。
@@ -992,8 +999,9 @@ async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, s
     - 输入取自哪份结果的哪几列按 _InputMasks 认（recompute.input_origin 的 wide：下标不是字面量的、整行、整份结果都认）
     - 认不出出处的输入（数据整形算出来再赋给变量的一格），值就是这次运行查到过的遮罩值的，按值认（masks.run_secrets）；
       运行输入是发起运行的人自己填的，不认
-    - 转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text，recompute.card_input）按上游那几个指标认：
-      在这次请求的指标依赖图上一次算出（_CopyGraph → recompute.masked_closure），不逐个往上递归
+    - 转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text、整张卡，recompute.card_input）按那张卡认：那张卡
+      在这次运行的任何一次执行里有一个指标不给，转抄出来的就不给（转抄的保守规则），在这次请求的指标依赖图上一次算出
+      （_CopyGraph → recompute.masked_closure），不逐个往上递归
     - 指标的值：取自遮罩列的一格、一行的不给；最外层的输入遮没遮核对不了的写「无法核对」；整份结果当输入、有认不出出处
       的输入的，值里有遮罩值才不给（len(vars.res.rows) 照给）
 
@@ -1012,12 +1020,10 @@ async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, s
 
 
 def _copied_held(kind: str, columns: tuple[str, ...], reason: str | None) -> _Held:
-    """转抄上游口径卡的输入不给值的原因（recompute.Judged.copied 的一项）：上游有指标不给的是 masked（整张卡转抄的是
-    table，指标的值另按值认），写上游让它不给的遮罩列；上游有指标核对不了的核对不了（整张卡转抄的同 table、带原因）。"""
+    """转抄上游口径卡的输入不给值的原因（recompute.Judged.copied 的一项）：转抄的那张卡有指标不给的是 masked（哪种写法都
+    一样），写那张卡让它不给的遮罩列；读到的上游指标核对不了的核对不了（整张卡转抄的同 table、带原因）。"""
     if kind == "masked":
         return _Held("masked", list(columns))
-    if kind == "table":
-        return _Held("table", list(columns))
     if kind == "table_unverified":
         return _Held("table", [], reason or CARD_UNVERIFIED)
     return _Held("unverified", [], reason or CARD_UNVERIFIED)
@@ -1053,9 +1059,11 @@ class _CopyGraph:
     recompute.masked_closure 一次算出最小不动点。认过的指标记下来：证据图给每个指标认标签、同一次请求里别的指标转抄它，
     都不再重认，工作量和图的大小成正比。
 
-    写作目录（output 给了：运行状态里每个节点最后一次的产出）里，循环中抄自己上一轮的卡指回自己，是一个环；封存之后
-    （output 没给）按每次执行认：卡在这次执行之前读到的是自己上一次执行的产出（_card_outputs），一次一次往回连，连到
-    第一次为止。两种都只按图算，不按追了几层算：以前追够八层就按遮罩算，没设遮罩的循环累加也成了「已遮罩」。"""
+    转抄的保守规则按整张卡认（recompute.CopyEdge.card）：转抄一张卡时，把它在这次运行里每一次执行的指标集（_executions：
+    封存之后按封存范围内的台账，写作时按运行状态里的台账）里的每个指标都放进图里，有一个不给，转抄出来的就不给。写作目录
+    （output 给了：运行状态里每个节点最后一次的产出）里，循环中抄自己上一轮的卡读到的是它自己最后一次的产出，第一轮取过号码、
+    最后一轮没取的，以前就这么照给了；封存之后（output 没给）另按每次执行往回连：卡在这次执行之前读到的是自己上一次执行的
+    产出（_card_outputs）。两种都只按图算，不按追了几层算：以前追够八层就按遮罩算，没设遮罩的循环累加也成了「已遮罩」。"""
 
     def __init__(self, sealed: _Sealed, masks: _Masks, *, output: Callable[[Any], Any] | None, by_value: bool,
                  sure: bool) -> None:
@@ -1064,6 +1072,8 @@ class _CopyGraph:
         self._links: dict[Any, recompute.MetricLinks] = {}
         self._held: dict[Any, dict[str, _Held]] = {}
         self._judged: dict[Any, recompute.Judged] = {}
+        self._runs: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        self._owners: dict[str, str] | None = None
 
     def matches(self, sealed: _Sealed, output: Callable[[Any], Any] | None, by_value: bool, sure: bool) -> bool:
         return self.sealed is sealed and self.given is output and self.by_value == by_value and self.sure == sure
@@ -1083,10 +1093,33 @@ class _CopyGraph:
                                                          lambda: secrets))
         return self._judged[key]
 
+    def _executions(self, node_id: str) -> list[tuple[str, dict[str, Any]]]:
+        """口径卡 node_id 在这次运行里每一次执行的指标集：[(工件, 内容)]，按台账（sealed.entries 里的 metric_set 条目）认，
+        读不出来、和哈希对不上的跳过（读到的那一次产出读不出来另有 CardInput.unreadable 兜着）。同一张卡只找一次。"""
+        if node_id not in self._runs:
+            found: list[tuple[str, dict[str, Any]]] = []
+            for artifact in dict.fromkeys(str(e["artifact"]) for e in self.sealed.entries
+                                          if e.get("kind") == "metric_set" and e.get("artifact")
+                                          and str(e.get("node_id") or "") == node_id):
+                content, ok = self.masks.fetch(artifact)
+                if ok is True and isinstance(content, dict) and isinstance(content.get("metrics"), list):
+                    found.append((artifact, content))
+            self._runs[node_id] = found
+        return self._runs[node_id]
+
+    def _owner(self, artifact: str) -> str | None:
+        """指标集工件 artifact 是哪张口径卡（节点 id）在这次运行里的产出，按台账认；认不出的是 None。"""
+        if self._owners is None:
+            self._owners = {}
+            for e in self.sealed.entries:
+                if e.get("kind") == "metric_set" and e.get("artifact") and e.get("node_id"):
+                    self._owners.setdefault(str(e["artifact"]), str(e["node_id"]))
+        return self._owners.get(artifact) if artifact else None
+
     async def _build(self, key: Any, card_node: str, artifact: str, metric: dict[str, Any]) -> list[Any]:
-        """认好 key 和顺着转抄的边够得着、还没认过的指标（转抄以外的输入，_links、_held），交回这一批新认的键。上游的
-        指标按上游那张卡那一次执行的产出认（_InputMasks 按 _card_outputs 找它当时读到的产出）。卡上没记输入的上游指标
-        （写死的数、升级前的老卡）不连边：照给。"""
+        """认好 key 和顺着转抄的边够得着、还没认过的指标（转抄以外的输入，_links、_held），交回这一批新认的键。转抄一张卡时
+        它每一次执行的每个指标都放进来（_executions，转抄的保守规则按整张卡认）；上游的指标按它那一次执行之前的产出认
+        （_InputMasks 按 _card_outputs 找它当时读到的产出）。卡上没记输入的指标（写死的数、升级前的老卡）不放：照给。"""
         fresh: list[Any] = []
         todo = [(key, card_node, artifact, metric)]
         while todo:
@@ -1094,7 +1127,7 @@ class _CopyGraph:
             if key in self._links:
                 continue
             hide = _InputMasks(self.sealed, self.masks, node, art, output=self.given, sure=self.sure)
-            links = recompute.MetricLinks(item_metric)
+            links = recompute.MetricLinks(item_metric, card=node or None)
             held: dict[str, _Held] = {}
             for item in item_metric.get("inputs") or []:
                 if not isinstance(item, dict):
@@ -1103,14 +1136,24 @@ class _CopyGraph:
                 copied = hide.copied(item)
                 if copied is not None:
                     upstream: list[Any] = []
+                    # 转抄的是哪张卡：按读到的产出上记着的指标集认（经数据整形赋给变量、转了一道的也认得出是哪张卡），
+                    # 认不出的按取值链上的那个节点
+                    owner = copied.node_id
                     if copied.card is not None:
+                        up_art = str(copied.card.get("artifact") or "")
+                        owner = self._owner(up_art) or copied.node_id
                         for index in copied.picked:
                             up_metric = copied.card["metrics"][index]
                             if isinstance(up_metric, dict) and up_metric.get("inputs"):
                                 up = (_card_key(copied.node_id, copied.card), index)
                                 upstream.append(up)
-                                todo.append((up, copied.node_id, str(copied.card.get("artifact") or ""), up_metric))
-                    links.copies.append(recompute.CopyEdge(path, tuple(upstream), copied.whole, copied.unreadable))
+                                todo.append((up, owner, up_art, up_metric))
+                    for run_art, content in self._executions(owner):
+                        for index, up_metric in enumerate(content["metrics"]):
+                            if isinstance(up_metric, dict) and up_metric.get("inputs"):
+                                todo.append(((run_art, index), owner, run_art, up_metric))
+                    links.copies.append(recompute.CopyEdge(path, tuple(upstream), copied.whole, copied.unreadable,
+                                                           card=owner))
                     continue
                 found, traced = await hide.check(item)
                 if found is None and not traced:
@@ -1151,12 +1194,17 @@ async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], le
     遮罩列只按确定的那一套认（sure，和单元格引用的自查同一个口径：_cited_masks）：SQL 认不准、证据面板整份遮的快照里，
     没确定取自遮罩列的普通金额、计数、只装着分档标签的列照给。以前跟着证据面板宁可多遮，WITH 写了列名表、VALUES 当表的
     销售额也成了「已遮罩」，正式运行引用它就判失败；同一格按 [[v:…]] 引用却不报违规。转抄上游口径卡的指标
-    （nodes.<卡>.metrics[0].value、nodes.<卡>.text）按上游那个指标认：运行状态里每张卡只有最后一次的产出，循环里抄自己
-    上一轮的卡指回自己，在依赖图上是一个环（_CopyGraph），环上没有别的输入取自遮罩格就照给。"""
+    （nodes.<卡>.metrics[0].value、nodes.<卡>.text、整张卡）按那张卡认（转抄的保守规则，_CopyGraph）：运行状态里每张卡只有
+    最后一次的产出，那张卡每一次执行的指标集按台账（ledger 的 metric_set 条目）读回来，有一次执行里有一个指标取自遮罩格，
+    转抄出来的就写「已遮罩」。以前只看最后一次的产出：循环里第一轮取号码、之后转抄上一轮的卡，最后一轮没碰号码列，写作目录
+    照给，号码进了正文和成果；封存之后按每次执行往回认才写「已遮罩」，同一个指标两样说法。循环里抄自己上一轮的卡指回自己，
+    在依赖图上是一个环，那张卡哪一次执行都没有取自遮罩格的指标就照给。"""
     queries = {str(e["artifact"]): {k: e[k] for k in ("node_id", "tool", "source", "via", "call_id", "exec")
                                     if e.get(k) is not None}
                for e in ledger if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact")}
-    view = _Sealed(run_id="", graph={}, events=[], queries=queries,
+    # 每张口径卡每一次执行的指标集：转抄的保守规则按整张卡、每一次执行认（_CopyGraph._executions 从 entries 里找）
+    runs = [dict(e) for e in ledger if isinstance(e, dict) and e.get("kind") == "metric_set" and e.get("artifact")]
+    view = _Sealed(run_id="", graph={}, events=[], queries=queries, entries=runs,
                    seal={"sealed": False, "ok": None, "manifest_seq": None, "legacy": False})
     masks = _Masks(view)
     found: list[tuple[str, str, str, dict[str, Any], dict[str, Any]]] = []
@@ -1171,8 +1219,11 @@ async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], le
     if not found:
         return []
     # cell()、Agent 字段落在的快照先在线程里读好（读盘、复验哈希）：在运行里认，不占着事件循环。转抄上游口径卡的指标要顺着
-    # 上游卡的输入认，运行状态里每张口径卡的输入一并读好
+    # 上游卡的输入认，运行状态里每张口径卡、台账里每一次执行的指标集连同它们的输入一并读好
+    await masks.prefetch(str(e["artifact"]) for e in runs)
     cards = [card for card in nodes.values() if isinstance(card, dict) and card.get("kind") == "metric_set"]
+    cards += [content for e in runs for content, ok in [masks.fetch(str(e["artifact"]))]
+              if ok is True and isinstance(content, dict)]
     await masks.prefetch(str(item["artifact"]) for metric in [*(m for *_, m, _ in found),
                                                               *(m for card in cards for m in card.get("metrics") or [])]
                          if isinstance(metric, dict) for item in metric.get("inputs") or []
@@ -1250,7 +1301,7 @@ class _InputMasks:
     的 sure，再按血缘排除值确实不取自遮罩列的），读不出来的按数据源现在设的列名。证据面板、推演照旧按 hidden 宁可多遮。
 
     转抄上游口径卡的输入（recompute.card_input：nodes.<卡>.metrics[0].value、vars.<卡的 assign_to>.metrics[0].value、
-    nodes.<卡>.text）这里只认出转抄了哪张卡的哪几个指标（copied），给不给按上游那几个指标在依赖图上认（_CopyGraph）。
+    nodes.<卡>.text）这里只认出转抄了哪张卡的哪几个指标（copied），给不给按那张卡在依赖图上认（_CopyGraph）。
     """
 
     def __init__(self, sealed: _Sealed, masks: _Masks, card_node: str, artifact: str, *,

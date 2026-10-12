@@ -343,8 +343,8 @@ def test_a_cycle_on_its_own_brings_no_mask():
 
 
 def test_one_masked_input_on_a_cycle_withholds_the_whole_cycle():
-    """环上 b 另有一个输入取自遮罩格（phone）：b、c 都不给，转抄它们的输入上写着 phone；只转抄 c 的整张卡、值是个数的 d
-    照给（整张卡转抄同整份结果，指标的值另按值认），环外没连上的 e 照给。"""
+    """环上 b 另有一个输入取自遮罩格（phone）：b、c 都不给，转抄它们的输入上写着 phone；转抄 c 的整份指标列表、值只是个数的 d
+    同样不给（转抄的保守规则：上游有指标不给，哪种写法转抄都不给，不再按值认），环外没连上的 e 照给。"""
     from app.engine.recompute import CopyEdge, MetricLinks, masked_closure
 
     b, c, d, e = ("b", 0), ("c", 0), ("d", 0), ("e", 0)
@@ -356,29 +356,28 @@ def test_one_masked_input_on_a_cycle_withholds_the_whole_cycle():
         d: MetricLinks(_metric("len(nodes.c.metrics)", 1), copies=[CopyEdge("nodes.c.metrics", (c,), True)]),
         e: MetricLinks(_metric("nodes.e.metrics[0].value"), copies=[CopyEdge("nodes.e.metrics[0].value", (e,), False)]),
     }, secrets=lambda: None)
-    assert {k: v.word for k, v in got.items()} == {b: "masked", c: "masked", d: None, e: None}
+    assert {k: v.word for k, v in got.items()} == {b: "masked", c: "masked", d: "masked", e: None}
     assert got[c].copied["nodes.b.metrics[0].value"] == ("masked", ("phone",), None)
     assert got[b].copied["nodes.c.metrics[0].value"] == ("masked", ("phone",), None)
-    assert got[d].copied["nodes.c.metrics"] == ("table", ("phone",), None)
+    assert got[d].copied["nodes.c.metrics"] == ("masked", ("phone",), None)
 
 
-def test_a_whole_copy_is_withheld_when_its_value_carries_a_masked_value():
-    """整张卡、清单文字转抄（table）：上游有指标不给时，指标的值里有这次运行查到过的遮罩值才不给。"""
-    from app.engine.masking import _Secrets
+def test_a_whole_copy_of_a_card_with_a_withheld_metric_is_withheld_whatever_its_value():
+    """整张卡、清单文字、整份指标列表转抄：上游有指标不给时，转抄出来的都不给，值里有没有遮罩值都一样（转抄的保守规则）。以前
+    整张卡转抄同整份结果、只按值认：上游的指标由遮罩格算出来（年薪 = 月薪 × 12）时值里认不出，清单文字原样照给。"""
     from app.engine.recompute import CopyEdge, MetricLinks, masked_closure
 
-    secrets = _Secrets()
-    secrets.add({"columns": ["phone"], "rows": [[PHONES[0]]]}, {"phone"})
     up, text, count = ("up", 0), ("text", 0), ("count", 0)
     links = {
-        up: MetricLinks(_metric("cell(nodes.q, 0, 'phone')", PHONES[0]),
-                        direct={"cell(nodes.q, 0, 'phone')": ("masked", ("phone",))}),
-        text: MetricLinks(_metric("nodes.up.text", f"- p（号码）= {PHONES[0]}"),
+        up: MetricLinks(_metric("cell(nodes.q, 0, 'salary') * 12", 97479.0),
+                        direct={"cell(nodes.q, 0, 'salary')": ("masked", ("salary",))}),
+        text: MetricLinks(_metric("nodes.up.text", "- annual（首位年薪）= 97479.0元"),
                           copies=[CopyEdge("nodes.up.text", (up,), True)]),
         count: MetricLinks(_metric("len(nodes.up.metrics)", 1), copies=[CopyEdge("nodes.up.metrics", (up,), True)]),
     }
-    got = masked_closure(links, secrets=lambda: secrets)
-    assert (got[up].word, got[text].word, got[count].word) == ("masked", "masked", None)
+    got = masked_closure(links, secrets=lambda: None)
+    assert (got[up].word, got[text].word, got[count].word) == ("masked", "masked", "masked")
+    assert got[text].copied["nodes.up.text"] == ("masked", ("salary",), None)
 
 
 def test_an_unreadable_upstream_cannot_be_checked():
@@ -495,8 +494,7 @@ def _within(seconds: float, work):
 def test_the_writer_catalog_judges_a_long_loop_of_copying_cards_within_a_second(monkeypatch, masked):
     """写作目录（withheld_metrics，运行状态里每张卡只有最后一次的产出）：三张卡、各 8 个指标，循环十轮后互相转抄、护栏选中
     整张卡，一秒以内认完，每个指标只认一次（同一张依赖图上认，转抄它的指标不再重认）。没碰号码列的全部照给；acc 的第一个
-    指标取号码列时，第一个指标所在的环（三张卡的 t0）都不给，别的指标照给（整张卡转抄、值是数的不因此不给）。以前四个指标
-    就要四十秒。"""
+    指标取号码列时，三张卡在一个环上互相转抄，按整张卡认（转抄的保守规则），全部不给。以前四个指标就要四十秒。"""
     import app.api.evidence as evidence_api
     from app.api.evidence import withheld_metrics
 
@@ -519,7 +517,7 @@ def test_the_writer_catalog_judges_a_long_loop_of_copying_cards_within_a_second(
                                   "locator": {"metric": f"t{i}"}, "value": seen[card]["metrics"][i]["value"]}
                for card in LOOP_CARDS for i in range(8)}
     got = _within(1.0, lambda: asyncio.run(withheld_metrics(catalog, nodes=seen, ledger=[])))
-    assert sorted(got) == (sorted(f"m:{card}.t0" for card in LOOP_CARDS) if masked else []), got
+    assert sorted(got) == (sorted(catalog) if masked else []), got
     assert len(built) == 3 * 8, len(built)
 
 
@@ -656,9 +654,10 @@ async def test_a_metric_from_an_unaliased_masked_expression_is_withheld_everywhe
 
 
 async def test_the_whatif_judges_copied_inputs_on_the_same_graph(client, monkeypatch, vip):
-    """卡 2 转抄卡 1 的两个指标：号码除以 1000 的余数（值是三位数，按值认不出，输入取自遮罩格）、客户编号。推演卡 2：转抄余数
-    的输入不给值、不能改，指标的原值写「已遮罩」，原因写「转抄的口径卡指标取自设置了遮罩的列」；转抄编号的照常推演。以前
-    推演只按值认，余数照给、还能改，改一下就看得出原值。证据面板点开卡 2 的指标同样写「已遮罩」。"""
+    """卡 2 转抄卡 1 的两个指标：号码除以 1000 的余数（值是三位数，按值认不出，输入取自遮罩格）、客户编号，另转抄卡 b 的客户
+    编号。推演卡 2：转抄卡 1 的两个输入都不给值、不能改，指标的原值写「已遮罩」，原因写「转抄的口径卡指标取自设置了遮罩的列」
+    ——转抄编号的也一样，卡 1 上有取自遮罩格的指标（转抄的保守规则）；转抄卡 b（没有取自遮罩格的指标）的照常推演。以前推演只
+    按值认，余数照给、还能改，改一下就看得出原值。证据面板点开卡 2 的指标同样写「已遮罩」。"""
     script(monkeypatch, "卡二的对照 [[m:ten]]，余数 [[m:tail2]]。")
     row = await finish(chain(
         node("start", "input"),
@@ -666,9 +665,12 @@ async def test_the_whatif_judges_copied_inputs_on_the_same_graph(client, monkeyp
         node("card", "metrics", caliber="会员口径", caliber_version="v1", metrics=[
             {"id": "tail", "name": "号码尾数", "format": "plain", "expression": "cell(nodes.q_cust, 0, 'phone') % 1000"},
             {"id": "first", "name": "首位编号", "format": "plain", "expression": "cell(nodes.q_cust, 0, 'id')"}]),
+        node("card_b", "metrics", caliber="编号口径", caliber_version="v1", metrics=[
+            {"id": "first_b", "name": "首位编号", "format": "plain", "expression": "cell(nodes.q_cust, 0, 'id')"}]),
         node("card2", "metrics", caliber="转抄口径", caliber_version="v1", metrics=[
             {"id": "tail2", "name": "转抄尾数", "format": "plain", "expression": "nodes.card.metrics[0].value + 1"},
-            {"id": "ten", "name": "编号十倍", "format": "plain", "expression": "nodes.card.metrics[1].value * 10"}]),
+            {"id": "first2", "name": "转抄编号", "format": "plain", "expression": "nodes.card.metrics[1].value + 1"},
+            {"id": "ten", "name": "编号十倍", "format": "plain", "expression": "nodes.card_b.metrics[0].value * 10"}]),
         node("write", "report", instructions="写一句", on_violation="flag"),
         node("out", "output", fields=[{"name": "报告", "value": "{{ nodes.write.text }}"}]),
     ))
@@ -683,10 +685,14 @@ async def test_the_whatif_judges_copied_inputs_on_the_same_graph(client, monkeyp
     assert copied["masked"] is True and copied["old"] is None and copied["editable"] is False, copied
     assert {"metric": "tail2", "input": "nodes.card.metrics[0].value",
             "reason": "转抄的口径卡指标取自设置了遮罩的列，不能用于推演"} in body["unsupported"], body["unsupported"]
+    first = metrics["first2"]
+    assert (first["old"], first["withheld"]) == ("已遮罩", True) and first["inputs"][0]["editable"] is False, first
+    assert {"metric": "first2", "input": "nodes.card.metrics[1].value",
+            "reason": "转抄的口径卡指标取自设置了遮罩的列，不能用于推演"} in body["unsupported"], body["unsupported"]
     ten = metrics["ten"]
     assert ten["old"] == 10 and ten["inputs"][0]["editable"] is True and ten["inputs"][0]["old"] == 1, ten
     res = await client.post(f"/api/runs/{row.id}/evidence/whatif",
-                            json={"card": "card2", "overrides": {"inputs": {"nodes.card.metrics[1].value": 5}}})
+                            json={"card": "card2", "overrides": {"inputs": {"nodes.card_b.metrics[0].value": 5}}})
     assert res.status_code == 200, res.text
     assert {m["id"]: m for m in res.json()["metrics"]}["ten"]["new"] == 50
     res = await client.post(f"/api/runs/{row.id}/evidence/whatif",
@@ -700,8 +706,9 @@ async def test_the_whatif_judges_copied_inputs_on_the_same_graph(client, monkeyp
 
 
 async def test_a_card_recording_a_copied_list_with_a_number_is_not_embedded(client, monkeypatch, vip):
-    """卡 2 数卡 1 清单文字的字数（len(nodes.card.text)）：指标的值是个数，照给、照常引用；可卡 2 上记着转抄来的清单文字
-    本身，里面写着号码，卡 2 只给 id，文件里没有号码。以前指标的值照给，卡 2 就原样附带了。"""
+    """卡 2 数卡 1 清单文字的字数（len(nodes.card.text)）：指标的值只是个数，可卡 1 上有取自号码列的指标，转抄的保守规则下
+    同样写「已遮罩」（写作者坚持引用、标注照常产出）；卡 2 上记着转抄来的清单文字本身，里面写着号码，卡 2 只给 id，文件里
+    没有号码。以前指标的值照给，卡 2 就原样附带了。"""
     script(monkeypatch, "清单字数 [[m:n_len]]。")
     row = await finish(chain(
         node("start", "input"),
@@ -711,12 +718,12 @@ async def test_a_card_recording_a_copied_list_with_a_number_is_not_embedded(clie
              "expression": "cell(nodes.q_cust, 0, 'phone')"}]),
         node("card2", "metrics", caliber="转抄口径", caliber_version="v1", metrics=[
             {"id": "n_len", "name": "清单字数", "unit": "字", "format": "thousands", "expression": "len(nodes.card.text)"}]),
-        node("write", "report", instructions="写一句", on_violation="fail"),
+        node("write", "report", instructions="写一句", on_violation="flag"),
         node("out", "output", fields=[{"name": "报告", "value": "{{ nodes.write.text }}"}]),
     ))
     assert row.status == "succeeded", row.error
     doc = await doc_of(row.id)
-    assert "masked" not in doc["catalog"]["m:n_len"] and doc["catalog"]["m:n_len"]["value"] > 0
+    assert doc["catalog"]["m:n_len"]["masked"] is True and doc["catalog"]["m:n_len"]["value"] == "已遮罩"
     _, bundle = await export(client, row.id)
     cards = {a["node_id"]: a for a in cards_of(bundle)}
     assert cards["card2"].get("masked") is True and "b64" not in cards["card2"], cards

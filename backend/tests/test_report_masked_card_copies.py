@@ -4,10 +4,11 @@
 nodes.card.text（清单文字逐条写着「指标（名称）= 值」），取值链认不出出处（recompute.input_origin 只认查询结果），只按出处认
 时直接照给：写作目录写着号码，文档的证据目录里值、渲染、标签都是号码，可验证报告里报告文档和卡 2 的节点完成事件都带着号码。
 
-现在转抄上游口径卡的输入按上游那几个指标认（recompute.card_input 认出转抄了哪张卡的哪几个指标，recompute.masked_closure
-在指标依赖图上一次认，api/evidence.py 的 _CopyGraph、bundle/build.py 的 _Store.metric_word 各自按自己的口径认好转抄以外的
-输入交进去）：上游的指标取自遮罩格，转抄它的这个指标同样写「已遮罩」；整张卡、清单文字同整份查询结果，值里有遮罩值才不给
-（数一数有几个指标的照给）。写作目录、报告自查、可验证报告同一个判断。
+现在转抄上游口径卡的输入按转抄的那张卡认（recompute.card_input 认出转抄了哪张卡，recompute.masked_closure 在指标依赖图上
+一次认，api/evidence.py 的 _CopyGraph、bundle/build.py 的 _Store.metric_word 各自按自己的口径认好转抄以外的输入交进去）：那张
+卡在这次运行里有一个指标取自遮罩格，转抄它的指标就写「已遮罩」，转抄的是号码、客户数还是整张清单、数指标个数都一样（转抄的
+保守规则，复核第 3 轮：只按值认的写法漏过了由遮罩格算出来的数，见 test_report_masked_copy_any_run）。那张卡上没有取自遮罩格的
+指标时照常。写作目录、报告自查、可验证报告同一个判断。
 
 真跑的部分用虚构的 SQLite 会员库（号码是编的），写作者是 MockChatModel 照剧本写。
 """
@@ -39,7 +40,7 @@ CARD = [
     {"id": "phone_raw", "name": "首位客户手机号", "format": "plain", "expression": "cell(nodes.q_cust, 0, 'phone')"},
     {"id": "n_cust", "name": "客户数", "unit": "位", "format": "thousands", "expression": "len(vars.cust.rows)"},
 ]
-#: 卡 2：转抄卡 1 的几种写法；后两个只转抄客户数、数指标个数，值里没有号码
+#: 卡 2：转抄卡 1 的几种写法；后两个只转抄客户数、数指标个数，值里没有号码，可卡 1 上有取自号码列的指标，照样不给
 COPIES = [
     {"id": "p_nodes", "name": "转抄手机号", "format": "plain", "expression": "nodes.card.metrics[0].value"},
     {"id": "p_vars", "name": "按变量转抄手机号", "format": "plain", "expression": "vars.kpi.metrics[0].value"},
@@ -48,8 +49,9 @@ COPIES = [
     {"id": "n_metrics", "name": "卡 1 的指标个数", "unit": "个", "format": "thousands",
      "expression": "len(nodes.card.metrics)"},
 ]
-WITHHELD = ("m:p_nodes", "m:p_vars", "m:p_text")
-CLEAN = "共有 [[m:n_copy]] 客户，首张口径卡记了 [[m:n_metrics]] 指标。"
+WITHHELD = ("m:p_nodes", "m:p_vars", "m:p_text", "m:n_copy", "m:n_metrics")
+#: 卡 1 自己的客户数照给、照常引用
+CLEAN = "共有 [[m:n_cust]] 客户。"
 
 
 @pytest.fixture
@@ -80,21 +82,21 @@ def graph(copies: list[dict] | None = None, card: list[dict] | None = None, **wr
 
 
 async def test_the_writer_and_the_doc_see_masked_for_copied_masked_metrics(monkeypatch, vip):
-    """写作目录：转抄号码的三种写法都写「已遮罩」并说不要引用，转抄客户数、数指标个数的照给；整段写作目录里没有号码。文档的
-    证据目录同样写「已遮罩」，整份文档没有号码。"""
+    """写作目录：转抄卡 1 的五种写法（转抄号码、清单文字，也包括只转抄客户数、数指标个数的）都写「已遮罩」并说不要引用——卡 1
+    上有取自号码列的指标；卡 1 自己的客户数照给。整段写作目录里没有号码。文档的证据目录同样写「已遮罩」，整份文档没有号码。"""
     seen = script(monkeypatch, CLEAN)
     row = await finish(graph())
     assert row.status == "succeeded", row.error
     lines = metric_lines(seen[0])
-    for name in ("转抄手机号", "按变量转抄手机号", "转抄清单"):
+    for name in ("转抄手机号", "按变量转抄手机号", "转抄清单", "转抄客户数", "卡 1 的指标个数"):
         assert f"{name} = 已遮罩（取自设置了遮罩的列，不要引用）" in lines, lines
-    assert "转抄客户数 = 3位" in lines and "卡 1 的指标个数 = 2个" in lines, lines
+    assert "客户数 = 3位" in lines, lines
     assert leaks(lines) == [], lines
     doc = await doc_of(row.id)
     for alias in WITHHELD:
         entry = doc["catalog"][alias]
         assert (entry["value"], entry["rendered"], entry.get("masked")) == ("已遮罩", "已遮罩", True), entry
-    assert "masked" not in doc["catalog"]["m:n_copy"] and "masked" not in doc["catalog"]["m:n_metrics"]
+    assert "masked" not in doc["catalog"]["m:n_cust"]
     assert leaks(doc) == []
     [checked] = [e.data for e in await events(row.id) if e.type == "report.checked"]
     assert checked["ok"] is True, checked
@@ -113,8 +115,8 @@ async def test_citing_a_copied_masked_metric_is_a_masked_cell_violation(monkeypa
 
 async def test_the_bundle_carries_no_copied_number(client, monkeypatch, vip):
     """可验证报告：卡 2 只给 id、它的节点完成事件只给哈希，报告文档照常附带（目录里写的是「已遮罩」），整个文件没有号码；
-    证据图的标签同样写「已遮罩」。"""
-    script(monkeypatch, CLEAN)
+    证据图的标签同样写「已遮罩」（写作者坚持引用转抄来的客户数、标注照常产出），卡 1 自己的客户数照给。"""
+    script(monkeypatch, "共有 [[m:n_cust]] 客户，转抄的客户数 [[m:n_copy]]。")
     row = await finish(graph())
     assert row.status == "succeeded", row.error
     resp = await client.get(f"/api/runs/{row.id}/bundle.html")
@@ -128,7 +130,7 @@ async def test_the_bundle_carries_no_copied_number(client, monkeypatch, vip):
     assert cards["card2"].get("masked") is True and "b64" not in cards["card2"], cards
     body = (await client.get(f"/api/runs/{row.id}/evidence")).json()
     labels = {e["alias"]: e["label"] for e in body["evidence"] if e["kind"] == "metric"}
-    assert labels["m:n_copy"] == "转抄客户数 = 3位", labels
+    assert labels["m:n_cust"] == "客户数 = 3位" and labels["m:n_copy"] == "转抄客户数 = 已遮罩", labels
     assert leaks(body) == [], [e for e in body["evidence"] if leaks(e)]
 
 
