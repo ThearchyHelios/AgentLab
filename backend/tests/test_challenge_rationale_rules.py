@@ -51,6 +51,21 @@ async def test_see_in_brackets_does_not_break_the_rationale(monkeypatch, shop):
     assert second["verdict"] == "refuted" and issuance["tier"] == "degraded"
 
 
+async def test_see_brackets_written_together_do_not_glue_two_numbers(monkeypatch, shop):
+    """两个只装着依据的括号连着写、数字包着粗体（复核第 2 轮）：去掉之后两个数不能挨成一个（「9001,200」），句末前悬着的
+    逗号也去掉。"""
+    plays = {
+        "华南销售额超过华东": Play([NET], "refuted", "扣除退款后华南、华东分别为 **[[v:Q1.r1.净销售额]]**（[[see:Q1]]）"
+                                                "（[[see:Q1]]）[[v:Q1.r0.净销售额]]，华南仍低于华东，（[[see:Q1]]）（[[see:Q1]]）。"),
+        "居各区域之首": Play([REFUNDS], "stands", "华东退款 [[v:Q1.r0.退款笔数]] 笔，扣除后仍居首。[[see:Q1]]"),
+    }
+    record, _ = await _record(monkeypatch, shop, plays)
+    refuted = next(claim for claim in record["claims"] if claim["verdict"] == "refuted")
+    assert refuted["rationale"] == "扣除退款后华南、华东分别为 900 1,200，华南仍低于华东。"
+    assert refuted["rationale_doc"]["markdown"] == refuted["rationale"]
+    assert refuted["rationale_doc"]["violations"] == []
+
+
 async def test_a_placeholder_rationale_is_recorded_as_no_rationale(monkeypatch, shop):
     """反方交回的理由只是占位词：记录里理由为空（审批卡据此写「反方没有给出理由」），判「被推翻」的照常不予采信。"""
     plays = {"华南销售额超过华东": Play([NET], "refuted", "placeholder"),

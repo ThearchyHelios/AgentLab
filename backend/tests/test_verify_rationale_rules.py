@@ -90,6 +90,24 @@ async def test_see_written_in_brackets_renders_clean_in_the_rationale(monkeypatc
     assert out.rationale["violations"] == []
 
 
+async def test_see_brackets_written_together_do_not_glue_two_numbers(monkeypatch, shop):
+    """两个只装着依据的括号连着写、数字包着粗体（复核第 2 轮）：去掉括号之后两个数不能挨成一个（「2303 笔」），句末前
+    悬着的逗号也去掉。"""
+    name, _ = shop
+    said = ("未作废订单合计 **[[v:Q1.r0.total]]**（[[see:Q1]]）（[[see:Q2]]）[[v:Q2.r0.n]] 笔都已核对，口径一致，"
+            "（[[see:Q1]]）（[[see:Q2]]）。")
+    count = "SELECT COUNT(*) AS n FROM orders WHERE is_deleted = 0"
+    Script(monkeypatch, [q(name, VALID_SUM, "c1"), q(name, count, "c2")], {**FOUND, "rationale": said})
+    out = await run(name)
+    shown = "未作废订单合计 230 3 笔都已核对，口径一致。"
+    assert out.result["rationale"] == shown and out.rationale["markdown"] == shown
+    [unit] = [unit for _, unit in iter_units(out.rationale)]
+    assert [s["alias"] for s in unit["see"]] == ["Q1", "Q2", "Q1", "Q2"]
+    numbers = [seg for seg in unit["segments"] if seg.get("ref")]
+    assert [(seg["text"], bool(seg.get("strong"))) for seg in numbers] == [("230", True), ("3", False)]
+    assert out.rationale["violations"] == []
+
+
 # --------------------------------------------------------------------------
 # 收尾超时
 # --------------------------------------------------------------------------

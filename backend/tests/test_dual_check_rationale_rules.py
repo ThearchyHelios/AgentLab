@@ -36,6 +36,16 @@ async def test_see_in_brackets_does_not_break_the_blind_rationale(monkeypatch, s
     assert doc["markdown"] == mine["rationale"] and doc["violations"] == []
 
 
+async def test_see_brackets_written_together_do_not_glue_the_number(monkeypatch, shop):
+    """两个只装着依据的括号连着写、数字包着粗体（复核第 2 轮）：去掉之后数字不能和后面的字挨成一个数（「3302 月」），
+    句末前悬着的逗号也去掉。"""
+    mine = await _blind_input(monkeypatch, shop, "结果是 **{ref}**（[[see:Q1]]）（[[see:Q1]]）2 月起按支付日统计，"
+                                                 "已排除退款，（[[see:Q1]]）（[[see:Q1]]）。")
+    assert mine["rationale"] == "结果是 330 2 月起按支付日统计，已排除退款。"
+    doc = mine["rationale_doc"]
+    assert doc["markdown"] == mine["rationale"] and doc["violations"] == []
+
+
 async def test_a_placeholder_rationale_is_not_shown_as_the_explanation(monkeypatch, shop):
     mine = await _blind_input(monkeypatch, shop, "placeholder")
     assert mine["value"] == 330.0, "数照样采用"

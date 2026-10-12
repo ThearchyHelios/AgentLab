@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from app.core import artifact_store
 from app.engine import verify_agent
 from app.engine.inquiry import NO_ANSWER
@@ -38,6 +40,11 @@ from tests.test_verify_rationale_rules import slow_final
 BRACKETED = ("仍居各区域之首（[[see:Q1]]，已排除测试账号）：华东为 [[v:Q1.r0.销售额]]（[[see:Q1]]），"
              "华南为 [[v:Q1.r1.销售额]]（同口径，[[see:Q1]]）。")
 BRACKETED_TEXT = "仍居各区域之首（已排除测试账号）：华东为 1,200，华南为 900（同口径）。"
+#: 两个只装着依据的括号连着写、数字包着粗体（复核第 2 轮）：去掉括号之后两个数不能挨成一个（「1,200900」），句末前悬着的
+#: 逗号也去掉
+TOGETHER = ("华东、华南分别为 **[[v:Q1.r0.销售额]]**（[[see:Q1]]）（[[see:Q1]]）[[v:Q1.r1.销售额]]，"
+            "华东仍居各区域之首，（[[see:Q1]]）（[[see:Q1]]）。")
+TOGETHER_TEXT = "华东、华南分别为 1,200 900，华东仍居各区域之首。"
 
 
 async def _asked(client, shop) -> tuple[dict, list]:
@@ -48,15 +55,17 @@ async def _asked(client, shop) -> tuple[dict, list]:
     return r.json()["inquiry"], await events(paused.id, "approval.inquiry")
 
 
-async def test_see_in_brackets_does_not_break_the_answer(monkeypatch, shop, client):
-    Models(monkeypatch, shop, plays={"排除测试账号": Play([NO_TEST], BRACKETED)})
+@pytest.mark.parametrize(("said", "shown"), [(BRACKETED, BRACKETED_TEXT), (TOGETHER, TOGETHER_TEXT)],
+                         ids=["bracketed", "together"])
+async def test_see_in_brackets_does_not_break_the_answer(monkeypatch, shop, client, said, shown):
+    Models(monkeypatch, shop, plays={"排除测试账号": Play([NO_TEST], said)})
     item, [event] = await _asked(client, shop)
     answer = item["answer"]
-    assert answer["ok"] is True and answer["text"] == BRACKETED_TEXT
+    assert answer["ok"] is True and answer["text"] == shown
     doc = artifact_store.load(answer["doc_artifact"])
-    assert doc["markdown"] == BRACKETED_TEXT and doc["source"] == BRACKETED
+    assert doc["markdown"] == shown and doc["source"] == said
     assert doc["violations"] == []
-    assert event.data["answer_text"] == BRACKETED_TEXT
+    assert event.data["answer_text"] == shown
 
 
 async def test_a_final_answer_that_runs_out_of_time_reports_the_time_limit(monkeypatch, shop, client):

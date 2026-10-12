@@ -1818,23 +1818,31 @@ _OPEN, _CLOSE = frozenset("（("), frozenset("）)")
 #: 依据和括号、依据和依据之间的分隔标点（「（[[see:Q3]]，原报告…）」「[[see:Q1]]、[[see:Q2]]」）
 _SEPS = "，、；,;：:"
 _SEP = frozenset(_SEPS)
-#: 其中的半角标点：按排版习惯后面隔一个空格。两个夹着依据的去掉后一个时，前一个不能直接贴着下文（「212,5」读成一个数）
-_HALF = frozenset(",;:")
 #: 其中的停顿标点（不含冒号）：依据挂在它后面、紧接着就到句末时，它悬在句末（「华南居首，。」）。冒号后面另起一行
 #: 常常是它引出的表格、列表，不动
 _PAUSE = _SEP - frozenset("：:")
 #: 句末标点：停顿标点悬在它前面时去掉（还有全文结尾）。半角句点不算：后面跟着数字时它是小数点。换行不算：列表项末尾
 #: 的「；」、软换行处连着两个分句的「，」是写作者自己的，依据挂在它后面正合「挂在句末」的规矩
 _ENDING = frozenset("。！？!?")
-#: 去掉一对括号之后会粘成一串的字：前面是数字、字母（或者标记的结尾、百分号、半角的逗号和小数点），后面是数字、字母
-#: （或者一个渲染出字的标记）。中文和数字之间不加空格也读得对，不算
-_NUMBERISH = frozenset("]%‰.,")
 #: 依据周围、渲染后会挤在一起的字：空白和分隔标点
 _GAP = frozenset(_BLANK) | _SEP
-#: 连着写的几个依据：中间只隔着空白、分隔标点
-_SEE_GROUP = re.compile(_SEE_MARK + r"(?:[" + _BLANK + _SEPS + r"]*" + _SEE_MARK + r")*")
-#: 其中只隔着空白的一段（两边都是字时，依据之间的分隔标点可能就是分句的标点，按它断开各算各的）
-_SEE_RUN = re.compile(_SEE_MARK + r"(?:[" + _BLANK + r"]*" + _SEE_MARK + r")*")
+#: 去掉依据周围的字之后，挨上的两个字会读成一串（_glue）：左边是数字、字母，或者这几个——标记的结尾（渲染出一个数）、
+#: 百分号、小数点、半角标点（「212,5」读成一个数；半角标点按排版习惯后面本来就隔一个空格）；右边是数字、字母，或者
+#: 一个渲染出字的标记。中文和数字之间不加空格也读得对，不算
+_STICKY = frozenset("]%‰.,;:")
+#: 渲染出来什么都没有的东西（依据标记、只装着依据的括号）在遮盖文本里换成这个字，位置和原文一一对应（_voids）
+_VOID = "\x00"
+#: 只装着依据的括号：里面除了依据（和已经认出来的、套在里面的这种括号）只有空白、分隔标点。头一个依据前面只认空白、
+#: 标点，免得一长串依据后面没有右括号时来回试
+_VOID_BRACKET = re.compile("[（(][" + _BLANK + _SEPS + "]*" + _VOID + "[" + _BLANK + _SEPS + _VOID + "]*[）)]")
+#: 连着写的几个：中间只隔着空白、分隔标点
+_VOID_GROUP = re.compile(_VOID + "+(?:[" + _BLANK + _SEPS + "]*" + _VOID + "+)*")
+#: 其中只隔着空白的一段（两边都是字时，中间的分隔标点可能就是分句的标点，按它断开各算各的）
+_VOID_RUN = re.compile(_VOID + "+(?:[" + _BLANK + "]*" + _VOID + "+)*")
+#: 遮盖文本里看得见的一段：一组里夹着的空白、标点，括号连同里面的空白、标点
+_SOLID = re.compile("[^" + _VOID + "]+")
+#: 粗体、斜体的星号和粗体的两个下划线：前端按 Markdown 渲染，不显示（组装文档时包着标记的粗体也去掉了星号）
+_EMPHASIS = re.compile(r"\*+|__+")
 
 
 def _rendered_unit(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots,
@@ -1852,13 +1860,13 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
     - 数字标记后面重复写的单位去掉。[[m:visits]] 渲染出来已经带单位（12,345人次），写作者常常
       还跟着写一遍（[[m:visits]] 人次），读者看到的是「12,345人次 人次」。单字的单位后面紧跟着字时
       不动：写作者写的可能是另一个单位（口径卡是「人」，正文写「人次」），硬删会把不一致藏起来；
-    - [[see:…]] 渲染成空，它周围留下的空白、括号、标点去掉（_see_cuts）：「最高月份 [[see:Q2]]。」会剩下
-      「最高月份 。」，「结果一致（[[see:Q3]]，原报告…）」会剩下「结果一致（，原报告…）」。去掉之后两边的数字、字母
-      会粘成一串的，换成一个空格（_glued）。
+    - [[see:…]] 渲染成空，它周围留下的空白、括号、标点去掉（_voids、_see_cuts）：「最高月份 [[see:Q2]]。」会剩下
+      「最高月份 。」，「结果一致（[[see:Q3]]，原报告…）」会剩下「结果一致（，原报告…）」。去掉之后两边挨上的字会读成
+      一串的，补回一个空格（_glue）。
 
     prev 是这段文字前面那个字（流式渲染分块时用），判断空白是不是在行首。
     """
-    cuts: list[tuple[int, ...]] = []
+    cuts: list[tuple[int, int]] = []
     for marker in parse_markers(text):
         if marker["kind"] not in _UNIT_KINDS:
             continue
@@ -1870,48 +1878,67 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
             after = text[hit.end():hit.end() + 1]
             if len(unit) > 1 or not after.isalnum():
                 cuts.append((marker["end"], hit.end()))
-    for group in _SEE_GROUP.finditer(text):
-        cuts.extend(_see_cuts(text, group.start(), group.end(), prev))
-    if not cuts:
+    see: list[tuple[int, int]] = []
+    spaces: set[int] = set()
+    if "see" in text:       # 没有依据标记就没有要收拾的（流式渲染的每一块都走这里，先挡掉）
+        masked, see = _voids(text)
+        for group in _VOID_GROUP.finditer(masked):
+            see += _see_cuts(text, masked, group.start(), group.end(), prev)
+        spaces = _glue(text, masked, see, prev)
+    if not cuts and not see:
         return text
-    # 几处要去掉的字可能重叠（依据前面的空白、它和括号之间的标点）：按并集去掉。带着替换的（第三项，去掉之后两边会
-    # 粘在一起，换成一个空格）连成一片时整片换成它
-    merged: list[list[Any]] = []
-    for a, b, *rep in sorted(cuts):
-        if merged and a < merged[-1][1]:
+    # 几处要去掉的字可能重叠、相接（依据前面的空白、它和括号之间的标点）：按并集去掉，要补空格的那一片换成一个空格
+    merged: list[list[int]] = []
+    for a, b in sorted(cuts + see):
+        if merged and a <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], b)
-            merged[-1][2] = merged[-1][2] or "".join(rep)
         else:
-            merged.append([a, b, "".join(rep)])
+            merged.append([a, b])
     out, last = [], 0
-    for a, b, rep in merged:
-        out += [text[last:a], rep]
+    for a, b in merged:
+        out += [text[last:a], " " if any(a <= x < b for x in spaces) else ""]
         last = b
     out.append(text[last:])
     return "".join(out)
 
 
-def _see_cuts(text: str, start: int, end: int, prev: str, *, whole: bool = False) -> list[tuple[int, ...]]:
-    """一组依据（_SEE_GROUP，text[start:end]）渲染成空之后，周围要一起去掉的字。标记本身留着：组装文档时句子靠它挂
-    依据（unit.see），渲染时它本来就不显示。
+def _voids(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """渲染出来什么都没有的东西：依据标记，和只装着依据的括号（里面可以隔着空白、分隔标点，套着的也算）。返回遮盖文本
+    （这些地方换成 _VOID，位置和原文一一对应）和这种括号连同里面的空白、标点：要一起去掉的字（「合计 6,635.68
+    （[[see:Q1]]）。」不剩「（）」）。依据标记本身留着：组装文档时句子靠它挂依据（unit.see），渲染时它本来就不显示。
 
-    - 括号里只有依据的（「合计 6,635.68（[[see:Q1]]）。」），连括号一起去掉；去掉之后整对括号当一个依据，外面照下面
-      几条再收拾一遍（「华南居首，（[[see:Q1]]）。」的逗号）。括号两边的数字、字母会粘成一串的，括号换成一个空格
-      （「4,919.5（[[see:Q1]]）2 月」不剩「4,919.52 月」，_glued）
-    - 依据在括号开头（「（[[see:Q3]]，原报告…）」）：它和括号之间、它后面的标点和空白；在括号末尾（「（同 SQL，
+    认出来的括号和依据一样当一个不显示的东西：连着写的几个（「（[[see:Q1]]）（[[see:m:gmv]]）」「[[see:Q1]]
+    （[[see:Q2]]）」）由 _VOID_GROUP 并成一组，外面照 _see_cuts 收拾一遍（「华南居首，（[[see:Q1]]）。」的逗号）。"""
+    chars = list(text.replace(_VOID, "\x01"))
+    for m in MARKER_RE.finditer(text):
+        if m.group("kind") == "see":
+            chars[m.start():m.end()] = _VOID * (m.end() - m.start())
+    masked, cuts = "".join(chars), []
+    while hits := list(_VOID_BRACKET.finditer(masked)):
+        # 一轮认出最里面的一层：套在外面的括号下一轮才只剩依据
+        for hit in hits:
+            cuts += [(s.start(), s.end()) for s in _SOLID.finditer(masked, hit.start(), hit.end())]
+            chars[hit.start():hit.end()] = _VOID * (hit.end() - hit.start())
+        masked = "".join(chars)
+    return masked, cuts
+
+
+def _see_cuts(text: str, masked: str, start: int, end: int, prev: str) -> list[tuple[int, int]]:
+    """一组不显示的东西（_VOID_GROUP：依据、只装着依据的括号，连着写的几个，masked[start:end]）渲染成空之后，周围要
+    一起去掉的字：
+
+    - 在括号开头（「（[[see:Q3]]，原报告…）」）：它和括号之间、它后面的标点和空白；在括号末尾（「（同 SQL，
       [[see:Q2]]）」）同理
-    - 后面就到句末（句末标点、全文结尾），依据前面、几个依据之间有停顿标点的（「华南居首，[[see:Q1]]。」）：
-      这些停顿标点（前面是冒号的留着：它引出的可能是下一行的表格、列表）；没有停顿标点、到句末只隔着空白的，空白去掉
-      （「华南居首 [[see:Q1]] 。」）
-    - 以上几种里，几个依据之间的空白、分隔标点一并去掉（「（[[see:Q1]]、[[see:Q2]]）」）
-    - 两边都是字的，依据之间的分隔标点可能就是分句的标点：按它断开，每段照 _run_cuts
+    - 后面就到句末（句末标点、全文结尾），前面、中间有停顿标点的（「华南居首，[[see:Q1]]。」「华南居首，
+      （[[see:Q1]]）。」）：这些停顿标点（前面是冒号的留着：它引出的可能是下一行的表格、列表）；没有停顿标点、到句末
+      只隔着空白的，空白去掉（「华南居首 [[see:Q1]] 。」）
+    - 以上几种里，中间的空白、分隔标点一并去掉（「（同 SQL；[[see:Q1]]、[[see:Q2]]）」）
+    - 两边都是字的，中间的分隔标点可能就是分句的标点：按它断开，每段照 _run_cuts
 
-    不含依据的括号、标点一个字不动。要看的只有依据前后连着的空白、括号、分隔标点，外加再往外的一个字：流式渲染把
-    这些字攒到后面的字来了才放（_TRAILING_SEE），分块渲染和整篇渲染判得一样。prev 是这段文字前面那个字。
-    whole：text[start:end] 是一对只装着依据的括号（括号本身已经记了去掉），当一个依据看它外面。
+    不含依据的括号、标点一个字不动。要看的只有这组前后连着的空白、分隔标点，外加再往外的一个字：流式渲染把这些字攒到
+    后面的字来了才放（_TRAILING_SEE），分块渲染和整篇渲染判得一样。prev 是这段文字前面那个字。
     """
-    marks = [] if whole else list(MARKER_RE.finditer(text, start, end))
-    gaps = [(m.end(), n.start()) for m, n in zip(marks, marks[1:]) if m.end() < n.start()]
+    gaps = [(s.start(), s.end()) for s in _SOLID.finditer(masked, start, end)]
     lo, hi = start, end
     while lo > 0 and text[lo - 1] in _GAP:
         lo -= 1
@@ -1920,16 +1947,12 @@ def _see_cuts(text: str, start: int, end: int, prev: str, *, whole: bool = False
     opener = text[lo - 1] if lo > 0 else prev
     closer = text[hi] if hi < len(text) else ""
     left, right = text[lo:start], text[end:hi]
-    if lo > 0 and opener in _OPEN and closer in _CLOSE:
-        # 括号里只有依据：连括号一起去掉
-        glue = " " if _glued(text, lo - 1, hi + 1, prev) else ""
-        return [(lo - 1, start), *gaps, (end, hi + 1, glue), *_see_cuts(text, lo - 1, hi + 1, prev, whole=True)]
     if opener in _OPEN:
         return [(lo, start), *gaps, (end, hi)]
     if closer in _CLOSE:
         # 和括号之间只有空白的，照依据前的空白处理（行首的缩进不动）
         return [*gaps, (end, hi), *([(lo, start)] if _SEP & set(left) else _blank_cut(text, start, end, prev))]
-    tail: list[tuple[int, ...]] = []
+    tail: list[tuple[int, int]] = []
     if closer in _ENDING or closer == "":
         if _PAUSE & set(left + "".join(text[a:b] for a, b in gaps)):
             # 依据后面、句末前面的停顿标点是写作者自己的（「增长 [[see:Q1]]，」），不是依据留下的，不动；只剩空白的去掉
@@ -1937,41 +1960,19 @@ def _see_cuts(text: str, start: int, end: int, prev: str, *, whole: bool = False
                     *([(lo, start)] if _PAUSE & set(left) else _blank_cut(text, start, end, prev))]
         if not _SEP & set(right):
             tail = [(end, hi)]
-    runs = [(start, end)] if whole else [(run.start(), run.end()) for run in _SEE_RUN.finditer(text, start, end)]
-    return [*tail, *(cut for a, b in runs for cut in _run_cuts(text, a, b, prev))]
+    return [*tail, *(cut for run in _VOID_RUN.finditer(masked, start, end)
+                     for cut in _run_cuts(text, masked, run.start(), run.end(), prev))]
 
 
-def _glued(text: str, start: int, end: int, prev: str) -> bool:
-    """去掉 text[start:end]（一对只装着依据的括号）之后，两边的字会不会粘成一串：前面是数字、字母（或者标记的结尾、
-    百分号、半角的逗号和小数点，_NUMBERISH），后面紧跟着数字、字母，或者一个渲染出字的标记。「[[v:Q1.r0.销售额]]
-    （[[see:Q1]]）2 月」去掉括号读成「4,919.52 月」，是另一个数，而且哪项核对都查不出来。括号前有空白的不会粘：
-    空白照 _blank_cut 留着。紧跟在括号后面的依据也不显示，越过它看下一个字（流式渲染把它和括号一起攒着）。"""
-    before = text[start - 1] if start > 0 else prev
-    if not (_wordish(before) or before in _NUMBERISH):
-        return False
-    while (marker := MARKER_RE.match(text, end)) is not None and marker.group("kind") == "see":
-        end = marker.end()
-    after = text[end:end + 1]
-    if after == "[":
-        return MARKER_RE.match(text, end) is not None
-    return _wordish(after)
+def _run_cuts(text: str, masked: str, start: int, end: int, prev: str) -> list[tuple[int, int]]:
+    """两边都是字的一段（_VOID_RUN，中间只隔着空白）：
 
-
-def _wordish(ch: str) -> bool:
-    """数字（全角的也算）或者半角字母：两个挨在一起读成一个数、一个词。"""
-    return ch.isdecimal() or (ch.isascii() and ch.isalnum())
-
-
-def _run_cuts(text: str, start: int, end: int, prev: str) -> list[tuple[int, ...]]:
-    """两边都是字的一段依据（_SEE_RUN，中间只隔着空白；或者一对只装着依据的括号）：
-
-    - 几个依据之间的空白，和依据前面的空白（_blank_cut）
+    - 中间的空白，和前面的空白（_blank_cut）
     - 夹在两个分隔标点中间（「结果一致，[[see:Q1]]，原报告…」）：去掉后面那个（连同它前面的空白，后面的空白留着
-      隔开下文：「a, [[see:Q1]], b」→「a, b」）。前面那个是半角标点、后面紧跟着字的，换成一个空格：「212,[[see:Q1]],5」
-      不剩「212,5」
+      隔开下文：「a, [[see:Q1]], b」→「a, b」）。去掉之后前一个贴着下文、读成一串的（「212,[[see:Q1]],5」），_glue
+      补回一个空格
     """
-    marks = list(MARKER_RE.finditer(text, start, end))
-    cuts: list[tuple[int, ...]] = [(m.end(), n.start()) for m, n in zip(marks, marks[1:]) if m.end() < n.start()]
+    cuts = [(s.start(), s.end()) for s in _SOLID.finditer(masked, start, end)]
     cuts += _blank_cut(text, start, end, prev)
     lo, hi = start, end
     while lo > 0 and text[lo - 1] in _GAP:
@@ -1980,10 +1981,7 @@ def _run_cuts(text: str, start: int, end: int, prev: str) -> list[tuple[int, ...
         hi += 1
     left, right = text[lo:start], text[end:hi]
     if _SEP & set(left) and _SEP & set(right):
-        cut = end + max(i for i, ch in enumerate(right) if ch in _SEP) + 1
-        after = text[cut:cut + 1]
-        spaced = left.rstrip(_BLANK)[-1] in _HALF and after not in ("", "\n") and after not in _BLANK
-        cuts.append((end, cut, " " if spaced else ""))
+        cuts.append((end, end + max(i for i, ch in enumerate(right) if ch in _SEP) + 1))
     return cuts
 
 
@@ -1998,6 +1996,65 @@ def _blank_cut(text: str, start: int, end: int, prev: str) -> list[tuple[int, in
     if blank < start and before not in ("", "\n") and not (after.isalnum() or after == "["):
         return [(blank, start)]
     return []
+
+
+def _glue(text: str, masked: str, see: list[tuple[int, int]], prev: str) -> set[int]:
+    """依据周围的字（see）去掉之后，两边真正挨上的两个看得见的字会读成一串的（_STICKY）：返回这一片里头一个去掉的字
+    的位置，_tidy 在那里补回一个空格。「[[v:Q1.r0.销售额]]（[[see:Q1]]）2 月」去掉括号读成「4,919.52 月」，是另一个
+    数，而且哪项核对都查不出来。
+
+    往两边找挨上的字时越过一切不显示的：去掉的字、依据标记、粗体斜体的星号和下划线。两个括号连着写（「（[[see:Q1]]）
+    （[[see:m:gmv]]）」）、数字包着粗体（「**[[v:…]]**（[[see:Q1]]）」）都照挨上的字判；依据标记的「]」越过去，不当
+    数字（「华南居首。[[see:Q1]]（[[see:Q2]]）2 月」不补）。一片里只补一个（「212,[[see:Q1]],[[see:m:gmv]],5」→
+    「212, 5」）；挨上的是写作者留着的空白的，不补。
+
+    空格补在头一个去掉的字那里。粗体把括号包在里面时（「**[[v:…]]（[[see:Q1]]）**2 月」）它落在收尾的星号前面：
+    前端的行内 Markdown 照样认这对星号，组装文档时包着标记的星号也去掉了，读者看到的一样。要挪到星号外面得先知道
+    这对星号从哪开始，流式渲染的一块里不一定有。
+
+    越过的这些字（空白、括号、分隔标点、依据、星号、下划线）流式渲染都攒到后面的字来了才放（_TRAILING_SEE）：一片总
+    落在同一块里，往左越出这一块就是 prev（它不会是这些字），分块渲染和整篇渲染判得一样。"""
+    gone = bytearray(len(text))
+    for a, b in see:
+        gone[a:b] = b"\x01" * (b - a)
+
+    def hidden(i: int) -> bool:
+        return bool(gone[i]) or masked[i] == _VOID
+
+    spaces: set[int] = set()
+    seen: set[tuple[int, int]] = set()
+    for run in re.finditer(rb"\x01+", gone):
+        p, q = run.start(), run.end()
+        while p > 0:
+            if hidden(p - 1):
+                p -= 1
+            elif text[p - 1] == "*" or (p > 1 and text[p - 2:p] == "__"):
+                mark = text[p - 1]
+                while p > 0 and text[p - 1] == mark:
+                    p -= 1
+            else:
+                break
+        while q < len(text):
+            if hidden(q):
+                q += 1
+            elif emphasis := _EMPHASIS.match(text, q):
+                q = emphasis.end()
+            else:
+                break
+        if (p, q) in seen:
+            continue
+        seen.add((p, q))
+        left = text[p - 1] if p > 0 else prev
+        right = text[q:q + 1]
+        sticks = (right == "[" and MARKER_RE.match(text, q) is not None) or _wordish(right)
+        if sticks and (_wordish(left) or left in _STICKY):
+            spaces.add(run.start())
+    return spaces
+
+
+def _wordish(ch: str) -> bool:
+    """数字（全角的也算）或者半角字母：两个挨在一起读成一个数、一个词。"""
+    return ch.isdecimal() or (ch.isascii() and ch.isalnum())
 
 
 def _render(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, prev: str = "") -> str:
@@ -2023,9 +2080,9 @@ def render_markers(text: str, catalog: dict[str, Any], *, cells_allowed: bool = 
 # 流式渲染：让 llm.token 里出现的就是最终的数字
 # --------------------------------------------------------------------------
 
-#: 文字末尾的空白、括号、分隔标点和 [[see:…]]：流式渲染先攒着，等后面的字来了再一起交给 _tidy（依据周围的这些字
-#: 去不去掉，要看再往后的那个字，见 _see_cuts）
-_TRAILING_SEE = re.compile(r"(?:[" + _BLANK + "（()）" + _SEPS + r"]|" + _SEE_MARK + r")+$")
+#: 文字末尾的空白、括号、分隔标点、星号、下划线和 [[see:…]]：流式渲染先攒着，等后面的字来了再一起交给 _tidy（依据
+#: 周围的这些字去不去掉、去掉之后补不补空格，要看再往后的那个字，见 _see_cuts、_glue）
+_TRAILING_SEE = re.compile(r"(?:[" + _BLANK + "（()）" + _SEPS + "*_" + r"]|" + _SEE_MARK + r")+$")
 
 
 def _safe_cut(text: str, has_unit: Callable[[dict[str, Any]], bool] | None = None) -> int:
@@ -2036,9 +2093,9 @@ def _safe_cut(text: str, has_unit: Callable[[dict[str, Any]], bool] | None = Non
     开头可能是另一个 [。
 
     整表标记闭合了也先不放：它展开时要看紧跟在后面的那个字（是不是换行），那个字还没到。
-    _tidy 要往后看的也先不放：末尾的空白、括号、分隔标点和 [[see:…]]（后面来的字决定它们去不去掉），
-    以及后面还没攒够 UNIT_LOOKAHEAD 个字的数字标记（后面可能是重复的单位）。has_unit 判断一个
-    标记渲染出来带不带单位，不带的（运行输入里的周次、没有单位的格）不用攒；不给就都攒。
+    _tidy 要往后看的也先不放：末尾的空白、括号、分隔标点、星号、下划线和 [[see:…]]（后面来的字决定它们去不
+    去掉、要不要补空格），以及后面还没攒够 UNIT_LOOKAHEAD 个字的数字标记（后面可能是重复的单位）。has_unit 判断
+    一个标记渲染出来带不带单位，不带的（运行输入里的周次、没有单位的格）不用攒；不给就都攒。
     """
     cut = len(text)
     start = text.rfind("[[")

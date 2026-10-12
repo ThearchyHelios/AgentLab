@@ -5,9 +5,11 @@
 [[v:Q1.r1.金额合计]]（[[see:Q1]]）」，渲染后剩下「（，原报告…）」「（）」，正式运行里随封存永久留着。
 
 - 括号（全角、半角，一对里混用也算）里只有依据的，连括号一起去掉；去掉之后整对括号当一个依据，外面照下面几条再收拾
-  一遍（括号前悬着的停顿标点、括号前后的空白）
-- 去掉括号之后两边的数字、字母会粘成一串的（「4,919.5（[[see:Q1]]）2 月」），括号换成一个空格：粘起来读成另一个数，
-  哪项核对都查不出来；半角逗号夹着依据、去掉后一个之后同理（「212,[[see:Q1]],5」→「212, 5」）
+  一遍（括号前悬着的停顿标点、括号前后的空白）。连着写的几个（「（[[see:Q1]]）（[[see:m:gmv]]）」）并成一组收拾
+- 去掉之后两边真正挨上的两个字会粘成一串的（「4,919.5（[[see:Q1]]）2 月」），补回一个空格：粘起来读成另一个数，
+  哪项核对都查不出来。找挨上的字时越过一切不显示的：依据、只装着依据的括号、粗体斜体的星号和下划线；依据标记的「]」
+  不当数字。一片里最多补一个，挨上的是写作者留着的空白的不补；半角逗号夹着依据、去掉后一个之后同理
+  （「212,[[see:Q1]],5」→「212, 5」）
 - 依据在括号开头、后面跟着「，」「、」「；」「：」的，标点一起去掉；在括号末尾、前面紧挨着标点的同理
 - 依据夹在两个分隔标点中间的，去掉后一个；后面就到句末（句末标点、全文结尾）、前面或几个依据之间有「，」「、」
   「；」的，去掉这些标点，到句末只隔着空白的去掉空白；依据后面、句末前面的标点是写作者自己的，不动
@@ -187,6 +189,132 @@ def test_a_glued_number_would_have_slipped_through_the_checks(catalog):
     assert [s["alias"] for s in unit["see"]] == ["Q1"]
 
 
+# --------------------------------------------------------------------------
+# 粘不粘看去掉之后真正挨上的两个字：越过依据、只装着依据的括号、粗体斜体的星号和下划线（复核第 2 轮）
+# --------------------------------------------------------------------------
+
+#: 读者看到的字：前端按 Markdown 渲染，星号、两个下划线不显示
+_EMPHASIS = re.compile(r"\*+|__+")
+
+
+def _visible(text: str) -> str:
+    return _EMPHASIS.sub("", text)
+
+
+@pytest.mark.parametrize(("raw", "shown"), [
+    # 两个只装着依据的括号连着写（全角半角混用、套着的也一样）：中间什么都不剩，两边会粘的照样隔开
+    ("华东 [[v:Q1.r0.销售额]]（[[see:Q1]]）（[[see:m:gmv]]）2 月起持续下滑。", "华东 4,919.5 2 月起持续下滑。"),
+    ("订单 [[v:Q1.r0.订单数]]（[[see:Q1]]）（[[see:m:gmv]]）[[v:Q1.r0.订单数]] 笔。", "订单 212 212 笔。"),
+    ("增幅 [[m:yoy]]（[[see:m:yoy]]）（[[see:Q1]]）3 个区域。", "增幅 12.5% 3 个区域。"),
+    ("增幅 [[m:yoy]]（[[see:m:yoy]]）([[see:Q1]])3 个区域。", "增幅 12.5% 3 个区域。"),
+    ("增幅 [[m:yoy]]（[[see:m:yoy]]）（（[[see:Q1]]））3 个区域。", "增幅 12.5% 3 个区域。"),
+    ("合计 [[v:Q1.r0.销售额]]（[[see:Q1]]） （[[see:m:gmv]]）2 月", "合计 4,919.5 2 月"),
+    # 依据和括号连着写、几个依据之间隔着空白：去掉之后两边会粘的，同样隔开
+    ("合计 [[v:Q1.r0.销售额]][[see:Q1]]（[[see:m:gmv]]）2 月。", "合计 4,919.5 2 月。"),
+    ("合计 [[v:Q1.r0.销售额]][[see:Q1]] [[see:m:gmv]]2 月。", "合计 4,919.5 2 月。"),
+    # 不会粘的照旧：中文和数字之间
+    ("华南居首（[[see:Q1]]）（[[see:m:gmv]]）2 月起回升。", "华南居首2 月起回升。"),
+])
+def test_see_only_brackets_written_together_do_not_glue_numbers(catalog, raw, shown):
+    assert render(raw, catalog) == shown
+    assert compose(raw, catalog)["markdown"] == shown
+
+
+@pytest.mark.parametrize(("raw", "shown"), [
+    # 连着写的几个只装着依据的括号当一组收拾：括号前悬着的停顿标点、中间的标点一并去掉
+    ("华南居首，（[[see:Q1]]）（[[see:m:gmv]]）。", "华南居首。"),
+    ("华南居首，[[see:Q1]]（[[see:m:gmv]]）。", "华南居首。"),
+    ("华南居首，（[[see:Q1]]）、（[[see:m:gmv]]）。", "华南居首。"),
+    ("结果一致（[[see:Q1]]）（[[see:m:gmv]]），原报告未过滤。", "结果一致，原报告未过滤。"),
+    ("结果一致（[[see:Q1]]）（[[see:m:gmv]]，原报告未过滤）。", "结果一致（原报告未过滤）。"),
+])
+def test_see_only_brackets_written_together_are_tidied_as_one(catalog, raw, shown):
+    assert render(raw, catalog) == shown
+    assert compose(raw, catalog)["markdown"] == shown
+
+
+@pytest.mark.parametrize(("raw", "shown"), [
+    # 粗体在括号前、后、把括号包在里面：星号不显示，挨上的是两边的数
+    ("销售额 **[[v:Q1.r0.销售额]]**（[[see:Q1]]）2 月起持续下滑。", "销售额 4,919.5 2 月起持续下滑。"),
+    ("华东 **[[v:Q1.r0.销售额]]**（[[see:Q1]]）[[v:Q1.r0.订单数]] 笔。", "华东 4,919.5 212 笔。"),
+    ("华东 [[v:Q1.r0.销售额]]（[[see:Q1]]）**[[v:Q1.r0.订单数]] 笔**", "华东 4,919.5 212 笔"),
+    ("**[[v:Q1.r0.销售额]]（[[see:Q1]]）**2 月", "4,919.5 2 月"),
+    ("华东 **[[v:Q1.r0.销售额]]**（[[see:Q1]]）（[[see:m:gmv]]）**[[v:Q1.r0.订单数]]** 笔", "华东 4,919.5 212 笔"),
+    ("__[[v:Q1.r0.销售额]]__（[[see:Q1]]）2 月", "4,919.5 2 月"),
+    ("*[[v:Q1.r0.销售额]]*（[[see:Q1]]）2 月", "4,919.5 2 月"),
+    # 依据前的空白：后面紧跟着的是星号，越过它看
+    ("合计 [[v:Q1.r0.销售额]] [[see:Q1]]**2 月**起", "合计 4,919.5 2 月起"),
+    # 不会粘的照旧
+    ("合计 **[[v:Q1.r0.销售额]]**（[[see:Q1]]）元", "合计 4,919.5元"),
+])
+def test_bold_around_a_number_does_not_hide_the_glue(catalog, raw, shown):
+    assert _visible(render(raw, catalog)) == shown
+    assert _visible(compose(raw, catalog)["markdown"]) == shown
+
+
+def test_bold_still_wraps_the_number_after_the_bracket_is_dropped(catalog):
+    doc = compose("销售额 **[[v:Q1.r0.销售额]]**（[[see:Q1]]）2 月起持续下滑。", catalog)
+    [number] = [seg for _, unit in iter_units(doc) for seg in unit["segments"] if seg.get("ref")]
+    assert number["text"] == "4,919.5" and number.get("strong") is True
+    assert render("销售额 **[[v:Q1.r0.销售额]]**（[[see:Q1]]）2 月", catalog) == "销售额 **4,919.5** 2 月"
+
+
+@pytest.mark.xfail(strict=True, reason="已知限制：粗体把括号包在里面时，补的空格落在收尾的星号前面（「**4,919.5 **2 月」）。"
+                                       "前端的行内 Markdown 照样认这对星号，组装出的文档去掉了包着标记的星号，读者看到的一样；"
+                                       "挪到星号外面得先知道这对星号从哪开始，流式渲染的一块里不一定有")
+def test_the_space_lands_outside_a_bold_that_wraps_the_bracket(catalog):
+    assert render("销售额 **[[v:Q1.r0.销售额]]（[[see:Q1]]）**2 月", catalog) == "销售额 **4,919.5** 2 月"
+
+
+@pytest.mark.parametrize(("raw", "shown"), [
+    # 依据标记的「]」不显示，不当数字：左边真正挨上的是句号、文首
+    ("华南居首。[[see:Q1]]（[[see:m:gmv]]）2 月起回升。", "华南居首。2 月起回升。"),
+    ("[[see:Q1]]（[[see:Q1]]）2 月", "2 月"),
+    ("华南居首。[[see:Q1]] （[[see:m:gmv]]）2 月起回升。", "华南居首。2 月起回升。"),   # 中间的空白同几个依据之间的
+    # 一片里最多补一个空格；挨上的本来就隔着空白的不补
+    ("212,[[see:Q1]],[[see:m:gmv]],5 个区域", "212, 5 个区域"),
+    ("212,（[[see:Q1]]）,[[see:m:gmv]],5 个区域", "212, 5 个区域"),
+    ("合计 [[v:Q1.r0.销售额]]（[[see:Q1]]）（[[see:m:gmv]]） 2 月", "合计 4,919.5 2 月"),
+])
+def test_a_space_is_put_back_once_and_only_where_it_sticks(catalog, raw, shown):
+    assert render(raw, catalog) == shown
+    assert compose(raw, catalog)["markdown"] == shown
+
+
+#: 结构化组合：左边一个渲染出数的标记（可能包着粗体），中间 1–3 段依据、只装着依据的括号、空白、星号，右边以数字、
+#: 字母或者渲染出数的标记开头
+_LEFTS = ["合计 [[v:Q1.r0.销售额]]", "合计 **[[v:Q1.r0.销售额]]**", "合计 __[[v:Q1.r0.销售额]]__", "增幅 [[m:yoy]]",
+          "编号 Q1"]
+_MIDDLES = ["（[[see:Q1]]）", "([[see:m:gmv]])", "（（[[see:Q1]]））", "[[see:Q1]]", "**", " ", "，"]
+_RIGHTS = ["2 月", "[[v:Q1.r0.订单数]] 笔", "**[[v:Q1.r0.订单数]] 笔**", "x 区"]
+#: 写作者原本就隔开了两边的中间段：括号（去掉依据之后还看得见）、空白、标点
+_SEPARATING = {"（[[see:Q1]]）", "([[see:m:gmv]])", "（（[[see:Q1]]））", " ", "，"}
+
+
+def _combos() -> list[tuple[str, str, str]]:
+    middles = [[m] for m in _MIDDLES]
+    middles += [[a, b] for a in _MIDDLES for b in _MIDDLES]
+    middles += [[a, b, c] for a in _MIDDLES for b in _MIDDLES for c in _MIDDLES]
+    return [(left, "".join(middle), right) for left in _LEFTS for right in _RIGHTS for middle in middles
+            if any(m in _SEPARATING for m in middle)]
+
+
+#: 左边那个数渲染出来的字，后面紧跟着数字、字母，或者半角的逗号、句点再跟数字：读成了另一个数、另一个词
+_GLUED = re.compile(r"(?:4,919\.5|12\.5%|Q1)(?=[\dA-Za-z]|[,.]\d)")
+
+
+def test_a_separator_the_writer_wrote_never_disappears_between_two_numbers(catalog):
+    """写作者原本隔开了的两边（括号、空白、标点），收拾依据之后不能挨成一串；也不会多出两个连着的空格。"""
+    bad = []
+    for left, middle, right in _combos():
+        raw = f"{left}{middle}{right}。"
+        shown = _visible(render(raw, catalog))
+        writer = _visible(re.sub(r"\[\[see:[^\]]*\]\]", "", raw))
+        if _GLUED.search(shown) or ("  " in shown and "  " not in writer):
+            bad.append((raw, shown))
+    assert not bad, bad[:10]
+
+
 @pytest.mark.parametrize(("raw", "shown"), [
     ("华南居首。[[see:Q1]]", "华南居首。"),
     ("华南居首 [[see:Q1]]，华东第二。", "华南居首，华东第二。"),
@@ -299,6 +427,12 @@ def _stream(catalog, raw: str, sizes: list[int]) -> list[str]:
     "华东 [[v:Q1.r0.销售额]]（[[see:Q1]]）2 月，合计 [[v:Q1.r0.销售额]]（[[see:Q1]]）[[see:m:gmv]][[v:Q1.r0.订单数]] 笔"
     "，212,[[see:Q1]],5 个",
     "华南居首，（[[see:Q1]]）。华南居首 [[see:Q1]] 。1. 华东居首；[[see:Q1]]\n2. 华南第二，（[[see:Q1]]），华东第二",
+    # 粗体、连着写的括号：往两边找挨上的字要越过星号、下划线，流式渲染得把它们和依据一起攒着
+    "销售额 **[[v:Q1.r0.销售额]]**（[[see:Q1]]）2 月，华东 [[v:Q1.r0.销售额]]（[[see:Q1]]）（[[see:m:gmv]]）"
+    "**[[v:Q1.r0.订单数]] 笔**",
+    "华南居首。[[see:Q1]]（[[see:m:gmv]]）2 月，212,[[see:Q1]],[[see:m:gmv]],5 个，合计 [[v:Q1.r0.销售额]] [[see:Q1]]"
+    "__2 月__",
+    "**[[v:Q1.r0.销售额]]（[[see:Q1]]）**2 月；华南居首，（[[see:Q1]]）（[[see:m:gmv]]）。order_（[[see:Q1]]）_x",
 ])
 @pytest.mark.parametrize("size", range(1, 9))
 def test_stream_tidies_see_in_brackets_like_the_full_render(catalog, raw, size):
@@ -310,7 +444,8 @@ def test_stream_tidies_see_in_brackets_like_the_full_render(catalog, raw, size):
 def _corpus(n: int) -> list[str]:
     rng = random.Random(20261006)
     pieces = ["[[see:Q1]]", "[[see:m:gmv]]", "[[v:Q1.r0.销售额]]", "[[m:gmv]]", "（", "）", "(", ")", "，", "、",
-              "；", "：", ",", ";", " ", "　", "。", "\n", "文字", "元", "[[", "]]", "[", "2", "x", "%", "！"]
+              "；", "：", ",", ";", " ", "　", "。", "\n", "文字", "元", "[[", "]]", "[", "2", "x", "%", "！",
+              "**", "*", "__", "_", "（[[see:Q1]]）"]
     return ["".join(rng.choice(pieces) for _ in range(rng.randint(1, 18))) for _ in range(n)]
 
 
@@ -321,3 +456,13 @@ def test_stream_matches_the_full_render_on_random_brackets(catalog, raw):
     for _ in range(3):
         sizes = [rng.randint(1, 12) for _ in range(len(raw))]
         assert "".join(_stream(catalog, raw, sizes)) == full
+
+
+def test_stream_matches_the_full_render_on_the_structured_combos(catalog):
+    """结构化组合（数、依据、只装着依据的括号、空白、星号、下划线）逐字、每 4 个字一块地送进去，拼起来和整篇渲染一样。"""
+    bad = []
+    for left, middle, right in _combos():
+        raw = f"{left}{middle}{right}。"
+        full = render(raw, catalog)
+        bad += [(raw, out) for size in (1, 4) if "".join(out := _stream(catalog, raw, [size] * len(raw))) != full]
+    assert not bad, bad[:5]
