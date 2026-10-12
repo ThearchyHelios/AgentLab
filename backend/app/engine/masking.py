@@ -1741,7 +1741,8 @@ INDIRECT_FUNCTIONS = (
 #:   column_statistics（直方图里是列的原值）、innodb_ft_*，MariaDB 的 column_stats，Oracle 的直方图、列统计和记着最小最大值
 #:   的 *_tab_columns、*_tab_cols（LOW_VALUE、HIGH_VALUE 按字节交回来就是号码、姓名的原文），以及它们的底表 histgrm$、
 #:   hist_head$
-#: - 别的会话执行过的 SQL 原文：Postgres 的 pg_stat_activity、pg_stat_statements、本连接预备过的语句；MySQL 的 general_log、
+#: - 别的会话执行过的 SQL 原文：Postgres 的 pg_stat_activity、pg_stat_statements、本连接预备过的语句，以及扩展里同一类的
+#:   pg_stat_monitor（语句原文）、pg_qualstats（条件里的常量 constvalue）、pg_store_plans（执行计划）；MySQL 的 general_log、
 #:   slow_log、PROCESSLIST、正在执行的事务（information_schema.INNODB_TRX 的 trx_query）、performance_schema（语句历史
 #:   events_statements_*、线程正在执行的 SQL），sys 库里建在 performance_schema 上的会话、锁等待视图（只认这几张，Oracle
 #:   常写的 sys.dual 不算；带 x$ 的不排版的那一份按下面的 X$ 算）和读 performance_schema 的函数（按 sys.ps_ 开头认：
@@ -1763,6 +1764,7 @@ INDIRECT_NAMES = (
     r"pg_stat(?:s|istic)\w*", r"sqlite_stat\d", r"column_statistics", r"innodb_ft_\w+", r"column_stats",
     r"(?:all|dba|user|cdb)_(?:\w+_)?(?:histograms|col_statistics|tab_cols|tab_columns)", r"(?:histgrm|hist_head)\$",
     r"pg_stat_activity", r"pg_stat_statements", r"pg_prepared_statements", r"general_log", r"slow_log",
+    r"pg_stat_monitor\w*", r"pg_qualstats\w*", r"pg_store_plans\w*",
     r"processlist", r"innodb_trx", r"innodb_locks", r"query_cache_info", r"optimizer_trace", r"performance_schema",
     r"events_statements_\w+",
     r"sys[\"`]?\s*\.\s*[\"`]?(?:(?:x\$)?(?:session|processlist|innodb_lock_waits|schema_table_lock_waits)|ps_\w+)",

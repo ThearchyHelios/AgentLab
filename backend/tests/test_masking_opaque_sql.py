@@ -225,6 +225,24 @@ def test_tables_and_sql_handed_to_functions_as_text_mask_the_whole_result(sql):
     assert done.columns == ["x"] and not _leaks(done)
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT query AS x FROM pg_stat_monitor",
+    "SELECT q.query AS x FROM pg_stat_monitor_internal(true) q",
+    "SELECT quals::text AS x FROM pg_qualstats",
+    "SELECT constvalue AS x FROM pg_qualstats()",
+    "SELECT plan AS x FROM pg_store_plans",
+])
+def test_extensions_that_keep_other_sessions_sql_mask_the_whole_result(sql):
+    """Postgres 扩展里记着别的会话执行过的语句、条件里的常量的视图和函数（pg_stat_monitor 的 query、pg_qualstats 的
+    constvalue、pg_store_plans 的计划）：交回的就是带号码的原文，和 pg_stat_statements 同一类，整份遮；可验证报告用的是同
+    一份名单，也只给哈希。"""
+    from app.bundle import build
+
+    done = masked(sql, ["x"], [[f"SELECT id FROM sales WHERE buyer_phone = '{PHONE}'"]])
+    assert done.columns == ["x"] and not _leaks(done)
+    assert masking._INDIRECT.search(sql) and build._INDIRECT_READS.search(sql)
+
+
 def test_a_table_handed_to_a_function_masks_the_whole_result_even_when_the_sql_cannot_be_read():
     sql = "SELECT table_to_xml('sales', true, false, '') AS x WHERE ("
     hidden, _ = masking._derived_hidden({"sql": sql, "columns": ["x"], "rows": []}, {"buyer_phone"}, "postgresql")
