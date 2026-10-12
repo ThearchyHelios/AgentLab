@@ -342,6 +342,24 @@ def _hidden(snapshot: dict[str, Any], source: Any, masked: dict[str, Any] | None
     return names
 
 
+def _derived(snapshot: dict[str, Any], hidden: set[str], fetch: _Fetch, mask: Any) -> tuple[set[str], set[str]]:
+    """(要遮的列, SQL 里指代遮罩列的名字)，都是小写。核查 agent 的摘录（mask 给了，engine/inquiry.py 的 ExcerptMask）另按
+    SQL 认出改了名字的遮罩列（buyer_phone AS 手机号、套函数、经子查询转一道……），和核查 agent 的查询在工具边界遮的是同一
+    套规则（表结构按快照冻结的那份、经 fetch 取）。mask 为 None（结论句裁判自己的摘录）照旧只按列名，摘录、复用键都和
+    以前一样。"""
+    if mask is None or not hidden:
+        return hidden, hidden
+    schema = fetch(snapshot.get("schema_artifact")) if snapshot.get("schema_artifact") else None
+    return mask.columns(snapshot, hidden, schema)
+
+
+def _unique_number(snapshot: dict[str, Any], column: str) -> bool:
+    """这一列按列类型是数值列：column_types 记成 number，列名在结果里只有这一列（同名的几列说不清是哪一列的类型，
+    masking._typed_numbers）。"""
+    columns = [str(c) for c in snapshot.get("columns") or []]
+    return column_kind(snapshot, column) == "number" and columns.count(column) == 1
+
+
 def _shown_columns(columns: list[str], cited: Iterable[str]) -> list[str]:
     """摘录给哪几列：被引用的列一律给（超过上限也给），再按原来的顺序用别的列补满到 EXCERPT_COLS 列。
 
@@ -354,11 +372,14 @@ def _shown_columns(columns: list[str], cited: Iterable[str]) -> list[str]:
 
 
 def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iterable[str], whole: bool,
-                   fetch: _Fetch, masked: dict[str, Any] | None, *, provenance_on: bool = False) -> str | None:
+                   fetch: _Fetch, masked: dict[str, Any] | None, *, provenance_on: bool = False,
+                   mask: Any = None) -> str | None:
     """一条查询的摘录：头、SQL、（期 4）来历行、列、被引用的行。
 
     provenance_on：文档带期 4 标记时为真（prepare 算）。这时上传表格的查询快照（有 data_version）在 SQL 之后、「列：」
     之前多几行来历（_provenance_lines）；其余情况一个字都不多，期 4 之前的文档、手工源的摘录和以前逐字相同。
+    mask：给核查 agent 的摘录才给（engine/inquiry.py 的 ExcerptMask），分段遮：改了名字的遮罩列也不给（_derived）；SQL
+    先遮再截（截在半截的值认不出）；列名、来历行按值换；格子逐格遮，数值格照原样。
     """
     snapshot = fetch(entry.get("artifact"))
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("rows"), list):
@@ -368,13 +389,15 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     source = entry.get("source") or snapshot.get("source")
     head = (f"【{alias}】合并查询结果（共 {total} 行）" if snapshot.get("source") == MERGE_SOURCE
             else f"【{alias}】查询结果（{entry.get('tool') or '查询'} · 数据源 {source or '—'} · 共 {total} 行）")
+    hidden, names = _derived(snapshot, _hidden(snapshot, source, masked), fetch, mask)
     sql = _clean(str(snapshot.get("sql") or ""))
+    if mask is not None:
+        sql = mask.sql(sql, snapshot, names)
     lines = [head, f"SQL：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}"]
     if snapshot.get("source") == MERGE_SOURCE:
         lines.append(_merge_line(snapshot))
-    hidden = _hidden(snapshot, source, masked)
     if provenance_on and snapshot.get("data_version"):
-        lines += _provenance_lines(snapshot, fetch, hidden)
+        lines += [mask.text(line) if mask is not None else line for line in _provenance_lines(snapshot, fetch, hidden)]
     columns = [str(c) for c in snapshot.get("columns") or [] if str(c).lower() not in hidden]
     shown_cols = _shown_columns(columns, cols)
     # 点名引用的行先给，整份引用的再从头补满，一共不超过 EXCERPT_ROWS 行
@@ -382,13 +405,16 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     if whole:
         picked += [r for r in range(total) if r not in picked][:EXCERPT_ROWS - len(picked)]
     omitted = len(columns) - len(shown_cols)
-    lines.append("列：" + " | ".join(shown_cols) + (f" | …另有 {omitted} 列" if omitted > 0 else ""))
+    heads = [mask.text(c) for c in shown_cols] if mask is not None else shown_cols
+    lines.append("列：" + " | ".join(heads) + (f" | …另有 {omitted} 列" if omitted > 0 else ""))
     for r in sorted(picked):
         cells = []
         for c in shown_cols:
             try:
                 raw, _ = locate_cell(snapshot, r, c)
-                cells.append(render_cell(raw, kind=column_kind(snapshot, c)))
+                shown = mask.cell(raw, numeric=_unique_number(snapshot, c)) if mask is not None else raw
+                # 按值换过的格子照文字给：「已遮罩」不能再按这一列的类型当数渲染
+                cells.append(render_cell(raw, kind=column_kind(snapshot, c)) if shown is raw else str(shown))
             except (CellError, RenderError):
                 cells.append(MISSING)
         lines.append(f"r{r}：" + " | ".join(cells))
@@ -483,11 +509,12 @@ def _cell_words(locator: dict[str, Any], hidden: set[str]) -> str:
 
 
 def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any],
-                   masked: dict[str, Any] | None) -> list[str]:
+                   masked: dict[str, Any] | None, mask: Any = None) -> list[str]:
     """指标的输入取自哪次查询、哪一格，再附上那次查询的 SQL（截到 SQL_CHARS，最多 ENTITY_QUERIES 次）。
 
     「活跃用户按会员号去重」这种讲口径的句子，证据在取数的 SQL 里；只给原式，裁判只能判证据不足。
     位置来自封存的口径卡；SQL 经 fetch 取，取不到（不在封存范围里）的不给。没追到查询的输入照实写。
+    mask 同 _query_excerpt：改了名字的遮罩列不写列名，SQL 先遮再截。
     """
     items = [i for i in metric.get("inputs") or [] if isinstance(i, dict)]
     lines: list[str] = []
@@ -504,11 +531,13 @@ def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any
         snapshot = fetch(artifact)
         snap = snapshot if isinstance(snapshot, dict) else {}
         source = (catalog.get(alias) or {}).get("source") if alias else None
-        hidden = _source_hidden(source or snap.get("source"), catalog, fetch, masked) \
-            | _mask_names(snap.get("mask_columns"))
+        hidden, names = _derived(snap, _source_hidden(source or snap.get("source"), catalog, fetch, masked)
+                                 | _mask_names(snap.get("mask_columns")), fetch, mask)
         label = f"查询 {alias} " if alias else "一次查询（不在这份报告的证据目录中）"
         lines.append(f"输入 {path}：取自{label}的 {_cell_words(item.get('locator') or {}, hidden)}")
         sql = _clean(str(snap.get("sql") or ""))
+        if sql and mask is not None:
+            sql = mask.sql(sql, snap, names)
         if sql and str(artifact) not in seen and len(seen) < ENTITY_QUERIES:
             seen.add(str(artifact))
             sqls.append(_sql_line(f"查询 {alias} 的 SQL" if alias else "这次查询的 SQL", sql))
@@ -518,7 +547,7 @@ def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any
 
 
 def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any],
-                    masked: dict[str, Any] | None) -> str:
+                    masked: dict[str, Any] | None, mask: Any = None) -> str:
     name = entry.get("name") or (entry.get("locator") or {}).get("metric") or alias
     rendered = entry.get("rendered")
     where = " ".join(v for v in (f"口径「{entry['caliber']}」" if entry.get("caliber") else "",
@@ -533,7 +562,7 @@ def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch, catalog: d
     if metric is not None:
         if metric.get("expression"):
             lines.append(f"原式：{_clean(str(metric['expression']))}")
-        lines.extend(_metric_inputs(metric, fetch, catalog, masked))
+        lines.extend(_metric_inputs(metric, fetch, catalog, masked, mask))
     return "\n".join(lines)
 
 
@@ -611,7 +640,8 @@ def _column_lines(entry: dict[str, Any], fetch: _Fetch) -> list[str]:
     return lines
 
 
-def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], whole: bool, fetch: _Fetch) -> str | None:
+def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], whole: bool, fetch: _Fetch,
+                       mask: Any = None) -> str | None:
     content = fetch(entry.get("artifact"))
     hits = content.get("hits") if isinstance(content, dict) else None
     if not isinstance(hits, list):
@@ -625,18 +655,21 @@ def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], who
         if not isinstance(hit, dict) or not isinstance(hit.get("content"), str):
             continue
         body = _clean(hit["content"])
+        # 核查 agent 的摘录（mask）：知识库片段里写着的遮罩值按值换（先换再截，截在半截的值认不出）
+        body = mask.text(body) if mask is not None else body
         title = f"《{_clean(str(hit['title']))}》" if hit.get("title") else ""
         lines.append(f"片段 {h + 1}{title}：{body[:CHUNK_CHARS]}{'…' if len(body) > CHUNK_CHARS else ''}")
     return "\n".join(lines)
 
 
 def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _Fetch,
-             masked: dict[str, Any] | None, catalog: dict[str, Any], *, provenance_on: bool = False) -> str | None:
+             masked: dict[str, Any] | None, catalog: dict[str, Any], *, provenance_on: bool = False,
+             mask: Any = None) -> str | None:
     """一件证据的摘录。provenance_on 只交给查询摘录（_query_excerpt）：指标摘录里「输入取自查询 Qn」的那几行不加
-    来历（P4-SPEC 调整 1），表名、字段名的摘录照旧。"""
+    来历（P4-SPEC 调整 1），表名、字段名的摘录照旧。mask 只给核查 agent 的摘录（见 prepare）。"""
     kind = entry.get("kind")
     if kind == "metric":
-        return _metric_excerpt(alias, entry, fetch, catalog, masked)
+        return _metric_excerpt(alias, entry, fetch, catalog, masked, mask)
     if kind == "input":
         field_name = (entry.get("locator") or {}).get("field") or alias
         return f"【{alias}】运行输入：{field_name} = {entry.get('rendered')}"
@@ -644,27 +677,30 @@ def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _
         rows = {r for c in cands for a, r in c.rows if a == alias}
         cols = [col for c in cands for a, col in c.cols if a == alias]
         return _query_excerpt(alias, entry, rows, cols, any(alias in c.whole for c in cands), fetch, masked,
-                              provenance_on=provenance_on)
+                              provenance_on=provenance_on, mask=mask)
     if kind == "retrieval":
         picked = [h for c in cands for a, h in c.hits if a == alias]
-        return _retrieval_excerpt(alias, entry, picked, any(alias in c.whole for c in cands), fetch)
+        return _retrieval_excerpt(alias, entry, picked, any(alias in c.whole for c in cands), fetch, mask)
     if kind == "table":
         head = f"【{alias}】表 {entry.get('name')}" + (f"（数据源 {entry['source']}）" if entry.get("source") else "")
-        return "\n".join([head, *_table_lines(entry, catalog, fetch, masked), *_entity_sql(entry, catalog, fetch)])
+        return "\n".join([head, *_table_lines(entry, catalog, fetch, masked),
+                          *_entity_sql(entry, catalog, fetch, masked, mask)])
     if kind == "column":
         table = (entry.get("locator") or {}).get("table")
         head = f"【{alias}】字段 {f'{table}.' if table else ''}{(entry.get('locator') or {}).get('column') or entry.get('name')}"
-        return "\n".join([head, *_column_lines(entry, fetch), *_entity_sql(entry, catalog, fetch)])
+        return "\n".join([head, *_column_lines(entry, fetch), *_entity_sql(entry, catalog, fetch, masked, mask)])
     return None
 
 
-def _entity_sql(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch) -> list[str]:
+def _entity_sql(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch, masked: dict[str, Any] | None = None,
+                mask: Any = None) -> list[str]:
     """表名、字段名出现过的查询的 SQL（每条截到 SQL_CHARS，最多 ENTITY_QUERIES 条）。
 
     讲算法的句子（「按会员号去重计数得出」）证据在 SQL 里；只给名字，裁判只能判不支持。
     查询用条目自己记的（表：SQL 里用到它；字段：它是结果列）。只在 SQL 里出现、不是结果列的字段自己没记：
     有表条目就从它记的查询里找，没有（文档目录只留正文用到的实体）就看全部查询，都只留 SQL 里写了这个
     字段名（有表名的还要写了表名）的。快照经 fetch 取：取不到（不在封存范围里）的不给。
+    mask 同 _query_excerpt：SQL 先遮再截（要遮的列按那条查询的数据源认，masked 同 _query_excerpt）。
     """
     locator = entry.get("locator") or {}
     column = locator.get("column") if entry.get("kind") == "column" else None
@@ -683,6 +719,9 @@ def _entity_sql(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch) -
         sql = _clean(str(snapshot.get("sql") or "")) if isinstance(snapshot, dict) else ""
         if not sql or any(not re.search(rf"(?<![\w]){re.escape(n)}(?![\w])", sql, re.I) for n in need):
             continue
+        if mask is not None:
+            source = catalog[q].get("source") or snapshot.get("source")
+            sql = mask.sql(sql, snapshot, _derived(snapshot, _hidden(snapshot, source, masked), fetch, mask)[1])
         lines.append(f"出现在查询 {q}：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}")
         if len(lines) == ENTITY_QUERIES:
             break
@@ -739,10 +778,16 @@ class JudgeRequest:
 
 
 def prepare(doc: dict[str, Any], catalog: dict[str, Any] | None = None, *, units: Iterable[str] | None = None,
-            loader: Callable[[str], Any] | None = None, masked: dict[str, Any] | None = None) -> JudgeRequest:
+            loader: Callable[[str], Any] | None = None, masked: dict[str, Any] | None = None,
+            mask: Any = None) -> JudgeRequest:
     """裁判的输入：候选句和证据摘录。纯函数（快照经 loader 取，缺省读工件库），不调模型。
 
     catalog 缺省用文档自己存的目录；masked = {数据源名: 要遮的列}，和快照里记下的 mask_columns 合在一起。
+    mask 只在给核查 agent（反方审稿、审批质询）准备摘录时给（engine/inquiry.py 的 ExcerptMask，这里只按它的 columns、
+    cell、sql、text 几个方法用）：摘录分段遮，和核查 agent 的查询在工具边界遮的是同一套口径——改了名字的遮罩列
+    （buyer_phone AS 手机号）按 SQL 认出来也不给；SQL 照质询封存 SQL 的办法换，范围比较的阈值、LIMIT 照原样；格子逐格
+    遮，数值格照原样；列名、知识库片段、来历行按值换。报告里的指标值、原式、运行输入不遮（报告本来就摆在读者眼前）。
+    以前先渲染好整段、再整段按值换，阈值、没设遮罩的数也成了「已遮罩」。结论句裁判自己的摘录不给它，和以前逐字相同。
 
     摘录按文档标记分版本（P4-SPEC 1.4、3.3）：带 `provenance: DOC_PROVENANCE` 的文档，上传表格的查询摘录多几行
     来历；没有标记的（期 4 之前组装的）和以前逐字相同，复用键、断点指纹都不变，已判过的句子照旧复用。
@@ -755,7 +800,7 @@ def prepare(doc: dict[str, Any], catalog: dict[str, Any] | None = None, *, units
     for alias in dict.fromkeys(a for c in cands for a in c.aliases):
         entry = catalog.get(alias)
         if isinstance(entry, dict) and (text := _excerpt(alias, entry, cands, fetch, masked, catalog,
-                                                         provenance_on=provenance_on)):
+                                                         provenance_on=provenance_on, mask=mask)):
             excerpts[alias] = text
     picked = {c.unit for c in cands}
     skipped: dict[str, str] = {}

@@ -6,24 +6,42 @@
 质询（engine/inquiry.py）、双盲复算（nodes/dual_check.py，经 inquiry 的同名导出）共用：
 
 - 工具边界先遮（mask_query_result）：核查 agent 的查询结果交给模型、落进快照之前，取自遮罩列的格子换成「已遮罩」，
-  别的格子按值换：这份结果里的遮罩值，加上这个 agent 前面的查询遮掉的、调用方交进来的（报告快照里的）。模型看不到
+  别的文字格按值换：这份结果里的遮罩值，加上这个 agent 前面的查询遮掉的、调用方交进来的（报告快照里的）。模型看不到
   遮罩值，就不会把它写进回答、理由、SQL——事后按值认每一轮复核都找到新的漏法，根治靠这一步；审批质询回答、反方
-  审稿理由里的按值遮降为第二道防线。查询失败时报错原话里的值也换（mask_error_text）
-
-- 哪些列（_derived_hidden）：从遮罩列本身起，按 SQL 一层层认出值取自遮罩列的结果列（别名、函数、子查询、WITH、UNION 的
-  另一支、和 * 写在同一支里没起别名的表达式、FROM 里拆开遮罩列的表值函数、函数参数里的 JSON 箭头 col->'path'）；* 把
-  遮罩列带进别的列名的（写了列名表的派生来源、UNION 后一支的 *、标量子查询里的 *）按它展开落到的位置算（_star_places，
-  展开数据源里的表的按查询当时冻结的表结构数位置，_schema_columns；写了库名的表按「库名.表名」查，另一个库里的同名表
-  查不到）。整行和函数参数里的 *（Postgres 的 row_to_json(s)、SELECT s、to_json(s.*)，Oracle 的 JSON_OBJECT(*)）按 *
-  展开的来源算；表的列名表（FROM sales AS s(i, r, p)）、TABLE x、套了括号的 * 先改写成认得出的样子（_normalized）。
+  审稿理由里的按值遮降为第二道防线。宁可多遮，但不改写没设遮罩的数值证据：数值格（数，列类型是 number 而且列名唯一
+  的，_typed_numbers）不按值换，按值换过的文字格记进快照（masked_cells），认不全整份遮的也记一笔（masked_whole）。查询
+  失败时报错原话里的值也换（mask_error_text）。分析本身出了意外，整份遮（_masked_whole）
+- 证据摘录（engine/inquiry.py 的 ExcerptMask，judge.prepare 按它逐段遮）：交给反方审稿、审批质询 agent 的报告摘录同一套
+  口径，格子逐格遮（masked_cell），SQL 只换在找某一个值的字面量，阈值照原样
+- 哪些列（_derived_masks）：从遮罩列本身起，按 SQL 一层层认出值取自遮罩列的结果列（别名、函数、子查询、WITH、UNION 的
+  另一支、和 * 写在同一支里没起别名的表达式、FROM 里拆开遮罩列的表值函数、函数参数里的 JSON 箭头 col->'path'、Oracle
+  的 JSON 点号 t.col.path）；* 把遮罩列带进别的列名的（写了列名表的派生来源、UNION 后一支的 *、标量子查询里的 *）按它
+  展开落到的位置算（_star_places，展开数据源里的表的按查询当时冻结的表结构数位置，_schema_columns；写了库名的表按
+  「库名.表名」查，另一个库里的同名表查不到）。整行和函数参数里的 *（Postgres 的 row_to_json(s)、SELECT s、
+  to_json(s.*)，Oracle 的 JSON_OBJECT(*)）按 * 展开的来源算；表的列名表（FROM sales AS s(i, r, p)）、TABLE x、
+  套了括号的 * 先改写成认得出的样子（_normalized）。
+  WITH 里的名字按作用域认（_scoped_cte）：不带 RECURSIVE 的一段看不见它自己和排在后面的段，同名的是数据源里的表。
   COUNT 只数个数、窗口的分区键只决定次序、按遮罩列分档又当分组键或套在汇总里数个数的、汇总里的 CASE 只在条件里用到的
-  不算（_value_columns、_band_only）。认不出落在哪一列的（PIVOT、UNPIVOT 这类也算）、SQL 解析不了又写着遮罩列（或者 *、
-  TABLE x）的，整份快照的列都算。双盲复算按同一套认法在派盲算之前挡下取自遮罩列的指标（derived_columns）
+  不算（_value_columns、_band_only）。认不全的写法整份快照的列都算，不再逐个形状补规则：认不出落在哪一列的（PIVOT、
+  UNPIVOT 这类也算），(表达式).* 展开读到遮罩列的（复合类型的列、函数交回的记录，外面套了括号、起了别名的也算，展开成
+  几列、叫什么说不清；不只选出项，VALUES、行构造器、函数参数里的也算；Postgres 里 FROM 中可能交回复合类型的表值函数
+  同理，_spreads_record），VALUES 当一张表用（FROM、JOIN、LATERAL 里的，WITH 里的一段，UNION 的一支）又读到遮罩列的
+  （各库给它的列起名不一样：Postgres、SQLite 叫 column1…，MySQL 叫 column_0…，MariaDB 拿第一行的值当列名，
+  _values_names），语法树和实际执行的对不上的（OPAQUE_SQL：MySQL 会执行的注释、U&"…"；没有 * 的一支选出项
+  和结果的列数对不上），表名、SQL 写在字符串里交给函数、统计信息和会话记录里存着值的（INDIRECT_FUNCTIONS、
+  INDIRECT_NAMES：query_to_xml 这一族、dblink、pg_stats、MySQL 的 column_statistics、INNODB_TRX、Oracle 的直方图和
+  V$SQL……，可验证报告用的同一份），不只读表结构的 SHOW、EXPLAIN 一条语句（_reads_beyond：引擎状态、日志、出错信息、
+  视图定义里的原文，MySQL 把只有一行的表的值代进计划里的条件），SQL 解析不了又写着遮罩列（或者 *、TABLE x、上面那几类，
+  或者是 Postgres 的）的，分析出了意外、超出工作量上限（ANALYSIS_STEPS）的；这些只收确定取自遮罩列的那几列的值
+  （_Masks.collect）。一次分析里派生来源对应的那块查询、一项的值取自哪些列记下来（_analysis），一长串 CTE 不再卡住。
+  双盲复算按同一套认法在派盲算之前挡下取自遮罩列的指标（derived_columns）
 - 只装着分档标签的列（_label_columns）：标签是 agent 写在 SQL 里的字，不当遮罩值；* 展开数据源里的表时按冻结的表结构
-  认它带不带同名的列（_schema_tables）
-- 哪些值（_Secrets）：遮罩列里出现过的值，按值认有门槛（SECRET_MIN、SECRET_DIGITS），换的时候先按词、按开头几个字筛出
-  正文里真有的那几个值，不现编上万个分支的正则；正文、文字格、SQL 的字符串和注释里换了写法的长号码（199-1474-2785、
-  +86 …、全角数字）按纯数字写法在集合里查（loose_spans）；已经摆在读者眼前的值免遮，之后并进来的照样免（protected）
+  认它带不带同名的列（_schema_tables），不知道表结构的按带得出算（多遮）。分档写在派生来源里、外层按它分组的（一档
+  一行，_grouped_labels）同当分组键的 CASE 一样照常显示（_shown_labels）
+- 哪些值（_Secrets）：遮罩列里出现过的值，按值认有门槛（SECRET_MIN、SECRET_DIGITS），占位的写法（PLACEHOLDERS：未知、
+  暂无……）不收；换的时候先按词、按开头几个字筛出正文里真有的那几个值，不现编上万个分支的正则；正文、文字格、SQL 的
+  字符串和注释里换了写法的长号码（199-1474-2785、+86 …、全角数字）按纯数字写法在集合里查（loose_spans）；已经摆在
+  读者眼前的值免遮，之后并进来的照样免（protected、spared）
 - 快照遮好的样子（_masked_view），回答时才认得出、事后要照位置重放的地方（view_edits、replay_edits）
 - 一次核查里认出的遮罩值（SeenValues）：调用方交进来的和 agent 查询时遮掉的分开记，合起来时 agent 查到的在前
 
@@ -37,10 +55,12 @@ import functools
 import json
 import logging
 import re
+import threading
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 from app.engine.evidence import MARKER_RE, RenderError, render_cell
 from app.engine.expressions import numeric_text
@@ -56,6 +76,12 @@ SECRET_MIN = 2
 SECRET_DIGITS = 5
 #: 遮罩列的值最多收这么多种写法（一份快照最多上千行）：再多就按已经收到的换
 SECRETS_MAX = 20_000
+#: 占位的写法：遮罩列里没填的格子常这样写，不是哪个人的信息。当遮罩值收了的话，没设遮罩的列、备注里同一个词都会被换掉
+#: （区域「未知」、「原因未知」变成「原因已遮罩」），一个都不收（不分大小写）
+PLACEHOLDERS = frozenset({
+    "未知", "暂无", "不详", "不明", "无", "空", "未填", "未填写", "未提供", "待定", "待补充", "暂缺", "缺失", "没有",
+    "其他", "其它", "保密", "匿名", "未登记", "未记录", "无数据", "null", "none", "nil", "nan", "n/a", "na", "-", "--",
+})
 
 
 #: 按词边界认值的字符：值的头尾是这样的字时，前后不能紧挨着同类的字（13900000001 不换掉 139000000012 的一截）
@@ -80,6 +106,49 @@ def _masked_word() -> str:
 #: _value_columns 里「值可能取自数据源里一张表的任何一列」：套在里面的子查询里的 * 展开了表，SQL 里看不出这张表有哪几列。
 #: 按它认（_reads）一律算取自遮罩列（宁可多遮）；真实的列名不会是这个
 _ANY_COLUMN = "*"
+#: 一次遮罩分析（_tainted 认遮罩列）最多走这么多步：展开一个派生来源、认一项的值取自哪些列各算一步，记下的结果再用不算。
+#: 一般的查询几百到几千步，两百段的普通 CTE 几万步；一长串 CTE 一段套一段地整行引用、展开 *（2 万字的上限里写得下几百段）
+#: 以前要几十秒，超出就不再分析，整份遮（工具边界每次查询都要分析，不能为一条病态的 SQL 卡住）
+ANALYSIS_STEPS = 400_000
+
+
+class _Overworked(Exception):
+    """遮罩分析超出了工作量上限（ANALYSIS_STEPS）。"""
+
+
+class _Analysis:
+    """一次遮罩分析里记下的中间结果：派生来源对应的那块查询（_derived_block）、一项的值取自哪些列（_value_columns），
+    按语法树节点记（分析期间树不再改写，节点都活着）；走过的步数（超出 ANALYSIS_STEPS 抛 _Overworked）。"""
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self.blocks: dict[int, Any] = {}
+        self.values: dict[int, set[str]] = {}
+
+    def step(self) -> None:
+        self.steps += 1
+        if self.steps > ANALYSIS_STEPS:
+            raise _Overworked()
+
+
+#: 当前线程上正在做的那次分析（_analysis）。按线程分开：工具边界的遮罩在线程里做，几个核查 agent 同时查询时互不相干
+_CURRENT = threading.local()
+
+
+@contextlib.contextmanager
+def _analysis() -> Iterator[_Analysis]:
+    """在一次分析（一棵解析、改写完的语法树）里记下中间结果、数步数；出来就丢掉。里面再开一次的另起一份，出来还原：
+    记下的结果按节点的 id 认，不同的树不能混用。"""
+    outer = getattr(_CURRENT, "state", None)
+    state = _CURRENT.state = _Analysis()
+    try:
+        yield state
+    finally:
+        _CURRENT.state = outer
+
+
+def _current() -> _Analysis | None:
+    return getattr(_CURRENT, "state", None)
 
 
 def _value_columns(node: Any) -> set[str]:
@@ -95,12 +164,21 @@ def _value_columns(node: Any) -> set[str]:
     col->'path'（JSON 箭头）被解析器当成以 col 为参数的 lambda，参数名照列名收（真的 lambda 的参数多算一列无害）。"""
     from sqlglot import exp
 
+    state = _current()
+    if state is not None and id(node) in state.values:
+        return state.values[id(node)]
     out: set[str] = set()
     stack = [node]
     # 已经展开过的派生来源：递归的 CTE 里 * 展开它自己时不再绕回去
     expanded = {id(node)}
     while stack:
         item = stack.pop()
+        if state is not None:
+            state.step()
+            if item is not node and id(item) in state.values:
+                # 这一项前面认过：直接并进来（它自己展开过的不必再走一遍）
+                out |= state.values[id(item)]
+                continue
         if isinstance(item, exp.Star) or (isinstance(item, exp.Column) and isinstance(item.this, exp.Star)):
             inputs = _scoped_star_inputs(item)
             if inputs is None:
@@ -112,6 +190,17 @@ def _value_columns(node: Any) -> set[str]:
         elif isinstance(item, exp.Column):
             if item.name:
                 out.add(item.name.lower())
+            if item.args.get("db") is not None:
+                # 三段以上的名字（t.profile.tel）：Oracle 的 JSON 点号、对象类型的属性写法里中间几段才是列（t 是表的别名），
+                # 解析器读成「库 t、表 profile、列 tel」，只认 tel 时号码原样交了出去。前面几段都算（多遮：写了库名、表名
+                # 的列，库名、表名碰巧和遮罩列同名时也算）
+                out.update(part.name.lower() for key in ("catalog", "db", "table")
+                           if (part := item.args.get(key)) is not None and part.name)
+        elif isinstance(item, exp.Dot) and isinstance(item.expression, exp.Star):
+            # (表达式).*（VALUES、行构造器、函数参数里的）：展开的各个字段都取自那个表达式。这个 * 不是在展开 FROM 里的
+            # 来源，不按 _scoped_star_inputs 算（以前算了，没设遮罩的复合类型 (p.address).* 也因为 FROM 里有表被当成
+            # 取自遮罩列）。读到遮罩列的整份遮，见 _tainted_in
+            stack.append(item.this)
         elif isinstance(item, exp.Count) or (isinstance(item, (exp.Case, exp.If)) and _band_only(item)):
             continue
         elif isinstance(item, (exp.Case, exp.If)) and (results := _branch_results(item)) is not None \
@@ -136,6 +225,8 @@ def _value_columns(node: Any) -> set[str]:
                     stack.extend(fresh)
         else:
             stack.extend(item.iter_expressions())
+    if state is not None:
+        state.values[id(node)] = out
     return out
 
 
@@ -488,6 +579,191 @@ def _all_labels(texts: list[set[str] | None]) -> set[str] | None:
     return set().union(*texts) if all(t is not None for t in texts) else None
 
 
+def _grouped_labels(sql: Any, kind: str | None, columns: list[str], labels: dict[str, set[str]],
+                    tables: dict[str, set[str]] | None) -> set[str]:
+    """结果里只装着分档标签（labels，_label_columns 认出的）、又是一档一行的列（列名小写）：标签列当分组键照常显示，同
+    _band_only，只是分档写在派生来源里、外层才按它分组（SELECT 档位, COUNT(*) FROM (SELECT *, CASE … END AS 档位 FROM
+    sales) GROUP BY 档位、WITH 里的一段算档位、外层分组）。一档一行：结果的这一列在每一支里都是那一层 SELECT 的分组键，
+    或者取自派生来源里一档一行的那一列（_item_grouped）。同名的几列都要是。解析不了、认不准的一个都不算（照旧整列遮）。"""
+    from app.data.sql_semantics import _parse, _read
+
+    if not labels:
+        return set()
+    try:
+        root, _ = _parse(sql, _read(kind))
+        if root is None:
+            return set()
+        _normalized(root, _read(kind), None)
+        result = next((top for top, role, _listed in _blocks(root) if role == "result"), None)
+        if result is None:
+            return set()
+        memo = _LabelMemo()
+        memo.tables = tables
+        out: set[str] = set()
+        for name in labels:
+            places = [i for i, c in enumerate(columns) if c.lower() == name]
+            if places and all(_result_grouped(result, place, name, len(columns), memo) for place in places):
+                out.add(name)
+        return out
+    except Exception:  # noqa: BLE001 - 分析本身的缺陷：一个都不算（照旧整列遮，宁可多遮）
+        logger.warning("核查查询的分档标签分组分析失败", exc_info=True)
+        return set()
+
+
+def _result_grouped(top: Any, place: int, name: str, width: int, memo: _LabelMemo) -> bool:
+    """结果（width 列）的第 place 列（列名 name）是不是一档一行：UNION 这类的每一支都是。落在 * 里的按列名经 * 往下找，
+    只有一支时才找（同 _result_label）。"""
+    from sqlglot import exp
+
+    leaves = _leaves(top)
+    if not all(isinstance(leaf, exp.Select) for leaf in leaves):
+        return False
+    for select in leaves:
+        items = list(select.expressions)
+        item = next((i for i, p in zip(items, _places(items, width)) if p == place), None)
+        if item is not None:
+            grouped = _item_grouped(item, select, memo)
+        elif len(leaves) == 1:
+            grouped = _star_grouped(select, name, memo) is True
+        else:
+            return False
+        if not grouped:
+            return False
+    return True
+
+
+def _item_grouped(item: Any, select: Any, memo: _LabelMemo) -> bool:
+    """select 的一个选出项一档一行：它就是这一层的分组键（_group_key），或者是单独一列、取自 FROM 里派生来源中一档一行的
+    那一列（_source_grouped）。"""
+    from sqlglot import exp
+
+    if _group_key(select, item):
+        return True
+    node = item
+    while isinstance(node, (exp.Alias, exp.Paren)):
+        node = node.this
+    if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star) and node.name:
+        return _source_grouped(select, node.table.lower() or None, node.name.lower(), memo) is True
+    return False
+
+
+def _group_key(select: Any, item: Any) -> bool:
+    """select 的选出项 item 是它 GROUP BY 的一个键：按位置、按别名、照原样再写一遍（同一列写不写表名都算，FROM 里只有
+    一个来源时）。ROLLUP、GROUPING SETS 这类不认。"""
+    from sqlglot import exp
+
+    group = select.args.get("group")
+    if group is None:
+        return False
+    node = item
+    while isinstance(node, (exp.Alias, exp.Paren)):
+        node = node.this
+    place = next((str(i + 1) for i, e in enumerate(select.expressions) if e is item), None)
+    alias = item.alias.lower() if isinstance(item, exp.Alias) and item.alias else None
+    single = len(_from_sources(select)) == 1
+    for key in group.expressions:
+        while isinstance(key, exp.Paren):
+            key = key.this
+        if (isinstance(key, exp.Literal) and not key.is_string and key.this == place) or key == node:
+            return True
+        if not isinstance(key, exp.Column) or isinstance(key.this, exp.Star):
+            continue
+        if alias and not key.table and key.name.lower() == alias:
+            return True
+        if isinstance(node, exp.Column) and key.name.lower() == node.name.lower() and (
+                key.table.lower() == node.table.lower() or (single and not (key.table and node.table))):
+            return True
+    return False
+
+
+def _source_grouped(select: Any, qualifier: str | None, name: str, memo: _LabelMemo) -> Any:
+    """select 的 FROM、JOIN 里读到的那一列（qualifier 同 _source_label）是不是一档一行：取自派生来源、那里一档一行的为
+    True；没有哪个来源出这一列为 None；别的（数据源里的表可能出这一列、按这一列 USING / NATURAL 连起来、派生来源里不是
+    一档一行）为 False。"""
+    sources = _from_sources(select)
+    if qualifier is not None:
+        sources = [(alias, source) for alias, source in sources if alias == qualifier]
+        if len(sources) != 1:
+            return False
+    found = False
+    for _alias, source in sources:
+        derived = _derived_block(source)
+        if derived is None:
+            if not _table_lacks(source, name, memo):
+                return False
+            continue
+        grouped = _block_grouped(derived[0], derived[1], name, memo)
+        if grouped is None:
+            continue
+        if not grouped:
+            return False
+        found = True
+    if not found:
+        return None
+    return False if _merging(select, name) else True
+
+
+def _block_grouped(block: Any, listed: list[str] | None, name: str, memo: _LabelMemo) -> Any:
+    """派生来源的那块查询（listed 是写的列名表）出的 name 这一列是不是一档一行；不出这一列为 None。查法同 _block_label_of：
+    一条 SELECT 按选出项的名字找，没有的经 * 往下找；UNION 这类按位置看每一支。"""
+    from sqlglot import exp
+
+    key = ("grouped", id(block), name)
+    if key in memo:
+        return memo[key]
+    # 先记成 False：递归的 CTE 绕回自己时按不是算
+    memo[key] = False
+    leaves = _leaves(block)
+    result: Any = False
+    if all(isinstance(leaf, exp.Select) for leaf in leaves):
+        if listed is None and len(leaves) == 1:
+            items = list(leaves[0].expressions)
+            named = [i for i, item in enumerate(items) if _same_name(item, name)]
+            if not named:
+                result = _star_grouped(leaves[0], name, memo)
+            elif _star_grouped(leaves[0], name, memo, before=named[0]) is None:
+                result = all(_item_grouped(items[i], leaves[0], memo) for i in named)
+        else:
+            width: int | None = None
+            place: int | None = None
+            if listed is not None:
+                if name not in listed:
+                    result = None
+                elif listed.count(name) == 1:
+                    place, width = listed.index(name), len(listed)
+            else:
+                first = list(leaves[0].expressions)
+                places = [p for item, p in zip(first, _places(first, None)) if _same_name(item, name)]
+                if not places and not any(_is_star(item) for item in first):
+                    result = None
+                elif len(places) == 1:
+                    place = places[0]
+            if place is not None:
+                picked = [next((i for i, p in zip(list(s.expressions), _places(list(s.expressions), width))
+                                if p == place), None) for s in leaves]
+                result = all(i is not None and _item_grouped(i, s, memo) for i, s in zip(picked, leaves))
+    memo[key] = result
+    return result
+
+
+def _star_grouped(select: Any, name: str, memo: _LabelMemo, *, before: int | None = None) -> Any:
+    """select 经 *（t.* 只看 t）带出的 name 这一列是不是一档一行；没有 * 带出这一列为 None。before 同 _star_label。"""
+    from sqlglot import exp
+
+    found = False
+    for item in select.expressions[:before]:
+        if not _is_star(item):
+            continue
+        qualifier = (item.table.lower() or None) if isinstance(item, exp.Column) else None
+        grouped = _source_grouped(select, qualifier, name, memo)
+        if grouped is None:
+            continue
+        if not grouped:
+            return False
+        found = True
+    return True if found else None
+
+
 def _from_sources(select: Any) -> list[tuple[str, Any]]:
     """一条 SELECT 的 FROM、JOIN 里的来源：(名字, 来源节点)，名字是别名，没起别名的是表名（小写）。"""
     from_ = select.args.get("from_")
@@ -499,9 +775,19 @@ def _from_sources(select: Any) -> list[tuple[str, Any]]:
 def _derived_block(source: Any) -> tuple[Any, list[str] | None] | None:
     """FROM、JOIN 里的一个来源 → (它的那块查询, 写的列名表)：FROM 里的子查询、LATERAL、指向 WITH 里一段的表名。数据源里
     的表、VALUES、函数这类为 None（出哪些列、装着什么，SQL 里看不出）。"""
-    from sqlglot import exp
+    state = _current()
+    if state is None:
+        return _derived_block_of(source)
+    if id(source) not in state.blocks:
+        state.step()
+        state.blocks[id(source)] = _derived_block_of(source)
+    return state.blocks[id(source)]
 
-    from app.data.sql_semantics import _visible_ctes
+
+def _derived_block_of(source: Any) -> tuple[Any, list[str] | None] | None:
+    """_derived_block 真去找的那一步（不看记下的结果）：指向 WITH 的名字要由里往外数看得见的 CTE（_scoped_cte），一长串
+    CTE 时每次都数一遍很慢，所以分析里记下来。"""
+    from sqlglot import exp
 
     node, alias = source, None
     if isinstance(node, exp.Lateral):
@@ -509,7 +795,7 @@ def _derived_block(source: Any) -> tuple[Any, list[str] | None] | None:
     if isinstance(node, exp.Table):
         if node.args.get("db") or node.args.get("catalog") or not isinstance(node.this, exp.Identifier):
             return None
-        cte = _visible_ctes(node).get(node.name.lower())
+        cte = _scoped_cte(node, node.name.lower())
         if cte is None:
             return None
         node, alias = cte.this, cte.args.get("alias")
@@ -519,6 +805,33 @@ def _derived_block(source: Any) -> tuple[Any, list[str] | None] | None:
     if not isinstance(node, (exp.Select, exp.SetOperation)):
         return None
     return node, ([c.name.lower() for c in alias.columns] if alias is not None and alias.columns else None)
+
+
+def _scoped_cte(node: Any, name: str) -> Any:
+    """node 所在的位置按名字 name（小写）指到的那一段 CTE，没有为 None（是数据源里的表）。由里往外找，里层的 WITH 遮住
+    外层的：一层查询的正文看得见它的 WITH 里的每一段；一段 CTE 的正文里，不带 RECURSIVE 的 WITH 只看得见排在这一段
+    前面的几段——Postgres、MySQL、Oracle 里看不见它自己，同名的是数据源里的表（WITH sales AS (SELECT * FROM sales
+    WHERE …) 过滤同名的表是常见写法）；SQLite 写自己是循环引用、报错，往后指的它看得见，这里照看不见算，当成数据源里的
+    表（宁可多遮）。带 RECURSIVE 的每一段都看得见（递归的那一支指向它自己）。以前一律当看得见（sql_semantics 的
+    _visible_ctes），sales 认成了这一段自己，* 展开绕回自己什么列都不带出，整行引用、列名表改名的号码原样交了出去。"""
+    from sqlglot import exp
+
+    child, cur = node, node.parent
+    inside: Any = None   # 往外走时经过的、离 cur 最近的那一段 CTE
+    while cur is not None:
+        if isinstance(child, exp.CTE):
+            inside = child
+        with_ = cur.args.get("with_")
+        if isinstance(with_, exp.With):
+            ctes = list(with_.expressions)
+            at = next((i for i, cte in enumerate(ctes) if cte is inside), None) if child is with_ else None
+            if at is not None and not with_.args.get("recursive"):
+                ctes = ctes[:at]
+            found = next((cte for cte in reversed(ctes) if cte.alias_or_name.lower() == name), None)
+            if found is not None:
+                return found
+        child, cur = cur, cur.parent
+    return None
 
 
 #: 表值函数常见的出列名：SQLite 的 json_each / json_tree（key、value、atom、fullkey、path），Postgres 的 jsonb_each
@@ -551,10 +864,23 @@ def _function_sources(select: Any) -> list[Any]:
     return out
 
 
-def _function_columns(source: Any) -> set[str] | None:
+def _function_node(source: Any) -> Any:
+    """表值函数这类来源里真正出行的那个节点（函数、VALUES、JSON_TABLE……）：套在外面的 LATERAL、表、括号先去掉。"""
+    from sqlglot import exp
+
+    node = source.this if isinstance(source, exp.Lateral) else source
+    func = node.this if isinstance(node, exp.Table) else node
+    while isinstance(func, exp.Subquery):
+        func = func.this
+    return func
+
+
+def _function_columns(source: Any, kind: str | None = None) -> set[str] | None:
     """表值函数这类来源出的列名（小写）：写的列名表、别名（Postgres 里一列的函数出的列就叫别名，没起别名的叫函数名）、
-    函数名、常见的出列名（_FUNCTION_COLUMNS）；JSON_TABLE 按 COLUMNS 里写的，VALUES 按 column1、column2…。不认得的函数
-    又没写列名表的，说不清出哪几列，为 None。"""
+    函数名、常见的出列名（_FUNCTION_COLUMNS）；JSON_TABLE 按 COLUMNS 里写的，VALUES 按数据源的类型 kind 认（_values_names：
+    Postgres、SQLite 叫 column1…，MySQL 叫 column_0…）。不认得的函数又没写列名表的、VALUES 的列名认不准又没写列名表的
+    （MariaDB、Oracle），说不清出哪几列，为 None。kind 没给的按 Postgres、SQLite 的叫法：_has_column 只在 Postgres 的
+    整行引用、(s).* 里要知道来源出不出某一列。"""
     from sqlglot import exp
 
     node = source.this if isinstance(source, exp.Lateral) else source
@@ -566,21 +892,119 @@ def _function_columns(source: Any) -> set[str] | None:
             names.add(alias.name.lower())
         listed = [c.name.lower() for c in alias.args.get("columns") or [] if c.name]
         names |= set(listed)
-    func = node.this if isinstance(node, exp.Table) else node
-    while isinstance(func, exp.Subquery):
-        func = func.this
+    func = _function_node(source)
     if isinstance(func, exp.JSONTable):
         schema = func.args.get("schema")
         defined = [str(c.name).lower() for c in (schema.expressions if schema is not None else []) if c.name]
         return names | set(defined) if defined or listed else None
     if isinstance(func, exp.Values):
-        width = max((len(row.expressions) for row in func.expressions if isinstance(row, exp.Tuple)), default=1)
-        return names | {f"column{i}" for i in range(1, width + 1)}
+        found = _values_names(func, kind, listed)
+        return names | {n for n in found if n} if listed or all(found) else None
     name = (func.name if isinstance(func, exp.Anonymous) else func.sql_name() if isinstance(func, exp.Func)
             else "").lower()
     if name:
         names.add(name)
     return names if listed or name in _TABLE_FUNCTIONS else None
+
+
+def _values_rows(values: Any, kind: str | None) -> list[list[Any]]:
+    """一个 VALUES 的每一行按列摊开的各项。MySQL 的一行写作 ROW(…)，解析器读成一个元组里套着一个 ROW 函数，摊开它的
+    参数；Postgres 的 VALUES (ROW(…)) 是一列复合类型，不摊。"""
+    from sqlglot import exp
+
+    from app.data.sql_semantics import _read
+
+    mysql = _read(kind) == "mysql"
+    rows: list[list[Any]] = []
+    for row in values.expressions:
+        items = list(row.expressions) if isinstance(row, exp.Tuple) else [row]
+        if mysql and len(items) == 1 and isinstance(items[0], exp.Anonymous) and items[0].name.upper() == "ROW":
+            items = list(items[0].expressions)
+        rows.append(items)
+    return rows
+
+
+def _values_names(values: Any, kind: str | None, listed: list[str]) -> list[str | None]:
+    """一个 VALUES 按次序的列名（小写）：写了列名表的前几列按列名表（Postgres 的列名表可以只写前几列），后面的按各库的
+    叫法——Postgres、SQLite 叫 column1、column2…，MySQL 8.0 叫 column_0、column_1…（从 0 数起）；MariaDB 拿第一行各项的
+    写法当列名，Oracle 的文档只有写了列名表的写法，认不准，记 None。kind 是数据源的类型（sqlite / postgresql / mysql /
+    mariadb / oracle）或解析用的方言名，没给的按 Postgres、SQLite 的叫法。以前一律按 column1… 认，MySQL 的 column_0 对不上，
+    外层按名字取、照原名带出的号码原样交了出去。"""
+    from app.data.sql_semantics import _read
+
+    width = max((len(row) for row in _values_rows(values, kind)), default=1)
+    read = _read(kind)
+    if (kind or "").strip().lower() == "mariadb" or read == "oracle":
+        defaults: list[str | None] = [None] * width
+    elif read == "mysql":
+        defaults = [f"column_{i}" for i in range(width)]
+    else:
+        defaults = [f"column{i}" for i in range(1, width + 1)]
+    return [*listed, *defaults[len(listed):]]
+
+
+def _values_listed(values: Any) -> list[str]:
+    """一个 VALUES 写的列名表（小写）：写在它自己、套在外面的括号或 LATERAL 上（(VALUES …) AS v(a, b)）。WITH v(a, b) 的
+    列名表记在 WITH 的那一段上，按派生来源认（_source_names），不在这里。"""
+    from sqlglot import exp
+
+    node, alias = values, values.args.get("alias")
+    while alias is None and isinstance(node.parent, (exp.Subquery, exp.Lateral)) and node.arg_key == "this":
+        node = node.parent
+        alias = node.args.get("alias")
+    return [c.name.lower() for c in alias.args.get("columns") or [] if c.name] if alias is not None else []
+
+
+def _values_table(values: Any) -> bool:
+    """这个 VALUES 当一张表用，交出的是行、外层按列名取或照原名带出：FROM、JOIN、LATERAL 里的，WITH 里的一段、UNION 这类
+    的一支（不套括号的解析器改写成 SELECT * FROM (VALUES …) AS _values，套了括号的原样挂着），整条就是它。标量子查询、
+    IN / ANY / EXISTS 里的不算：值经外层的表达式带出（_value_columns 已经算上），或者只用来筛行。"""
+    from sqlglot import exp
+
+    node = values
+    while isinstance(node.parent, exp.Subquery):
+        node = node.parent
+    return node.parent is None or isinstance(node.parent, (exp.From, exp.Join, exp.Lateral, exp.CTE, exp.SetOperation))
+
+
+def _values_taken(values: Any, names: set[str], kind: str | None) -> set[str]:
+    """一个 VALUES 里值取自 names 的那几列的列名（_values_names）：按位置，任何一行的那一项取自 names 就算（同 UNION 的
+    几支）。一行里 (表达式).*、s.* 展开成几列说不清，它和排在后面的项落在第几列认不出，不算；列名认不准的（None）不算。
+    这些名字照传下去（外层取它们的列、SQL 里拿它们做比较的字面量都按指代遮罩列认），整份遮时也只收这几列的值：同一行里
+    没碰遮罩列的区域不收（以前 VALUES 出的每一列都算，区域名在同一次核查里处处被换掉）。"""
+    from sqlglot import exp
+
+    labels = _values_names(values, kind, _values_listed(values))
+    out: set[str] = set()
+    for row in _values_rows(values, kind):
+        for i, item in enumerate(row):
+            node = _unwrapped(item)
+            if _is_star(node) or (isinstance(node, exp.Dot) and isinstance(node.expression, exp.Star)):
+                break
+            if i < len(labels) and labels[i] and _reads(names, _value_columns(item)):
+                out.add(labels[i])
+    return out
+
+
+def _spreads_record(source: Any) -> bool:
+    """Postgres 里这个表值函数这类来源可能交回复合类型、展开成它的各个字段（字段名 SQL 里看不出，同 (表达式).*）：
+    - unnest：数组的元素是复合类型时展开成各个字段（unnest(ARRAY[p.card]) 出 addr、tel），元素是什么类型 SQL 里看不出；
+    - 不在 _TABLE_FUNCTIONS 里的函数写了只有名字、没写类型的列名表：交回复合类型的（jsonb_populate_record(NULL::contact,
+      …)）列名表只改前几列的名字，后面的字段照原名出（Postgres 18 实测，unnest 的列名表也一样）。
+    写了带类型的列定义（jsonb_to_record(…) AS r(tel text)）的出的就是这几列；VALUES、JSON_TABLE 的列写在 SQL 里。"""
+    from sqlglot import exp
+
+    node = source.this if isinstance(source, exp.Lateral) else source
+    alias = source.args.get("alias") or (node.args.get("alias") if node is not source else None)
+    func = _function_node(source)
+    if isinstance(func, (exp.Values, exp.JSONTable)):
+        return False
+    name = (func.name if isinstance(func, exp.Anonymous) else func.sql_name() if isinstance(func, exp.Func)
+            else "").lower()
+    if name == "unnest":
+        return True
+    listed = list(alias.args.get("columns") or []) if alias is not None else []
+    return bool(listed) and name not in _TABLE_FUNCTIONS and not all(isinstance(c, exp.ColumnDef) for c in listed)
 
 
 def _merging(select: Any, name: str) -> bool:
@@ -859,20 +1283,27 @@ def _star_places(select: Any, width: int | None, names: set[str], tables: dict[s
 _ROW_DIALECTS = frozenset({"postgres", "duckdb"})
 
 
-def _normalized(root: Any, read: str | None, tables: dict[str, list[str]] | None) -> None:
+def _normalized(root: Any, read: str | None, tables: dict[str, list[str]] | None) -> list[set[str]]:
     """几种写法先就地改写成认得出的样子，再认遮罩列、标签列（_tainted、_label_columns）。只改解析出来的语法树，原文不动；
     改写前后结果有哪几列、每一列的值取自哪里都一样：
     - TABLE x（Postgres、MySQL）：解析器认不出，CTE、子查询里的读成了一个叫 TABLE 的列、表。改成 SELECT * FROM x；带库名、
       ORDER BY 的解析不了，按解析不了处理（_implicit）
-    - 选出项套了括号的 *（(s.*)）、(s).*：Postgres 照样展开成好几列，改成 s.*，不然按一列数位置。括号里不是来源的
-      （(t.profile).* 展开一个复合类型的列）改成展开一个对不上任何来源的 *：说不清展开成几列，整段遮
+    - 选出项套了括号、起了别名的 *（(s.*)、(s.*) AS x）、(s).*（s 是这一层 FROM 里的来源，不是哪个来源的列；外面也可以
+      套括号、起别名）：Postgres 照样展开成好几列（别名不起作用），改成 s.*，不然按一列数位置
     - 带列名表的表（Postgres 的 FROM sales AS s(i, r, p)，引用 CTE 时再写列名表的也算）：改成 (SELECT * FROM sales) AS
       s(i, r, p)，按派生来源的列名表认改了名的列。Postgres 的列名表可以比列少（只改前几列的名字，后面的照原名），这时
       * 展开的列数和列名表对不上，列名表里的几列整段算（_star_places），后面照原名的按名字认。不按表结构补全列名表：
       别的方言里列名表比列少只能是表结构过期了，补全就丢了这一道核对
     - 整行引用（read 是 _ROW_DIALECTS 之一，_row_source）：row_to_json(s)、json_agg(t)、SELECT s、s::text 里的 s 改成
       ROW(s.*)，按 * 展开的来源认（_value_columns）
-    tables 是查询当时冻结的表结构（_schema_columns，按次序的列名），认整行引用时看来源出不出某一列；没有为 None。"""
+    - 别的 (表达式).*（复合类型的列 (p.profile).*、函数交回的记录 (jsonb_each_text(pj)).*、子查询里的 ROW (q.r).*，外面
+      套了括号、起了别名的 ((p.profile).*)、(p.profile).* AS x 也算，_unwrapped）：展开成几列、各叫什么（复合类型的字段名、
+      函数的出列名）SQL 里看不出，改成一个对不上任何来源的 *（_star_sources 为 None），只用来数别的项的位置。表达式的值
+      取自哪些列（_value_columns，整行引用已经改写过）记下来交回：读到遮罩列的，整份快照都算（_tainted）——以前只改成对
+      不上来源的 *，最外层、第一支、派生来源里没写列名表的 * 按「照原名带出」认，字段名和遮罩列对不上，号码原样交了出去。
+      选出项以外的（VALUES、行构造器、函数参数里的）不换，_tainted_in 按它的值取自哪些列认
+    tables 是查询当时冻结的表结构（_schema_columns，按次序的列名），认整行引用时看来源出不出某一列；没有为 None。
+    交回每个 (表达式).* 的值取自哪些列。"""
     from sqlglot import exp
 
     for cte in list(root.find_all(exp.CTE)):
@@ -889,7 +1320,7 @@ def _normalized(root: Any, read: str | None, tables: dict[str, list[str]] | None
     selects = list(root.find_all(exp.Select))
     for select in selects:
         for item in list(select.expressions):
-            if (star := _bare_star(item)) is not None:
+            if (star := _bare_star(item, select, tables)) is not None:
                 item.replace(star)
     for select in selects:
         for _name, source in _from_sources(select):
@@ -910,6 +1341,30 @@ def _normalized(root: Any, read: str | None, tables: dict[str, list[str]] | None
             # 直接是选出项的起回原名：结果的列名照旧（SELECT s 的列叫 s）
             bare = isinstance(column.parent, exp.Select) and column.arg_key == "expressions"
             column.replace(exp.alias_(row, column.this.copy()) if bare else row)
+    opaque: list[set[str]] = []
+    for select in list(root.find_all(exp.Select)):
+        for item in list(select.expressions):
+            node = _unwrapped(item)
+            if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Star):
+                # 先认值取自哪些列（还挂在树上，* 和整行引用按作用域认），再换掉
+                opaque.append(set(_value_columns(node.this)))
+                item.replace(exp.Column(this=exp.Star(), table=exp.to_identifier(_OPAQUE_STAR)))
+    return opaque
+
+
+def _unwrapped(item: Any) -> Any:
+    """选出项去掉套在外面的括号、别名：Postgres 里 (s.*)、((p.card).*)、(p.card).* AS x 照样展开成好几列（别名不起作用，
+    实测如此）。以前只认不带外括号的 (表达式).*，((p.card).*) 按一项数，只遮了第一列，后面的号码原样交了出去。"""
+    from sqlglot import exp
+
+    node = item
+    while isinstance(node, (exp.Paren, exp.Alias)):
+        node = node.this
+    return node
+
+
+#: (表达式).* 改写成的 * 写的「表名」：对不上任何来源（_star_sources 为 None），真实的表名、别名不会是它
+_OPAQUE_STAR = "*"
 
 
 def _table_keyword(node: Any) -> bool:
@@ -920,24 +1375,28 @@ def _table_keyword(node: Any) -> bool:
     return isinstance(ident, exp.Identifier) and not ident.quoted and ident.name.upper() == "TABLE"
 
 
-def _bare_star(item: Any) -> Any:
-    """选出项是套了括号的 *（(s.*)、((*))）或 (s).* 时，改写成的 *、s.*；别的为 None（_normalized）。"""
+def _bare_star(item: Any, select: Any, tables: dict[str, list[str]] | None) -> Any:
+    """select 的选出项是套了括号、起了别名的 *（(s.*)、((*))、(s.*) AS x），或者 (s).*（外面也可以套括号、起别名）、s 是
+    这一层 FROM 里一个来源的名字、又不是哪个来源说得准出的一列（Postgres 先按列认，_has_column）时，改写成的 *、s.*；别的
+    为 None（_normalized，别的 (表达式).* 另外处理）。"""
     from sqlglot import exp
 
-    node = item
-    while isinstance(node, exp.Paren):
-        node = node.this
+    node = _unwrapped(item)
     if node is not item and _is_star(node):
         return node.copy()
-    if not (isinstance(item, exp.Dot) and isinstance(item.expression, exp.Star)):
+    if not (isinstance(node, exp.Dot) and isinstance(node.expression, exp.Star)):
         return None
-    inner = item.this
+    inner = node.this
     while isinstance(inner, exp.Paren):
         inner = inner.this
-    if isinstance(inner, exp.Column) and not inner.table and isinstance(inner.this, exp.Identifier):
-        return exp.Column(this=exp.Star(), table=inner.this.copy())
-    # 展开的不是 FROM 里的来源（复合类型的列、函数交回的记录）：记成一个对不上任何来源的 *（_star_sources 为 None）
-    return exp.Column(this=exp.Star(), table=exp.to_identifier("*"))
+    if not (isinstance(inner, exp.Column) and not inner.table and isinstance(inner.this, exp.Identifier)):
+        return None
+    name = inner.name.lower()
+    sources = _from_sources(select) + [((lateral.alias_or_name or "").lower(), lateral)
+                                       for lateral in select.args.get("laterals") or []]
+    if not any(alias == name for alias, _ in sources) or any(_has_column(s, name, tables) for _, s in sources):
+        return None
+    return exp.Column(this=exp.Star(), table=inner.this.copy())
 
 
 def _carries_value(column: Any) -> bool:
@@ -955,18 +1414,42 @@ def _carries_value(column: Any) -> bool:
 
 def _row_source(column: Any, tables: dict[str, list[str]] | None) -> str | None:
     """Postgres 里不带表名的名字 column 指整行时，它指的来源的名字（别名，没起别名的是表名）；是列、不是任何来源的为 None。
-    Postgres 先按列认：由里往外看得见的每一层（_outer_selects）的来源里，有一个出得了这一列（_has_column）就是列；都不是、
-    又有一个来源叫这个名字，才是整行（取最里面的那个）。说不清出不出这一列的（表结构里查不到的表、* 展开的列）按出不了算，
-    当整行（宁可多遮）。"""
+    Postgres 先按列认：由里往外看得见的每一层（_outer_selects）的来源里（LATERAL 里只看排在它前面的，_visible_sources），
+    有一个出得了这一列（_has_column）就是列；都不是、又有一个来源叫这个名字，才是整行（取最里面的那个）。说不清出不出这一列
+    的（表结构里查不到的表、* 展开的列）按出不了算，当整行（宁可多遮）。"""
     name = column.name.lower()
     found: str | None = None
     for select in _outer_selects(column):
-        for alias, source in _from_sources(select):
+        for alias, source in _visible_sources(select, column):
             if _has_column(source, name, tables):
                 return None
             if found is None and alias == name:
                 found = source.alias_or_name
     return found
+
+
+def _visible_sources(select: Any, node: Any) -> list[tuple[str, Any]]:
+    """select 的 FROM、JOIN 里，node（select 里面的一个节点）看得见的来源（_from_sources 的样子）。node 在 LATERAL 里的，只看
+    得见排在它前面的来源：看不见 LATERAL 自己（它的结果列不是 node 能取的列），也看不见后面的。以前把 LATERAL 自己的结果列
+    （SELECT s …、1 AS s）当成看得见的列，里面的整行引用 s 就被认成了列，号码原样交了出去。"""
+    from sqlglot import exp
+
+    sources = _from_sources(select)
+    child, below = node, None
+    while child.parent is not None and child.parent is not select:
+        child, below = child.parent, child
+    if child.parent is not select:
+        return sources
+    if isinstance(child, exp.From):
+        return []
+    if isinstance(child, exp.Join):
+        joins = list(select.args.get("joins") or [])
+        at = next((i for i, join in enumerate(joins) if join is child), None)
+        if at is None:
+            return sources
+        # 在连接的来源本身里（LATERAL）只看得见前面的；在 ON 条件里连它自己也看得见
+        return sources[:1 + at] if below is child.this else sources[:2 + at]
+    return sources
 
 
 def _has_column(source: Any, name: str, tables: dict[str, list[str]] | None) -> bool:
@@ -1081,9 +1564,20 @@ def _source_names(top: Any, listed: list[str] | None, names: set[str],
     return found, unknown
 
 
+class _Taint(NamedTuple):
+    """_tainted 认出来的：SQL 里指代遮罩列的名字（小写）；结果里值取自遮罩列的那几列的位置（认不全时是全部的列）；是不是
+    认不全、整份都算；确定取自遮罩列的位置（整份算之前认出的那几列）——整份遮时只收这几列的值当遮罩值（_derived_masks）。"""
+
+    names: set[str]
+    positions: set[int]
+    whole: bool
+    sure: set[int]
+
+
 def _tainted(sql: str, kind: str | None, masked: set[str], width: int, tables: dict[str, list[str]] | None = None
-             ) -> tuple[set[str], set[int]] | None:
-    """SQL 里指代遮罩列的名字（小写），和结果（width 列）里值取自遮罩列的那几列的位置。解析不了返回 None。
+             ) -> _Taint | None:
+    """SQL 里指代遮罩列的名字（小写）、结果（width 列）里值取自遮罩列的那几列的位置，以及是不是认不出、整份都算（这时
+    位置是全部的列，另交回整份算之前确定认出的位置，见 _Taint）。解析不了返回 None。
 
     名字从遮罩列本身起，一层层传下去：选出列的值取自这些名字的（buyer_phone AS 手机号、UPPER(buyer_phone) AS x），它的
     名字也算；派生来源（子查询、WITH 里的一段）按位置对上列名表、UNION 第一支的列名，也算，直到不再多出名字。同名
@@ -1091,16 +1585,20 @@ def _tainted(sql: str, kind: str | None, masked: set[str], width: int, tables: d
     位置是给没起别名的表达式用的（UPPER(buyer_phone) 的结果列名对不上任何名字）：和 * 写在同一支里的，* 前面的从头数、
     后面的从末尾倒着数。认不出的——两个 * 之间的项、派生来源里没起别名的表达式（外层的 * 会把它原样带出来，列名
     又认不准）——整份快照的列都算（同解析不了）。
-    FROM、JOIN、LATERAL 里的表值函数（json_each、unnest、JSON_TABLE、LATERAL VALUES）参数里写着这些名字的，它出的列
-    都算（_function_columns）：遮罩列是 JSON 时，json_each 拆开是最自然的写法。出哪几列说不清的整份快照都算。
+    FROM、JOIN、LATERAL 里的表值函数（json_each、unnest、JSON_TABLE）参数里写着这些名字的，它出的列都算
+    （_function_columns）：遮罩列是 JSON 时，json_each 拆开是最自然的写法。出哪几列说不清的整份快照都算，Postgres
+    里可能交回复合类型、展开成各个字段的（unnest、只写了列名的列名表，_spreads_record）也算。VALUES 当一张表用（FROM、
+    JOIN、LATERAL 里的，WITH 里的一段，UNION 的一支，_values_table）读到这些名字的也整份算：各库给它的列起名不一样
+    （_values_names），不逐个方言、逐个位置认；值取自这些名字的那几列，按方言认得出名字的照传下去（_values_taken）。
     * 展开的列换了名字（写了列名表的派生来源、UNION 后一支的 *）：* 带出这些名字的值时，它展开落到的那几列照位置算
     （_star_places，展开数据源里的表的按 tables 数位置，数不清的整段算）；标量子查询里的 *、函数参数里的 *（to_json(s.*)、
     JSON_OBJECT(*)）、整行引用（row_to_json(s)）按 _value_columns 算进外层的表达式。表的列名表、TABLE x、套了括号的 *
     先改写成上面这些认得出的样子（_normalized）。
     PIVOT、UNPIVOT、MATCH_RECOGNIZE 读到这些名字的：值转进了它们自己起名的列（UNPIVOT 的值列、PIVOT 按 IN 里的值起名的列、
-    MEASURES），出的是哪几列不好认，整份快照的列都算。"""
-    from sqlglot import exp
-
+    MEASURES），出的是哪几列不好认，整份快照的列都算。(表达式).* 读到这些名字的（树上任何位置的，VALUES 里的也算）、
+    OPAQUE_SQL 和 _INDIRECT 那几类写法（_opaque）、结果的一支没有 * 而选出项和结果的列数对不上的（MySQL 会执行的注释里
+    多写了几项这类，语法树和实际执行的对不上）同样整份算。解析之后的分析出了意外、超出工作量上限（ANALYSIS_STEPS）的
+    也整份算——不退回「解析不了」只看文字：没写遮罩列、没有 * 的整行引用（SELECT s）那样就放过去了。"""
     from app.data.sql_semantics import _parse, _read
 
     try:
@@ -1110,54 +1608,97 @@ def _tainted(sql: str, kind: str | None, masked: set[str], width: int, tables: d
     if root is None:
         return None
     try:
-        _normalized(root, _read(kind), tables)
-        names = set(masked)
-        selects = list(root.find_all(exp.Select))
-        blocks = _blocks(root)
-        sources = [(top, listed) for top, role, listed in blocks if role == "source"]
-        functions = [source for select_ in selects for source in _function_sources(select_)]
-        unreadable = False
-        for _ in range(len(selects) + len(sources) + len(functions) + 1):
-            before = len(names)
-            for select_ in selects:
-                for item in select_.expressions:
-                    name = item.alias_or_name.lower()
-                    if name and not _is_star(item) and name not in names and _reads(names, _value_columns(item)):
-                        names.add(name)
-            for top, listed in sources:
-                names |= _source_names(top, listed, names, tables)[0]
-            for source in functions:
-                if _reads(names, _value_columns(source)):
-                    columns = _function_columns(source)
-                    unreadable = unreadable or columns is None
-                    names |= columns or set()
-            if len(names) == before:
-                break
-        everything = unreadable or any(_source_names(top, listed, names, tables)[1] for top, listed in sources) \
-            or any(_reads(names, _value_columns(node)) for node in root.find_all(exp.Pivot, exp.MatchRecognize))
-        positions: set[int] = set()
-        for top, role, _listed in blocks:
-            if role != "result":
-                continue
-            branches = [leaf for leaf in _leaves(top) if isinstance(leaf, exp.Select)]
-            for k, select_ in enumerate(branches):
-                branch = list(select_.expressions)
-                for item, place in zip(branch, _places(branch, width)):
-                    if not _is_star(item) and _reads(names, _value_columns(item)):
-                        if place is None or place >= width:
-                            everything = True
-                        else:
-                            positions.add(place)
-                # UNION 后一支的 * 按位置落进第一支起的列名里；第一支、单独一条 SELECT 的 * 照原名带出，按名字认得出
-                spread = _star_places(select_, width, names, tables) if k else set()
-                if spread is None or any(place >= width for place in spread):
-                    everything = True
-                else:
-                    positions |= spread
-        return names, set(range(width)) if everything else positions
-    except Exception:  # noqa: BLE001 - 分析本身的缺陷不能让回答出错：按解析不了处理（宁可多遮）
-        logger.warning("质询的 SQL 遮罩分析失败", exc_info=True)
-        return None
+        opaque = _normalized(root, _read(kind), tables)
+        with _analysis():
+            return _tainted_in(root, sql, kind, masked, width, tables, opaque)
+    except _Overworked:
+        # 一长串 CTE 一段套一段地整行引用、展开 *：分析不过来，认不准，整份遮
+        logger.warning("SQL 遮罩分析超出工作量上限（%d 步），整份快照按遮罩处理", ANALYSIS_STEPS)
+    except Exception:  # noqa: BLE001 - 分析本身的缺陷不能让回答出错，也不能把原值放过去：整份遮（宁可多遮）
+        logger.warning("SQL 遮罩分析失败，整份快照按遮罩处理", exc_info=True)
+    return _Taint(set(masked), set(range(width)), True, set())
+
+
+def _tainted_in(root: Any, sql: str, kind: str | None, masked: set[str], width: int,
+                tables: dict[str, list[str]] | None, opaque: list[set[str]]) -> _Taint:
+    """_tainted 解析、改写（_normalized）之后真去认的那一步。opaque 是 (表达式).* 的值取自哪些列（_normalized 交回的）。"""
+    from sqlglot import exp
+
+    from app.data.sql_semantics import _read
+
+    names = set(masked)
+    selects = list(root.find_all(exp.Select))
+    blocks = _blocks(root)
+    sources = [(top, listed) for top, role, listed in blocks if role == "source"]
+    # VALUES 不按表值函数认（下面另认）：按出列名认时它出的每一列都算，同一行里没碰遮罩列的区域也收成了遮罩值
+    functions = [source for select_ in selects for source in _function_sources(select_)
+                 if not isinstance(_function_node(source), exp.Values)]
+    # Postgres 里可能交回复合类型、展开成各个字段的表值函数（_spreads_record）：读到遮罩列时出哪几列说不清，整份遮
+    spreading = {id(source) for source in functions if _spreads_record(source)} \
+        if _read(kind) in _ROW_DIALECTS else set()
+    # VALUES 当一张表用（FROM、JOIN、LATERAL 里的，WITH 里的一段，UNION 的一支，整条就是它，_values_table）又读到遮罩列
+    # （含派生出来的名字）：各库给它的列起名不一样（Postgres、SQLite 叫 column1…，MySQL 叫 column_0…，MariaDB 拿第一行的
+    # 值当列名），外层按名字取、照原名带出时对不上，以前 MySQL 派生表、CTE、LATERAL 里的 VALUES ROW 取了号码，原样交了
+    # 出去；套了括号的 VALUES（整条就是它、UNION 的一支）不在任何 SELECT 的 FROM 里，哪个库都没认。不再逐个方言、逐个
+    # 位置认，整份遮；按方言认得出的、值取自遮罩列的那几列的名字照传下去（_values_taken），整份遮时只收它们的值
+    tables_of_values = [values for values in root.find_all(exp.Values) if _values_table(values)]
+    unreadable = tabled = False
+    for _ in range(len(selects) + len(sources) + len(functions) + len(tables_of_values) + 1):
+        before = len(names)
+        for select_ in selects:
+            for item in select_.expressions:
+                name = item.alias_or_name.lower()
+                if name and not _is_star(item) and name not in names and _reads(names, _value_columns(item)):
+                    names.add(name)
+        for top, listed in sources:
+            names |= _source_names(top, listed, names, tables)[0]
+        for source in functions:
+            if _reads(names, _value_columns(source)):
+                columns = None if id(source) in spreading else _function_columns(source, kind)
+                unreadable = unreadable or columns is None
+                names |= columns or set()
+        for values in tables_of_values:
+            if _reads(names, _value_columns(values)):
+                tabled = True
+                names |= _values_taken(values, names, kind)
+        if len(names) == before:
+            break
+    # 认不出的整份遮：表值函数出哪几列说不清、VALUES 当一张表用（见上）、派生来源里有认不出名字的列、PIVOT 这类读到遮罩列，
+    # (表达式).* 读到遮罩列（展开成几列、叫什么都说不清），语法树和实际执行的对不上、SQL 写在字符串里交给函数执行、整表
+    # 导出、统计信息里的值（_opaque）。(表达式).* 不只看选出项（那几个 _normalized 已经换掉，值取自哪些列在 opaque 里）：
+    # VALUES 里同样展开成好几列（Postgres 文档：选出列表、VALUES、行构造器里的 composite.* 都展开），LATERAL VALUES 按表值
+    # 函数认时一个元组项只算一列，column2 起的号码原样交了出去。不逐个位置认：(表达式).* 在树上任何位置（行构造器、函数
+    # 参数里的不展开成几列，也一样，多遮）读到遮罩列就整份遮；VALUES 里的 *、(s.*) 读到遮罩列的，那个 VALUES 就读到了
+    # 遮罩列，按上面整份遮
+    expanded = [node.this for node in root.find_all(exp.Dot) if isinstance(node.expression, exp.Star)]
+    everything = unreadable or tabled or any(_source_names(top, listed, names, tables)[1] for top, listed in sources) \
+        or any(_reads(names, _value_columns(node)) for node in root.find_all(exp.Pivot, exp.MatchRecognize)) \
+        or any(_reads(names, cols) for cols in opaque) \
+        or any(_reads(names, _value_columns(node)) for node in expanded) or _opaque(sql, kind)
+    positions: set[int] = set()
+    for top, role, _listed in blocks:
+        if role != "result":
+            continue
+        branches = [leaf for leaf in _leaves(top) if isinstance(leaf, exp.Select)]
+        for k, select_ in enumerate(branches):
+            branch = list(select_.expressions)
+            if len(branch) != width and not any(_is_star(item) for item in branch):
+                # 没有 * 的一支，选出项和结果的列数对不上：语法树和数据库实际执行的不是一回事（解析器扔掉的注释里多写
+                # 了几项、方言的写法读岔了），哪一列取自哪里都说不准
+                everything = True
+            for item, place in zip(branch, _places(branch, width)):
+                if not _is_star(item) and _reads(names, _value_columns(item)):
+                    if place is None or place >= width:
+                        everything = True
+                    else:
+                        positions.add(place)
+            # UNION 后一支的 * 按位置落进第一支起的列名里；第一支、单独一条 SELECT 的 * 照原名带出，按名字认得出
+            spread = _star_places(select_, width, names, tables) if k else set()
+            if spread is None or any(place >= width for place in spread):
+                everything = True
+            else:
+                positions |= spread
+    return _Taint(names, set(range(width)) if everything else positions, everything, positions)
 
 
 def _mentions(sql: str, names: Iterable[str]) -> bool:
@@ -1171,32 +1712,220 @@ _COUNT_STAR = re.compile(r"\bcount\s*\(\s*(?:all\s+|distinct\s+)?\*\s*\)", re.I)
 _IMPLICIT = re.compile(r"(?:\bselect|\bdistinct|\ball|[,(.])\s*\*|\btable\s+[\w\"`]", re.I)
 
 
-def _implicit(sql: str) -> bool:
-    """解析不了的 SQL 里有没有不写列名也会带出遮罩列的写法（*、TABLE x）：它们能把遮罩列带进别的列名（列名表、UNION 的
-    后一支），同写着遮罩列一样整份遮（_derived_hidden）。只看文字，字符串、注释里的也算（多遮）。"""
-    return bool(_IMPLICIT.search(_COUNT_STAR.sub("", sql)))
+#: 语法树和数据库实际执行的对不上的写法：MySQL、MariaDB 会执行的注释（/*! … */、/*M! … */，解析器当注释扔掉，选出项
+#: 就少了几项），Postgres 按 Unicode 转义写的名字（U&"…"，带不带 UESCAPE 都是，原文里看不出是哪一列，解析器读成 U 和一个
+#: 带引号的名字按位与）。出现就整份遮（_tainted、_implicit）。可验证报告（bundle/build.py）用的是同一个
+OPAQUE_SQL = re.compile(r'/\*m?!|u&"', re.I)
+#: 不点列名也读得出表里内容的写法里的函数（后面要跟着左括号才算，列名碰巧叫 crosstab 的不算）：
+#: - 表名、SQL 写在字符串里交给函数执行或整表导出：Postgres 的 XML 一族（query_to_xml、table_to_xml、cursor_to_xml、
+#:   schema_to_xml、database_to_xml 和带 _and_xmlschema 的）、ts_stat、tablefunc 的 crosstab / connectby、dblink，Oracle 的
+#:   XMLTYPE、XQuery（XMLQUERY、XMLTABLE）
+#: - 按页、按文件、按日志读出的原始数据：Postgres 的 pageinspect（get_raw_page、按索引名读 B 树页的 bt_page_items）、服务器
+#:   文件、逻辑解码、pg_walinspect 读出的 WAL 块，MySQL 的 LOAD_FILE，Oracle 的 BFILENAME，SQLite 的 readfile
+#: - 别的会话执行过的 SQL 原文（写入语句里就是值）：Postgres 的 pg_stat_activity 背后的函数和按会话取的那一个，MySQL 企业版的
+#:   审计日志
+#: 只收支持的几种库（SQLite、MySQL / MariaDB、Postgres、Oracle）的：DuckDB 的 query()、SQL Server 的 OPENQUERY 这类以前也收，
+#: 名叫 query 的 CTE、字符串里写着的「Query (x)」因此被当成了它们，整份遮了不该遮的结果
+INDIRECT_FUNCTIONS = (
+    r"(?:query|table|cursor|schema|database)_to_xml\w*", r"ts_stat", r"crosstab\d*", r"connectby", r"dblink\w*",
+    r"xmltype", r"xmlquery", r"xmltable",
+    r"get_raw_page", r"bt_page_items", r"pg_read_(?:binary_)?file", r"pg_logical_slot_\w+", r"pg_get_wal_block_info",
+    r"load_file", r"bfilename", r"readfile",
+    r"pg_stat_get_(?:backend_)?activity", r"audit_log_read",
+)
+#: 不点列名也读得出表里内容的表、视图、包（按名字认）：
+#: - Oracle 的 DBMS_XMLGEN 这一族（包名后面跟着点），XQuery 里的 ora:view 和 oradb: 表；读游标、出报告的包：DBMS_XPLAN 的
+#:   DISPLAY_CURSOR（带 PEEKED_BINDS 时有绑定变量的值）、DBMS_SQLTUNE、DBMS_SQL_MONITOR 的报告、DBMS_WORKLOAD_REPOSITORY
+#:   的 AWR 报告（排在前面的语句原文）
+#: - 统计信息里的采样值、全文索引里的词：Postgres 的 pg_stats、pg_statistic 一族，SQLite 的 sqlite_stat*，MySQL 的
+#:   column_statistics（直方图里是列的原值）、innodb_ft_*，MariaDB 的 column_stats，Oracle 的直方图、列统计和记着最小最大值
+#:   的 *_tab_columns、*_tab_cols（LOW_VALUE、HIGH_VALUE 按字节交回来就是号码、姓名的原文），以及它们的底表 histgrm$、
+#:   hist_head$
+#: - 别的会话执行过的 SQL 原文：Postgres 的 pg_stat_activity、pg_stat_statements、本连接预备过的语句；MySQL 的 general_log、
+#:   slow_log、PROCESSLIST、正在执行的事务（information_schema.INNODB_TRX 的 trx_query）、performance_schema（语句历史
+#:   events_statements_*、线程正在执行的 SQL），sys 库里建在 performance_schema 上的会话、锁等待视图（只认这几张，Oracle
+#:   常写的 sys.dual 不算；带 x$ 的不排版的那一份按下面的 X$ 算）和读 performance_schema 的函数（按 sys.ps_ 开头认：
+#:   ps_thread_trx_info 交回那个线程的事务里执行过的语句原文，ps_thread_stack 交回它的语句栈，MySQL 8.0 实测带着条件里
+#:   的号码；同一族只交回编号、开关的 ps_thread_id、ps_is_* 也算进来，多遮。不写 sys. 的要数据源的默认库就是 sys 才
+#:   执行得了，不认，同上面的视图）；MariaDB 的查询缓存（QUERY_CACHE_INFO）；Oracle 的动态视图
+#:   V$ / GV$ / X$ 一律算，不逐个认（V$SQL 一族、v$sql_bind_capture、打开着的游标、LogMiner 的 V$LOGMNR_CONTENTS、XML 的
+#:   审计记录都在里面），AWR 历史 DBA_HIST_*、审计记录，SQL 调优集里的语句和绑定变量（*_sqlset_*）、调优顾问记下的
+#:   （*_sqltune_*）、SQL Access Advisor 的工作负载（*_advisor_sqlw_*）、固定下来的执行计划和 SQL Profile、Patch
+#: - 被锁那一行、改动前后那一行的值：MariaDB（和 MySQL 5.7）的 INNODB_LOCKS 的 lock_data 是被锁那一行的键值；Oracle 的
+#:   闪回事务（FLASHBACK_TRANSACTION_QUERY 的 UNDO_SQL）、LogMiner（V$LOGMNR_CONTENTS 的 SQL_REDO / SQL_UNDO）写着整行的值
+#: - MySQL、MariaDB 的 OPTIMIZER_TRACE：同 EXPLAIN 一条语句（_reads_beyond），优化器把只有一行的表的值代进条件写在里面
+#:   （要开着优化器跟踪才有内容）
+#: - SQLite 按页读出的原始数据
+#: information_schema、pg_catalog 不整个收：大多只有表结构，核查 agent 查列名、类型时常用，里面存着值的那几张上面逐个列了
+#: （可验证报告那边宁可多挡，整个收，见 SYSTEM_SCHEMAS）。SHOW、EXPLAIN 这类不是查询的语句另按 _reads_beyond 认
+INDIRECT_NAMES = (
+    r"dbms_xml\w*", r"ora:view", r"oradb", r"dbms_(?:xplan|sqltune|sql_monitor|workload_repository)",
+    r"pg_stat(?:s|istic)\w*", r"sqlite_stat\d", r"column_statistics", r"innodb_ft_\w+", r"column_stats",
+    r"(?:all|dba|user|cdb)_(?:\w+_)?(?:histograms|col_statistics|tab_cols|tab_columns)", r"(?:histgrm|hist_head)\$",
+    r"pg_stat_activity", r"pg_stat_statements", r"pg_prepared_statements", r"general_log", r"slow_log",
+    r"processlist", r"innodb_trx", r"innodb_locks", r"query_cache_info", r"optimizer_trace", r"performance_schema",
+    r"events_statements_\w+",
+    r"sys[\"`]?\s*\.\s*[\"`]?(?:(?:x\$)?(?:session|processlist|innodb_lock_waits|schema_table_lock_waits)|ps_\w+)",
+    r"(?:g?v|x)\$\w+", r"(?:dba|cdb)_hist_\w+",
+    r"(?:all|dba|user|cdb)_(?:sqlset|sqltune|advisor_sqlw)_\w+", r"(?:dba|cdb)_sql_(?:plan_baselines|profiles|patches)",
+    r"flashback_transaction_query",
+    r"(?:dba|cdb|user)_(?:\w+_)?audit_trail", r"unified_audit_trail", r"aud\$\w*", r"fga_log\$",
+    r"sqlite_dbpage",
+)
+#: 系统 schema：哪几张表采样了列值、记着别的会话的 SQL，一张张数靠不住。可验证报告整个挡（只决定附不附快照），工具边界
+#: 不挡（见 INDIRECT_NAMES）
+SYSTEM_SCHEMAS = (r"pg_catalog", r"information_schema")
+
+
+def indirect_reads(*names: str) -> re.Pattern[str]:
+    """认「不点列名也读得出表里内容」的写法的正则：INDIRECT_FUNCTIONS 跟着左括号（函数名和括号之间可以有引号、空白），
+    INDIRECT_NAMES 加上 names 按名字。工具边界（_INDIRECT）和可验证报告（bundle/build.py 的 _INDIRECT_READS，另加
+    SYSTEM_SCHEMAS）共用这一份名单：以前两份各写各的，挡在模型前面的这一份反而少了一大截。"""
+    return re.compile(r"(?<![0-9A-Za-z_$])(?:(?:" + "|".join(INDIRECT_FUNCTIONS) + r")[\"`]?\s*\(|(?:"
+                      + "|".join((*INDIRECT_NAMES, *names)) + r")(?![0-9A-Za-z_$]))", re.I)
+
+
+#: 工具边界认的那一份（不含 SYSTEM_SCHEMAS）。出现就整份遮（_tainted、_implicit），写在字符串、注释里的也算（多遮）
+_INDIRECT = indirect_reads()
+
+
+#: 守卫放行的、不是查询的语句里只读得出表结构、库清单的几种（MySQL、MariaDB）：SHOW 表、列、索引、库、表状态、建库语句，
+#: DESCRIBE / EXPLAIN 一张表（看它的列，后面可以跟一个列名或通配的写法）。核查 agent 探查表结构靠它们，照常。
+#: SHOW CREATE TABLE 不在里面：对视图交回的是视图定义（MySQL 8.0 实测，同 SHOW CREATE VIEW，WHERE 里写死的号码原样），
+#: 建表语句里还有默认值、CHECK 约束、分区的取值；以前因为写着 TABLE x 就整份遮，现在照旧
+_STRUCTURE_ONLY = re.compile(
+    r"show\s+(?:(?:extended|full)\s+)*(?:tables|columns|fields|index|indexes|keys|databases|schemas|table\s+status"
+    r"|create\s+(?:database|schema))\b"
+    r"|(?:explain|describe|desc)\s+(?!(?:select|with|table|values|analyze|format|for|extended|partitions|plan|query"
+    r"|verbose)\b)[\w$`\".]+(?:\s+[\w$`\"'%.]+)?\s*;?\s*$",
+    re.I)
+#: 不是查询、读得出别的东西的语句：SHOW、EXPLAIN、DESCRIBE（EXPLAIN 一条语句也写作 DESCRIBE）
+_STATEMENT_VERBS = frozenset({"show", "explain", "describe", "desc"})
+
+
+def _reads_beyond(bare: str, kind: str | None) -> bool:
+    """去掉注释的 SQL（bare）是 SHOW、EXPLAIN 这类不是查询的语句，读的又不只是表结构（_STRUCTURE_ONLY 以外的）：
+    - SHOW ENGINE INNODB STATUS（最近的死锁、正在执行的事务带着别的会话的 SQL）、BINLOG / RELAYLOG EVENTS（语句格式的
+      日志就是 SQL 原文）、REPLICA STATUS 的出错信息、PROFILES、WARNINGS（EXPLAIN 之后改写过的语句里，只有一行的表的
+      每一列都代成了常量）、视图和触发器的定义、建表语句（对视图交回的是视图定义）、MariaDB 的 SHOW EXPLAIN FOR 别的
+      连接……交回的是原文，可能带着号码；
+    - EXPLAIN 一条语句：MySQL 优化时把只有一行的表（按主键取一行）读出来、把值当常量代进条件，FORMAT=TREE / JSON、
+      EXPLAIN ANALYZE 写出的条件里就是那一行的值（MySQL 8.0 实测）。FOR CONNECTION 看别的连接正在执行的语句，也算。
+    守卫放行所有 SHOW、EXPLAIN（只读），这里不逐个认哪一种带着值：只读表结构的几种以外一律整份遮。Postgres 解析不了的
+    本来就整份遮（_derived_masks），SQLite 的 EXPLAIN 只有字节码和语句里写的字面量，照常。首关键字的认法同守卫的
+    first_verb（括号开头的也认）。"""
+    text = bare.strip()
+    verb = re.match(r"[A-Za-z_]+", text.lstrip("(").lstrip())
+    if verb is None or verb.group(0).lower() not in _STATEMENT_VERBS or (kind or "").lower() == "sqlite":
+        return False
+    return not _STRUCTURE_ONLY.match(text)
+
+
+def _opaque(sql: str, kind: str | None) -> bool:
+    """SQL 里有认不全的写法：OPAQUE_SQL（MySQL 会执行的注释、U&"…"），或者 _INDIRECT 那几类。按原文认（字符串、注释里
+    写着的也算，多遮），再按去掉注释的认：函数名和括号之间夹着注释（query_to_xml/**/(…)、query_to_xml --换行(…)）解析得了，
+    语法树上又不认函数名，原文里名字后面不紧跟着括号，以前就放过去了。去注释照守卫按数据源的方言切（data/guard.py）。
+    不只读表结构的 SHOW、EXPLAIN 一条语句也算（_reads_beyond）。"""
+    if OPAQUE_SQL.search(sql) or _INDIRECT.search(sql):
+        return True
+    from app.data.guard import strip_comments
+
+    try:
+        bare = strip_comments(sql, dialect=kind)
+    except Exception:  # noqa: BLE001 - 守卫切不开的写法：认不准，按认不全算（宁可多遮）
+        return True
+    return (bare != sql and bool(_INDIRECT.search(bare))) or _reads_beyond(bare, kind)
+
+
+def _implicit(sql: str, kind: str | None = None) -> bool:
+    """解析不了的 SQL 里有没有不写列名也会带出遮罩列的写法（*、TABLE x，OPAQUE_SQL、_INDIRECT 那几类，_opaque）：它们能
+    把遮罩列带进别的列名（列名表、UNION 的后一支）、整表交出来，同写着遮罩列一样整份遮（_derived_hidden）。只看文字，
+    字符串、注释里的也算（多遮）。只读表结构的 SHOW、DESCRIBE（_STRUCTURE_ONLY）不按 *、TABLE x 认：SHOW TABLE STATUS
+    里的 TABLE 不是 TABLE x 语句，以前因此整份遮，表状态看不到（SHOW CREATE TABLE 照旧整份遮，见 _STRUCTURE_ONLY）。"""
+    if _STRUCTURE_ONLY.match(sql.strip()):
+        return _opaque(sql, kind)
+    return bool(_IMPLICIT.search(_COUNT_STAR.sub("", sql))) or _opaque(sql, kind)
+
+
+class _Masks(NamedTuple):
+    """一份快照按 SQL 认出来的遮罩（_derived_masks）：要遮的列（小写）、SQL 里指代遮罩列的名字（小写）、要收值的列（小写，
+    collect：收进遮罩值的只有这几列，见 _derived_masks）、是不是认不全整份遮的（whole）。"""
+
+    hidden: set[str]
+    names: set[str]
+    collect: set[str]
+    whole: bool
 
 
 def _derived_hidden(snapshot: dict[str, Any], hidden: set[str], kind: str | None,
-                    tables: dict[str, list[str]] | None = None) -> tuple[set[str], set[str]]:
-    """(这份快照要遮的列, SQL 里指代遮罩列的名字)，都是小写。tables 是查询当时冻结的表结构（_schema_columns），* 展开
-    数据源里的表时按它数位置；没给的按快照记着的表结构快照（schema_artifact）认，和工具边界遮的时候是同一份。
+                    tables: dict[str, list[str]] | None = None, *, labels: dict[str, set[str]] | None = None
+                    ) -> tuple[set[str], set[str]]:
+    """(这份快照要遮的列, SQL 里指代遮罩列的名字)，都是小写，见 _derived_masks。"""
+    found = _derived_masks(snapshot, hidden, kind, tables, labels=labels)
+    return found.hidden, found.names
+
+
+def _derived_masks(snapshot: dict[str, Any], hidden: set[str], kind: str | None,
+                   tables: dict[str, list[str]] | None = None, *, labels: dict[str, set[str]] | None = None) -> _Masks:
+    """一份快照要遮的列、SQL 里指代遮罩列的名字、要收值的列、是不是整份遮（_Masks），都是小写。tables 是查询当时冻结的
+    表结构（_schema_columns），* 展开数据源里的表时按它数位置；没给的按快照记着的表结构快照（schema_artifact）认，和
+    工具边界遮的时候是同一份。
 
     证据面板只按列名遮（hidden）；agent 的查询起了别名、套了函数，结果列名就对不上。本仓库的查询惯例是起中文别名
     （region AS 区域），所以按 SQL 认出改了名字的遮罩列（_tainted）。SQL 解析不了、里面又写着遮罩列的（*、TABLE x 不写
-    列名也会把遮罩列带进别的列名，同样算，_implicit），整份快照的列都遮掉；合并查询的快照不看 SQL，它记着自己的来历
-    （_hidden_columns 已按 _merge_masks 遮好）。"""
+    列名也会把遮罩列带进别的列名，OPAQUE_SQL、_INDIRECT 那几类整表交出来，同样算，_implicit），或者数据源是有整行引用的
+    方言（Postgres：row_to_json(s)、SELECT s 不写列名、也没有 *，只看文字认不出），整份快照的列都遮掉；合并查询的快照
+    不看 SQL，它记着自己的来历（_hidden_columns 已按 _merge_masks 遮好）。
+    分档写在派生来源里、外层按它分组的标签列（一档一行，_grouped_labels）照常显示，同 _band_only；格子里装着标签以外的、
+    和遮罩列同名的照旧遮（_shown_labels）。labels 是调用方已经认好的标签列（_label_columns），没给的按快照认。
+    收值（collect）：认得清的，要遮的列都收；整份遮的只收确定取自遮罩列的那几列——列名对得上遮罩列和 SQL 里指代遮罩列的
+    名字的，加上整份算之前认出的位置（_Taint.sure）。以前整份遮时每一格都收成遮罩值，区域名、列名在同一次核查里处处被
+    换掉，封存的 SQL 也被改写（WHERE 已遮罩 = '华东'）；认不全的那几列的值本来就没交给模型，不收也不会从别处露出来。"""
     base = set(hidden)
     sql = snapshot.get("sql")
     if not base or not isinstance(sql, str) or not sql.strip() or snapshot.get("source") == MERGE_SOURCE:
-        return base, base
+        return _Masks(base, base, base, False)
     columns = [str(c) for c in snapshot.get("columns") or []]
+    lowered = {c.lower() for c in columns}
     found = _tainted(sql, kind, base, len(columns), _snapshot_columns(snapshot) if tables is None else tables)
     if found is None:
-        hides = _mentions(sql, base) or _implicit(sql)
-        return (base | {c.lower() for c in columns}, base) if hides else (base, base)
-    names, positions = found
-    return names | {columns[i].lower() for i in positions if i < len(columns)}, names
+        from app.data.sql_semantics import _read
+
+        if _mentions(sql, base) or _implicit(sql, kind) or _read(kind) in _ROW_DIALECTS:
+            return _Masks(base | lowered, base, base, True)
+        return _Masks(base, base, base, False)
+    out = found.names | {columns[i].lower() for i in found.positions if i < len(columns)}
+    if found.whole:
+        sure = found.names | {columns[i].lower() for i in found.sure if i < len(columns)}
+        return _Masks(out, found.names, sure, True)
+    if out & lowered:
+        out -= _shown_labels(snapshot, kind, columns, base, tables, labels)
+    return _Masks(out, found.names, out, False)
+
+
+def _shown_labels(snapshot: dict[str, Any], kind: str | None, columns: list[str], base: set[str],
+                  tables: dict[str, list[str]] | None, labels: dict[str, set[str]] | None) -> set[str]:
+    """派生自遮罩列、却当分组键照常显示的标签列（列名小写，_grouped_labels）：只装着标签（labels，没给的按快照认）、和
+    数据源设的遮罩列不同名、格子里只有标签（数的写法对不上的、查询时已经遮掉的都不算）、一档一行。表结构给了 tables 的
+    按它，没给的按快照记着的表结构快照。"""
+    sets = {name: set(cols) for name, cols in tables.items()} if tables is not None else (
+        _frozen_tables(snapshot["schema_artifact"]) if isinstance(snapshot.get("schema_artifact"), str) else None)
+    if labels is None:
+        labels = _snapshot_labels(snapshot, kind, sets)
+    wanted = {name: texts for name, texts in labels.items() if name not in base and _only_labels(snapshot, name, texts)}
+    return _grouped_labels(snapshot["sql"], kind, columns, wanted, sets) if wanted else set()
+
+
+def _only_labels(snapshot: dict[str, Any], name: str, texts: set[str]) -> bool:
+    """快照里叫 name 的列，格子不是空就是标签的一种写法（_forms 对得上 texts）。"""
+    columns = [str(c).lower() for c in snapshot.get("columns") or []]
+    index = [i for i, c in enumerate(columns) if c == name]
+    for row in snapshot.get("rows") or []:
+        cells = [row[i] for i in index if i < len(row)] if isinstance(row, list) else (
+            [v for k, v in row.items() if str(k).lower() == name] if isinstance(row, dict) else [row])
+        if any(v is not None and not (_forms(v) & texts) for v in cells):
+            return False
+    return True
 
 
 def derived_columns(snapshot: dict[str, Any], hidden: set[str], kind: str | None) -> set[str] | None:
@@ -1210,8 +1939,7 @@ def derived_columns(snapshot: dict[str, Any], hidden: set[str], kind: str | None
     found = _tainted(sql, kind, set(hidden), len(columns), _snapshot_columns(snapshot))
     if found is None:
         return None
-    names, positions = found
-    return {c.lower() for i, c in enumerate(columns) if c.lower() in names or i in positions}
+    return {c.lower() for i, c in enumerate(columns) if c.lower() in found.names or i in found.positions}
 
 
 def _snapshot_labels(snapshot: dict[str, Any], kind: str | None, tables: dict[str, set[str]] | None = None
@@ -1415,6 +2143,11 @@ def _forms(value: Any) -> set[str]:
     return forms
 
 
+def _placeholder(value: Any) -> bool:
+    """一格是占位的写法（PLACEHOLDERS：未知、暂无、N/A……），不当遮罩值收。"""
+    return isinstance(value, str) and _plain_text(value).lower() in PLACEHOLDERS
+
+
 def _strong(form: str) -> bool:
     """按值认得出的写法（见 SECRET_MIN、SECRET_DIGITS）。"""
     if _NUMERIC.fullmatch(form):
@@ -1522,7 +2255,8 @@ class _Secrets:
     def add(self, snapshot: Any, hidden: set[str], *, labels: dict[str, set[str]] | None = None,
             base: Iterable[str] = ()) -> None:
         """收一份快照里要遮的列（hidden，小写）的值。labels 是这份快照里只装着分档标签的列（_label_columns）：这几列的
-        格子等于标签的不收；改了名字的遮罩列、别的派生列照收，base（数据源设了遮罩的列，小写）自己选出来的值也照收。"""
+        格子等于标签的不收；改了名字的遮罩列、别的派生列照收，base（数据源设了遮罩的列，小写）自己选出来的值也照收。
+        占位的写法（PLACEHOLDERS：未知、暂无……）不收。"""
         if not _query_shaped(snapshot) or not hidden:
             return
         own = set(base)
@@ -1541,7 +2275,7 @@ class _Secrets:
             else:
                 continue
             for name, value in cells:
-                if value is None or isinstance(value, bool) or value == word:
+                if value is None or isinstance(value, bool) or value == word or _placeholder(value):
                     continue
                 forms = _forms(value)
                 if forms & written.get(name, set()):
@@ -1593,6 +2327,24 @@ class _Secrets:
         self.strong = {f for f in self.strong if not asked(f)}
         self.weak = {f for f in self.weak if not asked(f)}
         self._index, self._compiled = None, {}
+
+    def spared(self, value: str) -> bool:
+        """value（SQL 里的一个字面量、一格的文字）写在已经摆在读者眼前的文字里（protected）：认法同 _spare，数按去掉
+        千分位、正负号的数字认，换了写法的号码按纯数字写法认，别的按原文。value 不必是收过的遮罩值——证据摘录里和遮罩列
+        做等值比较的字面量不论认不认得出都换，提问人、这句结论原文里写着的照旧不换（inquiry._scrub_excerpt_sql）。"""
+        text = _plain_text(value)
+        if not text or not self.protected:
+            return False
+        given = " ".join(self.protected)
+        if _digits_of(text) in {_digits_of(n) for n in _DIGITS.findall(given)} if _NUMERIC.fullmatch(text) \
+                else text in given:
+            return True
+        keys = set(_loose_keys(text))
+        if not keys:
+            return False
+        runs = {"".join(_LOOSE_DIGITS.findall(run.group())).translate(_HALF_DIGITS)
+                for run in _LOOSE_RUN.finditer(given)}
+        return any(key in keys for run in runs for key in _loose_candidates(run))
 
     def show(self, numbers: Iterable[str]) -> None:
         """SQL 里照原样留着的阈值、行数（_shown_literals）：回答正文里复述它们不换（「金额不低于 30000 元」），换了只会
@@ -1777,7 +2529,8 @@ def _scrubbed_source(text: str, secrets: _Secrets) -> str:
 
 
 def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, *, embedded: bool = False,
-                 rename: bool = True) -> tuple[dict[str, Any], list[str]]:
+                 rename: bool = True, numbers: bool = True, changed: list[list[int]] | None = None
+                 ) -> tuple[dict[str, Any], list[str]]:
     """一份查询快照遮好的样子和遮掉的列：要遮的列（hidden，小写）每一格都换成「已遮罩」、类型记成文本（渲染时不当数）；
     别的列里写着按值认得出的遮罩值的格子也换（另一张表里没设遮罩的同一个手机号、改了名字没认出来的遮罩列）。
     列名里写着遮罩值的（agent 把遮罩值写进了别名，「13900000001 的单」），列名也换（同 SQL 里的名字，_scrub_sql）。
@@ -1788,6 +2541,9 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     里也没设遮罩。回答一路不这样换：渲染出来露了就整份不交（_leaked），不然回答被问的那一格看着像查到了别的东西。
     rename 为假时列名不换（工具边界先遮时：列名是模型自己写的，换了它引用的列名就对不上）。列名按文字的办法换（换了写法的
     号码也认，同 SQL 里带引号的名字）。
+    numbers 为假时数值格（数、列类型记成 number 的格子）不按值换，只换文字格（工具边界先遮时：存下的就是证据，访问次数
+    正好等于某一笔被遮的金额，换掉就改写了没设遮罩的数，双盲复算也取不到它）；要遮的列照旧整列换。changed 给了的话，按值
+    换过的格子（整格换的、文字里换掉一截的）按 [行, 列] 记进去，要遮的列里的不记。
     工具边界遮过的快照（记着 masked_at_query）里，整格就是「已遮罩」的是查询时按值换掉的：这一列照样记进遮掉的列，和回答时
     按值换掉的一样画。"""
     columns = [str(c) for c in snapshot.get("columns") or []]
@@ -1801,8 +2557,9 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     edited = False
     position = {c: i for i, c in enumerate(columns)}
     names = [secrets.scrub(c, loose=True) for c in columns] if by_value and rename else columns
+    counted = _typed_numbers(snapshot, columns) if not numbers else set()
 
-    def cell(i: int | None, value: Any) -> Any:
+    def cell(r: int, i: int | None, value: Any) -> Any:
         nonlocal edited
         if i in index:
             return word
@@ -1810,15 +2567,21 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
             if i is not None:
                 touched.add(i)
             return value
+        if not numbers and (i in counted or _number_cell(value)):
+            return value
         if by_value and secrets.hit(value):
             if i is not None:
                 touched.add(i)
+                if changed is not None:
+                    changed.append([r, i])
             return word
         if embedded and by_value and isinstance(value, (str, dict, list)):
             # JSON 列（对象、数组）按界面画出来的样子换，换过的照文字给
             text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
             if (scrubbed := secrets.scrub(text, loose=True)) != text:
                 edited = True
+                if changed is not None and i is not None:
+                    changed.append([r, i])
                 return scrubbed
         return value
 
@@ -1827,11 +2590,11 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
         return names[i] if i is not None else k
 
     rows: list[Any] = []
-    for row in snapshot["rows"]:
+    for r, row in enumerate(snapshot["rows"]):
         if isinstance(row, list):
-            rows.append([cell(i, v) for i, v in enumerate(row)])
+            rows.append([cell(r, i, v) for i, v in enumerate(row)])
         elif isinstance(row, dict):
-            rows.append({key(k): word if str(k).lower() in hidden else cell(position.get(str(k)), v)
+            rows.append({key(k): word if str(k).lower() in hidden else cell(r, position.get(str(k)), v)
                          for k, v in row.items()})
         else:
             rows.append(row)
@@ -1843,6 +2606,38 @@ def _masked_view(snapshot: dict[str, Any], hidden: set[str], secrets: _Secrets, 
     types.update({names[i]: "text" for i in index})
     view = {**snapshot, "rows": rows, "column_types": types, **({"columns": names} if renamed else {})}
     return view, [names[i] for i in sorted(touched)]
+
+
+def _number_cell(value: Any) -> bool:
+    """格子本身是数（整数、小数，真假不算）。写成字符串的数（Postgres 的 NUMERIC、MySQL 的 DECIMAL 交回来是 "20000.00"）
+    单看格子分不出是数还是文字，要靠列类型（_typed_numbers）。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _typed_numbers(snapshot: dict[str, Any], columns: list[str]) -> set[int]:
+    """按列类型认作数值列的列号：column_types 记成 number、而且结果里只有这一列叫这个名字。column_types 按列名记（查询层
+    逐列数类型，同名的几列后面的盖掉前面的），同名的几列说不清记的是哪一列的类型：备注是文字、另一张表里同名的评分是
+    整数，记下的是 number，以前按名字查，文字列也当成了数值列，里面的号码不再按值换，原样交给模型、落了库。同名的几列
+    按格子本身认（_number_cell：整数、小数才算数，写成字符串的数按文字处理，宁可多遮）。"""
+    kinds = snapshot.get("column_types") if isinstance(snapshot.get("column_types"), dict) else {}
+    counts = Counter(columns)
+    return {i for i, c in enumerate(columns) if kinds.get(c) == "number" and counts[c] == 1}
+
+
+def masked_cell(value: Any, secrets: _Secrets | None, *, numeric: bool = False) -> Any:
+    """一格按值遮好的样子，口径同工具边界（_masked_view 的 numbers=False、embedded）：数值格（格子是数，或者 numeric：
+    列类型是 number、列名唯一的列，见 _typed_numbers）照原样，不改写没设遮罩的数值证据；文字格整格就是遮罩值的换成
+    「已遮罩」，文字里夹着的换掉那一截（换了写法的号码也认），JSON（对象、数组）按界面画出来的样子换、换过的照文字给。
+    交给核查 agent 的证据摘录逐格这样遮（judge.prepare 的 mask），不再对渲染好的整段文字按值换：那样分不出数值格和文字
+    格，没设遮罩的访问次数正好等于某一笔金额也被换掉。"""
+    if secrets is None or not secrets.strong or value is None or numeric or _number_cell(value):
+        return value
+    if secrets.hit(value):
+        return _masked_word()
+    text = _cell_text(value)
+    if text is not None and (scrubbed := secrets.scrub(text, loose=True)) != text:
+        return scrubbed
+    return value
 
 
 def _cell_text(value: Any) -> str | None:
@@ -1972,11 +2767,16 @@ class QueryMask:
 
     payload：遮好的结果，交给模型的、落进快照的都是它。columns：查询时就整列遮掉的结果列（结果里的列名，按先后）。
     secrets：这份结果里遮掉的值，只在内存里交给调用方（审批质询按值遮的第二道防线：模型照着别处看到的号码写进回答、
-    查询条件时认得出），不进快照、不交给模型。"""
+    查询条件时认得出），不进快照、不交给模型。cells：别的列里按值换过的格子 [行, 列]（整格换的、文字里换掉一截的），
+    随快照存下（masked_cells），格子引用指到它们照实说是遮罩，不说成「不是数值」。"""
 
     payload: dict[str, Any]
     columns: list[str]
     secrets: _Secrets
+    cells: list[list[int]] = field(default_factory=list)
+    #: 认不全、整份结果都遮了（_derived_masks 的 whole，分析出了意外的兜底也算）：随快照存下（masked_whole，不交给模型），
+    #: 格子引用指到这份结果时照实说写法认不全，不说成「取自设置了遮罩的列」
+    whole: bool = False
 
 
 @dataclass
@@ -2009,30 +2809,40 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
     （schema_cache，和随快照冻结的是同一份）：认分档标签（_label_columns 的 tables）、数 * 展开数据源里的表落在第几列
     （_derived_hidden 的 tables）时用。
 
-    - 整列遮：列名直接对上遮罩列的，加上按 SQL 认出值取自遮罩列的（_derived_hidden：别名、函数、子查询、WITH、
+    - 整列遮：列名直接对上遮罩列的，加上按 SQL 认出值取自遮罩列的（_derived_masks：别名、函数、子查询、WITH、
       SELECT *（展开的列换了名字的也算）、表值函数、整行引用和函数参数里的 *、列名表、TABLE x；COUNT、只在条件里用到、
-      分档当分组键的不算）；SQL 解析不了、又写着遮罩列（或者 *、TABLE x）的，整份结果的列都遮。这几列的格子换成
-      「已遮罩」，类型记成文本
-    - 别的列按值换：整格就是遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，_Secrets.loose_spans）。遮罩值
-      是这份结果里的加上 known：先查号码、再查写着号码的备注、没设遮罩的联系方式表（别的库里的也一样）时，后一份同样
-      遮好。门槛同按值遮（SECRET_DIGITS、SECRET_MIN）；只装着分档标签的列里的标签不算遮罩值，这份结果自己写的标签也不
-      按 known 换（前面的查询认不准、当遮罩值收了的同名标签，不能把这一份的档位列换掉）
+      分档当分组键的不算，分档写在派生来源里、外层按它分组的也不算）；认不全的（SQL 解析不了又写着遮罩列、*、TABLE x，
+      或者是 Postgres 的；(表达式).* 读到遮罩列（VALUES 里的也算）、Postgres 里可能交回复合类型的表值函数读到遮罩列，
+      VALUES 当一张表用又读到遮罩列，MySQL 会执行的注释、U&"…"，表名、SQL 写在字符串里交给函数，统计信息、会话记录里
+      存着值的视图和函数，不只读表结构的 SHOW、EXPLAIN 一条语句，选出项和结果的列数对不上，分析出意外、超出工作量
+      上限）整份结果的列都遮（QueryMask.whole）。这几列的格子换成「已遮罩」，类型记成文本
+    - 别的列按值换，只换文字格：整格就是遮罩值的换掉，文字格里夹着的那一截换掉（换了写法的号码也认，
+      _Secrets.loose_spans），换过的格子记下来（QueryMask.cells）。遮罩值是这份结果里的加上 known：先查号码、再查写着
+      号码的备注、没设遮罩的联系方式表（别的库里的也一样）时，后一份同样遮好。门槛同按值遮（SECRET_DIGITS、SECRET_MIN）；
+      只装着分档标签的列里的标签不算遮罩值，这份结果自己写的标签也不按 known 换（前面的查询认不准、当遮罩值收了的同名
+      标签，不能把这一份的档位列换掉）。数值格（数、列类型是 number 而且列名唯一的格子，_typed_numbers）不按值换：存下的
+      快照就是证据，没设遮罩的数值列（访问次数正好等于某一笔被遮的金额）换掉就改写了证据，双盲复算也取不到它
     - 列名不换（模型自己写的，换了它引用的列名就对不上）；结果里一列都没取自遮罩列、也没有可按值换的原样交回：数值的
       汇总、只数个数的查询不受影响
 
-    交回的 secrets 只有这份结果里的遮罩值（known 调用方自己有）。分析本身出了意外，整份结果的列都遮：这一步挡在模型
-    前面，分析的缺陷不能把原值放过去（宁可多遮）。"""
+    交回的 secrets 只有这份结果里的遮罩值（known 调用方自己有）；整份遮的只收确定取自遮罩列的那几列（_Masks.collect），
+    不然区域名、列名都成了遮罩值，后面的查询、封存的 SQL 跟着被换掉。分析本身出了意外（认列、认标签、逐格换值哪一步都算），
+    整份结果的每一格都遮、全部的列记成查询时遮掉的（_masked_whole），一个值都不收：这一步挡在模型前面，分析的缺陷不能
+    把原值放过去（宁可多遮）。"""
     base = {str(c).strip().lower() for c in masked if str(c).strip()}
     columns = [str(c) for c in payload.get("columns") or []]
     given = known is not None and bool(known.strong)
     if not (base or given) or not columns or not _query_shaped(payload):
         return QueryMask(payload, [], _Secrets())
     try:
-        hidden = _derived_hidden(payload, base, kind, _schema_columns(schema))[0] if base else set()
-        own = _Secrets()
         labels = _snapshot_labels(payload, kind, _schema_tables(schema))
-        if any(c.lower() in hidden for c in columns):
-            own.add(payload, hidden, labels=labels, base=base)
+        found = _derived_masks(payload, base, kind, _schema_columns(schema), labels=labels) if base \
+            else _Masks(set(), set(), set(), False)
+        hidden = found.hidden
+        own = _Secrets()
+        # 收值只收确定取自遮罩列的那几列（整份遮时不是每一列都收，见 _derived_masks）
+        if any(c.lower() in found.collect for c in columns):
+            own.add(payload, found.collect, labels=labels, base=base)
         pool = own
         if given:
             pool = own.copy()
@@ -2043,12 +2853,27 @@ def mask_query_result(payload: dict[str, Any], masked: Iterable[str], kind: str 
         if not pool.strong and not any(c.lower() in hidden for c in columns):
             return QueryMask(payload, [], own)
         pool.prepare()
-        view, _ = _masked_view(payload, hidden, pool, embedded=True, rename=False)
+        cells: list[list[int]] = []
+        view, _ = _masked_view(payload, hidden, pool, embedded=True, rename=False, numbers=False, changed=cells)
     except Exception:  # noqa: BLE001 - 认不准就整份遮掉，原值不交给模型
         logger.warning("核查查询的遮罩分析出错，整份结果按遮罩处理", exc_info=True)
-        hidden, own = {c.lower() for c in columns}, _Secrets()
-        view, _ = _masked_view(payload, hidden, own, rename=False)
-    return QueryMask(view, [c for c in columns if c.lower() in hidden], own)
+        return QueryMask(_masked_whole(payload), columns, _Secrets(), whole=True)
+    return QueryMask(view, [c for c in columns if c.lower() in hidden], own, cells, whole=found.whole)
+
+
+def _masked_whole(payload: dict[str, Any]) -> dict[str, Any]:
+    """整份结果的每一格都换成「已遮罩」、类型都记成文本：遮罩分析出了意外时的兜底。不经 _masked_view——出意外的可能
+    就是它，兜底跟着出意外，原值就挡不住了。列名、SQL 是模型自己写的，照原样。"""
+    word = _masked_word()
+    rows: list[Any] = []
+    for row in payload.get("rows") or []:
+        if isinstance(row, list):
+            rows.append([word] * len(row))
+        elif isinstance(row, dict):
+            rows.append(dict.fromkeys(row, word))
+        else:
+            rows.append(word)
+    return {**payload, "rows": rows, "column_types": {str(c): "text" for c in payload.get("columns") or []}}
 
 
 #: 查询报错里引号括起来的一段（Postgres、DuckDB、MySQL 把转换失败的值写在引号里：invalid input syntax for type

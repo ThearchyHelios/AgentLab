@@ -111,8 +111,9 @@ def test_a_whole_row_of_an_outer_query_is_found_from_a_nested_derived_table(sql)
     "SELECT EXISTS(SELECT * FROM sales s2 WHERE s2.id = s.id) AS j FROM sales s",
 ])
 def test_rows_and_stars_that_bring_no_masked_values_stay_visible(sql):
-    """整行取自没有遮罩列的子查询、count(s.*) 只数个数：不算。"""
-    assert hidden_of(sql, ["j", "total"]) == set(MASKED)
+    """整行取自没有遮罩列的子查询、count(s.*) 只数个数：不算。结果的列数照选出项数（列数对不上的整份遮，见
+    test_masking_opaque_sql）。"""
+    assert hidden_of(sql, ["j", "total"] if "total" in sql else ["j"]) == set(MASKED)
 
 
 def test_a_column_named_like_its_table_is_a_column_where_the_schema_says_so():
@@ -188,8 +189,11 @@ def test_sql_that_cannot_be_read_but_has_a_star_or_a_table_statement_hides_every
     "SELECT amount * 2 AS j FROM sales WHERE (",
 ])
 def test_sql_that_cannot_be_read_with_only_a_count_or_a_product_shows_the_rest(sql):
-    """只有 COUNT(*)、乘号：不会把遮罩列带出来，照旧只遮遮罩列本身。"""
-    assert hidden_of(sql, ["j"]) == set(MASKED)
+    """只有 COUNT(*)、乘号：不会把遮罩列带出来，照旧只遮遮罩列本身（没有整行引用的方言）。Postgres 里解析不了的一律
+    整份遮：整行引用（row_to_json(s)、SELECT s）不写列名、也没有 *，只看文字认不出（见 test_masking_opaque_sql）。"""
+    assert hidden_of(sql, ["j"], kind="sqlite") == set(MASKED)
+    assert hidden_of(sql, ["j"], kind="mysql") == set(MASKED)
+    assert hidden_of(sql, ["j"]) == set(MASKED) | {"j"}
 
 
 # --------------------------------------------------------------------------

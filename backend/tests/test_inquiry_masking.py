@@ -183,10 +183,13 @@ BANDS = "CASE WHEN amount BETWEEN 0 AND 20000 THEN '小单' WHEN amount BETWEEN 
     "SELECT CASE WHEN amount <= 20000 THEN 1 WHEN amount <= 60000 THEN 2 ELSE NULL END AS 档位, COUNT(*) AS 笔数 "
     "FROM sales GROUP BY 1",
     "SELECT IIF(amount > 20000, '大单', '小单') AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 1",
+    # 分档写在子查询、WITH 里，外层再按它分组（K3b）：同样每一档一行
+    f"SELECT 档位, COUNT(*) AS 笔数 FROM (SELECT {BANDS} AS 档位 FROM sales) t GROUP BY 档位",
+    f"WITH t AS (SELECT {BANDS} AS 档位 FROM sales) SELECT 档位, COUNT(*) AS 笔数 FROM t GROUP BY 1",
 ])
 def test_a_band_label_used_as_the_group_key_is_not_a_masked_value(sql):
-    """按遮罩列分档、每一档一行（CASE、IIF 的结果全是写死的标签，又是分组键）：标签只说一行落在哪一档，带不出金额，
-    档位列不遮，才分得清哪一档是几笔。笔数照样只是计数。"""
+    """按遮罩列分档、每一档一行（CASE、IIF 的结果全是写死的标签，又是分组键；分档写在派生来源里、外层按它分组的也算）：
+    标签只说一行落在哪一档，带不出金额，档位列不遮，才分得清哪一档是几笔。笔数照样只是计数。"""
     assert hidden_of(sql, ["档位", "笔数"], {"amount"}) == {"amount"}
 
 
@@ -195,8 +198,8 @@ def test_a_band_label_used_as_the_group_key_is_not_a_masked_value(sql):
     f"SELECT id, {BANDS} AS 档位, 1 AS 笔数 FROM sales",
     # 结果里有一支取的是金额本身
     "SELECT CASE WHEN amount > 20000 THEN amount ELSE 0 END AS 档位, COUNT(*) AS 笔数 FROM sales GROUP BY 1",
-    # 分档写在子查询里，外层再分组：子查询里的档位逐行带出来，照旧算
-    f"SELECT 档位, COUNT(*) AS 笔数 FROM (SELECT {BANDS} AS 档位 FROM sales) t GROUP BY 档位",
+    # 分档写在子查询里，外层不分组：子查询里的档位逐行带出来，照旧算
+    f"SELECT 档位, 1 AS 笔数 FROM (SELECT {BANDS} AS 档位 FROM sales) t",
 ])
 def test_band_labels_row_by_row_still_count_as_derived(sql):
     assert hidden_of(sql, ["档位", "笔数"], {"amount"}) >= {"amount", "档位"}
@@ -265,9 +268,8 @@ def test_a_renamed_masked_column_keeps_values_that_match_labels_written_elsewher
 
 
 @pytest.mark.parametrize("sql, columns, rows", [
-    # 标签列经子查询、CTE 原样传下去（外层再分组也一样：每一行的档位照旧算派生值，见上）
-    (f"SELECT 档位, COUNT(*) AS 笔数 FROM (SELECT {BANDS} AS 档位 FROM sales) t GROUP BY 档位",
-     ["档位", "笔数"], [["大单", 2], ["小单", 3]]),
+    # 标签列经子查询、CTE 原样传下去，外层不分组：每一行的档位照旧算派生值（外层按它分组的不遮，见上）
+    (f"SELECT 档位, 1 AS 笔数 FROM (SELECT {BANDS} AS 档位 FROM sales) t", ["档位", "笔数"], [["大单", 1], ["小单", 1]]),
     (f"WITH t AS (SELECT {BANDS} AS 档位 FROM sales) SELECT * FROM t", ["档位"], [["小单"], ["大单"]]),
     # 没起别名的标签列：按位置认
     (f"SELECT id, {BANDS} FROM sales", ["id", BANDS], [[1, "小单"], [2, "大单"]]),
