@@ -8,15 +8,22 @@
 // - 导出：从服务端找一份已封存、封存核对一致、有报告文档的运行（GET /api/runs 找成功结束的，再看 /verify 和证据接口），
 //   下载 bundle.html：状态码、类型、附件名（RFC 5987）、页面本身零外链。找不到可导出的运行时照实报失败并说明原因；
 // - 断网打开：拦掉一切网络请求，从本地文件打开：各项核对没有不通过、总览通过、没有发出任何请求，数字点开看得到出处；
+//   数字与取值的显示文字都核对得了（没有「无法核对显示文字」：移植的显示规则漏了真实写法时这里先报）；
 // - 去掉 crypto.subtle：页面加载前删掉它，照常全部通过，页脚写明用的是本页内置的实现；
 // - 篡改：① 一条带规范字符串的事件内容、② 一份嵌入工件的一个字节、③ 元信息里的封存哈希，各自对应的核对项不通过、
-//   总览显示不通过；另做一次「哈希全部重算」的伪造：改报告里一个数字的引用值，文档、事件、清单、页面顶部的封存哈希
-//   都重算一遍，①–④ 都对得上，只有 ⑤ 拿口径卡、快照对出来不通过，报告标题旁的徽标跟着不通过；
+//   总览显示不通过；另做两种「哈希全部重算」的伪造：改报告里一个数字的引用值，或者引用值不动、只改它的显示文字（数字改
+//   一位；有引用快照文字的取值时也改一个），文档、事件、清单、页面顶部的封存哈希都重算一遍，①–④ 都对得上，只有 ⑤ 拿
+//   口径卡、快照对出来（显示文字按显示规则重新渲染后逐字比对）不通过，原因点名正文显示的字和引用的值，报告标题旁的徽标
+//   跟着不通过；
 // - 深浅色、窄屏：390 宽不横向溢出，点开的数字面板在窄屏上从底部抽出，深色下底是深的、字是浅的；
 // - 样本页：tests/bundle_samples.py 用虚构数据真实生成的几份页面（遮罩快照、两份报告、早期运行、失败结束、先失败后
 //   经继续运行跑到成功的早期运行、两条出具
-//   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列、设了遮罩的数据源上按地区汇总的查询），逐份
-//   断言各项结果和原因文案；在上面篡改 ④
+//   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列、设了遮罩的数据源上按地区汇总的查询、每种显示
+//   格式各引用一处的经营月报、单位带尾随空白的经营月报），逐份断言各项结果和原因文案；经营月报上只改文字取值、数字、
+//   换算成万的口径卡引用的显示文字并重算全部哈希，各自变红并点名；核对过的字不动、改它旁边的（链接地址藏起数字、前面
+//   补一位数、隔着显示时不占位置的控制字符补一位数、长得像负号的连字符、叠在空格上的横线、从右往左书写的字母把一位数
+//   挪到数字前面、整段改成分隔线、文字片段冒用数字的 id），读的人看到的数要就是核对过的那个；列表缩进写成十万级或负数、
+//   表格的列号写成十万，核对通过的数字照样留在屏幕上（宽屏、窄屏都不横向溢出）；在上面篡改 ④
 //   引用链（换文档、拿掉报告、多一份没人引用的工件）、⑥ 运行信息（运行结果、类别、出具档位）、拿掉被引用的口径卡、把
 //   报告文档标成遮罩、把遮罩卡标成服务端的文件与 id 不一致或解析不出来（服务端对被改过、解析不了的遮罩卡就这么标）、
 //   遮罩源上随文件附带的汇总快照改一个字节、它的数字改引用值并重算全部哈希、
@@ -141,6 +148,11 @@ const stateOf = (page) => page.evaluate(() => ({
     acc[b.dataset.result] = (acc[b.dataset.result] ?? 0) + 1
     return acc
   }, {}),
+  // 正文里标成不通过的数字：读屏念的那一句
+  failedButtons: [...document.querySelectorAll('button.num[data-result="fail"]')].map((b) => b.getAttribute('aria-label') ?? ''),
+  // 正文里每个可点的数字：哪一处、结果、读的人看到的字
+  buttons: [...document.querySelectorAll('button.num')].map((b) => ({ key: b.dataset.num, result: b.dataset.result,
+    text: b.textContent })),
   sha: document.querySelector('[data-sha]')?.dataset.sha ?? null,
   seal: document.getElementById('seal-hash')?.textContent ?? '',
   overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -155,22 +167,35 @@ const hasItem = (s, check, result, text) => s.items.some((i) => i.check === chec
   && (!text || i.text.includes(text)))
 
 /**
- * 「哈希全部重算」的伪造：改报告里一个能核对的数字的引用值，再把文档、引用它的事件、清单哈希、页面顶部的封存哈希
- * 全部重算。返回改了哪一处的说明，找不到可改的数字返回 null
+ * 「哈希全部重算」的伪造：报告里挑一个能核对的数字或取值（引用口径卡或随文件附带的快照，pick(片段) 为真的第一个），
+ * edit(片段) 改它，再把文档、引用它的事件、清单哈希、页面顶部的封存哈希全部重算。返回改了哪一处的说明（what、所在报告
+ * node、改过的片段 seg），找不到可改的返回 null
  */
-function forge(data) {
+function rewrite(data, pick, edit) {
+  const embedded = new Set(data.artifacts.filter((a) => typeof a.b64 === 'string').map((a) => a.id))
+  return rewriteDoc(data, (doc) => {
+    let hit = null
+    for (const block of doc.blocks ?? []) for (const unit of block.units ?? []) for (const seg of unit.segments ?? []) {
+      const c = seg.cite
+      if (!hit && c?.status === 'resolved' && ['metric', 'cell'].includes(c.kind)
+          && embedded.has(doc.catalog?.[c.alias]?.artifact) && pick(seg)) hit = seg
+    }
+    if (!hit) return null
+    edit(hit)
+    return { what: `片段 ${hit.id}（${hit.cite.kind}）`, seg: hit }
+  })
+}
+
+/**
+ * change(文档) 就地改报告文档（返回 { what, seg? } 说明改了哪里，找不到可改的返回 null），再把文档、引用它的事件、
+ * 清单哈希全部重算（页面顶部的封存哈希由 tamper 的 seal 换）。返回说明，另带所在报告 node
+ */
+function rewriteDoc(data, change) {
   const docArt = data.artifacts.find((a) => a.kind === 'report_doc' && typeof a.b64 === 'string')
   if (!docArt) return null
   const doc = JSON.parse(Buffer.from(docArt.b64, 'base64').toString('utf8'))
-  const embedded = new Set(data.artifacts.filter((a) => typeof a.b64 === 'string').map((a) => a.id))
-  let hit = null
-  for (const block of doc.blocks ?? []) for (const unit of block.units ?? []) for (const seg of unit.segments ?? []) {
-    const c = seg.cite
-    if (!hit && c?.status === 'resolved' && ['metric', 'cell'].includes(c.kind) && typeof c.value === 'number'
-        && embedded.has(doc.catalog?.[c.alias]?.artifact)) hit = seg
-  }
-  if (!hit) return null
-  hit.cite.value += 1
+  const done = change(doc)
+  if (!done) return null
   const bytes = Buffer.from(JSON.stringify(doc), 'utf8')
   const oldId = docArt.id
   const newId = sha(bytes)
@@ -186,7 +211,48 @@ function forge(data) {
   const lines = data.events.map((e, i) => [e, i]).sort((x, y) => x[0].seq - y[0].seq || x[1] - y[1])
     .map(([e]) => `${e.seq}|${e.type}|${e.node_id ?? ''}|${e.data_sha256}`)
   data.meta.manifest_hash = sha(lines.join('\n'))
-  return { what: `片段 ${hit.id}（${hit.cite.kind}）`, node: data.reports.find((r) => r.doc_artifact === newId)?.node_id }
+  return { ...done, node: data.reports.find((r) => r.doc_artifact === newId)?.node_id }
+}
+
+/** 经营月报样本里按 id 找片段（改它两边的文字做排版上的伪造） */
+const segById = (doc, id) => doc.blocks.flatMap((b) => b.units).flatMap((u) => u.segments).find((s) => s.id === id)
+
+/** 改一个数字的引用值（显示文字不动），重算全部哈希：⑤ 拿口径卡、快照对出来 */
+const forge = (data) => rewrite(data, (seg) => typeof seg.cite.value === 'number', (seg) => { seg.cite.value += 1 })
+
+/**
+ * 只改显示文字的伪造（验收里的 T4、T5）：引用值不动，正文显示的字换成 change(原来的字)，cite.rendered 跟着改，重算全部
+ * 哈希。pick 挑哪一个片段（默认第一个能核对的）
+ */
+const forgeShown = (change, pick = () => true) => (data) => rewrite(data, pick, (seg) => {
+  seg.text = change(seg.text)
+  seg.cite.rendered = seg.text
+})
+
+/** 显示文字里第一个数字加一（9 变 0）：74,613.65元 → 84,613.65元 */
+const bumpDigit = (text) => text.replace(/\d/, (d) => String((Number(d) + 1) % 10))
+
+/** 引用快照里文字的取值（华南、门店名这类） */
+const isTextValue = (seg) => seg.kind === 'value' && typeof seg.cite.value === 'string' && seg.cite.value.trim() !== ''
+
+/**
+ * 只改显示文字的伪造该有的样子：⑤ 里只有那一项不通过，原因点名正文显示的字和引用的值，正文里那个数字标成不通过、
+ * 读屏读作「不通过」；①–④ 照样通过（伪造重算了全部哈希）。quiet：读的是真数据，原因只断言、不打印
+ */
+const namesShown = ({ quiet = false } = {}) => (s, forged) => {
+  // 条目多时不通过的列在外面一份、收起的全部里又一份：只数外面的
+  const failed = s.items.filter((i) => i.check === 'numbers' && i.result === 'fail' && !i.folded)
+  const named = `正文显示「${forged.seg.text}」，引用的值是「${forged.seg.cite.value}」`
+  return [
+    ...turnsRed('numbers', ['events', 'manifest', 'artifacts', 'chain'])(s),
+    ['⑤ 里只有这一项不通过', failed.length === 1, `${failed.length} 项`],
+    ['原因点名正文显示的字和引用的值', failed.length === 1 && failed[0].text.includes(named),
+      quiet ? '' : failed[0]?.text ?? '没有不通过的项'],
+    ['正文里那个数字标成不通过，读屏读作「不通过」', s.failedButtons.length === 1
+      && s.failedButtons[0].includes(`${forged.seg.text}，不通过，查看出处`), quiet ? '' : s.failedButtons.join(' | ')],
+    ['那份报告标题旁的徽标跟着不通过', s.reports.find((r) => r.node === forged.node)?.result === 'fail',
+      JSON.stringify(s.reports.map((r) => [r.node, r.result]))],
+  ]
 }
 
 /** 改一份嵌入工件的一个字节（优先改数字），返回说明 */
@@ -311,6 +377,12 @@ await section('断网打开', async () => {
     check('核对项「artifacts」没有不通过', noFail(s.checks.artifacts), s.checks.artifacts)
     check('数字与取值没有不通过的', noFail(s.checks.numbers) || s.checks.numbers === 'na',
       `${s.checks.numbers}：${JSON.stringify(s.numberStates)}`)
+    // 显示文字在真数据上也要核得了：移植的显示规则漏了某种真实写法（或者真报告的排版被判成紧挨着）时，数字会大批变成
+    // 「无法核对显示文字」，上面那条「没有不通过」看不出来。Chrome 有 BigInt，正常导出的都该核得了。读的是真数据：
+    // 只打印条数
+    const unshown = new Set(s.items.filter((i) => i.check === 'numbers' && i.result === 'na'
+      && i.text.includes('无法核对显示文字')).map((i) => i.text)).size
+    check('数字与取值的显示文字都核对得了（没有「无法核对显示文字」）', unshown === 0, `${unshown} 项`)
     // 早期运行的运行结果、升级前的运行类别核对不了（无法核对），只要求没有对不上的
     check('运行信息没有与已核对的事件对不上的', s.checks.meta !== 'fail', `${s.checks.meta}：${JSON.stringify(s.meta)}`)
     check('没有发出任何网络请求', requests.length === 0, requests.slice(0, 3).join('、'))
@@ -332,7 +404,7 @@ await section('断网打开', async () => {
       const text = await page.locator('#detail').innerText()
       const cited = await target.getAttribute('data-kind') === 'number'
       check('点开数字看得到出处和核对结果', /出处/.test(text) && /核对结果/.test(text)
-        && (!cited || /显示格式由服务端渲染/.test(text)) && await page.locator('#detail').getAttribute('data-open') === key)
+        && (!cited || /与按显示规则渲染的结果一致/.test(text)) && await page.locator('#detail').getAttribute('data-open') === key)
       await page.keyboard.press('Escape')
       check('Esc 关掉出处面板', await page.locator('#detail').isHidden())
     } else {
@@ -359,8 +431,9 @@ await section('去掉 crypto.subtle', async () => {
 // ---------------------------------------------------------------- 篡改
 
 /**
- * 在一份页面上篡改后断网打开。mutate(data) 改数据、返回说明（找不到可改的返回 null）；expect(state) 返回
- * [[检查名, 条件, 说明]…]。seal：同时把页面顶部的封存哈希换成改过的数据里的那一份（重算全部哈希的伪造会这么做）
+ * 在一份页面上篡改后断网打开。mutate(data) 改数据、返回说明（找不到可改的返回 null）；expect(state, 说明, page) 返回
+ * [[检查名, 条件, 说明]…]（要点开面板的可以是异步的）。seal：同时把页面顶部的封存哈希换成改过的数据里的那一份
+ * （重算全部哈希的伪造会这么做）
  */
 async function tamper(source, label, mutate, expect, { seal = false } = {}) {
   const data = structuredClone(dataOf(source))
@@ -374,7 +447,9 @@ async function tamper(source, label, mutate, expect, { seal = false } = {}) {
   const opened = await openFile(writePage(`tampered-${label.replace(/[^\w一-鿿]+/g, '_')}.html`, page))
   try {
     const s = await stateOf(opened.page)
-    for (const [name, cond, detail] of expect(s, what)) check(`篡改${label}：${name}`, cond, detail ?? `${typeof what === 'string' ? what : what.what}；${describe(s)}`)
+    for (const [name, cond, detail] of await expect(s, what, opened.page)) {
+      check(`篡改${label}：${name}`, cond, detail ?? `${typeof what === 'string' ? what : what.what}；${describe(s)}`)
+    }
   } finally {
     await opened.ctx.close()
   }
@@ -408,6 +483,18 @@ await section('篡改', async () => {
     ['那份报告标题旁的徽标跟着不通过', s.reports.find((r) => r.node === forged.node)?.result === 'fail',
       JSON.stringify(s.reports.map((r) => [r.node, r.result]))],
   ], { seal: true })
+  // 只改显示文字（验收里的 T4）：引用值不动，一个数字的显示文字改一位，重算全部哈希。⑤ 按显示规则重新渲染对出来，点名
+  // 正文显示的字和引用的值。读的是真数据：原因只断言、不打印
+  await tamper(html, '一个数字的显示文字并重算全部哈希',
+    forgeShown(bumpDigit, (seg) => typeof seg.cite.value === 'number' && /\d/.test(seg.text ?? '')),
+    namesShown({ quiet: true }), { seal: true })
+  // 文字取值（验收里的 T5）：导出的报告里有引用快照文字的取值才做；样本页 formats 上一定做
+  if (rewrite(structuredClone(tamperable), isTextValue, () => {})) {
+    await tamper(html, '一个文字取值的显示并重算全部哈希', forgeShown((t) => `${t}（改）`, isTextValue),
+      namesShown({ quiet: true }), { seal: true })
+  } else {
+    note('导出的报告里没有引用快照文字的取值，文字取值的篡改在样本页 formats 上做')
+  }
   // ③ 改元信息里的封存哈希
   await tamper(html, '元信息里的封存哈希', (data) => {
     const h = data.meta.manifest_hash
@@ -493,7 +580,7 @@ await section('样本页：各种形状', async () => {
     check('生成样本页（tests/bundle_samples.py）', false, String(e?.message ?? e))
     return
   }
-  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 12, Object.keys(samples).join('、'))
+  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 14, Object.keys(samples).join('、'))
 
   await sample('base', async (s, page) => {
     check('base：总览通过，有无法核对的项时写「可核对的项全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过',
@@ -517,7 +604,7 @@ await section('样本页：各种形状', async () => {
     check('base：斜体渲染成斜体', (await page.locator('.doc em').allTextContents()).includes('按发生周统计'))
     const cell = page.locator('td.n button.num')
     check('base：表格里数字列右对齐', await cell.count() === 8)
-    // 「显示格式由服务端渲染」只附在带出处的数字上：模型自己写的数、表格里的文字取值都是原文
+    // 「与按显示规则渲染的结果一致」只附在显示文字核对过的数字和取值上：模型自己写的数没人重新渲染过
     const detailOf = async (locator) => {
       await locator.click()
       await page.locator('#detail').waitFor({ state: 'visible', timeout: 5000 })
@@ -528,9 +615,9 @@ await section('样本页：各种形状', async () => {
     const cellNumber = page.locator('td.n button.num[data-kind="number"]').first()
     const value = page.locator('button.num[data-kind="value"]').first()
     const bare = page.locator('button.num[data-kind="number"][data-result="na"]').filter({ hasText: /^42$/ })
-    check('base：带出处的数字注明显示格式由服务端渲染', /显示格式由服务端渲染/.test(await detailOf(cellNumber)))
-    check('base：文字取值、没有出处的数字不注明显示格式', !/显示格式由服务端渲染/.test(await detailOf(value))
-      && !/显示格式由服务端渲染/.test(await detailOf(bare)))
+    check('base：带出处的数字注明显示文字与按显示规则渲染的结果一致', /与按显示规则渲染的结果一致/.test(await detailOf(cellNumber)))
+    check('base：表格里的文字取值同样核对显示文字', /与按显示规则渲染的结果一致/.test(await detailOf(value)))
+    check('base：没有出处的数字不注明', !/按显示规则/.test(await detailOf(bare)))
     check('base：读屏把文字取值读作「取值」、数字读作「数字」', (await value.getAttribute('aria-label')).startsWith('取值 ')
       && (await cellNumber.getAttribute('aria-label')).startsWith('数字 '))
   })
@@ -656,6 +743,53 @@ await section('样本页：各种形状', async () => {
     check('stray：另一次运行的文档，④ 不通过并写明', s.overall === 'fail' && hasItem(s, 'chain', 'fail', '文档记下的运行或节点与这次不符'))
     check('stray：文档没通过核对时数字不予核对', s.checks.numbers === 'na' && hasItem(s, 'numbers', 'na', '所在的报告文档没有通过核对')
       && s.reports[0]?.warn.includes('其中的数字不予核对'), s.checks.numbers)
+  })
+  // 经营月报：每种显示格式各引用一处（货币单位、万 / 亿、比率、负数、不分组、小数位、pct、DECIMAL 文本、超过 2^53 的
+  // 订单号、日期时间、文字取值），原样导出全部通过：每个数字和取值的显示文字都按显示规则重新渲染、逐字对上
+  await sample('formats', async (s, page) => {
+    check('formats：总览「全部通过」，没有一项无法核对', s.overall === 'pass' && s.text === '全部通过'
+      && !s.items.some((i) => i.result !== 'pass'), `${s.overall}：${s.text}`)
+    check('formats：⑤ 数字 16 个、取值 3 个全部通过', s.checks.numbers === 'pass'
+      && s.sums.numbers.includes('数字 16 个 · 取值 3 个') && s.numberStates.pass === 19, s.sums.numbers)
+    const wan = page.locator('button.num').filter({ hasText: /^7\.46万元$/ })
+    let detail = '找不到「7.46万元」'
+    if (await wan.count()) {
+      await wan.first().click()
+      detail = await appears(page.locator('#detail')) ? await page.locator('#detail').innerText() : '点开后没有出处面板'
+      await page.keyboard.press('Escape')
+    }
+    check('formats：点开换算成万的数字，引用的值、口径卡里的值照原值写，注明与按显示规则渲染的结果一致',
+      detail.includes('74613.65') && detail.includes('与按显示规则渲染的结果一致') && !detail.includes('按显示规则应为'),
+      detail.replace(/\s+/g, ' ').slice(0, 160))
+    const order = page.locator('button.num').filter({ hasText: '202,609,071,234,567,890' })
+    detail = '找不到订单号'
+    let rowCell = ''
+    if (await order.count()) {
+      await order.first().click()
+      detail = await appears(page.locator('#detail')) ? await page.locator('#detail').innerText() : '点开后没有出处面板'
+      rowCell = await page.locator('#detail td[data-cell="order_no"]').textContent().catch(() => '') ?? ''
+      await page.keyboard.press('Escape')
+    }
+    // 引用的值、快照里的值、快照第 1 行那一格都按 JSON 原文写：读成 double 的 202609071234567900 一处都不能有
+    check('formats：超过 2^53 的订单号核对通过，出处面板里的值（连同快照那一行）一位不差',
+      detail.includes('202609071234567890') && !detail.includes('202609071234567900')
+      && rowCell === '202609071234567890' && detail.includes('与按显示规则渲染的结果一致'),
+      `${detail.replace(/\s+/g, ' ').slice(0, 160)} | 那一行的格：${rowCell}`)
+  })
+  // 口径卡单位带尾随空白（「元 」）：服务端照原样接在数后面，正文是「74,613.65元 」，两边都只去首尾空白，原样导出照样
+  // 全部通过，不会被说成文件被改过
+  await sample('formats-unit', async (s, page) => {
+    check('formats-unit：口径卡单位带尾随空白时原样导出「全部通过」', s.overall === 'pass' && s.text === '全部通过'
+      && s.numberStates.pass === 19, `${s.overall}：${s.text}；${JSON.stringify(s.numberStates)}`)
+    const gmv = page.locator('button.num').filter({ hasText: /^74,613\.65元\s*$/ })
+    let detail = '找不到销售额'
+    if (await gmv.count()) {
+      await gmv.first().click()
+      detail = await appears(page.locator('#detail')) ? await page.locator('#detail').innerText() : '点开后没有出处面板'
+      await page.keyboard.press('Escape')
+    }
+    check('formats-unit：点开销售额，注明与按显示规则渲染的结果一致，不另列「按显示规则应为」',
+      detail.includes('与按显示规则渲染的结果一致') && !detail.includes('按显示规则应为'), detail.replace(/\s+/g, ' ').slice(0, 160))
   })
 
   // 不执行脚本（附件预览、快速查看）：封存哈希、运行 ID、工作流名照样看得到，状态写「尚未核对」，不是一直「正在核对」
@@ -804,6 +938,198 @@ await section('样本页：篡改', async () => {
     ...turnsRed('numbers', ['events', 'manifest', 'artifacts', 'chain', 'meta'])(s),
     ['报告徽标不通过', s.reports[0]?.result === 'fail' && s.reports[0].parts.includes('不通过 1'), JSON.stringify(s.reports[0])],
   ], { seal: true })
+  // 只改显示文字、引用值不动、重算全部哈希（验收里的 T4、T5）：经营月报上改文字取值、千分位加货币单位的数字、换算成万的
+  // 口径卡引用，各自只有那一项不通过。原因点名正文显示的字和引用的值，数字另写按显示规则应显示的字
+  const shownForgeries = [
+    ['文字取值的显示', 'v:Q1.r0.region', '华东', null],
+    ['数字的显示', 'm:gmv', '84,613.65元', '74,613.65元'],
+    ['换算成万的口径卡引用的显示', 'm:gmv|万', '8.46万元', '7.46万元'],
+  ]
+  for (const [label, ref, text, expected] of shownForgeries) {
+    await tamper(samples.formats, `${label}并重算全部哈希`, forgeShown(() => text, (seg) => seg.ref === ref), (s, forged) => {
+      const reason = s.items.find((i) => i.check === 'numbers' && i.result === 'fail')?.text ?? ''
+      return [
+        ...namesShown()(s, forged),
+        expected ? ['原因另写按显示规则应显示的字', reason.includes(`按显示规则应显示为「${expected}」`), reason]
+          : ['文字取值的原因不另写应显示的字', !reason.includes('按显示规则应显示为'), reason],
+      ]
+    }, { seal: true })
+  }
+  // 点开改过的那个数字：出处面板并排列出按显示规则应为的字和正文显示的字
+  {
+    const data = structuredClone(dataOf(samples.formats))
+    const forged = forgeShown(() => '8.46万元', (seg) => seg.ref === 'm:gmv|万')(data)
+    const opened = await openFile(writePage('tampered-shown-detail.html', withSeal(withData(samples.formats, data),
+      data.meta.manifest_hash)))
+    try {
+      await opened.page.locator(`button.num[data-num="${forged.node}|${forged.seg.id}"]`).click()
+      const detail = await appears(opened.page.locator('#detail')) ? await opened.page.locator('#detail').innerText() : ''
+      check('篡改换算成万的口径卡引用的显示：出处面板写明不通过，列出按显示规则应为「7.46万元」、正文显示「8.46万元」',
+        detail.includes('不通过') && /按显示规则应为\s*7\.46万元/.test(detail) && /正文显示\s*8\.46万元/.test(detail),
+        detail.replace(/\s+/g, ' ').slice(0, 200))
+    } finally {
+      await opened.ctx.close()
+    }
+  }
+  // 核对过的字不动、改它旁边的（经营月报，重算全部哈希）：读的人看到的数要就是核对过的那个
+  const buttonOf = (s, forged) => s.buttons.find((b) => b.key === `${forged.node}|${forged.seg.id}`)
+  // 伪造的链接把销售额塞进链接地址（链接只显示文字），链接文字写成 84,613.65元：这一句改按原文显示，核对过的字露出来
+  await tamper(samples.formats, '用链接地址藏起核对通过的数字', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's3').text += '[84,613.65元](x '
+    segById(doc, 's5').text = `)${segById(doc, 's5').text}`
+    return { what: '销售额塞进链接地址', seg: segById(doc, 's4') }
+  }), async (s, forged, page) => {
+    const btn = buttonOf(s, forged)
+    const sentence = await page.locator('.doc p').first().innerText()
+    return [
+      ['销售额照样显示成可点的数字，字一个不少', btn?.text === '74,613.65元' && btn.result === 'pass', JSON.stringify(btn)],
+      ['这一句按原文显示，伪造的链接写法露在外面', sentence.includes('[84,613.65元](x 74,613.65元)'), sentence.slice(0, 80)],
+    ]
+  }, { seal: true })
+  // 前面补一位数：读起来是 174,613.65元，绿色下划线只在 74,613.65元 下面
+  await tamper(samples.formats, '核对通过的数字前面补一位数', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's3').text += '1'
+    return { what: '本月销售额 174,613.65元', seg: segById(doc, 's4') }
+  }), (s, forged) => {
+    const btn = buttonOf(s, forged)
+    const item = s.items.find((i) => i.check === 'numbers' && i.result === 'na' && i.text.includes('紧挨着的正文里还有数字或负号'))
+    return [
+      ['销售额判无法核对，不再标通过', btn?.result === 'na', JSON.stringify(btn)],
+      ['⑤ 写明紧挨着的正文里还有数字或负号', !!item, item?.text ?? '没有这一项'],
+      ['总览不再是「全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过', `${s.overall}：${s.text}`],
+    ]
+  }, { seal: true })
+  // 一段改成分隔线：分隔线不显示句子，这一段里核对通过的数字读的人看不到，导出时不会出现
+  await tamper(samples.formats, '把一段改成分隔线', (data) => rewriteDoc(data, (doc) => {
+    doc.blocks[2].type = 'hr'
+    return { what: '第二段改成分隔线' }
+  }), (s) => [
+    ...turnsRed('numbers', ['events', 'manifest', 'artifacts', 'chain'])(s),
+    ['原因写明正文里没有显示这一处', hasItem(s, 'numbers', 'fail', '正文里没有显示这一处：导出时不会出现这种情况')],
+  ], { seal: true })
+  // 文字片段冒用销售额的 id：页面按片段本身找核对结果，冒用的文字显示不成可点的数字、借不到「通过」
+  await tamper(samples.formats, '文字片段冒用核对通过的数字的 id', (data) => rewriteDoc(data, (doc) => {
+    const gmv = segById(doc, 's4')
+    doc.blocks[2].units.at(-1).segments.push({ kind: 'text', id: gmv.id, text: '84,613.65元', state: 'neutral' })
+    return { what: '第二段末尾加一段冒用 id 的文字', seg: gmv }
+  }), (s, forged) => {
+    const same = s.buttons.filter((b) => b.key === `${forged.node}|${forged.seg.id}`)
+    return [
+      ['冒用 id 的文字不显示成可点的数字', same.length === 1 && same[0].text === '74,613.65元'
+        && !s.buttons.some((b) => b.text.includes('84,613.65')), JSON.stringify(same)],
+    ]
+  }, { seal: true })
+  // 紧挨着的字（经营月报，重算全部哈希）：隔着显示时不占位置的控制字符补一位数、长得像负号的连字符、叠在空格上的横线、
+  // 从右往左书写的字母把一位数挪到数字前面——读起来都不是核对过的那个数，判无法核对并写明原因。字一律按码点写，脚本
+  // 里不出现看不见、改变方向的字
+  const cp = (...points) => String.fromCodePoint(...points)
+  const naBecause = (why) => (s, forged) => {
+    const btn = buttonOf(s, forged)
+    const item = s.items.find((i) => i.check === 'numbers' && i.result === 'na' && i.text.includes(why))
+    return [
+      ['那个数字判无法核对，不再标通过', btn?.result === 'na', JSON.stringify(btn)],
+      [`⑤ 写明「${why}」`, !!item, item?.text ?? '没有这一项'],
+      ['总览不再是「全部通过」', s.overall === 'pass' && s.text === '可核对的项全部通过', `${s.overall}：${s.text}`],
+    ]
+  }
+  const GLUED = '紧挨着的正文里还有数字或负号'
+  await tamper(samples.formats, '隔着显示时不占位置的控制字符补一位数', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's3').text += `1${cp(0x7f)}`
+    return { what: '销售额前面补「1」和一个 DEL', seg: segById(doc, 's4') }
+  }), naBecause(GLUED), { seal: true })
+  await tamper(samples.formats, '前面加一个长得像负号的连字符', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's12').text += cp(0x2010)
+    return { what: '转化率前面加 U+2010', seg: segById(doc, 's13') }
+  }), naBecause(GLUED), { seal: true })
+  await tamper(samples.formats, '叠在空格上的横线', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's3').text += cp(0x336)
+    return { what: '销售额前面的空格上叠一道长横线（U+0336）', seg: segById(doc, 's4') }
+  }), naBecause('紧挨着的正文里有看不见或在不同设备上显示不同的字'), { seal: true })
+  // 希伯来字母：逻辑上在销售额后面的「5」显示在销售额紧前面（读作 574,613.65元）。先量一下页面上确实这样显示，
+  // 说明这种伪造能把数读错
+  await tamper(samples.formats, '从右往左书写的字母把一位数挪到数字前面', (data) => rewriteDoc(data, (doc) => {
+    segById(doc, 's3').text += cp(0x5d0)
+    segById(doc, 's5').text = `5${segById(doc, 's5').text}`
+    return { what: '销售额前面加一个希伯来字母、后面加「5」', seg: segById(doc, 's4') }
+  }), async (s, forged, page) => {
+    const gap = await page.evaluate((key) => {
+      const btn = document.querySelector(`button.num[data-num="${key}"]`)
+      const text = btn?.nextSibling?.firstChild
+      if (!btn || !text || text.nodeType !== 3 || !text.data.startsWith('5')) return null
+      const range = document.createRange()
+      range.setStart(text, 0)
+      range.setEnd(text, 1)
+      return Math.round(btn.getBoundingClientRect().left - range.getBoundingClientRect().right)
+    }, `${forged.node}|${forged.seg.id}`)
+    return [
+      ['页面上「5」显示在销售额紧前面', gap !== null && Math.abs(gap) <= 2, `间距 ${gap}px`],
+      ...naBecause('这一句里有从右往左书写的文字')(s, forged),
+    ]
+  }, { seal: true })
+  // 列表缩进写得极大或写成负数（服务端按原文的缩进算级数、没有上限）：最多缩进 8 级，列表里核对通过的数字都留在屏幕上、
+  // 照常通过，宽屏、窄屏都不横向溢出
+  for (const [label, depths] of [['列表缩进写成十万级', [100000, 3]], ['列表缩进写成负数', [-100000, -3]]]) {
+    const data = structuredClone(dataOf(samples.formats))
+    rewriteDoc(data, (doc) => {
+      const block = doc.blocks[2]
+      block.type = 'list'
+      block.units.forEach((unit, i) => {
+        unit.depth = depths[i]
+        if (i > 0) unit.segments.unshift({ kind: 'structural', id: `li${i}`, text: '\n- ' })
+      })
+      return { what: label }
+    })
+    for (const width of [1280, 390]) {
+      const opened = await openFile(writePage(`tampered-depth-${depths[0]}-${width}.html`,
+        withSeal(withData(samples.formats, data), data.meta.manifest_hash)), { width })
+      try {
+        const s = await stateOf(opened.page)
+        const boxes = await opened.page.evaluate(() => [...document.querySelectorAll('.doc li button.num')].map((b) => {
+          const r = b.getBoundingClientRect()
+          return [Math.round(r.left), Math.round(r.right)]
+        }))
+        check(`篡改${label}（${width} 宽）：列表里的数字都在屏幕上、照常通过，页面不横向溢出`,
+          boxes.length === 7 && boxes.every(([l, r]) => l >= 0 && r <= width) && s.overflow <= 0
+            && s.overall === 'pass' && s.text === '全部通过',
+          `${JSON.stringify(boxes)}；溢出 ${s.overflow}px；${s.overall}：${s.text}`)
+      } finally {
+        await opened.ctx.close()
+      }
+    }
+  }
+  // 表格里一格的列号写成十万：只排有格的列，那一格紧接着前一列显示，不会被几万个空列挤到表格右边，也不建几十万个空格
+  {
+    const data = structuredClone(dataOf(samples.base))
+    const done = rewriteDoc(data, (doc) => {
+      const table = doc.blocks.find((b) => b.type === 'table')
+      const unit = table?.units.find((u) => u.loc?.row === 0 && u.loc?.col === 1)
+      const seg = unit?.segments.find((x) => x.kind === 'number' || x.kind === 'value')
+      if (!seg) return null
+      unit.loc = { row: 0, col: 100000 }
+      return { what: '表格第一行第二格的列号改成 100000', seg }
+    })
+    if (!done) {
+      check('篡改表格的列号：样本页 base 里找不到表格第一行第二格的数字', false)
+    } else {
+      const opened = await openFile(writePage('tampered-table-col.html', withSeal(withData(samples.base, data),
+        data.meta.manifest_hash)))
+      try {
+        const got = await opened.page.evaluate((key) => {
+          const btn = document.querySelector(`button.num[data-num="${key}"]`)
+          const wrap = btn?.closest('.table-wrap')
+          if (!btn || !wrap) return null
+          const b = btn.getBoundingClientRect()
+          const w = wrap.getBoundingClientRect()
+          return { result: btn.dataset.result, visible: b.left >= w.left && b.right <= w.left + wrap.clientWidth,
+            cols: wrap.querySelectorAll('thead th').length, cells: wrap.querySelectorAll('td').length }
+        }, `${done.node}|${done.seg.id}`)
+        check('篡改表格的列号：那一格紧接着前一列显示、照常通过，表格只有 3 列',
+          got?.result === 'pass' && got.visible && got.cols === 3 && got.cells === 24, JSON.stringify(got))
+      } finally {
+        await opened.ctx.close()
+      }
+    }
+  }
 })
 
 // ---------------------------------------------------------------- 记录页的导出按钮

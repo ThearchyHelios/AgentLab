@@ -464,7 +464,7 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     rendered = pages()
     got = {name: json.loads(data_block(page)) for name, page in rendered.items()}
     assert set(got) == {"base", "two-reports", "legacy", "failed", "continued", "degraded", "missing-doc",
-                        "missing-card", "nan", "stray", "masked-card", "masked-source"}
+                        "missing-card", "nan", "stray", "masked-card", "masked-source", "formats", "formats-unit"}
     for name, bundle in got.items():
         assert browser_manifest(bundle["events"]) == bundle["meta"]["manifest_hash"], name
 
@@ -513,3 +513,6 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     nan = got["nan"]
     assert "NaN" in next(e["canonical"] for e in nan["events"] if e["type"] == "run.started")
     assert b"NaN" in base64.b64decode(next(a["b64"] for a in nan["artifacts"] if a.get("node_id") == "fetch"))
+    # 口径卡单位带尾随空白：服务端把「元 」原样接在数后面，正文里的销售额带着那个空白
+    shown = {s.get("ref"): s["text"] for s in segments(got["formats-unit"])}
+    assert shown["m:gmv"] == "74,613.65元 " and shown["m:gmv|万"] == "7.46万元 "
