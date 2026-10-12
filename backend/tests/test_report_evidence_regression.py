@@ -17,6 +17,7 @@ import asyncio
 import json
 import re
 import sqlite3
+from contextvars import ContextVar
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -131,10 +132,14 @@ class World:
         self.first_rows = {key: db.execute(sql_of(table, cols, 1)).fetchone() for _, _, key, _, table, cols in AGENTS}
         db.close()
         real = llm_mod.get_chat_model
+        # 这一次抽取要的额度跟着发起它的那个任务走（ContextVar）：几个 Agent 并行抽取，以前读共用列表的最后一项
+        # （budgets[-1]），别的 Agent 刚要的大额度会算到这一个头上，该截断重试的这次就成了一次过，测试偶发变红
+        asked: ContextVar[int | None] = ContextVar("extract_budget", default=None)
 
         async def spy(session, spec):
             if spec.thinking == "off":
                 self.budgets.append(spec.max_tokens)
+                asked.set(spec.max_tokens)
             return await real(session, spec)
 
         monkeypatch.setattr(llm_mod, "get_chat_model", spy)
@@ -152,8 +157,8 @@ class World:
         def decide(model, messages):
             if model.response_format:
                 key = who(messages)
-                world.extract_calls[key].append(world.budgets[-1])
-                outcome(key, len(world.extract_calls[key]), world.budgets[-1])
+                world.extract_calls[key].append(asked.get())
+                outcome(key, len(world.extract_calls[key]), asked.get())
                 return AIMessage(content=json.dumps(world.extracted(key), ensure_ascii=False))
             if any(isinstance(m, SystemMessage) and "报告撰写人" in str(m.content) for m in messages):
                 world.writer.append(list(messages))
