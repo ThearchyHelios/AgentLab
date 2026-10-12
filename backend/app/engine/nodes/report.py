@@ -324,12 +324,13 @@ class _MaskedCells:
     重写（evidence.masked_cells）。写作目录本身不遮（写作者要看得到数据），只拦引用。
 
     哪几列算按 api/evidence.py 的 _cited_masks 认：列名就是遮罩列的，SQL 里给遮罩列起了别名、套了函数、经子查询或 WITH
-    转一道的（_mask_sets 的 sure，和证据面板同一个函数），再按血缘去掉别的表里同名的列（设了 name, phone，门店名不算客户
-    姓名）；合并查询按逐格来历和合并 SQL 认。证据面板为了展示宁可多遮（SQL 认不准时整份的列都遮），自查不跟着多算：多算
-    一列就是一次判失败，写作者也改不掉。
+    转一道的（_mask_sets 的 sure，和证据面板同一个函数）；合并查询按逐格来历和合并 SQL 认。遮罩按列名在整个数据源上
+    生效，和证据面板一样：哪张表（含视图）里叫这个名字的列都算，设了 name 时门店名和客户姓名都算，违规说明点名取自哪张表
+    的哪一列。证据面板为了展示宁可多遮（SQL 认不准时整份的列都遮），自查不跟着多算：多算一列就是一次判失败，写作者也
+    改不掉。
 
-    只查引用，不按值在正文里找遮罩值：两个字的姓名会撞上「销售高峰」这类常用词，同名列的值会撞上门店名，正式运行因此判
-    失败（复核第 3 轮去掉了按值认）；正文里照抄的号码本来就会被「数字没有出处」拦下。
+    只查引用，不按值在正文里找遮罩值：两个字的姓名会撞上「销售高峰」这类常用词，正式运行因此判失败（复核第 3 轮去掉了
+    按值认）；正文里照抄的号码本来就会被「数字没有出处」拦下。
 
     组装好一稿之后才认：只读正文引用到的那几份快照（读盘复验哈希放进线程），每份只读一次，重写的稿子不再读；没引用格子的
     一份都不读。"""
@@ -821,7 +822,10 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
 
     async def judge_round(round_doc: dict[str, Any], limits: judging.Budget, known: dict[str, Any],
                           first: bool) -> dict[str, Any]:
-        request = judging.prepare(round_doc, catalog, masked=masks)
+        # 摘录里每份查询快照逐份遮，改了名字的遮罩列（c.phone AS tel）也不给，和按需裁判同一个函数（_judge_loader）
+        from app.api.evidence import _judge_loader
+
+        request = judging.prepare(round_doc, catalog, masked=masks, loader=await _judge_loader(round_doc, catalog))
         key = judging.request_key(request, judge_spec, limits, known)
         if _in_graph():
             # 写作不进 checkpoint，接着跑时写作者会重写一稿：缓存里先前那一稿的判定对不上指纹，往后翻

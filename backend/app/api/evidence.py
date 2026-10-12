@@ -31,13 +31,15 @@ options.mask_columns 里的列换成「已遮罩」，SQL 里给它们起了别�
 
 结论句的判定（四期）是模型给的，不是证据：正式运行的判定在报告文档里、随文档封存；探索运行
 按需裁判（POST …/evidence/judge），判定作为 evidence.judged 事件追加在封存之后，只填补没判过的
-句子。交给裁判的摘录同样只取封存范围内的工件。
+句子。交给裁判的摘录同样只取封存范围内的工件，每份查询快照里确定取自遮罩列的列不给（_judge_loader，报告撰写节点
+当场裁判同一个函数）。
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import csv
+import functools
 import io
 import logging
 import re
@@ -1474,9 +1476,10 @@ class _Masks:
 
 def _snapshot_secrets(snap: dict[str, Any], sets: _MaskSets) -> Any:
     """一份查询快照里确定取自遮罩列的值（masking._Secrets，一个都没有为 None）：只收 sets.sure 那几列（列名就是遮罩列的、
-    SQL 里认得出取自遮罩列的），只装着分档标签的格子不收，和核查 agent 在工具边界收值同一个口径（masking：整份遮的快照只收
-    确定的那几列）。SQL 认不准、整份遮的快照只遮显示：以前连它的区域名、金额一起收，之后每条 SQL 里的「'华东'」都显示成
-    「已遮罩」。证据面板（_Masks.run_secrets）、推演（api/whatif.py 的 _Hidden.secrets）都按它收。"""
+    SQL 里认得出取自遮罩列的，没起别名、按位置认得出的 SELECT UPPER(phone) 也算），只装着分档标签的格子不收，和核查 agent
+    在工具边界收值同一个口径（masking：认得清的照收，整份遮的快照只收确定的那几列）。SQL 认不准、整份遮的快照只遮显示：
+    以前连它的区域名、金额一起收，之后每条 SQL 里的「'华东'」都显示成「已遮罩」。证据面板（_Masks.run_secrets）、推演
+    （api/whatif.py 的 _Hidden.secrets）都按它收。"""
     from app.engine.masking import _Secrets
 
     secrets = _Secrets()
@@ -1612,9 +1615,10 @@ class _MaskSets:
     """一份查询快照的遮罩（_mask_sets）：
 
     - hidden：要遮的列（小写）。证据面板、推演、勾行按它遮，宁可多遮：SQL 认不准时整份的列都算
-    - sure：其中能确定取自遮罩列的：列名就是遮罩列的，SQL 里认得出取自遮罩列的（别名、函数、子查询、WITH）。SQL 认不准、
-      整份算进来的那几列不在里面，只装着分档标签的列（CASE 写死的字）也不在。收「这次运行查到过的遮罩值」只收这几列
-      （_snapshot_secrets）；报告自查从这几列起，再按血缘去掉别的表里同名的列（_cited_masks）
+    - sure：其中能确定取自遮罩列的：列名就是遮罩列的，SQL 里认得出取自遮罩列的（别名、函数、子查询、WITH，没起别名
+      却按位置认得出的表达式）。SQL 认不准、整份算进来的那几列不在里面，只装着分档标签的列（CASE 写死的字）也不在。
+      收「这次运行查到过的遮罩值」只收这几列（_snapshot_secrets），交给结论句裁判的摘录逐份遮这几列（_judge_loader），
+      报告自查从这几列起（_cited_masks，只排除血缘证明值取自普通表别的列的）
     - base：遮罩列本身（查询当时记下的加数据源现在设的，小写）
     - labels：只装着分档标签的列 → 标签的写法（masking._snapshot_labels），收遮罩值时不收标签
     - gone：已经不在的数据源
@@ -1655,12 +1659,15 @@ def _derived(snap: dict[str, Any], hidden: set[str], kind: str | None,
 
 def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
           tables: dict[str, list[str]] | None = None) -> tuple[set[str], dict[str, set[str]]]:
-    """(能确定取自遮罩列的结果列, 只装着分档标签的列)，都是小写，报告自查按前一项判违规（_MaskSets.sure）。
+    """(能确定取自遮罩列的结果列, 只装着分档标签的列)，都是小写（_MaskSets.sure）：收遮罩值、交给裁判的摘录、报告自查
+    都从前一项起。
 
-    按数据源自己的方言认（masking._derived_hidden，交回要遮的列和 SQL 里指代遮罩列的名字）：结果列名就是遮罩列、或者是
-    SQL 里指代遮罩列的名字（c.phone AS tel 的 tel、UPPER(phone) AS p 的 p）的算。认不准时那一套把整份的列都算上（派生
-    来源里没起别名的表达式、PIVOT、SQL 解析不了又写着遮罩列……）：要遮的列盖住了全部结果列、名字却对不上这么多的，只认
-    名字对上的那几列——展示上多遮无妨，自查多算就是判失败，写作者也改不掉（最大的一笔订单金额被说成取自手机号）。
+    按数据源自己的方言认（masking._derived_hidden，交回要遮的列和 SQL 里指代遮罩列的名字）：结果列名就是遮罩列、SQL 里
+    指代遮罩列的名字（c.phone AS tel 的 tel、UPPER(phone) AS p 的 p）、没起别名却按位置认得出取自遮罩列的
+    （SELECT UPPER(phone) FROM customers）都算。认不准时那一套把整份的列都算上（派生来源里没起别名的表达式、PIVOT、SQL
+    解析不了又写着遮罩列……）：这样整份算进来的（_whole），只认名字对上的那几列——展示上多遮无妨，这里多算，自查就判
+    失败、写作者也改不掉（最大的一笔订单金额被说成取自手机号），区域名、金额也被收成遮罩值。以前凡是要遮的列盖住了全部
+    结果列、名字又对不上的都当整份算，按位置认得出的那一列也丢了，一个值都收不到（复核第 4 轮）。
     只装着分档标签的列（CASE WHEN phone IS NULL THEN '未留' ELSE '已留' END）格子里是 SQL 写死的字，不算；只数个数的
     （COUNT(*) FILTER (WHERE phone IS NULL)、SUM(phone IS NULL)）先改写成那一套认得出的样子再认（_counted）。
     出了意外只认列名对上的。"""
@@ -1671,15 +1678,32 @@ def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
     try:
         from app.engine.masking import _derived_hidden, _snapshot_labels
 
-        found, names = _derived_hidden(_counted(snap, kind), set(base), kind, tables)
+        counted = _counted(snap, kind)
+        found, names = _derived_hidden(counted, set(base), kind, tables)
         found &= columns
         named = (names & columns) | direct
-        sure = named if columns <= found and not columns <= named else found | direct
+        whole = columns <= found and not columns <= named and _whole(counted, base, kind, tables)
+        sure = named if whole else found | direct
         labels = _snapshot_labels(snap, kind)
         return sure - {name for name in labels if name not in base}, labels
     except Exception:  # noqa: BLE001 - 认不准：只认列名对上的
         logger.warning("报告自查：按 SQL 认取自遮罩列的结果列时出错，只认列名对上的", exc_info=True)
         return direct, {}
+
+
+#: _whole 垫在结果列后面的一列：SQL 里的名字不会是它
+_PAD_COLUMN = "\x00pad"
+
+
+def _whole(snap: dict[str, Any], base: set[str], kind: str | None, tables: dict[str, list[str]] | None) -> bool:
+    """要遮的列盖住了全部结果列时，是认不准、整份算进来的，还是每一列都真认得出取自遮罩列（_sure）。masking 那一套
+    认不准时交回全部的列，和每一列都按位置认出来的样子一样，所以结果后面垫一列再认一遍：认得出的列按 SQL 里的位置算，
+    垫的那一列没有哪一项落得上；整份算的连它一起算进来。"""
+    from app.engine.masking import _derived_hidden
+
+    padded = [*(str(c) for c in snap.get("columns") or []), _PAD_COLUMN]
+    found, _ = _derived_hidden({**snap, "columns": padded}, set(base), kind, tables)
+    return {c.lower() for c in padded} <= found
 
 
 def _counted(snap: dict[str, Any], kind: str | None) -> dict[str, Any]:
@@ -1753,11 +1777,12 @@ async def _mask_sets(snap: dict[str, Any] | None, source: Any, masks: _Masks, *,
 async def _cited_masks(snap: dict[str, Any], source: Any, masks: _Masks,
                        artifact: str | None = None) -> dict[str, list[str]]:
     """报告自查（engine/nodes/report.py 的 _MaskedCells）认一份查询快照里引用了就记 masked_cell 的列：{结果列（小写）:
-    它取自的遮罩列}，违规说明点名后者。
+    它的出处}，违规说明点名出处（认得出表的写「表.列」，见 _owned_columns）。
 
     从 _mask_sets 的 sure 起（列名就是遮罩列的、SQL 里认得出取自遮罩列的；SQL 认不准、整份算进来的和只装着分档标签的
-    不在里面），普通查询再按血缘核一遍值取自哪张表的哪一列，只认取自遮罩表里那一列的（_owned_columns：stores.name 和设了
-    遮罩的 customers.name 同名不算）。合并查询的值来自它的各个输入、不是数据源里的表，照 sure 算。"""
+    不在里面）。遮罩按列名在整个数据源上生效，和证据面板一样：哪张表（含视图）里叫这个名字的列都算，门店名（stores.name）
+    和客户姓名（customers.name）同叫 name、都设了遮罩时两者都算。普通查询再按血缘点名出处（_owned_columns）；合并查询的值
+    来自它的各个输入、不是数据源里的表，照 sure 算。"""
     sets = await _mask_sets(snap, source, masks, artifact=artifact)
     if not sets.sure:
         return {}
@@ -1767,59 +1792,72 @@ async def _cited_masks(snap: dict[str, Any], source: Any, masks: _Masks,
 
 
 def _owned_columns(snap: dict[str, Any], sure: set[str], base: set[str], kind: str | None) -> dict[str, list[str]]:
-    """sure 里值确实取自遮罩表里那一列的结果列 → 它取自的遮罩列（按血缘里出现的先后）。报告自查按它判违规。
+    """sure 里每一列的出处：{结果列: 它取自的遮罩列}，认得出表的写「表.列」（stores.name、customer_spend.name），认不出的
+    写这份快照的全部遮罩列。报告自查按它判违规、写违规说明。
 
-    遮罩按列名设在整个数据源上（data/engine.py 的 masked_columns，不带表名）：设了 name，stores.name 和 customers.name 按
-    列名都算。证据面板、可验证报告、核查 agent 照这样遮（宁可多遮）；自查多算一列就是判失败，所以按 SQL 的血缘
-    （sqlglot.lineage，按查询当时冻结的表结构展开 *、认出不带表名的列出自哪张表）核一遍每一列的值取自哪张表的哪一列：
+    遮罩按列名设在整个数据源上（data/engine.py 的 masked_columns 只认列名，不带表名）：设了 name，stores.name、
+    customers.name、视图里的 name 都算，和证据面板、可验证报告的遮法一致。自查不推断「这项遮罩本意管哪张表」：第 3 轮
+    这样推断过（遮罩列在几张表里都有时只认另有别的遮罩列的那几张），视图、没有第二个遮罩列的表（employees.name）因此被
+    排除，正式运行照常成功、姓名写进了报告。SQL 血缘（sqlglot.lineage，按查询当时冻结的表结构展开 *、认出不带表名的列出自
+    哪张表）只用来：
 
-    - 遮罩列在几张表里都有、其中有的表里另有别的遮罩列（customers 有 name 和 phone，stores 只有 name）：只认那几张表
-      （_mask_owners）。别的情形（只在一张表里有、哪张都没有别的遮罩列）照列名认
-    - 血缘里有认不出出处的（找不到这一列、表值函数、不带表名又有歧义的列、* 展开不了）：排除不了，照算
-    - 认得出、可一处都不取自遮罩表里的遮罩列（门店名、SELECT region AS phone）：不算
-    - 快照里没有冻结的表结构（数据源没探查过）：认不出同名的列还在哪几张表里，照列名认；值根本不取自遮罩列的照样不算
+    - 点名出处：血缘的末端里叫遮罩列名字的列，按出现的先后写「表.列」，读的人看得出是哪一列被这项遮罩管到了
+    - 排除值确实不取自遮罩列的（SELECT region AS phone FROM stores）：每个末端都落在表结构里标明是普通表（is_view 为
+      false）的列上、没有一处叫遮罩列的名字，才排除
+    - 认不出出处的照算（_owned_masks）：血缘认不出的列（没起别名的表达式……）、表值函数、视图（看不出它的列取自哪张表）、
+      表结构里没有的表、没有冻结表结构的快照、表结构没标是不是视图的老快照
 
-    只排除、不新增：sure 里没有的列血缘认出来也不算。分析出了意外，照 sure 算。纯计算，在调用方的线程里算。"""
+    只排除、不新增：sure 里没有的列血缘认出来也不算。分析出了意外，照 sure 算（出处写全部遮罩列）。纯计算，在调用方的
+    线程里算。"""
     plain = {c: sorted(base) for c in sorted(sure)}
     sql = snap.get("sql")
     if not sure or not isinstance(sql, str) or not sql.strip():
         return plain
     try:
         from app.data.sql_semantics import _parse, _read
-        from app.engine.masking import _frozen_columns
 
         read = _read(kind)
         root, _ = _parse(sql, read)
         if root is None:
             return plain
-        frozen = _frozen_columns(snap["schema_artifact"]) if isinstance(snap.get("schema_artifact"), str) else None
-        # 表结构里一张表按好几个名字记着（带不带库名），这里只要不带库名的那一份
-        tables = {name: cols for name, cols in (frozen or {}).items() if "." not in name}
-        owners = _mask_owners(tables, base)
+        artifact = snap.get("schema_artifact")
+        tables, ordinary = _frozen_schema(artifact) if isinstance(artifact, str) else ({}, frozenset())
         schema = {name: {c: "TEXT" for c in cols} for name, cols in tables.items()} or None
         nodes = _lineages(root, schema, read, [str(c) for c in snap.get("columns") or [] if str(c).lower() in sure])
         out: dict[str, list[str]] = {}
         for column in sorted(sure):
-            found = _owned_masks(nodes.get(column), base, owners, set(tables))
+            found = _owned_masks(nodes.get(column), base, ordinary)
             if found:
                 out[column] = found
         return out
-    except Exception:  # noqa: BLE001 - 核对不了出自哪张表：照 sure 算
-        logger.warning("报告自查：按血缘核对遮罩列出自哪张表时出错，照列名认", exc_info=True)
+    except Exception:  # noqa: BLE001 - 核对不了出处：照 sure 算
+        logger.warning("报告自查：按血缘核对遮罩列的出处时出错，照列名认", exc_info=True)
         return plain
 
 
-def _mask_owners(tables: dict[str, list[str]], base: set[str]) -> dict[str, set[str]]:
-    """遮罩列 → 它的遮罩表（小写的表名），只记排除得掉一些表的：遮罩列在几张表里都有，其中有的表里另有别的遮罩列，
-    只认那几张（设了 name, phone，customers 有这两列，stores 只有 name：name 指的是客户姓名）。只在一张表里有、几张表
-    里都有可哪张都没有别的遮罩列的不记：照列名认，哪张表的都算。"""
-    out: dict[str, set[str]] = {}
-    for mask in base:
-        having = {t for t, cols in tables.items() if mask in cols}
-        paired = {t for t in having if any(c in base and c != mask for c in tables[t])}
-        if paired and paired != having:
-            out[mask] = paired
-    return out
+@functools.lru_cache(maxsize=64)
+def _frozen_schema(artifact: str) -> tuple[dict[str, list[str]], frozenset[str]]:
+    """表结构快照工件 → ({表名: 按次序的列名}, 标明是普通表的表名)，都是小写（_owned_columns）。
+
+    前一项只要不带库名的那份名字（表结构里一张表按好几个名字记着，masking._schema_keys），血缘按它展开 *、认不带表名的
+    列。后一项是 is_view 明写为 false 的表（带不带库名的名字都记）：视图的列看不出取自哪张表，没标的老快照看不出是表还是
+    视图；几个库里同名的表有一张不是普通表，这个名字就不算。取不到、被改过的两样都是空的。工件按内容寻址、不会变，记下来。"""
+    from app.engine.masking import _schema_columns, _schema_keys
+
+    try:
+        schema = load(artifact)
+    except Exception:  # noqa: BLE001 - 取不到就当没有冻结的表结构（出处认不出的照算）
+        return {}, frozenset()
+    entries = schema.get("tables") if isinstance(schema, dict) else None
+    if not isinstance(entries, dict):
+        return {}, frozenset()
+    columns = {name: cols for name, cols in (_schema_columns(schema) or {}).items() if "." not in name}
+    ordinary: dict[str, bool] = {}
+    for key, meta in entries.items():
+        if isinstance(meta, dict):
+            for name in _schema_keys(key, meta):
+                ordinary[name] = ordinary.get(name, True) and meta.get("is_view") is False
+    return columns, frozenset(name for name, yes in ordinary.items() if yes)
 
 
 def _lineages(root: Any, schema: dict[str, Any] | None, read: str | None, columns: list[str]) -> dict[str, Any]:
@@ -1843,10 +1881,12 @@ def _lineages(root: Any, schema: dict[str, Any] | None, read: str | None, column
     return out
 
 
-def _owned_masks(node: Any, base: set[str], owners: dict[str, set[str]], known: set[str]) -> list[str]:
-    """一个结果列的值取自哪几列遮罩列（按血缘里出现的先后），别的表里同名的列不算（owners，_mask_owners）。血缘认不出来
-    （node 为 None）、里面有认不出出处的（_leaf_of 交回 None），有取自遮罩列的就点名它们、没有就照全部遮罩列算：排除不了。
-    known 是冻结的表结构里有的表：不在里面的表认不出有没有别的遮罩列，照算。"""
+def _owned_masks(node: Any, base: set[str], ordinary: frozenset[str]) -> list[str]:
+    """一个结果列的出处：血缘的末端里叫遮罩列名字的列（哪张表、哪个视图的都算），按出现的先后写「表.列」。
+
+    一处都没有时：有认不出出处的末端——血缘认不出来（node 为 None）、_leaf_of 交回 None（表值函数、整张表的 *……）、落在
+    不是普通表（ordinary，_frozen_schema）的表上（视图、表结构里没有的表）——排除不了，写全部遮罩列（照算）；每个末端都落在
+    普通表的别的列上（region AS phone）的交回空：不算。"""
     if node is None:
         return sorted(base)
     found: list[str] = []
@@ -1861,10 +1901,12 @@ def _owned_masks(node: Any, base: set[str], owners: dict[str, set[str]], known: 
         if place is _NO_COLUMN:
             continue
         table, column = place
-        if column not in base or (column in owners and table in known and table not in owners[column]):
-            continue
-        if column not in found:
-            found.append(column)
+        if column in base:
+            if (named := f"{table}.{column}") not in found:
+                found.append(named)
+        elif table not in ordinary:
+            # 视图、表结构里没有的表：看不出这一列取自哪里，排除不了
+            unplaced = True
     return found or (sorted(base) if unplaced else [])
 
 
@@ -1873,8 +1915,9 @@ _NO_COLUMN = object()
 
 
 def _leaf_of(leaf: Any) -> Any:
-    """血缘的一个末端出自哪张表的哪一列：(表名, 列名)，都是小写；没有取任何列的（写死的值、COUNT(*)）交回 _NO_COLUMN；
-    认不出出处的（sqlglot 找不到来源、表值函数、整张表的 *、派生来源里的 *）交回 None。"""
+    """血缘的一个末端出自哪张表的哪一列：(表名, 列名)，都是小写，表名照 SQL 里写的带上库名（archive.sales）；没有取任何列
+    的（写死的值、COUNT(*)）交回 _NO_COLUMN；认不出出处的（sqlglot 找不到来源、表值函数、整张表的 *、派生来源里的 *）交回
+    None。"""
     from sqlglot import exp
 
     source = leaf.source
@@ -1885,7 +1928,8 @@ def _leaf_of(leaf: Any) -> Any:
             return None
         if not isinstance(column, exp.Column) or isinstance(column.this, exp.Star) or not column.name:
             return None
-        return source.name.lower(), column.name.lower()
+        table = ".".join(part for part in (source.catalog, source.db, source.name) if part)
+        return table.lower(), column.name.lower()
     if isinstance(source, (exp.Table, exp.Placeholder)) or leaf.expression is source:
         return None
     return _NO_COLUMN
@@ -3180,6 +3224,49 @@ def _sealed_loader(sealed: _Sealed, *, chain: bool = False) -> Callable[[str], A
     return loader
 
 
+async def _judge_loader(doc: dict[str, Any], catalog: dict[str, Any], units: list[str] | None = None,
+                        loader: Callable[[str], Any] | None = None) -> Callable[[str], Any]:
+    """交给结论句裁判的 loader（judge.prepare 的 loader）：摘录里的每份查询快照逐份遮，这份快照里确定取自遮罩列的列
+    （_mask_sets 的 sure，和证据面板同一套认法：c.phone AS tel 的 tel、按位置认得出的 UPPER(phone)）也不给。
+
+    裁判自己只按列名遮（快照记下的 mask_columns 加数据源现在设的，judge._hidden）：改了名字的号码列照样进摘录，裁判理由
+    一引用就在证据面板、审计 CSV 里露出来。这里把那几列并进交给裁判的这一份快照的 mask_columns（只是交给 prepare 的
+    副本，工件本身不动），裁判照它自己的办法遮掉。只并这份快照自己的：不按数据源名合并（另一份快照里同名、却取自别的列
+    的照给），不用证据面板宁可多遮的 hidden（整份遮的快照、只数个数的列照给，被引用的金额、人数裁判要看得到才判得了）。
+    这样摘录变了的句子复用键随之变，此前判过的会重判一次。
+
+    只读要裁判的句子（units，None 是全部结论句，judge.candidates）挂的查询；读出来的快照另记一份交给 prepare 再取，
+    不读第二遍。loader 缺省读工件库；按需裁判传只认封存工件的那个（_sealed_loader）。报告撰写节点当场裁判
+    （engine/nodes/report.py）用同一个函数。"""
+    from app.engine.evidence import _mask_names
+    from app.engine.judge import candidates
+
+    read = loader or load
+    masks = _Masks()
+    shown: dict[str, Any] = {}
+    for alias in dict.fromkeys(a for c in candidates(doc, units) for a in c.aliases):
+        entry = catalog.get(alias)
+        if not isinstance(entry, dict) or entry.get("kind") != "query" or not entry.get("artifact"):
+            continue
+        artifact = str(entry["artifact"])
+        if artifact in shown:
+            continue
+        try:
+            snap = read(artifact)
+        except Exception:  # noqa: BLE001 - 读不出来、不在封存范围里：摘录本来就不给它，交给 prepare 照它的办法处理
+            continue
+        if not isinstance(snap, dict):
+            continue
+        recorded = _mask_names(snap.get("mask_columns"))
+        sure = set((await masks.sets(artifact, entry.get("source") or snap.get("source"), snap)).sure)
+        shown[artifact] = {**snap, "mask_columns": sorted(recorded | sure)} if sure - recorded else snap
+
+    def reader(artifact: str) -> Any:
+        key = str(artifact)
+        return shown[key] if key in shown else read(key)
+    return reader
+
+
 def _chain_set(sealed: _Sealed) -> set[str]:
     """封存范围内每份表结构快照经哈希链列出的清单 id 的并集。表结构快照取不回、哈希不符的跳过（不在链上）。"""
     out: set[str] = set()
@@ -3304,7 +3391,8 @@ async def _judge_now(sealed: _Sealed, report: _Report, units: list[str]) -> dict
         # 带期 4 标记的文档才让裁判取得到哈希链上的清单（摘录的来历行要用）；老文档的 loader 和以前完全相同
         loader = _sealed_loader(sealed, chain=doc.get("provenance") == DOC_PROVENANCE)
         masked = await judging.source_masks(catalog, loader=loader)
-        request = judging.prepare(doc, catalog, units=pending, loader=loader, masked=masked)
+        request = judging.prepare(doc, catalog, units=pending, masked=masked,
+                                  loader=await _judge_loader(doc, catalog, pending, loader))
         skipped = dict(request.skipped)
         if request.cands:
             async with SessionLocal() as session:

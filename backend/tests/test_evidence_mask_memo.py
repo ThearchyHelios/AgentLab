@@ -113,6 +113,23 @@ async def test_values_of_a_snapshot_masked_whole_are_not_collected(engine_up, ma
     assert shown.text(sql) == sql.replace(PHONES[0], "已遮罩") and shown.changed, shown.text(sql)
 
 
+@pytest.mark.parametrize("sql, column", [
+    ("SELECT UPPER(phone) FROM customers", "UPPER(phone)"),
+    ("SELECT TRIM(c.phone) FROM customers c ORDER BY c.id", "TRIM(c.phone)"),
+])
+async def test_values_of_an_unaliased_expression_over_every_column_are_collected(engine_up, mall, sql, column):
+    """复核第 4 轮：没起别名、表达式盖住全部结果列，SQL 认得出这一列取自遮罩列（按位置），不是认不准、整份算进来的：
+    算确定取自遮罩列（sure），值照收，之后别的查询步骤里写着的号码显示成「已遮罩」（第 3 轮一个值都收不到，号码原样显示）。"""
+    from app.api.evidence import _Masks, _Shown, _mask_sets
+
+    art = await put(sql, [column], [[p] for p in PHONES])
+    sets = await _mask_sets(artifact_store.load(art), "mall", _Masks(), artifact=art)
+    assert sets.sure == {column.lower()}, (sets.sure, sets.hidden)
+    secrets = await _Masks(sealed_of(art)).run_secrets()
+    probe = f"SELECT SUM(amount) FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.phone = '{PHONES[1]}'"
+    assert _Shown(secrets).text(probe) == probe.replace(PHONES[1], "已遮罩")
+
+
 # --------------------------------------------------------------------------
 # 按快照工件在进程里记下
 # --------------------------------------------------------------------------

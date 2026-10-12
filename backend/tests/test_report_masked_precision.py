@@ -184,10 +184,11 @@ async def test_the_sure_columns_follow_the_dialect_of_the_source(engine_up):
 
 
 async def test_a_failure_points_at_the_instructions_not_at_the_model(monkeypatch, mall):
-    """遮罩列多半是写作指令点名要的：判失败时只说去掉指令里的引用，不建议换模型、不建议先改成标注。说明点名取自哪一列。"""
+    """遮罩列多半是写作指令点名要的：判失败时只说去掉指令里的引用，不建议换模型、不建议先改成标注。说明点名取自哪张表
+    的哪一列（数据源没探查过表结构，SQL 里写着 c.phone、c 是 customers）。"""
     row = await finish(monkeypatch, graph(SQL_TOP, on_violation="fail"), "联系电话 [[v:Q1.r0.tel]]。")
     assert row.status == "failed", row.error
-    assert "指令中去掉对这些列的引用" in row.error and "按 SQL 认出取自设置了遮罩的列「phone」" in row.error, row.error
+    assert "指令中去掉对这些列的引用" in row.error and "按 SQL 认出取自 customers.phone" in row.error, row.error
     assert "指令遵循能力" not in row.error and "标注" not in row.error and leaks(row.error) == []
 
 

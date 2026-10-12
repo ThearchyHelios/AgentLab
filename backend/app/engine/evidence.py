@@ -3131,26 +3131,40 @@ def absence_claims(doc: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _masked_cell_message(ref: str, column: str, sources: list[str]) -> _Reason:
-    """违规 masked_cell 的说法：列名就是遮罩列的说「在数据源中设置了遮罩」，按 SQL 认出来的点名它取自的那几列遮罩列（sources，
-    按血缘认出来的；认不出时是这份快照的全部遮罩列）——遮罩按列名设在整个数据源上，读的人要看得出是哪一项遮罩设置管到了
-    这里。给写作者的那句说清这一列的值不能以任何写法写进报告：只说「删掉引用」，写作者会把值照抄成文字。"""
-    own = column.lower() in {s.lower() for s in sources} or not sources
-    where = (f"列「{column}」在数据源中设置了遮罩" if own
-             else f"列「{column}」按 SQL 认出取自设置了遮罩的列「{'、'.join(sources[:3])}」")
+    """违规 masked_cell 的说法，点名这一格的出处（sources）：
+
+    - 认得出表的写「表.列」（api/evidence.py 的 _owned_columns 按血缘认出来的）：照实写取自哪张表的哪一列、数据源对哪个
+      列名设了遮罩，并说明遮罩按列名对所有表生效——设了 name，门店名（stores.name）和客户姓名一样算，读的人要看得出是
+      哪一项遮罩设置管到了这里（遮罩设置只认列名，没有按表写的办法，这里不教人去改设置）
+    - 认不出表的（没有血缘、合并查询）：列名就是遮罩列的说「在数据源中设置了遮罩」，别的点名这份快照的遮罩列
+
+    给写作者的那句说清这一列的值不能以任何写法写进报告：只说「删掉引用」，写作者会把值照抄成文字。"""
+    tabled = [s for s in sources if "." in s]
+    masks = list(dict.fromkeys(s.rsplit(".", 1)[-1] for s in sources))
+    renamed = column.lower() not in {m.lower() for m in masks}
+    if tabled:
+        named = "、".join(f"「{m}」" for m in masks[:3])
+        where = (f"列「{column}」{'按 SQL 认出' if renamed else ''}取自 {'、'.join(tabled[:3])}，"
+                 f"数据源对列名{named}设置了遮罩（按列名对所有表生效）")
+    elif sources and renamed:
+        where = f"列「{column}」按 SQL 认出取自设置了遮罩的列「{'、'.join(masks[:3])}」"
+    else:
+        where = f"列「{column}」在数据源中设置了遮罩"
     return _Reason(
         f"引用了取自遮罩列的格子 [[{ref}]]：{where}，值不应写进报告",
-        f"[[{ref}]] 引用的{where}（手机号、姓名这类），这一列的值不能以任何形式写进报告，引用、数字、照抄的文字都不行："
-        "删掉这处引用和相应的内容；整表引用时用 cols= 只列别的列",
+        f"[[{ref}]] 引用的{where}。设置了遮罩的列（手机号、姓名这类）的值不能以任何形式写进报告，引用、数字、照抄的文字"
+        "都不行：删掉这处引用和相应的内容；整表引用时用 cols= 只列别的列",
     )
 
 
 def masked_cells(doc: dict[str, Any], catalog: dict[str, Any], masked: dict[str, Any] | None) -> list[dict[str, Any]]:
     """正文直接引用了取自遮罩列的格子（[[v:Q2.r0.tel]]，整表展开出来的格也算），每格一条违规 masked_cell。
 
-    masked 是 {查询快照工件: 取自遮罩列的结果列}，结果列可以是列名的集合，也可以是 {列名: 它取自的遮罩列}（说法里点名）。
-    由报告节点算好交进来（api/evidence.py 的 _cited_masks：列名就是遮罩列的、SQL 里给遮罩列起了别名套了函数的，按血缘
-    去掉别的表里同名的列；SQL 认不准、整份算进来的不在里面）：遮罩设在数据源上，这里只认文档和目录，查不了库。写作目录
-    不遮罩（写作者要看得到数据），所以拦在自查：和没有出处的数字一样交回写作者重写，仍不改的按「违规处置」办（report.py）。
+    masked 是 {查询快照工件: 取自遮罩列的结果列}，结果列可以是列名的集合，也可以是 {列名: 它的出处}（说法里点名，认得出
+    表的写「表.列」）。由报告节点算好交进来（api/evidence.py 的 _cited_masks：列名就是遮罩列的、SQL 里给遮罩列起了别名
+    套了函数的，哪张表里叫这个名字的列都算；SQL 认不准、整份算进来的不在里面）：遮罩设在数据源上，这里只认文档和目录，
+    查不了库。写作目录不遮罩（写作者要看得到数据），所以拦在自查：和没有出处的数字一样交回写作者重写，仍不改的按
+    「违规处置」办（report.py）。
     只认引用，不按值在正文里找遮罩值（两个字的姓名会撞上常用词）：照抄成正文的号码由数字核对拦下。
 
     违规不带那一格的值（不写 text、context）：它会进 report.checked、重写的日志、出具缺口，这些地方不能再露一次。带着
