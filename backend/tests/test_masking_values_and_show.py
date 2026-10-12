@@ -8,6 +8,15 @@
   （ENGINE INNODB STATUS、BINLOG / RELAYLOG EVENTS、REPLICA STATUS、WARNINGS、CREATE TABLE / VIEW……）和 EXPLAIN 一条
   语句。以前工具边界的名单里没有，可验证报告那份整个挡 information_schema、不附带解析不了的快照，反而挡得住
 
+复核第 3 轮补的同一类：
+- VALUES 当一张表用（FROM、JOIN、LATERAL 里的，WITH 里的一段，UNION 的一支）又读到遮罩列（含派生出来的名字）：各库给
+  VALUES 的列起名不一样（Postgres、SQLite 叫 column1…，MySQL 8.0 叫 column_0…，MariaDB 拿第一行的值当列名），以前一律
+  按 column1… 认，MySQL 派生表、CTE、LATERAL 里的 VALUES ROW 取了号码，原样交给模型、落库；套了括号的 VALUES（整条
+  就是它、UNION 的一支）解析器原样挂在树上，哪个库都漏。现在不论怎么起名都整份遮；列名按方言认，整份遮时只收值取自
+  遮罩列的那几列的值
+- MySQL sys 库里读 performance_schema 的函数（sys.ps_thread_trx_info 交回线程的事务里执行过的语句原文，ps_thread_stack
+  同类）：按 sys.ps_ 开头认，工具边界和可验证报告共用一份名单
+
 这里没有真的数据库：结果按它交回的样子造（复合类型展开成几列、SHOW 交回的几列，照 Postgres 18、MySQL 8.0 实测的样子）。
 数据都是虚构的：手机号、地址、区域。
 """
@@ -93,21 +102,19 @@ def test_an_expression_star_inside_values_masks_the_whole_result(sql, columns, r
     assert done.payload["rows"] == [[MASKED_WORD] * len(columns)] and not _leaks(done)
 
 
-@pytest.mark.parametrize("sql, columns, row, hidden", [
+@pytest.mark.parametrize("sql, columns, row", [
     pytest.param("SELECT v.* FROM people p, LATERAL (VALUES ((p.address).*)) v", ["column1", "column2"],
-                 ["某路", "某市"], [], id="没设遮罩的复合类型"),
-    pytest.param("SELECT v.column1 AS r FROM sales s, LATERAL (VALUES (s.region)) v", ["r"], ["华东"], [],
+                 ["某路", "某市"], id="没设遮罩的复合类型"),
+    pytest.param("SELECT v.column1 AS r FROM sales s, LATERAL (VALUES (s.region)) v", ["r"], ["华东"],
                  id="没碰遮罩列的 VALUES"),
-    pytest.param("SELECT v.column1 AS p FROM sales s, LATERAL (VALUES (s.buyer_phone)) v", ["p"], [PHONE], ["p"],
-                 id="VALUES 里直接写遮罩列"),
     pytest.param("SELECT v.column2 AS r FROM (SELECT id, region FROM sales) q, LATERAL (VALUES (q.*)) v", ["r"],
-                 ["华东"], [], id="没取遮罩列的子查询的 *"),
+                 ["华东"], id="没取遮罩列的子查询的 *"),
 ])
-def test_values_without_an_expression_star_on_a_masked_column_is_read_as_before(sql, columns, row, hidden):
-    """VALUES 里没有读到遮罩列的 (表达式).*：照旧按列认，没碰遮罩列的照常，直接写遮罩列的只遮那一列。"""
+def test_values_that_reads_no_masked_column_is_read_as_before(sql, columns, row):
+    """VALUES 没读到遮罩列（没设遮罩的复合类型、没碰遮罩列的列、没取遮罩列的子查询的 *）：照常，一列都不遮。读到遮罩列的
+    （直接写遮罩列的也算）当一张表用就整份遮，见下一节。"""
     done = masked(sql, columns, [list(row)])
-    assert not done.whole and done.columns == hidden
-    assert done.payload["rows"] == [[MASKED_WORD if c in hidden else v for c, v in zip(columns, row)]]
+    assert not done.whole and done.columns == [] and done.payload["rows"] == [list(row)]
 
 
 def test_an_expression_star_inside_a_function_argument_masks_the_whole_result_too():
@@ -115,6 +122,142 @@ def test_an_expression_star_inside_a_function_argument_masks_the_whole_result_to
     done = masked("SELECT p.id AS n, row_to_json(ROW((p.card).*)) AS j FROM people3 p", ["n", "j"],
                   [[1, json.dumps({"f1": "某路 1 号", "f2": PHONE})]])
     assert done.whole and done.payload["rows"] == [[MASKED_WORD, MASKED_WORD]] and not _leaks(done)
+
+
+# --------------------------------------------------------------------------
+# VALUES 当一张表用（复核第 3 轮）
+# --------------------------------------------------------------------------
+
+
+#: VALUES 当一张表用、读到遮罩列：(方言, SQL, 结果列, 各行)，号码在最后一列。MySQL 8.0 给 VALUES 的列起名 column_0、
+#: column_1…（从 0 数起），MariaDB 拿第一行的值当列名；以前一律按 column1… 认，MySQL、MariaDB 的这几种号码原样交了出去
+VALUES_TABLES = [
+    pytest.param("mysql", "SELECT * FROM (VALUES ROW((SELECT buyer_phone FROM sales LIMIT 1))) AS v", ["column_0"],
+                 [[PHONE]], id="MySQL-派生表"),
+    pytest.param("mysql", "SELECT x.column_0 FROM sales s, LATERAL (VALUES ROW(s.buyer_phone)) AS x", ["column_0"],
+                 [[PHONE]], id="MySQL-LATERAL"),
+    pytest.param("mysql", "WITH v AS (VALUES ROW((SELECT buyer_phone FROM sales LIMIT 1))) SELECT * FROM v",
+                 ["column_0"], [[PHONE]], id="MySQL-CTE"),
+    pytest.param("mysql", "SELECT v.column_0 AS c FROM (VALUES ROW((SELECT buyer_phone FROM sales WHERE id = 1)), "
+                 "ROW((SELECT buyer_phone FROM sales WHERE id = 2))) AS v", ["c"], [[PHONE], ["13900000002"]],
+                 id="MySQL-外层改了名字"),
+    pytest.param("mysql", "SELECT s.id, t.column_1 FROM sales s JOIN LATERAL (VALUES ROW(s.region, s.buyer_phone)) "
+                 "AS t ON TRUE", ["id", "column_1"], [[1, PHONE]], id="MySQL-JOIN LATERAL 连同编号"),
+    pytest.param("mysql", "SELECT w.* FROM sales s, LATERAL (SELECT * FROM (VALUES ROW(s.buyer_phone)) v) AS w",
+                 ["column_0"], [[PHONE]], id="MySQL-LATERAL 子查询里的 VALUES"),
+    pytest.param("mysql", "SELECT (SELECT column_0 FROM (VALUES ROW((SELECT buyer_phone FROM sales LIMIT 1))) v) AS p",
+                 ["p"], [[PHONE]], id="MySQL-标量子查询里的 VALUES"),
+    pytest.param("mysql", "WITH q AS (SELECT buyer_phone AS p FROM sales) "
+                 "SELECT v.column_0 FROM q, LATERAL (VALUES ROW(q.p)) AS v", ["column_0"], [[PHONE]],
+                 id="MySQL-取派生出来的名字"),
+    pytest.param("mysql", "VALUES ROW((SELECT buyer_phone FROM sales LIMIT 1)) UNION ALL SELECT region FROM sales",
+                 ["column_0"], [[PHONE], ["华东"]], id="MySQL-UNION 第一支"),
+    # 套了括号的 VALUES 解析器不改写成 FROM 里的 VALUES：整条就是它、UNION 的一支都原样挂在树上，以前不认，Postgres
+    # 里也漏
+    pytest.param("mysql", "(VALUES ROW((SELECT buyer_phone FROM sales LIMIT 1)))", ["column_0"], [[PHONE]],
+                 id="MySQL-整条套括号"),
+    pytest.param("postgresql", "(VALUES ((SELECT buyer_phone FROM sales LIMIT 1))) UNION ALL "
+                 "(SELECT region FROM sales)", ["column1"], [[PHONE], ["华东"]], id="Postgres-UNION 第一支套括号"),
+    pytest.param("mysql", "SELECT * FROM ((VALUES ROW((SELECT buyer_phone FROM sales LIMIT 1))) UNION ALL "
+                 "(SELECT 'a')) t", ["column_0"], [[PHONE], ["a"]], id="MySQL-派生表里 UNION 的一支"),
+    pytest.param("mariadb", "SELECT * FROM (VALUES ((SELECT buyer_phone FROM sales LIMIT 1))) AS v",
+                 ["(SELECT buyer_phone FROM sales LIMIT 1)"], [[PHONE]], id="MariaDB-派生表"),
+    pytest.param("mariadb", "SELECT * FROM (VALUES ('华东'), ((SELECT buyer_phone FROM sales LIMIT 1))) AS v",
+                 ["华东"], [["华东"], [PHONE]], id="MariaDB-第一行的值当列名"),
+    pytest.param("postgresql", "SELECT v.column1 AS p FROM sales s, LATERAL (VALUES (s.buyer_phone)) v", ["p"],
+                 [[PHONE]], id="Postgres-LATERAL"),
+    pytest.param("postgresql", "SELECT s.id, v.k, v.val FROM sales s CROSS JOIN LATERAL (VALUES ('phone', "
+                 "s.buyer_phone), ('region', s.region)) AS v(k, val)", ["id", "k", "val"],
+                 [[1, "phone", PHONE], [1, "region", "华东"]], id="Postgres-行转列"),
+    pytest.param("sqlite", "WITH v AS (VALUES ((SELECT buyer_phone FROM sales LIMIT 1))) SELECT * FROM v",
+                 ["column1"], [[PHONE]], id="SQLite-CTE"),
+]
+
+
+@pytest.mark.parametrize("kind, sql, columns, rows", VALUES_TABLES)
+def test_a_values_table_on_a_masked_column_masks_the_whole_result(kind, sql, columns, rows):
+    """VALUES 当一张表用、读到遮罩列（含派生出来的名字）：不论各库给它的列起什么名字，整份结果的每一格都遮，同一份里
+    没碰遮罩列的编号、区域也遮（多遮）。以前 MySQL、MariaDB 的这几种和套了括号的 VALUES masked=[]，号码原样交给模型、
+    落库；Postgres、SQLite 的按列名认得出，只遮了那几列。"""
+    done = masked(sql, columns, [list(r) for r in rows], kind=kind)
+    assert done.whole and done.columns == columns
+    assert done.payload["rows"] == [[MASKED_WORD] * len(columns)] * len(rows) and not _leaks(done)
+
+
+@pytest.mark.parametrize("kind, sql, columns, row", [
+    pytest.param("mysql", "SELECT x.column_0 AS r FROM sales s, LATERAL (VALUES ROW(s.region)) AS x", ["r"], ["华东"],
+                 id="MySQL-没碰遮罩列"),
+    pytest.param("mysql", "SELECT s.region, b.column_1 AS 档 FROM sales s JOIN (VALUES ROW(0, '小单'), "
+                 "ROW(20000, '大单')) AS b ON s.amount >= b.column_0", ["region", "档"], ["华东", "大单"],
+                 id="MySQL-写死的分档表"),
+    pytest.param("mysql", "SELECT region FROM sales UNION ALL VALUES ROW('其他')", ["region"], ["其他"],
+                 id="MySQL-UNION 一支写死的值"),
+])
+def test_a_values_table_reading_no_masked_column_stays_visible(kind, sql, columns, row):
+    """VALUES 当一张表用、却没读到遮罩列（写死的分档表、没碰遮罩列的 LATERAL、UNION 里写死的一支）：照常。"""
+    done = masked(sql, columns, [list(row)], kind=kind)
+    assert not done.whole and done.columns == [] and done.payload["rows"] == [list(row)]
+
+
+@pytest.mark.parametrize("kind, sql", [
+    # 号码在 ROW(…) 的第二项：MySQL 的一行解析成一个元组里套着一个 ROW 函数，要摊开数位置
+    pytest.param("mysql", "SELECT x.column_1 AS p, x.column_0 AS r FROM sales s, "
+                 "LATERAL (VALUES ROW(s.region, s.buyer_phone)) AS x", id="MySQL"),
+    pytest.param("postgresql", "SELECT v.column1 AS p, v.column2 AS r FROM sales s, "
+                 "LATERAL (VALUES (s.buyer_phone, s.region)) v", id="Postgres"),
+    pytest.param("postgresql", "SELECT v.a AS p, v.b AS r FROM sales s, LATERAL (VALUES (s.buyer_phone, s.region)) "
+                 "v(a, b)", id="Postgres-列名表"),
+    pytest.param("sqlite", "WITH v AS (VALUES ((SELECT buyer_phone FROM sales LIMIT 1), '华东')) "
+                 "SELECT column1 AS p, column2 AS r FROM v", id="SQLite-CTE"),
+])
+def test_only_the_values_columns_taken_from_a_masked_column_are_collected(kind, sql):
+    """VALUES 的列名按方言认（MySQL 叫 column_0…，Postgres、SQLite 叫 column1…，写了列名表的按列名表）：整份遮时只收值
+    取自遮罩列的那几列的值当遮罩值，后面的查询、回答里同一个号码照样按值换掉；同一行里的区域不收。以前 MySQL 按 column1
+    认，号码一个都没收；Postgres、SQLite 把 VALUES 出的每一列都收了，区域名在同一次核查里处处被换掉。"""
+    done = masked(sql, ["p", "r"], [[PHONE, "华东"]], kind=kind)
+    assert done.whole and done.payload["rows"] == [[MASKED_WORD, MASKED_WORD]]
+    assert PHONE in done.secrets.strong and "华东" not in done.secrets.strong
+
+
+def test_items_after_an_expanding_star_in_a_values_row_are_not_collected_by_place():
+    """一行里的 (表达式).* 展开成几列说不清：排在它后面的号码实际落在第三列，按位置数成第二列就收了没设遮罩的城市。
+    整份照遮，这一行不按位置收值（少收不露：这份结果的值本来就没交给模型）。"""
+    done = masked("SELECT v.column2 AS c, v.column3 AS p FROM people p, sales s, "
+                  "LATERAL (VALUES ((p.address).*, s.buyer_phone)) v", ["c", "p"], [["某市", PHONE]])
+    assert done.whole and done.payload["rows"] == [[MASKED_WORD, MASKED_WORD]]
+    assert "某市" not in done.secrets.strong
+
+
+@pytest.mark.parametrize("kind, sql, named, unnamed", [
+    pytest.param("mysql", "SELECT * FROM sales s, LATERAL (VALUES ROW(s.id, s.region)) AS x", {"column_0", "column_1"},
+                 {"column1", "column2"}, id="MySQL"),
+    pytest.param("postgresql", "SELECT * FROM sales s, LATERAL (VALUES (s.id, s.region)) AS x", {"column1", "column2"},
+                 {"column_0"}, id="Postgres"),
+    pytest.param("sqlite", "SELECT * FROM (VALUES (1, '华东')) AS x", {"column1", "column2"}, {"column_0"},
+                 id="SQLite"),
+    # 列名表只改前几列的名字：第一列叫 n，不再叫 column1（Postgres 里按 column1 取会报错）
+    pytest.param("postgresql", "SELECT * FROM (VALUES (1, '华东')) AS x(n)", {"n", "column2"}, {"column1"},
+                 id="Postgres-列名表只写前几列"),
+])
+def test_values_columns_are_named_the_way_each_database_names_them(kind, sql, named, unnamed):
+    """表值函数这类来源出的列名（_function_columns）里，VALUES 的列按方言起名：别处按列名认来源出不出某一列时对得上。"""
+    from app.data.sql_semantics import _parse, _read
+
+    root, _ = _parse(sql, _read(kind))
+    columns = masking._function_columns(masking._function_sources(root)[-1], kind)
+    assert named <= columns and not unnamed & columns
+
+
+@pytest.mark.parametrize("kind, sql", [
+    pytest.param("mariadb", "SELECT * FROM (VALUES (1, '华东')) AS x", id="MariaDB 拿第一行的值当列名"),
+    pytest.param("oracle", "SELECT * FROM (VALUES (1, '华东')) x", id="Oracle 没写列名表"),
+])
+def test_values_columns_that_cannot_be_named_are_unknown(kind, sql):
+    """VALUES 的列名认不准（MariaDB 拿第一行的值当列名，Oracle 的文档只有写了列名表的写法）又没写列名表：说不清出哪几列。"""
+    from app.data.sql_semantics import _parse, _read
+
+    root, _ = _parse(sql, _read(kind))
+    assert masking._function_columns(masking._function_sources(root)[-1], kind) is None
 
 
 # --------------------------------------------------------------------------
@@ -178,6 +321,20 @@ async def test_values_expansions_never_reach_the_model_or_the_store(monkeypatch,
     assert "1390000000" not in json.dumps(snapshot, ensure_ascii=False) and "1390000000" not in api
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM (VALUES ROW((SELECT buyer_phone FROM sales LIMIT 1))) AS v",
+    "SELECT x.column_0 FROM sales s, LATERAL (VALUES ROW(s.buyer_phone)) AS x",
+    "WITH v AS (VALUES ROW((SELECT buyer_phone FROM sales LIMIT 1))) SELECT * FROM v",
+], ids=["派生表", "LATERAL", "CTE"])
+async def test_mysql_values_tables_never_reach_the_model_or_the_store(monkeypatch, fake_source, sql):
+    """端到端（MySQL，VALUES 的列叫 column_0）：交给模型的、落库的、通用工件接口给的都只有「已遮罩」，masked_at_query
+    是全部的列，快照记着整份遮。以前 masked_at_query 是空的，号码原样交出。"""
+    seen, snapshot, api = await _asked(monkeypatch, fake_source, "mysql", sql, ["column_0"], [[PHONE], ["13900000002"]])
+    assert MASKED_WORD in seen and "1390000000" not in seen, seen
+    assert snapshot["masked_at_query"] == ["column_0"] and snapshot["masked_whole"] is True
+    assert "1390000000" not in json.dumps(snapshot, ensure_ascii=False) and "1390000000" not in api
+
+
 # --------------------------------------------------------------------------
 # 记着别的会话的 SQL、被锁那一行的值的视图
 # --------------------------------------------------------------------------
@@ -185,6 +342,10 @@ async def test_values_expansions_never_reach_the_model_or_the_store(monkeypatch,
 
 #: 另一个会话正在执行的语句（号码写在条件里）：会话、事务、锁、日志一类的视图交回的就是它
 BUSY = f"SELECT id, SLEEP(4) FROM sales WHERE buyer_phone = '{PHONE}' FOR UPDATE"
+#: MySQL sys 库的 ps_thread_trx_info 交回的 JSON：那个线程的事务里执行过的语句原文在 statements_executed[].sql_text 里
+#: （MySQL 8.0 实测）
+TRX_INFO = json.dumps([{"trx_id": "1234", "state": "ACTIVE", "statements_executed": [{"sql_text": BUSY}]}],
+                      ensure_ascii=False)
 
 
 @pytest.mark.parametrize("sql, kind", [
@@ -218,6 +379,32 @@ def test_views_that_keep_other_sessions_sql_mask_the_whole_result(sql, kind):
     masked=[]，条件里的号码原样交给模型、落库。"""
     done = masked(sql, ["t"], [[BUSY]], kind=kind)
     assert done.whole and done.payload["rows"] == [[MASKED_WORD]]
+
+
+@pytest.mark.parametrize("sql, column", [
+    pytest.param("SELECT sys.ps_thread_trx_info(81) AS t", "t", id="事务里执行过的语句"),
+    pytest.param("SELECT sys.ps_thread_trx_info(81)", "sys.ps_thread_trx_info(81)", id="不起别名"),
+    pytest.param("SELECT `sys`.`ps_thread_trx_info`(81) AS t", "t", id="反引号"),
+    pytest.param("SELECT SYS . PS_THREAD_TRX_INFO (81) AS t", "t", id="大写、隔着空格"),
+    pytest.param("SELECT sys.ps_thread_stack(81, FALSE) AS t", "t", id="语句栈"),
+    pytest.param("SELECT sys.ps_thread_trx_info(sys.ps_thread_id(NULL)) AS t", "t", id="套着取线程号"),
+])
+def test_sys_functions_reading_performance_schema_mask_the_whole_result(sql, column):
+    """MySQL sys 库里读 performance_schema 的函数交回别的会话执行过的 SQL 原文（条件里的号码）：按 sys.ps_ 开头认，整份
+    遮。以前名单里 sys 库只认会话、锁等待那几张视图，号码原样交给模型、落库。"""
+    done = masked(sql, [column], [[TRX_INFO]], kind="mysql")
+    assert done.whole and done.payload["rows"] == [[MASKED_WORD]] and not _leaks(done)
+
+
+@pytest.mark.parametrize("kind, sql, column, value", [
+    pytest.param("mysql", "SELECT sys.format_bytes(2048) AS b", "b", "2.00 KiB", id="sys 库里只排版的函数"),
+    pytest.param("mysql", "SELECT ps_total AS t FROM stats", "t", 12, id="ps_ 开头的列"),
+    pytest.param("oracle", "SELECT 1 AS n FROM sys.dual", "n", 1, id="Oracle 的 sys.dual"),
+])
+def test_other_sys_names_stay_visible(kind, sql, column, value):
+    """sys 库里别的函数（只排版、换单位的）、不写 sys. 的 ps_ 开头的列名、Oracle 的 sys.dual：照常。"""
+    done = masked(sql, [column], [[value]], kind=kind)
+    assert not done.whole and done.payload["rows"] == [[value]]
 
 
 @pytest.mark.parametrize("sql, columns", [
@@ -289,7 +476,8 @@ def test_explaining_a_statement_masks_the_whole_result(sql):
     ("SELECT trx_query AS t FROM information_schema.INNODB_TRX", ["t"], [[BUSY]]),
     ("SHOW ENGINE INNODB STATUS", ["Type", "Name", "Status"],
      [["InnoDB", "", f"---TRANSACTION 1234, ACTIVE 2 sec\nMySQL thread id 9, query id 70 localhost root\n{BUSY}"]]),
-], ids=["INNODB_TRX", "SHOW ENGINE INNODB STATUS"])
+    ("SELECT sys.ps_thread_trx_info(81) AS t", ["t"], [[TRX_INFO]]),
+], ids=["INNODB_TRX", "SHOW ENGINE INNODB STATUS", "sys.ps_thread_trx_info"])
 async def test_other_sessions_sql_never_reaches_the_model_or_the_store(monkeypatch, fake_source, sql, columns, rows):
     """端到端（MySQL）：另一个会话正在执行的 SQL 里写着号码，交给模型的、落库的、通用工件接口给的都只有「已遮罩」，
     快照记着整份遮。以前 masked_at_query 为空，SQL 原文连同号码原样交出。"""
@@ -306,3 +494,18 @@ def test_the_new_views_are_on_the_list_the_bundle_shares():
     for sql in ("SELECT trx_query FROM information_schema.INNODB_TRX", "SELECT sql_text FROM dba_sqlset_statements",
                 "SELECT undo_sql FROM flashback_transaction_query", "SELECT sql_redo FROM v$logmnr_contents"):
         assert build._INDIRECT_READS.search(sql) and masking._INDIRECT.search(sql), sql
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT sys.ps_thread_trx_info(81) AS t",
+    "SELECT `sys`.`ps_thread_stack`(81, FALSE) AS t",
+])
+def test_the_sys_functions_are_on_the_list_the_bundle_shares(sql):
+    """可验证报告和工具边界共用一份名单：sys.ps_ 开头的函数两边都认，报告不附带这样的快照（只给哈希），它的列整份算取自
+    遮罩列。以前报告判它没碰遮罩列，照常附带快照，别的会话 SQL 里的号码随文件交出去。"""
+    from app.bundle import build
+
+    snapshot = {"source": "shop", "sql": sql, "columns": ["t"], "rows": [[TRX_INFO]]}
+    assert build._INDIRECT_READS.search(sql) and masking._INDIRECT.search(sql)
+    assert build._untouched(snapshot, {"buyer_phone"}) is False
+    assert build._derived_columns(snapshot, {"buyer_phone"}) == {"buyer_phone", "t"}

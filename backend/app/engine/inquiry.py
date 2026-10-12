@@ -61,9 +61,9 @@
   复算），反方审稿核对这类汇总数的结论也拿不到数。汇总里套着结果全是写死常量的 CASE（SUM(CASE WHEN amount <= 20000
   THEN 1 ELSE 0 END)）只是按条件数个数，同 COUNT；汇总里的 CASE 只在条件里用到遮罩列的（SUM(CASE WHEN buyer_phone
   IS NOT NULL THEN amount ELSE 0 END)）同写在 WHERE 里，不算
-- FROM、JOIN、LATERAL 里的表值函数（json_each、json_tree、unnest、jsonb_each_text、JSON_TABLE、LATERAL VALUES）拆开
-  遮罩列的，按出列名认它出的列（常见函数的出列名、写的列名表、别名、函数名，_function_columns），同名的别的列一并遮
-  （多遮）；不认得的函数又没写列名表的，整份快照都遮。Postgres 里可能交回复合类型、展开成各个字段的也整份遮
+- FROM、JOIN、LATERAL 里的表值函数（json_each、json_tree、unnest、jsonb_each_text、JSON_TABLE）拆开遮罩列的，按
+  出列名认它出的列（常见函数的出列名、写的列名表、别名、函数名，_function_columns），同名的别的列一并遮（多遮）；
+  不认得的函数又没写列名表的，整份快照都遮。Postgres 里可能交回复合类型、展开成各个字段的也整份遮
   （masking._spreads_record）：unnest（数组的元素是复合类型时展开成 addr、tel 这些字段，写了列名表也只改前几列的
   名字），不认得的函数只写了列名、没写类型的列名表（jsonb_populate_record(NULL::contact, …) AS r(a) 后面的字段
   照原名出）；拆的是普通数组的 unnest 也一样整份遮（元素是什么类型 SQL 里看不出，多遮）。函数参数里没写表名的
@@ -90,15 +90,18 @@
   按看不见算（当成数据源里的表，多遮）
 - 认不全的写法整份遮（多遮，同一份里没碰遮罩列的编号、金额也遮）：(表达式).* 展开读到遮罩列的（复合类型的列
   (p.profile).*、函数交回的记录 (jsonb_each_text(pj)).*、子查询里的 ROW (q.r).*，外面套了括号、起了别名的也算，展开成
-  几列、各叫什么 SQL 里看不出；不只选出项，VALUES 里的、行构造器和函数参数里的也算），VALUES 里的 s.*、(s.*) 读到遮罩列
-  的（同样展开成好几列）；语法树和实际执行的对不上的（MySQL、MariaDB 会执行的注释 /*! … */，Postgres 的
-  U&"…" 名字，没有 * 的一支选出项和结果的列数对不上）；表名、SQL 写在字符串里交给函数执行、整表导出的（query_to_xml、
-  table_to_xml、cursor_to_xml、schema_to_xml、database_to_xml 这一族，dblink、crosstab、ts_stat，Oracle 的
-  DBMS_XMLGEN、XMLTYPE）、按页按文件按日志读原始数据的（pageinspect、逻辑解码、LOAD_FILE）、统计信息、会话记录、锁和
-  日志里存着值的（Postgres 的 pg_stats、pg_stat_statements、pg_stat_activity；SQLite 的 sqlite_stat4；MySQL 的
-  column_statistics、general_log、PROCESSLIST、INNODB_TRX、OPTIMIZER_TRACE、performance_schema；MariaDB 的
-  column_stats、INNODB_LOCKS、QUERY_CACHE_INFO；Oracle 的直方图、记着最小最大值的 *_tab_columns、V$SQL 一族、
-  SQL 调优集、固定下来的执行计划、闪回事务、LogMiner、审计记录），按名字认（masking 的 INDIRECT_FUNCTIONS、
+  几列、各叫什么 SQL 里看不出；不只选出项，VALUES 里的、行构造器和函数参数里的也算），VALUES 当一张表用（FROM、JOIN、
+  LATERAL 里的，WITH 里的一段，UNION 的一支）又读到遮罩列的（直接写遮罩列、经子查询或派生来源改了名字的、里面写着
+  s.*、(s.*) 的都算；各库给 VALUES 的列起名不一样：Postgres、SQLite 叫 column1…，MySQL 叫 column_0…，MariaDB 拿第一行
+  的值当列名，不逐个认，同一份里的编号、区域也遮，只收值取自遮罩列的那几列的值）；语法树和实际执行的对不上的（MySQL、
+  MariaDB 会执行的注释 /*! … */，Postgres 的 U&"…" 名字，没有 * 的一支选出项和结果的列数对不上）；表名、SQL 写在字符串里
+  交给函数执行、整表导出的（query_to_xml、table_to_xml、cursor_to_xml、schema_to_xml、database_to_xml 这一族，dblink、
+  crosstab、ts_stat，Oracle 的 DBMS_XMLGEN、XMLTYPE）、按页按文件按日志读原始数据的（pageinspect、逻辑解码、
+  LOAD_FILE）、统计信息、会话记录、锁和日志里存着值的（Postgres 的 pg_stats、pg_stat_statements、pg_stat_activity；
+  SQLite 的 sqlite_stat4；MySQL 的 column_statistics、general_log、PROCESSLIST、INNODB_TRX、OPTIMIZER_TRACE、
+  performance_schema，sys 库里读它的函数（按 sys.ps_ 开头认：ps_thread_trx_info、ps_thread_stack 交回别的线程执行过的
+  语句原文）；MariaDB 的 column_stats、INNODB_LOCKS、QUERY_CACHE_INFO；Oracle 的直方图、记着最小最大值的 *_tab_columns、
+  V$SQL 一族、SQL 调优集、固定下来的执行计划、闪回事务、LogMiner、审计记录），按名字认（masking 的 INDIRECT_FUNCTIONS、
   INDIRECT_NAMES，可验证报告用的同一份名单），去掉注释再认一遍（函数名和括号之间夹着注释），自己建的同类函数、视图
   认不出；information_schema、pg_catalog 里只有表结构的视图不算（核查 agent 查列名、类型常用）。不是查询的语句里，
   只读表结构的 SHOW（表、列、索引、库、表状态、建库语句）、DESCRIBE 一张表照常，别的 SHOW（ENGINE INNODB STATUS、
