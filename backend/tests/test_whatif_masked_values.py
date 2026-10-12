@@ -97,10 +97,11 @@ def test_a_missing_value_stays_missing():
 
 
 def test_a_top_level_cell_on_an_unreadable_snapshot_withholds_the_value():
-    """那一格所在的快照读不出来：遮没遮核对不了，输入不给值，指标的原值同样不给（和代入式一样）。"""
+    """那一格所在的快照读不出来：遮没遮核对不了，输入不给值，指标的原值同样不给（和代入式一样）。说法写「无法核对」，
+    不写「已遮罩」：数据源可能根本没设遮罩，读的人不该以为这里遮着。"""
     [m] = whatif(card("east", AMOUNT, "120.5", 120.5, [cell(0, "amount", 120.5)]), Changes(),
                  sources(load=lambda a: None if a == SNAP else STORE.get(a)))["metrics"]
-    assert m["status"] == "unsupported" and m["old"] == "已遮罩" and m["withheld"] is True
+    assert m["status"] == "unsupported" and m["old"] == m["rendered_old"] == "无法核对" and m["withheld"] is True
     assert "120.5" not in text_of(m)
 
 
@@ -136,17 +137,17 @@ def test_report_segments_of_a_withheld_metric_do_not_carry_the_value():
 
 
 @pytest.mark.parametrize("masked, unverified, expected", [
-    ({PHONE}, set(), True),                  # 取自遮罩列
-    ({"vars.kpi.i"}, set(), True),           # 遮罩列的那一格只嵌在下标里：推演整个按遮罩处理，原值也不给
-    (set(), {AMOUNT}, True),                 # 最外层的输入遮没遮核对不了
-    (set(), {"vars.kpi.i"}, False),          # 只嵌在下标里、遮没遮核对不了：不碍事
-    (set(), set(), False),
+    ({PHONE}, set(), "masked"),              # 取自遮罩列
+    ({"vars.kpi.i"}, set(), "masked"),       # 遮罩列的那一格只嵌在下标里：推演整个按遮罩处理，原值也不给
+    (set(), {AMOUNT}, "unverified"),         # 最外层的输入遮没遮核对不了
+    (set(), {"vars.kpi.i"}, None),           # 只嵌在下标里、遮没遮核对不了：不碍事
+    (set(), set(), None),
 ])
-def test_hides_value_is_one_rule_for_the_whatif_and_the_evidence_panel(masked, unverified, expected):
+def test_withheld_value_is_one_rule_for_the_whatif_and_the_evidence_panel(masked, unverified, expected):
     metric = {"expression": f"{AMOUNT} + vars.kpi.list[vars.kpi.i]"}
-    assert recompute.hides_value(metric, masked, unverified) is expected
+    assert recompute.withheld_value(metric, 1, masked=masked, unverified=unverified) == expected
     # 表达式读不懂：有一个遮没遮核对不了的就不给
-    assert recompute.hides_value({"expression": "1 +"}, set(), {AMOUNT}) is True
+    assert recompute.withheld_value({"expression": "1 +"}, 1, unverified={AMOUNT}) == "unverified"
 
 
 # --------------------------------------------------------------------------

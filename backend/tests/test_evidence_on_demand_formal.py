@@ -182,8 +182,37 @@ def test_a_formal_report_that_opted_in_but_was_never_judged_says_so():
     got = _on_demand(sealed, doc, unit["id"], None, claims="judge")
     assert got["available"] is False and got["reason"] == "formal", got
     assert JUDGED_WORDS not in got["message"] and "没有在报告撰写节点内完成裁判" in got["message"], got["message"]
-    # 同一份文档带上当场裁判的摘要：照旧说已完成裁判
+    # 同一份文档带上当场裁判的摘要、这句判过了：照旧说已完成裁判
     judged = {**doc, "judge": {"mode": "inline", "counts": {}}}
-    assert JUDGED_WORDS in _on_demand(sealed, judged, unit["id"], None, claims="judge")["message"]
+    assert JUDGED_WORDS in _on_demand(sealed, judged, unit["id"], {"status": "supported"}, claims="judge")["message"]
     # 不传策略（老调用方）：看文档里有没有当场裁判的摘要
     assert "没有开启结论句裁判" in _on_demand(sealed, doc, unit["id"], None)["message"]
+
+
+@pytest.mark.parametrize("verdict", [
+    # 触顶：这句没判成，判定里记着原因
+    {"status": "unjudged", "reason": "max_claims", "rationale": "已达上限（每份报告最多裁判 1 句），这句未裁判"},
+    # 裁判出错、格式不对、被截断都一样是未裁判
+    {"status": "unjudged", "reason": "error", "rationale": "裁判失败：连接超时"},
+    # 文档里压根没有这句的判定
+    None,
+])
+def test_an_inline_judged_report_that_did_not_judge_this_sentence_says_so(verdict):
+    """正式运行在节点里当场裁判过（文档里有裁判摘要），可这一句没判成：触顶、出错，或者没有判定。不能说已完成裁判，
+    照实说这句没判成、原因在判定里；判过的句子照旧说已完成裁判。按需裁判接口一次点了几句、有没判成的，也照实说。"""
+    from app.api.evidence import FORMAL_INLINE_MISSED_SOME, _formal_message, _on_demand, _Sealed
+
+    doc = compose_doc("增长主要来自新客首单。复购率也在上升。", {}, node_id="write", run_id="r-capped")
+    doc["judge"] = {"mode": "inline", "complete": False, "counts": {"unjudged": 1}, "limits_hit": ["max_claims"]}
+    first, second = [u["id"] for _, u in iter_units(doc)]
+    sealed = _Sealed(run_id="r-capped", graph={}, events=[], run_class="formal", status="succeeded", ledger_on=True,
+                     seal={"sealed": True, "ok": True, "manifest_seq": 3, "legacy": False})
+    got = _on_demand(sealed, doc, first, verdict, claims="judge")
+    assert got["available"] is False and got["reason"] == "formal", got
+    assert JUDGED_WORDS not in got["message"] and "这句没有判成" in got["message"], got["message"]
+    assert "原因见判定" in got["message"] and "不能按需裁判" in got["message"], got["message"]
+    # 判过的那一句照旧说已完成裁判
+    assert JUDGED_WORDS in _on_demand(sealed, doc, second, {"status": "supported"}, claims="judge")["message"]
+    # 一次问几句（按需裁判接口）：有一句没判成就照实说
+    assert _formal_message(doc, "judge", [verdict, {"status": "supported"}]) == FORMAL_INLINE_MISSED_SOME
+    assert _formal_message(doc, "judge", [{"status": "supported"}, {"status": "partial"}]).startswith("正式运行的结论句已在")

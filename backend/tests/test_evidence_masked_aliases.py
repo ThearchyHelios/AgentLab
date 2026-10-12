@@ -8,7 +8,7 @@
 - 查询步骤：c.phone AS tel 的 tel 列遮掉，面板底下的遮罩说明带上它
 - 指标的输入：cell() 取 tel 那一格、按位置取的 vars.res.rows[0][1] 都不给值；指标本身的值也不给
 - 推演：勾行接口遮 tel，用到 tel 的指标推演不了、原值不给
-- SQL 解析不了、里面又写着遮罩列的，整份快照的列都遮（保守规则）；没写着的只遮遮罩列本身
+- SQL 解析不了的，整份快照的列都遮（保守规则，和可验证报告同一个函数）
 - 合并查询：输入快照里改了名字的遮罩列，按逐格来历遮到合并结果里
 - 没设遮罩时一切照旧
 
@@ -299,8 +299,8 @@ async def query_step(sql: str, columns: list[str], rows: list[list]) -> dict:
     ("SELECT COUNT(DISTINCT phone) AS n FROM customers", ["n"], []),
     # 解析不了、又写着遮罩列：整份快照的列都遮
     ("SELECT name, phone AS p FROM customers WHERE ((", ["name", "p"], ["name", "p"]),
-    # 解析不了、没写着遮罩列：只遮遮罩列本身（结果里没有）
-    ("SELECT name, id AS p FROM customers WHERE ((", ["name", "p"], []),
+    # 每种读法都解析不了的，没写着遮罩列也整份遮：和可验证报告同一个函数（认不出结果里哪一列取自哪一列）
+    ("SELECT name, id AS p FROM customers WHERE ((", ["name", "p"], ["name", "p"]),
 ])
 async def test_the_query_step_reads_the_sql_like_the_bundle_and_the_verify_agent(sql, columns, masked):
     rows = [["客户甲" if i == 0 else "199-0000-0101" for i in range(len(columns))]]

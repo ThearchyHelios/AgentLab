@@ -93,8 +93,8 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "report_catalog_trimmed": ("report_catalog_trimmed", DEGRADED),
     # 目录有省略时写了「没有查到」这类缺失断言、重写后仍在：报告照常产出并标注，这几句结论依据不足
     "report_absence_claim": ("report_absence_claim", DEGRADED),
-    # 报告直接引用了取自遮罩列的格子、重写后仍在（「违规处置」为标注）：照常产出并标注，遮罩列的值随报告出具，
-    # 出具另记缺口降档
+    # 报告直接引用了取自遮罩列的格子、重写后仍在（「违规处置」为标注）：照常产出并标注，另记一条缺口（有出具契约的
+    # 成果按缺口降档）
     "report_masked_cell": ("report_masked_cell", DEGRADED),
     # 口径卡的指标集、报告文档没能落进工件库：答案照常，只是点不开证据
     "evidence_store_failed": ("evidence_store_failed", DEGRADED),

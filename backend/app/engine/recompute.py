@@ -15,9 +15,12 @@
   - vars.*：有 value_artifact（口径卡当时另存的完整值）才还原得出来；老运行照实说当时没有保存
   - 容器本身是一份查询结果（带 artifact 的 {columns, rows}，或者和某份快照的 rows 一模一样的列表）：排除行就去掉那几行
 - 遮罩列取来的输入不给值、也不拿来推演：改一个输入、排除一行，新值和原值一比就能算出遮住的那一格。vars.res.rows[0][2]
-  这种按位置取自查询结果的标量没有定位，顺着取值链认出是哪一列（positional_cell，证据面板的指标步骤用同一个认法）。
-  用到了遮罩列的指标，它本身的原值同样写「已遮罩」（hides_value，证据面板指标步骤的值同一个判断）：指标的值可能就是
-  那一格，输入里拿掉了、指标上照给，等于没遮
+  这种按位置取自查询结果的标量没有定位，顺着取值链认出是哪一列（positional_cell，证据面板的指标步骤用同一个认法）；
+  下标不是字面量的（rows[vars.i][2]）按列认，整行（rows[0]）按整行的列认（wide）。
+  指标本身的原值给不给（withheld_value，证据面板指标步骤的值同一个判断）：用到了遮罩列的一格、一行，原值写「已遮罩」——
+  指标的值可能就是那一格，输入里拿掉了、指标上照给，等于没遮；最外层的输入遮没遮核对不了，写「无法核对」。整份结果
+  当输入（len(vars.res.rows)）、认不出出处的输入（数据整形算出来再赋给变量的一格），按值认：值里有这次运行查到过的
+  遮罩值（Sources.secrets）才不给，数行数的照给。认不出出处、值就是遮罩值的输入同样不给值、不推演
 - 落在读不出来（文件不在、与哈希不一致）的查询快照上的输入同样不给值、不推演：那一格遮没遮核对不了，宁可多遮
 
 有的指标不论改什么都推演不了（_Plan.blocked）：卡上没记全输入、用到了遮罩列、最外层的输入还原不了（容器的完整值
@@ -63,6 +66,9 @@ NOT_RESTORABLE = "这类输入当时没有保存完整值"
 MASKED_INPUT = "这一列在数据源中设置了遮罩，不能用于推演"
 MASKED_TABLE = "这份查询结果里有设置了遮罩的列，不能用于推演"
 MASKED_METRIC = "这个指标用到了设置了遮罩的列，不能推演"
+#: 认不出出处的输入（数据整形算出来再赋给变量的一格），值和这次运行查到过的遮罩值一样（按值认，Sources.secrets）
+MASKED_VALUE_INPUT = "这个输入的值与设置了遮罩的列中的值相同，不能用于推演"
+MASKED_VALUE_METRIC = "这个指标的值或输入与设置了遮罩的列中的值相同，不能推演"
 #: 按位置取自查询结果的一格（vars.res.rows[0][2]）遮没遮核对不了：取值链上节点的产出读不出来，或者那份结果没存快照、
 #: 只带着数据源名（查询当时记下的遮罩在快照里）。和读不出来的快照一样宁可多遮（_positional）
 POSITION_UNREADABLE = "查询结果无法读取，核对不了这一格是否取自设置了遮罩的列"
@@ -114,6 +120,8 @@ class Sources:
       才算哪份的映射（快照读不出来时照样按台账记的数据源算）
     - returned：查询快照 → 它第一次交回时的事件序号；finished：节点 → 口径卡执行之前它最后一次跑完的事件序号。
       排除行只可能影响在那份快照交回之后才算出来的值（_doubt）。不知道的一律当可能受影响
+    - secrets：这次运行查到过的遮罩值（masking._Secrets，没有为 None），用到时才取：认不出出处的输入、整份结果当输入的
+      指标，值给不给按它认（withheld_value）。没给的（双盲复算）不按值认
     """
 
     load: Callable[[str], Any]
@@ -122,6 +130,7 @@ class Sources:
     masked: Mapping[str, frozenset[str]] = field(default_factory=dict)
     returned: Mapping[str, int] = field(default_factory=dict)
     finished: Mapping[str, int] = field(default_factory=dict)
+    secrets: Callable[[], Any] | None = None
 
 
 class _Store:
@@ -169,6 +178,18 @@ class _Input:
     unreadable: bool = False
     #: 出现在别的输入的下标、cell() 的行列里：它决定取哪一格，改它要重新取数
     selector: bool = False
+    #: 认得出取自哪份查询结果（落在快照上，或者顺着取值链认出来）。认不出的按值认遮罩（withheld_value）
+    traced: bool = False
+    #: 认不出出处，值里却有这次运行查到过的遮罩值（按值认的遮罩）
+    by_value: bool = False
+    #: 遮着的是一整份结果（或者值里有遮罩值的容器）：整个指标推演不了，可它不一定把遮罩值带进指标的值，指标的原值
+    #: 按值认（len(vars.res.rows) 照给）
+    whole: bool = False
+
+    @property
+    def cell(self) -> bool:
+        """取自遮罩列的一格、一行（或者值就是遮罩值的一格）：指标的值可能就是它，原值不给。"""
+        return self.masked and not (self.table or self.whole)
 
 
 @dataclass
@@ -183,6 +204,8 @@ class _Plan:
     plain: str | None = None
     #: 嵌在别的引用里的输入 → 包着它的最外层引用（_refs）
     within: dict[str, set[str]] = field(default_factory=dict)
+    #: 指标本身的原值给不给（withheld_value）：None 照给，masked 写「已遮罩」，unverified 写「无法核对」
+    held: str | None = None
 
     def settled(self, path: str, changes: Changes) -> bool:
         """包着这个输入的最外层引用都给了新值：它决定取哪一格已无关紧要，那几个引用以新值为准。"""
@@ -198,14 +221,16 @@ class _Plan:
     def blocked(self) -> tuple[str, str] | None:
         """整个指标推演不了（不论改什么）：(status, 原因)，推演得了的是 None。
 
-        卡上没记全输入、表达式有误；用到了遮罩列（哪怕只是嵌在下标里的一格）；最外层的输入还原不了——容器的完整值
-        找不回来，或者所在的查询快照读不出来。嵌在下标里的输入还原不了不碍事：它取到的那一格的值卡上记着。
+        卡上没记全输入、表达式有误；用到了遮罩列（哪怕只是嵌在下标里的一格），或者值里有这次运行查到过的遮罩值（按值认，
+        指标的原值不给时也算：新值一减就是原值）；最外层的输入还原不了——容器的完整值找不回来，或者所在的查询快照读不
+        出来。嵌在下标里的输入还原不了不碍事：它取到的那一格的值卡上记着。
         遮罩排在还原不了前面：同一格既遮着、快照又读不出来时，说遮罩（快照修好了它照样遮着）。
         """
         if self.problem:
             return "unsupported", self.problem
-        if any(inp.masked for inp in self.inputs.values()):
-            return "masked", MASKED_METRIC
+        masked = [inp for inp in self.inputs.values() if inp.masked]
+        if masked or self.held == "masked":
+            return "masked", MASKED_METRIC if any(not inp.by_value for inp in masked) else MASKED_VALUE_METRIC
         for path in self.tops:
             if problem := self.inputs[path].problem:
                 return "unsupported", f"无法推演：{path}（{problem}）"
@@ -213,10 +238,8 @@ class _Plan:
 
     @property
     def hides(self) -> bool:
-        """指标的原值也不给（hides_value 同一个判断）：用到了遮罩列，或者最外层的输入遮没遮核对不了。成立时一定推演
-        不了（blocked 不为 None），新值本来就是空的。"""
-        return _hides(self.tops, [p for p, i in self.inputs.items() if i.masked],
-                      [p for p, i in self.inputs.items() if i.unreadable])
+        """指标的原值也不给（held，withheld_value 同一个判断）。成立时一定推演不了（blocked 不为 None），新值本来就是空的。"""
+        return self.held is not None
 
     @property
     def stuck(self) -> str | None:
@@ -283,11 +306,14 @@ def _plan(metric: dict[str, Any], store: _Store) -> _Plan:
     expr = str(metric.get("expression") or "").strip()
     items = metric.get("inputs")
     if not expr or not isinstance(items, list):
-        return _Plan(metric, problem=NO_LINEAGE, plain=NO_LINEAGE_PLAIN)
+        # 卡上没记输入（升级前的卡）：认不出出处，原值按值认
+        return _Plan(metric, problem=NO_LINEAGE, plain=NO_LINEAGE_PLAIN,
+                     held=withheld_value(metric, metric.get("value"), uncertain=True, secrets=store.sources.secrets))
     try:
         tree, _, _ = parse_expression(expr)
     except ExpressionError as e:
-        return _Plan(metric, problem=f"表达式有误（{e}）")
+        return _Plan(metric, problem=f"表达式有误（{e}）",
+                     held=withheld_value(metric, metric.get("value"), uncertain=True, secrets=store.sources.secrets))
     tops, within = _refs(tree)
     remaining = _remaining(metric.get("substituted"), [*tops, *within])
     inputs: dict[str, _Input] = {}
@@ -298,6 +324,12 @@ def _plan(metric: dict[str, Any], store: _Store) -> _Plan:
     if lost := [p for p in tops if p not in inputs]:
         plan.plain = f"口径卡缺少输入 {'、'.join(lost[:3])} 的记录"
         plan.problem = f"{plan.plain}，不能推演"
+    # 指标的原值给不给：和证据面板的指标步骤同一个判断（withheld_value），输入按同一套分类交进去
+    plan.held = withheld_value(
+        metric, metric.get("value"), masked=[p for p, i in inputs.items() if i.cell],
+        unverified=[p for p, i in inputs.items() if i.unreadable],
+        uncertain=any((i.masked and not i.cell) or not i.traced for i in inputs.values()),
+        secrets=store.sources.secrets)
     return plan
 
 
@@ -375,8 +407,11 @@ def _restore(item: dict[str, Any], remaining: set[str], nested: set[str], store:
             inp.unreadable = True
             inp.problem = inp.problem or (TAMPERED if trouble == "tampered" else UNREADABLE)
     inp.masked = _masked(inp, locator, store)
+    inp.traced = inp.snapshot is not None or (item.get("via") in ("tool_cell", "agent_field") and artifact is not None)
     if not inp.masked:
         _positional(inp, store)
+    if not inp.masked and not inp.traced:
+        _by_value(inp, store)
     return inp
 
 
@@ -459,16 +494,19 @@ def _masked(inp: _Input, locator: dict[str, Any], store: _Store) -> bool:
 
 
 def _positional(inp: _Input, store: _Store) -> None:
-    """按位置取自查询结果的一格（vars.res.rows[0][2]）：卡上没记定位，顺着取值链找到那份结果、认出是哪一列（input_origin）。
+    """按位置取自查询结果的一格（vars.res.rows[0][2]）、一行（vars.res.rows[0]）：卡上没记定位，顺着取值链找到那份结果、
+    认出是哪一列（input_origin，wide：下标不是字面量的按列认，整行按整行的列认）。
 
     落在遮罩列上的按遮罩（masked）。遮没遮核对不了的——取值链上节点的产出读不出来，或者那份结果没存快照、只带着数据源名
     ——和读不出来的快照同一个处理：值不给、也不拿来推演（unreadable，原因记在 problem），宁可多遮。认得出、可那份结果
-    既没带快照的 id 也没带数据源名的（数据整形改过形状的结果）认不出出处，照常推演，见模块说明。"""
-    if inp.snapshot is not None or inp.shape != "scalar" or inp.item.get("via") in ("tool_cell", "agent_field"):
+    既没带快照的 id 也没带数据源名的（数据整形改过形状的结果）认不出出处，照常推演，见模块说明。整份结果（vars.res.rows）
+    不在这里认：对得上快照的按内容认过了（_table_of），对不上的当认不出出处，指标的原值按值认（withheld_value）。"""
+    if inp.snapshot is not None or inp.item.get("via") in ("tool_cell", "agent_field"):
         return
-    origin = input_origin(inp.item, lambda node_id: store.output(node_id)[0])
-    if origin is None:
+    origin = input_origin(inp.item, lambda node_id: store.output(node_id)[0], wide=True)
+    if origin is None or origin.table:
         return
+    inp.traced = True
     if origin.unverified is None and origin.artifact:
         hidden = store.sources.masked.get(origin.artifact)
         inp.masked = bool(hidden) and any(c.lower() in hidden for c in origin.columns)
@@ -478,43 +516,67 @@ def _positional(inp: _Input, store: _Store) -> None:
         inp.problem = inp.problem or origin.unverified or POSITION_NO_SNAPSHOT
 
 
+def _by_value(inp: _Input, store: _Store) -> None:
+    """认不出出处的输入按值认遮罩（数据整形把 vars.res.rows[0][2] 算出来再赋给 vars.first_phone 这种，取值链认不出）：值里
+    有这次运行查到过的遮罩值（Sources.secrets），就当它取自遮罩列，不给值、也不拿来推演。一格的值就是遮罩值的按一格算
+    （指标的原值不给）；容器（还原出来的完整值）按整份结果算，指标的原值另按值认。运行输入（input.*）是发起运行的人自己
+    填的，不认；完整值找不回来的容器只有卡上记的大概，认不了。"""
+    secrets = store.sources.secrets
+    value = inp.value if inp.problem is None else None
+    if secrets is None or inp.path.startswith("input.") or not maybe_masked_value(value) \
+            or not carries_masked(value, secrets()):
+        return
+    inp.masked = inp.by_value = True
+    inp.whole = inp.shape == "container"
+
+
 @dataclass(frozen=True)
 class Origin:
     """一个输入取自哪份查询结果的哪几列（input_origin）。
 
     - artifact、source：那份查询结果的快照 id 和数据源名，结果里没带的是 None
-    - columns：用到的列（列名照原样）。按位置取的一格、取值链上的产出读不出来时认不出是哪一列，为空
+    - columns：用到的列（列名照原样）。按位置取的一格、取值链上的产出读不出来时认不出是哪一列，为空；整行、整份结果、
+      列号不是字面量的（wide）是那份结果的全部列
     - unverified：遮没遮核对不了的原因（取值链上节点的产出读不出来）；核对得了的是 None
+    - table：取的是整份结果（vars.res.rows、vars.res，wide 才认）：它不一定把哪一格的值带进指标
     """
 
     artifact: str | None
     source: str | None
     columns: tuple[str, ...]
     unverified: str | None = None
+    table: bool = False
 
 
-def input_origin(item: dict[str, Any], output: Callable[[Any], Any]) -> Origin | None:
+def input_origin(item: dict[str, Any], output: Callable[[Any], Any], *, wide: bool = False) -> Origin | None:
     """卡上的一个输入取自哪份查询结果的哪几列，遮罩按列认时用（推演、证据面板的指标步骤、可验证报告是同一个认法）。
 
     cell() 的格、Agent 交来的字段按定位里的列认；vars.res.rows[0][2] 这种按位置取的一格顺着取值链认（positional_cell，
-    output 同它）。不是取自查询结果的格（常量、运行输入、Agent 没按出处交的字段、加工过的数）是 None。"""
+    output 同它）。不是取自查询结果的格（常量、运行输入、Agent 没按出处交的字段、加工过的数）是 None。
+
+    wide（推演、证据面板的指标步骤）：取值链伸进查询结果、下标却不全是字面量的也认——rows[vars.i][2] 按第 2 列认，
+    rows[0][vars.j] 按全部列认；整行 rows[0] 按整行的列认，整份结果 rows、vars.res 按全部列认、标 table。以前认不出，
+    这一格的值就当可以给，指标的原值照给。可验证报告、双盲复算照旧只认字面量下标的一格（它们另有认不出时的处理）。"""
     if item.get("via") in ("tool_cell", "agent_field") and isinstance(item.get("artifact"), str) and item["artifact"]:
         locator = item.get("locator") if isinstance(item.get("locator"), dict) else {}
         columns = [locator.get("column")] if locator.get("column") else list((locator.get("columns") or {}).values())
         return Origin(item["artifact"], None, tuple(c for c in columns if isinstance(c, str) and c))
-    found = positional_cell(str(item.get("path") or ""), item.get("node_id"), output)
+    found = positional_cell(str(item.get("path") or ""), item.get("node_id"), output, wide=wide)
     if found is None:
         return None
     if found.get("unreadable"):
         return Origin(None, None, (), POSITION_UNREADABLE)
-    return Origin(found["artifact"], found["source"], (found["column"],))
+    columns = tuple(found.get("columns") or ([found["column"]] if found.get("column") else []))
+    return Origin(found["artifact"], found["source"], columns, table=bool(found.get("table")))
 
 
 #: 取值链没走通
 _GONE = object()
+#: 下标不是字面量（rows[vars.i]、rows[len(vars.res.rows) - 1]）：wide 时认作「哪一行、哪一列说不准」
+_ANY = object()
 
 
-def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any]) -> dict[str, Any] | None:
+def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any], *, wide: bool = False) -> dict[str, Any] | None:
     """按位置取自一份查询结果的一格：vars.res.rows[0][2]、nodes.parse.rows[1]['amount'] 这种标量引用——查询结果经数据
     整形解析成对象之后按行号、列号（或列名）取。返回 {artifact, source, row, column}：artifact、source 是那份结果里带着的
     （数据源工具、合并查询交回的结果都带，没有的是 None），row 是从 0 数的行号，column 是列名。认不出来的返回 None。
@@ -525,9 +587,12 @@ def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any]) -> di
     的 node_id）交给变量的那个值——数据整形、合并查询交的是产出本身，Agent、LLM、代码节点交的是产出里的 data，工具节点
     交的是 JSON 文本，都试一遍，取值链走得通的那个就是。下标得是字面量：rows[vars.i] 要另取一个值才知道是哪一行，不认。
 
+    wide（见 input_origin）：rows 之后的下标可以不是字面量，整行、整份结果也认，另交回 columns（用到的列）和 table
+    （整份结果）；row、column 认不出时为 None。走到 rows 之前的下标仍得是字面量（vars.r[vars.k].rows 说不清是哪一份）。
+
     路径就是按位置取一格的样子（以 .rows[行号][列] 结尾），可那个节点的产出读不出来（文件不在、与哈希不一致、不知道是
     谁写的）时返回 {"unreadable": True}：这一格取自哪一列核对不了，调用方宁可多遮。卡上记着这个输入的值，算的时候
-    取值链是走得通的，现在读不出来只能是产出丢了或被改了。
+    取值链是走得通的，现在读不出来只能是产出丢了或被改了。wide 时伸进了行的（rows 后面还有下标）都算；整份结果不算。
     """
     try:
         tree = ast.parse(path, mode="eval").body
@@ -540,16 +605,21 @@ def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any]) -> di
         else:
             key = _literal_key(tree.slice)
             if key is _GONE:
-                return None
+                if not wide:
+                    return None
+                key = _ANY
             keys.append(key)
         tree = tree.value
     keys.reverse()
-    if not isinstance(tree, ast.Name) or tree.id not in ("vars", "nodes") or len(keys) < 4 \
-            or not isinstance(keys[0], str):
+    if not isinstance(tree, ast.Name) or tree.id not in ("vars", "nodes") or not keys \
+            or not isinstance(keys[0], str) or (not wide and len(keys) < 4):
         return None
     base = output(keys[0] if tree.id == "nodes" else node_id)
     if base is None:
-        positional = keys[-3] == "rows" and isinstance(keys[-2], int) and isinstance(keys[-1], (int, str))
+        if wide:
+            positional = "rows" in keys[1:-1]
+        else:
+            positional = keys[-3] == "rows" and isinstance(keys[-2], int) and isinstance(keys[-1], (int, str))
         return {"unreadable": True} if positional else None
     candidates = [base]
     if isinstance(base, dict) and "data" in base:
@@ -560,7 +630,7 @@ def positional_cell(path: str, node_id: Any, output: Callable[[Any], Any]) -> di
         except ValueError:
             pass
     for value in candidates:
-        if (found := _cell_in(value, keys[1:])) is not None:
+        if (found := (_cells_in if wide else _cell_in)(value, keys[1:])) is not None:
             return found
     return None
 
@@ -589,6 +659,53 @@ def _cell_in(value: Any, keys: list[Any]) -> dict[str, Any] | None:
         if value is _GONE:
             return None
     return None
+
+
+def _cells_in(value: Any, keys: list[Any]) -> dict[str, Any] | None:
+    """wide 的 _cell_in：走到一份查询结果，剩下的是 rows、rows[行]、rows[行][列…]，或者什么都不剩（整份结果）。"""
+    for i, key in enumerate(keys):
+        if isinstance(value, dict) and isinstance(value.get("rows"), list) and key == "rows":
+            return _cells_at(value, keys[i + 1:])
+        if isinstance(value, dict) and isinstance(key, str):
+            value = value.get(key, _GONE)
+        elif isinstance(value, list) and isinstance(key, int) and -len(value) <= key < len(value):
+            value = value[key]
+        else:
+            return None
+        if value is _GONE:
+            return None
+    if isinstance(value, dict) and isinstance(value.get("rows"), list):
+        return _cells_at(value, None)
+    return None
+
+
+def _cells_at(result: dict[str, Any], rest: list[Any] | None) -> dict[str, Any] | None:
+    """一份查询结果里 rest（rows 后面的下标）取到的那几列：整份结果（rest 为 None 或空）、整行、一格，列号认不出的算全部列。
+    字面量的行号越界、列名对不上的认不出（None）：卡上记着的值不是从这里取的。"""
+    rows = result["rows"]
+    columns = [str(c) for c in result.get("columns") or []]
+    artifact, source = result.get("artifact"), result.get("source")
+    out = {"artifact": artifact if isinstance(artifact, str) and artifact else None,
+           "source": source if isinstance(source, str) and source else None,
+           "row": None, "column": None, "columns": columns, "table": not rest}
+    if not rest:
+        return out
+    row = rest[0]
+    if row is not _ANY:
+        if not isinstance(row, int) or not -len(rows) <= row < len(rows):
+            return None
+        out["row"] = row % len(rows)
+    if len(rest) == 1 or rest[1] is _ANY:
+        return out
+    column = rest[1]
+    record = rows[out["row"]] if out["row"] is not None else None
+    if isinstance(column, int) and -len(columns) <= column < len(columns):
+        name: str | None = columns[column]
+    elif isinstance(column, str) and (column in columns or (isinstance(record, dict) and column in record)):
+        name = column
+    else:
+        return None
+    return {**out, "column": name, "columns": [name]}
 
 
 def _cell_at(result: dict[str, Any], row: Any, column: Any) -> dict[str, Any] | None:
@@ -669,8 +786,10 @@ def _check(changes: Changes, plans: list[_Plan], store: _Store, *, metric: str |
             raise WhatIfError(f"输入「{path}」的新值需要是数值，当前为{_shown(value)}")
         if not _number(value):
             raise WhatIfError(f"输入「{path}」的新值超出可计算的范围，需要是有限的数值")
-        if any(i.masked for i in found):
+        if any(i.masked and not i.by_value for i in found):
             raise WhatIfError(f"输入「{path}」取自设置了遮罩的列，不能用于推演")
+        if any(i.masked for i in found):
+            raise WhatIfError(f"输入「{path}」的值与设置了遮罩的列中的值相同，不能用于推演")
         if unreadable := next((i for i in found if i.unreadable), None):
             raise WhatIfError(f"输入「{path}」所在的{unreadable.problem}，不能用于推演")
         if any(i.selector for i in found):
@@ -879,7 +998,7 @@ def _result(plan: _Plan, status: str, new: Any, reason: str | None, values: dict
     delta, rendered_delta = _delta(metric, old, new) if known else (None, None)
     substituted = metric.get("substituted") if status == "unchanged" \
         else substitute(plan.tree, values) if status == "ok" and plan.tree is not None else None
-    if any(inp.masked or inp.unreadable for inp in plan.inputs.values()):
+    if plan.hides or any(inp.masked or inp.unreadable for inp in plan.inputs.values()):
         substituted = None      # 代入式里代进去的就是遮罩列（或者遮没遮核对不了）的那一格
     out = {
         "id": metric.get("id"), "name": metric.get("name") or metric.get("id"), "unit": metric.get("unit") or "",
@@ -892,11 +1011,12 @@ def _result(plan: _Plan, status: str, new: Any, reason: str | None, values: dict
         "inputs": [_input_view(inp, values, notes, blocked=blocked) for inp in plan.inputs.values()],
     }
     if plan.hides:
-        # 指标的值就是（或者算自）遮罩列的那一格：原值同样写「已遮罩」。以前输入里拿掉了、指标的 old 照给，同一个号码
-        # 换个地方照样看得到；原因在 reason 里（推演不了的原因）。本来就没有值的照旧是空的，缺输入还得看得出来
+        # 指标的值就是（或者算自）遮罩列的那一格：原值同样写「已遮罩」，遮没遮核对不了的写「无法核对」。以前输入里
+        # 拿掉了、指标的 old 照给，同一个号码换个地方照样看得到；原因在 reason 里（推演不了的原因）。本来就没有值的
+        # 照旧是空的，缺输入还得看得出来
         out["withheld"] = True
         if old is not None:
-            out["old"] = out["rendered_old"] = _masked_word()
+            out["old"] = out["rendered_old"] = _masked_word() if plan.held == "masked" else _unverified_word()
     return out
 
 
@@ -1026,7 +1146,7 @@ def _unsupported(plans: list[_Plan]) -> list[dict[str, Any]]:
         for inp in plan.inputs.values():
             if blocked and not (inp.masked or inp.problem):
                 continue
-            reason = (MASKED_TABLE if inp.table else MASKED_INPUT) if inp.masked \
+            reason = (MASKED_VALUE_INPUT if inp.by_value else MASKED_TABLE if inp.table else MASKED_INPUT) if inp.masked \
                 else f"无法推演：{inp.problem}" if inp.problem \
                 else SELECTOR if inp.selector else _fixed(inp)
             if reason:
@@ -1042,26 +1162,58 @@ def _fixed(inp: _Input) -> str | None:
     return None if value is None or is_number(value) else NOT_NUMBER
 
 
-def hides_value(metric: dict[str, Any], masked: Iterable[str], unverified: Iterable[str] = ()) -> bool:
-    """指标本身的值要不要一并不给（推演的原值、证据面板指标步骤的值）：masked、unverified 是取自遮罩列、遮没遮核对不了
-    的输入的路径。
+def withheld_value(metric: dict[str, Any], value: Any, *, masked: Iterable[str] = (), unverified: Iterable[str] = (),
+                   uncertain: bool = False, secrets: Callable[[], Any] | None = None) -> str | None:
+    """指标本身的值给不给（推演的原值、证据面板指标步骤的值，两处同一个判断）：None 照给；"masked" 写「已遮罩」；
+    "unverified" 写「无法核对」。masked 是取自遮罩列的一格、一行（或者值就是遮罩值的一格）的输入的路径，unverified 是
+    遮没遮核对不了的输入的路径，uncertain 是有没有整份结果当输入、认不出出处的输入。
 
-    - 有输入取自遮罩列：不给，哪怕它只嵌在下标里（推演把整个指标按遮罩处理，_Plan.blocked）。指标的值可能就是那一格
-      （cell(nodes.q, 0, 'phone')），也可能是算出来的数，宁可多遮：改一个别的输入、拿指标的值一减，就能算出遮住的那一格
-    - 最外层的输入遮没遮核对不了：不给，它的值就在指标值里。只嵌在下标里的不算：它只决定取哪一格，取到的值卡上另记着
-    认不出最外层引用（表达式有误）时，有一个遮没遮核对不了就不给。"""
-    masked, unverified = set(masked), set(unverified)
-    if masked or not unverified:
-        return bool(masked)
-    try:
-        tops, _ = _refs(parse_expression(str(metric.get("expression") or ""))[0])
-    except ExpressionError:
+    - 有输入取自遮罩列的一格、一行：不给，哪怕它只嵌在下标里（推演把整个指标按遮罩处理，_Plan.blocked）。指标的值可能
+      就是那一格（cell(nodes.q, 0, 'phone')），也可能是算出来的数，宁可多遮：改一个别的输入、拿指标的值一减，就能算出
+      遮住的那一格
+    - 最外层的输入遮没遮核对不了：不给，它的值就在指标值里。只嵌在下标里的不算：它只决定取哪一格，取到的值卡上另记着。
+      认不出最外层引用（表达式有误）时，有一个遮没遮核对不了就不给。说法和遮着的分开：读的人不该以为这里设了遮罩
+    - 整份结果当输入、认不出出处的输入（uncertain）：按值认，值里有这次运行查到过的遮罩值（secrets()，masking._Secrets）
+      才不给。整份结果不一定把哪一格带进指标：len(vars.res.rows) 数行数，照给；str(vars.res.rows)、max(r[2] for r in …)
+      值里就是号码，不给。以前整份结果有一列遮着就不给，推演写「已遮罩」、证据面板的指标步骤照写行数，同一个数两样说法
+    """
+    if any(True for _ in masked):
+        return "masked"
+    unverified = set(unverified)
+    if unverified:
+        try:
+            tops, _ = _refs(parse_expression(str(metric.get("expression") or ""))[0])
+        except ExpressionError:
+            return "unverified"
+        if unverified & set(tops):
+            return "unverified"
+    if uncertain and secrets is not None and maybe_masked_value(value) and carries_masked(value, secrets()):
+        return "masked"
+    return None
+
+
+def maybe_masked_value(value: Any) -> bool:
+    """值有没有可能是按值认得出的遮罩值（masking 的门槛：够长的数、两个字以上的文字），容器一律算。不可能的不必去取这次
+    运行的遮罩值（要把封存的查询快照读一遍）。"""
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (list, tuple, dict)):
         return True
-    return _hides(tops, masked, unverified)
+    from app.engine.masking import _forms, _strong
+
+    return any(_strong(form) for form in _forms(value))
 
 
-def _hides(tops: Iterable[str], masked: Iterable[str], unverified: Iterable[str]) -> bool:
-    return any(True for _ in masked) or bool(set(unverified) & set(tops))
+def carries_masked(value: Any, secrets: Any) -> bool:
+    """值里有没有按值认得出的遮罩值（secrets 是 masking._Secrets，None 为没有）：整个值就是一个遮罩值（数写法不同也算），
+    或者文字、容器（按 JSON 写出来）里写着一个（换了写法的长号码也认）。"""
+    if secrets is None or value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (list, tuple, dict)):
+        return bool(secrets.spans(json.dumps(value, ensure_ascii=False, default=str), loose=True))
+    if secrets.hit(value):
+        return True
+    return isinstance(value, str) and bool(secrets.spans(value, loose=True))
 
 
 def _masked_word() -> str:
@@ -1069,6 +1221,13 @@ def _masked_word() -> str:
     from app.api.evidence import MASKED
 
     return MASKED
+
+
+def _unverified_word() -> str:
+    """「无法核对」：遮没遮核对不了、不给的值（和「已遮罩」分开：读的人不该以为这里设了遮罩）。同 _masked_word。"""
+    from app.api.evidence import UNVERIFIED_VALUE
+
+    return UNVERIFIED_VALUE
 
 
 def substituted_without(metric: dict[str, Any], paths: Iterable[str], token: str) -> str | None:
@@ -1107,7 +1266,7 @@ def report_segments(reports: Iterable[tuple[str, dict[str, Any]]], *, card_node:
     只认指向这张卡这一份指标集的引用（目录条目的 node_id、artifact）：循环里同一张卡算过几次，报告引用的是哪一次
     就是哪一次。新值按片段自己的换算（|万、|pct……）渲染，和报告里的字同一套规则。指标推演不了（unsupported、masked）
     时 rendered_new、changed 为 None：不知道会变成什么。缺输入、当时就显示「—」的引用也列上：推演里补上了值，它会变。
-    原值不给的指标（withheld），rendered_old 同样写「已遮罩」。
+    原值不给的指标（withheld），rendered_old 同样写「已遮罩」或「无法核对」。
     """
     by_id = {str(r.get("id")): r for r in results}
     out: list[dict[str, Any]] = []
@@ -1124,8 +1283,10 @@ def report_segments(reports: Iterable[tuple[str, dict[str, Any]]], *, card_node:
                 if result is None:
                     continue
                 new = None if result.get("rendered_new") is None else _render(result, result.get("new"), cite.get("conv"))
-                # 原值不给的指标（_Plan.hides）：报告里引用它的地方同样写「已遮罩」，推演的答复里不出现它的值
-                old = _masked_word() if result.get("withheld") and result.get("old") is not None else seg.get("text")
+                # 原值不给的指标（_Plan.hides）：报告里引用它的地方同样写「已遮罩」（遮没遮核对不了的写「无法核对」），
+                # 推演的答复里不出现它的值
+                old = result.get("rendered_old") if result.get("withheld") and result.get("old") is not None \
+                    else seg.get("text")
                 out.append({"report": report_node, "unit": unit.get("id"), "sid": seg.get("id"), "metric": result["id"],
                             "rendered_old": old, "rendered_new": new,
                             "changed": None if new is None else new != seg.get("text")})

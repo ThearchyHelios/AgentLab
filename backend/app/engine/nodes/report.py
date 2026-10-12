@@ -319,29 +319,48 @@ class _RenderedStream:
             self._ctx.emit(EventType.LLM_TOKEN, delta=tail)
 
 
-async def _masked_columns(catalog: dict[str, Any]) -> dict[str, set[str]]:
-    """写作目录里每份查询快照（工件 id）取自遮罩列的结果列（小写），交给 compose_doc 的 masked。认法和证据面板的查询
-    步骤是同一个函数（api/evidence.py 的 _snapshot_masks）：查询当时记下的、数据源现在设的，SQL 里给遮罩列起了别名、
-    套了函数、经子查询转一道的也算，合并查询按逐格来历认。没有一列遮着的不列；读不出来的快照不列：引用它的格子本来就
-    解析不了。快照可能有好几份、每份几 MB，读盘复验哈希放进线程。"""
-    from app.api.evidence import _Masks, _snapshot_masks
-    from app.core.artifact_store import load
+class _MaskedCells:
+    """报告自查：正文引用了取自遮罩列的格子（evidence.masked_cells），记一条违规，和没有出处的数字一样交回写作者重写。
+    写作目录本身不遮（写作者要看得到数据），只拦写进报告的那几格。
 
-    masks = _Masks()
-    out: dict[str, set[str]] = {}
-    seen: set[str] = set()
-    for entry in catalog.values():
-        artifact = entry.get("artifact") if isinstance(entry, dict) and entry.get("kind") == "query" else None
-        if not isinstance(artifact, str) or not artifact or artifact in seen:
-            continue
-        seen.add(artifact)
-        try:
-            snap = await asyncio.to_thread(load, artifact)
-        except ValueError:
-            continue
-        if isinstance(snap, dict) and (hidden := (await _snapshot_masks(snap, entry.get("source"), masks))[0]):
-            out[artifact] = hidden
-    return out
+    哪几列算：和证据面板同一个函数（api/evidence.py 的 _mask_sets）认出来的「确定取自遮罩列」的那几列（sure）——列名
+    就是遮罩列的，SQL 里给遮罩列起了别名、套了函数、经子查询或 WITH 转一道的，合并查询按逐格来历和合并 SQL 认。证据
+    面板为了展示宁可多遮（SQL 认不准时整份的列都遮），自查不跟着多算：多算一列就是一次判失败，写作者也改不掉。
+
+    组装好一稿之后只给正文里引用到的那几份查询快照认（读盘复验哈希放进线程），认过的记下来，重写的稿子不再认。以前写作
+    之前就把目录里每份查询快照都读一遍，没设遮罩、没引用到的也一样。"""
+
+    def __init__(self, catalog: dict[str, Any]) -> None:
+        from app.api.evidence import _Masks
+
+        self._catalog = catalog
+        self._masks = _Masks()
+        self._memo: dict[str, dict[str, list[str]]] = {}
+
+    async def __call__(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """把这一稿引用了遮罩列的格子记进 doc 的违规（接在最后，和 compose_doc 给了 masked 时一样），交回同一份文档。"""
+        from app.api.evidence import _mask_sets
+        from app.core.artifact_store import load
+        from app.engine.evidence import iter_segments, masked_cells
+
+        wanted: dict[str, Any] = {}
+        for seg in iter_segments(doc):
+            cite = seg.get("cite") or {}
+            entry = self._catalog.get(cite.get("alias")) or {}
+            artifact = entry.get("artifact")
+            if cite.get("kind") == "cell" and cite.get("status") == "resolved" and isinstance(artifact, str) \
+                    and artifact and artifact not in self._memo:
+                wanted.setdefault(artifact, entry.get("source"))
+        for artifact, source in wanted.items():
+            try:
+                snap = await asyncio.to_thread(load, artifact)
+            except ValueError:
+                snap = None
+            sets = await _mask_sets(snap, source, self._masks) if isinstance(snap, dict) else None
+            self._memo[artifact] = {c: sorted(sets.base) for c in sets.sure} if sets is not None else {}
+        doc["violations"] = [*doc["violations"],
+                             *masked_cells(doc, self._catalog, {a: m for a, m in self._memo.items() if m})]
+        return doc
 
 
 async def _run_class(run_id: str) -> str | None:
@@ -404,6 +423,18 @@ def _blocking(violations: list[dict[str, Any]], numbers: str) -> list[dict[str, 
 def _fatal(blocking: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """要判失败的违规：重写之后还在的、不属于 REWRITE_ONLY 的。"""
     return [v for v in blocking if v.get("code") not in REWRITE_ONLY]
+
+
+def _fail_advice(fatal: list[dict[str, Any]]) -> str:
+    """判失败时给人看的下一步。引用了遮罩列的格子多半是写作指令点名要的（「联系电话 [[v:Q2.r0.tel]]」），换模型没用；
+    改成「标注」照常产出，遮罩列的值就随报告出去了——这两条都不建议，只说去改写作指令。别的违规照旧建议换模型、先标注。"""
+    masked = sum(1 for v in fatal if v.get("code") == "masked_cell")
+    if masked == len(fatal):
+        return "数据源设置了遮罩的列不应写进报告，请在报告撰写节点的指令中去掉对这些列的引用"
+    if masked:
+        return "引用了遮罩列的那几处，请在报告撰写节点的指令中去掉对这些列的引用；其余几处可换用指令遵循能力更强的模型"
+    return (f"请换用指令遵循能力更强的模型，或先将「{field_label('on_violation')}」设为"
+            f"「{option_label('on_violation', 'flag')}」，查看标注后再调整")
 
 
 def _violation_key(violation: dict[str, Any]) -> tuple[str, str]:
@@ -549,9 +580,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     spec = ctx.run.spec
     catalog = report_catalog(state, spec, ctx.node)
-    # 目录里取自遮罩列的结果列：正文引用了这些列的格子，自查记一条违规（evidence.masked_cells），和没有出处的数字一样
-    # 交回写作者重写。写作目录本身不遮（写作者要看得到数据），只拦写进报告的那几格
-    masked = await _masked_columns(catalog)
+    # 正文引用了取自遮罩列的格子：自查记一条违规，和没有出处的数字一样交回写作者重写（_MaskedCells）
+    masked = _MaskedCells(catalog)
     allow = report_allowance(spec, ctx.node)
     cells = True
     # 结论句策略只对升级后发起的运行生效：升级前的运行（图里也不会有 claims）事件、产出一个字不加
@@ -601,14 +631,16 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     entities = report_entities(spec, ctx.node) == "link"
 
-    def compose(raw: str) -> dict[str, Any]:
+    async def compose(raw: str) -> dict[str, Any]:
         # 第一稿、重写稿、裁判退回的改写稿都从这里过：整篇包在代码块里的先去掉外层围栏。文档的 source 记的是去掉
-        # 围栏之后的正文——markdown 由它渲染，出口契约复核取回的也是这份文档
-        return compose_doc(_unfenced(raw), catalog, node_id=ctx.node.id, run_id=ctx.run.run_id, allow_numbers=allow,
-                           cells_allowed=cells, entities=entities, absence=writer.trimmed, masked=masked)
+        # 围栏之后的正文——markdown 由它渲染，出口契约复核取回的也是这份文档。引用了遮罩列的格子组装好之后再认
+        # （_MaskedCells）：只读正文里引用到的那几份快照
+        return await masked(compose_doc(_unfenced(raw), catalog, node_id=ctx.node.id, run_id=ctx.run.run_id,
+                                        allow_numbers=allow, cells_allowed=cells, entities=entities,
+                                        absence=writer.trimmed))
 
     response, raw = await draft(messages)
-    doc = compose(raw)
+    doc = await compose(raw)
     repairs = 0
     while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs \
             and not (repairs and not _fatal(blocking)):
@@ -618,7 +650,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                          f"已要求模型重写（第 {repairs} 次）")
         messages = [*messages, response, HumanMessage(content=_repair_request(blocking))]
         response, raw = await draft(messages)
-        doc = compose(raw)
+        doc = await compose(raw)
 
     judgement: dict[str, Any] | None = None
     if claims == CLAIMS_JUDGE:
@@ -648,15 +680,15 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     gaps: list[str] = []
     hits = [v for v in doc["violations"] if v.get("code") == "masked_cell"]
     if hits and not (_fatal(blocking) and on_violation == "fail"):
-        # 重写之后还引用着遮罩列（「违规处置」为标注，照常产出）：时间线上单独一行说清，节点产出里写一条出具缺口，
-        # 出口照单收下、降档（io._upstream_issuance_gaps）。只点名引用，不写那几格的值
+        # 重写之后还引用着遮罩列（「违规处置」为标注，照常产出）：时间线上单独一行说清，节点产出里写一条缺口，成果节点
+        # 设了出具契约、报告在它上游时照单收下、降档（io._upstream_issuance_gaps）。降不降档由出具那一行说：探索运行、
+        # 没有契约的成果不出具，这里不预告。只点名引用，不写那几格的值
         tried = f"已要求模型重写 {repairs} 次仍未改掉" if repairs else "未要求重写"
         refs = list(dict.fromkeys(str(v.get("ref") or "") for v in hits))
-        gaps.append(f"报告引用了 {len(hits)} 处取自遮罩列的格子（{_named(hits)}），{tried}，这些值会随报告出具")
+        gaps.append(f"报告引用了 {len(hits)} 处取自遮罩列的格子（{_named(hits)}），{tried}：数据源设置了遮罩的列不应写进报告")
         ctx.emit(EventType.LOG, level="warn", code="report_masked_cell", count=len(hits), refs=refs,
                  columns=list(dict.fromkeys(str(v.get("column") or "") for v in hits)),
-                 message=f"{gaps[0]}。报告照常产出，这几处已标注：数据源设置了遮罩的列不应写进报告，"
-                         "请在报告撰写节点的指令中去掉对这些列的引用")
+                 message=f"{gaps[0]}。报告照常产出，这几处已标注，已记为缺口。请在报告撰写节点的指令中去掉对这些列的引用")
     doc_artifact = await _store(doc, ctx)
     ctx.emit(EventType.REPORT_CHECKED, doc_artifact=doc_artifact, ok=not doc["violations"],
              stats=doc["stats"], violations=doc["violations"][:20], repairs=repairs,
@@ -669,9 +701,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         more = f"；…另有 {len(blocking) - 5} 处" if len(blocking) > 5 else ""
         raise NodeError(
             ctx.node.id,
-            f"报告有 {len(blocking)} 处未通过核对（已要求重写 {repairs} 次）：{head}{more}。"
-            f"请换用指令遵循能力更强的模型，或先将「{field_label('on_violation')}」设为"
-            f"「{option_label('on_violation', 'flag')}」，查看标注后再调整",
+            f"报告有 {len(blocking)} 处未通过核对（已要求重写 {repairs} 次）：{head}{more}。{_fail_advice(blocking)}",
         )
 
     usage = {key: sum(one[key] for one in spent) for key in spent[0]}
@@ -757,7 +787,10 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
         settings = await judging.judge_settings(session)
         judge_spec = await judging.judge_model_spec(session, judge_cfg, settings=settings)
     budget = judging.report_budget(settings, judge_cfg)
-    masks = await judging.source_masks(catalog)
+    # 交给裁判的摘录要遮的列：数据源设的之外，SQL 里改了名字的遮罩列也算（和按需裁判同一个函数）
+    from app.api.evidence import _judge_masks
+
+    masks = await _judge_masks(catalog, await judging.source_masks(catalog))
 
     @task
     async def judge_step(request: judging.JudgeRequest, key: str, limits: judging.Budget, known: dict[str, Any],
@@ -801,7 +834,7 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
                  message=f"裁判认为 {len(bad)} 句结论证据不支持（{_named([{'text': t} for t, _ in sentences])}），"
                          "已退回写作模型仅修改这几句")
         again, raw = await draft([*messages, HumanMessage(content=_rewrite_request(sentences))])
-        rewritten = compose(raw)
+        rewritten = await compose(raw)
         worse = _blocking(rewritten["violations"], numbers)
         fresh = _new_violations(doc["violations"], rewritten["violations"])
         rewrite = {"units": bad, "sentences": [t for t, _ in sentences], "applied": False, "reason": None,

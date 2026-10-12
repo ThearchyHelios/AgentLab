@@ -1384,25 +1384,29 @@ await section('报告引用了取自遮罩列的格子（report_masked_cell）�
   check('后端发引用了遮罩列的警告，带着 count、refs、columns', reportPy.includes('code="report_masked_cell"')
     && reportPy.includes('count=len(hits), refs=refs') && reportPy.includes('columns=list(dict.fromkeys('),
     '改了 report.py 的字段就同步改 decode.ts 的 explainLog 和这里的夹具')
-  const MASKED = '报告引用了 2 处取自遮罩列的格子（「v:Q2.r0.tel」、「v:Q2.r1.tel」），已要求模型重写 1 次仍未改掉，这些值会随报告出具。'
-    + '报告照常产出，这几处已标注：数据源设置了遮罩的列不应写进报告，请在报告撰写节点的指令中去掉对这些列的引用'
+  const MASKED = '报告引用了 2 处取自遮罩列的格子（「v:Q2.r0.tel」、「v:Q2.r1.tel」），已要求模型重写 1 次仍未改掉：'
+    + '数据源设置了遮罩的列不应写进报告。报告照常产出，这几处已标注，已记为缺口。请在报告撰写节点的指令中去掉对这些列的引用'
   const steps = flatten(mod.decodeRun([E(1, 'node.started', 'w', { node_type: 'report', label: '写报告' }),
     E(2, 'log', 'w', { level: 'warn', code: 'report_masked_cell', message: MASKED, count: 2,
       refs: ['v:Q2.r0.tel', 'v:Q2.r1.tel'], columns: ['tel'] }),
     E(3, 'report.checked', 'w', { doc_artifact: 'abc', repairs: 1, ok: false, on_violation: 'flag', failed: false,
       stats: { numbers: 1, numbers_cited: 1, uncited_numbers: 0, unresolved: 0 },
       violations: [{ code: 'masked_cell', ref: 'v:Q2.r0.tel', column: 'tel',
-        message: '引用了取自遮罩列的格子 [[v:Q2.r0.tel]]：列「tel」取自数据源中设置了遮罩的列，值不应写进报告' }] }),
+        message: '引用了取自遮罩列的格子 [[v:Q2.r0.tel]]：列「tel」按 SQL 认出取自设置了遮罩的列「phone」，值不应写进报告' }] }),
   ]))
   const mc = steps.find((s) => s.code === 'report_masked_cell')
   check('标题说几处引用了遮罩列、已标注', mc?.title === '报告引用了 2 处取自遮罩列的格子，已标注', mc?.title)
   check('……副标题点名那几处引用（不写值）', mc?.sub === '[[v:Q2.r0.tel]]、[[v:Q2.r1.tel]]', mc?.sub)
-  check('……下一步说遮罩列不应写进报告、出具已降档、去改指令；是提醒（warn），原话留在展开区',
-    !!mc?.next?.includes('不应写进报告') && !!mc?.next?.includes('降档') && !!mc?.next?.includes('指令')
-    && mc?.level === 'warn' && mc?.detail === MASKED, mc?.next)
+  check('……下一步说遮罩列不应写进报告、已记为缺口、去改指令，不预告出具降档（探索运行、没有出具契约的成果不出具）；'
+    + '是提醒（warn），原话留在展开区',
+    !!mc?.next?.includes('不应写进报告') && !!mc?.next?.includes('记为缺口') && !!mc?.next?.includes('指令')
+    && !mc?.next?.includes('降档') && !mc?.next?.includes('随报告出具') && mc?.level === 'warn' && mc?.detail === MASKED,
+    mc?.next)
+  check('……后端的缺口、日志原话同样不预告出具（不写「随报告出具」「降档」）', !reportPy.includes('这些值会随报告出具')
+    && !reportPy.includes('出具已按缺口降档'), '改 report.py 里 report_masked_cell 的说法')
   const rc = steps.find((s) => s.code === 'report_checked')
   check('……核对那一行照常完成（标注，不判失败），违规清单里写着这一条的说明', rc?.status === 'done'
-    && !!rc?.detail?.includes('取自数据源中设置了遮罩的列'), `${rc?.status} ${rc?.detail}`)
+    && !!rc?.detail?.includes('取自设置了遮罩的列'), `${rc?.status} ${rc?.detail}`)
   const bare = flatten(mod.decodeRun([E(1, 'log', 'w', { level: 'warn', code: 'report_masked_cell', message: '报告引用了遮罩列' })]))
     .find((s) => s.code === 'report_masked_cell')
   check('……缺字段时标题照样说人话，不出 undefined', bare?.title === '报告引用了取自遮罩列的格子，已标注'
