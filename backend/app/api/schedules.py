@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -40,6 +41,29 @@ def _invalid(detail: str, field: str | None = None) -> CodedHTTPException:
 
 def _iso(moment: datetime | None) -> str | None:
     return service.as_utc(moment).isoformat() if moment is not None else None
+
+
+#: 查询串把「+」解成空格之后，时间末尾的时区偏移：「…03.376320 00:00」
+_SPACED_OFFSET = re.compile(r"(.*\d) (\d{2}:?\d{2})")
+
+
+def _cursor(moment: datetime) -> str:
+    """触发历史的翻页游标：UTC 写成 Z 结尾、精确到微秒。写成 +00:00 时照接口说明原样拼进地址，「+」在查询串里会被
+    解成空格，回 422（2026-10 验收）；Z 结尾的放进地址不用编码，和运行列表的游标一个写法。"""
+    return service.as_utc(moment).isoformat().replace("+00:00", "Z")
+
+
+def _cursor_time(before: str) -> datetime:
+    """before → 时间：Z、+00:00 都认，也认「+」被查询串解成空格的「 00:00」（老的游标照原样拼进地址时就是这样）。
+    不是时间的照样抛 ValueError。"""
+    text = before.strip()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        spaced = _SPACED_OFFSET.fullmatch(text)
+        if spaced is None:
+            raise
+        return datetime.fromisoformat(f"{spaced[1]}+{spaced[2]}")
 
 
 async def _body(request: Request) -> dict[str, Any]:
@@ -579,7 +603,8 @@ async def run_now(schedule_id: str, session: AsyncSession = Depends(get_session)
 @router.get("/{schedule_id}/fires")
 async def list_fires(schedule_id: str, limit: str | None = None, before: str | None = None,
                      session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """触发历史，新的在前：{items: [Fire], next_before}。翻页把 next_before 原样作为 before 传回来；没有更多时为空。"""
+    """触发历史，新的在前：{items: [Fire], next_before}。翻页把 next_before 原样作为 before 传回来（Z 结尾，拼进地址
+    不用编码）；没有更多时为空。"""
     await _get(session, schedule_id)
     size = 20
     if limit is not None:
@@ -589,7 +614,7 @@ async def list_fires(schedule_id: str, limit: str | None = None, before: str | N
     stmt = select(ScheduleFire).where(ScheduleFire.schedule_id == schedule_id)
     if before is not None:
         try:
-            cursor = datetime.fromisoformat(before.strip().replace("Z", "+00:00"))
+            cursor = _cursor_time(before)
         except ValueError as e:
             raise _invalid(f"翻页位置需要是接口返回的 next_before，当前为「{before}」", "before") from e
         stmt = stmt.where(ScheduleFire.created_at < service.as_utc(cursor))
@@ -597,7 +622,7 @@ async def list_fires(schedule_id: str, limit: str | None = None, before: str | N
         stmt.order_by(ScheduleFire.created_at.desc(), ScheduleFire.id.desc()).limit(size + 1))).scalars())
     items = rows[:size]
     return {"items": await _fire_outs(session, items),
-            "next_before": _iso(items[-1].created_at) if len(rows) > size else None}
+            "next_before": _cursor(items[-1].created_at) if len(rows) > size else None}
 
 
 @router.post("/{schedule_id}/webhook/test")

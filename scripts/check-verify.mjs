@@ -4,7 +4,8 @@
 // - 审批卡：两路对不上时，卡上要先按摘要画出来（完整对照还在路上时不能一片空白），再按工件补全；具体差异逐条列，
 //   只有兜底说明（或只有解析失败）时写明「未能归纳成具体差异」并默认展开对照；对照两条 SQL 时左右并排（窄栏上下排），
 //   原文按行比出的不同行高亮，规范化后不同的行（text_diff）分两栏高亮——夹具里的差异说明是服务端的真实输出
-//   （backend/tests/test_dual_check_fixture.py 核对），规范化的行和原文对不上，高亮不能指望两边逐行相等；
+//   （backend/tests/test_dual_check_fixture.py 核对），规范化的行和原文对不上，高亮不能指望两边逐行相等；不同的行
+//   前面带着标出所在子句的上级行（两边相同、不高亮，只放进用得着它的那一栏），只差一个关联条件时看得出是哪个 JOIN 的；
 //   「记入数据目录」不能说得比服务端宽：服务端在摘要里预告了采用哪一边写什么（payload.summary[].catalog）时照它说，
 //   两边都不写就不提，当前选的那一句加重；同一次裁决里别的指标按当前的选择落到同一张表的同一项上时，照服务端写目录前
 //   的归拢说——业务日期、去重规则说法不同的改说都不记，有效记录条件说合成一句；老服务端没有预告时只在可能写的形状下
@@ -297,7 +298,7 @@ await section('审批卡：并排对照与高亮（服务端真实的差异输�
   const blind = gmv.locator('[data-dual-sql="blind"]')
   check('两条 SQL 都在，各标是哪一边', (await text(orig)).includes('paid_at') && (await text(blind)).includes('created_at')
     && (await text(gmv.locator('[data-dual-pair]'))).includes('原流程的 SQL') && (await text(gmv.locator('[data-dual-pair]'))).includes('盲算的 SQL'))
-  // 夹具的 text_diff 是 explain_sql_diff 的真实输出：规范化后列名带表名、两个条件并成一行，和原文的任何一行都对不上
+  // 夹具的 text_diff 是 explain_sql_diff 的真实输出：规范化后列名带表名、每个条件一行，和原文的任何一行都对不上
   const real = sidesOf(fx.card.metrics[0].diff)
   const rawLines = new Set(fx.card.metrics[0].original.inputs[0].sql.split('\n').map((l) => l.trim()))
   check('（夹具）text_diff 是规范化后的行，和原文逐行对不上', real.del.length > 0 && !real.del.some((l) => rawLines.has(l)), real.del.join(' | '))
@@ -309,6 +310,16 @@ await section('审批卡：并排对照与高亮（服务端真实的差异输�
   check('……盲算一栏是「+ 」行', marks.normAdd.join('|') === real.add.join('|'), marks.normAdd.join('|'))
   const hl = await gmv.locator('[data-dual-norm] [data-diff-line]').first().evaluate((el) => getComputedStyle(el).backgroundColor)
   check('……高亮行有底色', !!hl && hl !== 'rgba(0, 0, 0, 0)' && hl !== 'transparent', hl)
+  // 不同的行前面带着两边相同的上级行（这里是 WHERE：两边不同的条件都在 WHERE 里）：两栏各在自己的不同行前面列一遍，
+  // 不高亮、不算进高亮的行；标题后面说明淡色的行是什么
+  const normRows = await gmv.evaluate((el) => ['original', 'blind'].map((s) => [...el.querySelectorAll(
+    `[data-dual-norm="${s}"] [data-diff-context], [data-dual-norm="${s}"] [data-diff-line]`)]
+    .map((n) => (n.hasAttribute('data-diff-context') ? `（${n.textContent.trim()}）` : n.textContent.trim()))))
+  check('……两边相同的上级行（WHERE）列在两栏的不同行前面', normRows.every((rows, n) => rows[0] === '（WHERE）'
+    && rows.slice(1).join('|') === (n ? real.add : real.del).join('|')), JSON.stringify(normRows))
+  const ctxStyle = await gmv.locator('[data-dual-norm] [data-diff-context]').first().evaluate((el) => [el.tagName, getComputedStyle(el).backgroundColor])
+  check('……上级行不是高亮的 <mark>、没有底色', ctxStyle[0] === 'SPAN' && (ctxStyle[1] === 'rgba(0, 0, 0, 0)' || ctxStyle[1] === 'transparent'), ctxStyle.join(' '))
+  check('……标题后面说明淡色的行两边相同、标出所在的子句', (await text(gmv.locator('[data-dual-text-diff-hint]'))).includes('淡色的行两边相同，标出所在的子句'))
   const o = await orig.boundingBox()
   const b = await blind.boundingBox()
   check('宽栏里左右并排：同一行、盲算在右边', !!o && !!b && Math.abs(o.y - b.y) < 2 && b.x >= o.x + o.width - 1, JSON.stringify({ o, b }))
@@ -349,6 +360,54 @@ await section('审批卡：并排对照与高亮（服务端真实的差异输�
   await page.keyboard.press('Enter')
   check('再按一次回车收起', (await toggle.getAttribute('aria-expanded')) === 'false' && await gmv.locator('[data-dual-compare]').count() === 0)
   check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('审批卡：规范化后的行带上所在的子句（只差一个关联条件）', async () => {
+  // 2026-10 复核：ON 单独一行时，只差一个关联条件的那一栏只剩「AND 条件」，看不出是哪个 JOIN 的关联条件、还是筛选条件；
+  // 两边 JOIN 的表不同时，两边都有的那一行 ON 被当成相同的行吃掉。现在 ON 挂在 JOIN 那一行的末尾，条件前面带着它所在的
+  // JOIN（两边相同的上级行，淡一级的字色、不高亮）；盲算一边没有不同的行，照实说没有，不把只有原流程用得着的那一行
+  // JOIN 画进去。夹具的 join_condition 是服务端对这一对 SQL 的真实输出（test_dual_check_fixture 核对）
+  const td = fx.variants.join_condition.diff.text_diff
+  check('（夹具）只差一个关联条件：一行带 ON 的上级行加一行不同的行', td.length === 2 && td[0] === '  LEFT JOIN refunds AS refunds ON'
+    && td[1].startsWith('- '), td.join(' | '))
+  for (const theme of ['dark', 'light']) {
+    const { page, errors } = await preview('dual-check-approval', { artifact: cardWith('join_condition'), theme })
+    await page.waitForSelector('[data-dual-check][data-state="ready"]')
+    const gmv = metric(page, 'gmv')
+    // 只给兜底说明时对照默认展开
+    const toggle = gmv.locator('[data-dual-compare-toggle]')
+    if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click()
+    const rows = await gmv.locator('[data-dual-norm="original"]').evaluate((el) => [...el.querySelectorAll('[data-diff-context], [data-diff-line]')]
+      .map((n) => ({ text: n.textContent, context: n.hasAttribute('data-diff-context'), tag: n.tagName })))
+    check(`${theme}：原流程一栏先是带 ON 的 JOIN 那一行（上级行），下面是缩进的那一个关联条件（高亮）`, rows.length === 2
+      && rows[0].context && rows[0].tag === 'SPAN' && rows[0].text === 'LEFT JOIN refunds AS refunds ON'
+      && !rows[1].context && rows[1].tag === 'MARK' && rows[1].text === `    ${td[1].slice(2).trim()}`, JSON.stringify(rows))
+    const other = gmv.locator('[data-dual-norm="blind"]')
+    check(`${theme}：盲算一栏照实说没有不同的行，不画只有原流程用得着的上级行`, (await text(other)).includes('这一边没有不同的行')
+      && await other.locator('[data-diff-context], [data-diff-line]').count() === 0, await text(other))
+    // 读得清：上级行的字色叠在代码框的底色上
+    const c = await gmv.locator('[data-dual-norm="original"] [data-diff-context]').evaluate((el) => {
+      let bg = 'rgba(0, 0, 0, 0)'
+      for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
+        const v = getComputedStyle(n).backgroundColor
+        if (v !== 'rgba(0, 0, 0, 0)' && v !== 'transparent') { bg = v; break }
+      }
+      return { fg: getComputedStyle(el).color, bg, base: getComputedStyle(document.body).backgroundColor, title: el.title }
+    })
+    const ratio = contrast(c.fg, c.bg, c.base)
+    check(`${theme}：上级行的字对比度 ≥ 4.5`, ratio >= 4.5, `${ratio.toFixed(2)}（${c.fg} on ${c.bg}）`)
+    check(`${theme}：悬停上级行说明它两边相同、标出所在的子句`, c.title === '淡色的行两边相同，标出所在的子句', c.title)
+    await shot(page, `approval-join-context-${theme}`)
+    check(`${theme}：页面没有报错`, errors.length === 0, errors.join('；'))
+  }
+  // 390px：标题后面的说明和带 ON 的 JOIN 那一行折行显示，不横向溢出
+  const narrow = await preview('dual-check-approval', { artifact: cardWith('join_condition'), width: 390, height: 844 })
+  await narrow.page.waitForSelector('[data-dual-check][data-state="ready"]')
+  const nt = metric(narrow.page, 'gmv').locator('[data-dual-compare-toggle]')
+  if ((await nt.getAttribute('aria-expanded')) !== 'true') await nt.click()
+  await narrow.page.waitForSelector('[data-dual-text-diff-hint]')
+  const w = await narrow.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('390px：带着上级行和说明也不横向溢出', w <= 0, `${w}px`)
 })
 
 /**
@@ -461,6 +520,18 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
         m.normDel.join('|') === real.del.join('|') && m.normAdd.join('|') === real.add.join('|'), `${m.normDel.join('|')} ‖ ${m.normAdd.join('|')}`)
       if (!real.add.length) {
         check('……一边没有不同的行时照实说', (await text(gmv.locator('[data-dual-norm="blind"]'))).includes('没有不同的行'))
+      }
+      // 规范化后每个条件一行（2026-10 验收：两个条件排在一行、三个拆成三行，两边相同的日期条件因为换行的位置不同被
+      // 标成了差异）。只差结束日期时，两边一样的开始日期不标，只标结束日期那一行
+      if (name === 'fallback') {
+        const marked = [...m.normDel, ...m.normAdd]
+        check('……两边相同的条件（开始日期）不标，只标不同的那一行', m.normDel.length === 1 && m.normAdd.length === 1
+          && !marked.some((l) => l.includes(">= '2026-09-01'"))
+          && marked.every((l) => l.includes("orders.paid_at < '2026-09-")), marked.join(' ‖ '))
+      }
+      if (name === 'two_filters') {
+        check('……一边多出的两个条件各占一行', m.normDel.includes("orders.channel = 'web'")
+          && m.normDel.includes("AND orders.status <> 'refunded'"), m.normDel.join(' | '))
       }
     }
     check(`${what}：页面没有报错`, errors.length === 0, errors.join('；'))

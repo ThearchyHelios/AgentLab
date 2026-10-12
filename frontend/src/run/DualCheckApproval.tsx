@@ -696,7 +696,7 @@ const MAX_LCS_CELLS = 250_000
 /**
  * 两段原文按行比（不看空白、大小写和行尾的逗号分号），返回两边各自不在最长公共子序列里的行号。
  *
- * 不拿 text_diff 去对原文：服务端的 text_diff 是规范化之后的行（列名带表名、条件并成一行），和原文的行几乎从来
+ * 不拿 text_diff 去对原文：服务端的 text_diff 是规范化之后的行（列名带表名、每个条件一行），和原文的行几乎从来
  * 对不上。一行都对不上（写法完全不同、各写成一行）时返回 null：整段都标出来没有信息量，差在哪看规范化后的行
  */
 function lineDiff(a: string[], b: string[]): { a: Set<number>; b: Set<number> } | null {
@@ -727,6 +727,36 @@ function lineDiff(a: string[], b: string[]): { a: Set<number>; b: Set<number> } 
 /** SQL 原文按行切（去掉末尾的空白行） */
 const linesOf = (sql: unknown): string[] | null => (hasSql(sql) ? (sql as string).replace(/\s+$/, '').split('\n') : null)
 
+/** 规范化后的一行：context 是服务端带上的上级行（「  」开头、两边相同），只为标出不同的行在哪个子句里，不高亮 */
+interface NormLine { text: string; context: boolean }
+
+/** 行首的空格数：服务端的规范化写法用空格缩进，子句的内容缩在子句名下面 */
+const depthOf = (line: string): number => line.length - line.trimStart().length
+
+/**
+ * text_diff 里一栏的行：这一边（「- 」原流程、「+ 」盲算）不同的行，加上它们用得着的上级行。服务端在不同的行前面带上
+ * 各级上级行（「  」开头：条件在哪个 WHERE、哪个 JOIN 的 ON、哪层子查询里），两边共用一份；这里只留这一边的不同行
+ * 往上数用得着的——排在前面、缩进比它浅的最近一行，一层层往上——另一边才用得着的不放进这一栏（一边多出一个 WHERE 时，
+ * 另一边关联条件上面那一行 JOIN 和它无关）。这一边没有不同的行时一行都不留，栏里照实说没有
+ */
+function normSide(lines: string[], mark: '- ' | '+ '): NormLine[] {
+  const own = lines.filter((l) => l.startsWith(mark) || l.startsWith('  '))
+    .map((l) => ({ text: l.slice(2), context: l.startsWith('  ') }))
+  if (!own.some((l) => !l.context)) return []
+  const keep = new Set<number>()
+  own.forEach((line, i) => {
+    if (line.context) return
+    let depth = depthOf(line.text)
+    for (let k = i - 1; k >= 0 && depth > 0; k--) {
+      const above = own[k]
+      if (!above.text.trim() || depthOf(above.text) >= depth) continue
+      if (above.context) keep.add(k)
+      depth = depthOf(above.text)
+    }
+  })
+  return own.filter((line, i) => !line.context || keep.has(i))
+}
+
 function valueText(v: unknown): string {
   if (v == null) return NONE
   if (typeof v === 'number') return Number.isFinite(v) ? v.toLocaleString('en-US', { maximumFractionDigits: 6 }) : String(v)
@@ -750,17 +780,16 @@ const CODE_BOX = 'overflow-y-auto whitespace-pre-wrap rounded border bg-panel px
 /**
  * 对照两条 SQL：先列每个输入两边各取到多少；再把不同的输入的两条 SQL 原文左右并排（卡片窄于 32rem 时上下排，按卡片
  * 自己的宽度算，画布右栏里也是上下排），两段原文按行比出的不同行高亮；最后是规范化后不同的行（服务端的 text_diff），
- * 同样分原流程、盲算两栏，每行高亮——原文格式差得太远、按行比不出东西时，差在哪就看这一段
+ * 同样分原流程、盲算两栏，不同的行高亮，前面淡色的是它所在子句的那几行（见 normSide）——原文格式差得太远、按行比不出
+ * 东西时，差在哪就看这一段
  */
 function Compare({ id, metric }: { id: string; metric: DualCheckMetric }) {
   const pairs = useMemo(() => pairsOf(metric), [metric])
   const norm = useMemo(() => {
     const lines = (Array.isArray(metric.diff?.text_diff) ? metric.diff.text_diff : []).filter((l): l is string => typeof l === 'string')
-    return {
-      original: lines.filter((l) => l.startsWith('- ')).map((l) => l.slice(2)),
-      blind: lines.filter((l) => l.startsWith('+ ')).map((l) => l.slice(2)),
-    }
+    return { original: normSide(lines, '- '), blind: normSide(lines, '+ ') }
   }, [metric])
+  const withContext = norm.original.some((l) => l.context) || norm.blind.some((l) => l.context)
   const differing = pairs.filter((p) => p.differs)
   return (
     <div id={id} className="mt-1.5 min-w-0 space-y-2" data-dual-compare="">
@@ -784,7 +813,9 @@ function Compare({ id, metric }: { id: string; metric: DualCheckMetric }) {
       {(differing.length ? differing : pairs).map((p) => <PairSql key={p.path} pair={p} />)}
       {(norm.original.length > 0 || norm.blind.length > 0) && (
         <div data-dual-text-diff="">
-          <div className="mb-0.5 text-2xs text-faint">{T.textDiff}</div>
+          <div className="mb-0.5 text-2xs text-faint">
+            {T.textDiff}{withContext && <span data-dual-text-diff-hint="">{` · ${T.textDiffContext}`}</span>}
+          </div>
           <div className="grid grid-cols-1 gap-2 @lg:grid-cols-2">
             <NormPane side="original" lines={norm.original} />
             <NormPane side="blind" lines={norm.blind} />
@@ -866,8 +897,11 @@ function SqlPane({ side, label, lines, marks }: { side: 'original' | 'blind'; la
   )
 }
 
-/** 规范化后不同的行的一栏：这一边的「- 」（原流程）或「+ 」（盲算）行，每行高亮；这一边一行都没有时照实说 */
-function NormPane({ side, lines }: { side: 'original' | 'blind'; lines: string[] }) {
+/**
+ * 规范化后不同的行的一栏：这一边的「- 」（原流程）或「+ 」（盲算）行，每行高亮；前面带着的上级行（两边相同，标出在
+ * 哪个子句里）不高亮、用淡一级的字色，同原文栏里没标的行；这一边一行都没有时照实说
+ */
+function NormPane({ side, lines }: { side: 'original' | 'blind'; lines: NormLine[] }) {
   const label = side === 'original' ? DUAL_CHECK_TEXT.original : DUAL_CHECK_TEXT.blind
   return (
     <figure className="m-0 min-w-0" data-dual-norm={side}>
@@ -875,11 +909,17 @@ function NormPane({ side, lines }: { side: 'original' | 'blind'; lines: string[]
       <div className={clsx('max-h-48', CODE_BOX, lines.length ? 'mono' : 'font-sans text-faint')} tabIndex={0} role="group"
            aria-label={`${T.textDiff} · ${label}`}>
         {lines.length
-          ? lines.map((line, i) => (
-            <mark key={i} className="mb-px block rounded-sm px-1 last:mb-0" style={MARK} data-diff-line={side === 'original' ? 'del' : 'add'}>
-              {line || ' '}
-            </mark>
-          ))
+          ? lines.map((line, i) => (line.context
+            ? (
+              <span key={i} className="mb-px block px-1 text-dim last:mb-0" title={T.textDiffContext} data-diff-context="">
+                {line.text || ' '}
+              </span>
+            )
+            : (
+              <mark key={i} className="mb-px block rounded-sm px-1 last:mb-0" style={MARK} data-diff-line={side === 'original' ? 'del' : 'add'}>
+                {line.text || ' '}
+              </mark>
+            )))
           : <span className="px-1">{T.textDiffNone}</span>}
       </div>
     </figure>

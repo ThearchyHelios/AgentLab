@@ -334,6 +334,52 @@ async def test_schema_tool_still_lists_everything_when_asked_for_nothing(source)
     assert "张表" in out and "orders" in out
 
 
+@pytest.fixture
+async def depots(tmp_path):
+    """两张表的库（虚构的仓储）：parcels、depots，结构已探查。"""
+    from app.data import introspect
+
+    path = tmp_path / "depots.db"
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE parcels (id INTEGER PRIMARY KEY, depot_id INTEGER, fee REAL);"
+                     "CREATE TABLE depots (id INTEGER PRIMARY KEY, zone TEXT);")
+    db.commit()
+    db.close()
+    src = SimpleNamespace(id="tool-args-depots-src", name="depots", kind="sqlite", database=str(path), host=None,
+                          port=None, username=None, password=None, options={}, readonly=True, description="测试库",
+                          schema_cache={})
+    src.schema_cache = await introspect.introspect(src)
+    return src
+
+
+@pytest.mark.parametrize("written", ['["parcels", "depots"]', '["parcels","depots"]', ' [ "parcels" , "depots" ] ',
+                                     ['["parcels", "depots"]'], ['["parcels"]', "depots"]])
+async def test_schema_tool_reads_a_json_array_written_as_one_string(depots, written) -> None:
+    """2026-10 验收：模型把 table 写成一整个字符串 '["orders", "stores"]'（参数说明里的 ["user","roles"] 引得它这么写），
+    只按逗号拆就成了「没有 ["orders"」「没有 "stores"]」——两张都在，模型却白白多调了几轮。写成字符串的 JSON 数组
+    和逗号分隔一样认。"""
+    out = await _make_schema_tool(depots).coroutine(table=written)
+    assert out.count("表 parcels") == 1 and out.count("表 depots") == 1, out
+    assert "没有" not in out
+
+
+async def test_schema_tool_reads_a_one_table_json_array(depots) -> None:
+    out = await _make_schema_tool(depots).coroutine(table='["parcels"]')
+    assert out.startswith("表 parcels") and "depots" not in out and "没有" not in out
+    # 空数组和不传一样：列出所有表
+    assert "共 2 张表" in await _make_schema_tool(depots).coroutine(table="[]")
+
+
+@pytest.mark.parametrize("written,missing", [
+    ("[parcels]", "[parcels]"),         # 不是 JSON（名字没加引号）：照旧整个当表名
+    ("['parcels']", "['parcels']"),     # 单引号也不是 JSON
+    ("[1, 2]", "[1"),                   # 数组里不是表名：照旧按逗号拆
+])
+async def test_schema_tool_leaves_other_bracketed_text_as_before(depots, written, missing) -> None:
+    out = await _make_schema_tool(depots).coroutine(table=written)
+    assert f"中没有 {missing}。" in out
+
+
 def test_copilot_is_told_not_to_pin_max_steps() -> None:
     """Copilot 把 max_steps: 8 写进了生成的图，后端默认值根本轮不上。"""
     from app.api.copilot import NODE_REFERENCE

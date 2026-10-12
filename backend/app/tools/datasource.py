@@ -644,6 +644,27 @@ async def _store_schema(source: Any, ctx: ToolContext, *,
         return None
 
 
+def _schema_tables(table: str | list[str] | None) -> list[str]:
+    """db_schema 的 table 参数 → 要看的表名。"user, roles"、["user","roles"]、整个写成一个字符串的 JSON 数组
+    '["user", "roles"]' 是同一个意思，模型三种都会写，为此拒绝一次调用纯属浪费一步。最后那种只按逗号拆就成了
+    「没有 ["user"」「没有 "roles"]」，两张表明明都在（2026-10 验收：盲算、反方审稿的核查 agent 因此白白多调了几轮
+    模型）。只认元素都是字符串的 JSON 数组，别的写法照旧按逗号拆。"""
+    wanted = [table] if isinstance(table, str) else list(table or [])
+    names: list[str] = []
+    for one in wanted:
+        text = str(one).strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list) and all(isinstance(t, str) for t in parsed):
+                names += parsed
+                continue
+        names.append(str(one))
+    return [t.strip() for one in names for t in one.split(",") if t.strip()]
+
+
 def _make_schema_tool(source: Any, *, fixed: bool = False,
                       catalog: Mapping[str, data_catalog.CatalogEntry] | None = None) -> StructuredTool:
     """source 同 _make_query_tool：上传源的表结构取绑定快照里冻结的那份。
@@ -655,10 +676,7 @@ def _make_schema_tool(source: Any, *, fixed: bool = False,
     async def _run(table: str | list[str] | None = None) -> str:
         if gone := _vanished(source, fixed):
             return f"{DATA_UNAVAILABLE}{gone}"
-        wanted = [table] if isinstance(table, str) else list(table or [])
-        # 逗号分隔也认："user, roles" 和 ["user","roles"] 是同一个意思，
-        # 而模型两种都会写。为此拒绝一次调用，纯属浪费一步
-        wanted = [t.strip() for one in wanted for t in str(one).split(",") if t.strip()]
+        wanted = _schema_tables(table)
         if wanted:
             return "\n\n".join(introspect.describe_table(source, t, catalog=notes) for t in wanted)
         tables = introspect.table_names(source)
