@@ -89,7 +89,7 @@ async def test_a_placeholder_rationale_is_recorded_as_no_rationale(monkeypatch, 
     first, second = record["claims"]
     assert (first["verdict"], first["rationale"], first["rationale_doc"]) == ("stands", "", None)
     assert second["verdict"] == "inconclusive"
-    assert second["rationale"] == "理由没有引用到任何查询结果，反方给出的「被推翻」不予采信，记为无法判断。反方没有给出理由"
+    assert second["rationale"] == "反方判了「被推翻」，但没有给出理由，不予采信，记为无法判断。"
     assert "placeholder" not in str(record)
     assert issuance["tier"] == "formal"
 
@@ -103,7 +103,7 @@ async def test_a_rationale_that_shows_nothing_is_recorded_as_no_rationale(monkey
     first, second = record["claims"]
     assert (first["verdict"], first["rationale"], first["rationale_doc"]) == ("stands", "", None)
     assert second["verdict"] == "inconclusive" and second["rationale_doc"] is None
-    assert second["rationale"].endswith("反方给出的「被推翻」不予采信，记为无法判断。反方没有给出理由")
+    assert second["rationale"] == "反方判了「被推翻」，但没有给出理由，不予采信，记为无法判断。"
     assert issuance["tier"] == "formal", "没有理由的「被推翻」不能让出具降档"
 
 

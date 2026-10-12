@@ -382,7 +382,10 @@ def _claim_of(cand: judging.Candidate, outcome: VerifyOutcome) -> tuple[dict[str
         why = "反查没有执行成功任何查询"
         return _unfounded(cand, outcome, verdict, why), why
     if verdict == "refuted" and not _cites(outcome.rationale):
-        return _unfounded(cand, outcome, verdict, "理由没有引用到任何查询结果"), None
+        # 理由是空的（只写了占位词的，核查 agent 已经按没给理由交回，见 verify_agent._no_rationale）：照实说没给理由，
+        # 不说「理由没有引用到…」再接「反方没有给出理由」
+        why = "理由没有引用到任何查询结果" if rationale.strip() else None
+        return _unfounded(cand, outcome, verdict, why), None
     return _claim(cand, verdict, rationale, doc=outcome.rationale, queries=outcome.queries, usage=outcome.usage), None
 
 
@@ -486,12 +489,17 @@ def _cites(doc: dict[str, Any] | None) -> bool:
     return isinstance(doc, dict) and any(unit.get("cites") for _, unit in iter_units(doc))
 
 
-def _unfounded(cand: judging.Candidate, outcome: VerifyOutcome, verdict: str, why: str) -> dict[str, Any]:
-    """没有出处的结论：记为无法判断，系统写明原因，反方原本的结论和理由照录在后面（照录的写法见 _said）。
+def _unfounded(cand: judging.Candidate, outcome: VerifyOutcome, verdict: str, why: str | None) -> dict[str, Any]:
+    """没有出处的结论：记为无法判断，系统写明原因，反方原本的结论和理由照录在后面（照录的写法见 _said）。why 为 None：
+    反方判了结论却根本没给理由，一句话说清（不再先说「理由没有引用到…」、后面又说「没有给出理由」）。
     rationale_doc 为 None：这段话是系统说的，界面照 rationale 显示，不拿反方那份文档冒充理由。查过的照记。"""
-    taken = f"反方给出的「{_VERDICT_LABEL[verdict]}」不予采信，记为无法判断" if verdict != "inconclusive" else "记为无法判断"
+    label = _VERDICT_LABEL[verdict]
+    if why is None:
+        text = f"反方判了「{label}」，但没有给出理由，不予采信，记为无法判断。"
+        return _claim(cand, "inconclusive", text, queries=outcome.queries, usage=outcome.usage)
+    taken = f"反方给出的「{label}」不予采信，记为无法判断" if verdict != "inconclusive" else "记为无法判断"
     rationale = _said(outcome.rationale, str((outcome.result or {}).get(RATIONALE) or "")).strip()
-    said = f"反方的理由：{rationale}" if rationale else "反方没有给出理由"
+    said = f"反方的理由：{rationale}" if rationale else "反方没有给出理由。"
     return _claim(cand, "inconclusive", f"{why}，{taken}。{said}", queries=outcome.queries, usage=outcome.usage)
 
 

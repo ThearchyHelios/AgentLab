@@ -2174,7 +2174,8 @@ def test_internal_wording_from_the_agent_is_not_shown():
         return inquiry_mod._error_words(outcome, timeout_s=120, daily_max_usd=2.0)
 
     assert words("收尾时超过时长上限，没能交结果", limit="timeout_s") == \
-        "回答超过时长上限（120 秒），未能给出回答，可缩小问题范围后重新提问"
+        ("回答超过时长上限（120 秒）：整理回答这一步超时，未能给出回答，可在设置的「核查」一节调大审批质询的时长上限，"
+         "或换用更快的核查模型后重新提问")
     assert words("已达全局每日核查金额上限 $2.00，没能交结果", limit="daily_max_usd") == \
         "今日核查花费已达上限（核查每日金额上限 $2.00），未能给出回答，可在设置的「核查」一节调高上限"
     assert words("核查模型没有按结构交结果（交回的内容里没有要求的字段：rationale）") == \

@@ -310,7 +310,10 @@ NO_ANSWER = "模型没有给出回答内容，请重新提问"
 LEAKED = "回答中含有设了遮罩的值，无法遮住，已不予展示，请换个问法重新提问"
 ERR_DAILY = "今日核查花费已达上限（{cap}），未能给出回答，可在设置的「核查」一节调高上限"
 ERR_COST = "这次回答的花费已达上限，未能给出回答，可缩小问题范围后重新提问"
-ERR_TIMEOUT = "回答超过时长上限{seconds}，未能给出回答，可缩小问题范围后重新提问"
+ERR_TIMEOUT = "回答超过时长上限{seconds}，未能给出回答，可缩小问题范围，或在设置的「核查」一节调大审批质询的时长上限后重新提问"
+#: 查完、整理回答那一步（收尾调用）超时：问题再小也一样要整理，缩小范围帮不上，说调大时长上限或换更快的核查模型
+ERR_SETTLE_TIMEOUT = ("回答超过时长上限{seconds}：整理回答这一步超时，未能给出回答，可在设置的「核查」一节调大审批质询的"
+                      "时长上限，或换用更快的核查模型后重新提问")
 ERR_SHAPE = "模型未能按要求给出回答，请重新提问；如反复出现，请在设置的「核查」一节更换核查模型"
 ERR_SILENT = "模型没有给出回复，未能给出回答，请重新提问"
 # 回答末尾的系统说明（with_note：另起一段，不挂出处、不查裸数字）
@@ -1896,7 +1899,7 @@ def _error_words(outcome: VerifyOutcome, *, timeout_s: Any, daily_max_usd: Any) 
             return _timeout_words(timeout_s)
         return ERR_COST
     if error.startswith("收尾时超过时长上限"):
-        return _timeout_words(timeout_s)
+        return _timeout_words(timeout_s, ERR_SETTLE_TIMEOUT)
     if error.startswith("核查模型没有按结构交结果"):
         return ERR_SHAPE
     if error == "核查模型没有给出回复":
@@ -1906,9 +1909,9 @@ def _error_words(outcome: VerifyOutcome, *, timeout_s: Any, daily_max_usd: Any) 
     return error
 
 
-def _timeout_words(timeout_s: Any) -> str:
+def _timeout_words(timeout_s: Any, words: str = ERR_TIMEOUT) -> str:
     seconds = timeout_s if isinstance(timeout_s, (int, float)) and not isinstance(timeout_s, bool) else None
-    return ERR_TIMEOUT.format(seconds=f"（{seconds:g} 秒）" if seconds is not None else "")
+    return words.format(seconds=f"（{seconds:g} 秒）" if seconds is not None else "")
 
 
 def _given_numbers(ask: Ask) -> list[str]:

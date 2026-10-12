@@ -80,7 +80,8 @@ async def test_a_final_answer_that_runs_out_of_time_reports_the_time_limit(monke
     item, [event] = await _asked(client, shop)
     answer = item["answer"]
     assert answer["ok"] is False and answer["text"] == "" and answer["doc_artifact"] is None
-    assert answer["error"] == "回答超过时长上限（0.5 秒），未能给出回答，可缩小问题范围后重新提问"
+    assert answer["error"] == ("回答超过时长上限（0.5 秒）：整理回答这一步超时，未能给出回答，可在设置的「核查」一节调大"
+                               "审批质询的时长上限，或换用更快的核查模型后重新提问")
     assert answer["limit"] == "timeout_s"
     assert [q["sql"] for q in item["queries"]] == [NO_TEST], "查到的照记"
     assert (event.data["limit"], event.data["error"]) == ("timeout_s", answer["error"])
