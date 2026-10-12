@@ -10,7 +10,8 @@ GET /api/runs/{run_id}/evidence/whatif/rows：推演时勾行用，按页取封�
 只认这次运行封存范围内的工件，和证据接口同一套白名单（api/evidence.py 的 _sealed / _sealed_loader）：口径卡的指标集
 从封存的 node.finished 台账找，排除行只认封存范围内交回过的查询快照，nodes.* 的完整值从封存的节点产出工件取，
 vars.* 的完整值（value_artifact）只认封存的指标集里写着的。还在跑、停在审批的运行也能推演，结果里 sealed 为假：
-数据可能还会变。遮罩列（查询当时记下的加数据源现在设的）不给值、也不能拿来推演，见 engine/recompute.py。
+数据可能还会变。遮罩列（查询当时记下的加数据源现在设的，SQL 里改了名字的也算）不给值、也不能拿来推演，用到它的指标
+原值也不给，见 engine/recompute.py。
 
 重算本身是纯函数（engine/recompute.py）。这里负责：认请求、找卡、准备工件和遮罩、找报告里引用的地方、标出可能受影响
 的下游口径卡。
@@ -30,14 +31,15 @@ from app.api.evidence import (
     MISSING_QUERY,
     REPORT_NOT_FOUND,
     TAMPERED_QUERY,
+    _MEMO,
     _Masks,
-    _merge_masks,
-    _recorded_masks,
+    _MaskSets,
     _reports,
     _Sealed,
     _sealed,
     _sealed_cards,
     _sealed_loader,
+    _snapshot_secrets,
 )
 from app.core.artifact_store import load
 from app.engine import recompute
@@ -115,7 +117,8 @@ async def evidence_whatif_rows(run_id: str, artifact: str | None = None, offset:
     """一页查询快照的行：{artifact, columns, rows, row_offset, row_index, total_rows, masked, hash_ok, sealed, note?}。
 
     形状和证据面板的查询步骤一致（界面用同一个函数读）。只认这次运行封存范围内交回过的快照；遮罩列（查询当时记下的
-    加数据源现在设的）写「已遮罩」；读不出来、与哈希不一致的不给行，note 照实说。只读：不追加事件、不落工件。
+    加数据源现在设的，SQL 里改了名字的也算）写「已遮罩」；读不出来、与哈希不一致的不给行，note 照实说。只读：不追加
+    事件、不落工件。
     """
     if not artifact or not artifact.strip():
         raise CodedHTTPException(422, "请求格式有误：artifact 应为查询快照的工件 ID", BAD_REQUEST)
@@ -243,9 +246,10 @@ def _sources(sealed: _Sealed, cards: list[tuple[str, str, dict[str, Any]]], star
     """重算要用的东西（recompute.Sources）：封存范围内的工件、口径卡那次执行之前的节点产出和跑完的时刻、快照交回的
     时刻、用到哪份才算哪份的遮罩。拿到的 Sources 要在工作线程里用（_Hidden 在线程里等事件循环查库）。"""
     loader = _loader(sealed, cards)
+    hidden = _Hidden(sealed, loader, loop)
     return recompute.Sources(load=loader, queries=tuple(sealed.queries), outputs=_outputs_before(sealed, started),
-                             masked=_Hidden(sealed, loader, loop), returned=_returned(sealed),
-                             finished=_finished_before(sealed, started))
+                             masked=hidden, returned=_returned(sealed), finished=_finished_before(sealed, started),
+                             secrets=hidden.secrets)
 
 
 def _outputs_before(sealed: _Sealed, started: int) -> dict[str, str]:
@@ -312,38 +316,72 @@ def _loader(sealed: _Sealed, cards: list[tuple[str, str, dict[str, Any]]]) -> An
 class _Hidden(Mapping[str, frozenset[str]]):
     """封存范围内的查询快照 → 要遮的列（小写），推演用到哪份才算哪份。
 
-    遮的列和证据面板查询步骤同一套（api/evidence.py 的 _query_step）：查询当时记下的加数据源现在设的，合并查询按它
-    合并的那几个数据源算。快照读不出来、被改过时照样按台账记的数据源算：遮罩不能因为快照坏了就失效（那一格的值另由
-    重算不给）。
+    遮的列和证据面板查询步骤同一套（api/evidence.py 的 _mask_sets）：查询当时记下的加数据源现在设的，按 SQL 认出
+    改了名字的也算，合并查询按它合并的那几个数据源、逐格来历和合并 SQL 算。快照读不出来、被改过时照样按台账记的数据源
+    算：遮罩不能因为快照坏了就失效（那一格的值另由重算不给）。
 
     在重算的工作线程里取用：快照经推演用的同一个 loader 读（重算本来也要读这一份，读过的不再读盘）；查数据源现在
     设的遮罩要访问库，交回事件循环去查（_Masks 是异步的），线程在这里等它。以前每次请求在事件循环里把这次运行的
     全部快照读一遍、复验一遍哈希，不管卡上用没用到。
+
+    secrets 同样在工作线程里收：这次运行查到过的遮罩值（和证据面板的 _Masks.run_secrets 同一个口径、同一份进程内记录
+    _MEMO），重算里认不出出处的输入、整份结果当输入的指标要按值认时才收，一次请求只收一次；证据面板、之前的推演收过的
+    快照不再读。分析结果同样按快照工件记在进程里。
     """
 
     def __init__(self, sealed: _Sealed, loader: Any, loop: asyncio.AbstractEventLoop) -> None:
         self._sealed, self._loader, self._loop = sealed, loader, loop
         self._masks = _Masks()
-        self._memo: dict[str, frozenset[str]] = {}
+        self._memo: dict[str, _MaskSets] = {}
+        self._secrets: Any = None
+        self._collected = False
 
     def __getitem__(self, artifact: str) -> frozenset[str]:
+        return frozenset(self._sets(artifact)[1].hidden)
+
+    def _sets(self, artifact: str) -> tuple[Any, _MaskSets]:
+        """(读出来的快照，读不出来为 None；它的遮罩)。"""
         key = str(artifact)
         if key not in self._sealed.queries:
             raise KeyError(key)
+        try:
+            snap = self._loader(key)
+        except ValueError:
+            snap = None
+        snap = snap if isinstance(snap, dict) else None
         if key not in self._memo:
-            try:
-                running = asyncio.get_running_loop()
-            except RuntimeError:
-                running = None
-            if running is self._loop:
-                raise RuntimeError("遮罩只能在工作线程里取：在事件循环里同步等它查库会卡死")
-            try:
-                snap = self._loader(key)
-            except ValueError:
-                snap = None
-            found = _mask_of(snap if isinstance(snap, dict) else None, self._sealed.queries[key], self._masks)
-            self._memo[key] = frozenset(asyncio.run_coroutine_threadsafe(found, self._loop).result())
-        return self._memo[key]
+            found = _mask_sets_of(snap, self._sealed.queries[key], self._masks, key)
+            self._memo[key] = self._wait(found)
+        return snap, self._memo[key]
+
+    def secrets(self) -> Any:
+        """这次运行查到过的遮罩值（masking._Secrets，没有为 None）：数据源现在设了遮罩、或者已经不在了的查询快照里确定
+        取自遮罩列的值，合并查询不收（api/evidence.py 的 _snapshot_secrets）。每份快照收到的值先查进程内记录（_MEMO），
+        记过的不再读。"""
+        if not self._collected:
+            self._collected = True
+            parts = []
+            for artifact, _source, key in self._wait(self._masks.value_keys(self._sealed.queries)):
+                known, got = _MEMO.values(key)
+                if not known:
+                    snap, sets = self._sets(artifact)
+                    if snap is None or snap.get("source") == MERGE_SOURCE:
+                        continue
+                    got = _MEMO.keep_values(key, _snapshot_secrets(snap, sets))
+                parts.append((key, got))
+            self._secrets = _MEMO.pooled(parts)
+        return self._secrets
+
+    def _wait(self, coro: Any) -> Any:
+        """在工作线程里等事件循环跑完 coro（查库）。在事件循环里同步等会卡死，直接报错。"""
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            coro.close()
+            raise RuntimeError("遮罩只能在工作线程里取：在事件循环里同步等它查库会卡死")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._sealed.queries)
@@ -352,10 +390,14 @@ class _Hidden(Mapping[str, frozenset[str]]):
         return len(self._sealed.queries)
 
 
+async def _mask_sets_of(snap: dict[str, Any] | None, info: dict[str, Any], masks: _Masks,
+                        artifact: str | None = None) -> _MaskSets:
+    """一份查询快照的遮罩，和证据面板的查询步骤同一个函数（api/evidence.py 的 _mask_sets）：查询当时记下的加数据源现在
+    设的，SQL 里给遮罩列起了别名、套了函数的结果列也算。snap 为 None（读不出来）时只能按台账记的数据源现在设的遮罩算。
+    artifact 是 snap 的工件 id：给了的，分析结果按快照记在进程里，之后的推演、证据面板不再分析。"""
+    return await masks.sets(artifact, info.get("source"), snap)
+
+
 async def _mask_of(snap: dict[str, Any] | None, info: dict[str, Any], masks: _Masks) -> set[str]:
-    """一份查询快照要遮的列（小写）。snap 为 None（读不出来）时只能按台账记的数据源现在设的遮罩算。"""
-    if snap is not None and snap.get("source") == MERGE_SOURCE:
-        hidden, _ = await _merge_masks(snap, masks)
-        return hidden
-    hidden, _ = await masks.of(info.get("source") or (snap or {}).get("source"))
-    return hidden | (_recorded_masks(snap) if snap is not None else set())
+    """一份查询快照要遮的列（小写，_mask_sets_of 的 hidden）。运行对比（api/compare.py）按这个名字调用。"""
+    return (await _mask_sets_of(snap, info, masks)).hidden

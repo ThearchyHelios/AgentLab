@@ -9,8 +9,8 @@ import clsx from 'clsx'
 import { ApiError } from '../api/client'
 import { Spinner, StatusBadge, isComposing } from '../components/ui'
 import {
-  EVIDENCE_KIND_STYLE, EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, claimBasis, closestNames, docForeign,
-  entitySources, evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, isJudged,
+  EVIDENCE_KIND_STYLE, EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, citeLabel, claimBasis, closestNames,
+  docForeign, entitySources, evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, isJudged,
   isJudgeLimit, judgeFlags, judgeLimitWords, judgeable, judgedVerdicts, limitOf, pointsToSettings,
   locatable, locatorText, notableInput, queryOf, queryWindow, quoteWhere, quoteWindow, reasonOf, rewriteOf, sealVerdict,
   segName, segmentKind, segmentState, sourceOf, unitText, unitVerdict, verdictMissing, verdictState, type ClaimBasis as Basis,
@@ -19,7 +19,7 @@ import {
 import { humanizeError } from '../lib/errors'
 import { formatDateTime, formatNumber, NONE, shortId } from '../lib/format'
 import {
-  ABSENCE_CLAIM_TEXT, CHALLENGE_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT,
+  ABSENCE_CLAIM_TEXT, CHALLENGE_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MASKED_CELL_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT,
   SQL_CHECK_TEXT, nodeTypeLabel,
 } from '../lib/terms'
 import { useCatalog } from '../store/catalog'
@@ -121,7 +121,7 @@ function maskedOf(input: EvidenceInput): string[] {
   return Array.isArray(raw) ? raw.filter((c): c is string => typeof c === 'string' && !!c) : []
 }
 
-/** 遮没遮核对不了的输入（快照、取值链上的产出读不出来）：值同样换成「已遮罩」，mask_unverified 是原因 */
+/** 遮没遮核对不了的输入（快照、取值链上的产出读不出来）：值换成「无法核对」，mask_unverified 是原因 */
 function unverifiedOf(input: EvidenceInput): string {
   const raw: unknown = input.mask_unverified
   return typeof raw === 'string' ? raw : ''
@@ -607,7 +607,16 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block, mark }: {
   // 一整句没有「这一段的证据」可言：封存核对通过时只说报告文档封存了，节点里当场判的判定跟着一起封存
   const sealLabel = sealed.status !== 'done' ? sealed.label
     : verdict && !late && isJudged(verdict) ? JUDGE_TEXT.sealedWithDoc : JUDGE_TEXT.sealedDoc
-  const cites = (unit.cites ?? []).map((alias) => ({ alias, label: doc.catalog?.[alias]?.label as string | undefined }))
+  // 挂的依据：说明按证据图（服务端已把用到遮罩列的指标的值换成「已遮罩」）写，不直接读文档目录里的「名称 = 渲染值」。
+  // 有指标依据时才去取证据图（正文挂上时一般已经取过，取过的不再发）
+  const graphSlot = useEvidence((s) => (runId ? s.graphs[runId] : undefined))
+  const loadGraph = useEvidence((s) => s.loadGraph)
+  const metricCite = (unit.cites ?? []).some((alias) => doc.catalog?.[alias]?.kind === 'metric')
+  useEffect(() => {
+    if (runId && metricCite) void loadGraph(runId)
+  }, [runId, metricCite, loadGraph])
+  const graph = !foreign && graphSlot?.status === 'ok' ? graphSlot.data : undefined
+  const cites = (unit.cites ?? []).map((alias) => ({ alias, label: citeLabel(alias, doc, graph, report, !!runId) }))
   // 讲方法、讲结构的句子：SQL 和字段清单直接列在挂的依据下面。正文不是封存的那份时不列（链是另一份报告的）
   const basis = useMemo(() => (foreign ? null : claimBasis(unit, doc)), [foreign, unit, doc])
   // 反方审稿对这一句的判断：服务端只认审的就是封存的这一份文档；正文不是那一份时不用。片段接口还没答、答不了时先按正文
@@ -1472,7 +1481,7 @@ function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) 
   const host = useEvidenceHost()
   const missing = input.status === 'missing' || input.value == null
   // 取自遮罩列（期 4）：服务端已把值换成「已遮罩」，这里照查询表格里遮罩格的样子写，读着不像一个真值。遮没遮核对不了的
-  // （快照读不出来）一样不显示值，悬停说明原因
+  // （快照读不出来）一样不显示值，写「无法核对」，悬停说明原因
   const unverified = unverifiedOf(input)
   const masked = !missing && (maskedOf(input).length > 0 || !!unverified)
   // Agent 交来、被截断切开的数组字段：对它计数、求和只算到了取回的那部分
@@ -1483,7 +1492,9 @@ function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) 
     cut && ` · ${EVIDENCE_TEXT.inputTruncated}`,
     masked && ` · ${unverified ? EVIDENCE_TEXT.unverifiedInput(unverified) : EVIDENCE_TEXT.maskedInput}`].filter(Boolean).join('')
   const style = missing || cut ? { color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' } : { color: 'var(--text)' }
-  const shown = masked ? EVIDENCE_TEXT.masked : valueText(input.value)
+  // 值那里的字照服务端写的（「已遮罩」，遮没遮核对不了的「无法核对」）；认不出的一律写「已遮罩」，不把别的字当值显示
+  const shown = !masked ? valueText(input.value)
+    : input.value === EVIDENCE_TEXT.unverifiedValue ? EVIDENCE_TEXT.unverifiedValue : EVIDENCE_TEXT.masked
   const body = (
     <span className="truncate">
       {masked ? <span className="font-sans italic text-faint">{shown}</span> : shown} ← {input.path ?? NONE}
@@ -1835,6 +1846,7 @@ const CODE_LABEL: Record<string, string> = {
   unknown_entity: '疑似不存在的名称',
   unverified_entity: '无法核实的名称',
   absence_claim: ABSENCE_CLAIM_TEXT.label,
+  masked_cell: MASKED_CELL_TEXT.label,
 }
 
 /** 违规清单：报告撰写节点核对出来的全部问题，画得出线的能定位，画不出的说清在哪 */

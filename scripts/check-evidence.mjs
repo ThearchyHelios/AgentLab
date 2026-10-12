@@ -3362,10 +3362,10 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
       body.redacted = { columns: ['order_cnt'], note: '这些列在数据源中设置了遮罩' }
     }
     if (id === 's23' && metric) {
-      // 遮没遮核对不了（快照读不出来）：同样不显示值，原因是服务端写好的一句，不进遮罩列
+      // 遮没遮核对不了（快照读不出来）：同样不显示值，值那里写「无法核对」，原因是服务端写好的一句，不进遮罩列
       for (const st of body.chain) {
         if (st.step === 'input' && st.path === 'vars.kpi.refund_cnt') {
-          Object.assign(st, { value: '已遮罩', mask_unverified: '查询快照无法读取，核对不了这一格是否取自设置了遮罩的列' })
+          Object.assign(st, { value: '无法核对', mask_unverified: '查询快照无法读取，核对不了这一格是否取自设置了遮罩的列' })
         }
       }
     }
@@ -3444,13 +3444,17 @@ await section('verify', '期 4：指标步骤的双盲复算、取自遮罩列�
     && await p.locator('[data-ev-input="vars.kpi.gmv"]').getAttribute('data-ev-input-masked') === null)
   check('面板底下写明遮罩的列和遮罩不是安全边界', (await p.locator('[data-ev-mask-note]').innerText().catch(() => '')).includes('order_cnt'))
   await pg.keyboard.press('Escape')
-  // 遮没遮核对不了：同样写「已遮罩」，悬停说明原因（快照读不出来），不算进遮罩列
+  // 遮没遮核对不了：不显示值，写「无法核对」（不写「已遮罩」：数据源可能根本没设遮罩），悬停说明原因（快照读不出来），
+  // 不算进遮罩列
   await openSeg(pg, 's23', '[data-ev-substituted]')
   const unsure = p.locator('[data-ev-input="vars.kpi.refund_cnt"]')
   const unsureTitle = await unsure.getAttribute('title').catch(() => '')
-  check('遮没遮核对不了的输入：标签写「已遮罩」，悬停写明快照读不出来、不显示值',
-    await unsure.getAttribute('data-ev-input-masked') === '' && (await unsure.innerText()).includes('已遮罩')
-      && (unsureTitle ?? '').includes('查询快照无法读取，核对不了这一格是否取自设置了遮罩的列，不显示值'), unsureTitle ?? '')
+  const unsureText = await unsure.innerText().catch(() => '')
+  check('遮没遮核对不了的输入：标签写「无法核对」、不写「已遮罩」，悬停写明快照读不出来、不显示值',
+    await unsure.getAttribute('data-ev-input-masked') === '' && unsureText.includes('无法核对')
+      && !unsureText.includes('已遮罩')
+      && (unsureTitle ?? '').includes('查询快照无法读取，核对不了这一格是否取自设置了遮罩的列，不显示值'),
+    `${unsureText} / ${unsureTitle ?? ''}`)
   check('……面板底下的遮罩说明不把它算进遮罩列', await p.locator('[data-ev-mask-note]').count() === 0)
   await pg.keyboard.press('Escape')
   check('核查状态那几页没有运行时报错', r.errors.length === 0, r.errors.join(' | '))

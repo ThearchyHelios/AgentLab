@@ -247,6 +247,18 @@ export const ABSENCE_CLAIM_TEXT = {
     + '或换用上下文窗口更大的写作模型后重新运行',
 }
 
+/**
+ * 报告直接引用了取自遮罩列的格子（报告自查的 masked_cell：[[v:Q2.r0.tel]]，c.phone AS tel 这种改了名字的也算；遮罩按
+ * 列名对数据源里所有表生效，视图、别的表里同名的列也算），重写后仍在、「违规处置」为标注时照常产出：时间线上那一行（日志
+ * report_masked_cell）和证据面板违规清单里的叫法。自查只查引用，不按值在正文里找遮罩值。
+ * 只说记为缺口，不说出具：探索运行、没设出具契约的成果不出具，报告接在侧枝上时缺口也进不了出具，降不降档由出具那一行说
+ */
+export const MASKED_CELL_TEXT = {
+  label: '引用了遮罩列',
+  title: (n?: number) => `报告引用了${n ? ` ${formatNumber(n)} 处` : ''}取自遮罩列的格子，已标注`,
+  next: '数据源设置了遮罩的列不应写进报告，这几处已记为缺口。请在报告撰写节点的指令中去掉对这些列的引用后重新运行',
+}
+
 /** 证据面板和证据条的文案 */
 export const EVIDENCE_TEXT = {
   allCited: (n: number) => `${formatNumber(n)} 个数字都有出处`,
@@ -327,6 +339,8 @@ export const EVIDENCE_TEXT = {
   openSnapshot: '打开完整快照',
   snapshotTitle: (alias: string) => `查询 ${alias} · 完整快照`,
   masked: '已遮罩',
+  /** 遮没遮核对不了、不显示的值（快照、取值链上的产出读不出来）：和「已遮罩」分开，数据源可能根本没设遮罩 */
+  unverifiedValue: '无法核对',
   /** 面板底部：被遮罩的列 + 遮罩不是安全边界（用户拍板写明） */
   maskNote: (cols: string[]) =>
     `已遮罩的列：${cols.join('、')}。遮罩只减少暴露，不是安全边界：完整快照和原始工件中仍为原值`,

@@ -364,6 +364,9 @@ async def test_masked_columns_are_neither_shown_nor_used(client, monkeypatch, sh
     # 三个指标都用到了遮罩列：不改动也照实说推演不了，不报「无变化」；什么都没改，下游不受影响
     assert {k: (m["status"], m["changed"], m["rendered_new"]) for k, m in metrics.items()} == {
         k: ("masked", None, None) for k in ("amount5", "cnt", "per")}
+    # 原值：取自遮罩列的那一格不给；数行数的 cnt 照给（行数不是遮罩值，报告正文、证据面板的指标步骤也写 10 单）
+    assert metrics["amount5"]["old"] == metrics["amount5"]["rendered_old"] == "已遮罩" and metrics["amount5"]["withheld"]
+    assert (metrics["cnt"]["old"], metrics["cnt"]["rendered_old"]) == (10, "10单") and not metrics["cnt"].get("withheld")
     assert all(reasons[(k, None)] == metrics[k]["reason"] for k in metrics) and body["affected_cards"] == []
 
     resp = await client.post(f"/api/runs/{row.id}/evidence/whatif",
