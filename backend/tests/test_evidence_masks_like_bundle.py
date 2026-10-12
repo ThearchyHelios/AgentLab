@@ -1,4 +1,4 @@
-"""证据面板认遮罩列和可验证报告是同一个函数；查询步骤里写着的遮罩值、交给裁判的摘录同样不给。
+"""证据面板认遮罩列和可验证报告是同一个函数；查询步骤里写着的遮罩值同样不给；交给裁判的摘录照数据源设的遮罩列。
 
 复核发现：
 - 证据面板只按数据源的一种方言调 masking._derived_hidden，可验证报告另有几道（语法树认不准的写法、不点列名也读得出表里
@@ -6,8 +6,9 @@
   照给、可验证报告整份遮。现在面板调可验证报告的那个函数（bundle/build.py 的 _derived_columns），再按数据源的方言认一遍
 - 查询步骤原样给出 SQL 里写着的遮罩值（按号码筛的 WHERE c.phone IN (…)），合并 SQL、SQL 检查的片段也一样；可验证报告
   按「这次运行查到过的遮罩值」认出来、整份只给哈希。现在展示时换成「已遮罩」，底下写明只是展示时换的
-- 按需裁判交给裁判的摘录只按列名去掉 phone，c.phone AS tel 那一列的号码照样交给裁判。现在按证据面板同一个函数认出的列
-  也并进去
+- 第 2 轮把面板那套宁可多遮的列按数据源名并给裁判（裁判按数据源名合起来遮，对同一数据源的每一份快照都生效）：整份遮的
+  快照的全部列、只数个数的列一并从摘录里消失，被引用的金额、人数裁判看不到，只能判证据不足。第 3 轮退回 M2 之前的做法，
+  只按数据源设的列名遮；c.phone AS tel 这种改了名字的号码列仍会进摘录，是裁判摘录已知的缺口，另行处理（judge.py）
 
 真跑的部分用虚构的 SQLite 商城库（号码是编的），报告由 MockChatModel 照剧本写。
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 
 import pytest
@@ -26,7 +28,7 @@ from app.core import artifact_store
 from app.data.engine import engines
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run
-from app.engine.evidence import iter_segments
+from app.engine.evidence import iter_segments, iter_units
 from app.engine.runner import run_manager
 from app.main import app
 
@@ -196,26 +198,94 @@ def test_sql_check_excerpts_and_merge_parts_are_shown_with_values_masked():
 
 
 # --------------------------------------------------------------------------
-# 交给裁判的摘录
+# 交给裁判的摘录：照数据源设的遮罩列（复核第 3 轮退回 M2 之前的做法）
 # --------------------------------------------------------------------------
 
+#: 派生来源里有没起别名的 UPPER(c.phone)：证据面板整份遮（宁可多遮），可这份快照的列和号码无关
+SQL_WHOLE = ("SELECT name, amount FROM (SELECT c.name, UPPER(c.phone), o.amount FROM customers c "
+             "JOIN orders o ON o.customer_id = c.id) t ORDER BY amount DESC")
+#: 金额、只数个数的留号人数：值里没有号码，面板照可验证报告的认法把只数个数的那一列也遮
+SQL_TOTAL = ("SELECT ROUND(SUM(o.amount), 2) AS amount, COUNT(*) FILTER (WHERE c.phone IS NOT NULL) AS with_phone "
+             "FROM orders o JOIN customers c ON c.id = o.customer_id")
+JUDGED = "全部订单金额 [[v:Q2.r0.amount]]，其中 [[v:Q2.r0.with_phone]] 笔的客户留了手机号，最大一笔 [[v:Q1.r0.amount]]。"
 
-async def test_the_judge_excerpt_drops_a_column_renamed_from_a_masked_one(engine_up, mall):
-    """c.phone AS tel：交给裁判的遮罩列表把 tel 并进数据源名下，摘录里不给 tel 那一列，号码一个都不交出去。"""
-    from app.api.evidence import _judge_masks
-    from app.engine import judge as judging
 
-    art = await artifact_store.put_json({"columns": ["customer", "tel", "spend"],
-                                         "rows": [["客户乙", PHONES[1], 380.0], ["客户甲", PHONES[0], 220.0]],
-                                         "source": "mall", "mask_columns": ["phone"],
-                                         "sql": "SELECT c.name AS customer, c.phone AS tel, 1 AS spend FROM customers c"},
-                                        kind="query")
-    entry = {"alias": "Q1", "kind": "query", "artifact": art, "columns": ["customer", "tel", "spend"], "rows": 2,
-             "node_id": "top", "source": "mall", "tool": "db_query__mall"}
-    masked = await _judge_masks({"Q1": entry}, {"mall": ["phone"]})
-    assert {c.lower() for c in masked["mall"]} >= {"phone", "tel"}, masked
-    excerpt = judging._query_excerpt("Q1", entry, {0}, ["tel", "spend"], True, judging._Fetch(None), masked)
-    assert excerpt and leaks(excerpt) == [] and "380" in excerpt, excerpt
-    # 只按列名（以前的办法）：号码照样在摘录里
-    before = judging._query_excerpt("Q1", entry, {0}, ["tel", "spend"], True, judging._Fetch(None), {"mall": ["phone"]})
-    assert leaks(before), "对照：只按列名遮时号码在摘录里"
+def judge_models(monkeypatch) -> list[str]:
+    """写作者回 JUDGED；裁判一律判有依据。返回每次交给裁判的请求原文。"""
+    from app.engine import judge as judge_mod
+    from app.engine.judge import JUDGE_ROLE
+    from app.providers.mock_model import MockChatModel
+
+    seen: list[str] = []
+
+    def decide(model, messages):
+        if JUDGE_ROLE in str(messages[0].content):
+            request = str(messages[-1].content)
+            seen.append(request)
+            items = [{"unit": uid, "verdict": "supported", "rationale": "虚构的理由", "used": []}
+                     for uid in re.findall(r"^\[(u\d+)\]", request, re.M)]
+            return AIMessage(content=json.dumps({"items": items}, ensure_ascii=False))
+        return AIMessage(content=JUDGED)
+
+    monkeypatch.setattr(MockChatModel, "_decide", decide)
+
+    async def judge_model_of(session, spec):
+        return MockChatModel(model_name="claude-sonnet-5"), "claude-sonnet-5"
+
+    monkeypatch.setattr(judge_mod, "get_chat_model", judge_model_of)
+    return seen
+
+
+async def judged_run(run_class: str, **report) -> Run:
+    from sqlalchemy import delete
+
+    from app.db.models import Setting
+    from app.engine.judge import SPEND_KEY
+
+    async with SessionLocal() as session:
+        await session.execute(delete(Setting).where(Setting.key.in_([SPEND_KEY, "judge"])))
+        await session.commit()
+    nodes = [node("start", "input"),
+             node("q_top", "tool", tool="db_query__mall", args={"sql": SQL_WHOLE}),
+             node("q_total", "tool", tool="db_query__mall", args={"sql": SQL_TOTAL}),
+             node("write", "report", instructions="写一句", **report),
+             node("out", "output", fields=[{"name": "报告", "value": "{{ nodes.write.text }}"}])]
+    spec = {"nodes": nodes, "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}
+    run_id = (await run_manager.start(graph=spec, input_payload={}, run_class=run_class)).id
+    for _ in range(400):
+        await asyncio.sleep(0.05)
+        async with SessionLocal() as session:
+            row = await session.get(Run, run_id)
+        if row.status in ("succeeded", "failed") and row.manifest_seq is not None:
+            assert row.status == "succeeded", row.error
+            return row
+    raise AssertionError(f"运行 {run_id} 没跑完：{row.status}")
+
+
+def excerpt_of(request: str) -> str:
+    """裁判请求里 Q2 那一段摘录。"""
+    return request.split("【Q2】", 1)[1].split("【", 1)[0]
+
+
+@pytest.mark.parametrize("where", ["on_demand", "inline"])
+async def test_the_judge_sees_the_cited_columns_of_every_snapshot(client, monkeypatch, mall, where):
+    """交给裁判的遮罩列只按数据源设的列名（judge.source_masks），不并证据面板那套宁可多遮的列：Q1 整份遮、Q2 只数个数
+    的列，面板都不显示，可它们和号码无关，裁判要看得到被引用的金额、人数才判得了。按需裁判（探索运行）、节点里当场裁判
+    （正式运行）同一个办法。号码列照旧不给（摘录里一个号码都没有）。"""
+    seen = judge_models(monkeypatch)
+    if where == "on_demand":
+        row = await judged_run("exploratory", claims="judge")
+        [report] = (await client.get(f"/api/runs/{row.id}/evidence")).json()["reports"]
+        doc = artifact_store.load(report["doc_artifact"])
+        uid = next(u["id"] for _, u in iter_units(doc)
+                   if any(seg.get("ref") == "v:Q2.r0.amount" for seg in u.get("segments") or []))
+        res = await client.post(f"/api/runs/{row.id}/evidence/judge", json={"units": [uid]})
+        assert res.status_code == 200, res.text
+    else:
+        await judged_run("formal", claims="judge")
+    [request] = seen
+    q2 = excerpt_of(request)
+    assert "amount" in q2 and "with_phone" in q2 and "710.75" in q2, q2
+    [q1_columns] = [line for line in request.split("【Q1】", 1)[1].split("【", 1)[0].splitlines() if line.startswith("列：")]
+    assert "amount" in q1_columns and "name" in q1_columns, q1_columns
+    assert leaks(request) == []

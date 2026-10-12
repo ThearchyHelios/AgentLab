@@ -248,18 +248,14 @@ export const ABSENCE_CLAIM_TEXT = {
 }
 
 /**
- * 报告写进了取自遮罩列的值（报告自查的 masked_cell）：直接引用了那一格（[[v:Q2.r0.tel]]，c.phone AS tel 这种改了名字的
- * 也算），或者按值认出正文里直接写着、经指标带出来的（违规带 by_value），重写后仍在、「违规处置」为标注时照常产出：
- * 时间线上那一行（日志 report_masked_cell，written 是其中按值认出来的几处）和证据面板违规清单里的叫法。
+ * 报告直接引用了取自遮罩列的格子（报告自查的 masked_cell：[[v:Q2.r0.tel]]，c.phone AS tel 这种改了名字的也算，别的表里
+ * 同名的列不算），重写后仍在、「违规处置」为标注时照常产出：时间线上那一行（日志 report_masked_cell）和证据面板违规清单
+ * 里的叫法。自查只查引用，不按值在正文里找遮罩值。
  * 只说记为缺口，不说出具：探索运行、没设出具契约的成果不出具，报告接在侧枝上时缺口也进不了出具，降不降档由出具那一行说
  */
 export const MASKED_CELL_TEXT = {
-  label: '写进了遮罩列的值',
-  title: (n?: number, written = 0) => {
-    if (!written) return `报告引用了${n ? ` ${formatNumber(n)} 处` : ''}取自遮罩列的格子，已标注`
-    if (n && n > written) return `报告引用、写进了 ${formatNumber(n)} 处取自遮罩列的值，已标注`
-    return `报告写进了 ${formatNumber(written)} 处设置了遮罩的列中的值，已标注`
-  },
+  label: '引用了遮罩列',
+  title: (n?: number) => `报告引用了${n ? ` ${formatNumber(n)} 处` : ''}取自遮罩列的格子，已标注`,
   next: '数据源设置了遮罩的列不应写进报告，这几处已记为缺口。请在报告撰写节点的指令中去掉对这些列的引用后重新运行',
 }
 

@@ -5,7 +5,7 @@
 所以拦在自查：
 
 - 组装文档时（compose_doc 的 masked：{查询快照工件: 取自遮罩列的列}），引用了这些列的格子记一条 masked_cell，列名对上
-  的、按 SQL 认出改了名字的都算（报告节点按证据面板同一个函数 api/evidence.py 的 _snapshot_masks 算）
+  的、按 SQL 认出改了名字的都算（报告节点按 api/evidence.py 的 _cited_masks 算，和证据面板同一个 _mask_sets 起步）
 - 违规里不带那一格的值（不写 text、context）：违规会进 report.checked、重写的日志、出具缺口，这些地方不能再露一次号码
 - 报告节点把它交回写作者重写（不是只标注的那几类）；重写后还在：「违规处置」为失败的判失败，为标注的照常产出，
   时间线上另起一行说清（report_masked_cell），节点产出里写一条出具缺口，出口降档

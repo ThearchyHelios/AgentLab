@@ -1,4 +1,4 @@
-"""报告自查（第 2 轮）：只数个数的列不算取自遮罩列；正文里直接写着的遮罩值按值认出来。
+"""报告自查：只数个数的列不算取自遮罩列；正文里写着的值不按值认。
 
 复核发现：
 - 只数个数、只决定算不算进来的写法——COUNT(*) FILTER (WHERE phone IS NULL)、SUM(phone IS NULL)、AVG(phone IS NOT NULL)、
@@ -6,16 +6,15 @@
   条件、汇总里的真假条件当成值的来历，自查跟着判 masked_cell，正式运行（默认违规即失败）因此判失败。等价的
   SUM(CASE WHEN phone IS NULL THEN 1 ELSE 0 END) 本来就不算。现在自查认之前先把这几种写法改写成认得出的样子
   （api/evidence.py 的 _counted），证据面板、推演照可验证报告的认法多遮（展示上多遮无妨）
-- 自查只认 [[v:]] 引用：写作者照着「删掉引用」把号码、姓名照抄成正文，或者经指标带出来（[[m:phone_raw]] 的值就是号码），
-  一条违规都没有。现在按值认一遍（engine/evidence.py 的 masked_values）：写作目录里取自遮罩列的值（只认确定取自遮罩列的
-  列，整份算进来的不算）出现在正文里，记一条 masked_cell，不带值；运行输入里写着的值是发起运行的人自己填的，不算
+- 第 2 轮另按值认过正文里写着的遮罩值（照抄的号码、姓名，经指标带出来的值），第 3 轮去掉了：两个字的姓名会撞上「销售
+  高峰」这类常用词，同名列的值会撞上门店名，正式运行因此判失败，代价远大于收益；照抄的号码本来就会被「数字没有出处」
+  拦下（test_report_masked_owners）。自查只查 [[v:]] 引用，这里留着不按值认的回归
 
 真跑的部分用虚构的 SQLite 商城库（号码、姓名是编的），写作者是 MockChatModel 照剧本写。
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 
 import pytest
@@ -26,7 +25,7 @@ from app.core import artifact_store
 from app.data.engine import engines
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent
-from app.engine.evidence import compose_doc, describe_violations
+from app.engine.evidence import compose_doc
 from app.engine.runner import run_manager
 
 CUSTOMERS = [(1, "陈思远", "19900000701"), (2, "林若溪", "19900000702"), (3, "周以宁", "19900000703")]
@@ -68,12 +67,6 @@ async def mall(tmp_path, engine_up):
     await engines.invalidate(source_id)
     yield path
     await engines.invalidate(source_id)
-
-
-def leaks(value) -> list[str]:
-    """写着的号码、姓名，按千分位写的（19,900,000,701）也算。"""
-    raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-    return [p for p in [*PHONES, *NAMES] if p in raw or p in raw.replace(",", "")]
 
 
 def masked_of(violations: list[dict]) -> list[dict]:
@@ -182,7 +175,7 @@ async def test_a_formal_report_citing_a_count_of_missing_phones_succeeds(monkeyp
 
 
 # --------------------------------------------------------------------------
-# 正文里直接写着的遮罩值
+# 正文里写着的值不按值认
 # --------------------------------------------------------------------------
 
 
@@ -198,77 +191,49 @@ TOP_ROWS = [[NAMES[1], PHONES[1], 380.0], [NAMES[0], PHONES[0], 220.0]]
 
 @pytest.mark.parametrize("text", [
     f"消费最高的客户电话是 {PHONES[1]}。",
-    # 换了写法的号码也认
     "消费最高的客户电话是 199-0000-0702。",
     f"消费最高的客户电话是 +86 {PHONES[1][:3]} {PHONES[1][3:7]} {PHONES[1][7:]}。",
 ])
-async def test_a_masked_value_copied_into_the_text_is_flagged(engine_up, mall, text):
-    """写作者把号码照抄成正文（没写成引用）：记一条 masked_cell（按值认出来的），不带值；交回写作者的那句说清在哪一句、
-    值不能以任何形式写进报告，句子里的值换成「已遮罩」。"""
+async def test_a_value_copied_into_the_text_is_not_a_masked_cell(engine_up, mall, text):
+    """写作者把号码照抄成正文（没写成引用）：自查不按值认，不记 masked_cell；裸数字由数字核对记 uncited_number。"""
     from app.engine.nodes.report import _MaskedCells
 
     catalog = await masked_catalog(SQL_TOP, ["customer", "tel", "spend"], TOP_ROWS)
     doc = await _MaskedCells(catalog)(compose_doc(text, catalog, node_id="write", run_id="r1"))
-    [v] = masked_of(doc["violations"])
-    assert v["by_value"] is True and v["segment"] and v["unit"] and "ref" not in v, v
-    assert "设置了遮罩的列中的值" in v["message"] and "不能以任何形式写进报告" in v["for_model"]
-    assert "已遮罩" in v["context"] and leaks(v) == [] and leaks(describe_violations([v])) == []
+    assert masked_of(doc["violations"]) == [] and any(v["code"] == "uncited_number" for v in doc["violations"])
 
 
-async def test_a_text_masked_column_copied_as_text_is_flagged(engine_up, mall):
-    """文字类的遮罩列（姓名）：数字核对管不到它，按值认才拦得住。"""
+async def test_a_name_copied_as_text_is_not_flagged(engine_up, mall):
+    """文字类的遮罩列（姓名）照抄成正文：同样不按值认（两个字的姓名会撞上常用词）。"""
     from app.engine.nodes.report import _MaskedCells
 
     await set_source(mall, {"mask_columns": ["name"]})
     catalog = await masked_catalog(SQL_TOP, ["customer", "tel", "spend"], TOP_ROWS)
     doc = await _MaskedCells(catalog)(compose_doc(f"消费最高的是{NAMES[1]}，花了 [[v:Q1.r0.spend]]。", catalog,
                                                   node_id="write", run_id="r1"))
-    [v] = masked_of(doc["violations"])
-    assert v["by_value"] is True and leaks(v) == [], v
+    assert masked_of(doc["violations"]) == [], doc["violations"]
 
 
-async def test_a_cited_masked_cell_is_not_counted_twice(engine_up, mall):
-    """[[v:Q1.r0.tel]] 已经按引用记过：同一处不再按值另记一条。"""
+async def test_a_cited_masked_cell_is_flagged_once(engine_up, mall):
+    """[[v:Q1.r0.tel]]：按引用记一条，没有按值另记的那一类（by_value）。"""
     from app.engine.nodes.report import _MaskedCells
 
     catalog = await masked_catalog(SQL_TOP, ["customer", "tel", "spend"], TOP_ROWS)
     doc = await _MaskedCells(catalog)(compose_doc("电话 [[v:Q1.r0.tel]]。", catalog, node_id="write", run_id="r1"))
     [v] = masked_of(doc["violations"])
-    assert v["ref"] == "v:Q1.r0.tel" and not v.get("by_value"), v
+    assert v["ref"] == "v:Q1.r0.tel" and "by_value" not in v, v
 
 
-async def test_values_only_conservatively_masked_or_given_as_run_input_are_not_flagged(engine_up, mall):
-    """不算违规的：SQL 认不准、整份算进来的列（姓名没设遮罩，只是面板多遮）；运行输入里写着的号码（发起运行的人自己填的）；
-    数据源没设遮罩。"""
-    from app.engine.nodes.report import _MaskedCells
-
-    unsure = ("SELECT name, amount FROM (SELECT c.name, UPPER(c.phone), o.amount FROM customers c "
-              "JOIN orders o ON o.customer_id = c.id) t ORDER BY amount DESC")
-    catalog = await masked_catalog(unsure, ["name", "amount"], [[NAMES[1], 300.0]])
-    doc = await _MaskedCells(catalog)(compose_doc(f"金额最大的一笔来自{NAMES[1]}。", catalog, node_id="write", run_id="r1"))
-    assert masked_of(doc["violations"]) == []
-
-    catalog = await masked_catalog(SQL_TOP, ["customer", "tel", "spend"], TOP_ROWS)
-    asked = _MaskedCells(catalog, protected=[json.dumps({"phone": PHONES[1]})])
-    doc = await asked(compose_doc(f"号码 {PHONES[1]} 的客户消费最高。", catalog, node_id="write", run_id="r1"))
-    assert masked_of(doc["violations"]) == []
-
-    await set_source(mall, {})
-    doc = await _MaskedCells(catalog)(compose_doc(f"电话 {PHONES[1]}。", catalog, node_id="write", run_id="r1"))
-    assert masked_of(doc["violations"]) == []
-
-
-async def test_snapshots_of_unmasked_sources_are_not_read_for_values(engine_up, mall, monkeypatch):
-    """按值认要读快照：数据源现在没设遮罩的一份都不读，没引用到格子的也不为引用去读。"""
+async def test_no_snapshot_is_read_without_a_cited_cell(engine_up, mall, monkeypatch):
+    """正文没引用格子：数据源设了遮罩也一份快照都不读（以前按值认要把设了遮罩的快照都读一遍）。"""
     from app.core import artifact_store as store
     from app.engine.nodes.report import _MaskedCells
 
-    await set_source(mall, {})
     catalog = await masked_catalog(SQL_TOP, ["customer", "tel", "spend"], TOP_ROWS)
     read: list[str] = []
     real = store.load
     monkeypatch.setattr(store, "load", lambda a: read.append(a) or real(a))
-    await _MaskedCells(catalog)(compose_doc("一共三位客户。", catalog, node_id="write", run_id="r1"))
+    await _MaskedCells(catalog)(compose_doc(f"一共三位客户，电话 {PHONES[0]}。", catalog, node_id="write", run_id="r1"))
     assert read == [], read
 
 
@@ -287,24 +252,12 @@ def card_graph(**report) -> dict:
                  node("out", "output", fields=[{"name": "报告", "value": "{{ nodes.write.text }}"}]))
 
 
-async def test_a_metric_whose_value_is_a_masked_value_is_flagged(monkeypatch, mall):
-    """[[m:phone_raw]] 的值就是号码：按值认出来，点名那处引用；取客户编号的 [[m:id3]] 照常。标注照常产出时，时间线那一行
-    说清有几处是正文里写着的值，缺口、日志都不写值。"""
-    row = await finish(monkeypatch, card_graph(on_violation="flag"), "第三位客户编号 [[m:id3]]，首位客户电话 [[m:phone_raw]]。")
+async def test_a_metric_reference_is_not_checked_by_value(monkeypatch, mall):
+    """自查只查 [[v:]] 引用：[[m:phone_raw]] 的值就是号码，自查不按值认（指标的值在证据面板、推演里另有判断，写「已遮罩」，
+    见 test_masked_metric_values）。违规即失败的运行照常成功，时间线上没有「引用了遮罩列」那一行。"""
+    row = await finish(monkeypatch, card_graph(on_violation="fail"), "第三位客户编号 [[m:id3]]，首位客户电话 [[m:phone_raw]]。")
     assert row.status == "succeeded", row.error
     rows = await events(row.id)
     checked = next(e.data for e in rows if e.type == "report.checked")
-    [v] = masked_of(checked["violations"])
-    assert v["ref"] == "m:phone_raw" and v["by_value"] is True and "[[m:phone_raw]]" in v["message"], v
-    [log] = [e.data for e in rows if e.type == "log" and e.data.get("code") == "report_masked_cell"]
-    assert log["count"] == 1 and log["written"] == 1 and log["refs"] == ["m:phone_raw"], log
-    finished = next(e.data for e in rows if e.type == "node.finished" and e.node_id == "write")
-    [gap] = artifact_store.load(finished["artifact"])["issuance_gaps"]
-    assert "设置了遮罩的列中的值" in gap and leaks([checked["violations"], log, gap]) == [], (gap, log)
-
-
-async def test_a_formal_report_copying_a_phone_fails_with_advice_about_the_instructions(monkeypatch, mall):
-    row = await finish(monkeypatch, card_graph(on_violation="fail", numbers="off"),
-                       f"首位客户电话 {PHONES[0]}，第三位客户编号 [[m:id3]]。")
-    assert row.status == "failed" and "设置了遮罩的列中的值" in row.error, row.error
-    assert "指令中去掉" in row.error and "指令遵循能力" not in row.error and leaks(row.error) == [], row.error
+    assert masked_of(checked["violations"]) == [], checked["violations"]
+    assert not [e for e in rows if e.type == "log" and e.data.get("code") == "report_masked_cell"]

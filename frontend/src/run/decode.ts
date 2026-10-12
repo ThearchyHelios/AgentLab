@@ -874,13 +874,12 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
       }
     }
     case 'report_masked_cell': {
-      // 报告写进了取自遮罩列的值，重写后仍在、照常产出（report.py）：读结构化字段 count、written（其中按值认出、正文里
-      // 直接写着的几处）、refs，副标题只点名引用，不写那几格的值（后端也没给）
+      // 报告引用了取自遮罩列的格子，重写后仍在、照常产出（report.py）：读结构化字段 count、refs，副标题只点名引用，
+      // 不写那几格的值（后端也没给）
       const n = typeof d.count === 'number' && d.count > 0 ? d.count : undefined
-      const written = typeof d.written === 'number' && d.written > 0 ? d.written : 0
       const refs = strs(d.refs)
       return {
-        title: MASKED_CELL_TEXT.title(n, written),
+        title: MASKED_CELL_TEXT.title(n),
         sub: refs.length ? refs.map((r) => `[[${r}]]`).join('、') : undefined,
         next: MASKED_CELL_TEXT.next,
       }
