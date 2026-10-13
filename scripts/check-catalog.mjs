@@ -1196,6 +1196,7 @@ await section('数据目录 · 起草：清单上的失败标记与单表重起�
   const note = page.locator('[data-catalog-last-draft]')
   check('打开这张表：写明上次起草失败和原因', await until(async () => (await note.count()) === 1)
         && (await note.innerText()).includes('上次起草失败') && (await note.innerText()).includes(FAIL), await note.innerText({ timeout: 500 }).catch(() => ''))
+  await shot(page, 'catalog-last-draft-detail')
   await note.locator('[data-catalog-redraft]').click()
   check('「重新起草这张表」：建只含这张表、用模型、不带补充说明的任务', await until(async () => !!lastBody(sent, /draft-jobs$/))
         && JSON.stringify(lastBody(sent, /draft-jobs$/)) === JSON.stringify({ tables: ['orders'], use_model: true }), JSON.stringify(lastBody(sent, /draft-jobs$/)))
