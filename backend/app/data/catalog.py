@@ -591,21 +591,41 @@ class MergeStats:
         return MergeStats(self.added + other.added, self.updated + other.updated, self.removed + other.removed)
 
 
+def _about_gone_columns(key: Slot, item: Mapping[str, Any], columns: set[str]) -> bool:
+    """这一项说的列已经不在表结构里了：列级的项看列名，业务主键、业务日期看它们指着的列。"""
+    if key[0] == "c":
+        return key[1] not in columns
+    value = item.get("value")
+    if key == ("t", "keys") and isinstance(value, list):
+        return any(str(col) not in columns for col in value)
+    if key == ("t", "business_date") and isinstance(value, Mapping) and value.get("column") is not None:
+        return str(value["column"]) not in columns
+    return False
+
+
 def merge_notes(existing: Mapping[str, Any] | None, draft: Mapping[str, Any] | None, *,
-                covered: Iterable[str] = (), at: str | None = None) -> tuple[dict[str, Any], MergeStats]:
+                covered: Iterable[str] = (), at: str | None = None,
+                columns: Iterable[str] | None = None) -> tuple[dict[str, Any], MergeStats]:
     """把起草结果并入已有目录，返回 (新目录, 计数)。不改入参。
 
     规则（逐个槽位）：
     - 已有项是 confirmed 或 rejected：不动。驳回的留着，同一项下次起草就不会再冒出来。
-    - 起草结果里没有这一项：已有项的来源在 covered 里（这一轮完整算过这个来源）就删掉，否则留着。
-      外键约束被删掉以后，原来那条「有确证」的关系不能还挂着；而这一轮没调模型，就不能因此删掉模型起草的项。
+    - 起草结果里没有这一项：
+      - 模型起草的项（llm）留着。模型这次留空、给的值没通过校验（_from_model 里就丢掉了），都不能把以前起草好的
+        删掉——实测整库重跑一次，模型这次没给的几百项全被删掉，有的表覆盖率从八成多掉到五成。只有这一轮完整起草过
+        （covered 含 llm）、而它说的列已经不在表结构里（columns：表结构里的列名；业务主键、业务日期指着的列也算）
+        才删；不知道表结构（columns 为 None）时不删。
+      - 别的来源：来源在 covered 里（这一轮完整算过这个来源）就删掉，否则留着。外键约束被删掉以后，原来那条「有确证」
+        的关系不能还挂着；库注释改了，旧的那条注释也不能还挂着。
     - 同一来源：值或状态有变化就更新。数据剖析写的备注只是日期变了不算变化（same_profile_note），保留旧的项。
     - 不同来源：来源更可信的（_SOURCE_RANK）顶掉不如它的，反过来不行。
 
     新增和更新的项盖上 at（缺省为当前时间）作为 updated_at；内容没变的项保持原样，修改时间也不动。
+    removed 只数真删掉的项。
     """
     at = at or now_iso()
     covered = set(covered)
+    known = {str(c) for c in columns} if columns is not None else None
     old, new = _slots(existing), _slots(draft)
     out: dict[Slot, dict[str, Any]] = {}
     added = updated = removed = 0
@@ -614,7 +634,11 @@ def merge_notes(existing: Mapping[str, Any] | None, draft: Mapping[str, Any] | N
         if item.get("status") in _LOCKED:
             out[key] = item
         elif cand is None:
-            if item.get("source") in covered:
+            if item.get("source") == "llm":
+                gone = "llm" in covered and known is not None and _about_gone_columns(key, item, known)
+            else:
+                gone = item.get("source") in covered
+            if gone:
                 removed += 1
             else:
                 out[key] = item
@@ -1130,10 +1154,11 @@ async def save_patch(session: AsyncSession, source_id: str, table: str, changes:
 
 @dataclass(frozen=True)
 class TableDraft:
-    """一张表的起草结果。covered：这一轮完整算过的来源（merge_notes 据此删掉这些来源里已经没有的旧项）。
+    """一张表的起草结果。covered：这一轮完整算过的来源（merge_notes 据此删掉这些来源里已经没有的旧项；模型起草的项
+    只在列已经不在表结构里时才删）。
 
     error：模型起草只写出了一部分（有的段没写出来）时，没写出来的是哪部分、为什么。这时 covered 不含 llm：没写全
-    就不算完整起草过，已有的模型起草项不会因此被删。"""
+    就不算完整起草过。"""
 
     notes: dict[str, Any]
     covered: frozenset[str] = frozenset()
@@ -1178,6 +1203,34 @@ _SENTENCE_MARKS = re.compile(r"[，。；;,.!?！？：:\n]")
 def _comment_is_label(text: str) -> bool:
     """短、不带句读的注释是名字（「实收金额」），否则是一段解释（「状态：1 表示有效…」）。"""
     return len(text) <= _LABEL_MAX and not _SENTENCE_MARKS.search(text)
+
+
+#: 标识符写法的注释：只有字母、数字、下划线、点，不带空格（「member_card」「ord.status」「GMV」）
+_IDENTIFIER = re.compile(r"[A-Za-z0-9_.]+")
+#: 比较注释和名字时忽略的字符：下划线、连字符、空白
+_NAME_FILLER = re.compile(r"[\s_\-]+")
+
+
+def _bare_name(text: str) -> str:
+    return _NAME_FILLER.sub("", text).lower()
+
+
+def comment_role(text: str, name: str) -> str | None:
+    """数据库注释在目录里记成什么：label 中文名；note 一段解释（表记进说明，列记进含义）；None 不记。
+
+    - 注释就是名字本身（和表名、列名相同，忽略大小写、下划线、连字符和空白；表名带 schema 前缀的也比不带前缀的），
+      或者是标识符写法（只有字母、数字、下划线、点，不带空格）：说明不了什么，不记。以前这种注释短、不带句读，就当
+      中文名记下了；库注释的级别又比模型起草高，模型起草的中文名永远进不了目录。交给模型的表结构里照旧有这条注释；
+    - 短、不带句读的是名字（「实收金额」）；
+    - 否则是一段解释（「状态：1 表示有效…」）。
+
+    只影响以后的起草：已有的目录不另做迁移，起草到那张表时按这一轮的注释重新算（旧的那条随之删掉）。
+    """
+    bare = _bare_name(text)
+    names = {name, name.rsplit(".", 1)[-1]}
+    if not bare or any(bare == _bare_name(n) for n in names) or _IDENTIFIER.fullmatch(text):
+        return None
+    return "label" if _comment_is_label(text) else "note"
 
 
 def _is_key(meta: Mapping[str, Any], columns: list[str]) -> bool:
@@ -1371,7 +1424,8 @@ def draft_structure(source: Any, table: str) -> TableDraft:
     """只看表结构就能起草的部分：数据库注释、外键约束、命名推断。table 必须是 schema_cache["tables"] 的键。
 
     - 数据库注释 → 中文名或含义（comment / proposed）：短而不带句读的是名字，记进表或列的中文名；否则是
-      一段解释，记进表的说明或列的含义。导入表格的源例外（system_notes_source）：说明是系统生成的，不拷。
+      一段解释，记进表的说明或列的含义；就是名字本身、标识符写法的不记（comment_role）。导入表格的源例外
+      （system_notes_source）：说明是系统生成的，不拷。
     - 外键约束 → 关系（fk / verified）。
     - 命名推断 → 关系（name / proposed）。
     """
@@ -1382,13 +1436,15 @@ def draft_structure(source: Any, table: str) -> TableDraft:
     notes: dict[str, Any] = {}
     if not system_notes_source(source):
         comment = (meta.get("comment") or "").strip()
-        if comment:
-            notes["label" if _comment_is_label(comment) else "description"] = make_item(comment, "comment")
+        role = comment_role(comment, table) if comment else None
+        if role is not None:
+            notes["label" if role == "label" else "description"] = make_item(comment, "comment")
         columns: dict[str, dict[str, Any]] = {}
         for col in meta.get("columns") or []:
             text = (col.get("comment") or "").strip()
-            if text:
-                columns[col["name"]] = {("label" if _comment_is_label(text) else "meaning"): make_item(text, "comment")}
+            role = comment_role(text, str(col["name"])) if text else None
+            if role is not None:
+                columns[col["name"]] = {("label" if role == "label" else "meaning"): make_item(text, "comment")}
         if columns:
             notes["columns"] = columns
     fks = fk_relations(cache, table)
@@ -1407,12 +1463,23 @@ def draft_structure(source: Any, table: str) -> TableDraft:
 
 #: 每次调用最多几张表、合计多少列（data/catalog_draft.py 按它分段）。实测每列约 50 个输出 token（不算思考），
 #: 会思考的模型思考也算在输出额度里：一段太大，想完就没额度写正文。列数超过 MODEL_BATCH_COLUMNS 的宽表拆成
-#: 「表级一段 + 列分段」，每个列分段也不超过这个列数
+#: 「表级一段 + 列分段」，列分段数是列数除以它向上取整，各段列数平均（相差不超过 1），不留很小的尾段
 MODEL_BATCH_TABLES = 4
 MODEL_BATCH_COLUMNS = 40
+#: 一次起草里额度用完或超时累计这么多次，之后新开始的段列数上限减半（MODEL_BATCH_COLUMNS → 一半 → …），
+#: 最低 MODEL_MIN_PART_COLUMNS 列
+MODEL_SHRINK_AFTER = 2
+MODEL_MIN_PART_COLUMNS = 10
+#: 一段（连同它拆出来的、补问的、重试的）最多调用几次模型，到了次数还没写完的记没写出来
+MODEL_PART_MAX_CALLS = 8
+#: 提醒：最近 MODEL_NOTICE_WINDOW 次调用里有 MODEL_NOTICE_ON 次以上没写出来时提醒换模型；之后少于 MODEL_NOTICE_OFF
+#: 次时清掉
+MODEL_NOTICE_WINDOW = 6
+MODEL_NOTICE_ON = 4
+MODEL_NOTICE_OFF = 2
 #: 全进程同时进行的模型调用最多几个（所有起草任务、同步起草共用）
 MODEL_CONCURRENCY = 3
-#: 单次调用最多等多久（秒）。会思考的模型想得久，一段 40 列常常要几分钟
+#: 单次调用最多等多久（秒）。会思考的模型想得久，一段 40 列常常要几分钟；超时了拆小再问（同额度用完）
 MODEL_TIMEOUT_S = 420
 #: 输出额度。会思考的模型（经 OpenAI 兼容网关的推理模型等）思考也算在里面：8192 时上百列的表常常想完就没额度
 #: 写正文。保留思考（不关），加大额度；服务方嫌额度太大时退回 MODEL_FALLBACK_MAX_TOKENS（同 copilot、recipe_ai）
@@ -1421,10 +1488,10 @@ MODEL_FALLBACK_MAX_TOKENS = 8192
 #: 一段没写出来（额度用完、只给空壳）时拆成两半再问：最多拆几层、拆到最少几列为止
 MODEL_SPLIT_DEPTH = 3
 MODEL_SPLIT_MIN_COLUMNS = 5
-#: 止损：连续这么多段拆到底仍一项没写出来，这次起草后面的段不再拆小重试（一段 40 列拆到底要 15 次调用，模型明显
-#: 用不了时不该照这个倍数烧额度）
+#: 止损：连续这么多段拆到底仍一项没写出来，这次起草后面的段不再拆小重试（模型明显用不了时不该一段一段拆到底烧额度；
+#: 每段另有 MODEL_PART_MAX_CALLS 次封顶）
 MODEL_GIVE_UP_AFTER = 2
-#: 网络错误、429、5xx、超时最多重试几次，每次重试前等多久（秒，依次取用）
+#: 网络错误、429、5xx 最多重试几次，每次重试前等多久（秒，依次取用）。超时不原样重试，当作这一段太大、拆小再问
 MODEL_RETRIES = 2
 MODEL_RETRY_DELAYS_S = (10.0, 30.0)
 #: 不指定表时起草使用次数最多的前几张
@@ -1573,8 +1640,9 @@ async def resolve_draft_model(session: AsyncSession) -> tuple[Any, str]:
 
     不关思考（spec 里不传 thinking，按接入默认）、温度 0、额度 MODEL_MAX_TOKENS，服务方嫌大时退回
     MODEL_FALLBACK_MAX_TOKENS（DraftModel）。单次调用的时限 MODEL_TIMEOUT_S 也交给 SDK，免得它先按全局的 5 分钟断开。
-    SDK 自己不重试（max_retries=0）：429、5xx、网络错误、超时由起草引擎按失败原因重试（最多 MODEL_RETRIES 次），
-    不然两层叠起来一段最多发 9 次请求，报错却写「已重试 2 次」，网关正在限流时还会放大流量。
+    SDK 自己不重试（max_retries=0）：429、5xx、网络错误由起草引擎退避重试（最多 MODEL_RETRIES 次）；超时当作这一段
+    太大，拆小再问（data/catalog_draft.py），不原样重试。不然两层叠起来一段最多发 9 次请求，报错却写「已重试 2 次」，
+    网关正在限流时还会放大流量。
     只建模型对象，不发请求。
 
     和 recipe_ai.resolve_draft_model 一样不用 get_chat_model：它在没有接入时静默退回演示模型，拿演示模型
@@ -1643,7 +1711,8 @@ def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
 def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool) -> dict[str, Any]:
     """模型给的一张表 → 目录项（llm / proposed）。不合规的值整项丢掉，不硬塞：列名对不上表结构的、
     表类型和度量类型不在取值里的、业务主键里有不存在的列的、看起来是计算公式的（_formula_like，公式进口径卡）。
-    导入表格的源，说明已经覆盖的字段也丢掉。"""
+    该是文字的地方写成了数组、对象（列名、表类型、业务日期的列、度量类型……）同样丢掉，不抛异常：实测见过把列名
+    写成数组的，以前在这里抛 TypeError，整张表记出错。导入表格的源，说明已经覆盖的字段也丢掉。"""
     columns = {c["name"]: c for c in meta.get("columns") or []}
     notes: dict[str, Any] = {}
     table_has_system_note = system and bool((meta.get("comment") or "").strip())
@@ -1652,21 +1721,23 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
             continue
         if (text := _clean_text(entry.get(name))) is not None and not _formula_like(("t", name), text):
             notes[name] = make_item(text, "llm")
-    if entry.get("kind") in TABLE_KINDS:
-        notes["kind"] = make_item(entry["kind"], "llm")
+    kind = entry.get("kind")
+    if isinstance(kind, str) and kind in TABLE_KINDS:
+        notes["kind"] = make_item(kind, "llm")
     keys = entry.get("keys")
     if _str_list_ok(keys) and all(k in columns for k in keys):
         notes["keys"] = make_item(list(dict.fromkeys(keys)), "llm")
     date = entry.get("business_date")
-    if isinstance(date, dict) and date.get("column") in columns:
+    if isinstance(date, dict) and isinstance(date.get("column"), str) and date["column"] in columns:
         value = {"column": date["column"]}
         for k in ("rule", "timezone"):
             if (text := _clean_text(date.get(k))) is not None:
                 value[k] = text
         notes["business_date"] = make_item(value, "llm")
     out_cols: dict[str, dict[str, Any]] = {}
-    for col in entry.get("columns") or []:
-        if not isinstance(col, dict) or col.get("name") not in columns:
+    listed = entry.get("columns")
+    for col in listed if isinstance(listed, list) else []:
+        if not isinstance(col, dict) or not isinstance(col.get("name"), str) or col["name"] not in columns:
             continue
         name = col["name"]
         has_system_note = system and bool((columns[name].get("comment") or "").strip())
@@ -1677,8 +1748,9 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
             text = _clean_text(col.get(field_name), limit)
             if text is not None and not _formula_like(("c", name, field_name), text):
                 items[field_name] = make_item(text, "llm")
-        if col.get("measure") in COLUMN_MEASURES:
-            items["measure"] = make_item(col["measure"], "llm")
+        measure = col.get("measure")
+        if isinstance(measure, str) and measure in COLUMN_MEASURES:
+            items["measure"] = make_item(measure, "llm")
         if items:
             out_cols[name] = items
     if out_cols:
@@ -1738,6 +1810,9 @@ class TableDraftResult:
     status: str = "ok"
     #: 模型分几段起草（不用模型时为 None）
     parts_total: int | None = None
+    #: 模型拿不准、留空了的列（catalog_draft.ModelOutcome.blank，按表结构的顺序），只留并入目录之后仍然没有中文名和
+    #: 含义的；表的状态不因此变
+    blank: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1767,25 +1842,32 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
     没用模型时为 None）有可用内容的再并上。同步起草和后台起草任务（每张表一结束就调）共用这一处。
 
     - 并入已有目录按 merge_notes 的规则：人工确认、驳回过的项不动。内容没变不写、不升版本。
-    - 模型只写出一部分的，模型那份不算完整起草过（covered 不含 llm），已有的模型起草项不会因此被删。
+    - 模型这次没给的项（留空、没通过校验）不删以前起草的；列已经不在表结构里的，模型各段都写出来时（covered 含 llm）
+      照旧删掉。模型只写出一部分的不算完整起草过（covered 不含 llm）。
+    - 模型留空的列（blank）按并入之后的目录再筛一遍：已经有中文名或含义的（以前起草的、库注释、起草进行中有人填的）
+      不算留空。
     - 写入撞上别人刚改过（乐观锁）就重读重并，最多三次。
     """
     result = TableDraftResult(table=table)
     structure = draft_structure(source, table)
+    meta = ((getattr(source, "schema_cache", None) or {}).get("tables") or {}).get(table) or {}
+    columns = [str(c["name"]) for c in meta.get("columns") or [] if isinstance(c, dict) and c.get("name") is not None]
     model_draft: TableDraft | None = None
     if modeled is not None:
         result.parts_total = modeled.parts_total
         result.model_error = modeled.error
         if modeled.items:
             result.model_items = modeled.items
+            result.blank = list(getattr(modeled, "blank", None) or [])
             model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"}) if modeled.status == "ok"
                                      else frozenset())
     for _attempt in range(3):
         entry = await read_entry(session, source.id, table)
         version = entry.version if entry else 0
-        merged, stats = merge_notes(entry.notes if entry else {}, structure.notes, covered=structure.covered, at=at)
+        merged, stats = merge_notes(entry.notes if entry else {}, structure.notes, covered=structure.covered, at=at,
+                                    columns=columns)
         if model_draft is not None:
-            merged, more = merge_notes(merged, model_draft.notes, covered=model_draft.covered, at=at)
+            merged, more = merge_notes(merged, model_draft.notes, covered=model_draft.covered, at=at, columns=columns)
             stats += more
         result.added, result.updated, result.removed = stats.added, stats.updated, stats.removed
         result.version = version
@@ -1800,6 +1882,10 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
     else:
         result.error = WRITE_CONFLICT_ERROR
         result.added = result.updated = result.removed = 0
+        result.blank = []
+    if result.blank:
+        named = visible_notes(merged).get("columns") or {}
+        result.blank = [c for c in result.blank if not any(f in (named.get(c) or {}) for f in ("label", "meaning"))]
     if result.error or (modeled is not None and modeled.status == "failed"):
         result.status = "failed"
     elif modeled is not None and modeled.status == "partial":
@@ -2238,13 +2324,16 @@ __all__ = [
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftModel", "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL",
     "MEASURE_LABEL", "MODEL_BATCH_COLUMNS", "MODEL_BATCH_TABLES", "MODEL_CONCURRENCY", "MODEL_EMPTY_REASON",
-    "MODEL_FALLBACK_MAX_TOKENS", "MODEL_MAX_TOKENS", "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SPLIT_DEPTH",
-    "MODEL_SPLIT_MIN_COLUMNS", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES",
+    "MODEL_FALLBACK_MAX_TOKENS", "MODEL_MAX_TOKENS", "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON",
+    "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS", "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER",
+    "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
+    "PATCH_MAX_CHANGES",
     "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE", "WRITE_CONFLICT_ERROR", "default_tables",
     "missing_table_error", "pick_tables", "write_draft",
     "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL",
     "TABLE_KINDS", "TableDraft", "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit",
-    "apply_patch", "codes_complete", "describe_slot", "draft_catalog", "draft_structure", "draft_with_model",
+    "apply_patch", "codes_complete", "comment_role", "describe_slot", "draft_catalog", "draft_structure",
+    "draft_with_model",
     "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "is_date_column", "is_profile_note",
     "join_paths",
     "make_item", "merge_notes", "name_words", "now_iso", "parse_path", "plan_patch", "profile_relation_holds",

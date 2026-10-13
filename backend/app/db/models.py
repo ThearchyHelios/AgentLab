@@ -379,10 +379,17 @@ class CatalogDraftJob(Base, TimestampMixin):
     created_by: Mapped[str | None] = mapped_column(String(100), default=None)
     started_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
-    # 用量：调用次数、输入和输出 token（拿不到用量的调用按 0 算）
+    # 用量：调用次数、输入和输出 token（拿不到用量的调用按 0 算，超时的调用也是 0）、超时几次、没写出来几次（额度用完、
+    # 只给空壳、超时、出错）
     calls: Mapped[int] = mapped_column(Integer, default=0)
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    timeouts: Mapped[int] = mapped_column(Integer, default=0)
+    failed_calls: Mapped[int] = mapped_column(Integer, default=0)
+    # 新开始的段每段最多几列（额度用完、超时多了会减半；用模型时开始起草后写上）
+    part_columns: Mapped[int | None] = mapped_column(Integer, default=None)
+    # 提醒：最近几次调用多数没写出来时的一句话（建议换起草模型、减少表或停止），少了清掉
+    notice: Mapped[str | None] = mapped_column(Text, default=None)
     # 任务整体出错的原因（逐表的原因在 catalog_draft_tasks）
     error: Mapped[str | None] = mapped_column(Text, default=None)
     # 重试建的任务记下是重试哪一个
@@ -411,6 +418,9 @@ class CatalogDraftTask(Base):
     removed: Mapped[int] = mapped_column(Integer, default=0)
     version: Mapped[int] = mapped_column(Integer, default=0)
     model_items: Mapped[int | None] = mapped_column(Integer, default=None)
+    # 模型拿不准、留空了的列（中文名和含义都没给）：几列，最多记 5 个列名。表的状态不因此变
+    blank_columns: Mapped[int] = mapped_column(Integer, default=0)
+    blank_sample: Mapped[list[Any] | None] = mapped_column(default=None)
     # error：整张表没起草（表结构里没有、写入一直冲突、服务重启中断）；model_error：模型那部分没写出来的原因和办法
     error: Mapped[str | None] = mapped_column(Text, default=None)
     model_error: Mapped[str | None] = mapped_column(Text, default=None)

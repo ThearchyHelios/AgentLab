@@ -87,9 +87,56 @@ def test_merge_removes_stale_items_only_for_covered_sources():
 
 
 def test_merge_keeps_column_entries_tidy():
-    existing = {"columns": {"amount": {"unit": make_item("元", "llm")}}}
-    merged, stats = catalog.merge_notes(existing, {}, covered={"llm"}, at=AT)
+    existing = {"columns": {"amount": {"unit": make_item("元", "comment")}}}
+    merged, stats = catalog.merge_notes(existing, {}, covered={"comment"}, at=AT)
     assert merged == {} and stats.removed == 1
+
+
+COLUMNS = ["id", "amount", "visit_date"]
+
+
+def test_a_redraft_keeps_model_items_the_model_left_blank_this_time():
+    """模型这次对某一项没给值（留空，或者给的值没通过校验、在 _from_model 里就丢掉了）：以前模型起草的项留着，不算删除。
+    只有给了合格的新值才替换。"""
+    existing = {"label": make_item("入园记录", "llm"), "kind": make_item("fact", "llm"),
+                "keys": make_item(["id"], "llm"), "business_date": make_item({"column": "visit_date"}, "llm"),
+                "columns": {"amount": {"label": make_item("实收金额", "llm"), "unit": make_item("元", "llm")},
+                            "visit_date": {"meaning": make_item("游客检票入园的日期", "llm")}}}
+    draft = {"label": make_item("入园明细", "llm"), "columns": {"amount": {"unit": make_item("元", "llm")}}}
+    merged, stats = catalog.merge_notes(existing, draft, covered={"llm"}, at=AT, columns=COLUMNS)
+    assert stats == catalog.MergeStats(added=0, updated=1, removed=0)
+    assert merged["label"]["value"] == "入园明细" and merged["label"]["updated_at"] == AT
+    for key in ("kind", "keys", "business_date"):
+        assert merged[key] == existing[key], key
+    assert merged["columns"] == existing["columns"]
+    # 不知道表结构里有哪些列时更不删
+    merged, stats = catalog.merge_notes(existing, {}, covered={"llm"}, at=AT)
+    assert merged == existing and stats.removed == 0
+
+
+def test_model_items_of_columns_gone_from_the_schema_are_still_removed():
+    """表结构里已经没有的列：这一轮完整起草过（covered 含 llm）时，模型起草的这一列的项照旧删掉；业务主键、业务日期
+    指着这一列的也删。没完整起草过（covered 不含 llm）的不删。"""
+    existing = {"keys": make_item(["id", "old_no"], "llm"), "business_date": make_item({"column": "old_day"}, "llm"),
+                "grain": make_item("每次入园一行", "llm"),
+                "columns": {"old_no": {"label": make_item("旧编号", "llm"), "meaning": make_item("已经删掉的列", "llm")},
+                            "amount": {"label": make_item("实收金额", "llm")}}}
+    merged, stats = catalog.merge_notes(existing, {}, covered={"llm"}, at=AT, columns=COLUMNS)
+    assert stats.removed == 4
+    assert set(merged) == {"grain", "columns"} and set(merged["columns"]) == {"amount"}
+    merged, stats = catalog.merge_notes(existing, {}, covered=set(), at=AT, columns=COLUMNS)
+    assert merged == existing and stats.removed == 0
+
+
+def test_other_sources_keep_their_covered_rule():
+    """只改模型起草的「覆盖即删」：数据库注释、外键、命名推断、剖析照旧——这一轮完整算过、却没有了的删掉。"""
+    existing = {"label": make_item("入园记录", "comment"),
+                "columns": {"amount": {"label": make_item("实收金额", "comment"),
+                                       "meaning": make_item("模型写的含义", "llm")}},
+                "relations": [_rel(["gate_id"], "gates", ["id"], source="name")]}
+    merged, stats = catalog.merge_notes(existing, {}, covered={"comment", "name", "llm"}, at=AT, columns=COLUMNS)
+    assert stats.removed == 3
+    assert merged == {"columns": {"amount": {"meaning": make_item("模型写的含义", "llm")}}}
 
 
 # ---------------------------------------------------------------- 单项审阅

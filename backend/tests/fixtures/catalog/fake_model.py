@@ -10,6 +10,7 @@
   不整列漏掉。list_all=False 时只给 replies 里有的列（模拟漏列的模型：漏掉的列会被补问一次，补问后仍没给的算没写出来）；
 - 直接 ainvoke 是纯文本那条路：同样的内容写成一段正文（AIMessage），前面带一句话；
 - fail 里的表所在的那一段抛异常，用来验证「一段失败只影响这一段」；
+- hang=N：头 N 次调用一直不回（等起草引擎按时限掐掉，当作超时）；
 - calls 记下每次收到的提示词全文，用来核对交给模型的内容（只有结构，没有数据）；modes 记下每次走的是
   structured 还是 text。
 
@@ -22,6 +23,7 @@ structured、text 模拟实测见过的几种回复（两条路各自设）：
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -105,10 +107,11 @@ def with_every_column(entry: dict, wanted: list[str]) -> dict:
 
 class FakeModel:
     def __init__(self, replies: dict[str, dict], fail: set[str] = frozenset(), *,
-                 structured: str = "tables", text: str = "tables", list_all: bool = True) -> None:
+                 structured: str = "tables", text: str = "tables", list_all: bool = True, hang: int = 0) -> None:
         self.replies, self.fail, self.calls = replies, set(fail), []
         self.structured, self.text = structured, text
         self.list_all = list_all
+        self.hang = hang
         self.modes: list[str] = []
 
     def with_structured_output(self, schema: Any, **_: Any) -> "_Structured":
@@ -118,8 +121,16 @@ class FakeModel:
     async def ainvoke(self, messages: list[Any]) -> Any:
         from langchain_core.messages import AIMessage
 
-        reply = self._reply(messages, "text")
+        reply = await self._answer(messages, "text")
         return AIMessage(content="草稿如下：" + json.dumps(reply, ensure_ascii=False))
+
+    async def _answer(self, messages: list[Any], mode: str) -> dict:
+        if self.hang > 0:
+            self.hang -= 1
+            self.calls.append("\n".join(str(getattr(m, "content", m)) for m in messages))
+            self.modes.append(mode)
+            await asyncio.sleep(3600)
+        return self._reply(messages, mode)
 
     def _reply(self, messages: list[Any], mode: str) -> dict:
         text = "\n".join(str(getattr(m, "content", m)) for m in messages)
@@ -147,4 +158,4 @@ class _Structured:
         self.owner = owner
 
     async def ainvoke(self, messages: list[Any]) -> dict:
-        return self.owner._reply(messages, "structured")
+        return await self.owner._answer(messages, "structured")
