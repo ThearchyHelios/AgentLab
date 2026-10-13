@@ -30,13 +30,16 @@
   不等于额度用完：只有停在额度上、或者正文为空而有思考才算。
 - 被截断的 JSON：先把已经完整的表、列对象捡回来，只补剩下的。
 - 一段里缺了的表、列只补缺的，补一次。补问之后：模型列出了、字段留空的列是拿不准（补问时才列出来的也一样），不算
-  没写出来；整列没列出来的算没写出来（这张表是 partial）；整张表还一项都没有的，照只给空壳处理（拆小、再问一次）。
+  没写出来（补问的那次调用把请写的都列出来了，用量和提醒里也不算没写出来）；整列没列出来的算没写出来（这张表是
+  partial）；整张表还一项都没有的，照只给空壳处理（拆小、再问一次）。
 - 结构化输出这个接口不支持（400 / 422 提到 response_format、json_schema、tool……，或者模型类不支持）：这次起草
   后面改走纯文本、从正文取 JSON（纯文本那条路另外说清 JSON 的格式）。
 - 服务方嫌额度太大：退回 MODEL_FALLBACK_MAX_TOKENS 重来，这次起草后面都用它（catalog.DraftModel.shrink）。
 - 网络错误、429、5xx：等一会儿重试（最多 MODEL_RETRIES 次，退避）。单次调用的时限是 MODEL_TIMEOUT_S。SDK
   自己不再重试（catalog.resolve_draft_model 建模型时 max_retries=0），实际重试次数和报错写的一致。
 - 别的错误：这一段没写出来，原因照实写。
+- 读回复时出了意料之外的错：这一块记没写出来（「起草这张表时出错」），这次调用照样记进用量、算一次出错。该是文字的
+  地方写成了数组、对象的值在校验（catalog._from_model）里丢掉，不算出错。
 - 封顶：每个原始段（计划里的整表段、表级那段或一个列分段，连同按缩小后的上限分开的各块、拆出来的、补问的、重试的）
   一共最多调用 MODEL_PART_MAX_CALLS 次，到了次数还没写完的记没写出来。
 - 止损：连续 MODEL_GIVE_UP_AFTER 段拆到底仍一项没写出来（模型明显用不了，例如思考总是吃满额度），这次起草后面的
@@ -45,14 +48,18 @@
   超时的不再拆小，超时拆出来、还没问的块也不再问；有一次调用写出来了就恢复。不然一直超时的模型首轮同时起草的几段
   要各自拆满次数，一段 40 列串着问约 7 个时限（420 秒时约 49 分钟）。
 - 提醒：最近 MODEL_NOTICE_WINDOW 次调用里有 MODEL_NOTICE_ON 次以上没写出来（额度用完、超时、空壳、出错），给一句
-  提醒（次数和原因，建议换起草模型、减少表或停止），经进度回调交给任务；之后少于 MODEL_NOTICE_OFF 次时清掉。以前
-  看不出调用在反复失败：一个任务 55 分钟只结束 1 张表，界面上只有段进度和用量。
+  提醒（次数和原因，建议换起草模型、缩小起草范围或停止），经进度回调交给任务；之后少于 MODEL_NOTICE_OFF 次时清掉。
+  以前看不出调用在反复失败：一个任务 55 分钟只结束 1 张表，界面上只有段进度和用量。
 
-**原因。** 没写出来的原因只写进这张表的 model_error：几段因为同一个原因没写出来时说「这几段」，每段写上列的范围
-（「第 5 段（列名 到 列名，共 33 列）」，列名照表结构原样），真拆小重试过的才补「已拆小重试仍没写出」。
+**原因。** 没写出来的原因只写进这张表的 model_error：几段因为同一个原因没写出来时说「这几段」，分段起草的表（只写
+出一部分的、一项都没写出来的都一样）每段写上列的范围（「第 5 段（列名 到 列名，共 33 列）」，列名照表结构原样），
+真拆小重试过的才补「已拆小重试仍没写出」。只有一段的表，这一段就是整张表：只写出一部分的写清是哪几列，一项都没写
+出来的只写原因。
 
 **留空的列。** 请模型写了、模型也列出了，中文名和含义却都没给（或者给的都没通过校验）的列是模型拿不准，不补问，
-记在 ModelOutcome.blank 里（表的状态不因此变）。已确认的、库注释已经说清的列不算（提示词里它们以此为准）。
+记在 ModelOutcome.blank 里（表的状态不因此变）。目录里已经有中文名或含义的列不算（不论来源，驳回的不算有：以前模型
+起草的留着，照「补充起草要求再重新起草」做一遍，模型这次没再给的老列不该又说成拿不准），库注释已经说清的不算
+（提示词里它们以此为准）；写入时（catalog.write_draft）再按并入目录之后的结果筛一遍。
 
 **并发。** 全进程最多 MODEL_CONCURRENCY 个调用同时进行（model_gate：按事件循环各一个信号量，所有起草任务和同步
 起草共用，先来先放）。一次起草里同时只起草 MODEL_CONCURRENCY 段（一段拆小、补缺都做完再起草下一段），同时在等
@@ -121,7 +128,7 @@ REASON_HALTED = "；模型连续 {n} 段都没写出来，已停止拆小重试�
 REASON_SLOW = "；拆到每段 {n} 列仍然超时，已停止拆小重试，建议更换起草模型"
 
 # ---- 提醒（最近几次调用多数没写出来），经进度回调交给任务（CatalogDraftJob.notice）
-NOTICE = ("最近 {calls} 次调用有 {failed} 次没写出来（{kinds}）。可以在{place}换一个模型、减少这次起草的表，"
+NOTICE = ("最近 {calls} 次调用有 {failed} 次没写出来（{kinds}）。建议在{place}换一个模型、缩小起草范围，"
           "或者停止这次起草")
 #: 一次调用没写出来的原因种类 → 提醒里的说法（按这个顺序列）
 FAILURE_LABEL = {"exhausted": "额度用完", "timeout": "超时", "hollow": "只给空壳", "error": "出错"}
@@ -980,14 +987,22 @@ class _Run:
                 return
             self._fail(pieces, _Why(reply.error, split=halved))
             return
-        gains = self._take(pieces, reply.entries)
+        try:
+            gains = self._take(pieces, reply.entries)
+        except Exception:
+            # 读回复时出了意料之外的错（_guarded 记这一块没写出来）：这次调用照样记进用量，算一次出错
+            await self._called(reply.usage or (0, 0), "error")
+            raise
         anything = any(g.items for g in gains)
-        await self._report(reply, wrote=anything)
+        complete = not (reply.exhausted or reply.truncated)
+        rest = self._remainder(pieces, gains, truncated=False, followup=followup) if complete else []
+        # 补问时请写的都列出来了、字段留空：是模型拿不准（记留空），这次调用不算没写出来（不进提醒的窗口）
+        await self._report(reply, wrote=anything or (followup and complete and not rest))
         if last and anything and self.mode != "text":
             # 结构化输出只给空壳、纯文本写出来了：这个模型的结构化输出靠不住，这次起草后面都走纯文本
             self.mode = "text"
             logger.info("起草数据目录：结构化输出只给了空壳，纯文本写出来了，后面改走纯文本")
-        if reply.exhausted or reply.truncated:
+        if not complete:
             rest = self._remainder(pieces, gains, truncated=True, followup=followup)
             if not rest:
                 return
@@ -1007,7 +1022,6 @@ class _Run:
                 return
             await self._split(pieces, depth, "hollow", followup, budget, halved)
             return
-        rest = self._remainder(pieces, gains, truncated=False, followup=followup)
         if not rest:
             return
         if followup:
@@ -1333,6 +1347,11 @@ class _Run:
         if not items:
             failures = [(why, part_of.get(key, 1)) for key, why in st.failed.items()]
             reason = _join(failures) if failures else (C.MODEL_EMPTY_REASON if st.named else REASON_MISSING)
+            if failures and len(st.parts) > 1:
+                # 宽表一项都没写出来：同样逐段写上列的范围
+                said = self._parts_said(st, failed_cols, failed_table)
+                every = "都" if len(said) == len(st.parts) else ""
+                reason = f"这张表 {len(st.columns)} 列，分 {len(st.parts)} 段起草，{'、'.join(said)}{every}没写出来：{reason}"
             return ModelOutcome("failed", {}, 0, reason, total, st.parts_done)
         notes = copy.deepcopy(st.notes)
         blank = self._blank(st, set(failed_cols))
@@ -1342,18 +1361,21 @@ class _Run:
         return ModelOutcome("ok", notes, items, None, total, st.parts_done, blank)
 
     def _blank(self, st: _Table, failed: set[str]) -> list[str]:
-        """模型拿不准、留空了的列：请它写了（不在没写出来的里面），中文名和含义却都没给（或者给的都没通过校验）。已确认
-        的、库注释已经说清的不算——提示词里它们以此为准，模型不写也不缺：已确认（有确证）的中文名或含义、库注释（按
-        catalog.comment_role 记进目录的那种；导入表格的源是系统说明）。"""
+        """模型拿不准、留空了的列：请它写了（不在没写出来的里面），中文名和含义却都没给（或者给的都没通过校验）。
+
+        目录里已经有中文名或含义的不算（不论来源：以前模型起草的——重新起草时模型这次没给的留着、不删；人工填写、确认的；
+        库注释；驳回的不算有）：照「补充起草要求再重新起草」做一遍，模型这次没再给的老列不该又说成拿不准。库注释已经说清
+        的（catalog.comment_role 记进目录的那种；导入表格的源是系统说明）同样不算：提示词里它们以此为准，模型不写也不缺。
+        写入时（catalog.write_draft）再按并入目录之后的结果筛一遍。"""
         drafted = st.notes.get("columns") or {}
-        confirmed = C._confirmed_only(st.existing).get("columns") or {}
+        known = C.visible_notes(st.existing).get("columns") or {}
         comments = {str(c.get("name")): (c.get("comment") or "").strip()
                     for c in st.meta.get("columns") or [] if isinstance(c, dict)}
         out: list[str] = []
         for col in st.columns:
             if col in failed:
                 continue
-            if any(f in (drafted.get(col) or {}) or f in (confirmed.get(col) or {}) for f in ("label", "meaning")):
+            if any(f in (drafted.get(col) or {}) or f in (known.get(col) or {}) for f in ("label", "meaning")):
                 continue
             text = comments.get(col)
             if text and (self.system or C.comment_role(text, col) is not None):
@@ -1362,18 +1384,25 @@ class _Run:
         return out
 
     @staticmethod
-    def _partial_text(st: _Table, failed_cols: list[str], failed_table: bool) -> str:
+    def _parts_said(st: _Table, failed_cols: list[str], failed_table: bool) -> list[str]:
+        """分段起草的表没写出来的是哪几段，每段写上列的范围（列名照表结构原样）：「第 1 段（表级的项）」「第 3 段（列名 到
+        列名，共 32 列）」。"""
+        part_of = st.part_of()
+        bad: dict[int, list[str]] = {}
+        for col in failed_cols:
+            bad.setdefault(part_of.get(col, 1), []).append(col)
+        said = ["第 1 段（表级的项）"] if failed_table else []
+        return said + [f"第 {k} 段（{_columns_text(st.columns, cols, count=True)}）" for k, cols in sorted(bad.items())]
+
+    @classmethod
+    def _partial_text(cls, st: _Table, failed_cols: list[str], failed_table: bool) -> str:
         """只写出一部分时说清哪部分没写出来（第几段、哪几列）、为什么、怎么办。"""
         part_of = st.part_of()
         keys = ([_TABLE] if failed_table else []) + failed_cols
         reason = _join((st.failed[k], part_of.get(k, 1)) for k in keys)
         n = len(st.columns)
         if len(st.parts) > 1:
-            bad: dict[int, list[str]] = {}
-            for col in failed_cols:
-                bad.setdefault(part_of.get(col, 1), []).append(col)
-            said = ["第 1 段（表级的项）"] if failed_table else []
-            said += [f"第 {k} 段（{_columns_text(st.columns, cols, count=True)}）" for k, cols in sorted(bad.items())]
+            said = cls._parts_said(st, failed_cols, failed_table)
             head = f"这张表 {n} 列，分 {len(st.parts)} 段起草，{'、'.join(said)}没写出来"
         elif failed_cols and failed_table:
             head = (f"这张表 {n} 列，有表级的项和 {len(failed_cols)} 列（{_columns_text(st.columns, failed_cols, count=False)}）"

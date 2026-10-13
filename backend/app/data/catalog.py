@@ -1711,7 +1711,8 @@ def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
 def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool) -> dict[str, Any]:
     """模型给的一张表 → 目录项（llm / proposed）。不合规的值整项丢掉，不硬塞：列名对不上表结构的、
     表类型和度量类型不在取值里的、业务主键里有不存在的列的、看起来是计算公式的（_formula_like，公式进口径卡）。
-    导入表格的源，说明已经覆盖的字段也丢掉。"""
+    该是文字的地方写成了数组、对象（列名、表类型、业务日期的列、度量类型……）同样丢掉，不抛异常：实测见过把列名
+    写成数组的，以前在这里抛 TypeError，整张表记出错。导入表格的源，说明已经覆盖的字段也丢掉。"""
     columns = {c["name"]: c for c in meta.get("columns") or []}
     notes: dict[str, Any] = {}
     table_has_system_note = system and bool((meta.get("comment") or "").strip())
@@ -1720,21 +1721,23 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
             continue
         if (text := _clean_text(entry.get(name))) is not None and not _formula_like(("t", name), text):
             notes[name] = make_item(text, "llm")
-    if entry.get("kind") in TABLE_KINDS:
-        notes["kind"] = make_item(entry["kind"], "llm")
+    kind = entry.get("kind")
+    if isinstance(kind, str) and kind in TABLE_KINDS:
+        notes["kind"] = make_item(kind, "llm")
     keys = entry.get("keys")
     if _str_list_ok(keys) and all(k in columns for k in keys):
         notes["keys"] = make_item(list(dict.fromkeys(keys)), "llm")
     date = entry.get("business_date")
-    if isinstance(date, dict) and date.get("column") in columns:
+    if isinstance(date, dict) and isinstance(date.get("column"), str) and date["column"] in columns:
         value = {"column": date["column"]}
         for k in ("rule", "timezone"):
             if (text := _clean_text(date.get(k))) is not None:
                 value[k] = text
         notes["business_date"] = make_item(value, "llm")
     out_cols: dict[str, dict[str, Any]] = {}
-    for col in entry.get("columns") or []:
-        if not isinstance(col, dict) or col.get("name") not in columns:
+    listed = entry.get("columns")
+    for col in listed if isinstance(listed, list) else []:
+        if not isinstance(col, dict) or not isinstance(col.get("name"), str) or col["name"] not in columns:
             continue
         name = col["name"]
         has_system_note = system and bool((columns[name].get("comment") or "").strip())
@@ -1745,8 +1748,9 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
             text = _clean_text(col.get(field_name), limit)
             if text is not None and not _formula_like(("c", name, field_name), text):
                 items[field_name] = make_item(text, "llm")
-        if col.get("measure") in COLUMN_MEASURES:
-            items["measure"] = make_item(col["measure"], "llm")
+        measure = col.get("measure")
+        if isinstance(measure, str) and measure in COLUMN_MEASURES:
+            items["measure"] = make_item(measure, "llm")
         if items:
             out_cols[name] = items
     if out_cols:
@@ -1806,7 +1810,8 @@ class TableDraftResult:
     status: str = "ok"
     #: 模型分几段起草（不用模型时为 None）
     parts_total: int | None = None
-    #: 模型拿不准、留空了的列（catalog_draft.ModelOutcome.blank，按表结构的顺序）；表的状态不因此变
+    #: 模型拿不准、留空了的列（catalog_draft.ModelOutcome.blank，按表结构的顺序），只留并入目录之后仍然没有中文名和
+    #: 含义的；表的状态不因此变
     blank: list[str] = field(default_factory=list)
 
 
@@ -1839,6 +1844,8 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
     - 并入已有目录按 merge_notes 的规则：人工确认、驳回过的项不动。内容没变不写、不升版本。
     - 模型这次没给的项（留空、没通过校验）不删以前起草的；列已经不在表结构里的，模型各段都写出来时（covered 含 llm）
       照旧删掉。模型只写出一部分的不算完整起草过（covered 不含 llm）。
+    - 模型留空的列（blank）按并入之后的目录再筛一遍：已经有中文名或含义的（以前起草的、库注释、起草进行中有人填的）
+      不算留空。
     - 写入撞上别人刚改过（乐观锁）就重读重并，最多三次。
     """
     result = TableDraftResult(table=table)
@@ -1875,6 +1882,10 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
     else:
         result.error = WRITE_CONFLICT_ERROR
         result.added = result.updated = result.removed = 0
+        result.blank = []
+    if result.blank:
+        named = visible_notes(merged).get("columns") or {}
+        result.blank = [c for c in result.blank if not any(f in (named.get(c) or {}) for f in ("label", "meaning"))]
     if result.error or (modeled is not None and modeled.status == "failed"):
         result.status = "failed"
     elif modeled is not None and modeled.status == "partial":

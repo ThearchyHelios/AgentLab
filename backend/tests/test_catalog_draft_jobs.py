@@ -287,9 +287,9 @@ async def test_a_redraft_keeps_what_the_model_left_blank_this_time(client, monke
     给了合格新值的才替换。以前整库重跑一次删掉几百项，表仍记「已完成」。"""
     sid = await _source(_tickets())
     full = {"label": "门票", "kind": "fact",
-            "columns": [{"name": f"c{i:02d}", "label": f"第{i}列", "meaning": f"第{i}列的含义"} for i in range(1, 7)]}
+            "columns": [{"name": f"c{i:02d}", "label": f"第{i}列", "meaning": f"第{i}列的含义"} for i in range(1, 6)]}
     first = await _draft(client, sid, monkeypatch, FakeModel({"tickets": full}), ["tickets"])
-    assert first["tasks"][0]["status"] == "ok" and first["blank_columns"] == 0
+    assert first["tasks"][0]["status"] == "ok" and first["blank_columns"] == 1, "c06 第一次就留空了"
     before = (await client.get(f"{_base(sid)}/tickets")).json()["notes"]
 
     # 这一次：表的中文名换了；c03 的中文名像公式（校验丢掉）、含义换了；c04 只给了中文名；其余列列出了但都留空
@@ -303,10 +303,11 @@ async def test_a_redraft_keeps_what_the_model_left_blank_this_time(client, monke
     assert after["label"]["value"] == "门票明细" and after["kind"] == before["kind"]
     assert after["columns"]["c03"]["label"] == before["columns"]["c03"]["label"]
     assert after["columns"]["c03"]["meaning"]["value"] == "新的含义"
-    for col in ("c01", "c02", "c05", "c06"):
+    for col in ("c01", "c02", "c05"):
         assert after["columns"][col] == before["columns"][col], col
-    # 模型这次留空的列照实记下（表的状态不因此变）
-    assert task["blank_columns"] == 4 and task["blank_sample"] == ["c01", "c02", "c05", "c06"]
+    # 留空的列只记目录里还是没有中文名、含义的（c06）：c01、c02、c05 这次留空，以前起草好的还在，不算留空——不然照
+    # 提示补了起草要求再起草，提示指着的却是目录里有中文名的列，一直消不掉
+    assert task["blank_columns"] == 1 and task["blank_sample"] == ["c06"]
 
 
 async def test_model_items_of_a_column_gone_from_the_schema_are_removed(client, monkeypatch):
@@ -351,8 +352,8 @@ async def test_the_notice_is_kept_on_the_job(client, monkeypatch):
     replies = {name: {"label": f"表{name}"} for name in tables}
     job = await _draft(client, sid, monkeypatch, FakeModel(replies, fail={"t1", "t2", "t3", "t4"}), list(tables))
     assert job["usage"]["calls"] == 5 and job["usage"]["failed_calls"] == 4
-    assert job["notice"] == ("最近 5 次调用有 4 次没写出来（出错 4 次）。可以在「设置 → 偏好设置」的「起草模型」换一个模型、"
-                             "减少这次起草的表，或者停止这次起草")
+    assert job["notice"] == ("最近 5 次调用有 4 次没写出来（出错 4 次）。建议在「设置 → 偏好设置」的「起草模型」换一个模型、"
+                             "缩小起草范围，或者停止这次起草")
     plain = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["t1"]})).json()["job"]
     await finished(plain["id"])
     plain = await get_job(client, sid, plain["id"])
@@ -373,6 +374,29 @@ async def test_blank_columns_reach_the_task_the_job_and_the_list(client, monkeyp
     assert job["blank_columns"] == 8
     rows = {r["table_name"]: r for r in (await client.get(_base(sid))).json()["tables"]}
     assert rows["tickets"]["last_draft"]["blank_columns"] == 7 and rows["gates"]["last_draft"]["blank_columns"] == 1
+
+
+async def test_blank_columns_are_counted_against_the_catalog_as_written(client, monkeypatch):
+    """留空的列按并入目录之后的结果算：起草进行中有人给某一列填了中文名，模型这次留空，这一列不算留空。"""
+    sid = await _source(_tickets(4))
+    model = Held({"tickets": {"label": "门票", "columns": [{"name": "c01", "label": "编号"}]}}, hold={"tickets"})
+    use(monkeypatch, model)
+    r = await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["tickets"], "use_model": True})
+    job_id = r.json()["job"]["id"]
+
+    async def asking() -> bool:
+        return (await get_job(client, sid, job_id))["tasks"][0]["status"] == "running"
+
+    await until(asking)
+    saved = await client.put(f"{_base(sid)}/tickets", json={"notes": {"columns": {"c02": {"label": {"value": "闸机号"}}}},
+                                                           "if_version": 0})
+    assert saved.status_code == 200, saved.text
+    model.release.set()
+    await finished(job_id)
+    task = (await get_job(client, sid, job_id))["tasks"][0]
+    assert task["status"] == "ok" and task["blank_columns"] == 2 and task["blank_sample"] == ["c03", "c04"]
+    after = (await client.get(f"{_base(sid)}/tickets")).json()["notes"]["columns"]
+    assert after["c02"]["label"]["value"] == "闸机号" and after["c01"]["label"]["value"] == "编号"
 
 
 async def test_the_sync_draft_is_409_while_a_job_is_queued_or_running(client, monkeypatch):
