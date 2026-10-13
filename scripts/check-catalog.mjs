@@ -408,11 +408,14 @@ const TASK_END = new Set(['ok', 'partial', 'failed', 'skipped', 'cancelled'])
 const RETRYABLE = new Set(['failed', 'partial', 'cancelled'])
 const isoNow = () => new Date().toISOString()
 /**
- * 服务端的几种 409（机读码 + 一句中文）。起草模型用不了有长短两句：没有接入时短（界面原样显示），设置里的起草模型所在
- * 接入停用时长（带句号，也要原样显示）
+ * 服务端的几种答复（机读码 + 一句中文），说法照 api/catalog.py、data/catalog_jobs.py、data/draft_model.py 的原话。
+ * 起草模型用不了有长短两句：没有接入时短（界面原样显示），设置里的起草模型所在接入停用时长（带句号，也要原样显示）
  */
-const BUSY = { detail: '这个数据源已有进行中的起草任务，请等它结束或停止后再开始', code: 'catalog_draft_busy' }
-const MODEL_DOWN = { detail: '未配置模型接入，无法由助手起草数据目录。请到「设置 → 模型接入」添加', code: 'catalog_draft_model_unavailable' }
+const busyOf = (state, src) => ({
+  detail: `数据源「${state.sources.find((s) => s.id === src)?.name ?? src}」正在起草数据目录，请等这次起草结束（或先停止它）再开始新的起草`,
+  code: 'catalog_draft_busy',
+})
+const MODEL_DOWN = { detail: '未配置模型接入，无法由模型起草数据目录。请到「设置 → 模型接入」添加', code: 'catalog_draft_model_unavailable' }
 const MODEL_OFF = {
   detail: '起草模型使用的模型接入「check-gw」已停用。请在「设置 → 模型接入」中启用它，或在「设置 → 偏好设置」的「起草模型」中重新选择',
   code: 'catalog_draft_model_unavailable',
@@ -422,8 +425,8 @@ const JOB_ERR = '起草任务出错：database is locked'
 /** 起草时每段最多几列（服务端的常量）：超过的宽表拆成「表级一段 + 列分段」 */
 const PART_COLUMNS = 40
 
-/** 建一个排队的任务：表结构里没有的表照样建进任务、记 skipped */
-function newJob(state, src, { tables, use_model, note = null }) {
+/** 建一个排队的任务：表结构里没有的表照样建进任务、记 skipped。重试建的记着原任务（retry_of，界面不用） */
+function newJob(state, src, { tables, use_model, note = null, retry_of = null }) {
   const id = `check-job-${++state.jobSeq}`
   const tasks = tables.map((name) => {
     const t = state.tables[src].find((x) => x.name === name && !x.missing)
@@ -439,7 +442,7 @@ function newJob(state, src, { tables, use_model, note = null }) {
   const job = {
     id, source_id: src, status: 'queued', use_model: !!use_model, model: use_model ? 'check-draft-model' : null,
     guidance: state.guidance[src] ?? null, note, created_at: isoNow(), started_at: null, finished_at: null, created_by: ACTOR,
-    usage: { calls: 0, input_tokens: 0, output_tokens: 0 }, error: null, tasks,
+    retry_of, usage: { calls: 0, input_tokens: 0, output_tokens: 0 }, error: null, tasks,
   }
   state.jobs.push(job)
   return job
@@ -530,19 +533,22 @@ const jobOf = (state, key) => {
 const activeOf = (state, src) => state.jobs.find((j) => j.source_id === src && JOB_ACTIVE.has(j.status)) ?? null
 
 function jobHandlers(state, reply) {
-  const NO_JOB = json({ detail: '找不到这次起草任务' }, 404)
+  const NO_JOB = json({ detail: '起草任务不存在，可能属于别的数据源，或者已随数据源删除' }, 404)
   return [
-    // 起草要求（数据源级）：空串清除，超长 422
+    // 起草要求（数据源级）：空串清除，超长 422。请求里必须有 guidance 这一项（服务端同样：没有就是 pydantic 的英文 422）
     [/^PUT \/datasources\/check-cat-[a-z]+\/catalog\/guidance$/, reply('guidance', (route, { key, body }) => {
-      const g = String(body?.guidance ?? '').trim()
-      if ([...g].length > 2000) return json({ detail: '起草要求不能超过 2,000 字' }, 422)(route)
+      if (!body || typeof body !== 'object' || !('guidance' in body)) {
+        return json({ detail: [{ type: 'missing', loc: ['guidance'], msg: 'Field required', input: body }] }, 422)(route)
+      }
+      const g = String(body.guidance ?? '').trim()
+      if ([...g].length > 2000) return json({ detail: `起草要求最多 2000 字，当前 ${[...g].length} 字，请删减后再保存` }, 422)(route)
       state.guidance[parts(key)[2]] = g || null
       return json({ guidance: g || null })(route)
     })],
     // 建任务：同一个源已有排队、进行中的 409；不给 tables 取使用次数前 20 张
     [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs$/, reply('createJob', (route, { key, body }) => {
       const src = parts(key)[2]
-      if (activeOf(state, src)) return json(BUSY, 409)(route)
+      if (activeOf(state, src)) return json(busyOf(state, src), 409)(route)
       const tables = body?.tables?.length ? body.tables
         : state.tables[src].filter((t) => !t.missing).sort((a, b) => b.usage - a.usage).slice(0, 20).map((t) => t.name)
       const job = newJob(state, src, { tables, use_model: !!body?.use_model, note: body?.note?.trim() || null })
@@ -560,7 +566,7 @@ function jobHandlers(state, reply) {
     [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs\/[^/]+\/cancel$/, reply('cancel', (route, { key }) => {
       const job = jobOf(state, key)
       if (!job) return NO_JOB(route)
-      if (!JOB_ACTIVE.has(job.status)) return json({ detail: '这次起草已经结束', code: 'catalog_draft_finished' }, 409)(route)
+      if (!JOB_ACTIVE.has(job.status)) return json({ detail: '这次起草已经结束了，不需要停止', code: 'catalog_draft_finished' }, 409)(route)
       if (job.status === 'queued') stopJob(job)
       else job.stopAsked = true
       return json({ job: jobOut(job) })(route)
@@ -569,10 +575,10 @@ function jobHandlers(state, reply) {
     [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs\/[^/]+\/retry$/, reply('retry', (route, { key }) => {
       const old = jobOf(state, key)
       if (!old) return NO_JOB(route)
-      if (activeOf(state, old.source_id)) return json(BUSY, 409)(route)
+      if (activeOf(state, old.source_id)) return json(busyOf(state, old.source_id), 409)(route)
       const tables = old.tasks.filter((t) => RETRYABLE.has(t.status)).map((t) => t.table_name)
-      if (!tables.length) return json({ detail: '这次起草没有需要重试的表' }, 422)(route)
-      const job = newJob(state, old.source_id, { tables, use_model: old.use_model, note: old.note })
+      if (!tables.length) return json({ detail: '这次起草里没有失败、只写出一部分或停止了的表，不需要重试' }, 422)(route)
+      const job = newJob(state, old.source_id, { tables, use_model: old.use_model, note: old.note, retry_of: old.id })
       return json({ job: jobOut(job) }, 202)(route)
     })],
     [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs\/[^/]+$/, (route, { key }) => {
@@ -1045,7 +1051,7 @@ await section('数据目录 · 起草：进度、结果与重试', async () => {
         && (await draftBox(page).locator('[data-draft-task]').count()) === 2) && count(sent, new RegExp(`^POST .*draft-jobs/${job.id}/retry$`)) === 2)
   check('……上一次的报错收起', await draftBox(page).locator('[data-draft-action-error]').count() === 0)
   const job2 = state.jobs.at(-1)
-  check('……新任务沿用用模型和补充说明', job2.id !== job.id && job2.use_model && job2.note === DRAFT_NOTE)
+  check('……新任务沿用用模型和补充说明', job2.id !== job.id && job2.use_model && job2.note === DRAFT_NOTE && job2.retry_of === job.id)
   settle(state, job2, 'store_sales', { added: 1, model_items: 3 })
   settle(state, job2, 'members', { added: 5, model_items: 5 })
   finishJob(job2)
@@ -1161,7 +1167,7 @@ await section('数据目录 · 起草：停止、后台继续与再打开', asyn
   await close()
 })
 
-await section('数据目录 · 起草：已有任务（409）、服务重启中断与整体出错', async () => {
+await section('数据目录 · 起草：已有任务（409）、服务重启中断、整体出错与离开页面', async () => {
   const state = freshState()
   // 上一次起草因服务重启中断：没结束的表记已停止，写明原因
   const old = newJob(state, S1, { tables: ['visits', 'orders', 'parks'], use_model: true, note: DRAFT_NOTE })
@@ -1209,16 +1215,33 @@ await section('数据目录 · 起草：已有任务（409）、服务重启中�
   await shot(page, 'catalog-draft-failed')
   await page.locator('[data-draft-close]').click()
 
-  // 别处（另一个标签页）又起了一个任务，这一页还不知道：点开始时服务端回 409，转去显示那一个
+  // 别处（另一个标签页）又起了一个任务，这一页还不知道：点开始时服务端回 409，转去显示那一个。先等设置阶段把上一次起草
+  // 取回来（写出「上一次起草…起草失败」），免得它晚到、取回的已经是别处那个进行中的任务，就走不到 409 了
   await page.locator('[data-catalog-draft]').first().click()
   await draftBox(page).waitFor()
+  check('上一次整体出错：设置阶段写明「起草失败」', await until(async () => (await draftText(page, '[data-draft-last]')).includes('起草失败')),
+    await draftText(page, '[data-draft-last]'))
   const other = newJob(state, S1, { tables: ['gates', 'members'], use_model: true })
   settle(state, other, 'gates', { added: 1 })
+  const pollsOf = (id) => count(sent, new RegExp(`^GET .*draft-jobs/${id}$`))
   await page.locator('[data-draft-start]').click()
   check('已有进行中的任务（409）：转去显示那一个，并写明', await until(async () => (await draftPhase(page)) === 'running')
         && (await draftText(page, '[data-draft-busy]')).includes('已有进行中的起草任务')
         && (await draftText(page, '[data-draft-progress]')) === '已完成 1 / 2 张表', `${await draftText(page, '[data-draft-busy]')} · ${await draftText(page, '[data-draft-progress]')}`)
-  check('……取的是进行中的那一个', count(sent, /draft-jobs\/active$/) >= 1 && count(sent, new RegExp(`^GET .*draft-jobs/${other.id}$`)) >= 0)
+  check('……先问进行中的是哪一个，之后跟着它取进度', count(sent, /draft-jobs\/active$/) >= 1 && await until(async () => pollsOf(other.id) >= 1),
+    `active ${count(sent, /draft-jobs\/active$/)} 次，取进度 ${pollsOf(other.id)} 次`)
+
+  // 任务进行中离开数据目录页（页内跳转，页面卸下，不是重新载入）：不再取进度。卸下以后稍停，让卸下前已经发出的那次
+  // 取进度落进记录（停得太久，没清掉的那一拍可能恰好落在这段里、数不出来），再数两个多间隔
+  await page.locator('[data-draft-hide]').click()
+  await until(async () => (await draftBox(page).count()) === 0)
+  await page.locator('[data-catalog-back]').click()
+  const left = await until(async () => new URL(page.url()).pathname === '/data/databases' && (await page.locator('[data-catalog-page]').count()) === 0)
+  await sleep(100)
+  const polled = pollsOf(other.id)
+  await sleep(3200)
+  check('任务进行中离开数据目录页：页面卸下以后不再取进度', left && pollsOf(other.id) === polled,
+    `${left ? '' : `没有离开（${new URL(page.url()).pathname}）；`}${polled} → ${pollsOf(other.id)}`)
   stopJob(other)
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()

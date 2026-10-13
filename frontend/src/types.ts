@@ -2918,6 +2918,8 @@ export interface CatalogDraftJob {
   finished_at: string | null
   /** 谁建的（X-Actor） */
   created_by: string | null
+  /** 重试建的任务记着原任务的 id，别的为 null。接口约定里没有这一项，服务端多给的；界面不用，老服务端没有这个键 */
+  retry_of?: string | null
   /** 表数 */
   total: number
   /** 已结束的表数 */
