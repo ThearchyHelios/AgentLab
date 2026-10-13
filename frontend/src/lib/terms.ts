@@ -964,6 +964,8 @@ export const PROVIDER_REF_TEXT = {
   judgeBroken: '裁判调用将失败，所有结论句记为未裁判',
   // 和核查一组「不存在」那句（VERIFY_SETTING_TEXT.section.providerGone）同一个后果
   verifyBroken: '核查调用将失败',
+  // 起草模型（数据目录的用模型起草、按配方导入的 AI 起草）：开始起草时就报错，不建任务
+  draftBroken: '用模型起草时将报错，无法起草',
   /**
    * 存着的接入名恰好是某个启用接入的模型（多半是把模型名填进了接入那一栏）：照「启用它」去做，启用的是那条旧接入。
    * 和服务端保存时 422 的那一句（factory.model_note）一字不差；两栏写这一组的叫法（「门控模型 · 模型」「门控模型 · 接入」）
@@ -2493,6 +2495,32 @@ export const CATALOG_DRAFT_TEXT = {
   redraft: '重新起草这张表',
   redraftHint: '用模型重新起草这张表（不带补充说明，带上数据源的起草要求）；人工确认、驳回过的项不会被改动',
   redraftBusy: '已有起草任务在进行，结束后再重新起草这张表',
+}
+
+/** 设置页「偏好设置」里「起草模型」一节（服务端 api/settings.py 的 catalog_draft 一组） */
+export const DRAFT_MODEL_SETTING_TEXT = {
+  title: '起草模型',
+  hint: '数据目录的「用模型起草」和按配方导入表格时的 AI 起草使用这个模型，留空则跟随助手的模型。'
+    + '起草一次要写出几十到上百列的说明，建议选择输出额度大、能稳定按格式输出的模型；会思考的模型，思考也计入输出额度。',
+  /** 和服务端 _provider_fields 里的叫法一字不差：保存被拒时的报错写的是它 */
+  provider: '起草模型 · 接入',
+  model: '起草模型 · 模型',
+  notSet: '未单独配置，跟随助手的模型',
+  providerDefault: '跟随助手的模型',
+  providerFromModel: '按模型名找接入',
+  providerOff: '（已停用）',
+  providerGoneOption: (name: string) => `${name}（不存在）`,
+  providerGone: (name: string) => `模型接入「${name}」不存在：${PROVIDER_REF_TEXT.draftBroken}`,
+  modelDefault: '留空：用接入的默认模型',
+  modelFollow: '留空：跟随助手的模型',
+  modelOf: (model: string) => `留空则使用 ${model}`,
+  /** 只填了起草模型、接入留空时实际用哪个接入（同核查一组的说法，只是上一级是助手的模型） */
+  byModel: (model: string, found: { name: string; enabled: boolean } | null | undefined, fallback: string | null | undefined) => {
+    if (found && !found.enabled) return `只填了模型：「${model}」属于已停用的接入「${found.name}」，${PROVIDER_REF_TEXT.draftBroken}。请启用该接入或选择其他接入`
+    if (found) return `只填了模型：将按模型名使用接入「${found.name}」。「跟随助手的模型」仅在接入和模型都留空时生效`
+    return `只填了模型：所有接入的模型列表中都没有「${model}」，将使用默认接入${fallback ? `「${fallback}」` : ''}调用。`
+      + '如该模型不属于默认接入，请选择对应的接入。「跟随助手的模型」仅在接入和模型都留空时生效'
+  },
 }
 
 // ===========================================================================
