@@ -196,7 +196,29 @@ async def test_catalog_draft_uses_the_draft_setting_keeps_thinking_and_a_big_bud
     assert catalog.MODEL_MAX_TOKENS == 32768 and catalog.MODEL_FALLBACK_MAX_TOKENS == 8192
     assert all(s.thinking is None and s.temperature == 0 for _, s in specs), "不关思考，按接入默认"
     assert all(s.timeout == catalog.MODEL_TIMEOUT_S == 420 for _, s in specs)
+    assert all(s.max_retries == 0 for _, s in specs), "重试只由起草引擎按失败原因来做，SDK 自己不再重试"
     assert model.budget == 32768 and model.model_name == "模型甲"
+
+
+@pytest.mark.parametrize("kind,extra", [
+    ("openai_compatible", {}),
+    ("anthropic", {}),
+    ("anthropic", {"auth_style": "bearer"}),
+], ids=["openai-compatible", "anthropic", "anthropic-bearer"])
+def test_the_built_model_does_not_retry_on_its_own_when_asked(kind, extra):
+    """ModelSpec.max_retries 一直传到 SDK 客户端（Bearer 鉴权换上的客户端也是）；不写就照 SDK 默认。"""
+    from app.core.crypto import encrypt
+    from app.providers.factory import ModelSpec, build_chat_model
+
+    provider = Provider(name="虚构接入", kind=kind, api_key=encrypt("sk-test"), base_url="https://gateway.example/v1",
+                        models=[], default_model="model-x", extra=extra)
+
+    def client_retries(chat: Any) -> int:
+        client = chat.root_async_client if kind == "openai_compatible" else chat._async_client
+        return client.max_retries
+
+    assert client_retries(build_chat_model(provider, ModelSpec(model="model-x", max_retries=0))) == 0
+    assert client_retries(build_chat_model(provider, ModelSpec(model="model-x"))) == 2
 
 
 async def test_catalog_draft_falls_back_to_the_assistant_model(mem, no_env_keys, monkeypatch):
@@ -213,6 +235,7 @@ async def test_recipe_ai_draft_follows_the_same_order_but_keeps_its_own_spec(mem
     assert avail.available and model_id == "模型丙" and avail.provider == "丙接入"
     assert [s.max_tokens for _, s in specs] == [A.AI_MAX_TOKENS, A.AI_FALLBACK_MAX_TOKENS]
     assert all(s.thinking == "off" and s.temperature == 0 for _, s in specs), "配方 AI 起草的思考设置不动"
+    assert all(s.max_retries is None for _, s in specs), "配方 AI 起草的重试照旧（SDK 默认）"
 
 
 async def test_a_broken_draft_setting_says_where_to_fix_it(mem, no_env_keys):

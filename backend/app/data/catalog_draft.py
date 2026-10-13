@@ -23,7 +23,8 @@
 - 结构化输出这个接口不支持（400 / 422 提到 response_format、json_schema、tool……，或者模型类不支持）：这次起草
   后面改走纯文本、从正文取 JSON（纯文本那条路另外说清 JSON 的格式）。
 - 服务方嫌额度太大：退回 MODEL_FALLBACK_MAX_TOKENS 重来，这次起草后面都用它（catalog.DraftModel.shrink）。
-- 网络错误、429、5xx、超时：等一会儿重试（最多 MODEL_RETRIES 次，退避）。单次调用的时限是 MODEL_TIMEOUT_S。
+- 网络错误、429、5xx、超时：等一会儿重试（最多 MODEL_RETRIES 次，退避）。单次调用的时限是 MODEL_TIMEOUT_S。SDK
+  自己不再重试（catalog.resolve_draft_model 建模型时 max_retries=0），实际重试次数和报错写的一致。
 - 别的错误：这一段没写出来，原因照实写。
 
 **并发。** 全进程最多 MODEL_CONCURRENCY 个调用同时进行（model_gate：按事件循环各一个信号量，所有起草任务和同步
