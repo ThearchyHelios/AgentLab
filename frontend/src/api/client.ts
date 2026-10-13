@@ -436,7 +436,8 @@ export const api = {
       post<{ job: CatalogDraftJob }>(`${catalogBase(sourceId)}/draft-jobs/${encodeURIComponent(jobId)}/cancel`),
     /**
      * 只重试失败的表：新任务只含原任务里失败、部分完成、已停止的表，用模型和补充说明沿用，起草要求取数据源现在的。
-     * 没有可重试的表 422；有进行中的任务 409（catalog_draft_busy）
+     * 没有可重试的表 422；有进行中的任务 409（catalog_draft_busy）；和建任务一样，起草模型用不了（原任务用模型时）
+     * 409 catalog_draft_model_unavailable、没有表结构 409
      */
     retryDraftJob: (sourceId: string, jobId: string) =>
       post<{ job: CatalogDraftJob }>(`${catalogBase(sourceId)}/draft-jobs/${encodeURIComponent(jobId)}/retry`),

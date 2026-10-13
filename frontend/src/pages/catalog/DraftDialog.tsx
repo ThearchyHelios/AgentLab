@@ -27,6 +27,13 @@ type Scope = 'selected' | 'filtered' | 'top' | 'all'
 /** 字数按服务端的算法：去掉首尾空白后的字符数（按码位，不按 UTF-16 的长度） */
 const charCount = (s: string) => [...s.trim()].length
 
+/**
+ * 建任务（开始、只重试失败的表）没建成怎么说。起草模型用不了（409，建任务和重试都会回）：服务端那句话已经写了原因和
+ * 去处，照原样，长句也不拆成「标题：原因」；别的错误前面写明没有开始
+ */
+const startErrorText = (e: unknown) =>
+  (e instanceof ApiError && e.code === DRAFT_MODEL_UNAVAILABLE ? e.message : DT.startFailed(errorMessage(e)))
+
 export function DraftDialog({
   sourceId, sourceDescription, guidance, rows, visible, selected, filtered, job, initial, initialBusy = false, stopping,
   onStart, onCancel, onRetry, onTrack, onGuidanceSaved, onClose,
@@ -156,29 +163,30 @@ export function DraftDialog({
       setBusy(r.busy)
       setMode('job')
     } catch (e) {
-      // 起草模型用不了（没有接入、已停用、只有演示接入）：服务端那句话已经写了原因和去处
-      setStartError(e instanceof ApiError && e.code === DRAFT_MODEL_UNAVAILABLE ? e.message : DT.startFailed(errorMessage(e)))
+      // 起草模型用不了（没有接入、已停用、只有演示接入）时留在这一步，写明原因
+      setStartError(startErrorText(e))
     } finally {
       setStarting(false)
     }
   }
 
-  const act = async (fn: () => Promise<void>) => {
+  const act = async (fn: () => Promise<void>, describe: (e: unknown) => string = errorMessage) => {
     setActing(true)
     setActionError(null)
     try {
       await fn()
     } catch (e) {
-      setActionError(errorMessage(e))
+      setActionError(describe(e))
     } finally {
       setActing(false)
     }
   }
   const stop = () => act(onCancel)
+  // 重试是新建一个任务：没建成（起草模型用不了、没有表结构……）和开始时同一个说法，留在结果里
   const retry = (from: CatalogDraftJob) => act(async () => {
     const r = await onRetry(from)
     setBusy(r.busy)
-  })
+  }, startErrorText)
   const openLast = (j: CatalogDraftJob) => {
     onTrack(j)
     setBusy(false)
@@ -357,7 +365,7 @@ function JobView({ job, running, stopping, busy }: { job: CatalogDraftJob; runni
         </p>
       )}
       {running && <p className="text-2xs leading-relaxed text-faint">{DT.hideHint}</p>}
-      {job.status === 'failed' && job.error && <Notice tone="err" attr={{ 'data-draft-job-error': '' }}>{DT.jobFailed(job.error)}</Notice>}
+      {job.status === 'failed' && job.error && <Notice tone="err" attr={{ 'data-draft-job-error': '' }}>{job.error}</Notice>}
       {job.status === 'interrupted' && <Notice tone="warn" attr={{ 'data-draft-interrupted': '' }}>{DT.interrupted}</Notice>}
       {job.status === 'cancelled' && <p className="text-2xs text-dim" data-draft-cancelled="">{DT.cancelled}</p>}
       {problemText && (
@@ -376,7 +384,7 @@ function JobView({ job, running, stopping, busy }: { job: CatalogDraftJob; runni
         </div>
         <ul className="max-h-64 divide-y divide-[var(--hairline)] overflow-y-auto overflow-x-hidden rounded-md border"
             aria-labelledby="catalog-draft-tasks-label" data-draft-tasks="">
-          {tasks.map((t) => <TaskRow key={t.table_name} task={t} />)}
+          {tasks.map((t) => <TaskRow key={t.table_name} task={t} jobError={job.error} />)}
         </ul>
       </div>
     </div>
@@ -393,9 +401,13 @@ const TASK_ICON: Record<CatalogDraftTaskStatus, { Icon: LucideIcon | null; color
   cancelled: { Icon: CircleSlash, color: 'var(--text-faint)' },
 }
 
-function TaskRow({ task: t }: { task: CatalogDraftTask }) {
+/**
+ * 逐表的一行。jobError：任务整体的原因（整体出错、服务重启中断时服务端把没结束的表也记上同一句）。和它一样的不再逐表
+ * 重复——几百张表各写一遍同一句，真正各有原因的那几张反而找不到；任务的原因已经写在上面（标题、提示）
+ */
+function TaskRow({ task: t, jobError }: { task: CatalogDraftTask; jobError: string | null }) {
   const { Icon, color } = TASK_ICON[t.status]
-  const reason = taskReason(t)
+  const reason = jobError && t.error === jobError ? (t.model_error ?? '') : taskReason(t)
   const parts = t.parts_total != null && t.parts_total > 1 && t.status !== 'pending' && t.status !== 'skipped'
   const changes = DT.taskAdded(t.added, t.updated)
   return (

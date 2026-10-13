@@ -407,9 +407,18 @@ const JOB_ACTIVE = new Set(['queued', 'running'])
 const TASK_END = new Set(['ok', 'partial', 'failed', 'skipped', 'cancelled'])
 const RETRYABLE = new Set(['failed', 'partial', 'cancelled'])
 const isoNow = () => new Date().toISOString()
-/** 服务端的两种 409（机读码 + 一句中文） */
+/**
+ * 服务端的几种 409（机读码 + 一句中文）。起草模型用不了有长短两句：没有接入时短（界面原样显示），设置里的起草模型所在
+ * 接入停用时长（带句号，也要原样显示）
+ */
 const BUSY = { detail: '这个数据源已有进行中的起草任务，请等它结束或停止后再开始', code: 'catalog_draft_busy' }
 const MODEL_DOWN = { detail: '未配置模型接入，无法由助手起草数据目录。请到「设置 → 模型接入」添加', code: 'catalog_draft_model_unavailable' }
+const MODEL_OFF = {
+  detail: '起草模型使用的模型接入「check-gw」已停用。请在「设置 → 模型接入」中启用它，或在「设置 → 偏好设置」的「起草模型」中重新选择',
+  code: 'catalog_draft_model_unavailable',
+}
+/** 任务整体出错时服务端写的原因（catalog_jobs.JOB_ERROR：已经带着「起草任务出错：」开头） */
+const JOB_ERR = '起草任务出错：database is locked'
 /** 起草时每段最多几列（服务端的常量）：超过的宽表拆成「表级一段 + 列分段」 */
 const PART_COLUMNS = 40
 
@@ -483,13 +492,26 @@ function finishJob(job, status) {
   job.started_at ??= job.finished_at
 }
 
-/** 停下：没开始和没写完的表记 cancelled，已经写进目录的不动 */
+/**
+ * 停下：没开始和没写完的表记 cancelled，已经写进目录的不动。带原因的（服务重启中断）任务和表记同一句（服务端 _close 的
+ * 做法）；使用者点的停止不带原因
+ */
 function stopJob(job, status = 'cancelled', error = null) {
   for (const t of job.tasks) {
     if (t.status === 'pending' || t.status === 'running') Object.assign(t, { status: 'cancelled', error, finished_at: isoNow() })
   }
+  if (error) job.error = error
   delete job.stopAsked
   finishJob(job, status)
+}
+
+/** 任务整体出错（数据源没了、开始时起草模型已经用不了、意外出错）：没结束的表也记失败，原因同任务的（服务端 _end 的做法） */
+function failJob(job, error) {
+  for (const t of job.tasks) {
+    if (t.status === 'pending' || t.status === 'running') Object.assign(t, { status: 'failed', error, finished_at: isoNow() })
+  }
+  job.error = error
+  finishJob(job, 'failed')
 }
 
 function lastDraftOf(state, src, name) {
@@ -543,7 +565,7 @@ function jobHandlers(state, reply) {
       else job.stopAsked = true
       return json({ job: jobOut(job) })(route)
     })],
-    // 重试：新任务只含失败、部分完成、停止的表，沿用用模型和补充说明
+    // 重试：新任务只含失败、部分完成、停止的表，沿用用模型和补充说明。起草模型用不了的 409 由检查用 replies.retry 给
     [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs\/[^/]+\/retry$/, reply('retry', (route, { key }) => {
       const old = jobOf(state, key)
       if (!old) return NO_JOB(route)
@@ -931,7 +953,7 @@ await section('数据目录 · 起草：设置与开始', async () => {
   // 起草模型用不了：409 带机读码，留在设置阶段写明原因，不进入进行中、不去取任务
   replies.createJob.push(json(MODEL_DOWN, 409))
   await page.locator('[data-draft-start]').click()
-  check('起草模型用不了（409）：留在设置阶段，写明原因', await until(async () => (await draftText(page, '[data-draft-start-error]')).includes('未配置模型接入'))
+  check('起草模型用不了（409）：留在设置阶段，照原样写服务端那句话', await until(async () => (await draftText(page, '[data-draft-start-error]')) === MODEL_DOWN.detail)
         && (await draftPhase(page)) === 'setup', await draftText(page, '[data-draft-start-error]'))
   const keys = writes(sent, /./).map((s) => s.key.replace(/^(\w+) .*\/catalog\//, '$1 '))
   check('……起草要求改过：先存起草要求、再建任务', keys.join(',') === 'PUT guidance,POST draft-jobs', keys.join(','))
@@ -961,7 +983,8 @@ await section('数据目录 · 起草：设置与开始', async () => {
 
 await section('数据目录 · 起草：进度、结果与重试', async () => {
   const state = freshState()
-  const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })
+  const replies = { retry: [] }
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state, replies) })
   await page.locator('[data-catalog-row]').first().waitFor()
   check('开始起草（闸机到会员 3 张，用模型，带补充说明）', await startDraft(page, { select: ['gates', 'members'], model: true, note: DRAFT_NOTE }))
   const job = state.jobs.at(-1)
@@ -1010,9 +1033,17 @@ await section('数据目录 · 起草：进度、结果与重试', async () => {
   // 只重试失败的表
   const retry = page.locator('[data-draft-retry]')
   check('给「只重试失败的表（2 张）」', (await retry.innerText().catch(() => '')).includes('只重试失败的表（2 张）'), await retry.innerText().catch(() => ''))
+  // 重试时起草模型已经用不了（服务端和建任务时一样回 409 catalog_draft_model_unavailable）：留在结果里，照原样写服务端
+  // 那句话（长句也不拆成「标题：原因」），不建新任务
+  replies.retry.push(json(MODEL_OFF, 409))
+  await retry.click()
+  check('重试时起草模型用不了（409）：留在结果里，照原样写服务端那句话，不建新任务',
+    await until(async () => (await draftText(page, '[data-draft-action-error]')) === MODEL_OFF.detail)
+        && (await draftPhase(page)) === 'done' && state.jobs.at(-1) === job, await draftText(page, '[data-draft-action-error]'))
   await retry.click()
   check('重试：调重试接口，进入新任务的进行中，只含没写全的 2 张', await until(async () => (await draftPhase(page)) === 'running'
-        && (await draftBox(page).locator('[data-draft-task]').count()) === 2) && count(sent, new RegExp(`^POST .*draft-jobs/${job.id}/retry$`)) === 1)
+        && (await draftBox(page).locator('[data-draft-task]').count()) === 2) && count(sent, new RegExp(`^POST .*draft-jobs/${job.id}/retry$`)) === 2)
+  check('……上一次的报错收起', await draftBox(page).locator('[data-draft-action-error]').count() === 0)
   const job2 = state.jobs.at(-1)
   check('……新任务沿用用模型和补充说明', job2.id !== job.id && job2.use_model && job2.note === DRAFT_NOTE)
   settle(state, job2, 'store_sales', { added: 1, model_items: 3 })
@@ -1082,9 +1113,11 @@ await section('数据目录 · 起草：停止、后台继续与再打开', asyn
   await strip.locator('[data-catalog-draft-open]').click()
   check('点开：回到对话框，直接显示进行中的任务', await until(async () => (await draftPhase(page)) === 'running')
         && (await draftText(page, '[data-draft-progress]')) === '已完成 2 / 20 张表', await draftText(page, '[data-draft-progress]'))
-  // 停止：调停止接口；服务端停下正在进行的调用之前写「正在停止」
+  // 停止：调停止接口；服务端马上取消进行中的模型调用，只等手上那张表写完（停止接口等它收尾才答）。这期间写「正在停止」，
+  // 说法照服务端的做法：不是「等当前这次调用结束」——一次调用可能要几分钟
   await page.locator('[data-draft-stop]').click()
-  check('点「停止」：调停止接口，写「正在停止」，停止按钮不能再点', await until(async () => (await draftText(page, '[data-draft-title]')).startsWith('正在停止'))
+  check('点「停止」：调停止接口，写「正在停止：取消进行中的模型调用…」，停止按钮不能再点',
+    await until(async () => (await draftText(page, '[data-draft-title]')).startsWith('正在停止：取消进行中的模型调用'))
         && count(sent, new RegExp(`^POST .*draft-jobs/${job.id}/cancel$`)) === 1 && await page.locator('[data-draft-stop]').isDisabled(),
     await draftText(page, '[data-draft-title]'))
   stopJob(job)
@@ -1128,7 +1161,7 @@ await section('数据目录 · 起草：停止、后台继续与再打开', asyn
   await close()
 })
 
-await section('数据目录 · 起草：已有任务（409）与服务重启中断', async () => {
+await section('数据目录 · 起草：已有任务（409）、服务重启中断与整体出错', async () => {
   const state = freshState()
   // 上一次起草因服务重启中断：没结束的表记已停止，写明原因
   const old = newJob(state, S1, { tables: ['visits', 'orders', 'parks'], use_model: true, note: DRAFT_NOTE })
@@ -1144,7 +1177,10 @@ await section('数据目录 · 起草：已有任务（409）与服务重启中�
   check('……点开：结果写明服务重启中断，可以接着重试', await until(async () => (await draftPhase(page)) === 'done')
         && (await draftText(page, '[data-draft-title]')) === '服务重启，起草中断' && (await draftText(page, '[data-draft-interrupted]')).includes('重试'),
     `${await draftText(page, '[data-draft-title]')} · ${await draftText(page, '[data-draft-interrupted]')}`)
-  check('……没写的 2 张写原因', (await draftText(page, '[data-draft-task="orders"] [data-draft-task-reason]')).includes('服务重启，起草中断'))
+  // 服务端把任务和没写完的表都记「服务重启，起草中断」：标题、提示已经写了，逐表只写「已停止」，不再各写一遍
+  check('……没写的 2 张记「已停止」，原因不再逐张重复', (await draftText(page, '[data-draft-task="orders"] [data-draft-task-status]')) === '已停止'
+        && (await draftText(page, '[data-draft-task="parks"] [data-draft-task-status]')) === '已停止'
+        && await draftBox(page).locator('[data-draft-task-reason]').count() === 0, await draftText(page, '[data-draft-tasks]'))
   await shot(page, 'catalog-draft-interrupted')
   await page.locator('[data-draft-retry]').click()
   check('……「只重试失败的表」接着起草没写的 2 张', await until(async () => (await draftPhase(page)) === 'running')
@@ -1154,6 +1190,23 @@ await section('数据目录 · 起草：已有任务（409）与服务重启中�
   settle(state, again, 'parks', { added: 1 })
   finishJob(again)
   await until(async () => (await draftPhase(page)) === 'done')
+  await page.locator('[data-draft-close]').click()
+
+  // 任务整体出错（意外出错、开始时起草模型已经用不了……）：服务端把没结束的表也记失败、原因同任务的。原因只在标题下面
+  // 写一次，照服务端的原话（它已经带着「起草任务出错：」开头，界面不再套一层）；逐表不再重复同一句；这些表都能重试
+  check('开始起草（使用次数最多的 20 张，用模型）', await startDraft(page, { model: true }))
+  const broken = state.jobs.at(-1)
+  settle(state, broken, 'visits', { added: 2, model_items: 4 })
+  settle(state, broken, 'orders', { status: 'failed', model_items: 0, model_error: CALL_ERR })
+  failJob(broken, JOB_ERR)
+  check('任务整体出错：标题写「起草失败」，原因照服务端的原话写一次', await until(async () => (await draftPhase(page)) === 'done')
+        && (await draftText(page, '[data-draft-title]')) === '起草失败' && (await draftText(page, '[data-draft-job-error]')) === JOB_ERR,
+    `${await draftText(page, '[data-draft-title]')} · ${await draftText(page, '[data-draft-job-error]')}`)
+  check('……逐表只列没写的 19 张；和任务相同的原因不再逐张重复，各有原因的照样写', (await draftBox(page).locator('[data-draft-task]').count()) === 19
+        && await draftBox(page).locator('[data-draft-task-reason]').count() === 1
+        && (await draftText(page, '[data-draft-task="orders"] [data-draft-task-reason]')) === CALL_ERR, await draftText(page, '[data-draft-tasks]'))
+  check('……这 19 张都能重试', (await page.locator('[data-draft-retry]').innerText().catch(() => '')).includes('（19 张）'))
+  await shot(page, 'catalog-draft-failed')
   await page.locator('[data-draft-close]').click()
 
   // 别处（另一个标签页）又起了一个任务，这一页还不知道：点开始时服务端回 409，转去显示那一个

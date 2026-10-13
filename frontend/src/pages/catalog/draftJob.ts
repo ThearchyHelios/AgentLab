@@ -152,7 +152,10 @@ export function useDraftJob(sourceId: string, active: CatalogActiveDraftJob | nu
     }
   }, [accept])
 
-  /** 只重试失败的表：同 start，409 已有任务时改去显示进行中的那一个 */
+  /**
+   * 只重试失败的表：同 start，409 已有任务时改去显示进行中的那一个；起草模型用不了（409）、没有可重试的表（422）等
+   * 照原样抛给调用方
+   */
   const retry = useCallback(async (from: CatalogDraftJob): Promise<{ job: CatalogDraftJob; busy: boolean }> => {
     const src = sourceRef.current
     try {

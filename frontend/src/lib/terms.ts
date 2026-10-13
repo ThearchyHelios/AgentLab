@@ -2427,7 +2427,8 @@ export const CATALOG_DRAFT_TEXT = {
   // ---- 进行中
   queued: '排队中，等待开始…',
   running: '正在起草…',
-  stopping: '正在停止：当前的模型调用结束后停止…',
+  // 服务端点了停止就取消进行中的模型调用（不等它答完，一次调用可能要几分钟），只等手上正在写入目录的那张表写完
+  stopping: '正在停止：取消进行中的模型调用，正在写入目录的表写完后停止…',
   progress: (done: number, total: number) => `已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
   /** 结束以后：全部写出来的表有几张（停止、失败、部分完成的不算） */
   progressDone: (ok: number, total: number) => `写完 ${formatNumber(ok)} / ${formatNumber(total)} 张表`,
@@ -2452,7 +2453,8 @@ export const CATALOG_DRAFT_TEXT = {
   } as Record<CatalogDraftJobStatus, string>,
   interrupted: '服务重启时这次起草还没有完成，没写完的表未起草。已写进目录的内容保留；可以只重试这些表，接着起草',
   cancelled: '已写进目录的内容保留，没写完的表未起草',
-  jobFailed: (reason: string) => `起草任务出错：${reason}`,
+  // 任务整体出错的原因（job.error）照服务端的原话写在标题「起草失败」下面，不再加前缀：服务端的原因有的已经是整句
+  // （「数据源不存在……」），有的自带「起草任务出错：」开头。没结束的表记失败、原因同任务的，逐表不再重复
   /** 没写全的表：失败、部分完成、已停止各几张；跳过的（表结构里没有）另说 */
   problems: (c: { failed: number; partial: number; cancelled: number; skipped: number }) => {
     const parts = [
@@ -2483,7 +2485,7 @@ export const CATALOG_DRAFT_TEXT = {
   toast: {
     succeeded: (summary: string) => `数据目录起草完成：${summary}`,
     partial: (n: number) => `数据目录起草完成，${formatNumber(n)} 张表未写全`,
-    failed: (reason: string) => `数据目录起草失败：${reason}`,
+    failed: (reason: string) => (reason ? `数据目录起草失败：${reason}` : '数据目录起草失败'),
     cancelled: '数据目录起草已停止',
     interrupted: '服务重启，数据目录起草中断',
   },
