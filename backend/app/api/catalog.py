@@ -13,6 +13,9 @@
 - POST   /catalog/draft-jobs     建后台起草任务（202）；GET /draft-jobs/active、/latest、/{job_id} 读任务；
                                  POST /draft-jobs/{job_id}/cancel 停止，/retry 只重试没写好的表（data/catalog_jobs.py）
 - POST   /catalog/profile        同步剖析：对业务库发少量只读查询，核对关系、取码值候选（data/catalog_profile.py）
+- GET    /catalog/review-queue   审阅队列：推断的项按使用次数、风险、来源排好；POST /catalog/review/batch 批量审阅，
+                                 GET /catalog/review-progress 审阅进度，GET /catalog/{table}/usage 用过这张表的运行
+                                 （data/catalog_review.py）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
 不对 422，源或表不存在 404。所有写操作记录请求头 X-Actor 的署名（自报、未认证）。剖析没开启、正在剖析 409。
@@ -24,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +38,7 @@ from app.api.coded import (
 )
 from app.api.runs import actor_of
 from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, introspect, table_versions
+from app.data import catalog_review
 from app.data.engine import SnapshotTampered
 from app.db.base import get_session
 from app.db.models import DataSource
@@ -232,6 +236,30 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
         # 排队或进行中的起草任务 {id, status, total, done}，界面据此显示进度；没有是 null
         "active_job": await catalog_jobs.job_brief(session, await catalog_jobs.active_job(session, source.id)),
     }
+
+
+# ---- 审阅队列、审阅进度（要登记在 GET /catalog/{table} 前面：不然 review-queue、review-progress 会被当成表名）
+
+
+@router.get("/{source_id}/catalog/review-queue")
+async def catalog_review_queue(source_id: str,
+                               limit: int = Query(50, ge=1, le=catalog_review.QUEUE_LIMIT_MAX),
+                               offset: int = Query(0, ge=0),
+                               kind: Literal["all", "facts", "names"] = Query("all"),
+                               table: str | None = Query(None, max_length=255),
+                               session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """审阅队列：只列推断的项，按使用次数、风险、来源排好（data/catalog_review.py）。kind 筛影响数字的项（facts）或名称
+    和说明（names），table 只看一张表。"""
+    _, source = await _resolved(session, source_id)
+    return await catalog_review.review_queue(session, source, kind=kind, table=table or None, limit=limit,
+                                             offset=offset)
+
+
+@router.get("/{source_id}/catalog/review-progress")
+async def catalog_review_progress(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """审阅进度：常用 20 张表、全部、影响数字的项各自确认了多少。"""
+    _, source = await _resolved(session, source_id)
+    return await catalog_review.review_progress(session, source)
 
 
 @router.get("/{source_id}/catalog/{table}")
@@ -525,6 +553,38 @@ async def review_catalog_item(source_id: str, table: str, payload: CatalogReview
     except catalog.CatalogPathError as e:
         raise HTTPException(422, str(e)) from e
     return await _detail(session, source, key, entry)
+
+
+class CatalogBatchReviewItem(BaseModel):
+    table_name: str = Field(min_length=1, max_length=255)
+    path: str = Field(min_length=1, max_length=600)
+    action: Literal["confirm", "reject", "reset"]
+    if_version: int = Field(ge=0)
+
+
+class CatalogBatchReviewIn(BaseModel):
+    items: list[CatalogBatchReviewItem] = Field(min_length=1, max_length=catalog_review.BATCH_MAX)
+
+
+@router.post("/{source_id}/catalog/review/batch")
+async def review_catalog_batch(source_id: str, payload: CatalogBatchReviewIn,
+                               x_actor: str | None = Header(default=None),
+                               session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """批量审阅：逐条结果和请求一一对应。逐表按 if_version 乐观锁，同一张表的几条一次写入；一张表冲突、路径不对、表不存在
+    只记在那几条上（ok 为假，code 是 catalog_conflict / catalog_path_invalid / table_missing），不影响别的。"""
+    _, source = await _resolved(session, source_id)
+    items = [catalog_review.BatchItem(i.table_name, i.path, i.action, i.if_version) for i in payload.items]
+    return {"results": await catalog_review.review_batch(session, source, items, actor=actor_of(x_actor))}
+
+
+@router.get("/{source_id}/catalog/{table}/usage")
+async def catalog_table_runs(source_id: str, table: str,
+                             limit: int = Query(20, ge=1, le=catalog_review.RUNS_LIMIT_MAX),
+                             session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """用过这张表的运行（total 是几次运行），新的在前；取法同使用次数（catalog.table_usage）。"""
+    _, source = await _resolved(session, source_id)
+    key, _ = await _table_key(session, source, table)
+    return await catalog_review.table_runs(session, source, key, limit=limit)
 
 
 def _tables_of(source: Any) -> dict[str, Any] | None:

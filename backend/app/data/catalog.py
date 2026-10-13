@@ -2249,27 +2249,27 @@ def query_snapshot_meta(source: Any, sql: str) -> dict[str, Any]:
     return {"source_id": getattr(source, "id", None), "source": getattr(source, "name", None), "tables": tables}
 
 
-async def table_usage(session: AsyncSession, source: Any) -> dict[str, int]:
-    """每张表被运行查询过的次数：{schema_cache 的表名: 次数}，没被查过的表不出现。
+async def query_snapshot_tables(session: AsyncSession, source: Any) -> list[tuple[str, frozenset[str]]]:
+    """这个源上属于运行的每一行查询快照引用：(运行 id, 这条查询用到的表——schema_cache 的表名)，没对上任何表的不收。
 
-    取法：数据源查询工具每次成功查询都存一份查询快照工件（tools/datasource.py），工件引用表 artifacts 里
-    按 (内容哈希, 运行) 各记一行。数「属于某次运行（runs 里有这次运行）、属于这个源、SQL 里用到了这张表」的
-    行：同一次运行里结果一模一样的重复查询只算一次，工具库里的试用（不属于任何运行）不算。
+    使用次数（table_usage）和「这张表被哪些运行用过」（data/catalog_review.py）共用这一份取法：数据源查询工具每次成功
+    查询都存一份查询快照工件（tools/datasource.py），工件引用表 artifacts 里按 (内容哈希, 运行) 各记一行；只收属于某次运行
+    （runs 里有这次运行）、属于这个源的行，工具库里的试用（不属于任何运行）不算。
 
-    表名在查询当时就记进了引用的 meta（query_snapshot_meta），这里只读 artifacts 一张表；升级前的老引用
-    没有 meta，退回读工件内容里的源名和 SQL，读过的按工件 id 缓存（内容永不改变）。SQL 里写的表名去掉
-    schema 前缀后按 name_key（只把 ASCII 字母转小写，和 SQLite 比较标识符的口径一致）对到表结构上，对不上的不计。
+    表名在查询当时就记进了引用的 meta（query_snapshot_meta），这里只读 artifacts 一张表；升级前的老引用没有 meta，退回读
+    工件内容里的源名和 SQL，读过的按工件 id 缓存（内容永不改变）。SQL 里写的表名去掉 schema 前缀后按 name_key（只把
+    ASCII 字母转小写，和 SQLite 比较标识符的口径一致）对到表结构上，对不上的不计。
     """
     rows = (await session.execute(
-        select(Artifact.id, Artifact.meta).join(Run, Run.id == Artifact.run_id)
+        select(Artifact.id, Artifact.meta, Artifact.run_id).join(Run, Run.id == Artifact.run_id)
         .where(Artifact.kind == QUERY_SNAPSHOT_KIND)
     )).all()
     tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
     lookup: dict[str, str] = {}
     for name in tables:
         lookup.setdefault(name_key(name), name)
-    counts: Counter[str] = Counter()
-    for artifact_id, meta in rows:
+    out: list[tuple[str, frozenset[str]]] = []
+    for artifact_id, meta, run_id in rows:
         meta = meta if isinstance(meta, dict) else {}
         if isinstance(meta.get("tables"), list):
             source_id, source_name, names = meta.get("source_id"), meta.get("source"), meta["tables"]
@@ -2281,8 +2281,21 @@ async def table_usage(session: AsyncSession, source: Any) -> dict[str, int]:
                 continue
         elif source_name != source.name:
             continue
-        hit = {lookup.get(name_key(str(n).rsplit(".", 1)[-1])) for n in names}
-        counts.update(t for t in hit if t is not None)
+        hit = frozenset(t for t in (lookup.get(name_key(str(n).rsplit(".", 1)[-1])) for n in names) if t is not None)
+        if hit:
+            out.append((str(run_id), hit))
+    return out
+
+
+async def table_usage(session: AsyncSession, source: Any) -> dict[str, int]:
+    """每张表被运行查询过的次数：{schema_cache 的表名: 次数}，没被查过的表不出现。
+
+    按查询快照引用的行数（query_snapshot_tables）：同一次运行里结果一模一样的重复查询只算一次，同一次运行里不同的查询
+    各算一次，工具库里的试用不算。
+    """
+    counts: Counter[str] = Counter()
+    for _run, hit in await query_snapshot_tables(session, source):
+        counts.update(hit)
     return dict(counts)
 
 
@@ -2337,7 +2350,8 @@ __all__ = [
     "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "is_date_column", "is_profile_note",
     "join_paths",
     "make_item", "merge_notes", "name_words", "now_iso", "parse_path", "plan_patch", "profile_relation_holds",
-    "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id", "render_table_index",
+    "query_snapshot_meta", "query_snapshot_tables", "read_catalog", "read_entry", "relation_graph", "relation_id",
+    "render_table_index",
     "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry", "review_item", "same_notes",
     "same_profile_note", "save_human_edit", "save_patch", "status_counts", "structure_relation_ids",
     "system_notes_source", "table_usage", "unreviewed_status", "validate_notes", "visible_notes", "write_entry",
