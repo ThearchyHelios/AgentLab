@@ -28,8 +28,8 @@
   的参数），提示词里又没有格式说明，模型就写成了说明文字。这次起草后面改走纯文本，这一段换纯文本问一次。有思考
   不等于额度用完：只有停在额度上、或者正文为空而有思考才算。
 - 被截断的 JSON：先把已经完整的表、列对象捡回来，只补剩下的。
-- 一段里缺了的表、列只补缺的，补一次。补问之后：模型列出了、字段留空的列是拿不准，不算没写出来；整列没列出来的
-  算没写出来（这张表是 partial，旧的模型起草项不删）；整张表还一项都没有的，照只给空壳处理（拆小、换纯文本）。
+- 一段里缺了的表、列只补缺的，补一次。补问之后：模型列出了、字段留空的列是拿不准（补问时才列出来的也一样），不算
+  没写出来；整列没列出来的算没写出来（这张表是 partial）；整张表还一项都没有的，照只给空壳处理（拆小、再问一次）。
 - 结构化输出这个接口不支持（400 / 422 提到 response_format、json_schema、tool……，或者模型类不支持）：这次起草
   后面改走纯文本、从正文取 JSON（纯文本那条路另外说清 JSON 的格式）。
 - 服务方嫌额度太大：退回 MODEL_FALLBACK_MAX_TOKENS 重来，这次起草后面都用它（catalog.DraftModel.shrink）。
@@ -1169,6 +1169,8 @@ class _Run:
         if len(failed) >= int(C.MODEL_NOTICE_ON) or (self.notice is not None and len(failed) >= int(C.MODEL_NOTICE_OFF)):
             counts = collections.Counter(failed)
             kinds = "、".join(f"{label} {counts[kind]} 次" for kind, label in FAILURE_LABEL.items() if counts[kind])
+            if self.notice is None:
+                logger.warning("起草数据目录：最近 %d 次调用有 %d 次没写出来（%s）", len(self.recent), len(failed), kinds)
             self.notice = NOTICE.format(calls=len(self.recent), failed=len(failed), kinds=kinds, place=DRAFT_MODEL_PLACE)
         else:
             self.notice = None
