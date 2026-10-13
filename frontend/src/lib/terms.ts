@@ -167,6 +167,8 @@ export const NODE_TYPE_LABEL: Record<NodeType, string> = {
   validate: '结构校验',
   metrics: '口径卡',
   report: '报告撰写',
+  dual_check: '双盲复算',
+  challenge: '反方审稿',
 }
 
 /** 与 decode.ts 里旧名字同名的出口，第二波改成从这里导入时不用改调用处 */
@@ -243,6 +245,18 @@ export const ABSENCE_CLAIM_TEXT = {
   title: (n?: number) => `报告写了${n ? ` ${formatNumber(n)} 处` : ''}缺失断言，已标注（证据目录有省略）`,
   next: '被省略的查询仍在证据台账里，可在证据面板中查看。请在报告撰写节点的指令中要求未展开的方向写作「本报告未覆盖」，'
     + '或换用上下文窗口更大的写作模型后重新运行',
+}
+
+/**
+ * 报告直接引用了取自遮罩列的格子（报告自查的 masked_cell：[[v:Q2.r0.tel]]，c.phone AS tel 这种改了名字的也算；遮罩按
+ * 列名对数据源里所有表生效，视图、别的表里同名的列也算），重写后仍在、「违规处置」为标注时照常产出：时间线上那一行（日志
+ * report_masked_cell）和证据面板违规清单里的叫法。自查只查引用，不按值在正文里找遮罩值。
+ * 只说记为缺口，不说出具：探索运行、没设出具契约的成果不出具，报告接在侧枝上时缺口也进不了出具，降不降档由出具那一行说
+ */
+export const MASKED_CELL_TEXT = {
+  label: '引用了遮罩列',
+  title: (n?: number) => `报告引用了${n ? ` ${formatNumber(n)} 处` : ''}取自遮罩列的格子，已标注`,
+  next: '数据源设置了遮罩的列不应写进报告，这几处已记为缺口。请在报告撰写节点的指令中去掉对这些列的引用后重新运行',
 }
 
 /** 证据面板和证据条的文案 */
@@ -325,6 +339,8 @@ export const EVIDENCE_TEXT = {
   openSnapshot: '打开完整快照',
   snapshotTitle: (alias: string) => `查询 ${alias} · 完整快照`,
   masked: '已遮罩',
+  /** 遮没遮核对不了、不显示的值（快照、取值链上的产出读不出来）：和「已遮罩」分开，数据源可能根本没设遮罩 */
+  unverifiedValue: '无法核对',
   /** 面板底部：被遮罩的列 + 遮罩不是安全边界（用户拍板写明） */
   maskNote: (cols: string[]) =>
     `已遮罩的列：${cols.join('、')}。遮罩只减少暴露，不是安全边界：完整快照和原始工件中仍为原值`,
@@ -471,6 +487,39 @@ export const EVIDENCE_TEXT = {
     loading: '正在推断来源…',
     failed: '未能获取推断的来源',
   },
+
+  // ---- 期 4：核查状态。指标步骤上的双盲复算、取自遮罩列的输入（反方审稿的判断复用审批卡的 CHALLENGE_TEXT）----
+  /**
+   * 指标步骤上的一行：「双盲复算：状态（盲算 值），审核人的选择。后果」。状态词和同一节里按代入式重算的「复算一致 /
+   * 无法复算」分开说（两件事），用时间线上的说法（与盲算结果一致 / 不一致）；选项名照审批卡的 choices 原样加引号。
+   * 运行已经结束：后果只说节点已经做了什么（记为缺口），降没降档看报告的出具横幅，这里不预告
+   */
+  dualCheck: {
+    label: '双盲复算',
+    status: { agreed: '与盲算结果一致', disagreed: '与盲算结果不一致', unchecked: '未能完成', skipped: '已跳过' } as Record<string, string>,
+    /** 服务端给了一个界面不认识的状态：照写原值，不归到哪一类 */
+    unknown: (status: string) => `未知状态「${status}」`,
+    /** 盲算的值，服务端按口径卡的格式渲染好的 */
+    blind: (value: string) => `盲算 ${value}`,
+    /** choice 是审批卡上那个选项的原名（DUAL_CHECK_TEXT.approval.choices） */
+    choice: (choice: string) => `审核人选择「${choice}」`,
+    noChoice: '审核人没有作出选择',
+    /** 采用盲算、两边都不对、没选：报告里的数没换，节点把它记成了缺口。正式运行叫出具缺口，探索运行不出具 */
+    kept: (formal: boolean) => `报告中的数仍取自原流程，这个指标已记为${formal ? '出具缺口' : '缺口'}`,
+    /** 未能完成：同样记了缺口 */
+    gap: (formal: boolean) => `这个指标已记为${formal ? '出具缺口' : '缺口'}`,
+    /** 跳过的原因，按这个指标说；认不出的原因代码不写 */
+    skip: {
+      disabled: '节点或设置中已关闭',
+      no_inputs: '这个指标没有来自查询的输入',
+      not_targeted: '这个指标不在复算范围内',
+    } as Record<string, string>,
+  },
+  /** 指标的输入取自数据源设置了遮罩的列：标签和代入式里不显示值 */
+  maskedInput: '取自设置了遮罩的列，不显示值',
+  /** 遮没遮核对不了（快照、取值链上的产出读不出来）：原因是服务端写好的一句 */
+  unverifiedInput: (why: string) => `${why}，不显示值`,
+  maskedMismatch: '与快照不一致；取自设置了遮罩的列，不显示值',
 } as const
 
 /**
@@ -885,6 +934,89 @@ export const PUBLISH_FIX_TEXT = {
 } as const
 
 /**
+ * 停用一个接入的后果。不只是下拉里看不到：点名它（或只写了它的模型）的节点、门控 / 裁判 / 核查设置都调不了它（后端
+ * providers/factory.named_provider）。调不了以后怎样各处不同（节点报错、门控转人工审批、裁判记未裁判、核查记缺口），
+ * 由设置页各组自己那一句说，这里只说「无法调用」；整句控制在 40 字以内
+ */
+const PROVIDER_DISABLED_EFFECT = '该接入的模型不再出现在下拉列表中，指定它或其模型的节点和设置也无法调用'
+
+/**
+ * 点名的模型接入不存在或已停用（后端 providers/factory.named_provider、engine/provider_refs.py）。以前点名的接入不存在时
+ * 运行悄悄换成演示模型、点名停用的照常调用；现在运行照实报错，设置页、画布校验、发布前检查都提前说出来
+ */
+export const PROVIDER_REF_TEXT = {
+  /** 节点配置里 provider 这一项的叫法：多数节点的检查器里没有这一栏，问题面板、修复预览里照样要写得出来 */
+  field: '模型接入',
+  /** 协作成员、修复预览里点号后面那一段：「成员「分析师」的模型接入」「工作流默认设置 · 模型接入」 */
+  memberField: '的模型接入',
+  /**
+   * 只写了模型、提供它的接入已停用时，问题落在写模型的那一处：成员的「成员「分析师」的模型」；节点定义里没有模型这一栏的
+   * （让模型重排的知识检索、让模型修复的结构校验）照样写得出「模型」
+   */
+  memberModel: '的模型',
+  model: '模型',
+  judge: '结论句裁判',
+  /** 设置页那一格下面：存着的接入不存在、已停用时先说状态，再说这一项因此会怎样（各组自己的后果） */
+  missing: (name: string) => `模型接入「${name}」不存在`,
+  disabled: (name: string) => `模型接入「${name}」已停用`,
+  gateBroken: '门控模型无法调用，所有工具调用将转为人工审批',
+  judgeBroken: '裁判调用将失败，所有结论句记为未裁判',
+  // 和核查一组「不存在」那句（VERIFY_SETTING_TEXT.section.providerGone）同一个后果
+  verifyBroken: '核查调用将失败',
+  /**
+   * 存着的接入名恰好是某个启用接入的模型（多半是把模型名填进了接入那一栏）：照「启用它」去做，启用的是那条旧接入。
+   * 和服务端保存时 422 的那一句（factory.model_note）一字不差；两栏写这一组的叫法（「门控模型 · 模型」「门控模型 · 接入」）
+   */
+  modelNote: (name: string, owner: string, modelField: string, providerField: string) =>
+    `「${name}」是接入「${owner}」的模型：如需使用该模型，请在「${modelField}」中填写，「${providerField}」留空或选择「${owner}」`,
+  /** 接入编辑框「启用」下面的说明、接入卡片上「已停用」的悬停说明 */
+  enabledHint: `停用后，${PROVIDER_DISABLED_EFFECT}`,
+  disabledChip: `已停用：${PROVIDER_DISABLED_EFFECT}`,
+  /**
+   * 检查器模型一栏的空选项：留空时执行用什么（同后端 NodeContext.cfg：节点没写的取工作流默认设置里的）。工作流默认设置
+   * 写了模型，用的就是那个模型（后端这时也不报「没有指定模型」）；节点（没写就是全图默认）点名了接入，用那个接入的默认
+   * 模型，照实说是哪个；那个接入不存在、已停用时说状态（检查器顶上另有接入那条问题），不说「使用」。和画布校验那条
+   * 「没有指定模型，将使用接入「X」的默认模型」同一个说法（后端 schema.MODEL_UNSET）
+   */
+  modelBlank: (named: string | null, state: 'ok' | 'missing' | 'disabled', fromDefaults: string | null = null) => (
+    state === 'missing' ? `默认（模型接入「${named}」不存在）`
+      : state === 'disabled' ? `默认（模型接入「${named}」已停用）`
+        : fromDefaults ? `默认（使用工作流默认设置的模型「${fromDefaults}」）`
+          : named ? `默认（使用接入「${named}」的默认模型）` : '默认（使用第一个可用的模型接入）'),
+  /** 同一栏下面的说明（没点名接入时用节点定义里的那句）；点名的接入不存在、已停用时不写，免得和接入那条问题打架 */
+  modelHelp: (named: string) => `留空则使用接入「${named}」的默认模型`,
+  modelHelpDefaults: (model: string) => `留空则使用工作流默认设置的模型「${model}」`,
+  /**
+   * 发布前检查里修完以后落到演示类接入的候选（后端 autofix 的 demo 标记）：选项名旁的醒目标签。说明里那半句「演示用，
+   * 不调用真实模型」照旧写，只是淡色小字、排在长句末尾——K1 要防的就是悄悄换成演示模型
+   */
+  demoTag: '演示模型',
+  demoTagHint: '选择后执行时由演示模型产出，不调用真实模型',
+} as const
+
+/**
+ * 「编排」页助手栏里「助手使用的模型」那一格（run/Composer.tsx）。服务端报助手的模型取不到时，指的就是这里
+ * （providers/factory.ASSISTANT_REPICK）：设置页没有助手的接入这一项，存着的接入失效了只能在这里重新选
+ */
+export const ASSISTANT_MODEL_TEXT = {
+  /** 和服务端 factory.ASSISTANT_MODEL_FIELD 一字不差：报错里让人去「助手使用的模型」中重新选择 */
+  label: '助手使用的模型',
+  follow: '跟随默认',
+  current: (model: string) => `（当前：${model}）`,
+  /**
+   * 存着的设定下拉里列不出来（点名了接入——下拉只选模型；或者模型不在可选列表中）：照实列成一项并选中它。否则下拉停在
+   * 「跟随默认」，看着一切正常，再选「跟随默认」也不算改动、清不掉存着的接入
+   */
+  saved: (provider: string | null, model: string | null) => (provider
+    ? (model ? `${model}（模型接入「${provider}」）` : `模型接入「${provider}」的默认模型`) : (model ?? '')),
+  note: '仅影响助手，不改变节点使用的模型。助手需要严格按格式输出，指令遵循能力较弱的模型可能无法生成工作流。',
+  /** 存着的设定用不了时，齿轮按钮的悬停说明（按钮上另有一个红点） */
+  broken: '助手使用的模型当前无法调用，点击查看原因',
+  /** 重新选择时保存失败：下拉退回选之前的样子（服务端存着的没变），在下面说明 */
+  saveFailed: '保存失败，助手使用的模型未更改',
+} as const
+
+/**
  * 一键升级为可追溯结构（问题面板的快速修复、记录页的横幅）。和发布前修复同一套规矩：
  * 只出预览，人点「应用」才走现有的保存存成草稿；不发布
  */
@@ -1002,6 +1134,34 @@ export const AGENT_GUARD_TEXT = {
   usdHint: '按模型目录中的价格估算；未登记价格的模型无法估算，只能依靠 token 预算',
   unlimited: '不限：费用仅受最大步数和上下文长度约束',
   unlimitedShort: '不限',
+} as const
+
+/** 「（16,384 token）」：输出额度，没给就不写 */
+const tokenCap = (maxTokens?: number) => (maxTokens ? `（${formatNumber(maxTokens)} token）` : '')
+
+/**
+ * 时间线上「核查模型的输出到了上限被截断」那一行（engine/verify_agent.py 的 verify_truncated 日志，双盲复算、反方审稿的
+ * 核查 Agent 发）。推理模型的思考也算在输出额度里，额度用完时回复是空的或只写了一半：照实说是输出额度不够，不说成
+ * 「没查到」「格式不对」，下一步指到换模型。截断的回复一律不采信，这次核查没有结果，节点按无法复算、未能反查记缺口
+ */
+export const VERIFY_TRUNCATED_TEXT = {
+  title: (maxTokens?: number) => `核查模型的输出达到上限${tokenCap(maxTokens)}被截断`,
+  sub: '这次核查未能给出结果',
+  next: '通常是推理占满了输出额度。请在节点上指定不带推理的模型，或在「设置 → 偏好设置 → 核查」中更换核查模型',
+} as const
+
+/**
+ * 时间线上结论句裁判的输出到了上限被截断（engine/judge.py）：被截断的那次调用（llm.end 带 truncated），和
+ * judge_truncated 日志那一行。不用「裁判未能执行」「检查接入后重新运行」的说法：截断时接入是好的，同一个模型重新运行
+ * 多半还是截断，该换的是模型
+ */
+export const JUDGE_TRUNCATED_TEXT = {
+  /** 被截断的那次调用：原来叫「请裁判模型判断 N 句结论」的那一行 */
+  call: (maxTokens?: number) => `裁判模型的输出达到上限${tokenCap(maxTokens)}被截断`,
+  title: (maxTokens?: number, unjudged?: number) => `裁判模型的输出达到上限${tokenCap(maxTokens)}被截断`
+    + (unjudged ? `，${formatNumber(unjudged)} 句结论未裁判` : ''),
+  next: '未裁判的结论句记为缺口，不能完整出具。通常是推理占满了输出额度：请在报告撰写节点的「结论句裁判」中指定不带推理的裁判模型，'
+    + '或在「设置 → 偏好设置 → 证据裁判」中更换，再重新运行',
 } as const
 
 /**
@@ -2720,4 +2880,1449 @@ export const COPILOT_CONTEXT_TEXT = {
   /** 没有数据目录的大库：只有一个数据源时说「这个数据源」，几个时点名 */
   noCatalog: (who: string | null) => `${who ?? '这个数据源'}还没有数据目录，起草后挑表和 SQL 检查会更准`,
   toCatalog: '去数据目录起草',
+}
+
+// ---------------------------------------------------------------------------
+// 下面几块是复核套件各工作包的文案位：名字先占好，各包只往自己那块里加，不去改同一处。
+// 还没做出来的功能，界面上统一写 PENDING_TEXT 那一句
+// ---------------------------------------------------------------------------
+
+/** 尚未完成的功能在界面上的统一说法 */
+const PENDING_TEXT = '功能开发中'
+
+/**
+ * 定时任务：导航、命令面板、定时任务页（pages/schedules）和记录页里的「定时」标记。
+ *
+ * 触发、跳过、补发各有固定说法：「触发」是到点（或手动）的那一下，「发起」是由它开始一次运行；跳过分「上次未结束」
+ * 和「错过时间」两种，不笼统写「失败」。时间都按定时任务自己的时区写，悬停另给本机时间
+ */
+export const SCHEDULE_TEXT = {
+  title: '定时任务',
+  hint: '按设定的周期自动发起工作流运行',
+
+  // ---- 列表
+  create: '新建定时任务',
+  emptyTitle: '还没有定时任务',
+  emptyBody: '定时任务按设定的周期自动发起工作流运行，适合日报、周报这类定期产出的结果。选择工作流、设定频率和输入即可创建，每次触发都记入触发历史。',
+  unsupported: '服务端暂不支持定时任务',
+  unsupportedHint: '当前服务端没有定时任务接口，请升级服务端后再使用',
+  listLabel: '定时任务列表',
+  formalChip: '正式运行',
+  pausedChip: '已暂停',
+  nextRun: '下次运行',
+  lastFire: '上次触发',
+  neverFired: '尚未触发',
+  /** 暂停中的没有下一次 */
+  nextPaused: '暂停中，不会触发',
+  /** 启用着却算不出下一次（如 2 月 30 日） */
+  nextNone: '往后不会再触发',
+  /** 计划时间已过、还没有这一次的触发记录：调度可能没开，或者正在发起 */
+  nextOverdue: '已到触发时间',
+  /** 悬停提示：按哪个时区、本机是几点 */
+  zoneTitle: (when: string, tz: string) => `${when}（${tz}）`,
+  localTitle: (when: string) => `本机时间 ${when}`,
+  enable: '启用',
+  enableLabel: (name: string) => `启用定时任务「${name}」`,
+  enabledOk: (name: string) => `已启用「${name}」`,
+  pausedOk: (name: string) => `已暂停「${name}」，到点不再发起运行`,
+  runNow: '立即运行',
+  runNowLabel: (name: string) => `立即运行定时任务「${name}」`,
+  edit: '编辑',
+  editLabel: (name: string) => `编辑定时任务「${name}」`,
+  deleteLabel: (name: string) => `删除定时任务「${name}」`,
+  deleteTitle: (name: string) => `删除定时任务「${name}」？`,
+  deleteConsequences: ['不再按计划发起运行，删除后不可恢复', '已发起的运行及其记录不受影响'],
+  deleteConfirm: '删除定时任务',
+  deleted: (name: string) => `已删除定时任务「${name}」`,
+  /** 启用开关遇到版本不符（409）：服务端那句是写给表单保存的，开关用这句，原话放进详情 */
+  toggleConflict: (name: string) => `「${name}」已在别处被修改，已重新载入最新状态，请确认后再切换`,
+
+  // ---- 立即运行的结果
+  runStarted: '已发起运行',
+  runSkipped: '上一次运行尚未结束，本次已按重叠策略跳过',
+  runFailed: (reason: string | null) => (reason ? `未能发起运行：${reason}` : '未能发起运行'),
+  openRun: '查看运行',
+
+  // ---- 触发
+  fireKind: { scheduled: '定时', manual: '手动', misfire: '补发' } as Record<import('../types').ScheduleFireKind, string>,
+  fireKindHint: {
+    scheduled: '到点按计划触发',
+    manual: '手动「立即运行」',
+    misfire: '错过触发时间后，在补发宽限内恢复时补发的一次',
+  } as Record<import('../types').ScheduleFireKind, string>,
+  /**
+   * 错过、没有补发的（服务端记 kind=misfire、status=skipped_misfire）：类型按「定时」写。没有补发的原因有两种（超出
+   * 补发宽限；宽限内恢复时积压的触发不补，只发起最近一次），这里不替服务端认定是哪一种，本条记了原因时指向它
+   */
+  fireKindMissedHint: (hasReason: boolean) => `按计划应在此时触发，错过后没有补发${hasReason ? '，原因见本条记录' : ''}`,
+  fireStatus: {
+    started: '已发起',
+    skipped_overlap: '上次未结束已跳过',
+    skipped_misfire: '错过已跳过',
+    failed_to_start: '发起失败',
+  } as Record<import('../types').ScheduleFireStatus, string>,
+  /**
+   * 结局的一般说明，本条没有记原因时悬停用：只说这种结局是什么，不指向不存在的原因。错过已跳过的两种原因都适用，
+   * 发起失败也可能是手动立即运行，不写「到点」
+   */
+  fireStatusHint: {
+    started: '已发起运行',
+    skipped_overlap: '上一次运行还没有结束，按重叠策略跳过了这一次',
+    skipped_misfire: '服务停机等原因错过了触发时间，这一次没有发起',
+    failed_to_start: '未能发起运行，服务端未提供原因',
+  } as Record<import('../types').ScheduleFireStatus, string>,
+  event: { finished: '运行结束', failed: '运行失败', awaiting_approval: '等待审批' } as Record<import('../types').ScheduleEvent, string>,
+  noticeStatus: { ok: '已发送', failed: '发送失败' } as Record<'ok' | 'failed', string>,
+
+  // ---- 详情
+  tabs: { settings: '设置', history: '触发历史' } as Record<'settings' | 'history', string>,
+  back: '返回列表',
+  notFound: '定时任务不存在或已被删除',
+  notFoundHint: '请返回列表查看现有的定时任务',
+
+  // ---- 表单：基本
+  newTitle: '新建定时任务',
+  name: '名称',
+  namePlaceholder: '例如：门店周报',
+  workflow: '工作流',
+  workflowPlaceholder: '搜索并选择工作流',
+  workflowNone: '没有匹配的工作流',
+  workflowEmpty: '还没有工作流，请先在编排页创建并保存。',
+  toStudio: '去编排',
+  /** 定时任务指向的工作流已经不在列表里 */
+  workflowGone: (name: string) => `工作流「${name}」已不存在，请重新选择`,
+  workflowDraft: '草稿',
+  workflowVersion: (status: string, v: number) => `${status} v${v}`,
+
+  // ---- 表单：频率
+  freq: '频率',
+  preset: { daily: '每天', weekly: '每周', monthly: '每月', hourly: '每隔几小时', custom: '自定义 cron' } as Record<
+    'daily' | 'weekly' | 'monthly' | 'hourly' | 'custom', string>,
+  time: '时间',
+  weekdays: '星期',
+  weekdayShort: ['周日', '周一', '周二', '周三', '周四', '周五', '周六'] as readonly string[],
+  monthday: '日期',
+  monthdayOption: (d: number) => `${d} 日`,
+  monthdayHint: '没有这一天的月份不触发',
+  everyHours: '间隔',
+  everyHoursOption: (n: number) => `每 ${n} 小时`,
+  minute: '第几分',
+  hourlyHint: (n: number, m: number) => `从 0 点起每 ${n} 小时一次，每次在第 ${m} 分`,
+  cron: 'cron 表达式',
+  cronHint: '五段，依次为分、时、日、月、星期，例如 0 9 * * 1-5 表示工作日 09:00',
+  timezone: '时区',
+  timezoneHint: '触发时间按这个时区计算',
+  timezoneLocal: '本机',
+  timezoneLabel: {
+    'Asia/Shanghai': '北京', 'Asia/Hong_Kong': '香港', 'Asia/Taipei': '台北', 'Asia/Singapore': '新加坡',
+    'Asia/Tokyo': '东京', 'Asia/Seoul': '首尔', 'Asia/Kolkata': '印度', 'Asia/Dubai': '迪拜', 'Europe/London': '伦敦',
+    'Europe/Paris': '巴黎', 'Europe/Berlin': '柏林', 'America/New_York': '纽约', 'America/Chicago': '芝加哥',
+    'America/Los_Angeles': '洛杉矶', UTC: '协调世界时',
+  } as Record<string, string>,
+
+  // ---- 表单：预览
+  preview: '接下来 5 次触发',
+  previewLoading: '正在计算…',
+  previewIdle: '填好频率后在此预览触发时间',
+  previewNone: '按这个频率往后不会触发',
+  previewFailed: '无法预览触发时间',
+  previewZone: (tz: string) => `按 ${tz} 计算`,
+
+  // ---- 表单：运行类别
+  runClass: '运行类别',
+  formal: '正式运行',
+  formalHint: '从已发布版本发起，结果出具、可审计。工作流须已发布',
+  formalVersion: (v: number) => `每次按当时的发布版本发起，当前为 v${v}`,
+  exploratory: '探索运行',
+  exploratoryHint: '使用工作流当前保存的内容，结果不出具',
+  /** 已保存的定时任务、这次没动工作流和运行类别，工作流后来撤了发布：保存照常，到点会发起失败 */
+  notPublished: '这个工作流目前没有发布版本：到点时无法发起正式运行，会记为发起失败。请先发布，或改用探索运行',
+
+  // ---- 表单：输入
+  inputs: '输入',
+  inputsHint: '可填固定值或模板，模板中的变量按触发时间计算；留空的字段按工作流的默认值',
+  inputsPick: '选择工作流后在此填写输入',
+  inputsNone: '这个工作流没有输入字段',
+  inputsLoading: '正在读取输入字段…',
+  inputsFailed: '无法读取输入字段',
+  inputsFromVersion: (v: number) => `字段取自已发布的 v${v}`,
+  inputsFromDraft: '字段取自工作流当前保存的内容',
+  required: '必填',
+  /** 已保存的定时任务、这次没动输入：保存照常，留空到点会发起失败 */
+  requiredNoDefault: '必填且没有默认值：留空时到点会发起失败',
+  /** 新建、或者这次改了工作流、运行类别、输入：服务端保存时就会拒 */
+  requiredFill: '必填且没有默认值，请填写后再保存',
+  defaultValue: (v: string) => `默认：${v}`,
+  variables: '插入变量',
+  variablesClose: '收起变量',
+  variablesLabel: (field: string) => `插入到「${field}」的变量`,
+  variablesEmpty: '服务端没有提供可用的变量',
+  variableTitle: (name: string, example: string) => (example ? `${name}，例如 ${example}` : name),
+  rendered: (v: string) => `下次触发时为：${v}`,
+  renderedEmpty: '下次触发时为空',
+  staleField: '工作流中已没有这个字段',
+  /** 画布上有、正式运行用的已发布版本里没有 */
+  staleNotInVersion: (v: number) => `已发布的 v${v} 中没有这个字段`,
+  /** 接在上面两句后面：交上去会被拒 */
+  staleRemove: '保存前请移除',
+  removeField: '移除',
+
+  // ---- 表单：重叠与补发
+  overlap: '重叠与补发',
+  overlapText: '上一次运行还没有结束时，跳过这一次，记入触发历史',
+  misfire: '错过触发时间',
+  misfireHint: '服务停机等原因错过触发时间时，在宽限内恢复则补发一次，超过则跳过',
+  misfireOption: (span: string) => `${span}内补发`,
+  span: { day: (n: number) => `${n} 天`, hour: (n: number) => `${n} 小时`, minute: (n: number) => `${n} 分钟`, second: (n: number) => `${n} 秒` },
+  enabledOnCreate: '创建后立即启用',
+
+  // ---- 表单：Webhook
+  webhook: 'Webhook 通知',
+  webhookOn: '运行有结果时发送 Webhook 通知',
+  webhookFormat: '格式',
+  format: { generic: '通用', feishu: '飞书', wecom: '企业微信', dingtalk: '钉钉' } as Record<
+    import('../types').ScheduleWebhookFormat, string>,
+  formatHint: {
+    generic: '以 JSON 发送到指定地址',
+    feishu: '飞书群机器人的 Webhook 地址',
+    wecom: '企业微信群机器人的 Webhook 地址',
+    dingtalk: '钉钉群机器人的 Webhook 地址',
+  } as Record<import('../types').ScheduleWebhookFormat, string>,
+  urlPlaceholder: {
+    generic: 'https://example.com/hooks/agentlab',
+    feishu: 'https://open.feishu.cn/open-apis/bot/v2/hook/…',
+    wecom: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…',
+    dingtalk: 'https://oapi.dingtalk.com/robot/send?access_token=…',
+  } as Record<import('../types').ScheduleWebhookFormat, string>,
+  url: '地址',
+  urlSaved: '已保存的地址',
+  urlSavedHint: '完整地址已加密保存，只显示主机和末 4 位',
+  urlReplace: '替换地址',
+  urlKeep: '保留原地址',
+  webhookRemove: '删除 Webhook',
+  webhookRemoving: '保存后将删除这个 Webhook',
+  webhookUndoRemove: '撤销删除',
+  secret: '签名密钥',
+  secretHint: {
+    generic: '可选。填写后每条消息带签名，接收端可据此校验来源',
+    feishu: '可选。机器人开启了签名校验时填写',
+    wecom: '企业微信群机器人不使用签名，留空即可',
+    dingtalk: '可选。机器人开启了加签时填写',
+  } as Record<import('../types').ScheduleWebhookFormat, string>,
+  secretSet: '已设置',
+  secretReplace: '替换',
+  secretClear: '清除',
+  secretClearing: '保存后将清除签名密钥',
+  secretUndo: '撤销',
+  secretNew: '新的签名密钥',
+  events: '通知哪些事件',
+  test: '发送测试消息',
+  testing: '正在发送…',
+  testNeedSave: '保存后才能发送测试消息',
+  testDirty: '测试使用已保存的设置，请先保存修改',
+  testOk: '测试消息已送达',
+  testFailed: '测试消息发送失败',
+  /** 结局后面接状态码和说明（两样都可能没有） */
+  testResult: (head: string, status: number | null, detail: string) =>
+    `${head}${status != null ? `（HTTP ${status}）` : ''}${detail ? `：${detail}` : ''}`,
+
+  // ---- 通知里的链接：运行、对比页都按这个地址拼（设置 notify 组，所有定时任务共用）
+  linkBase: '通知中的链接',
+  linkBaseValue: (url: string) => `按 ${url} 拼接`,
+  linkBaseUnset: '未设置服务访问地址，通知中不附带运行和对比页链接',
+  linkBaseEdit: '修改',
+  linkBaseSet: '设置',
+  linkBaseLabel: '服务访问地址',
+  linkBaseHint: '收件人打开运行、对比页链接用的地址，例如 https://agentlab.example.com。所有定时任务共用',
+  linkBasePlaceholder: 'https://agentlab.example.com',
+  linkBaseInvalid: '请输入以 http:// 或 https:// 开头的地址',
+  linkBaseSaved: '已保存服务访问地址',
+  linkBaseCleared: '已清除服务访问地址',
+  linkBaseFailed: '无法读取服务访问地址',
+
+  // ---- 表单：保存
+  save: '保存',
+  createSubmit: '创建',
+  discard: '撤销修改',
+  retry: '重试',
+  saving: '正在保存…',
+  cancel: '取消',
+  saved: '已保存',
+  created: (name: string) => `已创建定时任务「${name}」`,
+  missing: (items: string) => `还需处理：${items}`,
+  previewBlocks: '请先修正频率、时区或输入中标出的问题',
+  saveFailed: '保存失败',
+  conflict: '保存失败：这个定时任务已在别处被修改，请重新载入后再修改',
+  reload: '重新载入',
+  reloadTitle: '重新载入最新设置？',
+  reloadConsequences: ['页面上未保存的修改将丢失'],
+  reloadConfirm: '放弃修改并重新载入',
+  leaveTitle: '定时任务有未保存的修改',
+  leaveConsequences: ['离开后，这些修改将丢失'],
+  leaveConfirm: '放弃修改',
+
+  // ---- 表单的问题（写在对应字段下）
+  problem: {
+    name: '请填写名称',
+    workflow: '请选择工作流',
+    timezone: '请选择时区',
+    cronEmpty: '请填写 cron 表达式',
+    cronFields: 'cron 表达式应为五段，以空格分隔',
+    minute: '请填写 0–59 之间的分钟',
+    time: '请填写时间',
+    weekdays: '至少选择一天',
+    url: '请填写 Webhook 地址',
+    urlInvalid: '请输入以 http:// 或 https:// 开头的地址',
+    secret: '请填写新的签名密钥',
+    events: '至少选择一个事件',
+    notPublished: '这个工作流还没有发布版本，正式运行需要已发布的版本。请先发布，或改用探索运行',
+    inputsMissing: (names: string) => `必填输入「${names}」还没有填写`,
+    inputsUnknown: (names: string) => `输入「${names}」对不上工作流的输入字段，请移除`,
+  },
+  /** 「还需处理」里各项的叫法 */
+  problemField: {
+    name: '名称', workflow: '工作流', freq: '频率', timezone: '时区', runClass: '运行类别', inputs: '输入', url: 'Webhook 地址',
+    secret: '签名密钥', events: '通知事件',
+  } as Record<'name' | 'workflow' | 'freq' | 'timezone' | 'runClass' | 'inputs' | 'url' | 'secret' | 'events', string>,
+
+  // ---- 相对时间（将来）
+  until: {
+    soon: '不到 1 分钟后',
+    minutes: (n: number) => `${n} 分钟后`,
+    hours: (n: number) => `${n} 小时后`,
+    days: (n: number) => `${n} 天后`,
+  },
+
+  // ---- 触发历史
+  history: '触发历史',
+  historyHint: '每次触发都记在这里，包括跳过和发起失败的',
+  historyEmpty: '还没有触发记录',
+  historyEmptyHint: '到点后的每次触发都会记在这里，包括跳过和发起失败的',
+  historyRefresh: '刷新',
+  fireAt: '计划时间',
+  fireAtManual: '触发时间',
+  reason: '原因',
+  noRun: '未发起运行',
+  notified: '通知',
+  loadMore: '加载更多',
+  allLoaded: '已全部加载',
+  shown: (n: number) => `已显示 ${n} 条`,
+
+  // ---- 触发历史里的对比：运行成功结束后，服务端自动和同一定时任务上一次成功的运行比一次
+  /**
+   * 和运行详情「更多」菜单里的入口是同一件事（服务端用同一个函数挑基准，两处比的是同一对运行），基准就是紧挨着的上一次
+   * 时用同一个叫法。RUN_COMPARE_TEXT 定义在本对象之后，模块初始化时还取不到，写成 getter 用到时再取
+   */
+  get compareLink() { return RUN_COMPARE_TEXT.menu },
+  /**
+   * 基准不是紧挨着的上一次（上一次失败了、取消了，比的是再往前成功的那一次）时链接上看得见的叫法：触屏没有悬停，
+   * 键盘聚焦时也不显示 title，只在悬停里说明会让人以为比的就是上一次。运行详情「更多」里的菜单项按服务端给的 previous
+   * 用同一个叫法（同为 getter）；进了对比页都写「默认基准：同一定时任务上一次成功的运行」
+   */
+  get compareLinkLastOk() { return RUN_COMPARE_TEXT.menuLastOk },
+  /**
+   * 悬停写各类指标的个数，和 Webhook 通知里那一行同一个写法（服务端 scheduler/auto_compare.py 的 summary_text）：
+   * 变化三分法的三类总写上，0 个也写；其余各类有才写，次序同对比页；两边都没有指标时不写一串 0 个。只有个数，
+   * 不写数值。各类的叫法用对比页那一套（RUN_COMPARE_TEXT.classLabel）。base 是基准的短编号，基准不是紧挨着的
+   * 上一次（上一次失败了、取消了）时给，写明比的是哪一次，同通知
+   */
+  compareTitle: (summary: Partial<Record<string, number>>, base?: string | null) => {
+    const n = (key: string) => (typeof summary[key] === 'number' ? summary[key] as number : 0)
+    const core = ['data_only', 'caliber_and_data', 'sql_changed']
+    const rest = ['params_only', 'added', 'removed', 'incomparable', 'unchanged']
+    const head = base ? `与上一次成功的运行（${base}）相比` : '与上一次相比'
+    if (![...core, ...rest].some((key) => n(key) > 0)) return `${head}：两次运行都没有指标`
+    const parts = [...core, ...rest.filter((key) => n(key) > 0)]
+      .map((key) => `${RUN_COMPARE_TEXT.classLabel[key] ?? key} ${n(key)} 个`)
+    return `${head}：${parts.join('、')}`
+  },
+  /**
+   * 链接旁看得见的简短计数：触屏没有悬停，键盘聚焦时也不显示 title，只靠悬停看不出变化的规模。有变化的几类（只数据变、
+   * 口径与数据都变、SQL 结构变、只参数变、新增、移除）合起来写一个数；都没变化时说有几个无法比较，或者都未变；两边都
+   * 没有指标时不写（悬停里有）
+   */
+  compareCount: (summary: Partial<Record<string, number>>) => {
+    const n = (key: string) => (typeof summary[key] === 'number' ? summary[key] as number : 0)
+    const changed = ['data_only', 'caliber_and_data', 'sql_changed', 'params_only', 'added', 'removed']
+      .reduce((sum, key) => sum + n(key), 0)
+    if (changed) return `${changed} 个指标有变化`
+    if (n('incomparable')) return `${n('incomparable')} 个指标无法比较`
+    return n('unchanged') ? '指标都未变' : null
+  },
+
+  // ---- 运行详情页头的来源
+  /**
+   * 到点发起（以及没有署名的立即运行）的运行记在「定时任务：名字」名下，前缀和服务端 scheduler/service.py 的
+   * actor_label 一致。页头据此不再写「定时任务：X 发起」，换成下面那条链接
+   */
+  actorPrefix: '定时任务：',
+  runSource: (name?: string | null) => (name ? `由定时任务「${name}」发起` : '由定时任务发起'),
+  /** 有人署名点「立即运行」发起的：署名照写（runStarter），后面接这一句 */
+  runSourceManual: (name?: string | null) => (name ? `来自定时任务「${name}」` : '来自定时任务'),
+  runStarter: (who: string) => `${who} 发起`,
+  /** 悬停写全名（页头窄时链接会截断）和点开去哪 */
+  runSourceTitle: (name?: string | null) =>
+    (name ? `定时任务「${name}」：查看设置和触发历史` : '查看这个定时任务的设置和触发历史'),
+  /**
+   * 定时任务已经删除（取回的定时任务列表里没有它）：不再链过去——只会落到「不存在」页，页上的返回又回到定时任务列表。
+   * 和同一行的「工作流已删除」一样写成纯文本
+   */
+  runSourceGone: (name?: string | null) => (name ? `由定时任务「${name}」发起（已删除）` : '由已删除的定时任务发起'),
+  runSourceManualGone: (name?: string | null) => (name ? `来自定时任务「${name}」（已删除）` : '来自已删除的定时任务'),
+  runSourceGoneTitle: '这个定时任务已删除，它发起的运行记录仍然保留',
+
+  // ---- 记录页的定时标记
+  runTag: '定时',
+  runTagTitle: (name?: string | null) => (name ? `由定时任务「${name}」发起，点击查看` : '由定时任务发起，点击查看'),
+  /** 读屏念的来源（整行是打开运行的按钮，标记本身点不到，至少在名字里听到） */
+  runTagSr: (name?: string | null) => (name ? `由定时任务「${name}」发起` : '由定时任务发起'),
+}
+
+/**
+ * 运行对比（/runs/compare，pages/runs/ComparePage.tsx）：两次运行的指标变化拆成数据、口径、模板与 SQL 三类说清楚。
+ * 配方前后对照另有 COMPARE_TEXT，别混用。分类、拆分原因、说明（reasons、decomposition_note、notes）是服务端写的话，
+ * 原样显示，这里不改写
+ */
+export const RUN_COMPARE_TEXT = {
+  title: '运行对比',
+  hint: '把两次运行的指标变化拆成数据、口径、模板与 SQL 三类',
+  // 入口：运行详情的「更多」菜单。叫法看服务端给的 previous（基准是不是紧挨着的上一次），和定时任务触发历史里的同名
+  // 链接一个说法（SCHEDULE_TEXT.compareLink、compareLinkLastOk 取的就是这两条）
+  menu: '与上一次对比',
+  /** 上一次失败、取消、还没结束：基准是再往前成功的那一次，不能说成「上一次」 */
+  menuLastOk: '与上一次成功的运行对比',
+  /** 没有默认基准（多为工作流的第一次运行）：没有「上一次」可比，点了去对比页手动选 */
+  menuPick: '选择基准对比…',
+  menuSealedOnly: '运行结束并封存后才能对比',
+  /** 没有 workflow_id 的运行：画布、问数据里没保存就运行的，或者工作流删掉之后被置空的。服务端只比同一个已保存的工作流 */
+  menuNoWorkflow: '工作流未保存或已删除，无法对比',
+  menuFinding: '正在查找上一次成功的运行…',
+  pickManually: '手动选择基准',
+  retry: '重试',
+  // 顶部的两次运行
+  base: '基准',
+  target: '本次',
+  swap: '互换',
+  swapHint: '互换基准与本次',
+  openRun: (name: string) => `查看「${name}」这次运行的详情`,
+  scheduled: '定时任务发起',
+  unsealed: '未封存',
+  unsealedHint: '这次运行没有封存清单，不能参与对比',
+  runFailed: '无法读取这次运行',
+  runMissing: '运行记录不存在',
+  noBase: '未选择',
+  /**
+   * 默认基准是怎么选的，照服务端（api/compare.py 的 pick_base）的规则写：只挑比本次先发起、成功结束并封存的运行。
+   * 上一次失败、取消了时基准是再往前成功的那一次，所以不能写成「上一次运行」
+   */
+  reason: {
+    same_schedule: '默认基准：同一定时任务上一次成功的运行',
+    same_workflow: '默认基准：同一工作流、同一运行类别上一次成功的运行',
+  } as Record<string, string>,
+  pickBase: '更换基准',
+  /** 默认基准只取成功结束的运行（pick_base），手动选不限：失败、取消的也能选，下拉和基准卡上写明它的状态 */
+  pickHint: '同一工作流最近的运行，未封存的不能作为基准；默认基准只取成功结束的运行',
+  pickLoading: '正在读取同一工作流的运行…',
+  pickFailed: '无法读取同一工作流的运行',
+  pickNone: '同一工作流没有其他运行',
+  /** 本次的运行记录不存在：不知道是哪个工作流，列不出候选，重试也是一样 */
+  pickTargetGone: '本次运行的记录不存在，无法列出同一工作流的运行',
+  pickUnsaved: '工作流未保存或已删除，没有可对比的运行',
+  pickPlaceholder: '选择一次运行作为基准',
+  /**
+   * 下拉里的一次运行：时间 · 类别和版本 · 短 id，没有成功结束的写上状态（失败、已取消），没封存的另标。默认基准跳过的
+   * 正是这几种，手动挑时也得看得出哪次没成功
+   */
+  pickOption: (time: string, cls: string, id: string, sealed: boolean, status?: string | null) =>
+    `${time} · ${cls} · ${id}${status ? ` · ${status}` : ''}${sealed ? '' : '（未封存）'}`,
+  /** 当前的基准读不到时下拉里的那一项（短 id）：如实显示选的是哪一次 */
+  pickGone: (id: string, missing: boolean) => `${id}（${missing ? '记录不存在' : '无法读取'}）`,
+  // 页面状态
+  noTarget: '未指定要对比的运行',
+  /** 不逐个列菜单项的叫法（看有没有默认基准、是不是紧挨着的上一次，有三种），只说在哪里打开、默认比的是哪一次 */
+  noTargetHint: '可从运行详情的「更多」菜单打开对比，默认以上一次成功的运行为基准',
+  toRuns: '前往记录',
+  finding: '正在查找基准运行…',
+  loading: '正在对比两次运行…',
+  // 对比失败：标题说是哪一种，服务端的原因原样跟在后面，最后一句下一步只写界面上真有的入口，服务端已经写了的不再重复
+  errSealed: '无法对比：有运行未封存或封存核对不一致',
+  errUnsealed: '无法对比：有运行尚未结束并封存',
+  errSealBroken: '无法对比：封存核对不一致',
+  /** 409 时不知道（或者知道不是）本次的问题：服务端的原因里写着是哪一次 */
+  errSealedHint: '若是基准运行的问题，可在上方更换基准',
+  errMismatch: '无法对比这两次运行',
+  errMismatchHint: '可在上方选择同一工作流的另一次运行作为基准',
+  /** 本次没有 workflow_id：哪一次都比不了，不给下一步 */
+  errUnsaved: '无法对比：本次运行的工作流未保存或已删除',
+  errMissing: '运行记录不存在',
+  errMissingHint: '链接可能已失效，请从记录页重新打开',
+  /** 本次的记录读得到、对比却回 404：缺的是基准 */
+  errBaseMissingHint: '可在上方选择另一次运行作为基准',
+  /**
+   * 找不到默认基准：标题只说没有默认基准，原因（服务端的 NO_BASE_TEXT：没有找到上一次成功的运行、要什么条件）跟在后面。
+   * 不能写成「没有可作为基准的运行」：失败、取消但封存了的运行不当默认基准，却照样能在上方手动选
+   */
+  errNoBase: '没有默认基准',
+  errNoBaseHint: '可在上方选择同一工作流的其他运行作为基准',
+  /** 下拉里一次能选的都没有（只有本次、或者都没封存） */
+  errNoBaseNone: '同一工作流还没有其他已封存的运行',
+  /** 409、422、404 时下拉里除了本次和当前的基准，没有别的已封存的运行：换基准这条路走不通，照实说 */
+  errNoOtherBase: '同一工作流没有其他可换作基准的已封存运行',
+  viewBase: '查看基准运行',
+  viewTarget: '查看本次运行',
+  // 摘要
+  summary: '变化摘要',
+  summaryHint: '点击一类只看这一类的指标',
+  classLabel: {
+    data_only: '只数据变',
+    caliber_and_data: '口径与数据都变',
+    sql_changed: 'SQL 结构变',
+    params_only: '只参数变',
+    added: '新增',
+    removed: '移除',
+    incomparable: '无法比较',
+    unchanged: '未变',
+  } as Record<string, string>,
+  // 照服务端（engine/compare.py）的分类口径写：口径变了含小数位、单位、显示格式，SQL 结构变含上游节点改配置
+  classHint: {
+    data_only: '口径与 SQL 都没有改动，变化来自数据',
+    caliber_and_data: '口径（计算式、口径版本、小数位、单位或显示格式）有改动，数据可能也有变化；能严格拆分的分别给出口径效应和数据效应',
+    sql_changed: '取数的 SQL 或上游节点的配置有改动，无法在口径与数据之间拆分',
+    params_only: '所依据的查询 SQL 结构相同，只有参数（如日期）或运行输入不同',
+    added: '本次有、基准没有的指标',
+    removed: '基准有、本次没有的指标',
+    incomparable: '缺少比较所需的信息，无法判断变化来自哪里',
+    unchanged: '两次的值相同，口径与 SQL 也没有改动',
+  } as Record<string, string>,
+  classOther: '其他',
+  filterOn: (label: string, n: number) => `只显示「${label}」的 ${formatNumber(n)} 个指标`,
+  showAll: '显示全部',
+  // 指标
+  metrics: '指标',
+  metricsEmpty: '两次运行的口径卡上都没有指标',
+  count: (n: number) => `${formatNumber(n)} 个`,
+  /** 查询按「条」数，和「第 N 条」一致 */
+  queryCount: (n: number) => `${formatNumber(n)} 条`,
+  colMetric: '指标',
+  colBase: '基准',
+  colTarget: '本次',
+  colDelta: '变化',
+  colClass: '分类',
+  colSplit: '拆分或原因',
+  legend: '口径效应按本次的数据计算，是只换口径带来的变化；数据效应按基准的口径计算，是只换数据带来的变化。两者之和等于总变化',
+  caliber: '口径',
+  data: '数据',
+  splitSum: (caliber: string, data: string, total: string) =>
+    `口径效应 ${caliber}，数据效应 ${data}，两者之和等于总变化 ${total}`,
+  noChange: '无变化',
+  expand: (name: string) => `展开「${name}」的输入对比与维度归因`,
+  collapse: (name: string) => `收起「${name}」的明细`,
+  reasons: '变化说明',
+  inputs: '输入对比',
+  inputsNone: '口径卡没有记录这个指标的输入',
+  /** 取自设置了遮罩的列：两边的值都不显示 */
+  masked: '已遮罩',
+  colInput: '输入',
+  attribution: '维度归因',
+  attrBy: (measure: string) => `按「${measure}」的变化，从大到小`,
+  attrTop: (n: number) => `前 ${formatNumber(n)} 项`,
+  attrMore: (n: number) => `另有 ${formatNumber(n)} 项未列出`,
+  attrTotal: (value: string) => `合计变化 ${value}`,
+  attrNone: '没有可按维度归因的明细',
+  /**
+   * 服务端只对只数据变、只参数变、口径与数据都变的指标做维度归因（两边的行说的是同一回事）。别的类不是「没有明细」，
+   * 是有意不做：写明为什么
+   */
+  attrSkipped: {
+    sql_changed: '取数的 SQL 或上游配置有改动，两边的行不能直接对照，不做维度归因',
+    incomparable: '无法判断变化来源，不做维度归因',
+    added: '基准没有这个指标，不做维度归因',
+    removed: '本次没有这个指标，不做维度归因',
+    unchanged: '数值没有变化，不做维度归因',
+  } as Record<string, string>,
+  /** 服务端没给占比、也没说为什么时的说法 */
+  attrNoShare: '无法计算各项占比',
+  colKey: '维度',
+  colShare: '占比',
+  // 查询
+  queries: '查询',
+  queriesEmpty: '两次运行都没有执行查询',
+  structure: {
+    same: '相同',
+    params_only: '只参数变',
+    changed: '结构变',
+    added: '新增',
+    removed: '移除',
+  } as Record<string, string>,
+  structureHint: {
+    same: 'SQL 完全相同',
+    params_only: 'SQL 结构相同，只有字面量不同',
+    // 服务端在只换了数据源、有一边的 SQL 读不出来时也标「结构变」
+    changed: 'SQL 结构或数据源不同，或有一边的 SQL 无法读取',
+    added: '本次新增的查询，基准中没有',
+    removed: '基准中有、本次没有的查询',
+  } as Record<string, string>,
+  nth: (n: number) => `第 ${n} 条`,
+  rows: (n: number | null | undefined, truncated: boolean | null | undefined) =>
+    (n == null ? '—' : `${formatNumber(n)} 行${truncated ? '（已截断）' : ''}`),
+  rowsBoth: (base: string, target: string) => `基准 ${base} → 本次 ${target}`,
+  rowsBase: (base: string) => `基准 ${base}`,
+  rowsTarget: (target: string) => `本次 ${target}`,
+  literals: '变化的参数',
+  /** 参数前后两个值之间的箭头，读屏念这个 */
+  changedTo: '改为',
+  baseSql: '基准的 SQL',
+  targetSql: '本次的 SQL',
+  bothSql: '两次相同的 SQL',
+  /** 快照读不出来、又拿不到执行时的参数：这一边没有 SQL，不能拿空串去和另一边比 */
+  sqlUnreadable: '这一边的 SQL 无法读取',
+  onlyBase: '基准独有',
+  onlyTarget: '本次独有',
+  showSql: '查看 SQL',
+  hideSql: '收起 SQL',
+  diffCoarse: '两条 SQL 差异较大，只标出了大致范围',
+  // 模板
+  template: '模板',
+  version: (v: number | null | undefined) => (v == null ? '未固定版本' : `v${v}`),
+  versions: (base: string, target: string) => `基准 ${base} → 本次 ${target}`,
+  sameGraph: '两次运行使用同一张执行图',
+  nodesNone: '执行图有变化，但没有列出具体节点',
+  nodeChange: {
+    added: '新增节点',
+    removed: '移除节点',
+    config: '配置变更',
+  } as Record<string, string>,
+  keys: '配置项',
+  // 说明
+  notes: '说明',
+}
+
+/**
+ * 运行详情「工件」页签（pages/runs/ArtifactsPane.tsx）：这次运行按内容校验值存下的每一件东西，按节点分组。筛选按
+ * pages/runs/model.ts 的 artifactGroup 分三组：证据快照是取数、检索的原始结果和口径卡、报告文档、表结构；核查记录是
+ * 双盲复算、反方审稿、审批质询对结论的核查与问答，单独一组；节点产出是过程里的中间值。按种类归组：核查、质询时执行的
+ * 查询仍是查询快照，在证据快照里（一次运行里这类查询可能比流程本身的还多），所以证据快照不能说成「结论里的数字都从
+ * 这里来」。各种工件的名字和说明在 model.ts，后来新加的放在这里（质询回答的在 INQUIRY_TEXT）
+ */
+export const RUN_ARTIFACTS_TEXT = {
+  /** 运行详情「工件」页签头上的悬停：人先看到的这句要和页签里的三组对得上。清单还没取回来时不写件数 */
+  tabTitle: (n?: number | null) =>
+    (n == null ? '本次运行保存的证据、核查记录和产出' : `${n} 件：证据快照、核查记录和每个节点每一次的产出`),
+  filterGroup: '按类型筛选工件',
+  filter: { all: '全部', evidence: '证据快照', verify: '核查记录', output: '节点产出' } as Record<string, string>,
+  /**
+   * 筛选按钮的悬停：这一组装的是什么。核查、质询时执行的查询按种类仍是查询快照、在证据快照里，两组都要说一声；
+   * 核查记录这一组列的是行上的种类名（双盲复算对照、反方审稿记录、质询回答）
+   */
+  filterHint: {
+    evidence: '查询、工具调用、知识检索的原始结果，口径卡、报告文档和表结构；含核查、质询时执行的查询',
+    verify: '对结论的核查与问答：双盲复算对照、反方审稿记录、质询回答；其间执行的查询见「证据快照」',
+    output: '每个节点每执行一次的产出：循环里每一轮都有一件',
+  } as Record<string, string>,
+  /** 同一个节点同一类的第几件：循环里几十件节点产出要分得开 */
+  nth: (n: number) => `#${n}`,
+  attempt: (n: number) => `第 ${n} 次尝试`,
+  /** 打开一件的悬停写全说明：窄屏、长问题的说明在行上会截断 */
+  openTitle: (kind: string, about: string) => `打开${kind}：${about}（读取时按内容校验值重新校验）`,
+  /**
+   * 口径卡里容器型变量（vars.*）输入的完整值（engine/nodes/metrics.py 的 metric_input，工件行的 meta 里有 {path}）：
+   * 推演时拿它还原输入。和口径卡一样归在证据快照
+   */
+  kindMetricInput: '指标输入',
+  aboutMetricInput: (path?: string | null) => (path ? `口径卡输入「${path}」的完整值` : '口径卡输入的完整值'),
+}
+
+/**
+ * 可验证报告：把一次已封存运行的报告导出成一个 HTML 文件，收件人不连服务也能在浏览器里核对。
+ * 入口在记录页的封存凭证条上；页面本身的文案在服务端 bundle/verifier.js 里（它是离开系统独立打开的文件）
+ */
+export const BUNDLE_TEXT = {
+  title: '可验证报告',
+  export: '导出可验证报告',
+  hint: '导出为单个 HTML 文件：收件人不连服务，也能在浏览器中核对数字的出处和运行记录',
+  /** 失败结束的运行：之后继续运行会重新封存，导出的文件就再也对不上系统里的封存了 */
+  hintFailed: '导出为单个 HTML 文件。这次运行以失败结束：之后若继续运行，系统会重新封存，导出的文件将无法再与系统对照',
+  /** 不能导出时说明的原因：和凭证条左边「未封存 · …」的说法对得上 */
+  blockedRunning: '运行结束并封存后才能导出',
+  blockedWaiting: '等待审批中，运行结束并封存后才能导出',
+  blockedUnsealed: '这次运行没有封存清单，无法导出',
+  exported: (name: string) => `已导出「${name}」`,
+  exportedFailed: (name: string) => `已导出「${name}」。之后若继续运行，系统会重新封存，这份文件将无法再与系统对照`,
+  /** 服务端没给文件名时按运行名补，规则同服务端的附件名 */
+  fileName: (name: string) => `${name}-可验证报告.html`,
+}
+
+/**
+ * 审批质询：审批人在批准前就待审的报告提问（选一句、划一段原文，或就整份报告），核查模型只读查库作答。问答写进运行
+ * 记录、随运行一并封存，不改动报告；封存之后只有探索运行还能问，追加在封存之后
+ */
+export const INQUIRY_TEXT = {
+  title: '审批质询',
+
+  // ---- 时间线（decode.ts 解读 approval.inquiry）：标题带问题的前 40 字，副标题说回答是否完成、查了几次 ----
+  timeline: (question: string) => (question ? `审批人质询：${question}` : '审批人质询'),
+  complete: '回答完成',
+  /** 按已查到的结果收了尾：回答可能缺了没来得及查的部分 */
+  incomplete: (limit: string) => `回答不完整（${limit}）`,
+  failed: (limit: string | null) => (limit ? `未能回答（${limit}）` : '未能回答'),
+  /** 服务端没说成没成（缺字段）、却有回答正文：只说答了，不说完成 */
+  answered: '已回答',
+  queries: (n: number) => (n > 0 ? `查询 ${formatNumber(n)} 次` : '未执行查询'),
+  postSeal: '封存后追加',
+  limit: {
+    max_queries: '已达查询次数上限',
+    timeout_s: '已达时长上限',
+    max_cost_usd: '已达单次金额上限',
+    daily_max_usd: '已达核查每日金额上限',
+  } as Record<string, string>,
+  limitOther: '已达上限',
+  detail: {
+    question: (q: string) => `问题：${q}`,
+    quote: (q: string) => `原文：「${q}」`,
+    answer: (t: string) => `回答：${t}`,
+    error: (e: string) => `原因：${e}`,
+    model: (m: string) => `核查模型：${m}`,
+  },
+
+  // ---- 报告上的入口（EvidenceDoc）：句末的「质询」、划选原文时浮出的「质询」 ----
+  ask: '质询',
+  askUnit: (text: string) => `质询这句：${text}`,
+  /** 句末「质询」图标的悬停说明 */
+  askTitle: '质询这一句',
+  askSelection: '就选中的原文质询',
+  /** 读屏摘要里接在按键说明后面 */
+  keysHint: '每句结论后有「质询」按钮：方向键走到这一句，再按 Tab 到达；没有可点内容的句子，方向键直接走到它的「质询」',
+
+  // ---- 问答串（ReportInquiry） ----
+  headCount: (n: number) => `${formatNumber(n)} 次`,
+  askReport: '就整份报告提问',
+  intro: '展开逐段证据后，点句末的「质询」图标或划选一段原文，即可就该处提问',
+  introRun: '点句末的「质询」图标或划选一段原文，即可就该处提问',
+  /** 报告没有逐段证据（没有报告文档）：句子、原文上都没有入口 */
+  introNoDoc: '这份报告没有逐段证据，可以就整份报告提问',
+  /** 设置里关了审批质询：不给入口，已有的问答照列 */
+  disabled: '审批质询已在设置中关闭',
+  wholeReport: '整份报告',
+  /** 报告文档取不到，写不出问的是哪一句 */
+  unitMissing: '报告中的一句',
+  /** 之前几轮审批里问的、报告后来改写过（句子编号对不上），或者对不上是哪一稿：单独一组 */
+  otherDoc: '报告其他版本上的质询',
+  otherDocHint: '提问时的报告与当前显示的版本不同，或无法确认是否相同，所以不挂到当前报告的句子下面',
+  /**
+   * 别的审批里问的、审批列表又没取到：不知道提问时审的是哪一稿，不能说成「其他版本」（审批人会以为报告换过稿）。
+   * 单独一组照实说没能确认，给重试
+   */
+  unsureDoc: '无法确认提问时的报告版本',
+  unsureDocHint: '审批记录读取失败，暂不挂到当前报告的句子下面',
+  loadFailed: '无法读取之前的质询记录',
+  retry: '重试',
+  q: '问',
+  a: '答',
+  unsigned: '未署名',
+  entryLabel: (question: string) => `质询：${question}`,
+  quoteLine: (quote: string) => `原文「${quote}」`,
+  notRecorded: '这次问答没有写入运行记录',
+  notRecordedHint: '它只显示在当前页面，刷新后不再显示，也不会随运行封存',
+  /** 屏幕阅读器：回答回来了（带上问题的开头，连着几次回答各报一遍） */
+  arrived: (question: string) => {
+    const chars = [...question.trim()]
+    return `已收到回答：${chars.length > 20 ? `${chars.slice(0, 20).join('')}…` : chars.join('')}`
+  },
+  /** 同一张审批卡同时挂在两处（画布的审批浮层和右栏）：提问框只在打开它的那一处 */
+  elsewhere: '提问框已在另一处打开',
+  moveHere: '在这里继续',
+  /** 回答期间另开了提问框，正在回答的那一条却没问成：原来的问题和原因留在它那一句下面 */
+  askFailed: (message: string) => `没有问成：${message}`,
+  reask: '放回提问框',
+  dismiss: '忽略',
+
+  // ---- 提问框 ----
+  target: { unit: '就这句提问', quote: '就选中的原文提问', report: '就整份报告提问' } as Record<'unit' | 'quote' | 'report', string>,
+  questionLabel: '问题',
+  placeholder: '例如：这个数是否扣除了退款？',
+  submit: '提问',
+  cancel: '取消',
+  chars: (n: number, max: number) => `${formatNumber(n)}/${formatNumber(max)}`,
+  keys: 'Ctrl + 回车提交 · Esc 关闭',
+  empty: '请填写问题',
+  tooLong: (max: number) => `问题最多 ${formatNumber(max)} 字，请删减后再提交`,
+  quoteCut: (max: number) => `选中的原文超过 ${formatNumber(max)} 字，只提交前 ${formatNumber(max)} 字`,
+  hint: '由核查模型只读查询数据作答，问答写入运行记录，不改动报告',
+  hintPostSeal: '运行已封存：问答追加在封存之后，不改动报告',
+  busyOther: '这次运行另有一条质询正在回答，回答完再提问',
+  submitFailed: '提问失败',
+
+  // ---- 回答中：审批卡的批准 / 驳回暂停（服务端这时也会拒绝） ----
+  pending: '正在查询与回答，通常需要几十秒',
+  waited: (seconds: number) => `已等待 ${formatNumber(seconds)} 秒`,
+  decideBlocked: '正在回答质询，回答完再批准或驳回',
+
+  // ---- 回答 ----
+  noAnswer: '没有给出回答',
+  answerIncomplete: (limit: string) => `${limit}：回答依据已查到的结果，可能不完整`,
+  answeredBy: (model: string | null) => `回答由核查模型${model ? `「${model}」` : ''}给出，并非系统核对`,
+  cost: (usd: string) => `花费 ${usd}`,
+  /** 回答里有出处的数字：读屏听到「数字，出处：查询 Q1 · 第 1 行 · amount」，点一下展开那次查询的结果 */
+  cited: (text: string, source: string) => `${text}，出处：${source}，查看这次查询的结果`,
+  citedReport: (text: string, source: string) => `${text}，出处：${source}，在报告中查看证据`,
+  /** 问的是报告的另一稿：引用的是那一稿里的出处，不在当前这一稿里找 */
+  citedOther: (text: string, source: string) => `${text}，出处：${source}（提问时那一版报告中的出处）`,
+  /** 引用的是报告已有的出处，报告里却找不到引用它的地方：照回答文档记下的出处说一句 */
+  reportSource: (source: string) => `出处：${source}（报告已有的出处，报告中没有引用它的地方）`,
+  reportSourceOther: (source: string) => `出处：${source}（提问时那一版报告中的出处）`,
+  queriesHead: (n: number) => `核查模型执行的查询（${formatNumber(n)} 次）`,
+  /** 查询列表收着时也写：截断直接关系到回答靠不靠得住 */
+  queriesTruncated: (n: number) => `其中 ${formatNumber(n)} 次结果已截断`,
+  noQueries: '核查模型没有执行查询',
+  rows: (n: number) => `${formatNumber(n)} 行`,
+  truncated: '结果已截断，数据库中还有更多数据',
+  showResult: '查看结果',
+  hideResult: '收起结果',
+  snapshotLoading: '正在读取查询结果…',
+  snapshotFailed: '无法读取这次查询的结果',
+  masked: (columns: string) => `${columns} 在数据源中设置了遮罩，不显示原值`,
+
+  // ---- 运行详情「工件」页签：回答文档按工件种类 inquiry_answer 记在运行名下（pages/runs/model.ts 的工件名和说明） ----
+  artifactKind: '质询回答',
+  /**
+   * 服务端在工件的 meta 里只记问题的前 40 字（engine/inquiry.py 的 QUESTION_BRIEF）：满 40 字的多半截断过，末尾补省略号，
+   * 免得半句话读成整个问题。字数按原样数、显示时才去掉首尾空白：服务端截之前已经去过整个问题的首尾空白，摘要以空格、
+   * 换行结尾只会是截断截在了空白上，先去空白再数就少了一个字、漏掉省略号
+   */
+  artifactAbout: (question: string) =>
+    `质询「${question.trim()}${[...question].length >= 40 ? '…' : ''}」的回答`,
+  /** meta 里没有问题摘要时的说法（服务端照理都会记，这里兜底）：照报告文档那一句写装的是什么 */
+  artifactAboutNone: '审批质询的回答：逐段的片段和每个数字的出处',
+}
+
+/**
+ * 数字推演：在一次运行的基础上改动输入，推演指标的变化（证据面板里口径卡上的数，run/WhatIf.tsx）。
+ * 推演永远不是出具：横幅要说清不会写进运行记录、不会改动报告。行号对人一律从 1 数（和查询结果表格的 # 列一致）
+ */
+export const WHATIF_TEXT = {
+  title: '数字推演',
+  open: '推演',
+  openHint: '改动输入或排除查询结果中的行，查看这个数和报告会如何变化',
+  close: '收起推演',
+  banner: '推演，非出具：不会写进运行记录，也不会改动报告',
+  unsealed: '运行未封存，数据可能还会变',
+  sealBroken: '封存核对未通过，推演所依据的数据可能已被改动',
+  loading: '推演中…',
+  failed: '推演失败',
+  result: '推演结果',
+  unchanged: '无变化',
+  delta: (text: string) => `变化 ${text}`,
+  substituted: '推演代入式',
+  inputs: '输入',
+  original: (value: string) => `原值 ${value}`,
+  inputLabel: (path: string) => `${path} 的推演值`,
+  notNumber: '请输入数值',
+  masked: '已遮罩',
+  withheld: '查询快照无法核对，不显示原值',
+  excludedRows: (rows: number[]) => `已排除第 ${rows.map((r) => r + 1).join('、')} 行`,
+  pickRows: (alias: string) => `在查询 ${alias} 中勾选要排除的行`,
+  pickHere: (n: number) => `勾选要排除的行（共 ${n} 行）`,
+  pickHereClose: '收起要排除的行',
+  rowsHint: '勾选的行在推演中视为不存在，这个指标没有用到的行不能勾选',
+  rowUnused: '这个指标没有用到这一行，排除它不影响结果',
+  rowsPending: '推演结果返回后才能勾选',
+  rowsLoading: '正在读取查询结果…',
+  /** 三个数已按千分位写好（formatNumber） */
+  rowsRange: (from: string, to: string, total: string) => `第 ${from}–${to} 行，共 ${total} 行`,
+  rowsMore: (n: number) => `再显示 ${n} 行`,
+  excludeHead: '排除',
+  excludeRow: (row: number) => `排除第 ${row + 1} 行`,
+  excludedCount: (n: number) => `已排除 ${n} 行`,
+  backToResult: '回到推演结果',
+  segments: '报告中会变的地方',
+  segmentsNone: (n: number) => `报告中引用这个指标的 ${n} 处不受影响`,
+  segmentsUnknown: '这个指标无法推演，报告中引用它的地方会如何变化无法确定',
+  locate: '定位',
+  inReport: (node: string) => `另一份报告（${node}）`,
+  unsupported: '不支持推演的输入',
+  wholeMetric: '整个指标',
+  nothingToAdjust: '这个指标没有可以修改的输入，也没有可以排除的查询行',
+  affected: '可能受影响的下游口径卡',
+  affectedHint: '这些口径卡引用了本卡的指标，推演不会重算它们',
+  affectedCard: (caliber: string, version: string) => `口径卡「${caliber || '未命名'}」${version ? ` ${version}` : ''}`,
+  indirect: '间接引用',
+  reset: '恢复原值',
+  empty: '这个指标的计算式没有引用任何输入，无可推演',
+}
+
+/**
+ * 双盲复算：节点库说明、检查器、节点卡片摘要、两边对不上时的审批卡，以及时间线上双盲复算的日志。核查的上限叫法
+ * （limitLabel）和出具缺口里「核查未通过」「核查未完成」那两组（verifyGaps）反方审稿也用，放在这里一处；反方审稿自己的
+ * 时间线说法在 CHALLENGE_TEXT.log。
+ *
+ * 两边的叫法固定为「原流程」「盲算」（服务端 explain_sql_diff 的 labels 也是这两个词），审核人的三个选择固定为
+ * 「采用原流程的结果」「采用盲算的结果」「两边都不对」。选「采用盲算的结果」不会替换报告里的数，只记缺口，
+ * 卡上要说清；探索运行不出具，出具相关的话只对正式运行说
+ */
+export const DUAL_CHECK_TEXT = {
+  description: '另起一路独立计算，与原结果逐项比对',
+  original: '原流程',
+  blind: '盲算',
+
+  // ---- 检查器（nodeDefs 的 dual_check、canvas/DualCheckFields.tsx）
+  /**
+   * 字段名，键就是配置键。服务端校验和报错引用的是同一套叫法（engine/labels.py 的 DUAL_CHECK_FIELD_LABEL，check-verify
+   * 逐项比对）：问题挂在字段下面、出现在问题面板里时，人才找得到是哪一项。模型两项照「裁判模型 · 接入」「裁判模型」的写法
+   */
+  field: {
+    card: '口径卡',
+    metrics: '复算的指标',
+    definitions: '口径说明',
+    provider: '盲算模型 · 接入',
+    model: '盲算模型',
+    tolerance: '允许的相对误差',
+    on_reject: '未采用原流程时',
+    enabled: '启用双盲复算',
+  },
+  help: {
+    card: '留空则复算上游的口径卡。只能复算本节点上游的口径卡：运行到本节点时，它的结果已经算出',
+    metrics: '默认复算口径卡中输入来自查询结果的全部指标，取消勾选可以只复算其中一部分。输入不是来自查询的指标无法盲算',
+    definitions: '给盲算模型看的业务定义，例如「销售额按支付时间统计，不含退款」。盲算模型看不到原流程的 SQL，'
+      + '只能依据指标名称、这里的说明和数据目录编写查询，说明越具体，比对越有意义',
+    model: '接入和模型均未填写时，使用「设置 → 偏好设置 → 核查」中的核查模型；填写任一项后，整组以节点配置为准，'
+      + '不与设置合并。建议与原流程使用的模型不同，同一模型不易发现自身的错误',
+    tolerance: '两边的值相差不超过这个比例时算一致，例如 0.001 表示千分之一，0 表示必须完全相同。留空则使用设置中的值',
+    on_reject: '盲算与原流程不一致时运行暂停，由审核人逐个指标选择采用哪一边。选择「采用盲算的结果」或「两边都不对」时按这里处理',
+    enabled: '关闭时本节点不复算，直接放行，并在时间线上记录一条说明',
+  },
+  /**
+   * 口径卡下拉留空那一项：上游没有、只有一张、有好几张。好几张时服务端校验要求选一张（不选会挡住发起运行），
+   * 写成要选，不写「建议」
+   */
+  cardDefault: (name: string | null, upstream: number) => (upstream === 0 ? '默认：上游的口径卡（上游没有口径卡）'
+    : upstream === 1 && name ? `默认：上游的口径卡「${name}」` : `请选择要复算的口径卡（上游有 ${upstream} 张）`),
+  cardChoose: (n: number) => `上游有 ${n} 张口径卡，请选择要复算的那一张`,
+  cardUpstream: '上游的口径卡',
+  cardOther: '其他口径卡（需连接到本节点上游）',
+  /** 画布上一张口径卡的叫法：节点名，口径名不同时附在后面 */
+  cardOption: (label: string, caliber?: string | null) => (caliber && caliber !== label ? `${label}（${caliber}）` : label),
+  cardGone: (id: string) => `${id}（不在画布上）`,
+  cardNotUpstream: '所选口径卡不在本节点上游，运行到本节点时还没有它的结果。请把它连接到本节点之前',
+  cardMissingHint: '所选口径卡已不在画布上，请重新选择',
+  /** 选中的节点在画布上，但不是口径卡（助手改图、导入 JSON 会写出这种配置）：下拉里那一项、下面那句提示 */
+  cardWrongType: (label: string) => `${label}（不是口径卡）`,
+  cardWrongTypeHint: (type: string) => `所选节点是「${type}」节点，不是口径卡，请重新选择`,
+  metricsAll: '全部指标',
+  metricsDefault: '未指定：复算全部输入来自查询的指标',
+  metricsPicked: (n: number, total: number) => `已选 ${n} / ${total} 个指标`,
+  metricsNoCard: '先选择要复算的口径卡',
+  metricsNone: '这张口径卡还没有定义指标',
+  metricsPinned: '这张口径卡引用了其他工作流发布的口径，指标在运行时按引用的版本确定：将复算其中输入来自查询的全部指标',
+  metricsStale: (ids: string[]) => `已选的指标不在这张口径卡中：${ids.join('、')}`,
+  metricsClear: '清除不在卡中的指标',
+  metricsLast: '至少保留一个指标；要复算全部指标时全部勾选即可',
+  metricOption: (name: string | null | undefined, id: string) => (name && name !== id ? `${name}（${id}）` : id),
+  definitionPlaceholder: (name: string) => `「${name}」的口径说明`,
+  definitionsNone: '选择要复算的口径卡后，可以为每个指标写一段口径说明',
+  definitionsPinned: '这张口径卡引用了其他工作流发布的口径，指标在运行时才确定，无法在这里逐个填写口径说明',
+  definitionGone: (id: string) => `指标「${id}」已不在复算范围内，这段说明不会交给盲算模型`,
+  definitionRemove: '删除这段说明',
+  providerFollow: '跟随设置',
+  providerFromModel: '按模型名找接入',
+  providerGone: (name: string) => `${name}（不存在）`,
+  providerOff: '（已停用）',
+  modelFollow: '跟随设置',
+  modelOfProvider: '留空则使用该接入的默认模型',
+  /**
+   * 节点上只填了盲算模型、接入留空时实际用哪个接入（verify_model_spec：哪一级写了就整组用哪一级，不跨级拼；
+   * 再按模型名找接入）。found：按模型名找到的接入；fallback：认不出时去调的默认接入
+   */
+  byModel: (model: string, found: { name: string; enabled: boolean } | null | undefined, fallback: string | null | undefined) => {
+    if (found && !found.enabled) return `只填了模型：「${model}」属于已停用的接入「${found.name}」，盲算调用将失败。请启用该接入或选择其他接入`
+    if (found) return `只填了模型：将按模型名使用接入「${found.name}」。接入和模型都未填写时，才跟随设置中的核查模型`
+    return `只填了模型：所有接入的模型列表中都没有「${model}」，将使用默认接入${fallback ? `「${fallback}」` : ''}调用。`
+      + '如该模型不属于默认接入，请选择对应的接入'
+  },
+  tolerancePlaceholder: (v: number | null | undefined) => (v == null ? '跟随设置' : `跟随设置（${v}）`),
+  toleranceInvalid: '请填写不小于 0 的数',
+  /** 选项以服务端报错里的短说法（engine/labels.py 的 DUAL_CHECK_ON_REJECT_LABEL）开头，后面可以带一句用途 */
+  onReject: { degrade: '计入缺口、出具降档（默认）', fail: '判为失败，运行终止' } as Record<string, string>,
+  onRejectUnknown: (v: string) => `${v}：无法识别的值，请从上方选项中选择`,
+  enabled: { follow: '跟随设置', on: '开启', off: '关闭' },
+  /** 「跟随设置」那一项附上设置里现在是开是关（设置还没取到就不附） */
+  enabledFollow: (on: boolean | null | undefined) => (on == null ? '跟随设置' : `跟随设置（当前${on ? '开启' : '关闭'}）`),
+
+  // ---- 节点卡片的摘要：复算哪张卡、几个指标
+  summary: {
+    card: (name: string, picked: number | null, total: number | null) => `复算「${name}」 · ${
+      picked != null ? `${picked} 个指标` : total != null ? `全部 ${total} 个指标` : '全部指标'}`,
+    noCard: '复算上游的口径卡 · 尚未连接口径卡',
+    many: (n: number) => `复算上游的口径卡 · 上游有 ${n} 张，请指定`,
+    off: '已关闭',
+  },
+
+  // ---- 审批卡（run/DualCheckApproval.tsx）
+  approval: {
+    intro: (n: number) => `盲算与原流程有 ${n} 个指标不一致，请逐个选择采用哪一边的结果`,
+    model: (model: string) => `盲算模型：${model}`,
+    sameModel: '盲算模型与原流程相同，复算缺乏独立性',
+    /** delta_pct 已经乘过 100、带正负号写好（「+12.5%」） */
+    delta: (text: string) => `相差 ${text}`,
+    deltaZero: '原流程值为 0，无法计算相差比例',
+    deltaHint: '相差比例 =（盲算值 − 原流程值）÷ |原流程值|',
+    diffHead: '差异说明',
+    /** 一条具体差异都没有时的固定说法（服务端兜底说明的前半句）；兜底的原话另有原因（比较超时、解析失败）时附在下面 */
+    fallbackOnly: '两条 SQL 的写法不同，未能归纳成具体差异',
+    equivalent: '两条 SQL 的写法等价，差异出在取用的结果上，请对照两边取用的值',
+    loading: '正在加载完整对照…',
+    loadFailed: '无法加载完整对照，以下仅为摘要',
+    compare: '对照两条 SQL',
+    compareClose: '收起对照',
+    sqlOriginal: '原流程的 SQL',
+    sqlBlind: '盲算的 SQL',
+    sqlMissing: '没有记录 SQL',
+    source: (s: string) => `数据源 ${s}`,
+    inputs: '输入取值',
+    textDiff: '规范化后不同的行',
+    /** 不同的行前面带着淡色的上级行（服务端 text_diff 里「  」开头的行）时，接在 textDiff 后面，也是那几行的悬停说明 */
+    textDiffContext: '淡色的行两边相同，标出所在的子句',
+    textDiffNone: '这一边没有不同的行',
+    rationale: '盲算的说明',
+    /** 理由文档里有没有出处的数字时，理由下面那一句提醒 */
+    rationaleBare: '理由中标出的数字没有引用盲算自己的查询结果，无法核对出处',
+    /**
+     * 服务端没有预告（老服务端，见 catalogPreview）、两边又只差一处时，提交前说清选择可能被记进数据目录。卡上只看得到
+     * 差异的方面，看不到服务端写目录的其余条件（dual_check_facts.derive：只有一边按时间筛的不记，多出的条件得在排除
+     * 无效记录、又不是指标自己的范围，只差去不去重时得采用去重的一边；同一次裁决里几个指标给同一张表记的业务日期、
+     * 去重规则不同时一项都不写），所以每句只说必要条件（「仅当……才」），不写的几种常见情况照实说出来，免得审核人
+     * 为了不让目录被写错而避开本来对的一边。卡上是「方面那句 + tail」。tail 紧跟在「……时不记」后面，开头写明说的是
+     * 写入的项
+     */
+    catalog: {
+      time: '仅当两边按不同的列筛时间，采用的一边所用的时间列才会作为该表的业务日期记入数据目录；只有一边按时间筛时不记，'
+        + '同一次裁决里几个指标给同一张表记的业务日期不同时都不记',
+      filter: '仅当多出的条件只在一边、并且是在排除退款、作废、测试这类无效记录，采用有它的一边时，这个条件才会作为该表的'
+        + '有效记录条件记入数据目录；只看某个地区、某个渠道这类限定指标范围的条件不记',
+      aggregate: '仅当两边只差是否去重、并且采用的是去重的一边，去重的做法才会作为该表的去重规则记入数据目录；采用不去重的一边时不记，'
+        + '同一次裁决里几个指标给同一张表记的去重规则不同时都不记',
+      tail: '。写入的项记为人工确认的事实；选「两边都不对」时不记，数据目录中已有人工确认的不同说法时不覆盖，是否记入以时间线上的记录为准',
+    },
+    /**
+     * 服务端预告了采用哪一边会往数据目录里写什么（payload.summary[].catalog）时照它说：三个选择逐条一句，会写的说哪张表
+     * 的哪一项会记为什么，不写的说不会记入和原因（服务端的原话，和裁决后时间线上跳过的原因一字不差）。两边都认不出
+     * 可记的事实（都没有写到哪）时卡上不提数据目录。卡上是「head + 三条 + tail」，审核人当前选的那一条加重。
+     *
+     * 同一次裁决里几个指标按当前的选择落到同一张表同一项上时，服务端写目录前把它们归拢（dual_check_facts._merged）：
+     * 说法相同的写一次，有效记录条件用 AND 合成一句，业务日期、去重规则说法不同的都不写，驳回过的拿出来不写。对照工件
+     * 里有服务端把每种组合算好的结果（catalog_joint）时照它说：会写的是合起来的那个值，并写明和哪几个指标一起记
+     * （together）；没有时（老服务端、组合太多、工件还没取到）按其余指标当前的选择推（conflict、joined、pending），
+     * 被目录挡下的同项指标也算进来，推不准的（pending）只说可能，结尾换成 tailInferred：推出来的不是服务端算好的结果，
+     * 不能和 tail 一样只在「审批期间目录有改动」时才不准
+     */
+    catalogPreview: {
+      head: '记入数据目录：',
+      /** where 同时间线（log.catalogItem）：「orders」（shop）的业务日期；value 是要写进去的说法 */
+      write: (choice: string, where: string, value: string) => `${choice}时，${where}会记为「${value}」`,
+      /** 两边写的是同一张表的同一项、只差取值时，后一边省掉「哪张表的哪一项」 */
+      writeSame: (choice: string, value: string) => `${choice}时会记为「${value}」`,
+      /** reason 是服务端的原话 */
+      blocked: (choice: string, reason: string) => `${choice}时不会记入：${reason}`,
+      skip: (choice: string) => `${choice}时不记`,
+      /** 接在 write / writeSame 后面：和这些指标按当前的选择一起记入同一项（服务端算好的结果） */
+      together: (metrics: string) => `，与${metrics}的选择一起记入`,
+      /** metrics 是 metricNames 写好的、和这一边说法不同的指标（按它们当前的选择） */
+      conflict: (choice: string, where: string, metrics: string) => `${choice}时，${where}与${metrics}的选择说法不同，都不记`,
+      /** 同 writeSame：两边写的是同一项时，后一边省掉「哪张表的哪一项」 */
+      conflictSame: (choice: string, metrics: string) => `${choice}时与${metrics}的选择说法不同，都不记`,
+      /** 有效记录条件接在 write / writeSame 后面：和这些指标当前采用的条件合成一句写 */
+      joined: (metrics: string) => `，与${metrics}采用的条件用 AND 合成一句`,
+      /**
+       * 没有算好的合并结果、同一项上又有被目录挡下的指标（有效记录条件）：挡下的原因卡上认不出（驳回过的会被拿掉，
+       * 别的原因会连这一边一起挡下），写不写说不准，只说可能。value 同 write
+       */
+      pending: (choice: string, where: string, value: string, metrics: string) =>
+        `${choice}时，${where}可能记为「${value}」，也可能不记：要与${metrics}的选择合起来才能确定`,
+      /** 同 writeSame：两边写的是同一项时，后一边省掉「哪张表的哪一项」 */
+      pendingSame: (choice: string, value: string, metrics: string) =>
+        `${choice}时可能记为「${value}」，也可能不记：要与${metrics}的选择合起来才能确定`,
+      /** 「退款率」、「订单数」；多于 3 个只列前 3 个 */
+      metricNames: (names: string[]) => names.slice(0, 3).map((n) => `「${n}」`).join('、')
+        + (names.length > 3 ? `等 ${names.length} 个指标` : ''),
+      tail: '写入的项记为人工确认的事实。以上按发起审批时的数据目录和各指标当前的选择预告，审批期间数据目录有改动时，以时间线上的记录为准',
+      /** 有一条是按其余指标当前的选择推出来的（没有算好的合并结果）：推断不一定准，实际写入一律以时间线为准 */
+      tailInferred: '写入的项记为人工确认的事实。几个指标落到同一项上时，以上是按各指标当前的选择推断的结果，'
+        + '实际写入以时间线上的记录为准',
+    },
+    choices: { a: '采用原流程的结果', b: '采用盲算的结果', neither: '两边都不对' } as Record<'a' | 'b' | 'neither', string>,
+    choiceGroup: (name: string) => `「${name}」采用哪一边的结果`,
+    /** 三个选择的后果，按运行类别说：探索运行不出具，不提出具；老服务端没给类别的照实说「正式运行」 */
+    consequence: (runClass: string | null | undefined) => (runClass === 'formal'
+      ? '采用原流程的结果：沿用原流程的值，不影响出具。采用盲算的结果或两边都不对：报告中的数仍取自原流程，这个指标记为出具缺口，出具降档'
+      : runClass === 'exploratory'
+        ? '采用原流程的结果：沿用原流程的值。采用盲算的结果或两边都不对：报告中的数仍取自原流程，这个指标记为缺口'
+        : '采用原流程的结果：沿用原流程的值。采用盲算的结果或两边都不对：报告中的数仍取自原流程，这个指标记为缺口，正式运行的出具随之降档'),
+    /**
+     * 节点的「未采用原流程时」设为判为失败（从这次运行的图快照里读到的）：采用盲算或都不对时节点失败、运行终止，
+     * 不再说出具降档
+     */
+    consequenceFail: '采用原流程的结果：沿用原流程的值，运行继续。采用盲算的结果或两边都不对：节点的「未采用原流程时」'
+      + '设为「判为失败」，提交后运行将终止',
+    /** 读不到节点怎么设的（图快照取不到、节点在子工作流里）：降档那句后面有条件地补一句 */
+    consequenceMaybeFail: '如节点的「未采用原流程时」设为「判为失败」，选择后两项会终止运行',
+    note: '备注（可选）',
+    notePlaceholder: '说明裁决的依据，会随裁决记入运行记录',
+    submit: '提交裁决',
+    pending: (n: number) => `还有 ${n} 个指标未选择`,
+    /** 提交后的提示：全采用原流程、或节点按缺省处置时运行继续；判为失败时运行终止；读不到节点设置时不下结论 */
+    done: '已提交裁决，运行继续',
+    doneFail: '已提交裁决，运行将按节点设置终止',
+    doneUnknown: '已提交裁决',
+    empty: '审批内容不完整，没有可以裁决的指标',
+    /** 认不出任何指标时留的出口：驳回后节点按人工驳回失败 */
+    reject: '驳回并终止',
+    emptyReject: '驳回后节点失败，本次运行终止。可以在备注中说明原因',
+    rejected: '已驳回，本次运行终止',
+  },
+
+  // ---- 时间线（run/decode.ts explainLog）：按日志的 code 和结构化字段说，不从原话里认
+  /** 日志里的 limit 字段（达到了哪个上限） */
+  limitLabel: {
+    max_queries: '查询次数上限', timeout_s: '时长上限', max_cost_usd: '金额上限', daily_max_usd: '每日金额上限', max_claims: '句数上限',
+  } as Record<string, string>,
+  limitAny: '上限',
+  limitDailyNext: '今日核查费用已达上限。请在「设置 → 偏好设置 → 核查」中调高每日金额上限，或等到次日再运行',
+  /**
+   * 单次运行时限将至（日志带 cause: run_deadline，服务端 engine/deadline.py）：一段执行（两次人工审批之间）有单次运行
+   * 时限，核查节点为后续节点预留时间，剩下的时间不够就不再开始新的一项，开始了的按剩余时间缩短时长。双盲复算、反方审稿
+   * 这几行共用这句副标题，seconds 是单次运行时限（设置页「运行环境」里的叫法）
+   */
+  deadlineSub: (seconds: number) => `单次运行时限为 ${formatNumber(seconds)} 秒，已为后续节点预留时间`,
+  log: {
+    skippedDisabled: '双盲复算未启用，已跳过',
+    skippedDisabledNext: '如需复算，请在节点的「启用双盲复算」中选择「开启」，或在「设置 → 偏好设置 → 核查」中启用双盲复算',
+    skippedNoInputs: '没有输入来自查询的指标，已跳过复算',
+    skippedNoInputsNext: '双盲复算只复算输入来自查询结果的指标。请检查节点的「复算的指标」，或确认口径卡的输入取自查询',
+    skipped: '双盲复算已跳过',
+    sameModel: (model?: string) => (model ? `盲算模型与原流程同为「${model}」，复算缺乏独立性` : '盲算模型与原流程相同，复算缺乏独立性'),
+    sameModelNext: '请在节点的「盲算模型」中指定其他模型，或在「设置 → 偏好设置 → 核查」中修改核查模型',
+    agreed: (n?: number) => (n ? `双盲复算一致：${formatNumber(n)} 个指标与盲算结果相符` : '双盲复算一致：与盲算结果相符'),
+    disagreed: (n?: number) => (n ? `双盲复算有 ${formatNumber(n)} 个指标与盲算结果不一致，等待审核人裁决`
+      : '双盲复算有指标与盲算结果不一致，等待审核人裁决'),
+    disagreedNext: '请在审批卡上对照两边的 SQL，逐个指标选择采用哪一边的结果',
+    resolved: (parts: string[]) => (parts.length ? `审核人已裁决：${parts.join('，')}` : '审核人已裁决'),
+    resolvedA: (n: number) => `采用原流程 ${formatNumber(n)} 个`,
+    resolvedB: (n: number) => `采用盲算 ${formatNumber(n)} 个`,
+    resolvedNeither: (n: number) => `两边都不对 ${formatNumber(n)} 个`,
+    gaps: (n: number) => (n ? `${formatNumber(n)} 项记为缺口` : '没有缺口'),
+    catalog: (n: number) => `已将 ${formatNumber(n)} 项人工确认的事实记入数据目录`,
+    catalogNone: '本次裁决未写入数据目录',
+    /**
+     * 写进数据目录的一项：「orders」（shop）的业务日期。item 是目录项的中文叫法（认不出的键不传，只写表）；
+     * 老版本给的一句中文也从这里过
+     */
+    catalogItem: (table?: string, source?: string, item?: string) => {
+      const where = table ? `「${table}」${source ? `（${source}）` : ''}` : ''
+      return where && item ? `${where}的${item}` : where || item || ''
+    },
+    /** 写进数据目录的一项连同写进去的值：「orders」（shop）的业务日期记为「paid_date」 */
+    catalogValue: (where: string, value: string) => `${where}记为「${value}」`,
+    catalogSkipped: (n: number) => `${formatNumber(n)} 项未写入`,
+    catalogNext: '可在「数据 → 数据目录」中查看或修改',
+    /** metric 是指标 ID（服务端日志只带 ID，中文名在原话里），不当名字加引号 */
+    limit: (label: string, metric?: string) => (metric ? `指标 ${metric} 的盲算已达${label}，按无法复算处理` : `双盲复算已达${label}`),
+    limitNext: '请在「设置 → 偏好设置 → 核查」中调高双盲复算的上限',
+    /**
+     * dual_check_unchecked：盲算触顶、出错、交不出数，或者输入本身没法单独复算（合并查询、遮罩列）。只说记为缺口，
+     * 不说出具：探索运行不出具，节点接在侧枝上时缺口也进不了出具，降不降档由出具那一行说（同 gaps）
+     */
+    unchecked: (n?: number) => (n ? `双盲复算有 ${formatNumber(n)} 个指标无法复算，已记为缺口`
+      : '双盲复算有指标无法复算，已记为缺口'),
+    uncheckedNext: '无法复算的原因见展开内容。来自合并查询、遮罩列的输入无法单独复算；盲算触顶、出错的，可调高「设置 → 偏好设置 → 核查」中的上限后重新运行',
+    /**
+     * dual_check_unchecked 带 cause: run_deadline：单次运行时限将至，没来得及盲算、缩短时长后到时没算完的指标（服务端
+     * 另起这一条，原因都一样，副标题只点名）。调高每项的上限只会更快撞线，检查模型、数据源也无济于事：下一步说怎么腾出时间
+     */
+    deadline: (n?: number) => (n ? `运行时限将至，双盲复算有 ${formatNumber(n)} 个指标未能复算，已记为缺口`
+      : '运行时限将至，双盲复算有指标未能复算，已记为缺口'),
+    deadlineNext: '如需全部复算，可在节点的「复算的指标」中减少指标，或在双盲复算前加人工审批（时限按审批前后分段计算）；'
+      + '确需更长时间，请联系管理员调大单次运行时限（AGENTLAB_MAX_RUN_SECONDS）',
+  },
+  /**
+   * 出具缺口里双盲复算、反方审稿报上来的那几条（缺口以「双盲复算「节点名」：」「反方审稿：」开头）：时间线、成果卡片、
+   * 证据页把它们另起，不和「校验没跑全」混在一起，再按是查出了问题还是没核成分两组（run/decode.ts 的 splitIssuanceGaps）：
+   * failed 是核查查出来的问题（两路结果不一致、结论被推翻），unfinished 是没核成的（指标无法复算：合并查询、遮罩列的
+   * 输入做不了复算，盲算触顶、出错）——没核过的数不能说成「未通过」，读的人会以为这个数被查出了错
+   */
+  verifyGaps: {
+    failed: '核查未通过',
+    unfinished: '核查未完成',
+  },
+}
+
+/**
+ * 反方审稿节点：节点库说明、检查器、节点卡片摘要、审批卡上的反方审稿（run/ChallengeSummary.tsx），以及时间线上反方
+ * 审稿的日志（log）。四种判断全站只有这一种叫法：经受住、被削弱、被推翻、无法判断。判断由反方模型给出，不是系统核对。
+ * 「出具会降档」只在正式运行、有被推翻的结论、被推翻的真会让出具降档（服务端的 degrades；老服务端没给时按「没写只标注」
+ * 算）时才说；探索运行不出具、运行类别取不到时，不说任何和出具有关的话
+ */
+export const CHALLENGE_TEXT = {
+  description: '从反方立场复核上游报告的关键结论：另一个模型只读查库，逐句判断经受住、被削弱、被推翻还是无法判断',
+  verdict: { stands: '经受住', weakened: '被削弱', refuted: '被推翻', inconclusive: '无法判断' },
+  /** 服务端给了一个界面不认识的判断：照写原值，不归到哪一类 */
+  verdictUnknown: (v: string) => `未知判断「${v}」`,
+
+  // ---- 节点卡片的摘要。report 是节点 id：卡片摘要只看配置 ----
+  summary: (c: { report?: unknown; max_claims?: unknown; enabled?: unknown }) => [
+    c.enabled === false ? '已关闭' : '',
+    typeof c.report === 'string' && c.report.trim() ? `审报告节点 ${c.report.trim()}` : '审上游报告',
+    typeof c.max_claims === 'number' && c.max_claims > 0 ? `最多审 ${formatNumber(c.max_claims)} 句结论` : '句数跟随设置',
+  ].filter(Boolean).join(' · '),
+
+  // ---- 检查器 ----
+  field: {
+    report: '要审的报告',
+    max_claims: '最多审几句',
+    max_queries: '每句最多查询次数',
+    timeout_s: '每句时长上限（秒）',
+    provider: '反方模型 · 接入',
+    model: '反方模型',
+    on_refuted: '结论被推翻时',
+    enabled: '启用',
+  },
+  followSettings: '跟随设置',
+  help: {
+    max_claims: '每份报告最多挑几句关键结论来审。留空则使用「设置 → 偏好设置 → 核查」中的值',
+    max_queries: '复核每句结论时最多执行几次查询。留空则使用「设置 → 偏好设置 → 核查」中的值',
+    timeout_s: '复核每句结论的时长上限，到时按已查到的结果给出判断。留空则使用「设置 → 偏好设置 → 核查」中的值',
+    // 选项名照下拉里的写（「出具降档」「只标注」「报错并停止运行」），和服务端报错里点的选项名一致
+    on_refuted: '出具降档：被推翻的结论计入出具缺口，正式运行降档出具；只标注：在审批卡和运行记录中标出，不影响出具；'
+      + '报错并停止运行：本节点失败，运行停止',
+  },
+  onRefuted: { degrade: '出具降档（默认）', flag: '只标注', fail: '报错并停止运行' },
+  unknownValue: (v: string) => `${v}：无法识别的值，请从上方选项中选择`,
+  reportPick: {
+    auto: (only: string | null) => (only ? `未选择：审上游的「${only}」` : '未选择：审上游的报告撰写节点'),
+    none: '上游没有报告撰写节点，请先在本节点之前连接一个报告撰写节点',
+    many: (n: number) => `上游有 ${formatNumber(n)} 个报告撰写节点，请选择要审的那一个`,
+    missing: (id: string) => `${id}（已不在画布上）`,
+    notUpstream: (label: string) => `${label}（不在上游）`,
+    wrongType: (label: string) => `${label}（不是报告撰写节点）`,
+    missingHint: '所选节点已不在画布上，请重新选择',
+    notUpstreamHint: '所选节点不在本节点上游，运行到这里时它还没有写出报告，请重新选择或调整连线',
+    wrongTypeHint: (type: string) => `所选节点是「${type}」节点，不是报告撰写节点，请重新选择`,
+  },
+  enabled: {
+    follow: '跟随设置', on: '开启', off: '关闭',
+    hint: {
+      follow: '使用「设置 → 偏好设置 → 核查」中「反方审稿 · 启用」的值',
+      on: '无论设置如何都执行反方审稿',
+      off: '不执行反方审稿，上游的结果原样交给下游，运行记录中记一条说明',
+    },
+  },
+  model: {
+    providerFollow: '跟随设置',
+    providerFromModel: '按模型名找接入',
+    providerMissing: (name: string) => `${name}（不存在）`,
+    providerDisabled: '（已停用）',
+    modelFollow: '跟随设置',
+    modelDefault: '留空则使用该接入的默认模型',
+    help: '接入和模型均未填写时，使用「设置 → 偏好设置 → 核查」中的核查模型；填写任一项后，整组以节点配置为准，'
+      + '不与设置合并。建议反方模型与撰写报告的模型不同，同一模型较难发现自身的错误',
+    byModel: (model: string, found: { name: string; enabled: boolean } | null | undefined, fallback: string | null | undefined) => (
+      found && !found.enabled
+        ? `只填了模型：「${model}」属于已停用的接入「${found.name}」，调用将失败。请启用该接入或选择其他接入`
+        : found
+          ? `只填了模型：将按模型名使用接入「${found.name}」。接入和模型都未填写时，才跟随设置中的核查模型`
+          : `只填了模型：所有接入的模型列表中都没有「${model}」，将使用默认接入${fallback ? `「${fallback}」` : ''}调用；`
+            + '如该模型不属于默认接入，请选择对应的接入'),
+    same: (model: string) => `反方模型与撰写报告的模型相同（「${model}」），审稿效果有限`,
+  },
+
+  // ---- 审批卡 ----
+  head: (label: string) => `报告「${label}」的反方审稿`,
+  count: (verdict: string, n: number) => `${verdict} ${formatNumber(n)} 句`,
+  none: '报告中没有需要反方复核的关键结论',
+  degrade: '出具会降档',
+  degradeHint: '被推翻的结论计入出具缺口，本次正式运行将降档出具',
+  flagNote: '按节点设置，被推翻的结论只做标注，不影响出具档位',
+  /**
+   * 按降档处置，但反方审稿节点不在带出具契约的成果节点上游（服务端的 degrades 为假）：缺口进不了出具。这句画在人工审批
+   * 的卡上（画布上也会在审批节点旁弹出），主语写明是反方审稿节点，不说「本节点」——那里的本节点是审批节点
+   */
+  degradeOff: '反方审稿节点没有接在带出具契约的成果节点上游，被推翻的结论不计入出具缺口，不影响出具档位',
+  /**
+   * 服务端的 unreviewed：反查没有完成的句数（核查模型不可用、触顶没给出结论、数据源已不存在或已停用、报告没有引用
+   * 数据库查询……），都记为无法判断。触顶的可能已经查过几次，不能说成「没有查询数据」；不会多于「无法判断」的句数
+   */
+  unreviewed: (n: number) => `${formatNumber(n)} 句未能反查，已记为无法判断`,
+  unreviewedHint: '反查没有完成：可能是核查模型不可用、达到上限、数据源已不存在或已停用，或报告未引用数据库查询，原因见运行时间线',
+  /** 审批里没带工件（服务端保存审稿记录失败）：每句都看不了理由和查询，整块说一次 */
+  noRecord: '反方审稿记录未保存，无法查看理由和查询',
+  more: (n: number) => `另有 ${formatNumber(n)} 句未列出`,
+  showAll: '显示全部',
+  loading: '正在加载反方审稿…',
+  failed: '无法获取反方审稿的详细内容',
+  retry: '重试',
+  claimMissing: '反方审稿记录中没有这一句的详细内容',
+  judgedBy: (model: string | null) => `判断由反方模型${model ? `「${model}」` : ''}给出，并非系统核对`,
+  rationale: '理由',
+  rationaleEmpty: '反方没有给出理由',
+  docLoading: '正在加载理由…',
+  queries: (n: number) => `反方执行的查询（${formatNumber(n)} 次）`,
+  noQueries: '反方没有执行查询',
+  rows: (n: number) => `${formatNumber(n)} 行`,
+  truncated: '结果已截断，数据库中还有更多数据',
+  /** 理由里有出处的数字：读屏听到的是「数字，出处：查询 Q2 · 第 1 行 · amount」，点一下跳到那次查询 */
+  cited: (text: string, source: string) => `${text}，出处：${source}，跳到这次查询`,
+  /** 同上，没有可跳的查询时（双盲复算的理由）只念出处 */
+  citedPlain: (source: string) => `（出处：${source}）`,
+
+  // ---- 证据面板的单句展示（ChallengeSummary 的 scope="claim"）与正文的句末标记（run/EvidenceDoc）----
+  /** 证据面板里这一节的标题 */
+  claimTitle: '反方审稿',
+  /** 单句展示：展开反方对这一句的理由和它执行过的查询 */
+  claimDetail: '反方的理由与查询',
+  /** 这一句判为无法判断，而这份报告无法判断的句子全是没反查成的：这一句就是 */
+  claimUnreviewed: '这一句未能反查，已记为无法判断',
+  /** 同上，但无法判断的句子里还有查过了、数据不够的：说不准是不是这一句 */
+  claimMaybeUnreviewed: (n: number) => `这份报告有 ${formatNumber(n)} 句未能反查，已记为无法判断，这一句可能在其中`,
+  /**
+   * 单句展示的先行版：只知道判断（正文标记用的证据图），这一句的理由、查询和整份报告的计数要等片段接口答回来。
+   * 还在取、取不到（给重试）、答了却没有可用的内容
+   */
+  claimPending: '正在获取反方的理由与查询…',
+  claimFailed: '未能获取反方的理由与查询',
+  claimNoDetail: '无法查看反方的理由与查询',
+  /**
+   * 无法判断的落款：未能反查的句子也记为无法判断（服务端按规则记的，反方模型没看过这一句），说不准是哪一种时不说成反方
+   * 模型的判断。证据面板先行版的落款、正文句末标记的悬停说明都用这一句
+   */
+  judgedUnsure: '可能是反方模型的判断，也可能是未能反查时记下的，并非系统核对',
+  /** 正文句末标记的悬停说明：判断是反方模型给的 */
+  markTitle: (verdict: string) => `反方审稿：${verdict}（反方模型的判断，并非系统核对）`,
+  /** 同上，无法判断的那一种（括号里同 judgedUnsure） */
+  markTitleUnsure: (verdict: string) => `反方审稿：${verdict}（可能是反方模型的判断，也可能是未能反查时记下的，并非系统核对）`,
+  /** 句末标记读屏念的那一段：跟在句子后面（只有反方审稿时），或接在裁判的判定后面（两样都有时，并在一个标记里） */
+  markLabel: (verdict: string) => `反方审稿：${verdict}`,
+
+  // ---- 时间线（run/decode.ts explainLog）：按日志的 code 和结构化字段说，不从原话里认
+  log: {
+    skippedDisabled: '反方审稿未启用，已跳过',
+    skippedDisabledNext: '如需审稿，请在节点中开启，或在「设置 → 偏好设置 → 核查」中启用反方审稿',
+    // no_report：要审的报告节点找得到（找不到时节点直接报错，到不了这里），但它的报告文档读不出来——没有写出、
+    // 保存失败，或者它在这次没有执行到的分支上
+    skippedNoReport: '要审的报告没有可读取的报告文档，已跳过反方审稿',
+    skippedNoReportNext: '请确认报告撰写节点是否执行成功、是否写出了报告；它位于条件分支上时，确认本次运行执行到了它',
+    skippedNoClaims: '报告中没有需要审的关键结论，已跳过反方审稿',
+    skipped: '反方审稿已跳过',
+    sameModel: (model?: string) => (model ? `反方审稿模型与报告撰写模型同为「${model}」，审稿缺乏独立性`
+      : '反方审稿模型与报告撰写模型相同，审稿缺乏独立性'),
+    sameModelNext: '请在节点中指定其他审稿模型，或在「设置 → 偏好设置 → 核查」中修改核查模型',
+    done: (n?: number) => (n ? `反方审稿完成：审阅了 ${formatNumber(n)} 句结论` : '反方审稿完成'),
+    verdict: { stands: '经受住', weakened: '被削弱', refuted: '被推翻', inconclusive: '无法判断' } as Record<string, string>,
+    refuted: (n?: number) => (n ? `反方审稿推翻了 ${formatNumber(n)} 句结论` : '反方审稿推翻了报告中的结论'),
+    refutedNext: '请在证据中对照反方审稿的查询和理由，核实这些结论',
+    limit: (label: string, skipped?: number) => (skipped ? `反方审稿已达${label}，${formatNumber(skipped)} 句结论未审` : `反方审稿已达${label}`),
+    limitNext: '请在节点或「设置 → 偏好设置 → 核查」中调高反方审稿的上限',
+    /**
+     * challenge_unreviewed：有句子未能反查（核查模型不可用、整理证据出错、报告没有引用数据库查询、数据源不在了、一条
+     * 查询都没执行成功），记为无法判断。触顶的不在这里（由 challenge_limit 说），所以建议里不提调高上限
+     */
+    unreviewed: (n?: number) => (n ? `反方审稿有 ${formatNumber(n)} 句结论未能反查，已记为无法判断`
+      : '反方审稿有结论未能反查，已记为无法判断'),
+    unreviewedNext: '原因见展开内容。请检查核查模型和数据源是否可用，修正后重新运行；报告未引用数据库查询的结论无法反查',
+    /**
+     * 带 cause: run_deadline 的两条（服务端 engine/deadline.py）：单次运行时限将至，反方审稿为后续节点预留时间。
+     * challenge_unreviewed 是剩下的句子不再反查；challenge_limit 是开始了的句子按剩余时间缩短了反查时长、到时按查到的结果
+     * 收尾（n：这样的句数，skipped：其中未能给出判断的）。调高每句的上限只会更快撞线，检查模型、数据源也无济于事
+     */
+    deadline: (n?: number) => (n ? `运行时限将至，反方审稿有 ${formatNumber(n)} 句结论未反查，已记为无法判断`
+      : '运行时限将至，反方审稿有结论未反查，已记为无法判断'),
+    deadlineLimit: (n?: number, skipped?: number) => {
+      const head = n ? `运行时限将至，反方审稿缩短了 ${formatNumber(n)} 句结论的反查时长` : '运行时限将至，反方审稿缩短了反查时长'
+      return skipped ? `${head}，其中 ${formatNumber(skipped)} 句未能给出判断` : `${head}，已按查到的结果给出判断`
+    },
+    deadlineNext: '如需全部审完，可在节点或「设置 → 偏好设置 → 核查」中减少每份报告审的句数，或在反方审稿前加人工审批'
+      + '（时限按审批前后分段计算）；确需更长时间，请联系管理员调大单次运行时限（AGENTLAB_MAX_RUN_SECONDS）',
+    /** challenge_sources_lost：反查了，但该查的数据源有停用了的，判断不含它们的数据 */
+    sourcesLost: (n?: number) => (n ? `反方审稿有 ${formatNumber(n)} 句结论只查了部分数据源` : '反方审稿有结论只查了部分数据源'),
+    sourcesLostSub: (names: string[]) => `未能查询：${names.map((x) => `「${x}」`).join('、')}（已不存在或已停用），判断不含其中的数据`,
+    sourcesLostNext: '请在「数据」页确认这些数据源是否应启用，启用后重新运行',
+  },
+}
+
+/**
+ * 设置页「核查」一节（双盲复算、反方审稿、审批质询共用的核查模型、各自的开关和上限、每日金额上限）。
+ *
+ * 顶层是各项的叫法，和服务端 api/settings.py 的 VERIFY_SETTING_LABEL 一字不差（保存时 422 的报错写的就是这些，
+ * 界面上的字段名得对得上），嵌套的项写成「组.项」；check-verify 从 settings.py 读出来逐一比对。
+ * 这一节其余的标题、说明、今日花费放在 section 里
+ */
+export const VERIFY_SETTING_TEXT = {
+  provider: '核查模型 · 接入',
+  model: '核查模型 · 模型',
+  daily_max_usd: '核查每日金额上限（美元）',
+  dual_check: '双盲复算',
+  'dual_check.enabled': '双盲复算 · 启用',
+  'dual_check.tolerance': '双盲复算 · 允许的相对误差',
+  'dual_check.max_queries': '双盲复算 · 每项最多查询次数',
+  'dual_check.timeout_s': '双盲复算 · 每项时长上限（秒）',
+  challenge: '反方审稿',
+  'challenge.enabled': '反方审稿 · 启用',
+  'challenge.max_claims': '反方审稿 · 每份报告最多审几句',
+  'challenge.max_queries': '反方审稿 · 每句最多查询次数',
+  'challenge.timeout_s': '反方审稿 · 每句时长上限（秒）',
+  inquiry: '审批质询',
+  'inquiry.enabled': '审批质询 · 启用',
+  'inquiry.max_queries': '审批质询 · 每次最多查询次数',
+  'inquiry.timeout_s': '审批质询 · 每次时长上限（秒）',
+  section: {
+    title: '核查',
+    hint: '双盲复算、反方审稿和审批质询都由只读的 Agent 查询数据来核对：三项共用核查模型和每日金额上限，'
+      + '各自可以单独开关、设置上限。节点中已设置的项以节点为准。',
+    model: '核查模型',
+    /** 接入和模型都没填：服务端沿用证据裁判模型的取值链（verify_model_spec）。醒目地说一句，并给出建议 */
+    notSet: '未单独配置，将使用证据裁判的模型',
+    notSetAdvice: '建议配置一个与撰写报告、查询数据的模型都不同的模型：同一模型核对自身的输出时，不易发现其中的错误',
+    differ: '建议与撰写报告、查询数据的模型不同：同一模型不易发现自身的错误',
+    providerDefault: '跟随证据裁判模型',
+    providerFromModel: '按模型名找接入',
+    providerGone: (name: string) => `模型接入「${name}」不存在：核查调用将失败`,
+    providerGoneOption: (name: string) => `${name}（不存在）`,
+    providerOff: '（已停用）',
+    modelDefault: '留空：用接入的默认模型',
+    modelFollow: '留空：跟随证据裁判模型',
+    modelOf: (model: string) => `留空则使用 ${model}`,
+    /** 只填了核查模型、接入留空时实际用哪个接入（同裁判的说法，只是上一级是证据裁判模型） */
+    byModel: (model: string, found: { name: string; enabled: boolean } | null | undefined, fallback: string | null | undefined) => {
+      if (found && !found.enabled) return `只填了模型：「${model}」属于已停用的接入「${found.name}」，核查调用将失败。请启用该接入或选择其他接入`
+      if (found) return `只填了模型：将按模型名使用接入「${found.name}」。「跟随证据裁判模型」仅在接入和模型都留空时生效`
+      return `只填了模型：所有接入的模型列表中都没有「${model}」，将使用默认接入${fallback ? `「${fallback}」` : ''}调用。`
+        + '如该模型不属于默认接入，请选择对应的接入。「跟随证据裁判模型」仅在接入和模型都留空时生效'
+    },
+    parts: {
+      dual_check: '另起一路，由盲算模型在看不到原流程 SQL 的情况下独立查询，再与原流程的结果逐项比对',
+      challenge: '从报告中挑出关键结论，由反方模型查询数据尝试推翻',
+      inquiry: '审批人在批准前就报告提问，由核查模型查询数据作答，问答随运行一并封存',
+    } as Record<string, string>,
+    toleranceHint: '两边的值相差不超过这个比例时算一致，例如 0.000001 表示百万分之一，0 表示必须完全相同',
+    unlimited: '不限',
+    /**
+     * 某项设成不限时写明它还受什么约束，不要悄悄生效。by：眼下还设着上限的相关项。runTimeout 是双盲复算、反方审稿的
+     * 时长：它们在运行里执行，一段执行有单次运行时限，时限将至时按剩余时间缩短（服务端 engine/deadline.py），设成不限
+     * 也一样；timeout 是审批质询的，不在运行的那一段里执行
+     */
+    unlimitedNote: (kind: 'queries' | 'claims' | 'timeout' | 'runTimeout' | 'daily', by: string[]) => {
+      if (kind === 'timeout') return '不设上限，时长仅受模型接口自身的超时约束'
+      if (kind === 'runTimeout') return '不设上限，时长仍受单次运行时限约束，时限将至时按剩余时间缩短'
+      const what = kind === 'queries' ? '查询次数' : kind === 'claims' ? '句数' : '每日核查费用'
+      return by.length ? `不设上限，${what}仅受${by.join('、')}约束` : `不设上限，${what}不受其他上限约束`
+    },
+    bound: { timeout: '时长上限', daily: '每日金额上限', claims: '报告中关键结论的数量', queries: '各项的查询次数上限', timeouts: '各项的时长上限' },
+    invalid: {
+      count: '请填写正整数，或勾选「不限」',
+      seconds: '请填写大于 0 的秒数，或勾选「不限」',
+      usd: '请填写大于 0 的金额，或勾选「不限」',
+      tolerance: '请填写不小于 0 的数',
+    },
+    spend: (usd: string, calls: number) => `今日已花费 $${usd}（${formatNumber(calls)} 次调用）`,
+    spendNone: '今日尚无核查调用',
+    unpriced: (n: number) => `另有 ${formatNumber(n)} 次调用无法估算金额（模型不在价格目录中），未计入`,
+    saveInvalid: '核查设置中有无效值，请修正后再保存',
+  },
 }

@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src __BUNDLE_CSP__; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="color-scheme" content="light dark">
+<title>__BUNDLE_TITLE__</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff; --panel: #f5f6f8; --raise: #ffffff; --border: #dfe2e8; --fg: #16181d; --dim: #41454e; --faint: #5f6470;
+  --accent: #2a57c2; --ok: #1b7339; --ok-soft: #e5f4ea; --bad: #b92424; --bad-soft: #fcebeb; --na: #565b66; --na-soft: #eceef2;
+  --mark: #fff1b8; --code: #eff1f5; --shadow: 0 10px 32px rgba(16, 20, 28, .16);
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --detail-w: 420px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111318; --panel: #181b21; --raise: #1c1f26; --border: #2e323b; --fg: #e8eaee; --dim: #c1c5ce; --faint: #969ca8;
+    --accent: #8aaeff; --ok: #62d08c; --ok-soft: #14301f; --bad: #ff8080; --bad-soft: #3c1c1f; --na: #a9afbb; --na-soft: #262a31;
+    --mark: #4d4214; --code: #23262e; --shadow: 0 10px 32px rgba(0, 0, 0, .55);
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+/* 核对脚本一开始执行就给 html 标上 data-js：没执行（禁用脚本、附件预览）时只显示「尚未核对」那一句 */
+html:not([data-js]) .js-only, html[data-js] .no-js { display: none !important; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.65 var(--sans); overflow-wrap: break-word; }
+code, pre, .mono { font-family: var(--mono); }
+.page { max-width: 920px; margin: 0 auto; padding: 28px 16px 72px; }
+.brand { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .04em; color: var(--accent); }
+h1 { margin: 2px 0 0; font-size: 24px; line-height: 1.35; }
+.overall { display: flex; align-items: center; gap: 10px; margin: 16px 0 4px; padding: 12px 14px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--panel); font-size: 18px; font-weight: 650; }
+.overall[data-overall="pass"] { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
+.overall[data-overall="fail"] { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+.overall[data-overall="incomplete"], .overall[data-overall="partial"] { color: var(--na); background: var(--na-soft); border-color: var(--na); }
+.overall-mark { font-size: 20px; line-height: 1; }
+.overall-sub { margin: 4px 2px 0; font-size: 13px; color: var(--dim); }
+/* 总览不是绿色的通过时：真伪以系统里的封存核对为准，写在总览正下方，比封存说明醒目 */
+.overall-hint { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid var(--accent); border-radius: 6px; background: var(--panel);
+  color: var(--fg); font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.seal { margin: 18px 0; padding: 14px 16px; border: 2px solid var(--accent); border-radius: 10px; }
+.seal h2 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--dim); }
+.hash { display: block; font-size: 15px; font-weight: 600; line-height: 1.5; word-break: break-all; color: var(--fg); }
+.seal p { margin: 10px 0 0; font-size: 13px; color: var(--dim); }
+.seal p code { word-break: break-all; }
+.seal .seal-warn { padding: 8px 10px; border-radius: 8px; background: var(--bad-soft); color: var(--bad); }
+.meta { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 16px; margin: 0; font-size: 13px; }
+.meta dt { color: var(--faint); }
+.meta dd { margin: 0; min-width: 0; color: var(--dim); overflow-wrap: anywhere; }
+.meta-note { margin: 14px 0 6px; font-size: 12px; color: var(--faint); }
+.block { margin-top: 36px; }
+.block > h2 { margin: 0 0 10px; font-size: 18px; }
+.muted { color: var(--faint); }
+.bad { color: var(--bad); }
+.note { margin: 6px 0 12px; font-size: 13px; color: var(--dim); }
+.warn { margin: 0 0 10px; padding: 8px 10px; border-radius: 8px; background: var(--bad-soft); color: var(--bad); font-size: 13px; }
+.warn[data-why="missing"], .warn[data-why="unreadable"], .warn[data-why="masked"] { background: var(--na-soft); color: var(--na); }
+.report { margin: 14px 0; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--raise); }
+.report-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-bottom: 10px; }
+.report-head h3 { margin: 0; font-size: 15px; }
+.report-head .mono { font-size: 12px; }
+.report-parts { flex: 1 1 100%; font-size: 12px; color: var(--dim); }
+.doc { font-size: 15px; }
+.doc p { margin: 8px 0; }
+.doc .doc-h { margin: 18px 0 6px; line-height: 1.4; }
+.doc .doc-h1 { font-size: 19px; } .doc .doc-h2 { font-size: 17px; } .doc .doc-h3 { font-size: 15px; }
+.doc ul, .doc ol { margin: 8px 0; padding-left: 1.6em; }
+.doc li { margin: 2px 0; }
+.doc blockquote { margin: 8px 0; padding-left: 12px; border-left: 3px solid var(--accent); color: var(--dim); }
+.doc pre { margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: var(--code); overflow-x: auto; font-size: 13px; line-height: 1.55; }
+.doc code { font-size: .92em; padding: 0 4px; border-radius: 4px; background: var(--code); }
+.doc pre code { padding: 0; background: none; }
+.doc hr { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
+.doc .link { color: var(--accent); }
+.table-wrap { max-width: 100%; margin: 8px 0; overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+.table-wrap table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table-wrap th, .table-wrap td { padding: 5px 9px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+.table-wrap th { background: var(--panel); color: var(--dim); font-weight: 600; white-space: nowrap; }
+.table-wrap tr:last-child td { border-bottom: 0; }
+.table-wrap .n { text-align: right; font-variant-numeric: tabular-nums; }
+.table-wrap .hit { background: var(--mark); }
+.num { font: inherit; color: inherit; background: none; border: 0; margin: 0; padding: 0 1px; border-radius: 3px; cursor: pointer;
+  text-decoration-line: underline; text-decoration-thickness: 1.5px; text-underline-offset: 3px; }
+.num[data-result="pass"] { text-decoration-style: solid; text-decoration-color: var(--ok); }
+.num[data-result="fail"] { text-decoration-style: wavy; text-decoration-color: var(--bad); background: var(--bad-soft); }
+.num[data-result="na"] { text-decoration-style: dotted; text-decoration-color: var(--na); }
+.num:hover { background: var(--panel); }
+.num:focus-visible, .close:focus-visible, .items button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.num.is-active { background: var(--mark); }
+.badge { display: inline-flex; align-items: center; gap: 3px; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+  font-weight: 600; line-height: 1.5; white-space: nowrap; }
+.badge[data-result="pass"] { color: var(--ok); background: var(--ok-soft); }
+.badge[data-result="fail"] { color: var(--bad); background: var(--bad-soft); }
+.badge[data-result="na"], .badge[data-result="partial"] { color: var(--na); background: var(--na-soft); }
+.check { margin: 12px 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.check-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 10px 12px; background: var(--panel); }
+.check-head h3 { margin: 0; font-size: 14px; }
+.check-sum { font-size: 13px; color: var(--dim); }
+.items { margin: 0; padding: 0; list-style: none; }
+.items li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; padding: 7px 12px; border-top: 1px solid var(--border); font-size: 13px; }
+.items .what { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
+.items .why { flex: 1 1 100%; color: var(--dim); }
+.items button { font: inherit; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; text-align: left; }
+details > summary { padding: 8px 12px; border-top: 1px solid var(--border); font-size: 13px; color: var(--accent); cursor: pointer; }
+.detail { position: fixed; top: 0; right: 0; bottom: 0; z-index: 10; width: min(var(--detail-w), 100vw); overflow-y: auto;
+  background: var(--raise); border-left: 1px solid var(--border); box-shadow: var(--shadow); }
+.detail-head { position: sticky; top: 0; display: flex; align-items: flex-start; gap: 8px; padding: 14px 16px 10px;
+  background: var(--raise); border-bottom: 1px solid var(--border); }
+.detail-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 17px; overflow-wrap: anywhere; }
+.close { flex: none; width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+  color: var(--dim); font: 18px/1 var(--sans); cursor: pointer; }
+.detail-body { padding: 12px 16px 28px; font-size: 14px; }
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 12px; margin: 0 0 12px; }
+.kv dt { color: var(--faint); font-size: 13px; }
+.kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.sql { margin: 6px 0 12px; padding: 8px 10px; border-radius: 8px; background: var(--code); font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.sub { margin: 14px 0 4px; font-size: 13px; color: var(--faint); font-weight: 600; }
+.foot { margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--border); font-size: 12px; color: var(--faint); }
+.foot p { margin: 4px 0; }
+@media print {
+  .detail, .close, details > summary { display: none !important; }
+  .page, html.detail-open .page { max-width: none; margin: 0; padding: 0; }
+  .num { text-decoration-color: currentColor !important; background: none !important; }
+}
+/* 宽屏上出处面板停在右侧：打开时正文让出这一栏，表格里右对齐的数字不会被面板盖住 */
+@media screen and (min-width: 761px) {
+  html.detail-open .page { margin-right: min(var(--detail-w), 100vw); }
+}
+@media (max-width: 760px) {
+  .detail { top: auto; left: 0; width: auto; max-height: 72vh; border-left: 0; border-top: 1px solid var(--border); border-radius: 14px 14px 0 0; }
+}
+@media (max-width: 520px) {
+  body { font-size: 14px; }
+  .page { padding: 20px 16px 56px; }
+  h1 { font-size: 20px; }
+  .overall { font-size: 16px; }
+  .hash { font-size: 13px; }
+  .meta { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .meta dt { margin-top: 6px; }
+  .report { padding: 12px; }
+}
+</style>
+<script>__BUNDLE_SCRIPT__</script>
+</head>
+<body>
+<div class="page">
+  <header>
+    <p class="brand">可验证报告</p>
+    <h1 id="title">__BUNDLE_NAME__</h1>
+    <div id="overall" class="overall" data-overall="running" role="status" aria-live="polite">
+      <span class="overall-mark js-only" aria-hidden="true">…</span><span id="overall-text"><span class="js-only">正在核对…</span><span class="no-js">尚未核对：需要在浏览器中打开本文件，并允许执行其中的核对脚本</span></span>
+    </div>
+    <p id="overall-sub" class="overall-sub"></p>
+    <p id="overall-hint" class="overall-hint" role="note" hidden></p>
+    <section class="seal" aria-labelledby="seal-label">
+      <h2 id="seal-label">封存清单哈希</h2>
+      <code id="seal-hash" class="hash">__BUNDLE_SEAL__</code>
+      <p id="seal-note">这个文件只证明内部一致：报告里的数字能追到口径卡或查询快照，文档、快照和运行记录彼此对得上。它不能单独证明这些记录出自系统、未被整体替换。核对真伪：在系统中打开这次运行（运行 ID <code class="run-id">__BUNDLE_RUN__</code>），确认「凭证详情」里的清单哈希与上面一致，并点「核对」确认事件记录与封存时一致（接口 GET /api/runs/<span class="run-id">__BUNDLE_RUN__</span>/verify）。工作流名、版本、起止时间和节点名称取自运行记录，不在封存范围内，需要在系统中一并对照。</p>
+      <p id="seal-failed" class="seal-warn"__BUNDLE_FAILED__>这次运行以失败结束：之后若在系统中继续运行，系统会重新封存，本文件的封存哈希将无法再与系统对照。</p>
+    </section>
+    <dl id="meta" class="meta"></dl>
+    <p id="record-note" class="meta-note" hidden></p>
+    <dl id="record" class="meta"></dl>
+  </header>
+  <main class="js-only">
+    <section id="reports" class="block" aria-labelledby="reports-title"><h2 id="reports-title">报告</h2></section>
+    <section id="checks" class="block" aria-labelledby="checks-title"><h2 id="checks-title">核对明细</h2></section>
+    <section id="appended" class="block" aria-labelledby="appended-title" hidden><h2 id="appended-title">封存之后追加的事件</h2></section>
+  </main>
+  <footer id="foot" class="foot js-only"></footer>
+</div>
+<aside id="detail" class="detail" role="dialog" aria-modal="false" aria-labelledby="detail-title" hidden>
+  <div class="detail-head"><h2 id="detail-title"></h2><button type="button" id="detail-close" class="close" aria-label="关闭">×</button></div>
+  <div id="detail-body" class="detail-body"></div>
+</aside>
+<script type="application/json" id="bundle-data">__BUNDLE_DATA__</script>
+</body>
+</html>

@@ -16,6 +16,7 @@ import { EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
 import { IssuanceBanner } from '../../run/AssistantStream'
 import { EvidenceDoc, type EvidenceDocHandle } from '../../run/EvidenceDoc'
 import { EvidenceGuessView } from '../../run/EvidenceGuess'
+import { ReportInquiry, inquiryOpen, locateIn, useInquiryAccess } from '../../run/Inquiry'
 import { Markdown, inlineStyles } from '../../run/Markdown'
 import { useEvidence } from '../../store/evidence'
 import { useCatalog } from '../../store/catalog'
@@ -47,12 +48,40 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
   const loadGraph = useEvidence((s) => s.loadGraph)
   const reloadGraph = useEvidence((s) => s.reloadGraph)
   const first = useRef(true)
+  // 报告正文（审批卡里展开的、成果区的）有运行就先取过证据图，取的时候运行可能还停在审批上（之后报告又改写过）、刚收尾还没
+  // 封存，也可能是接着跑之前封存的那一版。挂上时手里那份不是「封存了、封存的就是这一版」就重取一次，不看运行停在哪：之后
+  // 没有新事件，refreshKey 不再变，过期的那份会一直留着。别处正在取的那份取回来再看一眼（recheck）。
+  // 重取回来之前先占位（renewing），不画手里那份：画出来的是旧稿，审计表却是挂上时新取的，点一行会按片段 id 打开旧稿里同号
+  // 的片段。第一次渲染就按挂上那一刻手里的那份定，不先画一帧旧稿再收起来；换下来的判据是 store 里那一格不再是它
+  const [held] = useState(() => useEvidence.getState().graphs[run.id])
+  const [renewing, setRenewing] = useState(() => staleHeld(held, run.manifest_seq))
+  const recheck = useRef(false)
   useEffect(() => {
-    if (first.current) { first.current = false; void loadGraph(run.id); return }
+    if (first.current) {
+      first.current = false
+      if (!staleHeld(held, run.manifest_seq)) void loadGraph(run.id)
+      else if (held?.status === 'loading') recheck.current = true
+      else void reloadGraph(run.id)
+      return
+    }
     void reloadGraph(run.id)
-  }, [run.id, refreshKey, loadGraph, reloadGraph])
+    // held 是挂上那一刻的，之后不变
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run.id, run.status, run.manifest_seq, refreshKey, loadGraph, reloadGraph])
+  useEffect(() => {
+    // 挂上时那一份还没换下来（重取还没发出、还没回来），或者正在取：接着等
+    if (!renewing || graphSlot === held || graphSlot?.status === 'loading') return
+    if (recheck.current) {
+      recheck.current = false
+      if (graphSlot?.status === 'ok' && !sealedNow(graphSlot.data, run.manifest_seq)) {
+        void reloadGraph(run.id)
+        return
+      }
+    }
+    setRenewing(false)
+  }, [renewing, graphSlot, held, run.id, run.manifest_seq, reloadGraph])
   const audit = useAudit(run.id, refreshKey)
-  const graph = graphSlot?.data
+  const graph = renewing ? undefined : graphSlot?.data
 
   const [root, setRoot] = useState<HTMLDivElement | null>(null)
   const wide = useWide(root, 880)
@@ -124,6 +153,10 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
 
   const mode = graph?.mode ?? audit.data?.mode
   const seal = audit.data?.seal ?? graph?.seal
+  // 审批质询：封存了的探索运行可以接着就报告提问（追加在封存之后）；正式运行封存后不再开放。问答串每次运行都挂（只读）：
+  // 审批时问过什么、怎么答的、查了什么随运行封存，审批处理掉以后也得在报告旁边看得到
+  const asking = inquiryOpen(run)
+  const { access: inquiry, disabled: inquiryOff } = useInquiryAccess(asking, null)
 
   if (!graph && graphSlot?.status !== 'error') {
     return (
@@ -144,7 +177,8 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
                       reports={graph.reports ?? []} labelOf={labelOf} />
           <UpgradeBanner run={run} mode={mode} />
           {/* 出具档位和降档原因写在报告上方：降档时只在侧栏小标签里写「SQL 检查未通过」，报告上却是绿色的
-              「10 个数字都有出处」，读的人会以为一切正常。SQL 检查导致的降档在横幅里单列一块 */}
+              「10 个数字都有出处」，读的人会以为一切正常。SQL 检查导致的降档在横幅里单列一块，双盲复算、反方审稿报上来的
+              缺口分「核查未通过」「核查未完成」两组（和问数据、画布右栏同一个横幅） */}
           {!!output?._issuance?.tier && (
             <div data-evidence-issuance="">
               <IssuanceBanner issuance={output._issuance} runClass={run.run_class} />
@@ -163,10 +197,16 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
                   </span>
                 </header>
                 {doc ? (
-                  <EvidenceDoc ref={(h) => { handles.current.set(r.node_id!, h) }} doc={doc} artifact={r.doc_artifact}
-                               runId={run.id} runClass={run.run_class} label={r.fields?.join('、') || r.node_id} tally
-                               tier={typeof output?._issuance?.tier === 'string' ? output._issuance.tier : undefined}
-                               panel={wide ? 'dock' : 'auto'} dock={dock} onView={(o) => onView(r.node_id!, o)} />
+                  <>
+                    <EvidenceDoc ref={(h) => { handles.current.set(r.node_id!, h) }} doc={doc} artifact={r.doc_artifact}
+                                 runId={run.id} runClass={run.run_class} label={r.fields?.join('、') || r.node_id} tally
+                                 tier={typeof output?._issuance?.tier === 'string' ? output._issuance.tier : undefined}
+                                 panel={wide ? 'dock' : 'auto'} dock={dock} onView={(o) => onView(r.node_id!, o)}
+                                 inquiry={inquiry} />
+                    <ReportInquiry runId={run.id} report={r.node_id!} docArtifact={r.doc_artifact} access={inquiry}
+                                   disabled={inquiryOff} postSeal={asking}
+                                   onLocate={(seg) => locateIn(handles.current.get(r.node_id!), doc, seg)} />
+                  </>
                 ) : slot?.status === 'error' ? (
                   <p className="text-2xs" style={{ color: 'var(--st-failed)' }}>{T.docGone(labelOf(r.node_id) ?? r.node_id ?? '')}</p>
                 ) : <Skeleton rows={4} height={14} />}
@@ -211,6 +251,17 @@ const openKey = (row: AuditRow): string | undefined =>
 
 /** 已经收尾的运行：还在跑、停在审批上的，报告可能还没写，说「这次的报告没有逐段证据」太早 */
 const SETTLED = new Set(['succeeded', 'failed', 'cancelled'])
+
+/**
+ * 手里这份证据图能不能直接用：封存了，而且封存的就是运行现在这一版（失败后接着跑的运行会重新封存，manifest_seq 跟着变）。
+ * 运行记录上没有 manifest_seq（老运行）、老服务端的证据图没给时只看封没封存
+ */
+const sealedNow = (graph: EvidenceGraph | undefined, seq: number | null | undefined) =>
+  !!graph?.seal?.sealed && (seq == null || graph.seal.manifest_seq == null || graph.seal.manifest_seq === seq)
+
+/** 证据页挂上时手里那份（别处取的）要不要重取：正在取的取回来再看；取到了的不是封存的这一版就重取。没有、取失败的照常取 */
+const staleHeld = (held: { status: string; data?: EvidenceGraph } | undefined, seq: number | null | undefined) =>
+  held?.status === 'loading' || (held?.status === 'ok' && !sealedNow(held.data, seq))
 
 /**
  * 工作流现在的图能不能一键升级：拿它去校验，看有没有 evidence.upgrade_available 这条建议。老后端不给

@@ -97,6 +97,24 @@ def load(artifact_id: str) -> Any | None:
     return json.loads(text)
 
 
+def read_bytes(artifact_id: str, *, verify: bool = True) -> bytes | None:
+    """按 id 取回工件文件的原始字节。文件本身就是 put_json 写下的规范 JSON，字节原样，不解析、不重排。
+
+    可验证报告要把工件按原字节嵌进页面，让拿到文件的人自己重算哈希，所以不能像 load 那样解析了再交出去。
+    默认同样复验哈希、对不上就抛 ValueError（和 load 一样的承诺）；verify=False 只给要把字节原样交给别人
+    去核的调用方——被改过的工件照实交出去，核的那一方就会看到对不上。id 不对或者文件不在了返回 None。
+    """
+    if not artifact_id or not artifact_id.isalnum():
+        return None
+    path = _path_of(artifact_id)
+    if not path.exists():
+        return None
+    data = path.read_bytes()
+    if verify and content_hash(data) != artifact_id:
+        raise ValueError(f"工件 {artifact_id[:12]}… 内容与哈希不符，疑似被篡改")
+    return data
+
+
 def manifest_hash(rows: list[tuple[int, str, str | None, dict[str, Any]]]) -> str:
     """把一次运行的全部事件压成一个清单哈希。
 

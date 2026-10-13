@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -9,16 +10,22 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
+from app.api.coded import CodedHTTPException
 from app.core.errors import explain, not_configured, raw
 from app.core.config import settings as app_settings
 from app.core.crypto import encrypt, mask
 from app.db.base import get_session
 from app.db.models import Provider, Setting
-from app.engine.judge import JUDGE_DEFAULTS, SETTING_GROUP as JUDGE_GROUP, SPEND_KEY as JUDGE_SPEND
-from app.engine.judge import daily_spend, judge_settings
+from app.engine.judge import JUDGE_DEFAULTS, MAX_TOKENS as JUDGE_MAX_TOKENS
+from app.engine.judge import SETTING_GROUP as JUDGE_GROUP, SETTING_LABEL as JUDGE_LABEL, SPEND_KEY as JUDGE_SPEND
+from app.engine.judge import daily_spend, judge_model_spec, judge_settings
 from app.engine.judge import sanitize_settings as judge_values, settings_problem as judge_problem
+from app.engine.spend import SPEND_KEY as VERIFY_SPEND, daily_spend as verify_daily_spend
 from app.providers import catalog
-from app.providers.factory import ModelSpec, ProviderNotConfigured, _resolve_key, build_chat_model
+from app.providers.factory import (
+    ModelSpec, ProviderNotConfigured, _resolve_key, assistant_unavailable, build_chat_model,
+    list_providers as all_providers, model_note, named_provider,
+)
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -413,6 +420,216 @@ async def probe_provider_models(
 
 
 # --------------------------------------------------------------------------
+# 核查：双盲复算、反方审稿、审批质询共用的一组设置
+# --------------------------------------------------------------------------
+
+#: 设置里 verify 这一组。三项都是让一个只读 agent 查库核对（engine/verify_agent.py），共用核查模型和每日金额上限；
+#: 各自的开关和上限分开放。上限写 null 表示不限（和裁判一组的约定一样）
+VERIFY_GROUP = "verify"
+VERIFY_DEFAULTS: dict[str, Any] = {
+    "provider": None,             # 核查模型：空着沿用证据裁判模型的取值链（verify_model_spec）
+    "model": None,
+    # 双盲复算：tolerance 是允许的相对误差，两边的值差在这个比例以内算一致
+    "dual_check": {"enabled": True, "tolerance": 1e-6, "max_queries": 6, "timeout_s": 120},
+    # 反方审稿：max_claims 是每份报告最多挑几句关键结论来审，查询次数、时长按每句算
+    "challenge": {"enabled": True, "max_claims": 5, "max_queries": 4, "timeout_s": 90},
+    # 审批质询：查询次数、时长按每次提问算
+    "inquiry": {"enabled": True, "max_queries": 6, "timeout_s": 120},
+    "daily_max_usd": 2.0,         # 全局每日核查金额上限（按本地日期），和裁判的每日上限分开记账（engine/spend.py）
+}
+#: 三项各自那一组的键
+_VERIFY_PARTS = ("dual_check", "challenge", "inquiry")
+_VERIFY_COUNTS = frozenset({"max_queries", "max_claims"})
+
+#: 设置页「核查」一节各项的叫法：报错时写它，不写键名。嵌套的项写成「组.项」
+VERIFY_SETTING_LABEL = {
+    "provider": "核查模型 · 接入", "model": "核查模型 · 模型",
+    "daily_max_usd": "核查每日金额上限（美元）",
+    "dual_check": "双盲复算", "dual_check.enabled": "双盲复算 · 启用",
+    "dual_check.tolerance": "双盲复算 · 允许的相对误差", "dual_check.max_queries": "双盲复算 · 每项最多查询次数",
+    "dual_check.timeout_s": "双盲复算 · 每项时长上限（秒）",
+    "challenge": "反方审稿", "challenge.enabled": "反方审稿 · 启用",
+    "challenge.max_claims": "反方审稿 · 每份报告最多审几句", "challenge.max_queries": "反方审稿 · 每句最多查询次数",
+    "challenge.timeout_s": "反方审稿 · 每句时长上限（秒）",
+    "inquiry": "审批质询", "inquiry.enabled": "审批质询 · 启用",
+    "inquiry.max_queries": "审批质询 · 每次最多查询次数", "inquiry.timeout_s": "审批质询 · 每次时长上限（秒）",
+}
+
+
+def _positive(value: Any, *, whole: bool) -> bool:
+    """上限：null（不限），或大于 0 的有限数；whole 时还得是整数（次数、句数）。True / False 不算数。"""
+    if value is None:
+        return True
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return False
+    return not (whole and int(value) != value)
+
+
+def _tolerance_ok(value: Any) -> bool:
+    """允许的相对误差：不小于 0 的有限数（0 表示必须完全一致）。不能是 null：没有「不限」的说法。"""
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
+
+
+def _verify_item_ok(key: str, value: Any) -> bool:
+    if key == "enabled":
+        return isinstance(value, bool)
+    if key == "tolerance":
+        return _tolerance_ok(value)
+    return _positive(value, whole=key in _VERIFY_COUNTS)
+
+
+def _verify_item_problem(part: str, key: str, value: Any) -> str | None:
+    label = VERIFY_SETTING_LABEL[f"{part}.{key}"]
+    if _verify_item_ok(key, value):
+        return None
+    if key == "enabled":
+        return f"「{label}」需要选择开启或关闭，当前为「{value}」"
+    if key == "tolerance":
+        return f"「{label}」需要填写不小于 0 的数（例如 0.000001 表示百万分之一），当前为「{value}」"
+    words = "正整数（次数）" if key == "max_queries" else "正整数（句数）" if key == "max_claims" else "大于 0 的秒数"
+    return f"「{label}」需要填写{words}，留空表示不限，当前为「{value}」"
+
+
+def verify_problem(value: Any) -> str | None:
+    """设置页写进来的 verify 这一组有什么问题，没问题返回 None。说明写设置页上的叫法。"""
+    if not isinstance(value, dict):
+        return f"「核查」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key, item in value.items():
+        if key not in VERIFY_DEFAULTS:
+            return (f"「核查」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{VERIFY_SETTING_LABEL[k]}」" for k in VERIFY_DEFAULTS))
+        label = VERIFY_SETTING_LABEL[key]
+        if key in ("provider", "model"):
+            if item is not None and not isinstance(item, str):
+                # 「跟随证据裁判模型」是设置页接入下拉框空选项的原话
+                return f"「{label}」需要填写模型接入的名称或模型 ID，留空表示跟随证据裁判模型，当前为「{item}」"
+        elif key == "daily_max_usd":
+            if not _positive(item, whole=False):
+                return f"「{label}」需要填写大于 0 的金额（美元），留空表示不限，当前为「{item}」"
+        elif not isinstance(item, dict):
+            return f"「{label}」设置格式有误，需要是一个对象，当前为「{item}」"
+        else:
+            allowed = VERIFY_DEFAULTS[key]
+            for sub, sub_value in item.items():
+                if sub not in allowed:
+                    return (f"「{label}」设置中不支持「{sub}」，可设置的项："
+                            + "、".join(f"「{VERIFY_SETTING_LABEL[f'{key}.{k}']}」" for k in allowed))
+                if problem := _verify_item_problem(key, sub, sub_value):
+                    return problem
+    return None
+
+
+def verify_values(stored: Any) -> dict[str, Any]:
+    """库里存的 verify 一组 → 补齐默认的完整设置。存坏了的项（旧版本、手改）按默认，存了 null 的上限就是不限；
+    三项各自那一组逐项补，只存了一项的其余照默认。"""
+    stored = stored if isinstance(stored, dict) else {}
+    out: dict[str, Any] = {k: dict(v) if isinstance(v, dict) else v for k, v in VERIFY_DEFAULTS.items()}
+    for key in ("provider", "model"):
+        value = stored.get(key)
+        out[key] = value.strip() or None if isinstance(value, str) else None
+    if "daily_max_usd" in stored and _positive(stored["daily_max_usd"], whole=False):
+        out["daily_max_usd"] = stored["daily_max_usd"]
+    for part in _VERIFY_PARTS:
+        saved = stored.get(part)
+        if not isinstance(saved, dict):
+            continue
+        for key in VERIFY_DEFAULTS[part]:
+            if key in saved and _verify_item_ok(key, saved[key]):
+                out[part][key] = saved[key]
+    return out
+
+
+async def verify_settings(session: AsyncSession) -> dict[str, Any]:
+    """设置里的 verify 一组，没存过的键补默认（读法同 judge_settings）。节点、质询接口都从这里读。"""
+    row = await session.get(Setting, VERIFY_GROUP)
+    return verify_values(row.value if row else None)
+
+
+def _model_text(value: Any) -> str | None:
+    return value.strip() or None if isinstance(value, str) else None
+
+
+async def verify_model_spec(session: AsyncSession, node_config: dict[str, Any] | None = None, *,
+                            settings: dict[str, Any] | None = None) -> ModelSpec:
+    """核查用哪个模型：节点配置里的 provider / model > 设置里的核查模型 > 证据裁判模型的取值链（裁判设置 >
+    助手模型 > 默认接入，见 judge.judge_model_spec）。哪一级写了就整组用哪一级，不跨级拼接入和模型。
+
+    和裁判一样关掉 thinking：核查最后要按结构交结果（强制工具调用），和思考模式不兼容。额度也和裁判一样（judge.MAX_TOKENS，
+    16384）：经 OpenAI 兼容接入的推理模型收不到 thinking=off，思考算在额度里，4096 常常想完就没额度查库、交结果了；
+    服务方嫌大时核查 agent 退回 judge.FALLBACK_MAX_TOKENS（engine/verify_agent.py）。
+    建议和被核查的模型不同，否则等于自己核自己；比较、提醒由调用方做（它知道被核查的是哪个模型）。
+    """
+    node = node_config if isinstance(node_config, dict) else {}
+    provider, model = _model_text(node.get("provider")), _model_text(node.get("model"))
+    if not (provider or model):
+        chosen = settings if settings is not None else await verify_settings(session)
+        provider, model = _model_text(chosen.get("provider")), _model_text(chosen.get("model"))
+    if not (provider or model):
+        return await judge_model_spec(session, None)
+    return ModelSpec(provider=provider, model=model, max_tokens=JUDGE_MAX_TOKENS, thinking="off")
+
+
+# --------------------------------------------------------------------------
+# 通知：定时任务推送 Webhook 时拼运行链接用的对外访问地址
+# --------------------------------------------------------------------------
+
+#: 设置里 notify 这一组。public_base_url 是别人打开 AgentLab 用的地址（https://agentlab.example.com），通知里的
+#: 运行链接 = 它 + /runs/{运行 id}。服务端不知道自己在反向代理后面叫什么，只能由人填；留空的通知里不附链接
+NOTIFY_GROUP = "notify"
+NOTIFY_DEFAULTS: dict[str, Any] = {"public_base_url": None}
+NOTIFY_SETTING_LABEL = {"public_base_url": "对外访问地址"}
+
+
+def _base_url_problem(value: Any) -> str | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    label = NOTIFY_SETTING_LABEL["public_base_url"]
+    hint = (f"「{label}」需要是 http:// 或 https:// 开头的完整地址（例如 https://agentlab.example.com），"
+            f"留空表示通知里不附运行链接，当前为「{value}」")
+    if not isinstance(value, str):
+        return hint
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:
+        return hint
+    if parts.scheme not in ("http", "https") or not parts.hostname or " " in value.strip():
+        return hint
+    if parts.query or parts.fragment:
+        return f"「{label}」不能带 ? 或 # 之后的部分，运行链接会接在地址后面，当前为「{value}」"
+    return None
+
+
+def notify_problem(value: Any) -> str | None:
+    """设置页写进来的 notify 这一组有什么问题，没问题返回 None。"""
+    if not isinstance(value, dict):
+        return f"「通知」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key, item in value.items():
+        if key not in NOTIFY_DEFAULTS:
+            return (f"「通知」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{NOTIFY_SETTING_LABEL[k]}」" for k in NOTIFY_DEFAULTS))
+        if problem := _base_url_problem(item):
+            return problem
+    return None
+
+
+def notify_values(stored: Any) -> dict[str, Any]:
+    """库里存的（或刚写进来的）notify 一组 → 补齐默认、规范化：去掉首尾空白和末尾的 /，空串当没填；存坏了的按没填。"""
+    stored = stored if isinstance(stored, dict) else {}
+    url = stored.get("public_base_url")
+    if not isinstance(url, str) or not url.strip() or _base_url_problem(url):
+        return {"public_base_url": None}
+    return {"public_base_url": url.strip().rstrip("/")}
+
+
+async def notify_settings(session: AsyncSession) -> dict[str, Any]:
+    """设置里的 notify 一组，没存过的补默认。定时任务推送 Webhook 时从这里读。"""
+    row = await session.get(Setting, NOTIFY_GROUP)
+    return notify_values(row.value if row else None)
+
+
+# --------------------------------------------------------------------------
 # 用户设置
 # --------------------------------------------------------------------------
 
@@ -440,6 +657,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 结论句裁判（engine/judge.py）：证据裁判模型和各项上限，上限存 null 表示不限。不放进 limits：
     # 那一组是环境变量定的、只读，这一组是用户自己定的
     JUDGE_GROUP: dict(JUDGE_DEFAULTS),
+    # 核查（双盲复算、反方审稿、审批质询）：核查模型、三项的开关和上限、每日金额上限。和裁判一组一样由用户定
+    VERIFY_GROUP: verify_values(None),
+    # 通知：定时任务的 Webhook 里拼运行链接用的对外访问地址
+    NOTIFY_GROUP: notify_values(None),
 }
 
 
@@ -488,11 +709,14 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     # limits 是服务端配置（环境变量），只读：库里可能存着旧版设置页写进去的一份
     #（见过 max_agent_steps: 25），它从来不生效，却会盖住真实的上限，界面照着错的数许诺
     stored.pop("limits", None)
-    # 裁判的每日计数是引擎记的账，不是用户设置：设置页整组回写时带着一份旧的，会把今天的花费清零
+    # 裁判、核查的每日计数是引擎记的账，不是用户设置：设置页整组回写时带着一份旧的，会把今天的花费清零
     stored.pop(JUDGE_SPEND, None)
+    stored.pop(VERIFY_SPEND, None)
     merged = {k: {**v, **(stored.get(k) or {})} for k, v in DEFAULT_SETTINGS.items()}
-    # 裁判设置按引擎实际生效的样子给：存坏了的项显示默认，存了 null 的上限显示不限
+    # 裁判、核查设置按引擎实际生效的样子给：存坏了的项显示默认，存了 null 的上限显示不限
     merged[JUDGE_GROUP] = judge_values(stored.get(JUDGE_GROUP))
+    merged[VERIFY_GROUP] = verify_values(stored.get(VERIFY_GROUP))
+    merged[NOTIFY_GROUP] = notify_values(stored.get(NOTIFY_GROUP))
     for key, value in stored.items():
         merged.setdefault(key, value)
     return merged
@@ -502,20 +726,90 @@ class SettingsIn(BaseModel):
     values: dict[str, Any]
 
 
+#: 点名的模型接入不存在或已停用时 PUT /api/settings 回 422 的机读码，field 是出错的那一项（verify.provider……）
+PROVIDER_INVALID = "settings_provider_invalid"
+
+
+def _provider_fields() -> dict[tuple[str, str], tuple[str, str | None]]:
+    """设置里点名模型接入的项：(组, 键) → (这一项在界面上的叫法, 同一组模型那一项的叫法)。门控、裁判、核查的叫法和
+    设置页一致；助手的模型由「编排」页助手栏的「助手使用的模型」单独设定（PUT /api/copilot/model），只有这一个下拉框
+    （模型那一项为 None），这里只防经设置接口写进去的那一份。"""
+    from app.api.copilot import COPILOT_SETTING_KEY   # 在这里导入：copilot 模块很大，设置模块被引擎各处导入
+    from app.providers.factory import ASSISTANT_MODEL_FIELD
+
+    return {
+        ("run", "tool_gate_provider"): ("门控模型 · 接入", "门控模型 · 模型"),
+        (JUDGE_GROUP, "provider"): (JUDGE_LABEL["provider"], JUDGE_LABEL["model"]),
+        (VERIFY_GROUP, "provider"): (VERIFY_SETTING_LABEL["provider"], VERIFY_SETTING_LABEL["model"]),
+        (COPILOT_SETTING_KEY, "provider"): (ASSISTANT_MODEL_FIELD, None),
+    }
+
+
+async def _provider_problem(session: AsyncSession, values: dict[str, Any]) -> tuple[str, str] | None:
+    """这次写进来的设置里点名的模型接入有没有问题：(字段, 说明)，没问题返回 None。说明和运行时报的原因、提示同一句
+    （factory.named_provider），主语写这一项在设置页上的叫法；下拉框里选的，写「指定的」。助手那一项只有「编排」页
+    助手栏一个下拉框（只选模型，选了就清掉接入），没有「换一个接入」的地方：说法同助手取不到模型时那一句
+    （factory.assistant_unavailable），哪里报都一样。
+
+    以前点名的接入不存在时运行悄悄换成演示模型，名字写错一个字就由演示模型写报告、做核查，现在运行时照实报错；保存时
+    先拦一道。留空照旧表示沿用上一级——说明里不再讲留空是什么意思：设置页那一格的空选项写着（「默认接入」「跟随助手
+    的模型」「跟随证据裁判模型」……），这里另写一遍只会对不上。只查这次改了的：存着的值没改（写好之后接入才被删、
+    停用）不挡这次保存别的项——设置页在那一项下标着「不存在」「已停用」，运行时照实报错，同设置页「只校验改过的」。
+    点名的名字恰好是某个启用接入的模型时，补一句在这一组的哪一栏用它（factory.model_note）。
+
+    名字不是字符串（接口写进来的数字一类）：核查、裁判两组自己的格式检查在前面先报；门控、助手两组没有自己的检查，
+    在这里报，免得存下去之后读它的地方（查助手当前用哪个模型）出错。"""
+    providers = None
+    for (group, key), (label, model_label) in _provider_fields().items():
+        sent = values.get(group)
+        if not isinstance(sent, dict):
+            continue
+        if (raw := sent.get(key)) is not None and not isinstance(raw, str):
+            return f"{group}.{key}", f"「{label}」需要填写模型接入的名称，当前为「{raw}」"
+        if (name := _model_text(raw)) is None:
+            continue
+        row = await session.get(Setting, group)
+        saved = row.value if row is not None and isinstance(row.value, dict) else {}
+        if _model_text(saved.get(key)) == name:
+            continue
+        if providers is None:
+            providers = await all_providers(session)
+        try:
+            named_provider(providers, name)
+        except ProviderNotConfigured as e:
+            if model_label is None:
+                return f"{group}.{key}", assistant_unavailable(e)
+            said = f"「{label}」指定的{e.reason}。{e.hint}"
+            if e.model_owner:
+                # 这几组的模型一栏是输入框：写「填写」
+                said += f"。{model_note(e.name, e.model_owner, f'「{model_label}」', f'「{label}」', '填写')}"
+            return f"{group}.{key}", said
+    return None
+
+
 @router.put("/settings")
 async def put_settings(
     payload: SettingsIn, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
     from app.tools.trust import SETTING_KEY as TRUST_KEY
 
+    # 先查后写：一组里有一项不对就整个请求不落库，免得存下半组
     if JUDGE_GROUP in payload.values and (problem := judge_problem(payload.values[JUDGE_GROUP])):
-        # 先查后写：一组里有一项不对就整个请求不落库，免得存下半组
         raise HTTPException(422, problem)
+    if VERIFY_GROUP in payload.values and (problem := verify_problem(payload.values[VERIFY_GROUP])):
+        raise HTTPException(422, problem)
+    if NOTIFY_GROUP in payload.values:
+        if problem := notify_problem(payload.values[NOTIFY_GROUP]):
+            raise HTTPException(422, problem)
+        # 存规范化之后的：末尾带 / 的地址拼链接会多出一个斜杠
+        payload.values[NOTIFY_GROUP] = notify_values(payload.values[NOTIFY_GROUP])
+    if found := await _provider_problem(session, payload.values):
+        raise CodedHTTPException(422, found[1], PROVIDER_INVALID, field=found[0])
     for key, value in payload.values.items():
-        if key in (TRUST_KEY, "limits", JUDGE_SPEND):
+        if key in (TRUST_KEY, "limits", JUDGE_SPEND, VERIFY_SPEND):
             # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，
             # 会把刚在工具页改的档位冲掉。limits 是环境变量定的，写进库也不生效。
-            # 裁判的每日计数是引擎记的账，只有裁判自己写
+            # 裁判、核查的每日计数是引擎记的账，只有引擎自己写
             continue
         row = await session.get(Setting, key)
         if row:
@@ -534,6 +828,15 @@ async def get_judge_spend(session: AsyncSession = Depends(get_session)) -> dict[
     这些调用估不出金额、没有算进 usd。daily_max_usd 为 null 表示不限。
     """
     return {**await daily_spend(), "daily_max_usd": (await judge_settings(session))["daily_max_usd"]}
+
+
+@router.get("/settings/verify/spend")
+async def get_verify_spend(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """今天（本地日期）核查（双盲复算、反方审稿、审批质询）花了多少，设置页放在核查的每日上限旁边。只读。
+
+    形状同 /settings/judge/spend：{date, usd, calls, unpriced_calls, daily_max_usd}，daily_max_usd 为 null 表示不限。
+    """
+    return {**await verify_daily_spend(), "daily_max_usd": (await verify_settings(session))["daily_max_usd"]}
 
 
 @router.get("/system")

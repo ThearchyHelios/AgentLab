@@ -35,7 +35,7 @@ from app.data import catalog as data_catalog
 from app.data import introspect, table_versions
 from app.data.sqlcheck import SqlChecker
 from app.data.engine import SnapshotTampered, masked_columns, query_timeout, run_query
-from app.data.guard import QueryLimits, SqlRejected, is_write
+from app.data.guard import QueryLimits, SqlRejected, check, is_write
 from app.data.tabular import UNSHAPED_NOTE
 from app.db.models import DataSource
 from app.tools.registry import ToolContext, Versions
@@ -53,10 +53,18 @@ RUN_VERSIONS_KEY = "data_versions"
 DATA_UNAVAILABLE = "查询失败（数据不可用）："
 #: 运行中途补固定一个源时发的那条日志事件的 code（_pin_late）
 LATE_PIN_CODE = "data_version_pinned"
+#: ToolContext.extra 里放「认出的遮罩值」的键（engine/masking 的 SeenValues：调用方交进来的，加上查询时遮掉的）：核查
+#: agent（engine/verify_agent.py）放进去，打开了遮罩开关的查询工具按它们按值遮，再把每次遮掉的值并进去。只在内存里给
+#: 调用方按值遮用，不进快照、不交给模型
+MASKED_VALUES_KEY = "masked_values"
 
 #: 每次查询之后基于数据目录的 SQL 检查最多等这么久。正常一条 SQL 几毫秒；等不到就放弃这一次检查，
 #: 查询结果照常交回——检查是附加的，不能拖慢查询
 SQL_CHECK_TIMEOUT_S = 2.0
+#: force_readonly 的工具拒掉写语句时交回的原因（接在「SQL 被拒绝：」后面）。不说「数据源是只读的」：源本身
+#: 可能是可写的，是这次调用只许读；也不提「另建一个可写的数据源」——核查用不着写
+FORCED_READONLY = ("这次查询只允许读取数据，这条语句会修改数据，不被允许。"
+                   "只能执行不改数据的 SELECT / WITH / SHOW / DESCRIBE / EXPLAIN")
 
 
 class _QueryArgs(BaseModel):
@@ -165,12 +173,13 @@ _FROZEN_SCHEMA_KEYS = ("schema", "synced_at", "truncated", "total", "import_mode
 CATALOG_SNAPSHOT_KEY = "catalog"
 
 
-def _query_description(source: Any) -> str:
+def _query_description(source: Any, *, readonly: bool | None = None) -> str:
+    """readonly 不给就按源本身；force_readonly 的工具传 True（源可写，这次调用也只许读）。"""
     tables = introspect.table_names(source)
     head = f"在数据源「{source.name}」上执行 SQL 查询。"
     if source.description:
         head += f"{source.description}。"
-    head += "只读。" if source.readonly else "可写（写操作需要人工审批）。"
+    head += "只读。" if (source.readonly if readonly is None else readonly) else "可写（写操作需要人工审批）。"
     if tables:
         listed = "、".join(tables[:25])
         more = f" 等 {len(tables)} 张表" if len(tables) > 25 else ""
@@ -194,13 +203,20 @@ def _query_description(source: Any) -> str:
 
 
 async def build_datasource_tools(
-    names: list[str], ctx: ToolContext, session: AsyncSession
+    names: list[str], ctx: ToolContext, session: AsyncSession, *, force_readonly: bool = False,
+    mask_results: bool = False,
 ) -> list[StructuredTool]:
     """按工具名反查数据源并构造工具。build_tools 的第四个来源。
 
     上传源先按 ctx.data_versions 解析成绑定快照的视图（见 _resolve），工具描述、表结构、
     查询都按那个版本来。固定的版本找不到时建一个同名的替身（_unavailable_tool），
     每次调用都说明原因，不拿当前版本顶上。
+
+    force_readonly：查询工具一律按只读守卫检查，可写源上的写语句也拒绝（见 _make_query_tool）。
+    核查（engine/verify_agent.py）建工具时传它：那一路没有审批关卡，绝不能写。
+
+    mask_results：查询结果交给模型、落进快照之前先遮（见 _make_query_tool）。核查建工具时也传它：模型看不到遮罩列的
+    值，就不会把它们写进回答、理由。缺省关着：Agent 节点、调用工具节点的查询照旧原样。
     """
     wanted: dict[str, list[str]] = {}
     for name in names:
@@ -230,7 +246,8 @@ async def build_datasource_tools(
         entries = await _catalog_of(row)
         for prefix in prefixes:
             if prefix == QUERY_PREFIX:
-                tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries))
+                tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries, force_readonly=force_readonly,
+                                              mask_results=mask_results))
             else:
                 tools.append(_make_schema_tool(source, fixed=fixed, catalog=entries))
     return tools
@@ -441,11 +458,20 @@ def _unavailable_tool(row: DataSource, prefix: str, reason: str) -> StructuredTo
 
 
 def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
-                     catalog: Mapping[str, data_catalog.CatalogEntry] | None = None) -> StructuredTool:
+                     catalog: Mapping[str, data_catalog.CatalogEntry] | None = None,
+                     force_readonly: bool = False, mask_results: bool = False) -> StructuredTool:
     """source 是手工源的 DataSource，或上传源绑定快照的 SourceView（字段同名）。
 
     fixed：上传源的版本是这次运行固定的（找不到时的说法不同）。
     catalog：建工具时读到的数据目录，随表结构快照冻结（_store_schema）。
+    force_readonly：不管源可不可写，一律按只读守卫检查，写语句交回 FORCED_READONLY、不执行。只靠守卫这一道：
+    连接池按源缓存、不分只读与否（engine.cache_key），可写源借不到连接层只读的连接——别为此另起一个只读池，
+    缓存键相同，会把这个源平时用的可写连接也换成只读的。
+    mask_results：数据源设了遮罩时，取自遮罩列的格子（按 SQL 认，改了名字的也算）在交给模型、落进快照之前就换成
+    「已遮罩」，见 engine/masking.py 的 mask_query_result；这一次遮掉的值并进 ctx.extra[MASKED_VALUES_KEY]（有的话）。
+    那里已经有的值（这个 agent 前面的查询遮掉的、调用方交进来的）这一次也按值换，数据源没设遮罩也一样：先查号码、
+    再查写着号码的备注或别的库，后一份同样遮好。按值换只换文字格，数值格照原样（存下的是证据）。查询失败时报错原话里
+    的值也换（masking.mask_error_text）。
     """
     # 数据源在 options.query_timeout_s 里配了就用它，否则取缺省。数据库按它停下语句，
     # 引擎按它告诉界面上限是多少（metadata["timeout_s"]）
@@ -463,7 +489,22 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
     async def _run(sql: str, limit: int | None = None) -> str:
         if gone := _vanished(source, fixed):
             return f"{DATA_UNAVAILABLE}{gone}"
+        if force_readonly and not source.readonly:
+            # 只读源由 run_query 自己按只读检查（原因照旧说「数据源是只读的」）；可写源在这里先按只读判一遍。
+            # 先过一遍和 run_query 相同的检查：多条语句、结构变更这类问题照原来的说法交回
+            try:
+                statement = check(sql, readonly=False, source_name=source.name, dialect=(source.kind or "").lower())
+            except SqlRejected as e:
+                return f"SQL 被拒绝：{e}"
+            if is_write(statement, dialect=(source.kind or "").lower()):
+                return f"SQL 被拒绝：{FORCED_READONLY}"
         limits = QueryLimits(timeout_seconds=seconds, **({"max_rows": int(limit)} if limit else {}))
+        mask = masked_columns(source.options)
+        # 此前认出的遮罩值合起来的另一份（agent 前面的查询遮掉的在前，调用方交进来的在后，见 masking.SeenValues）：线程里
+        # 读的时候这边不会再往里并。上万个值合一遍要几十毫秒，放进线程
+        sink = ctx.extra.get(MASKED_VALUES_KEY) if mask_results else None
+        known = await asyncio.to_thread(sink.pooled) if sink is not None else None
+        known = known if known is not None and known.strong else None
         try:
             result = await run_query(source, sql, limits=limits)
         except SqlRejected as e:
@@ -480,10 +521,33 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
 
             # 驱动的原话留着（"no such table: x" 正是模型改写 SQL 要的线索），
             # 类名和 SQLAlchemy 的包装前缀去掉：这一行也会原样出现在运行面板上
-            return f"查询失败：{first_line(e) or explain(e)[0]}"
+            said = first_line(e) or explain(e)[0]
+            if mask_results and (mask or known is not None):
+                from app.engine.masking import mask_error_text
+
+                # 数据库会把转换失败的值写进报错（invalid input syntax for type bigint: "139-0000-0001"）
+                said = mask_error_text(said, sql, known)
+            return f"查询失败：{said}"
 
         payload = result.to_payload()
         payload["source"] = source.name
+        # 查询时就整列遮掉的结果列；没开遮罩开关、数据源没设遮罩又没有可按值换的时为 None（快照和原来一字不差）。
+        # 别的列里按值换过的格子另记（masked_cells），没有就不记
+        masked_now: list[str] | None = None
+        masked_cells: list[list[int]] = []
+        masked_whole = False
+        if mask_results and (mask or known is not None):
+            from app.engine.masking import mask_query_result
+
+            # 按 SQL 认列、逐格比对是纯计算，放进线程（同 _sql_checks）
+            done = await asyncio.to_thread(mask_query_result, payload, mask, source.kind, known,
+                                           schema=source.schema_cache)
+            if mask or done.payload is not payload:
+                payload, masked_now, masked_cells = done.payload, done.columns, done.cells
+                masked_whole = done.whole
+            if sink is not None:
+                # 并进 agent 查到的那一份（不和调用方交进来的混在一起，上限收满了也不丢），也放进线程
+                await asyncio.to_thread(sink.add, done.secrets)
         # 对照数据目录检查这条 SQL（一对多关联后重复计算、存量跨期求和……）。结果交给模型（Agent 据此改写），
         # 也随查询快照存下：证据面板看得到，口径卡据此给指标标「存疑」、出具降档。没查出问题不加这个键，
         # 快照和以前一字不差
@@ -497,14 +561,27 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
         try:
             from app.core.artifact_store import put_json
 
-            # 只进快照、不进交给模型的结果的两样（模型看到多余的字段只会误会：以为数据被遮了，
+            # 只进快照、不进交给模型的结果的几样（模型看到多余的字段只会误会：以为数据被遮了，
             # 或者把一串十六进制抄进报告）：
-            # - 查询当时数据源设的遮罩列：数据源事后改名、删掉，证据面板仍按当时的遮；
+            # - 查询当时数据源设的遮罩列：数据源事后改名、删掉，证据面板仍按当时的遮。只记数据源设的列名——证据面板把
+            #   同源各份快照记的这一项并起来，从表的字段清单里去掉，混进结果列的别名会把同名的真实字段也去掉；
+            # - masked_at_query：开了遮罩开关时，查询时就整列遮掉的结果列（这几列的格子是「已遮罩」，不是数据源里的值，
+            #   改了名字的也在这里）。有这一项的快照，别的格子整格是「已遮罩」的是查询时按值换掉的；
+            # - masked_cells：别的列里查询时按值换过的文字格 [行, 列号]（整格换的、换掉一截的），格子引用指到它们时照实
+            #   说是遮罩。数值格不按值换，存下的数和数据库里的一样；
+            # - masked_whole：这条 SQL 的写法认不全，整份结果查询时都遮了（masked_at_query 是全部的列），格子引用指到它时
+            #   照实说写法认不全，不说成取自遮罩列；
             # - data_version：上传表格查的是哪个快照，事后据此认得出这个数出自哪一版数据。
             # 手工源、没设遮罩的，快照和原来一字不差
             extra: dict[str, Any] = {}
-            if mask := masked_columns(source.options):
+            if mask:
                 extra["mask_columns"] = mask
+            if masked_now is not None:
+                extra["masked_at_query"] = masked_now
+            if masked_cells:
+                extra["masked_cells"] = masked_cells
+            if masked_whole:
+                extra["masked_whole"] = True
             if version := getattr(source, "snapshot_id", None):
                 extra["data_version"] = version
             # 工件引用的 meta 记下源和 SQL 里用到的表：数据目录按它数每张表被运行查询过几次
@@ -520,12 +597,14 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
 
     return StructuredTool(
         name=f"{QUERY_PREFIX}{source.name}",
-        description=_query_description(source),
+        description=_query_description(source, readonly=True if force_readonly else None),
         args_schema=_QueryArgs,
         coroutine=_run,
         func=None,
-        # 同一个工具，危不危险看这一次的 SQL。审批关卡经 registry.call_is_dangerous 问它
-        metadata={"dangerous_if": lambda args: is_dangerous_call(source, str(args.get("sql") or "")),
+        # 同一个工具，危不危险看这一次的 SQL。审批关卡经 registry.call_is_dangerous 问它。
+        # force_readonly 的工具写不了，没有要人批的调用
+        metadata={"dangerous_if": (lambda args: False) if force_readonly
+                  else (lambda args: is_dangerous_call(source, str(args.get("sql") or ""))),
                   "timeout_s": seconds},
     )
 
@@ -578,6 +657,27 @@ async def _store_schema(source: Any, ctx: ToolContext, *,
         return None
 
 
+def _schema_tables(table: str | list[str] | None) -> list[str]:
+    """db_schema 的 table 参数 → 要看的表名。"user, roles"、["user","roles"]、整个写成一个字符串的 JSON 数组
+    '["user", "roles"]' 是同一个意思，模型三种都会写，为此拒绝一次调用纯属浪费一步。最后那种只按逗号拆就成了
+    「没有 ["user"」「没有 "roles"]」，两张表明明都在（2026-10 验收：盲算、反方审稿的核查 agent 因此白白多调了几轮
+    模型）。只认元素都是字符串的 JSON 数组，别的写法照旧按逗号拆。"""
+    wanted = [table] if isinstance(table, str) else list(table or [])
+    names: list[str] = []
+    for one in wanted:
+        text = str(one).strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list) and all(isinstance(t, str) for t in parsed):
+                names += parsed
+                continue
+        names.append(str(one))
+    return [t.strip() for one in names for t in one.split(",") if t.strip()]
+
+
 def _make_schema_tool(source: Any, *, fixed: bool = False,
                       catalog: Mapping[str, data_catalog.CatalogEntry] | None = None) -> StructuredTool:
     """source 同 _make_query_tool：上传源的表结构取绑定快照里冻结的那份。
@@ -589,10 +689,7 @@ def _make_schema_tool(source: Any, *, fixed: bool = False,
     async def _run(table: str | list[str] | None = None) -> str:
         if gone := _vanished(source, fixed):
             return f"{DATA_UNAVAILABLE}{gone}"
-        wanted = [table] if isinstance(table, str) else list(table or [])
-        # 逗号分隔也认："user, roles" 和 ["user","roles"] 是同一个意思，
-        # 而模型两种都会写。为此拒绝一次调用，纯属浪费一步
-        wanted = [t.strip() for one in wanted for t in str(one).split(",") if t.strip()]
+        wanted = _schema_tables(table)
         if wanted:
             return "\n\n".join(introspect.describe_table(source, t, catalog=notes) for t in wanted)
         tables = introspect.table_names(source)

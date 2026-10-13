@@ -14,6 +14,7 @@ from app.data.catalog_impact import catalog_drift, catalog_versions_for, recorde
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import publish_issues
+from app.engine.provider_refs import CODES as PROVIDER_CODES, load_issues, load_providers, quiet_unset_model
 from app.engine.schema import GraphSpec, NodeType, validate_graph
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
@@ -21,6 +22,14 @@ router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 _GONE = "工作流不存在，可能已被删除"
 _LEVELS = ("published", "governed")
 _BAD_LEVEL = "发布级别只能是「已发布」或「受管」"
+#: 剩下的挡住发布的只有模型接入的问题、人又要交给助手时的说明：换成哪个接入要人拿主意，助手处理不了。发布弹窗里
+#: 渲染成「助手：……」，说明里不再带冒号；可能是全图默认、也可能只写了模型而提供它的接入停用了，不说「节点」「点名」。
+#: 人刚点了「交给助手」，写「助手无法处理」，不写「无法交给助手处理」（读来像没交出去）
+PROVIDER_LEFT = ("剩余的问题是所用的模型接入不存在或已停用，助手无法处理。"
+                 "请在「设置 → 模型接入」中核对名称或启用相应的接入")
+#: 剩下的问题里有一条带着修复（provider_refs 按候选算得出来）才补这半句：一个候选都落不稳时那里什么都不给。弹窗里那一组
+#: 选项在每条问题下方，标题是「选择……改用的模型接入」；另起半句，不和前面的「或」连用
+PROVIDER_LEFT_FIX = "；也可在各条问题下方选择改用的模型接入"
 
 
 class WorkflowIn(BaseModel):
@@ -56,14 +65,28 @@ class WorkflowOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+async def _run_counts(session: AsyncSession, ids: list[str] | None = None) -> dict[str, int]:
+    """各工作流的运行次数 {工作流 id: 次数}，ids 为 None 时算全部。列表和单个工作流的接口都按它算：以前只有列表
+    计数，详情、保存、恢复的返回落在 WorkflowOut 的默认值 0 上，同一个工作流两处说的次数不一样。"""
+    stmt = select(Run.workflow_id, func.count(Run.id)).group_by(Run.workflow_id)
+    if ids is not None:
+        stmt = stmt.where(Run.workflow_id.in_(ids))
+    return dict((await session.execute(stmt)).all())
+
+
+async def _workflow_out(session: AsyncSession, workflow: Workflow) -> WorkflowOut:
+    """返回单个工作流的接口都走这里，run_count 和列表一致。"""
+    item = WorkflowOut.model_validate(workflow)
+    item.run_count = (await _run_counts(session, [workflow.id])).get(workflow.id, 0)
+    return item
+
+
 @router.get("", response_model=list[WorkflowOut])
 async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[WorkflowOut]:
     rows = list(
         (await session.execute(select(Workflow).order_by(Workflow.updated_at.desc()))).scalars()
     )
-    counts = dict(
-        (await session.execute(select(Run.workflow_id, func.count(Run.id)).group_by(Run.workflow_id))).all()
-    )
+    counts = await _run_counts(session)
     out: list[WorkflowOut] = []
     for row in rows:
         item = WorkflowOut.model_validate(row)
@@ -75,7 +98,7 @@ async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[W
 @router.post("", response_model=WorkflowOut, status_code=201)
 async def create_workflow(
     payload: WorkflowIn, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     workflow = Workflow(
         name=payload.name,
         description=payload.description,
@@ -90,23 +113,23 @@ async def create_workflow(
     )
     await session.commit()
     await session.refresh(workflow)
-    return workflow
+    return await _workflow_out(session, workflow)
 
 
 @router.get("/{workflow_id}", response_model=WorkflowOut)
 async def get_workflow(
     workflow_id: str, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
-    return workflow
+    return await _workflow_out(session, workflow)
 
 
 @router.patch("/{workflow_id}", response_model=WorkflowOut)
 async def update_workflow(
     workflow_id: str, payload: WorkflowPatch, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
@@ -137,7 +160,7 @@ async def update_workflow(
             workflow.status = "draft"
     await session.commit()
     await session.refresh(workflow)
-    return workflow
+    return await _workflow_out(session, workflow)
 
 
 @router.delete("/{workflow_id}", status_code=204)
@@ -163,7 +186,7 @@ async def delete_workflow(
 @router.post("/{workflow_id}/duplicate", response_model=WorkflowOut, status_code=201)
 async def duplicate_workflow(
     workflow_id: str, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     source = await session.get(Workflow, workflow_id)
     if not source:
         raise HTTPException(404, _GONE)
@@ -176,7 +199,7 @@ async def duplicate_workflow(
     session.add(copy)
     await session.commit()
     await session.refresh(copy)
-    return copy
+    return await _workflow_out(session, copy)
 
 
 class VersionOut(BaseModel):
@@ -258,7 +281,7 @@ async def get_version(
 @router.post("/{workflow_id}/versions/{version}/restore", response_model=WorkflowOut)
 async def restore_version(
     workflow_id: str, version: int, session: AsyncSession = Depends(get_session)
-) -> Workflow:
+) -> WorkflowOut:
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
@@ -289,7 +312,7 @@ async def restore_version(
         workflow.status = "draft"
     await session.commit()
     await session.refresh(workflow)
-    return workflow
+    return await _workflow_out(session, workflow)
 
 
 class PublishIn(BaseModel):
@@ -334,7 +357,8 @@ async def publish_workflow(
         return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
 
     checkers = await _sql_checkers(session, spec)
-    issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers)]
+    issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers,
+                                                     providers=await _providers(session, spec))]
     if any(i["level"] == "error" for i in issues):
         return {"ok": False, "level": payload.level, "version": version, "issues": issues}
 
@@ -421,6 +445,13 @@ async def _sql_checkers(session: AsyncSession, spec: GraphSpec) -> dict[str, Any
     return await load_checkers_by_name(session, graph_sources(spec.nodes))
 
 
+async def _providers(session: AsyncSession, spec: GraphSpec) -> list[Any]:
+    """模型接入表：节点点名的接入不存在或已停用、只写了模型而提供它的接入已停用时，发布、发布前检查、自动修复的复核
+    给 error、挡住发布，修复从启用的接入里列候选（engine/provider_refs.py、autofix 的 provider.*）。和 _sql_checkers
+    一样由接口这一层读好交给门禁，门禁本身不查库；三处传同一份。图里取模型的几处都没写接入和模型时不读库。"""
+    return await load_providers(session, spec)
+
+
 def _unreadable(level: str, e: Exception) -> dict[str, Any]:
     return {"level": level, "ok": False, "fixes": [], "issues": [
         {"level": "error", "node_id": None, "edge_id": None, "field": None, "code": None, "fix": None,
@@ -443,8 +474,8 @@ async def publish_check(
     except Exception as e:  # noqa: BLE001
         return _unreadable(payload.level, e)
     versions, cards = await _gate_context(session, spec)
-    return check(spec, level=payload.level, versions=versions, cards=cards,
-                 checkers=await _sql_checkers(session, spec))
+    return check(spec, level=payload.level, versions=versions, cards=cards, checkers=await _sql_checkers(session, spec),
+                 providers=await _providers(session, spec))
 
 
 @router.post("/{workflow_id}/autofix")
@@ -469,13 +500,20 @@ async def autofix(
             "remaining": bad["issues"], "fixes": [], "handoff": [], "assist": None, "ok": False}
     versions, cards = await _gate_context(session, spec)
     checkers = await _sql_checkers(session, spec)
+    providers = await _providers(session, spec)
     out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards,
-                      checkers=checkers)
+                      checkers=checkers, providers=providers)
     out["assist"] = None
     # 人在选项里选了「交给 Copilot」（handoff），和点「交给 Copilot」是一回事
     if payload.assist or out["handoff"]:
         if out["ok"]:
-            out["assist"] = {"ok": True, "summary": "修复后已没有阻止发布的错误，未再交给助手",
+            out["assist"] = {"ok": True, "summary": "修复后已没有阻止发布的错误，未再交给助手", "questions": []}
+            return out
+        left = [i for i in out["remaining"] if i["level"] == "error"]
+        if all(i.get("code") in PROVIDER_CODES for i in left):
+            # 剩下的只有点名接入的问题：换成哪个接入要人拿主意（助手的自查也不看接入表），不交给助手
+            fixable = any(i.get("fix") for i in left)
+            out["assist"] = {"ok": False, "summary": PROVIDER_LEFT + (PROVIDER_LEFT_FIX if fixable else ""),
                              "questions": []}
             return out
         from app.api.copilot import assist_publish_fix
@@ -488,8 +526,10 @@ async def autofix(
             out["changes"] += diff_changes(out["graph"], fixed, fix_id="assist", label="助手的修改")
             out["ops"] += helped["ops"]
             out["applied"].append("assist")
+            fixed_spec = GraphSpec.model_validate(fixed)
             after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards,
-                                checkers=await _sql_checkers(session, GraphSpec.model_validate(fixed)))
+                                checkers=await _sql_checkers(session, fixed_spec),
+                                providers=await _providers(session, fixed_spec))
             out.update(graph=fixed, remaining=after["remaining"], fixes=after["fixes"], ok=after["ok"])
         elif helped["reason"]:
             out["rejected"].append({"fix_id": "assist", "reason": helped["reason"]})
@@ -501,13 +541,19 @@ class ValidateIn(BaseModel):
 
 
 @router.post("/validate")
-async def validate(payload: ValidateIn) -> dict[str, Any]:
-    """画布上的实时校验。前端每次改动都会调它来标红。"""
+async def validate(payload: ValidateIn, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """画布上的实时校验。前端每次改动都会调它来标红。
+
+    点名的模型接入不存在或已停用（只写了模型、提供它的接入已停用也算）只给警告：探索运行仍可发起，执行到那个节点时
+    照实报错；发布时才挡住。这时同一节点上「没有指定模型，将使用接入「X」的默认模型」和它矛盾，不再列
+    （quiet_unset_model，发布一类在 governance._not_repeated 里同样处理）。"""
     try:
         spec = GraphSpec.model_validate(payload.graph)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
     result = validate_graph(spec)
+    found = await load_issues(session, spec, level="warning")
+    result.issues = [*quiet_unset_model(spec, result.issues, found), *found]
     return result.model_dump()
 
 

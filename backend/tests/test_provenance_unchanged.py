@@ -124,10 +124,12 @@ def sealed_of(name: str) -> api._Sealed:
                        schemas={k: dict(v) for k, v in s["schemas"].items()})
 
 
-class _StubMasks:
-    """金样生成时 `_Masks` 的替身：预填 memo（源名 → (遮罩列小写, 数据源还在)），不查库。"""
+class _StubMasks(api._Masks):
+    """金样生成时 `_Masks` 的替身：预填 memo（源名 → (遮罩列小写, 数据源还在)），不查库。别的（按工件记下的遮罩、
+    这次运行查到过的遮罩值）照 `_Masks` 的办法算。"""
 
-    def __init__(self, memo: dict[str, tuple[set[str], bool]]) -> None:
+    def __init__(self, memo: dict[str, tuple[set[str], bool]], sealed: Any = None) -> None:
+        super().__init__(sealed)
         self._memo = memo
 
     async def of(self, source: Any) -> tuple[set[str], bool]:
@@ -139,7 +141,7 @@ class _StubMasks:
 
 def stub_masks(monkeypatch, name: str) -> None:
     memo = {k: ({c.lower() for c in v}, True) for k, v in report(name)["masks"].items()}
-    monkeypatch.setattr(api, "_Masks", lambda: _StubMasks(memo))
+    monkeypatch.setattr(api, "_Masks", lambda sealed=None: _StubMasks(memo, sealed))
 
 
 def cell_segments(doc: dict[str, Any]) -> list[dict[str, Any]]:

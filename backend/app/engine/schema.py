@@ -9,6 +9,13 @@ from typing import Any, Iterable, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.engine.labels import TYPE_LABEL, field_label, judge_label, option_label, q, type_label  # noqa: F401
+# 双盲复算、反方审稿的叫法在 labels.py；校验、执行器和老的调用方照旧从这里取
+from app.engine.labels import (  # noqa: F401
+    CHALLENGE_LABEL,
+    CHALLENGE_ON_REFUTED_LABEL,
+    DUAL_CHECK_FIELD_LABEL,
+    DUAL_CHECK_ON_REJECT_LABEL,
+)
 
 
 class NodeType(StrEnum):
@@ -37,6 +44,9 @@ class NodeType(StrEnum):
     VALIDATE = "validate"  # 结构化校验 + 自动重试
     METRICS = "metrics"  # 口径卡：受控指标集，叙述层唯一合法的数字来源
     REPORT = "report"  # 报告撰写：模型只写引用标记，数字由系统从口径卡取出来渲染
+    # 下面两种目前只是占位（执行器原样放行），各自的工作包补上真正的逻辑
+    DUAL_CHECK = "dual_check"  # 双盲复算：另起一路独立算一遍，和原结果比对
+    CHALLENGE = "challenge"  # 反方审稿：专挑报告的毛病，提出反驳意见
 
 
 # 节点类型在画布上的叫法（TYPE_LABEL / type_label）从 labels.py 导入：报错和门禁文案用它，
@@ -422,6 +432,104 @@ def _check_report_sources(node: GraphNode, spec: GraphSpec, result: ValidationRe
                        node_id=node.id, field="metrics_from", code=code)
 
 
+#: 审核人没有采用原流程的结果（选了盲算，或者判断两边都不对）时：degrade 计入缺口、出具降档（默认）/ fail 判为失败。
+#: 各配置项和这两个取值的叫法（DUAL_CHECK_FIELD_LABEL、DUAL_CHECK_ON_REJECT_LABEL）在 labels.py
+DUAL_CHECK_ON_REJECT = ("degrade", "fail")
+
+
+def dual_check_card(spec: GraphSpec, node: GraphNode) -> tuple[str | None, str | None]:
+    """双盲复算要复算的口径卡：(节点 id, None) 或 (None, 为什么认不出)。写了「口径卡」（card）就是它，否则取上游唯一的
+    那张口径卡。校验和节点执行用的是这一个认法；写了的那个节点存不存在、是不是口径卡、在不在上游由调用方查。"""
+    card = node.config.get("card")
+    if card not in (None, ""):
+        return (card, None) if isinstance(card, str) else (None, f"「{DUAL_CHECK_FIELD_LABEL['card']}」需要选择一个口径卡节点")
+    upstream = _ancestors(spec, node.id)
+    cards = [n for n in spec.nodes if n.id in upstream and n.type == NodeType.METRICS]
+    if not cards:
+        return None, "「双盲复算」的上游没有口径卡：它复算的是口径卡上的指标，请把它接在口径卡之后"
+    if len(cards) > 1:
+        names = "、".join(f"「{n.title}」" for n in cards[:5])
+        return None, (f"「双盲复算」的上游有 {len(cards)} 张口径卡（{names}），"
+                      f"请在「{DUAL_CHECK_FIELD_LABEL['card']}」中选择要复算的那一张")
+    return cards[0].id, None
+
+
+def _check_dual_check(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
+    """双盲复算的配置：口径卡必须是它上游的口径卡；复算的指标、口径说明的键必须是那张卡上的指标 ID；开关、
+    误差、处置的取值；不能配失败重试。指标定义从别的工作流引用来的口径卡（caliber_from），画图时不知道有哪些指标，
+    不查指标 ID。"""
+    cfg = node.config
+    label = DUAL_CHECK_FIELD_LABEL
+
+    def add(message: str, field: str, code: str) -> None:
+        result.add(message, node_id=node.id, field=field, code=code)
+
+    switch = cfg.get("enabled")
+    # 用 is 比：0 == False、1 == True，用 in 比会放过去，执行时却按「跟随设置」走（执行器认的是 True / False 本身）
+    if not (switch is None or switch is True or switch is False):
+        add(f"「{label['enabled']}」只能选跟随设置、开启或关闭，当前为「{switch}」", "enabled",
+            "dual_check.option_invalid")
+    try:
+        retries = int(cfg.get("retries", 0) or 0)       # 和 compiler 取重试次数的写法一样
+    except (TypeError, ValueError):
+        retries = 0
+    if retries > 0:
+        # 失败都是确定的（审核人没采用原流程、口径卡配错）：重试时 @task 的调用序号往后走、对不上缓存，盲算整轮
+        # 再做一遍、再花一次钱，还要审核人再选一次
+        add(f"「双盲复算」节点不支持「{field_label('retries')}」：它的失败是确定的（审核人没有采用原流程的结果、"
+            "口径卡配置有误），重试只会把盲算再做一遍并再次请审核人选择。请把失败重试次数设为 0", "retries",
+            "dual_check.retries")
+    if cfg.get("on_reject") not in (None, "", *DUAL_CHECK_ON_REJECT):
+        allowed = "或".join(f"「{v}」" for v in DUAL_CHECK_ON_REJECT_LABEL.values())
+        add(f"「{label['on_reject']}」只能选{allowed}，当前为「{cfg.get('on_reject')}」", "on_reject",
+            "dual_check.option_invalid")
+    tolerance = cfg.get("tolerance")
+    if tolerance not in (None, "") and (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
+                                        or not math.isfinite(tolerance) or tolerance < 0):
+        add(f"「{label['tolerance']}」需要填写不小于 0 的数（例如 0.000001 表示百万分之一），留空表示按设置，"
+            f"当前为「{tolerance}」", "tolerance", "dual_check.option_invalid")
+
+    card_id, problem = dual_check_card(spec, node)
+    if problem:
+        add(problem, "card", "dual_check.card_invalid")
+        return
+    target = spec.node_map().get(card_id or "")
+    if target is None:
+        add(f"「{label['card']}」选择了「{card_id}」，但工作流中不存在这个节点", "card", "dual_check.card_invalid")
+        return
+    if target.type != NodeType.METRICS:
+        add(f"「{label['card']}」选择了「{target.title}」，它是「{type_label(target.type)}」节点，不是口径卡；"
+            "双盲复算只能复算口径卡上的指标", "card", "dual_check.card_invalid")
+        return
+    if target.id not in _ancestors(spec, node.id):
+        add(f"「{label['card']}」选择的口径卡「{target.title}」不在双盲复算的上游：复算时这张卡还没有计算。"
+            "请把口径卡连到双盲复算之前", "card", "dual_check.card_invalid")
+        return
+    if target.config.get("caliber_from") not in (None, "", {}):
+        known = None
+    else:
+        known = [str(d.get("id")) for d in target.config.get("metrics") or [] if isinstance(d, dict) and d.get("id")]
+    hint = ("，可选的指标 ID：" + "、".join(known[:12])) if known else ""
+
+    metrics = cfg.get("metrics")
+    if metrics not in (None, "", []):
+        if not isinstance(metrics, list) or not all(isinstance(m, str) and m.strip() for m in metrics):
+            add(f"「{label['metrics']}」需要填写口径卡上的指标 ID 列表，留空表示复算输入来自查询的全部指标", "metrics",
+                "dual_check.metrics_invalid")
+        elif known is not None and (unknown := [m for m in metrics if m not in known]):
+            add(f"「{label['metrics']}」中的「{'、'.join(unknown[:5])}」不是口径卡「{target.title}」上的指标 ID{hint}",
+                "metrics", "dual_check.metrics_invalid")
+    definitions = cfg.get("definitions")
+    if definitions not in (None, "", {}):
+        if not isinstance(definitions, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                        for k, v in definitions.items()):
+            add(f"「{label['definitions']}」需要写成「指标 ID → 口径说明」的对照，口径说明写成文字", "definitions",
+                "dual_check.definitions_invalid")
+        elif known is not None and (unknown := [k for k in definitions if k not in known]):
+            add(f"「{label['definitions']}」中的「{'、'.join(unknown[:5])}」不是口径卡「{target.title}」上的指标 ID{hint}",
+                "definitions", "dual_check.definitions_invalid")
+
+
 def _produces_query(node: GraphNode) -> bool:
     """这个节点的产出是一份存成快照的查询结果：调用数据库查询工具的「调用工具」节点，或另一个合并查询。"""
     if node.type == NodeType.MERGE:
@@ -497,6 +605,19 @@ CLAIMS_VALUES = (*REPORT_CLAIMS, CLAIMS_JUDGE)
 JUDGE_KEYS = ("provider", "model", "max_claims", "max_cost_usd", "timeout_s", "rewrite_once", "on_unsupported")
 #: 证据相矛盾时正式运行怎么判档：degrade 降档（默认）/ withhold 不予出具。探索运行只标注
 JUDGE_ON_UNSUPPORTED = ("degrade", "withhold")
+
+#: 「没有指定模型」那条提示的编号。节点（或全图默认）点名了接入、而那个接入本身不存在或已停用时，它和接入那条问题
+#: 互相矛盾（一条说照常执行、一条说会失败），接口层读了接入表以后按编号去掉它（provider_refs.quiet_unset_model）
+MODEL_UNSET = "model.unset"
+
+
+def _named_provider_of(spec: GraphSpec, node: GraphNode) -> str | None:
+    """节点执行时点名的接入名：节点上没写（None、空串）就取全图默认，同 NodeContext.cfg；只有空白、不是字符串的不算
+    点了名（同 provider_refs._name）。"""
+    value = node.config.get("provider")
+    if value in (None, ""):
+        value = spec.defaults.get("provider")
+    return value.strip() or None if isinstance(value, str) else None
 
 
 def claims_problem(value: Any) -> str | None:
@@ -610,6 +731,129 @@ def _check_report_from(node: GraphNode, report_from: Any, spec: GraphSpec,
                    node_id=node.id, field=field, code=code)
 
 
+# --------------------------------------------------------------------------
+# 反方审稿节点（engine/nodes/challenge.py）：审哪份报告、各项配置
+# --------------------------------------------------------------------------
+
+#: 结论被推翻时怎么办：degrade 计入出具缺口、出具降档（默认）/ flag 只标注 / fail 判节点失败、运行停止。
+#: 各项配置和这三个取值在界面上的叫法（CHALLENGE_LABEL、CHALLENGE_ON_REFUTED_LABEL）在 labels.py：报错写叫法，不写键名
+CHALLENGE_ON_REFUTED = ("degrade", "flag", "fail")
+
+
+def _challenge_field(key: str) -> str:
+    return f"「{type_label(NodeType.CHALLENGE)}」的「{CHALLENGE_LABEL[key]}」"
+
+
+def challenge_problems(config: dict[str, Any]) -> list[tuple[str, str]]:
+    """反方审稿各项配置有什么问题（要审的报告另见 challenge_report）：[(字段, 人话)]，没问题返回 []。
+    校验和节点执行时报的是同一句话。
+
+    三个上限留空（不写或写 null）就是沿用设置里「核查」一节的值，和「启用」留空一个意思。节点上没有「不限」的写法：
+    要放开上限去设置里改，免得一个节点悄悄把核查的花费放开了。
+    """
+    out: list[tuple[str, str]] = []
+    for key, words in (("max_claims", "每份报告最多反查的句数"), ("max_queries", "每句最多执行的查询次数")):
+        value = config.get(key)
+        if value not in (None, "") and not _positive(value, integer=True):
+            out.append((key, f"{_challenge_field(key)}需要填写正整数（{words}），留空表示沿用设置，当前为「{value}」"))
+    value = config.get("timeout_s")
+    if value not in (None, "") and not _positive(value):
+        out.append(("timeout_s", f"{_challenge_field('timeout_s')}需要填写大于 0 的秒数，留空表示沿用设置，"
+                                 f"当前为「{value}」"))
+    for key, what in (("provider", "模型接入的名称"), ("model", "模型 ID")):
+        value = config.get(key)
+        if value is not None and not isinstance(value, str):
+            out.append((key, f"{_challenge_field(key)}需要填写{what}，留空表示使用设置中的核查模型，当前为「{value}」"))
+    value = config.get("on_refuted")
+    if value not in (None, "") and value not in CHALLENGE_ON_REFUTED:
+        names = [f"「{CHALLENGE_ON_REFUTED_LABEL[v]}」" for v in CHALLENGE_ON_REFUTED]
+        out.append(("on_refuted", f"{_challenge_field('on_refuted')}只能选{'、'.join(names[:-1])}或{names[-1]}，"
+                                  f"当前为「{value}」"))
+    value = config.get("enabled")
+    if value is not None and not isinstance(value, bool):
+        out.append(("enabled", f"{_challenge_field('enabled')}只能是开启、关闭或跟随设置，当前为「{value}」"))
+    return out
+
+
+def challenge_report(spec: GraphSpec, node: GraphNode) -> tuple[str | None, str | None]:
+    """反方审稿审的是哪份报告：(报告撰写节点 id, None)；定不下来时 (None, 为什么)。校验、执行器、审批卡都按它认。
+
+    写了「要审的报告」就按写的，必须是它上游的报告撰写节点。没写就从上游找：直接连着的报告撰写节点只有一个，
+    就是它（「初稿 → 终稿 → 反方审稿」审终稿）；否则整个上游里只有一个报告撰写节点才取它。两份以上说不准审哪一份，
+    宁可让人选，也不能悄悄审错一份。
+    """
+    who, label = f"「{type_label(NodeType.CHALLENGE)}」", CHALLENGE_LABEL["report"]
+    nodes = spec.node_map()
+    upstream = _ancestors(spec, node.id)
+    chosen = node.config.get("report")
+    if chosen in (None, ""):
+        direct = list(dict.fromkeys(e.source for e in spec.incoming(node.id)
+                                    if (n := nodes.get(e.source)) is not None and n.type == NodeType.REPORT))
+        if len(direct) == 1:
+            return direct[0], None
+        found = [n for n in spec.nodes if n.id in upstream and n.type == NodeType.REPORT]
+        if len(found) == 1:
+            return found[0].id, None
+        if not found:
+            return None, (f"{who}的上游没有「报告撰写」节点：反方审稿只审报告撰写节点写出的报告。"
+                          f"请把它接在报告撰写节点之后，或在「{label}」中选择一个")
+        names = "、".join(f"「{n.title}」" for n in found[:5]) + ("等" if len(found) > 5 else "")
+        return None, f"{who}的上游有多个「报告撰写」节点（{names}），请在「{label}」中选择要审的那一份"
+    if not isinstance(chosen, str):
+        return None, f"{who}的「{label}」需要选择一个「报告撰写」节点，当前为「{chosen}」"
+    target = nodes.get(chosen)
+    if target is None:
+        return None, f"{who}的「{label}」选择了「{chosen}」，但工作流中不存在这个节点"
+    if target.type != NodeType.REPORT:
+        return None, (f"{who}的「{label}」选择了「{target.title}」，它是「{type_label(target.type)}」节点，"
+                      "不是「报告撰写」节点：反方审稿只审报告撰写节点写出的报告")
+    if chosen not in upstream:
+        return None, (f"{who}的「{label}」选择的「{target.title}」不在它的上游：审稿时这份报告还没有写出。"
+                      "请把报告撰写节点连到反方审稿之前")
+    return chosen, None
+
+
+def _check_challenge(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
+    """反方审稿的配置写错了挡住运行：执行时节点照样会报这一句，与其取数、写完报告才死在审稿这一步，不如在画图时说破。
+    反方模型和要审的报告的写作模型写成同一个的给警告：等于自己审自己。
+
+    两种「看着配了、其实不生效」的接法也在这里说破：
+    - 「报错并停止运行」配「出错时：记录错误并继续」：节点报的错被当成普通错误跳过，被推翻的结论照常完整出具，比默认的
+      降档还松，挡住运行。不放进 challenge_problems：执行时再报一遍的错照样会被这个设置吞掉，执行时改按降档处置
+    - 「出具降档」靠成果节点的出具契约收上游的出具缺口（nodes/io.py 只认成果节点的上游）：反方审稿接在侧枝上、或者在
+      成果之后，降档不会发生，给警告。图里没有带出具契约的成果节点时无所谓出具，不提醒
+    """
+    who = f"「{type_label(NodeType.CHALLENGE)}」"
+    for field, message in challenge_problems(node.config):
+        result.add(message, node_id=node.id, field=field, code="challenge.config_invalid")
+    on_refuted = node.config.get("on_refuted") or "degrade"
+    if on_refuted == "fail" and node.config.get("on_error") == "continue":
+        result.add(f"{_challenge_field('on_refuted')}选了「{CHALLENGE_ON_REFUTED_LABEL['fail']}」，"
+                   f"「{field_label('on_error')}」却是「{option_label('on_error', 'continue')}」：结论被推翻时节点报的错"
+                   "会被当作普通错误跳过，被推翻的结论照常完整出具。"
+                   f"请把「{CHALLENGE_LABEL['on_refuted']}」改为「{CHALLENGE_ON_REFUTED_LABEL['degrade']}」，"
+                   f"或把「{field_label('on_error')}」改回「中断整个运行」",
+                   node_id=node.id, field="on_refuted", code="challenge.config_invalid")
+    if on_refuted == "degrade":
+        issued = [n for n in spec.nodes if n.type == NodeType.OUTPUT and n.config.get("contract")]
+        if issued and not any(node.id in _ancestors(spec, n.id) for n in issued):
+            report_kind, output_kind = type_label(NodeType.REPORT), type_label(NodeType.OUTPUT)
+            result.add(f"{who}不在带出具契约的「{output_kind}」节点上游：结论被推翻时，「{output_kind}」节点收不到它记下的"
+                       f"出具缺口，出具不会降档。请改为「{report_kind} → {type_label(NodeType.CHALLENGE)} → {output_kind}」"
+                       f"的接法；只需记录的，把「{CHALLENGE_LABEL['on_refuted']}」改为「{CHALLENGE_ON_REFUTED_LABEL['flag']}」",
+                       level="warning", node_id=node.id, code="challenge.no_issuance")
+    report, problem = challenge_report(spec, node)
+    if report is None:
+        result.add(problem or f"{who}找不到要审的报告", node_id=node.id, field="report", code="challenge.report_invalid")
+        return
+    writer = spec.node_map()[report]
+    model = node.config.get("model")
+    if isinstance(model, str) and model and model == (writer.config.get("model") or spec.defaults.get("model")):
+        result.add(f"反方模型与报告「{writer.title}」的写作模型相同（「{model}」），等于自己审自己，难以发现写作模型自身"
+                   f"的错误。请在「{CHALLENGE_LABEL['model']}」中选择另一个模型", level="warning", node_id=node.id,
+                   field="model", code="challenge.same_model")
+
+
 def validate_graph(spec: GraphSpec) -> ValidationResult:
     """编译前的静态检查。错误会挡住运行，警告只在画布上提示。"""
     result = ValidationResult()
@@ -671,11 +915,15 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                 if not d.get("id") or not d.get("expression"):
                     result.add(f"指标定义缺少 ID 或表达式：{d.get('id') or '（空）'}",
                                node_id=node.id, field=f"metrics[{i}]")
+        elif node.type == NodeType.DUAL_CHECK:
+            _check_dual_check(node, spec, result)
         elif node.type == NodeType.REPORT:
             _check_report_sources(node, spec, result)
             _check_report_claims(node, spec, result)
         elif node.type == NodeType.MERGE:
             _check_merge(node, spec, result)
+        elif node.type == NodeType.CHALLENGE:
+            _check_challenge(node, spec, result)
         elif node.type == NodeType.OUTPUT:
             contract = cfg.get("contract")
             if contract and not isinstance(contract, dict):
@@ -694,11 +942,15 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
 
         if node.type in (NodeType.LLM, NodeType.AGENT, NodeType.SUPERVISOR, NodeType.REPORT):
             if not (cfg.get("model") or spec.defaults.get("model")):
+                # 点名了接入就用那个接入的默认模型，照实说是哪个：检查器、问题面板里只写「默认模型」，人会以为是第一个
+                # 可用的接入。那个接入本身不存在或已停用时，接口层去掉这一条，只留接入的问题（MODEL_UNSET）
+                named = _named_provider_of(spec, node)
                 result.add(
-                    "没有指定模型，将使用默认模型",
+                    f"没有指定模型，将使用接入「{named}」的默认模型" if named else "没有指定模型，将使用默认模型",
                     level="warning",
                     node_id=node.id,
                     field="model",
+                    code=MODEL_UNSET,
                 )
 
     # 表达式：用运行时同一个 parse_expression 先解析一遍。以前写错了只有跑到那一步

@@ -350,7 +350,7 @@ async def test_the_judge_model_follows_node_then_settings(client, monkeypatch):
     row = await finish(weekly(claims="judge"))
     await judge(client, row.id, [unit_ids(doc_of(row))[CAUSAL]])
     [spec] = models.specs
-    assert spec.model == "judge-from-settings" and spec.thinking == "off" and spec.max_tokens == 4096
+    assert spec.model == "judge-from-settings" and spec.thinking == "off" and spec.max_tokens == 16384
 
     row = await finish(weekly(claims="judge", judge={"model": "judge-from-node"}))
     body = (await judge(client, row.id, [unit_ids(doc_of(row))[CAUSAL]])).json()

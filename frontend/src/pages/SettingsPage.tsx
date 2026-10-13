@@ -5,7 +5,7 @@ import {
   AlertTriangle, Check, Cpu, Download, KeyRound, Monitor, Moon, Plug, Plus, Settings as SettingsIcon, Sun, X,
 } from 'lucide-react'
 import clsx from 'clsx'
-import { api } from '../api/client'
+import { ApiError, api } from '../api/client'
 import type { ProviderDraft } from '../api/client'
 import { modelOptions, providerOfModel, useCatalog, useOnReconnect } from '../store/catalog'
 import {
@@ -13,7 +13,7 @@ import {
   promptDialog, SectionBar, Skeleton, Spinner, TabPanel, Tabs, toast, useRadioGroup, useTabRoute,
 } from '../components/ui'
 import { setThemePref, useTheme } from '../components/CommandPalette'
-import { humanizeError } from '../lib/errors'
+import { errorMessage } from '../lib/errors'
 import { formatNumber, shortLabel } from '../lib/format'
 import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } from '../lib/health'
 import type { HealthRecord } from '../lib/health'
@@ -22,8 +22,13 @@ import type { Provider } from '../types'
 import { normalizeTheme } from '../lib/theme'
 import { useLeaveGuard } from '../lib/leave'
 import { localActor, setLocalActor } from '../lib/actor'
-import { AGENT_GUARD_TEXT, JUDGE_SETTING_TEXT, TOOL_GATE_TEXT, judgeByModelText, judgeUnlimitedText } from '../lib/terms'
+import {
+  AGENT_GUARD_TEXT, JUDGE_SETTING_TEXT, PROVIDER_REF_TEXT, TOOL_GATE_TEXT, VERIFY_SETTING_TEXT, judgeByModelText, judgeUnlimitedText,
+} from '../lib/terms'
 import type { ThemePref } from '../lib/theme'
+import {
+  ProviderOptions, VerifySection, verifyChanged, verifyDraftOf, verifyErrors, verifyLabels, verifyPayload, type VerifyDraft,
+} from './VerifySettings'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
 // 数据源搬去了顶级的「数据」页（/data），/settings/datasources 跳过去
@@ -181,7 +186,7 @@ function ProviderCard({ provider: p, kindLabel, onEdit, onRemove }: {
         <span className="text-sm font-medium">{p.name}</span>
         <span className="chip">{kindLabel}</span>
         {p.default_model && <span className="chip mono" title="默认模型">{p.default_model}</span>}
-        {!p.enabled && <span className="chip" title="停用的接入不会出现在模型下拉里">已停用</span>}
+        {!p.enabled && <span className="chip" title={PROVIDER_REF_TEXT.disabledChip}>已停用</span>}
         <span className="flex-1" />
         <HealthPill record={record} checkingSince={checkingSince} />
         <div className="flex items-center gap-1">
@@ -570,10 +575,18 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
           />
         </div>
 
-        <label className="flex items-center gap-2 text-xs">
-          <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
-          启用<span className="text-2xs text-faint">停用后，该接入的模型不会出现在节点的模型下拉列表中</span>
-        </label>
+        <div>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={form.enabled} aria-describedby="provider-enabled-hint"
+                   onChange={(e) => set({ enabled: e.target.checked })} />
+            启用
+          </label>
+          {/* 停用的后果另起一行写在复选框下面，不放进 label：放在里面时它和「启用」是并排的两个 flex 项，长说明会把「启用」
+              挤成上下两个字，读屏也把整句连着当成复选框的名字念 */}
+          <p id="provider-enabled-hint" className="mt-0.5 pl-5 text-2xs leading-snug text-faint" data-provider-enabled-hint="">
+            {PROVIDER_REF_TEXT.enabledHint}
+          </p>
+        </div>
 
         {blocked && <p className="text-2xs text-faint">还缺：{missing.join('、')}</p>}
 
@@ -615,9 +628,14 @@ function PrefsTab() {
     jClaims: string | null; jCost: string | null; jTimeout: string | null; jClick: string | null; jDaily: string | null
   } | null>(null)
   const [spend, setSpend] = useState<{ usd?: number; calls?: number; unpriced_calls?: number } | null>(null)
+  // 核查一组（双盲复算、反方审稿、审批质询）的草稿另放一份，和上面的共用保存条；verifySaves 是存过几次，今日核查花费跟着再取
+  const [verifyDraft, setVerifyDraft] = useState<VerifyDraft | null>(null)
+  const [verifySaves, setVerifySaves] = useState(0)
   const [saving, setSaving] = useState(false)
   const [savedFlash, setSavedFlash] = useState(0)
   const [saveError, setSaveError] = useState<unknown>(null)
+  // 服务端按项拒收（点名的模型接入不存在、已停用：422 带 field）：整句落到那一格下面，焦点移过去
+  const [fieldError, setFieldError] = useState<{ field: string; message: string } | null>(null)
 
   // 今天裁判花了多少：只读，放在每日上限旁边。老后端没有这个接口就不显示
   const loadSpend = () => api.settings.judgeSpend().then(setSpend, () => setSpend(null))
@@ -686,9 +704,14 @@ function PrefsTab() {
     jClick: judgeError('jClick'), jDaily: judgeError('jDaily'),
   }
   const judgeInvalid = Object.values(judgeErrors).some(Boolean)
-  const invalid = guardInvalid || judgeInvalid
+  const verifySaved = verifyDraftOf(values?.verify)
+  const verifyCur = verifyDraft ?? verifySaved
+  const verifyKeys = verifyChanged(verifyCur, verifySaved)
+  const verifyErrs = verifyErrors(verifyCur, verifySaved)
+  const verifyInvalid = Object.values(verifyErrs).some(Boolean)
+  const invalid = guardInvalid || judgeInvalid || verifyInvalid
   const changed = (Object.keys(saved) as (keyof typeof saved)[]).filter((k) => cur[k] !== saved[k])
-  const dirty = values ? changed.length : 0
+  const dirty = values ? changed.length + verifyKeys.length : 0
   // 外壳唯一的 blocker 在地址（pathname）变化时问：切标签、导航、⌘K、⌥ 数字、后退都算
   useLeaveGuard(dirty > 0, () => confirmLeave(dirty))
 
@@ -700,7 +723,13 @@ function PrefsTab() {
 
   const edit = (patch: Partial<typeof saved>) => {
     setSaveError(null)
+    setFieldError(null)
     setDraft({ ...cur, ...patch })
+  }
+  const editVerify = (patch: Partial<VerifyDraft>) => {
+    setSaveError(null)
+    setFieldError(null)
+    setVerifyDraft({ ...verifyCur, ...patch })
   }
 
   /**
@@ -711,6 +740,7 @@ function PrefsTab() {
     if (!values || !dirty || invalid) return
     setSaving(true)
     setSaveError(null)
+    setFieldError(null)
     const actor = cur.actor.trim()
     if (actor !== savedActor.current) {
       // 写不进去（隐私模式）时署名只在这一次会话里有效；setLocalActor 会通知导航底部的首字
@@ -730,7 +760,9 @@ function PrefsTab() {
         click_max_cost_usd: parseLimit(cur.jClick),
         daily_max_usd: parseLimit(cur.jDaily),
       } : null
-      if (runChanged || judge) {
+      // 核查一组同样整组写（VerifySettings 的 verifyPayload）
+      const verify = verifyKeys.length ? verifyPayload(verifyCur) : null
+      if (runChanged || judge || verify) {
         const run = {
           ...(values.run ?? {}),
           default_memory_scope: cur.scope,
@@ -742,21 +774,33 @@ function PrefsTab() {
           agent_budget_tokens: cur.budgetTokens.trim() === '' ? null : Number(cur.budgetTokens),
           agent_budget_usd: cur.budgetUsd.trim() === '' ? null : Number(cur.budgetUsd),
         }
-        const out = await api.settings.put({ ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}) })
+        const out = await api.settings.put({ ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}), ...(verify ? { verify } : {}) })
         setValues((v) => ({
           ...(v ?? {}),
           ...(runChanged ? { run: out?.run ?? run } : {}),
           ...(judge ? { judge: out?.judge ?? judge } : {}),
+          ...(verify ? { verify: out?.verify ?? verify } : {}),
         }))
         // 每日上限改了：旁边那句「今天已花」的分母跟着变，顺手再取一次
         if (judge) void loadSpend()
+        if (verify) setVerifySaves((n) => n + 1)
       }
       setDraft(null)
+      setVerifyDraft(null)
       setSavedFlash(Date.now())
     } catch (e) {
       // 署名已经存上了：留在草稿里的只剩运行默认值，条上的计数跟着变少
       setDraft({ ...cur, actor })
       setSaveError(e)
+      const at = e instanceof ApiError && e.field ? PROVIDER_FIELD_IDS[e.field] : undefined
+      if (at) {
+        setFieldError({ field: (e as ApiError).field!, message: (e as ApiError).message })
+        requestAnimationFrame(() => {
+          const el = document.getElementById(at)
+          el?.scrollIntoView({ block: 'center' })
+          el?.focus()
+        })
+      }
     } finally {
       setSaving(false)
     }
@@ -765,16 +809,36 @@ function PrefsTab() {
   const scopeOptions = [...new Set(['default', ...scopes.map((s) => s.scope), cur.scope])]
   const collectionNames = collections.map((c) => c.collection)
   const collectionMissing = !collectionNames.includes(cur.collection)
+  /**
+   * 接入那一格下面的报错：服务端按这一项拒收的话照它的整句；否则存着（或选着）的接入不存在、已停用时说清这一项会怎样。
+   * 只在接入表取到了时判「不存在」：表还没取回来，什么都找不到。labels 是这一组接入、模型两栏的叫法：名字恰好是某个
+   * 启用接入的模型时（多半是把模型名填进了接入一栏）补一句怎么用它，同服务端保存时那句，免得照「启用」去启用那条旧接入
+   */
+  const providerError = (field: string, name: string, found: Provider | undefined, broken: string,
+    labels: { provider: string; model: string }): string | undefined => {
+    if (fieldError?.field === field) return fieldError.message
+    if (!name || !providers.length) return undefined
+    if (found?.enabled) return undefined
+    const state = found ? PROVIDER_REF_TEXT.disabled(name) : PROVIDER_REF_TEXT.missing(name)
+    const owner = providerOfModel(providers, name)
+    const note = owner?.enabled ? `。${PROVIDER_REF_TEXT.modelNote(name, owner.provider.name, labels.model, labels.provider)}` : ''
+    return `${state}：${broken}${note}`
+  }
   // 门控模型留空时后端的挑法（resolve_provider）：第一个启用的真实接入，没有就第一个启用的
   const enabledProviders = providers.filter((p) => p.enabled)
   const defaultProvider = enabledProviders.find((p) => p.kind !== 'mock') ?? enabledProviders[0]
   const gateProvider = cur.gateProvider ? providers.find((p) => p.name === cur.gateProvider) : defaultProvider
   const gateProviderMissing = !!cur.gateProvider && providers.length > 0 && !gateProvider
+  // 点名的接入不存在、已停用都调不了（停用的以前照常调用，现在运行时照实报错）：两种都在这一格下面说
+  const gateProviderError = providerError('run.tool_gate_provider', cur.gateProvider, gateProvider, PROVIDER_REF_TEXT.gateBroken,
+    TOOL_GATE_TEXT)
   const gateModels = (gateProvider?.models ?? []).map((m) => m.id)
   // 裁判模型的接入：接入和模型都留空时后端依次用 Copilot 的模型、默认接入（judge_model_spec）。只填了模型时
   // 这一级写了就整组用这一级，按模型名找接入（resolve_provider）——不再跟随 Copilot，留空那一项不能还叫「跟随 Copilot」
   const judgeProvider = cur.judgeProvider ? providers.find((p) => p.name === cur.judgeProvider) : undefined
   const judgeProviderMissing = !!cur.judgeProvider && providers.length > 0 && !judgeProvider
+  const judgeProviderError = providerError('judge.provider', cur.judgeProvider, judgeProvider, PROVIDER_REF_TEXT.judgeBroken,
+    JUDGE_SETTING_TEXT)
   const judgeModelName = cur.judgeModel.trim()
   const judgeByModel = !cur.judgeProvider && !!judgeModelName
   // 裁判模型没有单独配置（接入、模型都留空）：后端依次用助手的模型、默认接入
@@ -877,22 +941,19 @@ function PrefsTab() {
               <div id="pref-gate-label" className="text-xs font-medium">{TOOL_GATE_TEXT.label}</div>
               <p id="pref-gate-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{TOOL_GATE_TEXT.hint}</p>
               <div className="grid grid-cols-2 gap-3">
-                <Field label={TOOL_GATE_TEXT.provider} htmlFor="pref-gate-provider"
-                       error={gateProviderMissing ? `模型接入「${cur.gateProvider}」不存在：门控模型无法调用，所有工具调用将转为人工审批` : undefined}>
+                <Field label={TOOL_GATE_TEXT.provider} htmlFor="pref-gate-provider" error={gateProviderError}>
                   {(p) => (
                     <select {...p} className="field" value={cur.gateProvider} onChange={(e) => pickGateProvider(e.target.value)}>
                       <option value="">
                         {TOOL_GATE_TEXT.providerDefault}{defaultProvider ? `（当前为 ${defaultProvider.name}）` : ''}
                       </option>
                       {gateProviderMissing && <option value={cur.gateProvider}>{cur.gateProvider}（不存在）</option>}
-                      {providers.map((pv) => (
-                        <option key={pv.id} value={pv.name}>{pv.name}{pv.enabled ? '' : '（已停用）'}</option>
-                      ))}
+                      <ProviderOptions providers={providers} current={cur.gateProvider} />
                     </select>
                   )}
                 </Field>
                 <Field label={TOOL_GATE_TEXT.model} htmlFor="pref-gate-model"
-                       hint={gateProvider?.default_model ? `留空则使用 ${gateProvider.default_model}` : undefined}>
+                       hint={gateProvider?.enabled && gateProvider.default_model ? `留空则使用 ${gateProvider.default_model}` : undefined}>
                   {(p) => (
                     <>
                       <input {...p} className="field mono text-xs" value={cur.gateModel} list="pref-gate-models"
@@ -958,8 +1019,7 @@ function PrefsTab() {
                   <p id="pref-judge-model-hint" className="mb-2 mt-0.5 text-2xs leading-relaxed text-faint">{JUDGE_SETTING_TEXT.differ}</p>
                 )}
                 <div className="grid grid-cols-2 gap-3">
-                  <Field label={JUDGE_SETTING_TEXT.provider} htmlFor="pref-judge-provider"
-                         error={judgeProviderMissing ? `模型接入「${cur.judgeProvider}」不存在：裁判调用将失败，所有结论句记为未裁判` : undefined}
+                  <Field label={JUDGE_SETTING_TEXT.provider} htmlFor="pref-judge-provider" error={judgeProviderError}
                          hint={judgeByModelHint ? (
                            <span data-judge-by-model={judgeOwner ? (judgeOwner.enabled ? 'found' : 'disabled') : 'default'}
                                  style={judgeOwner?.enabled ? undefined : { color: 'var(--st-waiting)' }}>{judgeByModelHint}</span>
@@ -968,14 +1028,12 @@ function PrefsTab() {
                       <select {...p} className="field" value={cur.judgeProvider} onChange={(e) => pickJudgeProvider(e.target.value)}>
                         <option value="">{judgeByModel ? JUDGE_SETTING_TEXT.providerFromModel : JUDGE_SETTING_TEXT.providerDefault}</option>
                         {judgeProviderMissing && <option value={cur.judgeProvider}>{cur.judgeProvider}（不存在）</option>}
-                        {providers.map((pv) => (
-                          <option key={pv.id} value={pv.name}>{pv.name}{pv.enabled ? '' : '（已停用）'}</option>
-                        ))}
+                        <ProviderOptions providers={providers} current={cur.judgeProvider} />
                       </select>
                     )}
                   </Field>
                   <Field label={JUDGE_SETTING_TEXT.model} htmlFor="pref-judge-model"
-                         hint={judgeProvider?.default_model ? `留空则使用 ${judgeProvider.default_model}` : undefined}>
+                         hint={judgeProvider?.enabled && judgeProvider.default_model ? `留空则使用 ${judgeProvider.default_model}` : undefined}>
                     {(p) => (
                       <>
                         <input {...p} className="field mono text-xs" value={cur.judgeModel} list="pref-judge-models"
@@ -1029,6 +1087,9 @@ function PrefsTab() {
               </div>
             </section>
           )}
+
+          {values.verify && <VerifySection cur={verifyCur} onEdit={editVerify} refresh={verifySaves}
+                                           errors={fieldError?.field === 'verify.provider' ? { ...verifyErrs, provider: fieldError.message } : verifyErrs} />}
         </>
       )}
 
@@ -1052,18 +1113,22 @@ function PrefsTab() {
                     judgeProvider: '裁判模型的接入', judgeModel: '裁判模型',
                     jClaims: '每份报告最多裁判句数', jCost: '每份报告的金额上限', jTimeout: '每份报告的时长上限',
                     jClick: '每次点击的金额上限', jDaily: '每日金额上限',
-                  })[k]).join('、')}
+                  })[k]).concat(verifyLabels(verifyKeys)).join('、')}
                 </span>
               </span>
               {saveError != null && (
-                <span className="text-2xs text-[var(--err)]" role="alert">保存失败：{humanizeError(saveError).title}</span>
+                <span className="text-2xs text-[var(--err)]" role="alert" data-prefs-save-error="">
+                  {/* 连同原因：服务端的说明常是两三句，只留标题会把「请在……中启用它」这类下一步截掉 */}
+                  保存失败：{errorMessage(saveError)}
+                </span>
               )}
               <span className="flex-1" />
               <button className="btn btn-sm btn-ghost" disabled={saving}
-                      onClick={() => { setDraft(null); setSaveError(null) }}>放弃</button>
+                      onClick={() => { setDraft(null); setVerifyDraft(null); setSaveError(null); setFieldError(null) }}>放弃</button>
               <button className="btn btn-sm btn-primary" disabled={saving || invalid}
                       title={guardInvalid ? '护栏设置中有无效值，请修正后再保存'
-                        : judgeInvalid ? '证据裁判的上限有无效值，请修正后再保存' : undefined}
+                        : judgeInvalid ? '证据裁判的上限有无效值，请修正后再保存'
+                        : verifyInvalid ? VERIFY_SETTING_TEXT.section.saveInvalid : undefined}
                       onClick={() => void save()}>
                 {saving ? <Spinner size={11} /> : <Check size={12} aria-hidden />} 保存设置
               </button>
@@ -1077,6 +1142,11 @@ function PrefsTab() {
       )}
     </div>
   )
+}
+
+/** 服务端按项拒收时（422 带 field）那一项在页面上是哪个控件：点名的模型接入的三格 */
+const PROVIDER_FIELD_IDS: Record<string, string> = {
+  'run.tool_gate_provider': 'pref-gate-provider', 'judge.provider': 'pref-judge-provider', 'verify.provider': 'pref-verify-provider',
 }
 
 /** 裁判那一组在草稿里的键：它们改了才写 judge 一组 */

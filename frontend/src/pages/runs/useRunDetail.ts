@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, api, streamRun } from '../../api/client'
 import { useCatalog, useOnReconnect } from '../../store/catalog'
+import { useInquiryRecorded } from '../../run/Inquiry'
 import { emptyTrace, finalizeTrace, foldEvent, type Trace } from '../../run/trace'
 import type { Approval, GraphSpec, Run, RunEvent } from '../../types'
 import { isLiveRun } from './model'
@@ -201,6 +202,16 @@ export function useRunDetail(runId: string, onChange: (run: Run) => void): RunDe
       flush()
     }
   }, [streaming, runId, flush, resync, refreshPending, refreshApprovals])
+
+  // 这一页里问的审批质询写进了运行记录（approval.inquiry）：停在审批上、已经结束的运行这里不接流，补拉一次事件，
+  // 时间线才出现「审批人质询」那一行。在接流的照常从流里收到
+  const inquired = useInquiryRecorded(runId)
+  const inquiredSeen = useRef(inquired)
+  useEffect(() => {
+    if (inquiredSeen.current === inquired) return
+    inquiredSeen.current = inquired
+    if (!streaming) void reload()
+  }, [inquired, streaming, reload])
 
   const follow = useCallback((next?: Run | null) => {
     if (next) adopt(next)

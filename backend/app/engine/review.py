@@ -93,6 +93,9 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     "report_catalog_trimmed": ("report_catalog_trimmed", DEGRADED),
     # 目录有省略时写了「没有查到」这类缺失断言、重写后仍在：报告照常产出并标注，这几句结论依据不足
     "report_absence_claim": ("report_absence_claim", DEGRADED),
+    # 报告直接引用了取自遮罩列的格子、重写后仍在（「违规处置」为标注）：照常产出并标注，另记一条缺口（有出具契约的
+    # 成果按缺口降档）
+    "report_masked_cell": ("report_masked_cell", DEGRADED),
     # 口径卡的指标集、报告文档没能落进工件库：答案照常，只是点不开证据
     "evidence_store_failed": ("evidence_store_failed", DEGRADED),
     # agent 的结构化字段：模型报的值和查询快照对不上（已按快照取值），或者出处核对不了
@@ -104,6 +107,9 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # 结论句裁判（claims: judge）：触顶、没跑成的句子记为未裁判，出具不能判完整——是缺口，要说明
     "judge_limit": ("judge_limit", DEGRADED),
     "judge_failed": ("judge_failed", DEGRADED),
+    # 裁判模型的输出到了上限被截断（推理模型的思考也算在额度里）：同 judge_failed 是缺口，记成它自己的 kind——说得清
+    # 是输出额度的问题，该换的是模型
+    "judge_truncated": ("judge_truncated", DEGRADED),
     # 证据不支持的句子交回写作者改过一次（和 report_repair 一样只记缺口）；改写稿冒出新问题没采用的，
     # 原稿里那几句仍是证据不支持
     "report_rewrite": ("report_rewrite", DEGRADED),
@@ -111,6 +117,26 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # 估不出裁判的金额、裁判和写作是同一个模型：配置上的提醒，答案本身没受影响
     "judge_unpriced": ("judge_unpriced", BENIGN),
     "judge_same_model": ("judge_same_model", BENIGN),
+    # 双盲复算、反方审稿的核查模型和被核查的模型相同：同 judge_same_model，只关乎独立性，结论本身没受影响
+    "dual_check_same_model": ("dual_check_same_model", BENIGN),
+    "challenge_same_model": ("challenge_same_model", BENIGN),
+    # 核查 agent（engine/verify_agent.py，双盲复算、反方审稿共用）估不出金额：同 judge_unpriced，配置上的提醒
+    "verify_unpriced": ("verify_unpriced", BENIGN),
+    # 核查没做完、没通过：盲算触顶、两路不一致、指标无法复算；反方审稿触顶、推翻了结论、有句子没能反查、只查了
+    # 部分数据源。答案照常交付（出具契约另按缺口降档），是缺口不是断裂，按各自的 kind 记，界面说得清是哪一种
+    "dual_check_limit": ("dual_check_limit", DEGRADED),
+    "dual_check_disagreed": ("dual_check_disagreed", DEGRADED),
+    "dual_check_unchecked": ("dual_check_unchecked", DEGRADED),
+    "challenge_limit": ("challenge_limit", DEGRADED),
+    "challenge_refuted": ("challenge_refuted", DEGRADED),
+    "challenge_unreviewed": ("challenge_unreviewed", DEGRADED),
+    "challenge_sources_lost": ("challenge_sources_lost", DEGRADED),
+    # 核查 agent 自己触顶、按已有结果收尾：多半和节点自己的 *_limit 说的是同一次触顶，照样是缺口，记成它自己的 kind，
+    # 不落成笼统的 warn——步数上限（max_steps）只有它说
+    "verify_limit": ("verify_limit", DEGRADED),
+    # 核查 agent 的输出到了上限被截断（推理模型的思考也算在额度里）：没交成结果，由节点按无法复算、未能反查记缺口。
+    # 同 verify_limit，是缺口不是断裂，记成它自己的 kind：说得清是输出额度的问题，换个模型就好
+    "verify_truncated": ("verify_truncated", DEGRADED),
 }
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。

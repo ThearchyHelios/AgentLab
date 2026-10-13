@@ -20,13 +20,17 @@ from app.api.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
 from app.api.copilot_context import DATASOURCE_BUDGET_CHARS as _DATASOURCE_BUDGET_CHARS  # noqa: F401
 from app.api.copilot_context import DETAIL_TABLE_LIMIT as _DETAIL_TABLE_LIMIT  # noqa: F401
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
-from app.core.errors import explain as explain_error, graph_error, not_configured, raw as raw_error
+from app.core.errors import explain as explain_error, graph_error, raw as raw_error
 from app.data.sqlcheck import CHECK_CODES
 from app.db.base import get_session
 from app.db.models import Workflow
 from app.engine.layout import CORRIDOR_MIN, MIN_ROW_GAP, NODE_W, _height, auto_layout
 from app.engine.schema import GraphSpec, NodeType, ValidationIssue, text_parse_issues, validate_graph
 from app.engine.state import message_text
+# 额度用完的认法、退回小额度的做法挪到了 providers/budget.py（核查、证据裁判也用），这里留着老名字；
+# _BUDGET_WORDS 另有 data/recipe_ai.py 的测试拿来比对
+from app.providers.budget import BUDGET_WORDS as _BUDGET_WORDS  # noqa: F401
+from app.providers.budget import BudgetFallback as _BudgetFallback, cut_off as _cut_off
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
 from app.tools.registry import all_specs
 
@@ -214,6 +218,18 @@ NODE_REFERENCE = """\
   写 2 只剩「2%」，0.004 这样的小比率还会显示不出来、报告引用不了。on_missing 默认 fail（缺输入整张卡失败）；写 null 则缺输入的指标记为空值，交给出具契约判档
   取 tool 节点查库的结果用 cell(nodes.取数节点id, 行, '列名')（行号从 0 数，列按列名）：cell() 直接认查询工具
   交回的结果，出处精确到快照里的那一格，不用再接 transform 解析。取 agent 的字段写 vars.<agent 的 assign_to>.字段
+- dual_check：双盲复算。正式出具前，口径卡上输入来自查询的指标另起一个看不到原 SQL 的只读 agent 独立写 SQL 再算一遍：
+  一致就放行；不一致时停下来，审批卡并排列出两边的 SQL、差异说明和两个值，由人逐个指标选采用原流程、采用盲算还是
+  两边都不对。选盲算或都不对的计入缺口、出具降档；两边只差一个方面（业务日期按哪一列、有效记录条件、去重）时，选择
+  会写进数据目录。**要正式出具的模板、口径卡上的指标来自查询（tool 节点查库，或 agent 查库并开了 cite_fields）时加**，
+  接在口径卡之后、report 之前（取数 → 口径卡 → dual_check → report → output）；只回答一个问题的问数据、指标都是
+  常量或运行输入的不必加。config: {card, metrics, definitions, provider, model, tolerance, on_reject, enabled}：
+  card 是要复算的口径卡节点 id（上游只有一张口径卡时不写）；metrics 是要复算的指标 id 列表（不写就是输入来自查询的
+  全部指标）；definitions 是 {指标 id: 口径说明}，写清业务定义（按哪个日期归属、排除哪些行、是否去重），盲算 agent
+  只看得到它和数据目录，所以要按业务写，不要抄原 SQL；provider / model 指定盲算模型（**默认不写**，取设置里的核查
+  模型；建议和取数的 agent 不同）；tolerance 是允许的相对误差（不写取设置）；on_reject：degrade（默认，计入缺口、
+  出具降档）/ fail（审核人没采用原流程的结果就判为失败）；enabled 不写跟随设置里的开关，true / false 强制开关。
+  不要给它配 retries：它的失败是确定的，重试只会把盲算再做一遍、再请审核人选一次（画布校验会报错）
 - report：报告撰写（带引用）。config: {instructions, system, metrics_from:[口径卡id], numbers, on_violation, max_repairs,
   claims, entities, assign_to}
   **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游的口径卡指标、查询结果
@@ -258,6 +274,18 @@ NODE_REFERENCE = """\
   写 null 表示不限，预算要用户定，拿不准就问；只有受管级别要这样，普通草稿里默认开的 judge 不写预算、不为预算问人）；契约用 report_from（受管级别不收 narrative），成果字段只取报告节点的正文；给口径卡
   供数的 agent 配 output_schema 和 cite_fields: true，code 节点喂口径卡的必须是真取数（evidence_role: "source"），
   否则把计算写进口径卡；llm、agent、协作团队写的文字不能绕过报告节点直接进出口，llm 也不能喂口径卡
+- challenge：反方审稿。报告写完后挑出几句关键结论（挂了依据的、带比较或因果的优先），每句派一个只读 agent 站在反方
+  自己写查询找反例，逐句判经受住、被削弱、被推翻或无法判断，理由引用它自己查到的数据；不改报告。
+  config: {report, max_claims, max_queries, timeout_s, provider, model, on_refuted, enabled}
+  **多个来源汇总成的分析报告、要正式出具的报告**加这个节点，串在 report 和 output 之间：report → challenge → output
+  （有审批时 report → challenge → human → output）。challenge 要在 output 上游：只从 report 拉出一条侧枝接 challenge、
+  output 不经过它时，降档不会发生。
+  report 写要审的报告节点 id（上游只有一个 report 时可以不写）；on_refuted 是结论被推翻时怎么办：degrade（默认，计入
+  出具缺口、出具降档）/ flag（只标注，不影响出具）/ fail（报错并停止运行，不要再配 on_error: continue）。max_claims
+  （每份报告最多审几句）、max_queries（每句最多查询次数）、timeout_s（每句时长上限，秒）、enabled（不写就跟随设置里
+  「核查」一节的开关）一般都不写，取设置里的默认；provider、model 指定反方模型，不写用设置里的核查模型（建议和写作
+  模型不同，同一个模型等于自己审自己）。challenge 后面直接接 human 时，审批卡自动附上这份报告的核对和审稿结果；
+  human 的 message 里引用 {{ nodes.报告节点id.text }}，审批人能直接读到正文。只回答一个问题、一次查询的不必加
 
 搭图规则（有数字结论时必须遵守）：
 1. 取数（tool 节点查库；或者 agent 查库并配 output_schema + cite_fields）→ 口径卡 → report → output
@@ -494,20 +522,31 @@ async def copilot_model_spec(
 
 @router.get("/model")
 async def get_copilot_model(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """当前 Copilot 会用哪个模型，以及是显式配的还是兜底来的。"""
+    """当前 Copilot 会用哪个模型，以及是显式配的还是兜底来的。
+
+    存的接入不存在、已停用（或者只存了模型名、提供它的接入已停用）时实际什么都用不了：effective_* 为空，
+    error 写明原因（和生成时报的同一句），能用时 error 为 None。panel_error 是同一件事写在助手栏「助手使用的模型」
+    那一格下面的说法：人就在这个下拉框旁边，去向写「上方」，不再把人指回这个下拉框本身。"""
     from app.db.models import Setting
-    from app.providers.factory import resolve_provider
+    from app.providers.factory import assistant_unavailable, resolve_provider
 
     row = await session.get(Setting, COPILOT_SETTING_KEY)
     saved = row.value if row else {}
     configured = bool(saved.get("provider") or saved.get("model"))
-    resolved = await resolve_provider(session, saved.get("provider"), saved.get("model"))
+    try:
+        resolved = await resolve_provider(session, saved.get("provider"), saved.get("model"))
+    except ProviderNotConfigured as e:
+        return {"configured": configured, "provider": saved.get("provider") or None,
+                "model": saved.get("model") or None, "effective_provider": None, "effective_model": None,
+                "error": _unconfigured(e), "panel_error": assistant_unavailable(e, here=True)}
     return {
         "configured": configured,
         "provider": saved.get("provider") or None,
         "model": saved.get("model") or None,
         "effective_provider": resolved.name if resolved else None,
         "effective_model": saved.get("model") or (resolved.default_model if resolved else None),
+        "error": None,
+        "panel_error": None,
     }
 
 
@@ -534,7 +573,10 @@ async def set_copilot_model(
 
 
 def _unconfigured(e: ProviderNotConfigured) -> str:
-    return f"助手使用的模型尚未配置完成：{not_configured(e, with_hint=False)}。请到「设置 → 模型接入」检查"
+    # 点名的接入不存在、已停用照实说是哪个、去哪里改，其余说「尚未配置完成」（表格导入、数据目录的 AI 起草同一句）
+    from app.providers.factory import assistant_unavailable
+
+    return assistant_unavailable(e)
 
 
 class GenerateOut(BaseModel):
@@ -1029,54 +1071,12 @@ class CopilotIncomplete(Exception):
         self.detail = detail
 
 
-def _cut_off(chunk: Any) -> str:
-    """这一块是不是在说「额度用完了」：OpenAI 系是 finish_reason=length，Anthropic 是 stop_reason=max_tokens。"""
-    meta = getattr(chunk, "response_metadata", None) or {}
-    reason = meta.get("finish_reason") or meta.get("stop_reason")
-    return str(reason) if reason in ("length", "max_tokens") else ""
-
-
 #: 流式改图的输出额度。会思考的模型（DeepSeek、Claude 的 adaptive thinking）思考也算在里面：
 #: 8192 时复杂的改图常常想完就没额度了，正文一个字没写（2026-09 部署实例上同类请求 5 轮坏了 4 轮）
 COPILOT_MAX_TOKENS = 32768
-#: 服务方不收大额度时退回这个（原来的默认值）
+#: 服务方不收大额度时退回这个（原来的默认值）。退回的做法（_BudgetFallback：只在还没吐出任何东西时重来，
+#: 之后的调用即自查修正轮都用小的）和截断的认法（_cut_off）在 providers/budget.py，核查、证据裁判也用它
 _FALLBACK_MAX_TOKENS = 8192
-#: 服务方嫌额度太大时报错里会出现的字样：超过模型的输出上限（DeepSeek chat 系只到 8K），
-#: 或者输入加额度超过上下文长度（本地 vLLM）
-_BUDGET_WORDS = ("max_tokens", "max_completion_tokens", "max_output_tokens", "maximum context length")
-
-
-def _budget_rejected(e: BaseException) -> bool:
-    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
-    return status in (400, 422) and any(w in str(e).lower() for w in _BUDGET_WORDS)
-
-
-class _BudgetFallback:
-    """先按大额度调；服务方一开口就嫌额度太大时按原来的额度重来，之后的调用（自查修正轮）都用小的。
-
-    只在还没吐出任何东西时重来：这类拒绝都发生在请求刚发出去的时候，重来不会重复输出。
-    """
-
-    def __init__(self, big: Any, small: Any) -> None:
-        self.model, self._small = big, small
-
-    @property
-    def max_tokens(self) -> Any:
-        return getattr(self.model, "max_tokens", None)
-
-    async def astream(self, messages: list[Any]):
-        started = False
-        try:
-            async for chunk in self.model.astream(messages):
-                started = True
-                yield chunk
-            return
-        except Exception as e:
-            if started or self.model is self._small or not _budget_rejected(e):
-                raise
-            self.model = self._small
-        async for chunk in self.model.astream(messages):
-            yield chunk
 
 
 async def _op_model(session: AsyncSession, payload: GenerateIn) -> tuple[Any, str]:

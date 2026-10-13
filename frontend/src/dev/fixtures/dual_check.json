@@ -1,0 +1,1766 @@
+{
+  "_note": "双盲复算的预览用例和 scripts/check-verify.mjs 共用的夹具。表名、数字都是虚构的通用示例，不来自任何真实数据。各处的 diff（差异说明）是服务端 explain_sql_diff 对同一对 SQL 的真实输出（方言 sqlite），catalog_preview 和 variants、peers 里的 catalog（采用哪一边会往数据目录里写什么）、catalog_blocked（目录里已有人工确认的业务日期时「销售额」的预告）、merges 里的 catalog 和 joint（几个指标落到同一项上时服务端算好的合并预告）是服务端写目录预告的真实输出，都由 backend/tests/test_dual_check_fixture.py 核对和重新生成，不要手改；merges 里的 written 是服务端按那几种选择真写一遍（record_choices）的结果，同一个测试核对，它要建临时数据源才算得出，不重新生成，报不一致时照报出的实际结果改。variants 是另几对 SQL 及其差异说明，检查脚本拿来换掉「销售额」那个指标，看不同的差异下卡上怎么说；peers 换掉「退款率」对不上的那个输入，和「销售额」落到数据目录的同一项上，merges 是检查脚本看的几种组合（notes 是那一组合发起审批时的目录，不写就是空目录）。card 里「销售额」盲算一边的 rationale_doc 是核查 agent 组装理由文档的真实输出（evidence.compose_doc，含一个没有出处的数字），「退款率」的几个输入没有这一项（同老工件）",
+  "approval": {
+    "id": "ap-dc-0001",
+    "run_id": "run-dc-0001",
+    "node_id": "dc",
+    "mode": "input",
+    "title": "双盲复算：2 个指标不一致",
+    "status": "pending",
+    "response": {},
+    "workflow_name": "门店周报",
+    "node_label": "复核周报口径",
+    "run_class": "formal",
+    "payload": {
+      "kind": "dual_check",
+      "node_id": "dc",
+      "title": "双盲复算：2 个指标不一致",
+      "card_artifact": "d0ab1e5c0ffee000d0ab1e5c0ffee000d0ab1e5c0ffee000d0ab1e5c0ffee000",
+      "summary": [
+        {
+          "metric_id": "gmv",
+          "name": "销售额",
+          "unit": "元",
+          "original_rendered": "45,678.5元",
+          "blind_rendered": "51,388.3元",
+          "delta_pct": 12.5,
+          "diff": [
+            "原流程按 paid_at 筛时间，盲算按 created_at"
+          ],
+          "fallback": false
+        },
+        {
+          "metric_id": "refund_rate",
+          "name": "退款率",
+          "unit": "",
+          "original_rendered": "2.35%",
+          "blind_rendered": "3.10%",
+          "delta_pct": 31.91,
+          "diff": [
+            "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文"
+          ],
+          "fallback": true
+        }
+      ]
+    }
+  },
+  "card": {
+    "model": "blind-model-x",
+    "same_model": false,
+    "metrics": [
+      {
+        "metric_id": "gmv",
+        "name": "销售额",
+        "unit": "元",
+        "decimals": 1,
+        "original": {
+          "value": 45678.5,
+          "rendered": "45,678.5元",
+          "inputs": [
+            {
+              "path": "vars.kpi.gmv",
+              "value": 45678.5,
+              "sql": "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'",
+              "source": "shop",
+              "alias": "Q1"
+            }
+          ]
+        },
+        "blind": {
+          "value": 51388.3,
+          "rendered": "51,388.3元",
+          "inputs": [
+            {
+              "path": "vars.kpi.gmv",
+              "value": 51388.3,
+              "sql": "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE created_at >= '2026-09-01'\n  AND created_at < '2026-09-08'",
+              "source": "shop",
+              "alias": "B1",
+              "rationale": "销售额按下单时间 created_at 归属到当周，本周全部订单金额之和是 51,388.3，比上周多 1200。",
+              "rationale_doc": {
+                "schema": "agentlab.report/1",
+                "entity_syntax": 2,
+                "provenance": 1,
+                "run_id": "run-dc-0001",
+                "node_id": "dc",
+                "markdown": "销售额按下单时间 created_at 归属到当周，本周全部订单金额之和是 51,388.3，比上周多 1200。",
+                "source": "销售额按下单时间 created_at 归属到当周，本周全部订单金额之和是 [[v:Q1.r0.gmv]]，比上周多 1200。[[see:Q1]]",
+                "catalog": {
+                  "Q1": {
+                    "alias": "Q1",
+                    "kind": "query",
+                    "eid": "ev:query:b615a51b194e1ba1",
+                    "locator": {},
+                    "node_id": "dc",
+                    "exec": 1,
+                    "artifact": "72a1a5e4698968eb90c3af92928aed35ea4e302a88607b7ead29022cb33bb867",
+                    "call_id": "blind-1",
+                    "tool": "db_query__shop",
+                    "source": "shop",
+                    "columns": [
+                      "gmv"
+                    ],
+                    "rows": 1,
+                    "truncated": false,
+                    "label": "db_query__shop · 1 行"
+                  }
+                },
+                "blocks": [
+                  {
+                    "type": "paragraph",
+                    "units": [
+                      {
+                        "id": "u0",
+                        "kind": "claim",
+                        "span": [
+                          0,
+                          57
+                        ],
+                        "cites": [
+                          "Q1"
+                        ],
+                        "see": [
+                          {
+                            "ref": "Q1",
+                            "role": "support",
+                            "alias": "Q1",
+                            "kind": "query",
+                            "status": "resolved",
+                            "eid": "ev:query:b615a51b194e1ba1",
+                            "locator": {}
+                          }
+                        ],
+                        "segments": [
+                          {
+                            "kind": "text",
+                            "text": "销售额按下单时间 created_at 归属到当周，本周全部订单金额之和是 ",
+                            "state": "neutral",
+                            "span": [
+                              0,
+                              38
+                            ],
+                            "id": "s0"
+                          },
+                          {
+                            "kind": "number",
+                            "text": "51,388.3",
+                            "ref": "v:Q1.r0.gmv",
+                            "cite": {
+                              "ref": "Q1.r0.gmv",
+                              "alias": "Q1",
+                              "locator": {
+                                "row": 0,
+                                "column": "gmv"
+                              },
+                              "eid": "ev:cell:5a48378137ed04ed",
+                              "kind": "cell",
+                              "role": "value",
+                              "status": "resolved",
+                              "value": 51388.3,
+                              "rendered": "51,388.3"
+                            },
+                            "state": "deterministic",
+                            "span": [
+                              38,
+                              46
+                            ],
+                            "id": "s1"
+                          },
+                          {
+                            "kind": "text",
+                            "text": "，比上周多 ",
+                            "span": [
+                              46,
+                              52
+                            ],
+                            "state": "neutral",
+                            "id": "s2"
+                          },
+                          {
+                            "kind": "number",
+                            "text": "1200",
+                            "span": [
+                              52,
+                              56
+                            ],
+                            "state": "none",
+                            "issue": "uncited_number",
+                            "id": "s3"
+                          },
+                          {
+                            "kind": "text",
+                            "text": "。",
+                            "span": [
+                              56,
+                              57
+                            ],
+                            "state": "neutral",
+                            "id": "s4"
+                          }
+                        ]
+                      }
+                    ],
+                    "id": "b0"
+                  }
+                ],
+                "stats": {
+                  "units": 1,
+                  "segments": 5,
+                  "claims": 1,
+                  "connective": 0,
+                  "headings": 0,
+                  "numbers": 2,
+                  "numbers_cited": 1,
+                  "values": 0,
+                  "uncited_numbers": 1,
+                  "unresolved": 0,
+                  "see": 1,
+                  "uncited_claims": 0,
+                  "violations": 1
+                },
+                "violations": [
+                  {
+                    "code": "uncited_number",
+                    "message": "数字「1200」没有出处：报告中直接写出了数字，系统无法核对",
+                    "for_model": "数字「1200」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+                    "span": [
+                      52,
+                      56
+                    ],
+                    "text": "1200",
+                    "context": "之和是 51,388.3，比上周多 1200。",
+                    "segment": "s3",
+                    "unit": "u0"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "diff": {
+          "equivalent": false,
+          "items": [
+            {
+              "aspect": "time",
+              "text": "原流程按 paid_at 筛时间，盲算按 created_at"
+            }
+          ],
+          "fallback": false,
+          "text_diff": [
+            "  WHERE",
+            "-   orders.paid_at >= '2026-09-01'",
+            "+   orders.created_at >= '2026-09-01'",
+            "-   AND orders.paid_at < '2026-09-08'",
+            "+   AND orders.created_at < '2026-09-08'"
+          ]
+        }
+      },
+      {
+        "metric_id": "refund_rate",
+        "name": "退款率",
+        "unit": "",
+        "decimals": 4,
+        "original": {
+          "value": 0.0235,
+          "rendered": "2.35%",
+          "inputs": [
+            {
+              "path": "vars.kpi.refunds",
+              "value": 47,
+              "sql": "SELECT COUNT(*) AS refunds\nFROM refunds r\nWHERE EXISTS (\n  SELECT 1 FROM orders o\n  WHERE o.id = r.order_id AND o.status <> 'test'\n)",
+              "source": "shop",
+              "alias": "Q2"
+            },
+            {
+              "path": "vars.kpi.orders",
+              "value": 2000,
+              "sql": "SELECT COUNT(*) AS orders FROM orders WHERE status <> 'test'",
+              "source": "shop",
+              "alias": "Q3"
+            }
+          ]
+        },
+        "blind": {
+          "value": 0.031,
+          "rendered": "3.10%",
+          "inputs": [
+            {
+              "path": "vars.kpi.refunds",
+              "value": 62,
+              "sql": "SELECT COUNT(*) AS refunds\nFROM refunds r\nWHERE r.order_id IN (SELECT id FROM orders)",
+              "source": "shop",
+              "alias": "B2",
+              "rationale": "退款笔数：订单表中能找到对应订单的退款记录数"
+            },
+            {
+              "path": "vars.kpi.orders",
+              "value": 2000,
+              "sql": "SELECT COUNT(*) AS orders FROM orders WHERE status <> 'test'",
+              "source": "shop",
+              "alias": "B3",
+              "rationale": "订单总数，不含测试订单"
+            }
+          ]
+        },
+        "diff": {
+          "equivalent": false,
+          "items": [
+            {
+              "aspect": "other",
+              "text": "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文"
+            }
+          ],
+          "fallback": true,
+          "text_diff": [
+            "  WHERE",
+            "-   EXISTS(",
+            "+   refunds.order_id IN (",
+            "      SELECT",
+            "-       1",
+            "+       \"orders@1\".id",
+            "-     WHERE",
+            "-       \"orders@1\".id = refunds.order_id",
+            "-       AND \"orders@1\".status <> 'test'"
+          ]
+        }
+      }
+    ]
+  },
+  "catalog_preview": {
+    "gmv": {
+      "a": {
+        "write": true,
+        "source": "shop",
+        "table": "orders",
+        "item": "business_date",
+        "value": {
+          "column": "paid_at"
+        }
+      },
+      "b": {
+        "write": true,
+        "source": "shop",
+        "table": "orders",
+        "item": "business_date",
+        "value": {
+          "column": "created_at"
+        }
+      }
+    },
+    "refund_rate": {
+      "a": {
+        "write": false,
+        "reason": "指标「退款率」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+      },
+      "b": {
+        "write": false,
+        "reason": "指标「退款率」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+      }
+    }
+  },
+  "graph": {
+    "nodes": [
+      {
+        "id": "start",
+        "type": "input",
+        "position": {
+          "x": 0,
+          "y": 120
+        },
+        "data": {
+          "label": "输入",
+          "config": {
+            "fields": [
+              {
+                "name": "week",
+                "required": true
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "fetch",
+        "type": "agent",
+        "position": {
+          "x": 280,
+          "y": 120
+        },
+        "data": {
+          "label": "取数",
+          "config": {
+            "prompt": "查询本周各门店的订单",
+            "tools": [
+              "db_query__shop"
+            ],
+            "assign_to": "kpi"
+          }
+        }
+      },
+      {
+        "id": "card",
+        "type": "metrics",
+        "position": {
+          "x": 560,
+          "y": 40
+        },
+        "data": {
+          "label": "周报口径卡",
+          "config": {
+            "caliber": "周报口径",
+            "caliber_version": "v1",
+            "metrics": [
+              {
+                "id": "gmv",
+                "name": "销售额",
+                "unit": "元",
+                "expression": "vars.kpi.gmv"
+              },
+              {
+                "id": "orders",
+                "name": "订单数",
+                "unit": "单",
+                "expression": "vars.kpi.orders"
+              },
+              {
+                "id": "aov",
+                "name": "客单价",
+                "unit": "元",
+                "expression": "vars.kpi.gmv / vars.kpi.orders"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "card2",
+        "type": "metrics",
+        "position": {
+          "x": 560,
+          "y": 260
+        },
+        "data": {
+          "label": "月报口径卡",
+          "config": {
+            "caliber": "月报口径",
+            "caliber_version": "v2",
+            "metrics": [
+              {
+                "id": "m_gmv",
+                "name": "月销售额",
+                "unit": "元",
+                "expression": "vars.kpi.gmv"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "dc",
+        "type": "dual_check",
+        "position": {
+          "x": 840,
+          "y": 40
+        },
+        "data": {
+          "label": "复核周报口径",
+          "config": {}
+        }
+      },
+      {
+        "id": "done",
+        "type": "output",
+        "position": {
+          "x": 1120,
+          "y": 40
+        },
+        "data": {
+          "label": "成果",
+          "config": {
+            "fields": [
+              {
+                "name": "结果",
+                "value": "{{ last_message }}"
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e1",
+        "source": "start",
+        "target": "fetch"
+      },
+      {
+        "id": "e2",
+        "source": "fetch",
+        "target": "card"
+      },
+      {
+        "id": "e3",
+        "source": "fetch",
+        "target": "card2"
+      },
+      {
+        "id": "e4",
+        "source": "card",
+        "target": "dc"
+      },
+      {
+        "id": "e5",
+        "source": "dc",
+        "target": "done"
+      }
+    ]
+  },
+  "providers": [
+    {
+      "id": "prov-a",
+      "name": "云端接入",
+      "kind": "anthropic",
+      "base_url": null,
+      "default_model": "model-a",
+      "models": [
+        {
+          "id": "model-a"
+        },
+        {
+          "id": "model-b"
+        }
+      ],
+      "enabled": true,
+      "extra": {}
+    },
+    {
+      "id": "prov-b",
+      "name": "备用接入",
+      "kind": "openai",
+      "base_url": null,
+      "default_model": "model-c",
+      "models": [
+        {
+          "id": "model-c"
+        }
+      ],
+      "enabled": false,
+      "extra": {}
+    }
+  ],
+  "verify": {
+    "provider": null,
+    "model": null,
+    "dual_check": {
+      "enabled": true,
+      "tolerance": 1e-06,
+      "max_queries": 6,
+      "timeout_s": 120
+    },
+    "challenge": {
+      "enabled": true,
+      "max_claims": 5,
+      "max_queries": 4,
+      "timeout_s": 90
+    },
+    "inquiry": {
+      "enabled": true,
+      "max_queries": 6,
+      "timeout_s": 120
+    },
+    "daily_max_usd": 2.0
+  },
+  "variants": {
+    "time_column": {
+      "sql": [
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE created_at >= '2026-09-01'\n  AND created_at < '2026-09-08'",
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "time",
+            "text": "原流程按 created_at 筛时间，盲算按 paid_at"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "  WHERE",
+          "-   orders.created_at >= '2026-09-01'",
+          "+   orders.paid_at >= '2026-09-01'",
+          "-   AND orders.created_at < '2026-09-08'",
+          "+   AND orders.paid_at < '2026-09-08'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "created_at"
+          }
+        },
+        "b": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "paid_at"
+          }
+        }
+      }
+    },
+    "time_one_side": {
+      "sql": [
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'",
+        "SELECT SUM(amount) AS gmv\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "time",
+            "text": "原流程按 paid_at 筛时间，盲算没有按时间筛选"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- WHERE",
+          "-   orders.paid_at >= '2026-09-01'",
+          "-   AND orders.paid_at < '2026-09-08'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」只有被采纳的原流程按时间筛选，盲算没有：审核人判断的是要不要限定时间，不是按哪一列归属，没有可记的业务日期，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」被采纳的盲算没有按时间筛选，没有可记的业务日期，不写入数据目录"
+        }
+      }
+    },
+    "filter_extra": {
+      "sql": [
+        "SELECT COUNT(*) AS orders\nFROM orders\nWHERE status <> 'test'",
+        "SELECT COUNT(*) AS orders\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "filter",
+            "text": "原流程排除了 status = 'test' 的行和 status 为空的行，盲算没有"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- WHERE",
+          "-   orders.status <> 'test'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "valid_filter",
+          "value": "status <> 'test'"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+        }
+      }
+    },
+    "filter_scope": {
+      "sql": [
+        "SELECT COUNT(*) AS orders\nFROM orders\nWHERE channel = 'web'",
+        "SELECT COUNT(*) AS orders\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "filter",
+            "text": "原流程只保留 channel = 'web' 的行，盲算没有这个条件"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- WHERE",
+          "-   orders.channel = 'web'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」多出的条件「channel = 'web'」不是在排除退款、作废、测试这类无效记录，可能是指标自己的筛选范围（例如只看某个地区、某个渠道），不是整张表的有效记录条件，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+        }
+      }
+    },
+    "two_filters": {
+      "sql": [
+        "SELECT COUNT(*) AS orders\nFROM orders\nWHERE channel = 'web'\n  AND status <> 'refunded'",
+        "SELECT COUNT(*) AS orders\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "filter",
+            "text": "原流程只保留 channel = 'web' 的行，盲算没有这个条件"
+          },
+          {
+            "aspect": "filter",
+            "text": "原流程排除了 status = 'refunded' 的行和 status 为空的行，盲算没有"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- WHERE",
+          "-   orders.channel = 'web'",
+          "-   AND orders.status <> 'refunded'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        }
+      }
+    },
+    "join": {
+      "sql": [
+        "SELECT COUNT(*) AS orders\nFROM orders o\nLEFT JOIN refunds r ON r.order_id = o.id",
+        "SELECT COUNT(*) AS orders\nFROM orders o\nJOIN refunds r ON r.order_id = o.id"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "join",
+            "text": "原流程用 LEFT JOIN 关联 refunds 表，盲算用 INNER JOIN"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "- FROM orders AS orders",
+          "- LEFT JOIN refunds AS refunds ON",
+          "+ FROM orders AS orders, refunds AS refunds",
+          "+ WHERE",
+          "-     orders.id = refunds.order_id",
+          "+   orders.id = refunds.order_id"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边差在关联，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边差在关联，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        }
+      }
+    },
+    "join_condition": {
+      "sql": [
+        "SELECT COUNT(*) AS lines\nFROM orders o\nLEFT JOIN refunds r ON r.order_id = o.id\n  AND r.amount > 0",
+        "SELECT COUNT(*) AS lines\nFROM orders o\nLEFT JOIN refunds r ON r.order_id = o.id"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "other",
+            "text": "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文"
+          }
+        ],
+        "fallback": true,
+        "text_diff": [
+          "  LEFT JOIN refunds AS refunds ON",
+          "-     AND refunds.amount > 0"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        }
+      }
+    },
+    "dedup": {
+      "sql": [
+        "SELECT COUNT(DISTINCT user_id) AS buyers\nFROM orders",
+        "SELECT COUNT(user_id) AS buyers\nFROM orders"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "aggregate",
+            "text": "原流程对 user_id 去重计数，盲算没去重"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "  SELECT",
+          "-   COUNT(DISTINCT orders.user_id)",
+          "+   COUNT(orders.user_id)"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "dedup",
+          "value": "对 user_id 计数时去重"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」被采纳的盲算没有去重：不去重是这个指标自己的算法，不是表的去重规则，不写入数据目录"
+        }
+      }
+    },
+    "fallback": {
+      "sql": [
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'",
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-09'"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "other",
+            "text": "两条 SQL 的写法不同，未能归纳成具体差异，请对照原文"
+          }
+        ],
+        "fallback": true,
+        "text_diff": [
+          "  WHERE",
+          "-   AND orders.paid_at < '2026-09-08'",
+          "+   AND orders.paid_at < '2026-09-09'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边的 SQL 不止差一个方面，或有未能归纳的差异，无法确定审核人认可的是哪一处，不写入数据目录"
+        }
+      }
+    },
+    "parse": {
+      "sql": [
+        "SELECT SUM(amount) AS gmv\nFROM orders",
+        "SELEC SUM(amount) AS gmv\nFROM orders WHERE"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "parse",
+            "text": "盲算：SQL 无法解析（第 1 行第 10 列附近），没有逐项比较"
+          }
+        ],
+        "fallback": false,
+        "text_diff": []
+      },
+      "catalog": {
+        "a": {
+          "write": false,
+          "reason": "指标「销售额」两边差在能否解析，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「销售额」两边差在能否解析，对不上数据目录里的业务日期、有效记录条件或去重规则，不写入数据目录"
+        }
+      }
+    }
+  },
+  "peers": {
+    "time": {
+      "sql": [
+        "SELECT COUNT(*) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id\nWHERE o.paid_at >= '2026-09-01'\n  AND o.paid_at < '2026-09-08'",
+        "SELECT COUNT(*) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id\nWHERE o.created_at >= '2026-09-01'\n  AND o.created_at < '2026-09-08'"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "time",
+            "text": "原流程按 paid_at 筛时间，盲算按 created_at"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "  WHERE",
+          "-   AND orders.paid_at >= '2026-09-01'",
+          "+   AND orders.created_at >= '2026-09-01'",
+          "-   AND orders.paid_at < '2026-09-08'",
+          "+   AND orders.created_at < '2026-09-08'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "paid_at"
+          }
+        },
+        "b": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "created_at"
+          }
+        }
+      }
+    },
+    "dedup": {
+      "sql": [
+        "SELECT COUNT(DISTINCT o.id) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id",
+        "SELECT COUNT(o.id) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "aggregate",
+            "text": "原流程对 orders.id 去重计数，盲算没去重"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "  SELECT",
+          "-   COUNT(DISTINCT orders.id)",
+          "+   COUNT(orders.id)"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "dedup",
+          "value": "对 id 计数时去重"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「退款率」被采纳的盲算没有去重：不去重是这个指标自己的算法，不是表的去重规则，不写入数据目录"
+        }
+      }
+    },
+    "filter": {
+      "sql": [
+        "SELECT COUNT(*) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id\nWHERE o.status <> 'cancelled'",
+        "SELECT COUNT(*) AS refunds\nFROM refunds r\nJOIN orders o ON o.id = r.order_id"
+      ],
+      "diff": {
+        "equivalent": false,
+        "items": [
+          {
+            "aspect": "filter",
+            "text": "原流程排除了 orders.status = 'cancelled' 的行和 orders.status 为空的行，盲算没有"
+          }
+        ],
+        "fallback": false,
+        "text_diff": [
+          "  WHERE",
+          "-   AND orders.status <> 'cancelled'"
+        ]
+      },
+      "catalog": {
+        "a": {
+          "write": true,
+          "source": "shop",
+          "table": "orders",
+          "item": "valid_filter",
+          "value": "status <> 'cancelled'"
+        },
+        "b": {
+          "write": false,
+          "reason": "指标「退款率」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+        }
+      }
+    }
+  },
+  "merges": {
+    "time_split": {
+      "gmv": null,
+      "refund_rate": "time",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "b"
+      },
+      "written": [],
+      "catalog": {
+        "gmv": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "paid_at"
+            }
+          },
+          "b": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "created_at"
+            }
+          }
+        },
+        "refund_rate": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "paid_at"
+            }
+          },
+          "b": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "created_at"
+            }
+          }
+        }
+      },
+      "joint": [
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": true,
+              "value": {
+                "column": "paid_at"
+              }
+            },
+            "refund_rate": {
+              "write": true,
+              "value": {
+                "column": "paid_at"
+              }
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "b"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「paid_at」；指标「退款率」采纳的是「created_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「paid_at」；指标「退款率」采纳的是「created_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "b"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「created_at」；指标「退款率」采纳的是「paid_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「created_at」；指标「退款率」采纳的是「paid_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "b"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "b"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": true,
+              "value": {
+                "column": "created_at"
+              }
+            },
+            "refund_rate": {
+              "write": true,
+              "value": {
+                "column": "created_at"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "time_same": {
+      "gmv": null,
+      "refund_rate": "time",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "a"
+      },
+      "written": [
+        {
+          "table": "orders",
+          "item": "business_date",
+          "value": {
+            "column": "paid_at"
+          }
+        }
+      ],
+      "catalog": {
+        "gmv": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "paid_at"
+            }
+          },
+          "b": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "created_at"
+            }
+          }
+        },
+        "refund_rate": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "paid_at"
+            }
+          },
+          "b": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "created_at"
+            }
+          }
+        }
+      },
+      "joint": [
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": true,
+              "value": {
+                "column": "paid_at"
+              }
+            },
+            "refund_rate": {
+              "write": true,
+              "value": {
+                "column": "paid_at"
+              }
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "b"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「paid_at」；指标「退款率」采纳的是「created_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「paid_at」；指标「退款率」采纳的是「created_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "b"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「created_at」；指标「退款率」采纳的是「paid_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「created_at」；指标「退款率」采纳的是「paid_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "b"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "b"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": true,
+              "value": {
+                "column": "created_at"
+              }
+            },
+            "refund_rate": {
+              "write": true,
+              "value": {
+                "column": "created_at"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "dedup_columns": {
+      "gmv": "dedup",
+      "refund_rate": "dedup",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "a"
+      },
+      "written": [],
+      "catalog": {
+        "gmv": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "dedup",
+            "value": "对 user_id 计数时去重"
+          },
+          "b": {
+            "write": false,
+            "reason": "指标「销售额」被采纳的盲算没有去重：不去重是这个指标自己的算法，不是表的去重规则，不写入数据目录"
+          }
+        },
+        "refund_rate": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "dedup",
+            "value": "对 id 计数时去重"
+          },
+          "b": {
+            "write": false,
+            "reason": "指标「退款率」被采纳的盲算没有去重：不去重是这个指标自己的算法，不是表的去重规则，不写入数据目录"
+          }
+        }
+      },
+      "joint": [
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "dedup",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的去重规则给出了不同的说法（指标「销售额」采纳的是「对 user_id 计数时去重」；指标「退款率」采纳的是「对 id 计数时去重」），无法确定哪一个是数据事实，都未写入数据目录"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的去重规则给出了不同的说法（指标「销售额」采纳的是「对 user_id 计数时去重」；指标「退款率」采纳的是「对 id 计数时去重」），无法确定哪一个是数据事实，都未写入数据目录"
+            }
+          }
+        }
+      ]
+    },
+    "filters": {
+      "gmv": "filter_extra",
+      "refund_rate": "filter",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "a"
+      },
+      "written": [
+        {
+          "table": "orders",
+          "item": "valid_filter",
+          "value": "status <> 'test' AND status <> 'cancelled'"
+        }
+      ],
+      "catalog": {
+        "gmv": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "valid_filter",
+            "value": "status <> 'test'"
+          },
+          "b": {
+            "write": false,
+            "reason": "指标「销售额」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+          }
+        },
+        "refund_rate": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "valid_filter",
+            "value": "status <> 'cancelled'"
+          },
+          "b": {
+            "write": false,
+            "reason": "指标「退款率」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+          }
+        }
+      },
+      "joint": [
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "valid_filter",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": true,
+              "value": "status <> 'test' AND status <> 'cancelled'"
+            },
+            "refund_rate": {
+              "write": true,
+              "value": "status <> 'test' AND status <> 'cancelled'"
+            }
+          }
+        }
+      ]
+    },
+    "filters_rejected": {
+      "gmv": "filter_extra",
+      "refund_rate": "filter",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "a"
+      },
+      "notes": {
+        "orders": {
+          "valid_filter": {
+            "value": "status <> 'test'",
+            "source": "llm",
+            "status": "rejected"
+          }
+        }
+      },
+      "written": [
+        {
+          "table": "orders",
+          "item": "valid_filter",
+          "value": "status <> 'cancelled'"
+        }
+      ],
+      "catalog": {
+        "gmv": {
+          "a": {
+            "write": false,
+            "source": "shop",
+            "table": "orders",
+            "item": "valid_filter",
+            "value": "status <> 'test'",
+            "reason": "「orders」的有效记录条件「status <> 'test'」曾被人工驳回，与这次指标「销售额」的选择相反，未写入。如需更改，请到数据目录中修改"
+          },
+          "b": {
+            "write": false,
+            "reason": "指标「销售额」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+          }
+        },
+        "refund_rate": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "valid_filter",
+            "value": "status <> 'cancelled'"
+          },
+          "b": {
+            "write": false,
+            "reason": "指标「退款率」多出筛选条件的是原流程，被采纳的盲算没有这个条件，不写入数据目录"
+          }
+        }
+      },
+      "joint": [
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "valid_filter",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "「orders」的有效记录条件「status <> 'test'」曾被人工驳回，与这次指标「销售额」的选择相反，未写入。如需更改，请到数据目录中修改"
+            },
+            "refund_rate": {
+              "write": true,
+              "value": "status <> 'cancelled'"
+            }
+          }
+        }
+      ]
+    },
+    "time_rejected": {
+      "gmv": null,
+      "refund_rate": "time",
+      "choices": {
+        "gmv": "a",
+        "refund_rate": "b"
+      },
+      "notes": {
+        "orders": {
+          "business_date": {
+            "value": {
+              "column": "created_at"
+            },
+            "source": "llm",
+            "status": "rejected"
+          }
+        }
+      },
+      "written": [],
+      "catalog": {
+        "gmv": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "paid_at"
+            }
+          },
+          "b": {
+            "write": false,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "created_at"
+            },
+            "reason": "「orders」的业务日期「created_at」曾被人工驳回，与这次指标「销售额」的选择相反，未写入。如需更改，请到数据目录中修改"
+          }
+        },
+        "refund_rate": {
+          "a": {
+            "write": true,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "paid_at"
+            }
+          },
+          "b": {
+            "write": false,
+            "source": "shop",
+            "table": "orders",
+            "item": "business_date",
+            "value": {
+              "column": "created_at"
+            },
+            "reason": "「orders」的业务日期「created_at」曾被人工驳回，与这次指标「退款率」的选择相反，未写入。如需更改，请到数据目录中修改"
+          }
+        }
+      },
+      "joint": [
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": true,
+              "value": {
+                "column": "paid_at"
+              }
+            },
+            "refund_rate": {
+              "write": true,
+              "value": {
+                "column": "paid_at"
+              }
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "a"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "b"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「paid_at」；指标「退款率」采纳的是「created_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「paid_at」；指标「退款率」采纳的是「created_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "b"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "a"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「created_at」；指标「退款率」采纳的是「paid_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "同一次裁决里对「orders」的业务日期给出了不同的说法（指标「销售额」采纳的是「created_at」；指标「退款率」采纳的是「paid_at」），无法确定哪一个是数据事实，都未写入数据目录"
+            }
+          }
+        },
+        {
+          "source": "shop",
+          "table": "orders",
+          "item": "business_date",
+          "members": [
+            {
+              "metric_id": "gmv",
+              "choice": "b"
+            },
+            {
+              "metric_id": "refund_rate",
+              "choice": "b"
+            }
+          ],
+          "outcomes": {
+            "gmv": {
+              "write": false,
+              "reason": "「orders」的业务日期「created_at」曾被人工驳回，与这次指标「销售额」、「退款率」的选择相反，未写入。如需更改，请到数据目录中修改"
+            },
+            "refund_rate": {
+              "write": false,
+              "reason": "「orders」的业务日期「created_at」曾被人工驳回，与这次指标「销售额」、「退款率」的选择相反，未写入。如需更改，请到数据目录中修改"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "catalog_blocked": {
+    "notes": {
+      "orders": {
+        "business_date": {
+          "value": {
+            "column": "paid_at"
+          },
+          "source": "human",
+          "status": "confirmed"
+        }
+      }
+    },
+    "catalog": {
+      "a": {
+        "write": false,
+        "source": "shop",
+        "table": "orders",
+        "item": "business_date",
+        "value": {
+          "column": "paid_at"
+        },
+        "reason": "「orders」的业务日期已是人工确认过的「paid_at」，无需重复写入"
+      },
+      "b": {
+        "write": false,
+        "source": "shop",
+        "table": "orders",
+        "item": "business_date",
+        "value": {
+          "column": "created_at"
+        },
+        "reason": "「orders」的业务日期已有人工确认过的说法「paid_at」，与这次指标「销售额」采纳的「created_at」不同，未覆盖。如需更改，请到数据目录中修改"
+      }
+    }
+  }
+}

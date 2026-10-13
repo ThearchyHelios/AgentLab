@@ -3,6 +3,8 @@ import type { NodeState, RunPhase } from './trace'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
   ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
+  CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, MASKED_CELL_TEXT, NODE_TYPE_LABEL,
+  VERIFY_TRUNCATED_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -703,6 +705,52 @@ const JUDGE_FAILED_TITLE = '结论句裁判未能执行'
 /** 审批行末尾：批的时候点了「始终允许」，这个工具之后不再问人 */
 const ALWAYS_NOTE = '，并设为「始终允许 · 门控把关」'
 
+/** 「审批人质询」那一行的标题里，问题最多带几个字（按字数，不按 UTF-16 码元） */
+const INQUIRY_TITLE = 40
+
+/**
+ * approval.inquiry → 一行「审批人质询」：标题带问题的前 40 字，副标题说回答是否完成、查了几次（封存之后问的另写一句）。
+ *
+ * 只认服务端给的：ok 为真才说「回答完成」，带着触顶原因的说不完整、写明是哪个上限；没说成没成（缺字段）又有回答正文的
+ * 只说「已回答」。查了几次认 queries，没有再认 inquiry_artifacts，两样都没有就不说次数——不拿 0 去顶。字段类型不对的
+ * 当没给：问题不是字符串就只写「审批人质询」
+ */
+function inquiryStep(d: Record<string, any>, seq: number): Step {
+  const T = INQUIRY_TEXT
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '')
+  const question = str(d.question)
+  const chars = [...question]
+  const head = chars.length > INQUIRY_TITLE ? `${chars.slice(0, INQUIRY_TITLE).join('')}…` : question
+  const limit = str(d.limit)
+  const limitText = limit ? T.limit[limit] ?? T.limitOther : ''
+  const answer = str(d.answer_text)
+  const error = str(d.error)
+  const state = d.ok === true ? (limit ? T.incomplete(limitText) : T.complete)
+    : d.ok === false || !answer ? T.failed(limitText || null) : T.answered
+  const runs = Array.isArray(d.queries) ? d.queries.length
+    : Array.isArray(d.inquiry_artifacts) ? d.inquiry_artifacts.length : null
+  const fine = !limit && !error && (d.ok === true || (d.ok !== false && !!answer))
+  const quote = str(d.quote)
+  const model = str(d.model)
+  const doc = str(d.answer_doc)
+  const detail = [
+    question ? T.detail.question(question) : '',
+    quote ? T.detail.quote(quote) : '',
+    answer ? T.detail.answer(answer) : '',
+    error ? T.detail.error(error) : '',
+    model ? T.detail.model(model) : '',
+  ].filter(Boolean).join('\n')
+  return {
+    id: `iq-${seq}`, seq, kind: 'human', status: 'done', code: 'approval_inquiry',
+    level: fine ? 'info' : 'warn',
+    title: T.timeline(head),
+    sub: [state, runs != null ? T.queries(runs) : '', d.post_seal === true ? T.postSeal : ''].filter(Boolean).join(' · '),
+    ...(detail ? { detail } : {}),
+    // 回答组装成的文档（数字带出处）：展开区可以下钻
+    ...(doc ? { artifact: doc } : {}),
+  }
+}
+
 /**
  * 门控模型（工具信任档「始终允许 · 门控把关」）对一次调用的结论。team：协作团队里拦下的，
  * 成员停不下来等人，这次调用不执行。没有工具名（老数据、字段缺了）就说「一次工具调用」
@@ -715,12 +763,68 @@ function gateTitle(tool: string, verdict: 'allow' | 'escalate' | 'team', reason:
 }
 
 /**
+ * 双盲复算、反方审稿的日志代码（期 3 前后端共用的约定）。这几条按 code 和结构化字段解读，不看原话；后端发成 info 的
+ * （一致、裁决、记入数据目录、审稿完成）也上时间线，不然这两种节点就是一个跑了几十秒、什么都没说的黑盒。
+ * 无法复算（dual_check_unchecked）、未能反查（challenge_unreviewed）、只查了部分数据源（challenge_sources_lost）是
+ * 期 4 补上的：以前认不得，只能照原话显示。核查模型的输出到了上限被截断（verify_truncated，两种节点共用的核查 Agent 发）
+ * 是期 5 验收前补上的
+ */
+const VERIFY_LOG_CODES = new Set([
+  'dual_check_skipped', 'dual_check_same_model', 'dual_check_agreed', 'dual_check_disagreed', 'dual_check_resolved',
+  'dual_check_catalog', 'dual_check_limit', 'dual_check_unchecked',
+  'challenge_skipped', 'challenge_same_model', 'challenge_done', 'challenge_refuted', 'challenge_limit',
+  'challenge_unreviewed', 'challenge_sources_lost', 'verify_truncated',
+])
+
+const DC = DUAL_CHECK_TEXT
+const CL = CHALLENGE_TEXT.log
+const VT = VERIFY_TRUNCATED_TEXT
+
+/**
+ * 出具缺口里哪几条是双盲复算、反方审稿报上来的：出具契约给上游节点报的缺口加了「节点类型「节点名」：」的前缀
+ * （nodes/io.py 的 _upstream_issuance_gaps，节点名就是类型叫法时只写「节点类型：」），按这两种节点类型的叫法认。
+ * 时间线、成果卡片、证据页把它们另起，不和「校验没跑全」的缺口混在一起，再分两组（叫法在 DUAL_CHECK_TEXT.verifyGaps）：
+ * - failed「核查未通过」：核查查出来的问题——两路结果不一致（审核人选了盲算、两边都不对、没作出选择），结论被推翻；
+ * - unfinished「核查未完成」：没核成的——指标无法复算（nodes/dual_check.py 的 GAP_UNCHECKED「指标「X」无法复算：原因」）。
+ *   合并查询、遮罩列的输入做不了复算，盲算触顶、出错的也没核过，说成「未通过」读的人会以为这个数被查出了错。
+ * 其余的照旧
+ */
+const VERIFY_GAP_KINDS = [NODE_TYPE_LABEL.dual_check, NODE_TYPE_LABEL.challenge]
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+/** 双盲复算报的「无法复算」：前缀（节点名可有可无）之后紧跟 GAP_UNCHECKED 的开头 */
+const UNCHECKED_GAP = new RegExp(`^${escapeRe(NODE_TYPE_LABEL.dual_check)}(?:「.*?」)?：指标「.+?」无法复算：`)
+export function splitIssuanceGaps(gaps: readonly string[]): { failed: string[]; unfinished: string[]; other: string[] } {
+  const out = { failed: [] as string[], unfinished: [] as string[], other: [] as string[] }
+  for (const g of gaps) {
+    const verify = VERIFY_GAP_KINDS.some((kind) => g.startsWith(`${kind}「`) || g.startsWith(`${kind}：`))
+    ;(!verify ? out.other : UNCHECKED_GAP.test(g) ? out.unfinished : out.failed).push(g)
+  }
+  return out
+}
+const isRecord = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v)
+/** 老日志、别的服务端版本可能给的是一句中文原因而不是代码：中文的照写，认不得的代码不往界面上放 */
+const cjkText = (v: unknown): string | undefined => (typeof v === 'string' && /[㐀-鿿]/.test(v) ? v : undefined)
+/** 个数：给的是数就取整，给的是清单就数一下，别的（缺了、写坏了）当不知道 */
+const countOf = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v)
+  : Array.isArray(v) ? v.length : undefined)
+/**
+ * 核查类日志的 cause：单次运行时限将至（服务端 engine/deadline.py）。核查节点为后续节点预留时间，没开始的、缩短时长后
+ * 到时没做完的另起一条带上它。这几行不叫人调高核查的上限（只会更快撞线），也不叫人去查模型和数据源
+ */
+const RUN_DEADLINE = 'run_deadline'
+/** run_seconds（单次运行时限）→ 那句副标题；不是正数（缺了、写坏了）就不写 */
+const deadlineSub = (v: unknown): string | undefined =>
+  (typeof v === 'number' && Number.isFinite(v) && v > 0 ? DC.deadlineSub(v) : undefined)
+
+/**
  * 几种「看着跑完了、其实没做成」的状况（NI-3/4/5）。后端这几条日志是写给排查的，原样
  * 贴出来是一串标记和术语，而且不说该去哪儿改——这里说成人话，并给出下一步。
- * 认不得的 code 返回 null，照原话显示
+ * 认不得的 code 返回 null，照原话显示。
+ *
+ * 双盲复算、反方审稿那几条（VERIFY_LOG_CODES）另带 level（该不该用提醒色）和 artifact（完整对照、审稿记录可下钻）
  */
 function explainLog(code: string | undefined, message: string, d: Record<string, any> = {},
-): Pick<Step, 'title' | 'sub' | 'next' | 'fix' | 'fixNode' | 'fixField' | 'checks'> | null {
+): Pick<Step, 'title' | 'sub' | 'next' | 'fix' | 'fixNode' | 'fixField' | 'checks' | 'level' | 'artifact'> | null {
   const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
   const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && !!x) : [])
   switch (code) {
@@ -767,6 +871,17 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         title: ABSENCE_CLAIM_TEXT.title(n),
         sub: texts.length ? texts.map((t) => `「${t}」`).join('、') : undefined,
         next: ABSENCE_CLAIM_TEXT.next,
+      }
+    }
+    case 'report_masked_cell': {
+      // 报告引用了取自遮罩列的格子，重写后仍在、照常产出（report.py）：读结构化字段 count、refs，副标题只点名引用，
+      // 不写那几格的值（后端也没给）
+      const n = typeof d.count === 'number' && d.count > 0 ? d.count : undefined
+      const refs = strs(d.refs)
+      return {
+        title: MASKED_CELL_TEXT.title(n),
+        sub: refs.length ? refs.map((r) => `[[${r}]]`).join('、') : undefined,
+        next: MASKED_CELL_TEXT.next,
       }
     }
     case 'report_catalog_trimmed': {
@@ -917,6 +1032,15 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         fix: 'canvas',
       }
     }
+    case 'judge_truncated': {
+      // 裁判模型的输出到了上限被截断（judge.py run_request）：max_tokens 是那次调用的额度，unjudged 是因此未裁判的句数。
+      // 读结构化字段，不从原话里认；缺了字段只给不带数的标题。下一步指到换模型：同一个模型重新运行多半还是截断
+      const limit = typeof d.max_tokens === 'number' && d.max_tokens > 0 ? d.max_tokens : undefined
+      const n = typeof d.unjudged === 'number' && d.unjudged > 0 ? Math.round(d.unjudged) : undefined
+      return {
+        title: JUDGE_TRUNCATED_TEXT.title(limit, n), next: JUDGE_TRUNCATED_TEXT.next, fix: 'canvas', fixField: 'judge',
+      }
+    }
     case 'judge_failed': {
       // 「结论句裁判没跑完：有 2 句结论没裁判：裁判调用失败（…）」
       return {
@@ -969,6 +1093,191 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         sub: `结果中包含原文不存在的值${what}，已作废`,
         next: '修复只能调整格式，不能补充数据。请先检查上游节点为何未获取到数据（常见原因是未绑定查询工具）',
         fix: 'canvas',
+      }
+    }
+    // ---- 双盲复算：只读结构化字段。老日志缺了字段就不点名、不报数，标题照样说得通
+    case 'dual_check_skipped': {
+      const reason = str(d.reason)
+      if (reason === 'disabled') {
+        return { title: DC.log.skippedDisabled, next: DC.log.skippedDisabledNext, fix: 'canvas', fixField: 'enabled', level: 'info' }
+      }
+      // 放了这个节点却一个指标都复算不了：多半是配错了，用提醒色
+      if (reason === 'no_inputs') {
+        return { title: DC.log.skippedNoInputs, next: DC.log.skippedNoInputsNext, fix: 'canvas', fixField: 'metrics', level: 'warn' }
+      }
+      return { title: DC.log.skipped, sub: cjkText(d.reason), level: 'info' }
+    }
+    case 'dual_check_same_model':
+      return { title: DC.log.sameModel(str(d.model)), next: DC.log.sameModelNext, fix: 'canvas', fixField: 'model', level: 'warn' }
+    case 'dual_check_agreed':
+      return { title: DC.log.agreed(countOf(d.metrics) || undefined), level: 'info' }
+    case 'dual_check_disagreed': {
+      // metrics 是 [{id, name}]：副标题点名，没起名字的指标写 id
+      const list = Array.isArray(d.metrics) ? d.metrics.filter(isRecord) : []
+      const names = list.map((m) => str(m.name) ?? str(m.id)).filter((n): n is string => !!n)
+      return {
+        title: DC.log.disagreed(list.length || undefined),
+        sub: names.length ? names.map((n) => `「${n}」`).join('') : undefined,
+        next: DC.log.disagreedNext,
+        level: 'warn',
+        ...(str(d.card_artifact) ? { artifact: str(d.card_artifact) } : {}),
+      }
+    }
+    case 'dual_check_resolved': {
+      // choices 是 {指标 id: a | b | neither}；gaps 是记成缺口的个数（给成清单的也数得出来）
+      const picked = isRecord(d.choices) ? Object.values(d.choices) : []
+      const n = (c: string) => picked.filter((v) => v === c).length
+      const parts = [
+        n('a') ? DC.log.resolvedA(n('a')) : '', n('b') ? DC.log.resolvedB(n('b')) : '', n('neither') ? DC.log.resolvedNeither(n('neither')) : '',
+      ].filter(Boolean)
+      const gaps = countOf(d.gaps)
+      // 没给缺口数时按约定推：采用盲算、两边都不对都会记缺口
+      const warn = gaps != null ? gaps > 0 : n('b') + n('neither') > 0
+      return { title: DC.log.resolved(parts), sub: gaps != null ? DC.log.gaps(gaps) : undefined, level: warn ? 'warn' : 'info' }
+    }
+    case 'dual_check_catalog': {
+      // written：[{source, table, item, value}] 写进数据目录的已确认事实；skipped：[{reason}] 没写的（已有已确认的不覆盖……）。
+      // item 是表级目录项的键（business_date / valid_filter / dedup），按数据目录页的叫法写；认不出的键不往界面上放，
+      // 只写表；老版本给的一句中文照写。value 是写进去的说法（期 4 起带），写法同审批卡上的「会记为」，两处一字不差
+      const written = Array.isArray(d.written) ? d.written.filter(isRecord) : []
+      const skipped = Array.isArray(d.skipped) ? d.skipped.filter(isRecord) : []
+      const what = written.map((w) => {
+        const key = str(w.item)
+        const known = !!key && Object.hasOwn(CATALOG_TABLE_FIELD_LABEL, key)
+        const item = known ? CATALOG_TABLE_FIELD_LABEL[key as keyof typeof CATALOG_TABLE_FIELD_LABEL] : cjkText(key)
+        const where = DC.log.catalogItem(str(w.table), str(w.source), item)
+        const value = known && w.value != null && w.value !== '' ? patchValueText(key, w.value) : ''
+        return where && value ? DC.log.catalogValue(where, value) : where
+      }).filter(Boolean)
+      const why = skipped.map((s) => str(s.reason)).filter((r): r is string => !!r)
+      const rest = skipped.length ? `${DC.log.catalogSkipped(skipped.length)}${why.length ? `：${why.join('；')}` : ''}` : ''
+      return {
+        title: written.length ? DC.log.catalog(written.length) : DC.log.catalogNone,
+        sub: [what.join('；'), rest].filter(Boolean).join('；') || undefined,
+        next: written.length ? DC.log.catalogNext : undefined,
+        level: 'info',
+      }
+    }
+    case 'dual_check_limit': {
+      const which = str(d.limit)
+      return {
+        title: DC.log.limit((which && DC.limitLabel[which]) || DC.limitAny, str(d.metric)),
+        next: which === 'daily_max_usd' ? DC.limitDailyNext : DC.log.limitNext,
+        level: 'warn',
+      }
+    }
+    case 'dual_check_unchecked': {
+      // metrics 是 [{id, name, reason}]：副标题点名、说原因（没起名字的写 id）。带 cause: run_deadline 的是单次运行时限
+      // 将至没核成的那几个（服务端另起这一条，原因都一样）：副标题只点名、带上时限，下一步说怎么腾出时间
+      const list = Array.isArray(d.metrics) ? d.metrics.filter(isRecord) : []
+      const late = d.cause === RUN_DEADLINE
+      const parts = list.map((m) => {
+        const name = str(m.name) ?? str(m.id)
+        const why = late ? undefined : cjkText(m.reason)
+        return name ? `「${name}」${why ? `：${why}` : ''}` : ''
+      }).filter(Boolean)
+      const sub = late ? [parts.join('、'), deadlineSub(d.run_seconds)].filter(Boolean).join('；') : parts.join('；')
+      return {
+        title: (late ? DC.log.deadline : DC.log.unchecked)(list.length || undefined),
+        sub: sub || undefined,
+        next: late ? DC.log.deadlineNext : DC.log.uncheckedNext,
+        level: 'warn',
+      }
+    }
+    // ---- 反方审稿：同上，文案在 CHALLENGE_TEXT.log（时间线的解读统一在这里做）
+    case 'challenge_skipped': {
+      const reason = str(d.reason)
+      if (reason === 'disabled') {
+        return { title: CL.skippedDisabled, next: CL.skippedDisabledNext, fix: 'canvas', fixField: 'enabled', level: 'info' }
+      }
+      if (reason === 'no_report') return { title: CL.skippedNoReport, next: CL.skippedNoReportNext, fix: 'canvas', level: 'warn' }
+      if (reason === 'no_claims') return { title: CL.skippedNoClaims, level: 'info' }
+      return { title: CL.skipped, sub: cjkText(d.reason), level: 'info' }
+    }
+    case 'challenge_same_model':
+      return { title: CL.sameModel(str(d.model)), next: CL.sameModelNext, fix: 'canvas', fixField: 'model', level: 'warn' }
+    case 'challenge_done': {
+      // counts：{stands, weakened, refuted, inconclusive}，四种结论各几句；为 0 的不写
+      const c = isRecord(d.counts) ? d.counts : {}
+      const keys = ['stands', 'weakened', 'refuted', 'inconclusive']
+      const nums = keys.map((k) => countOf(c[k]) ?? 0)
+      const total = nums.reduce((a, b) => a + b, 0)
+      const parts = keys.map((k, i) => (nums[i] ? `${CL.verdict[k]} ${formatNumber(nums[i])}` : '')).filter(Boolean)
+      return {
+        title: CL.done(total || undefined),
+        sub: parts.length ? parts.join(' · ') : undefined,
+        level: nums[2] > 0 ? 'warn' : 'info',
+        ...(str(d.artifact) ? { artifact: str(d.artifact) } : {}),
+      }
+    }
+    case 'challenge_refuted': {
+      const items = Array.isArray(d.items) ? d.items.filter(isRecord) : []
+      const texts = items.map((i) => str(i.text)).filter((t): t is string => !!t)
+      return {
+        title: CL.refuted(items.length || undefined),
+        sub: texts.length ? texts.map((t) => `「${t}」`).join('') : undefined,
+        next: CL.refutedNext,
+        level: 'warn',
+      }
+    }
+    case 'challenge_limit': {
+      const which = str(d.limit)
+      const skipped = countOf(d.claims_skipped)
+      if (d.cause === RUN_DEADLINE) {
+        // 时长按剩余时间缩短过的那几句到了时（limit 照旧是 timeout_s，服务端单起这一条）：不说「已达时长上限」，不叫人
+        // 调高每句的上限。claims：这样的句数
+        return {
+          title: CL.deadlineLimit(countOf(d.claims) || undefined, skipped || undefined),
+          sub: deadlineSub(d.run_seconds),
+          next: CL.deadlineNext,
+          level: 'warn',
+        }
+      }
+      return {
+        title: CL.limit((which && DC.limitLabel[which]) || DC.limitAny, skipped || undefined),
+        next: which === 'daily_max_usd' ? DC.limitDailyNext : CL.limitNext,
+        level: 'warn',
+      }
+    }
+    case 'challenge_unreviewed': {
+      // claims_skipped：未能反查的句数；reason：第一句未能反查的原因（一句中文）。带 cause: run_deadline 的是单次运行
+      // 时限将至、剩下没开始的句子（服务端另起这一条）：副标题说时限，下一步说怎么腾出时间，不叫人去查模型和数据源
+      if (d.cause === RUN_DEADLINE) {
+        return {
+          title: CL.deadline(countOf(d.claims_skipped) || undefined),
+          sub: deadlineSub(d.run_seconds) ?? cjkText(d.reason),
+          next: CL.deadlineNext,
+          level: 'warn',
+        }
+      }
+      return {
+        title: CL.unreviewed(countOf(d.claims_skipped) || undefined),
+        sub: cjkText(d.reason),
+        next: CL.unreviewedNext,
+        level: 'warn',
+      }
+    }
+    case 'challenge_sources_lost': {
+      // claims：只查了部分数据源的句数；sources：没查成的数据源名
+      const names = strs(d.sources)
+      return {
+        title: CL.sourcesLost(countOf(d.claims) || undefined),
+        sub: names.length ? CL.sourcesLostSub(names) : undefined,
+        next: CL.sourcesLostNext,
+        level: 'warn',
+      }
+    }
+    case 'verify_truncated': {
+      // 核查 Agent 的输出到了上限被截断（verify_agent.py）：max_tokens 是那次调用的输出额度。截断的回复一律不采信，这次核查
+      // 没有结果。读结构化字段，不从原话里认；缺了字段（别的服务端版本）只给不带数的标题。入口落到节点的模型：该换的是模型
+      const limit = typeof d.max_tokens === 'number' && d.max_tokens > 0 ? d.max_tokens : undefined
+      return {
+        title: VT.title(limit),
+        sub: VT.sub,
+        next: VT.next,
+        fix: 'canvas',
+        fixField: 'model',
+        level: 'warn',
       }
     }
     default:
@@ -1669,9 +1978,11 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
         }
         if (d.purpose === 'judge' && d.error) {
-          // 裁判没跑成（超时、调用失败）：这一批记为未裁判、报告照常交——同样是提醒，不是失败
+          // 裁判没跑成（超时、调用失败）：这一批记为未裁判、报告照常交——同样是提醒，不是失败。输出到了上限被截断的
+          // 照实说是截断（不是「未能执行」：接入是好的，该换的是模型，下一步见 judge_truncated 那一行）
+          const cap = num(d.max_tokens)
           step.level = 'warn'
-          step.title = JUDGE_FAILED_TITLE
+          step.title = d.truncated === true ? JUDGE_TRUNCATED_TEXT.call(cap && cap > 0 ? cap : undefined) : JUDGE_FAILED_TITLE
           step.detail = [String(d.error), step.detail].filter(Boolean).join('\n')
         }
         pendingLlm.delete(nodeId ?? '_')
@@ -1915,8 +2226,11 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         if (d.missing_expected?.length) gaps.push(`缺少期望指标：${d.missing_expected.join('、')}`)
         if (num(d.unmatched)) gaps.push(`${d.unmatched} 个数字无法追溯到指标集`)
         // 校验本身没跑全（叙述渲染为空、指标集为空）也会降档。不写出来的话，
-        // 时间线上就是一个光秃秃的「降档出具」，看起来和"全部通过"只差一个字
-        const notRun: string[] = Array.isArray(d.gaps) ? d.gaps.map(String) : []
+        // 时间线上就是一个光秃秃的「降档出具」，看起来和"全部通过"只差一个字。
+        // 双盲复算、反方审稿报上来的缺口另起，按查出了问题、没核成分成两组，不归在「校验不完整」下
+        const { failed, unfinished, other: notRun } = splitIssuanceGaps(Array.isArray(d.gaps) ? d.gaps.map(String) : [])
+        if (failed.length) gaps.push(`${DC.verifyGaps.failed}：${failed.join('；')}`)
+        if (unfinished.length) gaps.push(`${DC.verifyGaps.unfinished}：${unfinished.join('；')}`)
         if (notRun.length) gaps.push(`校验不完整：${notRun.join('；')}`)
         const checked = [
           num(d.metrics_checked) != null ? `核对 ${d.metrics_checked} 个指标` : '',
@@ -1975,6 +2289,12 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         }, nodeId)
         break
       }
+
+      case 'approval.inquiry':
+        // 审批人在批准前就待审的报告提问（审批质询）：运行停在审批上时服务端追加这一条，node_id 为空，运行本身没动、
+        // 报告也不改（相位照旧，见 nextPhase）。封存之后探索运行也能问，带 post_seal。一条事件就是一问一答，挂在顶层
+        out.push(inquiryStep(d, seq))
+        break
 
       case 'catalog.drift': {
         // 从发布版本发起的正式运行：发布之后数据目录有变化。只提醒、运行照常，所以是一条警告，不是失败
@@ -2143,6 +2463,19 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
             const full = gateTitle(gate.tool, 'team', gate.reason)
             gate.step.title = clip(full, 120)
             gate.step.detail = [full.length > 120 ? gate.reason : '', message].filter(Boolean).join('\n') || undefined
+            break
+          }
+        }
+        // 双盲复算、反方审稿的日志按 code 和结构化字段解读：info 的也上时间线，没有原话的老日志照样说得出来。
+        // 后端标了 warn / error 的照它的来，explainLog 认为该提醒的（有缺口、有推翻）也用提醒色
+        if (typeof d.code === 'string' && VERIFY_LOG_CODES.has(d.code)) {
+          const said = explainLog(d.code, message, d)
+          if (said) {
+            const tone = level === 'error' ? 'error' : level === 'warn' || said.level === 'warn' ? 'warn' : 'info'
+            push({
+              id: `lg-${seq}`, seq, kind: 'note', nodeId, status: 'done', code: d.code, ...said, level: tone,
+              ...(message ? { detail: message } : {}),
+            }, nodeId)
             break
           }
         }

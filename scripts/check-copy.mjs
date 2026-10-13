@@ -396,14 +396,15 @@ for (const r of RULES) {
 }
 
 console.log('\n=== 给模型的改写指令（for_model）不上界面 ===')
-// 后端在报告核对的 violations、助手自查的问题里另带 for_model：交回模型用的原话。前端在 api/client.ts 的
-// parseBody 里一进来就去掉，别处不该再碰它——原始事件、工件原文这些直接显示 JSON 的地方才不会露出来
+// 后端在报告核对的 violations、助手自查的问题里另带 for_model：交回模型用的原话。前端在请求层（api/http.ts）的
+// parseBody 里一进来就去掉，别处不该再碰它——原始事件、工件原文这些直接显示 JSON 的地方才不会露出来。
+// REST、上传的入口在 http.ts，助手流、运行事件流在 client.ts，两个文件合起来查
 {
-  const client = join(FRONT, 'api/client.ts')
-  const readers = frontFiles.filter((f) => f !== client && readFileSync(f, 'utf8').includes('for_model'))
-  check('前端只有 api/client.ts 提到 for_model', readers.length === 0, readers.map((f) => relative(ROOT, f)).join('、'))
-  const code = readFileSync(client, 'utf8')
-  check('api/client.ts：响应体一律经 parseBody 解析（不直接 res.json()），REST、上传、助手流、运行事件流四个入口都在',
+  const transport = ['api/http.ts', 'api/client.ts'].map((f) => join(FRONT, f))
+  const readers = frontFiles.filter((f) => !transport.includes(f) && readFileSync(f, 'utf8').includes('for_model'))
+  check('前端只有 api/http.ts、api/client.ts 提到 for_model', readers.length === 0, readers.map((f) => relative(ROOT, f)).join('、'))
+  const code = transport.map((f) => readFileSync(f, 'utf8')).join('\n')
+  check('api/http.ts、api/client.ts：响应体一律经 parseBody 解析（不直接 res.json()），REST、上传、助手流、运行事件流四个入口都在',
     !/\.json\(\)/.test(code) && (code.match(/parseBody\(/g) ?? []).length >= 5 && /delete[^\n]*MODEL_NOTE/.test(code))
 }
 

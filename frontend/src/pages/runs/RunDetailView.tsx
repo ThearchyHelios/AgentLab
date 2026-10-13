@@ -25,11 +25,13 @@ import {
 } from './model'
 import { ArtifactsPane, useRunArtifacts } from './ArtifactsPane'
 import { EvidencePane } from './EvidencePane'
-import { EVIDENCE_AUDIT_TEXT } from '../../lib/terms'
+import { EVIDENCE_AUDIT_TEXT, RUN_ARTIFACTS_TEXT } from '../../lib/terms'
 import { ClassChip, MoreMenu, RunTabs, TierChip, copyText, type MenuItem, type TabItem } from './parts'
 import { ProvenanceBar, Telemetry, runClocks } from './Telemetry'
 import { TracePane } from './TracePane'
 import { useRunDetail } from './useRunDetail'
+import { useCompareEntry } from './compare/entry'
+import { RunScheduleSource } from '../schedules/parts'
 
 /**
  * 一次运行的详情：头部读数、凭证、排错路径，下面分三个视图——
@@ -61,6 +63,9 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const [feedback, setFeedback] = useState<Feedback | null>(null)
   const streamBox = useRef<HTMLDivElement>(null)
   const now = useTicker(60_000)
+  // 「更多」里的「与上一次对比」：拿到能对比的运行就预先问默认基准（叫法看它是不是紧挨着的上一次），预先查找和点了
+  // 之后查找中的状态都在这里挂着，所以放在下面的提前返回之前。live 同下面的 live
+  const compareItem = useCompareEntry(d.run, d.streaming || isLiveRun(d.run?.status))
 
   useEffect(() => {
     if (d.state !== 'missing') return
@@ -460,6 +465,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       key: 'copy-link', label: '复制链接', icon: <Link2 size={12} />,
       onSelect: () => void copyText(`${location.origin}/runs/${run.id}`, '链接'),
     },
+    compareItem,
     {
       key: 'delete', label: '删除记录…', icon: <Trash2 size={12} />, danger: true, onSelect: () => void remove(),
       disabled: live || busy === 'delete',
@@ -532,7 +538,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     { key: 'evidence', label: EVIDENCE_AUDIT_TEXT.tab, title: EVIDENCE_AUDIT_TEXT.tabTitle },
     {
       key: 'artifacts', label: '工件', count: artifactCount, unit: '件', tone: 'quiet',
-      title: artifactCount == null ? '本次运行保存的证据和产出' : `${artifactCount} 件：查询和工具调用的原始结果、每个节点每一次的产出`,
+      title: RUN_ARTIFACTS_TEXT.tabTitle(artifactCount),
     },
   ]
 
@@ -550,16 +556,20 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
               <ClassChip runClass={run.run_class} version={run.version} always />
               <TierChip tier={(run.output as any)?._issuance?.tier} />
             </div>
-            <div className="mt-0.5 flex min-w-0 items-center gap-1 text-2xs text-faint">
+            {/* 窄时换行：不换行时这一行只有定时任务链接能缩，会被挤成 0 宽，其余各项被压成竖排 */}
+            <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-2xs text-faint">
               <span className="mono">{shortId(run.id)}</span>
               <span>·</span>
               <time className="tnum" title={`发起于 ${formatDateTime(run.created_at ?? null)}`}>
                 {formatTime(run.created_at ?? null, new Date(now))}
               </time>
               <span>·</span>
-              <span title={run.started_by ? undefined : '发起时未设置署名'}>
-                {run.started_by || '未署名'} 发起
-              </span>
+              {/* 定时任务发起的：写成到那个定时任务的链接（键盘可达；记录页的「定时」标记只能鼠标点） */}
+              {run.schedule_id ? <RunScheduleSource scheduleId={run.schedule_id} startedBy={run.started_by} /> : (
+                <span title={run.started_by ? undefined : '发起时未设置署名'}>
+                  {run.started_by || '未署名'} 发起
+                </span>
+              )}
               <span>·</span>
               <span className="tnum">{formatNumber(d.events.length)} 条事件</span>
               {workflowGone && <span>· 工作流已删除</span>}

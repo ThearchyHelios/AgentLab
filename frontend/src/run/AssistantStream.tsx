@@ -16,11 +16,12 @@ import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
 import {
-  COPILOT_CONTEXT_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, evidenceTally, issuanceLabel, nodeTypeLabel,
+  COPILOT_CONTEXT_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, evidenceTally, issuanceLabel,
+  nodeTypeLabel,
 } from '../lib/terms'
 import { SqlCheckList } from './SqlChecks'
 import {
-  ISSUANCE_HINT, childrenByExec, compactSteps, parseQueryResult, progressOf, spread, teamVerdictOf,
+  ISSUANCE_HINT, childrenByExec, compactSteps, parseQueryResult, progressOf, splitIssuanceGaps, spread, teamVerdictOf,
   type Exec, type FixKind, type ResultTable as Table, type Step, type StepKind, type TeamMemberEx,
   type TeamRun,
 } from './decode'
@@ -2296,6 +2297,22 @@ export function IssuanceSqlChecks({ tier, checks }: { tier: string; checks: Issu
   )
 }
 
+/**
+ * 出具横幅里双盲复算、反方审稿报上来的一组缺口：failed「核查未通过」、unfinished「核查未完成」。排在「校验未全部完成」
+ * 上面，样子和它一样（同一种提醒色、小标题加圆点列表），一条都没有时不画
+ */
+function IssuanceGaps({ kind, title, gaps }: { kind: 'failed' | 'unfinished'; title: string; gaps: string[] }) {
+  if (!gaps.length) return null
+  return (
+    <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }} data-issuance-verify-gaps={kind}>
+      <div className="font-medium">{title}：</div>
+      <ul className="mt-0.5 space-y-0.5 pl-2 [overflow-wrap:anywhere]">
+        {gaps.map((g) => <li key={g}>· {g}</li>)}
+      </ul>
+    </div>
+  )
+}
+
 const TIER_META: Record<string, { color: string; soft: string; hint: string }> = {
   formal: { color: 'var(--st-done)', soft: 'var(--st-done-soft)', hint: ISSUANCE_HINT.formal },
   degraded: { color: 'var(--st-waiting)', soft: 'var(--st-waiting-soft)', hint: ISSUANCE_HINT.degraded },
@@ -2312,7 +2329,9 @@ const TIER_META: Record<string, { color: string; soft: string; hint: string }> =
  *
  * 降档的原因必须写在这里：以前只列缺指标和回指不上的数字，而「叙述模板渲染
  * 为空」「指标集为空」这类校验根本没跑起来的缺口（gaps）一条都不显示——横幅
- * 说「请对照下方声明」，下方什么都没有。
+ * 说「请对照下方声明」，下方什么都没有。缺口分几块：没通过 SQL 检查的单列在最前，
+ * 双盲复算、反方审稿报上来的分「核查未通过」「核查未完成」，其余的归「校验未全部完成」。
+ * 运行详情的证据页、问数据的回答、画布右栏用的都是这一个横幅，三处说法一样。
  */
 export function IssuanceBanner({ issuance, runClass, evidence }: {
   issuance: any; runClass?: string
@@ -2331,7 +2350,11 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
   const sqlChecks: IssuanceSqlCheck[] = (Array.isArray(issuance?.sql_checks) ? issuance.sql_checks : [])
     .filter((x: unknown): x is IssuanceSqlCheck => !!x && typeof x === 'object')
   const sqlGaps = new Set(sqlChecks.map((x) => x.gap).filter(Boolean))
-  const gaps: string[] = (Array.isArray(issuance?.gaps) ? issuance.gaps.map(String) : []).filter((g: string) => !sqlGaps.has(g))
+  // 其余缺口里双盲复算、反方审稿报上来的另起两组：「核查未通过」（两路结果不一致、结论被推翻）、「核查未完成」（指标无法
+  // 复算），排在「校验未全部完成」上面，先后同时间线、证据页、成果节点的印章（分组见 decode.ts 的 splitIssuanceGaps）。
+  // 不分的话核查查出的问题读着像校验没做完，没核成的数又像被查出了错
+  const { failed: verifyFailed, unfinished: verifyUnfinished, other: gaps } = splitIssuanceGaps(
+    (Array.isArray(issuance?.gaps) ? issuance.gaps.map(String) : []).filter((g: string) => !sqlGaps.has(g)))
   const calibers: any[] = issuance?.calibers ?? []
   const matched = Number(issuance?.matched_numbers ?? 0)
   // 逐个数字的出处（matched[].caliber 形如「口径名 @ v2」）：有它就能按卡数清楚，
@@ -2404,6 +2427,8 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
       )}
 
       {!!sqlChecks.length && <IssuanceSqlChecks tier={tier} checks={sqlChecks} />}
+      <IssuanceGaps kind="failed" title={DUAL_CHECK_TEXT.verifyGaps.failed} gaps={verifyFailed} />
+      <IssuanceGaps kind="unfinished" title={DUAL_CHECK_TEXT.verifyGaps.unfinished} gaps={verifyUnfinished} />
       {!!gaps.length && (
         <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }} data-issuance-gaps="">
           <div className="font-medium">{RUN_SQL_CHECK_TEXT.otherGaps}</div>

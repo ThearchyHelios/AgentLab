@@ -11,7 +11,9 @@
  * 那一栏，定位落到工具上（见 toolBindingOf）。
  */
 import { ApiError } from '../api/client'
-import { APPROVAL_POLICY_LABEL, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL, UPGRADE_TEXT, nodeTypeLabel } from '../lib/terms'
+import {
+  APPROVAL_POLICY_LABEL, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_LABEL, PROVIDER_REF_TEXT, UPGRADE_TEXT, nodeTypeLabel,
+} from '../lib/terms'
 import { NODE_DEFS } from './nodeDefs'
 import type { FlowNode } from '../store/studio'
 import type {
@@ -244,6 +246,12 @@ function normalizeIssue(raw: any): ValidationIssue | null {
   }
 }
 
+/**
+ * 点名的模型接入不存在或已停用，或者只写了模型、提供它的接入已停用（后端 engine/provider_refs.py）。一处一条问题、
+ * 一条修复：同一个协作节点上自己的接入和成员的接入是两处，合并、找修复都要连字段一起认
+ */
+export const isProviderRefCode = (code?: string | null): boolean => code === 'provider.missing' || code === 'provider.disabled'
+
 function normalizeFix(raw: any): PublishFix | null {
   if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !raw.id) return null
   const kind = raw.kind === 'choice' || raw.kind === 'assist' ? raw.kind : raw.kind === 'auto' ? 'auto' : null
@@ -251,7 +259,9 @@ function normalizeFix(raw: any): PublishFix | null {
   const options = asArray<any>(raw.options)
     .filter((o) => o && typeof o === 'object' && 'value' in o)
     .map((o) => ({ value: o.value, label: asText(o.label ?? o.value), hint: o.hint ? asText(o.hint) : null,
-      ...(o.handoff === true ? { handoff: true } : {}) }))
+      ...(o.handoff === true ? { handoff: true } : {}),
+      // 点名的模型接入：修完以后落到演示类接入（后端 autofix._demo_mark），弹窗在选项名旁加醒目的标签
+      ...(o.demo === true ? { demo: true } : {}) }))
   // 选项类没有候选就没法选：不给控件，比给一个空下拉强
   if (kind === 'choice' && !options.length) return null
   return {
@@ -259,6 +269,7 @@ function normalizeFix(raw: any): PublishFix | null {
     code: asText(raw.code),
     kind,
     node_id: raw.node_id ?? null,
+    ...(typeof raw.field === 'string' && raw.field ? { field: raw.field } : {}),
     label: asText(raw.label) || raw.id,
     preview: raw.preview && typeof raw.preview === 'object' ? raw.preview : null,
     options,
@@ -312,12 +323,17 @@ export function isMissingEndpoint(e: unknown): boolean {
  * 这条问题的修复：后端点了 fix id 就按 id 找；没点的（/publish 被拦时的回包只有 code）按 code + 节点认。
  * 认不出时和后端 autofix.annotate 同一个退路：图级问题（没有节点，比如「没有带契约的出口」，
  * 修复却落在唯一的出口上）认同一编号的第一条修复；图级修复（改的是全图默认，不落在任何节点上）
- * 认同一编号的每一条问题。再认不出就没有
+ * 认同一编号的每一条问题。再认不出就没有。点名的模型接入不走退路（同 annotate）
  */
 export function fixFor(issue: ValidationIssue, fixes: PublishFix[]): PublishFix | undefined {
   if (issue.fix) return fixes.find((f) => f.id === issue.fix)
   if (!issue.code) return undefined
   const same = fixes.filter((f) => f.code === issue.code)
+  if (isProviderRefCode(issue.code)) {
+    // 点名的接入一处一条修复，只认节点、字段都对得上的那一条（同一节点上的几处按字段分）。没有就是这一处没有修复
+    //（一个候选都落不稳），不退到同节点、同编号别处的修复上——退过去，这一处的问题下面就画着另一处的选项
+    return same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null) && (f.field ?? null) === (issue.field ?? null))
+  }
   const exact = same.find((f) => (f.node_id ?? null) === (issue.node_id ?? null))
   if (exact) return exact
   return issue.node_id == null ? same[0] : same.find((f) => f.node_id == null)
@@ -326,13 +342,16 @@ export function fixFor(issue: ValidationIssue, fixes: PublishFix[]): PublishFix 
 /**
  * 同一处问题只列一行：validate 和门禁常对同一处各报一条（同 code、同节点，说法不同），
  * 列两行就是两组一样的修复控件、「会被拦下 2 处」。合成的那一行取最重的级别、第一条 error 的说法，
- * 其余说法收进 others（悬停可见）。没有 code 的认不出是不是同一处，照原样各列一行
+ * 其余说法收进 others（悬停可见）。没有 code 的认不出是不是同一处，照原样各列一行。
+ * 点名的模型接入连字段一起认：协作节点自己的接入和成员的接入是两处问题、各有各的修复，不合成一行
  */
 export function mergeIssues(issues: ValidationIssue[]): { issue: ValidationIssue; others: string[] }[] {
   const out: { issue: ValidationIssue; others: string[] }[] = []
   const at = new Map<string, number>()
   for (const issue of issues) {
-    const key = issue.code ? `${issue.code}\u0000${issue.node_id ?? ''}` : null
+    const key = issue.code
+      ? `${issue.code}\u0000${issue.node_id ?? ''}${isProviderRefCode(issue.code) ? `\u0000${issue.field ?? ''}` : ''}`
+      : null
     const i = key != null ? at.get(key) : undefined
     if (i == null) {
       if (key != null) at.set(key, out.length)
@@ -382,11 +401,16 @@ const CONTRACT_KEYS: Record<string, string> = {
 /** 不在节点定义的字段表里、由检查器自己画的几项（子工作流钉的版本、升版处置），以及图级的全图默认 */
 const EXTRA_FIELDS: Record<string, string> = {
   workflow_version: '固定版本', upgrade_policy: '上游发布新版本时', defaults: '工作流默认设置',
+  // 多数节点的检查器里没有接入这一栏（只有双盲复算、反方审稿有），修复点名接入时照样要写得出叫法；修复连带去掉的
+  // 模型也一样（知识检索、结构校验的检查器里没有模型这一栏）
+  provider: PROVIDER_REF_TEXT.field, model: PROVIDER_REF_TEXT.model,
 }
 /** 点号后面那一段的叫法：契约里的键，全图默认里的审批策略，列表项里的名称、取值、表达式 */
 const SUB_KEYS: Record<string, string> = {
   ...CONTRACT_KEYS, approval: '审批策略', claims: '未附依据的结论句', on_uncited: '未附依据时',
   name: '名称', value: '取值', expression: '表达式',
+  // 点名的接入：成员的、全图默认里的（连同全图默认里结论句裁判的那一份）
+  provider: PROVIDER_REF_TEXT.field, model: PROVIDER_REF_TEXT.model, judge: PROVIDER_REF_TEXT.judge,
 }
 /** 契约 claims 的 on_uncited：没挂依据的结论句怎么算 */
 const ON_UNCITED_LABEL: Record<string, string> = {

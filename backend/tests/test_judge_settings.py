@@ -17,6 +17,7 @@ from app.db.base import SessionLocal
 from app.db.models import Setting
 from app.engine.judge import (
     JUDGE_DEFAULTS,
+    MAX_TOKENS,
     SETTING_GROUP,
     SPEND_KEY,
     Budget,
@@ -166,7 +167,7 @@ async def test_the_judge_model_priority():
     async with SessionLocal() as session:
         spec = await judge_model_spec(session, None)
         assert (spec.provider, spec.model) == (None, None), "什么都没配：默认 provider"
-        assert spec.thinking == "off" and spec.max_tokens == 4096
+        assert spec.thinking == "off" and spec.max_tokens == MAX_TOKENS == 16384
 
         session.add(Setting(key="copilot", value={"provider": "", "model": "copilot-model"}))
         await session.commit()

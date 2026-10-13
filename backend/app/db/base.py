@@ -200,6 +200,17 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("import_stagings", "edits", "JSON"),
     ("import_stagings", "answers_dropped", "JSON"),
     ("import_stagings", "redraft_sha256", "VARCHAR(64)"),
+    # 运行选项（发起时的快照，整次运行沿用）和发起它的定时任务。存量运行回填 {} 和 NULL：
+    # 没有选项，也不是定时任务发起的
+    ("runs", "options", "JSON DEFAULT '{}'"),
+    ("runs", "schedule_id", "VARCHAR(32)"),
+]
+
+#: 迁移补上的列要建的索引：(索引名, 表, 列)。create_all 不碰已有的表，表上新列的索引也就不会建。
+#: 索引名照 NAMING_CONVENTION 取，和新库 create_all 建出来的同名，IF NOT EXISTS 才不会重复建
+_INDEX_MIGRATIONS: list[tuple[str, str, str]] = [
+    # 定时任务的触发历史按它找这个任务发起的运行
+    ("ix_runs_schedule_id", "runs", "schedule_id"),
 ]
 
 
@@ -210,6 +221,10 @@ def _migrate(conn) -> None:  # pragma: no cover - 同步回调
         cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
         if cols and column not in cols:
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+    for name, table, column in _INDEX_MIGRATIONS:
+        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+        if column in cols:
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))
 
 
 async def init_db() -> None:

@@ -12,7 +12,9 @@
    （按需裁判传只认封存工件的那个）。规则里写明数字已经由系统核对过。带期 4 文档标记的报告，上传表格的
    查询在 SQL 之后另有来历行（来源、口径、已接受、区域外文字，_provenance_lines）
 3. 调用（judge_doc）：一份报告合并成一次调用，超过每批的句数就分批；结构化输出失败退回 JSON 解析，
-   再失败就记未裁判。thinking 关掉，max_tokens 4096
+   再失败就记未裁判。thinking 关掉，输出额度 MAX_TOKENS（推理模型的思考也算在里面），服务方嫌大时退回
+   FALLBACK_MAX_TOKENS，被嫌大过的接入、模型之后直接用小的；输出到了上限被截断的整批记未裁判（truncated），
+   照实说是额度不够、不再退回纯文本多花一次，时间线上另记 judge_truncated
 4. 预算：每份报告的句数、金额、时长和全局每日金额，每一项都能是 None（不限）。调用前按目录价估算，
    超了按优先级截断；触顶就停，已判的保留，没判的记未裁判并说明是哪个上限——不报错
 5. 每日计数落在设置表（SPEND_KEY），按本地日期滚动。目录里没有价格的模型估不出金额，金额上限对它
@@ -38,7 +40,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from sqlalchemy import select
 
 from app.core.artifact_store import canonical_json, content_hash
@@ -69,6 +71,7 @@ from app.engine.merge_query import MERGE_SOURCE
 from app.engine.nodes.llm import _split_structured, _usage_of
 from app.engine.state import message_text
 from app.providers import catalog as pricing
+from app.providers.budget import BudgetFallback, budget_refused, cut_off, cut_words, error_usage, truncated_error
 from app.providers.factory import ModelSpec, ProviderNotConfigured, get_chat_model
 
 logger = logging.getLogger(__name__)
@@ -104,7 +107,13 @@ BATCH_SIZE = 8
 #: 一波最多几批同时问：几批共用剩下的时长，句数上限内的句子一两波就判完。第一批单独问：接入调不通（鉴权、
 #: 网关挂了）时只撞这一次，不让一整波一起失败
 PARALLEL_BATCHES = 4
-MAX_TOKENS = 4096
+#: 裁判（和核查：api/settings.py 的 verify_model_spec、engine/verify_agent.py 沿用这一档）的输出额度。thinking 关掉只对
+#: Anthropic 有用：经 OpenAI 兼容接入的推理模型（DeepSeek、GLM、Kimi 这一类）收不到 thinking=off，思考算在额度里，原来的
+#: 4096 常常想完就没额度写判定了（cite_fields 的抽取在 2026-10 撞过同一堵墙，那边也改成了 16384）。16384 是常见网关、
+#: 模型接受的输出上限里偏大的一档（GPT-4o 的上限就是它）；更小的服务方会拒收，那时退回 FALLBACK_MAX_TOKENS
+MAX_TOKENS = 16384
+#: 服务方嫌 MAX_TOKENS 太大（400 / 422，报错里有 max_tokens 一类字样）时退回这个：原来的额度，各家都收。之后的调用都用它
+FALLBACK_MAX_TOKENS = 4096
 #: 证据摘录：SQL 前几个字、每次查询最多几行几列、每段知识库片段最多几个字、整份引用的检索给几段。
 #: 列数上限只管没被引用的列：句子引用的格子所在的列一律给（遮罩的除外），再用别的列补满到这么多列
 SQL_CHARS = 300
@@ -124,9 +133,12 @@ SHORT_CHARS = 6
 _OUT_PER_UNIT = 120
 _OUT_BASE = 20
 
-#: 未裁判的原因。前四个是上限，报告里写「已到上限」
+#: 未裁判的原因。前四个是上限，报告里写「已到上限」；truncated 是裁判模型的输出到了上限被截断（推理模型的思考也算在
+#: 额度里），和格式不对分开记：说成「格式有误」，人会去查提示词，真正该换的是模型
 LIMITS = ("max_claims", "max_cost_usd", "daily_max_usd", "timeout_s")
-REASONS = (*LIMITS, "error", "format", "missing", "on_demand")
+REASONS = (*LIMITS, "error", "format", "truncated", "missing", "on_demand")
+#: 输出被截断时给人看的建议，接在 budget.cut_words 的「裁判模型的输出达到上限（N token）被截断」后面
+TRUNCATED_ADVICE = "通常是推理占满了输出额度，可换用不带推理的裁判模型"
 
 JUDGE_ROLE = "你是报告核查员：逐句判断报告里的话，能不能被它挂的证据支持。你不写报告，也不改报告。"
 
@@ -330,6 +342,24 @@ def _hidden(snapshot: dict[str, Any], source: Any, masked: dict[str, Any] | None
     return names
 
 
+def _derived(snapshot: dict[str, Any], hidden: set[str], fetch: _Fetch, mask: Any) -> tuple[set[str], set[str]]:
+    """(要遮的列, SQL 里指代遮罩列的名字)，都是小写。核查 agent 的摘录（mask 给了，engine/inquiry.py 的 ExcerptMask）另按
+    SQL 认出改了名字的遮罩列（buyer_phone AS 手机号、套函数、经子查询转一道……），和核查 agent 的查询在工具边界遮的是同一
+    套规则（表结构按快照冻结的那份、经 fetch 取）。mask 为 None（结论句裁判自己的摘录）照旧只按列名，摘录、复用键都和
+    以前一样。"""
+    if mask is None or not hidden:
+        return hidden, hidden
+    schema = fetch(snapshot.get("schema_artifact")) if snapshot.get("schema_artifact") else None
+    return mask.columns(snapshot, hidden, schema)
+
+
+def _unique_number(snapshot: dict[str, Any], column: str) -> bool:
+    """这一列按列类型是数值列：column_types 记成 number，列名在结果里只有这一列（同名的几列说不清是哪一列的类型，
+    masking._typed_numbers）。"""
+    columns = [str(c) for c in snapshot.get("columns") or []]
+    return column_kind(snapshot, column) == "number" and columns.count(column) == 1
+
+
 def _shown_columns(columns: list[str], cited: Iterable[str]) -> list[str]:
     """摘录给哪几列：被引用的列一律给（超过上限也给），再按原来的顺序用别的列补满到 EXCERPT_COLS 列。
 
@@ -342,11 +372,14 @@ def _shown_columns(columns: list[str], cited: Iterable[str]) -> list[str]:
 
 
 def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iterable[str], whole: bool,
-                   fetch: _Fetch, masked: dict[str, Any] | None, *, provenance_on: bool = False) -> str | None:
+                   fetch: _Fetch, masked: dict[str, Any] | None, *, provenance_on: bool = False,
+                   mask: Any = None) -> str | None:
     """一条查询的摘录：头、SQL、（期 4）来历行、列、被引用的行。
 
     provenance_on：文档带期 4 标记时为真（prepare 算）。这时上传表格的查询快照（有 data_version）在 SQL 之后、「列：」
     之前多几行来历（_provenance_lines）；其余情况一个字都不多，期 4 之前的文档、手工源的摘录和以前逐字相同。
+    mask：给核查 agent 的摘录才给（engine/inquiry.py 的 ExcerptMask），分段遮：改了名字的遮罩列也不给（_derived）；SQL
+    先遮再截（截在半截的值认不出）；列名、来历行按值换；格子逐格遮，数值格照原样。
     """
     snapshot = fetch(entry.get("artifact"))
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("rows"), list):
@@ -356,13 +389,15 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     source = entry.get("source") or snapshot.get("source")
     head = (f"【{alias}】合并查询结果（共 {total} 行）" if snapshot.get("source") == MERGE_SOURCE
             else f"【{alias}】查询结果（{entry.get('tool') or '查询'} · 数据源 {source or '—'} · 共 {total} 行）")
+    hidden, names = _derived(snapshot, _hidden(snapshot, source, masked), fetch, mask)
     sql = _clean(str(snapshot.get("sql") or ""))
+    if mask is not None:
+        sql = mask.sql(sql, snapshot, names)
     lines = [head, f"SQL：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}"]
     if snapshot.get("source") == MERGE_SOURCE:
         lines.append(_merge_line(snapshot))
-    hidden = _hidden(snapshot, source, masked)
     if provenance_on and snapshot.get("data_version"):
-        lines += _provenance_lines(snapshot, fetch, hidden)
+        lines += [mask.text(line) if mask is not None else line for line in _provenance_lines(snapshot, fetch, hidden)]
     columns = [str(c) for c in snapshot.get("columns") or [] if str(c).lower() not in hidden]
     shown_cols = _shown_columns(columns, cols)
     # 点名引用的行先给，整份引用的再从头补满，一共不超过 EXCERPT_ROWS 行
@@ -370,13 +405,16 @@ def _query_excerpt(alias: str, entry: dict[str, Any], rows: set[int], cols: Iter
     if whole:
         picked += [r for r in range(total) if r not in picked][:EXCERPT_ROWS - len(picked)]
     omitted = len(columns) - len(shown_cols)
-    lines.append("列：" + " | ".join(shown_cols) + (f" | …另有 {omitted} 列" if omitted > 0 else ""))
+    heads = [mask.text(c) for c in shown_cols] if mask is not None else shown_cols
+    lines.append("列：" + " | ".join(heads) + (f" | …另有 {omitted} 列" if omitted > 0 else ""))
     for r in sorted(picked):
         cells = []
         for c in shown_cols:
             try:
                 raw, _ = locate_cell(snapshot, r, c)
-                cells.append(render_cell(raw, kind=column_kind(snapshot, c)))
+                shown = mask.cell(raw, numeric=_unique_number(snapshot, c)) if mask is not None else raw
+                # 按值换过的格子照文字给：「已遮罩」不能再按这一列的类型当数渲染
+                cells.append(render_cell(raw, kind=column_kind(snapshot, c)) if shown is raw else str(shown))
             except (CellError, RenderError):
                 cells.append(MISSING)
         lines.append(f"r{r}：" + " | ".join(cells))
@@ -471,11 +509,12 @@ def _cell_words(locator: dict[str, Any], hidden: set[str]) -> str:
 
 
 def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any],
-                   masked: dict[str, Any] | None) -> list[str]:
+                   masked: dict[str, Any] | None, mask: Any = None) -> list[str]:
     """指标的输入取自哪次查询、哪一格，再附上那次查询的 SQL（截到 SQL_CHARS，最多 ENTITY_QUERIES 次）。
 
     「活跃用户按会员号去重」这种讲口径的句子，证据在取数的 SQL 里；只给原式，裁判只能判证据不足。
     位置来自封存的口径卡；SQL 经 fetch 取，取不到（不在封存范围里）的不给。没追到查询的输入照实写。
+    mask 同 _query_excerpt：改了名字的遮罩列不写列名，SQL 先遮再截。
     """
     items = [i for i in metric.get("inputs") or [] if isinstance(i, dict)]
     lines: list[str] = []
@@ -492,11 +531,13 @@ def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any
         snapshot = fetch(artifact)
         snap = snapshot if isinstance(snapshot, dict) else {}
         source = (catalog.get(alias) or {}).get("source") if alias else None
-        hidden = _source_hidden(source or snap.get("source"), catalog, fetch, masked) \
-            | _mask_names(snap.get("mask_columns"))
+        hidden, names = _derived(snap, _source_hidden(source or snap.get("source"), catalog, fetch, masked)
+                                 | _mask_names(snap.get("mask_columns")), fetch, mask)
         label = f"查询 {alias} " if alias else "一次查询（不在这份报告的证据目录中）"
         lines.append(f"输入 {path}：取自{label}的 {_cell_words(item.get('locator') or {}, hidden)}")
         sql = _clean(str(snap.get("sql") or ""))
+        if sql and mask is not None:
+            sql = mask.sql(sql, snap, names)
         if sql and str(artifact) not in seen and len(seen) < ENTITY_QUERIES:
             seen.add(str(artifact))
             sqls.append(_sql_line(f"查询 {alias} 的 SQL" if alias else "这次查询的 SQL", sql))
@@ -506,7 +547,7 @@ def _metric_inputs(metric: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any
 
 
 def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch, catalog: dict[str, Any],
-                    masked: dict[str, Any] | None) -> str:
+                    masked: dict[str, Any] | None, mask: Any = None) -> str:
     name = entry.get("name") or (entry.get("locator") or {}).get("metric") or alias
     rendered = entry.get("rendered")
     where = " ".join(v for v in (f"口径「{entry['caliber']}」" if entry.get("caliber") else "",
@@ -521,7 +562,7 @@ def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch, catalog: d
     if metric is not None:
         if metric.get("expression"):
             lines.append(f"原式：{_clean(str(metric['expression']))}")
-        lines.extend(_metric_inputs(metric, fetch, catalog, masked))
+        lines.extend(_metric_inputs(metric, fetch, catalog, masked, mask))
     return "\n".join(lines)
 
 
@@ -599,7 +640,8 @@ def _column_lines(entry: dict[str, Any], fetch: _Fetch) -> list[str]:
     return lines
 
 
-def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], whole: bool, fetch: _Fetch) -> str | None:
+def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], whole: bool, fetch: _Fetch,
+                       mask: Any = None) -> str | None:
     content = fetch(entry.get("artifact"))
     hits = content.get("hits") if isinstance(content, dict) else None
     if not isinstance(hits, list):
@@ -613,18 +655,21 @@ def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], who
         if not isinstance(hit, dict) or not isinstance(hit.get("content"), str):
             continue
         body = _clean(hit["content"])
+        # 核查 agent 的摘录（mask）：知识库片段里写着的遮罩值按值换（先换再截，截在半截的值认不出）
+        body = mask.text(body) if mask is not None else body
         title = f"《{_clean(str(hit['title']))}》" if hit.get("title") else ""
         lines.append(f"片段 {h + 1}{title}：{body[:CHUNK_CHARS]}{'…' if len(body) > CHUNK_CHARS else ''}")
     return "\n".join(lines)
 
 
 def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _Fetch,
-             masked: dict[str, Any] | None, catalog: dict[str, Any], *, provenance_on: bool = False) -> str | None:
+             masked: dict[str, Any] | None, catalog: dict[str, Any], *, provenance_on: bool = False,
+             mask: Any = None) -> str | None:
     """一件证据的摘录。provenance_on 只交给查询摘录（_query_excerpt）：指标摘录里「输入取自查询 Qn」的那几行不加
-    来历（P4-SPEC 调整 1），表名、字段名的摘录照旧。"""
+    来历（P4-SPEC 调整 1），表名、字段名的摘录照旧。mask 只给核查 agent 的摘录（见 prepare）。"""
     kind = entry.get("kind")
     if kind == "metric":
-        return _metric_excerpt(alias, entry, fetch, catalog, masked)
+        return _metric_excerpt(alias, entry, fetch, catalog, masked, mask)
     if kind == "input":
         field_name = (entry.get("locator") or {}).get("field") or alias
         return f"【{alias}】运行输入：{field_name} = {entry.get('rendered')}"
@@ -632,27 +677,30 @@ def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _
         rows = {r for c in cands for a, r in c.rows if a == alias}
         cols = [col for c in cands for a, col in c.cols if a == alias]
         return _query_excerpt(alias, entry, rows, cols, any(alias in c.whole for c in cands), fetch, masked,
-                              provenance_on=provenance_on)
+                              provenance_on=provenance_on, mask=mask)
     if kind == "retrieval":
         picked = [h for c in cands for a, h in c.hits if a == alias]
-        return _retrieval_excerpt(alias, entry, picked, any(alias in c.whole for c in cands), fetch)
+        return _retrieval_excerpt(alias, entry, picked, any(alias in c.whole for c in cands), fetch, mask)
     if kind == "table":
         head = f"【{alias}】表 {entry.get('name')}" + (f"（数据源 {entry['source']}）" if entry.get("source") else "")
-        return "\n".join([head, *_table_lines(entry, catalog, fetch, masked), *_entity_sql(entry, catalog, fetch)])
+        return "\n".join([head, *_table_lines(entry, catalog, fetch, masked),
+                          *_entity_sql(entry, catalog, fetch, masked, mask)])
     if kind == "column":
         table = (entry.get("locator") or {}).get("table")
         head = f"【{alias}】字段 {f'{table}.' if table else ''}{(entry.get('locator') or {}).get('column') or entry.get('name')}"
-        return "\n".join([head, *_column_lines(entry, fetch), *_entity_sql(entry, catalog, fetch)])
+        return "\n".join([head, *_column_lines(entry, fetch), *_entity_sql(entry, catalog, fetch, masked, mask)])
     return None
 
 
-def _entity_sql(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch) -> list[str]:
+def _entity_sql(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch, masked: dict[str, Any] | None = None,
+                mask: Any = None) -> list[str]:
     """表名、字段名出现过的查询的 SQL（每条截到 SQL_CHARS，最多 ENTITY_QUERIES 条）。
 
     讲算法的句子（「按会员号去重计数得出」）证据在 SQL 里；只给名字，裁判只能判不支持。
     查询用条目自己记的（表：SQL 里用到它；字段：它是结果列）。只在 SQL 里出现、不是结果列的字段自己没记：
     有表条目就从它记的查询里找，没有（文档目录只留正文用到的实体）就看全部查询，都只留 SQL 里写了这个
     字段名（有表名的还要写了表名）的。快照经 fetch 取：取不到（不在封存范围里）的不给。
+    mask 同 _query_excerpt：SQL 先遮再截（要遮的列按那条查询的数据源认，masked 同 _query_excerpt）。
     """
     locator = entry.get("locator") or {}
     column = locator.get("column") if entry.get("kind") == "column" else None
@@ -671,6 +719,9 @@ def _entity_sql(entry: dict[str, Any], catalog: dict[str, Any], fetch: _Fetch) -
         sql = _clean(str(snapshot.get("sql") or "")) if isinstance(snapshot, dict) else ""
         if not sql or any(not re.search(rf"(?<![\w]){re.escape(n)}(?![\w])", sql, re.I) for n in need):
             continue
+        if mask is not None:
+            source = catalog[q].get("source") or snapshot.get("source")
+            sql = mask.sql(sql, snapshot, _derived(snapshot, _hidden(snapshot, source, masked), fetch, mask)[1])
         lines.append(f"出现在查询 {q}：{sql[:SQL_CHARS]}{'…' if len(sql) > SQL_CHARS else ''}")
         if len(lines) == ENTITY_QUERIES:
             break
@@ -727,10 +778,16 @@ class JudgeRequest:
 
 
 def prepare(doc: dict[str, Any], catalog: dict[str, Any] | None = None, *, units: Iterable[str] | None = None,
-            loader: Callable[[str], Any] | None = None, masked: dict[str, Any] | None = None) -> JudgeRequest:
+            loader: Callable[[str], Any] | None = None, masked: dict[str, Any] | None = None,
+            mask: Any = None) -> JudgeRequest:
     """裁判的输入：候选句和证据摘录。纯函数（快照经 loader 取，缺省读工件库），不调模型。
 
     catalog 缺省用文档自己存的目录；masked = {数据源名: 要遮的列}，和快照里记下的 mask_columns 合在一起。
+    mask 只在给核查 agent（反方审稿、审批质询）准备摘录时给（engine/inquiry.py 的 ExcerptMask，这里只按它的 columns、
+    cell、sql、text 几个方法用）：摘录分段遮，和核查 agent 的查询在工具边界遮的是同一套口径——改了名字的遮罩列
+    （buyer_phone AS 手机号）按 SQL 认出来也不给；SQL 照质询封存 SQL 的办法换，范围比较的阈值、LIMIT 照原样；格子逐格
+    遮，数值格照原样；列名、知识库片段、来历行按值换。报告里的指标值、原式、运行输入不遮（报告本来就摆在读者眼前）。
+    以前先渲染好整段、再整段按值换，阈值、没设遮罩的数也成了「已遮罩」。结论句裁判自己的摘录不给它，和以前逐字相同。
 
     摘录按文档标记分版本（P4-SPEC 1.4、3.3）：带 `provenance: DOC_PROVENANCE` 的文档，上传表格的查询摘录多几行
     来历；没有标记的（期 4 之前组装的）和以前逐字相同，复用键、断点指纹都不变，已判过的句子照旧复用。
@@ -743,7 +800,7 @@ def prepare(doc: dict[str, Any], catalog: dict[str, Any] | None = None, *, units
     for alias in dict.fromkeys(a for c in cands for a in c.aliases):
         entry = catalog.get(alias)
         if isinstance(entry, dict) and (text := _excerpt(alias, entry, cands, fetch, masked, catalog,
-                                                         provenance_on=provenance_on)):
+                                                         provenance_on=provenance_on, mask=mask)):
             excerpts[alias] = text
     picked = {c.unit for c in cands}
     skipped: dict[str, str] = {}
@@ -831,7 +888,8 @@ def settings_problem(value: Any) -> str | None:
         label = SETTING_LABEL.get(key, key)
         if key in ("provider", "model"):
             if item is not None and not isinstance(item, str):
-                return f"「{label}」需要填写模型接入的名称或模型 ID，留空表示不指定，当前为「{item}」"
+                # 「跟随助手的模型」是设置页接入下拉框空选项的原话（核查一组同样照设置页写，api/settings.verify_problem）
+                return f"「{label}」需要填写模型接入的名称或模型 ID，留空表示跟随助手的模型，当前为「{item}」"
         elif not _limit_ok(key, item):
             return f"「{label}」需要填写{_limit_words(key)}，留空表示不限，当前为「{item}」"
     return None
@@ -897,7 +955,8 @@ def _text(value: Any) -> str | None:
 async def judge_model_spec(session: Any, node_judge: dict[str, Any] | None = None, *,
                            settings: dict[str, Any] | None = None) -> ModelSpec:
     """裁判用哪个模型：节点上的 judge.model（连同 provider）> 设置里的证据裁判模型 > Copilot 模型 >
-    默认 provider。哪一级写了就整组用哪一级，不跨级拼 provider 和模型。thinking 关、max_tokens 4096。
+    默认 provider。哪一级写了就整组用哪一级，不跨级拼 provider 和模型。thinking 关、额度 MAX_TOKENS（推理模型关不掉
+    思考，见 MAX_TOKENS 的说明；服务方嫌大时 run_request 退回 FALLBACK_MAX_TOKENS）。
 
     建议和写作模型不同，否则等于自己审自己（报告节点发现相同会发 judge_same_model 警告）。
     """
@@ -1058,12 +1117,20 @@ def _items_of(value: Any) -> list[Any] | None:
     return value if isinstance(value, list) else None
 
 
+#: _ask 交回的没成的原因：输出到了上限被截断
+_TRUNCATED = "truncated"
+
+
 async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | None, list[BaseMessage], str | None,
                                                                   int]:
     """问一次裁判：(判定清单, 模型的原始回复, 没成的原因, 调了几次模型)。
 
     先走结构化输出；不成（模型不支持、给的不是合法结构）先从原始回复里找 JSON，再退回纯文本调用、
-    从回复里抠 JSON。原因以 error: 开头的是调用本身失败，format 是格式不对。超时由调用方掐。
+    从回复里抠 JSON。原因以 error: 开头的是调用本身失败，format 是格式不对，truncated 是输出到了上限被截断
+    （Anthropic 的 stop_reason=max_tokens、OpenAI 系的 finish_reason=length，以及 openai 结构化输出抛的
+    LengthFinishReasonError）。截断的回复整批不采信：强制工具调用截在半路时 Anthropic 给的是空对象，有的网关给半截的
+    清单——最后一条可能只写了编号，也可能判定写完了、理由写到一半，分不清哪条是完整的。结构化调用被截断的不再退回
+    纯文本：推理占满额度时纯文本调用多半一样被截断，白花一次额度。超时由调用方掐。
     """
     raws: list[BaseMessage] = []
     try:
@@ -1071,6 +1138,8 @@ async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | Non
         raw, parsed = _split_structured(got)
         if raw is not None:
             raws.append(raw)
+        if cut_off(raw):
+            return None, raws, _TRUNCATED, 1
         if (items := _items_of(parsed)) is not None:
             return items, raws, None, 1
         if raw is not None:
@@ -1078,15 +1147,43 @@ async def _ask(model: Any, messages: list[BaseMessage]) -> tuple[list[Any] | Non
             for found in [message_text(raw), *(c.get("args") for c in getattr(raw, "tool_calls", None) or [])]:
                 if (items := _items_of(found)) is not None:
                     return items, raws, None, 1
-    except Exception:  # noqa: BLE001 - 不支持结构化输出的模型退回文本解析
-        pass
+    except Exception as e:  # noqa: BLE001 - 不支持结构化输出的模型退回文本解析
+        if truncated_error(e):
+            return None, [*raws, *_spent(e)], _TRUNCATED, 1
     try:
         reply = await model.ainvoke(messages)
     except Exception as e:  # noqa: BLE001
+        if truncated_error(e):
+            return None, [*raws, *_spent(e)], _TRUNCATED, 2
         return None, raws, f"error:{describe_exception(e)}", 2
     raws.append(reply)
+    if cut_off(reply):
+        # 正文里就算抠得出一段清单，后面还在写，说不清写完了没有：同样整批不采信
+        return None, raws, _TRUNCATED, 2
     items = _items_of(message_text(reply))
     return items, raws, None if items is not None else "format", 2
+
+
+def _spent(error: BaseException) -> list[BaseMessage]:
+    """截断时 openai 的异常带着这次的用量：折成一条空回复交给记账（额度是真花出去了，每日上限不能漏掉它）。"""
+    inp, out = error_usage(error)
+    if not (inp or out):
+        return []
+    return [AIMessage(content="", usage_metadata={"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out})]
+
+
+def _with_fallback(model: Any, spec: ModelSpec, model_id: str) -> BudgetFallback:
+    """裁判模型包一层：服务方嫌 MAX_TOKENS 太大（或者 anthropic SDK 在本地就拒了）时按 FALLBACK_MAX_TOKENS 重建一个再问
+    （要退回时才建，平常不多建），之后各批都用小的。被嫌大过的按 (接入, 模型, 额度) 记在进程里：之后每份报告、每次
+    点击直接用小的，核查（verify_agent._with_fallback）同一种记法、互相认。经本模块的 get_chat_model 建：测试换成剧本
+    时，小额度的那个也是剧本。"""
+
+    async def build() -> Any:
+        async with SessionLocal() as session:
+            return (await get_chat_model(session, spec.model_copy(update={"max_tokens": FALLBACK_MAX_TOKENS})))[0]
+
+    return BudgetFallback(model, build=build, limits=(spec.max_tokens, FALLBACK_MAX_TOKENS), rejected=budget_refused,
+                          key=(spec.provider, model_id, spec.max_tokens))
 
 
 def _unjudged(reason: str, rationale: str, *, judge: str | None, post_seal: bool) -> dict[str, Any]:
@@ -1116,6 +1213,8 @@ def _why_unjudged(reason: str, budget: Budget, detail: str = "", *, click: bool 
         return f"裁判失败：{detail}"[:120]
     if reason == "format":
         return detail or "裁判返回的结果格式有误，这句未裁判"
+    if reason == "truncated":
+        return f"{detail or cut_words('裁判模型', None)}，这句未裁判。{TRUNCATED_ADVICE}"
     if reason == "missing":
         return "裁判未对这句给出判定"
     return "探索运行按需裁判：点开这句并请模型判断后才会裁判"
@@ -1149,6 +1248,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
     try:
         async with SessionLocal() as session:
             model, model_id = await get_chat_model(session, spec)
+        model = _with_fallback(model, spec, model_id)
     except Exception as e:  # noqa: BLE001 - 裁判模型没配好：这回判不了，报告照常
         why = not_configured(e) if isinstance(e, ProviderNotConfigured) else describe_exception(e)
         details["error"] = f"裁判模型不可用（{why}）"
@@ -1185,6 +1285,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
 
     spent = 0.0
     width = 1
+    cut_limit: int | None = None        # 被截断的那次调用的额度：judge_truncated 日志照它写
     while pending:
         remaining = None if budget.timeout_s is None else budget.timeout_s - (time.monotonic() - started)
         if remaining is not None and remaining <= 0:
@@ -1261,6 +1362,14 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
             end = {"model": model_id, "purpose": "judge", "duration_ms": int((time.perf_counter() - began) * 1000),
                    "input_tokens": inp, "output_tokens": out, "total_tokens": inp + out,
                    "cost_usd": round(actual, 6), "calls": calls, "units": len(batch)}
+            if problem == _TRUNCATED:
+                # 输出到了上限被截断：这一批记未裁判，原因照实说是额度，不说「格式有误」「调用失败」。别的批照常问
+                # （同格式不对）：截断取决于这一批要想多久，不像鉴权、网关出错那样后面几批多半一样
+                cut_limit = model.max_tokens
+                details["truncated"] = cut_words("裁判模型", cut_limit)
+                emit(EventType.LLM_END, **end, error=details["truncated"], truncated=True, max_tokens=cut_limit)
+                stop(batch, "truncated", details["truncated"])
+                continue
             if problem is not None and problem != "format":
                 reason = "timeout_s" if problem == "timeout_s" else "error"
                 detail = problem.partition(":")[2]
@@ -1297,7 +1406,12 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
         n = sum(outcome["unjudged"].get(r, 0) for r in hit)
         emit(EventType.LOG, level="warn", code="judge_limit", limits=hit, unjudged=n,
              message=f"结论句裁判已达上限（{labels}）：{n} 句未裁判，已裁判的结果保留")
-    if failed := [g for r, g in outcome["_gaps"] if r not in LIMITS]:
+    # 输出被截断单独记一条（带那次的额度、几句未裁判）：judge_failed 在时间线上的下一步是检查接入、重新运行，截断时接入
+    # 是好的，同一个模型重新运行多半还是截断，该换的是模型
+    if truncated := [g for r, g in outcome["_gaps"] if r == "truncated"]:
+        emit(EventType.LOG, level="warn", code="judge_truncated", max_tokens=cut_limit,
+             unjudged=outcome["unjudged"]["truncated"], message="结论句裁判未完成：" + "；".join(truncated))
+    if failed := [g for r, g in outcome["_gaps"] if r not in LIMITS and r != "truncated"]:
         emit(EventType.LOG, level="warn", code="judge_failed", message="结论句裁判未完成：" + "；".join(failed))
     outcome.pop("_gaps")
     return outcome
@@ -1394,6 +1508,8 @@ def _outcome(request: JudgeRequest, verdicts: dict[str, dict[str, Any]], budget:
             text = f"有 {n} 句结论未裁判：裁判调用失败（{details.get('error') or '原因不明'}）"
         elif reason == "format":
             text = f"有 {n} 句结论未裁判：裁判返回的结果格式有误"
+        elif reason == "truncated":
+            text = f"有 {n} 句结论未裁判：{details.get('truncated') or cut_words('裁判模型', None)}，{TRUNCATED_ADVICE}"
         else:
             text = f"有 {n} 句结论未获得裁判结果"
         gaps.append((reason, text))

@@ -7,15 +7,15 @@ import { NODE_DEFS, syntaxOf, type FieldDef, type FieldSyntax, type NodeDef } fr
 import { fieldOfIssue, isCaseKeyIssue, unboundToolOf, withToolBound, type FieldRef } from './issues'
 import { hintOf } from './shortcuts'
 import { isActivePhase } from '../run/trace'
-import { EDIT_LOCK_TEXT, useEditLock, useStudio } from '../store/studio'
+import { EDIT_LOCK_TEXT, toGraph, useEditLock, useStudio } from '../store/studio'
 import { datasourceTools, modelOptions, providerOfModel, useCatalog, useDatasources } from '../store/catalog'
 import { api } from '../api/client'
 import { IconButton, JsonInput, Modal, isComposing, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
-import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, MERGE_TEXT, CATALOG_UI_TEXT, NODE_TYPE_LABEL, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
+import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, MERGE_TEXT, CATALOG_UI_TEXT, NODE_TYPE_LABEL, PROVIDER_REF_TEXT, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
 import { TemplateText } from './TemplateText'
 import { MERGE_ALIAS, isQueryNode, mergeAlias } from './mergeInputs'
-import type { NodeType, ValidationIssue, WorkflowVersion } from '../types'
+import type { NodeType, Provider, ValidationIssue, WorkflowVersion } from '../types'
 
 /** 检查器里一条落到字段上的问题 */
 type FieldIssue = ValidationIssue & { at: FieldRef | null }
@@ -544,11 +544,38 @@ function SyntaxBadge({ syntax }: { syntax: FieldSyntax }) {
   )
 }
 
+/**
+ * 模型一栏留空时执行用什么，同后端 NodeContext.cfg：节点没写的取工作流默认设置里的。工作流默认设置写了模型，用的就是那个
+ * 模型（后端这时也不报「没有指定模型」）；否则节点点名了接入（没写就是全图默认点名的）时是那个接入的默认模型。点名的接入
+ * 不存在、已停用时空选项说状态、下面不写说明：检查器顶上另有接入那条问题，这里再说「使用……」就和它矛盾。全图默认不在
+ * 节点里，从 toGraph 带回去的那一份读。接入表还没取回来时不判状态。help 为 undefined 时用节点定义里那句
+ */
+function modelDefault(config: Record<string, any>, providers: Provider[]): { blank: string; help?: string | null } {
+  const defaults = toGraph([], []).defaults ?? {}
+  let value = config.provider
+  if (value == null || value === '') value = defaults.provider
+  const named = typeof value === 'string' && value.trim() ? value.trim() : null
+  const fallback = typeof defaults.model === 'string' && defaults.model.trim() ? defaults.model.trim() : null
+  // 认法同后端 named_provider：名称或 id，名称两边的空白不算
+  const found = named ? providers.find((p) => p.id === named || p.name === named || p.name.trim() === named) : undefined
+  const state = !named || !providers.length || found?.enabled ? 'ok' : found ? 'disabled' : 'missing'
+  const help = state !== 'ok' ? null : fallback ? PROVIDER_REF_TEXT.modelHelpDefaults(fallback)
+    : named ? PROVIDER_REF_TEXT.modelHelp(named) : undefined
+  return { blank: PROVIDER_REF_TEXT.modelBlank(named, state, fallback), help }
+}
+
 function Field({ field, nodeId, value, config, issues, onChange }: {
   field: FieldDef; nodeId: string; value: any; config: Record<string, any>
   issues: FieldIssue[]; onChange: (v: any) => void
 }) {
   const id = `f-${nodeId}-${field.key}`
+  // 节点定义里的模型一栏（MODEL_FIELDS）：说明跟着全图默认的模型、点名的接入走（modelDefault），节点定义里那句只适用于
+  // 两样都没写的时候。自己画的模型栏（核查节点的反方模型、盲算模型）只读节点自己的配置、留空跟随设置，不取全图默认，
+  // 说明在它自己里面——这里再套一句「留空则使用接入「X」的默认模型」就和它相反
+  const modelField = field.type === 'model' && !field.render
+  const providers = useCatalog((s) => (modelField ? s.providers : NO_ROWS))
+  const model = modelField ? modelDefault(config, providers) : null
+  const help = model?.help === undefined ? field.help : model.help ?? undefined
   const syntax = syntaxOf(field)
   const composite = field.type === 'cases' || field.type === 'agents' || field.type === 'ioFields'
     || field.type === 'metricsList' || field.type === 'caliberFrom' || field.type === 'judge'
@@ -590,8 +617,8 @@ function Field({ field, nodeId, value, config, issues, onChange }: {
       <FieldInput field={field} id={id} nodeId={nodeId} syntax={syntax} value={value} config={config}
                   invalid={bad} describedBy={[errorId, off ? `${id}-off` : ''].filter(Boolean).join(' ') || undefined}
                   disabled={!!off} issues={issues} onChange={onChange} />
-      {field.help && field.type !== 'switch' && (
-        <div className="mt-1 text-2xs leading-snug text-faint">{field.help}</div>
+      {help && field.type !== 'switch' && (
+        <div className="mt-1 text-2xs leading-snug text-faint" data-field-help="">{help}</div>
       )}
       {off && <div id={`${id}-off`} className="mt-1 text-2xs leading-snug" style={{ color: 'var(--st-waiting)' }}>{off}</div>}
       {!!own.length && (
@@ -618,6 +645,9 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
   const defaults = useRunDefaults(field.key === 'scope' || field.type === 'collection')
   const aria = { 'aria-invalid': invalid || undefined, 'aria-describedby': describedBy }
 
+  if (field.render) {
+    return <>{field.render({ id, nodeId, value, config, invalid, describedBy, disabled, onChange })}</>
+  }
   switch (field.type) {
     case 'text':
       if (syntax !== 'plain') {
@@ -702,7 +732,7 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
       const groups = [...new Set(options.map((o) => o.group))]
       return (
         <select id={id} className="field" value={value ?? ''} {...aria} onChange={(e) => onChange(e.target.value)}>
-          <option value="">默认（使用第一个可用的模型接入）</option>
+          <option value="">{modelDefault(config, providers).blank}</option>
           {groups.map((g) => (
             <optgroup key={g} label={g}>
               {options.filter((o) => o.group === g).map((o) => (

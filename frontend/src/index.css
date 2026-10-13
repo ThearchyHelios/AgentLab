@@ -83,6 +83,8 @@
   --nt-validate: #ebb1fd;
   --nt-metrics: #cbaddb;
   --nt-report: #a9b0ec;
+  --nt-dual_check: #a98ee0;
+  --nt-challenge: #dcb7ef;
 
   /* 检索通路的分类色：只说「这一分是哪一路检索贡献的」，不表示状态，所以
      不借 accent / ok / warn。两色按 dataviz 校验过：色觉异常下也分得开，
@@ -142,6 +144,8 @@
   --nt-validate: #885398;
   --nt-metrics: #6e557b;
   --nt-report: #4f5694;
+  --nt-dual_check: #5a4a91;
+  --nt-challenge: #7d4c8f;
   --via-semantic: #0a7ea4;
   --via-keyword: #c2447a;
 }
@@ -199,6 +203,8 @@
     --nt-validate: #885398;
     --nt-metrics: #6e557b;
     --nt-report: #4f5694;
+    --nt-dual_check: #5a4a91;
+    --nt-challenge: #7d4c8f;
     --via-semantic: #0a7ea4;
     --via-keyword: #c2447a;
   }
@@ -407,6 +413,8 @@
 .nt-subgraph   { --nt: var(--nt-subgraph); }
 .nt-metrics    { --nt: var(--nt-metrics); }
 .nt-report     { --nt: var(--nt-report); }
+.nt-dual_check { --nt: var(--nt-dual_check); }
+.nt-challenge  { --nt: var(--nt-challenge); }
 
 /* --------------------------------------------------------------------------
    React Flow 覆盖

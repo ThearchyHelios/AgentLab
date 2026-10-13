@@ -1,0 +1,208 @@
+{
+ "_comment": "口径卡的金样：加 value_artifact 之前的代码（feat/verify-suite 35bb23d）真跑出来的 metric_set 工件。scalar 是只有标量输入的卡，改动之后工件必须逐字节相同（工件 id 不变）；box 带容器型 vars 输入，改动之后只多 value_artifact 这一个键。虚构数据。",
+ "scalar": {
+  "artifact": "4af4e64d2fac8bae1f0acc8f65573afb3b527547878c053cc9b6d6687e321408",
+  "card": {
+   "caliber": "推演口径",
+   "caliber_version": "v3",
+   "kind": "metric_set",
+   "metrics": [
+    {
+     "decimals": 1,
+     "expression": "vars.kpi.gmv",
+     "format": "thousands",
+     "id": "gmv",
+     "inputs": [
+      {
+       "field": "gmv",
+       "node_id": "fetch",
+       "path": "vars.kpi.gmv",
+       "status": "ok",
+       "value": 45678.5,
+       "via": "transform"
+      }
+     ],
+     "name": "销售额",
+     "recompute_ok": true,
+     "rendered": "45,678.5元",
+     "status": "ok",
+     "substituted": "45678.5",
+     "unit": "元",
+     "value": 45678.5
+    },
+    {
+     "decimals": 1,
+     "expression": "round((vars.kpi.gmv - vars.kpi.gmv_prev) / vars.kpi.gmv_prev * 100, 1)",
+     "format": "plain",
+     "id": "wow",
+     "inputs": [
+      {
+       "field": "gmv",
+       "node_id": "fetch",
+       "path": "vars.kpi.gmv",
+       "status": "ok",
+       "value": 45678.5,
+       "via": "transform"
+      },
+      {
+       "field": "gmv_prev",
+       "node_id": "fetch",
+       "path": "vars.kpi.gmv_prev",
+       "status": "ok",
+       "value": 42010.0,
+       "via": "transform"
+      }
+     ],
+     "name": "环比增幅",
+     "recompute_ok": true,
+     "rendered": "8.7%",
+     "status": "ok",
+     "substituted": "round((45678.5 - 42010.0) / 42010.0 * 100, 1)",
+     "unit": "%",
+     "value": 8.7
+    },
+    {
+     "decimals": null,
+     "expression": "vars.kpi.orders",
+     "format": "thousands",
+     "id": "orders",
+     "inputs": [
+      {
+       "field": "orders",
+       "node_id": "fetch",
+       "path": "vars.kpi.orders",
+       "status": "ok",
+       "value": 1234,
+       "via": "transform"
+      }
+     ],
+     "name": "订单数",
+     "recompute_ok": true,
+     "rendered": "1,234单",
+     "status": "ok",
+     "substituted": "1234",
+     "unit": "单",
+     "value": 1234
+    },
+    {
+     "decimals": 4,
+     "expression": "vars.kpi.refunds / vars.kpi.orders",
+     "format": "percent_of_ratio",
+     "id": "refund_rate",
+     "inputs": [
+      {
+       "field": "refunds",
+       "node_id": "fetch",
+       "path": "vars.kpi.refunds",
+       "status": "ok",
+       "value": 29,
+       "via": "transform"
+      },
+      {
+       "field": "orders",
+       "node_id": "fetch",
+       "path": "vars.kpi.orders",
+       "status": "ok",
+       "value": 1234,
+       "via": "transform"
+      }
+     ],
+     "name": "退款率",
+     "recompute_ok": true,
+     "rendered": "2.35%",
+     "status": "ok",
+     "substituted": "29 / 1234",
+     "unit": "",
+     "value": 0.0235
+    }
+   ]
+  }
+ },
+ "box": {
+  "artifact": "e2ec0b24639f78e4c14a22408516e5e6d7e4890025a6d0cbcad6fa7828bfbee9",
+  "card": {
+   "caliber": "推演口径",
+   "caliber_version": "v3",
+   "kind": "metric_set",
+   "metrics": [
+    {
+     "decimals": null,
+     "expression": "len(vars.kpi.items)",
+     "format": "thousands",
+     "id": "n",
+     "inputs": [
+      {
+       "field": "items",
+       "node_id": "fetch",
+       "path": "vars.kpi.items",
+       "status": "ok",
+       "value": "[3 项]",
+       "via": "transform"
+      }
+     ],
+     "name": "条数",
+     "recompute_ok": true,
+     "rendered": "3",
+     "status": "ok",
+     "substituted": "len(vars.kpi.items)",
+     "unit": "",
+     "value": 3
+    },
+    {
+     "decimals": null,
+     "expression": "len(vars.kpi.meta)",
+     "format": "thousands",
+     "id": "m",
+     "inputs": [
+      {
+       "field": "meta",
+       "node_id": "fetch",
+       "path": "vars.kpi.meta",
+       "status": "ok",
+       "value": "{2 个字段}",
+       "via": "transform"
+      }
+     ],
+     "name": "字段数",
+     "recompute_ok": true,
+     "rendered": "2",
+     "status": "ok",
+     "substituted": "len(vars.kpi.meta)",
+     "unit": "",
+     "value": 2
+    },
+    {
+     "decimals": null,
+     "expression": "sum(vars.kpi.items) + vars.kpi.gmv",
+     "format": "thousands",
+     "id": "s",
+     "inputs": [
+      {
+       "field": "items",
+       "node_id": "fetch",
+       "path": "vars.kpi.items",
+       "status": "ok",
+       "value": "[3 项]",
+       "via": "transform"
+      },
+      {
+       "field": "gmv",
+       "node_id": "fetch",
+       "path": "vars.kpi.gmv",
+       "status": "ok",
+       "value": 10,
+       "via": "transform"
+      }
+     ],
+     "name": "合计",
+     "recompute_ok": true,
+     "rendered": "25",
+     "status": "ok",
+     "substituted": "sum(vars.kpi.items) + 10",
+     "unit": "",
+     "value": 25
+    }
+   ]
+  }
+ }
+}

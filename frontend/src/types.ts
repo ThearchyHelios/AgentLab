@@ -1,7 +1,7 @@
 export type NodeType =
   | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code' | 'merge'
   | 'branch' | 'loop' | 'subgraph' | 'memory' | 'retrieve' | 'transform'
-  | 'human' | 'validate' | 'metrics' | 'report'
+  | 'human' | 'validate' | 'metrics' | 'report' | 'dual_check' | 'challenge'
 
 export interface GraphNode {
   id: string
@@ -1384,11 +1384,14 @@ export interface PublishFix {
   code: string
   kind: 'auto' | 'choice' | 'assist'
   node_id?: string | null
+  /** 这条修复落在哪个字段：点名的模型接入一处一条（同一节点上的几处按它区分） */
+  field?: string | null
   label: string
   preview?: { field?: string | null; before?: unknown; after?: unknown } | null
   /** handoff：选了这一项就是「交给 Copilot」（G4 的「它在做计算」）。只认这个标记，不认值——
-   *  别的选项拿节点 id 当值，节点 id 恰好叫 copilot 的报告撰写节点照样是普通候选 */
-  options?: { value: unknown; label: string; hint?: string | null; handoff?: boolean }[]
+   *  别的选项拿节点 id 当值，节点 id 恰好叫 copilot 的报告撰写节点照样是普通候选。
+   *  demo：点名的模型接入的候选，修完以后执行时落到演示类接入（不调用真实模型），选项名旁加醒目的标签 */
+  options?: { value: unknown; label: string; hint?: string | null; handoff?: boolean; demo?: boolean }[]
   multiple?: boolean
   /** 建议值：界面上标「建议」，仍然要人选 */
   default?: unknown
@@ -2037,7 +2040,12 @@ export interface EvidenceGraph {
               /** 封存的裁判摘要（文档的 judge） */
               judge?: EvidenceJudgeSummary | null
               /** 最近一次按需裁判用的模型：和写作模型相同没有、在不在价格表里 */
-              judge_meta?: EvidenceJudgeMeta | null }[]
+              judge_meta?: EvidenceJudgeMeta | null
+              /**
+               * 期 4：被反方审过的句子 → 判断（_challenge_verdicts，和片段接口的 unit.challenge 同一个读法，每句的判断
+               * 一字不差）。正文据此给被审过的句子挂句末标记、点开整句面板。一句都没审、文档读不出来、老服务端都没有这个键
+               */
+              challenge_verdicts?: EvidenceChallengeVerdicts }[]
   evidence?: { alias?: string; eid?: string; kind?: string; label?: string; node_id?: string; artifact?: string
                sealed?: boolean; cited_by?: string[]; report?: string }[]
   edges?: { from: string; to: string; rel: string }[]
@@ -2090,6 +2098,65 @@ export interface EvidenceInput {
   cell?: string
   /** agent 的数组字段：引用的行段到了截断查询结果的末行，后面还有没取回的行（query 步骤上是快照本身截断了） */
   truncated?: boolean | null
+  /**
+   * 期 4：取自数据源设置了遮罩的列（_withheld）：服务端已把值换成「已遮罩」、拿掉 model_value / snapshot_value，这里写明
+   * 是哪几列。没遮的没有这个键
+   */
+  masked?: string[]
+  /**
+   * 期 4：遮没遮核对不了（查询快照、取值链上的产出读不出来）：值同样换成「已遮罩」，这是原因（人话，服务端写好的一句）。
+   * 不进 masked：面板底下「这些列设置了遮罩」不把它们算进去
+   */
+  mask_unverified?: string
+}
+
+// ---------------------------------------------------------------------------
+// 期 4：证据接口里的核查状态（api/evidence.py）。是核查，不是证据：没核查过的指标、句子不带这些键。形状照服务端的
+// 真实输出逐字核对过，前端认的时候仍按「认不出就不画」写（run/EvidencePanel.tsx 的 dualCheckOf / challengeOf）
+// ---------------------------------------------------------------------------
+
+/** 双盲复算跳过一个指标的原因（_not_checked）：关闭了；这个指标没有来自查询的输入；不在复算范围内（或值不是数） */
+export type EvidenceDualCheckSkip = 'disabled' | 'no_inputs' | 'not_targeted'
+
+/**
+ * 指标步骤上的双盲复算状态（_dual_check_of / _dual_status）。没有双盲复算复核过这份指标集时指标步骤没有 dual_check。
+ * 产出读不出来、退回台账条目时只有 status、node_id 和 choice
+ */
+export interface EvidenceDualCheck {
+  /** agreed 与盲算一致；disagreed 不一致；unchecked 未能完成（盲算触顶、出错，或输入没法单独复算）；skipped 没复算这个指标 */
+  status: 'agreed' | 'disagreed' | 'unchecked' | 'skipped'
+  /** 双盲复算节点 */
+  node_id: string
+  /** 只有 disagreed：审核人的选择（a 采用原流程、b 采用盲算、neither 两边都不对）。没选的没有 */
+  choice?: DualCheckChoice
+  /** 只有 agreed / disagreed：盲算值，服务端按口径卡的格式渲染好的 */
+  blind_rendered?: string
+  /** unchecked：给人看的原因；skipped：EvidenceDualCheckSkip 里的代码（界面认不出的代码不显示） */
+  reason?: string
+}
+
+/**
+ * 一份报告里被反方审过的句子 → 判断（证据图 reports[].challenge_verdicts，_challenge_verdicts）。只有被审过的句子；判断和
+ * 点开这一句时片段接口答的 unit.challenge.verdict 一字不差。正文据此挂句末标记，证据面板在片段接口答回来之前先按它写判断
+ */
+export type EvidenceChallengeVerdicts = Record<string, ChallengeVerdict | (string & {})>
+
+/** 句子上的反方审稿判断（_challenge_of）：片段接口答的 unit.challenge。没被反方审过的句子没有这个键 */
+export interface EvidenceUnitChallenge {
+  /** 这一句的判断（反方模型给的，不是系统核对） */
+  verdict: ChallengeVerdict | (string & {})
+  /** 反方审稿节点（几个都审了这一句时取最后跑完的那个） */
+  node_id: string
+  /** 审稿记录（challenge_artifact）。服务端保存失败时为 null：判断照样有，理由和查询看不了 */
+  artifact: string | null
+  /** 实际生效的处置：degrade 被推翻的计入出具缺口；flag 只标注；fail 节点报错、运行停了 */
+  on_refuted: 'degrade' | 'flag' | 'fail'
+  /** 报告撰写节点的名字（画布上的标题，取不到时是节点 id） */
+  report_label: string
+  /** 这次审稿四种判断各几句：整份报告的（节点产出里的那一份），不是这一句的 */
+  counts: ChallengeCounts
+  /** 没能反查的句数（都记为无法判断，不会多于 counts.inconclusive）。节点产出里有才带 */
+  unreviewed?: number
 }
 
 /** 口径卡钉在另一个已发布工作流某个版本里的口径卡上 */
@@ -2213,6 +2280,8 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   sql_check_failed?: boolean
   /** metric：没通过的原因（人话，「所依据的查询未通过 SQL 检查（…），结果不可靠」） */
   sql_check_reason?: string
+  /** metric（期 4）：这个指标的双盲复算状态。没有双盲复算复核过这份指标集时没有这个键 */
+  dual_check?: EvidenceDualCheck
   /** query：这次查询对照数据目录查出的问题。没查出问题时没有这个键 */
   checks?: SqlCheckItem[]
   /** query：查询当时冻结的表结构快照（工件 id）。合并查询、老快照没有 */
@@ -2366,7 +2435,9 @@ export interface EvidenceSegmentDetail {
           /** 这一句的判定：封存的文档里的，或者按最新的 evidence.judged 叠上的（post_seal） */
           verdict?: EvidenceVerdict
           /** 这一句能不能请模型判断、不能的话为什么 */
-          on_demand?: EvidenceOnDemand }
+          on_demand?: EvidenceOnDemand
+          /** 期 4：反方审稿对这一句的判断。没审到这一句的没有这个键 */
+          challenge?: EvidenceUnitChallenge }
   block?: { id?: string; type?: string }
   chain?: EvidenceStep[]
   /** 片段为什么是现在这个状态，一句人话 */
@@ -3019,4 +3090,813 @@ export interface SqlCheckItem {
   column?: string
   relation_id?: string
   sql_excerpt?: string
+}
+
+// ===========================================================================
+// 数字推演（后端 app/api/whatif.py、app/engine/recompute.py）：在一次运行的口径卡上改输入、排除查询快照里的行，
+// 看指标和报告里引用它的地方会变成多少。推演不是出具：不写运行记录、不改报告
+// ===========================================================================
+
+/** 推演的改动：输入路径 → 新值；查询快照的工件 id → 要排除的行号（快照里的行号，从 0 数） */
+export interface WhatIfOverrides {
+  inputs: Record<string, number>
+  exclude_rows: Record<string, number[]>
+}
+
+/** POST /runs/{id}/evidence/whatif 的请求体 */
+export interface WhatIfRequest {
+  /** 报告撰写节点 id：只列这份报告里引用的地方 */
+  report?: string
+  /** 口径卡节点 id */
+  card: string
+  /** 只推演这一个指标 */
+  metric?: string
+  overrides: WhatIfOverrides
+}
+
+/** 一个输入在推演里的样子 */
+export interface WhatIfInput {
+  path: string
+  via?: string | null
+  node_id?: string | null
+  /** 落在哪份查询快照上（cell() 取的格、agent 字段、整份查询结果）：排除这份快照里的行会影响它 */
+  artifact?: string
+  locator?: EvidenceLocator
+  kind: 'number' | 'text' | 'bool' | 'missing' | 'container' | (string & {})
+  /** 数值（或原本缺失）的标量、不是遮罩列、不决定取哪一格、还原得出：可以改。整个指标推演不了时一律为 false */
+  editable: boolean
+  /** 原值、推演用的值。容器写大概（「[12 项]」）；遮罩列的一律是 null */
+  old?: unknown
+  new?: unknown
+  changed?: boolean
+  /** 起了作用的被排除行（快照里的行号，从 0 数） */
+  excluded_rows?: number[]
+  /**
+   * 这个输入实际用到的快照行（含两端，从 0 数）：单格一行、数组字段一段、整份查询结果全部。排除别的行影响不到它，
+   * 界面只让这几行可勾。遮罩的、还原不了的（完整值找不回来、快照读不出来）没有，决定取哪一格的数组字段、整份结果
+   * 也没有（少了几行，取到哪一格说不准），整个指标推演不了时一律没有
+   */
+  row_span?: [number, number]
+  masked?: boolean
+  /** 落在的查询快照读不出来（文件不在、与哈希不一致）：遮没遮核对不了，值不给 */
+  withheld?: boolean
+}
+
+/**
+ * unchanged：没碰到改动，原值原样交回；ok：重算了；excluded：排除行后缺了输入，算不出来；error：新值让计算出错（除以零……）；
+ * unsupported：推演不了（有输入还原不了、口径卡没记输入，或者排除行后说不准受不受影响）；masked：用到了遮罩列，
+ * 不推演。整个指标推演不了的不改动也是 unsupported / masked（unsupported 里另有一条 input 为空的）
+ */
+export type WhatIfStatus = 'unchanged' | 'ok' | 'excluded' | 'error' | 'unsupported' | 'masked'
+
+export interface WhatIfMetric {
+  id: string
+  name: string
+  unit: string
+  decimals?: number | null
+  format?: string
+  old: unknown
+  new: unknown
+  delta: number | null
+  /** 按口径卡的格式渲染（和报告里的字同一套规则） */
+  rendered_old: string
+  /** unsupported、masked 时为 null：不知道会变成什么 */
+  rendered_new: string | null
+  /** 带正负号；比率、百分数写「个百分点」。没变化、不是数时为 null */
+  rendered_delta: string | null
+  changed: boolean | null
+  status: WhatIfStatus | (string & {})
+  reason: string | null
+  /** 推演用的代入式（重算了才有；没碰到改动的是卡上原来的代入式） */
+  substituted: string | null
+  inputs: WhatIfInput[]
+}
+
+/** 报告里引用这个指标的一处，推演之后会写成什么 */
+export interface WhatIfSegment {
+  report: string
+  unit: string
+  sid: string
+  metric: string
+  rendered_old: string
+  rendered_new: string | null
+  changed: boolean | null
+}
+
+export interface WhatIfUnsupported {
+  metric: string
+  /**
+   * null：整个指标都推演不了（口径卡没记输入、用到了遮罩列、有输入还原不了或所在的快照读不出来），reason 和指标上的
+   * 一样。不论改什么都推演不了，不改动也有这一条；界面据此只写原因，不画输入框、勾选框
+   */
+  input: string | null
+  reason: string
+}
+
+/** 引用了这张口径卡的下游口径卡：只标可能受影响，不重算 */
+export interface WhatIfAffectedCard {
+  node_id: string
+  artifact: string
+  caliber: string
+  version: string
+  metrics: string[]
+  /** 直接引用（false 是经别的卡间接引用） */
+  direct: boolean
+}
+
+/**
+ * GET /runs/{id}/evidence/whatif/rows：一页查询快照的行（推演时勾行用），形状和证据面板的查询步骤一致，
+ * 可以直接交给 queryWindow。遮罩列写「已遮罩」；快照读不出来时没有行，note 说明原因
+ */
+export interface WhatIfRowsPage {
+  run_id: string
+  artifact: string
+  node_id?: string | null
+  tool?: string | null
+  source?: string | null
+  columns: string[]
+  rows: unknown[][]
+  row_offset: number
+  row_index: number[]
+  total_rows: number | null
+  truncated: boolean | null
+  masked: string[]
+  hash_ok: boolean | null
+  sealed: boolean
+  note?: string
+}
+
+export interface WhatIfResult {
+  run_id: string
+  card: { node_id: string; artifact: string; caliber: string; version: string }
+  report: string | null
+  /** 运行已封存且封存核对一致：推演依据的数据不会再变 */
+  sealed: boolean
+  seal: { sealed: boolean; ok: boolean | null }
+  metrics: WhatIfMetric[]
+  segments: WhatIfSegment[]
+  unsupported: WhatIfUnsupported[]
+  affected_cards: WhatIfAffectedCard[]
+}
+
+// ---------------------------------------------------------------------------
+// 定时任务（/api/schedules，页面在 pages/schedules）。前后端按同一份接口约定，字段名和形状不各自发挥；时间一律是
+// ISO 字符串（UTC），按定时任务自己的时区显示
+// ---------------------------------------------------------------------------
+
+/**
+ * 运行列表里的定时来源：发起它的定时任务，手动发起的是 null，老服务端不给。写在这里而不是上面 Run 的定义里：
+ * 同名接口会合并，定时任务的类型集中在文件末尾这一段，不和别的工作包改同一处
+ */
+export interface Run {
+  schedule_id?: string | null
+}
+
+export type ScheduleRunClass = 'formal' | 'exploratory'
+/** Webhook 消息的格式：通用 JSON、飞书 / 企业微信 / 钉钉的群机器人 */
+export type ScheduleWebhookFormat = 'generic' | 'feishu' | 'wecom' | 'dingtalk'
+/** 订阅的事件：运行结束、运行失败、停在人工审批上（只在真有待审批时发） */
+export type ScheduleEvent = 'finished' | 'failed' | 'awaiting_approval'
+/** 触发的来源：到点、手动「立即运行」、错过之后在宽限内补发 */
+export type ScheduleFireKind = 'scheduled' | 'manual' | 'misfire'
+/** 触发的结局：发起了运行、上一次还没结束而跳过、错过时间超出宽限而跳过、发起时被拒 */
+export type ScheduleFireStatus = 'started' | 'skipped_overlap' | 'skipped_misfire' | 'failed_to_start'
+
+/** 读出来的 Webhook 设置。完整地址服务端加密保存、不再返回，只露主机和末 4 位 */
+export interface ScheduleWebhook {
+  format: ScheduleWebhookFormat
+  /** 如 open.feishu.cn/…ab12 */
+  url_hint: string
+  has_secret: boolean
+  events: ScheduleEvent[]
+}
+
+/** 一次触发发出的一条通知 */
+export interface ScheduleFireNotice {
+  event: ScheduleEvent
+  status: 'ok' | 'failed'
+  at: string
+}
+
+/**
+ * 运行成功结束后和同一定时任务上一次成功的运行的自动对比：基准是哪一次、各类指标的个数（同对比接口的 summary）。
+ * 只有个数，具体的数在对比页上
+ */
+export interface ScheduleFireCompare {
+  base_run_id: string
+  summary: RunCompareSummary
+  /**
+   * 基准是不是紧挨着的上一次。上一次失败了、取消了时，基准是再往前成功的那一次，为 false：界面写明比的是哪一次。
+   * 老服务端不给，按 true 看
+   */
+  previous?: boolean
+}
+
+/** 一次触发（触发历史的一行） */
+export interface ScheduleFire {
+  id: string
+  /** 计划触发的时间；手动运行是按下的那一刻 */
+  fire_at: string
+  kind: ScheduleFireKind
+  status: ScheduleFireStatus
+  run_id: string | null
+  /** 发起的那次运行现在的状态（同 Run.status） */
+  run_status: RunStatus | null
+  /** 跳过、发起失败的原因（中文） */
+  reason: string | null
+  notified: ScheduleFireNotice[]
+  /**
+   * 和同一定时任务上一次成功的运行的对比。运行没有成功结束、没有可比的、还没算、比不了、任何一边又在执行（不在终态）
+   * 或重新封存过时为 null；老服务端不给
+   */
+  compare?: ScheduleFireCompare | null
+  created_at: string
+}
+
+export interface Schedule {
+  id: string
+  name: string
+  workflow_id: string
+  workflow_name: string
+  /** 五段 cron：分 时 日 月 星期 */
+  cron: string
+  /** IANA 时区名，如 Asia/Shanghai */
+  timezone: string
+  run_class: ScheduleRunClass
+  /** 字段名 → 模板字符串，变量（{{ schedule.yesterday }} 这类）按触发时间计算 */
+  input_template: Record<string, string>
+  enabled: boolean
+  /** 上一次还没结束时怎么办：目前只有跳过 */
+  overlap: 'skip'
+  /** 错过触发时间后多少秒内恢复还补发一次 */
+  misfire_grace_s: number
+  webhook: ScheduleWebhook | null
+  /** 暂停中、或者往后不会再触发时为 null */
+  next_run_at: string | null
+  last_fire: ScheduleFire | null
+  /** 频率的中文说法，如「每周一 09:00（Asia/Shanghai）」 */
+  description_text: string
+  created_by: string | null
+  created_at: string
+  updated_at: string
+  /** 乐观锁：修改时带上读到的版本，别人在这期间改过时回 409 */
+  version: number
+}
+
+/** 新建、修改时交上去的 Webhook。地址、密钥的明文只在写的时候给 */
+export interface ScheduleWebhookIn {
+  format: ScheduleWebhookFormat
+  /** 修改时：省略表示不改，空串表示删除整个 Webhook */
+  url?: string
+  /** 修改时：省略表示不改，空串表示清除 */
+  secret?: string
+  events: ScheduleEvent[]
+}
+
+/** POST /api/schedules 的请求体 */
+export interface ScheduleCreate {
+  name: string
+  workflow_id: string
+  cron: string
+  timezone: string
+  run_class: ScheduleRunClass
+  input_template: Record<string, string>
+  enabled: boolean
+  overlap: 'skip'
+  misfire_grace_s: number
+  webhook: ScheduleWebhookIn | null
+}
+
+/** PATCH /api/schedules/{id} 的请求体：只带改了的字段，外加读到的版本 */
+export type SchedulePatch = Partial<Omit<ScheduleCreate, 'webhook'>> & {
+  webhook?: ScheduleWebhookIn
+  version: number
+}
+
+export interface SchedulePreviewRequest {
+  cron: string
+  timezone: string
+  input_template?: Record<string, string>
+  workflow_id?: string
+  n?: number
+}
+
+/** 预览：频率的中文说法、接下来几次触发时间、按下一次触发时间渲染出的输入。非法时 422 {detail, field} */
+export interface SchedulePreview {
+  description_text: string
+  next: string[]
+  inputs: Record<string, string>
+}
+
+/** 输入模板里能用的变量 */
+export interface ScheduleVariable {
+  /** 如 schedule.yesterday */
+  name: string
+  /** 如「昨天（YYYY-MM-DD）」 */
+  label: string
+  example: string
+}
+
+/** POST /api/schedules/{id}/run：这次手动触发和它发起的运行（没发起时为 null） */
+export interface ScheduleRunResult {
+  fire: ScheduleFire
+  run_id: string | null
+}
+
+/** GET /api/schedules/{id}/fires 的一页，新的在前；next_before 是下一页的游标，没有更多时为 null */
+export interface ScheduleFirePage {
+  items: ScheduleFire[]
+  next_before: string | null
+}
+
+/** POST /api/schedules/{id}/webhook/test：用已保存的设置发一条测试消息 */
+export interface ScheduleWebhookTest {
+  ok: boolean
+  http_status: number | null
+  message: string
+}
+
+// 运行对比（GET /api/runs/{id}/compare/base、/compare?base=）：两次运行的指标变化按数据 / 口径 / 模板与 SQL 拆开说。
+// 形状照前后端共用的接口约定，字段名一个不改；数值都是服务端算好的，界面只排版，渲染值原样显示
+// ---------------------------------------------------------------------------
+
+/** 对比里的一次运行。版本是空的：没从固定版本发起（探索运行）；schedule_id 是空的：手动发起 */
+export interface RunCompareRef {
+  id: string
+  workflow_name: string
+  version: number | null
+  run_class: 'formal' | 'exploratory' | null
+  started_at: string | null
+  finished_at: string | null
+  schedule_id: string | null
+}
+
+/** 默认基准从哪来：同一定时任务的上一次，没有就同一工作流、同一运行类别的上一次 */
+export type RunCompareBaseReason = 'same_schedule' | 'same_workflow'
+
+/** GET /runs/{id}/compare/base。找不到时 404，detail 是一句原因 */
+export interface RunCompareBase {
+  base_run_id: string
+  reason: RunCompareBaseReason | (string & {})
+  base: RunCompareRef
+  /**
+   * 基准是不是紧挨着的上一次（服务端 pick_base 算的，同触发历史里自动对比的 previous）：上一次失败、取消、还没结束时
+   * 为 false，运行详情「更多」里的入口据此写「与上一次成功的运行对比」。老服务端不给，按 true 算
+   */
+  previous?: boolean
+}
+
+/**
+ * 指标的分类。unchanged：未变；data_only：只数据变；caliber_and_data：口径与数据都变（能严格拆时给口径效应、数据效应）；
+ * sql_changed：所依据的查询 SQL 结构变了（口径不同，不拆）；params_only：SQL 只差字面量（定时运行的日期）；
+ * added / removed：只有本次 / 只有基准有；incomparable：缺比较所需的信息
+ */
+export type RunCompareClass =
+  | 'unchanged' | 'data_only' | 'caliber_and_data' | 'sql_changed' | 'params_only' | 'added' | 'removed' | 'incomparable'
+
+/** 各类指标的个数 */
+export type RunCompareSummary = Record<RunCompareClass, number>
+
+export interface RunCompareTemplateNode {
+  node_id: string
+  title: string
+  change: 'added' | 'removed' | 'config' | (string & {})
+  /** 改了的配置项（节点配置里的键） */
+  keys: string[]
+  /** 约定之外、服务端顺带给的：各配置项在界面上的叫法，和 keys 一一对应。没给（或对不上）时照写键名 */
+  labels?: string[]
+}
+
+export interface RunCompareTemplate {
+  base_version: number | null
+  target_version: number | null
+  /** 两次运行的执行图完全相同 */
+  same_graph: boolean
+  nodes: RunCompareTemplateNode[]
+}
+
+/**
+ * 严格拆分：口径效应 = 新口径(本次的数据) − 旧口径(本次的数据)，数据效应 = 旧口径(本次的数据) − 旧口径(基准的数据)，
+ * 两者之和正好是总变化。*_rendered 是服务端按口径卡格式写好的（带正负号）
+ */
+export interface RunCompareDecomposition {
+  caliber_effect: number
+  data_effect: number
+  caliber_rendered: string
+  data_rendered: string
+}
+
+/** 一个输入在两次运行里的值（容器写大概，缺的是 null） */
+export interface RunCompareInput {
+  path: string
+  base: unknown
+  target: unknown
+  /** 约定之外、服务端顺带给的：取自设置了遮罩的列，两边的值都不给 */
+  masked?: boolean
+}
+
+export interface RunCompareAttributionRow {
+  /** 各维度列上的取值，和 columns 一一对应 */
+  key: unknown[]
+  base: number | null
+  target: number | null
+  delta: number | null
+  /** 这一项的变化占总变化的比例（小数，0.4 是 40%）。度量列之和对不上指标的输入时为 null，原因在 note */
+  share: number | null
+}
+
+/** 维度归因：按键对齐两边查询结果的行，变化最大的排在前面 */
+export interface RunCompareAttribution {
+  columns: string[]
+  measure: string
+  rows: RunCompareAttributionRow[]
+  total_delta: number | null
+  note: string | null
+}
+
+export interface RunCompareMetric {
+  card_id: string
+  card_title: string
+  metric_id: string
+  name: string
+  unit: string
+  decimals: number | null
+  base: number | null
+  target: number | null
+  base_rendered: string | null
+  target_rendered: string | null
+  delta: number | null
+  /** 带正负号；比率、百分数写「个百分点」。没变化、不是数时可能为 null */
+  delta_rendered: string | null
+  /** 相对基准变化了百分之几（已乘 100，保留两位：12.5 是 +12.5%，和占比的小数写法不同）；基准为 0、缺值时为 null */
+  delta_pct: number | null
+  classification: RunCompareClass | (string & {})
+  reasons: string[]
+  decomposition: RunCompareDecomposition | null
+  /** 没法严格拆分的原因；能拆、或者用不着拆（只数据变、未变）时为 null */
+  decomposition_note: string | null
+  inputs: RunCompareInput[]
+  attribution: RunCompareAttribution | null
+}
+
+/** same：完全相同；params_only：规范化之后相同，只差字面量；changed：结构不同；added / removed：只有一边有 */
+export type RunCompareStructure = 'same' | 'params_only' | 'changed' | 'added' | 'removed'
+
+export interface RunCompareQuery {
+  node_id: string
+  node_title: string
+  /** 同一节点里的第几条查询（服务端的序号，只用来排序和区分，界面另按 1 起数） */
+  ordinal: number
+  structure: RunCompareStructure | (string & {})
+  base_sql: string | null
+  target_sql: string | null
+  /** 不同的字面量（SQL 写法，字符串带引号），按出现的顺序 */
+  literals: { base: unknown; target: unknown }[]
+  base_rows: number | null
+  target_rows: number | null
+  base_truncated: boolean | null
+  target_truncated: boolean | null
+  /** 约定之外、服务端顺带给的：结构变了时差在哪，一处一句中文（按对结果的影响从大到小） */
+  differences?: string[]
+  /** 约定之外、服务端顺带给的：快照读不出来、与哈希不一致时的一句说明 */
+  problem?: string
+}
+
+/** GET /runs/{id}/compare?base=。任一未封存或封存核对不一致 409；不是同一工作流、是同一次运行 422 */
+export interface RunComparison {
+  target: RunCompareRef
+  base: RunCompareRef
+  summary: RunCompareSummary
+  template: RunCompareTemplate
+  metrics: RunCompareMetric[]
+  queries: RunCompareQuery[]
+  notes: string[]
+}
+
+/** 运行接口回的运行带着发起它的定时任务（RunOut.schedule_id）；Run 上没写这一项，对比页的运行卡要用 */
+export type RunWithSchedule = Run & { schedule_id?: string | null }
+
+// ---------------------------------------------------------------------------
+// 双盲复算：审批 payload、完整对照工件、节点配置，以及设置里「核查」一组（期 3 前后端共用的约定）
+// ---------------------------------------------------------------------------
+
+/** 审核人对一个指标的裁决：a 采用原流程的结果，b 采用盲算的结果，neither 两边都不对 */
+export type DualCheckChoice = 'a' | 'b' | 'neither'
+
+/** 双盲复算挂起时 payload.summary 的一项：审批卡先用它画，完整对照另从 card_artifact 取 */
+export interface DualCheckSummaryItem {
+  metric_id: string
+  name: string
+  unit?: string | null
+  original_rendered: string | null
+  blind_rendered: string | null
+  /** (盲算值 − 原流程值) ÷ |原流程值| × 100，保留两位小数（12.5 表示相差 12.5%）；原流程值为 0 时为 null */
+  delta_pct: number | null
+  /** 具体差异，一条一句中文，最多 3 条 */
+  diff: string[]
+  /** 只有兜底说明：两条 SQL 的写法不同，未能归纳成具体差异 */
+  fallback: boolean
+  /**
+   * 约定之外、服务端另带的：采用原流程（a）、采用盲算（b）各会往数据目录里写什么。老服务端没有这一项，卡上按差异的
+   * 形状有条件地说
+   */
+  catalog?: { a: DualCheckCatalogSide; b: DualCheckCatalogSide }
+}
+
+/**
+ * 采用一边的结果会往数据目录里写什么：服务端按发起审批时的数据目录预告（dual_check_facts.preview，和裁决后真写的
+ * 是同一套判断）。write 为真时 table 的 item（business_date / valid_filter / dedup）会记为 value（有效记录条件是和
+ * 目录里已有的条件合起来之后的整句）；为假时 reason 说明为什么不写
+ */
+export type DualCheckCatalogSide =
+  | { write: true; source?: string | null; table: string; item: string; value: unknown }
+  | { write: false; reason?: string | null }
+
+/** payload.kind 为 dual_check 的审批 payload（审批的 mode 是 input） */
+export interface DualCheckPayload {
+  kind: 'dual_check'
+  node_id: string
+  title: string
+  /** 完整对照放在这个工件里（GET /api/artifacts/{id}），内容见 DualCheckCard */
+  card_artifact: string
+  summary: DualCheckSummaryItem[]
+  /** 约定之外、服务端另带的：节点实际生效的「未采用原流程时」。没有时卡上从运行的图快照里读 */
+  on_reject?: 'degrade' | 'fail'
+}
+
+/** 审核人的回复：POST /approvals/{id}/decide 的 value */
+export interface DualCheckReply {
+  choices: Record<string, DualCheckChoice>
+  note: string
+}
+
+/** 指标的一个输入：取自哪条查询的哪一格（alias 是查询快照的编号） */
+export interface DualCheckInput {
+  path: string
+  value: unknown
+  sql?: string | null
+  source?: string | null
+  alias?: string | null
+}
+
+/** 盲算那一边的输入多一段盲算模型自己的说明 */
+export interface DualCheckBlindInput extends DualCheckInput {
+  rationale?: string | null
+}
+
+export interface DualCheckSide<I extends DualCheckInput = DualCheckInput> {
+  value: number | null
+  rendered: string | null
+  inputs: I[]
+}
+
+/** 两条 SQL 差在哪（服务端 sql_semantics.explain_sql_diff）。aspect 为 other 的是兜底说明，parse 是解析不了 */
+export interface DualCheckDiff {
+  equivalent: boolean
+  items: { aspect: string; text: string }[]
+  /** 用了兜底说明（一条具体说法都没有，或者具体说法只覆盖了一部分） */
+  fallback: boolean
+  /**
+   * 规范化之后两条 SQL 不同的行：「- 」开头是原流程的，「+ 」开头是盲算的；「  」开头的是两边相同的上级行，只为标出
+   * 不同的行在哪个子句里（老工件里没有）
+   */
+  text_diff: string[]
+}
+
+export interface DualCheckMetric {
+  metric_id: string
+  name: string
+  unit?: string | null
+  decimals?: number | null
+  original: DualCheckSide
+  blind: DualCheckSide<DualCheckBlindInput>
+  diff: DualCheckDiff
+  /** 相差比例，口径同 DualCheckSummaryItem.delta_pct（有的话） */
+  delta_pct?: number | null
+}
+
+/** card_artifact 工件的内容 */
+export interface DualCheckCard {
+  metrics: DualCheckMetric[]
+  /** 盲算用的模型 */
+  model?: string | null
+  /** 盲算模型和原流程的模型相同 */
+  same_model?: boolean
+}
+
+/** 双盲复算节点的配置。留空的项：card 取上游的口径卡，metrics 取输入来自查询的全部指标，其余跟随设置 */
+export interface DualCheckConfig {
+  card?: string
+  metrics?: string[]
+  definitions?: Record<string, string>
+  provider?: string
+  model?: string
+  tolerance?: number
+  on_reject?: 'degrade' | 'fail'
+  /** null 或不写：跟随设置 */
+  enabled?: boolean | null
+}
+
+/** 设置里的 verify 一组（GET /settings 给的是补齐默认之后的完整一组；上限为 null 表示不限） */
+export interface VerifySettings {
+  provider: string | null
+  model: string | null
+  dual_check: { enabled: boolean; tolerance: number; max_queries: number | null; timeout_s: number | null }
+  challenge: { enabled: boolean; max_claims: number | null; max_queries: number | null; timeout_s: number | null }
+  inquiry: { enabled: boolean; max_queries: number | null; timeout_s: number | null }
+  daily_max_usd: number | null
+}
+
+/** GET /settings/verify/spend：今天（本地日期）核查花了多少。unpriced_calls 是估不出金额、没算进 usd 的调用次数 */
+export interface VerifySpend {
+  date?: string
+  usd?: number
+  calls?: number
+  unpriced_calls?: number
+  daily_max_usd?: number | null
+}
+
+// ---------------------------------------------------------------------------
+// 反方审稿（challenge 节点）：审批卡上的概况、challenge_artifact 工件的内容。形状照前后端共用的接口约定，字段名一个不改；
+// 判断由反方模型给出，界面只排版，理由正文、行数这些都是服务端给的
+// ---------------------------------------------------------------------------
+
+/** 一句结论经受住反方的复核没有：经受住 / 被削弱 / 被推翻 / 无法判断 */
+export type ChallengeVerdict = 'stands' | 'weakened' | 'refuted' | 'inconclusive'
+
+/** 各种判断的句数 */
+export type ChallengeCounts = Record<ChallengeVerdict, number>
+
+/** 审批卡、节点产出里列的一句：unit 是报告文档里这一句的 id，text 是结论原文 */
+export interface ChallengeItem {
+  unit: string
+  text: string
+  verdict: ChallengeVerdict | (string & {})
+}
+
+/**
+ * 审批卡上的反方审稿概况（human 节点 payload.reports[i].challenge）。items 最多 10 条，完整内容在 artifact 指的工件里。
+ * on_refuted 是实际生效的处理方式：degrade 被推翻的结论计入出具缺口；flag 只标注。报错（fail）时节点已经失败，到不了审批。
+ * 老服务端不给时按 degrade
+ */
+export interface ApprovalChallenge {
+  counts: ChallengeCounts
+  items: ChallengeItem[]
+  /** challenge_artifact 工件 id。服务端保存审稿记录失败时为 null：判断照样有，理由和查询看不了 */
+  artifact: string | null
+  on_refuted?: 'degrade' | 'flag' | (string & {})
+  /** 期 4（nodes/challenge.challenge_summary）：没能反查的句数，都记为无法判断。升级前的产出、老服务端没有 */
+  unreviewed?: number
+  /**
+   * 期 4：被推翻的会不会让出具降档（按降档处置、又接在带出具契约的成果节点上游才为真）。升级前的产出、老服务端没有，
+   * 审批卡按「没写只标注就降档」的旧规则说
+   */
+  degrades?: boolean
+}
+
+/**
+ * 审批审的报告经过反方审稿时多一个 challenge。和上面的 ApprovalReport 是同一个接口（声明合并）：反方审稿的类型集中在
+ * 这一段，这一项也就近写在这里
+ */
+export interface ApprovalReport {
+  challenge?: ApprovalChallenge
+}
+
+/** 反方为复核一句结论执行的一次只读查询：编号是它自己的（Q1、Q2…），和报告里的查询编号无关 */
+export interface ChallengeQuery {
+  alias: string
+  /** 查询快照工件 */
+  artifact: string
+  sql: string
+  row_count: number | null
+  truncated: boolean
+  /** 数据源名 */
+  source: string | null
+}
+
+/** 工件里的一句：判断、理由、查询 */
+export interface ChallengeClaim extends ChallengeItem {
+  /** 理由渲染后的正文（数字已换成查询结果里的值） */
+  rationale: string
+  /**
+   * 理由组装成的文档（和报告文档同一种形状，数字带出处、裸数字被标出）。约定没说是工件 id 还是文档本身，两种都认；
+   * 没有时只显示 rationale
+   */
+  rationale_doc?: string | EvidenceDocData | null
+  queries: ChallengeQuery[]
+  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number; cost_usd?: number | null; calls?: number }
+}
+
+/** challenge_artifact 工件的内容：审的哪份报告、每句的复核，以及反方用的模型 */
+export interface ChallengeArtifact {
+  /** 被审的报告撰写节点 */
+  report: string
+  doc_artifact: string
+  claims: ChallengeClaim[]
+  model: string | null
+}
+
+// ---------------------------------------------------------------------------
+// 审批质询：审批人就待审的报告提问，核查模型只读查库作答。形状照前后端共用的接口约定（F5a / F5b 同一份），字段名一个
+// 不改；回答正文、行数、触顶原因都是服务端给的，界面只排版
+// ---------------------------------------------------------------------------
+
+/** 回答停在哪个上限上：每次最多查询次数、时长、这一次的金额、核查的每日金额 */
+export type InquiryLimit = 'max_queries' | 'timeout_s' | 'max_cost_usd' | 'daily_max_usd'
+
+/** 质询的回答 */
+export interface InquiryAnswer {
+  /** 渲染后的正文（数字已按出处换好） */
+  text: string
+  /** compose_doc 组装的文档工件：有它，正文里的数字可以点开看出处；没有（组装失败）只显示 text */
+  doc_artifact: string | null
+  ok: boolean
+  limit: InquiryLimit | (string & {}) | null
+  /** 没答成时的中文说明 */
+  error: string | null
+}
+
+/** 核查模型为回答执行的一次只读查询。编号是这次质询自己的，快照按质询工件接口取（遮罩列已遮掉） */
+export interface InquiryQuery {
+  alias: string
+  artifact: string
+  sql: string
+  row_count: number | null
+  truncated: boolean
+  /** 数据源名 */
+  source: string | null
+}
+
+export interface InquiryUsage {
+  input_tokens?: number
+  output_tokens?: number
+  cost_usd?: number | null
+  calls?: number
+  unpriced_calls?: number
+}
+
+/** 一次质询：问的是哪份报告的哪一句（或划选的哪段原文）、问了什么、怎么答的、查了什么 */
+export interface Inquiry {
+  /** 运行记录里那条 approval.inquiry 事件的序号；没写进运行记录时为 null */
+  seq: number | null
+  /** 什么时候问的（ISO 时间或秒级时间戳） */
+  at: string | number | null
+  /** 提问人的署名；没署名时为 null */
+  actor: string | null
+  /** 报告撰写节点 id */
+  report: string
+  /** 句子单元 id（如 u12）；就整份报告提问时为 null */
+  unit: string | null
+  /** 划选的原文 */
+  quote: string | null
+  question: string
+  answer: InquiryAnswer
+  queries: InquiryQuery[]
+  /** 作答的核查模型 */
+  model: string | null
+  usage: InquiryUsage
+  /** 运行封存之后才问的（只有探索运行可以） */
+  post_seal: boolean
+  /** 提问时停在的那张审批；封存之后问的为 null */
+  approval_id: string | null
+}
+
+/** POST /runs/{id}/inquiries 的请求体 */
+export interface InquiryRequest {
+  report: string
+  unit: string | null
+  quote?: string | null
+  question: string
+  /** 运行停在审批上时必填：指明是哪一张 */
+  approval_id?: string
+}
+
+/** POST /runs/{id}/inquiries 的答复 */
+export interface InquiryResponse {
+  inquiry: Inquiry
+  /** 是否写进了运行记录 */
+  recorded: boolean
+  /** 没写进运行记录时的中文说明，否则为 null */
+  note: string | null
+}
+
+/** GET /runs/{id}/inquiries 的答复 */
+export interface InquiryList {
+  items: Inquiry[]
+}
+
+/**
+ * GET /runs/{id}/inquiries/artifacts/{artifact}：质询引用过的查询快照，遮罩列照证据面板的规则遮掉（值写「已遮罩」）。
+ * 约定只说了是快照：可能是快照本身，也可能包在 {id, content} 里（同工件接口），界面两种都认
+ */
+export interface InquirySnapshot {
+  columns: string[]
+  rows: unknown[][]
+  sql: string | null
+  truncated: boolean
+  /** 结果一共几行（快照的 row_count / total_rows），不给时按 rows 的长度 */
+  total: number | null
+  /** 遮掉的列 */
+  masked: string[]
+  source: string | null
 }

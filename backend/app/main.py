@@ -9,8 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import (
-    artifacts, catalog, conversations, copilot, datasources, evidence, governance, knowledge, runs,
-    sandbox, settings as settings_api, source_versions, table_imports, tools, workflows,
+    artifacts, bundle, catalog, compare, conversations, copilot, datasources, evidence, governance, inquiry, knowledge,
+    runs, sandbox, schedules, settings as settings_api, source_versions, table_imports, tools, whatif, workflows,
 )
 from app.api.coded import CodedHTTPException, coded_handler
 from app.core.config import settings
@@ -74,10 +74,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     from app.sandbox.manager import sandbox_manager as _sbm
 
     await _sbm.start_reaper()
+    # 定时任务的调度循环放在 run_manager 之后起：它到点要发起运行。拷来的数据目录（检查脚本的
+    # --stacks）用 AGENTLAB_SCHEDULER=0 关掉，免得替原库把定时任务再执行一遍
+    from app import scheduler
+
+    if scheduler.scheduler_enabled():
+        await scheduler.start()
     logger.info("AgentLab 就绪 · 数据目录 %s", settings.data_dir)
     try:
         yield
     finally:
+        # 先停调度，再停运行：停运行的途中不该再有新运行被发起
+        await scheduler.stop()
         await run_manager.shutdown()
         from app.sandbox.manager import sandbox_manager
 
@@ -102,6 +110,12 @@ app.add_middleware(
 
 for router in (
     workflows.router,
+    # 这几个也挂在 /api/runs 下面，要在 runs.router 之前登记：以后加的固定路径（/api/runs/compare 之类）
+    # 才不会被 runs 的 /{run_id} 当成运行 id 吃掉。/{run_id}/… 的子路径放在哪边都不冲突
+    compare.router,
+    bundle.router,
+    inquiry.router,
+    whatif.router,
     runs.router,
     runs.approvals_router,
     evidence.router,
@@ -117,6 +131,7 @@ for router in (
     conversations.router,
     artifacts.router,
     governance.router,
+    schedules.router,
     # 按配方导入的 /api/datasources/imports/… 要在 datasources 的通配 /{source_id} 之前登记
     table_imports.router,
     source_versions.router,

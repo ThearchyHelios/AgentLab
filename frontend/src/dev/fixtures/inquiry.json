@@ -1,0 +1,4347 @@
+{
+ "//": "审批质询预览用例与 check-inquiry 共用的夹具（frontend/src/dev/fixtures/inquiry.tsx）。报告文档和回答文档由后端 evidence.build_catalog + compose_doc 真实组装（虚构的超市、片区、金额），查询快照照质询工件接口的样子给：遮罩列的值写「已遮罩」，另带 masked。生成脚本不在仓库里：改了文档的形状，照这个思路按后端的输出重新生成。run_artifacts 是探索运行的工件列表（照 GET /api/runs/{id}/artifacts 的样子手写，质询回答的 meta 同 engine/inquiry.py 写的 {report, unit, question: 问题的前 40 字}），给运行详情「工件」页签的用例",
+ "runs": {
+  "approve": "run-inq-approve",
+  "formal": "run-inq-formal",
+  "explore": "run-inq-explore",
+  "sealed": "run-inq-sealed"
+ },
+ "approval_id": "ap-inq-1",
+ "formal_approval_id": "ap-inq-2",
+ "reports": {
+  "approve": {
+   "node_id": "write",
+   "label": "写月报",
+   "doc_artifact": "a89df85369c394d3a4bf65968c59e2c3295af490621edb0cfa4c27b54f30f149",
+   "stats": {
+    "units": 8,
+    "segments": 30,
+    "claims": 7,
+    "connective": 0,
+    "headings": 1,
+    "numbers": 8,
+    "numbers_cited": 7,
+    "values": 0,
+    "uncited_numbers": 1,
+    "unresolved": 0,
+    "see": 0,
+    "uncited_claims": 3,
+    "violations": 1
+   },
+   "claims": "off"
+  },
+  "formal": {
+   "node_id": "write",
+   "label": "写月报",
+   "doc_artifact": "59b8f3417d7466fceef466a0ff23570e329b11fbaa239eaeef3c459d26b83d0d",
+   "stats": {
+    "units": 8,
+    "segments": 30,
+    "claims": 7,
+    "connective": 0,
+    "headings": 1,
+    "numbers": 8,
+    "numbers_cited": 7,
+    "values": 0,
+    "uncited_numbers": 1,
+    "unresolved": 0,
+    "see": 0,
+    "uncited_claims": 3,
+    "violations": 1
+   },
+   "claims": "off"
+  },
+  "explore": {
+   "node_id": "write",
+   "label": "写月报",
+   "doc_artifact": "8cb677489bbaafcafd3b0f0df1939c1ca57cccaa3c065e14c4efe2991a3dd9a9",
+   "stats": {
+    "units": 8,
+    "segments": 30,
+    "claims": 7,
+    "connective": 0,
+    "headings": 1,
+    "numbers": 8,
+    "numbers_cited": 7,
+    "values": 0,
+    "uncited_numbers": 1,
+    "unresolved": 0,
+    "see": 0,
+    "uncited_claims": 3,
+    "violations": 1
+   },
+   "claims": "off"
+  },
+  "sealed": {
+   "node_id": "write",
+   "label": "写月报",
+   "doc_artifact": "2d18aed9086913a6552d335331a70c9805106aa7511e5676ba8e524ee15ebe97",
+   "stats": {
+    "units": 8,
+    "segments": 30,
+    "claims": 7,
+    "connective": 0,
+    "headings": 1,
+    "numbers": 8,
+    "numbers_cited": 7,
+    "values": 0,
+    "uncited_numbers": 1,
+    "unresolved": 0,
+    "see": 0,
+    "uncited_claims": 3,
+    "violations": 1
+   },
+   "claims": "off"
+  }
+ },
+ "items": [
+  {
+   "seq": 31,
+   "at": "2026-10-05T06:12:40Z",
+   "actor": "张工",
+   "report": "write",
+   "unit": "u2",
+   "quote": null,
+   "question": "退款率的分母是含税销售额还是不含税销售额？",
+   "answer": {
+    "text": "退款率按退款金额除以含税销售额计算：9 月退款金额 21,500 元，含税销售额 1,135,000 元，两者之比为 0.0189。含税销售额与报告中的销售额 1,135,000元 一致，口径相同。",
+    "doc_artifact": "1c66d590eac155dec35e2215e20c6e7497e96d0b2d73894eff1dea3fb641bb51",
+    "ok": true,
+    "limit": null,
+    "error": null
+   },
+   "queries": [
+    {
+     "alias": "Q1",
+     "artifact": "02ca8aeabca59d785d982b321d22ff889cb2da5a037cd4a080407e9044356434",
+     "sql": "SELECT SUM(r.amount) AS refund, SUM(o.amount) AS gross, ROUND(SUM(r.amount) * 1.0 / SUM(o.amount), 4) AS rate FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE o.paid_at >= '2026-09-01' AND o.paid_at < '2026-10-01'",
+     "row_count": 1,
+     "truncated": false,
+     "source": "qingshan_mart"
+    }
+   ],
+   "model": "verify-mini",
+   "usage": {
+    "input_tokens": 5210,
+    "output_tokens": 640,
+    "cost_usd": 0.0042,
+    "calls": 3,
+    "unpriced_calls": 0
+   },
+   "post_seal": false,
+   "approval_id": "ap-inq-1"
+  },
+  {
+   "seq": 34,
+   "at": "2026-10-05T06:20:05Z",
+   "actor": null,
+   "report": "write",
+   "unit": "u3",
+   "quote": null,
+   "question": "新客贡献了多少增长？请给出新客与老客各自的销售额。",
+   "answer": {
+    "text": "9 月新客销售额 151,000 元，老客 984,000 元，新客约占 13%，单凭这些不足以说明增长主要来自新客。新客中消费最高的会员消费 9,000 元。",
+    "doc_artifact": "08aadcdf2338b5be5addd826bdc96fa9ec3f410edd629557d5f91e790d6bbb34",
+    "ok": true,
+    "limit": "max_queries",
+    "error": null
+   },
+   "queries": [
+    {
+     "alias": "Q1",
+     "artifact": "36cf830847abf4b41ae28ab17cd375bebba829662454cf066588cd774c21a399",
+     "sql": "SELECT customer_type, SUM(amount) AS amount FROM orders WHERE paid_at >= '2026-09-01' AND paid_at < '2026-10-01' GROUP BY customer_type ORDER BY customer_type",
+     "row_count": 2,
+     "truncated": false,
+     "source": "qingshan_mart"
+    },
+    {
+     "alias": "Q2",
+     "artifact": "57b0c8fe914a2bf78c2bd6ecbecdbb24758914657962d4b8f62de6303079f892",
+     "sql": "SELECT member_id, phone, first_order_at, amount FROM orders WHERE customer_type = '新客' ORDER BY amount DESC",
+     "row_count": 50,
+     "truncated": true,
+     "source": "qingshan_mart"
+    }
+   ],
+   "model": "verify-mini",
+   "usage": {
+    "input_tokens": 5210,
+    "output_tokens": 640,
+    "cost_usd": 0.0042,
+    "calls": 3,
+    "unpriced_calls": 0
+   },
+   "post_seal": false,
+   "approval_id": "ap-inq-1"
+  },
+  {
+   "seq": 36,
+   "at": "2026-10-05T06:25:51Z",
+   "actor": "张工",
+   "report": "write",
+   "unit": "u4",
+   "quote": "枫岭区销售额最高",
+   "question": "枫岭区的销售额是否包含线上订单？",
+   "answer": {
+    "text": "",
+    "doc_artifact": null,
+    "ok": false,
+    "limit": "daily_max_usd",
+    "error": "今日核查费用已达上限，未能作答。可在「设置 → 偏好设置 → 核查」中调整每日金额上限"
+   },
+   "queries": [],
+   "model": "verify-mini",
+   "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cost_usd": 0,
+    "calls": 0
+   },
+   "post_seal": false,
+   "approval_id": "ap-inq-1"
+  }
+ ],
+ "answer": {
+  "seq": 40,
+  "at": "2026-10-05T06:31:12Z",
+  "actor": "张工",
+  "report": "write",
+  "unit": "u1",
+  "quote": null,
+  "question": "这里的销售额包含线上订单吗？",
+  "answer": {
+   "text": "枫岭区 9 月线上订单销售额 118,000 元，门店 334,000 元，报告中的片区销售额包含线上订单。",
+   "doc_artifact": "4ed3d62d2af13bbea40195283f3caf63462ca76bb5d4f7ddf1216d36dd5e0463",
+   "ok": true,
+   "limit": null,
+   "error": null
+  },
+  "queries": [
+   {
+    "alias": "Q1",
+    "artifact": "ca81d2368e8597720aad6fd4eb6a0c33227770aa4a5b3b3219df6ccaa0d23be9",
+    "sql": "SELECT channel, SUM(amount) AS amount FROM orders WHERE region = '枫岭区' AND paid_at >= '2026-09-01' AND paid_at < '2026-10-01' GROUP BY channel ORDER BY channel",
+    "row_count": 2,
+    "truncated": false,
+    "source": "qingshan_mart"
+   }
+  ],
+  "model": "verify-mini",
+  "usage": {
+   "input_tokens": 5210,
+   "output_tokens": 640,
+   "cost_usd": 0.0042,
+   "calls": 3,
+   "unpriced_calls": 0
+  },
+  "post_seal": false,
+  "approval_id": "ap-inq-1"
+ },
+ "explore_items": [
+  {
+   "seq": 58,
+   "at": "2026-10-05T08:02:33Z",
+   "actor": "李工",
+   "report": "write",
+   "unit": "u2",
+   "quote": null,
+   "question": "退款率怎么算的？",
+   "answer": {
+    "text": "退款率按退款金额除以含税销售额计算，9 月为 0.0189。",
+    "doc_artifact": "911780ed990217a2a2e7e3424a9408d23b53a524ba5d1812ec677b7d6b5b80aa",
+    "ok": true,
+    "limit": null,
+    "error": null
+   },
+   "queries": [
+    {
+     "alias": "Q1",
+     "artifact": "02ca8aeabca59d785d982b321d22ff889cb2da5a037cd4a080407e9044356434",
+     "sql": "SELECT SUM(r.amount) AS refund, SUM(o.amount) AS gross, ROUND(SUM(r.amount) * 1.0 / SUM(o.amount), 4) AS rate FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE o.paid_at >= '2026-09-01' AND o.paid_at < '2026-10-01'",
+     "row_count": 1,
+     "truncated": false,
+     "source": "qingshan_mart"
+    }
+   ],
+   "model": "verify-mini",
+   "usage": {
+    "input_tokens": 5210,
+    "output_tokens": 640,
+    "cost_usd": 0.0042,
+    "calls": 3,
+    "unpriced_calls": 0
+   },
+   "post_seal": true,
+   "approval_id": null
+  }
+ ],
+ "docs": {
+  "a89df85369c394d3a4bf65968c59e2c3295af490621edb0cfa4c27b54f30f149": {
+   "schema": "agentlab.report/1",
+   "entity_syntax": 2,
+   "provenance": 1,
+   "run_id": "run-inq-approve",
+   "node_id": "write",
+   "markdown": "## 9 月经营概况\n\n9 月销售额 1,135,000元，订单 8,420单。退款金额 21,500元，退款率 1.89%。\n\n增长主要来自新客。\n\n分片区看，枫岭区销售额最高，为 452,000 元，松溪区次之（398,500 元）。临潭区 284,500 元，环比下降 3.2%。\n\n- 枫岭区的客单价高于其余两区\n- 松溪区的订单数最多",
+   "source": "## 9 月经营概况\n\n9 月销售额 [[m:gmv]]，订单 [[m:orders]]。退款金额 [[m:refund]]，退款率 [[m:refund_rate]]。\n\n增长主要来自新客。\n\n分片区看，枫岭区销售额最高，为 [[v:Q1.r0.amount]] 元，松溪区次之（[[v:Q1.r1.amount]] 元）。临潭区 [[v:Q1.r2.amount]] 元，环比下降 3.2%。\n\n- 枫岭区的客单价高于其余两区\n- 松溪区的订单数最多",
+   "catalog": {
+    "m:gmv": {
+     "alias": "m:gmv",
+     "kind": "metric",
+     "eid": "ev:metric:a867f352bc111166",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "gmv"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "销售额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 1135000,
+     "status": "ok",
+     "rendered": "1,135,000元",
+     "label": "销售额 = 1,135,000元"
+    },
+    "m:orders": {
+     "alias": "m:orders",
+     "kind": "metric",
+     "eid": "ev:metric:bb840f0fb915d4b1",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "orders"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "订单数",
+     "unit": "单",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 8420,
+     "status": "ok",
+     "rendered": "8,420单",
+     "label": "订单数 = 8,420单"
+    },
+    "m:refund": {
+     "alias": "m:refund",
+     "kind": "metric",
+     "eid": "ev:metric:82118fae68692f09",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款金额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 21500,
+     "status": "ok",
+     "rendered": "21,500元",
+     "label": "退款金额 = 21,500元"
+    },
+    "m:refund_rate": {
+     "alias": "m:refund_rate",
+     "kind": "metric",
+     "eid": "ev:metric:80676887dbac8214",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund_rate"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款率",
+     "unit": "",
+     "decimals": 4,
+     "format": "percent_of_ratio",
+     "value": 0.0189,
+     "status": "ok",
+     "rendered": "1.89%",
+     "label": "退款率 = 1.89%"
+    },
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:4658b8445675a26b",
+     "locator": {},
+     "node_id": "regions",
+     "exec": 1,
+     "artifact": "67b5757e2f07807b9eb47cc04ac6c34556773ae3224aca042bb91664857a2e65",
+     "tool": "db_query__qingshan_mart",
+     "source": "qingshan_mart",
+     "columns": [
+      "region",
+      "amount"
+     ],
+     "rows": 3,
+     "truncated": false,
+     "label": "db_query__qingshan_mart · 3 行"
+    }
+   },
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u0",
+       "kind": "heading",
+       "span": [
+        3,
+        10
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "## ",
+         "state": "neutral",
+         "span": [
+          0,
+          3
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "text",
+         "text": "9 月经营概况",
+         "state": "neutral",
+         "span": [
+          3,
+          10
+         ],
+         "id": "s1"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        12,
+        40
+       ],
+       "cites": [
+        "m:gmv",
+        "m:orders"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          10,
+          12
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "text",
+         "text": "9 月销售额 ",
+         "state": "neutral",
+         "span": [
+          12,
+          19
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "number",
+         "text": "1,135,000元",
+         "ref": "m:gmv",
+         "cite": {
+          "ref": "gmv",
+          "alias": "m:gmv",
+          "locator": {
+           "metric": "gmv"
+          },
+          "eid": "ev:metric:a867f352bc111166",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 1135000,
+          "rendered": "1,135,000元"
+         },
+         "state": "deterministic",
+         "span": [
+          19,
+          29
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "text",
+         "text": "，订单 ",
+         "state": "neutral",
+         "span": [
+          29,
+          33
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "number",
+         "text": "8,420单",
+         "ref": "m:orders",
+         "cite": {
+          "ref": "orders",
+          "alias": "m:orders",
+          "locator": {
+           "metric": "orders"
+          },
+          "eid": "ev:metric:bb840f0fb915d4b1",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 8420,
+          "rendered": "8,420单"
+         },
+         "state": "deterministic",
+         "span": [
+          33,
+          39
+         ],
+         "id": "s6"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          39,
+          40
+         ],
+         "id": "s7"
+        }
+       ]
+      },
+      {
+       "id": "u2",
+       "kind": "claim",
+       "span": [
+        40,
+        63
+       ],
+       "cites": [
+        "m:refund",
+        "m:refund_rate"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "退款金额 ",
+         "state": "neutral",
+         "span": [
+          40,
+          45
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "number",
+         "text": "21,500元",
+         "ref": "m:refund",
+         "cite": {
+          "ref": "refund",
+          "alias": "m:refund",
+          "locator": {
+           "metric": "refund"
+          },
+          "eid": "ev:metric:82118fae68692f09",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 21500,
+          "rendered": "21,500元"
+         },
+         "state": "deterministic",
+         "span": [
+          45,
+          52
+         ],
+         "id": "s9"
+        },
+        {
+         "kind": "text",
+         "text": "，退款率 ",
+         "state": "neutral",
+         "span": [
+          52,
+          57
+         ],
+         "id": "s10"
+        },
+        {
+         "kind": "number",
+         "text": "1.89%",
+         "ref": "m:refund_rate",
+         "cite": {
+          "ref": "refund_rate",
+          "alias": "m:refund_rate",
+          "locator": {
+           "metric": "refund_rate"
+          },
+          "eid": "ev:metric:80676887dbac8214",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 0.0189,
+          "rendered": "1.89%"
+         },
+         "state": "deterministic",
+         "span": [
+          57,
+          62
+         ],
+         "id": "s11"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          62,
+          63
+         ],
+         "id": "s12"
+        }
+       ]
+      }
+     ],
+     "id": "b1"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u3",
+       "kind": "claim",
+       "span": [
+        65,
+        74
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          63,
+          65
+         ],
+         "id": "s13"
+        },
+        {
+         "kind": "text",
+         "text": "增长主要来自新客。",
+         "state": "neutral",
+         "span": [
+          65,
+          74
+         ],
+         "id": "s14"
+        }
+       ]
+      }
+     ],
+     "id": "b2"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u4",
+       "kind": "claim",
+       "span": [
+        76,
+        119
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          74,
+          76
+         ],
+         "id": "s15"
+        },
+        {
+         "kind": "text",
+         "text": "分片区看，枫岭区销售额最高，为 ",
+         "state": "neutral",
+         "span": [
+          76,
+          92
+         ],
+         "id": "s16"
+        },
+        {
+         "kind": "number",
+         "text": "452,000",
+         "ref": "v:Q1.r0.amount",
+         "cite": {
+          "ref": "Q1.r0.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "amount"
+          },
+          "eid": "ev:cell:0a1e7f806f2eb24a",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 452000,
+          "rendered": "452,000"
+         },
+         "state": "deterministic",
+         "span": [
+          92,
+          99
+         ],
+         "id": "s17"
+        },
+        {
+         "kind": "text",
+         "text": " 元，松溪区次之（",
+         "state": "neutral",
+         "span": [
+          99,
+          108
+         ],
+         "id": "s18"
+        },
+        {
+         "kind": "number",
+         "text": "398,500",
+         "ref": "v:Q1.r1.amount",
+         "cite": {
+          "ref": "Q1.r1.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 1,
+           "column": "amount"
+          },
+          "eid": "ev:cell:9df40facfe235170",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 398500,
+          "rendered": "398,500"
+         },
+         "state": "deterministic",
+         "span": [
+          108,
+          115
+         ],
+         "id": "s19"
+        },
+        {
+         "kind": "text",
+         "text": " 元）。",
+         "state": "neutral",
+         "span": [
+          115,
+          119
+         ],
+         "id": "s20"
+        }
+       ]
+      },
+      {
+       "id": "u5",
+       "kind": "claim",
+       "span": [
+        119,
+        143
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "临潭区 ",
+         "state": "neutral",
+         "span": [
+          119,
+          123
+         ],
+         "id": "s21"
+        },
+        {
+         "kind": "number",
+         "text": "284,500",
+         "ref": "v:Q1.r2.amount",
+         "cite": {
+          "ref": "Q1.r2.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 2,
+           "column": "amount"
+          },
+          "eid": "ev:cell:7b9793466ab9ba7b",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 284500,
+          "rendered": "284,500"
+         },
+         "state": "deterministic",
+         "span": [
+          123,
+          130
+         ],
+         "id": "s22"
+        },
+        {
+         "kind": "text",
+         "text": " 元，环比下降 ",
+         "span": [
+          130,
+          138
+         ],
+         "state": "neutral",
+         "id": "s23"
+        },
+        {
+         "kind": "number",
+         "text": "3.2%",
+         "span": [
+          138,
+          142
+         ],
+         "state": "none",
+         "issue": "uncited_number",
+         "id": "s24"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "span": [
+          142,
+          143
+         ],
+         "state": "neutral",
+         "id": "s25"
+        }
+       ]
+      }
+     ],
+     "id": "b3"
+    },
+    {
+     "type": "list",
+     "ordered": false,
+     "units": [
+      {
+       "id": "u6",
+       "kind": "claim",
+       "span": [
+        147,
+        160
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n- ",
+         "state": "neutral",
+         "span": [
+          143,
+          147
+         ],
+         "id": "s26"
+        },
+        {
+         "kind": "text",
+         "text": "枫岭区的客单价高于其余两区",
+         "state": "neutral",
+         "span": [
+          147,
+          160
+         ],
+         "id": "s27"
+        }
+       ],
+       "depth": 0
+      },
+      {
+       "id": "u7",
+       "kind": "claim",
+       "span": [
+        163,
+        172
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n- ",
+         "state": "neutral",
+         "span": [
+          160,
+          163
+         ],
+         "id": "s28"
+        },
+        {
+         "kind": "text",
+         "text": "松溪区的订单数最多",
+         "state": "neutral",
+         "span": [
+          163,
+          172
+         ],
+         "id": "s29"
+        }
+       ],
+       "depth": 0
+      }
+     ],
+     "id": "b4"
+    }
+   ],
+   "stats": {
+    "units": 8,
+    "segments": 30,
+    "claims": 7,
+    "connective": 0,
+    "headings": 1,
+    "numbers": 8,
+    "numbers_cited": 7,
+    "values": 0,
+    "uncited_numbers": 1,
+    "unresolved": 0,
+    "see": 0,
+    "uncited_claims": 3,
+    "violations": 1
+   },
+   "violations": [
+    {
+     "code": "uncited_number",
+     "message": "数字「3.2%」没有出处：报告中直接写出了数字，系统无法核对",
+     "for_model": "数字「3.2%」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "span": [
+      138,
+      142
+     ],
+     "text": "3.2%",
+     "context": "潭区 284,500 元，环比下降 3.2%。  - 枫岭区的客单价高于其余两区",
+     "segment": "s24",
+     "unit": "u5"
+    }
+   ]
+  },
+  "59b8f3417d7466fceef466a0ff23570e329b11fbaa239eaeef3c459d26b83d0d": {
+   "schema": "agentlab.report/1",
+   "entity_syntax": 2,
+   "provenance": 1,
+   "run_id": "run-inq-formal",
+   "node_id": "write",
+   "markdown": "## 9 月经营概况\n\n9 月销售额 1,135,000元，订单 8,420单。退款金额 21,500元，退款率 1.89%。\n\n增长主要来自新客。\n\n分片区看，枫岭区销售额最高，为 452,000 元，松溪区次之（398,500 元）。临潭区 284,500 元，环比下降 3.2%。\n\n- 枫岭区的客单价高于其余两区\n- 松溪区的订单数最多",
+   "source": "## 9 月经营概况\n\n9 月销售额 [[m:gmv]]，订单 [[m:orders]]。退款金额 [[m:refund]]，退款率 [[m:refund_rate]]。\n\n增长主要来自新客。\n\n分片区看，枫岭区销售额最高，为 [[v:Q1.r0.amount]] 元，松溪区次之（[[v:Q1.r1.amount]] 元）。临潭区 [[v:Q1.r2.amount]] 元，环比下降 3.2%。\n\n- 枫岭区的客单价高于其余两区\n- 松溪区的订单数最多",
+   "catalog": {
+    "m:gmv": {
+     "alias": "m:gmv",
+     "kind": "metric",
+     "eid": "ev:metric:a867f352bc111166",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "gmv"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "销售额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 1135000,
+     "status": "ok",
+     "rendered": "1,135,000元",
+     "label": "销售额 = 1,135,000元"
+    },
+    "m:orders": {
+     "alias": "m:orders",
+     "kind": "metric",
+     "eid": "ev:metric:bb840f0fb915d4b1",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "orders"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "订单数",
+     "unit": "单",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 8420,
+     "status": "ok",
+     "rendered": "8,420单",
+     "label": "订单数 = 8,420单"
+    },
+    "m:refund": {
+     "alias": "m:refund",
+     "kind": "metric",
+     "eid": "ev:metric:82118fae68692f09",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款金额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 21500,
+     "status": "ok",
+     "rendered": "21,500元",
+     "label": "退款金额 = 21,500元"
+    },
+    "m:refund_rate": {
+     "alias": "m:refund_rate",
+     "kind": "metric",
+     "eid": "ev:metric:80676887dbac8214",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund_rate"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款率",
+     "unit": "",
+     "decimals": 4,
+     "format": "percent_of_ratio",
+     "value": 0.0189,
+     "status": "ok",
+     "rendered": "1.89%",
+     "label": "退款率 = 1.89%"
+    },
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:4658b8445675a26b",
+     "locator": {},
+     "node_id": "regions",
+     "exec": 1,
+     "artifact": "67b5757e2f07807b9eb47cc04ac6c34556773ae3224aca042bb91664857a2e65",
+     "tool": "db_query__qingshan_mart",
+     "source": "qingshan_mart",
+     "columns": [
+      "region",
+      "amount"
+     ],
+     "rows": 3,
+     "truncated": false,
+     "label": "db_query__qingshan_mart · 3 行"
+    }
+   },
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u0",
+       "kind": "heading",
+       "span": [
+        3,
+        10
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "## ",
+         "state": "neutral",
+         "span": [
+          0,
+          3
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "text",
+         "text": "9 月经营概况",
+         "state": "neutral",
+         "span": [
+          3,
+          10
+         ],
+         "id": "s1"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        12,
+        40
+       ],
+       "cites": [
+        "m:gmv",
+        "m:orders"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          10,
+          12
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "text",
+         "text": "9 月销售额 ",
+         "state": "neutral",
+         "span": [
+          12,
+          19
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "number",
+         "text": "1,135,000元",
+         "ref": "m:gmv",
+         "cite": {
+          "ref": "gmv",
+          "alias": "m:gmv",
+          "locator": {
+           "metric": "gmv"
+          },
+          "eid": "ev:metric:a867f352bc111166",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 1135000,
+          "rendered": "1,135,000元"
+         },
+         "state": "deterministic",
+         "span": [
+          19,
+          29
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "text",
+         "text": "，订单 ",
+         "state": "neutral",
+         "span": [
+          29,
+          33
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "number",
+         "text": "8,420单",
+         "ref": "m:orders",
+         "cite": {
+          "ref": "orders",
+          "alias": "m:orders",
+          "locator": {
+           "metric": "orders"
+          },
+          "eid": "ev:metric:bb840f0fb915d4b1",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 8420,
+          "rendered": "8,420单"
+         },
+         "state": "deterministic",
+         "span": [
+          33,
+          39
+         ],
+         "id": "s6"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          39,
+          40
+         ],
+         "id": "s7"
+        }
+       ]
+      },
+      {
+       "id": "u2",
+       "kind": "claim",
+       "span": [
+        40,
+        63
+       ],
+       "cites": [
+        "m:refund",
+        "m:refund_rate"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "退款金额 ",
+         "state": "neutral",
+         "span": [
+          40,
+          45
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "number",
+         "text": "21,500元",
+         "ref": "m:refund",
+         "cite": {
+          "ref": "refund",
+          "alias": "m:refund",
+          "locator": {
+           "metric": "refund"
+          },
+          "eid": "ev:metric:82118fae68692f09",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 21500,
+          "rendered": "21,500元"
+         },
+         "state": "deterministic",
+         "span": [
+          45,
+          52
+         ],
+         "id": "s9"
+        },
+        {
+         "kind": "text",
+         "text": "，退款率 ",
+         "state": "neutral",
+         "span": [
+          52,
+          57
+         ],
+         "id": "s10"
+        },
+        {
+         "kind": "number",
+         "text": "1.89%",
+         "ref": "m:refund_rate",
+         "cite": {
+          "ref": "refund_rate",
+          "alias": "m:refund_rate",
+          "locator": {
+           "metric": "refund_rate"
+          },
+          "eid": "ev:metric:80676887dbac8214",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 0.0189,
+          "rendered": "1.89%"
+         },
+         "state": "deterministic",
+         "span": [
+          57,
+          62
+         ],
+         "id": "s11"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          62,
+          63
+         ],
+         "id": "s12"
+        }
+       ]
+      }
+     ],
+     "id": "b1"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u3",
+       "kind": "claim",
+       "span": [
+        65,
+        74
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          63,
+          65
+         ],
+         "id": "s13"
+        },
+        {
+         "kind": "text",
+         "text": "增长主要来自新客。",
+         "state": "neutral",
+         "span": [
+          65,
+          74
+         ],
+         "id": "s14"
+        }
+       ]
+      }
+     ],
+     "id": "b2"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u4",
+       "kind": "claim",
+       "span": [
+        76,
+        119
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          74,
+          76
+         ],
+         "id": "s15"
+        },
+        {
+         "kind": "text",
+         "text": "分片区看，枫岭区销售额最高，为 ",
+         "state": "neutral",
+         "span": [
+          76,
+          92
+         ],
+         "id": "s16"
+        },
+        {
+         "kind": "number",
+         "text": "452,000",
+         "ref": "v:Q1.r0.amount",
+         "cite": {
+          "ref": "Q1.r0.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "amount"
+          },
+          "eid": "ev:cell:0a1e7f806f2eb24a",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 452000,
+          "rendered": "452,000"
+         },
+         "state": "deterministic",
+         "span": [
+          92,
+          99
+         ],
+         "id": "s17"
+        },
+        {
+         "kind": "text",
+         "text": " 元，松溪区次之（",
+         "state": "neutral",
+         "span": [
+          99,
+          108
+         ],
+         "id": "s18"
+        },
+        {
+         "kind": "number",
+         "text": "398,500",
+         "ref": "v:Q1.r1.amount",
+         "cite": {
+          "ref": "Q1.r1.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 1,
+           "column": "amount"
+          },
+          "eid": "ev:cell:9df40facfe235170",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 398500,
+          "rendered": "398,500"
+         },
+         "state": "deterministic",
+         "span": [
+          108,
+          115
+         ],
+         "id": "s19"
+        },
+        {
+         "kind": "text",
+         "text": " 元）。",
+         "state": "neutral",
+         "span": [
+          115,
+          119
+         ],
+         "id": "s20"
+        }
+       ]
+      },
+      {
+       "id": "u5",
+       "kind": "claim",
+       "span": [
+        119,
+        143
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "临潭区 ",
+         "state": "neutral",
+         "span": [
+          119,
+          123
+         ],
+         "id": "s21"
+        },
+        {
+         "kind": "number",
+         "text": "284,500",
+         "ref": "v:Q1.r2.amount",
+         "cite": {
+          "ref": "Q1.r2.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 2,
+           "column": "amount"
+          },
+          "eid": "ev:cell:7b9793466ab9ba7b",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 284500,
+          "rendered": "284,500"
+         },
+         "state": "deterministic",
+         "span": [
+          123,
+          130
+         ],
+         "id": "s22"
+        },
+        {
+         "kind": "text",
+         "text": " 元，环比下降 ",
+         "span": [
+          130,
+          138
+         ],
+         "state": "neutral",
+         "id": "s23"
+        },
+        {
+         "kind": "number",
+         "text": "3.2%",
+         "span": [
+          138,
+          142
+         ],
+         "state": "none",
+         "issue": "uncited_number",
+         "id": "s24"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "span": [
+          142,
+          143
+         ],
+         "state": "neutral",
+         "id": "s25"
+        }
+       ]
+      }
+     ],
+     "id": "b3"
+    },
+    {
+     "type": "list",
+     "ordered": false,
+     "units": [
+      {
+       "id": "u6",
+       "kind": "claim",
+       "span": [
+        147,
+        160
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n- ",
+         "state": "neutral",
+         "span": [
+          143,
+          147
+         ],
+         "id": "s26"
+        },
+        {
+         "kind": "text",
+         "text": "枫岭区的客单价高于其余两区",
+         "state": "neutral",
+         "span": [
+          147,
+          160
+         ],
+         "id": "s27"
+        }
+       ],
+       "depth": 0
+      },
+      {
+       "id": "u7",
+       "kind": "claim",
+       "span": [
+        163,
+        172
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n- ",
+         "state": "neutral",
+         "span": [
+          160,
+          163
+         ],
+         "id": "s28"
+        },
+        {
+         "kind": "text",
+         "text": "松溪区的订单数最多",
+         "state": "neutral",
+         "span": [
+          163,
+          172
+         ],
+         "id": "s29"
+        }
+       ],
+       "depth": 0
+      }
+     ],
+     "id": "b4"
+    }
+   ],
+   "stats": {
+    "units": 8,
+    "segments": 30,
+    "claims": 7,
+    "connective": 0,
+    "headings": 1,
+    "numbers": 8,
+    "numbers_cited": 7,
+    "values": 0,
+    "uncited_numbers": 1,
+    "unresolved": 0,
+    "see": 0,
+    "uncited_claims": 3,
+    "violations": 1
+   },
+   "violations": [
+    {
+     "code": "uncited_number",
+     "message": "数字「3.2%」没有出处：报告中直接写出了数字，系统无法核对",
+     "for_model": "数字「3.2%」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "span": [
+      138,
+      142
+     ],
+     "text": "3.2%",
+     "context": "潭区 284,500 元，环比下降 3.2%。  - 枫岭区的客单价高于其余两区",
+     "segment": "s24",
+     "unit": "u5"
+    }
+   ]
+  },
+  "8cb677489bbaafcafd3b0f0df1939c1ca57cccaa3c065e14c4efe2991a3dd9a9": {
+   "schema": "agentlab.report/1",
+   "entity_syntax": 2,
+   "provenance": 1,
+   "run_id": "run-inq-explore",
+   "node_id": "write",
+   "markdown": "## 9 月经营概况\n\n9 月销售额 1,135,000元，订单 8,420单。退款金额 21,500元，退款率 1.89%。\n\n增长主要来自新客。\n\n分片区看，枫岭区销售额最高，为 452,000 元，松溪区次之（398,500 元）。临潭区 284,500 元，环比下降 3.2%。\n\n- 枫岭区的客单价高于其余两区\n- 松溪区的订单数最多",
+   "source": "## 9 月经营概况\n\n9 月销售额 [[m:gmv]]，订单 [[m:orders]]。退款金额 [[m:refund]]，退款率 [[m:refund_rate]]。\n\n增长主要来自新客。\n\n分片区看，枫岭区销售额最高，为 [[v:Q1.r0.amount]] 元，松溪区次之（[[v:Q1.r1.amount]] 元）。临潭区 [[v:Q1.r2.amount]] 元，环比下降 3.2%。\n\n- 枫岭区的客单价高于其余两区\n- 松溪区的订单数最多",
+   "catalog": {
+    "m:gmv": {
+     "alias": "m:gmv",
+     "kind": "metric",
+     "eid": "ev:metric:a867f352bc111166",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "gmv"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "销售额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 1135000,
+     "status": "ok",
+     "rendered": "1,135,000元",
+     "label": "销售额 = 1,135,000元"
+    },
+    "m:orders": {
+     "alias": "m:orders",
+     "kind": "metric",
+     "eid": "ev:metric:bb840f0fb915d4b1",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "orders"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "订单数",
+     "unit": "单",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 8420,
+     "status": "ok",
+     "rendered": "8,420单",
+     "label": "订单数 = 8,420单"
+    },
+    "m:refund": {
+     "alias": "m:refund",
+     "kind": "metric",
+     "eid": "ev:metric:82118fae68692f09",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款金额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 21500,
+     "status": "ok",
+     "rendered": "21,500元",
+     "label": "退款金额 = 21,500元"
+    },
+    "m:refund_rate": {
+     "alias": "m:refund_rate",
+     "kind": "metric",
+     "eid": "ev:metric:80676887dbac8214",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund_rate"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款率",
+     "unit": "",
+     "decimals": 4,
+     "format": "percent_of_ratio",
+     "value": 0.0189,
+     "status": "ok",
+     "rendered": "1.89%",
+     "label": "退款率 = 1.89%"
+    },
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:4658b8445675a26b",
+     "locator": {},
+     "node_id": "regions",
+     "exec": 1,
+     "artifact": "67b5757e2f07807b9eb47cc04ac6c34556773ae3224aca042bb91664857a2e65",
+     "tool": "db_query__qingshan_mart",
+     "source": "qingshan_mart",
+     "columns": [
+      "region",
+      "amount"
+     ],
+     "rows": 3,
+     "truncated": false,
+     "label": "db_query__qingshan_mart · 3 行"
+    }
+   },
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u0",
+       "kind": "heading",
+       "span": [
+        3,
+        10
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "## ",
+         "state": "neutral",
+         "span": [
+          0,
+          3
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "text",
+         "text": "9 月经营概况",
+         "state": "neutral",
+         "span": [
+          3,
+          10
+         ],
+         "id": "s1"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        12,
+        40
+       ],
+       "cites": [
+        "m:gmv",
+        "m:orders"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          10,
+          12
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "text",
+         "text": "9 月销售额 ",
+         "state": "neutral",
+         "span": [
+          12,
+          19
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "number",
+         "text": "1,135,000元",
+         "ref": "m:gmv",
+         "cite": {
+          "ref": "gmv",
+          "alias": "m:gmv",
+          "locator": {
+           "metric": "gmv"
+          },
+          "eid": "ev:metric:a867f352bc111166",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 1135000,
+          "rendered": "1,135,000元"
+         },
+         "state": "deterministic",
+         "span": [
+          19,
+          29
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "text",
+         "text": "，订单 ",
+         "state": "neutral",
+         "span": [
+          29,
+          33
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "number",
+         "text": "8,420单",
+         "ref": "m:orders",
+         "cite": {
+          "ref": "orders",
+          "alias": "m:orders",
+          "locator": {
+           "metric": "orders"
+          },
+          "eid": "ev:metric:bb840f0fb915d4b1",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 8420,
+          "rendered": "8,420单"
+         },
+         "state": "deterministic",
+         "span": [
+          33,
+          39
+         ],
+         "id": "s6"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          39,
+          40
+         ],
+         "id": "s7"
+        }
+       ]
+      },
+      {
+       "id": "u2",
+       "kind": "claim",
+       "span": [
+        40,
+        63
+       ],
+       "cites": [
+        "m:refund",
+        "m:refund_rate"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "退款金额 ",
+         "state": "neutral",
+         "span": [
+          40,
+          45
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "number",
+         "text": "21,500元",
+         "ref": "m:refund",
+         "cite": {
+          "ref": "refund",
+          "alias": "m:refund",
+          "locator": {
+           "metric": "refund"
+          },
+          "eid": "ev:metric:82118fae68692f09",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 21500,
+          "rendered": "21,500元"
+         },
+         "state": "deterministic",
+         "span": [
+          45,
+          52
+         ],
+         "id": "s9"
+        },
+        {
+         "kind": "text",
+         "text": "，退款率 ",
+         "state": "neutral",
+         "span": [
+          52,
+          57
+         ],
+         "id": "s10"
+        },
+        {
+         "kind": "number",
+         "text": "1.89%",
+         "ref": "m:refund_rate",
+         "cite": {
+          "ref": "refund_rate",
+          "alias": "m:refund_rate",
+          "locator": {
+           "metric": "refund_rate"
+          },
+          "eid": "ev:metric:80676887dbac8214",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 0.0189,
+          "rendered": "1.89%"
+         },
+         "state": "deterministic",
+         "span": [
+          57,
+          62
+         ],
+         "id": "s11"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          62,
+          63
+         ],
+         "id": "s12"
+        }
+       ]
+      }
+     ],
+     "id": "b1"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u3",
+       "kind": "claim",
+       "span": [
+        65,
+        74
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          63,
+          65
+         ],
+         "id": "s13"
+        },
+        {
+         "kind": "text",
+         "text": "增长主要来自新客。",
+         "state": "neutral",
+         "span": [
+          65,
+          74
+         ],
+         "id": "s14"
+        }
+       ]
+      }
+     ],
+     "id": "b2"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u4",
+       "kind": "claim",
+       "span": [
+        76,
+        119
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          74,
+          76
+         ],
+         "id": "s15"
+        },
+        {
+         "kind": "text",
+         "text": "分片区看，枫岭区销售额最高，为 ",
+         "state": "neutral",
+         "span": [
+          76,
+          92
+         ],
+         "id": "s16"
+        },
+        {
+         "kind": "number",
+         "text": "452,000",
+         "ref": "v:Q1.r0.amount",
+         "cite": {
+          "ref": "Q1.r0.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "amount"
+          },
+          "eid": "ev:cell:0a1e7f806f2eb24a",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 452000,
+          "rendered": "452,000"
+         },
+         "state": "deterministic",
+         "span": [
+          92,
+          99
+         ],
+         "id": "s17"
+        },
+        {
+         "kind": "text",
+         "text": " 元，松溪区次之（",
+         "state": "neutral",
+         "span": [
+          99,
+          108
+         ],
+         "id": "s18"
+        },
+        {
+         "kind": "number",
+         "text": "398,500",
+         "ref": "v:Q1.r1.amount",
+         "cite": {
+          "ref": "Q1.r1.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 1,
+           "column": "amount"
+          },
+          "eid": "ev:cell:9df40facfe235170",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 398500,
+          "rendered": "398,500"
+         },
+         "state": "deterministic",
+         "span": [
+          108,
+          115
+         ],
+         "id": "s19"
+        },
+        {
+         "kind": "text",
+         "text": " 元）。",
+         "state": "neutral",
+         "span": [
+          115,
+          119
+         ],
+         "id": "s20"
+        }
+       ]
+      },
+      {
+       "id": "u5",
+       "kind": "claim",
+       "span": [
+        119,
+        143
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "临潭区 ",
+         "state": "neutral",
+         "span": [
+          119,
+          123
+         ],
+         "id": "s21"
+        },
+        {
+         "kind": "number",
+         "text": "284,500",
+         "ref": "v:Q1.r2.amount",
+         "cite": {
+          "ref": "Q1.r2.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 2,
+           "column": "amount"
+          },
+          "eid": "ev:cell:7b9793466ab9ba7b",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 284500,
+          "rendered": "284,500"
+         },
+         "state": "deterministic",
+         "span": [
+          123,
+          130
+         ],
+         "id": "s22"
+        },
+        {
+         "kind": "text",
+         "text": " 元，环比下降 ",
+         "span": [
+          130,
+          138
+         ],
+         "state": "neutral",
+         "id": "s23"
+        },
+        {
+         "kind": "number",
+         "text": "3.2%",
+         "span": [
+          138,
+          142
+         ],
+         "state": "none",
+         "issue": "uncited_number",
+         "id": "s24"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "span": [
+          142,
+          143
+         ],
+         "state": "neutral",
+         "id": "s25"
+        }
+       ]
+      }
+     ],
+     "id": "b3"
+    },
+    {
+     "type": "list",
+     "ordered": false,
+     "units": [
+      {
+       "id": "u6",
+       "kind": "claim",
+       "span": [
+        147,
+        160
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n- ",
+         "state": "neutral",
+         "span": [
+          143,
+          147
+         ],
+         "id": "s26"
+        },
+        {
+         "kind": "text",
+         "text": "枫岭区的客单价高于其余两区",
+         "state": "neutral",
+         "span": [
+          147,
+          160
+         ],
+         "id": "s27"
+        }
+       ],
+       "depth": 0
+      },
+      {
+       "id": "u7",
+       "kind": "claim",
+       "span": [
+        163,
+        172
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n- ",
+         "state": "neutral",
+         "span": [
+          160,
+          163
+         ],
+         "id": "s28"
+        },
+        {
+         "kind": "text",
+         "text": "松溪区的订单数最多",
+         "state": "neutral",
+         "span": [
+          163,
+          172
+         ],
+         "id": "s29"
+        }
+       ],
+       "depth": 0
+      }
+     ],
+     "id": "b4"
+    }
+   ],
+   "stats": {
+    "units": 8,
+    "segments": 30,
+    "claims": 7,
+    "connective": 0,
+    "headings": 1,
+    "numbers": 8,
+    "numbers_cited": 7,
+    "values": 0,
+    "uncited_numbers": 1,
+    "unresolved": 0,
+    "see": 0,
+    "uncited_claims": 3,
+    "violations": 1
+   },
+   "violations": [
+    {
+     "code": "uncited_number",
+     "message": "数字「3.2%」没有出处：报告中直接写出了数字，系统无法核对",
+     "for_model": "数字「3.2%」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "span": [
+      138,
+      142
+     ],
+     "text": "3.2%",
+     "context": "潭区 284,500 元，环比下降 3.2%。  - 枫岭区的客单价高于其余两区",
+     "segment": "s24",
+     "unit": "u5"
+    }
+   ]
+  },
+  "2d18aed9086913a6552d335331a70c9805106aa7511e5676ba8e524ee15ebe97": {
+   "schema": "agentlab.report/1",
+   "entity_syntax": 2,
+   "provenance": 1,
+   "run_id": "run-inq-sealed",
+   "node_id": "write",
+   "markdown": "## 9 月经营概况\n\n9 月销售额 1,135,000元，订单 8,420单。退款金额 21,500元，退款率 1.89%。\n\n增长主要来自新客。\n\n分片区看，枫岭区销售额最高，为 452,000 元，松溪区次之（398,500 元）。临潭区 284,500 元，环比下降 3.2%。\n\n- 枫岭区的客单价高于其余两区\n- 松溪区的订单数最多",
+   "source": "## 9 月经营概况\n\n9 月销售额 [[m:gmv]]，订单 [[m:orders]]。退款金额 [[m:refund]]，退款率 [[m:refund_rate]]。\n\n增长主要来自新客。\n\n分片区看，枫岭区销售额最高，为 [[v:Q1.r0.amount]] 元，松溪区次之（[[v:Q1.r1.amount]] 元）。临潭区 [[v:Q1.r2.amount]] 元，环比下降 3.2%。\n\n- 枫岭区的客单价高于其余两区\n- 松溪区的订单数最多",
+   "catalog": {
+    "m:gmv": {
+     "alias": "m:gmv",
+     "kind": "metric",
+     "eid": "ev:metric:a867f352bc111166",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "gmv"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "销售额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 1135000,
+     "status": "ok",
+     "rendered": "1,135,000元",
+     "label": "销售额 = 1,135,000元"
+    },
+    "m:orders": {
+     "alias": "m:orders",
+     "kind": "metric",
+     "eid": "ev:metric:bb840f0fb915d4b1",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "orders"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "订单数",
+     "unit": "单",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 8420,
+     "status": "ok",
+     "rendered": "8,420单",
+     "label": "订单数 = 8,420单"
+    },
+    "m:refund": {
+     "alias": "m:refund",
+     "kind": "metric",
+     "eid": "ev:metric:82118fae68692f09",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款金额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 21500,
+     "status": "ok",
+     "rendered": "21,500元",
+     "label": "退款金额 = 21,500元"
+    },
+    "m:refund_rate": {
+     "alias": "m:refund_rate",
+     "kind": "metric",
+     "eid": "ev:metric:80676887dbac8214",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund_rate"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款率",
+     "unit": "",
+     "decimals": 4,
+     "format": "percent_of_ratio",
+     "value": 0.0189,
+     "status": "ok",
+     "rendered": "1.89%",
+     "label": "退款率 = 1.89%"
+    },
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:4658b8445675a26b",
+     "locator": {},
+     "node_id": "regions",
+     "exec": 1,
+     "artifact": "67b5757e2f07807b9eb47cc04ac6c34556773ae3224aca042bb91664857a2e65",
+     "tool": "db_query__qingshan_mart",
+     "source": "qingshan_mart",
+     "columns": [
+      "region",
+      "amount"
+     ],
+     "rows": 3,
+     "truncated": false,
+     "label": "db_query__qingshan_mart · 3 行"
+    }
+   },
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "units": [
+      {
+       "id": "u0",
+       "kind": "heading",
+       "span": [
+        3,
+        10
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "## ",
+         "state": "neutral",
+         "span": [
+          0,
+          3
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "text",
+         "text": "9 月经营概况",
+         "state": "neutral",
+         "span": [
+          3,
+          10
+         ],
+         "id": "s1"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        12,
+        40
+       ],
+       "cites": [
+        "m:gmv",
+        "m:orders"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          10,
+          12
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "text",
+         "text": "9 月销售额 ",
+         "state": "neutral",
+         "span": [
+          12,
+          19
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "number",
+         "text": "1,135,000元",
+         "ref": "m:gmv",
+         "cite": {
+          "ref": "gmv",
+          "alias": "m:gmv",
+          "locator": {
+           "metric": "gmv"
+          },
+          "eid": "ev:metric:a867f352bc111166",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 1135000,
+          "rendered": "1,135,000元"
+         },
+         "state": "deterministic",
+         "span": [
+          19,
+          29
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "text",
+         "text": "，订单 ",
+         "state": "neutral",
+         "span": [
+          29,
+          33
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "number",
+         "text": "8,420单",
+         "ref": "m:orders",
+         "cite": {
+          "ref": "orders",
+          "alias": "m:orders",
+          "locator": {
+           "metric": "orders"
+          },
+          "eid": "ev:metric:bb840f0fb915d4b1",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 8420,
+          "rendered": "8,420单"
+         },
+         "state": "deterministic",
+         "span": [
+          33,
+          39
+         ],
+         "id": "s6"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          39,
+          40
+         ],
+         "id": "s7"
+        }
+       ]
+      },
+      {
+       "id": "u2",
+       "kind": "claim",
+       "span": [
+        40,
+        63
+       ],
+       "cites": [
+        "m:refund",
+        "m:refund_rate"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "退款金额 ",
+         "state": "neutral",
+         "span": [
+          40,
+          45
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "number",
+         "text": "21,500元",
+         "ref": "m:refund",
+         "cite": {
+          "ref": "refund",
+          "alias": "m:refund",
+          "locator": {
+           "metric": "refund"
+          },
+          "eid": "ev:metric:82118fae68692f09",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 21500,
+          "rendered": "21,500元"
+         },
+         "state": "deterministic",
+         "span": [
+          45,
+          52
+         ],
+         "id": "s9"
+        },
+        {
+         "kind": "text",
+         "text": "，退款率 ",
+         "state": "neutral",
+         "span": [
+          52,
+          57
+         ],
+         "id": "s10"
+        },
+        {
+         "kind": "number",
+         "text": "1.89%",
+         "ref": "m:refund_rate",
+         "cite": {
+          "ref": "refund_rate",
+          "alias": "m:refund_rate",
+          "locator": {
+           "metric": "refund_rate"
+          },
+          "eid": "ev:metric:80676887dbac8214",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 0.0189,
+          "rendered": "1.89%"
+         },
+         "state": "deterministic",
+         "span": [
+          57,
+          62
+         ],
+         "id": "s11"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          62,
+          63
+         ],
+         "id": "s12"
+        }
+       ]
+      }
+     ],
+     "id": "b1"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u3",
+       "kind": "claim",
+       "span": [
+        65,
+        74
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          63,
+          65
+         ],
+         "id": "s13"
+        },
+        {
+         "kind": "text",
+         "text": "增长主要来自新客。",
+         "state": "neutral",
+         "span": [
+          65,
+          74
+         ],
+         "id": "s14"
+        }
+       ]
+      }
+     ],
+     "id": "b2"
+    },
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u4",
+       "kind": "claim",
+       "span": [
+        76,
+        119
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n",
+         "state": "neutral",
+         "span": [
+          74,
+          76
+         ],
+         "id": "s15"
+        },
+        {
+         "kind": "text",
+         "text": "分片区看，枫岭区销售额最高，为 ",
+         "state": "neutral",
+         "span": [
+          76,
+          92
+         ],
+         "id": "s16"
+        },
+        {
+         "kind": "number",
+         "text": "452,000",
+         "ref": "v:Q1.r0.amount",
+         "cite": {
+          "ref": "Q1.r0.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "amount"
+          },
+          "eid": "ev:cell:0a1e7f806f2eb24a",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 452000,
+          "rendered": "452,000"
+         },
+         "state": "deterministic",
+         "span": [
+          92,
+          99
+         ],
+         "id": "s17"
+        },
+        {
+         "kind": "text",
+         "text": " 元，松溪区次之（",
+         "state": "neutral",
+         "span": [
+          99,
+          108
+         ],
+         "id": "s18"
+        },
+        {
+         "kind": "number",
+         "text": "398,500",
+         "ref": "v:Q1.r1.amount",
+         "cite": {
+          "ref": "Q1.r1.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 1,
+           "column": "amount"
+          },
+          "eid": "ev:cell:9df40facfe235170",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 398500,
+          "rendered": "398,500"
+         },
+         "state": "deterministic",
+         "span": [
+          108,
+          115
+         ],
+         "id": "s19"
+        },
+        {
+         "kind": "text",
+         "text": " 元）。",
+         "state": "neutral",
+         "span": [
+          115,
+          119
+         ],
+         "id": "s20"
+        }
+       ]
+      },
+      {
+       "id": "u5",
+       "kind": "claim",
+       "span": [
+        119,
+        143
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "临潭区 ",
+         "state": "neutral",
+         "span": [
+          119,
+          123
+         ],
+         "id": "s21"
+        },
+        {
+         "kind": "number",
+         "text": "284,500",
+         "ref": "v:Q1.r2.amount",
+         "cite": {
+          "ref": "Q1.r2.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 2,
+           "column": "amount"
+          },
+          "eid": "ev:cell:7b9793466ab9ba7b",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 284500,
+          "rendered": "284,500"
+         },
+         "state": "deterministic",
+         "span": [
+          123,
+          130
+         ],
+         "id": "s22"
+        },
+        {
+         "kind": "text",
+         "text": " 元，环比下降 ",
+         "span": [
+          130,
+          138
+         ],
+         "state": "neutral",
+         "id": "s23"
+        },
+        {
+         "kind": "number",
+         "text": "3.2%",
+         "span": [
+          138,
+          142
+         ],
+         "state": "none",
+         "issue": "uncited_number",
+         "id": "s24"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "span": [
+          142,
+          143
+         ],
+         "state": "neutral",
+         "id": "s25"
+        }
+       ]
+      }
+     ],
+     "id": "b3"
+    },
+    {
+     "type": "list",
+     "ordered": false,
+     "units": [
+      {
+       "id": "u6",
+       "kind": "claim",
+       "span": [
+        147,
+        160
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n\n- ",
+         "state": "neutral",
+         "span": [
+          143,
+          147
+         ],
+         "id": "s26"
+        },
+        {
+         "kind": "text",
+         "text": "枫岭区的客单价高于其余两区",
+         "state": "neutral",
+         "span": [
+          147,
+          160
+         ],
+         "id": "s27"
+        }
+       ],
+       "depth": 0
+      },
+      {
+       "id": "u7",
+       "kind": "claim",
+       "span": [
+        163,
+        172
+       ],
+       "cites": [],
+       "see": [],
+       "segments": [
+        {
+         "kind": "structural",
+         "text": "\n- ",
+         "state": "neutral",
+         "span": [
+          160,
+          163
+         ],
+         "id": "s28"
+        },
+        {
+         "kind": "text",
+         "text": "松溪区的订单数最多",
+         "state": "neutral",
+         "span": [
+          163,
+          172
+         ],
+         "id": "s29"
+        }
+       ],
+       "depth": 0
+      }
+     ],
+     "id": "b4"
+    }
+   ],
+   "stats": {
+    "units": 8,
+    "segments": 30,
+    "claims": 7,
+    "connective": 0,
+    "headings": 1,
+    "numbers": 8,
+    "numbers_cited": 7,
+    "values": 0,
+    "uncited_numbers": 1,
+    "unresolved": 0,
+    "see": 0,
+    "uncited_claims": 3,
+    "violations": 1
+   },
+   "violations": [
+    {
+     "code": "uncited_number",
+     "message": "数字「3.2%」没有出处：报告中直接写出了数字，系统无法核对",
+     "for_model": "数字「3.2%」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "span": [
+      138,
+      142
+     ],
+     "text": "3.2%",
+     "context": "潭区 284,500 元，环比下降 3.2%。  - 枫岭区的客单价高于其余两区",
+     "segment": "s24",
+     "unit": "u5"
+    }
+   ]
+  },
+  "1c66d590eac155dec35e2215e20c6e7497e96d0b2d73894eff1dea3fb641bb51": {
+   "schema": "agentlab.report/1",
+   "entity_syntax": 2,
+   "provenance": 1,
+   "run_id": "run-inq-approve",
+   "node_id": "verify",
+   "markdown": "退款率按退款金额除以含税销售额计算：9 月退款金额 21,500 元，含税销售额 1,135,000 元，两者之比为 0.0189。含税销售额与报告中的销售额 1,135,000元 一致，口径相同。",
+   "source": "退款率按退款金额除以含税销售额计算：9 月退款金额 [[v:Q1.r0.refund]] 元，含税销售额 [[v:Q1.r0.gross]] 元，两者之比为 [[v:Q1.r0.rate]]。含税销售额与报告中的销售额 [[m:gmv]] 一致，口径相同。[[see:Q1]]",
+   "catalog": {
+    "m:gmv": {
+     "alias": "m:gmv",
+     "kind": "metric",
+     "eid": "ev:metric:a867f352bc111166",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "gmv"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "销售额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 1135000,
+     "status": "ok",
+     "rendered": "1,135,000元",
+     "label": "销售额 = 1,135,000元"
+    },
+    "m:orders": {
+     "alias": "m:orders",
+     "kind": "metric",
+     "eid": "ev:metric:bb840f0fb915d4b1",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "orders"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "订单数",
+     "unit": "单",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 8420,
+     "status": "ok",
+     "rendered": "8,420单",
+     "label": "订单数 = 8,420单"
+    },
+    "m:refund": {
+     "alias": "m:refund",
+     "kind": "metric",
+     "eid": "ev:metric:82118fae68692f09",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款金额",
+     "unit": "元",
+     "decimals": 0,
+     "format": "thousands",
+     "value": 21500,
+     "status": "ok",
+     "rendered": "21,500元",
+     "label": "退款金额 = 21,500元"
+    },
+    "m:refund_rate": {
+     "alias": "m:refund_rate",
+     "kind": "metric",
+     "eid": "ev:metric:80676887dbac8214",
+     "node_id": "card",
+     "artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e",
+     "locator": {
+      "metric": "refund_rate"
+     },
+     "caliber": "月报口径",
+     "version": "v2",
+     "name": "退款率",
+     "unit": "",
+     "decimals": 4,
+     "format": "percent_of_ratio",
+     "value": 0.0189,
+     "status": "ok",
+     "rendered": "1.89%",
+     "label": "退款率 = 1.89%"
+    },
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:7d73ed945072dc9b",
+     "locator": {},
+     "node_id": "verify",
+     "exec": 1,
+     "artifact": "02ca8aeabca59d785d982b321d22ff889cb2da5a037cd4a080407e9044356434",
+     "tool": "db_query__qingshan_mart",
+     "source": "qingshan_mart",
+     "columns": [
+      "refund",
+      "gross",
+      "rate"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__qingshan_mart · 1 行"
+    }
+   },
+   "blocks": [
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u0",
+       "kind": "claim",
+       "span": [
+        0,
+        66
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "退款率按退款金额除以含税销售额计算：9 月退款金额 ",
+         "state": "neutral",
+         "span": [
+          0,
+          26
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "number",
+         "text": "21,500",
+         "ref": "v:Q1.r0.refund",
+         "cite": {
+          "ref": "Q1.r0.refund",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "refund"
+          },
+          "eid": "ev:cell:0f068f8ee1656d4b",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 21500,
+          "rendered": "21,500"
+         },
+         "state": "deterministic",
+         "span": [
+          26,
+          32
+         ],
+         "id": "s1"
+        },
+        {
+         "kind": "text",
+         "text": " 元，含税销售额 ",
+         "state": "neutral",
+         "span": [
+          32,
+          41
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "number",
+         "text": "1,135,000",
+         "ref": "v:Q1.r0.gross",
+         "cite": {
+          "ref": "Q1.r0.gross",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "gross"
+          },
+          "eid": "ev:cell:de4f4c63e35aea73",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 1135000,
+          "rendered": "1,135,000"
+         },
+         "state": "deterministic",
+         "span": [
+          41,
+          50
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "text",
+         "text": " 元，两者之比为 ",
+         "state": "neutral",
+         "span": [
+          50,
+          59
+         ],
+         "id": "s4"
+        },
+        {
+         "kind": "number",
+         "text": "0.0189",
+         "ref": "v:Q1.r0.rate",
+         "cite": {
+          "ref": "Q1.r0.rate",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "rate"
+          },
+          "eid": "ev:cell:e651bc70e437e2bc",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 0.0189,
+          "rendered": "0.0189"
+         },
+         "state": "deterministic",
+         "span": [
+          59,
+          65
+         ],
+         "id": "s5"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          65,
+          66
+         ],
+         "id": "s6"
+        }
+       ]
+      },
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        66,
+        99
+       ],
+       "cites": [
+        "m:gmv",
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:7d73ed945072dc9b",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "含税销售额与报告中的销售额 ",
+         "state": "neutral",
+         "span": [
+          66,
+          80
+         ],
+         "id": "s7"
+        },
+        {
+         "kind": "number",
+         "text": "1,135,000元",
+         "ref": "m:gmv",
+         "cite": {
+          "ref": "gmv",
+          "alias": "m:gmv",
+          "locator": {
+           "metric": "gmv"
+          },
+          "eid": "ev:metric:a867f352bc111166",
+          "kind": "metric",
+          "role": "value",
+          "status": "resolved",
+          "value": 1135000,
+          "rendered": "1,135,000元"
+         },
+         "state": "deterministic",
+         "span": [
+          80,
+          90
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "text",
+         "text": " 一致，口径相同。",
+         "state": "neutral",
+         "span": [
+          90,
+          99
+         ],
+         "id": "s9"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    }
+   ],
+   "stats": {
+    "units": 2,
+    "segments": 10,
+    "claims": 2,
+    "connective": 0,
+    "headings": 0,
+    "numbers": 4,
+    "numbers_cited": 4,
+    "values": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "see": 1,
+    "uncited_claims": 0,
+    "violations": 0
+   },
+   "violations": []
+  },
+  "08aadcdf2338b5be5addd826bdc96fa9ec3f410edd629557d5f91e790d6bbb34": {
+   "schema": "agentlab.report/1",
+   "entity_syntax": 2,
+   "provenance": 1,
+   "run_id": "run-inq-approve",
+   "node_id": "verify",
+   "markdown": "9 月新客销售额 151,000 元，老客 984,000 元，新客约占 13%，单凭这些不足以说明增长主要来自新客。新客中消费最高的会员消费 9,000 元。",
+   "source": "9 月新客销售额 [[v:Q1.r0.amount]] 元，老客 [[v:Q1.r1.amount]] 元，新客约占 13%，单凭这些不足以说明增长主要来自新客。新客中消费最高的会员消费 [[v:Q2.r0.amount]] 元。[[see:Q1]]",
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:3c4aa132de11b466",
+     "locator": {},
+     "node_id": "verify",
+     "exec": 1,
+     "artifact": "36cf830847abf4b41ae28ab17cd375bebba829662454cf066588cd774c21a399",
+     "tool": "db_query__qingshan_mart",
+     "source": "qingshan_mart",
+     "columns": [
+      "customer_type",
+      "amount"
+     ],
+     "rows": 2,
+     "truncated": false,
+     "label": "db_query__qingshan_mart · 2 行"
+    },
+    "Q2": {
+     "alias": "Q2",
+     "kind": "query",
+     "eid": "ev:query:97e281218b0b9496",
+     "locator": {},
+     "node_id": "verify",
+     "exec": 1,
+     "artifact": "57b0c8fe914a2bf78c2bd6ecbecdbb24758914657962d4b8f62de6303079f892",
+     "tool": "db_query__qingshan_mart",
+     "source": "qingshan_mart",
+     "columns": [
+      "member_id",
+      "phone",
+      "first_order_at",
+      "amount"
+     ],
+     "rows": 50,
+     "truncated": true,
+     "label": "db_query__qingshan_mart · 50 行"
+    }
+   },
+   "blocks": [
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u0",
+       "kind": "claim",
+       "span": [
+        0,
+        59
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "9 月新客销售额 ",
+         "state": "neutral",
+         "span": [
+          0,
+          9
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "number",
+         "text": "151,000",
+         "ref": "v:Q1.r0.amount",
+         "cite": {
+          "ref": "Q1.r0.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "amount"
+          },
+          "eid": "ev:cell:de32bdd67974bf18",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 151000,
+          "rendered": "151,000"
+         },
+         "state": "deterministic",
+         "span": [
+          9,
+          16
+         ],
+         "id": "s1"
+        },
+        {
+         "kind": "text",
+         "text": " 元，老客 ",
+         "state": "neutral",
+         "span": [
+          16,
+          22
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "number",
+         "text": "984,000",
+         "ref": "v:Q1.r1.amount",
+         "cite": {
+          "ref": "Q1.r1.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 1,
+           "column": "amount"
+          },
+          "eid": "ev:cell:ceb74003e12744e8",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 984000,
+          "rendered": "984,000"
+         },
+         "state": "deterministic",
+         "span": [
+          22,
+          29
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "text",
+         "text": " 元，新客约占 ",
+         "span": [
+          29,
+          37
+         ],
+         "state": "neutral",
+         "id": "s4"
+        },
+        {
+         "kind": "number",
+         "text": "13%",
+         "span": [
+          37,
+          40
+         ],
+         "state": "none",
+         "issue": "uncited_number",
+         "id": "s5"
+        },
+        {
+         "kind": "text",
+         "text": "，单凭这些不足以说明增长主要来自新客。",
+         "span": [
+          40,
+          59
+         ],
+         "state": "neutral",
+         "id": "s6"
+        }
+       ]
+      },
+      {
+       "id": "u1",
+       "kind": "claim",
+       "span": [
+        59,
+        80
+       ],
+       "cites": [
+        "Q2",
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:3c4aa132de11b466",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "新客中消费最高的会员消费 ",
+         "state": "neutral",
+         "span": [
+          59,
+          72
+         ],
+         "id": "s7"
+        },
+        {
+         "kind": "number",
+         "text": "9,000",
+         "ref": "v:Q2.r0.amount",
+         "cite": {
+          "ref": "Q2.r0.amount",
+          "alias": "Q2",
+          "locator": {
+           "row": 0,
+           "column": "amount"
+          },
+          "eid": "ev:cell:07282a98c9fafe2e",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 9000,
+          "rendered": "9,000"
+         },
+         "state": "deterministic",
+         "span": [
+          72,
+          77
+         ],
+         "id": "s8"
+        },
+        {
+         "kind": "text",
+         "text": " 元。",
+         "state": "neutral",
+         "span": [
+          77,
+          80
+         ],
+         "id": "s9"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    }
+   ],
+   "stats": {
+    "units": 2,
+    "segments": 10,
+    "claims": 2,
+    "connective": 0,
+    "headings": 0,
+    "numbers": 4,
+    "numbers_cited": 3,
+    "values": 0,
+    "uncited_numbers": 1,
+    "unresolved": 0,
+    "see": 1,
+    "uncited_claims": 0,
+    "violations": 1
+   },
+   "violations": [
+    {
+     "code": "uncited_number",
+     "message": "数字「13%」没有出处：报告中直接写出了数字，系统无法核对",
+     "for_model": "数字「13%」没有出处：要写成引用标记（比如 [[m:指标id]]），不能直接写数字",
+     "span": [
+      37,
+      40
+     ],
+     "text": "13%",
+     "context": "老客 984,000 元，新客约占 13%，单凭这些不足以说明增长主要来自新客",
+     "segment": "s5",
+     "unit": "u0"
+    }
+   ]
+  },
+  "4ed3d62d2af13bbea40195283f3caf63462ca76bb5d4f7ddf1216d36dd5e0463": {
+   "schema": "agentlab.report/1",
+   "entity_syntax": 2,
+   "provenance": 1,
+   "run_id": "run-inq-approve",
+   "node_id": "verify",
+   "markdown": "枫岭区 9 月线上订单销售额 118,000 元，门店 334,000 元，报告中的片区销售额包含线上订单。",
+   "source": "枫岭区 9 月线上订单销售额 [[v:Q1.r0.amount]] 元，门店 [[v:Q1.r1.amount]] 元，报告中的片区销售额包含线上订单。[[see:Q1]]",
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:d4bea3bc648535a9",
+     "locator": {},
+     "node_id": "verify",
+     "exec": 1,
+     "artifact": "ca81d2368e8597720aad6fd4eb6a0c33227770aa4a5b3b3219df6ccaa0d23be9",
+     "tool": "db_query__qingshan_mart",
+     "source": "qingshan_mart",
+     "columns": [
+      "channel",
+      "amount"
+     ],
+     "rows": 2,
+     "truncated": false,
+     "label": "db_query__qingshan_mart · 2 行"
+    }
+   },
+   "blocks": [
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u0",
+       "kind": "claim",
+       "span": [
+        0,
+        54
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:d4bea3bc648535a9",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "枫岭区 9 月线上订单销售额 ",
+         "state": "neutral",
+         "span": [
+          0,
+          15
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "number",
+         "text": "118,000",
+         "ref": "v:Q1.r0.amount",
+         "cite": {
+          "ref": "Q1.r0.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "amount"
+          },
+          "eid": "ev:cell:2d8a4ebd33347c2e",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 118000,
+          "rendered": "118,000"
+         },
+         "state": "deterministic",
+         "span": [
+          15,
+          22
+         ],
+         "id": "s1"
+        },
+        {
+         "kind": "text",
+         "text": " 元，门店 ",
+         "state": "neutral",
+         "span": [
+          22,
+          28
+         ],
+         "id": "s2"
+        },
+        {
+         "kind": "number",
+         "text": "334,000",
+         "ref": "v:Q1.r1.amount",
+         "cite": {
+          "ref": "Q1.r1.amount",
+          "alias": "Q1",
+          "locator": {
+           "row": 1,
+           "column": "amount"
+          },
+          "eid": "ev:cell:6eca03c8d280f692",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 334000,
+          "rendered": "334,000"
+         },
+         "state": "deterministic",
+         "span": [
+          28,
+          35
+         ],
+         "id": "s3"
+        },
+        {
+         "kind": "text",
+         "text": " 元，报告中的片区销售额包含线上订单。",
+         "state": "neutral",
+         "span": [
+          35,
+          54
+         ],
+         "id": "s4"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    }
+   ],
+   "stats": {
+    "units": 1,
+    "segments": 5,
+    "claims": 1,
+    "connective": 0,
+    "headings": 0,
+    "numbers": 2,
+    "numbers_cited": 2,
+    "values": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "see": 1,
+    "uncited_claims": 0,
+    "violations": 0
+   },
+   "violations": []
+  },
+  "911780ed990217a2a2e7e3424a9408d23b53a524ba5d1812ec677b7d6b5b80aa": {
+   "schema": "agentlab.report/1",
+   "entity_syntax": 2,
+   "provenance": 1,
+   "run_id": "run-inq-explore",
+   "node_id": "verify",
+   "markdown": "退款率按退款金额除以含税销售额计算，9 月为 0.0189。",
+   "source": "退款率按退款金额除以含税销售额计算，9 月为 [[v:Q1.r0.rate]]。[[see:Q1]]",
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "kind": "query",
+     "eid": "ev:query:7d73ed945072dc9b",
+     "locator": {},
+     "node_id": "verify",
+     "exec": 1,
+     "artifact": "02ca8aeabca59d785d982b321d22ff889cb2da5a037cd4a080407e9044356434",
+     "tool": "db_query__qingshan_mart",
+     "source": "qingshan_mart",
+     "columns": [
+      "refund",
+      "gross",
+      "rate"
+     ],
+     "rows": 1,
+     "truncated": false,
+     "label": "db_query__qingshan_mart · 1 行"
+    }
+   },
+   "blocks": [
+    {
+     "type": "paragraph",
+     "units": [
+      {
+       "id": "u0",
+       "kind": "claim",
+       "span": [
+        0,
+        30
+       ],
+       "cites": [
+        "Q1"
+       ],
+       "see": [
+        {
+         "ref": "Q1",
+         "role": "support",
+         "alias": "Q1",
+         "kind": "query",
+         "status": "resolved",
+         "eid": "ev:query:7d73ed945072dc9b",
+         "locator": {}
+        }
+       ],
+       "segments": [
+        {
+         "kind": "text",
+         "text": "退款率按退款金额除以含税销售额计算，9 月为 ",
+         "state": "neutral",
+         "span": [
+          0,
+          23
+         ],
+         "id": "s0"
+        },
+        {
+         "kind": "number",
+         "text": "0.0189",
+         "ref": "v:Q1.r0.rate",
+         "cite": {
+          "ref": "Q1.r0.rate",
+          "alias": "Q1",
+          "locator": {
+           "row": 0,
+           "column": "rate"
+          },
+          "eid": "ev:cell:e651bc70e437e2bc",
+          "kind": "cell",
+          "role": "value",
+          "status": "resolved",
+          "value": 0.0189,
+          "rendered": "0.0189"
+         },
+         "state": "deterministic",
+         "span": [
+          23,
+          29
+         ],
+         "id": "s1"
+        },
+        {
+         "kind": "text",
+         "text": "。",
+         "state": "neutral",
+         "span": [
+          29,
+          30
+         ],
+         "id": "s2"
+        }
+       ]
+      }
+     ],
+     "id": "b0"
+    }
+   ],
+   "stats": {
+    "units": 1,
+    "segments": 3,
+    "claims": 1,
+    "connective": 0,
+    "headings": 0,
+    "numbers": 1,
+    "numbers_cited": 1,
+    "values": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "see": 1,
+    "uncited_claims": 0,
+    "violations": 0
+   },
+   "violations": []
+  }
+ },
+ "snapshots": {
+  "02ca8aeabca59d785d982b321d22ff889cb2da5a037cd4a080407e9044356434": {
+   "artifact": "02ca8aeabca59d785d982b321d22ff889cb2da5a037cd4a080407e9044356434",
+   "sql": "SELECT SUM(r.amount) AS refund, SUM(o.amount) AS gross, ROUND(SUM(r.amount) * 1.0 / SUM(o.amount), 4) AS rate FROM orders o LEFT JOIN refunds r ON r.order_id = o.id WHERE o.paid_at >= '2026-09-01' AND o.paid_at < '2026-10-01'",
+   "source": "qingshan_mart",
+   "columns": [
+    "refund",
+    "gross",
+    "rate"
+   ],
+   "rows": [
+    [
+     21500,
+     1135000,
+     0.0189
+    ]
+   ],
+   "row_count": 1,
+   "truncated": false,
+   "masked": []
+  },
+  "36cf830847abf4b41ae28ab17cd375bebba829662454cf066588cd774c21a399": {
+   "artifact": "36cf830847abf4b41ae28ab17cd375bebba829662454cf066588cd774c21a399",
+   "sql": "SELECT customer_type, SUM(amount) AS amount FROM orders WHERE paid_at >= '2026-09-01' AND paid_at < '2026-10-01' GROUP BY customer_type ORDER BY customer_type",
+   "source": "qingshan_mart",
+   "columns": [
+    "customer_type",
+    "amount"
+   ],
+   "rows": [
+    [
+     "新客",
+     151000
+    ],
+    [
+     "老客",
+     984000
+    ]
+   ],
+   "row_count": 2,
+   "truncated": false,
+   "masked": []
+  },
+  "57b0c8fe914a2bf78c2bd6ecbecdbb24758914657962d4b8f62de6303079f892": {
+   "artifact": "57b0c8fe914a2bf78c2bd6ecbecdbb24758914657962d4b8f62de6303079f892",
+   "sql": "SELECT member_id, phone, first_order_at, amount FROM orders WHERE customer_type = '新客' ORDER BY amount DESC",
+   "source": "qingshan_mart",
+   "columns": [
+    "member_id",
+    "phone",
+    "first_order_at",
+    "amount"
+   ],
+   "rows": [
+    [
+     "M1000",
+     "已遮罩",
+     "2026-09-01",
+     9000
+    ],
+    [
+     "M1001",
+     "已遮罩",
+     "2026-09-02",
+     8880
+    ],
+    [
+     "M1002",
+     "已遮罩",
+     "2026-09-03",
+     8760
+    ],
+    [
+     "M1003",
+     "已遮罩",
+     "2026-09-04",
+     8640
+    ],
+    [
+     "M1004",
+     "已遮罩",
+     "2026-09-05",
+     8520
+    ],
+    [
+     "M1005",
+     "已遮罩",
+     "2026-09-06",
+     8400
+    ],
+    [
+     "M1006",
+     "已遮罩",
+     "2026-09-07",
+     8280
+    ],
+    [
+     "M1007",
+     "已遮罩",
+     "2026-09-08",
+     8160
+    ],
+    [
+     "M1008",
+     "已遮罩",
+     "2026-09-09",
+     8040
+    ],
+    [
+     "M1009",
+     "已遮罩",
+     "2026-09-10",
+     7920
+    ],
+    [
+     "M1010",
+     "已遮罩",
+     "2026-09-11",
+     7800
+    ],
+    [
+     "M1011",
+     "已遮罩",
+     "2026-09-12",
+     7680
+    ],
+    [
+     "M1012",
+     "已遮罩",
+     "2026-09-13",
+     7560
+    ],
+    [
+     "M1013",
+     "已遮罩",
+     "2026-09-14",
+     7440
+    ],
+    [
+     "M1014",
+     "已遮罩",
+     "2026-09-15",
+     7320
+    ],
+    [
+     "M1015",
+     "已遮罩",
+     "2026-09-16",
+     7200
+    ],
+    [
+     "M1016",
+     "已遮罩",
+     "2026-09-17",
+     7080
+    ],
+    [
+     "M1017",
+     "已遮罩",
+     "2026-09-18",
+     6960
+    ],
+    [
+     "M1018",
+     "已遮罩",
+     "2026-09-19",
+     6840
+    ],
+    [
+     "M1019",
+     "已遮罩",
+     "2026-09-20",
+     6720
+    ],
+    [
+     "M1020",
+     "已遮罩",
+     "2026-09-21",
+     6600
+    ],
+    [
+     "M1021",
+     "已遮罩",
+     "2026-09-22",
+     6480
+    ],
+    [
+     "M1022",
+     "已遮罩",
+     "2026-09-23",
+     6360
+    ],
+    [
+     "M1023",
+     "已遮罩",
+     "2026-09-24",
+     6240
+    ],
+    [
+     "M1024",
+     "已遮罩",
+     "2026-09-25",
+     6120
+    ],
+    [
+     "M1025",
+     "已遮罩",
+     "2026-09-26",
+     6000
+    ],
+    [
+     "M1026",
+     "已遮罩",
+     "2026-09-27",
+     5880
+    ],
+    [
+     "M1027",
+     "已遮罩",
+     "2026-09-28",
+     5760
+    ],
+    [
+     "M1028",
+     "已遮罩",
+     "2026-09-01",
+     5640
+    ],
+    [
+     "M1029",
+     "已遮罩",
+     "2026-09-02",
+     5520
+    ],
+    [
+     "M1030",
+     "已遮罩",
+     "2026-09-03",
+     5400
+    ],
+    [
+     "M1031",
+     "已遮罩",
+     "2026-09-04",
+     5280
+    ],
+    [
+     "M1032",
+     "已遮罩",
+     "2026-09-05",
+     5160
+    ],
+    [
+     "M1033",
+     "已遮罩",
+     "2026-09-06",
+     5040
+    ],
+    [
+     "M1034",
+     "已遮罩",
+     "2026-09-07",
+     4920
+    ],
+    [
+     "M1035",
+     "已遮罩",
+     "2026-09-08",
+     4800
+    ],
+    [
+     "M1036",
+     "已遮罩",
+     "2026-09-09",
+     4680
+    ],
+    [
+     "M1037",
+     "已遮罩",
+     "2026-09-10",
+     4560
+    ],
+    [
+     "M1038",
+     "已遮罩",
+     "2026-09-11",
+     4440
+    ],
+    [
+     "M1039",
+     "已遮罩",
+     "2026-09-12",
+     4320
+    ],
+    [
+     "M1040",
+     "已遮罩",
+     "2026-09-13",
+     4200
+    ],
+    [
+     "M1041",
+     "已遮罩",
+     "2026-09-14",
+     4080
+    ],
+    [
+     "M1042",
+     "已遮罩",
+     "2026-09-15",
+     3960
+    ],
+    [
+     "M1043",
+     "已遮罩",
+     "2026-09-16",
+     3840
+    ],
+    [
+     "M1044",
+     "已遮罩",
+     "2026-09-17",
+     3720
+    ],
+    [
+     "M1045",
+     "已遮罩",
+     "2026-09-18",
+     3600
+    ],
+    [
+     "M1046",
+     "已遮罩",
+     "2026-09-19",
+     3480
+    ],
+    [
+     "M1047",
+     "已遮罩",
+     "2026-09-20",
+     3360
+    ],
+    [
+     "M1048",
+     "已遮罩",
+     "2026-09-21",
+     3240
+    ],
+    [
+     "M1049",
+     "已遮罩",
+     "2026-09-22",
+     3120
+    ]
+   ],
+   "row_count": 50,
+   "truncated": true,
+   "masked": [
+    "phone"
+   ]
+  },
+  "ca81d2368e8597720aad6fd4eb6a0c33227770aa4a5b3b3219df6ccaa0d23be9": {
+   "artifact": "ca81d2368e8597720aad6fd4eb6a0c33227770aa4a5b3b3219df6ccaa0d23be9",
+   "sql": "SELECT channel, SUM(amount) AS amount FROM orders WHERE region = '枫岭区' AND paid_at >= '2026-09-01' AND paid_at < '2026-10-01' GROUP BY channel ORDER BY channel",
+   "source": "qingshan_mart",
+   "columns": [
+    "channel",
+    "amount"
+   ],
+   "rows": [
+    [
+     "线上",
+     118000
+    ],
+    [
+     "门店",
+     334000
+    ]
+   ],
+   "row_count": 2,
+   "truncated": false,
+   "masked": []
+  }
+ },
+ "run_artifacts": [
+  {
+   "id": "8cb677489bbaafcafd3b0f0df1939c1ca57cccaa3c065e14c4efe2991a3dd9a9",
+   "kind": "report_doc",
+   "node_id": "write",
+   "size": 18234,
+   "meta": {},
+   "created_at": "2026-10-05T06:30:00"
+  },
+  {
+   "id": "02ca8aeabca59d785d982b321d22ff889cb2da5a037cd4a080407e9044356434",
+   "kind": "query_snapshot",
+   "node_id": null,
+   "size": 1460,
+   "meta": {},
+   "created_at": "2026-10-05T06:44:30"
+  },
+  {
+   "id": "911780ed990217a2a2e7e3424a9408d23b53a524ba5d1812ec677b7d6b5b80aa",
+   "kind": "inquiry_answer",
+   "node_id": null,
+   "size": 2140,
+   "meta": {
+    "report": "write",
+    "unit": "u2",
+    "question": "退款率怎么算的？"
+   },
+   "created_at": "2026-10-05T06:45:00"
+  },
+  {
+   "id": "4ed3d62d2af13bbea40195283f3caf63462ca76bb5d4f7ddf1216d36dd5e0463",
+   "kind": "inquiry_answer",
+   "node_id": null,
+   "size": 2510,
+   "meta": {
+    "report": "write",
+    "unit": null,
+    "question": "枫岭区的销售额是否包含线上订单？如果包含，线上订单按下单门店还是按收货地址归到片"
+   },
+   "created_at": "2026-10-05T06:52:00"
+  },
+  {
+   "id": "1c66d590eac155dec35e2215e20c6e7497e96d0b2d73894eff1dea3fb641bb51",
+   "kind": "inquiry_answer",
+   "node_id": null,
+   "size": 1980,
+   "meta": {
+    "report": "write",
+    "unit": "u2"
+   },
+   "created_at": "2026-10-05T06:58:00"
+  },
+  {
+   "id": "ab8f8dbfb139d3be461bd9b5f4024cc161be5588a2eea9275a47eac160bfc885",
+   "kind": "inquiry_answer",
+   "node_id": null,
+   "size": 2380,
+   "meta": {
+    "report": "write",
+    "unit": "u3",
+    "question": "本周枫岭片区 GMV 环比下降了多少？下降的主要原因是不是 SKU 结构的变化 "
+   },
+   "created_at": "2026-10-05T07:04:00"
+  }
+ ],
+ "card_artifact": "757e03414694c3b3480236718d32082ba449e7712d9ce99f4aee39ffdc5c3f4e"
+}

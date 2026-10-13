@@ -128,8 +128,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             errors.append(f"指标「{metric_id}」：小数位（decimals）需要填写整数，当前为「{definition.get('decimals')}」")
             continue
         decimals = display["decimals"]
-        if isinstance(value, float) and decimals is not None:
-            value = round(value, decimals)
+        value = round_metric(value, decimals)
         substituted = substitute(tree, values)
         incomplete: dict[str, Any] = {}
         if use.sources:
@@ -137,6 +136,13 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             incomplete = {"incomplete": True, "incomplete_reason": _incomplete_reason(sources),
                           "truncated_sources": sources}
         inputs = [_input_of(path, values[path], state, ctx, tctx) for path in paths]
+        for path, item in zip(paths, inputs):
+            # 容器型的 vars.* 输入（列表、字典）另存一份完整值：卡里只记了「[12 项]」这样的大概，事后推演
+            # （engine/recompute.py）要拿完整的值重算。nodes.*、input.* 的完整值在那个节点封存的产出工件里，
+            # agent 字段能按出处从查询快照还原，都不用另存；vars 是谁写的、写进去的是不是节点产出本身说不准，
+            # 只能在这一刻存下。只给这种输入多一个键：没有容器型 vars 输入的卡和以前逐字节相同
+            if _container_var(path, values[path]) and (stored := await _store_value(path, values[path], ctx)):
+                item["value_artifact"] = stored
         sql_check: dict[str, Any] = {}
         if failed := _failed_queries(inputs, list(use.sources.values()), paths, tctx, checked):
             sql_check = {"sql_check_failed": True, "sql_check_reason": _sql_check_reason(failed),
@@ -325,6 +331,17 @@ def _integer(raw: Any) -> int | None:
     if isinstance(raw, str) and re.fullmatch(r"\s*[+-]?\d+\s*", raw):
         return int(raw)
     return None
+
+
+def round_metric(value: Any, decimals: Any) -> Any:
+    """口径卡的取整：只取整浮点，按小数位 round（Python 的 round，负数取整到十位、百位）；整数、文本、空值原样，
+    小数位没写或不是整数（老卡上记着的 true、2.0 这类怪值）时也原样。
+
+    推演重算（engine/recompute.py）、双盲复算的盲值都按卡重算，取整规则只能有这一处：两边各写一行，口径卡哪天换了
+    取整方式，推演就会对着同一张卡算出另一个数。"""
+    if isinstance(value, float) and isinstance(decimals, int) and not isinstance(decimals, bool):
+        return round(value, decimals)
+    return value
 
 
 def _rendered(value: Any, definition: dict[str, Any], display: dict[str, Any]) -> str:
@@ -719,11 +736,36 @@ def _recompute(substituted: str, tctx: dict[str, Any], value: Any, decimals: int
         again = eval_expression(substituted, tctx)
     except Exception:  # noqa: BLE001 - 代入式算不出来本身就是「对不上」
         return False
-    if isinstance(again, float) and decimals is not None:
-        again = round(again, decimals)
+    again = round_metric(again, decimals)
     if is_number(again) and is_number(value):
         return math.isclose(again, value, rel_tol=1e-12, abs_tol=0.0) or again == value
     return again == value
+
+
+#: 另存的完整值最大多少字节（规范 JSON）。查询结果整份赋给变量时可能很大，每张卡都再存一份不值当：大过这个数就
+#: 不存，推演照实说当时没有保存完整值
+VALUE_ARTIFACT_MAX = 4 * 1024 * 1024
+
+
+def _container_var(path: str, value: Any) -> bool:
+    head = _REF_HEAD.match(path)
+    return isinstance(value, (list, dict)) and head is not None and head.group(1) == "vars"
+
+
+async def _store_value(path: str, value: Any, ctx: NodeContext) -> str | None:
+    """容器型 vars 输入的完整值落成 metric_input 工件：{path, value}。它的 id 记在指标集里，指标集内容寻址、
+    在封存范围内，完整值也就随运行封存，不另起台账条目。存不下（太大、写失败）就不存：口径卡照常算出来，
+    只是这个输入以后推演不了。"""
+    from app.core.artifact_store import canonical_json, put_json
+
+    content = {"path": path, "value": value}
+    try:
+        if len(canonical_json(content).encode()) > VALUE_ARTIFACT_MAX:
+            return None
+        return await put_json(content, kind="metric_input", run_id=ctx.run.run_id, node_id=ctx.node.id,
+                              meta={"path": path})
+    except Exception:  # noqa: BLE001 - 完整值存不下不该毁掉口径卡
+        return None
 
 
 async def _store(card: dict[str, Any], caliber: str, version: str, ctx: NodeContext) -> str | None:

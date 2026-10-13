@@ -16,6 +16,7 @@ import {
   headlineMs, idTail, isLiveRun, runShape, runTiming, timingTitle, type ParsedQuery,
 } from './model'
 import { ClassChip, LiveElapsed, TierChip } from './parts'
+import { ScheduleTag, useScheduleNames } from '../schedules/parts'
 import type { ApprovalQueue, RunList, StatusCounts } from './useRunsData'
 
 // -------------------------------------------------------------------------
@@ -191,6 +192,8 @@ export function RunRows({
 }) {
   const changed = useChangedRows(list.rows)
   const now = useTicker(60_000)
+  // 定时任务发起的运行在名字旁标「定时」，悬停写是哪个定时任务：名字按需取一次
+  const scheduleNames = useScheduleNames(list.rows.map((r) => r.schedule_id))
 
   if (list.state === 'loading') {
     return <div className="p-3"><Skeleton rows={6} height={46} gap={8} /></div>
@@ -241,6 +244,7 @@ export function RunRows({
               flash={changed.get(run.id)}
               now={now}
               onOpen={onOpen}
+              scheduleName={run.schedule_id ? scheduleNames.get(run.schedule_id) : undefined}
             />
           ))}
         </section>
@@ -295,10 +299,12 @@ function useChangedRows(rows: Run[]): Map<string, number> {
   return changed
 }
 
-function RunRow({ run, code, approval, selected, dup, flash, now, onOpen }: {
+function RunRow({ run, code, approval, selected, dup, flash, now, onOpen, scheduleName }: {
   run: Run; code: StatusCode; approval?: Approval; selected: boolean; dup: boolean
   /** 状态刚变过：第几次变化（换 key 重播闪光） */
   flash?: number; now: number; onOpen: (id: string) => void
+  /** 发起它的定时任务的名字（不是定时任务发起的、或名字还没取到时没有） */
+  scheduleName?: string
 }) {
   const meta = statusMeta(code)
   const timing = runTiming(run)
@@ -341,6 +347,7 @@ function RunRow({ run, code, approval, selected, dup, flash, now, onOpen }: {
             {idTail(run.workflow_id)}
           </span>
         )}
+        {run.schedule_id && <ScheduleTag scheduleId={run.schedule_id} name={scheduleName} />}
         <span className="flex-1" />
         <ClassChip runClass={run.run_class} version={run.version} />
         <TierChip tier={tier} />

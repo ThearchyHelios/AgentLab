@@ -22,6 +22,7 @@ TYPE_LABEL: dict[str, str] = {
     "branch": "条件分支", "loop": "循环", "subgraph": "子工作流",
     "memory": "长期记忆", "retrieve": "知识检索", "transform": "数据整形",
     "human": "人工审批", "validate": "结构校验", "metrics": "口径卡", "report": "报告撰写",
+    "dual_check": "双盲复算", "challenge": "反方审稿",
 }
 
 #: 各类节点共用的字段名（nodeDefs.ts）。同一个键在不同节点上叫法不同的，见 _FIELD_BY_TYPE
@@ -65,6 +66,24 @@ FIELD_LABEL: dict[str, str] = {
     "defaults": "工作流默认设置",
 }
 
+#: 双盲复算节点各配置项的叫法（lib/terms.ts 的 DUAL_CHECK_TEXT.field，check-verify 逐项比对）。模型两项照结论句裁判
+#: 「裁判模型 · 接入」「裁判模型」的写法
+DUAL_CHECK_FIELD_LABEL: dict[str, str] = {
+    "card": "口径卡", "metrics": "复算的指标", "definitions": "口径说明", "provider": "盲算模型 · 接入",
+    "model": "盲算模型", "tolerance": "允许的相对误差", "on_reject": "未采用原流程时", "enabled": "启用双盲复算",
+}
+#: 「未采用原流程时」两个取值的短说法：检查器下拉的选项以它开头（DUAL_CHECK_TEXT.onReject），后面可以带一句用途
+DUAL_CHECK_ON_REJECT_LABEL: dict[str, str] = {"degrade": "计入缺口、出具降档", "fail": "判为失败"}
+#: 反方审稿节点各配置项的叫法（lib/terms.ts 的 CHALLENGE_TEXT.field，check-challenge 逐项比对）
+CHALLENGE_LABEL: dict[str, str] = {
+    "report": "要审的报告", "max_claims": "最多审几句", "max_queries": "每句最多查询次数",
+    "timeout_s": "每句时长上限（秒）", "provider": "反方模型 · 接入", "model": "反方模型",
+    "on_refuted": "结论被推翻时", "enabled": "启用",
+}
+#: 「结论被推翻时」三个取值的叫法：和检查器下拉（CHALLENGE_TEXT.onRefuted）一致，只去掉「（默认）」。报错让人去改
+#: 某一项时，人在下拉里找得到这个名字
+CHALLENGE_ON_REFUTED_LABEL: dict[str, str] = {"degrade": "出具降档", "flag": "只标注", "fail": "报错并停止运行"}
+
 _FIELD_BY_TYPE: dict[str, dict[str, str]] = {
     "input": {"fields": "输入字段"},
     "agent": {"prompt": "任务"},
@@ -80,6 +99,8 @@ _FIELD_BY_TYPE: dict[str, dict[str, str]] = {
               "stop_on_reject": "驳回即终止运行"},
     "validate": {"source": "待校验内容", "fail_fast": "校验失败即中断"},
     "merge": {"inputs": "输入", "sql": "合并 SQL"},
+    "dual_check": DUAL_CHECK_FIELD_LABEL,
+    "challenge": CHALLENGE_LABEL,
 }
 
 #: 出具契约里的键（canvas/issues.ts 的 CONTRACT_KEYS、SUB_KEYS）
@@ -113,6 +134,8 @@ _OPTION_LABEL: dict[str, dict[str, str]] = {
                        "incomparable": "标注与历史不可比"},
     "isolation": {"strict": "严格：microVM", "fast": "快速：系统沙箱"},
     "thinking": {"summarized": "开启并显示摘要", "adaptive": "开启但不显示", "off": "关闭"},
+    "on_reject": DUAL_CHECK_ON_REJECT_LABEL,
+    "on_refuted": CHALLENGE_ON_REFUTED_LABEL,
 }
 #: 让人在几个取值之间选时的完整选项文字（发布前修复的候选），和检查器下拉一致，只去掉「（默认）」
 CHOICE_LABEL: dict[str, dict[str, str]] = {

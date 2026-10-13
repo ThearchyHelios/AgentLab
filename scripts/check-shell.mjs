@@ -135,8 +135,11 @@ await section('导航', '=== 导航 ===', async () => {
   const box = await nav(page).boundingBox()
   check('导航宽 64px（w-16）', Math.round(box.width) === 64, `${box.width}`)
   const labels = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').allInnerTexts()
-  check('导航项：问数据、编排、记录、数据、工具、知识、设置',
-    labels.join(',') === '问数据,编排,记录,数据,工具,知识,设置', labels.join(','))
+  // 定时任务是后加的，排在设置前面；设置留在最底下，快捷键还是 ⌥7（定时任务用 ⌥8）
+  check('导航项：问数据、编排、记录、数据、工具、知识、定时任务、设置',
+    labels.join(',') === '问数据,编排,记录,数据,工具,知识,定时任务,设置', labels.join(','))
+  const keys = await nav(page).locator('li > a[aria-keyshortcuts]').evaluateAll((els) => els.map((el) => el.getAttribute('aria-keyshortcuts')))
+  check('设置仍是 ⌥7，定时任务是 ⌥8', keys[6] === 'Alt+8' && keys[7] === 'Alt+7', keys.join(','))
   const fontSize = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').first()
     .evaluate((el) => getComputedStyle(el).fontSize)
   check('导航标签 11px', fontSize === '11px', fontSize)
@@ -163,6 +166,8 @@ await section('导航', '=== 导航 ===', async () => {
   await page.locator('main').click({ position: { x: 600, y: 300 } }).catch(() => {})
   await page.keyboard.press('Alt+Digit3')
   check('⌥3 切到记录页', await page.waitForURL(/\/runs(\?|$)/, { timeout: 5000 }).then(() => true, () => false), page.url())
+  await page.keyboard.press('Alt+Digit8')
+  check('⌥8 切到定时任务页', await page.waitForURL(/\/schedules(\?|$)/, { timeout: 5000 }).then(() => true, () => false), page.url())
 
   await page.goto(`${WEB}/settings/datasources`)
   check('旧地址 /settings/datasources 重定向到 /data', await page.waitForURL(/\/data(\/|$)/, { timeout: 8000 }).then(() => true, () => false), page.url())

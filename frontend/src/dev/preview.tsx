@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import type { JSX } from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
 import { Database, MessageSquare, RotateCw } from 'lucide-react'
@@ -33,6 +34,20 @@ import '../index.css'
  */
 
 type Bucket = keyof typeof fixtures
+
+/**
+ * 各功能自带的预览用例：dev/fixtures/*.tsx 各自导出 cases（用例名 → 组件），?syn=<用例名> 先在这里找，
+ * 找不到再走下面 synthetic() 里的用例。新功能加预览只加自己的文件，不用改这里——几个工作包同时加用例，
+ * 不会在这一个文件上互相冲突。写法见 dev/fixtures/_example.tsx
+ */
+type FixtureCases = Record<string, () => JSX.Element>
+const FIXTURE_CASES: FixtureCases = {}
+for (const [file, mod] of Object.entries(import.meta.glob<{ cases?: FixtureCases }>('./fixtures/*.tsx', { eager: true }))) {
+  for (const [name, render] of Object.entries(mod.cases ?? {})) {
+    if (name in FIXTURE_CASES) console.warn(`预览用例重名：${name}（${file} 盖掉了先加载的那个）`)
+    FIXTURE_CASES[name] = render
+  }
+}
 
 const CASES: { key: Bucket; question: string; phase: StreamTurn['phase']; status: string }[] = [
   { key: 'db', question: '这个库里有多少数据？挑最大的表说说', phase: 'done', status: '已完成' },
@@ -561,6 +576,9 @@ function Preview() {
     )
   }
   if (syn) {
+    // 当组件渲染，不直接调用：用例里可以用 hook
+    const Fixture = FIXTURE_CASES[syn]
+    if (Fixture) return <Fixture />
     const linked: string[] = ((window as any).__linked ??= [])
     const stream = (
       <AssistantStream

@@ -18,24 +18,45 @@ artifacts 表可以事后插行，run.output 是可以改写的一列，封存�
 按数值在封存的查询快照、口径卡里猜候选（legacy_text），只做展示，写明是猜的。
 
 查询步骤只给被引用的行和前后各 2 行，完整快照仍走 /api/artifacts/{id}。数据源
-options.mask_columns 里的列换成「已遮罩」——在有身份体系之前，这只减少暴露，不是
-安全边界：知道工件 id 的人照样能取到整份快照。
+options.mask_columns 里的列换成「已遮罩」，SQL 里给它们起了别名、套了函数得来的结果列也换
+（_mask_sets，和可验证报告同一个函数，合并查询另按合并 SQL 认）；用到这些列的指标，指标步骤的值、
+证据图的标签也不给（_metric_masks，和推演同一个判断；报告撰写节点写作之前按同一个判断把这类指标在目录里写成「已遮罩」，
+withheld_metrics，只是遮罩列只认确定的那一套，和单元格引用的自查同一个口径；可验证报告认老文档也按这个口径，
+certain_masks；转抄上游口径卡的指标在指标依赖图上一次认，_CopyGraph → recompute.masked_closure，按整张卡认：转抄的那张卡
+在这次运行的任何一次执行里有一个指标取自遮罩格，转抄出来的就不给，推演的转抄输入按同一张图，copied_inputs）；SQL、合并
+警告里写着的遮罩值（这次运行里确定取自遮罩列的值）
+展示时换掉。一份快照的遮罩分析、收到的值按快照工件记在进程里（_MEMO），之后的请求不再读盘、不再分析
+——在有身份体系之前，这只减少暴露，不是安全边界：知道工件 id 的人照样能取到整份快照。
+
+已知局限（遮罩只减少暴露、不是安全边界，可验证报告的真伪以服务端封存的清单哈希为准）：认遮罩列只按 SQL 和列名认，写法的
+长尾认不全，取自那些列的指标、单元格在写作目录、报告文档、成果和可验证报告里照给。已知的有：先给遮罩列起别名、外层再套
+没起别名的表达式（SELECT * FROM (SELECT UPPER(p) FROM (SELECT phone AS p …))，列名「UPPER(p)」里没有遮罩列的名字）、
+一元加号这类认法本身漏掉的表达式（+phone，masking._derived_masks 的缺口）、Postgres 给没起别名的表达式起的列名（upper、
+?column?）、视图和别的表里换了名字存着的遮罩列、自己建的函数，以及数据整形把号码取出来再赋给变量（出处认不出）。
+
+期 4 的核查状态同样只读封存范围内的东西：指标步骤带双盲复算的结果（_dual_check_of，读双盲复算节点的产出和台账
+条目），句子带反方审稿的判断（_challenge_of，读反方审稿节点的产出和审稿记录）。它们是核查，不是证据：没有就不带这两个键。
+证据图的每份报告另带一张被反方审过的句子 → 判断的表（_challenge_verdicts，和 _challenge_of 同一个读法），正文据此挂
+句末标记，不用逐句请求片段接口。
 
 结论句的判定（四期）是模型给的，不是证据：正式运行的判定在报告文档里、随文档封存；探索运行
 按需裁判（POST …/evidence/judge），判定作为 evidence.judged 事件追加在封存之后，只填补没判过的
-句子。交给裁判的摘录同样只取封存范围内的工件。
+句子。交给裁判的摘录同样只取封存范围内的工件，每份查询快照里确定取自遮罩列的列不给（_judge_loader，报告撰写节点
+当场裁判同一个函数）。
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import csv
+import functools
 import io
 import logging
 import re
 import sqlite3
+import threading
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, get_args
@@ -75,7 +96,7 @@ from app.data.provenance_types import (
 from app.data.table_versions import SnapshotManifestMismatch, SnapshotMissing
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent, Workflow
-from app.engine import direct_select
+from app.engine import direct_select, recompute
 from app.engine.evidence import (
     ENTITY_KINDS,
     GUESS_NOTE,
@@ -103,6 +124,7 @@ from app.engine.evidence import (
 )
 from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candidates, outdated
 from app.engine.merge_query import MERGE_SOURCE, trace_cell
+from app.engine.schema import CLAIMS_JUDGE, GraphSpec, challenge_report, dual_check_card
 from app.engine.toolcalls import QUERY_PREFIX
 
 router = APIRouter(prefix="/api/runs", tags=["evidence"])
@@ -121,7 +143,14 @@ NONE_NOTE = "本次运行没有报告文档，也没有出具契约，没有可�
 NO_DOC_NOTE = "本次运行的出具契约采用引用模式核对，但报告没有产出可核对的文档"
 
 MASKED = "已遮罩"
-MASK_NOTE = "这些列在数据源中设置了遮罩，面板上不显示原值。遮罩只减少暴露，不是安全边界"
+#: 面板底下的遮罩说明。遮的列可能是遮罩列本身，也可能是 SQL 里给它起了别名、套了函数得来的结果列（c.phone AS tel）
+MASK_NOTE = "这些列取自数据源中设置了遮罩的列，面板上不显示原值。遮罩只减少暴露，不是安全边界"
+#: 遮没遮核对不了、不显示的值（指标步骤的值、推演的原值）：和「已遮罩」分开，读的人不该以为这里设了遮罩
+UNVERIFIED_VALUE = "无法核对"
+#: 认不出出处的输入（数据整形算出来再赋给变量的一格），值和这次运行查到过的遮罩值一样：界面上接在「，不显示值」前面
+VALUE_MASKED = "值与设置了遮罩的列中的值相同"
+#: 查询步骤的 SQL、合并警告里写着的遮罩值展示时换成了「已遮罩」（_Shown）：复制下来的不是执行的原文
+SQL_MASKED_NOTE = "SQL 和提示中写着的遮罩值仅在展示时换成「已遮罩」，执行的原文未改动"
 #: 查询条目的数据源现在找不到了（改名或删掉了）：只能按快照里记下的、查询当时的遮罩来遮
 SOURCE_GONE = "数据源「{source}」已不存在（可能已改名或删除），按查询时记录的遮罩处理"
 #: 查询步骤给被引用的行前后各带几行
@@ -357,18 +386,45 @@ async def evidence_graph(run_id: str) -> dict[str, Any]:
         return {**body, "mode": mode, **extra}
 
     inputs = _input_payloads(sealed)
+    masks = _Masks(sealed)
     for report in reports:
+        # 期 4：被反方审过的句子 → 判断，正文据此给它们挂句末标记。文档读不出来的不给；一句都没审的没有这个键
+        marks = _challenge_verdicts(sealed, report) if report.doc is not None else {}
         body["reports"].append({
             "node_id": report.node_id, "doc_artifact": report.doc_artifact,
             "doc_sealed": sealed.trusted, "hash_ok": report.hash_ok, "ok": report.ok,
             "repairs": report.repairs, "fields": report.fields, "stats": report.stats,
             **_judgement_of(report, sealed),
+            **({"challenge_verdicts": marks} if marks else {}),
         })
         if report.doc is not None:
             evidence, edges = _graph_of(report, sealed, inputs)
+            await _withheld_labels(evidence, report.doc, sealed, masks)
             body["evidence"].extend(evidence)
             body["edges"].extend(edges)
     return {**body, "mode": "cited"}
+
+
+async def _withheld_labels(evidence: list[dict[str, Any]], doc: dict[str, Any], sealed: _Sealed, masks: _Masks) -> None:
+    """证据图里指标的标签（目录里写的「名称 = 渲染值」）：指标的值不给的（用到遮罩列的一格、遮没遮核对不了、值里有遮罩值，
+    _metric_masks，和指标步骤同一个判断），值换成「已遮罩」「无法核对」。以前指标步骤写着「已遮罩」，证据图的标签照给
+    号码；报告只写了 [[see:m:phone_raw]]、正文里没有号码的，号码也从这里露出来。"""
+    catalog = doc.get("catalog") or {}
+    cards: dict[str, Any] = {}
+    for item in evidence:
+        entry = catalog.get(item.get("alias")) or {}
+        artifact = str(entry.get("artifact") or "")
+        if item.get("kind") != "metric" or not artifact:
+            continue
+        if artifact not in cards:
+            cards[artifact] = _load_card(artifact)[0]
+        metric = _metric_in(cards[artifact], (entry.get("locator") or {}).get("metric"))
+        if metric is None or metric.get("value") is None:
+            continue
+        _, word = await _metric_masks(metric, str(entry.get("node_id") or ""), artifact, sealed, masks,
+                                      card=cards[artifact])
+        if word is not None:
+            item["label"] = f"{entry.get('name') or metric.get('name') or metric.get('id')} = {word}"
 
 
 async def _mode_of(sealed: _Sealed, reports: list[_Report]) -> tuple[str, dict[str, Any]]:
@@ -726,8 +782,11 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
     start, end = unit.get("span") or [0, 0]
     chain = await _chain(seg, doc, sealed, chosen.node_id)
     covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
-    masked = list(dict.fromkeys(c for step in chain if step.get("step") == "query" for c in step.get("masked") or []))
+    # 遮罩列：查询步骤里遮着的，加上指标步骤里取自遮罩列的输入（按位置取的那一格可能没有对应的查询步骤）
+    masked = list(dict.fromkeys(c for step in chain if step.get("step") in ("query", "input")
+                                for c in step.get("masked") or []))
     verdict = _effective_verdicts(chosen, sealed)[0].get(str(unit.get("id")))
+    challenged = _challenge_of(sealed, chosen, str(unit.get("id")))
     return {
         "report": {"node_id": chosen.node_id, "doc_artifact": chosen.doc_artifact},
         "segment": {"id": seg["id"], "text": seg.get("text"), "kind": seg.get("kind"), "state": seg.get("state"),
@@ -736,7 +795,9 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
         "unit": {"id": unit.get("id"), "kind": unit.get("kind"), "text": markdown[start:end],
                  "span": unit.get("span"), "cites": unit.get("cites") or [],
                  **({"verdict": verdict} if verdict is not None else {}),
-                 "on_demand": _on_demand(sealed, doc, str(unit.get("id")), verdict)},
+                 # 期 4：反方审稿对这一句的判断，没审到这一句的没有这个键
+                 **({"challenge": challenged} if challenged is not None else {}),
+                 "on_demand": _on_demand(sealed, doc, str(unit.get("id")), verdict, chosen.claims)},
         "block": {"id": block.get("id"), "type": block.get("type")},
         "chain": chain,
         "note": _note(seg, unit),
@@ -778,7 +839,7 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
                  report_node: str) -> list[dict[str, Any]]:
     cite = seg.get("cite") or {}
     entry = (doc.get("catalog") or {}).get(cite.get("alias")) or {}
-    masks = _Masks()
+    masks = _Masks(sealed)
     if seg.get("kind") == "entity" and seg.get("issue") in SUSPICIOUS:
         return [_suspicious_step(seg, cite, sealed, report_node)]
     if seg.get("kind") == "entity" and seg.get("state") == "deterministic" and cite.get("status") == "resolved":
@@ -827,8 +888,12 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     metric_id = (cite.get("locator") or {}).get("metric")
     card, hash_ok = _load_card(artifact) if artifact else (None, False)
     metric = _metric_in(card, metric_id)
+    # 报告撰写节点把这个指标的值换成了「已遮罩」（文档的证据目录里记着 masked）：正文写的就是目录里那个字，按它比渲染，
+    # 不拿卡上的原值去比（比了只会报渲染不一致）
+    written_masked = bool(entry.get("masked"))
     try:
-        rendered_now = render_metric(metric, cite.get("conv")) if metric else None
+        rendered_now = str(entry.get("rendered") or "") if written_masked \
+            else render_metric(metric, cite.get("conv")) if metric else None
     except RenderError:
         rendered_now = None
     source = metric or entry
@@ -855,10 +920,14 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         "source": await _caliber_source((card or {}).get("source")),
         "caliber_upgrade": _caliber_upgrade(sealed.upgrades.get(str(entry.get("node_id") or ""))),
     }
+    # 期 4：这个指标做没做过双盲复算、结果如何。没有双盲复算复核过这份指标集时没有这个键，老运行一字不差
+    if checked := _dual_check_of(sealed, str(entry.get("node_id") or ""), artifact, metric_id, metric):
+        step["dual_check"] = checked
     catalog = doc.get("catalog") or {}
     inputs: list[dict[str, Any]] = []
     #: 输入指到的查询快照 → 被引用的格；同一份快照只给一个查询步骤，格合在一起高亮
     wanted: dict[str, list[tuple[Any, Any]]] = {}
+    held, word = await _metric_masks(metric or {}, str(entry.get("node_id") or ""), artifact, sealed, masks, card=card)
     for item in (metric or {}).get("inputs") or []:
         one = {"step": "input", **item}
         artifact_of = item.get("artifact")
@@ -867,9 +936,449 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
             if cell := _input_cell(item, catalog):
                 one["cell"] = cell
             wanted.setdefault(str(artifact_of), []).extend(_located(item.get("locator") or {}))
+        if (found := held.get(str(item.get("path")))) is not None:
+            one = _withheld(one, found)
         inputs.append(one)
+    if withheld := {path: _held_word(found) for path, found in held.items() if found.kind != "table"}:
+        # 代入式里那几处同样写「已遮罩」（遮没遮核对不了的写「无法核对」）：不然标签里遮着、代入式里亮着，同一个值换个
+        # 地方照样看得到。整份结果当输入的不换：代入式里本来就只留着它的路径
+        step["substituted"] = recompute.substituted_without(metric or {}, withheld)
+    if step["value"] is not None and (word is not None or written_masked):
+        # 指标的值本身也不给，和推演的原值同一个判断（_metric_masks）：指标可能就是遮罩列的那一格（cell(nodes.q, 0,
+        # 'phone')），输入里遮着、这里亮着等于没遮。报告上的字（rendered）是读者已经看到的，照旧——写作时就认出来的，
+        # 目录、正文里本来就是「已遮罩」。文档记着不给、这里却认不出的（数据源事后撤了遮罩），照文档不给
+        step["value"] = word or MASKED
     queries = [s for a, cells in wanted.items() for s in await _query_steps(a, cells, doc, sealed, masks)]
     return [step, *inputs, *queries]
+
+
+@dataclass(frozen=True)
+class _Held:
+    """一个输入不给值的原因（_InputMasks.check、_metric_masks）。kind：
+
+    - masked：取自遮罩列的一格、一行，columns 是那几列遮罩列（列名照原样，按出现的先后）
+    - table：整份结果当输入（vars.res.rows），结果里 columns 这几列遮着；它不一定把哪一格带进指标，指标的值另按值认。
+      快照读不出来的，reason 写原因
+    - unverified：遮没遮核对不了，columns 是用到的列（认不出是哪一列时为空），reason 给人看
+    - value：认不出出处，值却就是这次运行查到过的遮罩值（按值认），reason 给人看"""
+
+    kind: str
+    columns: list[str]
+    reason: str | None = None
+
+
+def _withheld(step: dict[str, Any], held: _Held) -> dict[str, Any]:
+    """不给值的输入：值写「已遮罩」，遮没遮核对不了的写「无法核对」（_held_word；本来就没有值的照旧是空的，缺输入还得看得
+    出来），模型报的值、快照里的值一并拿掉。取自遮罩列的，masked 写明是哪几列；遮没遮核对不了的、按值认出来的
+    （_InputMasks），mask_unverified 写原因、不进 masked——面板底下那句「这些列设置了遮罩」不能把它们也算进去。"""
+    out = {k: v for k, v in step.items() if k not in ("model_value", "snapshot_value")}
+    if out.get("value") is not None:
+        out["value"] = _held_word(held)
+    if held.reason is None:
+        out["masked"] = held.columns
+    else:
+        out["mask_unverified"] = held.reason
+    return out
+
+
+def _held_word(held: _Held) -> str:
+    """不给值的输入写在值那里的字：遮没遮核对不了的（快照、取值链上的产出读不出来）写「无法核对」——数据源可能根本没设
+    遮罩，读的人不该以为这里遮着；别的（取自遮罩列的、按值认出来的）写「已遮罩」。代入式里那一处同一个字。"""
+    unverified = held.kind == "unverified" or (held.kind == "table" and held.reason is not None)
+    return UNVERIFIED_VALUE if unverified else MASKED
+
+
+async def _metric_masks(metric: dict[str, Any], card_node: str, artifact: str, sealed: _Sealed,
+                        masks: _Masks, *, card: dict[str, Any] | None = None,
+                        output: Callable[[Any], Any] | None = None, by_value: bool = True, sure: bool = False
+                        ) -> tuple[dict[str, _Held], str | None]:
+    """一个指标的输入里哪些不给值（路径 → _Held），指标本身的值给不给（None 照给，否则是写在值那里的字：「已遮罩」
+    「无法核对」）。证据面板的指标步骤、证据图的标签、报告撰写节点的写作目录（withheld_metrics）、推演里转抄的输入
+    （copied_inputs）都按这一个函数认，和推演同一套分类、同一个判断（recompute.withheld_value）：
+
+    - 输入取自哪份结果的哪几列按 _InputMasks 认（recompute.input_origin 的 wide：下标不是字面量的、整行、整份结果都认）
+    - 认不出出处的输入（数据整形算出来再赋给变量的一格），值就是这次运行查到过的遮罩值的，按值认（masks.run_secrets）；
+      运行输入是发起运行的人自己填的，不认
+    - 转抄上游口径卡的输入（nodes.<卡>.metrics[0].value、nodes.<卡>.text、整张卡，recompute.card_input）按那张卡认：那张卡
+      在这次运行的任何一次执行里有一个指标不给，转抄出来的就不给（转抄的保守规则），在这次请求的指标依赖图上一次算出
+      （_CopyGraph → recompute.masked_closure），不逐个往上递归
+    - 指标的值：取自遮罩列的一格、一行的不给；最外层的输入遮没遮核对不了的写「无法核对」；整份结果当输入、有认不出出处
+      的输入的，值里有遮罩值才不给（len(vars.res.rows) 照给）
+
+    card 是指标所在的那张卡（认它在卡上的位置，依赖图按 (指标集工件, 位置) 认指标），没给的按这个指标对象本身认。
+    output（节点 id → 那个节点的产出）给了的，按位置取的一格、转抄的上游卡顺着它走取值链，不去封存的事件里找口径卡算这一次
+    之前的产出：报告撰写节点写作时运行还没封存，产出就在运行状态里。by_value 为假（报告撰写节点的写作目录）：认不出出处的
+    输入不按值认，也不因此按值认指标的值——只按出处认，见 withheld_metrics。sure 为真（写作目录、可验证报告认老文档）：
+    遮罩列只按确定的那一套认（_InputMasks 的 sure），不跟着证据面板宁可多遮。"""
+    graph = masks.copies(sealed, output=output, by_value=by_value, sure=sure)
+    judged = await graph.judged(card_node, artifact, metric, card)
+    held = dict(graph.held(card_node, artifact, metric, card))
+    for path, (kind, columns, reason) in judged.copied.items():
+        if kind is not None:
+            held[path] = _copied_held(kind, columns, reason)
+    return held, {"masked": MASKED, "unverified": UNVERIFIED_VALUE}.get(judged.word or "")
+
+
+def _copied_held(kind: str, columns: tuple[str, ...], reason: str | None) -> _Held:
+    """转抄上游口径卡的输入不给值的原因（recompute.Judged.copied 的一项）：转抄的那张卡有指标不给的是 masked（哪种写法都
+    一样），写那张卡让它不给的遮罩列；读到的上游指标核对不了的核对不了（整张卡转抄的同 table、带原因）。"""
+    if kind == "masked":
+        return _Held("masked", list(columns))
+    if kind == "table_unverified":
+        return _Held("table", [], reason or CARD_UNVERIFIED)
+    return _Held("unverified", [], reason or CARD_UNVERIFIED)
+
+
+def _card_key(node_id: Any, card: dict[str, Any]) -> Any:
+    """一张口径卡在依赖图上的键：它的指标集工件（每次执行一份，内容寻址）；产出里没记工件的（落工件失败）按节点和这份
+    产出本身认。"""
+    return str(card.get("artifact") or "") or ("node", str(node_id or ""), id(card))
+
+
+def _metric_key(artifact: str, card_node: str, metric: dict[str, Any], card: dict[str, Any] | None) -> Any:
+    """一个指标在依赖图上的键：(指标集工件, 指标在卡上的位置)，转抄的边按同样的键指到上游。认不出位置的（没给卡，或者
+    调用方另取来的指标对象）按这个指标对象本身认，不和别的指标混在一起（依赖图留着它，对象 id 在这次请求里不会被复用）。"""
+    metrics = card.get("metrics") if isinstance(card, dict) and isinstance(card.get("metrics"), list) else []
+    index = next((i for i, m in enumerate(metrics) if m is metric), None)
+    if index is None:
+        return ("metric", id(metric))
+    return (artifact or _card_key(card_node, card), index)  # type: ignore[arg-type]
+
+
+def _needs_secrets(links: recompute.MetricLinks) -> bool:
+    """依赖图上这个指标可能要按值认（整份结果当输入、认不出出处的输入、整张卡转抄），值又可能是遮罩值：认之前先把这次运行
+    查到过的遮罩值收好（masked_closure 在同步代码里取）。"""
+    return recompute.maybe_masked_value(links.metric.get("value")) and (
+        links.uncertain or any(kind == "table" for kind, _ in links.direct.values())
+        or any(edge.whole for edge in links.copies))
+
+
+class _CopyGraph:
+    """一次请求里认指标的值给不给（_metric_masks）用的指标依赖图。键是 (指标集工件, 指标在卡上的位置)：转抄以外的输入按
+    _InputMasks 认（取自遮罩格的、核对不了的、按值认出来的），转抄上游口径卡的输入（recompute.card_input）连成边，交给
+    recompute.masked_closure 一次算出最小不动点。认过的指标记下来：证据图给每个指标认标签、同一次请求里别的指标转抄它，
+    都不再重认，工作量和图的大小成正比。
+
+    转抄的保守规则按整张卡认（recompute.CopyEdge.card）：转抄一张卡时，把它在这次运行里每一次执行的指标集（_executions：
+    封存之后按封存范围内的台账，写作时按运行状态里的台账）里的每个指标都放进图里，有一个不给，转抄出来的就不给。写作目录
+    （output 给了：运行状态里每个节点最后一次的产出）里，循环中抄自己上一轮的卡读到的是它自己最后一次的产出，第一轮取过号码、
+    最后一轮没取的，以前就这么照给了；封存之后（output 没给）另按每次执行往回连：卡在这次执行之前读到的是自己上一次执行的
+    产出（_card_outputs）。两种都只按图算，不按追了几层算：以前追够八层就按遮罩算，没设遮罩的循环累加也成了「已遮罩」。"""
+
+    def __init__(self, sealed: _Sealed, masks: _Masks, *, output: Callable[[Any], Any] | None, by_value: bool,
+                 sure: bool) -> None:
+        self.sealed, self.masks = sealed, masks
+        self.given, self.by_value, self.sure = output, by_value, sure
+        self._links: dict[Any, recompute.MetricLinks] = {}
+        self._held: dict[Any, dict[str, _Held]] = {}
+        self._judged: dict[Any, recompute.Judged] = {}
+        self._runs: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        self._owners: dict[str, str] | None = None
+
+    def matches(self, sealed: _Sealed, output: Callable[[Any], Any] | None, by_value: bool, sure: bool) -> bool:
+        return self.sealed is sealed and self.given is output and self.by_value == by_value and self.sure == sure
+
+    def held(self, card_node: str, artifact: str, metric: dict[str, Any], card: dict[str, Any] | None
+             ) -> dict[str, _Held]:
+        """认过的指标里转抄以外不给值的输入（judged 之后才有）。"""
+        return self._held[_metric_key(artifact, card_node, metric, card)]
+
+    async def judged(self, card_node: str, artifact: str, metric: dict[str, Any], card: dict[str, Any] | None
+                     ) -> recompute.Judged:
+        key = _metric_key(artifact, card_node, metric, card)
+        if key not in self._judged:
+            fresh = await self._build(key, card_node, artifact, metric)
+            secrets = await self.masks.run_secrets() if any(_needs_secrets(self._links[k]) for k in fresh) else None
+            self._judged.update(recompute.masked_closure({k: self._links[k] for k in fresh}, self._judged,
+                                                         lambda: secrets))
+        return self._judged[key]
+
+    def _executions(self, node_id: str) -> list[tuple[str, dict[str, Any]]]:
+        """口径卡 node_id 在这次运行里每一次执行的指标集：[(工件, 内容)]，按台账（sealed.entries 里的 metric_set 条目）认，
+        读不出来、和哈希对不上的跳过（读到的那一次产出读不出来另有 CardInput.unreadable 兜着）。同一张卡只找一次。"""
+        if node_id not in self._runs:
+            found: list[tuple[str, dict[str, Any]]] = []
+            for artifact in dict.fromkeys(str(e["artifact"]) for e in self.sealed.entries
+                                          if e.get("kind") == "metric_set" and e.get("artifact")
+                                          and str(e.get("node_id") or "") == node_id):
+                content, ok = self.masks.fetch(artifact)
+                if ok is True and isinstance(content, dict) and isinstance(content.get("metrics"), list):
+                    found.append((artifact, content))
+            self._runs[node_id] = found
+        return self._runs[node_id]
+
+    def _owner(self, artifact: str) -> str | None:
+        """指标集工件 artifact 是哪张口径卡（节点 id）在这次运行里的产出，按台账认；认不出的是 None。"""
+        if self._owners is None:
+            self._owners = {}
+            for e in self.sealed.entries:
+                if e.get("kind") == "metric_set" and e.get("artifact") and e.get("node_id"):
+                    self._owners.setdefault(str(e["artifact"]), str(e["node_id"]))
+        return self._owners.get(artifact) if artifact else None
+
+    async def _build(self, key: Any, card_node: str, artifact: str, metric: dict[str, Any]) -> list[Any]:
+        """认好 key 和顺着转抄的边够得着、还没认过的指标（转抄以外的输入，_links、_held），交回这一批新认的键。转抄一张卡时
+        它每一次执行的每个指标都放进来（_executions，转抄的保守规则按整张卡认）；上游的指标按它那一次执行之前的产出认
+        （_InputMasks 按 _card_outputs 找它当时读到的产出）。卡上没记输入的指标（写死的数、升级前的老卡）不放：照给。"""
+        fresh: list[Any] = []
+        todo = [(key, card_node, artifact, metric)]
+        while todo:
+            key, node, art, item_metric = todo.pop()
+            if key in self._links:
+                continue
+            hide = _InputMasks(self.sealed, self.masks, node, art, output=self.given, sure=self.sure)
+            links = recompute.MetricLinks(item_metric, card=node or None)
+            held: dict[str, _Held] = {}
+            for item in item_metric.get("inputs") or []:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path"))
+                copied = hide.copied(item)
+                if copied is not None:
+                    upstream: list[Any] = []
+                    # 转抄的是哪张卡：按读到的产出上记着的指标集认（经数据整形赋给变量、转了一道的也认得出是哪张卡），
+                    # 认不出的按取值链上的那个节点
+                    owner = copied.node_id
+                    if copied.card is not None:
+                        up_art = str(copied.card.get("artifact") or "")
+                        owner = self._owner(up_art) or copied.node_id
+                        for index in copied.picked:
+                            up_metric = copied.card["metrics"][index]
+                            if isinstance(up_metric, dict) and up_metric.get("inputs"):
+                                up = (_card_key(copied.node_id, copied.card), index)
+                                upstream.append(up)
+                                todo.append((up, owner, up_art, up_metric))
+                    for run_art, content in self._executions(owner):
+                        for index, up_metric in enumerate(content["metrics"]):
+                            if isinstance(up_metric, dict) and up_metric.get("inputs"):
+                                todo.append(((run_art, index), owner, run_art, up_metric))
+                    links.copies.append(recompute.CopyEdge(path, tuple(upstream), copied.whole, copied.unreadable,
+                                                           card=owner))
+                    continue
+                found, traced = await hide.check(item)
+                if found is None and not traced:
+                    if not self.by_value:
+                        continue
+                    links.uncertain = True
+                    value = item.get("value")
+                    if not path.startswith("input.") and recompute.maybe_masked_value(value) \
+                            and recompute.carries_masked(value, await self.masks.run_secrets()):
+                        found = _Held("value", [], VALUE_MASKED)
+                if found is not None:
+                    held[path] = found
+                    # 遮罩列只在确实取自遮罩列时往下游传（核对不了的那几列不算）
+                    links.direct[path] = (found.kind, tuple(found.columns) if found.reason is None else ())
+            self._links[key] = links
+            self._held[key] = held
+            fresh.append(key)
+        return fresh
+
+
+async def withheld_metrics(catalog: dict[str, Any], *, nodes: dict[str, Any], ledger: list[Any]) -> list[str]:
+    """报告撰写节点写作之前：目录里值取自遮罩格的指标（别名，按目录的先后），交给 evidence.withhold_metrics 换成「已遮罩」。
+
+    和证据面板指标步骤的值、推演的原值同一个判断（_metric_masks 判「已遮罩」的：cell() 取的遮罩格、取自改了名字的遮罩列、
+    按位置取自遮罩列的一格、一行，整份结果里带着遮罩列、值里就有这次运行查到过的遮罩值的）。以前写作目录、文档的证据目录
+    原样写着这些值，证据面板写「已遮罩」，同一个号码从报告正文和可验证报告里出去了。
+
+    只按出处认（by_value=False）：认不出出处的输入（写死的目标、数据整形算出来的数）不因为值碰巧等于遮罩列里的某一格就
+    算取自遮罩列。证据面板为了展示按值多遮一层，这里跟着多算，「单笔目标 20,000元」这种普通指标就在报告里成了「已遮罩」，
+    引用它的正式运行判失败、写作者也改不掉（报告自查第 3 轮去掉按值认是同一个道理）。数据整形把号码取出来再赋给变量的，
+    出处认不出，这里照给（已知的缺口，同证据面板对改过形状的结果）。这时运行还没封存，不看事件：
+    - 卡上的指标取自运行状态里口径卡节点的产出（nodes，和台账里那份指标集是同一份内容），按位置取的一格顺着运行状态里的
+      产出走取值链（口径卡算的时候读到的就是它们）
+    - 查询快照的数据源按证据台账认（ledger 的 query 条目），这次运行查到过的遮罩值从台账里的查询快照收
+    遮没遮核对不了的（「无法核对」）不算：写作时快照和产出刚落下，读不出来的只能是坏了的文件，宁可照给、不让写作者因此
+    改不掉；可验证报告那边另有兜底（bundle/build.py 只给哈希）。
+
+    遮罩列只按确定的那一套认（sure，和单元格引用的自查同一个口径：_cited_masks）：SQL 认不准、证据面板整份遮的快照里，
+    没确定取自遮罩列的普通金额、计数、只装着分档标签的列照给。以前跟着证据面板宁可多遮，WITH 写了列名表、VALUES 当表的
+    销售额也成了「已遮罩」，正式运行引用它就判失败；同一格按 [[v:…]] 引用却不报违规。转抄上游口径卡的指标
+    （nodes.<卡>.metrics[0].value、nodes.<卡>.text、整张卡）按那张卡认（转抄的保守规则，_CopyGraph）：运行状态里每张卡只有
+    最后一次的产出，那张卡每一次执行的指标集按台账（ledger 的 metric_set 条目）读回来，有一次执行里有一个指标取自遮罩格，
+    转抄出来的就写「已遮罩」。以前只看最后一次的产出：循环里第一轮取号码、之后转抄上一轮的卡，最后一轮没碰号码列，写作目录
+    照给，号码进了正文和成果；封存之后按每次执行往回认才写「已遮罩」，同一个指标两样说法。循环里抄自己上一轮的卡指回自己，
+    在依赖图上是一个环，那张卡哪一次执行都没有取自遮罩格的指标就照给。"""
+    queries = {str(e["artifact"]): {k: e[k] for k in ("node_id", "tool", "source", "via", "call_id", "exec")
+                                    if e.get(k) is not None}
+               for e in ledger if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact")}
+    # 每张口径卡每一次执行的指标集：转抄的保守规则按整张卡、每一次执行认（_CopyGraph._executions 从 entries 里找）
+    runs = [dict(e) for e in ledger if isinstance(e, dict) and e.get("kind") == "metric_set" and e.get("artifact")]
+    view = _Sealed(run_id="", graph={}, events=[], queries=queries, entries=runs,
+                   seal={"sealed": False, "ok": None, "manifest_seq": None, "legacy": False})
+    masks = _Masks(view)
+    found: list[tuple[str, str, str, dict[str, Any], dict[str, Any]]] = []
+    for alias, entry in catalog.items():
+        if not isinstance(entry, dict) or entry.get("kind") != "metric" or entry.get("value") is None:
+            continue
+        card_node = str(entry.get("node_id") or "")
+        card = nodes.get(card_node)
+        metric = _metric_in(card if isinstance(card, dict) else None, (entry.get("locator") or {}).get("metric"))
+        if isinstance(metric, dict) and metric.get("inputs"):
+            found.append((alias, card_node, str(entry.get("artifact") or ""), metric, card))
+    if not found:
+        return []
+    # cell()、Agent 字段落在的快照先在线程里读好（读盘、复验哈希）：在运行里认，不占着事件循环。转抄上游口径卡的指标要顺着
+    # 上游卡的输入认，运行状态里每张口径卡、台账里每一次执行的指标集连同它们的输入一并读好
+    await masks.prefetch(str(e["artifact"]) for e in runs)
+    cards = [card for card in nodes.values() if isinstance(card, dict) and card.get("kind") == "metric_set"]
+    cards += [content for e in runs for content, ok in [masks.fetch(str(e["artifact"]))]
+              if ok is True and isinstance(content, dict)]
+    await masks.prefetch(str(item["artifact"]) for metric in [*(m for *_, m, _ in found),
+                                                              *(m for card in cards for m in card.get("metrics") or [])]
+                         if isinstance(metric, dict) for item in metric.get("inputs") or []
+                         if isinstance(item, dict) and isinstance(item.get("artifact"), str) and item["artifact"])
+
+    def output(node_id: Any) -> Any:
+        return nodes.get(str(node_id or ""))
+
+    out: list[str] = []
+    for alias, card_node, artifact, metric, card in found:
+        _, word = await _metric_masks(metric, card_node, artifact, view, masks, card=card, output=output,
+                                      by_value=False, sure=True)
+        if word == MASKED:
+            out.append(alias)
+    return out
+
+
+async def certain_masks(sealed: _Sealed, masks: _Masks) -> tuple[dict[str, frozenset[str]], Any]:
+    """可验证报告认老文档时用的遮罩（bundle/build.py 的 _Store.metric_word，sure）：(封存范围内每份读得出来的查询快照 →
+    确定取自遮罩列的结果列（小写，_cited_masks 的键，和写作目录同一个口径）, 这次运行查到过的遮罩值（run_secrets）)。
+
+    可验证报告在线程里构建、不查库，这几样按证据面板的那一套先在这里认好交进去：老文档整份只给哈希的判断和写作目录
+    逐个指标一样（SQL 认不准时不因此算遮罩列），不另写一套。读不出来、和哈希对不上的快照不在里面：可验证报告按它的数据源
+    现在设的遮罩认，同 _InputMasks。"""
+    await masks.prefetch(sealed.queries)
+    out: dict[str, frozenset[str]] = {}
+    for artifact, info in sealed.queries.items():
+        snap, ok = masks.fetch(artifact)
+        if ok is True and isinstance(snap, dict):
+            out[artifact] = frozenset(await masks.cited(artifact, (info or {}).get("source"), snap))
+    return out, await masks.run_secrets()
+
+
+async def copied_inputs(sealed: _Sealed, card_node: str, artifact: str, card: dict[str, Any]
+                        ) -> dict[int, dict[str, tuple[str | None, str | None]]]:
+    """推演（api/whatif.py）用：这张卡上每个指标转抄上游口径卡的输入给不给值，{指标在卡上的位置: {输入路径: (种类, 原因)}}，
+    种类同 recompute.Judged.copied（None 照给）。和证据面板的指标步骤同一个判断、同一张依赖图（_metric_masks 的
+    _CopyGraph，宁可多遮的那一套）：推演据此不给转抄来的遮罩值、不让改，核对不了的不给，照给的照常推演。以前推演只按值认，
+    转抄来的值不是够长的号码（短编码、从遮罩格算出来的数）就照给、还能改。"""
+    masks = _Masks(sealed)
+    graph = masks.copies(sealed, output=None, by_value=True, sure=False)
+    out: dict[int, dict[str, tuple[str | None, str | None]]] = {}
+    for index, metric in enumerate(card.get("metrics") or []):
+        if isinstance(metric, dict) and metric.get("inputs"):
+            judged = await graph.judged(card_node, artifact, metric, card)
+            if judged.copied:
+                out[index] = {path: (kind, reason or (CARD_UNVERIFIED if kind in ("unverified", "table_unverified")
+                                                      else None))
+                              for path, (kind, _, reason) in judged.copied.items()}
+    return out
+
+
+#: tool_cell、Agent 字段落在的查询快照读不出来：只知道数据源现在设的遮罩，查询当时记下的在快照里，遮没遮核对不了
+SNAPSHOT_UNVERIFIED = "查询快照无法读取，核对不了这一格是否取自设置了遮罩的列"
+#: 转抄的上游口径卡指标遮没遮核对不了（它的输入落在读不出来的快照上这类）
+CARD_UNVERIFIED = "转抄的上游口径卡指标核对不了是否取自设置了遮罩的列"
+
+
+class _InputMasks:
+    """一个指标的输入里哪些不能给值。遮的列和查询步骤同一套（_mask_sets）：查询当时记下的加数据源现在设的，按 SQL
+    认出改了名字的（c.phone AS tel 的 tel）也算，合并查询按它合并的那几个数据源、逐格来历和合并 SQL 算。
+
+    取自哪份查询结果的哪几列按 recompute.input_origin 认（wide），推演是同一个认法：cell() 的格、Agent 交来的字段按
+    定位里的列认；vars.res.rows[0][2] 这种按位置取的一格卡上没记定位，顺着取值链认，从写变量的节点在口径卡算这一次之前
+    的产出起走（_card_outputs）；下标不是字面量的按列认，整行按整行的列认，整份结果（vars.res.rows）记 table。
+
+    遮没遮核对不了的宁可多遮，和推演一致：快照读不出来（数据源现在没遮这一列，可查询当时记下的遮罩在快照里）、按位置取的
+    一格取值链上的产出读不出来、那份结果没存快照只带着数据源名。认得出、可结果既没带快照的 id 也没带数据源名的（数据整形
+    改过形状）不遮：认不出出处，卡上本来就只记着路径和值，值另按值认（_metric_masks）。
+
+    一次请求里同一件工件只读一次、同一份快照的遮罩只认一次（记在 _Masks 上）：按位置取了十几格的指标，不必把写变量的
+    节点那几 MB 的产出重读十几遍；证据图给每个指标认一遍输入，也不必把同一份快照反复读盘。
+
+    sure（写作目录、可验证报告认老文档）：遮罩列只按确定的那一套认——读得出来的快照按单元格引用自查的 _cited_masks（_mask_sets
+    的 sure，再按血缘排除值确实不取自遮罩列的），读不出来的按数据源现在设的列名。证据面板、推演照旧按 hidden 宁可多遮。
+
+    转抄上游口径卡的输入（recompute.card_input：nodes.<卡>.metrics[0].value、vars.<卡的 assign_to>.metrics[0].value、
+    nodes.<卡>.text）这里只认出转抄了哪张卡的哪几个指标（copied），给不给按那张卡在依赖图上认（_CopyGraph）。
+    """
+
+    def __init__(self, sealed: _Sealed, masks: _Masks, card_node: str, artifact: str, *,
+                 output: Callable[[Any], Any] | None = None, sure: bool = False) -> None:
+        self._sealed, self._masks = sealed, masks
+        self._card, self._artifact = card_node, artifact
+        self._outputs: dict[str, str] | None = None
+        # 报告撰写节点写作时（withheld_metrics）：节点的产出就在运行状态里，不从封存的事件里找
+        self._given = output
+        self._sure = sure
+
+    def _fetch(self, artifact: str) -> tuple[Any, bool | None]:
+        return self._masks.fetch(artifact)
+
+    def copied(self, item: dict[str, Any]) -> recompute.CardInput | None:
+        """这个输入转抄了上游哪张口径卡的哪几个指标（recompute.card_input），不是转抄的为 None。卡当时的产出读不出来的
+        （文件不在、与哈希不一致）交回 unreadable：核对不了，宁可多遮。"""
+        return recompute.card_input(item, self._output)
+
+    async def check(self, item: dict[str, Any]) -> tuple[_Held | None, bool]:
+        """(不给值的原因, 认不认得出出处)：给值的原因为 None。认不出出处的（常量、运行输入、数据整形算出来的一格）第二项
+        为假，值按值认（_metric_masks）。转抄上游口径卡的输入不在这里认（copied）。"""
+        origin = recompute.input_origin(item, self._output, wide=True)
+        if origin is None:
+            return None, False
+        if origin.unverified is not None:
+            return _Held("unverified", list(origin.columns), origin.unverified), True
+        used = list(dict.fromkeys(origin.columns))
+        if not used:
+            return None, True
+        snap, ok = self._fetch(origin.artifact) if origin.artifact else (None, None)
+        readable = ok is True and isinstance(snap, dict)
+        hidden = await self._hidden(origin.artifact, origin.source, snap if readable else None)
+        if masked := [c for c in used if c.lower() in hidden]:
+            return _Held("table" if origin.table else "masked", masked), True
+        why = SNAPSHOT_UNVERIFIED if origin.artifact and not readable \
+            else recompute.POSITION_NO_SNAPSHOT if not origin.artifact and origin.source else None
+        if why is not None:
+            return _Held("table" if origin.table else "unverified", used, why), True
+        return None, True
+
+    def _output(self, node_id: Any) -> Any:
+        if self._given is not None:
+            return self._given(node_id)
+        if self._outputs is None:
+            self._outputs = self._masks.card_outputs(self._sealed, self._card, self._artifact)
+        artifact = self._outputs.get(str(node_id or ""))
+        content, ok = self._fetch(artifact) if artifact else (None, None)
+        return content if ok is True else None
+
+    async def _hidden(self, artifact: str | None, source: str | None, snap: dict[str, Any] | None) -> set[str]:
+        info = self._sealed.queries.get(artifact) if artifact else None
+        name = (info or {}).get("source") or source
+        if self._sure and snap is not None:
+            return await self._masks.cited(artifact, name, snap)
+        sets = await self._masks.sets(artifact, name, snap)
+        return sets.sure if self._sure else sets.hidden
+
+
+def _card_outputs(sealed: _Sealed, card_node: str, artifact: str) -> dict[str, str]:
+    """口径卡算出这份指标集的那一次执行开始之前，每个节点最后一次的产出工件：卡上 vars.*、nodes.* 取到的就是它们。
+    认不出是哪一次执行（台账里没有这份指标集）时，取封存范围内每个节点最后一次的产出。"""
+    finished = next((seq for seq, etype, node_id, data in sealed.events
+                     if etype == "node.finished" and node_id == card_node and isinstance(data, dict)
+                     and any(isinstance(e, dict) and e.get("kind") == "metric_set" and e.get("artifact") == artifact
+                             for e in data.get("evidence") or [])), None)
+    if finished is None:
+        return dict(sealed.outputs)
+    started = max((seq for seq, etype, node_id, _ in sealed.events
+                   if etype == "node.started" and node_id == card_node and seq < finished), default=finished)
+    out: dict[str, str] = {}
+    for seq, etype, node_id, data in sealed.events:
+        if seq >= started:
+            break
+        if etype == "node.finished" and node_id and isinstance(data, dict) and data.get("artifact"):
+            out[node_id] = str(data["artifact"])
+    return out
 
 
 def _located(locator: dict[str, Any]) -> list[tuple[Any, Any]]:
@@ -899,11 +1408,328 @@ def _caliber_upgrade(event: dict[str, Any] | None) -> dict[str, Any] | None:
     return {k: event.get(k) for k in ("workflow_id", "caliber_node", "pinned", "latest", "policy", "policy_label")}
 
 
-class _Masks:
-    """一次请求里查过的数据源遮罩：数据源名 → (要遮的列（小写）, 数据源现在还在不在)。"""
+#: 双盲复算节点产出里一个指标的结果（engine/nodes/dual_check.py 的 SAME / DIFFERENT / UNCHECKED），原样交给界面
+_DUAL_RESULTS = ("agreed", "disagreed", "unchecked")
 
-    def __init__(self) -> None:
+
+def _spec_of(sealed: _Sealed) -> GraphSpec | None:
+    """这次运行的图（认双盲复算复算哪张卡、反方审稿审哪份报告，和执行时同一个认法）。图读不懂的是 None。"""
+    try:
+        return GraphSpec.model_validate(sealed.graph)
+    except Exception:  # noqa: BLE001 - 图读不懂只是认不出来，证据照常给
+        return None
+
+
+def _dual_check_of(sealed: _Sealed, card_node: str, artifact: str, metric_id: Any,
+                   metric: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """这个指标的双盲复算状态：{status, node_id, choice?, blind_rendered?, reason?}。没有双盲复算复核过这份指标集的是 None。
+    metric 是卡上的这个指标（认它为什么没被复算用），读不到卡时为 None。
+
+    认的是复核了口径卡的哪一次结果：台账条目（kind dual_check）记着它复算的指标集工件，和指标步骤的工件对上才算——口径卡
+    在循环里算了几次时，报告引用的那一次才是。直通了的（设置里关了、口径卡上没有来自查询的输入）没有台账条目：按画布上
+    它复算的那张卡、和它跑完之前那张卡最后一次的指标集认。几个双盲复算复核了同一份指标集时取最后跑完的那个。
+
+    - agreed / disagreed / unchecked：节点产出里这个指标的结果。不一致的带审核人的选择（a / b / neither，没选的不带）；
+      一致、不一致的带盲算值（渲染好的）；无法复算的带原因
+    - skipped：节点没复算这个指标，reason 说为什么（_not_checked）：关闭了（disabled，节点直通）；不在节点配置的
+      「复算的指标」里、或者值不是数（not_targeted）；这个指标没有一个输入来自查询快照（no_inputs）。节点直通时产出里的
+      no_inputs 说的是整张卡，不原样套到每个指标上：卡上确有来自查询的指标、只是没被选上的，写它的说法是 not_targeted
+    产出读不出来（文件不在、与哈希不一致）时按台账条目说状态和选择，不带盲算值和原因。
+    """
+    if not card_node or not artifact or metric_id is None:
+        return None
+    checkers = set(sealed.nodes_of("dual_check"))
+    if not checkers:
+        return None
+    spec: GraphSpec | None = None
+    spec_read = False
+    #: 口径卡节点 → 到这一刻为止它最后一次的指标集
+    latest: dict[str, str] = {}
+    found: dict[str, Any] | None = None
+    for _, etype, node_id, data in sealed.events:
+        if etype != "node.finished" or not node_id or not isinstance(data, dict):
+            continue
+        ledger = [e for e in data.get("evidence") or [] if isinstance(e, dict)]
+        for e in ledger:
+            if e.get("kind") == "metric_set" and e.get("artifact"):
+                latest[node_id] = str(e["artifact"])
+        if node_id not in checkers:
+            continue
+        output, ok = _fetch(str(data.get("artifact") or ""))
+        output = output if ok is True and isinstance(output, dict) else {}
+        entry = next((e for e in ledger if e.get("kind") == "dual_check"), None)
+        if not spec_read:
+            spec, spec_read = _spec_of(sealed), True
+        node = spec.node_map().get(node_id) if spec else None
+        if entry is not None:
+            card, checked = str(entry.get("card") or ""), str(entry.get("metric_set") or "")
+        elif output.get("status") == "skipped":
+            card = (dual_check_card(spec, node)[0] or "") if spec and node else ""
+            checked = latest.get(card, "")
+        else:
+            continue
+        if card != card_node or checked != artifact:
+            continue
+        found = _dual_status(node_id, output, entry, str(metric_id), metric, _picked(node))
+    return found
+
+
+def _picked(node: Any) -> list[str] | None:
+    """画布上这个双盲复算节点配的「复算的指标」，认法同 dual_check._options：没配、配了空列表都是 None（复算全部）。"""
+    wanted = node.config.get("metrics") if node is not None else None
+    picked = [str(m) for m in wanted if isinstance(m, str) and m.strip()] if isinstance(wanted, list) else []
+    return picked or None
+
+
+def _query_input(item: Any) -> bool:
+    """来自查询快照的输入（同 dual_check._from_query）：双盲复算只复算有这种输入的指标。"""
+    return isinstance(item, dict) and item.get("via") in ("tool_cell", "agent_field") \
+        and isinstance(item.get("artifact"), str) and bool(item["artifact"])
+
+
+def _not_checked(node_reason: str, metric: dict[str, Any] | None, picked: list[str] | None, metric_id: str) -> str:
+    """节点没复算这个指标的原因。关闭了（disabled）照节点的说；别的按这个指标自己说：不在配置的「复算的指标」里是
+    not_targeted；卡上读得到它、它没有一个输入来自查询快照是 no_inputs，有（那就是值不是数）是 not_targeted。读不到卡时
+    照节点直通的原因说，节点跑了的说 not_targeted。"""
+    if node_reason == "disabled":
+        return node_reason
+    if picked is not None and metric_id not in picked:
+        return "not_targeted"
+    if metric is not None:
+        return "not_targeted" if any(_query_input(i) for i in metric.get("inputs") or []) else "no_inputs"
+    return node_reason or "not_targeted"
+
+
+def _dual_status(node_id: str, output: dict[str, Any], entry: dict[str, Any] | None, metric_id: str,
+                 metric: dict[str, Any] | None, picked: list[str] | None) -> dict[str, Any]:
+    """一次双盲复算里这个指标的状态（_dual_check_of 的答复）。"""
+    if output.get("status") == "skipped":
+        reason = _not_checked(str(output.get("reason") or ""), metric, picked, metric_id)
+        return {"status": "skipped", "node_id": node_id, "reason": reason}
+    row = next((m for m in output.get("metrics") or [] if isinstance(m, dict) and str(m.get("metric_id")) == metric_id),
+               None)
+    if row is None and not output and entry is not None:
+        # 产出读不出来：退回台账条目，只有状态和选择
+        brief = next((m for m in entry.get("metrics") or [] if isinstance(m, dict) and str(m.get("id")) == metric_id),
+                     None)
+        row = {"status": brief.get("status"), **({"choice": brief["choice"]} if "choice" in brief else {})} \
+            if brief is not None else None
+    if row is None:
+        return {"status": "skipped", "node_id": node_id, "reason": _not_checked("", metric, picked, metric_id)}
+    status = row.get("status") if row.get("status") in _DUAL_RESULTS else "unchecked"
+    out: dict[str, Any] = {"status": status, "node_id": node_id}
+    if status == "disagreed" and row.get("choice") in ("a", "b", "neither"):
+        out["choice"] = row["choice"]
+    rendered = row.get("blind_rendered")
+    if status != "unchecked" and isinstance(rendered, str) and rendered:
+        out["blind_rendered"] = rendered
+    if status == "unchecked" and isinstance(row.get("reason"), str) and row["reason"]:
+        out["reason"] = row["reason"]
+    return out
+
+
+#: 反方审稿的四种判断（engine/nodes/challenge.py 的 VERDICTS）：审稿概况的计数照这个顺序
+_CHALLENGE_VERDICTS = ("stands", "weakened", "refuted", "inconclusive")
+
+
+def _reviews(sealed: _Sealed, report: _Report
+             ) -> Iterator[tuple[str, dict[str, Any], str | None, list[dict[str, Any]]]]:
+    """审的就是正文这一份报告文档的每一次反方审稿，按跑完的先后：(节点, 产出, 审稿记录工件, 逐句的判断)。逐句判断的
+    每一项至少是个 dict，unit、verdict 认不认得由调用方看。片段接口的 unit.challenge（_challenge_of）和证据图的
+    challenge_verdicts（_challenge_verdicts）都从这里读，两边说的一定是同一次审稿。
+
+    只认审的就是这一份文档的：审稿记录（challenge_artifact）里记着它审的报告节点和文档工件，和这份对上才算——
+    报告在审稿之后又重写了（循环、接着跑），同一个句子编号在新的一稿里说的可能是另一句话。记录没存上（产出里的
+    challenge_artifact 为空）或读不出来时，按画布上它审的报告、和它跑完之前那份报告最后一次自查记下的文档认，判断取
+    产出里列的那几句（最多 10 句，被推翻、被削弱的排在前面），审稿记录工件照产出写（没存上的为空）。
+
+    节点设为「报错并停止运行」、又有句子被推翻时，节点报错、没有 node.finished：审完那一刻的 challenge_done 日志记着
+    审稿记录和计数，按它认（只认审稿记录存上了的），产出拼成 {challenge_artifact, counts, on_refuted: fail}。运行因此
+    失败了，被推翻的是哪几句、反方凭什么，证据面板里照样看得到。
+    """
+    reviewers = set(sealed.nodes_of("challenge"))
+    if not reviewers:
+        return
+    spec: GraphSpec | None = None
+    #: 报告节点 → 到这一刻为止它最后一次自查记下的文档
+    drafts: dict[str, str] = {}
+    #: 反方审稿节点 → 这一次执行里审完时的日志：节点报错时它就是审稿结果
+    done: dict[str, dict[str, Any]] = {}
+    for _, etype, node_id, data in sealed.events:
+        if not node_id or not isinstance(data, dict):
+            continue
+        if etype == "report.checked" and data.get("doc_artifact"):
+            drafts[node_id] = str(data["doc_artifact"])
+            continue
+        if node_id not in reviewers:
+            continue
+        if etype == "node.started":
+            done.pop(node_id, None)
+            continue
+        if etype == "log" and data.get("code") == "challenge_done":
+            done[node_id] = data
+            continue
+        if etype == "node.finished":
+            done.pop(node_id, None)
+            output, ok = _fetch(str(data.get("artifact") or ""))
+            if ok is not True or not isinstance(output, dict) or not isinstance(output.get("counts"), dict):
+                continue    # 直通了（关闭、没有可审的句子）或者产出读不出来
+        elif etype == "node.failed" and node_id in done:
+            log = done.pop(node_id)
+            if not isinstance(log.get("artifact"), str) or not log["artifact"]:
+                continue
+            output = {"challenge_artifact": log["artifact"], "counts": log.get("counts"), "on_refuted": "fail"}
+        else:
+            continue
+        artifact = output.get("challenge_artifact") if isinstance(output.get("challenge_artifact"), str) else None
+        record, saved = _fetch(artifact) if artifact else (None, None)
+        if saved is True and isinstance(record, dict):
+            if record.get("report") != report.node_id or record.get("doc_artifact") != report.doc_artifact:
+                continue
+            claims = record.get("claims")
+        elif etype == "node.failed":
+            continue    # 节点报错时没有产出可退：认不出审的是哪一稿
+        else:
+            spec = spec or _spec_of(sealed)
+            node = spec.node_map().get(node_id) if spec else None
+            target = challenge_report(spec, node)[0] if spec and node else None
+            if target != report.node_id or drafts.get(target) != report.doc_artifact:
+                continue
+            claims = output.get("items")
+        yield node_id, output, artifact, [c for c in claims or [] if isinstance(c, dict)]
+
+
+def _verdict_in(claims: list[dict[str, Any]], unit_id: str) -> str | None:
+    """一次审稿里这一句的判断：取列着这一句的第一条，判断不是一个词（缺了、空的、不是字符串）时这次审稿不算审到它。"""
+    verdict = next((c.get("verdict") for c in claims if c.get("unit") == unit_id), None)
+    return verdict if isinstance(verdict, str) and verdict else None
+
+
+def _challenge_of(sealed: _Sealed, report: _Report, unit_id: str) -> dict[str, Any] | None:
+    """这一句的反方审稿判断：{verdict, node_id, artifact, on_refuted, report_label, counts, unreviewed?}。没审到这一句的
+    是 None。认哪一次审稿见 _reviews；几个反方审稿审了同一份文档时取最后跑完、审到了这一句的那个。artifact 是审稿记录
+    （没存上的为空），on_refuted 是实际生效的处置（节点报错停止运行的是 fail），report_label 是报告节点的名字。
+
+    counts 是这次审稿四种判断各几句——整份报告的，取节点产出里的那一份；unreviewed 是没能反查的句数，产出里有才带。
+    证据面板单句展示时不画报告级的计数，可「无法判断」是不是因为反查没完成，得拿这两个数对一下。
+    """
+    if not unit_id:
+        return None
+    found: dict[str, Any] | None = None
+    spec: GraphSpec | None = None
+    for node_id, output, artifact, claims in _reviews(sealed, report):
+        verdict = _verdict_in(claims, unit_id)
+        if verdict is None:
+            continue
+        spec = spec or _spec_of(sealed)
+        writer = spec.node_map().get(report.node_id) if spec else None
+        unreviewed = output.get("unreviewed")
+        found = {"verdict": verdict, "node_id": node_id, "artifact": artifact,
+                 "on_refuted": str(output.get("on_refuted") or "degrade"),
+                 "report_label": writer.title if writer else report.node_id,
+                 "counts": _challenge_counts(output.get("counts"), claims),
+                 **({"unreviewed": unreviewed} if isinstance(unreviewed, int) and not isinstance(unreviewed, bool)
+                    and unreviewed >= 0 else {})}
+    return found
+
+
+def _challenge_verdicts(sealed: _Sealed, report: _Report) -> dict[str, str]:
+    """这份报告里被反方审过的句子 → 判断（证据图 reports[] 的 challenge_verdicts）。正文据此给被审过的句子挂句末标记、
+    点开整句面板：有的被审句子既没有可点的片段、也没有裁判判定，不靠这张表就打不开；也不用为了认出它们逐句请求片段接口。
+
+    读法和 _challenge_of 一字不差（同一个 _reviews、同一个 _verdict_in）：每一句取最后跑完、审到了它的那次审稿，所以表里
+    每一句的判断就是点开它时片段接口答的 unit.challenge.verdict。只有被审过的句子；一句都没审的是空表。
+    """
+    out: dict[str, str] = {}
+    for _, _, _, claims in _reviews(sealed, report):
+        units = dict.fromkeys(c.get("unit") for c in claims if isinstance(c.get("unit"), str) and c.get("unit"))
+        out.update({uid: verdict for uid in units if (verdict := _verdict_in(claims, uid)) is not None})
+    return out
+
+
+def _challenge_counts(raw: Any, claims: list[dict[str, Any]]) -> dict[str, int]:
+    """四种判断各几句：取节点产出（或审完时的日志）里的计数；一个数都认不出来时按认得的句子数（审稿记录里的是全部，
+    记录没存上时只有产出里列的那几句）。"""
+    given = raw if isinstance(raw, dict) else {}
+    known = {v: given[v] for v in _CHALLENGE_VERDICTS
+             if isinstance(given.get(v), int) and not isinstance(given[v], bool) and given[v] >= 0}
+    if known:
+        return {v: known.get(v, 0) for v in _CHALLENGE_VERDICTS}
+    return {v: sum(1 for c in claims if c.get("verdict") == v) for v in _CHALLENGE_VERDICTS}
+
+
+class _Masks:
+    """一次请求里查过的数据源遮罩：数据源名 → (要遮的列（小写）, 数据源现在还在不在)。顺带记下数据源的类型（kind），
+    按 SQL 认改了名字的遮罩列时照它的方言解析（_mask_sets）；数据源不在了的按通用读法。
+
+    给了 sealed（证据面板的片段、证据图）时另能交回这次运行查到过的遮罩值（run_secrets），一次请求只收一次。一份快照的
+    遮罩分析、收到的值另按快照工件记在进程里（_MEMO），之后的请求不再读、不再分析。"""
+
+    def __init__(self, sealed: _Sealed | None = None) -> None:
         self._memo: dict[str, tuple[set[str], bool]] = {}
+        self._kinds: dict[str, str | None] = {}
+        self._sealed = sealed
+        self._secrets: Any = None
+        self._collected = False
+        self._read: dict[str, tuple[Any, bool | None]] = {}
+        self._sets: dict[tuple[str | None, str], _MaskSets] = {}
+        self._cited: dict[tuple[str, str], set[str]] = {}
+        self._graphs: list[_CopyGraph] = []
+        self._outputs: dict[tuple[int, str, str], dict[str, str]] = {}
+
+    def copies(self, sealed: _Sealed, *, output: Callable[[Any], Any] | None, by_value: bool, sure: bool) -> _CopyGraph:
+        """这次请求里认指标的值给不给用的指标依赖图（_CopyGraph），按认法（output、by_value、sure）各一张：证据图给每个
+        指标认标签、转抄同一个上游指标的几个指标，都在同一张图上认，认过的不再认。"""
+        for graph in self._graphs:
+            if graph.matches(sealed, output, by_value, sure):
+                return graph
+        graph = _CopyGraph(sealed, self, output=output, by_value=by_value, sure=sure)
+        self._graphs.append(graph)
+        return graph
+
+    def card_outputs(self, sealed: _Sealed, card_node: str, artifact: str) -> dict[str, str]:
+        """_card_outputs，一次请求里同一张卡的同一次执行只找一次：循环里每一次执行都转抄上一次的产出时，依赖图要逐次往回
+        认，每次都把整次运行的事件扫一遍就成了执行次数乘事件数。调用方只读不改。"""
+        key = (id(sealed), str(card_node), str(artifact))
+        if key not in self._outputs:
+            self._outputs[key] = _card_outputs(sealed, card_node, artifact)
+        return self._outputs[key]
+
+    def fetch(self, artifact: str) -> tuple[Any, bool | None]:
+        """取回一件工件（_fetch）：一次请求里同一件只读一次。证据图要给每个指标认一遍输入，同一份快照、同一个节点的
+        产出不必反复读盘、复验哈希。"""
+        if artifact not in self._read:
+            self._read[artifact] = _fetch(artifact)
+        return self._read[artifact]
+
+    async def prefetch(self, artifacts: Iterable[str]) -> None:
+        """先在线程里把这几件工件取回来（_fetch：读盘、复验哈希），之后 fetch 直接用。报告撰写节点在运行里认遮罩
+        （withheld_metrics），几 MB 的快照不该占着事件循环。"""
+        todo = [a for a in dict.fromkeys(artifacts) if a and a not in self._read]
+        if todo:
+            self._read.update(await asyncio.to_thread(lambda: {a: _fetch(a) for a in todo}))
+
+    async def sets(self, artifact: str | None, source: Any, snap: dict[str, Any] | None) -> _MaskSets:
+        """一份查询快照的遮罩（_mask_sets），一次请求里同一份（按工件和数据源认）只认一次。snap 是这件工件读出来的内容，
+        读不出来的为 None。"""
+        key = (artifact, str(source or ""))
+        if artifact is None or key not in self._sets:
+            found = await _mask_sets(snap, source, self, artifact=artifact)
+            if artifact is None:
+                return found
+            self._sets[key] = found
+        return self._sets[key]
+
+    async def cited(self, artifact: str | None, source: Any, snap: dict[str, Any]) -> set[str]:
+        """一份读得出来的查询快照里确定取自遮罩列的结果列（小写，_cited_masks 的键：单元格引用的自查按它判违规），一次请求里
+        同一份只认一次（_owned_columns 要按 SQL 血缘认，指标一个个认输入时不必反复算）。调用方只读不改。"""
+        key = (str(artifact or ""), str(source or ""))
+        if not artifact or key not in self._cited:
+            found = set(await _cited_masks(snap, source, self, artifact))
+            if not artifact:
+                return found
+            self._cited[key] = found
+        return self._cited[key]
 
     async def of(self, source: Any) -> tuple[set[str], bool]:
         name = str(source or "")
@@ -913,7 +1739,541 @@ class _Masks:
             async with SessionLocal() as session:
                 row = (await session.execute(select(DataSource).where(DataSource.name == name))).scalar_one_or_none()
             self._memo[name] = ({c.lower() for c in masked_columns(row.options if row else None)}, row is not None)
+            self._kinds[name] = row.kind if row is not None else None
         return self._memo[name]
+
+    async def kind(self, source: Any) -> str | None:
+        name = str(source or "")
+        if not name:
+            return None
+        await self.of(name)
+        return self._kinds.get(name)
+
+    async def memo_key(self, artifact: str | None, source: Any) -> tuple[Any, ...] | None:
+        """一份快照在进程内记录（_MEMO）里的键：(工件, 数据源名, 数据源现在设的遮罩, 数据源在不在, 类型)。工件按内容
+        寻址、不会变，一份快照的遮罩只取决于它的内容和后面几样；遮罩设置改了键就跟着变，不会拿旧的结果。合并查询、
+        没有工件或数据源名的没有键（不记）。"""
+        name = str(source or "")
+        if not artifact or not name or name == MERGE_SOURCE:
+            return None
+        current, found = await self.of(name)
+        return str(artifact), name, frozenset(current), found, self._kinds.get(name)
+
+    async def value_keys(self, queries: dict[str, Any]) -> list[tuple[str, Any, tuple[Any, ...]]]:
+        """封存范围内要收遮罩值的那几份查询快照：(工件, 数据源名, 进程内记录的键)。数据源现在设了遮罩、或者已经不在了的
+        才收（masked_source）；合并查询不收：它的值都来自它的输入，输入另有快照。"""
+        out: list[tuple[str, Any, tuple[Any, ...]]] = []
+        for artifact, info in queries.items():
+            source = (info or {}).get("source")
+            if await self.masked_source(source) and (key := await self.memo_key(artifact, source)) is not None:
+                out.append((str(artifact), source, key))
+        return out
+
+    async def run_secrets(self) -> Any:
+        """这次运行查到过的遮罩值（masking._Secrets）：封存范围内、数据源现在设了遮罩（或者已经不在了）的每份查询快照里，
+        确定取自遮罩列的那几列的值（_snapshot_secrets：_mask_sets 的 sure，SQL 认不准、整份遮的快照只遮显示，不收）。
+        认不出出处、值却就是遮罩值的地方据此也不给：指标和输入的值（数据整形算出来再赋给变量的一格）、SQL 里的字面量
+        （按号码筛的 WHERE phone IN (…)）、合并警告里举的例子。
+
+        只在用到时收、一次请求只收一次；每份快照收到的值按快照工件记在进程里（_MEMO），之后的请求（推演也一样）不再读盘、
+        复验哈希、做 SQL 分析，只读还没记下的那几份。没给 sealed、一个值都没收到时为 None。"""
+        if self._collected:
+            return self._secrets
+        self._collected = True
+        if self._sealed is None:
+            return None
+        parts: list[tuple[tuple[Any, ...], Any]] = []
+        for artifact, source, key in await self.value_keys(self._sealed.queries):
+            known, got = _MEMO.values(key)
+            if not known:
+                snap, ok = self.fetch(artifact)
+                if ok is not True or not isinstance(snap, dict) or snap.get("source") == MERGE_SOURCE:
+                    continue
+                got = _MEMO.keep_values(key, _snapshot_secrets(snap, await self.sets(artifact, source, snap)))
+            parts.append((key, got))
+        self._secrets = _MEMO.pooled(parts)
+        return self._secrets
+
+    async def masked_source(self, source: Any) -> bool:
+        """这个数据源上的查询快照要不要收遮罩值（run_secrets）：数据源现在设了遮罩，或者已经不在了（只能按快照里记下的
+        认）。合并查询不收。"""
+        if not source or source == MERGE_SOURCE:
+            return False
+        cols, found = await self.of(source)
+        return bool(cols) or not found
+
+
+def _snapshot_secrets(snap: dict[str, Any], sets: _MaskSets) -> Any:
+    """一份查询快照里确定取自遮罩列的值（masking._Secrets，一个都没有为 None）：只收 sets.sure 那几列（列名就是遮罩列的、
+    SQL 里认得出取自遮罩列的，没起别名、按位置认得出的 SELECT UPPER(phone) 也算），只装着分档标签的格子不收，和核查 agent
+    在工具边界收值同一个口径（masking：认得清的照收，整份遮的快照只收确定的那几列）。SQL 认不准、整份遮的快照只遮显示：
+    以前连它的区域名、金额一起收，之后每条 SQL 里的「'华东'」都显示成「已遮罩」。证据面板（_Masks.run_secrets）、推演
+    （api/whatif.py 的 _Hidden.secrets）都按它收。"""
+    from app.engine.masking import _Secrets
+
+    secrets = _Secrets()
+    secrets.add(snap, set(sets.sure), labels=dict(sets.labels), base=set(sets.base))
+    return secrets if secrets.weak else None
+
+
+#: 进程内记录里「没有这一项」（记下的值本身可以是 None：这份快照一个遮罩值都没有）
+_ABSENT = object()
+
+
+class _SnapshotMemo:
+    """按查询快照工件记在进程里的遮罩分析（_MaskSets）和收到的遮罩值（masking._Secrets），跨请求共用。证据面板每点开一个
+    片段、推演每算一次，都要知道这次运行查到过的遮罩值（_Masks.run_secrets、api/whatif.py 的 _Hidden.secrets）；以前缓存
+    只在一次请求里有效，每次都把设了遮罩的数据源上的快照读盘、复验哈希、逐份做 SQL 分析（一份几十毫秒）。
+
+    键见 _Masks.memo_key。只记读得出来的快照（读不出来、与哈希不一致的下次照旧去读：文件可能修好了）；合并查询不记（它的
+    遮罩还取决于各个输入，输入另按自己的键记）。只记分析结果和收到的值，不记快照本身（几 MB 的行）：分析结果按份数封顶，
+    收到的值按条数合计封顶，并起来的值按运行封顶，都是最近用到的留着。
+
+    推演在工作线程里取、证据面板在事件循环里取，所以存取都加锁；记下的东西调用方只读不改：分析结果存成冻结的集合，
+    并起来的值每次交出去一份新的（_shared：集合另抄一份、共用建好的索引），各自的正则缓存互不相扰。"""
+
+    SETS_MAX = 1024
+    VALUES_MAX = 200_000
+    POOLS_MAX = 8
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sets: OrderedDict[tuple[Any, ...], _MaskSets] = OrderedDict()
+        self._values: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+        self._size = 0
+        self._pools: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._sets.clear()
+            self._values.clear()
+            self._pools.clear()
+            self._size = 0
+
+    def sets(self, key: tuple[Any, ...]) -> _MaskSets | None:
+        with self._lock:
+            found = self._sets.get(key)
+            if found is not None:
+                self._sets.move_to_end(key)
+            return found
+
+    def keep_sets(self, key: tuple[Any, ...], sets: _MaskSets) -> _MaskSets:
+        frozen = _MaskSets(frozenset(sets.hidden), frozenset(sets.sure), frozenset(sets.base),  # type: ignore[arg-type]
+                           {k: frozenset(v) for k, v in sets.labels.items()}, list(sets.gone))  # type: ignore[misc]
+        with self._lock:
+            self._sets[key] = frozen
+            self._sets.move_to_end(key)
+            while len(self._sets) > self.SETS_MAX:
+                self._sets.popitem(last=False)
+        return frozen
+
+    def values(self, key: tuple[Any, ...]) -> tuple[bool, Any]:
+        """(记没记过, 这份快照收到的值)。"""
+        with self._lock:
+            found = self._values.get(key, _ABSENT)
+            if found is _ABSENT:
+                return False, None
+            self._values.move_to_end(key)
+            return True, found
+
+    def keep_values(self, key: tuple[Any, ...], secrets: Any) -> Any:
+        with self._lock:
+            old = self._values.pop(key, _ABSENT)
+            if old is not _ABSENT:
+                self._size -= _value_count(old)
+            self._values[key] = secrets
+            self._size += _value_count(secrets)
+            while self._size > self.VALUES_MAX and len(self._values) > 1:
+                _, dropped = self._values.popitem(last=False)
+                self._size -= _value_count(dropped)
+        return secrets
+
+    def pooled(self, parts: list[tuple[tuple[Any, ...], Any]]) -> Any:
+        """几份快照收到的值并成一份、建好索引（上万个值建一次要几十毫秒），按这几份的键记下；交出去的是 _shared 的一份。
+        一个值都没有为 None。"""
+        if not parts:
+            return None
+        key = tuple(k for k, _ in parts)
+        with self._lock:
+            found = self._pools.get(key, _ABSENT)
+            if found is not _ABSENT:
+                self._pools.move_to_end(key)
+        if found is _ABSENT:
+            found = _pool([one for _, one in parts])
+            with self._lock:
+                self._pools[key] = found
+                while len(self._pools) > self.POOLS_MAX:
+                    self._pools.popitem(last=False)
+        return _shared(found)
+
+
+def _value_count(secrets: Any) -> int:
+    return len(secrets.weak) if secrets is not None else 0
+
+
+def _pool(parts: list[Any]) -> Any:
+    """几份 masking._Secrets 并成一份（合起来最多 SECRETS_MAX 种，同 _Secrets.merge），建好索引；一个值都没有为 None。"""
+    from app.engine.masking import _Secrets
+
+    out = _Secrets()
+    for one in parts:
+        out.merge(one)
+    if not out.strong:
+        return None
+    out.prepare()
+    return out
+
+
+def _shared(secrets: Any) -> Any:
+    """记在进程里的一份遮罩值交给一个请求用：值的集合另抄一份（调用方往里并值、免遮不碍别人），建好的索引共用（只读），
+    正则缓存各起一份（_Secrets.pattern 会改它）。"""
+    if secrets is None:
+        return None
+    from app.engine.masking import _Secrets
+
+    return _Secrets(strong=set(secrets.strong), weak=set(secrets.weak), shown=set(secrets.shown),
+                    protected=secrets.protected, _index=secrets._index)
+
+
+#: 证据面板、推演、报告自查共用的进程内记录（见 _SnapshotMemo）
+_MEMO = _SnapshotMemo()
+
+
+@dataclass
+class _MaskSets:
+    """一份查询快照的遮罩（_mask_sets）：
+
+    - hidden：要遮的列（小写）。证据面板、推演、勾行按它遮，宁可多遮：SQL 认不准时整份的列都算
+    - sure：其中能确定取自遮罩列的：列名就是遮罩列的，SQL 里认得出取自遮罩列的（别名、函数、子查询、WITH，没起别名
+      却按位置认得出的表达式）。SQL 认不准、整份算进来的那几列不在里面，只装着分档标签的列（CASE 写死的字）也不在。
+      收「这次运行查到过的遮罩值」只收这几列（_snapshot_secrets），交给结论句裁判的摘录逐份遮这几列（_judge_loader），
+      报告自查从这几列起（_cited_masks，只排除血缘证明值取自普通表别的列的）
+    - base：遮罩列本身（查询当时记下的加数据源现在设的，小写）
+    - labels：只装着分档标签的列 → 标签的写法（masking._snapshot_labels），收遮罩值时不收标签
+    - gone：已经不在的数据源
+
+    记进进程内记录（_MEMO）的是冻结的集合：几个请求共用一份，调用方只读不改。"""
+
+    hidden: set[str]
+    sure: set[str]
+    base: set[str]
+    labels: dict[str, set[str]] = field(default_factory=dict)
+    gone: list[str] = field(default_factory=list)
+
+
+def _derived(snap: dict[str, Any], hidden: set[str], kind: str | None,
+             tables: dict[str, list[str]] | None = None) -> set[str]:
+    """一份查询快照里值取自遮罩列（hidden，小写）的结果列（小写，含 hidden 本身），证据面板、推演按它遮。
+
+    和可验证报告是同一个函数（bundle/build.py 的 _derived_columns：按每种支持的库的读法各认一遍合起来，语法树认不准的
+    写法——MySQL 会执行的注释、U&"…"、表名写在字符串里交给函数、统计信息表——和列名表、整行引用、不照原名展开的 *、
+    吃进遮罩列的表函数，整份的列都算），再按数据源自己的方言认一遍（engine/masking.py 的 _derived_hidden，核查 agent
+    在工具边界遮的那一套；tables 是 * 展开时数位置用的表结构，合并查询交的是各输入的列）。可验证报告整份遮的，这里不会
+    照给。合并查询的快照这里不看（来源不是数据源），由 _merge_mask_sets 换个说法交进来。
+
+    分析本身出了意外：整份的列都算（宁可多遮）。纯计算，一条 SQL 几毫秒，在调用方的线程里算：推演在工作线程里等事件循环
+    查库（api/whatif.py 的 _Hidden），这里再开线程会和它争同一个线程池。"""
+    if not hidden:
+        return set()
+    try:
+        # bundle、masking 都用到这里的说法（MASKED），用到时才导入：都不在模块顶上互相导入
+        from app.bundle.build import _derived_columns
+        from app.engine.masking import _derived_hidden
+
+        return set(hidden) | _derived_columns(snap, set(hidden)) | _derived_hidden(snap, set(hidden), kind, tables)[0]
+    except Exception:  # noqa: BLE001 - 认不准就整份遮掉
+        logger.warning("证据面板：按 SQL 认改了名字的遮罩列时出错，整份快照的列都按遮罩处理", exc_info=True)
+        return set(hidden) | {str(c).lower() for c in snap.get("columns") or []}
+
+
+def _sure(snap: dict[str, Any], base: set[str], kind: str | None,
+          tables: dict[str, list[str]] | None = None) -> tuple[set[str], dict[str, set[str]]]:
+    """(能确定取自遮罩列的结果列, 只装着分档标签的列)，都是小写（_MaskSets.sure）：收遮罩值、交给裁判的摘录、报告自查
+    都从前一项起。
+
+    按数据源自己的方言认（masking._derived_masks，工具边界遮的那一套）：结果列名就是遮罩列、SQL 里指代遮罩列的名字
+    （c.phone AS tel 的 tel、UPPER(phone) AS p 的 p）、没起别名却按位置认得出取自遮罩列的（SELECT UPPER(phone) FROM
+    customers）都算。认不准时那一套整份遮（whole：派生来源里没起别名的表达式、PIVOT、SQL 解析不了又写着遮罩列……），
+    这时只认它的 collect——名字对上的、整份算之前已按位置认出的那几列。展示上多遮无妨，这里多算，自查就判失败、写作者
+    也改不掉（最大的一笔订单金额被说成取自手机号），区域名、金额也被收成遮罩值。整份算不算以那一套交回的 whole 为准：
+    以前在结果后面垫一列再认一遍来探测，那一套把「没有 * 的一支、列数和结果对不上」也判整份之后，垫过的每条 SQL 都成了
+    整份算，按位置认得出的列一个都收不到（合入 K3b 之后的复核）。
+    只装着分档标签的列（CASE WHEN phone IS NULL THEN '未留' ELSE '已留' END）格子里是 SQL 写死的字，不算；只数个数的
+    （COUNT(*) FILTER (WHERE phone IS NULL)、SUM(phone IS NULL)）先改写成那一套认得出的样子再认（_counted）。
+    出了意外只认列名对上的。
+    整份算的快照里，列名本身就是取自遮罩列的表达式的（* 展开派生表、WITH 里没起别名的 UPPER(phone)）另按列名认
+    （_named_from_masks）：那一套整份算之前认不出它落在哪个位置，collect 里没有，指标、单元格引用照给了号码。"""
+    columns = {str(c).lower() for c in snap.get("columns") or []}
+    direct = set(base) & columns
+    if not base or not columns:
+        return direct, {}
+    try:
+        from app.engine.masking import _derived_masks, _snapshot_labels
+
+        found = _derived_masks(_counted(snap, kind), set(base), kind, tables)
+        sure = ((found.collect if found.whole else found.hidden) & columns) | direct
+        if found.whole:
+            sure |= _named_from_masks(snap, base, kind)
+        labels = _snapshot_labels(snap, kind)
+        return sure - {name for name in labels if name not in base}, labels
+    except Exception:  # noqa: BLE001 - 认不准：只认列名对上的
+        logger.warning("报告自查：按 SQL 认取自遮罩列的结果列时出错，只认列名对上的", exc_info=True)
+        return direct, {}
+
+
+def _named_from_masks(snap: dict[str, Any], base: set[str], kind: str | None) -> set[str]:
+    """SQL 认不准、整份算的快照里，列名本身就是一个取自遮罩列的表达式的结果列（小写，_sure）：没起别名的表达式，SQLite、
+    MySQL 拿表达式的原文当列名（UPPER(phone)、phone || ''、SUBSTR(phone, 1, 11)），* 展开派生表、WITH、UNION 的一支时原样
+    带出来。认遮罩列的那一套（masking._derived_masks）认不出 * 展开到了哪个位置，整份算、collect 里没有它：写作目录、
+    单元格引用的自查就照给了号码。
+
+    按列名拼一条只选这一项的 SQL，交给同一套认（同 _sure，只数个数的先改写，_counted）：认得出取自遮罩列、又不是只装着
+    分档标签的（masking._label_columns）才算；COUNT(phone)、COUNT(*) FILTER (WHERE phone IS NULL)、LOWER(name) 这类不算。
+    只认列名里写着遮罩列名字的（masking._mentions），别的列不拼。Postgres 给这种列起的名字是函数名（upper），认不出，
+    照旧只在证据面板、可验证报告那边宁可多遮。"""
+    from app.engine.masking import _derived_masks, _label_columns, _mentions
+
+    out: set[str] = set()
+    for column in snap.get("columns") or []:
+        name = str(column)
+        lowered = name.lower()
+        if lowered in base or not _mentions(name, base):
+            continue
+        probe = _counted({"sql": f"SELECT {name} FROM t", "columns": [name]}, kind)
+        found = _derived_masks(probe, set(base), kind)
+        if found.whole or lowered not in found.hidden or lowered in _label_columns(probe["sql"], kind, [name]):
+            continue
+        out.add(lowered)
+    return out
+
+
+def _counted(snap: dict[str, Any], kind: str | None) -> dict[str, Any]:
+    """报告自查认确定取自遮罩列的列之前（_sure），把只决定算不算进来的写法改写成认遮罩列的那一套认得出的样子：
+
+    - 汇总的 FILTER (WHERE …) 去掉：条件只决定这一行算不算进来，同写在 WHERE 里；
+    - 汇总里结果为真假的条件（SUM(phone IS NULL)、AVG(LENGTH(phone) = 11)、MAX(phone LIKE '199%')）改成
+      CASE WHEN … THEN 1 ELSE 0 END：那一套认它只数个数（masking._band_only）。
+
+    COUNT(*) FILTER (WHERE phone IS NULL) 数的是没留号码的人数，值里没有号码；那一套把 FILTER 的条件、汇总里的条件当成
+    值的来历，自查跟着判违规，正式运行就因为一个人数判失败。只改自查用的这一份：证据面板、推演照可验证报告的认法多遮
+    （展示上多遮无妨，可验证报告同样把它算作取自遮罩列），根上的改法在 masking 里。没有这些写法、改写不了的原样交回。"""
+    sql = snap.get("sql")
+    if not isinstance(sql, str) or not sql.strip():
+        return snap
+    try:
+        from sqlglot import exp
+
+        from app.data.sql_semantics import _parse, _read
+
+        root, _ = _parse(sql, _read(kind))
+        if root is None:
+            return snap
+        changed = False
+        for node in list(root.find_all(exp.Filter)):
+            node.replace(node.this)
+            changed = True
+        for agg in list(root.find_all(exp.AggFunc)):
+            arg = agg.this
+            while isinstance(arg, exp.Paren):
+                arg = arg.this
+            if not isinstance(agg, exp.Count) and isinstance(arg, (exp.Predicate, exp.Connector, exp.Not)):
+                agg.set("this", exp.Case(ifs=[exp.If(this=arg.copy(), true=exp.Literal.number(1))],
+                                         default=exp.Literal.number(0)))
+                changed = True
+        return {**snap, "sql": root.sql(dialect=_read(kind))} if changed else snap
+    except Exception:  # noqa: BLE001 - 改写不了就照原样认（多算的那一边）
+        logger.warning("报告自查：改写只数个数的写法时出错，照原样认", exc_info=True)
+        return snap
+
+
+async def _mask_sets(snap: dict[str, Any] | None, source: Any, masks: _Masks, *, depth: int = 0,
+                     artifact: str | None = None) -> _MaskSets:
+    """一份查询快照的遮罩（_MaskSets）：证据面板的查询步骤、指标的输入、推演、报告自查（engine/nodes/report.py）都按这一个
+    函数认。
+
+    - 遮罩列是「查询当时记下的」和「数据源现在设的」两者之和：事后加的遮罩照样生效，数据源改名、删掉了也不会把当时
+      遮着的列亮出来；数据源不在了的，它的名字进 gone
+    - 列名对上的之外，按 SQL 认出改了名字的遮罩列：要遮的按 _derived（和可验证报告同一个函数），确定的按 _sure
+    - 合并查询不是数据源：按它合并的那几个数据源、逐格来历和合并 SQL 认（_merge_mask_sets）
+    - snap 为 None（快照读不出来）：只能按 source 现在设的遮罩算，没有 SQL 可认
+
+    artifact 是 snap 的工件 id：给了的，分析结果按快照记在进程里（_MEMO，键见 _Masks.memo_key），之后的请求不再分析。"""
+    if snap is not None and snap.get("source") == MERGE_SOURCE:
+        return await _merge_mask_sets(snap, masks, depth=depth)
+    name = source or (snap or {}).get("source")
+    current, found = await masks.of(name)
+    base = set(current) | (_recorded_masks(snap) if snap is not None else set())
+    gone = [] if found or not name else [str(name)]
+    if snap is None or not base:
+        return _MaskSets(set(base), set(base), base, gone=gone)
+    key = await masks.memo_key(artifact, name) if artifact else None
+    if key is not None and (kept := _MEMO.sets(key)) is not None:
+        return kept
+    kind = await masks.kind(name)
+    sure, labels = _sure(snap, base, kind)
+    out = _MaskSets(_derived(snap, base, kind) | sure, sure, base, labels, gone)
+    return _MEMO.keep_sets(key, out) if key is not None else out
+
+
+async def _cited_masks(snap: dict[str, Any], source: Any, masks: _Masks,
+                       artifact: str | None = None) -> dict[str, list[str]]:
+    """报告自查（engine/nodes/report.py 的 _MaskedCells）认一份查询快照里引用了就记 masked_cell 的列：{结果列（小写）:
+    它的出处}，违规说明点名出处（认得出表的写「表.列」，见 _owned_columns）。
+
+    从 _mask_sets 的 sure 起（列名就是遮罩列的、SQL 里认得出取自遮罩列的；SQL 认不准、整份算进来的和只装着分档标签的
+    不在里面）。遮罩按列名在整个数据源上生效，和证据面板一样：哪张表（含视图）里叫这个名字的列都算，门店名（stores.name）
+    和客户姓名（customers.name）同叫 name、都设了遮罩时两者都算。普通查询再按血缘点名出处（_owned_columns）；合并查询的值
+    来自它的各个输入、不是数据源里的表，照 sure 算。"""
+    sets = await _mask_sets(snap, source, masks, artifact=artifact)
+    if not sets.sure:
+        return {}
+    if snap.get("source") == MERGE_SOURCE:
+        return {c: sorted(sets.base) for c in sorted(sets.sure)}
+    return _owned_columns(snap, set(sets.sure), set(sets.base), await masks.kind(source or snap.get("source")))
+
+
+def _owned_columns(snap: dict[str, Any], sure: set[str], base: set[str], kind: str | None) -> dict[str, list[str]]:
+    """sure 里每一列的出处：{结果列: 它取自的遮罩列}，认得出表的写「表.列」（stores.name、customer_spend.name），认不出的
+    写这份快照的全部遮罩列。报告自查按它判违规、写违规说明。
+
+    遮罩按列名设在整个数据源上（data/engine.py 的 masked_columns 只认列名，不带表名）：设了 name，stores.name、
+    customers.name、视图里的 name 都算，和证据面板、可验证报告的遮法一致。自查不推断「这项遮罩本意管哪张表」：第 3 轮
+    这样推断过（遮罩列在几张表里都有时只认另有别的遮罩列的那几张），视图、没有第二个遮罩列的表（employees.name）因此被
+    排除，正式运行照常成功、姓名写进了报告。SQL 血缘（sqlglot.lineage，按查询当时冻结的表结构展开 *、认出不带表名的列出自
+    哪张表）只用来：
+
+    - 点名出处：血缘的末端里叫遮罩列名字的列，按出现的先后写「表.列」，读的人看得出是哪一列被这项遮罩管到了
+    - 排除值确实不取自遮罩列的（SELECT region AS phone FROM stores）：每个末端都落在表结构里标明是普通表（is_view 为
+      false）的列上、没有一处叫遮罩列的名字，才排除
+    - 认不出出处的照算（_owned_masks）：血缘认不出的列（没起别名的表达式……）、表值函数、视图（看不出它的列取自哪张表）、
+      表结构里没有的表、没有冻结表结构的快照、表结构没标是不是视图的老快照
+
+    只排除、不新增：sure 里没有的列血缘认出来也不算。分析出了意外，照 sure 算（出处写全部遮罩列）。纯计算，在调用方的
+    线程里算。"""
+    plain = {c: sorted(base) for c in sorted(sure)}
+    sql = snap.get("sql")
+    if not sure or not isinstance(sql, str) or not sql.strip():
+        return plain
+    try:
+        from app.data.sql_semantics import _parse, _read
+
+        read = _read(kind)
+        root, _ = _parse(sql, read)
+        if root is None:
+            return plain
+        artifact = snap.get("schema_artifact")
+        tables, ordinary = _frozen_schema(artifact) if isinstance(artifact, str) else ({}, frozenset())
+        schema = {name: {c: "TEXT" for c in cols} for name, cols in tables.items()} or None
+        nodes = _lineages(root, schema, read, [str(c) for c in snap.get("columns") or [] if str(c).lower() in sure])
+        out: dict[str, list[str]] = {}
+        for column in sorted(sure):
+            found = _owned_masks(nodes.get(column), base, ordinary)
+            if found:
+                out[column] = found
+        return out
+    except Exception:  # noqa: BLE001 - 核对不了出处：照 sure 算
+        logger.warning("报告自查：按血缘核对遮罩列的出处时出错，照列名认", exc_info=True)
+        return plain
+
+
+@functools.lru_cache(maxsize=64)
+def _frozen_schema(artifact: str) -> tuple[dict[str, list[str]], frozenset[str]]:
+    """表结构快照工件 → ({表名: 按次序的列名}, 标明是普通表的表名)，都是小写（_owned_columns）。
+
+    前一项只要不带库名的那份名字（表结构里一张表按好几个名字记着，masking._schema_keys），血缘按它展开 *、认不带表名的
+    列。后一项是 is_view 明写为 false 的表（带不带库名的名字都记）：视图的列看不出取自哪张表，没标的老快照看不出是表还是
+    视图；几个库里同名的表有一张不是普通表，这个名字就不算。取不到、被改过的两样都是空的。工件按内容寻址、不会变，记下来。"""
+    from app.engine.masking import _schema_columns, _schema_keys
+
+    try:
+        schema = load(artifact)
+    except Exception:  # noqa: BLE001 - 取不到就当没有冻结的表结构（出处认不出的照算）
+        return {}, frozenset()
+    entries = schema.get("tables") if isinstance(schema, dict) else None
+    if not isinstance(entries, dict):
+        return {}, frozenset()
+    columns = {name: cols for name, cols in (_schema_columns(schema) or {}).items() if "." not in name}
+    ordinary: dict[str, bool] = {}
+    for key, meta in entries.items():
+        if isinstance(meta, dict):
+            for name in _schema_keys(key, meta):
+                ordinary[name] = ordinary.get(name, True) and meta.get("is_view") is False
+    return columns, frozenset(name for name, yes in ordinary.items() if yes)
+
+
+def _lineages(root: Any, schema: dict[str, Any] | None, read: str | None, columns: list[str]) -> dict[str, Any]:
+    """结果列（小写）→ 它的血缘（sqlglot.lineage 的节点）。先一次认全部的列（只解析、补全一遍）；认不了的逐列再认，还是
+    认不出的不在里面（_owned_masks 当认不出出处）。"""
+    from sqlglot.lineage import lineage
+
+    try:
+        found = lineage(None, root.copy(), schema=schema, dialect=read)
+        every = {str(k).lower(): v for k, v in found.items()} if isinstance(found, dict) else {}
+    except Exception:  # noqa: BLE001 - 有一列认不了就整条认不了：下面逐列认
+        every = {}
+    out: dict[str, Any] = {}
+    for column in columns:
+        if (node := every.get(column.lower())) is None:
+            try:
+                node = lineage(column, root.copy(), schema=schema, dialect=read)
+            except Exception:  # noqa: BLE001 - 认不出这一列（没起别名的表达式……）
+                continue
+        out[column.lower()] = node
+    return out
+
+
+def _owned_masks(node: Any, base: set[str], ordinary: frozenset[str]) -> list[str]:
+    """一个结果列的出处：血缘的末端里叫遮罩列名字的列（哪张表、哪个视图的都算），按出现的先后写「表.列」。
+
+    一处都没有时：有认不出出处的末端——血缘认不出来（node 为 None）、_leaf_of 交回 None（表值函数、整张表的 *……）、落在
+    不是普通表（ordinary，_frozen_schema）的表上（视图、表结构里没有的表）——排除不了，写全部遮罩列（照算）；每个末端都落在
+    普通表的别的列上（region AS phone）的交回空：不算。"""
+    if node is None:
+        return sorted(base)
+    found: list[str] = []
+    unplaced = False
+    for leaf in node.walk():
+        if leaf.downstream:
+            continue
+        place = _leaf_of(leaf)
+        if place is None:
+            unplaced = True
+            continue
+        if place is _NO_COLUMN:
+            continue
+        table, column = place
+        if column in base:
+            if (named := f"{table}.{column}") not in found:
+                found.append(named)
+        elif table not in ordinary:
+            # 视图、表结构里没有的表：看不出这一列取自哪里，排除不了
+            unplaced = True
+    return found or (sorted(base) if unplaced else [])
+
+
+#: 血缘里的一个末端没有取任何列（写死的值、COUNT(*)）
+_NO_COLUMN = object()
+
+
+def _leaf_of(leaf: Any) -> Any:
+    """血缘的一个末端出自哪张表的哪一列：(表名, 列名)，都是小写，表名照 SQL 里写的带上库名（archive.sales）；没有取任何列
+    的（写死的值、COUNT(*)）交回 _NO_COLUMN；认不出出处的（sqlglot 找不到来源、表值函数、整张表的 *、派生来源里的 *）交回
+    None。"""
+    from sqlglot import exp
+
+    source = leaf.source
+    if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
+        try:
+            column = exp.to_column(leaf.name)
+        except Exception:  # noqa: BLE001 - 名字读不出来：认不出
+            return None
+        if not isinstance(column, exp.Column) or isinstance(column.this, exp.Star) or not column.name:
+            return None
+        table = ".".join(part for part in (source.catalog, source.db, source.name) if part)
+        return table.lower(), column.name.lower()
+    if isinstance(source, (exp.Table, exp.Placeholder)) or leaf.expression is source:
+        return None
+    return _NO_COLUMN
 
 
 async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str, Any], sealed: _Sealed,
@@ -960,31 +2320,32 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     rows = snap["rows"]
     step["source"] = step["source"] or snap.get("source")
     merged = snap.get("source") == MERGE_SOURCE
+    # 遮的列：查询当时记下的加数据源现在设的，按 SQL 认出改了名字的（c.phone AS tel）也遮。合并查询不是数据源，按它
+    # 合并的那几个数据源、逐格来历和合并 SQL 算，不能拿「合并查询」去找数据源，找不到再说它「已不存在」（_mask_sets）
+    sets = await masks.sets(artifact, step["source"], snap)
+    hidden, gone = sets.hidden, sets.gone
+    notes = [SOURCE_GONE.format(source="、".join(gone))] if gone else []
+    # SQL、合并 SQL、SQL 检查的片段、合并警告里写着的遮罩值（按号码筛的 WHERE phone IN (…)、按号码合并时警告举的例子）
+    # 换成「已遮罩」，和可验证报告认 SQL 字面量同一个口径（这次运行查到过的遮罩值）。只换展示的这一份，执行的原文、
+    # 哈希核对用的快照都不动
+    shown = _Shown(await masks.run_secrets() if _has_values(snap) else None)
     if merged:
-        # 合并查询不是数据源：遮罩按它合并的那几个数据源算（_merge_masks），不能拿「合并查询」去找数据源，
-        # 找不到再说它「已不存在」
-        hidden, gone = await _merge_masks(snap, masks)
-        if gone:
-            step["mask_note"] = SOURCE_GONE.format(source="、".join(gone))
-        step["merge"] = _merge_view(snap, cells, catalog, sealed)
+        step["merge"] = shown.merge(_merge_view(snap, cells, catalog, sealed))
         if hint and _leads_to_upload(snap, cells):
             step["provenance"] = True
-    else:
-        # 遮的是「查询当时记下的」和「数据源现在设的」两者之和：事后加的遮罩照样生效，数据源改名、
-        # 删掉了也不会把当时遮着的列亮出来
-        hidden, found = await masks.of(step["source"])
-        hidden = hidden | _recorded_masks(snap)
-        if not found:
-            step["mask_note"] = SOURCE_GONE.format(source=step["source"])
     masked = {i for i, c in enumerate(columns) if c.lower() in hidden}
     index = sorted({i for r in rows_hit for i in range(r - WINDOW, r + WINDOW + 1) if 0 <= i < len(rows)})
-    step.update(sql=snap.get("sql"), columns=columns, total_rows=len(rows), truncated=bool(snap.get("truncated")),
-                masked=[columns[i] for i in sorted(masked)],
+    step.update(sql=shown.text(snap.get("sql")), columns=columns, total_rows=len(rows),
+                truncated=bool(snap.get("truncated")), masked=[columns[i] for i in sorted(masked)],
                 # 查询时从驱动的原始值记下的列类型（老快照没有）：文本列里的 "2026" 按文本显示，不当数
                 column_types=snap.get("column_types") if isinstance(snap.get("column_types"), dict) else {},
                 **({"provenance": True} if hint and snap.get("data_version") and not merged else {}),
-                **({"checks": checks} if (checks := _query_checks(snap)) else {}),
+                **({"checks": shown.checks(checks)} if (checks := _query_checks(snap)) else {}),
                 **_catalog_of(snap))
+    if shown.changed:
+        notes.append(SQL_MASKED_NOTE)
+    if notes:
+        step["mask_note"] = "；".join(notes)
     if len(index) > MAX_WINDOW_ROWS:
         index, step["window_truncated"] = index[:MAX_WINDOW_ROWS], True
     step["row_index"] = index
@@ -992,6 +2353,46 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     step["rows"] = [[MASKED if i in masked else v for i, v in enumerate(rows[r])] if isinstance(rows[r], list)
                     else rows[r] for r in index]
     return step
+
+
+class _Shown:
+    """查询步骤上要展示的 SQL、合并 SQL、SQL 检查的片段、合并警告：里面写着的遮罩值（secrets，这次运行查到过的，
+    masking._Secrets）换成「已遮罩」，换了写法的长号码也认。secrets 为 None 时原样交回。changed：换过东西，查询步骤
+    底下要说清这只是展示时遮的。"""
+
+    def __init__(self, secrets: Any) -> None:
+        self._secrets = secrets
+        self.changed = False
+
+    def text(self, value: Any) -> Any:
+        if self._secrets is None or not isinstance(value, str) or not value:
+            return value
+        out = self._secrets.scrub(value, loose=True)
+        self.changed = self.changed or out != value
+        return out
+
+    def checks(self, checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{**c, **{k: self.text(c[k]) for k in ("message", "sql_excerpt") if isinstance(c.get(k), str)}}
+                for c in checks]
+
+    def merge(self, view: dict[str, Any]) -> dict[str, Any]:
+        view["sql"] = self.text(view.get("sql"))
+        view["warnings"] = [{**w, "message": self.text(w.get("message"))} for w in view.get("warnings") or []]
+        view["inputs"] = [{**i, **({"checks": self.checks(i["checks"])} if i.get("checks") else {})}
+                          for i in view.get("inputs") or []]
+        return view
+
+
+def _has_values(snap: dict[str, Any]) -> bool:
+    """查询步骤上有没有可能写着遮罩值的文字：SQL 里有字符串、五位以上的数（按值认的门槛，见 masking.SECRET_DIGITS），
+    或者有 SQL 检查结果、合并警告。都没有的不必去取这次运行的遮罩值（要把封存的查询快照读一遍）。"""
+    sql = snap.get("sql")
+    return (isinstance(sql, str) and bool(_LITERALISH.search(sql))) or bool(snap.get("checks")) \
+        or bool(snap.get("warnings"))
+
+
+#: SQL 里像是写着值的地方：引号括起来的字、五位以上的数（「已遮罩」只换这些，见 _Shown）
+_LITERALISH = re.compile(r"['\"]|\d{5,}")
 
 
 def _catalog_of(snap: dict[str, Any]) -> dict[str, Any]:
@@ -1114,31 +2515,95 @@ def _input_checks(artifact: str) -> list[dict[str, Any]]:
     return _query_checks(snap) if isinstance(snap, dict) else []
 
 
-async def _merge_masks(snap: dict[str, Any], masks: _Masks) -> tuple[set[str], list[str]]:
-    """合并结果要遮的列（小写）和已经不在的数据源：
+async def _merge_masks(snap: dict[str, Any], masks: _Masks, *, depth: int = 0) -> tuple[set[str], list[str]]:
+    """合并结果要遮的列（小写）和已经不在的数据源（_merge_mask_sets 的 hidden、gone）。质询、双盲复算按这个名字调用。"""
+    sets = await _merge_mask_sets(snap, masks, depth=depth)
+    return sets.hidden, sets.gone
 
-    - 合并当时记下的（快照的 mask_columns：各输入当时的遮罩列，加上来自遮罩列、换了名字的结果列）；
-    - 它合并的每个数据源现在设的（按列名）；
-    - 结果列有逐格来历、来自某个数据源现在遮着的列的，按来历遮（换了名字也遮住）。宁可多遮。"""
-    hidden = _recorded_masks(snap)
+
+async def _merge_mask_sets(snap: dict[str, Any], masks: _Masks, *, depth: int = 0) -> _MaskSets:
+    """合并结果的遮罩（_MaskSets）：
+
+    - 合并当时记下的（快照的 mask_columns：各输入当时的遮罩列，加上来自遮罩列、换了名字的结果列）和它合并的每个数据源
+      现在设的，按列名；
+    - 结果列有逐格来历的，按来历遮：来自的那一列在输入里要遮（_merge_input_sets：输入快照按查询步骤同一套认，数据源
+      现在设的、SQL 里改了名字的都算，输入本身是合并结果的再往下追），换了名字也遮住；
+    - 合并 SQL 本身也按 SQL 认（_derived、_sure，SQLite 的方言：合并在内存 SQLite 里执行）：各输入里要遮的列名当作遮罩
+      列，合并 SQL 里对它们改名、套函数、拼接、汇总、经 WITH 转一道得来的结果列都算。逐格来历只认单层直接选列的写法，
+      以前 SELECT a.tel AS contact, SUM(b.amount) … GROUP BY a.tel 这种合并没有来历，号码在证据面板、勾行里原样给出；
+    - 输入快照读不出来（追得太深也算）、又可能带着遮罩的：它的列全部当遮罩列（宁可多遮），来历指向它的结果列也遮；
+      连它有哪几列都不知道的（老快照没记输入的列），整份结果的列都遮。
+
+    确定的（sure）只按确定的认：输入里确定取自遮罩列的列名、来历指向它们的结果列、合并 SQL 里认得出的；输入读不出来时
+    只认它的数据源现在设的列名。"""
+    recorded = _recorded_masks(snap)
+    base = set(recorded)
     gone: list[str] = []
     for name in snap.get("sources") or []:
         cols, found = await masks.of(name)
-        hidden |= cols
+        base |= cols
         if not found:
             gone.append(str(name))
+    columns = [str(c).lower() for c in snap.get("columns") or []]
+    hidden, sure = set(base), set(base)
+    by_alias = {str(i.get("alias")): i for i in snap.get("inputs") or [] if isinstance(i, dict)}
+    inputs = {alias: await _merge_input_sets(item, masks, depth, bool(recorded)) for alias, item in by_alias.items()}
     lineage = snap.get("lineage") if isinstance(snap.get("lineage"), dict) else {}
     origins = lineage.get("sources") or []
-    by_alias = {str(i.get("alias")): i for i in snap.get("inputs") or [] if isinstance(i, dict)}
-    for name, target in zip(snap.get("columns") or [], lineage.get("columns") or []):
+    for name, target in zip(columns, lineage.get("columns") or []):
         if not isinstance(target, dict) or not isinstance(target.get("source"), int) \
                 or not 0 <= target["source"] < len(origins):
             continue
         origin = origins[target["source"]] if isinstance(origins[target["source"]], dict) else {}
-        source = (by_alias.get(str(origin.get("input"))) or {}).get("source")
-        if source and source != MERGE_SOURCE and str(target.get("column") or "").lower() in (await masks.of(source))[0]:
-            hidden.add(str(name).lower())
-    return hidden, gone
+        got = inputs.get(str(origin.get("input")))
+        column = str(target.get("column") or "").lower()
+        if got is not None and column in got.hidden:
+            hidden.add(name)
+        if got is not None and column in got.sure:
+            sure.add(name)
+    if any(got.base == {_EVERY} and not got.hidden for got in inputs.values()):
+        # 读不出来、又不知道有哪几列的输入：认不出哪个结果列来自它
+        hidden |= set(columns)
+    view = {**snap, "source": None}        # 合并 SQL 照普通查询认（_derived 不看合并查询的 SQL）
+    tables = {alias.lower(): [str(c).lower() for c in item.get("columns") or []]
+              for alias, item in by_alias.items() if isinstance(item.get("columns"), list)}
+    names = set(base).union(*(got.hidden for got in inputs.values())) if inputs else set(base)
+    hidden |= _derived(view, names, "sqlite", tables or None) & set(columns)
+    certain = set(base).union(*(got.sure for got in inputs.values())) if inputs else set(base)
+    labels: dict[str, set[str]] = {}
+    if certain:
+        found, labels = _sure(view, certain, "sqlite", tables or None)
+        sure |= found
+    sure &= set(columns) | base
+    every = set(base).union(*(got.base for got in inputs.values() if got.base != {_EVERY})) if inputs else set(base)
+    return _MaskSets(hidden | sure, sure, every, labels, list(dict.fromkeys([*gone, *(n for got in inputs.values()
+                                                                                       for n in got.gone)])))
+
+
+#: 合并的一个输入读不出来、又不知道有哪几列时，_merge_input_sets 交回的 base 记成它：认不出哪个结果列来自它
+_EVERY = "\x00*"
+
+
+async def _merge_input_sets(item: dict[str, Any], masks: _Masks, depth: int, recorded: bool) -> _MaskSets:
+    """合并的一个输入（快照 inputs 里的一项）的遮罩：读得出输入快照的按 _mask_sets 认（SQL 里给遮罩列起了别名的也算，
+    输入本身是合并结果的再往下追）。
+
+    读不出来、追得太深的，遮没遮核对不了：它的数据源现在设了遮罩、已经不在了、本身是合并结果、或者合并当时记下过遮罩
+    （recorded，不知道是哪个输入的）时，它的每一列都当遮罩列（hidden），确定的只认它的数据源现在设的列名；连有哪几列
+    都不知道的，base 记成 _EVERY。别的（数据源还在、没设遮罩，合并时也没记）照旧没有遮罩。"""
+    source = item.get("source")
+    artifact = str(item.get("artifact") or "")
+    content, ok = masks.fetch(artifact) if artifact and depth < MERGE_DEPTH else (None, None)
+    if ok is True and isinstance(content, dict):
+        return await _mask_sets(content, source, masks, depth=depth + 1, artifact=artifact)
+    current, found = await masks.of(source) if source and source != MERGE_SOURCE else (set(), True)
+    if not (current or recorded or not found or source == MERGE_SOURCE or not source):
+        return _MaskSets(set(), set(), set())
+    columns = item.get("columns")
+    if not isinstance(columns, list):
+        return _MaskSets(set(), set(current), {_EVERY})
+    return _MaskSets(set(current) | {str(c).lower() for c in columns}, set(current), set(current),
+                     gone=[] if found or not source else [str(source)])
 
 
 def _leads_to_upload(snap: dict[str, Any], cells: list[tuple[Any, Any]], depth: int = 0) -> bool:
@@ -1898,6 +3363,19 @@ JUDGE_MAX_UNITS = 200
 _TERMINAL = ("succeeded", "failed", "cancelled")
 
 FORMAL_JUDGED = "正式运行的结论句已在报告撰写节点内完成裁判，结果随报告一起封存，不能再按需裁判"
+#: 正式运行、报告没开结论句裁判（结论句策略是不裁判或只要求附依据，升级前的运行也一样）：节点里没判过，照实说
+FORMAL_NO_JUDGE = "这份报告没有开启结论句裁判，正式运行的结论句不能按需裁判"
+#: 正式运行、开了裁判节点里却没判：报告没通过核对、节点按设置紧接着判失败时，不再花钱裁判
+FORMAL_UNJUDGED = "这份报告开启了结论句裁判，但报告未通过核对，结论句没有在报告撰写节点内完成裁判；正式运行的结论句不能按需裁判"
+#: 按需裁判接口认不出是哪份报告（没有封存的报告、点名的不是报告撰写节点、文档读不出来）：不替它说判没判过
+FORMAL_ONLY = "正式运行的结论句只在报告撰写节点内裁判，不能按需裁判"
+#: 正式运行在节点里当场裁判过，可这句没判成（触顶、出错、格式不对、被截断，原因记在这句的判定里）
+FORMAL_INLINE_MISSED = "这份报告在报告撰写节点内裁判时，这句没有判成（原因见判定）；正式运行的结论句不能按需裁判"
+#: 同上，可文档里压根没有这句的判定（没有原因可看）
+FORMAL_INLINE_NO_VERDICT = "这份报告在报告撰写节点内裁判过，但这句没有判定；正式运行的结论句不能按需裁判"
+#: 同上，按需裁判接口一次点了几句、其中有没判成的
+FORMAL_INLINE_MISSED_SOME = ("这份报告在报告撰写节点内裁判时，所选的句子有的没有判成（原因见各句的判定）；"
+                             "正式运行的结论句不能按需裁判")
 UNSEALED_JUDGE = "运行尚未结束并封存（仍在运行、停在人工审批或正在继续运行），请在运行结束后再请模型裁判"
 LEGACY_JUDGE = "这次运行发起时系统尚未记录证据，不支持按需裁判"
 BROKEN_JUDGE = "封存核对未通过：封存后有事件被修改、删除或插入，报告和证据已不可信，无法再请模型裁判"
@@ -1991,17 +3469,21 @@ def _judge_meta(report: _Report, sealed: _Sealed) -> dict[str, Any] | None:
             "priced": data.get("priced") if isinstance(data.get("priced"), bool) else None, "writer_model": writer}
 
 
-def _on_demand(sealed: _Sealed, doc: dict[str, Any], uid: str, verdict: dict[str, Any] | None) -> dict[str, Any]:
-    """这句能不能「请模型判断」：{available, reason, message}。和 POST …/evidence/judge 同一套条件。"""
+def _on_demand(sealed: _Sealed, doc: dict[str, Any], uid: str, verdict: dict[str, Any] | None,
+               claims: str | None = None) -> dict[str, Any]:
+    """这句能不能「请模型判断」：{available, reason, message}。和 POST …/evidence/judge 同一套条件。
+
+    claims 是写这份报告时的结论句策略（_Report.claims）。不是结论句的先说：标题、连接性文字不论哪类运行都无需裁判。
+    以前正式运行一律先答「已在节点内完成裁判」，标题、没开裁判的报告也这么说（_formal_message）。"""
     def no(reason: str, message: str) -> dict[str, Any]:
         return {"available": False, "reason": reason, "message": message}
 
-    if sealed.run_class == "formal":
-        return no("formal", FORMAL_JUDGED)
-    if not sealed.ledger_on:
-        return no("legacy", LEGACY_JUDGE)
     if not candidates(doc, [uid]):
         return no("not_a_claim", f"这句{NOT_A_CLAIM}")
+    if sealed.run_class == "formal":
+        return no("formal", _formal_message(doc, claims, [verdict]))
+    if not sealed.ledger_on:
+        return no("legacy", LEGACY_JUDGE)
     stale = _stale(verdict)
     if isinstance(verdict, dict) and verdict.get("status") in SETTLED and not stale:
         return no("judged", JUDGED_ALREADY)
@@ -2019,6 +3501,40 @@ def _stale(verdict: Any) -> bool:
 
     封存的判定（文档里的，post_seal 为 False）不在此列：追加的判定盖不掉它，版本再旧也不重开。"""
     return isinstance(verdict, dict) and bool(verdict.get("post_seal")) and outdated(verdict)
+
+
+def _formal_message(doc: dict[str, Any] | None, claims: str | None, verdicts: list[Any] | None = None) -> str:
+    """正式运行为什么不能按需裁判，照实说节点里判没判过：文档里有当场裁判的摘要（mode inline）才是裁判过了，问到的句子
+    （verdicts，这几句的判定）有没判成的（触顶、出错、被截断，判定是未裁判；没有判定）照实说没判成；开了裁判却没有摘要的，
+    是报告没通过核对、节点紧接着判失败，不再花钱裁判；别的是没开结论句裁判（策略为不裁判、只要求附依据，升级前的运行
+    没记策略，也没有裁判摘要）。没有文档（认不出是哪份报告）的不替它说判没判过。"""
+    if doc is None:
+        return FORMAL_ONLY
+    judge = doc.get("judge")
+    if isinstance(judge, dict) and judge.get("mode") == "inline":
+        if verdicts and any(not (isinstance(v, dict) and v.get("status") in SETTLED) for v in verdicts):
+            if len(verdicts) > 1:
+                return FORMAL_INLINE_MISSED_SOME
+            # 文档里压根没记这句的判定：不说「原因见判定」，没有判定可看
+            return FORMAL_INLINE_MISSED if isinstance(verdicts[0], dict) else FORMAL_INLINE_NO_VERDICT
+        return FORMAL_JUDGED
+    return FORMAL_UNJUDGED if claims == CLAIMS_JUDGE else FORMAL_NO_JUDGE
+
+
+def _formal_refusal(sealed: _Sealed, wanted: str | None, units: list[str] | None = None) -> str:
+    """按需裁判接口拒绝正式运行时的那句话，和片段接口说的一致：按请求要的那份报告（没指定取成果里标注的那一份）、
+    点的那几句结论句（不是结论句的不算）说。选不出报告、文档读不出来的，只说正式运行不能按需裁判（FORMAL_ONLY）。"""
+    reports = _reports(sealed)
+    try:
+        chosen = _choose(reports, wanted, sealed) if reports else None
+    except CodedHTTPException:
+        chosen = None
+    doc = chosen.doc if chosen else None
+    verdicts = None
+    if doc is not None and units:
+        picked = {c.unit for c in candidates(doc, units)}
+        verdicts = [u.get("verdict") for _, u in iter_units(doc) if str(u.get("id")) in picked]
+    return _formal_message(doc, chosen.claims if chosen else None, verdicts)
 
 
 def _sealed_loader(sealed: _Sealed, *, chain: bool = False) -> Callable[[str], Any]:
@@ -2047,6 +3563,49 @@ def _sealed_loader(sealed: _Sealed, *, chain: bool = False) -> Callable[[str], A
             extended = _chain_set(sealed)
         return load(key) if key in extended else None
     return loader
+
+
+async def _judge_loader(doc: dict[str, Any], catalog: dict[str, Any], units: list[str] | None = None,
+                        loader: Callable[[str], Any] | None = None) -> Callable[[str], Any]:
+    """交给结论句裁判的 loader（judge.prepare 的 loader）：摘录里的每份查询快照逐份遮，这份快照里确定取自遮罩列的列
+    （_mask_sets 的 sure，和证据面板同一套认法：c.phone AS tel 的 tel、按位置认得出的 UPPER(phone)）也不给。
+
+    裁判自己只按列名遮（快照记下的 mask_columns 加数据源现在设的，judge._hidden）：改了名字的号码列照样进摘录，裁判理由
+    一引用就在证据面板、审计 CSV 里露出来。这里把那几列并进交给裁判的这一份快照的 mask_columns（只是交给 prepare 的
+    副本，工件本身不动），裁判照它自己的办法遮掉。只并这份快照自己的：不按数据源名合并（另一份快照里同名、却取自别的列
+    的照给），不用证据面板宁可多遮的 hidden（整份遮的快照、只数个数的列照给，被引用的金额、人数裁判要看得到才判得了）。
+    这样摘录变了的句子复用键随之变，此前判过的会重判一次。
+
+    只读要裁判的句子（units，None 是全部结论句，judge.candidates）挂的查询；读出来的快照另记一份交给 prepare 再取，
+    不读第二遍。loader 缺省读工件库；按需裁判传只认封存工件的那个（_sealed_loader）。报告撰写节点当场裁判
+    （engine/nodes/report.py）用同一个函数。"""
+    from app.engine.evidence import _mask_names
+    from app.engine.judge import candidates
+
+    read = loader or load
+    masks = _Masks()
+    shown: dict[str, Any] = {}
+    for alias in dict.fromkeys(a for c in candidates(doc, units) for a in c.aliases):
+        entry = catalog.get(alias)
+        if not isinstance(entry, dict) or entry.get("kind") != "query" or not entry.get("artifact"):
+            continue
+        artifact = str(entry["artifact"])
+        if artifact in shown:
+            continue
+        try:
+            snap = read(artifact)
+        except Exception:  # noqa: BLE001 - 读不出来、不在封存范围里：摘录本来就不给它，交给 prepare 照它的办法处理
+            continue
+        if not isinstance(snap, dict):
+            continue
+        recorded = _mask_names(snap.get("mask_columns"))
+        sure = set((await masks.sets(artifact, entry.get("source") or snap.get("source"), snap)).sure)
+        shown[artifact] = {**snap, "mask_columns": sorted(recorded | sure)} if sure - recorded else snap
+
+    def reader(artifact: str) -> Any:
+        key = str(artifact)
+        return shown[key] if key in shown else read(key)
+    return reader
 
 
 def _chain_set(sealed: _Sealed) -> set[str]:
@@ -2132,7 +3691,7 @@ async def judge_units(run_id: str, payload: Any = Body(None), report: str | None
     async with _JUDGING.hold(run_id):
         sealed = await _sealed(run_id)
         if sealed.run_class == "formal":
-            raise CodedHTTPException(409, FORMAL_JUDGED, JUDGE_FORMAL)
+            raise CodedHTTPException(409, _formal_refusal(sealed, wanted, units), JUDGE_FORMAL)
         if not sealed.ledger_on:
             raise CodedHTTPException(409, LEGACY_JUDGE, JUDGE_LEGACY)
         if not sealed.sealed or sealed.status not in _TERMINAL:
@@ -2173,7 +3732,8 @@ async def _judge_now(sealed: _Sealed, report: _Report, units: list[str]) -> dict
         # 带期 4 标记的文档才让裁判取得到哈希链上的清单（摘录的来历行要用）；老文档的 loader 和以前完全相同
         loader = _sealed_loader(sealed, chain=doc.get("provenance") == DOC_PROVENANCE)
         masked = await judging.source_masks(catalog, loader=loader)
-        request = judging.prepare(doc, catalog, units=pending, loader=loader, masked=masked)
+        request = judging.prepare(doc, catalog, units=pending, masked=masked,
+                                  loader=await _judge_loader(doc, catalog, pending, loader))
         skipped = dict(request.skipped)
         if request.cands:
             async with SessionLocal() as session:
@@ -2288,6 +3848,9 @@ GROUPS = (("cited", "有出处"), ("none", "无证据"), ("suspicious", "可疑�
 #: 文档本身对不上的违规：不管落在哪个片段上都单独列一行，不能被那个片段「有出处」的行盖住
 _INTEGRITY = frozenset({"bad_schema", "segment_mismatch", "structural_text", "render_mismatch", "eid_mismatch",
                         "state_mismatch"})
+#: 落在已经列出的片段上也单列一行的违规：文档对不上的，和引用了遮罩列的格子的（masked_cell：引用的那一格落在的正是一个
+#: 「有出处」的单元格片段，不单列的话审计表、导出的 CSV 里只有一行普通的「有出处」）
+_LISTED_ALWAYS = _INTEGRITY | {"masked_cell"}
 UNCITED_CLAIM = "这句结论没有附依据（既没有引用，也没有注明依据）"
 UNCITED_CLAIM_COUNTED = "这句结论没有附依据。本报告要求结论句附依据，出具时计入缺口"
 UNCITED_CLAIM_WITHHELD = "这句结论没有附依据，按出具契约不予出具"
@@ -2326,6 +3889,7 @@ _CSV_LABELS: dict[str, dict[Any, str]] = {
     "issue": {"uncited_number": "没有出处的数字", "unresolved_ref": "引用无法解析", "unknown_entity": "疑似不存在的名称",
               "unverified_entity": "无法核实", "uncited_claim": "结论句未附依据", "no_candidate": "未找到候选",
               "contradicted_claim": "证据相矛盾", "insufficient_claim": "证据不足", "unsupported_claim": "证据不支持",
+              "masked_cell": "引用了遮罩列",
               **{code: "文档不一致" for code in _INTEGRITY}},
     "evidence_kind": {"metric": "口径卡指标", "cell": "查询单元格", "input": "运行输入", "table": "表", "column": "字段",
                       "quote": "知识库原话", "query": "查询结果"},
@@ -2477,7 +4041,7 @@ def _audit_doc(report: _Report, sealed: _Sealed, inputs: dict[str, Any],
                      "sentence": claim["text"], "note": claim_note})
     rows.extend(_verdict_rows(report, sealed, field_name, markdown))
     for v in doc.get("violations") or []:
-        if not isinstance(v, dict) or (str(v.get("segment")) in listed and v.get("code") not in _INTEGRITY):
+        if not isinstance(v, dict) or (str(v.get("segment")) in listed and v.get("code") not in _LISTED_ALWAYS):
             continue
         rows.append({"group": "suspicious" if v.get("code") in SUSPICIOUS else "none", "report": report.node_id,
                      "field": field_name, "segment": v.get("segment"), "unit": v.get("unit"), "kind": "violation",

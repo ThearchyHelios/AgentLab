@@ -2,6 +2,8 @@
 // 先预览再「应用并重新检查」、问题面板里的「发布前检查」、老后端（两个接口 404）照旧。
 // 另有一键升级为可追溯结构（可点击证据五期）：问题面板的快速修复、升级预览、应用走现有的保存、
 // 从记录页横幅跳过来（?upgrade=1）。升级接口和校验给的那条建议同样在浏览器里伪造。
+// 还有点名的模型接入不存在或已停用（K1）：一处一行、各有一组要人选的修复，问题面板不露键名，
+// 在设置里删了接入回到画布要重新校验。接入表、校验同样伪造。
 //
 // 不写库：工作流、保存、发布、publish-check、autofix 全在浏览器里用 page.route 伪造。
 // 伪造的检查接口按请求里的图现算（下面的 lint），所以修完、存完、再查，结论会真的变；
@@ -162,6 +164,79 @@ const SQLWF = {
   edges: chain('in', 'sum', 'done'),
 }
 
+/**
+ * 点名的模型接入（K1）：「提问」点的接入不存在，协作节点自己的接入已停用、成员「分析师」点的接入不存在。
+ * 接入表在 open() 里伪造（state.providers），校验和门禁都按它现算
+ */
+const PROV = {
+  nodes: [
+    node('in', 'input', 0, '入口', { fields: [{ name: 'week', required: true }] }),
+    node('ask', 'llm', 240, '提问', { prompt: '总结本周销售', provider: 'demo-old', model: 'old-model' }),
+    node('team', 'supervisor', 480, '协作', { goal: '复核', provider: 'demo-off', agents: [{ name: '分析师', provider: 'demo-old', tools: [] }] }),
+    node('done', 'output', 720, '成果', { fields: [{ name: 'report', value: '{{ last_message }}' }] }),
+  ],
+  edges: chain('in', 'ask', 'team', 'done'),
+}
+/** 点名的接入现在好好的（启用着）：在设置里删掉它之后回到画布，校验要重新查出来 */
+const PROV_OK = {
+  nodes: [
+    node('in', 'input', 0, '入口', { fields: [{ name: 'week', required: true }] }),
+    node('ask', 'llm', 240, '提问', { prompt: '总结本周销售', provider: 'demo-main' }),
+    node('done', 'output', 480, '成果', { fields: [{ name: 'report', value: '{{ nodes.ask.text }}' }] }),
+  ],
+  edges: chain('in', 'ask', 'done'),
+}
+/**
+ * 只写了模型、提供它的接入已停用（K1）：让模型重排的检索写的 tiny-1 只有停用的 demo-off 提供，协作成员同样只写了
+ * tiny-1。检索的检查器里没有模型这一栏、成员也没有：问题面板和修复预览照样要写得出「模型」
+ */
+const PROV_MODEL = {
+  nodes: [
+    node('in', 'input', 0, '入口', { fields: [{ name: 'week', required: true }] }),
+    node('look', 'retrieve', 240, '检索', { query: '{{ input.week }}', rerank: 'model', model: 'tiny-1' }),
+    node('team', 'supervisor', 480, '协作', { goal: '复核', agents: [{ name: '分析师', model: 'tiny-1', tools: [] }] }),
+    node('done', 'output', 720, '成果', { fields: [{ name: 'report', value: '{{ last_message }}' }] }),
+  ],
+  edges: chain('in', 'look', 'team', 'done'),
+}
+/**
+ * 一处给不出修复（K1b）：协作节点点名的接入不存在，成员「研究员」跟随节点的接入、自己只写了停用的 demo-off 提供的模型——
+ * 节点换成哪家、去掉接入，研究员都落不稳，这一处没有修复，提示也不指到发布前检查；成员「分析师」自己点名的接入不存在，
+ * 改用 demo-main 落得稳，有修复。两条同编号、同节点：前一条不能借后一条的修复
+ */
+const PROV_NOFIX = {
+  nodes: [
+    node('in', 'input', 0, '入口', { fields: [{ name: 'week', required: true }] }),
+    node('team', 'supervisor', 240, '协作', { goal: '复核', provider: 'demo-old',
+      agents: [{ name: '分析师', provider: 'demo-old', tools: [] }, { name: '研究员', model: 'tiny-1', tools: [] }] }),
+    node('done', 'output', 480, '成果', { fields: [{ name: 'report', value: '{{ last_message }}' }] }),
+  ],
+  edges: chain('in', 'team', 'done'),
+}
+const PROVIDERS = [
+  { id: 'pv-main', name: 'demo-main', kind: 'openai_compatible', base_url: 'https://example.com/v1', default_model: 'big-model',
+    models: [{ id: 'big-model' }], enabled: true, extra: {}, api_key_masked: '', has_key: true },
+  { id: 'pv-off', name: 'demo-off', kind: 'openai_compatible', base_url: 'https://example.com/v1', default_model: 'tiny-1',
+    models: [{ id: 'tiny-1' }], enabled: false, extra: {}, api_key_masked: '', has_key: true },
+]
+/**
+ * 启用的只有演示类接入（K1b）：「提问」点名停用的 demo-off，「不指定接入」落到演示接入，「改用 demo-mock」本身就是演示接入。
+ * 两个候选都带 demo 标记（后端 autofix._demo_mark），选项名旁要有醒目的「演示模型」标签，不能只靠说明末尾的淡色小字
+ */
+const PROV_DEMO = {
+  nodes: [
+    node('in', 'input', 0, '入口', { fields: [{ name: 'week', required: true }] }),
+    node('ask', 'llm', 240, '提问', { prompt: '总结本周销售', provider: 'demo-off' }),
+    node('done', 'output', 480, '成果', { fields: [{ name: 'report', value: '{{ nodes.ask.text }}' }] }),
+  ],
+  edges: chain('in', 'ask', 'done'),
+}
+const DEMO_PROVIDERS = [
+  PROVIDERS[1],
+  { id: 'pv-mock', name: 'demo-mock', kind: 'mock', base_url: '', default_model: 'mock-1',
+    models: [{ id: 'mock-1' }], enabled: true, extra: {}, api_key_masked: '', has_key: false },
+]
+
 const wf = (id, name, graph, extra = {}) => ({
   id, name, description: '检查脚本伪造的工作流', graph, tags: [], version: 3, is_template: false,
   status: 'draft', published_version: null, published_by: null, run_count: 0,
@@ -179,6 +254,11 @@ const FAKES = {
   'pf-legacy': wf('pf-legacy', '__upgrade_check_legacy__', LEGACY, { status: 'published', published_version: 3 }),
   'pf-ask': wf('pf-ask', '__upgrade_check_ask__', ASK),
   'pf-sql': wf('pf-sql', '__publish_check_sql__', SQLWF),
+  'pf-prov': wf('pf-prov', '__publish_check_provider__', PROV),
+  'pf-provok': wf('pf-provok', '__publish_check_provider_ok__', PROV_OK),
+  'pf-provmodel': wf('pf-provmodel', '__publish_check_provider_model__', PROV_MODEL),
+  'pf-provnofix': wf('pf-provnofix', '__publish_check_provider_nofix__', PROV_NOFIX),
+  'pf-provdemo': wf('pf-provdemo', '__publish_check_provider_demo__', PROV_DEMO),
 }
 
 const clone = (x) => JSON.parse(JSON.stringify(x))
@@ -187,14 +267,110 @@ const who = (n) => `「${n.data.label}」`
 const metricOptions = (m) => m.data.config.metrics.map((x) => ({ value: x.id, label: `${x.name}（${x.id}）`, hint: `口径卡「${m.data.label}」` }))
 
 /**
+ * 伪造的点名接入检查，形状照后端 engine/provider_refs.py 与 autofix.provider_choice：一处一条问题（字段 provider、
+ * agents[i].provider），门禁里是 error、带一条要人选的修复（id 是 code:节点:字段）；画布校验里是 warning、没有修复。
+ * 候选照后端按执行时的取法算去掉、换掉以后落到哪里（只覆盖这几张图用到的情形，图里没有全图默认）：节点去掉接入落到
+ * 第一个可用的接入；成员去掉接入跟随节点自己的接入，那个接入停用了就不给这一项；落到的接入不提供同一处写着的模型时
+ * 模型一并去掉（_drops 记哪几个候选要去掉，应用时用，前端收不到）。协作节点换掉、去掉接入时，跟着它的成员自己写着
+ * 没有启用接入提供的模型，一个候选都落不稳：没有修复，提示不写「或在「发布前检查」中改用其他接入」，改说卡在哪里
+ * （后端 provider_refs._tail：「无法改用其他接入：」加第一处落不稳的地方）。落到演示类接入的候选说明末尾照实说、带 demo 标记
+ */
+function providerLint(graph, providers, level) {
+  const issues = []
+  const fixes = []
+  const refs = []
+  const kind = { llm: '模型调用', supervisor: '多 Agent 协作' }
+  const serves = (p, m) => (p.models ?? []).some((x) => x.id === m) || p.default_model === m
+  const enabled = providers.filter((x) => x.enabled)
+  const demo = (p) => (p?.kind === 'mock' ? { demo: true } : {})
+  for (const n of graph.nodes) {
+    const c = n.data.config ?? {}
+    const at = `${who(n)}（${kind[n.type]}）`
+    if (c.provider) refs.push({ n, field: 'provider', name: c.provider, who: at, holder: c })
+    ;(c.agents ?? []).forEach((a, i) => {
+      if (a.provider) refs.push({ n, field: `agents[${i}].provider`, name: a.provider, who: `${at}的成员「${a.name}」`, holder: a, team: at })
+    })
+  }
+  for (const r of refs) {
+    const p = providers.find((x) => x.name === r.name)
+    if (p?.enabled) continue
+    const code = p ? 'provider.disabled' : 'provider.missing'
+    const id = `${code}:${r.n.id}:${r.field}`
+    const gate = level === 'error'
+    const model = r.holder.model
+    const options = []
+    const drops = []
+    const up = r.team && r.n.data.config.provider ? providers.find((x) => x.name === r.n.data.config.provider) : enabled[0]
+    const stuckBy = r.team ? null : (r.n.data.config.agents ?? []).find((a) => !a.provider && a.model && !enabled.some((x) => serves(x, a.model)))
+    const stuck = !!stuckBy
+    if (up?.enabled && !stuck) {
+      const drop = !!model && !serves(up, model)
+      if (drop) drops.push('')
+      options.push({ value: '', label: '不指定接入', hint: `去掉这一处指定的接入${drop ? `和模型「${model}」` : ''}，执行时改用`
+        + (r.team && r.n.data.config.provider ? `${r.team}指定的接入「${up.name}」` : `第一个可用的模型接入「${up.name}」`)
+        + (up.kind === 'mock' ? '（演示用，不调用真实模型）' : ''), ...demo(up) })
+    }
+    for (const x of stuck ? [] : enabled) {
+      const drop = !!model && !serves(x, model)
+      if (drop) drops.push(x.name)
+      const notes = [drop ? `不提供模型「${model}」，将改用它的默认模型「${x.default_model}」` : '',
+        x.kind === 'mock' ? '演示用的模型接入，不调用真实模型' : ''].filter(Boolean)
+      options.push({ value: x.name, label: x.name, hint: notes.join('；') || null, ...demo(x) })
+    }
+    const fixable = options.length > 0
+    const off = stuckBy && providers.find((x) => !x.enabled && serves(x, stuckBy.model))
+    issues.push({ level, node_id: r.n.id, field: r.field, code, fix: gate && fixable ? id : null,
+      message: `${r.who}指定的模型接入「${r.name}」${p ? '已停用' : '不存在'}。请在「设置 → 模型接入」中${p ? '启用它' : '核对名称'}`
+        + (fixable ? '，或在「发布前检查」中改用其他接入'
+          : off ? `。无法改用其他接入：${r.who}的成员「${stuckBy.name}」指定的模型「${stuckBy.model}」所属的模型接入「${off.name}」已停用` : '') })
+    if (gate && fixable) {
+      fixes.push({ id, code, node_id: r.n.id, field: r.field, kind: 'choice', label: `选择${r.who}改用的模型接入`, options, _drops: drops })
+    }
+  }
+  // 哪一级都没写接入、只写了模型：按模型名找，只有停用的接入提供它时同样是问题，落在写模型的那一处。修复是「不指定
+  // 模型」（落到第一个可用的接入）或改用一个启用的接入（写在模型旁边，模型去掉）
+  const models = []
+  for (const n of graph.nodes) {
+    const c = n.data.config ?? {}
+    const at = `${who(n)}（${n.type === 'retrieve' ? '知识检索' : kind[n.type]}）`
+    if (!c.provider && c.model && (n.type !== 'retrieve' || c.rerank === 'model')) {
+      models.push({ n, field: 'model', name: c.model, who: at, holder: c, editable: n.type !== 'retrieve' })
+    }
+    ;(c.agents ?? []).forEach((a, i) => {
+      if (!c.provider && !a.provider && a.model) models.push({ n, field: `agents[${i}].model`, name: a.model, who: `${at}的成员「${a.name}」`, holder: a })
+    })
+  }
+  for (const r of models) {
+    const off = enabled.some((x) => serves(x, r.name)) ? null : providers.find((x) => !x.enabled && serves(x, r.name))
+    if (!off) continue
+    const id = `provider.disabled:${r.n.id}:${r.field}`
+    const gate = level === 'error'
+    issues.push({ level, node_id: r.n.id, field: r.field, code: 'provider.disabled', fix: gate ? id : null,
+      message: `${r.who}指定的模型「${r.name}」所属的模型接入「${off.name}」已停用。请在「设置 → 模型接入」中启用它，`
+        + (r.editable ? '或在节点中换一个模型' : '或在「发布前检查」中改用其他接入') })
+    if (!gate || !enabled.length) continue
+    fixes.push({ id, code: 'provider.disabled', node_id: r.n.id, field: r.field, kind: 'choice', label: `选择${r.who}改用的模型接入`,
+      options: [{ value: '', label: '不指定模型', hint: `去掉这一处指定的模型，执行时改用第一个可用的模型接入「${enabled[0].name}」` },
+        ...enabled.map((x) => ({ value: x.name, label: x.name, hint: `不提供模型「${r.name}」，将改用它的默认模型「${x.default_model}」` }))],
+      _drops: ['', ...enabled.map((x) => x.name)] })
+  }
+  return { issues, fixes }
+}
+
+/**
  * 伪造的门禁：按请求里的图现算，形状照 PF-SPEC（issues 带 code 和 fix，fixes 列修法）。
  * 已发布档只给提示，受管档有错。修法的 id 是 code:节点（图级的是 code:graph）。
  * followsNever：当作这张图的工作流默认设置是「全部无需审批」（画布上不带 defaults，按工作流认）
  */
-function lint(graph, level, { followsNever = false } = {}) {
+function lint(graph, level, { followsNever = false, providers = null } = {}) {
   const hard = level === 'governed'
   const issues = []
   const fixes = []
+  if (providers) {
+    const found = providerLint(graph, providers, 'error')
+    issues.push(...found.issues)
+    fixes.push(...found.fixes)
+  }
   const add = (n, code, message, fix, isError = true) => {
     const id = `${code}:${n.id}`
     issues.push({ level: isError && hard ? 'error' : 'warning', node_id: n.id, code, message, fix: fix ? id : null, field: null })
@@ -294,9 +470,9 @@ function lint(graph, level, { followsNever = false } = {}) {
 }
 
 /** 伪造的 autofix：在副本上照选中的修法改，逐项记 changes；钉不上的（pf-lib 没发过版时）进 rejected */
-function autofix(body, { unpublished = false, followsNever = false } = {}) {
+function autofix(body, { unpublished = false, followsNever = false, providers = null } = {}) {
   const graph = clone(body.graph)
-  const before = lint(graph, body.level, { followsNever })
+  const before = lint(graph, body.level, { followsNever, providers })
   const changes = []
   const rejected = []
   const applied = []
@@ -338,6 +514,24 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
       const v = body.choices?.[id]
       const to = `{{ nodes.${v}.text }}`
       change('fields[0].value', c.fields[0].value, to); c.fields[0].value = to
+    } else if (fix.code.startsWith('provider.')) {
+      // 点名的接入：改用选的那个，选「不指定接入」就去掉这一项；落到的接入不提供同一处写着的模型时模型一并去掉。
+      // 只写了模型的那一处：改用的接入写在模型旁边、模型去掉，「不指定模型」只去掉模型
+      const v = body.choices?.[id]
+      if (v === undefined) { rejected.push({ fix_id: id, reason: `这一处需要你选择：${fix.label}` }); continue }
+      if (!fix.options.some((o) => o.value === v)) { rejected.push({ fix_id: id, reason: `所选的「${v}」不在候选项中` }); continue }
+      const m = /^agents\[(\d+)\]\.(provider|model)$/.exec(fix.field)
+      const holder = m ? c.agents[Number(m[1])] : c
+      const base = fix.field.replace(/(provider|model)$/, '')
+      if (fix.field.endsWith('provider') || v) {
+        change(`${base}provider`, holder.provider ?? null, v || null)
+        if (v) holder.provider = v
+        else delete holder.provider
+      }
+      if (fix._drops.includes(v) && holder.model) {
+        change(`${base}model`, holder.model, null)
+        delete holder.model
+      }
     } else if (fix.code === 'contract.required_missing') {
       const v = body.choices?.[id]
       if (!Array.isArray(v) || !v.length) { rejected.push({ fix_id: id, reason: `这一处需要你选择：${fix.label}` }); continue }
@@ -356,7 +550,7 @@ function autofix(body, { unpublished = false, followsNever = false } = {}) {
     assist = { ok: true, summary: '把复核团队的轮数收紧到 2 轮；换成固定编排要删节点，按规矩没动它',
       questions: ['复核团队要换成哪一个固定编排的 Agent？它现在只有一个成员 checker，保留它的职责吗？'] }
   }
-  const remaining = lint(graph, body.level, { followsNever })
+  const remaining = lint(graph, body.level, { followsNever, providers })
   return { graph, changes, applied, rejected, handoff, remaining: remaining.issues, assist, ok: remaining.ok, ops: [] }
 }
 
@@ -468,7 +662,11 @@ async function open({ id = 'pf-hard', width = 1440, height = 900, backend = 'new
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
   // validate：'ok' | 'fail'（校验接口 500，后端断开时和保存一起失败）。检查中途改它，下一次校验就按新的回
   const state = { checks: [], autofixes: [], patches: [], publishes: [], upgrades: [], version: FAKES[id].version, graph: clone(FAKES[id].graph), save, backend, upgrade,
-    validate: 'ok' }
+    validate: 'ok', validates: 0, deleted: [] }
+  // 点名接入、只写了模型的那几张图：接入表伪造，校验、门禁、修复都按它现算
+  const providers = id === 'pf-provdemo' ? clone(DEMO_PROVIDERS)
+    : ['pf-prov', 'pf-provok', 'pf-provmodel', 'pf-provnofix'].includes(id) ? clone(PROVIDERS) : null
+  state.providers = providers
 
   await page.route(/\/api\//, (route) => {
     const req = route.request()
@@ -482,6 +680,23 @@ async function open({ id = 'pf-hard', width = 1440, height = 900, backend = 'new
     await page.route(/\/api\/workflows\/validate$/, (route) => state.validate === 'fail'
       ? json(route, { detail: '校验服务暂时无法连接' }, 500)
       : json(route, { ok: true, issues: advice ? upgradeAdvice(route.request().postDataJSON()?.graph ?? { nodes: [], edges: [] }) : [] }))
+  }
+  if (providers) {
+    await page.route(/\/api\/workflows\/validate$/, (route) => {
+      state.validates += 1
+      const graph = route.request().postDataJSON()?.graph ?? { nodes: [], edges: [] }
+      return json(route, { ok: true, issues: providerLint(graph, state.providers, 'warning').issues })
+    })
+    await page.route(/\/api\/providers(\?.*)?$/, (route) => (route.request().method() === 'GET'
+      ? json(route, state.providers) : route.fallback()))
+    // 设置里删接入：只改伪造的接入表
+    await page.route(/\/api\/providers\/pv-[a-z]+$/, (route) => {
+      if (route.request().method() !== 'DELETE') return route.fallback()
+      const pid = new URL(route.request().url()).pathname.split('/').pop()
+      state.deleted.push(pid)
+      state.providers = state.providers.filter((x) => x.id !== pid)
+      return json(route, { ok: true })
+    })
   }
   await page.route(/\/api\/copilot\/upgrade-evidence$/, async (route) => {
     const body = route.request().postDataJSON()
@@ -520,19 +735,19 @@ async function open({ id = 'pf-hard', width = 1440, height = 900, backend = 'new
       const last = state.checks.at(-1)
       if (!(last && last.key === key && Date.now() - last.at < 300)) state.checks.push({ ...body, key, at: Date.now() })
       if (state.backend === 'old') return json(route, { detail: 'Not Found' }, 404)
-      return json(route, lint(body.graph ?? state.graph, body.level, { followsNever }))
+      return json(route, lint(body.graph ?? state.graph, body.level, { followsNever, providers: state.providers }))
     }
     if (method === 'POST' && sub === 'autofix') {
       const body = req.postDataJSON()
       state.autofixes.push(body)
       if (state.backend !== 'new') return json(route, { detail: 'Not Found' }, 404)
       if (fixDelay) await new Promise((r) => setTimeout(r, fixDelay))
-      return json(route, autofix(body, { unpublished, followsNever }))
+      return json(route, autofix(body, { unpublished, followsNever, providers: state.providers }))
     }
     if (method === 'POST' && sub === 'publish') {
       const body = req.postDataJSON()
       state.publishes.push(body)
-      const r = lint(state.graph, body.level, { followsNever })
+      const r = lint(state.graph, body.level, { followsNever, providers: state.providers })
       // 真后端的 /publish 回包：问题带 code、不带 fix（fix 只有 publish-check 给）；老后端连 code 也没有
       const issues = state.backend === 'old' ? r.issues.map(({ code: _c, fix: _f, ...rest }) => rest)
         : r.issues.map(({ fix: _f, ...rest }) => rest)
@@ -1511,6 +1726,210 @@ await section('升级：?upgrade=1 直达：打开问题面板、开始预览，
     page.url())
   check('没有自动保存', state.patches.length === 0)
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+await section('点名的模型接入：一处一行、各有一组要人选的修复，预览写「模型接入」', async () => {
+  const { page, state, errors } = await open({ id: 'pf-prov' })
+  await openDialog(page)
+  await waitFor(page, async () => (await dialog(page).locator('[data-preflight-issue]').count()) > 0)
+  const rows = dialog(page).locator('[data-preflight-issue^="provider."]')
+  check('三处点名的接入各一行：协作节点自己的接入和成员的接入不合成一行', await rows.count() === 3, `${await rows.count()} 行`)
+  const summary = await dialog(page).locator('[data-preflight-summary]').innerText().catch(() => '')
+  check('……结论按三处算：3 处问题将被门禁拦截', summary.includes('3 处问题将被门禁拦截'), summary)
+  const member = dialog(page).locator('[data-fix-choice="provider.missing:team:agents[0].provider"]')
+  const memberText = await member.innerText().catch(() => '')
+  const askText = await dialog(page).locator('[data-fix-choice="provider.missing:ask:provider"]').innerText().catch(() => '')
+  check('每一处一组选项：启用的接入在、停用的不在候选里', await dialog(page).locator('[data-fix-choice^="provider."]').count() === 3
+    && memberText.includes('demo-main') && !memberText.includes('demo-off') && askText.includes('demo-main') && !askText.includes('demo-off'),
+    `${askText} | ${memberText}`)
+  check('……「不指定接入」写清执行时改用哪里、写着的模型一并去掉', askText.includes('不指定接入')
+    && askText.includes('去掉这一处指定的接入和模型「old-model」，执行时改用第一个可用的模型接入「demo-main」'), askText)
+  check('……成员去掉接入会跟随节点上停用的 demo-off：不给这一项，只剩启用的接入',
+    await member.locator('input[type="radio"]').count() === 1 && !memberText.includes('不指定接入'), memberText)
+  check('……标题说清是哪一处', memberText.includes('选择「协作」（多 Agent 协作）的成员「分析师」改用的模型接入'), memberText)
+  check('……不替人选', await member.locator('input:checked').count() === 0)
+  await member.locator('label', { hasText: 'demo-main' }).click()
+  await member.locator('[data-fix-action="choice"]').click()
+  await dialog(page).locator('[data-fix-preview="ready"]').waitFor()
+  check('预览请求只修这一处，带着选的接入', JSON.stringify(state.autofixes.at(-1)?.apply) === '["provider.missing:team:agents[0].provider"]'
+    && state.autofixes.at(-1)?.choices?.['provider.missing:team:agents[0].provider'] === 'demo-main')
+  const line = await dialog(page).locator('[data-fix-change]').first().innerText().catch(() => '')
+  check('预览写「「协作」 · 团队成员 · 「分析师」 · 模型接入：demo-old → demo-main」，不露键名',
+    /「协作」\s*·\s*团队成员 · 「分析师」 · 模型接入：\s*demo-old\s*demo-main/.test(line) && !/provider/.test(line), line)
+  await dialog(page).locator('[data-fix-apply]').click()
+  await waitFor(page, async () => state.patches.length === 1 && state.checks.length >= 2)
+  const team = cfgOf(state.patches[0]?.graph, 'team')
+  check('应用：成员改用 demo-main，节点自己的接入不动', team?.agents?.[0]?.provider === 'demo-main' && team?.provider === 'demo-off',
+    JSON.stringify(team ?? {}).slice(0, 120))
+  await waitFor(page, async () => (await dialog(page).locator('[data-preflight-issue^="provider."]').count()) === 2)
+  check('……重查之后剩两处', await dialog(page).locator('[data-preflight-issue^="provider."]').count() === 2)
+  await shoot(page, 'publish-provider-fix', dialog(page))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+await section('点名的模型接入：给不出修复的那一处不借同节点别处的修复，提示也不指到发布前检查', async () => {
+  const { page, errors } = await open({ id: 'pf-provnofix' })
+  await openDialog(page)
+  await waitFor(page, async () => (await dialog(page).locator('[data-preflight-issue^="provider."]').count()) === 2)
+  const rows = dialog(page).locator('[data-preflight-issue^="provider."]')
+  const own = rows.nth(0)
+  const member = rows.nth(1)
+  const ownText = await own.innerText().catch(() => '')
+  check('协作节点自己的接入：一行，没有修复（选项、预览按钮都没有）', await own.locator('[data-fix-choice]').count() === 0
+    && await own.getAttribute('data-fix-kind') === null, ownText.replace(/\s+/g, ' ').slice(0, 100))
+  check('……提示不指到发布前检查：说去设置里核对，再说卡在哪里（成员只写了停用接入的模型）',
+    ownText.includes('指定的模型接入「demo-old」不存在。请在「设置 → 模型接入」中核对名称。无法改用其他接入：'
+      + '「协作」（多 Agent 协作）的成员「研究员」指定的模型「tiny-1」所属的模型接入「demo-off」已停用')
+    && !ownText.includes('发布前检查'), ownText.replace(/\s+/g, ' ').slice(0, 160))
+  check('成员「分析师」那一处：自己的修复画在自己这一行', await member.locator('[data-fix-choice="provider.missing:team:agents[0].provider"]').count() === 1
+    && (await member.innerText()).includes('或在「发布前检查」中改用其他接入'))
+  check('整个弹窗里只有这一组接入的修复', await dialog(page).locator('[data-fix-choice^="provider."]').count() === 1)
+  await shoot(page, 'publish-provider-nofix', dialog(page))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+await section('点名的模型接入：落到演示类接入的候选在选项名旁有醒目的「演示模型」标签', async () => {
+  const { page, errors } = await open({ id: 'pf-provdemo' })
+  await openDialog(page)
+  const group = dialog(page).locator('[data-fix-choice="provider.disabled:ask:provider"]')
+  await waitFor(page, async () => (await group.count()) === 1)
+  const tags = group.locator('[data-fix-demo]')
+  check('两个候选都落到演示接入，各有一个「演示模型」标签', await tags.count() === 2
+    && (await tags.allInnerTexts()).every((t) => t.trim() === '演示模型'), String(await tags.count()))
+  const clear = group.locator('label', { hasText: '不指定接入' })
+  check('……「不指定接入」的说明里照旧写明演示用、不调用真实模型', (await clear.innerText()).includes('（演示用，不调用真实模型）'))
+  // 醒目：标签用提醒色，不是说明那种淡色小字；标签就在选项名旁（同一行）
+  const look = await group.evaluate((el) => {
+    const tag = el.querySelector('[data-fix-demo]')
+    const hint = tag.closest('label').querySelector('.text-faint')
+    const probe = document.createElement('span')
+    probe.style.color = 'var(--warn)'
+    el.appendChild(probe)
+    const warn = getComputedStyle(probe).color
+    probe.remove()
+    const name = tag.parentElement.firstChild
+    const range = document.createRange()
+    range.selectNodeContents(name)
+    return { tag: getComputedStyle(tag).color, hint: hint ? getComputedStyle(hint).color : '', warn,
+      sameLine: Math.abs(range.getBoundingClientRect().top - tag.getBoundingClientRect().top) < 6 }
+  })
+  check('……标签用提醒色（不是说明的淡色），和选项名在同一行', look.tag === look.warn && look.tag !== look.hint && look.sameLine, JSON.stringify(look))
+  await shoot(page, 'publish-provider-demo', dialog(page))
+  // 390 宽：「发布」收在「更多操作」里。标签和说明在弹窗里折行，不伸出弹窗、不出横向滚动条
+  const narrow = await open({ id: 'pf-provdemo', width: 390, height: 844 })
+  await narrow.page.getByRole('button', { name: '更多操作' }).click()
+  await narrow.page.locator('[role="menu"][aria-label="更多操作"] [role^="menuitem"]', { hasText: '发布' }).click()
+  await dialog(narrow.page).waitFor()
+  await waitFor(narrow.page, async () => (await dialog(narrow.page).locator('[data-fix-demo]').count()) === 2)
+  const fits = await narrow.page.evaluate(() => {
+    const d = document.querySelector('[role="dialog"]')
+    const box = d.getBoundingClientRect()
+    const tags = [...d.querySelectorAll('[data-fix-demo]')].map((t) => t.getBoundingClientRect())
+    return { own: d.scrollWidth - d.clientWidth,
+      inside: tags.every((r) => r.right <= Math.min(box.right, window.innerWidth) + 0.5 && r.left >= box.left - 0.5) }
+  })
+  check('390 宽：标签在弹窗里，弹窗不出横向滚动条', fits.own <= 0 && fits.inside, JSON.stringify(fits))
+  await shoot(narrow.page, 'publish-provider-demo-390', dialog(narrow.page))
+  check('没有运行时报错', errors.length === 0 && narrow.errors.length === 0, [...errors, ...narrow.errors].join(' | '))
+})
+
+await section('点名的模型接入：问题面板写「模型接入」，不露键名', async () => {
+  const { page, errors } = await open({ id: 'pf-prov' })
+  await page.locator('.react-flow__pane').click({ position: { x: 30, y: 30 } })
+  await page.keyboard.press('Alt+KeyP')
+  await page.locator('#dock-problems').waitFor()
+  await waitFor(page, async () => (await page.locator('#dock-problems [data-problem-field]').count()) >= 3)
+  const fields = await page.locator('#dock-problems [data-problem-field]').allInnerTexts()
+  check('字段写「模型接入」「成员「分析师」的模型接入」', fields.filter((t) => t.trim() === '模型接入').length === 2
+    && fields.some((t) => t.trim() === '成员「分析师」的模型接入'), fields.join(' | '))
+  check('……没有一处露出键名 provider', !(await page.locator('#dock-problems').innerText()).includes('provider'))
+  await shoot(page, 'problems-provider', page.locator('section[aria-label="问题"]'))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+await section('只写了模型、提供它的接入已停用：问题面板写「模型」，修复给「不指定模型」，预览不露键名', async () => {
+  const { page, state, errors } = await open({ id: 'pf-provmodel' })
+  await page.locator('.react-flow__pane').click({ position: { x: 30, y: 30 } })
+  await page.keyboard.press('Alt+KeyP')
+  await page.locator('#dock-problems').waitFor()
+  await waitFor(page, async () => (await page.locator('#dock-problems [data-problem-field]').count()) >= 2)
+  const fields = await page.locator('#dock-problems [data-problem-field]').allInnerTexts()
+  check('字段写「模型」「成员「分析师」的模型」（检索、成员的检查器里都没有模型这一栏）',
+    fields.some((t) => t.trim() === '模型') && fields.some((t) => t.trim() === '成员「分析师」的模型'), fields.join(' | '))
+  const panel = await page.locator('#dock-problems').innerText()
+  check('……说清是哪个模型、哪个接入停用了，没有一处露出键名 model', panel.includes('「检索」（知识检索）指定的模型「tiny-1」所属的模型接入「demo-off」已停用')
+    && !/\bmodel\b/.test(panel), panel.slice(0, 160))
+  await shoot(page, 'problems-provider-model', page.locator('section[aria-label="问题"]'))
+
+  await openDialog(page)
+  const look = dialog(page).locator('[data-fix-choice="provider.disabled:look:model"]')
+  await look.waitFor()
+  const lookText = await look.innerText().catch(() => '')
+  check('修复：「不指定模型」写清执行时改用哪里，启用的接入写清换成它的哪个模型', lookText.includes('不指定模型')
+    && lookText.includes('去掉这一处指定的模型，执行时改用第一个可用的模型接入「demo-main」')
+    && lookText.includes('不提供模型「tiny-1」，将改用它的默认模型「big-model」') && !lookText.includes('demo-off'), lookText)
+  // 「不指定模型」的说明里也写着 demo-main：按选项文字开头认
+  await look.locator('label').filter({ hasText: /^demo-main/ }).click()
+  await look.locator('[data-fix-action="choice"]').click()
+  await dialog(page).locator('[data-fix-preview="ready"]').waitFor()
+  const lines = await dialog(page).locator('[data-fix-change]').allInnerTexts()
+  check('预览两行：写上接入、去掉模型，都写叫法', lines.length === 2 && /「检索」\s*·\s*模型接入：/.test(lines[0]) && lines[0].includes('demo-main')
+    && /「检索」\s*·\s*模型：\s*tiny-1/.test(lines[1]) && !lines.some((t) => /provider|model\b/.test(t)), lines.join(' | '))
+  await dialog(page).locator('[data-fix-apply]').click()
+  await waitFor(page, async () => state.patches.length === 1)
+  const saved = cfgOf(state.patches[0]?.graph, 'look')
+  check('应用：检索改用 demo-main、去掉停用接入的模型', saved?.provider === 'demo-main' && !('model' in (saved ?? {})), JSON.stringify(saved ?? {}))
+  await shoot(page, 'publish-provider-model', dialog(page))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+await section('点名的模型接入：在设置里删了接入，回到画布重新校验', async () => {
+  const { page, state, errors } = await open({ id: 'pf-provok' })
+  const providerIssues = () => page.evaluate(() => window.__studio.getState().issues
+    .filter((i) => String(i.code ?? '').startsWith('provider.')).map((i) => i.message))
+  await waitFor(page, async () => state.validates > 0)
+  check('起初点名的接入启用着：没有接入问题', (await providerIssues()).length === 0)
+  const before = state.validates
+  await page.locator('nav[aria-label="主导航"] a[href="/settings"]').click()
+  await page.locator('[data-provider="demo-main"]').waitFor()
+  await page.getByRole('button', { name: '删除模型接入 demo-main' }).click()
+  await page.getByRole('button', { name: '删除接入' }).click()
+  await waitFor(page, async () => state.deleted.length === 1)
+  await page.waitForTimeout(400)
+  await page.evaluate(() => history.back())
+  await waitFor(page, async () => (await providerIssues()).length > 0, 6000)
+  const said = await providerIssues()
+  check('回到画布：重新校验，查出「demo-main」不存在', state.validates > before && said.some((m) => m.includes('「demo-main」不存在')),
+    `${before} → ${state.validates} · ${said.join(' | ').slice(0, 100)}`)
+  // 接入表没再变：来回切页不重复校验
+  const settled = state.validates
+  await page.locator('nav[aria-label="主导航"] a[href="/settings"]').click()
+  await page.locator('[data-provider="demo-off"]').waitFor()
+  await page.evaluate(() => history.back())
+  await page.waitForFunction(() => window.location.pathname.startsWith('/studio/'))
+  await page.waitForTimeout(1200)
+  check('接入表没变：切回来不重复校验', state.validates === settled, `${settled} → ${state.validates}`)
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+await section('点名的模型接入：390px 下修复选项不伸出弹窗', async () => {
+  const { page } = await open({ id: 'pf-prov', width: 390, height: 820 })
+  await page.getByRole('button', { name: '更多操作' }).click()
+  await page.locator('[role="menu"][aria-label="更多操作"] [role^="menuitem"]', { hasText: '发布' }).click()
+  await dialog(page).waitFor()
+  await dialog(page).locator('[data-fix-choice^="provider."]').first().waitFor()
+  const m = await page.evaluate(() => {
+    const d = document.querySelector('[role="dialog"]')
+    const wide = [...d.querySelectorAll('*')].filter((el) => {
+      const b = el.getBoundingClientRect()
+      return b.width > 0 && (b.right > window.innerWidth + 0.5 || b.left < -0.5)
+    }).map((el) => el.tagName + (el.className ? `.${String(el.className).split(' ')[0]}` : ''))
+    const scrollers = [...d.querySelectorAll('*')].filter((el) => el.scrollWidth > el.clientWidth + 1
+      && !['visible', 'hidden', 'clip'].includes(getComputedStyle(el).overflowX)).length
+    return { wide: wide.slice(0, 4), scrollers, own: d.scrollWidth - d.clientWidth }
+  })
+  check('390px：几组接入选项和长标题都在弹窗里，没有横向滚动条', !m.wide.length && m.scrollers === 0 && m.own <= 0, JSON.stringify(m))
+  await shoot(page, 'publish-provider-390', page)
 })
 
 await section('360px 下不横向滚动', async () => {

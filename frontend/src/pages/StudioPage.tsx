@@ -78,6 +78,15 @@ function matches(e: KeyboardEvent, combo: string): boolean {
 /** 改图的快捷键。正式运行期间按了要说为什么没反应，不能安静地什么都不做 */
 const EDIT_SHORTCUTS = new Set<StudioShortcutId>(['undo', 'redo', 'paste', 'duplicate', 'layout'])
 
+/**
+ * 接入表的签名：只看校验用得上的（id、名称、启用与否）。画布校验会查节点点名的接入是不是不存在、已停用（后端
+ * engine/provider_refs.py），接入在设置里启用、停用、改名、删除之后，眼前的问题清单就过时了。记在模块里而不是
+ * 组件里：去设置页改完再回来，编排页是重新挂上的，要和离开前校验时的那份比
+ */
+let checkedProviders: string | null = null
+const providerSig = (providers: { id: string; name: string; enabled: boolean }[]) =>
+  providers.map((p) => `${p.id}\u0000${p.name}\u0000${p.enabled ? 1 : 0}`).join('\u0001')
+
 export function StudioPage() {
   const { workflowId } = useParams()
   const [params, setParams] = useSearchParams()
@@ -87,6 +96,8 @@ export function StudioPage() {
   const workflows = useCatalog((s) => s.workflows)
   const refresh = useCatalog((s) => s.refresh)
   const catalogLoaded = useCatalog((s) => s.loaded)
+  // 选签名（字符串）而不是整张表：目录每刷新一次表都是新数组，内容没变就不该重新校验
+  const providers = useCatalog((s) => providerSig(s.providers))
   const workflow = useStudio((s) => s.workflow)
   const dirty = useStudio((s) => s.dirty)
   // 只订阅数量，不订阅整个 nodes——后者每拖一下都会让整页重渲染
@@ -240,6 +251,15 @@ export function StudioPage() {
     // resolve 用一个 ref 记住正在解哪个 id，重复的直接让开
     resolve(workflowId)
   }, [workflowId, workflow, workflows, catalogLoaded, dirty, load, navigate, resolve, location.state])
+
+  // 接入表变了（在设置里启用、停用、改名、删除了接入）：画布上的问题清单可能已经过时，重新校验一次。
+  // 第一次拿到接入表时只记下来——打开画布本身就会校验，后端校验时读的是库里的接入表，不靠这里
+  useEffect(() => {
+    if (!catalogLoaded) return
+    const changed = checkedProviders !== null && checkedProviders !== providers
+    checkedProviders = providers
+    if (changed && useStudio.getState().nodes.length) void useStudio.getState().validate()
+  }, [providers, catalogLoaded])
 
   // 断开期间没取到的那张，连上之后再取一次。有未保存的改动就不动它
   useOnReconnect(() => {

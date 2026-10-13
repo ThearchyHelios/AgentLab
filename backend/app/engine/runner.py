@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
-from sqlalchemy import select, update
+from sqlalchemy import case, func, select, update
 
 from app.core.bus import bus
 from app.core.config import settings
@@ -23,6 +24,7 @@ from app.db.models import Approval, Run, RunEvent, Workflow
 from app.engine.approval import read_decision
 from app.engine.compiler import compile_graph, initial_state
 from app.engine.context import NodeError, RunContext
+from app.engine.deadline import segment
 from app.engine.replay import PROTOCOL, PROTOCOL_KEY, protocol_of
 from app.engine.schema import GraphSpec, NodeType, loop_steps, topology_of, validate_graph
 from app.tools.datasource import RUN_VERSIONS_KEY
@@ -32,6 +34,10 @@ logger = logging.getLogger(__name__)
 # 流式增量（正文 token、思考 delta）量太大，只做实时推送不落库；
 # 轨迹里正文靠 node.finished 的 preview，思考靠调用结束时的单条 llm.thinking 汇总
 _EPHEMERAL = {EventType.LLM_TOKEN, EventType.LLM_THINKING_DELTA}
+
+#: RunContext.extra 里放这次运行的选项（Run.options）的键。节点从这里读发起时定下的快照、不读设置的
+#: 当前值：审批停下期间改了设置，恢复后的那一段也按发起时的，重放和正式运行才可复现
+RUN_OPTIONS_KEY = "run_options"
 
 
 class RunManager:
@@ -61,6 +67,15 @@ class RunManager:
         # 一个 checkpoint 都没写过，"恢复"它只会从 START 用默认值重跑一遍，
         # 还丢掉 run.input——那不是恢复，是伪造一份结果。
         async with SessionLocal() as session:
+            # 先把落后于库里实际最后一条的 last_seq 改正（为什么会落后见 _seq_floor）。内存里的序号计数刚清零，
+            # 接下来各处都按 last_seq 接号：本模块的几处另外兜了底，按需裁判记判定（api/evidence.py 的
+            # _append_judged）没有，不改正的话它重启后第一次追加就撞上已有的序号。有 (run_id, seq) 索引，
+            # 每次运行一次索引查找。updated_at 不动：这是补记录，不是运行有了变化
+            latest = select(func.max(RunEvent.seq)).where(RunEvent.run_id == Run.id).scalar_subquery()
+            await session.execute(
+                update(Run).where(func.coalesce(Run.last_seq, 0) < latest)
+                .values(last_seq=latest, updated_at=Run.updated_at)
+                .execution_options(synchronize_session=False))
             stranded = list((await session.execute(
                 select(Run.id, Run.last_seq).where(Run.status == "running")
             )).all())
@@ -158,7 +173,7 @@ class RunManager:
         self, run_id: str, event_type: EventType | str, *, node_id: str | None = None,
         **data: Any,
     ) -> None:
-        """给 API 层用的事件入口（比如 formal 启动时记录口径升版处置）。"""
+        """给运行之外的代码往运行里记一条事件。发起时就定下的事件不走这里，交给 start 的 notes。"""
         await self._emit(run_id, event_type, node_id=node_id, data=data)
 
     # ---------------- 启动 ----------------
@@ -177,7 +192,16 @@ class RunManager:
         version_hash: str | None = None,
         started_by: str | None = None,
         approval_default: str | None = None,
+        options: dict[str, Any] | None = None,
+        schedule_id: str | None = None,
+        notes: Sequence[tuple[EventType | str, str | None, dict[str, Any]]] = (),
     ) -> Run:
+        """建运行记录、交给执行任务。options 是这次运行的选项快照，schedule_id 是发起它的定时任务（可空）。
+
+        notes 是发起时就定下的事件 (类型, node_id, 数据)，比如正式运行按什么级别出具、口径升版怎么处置。它们和
+        运行记录同一个事务提交，排在 run.started 前面：写不进去就不建运行，不会出现运行已经在执行、调用方却
+        只拿到一个异常（定时任务会把它记成未能发起）；也不会和执行抢先后，运行结束得快时落到封存之后。
+        """
         spec = GraphSpec.model_validate(graph)
         report = validate_graph(spec)
         if not report.ok:
@@ -187,6 +211,8 @@ class RunManager:
             )
         if approval_default is None:
             approval_default = await _approval_default(run_class=run_class)
+        # 拷一份：调用方手上的 dict 之后再改，不该改到这次运行的快照
+        options = copy.deepcopy(options) if options else {}
 
         async with SessionLocal() as session:
             from app.data.table_versions import pin_lock
@@ -214,11 +240,23 @@ class RunManager:
                     tool_trust=tool_trust,
                     agent_limits=agent_limits,
                     data_versions=data_versions,
+                    options=options,
+                    schedule_id=schedule_id,
                 )
                 run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
                 session.add(run)
+                staged: list[RunEventModel] = []
+                if notes:
+                    await session.flush()   # 事件要带上运行的 id
+                    staged = [self._event(run.id, kind, node_id=node_id, data=data)
+                              for kind, node_id, data in notes]
+                    for event in staged:
+                        await _stage(session, event, run)
                 await session.commit()
             await session.refresh(run)
+        # 先落库再广播，理由同 _emit；执行任务还没建，run.started 必定排在它们后面
+        for event in staged:
+            await bus.publish(event)
 
         self._tasks[run.id] = asyncio.create_task(
             self._drive(
@@ -232,6 +270,7 @@ class RunManager:
                 tool_trust=tool_trust,
                 agent_limits=agent_limits,
                 data_versions=data_versions,
+                options=options,
             )
         )
         return run
@@ -379,7 +418,7 @@ class RunManager:
                 .values(status="resolved")
             )
             run = await session.get(Run, run_id)
-            bus.set_seq(run_id, run.last_seq)
+            bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             await session.commit()
             await session.refresh(run)
 
@@ -479,7 +518,7 @@ class RunManager:
                               **({"graph": spec.model_dump(mode="json")} if graph is not None else {}),
                               **({"started_by": actor} if actor else {}))
             run = await session.get(Run, run_id)
-            bus.set_seq(run_id, run.last_seq)
+            bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             await session.commit()
             await session.refresh(run)
 
@@ -538,9 +577,14 @@ class RunManager:
             closed = await _close_approvals(session, run_id, actor, now)
             run = await session.get(Run, run_id)
             timing = await _timing(session, run, 0, now)
-            run.usage = {**(run.usage or {}), "duration_ms": timing["active_ms"], **timing}
+            usage = dict(run.usage or {})
+            # 停下时记的用量里还没有这次停在审批期间问的质询，这里补上（上次停下时计过的不再计）
+            inquiry = (await _usage_of_events(session, run_id)).get("inquiry")
+            if inquiry or usage.get("inquiry"):
+                usage = _with_inquiry(usage, inquiry)
+            run.usage = {**usage, "duration_ms": timing["active_ms"], **timing}
             run.error = "用户取消：等待审批时放弃了这次运行" if closed else "用户取消：挂起期间放弃了这次运行"
-            bus.set_seq(run_id, run.last_seq or 0)
+            bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             # 和状态同一个事务提交，理由同 _finalize
             event = self._event(run_id, EventType.RUN_CANCELLED, data={
                 "timing": timing, "actor": actor,
@@ -585,6 +629,7 @@ class RunManager:
         tool_trust: dict[str, str] | None = None,
         agent_limits: dict[str, Any] | None = None,
         data_versions: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
         resumed: list[str] | tuple[str, ...] = (),
         actors: dict[str, str | None] | None = None,
     ) -> None:
@@ -631,7 +676,10 @@ class RunManager:
                           # 运行记录里的那份，含运行中途第一次用到时补上的；None 是升级前的运行
                           "data_versions": data_versions,
                           # 这一段是按哪一版重放协议跑的，恢复时据此认出升级前做下的工作
-                          "replay_protocol": PROTOCOL},
+                          "replay_protocol": PROTOCOL,
+                          # 发起时定下的运行选项（核查设置之类），每一段都记、记的是同一份。没有选项的
+                          # 运行不带这个键，和加选项之前的 run.started 逐字相同
+                          **({"options": options} if options else {})},
                 )
 
                 run_ctx = RunContext(
@@ -648,7 +696,9 @@ class RunManager:
                     # 的 run_versions）。复制一份：运行中途补固定的源就地写进这个 dict，同一段执行里
                     # 后面的节点都看得到，但不该碰到别处（运行记录、事件）手上的那个对象
                     extra={"resumed": set(resumed), "actors": dict(actors or {}),
-                           RUN_VERSIONS_KEY: dict(data_versions) if data_versions is not None else None},
+                           RUN_VERSIONS_KEY: dict(data_versions) if data_versions is not None else None,
+                           # 同理也是一份拷贝：节点读它，不该改到运行记录那份
+                           RUN_OPTIONS_KEY: copy.deepcopy(options or {})},
                 )
                 app = compile_graph(spec, run_ctx).compile(checkpointer=self.checkpointer)
                 # 循环按自己声明的轮数另记一份预算，全局上限只管没人把关的环
@@ -665,7 +715,8 @@ class RunManager:
                 # 代码执行它——一个挂住的模型或工具能把运行和它占着的并发名额一直拖着。
                 # 按"这一段执行"计：等人工审批时 _drive 已经结束，那段时间不算。
                 deadline = asyncio.timeout(settings.max_run_seconds)
-                async with deadline:
+                # 截止时刻同时交给节点（engine/deadline.py）：核查节点据此在上限之内收尾，不把整次运行拖到被中止
+                async with deadline, segment(deadline.when(), settings.max_run_seconds):
                     async for mode, chunk in app.astream(
                         payload, config=config, stream_mode=["custom", "updates"]
                     ):
@@ -838,6 +889,7 @@ class RunManager:
             if run:
                 timing = await _timing(session, run, elapsed_ms, now)
                 events_usage = await _usage_of_events(session, run_id)
+                inquiry = events_usage.pop("inquiry", None)
                 if status != "succeeded":
                     # 状态里的用量只算跑完了的节点。失败、取消、停在审批上的那个节点已经
                     # 花出去的调用（校验修复、agent 的前几步）只在 llm.end 里——以前这部分
@@ -846,6 +898,9 @@ class RunManager:
                 elif events_usage.get("unpriced_calls"):
                     # 金额估不出来的调用只有 llm.end 数得出（状态里的用量只有金额，0 分不出是免费还是没价）
                     usage = {**usage, "unpriced_calls": events_usage["unpriced_calls"]}
+                if inquiry:
+                    # 审批质询不在图里执行，状态和 llm.end 两本账里都没有它：比完再加上
+                    usage = _with_inquiry(usage, inquiry)
                 # duration_ms 是各段执行时长之和（= active_ms）。以前用这一段的耗时
                 # 覆盖它：87 秒、中间等过一次审批的运行，列表上写着 22ms
                 usage.update(duration_ms=timing["active_ms"], **timing)
@@ -1025,6 +1080,8 @@ def _carried(run: Run) -> dict[str, Any]:
         "agent_limits": run.agent_limits,
         # 固定的数据版本照运行记录来，不重新读数据源的当前指针：中途重传过，续跑查的仍是发起时那一版
         "data_versions": run.data_versions,
+        # 运行选项同理：照发起时的快照，不重新读设置
+        "options": run.options or {},
     }
 
 
@@ -1062,11 +1119,12 @@ async def _data_versions(session: Any, spec: GraphSpec) -> dict[str, Any]:
 async def _bound_sources(session: Any, spec: GraphSpec) -> tuple[set[str], bool]:
     """图里（含子工作流）绑定的数据源工具指向的源名，以及有没有带模板、发起时定不下来的工具名。
 
-    绑定的取法和发起前检查同一个（api/runs.py 的 tool_bindings），子工作流照运行时的取法
+    绑定的取法和发起前检查同一个（engine/launch.py 的 tool_bindings），子工作流照运行时的取法
     读出来接着找：固定了版本的读那一版，没固定的读工作流现在的图。读不到、图不成形的跳过——
     那个节点运行时自己会报错。同一个工作流（同一版）只读一次，互相引用也不会转圈。
     """
-    from app.api.runs import node_setting, tool_bindings
+    # 在函数里导入：launch 在模块级导入了本模块（它要 run_manager）
+    from app.engine.launch import node_setting, tool_bindings
     from app.db.models import WorkflowVersion
     from app.tools.datasource import source_of_tool
 
@@ -1223,15 +1281,34 @@ async def _claim(
 
 
 async def _stage(session: Any, event: RunEventModel, run: Run | None = None) -> None:
-    """把一条事件写进这个 session，随它一起提交。run 已经在 session 里时直接改它的 last_seq。"""
-    session.add(RunEvent(run_id=event.run_id, seq=event.seq, type=str(event.type),
+    """把一条事件写进这个 session，随它一起提交。run 已经在 session 里时直接改它的 last_seq。
+
+    落库的 id 用事件自己的：广播出去的、交回给调用方的和库里的是同一个 id，回头按 id 找得到。
+    """
+    session.add(RunEvent(id=event.id, run_id=event.run_id, seq=event.seq, type=str(event.type),
                          node_id=event.node_id, ts=event.ts, data=event.data))
     if run is not None:
         run.last_seq = event.seq
     else:
+        # 只往大里改：另开会话记的事件（note）和执行任务同时在写时，取号和提交的先后可以不一样，号小的后提交，
+        # 无条件写会把 last_seq 写小（后果见 _seq_floor）
         await session.execute(
-            update(Run).where(Run.id == event.run_id).values(last_seq=event.seq)
+            update(Run).where(Run.id == event.run_id)
+            .values(last_seq=case((Run.last_seq > event.seq, Run.last_seq), else_=event.seq))
+            .execution_options(synchronize_session=False)
         )
+
+
+async def _seq_floor(session: Any, run_id: str, last_seq: int | None) -> int:
+    """接着一次运行往下编号的起点：last_seq 和库里实际最大的序号取大的。
+
+    last_seq 按说就是最后一条，但有的写入会把它写小：按需裁判记判定（api/evidence.py 的 _append_judged）
+    的条件更新不带 last_seq 条件，它取了号还没写、封存后追加（engine/run_append.py）抢先提交了，它再提交时
+    把 last_seq 写回自己那个更小的号。同一进程里序号计数只增不减，不碍事；进程重启后计数从 0 起，只按
+    last_seq 接号就会撞上已有的序号。清单按序号排序算哈希，撞了号封存核对就时对时不对。
+    """
+    stored = await session.scalar(select(func.max(RunEvent.seq)).where(RunEvent.run_id == run_id))
+    return max(last_seq or 0, stored or 0)
 
 
 async def _close_approvals(session: Any, run_id: str, actor: str | None, now: datetime) -> int:
@@ -1248,18 +1325,39 @@ async def _close_approvals(session: Any, run_id: str, actor: str | None, now: da
 
 
 _USAGE_KEYS = ("input_tokens", "output_tokens", "cost_usd", "calls")
+#: 审批质询的用量里计进运行用量的键：unpriced_calls 是其中金额估不出来的调用次数（模型不在价格目录里）
+_INQUIRY_KEYS = (*_USAGE_KEYS, "unpriced_calls")
 
 
 async def _usage_of_events(session: Any, run_id: str) -> dict[str, Any]:
-    """按 llm.end 事件逐次加总的用量：每次模型调用都有一条，不管节点最后成没成。"""
+    """按事件加总的用量。
+
+    llm.end 逐次加总：每次模型调用都有一条，不管节点最后成没成。审批质询不在图里执行、不发 llm.end，
+    它的用量写在 approval.inquiry 事件数据的 usage 里，单独加总放在 inquiry 下（没有质询就没有这个键）：
+    llm.end 这本账要和状态里的用量比大小（_spent），质询花的两本里都没有，混进去比会被状态那本盖掉。
+
+    封存之后追加的质询（数据带 post_seal）不算：运行用量是这次运行自己花的，结束时就定下了、写进了终态事件；
+    事后的批注另有自己的账，同按需裁判的判定。继续运行之后它落进新的封存范围，照样不算——不然同一条质询
+    计不计，全看之后有没有继续运行。
+    """
     rows = await session.execute(
-        select(RunEvent.data).where(RunEvent.run_id == run_id, RunEvent.type == EventType.LLM_END)
+        select(RunEvent.type, RunEvent.data).where(
+            RunEvent.run_id == run_id, RunEvent.type.in_([EventType.LLM_END, EventType.APPROVAL_INQUIRY]))
     )
     from app.providers.catalog import unpriced_call
 
     total: dict[str, Any] = dict.fromkeys(_USAGE_KEYS, 0)
     unpriced = 0
-    for (data,) in rows:
+    inquiry: dict[str, Any] = {}
+    for kind, data in rows:
+        if kind == EventType.APPROVAL_INQUIRY:
+            spent = (data or {}).get("usage")
+            if isinstance(spent, dict) and not (data or {}).get("post_seal"):
+                for key in _INQUIRY_KEYS:
+                    value = spent.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        inquiry[key] = inquiry.get(key, 0) + value
+            continue
         for key in _USAGE_KEYS:
             value = (data or {}).get(key, 1 if key == "calls" else 0)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1269,7 +1367,32 @@ async def _usage_of_events(session: Any, run_id: str) -> dict[str, Any]:
     if unpriced:
         # 有几次调用的金额估不出来（模型不在价格目录里）：cost_usd 只是估得出的那部分，界面据此不写 $0
         total["unpriced_calls"] = unpriced
+    if inquiry:
+        if "cost_usd" in inquiry:
+            inquiry["cost_usd"] = round(inquiry["cost_usd"], 6)
+        total["inquiry"] = inquiry
     return total
+
+
+def _with_inquiry(usage: dict[str, Any], inquiry: dict[str, Any] | None) -> dict[str, Any]:
+    """把审批质询的用量计进运行用量，明细另放在 inquiry 下（界面要说清其中多少是质询花的）。
+
+    usage 里已经计过一回的（上次停下时记下的 inquiry）先减掉再加：停过两次、两次都问过的运行，
+    每次质询只计一遍。
+    """
+    out = dict(usage)
+    counted = out.pop("inquiry", None) or {}
+    for key in _INQUIRY_KEYS:
+        delta = (inquiry or {}).get(key, 0) - counted.get(key, 0)
+        if delta:
+            out[key] = (out.get(key) or 0) + delta
+    if isinstance(out.get("cost_usd"), float):
+        out["cost_usd"] = round(out["cost_usd"], 6)
+    if "input_tokens" in out or "output_tokens" in out:
+        out["total_tokens"] = int(out.get("input_tokens") or 0) + int(out.get("output_tokens") or 0)
+    if inquiry:
+        out["inquiry"] = dict(inquiry)
+    return out
 
 
 def _spent(state_usage: dict[str, Any], events_usage: dict[str, Any]) -> dict[str, Any]:

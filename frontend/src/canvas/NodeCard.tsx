@@ -10,14 +10,16 @@ import { NODE_DEFS, sourceHandles } from './nodeDefs'
 import { DENSE_EXITS, NODE_WIDTH } from './routing'
 import { LiveClock, stillClock, TeamMatrix, teamBrief, type TeamEnding } from './TeamMatrix'
 import { edgeKey, topology } from '../run/derive'
-import { exhaustedOf } from '../run/decode'
+import { exhaustedOf, splitIssuanceGaps } from '../run/decode'
 import { api } from '../api/client'
 import { isComposing, StatusBadge, toast } from '../components/ui'
 import { claimCountsOf, matchedSource } from '../lib/evidence'
 import { explainRunError } from '../lib/explain'
 import { formatDuration, formatLapse, formatNumber, formatTokens, NONE, shortId } from '../lib/format'
 import { statusMeta } from '../lib/status'
-import { claimTally, issuanceLabel, reportStampText, RUN_CLASS_LABEL, UPGRADE_POLICY_LABEL } from '../lib/terms'
+import {
+  CHALLENGE_TEXT, claimTally, DUAL_CHECK_TEXT, issuanceLabel, reportStampText, RUN_CLASS_LABEL, UPGRADE_POLICY_LABEL,
+} from '../lib/terms'
 import { useReportStamp, type ReportStamp } from './reportStamp'
 import { ApprovalCard } from '../run/RunPanel'
 import type { NodeState, NodeTrace } from '../run/trace'
@@ -92,6 +94,9 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       return first(config.expression, config.template) || '未配置'
     case 'subgraph':
       return config.workflow_id ? '嵌套工作流' : '未选择工作流'
+    // 还是占位的两种：卡片上直接说尚未生效，免得以为放上去就会执行
+    case 'challenge':
+      return CHALLENGE_TEXT.summary(config)
     default:
       return ''
   }
@@ -761,10 +766,13 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const reportStamp = useReportStamp(id, type === 'report')
   // 只有排队中的卡片要知道自己有几路上游，别的卡片不必为改图重跑这一趟
   const fanIn = useStudio((s) => (state === 'queued' ? fanInOf(s.nodes, s.edges)[id] ?? 0 : 0))
+  // 节点定义给了摘要钩子（摘要要提到别的节点：双盲复算复算的是哪张口径卡）就用它，没给照旧走 summarize。
+  // 选择器只返回字符串：别的节点改了、这一句没变，卡片就不重渲染
+  const hookedSummary = useStudio((s) => def?.summary?.({ id, config: data.config ?? {}, nodes: s.nodes, edges: s.edges }) ?? '')
 
   const Icon = def?.icon ?? Sparkles
   const handles = sourceHandles(type, data.config)
-  const summary = summarize(type, data.config)
+  const summary = hookedSummary || summarize(type, data.config)
   const meta = statusMeta(state)
   // 循环容器在两轮之间也是 running，但在跑的是循环体：不转圈、不挂光弧。
   // 回放时取游标那一刻的（航迹上的 looping 是最后的值）
@@ -890,10 +898,14 @@ function NodeCardImpl({ id, data, selected, isConnectable }: NodeProps<FlowNode>
   const tier = view.at != null && issuedAt != null && view.at < issuedAt ? undefined : issuance?.tier
   const tierClass = tier === 'formal' ? 'is-formal' : tier === 'degraded' ? 'is-degraded' : tier === 'withheld' ? 'is-withheld' : ''
   const detail = issuanceDetail?.tier ? issuanceDetail : undefined
-  const gaps: string[] = Array.isArray(detail?.gaps) ? detail.gaps.map(String) : []
+  // 双盲复算、反方审稿报上来的缺口和「校验没跑全」分开说，再分查出了问题（两路不一致、结论被推翻）和没核成（无法复算）
+  const { failed: verifyFailed, unfinished: verifyUnfinished, other: gaps } =
+    splitIssuanceGaps(Array.isArray(detail?.gaps) ? detail.gaps.map(String) : [])
   const stampTitle = tier ? [
     `出具判定：${issuanceLabel(tier)}`,
     detail ? `可追溯 ${detail.matched_numbers ?? 0} 个数字 / 核对 ${detail.metrics_checked ?? 0} 个指标` : '',
+    verifyFailed.length ? `${DUAL_CHECK_TEXT.verifyGaps.failed}：${verifyFailed.join('；')}` : '',
+    verifyUnfinished.length ? `${DUAL_CHECK_TEXT.verifyGaps.unfinished}：${verifyUnfinished.join('；')}` : '',
     // 降档常常不是数字对不上，而是校验根本没跑全（叙述模板渲染为空、指标集为空）：
     // 不写出来，悬停在一个「降档出具」上看不到任何理由
     gaps.length ? `校验未全部完成：${gaps.join('；')}` : '',
