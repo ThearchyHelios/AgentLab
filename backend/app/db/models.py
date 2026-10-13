@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
-    Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint,
+    Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -346,6 +346,76 @@ class CatalogNote(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1)
     # 最近一次写入的署名（请求头 X-Actor，自报、未认证）；助手起草时可为空
     updated_by: Mapped[str | None] = mapped_column(String(100), default=None)
+
+
+class CatalogDraftJob(Base, TimestampMixin):
+    """数据目录的一次后台起草任务（data/catalog_jobs.py）。逐表的状态在 catalog_draft_tasks。
+
+    以前起草是一次同步长请求，出错整个对话框就停、关掉之后没有任何记录哪些表失败、为什么；现在建任务后在后台起草，
+    进度（每张表到第几段、计数、用量）随时落库，接口读的是库里的状态。
+
+    同一个数据源同时只有一个排队或进行中的任务：接口先查一遍，部分唯一索引兜底（两个请求同时建，后提交的撞上）。
+    服务重启时还没结束的标成 interrupted，不自动续跑。挂外键、级联删除：任务是数据源的附属记录，源删掉了留着没有意义。
+    """
+
+    __tablename__ = "catalog_draft_jobs"
+    __table_args__ = (
+        Index("ix_catalog_draft_jobs_source_created", "source_id", "created_at"),
+        Index("ux_catalog_draft_jobs_active", "source_id", unique=True,
+              sqlite_where=text("status IN ('queued', 'running')")),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    source_id: Mapped[str] = mapped_column(ForeignKey("data_sources.id", ondelete="CASCADE"))
+    # queued | running | succeeded | partial | failed | cancelled | interrupted
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    use_model: Mapped[bool] = mapped_column(default=False)
+    # 实际用的模型 id（用模型时开始起草后写上）
+    model: Mapped[str | None] = mapped_column(String(200), default=None)
+    # 建任务时的快照：数据源级的起草要求、这一次的补充说明
+    guidance: Mapped[str | None] = mapped_column(Text, default=None)
+    note: Mapped[str | None] = mapped_column(Text, default=None)
+    # 请求头 X-Actor 的署名（自报、未认证）
+    created_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    # 用量：调用次数、输入和输出 token（拿不到用量的调用按 0 算）
+    calls: Mapped[int] = mapped_column(Integer, default=0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # 任务整体出错的原因（逐表的原因在 catalog_draft_tasks）
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    # 重试建的任务记下是重试哪一个
+    retry_of: Mapped[str | None] = mapped_column(String(32), default=None)
+
+
+class CatalogDraftTask(Base):
+    """起草任务里的一张表。按 seq（起草顺序）排。状态：pending 排队、running 起草中、ok、partial 模型只写出一部分、
+    failed、skipped 表结构里没有、cancelled（停止或服务重启）。"""
+
+    __tablename__ = "catalog_draft_tasks"
+    __table_args__ = (UniqueConstraint("job_id", "seq"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    job_id: Mapped[str] = mapped_column(ForeignKey("catalog_draft_jobs.id", ondelete="CASCADE"), index=True)
+    seq: Mapped[int] = mapped_column(Integer)
+    # 表结构里的键；表结构里没有的（skipped）是请求里的原样名字
+    table_name: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    column_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 模型分几段起草（不用模型时为 NULL）、已经结束了几段
+    parts_total: Mapped[int | None] = mapped_column(Integer, default=None)
+    parts_done: Mapped[int] = mapped_column(Integer, default=0)
+    added: Mapped[int] = mapped_column(Integer, default=0)
+    updated: Mapped[int] = mapped_column(Integer, default=0)
+    removed: Mapped[int] = mapped_column(Integer, default=0)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    model_items: Mapped[int | None] = mapped_column(Integer, default=None)
+    # error：整张表没起草（表结构里没有、写入一直冲突、服务重启中断）；model_error：模型那部分没写出来的原因和办法
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    model_error: Mapped[str | None] = mapped_column(Text, default=None)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
 
 
 class Setting(Base, TimestampMixin):

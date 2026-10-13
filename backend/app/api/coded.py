@@ -19,6 +19,11 @@ DATASOURCE_INACTIVE = "datasource_inactive"
 SCHEMA_MISSING = "schema_missing"
 PROFILE_BUSY = "profile_busy"
 SNAPSHOT_TAMPERED = "snapshot_tampered"
+#: 数据目录的后台起草任务（api/catalog.py 的 /catalog/draft-jobs）：同一个源已有排队或进行中的任务（409，界面改去
+#: GET /draft-jobs/active 显示那一个）、起草模型用不了（409，不建任务）、要停止的任务已经结束了（409）
+CATALOG_DRAFT_BUSY = "catalog_draft_busy"
+CATALOG_DRAFT_MODEL_UNAVAILABLE = "catalog_draft_model_unavailable"
+CATALOG_DRAFT_FINISHED = "catalog_draft_finished"
 
 
 class CodedHTTPException(HTTPException):
