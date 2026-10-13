@@ -6,7 +6,8 @@
 必须人工确认之后才能启用。每月重传按已确认的配方重放，不再调用模型。
 
 **为什么不用 get_chat_model。** 它在没有接入时会静默退回演示模型；拿演示模型起草等于假装起草了。这里
-自己按助手的模型设置解析接入，没有、停用、只有演示接入、缺 key 都在调用模型之前判定为不可用。
+自己解析接入（取值顺序和数据目录起草共用 data/draft_model.py：设置里的起草模型 > 助手的模型 > 默认接入），
+没有、停用、只有演示接入、缺 key 都在调用模型之前判定为不可用。
 
 **调用参数照 c837cdb 修过的问题来**：关思考（thinking="off"）、额度 32768、服务方嫌额度大时退回 8192；
 正文一律经 message_text 抽取（回复可能是块列表）；输出被截断单独记一种失败，不当成「不是 JSON」去修订。
@@ -42,6 +43,7 @@ from app.data.recipe_types import (
     GridCell,
     Recipe,
 )
+from app.data.draft_model import COPILOT_SETTING_KEY as _DRAFT_COPILOT_KEY
 from app.data.tabular import EXCEL_ERRORS
 from app.data.xlsx_scan import WorkbookScan, cell_ref, col_letter
 
@@ -58,8 +60,9 @@ class AiTooLarge(ValueError):
 
 # 没有 AiFailed：调用之后的任何失败都体现在返回值里（draft=None、error、usage 照记）
 
-#: 助手的模型设置键（与 app/api/copilot.py 的 COPILOT_SETTING_KEY 同值；数据层不导入接口层，测试断言两者相等）
-COPILOT_SETTING_KEY = "copilot"
+#: 助手的模型设置键（与 app/api/copilot.py 的 COPILOT_SETTING_KEY 同值；数据层不导入接口层，测试断言两者相等）。
+#: 取模型时由 data/draft_model.py 读，这里留着这个名字给测试和老代码用
+COPILOT_SETTING_KEY = _DRAFT_COPILOT_KEY
 #: 1 次起草 + 最多 2 次修订
 AI_MAX_ATTEMPTS = 3
 #: 单次调用的超时（秒）；测试 monkeypatch 调小
@@ -252,37 +255,27 @@ class _BudgetFallback:
         return await self.model.ainvoke(messages)
 
 
-def _unconfigured(e: BaseException) -> str:
-    """和 copilot._unconfigured 同一句（providers/factory.assistant_unavailable）。"""
-    from app.providers.factory import assistant_unavailable
-
-    return assistant_unavailable(e)
-
-
 async def resolve_draft_model(session: AsyncSession) -> tuple[Any | None, str, AiAvailability]:
-    """(可调用的模型, 模型 id, 可用性)；不可用时模型为 None。只建模型对象，不发请求。"""
-    from app.db.models import Setting
-    from app.providers.factory import ModelSpec, ProviderNotConfigured, build_chat_model, resolve_provider
+    """(可调用的模型, 模型 id, 可用性)；不可用时模型为 None。只建模型对象，不发请求。
 
-    row = await session.get(Setting, COPILOT_SETTING_KEY)
-    saved = (row.value if row else None) or {}
-    spec = ModelSpec(provider=saved.get("provider") or None, model=saved.get("model") or None,
-                     max_tokens=AI_MAX_TOKENS, temperature=0, thinking="off")
+    用哪个接入、哪个模型和数据目录起草共用一处取值（data/draft_model.py：起草模型 > 助手的模型 > 默认接入）；
+    额度、关思考照旧是这里自己的。"""
+    from app.data.draft_model import DraftModelUnavailable, draft_unavailable, resolve_draft_provider
+    from app.providers.factory import ModelSpec, ProviderNotConfigured, build_chat_model
+
     try:
-        provider = await resolve_provider(session, spec.provider, spec.model)
-    except ProviderNotConfigured as e:
-        # 存的接入名不存在、已停用，只存了模型名、提供它的接入已停用：resolve_provider 都会报出来
-        return None, "", AiAvailability(False, reason=_unconfigured(e))
-    if provider is None:
-        return None, "", AiAvailability(False, reason="未配置模型接入，无法使用 AI 起草。请到「设置 → 模型接入」添加")
-    if provider.kind == "mock":
-        return None, "", AiAvailability(False, reason="当前只有演示用的模型接入，无法用于 AI 起草。"
-                                                      "请到「设置 → 模型接入」添加真实的模型接入")
+        provider, choice = await resolve_draft_provider(
+            session, none_reason="未配置模型接入，无法使用 AI 起草。请到「设置 → 模型接入」添加",
+            mock_reason="当前只有演示用的模型接入，无法用于 AI 起草。请到「设置 → 模型接入」添加真实的模型接入")
+    except DraftModelUnavailable as e:
+        return None, "", AiAvailability(False, reason=str(e))
+    spec = ModelSpec(provider=choice.provider, model=choice.model, max_tokens=AI_MAX_TOKENS, temperature=0,
+                     thinking="off")
     try:
         big = build_chat_model(provider, spec)
         small = build_chat_model(provider, spec.model_copy(update={"max_tokens": AI_FALLBACK_MAX_TOKENS}))
     except ProviderNotConfigured as e:
-        return None, "", AiAvailability(False, reason=_unconfigured(e))
+        return None, "", AiAvailability(False, reason=draft_unavailable(e, choice.origin))
     model_id = spec.model or provider.default_model or ""
     return (_BudgetFallback(big, small, model_id), model_id,
             AiAvailability(True, model=model_id, provider=provider.name))

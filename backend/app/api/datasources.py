@@ -27,8 +27,8 @@ from app.data.catalog_profile import profile_settings_rejection
 from app.data import introspect as introspect_mod
 from app.data import table_versions
 from app.data.engine import (
-    MASK_COLUMNS_OPTION, MAX_QUERY_TIMEOUT_S, QUERY_TIMEOUT_OPTION, SUPPORTED_KINDS, SnapshotTampered, build_url,
-    engine_args, engines, mask_columns_problem, query_timeout_problem,
+    CATALOG_DRAFT_GUIDANCE_OPTION, MASK_COLUMNS_OPTION, MAX_QUERY_TIMEOUT_S, QUERY_TIMEOUT_OPTION, SUPPORTED_KINDS,
+    SnapshotTampered, build_url, engine_args, engines, mask_columns_problem, query_timeout_problem,
 )
 from app.db.base import get_session, new_id
 from app.db.models import DataSource, ImportStaging, SourceSnapshot, TableImport, TableRecipe
@@ -124,6 +124,22 @@ def _import_mode(row: DataSource) -> str | None:
     return "simple" if _is_upload(row) else None
 
 
+#: options 里由别的接口维护的项：数据源表单不显示、不提交它们，整份回写 options 时原样留着（同模型接入 extra 里的
+#: last_check）。数据目录的起草要求只经 PUT /catalog/guidance 改（api/catalog.py）：表单把认不得的项放进「高级参数」
+#: 的单行输入框，多行的要求会被压成一行
+_MANAGED_OPTIONS = (CATALOG_DRAFT_GUIDANCE_OPTION,)
+
+
+def _shown_options(options: dict[str, Any] | None) -> dict[str, Any]:
+    return {k: v for k, v in (options or {}).items() if k not in _MANAGED_OPTIONS}
+
+
+def _with_managed(options: dict[str, Any], saved: dict[str, Any] | None) -> dict[str, Any]:
+    """表单提交的 options + 存着的、由别的接口维护的项（提交里带了也不认）。"""
+    kept = {k: v for k, v in (saved or {}).items() if k in _MANAGED_OPTIONS}
+    return {**_shown_options(options), **kept}
+
+
 def _to_out(row: DataSource, snapshot: dict[str, Any] | None = None,
             recipe_info: dict[str, Any] | None = None) -> DataSourceOut:
     cache = row.schema_cache or {}
@@ -137,7 +153,7 @@ def _to_out(row: DataSource, snapshot: dict[str, Any] | None = None,
         schema_error=str(cache.get("error") or "") if cache.get("failed") else "",
         available_schemas=list(cache.get("available_schemas") or []),
         id=row.id, name=row.name, kind=row.kind, host=row.host, port=row.port,
-        database=row.database, username=row.username, options=row.options or {},
+        database=row.database, username=row.username, options=_shown_options(row.options),
         readonly=row.readonly, description=row.description, enabled=row.enabled,
         password_masked=mask(row.password),
         has_password=bool(row.password),
@@ -429,7 +445,8 @@ async def create_source(
     _refuse_reserved(payload.kind, payload.database)
 
     row = DataSource(
-        **payload.model_dump(exclude={"password"}),
+        **payload.model_dump(exclude={"password", "options"}),
+        options=_with_managed(payload.options, None),
         password=encrypt(payload.password),
     )
     _settle_oracle(row, None, None)
@@ -472,6 +489,7 @@ async def update_source(
         raise HTTPException(422, _UPLOAD_DIR_READONLY)
     if "options" in data:
         _refuse_bad_options(data["options"])
+        data["options"] = _with_managed(data["options"] or {}, row.options)
     if "password" in data:
         # 空串表示清空，非空表示换新的
         data["password"] = encrypt(data["password"]) if data["password"] else None
