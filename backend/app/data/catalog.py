@@ -591,21 +591,41 @@ class MergeStats:
         return MergeStats(self.added + other.added, self.updated + other.updated, self.removed + other.removed)
 
 
+def _about_gone_columns(key: Slot, item: Mapping[str, Any], columns: set[str]) -> bool:
+    """这一项说的列已经不在表结构里了：列级的项看列名，业务主键、业务日期看它们指着的列。"""
+    if key[0] == "c":
+        return key[1] not in columns
+    value = item.get("value")
+    if key == ("t", "keys") and isinstance(value, list):
+        return any(str(col) not in columns for col in value)
+    if key == ("t", "business_date") and isinstance(value, Mapping) and value.get("column") is not None:
+        return str(value["column"]) not in columns
+    return False
+
+
 def merge_notes(existing: Mapping[str, Any] | None, draft: Mapping[str, Any] | None, *,
-                covered: Iterable[str] = (), at: str | None = None) -> tuple[dict[str, Any], MergeStats]:
+                covered: Iterable[str] = (), at: str | None = None,
+                columns: Iterable[str] | None = None) -> tuple[dict[str, Any], MergeStats]:
     """把起草结果并入已有目录，返回 (新目录, 计数)。不改入参。
 
     规则（逐个槽位）：
     - 已有项是 confirmed 或 rejected：不动。驳回的留着，同一项下次起草就不会再冒出来。
-    - 起草结果里没有这一项：已有项的来源在 covered 里（这一轮完整算过这个来源）就删掉，否则留着。
-      外键约束被删掉以后，原来那条「有确证」的关系不能还挂着；而这一轮没调模型，就不能因此删掉模型起草的项。
+    - 起草结果里没有这一项：
+      - 模型起草的项（llm）留着。模型这次留空、给的值没通过校验（_from_model 里就丢掉了），都不能把以前起草好的
+        删掉——实测整库重跑一次，模型这次没给的几百项全被删掉，有的表覆盖率从八成多掉到五成。只有这一轮完整起草过
+        （covered 含 llm）、而它说的列已经不在表结构里（columns：表结构里的列名；业务主键、业务日期指着的列也算）
+        才删；不知道表结构（columns 为 None）时不删。
+      - 别的来源：来源在 covered 里（这一轮完整算过这个来源）就删掉，否则留着。外键约束被删掉以后，原来那条「有确证」
+        的关系不能还挂着；库注释改了，旧的那条注释也不能还挂着。
     - 同一来源：值或状态有变化就更新。数据剖析写的备注只是日期变了不算变化（same_profile_note），保留旧的项。
     - 不同来源：来源更可信的（_SOURCE_RANK）顶掉不如它的，反过来不行。
 
     新增和更新的项盖上 at（缺省为当前时间）作为 updated_at；内容没变的项保持原样，修改时间也不动。
+    removed 只数真删掉的项。
     """
     at = at or now_iso()
     covered = set(covered)
+    known = {str(c) for c in columns} if columns is not None else None
     old, new = _slots(existing), _slots(draft)
     out: dict[Slot, dict[str, Any]] = {}
     added = updated = removed = 0
@@ -614,7 +634,11 @@ def merge_notes(existing: Mapping[str, Any] | None, draft: Mapping[str, Any] | N
         if item.get("status") in _LOCKED:
             out[key] = item
         elif cand is None:
-            if item.get("source") in covered:
+            if item.get("source") == "llm":
+                gone = "llm" in covered and known is not None and _about_gone_columns(key, item, known)
+            else:
+                gone = item.get("source") in covered
+            if gone:
                 removed += 1
             else:
                 out[key] = item
@@ -1130,10 +1154,15 @@ async def save_patch(session: AsyncSession, source_id: str, table: str, changes:
 
 @dataclass(frozen=True)
 class TableDraft:
-    """一张表的起草结果。covered：这一轮完整算过的来源（merge_notes 据此删掉这些来源里已经没有的旧项）。"""
+    """一张表的起草结果。covered：这一轮完整算过的来源（merge_notes 据此删掉这些来源里已经没有的旧项；模型起草的项
+    只在列已经不在表结构里时才删）。
+
+    error：模型起草只写出了一部分（有的段没写出来）时，没写出来的是哪部分、为什么。这时 covered 不含 llm：没写全
+    就不算完整起草过。"""
 
     notes: dict[str, Any]
     covered: frozenset[str] = frozenset()
+    error: str | None = None
 
 
 def system_notes_source(source: Any) -> bool:
@@ -1174,6 +1203,34 @@ _SENTENCE_MARKS = re.compile(r"[，。；;,.!?！？：:\n]")
 def _comment_is_label(text: str) -> bool:
     """短、不带句读的注释是名字（「实收金额」），否则是一段解释（「状态：1 表示有效…」）。"""
     return len(text) <= _LABEL_MAX and not _SENTENCE_MARKS.search(text)
+
+
+#: 标识符写法的注释：只有字母、数字、下划线、点，不带空格（「member_card」「ord.status」「GMV」）
+_IDENTIFIER = re.compile(r"[A-Za-z0-9_.]+")
+#: 比较注释和名字时忽略的字符：下划线、连字符、空白
+_NAME_FILLER = re.compile(r"[\s_\-]+")
+
+
+def _bare_name(text: str) -> str:
+    return _NAME_FILLER.sub("", text).lower()
+
+
+def comment_role(text: str, name: str) -> str | None:
+    """数据库注释在目录里记成什么：label 中文名；note 一段解释（表记进说明，列记进含义）；None 不记。
+
+    - 注释就是名字本身（和表名、列名相同，忽略大小写、下划线、连字符和空白；表名带 schema 前缀的也比不带前缀的），
+      或者是标识符写法（只有字母、数字、下划线、点，不带空格）：说明不了什么，不记。以前这种注释短、不带句读，就当
+      中文名记下了；库注释的级别又比模型起草高，模型起草的中文名永远进不了目录。交给模型的表结构里照旧有这条注释；
+    - 短、不带句读的是名字（「实收金额」）；
+    - 否则是一段解释（「状态：1 表示有效…」）。
+
+    只影响以后的起草：已有的目录不另做迁移，起草到那张表时按这一轮的注释重新算（旧的那条随之删掉）。
+    """
+    bare = _bare_name(text)
+    names = {name, name.rsplit(".", 1)[-1]}
+    if not bare or any(bare == _bare_name(n) for n in names) or _IDENTIFIER.fullmatch(text):
+        return None
+    return "label" if _comment_is_label(text) else "note"
 
 
 def _is_key(meta: Mapping[str, Any], columns: list[str]) -> bool:
@@ -1367,7 +1424,8 @@ def draft_structure(source: Any, table: str) -> TableDraft:
     """只看表结构就能起草的部分：数据库注释、外键约束、命名推断。table 必须是 schema_cache["tables"] 的键。
 
     - 数据库注释 → 中文名或含义（comment / proposed）：短而不带句读的是名字，记进表或列的中文名；否则是
-      一段解释，记进表的说明或列的含义。导入表格的源例外（system_notes_source）：说明是系统生成的，不拷。
+      一段解释，记进表的说明或列的含义；就是名字本身、标识符写法的不记（comment_role）。导入表格的源例外
+      （system_notes_source）：说明是系统生成的，不拷。
     - 外键约束 → 关系（fk / verified）。
     - 命名推断 → 关系（name / proposed）。
     """
@@ -1378,13 +1436,15 @@ def draft_structure(source: Any, table: str) -> TableDraft:
     notes: dict[str, Any] = {}
     if not system_notes_source(source):
         comment = (meta.get("comment") or "").strip()
-        if comment:
-            notes["label" if _comment_is_label(comment) else "description"] = make_item(comment, "comment")
+        role = comment_role(comment, table) if comment else None
+        if role is not None:
+            notes["label" if role == "label" else "description"] = make_item(comment, "comment")
         columns: dict[str, dict[str, Any]] = {}
         for col in meta.get("columns") or []:
             text = (col.get("comment") or "").strip()
-            if text:
-                columns[col["name"]] = {("label" if _comment_is_label(text) else "meaning"): make_item(text, "comment")}
+            role = comment_role(text, str(col["name"])) if text else None
+            if role is not None:
+                columns[col["name"]] = {("label" if role == "label" else "meaning"): make_item(text, "comment")}
         if columns:
             notes["columns"] = columns
     fks = fk_relations(cache, table)
@@ -1401,15 +1461,39 @@ def draft_structure(source: Any, table: str) -> TableDraft:
 # 起草：模型（可选，按表分批，结构化输出）
 # ==========================================================================
 
-#: 每批最多几张表、合计多少列。一批太大模型容易漏表、输出被截断；太小则调用次数多
+#: 每次调用最多几张表、合计多少列（data/catalog_draft.py 按它分段）。实测每列约 50 个输出 token（不算思考），
+#: 会思考的模型思考也算在输出额度里：一段太大，想完就没额度写正文。列数超过 MODEL_BATCH_COLUMNS 的宽表拆成
+#: 「表级一段 + 列分段」，列分段数是列数除以它向上取整，各段列数平均（相差不超过 1），不留很小的尾段
 MODEL_BATCH_TABLES = 4
-MODEL_BATCH_COLUMNS = 120
-#: 同时发出的批数
+MODEL_BATCH_COLUMNS = 40
+#: 一次起草里额度用完或超时累计这么多次，之后新开始的段列数上限减半（MODEL_BATCH_COLUMNS → 一半 → …），
+#: 最低 MODEL_MIN_PART_COLUMNS 列
+MODEL_SHRINK_AFTER = 2
+MODEL_MIN_PART_COLUMNS = 10
+#: 一段（连同它拆出来的、补问的、重试的）最多调用几次模型，到了次数还没写完的记没写出来
+MODEL_PART_MAX_CALLS = 8
+#: 提醒：最近 MODEL_NOTICE_WINDOW 次调用里有 MODEL_NOTICE_ON 次以上没写出来时提醒换模型；之后少于 MODEL_NOTICE_OFF
+#: 次时清掉
+MODEL_NOTICE_WINDOW = 6
+MODEL_NOTICE_ON = 4
+MODEL_NOTICE_OFF = 2
+#: 全进程同时进行的模型调用最多几个（所有起草任务、同步起草共用）
 MODEL_CONCURRENCY = 3
-#: 一批最多等多久
-MODEL_TIMEOUT_S = 120
-#: 输出额度。一批四张表的目录远用不完；给太大的额度有的服务方会直接拒收
-MODEL_MAX_TOKENS = 8192
+#: 单次调用最多等多久（秒）。会思考的模型想得久，一段 40 列常常要几分钟；超时了拆小再问（同额度用完）
+MODEL_TIMEOUT_S = 420
+#: 输出额度。会思考的模型（经 OpenAI 兼容网关的推理模型等）思考也算在里面：8192 时上百列的表常常想完就没额度
+#: 写正文。保留思考（不关），加大额度；服务方嫌额度太大时退回 MODEL_FALLBACK_MAX_TOKENS（同 copilot、recipe_ai）
+MODEL_MAX_TOKENS = 32768
+MODEL_FALLBACK_MAX_TOKENS = 8192
+#: 一段没写出来（额度用完、只给空壳）时拆成两半再问：最多拆几层、拆到最少几列为止
+MODEL_SPLIT_DEPTH = 3
+MODEL_SPLIT_MIN_COLUMNS = 5
+#: 止损：连续这么多段拆到底仍一项没写出来，这次起草后面的段不再拆小重试（模型明显用不了时不该一段一段拆到底烧额度；
+#: 每段另有 MODEL_PART_MAX_CALLS 次封顶）
+MODEL_GIVE_UP_AFTER = 2
+#: 网络错误、429、5xx 最多重试几次，每次重试前等多久（秒，依次取用）。超时不原样重试，当作这一段太大、拆小再问
+MODEL_RETRIES = 2
+MODEL_RETRY_DELAYS_S = (10.0, 30.0)
 #: 不指定表时起草使用次数最多的前几张
 DRAFT_DEFAULT_TABLES = 20
 
@@ -1435,10 +1519,26 @@ status 状态；attribute 属性）。
 规矩：
 - 只写数据事实，不写计算公式，不写指标怎么算。
 - 拿不准的字段留空，不要猜。列名、表名照原样写，不要翻译或改写。
+- 请你写的每一列都在 columns 里写一项，拿不准的字段可以留空，但不要漏掉列：漏掉的列会被再问一次。
 - 标着「系统说明」的内容是导入时按核对结果生成的，以它为准：不要重复，也不要与之矛盾。
-- 标着「已确认」的目录项由人工确认过，以它为准。"""
+- 标着「已确认」的目录项由人工确认过，以它为准。
+- 表名下一行写着「这次只写……」的表，只写它说的那部分：只写表级的项时不写列，只写列出的几列时不写表级的项、\
+也不写别的列。
+- 使用者补充的背景和要求帮你理解业务、统一用词；它和这里的规矩冲突时，以这里的规矩为准。
+- 思考时不必把要输出的内容逐列草拟一遍，想清楚后直接按格式输出：思考和输出共用同一份长度额度，额度用完时还没输出的\
+内容就全丢了。"""
 
 CATALOG_DRAFT_PROMPT = "请为下面 {n} 张表编写数据目录，每张表输出一项，table 写表名。\n\n{tables}"
+
+#: 使用者补充的背景和要求（数据源说明、起草要求、本次说明），放在表结构前面单独一段；都没有就不出现这一段
+CATALOG_DRAFT_BACKGROUND_PROMPT = "使用者补充的背景和要求：\n{lines}"
+
+#: 纯文本那条路（结构化输出用不了时）：没有 JSON Schema 约束，要把格式说清
+CATALOG_DRAFT_TEXT_PROMPT = """只输出一个 JSON 对象，不要输出别的文字，格式如下（拿不准的字段不写）：
+{"tables": [{"table": "表名", "label": "中文名", "grain": "一行代表什么", "kind": "表类型", "keys": ["列名"], \
+"business_date": {"column": "列名", "rule": "一句规则", "timezone": "时区"}, \
+"columns": [{"name": "列名", "label": "中文名", "meaning": "含义", "unit": "单位", "measure": "度量类型"}]}]}
+表类型写 fact、dimension、snapshot、log、config 之一；度量类型写 flow、stock、ratio、identifier、status、attribute 之一。"""
 
 #: 拼表结构描述用的固定片段（写给模型）
 CATALOG_DRAFT_PROMPT_LABELS = {
@@ -1455,6 +1555,16 @@ CATALOG_DRAFT_PROMPT_LABELS = {
     "col_system": "系统说明：{text}",
     "unique": "唯一约束：{cols}",
     "confirmed": "已确认的目录项：",
+    # 分段起草：表名下一行说这次只写哪部分（宽表的表级一段、列分段，拆小重问时的半段）
+    "only_table": "这次只写表级的项（中文名、粒度、表类型、业务主键、业务日期），不写列",
+    "only_columns": "这次只写下面列出的 {n} 列（这张表共 {total} 列），不写表级的项",
+    "table_and_columns": "这次只写表级的项和这 {n} 列：{cols}",
+    "brief_columns": "列（共 {n} 列，这里只列名字和类型）：",
+    "drafted": "已起草的表级内容：",
+    # 使用者补充的背景和要求
+    "description": "数据源说明：{text}",
+    "guidance": "起草要求：{text}",
+    "note": "本次说明：{text}",
 }
 
 CATALOG_DRAFT_PROMPT_SCHEMA: dict[str, Any] = {
@@ -1499,97 +1609,67 @@ CATALOG_DRAFT_PROMPT_SCHEMA: dict[str, Any] = {
     "required": ["tables"],
 }
 
-_P = CATALOG_DRAFT_PROMPT_LABELS
+class DraftModel:
+    """起草用的模型：先按 MODEL_MAX_TOKENS 的额度调；服务方嫌额度太大（budget_rejected）时换成 MODEL_FALLBACK_MAX_TOKENS
+    的那一个，之后的调用都用它（shrink）。一次起草（一个起草任务、一次同步起草）共用一个，退回之后不再先失败一次。
+
+    只转发起草用到的两个方法：with_structured_output 每次都取当前那个模型的，ainvoke 同理。"""
+
+    def __init__(self, big: Any, small: Any | None, model_name: str = "") -> None:
+        self.model, self._small = big, small
+        self.model_name = model_name
+        self.budget = MODEL_MAX_TOKENS
+
+    def shrink(self) -> bool:
+        """换成小额度的模型。已经换过、没有小的，返回 False。"""
+        if self._small is None or self.model is self._small:
+            return False
+        self.model, self.budget = self._small, MODEL_FALLBACK_MAX_TOKENS
+        return True
+
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
+        return self.model.with_structured_output(schema, **kwargs)
+
+    async def ainvoke(self, messages: list[Any]) -> Any:
+        return await self.model.ainvoke(messages)
 
 
 async def resolve_draft_model(session: AsyncSession) -> tuple[Any, str]:
-    """(模型, 模型 id)：用设置里助手的模型，关掉思考、温度 0。没有可用的模型抛 CatalogModelUnavailable。
+    """(模型, 模型 id)：用哪个接入、哪个模型按 data/draft_model.py 的顺序（设置里的起草模型 > 助手的模型 > 默认接入），
+    和按配方导入的 AI 起草共用。没有可用的模型抛 CatalogModelUnavailable。
+
+    不关思考（spec 里不传 thinking，按接入默认）、温度 0、额度 MODEL_MAX_TOKENS，服务方嫌大时退回
+    MODEL_FALLBACK_MAX_TOKENS（DraftModel）。单次调用的时限 MODEL_TIMEOUT_S 也交给 SDK，免得它先按全局的 5 分钟断开。
+    SDK 自己不重试（max_retries=0）：429、5xx、网络错误由起草引擎退避重试（最多 MODEL_RETRIES 次）；超时当作这一段
+    太大，拆小再问（data/catalog_draft.py），不原样重试。不然两层叠起来一段最多发 9 次请求，报错却写「已重试 2 次」，
+    网关正在限流时还会放大流量。
+    只建模型对象，不发请求。
 
     和 recipe_ai.resolve_draft_model 一样不用 get_chat_model：它在没有接入时静默退回演示模型，拿演示模型
-    起草出来的目录会被当成真的写进库里。数据层不导入接口层，设置键取 recipe_ai 里那份（与助手的同值，
-    那边有测试核对）。
+    起草出来的目录会被当成真的写进库里。
     """
-    from app.data.recipe_ai import COPILOT_SETTING_KEY
-    from app.db.models import Setting
-    from app.providers.factory import (
-        ModelSpec, ProviderNotConfigured, assistant_unavailable, build_chat_model, resolve_provider,
-    )
+    from app.data.draft_model import DraftModelUnavailable, draft_unavailable, resolve_draft_provider
+    from app.providers.factory import ModelSpec, ProviderNotConfigured, build_chat_model
 
-    row = await session.get(Setting, COPILOT_SETTING_KEY)
-    saved = (row.value if row else None) or {}
-    spec = ModelSpec(provider=saved.get("provider") or None, model=saved.get("model") or None,
-                     max_tokens=MODEL_MAX_TOKENS, temperature=0, thinking="off")
     try:
-        # 存的接入名不存在、已停用，只存了模型名、提供它的接入已停用：resolve_provider 都会报出来
-        provider = await resolve_provider(session, spec.provider, spec.model)
-    except ProviderNotConfigured as e:
-        raise CatalogModelUnavailable(assistant_unavailable(e)) from e
-    if provider is None:
-        raise CatalogModelUnavailable("未配置模型接入，无法由助手起草数据目录。请到「设置 → 模型接入」添加")
-    if provider.kind == "mock":
-        raise CatalogModelUnavailable("当前只有演示用的模型接入，无法用于起草数据目录。"
-                                      "请到「设置 → 模型接入」添加真实的模型接入")
+        provider, choice = await resolve_draft_provider(
+            session, none_reason="未配置模型接入，无法由模型起草数据目录。请到「设置 → 模型接入」添加",
+            mock_reason="当前只有演示用的模型接入，无法用于起草数据目录。请到「设置 → 模型接入」添加真实的模型接入")
+    except DraftModelUnavailable as e:
+        raise CatalogModelUnavailable(str(e)) from e
+    spec = ModelSpec(provider=choice.provider, model=choice.model, max_tokens=MODEL_MAX_TOKENS, temperature=0,
+                     timeout=MODEL_TIMEOUT_S, max_retries=0)
     try:
-        model = build_chat_model(provider, spec)
+        big = build_chat_model(provider, spec)
+        small = build_chat_model(provider, spec.model_copy(update={"max_tokens": MODEL_FALLBACK_MAX_TOKENS}))
     except ProviderNotConfigured as e:
-        raise CatalogModelUnavailable(assistant_unavailable(e)) from e
-    return model, spec.model or provider.default_model or ""
+        raise CatalogModelUnavailable(draft_unavailable(e, choice.origin)) from e
+    model_id = spec.model or provider.default_model or ""
+    return DraftModel(big, small, model_id), model_id
 
 
 def _confirmed_only(notes: Mapping[str, Any] | None) -> dict[str, Any]:
     return _assemble({k: v for k, v in _slots(notes).items() if v.get("status") in ("confirmed", "verified")})
-
-
-def _describe_for_model(name: str, meta: Mapping[str, Any], *, system: bool, existing: Mapping[str, Any] | None) -> str:
-    """一张表交给模型的结构描述：列、类型、主键、外键、唯一约束、注释；不含任何数据值。"""
-    lines = [(_P["view"] if meta.get("is_view") else _P["table"]).format(name=name)]
-    comment = (meta.get("comment") or "").strip()
-    if comment:
-        lines.append((_P["system"] if system else _P["comment"]).format(text=comment))
-    pk = set(meta.get("primary_key") or [])
-    fk_of: dict[str, str] = {}
-    for fk in meta.get("foreign_keys") or []:
-        if isinstance(fk, dict) and len(fk.get("columns") or []) == 1:
-            to_cols = fk.get("to_columns") or []
-            fk_of[fk["columns"][0]] = f"{fk.get('to_table')}.{to_cols[0]}" if to_cols else str(fk.get("to_table"))
-    lines.append(_P["columns"])
-    for col in meta.get("columns") or []:
-        marks = []
-        if col["name"] in pk:
-            marks.append(_P["pk"])
-        if not col.get("nullable", True):
-            marks.append(_P["not_null"])
-        if col["name"] in fk_of:
-            marks.append(_P["fk"].format(target=fk_of[col["name"]]))
-        if text := (col.get("comment") or "").strip():
-            marks.append((_P["col_system"] if system else _P["col_comment"]).format(text=text))
-        line = _P["column"].format(name=col["name"], type=col.get("type") or "")
-        lines.append(line + ("，" + "，".join(marks) if marks else ""))
-    for group in meta.get("unique") or []:
-        if isinstance(group, list) and group:
-            lines.append(_P["unique"].format(cols="、".join(group)))
-    confirmed = _notes_lines(_confirmed_only(existing), meta=meta, system_notes=False)
-    if confirmed:
-        lines.append(_P["confirmed"])
-        lines += confirmed
-    return "\n".join(lines)
-
-
-def _batches(names: list[str], tables: Mapping[str, Any]) -> list[list[str]]:
-    """按表分批：每批不超过 MODEL_BATCH_TABLES 张、合计不超过 MODEL_BATCH_COLUMNS 列（一张表超了就自成一批）。"""
-    out: list[list[str]] = []
-    batch: list[str] = []
-    width = 0
-    for name in names:
-        n = len((tables.get(name) or {}).get("columns") or [])
-        if batch and (len(batch) >= MODEL_BATCH_TABLES or width + n > MODEL_BATCH_COLUMNS):
-            out.append(batch)
-            batch, width = [], 0
-        batch.append(name)
-        width += n
-    if batch:
-        out.append(batch)
-    return out
 
 
 #: 模型给了这张表、但一项可用内容都没有（只有表名的空壳，或者给的值全不合规）：这张表记模型失败，不算起草成功。
@@ -1621,39 +1701,6 @@ def _model_tables(raw: Any) -> list[dict[str, Any]] | None:
     return [t for t in raw if isinstance(t, dict)]
 
 
-async def _ask_model(model: Any, messages: list[Any],
-                     usable: Callable[[list[dict[str, Any]]], bool] | None = None) -> list[dict[str, Any]]:
-    """问一批。先走结构化输出；模型不支持、调用报错、给回来的不是约定的结构，或者 usable 说它不够用（实测见过
-    结构化输出只给 {"tables":[{"table":"x"}]} 这样的空壳），再退回纯文本、从正文里取 JSON。
-
-    结构化输出报错也退回（同 judge._ask）：有的网关不支持工具调用，一调就报错，纯文本却能用。代价是真的
-    网络故障会多试一次，两次加起来仍受 MODEL_TIMEOUT_S 约束。
-
-    两条路都拿到了东西时，结构化的在前、纯文本的在后一起交回（同一张表各有一份，调用方挑能用的那份）；纯文本那次
-    失败了就只交回结构化的那份（调用方据此给空壳的表记失败）。
-    """
-    try:
-        parsed = _model_tables(await model.with_structured_output(CATALOG_DRAFT_PROMPT_SCHEMA).ainvoke(messages))
-    except Exception:  # noqa: BLE001 - 退回纯文本
-        parsed = None
-    if parsed is not None and (usable is None or usable(parsed)):
-        return parsed
-    from app.engine.state import message_text
-
-    try:
-        reply = await model.ainvoke(messages)
-    except Exception:  # noqa: BLE001 - 结构化那份还在：交回它，空壳的表由调用方记失败
-        if parsed is not None:
-            return parsed
-        raise
-    text = _model_tables(message_text(reply))
-    if text is None:
-        if parsed is not None:
-            return parsed
-        raise ValueError("模型的回复不是约定的格式")
-    return [*(parsed or []), *text]
-
-
 def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
     if not isinstance(value, str):
         return None
@@ -1664,7 +1711,8 @@ def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
 def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool) -> dict[str, Any]:
     """模型给的一张表 → 目录项（llm / proposed）。不合规的值整项丢掉，不硬塞：列名对不上表结构的、
     表类型和度量类型不在取值里的、业务主键里有不存在的列的、看起来是计算公式的（_formula_like，公式进口径卡）。
-    导入表格的源，说明已经覆盖的字段也丢掉。"""
+    该是文字的地方写成了数组、对象（列名、表类型、业务日期的列、度量类型……）同样丢掉，不抛异常：实测见过把列名
+    写成数组的，以前在这里抛 TypeError，整张表记出错。导入表格的源，说明已经覆盖的字段也丢掉。"""
     columns = {c["name"]: c for c in meta.get("columns") or []}
     notes: dict[str, Any] = {}
     table_has_system_note = system and bool((meta.get("comment") or "").strip())
@@ -1673,21 +1721,23 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
             continue
         if (text := _clean_text(entry.get(name))) is not None and not _formula_like(("t", name), text):
             notes[name] = make_item(text, "llm")
-    if entry.get("kind") in TABLE_KINDS:
-        notes["kind"] = make_item(entry["kind"], "llm")
+    kind = entry.get("kind")
+    if isinstance(kind, str) and kind in TABLE_KINDS:
+        notes["kind"] = make_item(kind, "llm")
     keys = entry.get("keys")
     if _str_list_ok(keys) and all(k in columns for k in keys):
         notes["keys"] = make_item(list(dict.fromkeys(keys)), "llm")
     date = entry.get("business_date")
-    if isinstance(date, dict) and date.get("column") in columns:
+    if isinstance(date, dict) and isinstance(date.get("column"), str) and date["column"] in columns:
         value = {"column": date["column"]}
         for k in ("rule", "timezone"):
             if (text := _clean_text(date.get(k))) is not None:
                 value[k] = text
         notes["business_date"] = make_item(value, "llm")
     out_cols: dict[str, dict[str, Any]] = {}
-    for col in entry.get("columns") or []:
-        if not isinstance(col, dict) or col.get("name") not in columns:
+    listed = entry.get("columns")
+    for col in listed if isinstance(listed, list) else []:
+        if not isinstance(col, dict) or not isinstance(col.get("name"), str) or col["name"] not in columns:
             continue
         name = col["name"]
         has_system_note = system and bool((columns[name].get("comment") or "").strip())
@@ -1698,8 +1748,9 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
             text = _clean_text(col.get(field_name), limit)
             if text is not None and not _formula_like(("c", name, field_name), text):
                 items[field_name] = make_item(text, "llm")
-        if col.get("measure") in COLUMN_MEASURES:
-            items["measure"] = make_item(col["measure"], "llm")
+        measure = col.get("measure")
+        if isinstance(measure, str) and measure in COLUMN_MEASURES:
+            items["measure"] = make_item(measure, "llm")
         if items:
             out_cols[name] = items
     if out_cols:
@@ -1708,65 +1759,30 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
 
 
 async def draft_with_model(model: Any, source: Any, tables: list[str], *,
-                           existing: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, TableDraft | str]:
+                           existing: Mapping[str, Mapping[str, Any]] | None = None,
+                           guidance: str | None = None, note: str | None = None) -> dict[str, TableDraft | str]:
     """用模型起草这些表的中文名、粒度、表类型、业务主键、业务日期和每列的中文名、含义、单位、度量类型。
 
-    model 要有 with_structured_output(schema) 或 ainvoke(messages)（测试注入假模型）。按表分批（_batches），
-    最多 MODEL_CONCURRENCY 批同时发。返回 {表名: TableDraft 或失败原因}：一批失败只影响这一批的表，
-    其余照常；失败的表不算 covered，已有的模型起草项不会因此被删。
+    实现在 data/catalog_draft.py（分段、按失败原因处理、捡回被截断的部分）；这里是给老调用方的形状：返回
+    {表名: TableDraft 或失败原因}。全部写出来的 covered 是 {"llm"}；只写出一部分的仍是 TableDraft，covered 为空、
+    error 写明哪部分没写出来；一项都没写出来的是失败原因。表结构里没有的表不在结果里。
 
-    交给模型的只有表结构（列、类型、主键、外键、唯一约束、注释），不发任何数据值；existing 里已确认、
-    有确证的项作为「以此为准」的背景一起交过去。
+    model 要有 with_structured_output(schema) 或 ainvoke(messages)（测试注入假模型）。交给模型的只有表结构和使用者
+    补充的背景（数据源说明、guidance 起草要求、note 本次说明），不发任何数据值；existing 里已确认、有确证的项作为
+    「以此为准」的背景一起交过去。
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
+    from app.data import catalog_draft
 
-    all_tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
-    system = system_notes_source(source)
-    names = [t for t in tables if isinstance(all_tables.get(t), dict)]
-    results: dict[str, TableDraft | str] = {}
-    gate = asyncio.Semaphore(MODEL_CONCURRENCY)
-
-    async def run(batch: list[str]) -> None:
-        described = "\n\n".join(_describe_for_model(n, all_tables[n], system=system,
-                                                    existing=(existing or {}).get(n)) for n in batch)
-        messages = [SystemMessage(content=CATALOG_DRAFT_SYSTEM),
-                    HumanMessage(content=CATALOG_DRAFT_PROMPT.format(n=len(batch), tables=described))]
-        def drafted(entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-            """这批里每张表能用的那份：同一张表给了几份（结构化、纯文本各一份）时取第一份有可用内容的。"""
-            out: dict[str, dict[str, Any]] = {}
-            for entry in entries:
-                name = str(entry.get("table"))
-                if name in batch and name not in out:
-                    notes = _from_model(entry, all_tables[name], system=system)
-                    if notes:
-                        out[name] = notes
-            return out
-
-        try:
-            async with gate:
-                got = await asyncio.wait_for(
-                    _ask_model(model, messages, usable=lambda entries: len(drafted(entries)) == len(batch)),
-                    timeout=MODEL_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            for n in batch:
-                results[n] = f"模型起草超时：{MODEL_TIMEOUT_S} 秒内没有收到回复"
-            return
-        except Exception as e:  # noqa: BLE001 - 一批失败不影响其他批和其他来源
-            from app.core.errors import describe_exception, first_line
-
-            for n in batch:
-                results[n] = f"模型起草失败：{first_line(e) or describe_exception(e)}"
-            return
-        named = {str(t.get("table")) for t in got}
-        usable = drafted(got)
-        for n in batch:
-            if n in usable:
-                results[n] = TableDraft(notes=usable[n], covered=frozenset({"llm"}))
-            else:
-                results[n] = MODEL_EMPTY_REASON if n in named else "模型的回复里没有这张表"
-
-    await asyncio.gather(*(run(b) for b in _batches(names, all_tables)))
-    return {n: results[n] for n in names if n in results}
+    outcomes = await catalog_draft.run_model_draft(
+        model, source, tables, existing=existing, background=catalog_draft.Background(guidance=guidance, note=note))
+    out: dict[str, TableDraft | str] = {}
+    for name, outcome in outcomes.items():
+        if outcome.status == "failed":
+            out[name] = outcome.error or MODEL_EMPTY_REASON
+        else:
+            out[name] = TableDraft(notes=outcome.notes, covered=frozenset({"llm"}) if outcome.status == "ok"
+                                   else frozenset(), error=outcome.error)
+    return out
 
 
 # ==========================================================================
@@ -1776,7 +1792,8 @@ async def draft_with_model(model: Any, source: Any, tables: list[str], *,
 
 @dataclass
 class TableDraftResult:
-    """一张表这次起草的结果。error：这张表没起草（表结构里没有、写入一直冲突）；model_error：只是模型那部分失败。"""
+    """一张表这次起草的结果。error：这张表没起草（表结构里没有、写入一直冲突）；model_error：只是模型那部分失败，
+    或者只写出了一部分（哪部分没写出来、为什么）。"""
 
     table: str
     added: int = 0
@@ -1785,9 +1802,17 @@ class TableDraftResult:
     version: int = 0
     error: str | None = None
     model_error: str | None = None
-    #: 模型给了这张表几项可用内容（并入目录之前，按项数）。没用模型、模型这部分失败时为 None。
+    #: 模型给了这张表几项可用内容（并入目录之前，按项数）。没用模型、模型这部分一项都没写出来时为 None。
     #: 大于 0 而新增、更新、删除都是 0，才是「模型给了内容、只是和现有目录一致」
     model_items: int | None = None
+    #: ok 写入了（用模型时各段都写出来了）、partial 模型只写出一部分、failed 没写入或模型一段都没写出来、
+    #: skipped 表结构里没有这张表
+    status: str = "ok"
+    #: 模型分几段起草（不用模型时为 None）
+    parts_total: int | None = None
+    #: 模型拿不准、留空了的列（catalog_draft.ModelOutcome.blank，按表结构的顺序），只留并入目录之后仍然没有中文名和
+    #: 含义的；表的状态不因此变
+    blank: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1802,35 +1827,113 @@ class DraftReport:
     model_error: str | None = None
 
 
-async def draft_catalog(session: AsyncSession, source: Any, *, tables: list[str] | None = None,
-                        use_model: bool = False, model: Any = None, actor: str | None = None) -> DraftReport:
-    """起草这些表的目录并写入，同步完成。
+#: 表结构里没有要起草的表（被删了、改名了，或者名字写错了）
+def missing_table_error(name: str) -> str:
+    return f"表结构里没有 {name}，请先重新探查结构"
 
-    - source：手工源的 DataSource，或上传源绑定当前快照的视图（table_versions.resolve_source）；按 source.id 存。
-    - tables 为空时按使用次数（table_usage）取前 DRAFT_DEFAULT_TABLES 张，次数相同按表结构里的顺序。
-    - 每张表：数据库注释、外键约束、命名推断照做；use_model 时再加模型起草。model 可注入（测试用假模型），
-      不给就按设置解析（resolve_draft_model）；模型用不了、某一批失败，都不影响其余来源照常写入。
+
+#: 写入一直撞上别人刚改过（乐观锁重读重并三次仍冲突）
+WRITE_CONFLICT_ERROR = "这张表的数据目录正被其他人修改，请稍后再起草"
+
+
+async def write_draft(session: AsyncSession, source: Any, table: str, modeled: Any = None, *, at: str,
+                      actor: str | None) -> TableDraftResult:
+    """一张表的起草并入目录并写入：数据库注释、外键约束、命名推断照做，modeled（catalog_draft.ModelOutcome，
+    没用模型时为 None）有可用内容的再并上。同步起草和后台起草任务（每张表一结束就调）共用这一处。
+
     - 并入已有目录按 merge_notes 的规则：人工确认、驳回过的项不动。内容没变不写、不升版本。
+    - 模型这次没给的项（留空、没通过校验）不删以前起草的；列已经不在表结构里的，模型各段都写出来时（covered 含 llm）
+      照旧删掉。模型只写出一部分的不算完整起草过（covered 不含 llm）。
+    - 模型留空的列（blank）按并入之后的目录再筛一遍：已经有中文名或含义的（以前起草的、库注释、起草进行中有人填的）
+      不算留空。
     - 写入撞上别人刚改过（乐观锁）就重读重并，最多三次。
     """
-    cache = getattr(source, "schema_cache", None) or {}
-    all_tables = cache.get("tables") or {}
-    report = DraftReport()
-    if tables:
-        wanted = list(dict.fromkeys(str(t) for t in tables))
+    result = TableDraftResult(table=table)
+    structure = draft_structure(source, table)
+    meta = ((getattr(source, "schema_cache", None) or {}).get("tables") or {}).get(table) or {}
+    columns = [str(c["name"]) for c in meta.get("columns") or [] if isinstance(c, dict) and c.get("name") is not None]
+    model_draft: TableDraft | None = None
+    if modeled is not None:
+        result.parts_total = modeled.parts_total
+        result.model_error = modeled.error
+        if modeled.items:
+            result.model_items = modeled.items
+            result.blank = list(getattr(modeled, "blank", None) or [])
+            model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"}) if modeled.status == "ok"
+                                     else frozenset())
+    for _attempt in range(3):
+        entry = await read_entry(session, source.id, table)
+        version = entry.version if entry else 0
+        merged, stats = merge_notes(entry.notes if entry else {}, structure.notes, covered=structure.covered, at=at,
+                                    columns=columns)
+        if model_draft is not None:
+            merged, more = merge_notes(merged, model_draft.notes, covered=model_draft.covered, at=at, columns=columns)
+            stats += more
+        result.added, result.updated, result.removed = stats.added, stats.updated, stats.removed
+        result.version = version
+        if entry is None and not merged:
+            break                    # 什么也没起草出来，不建空目录
+        try:
+            written = await write_entry(session, source.id, table, merged, if_version=version, actor=actor)
+        except CatalogConflict:
+            continue
+        result.version = written.version
+        break
     else:
-        usage = await table_usage(session, source)
-        order = {name: i for i, name in enumerate(all_tables)}
-        wanted = sorted(all_tables, key=lambda n: (-usage.get(n, 0), order[n]))[:DRAFT_DEFAULT_TABLES]
+        result.error = WRITE_CONFLICT_ERROR
+        result.added = result.updated = result.removed = 0
+        result.blank = []
+    if result.blank:
+        named = visible_notes(merged).get("columns") or {}
+        result.blank = [c for c in result.blank if not any(f in (named.get(c) or {}) for f in ("label", "meaning"))]
+    if result.error or (modeled is not None and modeled.status == "failed"):
+        result.status = "failed"
+    elif modeled is not None and modeled.status == "partial":
+        result.status = "partial"
+    return result
+
+
+def pick_tables(cache: Mapping[str, Any], wanted: Iterable[str]) -> tuple[list[str], list[str]]:
+    """要起草的表 → (表结构里的键，去重、按给的顺序；表结构里没有的原样名字)。"""
     picked: list[str] = []
-    for name in wanted:
+    unknown: list[str] = []
+    for name in dict.fromkeys(str(t) for t in wanted):
         key = resolve_table_name(cache, name)
         if key is None:
-            report.tables.append(TableDraftResult(table=name, error=f"表结构里没有 {name}，请先重新探查结构"))
+            unknown.append(name)
         elif key not in picked:
             picked.append(key)
+    return picked, unknown
 
-    llm: dict[str, TableDraft | str] = {}
+
+async def default_tables(session: AsyncSession, source: Any) -> list[str]:
+    """不指定表时起草哪些：按使用次数（table_usage）取前 DRAFT_DEFAULT_TABLES 张，次数相同按表结构里的顺序。"""
+    all_tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
+    usage = await table_usage(session, source)
+    order = {name: i for i, name in enumerate(all_tables)}
+    return sorted(all_tables, key=lambda n: (-usage.get(n, 0), order[n]))[:DRAFT_DEFAULT_TABLES]
+
+
+async def draft_catalog(session: AsyncSession, source: Any, *, tables: list[str] | None = None,
+                        use_model: bool = False, model: Any = None, actor: str | None = None,
+                        guidance: str | None = None, note: str | None = None) -> DraftReport:
+    """起草这些表的目录并写入，同步完成（POST /catalog/draft；界面改用后台起草任务，见 data/catalog_jobs.py）。
+
+    - source：手工源的 DataSource，或上传源绑定当前快照的视图（table_versions.resolve_source）；按 source.id 存。
+    - tables 为空时按使用次数取前 DRAFT_DEFAULT_TABLES 张（default_tables）。
+    - 每张表：数据库注释、外键约束、命名推断照做；use_model 时再加模型起草（data/catalog_draft.py：分段、按失败
+      原因处理）。model 可注入（测试用假模型），不给就按设置解析（resolve_draft_model）；模型用不了、某一段失败，
+      都不影响其余来源照常写入。guidance 是数据源级的起草要求，note 是本次说明，和数据源说明一起交给模型。
+    - 并入、写入见 write_draft。
+    """
+    cache = getattr(source, "schema_cache", None) or {}
+    report = DraftReport()
+    wanted = list(tables) if tables else await default_tables(session, source)
+    picked, unknown = pick_tables(cache, wanted)
+    for name in unknown:
+        report.tables.append(TableDraftResult(table=name, error=missing_table_error(name), status="skipped"))
+
+    outcomes: dict[str, Any] = {}
     if use_model and picked:
         try:
             if model is None:
@@ -1840,41 +1943,17 @@ async def draft_catalog(session: AsyncSession, source: Any, *, tables: list[str]
         except CatalogModelUnavailable as e:
             report.model_error = str(e)
         else:
+            from app.data import catalog_draft
+
             report.model_used = True
             existing = await read_catalog(session, source.id)
-            llm = await draft_with_model(model, source, picked, existing={t: e.notes for t, e in existing.items()})
+            outcomes = await catalog_draft.run_model_draft(
+                model, source, picked, existing={t: e.notes for t, e in existing.items()},
+                background=catalog_draft.Background(guidance=guidance, note=note))
 
     at = now_iso()
     for table in picked:
-        result = TableDraftResult(table=table)
-        structure = draft_structure(source, table)
-        modeled = llm.get(table)
-        if isinstance(modeled, str):
-            result.model_error = modeled
-        elif isinstance(modeled, TableDraft):
-            result.model_items = len(_slots(modeled.notes))
-        for _attempt in range(3):
-            entry = await read_entry(session, source.id, table)
-            version = entry.version if entry else 0
-            merged, stats = merge_notes(entry.notes if entry else {}, structure.notes, covered=structure.covered,
-                                        at=at)
-            if isinstance(modeled, TableDraft):
-                merged, more = merge_notes(merged, modeled.notes, covered=modeled.covered, at=at)
-                stats += more
-            result.added, result.updated, result.removed = stats.added, stats.updated, stats.removed
-            result.version = version
-            if entry is None and not merged:
-                break                    # 什么也没起草出来，不建空目录
-            try:
-                written = await write_entry(session, source.id, table, merged, if_version=version, actor=actor)
-            except CatalogConflict:
-                continue
-            result.version = written.version
-            break
-        else:
-            result.error = "这张表的数据目录正被其他人修改，请稍后再起草"
-            result.added = result.updated = result.removed = 0
-        report.tables.append(result)
+        report.tables.append(await write_draft(session, source, table, outcomes.get(table), at=at, actor=actor))
     return report
 
 
@@ -2239,15 +2318,22 @@ def frozen_catalog(entries: Mapping[str, CatalogEntry], tables: Iterable[str]) -
 
 
 __all__ = [
-    "CARDINALITIES", "CARDINALITY_LABEL", "CATALOG_DRAFT_PROMPT", "CATALOG_DRAFT_PROMPT_SCHEMA",
-    "CATALOG_DRAFT_SYSTEM", "COLUMN_FIELDS", "COLUMN_FIELD_LABEL", "COLUMN_MEASURES", "CatalogConflict",
+    "CARDINALITIES", "CARDINALITY_LABEL", "CATALOG_DRAFT_BACKGROUND_PROMPT", "CATALOG_DRAFT_PROMPT",
+    "CATALOG_DRAFT_PROMPT_LABELS", "CATALOG_DRAFT_PROMPT_SCHEMA", "CATALOG_DRAFT_SYSTEM", "CATALOG_DRAFT_TEXT_PROMPT",
+    "COLUMN_FIELDS", "COLUMN_FIELD_LABEL", "COLUMN_MEASURES", "CatalogConflict",
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
-    "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL", "MEASURE_LABEL",
-    "MODEL_EMPTY_REASON", "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES", "PROFILE_NOTE_PREFIX",
-    "PROFILE_VERIFY_COVERAGE",
+    "DraftModel", "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL",
+    "MEASURE_LABEL", "MODEL_BATCH_COLUMNS", "MODEL_BATCH_TABLES", "MODEL_CONCURRENCY", "MODEL_EMPTY_REASON",
+    "MODEL_FALLBACK_MAX_TOKENS", "MODEL_MAX_TOKENS", "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON",
+    "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS", "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER",
+    "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
+    "PATCH_MAX_CHANGES",
+    "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE", "WRITE_CONFLICT_ERROR", "default_tables",
+    "missing_table_error", "pick_tables", "write_draft",
     "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL",
     "TABLE_KINDS", "TableDraft", "TableDraftResult", "UI_KIND_LABEL", "UI_MEASURE_LABEL", "apply_human_edit",
-    "apply_patch", "codes_complete", "describe_slot", "draft_catalog", "draft_structure", "draft_with_model",
+    "apply_patch", "codes_complete", "comment_role", "describe_slot", "draft_catalog", "draft_structure",
+    "draft_with_model",
     "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "is_date_column", "is_profile_note",
     "join_paths",
     "make_item", "merge_notes", "name_words", "now_iso", "parse_path", "plan_patch", "profile_relation_holds",

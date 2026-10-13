@@ -28,6 +28,9 @@ class ModelSpec(BaseModel):
     thinking: str | None = None  # off | adaptive
     effort: str | None = None  # low | medium | high | xhigh | max
     timeout: int | None = None
+    # SDK 自己遇到 429、5xx、连接错误、超时时重试几次；None 照 SDK 默认（openai、anthropic 都是 2 次）。
+    # 自己按失败原因重试的调用方（数据目录起草）设 0，免得两层重试叠在一起、实际次数和报错写的对不上
+    max_retries: int | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -227,6 +230,8 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
     # 以前只有节点显式配了才传，而没有任何地方给 spec.timeout 赋过值——所有调用
     # 都走 SDK 默认的 10 分钟
     kwargs["timeout"] = spec.timeout or settings.model_timeout_seconds
+    if spec.max_retries is not None:
+        kwargs["max_retries"] = spec.max_retries
 
     # 采样参数：能力允许才传
     if spec.temperature is not None and catalog.supports_sampling(model):
@@ -314,7 +319,8 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
             # 且 api_key=None 时不会发出 x-api-key。
             import anthropic
 
-            client_args = {"base_url": base_url, "api_key": None, "auth_token": api_key}
+            client_args = {"base_url": base_url, "api_key": None, "auth_token": api_key,
+                           "max_retries": chat.max_retries}
             chat._client = anthropic.Anthropic(**client_args)
             chat._async_client = anthropic.AsyncAnthropic(**client_args)
         return chat

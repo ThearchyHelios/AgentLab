@@ -204,6 +204,14 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # 没有选项，也不是定时任务发起的
     ("runs", "options", "JSON DEFAULT '{}'"),
     ("runs", "schedule_id", "VARCHAR(32)"),
+    # 数据目录起草任务（验收后修正）：超时、没写出来的调用次数，当前的列数上限，提醒；逐表的模型留空的列。
+    # 存量任务回填 0 和 NULL：升级前没记这些
+    ("catalog_draft_jobs", "timeouts", "INTEGER DEFAULT 0"),
+    ("catalog_draft_jobs", "failed_calls", "INTEGER DEFAULT 0"),
+    ("catalog_draft_jobs", "part_columns", "INTEGER"),
+    ("catalog_draft_jobs", "notice", "TEXT"),
+    ("catalog_draft_tasks", "blank_columns", "INTEGER DEFAULT 0"),
+    ("catalog_draft_tasks", "blank_sample", "JSON"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列)。create_all 不碰已有的表，表上新列的索引也就不会建。

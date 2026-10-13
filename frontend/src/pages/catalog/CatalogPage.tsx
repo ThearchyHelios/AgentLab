@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, BookMarked, Database, ListFilter as ListFilterIcon, ScanSearch, Sparkles } from 'lucide-react'
+import { ArrowLeft, BookMarked, Database, ListFilter as ListFilterIcon, ScanSearch, Sparkles, TriangleAlert } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import type { CatalogDetail, CatalogList, CatalogTableRow } from '../../types'
 import { EmptyState, ErrorState, PageHeader, Skeleton, Spinner, toast, useTicker } from '../../components/ui'
 import { useCatalog, useDatasources, useOnReconnect } from '../../store/catalog'
-import { CATALOG_TEXT as CT, PROFILE_STOP_LABEL, PROFILE_TEXT as PT, SCHEMA_PARTIAL_TEXT as SPT } from '../../lib/terms'
+import {
+  CATALOG_DRAFT_TEXT as DT, CATALOG_TEXT as CT, PROFILE_STOP_LABEL, PROFILE_TEXT as PT, SCHEMA_PARTIAL_TEXT as SPT,
+} from '../../lib/terms'
 import { StatusLegend, SystemNotesNotice } from './parts'
 import { DraftDialog } from './DraftDialog'
+import { isJobActive, jobBlank, retryableCount, useDraftJob } from './draftJob'
+import type { DraftPreset, DraftStartBody } from './draftJob'
 import { ProfileDialog } from './ProfileDialog'
 import type { ProfileJob } from './ProfileDialog'
 import { ProfileSettingsDialog } from './ProfileSettings'
@@ -99,7 +103,11 @@ export function CatalogPage() {
   const search = writeListParams(params, list).toString()
   searchRef.current = search ? `?${search}` : ''
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
-  const [drafting, setDrafting] = useState(false)
+  /**
+   * 起草对话框开着没有、打开时显示什么：setup 选范围开始；job 显示页面跟着的任务（进行中的进度、刚结束的结果）。
+   * busy：是撞上已有任务（409）转过去显示的；preset：设置阶段预先选好的范围（表详情里「补充起草要求」）
+   */
+  const [draftOpen, setDraftOpen] = useState<{ view: 'setup' | 'job'; busy?: boolean; preset?: DraftPreset } | null>(null)
   /** 起草写进了这些表：详情据此重新载入（编辑中的不动，保存时服务端会用版本号拦下） */
   const [drafted, setDrafted] = useState<{ seq: number; tables: Set<string> }>({ seq: 0, tables: new Set() })
   const [profiling, setProfiling] = useState(false)
@@ -142,11 +150,67 @@ export function CatalogPage() {
     }))
   }, [])
 
-  const onDrafted = useCallback((tables: string[]) => {
-    setDrafted((cur) => ({ seq: cur.seq + 1, tables: new Set(tables) }))
-    setSelected(new Set())
-    void load()
-  }, [load])
+  /**
+   * 起草任务（后台进行，状态在页面上）：每张表一结束就重取清单、正在看的表在里面就重新载入（编辑中的不动，保存时服务端
+   * 会用版本号拦下）；结束时重取一次清单。对话框关着时结束的，弹提示并给「查看结果」
+   */
+  const draftOpenRef = useRef(draftOpen)
+  draftOpenRef.current = draftOpen
+  const draft = useDraftJob(sourceId, data?.active_job, {
+    onTablesEnded: (tables) => {
+      setDrafted((cur) => ({ seq: cur.seq + 1, tables: new Set(tables) }))
+      void load()
+    },
+    onFinished: (job) => {
+      void load()
+      if (draftOpenRef.current) return
+      const src = job.source_id
+      const opts = {
+        key: `catalog-draft:${src}`, duration: 10000,
+        action: { label: DT.viewResult, onClick: () => { if (sourceRef.current === src) setDraftOpen({ view: 'job' }) } },
+      }
+      // 留空的列不算没写全，提示里接着写一句，点「查看结果」看是哪几张表、怎么办
+      const blank = jobBlank(job)
+      if (job.status === 'succeeded') toast.ok(DT.toast.withBlank(DT.toast.succeeded(CT.draftSummary(job.added, job.updated, job.removed)), blank), opts)
+      else if (job.status === 'partial') toast.warn(DT.toast.withBlank(DT.toast.partial(retryableCount(job)), blank), opts)
+      else if (job.status === 'failed') toast.error(DT.toast.failed(job.error ?? ''), opts)
+      else if (job.status === 'interrupted') toast.warn(DT.toast.interrupted, opts)
+      else toast.warn(DT.toast.cancelled, opts)
+    },
+  })
+  const draftJob = draft.job
+  const draftActive = isJobActive(draftJob)
+  /** 打开起草对话框：有进行中的任务就直接显示它；上一次的结果看过了，再点就是重新开始 */
+  const openDraft = useCallback(() => setDraftOpen({ view: draftActive ? 'job' : 'setup' }), [draftActive])
+  const startDraft = useCallback(async (body: DraftStartBody) => {
+    const r = await draft.start(body)
+    // 选中的表已经交给起草任务了：清空，免得接着点「起草所选」又起草一遍
+    if (!r.busy) setSelected(new Set())
+    return r
+  }, [draft.start])
+  /** 详情里「重新起草这张表」：只含这张表、用模型、不带补充说明。模型用不了等开始不了的，直接提示原因 */
+  const redraftTable = useCallback(async (t: string) => {
+    try {
+      const r = await draft.start({ tables: [t], use_model: true })
+      setDraftOpen({ view: 'job', busy: r.busy })
+    } catch (e) {
+      toast.error(e)
+    }
+  }, [draft.start])
+  /** 详情里「补充起草要求」（上次起草有留空的列）：打开起草设置，范围只有这张表，先补起草要求再开始 */
+  const draftWithGuidance = useCallback((t: string) => {
+    setDraftOpen({ view: 'setup', preset: { tables: [t], label: DT.scopeTable(t) } })
+  }, [])
+  const onGuidanceSaved = useCallback((g: string | null) => {
+    setData((cur) => cur && ({ ...cur, guidance: g }))
+  }, [])
+  // 上方的进度：跟着的任务在进行就按它；跟着的就是清单说的那一个、已经结束了，就不信清单（清单还没重取回来）
+  const listActive = isJobActive(data?.active_job) ? data?.active_job ?? null : null
+  const stripJob: { done: number; total: number; status: string } | null = draftJob && (draftActive || draftJob.id === listActive?.id)
+    ? (draftActive ? draftJob : null)
+    : listActive
+  // 调用接连没写出来的提醒：关着对话框时也要看得到（上方的进度带着它）
+  const stripNotice = draftActive ? draftJob?.notice?.trim() || null : null
 
   const options = savedOptions?.sourceId === sourceId ? savedOptions.options : source?.options
   const profileSettings = useMemo(() => profileSettingsOf(options), [options])
@@ -262,7 +326,7 @@ export function CatalogPage() {
   const empty = rows.length > 0 && rows.every((r) => progressOf(r.counts) === 'none')
   const hasTables = rows.length > 0
   const draftButton = (primary = false) => (
-    <button type="button" className={clsx('btn btn-sm', primary && 'btn-primary')} onClick={() => setDrafting(true)} data-catalog-draft="">
+    <button type="button" className={clsx('btn btn-sm', primary && 'btn-primary')} onClick={openDraft} data-catalog-draft="">
       <Sparkles size={11} aria-hidden /> {CT.draft}
     </button>
   )
@@ -281,7 +345,7 @@ export function CatalogPage() {
     )
   // 页头的「起草」窄屏只留图标，标题才放得下
   const headerDraft = (
-    <button type="button" className="btn btn-sm" onClick={() => setDrafting(true)} aria-label={CT.draft} title={CT.draft} data-catalog-draft="">
+    <button type="button" className="btn btn-sm" onClick={openDraft} aria-label={CT.draft} title={CT.draft} data-catalog-draft="">
       <Sparkles size={11} aria-hidden /> <span className="hidden sm:inline">{CT.draft}</span>
     </button>
   )
@@ -335,7 +399,7 @@ export function CatalogPage() {
             onSelected={setSelected}
             active={table}
             onOpen={openTable}
-            onDraft={() => setDrafting(true)}
+            onDraft={openDraft}
             onProfile={openProfile}
           />
         </aside>
@@ -343,7 +407,8 @@ export function CatalogPage() {
           {table
             ? (
               <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} fillCodes={fillCodes} prev={prev} next={next}
-                           onFillDone={onFillDone} onOpen={openTable} onBack={backToList} onDetail={onDetail} />
+                           onFillDone={onFillDone} onOpen={openTable} onBack={backToList} onDetail={onDetail}
+                           draftBusy={!!stripJob} onRedraft={redraftTable} onDraftGuidance={draftWithGuidance} />
             )
             : <Overview rows={rows} empty={empty} systemNotes={data.system_notes} draft={draftButton(true)} onOpen={openTable} />}
         </section>
@@ -373,16 +438,28 @@ export function CatalogPage() {
                              onGoSource={() => navigate(back)} />
       )}
       {hasTables && usage.used > 0 && !empty && <UsageSummary {...usage} active={usedOnly ? filter : null} onFocus={focusUsed} />}
+      {hasTables && stripJob && !draftOpen && <DraftStrip job={stripJob} notice={stripNotice} onOpen={openDraft} />}
       {body}
-      {drafting && data && (
+      {draftOpen && data && (
         <DraftDialog
           sourceId={sourceId}
+          sourceDescription={source?.description ?? ''}
+          guidance={data.guidance ?? ''}
           rows={rows}
           visible={visible}
           selected={[...selected]}
           filtered={filtered}
-          onClose={() => setDrafting(false)}
-          onDrafted={onDrafted}
+          job={draftJob}
+          initial={draftOpen.view}
+          initialBusy={!!draftOpen.busy}
+          preset={draftOpen.preset ?? null}
+          stopping={draft.stopping}
+          onStart={startDraft}
+          onCancel={draft.cancel}
+          onRetry={draft.retry}
+          onTrack={draft.track}
+          onGuidanceSaved={onGuidanceSaved}
+          onClose={() => setDraftOpen(null)}
         />
       )}
       {profiling && data && (
@@ -408,6 +485,41 @@ export function CatalogPage() {
         <ProfileSettingsDialog row={{ id: source.id, name: source.name, options }} onClose={() => setProfileSettingsOpen(false)}
                                onSaved={onProfileSettingsSaved} />
       )}
+    </div>
+  )
+}
+
+/**
+ * 起草任务在进行：目录页上方一条进度（关掉对话框任务照常进行，每张表起草完就写进目录）。点「查看进度」回到对话框。
+ * notice：调用接连没写出来时服务端给的提醒，跟着写一行（全文在悬停里，对话框里也有）
+ */
+function DraftStrip({ job, notice, onOpen }: {
+  job: { done: number; total: number; status: string }
+  notice: string | null
+  onOpen: () => void
+}) {
+  const text = job.status === 'queued' ? DT.stripQueued(job.total) : DT.strip(job.done, job.total)
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2 text-xs"
+         style={{ background: 'color-mix(in srgb, var(--accent) 6%, var(--bg-panel))' }}
+         data-catalog-draft-progress={`${job.done}/${job.total}`}>
+      <Spinner size={12} />
+      <div className="min-w-0 flex-1">
+        <p className="truncate font-medium" title={text}>{text}</p>
+        {notice && (
+          <p className="mt-0.5 flex min-w-0 items-center gap-1 text-2xs text-[var(--warn)]" role="status" title={notice}
+             data-catalog-draft-notice="">
+            <TriangleAlert size={10} className="shrink-0" aria-hidden />
+            <span className="min-w-0 truncate">{notice}</span>
+          </p>
+        )}
+        <div className="mt-1 h-1 max-w-xs overflow-hidden rounded-full bg-hover" role="progressbar" aria-label={text}
+             aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={job.done}>
+          <div className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-300"
+               style={{ width: `${job.total ? (job.done / job.total) * 100 : 0}%` }} />
+        </div>
+      </div>
+      <button type="button" className="btn btn-sm shrink-0" onClick={onOpen} data-catalog-draft-open="">{DT.stripOpen}</button>
     </div>
   )
 }

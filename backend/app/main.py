@@ -70,6 +70,15 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         except Exception:  # noqa: BLE001
             logger.exception("上传表格的版本整理失败，服务照常启动")
 
+    # 上次没做完的数据目录起草任务：标成中断（没结束的表记停止），不自动续跑——拷来的数据目录（检查脚本、验收副本）
+    # 启动时不能替人去调模型。界面上点「重试」接着起草没写好的表
+    from app.data import catalog_jobs
+
+    try:
+        await catalog_jobs.startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("数据目录起草任务的启动整理失败，服务照常启动")
+
     await run_manager.setup()
     from app.sandbox.manager import sandbox_manager as _sbm
 
@@ -84,8 +93,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # 先停调度，再停运行：停运行的途中不该再有新运行被发起
+        # 先停调度，再停运行：停运行的途中不该再有新运行被发起。起草任务停下来标成中断，下次启动不会再续
         await scheduler.stop()
+        await catalog_jobs.manager.shutdown()
         await run_manager.shutdown()
         from app.sandbox.manager import sandbox_manager
 

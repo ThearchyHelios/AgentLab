@@ -2790,6 +2790,8 @@ export interface CatalogTableRow {
   version: number
   updated_at: string | null
   updated_by: string | null
+  /** 这张表最近一次起草任务里的那一项（任务还在进行就是进行中的状态）；没起草过为 null。老服务端没有这个键 */
+  last_draft?: CatalogLastDraft | null
 }
 
 /** GET /datasources/{id}/catalog */
@@ -2804,6 +2806,10 @@ export interface CatalogList {
   schema_truncated?: boolean
   /** 数据库里一共几张表（含视图）；没截断时等于探查到的张数 */
   schema_total?: number
+  /** 这个数据源的起草要求（使用者补充给模型的背景和要求）；没填为 null。老服务端没有这一项 */
+  guidance?: string | null
+  /** 排队或进行中的起草任务（页面据此显示进度）；没有为 null。老服务端没有这一项 */
+  active_job?: CatalogActiveDraftJob | null
 }
 
 /** 表结构里的一列 */
@@ -2851,32 +2857,133 @@ export interface CatalogDetail {
 /** 单项审阅：确认、驳回、撤销审阅（回到来源的初始状态；人工填写的项直接删掉） */
 export type CatalogReviewAction = 'confirm' | 'reject' | 'reset'
 
-/** 起草结果里的一张表 */
-export interface CatalogDraftRow {
+// ---------------------------------------------------------------------------
+// 起草任务（/api/datasources/{id}/catalog/draft-jobs）：起草在服务端后台进行，逐表起草、每张表一结束就并入目录。
+// 关掉对话框不停任务；服务重启时还没结束的任务记 interrupted，不自动续跑，由人点「重试」接着起草。
+// ---------------------------------------------------------------------------
+
+/**
+ * 起草任务的状态：排队、进行中、完成、部分完成（有失败、部分完成或停止的表）、失败（任务整体出错）、已停止（用户停止）、
+ * 服务重启中断
+ */
+export type CatalogDraftJobStatus = 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'cancelled' | 'interrupted'
+
+/**
+ * 任务里一张表的状态。ok：写入成功（或没有东西要写），用模型时各段都写出来了；partial：用模型，有的段没写出来；
+ * failed：整张表没起草（error），或用模型时一段都没写出来（model_error），按注释、外键、命名起草的部分照常写入；
+ * skipped：表结构里没有这张表；cancelled：停止或服务重启时还没开始、没写完
+ */
+export type CatalogDraftTaskStatus = 'pending' | 'running' | 'ok' | 'partial' | 'failed' | 'skipped' | 'cancelled'
+
+/** 起草任务里的一张表（按起草顺序） */
+export interface CatalogDraftTask {
   table_name: string
+  status: CatalogDraftTaskStatus
+  /** 列数 */
+  columns: number
+  /** 模型分几段起草（超过 40 列的宽表拆成表级一段加列分段）；不用模型时为 null */
+  parts_total: number | null
+  parts_done: number
   added: number
   updated: number
   removed: number
   version: number
-  /** 这张表没有起草（表结构里没有、写入一直冲突） */
-  error: string | null
-  /** 只是模型那部分失败，其余来源照常写入。模型给了这张表、却一项可用内容都没有，也记在这里 */
-  model_error: string | null
   /**
-   * 模型给了这张表几项可用内容（并入目录之前）。没用模型、模型这部分失败时为 null（老后端没有这个键）。
+   * 模型给了这张表几项可用内容（并入目录之前）。没用模型、模型这部分失败时为 null。
    * 大于 0 而新增、更新、删除都是 0，才是「模型给了内容、只是和现有目录一致」
    */
-  model_items?: number | null
+  model_items: number | null
+  /**
+   * 模型拿不准、留空的列数：模型列出了（或这一段请它写了），中文名和含义却都没给（给了却都没通过校验的也算）。
+   * 表的状态不因此变（照旧可以是已完成）。老服务端没有这个键
+   */
+  blank_columns?: number
+  /** 留空的列里的前几个（最多 5 个，列名照表结构原样）。老服务端没有这个键 */
+  blank_sample?: string[]
+  /** 整张表没起草的原因：表结构里没有、写入一直冲突、服务重启中断 */
+  error: string | null
+  /** 模型那部分没写出来的原因和办法（第几段、哪些列、为什么） */
+  model_error: string | null
+  started_at: string | null
+  finished_at: string | null
 }
 
-/** POST /datasources/{id}/catalog/draft */
-export interface CatalogDraftOut {
-  tables: CatalogDraftRow[]
-  total: { added: number; updated: number; removed: number }
-  model_used: boolean
+/** 起草任务的模型用量 */
+export interface CatalogDraftUsage {
+  /** 调用次数（没写出来的、超时的也算） */
+  calls: number
+  /** 超时的调用不计 token（照实记 0：服务方可能已经生成了内容） */
+  input_tokens: number
+  output_tokens: number
+  /** 超时的调用次数。老服务端没有这个键 */
+  timeouts?: number
+  /** 没写出来的调用次数：额度用完、只给空壳、超时、出错。老服务端没有这个键 */
+  failed_calls?: number
+}
+
+/** 一次起草任务 */
+export interface CatalogDraftJob {
+  id: string
+  source_id: string
+  status: CatalogDraftJobStatus
+  use_model: boolean
+  /** 实际用的模型 id；不用模型、还没开始时为 null */
   model: string | null
-  /** 模型整体用不了（没有配置、已停用……）：只按注释、外键和命名起草 */
+  /** 这次用到的起草要求（数据源级那份的快照） */
+  guidance: string | null
+  /** 这次的补充说明 */
+  note: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  /** 谁建的（X-Actor） */
+  created_by: string | null
+  /** 重试建的任务记着原任务的 id，别的为 null。接口约定里没有这一项，服务端多给的；界面不用，老服务端没有这个键 */
+  retry_of?: string | null
+  /** 表数 */
+  total: number
+  /** 已结束的表数 */
+  done: number
+  counts: Record<CatalogDraftTaskStatus, number>
+  added: number
+  updated: number
+  removed: number
+  /** 各表模型拿不准、留空的列数合计。老服务端没有这个键 */
+  blank_columns?: number
+  /** 模型调用的用量；拿不到用量时照实是 0 */
+  usage: CatalogDraftUsage
+  /**
+   * 当前每段最多几列：一次起草里额度用完或超时累计 2 次后，之后新开始的段减半（40 → 20 → 10，最低 10）。
+   * 不用模型时可能为 null；老服务端没有这个键
+   */
+  part_columns?: number | null
+  /**
+   * 调用接连没写出来时的提醒（一句中文：最近几次里几次没写出来、原因，建议换起草模型、缩小范围或停止）；
+   * 好转后服务端清掉，为 null。老服务端没有这个键
+   */
+  notice?: string | null
+  /** 任务整体出错的原因 */
+  error: string | null
+  tasks: CatalogDraftTask[]
+}
+
+/** 目录清单顶上的进行中任务（GET /datasources/{id}/catalog 的 active_job） */
+export interface CatalogActiveDraftJob {
+  id: string
+  status: CatalogDraftJobStatus
+  total: number
+  done: number
+}
+
+/** 清单一行上这张表最近一次起草的结果 */
+export interface CatalogLastDraft {
+  status: CatalogDraftTaskStatus
+  job_id: string
+  finished_at: string | null
+  error: string | null
   model_error: string | null
+  /** 那次起草模型拿不准、留空的列数（同 CatalogDraftTask.blank_columns）。老服务端没有这个键 */
+  blank_columns?: number
 }
 
 /**

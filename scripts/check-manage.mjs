@@ -589,6 +589,96 @@ await section('设置 · 门控模型', async () => {
   await old.close()
 })
 
+await section('设置 · 起草模型', async () => {
+  // 数据目录「用模型起草」和按配方导入表格时的 AI 起草用的模型（catalog_draft 一组）：两项都留空跟随助手的模型；只填模型时
+  // 按模型名找接入；存着的接入停用了在那一格下面说；服务端按项拒收（422 带 field）时整句落到那一格下面。设置读写、接入表都是假的
+  const PROVIDERS = [
+    { id: 'check-draft-p1', name: 'demo-main', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'big-model',
+      models: [{ id: 'big-model' }], enabled: true, extra: {}, api_key_masked: '', has_key: true },
+    { id: 'check-draft-p2', name: 'demo-wide', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'wide-1',
+      models: [{ id: 'wide-1' }, { id: 'wide-2' }], enabled: true, extra: {}, api_key_masked: '', has_key: true },
+    { id: 'check-draft-p3', name: 'demo-off', kind: 'openai', base_url: 'https://example.com/v1', default_model: 'off-model',
+      models: [{ id: 'off-model' }], enabled: false, extra: {}, api_key_masked: '', has_key: true },
+  ]
+  let stored = await get('/settings')
+  stored = { ...stored, catalog_draft: { provider: null, model: null } }
+  // 服务端的说法（api/settings._provider_problem）：主语是这一项在设置页上的叫法
+  const REFUSED = '「起草模型 · 接入」指定的模型接入「demo-wide」已停用。请在「设置 → 模型接入」中启用它，或换一个接入'
+  let refuse = false
+  const { page, sent, errors, close } = await open('/settings/prefs', {
+    handlers: [
+      [/^GET \/settings$/, (route) => json(stored)(route)],
+      [/^PUT \/settings$/, (route, { body }) => {
+        if (refuse) {
+          refuse = false
+          return route.fulfill({ status: 422, contentType: 'application/json',
+            body: JSON.stringify({ detail: REFUSED, code: 'settings_provider_invalid', field: 'catalog_draft.provider' }) })
+        }
+        stored = { ...stored, ...body.values }
+        return json(stored)(route)
+      }],
+      [/^GET \/providers$/, json(PROVIDERS)],
+    ],
+  })
+  const box = page.locator('[data-draft-model-settings]')
+  await box.waitFor()
+  const text = (await box.innerText()).replace(/\s+/g, ' ')
+  check('偏好设置里有「起草模型」一节：说明数据目录和导入表格的起草都用它，留空跟随助手的模型',
+    text.includes('起草模型') && text.includes('数据目录') && text.includes('导入表格') && text.includes('跟随助手的模型'), text.slice(0, 160))
+  const provider = page.getByLabel('起草模型 · 接入')
+  const model = page.getByLabel('起草模型 · 模型')
+  check('……接入留空写「跟随助手的模型」，模型的占位也写明', (await provider.locator('option').first().innerText()) === '跟随助手的模型'
+    && (await model.getAttribute('placeholder')) === '留空：跟随助手的模型', await provider.locator('option').first().innerText())
+  check('……停用的接入列着但选不了', await provider.locator('option[value="demo-off"]').evaluate((o) => o.disabled))
+  // 只填模型：按模型名找接入，写明用的是哪家
+  await model.fill('wide-2')
+  check('只填模型：写明按模型名使用哪个接入', (await box.innerText()).includes('将按模型名使用接入「demo-wide」'), (await box.innerText()).replace(/\s+/g, ' ').slice(0, 200))
+  check('……接入那一格的空选项改叫「按模型名找接入」', (await provider.locator('option').first().innerText()) === '按模型名找接入')
+  await provider.selectOption('demo-wide')
+  const bar = (await page.locator('[data-prefs-bar]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('……改了两项：保存条写「起草模型 · 接入、起草模型 · 模型」', bar.includes('有 2 项未保存') && bar.includes('起草模型 · 接入')
+    && bar.includes('起草模型 · 模型'), bar)
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForTimeout(500)
+  const put = sent.filter((s) => s.key === 'PUT /settings').at(-1)
+  check('保存只 PUT catalog_draft 一组：接入、模型', Object.keys(put?.body?.values ?? {}).join() === 'catalog_draft'
+    && JSON.stringify(put.body.values.catalog_draft) === JSON.stringify({ provider: 'demo-wide', model: 'wide-2' }), JSON.stringify(put?.body?.values))
+  await shot(page, 'prefs-draft-model')
+  // 换接入：原来填的模型不在新接入里就清掉；都清空存成 null（跟随助手的模型）
+  await provider.selectOption('demo-main')
+  check('换了接入，旧接入的模型清掉', await model.inputValue() === '', await model.inputValue())
+  await provider.selectOption('')
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForTimeout(500)
+  const put2 = sent.filter((s) => s.key === 'PUT /settings').at(-1)?.body?.values?.catalog_draft
+  check('……两项都留空：存成 null', JSON.stringify(put2) === JSON.stringify({ provider: null, model: null }), JSON.stringify(put2))
+  // 服务端按项拒收：整句落到接入那一格下面，焦点移过去
+  refuse = true
+  await provider.selectOption('demo-wide')
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForTimeout(500)
+  const said = await page.locator('#pref-draft-provider-error').innerText().catch(() => '')
+  check('服务端按项拒收（422 带 field）：整句落到「起草模型 · 接入」下面', said === REFUSED, said)
+  check('……焦点移到那一格', await page.locator('#pref-draft-provider').evaluate((el) => el === document.activeElement))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+
+  // 存着的接入后来停用了：那一格下面说清起草会怎样
+  const disabled = { ...stored, catalog_draft: { provider: 'demo-off', model: null } }
+  const off = await open('/settings/prefs', { handlers: [[/^GET \/settings$/, (route) => json(disabled)(route)], [/^GET \/providers$/, json(PROVIDERS)]] })
+  await off.page.locator('[data-draft-model-settings]').waitFor().catch(() => {})
+  const offSaid = await off.page.locator('#pref-draft-provider-error').innerText().catch(() => '')
+  check('存着的接入已停用：那一格下面说清用模型起草会失败', offSaid.includes('模型接入「demo-off」已停用') && offSaid.includes('起草'), offSaid)
+  check('没有运行时报错', off.errors.length === 0, off.errors[0] ?? '')
+  await off.close()
+  // 老服务端：设置里没有这一组，不显示这一节
+  const legacy = Object.fromEntries(Object.entries(stored).filter(([k]) => k !== 'catalog_draft'))
+  const old = await open('/settings/prefs', { handlers: [[/^GET \/settings$/, (route) => json(legacy)(route)], [/^GET \/providers$/, json(PROVIDERS)]] })
+  check('老服务端没有这一组：不显示「起草模型」，也没有保存条', await old.page.locator('[data-draft-model-settings]').count() === 0
+    && await old.page.locator('[data-prefs-bar]').count() === 0)
+  await old.close()
+})
+
 await section('设置 · 点名的接入已停用或不存在', async () => {
   // 点名停用的接入以前照常调用，现在运行时照实报错（K1）：存着的值后来被停用了，那一格下面要说；别的停用接入列着但选不了；
   // 服务端按项拒收（422 带 field）时整句落到那一格下面、焦点移过去，保存条上原因不截断。接入表、设置读写都是假的

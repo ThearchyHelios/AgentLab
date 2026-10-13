@@ -7,11 +7,16 @@
 - POST   /catalog/{table}/patch/preview  目录修改提案的预览（只读）：对着当前目录算改前、改后
 - POST   /catalog/{table}/patch  保存目录修改提案（乐观锁），记为人工确认
 - GET    /catalog/{table}/impact 影响面：引用这张表的已发布、受管模板（data/catalog_impact.py）
-- POST   /catalog/draft          同步起草（注释、外键、命名推断，可选模型）
+- POST   /catalog/draft          同步起草（注释、外键、命名推断，可选模型）。界面改用下面的后台起草任务，这个留着；
+                                 同一个源有排队或进行中的后台任务时 409 catalog_draft_busy
+- PUT    /catalog/guidance       数据源级的起草要求（使用者补充的背景和要求，起草时交给模型）
+- POST   /catalog/draft-jobs     建后台起草任务（202）；GET /draft-jobs/active、/latest、/{job_id} 读任务；
+                                 POST /draft-jobs/{job_id}/cancel 停止，/retry 只重试没写好的表（data/catalog_jobs.py）
 - POST   /catalog/profile        同步剖析：对业务库发少量只读查询，核对关系、取码值候选（data/catalog_profile.py）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
 不对 422，源或表不存在 404。所有写操作记录请求头 X-Actor 的署名（自报、未认证）。剖析没开启、正在剖析 409。
+起草任务的 409 带机读码（api/coded.py）：同一个源已有排队或进行中的任务、起草模型用不了、要停止的任务已经结束。
 
 上传表格的源按当前快照的表结构回答（table_versions.resolve_source），和查询实际用的库是同一个版本。
 """
@@ -19,13 +24,17 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.coded import PROFILE_BUSY, SCHEMA_MISSING, SNAPSHOT_TAMPERED, CodedHTTPException
+from app.api.coded import (
+    CATALOG_DRAFT_BUSY, CATALOG_DRAFT_FINISHED, CATALOG_DRAFT_MODEL_UNAVAILABLE, PROFILE_BUSY, SCHEMA_MISSING,
+    SNAPSHOT_TAMPERED, CodedHTTPException,
+)
 from app.api.runs import actor_of
-from app.data import catalog, catalog_impact, catalog_profile, introspect, table_versions
+from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, introspect, table_versions
 from app.data.engine import SnapshotTampered
 from app.db.base import get_session
 from app.db.models import DataSource
@@ -64,8 +73,24 @@ class CatalogPatchIn(CatalogPatchPreviewIn):
 class CatalogDraftIn(BaseModel):
     #: 要起草的表；不给或为空时按使用次数取前 20 张
     tables: list[str] | None = Field(default=None, max_length=200)
-    #: 是否请助手的模型起草中文名、粒度、列的含义等
+    #: 是否请起草模型（设置里的起草模型，没设沿用助手的模型）写中文名、粒度、列的含义等
     use_model: bool = False
+
+
+class DraftJobIn(BaseModel):
+    #: 要起草的表；不给或为空时按使用次数取前 20 张。最多 500 张（超了 422，说明是中文）
+    tables: list[str] | None = None
+    #: 是否请起草模型写中文名、粒度、列的含义等
+    use_model: bool = False
+    #: 这一次的补充说明，和数据源级的起草要求一起交给模型（最多 1000 字）
+    note: str | None = None
+
+
+#: PUT /catalog/guidance 的请求 {guidance: string}：数据源级的起草要求，空串（或 null）清除，最多 2000 字。必须写
+#: 这一项：表名恰好叫 guidance 时，整份提交那张表目录的请求也落到这个路径上，不能把它当成「清除起草要求」。
+#: 没写、不是文字都回 422，说明是中文的一句话（同超长）
+GUIDANCE_MISSING = "请求里要写起草要求（guidance 一项，一段文字；要清除起草要求请传空串）"
+GUIDANCE_NOT_TEXT = "起草要求要是一段文字（要清除起草要求请传空串）"
 
 
 class CatalogProfileIn(BaseModel):
@@ -100,7 +125,7 @@ def _item_value(notes: dict[str, Any], name: str) -> tuple[Any, str | None]:
 
 
 def _summary_row(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogEntry | None,
-                 usage: int) -> dict[str, Any]:
+                 usage: int, last_draft: dict[str, Any] | None = None) -> dict[str, Any]:
     notes = entry.notes if entry else {}
     label, label_status = _item_value(notes, "label")
     kind, _ = _item_value(notes, "kind")
@@ -120,6 +145,9 @@ def _summary_row(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogE
         "version": entry.version if entry else 0,
         "updated_at": _iso(entry.updated_at) if entry else None,
         "updated_by": entry.updated_by if entry else None,
+        # 这张表最近一次起草任务里的那一项：{status, job_id, finished_at, error, model_error, blank_columns}，没起草过
+        # 是 null
+        "last_draft": last_draft,
     }
 
 
@@ -180,15 +208,18 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
     说明有没有截断，schema_total 是数据库里一共几张表（含视图），界面据此说明「只探查了前 200 张」。老缓存没记
     总数时按探查到的张数算。
     """
-    _, source = await _resolved(session, source_id)
+    row, source = await _resolved(session, source_id)
     cache = source.schema_cache or {}
     tables = cache.get("tables") or {}
     entries = await catalog.read_catalog(session, source.id)
     usage = await catalog.table_usage(session, source)
+    drafts = await catalog_jobs.last_drafts(session, source.id)
     order = {name: i for i, name in enumerate(tables)}
-    rows = [_summary_row(name, meta, entries.get(name), usage.get(name, 0)) for name, meta in tables.items()]
+    rows = [_summary_row(name, meta, entries.get(name), usage.get(name, 0), drafts.get(name))
+            for name, meta in tables.items()]
     rows.sort(key=lambda r: (-r["usage"], order[r["table_name"]]))
-    rows += [_summary_row(name, None, entry, 0) for name, entry in sorted(entries.items()) if name not in tables]
+    rows += [_summary_row(name, None, entry, 0, drafts.get(name))
+             for name, entry in sorted(entries.items()) if name not in tables]
     return {
         "tables": rows,
         "system_notes": catalog.system_notes_source(source),
@@ -196,6 +227,10 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
         "schema_note": None if tables else introspect.why_empty(cache),
         "schema_truncated": bool(cache.get("truncated")),
         "schema_total": max(_int(cache.get("total")), len(tables)),
+        # 数据源级的起草要求（没有是 null）
+        "guidance": catalog_jobs.guidance_of(row),
+        # 排队或进行中的起草任务 {id, status, total, done}，界面据此显示进度；没有是 null
+        "active_job": await catalog_jobs.job_brief(session, await catalog_jobs.active_job(session, source.id)),
     }
 
 
@@ -205,6 +240,156 @@ async def get_catalog_table(source_id: str, table: str,
     _, source = await _resolved(session, source_id)
     key, entry = await _table_key(session, source, table)
     return await _detail(session, source, key, entry)
+
+
+async def _source_row(session: AsyncSession, source_id: str) -> DataSource:
+    row = await session.get(DataSource, source_id)
+    if row is None:
+        raise HTTPException(404, "数据源不存在，可能已被删除")
+    return row
+
+
+@router.put("/{source_id}/catalog/guidance")
+async def put_catalog_guidance(source_id: str, body: dict[str, Any] = Body(...),
+                               x_actor: str | None = Header(default=None),
+                               session: AsyncSession = Depends(get_session)) -> Any:
+    """存数据源级的起草要求：去首尾空白，空串清除，最多 2000 字（超了 422）。上传表格的源存在它自己的数据源记录上。
+
+    要登记在 PUT /catalog/{table} 前面：不然「guidance」会被当成表名。反过来，表名恰好叫 guidance 时，整份提交那张表
+    目录的请求（{notes, if_version}，没有 guidance 这一项）也落到这里：照旧当作那张表的整份提交。"""
+    if "guidance" not in body and "notes" in body:
+        try:
+            table_payload = CatalogPutIn.model_validate(body)
+        except ValidationError as e:
+            raise RequestValidationError(e.errors()) from e
+        return await put_catalog_table(source_id, "guidance", table_payload, x_actor=x_actor, session=session)
+    if "guidance" not in body:
+        raise HTTPException(422, GUIDANCE_MISSING)
+    guidance = body["guidance"]
+    if guidance is not None and not isinstance(guidance, str):
+        raise HTTPException(422, GUIDANCE_NOT_TEXT)
+    row = await _source_row(session, source_id)
+    try:
+        value = await catalog_jobs.save_guidance(session, row, guidance)
+    except catalog_jobs.TextTooLong as e:
+        raise HTTPException(422, str(e)) from e
+    return {"guidance": value}
+
+
+async def _ensure_model(session: AsyncSession) -> None:
+    """起草模型用不了（没有接入、停用、只有演示接入……）：409，不建任务。说法同同步起草时的 model_error。"""
+    try:
+        await catalog_jobs.check_model(session)
+    except catalog.CatalogModelUnavailable as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_MODEL_UNAVAILABLE) from e
+
+
+def _no_schema(cache: dict[str, Any]) -> HTTPException:
+    return HTTPException(409, f"{introspect.why_empty(cache)}，无法起草数据目录。请先在数据源卡片上点「探查结构」")
+
+
+@router.post("/{source_id}/catalog/draft-jobs", status_code=202)
+async def create_draft_job(source_id: str, payload: DraftJobIn, x_actor: str | None = Header(default=None),
+                           session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """建后台起草任务，马上返回（202，任务是排队中）。同一个源已有排队或进行中的任务 409 catalog_draft_busy（界面改去
+    GET /draft-jobs/active 显示那一个）；用模型而起草模型用不了 409 catalog_draft_model_unavailable；没有表结构 409。
+    表结构里没有的表照样建进任务、状态 skipped。"""
+    if payload.tables and len(payload.tables) > catalog_jobs.MAX_TABLES:
+        raise HTTPException(422, f"一次最多起草 {catalog_jobs.MAX_TABLES} 张表，当前 {len(payload.tables)} 张，"
+                                 "请分几次起草")
+    try:
+        note = catalog_jobs.clean_text(payload.note, catalog_jobs.NOTE_MAX, "本次说明")
+    except catalog_jobs.TextTooLong as e:
+        raise HTTPException(422, str(e)) from e
+    row, source = await _resolved(session, source_id)
+    try:
+        await catalog_jobs.ensure_idle(session, row)
+    except catalog_jobs.DraftBusy as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
+    cache = source.schema_cache or {}
+    if not cache.get("tables"):
+        raise _no_schema(cache)
+    if payload.use_model:
+        await _ensure_model(session)
+    try:
+        job, tasks = await catalog_jobs.create_job(session, row, source, tables=payload.tables or None,
+                                                   use_model=payload.use_model, note=note, actor=actor_of(x_actor))
+    except catalog_jobs.DraftBusy as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
+    catalog_jobs.manager.start(job.id)
+    return {"job": catalog_jobs.job_dict(job, tasks)}
+
+
+@router.get("/{source_id}/catalog/draft-jobs/active")
+async def active_draft_job(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """排队或进行中的那个起草任务，没有是 null。"""
+    row = await _source_row(session, source_id)
+    return {"job": await catalog_jobs.job_out(session, await catalog_jobs.active_job(session, row.id))}
+
+
+@router.get("/{source_id}/catalog/draft-jobs/latest")
+async def latest_draft_job(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """最近建的一个起草任务（任何状态），没有是 null。"""
+    row = await _source_row(session, source_id)
+    return {"job": await catalog_jobs.job_out(session, await catalog_jobs.latest_job(session, row.id))}
+
+
+async def _job_or_404(session: AsyncSession, source_id: str, job_id: str) -> tuple[DataSource, Any]:
+    row = await _source_row(session, source_id)
+    job = await catalog_jobs.load(session, row.id, job_id)
+    if job is None:
+        raise HTTPException(404, "起草任务不存在，可能属于别的数据源，或者已随数据源删除")
+    return row, job
+
+
+@router.get("/{source_id}/catalog/draft-jobs/{job_id}")
+async def get_draft_job(source_id: str, job_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _, job = await _job_or_404(session, source_id, job_id)
+    return {"job": await catalog_jobs.job_out(session, job)}
+
+
+@router.post("/{source_id}/catalog/draft-jobs/{job_id}/cancel")
+async def cancel_draft_job(source_id: str, job_id: str,
+                           session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """停止：排队的直接停止；进行中的停掉正在进行的模型调用，没开始和没写完的表记停止，已经写进目录的不回滚。
+    已经结束的 409 catalog_draft_finished。返回停止之后的任务。"""
+    row, job = await _job_or_404(session, source_id, job_id)
+    owner = row.id
+    try:
+        await catalog_jobs.cancel(session, job)
+    except catalog_jobs.DraftFinished as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_FINISHED) from e
+    session.expire_all()                  # 后台在别的会话里收的尾：重新读
+    return {"job": await catalog_jobs.job_out(session, await catalog_jobs.load(session, owner, job_id))}
+
+
+@router.post("/{source_id}/catalog/draft-jobs/{job_id}/retry", status_code=202)
+async def retry_draft_job(source_id: str, job_id: str, x_actor: str | None = Header(default=None),
+                          session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """重试：新任务，只含原任务里没写好（failed、partial）和停止了（cancelled）的表；用不用模型、本次说明沿用，起草要求
+    取数据源当前的。有排队或进行中的任务 409 catalog_draft_busy；没有可重试的表 422；起草模型用不了 409。"""
+    _, old = await _job_or_404(session, source_id, job_id)
+    row, source = await _resolved(session, source_id)
+    try:
+        await catalog_jobs.ensure_idle(session, row)
+    except catalog_jobs.DraftBusy as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
+    try:
+        tables = await catalog_jobs.retry_tables(session, old)
+    except catalog_jobs.NothingToRetry as e:
+        raise HTTPException(422, str(e)) from e
+    cache = source.schema_cache or {}
+    if not cache.get("tables"):
+        raise _no_schema(cache)
+    if old.use_model:
+        await _ensure_model(session)
+    try:
+        job, tasks = await catalog_jobs.create_job(session, row, source, tables=tables, use_model=old.use_model,
+                                                   note=old.note, actor=actor_of(x_actor), retry_of=old.id)
+    except catalog_jobs.DraftBusy as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
+    catalog_jobs.manager.start(job.id)
+    return {"job": catalog_jobs.job_dict(job, tasks)}
 
 
 @router.put("/{source_id}/catalog/{table}")
@@ -228,17 +413,26 @@ async def put_catalog_table(source_id: str, table: str, payload: CatalogPutIn,
 async def draft_catalog(source_id: str, payload: CatalogDraftIn,
                         x_actor: str | None = Header(default=None),
                         session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """同步起草。返回每张表新增、更新、删除了几项；模型用不了或某张表的模型起草失败，照实写在结果里。
+    """同步起草（界面改用后台起草任务，这个接口留着，返回形状不变）。引擎同后台任务（分段、按失败原因处理），起草要求
+    取数据源级的那份。返回每张表新增、更新、删除了几项；模型用不了或某张表的模型起草失败，照实写在结果里。
 
     model_items：模型给了这张表几项可用内容（没用模型、模型这部分失败时为 null）。界面据此区分「模型给了内容、
     只是和现有目录一致」（model_items > 0、三个数都是 0）和「模型没给内容」（model_error 有值）。
+
+    同一个源有排队或进行中的后台起草任务时 409 catalog_draft_busy（和建任务同一句话）：两边同时写同一个源的目录、
+    抢模型名额。
     """
-    _, source = await _resolved(session, source_id)
+    row, source = await _resolved(session, source_id)
+    try:
+        await catalog_jobs.ensure_idle(session, row)
+    except catalog_jobs.DraftBusy as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     cache = source.schema_cache or {}
     if not cache.get("tables"):
-        raise HTTPException(409, f"{introspect.why_empty(cache)}，无法起草数据目录。请先在数据源卡片上点「探查结构」")
+        raise _no_schema(cache)
     report = await catalog.draft_catalog(session, source, tables=payload.tables or None,
-                                         use_model=payload.use_model, actor=actor_of(x_actor))
+                                         use_model=payload.use_model, actor=actor_of(x_actor),
+                                         guidance=catalog_jobs.guidance_of(row))
     rows = [{"table_name": r.table, "added": r.added, "updated": r.updated, "removed": r.removed,
              "version": r.version, "error": r.error, "model_error": r.model_error, "model_items": r.model_items}
             for r in report.tables]

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -86,7 +87,8 @@ async def test_the_model_and_the_snapshot_see_only_masks_when_the_analysis_fails
     assert _clean(json.dumps(snapshot, ensure_ascii=False))
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         got = await client.get(f"/api/artifacts/{out.queries[0]['artifact']}")
-    assert got.status_code == 200 and _clean(got.text) and "1200" not in got.text
+    # 金额原值不出现。先去掉哈希再查：工件 id、快照里记的哈希是随机的十六进制，偶尔碰巧含「1200」
+    assert got.status_code == 200 and _clean(got.text) and "1200" not in re.sub(r"[0-9a-f]{32,}", "", got.text)
     assert out.result["value"] is None
     assert out.cells[0]["reason"] == "Q1 的写法认不全，整份结果查询时已遮罩，不采信"
 

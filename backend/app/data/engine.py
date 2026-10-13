@@ -62,12 +62,18 @@ MASK_COLUMNS_OPTION = "mask_columns"
 #: data/catalog_profile.py；放在这里只为让拼连接串时摘掉它
 CATALOG_PROFILE_OPTION = "catalog_profile"
 
+#: 数据源 options 里的数据目录起草要求：使用者补充的背景和要求，起草时交给模型（一段文字，最多 2000 字）。
+#: 只经 PUT /api/datasources/{id}/catalog/guidance 维护，见 data/catalog_jobs.py；放在这里只为让拼连接串时摘掉它
+CATALOG_DRAFT_GUIDANCE_OPTION = "catalog_draft_guidance"
+
 # options 里这些 key 是 AgentLab 自己的配置，不是驱动参数，拼 URL 时要摘掉。
 # schema：探查哪个 schema（企业库里只读账号名下常常什么都没有，数据在别处）
 # query_timeout_s：查询时限，由数据层按语句下发给数据库，见 _server_deadline
 # mask_columns：证据面板遮罩的列，驱动不认识它，拼进连接串会被当成未知参数拒掉
 # catalog_profile：数据剖析设置，同上；它还是个对象，拼进去连 URL 都不成形
-_NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION, MASK_COLUMNS_OPTION, CATALOG_PROFILE_OPTION})
+# catalog_draft_guidance：数据目录的起草要求，一段中文，拼进去连接直接失败
+_NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION, MASK_COLUMNS_OPTION, CATALOG_PROFILE_OPTION,
+                                 CATALOG_DRAFT_GUIDANCE_OPTION})
 
 _MASK_SPLIT = re.compile(r"[,，、;；\n]+")
 
