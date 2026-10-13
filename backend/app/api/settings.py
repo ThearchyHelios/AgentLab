@@ -14,6 +14,7 @@ from app.api.coded import CodedHTTPException
 from app.core.errors import explain, not_configured, raw
 from app.core.config import settings as app_settings
 from app.core.crypto import encrypt, mask
+from app.data.draft_model import CATALOG_DRAFT_SETTING_KEY, setting_pair
 from app.db.base import get_session
 from app.db.models import Provider, Setting
 from app.engine.judge import JUDGE_DEFAULTS, MAX_TOKENS as JUDGE_MAX_TOKENS
@@ -570,6 +571,39 @@ async def verify_model_spec(session: AsyncSession, node_config: dict[str, Any] |
 
 
 # --------------------------------------------------------------------------
+# 起草模型：数据目录的「用模型起草」和按配方导入的 AI 起草用哪个模型
+# --------------------------------------------------------------------------
+
+#: 设置里 catalog_draft 这一组：{provider, model}。都留空时沿用助手的模型，再没有就是默认接入（取值顺序见
+#: data/draft_model.py，两处起草共用）。只放接入和模型：额度、思考由两处起草各自定
+CATALOG_DRAFT_GROUP = CATALOG_DRAFT_SETTING_KEY
+CATALOG_DRAFT_DEFAULTS: dict[str, Any] = {"provider": None, "model": None}
+#: 设置页「起草模型」一节各项的叫法：报错时写它，不写键名
+CATALOG_DRAFT_LABEL = {"provider": "起草模型 · 接入", "model": "起草模型 · 模型"}
+
+
+def catalog_draft_problem(value: Any) -> str | None:
+    """设置页写进来的 catalog_draft 这一组有什么问题，没问题返回 None。点名的接入在不在由 _provider_problem 查。"""
+    if not isinstance(value, dict):
+        return f"「起草模型」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key, item in value.items():
+        if key not in CATALOG_DRAFT_DEFAULTS:
+            return (f"「起草模型」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{CATALOG_DRAFT_LABEL[k]}」" for k in CATALOG_DRAFT_DEFAULTS))
+        if item is not None and not isinstance(item, str):
+            # 「跟随助手的模型」是设置页接入下拉框空选项的原话
+            what = "模型接入的名称" if key == "provider" else "模型 ID"
+            return f"「{CATALOG_DRAFT_LABEL[key]}」需要填写{what}，留空表示跟随助手的模型，当前为「{item}」"
+    return None
+
+
+def catalog_draft_values(stored: Any) -> dict[str, Any]:
+    """库里存的 catalog_draft 一组 → 补齐默认、规范化（去掉首尾空白，空串和存坏了的当没填）。"""
+    provider, model = setting_pair(stored)
+    return {"provider": provider, "model": model}
+
+
+# --------------------------------------------------------------------------
 # 通知：定时任务推送 Webhook 时拼运行链接用的对外访问地址
 # --------------------------------------------------------------------------
 
@@ -661,6 +695,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     VERIFY_GROUP: verify_values(None),
     # 通知：定时任务的 Webhook 里拼运行链接用的对外访问地址
     NOTIFY_GROUP: notify_values(None),
+    # 起草模型：数据目录起草、按配方导入的 AI 起草用的模型，留空沿用助手的模型
+    CATALOG_DRAFT_GROUP: catalog_draft_values(None),
 }
 
 
@@ -717,6 +753,7 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     merged[JUDGE_GROUP] = judge_values(stored.get(JUDGE_GROUP))
     merged[VERIFY_GROUP] = verify_values(stored.get(VERIFY_GROUP))
     merged[NOTIFY_GROUP] = notify_values(stored.get(NOTIFY_GROUP))
+    merged[CATALOG_DRAFT_GROUP] = catalog_draft_values(stored.get(CATALOG_DRAFT_GROUP))
     for key, value in stored.items():
         merged.setdefault(key, value)
     return merged
@@ -731,8 +768,8 @@ PROVIDER_INVALID = "settings_provider_invalid"
 
 
 def _provider_fields() -> dict[tuple[str, str], tuple[str, str | None]]:
-    """设置里点名模型接入的项：(组, 键) → (这一项在界面上的叫法, 同一组模型那一项的叫法)。门控、裁判、核查的叫法和
-    设置页一致；助手的模型由「编排」页助手栏的「助手使用的模型」单独设定（PUT /api/copilot/model），只有这一个下拉框
+    """设置里点名模型接入的项：(组, 键) → (这一项在界面上的叫法, 同一组模型那一项的叫法)。门控、裁判、核查、起草模型的
+    叫法和设置页一致；助手的模型由「编排」页助手栏的「助手使用的模型」单独设定（PUT /api/copilot/model），只有这一个下拉框
     （模型那一项为 None），这里只防经设置接口写进去的那一份。"""
     from app.api.copilot import COPILOT_SETTING_KEY   # 在这里导入：copilot 模块很大，设置模块被引擎各处导入
     from app.providers.factory import ASSISTANT_MODEL_FIELD
@@ -741,6 +778,7 @@ def _provider_fields() -> dict[tuple[str, str], tuple[str, str | None]]:
         ("run", "tool_gate_provider"): ("门控模型 · 接入", "门控模型 · 模型"),
         (JUDGE_GROUP, "provider"): (JUDGE_LABEL["provider"], JUDGE_LABEL["model"]),
         (VERIFY_GROUP, "provider"): (VERIFY_SETTING_LABEL["provider"], VERIFY_SETTING_LABEL["model"]),
+        (CATALOG_DRAFT_GROUP, "provider"): (CATALOG_DRAFT_LABEL["provider"], CATALOG_DRAFT_LABEL["model"]),
         (COPILOT_SETTING_KEY, "provider"): (ASSISTANT_MODEL_FIELD, None),
     }
 
@@ -797,6 +835,9 @@ async def put_settings(
     if JUDGE_GROUP in payload.values and (problem := judge_problem(payload.values[JUDGE_GROUP])):
         raise HTTPException(422, problem)
     if VERIFY_GROUP in payload.values and (problem := verify_problem(payload.values[VERIFY_GROUP])):
+        raise HTTPException(422, problem)
+    if CATALOG_DRAFT_GROUP in payload.values and (
+            problem := catalog_draft_problem(payload.values[CATALOG_DRAFT_GROUP])):
         raise HTTPException(422, problem)
     if NOTIFY_GROUP in payload.values:
         if problem := notify_problem(payload.values[NOTIFY_GROUP]):

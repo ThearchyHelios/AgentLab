@@ -1401,15 +1401,25 @@ def draft_structure(source: Any, table: str) -> TableDraft:
 # 起草：模型（可选，按表分批，结构化输出）
 # ==========================================================================
 
-#: 每批最多几张表、合计多少列。一批太大模型容易漏表、输出被截断；太小则调用次数多
+#: 每次调用最多几张表、合计多少列（data/catalog_draft.py 按它分段）。实测每列约 50 个输出 token（不算思考），
+#: 会思考的模型思考也算在输出额度里：一段太大，想完就没额度写正文。列数超过 MODEL_BATCH_COLUMNS 的宽表拆成
+#: 「表级一段 + 列分段」，每个列分段也不超过这个列数
 MODEL_BATCH_TABLES = 4
-MODEL_BATCH_COLUMNS = 120
-#: 同时发出的批数
+MODEL_BATCH_COLUMNS = 40
+#: 全进程同时进行的模型调用最多几个（所有起草任务、同步起草共用）
 MODEL_CONCURRENCY = 3
-#: 一批最多等多久
-MODEL_TIMEOUT_S = 120
-#: 输出额度。一批四张表的目录远用不完；给太大的额度有的服务方会直接拒收
-MODEL_MAX_TOKENS = 8192
+#: 单次调用最多等多久（秒）。会思考的模型想得久，一段 40 列常常要几分钟
+MODEL_TIMEOUT_S = 420
+#: 输出额度。会思考的模型（经 OpenAI 兼容网关的推理模型等）思考也算在里面：8192 时上百列的表常常想完就没额度
+#: 写正文。保留思考（不关），加大额度；服务方嫌额度太大时退回 MODEL_FALLBACK_MAX_TOKENS（同 copilot、recipe_ai）
+MODEL_MAX_TOKENS = 32768
+MODEL_FALLBACK_MAX_TOKENS = 8192
+#: 一段没写出来（额度用完、只给空壳）时拆成两半再问：最多拆几层、拆到最少几列为止
+MODEL_SPLIT_DEPTH = 3
+MODEL_SPLIT_MIN_COLUMNS = 5
+#: 网络错误、429、5xx、超时最多重试几次，每次重试前等多久（秒，依次取用）
+MODEL_RETRIES = 2
+MODEL_RETRY_DELAYS_S = (10.0, 30.0)
 #: 不指定表时起草使用次数最多的前几张
 DRAFT_DEFAULT_TABLES = 20
 
@@ -1502,38 +1512,60 @@ CATALOG_DRAFT_PROMPT_SCHEMA: dict[str, Any] = {
 _P = CATALOG_DRAFT_PROMPT_LABELS
 
 
+class DraftModel:
+    """起草用的模型：先按 MODEL_MAX_TOKENS 的额度调；服务方嫌额度太大（budget_rejected）时换成 MODEL_FALLBACK_MAX_TOKENS
+    的那一个，之后的调用都用它（shrink）。一次起草（一个起草任务、一次同步起草）共用一个，退回之后不再先失败一次。
+
+    只转发起草用到的两个方法：with_structured_output 每次都取当前那个模型的，ainvoke 同理。"""
+
+    def __init__(self, big: Any, small: Any | None, model_name: str = "") -> None:
+        self.model, self._small = big, small
+        self.model_name = model_name
+        self.budget = MODEL_MAX_TOKENS
+
+    def shrink(self) -> bool:
+        """换成小额度的模型。已经换过、没有小的，返回 False。"""
+        if self._small is None or self.model is self._small:
+            return False
+        self.model, self.budget = self._small, MODEL_FALLBACK_MAX_TOKENS
+        return True
+
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
+        return self.model.with_structured_output(schema, **kwargs)
+
+    async def ainvoke(self, messages: list[Any]) -> Any:
+        return await self.model.ainvoke(messages)
+
+
 async def resolve_draft_model(session: AsyncSession) -> tuple[Any, str]:
-    """(模型, 模型 id)：用设置里助手的模型，关掉思考、温度 0。没有可用的模型抛 CatalogModelUnavailable。
+    """(模型, 模型 id)：用哪个接入、哪个模型按 data/draft_model.py 的顺序（设置里的起草模型 > 助手的模型 > 默认接入），
+    和按配方导入的 AI 起草共用。没有可用的模型抛 CatalogModelUnavailable。
+
+    不关思考（spec 里不传 thinking，按接入默认）、温度 0、额度 MODEL_MAX_TOKENS，服务方嫌大时退回
+    MODEL_FALLBACK_MAX_TOKENS（DraftModel）。单次调用的时限 MODEL_TIMEOUT_S 也交给 SDK，免得它先按全局的 5 分钟断开。
+    只建模型对象，不发请求。
 
     和 recipe_ai.resolve_draft_model 一样不用 get_chat_model：它在没有接入时静默退回演示模型，拿演示模型
-    起草出来的目录会被当成真的写进库里。数据层不导入接口层，设置键取 recipe_ai 里那份（与助手的同值，
-    那边有测试核对）。
+    起草出来的目录会被当成真的写进库里。
     """
-    from app.data.recipe_ai import COPILOT_SETTING_KEY
-    from app.db.models import Setting
-    from app.providers.factory import (
-        ModelSpec, ProviderNotConfigured, assistant_unavailable, build_chat_model, resolve_provider,
-    )
+    from app.data.draft_model import DraftModelUnavailable, draft_unavailable, resolve_draft_provider
+    from app.providers.factory import ModelSpec, ProviderNotConfigured, build_chat_model
 
-    row = await session.get(Setting, COPILOT_SETTING_KEY)
-    saved = (row.value if row else None) or {}
-    spec = ModelSpec(provider=saved.get("provider") or None, model=saved.get("model") or None,
-                     max_tokens=MODEL_MAX_TOKENS, temperature=0, thinking="off")
     try:
-        # 存的接入名不存在、已停用，只存了模型名、提供它的接入已停用：resolve_provider 都会报出来
-        provider = await resolve_provider(session, spec.provider, spec.model)
-    except ProviderNotConfigured as e:
-        raise CatalogModelUnavailable(assistant_unavailable(e)) from e
-    if provider is None:
-        raise CatalogModelUnavailable("未配置模型接入，无法由助手起草数据目录。请到「设置 → 模型接入」添加")
-    if provider.kind == "mock":
-        raise CatalogModelUnavailable("当前只有演示用的模型接入，无法用于起草数据目录。"
-                                      "请到「设置 → 模型接入」添加真实的模型接入")
+        provider, choice = await resolve_draft_provider(
+            session, none_reason="未配置模型接入，无法由模型起草数据目录。请到「设置 → 模型接入」添加",
+            mock_reason="当前只有演示用的模型接入，无法用于起草数据目录。请到「设置 → 模型接入」添加真实的模型接入")
+    except DraftModelUnavailable as e:
+        raise CatalogModelUnavailable(str(e)) from e
+    spec = ModelSpec(provider=choice.provider, model=choice.model, max_tokens=MODEL_MAX_TOKENS, temperature=0,
+                     timeout=MODEL_TIMEOUT_S)
     try:
-        model = build_chat_model(provider, spec)
+        big = build_chat_model(provider, spec)
+        small = build_chat_model(provider, spec.model_copy(update={"max_tokens": MODEL_FALLBACK_MAX_TOKENS}))
     except ProviderNotConfigured as e:
-        raise CatalogModelUnavailable(assistant_unavailable(e)) from e
-    return model, spec.model or provider.default_model or ""
+        raise CatalogModelUnavailable(draft_unavailable(e, choice.origin)) from e
+    model_id = spec.model or provider.default_model or ""
+    return DraftModel(big, small, model_id), model_id
 
 
 def _confirmed_only(notes: Mapping[str, Any] | None) -> dict[str, Any]:
