@@ -12,6 +12,8 @@
 - base：一份报告，引用口径卡、门店流水（没有遮罩）、会员消费（有遮罩）各一处，一个没有出处的数，一张门店流水整表
   （数字列右对齐，数字与取值共 21 个，超过折叠的条数）；一条封存之后追加的按需裁判
 - two-reports：另有一份月报，两份报告各自的引用链
+- metric-only：只引用口径卡指标的报告——正文没有一处 [[v:]]，门店流水的快照从口径卡的输入这一条路随文件附带，
+  引用链（④）按「已核对的口径卡的输入」认它；点开数字看得到指标、原式、代入式、输入和复算
 - legacy：早期运行，封存范围按结束事件推算（运行结束事件在范围外，运行结果无法核对）
 - failed：失败结束的运行（没有出具判定），封存说明多一句「继续运行会重新封存」
 - continued：早期运行先失败、经继续运行跑到成功：范围里有那条运行失败，之后运行又继续了，成功结束的那条在范围外
@@ -66,8 +68,41 @@ REGIONS = {"columns": ["region", "spend"], "column_types": {"region": "text", "s
            "rows": [["华东", 320.0], ["华南", 188.5]], "source": "crm",
            "sql": "SELECT region, SUM(spend) AS spend FROM members GROUP BY region ORDER BY region", "truncated": False,
            "mask_columns": ["phone"]}
-CARD = {"kind": "metric_set", "caliber": "周报口径", "caliber_version": "v2",
-        "metrics": [{"id": "gmv", "name": "销售额", "value": 8381.25, "unit": "元", "decimals": 2, "format": "thousands"}]}
+
+
+def _num(value: Any) -> str:
+    """代入式里的一个数：照 Python 字面量的样子（整型不带 .0）；DECIMAL 落成的数字文本原样。"""
+    if isinstance(value, str):
+        return value
+    return str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+
+
+def card_of(shop_id: str) -> dict[str, Any]:
+    """周报口径卡：销售额是八家门店流水之和。和真实口径卡一样带着计算方式（原式、代入式）、每个输入
+    （取自哪次查询的哪一格）和复算结果——可验证报告点开数字时据此展示，引用链据此附上输入指向的查询快照。"""
+    cells = [f"cell(nodes.fetch, {i}, 'amount')" for i in range(len(STORES))]
+    gmv = {"id": "gmv", "name": "销售额", "value": round(sum(float(v) for _, v in STORES), 2), "unit": "元",
+           "decimals": 2, "format": "thousands", "expression": " + ".join(cells),
+           "substituted": " + ".join(_num(v) for _, v in STORES), "recompute_ok": True,
+           "inputs": [{"path": f"cell(nodes.fetch, {i}, 'amount')", "value": v, "node_id": "fetch",
+                       "via": "tool_cell", "artifact": shop_id, "locator": {"row": i, "column": "amount"},
+                       "status": "verified"}
+                      for i, (_, v) in enumerate(STORES)]}
+    return {"kind": "metric_set", "caliber": "周报口径", "caliber_version": "v2", "metrics": [gmv]}
+
+
+def masked_card(card: dict[str, Any], crm_id: str) -> dict[str, Any]:
+    """口径卡多两个指标：联系电话位数、首位会员手机号，输入都是会员消费第 0 行的号码（phone 设了遮罩），卡上记着号码原值
+    和代入式；首位会员手机号的值就是号码。"""
+    cell, phone = "cell(nodes.members, 0, 'phone')", CRM["rows"][0][1]
+    read = {"path": cell, "value": phone, "node_id": "members", "via": "tool_cell", "artifact": crm_id,
+            "locator": {"row": 0, "column": "phone"}, "status": "verified"}
+    contact = {"id": "contact", "name": "联系电话位数", "value": 8, "unit": "位", "decimals": 0, "format": "thousands",
+               "expression": f"len({cell})", "substituted": f"len('{phone}')", "inputs": [dict(read)]}
+    first = {"id": "phone_raw", "name": "首位会员手机号", "value": phone, "unit": "", "decimals": None, "format": "plain",
+             "expression": cell, "substituted": f"'{phone}'", "inputs": [dict(read)]}
+    return {**card, "metrics": [*card["metrics"], contact, first]}
+
 
 WEEKLY = ("## 门店周报\n\n本周销售额 [[m:gmv]]，*按发生周统计*。青石店流水 [[v:Q1.r0.amount]]，白沙店 [[v:Q1.r1.amount]]，"
           "**会员消费** [[v:Q2.r0.spend]]，另有 42 笔退款待入账。[[see:Q1]]\n\n- 云岭店流水最高\n- 枫桥店流水最低\n\n"
@@ -112,6 +147,8 @@ PROSE = ("## 正文\n\n全场运费统一[[m:orders]]，消费合计——[[m:gm
 #: 会员周报：Q3 是会员按地区汇总（没碰遮罩列），Q2 是选出了号码的会员消费
 MEMBERS = ("## 会员周报\n\n华东会员消费 [[v:Q3.r0.spend]]，华南 [[v:Q3.r1.spend]]。[[see:Q3]]\n\n"
            "会员林一消费 [[v:Q2.r0.spend]]。")
+#: 只引用指标的报告：正文没有一处 [[v:]]，门店流水的快照只能从口径卡的输入这一条路随文件附带（引用链 ④）
+METRIC_ONLY = "## 门店周报\n\n本周销售额 [[m:gmv]]，各门店明细随后补上。"
 
 
 def stored(obj: Any) -> tuple[str, bytes]:
@@ -131,19 +168,6 @@ def shop(nan: bool = False) -> dict[str, Any]:
 
 #: 报告撰写节点把值取自遮罩格的指标写成的字（同 api/evidence.py 的 MASKED）
 MASKED = "已遮罩"
-
-
-def masked_card(crm_id: str) -> dict[str, Any]:
-    """口径卡多两个指标：联系电话位数、首位会员手机号，输入都是会员消费第 0 行的号码（phone 设了遮罩），卡上记着号码原值
-    和代入式；首位会员手机号的值就是号码。"""
-    cell, phone = "cell(nodes.members, 0, 'phone')", CRM["rows"][0][1]
-    read = {"path": cell, "value": phone, "node_id": "members", "via": "tool_cell", "artifact": crm_id,
-            "locator": {"row": 0, "column": "phone"}, "status": "verified"}
-    contact = {"id": "contact", "name": "联系电话位数", "value": 8, "unit": "位", "decimals": 0, "format": "thousands",
-               "expression": f"len({cell})", "substituted": f"len('{phone}')", "inputs": [dict(read)]}
-    first = {"id": "phone_raw", "name": "首位会员手机号", "value": phone, "unit": "", "decimals": None, "format": "plain",
-             "expression": cell, "substituted": f"'{phone}'", "inputs": [dict(read)]}
-    return {**CARD, "metrics": [*CARD["metrics"], contact, first]}
 
 
 #: masked_card 上值不给的指标（和报告撰写节点的写作目录同一个判断：输入确定取自遮罩格）
@@ -171,7 +195,7 @@ class Sample:
         snapshot = table or shop(nan)
         self.shop_id = self.put(snapshot)
         self.crm_id = self.put(CRM)
-        self.card = card or (masked_card(self.crm_id) if masked else CARD)
+        self.card = card or (masked_card(card_of(self.shop_id), self.crm_id) if masked else card_of(self.shop_id))
         self.card_id = self.put(self.card)
         self.entries = {
             "fetch": {"kind": "query", "node_id": "fetch", "exec": 1, "artifact": self.shop_id,
@@ -317,6 +341,9 @@ def bundles() -> dict[str, dict[str, Any]]:
     n = Sample(nan=True)
     events, bound = n.events({"write": n.doc(WEEKLY, "write")}, nan=True)
     out["nan"] = build(n, events, bound)
+
+    # 只引用指标的报告：门店流水的快照没被正文引用，从口径卡的输入这一条路随文件附带、引用链认得它
+    out["metric-only"] = build(s, *s.events({"write": s.doc(METRIC_ONLY, "write")}))
 
     m = Sample(masked=True)
     events, bound = m.events({"write": m.doc(WEEKLY, "write", masked=MASKED_METRICS)})

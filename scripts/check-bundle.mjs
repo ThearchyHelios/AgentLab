@@ -595,6 +595,15 @@ async function sample(name, fn, opts = {}) {
   }
 }
 
+/** 点开正文里一个数字，等出处面板出来，交回面板里的全部文字（看完按 Esc 关掉） */
+async function detailText(page, locator) {
+  await locator.click()
+  await page.locator('#detail').waitFor({ state: 'visible', timeout: 5000 })
+  const text = await page.locator('#detail').innerText()
+  await page.keyboard.press('Escape')
+  return text
+}
+
 await section('样本页：各种形状', async () => {
   try {
     samples = samplePages()
@@ -602,7 +611,7 @@ await section('样本页：各种形状', async () => {
     check('生成样本页（tests/bundle_samples.py）', false, String(e?.message ?? e))
     return
   }
-  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 16, Object.keys(samples).join('、'))
+  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 17, Object.keys(samples).join('、'))
 
   await sample('base', async (s, page) => {
     check('base：有无法核对的项，总览是中性的「可核对的项全部通过，另有 N 项无法核对」，不是绿色的通过', neutral(s),
@@ -653,6 +662,18 @@ await section('样本页：各种形状', async () => {
     check('base：没有出处的数字不注明', !/按显示规则/.test(await detailOf(bare)))
     check('base：读屏把文字取值读作「取值」、数字读作「数字」', (await value.getAttribute('aria-label')).startsWith('取值 ')
       && (await cellNumber.getAttribute('aria-label')).startsWith('数字 '))
+    // 点开引用口径卡指标的数字：口径、计算方式（原式、代入式）、输入、复算，和输入指向的查询快照
+    const metric = page.locator('.doc p button.num[data-kind="number"][data-result="pass"]').first()
+    const mdetail = await detailOf(metric)
+    check('base：指标数字的出处面板写明指标、口径与版本、原式、代入式、输入、复算',
+      mdetail.includes('销售额（gmv）') && mdetail.includes('周报口径 v2')
+        && mdetail.includes('原式（计算方式）') && mdetail.includes('代入式（代入输入后的算式）')
+        && mdetail.includes('输入') && mdetail.includes('复算一致'), mdetail.slice(0, 400))
+    check('base：每个输入带着取值和出处（哪次查询的哪一行哪一列）',
+      mdetail.includes("← cell(nodes.fetch, 0, 'amount')") && mdetail.includes('取自 查询 Q1 · 第 1 行 · amount'),
+      mdetail.slice(0, 400))
+    check('base：输入指向的查询快照随文件附带，看得到 SQL 和被引用的那一行',
+      mdetail.includes('SELECT store, amount, ratio FROM orders') && mdetail.includes('快照第 1 行'), mdetail.slice(0, 400))
   })
 
   // 宽屏：出处面板停在右侧，正文让出这一栏。点开表格里右对齐的数字，它和同列的数字都不被面板盖住
@@ -681,6 +702,22 @@ await section('样本页：各种形状', async () => {
     check('two-reports：两份报告各自显示，引用链都通过', s.reports.length === 2 && s.checks.chain === 'pass'
       && s.items.filter((i) => i.check === 'chain' && i.text.includes('的文档')).length === 2, JSON.stringify(s.reports.map((r) => r.node)))
     check('two-reports：月报的数字全部通过', s.reports.find((r) => r.node === 'monthly')?.result === 'pass')
+  })
+  // 只引用指标的报告：正文没引用门店流水，快照从口径卡的输入这一条路随文件附带，④ 认得这条引用
+  await sample('metric-only', async (s, page) => {
+    check('metric-only：总览通过', s.overall === 'pass', `${s.overall}：${s.text}`)
+    check('metric-only：引用链写明从已核对的口径卡的输入认这份快照',
+      s.checks.chain === 'pass' && hasItem(s, 'chain', 'pass', '口径卡「周报口径」的输入（指标 gmv）'), describe(s))
+    check('metric-only：只嵌报告文档、口径卡和口径卡的输入指向的快照（会员消费谁都没引用，不嵌）',
+      s.items.filter((i) => i.check === 'artifacts').length === 3
+        && !s.items.some((i) => i.check === 'artifacts' && i.text.includes('members')),
+      String(s.items.filter((i) => i.check === 'artifacts').length))
+    const detail = await detailText(page, page.locator('button.num[data-kind="number"]').first())
+    check('metric-only：点开数字看得到指标、口径与版本、原式、代入式、输入和复算',
+      detail.includes('销售额（gmv）') && detail.includes('周报口径 v2') && detail.includes('原式（计算方式）')
+        && detail.includes('代入式（代入输入后的算式）') && detail.includes('复算一致'), detail.slice(0, 400))
+    check('metric-only：输入指向的查询快照看得到 SQL 和被引用的那一行',
+      detail.includes('SELECT store, amount, ratio FROM orders') && detail.includes('快照第 1 行'), detail.slice(0, 400))
   })
   await sample('legacy', async (s, page) => {
     check('legacy：总览中性（运行结果无法核对），范围写明按结束事件推算', neutral(s)
@@ -902,6 +939,13 @@ await section('样本页：篡改', async () => {
     data.artifacts = data.artifacts.filter((a) => a.kind !== 'metric_set')
     return '删掉口径卡条目'
   }, (s) => [...turnsRed('numbers')(s), ['原因写明', hasItem(s, 'numbers', 'fail', '引用的工件不在文件的工件清单里')]])
+  // 只引用指标的报告：拿掉口径卡，数字没了核对的对象（⑤ 变红）；它的输入指向的快照还被已核对的
+  // tool.end 事件引用着，④ 照样通过——事件本身就是一条合法的引用
+  await tamper(samples['metric-only'], '拿掉被引用的口径卡（只引用指标的报告）', (data) => {
+    data.artifacts = data.artifacts.filter((a) => a.kind !== 'metric_set')
+    return '删掉口径卡条目'
+  }, (s) => [...turnsRed('numbers', ['events', 'manifest', 'artifacts', 'chain'])(s),
+    ['数字无法核对，写明引用的工件不在清单里', hasItem(s, 'numbers', 'fail', '引用的工件不在文件的工件清单里')]])
   // 证据目录里写着取自遮罩列的指标的值的老文档，服务端只给哈希、不附带它引用的工件（见样本页 masked-old-doc）：伪造者把
   // 一份好好的文档也标成遮罩，页面照服务端的说法写原因、正文不显示，可它引用的那几份工件还列着，已核对的事件和文档里却
   // 没人引用它们，判不通过——藏不起一份报告还显示通过

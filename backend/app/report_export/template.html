@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src __REPORT_CSP__; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="color-scheme" content="light dark">
+<title>__REPORT_TITLE__</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff; --panel: #f5f6f8; --raise: #ffffff; --border: #dfe2e8; --fg: #16181d; --dim: #41454e; --faint: #5f6470;
+  --accent: #2a57c2; --ok: #1b7339; --ok-soft: #e5f4ea; --bad: #b92424; --bad-soft: #fcebeb; --na: #565b66; --na-soft: #eceef2;
+  --wait: #8a6100; --wait-soft: #fdf3d7; --mark: #fff1b8; --code: #eff1f5; --shadow: 0 10px 32px rgba(16, 20, 28, .16);
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --detail-w: 460px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111318; --panel: #181b21; --raise: #1c1f26; --border: #2e323b; --fg: #e8eaee; --dim: #c1c5ce; --faint: #969ca8;
+    --accent: #8aaeff; --ok: #62d08c; --ok-soft: #14301f; --bad: #ff8080; --bad-soft: #3c1c1f; --na: #a9afbb; --na-soft: #262a31;
+    --wait: #e3c06a; --wait-soft: #362c12; --mark: #4d4214; --code: #23262e; --shadow: 0 10px 32px rgba(0, 0, 0, .55);
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.65 var(--sans); overflow-wrap: break-word; }
+code, pre, .mono { font-family: var(--mono); }
+.page { max-width: 920px; margin: 0 auto; padding: 28px 16px 72px; }
+.brand { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .04em; color: var(--accent); }
+h1 { margin: 2px 0 0; font-size: 24px; line-height: 1.35; }
+.report-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 10px 0 0; font-size: 13px; color: var(--dim); }
+.report-line .mono { font-size: 12px; color: var(--faint); }
+.seal { margin: 14px 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+  font-size: 13px; color: var(--dim); }
+.seal code { word-break: break-all; }
+.meta { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 16px; margin: 14px 0 0; font-size: 13px; }
+.meta dt { color: var(--faint); }
+.meta dd { margin: 0; min-width: 0; color: var(--dim); overflow-wrap: anywhere; }
+.meta-note { margin: 12px 0 0; font-size: 12px; color: var(--faint); }
+.block { margin-top: 30px; }
+.block > h2 { margin: 0 0 10px; font-size: 18px; }
+.muted { color: var(--faint); }
+.warn { margin: 0 0 10px; padding: 8px 10px; border-radius: 8px; background: var(--wait-soft); color: var(--wait); font-size: 13px; }
+.doc { margin-top: 16px; padding: 18px 20px; border: 1px solid var(--border); border-radius: 10px; background: var(--raise);
+  font-size: 15px; }
+.doc p { margin: 8px 0; }
+.doc .doc-h { margin: 18px 0 6px; line-height: 1.4; }
+.doc .doc-h1 { font-size: 19px; } .doc .doc-h2 { font-size: 17px; } .doc .doc-h3 { font-size: 15px; }
+.doc ul, .doc ol { margin: 8px 0; padding-left: 1.6em; }
+.doc li { margin: 2px 0; }
+.doc blockquote { margin: 8px 0; padding-left: 12px; border-left: 3px solid var(--accent); color: var(--dim); }
+.doc pre { margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: var(--code); overflow-x: auto; font-size: 13px; line-height: 1.55; }
+.doc code { font-size: .92em; padding: 0 4px; border-radius: 4px; background: var(--code); }
+.doc pre code { padding: 0; background: none; }
+.doc hr { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
+.doc .link { color: var(--accent); }
+.table-wrap { max-width: 100%; margin: 8px 0; overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+.table-wrap table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table-wrap th, .table-wrap td { padding: 5px 9px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+.table-wrap th { background: var(--panel); color: var(--dim); font-weight: 600; white-space: nowrap; }
+.table-wrap tr:last-child td { border-bottom: 0; }
+.table-wrap .n { text-align: right; font-variant-numeric: tabular-nums; }
+.num { font: inherit; color: inherit; background: none; border: 0; margin: 0; padding: 0 1px; border-radius: 3px; cursor: pointer;
+  text-decoration-line: underline; text-decoration-thickness: 1.5px; text-underline-offset: 3px; }
+.num-ok { text-decoration-style: solid; text-decoration-color: var(--ok); }
+.num-na { text-decoration-style: dotted; text-decoration-color: var(--na); }
+.num-bad { text-decoration-style: wavy; text-decoration-color: var(--bad); }
+.num:hover { background: var(--panel); }
+.num:focus-visible, .close:focus-visible, .chipbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.num.is-active { background: var(--mark); }
+.detail { position: fixed; top: 0; right: 0; bottom: 0; z-index: 10; width: min(var(--detail-w), 100vw); overflow-y: auto;
+  background: var(--raise); border-left: 1px solid var(--border); box-shadow: var(--shadow); }
+.detail-head { position: sticky; top: 0; display: flex; align-items: flex-start; gap: 8px; padding: 14px 16px 10px;
+  background: var(--raise); border-bottom: 1px solid var(--border); }
+.detail-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 17px; overflow-wrap: anywhere; }
+.close { flex: none; width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+  color: var(--dim); font: 18px/1 var(--sans); cursor: pointer; }
+.detail-body { padding: 12px 16px 28px; font-size: 14px; }
+.part { margin: 0 0 16px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.part > h3 { margin: 0; padding: 8px 12px; background: var(--panel); font-size: 13px; }
+.part-body { padding: 10px 12px; }
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 12px; margin: 0; }
+.kv dt { color: var(--faint); font-size: 13px; }
+.kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.sql { margin: 6px 0 10px; padding: 8px 10px; border-radius: 8px; background: var(--code); font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.sub { margin: 14px 0 4px; font-size: 13px; color: var(--faint); font-weight: 600; }
+.badge { display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  line-height: 1.6; white-space: nowrap; }
+.badge[data-kind="ok"] { color: var(--ok); background: var(--ok-soft); }
+.badge[data-kind="bad"] { color: var(--bad); background: var(--bad-soft); }
+.badge[data-kind="na"] { color: var(--na); background: var(--na-soft); }
+.badge[data-kind="wait"] { color: var(--wait); background: var(--wait-soft); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 0; }
+.chipbtn { font: inherit; font-size: 12px; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer;
+  text-align: left; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
+.hit { background: var(--mark); }
+.foot { margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--border); font-size: 12px; color: var(--faint); }
+.foot p { margin: 4px 0; }
+@media print {
+  .detail, .close { display: none !important; }
+  .page, html.detail-open .page { max-width: none; margin: 0; padding: 0; }
+  .num { text-decoration-color: currentColor !important; background: none !important; }
+}
+/* 宽屏上出处面板停在右侧：打开时正文让出这一栏，表格里右对齐的数字不会被面板盖住 */
+@media screen and (min-width: 761px) {
+  html.detail-open .page { margin-right: min(var(--detail-w), 100vw); }
+}
+@media (max-width: 760px) {
+  .detail { top: auto; left: 0; width: auto; max-height: 72vh; border-left: 0; border-top: 1px solid var(--border); border-radius: 14px 14px 0 0; }
+}
+@media (max-width: 520px) {
+  body { font-size: 14px; }
+  .page { padding: 20px 16px 56px; }
+  h1 { font-size: 20px; }
+  .meta { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .meta dt { margin-top: 6px; }
+  .doc { padding: 12px; }
+}
+</style>
+<script>__REPORT_SCRIPT__</script>
+</head>
+<body>
+<div class="page">
+  <header>
+    <p class="brand">报告</p>
+    <h1 id="title">__REPORT_NAME__</h1>
+    <p class="report-line">
+      <span id="report-label">运行 <code class="mono">__REPORT_RUN__</code></span>
+      <span class="mono" id="doc-id"></span>
+    </p>
+    <p id="doc-warn" class="warn" hidden></p>
+    <dl id="meta" class="meta"></dl>
+    <section class="seal" id="seal-box" aria-labelledby="seal-label">
+      <h2 id="seal-label" class="meta-note" style="margin:0 0 4px">封存状态</h2>
+      <span id="seal-text">__REPORT_SEAL__</span>
+    </section>
+    <p class="meta-note" id="record-note">工作流名、版本、起止时间、节点名称和上面的封存状态取自导出那一刻的系统记录。这份文件用于阅读报告和查证数字的口径与出处，不用于证明文件本身未被修改——那要用「可验证报告」（封存哈希核对件），在系统中这次运行的「凭证详情」里导出。</p>
+  </header>
+  <main>
+    <section id="report" class="block" aria-labelledby="report-title"><h2 id="report-title">报告正文</h2>__REPORT_BODY__</section>
+  </main>
+  <footer id="foot" class="foot">
+    <p>数字的显示格式（千分位、单位、小数位）由系统渲染；点开的口径、来源和计算方式是导出那一刻系统里的记录。</p>
+    <p id="foot-schema"></p>
+  </footer>
+</div>
+<aside id="detail" class="detail" role="dialog" aria-modal="false" aria-labelledby="detail-title" hidden>
+  <div class="detail-head"><h2 id="detail-title"></h2><button type="button" id="detail-close" class="close" aria-label="关闭">×</button></div>
+  <div id="detail-body" class="detail-body"></div>
+</aside>
+<script type="application/json" id="report-data">__REPORT_DATA__</script>
+</body>
+</html>

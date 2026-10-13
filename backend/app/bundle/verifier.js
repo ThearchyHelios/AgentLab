@@ -136,6 +136,7 @@
     chainDoc: (label) => `报告「${label}」的文档`,
     chainByEvent: (seq, what) => `第 ${seq} 条事件（${what}）`,
     chainByDoc: (label, alias) => `报告「${label}」的证据目录（${alias}）`,
+    chainByCard: (label, metric) => `口径卡「${label}」的输入（指标 ${metric}）`,
     chainFrom: '引用自',
     chainNoCheckEvent: '找不到这个报告节点的报告自查事件',
     chainCheckEventFailed: '报告自查事件的内容没有通过核对',
@@ -200,6 +201,12 @@
     shownOdd: '紧挨着这个数的字不在常见写法里，无法确认读者看到的数',
     numNotShown: '正文里没有显示这一处：导出时不会出现这种情况，文件可能被改过',
     numAria: (kind, text, result) => `${kind === 'value' ? '取值' : '数字'} ${text}，${result}，查看出处`,
+    // 数字详情里口径卡一节：指标、计算方式（原式、代入式）、输入、复算。遮罩未附带的卡没有这一节（原因见核对明细 ③）
+    dMetric: '指标', dUnit: '单位', dExpression: '原式（计算方式）', dSubstituted: '代入式（代入输入后的算式）',
+    dInputs: '输入', dRecompute: '复算', dSourceName: '数据源', dInputValue: '取值', dFrom: '取自',
+    recomputeOk: '复算一致', recomputeBad: '复算不一致：代入式的计算结果与记录值不符', recomputeNone: '无法复算',
+    inputFrom: (query, row, column) => (query ? `查询 ${query}` : '') + (Number.isInteger(row) ? ` · 第 ${row + 1} 行` : '') + (column ? ` · ${column}` : ''),
+    inputNotAttached: '快照未随文件附带（见核对明细 ③），输入的值按口径卡的记录展示',
     statusOk: (seq, what) => `与第 ${seq} 条事件（${what}）一致`,
     statusMismatch: (claim, seq, what) => `文件里写的是「${claim}」，与封存范围内最后一条结束类事件（第 ${seq} 条，${what}）不符`,
     statusLegacy: '早期运行在结束事件落库之前封存，结束事件不在封存范围内，运行结果无法核对',
@@ -1157,6 +1164,7 @@
   async function verify(data, digest, shownSeal) {
     const out = {
       events: [], manifest: [], artifacts: [], chain: [], numbers: [], docs: [], meta: [], checked: new Map(), order: [],
+      arts: new Map(), queryAliases: new Map(),
     }
     const events = Array.isArray(data.events) ? data.events.filter(isObj) : []
     const meta = data.meta
@@ -1313,12 +1321,33 @@
         if (isObj(entry) && typeof entry.artifact === 'string') push(byDoc, entry.artifact, { report, alias })
       }
     }
+    // 工件 → 报告目录里它的编号（Q1、M1……）：数字详情里口径卡的输入据此写出「查询 Q1 · 第 N 行 · 列」
+    for (const [id, refs] of byDoc) {
+      if (refs.length && !out.queryAliases.has(id)) out.queryAliases.set(id, refs[0].alias)
+    }
+    out.arts = arts
+    // 已核对的口径卡记着的输入 → 输入指向的查询快照。卡本身核过哈希（③ 通过），它记的引用和文档的证据目录
+    // 同一个分量：报告只引用指标、不直接引用查询时，查询快照就是从这条路嵌进来、也是从这条路认的。
+    // 没核对过的卡（哈希对不上）不认：被改过的卡说输入来自哪，不能替它圆
+    const byCard = new Map()   // 工件 id → [{ card, metric }]
+    for (const item of out.artifacts) {
+      if (item.a.kind !== 'metric_set' || item.result !== PASS) continue
+      for (const metric of Array.isArray(item.json.metrics) ? item.json.metrics : []) {
+        if (!isObj(metric) || !Array.isArray(metric.inputs)) continue
+        for (const input of metric.inputs) {
+          if (isObj(input) && typeof input.artifact === 'string' && input.artifact) {
+            push(byCard, input.artifact, { card: item, metric: metric.id })
+          }
+        }
+      }
+    }
     for (const item of out.artifacts) {
       if (item.a.kind === 'report_doc') continue
       const evs = byEvent.get(item.a.id) || []
       const docs = byDoc.get(item.a.id) || []
-      const ok = evs.length > 0 || docs.length > 0
-      out.chain.push({ kind: item.a.kind, art: item, events: evs, docs, result: ok ? PASS : FAIL,
+      const cards = byCard.get(item.a.id) || []
+      const ok = evs.length > 0 || docs.length > 0 || cards.length > 0
+      out.chain.push({ kind: item.a.kind, art: item, events: evs, docs, cards, result: ok ? PASS : FAIL,
         reason: ok ? '' : T.chainUnreferenced })
       if (ok) chained.add(item.a.id)
     }
@@ -1402,6 +1431,8 @@
       const at = metrics.findIndex((m) => isObj(m) && m.id === metricId)
       const metric = metrics[at]
       info.card = art.json
+      // 指标本身：详情里据此展示指标名、原式、代入式、输入和复算（计算方式）
+      info.metric = metric || null
       if (!metric) return { ...info, result: FAIL, reason: T.numNoMetric }
       info.truth = metric.value
       info.truthToken = tokenAt(tokensOf(art), ['metrics', at, 'value'])
@@ -1717,9 +1748,36 @@
     return [' ', badge(item.result), item.reason ? h('span', { class: 'muted' }, ` ${item.reason}`) : null]
   }
 
+  /** 一份随文件附带的查询快照：SQL + 被引用的那一行（引用的格高亮）。数字详情里单元格引用和口径卡的输入共用。
+   *  art 是这份快照的核对条目：数照 JSON 原文写（同「快照里的值」），超过 2^53 的订单号读成 double 会丢位 */
+  function snapshotBlock(snap, row, column, art) {
+    const parts = []
+    if (typeof snap.sql === 'string' && snap.sql) parts.push(h('p', { class: 'sub' }, T.dSql), h('pre', { class: 'sql' }, snap.sql))
+    if (snap.source) parts.push(kv([[T.dSourceName, String(snap.source)]]))
+    const record = Number.isInteger(row) && Array.isArray(snap.rows) ? snap.rows[row] : undefined
+    if (Array.isArray(record) || isObj(record)) {
+      // 被引用的那一行：快照随文件附带（没碰设了遮罩的列）才走到这里，整行照原样列出，引用的那一格高亮
+      let columns = (Array.isArray(snap.columns) ? snap.columns : []).map(String)
+      if (isObj(record) && !columns.length) columns = Object.keys(record)
+      const tokens = art ? tokensOf(art) : null
+      const cellText = (c, i) => {
+        const value = isObj(record) ? own(record, c) : record[i]
+        if (value == null) return '—'
+        if (typeof value !== 'number') return textOf(value)
+        return numberText(value, tokenAt(tokens, ['rows', row, isObj(record) ? c : i]))
+      }
+      parts.push(h('p', { class: 'sub' }, T.dRow(row)), h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, columns.map((c) => h('th', { class: c === column ? 'hit' : null }, c)))),
+        h('tbody', {}, h('tr', {}, columns.map((c, i) => h('td', { class: c === column ? 'hit' : null,
+          'data-cell': c }, cellText(c, i))))))))
+    }
+    return parts
+  }
+
   function detailOf(number) {
     const cite = isObj(number.seg.cite) ? number.seg.cite : null
     const card = number.card
+    const metric = number.metric
     // 显示文字核对过的（引用的值对上了，按显示规则渲染得出来）：一致时注明，对不上时另列应显示的字。没有出处的数、
     // 核对不了的引用不写：那些字没人重新渲染过。一致不等于通过：运行输入的显示文字对得上，引用的值仍核对不了；紧挨着
     // 还有数字的，这处的字本身也对得上，读起来却不是这个值
@@ -1730,6 +1788,8 @@
       [T.dSource, number.source],
       number.node ? [T.dNode, nodeLabel(number.node)] : null,
       card ? [T.dCaliber, [card.caliber || '—', card.caliber_version ? ` ${card.caliber_version}` : ''].join('')] : null,
+      metric ? [T.dMetric, [metric.name || metric.id || '—', metric.id && metric.name ? h('span', { class: 'muted' }, `（${metric.id}）`) : null]] : null,
+      metric && metric.unit ? [T.dUnit, String(metric.unit)] : null,
       cite && cite.status === 'resolved' && 'value' in cite ? [T.dCited, exactText(cite.value, number.citedToken)] : null,
       'truth' in number ? [number.kind === 'metric' ? T.dCard : T.dCell,
         number.truthText ?? exactText(number.truth, number.truthToken)] : null,
@@ -1739,27 +1799,52 @@
       [T.dReport, nodeLabel(number.report.node_id)],
     ]
     const parts = [kv(rows)]
-    const snap = number.snapshot
-    if (snap && typeof snap.sql === 'string' && snap.sql) parts.push(h('p', { class: 'sub' }, T.dSql), h('pre', { class: 'sql' }, snap.sql))
-    const record = snap && Number.isInteger(number.row) && Array.isArray(snap.rows) ? snap.rows[number.row] : undefined
-    if (Array.isArray(record) || isObj(record)) {
-      // 被引用的那一行：快照随文件附带（没碰设了遮罩的列）才走到这里，整行照原样列出，引用的那一格高亮。数照 JSON
-      // 原文写（同上面「快照里的值」）：超过 2^53 的订单号读成 double 会丢位，和一位不差的「引用的值」对不上
-      let columns = (Array.isArray(snap.columns) ? snap.columns : []).map(String)
-      if (isObj(record) && !columns.length) columns = Object.keys(record)
-      const art = view.out.artifacts.find((a) => a.a.id === number.artifact)
-      const tokens = art ? tokensOf(art) : null
-      const cellText = (c, i) => {
-        const value = isObj(record) ? own(record, c) : record[i]
-        if (value == null) return '—'
-        if (typeof value !== 'number') return textOf(value)
-        return numberText(value, tokenAt(tokens, ['rows', number.row, isObj(record) ? c : i]))
+    // 口径卡一节：计算方式（原式、代入式）、输入、复算。卡随文件附带才有（遮罩的只给 id，见核对明细 ③）
+    if (metric) {
+      parts.push(h('p', { class: 'sub' }, T.dExpression), h('pre', { class: 'sql' }, String(metric.expression || '—')))
+      parts.push(h('p', { class: 'sub' }, T.dSubstituted), h('pre', { class: 'sql' }, String(metric.substituted || '—')))
+      // 输入的值照卡上 JSON 的原文写（同「口径卡里的值」）：超过 2^53 的数读成 double 会丢位
+      const cardArt = view.out.artifacts.find((a) => a.a.id === number.artifact)
+      const cardTokens = cardArt ? tokensOf(cardArt) : null
+      const at = Array.isArray(card && card.metrics) ? card.metrics.indexOf(metric) : -1
+      const inputs = (Array.isArray(metric.inputs) ? metric.inputs : [])
+        .map((input, i) => ({ input, token: tokenAt(cardTokens, ['metrics', at, 'inputs', i, 'value']) }))
+        .filter(({ input }) => isObj(input))
+      if (inputs.length) {
+        parts.push(h('p', { class: 'sub' }, T.dInputs),
+          h('ul', { class: 'items' }, inputs.map(({ input, token }) => {
+            const loc = isObj(input.locator) ? input.locator : {}
+            const row = Number.isInteger(loc.row) ? loc.row : null
+            const column = loc.column != null ? String(loc.column) : null
+            const alias = typeof input.artifact === 'string' ? view.out.queryAliases.get(input.artifact) : undefined
+            const from = [T.inputFrom(alias, row, column), input.node_id ? nodeLabel(input.node_id) : null]
+              .filter(Boolean).join(' · ')
+            return h('li', {},
+              h('span', { class: 'what' }, [
+                `${T.dInputValue} `, exactText(input.value, token),
+                h('span', { class: 'muted' }, ` ← ${input.path || '—'}`),
+              ]),
+              from ? h('span', { class: 'why' }, `${T.dFrom} ${from}`) : null)
+          })))
+        // 输入指向的查询快照：随文件附带的给出 SQL 和被引用的那一行；没附带的（遮罩等）说明按卡的记录展示
+        for (const { input } of inputs) {
+          if (typeof input.artifact !== 'string' || !input.artifact) continue
+          const art = view.out.arts.get(input.artifact)
+          if (!art || art.result !== PASS) {
+            parts.push(h('p', { class: 'note' }, `${T.inputNotAttached}${art && art.a.masked ? `：${art.reason}` : ''}`))
+            continue
+          }
+          const loc = isObj(input.locator) ? input.locator : {}
+          parts.push(...snapshotBlock(art.json, Number.isInteger(loc.row) ? loc.row : null,
+            loc.column != null ? String(loc.column) : null, art))
+        }
       }
-      parts.push(h('p', { class: 'sub' }, T.dRow(number.row)), h('div', { class: 'table-wrap' }, h('table', {},
-        h('thead', {}, h('tr', {}, columns.map((c) => h('th', { class: c === number.column ? 'hit' : null }, c)))),
-        h('tbody', {}, h('tr', {}, columns.map((c, i) => h('td', { class: c === number.column ? 'hit' : null,
-          'data-cell': c }, cellText(c, i))))))))
+      parts.push(kv([[T.dRecompute, metric.recompute_ok == null ? T.recomputeNone
+        : metric.recompute_ok ? T.recomputeOk : T.recomputeBad]]))
     }
+    const snap = number.snapshot
+    if (snap) parts.push(...snapshotBlock(snap, number.row, number.column,
+      view.out.artifacts.find((a) => a.a.id === number.artifact)))
     return parts
   }
 
@@ -1920,6 +2005,7 @@
         return [T.chainDoc(nodeLabel(c.report.node_id)), ' ', h('code', {}, short(c.report.doc_artifact)), from]
       }
       const refs = [...c.docs.map((d) => T.chainByDoc(nodeLabel(d.report.node_id), d.alias)),
+        ...c.cards.map((k) => T.chainByCard(nodeLabel(k.card.a.node_id), k.metric)),
         ...c.events.map((ev) => T.chainByEvent(ev.seq, eventWhat(ev)))]
       return [KIND_LABEL[c.kind] || c.kind, ' ', h('code', {}, short(c.art.a.id)),
         refs.length ? ` ← ${T.chainFrom}${refs.join('、')}` : '']
