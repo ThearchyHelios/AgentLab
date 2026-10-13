@@ -23,12 +23,14 @@ import { normalizeTheme } from '../lib/theme'
 import { useLeaveGuard } from '../lib/leave'
 import { localActor, setLocalActor } from '../lib/actor'
 import {
-  AGENT_GUARD_TEXT, JUDGE_SETTING_TEXT, PROVIDER_REF_TEXT, TOOL_GATE_TEXT, VERIFY_SETTING_TEXT, judgeByModelText, judgeUnlimitedText,
+  AGENT_GUARD_TEXT, DRAFT_MODEL_SETTING_TEXT, JUDGE_SETTING_TEXT, PROVIDER_REF_TEXT, TOOL_GATE_TEXT, VERIFY_SETTING_TEXT, judgeByModelText,
+  judgeUnlimitedText,
 } from '../lib/terms'
 import type { ThemePref } from '../lib/theme'
 import {
   ProviderOptions, VerifySection, verifyChanged, verifyDraftOf, verifyErrors, verifyLabels, verifyPayload, type VerifyDraft,
 } from './VerifySettings'
+import { DraftModelSection } from './DraftModelSettings'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
 // 数据源搬去了顶级的「数据」页（/data），/settings/datasources 跳过去
@@ -626,6 +628,8 @@ function PrefsTab() {
     judgeProvider: string; judgeModel: string
     // 证据裁判的五项上限：null 是不限（存 null），字符串是正在填的数
     jClaims: string | null; jCost: string | null; jTimeout: string | null; jClick: string | null; jDaily: string | null
+    // 起草模型（数据目录的用模型起草、按配方导入的 AI 起草）：空串 = 跟随助手的模型（存 null）
+    draftProvider: string; draftModel: string
   } | null>(null)
   const [spend, setSpend] = useState<{ usd?: number; calls?: number; unpriced_calls?: number } | null>(null)
   // 核查一组（双盲复算、反方审稿、审批质询）的草稿另放一份，和上面的共用保存条；verifySaves 是存过几次，今日核查花费跟着再取
@@ -673,6 +677,9 @@ function PrefsTab() {
     jTimeout: limitText(values?.judge, 'report_timeout_s'),
     jClick: limitText(values?.judge, 'click_max_cost_usd'),
     jDaily: limitText(values?.judge, 'daily_max_usd'),
+    // 起草模型（服务端 catalog_draft 一组；老服务端没有这一组时两项都是空，这一节也不显示）
+    draftProvider: typeof values?.catalog_draft?.provider === 'string' ? values.catalog_draft.provider : '',
+    draftModel: typeof values?.catalog_draft?.model === 'string' ? values.catalog_draft.model : '',
   }
   const cur = draft ?? saved
   const stepCap = Number(values?.limits?.max_agent_steps) || 100
@@ -748,7 +755,8 @@ function PrefsTab() {
       savedActor.current = actor
     }
     const judgeChanged = changed.some((k) => JUDGE_DRAFT.has(k))
-    const runChanged = changed.some((k) => k !== 'actor' && !JUDGE_DRAFT.has(k))
+    const draftChanged = changed.some((k) => DRAFT_MODEL_DRAFT.has(k))
+    const runChanged = changed.some((k) => k !== 'actor' && !JUDGE_DRAFT.has(k) && !DRAFT_MODEL_DRAFT.has(k))
     try {
       // 裁判一组整组写：后端对没给的键回落到默认值，只发改过的那一项会把别的项冲回默认
       const judge = judgeChanged ? {
@@ -762,7 +770,9 @@ function PrefsTab() {
       } : null
       // 核查一组同样整组写（VerifySettings 的 verifyPayload）
       const verify = verifyKeys.length ? verifyPayload(verifyCur) : null
-      if (runChanged || judge || verify) {
+      // 起草模型一组：两项一起写，空着的存 null（跟随助手的模型）
+      const catalogDraft = draftChanged ? { provider: cur.draftProvider || null, model: cur.draftModel.trim() || null } : null
+      if (runChanged || judge || verify || catalogDraft) {
         const run = {
           ...(values.run ?? {}),
           default_memory_scope: cur.scope,
@@ -774,12 +784,16 @@ function PrefsTab() {
           agent_budget_tokens: cur.budgetTokens.trim() === '' ? null : Number(cur.budgetTokens),
           agent_budget_usd: cur.budgetUsd.trim() === '' ? null : Number(cur.budgetUsd),
         }
-        const out = await api.settings.put({ ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}), ...(verify ? { verify } : {}) })
+        const out = await api.settings.put({
+          ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}), ...(verify ? { verify } : {}),
+          ...(catalogDraft ? { catalog_draft: catalogDraft } : {}),
+        })
         setValues((v) => ({
           ...(v ?? {}),
           ...(runChanged ? { run: out?.run ?? run } : {}),
           ...(judge ? { judge: out?.judge ?? judge } : {}),
           ...(verify ? { verify: out?.verify ?? verify } : {}),
+          ...(catalogDraft ? { catalog_draft: out?.catalog_draft ?? catalogDraft } : {}),
         }))
         // 每日上限改了：旁边那句「今天已花」的分母跟着变，顺手再取一次
         if (judge) void loadSpend()
@@ -1090,6 +1104,11 @@ function PrefsTab() {
 
           {values.verify && <VerifySection cur={verifyCur} onEdit={editVerify} refresh={verifySaves}
                                            errors={fieldError?.field === 'verify.provider' ? { ...verifyErrs, provider: fieldError.message } : verifyErrs} />}
+
+          {values.catalog_draft && (
+            <DraftModelSection provider={cur.draftProvider} model={cur.draftModel} onEdit={edit}
+                               error={fieldError?.field === 'catalog_draft.provider' ? fieldError.message : undefined} />
+          )}
         </>
       )}
 
@@ -1113,6 +1132,7 @@ function PrefsTab() {
                     judgeProvider: '裁判模型的接入', judgeModel: '裁判模型',
                     jClaims: '每份报告最多裁判句数', jCost: '每份报告的金额上限', jTimeout: '每份报告的时长上限',
                     jClick: '每次点击的金额上限', jDaily: '每日金额上限',
+                    draftProvider: DRAFT_MODEL_SETTING_TEXT.provider, draftModel: DRAFT_MODEL_SETTING_TEXT.model,
                   })[k]).concat(verifyLabels(verifyKeys)).join('、')}
                 </span>
               </span>
@@ -1147,10 +1167,13 @@ function PrefsTab() {
 /** 服务端按项拒收时（422 带 field）那一项在页面上是哪个控件：点名的模型接入的三格 */
 const PROVIDER_FIELD_IDS: Record<string, string> = {
   'run.tool_gate_provider': 'pref-gate-provider', 'judge.provider': 'pref-judge-provider', 'verify.provider': 'pref-verify-provider',
+  'catalog_draft.provider': 'pref-draft-provider',
 }
 
 /** 裁判那一组在草稿里的键：它们改了才写 judge 一组 */
 const JUDGE_DRAFT = new Set<string>(['judgeProvider', 'judgeModel', 'jClaims', 'jCost', 'jTimeout', 'jClick', 'jDaily'])
+/** 起草模型那一组在草稿里的键：它们改了才写 catalog_draft 一组 */
+const DRAFT_MODEL_DRAFT = new Set<string>(['draftProvider', 'draftModel'])
 
 /** 勾掉「不限」时填回的数：同后端 JUDGE_DEFAULTS */
 const JUDGE_FALLBACK = {

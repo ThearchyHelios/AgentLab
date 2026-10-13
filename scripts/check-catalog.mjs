@@ -2,8 +2,10 @@
 //
 // 数据目录的写操作都会改变助手和将来的 SQL 检查读到的东西：确认一项、驳回一项、整份提交都不是随手可以撤回的。
 // 所以这里查的是「请求里带没带读到的版本」「批量确认只动推断项、来源不变」「编辑时没动的项原样交回（被驳回的照旧
-// 驳回）」「别人刚改过时有没有停下来让人重新载入，而不是悄悄覆盖」「起草按批调用、能停、出错时说得清」——
-// 正常路径的页面检查一个字都不会说。
+// 驳回）」「别人刚改过时有没有停下来让人重新载入，而不是悄悄覆盖」——正常路径的页面检查一个字都不会说。
+// 起草是后台任务：查的是「起草要求和补充说明有没有随请求发出」「关掉对话框任务照常进行、页面上有进度、再打开就是它」
+// 「能停」「哪张表没写全、为什么写得清」「能只重试失败的」「已有任务、模型用不了这两种 409 各有去处」「清单上标出上次
+// 起草失败的表、能单独重起草」。任务怎么往前走由检查自己推，页面每 1.5 秒取一次。
 // 数据剖析（阶段 4B）会对业务库发查询：剖析接口、保存数据源一律在浏览器层答掉，查的是「确认前写没写预算」「进行中是否
 // 明说停不下来」「报告说没说清用了几条查询、为什么停、跳过了什么」「各种 409 有没有下一步」「设置被拒时报错落没落到那一项」。
 //
@@ -249,8 +251,10 @@ const manual = (id, name, count) => ({
   ...blank, id, name, origin: 'manual', database: `/tmp/check/${name}.db`, table_count: count, tools: [`db_query__${name}`],
   schema_synced_at: count ? T0 : null,
 })
+/** 景区库的数据源说明：起草时连同起草要求一起交给模型，起草对话框里写明 */
+const S1_DESCRIPTION = '虚构的景区票务与客流库，供检查使用'
 const SOURCES = [
-  manual(S1, 'zzcatscenic', 151),
+  { ...manual(S1, 'zzcatscenic', 151), description: S1_DESCRIPTION },
   {
     ...blank, id: S2, name: 'zzcatupload', origin: 'upload', table_count: 2, tools: ['db_query__zzcatupload'], schema_synced_at: T0,
     database: `/tmp/check/uploads/${S2}.db`, import_mode: 'simple', current_recipe: null, open_staging: null,
@@ -261,6 +265,9 @@ const SOURCES = [
 ]
 const NAMES = SOURCES.map((s) => s.name)
 
+/** 景区库存着的起草要求（数据源级，PUT /catalog/guidance 改它） */
+const S1_GUIDANCE = '景区票务库：「核销」指闸机检票入园；金额单位是元，人数单位是人'
+
 const freshState = () => ({
   sources: SOURCES,
   tables: {
@@ -269,6 +276,13 @@ const freshState = () => ({
     [S3]: [],
     [S4]: ['parking_lots', 'parking_records', 'shuttle_trips'].map((n, i) => table(n, 3 - i, [pk(), col('name', 'TEXT')], null)),
   },
+  // 起草任务（后台任务）：建的先后就是数组的先后
+  jobs: [],
+  jobSeq: 0,
+  guidance: { [S1]: S1_GUIDANCE },
+  // 设置里的起草模型（没配：跟随助手的模型）和助手当前用的模型
+  draftModel: { provider: null, model: null },
+  assistantModel: { configured: true, provider: null, model: null, effective_provider: 'check-gateway', effective_model: 'check-assistant-model', error: null },
 })
 
 // ---------------------------------------------------------------------------
@@ -354,11 +368,15 @@ function listOf(state, src) {
   const all = state.tables[src]
   const rows = all.filter((t) => !t.missing).sort((a, b) => b.usage - a.usage).map(rowOf)
   rows.push(...all.filter((t) => t.missing).map(rowOf))
+  // 每行带这张表最近一次起草任务里的那一项（夹具可以直接给 lastDraft，任务里有这张表时以任务为准）
+  for (const r of rows) r.last_draft = lastDraftOf(state, src, r.table_name)
   // 探查结构截断了的源（state.schemaTotal 里给了数据库里的总数）：清单只有探查到的那部分
   const explored = all.filter((t) => !t.missing).length
   const total = state.schemaTotal?.[src] ?? explored
+  const active = state.jobs.find((j) => j.source_id === src && JOB_ACTIVE.has(j.status))
   return { tables: rows, system_notes: isUpload(src), schema_note: all.length ? null : '尚未探查结构',
-    schema_truncated: total > explored, schema_total: total }
+    schema_truncated: total > explored, schema_total: total, guidance: state.guidance[src] ?? null,
+    active_job: active ? (({ id, status, total: n, done }) => ({ id, status, total: n, done }))(jobOut(active)) : null }
 }
 const detailOf = (src, t) => ({
   table_name: t.name, in_schema: !t.missing, notes: t.notes ?? {}, version: t.version, updated_at: t.updated_at, updated_by: t.updated_by,
@@ -381,18 +399,200 @@ const writeEntry = (t, notes) => {
   t.updated_by = ACTOR
 }
 
-/** 起草的默认回答：每张表新增 2 项；没有目录的表顺手填上一个推断的中文名，清单重取后看得出来 */
-function draftReply(state) {
-  return (route, { key, body }) => {
-    const src = parts(key)[2]
-    const rows = (body.tables ?? []).map((name) => {
-      const t = state.tables[src].find((x) => x.name === name)
-      if (t && !t.notes) writeEntry(t, { label: item(`${name} 的推断名`, 'name') })
-      return { table_name: name, added: 2, updated: 0, removed: 0, version: t?.version ?? 0, error: null, model_error: null }
-    })
-    const total = { added: rows.length * 2, updated: 0, removed: 0 }
-    return json({ tables: rows, total, model_used: !!body.use_model, model: body.use_model ? 'check-model' : null, model_error: null })(route)
+// ---------------------------------------------------------------------------
+// 起草任务（后台任务，/api/datasources/{id}/catalog/draft-jobs）。任务怎么往前走由检查自己推（settle、finishJob、
+// stopJob）：页面每 1.5 秒取一次，看到的就是推到的那一步。不按时间自己走，结果不受机器快慢影响
+// ---------------------------------------------------------------------------
+const JOB_ACTIVE = new Set(['queued', 'running'])
+const TASK_END = new Set(['ok', 'partial', 'failed', 'skipped', 'cancelled'])
+const RETRYABLE = new Set(['failed', 'partial', 'cancelled'])
+const isoNow = () => new Date().toISOString()
+/**
+ * 服务端的几种答复（机读码 + 一句中文），说法照 api/catalog.py、data/catalog_jobs.py、data/draft_model.py 的原话。
+ * 起草模型用不了有长短两句：没有接入时短（界面原样显示），设置里的起草模型所在接入停用时长（带句号，也要原样显示）
+ */
+const busyOf = (state, src) => ({
+  detail: `数据源「${state.sources.find((s) => s.id === src)?.name ?? src}」正在起草数据目录，请等这次起草结束（或先停止它）再开始新的起草`,
+  code: 'catalog_draft_busy',
+})
+const MODEL_DOWN = { detail: '未配置模型接入，无法由模型起草数据目录。请到「设置 → 模型接入」添加', code: 'catalog_draft_model_unavailable' }
+const MODEL_OFF = {
+  detail: '起草模型使用的模型接入「check-gw」已停用。请在「设置 → 模型接入」中启用它，或在「设置 → 偏好设置」的「起草模型」中重新选择',
+  code: 'catalog_draft_model_unavailable',
+}
+/** 任务整体出错时服务端写的原因（catalog_jobs.JOB_ERROR：已经带着「起草任务出错：」开头） */
+const JOB_ERR = '起草任务出错：database is locked'
+/** 起草时每段最多几列（服务端的常量）：超过的宽表拆成「表级一段 + 列分段」 */
+const PART_COLUMNS = 40
+
+/** 建一个排队的任务：表结构里没有的表照样建进任务、记 skipped。重试建的记着原任务（retry_of，界面不用） */
+function newJob(state, src, { tables, use_model, note = null, retry_of = null }) {
+  const id = `check-job-${++state.jobSeq}`
+  const tasks = tables.map((name) => {
+    const t = state.tables[src].find((x) => x.name === name && !x.missing)
+    const cols = t?.columns?.length ?? 0
+    return {
+      table_name: name, status: t ? 'pending' : 'skipped', columns: cols,
+      parts_total: t && use_model ? (cols > PART_COLUMNS ? 1 + Math.ceil(cols / PART_COLUMNS) : 1) : null, parts_done: 0,
+      added: 0, updated: 0, removed: 0, version: t?.version ?? 0, model_items: null,
+      error: t ? null : `表结构里没有 ${name}，请先重新探查结构`, model_error: null,
+      started_at: null, finished_at: t ? null : isoNow(),
+    }
+  })
+  const job = {
+    id, source_id: src, status: 'queued', use_model: !!use_model, model: use_model ? 'check-draft-model' : null,
+    guidance: state.guidance[src] ?? null, note, created_at: isoNow(), started_at: null, finished_at: null, created_by: ACTOR,
+    retry_of, usage: { calls: 0, input_tokens: 0, output_tokens: 0 }, error: null, tasks,
   }
+  state.jobs.push(job)
+  return job
+}
+
+/** 接口返回的形状：计数、合计由逐表算出来 */
+function jobOut(job) {
+  const counts = { pending: 0, running: 0, ok: 0, partial: 0, failed: 0, skipped: 0, cancelled: 0 }
+  for (const t of job.tasks) counts[t.status]++
+  const sum = (k) => job.tasks.reduce((n, t) => n + t[k], 0)
+  const { stopAsked, ...rest } = job
+  return clone({ ...rest, total: job.tasks.length, done: job.tasks.filter((t) => TASK_END.has(t.status)).length, counts,
+    added: sum('added'), updated: sum('updated'), removed: sum('removed') })
+}
+
+/**
+ * 推进一张表：outcome.status 默认 ok（写完），给 running 就是还在起草（可带 parts_done）。写进了东西的表给它
+ * 一个起草出的中文名，清单重取后看得出来。用模型的每次推进记一次调用
+ */
+function settle(state, job, name, outcome = {}) {
+  const task = job.tasks.find((t) => t.table_name === name)
+  if (job.status === 'queued') Object.assign(job, { status: 'running', started_at: isoNow() })
+  const status = outcome.status ?? 'ok'
+  Object.assign(task, { started_at: task.started_at ?? isoNow() }, outcome, { status })
+  if (TASK_END.has(status)) {
+    task.finished_at = isoNow()
+    if (status === 'ok' && task.parts_total != null && outcome.parts_done == null) task.parts_done = task.parts_total
+    if (task.added > 0) {
+      const t = state.tables[job.source_id].find((x) => x.name === name)
+      if (t) {
+        writeEntry(t, { ...(t.notes ?? {}), label: item(`${name} 的起草名`) })
+        task.version = t.version
+      }
+    }
+  }
+  if (job.use_model) {
+    job.usage.calls += 1
+    job.usage.input_tokens += 1200
+    job.usage.output_tokens += 2400
+  }
+}
+
+/** 排队的任务开始起草（服务端轮到它了） */
+const runJob = (job) => Object.assign(job, { status: 'running', started_at: isoNow() })
+
+/** 收尾：有失败、部分完成、停止的表就是 partial */
+function finishJob(job, status) {
+  const bad = job.tasks.some((t) => RETRYABLE.has(t.status))
+  Object.assign(job, { status: status ?? (bad ? 'partial' : 'succeeded'), finished_at: isoNow() })
+  job.started_at ??= job.finished_at
+}
+
+/**
+ * 停下：没开始和没写完的表记 cancelled，已经写进目录的不动。带原因的（服务重启中断）任务和表记同一句（服务端 _close 的
+ * 做法）；使用者点的停止不带原因
+ */
+function stopJob(job, status = 'cancelled', error = null) {
+  for (const t of job.tasks) {
+    if (t.status === 'pending' || t.status === 'running') Object.assign(t, { status: 'cancelled', error, finished_at: isoNow() })
+  }
+  if (error) job.error = error
+  delete job.stopAsked
+  finishJob(job, status)
+}
+
+/** 任务整体出错（数据源没了、开始时起草模型已经用不了、意外出错）：没结束的表也记失败，原因同任务的（服务端 _end 的做法） */
+function failJob(job, error) {
+  for (const t of job.tasks) {
+    if (t.status === 'pending' || t.status === 'running') Object.assign(t, { status: 'failed', error, finished_at: isoNow() })
+  }
+  job.error = error
+  finishJob(job, 'failed')
+}
+
+function lastDraftOf(state, src, name) {
+  for (const job of [...state.jobs].reverse()) {
+    if (job.source_id !== src) continue
+    const t = job.tasks.find((x) => x.table_name === name)
+    if (t) return { status: t.status, job_id: job.id, finished_at: t.finished_at, error: t.error, model_error: t.model_error }
+  }
+  return state.tables[src]?.find((x) => x.name === name)?.lastDraft ?? null
+}
+
+const jobOf = (state, key) => {
+  const [, , src, , , id] = parts(key)
+  return state.jobs.find((j) => j.id === id && j.source_id === src) ?? null
+}
+const activeOf = (state, src) => state.jobs.find((j) => j.source_id === src && JOB_ACTIVE.has(j.status)) ?? null
+
+function jobHandlers(state, reply) {
+  const NO_JOB = json({ detail: '起草任务不存在，可能属于别的数据源，或者已随数据源删除' }, 404)
+  return [
+    // 起草要求（数据源级）：空串清除，超长 422。请求里必须有 guidance 这一项（服务端同样：没有就是 pydantic 的英文 422）
+    [/^PUT \/datasources\/check-cat-[a-z]+\/catalog\/guidance$/, reply('guidance', (route, { key, body }) => {
+      if (!body || typeof body !== 'object' || !('guidance' in body)) {
+        return json({ detail: [{ type: 'missing', loc: ['guidance'], msg: 'Field required', input: body }] }, 422)(route)
+      }
+      const g = String(body.guidance ?? '').trim()
+      if ([...g].length > 2000) return json({ detail: `起草要求最多 2000 字，当前 ${[...g].length} 字，请删减后再保存` }, 422)(route)
+      state.guidance[parts(key)[2]] = g || null
+      return json({ guidance: g || null })(route)
+    })],
+    // 建任务：同一个源已有排队、进行中的 409；不给 tables 取使用次数前 20 张
+    [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs$/, reply('createJob', (route, { key, body }) => {
+      const src = parts(key)[2]
+      if (activeOf(state, src)) return json(busyOf(state, src), 409)(route)
+      const tables = body?.tables?.length ? body.tables
+        : state.tables[src].filter((t) => !t.missing).sort((a, b) => b.usage - a.usage).slice(0, 20).map((t) => t.name)
+      const job = newJob(state, src, { tables, use_model: !!body?.use_model, note: body?.note?.trim() || null })
+      return json({ job: jobOut(job) }, 202)(route)
+    })],
+    [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs\/active$/, (route, { key }) => {
+      const job = activeOf(state, parts(key)[2])
+      return json({ job: job && jobOut(job) })(route)
+    }],
+    [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs\/latest$/, (route, { key }) => {
+      const job = state.jobs.filter((j) => j.source_id === parts(key)[2]).at(-1) ?? null
+      return json({ job: job && jobOut(job) })(route)
+    }],
+    // 停止：排队的直接停；进行中的记下来，等检查用 stopJob 推到底（这期间页面应当写「正在停止」）
+    [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs\/[^/]+\/cancel$/, reply('cancel', (route, { key }) => {
+      const job = jobOf(state, key)
+      if (!job) return NO_JOB(route)
+      if (!JOB_ACTIVE.has(job.status)) return json({ detail: '这次起草已经结束了，不需要停止', code: 'catalog_draft_finished' }, 409)(route)
+      if (job.status === 'queued') stopJob(job)
+      else job.stopAsked = true
+      return json({ job: jobOut(job) })(route)
+    })],
+    // 重试：新任务只含失败、部分完成、停止的表，沿用用模型和补充说明。起草模型用不了的 409 由检查用 replies.retry 给
+    [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs\/[^/]+\/retry$/, reply('retry', (route, { key }) => {
+      const old = jobOf(state, key)
+      if (!old) return NO_JOB(route)
+      if (activeOf(state, old.source_id)) return json(busyOf(state, old.source_id), 409)(route)
+      const tables = old.tasks.filter((t) => RETRYABLE.has(t.status)).map((t) => t.table_name)
+      if (!tables.length) return json({ detail: '这次起草里没有失败、只写出一部分或停止了的表，不需要重试' }, 422)(route)
+      const job = newJob(state, old.source_id, { tables, use_model: old.use_model, note: old.note, retry_of: old.id })
+      return json({ job: jobOut(job) }, 202)(route)
+    })],
+    [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/draft-jobs\/[^/]+$/, (route, { key }) => {
+      const job = jobOf(state, key)
+      return job ? json({ job: jobOut(job) })(route) : NO_JOB(route)
+    }],
+    // 起草对话框写明用哪个起草模型：设置里的 catalog_draft（其余设置照真服务端的）、助手当前用的模型
+    [/^GET \/settings$/, async (route) => {
+      const real = await route.fetch()
+      const body = await real.json().catch(() => ({}))
+      return route.fulfill({ response: real, json: { ...body, catalog_draft: state.draftModel } })
+    }],
+    [/^GET \/copilot\/model$/, (route) => json(state.assistantModel)(route)],
+  ]
 }
 
 function catalogHandlers(state, replies = {}) {
@@ -407,7 +607,10 @@ function catalogHandlers(state, replies = {}) {
     [/^GET \/datasources\/check-cat-[a-z]+\/schema$/, (route, { key }) =>
       json({ tables: state.tables[parts(key)[2]].filter((t) => !t.missing).map((t) => t.name), summary: '', synced_at: T0 })(route)],
     [/^GET \/datasources\/check-cat-[a-z]+\/catalog$/, (route, { key }) => json(listOf(state, parts(key)[2]))(route)],
-    [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft$/, reply('draft', draftReply(state))],
+    // 起草任务、起草要求：放在单表的 GET / PUT 前面（catalog/guidance 也对得上单表 PUT 的写法）
+    ...jobHandlers(state, reply),
+    // 旧的同步起草接口：前端不该再用它，调了就答 410，下面的检查会数它
+    [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/draft$/, json({ detail: '检查脚本：前端不该再调用同步起草接口' }, 410)],
     // 影响面：引用这张表的已发布、受管模板（只读）。没配的表答空
     [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/[^/]+\/impact$/, reply('impact', (route, { key }) => {
       const name = parts(key)[4]
@@ -450,6 +653,32 @@ const confirmBox = (page) => page.locator('[role="dialog"]').filter({ hasNot: pa
   .filter({ hasNot: page.locator('[data-item-panel]') }).last()
 const consequences = async (page) => (await confirmBox(page).locator('ul li').allInnerTexts()).map((t) => t.trim())
 const draftBox = (page) => page.locator('[data-draft-dialog]')
+/** 起草对话框在哪一步：setup / running / done；没开着为 null */
+const draftPhase = (page) => draftBox(page).getAttribute('data-draft-dialog', { timeout: 500 }).catch(() => null)
+/** 对话框里某一处的文字（空白压成一个空格）；没有这一处为空串 */
+const draftText = async (page, sel) => (await draftBox(page).locator(sel).first().innerText({ timeout: 500 }).catch(() => '')).replace(/\s+/g, ' ').trim()
+
+/** 选几张表（第一张点、最后一张 Shift 点）或者不选，打开起草对话框，按需勾用模型、写补充说明，开始；等到进入进行中 */
+async function startDraft(page, { select = null, model = false, note = '' } = {}) {
+  if (select) {
+    await page.locator(`[data-catalog-select="${select[0]}"]`).click()
+    if (select.length > 1) await page.locator(`[data-catalog-select="${select.at(-1)}"]`).click({ modifiers: ['Shift'] })
+    await page.locator('[data-catalog-draft-selected]').click()
+  } else {
+    await page.locator('[data-catalog-draft]').first().click()
+  }
+  await draftBox(page).waitFor()
+  if (model) await draftBox(page).locator('[data-draft-model] input').check()
+  if (note) await draftBox(page).locator('[data-draft-note] textarea').fill(note)
+  await page.locator('[data-draft-start]').click()
+  return until(async () => (await draftPhase(page)) === 'running')
+}
+
+/** 起草用的几句话（虚构） */
+const GUIDANCE2 = '景区票务库：「核销」指闸机检票入园；金额单位是元。会员相关的表统一写「会员」，不写「用户」'
+const DRAFT_NOTE = '这一批是闸机和会员相关的表'
+const WIDE_ERR = '这张表 50 列，分 3 段起草，第 2 段没写出来（共 10 列）：模型的思考和输出用完了额度（32768 个 token），已拆小重试仍没写出。可以只重试这张表'
+const CALL_ERR = '调用模型出错：服务暂时不可用（已重试 2 次）'
 const detail = (page) => page.locator('[data-catalog-detail]')
 const version = async (page) => Number(await detail(page).getAttribute('data-version'))
 const panel = (page) => page.locator('[data-item-panel]')
@@ -691,10 +920,9 @@ await section('数据目录 · 用到但没确认（顶部摘要）', async () =
   await close()
 })
 
-await section('数据目录 · 起草', async () => {
+await section('数据目录 · 起草：设置与开始', async () => {
   const state = freshState()
-  const MODEL_ERR = '未配置模型接入，无法由助手起草数据目录。请到「设置 → 模型接入」添加'
-  const replies = { draft: [] }
+  const replies = { createJob: [] }
   const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state, replies) })
   await page.locator('[data-catalog-row]').first().waitFor()
 
@@ -707,119 +935,372 @@ await section('数据目录 · 起草', async () => {
   check('起草范围默认是「已选的 3 张表」', await draftBox(page).locator('[data-draft-scope="selected"] input').isChecked()
         && (await draftBox(page).locator('[data-draft-scope="selected"]').innerText()).includes('已选的 3 张表'))
   check('……说明只发送表结构、不发送数据', (await draftBox(page).locator('[data-draft-model]').innerText()).includes('不发送数据'))
+  check('没勾「用模型起草」：不显示起草要求和补充说明（只对模型有用）',
+    await draftBox(page).locator('[data-draft-guidance], [data-draft-note]').count() === 0)
   await draftBox(page).locator('[data-draft-model] input').check()
-  // 模型整体用不了：第一批就知道，结果里写明原因
-  replies.draft.push((route, ctx) => {
-    const rows = ctx.body.tables.map((n) => ({ table_name: n, added: 4, updated: 1, removed: 0, version: 1, error: null, model_error: null }))
-    for (const n of ctx.body.tables) writeEntry(state.tables[S1].find((t) => t.name === n), { label: item(`${n} 的推断名`, 'name') })
-    return json({ tables: rows, total: { added: 12, updated: 3, removed: 0 }, model_used: false, model: null, model_error: MODEL_ERR })(route)
-  })
-  const listsBefore = count(sent, /^GET \/datasources\/check-cat-scenic\/catalog$/)
-  await page.locator('[data-draft-start]').click()
-  check('起草完成：写出「新增 12 项、更新 3 项」', await until(async () => (await draftBox(page).locator('[data-draft-summary]').innerText().catch(() => '')) === '新增 12 项、更新 3 项'),
-        await draftBox(page).locator('[data-draft-summary]').innerText().catch(() => ''))
-  const body = lastBody(sent, /catalog\/draft$/)
-  check('……请求带所选的表（清单顺序）和「用模型起草」', JSON.stringify(body) === JSON.stringify({ tables: ['gates', 'store_sales', 'members'], use_model: true }), JSON.stringify(body))
-  check('……模型用不了时写明原因', (await draftBox(page).locator('[data-draft-model-error]').innerText().catch(() => '')).includes('模型未参与起草：未配置模型接入'))
-  check('……进度写「已完成 3 / 3 张表」', (await draftBox(page).locator('[data-draft-progress]').innerText()) === '已完成 3 / 3 张表')
-  check('……写请求带本机署名', sent.filter((s) => /catalog\/draft$/.test(s.key)).every((s) => decodeURIComponent(s.actor ?? '') === ACTOR))
-  await shot(page, 'catalog-draft-done')
-  await page.locator('[data-draft-close]').click()
-  check('关掉后重取清单、清空选择，起草出的中文名出现在清单上', await until(async () => count(sent, /^GET \/datasources\/check-cat-scenic\/catalog$/) > listsBefore)
-        && (await page.locator('[data-catalog-count]').innerText()).endsWith('张表')
-        && await until(async () => (await page.locator('[data-catalog-row="gates"] [data-row-label]').innerText()) === 'gates 的推断名'))
+  const guidance = draftBox(page).locator('[data-draft-guidance] textarea')
+  const note = draftBox(page).locator('[data-draft-note] textarea')
+  check('勾上以后：起草要求显示数据源现在存的那一份，可以改', await guidance.inputValue().catch(() => '') === S1_GUIDANCE
+        && await guidance.isEditable().catch(() => false), await guidance.inputValue().catch(() => '—'))
+  check('……本次补充说明是空的', await note.inputValue().catch(() => '—') === '')
+  check('……写明用的是哪个起草模型：设置里没配，跟随助手的模型（写出当前是哪个）',
+    (await draftText(page, '[data-draft-model-name]')).includes('跟随助手的模型（当前：check-assistant-model）'), await draftText(page, '[data-draft-model-name]'))
+  check('……数据源说明也一并交给模型：写出来', (await draftText(page, '[data-draft-source-description]')).includes(S1_DESCRIPTION),
+    await draftText(page, '[data-draft-source-description]'))
+  await shot(page, 'catalog-draft-setup')
 
-  // 全部 151 张（只剩目录的那张起草不了，不算进范围），不请模型时每批 40 张
+  // 超长：写明上限，不能开始
+  await guidance.fill('长'.repeat(2001))
+  check('起草要求超过 2,000 字：写明上限，「起草」不可用', (await draftText(page, '[data-draft-guidance]')).includes('不超过 2,000 字')
+        && await page.locator('[data-draft-start]').isDisabled(), await draftText(page, '[data-draft-guidance]'))
+  await guidance.fill(GUIDANCE2)
+  await note.fill(DRAFT_NOTE)
+
+  // 起草模型用不了：409 带机读码，留在设置阶段写明原因，不进入进行中、不去取任务
+  replies.createJob.push(json(MODEL_DOWN, 409))
+  await page.locator('[data-draft-start]').click()
+  check('起草模型用不了（409）：留在设置阶段，照原样写服务端那句话', await until(async () => (await draftText(page, '[data-draft-start-error]')) === MODEL_DOWN.detail)
+        && (await draftPhase(page)) === 'setup', await draftText(page, '[data-draft-start-error]'))
+  const keys = writes(sent, /./).map((s) => s.key.replace(/^(\w+) .*\/catalog\//, '$1 '))
+  check('……起草要求改过：先存起草要求、再建任务', keys.join(',') === 'PUT guidance,POST draft-jobs', keys.join(','))
+  check('……存的是改过的那一份', JSON.stringify(lastBody(sent, /catalog\/guidance$/)) === JSON.stringify({ guidance: GUIDANCE2 }),
+    JSON.stringify(lastBody(sent, /catalog\/guidance$/)))
+  check('……没有去取任务进度', count(sent, /draft-jobs\/check-job/) === 0)
+
+  // 再点一次：这回建得起来；起草要求已经存过、没再改，不再存一次
+  await page.locator('[data-draft-start]').click()
+  check('建起来以后进入进行中', await until(async () => (await draftPhase(page)) === 'running'))
+  const body = lastBody(sent, /draft-jobs$/)
+  check('建任务的请求：所选的表（清单顺序）、用模型、本次补充说明',
+    JSON.stringify(body) === JSON.stringify({ tables: ['gates', 'store_sales', 'members'], use_model: true, note: DRAFT_NOTE }), JSON.stringify(body))
+  check('……起草要求只存了一次', count(sent, /^PUT .*catalog\/guidance$/) === 1)
+  check('……写请求都带本机署名', writes(sent, /catalog\/(draft-jobs|guidance)/).every((s) => decodeURIComponent(s.actor ?? '') === ACTOR))
+  check('进行中：逐表列出 3 张，都在等待', (await draftBox(page).locator('[data-draft-task]').count()) === 3
+        && (await draftText(page, '[data-draft-task="gates"] [data-draft-task-status]')) === '等待', await draftText(page, '[data-draft-tasks]'))
+  check('……进度写「已完成 0 / 3 张表」', (await draftText(page, '[data-draft-progress]')) === '已完成 0 / 3 张表', await draftText(page, '[data-draft-progress]'))
+  check('……清单上的选择清空（这几张已经交给起草任务）', (await page.locator('[data-catalog-count]').innerText()).endsWith('张表'))
+  await shot(page, 'catalog-draft-running')
+  stopJob(state.jobs.at(-1))
+  check('没有调用旧的同步起草接口', count(sent, /catalog\/draft$/) === 0)
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据目录 · 起草：进度、结果与重试', async () => {
+  const state = freshState()
+  const replies = { retry: [] }
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state, replies) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  check('开始起草（闸机到会员 3 张，用模型，带补充说明）', await startDraft(page, { select: ['gates', 'members'], model: true, note: DRAFT_NOTE }))
+  const job = state.jobs.at(-1)
+
+  // 一张写完、宽表起草到第 1 段
+  settle(state, job, 'gates', { added: 3, model_items: 6 })
+  settle(state, job, 'store_sales', { status: 'running', parts_done: 1 })
+  check('进度：已完成 1 / 3 张表', await until(async () => (await draftBox(page).locator('[data-draft-progress]').getAttribute('data-draft-progress', { timeout: 500 }).catch(() => '')) === '1/3'),
+    await draftText(page, '[data-draft-progress]'))
+  const bar = draftBox(page).locator('[role="progressbar"]').first()
+  check('……进度条读屏可读：名称、当前值、上限', (await bar.getAttribute('aria-valuenow')) === '1' && (await bar.getAttribute('aria-valuemax')) === '3'
+        && !!(await bar.getAttribute('aria-label')))
+  check('……宽表写出段进度「1 / 3 段」，状态是「起草中」', (await draftText(page, '[data-draft-task="store_sales"] [data-draft-task-parts]')) === '1 / 3 段'
+        && (await draftText(page, '[data-draft-task="store_sales"] [data-draft-task-status]')) === '起草中', await draftText(page, '[data-draft-task="store_sales"]'))
+  check('……写完的那张写「已完成」', (await draftText(page, '[data-draft-task="gates"] [data-draft-task-status]')) === '已完成')
+  check('……合计写「新增 3 项、更新 0 项」', (await draftText(page, '[data-draft-summary]')) === '新增 3 项、更新 0 项', await draftText(page, '[data-draft-summary]'))
+  check('……写明用的模型', (await draftText(page, '[data-draft-model-used]')).includes('check-draft-model'), await draftText(page, '[data-draft-model-used]'))
+  check('写完的表马上并入目录：清单重取，起草出的中文名出现',
+    await until(async () => (await page.locator('[data-catalog-row="gates"] [data-row-label]').innerText({ timeout: 500 }).catch(() => '')) === 'gates 的起草名'))
+
+  // 宽表有一段没写出来；会员表一段都没写出来
+  settle(state, job, 'store_sales', { status: 'partial', parts_done: 2, added: 4, model_items: 8, model_error: WIDE_ERR })
+  settle(state, job, 'members', { status: 'failed', model_items: 0, model_error: CALL_ERR })
+  finishJob(job)
+  check('结束：标题写「起草完成，部分表未写全」', await until(async () => (await draftPhase(page)) === 'done')
+        && (await draftText(page, '[data-draft-title]')) === '起草完成，部分表未写全', await draftText(page, '[data-draft-title]'))
+  const problems = await draftText(page, '[data-draft-problems]')
+  check('……写明哪些没写全：失败 1 张、部分完成 1 张', problems.includes('失败 1 张') && problems.includes('部分完成 1 张'), problems)
+  const shown = await draftBox(page).locator('[data-draft-task]').evaluateAll((els) => els.map((e) => e.getAttribute('data-draft-task')))
+  check('……逐表只列没写全的 2 张，各自写原因', shown.join(',') === 'store_sales,members'
+        && (await draftText(page, '[data-draft-task="store_sales"] [data-draft-task-reason]')).includes('第 2 段没写出来')
+        && (await draftText(page, '[data-draft-task="members"] [data-draft-task-reason]')).includes('已重试 2 次'), shown.join(','))
+  await draftBox(page).locator('[data-draft-show-all]').click()
+  check('……点「显示全部」列出 3 张', (await draftBox(page).locator('[data-draft-task]').count()) === 3)
+  check('……合计、用量照实写', (await draftText(page, '[data-draft-summary]')) === '新增 7 项、更新 0 项'
+        && (await draftText(page, '[data-draft-usage]')).includes('调用模型 4 次'), `${await draftText(page, '[data-draft-summary]')} · ${await draftText(page, '[data-draft-usage]')}`)
+  check('……清单上失败的表标「上次起草失败」', await until(async () => (await page.locator('[data-catalog-row="members"] [data-row-last-draft="failed"]').count()) === 1))
+  await shot(page, 'catalog-draft-partial')
+
+  // 结束以后不再取进度
+  const polls = () => count(sent, new RegExp(`^GET .*draft-jobs/${job.id}$`))
+  const n = polls()
+  await sleep(3200)
+  check('结束以后不再取进度', polls() === n, `${n} → ${polls()}`)
+
+  // 只重试失败的表
+  const retry = page.locator('[data-draft-retry]')
+  check('给「只重试失败的表（2 张）」', (await retry.innerText().catch(() => '')).includes('只重试失败的表（2 张）'), await retry.innerText().catch(() => ''))
+  // 重试时起草模型已经用不了（服务端和建任务时一样回 409 catalog_draft_model_unavailable）：留在结果里，照原样写服务端
+  // 那句话（长句也不拆成「标题：原因」），不建新任务
+  replies.retry.push(json(MODEL_OFF, 409))
+  await retry.click()
+  check('重试时起草模型用不了（409）：留在结果里，照原样写服务端那句话，不建新任务',
+    await until(async () => (await draftText(page, '[data-draft-action-error]')) === MODEL_OFF.detail)
+        && (await draftPhase(page)) === 'done' && state.jobs.at(-1) === job, await draftText(page, '[data-draft-action-error]'))
+  await retry.click()
+  check('重试：调重试接口，进入新任务的进行中，只含没写全的 2 张', await until(async () => (await draftPhase(page)) === 'running'
+        && (await draftBox(page).locator('[data-draft-task]').count()) === 2) && count(sent, new RegExp(`^POST .*draft-jobs/${job.id}/retry$`)) === 2)
+  check('……上一次的报错收起', await draftBox(page).locator('[data-draft-action-error]').count() === 0)
+  const job2 = state.jobs.at(-1)
+  check('……新任务沿用用模型和补充说明', job2.id !== job.id && job2.use_model && job2.note === DRAFT_NOTE && job2.retry_of === job.id)
+  settle(state, job2, 'store_sales', { added: 1, model_items: 3 })
+  settle(state, job2, 'members', { added: 5, model_items: 5 })
+  finishJob(job2)
+  check('……都写完：「起草完成」，不再给重试', await until(async () => (await draftText(page, '[data-draft-title]')) === '起草完成')
+        && await page.locator('[data-draft-retry]').count() === 0, await draftText(page, '[data-draft-title]'))
+  check('……没有没写全的表时逐表全部列出', (await draftBox(page).locator('[data-draft-task]').count()) === 2)
+  await page.locator('[data-draft-close]').click()
+  check('关掉以后清单上的标记跟着最新一次起草：会员表不再标失败', await until(async () => (await page.locator('[data-catalog-row="members"] [data-row-last-draft]').count()) === 0))
+
+  // 一项都没写进去：只有「模型给了内容、只是和现有目录一致」才说「没有变化」
+  const nothing = async (outcome) => {
+    await startDraft(page, { select: ['parks'], model: true })
+    const j = state.jobs.at(-1)
+    settle(state, j, 'parks', outcome)
+    finishJob(j)
+    await until(async () => (await draftPhase(page)) === 'done')
+    const out = await draftText(page, '[data-draft-summary]')
+    await page.locator('[data-draft-close]').click()
+    return out
+  }
+  check('模型一项可用内容都没给：不说「没有变化」，说「目录没有更新」', (await nothing({ status: 'failed', model_items: 0, model_error: '模型没有给出这张表的可用内容' }))
+        === '目录没有更新：模型没有给出可用的内容，原因见下方')
+  check('……模型给了内容、只是和现有目录一致：才说「没有变化」', (await nothing({ model_items: 3 })) === '没有变化：起草出的内容与现有目录一致')
+  check('没有调用旧的同步起草接口', count(sent, /catalog\/draft$/) === 0)
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据目录 · 起草：停止、后台继续与再打开', async () => {
+  const state = freshState()
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  // 页头「起草」：没选表，范围默认是使用次数最多的 20 张
   await page.locator('[data-catalog-draft]').first().click()
   await draftBox(page).waitFor()
   const scopes = await draftBox(page).locator('[data-draft-scope]').evaluateAll((els) => els.map((e) => e.getAttribute('data-draft-scope')))
   check('没选表时：范围是「使用次数最多的 20 张」「全部 151 张」，默认前者', scopes.join(',') === 'top,all'
         && await draftBox(page).locator('[data-draft-scope="top"] input').isChecked()
         && (await draftBox(page).locator('[data-draft-scope="all"]').innerText()).includes('全部 151 张表'), scopes.join(','))
-  await draftBox(page).locator('[data-draft-scope="all"]').click()
-  const n0 = count(sent, /catalog\/draft$/)
-  await page.locator('[data-draft-start]').click()
-  await until(async () => (await draftBox(page).getAttribute('data-draft-dialog')) === 'done', 8000)
-  const batches = sent.filter((s) => /catalog\/draft$/.test(s.key)).slice(n0).map((s) => s.body)
-  check('表多时分批调用：40、40、40、31 张，都不请模型', batches.map((b) => b.tables.length).join(',') === '40,40,40,31'
-        && batches.every((b) => b.use_model === false) && !batches.flatMap((b) => b.tables).includes('legacy_coupons'),
-        batches.map((b) => b.tables.length).join(','))
-  check('……进度写满、合计各批的结果', (await draftBox(page).locator('[data-draft-progress]').innerText()) === '已完成 151 / 151 张表'
-        && (await draftBox(page).locator('[data-draft-summary]').innerText()) === '新增 302 项、更新 0 项')
-  check('……进度条读屏可读（progressbar 带当前值）', (await draftBox(page).locator('[role="progressbar"]').getAttribute('aria-valuenow')) === '151')
-  await page.locator('[data-draft-close]').click()
-
-  // 请模型时每批 12 张
-  await page.locator('[data-catalog-draft]').first().click()
+  check('……没有上一次起草时不写「上一次」', await draftBox(page).locator('[data-draft-last]').count() === 0)
   await draftBox(page).locator('[data-draft-model] input').check()
-  const n1 = count(sent, /catalog\/draft$/)
   await page.locator('[data-draft-start]').click()
-  await until(async () => (await draftBox(page).getAttribute('data-draft-dialog')) === 'done', 8000)
-  const modelBatches = sent.filter((s) => /catalog\/draft$/.test(s.key)).slice(n1).map((s) => s.body)
-  check('用模型起草前 20 张：每批 12 张（12、8），都请模型', modelBatches.map((b) => `${b.tables.length}:${b.use_model}`).join(',') === '12:true,8:true',
-        modelBatches.map((b) => `${b.tables.length}:${b.use_model}`).join(','))
-  check('……写出用的是哪个模型', (await draftBox(page).innerText()).includes('模型：check-model'))
-  await page.locator('[data-draft-close]').click()
+  await until(async () => (await draftPhase(page)) === 'running')
+  const body = lastBody(sent, /draft-jobs$/) ?? {}
+  check('请求带使用次数最多的 20 张表（不含只剩目录的那张），补充说明空着就不带', body.tables?.length === 20 && !body.tables.includes('legacy_coupons')
+        && body.use_model === true && !('note' in body), JSON.stringify(body).slice(0, 160))
+  const job = state.jobs.at(-1)
+  check('刚建好还在排队：标题写「排队中」', (await draftText(page, '[data-draft-title]')).startsWith('排队中'), await draftText(page, '[data-draft-title]'))
+  runJob(job)
+  check('……轮到它了：「正在起草…」', await until(async () => (await draftText(page, '[data-draft-title]')) === '正在起草…'), await draftText(page, '[data-draft-title]'))
 
-  // 一项都没写进去：只有「模型给了内容、只是和现有目录一致」才说「没有变化」，模型没给出内容要说「目录没有更新」
-  const emptyReply = ({ items, modelError }) => (route, ctx) => json({
-    tables: ctx.body.tables.map((n) => ({ table_name: n, added: 0, updated: 0, removed: 0, version: 1, error: null,
-      model_error: modelError, model_items: items })),
-    total: { added: 0, updated: 0, removed: 0 }, model_used: true, model: 'check-model', model_error: null,
-  })(route)
-  const draftOnce = async (reply) => {
-    replies.draft.push(reply, reply)
-    await page.locator('[data-catalog-draft]').first().click()
-    await draftBox(page).locator('[data-draft-model] input').check()
-    await page.locator('[data-draft-start]').click()
-    await until(async () => (await draftBox(page).getAttribute('data-draft-dialog')) === 'done', 8000)
-    const summary = await draftBox(page).locator('[data-draft-summary]').innerText()
-    const notice = await draftBox(page).locator('[data-draft-table-model-errors]').innerText().catch(() => '')
-    await page.locator('[data-draft-close]').click()
-    return { summary, notice }
-  }
-  const noContent = await draftOnce(emptyReply({ items: null, modelError: '模型没有给出这张表的可用内容' }))
-  check('模型没给出内容（每张表记 model_error）：不说「没有变化」，说「目录没有更新」并列出原因',
-    noContent.summary === '目录没有更新：模型没有给出可用的内容，原因见下方' && noContent.notice.includes('模型没有给出这张表的可用内容'),
-    JSON.stringify(noContent))
-  const zeroItems = await draftOnce(emptyReply({ items: 0, modelError: null }))
-  check('……模型一项可用内容都没给（model_items 都是 0）：同样不说「没有变化」', zeroItems.summary === '目录没有更新：模型没有给出可用的内容，原因见下方',
-    JSON.stringify(zeroItems))
-  const same = await draftOnce(emptyReply({ items: 3, modelError: null }))
-  check('……模型给了内容、只是和现有目录一致：才说「没有变化」', same.summary === '没有变化：起草出的内容与现有目录一致', JSON.stringify(same))
-
-  // 中途停止：当前这一批做完后不再发下一批
-  replies.draft.push(async (route, ctx) => { await sleep(900); return draftReply(state)(route, ctx) })
-  await page.locator('[data-catalog-draft]').first().click()
-  await draftBox(page).locator('[data-draft-scope="all"]').click()
-  const n2 = count(sent, /catalog\/draft$/)
-  await page.locator('[data-draft-start]').click()
+  // 关掉对话框：任务不停，目录页上方显示进度
+  await page.locator('[data-draft-hide]').click()
+  check('「在后台继续」：对话框关上，没有发停止', await until(async () => (await draftBox(page).count()) === 0) && count(sent, /\/cancel$/) === 0)
+  const strip = page.locator('[data-catalog-draft-progress]')
+  check('……目录页上方显示一条进度', await until(async () => (await strip.count()) === 1) && (await strip.innerText()).includes('已完成 0 / 20 张表'),
+    await strip.innerText({ timeout: 500 }).catch(() => ''))
+  settle(state, job, 'visits', { added: 2 })
+  settle(state, job, 'orders', { added: 1 })
+  check('……进度跟着任务走', await until(async () => (await strip.getAttribute('data-catalog-draft-progress', { timeout: 500 }).catch(() => '')) === '2/20'),
+    await strip.getAttribute('data-catalog-draft-progress', { timeout: 500 }).catch(() => ''))
+  check('……进度条读屏可读', (await strip.locator('[role="progressbar"]').getAttribute('aria-valuenow').catch(() => '')) === '2')
+  await shot(page, 'catalog-draft-strip')
+  // 点开回到对话框：直接是进行中的那个任务
+  await strip.locator('[data-catalog-draft-open]').click()
+  check('点开：回到对话框，直接显示进行中的任务', await until(async () => (await draftPhase(page)) === 'running')
+        && (await draftText(page, '[data-draft-progress]')) === '已完成 2 / 20 张表', await draftText(page, '[data-draft-progress]'))
+  // 停止：调停止接口；服务端马上取消进行中的模型调用，只等手上那张表写完（停止接口等它收尾才答）。这期间写「正在停止」，
+  // 说法照服务端的做法：不是「等当前这次调用结束」——一次调用可能要几分钟
   await page.locator('[data-draft-stop]').click()
-  check('点「停止」后写「当前这一批完成后停止…」', (await draftBox(page).locator('[data-draft-title]').innerText()) === '当前这一批完成后停止…')
-  await until(async () => (await draftBox(page).getAttribute('data-draft-dialog')) === 'done', 5000)
-  check('……这一批做完就停：只发了 1 批，写明完成了多少', count(sent, /catalog\/draft$/) - n2 === 1
-        && (await draftBox(page).locator('[data-draft-title]').innerText()) === '已停止：完成 40 / 151 张表，其余未起草')
+  check('点「停止」：调停止接口，写「正在停止：取消进行中的模型调用…」，停止按钮不能再点',
+    await until(async () => (await draftText(page, '[data-draft-title]')).startsWith('正在停止：取消进行中的模型调用'))
+        && count(sent, new RegExp(`^POST .*draft-jobs/${job.id}/cancel$`)) === 1 && await page.locator('[data-draft-stop]').isDisabled(),
+    await draftText(page, '[data-draft-title]'))
+  stopJob(job)
+  check('……停下来：标题写「已停止」，没开始的 18 张记已停止', await until(async () => (await draftPhase(page)) === 'done')
+        && (await draftText(page, '[data-draft-title]')) === '已停止' && (await draftText(page, '[data-draft-problems]')).includes('已停止 18 张'),
+    `${await draftText(page, '[data-draft-title]')} · ${await draftText(page, '[data-draft-problems]')}`)
+  check('……已经写进目录的不回滚：合计照实写', (await draftText(page, '[data-draft-summary]')) === '新增 3 项、更新 0 项', await draftText(page, '[data-draft-summary]'))
+  check('……可以只重试没写的 18 张', (await page.locator('[data-draft-retry]').innerText().catch(() => '')).includes('（18 张）'))
   await page.locator('[data-draft-close]').click()
 
-  // 第二批出错：停下来，写服务端原话；个别表没起草、模型只在个别表上失败的分开列
-  replies.draft.push((route, ctx) => {
-    const rows = ctx.body.tables.map((n, i) => ({ table_name: n, added: 1, updated: 0, removed: 0, version: 1,
-      error: i === 0 ? '这张表的数据目录正被其他人修改，请稍后再起草' : null, model_error: i === 1 ? '模型返回的内容无法解析' : null }))
-    return json({ tables: rows, total: { added: 39, updated: 0, removed: 0 }, model_used: true, model: 'check-model', model_error: null })(route)
-  })
-  replies.draft.push(json({ detail: '服务端处理起草时出错，请稍后重试' }, 500))
+  // 再起一个（不用模型），按 Esc 关掉对话框，重新载入页面：清单带着进行中的任务，打开就是它
   await page.locator('[data-catalog-draft]').first().click()
-  await draftBox(page).locator('[data-draft-scope="all"]').click()
+  await draftBox(page).waitFor()
+  check('上一次停止了：设置阶段写明上一次的结果，可以点开看', (await draftText(page, '[data-draft-last]')).includes('已停止')
+        && await draftBox(page).locator('[data-draft-last-open]').count() === 1, await draftText(page, '[data-draft-last]'))
   await page.locator('[data-draft-start]').click()
-  await until(async () => (await draftBox(page).getAttribute('data-draft-dialog')) === 'done', 5000)
-  const text = await draftBox(page).innerText()
-  check('第二批出错：写「起草中断」和服务端原话，进度停在 40', text.includes('起草中断') && text.includes('服务端处理起草时出错')
-        && (await draftBox(page).locator('[data-draft-progress]').innerText()) === '已完成 40 / 151 张表', text.replace(/\s+/g, ' ').slice(0, 160))
-  check('……没起草的表单独列出（1 张）', (await draftBox(page).locator('[data-draft-table-errors]').innerText()).includes('1 张表未能起草'))
-  check('……模型只在个别表上失败的另列（1 张），说明已按其余来源起草', (await draftBox(page).locator('[data-draft-table-model-errors]').innerText()).includes('1 张表的模型起草失败'))
+  await until(async () => (await draftPhase(page)) === 'running')
+  const job3 = state.jobs.at(-1)
+  check('不用模型：请求的用模型为假，逐表不写段进度', lastBody(sent, /draft-jobs$/)?.use_model === false
+        && await draftBox(page).locator('[data-draft-task-parts]').count() === 0)
+  await page.keyboard.press('Escape')
+  check('按 Esc 关掉对话框也不停任务', await until(async () => (await draftBox(page).count()) === 0)
+        && count(sent, new RegExp(`^POST .*draft-jobs/${job3.id}/cancel$`)) === 0)
+  await goto(page, `/data/catalog/${S1}`)
+  check('重新载入页面：清单带着进行中的任务，上方照样显示进度', await until(async () => (await page.locator('[data-catalog-draft-progress]').count()) === 1))
+  await page.locator('[data-catalog-draft]').first().click()
+  check('……点「起草」直接显示进行中的任务，不是重新选范围', await until(async () => (await draftPhase(page)) === 'running')
+        && await draftBox(page).locator('[data-draft-scope]').count() === 0)
+  await page.locator('[data-draft-hide]').click()
+  // 关着对话框时结束：提示，带「查看结果」
+  for (const t of job3.tasks) if (t.status === 'pending') settle(state, job3, t.table_name, { added: 1 })
+  finishJob(job3)
+  const toastBox = page.locator('[data-toast]').filter({ hasText: '起草完成' })
+  check('关着对话框时结束：提示「数据目录起草完成」，带「查看结果」', await until(async () => (await toastBox.count()) > 0),
+    await page.locator('[data-toast]').allInnerTexts().then((t) => t.join(' | ')).catch(() => ''))
+  check('……上方的进度收起', (await page.locator('[data-catalog-draft-progress]').count()) === 0)
+  await toastBox.getByRole('button', { name: '查看结果' }).click()
+  check('……点「查看结果」打开这一次的结果', await until(async () => (await draftPhase(page)) === 'done')
+        && (await draftText(page, '[data-draft-title]')) === '起草完成', await draftText(page, '[data-draft-title]'))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据目录 · 起草：已有任务（409）、服务重启中断、整体出错与离开页面', async () => {
+  const state = freshState()
+  // 上一次起草因服务重启中断：没结束的表记已停止，写明原因
+  const old = newJob(state, S1, { tables: ['visits', 'orders', 'parks'], use_model: true, note: DRAFT_NOTE })
+  settle(state, old, 'visits', { added: 2 })
+  stopJob(old, 'interrupted', '服务重启，起草中断')
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  await page.locator('[data-catalog-draft]').first().click()
+  await draftBox(page).waitFor()
+  check('上一次起草因服务重启中断：设置阶段写明，给「查看」', await until(async () => (await draftText(page, '[data-draft-last]')).includes('服务重启')),
+    await draftText(page, '[data-draft-last]'))
+  await draftBox(page).locator('[data-draft-last-open]').click()
+  check('……点开：结果写明服务重启中断，可以接着重试', await until(async () => (await draftPhase(page)) === 'done')
+        && (await draftText(page, '[data-draft-title]')) === '服务重启，起草中断' && (await draftText(page, '[data-draft-interrupted]')).includes('重试'),
+    `${await draftText(page, '[data-draft-title]')} · ${await draftText(page, '[data-draft-interrupted]')}`)
+  // 服务端把任务和没写完的表都记「服务重启，起草中断」：标题、提示已经写了，逐表只写「已停止」，不再各写一遍
+  check('……没写的 2 张记「已停止」，原因不再逐张重复', (await draftText(page, '[data-draft-task="orders"] [data-draft-task-status]')) === '已停止'
+        && (await draftText(page, '[data-draft-task="parks"] [data-draft-task-status]')) === '已停止'
+        && await draftBox(page).locator('[data-draft-task-reason]').count() === 0, await draftText(page, '[data-draft-tasks]'))
+  await shot(page, 'catalog-draft-interrupted')
+  await page.locator('[data-draft-retry]').click()
+  check('……「只重试失败的表」接着起草没写的 2 张', await until(async () => (await draftPhase(page)) === 'running')
+        && JSON.stringify(state.jobs.at(-1).tasks.map((t) => t.table_name)) === JSON.stringify(['orders', 'parks']))
+  const again = state.jobs.at(-1)
+  settle(state, again, 'orders', { added: 1 })
+  settle(state, again, 'parks', { added: 1 })
+  finishJob(again)
+  await until(async () => (await draftPhase(page)) === 'done')
+  await page.locator('[data-draft-close]').click()
+
+  // 任务整体出错（意外出错、开始时起草模型已经用不了……）：服务端把没结束的表也记失败、原因同任务的。原因只在标题下面
+  // 写一次，照服务端的原话（它已经带着「起草任务出错：」开头，界面不再套一层）；逐表不再重复同一句；这些表都能重试
+  check('开始起草（使用次数最多的 20 张，用模型）', await startDraft(page, { model: true }))
+  const broken = state.jobs.at(-1)
+  settle(state, broken, 'visits', { added: 2, model_items: 4 })
+  settle(state, broken, 'orders', { status: 'failed', model_items: 0, model_error: CALL_ERR })
+  failJob(broken, JOB_ERR)
+  check('任务整体出错：标题写「起草失败」，原因照服务端的原话写一次', await until(async () => (await draftPhase(page)) === 'done')
+        && (await draftText(page, '[data-draft-title]')) === '起草失败' && (await draftText(page, '[data-draft-job-error]')) === JOB_ERR,
+    `${await draftText(page, '[data-draft-title]')} · ${await draftText(page, '[data-draft-job-error]')}`)
+  check('……逐表只列没写的 19 张；和任务相同的原因不再逐张重复，各有原因的照样写', (await draftBox(page).locator('[data-draft-task]').count()) === 19
+        && await draftBox(page).locator('[data-draft-task-reason]').count() === 1
+        && (await draftText(page, '[data-draft-task="orders"] [data-draft-task-reason]')) === CALL_ERR, await draftText(page, '[data-draft-tasks]'))
+  check('……这 19 张都能重试', (await page.locator('[data-draft-retry]').innerText().catch(() => '')).includes('（19 张）'))
   await shot(page, 'catalog-draft-failed')
-  check('只发过起草请求，没有别的写请求', writes(sent, /./).every((s) => /catalog\/draft$/.test(s.key)), JSON.stringify(writes(sent, /./).filter((s) => !/catalog\/draft$/.test(s.key)).map((s) => s.key)))
-  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  await page.locator('[data-draft-close]').click()
+
+  // 别处（另一个标签页）又起了一个任务，这一页还不知道：点开始时服务端回 409，转去显示那一个。先等设置阶段把上一次起草
+  // 取回来（写出「上一次起草…起草失败」），免得它晚到、取回的已经是别处那个进行中的任务，就走不到 409 了
+  await page.locator('[data-catalog-draft]').first().click()
+  await draftBox(page).waitFor()
+  check('上一次整体出错：设置阶段写明「起草失败」', await until(async () => (await draftText(page, '[data-draft-last]')).includes('起草失败')),
+    await draftText(page, '[data-draft-last]'))
+  const other = newJob(state, S1, { tables: ['gates', 'members'], use_model: true })
+  settle(state, other, 'gates', { added: 1 })
+  const pollsOf = (id) => count(sent, new RegExp(`^GET .*draft-jobs/${id}$`))
+  await page.locator('[data-draft-start]').click()
+  check('已有进行中的任务（409）：转去显示那一个，并写明', await until(async () => (await draftPhase(page)) === 'running')
+        && (await draftText(page, '[data-draft-busy]')).includes('已有进行中的起草任务')
+        && (await draftText(page, '[data-draft-progress]')) === '已完成 1 / 2 张表', `${await draftText(page, '[data-draft-busy]')} · ${await draftText(page, '[data-draft-progress]')}`)
+  check('……先问进行中的是哪一个，之后跟着它取进度', count(sent, /draft-jobs\/active$/) >= 1 && await until(async () => pollsOf(other.id) >= 1),
+    `active ${count(sent, /draft-jobs\/active$/)} 次，取进度 ${pollsOf(other.id)} 次`)
+
+  // 任务进行中离开数据目录页（页内跳转，页面卸下，不是重新载入）：不再取进度。卸下以后稍停，让卸下前已经发出的那次
+  // 取进度落进记录（停得太久，没清掉的那一拍可能恰好落在这段里、数不出来），再数两个多间隔
+  await page.locator('[data-draft-hide]').click()
+  await until(async () => (await draftBox(page).count()) === 0)
+  await page.locator('[data-catalog-back]').click()
+  const left = await until(async () => new URL(page.url()).pathname === '/data/databases' && (await page.locator('[data-catalog-page]').count()) === 0)
+  await sleep(100)
+  const polled = pollsOf(other.id)
+  await sleep(3200)
+  check('任务进行中离开数据目录页：页面卸下以后不再取进度', left && pollsOf(other.id) === polled,
+    `${left ? '' : `没有离开（${new URL(page.url()).pathname}）；`}${polled} → ${pollsOf(other.id)}`)
+  stopJob(other)
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据目录 · 起草：清单上的失败标记与单表重起草', async () => {
+  const state = freshState()
+  const replies = { createJob: [] }
+  const FAIL = '模型 420 秒内没有写完这一段'
+  const tOf = (n) => state.tables[S1].find((t) => t.name === n)
+  tOf('orders').lastDraft = { status: 'failed', job_id: 'check-job-old', finished_at: T0, error: null, model_error: FAIL }
+  tOf('order_items').lastDraft = { status: 'partial', job_id: 'check-job-old', finished_at: T0, error: null, model_error: WIDE_ERR }
+  tOf('parks').lastDraft = { status: 'ok', job_id: 'check-job-old', finished_at: T0, error: null, model_error: null }
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state, replies) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  const mark = (n) => page.locator(`[data-catalog-row="${n}"] [data-row-last-draft]`)
+  check('上次起草失败的表：清单上标「上次起草失败」并写原因', (await mark('orders').getAttribute('data-row-last-draft', { timeout: 1000 }).catch(() => '')) === 'failed'
+        && (await mark('orders').innerText()).includes('上次起草失败') && (await mark('orders').innerText()).includes(FAIL),
+    await mark('orders').innerText({ timeout: 500 }).catch(() => ''))
+  check('……部分完成的标「上次起草部分完成」', (await mark('order_items').getAttribute('data-row-last-draft', { timeout: 1000 }).catch(() => '')) === 'partial'
+        && (await mark('order_items').innerText()).includes('上次起草部分完成'))
+  check('……原因全文在悬停里', (await mark('order_items').getAttribute('title', { timeout: 500 }).catch(() => '') ?? '').includes(WIDE_ERR))
+  check('……写完了的、没起草过的不标', await mark('parks').count() === 0 && await mark('visits').count() === 0)
+  await shot(page, 'catalog-last-draft-marks')
+
+  // 打开这张表：写明原因，给「重新起草这张表」
+  await page.locator('[data-catalog-row="orders"] [data-catalog-open-row]').click()
+  const note = page.locator('[data-catalog-last-draft]')
+  check('打开这张表：写明上次起草失败和原因', await until(async () => (await note.count()) === 1)
+        && (await note.innerText()).includes('上次起草失败') && (await note.innerText()).includes(FAIL), await note.innerText({ timeout: 500 }).catch(() => ''))
+  await shot(page, 'catalog-last-draft-detail')
+  await note.locator('[data-catalog-redraft]').click()
+  check('「重新起草这张表」：建只含这张表、用模型、不带补充说明的任务', await until(async () => !!lastBody(sent, /draft-jobs$/))
+        && JSON.stringify(lastBody(sent, /draft-jobs$/)) === JSON.stringify({ tables: ['orders'], use_model: true }), JSON.stringify(lastBody(sent, /draft-jobs$/)))
+  check('……打开对话框显示这个任务的进度', await until(async () => (await draftPhase(page)) === 'running')
+        && (await draftBox(page).locator('[data-draft-task]').count()) === 1)
+  const job = state.jobs.at(-1)
+  settle(state, job, 'orders', { added: 2 })
+  finishJob(job)
+  await until(async () => (await draftPhase(page)) === 'done')
+  await page.locator('[data-draft-close]').click()
+  check('……写完以后：清单上的标记和详情里的说明都收起', await until(async () => (await mark('orders').count()) === 0
+        && (await page.locator('[data-catalog-last-draft]').count()) === 0))
+
+  // 模型用不了：单表重起草直接提示原因，不打开对话框
+  await page.locator('[data-catalog-row="order_items"] [data-catalog-open-row]').click()
+  await until(async () => (await page.locator('[data-catalog-last-draft]').count()) === 1)
+  check('部分完成的表：详情里写「上次起草部分完成」', (await page.locator('[data-catalog-last-draft]').innerText()).includes('上次起草部分完成'))
+  // 正在编辑这张表：起草会写进它，编辑中的保存就会撞上版本冲突，先不给点
+  await page.locator('[data-catalog-edit]').click()
+  check('正在编辑这张表：「重新起草这张表」不能点，写明先保存或取消', await page.locator('[data-catalog-redraft]').isDisabled()
+        && (await page.locator('[data-catalog-last-draft]').innerText()).includes('保存或取消后再重新起草'))
+  await page.locator('[data-catalog-cancel]').click()
+  replies.createJob.push(json(MODEL_DOWN, 409))
+  await page.locator('[data-catalog-redraft]').click()
+  check('模型用不了：提示原因，不打开对话框', await until(async () => (await page.locator('[data-toast]').filter({ hasText: '未配置模型接入' }).count()) > 0)
+        && await draftBox(page).count() === 0, await page.locator('[data-toast]').allInnerTexts().then((t) => t.join(' | ')).catch(() => ''))
+  check('只发过起草任务相关的写请求', writes(sent, /./).every((s) => /catalog\/(draft-jobs|guidance)/.test(s.key)),
+    JSON.stringify(writes(sent, /./).map((s) => s.key)))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })
@@ -1899,6 +2380,32 @@ await section('数据目录 · 窄屏', async () => {
   const inner = await profileBox(page).evaluate((el) => el.scrollWidth - el.clientWidth)
   check('……数据剖析弹窗在视口里，正文不横向滚动', !!dlg && dlg.x >= 0 && dlg.x + dlg.width <= 390 && inner <= 1, `${JSON.stringify(dlg)} ${inner}`)
   await page.keyboard.press('Escape')
+  // 起草：设置阶段、进行中（宽表的段进度、长原因）弹窗都在视口里、不横向滚动；关掉以后上方那条进度也不撑宽页面
+  const draftFits = async () => {
+    const d = await page.locator('[role="dialog"]').last().boundingBox()
+    const scroll = await draftBox(page).evaluate((el) => el.scrollWidth - el.clientWidth)
+    return { ok: !!d && d.x >= 0 && d.x + d.width <= 390 && scroll <= 1, d, scroll }
+  }
+  await page.locator('[data-catalog-draft]').first().click()
+  await draftBox(page).waitFor()
+  await draftBox(page).locator('[data-draft-model] input').check()
+  const setupFit = await draftFits()
+  check('……起草弹窗（设置阶段）在视口里，正文不横向滚动', setupFit.ok, JSON.stringify(setupFit))
+  await page.locator('[data-draft-start]').click()
+  await until(async () => (await draftPhase(page)) === 'running')
+  const narrowJob = state.jobs.at(-1)
+  settle(state, narrowJob, 'visits', { added: 2 })
+  settle(state, narrowJob, 'store_sales', { status: 'partial', parts_done: 2, added: 4, model_error: WIDE_ERR })
+  await until(async () => (await draftText(page, '[data-draft-task="store_sales"] [data-draft-task-reason]')).includes('第 2 段'))
+  const runFit = await draftFits()
+  check('……起草进行中：段进度和长原因折行，弹窗不横向滚动', runFit.ok, JSON.stringify(runFit))
+  await shot(page, 'catalog-narrow-draft')
+  await page.locator('[data-draft-hide]').click()
+  await until(async () => (await page.locator('[data-catalog-draft-progress]').count()) === 1)
+  check('……上方的起草进度不撑宽页面', await overflow() <= 1 && !!(await page.locator('[data-catalog-draft-progress]').boundingBox())
+        && (await page.locator('[data-catalog-draft-progress]').boundingBox()).width <= 390, String(await overflow()))
+  stopJob(narrowJob)
+  await until(async () => (await page.locator('[data-catalog-draft-progress]').count()) === 0)
   // 宽屏照旧是表格（表头在，列表格 860px 起，框里横向滚动）
   await page.setViewportSize({ width: 1440, height: 900 })
   await openDetail(page, S1, 'visits')
