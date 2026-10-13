@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useRef } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
-import { AlertTriangle, History, ScanSearch, Search, Sparkles, X } from 'lucide-react'
+import { AlertTriangle, History, Info, ScanSearch, Search, Sparkles, X } from 'lucide-react'
 import clsx from 'clsx'
 import type { CatalogTableRow } from '../../types'
 import { useRadioGroup } from '../../components/ui'
@@ -10,15 +10,15 @@ import {
 } from '../../lib/terms'
 import { CountBadges } from './parts'
 import { LIST_FILTERS, LIST_SORTS, progressOf } from './model'
-import { taskReason } from './draftJob'
+import { lastBlankOf, taskReason } from './draftJob'
 import type { ListFilter, ListSort } from './model'
 
 // ===========================================================================
 // 表清单（数据目录页的左栏）：搜索、按审阅进度筛选、排序、多选后批量起草。
 // 一行两层：上面是中文名和各状态的项数，下面是表名、类型、关联数和使用次数；还没填中文名的表上面直接写表名，
 // 下面淡淡地写「未填写中文名」——一屏几十行「未填写中文名」认不出是哪张表。上次起草失败、部分完成的表再多一行，
-// 写明原因（全文在悬停里，点开表还有「重新起草这张表」）。键盘：↑↓ 在行之间移动，Home / End 到两头，Enter 打开；
-// 复选框按住 Shift 点选可以连选一段。
+// 写明原因（全文在悬停里，点开表还有「重新起草这张表」）；上次起草有留空列（模型拿不准）的表另有一行淡色的轻提示，
+// 不是失败标记。键盘：↑↓ 在行之间移动，Home / End 到两头，Enter 打开；复选框按住 Shift 点选可以连选一段。
 // ===========================================================================
 
 export function TableIndex({
@@ -213,6 +213,10 @@ const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen
   const last = r.last_draft && (r.last_draft.status === 'failed' || r.last_draft.status === 'partial') ? r.last_draft : null
   const lastLabel = last ? (last.status === 'failed' ? DT.lastFailed : DT.lastPartial) : ''
   const lastText = last ? (taskReason(last) ? DT.lastWith(lastLabel, taskReason(last)) : lastLabel) : ''
+  // 上次起草有留空的列：表照样写完了，只是模型对这几列拿不准。淡色的轻提示，和失败标记分开。表结构里已经没有的表
+  // 起草不了：悬停里不建议重新起草
+  const blank = lastBlankOf(r.last_draft)
+  const blankTitle = r.in_schema ? `${DT.lastBlank(blank)}。${DT.lastBlankAdvice}` : DT.lastBlank(blank)
   return (
     <li
       className={clsx('relative flex items-stretch border-b border-hairline', active ? 'bg-accent-soft' : 'hover:bg-hover')}
@@ -260,6 +264,13 @@ const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen
                 style={{ color: last.status === 'failed' ? 'var(--err)' : 'var(--warn)' }}>
             <AlertTriangle size={10} className="shrink-0" aria-hidden />
             <span className="min-w-0 truncate">{lastText}</span>
+          </span>
+        )}
+        {blank > 0 && (
+          <span className="mt-0.5 flex min-w-0 items-center gap-1 text-2xs text-faint" title={blankTitle}
+                data-row-blank={blank}>
+            <Info size={10} className="shrink-0" aria-hidden />
+            <span className="min-w-0 truncate">{DT.lastBlank(blank)}</span>
           </span>
         )}
       </button>

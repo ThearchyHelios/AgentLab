@@ -2893,12 +2893,32 @@ export interface CatalogDraftTask {
    * 大于 0 而新增、更新、删除都是 0，才是「模型给了内容、只是和现有目录一致」
    */
   model_items: number | null
+  /**
+   * 模型拿不准、留空的列数：模型列出了（或这一段请它写了），中文名和含义却都没给（给了却都没通过校验的也算）。
+   * 表的状态不因此变（照旧可以是已完成）。老服务端没有这个键
+   */
+  blank_columns?: number
+  /** 留空的列里的前几个（最多 5 个，列名照表结构原样）。老服务端没有这个键 */
+  blank_sample?: string[]
   /** 整张表没起草的原因：表结构里没有、写入一直冲突、服务重启中断 */
   error: string | null
   /** 模型那部分没写出来的原因和办法（第几段、哪些列、为什么） */
   model_error: string | null
   started_at: string | null
   finished_at: string | null
+}
+
+/** 起草任务的模型用量 */
+export interface CatalogDraftUsage {
+  /** 调用次数（没写出来的、超时的也算） */
+  calls: number
+  /** 超时的调用不计 token（照实记 0：服务方可能已经生成了内容） */
+  input_tokens: number
+  output_tokens: number
+  /** 超时的调用次数。老服务端没有这个键 */
+  timeouts?: number
+  /** 没写出来的调用次数：额度用完、只给空壳、超时、出错。老服务端没有这个键 */
+  failed_calls?: number
 }
 
 /** 一次起草任务 */
@@ -2928,8 +2948,20 @@ export interface CatalogDraftJob {
   added: number
   updated: number
   removed: number
+  /** 各表模型拿不准、留空的列数合计。老服务端没有这个键 */
+  blank_columns?: number
   /** 模型调用的用量；拿不到用量时照实是 0 */
-  usage: { calls: number; input_tokens: number; output_tokens: number }
+  usage: CatalogDraftUsage
+  /**
+   * 当前每段最多几列：一次起草里额度用完或超时累计 2 次后，之后新开始的段减半（40 → 20 → 10，最低 10）。
+   * 不用模型时可能为 null；老服务端没有这个键
+   */
+  part_columns?: number | null
+  /**
+   * 调用接连没写出来时的提醒（一句中文：最近几次里几次没写出来、原因，建议换起草模型、缩小范围或停止）；
+   * 好转后服务端清掉，为 null。老服务端没有这个键
+   */
+  notice?: string | null
   /** 任务整体出错的原因 */
   error: string | null
   tasks: CatalogDraftTask[]
@@ -2950,6 +2982,8 @@ export interface CatalogLastDraft {
   finished_at: string | null
   error: string | null
   model_error: string | null
+  /** 那次起草模型拿不准、留空的列数（同 CatalogDraftTask.blank_columns）。老服务端没有这个键 */
+  blank_columns?: number
 }
 
 /**

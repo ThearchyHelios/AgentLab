@@ -36,6 +36,32 @@ export const retryableCount = (j: CatalogDraftJob): number => j.tasks.filter((t)
 /** 一张表这次为什么没写全：整张表没起草的原因在前，模型那部分的原因在后 */
 export const taskReason = (t: { error: string | null; model_error: string | null }): string => t.error ?? t.model_error ?? ''
 
+/** 每段最多几列（服务端起草的起始上限）。任务里的当前上限比它小：额度用完、超时多了，之后的段缩小了 */
+export const DRAFT_PART_COLUMNS = 40
+
+/** 模型拿不准、留空的列数（任务里的一张表、清单上的上次起草）；老服务端没有这个键时为 0 */
+export const blankOf = (t: { blank_columns?: number } | null | undefined): number => Math.max(0, t?.blank_columns ?? 0)
+
+/**
+ * 清单、表详情上「上次起草有 N 列模型拿不准、留空了」的 N：这张表的那次起草结束了才算（还在起草的那一次写到一半，
+ * 不说「上次」）
+ */
+export const lastBlankOf = (d: { status: CatalogDraftTaskStatus; blank_columns?: number } | null | undefined): number =>
+  (d && TASK_ENDED.has(d.status) ? blankOf(d) : 0)
+
+/** 一次起草里留空的列合计：服务端给了合计就用它，老服务端没有就按逐表加 */
+export const jobBlank = (j: CatalogDraftJob): number => (j.blank_columns != null ? blankOf(j) : j.tasks.reduce((n, t) => n + blankOf(t), 0))
+
+/** 结束后默认列出的表：没写全的（失败、部分完成、已停止）和有留空列的 */
+export const needsLook = (t: CatalogDraftTask): boolean => RETRYABLE.has(t.status) || blankOf(t) > 0
+
+/** 回到设置时预先选好的范围（结果里「重新起草这几张表」、表详情里「补充起草要求」） */
+export interface DraftPreset {
+  tables: string[]
+  /** 范围那一项的写法 */
+  label: string
+}
+
 /**
  * 一项都没写进去的任务该怎么说（只对写完了的任务：完成、部分完成）。null：照常写合计。
  * 用模型、却没有一张表拿到模型的可用内容：目录没有更新、模型没给内容；有表没写全：目录没有更新、原因见下方；
