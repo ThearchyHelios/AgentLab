@@ -9,6 +9,7 @@
 - 目录清单：每行 last_draft（带模型留空的列数），顶层 guidance、active_job
 - 重新起草时模型这次留空、给的值没通过校验：以前起草好的模型项留着，删除只在列已经不在表结构里时才有
 - 用量记超时次数、没写出来的调用次数；任务记当前的列数上限、提醒（最近 6 次调用 4 次没写出来）；逐表记模型留空的列
+- 旧的同步起草：同一个源有排队或进行中的任务时 409 catalog_draft_busy
 - 起草要求存在数据源 options 里（上传表格的源存在它自己那一行），数据源接口不显示、整份回写 options 时留着，拼连接串时摘掉
 
 表名、列名、说明文字都是虚构的。
@@ -372,6 +373,31 @@ async def test_blank_columns_reach_the_task_the_job_and_the_list(client, monkeyp
     assert job["blank_columns"] == 8
     rows = {r["table_name"]: r for r in (await client.get(_base(sid))).json()["tables"]}
     assert rows["tickets"]["last_draft"]["blank_columns"] == 7 and rows["gates"]["last_draft"]["blank_columns"] == 1
+
+
+async def test_the_sync_draft_is_409_while_a_job_is_queued_or_running(client, monkeypatch):
+    """旧的同步起草不和后台任务同时写同一个源的目录、抢模型名额：有排队或进行中的任务时 409（和建任务同一句话）。"""
+    sid = await _source()
+    start = catalog_jobs.manager.start
+    monkeypatch.setattr(catalog_jobs.manager, "start", lambda job_id: None)       # 排着、不开始
+    queued = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["gates"]})).json()["job"]
+    r = await client.post(f"{_base(sid)}/draft", json={"tables": ["channels"]})
+    assert r.status_code == 409 and r.json()["code"] == "catalog_draft_busy", r.text
+    busy = await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["gates"]})
+    assert busy.status_code == 409 and r.json()["detail"] == busy.json()["detail"]
+    assert (await client.get(f"{_base(sid)}/channels")).json()["version"] == 0, "什么都没写"
+    await client.post(f"{_base(sid)}/draft-jobs/{queued['id']}/cancel")
+
+    monkeypatch.setattr(catalog_jobs.manager, "start", start)
+    model = Held(REPLIES, hold={"visits"})
+    use(monkeypatch, model)
+    running = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["visits"], "use_model": True})).json()
+    r = await client.post(f"{_base(sid)}/draft", json={"tables": ["channels"]})
+    assert r.status_code == 409 and r.json()["code"] == "catalog_draft_busy", r.text
+    model.release.set()
+    await finished(running["job"]["id"])
+    r = await client.post(f"{_base(sid)}/draft", json={"tables": ["channels"]})
+    assert r.status_code == 200, r.text
 
 
 def test_old_job_tables_get_the_new_columns():
