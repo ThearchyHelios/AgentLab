@@ -541,7 +541,11 @@ async def test_a_table_named_guidance_can_still_be_saved(client):
     assert r.status_code == 200, r.text
     assert r.json()["table_name"] == "guidance" and r.json()["notes"]["label"]["value"] == "操作指引"
     assert (await client.get(_base(sid))).json()["guidance"] == "金额按元"
-    assert (await client.put(f"{_base(sid)}/guidance", json={})).status_code == 422
+    for body in ({}, {"guidance": 3}, {"guidance": ["金额按元"]}):
+        r = await client.put(f"{_base(sid)}/guidance", json=body)
+        assert r.status_code == 422, body
+        assert isinstance(r.json()["detail"], str) and "起草要求" in r.json()["detail"], "说明是中文的一句话"
+    assert (await client.get(_base(sid))).json()["guidance"] == "金额按元"
 
 
 async def test_guidance_of_an_uploaded_source_lives_on_its_own_row(client):

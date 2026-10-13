@@ -85,10 +85,11 @@ class DraftJobIn(BaseModel):
     note: str | None = None
 
 
-class GuidanceIn(BaseModel):
-    #: 数据源级的起草要求；空串（或 null）清除。最多 2000 字（超了 422，说明是中文）。必须写这一项：表名恰好叫
-    #: guidance 时，整份提交那张表目录的请求也落到这个路径上，不能把它当成「清除起草要求」
-    guidance: str | None
+#: PUT /catalog/guidance 的请求 {guidance: string}：数据源级的起草要求，空串（或 null）清除，最多 2000 字。必须写
+#: 这一项：表名恰好叫 guidance 时，整份提交那张表目录的请求也落到这个路径上，不能把它当成「清除起草要求」。
+#: 没写、不是文字都回 422，说明是中文的一句话（同超长）
+GUIDANCE_MISSING = "请求里要写起草要求（guidance 一项，一段文字；要清除起草要求请传空串）"
+GUIDANCE_NOT_TEXT = "起草要求要是一段文字（要清除起草要求请传空串）"
 
 
 class CatalogProfileIn(BaseModel):
@@ -260,13 +261,14 @@ async def put_catalog_guidance(source_id: str, body: dict[str, Any] = Body(...),
         except ValidationError as e:
             raise RequestValidationError(e.errors()) from e
         return await put_catalog_table(source_id, "guidance", table_payload, x_actor=x_actor, session=session)
-    try:
-        payload = GuidanceIn.model_validate(body)
-    except ValidationError as e:
-        raise RequestValidationError(e.errors()) from e
+    if "guidance" not in body:
+        raise HTTPException(422, GUIDANCE_MISSING)
+    guidance = body["guidance"]
+    if guidance is not None and not isinstance(guidance, str):
+        raise HTTPException(422, GUIDANCE_NOT_TEXT)
     row = await _source_row(session, source_id)
     try:
-        value = await catalog_jobs.save_guidance(session, row, payload.guidance)
+        value = await catalog_jobs.save_guidance(session, row, guidance)
     except catalog_jobs.TextTooLong as e:
         raise HTTPException(422, str(e)) from e
     return {"guidance": value}
