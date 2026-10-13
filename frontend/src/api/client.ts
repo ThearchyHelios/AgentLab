@@ -1,5 +1,5 @@
 import type {
-  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogDetail, CatalogDraftOut, CatalogImpact, CatalogList, CatalogNotes,
+  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogDetail, CatalogDraftJob, CatalogImpact, CatalogList, CatalogNotes,
   CatalogPatchPreview, CatalogPatchSubmit, CatalogProfileOut, CatalogReviewAction, CommitOut, CurrentRecipe, EditPreview,
   EditRequest, ImportRecord,
   ManifestOut, PurgeRawBody, PurgeRawOut, QuestionAnswer, Recipe, RedraftRulesOut, RemovePeriodBody, RemovePeriodOut,
@@ -30,6 +30,9 @@ export {
 export type { ApiErrorKind, RequestOptions, UploadOptions, UploadProgress } from './http'
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
+
+/** 数据目录的接口前缀：/datasources/{id}/catalog */
+const catalogBase = (sourceId: string) => `/datasources/${encodeURIComponent(sourceId)}/catalog`
 
 /**
  * 上传表格被退回、要用户先选怎么处理（422 带 decision）时，取出那份决定；别的错误返回 null。
@@ -409,12 +412,37 @@ export const api = {
       post<CatalogDetail>(`/datasources/${encodeURIComponent(sourceId)}/catalog/${encodeURIComponent(table)}/patch`,
         { changes, if_version: ifVersion }),
     /**
-     * 同步起草（注释、外键、命名推断；use_model 时再请助手的模型起草）。不给 tables 时按使用次数取前 20 张。
-     * 人工确认、驳回过的项不动。没有表结构时回 409
+     * 建一个起草任务（后台进行：注释、外键、命名推断；use_model 时再请起草模型起草，带上数据源的起草要求和这次的 note）。
+     * 不给 tables 时按使用次数取前 20 张；表结构里没有的表照样建进任务、记 skipped。人工确认、驳回过的项不动。
+     * 409：同一个数据源已有排队、进行中的任务（code 为 catalog_draft_busy，改去取 activeDraftJob）；起草模型用不了
+     * （catalog_draft_model_unavailable，不建任务）；没有表结构
      */
-    draft: (sourceId: string, body: { tables?: string[]; use_model: boolean }, opts?: RequestOptions) =>
-      request<CatalogDraftOut>(`/datasources/${encodeURIComponent(sourceId)}/catalog/draft`,
-        { method: 'POST', body: JSON.stringify(body), ...opts }),
+    createDraftJob: (sourceId: string, body: { tables?: string[]; use_model: boolean; note?: string }) =>
+      post<{ job: CatalogDraftJob }>(`${catalogBase(sourceId)}/draft-jobs`, body),
+    /** 排队或进行中的那个起草任务；没有为 null */
+    activeDraftJob: (sourceId: string, opts?: RequestOptions) =>
+      get<{ job: CatalogDraftJob | null }>(`${catalogBase(sourceId)}/draft-jobs/active`, opts),
+    /** 最近建的一个起草任务（任何状态）；没有为 null */
+    latestDraftJob: (sourceId: string, opts?: RequestOptions) =>
+      get<{ job: CatalogDraftJob | null }>(`${catalogBase(sourceId)}/draft-jobs/latest`, opts),
+    /** 一个起草任务的当前状态；不存在或不属于这个数据源回 404 */
+    draftJob: (sourceId: string, jobId: string, opts?: RequestOptions) =>
+      get<{ job: CatalogDraftJob }>(`${catalogBase(sourceId)}/draft-jobs/${encodeURIComponent(jobId)}`, opts),
+    /**
+     * 停止起草：排队的直接停；进行中的停掉正在进行的模型调用，没开始和没写完的表记已停止，已经写进目录的不回滚。
+     * 已经结束的回 409（catalog_draft_finished）
+     */
+    cancelDraftJob: (sourceId: string, jobId: string) =>
+      post<{ job: CatalogDraftJob }>(`${catalogBase(sourceId)}/draft-jobs/${encodeURIComponent(jobId)}/cancel`),
+    /**
+     * 只重试失败的表：新任务只含原任务里失败、部分完成、已停止的表，用模型和补充说明沿用，起草要求取数据源现在的。
+     * 没有可重试的表 422；有进行中的任务 409（catalog_draft_busy）
+     */
+    retryDraftJob: (sourceId: string, jobId: string) =>
+      post<{ job: CatalogDraftJob }>(`${catalogBase(sourceId)}/draft-jobs/${encodeURIComponent(jobId)}/retry`),
+    /** 存数据源的起草要求（去首尾空白，最多 2000 字，空串清除）。上传表格建的源存在它自己的数据源上 */
+    putGuidance: (sourceId: string, guidance: string) =>
+      put<{ guidance: string | null }>(`${catalogBase(sourceId)}/guidance`, { guidance }),
     /**
      * 同步剖析：对业务库发少量只读查询，核对关系、取码值候选，结论写进目录。不给 tables 时按使用次数取前 10 张
      * 有待核实关系的表。没开启、数据源停用、没有表结构、同一个数据源正在剖析、快照被改动时回 409（detail 是一句中文）

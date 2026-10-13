@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { AlertTriangle, ArrowLeft, ChevronLeft, ChevronRight, GitBranch, ListChecks, Lock, Pencil, Plus, RotateCw, Search, X } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, ChevronLeft, ChevronRight, GitBranch, ListChecks, Lock, Pencil, Plus, RotateCw, Search, Sparkles, X } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import type {
@@ -11,7 +11,7 @@ import { DeleteButton, EmptyState, ErrorState, Notice, Skeleton, Spinner, confir
 import { useLeaveGuard } from '../../lib/leave'
 import { formatDateTime, formatNumber, formatTime } from '../../lib/format'
 import {
-  CATALOG_CARDINALITY_LABEL, CATALOG_IMPACT_TEXT, CATALOG_KIND_HINT, CATALOG_KIND_LABEL, CATALOG_TABLE_FIELD_HINT,
+  CATALOG_CARDINALITY_LABEL, CATALOG_DRAFT_TEXT as DT, CATALOG_IMPACT_TEXT, CATALOG_KIND_HINT, CATALOG_KIND_LABEL, CATALOG_TABLE_FIELD_HINT,
   CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT, CODES_TEXT as KT,
 } from '../../lib/terms'
 import { CatalogImpactList } from '../../components/CatalogImpact'
@@ -21,6 +21,7 @@ import { ColumnTable, NARROW, Value, pendingCodes } from './ColumnTable'
 import type { ColumnModel } from './ColumnTable'
 import { CodesDialog } from './CodesDialog'
 import { coverageText } from './profile'
+import { taskReason } from './draftJob'
 import {
   COLUMN_FIELDS, DATE_KEYS, TABLE_FIELDS, buildNotes, changeCount, columnPath, confirmProposed, countsOf, formFromNotes,
   relationDraft, relationPath, relationRemoval, tablePath, unknownKeys, validateForm,
@@ -51,7 +52,9 @@ const PROBLEM_TEXT = {
 type Editing = { initial: EditForm; form: EditForm }
 type Conflict = 'edit' | 'review'
 
-export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillDone, prev, next, onOpen, onBack, onDetail }: {
+export function TableDetail({
+  sourceId, table, rows, drafted, fillCodes, onFillDone, prev, next, onOpen, onBack, onDetail, draftBusy = false, onRedraft,
+}: {
   sourceId: string
   table: string
   /** 全部表：关联关系的目标表能点就跳过去，编辑时给目标表做候选 */
@@ -72,6 +75,10 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
   onBack: () => void
   /** 载入或写入之后的单表目录：清单据此更新这一行 */
   onDetail: (d: CatalogDetail) => void
+  /** 这个数据源有排队、进行中的起草任务：「重新起草这张表」等它结束 */
+  draftBusy?: boolean
+  /** 上次起草失败、部分完成时的「重新起草这张表」：建只含这张表的起草任务（用模型、不带补充说明） */
+  onRedraft?: (table: string) => Promise<void>
 }) {
   const [detail, setDetail] = useState<CatalogDetail | null>(null)
   const [loadError, setLoadError] = useState<unknown>(null)
@@ -101,6 +108,7 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
    */
   const [savedAt, setSavedAt] = useState<number | null>(null)
   const [impact, setImpact] = useState<{ version: number; n: number } | null>(null)
+  const [redrafting, setRedrafting] = useState(false)
   const loadSeq = useRef(0)
   const onDetailRef = useRef(onDetail)
   onDetailRef.current = onDetail
@@ -308,6 +316,8 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
 
   const notes = detail.notes
   const counts = countsOf(notes)
+  /** 这张表最近一次起草的结果（清单上那一行带的） */
+  const lastDraft = rows.find((r) => r.table_name === table)?.last_draft ?? null
   const label = notes.label && notes.label.status !== 'rejected' ? notes.label.value : null
   const kind = notes.kind && notes.kind.status !== 'rejected' ? notes.kind.value : null
   const st = detail.structure
@@ -446,6 +456,25 @@ export function TableDetail({ sourceId, table, rows, drafted, fillCodes, onFillD
             </Notice>
           )}
           {writeError && <Notice tone="err" attr={{ 'data-catalog-write-error': '' }}>{writeError}</Notice>}
+          {lastDraft && (lastDraft.status === 'failed' || lastDraft.status === 'partial') && (
+            // 上次起草没写全：写明原因，给「重新起草这张表」（只含这张表、用模型）。有起草任务在进行时等它结束
+            <Notice tone={lastDraft.status === 'failed' ? 'err' : 'warn'} attr={{ 'data-catalog-last-draft': lastDraft.status }}>
+              <p className="font-medium">{lastDraft.status === 'failed' ? DT.lastFailed : DT.lastPartial}</p>
+              {taskReason(lastDraft) && <p className="mt-0.5 break-words text-dim" data-catalog-last-draft-reason="">{taskReason(lastDraft)}</p>}
+              {onRedraft && (
+                <>
+                  <button type="button" className="btn btn-sm mt-2" disabled={draftBusy || redrafting} title={DT.redraftHint}
+                          onClick={async () => {
+                            setRedrafting(true)
+                            try { await onRedraft(table) } finally { setRedrafting(false) }
+                          }} data-catalog-redraft="">
+                    {redrafting ? <Spinner size={11} /> : <Sparkles size={11} aria-hidden />} {DT.redraft}
+                  </button>
+                  <p className="mt-1 text-2xs text-faint">{draftBusy ? DT.redraftBusy : DT.redraftHint}</p>
+                </>
+              )}
+            </Notice>
+          )}
           {!detail.in_schema && (
             <Notice tone="warn" attr={{ 'data-catalog-missing': '' }}>{CT.missingBody}</Notice>
           )}

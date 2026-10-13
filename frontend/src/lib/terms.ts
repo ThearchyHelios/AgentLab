@@ -43,10 +43,11 @@
  */
 
 import type {
-  CatalogCardinality, CatalogMeasure, CatalogProfileNumberKey, CatalogSource, CatalogStatus, CatalogTableKind, NodeType, SnapshotReasonCode,
+  CatalogCardinality, CatalogDraftJobStatus, CatalogDraftTaskStatus, CatalogMeasure, CatalogProfileNumberKey, CatalogSource, CatalogStatus,
+  CatalogTableKind, NodeType, SnapshotReasonCode,
   SqlCheckCode, SqlCheckLevel, ToolTrust,
 } from '../types'
-import { formatCost, formatNumber } from './format'
+import { formatCost, formatNumber, formatTokens } from './format'
 
 export const TERMS = {
   workflow: '工作流',
@@ -2198,7 +2199,7 @@ export const CATALOG_TEXT = {
   noSchemaBody: (note: string) => `${note.replace(/[。.]$/, '')}。数据目录按表结构逐表记录，请先回到数据源卡片点击「探查结构」。`,
   noSchemaUploadBody: '这个表格还没有可用的表结构，请重新上传后再编写数据目录。',
   emptyTitle: '还没有数据目录',
-  emptyBody: '先起草，再逐表确认。起草按数据库注释、外键约束和列名推断，也可以请助手的模型起草中文名和含义。',
+  emptyBody: '先起草，再逐表确认。起草按数据库注释、外键约束和列名推断，也可以用模型起草中文名和含义。',
   // ---- 导入表格的说明
   systemTitle: '导入时生成的说明',
   systemBody: '这个数据源由导入表格生成，表和列的说明由系统按核对结果生成，只读，不能在数据目录中改写。',
@@ -2260,29 +2261,17 @@ export const CATALOG_TEXT = {
   scopeAll: (n: number) => `全部 ${formatNumber(n)} 张表`,
   draftBase: '按数据库注释、外键约束和列名推断起草。已确认、已驳回的项不会被改动；起草出的项都是推断，需要逐项确认。',
   useModel: '用模型起草',
-  useModelHint: '请助手的模型按表结构起草中文名、说明、粒度和列的含义。只发送表结构（表名、列名、类型、约束、注释），不发送数据；耗时较长，并产生模型费用。',
+  useModelHint: '请起草模型按表结构起草中文名、说明、粒度和列的含义。只发送表结构（表名、列名、类型、约束、注释）和起草要求，不发送数据；在后台进行，耗时较长，并产生模型费用。',
   draftStart: (n: number) => `起草 ${formatNumber(n)} 张表`,
-  drafting: '正在起草…',
-  draftProgress: (done: number, total: number) => `已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
-  draftStop: '停止',
-  draftStopping: '当前这一批完成后停止…',
-  draftDone: '起草完成',
-  draftStopped: (done: number, total: number) => `已停止：完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，其余未起草`,
-  draftFailed: '起草中断',
   draftSummary: (added: number, updated: number, removed: number) =>
     `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
-  // 只在起草确实给出了内容、只是和现有目录一致时用：有表的模型起草失败或没给出可用内容（model_error）时
-  // 不能说「没有变化」，改用 draftNothingWritten
+  // 只在起草确实给出了内容、只是和现有目录一致时用：模型没给出可用内容时说 draftNothingWritten，有表没写全时说
+  // draftNothingWrittenFailed，不能说「没有变化」
   draftNoChange: '没有变化：起草出的内容与现有目录一致',
   draftNothingWritten: '目录没有更新：模型没有给出可用的内容，原因见下方',
-  draftModelSkipped: (reason: string) => `模型未参与起草：${reason.replace(/[。.]$/, '')}。已按注释、外键和命名起草。`,
-  draftModelUsed: (model: string) => `模型：${model}`,
-  draftTableErrors: (n: number) => `${formatNumber(n)} 张表未能起草`,
-  draftModelErrors: (n: number) => `${formatNumber(n)} 张表的模型起草失败，已按注释、外键和命名起草`,
+  draftNothingWrittenFailed: '目录没有更新：部分表未写全，原因见下方',
   draftClose: '完成',
-  moreTables: (n: number) => `…另有 ${formatNumber(n)} 张`,
   cancel: '取消',
-  draftBackground: '起草仍在进行，当前这一批完成后停止',
   // ---- 表详情
   backToList: '返回表清单',
   prev: '上一张',
@@ -2387,6 +2376,123 @@ export const CATALOG_TEXT = {
   reload: '重新载入',
   reloadDiscardTitle: '放弃未保存的修改并重新载入？',
   reloadDiscardAction: '放弃修改并重新载入',
+}
+
+// ===========================================================================
+// 数据目录的起草任务（/api/datasources/{id}/catalog/draft-jobs）：起草在服务端后台进行，关掉对话框不停；逐表起草，
+// 每张表一结束就写进目录。
+//
+// 术语：
+// - 「起草任务」的状态：排队中、正在起草、起草完成、部分表未写全、起草失败、已停止、服务重启中断。
+//   一张表：等待、起草中、已完成、部分完成、失败、已跳过（表结构里没有）、已停止。
+// - 「起草要求」：使用者补充给模型的业务背景和用词约定，存在数据源上，以后每次用模型起草都带上；
+//   「本次补充说明」只用于这一次（重试时沿用）。两者都只交给模型，不改起草规则：冲突时以规则为准。
+// - 「起草模型」：设置里单独的一项（偏好设置 → 起草模型），留空跟随助手的模型。
+// - 宽表的「段」：超过 40 列的表拆成表级一段和若干列分段，逐段起草；写的是「已完成 3 / 9 段」。
+// - 「只重试失败的表」：重新起草失败、部分完成和已停止的表；已经写进目录的内容不回滚、不受影响。
+// ===========================================================================
+
+/** 起草要求、本次补充说明的字数上限（服务端同一个数：超长 422） */
+export const DRAFT_GUIDANCE_MAX = 2000
+export const DRAFT_NOTE_MAX = 1000
+
+export const CATALOG_DRAFT_TEXT = {
+  // ---- 设置阶段：起草要求、本次补充说明、起草模型
+  guidance: '起草要求',
+  guidanceHint: '写给模型的业务背景和用词约定，保存在这个数据源上，以后每次用模型起草都会带上。例如：「核销」指检票入园；金额单位是元',
+  guidanceRule: '起草要求只帮助模型理解业务、统一用词；与起草规则冲突时以规则为准，起草出的项仍需逐项确认',
+  guidancePlaceholder: '业务背景、常用说法、单位约定……',
+  note: '本次补充说明',
+  noteHint: '只用于这一次起草，例如「这一批是会员相关的表」；重试时沿用',
+  notePlaceholder: '可不填',
+  count: (n: number, max: number) => `${formatNumber(n)} / ${formatNumber(max)} 字`,
+  tooLong: (max: number) => `不超过 ${formatNumber(max)} 字`,
+  sourceDescription: (text: string) => `数据源说明也会一并交给模型：${text}`,
+  model: '起草模型',
+  /** 设置里没配起草模型：跟随助手的模型，写出当前是哪个（取不到就不写） */
+  modelFollow: (current: string | null) => (current ? `跟随助手的模型（当前：${current}）` : '跟随助手的模型'),
+  /** 设置里配了：模型（没填模型就是那个接入的默认模型）和接入 */
+  modelNamed: (model: string | null, provider: string | null) => (model
+    ? (provider ? `${model}（模型接入「${provider}」）` : model)
+    : `模型接入「${provider}」的默认模型`),
+  modelWhere: '可在「设置 → 偏好设置 → 起草模型」中更换',
+  tooMany: (max: number) => `一次最多起草 ${formatNumber(max)} 张表，请缩小范围`,
+  saveGuidanceFailed: (reason: string) => `起草要求未能保存，未开始起草：${reason}`,
+  startFailed: (reason: string) => `未能开始起草：${reason}`,
+  // ---- 上一次起草（设置阶段，没写全的才提）
+  last: (state: string, at: string) => `上一次起草（${at}）：${state}`,
+  lastOpen: '查看',
+  // ---- 进行中
+  queued: '排队中，等待开始…',
+  running: '正在起草…',
+  stopping: '正在停止：当前的模型调用结束后停止…',
+  progress: (done: number, total: number) => `已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
+  /** 结束以后：全部写出来的表有几张（停止、失败、部分完成的不算） */
+  progressDone: (ok: number, total: number) => `写完 ${formatNumber(ok)} / ${formatNumber(total)} 张表`,
+  parts: (done: number, total: number) => `${formatNumber(done)} / ${formatNumber(total)} 段`,
+  partsHint: '超过 40 列的表拆成表级一段和若干列分段，逐段起草',
+  hide: '在后台继续',
+  hideHint: '关闭对话框不会停止起草，进度显示在目录页上方；每张表起草完就写进目录',
+  stop: '停止',
+  busy: '这个数据源已有进行中的起草任务，下面显示的是它的进度',
+  modelUsed: (model: string) => `模型：${model}`,
+  usage: (calls: number, input: number, output: number) =>
+    `调用模型 ${formatNumber(calls)} 次，输入 ${formatTokens(input, { compact: true })}、输出 ${formatTokens(output, { compact: true })}`,
+  // ---- 结束
+  title: {
+    queued: '排队中，等待开始…',
+    running: '正在起草…',
+    succeeded: '起草完成',
+    partial: '起草完成，部分表未写全',
+    failed: '起草失败',
+    cancelled: '已停止',
+    interrupted: '服务重启，起草中断',
+  } as Record<CatalogDraftJobStatus, string>,
+  interrupted: '服务重启时这次起草还没有完成，没写完的表未起草。已写进目录的内容保留；可以只重试这些表，接着起草',
+  cancelled: '已写进目录的内容保留，没写完的表未起草',
+  jobFailed: (reason: string) => `起草任务出错：${reason}`,
+  /** 没写全的表：失败、部分完成、已停止各几张；跳过的（表结构里没有）另说 */
+  problems: (c: { failed: number; partial: number; cancelled: number; skipped: number }) => {
+    const parts = [
+      c.failed ? `失败 ${formatNumber(c.failed)} 张` : '',
+      c.partial ? `部分完成 ${formatNumber(c.partial)} 张` : '',
+      c.cancelled ? `已停止 ${formatNumber(c.cancelled)} 张` : '',
+    ].filter(Boolean)
+    const bad = parts.length ? `${formatNumber(c.failed + c.partial + c.cancelled)} 张表未写全：${parts.join('、')}` : ''
+    const skipped = c.skipped ? `${formatNumber(c.skipped)} 张表已跳过（表结构里没有）` : ''
+    return [bad, skipped].filter(Boolean).join('；')
+  },
+  retry: (n: number) => `只重试失败的表（${formatNumber(n)} 张）`,
+  retryHint: '重新起草失败、部分完成和已停止的表；已写进目录的内容不受影响',
+  showAll: (n: number) => `显示全部 ${formatNumber(n)} 张表`,
+  showProblems: '只看未写全的表',
+  tasks: '逐表进度',
+  taskStatus: {
+    pending: '等待', running: '起草中', ok: '已完成', partial: '部分完成', failed: '失败', skipped: '已跳过', cancelled: '已停止',
+  } as Record<CatalogDraftTaskStatus, string>,
+  taskAdded: (added: number, updated: number) => (added || updated
+    ? `+${formatNumber(added)}${updated ? ` · 改 ${formatNumber(updated)}` : ''}` : ''),
+  taskAddedHint: (added: number, updated: number, removed: number) =>
+    `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
+  // ---- 目录页上方的进度、结束提示
+  strip: (done: number, total: number) => `正在起草：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
+  stripQueued: (total: number) => `起草任务排队中，共 ${formatNumber(total)} 张表`,
+  stripOpen: '查看进度',
+  toast: {
+    succeeded: (summary: string) => `数据目录起草完成：${summary}`,
+    partial: (n: number) => `数据目录起草完成，${formatNumber(n)} 张表未写全`,
+    failed: (reason: string) => `数据目录起草失败：${reason}`,
+    cancelled: '数据目录起草已停止',
+    interrupted: '服务重启，数据目录起草中断',
+  },
+  viewResult: '查看结果',
+  // ---- 清单上的标记、表详情里的说明
+  lastFailed: '上次起草失败',
+  lastPartial: '上次起草部分完成',
+  lastWith: (label: string, reason: string) => `${label}：${reason}`,
+  redraft: '重新起草这张表',
+  redraftHint: '用模型重新起草这张表（不带补充说明，带上数据源的起草要求）；人工确认、驳回过的项不会被改动',
+  redraftBusy: '已有起草任务在进行，结束后再重新起草这张表',
 }
 
 // ===========================================================================
