@@ -2434,6 +2434,13 @@ export const CATALOG_DRAFT_TEXT = {
   // ---- 从结果、表详情回到设置：范围就是那几张表
   scopeBlank: (n: number) => `有留空列的 ${formatNumber(n)} 张表`,
   scopeTable: (name: string) => `这张表：${name}`,
+  /**
+   * 预先选好的范围里有表已经不在表结构里（打开表详情以后别处重新探查了结构）：写在那一项下面。一张都不剩时那一项
+   * 照旧选着、不能开始，不退回别的范围
+   */
+  presetMissing: (gone: number, total: number) => (gone < total
+    ? `其中 ${formatNumber(gone)} 张在表结构中已没有，不会起草`
+    : total === 1 ? '表结构中已没有这张表，不能起草' : `表结构中已没有这 ${formatNumber(total)} 张表，不能起草`),
   // ---- 进行中
   queued: '排队中，等待开始…',
   running: '正在起草…',
@@ -2538,6 +2545,8 @@ export const CATALOG_DRAFT_TEXT = {
   redraftHint: '用模型重新起草这张表（不带补充说明，带上数据源的起草要求）；人工确认、驳回过的项不会被改动',
   redraftBusy: '已有起草任务在进行，结束后再重新起草这张表',
   redraftEditing: '正在编辑这张表，保存或取消后再重新起草',
+  /** 表结构里已经没有的表（只剩目录）：上次起草的结果照写，不给重新起草（服务端只会把它记成已跳过） */
+  redraftMissing: '表结构中已没有这张表，不能重新起草',
 }
 
 /** 设置页「偏好设置」里「起草模型」一节（服务端 api/settings.py 的 catalog_draft 一组） */

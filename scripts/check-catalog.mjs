@@ -1544,6 +1544,90 @@ await section('数据目录 · 起草：模型拿不准、留空的列', async (
   await close()
 })
 
+await section('数据目录 · 起草：表结构里已经没有的表', async () => {
+  const state = freshState()
+  const tOf = (n) => state.tables[S1].find((t) => t.name === n)
+  // 起草过（部分完成、留了几列空）的表后来重新探查结构时没了，只剩目录；另一张有留空列的这时还在表结构里
+  tOf('legacy_coupons').lastDraft = {
+    status: 'partial', job_id: 'check-job-old', finished_at: T0, error: null, model_error: CALL_ERR, blank_columns: 3,
+  }
+  tOf('channels').lastDraft = { status: 'ok', job_id: 'check-job-old', finished_at: T0, error: null, model_error: null, blank_columns: 4 }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  const tip = page.locator('[data-catalog-last-draft]')
+  const tipText = async () => (await tip.innerText({ timeout: 500 }).catch(() => '')).replace(/\s+/g, ' ').trim()
+  const buttons = () => tip.locator('[data-catalog-redraft], [data-catalog-draft-guidance]').count()
+
+  // 清单：只剩目录的表照样写上次起草留空了几列（是历史），悬停里不再建议重新起草（起草不了）
+  const goneBlank = page.locator('[data-catalog-row="legacy_coupons"] [data-row-blank]')
+  const goneTitle = (await goneBlank.getAttribute('title', { timeout: 1000 }).catch(() => '')) ?? ''
+  check('清单：只剩目录的表照样提示上次起草留空的列，悬停里不建议重新起草',
+    (await goneBlank.innerText({ timeout: 500 }).catch(() => '')).includes('上次起草有 3 列模型拿不准、留空了')
+      && !!goneTitle && !goneTitle.includes('重新起草'), goneTitle)
+
+  // 表详情：写明上次起草的结果，不给「重新起草这张表」「补充起草要求」（服务端只会把它记成已跳过），写明为什么
+  await page.locator('[data-catalog-row="legacy_coupons"] [data-catalog-open-row]').click()
+  check('只剩目录的表：详情顶部照样写上次起草部分完成、原因和留空的列',
+    await until(async () => (await tipText()).includes('上次起草部分完成'))
+      && (await tipText()).includes(CALL_ERR) && (await tipText()).includes('3 列模型拿不准、留空了'), await tipText())
+  check('……不给「重新起草这张表」「补充起草要求」，写明表结构中已没有这张表、不能重新起草',
+    await buttons() === 0
+      && (await tip.locator('[data-catalog-redraft-missing]').innerText({ timeout: 500 }).catch(() => '')).includes('表结构中已没有这张表，不能重新起草'),
+    await tipText())
+  check('……也不建议补充起草要求再重新起草', !(await tipText()).includes('再重新起草'), await tipText())
+  await shot(page, 'catalog-missing-last-draft')
+
+  // 打开详情以后表才没了（别处重新探查了结构）：清单重取了、详情还没有重新载入。这时点「补充起草要求」，起草设置
+  // 不能退回别的范围（以前退到「使用次数最多的 20 张表」还勾着用模型，以为只起草这一张，实际按别的范围起草了）
+  await page.locator('[data-catalog-row="channels"] [data-catalog-open-row]').click()
+  check('还在表结构里的表：详情给「重新起草这张表」和「补充起草要求」',
+    await until(async () => (await tip.locator('[data-catalog-draft-guidance]').count()) === 1)
+      && await tip.locator('[data-catalog-redraft]').count() === 1, await tipText())
+  tOf('channels').missing = true
+  // 起草另一张表：每张表起草完页面就重取清单；正在看的这张不在任务里，详情不重新载入
+  check('起草另一张表（不用模型）', await startDraft(page, { select: ['gates'] }))
+  const job = state.jobs.at(-1)
+  settle(state, job, 'gates', { added: 1 })
+  finishJob(job)
+  await until(async () => (await draftPhase(page)) === 'done')
+  await page.locator('[data-draft-close]').click()
+  check('……清单重取回来：这张表标成表结构中已没有，详情还是打开时的那份',
+    await until(async () => (await page.locator('[data-catalog-row="channels"] [data-row-missing]').count()) === 1)
+      && await tip.locator('[data-catalog-draft-guidance]').count() === 1)
+  const jobsBefore = count(sent, /^POST .*draft-jobs$/)
+  await tip.locator('[data-catalog-draft-guidance]').click()
+  const presetInput = draftBox(page).locator('[data-draft-scope="preset"] input')
+  check('「补充起草要求」：范围仍是这张表、选着它，写明表结构中已没有这张表、不能起草',
+    await until(async () => (await draftPhase(page)) === 'setup')
+      && await presetInput.isChecked({ timeout: 1000 }).catch(() => false)
+      && (await draftText(page, '[data-draft-scope="preset"]')).includes('channels')
+      && (await draftText(page, '[data-draft-preset-missing]')).includes('表结构中已没有这张表，不能起草'),
+    `${await draftText(page, '[data-draft-scope="preset"]')} · 选中：${await draftBox(page).locator('[data-draft-scope]:has(input:checked)').getAttribute('data-draft-scope', { timeout: 500 }).catch(() => '')}`)
+  check('……不能开始，也不默认勾用模型，焦点不放进起草要求', await page.locator('[data-draft-start]').isDisabled()
+      && !(await draftBox(page).locator('[data-draft-model] input').isChecked())
+      && await page.evaluate(() => document.activeElement?.id !== 'catalog-draft-guidance'),
+    `${await page.locator('[data-draft-start]').innerText()} · 用模型：${await draftBox(page).locator('[data-draft-model] input').isChecked()}`)
+  // 截图等弹窗的打开动效播完
+  if (SHOTS) await sleep(400)
+  await shot(page, 'catalog-missing-preset')
+  await page.keyboard.press('Escape')
+  check('……关掉：没有建任务', await until(async () => (await draftBox(page).count()) === 0) && count(sent, /^POST .*draft-jobs$/) === jobsBefore)
+
+  // 换一张再回来：详情重新载入，也认得表结构中已没有，不再给两个按钮
+  await page.locator('[data-catalog-row="gates"] [data-catalog-open-row]').click()
+  await until(async () => (await page.locator('[data-catalog-detail="gates"][data-version]').count()) === 1)
+  await page.locator('[data-catalog-row="channels"] [data-catalog-open-row]').click()
+  check('重新打开这张表：详情也写明表结构中已没有，不再给两个按钮',
+    await until(async () => (await page.locator('[data-catalog-detail="channels"] [data-catalog-missing]').count()) === 1)
+      && await buttons() === 0 && (await tipText()).includes('不能重新起草'), await tipText())
+  await cleanCopy(page, '表结构里已经没有的表')
+  check('只发过起草任务相关的写请求', writes(sent, /./).every((s) => /catalog\/(draft-jobs|guidance)/.test(s.key)),
+    JSON.stringify(writes(sent, /./).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
 await section('数据目录 · 表详情与单项审阅', async () => {
   const state = freshState()
   const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })

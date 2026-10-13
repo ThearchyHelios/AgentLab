@@ -25,7 +25,8 @@ import type { DraftPreset, DraftStartBody } from './draftJob'
 //
 // 留空的列（模型列出了、中文名和含义都没给）不算没写全，表照样是已完成；结果里写合计和办法——在起草要求里补充缩写和
 // 术语的含义，再重新起草这几张表。「重新起草这几张表」回到设置：范围就是那几张、勾着用模型、焦点在起草要求，
-// 补完再开始。表详情里的「补充起草要求」也是这样打开（范围是那一张，见 preset）。
+// 补完再开始。表详情里的「补充起草要求」也是这样打开（范围是那一张，见 preset）。预先选好的范围里的表已经不在表结构
+// 里时不退回别的范围：那一项照旧选着、写明原因，不能开始。
 // ===========================================================================
 
 type Scope = 'preset' | 'selected' | 'filtered' | 'top' | 'all'
@@ -66,8 +67,9 @@ export function DraftDialog({
   /** 打开时显示的任务是撞上已有任务（409）转过来的：写明 */
   initialBusy?: boolean
   /**
-   * 打开设置时预先选好的范围（表详情里「补充起草要求」：只有那张表）。给了就勾上用模型、焦点放在起草要求上：
-   * 打开它就是为了先补起草要求再起草
+   * 打开设置时预先选好的范围（表详情里「补充起草要求」：只有那张表）。给了就选它；里面有可起草的表时勾上用模型、
+   * 焦点放在起草要求上（打开它就是为了先补起草要求再起草）。一张可起草的都没有（已不在表结构里）时照旧选着它、
+   * 写明原因、不能开始，也不勾用模型——不退回别的范围
    */
   preset?: DraftPreset | null
   /** 点了停止、服务端还没停下来 */
@@ -88,9 +90,13 @@ export function DraftDialog({
   /** 预先选好的范围：打开时给的，或者结果里点了「重新起草这几张表」 */
   const [preset, setPreset] = useState<DraftPreset | null>(initialPreset)
   const scopes = useMemo(() => {
-    const out: { key: Scope; label: string; tables: string[] }[] = []
-    const pre = preset?.tables.filter((t) => liveSet.has(t)) ?? []
-    if (preset && pre.length) out.push({ key: 'preset', label: preset.label, tables: pre })
+    const out: { key: Scope; label: string; tables: string[]; gone?: number }[] = []
+    // 预先选好的范围总在第一项：里面的表已经不在表结构里的（打开表详情以后别处重新探查了结构）不起草、写明有几张；
+    // 一张都不剩也留着这一项，不退回别的范围——以为只起草那一张，实际按别的范围用模型起草了
+    if (preset) {
+      const pre = preset.tables.filter((t) => liveSet.has(t))
+      out.push({ key: 'preset', label: preset.label, tables: pre, gone: preset.tables.length - pre.length })
+    }
     const sel = selected.filter((t) => liveSet.has(t))
     if (sel.length) out.push({ key: 'selected', label: CT.scopeSelected(sel.length), tables: sel })
     const vis = visible.filter((r) => r.in_schema).map((r) => r.table_name)
@@ -100,11 +106,15 @@ export function DraftDialog({
     return out
   }, [preset, selected, visible, filtered, live, liveSet])
   const [scope, setScope] = useState<Scope>(() => scopes[0].key)
-  const tables = scopes.find((s) => s.key === scope)?.tables ?? scopes[0].tables
+  /** 起草的就是这一项：选的那一项不在了（所选、筛选变了）就是第一项，单选框也照它勾，看得见起草的是哪些 */
+  const current = scopes.find((s) => s.key === scope) ?? scopes[0]
+  const tables = current.tables
   const tooMany = tables.length > DRAFT_MAX_TABLES
-  const [useModel, setUseModel] = useState(!!initialPreset)
+  /** 打开时给的范围里有可起草的表：勾上用模型、焦点放进起草要求（打开它就是为了先补起草要求）；一张都没有就都不做 */
+  const presetLive = !!initialPreset && initialPreset.tables.some((t) => liveSet.has(t))
+  const [useModel, setUseModel] = useState(presetLive)
   /** 回到设置以后把焦点放进起草要求（预先选好范围的两种入口都是为了先补起草要求） */
-  const [focusGuidance, setFocusGuidance] = useState(!!initialPreset)
+  const [focusGuidance, setFocusGuidance] = useState(presetLive)
   const [guidanceText, setGuidanceText] = useState(guidance)
   const [note, setNote] = useState('')
   const guidanceLen = charCount(guidanceText)
@@ -284,9 +294,16 @@ export function DraftDialog({
               <div className="space-y-1.5" role="radiogroup" aria-label={CT.draftScope}>
                 {scopes.map((s) => (
                   <label key={s.key} className={clsx('flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-xs',
-                    scope === s.key ? 'border-[var(--accent)] bg-accent-soft' : 'hover:bg-hover')} data-draft-scope={s.key}>
-                    <input type="radio" name="catalog-draft-scope" checked={scope === s.key} onChange={() => setScope(s.key)} />
-                    <span>{s.label}</span>
+                    current.key === s.key ? 'border-[var(--accent)] bg-accent-soft' : 'hover:bg-hover')} data-draft-scope={s.key}>
+                    <input type="radio" name="catalog-draft-scope" checked={current.key === s.key} onChange={() => setScope(s.key)} />
+                    <span className="min-w-0 break-words">
+                      {s.label}
+                      {!!s.gone && (
+                        <span className={clsx('block text-2xs', s.tables.length ? 'text-faint' : 'text-[var(--warn)]')} data-draft-preset-missing="">
+                          {DT.presetMissing(s.gone, s.gone + s.tables.length)}
+                        </span>
+                      )}
+                    </span>
                   </label>
                 ))}
               </div>

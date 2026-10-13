@@ -213,8 +213,10 @@ const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen
   const last = r.last_draft && (r.last_draft.status === 'failed' || r.last_draft.status === 'partial') ? r.last_draft : null
   const lastLabel = last ? (last.status === 'failed' ? DT.lastFailed : DT.lastPartial) : ''
   const lastText = last ? (taskReason(last) ? DT.lastWith(lastLabel, taskReason(last)) : lastLabel) : ''
-  // 上次起草有留空的列：表照样写完了，只是模型对这几列拿不准。淡色的轻提示，和失败标记分开
+  // 上次起草有留空的列：表照样写完了，只是模型对这几列拿不准。淡色的轻提示，和失败标记分开。表结构里已经没有的表
+  // 起草不了：悬停里不建议重新起草
   const blank = lastBlankOf(r.last_draft)
+  const blankTitle = r.in_schema ? `${DT.lastBlank(blank)}。${DT.lastBlankAdvice}` : DT.lastBlank(blank)
   return (
     <li
       className={clsx('relative flex items-stretch border-b border-hairline', active ? 'bg-accent-soft' : 'hover:bg-hover')}
@@ -265,7 +267,7 @@ const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen
           </span>
         )}
         {blank > 0 && (
-          <span className="mt-0.5 flex min-w-0 items-center gap-1 text-2xs text-faint" title={`${DT.lastBlank(blank)}。${DT.lastBlankAdvice}`}
+          <span className="mt-0.5 flex min-w-0 items-center gap-1 text-2xs text-faint" title={blankTitle}
                 data-row-blank={blank}>
             <Info size={10} className="shrink-0" aria-hidden />
             <span className="min-w-0 truncate">{DT.lastBlank(blank)}</span>

@@ -77,9 +77,12 @@ export function TableDetail({
   onDetail: (d: CatalogDetail) => void
   /** 这个数据源有排队、进行中的起草任务：「重新起草这张表」等它结束 */
   draftBusy?: boolean
-  /** 上次起草失败、部分完成或有留空列时的「重新起草这张表」：建只含这张表的起草任务（用模型、不带补充说明） */
+  /**
+   * 上次起草失败、部分完成或有留空列时的「重新起草这张表」：建只含这张表的起草任务（用模型、不带补充说明）。
+   * 表结构里已经没有的表不给
+   */
   onRedraft?: (table: string) => Promise<void>
-  /** 上次起草有留空列时的「补充起草要求」：打开起草设置，范围只有这张表，先补起草要求再开始 */
+  /** 上次起草有留空列时的「补充起草要求」：打开起草设置，范围只有这张表，先补起草要求再开始。表结构里已经没有的表不给 */
   onDraftGuidance?: (table: string) => void
 }) {
   const [detail, setDetail] = useState<CatalogDetail | null>(null)
@@ -465,7 +468,8 @@ export function TableDetail({
             // 上次起草没写全：写明原因；有留空的列：写几列、怎么办（在起草要求里补充缩写和术语的含义）。只有留空的列时是
             // 提示（表照样写完了），不是失败。给「重新起草这张表」（只含这张表、用模型）；有留空的列再给「补充起草要求」
             // （打开起草设置，范围是这张表）。有起草任务在进行、正在编辑这张表时先不给点：起草会写进这张表，编辑中的保存
-            // 就会撞上版本冲突
+            // 就会撞上版本冲突。表结构里已经没有这张表（只剩目录）时上次的结果照写，不给这两个按钮、不建议重新起草，
+            // 写明为什么：服务端只会把它记成「已跳过」
             <Notice tone={lastBad ? (lastBad.status === 'failed' ? 'err' : 'warn') : 'info'} attr={{ 'data-catalog-last-draft': lastDraft.status }}>
               {lastBad && <p className="font-medium">{lastBad.status === 'failed' ? DT.lastFailed : DT.lastPartial}</p>}
               {lastBad && taskReason(lastBad) && (
@@ -474,10 +478,11 @@ export function TableDetail({
               {lastBlank > 0 && (
                 <>
                   <p className={lastBad ? 'mt-0.5 text-dim' : 'font-medium'} data-catalog-last-draft-blank={lastBlank}>{DT.lastBlank(lastBlank)}</p>
-                  <p className="mt-0.5 text-dim">{DT.lastBlankAdvice}</p>
+                  {detail.in_schema && <p className="mt-0.5 text-dim">{DT.lastBlankAdvice}</p>}
                 </>
               )}
-              {onRedraft && (
+              {!detail.in_schema && <p className="mt-1 text-2xs text-faint" data-catalog-redraft-missing="">{DT.redraftMissing}</p>}
+              {detail.in_schema && onRedraft && (
                 <>
                   <div className="mt-2 flex flex-wrap items-center gap-1.5">
                     <button type="button" className="btn btn-sm" disabled={draftBusy || redrafting || !!edit} title={DT.redraftHint}
