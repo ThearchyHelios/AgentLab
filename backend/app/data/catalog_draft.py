@@ -21,9 +21,10 @@
 
 - 思考加输出用完额度（finish_reason=length、LengthFinishReasonError、正文为空而有思考）、只给空壳、超时（当作这一段
   太大，不原样重试同样大小的段）：把这一段拆成两半再问（多表的段按表拆，单表的按列拆），最小
-  MODEL_SPLIT_MIN_COLUMNS 列，最多拆 MODEL_SPLIT_DEPTH 层。拆不开的空壳再问一次：结构化输出给的换纯文本（有的网关的
-  结构化输出只给空壳、纯文本却能写——写出来了，这次起草后面都走纯文本），已经走纯文本的原样再问；仍是空壳才记没写
-  出来。
+  MODEL_SPLIT_MIN_COLUMNS 列，最多拆 MODEL_SPLIT_DEPTH 层。同一张表按列拆时带表级项的前一半先写、后一半拿它做背景；
+  超时的两半同时问（一次超时就是一个时限，串着问 40 → 20 → 10 要好几个时限）。拆不开的空壳再问一次：结构化输出给的
+  换纯文本（有的网关的结构化输出只给空壳、纯文本却能写——写出来了，这次起草后面都走纯文本），已经走纯文本的原样再问；
+  仍是空壳才记没写出来。
 - 结构化输出回了一段说明文字（不是 JSON、也没停在额度上）：网关接受了结构化输出的参数却没照做（例如开了丢弃不认识
   的参数），提示词里又没有格式说明，模型就写成了说明文字。这次起草后面改走纯文本，这一段换纯文本问一次。有思考
   不等于额度用完：只有停在额度上、或者正文为空而有思考才算。
@@ -36,9 +37,13 @@
 - 网络错误、429、5xx：等一会儿重试（最多 MODEL_RETRIES 次，退避）。单次调用的时限是 MODEL_TIMEOUT_S。SDK
   自己不再重试（catalog.resolve_draft_model 建模型时 max_retries=0），实际重试次数和报错写的一致。
 - 别的错误：这一段没写出来，原因照实写。
-- 封顶：一段（连同它拆出来的、补问的、重试的）最多调用 MODEL_PART_MAX_CALLS 次，到了次数还没写完的记没写出来。
+- 封顶：每个原始段（计划里的整表段、表级那段或一个列分段，连同按缩小后的上限分开的各块、拆出来的、补问的、重试的）
+  一共最多调用 MODEL_PART_MAX_CALLS 次，到了次数还没写完的记没写出来。
 - 止损：连续 MODEL_GIVE_UP_AFTER 段拆到底仍一项没写出来（模型明显用不了，例如思考总是吃满额度），这次起草后面的
-  段不再拆小重试、没写出来就直接记下，报错建议更换起草模型；有一段写出来了就恢复。
+  段不再拆小重试、没写出来就直接记下，报错建议更换起草模型；有一段写出来了就恢复。超时另有一条：拆到每段
+  MODEL_MIN_PART_COLUMNS 列的调用接连超时 MODEL_GIVE_UP_AFTER 次（超时和段大小无关，再拆小也是一次一个时限），后面
+  超时的不再拆小，超时拆出来、还没问的块也不再问；有一次调用写出来了就恢复。不然一直超时的模型首轮同时起草的几段
+  要各自拆满次数，一段 40 列串着问约 7 个时限（420 秒时约 49 分钟）。
 - 提醒：最近 MODEL_NOTICE_WINDOW 次调用里有 MODEL_NOTICE_ON 次以上没写出来（额度用完、超时、空壳、出错），给一句
   提醒（次数和原因，建议换起草模型、减少表或停止），经进度回调交给任务；之后少于 MODEL_NOTICE_OFF 次时清掉。以前
   看不出调用在反复失败：一个任务 55 分钟只结束 1 张表，界面上只有段进度和用量。
@@ -112,6 +117,8 @@ REASON_CRASH = "起草这张表时出错：{line}"
 REASON_CAPPED = "每段最多调用 {n} 次模型，{seg}到了次数仍没写完，已停止重试"
 #: 止损（连续几段拆到底仍一项没写出来，后面的段不再拆小重试）时补在原因后面
 REASON_HALTED = "；模型连续 {n} 段都没写出来，已停止拆小重试，建议更换起草模型"
+#: 拆到每段 MODEL_MIN_PART_COLUMNS 列仍接连超时（超时和段大小无关，后面超时的不再拆小）时补在原因后面
+REASON_SLOW = "；拆到每段 {n} 列仍然超时，已停止拆小重试，建议更换起草模型"
 
 # ---- 提醒（最近几次调用多数没写出来），经进度回调交给任务（CatalogDraftJob.notice）
 NOTICE = ("最近 {calls} 次调用有 {failed} 次没写出来（{kinds}）。可以在{place}换一个模型、减少这次起草的表，"
@@ -306,6 +313,8 @@ class _Reply:
     timeout: bool = False
     #: 这一段的调用次数用完了，这次没有调用
     capped: bool = False
+    #: 超时拆出来的块，轮到它时已经止损：这次没有调用（见 _Run._ask 的 optional）
+    skipped: bool = False
     #: 这次调用的用量 (输入, 输出)，还没报给进度回调；没有调用（capped）的是 None
     usage: tuple[int, int] | None = None
 
@@ -313,18 +322,20 @@ class _Reply:
 @dataclass(frozen=True)
 class _Why:
     """一部分没写出来的原因。base 给人看的原因（可以带 SEG，拼成一句时换成「这一段」「这几段」）；split 真拆小重试过；
-    halted 本来还能拆小，因为前面连续几段都没写出来（止损）才没拆。"""
+    halted 本来还能拆小、因为止损才没拆时止损的说明（REASON_HALTED：前面连续几段都没写出来；REASON_SLOW：拆到每段
+    MODEL_MIN_PART_COLUMNS 列仍接连超时），没有是空串。"""
 
     base: str
     split: bool = False
-    halted: bool = False
+    halted: str = ""
 
 
 def _join(failures: Iterable[tuple[_Why, int]]) -> str:
     """几处没写出来的原因拼成一句。failures 是 (原因, 属于这张表的第几段)。
 
     同样的原因只说一次（最多说两种）；同一个原因落在几段上说「这几段」，同一段拆出来的几块仍是「这一段」；拆小重试过、
-    止损的说明各在最后补一次（只看说出来的那几种）。不然宽表的表级那段拆不开、列分段拆过时，同一句原因会说两遍。"""
+    止损的说明各在最后补一次（只看说出来的那几种；两种止损各说一次）。不然宽表的表级那段拆不开、列分段拆过时，同一句
+    原因会说两遍。"""
     failures = list(failures)
     parts: dict[str, set[int]] = {}
     for why, part in failures:
@@ -334,8 +345,8 @@ def _join(failures: Iterable[tuple[_Why, int]]) -> str:
     text = "；".join(base.replace(SEG, SEG_MANY if len(parts[base]) > 1 else SEG_ONE) for base in shown)
     if any(w.split for w in told):
         text += REASON_SPLIT
-    if any(w.halted for w in told):
-        text += REASON_HALTED.format(n=max(1, int(C.MODEL_GIVE_UP_AFTER)))
+    for note in dict.fromkeys(w.halted for w in told if w.halted):
+        text += note
     return text
 
 
@@ -784,6 +795,9 @@ class _Run:
         self.gate = asyncio.Semaphore(max(1, int(C.MODEL_CONCURRENCY)))
         #: 连续几段拆到底仍一项没写出来（止损用，有一段写出来就清零）
         self.dead_streak = 0
+        #: 拆到每段 MODEL_MIN_PART_COLUMNS 列（或更小）的调用接连超时了几次（有一次调用写出来就清零）：超时和段大小
+        #: 无关，再拆小也是一次一个时限，后面超时的不再拆小
+        self.slow_streak = 0
         #: 新开始的段每段最多几列：额度用完或超时（strikes）累计 MODEL_SHRINK_AFTER 次减半一次
         self.part_columns = max(1, int(C.MODEL_BATCH_COLUMNS))
         self.strikes = 0
@@ -791,10 +805,24 @@ class _Run:
         self.recent: collections.deque[str | None] = collections.deque(maxlen=max(1, int(C.MODEL_NOTICE_WINDOW)))
         self.notice: str | None = None
 
-    @property
-    def halted(self) -> bool:
-        """止损：连续 MODEL_GIVE_UP_AFTER 段一项都没写出来，后面的段不再拆小重试。"""
-        return self.dead_streak >= max(1, int(C.MODEL_GIVE_UP_AFTER))
+    def _halt_note(self, kind: str | None = None) -> str:
+        """止损的说明（拼在原因后面），没止损是空串。
+
+        - 连续 MODEL_GIVE_UP_AFTER 段一项都没写出来：后面的段不再拆小重试（不论原因）；
+        - 超时的（kind 是 timeout）另看：拆到每段 MODEL_MIN_PART_COLUMNS 列的调用接连超时 MODEL_GIVE_UP_AFTER 次，
+          超时就和段大小无关了，再拆小也是一次一个时限，后面超时的不再拆小，超时拆出来还没问的块也不再问。只管超时：
+          额度用完、只给空壳照旧拆小（段小了思考和输出才放得下）。"""
+        give_up = max(1, int(C.MODEL_GIVE_UP_AFTER))
+        if self.dead_streak >= give_up:
+            return REASON_HALTED.format(n=give_up)
+        if kind == "timeout" and self.slow_streak >= give_up:
+            return REASON_SLOW.format(n=self._floor())
+        return ""
+
+    @staticmethod
+    def _floor() -> int:
+        """段大小减半的下限（每段最少几列）。"""
+        return min(max(1, int(C.MODEL_BATCH_COLUMNS)), max(1, int(C.MODEL_MIN_PART_COLUMNS)))
 
     # ---------------------------------------------------------------- 总流程
 
@@ -860,8 +888,12 @@ class _Run:
         return units
 
     async def _work(self, work: _Work, queue: collections.deque[_Work], left: dict[str, int]) -> None:
-        """起草一段；它之后的段（宽表的列分段）排到队尾；一张表的段都结束了，这张表的模型部分就结束了。"""
-        await self._start(work.pieces)
+        """起草一段；它之后的段（宽表的列分段）排到队尾；一张表的段都结束了，这张表的模型部分就结束了。
+
+        这一段（原始段：计划里的整表段、表级那段或一个列分段）连同按缩小后的上限分开的各块、拆出来的、补问的、重试的，
+        一共最多调用 MODEL_PART_MAX_CALLS 次（各块共用一个 _Budget）；止损按原始段数（_tally）。"""
+        await self._start(work.pieces, _Budget(max(1, int(C.MODEL_PART_MAX_CALLS))))
+        self._tally(work.pieces)
         for piece in work.pieces:
             await self._part_done(piece.table)
         queue.extend(work.then)
@@ -870,30 +902,31 @@ class _Run:
             if not left[piece.table]:
                 await self._table_done(piece.table)
 
-    async def _start(self, pieces: list[_Piece]) -> None:
+    async def _start(self, pieces: list[_Piece], budget: _Budget) -> None:
         """开始起草一段。超过当前的列数上限（额度用完、超时多了会减半）的先按上限分开：多表的段按表重新拼，单张表的
-        按列均分（表级的项跟着第一块，先写它，后面几块拿它做背景）。分开的每一块各算一段（各有调用次数的上限）。"""
+        按列均分（表级的项跟着第一块，先写它，后面几块拿它做背景）。分开的各块同时起草，共用这一段的调用次数（budget）：
+        以前每块各有 MODEL_PART_MAX_CALLS 次，上限缩到 10 列以后一段 40 列最多能调用 32 次。"""
         cap = max(1, self.part_columns)
         if sum(len(p.columns) for p in pieces) <= cap:
-            await self._guarded(pieces)
+            await self._guarded(pieces, budget)
             return
         if len(pieces) > 1:
-            await asyncio.gather(*(self._start(group) for group in _pack(pieces, cap)))
+            await asyncio.gather(*(self._start(group, budget) for group in _pack(pieces, cap)))
             return
         piece = pieces[0]
         chunks = _even(piece.columns, -(-len(piece.columns) // cap))
         first = [_Piece(piece.table, chunks[0], piece.table_level, piece.part)]
         rest = [[_Piece(piece.table, cols, False, piece.part)] for cols in chunks[1:]]
         if piece.table_level:
-            await self._guarded(first)
-            await asyncio.gather(*(self._guarded(group) for group in rest))
+            await self._guarded(first, budget)
+            await asyncio.gather(*(self._guarded(group, budget) for group in rest))
         else:
-            await asyncio.gather(*(self._guarded(group) for group in [first, *rest]))
+            await asyncio.gather(*(self._guarded(group, budget) for group in [first, *rest]))
 
-    async def _guarded(self, pieces: list[_Piece]) -> None:
-        """起草一段；意料之外的错误只记这一段没写出来，不影响别的段和别的表。"""
+    async def _guarded(self, pieces: list[_Piece], budget: _Budget) -> None:
+        """起草一段（或它按上限分开的一块）；意料之外的错误只记这一块没写出来，不影响别的段和别的表。"""
         try:
-            await self._segment(pieces, 0, False, _Budget(max(1, int(C.MODEL_PART_MAX_CALLS))))
+            await self._segment(pieces, 0, False, budget)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -901,10 +934,9 @@ class _Run:
 
             logger.exception("起草数据目录时出错：%s", "、".join(p.table for p in pieces))
             self._fail(pieces, REASON_CRASH.format(line=first_line(e) or describe_exception(e)))
-        self._tally(pieces)
 
     def _tally(self, pieces: list[_Piece]) -> None:
-        """一段（连同拆小、补缺）结束：一项都没写出来的接着数，写出来了清零。"""
+        """一段（原始段，连同它分开的各块、拆小、补缺）结束：一项都没写出来的接着数，写出来了清零。"""
         if any(self.tables[p.table].wrote(p) for p in pieces):
             self.dead_streak = 0
             return
@@ -915,17 +947,29 @@ class _Run:
     # ---------------------------------------------------------------- 一段
 
     async def _segment(self, pieces: list[_Piece], depth: int, followup: bool, budget: _Budget, *,
-                       halved: bool = False, mode: str | None = None, last: bool = False) -> None:
+                       halved: bool = False, mode: str | None = None, last: bool = False,
+                       optional: bool = False) -> None:
         """问一段，拿到的并进各表；按失败原因拆开、补缺、记下没写出来的。
 
         depth：已经拆了几层（截断后只补剩下的也算一层）。followup：这一段是在补缺（补过就不再补，见 _after_followup）。
-        budget：这一段还能调用几次。halved：这几块是真拆小（_split）出来的——原因里「已拆小重试」只在这时写。
-        mode / last：换纯文本问的那一次——拆不开的空壳、结构化输出回了说明文字（再不行就记没写出来）。"""
-        reply = await self._ask(pieces, budget, mode)
+        budget：这一段（原始段）还能调用几次。halved：这几块是真拆小（_split）出来的——原因里「已拆小重试」只在这时写。
+        mode / last：换纯文本问的那一次——拆不开的空壳、结构化输出回了说明文字（再不行就记没写出来）。
+        optional：超时拆出来的块，轮到它时已经止损就不问了（_ask）。"""
+        reply = await self._ask(pieces, budget, mode, optional=optional)
         if reply.capped:
             self._fail(pieces, self._capped(halved))
             return
+        if reply.skipped:
+            note = self._halt_note("timeout")
+            self._fail(pieces, lambda p: self._reason("timeout", split=True, piece=p, halted=note))
+            return
         if reply.timeout:
+            # 先记下再报用量：报用量要写库、会让出事件循环，等名额的块醒来时要看到这一次
+            if sum(len(p.columns) for p in pieces) <= self._floor():
+                self.slow_streak += 1
+                if self.slow_streak == max(1, int(C.MODEL_GIVE_UP_AFTER)):
+                    logger.warning("起草数据目录：拆到每段 %d 列仍接连超时 %d 次，后面超时的不再拆小",
+                                   self._floor(), self.slow_streak)
             await self._report(reply, wrote=False)
             await self._split(pieces, depth, "timeout", followup, budget, halved)
             return
@@ -1000,31 +1044,40 @@ class _Run:
             logger.info("起草数据目录：结构化输出回了说明文字，后面改走纯文本")
         await self._segment(pieces, depth, followup, budget, halved=halved, mode="text", last=True)
 
-    def _stopped(self, pieces: list[_Piece], depth: int) -> bool:
-        """这几段本来还能拆小，因为前面连续几段都没写出来（止损）才没拆。"""
-        return self.halted and depth < int(C.MODEL_SPLIT_DEPTH) and _halves(pieces) is not None
+    def _stopped(self, pieces: list[_Piece], depth: int) -> str:
+        """这几段本来还能拆小、因为止损才没拆时，止损的说明；不是的话是空串。"""
+        if depth < int(C.MODEL_SPLIT_DEPTH) and _halves(pieces) is not None:
+            return self._halt_note()
+        return ""
 
     async def _split(self, pieces: list[_Piece], depth: int, kind: str, followup: bool, budget: _Budget,
                      halved: bool) -> None:
-        """拆成两半再问（额度用完、超时、只给空壳、截断后一项都没捡回来）。拆不开的空壳再问一次：结构化输出给的换纯文本，
-        已经走纯文本的原样再问；别的原因拆不开就记没写出来。"""
+        """拆成两半再问（额度用完、超时、只给空壳、截断后一项都没捡回来）。
+
+        - 同一张表按列拆、前一半带着表级的项：先写前一半，后一半拿它做背景。超时的不等：一次超时就是一个时限，40 → 20
+          → 10 一层一层串着问要好几个时限，两半同时问；拆出来的块轮到它时已经止损的不再问（optional）。
+        - 拆不开的空壳再问一次：结构化输出给的换纯文本，已经走纯文本的原样再问。止损时本来能拆的不拆：结构化输出给的
+          照旧换纯文本问一次（看看是不是结构化输出的问题），已经走纯文本的不再问。
+        - 别的原因拆不开、止损了，就记没写出来。"""
         halves = _halves(pieces) if depth < int(C.MODEL_SPLIT_DEPTH) else None
-        halted = halves is not None and self.halted
+        halted = self._halt_note(kind) if halves is not None else ""
         if halves is not None and not halted:
             first, second = halves
-            if (len(first) == len(second) == 1 and first[0].table == second[0].table and first[0].table_level):
-                # 同一张表按列拆、前一半带着表级的项：先写前一半，后一半拿它做背景
+            timeout = kind == "timeout"
+            if (not timeout and len(first) == len(second) == 1 and first[0].table == second[0].table
+                    and first[0].table_level):
                 await self._segment(first, depth + 1, followup, budget, halved=True)
                 await self._segment(second, depth + 1, followup, budget, halved=True)
                 return
-            results = await asyncio.gather(self._segment(first, depth + 1, followup, budget, halved=True),
-                                           self._segment(second, depth + 1, followup, budget, halved=True),
-                                           return_exceptions=True)
+            results = await asyncio.gather(
+                self._segment(first, depth + 1, followup, budget, halved=True, optional=timeout),
+                self._segment(second, depth + 1, followup, budget, halved=True, optional=timeout),
+                return_exceptions=True)
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
             return
-        if kind == "hollow":
+        if kind == "hollow" and (not halted or self.mode == "structured"):
             await self._segment(pieces, depth, followup, budget, halved=halved, mode="text", last=True)
             return
         self._fail(pieces, lambda p: self._reason(kind, split=halved, piece=p, halted=halted))
@@ -1050,21 +1103,27 @@ class _Run:
 
     # ---------------------------------------------------------------- 调用
 
-    async def _ask(self, pieces: list[_Piece], budget: _Budget, mode: str | None = None) -> _Reply:
+    async def _ask(self, pieces: list[_Piece], budget: _Budget, mode: str | None = None, *,
+                   optional: bool = False) -> _Reply:
         """调一次模型（按原因重来：额度被拒、结构化输出不支持、网络错误……），交回读好的回复。
 
-        这一段的调用次数用完了交回 capped（不调用）。超时不原样重试：交回 timeout，由调用方当作这一段太大、拆小再问。
-        重来之前的那次调用在这里就报给进度回调；交回的那次由调用方读完内容再报（写没写出来要看校验之后的内容）。"""
+        这一段的调用次数用完了交回 capped（不调用）。optional（超时拆出来的块）：拿到名额时已经止损，交回 skipped（不调用，
+        次数退回）——等名额的时候前面的块接连超时，再问也是一个时限。超时不原样重试：交回 timeout，由调用方当作这一段
+        太大、拆小再问。重来之前的那次调用在这里就报给进度回调；交回的那次由调用方读完内容再报（写没写出来要看校验之后
+        的内容）。"""
         mode = mode or self.mode
         retried = 0
         while True:
             if budget.left <= 0:
                 return _Reply(capped=True)
-            budget.left -= 1
+            budget.left -= 1                 # 先占上：各块共用这一段的次数，等名额的时候别的块不能把它用掉
             used = getattr(self.model, "budget", None)
             try:
                 # 先占这次起草自己的名额，再去排全进程的：一次起草排在全进程名额上的调用最多 MODEL_CONCURRENCY 个
                 async with self.gate, model_gate():
+                    if optional and self._halt_note("timeout"):
+                        budget.left += 1
+                        return _Reply(skipped=True)
                     await self._hook(self.hooks.call_started, [p.table for p in pieces])
                     reply, raw = await asyncio.wait_for(self._call(pieces, mode), timeout=C.MODEL_TIMEOUT_S)
                 reply.usage = _usage_of(raw)
@@ -1155,13 +1214,14 @@ class _Run:
 
     async def _called(self, usage: tuple[int, int], failure: str | None, *, strike: bool = False) -> None:
         """记下一次调用：额度用完或超时（strike）累计 MODEL_SHRINK_AFTER 次，新开始的段列数上限减半；最近几次调用多数
-        没写出来时提醒，少了清掉。报给进度回调。"""
+        没写出来时提醒，少了清掉。写出来了（failure 为 None）就清掉接连超时的计数。报给进度回调。"""
         self.recent.append(failure)
+        if failure is None:
+            self.slow_streak = 0
         if strike:
             self.strikes += 1
             width = max(1, int(C.MODEL_BATCH_COLUMNS))
-            floor = min(width, max(1, int(C.MODEL_MIN_PART_COLUMNS)))
-            cap = max(floor, width >> (self.strikes // max(1, int(C.MODEL_SHRINK_AFTER))))
+            cap = max(self._floor(), width >> (self.strikes // max(1, int(C.MODEL_SHRINK_AFTER))))
             if cap < self.part_columns:
                 self.part_columns = cap
                 logger.info("起草数据目录：额度用完或超时已有 %d 次，之后新开始的段每段最多 %d 列", self.strikes, cap)
@@ -1243,7 +1303,7 @@ class _Run:
             if piece.table_level and not st.got_table:
                 st.failed.setdefault(_TABLE, why)
 
-    def _reason(self, kind: str, *, split: bool, piece: _Piece | None = None, halted: bool = False) -> _Why:
+    def _reason(self, kind: str, *, split: bool, piece: _Piece | None = None, halted: str = "") -> _Why:
         if kind == "exhausted":
             base = REASON_EXHAUSTED.format(budget=self._budget(), seg=SEG)
         elif kind == "truncated":
@@ -1447,5 +1507,5 @@ class _Run:
 
 __all__ = ["BUDGET_WORDS", "Background", "CallReport", "FAILURE_LABEL", "Hooks", "ModelOutcome", "NOTICE", "REASON_CALL",
            "REASON_CAPPED", "REASON_EXHAUSTED", "REASON_FORMAT", "REASON_HALTED", "REASON_HOLLOW", "REASON_MISSING",
-           "REASON_RETRIED", "REASON_SPLIT", "REASON_TIMEOUT", "REASON_TRUNCATED", "REASON_UNANSWERED", "SEG",
-           "classify_failure", "model_gate", "parts_for", "run_model_draft"]
+           "REASON_RETRIED", "REASON_SLOW", "REASON_SPLIT", "REASON_TIMEOUT", "REASON_TRUNCATED", "REASON_UNANSWERED",
+           "SEG", "classify_failure", "model_gate", "parts_for", "run_model_draft"]

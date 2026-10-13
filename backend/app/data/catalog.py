@@ -1640,8 +1640,9 @@ async def resolve_draft_model(session: AsyncSession) -> tuple[Any, str]:
 
     不关思考（spec 里不传 thinking，按接入默认）、温度 0、额度 MODEL_MAX_TOKENS，服务方嫌大时退回
     MODEL_FALLBACK_MAX_TOKENS（DraftModel）。单次调用的时限 MODEL_TIMEOUT_S 也交给 SDK，免得它先按全局的 5 分钟断开。
-    SDK 自己不重试（max_retries=0）：429、5xx、网络错误、超时由起草引擎按失败原因重试（最多 MODEL_RETRIES 次），
-    不然两层叠起来一段最多发 9 次请求，报错却写「已重试 2 次」，网关正在限流时还会放大流量。
+    SDK 自己不重试（max_retries=0）：429、5xx、网络错误由起草引擎退避重试（最多 MODEL_RETRIES 次）；超时当作这一段
+    太大，拆小再问（data/catalog_draft.py），不原样重试。不然两层叠起来一段最多发 9 次请求，报错却写「已重试 2 次」，
+    网关正在限流时还会放大流量。
     只建模型对象，不发请求。
 
     和 recipe_ai.resolve_draft_model 一样不用 get_chat_model：它在没有接入时静默退回演示模型，拿演示模型

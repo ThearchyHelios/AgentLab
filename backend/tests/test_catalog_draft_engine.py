@@ -846,8 +846,11 @@ def test_reasons_are_joined_by_their_base():
     assert D._join([(W(ex), 2), (W(ex), 3)]) == _exhausted("这几段")
     assert D._join([(W(ex), 2), (W(ex, split=True), 2)]) == _exhausted() + D.REASON_SPLIT
     assert D._join([(W("甲"), 1), (W("乙"), 1), (W("丙", split=True), 1)]) == "甲；乙", "没说出来的原因不补后缀"
-    assert D._join([(W(D.REASON_HOLLOW, halted=True), 1), (W(D.REASON_HOLLOW), 2)]) == \
-        D.REASON_HOLLOW + D.REASON_HALTED.format(n=catalog.MODEL_GIVE_UP_AFTER)
+    halted = D.REASON_HALTED.format(n=catalog.MODEL_GIVE_UP_AFTER)
+    assert D._join([(W(D.REASON_HOLLOW, halted=halted), 1), (W(D.REASON_HOLLOW), 2)]) == D.REASON_HOLLOW + halted
+    slow = D.REASON_SLOW.format(n=catalog.MODEL_MIN_PART_COLUMNS)
+    assert D._join([(W(D.REASON_HOLLOW, halted=halted), 1), (W(D.REASON_HOLLOW, halted=slow), 2),
+                    (W(D.REASON_HOLLOW, halted=halted), 3)]) == D.REASON_HOLLOW + halted + slow, "两种止损各说一次"
     assert D._join([(W("调用模型出错：{坏的}"), 1)]) == "调用模型出错：{坏的}", "报错原文里的花括号原样留着"
 
 
@@ -1012,6 +1015,118 @@ async def test_the_notice_comes_when_four_of_six_calls_fail_and_goes_when_fewer_
     assert notices[8].startswith("最近 6 次调用有 2 次没写出来")
     assert notices[9] is None, "最近 6 次只有 1 次没写出来：清掉"
     assert got["t9"].status == "ok"
+
+
+# --------------------------------------------------------------------------
+# 复核后的修正：每个原始段一共 8 次、一直超时的模型几轮就停、止损后纯文本不再原样再问
+# --------------------------------------------------------------------------
+
+
+def _width(call: Call, tables: dict) -> int:
+    """这次调用请模型写几列（只写表级的项是 0）。"""
+    return sum(len(tables[name]["columns"]) if part == "full" else len(cols or [])
+               for name, (part, cols) in call.asked.items())
+
+
+async def test_the_chunks_of_a_part_cut_by_the_smaller_cap_share_its_eight_calls(monkeypatch):
+    """每个原始段（连同段大小减半后按上限分开的各块、拆出来的、补问的、重试的）一共最多调用 8 次。以前分开的每一块各有
+    8 次：上限缩到 10 列以后一直只给空壳，4 张窄表拼成的 40 列段调用了 20 次，单张 40 列的表也是 20 次。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_GIVE_UP_AFTER", 99)        # 不让止损先停下来
+    tables = {"w40": _table(40), **{f"n{i}": _table(10) for i in range(1, 5)}, "x40": _table(40)}
+
+    def handle(call: Call) -> Reply:
+        return EXHAUSTED if "w40" in call.asked else _hollow(call)
+
+    model, reports = Scripted(handle), Reports()
+    got = await D.run_model_draft(model, _source(tables), list(tables), hooks=reports.hooks())
+    first = sum(1 for c in model.calls if "w40" in c.asked)
+    assert first == 8 and reports.items[first - 1].part_columns == 10, "w40 一直用完额度，上限缩到 10 列"
+    packed = [c for c in model.calls if set(c.asked) & {"n1", "n2", "n3", "n4"}]
+    assert len(packed) == 8, "拼成的 40 列段按 10 列分开成 4 块，4 块一共 8 次"
+    assert all(len(c.asked) == 1 and _width(c, tables) <= 10 for c in packed)
+    assert {got[f"n{i}"].status for i in range(1, 5)} == {"failed"}
+    assert "每段最多调用 8 次模型，这一段到了次数仍没写完，已停止重试" in {got[f"n{i}"].error for i in range(1, 5)}, \
+        "次数用完时还没问的块记「每段最多调用 8 次」"
+    wide = [c for c in model.calls if "x40" in c.asked]
+    assert len(wide) == 8 and _width(wide[0], tables) == 10, "单张 40 列的表按 10 列分开，各块一共 8 次"
+    assert len(reports.items) == len(model.calls)
+
+
+class AlwaysSlow:
+    """每次调用都超时（立刻抛 TimeoutError，和到了单次调用的时限走同一条路），fits(列数) 为真的照常写。
+
+    记下每次调用在第几轮：每次调用一样长（一个时限），一次调用开始时，已经结束的调用里最晚的那一轮的下一轮——
+    轮数乘以时限就是用掉的时间。"""
+
+    def __init__(self, tables: dict, fits: Callable[[int], bool] = lambda n: False) -> None:
+        self.tables, self.fits, self.ok = tables, fits, answering(tables)
+        self.rounds: list[int] = []
+        self._ended: list[int] = []
+
+    async def __call__(self, call: Call) -> Reply:
+        r = 1 + max(self._ended, default=0)
+        self.rounds.append(r)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self._ended.append(r)
+        if self.fits(_width(call, self.tables)):
+            return self.ok(call)
+        raise TimeoutError()
+
+
+SLOW_STOP = "；拆到每段 10 列仍然超时，已停止拆小重试，建议更换起草模型"
+
+
+async def test_a_model_that_always_times_out_stops_after_three_rounds_not_seven():
+    """每次调用都超时、和段大小无关：超时拆出来的两半同时问（不再等带表级项的前一半写完才问后一半），拆到每段 10 列的
+    调用接连超时 2 次就停止拆小，拆出来还没问的块不再问。40 列的表 3 轮、6 次调用就结束（时限 420 秒时约 21 分钟）；
+    以前 40→20→10→5 一层一层串着问，8 次调用约 7 轮（约 49 分钟）。"""
+    tables = {"t40": _table(40)}
+    slow = AlwaysSlow(tables)
+    model, reports = Scripted(slow), Reports()
+    got = await D.run_model_draft(model, _source(tables), ["t40"], hooks=reports.hooks())
+    assert [_width(c, tables) for c in model.calls] == [40, 20, 20, 10, 10, 10], "拆到每段 10 列仍超时就不再往下拆"
+    assert slow.rounds == [1, 2, 2, 3, 3, 3], "两半同时问"
+    assert reports.failures == ["timeout"] * 6 and len(reports.items) == len(model.calls)
+    o = got["t40"]
+    assert o.status == "failed" and o.error == "模型 420 秒内没有写完这一段" + D.REASON_SPLIT + SLOW_STOP
+
+
+async def test_three_parts_that_always_time_out_end_in_four_rounds():
+    """首轮同时起草的 3 段都一直超时：拆到每段 10 列仍超时就一起停下，不再各自拆满 8 次。12 次调用、4 轮；以前 24 次
+    调用、约 8 轮（止损要等一整段结束才计数，首轮的 3 段都跑满）。"""
+    tables = {f"t{i}": _table(40) for i in range(1, 4)}
+    slow = AlwaysSlow(tables)
+    model = Scripted(slow)
+    got = await D.run_model_draft(model, _source(tables), list(tables))
+    assert len(model.calls) == 12 and max(slow.rounds) == 4
+    assert {o.status for o in got.values()} == {"failed"}
+    assert all(o.error.endswith(SLOW_STOP) for o in got.values())
+
+
+async def test_timeouts_that_go_away_at_ten_columns_are_still_split_down_and_written():
+    """超时和段大小有关（40、20 列超时，10 列写得完）：照旧拆到 10 列写出来，不因为前面超时多就停下。"""
+    tables = {"t40": _table(40)}
+    slow = AlwaysSlow(tables, fits=lambda n: n <= 10)
+    model = Scripted(slow)
+    got = await D.run_model_draft(model, _source(tables), ["t40"])
+    assert got["t40"].status == "ok" and len(got["t40"].notes["columns"]) == 40
+    assert len(model.calls) == 7 and max(slow.rounds) == 4
+
+
+async def test_a_halted_part_that_could_be_split_is_not_asked_again_in_text_mode(monkeypatch):
+    """止损以后本来能拆小的段只给空壳：已经走纯文本的不再原样再问（约定只对拆不开的段再问一次）；结构化输出的照旧换
+    纯文本问一次，看看是不是结构化输出的问题（见 test_the_column_parts_of_a_wide_table_stop_splitting_too）。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    tables = {f"t{i}": _table(10) for i in range(1, 5)}
+    model = Scripted(_text_only(_hollow))
+    got = await D.run_model_draft(model, _source(tables), list(tables))
+    # t1：结构化不支持 1 次、纯文本 1 次、拆成两半各问一次再原样再问一次；t2 同样（少了结构化那次）；之后止损
+    assert _by_table(model) == {"t1": 6, "t2": 5, "t3": 1, "t4": 1}
+    assert got["t3"].error == (catalog.MODEL_EMPTY_REASON
+                               + "；模型连续 2 段都没写出来，已停止拆小重试，建议更换起草模型")
 
 
 # --------------------------------------------------------------------------

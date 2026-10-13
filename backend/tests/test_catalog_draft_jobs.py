@@ -335,8 +335,8 @@ async def test_usage_counts_timeouts_and_failed_calls(client, monkeypatch):
     assert job["status"] == "succeeded" and job["tasks"][0]["status"] == "ok"
     assert job["usage"] == {"calls": 5, "input_tokens": 0, "output_tokens": 0, "timeouts": 2, "failed_calls": 2}
     assert job["part_columns"] == 20 and job["notice"] is None
-    # 24 列整张问超时 → 前 12 列（带表级的项）超时 → 拆成 6、6 → 后 12 列
-    assert [len(requested(c)["tickets"][1] or []) for c in model.calls] == [0, 12, 6, 6, 12]
+    # 24 列整张问超时 → 两半同时问：前 12 列（带表级的项）超时、后 12 列写出 → 前 12 列拆成 6、6
+    assert [len(requested(c)["tickets"][1] or []) for c in model.calls] == [0, 12, 12, 6, 6]
 
     plain = await _draft(client, sid, monkeypatch, FakeModel(replies), ["tickets"])
     assert plain["part_columns"] == 40 and plain["usage"]["timeouts"] == plain["usage"]["failed_calls"] == 0
