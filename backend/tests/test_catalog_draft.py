@@ -274,10 +274,11 @@ async def test_model_single_table_object_without_wrapper_is_recognized():
 
 
 async def test_hollow_structured_output_retries_with_text():
-    """结构化输出只给了 {"tables":[{"table":"visits"}]} 这样的空壳：改走纯文本再问一次，用纯文本给的内容。"""
+    """结构化输出只给了 {"tables":[{"table":"visits"}]} 这样的空壳、这一段又拆不开（不到 10 列）：改走纯文本再问一次，
+    用纯文本给的内容。纯文本只给了表级的项、没给列：再补问一次没给的列（只问缺的，data/catalog_draft.py）。"""
     model = FakeModel({"visits": {"label": "入园记录", "kind": "fact"}}, structured="hollow", text="tables")
     got = await catalog.draft_with_model(model, _source(_scenic_tables()), ["visits"])
-    assert model.modes == ["structured", "text"]
+    assert model.modes == ["structured", "text", "text"]
     assert got["visits"].notes == {"label": make_item("入园记录", "llm"), "kind": make_item("fact", "llm")}
 
 
