@@ -304,6 +304,7 @@ async def test_truncated_tool_call_arguments_are_salvaged_too():
 
 
 async def test_missing_tables_are_asked_again_once():
+    """缺了的表只补缺的、补一次；补问时整张表还是一项都没有，按只给空壳处理（拆不开就换纯文本问一次）。"""
     tables = {"a_tab": _table(4), "b_tab": _table(4), "c_tab": _table(4)}
     ok = answering(tables)
 
@@ -315,13 +316,34 @@ async def test_missing_tables_are_asked_again_once():
 
     model = Scripted(handle)
     got = await D.run_model_draft(model, _source(tables), ["a_tab", "b_tab", "c_tab"])
-    assert len(model.calls) == 2
+    assert len(model.calls) == 3
     assert model.calls[1].asked == {"b_tab": ("full", None), "c_tab": ("full", None)}
+    assert model.calls[2].asked == {"c_tab": ("full", None)} and model.calls[2].mode == "text"
     assert _status(got) == {"a_tab": "ok", "b_tab": "ok", "c_tab": "failed"}
     assert got["c_tab"].error == "模型的回复里没有这张表"
 
 
-async def test_columns_the_model_skips_are_asked_once_and_then_left_empty():
+async def test_a_table_still_missing_after_the_followup_is_split_like_a_hollow_shell():
+    """补问时整张表还是一项都没有：照第一次的规则拆小（这里按列拆成两半），不直接记失败。"""
+    tables = {"a_tab": _table(4), "b_tab": _table(12)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        reply = ok(call)
+        if call.n < 2:
+            reply.obj["tables"] = [e for e in reply.obj["tables"] if e["table"] == "a_tab"]
+        return reply
+
+    model = Scripted(handle)
+    got = await D.run_model_draft(model, _source(tables), ["a_tab", "b_tab"])
+    assert _status(got) == {"a_tab": "ok", "b_tab": "ok"}
+    cols = [f"c{i:03d}" for i in range(1, 13)]
+    assert [c.asked for c in model.calls[2:]] == [{"b_tab": ("table+columns", cols[:6])},
+                                                  {"b_tab": ("columns", cols[6:])}]
+
+
+async def test_columns_still_missing_after_the_followup_are_not_written():
+    """补问过仍然没列出来的列算没写出来：表是 partial，说清哪部分没写出来（不算拿不准，旧的模型起草项不删）。"""
     tables = {"t8": _table(8)}
     ok = answering(tables)
 
@@ -335,8 +357,51 @@ async def test_columns_the_model_skips_are_asked_once_and_then_left_empty():
     got = await D.run_model_draft(model, _source(tables), ["t8"])
     assert len(model.calls) == 2 and model.calls[1].asked == {"t8": ("columns", ["c007", "c008"])}
     o = got["t8"]
-    assert o.status == "ok" and o.error is None, "补问过仍然没给的列算拿不准、留空"
+    assert o.status == "partial"
+    assert o.error == "这张表 8 列，有 2 列没写出来：模型的回复里漏了这些列，补问一次仍没有给出。可以只重试这张表"
     assert set(o.notes["columns"]) == {f"c{i:03d}" for i in range(1, 7)}
+    compat = (await catalog.draft_with_model(Scripted(handle), _source(tables), ["t8"]))["t8"]
+    assert compat.covered == frozenset(), "没写全的不算完整起草过"
+
+
+async def test_a_followup_that_comes_back_as_an_empty_shell_leaves_the_table_partial():
+    """40 列的表第一次只回了 20 列，补问只给一个空壳：没写出来的 20 列照实记下，表是 partial。"""
+    tables = {"t40": _table(40)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        if call.n == 0:
+            reply = ok(call)
+            reply.obj["tables"][0]["columns"] = reply.obj["tables"][0]["columns"][:20]
+            return reply
+        return Reply(obj={"tables": [{"table": "t40"}]})
+
+    model = Scripted(handle)
+    got = await D.run_model_draft(model, _source(tables), ["t40"])
+    o = got["t40"]
+    assert len(model.calls) == 2
+    assert model.calls[1].asked == {"t40": ("columns", [f"c{i:03d}" for i in range(21, 41)])}
+    assert o.status == "partial" and len(o.notes["columns"]) == 20
+    assert o.error == "这张表 40 列，有 20 列没写出来：模型的回复里漏了这些列，补问一次仍没有给出。可以只重试这张表"
+
+
+async def test_columns_listed_with_empty_fields_are_left_to_the_model():
+    """列出了、字段留空的列是模型拿不准：不补问，也不算没写出来。"""
+    tables = {"t8": _table(8)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        reply = ok(call)
+        for entry in reply.obj["tables"]:
+            entry["columns"] = [c if c["name"] not in ("c007", "c008") else {"name": c["name"]}
+                                for c in entry.get("columns", [])]
+        return reply
+
+    model = Scripted(handle)
+    got = await D.run_model_draft(model, _source(tables), ["t8"])
+    assert len(model.calls) == 1
+    assert got["t8"].status == "ok" and got["t8"].error is None
+    assert set(got["t8"].notes["columns"]) == {f"c{i:03d}" for i in range(1, 7)}
 
 
 # --------------------------------------------------------------------------
@@ -380,6 +445,34 @@ async def test_structured_output_unsupported_switches_to_text_for_the_rest():
     got = await D.run_model_draft(model, _source(tables), ["wide45"])
     assert got["wide45"].status == "ok"
     assert [c.mode for c in model.calls] == ["structured", "text", "text", "text"]
+
+
+@pytest.mark.parametrize("thinking", ["", "先想想每一列是什么……"], ids=["plain", "with-thinking"])
+async def test_structured_output_that_comes_back_as_prose_falls_back_to_text(thinking):
+    """网关接受了结构化输出的参数却没照做（模型写成了一段说明文字）：换纯文本问，不当成额度用完去拆，也不直接判失败。"""
+    tables = {"t40": _table(40)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        if call.mode == "structured":
+            return Reply(text="好的。这张表记录的是一笔笔业务，各列的含义如下：第一列是编号……", thinking=thinking)
+        return ok(call)
+
+    model = Scripted(handle)
+    got = await D.run_model_draft(model, _source(tables), ["t40"])
+    assert got["t40"].status == "ok" and len(got["t40"].notes["columns"]) == 40
+    assert [c.mode for c in model.calls] == ["structured", "text"]
+    assert catalog.CATALOG_DRAFT_TEXT_PROMPT in model.calls[1].text
+
+
+async def test_prose_on_both_paths_is_a_format_failure_not_a_budget_one():
+    def handle(call: Call) -> Reply:
+        return Reply(text="这张表看起来是业务明细，具体含义需要结合业务确认。", thinking="……")
+
+    model = Scripted(handle)
+    got = await D.run_model_draft(model, _source({"t40": _table(40)}), ["t40"])
+    assert [c.mode for c in model.calls] == ["structured", "text"], "格式不对不拆小重试"
+    assert got["t40"].status == "failed" and got["t40"].error == "模型的回复不是约定的格式"
 
 
 async def test_a_model_without_structured_output_goes_to_text():
@@ -498,6 +591,33 @@ async def test_tables_are_packed_up_to_40_columns_and_4_tables():
         (("ta", "tb"), "full"), (("tc", "td", "te", "tf"), "full"), (("tg",), "full"),
         (("th",), "table"), (("th",), "columns"), (("th",), "columns"),
     ])
+
+
+# --------------------------------------------------------------------------
+# 报错去重
+# --------------------------------------------------------------------------
+
+
+def _hollow(call: Call) -> Reply:
+    return Reply(obj={"tables": [{"table": t} for t in call.asked]})
+
+
+async def test_the_same_reason_is_said_once_even_when_some_parts_were_split():
+    """宽表的表级那段拆不开、列分段拆过：原因只说一次，拆过的在最后补一句。"""
+    model = Scripted(_hollow)
+    got = await D.run_model_draft(model, _source({"wide45": _table(45)}), ["wide45"])
+    o = got["wide45"]
+    assert o.status == "failed"
+    assert o.error == "模型只给了空壳，没有写出可用的内容；已拆小重试仍没写出"
+
+
+def test_reasons_are_joined_by_their_base():
+    W = D._Why
+    exhausted = D.REASON_EXHAUSTED.format(budget=32768)
+    assert D._join([W(D.REASON_HOLLOW), W(D.REASON_HOLLOW, split=True)]) == D.REASON_HOLLOW + D.REASON_SPLIT
+    assert D._join([W(exhausted, split=True), W(D.REASON_HOLLOW)]) == \
+        f"{exhausted}；{D.REASON_HOLLOW}{D.REASON_SPLIT}"
+    assert D._join([W("甲"), W("乙"), W("丙", split=True)]) == "甲；乙", "没说出来的原因不补后缀"
 
 
 # --------------------------------------------------------------------------

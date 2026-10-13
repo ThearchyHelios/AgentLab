@@ -215,6 +215,57 @@ async def test_a_table_whose_model_part_failed_is_failed_but_structure_is_writte
     assert by["channels"]["status"] == "ok"
 
 
+class HalfThenHollow:
+    """假模型：第一次只给前一半列，补问时只给一个空壳（表名对上、一项都没有）。"""
+
+    model_name = "half-model"
+
+    def __init__(self, table: str, reply: dict) -> None:
+        self.table, self.reply, self.calls = table, reply, 0
+
+    def with_structured_output(self, schema, **_):
+        outer = self
+
+        class _S:
+            async def ainvoke(self, messages):
+                outer.calls += 1
+                if outer.calls == 1:
+                    cols = outer.reply["columns"]
+                    return {"tables": [{"table": outer.table, **outer.reply, "columns": cols[:len(cols) // 2]}]}
+                return {"tables": [{"table": outer.table}]}
+
+        return _S()
+
+    async def ainvoke(self, messages):
+        raise AssertionError("这里不该走纯文本")
+
+
+async def test_a_followup_that_comes_back_empty_keeps_the_earlier_model_items(client, monkeypatch):
+    """补问只给空壳：表是 partial、任务是 partial，以前起草过的列（待确认的模型起草项）不因这次没写全被删掉。"""
+    cols = [_col(f"c{i:02d}") for i in range(1, 9)]
+    sid = await _source({"tickets": {"qualified": "tickets", "columns": cols, "primary_key": ["c01"], "comment": None,
+                                      "is_view": False, "foreign_keys": []}})
+    full = {"label": "门票", "kind": "fact",
+            "columns": [{"name": f"c{i:02d}", "label": f"第{i}列"} for i in range(1, 9)]}
+    use(monkeypatch, FakeModel({"tickets": full}))
+    first = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["tickets"], "use_model": True})).json()
+    await finished(first["job"]["id"])
+    before = (await client.get(f"{_base(sid)}/tickets")).json()["notes"]["columns"]
+    assert {c for c, items in before.items() if "label" in items} == {f"c{i:02d}" for i in range(1, 9)}
+
+    model = HalfThenHollow("tickets", full)
+    use(monkeypatch, model)
+    second = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["tickets"], "use_model": True})).json()
+    await finished(second["job"]["id"])
+    job = await get_job(client, sid, second["job"]["id"])
+    task = job["tasks"][0]
+    assert model.calls == 2
+    assert job["status"] == "partial" and task["status"] == "partial" and task["removed"] == 0
+    assert "有 4 列没写出来" in task["model_error"] and "可以只重试这张表" in task["model_error"]
+    after = (await client.get(f"{_base(sid)}/tickets")).json()["notes"]["columns"]
+    assert {c for c, items in after.items() if "label" in items} == {f"c{i:02d}" for i in range(1, 9)}
+
+
 async def test_a_job_that_cannot_start_is_failed_with_the_reason(client, monkeypatch):
     """建任务时起草模型还能用，开始起草时已经用不了（接入刚被停用）：任务整体 failed，error 写原因，没开始的表也记 failed。"""
     sid = await _source()

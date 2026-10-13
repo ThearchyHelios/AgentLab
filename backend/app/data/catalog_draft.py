@@ -18,8 +18,12 @@
   两半再问（多表的段按表拆，单表的按列拆），最小 MODEL_SPLIT_MIN_COLUMNS 列，最多拆 MODEL_SPLIT_DEPTH 层。
   拆不开的空壳（结构化输出给的）换纯文本问一次：有的网关的结构化输出只给空壳、纯文本却能写——写出来了，这次起草
   后面都走纯文本。
+- 结构化输出回了一段说明文字（不是 JSON、也没停在额度上）：网关接受了结构化输出的参数却没照做（例如开了丢弃不认识
+  的参数），提示词里又没有格式说明，模型就写成了说明文字。这次起草后面改走纯文本，这一段换纯文本问一次。有思考
+  不等于额度用完：只有停在额度上、或者正文为空而有思考才算。
 - 被截断的 JSON：先把已经完整的表、列对象捡回来，只补剩下的。
-- 一段里缺了的表、列只补缺的，补一次。补过仍然没给的列算模型拿不准、留空，不算没写出来；整张表一项都没有才算。
+- 一段里缺了的表、列只补缺的，补一次。补问之后：模型列出了、字段留空的列是拿不准，不算没写出来；整列没列出来的
+  算没写出来（这张表是 partial，旧的模型起草项不删）；整张表还一项都没有的，照只给空壳处理（拆小、换纯文本）。
 - 结构化输出这个接口不支持（400 / 422 提到 response_format、json_schema、tool……，或者模型类不支持）：这次起草
   后面改走纯文本、从正文取 JSON（纯文本那条路另外说清 JSON 的格式）。
 - 服务方嫌额度太大：退回 MODEL_FALLBACK_MAX_TOKENS 重来，这次起草后面都用它（catalog.DraftModel.shrink）。
@@ -44,7 +48,7 @@ import json
 import logging
 import re
 import weakref
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -72,6 +76,7 @@ REASON_HOLLOW = "模型只给了空壳，没有写出可用的内容"
 REASON_TRUNCATED = "模型的输出被截断，这一段没写完"
 REASON_FORMAT = "模型的回复不是约定的格式"
 REASON_MISSING = "模型的回复里没有这张表"
+REASON_UNANSWERED = "模型的回复里漏了这些列，补问一次仍没有给出"
 REASON_TIMEOUT = "模型 {seconds} 秒内没有写完这一段"
 REASON_CALL = "调用模型出错：{line}"
 REASON_RETRIED = "（已重试 {n} 次）"
@@ -222,6 +227,28 @@ class _Reply:
     exhausted: bool = False
     #: 这一段最终没写出来的原因（重试用完、别的错误、不是约定的格式）
     error: str | None = None
+    #: 结构化输出回了一段说明文字（error 是「不是约定的格式」）：换纯文本还可能写出来
+    prose: bool = False
+
+
+@dataclass(frozen=True)
+class _Why:
+    """一部分没写出来的原因。base 给人看的原因；split 拆小重试过。"""
+
+    base: str
+    split: bool = False
+
+
+def _join(whys: Iterable[_Why]) -> str:
+    """几处没写出来的原因拼成一句：同样的原因只说一次（最多说两种），拆小重试过的在最后补一次（只看说出来的那几种）。
+    不然宽表的表级那段拆不开、列分段拆过时，同一句原因会说两遍。"""
+    whys = list(whys)
+    shown = list(dict.fromkeys(w.base for w in whys))[:2]
+    told = [w for w in whys if w.base in shown]
+    text = "；".join(shown)
+    if any(w.split for w in told):
+        text += REASON_SPLIT
+    return text
 
 
 class _Cut:
@@ -480,11 +507,13 @@ def _structured_reply(raw: Any, parsed: Any) -> _Reply:
         reply = _parse_text(text, cut)
         if reply is not None:
             return reply
-    if cut or _thought(raw):
-        return _Reply(exhausted=True)
+    if cut or (not texts and _thought(raw)):
+        return _Reply(exhausted=True)      # 停在额度上，或者正文为空而有思考（同 _text_reply）
     if not texts:
         return _Reply()                    # 什么都没写：按空壳处理
-    return _Reply(error=REASON_FORMAT)
+    # 写了字却不是约定的格式、也没停在额度上：网关接受了结构化输出的参数却没照做，模型写成了说明文字。有没有思考都
+    # 一样，不是额度的问题；换纯文本（另带格式说明）还能写出来
+    return _Reply(error=REASON_FORMAT, prose=True)
 
 
 def _text_reply(raw: Any) -> _Reply:
@@ -546,12 +575,16 @@ class _Table:
     got_table: bool = False
     got_columns: set[str] = field(default_factory=set)
     #: 没写出来的列（表级的项记在 _TABLE）→ 原因
-    failed: dict[str, str] = field(default_factory=dict)
+    failed: dict[str, _Why] = field(default_factory=dict)
     parts_done: int = 0
     finished: bool = False
 
     def whole(self, piece: _Piece) -> bool:
         return piece.table_level and len(piece.columns) == len(self.columns)
+
+    def has_any(self) -> bool:
+        """这张表已经拿到了模型起草的内容（表级的项或任何一列）。"""
+        return self.got_table or bool(self.got_columns)
 
 
 def _restrict(notes: Mapping[str, Any], piece: _Piece) -> dict[str, Any]:
@@ -665,10 +698,13 @@ class _Run:
                        last: bool = False) -> None:
         """问一段，拿到的并进各表；按失败原因拆开、补缺、记下没写出来的。
 
-        depth：已经拆了几层（截断后只补剩下的也算一层）。followup：这一段是在补缺（补过就不再补，空着的算模型拿不准）。
-        mode / last：拆不开的空壳换纯文本问的那一次（再空就记没写出来）。"""
+        depth：已经拆了几层（截断后只补剩下的也算一层）。followup：这一段是在补缺（补过就不再补，见 _after_followup）。
+        mode / last：换纯文本问的那一次——拆不开的空壳、结构化输出回了说明文字（再不行就记没写出来）。"""
         reply = await self._ask(pieces, mode)
         if reply.error is not None:
+            if reply.prose and not last:
+                await self._prose_to_text(pieces, depth, followup)
+                return
             self._fail(pieces, reply.error)
             return
         gains = self._take(pieces, reply.entries)
@@ -689,19 +725,45 @@ class _Run:
             else:
                 self._fail(rest, self._reason(kind, split=True))
             return
-        if not anything:
-            if followup:
-                return
+        if not anything and not followup:
             if last:
                 self._fail(pieces, lambda p: self._reason("hollow", split=depth > 0, piece=p))
                 return
             await self._split(pieces, depth, "hollow", followup)
             return
-        if followup:
-            return
         rest = self._remainder(pieces, gains, truncated=False)
-        if rest:
-            await self._segment(rest, depth, True)
+        if not rest:
+            return
+        if followup:
+            await self._after_followup(rest, depth, last=last)
+            return
+        await self._segment(rest, depth, True)
+
+    async def _after_followup(self, rest: list[_Piece], depth: int, *, last: bool) -> None:
+        """补问过仍然没给的部分（补过就不再补）。
+
+        - 这张表已经拿到了内容：没列出来的列记没写出来（这张表是 partial，旧的模型起草项不删）。模型列出了、字段留空
+          的列是拿不准，不在这里（_remainder 只把没列出来的列交过来）；
+        - 这张表到现在还一项都没有（回复里没有这张表、只给了空壳）：照第一次只给空壳的规矩，拆小再问，拆不开换纯文本
+          问一次。拆出来的半段是新的一段（还能补缺一次），层数照算。"""
+        given = [p for p in rest if self.tables[p.table].has_any()]
+        empty = [p for p in rest if not self.tables[p.table].has_any()]
+        if given:
+            self._fail(given, _Why(REASON_UNANSWERED))
+        if not empty:
+            return
+        if last:
+            self._fail(empty, lambda p: self._reason("hollow", split=depth > 0, piece=p))
+            return
+        await self._split(empty, depth, "hollow", False)
+
+    async def _prose_to_text(self, pieces: list[_Piece], depth: int, followup: bool) -> None:
+        """结构化输出回了一段说明文字：网关接受了结构化输出的参数却没照做。这次起草后面都走纯文本（另带格式说明），
+        这一段换纯文本问一次。纯文本额度用完了还能照常拆小（拆出来的半段也走纯文本，不再先问一遍结构化输出）。"""
+        if self.mode != "text":
+            self.mode = "text"
+            logger.info("起草数据目录：结构化输出回了说明文字，后面改走纯文本")
+        await self._segment(pieces, depth, followup, mode="text", last=True)
 
     async def _split(self, pieces: list[_Piece], depth: int, kind: str, followup: bool) -> None:
         halves = _halves(pieces) if depth < int(C.MODEL_SPLIT_DEPTH) else None
@@ -724,8 +786,9 @@ class _Run:
         self._fail(pieces, lambda p: self._reason(kind, split=depth > 0, piece=p))
 
     def _remainder(self, pieces: list[_Piece], gains: list[_Gain], *, truncated: bool) -> list[_Piece]:
-        """还没写出来的部分：回复里没有这张表、或者这张表一项可用内容都没有的整段重问；有内容的只问没给的列。
-        截断的回复里表级的项也没拿到的，表级的项一起重问（没截断时表级空着算模型拿不准）。"""
+        """还没写出来的部分：回复里没有这张表、或者这张表一项可用内容都没有的整段重问；有内容的只问没列出来的列
+        （列出了、字段留空的算模型拿不准，不再问）。截断的回复里表级的项也没拿到的，表级的项一起重问（没截断时表级
+        空着算模型拿不准：这张表在回复里，表级的字段留空和列的字段留空一样）。"""
         out: list[_Piece] = []
         for piece, gain in zip(pieces, gains):
             if not gain.named or not gain.items:
@@ -874,18 +937,20 @@ class _Run:
                 st.notes.setdefault(key, value)
                 st.got_table = True
 
-    def _fail(self, pieces: list[_Piece], reason: str | Callable[[_Piece], str]) -> None:
+    def _fail(self, pieces: list[_Piece], reason: _Why | str | Callable[[_Piece], _Why]) -> None:
         """这几段没写出来：还没拿到内容的列（和表级的项）记下原因。"""
         for piece in pieces:
             st = self.tables[piece.table]
             why = reason(piece) if callable(reason) else reason
+            if isinstance(why, str):
+                why = _Why(why)
             for col in piece.columns:
                 if col not in st.got_columns:
                     st.failed.setdefault(col, why)
             if piece.table_level and not st.got_table:
                 st.failed.setdefault(_TABLE, why)
 
-    def _reason(self, kind: str, *, split: bool, piece: _Piece | None = None) -> str:
+    def _reason(self, kind: str, *, split: bool, piece: _Piece | None = None) -> _Why:
         if kind == "exhausted":
             base = REASON_EXHAUSTED.format(budget=self._budget())
         elif kind == "truncated":
@@ -896,7 +961,7 @@ class _Run:
                 base = C.MODEL_EMPTY_REASON if st.named else REASON_MISSING
             else:
                 base = REASON_HOLLOW
-        return base + (REASON_SPLIT if split else "")
+        return _Why(base, split=split)
 
     # ---------------------------------------------------------------- 收尾
 
@@ -906,8 +971,8 @@ class _Run:
         failed_table = _TABLE in st.failed and not st.got_table
         total = len(st.parts) or 1
         if not items:
-            reasons = list(dict.fromkeys(st.failed.values()))
-            reason = "；".join(reasons[:2]) if reasons else (C.MODEL_EMPTY_REASON if st.named else REASON_MISSING)
+            whys = list(st.failed.values())
+            reason = _join(whys) if whys else (C.MODEL_EMPTY_REASON if st.named else REASON_MISSING)
             return ModelOutcome("failed", {}, 0, reason, total, st.parts_done)
         notes = copy.deepcopy(st.notes)
         if failed_cols or failed_table:
@@ -919,7 +984,7 @@ class _Run:
     def _partial_text(st: _Table, failed_cols: list[str], failed_table: bool) -> str:
         """只写出一部分时说清哪部分没写出来、为什么、怎么办。"""
         keys = ([_TABLE] if failed_table else []) + failed_cols
-        reason = "；".join(list(dict.fromkeys(st.failed[k] for k in keys))[:2])
+        reason = _join(st.failed[k] for k in keys)
         n = len(st.columns)
         if len(st.parts) > 1:
             part_of = {c: p.part for p in st.parts for c in p.columns}
@@ -1056,5 +1121,5 @@ class _Run:
 
 
 __all__ = ["BUDGET_WORDS", "Background", "Hooks", "ModelOutcome", "REASON_CALL", "REASON_EXHAUSTED", "REASON_FORMAT",
-           "REASON_HOLLOW", "REASON_MISSING", "REASON_RETRIED", "REASON_SPLIT", "REASON_TIMEOUT", "REASON_TRUNCATED",
-           "classify_failure", "model_gate", "parts_for", "run_model_draft"]
+           "REASON_HOLLOW", "REASON_MISSING", "REASON_RETRIED", "REASON_SPLIT", "REASON_TIMEOUT",
+           "REASON_TRUNCATED", "REASON_UNANSWERED", "classify_failure", "model_gate", "parts_for", "run_model_draft"]
