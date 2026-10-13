@@ -1421,6 +1421,9 @@ MODEL_FALLBACK_MAX_TOKENS = 8192
 #: 一段没写出来（额度用完、只给空壳）时拆成两半再问：最多拆几层、拆到最少几列为止
 MODEL_SPLIT_DEPTH = 3
 MODEL_SPLIT_MIN_COLUMNS = 5
+#: 止损：连续这么多段拆到底仍一项没写出来，这次起草后面的段不再拆小重试（一段 40 列拆到底要 15 次调用，模型明显
+#: 用不了时不该照这个倍数烧额度）
+MODEL_GIVE_UP_AFTER = 2
 #: 网络错误、429、5xx、超时最多重试几次，每次重试前等多久（秒，依次取用）
 MODEL_RETRIES = 2
 MODEL_RETRY_DELAYS_S = (10.0, 30.0)

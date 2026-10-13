@@ -594,7 +594,7 @@ async def test_tables_are_packed_up_to_40_columns_and_4_tables():
 
 
 # --------------------------------------------------------------------------
-# 报错去重
+# 报错去重、止损、几次起草轮流用模型
 # --------------------------------------------------------------------------
 
 
@@ -602,8 +602,9 @@ def _hollow(call: Call) -> Reply:
     return Reply(obj={"tables": [{"table": t} for t in call.asked]})
 
 
-async def test_the_same_reason_is_said_once_even_when_some_parts_were_split():
+async def test_the_same_reason_is_said_once_even_when_some_parts_were_split(monkeypatch):
     """宽表的表级那段拆不开、列分段拆过：原因只说一次，拆过的在最后补一句。"""
+    monkeypatch.setattr(catalog, "MODEL_GIVE_UP_AFTER", 99)
     model = Scripted(_hollow)
     got = await D.run_model_draft(model, _source({"wide45": _table(45)}), ["wide45"])
     o = got["wide45"]
@@ -618,6 +619,92 @@ def test_reasons_are_joined_by_their_base():
     assert D._join([W(exhausted, split=True), W(D.REASON_HOLLOW)]) == \
         f"{exhausted}；{D.REASON_HOLLOW}{D.REASON_SPLIT}"
     assert D._join([W("甲"), W("乙"), W("丙", split=True)]) == "甲；乙", "没说出来的原因不补后缀"
+    assert D._join([W(D.REASON_HOLLOW, halted=True), W(D.REASON_HOLLOW)]) == \
+        D.REASON_HOLLOW + D.REASON_HALTED.format(n=catalog.MODEL_GIVE_UP_AFTER)
+
+
+def _by_table(model: Scripted) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for call in model.calls:
+        for name in call.asked:
+            out[name] = out.get(name, 0) + 1
+    return out
+
+
+async def test_after_two_segments_in_a_row_come_to_nothing_the_rest_are_not_split(monkeypatch):
+    """模型明显用不了（思考总是吃满额度）：连续 2 段拆到底仍一项没写出，后面的段只问一次、不再拆，报错说明已停止拆小重试。
+    有一段写出来了就恢复拆小。一次只起草一段（并发 1），先后是确定的。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    assert catalog.MODEL_GIVE_UP_AFTER == 2
+    tables = {f"t{i}": _table(10) for i in range(1, 5)}
+    exhausted = Reply(text="", finish="length", thinking="……")
+
+    model = Scripted(lambda call: exhausted)
+    got = await D.run_model_draft(model, _source(tables), list(tables))
+    assert _by_table(model) == {"t1": 3, "t2": 3, "t3": 1, "t4": 1}
+    budget = D.REASON_EXHAUSTED.format(budget=32768)
+    assert got["t1"].error == budget + D.REASON_SPLIT
+    assert got["t3"].error == budget + "；模型连续 2 段都没写出来，已停止拆小重试，建议更换起草模型"
+
+    ok = answering(tables)
+    model = Scripted(lambda call: ok(call) if "t3" in call.asked else exhausted)
+    got = await D.run_model_draft(model, _source(tables), list(tables))
+    assert _by_table(model) == {"t1": 3, "t2": 3, "t3": 1, "t4": 3}, "t3 写出来了，t4 照常拆小"
+    assert got["t3"].status == "ok" and got["t4"].error == budget + D.REASON_SPLIT
+
+
+async def test_the_column_parts_of_a_wide_table_stop_splitting_too(monkeypatch):
+    """宽表的列分段一段一段排队起草（一段拆到底再起草下一段），止损在宽表里同样起作用。
+
+    95 列：表级那段拆不开（结构化、纯文本各一次）；第 2 段 40 列拆到底（15 次结构化 + 8 次纯文本）；这时已经连续 2 段
+    没写出来，第 3、4 段只问一次、换纯文本一次。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    model = Scripted(_hollow)
+    got = await D.run_model_draft(model, _source({"wide95": _table(95)}), ["wide95"])
+    assert len(model.calls) == 2 + 23 + 2 + 2
+    assert got["wide95"].error == (D.REASON_HOLLOW + D.REASON_SPLIT
+                                   + "；模型连续 2 段都没写出来，已停止拆小重试，建议更换起草模型")
+
+
+async def test_a_wide_table_that_never_comes_back_is_bounded_by_the_first_wave():
+    """默认并发（3 段同时起草）：294 列一直只给空壳，最多是表级那段 2 次、头 3 个列分段拆到底（各 23 次）、其余 5 段
+    各 2 次。以前所有列分段一下子都排上去、一层一层地拆，要 168 次。"""
+    model = Scripted(_hollow)
+    got = await D.run_model_draft(model, _source({"wide294": _table(294)}), ["wide294"])
+    assert got["wide294"].status == "failed"
+    assert len(model.calls) <= 2 + 3 * 23 + 5 * 2
+
+
+async def test_a_big_draft_does_not_hold_the_model_ahead_of_a_later_one(monkeypatch):
+    """全进程的调用名额先来先放：一次起草不把它的所有段一下子都排上去，后开始的那次起草（另一个数据源）能轮上。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    big = {f"a{i}": _table(4) for i in range(1, 5)}
+    small = {"b1": _table(4)}
+    order: list[str] = []
+    release = asyncio.Event()
+
+    def handler(tables: dict) -> Callable[[Call], Any]:
+        ok = answering(tables)
+
+        async def handle(call: Call) -> Reply:
+            order.append(next(iter(call.asked)))
+            if len(order) == 1:
+                await release.wait()
+            return ok(call)
+        return handle
+
+    first = asyncio.create_task(D.run_model_draft(Scripted(handler(big)), _source(big), list(big)))
+    while not order:
+        await asyncio.sleep(0)
+    second = asyncio.create_task(D.run_model_draft(Scripted(handler(small)), _source(small), ["b1"]))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    release.set()
+    got_big, got_small = await asyncio.gather(first, second)
+    assert set(_status(got_big).values()) == {"ok"} and _status(got_small) == {"b1": "ok"}
+    assert order == ["a1", "b1", "a2", "a3", "a4"]
 
 
 # --------------------------------------------------------------------------
