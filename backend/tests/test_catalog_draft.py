@@ -67,6 +67,48 @@ def test_long_table_comment_goes_to_description():
     assert draft.notes["description"]["value"].startswith("游客每次检票入园")
 
 
+@pytest.mark.parametrize("comment, role", [
+    ("实收金额", "label"),
+    ("Paid amount", "label"),                          # 带空格的英文短语照旧当名字
+    ("状态：1 表示有效，0 表示作废", "note"),
+    ("paid_amt", None), ("PAID-AMT", None), ("Paid Amt", None),   # 和列名相同（忽略大小写、下划线、连字符、空白）
+    ("member_level_code", None), ("ord.status", None), ("GMV", None), ("v2", None),   # 标识符写法
+    ("member-level", "label"),                         # 带连字符、和名字不同：不是标识符写法
+])
+def test_comment_role_by_text_and_name(comment, role):
+    assert catalog.comment_role(comment, "paid_amt") == role
+
+
+def test_a_comment_that_is_just_the_name_or_an_identifier_is_not_a_label():
+    """注释就是表名本身（列注释就是列名）、或者是标识符写法：不当中文名，也不当说明（不然它比模型起草可信，模型起草的
+    中文名、含义永远进不了目录）；交给模型的表结构里照旧有这条注释。"""
+    src = _source({"member_card": _table(
+        _col("id"), _col("card_no", "TEXT", comment="CARD-NO"), _col("open_dt", "TEXT", comment="open_date"),
+        _col("bal", "REAL", comment="卡内余额"), comment="MEMBER CARD")})
+    draft = catalog.draft_structure(src, "member_card")
+    assert "label" not in draft.notes and "description" not in draft.notes
+    assert draft.notes["columns"] == {"bal": {"label": make_item("卡内余额", "comment")}}
+    assert "comment" in draft.covered
+    # schema 前缀不算：注释写的是不带前缀的表名，同样不当中文名
+    src = _source({"core.member_card": _table(_col("id"), comment="MEMBER_CARD")})
+    assert "label" not in catalog.draft_structure(src, "core.member_card").notes
+
+
+async def test_a_redraft_drops_an_old_label_that_was_just_the_name_and_takes_the_model_one():
+    """以前按老规矩把「注释就是表名」记成了中文名（注释的级别高于模型起草）：以后起草时这条注释不再当中文名，旧的那一项
+    随这一轮的注释一起删掉，模型起草的中文名就能进目录。已有目录不另做迁移，起草到这张表时才变。"""
+    tables = {"member_card": _table(_col("id"), _col("bal", "REAL"), comment="MEMBER_CARD", fks=[])}
+    row = await _db_source(tables)
+    async with SessionLocal() as session:
+        await catalog.write_entry(session, row.id, "member_card", {"label": make_item("MEMBER_CARD", "comment")},
+                                  if_version=0, actor=None)
+        report = await catalog.draft_catalog(session, row, tables=["member_card"], use_model=True,
+                                             model=FakeModel({"member_card": {"label": "会员卡"}}))
+        entry = await catalog.read_entry(session, row.id, "member_card")
+    assert entry.notes["label"]["value"] == "会员卡" and entry.notes["label"]["source"] == "llm"
+    assert (report.tables[0].added, report.tables[0].removed) == (1, 1)
+
+
 @pytest.mark.parametrize("kw", [{"origin": "upload"}, {"import_mode": "recipe"}])
 def test_imported_table_comments_are_not_copied(kw):
     """导入表格的说明是按核对结果生成的（recipe_notes），数据目录不重复它们。"""
