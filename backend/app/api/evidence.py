@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import csv
 import functools
 import io
@@ -124,6 +125,7 @@ from app.engine.evidence import (
     sql_tables,
     table_fields,
     uncited_claims,
+    withhold_metrics,
 )
 from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candidates, outdated
 from app.engine.merge_query import MERGE_SOURCE, trace_cell
@@ -2671,6 +2673,48 @@ def _export_cite_key(seg: dict[str, Any]) -> tuple | None:
             loc.get("metric"), loc.get("row"), loc.get("column"), loc.get("field"), seg.get("issue"))
 
 
+async def _export_withheld(sealed: _Sealed, doc: dict[str, Any]) -> frozenset[str]:
+    """报告导出用：正文引用了、证据目录里却还带着原值的取自遮罩列的指标（目录里的别名）。升级前的报告撰写节点写的老文档
+    （或者写完之后数据源才设的遮罩）才有；现在写的，这类指标在目录里已经是「已遮罩」。和可验证报告认老文档同一个判断
+    （certain_masks + bundle/build.py 的 withheld_metric_aliases：只按确定取自遮罩列的认，值碰巧等于遮罩值的普通指标、SQL
+    认不准时的普通金额照给）。导出的文件不带证据目录，只看正文引用了的那几个；一个都没有的不去认遮罩。"""
+    from app.bundle.build import withheld_metric_aliases
+    from app.core.artifact_store import read_bytes
+
+    catalog = doc.get("catalog") if isinstance(doc.get("catalog"), dict) else {}
+    cited = {str(seg["cite"]["alias"]) for _, unit in iter_units(doc) for seg in unit.get("segments") or []
+             if isinstance(seg, dict) and isinstance(seg.get("cite"), dict) and seg["cite"].get("kind") == "metric"
+             and seg["cite"].get("alias")}
+    entries = {alias: catalog[alias] for alias in sorted(cited) if isinstance(catalog.get(alias), dict)
+               and catalog[alias].get("kind") == "metric" and not catalog[alias].get("masked")
+               and catalog[alias].get("value") is not None}
+    if not entries:
+        return frozenset()
+    masks = await _mask_fingerprint()
+    sure, secrets = await certain_masks(sealed, _Masks(sealed))
+    # 读工件、解析口径卡是同步的活，不该占着事件循环（同可验证报告）
+    return await asyncio.to_thread(lambda: withheld_metric_aliases(
+        {"catalog": entries}, read=lambda artifact: read_bytes(artifact, verify=False), events=sealed.events,
+        source_masks=masks, sure_columns=sure, sure_secrets=secrets))
+
+
+def _withhold_in_doc(doc: dict[str, Any], aliases: frozenset[str]) -> dict[str, Any]:
+    """老文档里值不该给的那几个指标照现在的报告撰写节点的写法改写，交回副本（原文档不动）：目录条目的值、渲染写「已遮罩」、
+    记 masked（engine/evidence.withhold_metrics），引用它们的片段写「已遮罩」。出处链（_metric_chain）据此按目录里的那个字
+    比渲染、值也写「已遮罩」，正文和点开的面板里都不出现原值。"""
+    out = copy.deepcopy(doc)
+    out["catalog"] = withhold_metrics(out.get("catalog") or {}, sorted(aliases), MASKED)
+    for _, unit in iter_units(out):
+        for seg in unit.get("segments") or []:
+            cite = seg.get("cite") if isinstance(seg, dict) else None
+            if isinstance(cite, dict) and cite.get("kind") == "metric" and cite.get("alias") in aliases:
+                seg["text"] = MASKED
+                for key in ("value", "rendered"):
+                    if key in cite:
+                        cite[key] = MASKED
+    return out
+
+
 @router.get("/{run_id}/report.html")
 async def export_report_html(run_id: str, report: str | None = None) -> Response:
     """把一次运行的报告导出成一个自包含的 HTML 文件（app/report_export）。
@@ -2700,6 +2744,10 @@ async def export_report_html(run_id: str, report: str | None = None) -> Response
     if chosen.doc is None:
         raise CodedHTTPException(404, "无法读取报告文档", DOC_MISSING)
     doc = chosen.doc
+    # 升级前写的老文档：证据目录里还带着取自遮罩列的指标的原值，正文引用了的话正文里也是。可验证报告把这样的文档整份只给
+    # 哈希；这份文件同样会拿给系统外的人，按同一个判断把引用了它们的片段照现在的写法换成「已遮罩」
+    if withheld := await _export_withheld(sealed, doc):
+        doc = _withhold_in_doc(doc, withheld)
     nodes: dict[str, dict[str, str]] = {}
     for item in sealed.graph.get("nodes") or []:
         if isinstance(item, dict) and item.get("id"):

@@ -409,13 +409,17 @@ class _Store:
         目录里的口径卡读不出来或找不到这个指标的，按值认：值就是这次运行查到过的遮罩值才算（sure_seen）。按解析出来的内容认，
         不看哈希（同 card_masked）：服务端的文件被改过，嵌进页面的照样是这份原字节。"""
         if doc_id not in self._docs:
-            doc = self.content(doc_id)
-            catalog = doc.get("catalog") if isinstance(doc, dict) else None
-            self._docs[doc_id] = isinstance(catalog, dict) and any(
-                self._carries_withheld(entry) for entry in catalog.values()
-                if isinstance(entry, dict) and entry.get("kind") == "metric" and not entry.get("masked")
-                and entry.get("value") is not None)
+            self._docs[doc_id] = bool(self.withheld_aliases(self.content(doc_id)))
         return self._docs[doc_id]
+
+    def withheld_aliases(self, doc: Any) -> frozenset[str]:
+        """这份文档的证据目录里还带着原值、值却不给的那几个指标（目录里的别名），认法见 doc_withheld。"""
+        catalog = doc.get("catalog") if isinstance(doc, dict) else None
+        if not isinstance(catalog, dict):
+            return frozenset()
+        return frozenset(str(alias) for alias, entry in catalog.items()
+                         if isinstance(entry, dict) and entry.get("kind") == "metric" and not entry.get("masked")
+                         and entry.get("value") is not None and self._carries_withheld(entry))
 
     def _carries_withheld(self, entry: dict[str, Any]) -> bool:
         artifact = entry.get("artifact")
@@ -1035,6 +1039,18 @@ def _card_input_queries(card: Any) -> list[tuple[str, str | None]]:
             owner = item.get("node_id")
             out.append((artifact, str(owner) if owner else None))
     return out
+
+
+def withheld_metric_aliases(doc: Any, *, read: Reader, events: Sequence[tuple[int, str, str | None, Any]] = (),
+                            source_masks: Mapping[str, Any] | None = None,
+                            sure_columns: Mapping[str, Iterable[str]] | None = None,
+                            sure_secrets: Any = None) -> frozenset[str]:
+    """报告文档的证据目录里还带着原值、值却不该给的指标（目录里的别名）：可验证报告据此把老文档整份只给哈希
+    （_Store.doc_withheld），报告导出成 HTML（api/evidence.export_report_html）据此把引用它们的片段写成「已遮罩」——两样
+    都要拿给系统外的人，同一个判断。参数同 build_bundle：events 是封存范围内的事件，sure_columns、sure_secrets 由调用方按
+    api/evidence.py 的 certain_masks 认好交进来。"""
+    store = _Store(read, source_masks or {}, events, sure_columns=sure_columns, sure_secrets=sure_secrets)
+    return store.withheld_aliases(doc)
 
 
 class _Artifacts:
