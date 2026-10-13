@@ -144,7 +144,8 @@ def _summary_row(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogE
         "version": entry.version if entry else 0,
         "updated_at": _iso(entry.updated_at) if entry else None,
         "updated_by": entry.updated_by if entry else None,
-        # 这张表最近一次起草任务里的那一项：{status, job_id, finished_at, error, model_error}，没起草过是 null
+        # 这张表最近一次起草任务里的那一项：{status, job_id, finished_at, error, model_error, blank_columns}，没起草过
+        # 是 null
         "last_draft": last_draft,
     }
 

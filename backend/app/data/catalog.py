@@ -1463,12 +1463,23 @@ def draft_structure(source: Any, table: str) -> TableDraft:
 
 #: 每次调用最多几张表、合计多少列（data/catalog_draft.py 按它分段）。实测每列约 50 个输出 token（不算思考），
 #: 会思考的模型思考也算在输出额度里：一段太大，想完就没额度写正文。列数超过 MODEL_BATCH_COLUMNS 的宽表拆成
-#: 「表级一段 + 列分段」，每个列分段也不超过这个列数
+#: 「表级一段 + 列分段」，列分段数是列数除以它向上取整，各段列数平均（相差不超过 1），不留很小的尾段
 MODEL_BATCH_TABLES = 4
 MODEL_BATCH_COLUMNS = 40
+#: 一次起草里额度用完或超时累计这么多次，之后新开始的段列数上限减半（MODEL_BATCH_COLUMNS → 一半 → …），
+#: 最低 MODEL_MIN_PART_COLUMNS 列
+MODEL_SHRINK_AFTER = 2
+MODEL_MIN_PART_COLUMNS = 10
+#: 一段（连同它拆出来的、补问的、重试的）最多调用几次模型，到了次数还没写完的记没写出来
+MODEL_PART_MAX_CALLS = 8
+#: 提醒：最近 MODEL_NOTICE_WINDOW 次调用里有 MODEL_NOTICE_ON 次以上没写出来时提醒换模型；之后少于 MODEL_NOTICE_OFF
+#: 次时清掉
+MODEL_NOTICE_WINDOW = 6
+MODEL_NOTICE_ON = 4
+MODEL_NOTICE_OFF = 2
 #: 全进程同时进行的模型调用最多几个（所有起草任务、同步起草共用）
 MODEL_CONCURRENCY = 3
-#: 单次调用最多等多久（秒）。会思考的模型想得久，一段 40 列常常要几分钟
+#: 单次调用最多等多久（秒）。会思考的模型想得久，一段 40 列常常要几分钟；超时了拆小再问（同额度用完）
 MODEL_TIMEOUT_S = 420
 #: 输出额度。会思考的模型（经 OpenAI 兼容网关的推理模型等）思考也算在里面：8192 时上百列的表常常想完就没额度
 #: 写正文。保留思考（不关），加大额度；服务方嫌额度太大时退回 MODEL_FALLBACK_MAX_TOKENS（同 copilot、recipe_ai）
@@ -1477,10 +1488,10 @@ MODEL_FALLBACK_MAX_TOKENS = 8192
 #: 一段没写出来（额度用完、只给空壳）时拆成两半再问：最多拆几层、拆到最少几列为止
 MODEL_SPLIT_DEPTH = 3
 MODEL_SPLIT_MIN_COLUMNS = 5
-#: 止损：连续这么多段拆到底仍一项没写出来，这次起草后面的段不再拆小重试（一段 40 列拆到底要 15 次调用，模型明显
-#: 用不了时不该照这个倍数烧额度）
+#: 止损：连续这么多段拆到底仍一项没写出来，这次起草后面的段不再拆小重试（模型明显用不了时不该一段一段拆到底烧额度；
+#: 每段另有 MODEL_PART_MAX_CALLS 次封顶）
 MODEL_GIVE_UP_AFTER = 2
-#: 网络错误、429、5xx、超时最多重试几次，每次重试前等多久（秒，依次取用）
+#: 网络错误、429、5xx 最多重试几次，每次重试前等多久（秒，依次取用）。超时不原样重试，当作这一段太大、拆小再问
 MODEL_RETRIES = 2
 MODEL_RETRY_DELAYS_S = (10.0, 30.0)
 #: 不指定表时起草使用次数最多的前几张
@@ -1794,6 +1805,8 @@ class TableDraftResult:
     status: str = "ok"
     #: 模型分几段起草（不用模型时为 None）
     parts_total: int | None = None
+    #: 模型拿不准、留空了的列（catalog_draft.ModelOutcome.blank，按表结构的顺序）；表的状态不因此变
+    blank: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1837,6 +1850,7 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
         result.model_error = modeled.error
         if modeled.items:
             result.model_items = modeled.items
+            result.blank = list(getattr(modeled, "blank", None) or [])
             model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"}) if modeled.status == "ok"
                                      else frozenset())
     for _attempt in range(3):
@@ -2298,8 +2312,10 @@ __all__ = [
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftModel", "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL",
     "MEASURE_LABEL", "MODEL_BATCH_COLUMNS", "MODEL_BATCH_TABLES", "MODEL_CONCURRENCY", "MODEL_EMPTY_REASON",
-    "MODEL_FALLBACK_MAX_TOKENS", "MODEL_MAX_TOKENS", "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SPLIT_DEPTH",
-    "MODEL_SPLIT_MIN_COLUMNS", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH", "PATCH_MAX_CHANGES",
+    "MODEL_FALLBACK_MAX_TOKENS", "MODEL_MAX_TOKENS", "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON",
+    "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS", "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER",
+    "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
+    "PATCH_MAX_CHANGES",
     "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE", "WRITE_CONFLICT_ERROR", "default_tables",
     "missing_table_error", "pick_tables", "write_draft",
     "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL",

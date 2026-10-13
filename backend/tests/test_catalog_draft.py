@@ -324,7 +324,7 @@ async def test_hollow_structured_output_retries_with_text():
     got = await catalog.draft_with_model(model, _source(_scenic_tables()), ["visits"])
     assert model.modes == ["structured", "text", "text"]
     assert got["visits"].notes == {"label": make_item("入园记录", "llm"), "kind": make_item("fact", "llm")}
-    assert got["visits"].covered == frozenset() and "有 5 列没写出来" in got["visits"].error
+    assert got["visits"].covered == frozenset() and "有 5 列（id 到 status）没写出来" in got["visits"].error
 
 
 async def test_hollow_structured_then_single_text_object():

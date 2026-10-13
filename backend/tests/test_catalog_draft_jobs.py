@@ -6,7 +6,9 @@
 - 停止：排队的直接 cancelled；进行中的停掉正在进行的模型调用，没写完的表记 cancelled，已经写进目录的不回滚；已结束的 409
 - 服务启动时把没结束的任务标成 interrupted（没结束的表记 cancelled、写明服务重启），不自动续跑；关停时同样
 - 重试：只含原任务里 failed、partial、cancelled 的表，本次说明沿用、起草要求取数据源当前的；没有可重试的 422
-- 目录清单：每行 last_draft，顶层 guidance、active_job
+- 目录清单：每行 last_draft（带模型留空的列数），顶层 guidance、active_job
+- 重新起草时模型这次留空、给的值没通过校验：以前起草好的模型项留着，删除只在列已经不在表结构里时才有
+- 用量记超时次数、没写出来的调用次数；任务记当前的列数上限、提醒（最近 6 次调用 4 次没写出来）；逐表记模型留空的列
 - 起草要求存在数据源 options 里（上传表格的源存在它自己那一行），数据源接口不显示、整份回写 options 时留着，拼连接串时摘掉
 
 表名、列名、说明文字都是虚构的。
@@ -261,9 +263,134 @@ async def test_a_followup_that_comes_back_empty_keeps_the_earlier_model_items(cl
     task = job["tasks"][0]
     assert model.calls == 2
     assert job["status"] == "partial" and task["status"] == "partial" and task["removed"] == 0
-    assert "有 4 列没写出来" in task["model_error"] and "可以只重试这张表" in task["model_error"]
+    assert "有 4 列（c05 到 c08）没写出来" in task["model_error"] and "可以只重试这张表" in task["model_error"]
     after = (await client.get(f"{_base(sid)}/tickets")).json()["notes"]["columns"]
     assert {c for c, items in after.items() if "label" in items} == {f"c{i:02d}" for i in range(1, 9)}
+
+
+def _tickets(n: int = 6) -> dict:
+    return {"tickets": {"qualified": "tickets", "columns": [_col(f"c{i:02d}") for i in range(1, n + 1)],
+                        "primary_key": ["c01"], "comment": None, "is_view": False, "foreign_keys": []}}
+
+
+async def _draft(client, sid: str, monkeypatch, model, tables: list[str]) -> dict:
+    use(monkeypatch, model)
+    r = await client.post(f"{_base(sid)}/draft-jobs", json={"tables": tables, "use_model": True})
+    assert r.status_code == 202, r.text
+    await finished(r.json()["job"]["id"])
+    return await get_job(client, sid, r.json()["job"]["id"])
+
+
+async def test_a_redraft_keeps_what_the_model_left_blank_this_time(client, monkeypatch):
+    """重新起草（比如补了起草要求再起草一次）时模型这次留空、或者给的值没通过校验：以前起草好的模型项留着，不算删除；
+    给了合格新值的才替换。以前整库重跑一次删掉几百项，表仍记「已完成」。"""
+    sid = await _source(_tickets())
+    full = {"label": "门票", "kind": "fact",
+            "columns": [{"name": f"c{i:02d}", "label": f"第{i}列", "meaning": f"第{i}列的含义"} for i in range(1, 7)]}
+    first = await _draft(client, sid, monkeypatch, FakeModel({"tickets": full}), ["tickets"])
+    assert first["tasks"][0]["status"] == "ok" and first["blank_columns"] == 0
+    before = (await client.get(f"{_base(sid)}/tickets")).json()["notes"]
+
+    # 这一次：表的中文名换了；c03 的中文名像公式（校验丢掉）、含义换了；c04 只给了中文名；其余列列出了但都留空
+    again = {"label": "门票明细", "columns": [{"name": "c03", "label": "=c01+c02", "meaning": "新的含义"},
+                                           {"name": "c04", "label": "第4列"}]}
+    second = await _draft(client, sid, monkeypatch, FakeModel({"tickets": again}), ["tickets"])
+    task = second["tasks"][0]
+    assert task["status"] == "ok" and task["removed"] == 0 and second["removed"] == 0
+    assert (task["added"], task["updated"]) == (0, 2)
+    after = (await client.get(f"{_base(sid)}/tickets")).json()["notes"]
+    assert after["label"]["value"] == "门票明细" and after["kind"] == before["kind"]
+    assert after["columns"]["c03"]["label"] == before["columns"]["c03"]["label"]
+    assert after["columns"]["c03"]["meaning"]["value"] == "新的含义"
+    for col in ("c01", "c02", "c05", "c06"):
+        assert after["columns"][col] == before["columns"][col], col
+    # 模型这次留空的列照实记下（表的状态不因此变）
+    assert task["blank_columns"] == 4 and task["blank_sample"] == ["c01", "c02", "c05", "c06"]
+
+
+async def test_model_items_of_a_column_gone_from_the_schema_are_removed(client, monkeypatch):
+    sid = await _source(_tickets())
+    full = {"label": "门票", "columns": [{"name": f"c{i:02d}", "label": f"第{i}列"} for i in range(1, 7)]}
+    await _draft(client, sid, monkeypatch, FakeModel({"tickets": full}), ["tickets"])
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, sid)
+        row.schema_cache = {"tables": _tickets(5)}                  # 重新探查过：c06 已经没有了
+        await session.commit()
+    job = await _draft(client, sid, monkeypatch, FakeModel({"tickets": {"label": "门票"}}), ["tickets"])
+    assert job["tasks"][0]["removed"] == 1
+    after = (await client.get(f"{_base(sid)}/tickets")).json()["notes"]
+    assert set(after["columns"]) == {"c01", "c02", "c03", "c04", "c05"}
+
+
+async def test_usage_counts_timeouts_and_failed_calls(client, monkeypatch):
+    """超时的调用拆小再问，用量里记超时几次、没写出来几次（超时的调用拿不到用量，token 记 0）；额度用完或超时累计 2 次，
+    新开始的段列数上限减半，任务上记着当前的上限。"""
+    monkeypatch.setattr(catalog, "MODEL_TIMEOUT_S", 0.05)
+    sid = await _source(_tickets(24))
+    replies = {"tickets": {"label": "门票", "columns": [{"name": f"c{i:02d}", "label": f"第{i}列"}
+                                                       for i in range(1, 25)]}}
+    model = FakeModel(replies, hang=2)
+    job = await _draft(client, sid, monkeypatch, model, ["tickets"])
+    assert job["status"] == "succeeded" and job["tasks"][0]["status"] == "ok"
+    assert job["usage"] == {"calls": 5, "input_tokens": 0, "output_tokens": 0, "timeouts": 2, "failed_calls": 2}
+    assert job["part_columns"] == 20 and job["notice"] is None
+    # 24 列整张问超时 → 前 12 列（带表级的项）超时 → 拆成 6、6 → 后 12 列
+    assert [len(requested(c)["tickets"][1] or []) for c in model.calls] == [0, 12, 6, 6, 12]
+
+    plain = await _draft(client, sid, monkeypatch, FakeModel(replies), ["tickets"])
+    assert plain["part_columns"] == 40 and plain["usage"]["timeouts"] == plain["usage"]["failed_calls"] == 0
+
+
+async def test_the_notice_is_kept_on_the_job(client, monkeypatch):
+    """最近 6 次调用有 4 次以上没写出来：任务上写一句提醒（次数、原因、建议换起草模型）；不用模型的任务没有。"""
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    tables = {f"t{i}": {"qualified": f"t{i}", "columns": [_col("id"), _col("v")], "primary_key": ["id"],
+                        "comment": None, "is_view": False, "foreign_keys": []} for i in range(1, 6)}
+    sid = await _source(tables)
+    replies = {name: {"label": f"表{name}"} for name in tables}
+    job = await _draft(client, sid, monkeypatch, FakeModel(replies, fail={"t1", "t2", "t3", "t4"}), list(tables))
+    assert job["usage"]["calls"] == 5 and job["usage"]["failed_calls"] == 4
+    assert job["notice"] == ("最近 5 次调用有 4 次没写出来（出错 4 次）。可以在「设置 → 偏好设置」的「起草模型」换一个模型、"
+                             "减少这次起草的表，或者停止这次起草")
+    plain = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["t1"]})).json()["job"]
+    await finished(plain["id"])
+    plain = await get_job(client, sid, plain["id"])
+    assert plain["notice"] is None and plain["part_columns"] is None and plain["blank_columns"] == 0
+
+
+async def test_blank_columns_reach_the_task_the_job_and_the_list(client, monkeypatch):
+    """模型列出了、中文名和含义都没给的列：逐表记列数和最多 5 个列名，任务上是合计，目录清单的 last_draft 也带列数。"""
+    tables = {**_tickets(8), "gates": _tables()["gates"]}
+    sid = await _source(tables)
+    replies = {"tickets": {"label": "门票", "columns": [{"name": "c01", "label": "编号"}]},
+               "gates": {"label": "闸口", "columns": [{"name": "id", "label": "编号"}]}}
+    job = await _draft(client, sid, monkeypatch, FakeModel(replies), ["tickets", "gates"])
+    by = {t["table_name"]: t for t in job["tasks"]}
+    assert by["tickets"]["status"] == "ok" and by["tickets"]["blank_columns"] == 7
+    assert by["tickets"]["blank_sample"] == ["c02", "c03", "c04", "c05", "c06"]
+    assert by["gates"]["blank_columns"] == 1 and by["gates"]["blank_sample"] == ["gate_code"]
+    assert job["blank_columns"] == 8
+    rows = {r["table_name"]: r for r in (await client.get(_base(sid))).json()["tables"]}
+    assert rows["tickets"]["last_draft"]["blank_columns"] == 7 and rows["gates"]["last_draft"]["blank_columns"] == 1
+
+
+def test_old_job_tables_get_the_new_columns():
+    """升级前建的起草任务表：新列补上，存量行的计数是 0、提醒和列数上限为空。"""
+    from sqlalchemy import create_engine, text
+
+    from app.db.base import _migrate
+
+    db = create_engine("sqlite://")
+    with db.begin() as conn:
+        conn.execute(text("CREATE TABLE catalog_draft_jobs (id VARCHAR(32) PRIMARY KEY, calls INTEGER)"))
+        conn.execute(text("CREATE TABLE catalog_draft_tasks (id VARCHAR(32) PRIMARY KEY, removed INTEGER)"))
+        conn.execute(text("INSERT INTO catalog_draft_jobs (id, calls) VALUES ('j1', 3)"))
+        conn.execute(text("INSERT INTO catalog_draft_tasks (id, removed) VALUES ('t1', 0)"))
+        _migrate(conn)
+        _migrate(conn)
+        assert conn.execute(text("SELECT timeouts, failed_calls, part_columns, notice FROM catalog_draft_jobs")) \
+            .one() == (0, 0, None, None)
+        assert conn.execute(text("SELECT blank_columns, blank_sample FROM catalog_draft_tasks")).one() == (0, None)
 
 
 async def test_a_job_that_cannot_start_is_failed_with_the_reason(client, monkeypatch):

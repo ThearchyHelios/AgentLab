@@ -6,7 +6,11 @@
 - 被截断的 JSON：已经完整的表、列对象捡回来，只补剩下的；
 - 只回一部分表：只补缺的，补一次；
 - 服务方嫌额度太大 → 退回 8192，后面都用它；结构化输出不支持 → 后面改走纯文本；
-- 网络错误、5xx、超时 → 退避重试，最多 2 次，报错写明重试过几次。
+- 网络错误、5xx → 退避重试，最多 2 次，报错写明重试过几次；超时当作这一段太大，拆小再问，不原样重试。
+
+验收后修正的几条（用假模型复现）：宽表的列分段均分、没有很小的尾段；拆不开的空壳纯文本也再问一次；额度用完或超时
+累计 2 次后新开始的段列数减半；一段最多调用 8 次；最近 6 次调用 4 次没写出来时提醒、少于 2 次时清掉；记超时和没写
+出来的调用；模型留空的列计数；窄表不被宽表的列分段插队；原因写清是哪几段、哪几列。
 
 表名、列名、说明文字都是虚构的。
 """
@@ -163,6 +167,34 @@ def _status(outcomes: dict) -> dict:
     return {t: o.status for t, o in outcomes.items()}
 
 
+def _hollow(call: Call) -> Reply:
+    return Reply(obj={"tables": [{"table": t} for t in call.asked]})
+
+
+def _exhausted(seg: str = "这一段", budget: int = 32768) -> str:
+    return D.REASON_EXHAUSTED.format(budget=budget, seg=seg)
+
+
+EXHAUSTED = Reply(text="", finish="length", thinking="……")
+
+
+class Reports:
+    """进度回调 call_done 收到的每次调用的结果。"""
+
+    def __init__(self) -> None:
+        self.items: list[D.CallReport] = []
+
+    async def __call__(self, report: D.CallReport) -> None:
+        self.items.append(report)
+
+    def hooks(self) -> D.Hooks:
+        return D.Hooks(call_done=self)
+
+    @property
+    def failures(self) -> list[str | None]:
+        return [r.failure for r in self.items]
+
+
 # --------------------------------------------------------------------------
 # 思考用完额度、空壳：拆开再问
 # --------------------------------------------------------------------------
@@ -220,9 +252,10 @@ async def test_hollow_shell_splits_the_pack_by_table():
     assert all(c.asked[t][0] == "full" for c in model.calls[1:] for t in c.asked)
 
 
-async def test_splitting_stops_at_three_levels_and_five_columns():
+async def test_splitting_stops_at_three_levels_and_five_columns(monkeypatch):
+    monkeypatch.setattr(catalog, "MODEL_PART_MAX_CALLS", 99)
     tables = {"wide40": _table(40)}
-    model = Scripted(lambda call: Reply(text="", finish="length", thinking="……"))
+    model = Scripted(lambda call: EXHAUSTED)
     got = await D.run_model_draft(model, _source(tables), ["wide40"])
     o = got["wide40"]
     assert len(model.calls) == 1 + 2 + 4 + 8, "40 → 20 → 10 → 5 列，最多拆三层"
@@ -234,6 +267,30 @@ async def test_splitting_stops_at_three_levels_and_five_columns():
     got = await D.run_model_draft(small, _source({"t9": _table(9)}), ["t9"])
     assert len(small.calls) == 1, "不到 10 列拆不出两段 5 列"
     assert got["t9"].error == "模型的思考和输出用完了额度（32768 个 token），这一段没写出来"
+
+
+async def test_one_part_makes_at_most_eight_calls(monkeypatch):
+    """一段（连同它拆出来的、补问的、重试的）最多调用 8 次：40 列一直用完额度，拆到第 8 次就停，剩下没问的记没写出来、
+    原因写清。以前一段 40 列拆到底要 15 次。"""
+    monkeypatch.setattr(catalog, "MODEL_GIVE_UP_AFTER", 99)
+    assert catalog.MODEL_PART_MAX_CALLS == 8
+    model = Scripted(lambda call: EXHAUSTED)
+    got = await D.run_model_draft(model, _source({"t40": _table(40)}), ["t40"])
+    assert len(model.calls) == 8
+    o = got["t40"]
+    assert o.status == "failed"
+    assert o.error == (_exhausted() + "；每段最多调用 8 次模型，这一段到了次数仍没写完，已停止重试"
+                       + D.REASON_SPLIT)
+
+    # 网络错误的重试也算在这 8 次里
+    def flaky(call: Call) -> Reply:
+        raise ConnectError("All connection attempts failed")
+
+    monkeypatch.setattr(catalog, "MODEL_PART_MAX_CALLS", 2)
+    model = Scripted(flaky)
+    got = await D.run_model_draft(model, _source({"t4": _table(4)}), ["t4"])
+    assert len(model.calls) == 2
+    assert got["t4"].error == "每段最多调用 2 次模型，这一段到了次数仍没写完，已停止重试"
 
 
 async def test_an_unsplittable_hollow_shell_tries_text_once_then_stays_on_text():
@@ -253,6 +310,31 @@ async def test_an_unsplittable_hollow_shell_tries_text_once_then_stays_on_text()
     assert got["wide45"].status == "ok" and len(got["wide45"].notes["columns"]) == 45
     assert [c.mode for c in model.calls] == ["structured", "text", "text", "text"]
     assert catalog.CATALOG_DRAFT_TEXT_PROMPT in model.calls[1].text, "纯文本那条路要说清 JSON 的格式"
+
+
+def _text_only(handle_text: Callable[[Call], Reply]) -> Callable[[Call], Reply]:
+    """结构化输出不支持（这次起草一开始就改走纯文本），纯文本交给 handle_text。"""
+    def handle(call: Call) -> Reply:
+        if call.mode == "structured":
+            raise _Status(400, "This response_format type is unavailable now")
+        return handle_text(call)
+    return handle
+
+
+async def test_an_unsplittable_hollow_shell_is_asked_again_in_text_mode_too():
+    """已经走纯文本时，拆不开的段（不到 10 列）只给空壳：原样再问一次，写出来就用；仍是空壳才记没写出来。
+    以前纯文本模式下不补问，整张表直接记没写出来。"""
+    tables = {"t8": _table(8)}
+    ok = answering(tables)
+    model = Scripted(_text_only(lambda call: _hollow(call) if call.n == 1 else ok(call)))
+    got = await D.run_model_draft(model, _source(tables), ["t8"])
+    assert [c.mode for c in model.calls] == ["structured", "text", "text"]
+    assert got["t8"].status == "ok" and len(got["t8"].notes["columns"]) == 8
+
+    model = Scripted(_text_only(_hollow))
+    got = await D.run_model_draft(model, _source(tables), ["t8"])
+    assert [c.mode for c in model.calls] == ["structured", "text", "text"], "再问一次，不多问"
+    assert got["t8"].status == "failed" and got["t8"].error == catalog.MODEL_EMPTY_REASON
 
 
 # --------------------------------------------------------------------------
@@ -358,10 +440,33 @@ async def test_columns_still_missing_after_the_followup_are_not_written():
     assert len(model.calls) == 2 and model.calls[1].asked == {"t8": ("columns", ["c007", "c008"])}
     o = got["t8"]
     assert o.status == "partial"
-    assert o.error == "这张表 8 列，有 2 列没写出来：模型的回复里漏了这些列，补问一次仍没有给出。可以只重试这张表"
+    assert o.error == ("这张表 8 列，有 2 列（c007、c008）没写出来：模型的回复里漏了这些列，补问一次仍没有给出。"
+                       "可以只重试这张表")
     assert set(o.notes["columns"]) == {f"c{i:03d}" for i in range(1, 7)}
+    assert o.blank == [], "没写出来的列不算留空"
     compat = (await catalog.draft_with_model(Scripted(handle), _source(tables), ["t8"]))["t8"]
     assert compat.covered == frozenset(), "没写全的不算完整起草过"
+
+
+async def test_columns_listed_blank_in_the_followup_are_left_blank_not_failed():
+    """补问时模型把漏的列列出来了、字段却留空：是拿不准（记留空），不算「漏了这些列」。"""
+    tables = {"t8": _table(8)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        reply = ok(call)
+        entry = reply.obj["tables"][0]
+        if call.n == 0:
+            entry["columns"] = [c for c in entry["columns"] if c["name"] not in ("c003", "c007")]
+        else:
+            entry["columns"] = [{"name": c["name"]} for c in entry["columns"]]
+        return reply
+
+    model = Scripted(handle)
+    got = await D.run_model_draft(model, _source(tables), ["t8"])
+    assert model.calls[1].asked == {"t8": ("columns", ["c003", "c007"])}
+    o = got["t8"]
+    assert o.status == "ok" and o.error is None and o.blank == ["c003", "c007"]
 
 
 async def test_a_followup_that_comes_back_as_an_empty_shell_leaves_the_table_partial():
@@ -382,11 +487,12 @@ async def test_a_followup_that_comes_back_as_an_empty_shell_leaves_the_table_par
     assert len(model.calls) == 2
     assert model.calls[1].asked == {"t40": ("columns", [f"c{i:03d}" for i in range(21, 41)])}
     assert o.status == "partial" and len(o.notes["columns"]) == 20
-    assert o.error == "这张表 40 列，有 20 列没写出来：模型的回复里漏了这些列，补问一次仍没有给出。可以只重试这张表"
+    assert o.error == ("这张表 40 列，有 20 列（c021 到 c040）没写出来：模型的回复里漏了这些列，补问一次仍没有给出。"
+                       "可以只重试这张表")
 
 
 async def test_columns_listed_with_empty_fields_are_left_to_the_model():
-    """列出了、字段留空的列是模型拿不准：不补问，也不算没写出来。"""
+    """列出了、字段留空的列是模型拿不准：不补问，也不算没写出来；记成留空（表的状态不因此变）。"""
     tables = {"t8": _table(8)}
     ok = answering(tables)
 
@@ -402,6 +508,30 @@ async def test_columns_listed_with_empty_fields_are_left_to_the_model():
     assert len(model.calls) == 1
     assert got["t8"].status == "ok" and got["t8"].error is None
     assert set(got["t8"].notes["columns"]) == {f"c{i:03d}" for i in range(1, 7)}
+    assert got["t8"].blank == ["c007", "c008"]
+
+
+async def test_blank_columns_are_the_ones_without_a_label_or_meaning():
+    """留空的列：请模型写了、中文名和含义却都没给（只给了度量类型、单位，或者给的都没通过校验）。已确认的、库注释已经说清
+    的不算：给模型的提示词里它们以此为准，模型不写也不缺。"""
+    meta = _table(9)
+    meta["columns"][5]["comment"] = "会员等级"            # c006：库注释就是中文名
+    meta["columns"][8]["comment"] = "C009"                # c009：注释就是列名，说明不了什么
+    tables = {"t9": meta}
+    existing = {"t9": {"columns": {"c005": {"label": catalog.make_item("已确认的名字", "human")}}}}
+
+    def handle(call: Call) -> Reply:
+        return Reply(obj={"tables": [{"table": "t9", "label": "某表", "columns": [
+            {"name": "c001", "label": "第一列"},
+            {"name": "c002", "meaning": "第二列的含义"},
+            {"name": "c003", "measure": "attribute", "unit": "元"},    # 中文名、含义都没给
+            {"name": "c004", "label": "=c001+c002"},                    # 像公式：校验丢掉
+            {"name": "c005"}, {"name": "c006"}, {"name": "c007"}, {"name": "c008"}, {"name": "c009"}]}]})
+
+    got = await D.run_model_draft(Scripted(handle), _source(tables), ["t9"], existing=existing)
+    o = got["t9"]
+    assert o.status == "ok" and o.error is None
+    assert o.blank == ["c003", "c004", "c007", "c008", "c009"]
 
 
 # --------------------------------------------------------------------------
@@ -521,7 +651,29 @@ async def test_other_errors_are_not_retried():
     assert len(model.calls) == 1 and got["t4"].error == "调用模型出错：网关拒绝了这次请求"
 
 
-async def test_a_call_past_the_time_limit_is_retried_then_reported(monkeypatch):
+async def test_a_call_past_the_time_limit_is_split_not_retried(monkeypatch, _no_wait):
+    """超时当作这一段太大：不原样重试同样大小的段，拆成两半再问（同额度用完）。超时的调用拿不到用量，记 0。"""
+    monkeypatch.setattr(catalog, "MODEL_TIMEOUT_S", 0.05)
+    tables = {"t24": _table(24)}
+    ok = answering(tables, usage=(100, 50))
+
+    async def handle(call: Call) -> Reply:
+        if call.n == 0:
+            await asyncio.sleep(1)
+        return ok(call)
+
+    model, reports = Scripted(handle), Reports()
+    got = await D.run_model_draft(model, _source(tables), ["t24"], hooks=reports.hooks())
+    cols = [f"c{i:03d}" for i in range(1, 25)]
+    assert got["t24"].status == "ok"
+    assert [c.asked for c in model.calls] == [{"t24": ("full", None)}, {"t24": ("table+columns", cols[:12])},
+                                              {"t24": ("columns", cols[12:])}]
+    assert reports.failures == ["timeout", None, None]
+    assert [(r.input_tokens, r.output_tokens) for r in reports.items] == [(0, 0), (100, 50), (100, 50)]
+    assert _no_wait == [], "不退避重试"
+
+
+async def test_a_small_part_past_the_time_limit_is_not_retried(monkeypatch):
     monkeypatch.setattr(catalog, "MODEL_TIMEOUT_S", 0.05)
 
     async def slow(call: Call) -> Reply:
@@ -530,8 +682,8 @@ async def test_a_call_past_the_time_limit_is_retried_then_reported(monkeypatch):
 
     model = Scripted(slow)
     got = await D.run_model_draft(model, _source({"t4": _table(4)}), ["t4"])
-    assert len(model.calls) == 3
-    assert got["t4"].error == "模型 0.05 秒内没有写完这一段（已重试 2 次）"
+    assert len(model.calls) == 1, "拆不开、也不原样重试"
+    assert got["t4"].status == "failed" and got["t4"].error == "模型 0.05 秒内没有写完这一段"
 
 
 # --------------------------------------------------------------------------
@@ -554,11 +706,28 @@ async def test_a_wide_table_is_split_into_a_table_part_and_column_parts():
     first, *rest = model.calls
     assert first.asked == {"wide95": ("table", None)}
     assert catalog.CATALOG_DRAFT_PROMPT_LABELS["brief_columns"].format(n=95) in first.text
-    assert sorted(len(c.asked["wide95"][1]) for c in rest) == [15, 40, 40]
+    assert sorted(len(c.asked["wide95"][1]) for c in rest) == [31, 32, 32]
     for call in rest:
         assert call.asked["wide95"][0] == "columns"
         assert "wide95的中文名" in call.text and "虚构的宽表" in call.text, "列分段带着表注释和表级起草结果"
     assert {c for call in rest for c in call.asked["wide95"][1]} == {f"c{i:03d}" for i in range(1, 96)}
+
+
+@pytest.mark.parametrize("n, sizes", [(164, [33, 33, 33, 33, 32]), (95, [32, 32, 31]), (41, [21, 20]),
+                                      (80, [40, 40]), (81, [27, 27, 27])])
+async def test_column_parts_are_even_without_a_small_tail(monkeypatch, n, sizes):
+    """列分段数 = 列数 / 40 向上取整，各段列数平均（相差不超过 1）：不再留下几列的尾段（实测会思考的模型常对这种小段只给
+    空壳）。表级那段照旧在最前面。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    tables = {"wide": _table(n)}
+    model = Scripted(answering(tables))
+    got = await D.run_model_draft(model, _source(tables), ["wide"])
+    o = got["wide"]
+    assert o.status == "ok" and o.parts_total == 1 + len(sizes) == D.parts_for(n)
+    assert model.calls[0].asked == {"wide": ("table", None)}
+    parts = [c.asked["wide"][1] for c in model.calls[1:]]
+    assert [len(p) for p in parts] == sizes
+    assert [c for p in parts for c in p] == [f"c{i:03d}" for i in range(1, n + 1)], "按表结构的顺序连续切开"
 
 
 async def test_a_wide_table_with_one_failed_part_is_partial_and_says_which():
@@ -574,10 +743,67 @@ async def test_a_wide_table_with_one_failed_part_is_partial_and_says_which():
     model = Scripted(handle)
     got = await D.run_model_draft(model, _source(tables), ["wide95"])
     o = got["wide95"]
-    assert o.status == "partial" and len(o.notes["columns"]) == 55
-    assert o.error == "这张表 95 列，分 4 段起草，第 3 段没写出来（共 40 列）：调用模型出错：网关拒绝。可以只重试这张表"
+    assert o.status == "partial" and len(o.notes["columns"]) == 63
+    assert o.error == ("这张表 95 列，分 4 段起草，第 3 段（c033 到 c064，共 32 列）没写出来：调用模型出错：网关拒绝。"
+                       "可以只重试这张表")
     compat = (await catalog.draft_with_model(Scripted(handle), _source(tables), ["wide95"]))["wide95"]
     assert compat.covered == frozenset() and compat.error == o.error, "没写全的不算完整起草过，旧的模型项不删"
+
+
+async def test_reasons_name_each_part_and_say_these_parts(monkeypatch):
+    """几段因为同一个原因没写出来：原因里写「这几段」；每段写上列的范围（列名照表结构原样）；拆过的才补「已拆小重试」。"""
+    monkeypatch.setattr(catalog, "MODEL_SHRINK_AFTER", 99)
+    tables = {"wide95": _table(95)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        part, cols = call.asked["wide95"]
+        if part == "columns" and cols[0] >= "c033":          # 第 3、4 段（c033 起）一直用完额度
+            return EXHAUSTED
+        return ok(call)
+
+    got = await D.run_model_draft(Scripted(handle), _source(tables), ["wide95"])
+    o = got["wide95"]
+    assert o.status == "partial" and len(o.notes["columns"]) == 32
+    assert o.error == ("这张表 95 列，分 4 段起草，第 3 段（c033 到 c064，共 32 列）、第 4 段（c065 到 c095，共 31 列）没写出来："
+                       + _exhausted("这几段") + D.REASON_SPLIT + "。可以只重试这张表")
+
+
+async def test_a_part_that_was_never_halved_does_not_say_it_was():
+    """被截断后只补剩下的（不是拆小）：补的那次也用完了额度、又拆不开，原因里不写「已拆小重试」。"""
+    tables = {"t9": _table(9)}
+    full = json.dumps({"tables": [{"table": "t9", **_reply("t9", tables["t9"])}]}, ensure_ascii=False)
+    cut = full[:full.index('"c005"') + 8]
+
+    def handle(call: Call) -> Reply:
+        return Reply(text=cut, finish="length") if call.n == 0 else EXHAUSTED
+
+    model = Scripted(handle)
+    got = await D.run_model_draft(model, _source(tables), ["t9"])
+    o = got["t9"]
+    assert len(model.calls) == 2 and model.calls[1].asked == {"t9": ("columns", [f"c{i:03d}" for i in range(5, 10)])}
+    assert o.status == "partial"
+    assert o.error == "这张表 9 列，有 5 列（c005 到 c009）没写出来：" + _exhausted() + "。可以只重试这张表"
+
+
+@pytest.mark.parametrize("missing, said", [
+    (["c004"], "有 1 列（c004）"),
+    (["c003", "c007"], "有 2 列（c003、c007）"),
+    (["c002", "c004", "c006", "c008"], "有 4 列（c002、c004、c006 等）"),
+    (["c003", "c004", "c005", "c006"], "有 4 列（c003 到 c006）"),
+])
+async def test_columns_not_written_are_named(missing, said):
+    tables = {"t8": _table(8)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        reply = ok(call)
+        for entry in reply.obj["tables"]:
+            entry["columns"] = [c for c in entry.get("columns", []) if c["name"] not in missing]
+        return reply
+
+    got = await D.run_model_draft(Scripted(handle), _source(tables), ["t8"])
+    assert got["t8"].error == f"这张表 8 列，{said}没写出来：{D.REASON_UNANSWERED}。可以只重试这张表"
 
 
 async def test_tables_are_packed_up_to_40_columns_and_4_tables():
@@ -598,13 +824,10 @@ async def test_tables_are_packed_up_to_40_columns_and_4_tables():
 # --------------------------------------------------------------------------
 
 
-def _hollow(call: Call) -> Reply:
-    return Reply(obj={"tables": [{"table": t} for t in call.asked]})
-
-
 async def test_the_same_reason_is_said_once_even_when_some_parts_were_split(monkeypatch):
     """宽表的表级那段拆不开、列分段拆过：原因只说一次，拆过的在最后补一句。"""
     monkeypatch.setattr(catalog, "MODEL_GIVE_UP_AFTER", 99)
+    monkeypatch.setattr(catalog, "MODEL_PART_MAX_CALLS", 99)
     model = Scripted(_hollow)
     got = await D.run_model_draft(model, _source({"wide45": _table(45)}), ["wide45"])
     o = got["wide45"]
@@ -613,14 +836,19 @@ async def test_the_same_reason_is_said_once_even_when_some_parts_were_split(monk
 
 
 def test_reasons_are_joined_by_their_base():
+    """(原因, 第几段)：同样的原因只说一次；同一个原因落在几段上写「这几段」，同一段拆出来的几块仍是「这一段」。"""
     W = D._Why
-    exhausted = D.REASON_EXHAUSTED.format(budget=32768)
-    assert D._join([W(D.REASON_HOLLOW), W(D.REASON_HOLLOW, split=True)]) == D.REASON_HOLLOW + D.REASON_SPLIT
-    assert D._join([W(exhausted, split=True), W(D.REASON_HOLLOW)]) == \
-        f"{exhausted}；{D.REASON_HOLLOW}{D.REASON_SPLIT}"
-    assert D._join([W("甲"), W("乙"), W("丙", split=True)]) == "甲；乙", "没说出来的原因不补后缀"
-    assert D._join([W(D.REASON_HOLLOW, halted=True), W(D.REASON_HOLLOW)]) == \
+    ex = D.REASON_EXHAUSTED.format(budget=32768, seg=D.SEG)
+    assert D._join([(W(D.REASON_HOLLOW), 1), (W(D.REASON_HOLLOW, split=True), 2)]) == \
+        D.REASON_HOLLOW + D.REASON_SPLIT
+    assert D._join([(W(ex, split=True), 2), (W(D.REASON_HOLLOW), 1)]) == \
+        f"{_exhausted()}；{D.REASON_HOLLOW}{D.REASON_SPLIT}"
+    assert D._join([(W(ex), 2), (W(ex), 3)]) == _exhausted("这几段")
+    assert D._join([(W(ex), 2), (W(ex, split=True), 2)]) == _exhausted() + D.REASON_SPLIT
+    assert D._join([(W("甲"), 1), (W("乙"), 1), (W("丙", split=True), 1)]) == "甲；乙", "没说出来的原因不补后缀"
+    assert D._join([(W(D.REASON_HOLLOW, halted=True), 1), (W(D.REASON_HOLLOW), 2)]) == \
         D.REASON_HOLLOW + D.REASON_HALTED.format(n=catalog.MODEL_GIVE_UP_AFTER)
+    assert D._join([(W("调用模型出错：{坏的}"), 1)]) == "调用模型出错：{坏的}", "报错原文里的花括号原样留着"
 
 
 def _by_table(model: Scripted) -> dict[str, int]:
@@ -643,7 +871,7 @@ async def test_after_two_segments_in_a_row_come_to_nothing_the_rest_are_not_spli
     model = Scripted(lambda call: exhausted)
     got = await D.run_model_draft(model, _source(tables), list(tables))
     assert _by_table(model) == {"t1": 3, "t2": 3, "t3": 1, "t4": 1}
-    budget = D.REASON_EXHAUSTED.format(budget=32768)
+    budget = _exhausted()
     assert got["t1"].error == budget + D.REASON_SPLIT
     assert got["t3"].error == budget + "；模型连续 2 段都没写出来，已停止拆小重试，建议更换起草模型"
 
@@ -657,23 +885,23 @@ async def test_after_two_segments_in_a_row_come_to_nothing_the_rest_are_not_spli
 async def test_the_column_parts_of_a_wide_table_stop_splitting_too(monkeypatch):
     """宽表的列分段一段一段排队起草（一段拆到底再起草下一段），止损在宽表里同样起作用。
 
-    95 列：表级那段拆不开（结构化、纯文本各一次）；第 2 段 40 列拆到底（15 次结构化 + 8 次纯文本）；这时已经连续 2 段
-    没写出来，第 3、4 段只问一次、换纯文本一次。"""
+    95 列：表级那段拆不开（结构化、纯文本各一次）；第 2 段 32 列拆小、到 8 次封顶；这时已经连续 2 段没写出来，第 3、4 段
+    只问一次、换纯文本一次。"""
     monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
     model = Scripted(_hollow)
     got = await D.run_model_draft(model, _source({"wide95": _table(95)}), ["wide95"])
-    assert len(model.calls) == 2 + 23 + 2 + 2
-    assert got["wide95"].error == (D.REASON_HOLLOW + D.REASON_SPLIT
-                                   + "；模型连续 2 段都没写出来，已停止拆小重试，建议更换起草模型")
+    assert len(model.calls) == 2 + 8 + 2 + 2
+    assert got["wide95"].error == (D.REASON_HOLLOW + "；每段最多调用 8 次模型，这一段到了次数仍没写完，已停止重试"
+                                   + D.REASON_SPLIT + "；模型连续 2 段都没写出来，已停止拆小重试，建议更换起草模型")
 
 
 async def test_a_wide_table_that_never_comes_back_is_bounded_by_the_first_wave():
-    """默认并发（3 段同时起草）：294 列一直只给空壳，最多是表级那段 2 次、头 3 个列分段拆到底（各 23 次）、其余 5 段
-    各 2 次。以前所有列分段一下子都排上去、一层一层地拆，要 168 次。"""
+    """默认并发（3 段同时起草）：294 列（8 个列分段）一直只给空壳，最多是表级那段 2 次、头 3 个列分段各 8 次（封顶）、
+    其余 5 段各 2 次。以前所有列分段一下子都排上去、一层一层地拆，要 168 次。"""
     model = Scripted(_hollow)
     got = await D.run_model_draft(model, _source({"wide294": _table(294)}), ["wide294"])
-    assert got["wide294"].status == "failed"
-    assert len(model.calls) <= 2 + 3 * 23 + 5 * 2
+    assert got["wide294"].status == "failed" and got["wide294"].parts_total == 9
+    assert len(model.calls) <= 2 + 3 * 8 + 5 * 2
 
 
 async def test_a_big_draft_does_not_hold_the_model_ahead_of_a_later_one(monkeypatch):
@@ -705,6 +933,85 @@ async def test_a_big_draft_does_not_hold_the_model_ahead_of_a_later_one(monkeypa
     got_big, got_small = await asyncio.gather(first, second)
     assert set(_status(got_big).values()) == {"ok"} and _status(got_small) == {"b1": "ok"}
     assert order == ["a1", "b1", "a2", "a3", "a4"]
+
+
+def _order(model: Scripted) -> list[tuple[str, str]]:
+    return [(name, part) for call in model.calls for name, (part, _) in call.asked.items()]
+
+
+async def test_narrow_tables_are_not_cut_in_by_the_column_parts_of_a_wide_one(monkeypatch):
+    """一个任务里按表的先后排队：宽表的表级那段写完，它的列分段排到已经排着的窄表段后面（先来先服务），不插队。
+    以前插到队首，窄表要等宽表的列分段全部派完。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    tables = {"wide": _table(45), "na": _table(4), "nb": _table(4)}
+    model = Scripted(answering(tables))
+    got = await D.run_model_draft(model, _source(tables), ["wide", "na", "nb"])
+    assert set(_status(got).values()) == {"ok"}
+    assert _order(model) == [("wide", "table"), ("na", "full"), ("nb", "full"), ("wide", "columns"),
+                             ("wide", "columns")]
+
+
+async def test_after_two_exhausted_or_timed_out_calls_new_parts_are_halved(monkeypatch):
+    """额度用完或超时累计 2 次，之后新开始的段列数上限减半（40 → 20 → 10，最低 10）；已经开始的段照旧（按原因拆小）。
+    每次调用的结果里带着当前的上限（part_columns）。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    tables = {f"t{i}": _table(40) for i in range(1, 4)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        (_, (part, cols)), = call.asked.items()
+        width = 40 if part == "full" else len(cols)
+        return EXHAUSTED if width > 10 else ok(call)        # 这个模型一次只写得出 10 列
+
+    model, reports = Scripted(handle), Reports()
+    got = await D.run_model_draft(model, _source(tables), list(tables), hooks=reports.hooks())
+    assert set(_status(got).values()) == {"ok"}
+    asked = {name: [(part, len(cols or [])) for c in model.calls for n, (part, cols) in c.asked.items() if n == name]
+             for name in tables}
+    # t1：整张 40 列开始，用完额度拆成 20、20，又各拆成 10、10
+    assert asked["t1"][0] == ("full", 0) and len(asked["t1"]) == 7
+    # 第 2 次用完额度后上限是 20：t2 一开始就按 20 列切成两段（各自再拆一次）
+    assert asked["t2"][0] == ("table+columns", 20) and ("columns", 20) in asked["t2"]
+    # 第 4 次之后上限是 10：t3 一开始就切成 4 段 10 列，一次都没用完额度
+    assert asked["t3"] == [("table+columns", 10), ("columns", 10), ("columns", 10), ("columns", 10)]
+    caps = [r.part_columns for r in reports.items]
+    assert list(dict.fromkeys(caps)) == [40, 20, 10]
+    assert caps[:2] == [40, 20], "第 2 次用完额度的那次调用之后就是 20"
+    assert min(caps) == 10 == catalog.MODEL_MIN_PART_COLUMNS
+
+
+async def test_the_notice_comes_when_four_of_six_calls_fail_and_goes_when_fewer_than_two(monkeypatch):
+    """最近 6 次调用有 4 次以上没写出来：提醒（写明次数和原因，建议换起草模型、减少表或停止）；之后最近 6 次里没写出来
+    的少于 2 次就清掉。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    tables = {f"t{i}": _table(4) for i in range(1, 10)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        name = next(iter(call.asked))
+        if name in ("t1", "t2"):
+            raise RuntimeError("网关拒绝了这次请求")
+        if name == "t3":
+            return EXHAUSTED
+        if name == "t4":
+            return _hollow(call)
+        return ok(call)
+
+    reports = Reports()
+    got = await D.run_model_draft(Scripted(handle), _source(tables), list(tables), hooks=reports.hooks())
+    assert reports.failures == ["error", "error", "exhausted", "hollow", "hollow"] + [None] * 5
+    notices = [r.notice for r in reports.items]
+    assert notices[:3] == [None] * 3
+    assert notices[3] == ("最近 4 次调用有 4 次没写出来（额度用完 1 次、只给空壳 1 次、出错 2 次）。可以在「设置 → 偏好设置」"
+                          "的「起草模型」换一个模型、减少这次起草的表，或者停止这次起草")
+    assert notices[4].startswith("最近 5 次调用有 5 次没写出来")
+    assert notices[7].startswith("最近 6 次调用有 3 次没写出来"), "还有 2 次以上没写出来：留着，次数照实写"
+    assert notices[8].startswith("最近 6 次调用有 2 次没写出来")
+    assert notices[9] is None, "最近 6 次只有 1 次没写出来：清掉"
+    assert got["t9"].status == "ok"
 
 
 # --------------------------------------------------------------------------
@@ -747,13 +1054,11 @@ async def test_usage_is_added_up_through_the_hooks():
             return Reply(text="", finish="length", thinking="……", usage=(100, 32768))
         return ok(call)
 
-    seen: list[tuple[int, int]] = []
-
-    async def usage(i: int, o: int) -> None:
-        seen.append((i, o))
-
-    await D.run_model_draft(Scripted(handle), _source(tables), ["orders_x"], hooks=D.Hooks(usage=usage))
-    assert seen == [(100, 32768), (120, 60), (120, 60)]
+    reports = Reports()
+    await D.run_model_draft(Scripted(handle), _source(tables), ["orders_x"], hooks=reports.hooks())
+    assert [(r.input_tokens, r.output_tokens, r.failure) for r in reports.items] == \
+        [(100, 32768, "exhausted"), (120, 60, None), (120, 60, None)]
+    assert {r.notice for r in reports.items} == {None} and {r.part_columns for r in reports.items} == {40}
 
 
 def test_budget_words_match_the_other_drafts():

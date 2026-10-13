@@ -6,8 +6,9 @@
 - **建任务**（create_job）：同一个数据源同时只有一个排队或进行中的任务（DraftBusy；部分唯一索引兜底）。不指定表时
   按使用次数取前 20 张；表结构里没有的表照样建进任务、状态 skipped。起草要求（数据源级）和本次说明随任务记下快照。
 - **在后台起草**（manager.start）：进程内的 asyncio 任务，引擎是 data/catalog_draft.py（分段、按失败原因处理）。
-  每张表一结束就并入目录（catalog.write_draft，规则和同步起草一样：人工确认、驳回过的不动，乐观锁冲突重读重并）；
-  逐表的状态、到第几段、计数、用量随时落库，接口读的是库里的状态。
+  每张表一结束就并入目录（catalog.write_draft，规则和同步起草一样：人工确认、驳回过的不动，模型这次没给的项不删
+  以前起草的，乐观锁冲突重读重并）；逐表的状态、到第几段、计数、模型留空的列，任务的用量（含超时、没写出来的调用
+  次数）、当前的列数上限、提醒随时落库，接口读的是库里的状态。
 - **停止**（cancel）：排队的直接 cancelled；进行中的停掉正在进行的模型调用，没开始和没写完的表记 cancelled，已经写进
   目录的不回滚，任务最后是 cancelled。
 - **重试**（retry_tables + create_job）：新任务，只含原任务里 failed、partial、cancelled 的表；用不用模型、本次说明沿用，
@@ -55,6 +56,8 @@ GUIDANCE_MAX = 2000
 NOTE_MAX = 1000
 #: 目录清单上「这张表最近一次起草」只看最近这么多个任务
 LAST_DRAFT_JOBS = 100
+#: 逐表最多记几个模型留空的列名
+BLANK_SAMPLE = 5
 #: 停止进行中的任务时最多等它收尾多久（秒）；关停服务时另给（shutdown 的 grace）
 STOP_GRACE_S = 10.0
 
@@ -164,6 +167,9 @@ def task_dict(task: CatalogDraftTask) -> dict[str, Any]:
         "removed": task.removed,
         "version": task.version,
         "model_items": task.model_items,
+        # 模型拿不准、留空了的列（中文名和含义都没给）：几列、最多 5 个列名（按表结构的顺序）。表的状态不因此变
+        "blank_columns": task.blank_columns or 0,
+        "blank_sample": list(task.blank_sample or []),
         "error": task.error,
         "model_error": task.model_error,
         "started_at": _iso(task.started_at),
@@ -200,8 +206,14 @@ def job_dict(job: CatalogDraftJob, tasks: list[CatalogDraftTask]) -> dict[str, A
         "added": sum(t.added or 0 for t in tasks),
         "updated": sum(t.updated or 0 for t in tasks),
         "removed": sum(t.removed or 0 for t in tasks),
+        "blank_columns": sum(t.blank_columns or 0 for t in tasks),
+        # 超时的调用拿不到用量，token 按 0 算（网关那边可能已经生成了）；failed_calls 含额度用完、只给空壳、超时、出错
         "usage": {"calls": job.calls or 0, "input_tokens": job.input_tokens or 0,
-                  "output_tokens": job.output_tokens or 0},
+                  "output_tokens": job.output_tokens or 0, "timeouts": job.timeouts or 0,
+                  "failed_calls": job.failed_calls or 0},
+        # 新开始的段每段最多几列（不用模型、还没开始时为 null）；提醒：最近几次调用多数没写出来时的一句话，没有为 null
+        "part_columns": job.part_columns,
+        "notice": job.notice,
         "error": job.error,
         "tasks": [task_dict(t) for t in tasks],
     }
@@ -225,20 +237,22 @@ async def job_brief(session: AsyncSession, job: CatalogDraftJob | None) -> dict[
 
 
 async def last_drafts(session: AsyncSession, source_id: str) -> dict[str, dict[str, Any]]:
-    """每张表最近一次起草任务里的那一项：{表名: {status, job_id, finished_at, error, model_error}}。任务还在进行，
-    就是进行中的状态。只看最近 LAST_DRAFT_JOBS 个任务；每张表取哪一项在库里挑好（清单页起草时会反复取）。"""
+    """每张表最近一次起草任务里的那一项：{表名: {status, job_id, finished_at, error, model_error, blank_columns}}。
+    任务还在进行，就是进行中的状态。只看最近 LAST_DRAFT_JOBS 个任务；每张表取哪一项在库里挑好（清单页起草时会反复取）。"""
     recent = (select(CatalogDraftJob.id).where(CatalogDraftJob.source_id == source_id)
               .order_by(CatalogDraftJob.created_at.desc()).limit(LAST_DRAFT_JOBS)).scalar_subquery()
     rank = func.row_number().over(partition_by=CatalogDraftTask.table_name,
                                   order_by=(CatalogDraftJob.created_at.desc(), CatalogDraftTask.seq)).label("rank")
     inner = (select(CatalogDraftTask.table_name, CatalogDraftTask.status, CatalogDraftTask.job_id,
-                    CatalogDraftTask.finished_at, CatalogDraftTask.error, CatalogDraftTask.model_error, rank)
+                    CatalogDraftTask.finished_at, CatalogDraftTask.error, CatalogDraftTask.model_error,
+                    CatalogDraftTask.blank_columns, rank)
              .join(CatalogDraftJob, CatalogDraftJob.id == CatalogDraftTask.job_id)
              .where(CatalogDraftJob.id.in_(recent))).subquery()
     rows = (await session.execute(select(inner).where(inner.c.rank == 1))).mappings()
     return {row["table_name"]: {"status": row["status"], "job_id": row["job_id"],
                                 "finished_at": _iso(row["finished_at"]), "error": row["error"],
-                                "model_error": row["model_error"]} for row in rows}
+                                "model_error": row["model_error"], "blank_columns": row["blank_columns"] or 0}
+            for row in rows}
 
 
 # ==========================================================================
@@ -463,7 +477,7 @@ class _JobRun:
             await self._write(self._skip, gone)
         if use_model and names:
             await self._write(self._set_model, model_id)
-            hooks = catalog_draft.Hooks(call_started=self._call_started, usage=self._usage,
+            hooks = catalog_draft.Hooks(call_started=self._call_started, call_done=self._call_done,
                                         part_done=self._part_done, table_done=self._table_done)
             await catalog_draft.run_model_draft(model, source, names, existing=existing, background=background,
                                                 hooks=hooks)
@@ -482,8 +496,8 @@ class _JobRun:
             self._started.update(fresh)
             await self._write(self._mark_running, fresh)
 
-    async def _usage(self, input_tokens: int, output_tokens: int) -> None:
-        await self._write(self._add_usage, input_tokens, output_tokens)
+    async def _call_done(self, report: catalog_draft.CallReport) -> None:
+        await self._write(self._add_call, report)
 
     async def _part_done(self, table: str) -> None:
         await self._write(self._bump_part, table)
@@ -506,7 +520,8 @@ class _JobRun:
 
     async def _set_model(self, session: AsyncSession, model_id: str) -> None:
         await session.execute(update(CatalogDraftJob).where(CatalogDraftJob.id == self.job_id)
-                              .values(model=model_id or None).execution_options(synchronize_session=False))
+                              .values(model=model_id or None, part_columns=max(1, int(catalog.MODEL_BATCH_COLUMNS)))
+                              .execution_options(synchronize_session=False))
         await session.commit()
 
     async def _skip(self, session: AsyncSession, names: list[str]) -> None:
@@ -521,11 +536,16 @@ class _JobRun:
                               .values(status="running", started_at=utcnow()))
         await session.commit()
 
-    async def _add_usage(self, session: AsyncSession, input_tokens: int, output_tokens: int) -> None:
+    async def _add_call(self, session: AsyncSession, report: catalog_draft.CallReport) -> None:
+        """一次调用：用量、超时、没写出来的次数累加，当前的列数上限和提醒照这次调用之后的写（按调用的先后写进来）。"""
         await session.execute(
             update(CatalogDraftJob).where(CatalogDraftJob.id == self.job_id)
-            .values(calls=CatalogDraftJob.calls + 1, input_tokens=CatalogDraftJob.input_tokens + int(input_tokens),
-                    output_tokens=CatalogDraftJob.output_tokens + int(output_tokens))
+            .values(calls=CatalogDraftJob.calls + 1,
+                    input_tokens=CatalogDraftJob.input_tokens + int(report.input_tokens),
+                    output_tokens=CatalogDraftJob.output_tokens + int(report.output_tokens),
+                    timeouts=func.coalesce(CatalogDraftJob.timeouts, 0) + int(report.timeout),
+                    failed_calls=func.coalesce(CatalogDraftJob.failed_calls, 0) + int(report.failure is not None),
+                    part_columns=report.part_columns, notice=report.notice)
             .execution_options(synchronize_session=False))
         await session.commit()
 
@@ -551,6 +571,7 @@ class _JobRun:
             "status": result.status, "added": result.added, "updated": result.updated, "removed": result.removed,
             "version": result.version, "model_items": result.model_items, "error": result.error,
             "model_error": result.model_error, "finished_at": utcnow(),
+            "blank_columns": len(result.blank), "blank_sample": result.blank[:BLANK_SAMPLE] or None,
         }
         if outcome is not None:
             values["parts_done"] = outcome.parts_done
@@ -638,8 +659,9 @@ class DraftJobs:
 manager = DraftJobs()
 
 
-__all__ = ["ACTIVE", "DraftBusy", "DraftFinished", "DraftJobs", "FINISHED", "GUIDANCE_MAX", "INTERRUPTED_ERROR",
-           "MAX_TABLES", "NOTE_MAX", "NothingToRetry", "RETRYABLE", "TASK_DONE", "TASK_STATUSES", "TextTooLong",
+__all__ = ["ACTIVE", "BLANK_SAMPLE", "DraftBusy", "DraftFinished", "DraftJobs", "FINISHED", "GUIDANCE_MAX",
+           "INTERRUPTED_ERROR", "MAX_TABLES", "NOTE_MAX", "NothingToRetry", "RETRYABLE", "TASK_DONE", "TASK_STATUSES",
+           "TextTooLong",
            "active_job", "cancel", "check_model", "clean_text", "create_job", "ensure_idle", "guidance_of", "job_brief",
            "job_dict", "job_out", "last_drafts", "latest_job", "load", "manager", "retry_tables", "save_guidance",
            "startup", "tasks_of"]
