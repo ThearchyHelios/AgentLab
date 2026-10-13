@@ -97,7 +97,7 @@ const ORDER = [
 const ESTIMATE = {
   challenge: 30,
   stream: 173, chat: 160, studio: 149, manage: 145, runs: 112, publish: 92, shell: 87,
-  evidence: 91, versions: 60, catalog: 110, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
+  evidence: 91, versions: 60, catalog: 130, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
   // 占位，换成真检查时按实测改
   schedules: 60, compare: 45, verify: 71, inquiry: 60, bundle: 16, whatif: 33, 'report-export': 30,
 }

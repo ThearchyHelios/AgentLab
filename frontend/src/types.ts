@@ -2893,6 +2893,13 @@ export interface CatalogDraftTask {
    * 大于 0 而新增、更新、删除都是 0，才是「模型给了内容、只是和现有目录一致」
    */
   model_items: number | null
+  /**
+   * 模型拿不准、留空的列数：模型列出了（或这一段请它写了），中文名和含义却都没给（给了却都没通过校验的也算）。
+   * 表的状态不因此变（照旧可以是已完成）。老服务端没有这个键
+   */
+  blank_columns?: number
+  /** 留空的列里的前几个（最多 5 个，列名照表结构原样）。老服务端没有这个键 */
+  blank_sample?: string[]
   /** 整张表没起草的原因：表结构里没有、写入一直冲突、服务重启中断 */
   error: string | null
   /** 模型那部分没写出来的原因和办法（第几段、哪些列、为什么） */
@@ -2941,6 +2948,8 @@ export interface CatalogDraftJob {
   added: number
   updated: number
   removed: number
+  /** 各表模型拿不准、留空的列数合计。老服务端没有这个键 */
+  blank_columns?: number
   /** 模型调用的用量；拿不到用量时照实是 0 */
   usage: CatalogDraftUsage
   /**
@@ -2973,6 +2982,8 @@ export interface CatalogLastDraft {
   finished_at: string | null
   error: string | null
   model_error: string | null
+  /** 那次起草模型拿不准、留空的列数（同 CatalogDraftTask.blank_columns）。老服务端没有这个键 */
+  blank_columns?: number
 }
 
 /**

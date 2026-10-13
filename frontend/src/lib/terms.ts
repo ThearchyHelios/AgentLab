@@ -2395,6 +2395,8 @@ export const CATALOG_TEXT = {
 // - 「只重试失败的表」：重新起草失败、部分完成和已停止的表；已经写进目录的内容不回滚、不受影响。
 // - 「没写出来」：一次调用没有写出内容（额度用完、只给空壳、超时、出错）。接连没写出来时服务端给一句「提醒」，
 //   好转后收起；提醒是提醒的样式，不是错误。超时的调用不计用量。
+// - 「留空」：模型列出了一列（或这一段请它写了），中文名和含义却都没给，写「N 列模型拿不准、留空了」。表的状态不因此
+//   变，不算没写全；办法是在起草要求里补充缩写和术语的含义，再重新起草，已有的内容不会丢。
 // ===========================================================================
 
 /** 起草要求、本次补充说明的字数上限（服务端同一个数：超长 422） */
@@ -2424,9 +2426,14 @@ export const CATALOG_DRAFT_TEXT = {
   tooMany: (max: number) => `一次最多起草 ${formatNumber(max)} 张表，请缩小范围`,
   saveGuidanceFailed: (reason: string) => `起草要求未能保存，未开始起草：${reason}`,
   startFailed: (reason: string) => `未能开始起草：${reason}`,
-  // ---- 上一次起草（设置阶段，没写全的才提）
+  // ---- 上一次起草（设置阶段，没写全、有留空列的才提）
   last: (state: string, at: string) => `上一次起草（${at}）：${state}`,
+  /** 上一次的结果：状态，有留空的列时接着写几列 */
+  lastState: (title: string, blank: number) => (blank ? `${title}，${formatNumber(blank)} 列模型拿不准、留空了` : title),
   lastOpen: '查看',
+  // ---- 从结果、表详情回到设置：范围就是那几张表
+  scopeBlank: (n: number) => `有留空列的 ${formatNumber(n)} 张表`,
+  scopeTable: (name: string) => `这张表：${name}`,
   // ---- 进行中
   queued: '排队中，等待开始…',
   running: '正在起草…',
@@ -2457,6 +2464,15 @@ export const CATALOG_DRAFT_TEXT = {
   timeoutNote: '超时的调用不计用量，实际用量可能更多',
   /** 额度用完、超时多了，服务端把之后的段缩小了 */
   partColumns: (n: number) => `模型多次用完额度或超时，之后的段每段最多 ${formatNumber(n)} 列`,
+  // ---- 留空的列：模型列出了、中文名和含义却都没给。表的状态不因此变
+  blank: (n: number) => `${formatNumber(n)} 列模型拿不准、留空了`,
+  /** 留空的列名（服务端最多给 5 个）；没列全时写一共几列 */
+  blankSample: (sample: string[], n: number) =>
+    `留空的列：${sample.join('、')}${n > sample.length ? ` 等 ${formatNumber(n)} 列` : ''}`,
+  blankTotal: (columns: number, tables: number) => `共 ${formatNumber(columns)} 列模型拿不准、留空了（${formatNumber(tables)} 张表）`,
+  blankAdvice: '可以在起草要求里补充缩写和术语的含义，再重新起草这几张表，已有的内容不会丢',
+  blankRedraft: (n: number) => `重新起草这 ${formatNumber(n)} 张表`,
+  blankRedraftHint: '回到起草设置，范围是这几张表：先在起草要求里补充缩写和术语的含义，再开始起草',
   // ---- 结束
   title: {
     queued: '排队中，等待开始…',
@@ -2486,6 +2502,7 @@ export const CATALOG_DRAFT_TEXT = {
   retryHint: '重新起草失败、部分完成和已停止的表；已写进目录的内容不受影响',
   showAll: (n: number) => `显示全部 ${formatNumber(n)} 张表`,
   showProblems: '只看未写全的表',
+  showProblemsBlank: '只看未写全、有留空列的表',
   tasks: '逐表进度',
   taskStatus: {
     pending: '等待', running: '起草中', ok: '已完成', partial: '部分完成', failed: '失败', skipped: '已跳过', cancelled: '已停止',
@@ -2501,6 +2518,8 @@ export const CATALOG_DRAFT_TEXT = {
   toast: {
     succeeded: (summary: string) => `数据目录起草完成：${summary}`,
     partial: (n: number) => `数据目录起草完成，${formatNumber(n)} 张表未写全`,
+    /** 完成、部分完成的提示后面接着写留空的列（没有就不写） */
+    withBlank: (text: string, blank: number) => (blank ? `${text}；${formatNumber(blank)} 列模型拿不准、留空了` : text),
     failed: (reason: string) => (reason ? `数据目录起草失败：${reason}` : '数据目录起草失败'),
     cancelled: '数据目录起草已停止',
     interrupted: '服务重启，数据目录起草中断',
@@ -2510,6 +2529,11 @@ export const CATALOG_DRAFT_TEXT = {
   lastFailed: '上次起草失败',
   lastPartial: '上次起草部分完成',
   lastWith: (label: string, reason: string) => `${label}：${reason}`,
+  /** 上次起草有留空的列：清单上是轻提示（不是失败标记），表详情顶部同一句 */
+  lastBlank: (n: number) => `上次起草有 ${formatNumber(n)} 列模型拿不准、留空了`,
+  lastBlankAdvice: '可以在起草要求里补充缩写和术语的含义，再重新起草这张表，已有的内容不会丢',
+  draftGuidance: '补充起草要求',
+  draftGuidanceHint: '打开起草设置，范围是这张表：先在起草要求里补充缩写和术语的含义，再开始起草',
   redraft: '重新起草这张表',
   redraftHint: '用模型重新起草这张表（不带补充说明，带上数据源的起草要求）；人工确认、驳回过的项不会被改动',
   redraftBusy: '已有起草任务在进行，结束后再重新起草这张表',

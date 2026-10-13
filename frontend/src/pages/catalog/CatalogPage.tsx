@@ -12,8 +12,8 @@ import {
 } from '../../lib/terms'
 import { StatusLegend, SystemNotesNotice } from './parts'
 import { DraftDialog } from './DraftDialog'
-import { isJobActive, retryableCount, useDraftJob } from './draftJob'
-import type { DraftStartBody } from './draftJob'
+import { isJobActive, jobBlank, retryableCount, useDraftJob } from './draftJob'
+import type { DraftPreset, DraftStartBody } from './draftJob'
 import { ProfileDialog } from './ProfileDialog'
 import type { ProfileJob } from './ProfileDialog'
 import { ProfileSettingsDialog } from './ProfileSettings'
@@ -105,9 +105,9 @@ export function CatalogPage() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
   /**
    * 起草对话框开着没有、打开时显示什么：setup 选范围开始；job 显示页面跟着的任务（进行中的进度、刚结束的结果）。
-   * busy：是撞上已有任务（409）转过去显示的
+   * busy：是撞上已有任务（409）转过去显示的；preset：设置阶段预先选好的范围（表详情里「补充起草要求」）
    */
-  const [draftOpen, setDraftOpen] = useState<{ view: 'setup' | 'job'; busy?: boolean } | null>(null)
+  const [draftOpen, setDraftOpen] = useState<{ view: 'setup' | 'job'; busy?: boolean; preset?: DraftPreset } | null>(null)
   /** 起草写进了这些表：详情据此重新载入（编辑中的不动，保存时服务端会用版本号拦下） */
   const [drafted, setDrafted] = useState<{ seq: number; tables: Set<string> }>({ seq: 0, tables: new Set() })
   const [profiling, setProfiling] = useState(false)
@@ -169,8 +169,10 @@ export function CatalogPage() {
         key: `catalog-draft:${src}`, duration: 10000,
         action: { label: DT.viewResult, onClick: () => { if (sourceRef.current === src) setDraftOpen({ view: 'job' }) } },
       }
-      if (job.status === 'succeeded') toast.ok(DT.toast.succeeded(CT.draftSummary(job.added, job.updated, job.removed)), opts)
-      else if (job.status === 'partial') toast.warn(DT.toast.partial(retryableCount(job)), opts)
+      // 留空的列不算没写全，提示里接着写一句，点「查看结果」看是哪几张表、怎么办
+      const blank = jobBlank(job)
+      if (job.status === 'succeeded') toast.ok(DT.toast.withBlank(DT.toast.succeeded(CT.draftSummary(job.added, job.updated, job.removed)), blank), opts)
+      else if (job.status === 'partial') toast.warn(DT.toast.withBlank(DT.toast.partial(retryableCount(job)), blank), opts)
       else if (job.status === 'failed') toast.error(DT.toast.failed(job.error ?? ''), opts)
       else if (job.status === 'interrupted') toast.warn(DT.toast.interrupted, opts)
       else toast.warn(DT.toast.cancelled, opts)
@@ -195,6 +197,10 @@ export function CatalogPage() {
       toast.error(e)
     }
   }, [draft.start])
+  /** 详情里「补充起草要求」（上次起草有留空的列）：打开起草设置，范围只有这张表，先补起草要求再开始 */
+  const draftWithGuidance = useCallback((t: string) => {
+    setDraftOpen({ view: 'setup', preset: { tables: [t], label: DT.scopeTable(t) } })
+  }, [])
   const onGuidanceSaved = useCallback((g: string | null) => {
     setData((cur) => cur && ({ ...cur, guidance: g }))
   }, [])
@@ -402,7 +408,7 @@ export function CatalogPage() {
             ? (
               <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} fillCodes={fillCodes} prev={prev} next={next}
                            onFillDone={onFillDone} onOpen={openTable} onBack={backToList} onDetail={onDetail}
-                           draftBusy={!!stripJob} onRedraft={redraftTable} />
+                           draftBusy={!!stripJob} onRedraft={redraftTable} onDraftGuidance={draftWithGuidance} />
             )
             : <Overview rows={rows} empty={empty} systemNotes={data.system_notes} draft={draftButton(true)} onOpen={openTable} />}
         </section>
@@ -446,6 +452,7 @@ export function CatalogPage() {
           job={draftJob}
           initial={draftOpen.view}
           initialBusy={!!draftOpen.busy}
+          preset={draftOpen.preset ?? null}
           stopping={draft.stopping}
           onStart={startDraft}
           onCancel={draft.cancel}

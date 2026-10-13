@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CircleCheck, CircleDashed, CircleMinus, CircleSlash, CircleX, RotateCcw, Sparkles, TriangleAlert } from 'lucide-react'
+import { CircleCheck, CircleDashed, CircleMinus, CircleSlash, CircleX, Info, RotateCcw, Sparkles, TriangleAlert } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
@@ -9,25 +9,32 @@ import { errorMessage } from '../../lib/errors'
 import { formatTime } from '../../lib/format'
 import { CATALOG_DRAFT_TEXT as DT, CATALOG_TEXT as CT, DRAFT_GUIDANCE_MAX, DRAFT_NOTE_MAX } from '../../lib/terms'
 import {
-  DRAFT_MAX_TABLES, DRAFT_MODEL_UNAVAILABLE, DRAFT_PART_COLUMNS, DRAFT_TOP_N, RETRYABLE, isJobActive, nothingWritten, retryableCount,
-  taskReason,
+  DRAFT_MAX_TABLES, DRAFT_MODEL_UNAVAILABLE, DRAFT_PART_COLUMNS, DRAFT_TOP_N, RETRYABLE, blankOf, isJobActive, jobBlank, needsLook,
+  nothingWritten, retryableCount, taskReason,
 } from './draftJob'
-import type { DraftStartBody } from './draftJob'
+import type { DraftPreset, DraftStartBody } from './draftJob'
 
 // ===========================================================================
 // 起草数据目录。起草是服务端的后台任务：这里选范围、写起草要求和本次补充说明，建任务；之后显示页面跟着的那个任务
 // （进行中的进度、结束后的结果），任务本身的状态在页面上（draftJob.ts），关掉对话框照常进行。
 //
 // 三段：设置（范围、用不用模型；用模型时写起草要求、补充说明，写明用哪个起草模型）→ 进行中（总进度、合计、调用接连
-// 没写出来时的提醒、逐表的状态和宽表的段进度、没写全的原因；可以停止、在后台继续）→ 结束（汇总、没写全的表和原因、
-// 只重试失败的表）。
+// 没写出来时的提醒、逐表的状态和宽表的段进度、没写全的原因、留空的列；可以停止、在后台继续）→ 结束（汇总、没写全的表
+// 和原因、留空的列合计、只重试失败的表）。
 // 已经写进目录的内容不回滚——起草只增改推断项，人工确认、驳回过的项服务端不会动。
+//
+// 留空的列（模型列出了、中文名和含义都没给）不算没写全，表照样是已完成；结果里写合计和办法——在起草要求里补充缩写和
+// 术语的含义，再重新起草这几张表。「重新起草这几张表」回到设置：范围就是那几张、勾着用模型、焦点在起草要求，
+// 补完再开始。表详情里的「补充起草要求」也是这样打开（范围是那一张，见 preset）。
 // ===========================================================================
 
-type Scope = 'selected' | 'filtered' | 'top' | 'all'
+type Scope = 'preset' | 'selected' | 'filtered' | 'top' | 'all'
 
 /** 字数按服务端的算法：去掉首尾空白后的字符数（按码位，不按 UTF-16 的长度） */
 const charCount = (s: string) => [...s.trim()].length
+
+/** 起草要求输入框的 id：预先选好范围回到设置时焦点放在这里 */
+const GUIDANCE_ID = 'catalog-draft-guidance'
 
 /**
  * 建任务（开始、只重试失败的表）没建成怎么说。起草模型用不了（409，建任务和重试都会回）：服务端那句话已经写了原因和
@@ -37,8 +44,8 @@ const startErrorText = (e: unknown) =>
   (e instanceof ApiError && e.code === DRAFT_MODEL_UNAVAILABLE ? e.message : DT.startFailed(errorMessage(e)))
 
 export function DraftDialog({
-  sourceId, sourceDescription, guidance, rows, visible, selected, filtered, job, initial, initialBusy = false, stopping,
-  onStart, onCancel, onRetry, onTrack, onGuidanceSaved, onClose,
+  sourceId, sourceDescription, guidance, rows, visible, selected, filtered, job, initial, initialBusy = false, preset: initialPreset = null,
+  stopping, onStart, onCancel, onRetry, onTrack, onGuidanceSaved, onClose,
 }: {
   sourceId: string
   /** 数据源说明：用模型起草时连同起草要求一起交给模型 */
@@ -58,6 +65,11 @@ export function DraftDialog({
   initial: 'setup' | 'job'
   /** 打开时显示的任务是撞上已有任务（409）转过来的：写明 */
   initialBusy?: boolean
+  /**
+   * 打开设置时预先选好的范围（表详情里「补充起草要求」：只有那张表）。给了就勾上用模型、焦点放在起草要求上：
+   * 打开它就是为了先补起草要求再起草
+   */
+  preset?: DraftPreset | null
   /** 点了停止、服务端还没停下来 */
   stopping: boolean
   /** 建任务；409 已有任务时页面改取进行中的那一个（busy 为真） */
@@ -73,8 +85,12 @@ export function DraftDialog({
   // 表结构里已经没有的表起草不了（服务端会记「已跳过」），不算进范围
   const live = useMemo(() => rows.filter((r) => r.in_schema).map((r) => r.table_name), [rows])
   const liveSet = useMemo(() => new Set(live), [live])
+  /** 预先选好的范围：打开时给的，或者结果里点了「重新起草这几张表」 */
+  const [preset, setPreset] = useState<DraftPreset | null>(initialPreset)
   const scopes = useMemo(() => {
     const out: { key: Scope; label: string; tables: string[] }[] = []
+    const pre = preset?.tables.filter((t) => liveSet.has(t)) ?? []
+    if (preset && pre.length) out.push({ key: 'preset', label: preset.label, tables: pre })
     const sel = selected.filter((t) => liveSet.has(t))
     if (sel.length) out.push({ key: 'selected', label: CT.scopeSelected(sel.length), tables: sel })
     const vis = visible.filter((r) => r.in_schema).map((r) => r.table_name)
@@ -82,11 +98,13 @@ export function DraftDialog({
     if (live.length > DRAFT_TOP_N) out.push({ key: 'top', label: CT.scopeTop(DRAFT_TOP_N), tables: live.slice(0, DRAFT_TOP_N) })
     out.push({ key: 'all', label: CT.scopeAll(live.length), tables: live })
     return out
-  }, [selected, visible, filtered, live, liveSet])
+  }, [preset, selected, visible, filtered, live, liveSet])
   const [scope, setScope] = useState<Scope>(() => scopes[0].key)
   const tables = scopes.find((s) => s.key === scope)?.tables ?? scopes[0].tables
   const tooMany = tables.length > DRAFT_MAX_TABLES
-  const [useModel, setUseModel] = useState(false)
+  const [useModel, setUseModel] = useState(!!initialPreset)
+  /** 回到设置以后把焦点放进起草要求（预先选好范围的两种入口都是为了先补起草要求） */
+  const [focusGuidance, setFocusGuidance] = useState(!!initialPreset)
   const [guidanceText, setGuidanceText] = useState(guidance)
   const [note, setNote] = useState('')
   const guidanceLen = charCount(guidanceText)
@@ -102,7 +120,7 @@ export function DraftDialog({
   const [busy, setBusy] = useState(initialBusy)
   const [acting, setActing] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
-  /** 上一次起草（没写全的才提），设置阶段写一行、可以点开 */
+  /** 上一次起草（没写全、有留空列的才提），设置阶段写一行、可以点开 */
   const [last, setLast] = useState<CatalogDraftJob | null>(null)
   /** 起草模型的说法：设置里的起草模型，没配就是跟随助手的模型 */
   const [modelLine, setModelLine] = useState<{ text: string; warn: string | null } | null>(null)
@@ -120,12 +138,21 @@ export function DraftDialog({
         onTrackRef.current(latest)
         setBusy(true)
         setMode('job')
-      } else if (latest.status !== 'succeeded') {
+      } else if (latest.status !== 'succeeded' || jobBlank(latest) > 0) {
         setLast(latest)
       }
     }, () => {})
     return () => { alive = false }
   }, [inSetup, sourceId])
+
+  // 预先选好范围回到设置（打开时给的、结果里点的）：焦点放进起草要求
+  useEffect(() => {
+    if (!focusGuidance || mode !== 'setup' || !useModel) return
+    const el = document.getElementById(GUIDANCE_ID)
+    if (!el) return
+    el.focus()
+    setFocusGuidance(false)
+  }, [focusGuidance, mode, useModel])
 
   // 起草模型：设置里的 catalog_draft 填了就是它；没填跟随助手的模型（写出当前是哪个，用不了时写原因）
   useEffect(() => {
@@ -194,6 +221,26 @@ export function DraftDialog({
     setBusy(false)
     setMode('job')
   }
+  /**
+   * 结果里「重新起草这几张表」（有留空列的表）：回到设置，范围就是这几张，勾上用模型，焦点放进起草要求——先补上
+   * 缩写和术语的含义再开始。任务本身不动（页面照旧跟着它，开始新的起草才换）
+   */
+  const redraftBlank = (names: string[]) => {
+    setPreset({ tables: names, label: DT.scopeBlank(names.length) })
+    setScope('preset')
+    setUseModel(true)
+    setFocusGuidance(true)
+    setStartError(null)
+    setActionError(null)
+    setBusy(false)
+    setLast(null)
+    setMode('setup')
+  }
+  /** 结果里有留空列、还在表结构里的表（「重新起草这几张表」的范围） */
+  const blankTables = useMemo(
+    () => (job ? job.tasks.filter((t) => blankOf(t) > 0 && liveSet.has(t.table_name)).map((t) => t.table_name) : []),
+    [job, liveSet],
+  )
 
   const phase: 'setup' | 'running' | 'done' = inSetup ? 'setup' : isJobActive(job) ? 'running' : 'done'
   const canStart = !!tables.length && !tooMany && !(useModel && (guidanceOver || noteOver)) && !starting
@@ -263,7 +310,7 @@ export function DraftDialog({
                     {modelLine?.warn && <span className="block text-[var(--warn)]" data-draft-model-warn="">{modelLine.warn}</span>}
                   </div>
                   <div data-draft-guidance="">
-                    <Field label={DT.guidance} htmlFor="catalog-draft-guidance" hint={DT.guidanceHint}
+                    <Field label={DT.guidance} htmlFor={GUIDANCE_ID} hint={DT.guidanceHint}
                            error={guidanceOver ? DT.tooLong(DRAFT_GUIDANCE_MAX) : undefined}>
                       {(p) => (
                         <textarea {...p} className="field min-h-[4.5rem] resize-y text-xs leading-relaxed" rows={3} value={guidanceText}
@@ -292,9 +339,14 @@ export function DraftDialog({
               )}
             </div>
             {last && (
+              // 没写全的用警告色；都写完了、只是有留空列的是提示
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-3 py-2 text-2xs text-dim" data-draft-last={last.status}>
-                <TriangleAlert size={11} className="shrink-0" style={{ color: 'var(--warn)' }} aria-hidden />
-                <span className="min-w-0 flex-1">{DT.last(DT.title[last.status], formatTime(last.finished_at ?? last.created_at))}</span>
+                {last.status === 'succeeded'
+                  ? <Info size={11} className="shrink-0" style={{ color: 'var(--accent)' }} aria-hidden />
+                  : <TriangleAlert size={11} className="shrink-0" style={{ color: 'var(--warn)' }} aria-hidden />}
+                <span className="min-w-0 flex-1">
+                  {DT.last(DT.lastState(DT.title[last.status], jobBlank(last)), formatTime(last.finished_at ?? last.created_at))}
+                </span>
                 <button type="button" className="btn btn-sm" onClick={() => openLast(last)} data-draft-last-open="">{DT.lastOpen}</button>
               </div>
             )}
@@ -303,7 +355,8 @@ export function DraftDialog({
         )}
 
         {phase !== 'setup' && job && (
-          <JobView key={job.id} job={job} running={phase === 'running'} stopping={stopping} busy={busy} />
+          <JobView key={job.id} job={job} running={phase === 'running'} stopping={stopping} busy={busy}
+                   blankTables={blankTables} onRedraftBlank={redraftBlank} />
         )}
         {phase !== 'setup' && actionError && <Notice tone="err" attr={{ 'data-draft-action-error': '' }}>{actionError}</Notice>}
       </div>
@@ -319,13 +372,26 @@ function Counter({ n, max }: { n: number; max: number }) {
   )
 }
 
-/** 任务的进度或结果：标题、总进度、提醒（进行中）、合计、模型和用量（超时、没写出来的次数）、没写全的表、逐表列表 */
-function JobView({ job, running, stopping, busy }: { job: CatalogDraftJob; running: boolean; stopping: boolean; busy: boolean }) {
+/**
+ * 任务的进度或结果：标题、总进度、提醒（进行中）、合计、模型和用量（超时、没写出来的次数）、没写全的表、留空的列合计
+ * （结束后）、逐表列表
+ */
+function JobView({ job, running, stopping, busy, blankTables, onRedraftBlank }: {
+  job: CatalogDraftJob
+  running: boolean
+  stopping: boolean
+  busy: boolean
+  /** 有留空列、还在表结构里的表：结束后给「重新起草这几张表」 */
+  blankTables: string[]
+  onRedraftBlank: (tables: string[]) => void
+}) {
   const problems = job.tasks.filter((t) => RETRYABLE.has(t.status))
+  // 结束后默认只列要看的表：没写全的、有留空列的（几百张表里找它们太费劲），可以展开全部
+  const attention = job.tasks.filter(needsLook)
+  const blankCount = job.tasks.filter((t) => blankOf(t) > 0).length
   const [showAll, setShowAll] = useState(false)
-  // 结束后有没写全的表时默认只列这些（几百张表里找失败的太费劲），可以展开全部
-  const onlyProblems = !running && problems.length > 0 && !showAll
-  const tasks = onlyProblems ? problems : job.tasks
+  const onlyProblems = !running && attention.length > 0 && !showAll
+  const tasks = onlyProblems ? attention : job.tasks
   const title = running ? (stopping ? DT.stopping : DT.title[job.status]) : DT.title[job.status]
   const empty = nothingWritten(job)
   const summary = empty === 'model' ? CT.draftNothingWritten
@@ -351,6 +417,7 @@ function JobView({ job, running, stopping, busy }: { job: CatalogDraftJob; runni
   const notice = running ? job.notice?.trim() ?? '' : ''
   // 额度用完、超时多了，之后的段缩小了：进行中写一句，段数为什么变多看得明白
   const partColumns = running && job.use_model && job.part_columns != null && job.part_columns < DRAFT_PART_COLUMNS ? job.part_columns : null
+  const blankTotal = jobBlank(job)
   return (
     <div className="min-w-0 space-y-3">
       {busy && <Notice tone="info" attr={{ 'data-draft-busy': '' }}>{DT.busy}</Notice>}
@@ -388,14 +455,27 @@ function JobView({ job, running, stopping, busy }: { job: CatalogDraftJob; runni
       {problemText && (
         <p className="text-xs leading-relaxed" data-draft-problems="">{problemText}</p>
       )}
+      {!running && blankTotal > 0 && (
+        // 留空的列不算没写全（表照样是已完成）：写合计和办法，给「重新起草这几张表」回到设置先补起草要求
+        <Notice tone="info" attr={{ 'data-draft-blank-summary': '' }}>
+          <p className="font-medium">{DT.blankTotal(blankTotal, blankCount)}</p>
+          <p className="mt-0.5 text-dim">{DT.blankAdvice}</p>
+          {blankTables.length > 0 && (
+            <button type="button" className="btn btn-sm mt-2" title={DT.blankRedraftHint} onClick={() => onRedraftBlank(blankTables)}
+                    data-draft-blank-redraft="">
+              <Sparkles size={11} aria-hidden /> {DT.blankRedraft(blankTables.length)}
+            </button>
+          )}
+        </Notice>
+      )}
       <div>
         <div className="mb-1 flex items-center gap-2">
           <span className="text-2xs font-medium text-dim" id="catalog-draft-tasks-label">{DT.tasks}</span>
           <span className="flex-1" />
-          {!running && problems.length > 0 && problems.length < job.tasks.length && (
+          {!running && attention.length > 0 && attention.length < job.tasks.length && (
             <button type="button" className="rounded px-1 text-2xs text-[var(--accent)] outline-none hover:underline focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
                     aria-pressed={showAll} onClick={() => setShowAll((v) => !v)} data-draft-show-all="">
-              {showAll ? DT.showProblems : DT.showAll(job.tasks.length)}
+              {showAll ? (blankCount ? DT.showProblemsBlank : DT.showProblems) : DT.showAll(job.tasks.length)}
             </button>
           )}
         </div>
@@ -420,13 +500,16 @@ const TASK_ICON: Record<CatalogDraftTaskStatus, { Icon: LucideIcon | null; color
 
 /**
  * 逐表的一行。jobError：任务整体的原因（整体出错、服务重启中断时服务端把没结束的表也记上同一句）。和它一样的不再逐表
- * 重复——几百张表各写一遍同一句，真正各有原因的那几张反而找不到；任务的原因已经写在上面（标题、提示）
+ * 重复——几百张表各写一遍同一句，真正各有原因的那几张反而找不到；任务的原因已经写在上面（标题、提示）。
+ * 有留空的列时再写一行「N 列模型拿不准、留空了」：列名悬停看得到，也可以展开（服务端最多给 5 个）
  */
 function TaskRow({ task: t, jobError }: { task: CatalogDraftTask; jobError: string | null }) {
   const { Icon, color } = TASK_ICON[t.status]
   const reason = jobError && t.error === jobError ? (t.model_error ?? '') : taskReason(t)
   const parts = t.parts_total != null && t.parts_total > 1 && t.status !== 'pending' && t.status !== 'skipped'
   const changes = DT.taskAdded(t.added, t.updated)
+  const blank = blankOf(t)
+  const sample = t.blank_sample?.filter(Boolean) ?? []
   return (
     <li className="min-w-0 px-3 py-1.5" data-draft-task={t.table_name} data-status={t.status}>
       <div className="flex min-w-0 items-center gap-2 text-xs">
@@ -448,6 +531,14 @@ function TaskRow({ task: t, jobError }: { task: CatalogDraftTask; jobError: stri
       {reason && (
         <p className="mt-0.5 break-words pl-5 text-2xs leading-relaxed text-dim" data-draft-task-reason="">{reason}</p>
       )}
+      {blank > 0 && (sample.length
+        ? (
+          <details className="mt-0.5 pl-5 text-2xs leading-relaxed text-dim" data-draft-task-blank={blank}>
+            <summary className="cursor-pointer select-none hover:text-fg" title={DT.blankSample(sample, blank)}>{DT.blank(blank)}</summary>
+            <p className="break-words text-faint" data-draft-task-blank-sample="">{DT.blankSample(sample, blank)}</p>
+          </details>
+        )
+        : <p className="mt-0.5 pl-5 text-2xs leading-relaxed text-dim" data-draft-task-blank={blank}>{DT.blank(blank)}</p>)}
     </li>
   )
 }
