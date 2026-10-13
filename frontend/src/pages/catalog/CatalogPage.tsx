@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, BookMarked, Database, ListFilter as ListFilterIcon, ScanSearch, Sparkles } from 'lucide-react'
+import { ArrowLeft, BookMarked, Database, ListFilter as ListFilterIcon, ScanSearch, Sparkles, TriangleAlert } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import type { CatalogDetail, CatalogList, CatalogTableRow } from '../../types'
@@ -203,6 +203,8 @@ export function CatalogPage() {
   const stripJob: { done: number; total: number; status: string } | null = draftJob && (draftActive || draftJob.id === listActive?.id)
     ? (draftActive ? draftJob : null)
     : listActive
+  // 调用接连没写出来的提醒：关着对话框时也要看得到（上方的进度带着它）
+  const stripNotice = draftActive ? draftJob?.notice?.trim() || null : null
 
   const options = savedOptions?.sourceId === sourceId ? savedOptions.options : source?.options
   const profileSettings = useMemo(() => profileSettingsOf(options), [options])
@@ -430,7 +432,7 @@ export function CatalogPage() {
                              onGoSource={() => navigate(back)} />
       )}
       {hasTables && usage.used > 0 && !empty && <UsageSummary {...usage} active={usedOnly ? filter : null} onFocus={focusUsed} />}
-      {hasTables && stripJob && !draftOpen && <DraftStrip job={stripJob} onOpen={openDraft} />}
+      {hasTables && stripJob && !draftOpen && <DraftStrip job={stripJob} notice={stripNotice} onOpen={openDraft} />}
       {body}
       {draftOpen && data && (
         <DraftDialog
@@ -481,9 +483,14 @@ export function CatalogPage() {
 }
 
 /**
- * 起草任务在进行：目录页上方一条进度（关掉对话框任务照常进行，每张表起草完就写进目录）。点「查看进度」回到对话框
+ * 起草任务在进行：目录页上方一条进度（关掉对话框任务照常进行，每张表起草完就写进目录）。点「查看进度」回到对话框。
+ * notice：调用接连没写出来时服务端给的提醒，跟着写一行（全文在悬停里，对话框里也有）
  */
-function DraftStrip({ job, onOpen }: { job: { done: number; total: number; status: string }; onOpen: () => void }) {
+function DraftStrip({ job, notice, onOpen }: {
+  job: { done: number; total: number; status: string }
+  notice: string | null
+  onOpen: () => void
+}) {
   const text = job.status === 'queued' ? DT.stripQueued(job.total) : DT.strip(job.done, job.total)
   return (
     <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2 text-xs"
@@ -492,6 +499,13 @@ function DraftStrip({ job, onOpen }: { job: { done: number; total: number; statu
       <Spinner size={12} />
       <div className="min-w-0 flex-1">
         <p className="truncate font-medium" title={text}>{text}</p>
+        {notice && (
+          <p className="mt-0.5 flex min-w-0 items-center gap-1 text-2xs text-[var(--warn)]" role="status" title={notice}
+             data-catalog-draft-notice="">
+            <TriangleAlert size={10} className="shrink-0" aria-hidden />
+            <span className="min-w-0 truncate">{notice}</span>
+          </p>
+        )}
         <div className="mt-1 h-1 max-w-xs overflow-hidden rounded-full bg-hover" role="progressbar" aria-label={text}
              aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={job.done}>
           <div className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-300"

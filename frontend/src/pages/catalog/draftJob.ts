@@ -36,6 +36,9 @@ export const retryableCount = (j: CatalogDraftJob): number => j.tasks.filter((t)
 /** 一张表这次为什么没写全：整张表没起草的原因在前，模型那部分的原因在后 */
 export const taskReason = (t: { error: string | null; model_error: string | null }): string => t.error ?? t.model_error ?? ''
 
+/** 每段最多几列（服务端起草的起始上限）。任务里的当前上限比它小：额度用完、超时多了，之后的段缩小了 */
+export const DRAFT_PART_COLUMNS = 40
+
 /**
  * 一项都没写进去的任务该怎么说（只对写完了的任务：完成、部分完成）。null：照常写合计。
  * 用模型、却没有一张表拿到模型的可用内容：目录没有更新、模型没给内容；有表没写全：目录没有更新、原因见下方；

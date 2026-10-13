@@ -2901,6 +2901,19 @@ export interface CatalogDraftTask {
   finished_at: string | null
 }
 
+/** 起草任务的模型用量 */
+export interface CatalogDraftUsage {
+  /** 调用次数（没写出来的、超时的也算） */
+  calls: number
+  /** 超时的调用不计 token（照实记 0：服务方可能已经生成了内容） */
+  input_tokens: number
+  output_tokens: number
+  /** 超时的调用次数。老服务端没有这个键 */
+  timeouts?: number
+  /** 没写出来的调用次数：额度用完、只给空壳、超时、出错。老服务端没有这个键 */
+  failed_calls?: number
+}
+
 /** 一次起草任务 */
 export interface CatalogDraftJob {
   id: string
@@ -2929,7 +2942,17 @@ export interface CatalogDraftJob {
   updated: number
   removed: number
   /** 模型调用的用量；拿不到用量时照实是 0 */
-  usage: { calls: number; input_tokens: number; output_tokens: number }
+  usage: CatalogDraftUsage
+  /**
+   * 当前每段最多几列：一次起草里额度用完或超时累计 2 次后，之后新开始的段减半（40 → 20 → 10，最低 10）。
+   * 不用模型时可能为 null；老服务端没有这个键
+   */
+  part_columns?: number | null
+  /**
+   * 调用接连没写出来时的提醒（一句中文：最近几次里几次没写出来、原因，建议换起草模型、缩小范围或停止）；
+   * 好转后服务端清掉，为 null。老服务端没有这个键
+   */
+  notice?: string | null
   /** 任务整体出错的原因 */
   error: string | null
   tasks: CatalogDraftTask[]

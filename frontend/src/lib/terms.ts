@@ -2390,8 +2390,11 @@ export const CATALOG_TEXT = {
 // - 「起草要求」：使用者补充给模型的业务背景和用词约定，存在数据源上，以后每次用模型起草都带上；
 //   「本次补充说明」只用于这一次（重试时沿用）。两者都只交给模型，不改起草规则：冲突时以规则为准。
 // - 「起草模型」：设置里单独的一项（偏好设置 → 起草模型），留空跟随助手的模型。
-// - 宽表的「段」：超过 40 列的表拆成表级一段和若干列分段，逐段起草；写的是「已完成 3 / 9 段」。
+// - 宽表的「段」：超过 40 列的表拆成表级一段和若干列分段，逐段起草；写的是「已完成 3 / 9 段」。模型多次用完额度或
+//   超时后，之后的段缩小（每段最多 20 列、10 列）。
 // - 「只重试失败的表」：重新起草失败、部分完成和已停止的表；已经写进目录的内容不回滚、不受影响。
+// - 「没写出来」：一次调用没有写出内容（额度用完、只给空壳、超时、出错）。接连没写出来时服务端给一句「提醒」，
+//   好转后收起；提醒是提醒的样式，不是错误。超时的调用不计用量。
 // ===========================================================================
 
 /** 起草要求、本次补充说明的字数上限（服务端同一个数：超长 422） */
@@ -2441,6 +2444,19 @@ export const CATALOG_DRAFT_TEXT = {
   modelUsed: (model: string) => `模型：${model}`,
   usage: (calls: number, input: number, output: number) =>
     `调用模型 ${formatNumber(calls)} 次，输入 ${formatTokens(input, { compact: true })}、输出 ${formatTokens(output, { compact: true })}`,
+  /**
+   * 用量那一行接着写的：没写出来、超时的调用各几次（没有的不写）。没写出来的次数里含超时的，写成「其中」，免得
+   * 读成两个数相加
+   */
+  usageFailures: (timeouts: number, failed: number) => {
+    if (failed && timeouts && timeouts <= failed) return `没写出来 ${formatNumber(failed)} 次（其中超时 ${formatNumber(timeouts)} 次）`
+    return [failed ? `没写出来 ${formatNumber(failed)} 次` : '', timeouts ? `超时 ${formatNumber(timeouts)} 次` : ''].filter(Boolean).join('、')
+  },
+  usageFailuresHint: '没写出来：调用没有写出内容，包括额度用完、只给空壳、超时和出错',
+  // 超时的调用服务端照实记 0 个 token，服务方却可能已经生成了内容
+  timeoutNote: '超时的调用不计用量，实际用量可能更多',
+  /** 额度用完、超时多了，服务端把之后的段缩小了 */
+  partColumns: (n: number) => `模型多次用完额度或超时，之后的段每段最多 ${formatNumber(n)} 列`,
   // ---- 结束
   title: {
     queued: '排队中，等待开始…',

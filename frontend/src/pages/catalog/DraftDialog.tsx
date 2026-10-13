@@ -9,7 +9,8 @@ import { errorMessage } from '../../lib/errors'
 import { formatTime } from '../../lib/format'
 import { CATALOG_DRAFT_TEXT as DT, CATALOG_TEXT as CT, DRAFT_GUIDANCE_MAX, DRAFT_NOTE_MAX } from '../../lib/terms'
 import {
-  DRAFT_MAX_TABLES, DRAFT_MODEL_UNAVAILABLE, DRAFT_TOP_N, RETRYABLE, isJobActive, nothingWritten, retryableCount, taskReason,
+  DRAFT_MAX_TABLES, DRAFT_MODEL_UNAVAILABLE, DRAFT_PART_COLUMNS, DRAFT_TOP_N, RETRYABLE, isJobActive, nothingWritten, retryableCount,
+  taskReason,
 } from './draftJob'
 import type { DraftStartBody } from './draftJob'
 
@@ -17,8 +18,9 @@ import type { DraftStartBody } from './draftJob'
 // 起草数据目录。起草是服务端的后台任务：这里选范围、写起草要求和本次补充说明，建任务；之后显示页面跟着的那个任务
 // （进行中的进度、结束后的结果），任务本身的状态在页面上（draftJob.ts），关掉对话框照常进行。
 //
-// 三段：设置（范围、用不用模型；用模型时写起草要求、补充说明，写明用哪个起草模型）→ 进行中（总进度、合计、逐表的
-// 状态和宽表的段进度、没写全的原因；可以停止、在后台继续）→ 结束（汇总、没写全的表和原因、只重试失败的表）。
+// 三段：设置（范围、用不用模型；用模型时写起草要求、补充说明，写明用哪个起草模型）→ 进行中（总进度、合计、调用接连
+// 没写出来时的提醒、逐表的状态和宽表的段进度、没写全的原因；可以停止、在后台继续）→ 结束（汇总、没写全的表和原因、
+// 只重试失败的表）。
 // 已经写进目录的内容不回滚——起草只增改推断项，人工确认、驳回过的项服务端不会动。
 // ===========================================================================
 
@@ -317,7 +319,7 @@ function Counter({ n, max }: { n: number; max: number }) {
   )
 }
 
-/** 任务的进度或结果：标题、总进度、合计、模型和用量、没写全的表、逐表列表 */
+/** 任务的进度或结果：标题、总进度、提醒（进行中）、合计、模型和用量（超时、没写出来的次数）、没写全的表、逐表列表 */
 function JobView({ job, running, stopping, busy }: { job: CatalogDraftJob; running: boolean; stopping: boolean; busy: boolean }) {
   const problems = job.tasks.filter((t) => RETRYABLE.has(t.status))
   const [showAll, setShowAll] = useState(false)
@@ -342,6 +344,13 @@ function JobView({ job, running, stopping, busy }: { job: CatalogDraftJob; runni
   const progress = running ? DT.progress(job.done, job.total) : DT.progressDone(ok, job.total)
   const tone = job.status === 'failed' ? 'var(--err)' : running ? 'var(--accent)' : problems.length ? 'var(--warn)' : 'var(--st-done)'
   const pct = job.total ? (value / job.total) * 100 : 0
+  const { usage } = job
+  const timeouts = usage.timeouts ?? 0
+  const failures = DT.usageFailures(timeouts, usage.failed_calls ?? 0)
+  // 调用接连没写出来时服务端给的提醒：进行中写在进度条下面（提醒，不是错误）；好转后服务端清掉
+  const notice = running ? job.notice?.trim() ?? '' : ''
+  // 额度用完、超时多了，之后的段缩小了：进行中写一句，段数为什么变多看得明白
+  const partColumns = running && job.use_model && job.part_columns != null && job.part_columns < DRAFT_PART_COLUMNS ? job.part_columns : null
   return (
     <div className="min-w-0 space-y-3">
       {busy && <Notice tone="info" attr={{ 'data-draft-busy': '' }}>{DT.busy}</Notice>}
@@ -355,14 +364,22 @@ function JobView({ job, running, stopping, busy }: { job: CatalogDraftJob; runni
            aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={value}>
         <div className="h-full rounded-full transition-[width] duration-300" style={{ width: `${pct}%`, background: tone }} />
       </div>
+      {notice && <Notice tone="warn" className="break-words" attr={{ 'data-draft-notice': '' }}>{notice}</Notice>}
       <p className="tnum text-sm" data-draft-summary="">{summary}</p>
-      {(job.model || job.usage.calls > 0) && (
-        <p className="flex flex-wrap gap-x-3 gap-y-0.5 text-2xs text-faint">
-          {job.model && <span className="break-all" data-draft-model-used="">{DT.modelUsed(job.model)}</span>}
-          {job.usage.calls > 0 && (
-            <span className="tnum" data-draft-usage="">{DT.usage(job.usage.calls, job.usage.input_tokens, job.usage.output_tokens)}</span>
-          )}
-        </p>
+      {(job.model || usage.calls > 0 || failures) && (
+        <div className="space-y-0.5 text-2xs leading-relaxed text-faint">
+          <p className="flex flex-wrap gap-x-3 gap-y-0.5" data-draft-usage-line="">
+            {job.model && <span className="break-all" data-draft-model-used="">{DT.modelUsed(job.model)}</span>}
+            {usage.calls > 0 && (
+              <span className="tnum" data-draft-usage="">{DT.usage(usage.calls, usage.input_tokens, usage.output_tokens)}</span>
+            )}
+            {failures && (
+              <span className="tnum text-[var(--warn)]" title={DT.usageFailuresHint} data-draft-usage-failures="">{failures}</span>
+            )}
+          </p>
+          {timeouts > 0 && <p data-draft-timeout-note="">{DT.timeoutNote}</p>}
+          {partColumns != null && <p data-draft-part-columns={partColumns}>{DT.partColumns(partColumns)}</p>}
+        </div>
       )}
       {running && <p className="text-2xs leading-relaxed text-faint">{DT.hideHint}</p>}
       {job.status === 'failed' && job.error && <Notice tone="err" attr={{ 'data-draft-job-error': '' }}>{job.error}</Notice>}
