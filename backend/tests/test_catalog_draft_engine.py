@@ -553,3 +553,41 @@ def test_budget_words_match_the_other_drafts():
     from app.data import recipe_ai
 
     assert D.BUDGET_WORDS == recipe_ai._BUDGET_WORDS
+
+
+# --------------------------------------------------------------------------
+# 从正文里取 JSON
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text, tables, truncated", [
+    # 前面有一句话、带括号的说明、围栏
+    ('按 {table} 的格式写好了：\n```json\n{"tables": [{"table": "a", "label": "甲"}]}\n```', ["a"], False),
+    ('[说明] 草稿：{"tables": [{"table": "a"}]} 以上', ["a"], False),
+    # 外面多包了一层
+    ('{"result": {"tables": [{"table": "a"}, {"table": "b"}]}}', ["a", "b"], False),
+    # 截断在字符串、数字、字面量、键名中间：只收写完了的
+    ('{"tables": [{"table": "a", "label": "甲"}, {"table": "b", "label": "乙', ["a", "b"], True),
+    ('{"tables": [{"table": "a", "columns": [{"name": "x", "label": "某"}, {"name": "y", "len": 12', ["a"], True),
+    ('{"tables": [{"table": "a", "keys": ["x", "y"', ["a"], True),
+    ('{"tables": [{"table": "a"}, {"tab', ["a"], True),
+    ('{"tables": [{"table": "a", "flag": tr', ["a"], True),
+])
+def test_json_is_taken_from_the_text(text, tables, truncated):
+    reply = D._parse_text(text, cut=False)
+    assert reply is not None and [e["table"] for e in reply.entries] == tables
+    assert reply.truncated is truncated
+
+
+def test_cut_values_are_dropped_and_complete_ones_kept():
+    text = '{"tables": [{"table": "a", "label": "甲", "keys": ["x", "y"], "columns": [{"name": "x", "label": "某"}, ' \
+           '{"name": "y", "label": "半'
+    entry = D._parse_text(text, cut=True).entries[0]
+    assert entry == {"table": "a", "label": "甲", "keys": ["x", "y"], "columns": [{"name": "x", "label": "某"}]}
+    cut_keys = D._parse_text('{"tables": [{"table": "a", "label": "甲", "keys": ["x", "y"', cut=True).entries[0]
+    assert cut_keys == {"table": "a", "label": "甲"}, "没写完的业务主键整项不要，不能只留前半"
+
+
+@pytest.mark.parametrize("text", ["好的，我来写", "{坏的 json}", ""])
+def test_not_json_is_not_a_reply(text):
+    assert D._parse_text(text, cut=False) is None

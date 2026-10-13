@@ -1449,6 +1449,7 @@ status 状态；attribute 属性）。
 规矩：
 - 只写数据事实，不写计算公式，不写指标怎么算。
 - 拿不准的字段留空，不要猜。列名、表名照原样写，不要翻译或改写。
+- 请你写的每一列都在 columns 里写一项，拿不准的字段可以留空，但不要漏掉列：漏掉的列会被再问一次。
 - 标着「系统说明」的内容是导入时按核对结果生成的，以它为准：不要重复，也不要与之矛盾。
 - 标着「已确认」的目录项由人工确认过，以它为准。
 - 表名下一行写着「这次只写……」的表，只写它说的那部分：只写表级的项时不写列，只写列出的几列时不写表级的项、\
@@ -1464,10 +1465,10 @@ CATALOG_DRAFT_BACKGROUND_PROMPT = "使用者补充的背景和要求：\n{lines}
 
 #: 纯文本那条路（结构化输出用不了时）：没有 JSON Schema 约束，要把格式说清
 CATALOG_DRAFT_TEXT_PROMPT = """只输出一个 JSON 对象，不要输出别的文字，格式如下（拿不准的字段不写）：
-{"tables": [{"table": "表名", "label": "中文名", "grain": "一行代表什么", "kind": "fact", "keys": ["列名"], \
+{"tables": [{"table": "表名", "label": "中文名", "grain": "一行代表什么", "kind": "表类型", "keys": ["列名"], \
 "business_date": {"column": "列名", "rule": "一句规则", "timezone": "时区"}, \
-"columns": [{"name": "列名", "label": "中文名", "meaning": "含义", "unit": "单位", "measure": "flow"}]}]}
-kind 取 fact、dimension、snapshot、log、config 之一；measure 取 flow、stock、ratio、identifier、status、attribute 之一。"""
+"columns": [{"name": "列名", "label": "中文名", "meaning": "含义", "unit": "单位", "measure": "度量类型"}]}]}
+表类型写 fact、dimension、snapshot、log、config 之一；度量类型写 flow、stock、ratio、identifier、status、attribute 之一。"""
 
 #: 拼表结构描述用的固定片段（写给模型）
 CATALOG_DRAFT_PROMPT_LABELS = {

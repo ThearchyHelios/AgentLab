@@ -215,6 +215,29 @@ async def test_a_table_whose_model_part_failed_is_failed_but_structure_is_writte
     assert by["channels"]["status"] == "ok"
 
 
+async def test_a_job_that_cannot_start_is_failed_with_the_reason(client, monkeypatch):
+    """建任务时起草模型还能用，开始起草时已经用不了（接入刚被停用）：任务整体 failed，error 写原因，没开始的表也记 failed。"""
+    sid = await _source()
+    calls: list[int] = []
+
+    async def flaky(session):
+        calls.append(1)
+        if len(calls) > 1:
+            raise catalog.CatalogModelUnavailable("起草模型使用的模型接入「虚构接入」已停用")
+        return FakeModel(REPLIES), "fake-model"
+
+    monkeypatch.setattr(catalog, "resolve_draft_model", flaky)
+    job = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["visits", "gates"],
+                                                                "use_model": True})).json()["job"]
+    await finished(job["id"])
+    got = await get_job(client, sid, job["id"])
+    assert got["status"] == "failed" and got["error"] == "起草模型使用的模型接入「虚构接入」已停用"
+    assert {t["status"] for t in got["tasks"]} == {"failed"} and got["finished_at"]
+    assert all(t["error"] == got["error"] for t in got["tasks"])
+    retry = await client.post(f"{_base(sid)}/draft-jobs/{job['id']}/retry")
+    assert retry.status_code == 409 and retry.json()["code"] == "catalog_draft_model_unavailable"
+
+
 async def test_busy_source_is_409_and_the_active_job_is_reachable(client, monkeypatch):
     sid = await _source()
     model = Held(REPLIES, hold={"visits"})

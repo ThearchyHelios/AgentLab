@@ -407,21 +407,29 @@ class _JobRun:
             current = asyncio.current_task()
             if current is not None:
                 current.uncancel()
-            await self._settle()
             if self.stop_reason == "user":
-                await self._write(_close, self.job_id, "cancelled", None, "cancelled", None)
+                await self._end("cancelled", None, "cancelled", None)
             else:
-                await self._write(_close, self.job_id, "interrupted", INTERRUPTED_ERROR, "cancelled", INTERRUPTED_ERROR)
+                await self._end("interrupted", INTERRUPTED_ERROR, "cancelled", INTERRUPTED_ERROR)
         except _JobFailed as e:
-            await self._settle()
-            await self._write(_close, self.job_id, "failed", str(e), "failed", str(e))
+            await self._end("failed", str(e), "failed", str(e))
         except Exception as e:  # noqa: BLE001 - 任务整体出错：照实记下，不留在「起草中」
             from app.core.errors import describe_exception, first_line
 
             logger.exception("数据目录起草任务 %s 出错", self.job_id)
-            await self._settle()
             reason = JOB_ERROR.format(line=first_line(e) or describe_exception(e))
-            await self._write(_close, self.job_id, "failed", reason, "failed", reason)
+            await self._end("failed", reason, "failed", reason)
+
+    async def _end(self, job_status: str, job_error: str | None, task_status: str, task_error: str | None) -> None:
+        """停止、出错时收尾：等手上的库写入写完，再把没结束的表和任务记下来。收尾本身写不进去只记日志（下次启动时
+        startup 会把它标成中断）。"""
+        try:
+            await self._settle()
+            await self._write(_close, self.job_id, job_status, job_error, task_status, task_error)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("数据目录起草任务 %s 收尾时写库出错", self.job_id)
 
     async def _run(self) -> None:
         if not await self._write(self._claim):
@@ -617,7 +625,7 @@ class DraftJobs:
         if run is not None:
             await asyncio.wait([run.task], timeout=timeout)  # type: ignore[list-item]
 
-    async def shutdown(self, *, grace: float = 5.0) -> None:
+    async def shutdown(self, *, grace: float = 3.0) -> None:
         """关停：停掉进行中的任务（标中断），最多等 grace 秒收尾。"""
         runs = [run for job_id in list(self._runs) if (run := self._alive(job_id)) is not None]
         for run in runs:

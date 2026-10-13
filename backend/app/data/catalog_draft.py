@@ -347,15 +347,18 @@ def _array(text: str, i: int, depth: int) -> tuple[Any, int, bool]:
         out.append(value)
 
 
-def _json_prefix(text: str) -> tuple[Any, bool] | None:
-    """正文里的第一个 JSON 值：(值, 写完了没有)。前面可以有一句话、围栏，后面可以有别的字；不是 JSON 返回 None。"""
-    for start in sorted(k for k in (text.find("{"), text.find("[")) if k >= 0):
-        try:
-            value, _, complete = _value(text, start, 0)
-        except (_Bad, RecursionError):
-            continue
-        return value, complete
-    return None
+#: 正文里最多试几个 { 或 [ 作为 JSON 的开头（前面的说明文字里也可能有括号）
+_MAX_STARTS = 16
+
+
+def _starts(text: str) -> list[int]:
+    out: list[int] = []
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            out.append(i)
+            if len(out) >= _MAX_STARTS:
+                break
+    return out
 
 
 def _entry(item: Any) -> dict[str, Any] | None:
@@ -398,16 +401,22 @@ def _tables_of(root: Any) -> list[dict[str, Any]] | None:
 
 
 def _parse_text(text: str, cut: bool) -> _Reply | None:
-    found = _json_prefix(text)
-    if found is None:
-        return None
-    root, complete = found
-    entries = _tables_of(root)
-    if entries is None:
-        return None
-    if complete:
-        return _Reply(entries=entries)
-    return _Reply(entries=entries, truncated=True, exhausted=cut)
+    """正文里的表对象。前面可以有一句话、围栏，后面可以有别的字；JSON 没写完的（截断）只收已经写完的部分。
+    认不出约定的格式返回 None。"""
+    empty: _Reply | None = None
+    for start in _starts(text):
+        try:
+            root, _, complete = _value(text, start, 0)
+        except (_Bad, RecursionError):
+            continue
+        entries = _tables_of(root)
+        if entries is None:
+            continue
+        reply = _Reply(entries=entries) if complete else _Reply(entries=entries, truncated=True, exhausted=cut)
+        if entries:
+            return reply
+        empty = empty or reply           # {} 或 {"tables": []}：后面还可能有真的那一份
+    return empty
 
 
 def _cut_off(raw: Any) -> bool:
@@ -738,7 +747,10 @@ class _Run:
             try:
                 async with model_gate():
                     await self._hook(self.hooks.call_started, [p.table for p in pieces])
-                    return await asyncio.wait_for(self._call(pieces, mode), timeout=C.MODEL_TIMEOUT_S)
+                    reply, raw = await asyncio.wait_for(self._call(pieces, mode), timeout=C.MODEL_TIMEOUT_S)
+                # 用量记在时限之外：落库慢了不能把已经回来的这次调用算成超时
+                await self._usage(raw)
+                return reply
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - 按原因分别处理
@@ -760,16 +772,15 @@ class _Run:
                     continue
                 return _Reply(error=self._call_error(e, kind, retried))
 
-    async def _call(self, pieces: list[_Piece], mode: str) -> _Reply:
+    async def _call(self, pieces: list[_Piece], mode: str) -> tuple[_Reply, Any]:
+        """一次调用：(读好的回复, 原始回复)。原始回复给用量用（测试的假模型没有，是 None）。"""
         messages = self._messages(pieces, mode)
         if mode == "structured":
             runnable = self.model.with_structured_output(C.CATALOG_DRAFT_PROMPT_SCHEMA, include_raw=True)
             raw, parsed = _unpack(await runnable.ainvoke(messages))
-            await self._usage(raw)
-            return _structured_reply(raw, parsed)
+            return _structured_reply(raw, parsed), raw
         raw = await self.model.ainvoke(messages)
-        await self._usage(raw)
-        return _text_reply(raw)
+        return _text_reply(raw), raw
 
     async def _length_reply(self, e: BaseException) -> _Reply:
         """LengthFinishReasonError：额度用完了。异常里带着那次的回复，能捡回来的照捡。"""
