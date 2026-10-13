@@ -457,20 +457,21 @@ export function TableDetail({
           )}
           {writeError && <Notice tone="err" attr={{ 'data-catalog-write-error': '' }}>{writeError}</Notice>}
           {lastDraft && (lastDraft.status === 'failed' || lastDraft.status === 'partial') && (
-            // 上次起草没写全：写明原因，给「重新起草这张表」（只含这张表、用模型）。有起草任务在进行时等它结束
+            // 上次起草没写全：写明原因，给「重新起草这张表」（只含这张表、用模型）。有起草任务在进行、正在编辑这张表时
+            // 先不给点：起草会写进这张表，编辑中的保存就会撞上版本冲突
             <Notice tone={lastDraft.status === 'failed' ? 'err' : 'warn'} attr={{ 'data-catalog-last-draft': lastDraft.status }}>
               <p className="font-medium">{lastDraft.status === 'failed' ? DT.lastFailed : DT.lastPartial}</p>
               {taskReason(lastDraft) && <p className="mt-0.5 break-words text-dim" data-catalog-last-draft-reason="">{taskReason(lastDraft)}</p>}
               {onRedraft && (
                 <>
-                  <button type="button" className="btn btn-sm mt-2" disabled={draftBusy || redrafting} title={DT.redraftHint}
+                  <button type="button" className="btn btn-sm mt-2" disabled={draftBusy || redrafting || !!edit} title={DT.redraftHint}
                           onClick={async () => {
                             setRedrafting(true)
                             try { await onRedraft(table) } finally { setRedrafting(false) }
                           }} data-catalog-redraft="">
                     {redrafting ? <Spinner size={11} /> : <Sparkles size={11} aria-hidden />} {DT.redraft}
                   </button>
-                  <p className="mt-1 text-2xs text-faint">{draftBusy ? DT.redraftBusy : DT.redraftHint}</p>
+                  <p className="mt-1 text-2xs text-faint">{edit ? DT.redraftEditing : draftBusy ? DT.redraftBusy : DT.redraftHint}</p>
                 </>
               )}
             </Notice>

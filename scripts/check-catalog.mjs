@@ -1214,6 +1214,11 @@ await section('数据目录 · 起草：清单上的失败标记与单表重起�
   await page.locator('[data-catalog-row="order_items"] [data-catalog-open-row]').click()
   await until(async () => (await page.locator('[data-catalog-last-draft]').count()) === 1)
   check('部分完成的表：详情里写「上次起草部分完成」', (await page.locator('[data-catalog-last-draft]').innerText()).includes('上次起草部分完成'))
+  // 正在编辑这张表：起草会写进它，编辑中的保存就会撞上版本冲突，先不给点
+  await page.locator('[data-catalog-edit]').click()
+  check('正在编辑这张表：「重新起草这张表」不能点，写明先保存或取消', await page.locator('[data-catalog-redraft]').isDisabled()
+        && (await page.locator('[data-catalog-last-draft]').innerText()).includes('保存或取消后再重新起草'))
+  await page.locator('[data-catalog-cancel]').click()
   replies.createJob.push(json(MODEL_DOWN, 409))
   await page.locator('[data-catalog-redraft]').click()
   check('模型用不了：提示原因，不打开对话框', await until(async () => (await page.locator('[data-toast]').filter({ hasText: '未配置模型接入' }).count()) > 0)

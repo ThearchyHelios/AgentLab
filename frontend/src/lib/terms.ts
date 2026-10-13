@@ -2495,6 +2495,7 @@ export const CATALOG_DRAFT_TEXT = {
   redraft: '重新起草这张表',
   redraftHint: '用模型重新起草这张表（不带补充说明，带上数据源的起草要求）；人工确认、驳回过的项不会被改动',
   redraftBusy: '已有起草任务在进行，结束后再重新起草这张表',
+  redraftEditing: '正在编辑这张表，保存或取消后再重新起草',
 }
 
 /** 设置页「偏好设置」里「起草模型」一节（服务端 api/settings.py 的 catalog_draft 一组） */
