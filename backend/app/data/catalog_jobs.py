@@ -226,21 +226,19 @@ async def job_brief(session: AsyncSession, job: CatalogDraftJob | None) -> dict[
 
 async def last_drafts(session: AsyncSession, source_id: str) -> dict[str, dict[str, Any]]:
     """每张表最近一次起草任务里的那一项：{表名: {status, job_id, finished_at, error, model_error}}。任务还在进行，
-    就是进行中的状态。只看最近 LAST_DRAFT_JOBS 个任务。"""
-    ids = list((await session.execute(
-        select(CatalogDraftJob.id).where(CatalogDraftJob.source_id == source_id)
-        .order_by(CatalogDraftJob.created_at.desc()).limit(LAST_DRAFT_JOBS)
-    )).scalars())
-    if not ids:
-        return {}
-    rank = {job_id: i for i, job_id in enumerate(ids)}
-    rows = (await session.execute(select(CatalogDraftTask).where(CatalogDraftTask.job_id.in_(ids)))).scalars()
-    out: dict[str, dict[str, Any]] = {}
-    for task in sorted(rows, key=lambda t: (rank[t.job_id], t.seq)):
-        out.setdefault(task.table_name, {"status": task.status, "job_id": task.job_id,
-                                         "finished_at": _iso(task.finished_at), "error": task.error,
-                                         "model_error": task.model_error})
-    return out
+    就是进行中的状态。只看最近 LAST_DRAFT_JOBS 个任务；每张表取哪一项在库里挑好（清单页起草时会反复取）。"""
+    recent = (select(CatalogDraftJob.id).where(CatalogDraftJob.source_id == source_id)
+              .order_by(CatalogDraftJob.created_at.desc()).limit(LAST_DRAFT_JOBS)).scalar_subquery()
+    rank = func.row_number().over(partition_by=CatalogDraftTask.table_name,
+                                  order_by=(CatalogDraftJob.created_at.desc(), CatalogDraftTask.seq)).label("rank")
+    inner = (select(CatalogDraftTask.table_name, CatalogDraftTask.status, CatalogDraftTask.job_id,
+                    CatalogDraftTask.finished_at, CatalogDraftTask.error, CatalogDraftTask.model_error, rank)
+             .join(CatalogDraftJob, CatalogDraftJob.id == CatalogDraftTask.job_id)
+             .where(CatalogDraftJob.id.in_(recent))).subquery()
+    rows = (await session.execute(select(inner).where(inner.c.rank == 1))).mappings()
+    return {row["table_name"]: {"status": row["status"], "job_id": row["job_id"],
+                                "finished_at": _iso(row["finished_at"]), "error": row["error"],
+                                "model_error": row["model_error"]} for row in rows}
 
 
 # ==========================================================================
