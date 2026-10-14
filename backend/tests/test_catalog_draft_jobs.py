@@ -444,6 +444,8 @@ def test_old_job_tables_get_the_new_columns():
         # 闭环第一步：逐段落盘的段数、块进度。存量行是 0 和 NULL：升级前没记这些
         assert conn.execute(text("SELECT parts_written, chunks_total, chunks_done FROM catalog_draft_tasks")) \
             .one() == (0, None, None)
+        # 复核后：逐表的日志（没收下的有效记录条件）。存量行是 NULL，接口给空列表
+        assert conn.execute(text("SELECT log FROM catalog_draft_tasks")).one() == (None,)
 
 
 async def test_a_job_that_cannot_start_is_failed_with_the_reason(client, monkeypatch):
@@ -1035,3 +1037,18 @@ async def test_a_wide_table_whose_closing_write_fails_keeps_the_count_of_parts_o
     assert task["status"] == "failed" and task["error"] == catalog.WRITE_CONFLICT_ERROR
     assert task["parts_written"] == 3, "最后一段没写进去"
     assert len((await client.get(f"{_base(sid)}/wide")).json()["notes"]["columns"]) == 64
+
+
+async def test_a_dropped_filter_is_logged_on_the_task_not_failed(client, monkeypatch):
+    """模型提议的有效记录条件没通过校验：丢掉、不算失败（表照样完成），逐表的 log 里记一条，接口看得到；没有就是
+    空列表。"""
+    sid = await _source()
+    replies = {**REPLIES, "gates": {"label": "闸口",
+                                    "valid_filter": {"condition": "gate_code IN (SELECT 1)", "reason": "猜的"}}}
+    job = await _draft(client, sid, monkeypatch, FakeModel(replies), ["gates", "channels"])
+    by = {t["table_name"]: t for t in job["tasks"]}
+    assert by["gates"]["status"] == "ok" and by["gates"]["model_error"] is None
+    assert by["gates"]["log"] == ["有效记录条件里不能有子查询，模型提议的这一条没有收下：gate_code IN (SELECT 1)"]
+    assert by["channels"]["log"] == []
+    notes = (await client.get(f"{_base(sid)}/gates")).json()["notes"]
+    assert "valid_filter" not in notes and notes["label"]["value"] == "闸口"

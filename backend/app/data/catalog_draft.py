@@ -83,7 +83,8 @@
 剖析核对的也是这一条）。开了数据剖析的源（catalog_profile.profile_settings）：目录里记下的码值交给模型做背景（遮罩的列
 不给，「已确认的目录项」里遮罩列的码值同样不给），表级那段写完后经剖析的只读守卫数一数有效行过滤排除了多少行
 （catalog_profile.check_valid_filter），排除 0% 或 100% 的不收，收下的 note 写上排除比例；没开剖析、连不上的照收，
-note 写没有核对的原因。
+note 写没有核对的原因。没收下的（没通过校验、排除 0% 或 100%）不算失败，在这张表的日志里记一句（ModelOutcome.log，
+起草任务逐表的 log）。
 
 交给模型的是表结构（列、类型、主键、外键、唯一约束、注释）和使用者补充的背景；开了数据剖析的源另给目录里记下的码值
 （剖析取过的取值和含义，遮罩的列不给），别的数据值一概不发。写给模型的文字都在 catalog.py 名字带 _SYSTEM / _PROMPT
@@ -149,6 +150,15 @@ REASON_ABANDONED = "这张表接连 {k} 段都没写出来，剩下的 {n} 段�
 #: 跳过不问的段在「没写出来」记录里的原因（不拼进原因，见 _Run._outcome）
 _SKIPPED = "\0skipped"
 
+# ---- 这张表起草时记下的几句话（不算失败），经 ModelOutcome.log 交给起草任务逐表的 log（界面看得到）
+#: 模型提议的有效记录条件没有收下：why 是原因（没通过校验的说法，或者剖析核对的结果）
+LOG_FILTER_DROPPED = "{why}，模型提议的这一条没有收下：{condition}"
+#: 剖析核对排除了 0% 或 100% 的行
+LOG_FILTER_COUNTED = "{label}按剖析核对{what}（共 {rows} 行）"
+#: 一张表最多记几句；日志里的条件最多写几个字
+LOG_MAX = 10
+_LOG_CONDITION_MAX = 200
+
 # ---- 提醒（最近几次调用多数没写出来），经进度回调交给任务（CatalogDraftJob.notice）
 NOTICE = ("最近 {calls} 次调用有 {failed} 次没写出来（{kinds}）。建议在{place}换一个模型、缩小起草范围，"
           "或者停止这次起草")
@@ -178,7 +188,8 @@ class ModelOutcome:
     （error 写原因）。notes 是写出来的那些（已逐项校验，llm / proposed）；items 是项数。parts_total 分几段起草
     （整表段是 1，宽表是 1 + 列分段数），parts_done 已经结束了几段，parts_written 其中写出了内容的段数。blank：模型拿
     不准、留空了的列（按表结构的顺序；表的状态不因此变）。chunks_total、chunks_done：这张表实际分成的块数和已结束的
-    块数（段被缩小的上限分开、拆成两半后会变多）。"""
+    块数（段被缩小的上限分开、拆成两半后会变多）。log：起草时记下的几句话，不算失败（模型提议的有效记录条件没有收下的
+    原因），最多 LOG_MAX 句。"""
 
     status: str
     notes: dict[str, Any]
@@ -190,6 +201,7 @@ class ModelOutcome:
     parts_written: int = 0
     chunks_total: int = 0
     chunks_done: int = 0
+    log: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -762,6 +774,8 @@ class _Table:
     chunks_done: int = 0
     #: 有效行过滤核对过了（表级那段写完核对一次）
     vetted: bool = False
+    #: 起草时记下的几句话（不算失败）：模型提议的有效记录条件没有收下的原因
+    log: list[str] = field(default_factory=list)
 
     def whole(self, piece: _Piece) -> bool:
         return piece.table_level and len(piece.columns) == len(self.columns)
@@ -1442,7 +1456,13 @@ class _Run:
             gain = _Gain()
             for entry in by_table.get(piece.table, []):
                 gain.named = st.named = True
-                drafted = C._from_model(entry, st.meta, system=self.system, source_kind=self.kind, table=st.name)
+                dropped: list[tuple[str, str]] = []
+                drafted = C._from_model(entry, st.meta, system=self.system, source_kind=self.kind, table=st.name,
+                                        dropped=dropped)
+                if piece.table_level and "valid_filter" not in st.notes:
+                    # 只在请它写表级的项时记：只写几列的那几段里多给的表级的项本来就不要
+                    for why, condition in dropped:
+                        self._log(st, why, condition)
                 notes = _restrict(drafted, piece)
                 cols = entry.get("columns") if isinstance(entry.get("columns"), list) else []
                 gain.answered |= {c.get("name") for c in cols if isinstance(c, dict) and c.get("name") in piece.columns}
@@ -1508,7 +1528,7 @@ class _Run:
         total = len(st.parts) or 1
         part_of = st.part_of()
         progress = {"parts_written": len(st.written_parts), "chunks_total": st.chunks_total,
-                    "chunks_done": st.chunks_done}
+                    "chunks_done": st.chunks_done, "log": list(dict.fromkeys(st.log))[:LOG_MAX]}
         abandoned = self._abandoned_text(st)
         if not items:
             failures = [(why, part_of.get(key, 1)) for key, why in st.failed.items() if why.base != _SKIPPED]
@@ -1614,8 +1634,8 @@ class _Run:
 
         - 目录里人工确认、驳回过的有效行过滤：并入时不会采用这次的提议，不必再查库；
         - 没开数据剖析：照收，note 写「没有核对排除比例（数据源没有开数据剖析）」；
-        - 开了：经剖析的只读守卫数排除比例（catalog_profile.check_valid_filter）。排除 0% 或 100% 的不收（日志记一条，
-          不算失败）；收下的 note 在依据后面写上剖析核对的结果，或者没有核对的原因。"""
+        - 开了：经剖析的只读守卫数排除比例（catalog_profile.check_valid_filter）。排除 0% 或 100% 的不收（这张表的日志
+          记一句，不算失败）；收下的 note 在依据后面写上剖析核对的结果，或者没有核对的原因。"""
         if st.vetted:
             return
         st.vetted = True
@@ -1645,8 +1665,21 @@ class _Run:
         if not found.keep:
             logger.info("起草数据目录：表 %s 的有效行过滤 %s 没有收下：%s", st.name, item.get("value"), found.dropped)
             st.notes.pop("valid_filter", None)
+            why = found.dropped or found.note
+            if found.rows is not None:
+                why = LOG_FILTER_COUNTED.format(label=C.TABLE_FIELD_LABEL["valid_filter"], what=found.dropped,
+                                                rows=f"{found.rows:,}")
+            self._log(st, why, str(item.get("value") or ""))
             return
         item["note"] = _sentences(item.get("note"), found.note)
+
+    @staticmethod
+    def _log(st: _Table, why: str, condition: str) -> None:
+        """这张表的日志记一句：模型提议的有效记录条件没有收下（不算失败）。"""
+        condition = " ".join(condition.split())
+        if len(condition) > _LOG_CONDITION_MAX:
+            condition = condition[:_LOG_CONDITION_MAX] + "…"
+        st.log.append(LOG_FILTER_DROPPED.format(why=why, condition=condition))
 
     @staticmethod
     async def _hook(fn: Callable[..., Awaitable[None]] | None, *args: Any) -> None:
@@ -1790,7 +1823,8 @@ def _sentences(*parts: Any) -> str:
     return "。".join(texts)
 
 
-__all__ = ["BUDGET_WORDS", "Background", "CallReport", "FAILURE_LABEL", "Hooks", "ModelOutcome", "NOTICE", "PartWrite",
+__all__ = ["BUDGET_WORDS", "Background", "CallReport", "FAILURE_LABEL", "Hooks", "LOG_FILTER_COUNTED",
+           "LOG_FILTER_DROPPED", "LOG_MAX", "ModelOutcome", "NOTICE", "PartWrite",
            "REASON_ABANDONED", "REASON_CALL", "REASON_CAPPED", "REASON_EXHAUSTED", "REASON_FORMAT", "REASON_HALTED",
            "REASON_HOLLOW", "REASON_MISSING", "REASON_OMITTED", "REASON_RETRIED", "REASON_SPLIT", "REASON_SPLIT_PARTS",
            "REASON_TIMEOUT", "REASON_TRUNCATED", "REASON_UNANSWERED", "SEG", "classify_failure", "model_gate",

@@ -216,6 +216,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("catalog_draft_tasks", "parts_written", "INTEGER DEFAULT 0"),
     ("catalog_draft_tasks", "chunks_total", "INTEGER"),
     ("catalog_draft_tasks", "chunks_done", "INTEGER"),
+    # 复核后：逐表的日志（模型提议的有效记录条件没有收下的原因）。存量任务回填 NULL，接口给空列表
+    ("catalog_draft_tasks", "log", "JSON"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列)。create_all 不碰已有的表，表上新列的索引也就不会建。

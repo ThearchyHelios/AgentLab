@@ -426,6 +426,8 @@ class CatalogDraftTask(Base):
     # 模型拿不准、留空了的列（中文名和含义都没给）：几列，最多记 5 个列名。表的状态不因此变
     blank_columns: Mapped[int] = mapped_column(Integer, default=0)
     blank_sample: Mapped[list[Any] | None] = mapped_column(default=None)
+    # 起草时记下的几句话，不算失败（模型提议的有效记录条件没有收下的原因），最多 10 句
+    log: Mapped[list[Any] | None] = mapped_column(default=None)
     # error：整张表没起草（表结构里没有、写入一直冲突、服务重启中断）；model_error：模型那部分没写出来的原因和办法
     error: Mapped[str | None] = mapped_column(Text, default=None)
     model_error: Mapped[str | None] = mapped_column(Text, default=None)

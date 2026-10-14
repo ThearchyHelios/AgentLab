@@ -184,6 +184,8 @@ def task_dict(task: CatalogDraftTask) -> dict[str, Any]:
         # 模型拿不准、留空了的列（中文名和含义都没给）：几列、最多 5 个列名（按表结构的顺序）。表的状态不因此变
         "blank_columns": task.blank_columns or 0,
         "blank_sample": list(task.blank_sample or []),
+        # 起草时记下的几句话，不算失败（模型提议的有效记录条件没有收下的原因：没通过校验、剖析核对排除 0% 或 100%）
+        "log": list(task.log or []),
         "error": task.error,
         "model_error": task.model_error,
         "started_at": _iso(task.started_at),
@@ -694,7 +696,7 @@ class _JobRun:
             values["version"] = result.version
         if outcome is not None:
             values.update(parts_done=outcome.parts_done, chunks_total=outcome.chunks_total,
-                          chunks_done=outcome.chunks_done)
+                          chunks_done=outcome.chunks_done, log=list(outcome.log) or None)
             if not result.error:
                 # 收尾写进去了：写出内容的段都在目录里了。没写进去（一直撞上别人刚改过）的照库里逐段写进去的段数
                 values["parts_written"] = outcome.parts_written

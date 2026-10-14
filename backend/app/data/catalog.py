@@ -1762,13 +1762,14 @@ def _fact_item(value: str, reason: str | None) -> dict[str, Any]:
     return make_item(value, "llm", note=FACT_REASON_NOTE.format(reason=reason) if reason else None)
 
 
-def _model_facts(entry: Mapping[str, Any], meta: Mapping[str, Any], *, kind: str | None,
-                 table: str | None) -> dict[str, Any]:
+def _model_facts(entry: Mapping[str, Any], meta: Mapping[str, Any], *, kind: str | None, table: str | None,
+                 dropped: list[tuple[str, str]] | None = None) -> dict[str, Any]:
     """模型提议的有效行过滤、去重规则（llm / proposed，依据写进 note）。
 
-    有效行过滤按数据源的方言解析成一个条件、只能用这张表的列（sqlcheck.parse_valid_filter），不过就丢掉、日志记一条，
-    不算这张表失败。存的是 sqlcheck.stored_valid_filter 整理过的写法：原文照旧，只把列换成表结构里的真名、不带
-    表名，按数据源的需要加引号——剖析核对的、SQL 检查让模型照着加的都是这一条。去重规则是一句话，同文字项的规矩。"""
+    有效行过滤按数据源的方言解析成一个条件、只能用这张表的列（sqlcheck.parse_valid_filter），不过就丢掉、不算这张表
+    失败：服务端日志记一条，dropped 给了就记下 (原因, 模型写的条件)，起草引擎把它写进这张表的日志（起草任务逐表的
+    log）。存的是 sqlcheck.stored_valid_filter 整理过的写法：原文照旧，只把列换成表结构里的真名、不带表名，按数据源的
+    需要加引号——剖析核对的、SQL 检查让模型照着加的都是这一条。去重规则是一句话，同文字项的规矩。"""
     from app.data import sqlcheck
 
     out: dict[str, Any] = {}
@@ -1789,6 +1790,8 @@ def _model_facts(entry: Mapping[str, Any], meta: Mapping[str, Any], *, kind: str
 
             logging.getLogger(__name__).info("起草数据目录：表 %s 的有效行过滤没有通过校验，已丢掉：%s（%s）",
                                              table or meta.get("qualified") or entry.get("table"), problem, text[:200])
+            if dropped is not None:
+                dropped.append((problem, text))
     found = _model_fact(entry.get("dedup"), "rule")
     if found is not None and (text := _clean_text(found[0])) is not None:
         out["dedup"] = _fact_item(text, found[1])
@@ -1796,14 +1799,14 @@ def _model_facts(entry: Mapping[str, Any], meta: Mapping[str, Any], *, kind: str
 
 
 def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool, source_kind: str | None = None,
-                table: str | None = None) -> dict[str, Any]:
+                table: str | None = None, dropped: list[tuple[str, str]] | None = None) -> dict[str, Any]:
     """模型给的一张表 → 目录项（llm / proposed）。不合规的值整项丢掉，不硬塞：列名对不上表结构的、
     表类型和度量类型不在取值里的、业务主键里有不存在的列的、看起来是计算公式的（_formula_like，公式进口径卡）。
     该是文字的地方写成了数组、对象（列名、表类型、业务日期的列、度量类型……）同样丢掉，不抛异常：实测见过把列名
     写成数组的，以前在这里抛 TypeError，整张表记出错。导入表格的源，说明已经覆盖的字段也丢掉。
 
     有效行过滤、去重规则见 _model_facts：source_kind 是数据源类型（按它的方言解析条件，不认识的类型不收有效行过滤），
-    table 是表名（条件里的列可以带这张表的表名）。"""
+    table 是表名（条件里的列可以带这张表的表名），dropped 收没通过校验的有效行过滤 (原因, 模型写的条件)。"""
     columns = {c["name"]: c for c in meta.get("columns") or []}
     notes: dict[str, Any] = {}
     table_has_system_note = system and bool((meta.get("comment") or "").strip())
@@ -1825,7 +1828,7 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
             if (text := _clean_text(date.get(k))) is not None:
                 value[k] = text
         notes["business_date"] = make_item(value, "llm")
-    notes.update(_model_facts(entry, meta, kind=source_kind, table=table))
+    notes.update(_model_facts(entry, meta, kind=source_kind, table=table, dropped=dropped))
     out_cols: dict[str, dict[str, Any]] = {}
     listed = entry.get("columns")
     for col in listed if isinstance(listed, list) else []:

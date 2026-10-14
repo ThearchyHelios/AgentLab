@@ -6,6 +6,7 @@
   存的是整理过的写法：原文照旧，列换成表结构里的真名、不带表名、按方言加引号（剖析核对的也是这一条）；
 - 开了数据剖析、能连上的源：经剖析的只读守卫数出排除比例，排除 0% 或 100% 的不收，收下的在 note 里写剖析核对的结果；
   没开剖析、连不上的照收，note 写没有核对的原因；
+- 没收下的（没通过校验、排除 0% 或 100%）不算失败，在这张表的日志里记一句（起草任务逐表的 log）；
 - 开了剖析的源，目录里记下的码值交给模型做背景（遮罩的列不给；「已确认的目录项」里遮罩列的码值也不给）；
 - 这两项照旧记模型起草 / 推断；SQL 检查只在人工确认、有确证时才把漏了有效行过滤报成警告，推断的只是提示。
 
@@ -183,12 +184,14 @@ def test_the_stored_filter_names_its_columns_the_way_the_source_needs(kind, cond
 
 
 def test_a_filter_that_grows_past_the_limit_once_quoted_is_dropped_not_written():
-    """整理时加了引号、超过 500 字的不收：目录里这一项最多 500 字，写进去会让整张表写入失败。"""
+    """整理时加了引号、超过 500 字的不收（记下原因）：目录里这一项最多 500 字，写进去会让整张表写入失败。"""
     condition = "orderstatus IN (" + ", ".join(f"'{i:03d}'" for i in range(66)) + ") OR updated_at IS NULL"
     assert len(condition) == 499
+    dropped: list[tuple[str, str]] = []
     notes = catalog._from_model({"table": "orders", "label": "订单", "valid_filter": condition}, MIXED, system=False,
-                                source_kind="postgresql", table="orders")
+                                source_kind="postgresql", table="orders", dropped=dropped)
     assert "valid_filter" not in notes and notes["label"]["value"] == "订单"
+    assert dropped == [("有效记录条件按数据源的写法整理后超过 500 字", condition)]
     assert not catalog.validate_notes(notes)
 
 
@@ -434,6 +437,28 @@ async def test_the_engine_checks_the_filter_on_a_profiled_source(scenic, scenic_
     got = await D.run_model_draft(FakeModel({"visits": useless}), source, ["visits"])
     assert got["visits"].status == "ok" and "valid_filter" not in got["visits"].notes, "排除 0% 的不收"
     assert got["visits"].notes["label"]["value"] == "入园记录"
+
+
+async def test_a_dropped_filter_is_written_into_the_table_log(scenic, scenic_db):
+    """没收下的有效记录条件不算失败，在这张表的日志里记一条（起草任务逐表的 log，界面看得到）：没通过校验的写原因，
+    剖析核对排除 0% 或 100% 的写数到了多少行。收下的、模型没提的不记。"""
+    bad = {**REPLY, "valid_filter": {"condition": "status IN (SELECT code FROM bad_codes)", "reason": "猜的"}}
+    got = await D.run_model_draft(FakeModel({"orders": bad}), _plain({"orders": _orders()}), ["orders"])
+    assert got["orders"].status == "ok" and got["orders"].error is None
+    assert got["orders"].log == [
+        "有效记录条件里不能有子查询，模型提议的这一条没有收下：status IN (SELECT code FROM bad_codes)"]
+
+    source = await scenic()
+    total, _ = _count(scenic_db, "1 = 1")
+    for condition, what in (("status IN (0, 1)", "没有排除任何一行"), ("status = 7", "所有行都被排除了")):
+        useless = {"label": "入园记录", "valid_filter": {"condition": condition, "reason": "猜的"}}
+        got = await D.run_model_draft(FakeModel({"visits": useless}), source, ["visits"])
+        assert got["visits"].log == [
+            f"有效记录条件按剖析核对{what}（共 {total:,} 行），模型提议的这一条没有收下：{condition}"]
+
+    for reply in (REPLY, {"label": "订单"}):
+        got = await D.run_model_draft(FakeModel({"orders": reply}), _plain({"orders": _orders()}), ["orders"])
+        assert got["orders"].log == []
 
 
 async def test_a_confirmed_filter_is_not_checked_again(scenic, monkeypatch):
