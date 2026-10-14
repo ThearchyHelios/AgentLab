@@ -700,8 +700,9 @@ class AssistantMessageIn(BaseModel):
 class AssistantIn(BaseModel):
     #: 整段对话（服务端不存）；没有使用者的话时助手先开口
     messages: list[AssistantMessageIn] = Field(default_factory=list, max_length=catalog_assistant.MAX_MESSAGES)
-    #: 界面上还没保存的修改，让模型知道
-    pending: list[CatalogPatchChange] = Field(default_factory=list, max_length=catalog_assistant.MAX_PENDING)
+    #: 界面上还没保存的修改，让模型知道。不设上限：宽表上几轮攒下来常常超过一次保存的 200 项，不能因此不让问（背景里只列
+    #: 最近的 catalog_assistant.PENDING_SHOWN 项，码值照全部合并）
+    pending: list[CatalogPatchChange] = Field(default_factory=list)
 
 
 @router.post("/{source_id}/catalog/{table}/assistant")

@@ -1,9 +1,11 @@
 """表助手（data/catalog_assistant.py，POST /api/datasources/{id}/catalog/{table}/assistant）。
 
 - 开始前：表不在 404；起草模型用不了 409 catalog_draft_model_unavailable（说法同起草任务）；对话超过 40 条、一条超过
-  4000 字、待保存的修改超过 200 项 422
+  4000 字 422。界面上待保存的修改不设上限（宽表上攒到 200 项以上也照常对话）：背景里只列最近的 200 项、写明另有几项，
+  码值照全部待保存的修改合并
 - 流：text 增量、query（跑过的只读查询，前 10 行，遮罩列写「已遮罩」）、proposal（按 plan_patch 核对过的提案，形状同助手流
-  的 catalog_patch：公式不收、列名必须在表结构里、遮罩列不给码值）、done（用量、查询条数）、error（中途出错，之后没有 done）
+  的 catalog_patch：公式不收、列名必须在表结构里、遮罩列不给码值；有效记录条件要是只用这张表的列的一个条件，有起草的
+  校验规矩 sqlcheck.valid_filter_problem 时按它）、done（用量、查询条数）、error（中途出错，之后没有 done）
 - 交给模型的背景：表结构、这张表的目录（每项的来源和状态）、关联关系（含别的表指过来的）、使用次数、数据源的起草要求、
   最近一次起草留空的列、界面上还没保存的修改；遮罩列只给列名、不给任何值
 - 只读查询：只有开了数据剖析的源才给这个工具；经剖析的只读守卫和单条时限；每次请求最多 5 条；最多 50 行交给模型；结果
@@ -207,8 +209,6 @@ async def test_refusals_before_the_stream(client, tmp_path, monkeypatch):
     assert (await client.post(_url(sid), json=too_many)).status_code == 422
     too_long = _ask("长" * 4001)
     assert (await client.post(_url(sid), json=too_long)).status_code == 422
-    pending = [{"path": "label", "value": "订单", "reason": "x"}] * 201
-    assert (await client.post(_url(sid), json=_ask("x", pending=pending))).status_code == 422
     wrong_role = {"messages": [{"role": "system", "content": "x"}]}
     assert (await client.post(_url(sid), json=wrong_role)).status_code == 422
     last_is_answer = {"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]}
@@ -333,6 +333,8 @@ async def test_background_has_structure_catalog_and_hides_masked_values(client, 
     # 规矩
     for rule in ("只改数据目录", "不改业务库", "公式", "拿不准", "原话"):
         assert rule in system
+    # 有效记录条件的写法（同起草时的校验规矩），免得提了再被退回
+    assert "只能用这张表的列" in system and "不能有子查询" in system and "UPPER、LOWER、TRIM、COALESCE" in system
     # 表结构、目录（来源和状态）、使用次数、起草要求、数据源说明
     for fact in ("order_no", "status", "amount", "member_id → members.id", "主键", "每笔订单一行", "人工填写", "已确认",
                  "模型起草", "已驳回", "还没有被运行用到过", "金额一律按元", "虚构的网店库", "数据剖析：全表 30 行"):
@@ -462,6 +464,83 @@ async def test_proposal_codes_build_on_the_pending_ones(client, tmp_path, monkey
     [change] = proposal["changes"]
     assert change["value"] == {"2": "已退款", "9": "作废"}
     assert change["after"] == {"1": "已支付", "2": "已退款", "9": "作废"}
+
+
+async def test_many_pending_changes_do_not_block_the_conversation(client, tmp_path, monkeypatch):
+    """宽表上逐列补中文名、含义，待保存的修改攒到 200 项以上：照常对话（不 422）。背景里只列最近的 200 项、写明另有几项；
+    码值照全部待保存的修改合并（最早那条码值没列进背景，新提的码值也不能把它丢了）。"""
+    sid = await _source(client, tmp_path)
+    oldest = {"path": "columns.status.codes", "value": {"2": "已退款"}, "reason": "用户说：2 是退款"}
+    labels = [{"path": f"columns.c{i:03d}.label", "value": f"第 {i} 列", "reason": f"用户说：第 {i} 列"}
+              for i in range(201)]
+    model = Scripted([Turn(calls=[("propose_changes", {"changes": [
+        {"path": "columns.status.codes", "value": {"9": "作废"}, "reason": "用户说：9 是作废"}]})]),
+        Turn(text=["好。"])])
+    use(monkeypatch, model)
+    events, _ = await _talk(client, sid, _ask("9 是作废", pending=[oldest, *labels]))
+    assert events[-1]["type"] == "done"
+    system = model.seen[0][0].content
+    # 最近的 200 项列出来了，最早的两项没列，写明另有 2 项
+    assert "columns.c200.label" in system and "columns.c001.label" in system
+    assert "columns.c000.label" not in system and "用户说：2 是退款" not in system
+    assert "另有 2 项" in system
+    [proposal] = [e for e in events if e["type"] == "proposal"]
+    [change] = proposal["changes"]
+    assert change["value"] == {"2": "已退款", "9": "作废"}
+    # 再多也收
+    model = Scripted([Turn(text=["好。"])])
+    use(monkeypatch, model)
+    many = [{"path": f"columns.c{i:04d}.meaning", "value": "说明", "reason": "x"} for i in range(1200)]
+    events, _ = await _talk(client, sid, _ask("接着看", pending=many))
+    assert events[-1]["type"] == "done" and "另有 1000 项" in model.seen[0][0].content
+
+
+async def _propose_filters(client, sid: str, monkeypatch, filters: list[str]) -> tuple[list[dict], Scripted]:
+    """模型一轮提一条有效记录条件（同一条提案里同一个路径只认第一次），最后一轮回答。"""
+    turns = [Turn(calls=[("propose_changes", {"changes": [
+        {"path": "valid_filter", "value": f, "reason": "用户说：统计时排除作废"}]})]) for f in filters]
+    model = Scripted([*turns, Turn(text=["好。"])])
+    use(monkeypatch, model)
+    events, _ = await _talk(client, sid, _ask("统计时排除作废的单子"))
+    return events, model
+
+
+async def test_valid_filter_proposals_must_be_a_condition_on_this_table(client, tmp_path, monkeypatch):
+    """有效记录条件是模型写的 SQL：引用表结构里没有的列、别的表的列、带子查询的不交给界面，原因交回模型；合规的照常提。"""
+    sid = await _source(client, tmp_path)
+    events, model = await _propose_filters(client, sid, monkeypatch, [
+        "status <> 9 AND ghost_col = 1",
+        "members.nick IS NOT NULL",
+        "member_id IN (SELECT id FROM members)",
+        "status <> 9",
+    ])
+    proposals = [e for e in events if e["type"] == "proposal"]
+    assert [[c["value"] for c in p["changes"]] for p in proposals] == [["status <> 9"]]
+    said = [[m for m in seen if isinstance(m, ToolMessage)][-1].content for seen in model.seen[1:5]]
+    assert "ghost_col" in said[0] and "不在表结构里" in said[0] and "没有可以交给使用者的修改" in said[0]
+    assert "members.nick" in said[1]
+    assert "子查询" in said[2]
+    assert "已把 1 项修改交给使用者确认" in said[3]
+
+
+async def test_valid_filter_proposals_follow_the_drafting_rules(client, tmp_path, monkeypatch):
+    """有起草的校验规矩（sqlcheck.valid_filter_problem：只能用几个函数、不能有聚合……）时按它核对，说法照它的。"""
+    from app.data import sqlcheck
+
+    sid = await _source(client, tmp_path)
+    calls: list[tuple] = []
+
+    def strict(condition, meta, *, kind, table=None):
+        calls.append((condition, [c["name"] for c in meta["columns"]], kind, table))
+        return "有效行过滤里只能用 UPPER、LOWER、TRIM、COALESCE 这几个函数，不能用 ABS" if "ABS" in condition else None
+
+    monkeypatch.setattr(sqlcheck, "valid_filter_problem", strict, raising=False)
+    events, model = await _propose_filters(client, sid, monkeypatch, ["ABS(amount) > 0", "status <> 9"])
+    proposals = [e for e in events if e["type"] == "proposal"]
+    assert [[c["value"] for c in p["changes"]] for p in proposals] == [["status <> 9"]]
+    assert "不能用 ABS" in [m for m in model.seen[1] if isinstance(m, ToolMessage)][-1].content
+    assert calls[0][0] == "ABS(amount) > 0" and calls[0][2:] == ("sqlite", "orders")
+    assert "status" in calls[0][1] and "member_id" in calls[0][1]
 
 
 async def test_nothing_acceptable_means_no_proposal_event(client, tmp_path, monkeypatch):

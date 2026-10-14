@@ -7,7 +7,8 @@
 
 **只改目录、不改业务库。** 模型只有两个工具：
 - propose_changes：一批修改提案。按 catalog.plan_patch 核对（取值格式、列名必须在表结构里、公式不收），遮罩列不给码值，已经
-  是这个值又确认过的不提；核对过的作为 proposal 事件交给界面，**不写目录**。没收下的项和原因交回模型（不带任何取值）。
+  是这个值又确认过的不提；有效记录条件是模型写的 SQL，另按起草的规矩核对（_Tools.filter_problem：一个条件、只用这张表的
+  列、不能有子查询……）。核对过的作为 proposal 事件交给界面，**不写目录**。没收下的项和原因交回模型（不带任何取值）。
   界面上还没保存的修改（pending）里同一列的码值并进新提的码值：界面上同一路径以后一次为准，不能把先提的码值丢了。
 - run_query：只读查询，只有数据源开了数据剖析才给。经剖析的只读守卫和单条时限（catalog_profile._Runner：
   guard.check(readonly=True)，单条时限取剖析设置和数据源查询时限中较小的一个），每次请求最多 MAX_QUERIES 条（守卫拒掉的
@@ -36,7 +37,9 @@ catalog.MODEL_MAX_TOKENS，服务方嫌大时退回 catalog.MODEL_FALLBACK_MAX_T
 等模型的时候每 HEARTBEAT_S 秒发一行 SSE 注释（「: keep-alive」，不是事件），免得中间的代理断开。
 
 **对话不存服务端**：每次请求带上整段对话（最多 MAX_MESSAGES 条、每条最多 MESSAGE_MAX 字）。查询结果只在这一次请求里
-看得到，提示词里让模型把要用的结论写进回答。
+看得到，提示词里让模型把要用的结论写进回答。界面上待保存的修改不设上限（宽表上逐列补中文名、含义，几轮下来常常超过一次
+保存的 200 项，不能因此不让问）：背景里只列最近的 PENDING_SHOWN 项（界面上新的提案接在后面），写明另有几项；码值照全部
+待保存的修改合并。
 
 写给模型的文字都在名字带 _SYSTEM / _PROMPT 的常量里；这里的 ERROR_* 是给人看的。
 """
@@ -56,17 +59,18 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.data import catalog, catalog_jobs, catalog_profile
+from app.data import catalog, catalog_jobs, catalog_profile, sqlcheck
 from app.data.catalog_review import SOURCE_LABEL, item_label, slot_path, table_usage_counts
+from app.data.catalog_transfer import filter_columns_problem
 from app.data.draft_model import DRAFT_MODEL_PLACE
 from app.data.engine import SnapshotTampered, masked_columns
 
 logger = logging.getLogger(__name__)
 
-#: 对话最多几条、每条最多几个字；界面上待保存的修改最多几项（同 PATCH 的上限）
+#: 对话最多几条、每条最多几个字；界面上待保存的修改在背景里最多列几项（最近的；请求里交多少都收）
 MAX_MESSAGES = 40
 MESSAGE_MAX = 4000
-MAX_PENDING = catalog.PATCH_MAX_CHANGES
+PENDING_SHOWN = 200
 #: 每次请求最多调用几次模型、最多几条只读查询
 MAX_ROUNDS = 8
 MAX_QUERIES = 5
@@ -133,7 +137,9 @@ fact/dimension/snapshot/log/config、business_date {"column","rule","timezone"}�
 flow/stock/ratio/identifier/status/attribute、codes 码值 {"码":"含义"}）；已有的关联关系写 relations.<编号>；新增关联关系\
 写 relations.new，value 写 {"columns":[本表列],"to_table":"目标表","to_columns":[目标列],\
 "cardinality":"many_to_one/one_to_one/one_to_many"}。
-- codes 只写要补充或更正的码，原有的码会保留；valid_filter 要写成完整的条件（原有条件也要带上）。"""
+- codes 只写要补充或更正的码，原有的码会保留；valid_filter 要写成完整的条件（原有条件也要带上）。
+- valid_filter 只能用这张表的列（不带表名），由比较、IN、BETWEEN、LIKE、IS NULL 用 AND / OR / NOT 连起来，例如 \
+status NOT IN ('C', 'X')；不能有子查询、聚合、窗口函数、分号，函数只能用 UPPER、LOWER、TRIM、COALESCE。"""
 
 #: 查询工具的说明（开了剖析时接在系统提示后面）、没开剖析时的那句
 ASSISTANT_QUERY_PROMPT = """只读查询：run_query 在这个数据源上执行一条只读 SQL（{dialect} 的写法），最多返回 {rows} 行，\
@@ -180,6 +186,7 @@ ASSISTANT_PROMPT_LABELS = {
     "unnamed": "目录里还没有中文名和含义的列：{cols}（共 {n} 列{more}）",
     "unnamed_more": "，这里列出前 {n} 个",
     "pending": "界面上还没保存的修改（使用者已经接受、还没保存）：",
+    "pending_more": "（另有 {n} 项更早的待保存修改没有列出：太多了。它们同样已经接受，不要重复提）",
     "pending_item": "- {path}：{value}（依据：{reason}）",
     "status_proposed": "推断",
     "status_verified": "有确证",
@@ -509,7 +516,6 @@ async def prepare(session: AsyncSession, row: Any, source: Any, table: str,
     if unnamed:
         more = labels["unnamed_more"].format(n=UNNAMED_SHOWN) if len(unnamed) > UNNAMED_SHOWN else ""
         lines.append(labels["unnamed"].format(cols="、".join(unnamed[:UNNAMED_SHOWN]), n=len(unnamed), more=more))
-    pending = list(pending)
     pending_codes: dict[str, dict[str, Any]] = {}
     shown_pending: list[str] = []
     for change in pending:
@@ -527,7 +533,10 @@ async def prepare(session: AsyncSession, row: Any, source: Any, table: str,
         reason = str(change.get("reason") or "").strip()
         shown_pending.append(labels["pending_item"].format(path=path, value=_value_text(value), reason=reason or "—"))
     if shown_pending:
-        lines += ["", labels["pending"], *shown_pending]
+        lines += ["", labels["pending"]]
+        if len(shown_pending) > PENDING_SHOWN:
+            lines.append(labels["pending_more"].format(n=len(shown_pending) - PENDING_SHOWN))
+        lines += shown_pending[-PENDING_SHOWN:]
     if can_query:
         tools = ASSISTANT_QUERY_PROMPT.format(dialect=row.kind, rows=QUERY_ROWS, limit=MAX_QUERIES)
     else:
@@ -652,6 +661,18 @@ class _Tools:
             return change
         return {**change, "value": {**before, **value}}
 
+    def filter_problem(self, condition: Any) -> str | None:
+        """模型提的有效记录条件哪里不合规（交回模型的一句话），合规是 None。
+
+        按模型起草时的规矩核对（sqlcheck.valid_filter_problem：一个条件、只用这张表的列、不能有子查询、聚合、窗口、分号，
+        只能用比较、IN、BETWEEN、LIKE、IS NULL 和几个函数）；sqlcheck 里还没有这条规矩时，至少核对用到的列都是这张表的、
+        都在表结构里、没有子查询（catalog_transfer.filter_columns_problem，导入时核对人工写的条件也用它）。"""
+        meta = self.ctx.tables.get(self.ctx.table) or {}
+        strict = getattr(sqlcheck, "valid_filter_problem", None)
+        if strict is not None:
+            return strict(condition, meta, kind=self.ctx.kind, table=self.ctx.table)
+        return filter_columns_problem(condition, meta, kind=self.ctx.kind, table=self.ctx.table)
+
     async def propose(self, changes: Any) -> tuple[dict[str, Any] | None, str]:
         """(给界面的 proposal 事件, 交回模型的结果)。提案不写目录。"""
         from app.db.base import SessionLocal
@@ -673,6 +694,9 @@ class _Tools:
                 continue
             if change.state == "same":
                 dropped.append(prompts["same"].format(where=_where(key, change)))
+                continue
+            if key == ("t", "valid_filter") and (problem := self.filter_problem(change.after)) is not None:
+                dropped.append(problem)
                 continue
             kept.append(change)
         said: list[str] = []
@@ -883,5 +907,5 @@ async def stream(model: Any, model_id: str, ctx: AssistantContext,
 
 
 __all__ = ["AssistantContext", "CODE_FAILED", "CODE_MODEL", "CODE_ROUNDS", "CODE_TIMEOUT", "CODE_TRUNCATED",
-           "HEARTBEAT_S", "MAX_MESSAGES", "MAX_PENDING", "MAX_QUERIES", "MAX_ROUNDS", "MESSAGE_MAX", "PROPOSE_TOOL",
+           "HEARTBEAT_S", "MAX_MESSAGES", "MAX_QUERIES", "MAX_ROUNDS", "MESSAGE_MAX", "PENDING_SHOWN", "PROPOSE_TOOL",
            "QUERY_ROWS", "QUERY_TOOL", "SHOWN_ROWS", "conversation_problem", "prepare", "resolve_model", "stream"]
