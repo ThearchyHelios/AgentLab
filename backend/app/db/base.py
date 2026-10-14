@@ -212,6 +212,10 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("catalog_draft_jobs", "notice", "TEXT"),
     ("catalog_draft_tasks", "blank_columns", "INTEGER DEFAULT 0"),
     ("catalog_draft_tasks", "blank_sample", "JSON"),
+    # 数据目录闭环第一步：宽表逐段落盘的段数、块进度。存量任务回填 0 和 NULL：升级前没记这些
+    ("catalog_draft_tasks", "parts_written", "INTEGER DEFAULT 0"),
+    ("catalog_draft_tasks", "chunks_total", "INTEGER"),
+    ("catalog_draft_tasks", "chunks_done", "INTEGER"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列)。create_all 不碰已有的表，表上新列的索引也就不会建。

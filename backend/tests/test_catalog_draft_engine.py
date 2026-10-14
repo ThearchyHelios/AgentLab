@@ -254,6 +254,7 @@ async def test_hollow_shell_splits_the_pack_by_table():
 
 async def test_splitting_stops_at_three_levels_and_five_columns(monkeypatch):
     monkeypatch.setattr(catalog, "MODEL_PART_MAX_CALLS", 99)
+    monkeypatch.setattr(catalog, "MODEL_HALT_ON", 99)             # 不让按比例止损先停下来
     tables = {"wide40": _table(40)}
     model = Scripted(lambda call: EXHAUSTED)
     got = await D.run_model_draft(model, _source(tables), ["wide40"])
@@ -272,7 +273,7 @@ async def test_splitting_stops_at_three_levels_and_five_columns(monkeypatch):
 async def test_one_part_makes_at_most_eight_calls(monkeypatch):
     """一段（连同它拆出来的、补问的、重试的）最多调用 8 次：40 列一直用完额度，拆到第 8 次就停，剩下没问的记没写出来、
     原因写清。以前一段 40 列拆到底要 15 次。"""
-    monkeypatch.setattr(catalog, "MODEL_GIVE_UP_AFTER", 99)
+    monkeypatch.setattr(catalog, "MODEL_HALT_ON", 99)
     assert catalog.MODEL_PART_MAX_CALLS == 8
     model = Scripted(lambda call: EXHAUSTED)
     got = await D.run_model_draft(model, _source({"t40": _table(40)}), ["t40"])
@@ -755,6 +756,7 @@ async def test_a_wide_table_with_one_failed_part_is_partial_and_says_which():
 async def test_reasons_name_each_part_and_say_these_parts(monkeypatch):
     """几段因为同一个原因没写出来：原因里写「这几段」；每段写上列的范围（列名照表结构原样）；拆过的才补「已拆小重试」。"""
     monkeypatch.setattr(catalog, "MODEL_SHRINK_AFTER", 99)
+    monkeypatch.setattr(catalog, "MODEL_HALT_ON", 99)
     tables = {"wide95": _table(95)}
     ok = answering(tables)
 
@@ -827,33 +829,38 @@ async def test_tables_are_packed_up_to_40_columns_and_4_tables():
 
 
 async def test_the_same_reason_is_said_once_even_when_some_parts_were_split(monkeypatch):
-    """宽表的表级那段拆不开、列分段拆过：原因只说一次，拆过的在最后补一句。"""
-    monkeypatch.setattr(catalog, "MODEL_GIVE_UP_AFTER", 99)
+    """宽表的表级那段拆不开、列分段拆过：原因只说一次，「已拆小重试」只跟在真拆过的那几段后面说。"""
+    monkeypatch.setattr(catalog, "MODEL_HALT_ON", 99)
     monkeypatch.setattr(catalog, "MODEL_PART_MAX_CALLS", 99)
     model = Scripted(_hollow)
     got = await D.run_model_draft(model, _source({"wide45": _table(45)}), ["wide45"])
     o = got["wide45"]
     assert o.status == "failed"
     assert o.error == ("这张表 45 列，分 3 段起草，第 1 段（表级的项）、第 2 段（c001 到 c023，共 23 列）、"
-                       "第 3 段（c024 到 c045，共 22 列）都没写出来：模型只给了空壳，没有写出可用的内容；已拆小重试仍没写出")
+                       "第 3 段（c024 到 c045，共 22 列）都没写出来：模型只给了空壳，没有写出可用的内容；"
+                       "其中第 2、3 段已拆小重试仍没写出")
 
 
 def test_reasons_are_joined_by_their_base():
-    """(原因, 第几段)：同样的原因只说一次；同一个原因落在几段上写「这几段」，同一段拆出来的几块仍是「这一段」。"""
+    """(原因, 第几段)：同样的原因只说一次；同一个原因落在几段上写「这几段」，同一段拆出来的几块仍是「这一段」。
+    「已拆小重试仍没写出」只跟在真拆过的那几段后面说：说到的段都拆过时不点名，只有一部分拆过时写「其中第几段」。"""
     W = D._Why
     ex = D.REASON_EXHAUSTED.format(budget=32768, seg=D.SEG)
     assert D._join([(W(D.REASON_HOLLOW), 1), (W(D.REASON_HOLLOW, split=True), 2)]) == \
-        D.REASON_HOLLOW + D.REASON_SPLIT
+        D.REASON_HOLLOW + "；其中第 2 段已拆小重试仍没写出"
     assert D._join([(W(ex, split=True), 2), (W(D.REASON_HOLLOW), 1)]) == \
-        f"{_exhausted()}；{D.REASON_HOLLOW}{D.REASON_SPLIT}"
+        f"{_exhausted()}；{D.REASON_HOLLOW}；其中第 2 段已拆小重试仍没写出"
+    assert D._join([(W(ex, split=True), 2), (W(ex, split=True), 3)]) == _exhausted("这几段") + D.REASON_SPLIT
+    assert D._join([(W(ex, split=True), 3), (W(ex), 4), (W(ex, split=True), 2)]) == \
+        _exhausted("这几段") + "；其中第 2、3 段已拆小重试仍没写出"
     assert D._join([(W(ex), 2), (W(ex), 3)]) == _exhausted("这几段")
-    assert D._join([(W(ex), 2), (W(ex, split=True), 2)]) == _exhausted() + D.REASON_SPLIT
+    assert D._join([(W(ex), 2), (W(ex, split=True), 2)]) == _exhausted() + D.REASON_SPLIT, "同一段里有一块拆过就算拆过"
     assert D._join([(W("甲"), 1), (W("乙"), 1), (W("丙", split=True), 1)]) == "甲；乙", "没说出来的原因不补后缀"
-    halted = D.REASON_HALTED.format(n=catalog.MODEL_GIVE_UP_AFTER)
+    halted = D.REASON_HALTED.format(window=catalog.MODEL_HALT_WINDOW, on=catalog.MODEL_HALT_ON)
+    assert halted == "；最近 10 次调用有 7 次以上没写出来，已停止拆小重试，建议更换起草模型"
     assert D._join([(W(D.REASON_HOLLOW, halted=halted), 1), (W(D.REASON_HOLLOW), 2)]) == D.REASON_HOLLOW + halted
-    slow = D.REASON_SLOW.format(n=catalog.MODEL_MIN_PART_COLUMNS)
-    assert D._join([(W(D.REASON_HOLLOW, halted=halted), 1), (W(D.REASON_HOLLOW, halted=slow), 2),
-                    (W(D.REASON_HOLLOW, halted=halted), 3)]) == D.REASON_HOLLOW + halted + slow, "两种止损各说一次"
+    assert D._join([(W(D.REASON_HOLLOW, halted=halted), 1), (W(D.REASON_HOLLOW, halted=halted), 3)]) == \
+        D.REASON_HOLLOW + halted, "止损只说一次"
     assert D._join([(W("调用模型出错：{坏的}"), 1)]) == "调用模型出错：{坏的}", "报错原文里的花括号原样留着"
 
 
@@ -865,50 +872,133 @@ def _by_table(model: Scripted) -> dict[str, int]:
     return out
 
 
-async def test_after_two_segments_in_a_row_come_to_nothing_the_rest_are_not_split(monkeypatch):
-    """模型明显用不了（思考总是吃满额度）：连续 2 段拆到底仍一项没写出，后面的段只问一次、不再拆，报错说明已停止拆小重试。
-    有一段写出来了就恢复拆小。一次只起草一段（并发 1），先后是确定的。"""
+HALTED = "；最近 10 次调用有 7 次以上没写出来，已停止拆小重试，建议更换起草模型"
+
+
+async def test_when_most_recent_calls_fail_the_rest_are_asked_once_until_the_ratio_drops(monkeypatch):
+    """按比例止损：这次起草最近 10 次调用有 7 次以上没写出来，之后的段不再拆小、每块只问一次，报错说明已停止拆小重试；
+    比例降下去（最近 10 次里少于 7 次）就恢复拆小。偶尔一次写出来不会清零：t4 到 t6 写出来了，最近 10 次里仍有 7 次没写
+    出来，照旧不拆；t7 写出来以后才降下去，t8 照常拆小。一次只起草一段（并发 1），先后是确定的。"""
     monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
     monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
-    assert catalog.MODEL_GIVE_UP_AFTER == 2
-    tables = {f"t{i}": _table(10) for i in range(1, 5)}
-    exhausted = Reply(text="", finish="length", thinking="……")
-
-    model = Scripted(lambda call: exhausted)
-    got = await D.run_model_draft(model, _source(tables), list(tables))
-    assert _by_table(model) == {"t1": 3, "t2": 3, "t3": 1, "t4": 1}
-    budget = _exhausted()
-    assert got["t1"].error == budget + D.REASON_SPLIT
-    assert got["t3"].error == budget + "；模型连续 2 段都没写出来，已停止拆小重试，建议更换起草模型"
-
+    assert (catalog.MODEL_HALT_WINDOW, catalog.MODEL_HALT_ON) == (10, 7)
+    tables = {f"t{i}": _table(10) for i in range(1, 9)}
     ok = answering(tables)
-    model = Scripted(lambda call: ok(call) if "t3" in call.asked else exhausted)
+    bad = {"t1", "t2", "t3", "t8"}
+
+    model, reports = Scripted(lambda call: EXHAUSTED if set(call.asked) & bad else ok(call)), Reports()
+    got = await D.run_model_draft(model, _source(tables), list(tables), hooks=reports.hooks())
+    assert _by_table(model) == {"t1": 3, "t2": 3, "t3": 1, "t4": 1, "t5": 1, "t6": 1, "t7": 1, "t8": 3}
+    assert got["t1"].error == _exhausted() + D.REASON_SPLIT
+    assert got["t3"].error == _exhausted() + HALTED
+    assert {got[f"t{i}"].status for i in range(4, 8)} == {"ok"}
+    assert got["t8"].error == _exhausted() + D.REASON_SPLIT, "比例降下去以后照常拆小"
+    assert len(reports.items) == len(model.calls)
+
+
+async def test_while_halted_a_chunk_is_not_asked_again_for_missing_columns(monkeypatch):
+    """止损期间每块只问一次：回复里漏了几列不补问，漏的列记没写出来、说明已停止拆小重试。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    tables = {**{f"x{i}": _table(4) for i in range(1, 8)}, "t8": _table(8)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        if "t8" not in call.asked:
+            raise RuntimeError("网关拒绝了这次请求")
+        reply = ok(call)
+        reply.obj["tables"][0]["columns"] = reply.obj["tables"][0]["columns"][:6]
+        return reply
+
+    model = Scripted(handle)
     got = await D.run_model_draft(model, _source(tables), list(tables))
-    assert _by_table(model) == {"t1": 3, "t2": 3, "t3": 1, "t4": 3}, "t3 写出来了，t4 照常拆小"
-    assert got["t3"].status == "ok" and got["t4"].error == budget + D.REASON_SPLIT
+    assert _by_table(model)["t8"] == 1, "漏了 c007、c008 也不补问"
+    o = got["t8"]
+    assert o.status == "partial"
+    assert o.error == ("这张表 8 列，有 2 列（c007、c008）没写出来：模型的回复里漏了这些列" + HALTED
+                       + "。可以只重试这张表")
+
+
+#: 200 列的宽表分 6 段起草（表级一段、列分段 5 段），逐段写上列的范围
+WIDE200_PARTS = ("这张表 200 列，分 6 段起草，第 1 段（表级的项）、第 2 段（c001 到 c040，共 40 列）、"
+                 "第 3 段（c041 到 c080，共 40 列）、第 4 段（c081 到 c120，共 40 列）、第 5 段（c121 到 c160，共 40 列）、"
+                 "第 6 段（c161 到 c200，共 40 列）")
+
+
+async def test_a_wide_table_skips_its_remaining_parts_after_three_dead_parts_in_a_row(monkeypatch):
+    """同一张表连续 3 个原始段都一项没写出来：这张表剩下的段跳过不问，原因写清跳过了几段、可以换一个起草模型后只重试
+    这张表。200 列分 6 段（表级一段、列分段 5 段）。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    assert catalog.MODEL_TABLE_GIVE_UP_AFTER == 3
+    tables = {"wide200": _table(200)}
+
+    def refuse(call: Call) -> Reply:
+        raise RuntimeError("网关拒绝")
+
+    model = Scripted(refuse)
+    got = await D.run_model_draft(model, _source(tables), ["wide200"])
+    o = got["wide200"]
+    assert len(model.calls) == 3, "第 4 到 6 段跳过不问"
+    assert (o.status, o.parts_total, o.parts_done) == ("failed", 6, 6)
+    assert o.error == (WIDE200_PARTS + "都没写出来：调用模型出错：网关拒绝；"
+                       "这张表接连 3 段都没写出来，剩下的 3 段已跳过，可以换一个起草模型后只重试这张表")
+
+    # 表级那段写出来了、后面接连 3 段没写出来：只写出一部分，剩下的 2 段跳过；不再另说「可以只重试这张表」
+    ok = answering(tables)
+    model = Scripted(lambda call: ok(call) if call.n == 0 else refuse(call))
+    got = await D.run_model_draft(model, _source(tables), ["wide200"])
+    o = got["wide200"]
+    assert len(model.calls) == 4 and o.status == "partial"
+    assert o.error == ("这张表 200 列，分 6 段起草，第 2 段（c001 到 c040，共 40 列）、第 3 段（c041 到 c080，共 40 列）、"
+                       "第 4 段（c081 到 c120，共 40 列）、第 5 段（c121 到 c160，共 40 列）、第 6 段（c161 到 c200，共 40 列）"
+                       "没写出来：调用模型出错：网关拒绝；这张表接连 3 段都没写出来，剩下的 2 段已跳过，"
+                       "可以换一个起草模型后只重试这张表")
+
+
+async def test_a_part_that_writes_resets_the_dead_parts_of_its_table(monkeypatch):
+    """中间有一段写出来了，就不算「接连」：200 列的第 2、3、5、6 段没写出来、第 4 段写出来了，每段都照常问。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    tables = {"wide200": _table(200)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        part, cols = call.asked["wide200"]
+        if part == "table" or "c081" in (cols or []):
+            return ok(call)
+        raise RuntimeError("网关拒绝")
+
+    model = Scripted(handle)
+    got = await D.run_model_draft(model, _source(tables), ["wide200"])
+    assert len(model.calls) == 6 and got["wide200"].status == "partial"
+    assert "已跳过" not in got["wide200"].error
 
 
 async def test_the_column_parts_of_a_wide_table_stop_splitting_too(monkeypatch):
-    """宽表的列分段一段一段排队起草（一段拆到底再起草下一段），止损在宽表里同样起作用。
-
-    95 列：表级那段拆不开（结构化、纯文本各一次）；第 2 段 32 列拆小、到 8 次封顶；这时已经连续 2 段没写出来，第 3、4 段
-    只问一次、换纯文本一次。"""
+    """按比例止损在宽表里同样起作用，接连没写出来的宽表剩下的段跳过：95 列一直只给空壳（已经走纯文本），第 2 段拆小到
+    止损；之后的第 3 段只问一次；接连 3 段没写出来，第 4 段跳过。"""
     monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
-    model = Scripted(_hollow)
+    model = Scripted(_text_only(_hollow))
     got = await D.run_model_draft(model, _source({"wide95": _table(95)}), ["wide95"])
-    assert len(model.calls) == 2 + 8 + 2 + 2
-    assert got["wide95"].error == (WIDE95_PARTS + "都没写出来：" + D.REASON_HOLLOW
-                                   + "；每段最多调用 8 次模型，这一段到了次数仍没写完，已停止重试"
-                                   + D.REASON_SPLIT + "；模型连续 2 段都没写出来，已停止拆小重试，建议更换起草模型")
+    o = got["wide95"]
+    asked = [c for c in model.calls if c.mode == "text"]
+    assert len(asked) <= 2 + 8 + 1
+    assert not any("c065" in (c.asked["wide95"][1] or []) for c in asked), "第 4 段没问"
+    assert o.status == "failed" and o.error.startswith(WIDE95_PARTS + "都没写出来：")
+    assert HALTED in o.error
+    assert o.error.endswith("这张表接连 3 段都没写出来，剩下的 1 段已跳过，可以换一个起草模型后只重试这张表")
 
 
 async def test_a_wide_table_that_never_comes_back_is_bounded_by_the_first_wave():
-    """默认并发（3 段同时起草）：294 列（8 个列分段）一直只给空壳，最多是表级那段 2 次、头 3 个列分段各 8 次（封顶）、
-    其余 5 段各 2 次。以前所有列分段一下子都排上去、一层一层地拆，要 168 次。"""
+    """默认并发（3 段同时起草）：294 列（8 个列分段）一直只给空壳：表级那段 2 次，头一批同时起草的列分段拆小到止损或
+    封顶；接连 3 段没写出来以后，没开始的段跳过不问。以前所有列分段一下子都排上去、一层一层地拆，要 168 次。"""
     model = Scripted(_hollow)
     got = await D.run_model_draft(model, _source({"wide294": _table(294)}), ["wide294"])
-    assert got["wide294"].status == "failed" and got["wide294"].parts_total == 9
-    assert len(model.calls) <= 2 + 3 * 8 + 5 * 2
+    o = got["wide294"]
+    assert o.status == "failed" and o.parts_total == 9 and o.parts_done == 9
+    assert len(model.calls) <= 2 + 4 * 8
+    assert "已跳过" in o.error
+    asked = {c for call in model.calls for c in call.asked["wide294"][1] or []}
+    assert "c294" not in asked, "最后一段没问"
 
 
 async def test_a_big_draft_does_not_hold_the_model_ahead_of_a_later_one(monkeypatch):
@@ -1042,7 +1132,7 @@ async def test_the_chunks_of_a_part_cut_by_the_smaller_cap_share_its_eight_calls
     """每个原始段（连同段大小减半后按上限分开的各块、拆出来的、补问的、重试的）一共最多调用 8 次。以前分开的每一块各有
     8 次：上限缩到 10 列以后一直只给空壳，4 张窄表拼成的 40 列段调用了 20 次，单张 40 列的表也是 20 次。"""
     monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
-    monkeypatch.setattr(catalog, "MODEL_GIVE_UP_AFTER", 99)        # 不让止损先停下来
+    monkeypatch.setattr(catalog, "MODEL_HALT_ON", 99)              # 不让止损先停下来
     tables = {"w40": _table(40), **{f"n{i}": _table(10) for i in range(1, 5)}, "x40": _table(40)}
 
     def handle(call: Call) -> Reply:
@@ -1085,34 +1175,31 @@ class AlwaysSlow:
         raise TimeoutError()
 
 
-SLOW_STOP = "；拆到每段 10 列仍然超时，已停止拆小重试，建议更换起草模型"
-
-
-async def test_a_model_that_always_times_out_stops_after_three_rounds_not_seven():
-    """每次调用都超时、和段大小无关：超时拆出来的两半同时问（不再等带表级项的前一半写完才问后一半），拆到每段 10 列的
-    调用接连超时 2 次就停止拆小，拆出来还没问的块不再问。40 列的表 3 轮、6 次调用就结束（时限 420 秒时约 21 分钟）；
-    以前 40→20→10→5 一层一层串着问，8 次调用约 7 轮（约 49 分钟）。"""
+async def test_a_model_that_always_times_out_is_bounded_by_the_part_cap():
+    """每次调用都超时：超时拆出来的两半同时问，最多拆到这一段的调用次数用完（8 次）或止损。以前 40→20→10→5 一层一层串着问，
+    8 次调用约 7 轮；现在两半同时问，至多 4 轮。"""
     tables = {"t40": _table(40)}
     slow = AlwaysSlow(tables)
     model, reports = Scripted(slow), Reports()
     got = await D.run_model_draft(model, _source(tables), ["t40"], hooks=reports.hooks())
-    assert [_width(c, tables) for c in model.calls] == [40, 20, 20, 10, 10, 10], "拆到每段 10 列仍超时就不再往下拆"
-    assert slow.rounds == [1, 2, 2, 3, 3, 3], "两半同时问"
-    assert reports.failures == ["timeout"] * 6 and len(reports.items) == len(model.calls)
+    assert len(model.calls) <= catalog.MODEL_PART_MAX_CALLS and max(slow.rounds) <= 4
+    assert [_width(c, tables) for c in model.calls[:3]] == [40, 20, 20], "两半同时问"
+    assert set(reports.failures) == {"timeout"} and len(reports.items) == len(model.calls)
     o = got["t40"]
-    assert o.status == "failed" and o.error == "模型 420 秒内没有写完这一段" + D.REASON_SPLIT + SLOW_STOP
+    assert o.status == "failed" and "模型 420 秒内没有写完这一段" + D.REASON_SPLIT in o.error
+    assert o.chunks_done == o.chunks_total > 1, "拆出来的块都结束了"
 
 
-async def test_three_parts_that_always_time_out_end_in_four_rounds():
-    """首轮同时起草的 3 段都一直超时：拆到每段 10 列仍超时就一起停下，不再各自拆满 8 次。12 次调用、4 轮；以前 24 次
-    调用、约 8 轮（止损要等一整段结束才计数，首轮的 3 段都跑满）。"""
+async def test_three_parts_that_always_time_out_stop_together():
+    """首轮同时起草的 3 段都一直超时：最近 10 次调用 7 次以上没写出来以后，拆出来还没问的块不再问，不再各自拆满 8 次。
+    以前（接连超时的止损）12 次调用；更早要 24 次。"""
     tables = {f"t{i}": _table(40) for i in range(1, 4)}
     slow = AlwaysSlow(tables)
     model = Scripted(slow)
     got = await D.run_model_draft(model, _source(tables), list(tables))
-    assert len(model.calls) == 12 and max(slow.rounds) == 4
+    assert len(model.calls) <= 9 and max(slow.rounds) <= 4
     assert {o.status for o in got.values()} == {"failed"}
-    assert all(o.error.endswith(SLOW_STOP) for o in got.values())
+    assert any(HALTED in o.error for o in got.values())
 
 
 async def test_timeouts_that_go_away_at_ten_columns_are_still_split_down_and_written():
@@ -1152,7 +1239,7 @@ async def test_a_call_whose_reply_cannot_be_read_still_counts(monkeypatch):
     """读回复时出了意料之外的错：这张表记出错，这次调用照样记进用量（算一次出错），调用次数和用量对得上。"""
     tables = {"t4": _table(4)}
 
-    def broken(entry, meta, *, system):
+    def broken(entry, meta, *, system, **_):
         raise RuntimeError("校验时出了意外")
 
     monkeypatch.setattr(catalog, "_from_model", broken)
@@ -1190,24 +1277,52 @@ async def test_a_wide_table_that_wrote_nothing_names_every_part():
 
     got = await D.run_model_draft(Scripted(handle), _source({"wide95": _table(95)}), ["wide95"])
     o = got["wide95"]
-    assert o.status == "failed" and o.error == WIDE95_PARTS + "都没写出来：调用模型出错：网关拒绝"
+    assert o.status == "failed" and o.error == (WIDE95_PARTS + "都没写出来：调用模型出错：网关拒绝；"
+                                                "这张表接连 3 段都没写出来，剩下的 1 段已跳过，可以换一个起草模型后只重试这张表")
 
     narrow = await D.run_model_draft(Scripted(handle), _source({"t8": _table(8)}), ["t8"])
     assert narrow["t8"].error == "调用模型出错：网关拒绝", "只有一段的表：这一段就是整张表，照旧只写原因"
 
 
 async def test_a_halted_part_that_could_be_split_is_not_asked_again_in_text_mode(monkeypatch):
-    """止损以后本来能拆小的段只给空壳：已经走纯文本的不再原样再问（约定只对拆不开的段再问一次）；结构化输出的照旧换
-    纯文本问一次，看看是不是结构化输出的问题（见 test_the_column_parts_of_a_wide_table_stop_splitting_too）。"""
+    """止损以后每块只问一次：已经走纯文本的空壳不再原样再问、也不拆小。t1：结构化不支持 1 次、纯文本 1 次、拆成两半各问
+    一次再原样再问一次（6 次都没写出来）；t2 的第一次是第 7 次没写出来，之后止损。"""
     monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
     monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
     tables = {f"t{i}": _table(10) for i in range(1, 5)}
     model = Scripted(_text_only(_hollow))
     got = await D.run_model_draft(model, _source(tables), list(tables))
-    # t1：结构化不支持 1 次、纯文本 1 次、拆成两半各问一次再原样再问一次；t2 同样（少了结构化那次）；之后止损
-    assert _by_table(model) == {"t1": 6, "t2": 5, "t3": 1, "t4": 1}
-    assert got["t3"].error == (catalog.MODEL_EMPTY_REASON
-                               + "；模型连续 2 段都没写出来，已停止拆小重试，建议更换起草模型")
+    assert _by_table(model) == {"t1": 6, "t2": 1, "t3": 1, "t4": 1}
+    assert got["t2"].error == catalog.MODEL_EMPTY_REASON + HALTED
+
+
+async def test_while_halted_structured_output_still_gets_one_probe_in_text(monkeypatch):
+    """止损期间结构化输出只给空壳：这次起草还没换纯文本问过的，照旧换纯文本问一次（看看是不是结构化输出的问题）；纯文本
+    写出来了，后面都走纯文本。问过一次（纯文本也只给空壳）就不再问。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    tables = {**{f"x{i}": _table(4) for i in range(1, 8)}, "t8": _table(8), "t9": _table(8)}
+    ok = answering(tables)
+
+    def handle(text_works: bool) -> Callable[[Call], Reply]:
+        def go(call: Call) -> Reply:
+            if next(iter(call.asked)).startswith("x"):
+                raise RuntimeError("网关拒绝了这次请求")
+            if call.mode == "structured":
+                return _hollow(call)
+            return ok(call) if text_works else _hollow(call)
+        return go
+
+    model = Scripted(handle(True))
+    got = await D.run_model_draft(model, _source(tables), list(tables))
+    assert [c.mode for c in model.calls if "x1" not in c.asked and not next(iter(c.asked)).startswith("x")] == \
+        ["structured", "text", "text"]
+    assert got["t8"].status == got["t9"].status == "ok"
+
+    model = Scripted(handle(False))
+    got = await D.run_model_draft(model, _source(tables), list(tables))
+    assert _by_table(model)["t8"] == 2 and _by_table(model)["t9"] == 1, "纯文本问过一次，不再问"
+    assert got["t9"].error == catalog.MODEL_EMPTY_REASON + HALTED
 
 
 # --------------------------------------------------------------------------
@@ -1299,3 +1414,113 @@ def test_cut_values_are_dropped_and_complete_ones_kept():
 @pytest.mark.parametrize("text", ["好的，我来写", "{坏的 json}", ""])
 def test_not_json_is_not_a_reply(text):
     assert D._parse_text(text, cut=False) is None
+
+
+# --------------------------------------------------------------------------
+# 闭环第一步的起草遗留：逐段交出去落盘、块进度、「已拆小重试」只说拆过的段
+# --------------------------------------------------------------------------
+
+
+class Written:
+    """进度回调 part_written 收到的：(表名, 已写出内容的段数, 这时这张表拿到的列)；chunks_changed 收到的块进度。"""
+
+    def __init__(self) -> None:
+        self.parts: list[tuple[str, int, set[str], bool]] = []
+        self.chunks: dict[str, list[tuple[int, int]]] = {}
+
+    async def part_written(self, table: str, written: D.PartWrite) -> None:
+        cols = set((written.notes.get("columns") or {}))
+        self.parts.append((table, written.parts_written, cols, "label" in written.notes))
+
+    async def chunks_changed(self, table: str, total: int, done: int) -> None:
+        self.chunks.setdefault(table, []).append((total, done))
+
+    def hooks(self) -> D.Hooks:
+        return D.Hooks(part_written=self.part_written, chunks_changed=self.chunks_changed)
+
+
+async def test_each_part_of_a_wide_table_is_handed_over_as_soon_as_it_is_written(monkeypatch):
+    """宽表每写出一段就交给调用方并入目录（最后一段由 table_done 收尾）：交出去的是这张表到这时拿到的全部内容。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    tables = {"wide95": _table(95)}
+    seen = Written()
+    got = await D.run_model_draft(Scripted(answering(tables)), _source(tables), ["wide95"], hooks=seen.hooks())
+    o = got["wide95"]
+    assert o.status == "ok" and o.parts_written == 4
+    assert [(t, n, len(cols), label) for t, n, cols, label in seen.parts] == [
+        ("wide95", 1, 0, True), ("wide95", 2, 32, True), ("wide95", 3, 64, True)]
+
+    def handle(call: Call) -> Reply:
+        part, cols = call.asked["wide95"]
+        if part == "columns" and "c033" in cols:
+            raise RuntimeError("网关拒绝")
+        return answering(tables)(call)
+
+    seen = Written()
+    got = await D.run_model_draft(Scripted(handle), _source(tables), ["wide95"], hooks=seen.hooks())
+    assert got["wide95"].status == "partial" and got["wide95"].parts_written == 3
+    assert [n for _, n, _, _ in seen.parts] == [1, 2], "没写出来的那段不交"
+
+
+async def test_a_narrow_table_is_handed_over_only_once_at_the_end():
+    tables = {"t8": _table(8)}
+    seen = Written()
+    got = await D.run_model_draft(Scripted(answering(tables)), _source(tables), ["t8"], hooks=seen.hooks())
+    assert seen.parts == [] and got["t8"].parts_written == 1
+    failed = await D.run_model_draft(Scripted(lambda call: EXHAUSTED), _source({"t4": _table(4)}), ["t4"])
+    assert failed["t4"].parts_written == 0
+
+
+async def test_chunks_count_what_the_table_is_actually_asked_in(monkeypatch):
+    """块进度：一开始是这张表分的段数；一段被拆成两半多一块、被缩小的上限分开成几块就多几块；一块结束算一块。
+    多表拼成的段按表拆开时，每张表还是一块。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    monkeypatch.setattr(catalog, "MODEL_SHRINK_AFTER", 1)
+    tables = {"a12": _table(12), "b40": _table(40)}
+    ok = answering(tables)
+    seen = Written()
+    got = await D.run_model_draft(Scripted(lambda call: EXHAUSTED if call.n == 0 else ok(call)), _source(tables),
+                                  ["a12", "b40"], hooks=seen.hooks())
+    a, b = got["a12"], got["b40"]
+    assert a.status == b.status == "ok"
+    assert (a.chunks_total, a.chunks_done) == (2, 2), "额度用完拆成两半"
+    assert (b.chunks_total, b.chunks_done) == (2, 2), "上限缩到 20 列，40 列的段分开成两块"
+    assert seen.chunks["a12"][-1] == (2, 2) and seen.chunks["b40"][-1] == (2, 2)
+    assert all(done <= total for pairs in seen.chunks.values() for total, done in pairs)
+
+    wide = {"wide95": _table(95)}
+    got = await D.run_model_draft(Scripted(answering(wide)), _source(wide), ["wide95"])
+    assert (got["wide95"].chunks_total, got["wide95"].chunks_done) == (4, 4)
+
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 4)
+    packed = {"p6": _table(6), "q6": _table(6)}
+    okp = answering(packed)
+    model = Scripted(lambda call: _hollow(call) if call.n == 0 else okp(call))
+    got = await D.run_model_draft(model, _source(packed), ["p6", "q6"])
+    assert [set(c.asked) for c in model.calls] == [{"p6", "q6"}, {"p6"}, {"q6"}], "按表拆开"
+    assert {(o.chunks_total, o.chunks_done) for o in got.values()} == {(1, 1)}
+
+
+async def test_only_the_parts_that_were_split_say_so(monkeypatch):
+    """一张表几段没写出来、只有一部分真拆小重试过：「已拆小重试仍没写出」只跟在拆过的那几段后面说。95 列：第 3 段一直用完
+    额度（拆小重试过），第 4 段调用出错（没拆过）。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_SHRINK_AFTER", 99)
+    monkeypatch.setattr(catalog, "MODEL_HALT_ON", 99)
+    tables = {"wide95": _table(95)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        part, cols = call.asked["wide95"]
+        if part == "columns" and cols[0] >= "c065":
+            raise RuntimeError("网关拒绝")
+        if part == "columns" and cols[0] >= "c033":
+            return EXHAUSTED
+        return ok(call)
+
+    got = await D.run_model_draft(Scripted(handle), _source(tables), ["wide95"])
+    o = got["wide95"]
+    assert o.status == "partial"
+    assert o.error == ("这张表 95 列，分 4 段起草，第 3 段（c033 到 c064，共 32 列）、第 4 段（c065 到 c095，共 31 列）没写出来："
+                       + _exhausted() + "；调用模型出错：网关拒绝；其中第 3 段已拆小重试仍没写出。可以只重试这张表")

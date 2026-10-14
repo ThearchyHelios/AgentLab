@@ -410,9 +410,14 @@ class CatalogDraftTask(Base):
     table_name: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(20), default="pending")
     column_count: Mapped[int] = mapped_column(Integer, default=0)
-    # 模型分几段起草（不用模型时为 NULL）、已经结束了几段
+    # 模型分几段起草（不用模型时为 NULL）、已经结束了几段、其中写出了内容并进了目录的段数（宽表每写出一段就并入目录，
+    # 停止、服务重启时已经写进去的留着）
     parts_total: Mapped[int | None] = mapped_column(Integer, default=None)
     parts_done: Mapped[int] = mapped_column(Integer, default=0)
+    parts_written: Mapped[int] = mapped_column(Integer, default=0)
+    # 块进度：这张表实际分成几块来问、已经结束了几块（段被缩小、拆成两半后会变多）；不用模型时为 NULL
+    chunks_total: Mapped[int | None] = mapped_column(Integer, default=None)
+    chunks_done: Mapped[int | None] = mapped_column(Integer, default=None)
     added: Mapped[int] = mapped_column(Integer, default=0)
     updated: Mapped[int] = mapped_column(Integer, default=0)
     removed: Mapped[int] = mapped_column(Integer, default=0)

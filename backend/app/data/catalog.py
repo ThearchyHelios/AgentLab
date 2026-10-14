@@ -1488,9 +1488,13 @@ MODEL_FALLBACK_MAX_TOKENS = 8192
 #: 一段没写出来（额度用完、只给空壳）时拆成两半再问：最多拆几层、拆到最少几列为止
 MODEL_SPLIT_DEPTH = 3
 MODEL_SPLIT_MIN_COLUMNS = 5
-#: 止损：连续这么多段拆到底仍一项没写出来，这次起草后面的段不再拆小重试（模型明显用不了时不该一段一段拆到底烧额度；
-#: 每段另有 MODEL_PART_MAX_CALLS 次封顶）
-MODEL_GIVE_UP_AFTER = 2
+#: 止损（按比例）：这次起草最近 MODEL_HALT_WINDOW 次调用里有 MODEL_HALT_ON 次以上没写出来（额度用完、超时、空壳、出错），
+#: 之后的段不再拆小、每块只问一次，直到比例降下去。模型明显用不了时不该一段一段拆到底烧额度；以前按「连续几段」算，
+#: 偶尔一次写出来就清零，会思考的模型在宽表上 90 分钟停不下来。每段另有 MODEL_PART_MAX_CALLS 次封顶
+MODEL_HALT_WINDOW = 10
+MODEL_HALT_ON = 7
+#: 同一张表连续这么多个原始段都一项没写出来，这张表剩下的段跳过不问（可以换一个起草模型后只重试这张表）
+MODEL_TABLE_GIVE_UP_AFTER = 3
 #: 网络错误、429、5xx 最多重试几次，每次重试前等多久（秒，依次取用）。超时不原样重试，当作这一段太大、拆小再问
 MODEL_RETRIES = 2
 MODEL_RETRY_DELAYS_S = (10.0, 30.0)
@@ -1842,8 +1846,10 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
     没用模型时为 None）有可用内容的再并上。同步起草和后台起草任务（每张表一结束就调）共用这一处。
 
     - 并入已有目录按 merge_notes 的规则：人工确认、驳回过的项不动。内容没变不写、不升版本。
-    - 模型这次没给的项（留空、没通过校验）不删以前起草的；列已经不在表结构里的，模型各段都写出来时（covered 含 llm）
-      照旧删掉。模型只写出一部分的不算完整起草过（covered 不含 llm）。
+    - 模型这次没给的项（留空、没通过校验）不删以前起草的；列已经不在表结构里的（业务主键、业务日期指着的列也算），
+      整张表起草完（各段都写出来的 ok、只写出一部分的 partial 都一样）就按完整覆盖的规则删掉：删的只是说已经不存在的
+      列的模型起草项，和这次写没写全无关。后台任务里宽表每写出一段就先并入一次（catalog_jobs.write_part，那一次不删
+      任何东西），这里是整张表的收尾。
     - 模型留空的列（blank）按并入之后的目录再筛一遍：已经有中文名或含义的（以前起草的、库注释、起草进行中有人填的）
       不算留空。
     - 写入撞上别人刚改过（乐观锁）就重读重并，最多三次。
@@ -1859,8 +1865,8 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
         if modeled.items:
             result.model_items = modeled.items
             result.blank = list(getattr(modeled, "blank", None) or [])
-            model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"}) if modeled.status == "ok"
-                                     else frozenset())
+            model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"})
+                                     if modeled.status in ("ok", "partial") else frozenset())
     for _attempt in range(3):
         entry = await read_entry(session, source.id, table)
         version = entry.version if entry else 0
@@ -2324,9 +2330,10 @@ __all__ = [
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftModel", "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL",
     "MEASURE_LABEL", "MODEL_BATCH_COLUMNS", "MODEL_BATCH_TABLES", "MODEL_CONCURRENCY", "MODEL_EMPTY_REASON",
-    "MODEL_FALLBACK_MAX_TOKENS", "MODEL_MAX_TOKENS", "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON",
-    "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS", "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER",
-    "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
+    "MODEL_FALLBACK_MAX_TOKENS", "MODEL_HALT_ON", "MODEL_HALT_WINDOW", "MODEL_MAX_TOKENS",
+    "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON", "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS",
+    "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER", "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS",
+    "MODEL_TABLE_GIVE_UP_AFTER", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
     "PATCH_MAX_CHANGES",
     "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE", "WRITE_CONFLICT_ERROR", "default_tables",
     "missing_table_error", "pick_tables", "write_draft",

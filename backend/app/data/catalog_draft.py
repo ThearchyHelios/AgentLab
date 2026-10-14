@@ -42,19 +42,22 @@
   地方写成了数组、对象的值在校验（catalog._from_model）里丢掉，不算出错。
 - 封顶：每个原始段（计划里的整表段、表级那段或一个列分段，连同按缩小后的上限分开的各块、拆出来的、补问的、重试的）
   一共最多调用 MODEL_PART_MAX_CALLS 次，到了次数还没写完的记没写出来。
-- 止损：连续 MODEL_GIVE_UP_AFTER 段拆到底仍一项没写出来（模型明显用不了，例如思考总是吃满额度），这次起草后面的
-  段不再拆小重试、没写出来就直接记下，报错建议更换起草模型；有一段写出来了就恢复。超时另有一条：拆到每段
-  MODEL_MIN_PART_COLUMNS 列的调用接连超时 MODEL_GIVE_UP_AFTER 次（超时和段大小无关，再拆小也是一次一个时限），后面
-  超时的不再拆小，超时拆出来、还没问的块也不再问；有一次调用写出来了就恢复。不然一直超时的模型首轮同时起草的几段
-  要各自拆满次数，一段 40 列串着问约 7 个时限（420 秒时约 49 分钟）。
+- 止损按比例：这次起草最近 MODEL_HALT_WINDOW 次调用里有 MODEL_HALT_ON 次以上没写出来（额度用完、超时、空壳、出错），
+  之后的段不再拆小、每块只问一次（不拆小、不补问漏掉的列、截断后不再补剩下的、空壳不再换纯文本原样再问；拆出来还没问
+  的块也不再问），报错建议更换起草模型，直到比例降下去。以前按「连续几段拆到底」「接连超时」算，偶尔一次写出来就清零：
+  实测会思考的模型在宽表上单次 1 到 7 分钟、四分之一超时，90 分钟停不下来。几处只管通信的调整照旧：服务方嫌额度
+  太大退回小额度、结构化输出不支持或回了说明文字改走纯文本、网络错误退避重试；结构化输出只给空壳的，这次起草还没换
+  纯文本问过的照旧问一次（看看是不是结构化输出的问题）。
+- 同一张表连续 MODEL_TABLE_GIVE_UP_AFTER 个原始段都一项没写出来：这张表剩下还没开始的段跳过不问（宽表一段一段问下去
+  只是烧额度），原因写清跳过了几段、可以换一个起草模型后只重试这张表。中间有一段写出来了就不算「接连」。
 - 提醒：最近 MODEL_NOTICE_WINDOW 次调用里有 MODEL_NOTICE_ON 次以上没写出来（额度用完、超时、空壳、出错），给一句
   提醒（次数和原因，建议换起草模型、缩小起草范围或停止），经进度回调交给任务；之后少于 MODEL_NOTICE_OFF 次时清掉。
   以前看不出调用在反复失败：一个任务 55 分钟只结束 1 张表，界面上只有段进度和用量。
 
 **原因。** 没写出来的原因只写进这张表的 model_error：几段因为同一个原因没写出来时说「这几段」，分段起草的表（只写
 出一部分的、一项都没写出来的都一样）每段写上列的范围（「第 5 段（列名 到 列名，共 33 列）」，列名照表结构原样），
-真拆小重试过的才补「已拆小重试仍没写出」。只有一段的表，这一段就是整张表：只写出一部分的写清是哪几列，一项都没写
-出来的只写原因。
+真拆小重试过的才补「已拆小重试仍没写出」，而且只跟在拆过的那几段后面说（说到的段只有一部分拆过时写「其中第 3 段」）。
+只有一段的表，这一段就是整张表：只写出一部分的写清是哪几列，一项都没写出来的只写原因。
 
 **留空的列。** 请模型写了、模型也列出了，中文名和含义却都没给（或者给的都没通过校验）的列是模型拿不准，不补问，
 记在 ModelOutcome.blank 里（表的状态不因此变）。目录里已经有中文名或含义的列不算（不论来源，驳回的不算有：以前模型
@@ -67,8 +70,10 @@
 的不会等前一个排着的段全部调完。一次起草里按表的先后排队：宽表的表级那段写完，它的列分段排到已经排着的段后面
 （先来先服务），不插到窄表前面。
 
-**进度。** 调用方给 Hooks：开始调用、每次调用的结果（用量、没写出来的原因、当前的提醒和列数上限）、一段结束、一张表
-的模型部分全部结束。后台起草任务据此落库，每张表一结束就并入目录（data/catalog_jobs.py）。
+**进度。** 调用方给 Hooks：开始调用、每次调用的结果（用量、没写出来的原因、当前的提醒和列数上限）、一段结束、宽表的
+一段写出来了（交出这张表到这时拿到的全部内容，调用方马上并入目录：停止、服务重启时已经写出来的段不丢）、块进度变了、
+一张表的模型部分全部结束。后台起草任务据此落库（data/catalog_jobs.py）。块：这张表实际分成几块来问——一开始是段数，
+一段被缩小的上限分开成几块、被拆成两半，块数就多几块；一块问完（写没写出来都算）算结束一块。
 
 交给模型的只有表结构（列、类型、主键、外键、唯一约束、注释）和使用者补充的背景，不发任何数据值。写给模型的文字都在
 catalog.py 名字带 _SYSTEM / _PROMPT 的常量里；这里的 REASON_* 是给人看的（拼进这张表的 model_error）。
@@ -111,21 +116,27 @@ SEG_ONE = "这一段"
 SEG_MANY = "这几段"
 REASON_EXHAUSTED = "模型的思考和输出用完了额度（{budget} 个 token），{seg}没写出来"
 REASON_SPLIT = "；已拆小重试仍没写出"
+#: 说到的几段里只有一部分真拆小重试过：只说那几段
+REASON_SPLIT_PARTS = "；其中第 {parts} 段已拆小重试仍没写出"
 REASON_HOLLOW = "模型只给了空壳，没有写出可用的内容"
 REASON_TRUNCATED = "模型的输出被截断，{seg}没写完"
 REASON_FORMAT = "模型的回复不是约定的格式"
 REASON_MISSING = "模型的回复里没有这张表"
 REASON_UNANSWERED = "模型的回复里漏了这些列，补问一次仍没有给出"
+#: 止损期间每块只问一次：漏了的列不补问
+REASON_OMITTED = "模型的回复里漏了这些列"
 REASON_TIMEOUT = "模型 {seconds} 秒内没有写完{seg}"
 REASON_CALL = "调用模型出错：{line}"
 REASON_RETRIED = "（已重试 {n} 次）"
 REASON_CRASH = "起草这张表时出错：{line}"
 #: 一段到了调用次数的上限（MODEL_PART_MAX_CALLS）还没写完
 REASON_CAPPED = "每段最多调用 {n} 次模型，{seg}到了次数仍没写完，已停止重试"
-#: 止损（连续几段拆到底仍一项没写出来，后面的段不再拆小重试）时补在原因后面
-REASON_HALTED = "；模型连续 {n} 段都没写出来，已停止拆小重试，建议更换起草模型"
-#: 拆到每段 MODEL_MIN_PART_COLUMNS 列仍接连超时（超时和段大小无关，后面超时的不再拆小）时补在原因后面
-REASON_SLOW = "；拆到每段 {n} 列仍然超时，已停止拆小重试，建议更换起草模型"
+#: 止损（最近几次调用多数没写出来，之后的段不再拆小、每块只问一次）时补在原因后面
+REASON_HALTED = "；最近 {window} 次调用有 {on} 次以上没写出来，已停止拆小重试，建议更换起草模型"
+#: 同一张表接连几段都没写出来，剩下的段跳过不问
+REASON_ABANDONED = "这张表接连 {k} 段都没写出来，剩下的 {n} 段已跳过，可以换一个起草模型后只重试这张表"
+#: 跳过不问的段在「没写出来」记录里的原因（不拼进原因，见 _Run._outcome）
+_SKIPPED = "\0skipped"
 
 # ---- 提醒（最近几次调用多数没写出来），经进度回调交给任务（CatalogDraftJob.notice）
 NOTICE = ("最近 {calls} 次调用有 {failed} 次没写出来（{kinds}）。建议在{place}换一个模型、缩小起草范围，"
@@ -154,8 +165,9 @@ class ModelOutcome:
 
     status：ok 各段都写出来了；partial 有的段写出来、有的没有（error 写清哪部分、为什么）；failed 一项都没写出来
     （error 写原因）。notes 是写出来的那些（已逐项校验，llm / proposed）；items 是项数。parts_total 分几段起草
-    （整表段是 1，宽表是 1 + 列分段数），parts_done 已经结束了几段。blank：模型拿不准、留空了的列（按表结构的顺序；
-    表的状态不因此变）。"""
+    （整表段是 1，宽表是 1 + 列分段数），parts_done 已经结束了几段，parts_written 其中写出了内容的段数。blank：模型拿
+    不准、留空了的列（按表结构的顺序；表的状态不因此变）。chunks_total、chunks_done：这张表实际分成的块数和已结束的
+    块数（段被缩小的上限分开、拆成两半后会变多）。"""
 
     status: str
     notes: dict[str, Any]
@@ -164,6 +176,18 @@ class ModelOutcome:
     parts_total: int
     parts_done: int
     blank: list[str] = field(default_factory=list)
+    parts_written: int = 0
+    chunks_total: int = 0
+    chunks_done: int = 0
+
+
+@dataclass(frozen=True)
+class PartWrite:
+    """宽表写出了一段（进度回调 part_written 收到的）：notes 是这张表到这时拿到的全部模型起草（已校验、已核对，深拷贝），
+    parts_written 是其中写出了内容的段数。调用方马上并入目录（这一次不删任何东西），整张表结束时另有 table_done 收尾。"""
+
+    notes: dict[str, Any]
+    parts_written: int
 
 
 @dataclass(frozen=True)
@@ -192,12 +216,16 @@ class Hooks:
     - call_started(表名列表)：一次调用拿到并发名额、马上要发出去了；
     - call_done(CallReport)：每次调用一回（条数就是调用次数），带着用量、没写出来的原因、当前的提醒和列数上限；
     - part_done(表名)：这张表的一段结束了（写没写出来都算）；
+    - part_written(表名, PartWrite)：宽表写出了一段、后面还有段没结束（最后一段由 table_done 收尾；只有一段的表不调）；
+    - chunks_changed(表名, 块数, 已结束的块数)：块进度变了；
     - table_done(表名, ModelOutcome)：这张表的模型部分全部结束。"""
 
     call_started: Callable[[list[str]], Awaitable[None]] | None = None
     call_done: Callable[[CallReport], Awaitable[None]] | None = None
     part_done: Callable[[str], Awaitable[None]] | None = None
     table_done: Callable[[str, ModelOutcome], Awaitable[None]] | None = None
+    part_written: Callable[[str, PartWrite], Awaitable[None]] | None = None
+    chunks_changed: Callable[[str, int, int], Awaitable[None]] | None = None
 
 
 def parts_for(columns: int) -> int:
@@ -328,9 +356,9 @@ class _Reply:
 
 @dataclass(frozen=True)
 class _Why:
-    """一部分没写出来的原因。base 给人看的原因（可以带 SEG，拼成一句时换成「这一段」「这几段」）；split 真拆小重试过；
-    halted 本来还能拆小、因为止损才没拆时止损的说明（REASON_HALTED：前面连续几段都没写出来；REASON_SLOW：拆到每段
-    MODEL_MIN_PART_COLUMNS 列仍接连超时），没有是空串。"""
+    """一部分没写出来的原因。base 给人看的原因（可以带 SEG，拼成一句时换成「这一段」「这几段」；跳过不问的段是 _SKIPPED，
+    不拼进原因）；split 真拆小重试过；halted 本来还能拆小、补问或再问、因为止损才没问时止损的说明（REASON_HALTED：最近
+    几次调用多数没写出来），没有是空串。"""
 
     base: str
     split: bool = False
@@ -341,18 +369,23 @@ def _join(failures: Iterable[tuple[_Why, int]]) -> str:
     """几处没写出来的原因拼成一句。failures 是 (原因, 属于这张表的第几段)。
 
     同样的原因只说一次（最多说两种）；同一个原因落在几段上说「这几段」，同一段拆出来的几块仍是「这一段」；拆小重试过、
-    止损的说明各在最后补一次（只看说出来的那几种；两种止损各说一次）。不然宽表的表级那段拆不开、列分段拆过时，同一句
-    原因会说两遍。"""
+    止损的说明各在最后补一次（只看说出来的那几种）。不然宽表的表级那段拆不开、列分段拆过时，同一句原因会说两遍。
+
+    「已拆小重试仍没写出」只跟在真拆过的那几段后面说：说到的段都拆过（只有一段的表就是这一段）时不点名，只有一部分拆过
+    时写「其中第 3、4 段已拆小重试仍没写出」。以前一律补在最后，读起来像每一段都拆过。"""
     failures = list(failures)
     parts: dict[str, set[int]] = {}
     for why, part in failures:
         parts.setdefault(why.base, set()).add(part)
     shown = list(parts)[:2]
-    told = [w for w, _ in failures if w.base in shown]
+    told = [(w, part) for w, part in failures if w.base in shown]
     text = "；".join(base.replace(SEG, SEG_MANY if len(parts[base]) > 1 else SEG_ONE) for base in shown)
-    if any(w.split for w in told):
-        text += REASON_SPLIT
-    for note in dict.fromkeys(w.halted for w in told if w.halted):
+    split = sorted({part for w, part in told if w.split})
+    if split:
+        everywhere = {part for _, part in told}
+        text += REASON_SPLIT if set(split) == everywhere else \
+            REASON_SPLIT_PARTS.format(parts="、".join(str(part) for part in split))
+    for note in dict.fromkeys(w.halted for w, _ in told if w.halted):
         text += note
     return text
 
@@ -706,6 +739,16 @@ class _Table:
     failed: dict[str, _Why] = field(default_factory=dict)
     parts_done: int = 0
     finished: bool = False
+    #: 写出了内容的段（第几段）
+    written_parts: set[int] = field(default_factory=set)
+    #: 接连几个原始段一项都没写出来（写出来就清零）；到了 MODEL_TABLE_GIVE_UP_AFTER 段，剩下的段跳过不问
+    dead_parts: int = 0
+    abandoned: bool = False
+    #: 跳过不问的段（第几段）
+    skipped_parts: list[int] = field(default_factory=list)
+    #: 块进度：实际分成几块、结束了几块
+    chunks_total: int = 0
+    chunks_done: int = 0
 
     def whole(self, piece: _Piece) -> bool:
         return piece.table_level and len(piece.columns) == len(self.columns)
@@ -751,6 +794,15 @@ class _Budget:
     """一段（新开始的一段，连同它拆出来的、补问的、重试的）还能调用几次模型。"""
 
     left: int
+
+
+@dataclass
+class _Chunk:
+    """一块：一次拿来问的几张表（多表拼成的段每张表各是一块）。补问、截断后补剩下的、换纯文本再问都还是这一块；拆成两半
+    （单张表按列拆，多一块；多表的段按表拆，各张表仍是一块）后，这一块里被拆的表交给新的块，split 记下它们。"""
+
+    tables: tuple[str, ...]
+    split: set[str] = field(default_factory=set)
 
 
 def _pack(pieces: list[_Piece], cap: int) -> list[list[_Piece]]:
@@ -800,31 +852,28 @@ class _Run:
         self.background = self._background(getattr(source, "description", None), background)
         #: 这次起草同时在等名额或正在进行的调用最多几个（全进程的名额另算，见 model_gate）
         self.gate = asyncio.Semaphore(max(1, int(C.MODEL_CONCURRENCY)))
-        #: 连续几段拆到底仍一项没写出来（止损用，有一段写出来就清零）
-        self.dead_streak = 0
-        #: 拆到每段 MODEL_MIN_PART_COLUMNS 列（或更小）的调用接连超时了几次（有一次调用写出来就清零）：超时和段大小
-        #: 无关，再拆小也是一次一个时限，后面超时的不再拆小
-        self.slow_streak = 0
         #: 新开始的段每段最多几列：额度用完或超时（strikes）累计 MODEL_SHRINK_AFTER 次减半一次
         self.part_columns = max(1, int(C.MODEL_BATCH_COLUMNS))
         self.strikes = 0
         #: 最近几次调用没写出来的原因种类（写出来了是 None），提醒看它
         self.recent: collections.deque[str | None] = collections.deque(maxlen=max(1, int(C.MODEL_NOTICE_WINDOW)))
         self.notice: str | None = None
+        #: 最近 MODEL_HALT_WINDOW 次调用没写出来没有（止损按比例看它）
+        self.window: collections.deque[bool] = collections.deque(maxlen=max(1, int(C.MODEL_HALT_WINDOW)))
+        self.was_halted = False
+        #: 这次起草里结构化输出只给空壳时换纯文本问过没有（止损期间只问这一次）
+        self.text_probed = False
 
-    def _halt_note(self, kind: str | None = None) -> str:
-        """止损的说明（拼在原因后面），没止损是空串。
+    def _halted(self) -> bool:
+        """止损：最近 MODEL_HALT_WINDOW 次调用里有 MODEL_HALT_ON 次以上没写出来。之后的段不再拆小、每块只问一次，直到
+        比例降下去（偶尔一次写出来不会清零）。"""
+        return sum(self.window) >= max(1, int(C.MODEL_HALT_ON))
 
-        - 连续 MODEL_GIVE_UP_AFTER 段一项都没写出来：后面的段不再拆小重试（不论原因）；
-        - 超时的（kind 是 timeout）另看：拆到每段 MODEL_MIN_PART_COLUMNS 列的调用接连超时 MODEL_GIVE_UP_AFTER 次，
-          超时就和段大小无关了，再拆小也是一次一个时限，后面超时的不再拆小，超时拆出来还没问的块也不再问。只管超时：
-          额度用完、只给空壳照旧拆小（段小了思考和输出才放得下）。"""
-        give_up = max(1, int(C.MODEL_GIVE_UP_AFTER))
-        if self.dead_streak >= give_up:
-            return REASON_HALTED.format(n=give_up)
-        if kind == "timeout" and self.slow_streak >= give_up:
-            return REASON_SLOW.format(n=self._floor())
-        return ""
+    def _halt_note(self) -> str:
+        """止损的说明（拼在原因后面），没止损是空串。"""
+        if not self._halted():
+            return ""
+        return REASON_HALTED.format(window=max(1, int(C.MODEL_HALT_WINDOW)), on=max(1, int(C.MODEL_HALT_ON)))
 
     @staticmethod
     def _floor() -> int:
@@ -846,6 +895,8 @@ class _Run:
                 head, *rest = self.tables[unit].parts
                 # 表级那段先写：列分段拿它做背景
                 queue.append(_Work([head], [_Work([p]) for p in rest]))
+        for st in self.tables.values():
+            st.chunks_total = len(st.parts)
         left = {name: len(st.parts) for name, st in self.tables.items()}
         busy = 0
         changed = asyncio.Event()
@@ -898,9 +949,16 @@ class _Run:
         """起草一段；它之后的段（宽表的列分段）排到队尾；一张表的段都结束了，这张表的模型部分就结束了。
 
         这一段（原始段：计划里的整表段、表级那段或一个列分段）连同按缩小后的上限分开的各块、拆出来的、补问的、重试的，
-        一共最多调用 MODEL_PART_MAX_CALLS 次（各块共用一个 _Budget）；止损按原始段数（_tally）。"""
-        await self._start(work.pieces, _Budget(max(1, int(C.MODEL_PART_MAX_CALLS))))
-        self._tally(work.pieces)
+        一共最多调用 MODEL_PART_MAX_CALLS 次（各块共用一个 _Budget）。接连几段没写出来的表（_tally），剩下的段跳过不问。
+        宽表写出了一段、后面还有段没结束，就把这张表到这时拿到的内容交给调用方并入目录（part_written）；最后一段结束由
+        table_done 收尾。"""
+        asked = [p for p in work.pieces if not self.tables[p.table].abandoned]
+        for piece in work.pieces:
+            if self.tables[piece.table].abandoned:
+                await self._skip_part(piece)
+        if asked:
+            await self._start(asked, _Budget(max(1, int(C.MODEL_PART_MAX_CALLS))))
+            self._tally(asked)
         for piece in work.pieces:
             await self._part_done(piece.table)
         queue.extend(work.then)
@@ -908,6 +966,8 @@ class _Run:
             left[piece.table] -= 1
             if not left[piece.table]:
                 await self._table_done(piece.table)
+            elif piece.part in self.tables[piece.table].written_parts:
+                await self._part_written(piece.table)
 
     async def _start(self, pieces: list[_Piece], budget: _Budget) -> None:
         """开始起草一段。超过当前的列数上限（额度用完、超时多了会减半）的先按上限分开：多表的段按表重新拼，单张表的
@@ -922,6 +982,7 @@ class _Run:
             return
         piece = pieces[0]
         chunks = _even(piece.columns, -(-len(piece.columns) // cap))
+        await self._more_chunks(piece.table, len(chunks) - 1)
         first = [_Piece(piece.table, chunks[0], piece.table_level, piece.part)]
         rest = [[_Piece(piece.table, cols, False, piece.part)] for cols in chunks[1:]]
         if piece.table_level:
@@ -931,9 +992,10 @@ class _Run:
             await asyncio.gather(*(self._guarded(group, budget) for group in [first, *rest]))
 
     async def _guarded(self, pieces: list[_Piece], budget: _Budget) -> None:
-        """起草一段（或它按上限分开的一块）；意料之外的错误只记这一块没写出来，不影响别的段和别的表。"""
+        """起草一块（一段，或它按上限分开的一块）；意料之外的错误只记这一块没写出来，不影响别的段和别的表。"""
+        chunk = _Chunk(tuple(dict.fromkeys(p.table for p in pieces)))
         try:
-            await self._segment(pieces, 0, False, budget)
+            await self._segment(pieces, 0, False, budget, chunk=chunk)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -941,49 +1003,78 @@ class _Run:
 
             logger.exception("起草数据目录时出错：%s", "、".join(p.table for p in pieces))
             self._fail(pieces, REASON_CRASH.format(line=first_line(e) or describe_exception(e)))
+        await self._chunk_done(chunk)
 
     def _tally(self, pieces: list[_Piece]) -> None:
-        """一段（原始段，连同它分开的各块、拆小、补缺）结束：一项都没写出来的接着数，写出来了清零。"""
-        if any(self.tables[p.table].wrote(p) for p in pieces):
-            self.dead_streak = 0
+        """一段（原始段，连同它分开的各块、拆小、补缺）结束：记下这一段写出内容没有；同一张表接连
+        MODEL_TABLE_GIVE_UP_AFTER 段一项都没写出来，这张表剩下的段跳过不问（写出来了清零）。"""
+        give_up = max(1, int(C.MODEL_TABLE_GIVE_UP_AFTER))
+        for piece in pieces:
+            st = self.tables[piece.table]
+            if st.wrote(piece):
+                st.written_parts.add(piece.part)
+                st.dead_parts = 0
+                continue
+            st.dead_parts += 1
+            if st.dead_parts >= give_up and not st.abandoned and len(st.parts) > 1:
+                st.abandoned = True
+                logger.warning("起草数据目录：表 %s 接连 %d 段都没写出来，剩下的段跳过", st.name, st.dead_parts)
+
+    async def _skip_part(self, piece: _Piece) -> None:
+        """这张表接连几段都没写出来：这一段跳过不问（算一块结束）。"""
+        st = self.tables[piece.table]
+        st.skipped_parts.append(piece.part)
+        self._fail([piece], _Why(_SKIPPED))
+        st.chunks_done += 1
+        await self._hook(self.hooks.chunks_changed, st.name, st.chunks_total, st.chunks_done)
+
+    # ---------------------------------------------------------------- 块进度
+
+    async def _more_chunks(self, table: str, n: int) -> None:
+        if n <= 0:
             return
-        self.dead_streak += 1
-        if self.dead_streak == max(1, int(C.MODEL_GIVE_UP_AFTER)):
-            logger.warning("起草数据目录：模型连续 %d 段都没写出来，这次起草后面的段不再拆小重试", self.dead_streak)
+        st = self.tables[table]
+        st.chunks_total += n
+        await self._hook(self.hooks.chunks_changed, table, st.chunks_total, st.chunks_done)
+
+    async def _chunk_done(self, chunk: _Chunk) -> None:
+        """一块问完了：这一块里没被拆给新块的表，各结束一块。"""
+        for table in chunk.tables:
+            if table in chunk.split:
+                continue
+            st = self.tables[table]
+            st.chunks_done += 1
+            await self._hook(self.hooks.chunks_changed, table, st.chunks_total, st.chunks_done)
 
     # ---------------------------------------------------------------- 一段
 
     async def _segment(self, pieces: list[_Piece], depth: int, followup: bool, budget: _Budget, *,
-                       halved: bool = False, mode: str | None = None, last: bool = False,
-                       optional: bool = False) -> None:
+                       chunk: _Chunk, halved: bool = False, mode: str | None = None, last: bool = False,
+                       optional: str | None = None) -> None:
         """问一段，拿到的并进各表；按失败原因拆开、补缺、记下没写出来的。
 
         depth：已经拆了几层（截断后只补剩下的也算一层）。followup：这一段是在补缺（补过就不再补，见 _after_followup）。
-        budget：这一段（原始段）还能调用几次。halved：这几块是真拆小（_split）出来的——原因里「已拆小重试」只在这时写。
-        mode / last：换纯文本问的那一次——拆不开的空壳、结构化输出回了说明文字（再不行就记没写出来）。
-        optional：超时拆出来的块，轮到它时已经止损就不问了（_ask）。"""
+        budget：这一段（原始段）还能调用几次。chunk：这是哪一块（块进度）。halved：这几块是真拆小（_split）出来的——
+        原因里「已拆小重试」只在这时写。mode / last：换纯文本问的那一次——拆不开的空壳、结构化输出回了说明文字（再不行
+        就记没写出来）。optional：拆出来的块（值是拆它的原因），轮到它时已经止损就不问了（_ask）。
+
+        止损期间（_halted）每块只问一次：不拆小（_split）、不补问漏掉的列、截断后不再补剩下的。"""
         reply = await self._ask(pieces, budget, mode, optional=optional)
         if reply.capped:
             self._fail(pieces, self._capped(halved))
             return
         if reply.skipped:
-            note = self._halt_note("timeout")
-            self._fail(pieces, lambda p: self._reason("timeout", split=True, piece=p, halted=note))
+            note = self._halt_note()
+            self._fail(pieces, lambda p: self._reason(optional or "hollow", split=True, piece=p, halted=note))
             return
         if reply.timeout:
-            # 先记下再报用量：报用量要写库、会让出事件循环，等名额的块醒来时要看到这一次
-            if sum(len(p.columns) for p in pieces) <= self._floor():
-                self.slow_streak += 1
-                if self.slow_streak == max(1, int(C.MODEL_GIVE_UP_AFTER)):
-                    logger.warning("起草数据目录：拆到每段 %d 列仍接连超时 %d 次，后面超时的不再拆小",
-                                   self._floor(), self.slow_streak)
             await self._report(reply, wrote=False)
-            await self._split(pieces, depth, "timeout", followup, budget, halved)
+            await self._split(pieces, depth, "timeout", followup, budget, halved, chunk)
             return
         if reply.error is not None:
             await self._report(reply, wrote=False)
             if reply.prose and not last:
-                await self._prose_to_text(pieces, depth, followup, budget, halved)
+                await self._prose_to_text(pieces, depth, followup, budget, halved, chunk)
                 return
             self._fail(pieces, _Why(reply.error, split=halved))
             return
@@ -1008,28 +1099,36 @@ class _Run:
                 return
             kind = "exhausted" if reply.exhausted else "truncated"
             if not anything:
-                await self._split(rest, depth, kind, followup, budget, halved)
-            elif depth < int(C.MODEL_SPLIT_DEPTH):
+                await self._split(rest, depth, kind, followup, budget, halved, chunk)
+            elif depth < int(C.MODEL_SPLIT_DEPTH) and not self._halted():
                 # 捡回了一部分：只补剩下的（不是拆小）
-                await self._segment(rest, depth + 1, followup, budget, halved=halved)
+                await self._segment(rest, depth + 1, followup, budget, chunk=chunk, halved=halved)
             else:
-                self._fail(rest, self._reason(kind, split=halved))
+                note = self._halt_note() if depth < int(C.MODEL_SPLIT_DEPTH) else ""
+                self._fail(rest, self._reason(kind, split=halved, halted=note))
             return
         if not anything and not followup:
             if last:
                 halted = self._stopped(pieces, depth)
                 self._fail(pieces, lambda p: self._reason("hollow", split=halved, piece=p, halted=halted))
                 return
-            await self._split(pieces, depth, "hollow", followup, budget, halved)
+            await self._split(pieces, depth, "hollow", followup, budget, halved, chunk)
             return
         if not rest:
             return
         if followup:
-            await self._after_followup(rest, depth, budget, halved, last=last)
+            await self._after_followup(rest, depth, budget, halved, chunk, last=last)
             return
-        await self._segment(rest, depth, True, budget, halved=halved)
+        if self._halted():
+            # 止损期间每块只问一次：漏了的不补问
+            note = self._halt_note()
+            self._fail(rest, lambda p: _Why(REASON_OMITTED, split=halved, halted=note)
+                       if self.tables[p.table].has_any() else self._reason("hollow", split=halved, piece=p,
+                                                                           halted=note))
+            return
+        await self._segment(rest, depth, True, budget, chunk=chunk, halved=halved)
 
-    async def _after_followup(self, rest: list[_Piece], depth: int, budget: _Budget, halved: bool, *,
+    async def _after_followup(self, rest: list[_Piece], depth: int, budget: _Budget, halved: bool, chunk: _Chunk, *,
                               last: bool) -> None:
         """补问过仍然没给的部分（补过就不再补）。
 
@@ -1047,16 +1146,17 @@ class _Run:
             halted = self._stopped(empty, depth)
             self._fail(empty, lambda p: self._reason("hollow", split=halved, piece=p, halted=halted))
             return
-        await self._split(empty, depth, "hollow", False, budget, halved)
+        await self._split(empty, depth, "hollow", False, budget, halved, chunk)
 
     async def _prose_to_text(self, pieces: list[_Piece], depth: int, followup: bool, budget: _Budget,
-                             halved: bool) -> None:
+                             halved: bool, chunk: _Chunk) -> None:
         """结构化输出回了一段说明文字：网关接受了结构化输出的参数却没照做。这次起草后面都走纯文本（另带格式说明），
-        这一段换纯文本问一次。纯文本额度用完了还能照常拆小（拆出来的半段也走纯文本，不再先问一遍结构化输出）。"""
+        这一段换纯文本问一次（止损期间也问：这是通信方式的问题，不是模型写不出来）。纯文本额度用完了还能照常拆小
+        （拆出来的半段也走纯文本，不再先问一遍结构化输出）。"""
         if self.mode != "text":
             self.mode = "text"
             logger.info("起草数据目录：结构化输出回了说明文字，后面改走纯文本")
-        await self._segment(pieces, depth, followup, budget, halved=halved, mode="text", last=True)
+        await self._segment(pieces, depth, followup, budget, chunk=chunk, halved=halved, mode="text", last=True)
 
     def _stopped(self, pieces: list[_Piece], depth: int) -> str:
         """这几段本来还能拆小、因为止损才没拆时，止损的说明；不是的话是空串。"""
@@ -1065,36 +1165,57 @@ class _Run:
         return ""
 
     async def _split(self, pieces: list[_Piece], depth: int, kind: str, followup: bool, budget: _Budget,
-                     halved: bool) -> None:
+                     halved: bool, chunk: _Chunk) -> None:
         """拆成两半再问（额度用完、超时、只给空壳、截断后一项都没捡回来）。
 
         - 同一张表按列拆、前一半带着表级的项：先写前一半，后一半拿它做背景。超时的不等：一次超时就是一个时限，40 → 20
-          → 10 一层一层串着问要好几个时限，两半同时问；拆出来的块轮到它时已经止损的不再问（optional）。
-        - 拆不开的空壳再问一次：结构化输出给的换纯文本，已经走纯文本的原样再问。止损时本来能拆的不拆：结构化输出给的
-          照旧换纯文本问一次（看看是不是结构化输出的问题），已经走纯文本的不再问。
+          → 10 一层一层串着问要好几个时限，两半同时问。拆出来的两半是新的块（单张表多一块）；轮到它时已经止损的不再问
+          （optional）。
+        - 拆不开的空壳再问一次：结构化输出给的换纯文本，已经走纯文本的原样再问。
+        - 止损期间（_halted）不拆小、每块只问一次：本来能拆的不拆；空壳不再原样再问，只有结构化输出给的、这次起草还没
+          换纯文本问过的照旧问一次（看看是不是结构化输出的问题）。
         - 别的原因拆不开、止损了，就记没写出来。"""
         halves = _halves(pieces) if depth < int(C.MODEL_SPLIT_DEPTH) else None
-        halted = self._halt_note(kind) if halves is not None else ""
+        halted = self._halted()
         if halves is not None and not halted:
             first, second = halves
-            timeout = kind == "timeout"
-            if (not timeout and len(first) == len(second) == 1 and first[0].table == second[0].table
+            await self._split_chunk(chunk, pieces)
+            if (kind != "timeout" and len(first) == len(second) == 1 and first[0].table == second[0].table
                     and first[0].table_level):
-                await self._segment(first, depth + 1, followup, budget, halved=True)
-                await self._segment(second, depth + 1, followup, budget, halved=True)
+                await self._half(first, depth + 1, followup, budget, kind)
+                await self._half(second, depth + 1, followup, budget, kind)
                 return
-            results = await asyncio.gather(
-                self._segment(first, depth + 1, followup, budget, halved=True, optional=timeout),
-                self._segment(second, depth + 1, followup, budget, halved=True, optional=timeout),
-                return_exceptions=True)
+            results = await asyncio.gather(self._half(first, depth + 1, followup, budget, kind),
+                                           self._half(second, depth + 1, followup, budget, kind),
+                                           return_exceptions=True)
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
             return
-        if kind == "hollow" and (not halted or self.mode == "structured"):
-            await self._segment(pieces, depth, followup, budget, halved=halved, mode="text", last=True)
+        if kind == "hollow" and (not halted or (self.mode == "structured" and not self.text_probed)):
+            self.text_probed = True
+            await self._segment(pieces, depth, followup, budget, chunk=chunk, halved=halved, mode="text", last=True)
             return
-        self._fail(pieces, lambda p: self._reason(kind, split=halved, piece=p, halted=halted))
+        note = self._halt_note() if halted and (halves is not None or kind == "hollow") else ""
+        self._fail(pieces, lambda p: self._reason(kind, split=halved, piece=p, halted=note))
+
+    async def _half(self, pieces: list[_Piece], depth: int, followup: bool, budget: _Budget, kind: str) -> None:
+        """拆出来的一半：新的一块，问完算结束一块。"""
+        chunk = _Chunk(tuple(dict.fromkeys(p.table for p in pieces)))
+        try:
+            await self._segment(pieces, depth, followup, budget, chunk=chunk, halved=True, optional=kind)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._chunk_done(chunk)      # 出错也算问完（_guarded 记没写出来），块进度对得上
+            raise
+        await self._chunk_done(chunk)
+
+    async def _split_chunk(self, chunk: _Chunk, pieces: list[_Piece]) -> None:
+        """这一块里的这几张表拆给了新的块：单张表按列拆成两半，多一块；多表的段按表拆，各张表仍是一块。"""
+        chunk.split.update(dict.fromkeys(p.table for p in pieces))
+        if len(pieces) == 1:
+            await self._more_chunks(pieces[0].table, 1)
 
     def _remainder(self, pieces: list[_Piece], gains: list[_Gain], *, truncated: bool,
                    followup: bool) -> list[_Piece]:
@@ -1118,13 +1239,13 @@ class _Run:
     # ---------------------------------------------------------------- 调用
 
     async def _ask(self, pieces: list[_Piece], budget: _Budget, mode: str | None = None, *,
-                   optional: bool = False) -> _Reply:
+                   optional: str | None = None) -> _Reply:
         """调一次模型（按原因重来：额度被拒、结构化输出不支持、网络错误……），交回读好的回复。
 
-        这一段的调用次数用完了交回 capped（不调用）。optional（超时拆出来的块）：拿到名额时已经止损，交回 skipped（不调用，
-        次数退回）——等名额的时候前面的块接连超时，再问也是一个时限。超时不原样重试：交回 timeout，由调用方当作这一段
+        这一段的调用次数用完了交回 capped（不调用）。optional（拆出来的块）：拿到名额时已经止损，交回 skipped（不调用，
+        次数退回）——等名额的时候前面的调用多数没写出来，不再拆小重试。超时不原样重试：交回 timeout，由调用方当作这一段
         太大、拆小再问。重来之前的那次调用在这里就报给进度回调；交回的那次由调用方读完内容再报（写没写出来要看校验之后
-        的内容）。"""
+        的内容）。服务方嫌额度太大、结构化输出不支持、网络错误的重来止损期间照旧（只管通信，不是模型写不出来）。"""
         mode = mode or self.mode
         retried = 0
         while True:
@@ -1135,7 +1256,7 @@ class _Run:
             try:
                 # 先占这次起草自己的名额，再去排全进程的：一次起草排在全进程名额上的调用最多 MODEL_CONCURRENCY 个
                 async with self.gate, model_gate():
-                    if optional and self._halt_note("timeout"):
+                    if optional and self._halted():
                         budget.left += 1
                         return _Reply(skipped=True)
                     await self._hook(self.hooks.call_started, [p.table for p in pieces])
@@ -1228,10 +1349,17 @@ class _Run:
 
     async def _called(self, usage: tuple[int, int], failure: str | None, *, strike: bool = False) -> None:
         """记下一次调用：额度用完或超时（strike）累计 MODEL_SHRINK_AFTER 次，新开始的段列数上限减半；最近几次调用多数
-        没写出来时提醒，少了清掉。写出来了（failure 为 None）就清掉接连超时的计数。报给进度回调。"""
+        没写出来时提醒，少了清掉；止损按最近 MODEL_HALT_WINDOW 次调用的比例（_halted）。报给进度回调。"""
         self.recent.append(failure)
-        if failure is None:
-            self.slow_streak = 0
+        self.window.append(failure is not None)
+        halted = self._halted()
+        if halted != self.was_halted:
+            self.was_halted = halted
+            if halted:
+                logger.warning("起草数据目录：最近 %d 次调用有 %d 次没写出来，之后的段不再拆小、每块只问一次",
+                               len(self.window), sum(self.window))
+            else:
+                logger.info("起草数据目录：最近的调用多数写出来了，恢复拆小重试")
         if strike:
             self.strikes += 1
             width = max(1, int(C.MODEL_BATCH_COLUMNS))
@@ -1344,21 +1472,33 @@ class _Run:
         failed_table = _TABLE in st.failed and not st.got_table
         total = len(st.parts) or 1
         part_of = st.part_of()
+        progress = {"parts_written": len(st.written_parts), "chunks_total": st.chunks_total,
+                    "chunks_done": st.chunks_done}
+        abandoned = self._abandoned_text(st)
         if not items:
-            failures = [(why, part_of.get(key, 1)) for key, why in st.failed.items()]
+            failures = [(why, part_of.get(key, 1)) for key, why in st.failed.items() if why.base != _SKIPPED]
             reason = _join(failures) if failures else (C.MODEL_EMPTY_REASON if st.named else REASON_MISSING)
-            if failures and len(st.parts) > 1:
+            if abandoned:
+                reason = f"{reason}；{abandoned}"
+            if st.failed and len(st.parts) > 1:
                 # 宽表一项都没写出来：同样逐段写上列的范围
                 said = self._parts_said(st, failed_cols, failed_table)
                 every = "都" if len(said) == len(st.parts) else ""
                 reason = f"这张表 {len(st.columns)} 列，分 {len(st.parts)} 段起草，{'、'.join(said)}{every}没写出来：{reason}"
-            return ModelOutcome("failed", {}, 0, reason, total, st.parts_done)
+            return ModelOutcome("failed", {}, 0, reason, total, st.parts_done, **progress)
         notes = copy.deepcopy(st.notes)
         blank = self._blank(st, set(failed_cols))
         if failed_cols or failed_table:
-            return ModelOutcome("partial", notes, items, self._partial_text(st, failed_cols, failed_table), total,
-                                st.parts_done, blank)
-        return ModelOutcome("ok", notes, items, None, total, st.parts_done, blank)
+            return ModelOutcome("partial", notes, items, self._partial_text(st, failed_cols, failed_table, abandoned),
+                                total, st.parts_done, blank, **progress)
+        return ModelOutcome("ok", notes, items, None, total, st.parts_done, blank, **progress)
+
+    @staticmethod
+    def _abandoned_text(st: _Table) -> str:
+        """这张表接连几段没写出来、剩下的段跳过了：说清跳过了几段、怎么办。没跳过是空串。"""
+        if not st.skipped_parts:
+            return ""
+        return REASON_ABANDONED.format(k=max(1, int(C.MODEL_TABLE_GIVE_UP_AFTER)), n=len(st.skipped_parts))
 
     def _blank(self, st: _Table, failed: set[str]) -> list[str]:
         """模型拿不准、留空了的列：请它写了（不在没写出来的里面），中文名和含义却都没给（或者给的都没通过校验）。
@@ -1395,11 +1535,14 @@ class _Run:
         return said + [f"第 {k} 段（{_columns_text(st.columns, cols, count=True)}）" for k, cols in sorted(bad.items())]
 
     @classmethod
-    def _partial_text(cls, st: _Table, failed_cols: list[str], failed_table: bool) -> str:
-        """只写出一部分时说清哪部分没写出来（第几段、哪几列）、为什么、怎么办。"""
+    def _partial_text(cls, st: _Table, failed_cols: list[str], failed_table: bool, abandoned: str = "") -> str:
+        """只写出一部分时说清哪部分没写出来（第几段、哪几列）、为什么、怎么办。剩下的段跳过了的，跳过的说明里已经说了
+        怎么办（换一个起草模型后只重试这张表），不再另说「可以只重试这张表」。"""
         part_of = st.part_of()
         keys = ([_TABLE] if failed_table else []) + failed_cols
-        reason = _join((st.failed[k], part_of.get(k, 1)) for k in keys)
+        reason = _join((st.failed[k], part_of.get(k, 1)) for k in keys if st.failed[k].base != _SKIPPED)
+        if abandoned:
+            reason = f"{reason}；{abandoned}" if reason else abandoned
         n = len(st.columns)
         if len(st.parts) > 1:
             said = cls._parts_said(st, failed_cols, failed_table)
@@ -1411,7 +1554,7 @@ class _Run:
             head = f"这张表 {n} 列，有 {len(failed_cols)} 列（{_columns_text(st.columns, failed_cols, count=False)}）没写出来"
         else:
             head = f"这张表 {n} 列，表级的项没写出来"
-        return f"{head}：{reason}。可以只重试这张表"
+        return f"{head}：{reason}" if abandoned else f"{head}：{reason}。可以只重试这张表"
 
     async def _part_done(self, name: str) -> None:
         self.tables[name].parts_done += 1
@@ -1423,6 +1566,11 @@ class _Run:
             return
         st.finished = True
         await self._hook(self.hooks.table_done, name, self._outcome(st))
+
+    async def _part_written(self, name: str) -> None:
+        """宽表写出了一段、后面还有段没结束：把这张表到这时拿到的全部内容交给调用方并入目录（停止、服务重启时不丢）。"""
+        st = self.tables[name]
+        await self._hook(self.hooks.part_written, name, PartWrite(copy.deepcopy(st.notes), len(st.written_parts)))
 
     @staticmethod
     async def _hook(fn: Callable[..., Awaitable[None]] | None, *args: Any) -> None:
@@ -1534,7 +1682,8 @@ class _Run:
         return C._notes_lines(confirmed, meta=st.meta, system_notes=False)
 
 
-__all__ = ["BUDGET_WORDS", "Background", "CallReport", "FAILURE_LABEL", "Hooks", "ModelOutcome", "NOTICE", "REASON_CALL",
-           "REASON_CAPPED", "REASON_EXHAUSTED", "REASON_FORMAT", "REASON_HALTED", "REASON_HOLLOW", "REASON_MISSING",
-           "REASON_RETRIED", "REASON_SLOW", "REASON_SPLIT", "REASON_TIMEOUT", "REASON_TRUNCATED", "REASON_UNANSWERED",
-           "SEG", "classify_failure", "model_gate", "parts_for", "run_model_draft"]
+__all__ = ["BUDGET_WORDS", "Background", "CallReport", "FAILURE_LABEL", "Hooks", "ModelOutcome", "NOTICE", "PartWrite",
+           "REASON_ABANDONED", "REASON_CALL", "REASON_CAPPED", "REASON_EXHAUSTED", "REASON_FORMAT", "REASON_HALTED",
+           "REASON_HOLLOW", "REASON_MISSING", "REASON_OMITTED", "REASON_RETRIED", "REASON_SPLIT", "REASON_SPLIT_PARTS",
+           "REASON_TIMEOUT", "REASON_TRUNCATED", "REASON_UNANSWERED", "SEG", "classify_failure", "model_gate",
+           "parts_for", "run_model_draft"]
