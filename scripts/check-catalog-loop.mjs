@@ -293,13 +293,17 @@ function applyReview(notes, path, action) {
   else it.status = action === 'confirm' ? 'confirmed' : action === 'reject' ? 'rejected' : INIT[it.source] ?? 'proposed'
   return assemble(map)
 }
-/** 保存提案（catalog.apply_patch 的简化）：码值是补充，其余整项替换；改动的项记为人工填写、已确认 */
+/**
+ * 保存提案（catalog.apply_patch 的简化）：码值是补充（驳回的码值不算），其余整项替换；改动的项记为人工填写、已确认，
+ * 写了依据的项依据进备注「依据：……」
+ */
 function applyPatch(notes, changes) {
   const map = slots(clone(notes ?? {}))
   for (const c of changes) {
     const prev = map.get(c.path)
-    const value = c.path.endsWith('.codes') && prev ? { ...prev.value, ...c.value } : c.value
-    map.set(c.path, { value, source: 'human', status: 'confirmed', updated_at: new Date().toISOString() })
+    const live = prev && prev.status !== 'rejected' ? prev : null
+    const value = c.path.endsWith('.codes') && live ? { ...live.value, ...c.value } : c.value
+    map.set(c.path, { value, source: 'human', status: 'confirmed', updated_at: new Date().toISOString(), ...(c.reason ? { note: `依据：${c.reason}` } : {}) })
   }
   return assemble(map)
 }
@@ -840,6 +844,13 @@ await section('表助手 · 入口、开场、提案与待保存的修改', asyn
     await textOf(panel(page).locator('[data-assistant-saved]')))
   check('……表详情换上最新的目录（第 4 版），有效记录条件是新的值', await until(async () => (await version(page)) === 4) && v0 === 2
         && (await textOf(page.locator('[data-field="valid_filter"]'))).includes('status NOT IN (8, 9)'))
+  // 保存的修改在依据里附上原话（服务端记成这一项的备注「依据：……」）：表级的项写在值下面，列的一格悬停看得到
+  check('……保存时的依据看得到：有效记录条件的值下面写「依据：用户说……」',
+    (await textOf(page.locator('[data-field="valid_filter"] [data-field-note]'))).includes('依据：用户说「统计时退票和作废的都要排除」'),
+    await textOf(page.locator('[data-field="valid_filter"]')))
+  const savedNote = page.locator('[data-column="status"] [data-cell="codes"] [data-cell-note]')
+  check('……码值那一格悬停写保存时的依据', ((await savedNote.getAttribute('title').catch(() => '')) ?? '').includes('依据：用户说「8 是退票」'),
+    String(await savedNote.getAttribute('title').catch(() => null)))
   check('……卡片上存了的项标「已保存」，不能再加回', (await changeState(page, 'valid_filter')) === 'saved'
         && await panel(page).locator('[data-assistant-change="valid_filter"] [data-assistant-change-toggle]').count() === 0)
   await cleanCopy(page, '表助手')
@@ -1386,6 +1397,44 @@ await section('导出导入 · 导出文件、导入先预览再写入', async (
   await cleanCopy(page, '导入预览')
   check('只发过导入的写请求（预览、导入）', writes(sent).every((s) => /catalog\/import(\/preview)?$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('表详情 · 人工确认的项的说明', async () => {
+  // 人工确认的项带着备注（保存提案时的依据、数据剖析的说明）：表级的项写在值下面（同有效记录条件的说明），列的一格、
+  // 关联关系悬停看得到。推断的项照旧只有有效记录条件、去重规则在值下面写说明
+  const state = freshState()
+  const visits = state.tables[S1].find((t) => t.name === 'visits')
+  const LABEL_NOTE = '依据：使用者说：这张表一次刷闸记一行'
+  const COL_NOTE = '依据：使用者说：入园人数按人计'
+  const REL_NOTE = '依据：使用者说：每条入园记录对应一个景区。数据剖析：抽样 2,000 行，覆盖率 98%'
+  visits.notes.label = item('入园记录', 'human', undefined, { note: LABEL_NOTE })
+  visits.notes.grain = item('一张门票的一次入园', 'llm', 'proposed', { note: '依据：表名和票号列' })
+  visits.notes.columns.visitor_count.unit = item('人', 'human', undefined, { note: COL_NOTE })
+  visits.notes.columns.visitor_count.label = item('入园人数', 'llm', 'proposed', { note: '依据：列名' })
+  visits.notes.relations = [{ id: 'r_park', columns: ['park_id'], to_table: 'parks', to_columns: ['id'], cardinality: 'many_to_one', coverage: 0.98,
+    source: 'human', status: 'confirmed', updated_at: T0, note: REL_NOTE }]
+  const { page, errors, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state) })
+  await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
+  await shot(page, 'catalog-confirmed-notes')
+  check('人工确认的表级项：值下面写备注（中文名）', (await textOf(page.locator('[data-field="label"] [data-field-note]'))).includes(LABEL_NOTE),
+    await textOf(page.locator('[data-field="label"]')))
+  check('……推断的表级项照旧不在值下面写（粒度）', await page.locator('[data-field="grain"] [data-field-note]').count() === 0)
+  const cellNote = page.locator('[data-column="visitor_count"] [data-cell="unit"] [data-cell-note]')
+  check('人工确认的列级项：那一格悬停写备注', ((await cellNote.getAttribute('title').catch(() => '')) ?? '').includes(COL_NOTE),
+    String(await cellNote.getAttribute('title').catch(() => null)))
+  check('……读屏也念得到', (await cellNote.innerText().catch(() => '')).includes(COL_NOTE))
+  check('……推断的列级项不加（中文名）', await page.locator('[data-column="visitor_count"] [data-cell="label"] [data-cell-note]').count() === 0)
+  const relNote = page.locator('[data-relation="r_park"] [data-relation-note]')
+  if (SHOTS) {
+    await page.locator('[data-column="visitor_count"]').scrollIntoViewIfNeeded()
+    await shot(page, 'catalog-confirmed-notes-columns')
+    await page.locator('[data-relation="r_park"]').scrollIntoViewIfNeeded()
+    await shot(page, 'catalog-confirmed-notes-relations')
+  }
+  check('人工确认的关联关系：悬停写备注', ((await relNote.getAttribute('title').catch(() => '')) ?? '').includes(REL_NOTE),
+    String(await relNote.getAttribute('title').catch(() => null)))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })

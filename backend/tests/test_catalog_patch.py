@@ -169,6 +169,41 @@ async def test_apply_patch_records_human_confirmed(scenic_db):
         catalog.apply_patch(proposed, [{"path": "kind", "value": "nope"}], table="visits", tables=tables)
 
 
+_PARKS = catalog.relation_id("visits", ["park_id"], "parks", ["id"])
+
+
+async def test_saving_keeps_the_reason_as_the_note(scenic_db):
+    """保存的修改在依据里附上使用者的原话（表助手、助手流里的提案都经这里保存）：有依据的项 note 写「依据：……」，超出目录
+    文字项的上限截断；没有依据的照旧。值不变、保存即确认的项，和沿用了测量备注的关联关系，依据写在原来的备注前面——原来的
+    备注说的还是这个值；关联关系的测量备注以「数据剖析：」开头，再剖析时会整段换掉，依据放在前面才留得住。"""
+    tables = (await _schema(scenic_db))["tables"]
+    proposed = scenic_notes.notes("proposed")["visits"]
+    proposed["valid_filter"]["note"] = "依据：码值 0 是作废。剖析核对：排除 3.2% 的行（共 1,000 行）"
+    rel = next(r for r in proposed["relations"] if r["id"] == _PARKS)
+    rel.update(source="profile", coverage=0.97, note="数据剖析：抽样 1,000 行，覆盖率 97%。")
+    out = catalog.apply_patch(proposed, [
+        {"path": "columns.visitor_count.measure", "value": "stock", "reason": "使用者说：在园人数是存量"},
+        {"path": "columns.visitor_count.unit", "value": "人"},                     # 没有依据：照旧不写备注
+        {"path": "valid_filter", "value": "status = 1", "reason": "使用者说：只算有效的"},   # 值不变：保存即确认
+        {"path": f"relations.{_PARKS}", "value": {"columns": ["park_id"], "to_table": "parks", "to_columns": ["id"],
+                                                 "cardinality": "one_to_one"}, "reason": "使用者说：一个景区一条"},
+        {"path": "grain", "value": "一张门票的一次入园", "reason": "长" * 600},
+    ], table="visits", tables=tables, at="2026-10-14T00:00:00+00:00")
+    measure = out["columns"]["visitor_count"]["measure"]
+    assert measure["note"] == "依据：使用者说：在园人数是存量"
+    assert (measure["value"], measure["source"], measure["status"]) == ("stock", "human", "confirmed")
+    assert "note" not in out["columns"]["visitor_count"]["unit"]
+    valid = out["valid_filter"]
+    assert valid["note"] == "依据：使用者说：只算有效的。依据：码值 0 是作废。剖析核对：排除 3.2% 的行（共 1,000 行）"
+    assert (valid["source"], valid["status"]) == ("llm", "confirmed")
+    saved = next(r for r in out["relations"] if r["id"] == _PARKS)
+    assert saved["note"] == "依据：使用者说：一个景区一条。数据剖析：抽样 1,000 行，覆盖率 97%"
+    assert (saved["cardinality"], saved["coverage"], saved["source"]) == ("one_to_one", 0.97, "human")
+    grain = out["grain"]["note"]
+    assert grain.startswith("依据：长") and grain.endswith("…") and len(grain) == 500
+    assert catalog.validate_notes(out) == []
+
+
 # --------------------------------------------------------------------------
 # 协议
 # --------------------------------------------------------------------------
@@ -337,6 +372,8 @@ async def test_preview_and_save(scenic_source):
         assert detail["version"] == version + 1 and detail["updated_by"] == "王敏"
         codes = detail["notes"]["columns"]["status"]["codes"]
         assert codes["value"]["9"] == "作废" and (codes["source"], codes["status"]) == ("human", "confirmed")
+        # 依据随项保存：保存之后看得到当初为什么这么改
+        assert codes["note"] == "依据：作废单"
 
         # 拿旧版本再存：409，什么都不写
         r = await client.post(f"{base}/patch", json={"changes": changes, "if_version": version})

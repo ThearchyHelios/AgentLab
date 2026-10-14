@@ -50,7 +50,8 @@ is_test = 0、is_valid = 1、deleted_at IS NULL）；只涉及一张表。拿不
 原因，只有审批停下期间目录被人改了、数据源换了版本时才会和最后写的不一样：真写按写入时的目录、表结构和导入时认作
 日期的列判断。组合太多的（JOINT_LIMIT）那一项不预告，卡上有条件地说。
 
-catalog.save_patch 不收备注，这里用它的同一套原料（read_entry、apply_patch、write_entry 的乐观锁）写，只多把备注放进项里。
+catalog.save_patch 只把提案的依据写成「依据：……」的备注，这里的备注是出处（哪次运行、哪个节点），所以用它的同一套原料
+（read_entry、apply_patch、write_entry 的乐观锁）写，再把这一项换成带出处备注的人工确认项。
 """
 from __future__ import annotations
 

@@ -680,7 +680,8 @@ async def preview_catalog_patch(source_id: str, table: str, payload: CatalogPatc
 async def save_catalog_patch(source_id: str, table: str, payload: CatalogPatchIn,
                              x_actor: str | None = Header(default=None),
                              session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """保存一条目录修改提案：改动过的项记为人工填写、已确认。版本不符 409；有一项不合法 422，整条不写。"""
+    """保存一条目录修改提案：改动过的项记为人工填写、已确认，写了依据的项依据进备注（「依据：……」，规则见
+    catalog.apply_patch）。版本不符 409；有一项不合法 422，整条不写。"""
     _, source = await _resolved(session, source_id)
     key, _ = await _table_key(session, source, table)
     try:

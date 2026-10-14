@@ -1100,12 +1100,33 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
     return PatchPlan(out, problems)
 
 
+def _reason_note(reason: str | None) -> str | None:
+    """提案的依据 → 保存时这一项的备注「依据：……」（同模型起草的依据，FACT_REASON_NOTE）。超出目录文字项的上限
+    （_TEXT_MAX）时截断、末尾写省略号。没有依据为 None。"""
+    text = (reason or "").strip()
+    if not text:
+        return None
+    note = FACT_REASON_NOTE.format(reason=text)
+    return note if len(note) <= _TEXT_MAX else note[:_TEXT_MAX - 1] + "…"
+
+
+def _join_notes(*parts: Any) -> str | None:
+    """几段备注连成一段：各段去掉句末的句号，用句号隔开（同起草里「依据：……。剖析核对：……」的写法）。都空为 None。"""
+    texts = [p.strip().rstrip("。") for p in parts if isinstance(p, str) and p.strip()]
+    return "。".join(texts) or None
+
+
 def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
                 tables: Mapping[str, Any] | None = None, at: str | None = None) -> dict[str, Any]:
     """把一条提案并进目录，返回新目录（不改入参）。有一项不合法就整条不收，抛 CatalogInvalid。
 
     值有变化的项记为人工填写、已确认（和人工编辑同一条规矩：改动出自人的确认，不是模型起草）；值没变的只把
     状态改成已确认、来源不变（等同单项确认）；已经确认过的原样不动。
+
+    提案里写了依据（reason）的项，依据写进这一项的备注「依据：……」（_reason_note）：保存的修改附上使用者的原话，保存之后
+    看得到当初为什么这么改。改了值的项备注就是这一句（原来的备注说的是旧值）；值不变、保存即确认的项，和沿用了测量备注的
+    关联关系，依据写在原来的备注前面——原来的备注说的还是这个值；关联关系的测量备注以「数据剖析：」开头，再剖析时整段
+    换成新的（catalog_profile._patch_confirmed），依据放在前面才不会被一起换掉。没写依据的照旧。
     """
     plan = plan_patch(notes, changes, table=table, tables=tables)
     if plan.problems:
@@ -1117,20 +1138,26 @@ def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
         if change.state == "same":
             continue
         prev = slots.get(key)
+        said = _reason_note(change.reason)
         if change.state == "confirm" and prev is not None:
-            slots[key] = {**prev, "status": "confirmed", "updated_at": at}
+            item = {**prev, "status": "confirmed", "updated_at": at}
+            if said:
+                item["note"] = _join_notes(said, prev.get("note"))
+            slots[key] = item
             continue
         if key[0] == "r":
             rel = {"id": key[1], **change.after, "source": "human", "status": "confirmed", "updated_at": at}
-            if prev is not None and prev.get("note"):
-                rel["note"] = prev["note"]       # 覆盖率沿用了，说明它怎么测的那段备注也留着
+            # 覆盖率沿用了，说明它怎么测的那段备注也留着
+            kept = prev.get("note") if prev is not None else None
+            if note := (_join_notes(said, kept) if said else kept):
+                rel["note"] = note
             slots[key] = rel
         else:
             # 码值是补充、不删已有的码：原来标了「已列全」的，补充之后仍然列全。提案自己不能标「已列全」——
             # 用户在对话里说一个码值的意思，不等于确认这一列只有这些取值
             done = key[0] == "c" and key[2] == "codes" and prev is not None and prev.get("status") != "rejected" \
                 and codes_complete(prev)
-            slots[key] = make_item(change.after, "human", "confirmed", at=at, complete=done)
+            slots[key] = make_item(change.after, "human", "confirmed", note=said, at=at, complete=done)
     out = _assemble(slots)
     if problems := validate_notes(out):
         raise CatalogInvalid(problems)

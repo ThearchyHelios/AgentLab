@@ -1,14 +1,14 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { Check, CircleCheck, CircleDashed, CircleX, RotateCcw, ShieldCheck, Trash2, X } from 'lucide-react'
+import { Check, CircleCheck, CircleDashed, CircleX, Info, RotateCcw, ShieldCheck, Trash2, X } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import clsx from 'clsx'
 import type { CatalogCounts, CatalogReviewAction, CatalogSource, CatalogStatus } from '../../types'
 import { Notice } from '../../components/ui'
 import { formatDateTime, formatNumber, formatTime } from '../../lib/format'
 import {
-  CATALOG_SOURCE_LABEL, CATALOG_STATUS_HINT, CATALOG_STATUS_LABEL, CATALOG_TEXT as CT,
+  CATALOG_SOURCE_LABEL, CATALOG_STATUS_HINT, CATALOG_STATUS_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT,
 } from '../../lib/terms'
 import { STATUSES, initialStatus } from './model'
 
@@ -291,6 +291,27 @@ function ActionButton({ icon, children, disabled, onClick, action, title }: {
       <span aria-hidden>{icon}</span>
       {children}
     </button>
+  )
+}
+
+/**
+ * 人工确认的项带的备注：保存提案时附的依据（「依据：使用者说……」）、确认时留着的数据剖析说明。确认过的项是 SQL 检查和
+ * 助手的依据，为什么这么定要看得到，不能只藏在状态弹层里：表级的项写在值下面（TableFieldRow，同有效记录条件的说明），
+ * 列的一格、关联关系悬停看（NoteHint）。没有备注、不是已确认的为空串
+ */
+export const confirmedNote = (item: { status: CatalogStatus; note?: string } | null | undefined): string =>
+  (item && item.status === 'confirmed' ? item.note?.trim() ?? '' : '')
+
+/**
+ * 列的一格、关联关系上的备注：只占一个小图标，悬停看全文；读屏念「说明：……」。attr 是给检查脚本定位的 data- 属性名
+ */
+export function NoteHint({ note, attr }: { note: string; attr: string }) {
+  return (
+    <span className="inline-flex shrink-0 cursor-help items-center pt-[3px] text-faint hover:text-dim" title={`${UT.fieldNote}：${note}`}
+          {...{ [attr]: '' }}>
+      <Info size={11} aria-hidden />
+      <span className="sr-only">{UT.fieldNote}：{note}</span>
+    </span>
   )
 }
 

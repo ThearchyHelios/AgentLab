@@ -9,7 +9,7 @@ import { IconButton } from '../../components/ui'
 import {
   CATALOG_COLUMN_FIELD_LABEL, CATALOG_MEASURE_HINT, CATALOG_MEASURE_LABEL, CATALOG_TEXT as CT, CODES_TEXT as KT,
 } from '../../lib/terms'
-import { FOCUS_RING, FOCUS_STYLE, ItemMark } from './parts'
+import { FOCUS_RING, FOCUS_STYLE, ItemMark, NoteHint, confirmedNote } from './parts'
 import type { ReviewTarget } from './parts'
 import { COLUMN_FIELDS, codesComplete, columnPath, completeOf } from './model'
 import type { ColumnDraft, ColumnField } from './model'
@@ -136,6 +136,8 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
     const problem = problems[`c:${name}:${f}`]
     const changed = editing && ((draft?.[f] ?? '') !== (initial?.[f] ?? '') || (f === 'codes' && completeOf(draft) !== completeOf(initial)))
     const focused = focusField === f
+    // 人工确认的项的备注（保存时的依据……）：悬停看
+    const note = editing ? '' : confirmedNote(it)
     return (
       // 窄框下没填的项不占行（编辑时照常列出来好填）
       <td className={clsx('px-2 py-1.5 align-top', NARROW.cell, !it && !editing && '@max-[40rem]:hidden', focused && FOCUS_RING)}
@@ -144,6 +146,7 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
         <span className={NARROW.label}>{CT.columnHead[f]}</span>
         <div className="flex min-w-0 flex-1 items-start gap-1.5">
           <div className="min-w-0 flex-1">{editing ? input : view}</div>
+          {note && <NoteHint note={note} attr="data-cell-note" />}
           {it && !changed && (
             <span className="pt-0.5">
               <ItemMark compact disabled={busy || editing} disabledHint={editing ? CT.reviewWhileEditing : undefined}

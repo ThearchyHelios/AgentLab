@@ -18,7 +18,7 @@ import {
   CATALOG_USAGE_TEXT, CODES_TEXT as KT,
 } from '../../lib/terms'
 import { CatalogImpactList } from '../../components/CatalogImpact'
-import { CountBadges, FOCUS_RING, FOCUS_STYLE, ItemMark, StatusChip, StatusLegend, SystemNotesNotice } from './parts'
+import { CountBadges, FOCUS_RING, FOCUS_STYLE, ItemMark, NoteHint, StatusChip, StatusLegend, SystemNotesNotice, confirmedNote } from './parts'
 import type { ReviewTarget } from './parts'
 import { ColumnTable, NARROW, Value, pendingCodes } from './ColumnTable'
 import type { ColumnModel } from './ColumnTable'
@@ -695,7 +695,10 @@ function blankCodes(notes: CatalogDetail['notes'], pick: (path: string) => boole
 // 表级各项
 // ---------------------------------------------------------------------------
 
-/** 值下面写说明的项：有效记录条件、去重规则（模型起草时附的依据、数据剖析核对的排除比例或没有核对的原因） */
+/**
+ * 推断时也在值下面写说明的项：有效记录条件、去重规则（模型起草时附的依据、数据剖析核对的排除比例或没有核对的原因）。
+ * 别的项人工确认过、带着备注（保存提案时附的依据……）时也写
+ */
 const NOTED_FIELDS = new Set<TableField>(['valid_filter', 'dedup'])
 
 function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, onReview, focused = false }: {
@@ -766,7 +769,8 @@ function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, o
     }
   }
   const unknown = edit && field === 'keys' ? unknownKeys(edit.form.table.keys ?? '', columns) : []
-  const note = !edit && item && item.status !== 'rejected' && NOTED_FIELDS.has(field) ? item.note?.trim() ?? '' : ''
+  const note = edit || !item || item.status === 'rejected' ? ''
+    : NOTED_FIELDS.has(field) ? item.note?.trim() ?? '' : confirmedNote(item)
 
   return (
     <div className={clsx('grid gap-x-4 gap-y-1 px-3 py-2.5 sm:grid-cols-[7.5rem_minmax(0,1fr)]', focused && FOCUS_RING)}
@@ -918,8 +922,12 @@ function RelationList({ relations, busy, targetOf, onOpen, onReview, focusPath =
                     : <span className="text-faint">—</span>}
                 </td>
                 <td className={clsx(cell, '@max-[40rem]:order-first @max-[40rem]:pb-1')} data-relation-status="">
-                  <ItemMark target={{ path: relationPath(r.id), where, source: r.source, status: r.status, note: r.note, updated_at: r.updated_at }}
-                            disabled={busy} onReview={(a) => onReview({ path: relationPath(r.id), where, source: r.source, status: r.status }, a)} />
+                  <span className="inline-flex items-start gap-1.5">
+                    <ItemMark target={{ path: relationPath(r.id), where, source: r.source, status: r.status, note: r.note, updated_at: r.updated_at }}
+                              disabled={busy} onReview={(a) => onReview({ path: relationPath(r.id), where, source: r.source, status: r.status }, a)} />
+                    {/* 人工确认的关系的备注（保存时的依据、沿用的测量说明）：悬停看 */}
+                    {confirmedNote(r) && <NoteHint note={confirmedNote(r)} attr="data-relation-note" />}
+                  </span>
                 </td>
               </tr>
             )
