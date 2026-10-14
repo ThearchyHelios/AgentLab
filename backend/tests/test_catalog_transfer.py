@@ -411,3 +411,22 @@ async def test_round_trip_into_an_empty_copy_reproduces_the_catalog(client):
     expected["relations"] = [r for r in mine.notes["relations"] if r["to_table"] != "stores"]
     del expected["columns"]["gift_flag"]                     # 表结构里没有这一列
     assert theirs.notes == expected
+
+
+async def test_a_bad_reason_on_an_inferred_item_is_dropped_not_the_item(client):
+    """手改过的文件里，推断的项带着不合规的确认时的依据（推断项本来就不该有依据）：去掉依据、照常填空缺，不把整项跳过。
+    已确认的项依据不合规照旧跳过（依据是它的一部分，照带就得合规）。"""
+    local, remote = await _pair()
+    content = await _export(client, local)
+    notes = content["tables"]["orders"]["notes"]
+    notes["grain"] = {"value": "每笔订单一行", "source": "llm", "status": "proposed", "reason": "依" * 600}
+    notes["description"] = {"value": "订单头", "source": "human", "status": "confirmed", "reason": 42}
+    report = (await client.post(f"{_base(remote)}/import/preview", json={"content": content})).json()
+    skipped = {s["path"]: s["why"] for s in _by(report)["ORDERS"]["skipped"]}
+    assert "grain" not in skipped
+    assert "description" in skipped and "依据" in skipped["description"]
+    r = await client.post(f"{_base(remote)}/import", json={"content": content})
+    assert r.status_code == 200, r.text
+    assert "grain" not in {s["path"] for s in _by(r.json())["ORDERS"]["skipped"]}
+    got = (await client.get(f"{_base(remote)}/ORDERS")).json()["notes"]
+    assert "reason" not in got["grain"]          # 目标原有的推断粒度保留（推断只填空缺），也没被挂上依据

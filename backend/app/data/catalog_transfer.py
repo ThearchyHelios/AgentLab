@@ -396,6 +396,9 @@ def plan_table(table_name: str, target: str, file_notes: Mapping[str, Any], targ
         if why is not None:
             plan.skipped.append({"path": path, "why": why})
             continue
+        if isinstance(item, dict) and item.get("status") not in _LOCKED and "reason" in item:
+            # 推断、有确证的项不带确认时的依据：在校验之前去掉，手改的文件里依据不合规也不把整项跳过
+            item = {k: v for k, v in item.items() if k != "reason"}
         problem = _item_problem(mapped or key, item)
         if problem is not None or mapped is None:
             plan.skipped.append({"path": path, "why": problem or "无法识别这一项"})
@@ -405,8 +408,6 @@ def plan_table(table_name: str, target: str, file_notes: Mapping[str, Any], targ
             continue
         seen.add(mapped)
         status = item.get("status")
-        if status not in _LOCKED:
-            item = {k: v for k, v in item.items() if k != "reason"}  # 推断、有确证的项不带确认时的依据
         have = existing.get(mapped)
         if have is None:
             plan.add += 1
