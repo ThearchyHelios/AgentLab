@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import uuid
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -1052,3 +1054,27 @@ async def test_a_dropped_filter_is_logged_on_the_task_not_failed(client, monkeyp
     assert by["channels"]["log"] == []
     notes = (await client.get(f"{_base(sid)}/gates")).json()["notes"]
     assert "valid_filter" not in notes and notes["label"]["value"] == "闸口"
+
+
+async def test_each_write_of_a_job_stamps_its_own_time(client, monkeypatch):
+    """起草任务写进目录的项，修改时间是那一次写入的时间：宽表逐段落盘的每一段、整张表收尾各取一次当时的时间。以前只在任务
+    开始时取一次（截到秒），整个任务写进去的项都是开始那一刻，比任务的开始时间还早，也看不出哪一段是什么时候写的。
+
+    时钟换成每取一次走一分钟的假时钟；同时只起草一段，各段的先后是定的：表级那段、第 2、3 段逐段落盘，第 4 段由收尾写进去。"""
+    ticks = itertools.count()
+    start = datetime(2026, 10, 14, 3, tzinfo=timezone.utc)
+    monkeypatch.setattr(catalog, "now_iso",
+                        lambda: (start + timedelta(minutes=next(ticks))).isoformat(timespec="seconds"))
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    sid = await _source(_wide())
+    job = await _draft(client, sid, monkeypatch, FakeModel(_wide_reply()), ["wide"])
+    task = job["tasks"][0]
+    assert task["status"] == "ok" and task["parts_written"] == 4
+    notes = (await client.get(f"{_base(sid)}/wide")).json()["notes"]
+    cols = notes["columns"]
+    parts = [{cols[f"c{i:03d}"]["label"]["updated_at"] for i in range(lo, hi + 1)}
+             for lo, hi in ((1, 32), (33, 64), (65, 95))]
+    assert all(len(p) == 1 for p in parts), "同一段的项是同一次写进去的"
+    assert notes["kind"]["updated_at"] == notes["label"]["updated_at"], "表级那段的两项是同一次写进去的"
+    stamps = [notes["label"]["updated_at"], *(p.pop() for p in parts)]
+    assert len(set(stamps)) == 4 and stamps == sorted(stamps), stamps
