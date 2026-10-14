@@ -281,7 +281,9 @@ async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: st
                 async with SessionLocal() as session:
                     run = await launch_run(session, workflow_id=workflow_id, run_class=run_class,
                                            input_payload=inputs, actor=actor or actor_label(name),
-                                           schedule_id=schedule_id)
+                                           schedule_id=schedule_id, origin_kind="schedule",
+                                           origin={"schedule_id": schedule_id, "schedule": name,
+                                                   "fire_id": fire.id, "fire_kind": kind})
             except LaunchRefused as e:
                 return await _finish(fire.id, status="failed_to_start", reason=e.message)
             except Exception:  # noqa: BLE001 - 发起失败不能让调度循环停下；详细信息进日志，记录上写通用说明
@@ -297,10 +299,11 @@ async def record_skip(schedule_id: str, fire_at: datetime, reason: str) -> Sched
     return await _record(schedule_id, fire_at, "misfire", "skipped_misfire", reason, {})
 
 
-async def _active_run(schedule_id: str) -> tuple[str, str, bool] | None:
-    """这个任务发起的、还没结束的运行（最近的那一个）：(运行 id, 状态, 是否停在审批)，没有返回 None。
+async def _active_run(schedule_id: str) -> tuple[str, str, bool, bool] | None:
+    """这个任务发起的、还没结束的运行（最近的那一个）：(运行 id, 状态, 是否停在审批, 是否等写入核实)，没有返回 None。
 
-    停在审批：有 pending 的审批，或者刚批完（answered）、还没接着执行。interrupted 而两样都没有的是挂起的。"""
+    停在审批：有 pending 的审批，或者刚批完（answered）、还没接着执行。interrupted 而两样都没有的是挂起的；挂起的里面
+    有写外部系统结果未知、等核实的（app/process/actions.py），处理办法不一样，单独说。"""
     async with SessionLocal() as session:
         row = (await session.execute(
             select(Run.id, Run.status).where(Run.schedule_id == schedule_id, Run.status.in_(ACTIVE_RUN))
@@ -311,16 +314,22 @@ async def _active_run(schedule_id: str) -> tuple[str, str, bool] | None:
         waiting = status == "interrupted" and bool(await session.scalar(
             select(func.count()).select_from(Approval).where(
                 Approval.run_id == run_id, Approval.status.in_(("pending", "answered")))))
-        return run_id, status, waiting
+        from app.process.actions import unresolved_action
+
+        held = status == "interrupted" and not waiting and await unresolved_action(session, run_id)
+        return run_id, status, waiting, held
 
 
-def overlap_reason(run_id: str, status: str, waiting: bool) -> str:
+def overlap_reason(run_id: str, status: str, waiting: bool, action_pending: bool = False) -> str:
     """跳过的原因按挡路的那次运行说清楚该等还是该处理。运行编号和界面上的短编号一样写（#前 6 位）。"""
     tag = f"#{run_id[:6]}"
     if status != "interrupted":
         return f"上一次运行 {tag} 仍在进行中，本次触发已跳过"
     if waiting:
         return f"上一次运行 {tag} 正在等待审批，处理审批、运行结束后才会按时发起新的运行；本次触发已跳过"
+    if action_pending:
+        return (f"上一次运行 {tag} 有一次写入外部系统的结果未知，正在等待核实，核实后会自动继续；它结束后才会按时发起"
+                "新的运行，本次触发已跳过")
     return (f"上一次运行 {tag} 已挂起（通常是服务重启所致），请在「记录」中继续运行或放弃这次运行，"
             "它结束后才会按时发起新的运行；本次触发已跳过")
 

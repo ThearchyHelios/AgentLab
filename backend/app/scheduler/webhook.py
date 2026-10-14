@@ -1,36 +1,21 @@
-"""定时任务的通知：运行结束、失败、停在审批（或因服务重启挂起）时按任务的设置推送 Webhook。
+"""定时任务的通知：运行结束、失败、停在审批（或因服务重启挂起、写入外部系统的结果未知）时按任务的设置推送 Webhook。
 
-四种格式：通用 JSON、飞书（文本消息）、企业微信（markdown）、钉钉（markdown）。配了签名密钥时：通用格式在请求头
-里带 HMAC-SHA256 签名，飞书、钉钉按各自平台的算法签（飞书放在请求体，钉钉放在地址上）；企业微信的 key 本来就在
-地址里，没有另外的签名。
-
-Webhook 地址本身就是凭证（企业微信的 key、钉钉的 access_token 都在地址里，飞书的在路径里），和签名密钥一样
-加密落库，日志、推送记录、接口返回里只出现主机名。httpx 每发一个请求都会在 INFO 级别记一行完整地址，这里装了
-一个过滤器把推送期间的那几行换成主机名。
+格式、签名、发送、脱敏抽到了 app/notify/core.py，待办、实例、动作的通知（app/notify/service.py）共用同一份。这里留
+定时任务自己的部分：消息内容、每一拍的通知扫描、推送记录（webhook_deliveries，不迁移，F14）。原来在这里的名字照原名
+再导出，调用方和测试不用改；_transport、RETRY_DELAYS 仍是这个模块自己的（测试照旧替换它们），send 每次调用时读。
 
 通知里只有任务名、状态、出具档位、缺口条数、运行链接、封存哈希（界面上叫清单哈希）前 12 位和起止时间，失败时
 另写失败节点的名字和下一步（不许诺能继续运行）；运行成功结束后和同一任务上一次成功的运行的对比（auto_compare）只写
 各类指标的个数和对比页链接。不放报告里的具体数字，也不放失败时的原始报错——报错里可能带着查询到的数据，Webhook
 推去的群不一定有权看。
-
-三个平台出错时都回 HTTP 200、错误码放在响应体里，所以送没送达要看响应体：按地址的主机认平台，不看选的格式——
-格式选错了（飞书的地址选了通用格式）正是最需要认出来的情形。群机器人的地址只认自己平台的格式，保存时就拦下
-对不上的（见 bot_format）。
 """
 from __future__ import annotations
 
 import asyncio
-import base64
-import contextvars
-import hashlib
-import hmac
-import json
 import logging
-import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import parse_qsl, quote_plus, urlsplit
 
 import httpx
 from sqlalchemy import and_, func, or_, select, update
@@ -38,21 +23,25 @@ from sqlalchemy import and_, func, or_, select, update
 from app.core.crypto import decrypt
 from app.core.events import EventType
 from app.db.base import SessionLocal, utcnow
-from app.db.models import Approval, Run, RunEvent, Schedule, ScheduleFire, WebhookDelivery
+from app.db.models import ActionRecord, Approval, Run, RunEvent, Schedule, ScheduleFire, WebhookDelivery
 from app.engine.labels import ISSUANCE_LABEL
+from app.notify import core
+# 抽到 app/notify/core.py 的名字照原名再导出
+from app.notify.core import (  # noqa: F401
+    _BOTS, _PLATFORM_HOSTS, _SENDING, FORMAT_LABEL, FORMATS, TIMEOUT_S, Outcome, _platform_error,
+    _platform_message, _RedactWebhookUrls, _reply_json, _sensitive, bot_format, check_url, format_problem, host_of,
+    url_hint,
+)
+from app.notify.core import scrub as _scrub  # noqa: F401
 from app.scheduler import auto_compare, service
 
 logger = logging.getLogger(__name__)
 
-FORMATS = ("generic", "feishu", "wecom", "dingtalk")
 EVENTS = ("finished", "failed", "awaiting_approval")
-#: 格式、事件在报错里的叫法，和界面上的选项一致
-FORMAT_LABEL = {"generic": "通用", "feishu": "飞书", "wecom": "企业微信", "dingtalk": "钉钉"}
+#: 事件在报错里的叫法，和界面上的选项一致
 EVENT_LABEL = {"finished": "运行结束", "failed": "运行失败", "awaiting_approval": "等待审批"}
-#: 单次请求的超时（秒）
-TIMEOUT_S = 10.0
-#: 失败后再试 3 次，每次之前等这么久（秒）。4xx（429 除外）不重试：地址或参数错了，重试也一样
-RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
+#: 失败后再试 3 次，每次之前等这么久（秒）。测试里换成 (0, 0, 0)
+RETRY_DELAYS: tuple[float, ...] = core.RETRY_DELAYS
 #: 只看这么多天内的触发：更早结束的运行状态不会再变，不用每一拍都扫。例外见 notify_due：停在审批上、有待审批的不受
 #: 这个限制，运行记录这些天内有过变化的也照扫——审批可以等上一个多月，批完接着执行、停到下一个审批点或跑完都要推
 SCAN_DAYS = 30
@@ -67,6 +56,10 @@ _STATUS_LABEL = {"succeeded": "已完成", "failed": "失败", "cancelled": "已
 #: 挂起的运行要人去处理：不处理，这个任务之后的触发都按「上一次还没结束」跳过
 SUSPENDED_REASON = "运行停在断点上、没有待审批，通常是服务重启所致"
 SUSPENDED_ACTION = "请在 AgentLab 的「记录」中继续运行或放弃这次运行；它结束之前，这个定时任务之后的触发都会跳过"
+#: 写外部系统的结果未知、挂起等核实的运行（app/process/actions.py）：核实之后系统自动接着跑，不用人去点继续运行
+ACTION_PENDING_REASON = "运行中有一次写入外部系统的结果未知，已挂起等待核实"
+ACTION_PENDING_ACTION = ("请在 AgentLab 的「应用」中处理核实待办（登记了查询能力的由系统自动核实）；核实之后运行会自动继续，"
+                         "它结束之前，这个定时任务之后的触发都会跳过")
 #: 失败的运行怎么处理：不许诺「修正后可继续运行」。开始执行过的也可能没有断点（执行第一个节点前就失败）或已不兼容
 #: （系统升级），能不能继续以记录页的提示为准。「记录」是导航里那一页的名字，和挂起那句一致
 FAILED_ACTION = "请在 AgentLab 的「记录」中查看失败原因"
@@ -78,145 +71,6 @@ NEXT_AS_USUAL = "下一次触发会照常发起"
 #: 从没开始执行、任务又不在排期上（停用了）：原因刚写过，记录页上也没有更多可看的，下一步是重新发起。「立即运行」
 #: 是定时任务页上那个按钮的名字，停用的任务也能点
 RERUN_ACTION = "如需重新发起，请在 AgentLab 的「定时任务」中点击「立即运行」"
-
-
-# --------------------------------------------------------------------------
-# 地址：校验、提示、脱敏
-# --------------------------------------------------------------------------
-
-
-_URL_FORMAT = ("Webhook 地址需要是 http:// 或 https:// 开头的完整地址，例如飞书机器人的 "
-               "https://open.feishu.cn/open-apis/bot/v2/hook/…")
-
-
-def check_url(url: Any) -> str:
-    """校验 Webhook 地址，返回去掉首尾空白的地址。不对抛 ValueError（中文说明，不回显地址）。
-
-    除了 http(s)、有主机名，还要 httpx 真发得出去：端口写错、夹着不可见的字符（从聊天软件复制时常带上零宽空格）、
-    主机名不合 IDNA 规则的，保存时就拦下。以前这些照样存进去，到「测试 Webhook」才在 httpx 里抛出 500 或英文报错。
-    """
-    text = url.strip() if isinstance(url, str) else ""
-    if not text:
-        raise ValueError(_URL_FORMAT)
-    if any(c.isspace() or unicodedata.category(c) in ("Cc", "Cf") for c in text):
-        raise ValueError("Webhook 地址中有空格或不可见的字符（从聊天软件复制时常会带上），请删除后重新填写")
-    if len(text) > 2000:
-        raise ValueError("Webhook 地址过长（超过 2000 个字符），请检查是否粘贴了多余的内容")
-    try:
-        parts = urlsplit(text)
-    except ValueError:
-        raise ValueError(_URL_FORMAT) from None
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise ValueError(_URL_FORMAT)
-    try:
-        port = parts.port
-    except ValueError:   # 不是数字，或者超出 65535
-        port = -1
-    if port is not None and not 1 <= port <= 65535:
-        raise ValueError("Webhook 地址中的端口需要是 1 到 65535 之间的数字")
-    try:
-        # 照发送时的样子建一个请求（不发出去）：httpx 到这一步才按 IDNA 解码主机名
-        httpx.Request("POST", text)
-    except (httpx.InvalidURL, ValueError):   # IDNA 的错误是 UnicodeError，也是 ValueError
-        raise ValueError("Webhook 地址的主机名不符合规范，无法发送，请检查后重新填写") from None
-    return text
-
-
-#: 群机器人的地址（主机，路径前缀）→ 格式。这些地址只认自己平台的消息格式：格式选错了，平台回错误码，群里收不到
-_BOTS = (
-    ("open.feishu.cn", "/open-apis/bot/", "feishu"),
-    ("open.larksuite.com", "/open-apis/bot/", "feishu"),
-    ("qyapi.weixin.qq.com", "/cgi-bin/webhook/", "wecom"),
-    ("oapi.dingtalk.com", "/robot/", "dingtalk"),
-)
-#: 平台的主机 → 按哪个平台读 HTTP 200 里的错误码。同一主机上不是群机器人的接口（飞书集成平台的 Webhook 触发器
-#: 收任意 JSON）也是同一套错误码约定
-_PLATFORM_HOSTS = {host: fmt for host, _, fmt in _BOTS}
-
-
-def bot_format(url: str) -> str | None:
-    """这条地址是哪个平台的群机器人（feishu / wecom / dingtalk），不是群机器人的返回 None。"""
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return None
-    host = (parts.hostname or "").lower()
-    return next((fmt for bot_host, prefix, fmt in _BOTS if host == bot_host and parts.path.startswith(prefix)), None)
-
-
-def format_problem(fmt: str, url: str) -> str | None:
-    """格式和地址对不上时的说明（群机器人的地址选了别的格式），对得上返回 None。"""
-    expected = bot_format(url)
-    if expected is None or expected == fmt:
-        return None
-    label = FORMAT_LABEL[expected]
-    return f"这是{label}群机器人的地址，只接收{label}的消息格式，Webhook 格式请选择「{label}」"
-
-
-def host_of(url: str) -> str:
-    """主机名（带非默认端口）。日志、报错里只写它。端口写错的地址也照样给出主机名。"""
-    try:
-        parts = urlsplit(url)
-        host = parts.hostname or "?"
-    except ValueError:
-        return "?"
-    try:
-        port = parts.port
-    except ValueError:
-        return host
-    return f"{host}:{port}" if port else host
-
-
-def url_hint(url: str) -> str:
-    """给界面看的地址提示：只露主机和末 4 位（open.feishu.cn/…ab12）。"""
-    return f"{host_of(url)}/…{url[-4:]}"
-
-
-def _sensitive(url: str, secret: str | None) -> list[str]:
-    """一条地址里不能出现在日志、报错里的片段：整条地址、查询参数的值（key、access_token）、路径里的长片段（飞书
-    的令牌在路径里）、签名密钥。长的在前，免得先换掉短的、长的就认不出来了。"""
-    out = {url, secret or ""}
-    try:
-        parts = urlsplit(url)
-        out |= {value for _, value in parse_qsl(parts.query)}
-        out |= {seg for seg in parts.path.split("/") if len(seg) >= 12}
-        out.add(f"{parts.netloc}{parts.path}")
-    except ValueError:
-        pass
-    return sorted((s for s in out if len(s) >= 4), key=len, reverse=True)
-
-
-def _scrub(text: str, url: str, secret: str | None) -> str:
-    for piece in _sensitive(url, secret):
-        text = text.replace(piece, "…")
-    return text
-
-
-#: 正在推送哪条地址、用的哪个密钥。httpx 记请求日志时还在同一个任务里，过滤器据此只改推送的那几行
-_SENDING: contextvars.ContextVar[tuple[str, str | None] | None] = contextvars.ContextVar("webhook_sending", default=None)
-
-
-class _RedactWebhookUrls(logging.Filter):
-    """把 httpx 记下的推送请求的地址换成主机名。别的请求（模型接入、数据源工具）原样放过。"""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        sending = _SENDING.get()
-        if sending and isinstance(record.args, tuple):
-            url, secret = sending
-            record.args = tuple(
-                url_hint(str(arg)) if isinstance(arg, httpx.URL)
-                else _scrub(arg, url, secret) if isinstance(arg, str) else arg
-                for arg in record.args)
-        return True
-
-
-def _install_filter() -> None:
-    target = logging.getLogger("httpx")
-    if not any(isinstance(f, _RedactWebhookUrls) for f in target.filters):
-        target.addFilter(_RedactWebhookUrls())
-
-
-_install_filter()
 
 
 # --------------------------------------------------------------------------
@@ -253,6 +107,8 @@ class Notice:
     reason: str | None = None
     pending_approvals: int | None = None
     suspended: bool = False
+    #: 挂起的原因是写外部系统的结果未知（等核实，核实后自动接着跑），不是服务重启。只在 suspended 时有意义
+    action_pending: bool = False
     error_node: str | None = None
     next_fire: bool = False
     compare: dict[str, Any] | None = None
@@ -303,6 +159,8 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
                                 "这个定时任务之后的触发都会跳过"))
     if notice.status == "failed_to_start" and notice.reason:
         lines.append(("原因", notice.reason))
+    elif notice.suspended and notice.action_pending:
+        lines += [("原因", ACTION_PENDING_REASON), ("处理", ACTION_PENDING_ACTION)]
     elif notice.suspended:
         lines += [("原因", SUSPENDED_REASON), ("处理", SUSPENDED_ACTION)]
     elif notice.status == "failed":
@@ -358,7 +216,9 @@ def _date_of(text: Any, tz: str) -> str | None:
 
 def _status_label(notice: Notice) -> str:
     if notice.status == "interrupted":
-        return "等待审批" if notice.pending_approvals else "已挂起，可继续运行"
+        if notice.pending_approvals:
+            return "等待审批"
+        return "已挂起，等待核实" if notice.action_pending else "已挂起，可继续运行"
     return _STATUS_LABEL.get(notice.status or "", notice.status or "")
 
 
@@ -377,30 +237,21 @@ def _links(notice: Notice) -> list[tuple[str, str]]:
     return [(label, url) for label, url in (("查看运行", notice.run_url), ("查看对比", notice.compare_url)) if url]
 
 
-def _text(notice: Notice) -> str:
+def _message(notice: Notice) -> core.Message:
     title, lines, _ = message(notice)
-    out = [f"【AgentLab】{title}", *(f"{k}：{v}" for k, v in lines)]
-    out += [f"{label}：{url}" for label, url in _links(notice)]
-    return "\n".join(out)
+    return core.Message(title=title, lines=lines, links=_links(notice), ok=notice.event in ("finished", "test"))
+
+
+def _text(notice: Notice) -> str:
+    return core.text_of(_message(notice))
 
 
 def _wecom_markdown(notice: Notice) -> str:
-    title, lines, _ = message(notice)
-    color = "info" if notice.event in ("finished", "test") else "warning"
-    out = [f"**【AgentLab】{title}**"]
-    for key, value in lines:
-        shown = f'<font color="{color}">{value}</font>' if key == "状态" else value
-        out.append(f"> {key}：{shown}")
-    out += [f"[{label}]({url})" for label, url in _links(notice)]
-    return "\n".join(out)
+    return core.wecom_markdown(_message(notice))
 
 
 def _dingtalk_markdown(notice: Notice) -> tuple[str, str]:
-    title, lines, _ = message(notice)
-    out = [f"#### 【AgentLab】{title}", "", *(f"- {k}：{v}" for k, v in lines)]
-    for label, url in _links(notice):
-        out += ["", f"[{label}]({url})"]
-    return title, "\n".join(out)
+    return core.dingtalk_markdown(_message(notice))
 
 
 def _iso(moment: datetime | None) -> str | None:
@@ -430,6 +281,7 @@ def _generic(notice: Notice, now: datetime) -> dict[str, Any]:
         "started_at": _iso(notice.started_at),
         "finished_at": _iso(notice.finished_at),
         "reason": (notice.reason if notice.status == "failed_to_start"
+                   else f"{ACTION_PENDING_REASON}。{ACTION_PENDING_ACTION}" if notice.suspended and notice.action_pending
                    else f"{SUSPENDED_REASON}。{SUSPENDED_ACTION}" if notice.suspended
                    else NOT_STARTED_REASON if notice.never_started else None),
         "error_node": notice.error_node,
@@ -446,40 +298,7 @@ def build_request(fmt: str, url: str, secret: str | None, notice: Notice, *,
                   now: datetime | None = None) -> tuple[str, dict[str, str], bytes]:
     """(请求地址, 请求头, 请求体)。签名里的时间戳按 now 取，每次重试重新算：飞书要求时间戳在一小时内。"""
     now = now or utcnow()
-    headers = {"Content-Type": "application/json"}
-    if fmt == "feishu":
-        body: dict[str, Any] = {"msg_type": "text", "content": {"text": _text(notice)}}
-        if secret:
-            ts = str(int(now.timestamp()))
-            # 飞书自定义机器人的签名：以「timestamp + 换行 + 密钥」为键，对空串做 HMAC-SHA256，再 base64
-            key = f"{ts}\n{secret}".encode()
-            body = {"timestamp": ts, "sign": base64.b64encode(hmac.new(key, b"", hashlib.sha256).digest()).decode(),
-                    **body}
-        return url, headers, _json(body)
-    if fmt == "wecom":
-        return url, headers, _json({"msgtype": "markdown", "markdown": {"content": _wecom_markdown(notice)}})
-    if fmt == "dingtalk":
-        title, text = _dingtalk_markdown(notice)
-        target = url
-        if secret:
-            # 钉钉自定义机器人的签名：毫秒时间戳，以密钥为键对「timestamp + 换行 + 密钥」做 HMAC-SHA256，base64 后
-            # 再做 URL 编码，和 timestamp 一起加在地址上
-            ts = str(int(now.timestamp() * 1000))
-            digest = hmac.new(secret.encode(), f"{ts}\n{secret}".encode(), hashlib.sha256).digest()
-            sign = quote_plus(base64.b64encode(digest).decode())
-            target = f"{url}{'&' if '?' in url else '?'}timestamp={ts}&sign={sign}"
-        return target, headers, _json({"msgtype": "markdown", "markdown": {"title": title, "text": text}})
-    payload = _json(_generic(notice, now))
-    if secret:
-        # 通用格式：接收端按 HMAC-SHA256(密钥, 「时间戳.请求体」) 验签，时间戳防重放
-        ts = str(int(now.timestamp()))
-        mac = hmac.new(secret.encode(), f"{ts}.".encode() + payload, hashlib.sha256).hexdigest()
-        headers |= {"X-AgentLab-Timestamp": ts, "X-AgentLab-Signature": f"sha256={mac}"}
-    return url, headers, payload
-
-
-def _json(value: dict[str, Any]) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+    return core.build_request(fmt, url, secret, _message(notice), generic=_generic(notice, now), now=now)
 
 
 # --------------------------------------------------------------------------
@@ -487,106 +306,13 @@ def _json(value: dict[str, Any]) -> bytes:
 # --------------------------------------------------------------------------
 
 
-@dataclass
-class Outcome:
-    """一次推送（含重试）的结果。error 是中文说明，只有主机名，不含地址和密钥。"""
-
-    ok: bool
-    http_status: int | None
-    attempts: int
-    error: str | None = None
-    #: 这一次失败值不值得再试（只在单次尝试的结果上有意义）
-    retryable: bool = False
-
-
-def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=TIMEOUT_S, transport=_transport, follow_redirects=False)
-
-
 async def send(fmt: str, url: str, secret: str | None, notice: Notice, *, retry: bool = True) -> Outcome:
-    """推送一条通知。retry 时失败再试 3 次（退避），4xx（429 除外）不重试。失败只记主机名。"""
-    host = host_of(url)
-    delays = RETRY_DELAYS if retry else ()
-    last = Outcome(False, None, 0, "没有发出请求")
-    async with _client() as client:
-        for attempt in range(len(delays) + 1):
-            if attempt:
-                await asyncio.sleep(delays[attempt - 1])
-            target, headers, body = build_request(fmt, url, secret, notice)
-            last = await _post_once(client, fmt, target, headers, body, url, secret)
-            last.attempts = attempt + 1
-            if last.ok:
-                return last
-            logger.warning("定时任务「%s」的 Webhook（%s）第 %d 次推送失败：%s",
-                           notice.schedule_name, host, attempt + 1, last.error)
-            if not last.retryable:
-                break
-    return last
+    """推送一条通知。retry 时失败再试 3 次（退避），4xx（429 除外）不重试。失败只记主机名。
 
-
-async def _post_once(client: httpx.AsyncClient, fmt: str, target: str, headers: dict[str, str], body: bytes,
-                     url: str, secret: str | None) -> Outcome:
-    host = host_of(url)
-    token = _SENDING.set((url, secret))
-    try:
-        response = await client.post(target, content=body, headers=headers)
-    except httpx.TimeoutException:
-        return Outcome(False, None, 1, f"请求 {host} 超时（{TIMEOUT_S:g} 秒）", retryable=True)
-    except httpx.ConnectError:
-        return Outcome(False, None, 1, f"无法连接 {host}", retryable=True)
-    except httpx.HTTPError as e:
-        return Outcome(False, None, 1, f"请求 {host} 失败（{type(e).__name__}）", retryable=True)
-    except httpx.InvalidURL:
-        # 保存时的地址校验加严之前存进库的地址：httpx 抛的不是 HTTPError。重试也一样，请人改地址
-        return Outcome(False, None, 1, f"发往 {host} 的 Webhook 地址无效，请重新填写地址")
-    except Exception as e:  # noqa: BLE001 - 端口越界之类在传输层才抛（不是 HTTPError），不能让测试接口回 500
-        return Outcome(False, None, 1, f"无法向 {host} 发送请求（{type(e).__name__}），请检查 Webhook 地址")
-    finally:
-        _SENDING.reset(token)
-    status = response.status_code
-    reply = _reply_json(response)
-    if not 200 <= status < 300:
-        detail = _platform_message(reply)
-        text = f"{host} 返回 HTTP {status}" + (f"：{detail}" if detail else "")
-        return Outcome(False, status, 1, _scrub(text, url, secret)[:300], retryable=status == 429 or status >= 500)
-    if problem := _platform_error(fmt, url, reply):
-        return Outcome(False, status, 1, _scrub(f"{host} {problem}", url, secret)[:300], retryable=True)
-    return Outcome(True, status, 1)
-
-
-def _reply_json(response: httpx.Response) -> dict[str, Any] | None:
-    try:
-        data = response.json()
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _platform_message(reply: dict[str, Any] | None) -> str:
-    if not reply:
-        return ""
-    text = reply.get("errmsg") or reply.get("msg") or reply.get("StatusMessage") or ""
-    return str(text)[:200]
-
-
-def _platform_error(fmt: str, url: str, reply: dict[str, Any] | None) -> str | None:
-    """HTTP 200 里的平台错误码：飞书 code（老接口 StatusCode），企业微信、钉钉 errcode。0 是成功。
-
-    按地址的主机认平台，不看选的格式：以前只看所选格式自己的字段（通用格式完全不看），飞书的地址选了通用格式、
-    平台回 code 19002，照样记「已送达」。主机不是这几个平台的（自建接收端、代理转发）才按所选格式读，通用格式
-    不解读——自建接收端的 code 字段是什么意思由它自己定。说明里写主机名（调用方拼在前面），不写平台名。"""
-    try:
-        host = (urlsplit(url).hostname or "").lower()
-    except ValueError:
-        host = ""
-    platform = _PLATFORM_HOSTS.get(host) or (fmt if fmt != "generic" else None)
-    if not reply or platform is None:
-        return None
-    code = reply.get("code", reply.get("StatusCode")) if platform == "feishu" else reply.get("errcode")
-    if code in (None, 0, "0"):
-        return None
-    detail = _platform_message(reply)
-    return f"返回错误码 {code}" + (f"：{detail}" if detail else "")
+    _transport、RETRY_DELAYS 在调用时从这个模块读：测试替换的是它们。"""
+    return await core.post(fmt, url, secret, lambda: build_request(fmt, url, secret, notice),
+                           label=f"定时任务「{notice.schedule_name}」的 Webhook", retry=retry, transport=_transport,
+                           delays=RETRY_DELAYS)
 
 
 async def _record(schedule_id: str, fire_id: str | None, run_id: str | None, event: str, outcome: Outcome) -> None:
@@ -715,6 +441,7 @@ class _Seen:
     event: str | None = None
     pending: int = 0
     sealed: bool = False
+    action_pending: bool = False
 
 
 async def _state_of(session: Any, fire: ScheduleFire, run: Run | None, now: datetime) -> _Seen:
@@ -725,6 +452,8 @@ async def _state_of(session: Any, fire: ScheduleFire, run: Run | None, now: date
       第几段执行（每段执行从一条 run.started 开始），同一个审批点不重复推。
     - 没有待审批：通常是服务重启挂起的。它不会自己接着执行，这个任务之后的触发都会按「上一次还没结束」跳过，
       不说一声任务就此静默停摆——按 failed 推一次，写明要去继续运行或放弃。
+      其中写外部系统的结果未知、挂起等核实的（动作挂起，app/process/actions.py）另记一种状态：处理办法不一样（去核实，
+      核实后自动接着跑，点继续运行会被拒），说明也不一样。
     审批批完到运行改回 running 之间，审批是 answered、还没有 resolved：那不是挂起，等下一拍。
     """
     if fire.status == "failed_to_start":
@@ -753,6 +482,9 @@ async def _state_of(session: Any, fire: ScheduleFire, run: Run | None, now: date
         return _Seen(f"interrupted:approval:{segment}", "awaiting_approval", counts["pending"])
     if counts.get("answered"):
         return _Seen(None)
+    if await session.scalar(select(func.count()).select_from(ActionRecord).where(
+            ActionRecord.run_id == run.id, ActionRecord.state.in_(("sent", "unknown")))):
+        return _Seen(f"interrupted:action:{segment}", "failed", action_pending=True)
     return _Seen(f"interrupted:held:{segment}", "failed")
 
 
@@ -783,6 +515,7 @@ async def _notice(session: Any, schedule: Schedule, fire: ScheduleFire, run: Run
         reason=fire.reason if fire.status == "failed_to_start" else None,
         pending_approvals=pending or None,
         suspended=run is not None and run.status == "interrupted" and not pending,
+        action_pending=seen.action_pending,
         error_node=_failed_node(run) if run is not None and run.status == "failed" else None,
         next_fire=bool(schedule.enabled and schedule.next_run_at is not None),
     )

@@ -312,6 +312,29 @@ TEMPLATES: list[dict[str, Any]] = [
             _e("each", "done", "done"),
         ],
     },
+    {
+        # 流程模板（应用平台 §3.7）：图里只写岗位名，不写具体的人——做成应用时在应用里把「财务」「总监」绑到人或组。
+        # 不依赖任何外部端点：发布、做成应用、会签、超时升级都能直接演示
+        "name": "⑩ 报销审批（会签）",
+        "description": "员工发起报销，财务岗位全体同意才通过，1 小时内没处理完升级给总监；任何一人驳回即退回。",
+        "tags": ["流程", "人工审批", "会签"],
+        "nodes": [
+            _n("start", "input", "发起报销", fields=[
+                {"name": "applicant", "required": True, "description": "报销人"},
+                {"name": "amount", "required": True, "description": "金额（元）"},
+                {"name": "reason", "required": True, "description": "事由"}]),
+            _n("review", "human", "财务会签", mode="approve",
+               title="报销审批：{{ input.applicant }}",
+               message="报销人：{{ input.applicant }}\n金额（元）：{{ input.amount }}\n事由：{{ input.reason }}",
+               assignee={"kind": "slot", "slot": "finance"}, policy="all", due="PT1H",
+               on_timeout={"action": "escalate", "to_slot": "director"}),
+            _n("approved", "output", "已通过", fields=[
+                {"name": "结论", "value": "已通过"}, {"name": "会签备注", "value": "{{ nodes.review.note }}"}]),
+            _n("rejected", "output", "已退回", fields=[
+                {"name": "结论", "value": "已退回"}, {"name": "退回原因", "value": "{{ nodes.review.note }}"}]),
+        ],
+        "edges": [_e("start", "review"), _e("review", "approved", "approved"), _e("review", "rejected", "rejected")],
+    },
 ]
 
 

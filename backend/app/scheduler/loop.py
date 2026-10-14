@@ -112,11 +112,24 @@ def _span(first: datetime, last: datetime, tz: str) -> str:
 
 
 async def tick(now: datetime | None = None) -> None:
-    """完整的一拍：发起到点的，再推送该推送的通知。测试和手动调用用；循环里两件事分开跑（见 _Runner._loop）。"""
+    """完整的一拍：发起到点的，处理流程的时限和核实，再推送该推送的通知。测试和手动调用用；循环里分开跑（见 _Runner._loop）。"""
     from app.scheduler import webhook
 
     await fire_due(now)
+    await process_due(now)
     await webhook.notify_due(now)
+
+
+async def process_due(now: datetime | None = None) -> None:
+    """流程的一拍（app/process）：待办的提醒、升级、超时驳回（永不自动批准）；结果未知的写入按退避去查。
+    各自出错只记日志：这一拍出错不该让调度循环停下，下一拍照常再查。"""
+    from app.process import actions, tasks
+
+    for name, step in (("待办的时限处理", tasks.tick), ("写入结果的查询", actions.tick)):
+        try:
+            await step(now)
+        except Exception:  # noqa: BLE001
+            logger.exception("%s这一拍出错，下一拍照常进行", name)
 
 
 async def _notify(webhook) -> None:  # noqa: ANN001 - 传进来的是 app.scheduler.webhook 模块
@@ -152,6 +165,7 @@ class _Runner:
         while not stopping.is_set():
             try:
                 await fire_due()
+                await process_due()
                 # stop 撞在这一拍的发起当中时，收尾不再新起通知扫描：stop 只等它动手时手上的那一份
                 if not stopping.is_set() and (self.notify is None or self.notify.done()):
                     self.notify = asyncio.create_task(_notify(webhook), name="agentlab-scheduler-notify")

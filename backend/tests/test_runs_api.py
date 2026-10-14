@@ -152,6 +152,21 @@ async def test_run_class_and_name_filters(client, seeded_runs):
     assert (await client.get("/api/runs", params={"q": "列表%周报"})).json() == []
 
 
+async def test_origin_filter_takes_a_comma_list_and_none_for_old_runs(client, seeded_runs):
+    """记录页的来源筛选（X3）：以前服务端不认这个参数，筛了也返回全部。none 是来源未记录的老运行。"""
+    wf_id, ids, _ = seeded_runs
+    async with SessionLocal() as session:
+        for run_id, kind in zip(ids, ["chat", "canvas", "schedule"]):
+            (await session.get(Run, run_id)).origin_kind = kind
+        await session.commit()
+    got = (await client.get("/api/runs", params={"workflow_id": wf_id, "origin_kind": "chat,schedule"})).json()
+    assert {x["id"] for x in got} == {ids[0], ids[2]}
+    old = (await client.get("/api/runs", params={"workflow_id": wf_id, "origin_kind": "none"})).json()
+    assert {x["id"] for x in old} == set(ids[3:])
+    both = (await client.get("/api/runs", params={"workflow_id": wf_id, "origin_kind": "canvas,none"})).json()
+    assert {x["id"] for x in both} == {ids[1], *ids[3:]}
+
+
 async def test_newest_first_and_before_is_a_cursor(client, seeded_runs):
     wf_id, ids, _ = seeded_runs
     page1 = (await client.get("/api/runs", params={"workflow_id": wf_id, "limit": 2})).json()
@@ -298,6 +313,30 @@ async def test_a_sealed_formal_run_needs_force(client):
     r = await client.delete(f"/api/runs/{run_id}", params={"force": "true"})
     assert r.status_code == 204
     assert (await client.get(f"/api/runs/{run_id}")).status_code == 404
+
+
+@pytest.mark.parametrize("state", ["sent", "unknown", "confirmed", "failed"])
+async def test_a_run_that_wrote_to_an_external_system_cannot_be_deleted(client, state):
+    """生效记录随运行级联删除（P8）：写过外部系统的运行不能删，强制删除也不行。演练不算生效，照常能删。"""
+    from app.db.models import ActionRecord
+
+    run_id = await _plain_run(status="interrupted" if state in ("sent", "unknown") else "succeeded",
+                              run_class="formal", manifest_hash="ab" * 32, manifest_seq=3)
+    async with SessionLocal() as session:
+        session.add(ActionRecord(action_key=uuid.uuid4().hex, idem_key=uuid.uuid4().hex, run_id=run_id,
+                                 node_id="pay", capability="erp_pay", payload_hash="h", state=state))
+        await session.commit()
+    for params in ({}, {"force": "true"}):
+        r = await client.delete(f"/api/runs/{run_id}", params=params)
+        assert r.status_code == 409 and r.json()["code"] == "run_has_effects", r.text
+    assert (await client.get(f"/api/runs/{run_id}")).status_code == 200
+
+    rehearsal = await _plain_run(status="succeeded", run_class="exploratory")
+    async with SessionLocal() as session:
+        session.add(ActionRecord(action_key=uuid.uuid4().hex, idem_key=uuid.uuid4().hex, run_id=rehearsal,
+                                 node_id="pay", capability="erp_pay", payload_hash="h", state="simulated"))
+        await session.commit()
+    assert (await client.delete(f"/api/runs/{rehearsal}")).status_code == 204
 
 
 async def test_an_ordinary_finished_run_deletes_straight_away(client):

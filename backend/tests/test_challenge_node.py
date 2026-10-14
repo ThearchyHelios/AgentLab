@@ -908,9 +908,11 @@ async def test_a_fail_that_would_be_swallowed_degrades_instead(monkeypatch, shop
 
 
 async def test_continuing_with_only_the_disposition_changed_keeps_the_review(monkeypatch, shop):
-    """判失败后只把「结论被推翻时」改成「只标注」再接着跑（报错里就是这么建议的）：审稿沿用 checkpoint 里的，不重审。"""
+    """判失败后只把「结论被推翻时」改成「只标注」再接着跑（报错里就是这么建议的）：审稿沿用 checkpoint 里的，不重审。
+
+    探索运行：正式运行固定在发布的版本上，不能改了配置再接着跑（F2，runner.continue_failed）。"""
     models = Models(monkeypatch, shop)
-    run = await run_manager.start(graph=graph(shop, on_refuted="fail"), input_payload={}, run_class="formal")
+    run = await run_manager.start(graph=graph(shop, on_refuted="fail"), input_payload={}, run_class="exploratory")
     row = await wait(run.id)
     assert row.status == "failed", row.error
     calls = len(models.calls)
@@ -924,9 +926,10 @@ async def test_continuing_with_only_the_disposition_changed_keeps_the_review(mon
 
 
 async def test_continuing_with_a_revised_review_reviews_again(monkeypatch, shop):
-    """接着跑时改了审稿本身（句数、反方模型）：checkpoint 里那份是按旧配置审的，对不上就重审，不拿旧结果冒充。"""
+    """接着跑时改了审稿本身（句数、反方模型）：checkpoint 里那份是按旧配置审的，对不上就重审，不拿旧结果冒充。
+    探索运行，理由同上。"""
     models = Models(monkeypatch, shop)
-    run = await run_manager.start(graph=graph(shop, on_refuted="fail"), input_payload={}, run_class="formal")
+    run = await run_manager.start(graph=graph(shop, on_refuted="fail"), input_payload={}, run_class="exploratory")
     row = await wait(run.id)
     assert row.status == "failed", row.error
     assert models.reviewed() == ["居各区域之首", "华南销售额超过华东"]

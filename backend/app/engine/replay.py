@@ -28,7 +28,14 @@ from app.engine.context import NodeContext
 #: 记录 task，agent 的 tool_step 也换了位置和返回值：升级前停下的断点照新代码重放，
 #: 节点里已经执行过的工具、模型调用对不上旧的位置，会再执行一次（副作用翻倍），缓存
 #: 下来的旧返回值还可能直接对不上形状。恢复前先看版本，对不上又有这种风险就拒绝
-#: （见 runner 的 _stale_replay）。以后再改节点里 task 的调用顺序，把它加一
+#: （见 runner 的 _stale_replay）。
+#:
+#: 规矩：以后改了任何节点里 task 的调用顺序（多一个、少一个、换位置，含 once / ask 的记录 task），把它加一，
+#: 并跑一遍升级安全测试（tests/test_replay_side_effects.py 里「跨重放协议」那几条：monkeypatch 成新版本号，
+#: 停在人工节点的能恢复、停在 Agent 半路审批的拒绝、写入节点开头等确认的能恢复且只发一次、结果未知的核实后
+#: 接着跑且不重发）。应用的流程实例一等就是几天，中间升级是常态：不加一，旧断点会按新顺序重放、重复执行；
+#: 加了一，_stale_replay 才认得出哪些断点不能续。写入动作（调用工具节点 tool.start 带 action_key）是唯一的豁免，
+#: 理由见 _stale_replay
 PROTOCOL = 2
 PROTOCOL_KEY = "agentlab_replay"
 

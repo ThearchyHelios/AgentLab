@@ -66,7 +66,7 @@ def _slow_tool(name: str = "slow_lookup") -> StructuredTool:
 
 def _serve(monkeypatch, tool: StructuredTool) -> None:
     """让各节点按名字拿到这个工具。"""
-    async def _build(names, ctx, *, session=None):
+    async def _build(names, ctx, *, session=None, allow_write=False):
         return [tool] if tool.name in names else []
 
     import app.engine.nodes.llm as llm_nodes
