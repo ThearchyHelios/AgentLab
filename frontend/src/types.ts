@@ -3225,9 +3225,13 @@ export interface CatalogAssistantChange extends CatalogPatchChange {
   label?: string
 }
 
+/**
+ * 事件流里的一个事件。服务端等模型时另发 SSE 注释行（「: keep-alive」，不是事件），读流时跳过。
+ * query 的 row_count 是取回的行数；truncated（接口约定里没有写明，服务端给了才用）为真时后面还有行，取回的只是前一截
+ */
 export type CatalogAssistantEvent =
   | { type: 'text'; delta: string }
-  | { type: 'query'; sql: string; columns: string[]; rows: unknown[][]; row_count: number; error: string | null }
+  | { type: 'query'; sql: string; columns: string[]; rows: unknown[][]; row_count: number; truncated?: boolean; error: string | null }
   | { type: 'proposal'; source_id: string; table: string; version: number; changes: CatalogAssistantChange[] }
   | { type: 'done'; usage: { input_tokens: number; output_tokens: number }; queries: number }
   | { type: 'error'; message: string; code?: string | null }
@@ -3235,7 +3239,7 @@ export type CatalogAssistantEvent =
 /** 交给表助手的一轮请求 */
 export interface CatalogAssistantRequest {
   messages: { role: 'user' | 'assistant'; content: string }[]
-  /** 界面上还没保存的修改 */
+  /** 界面上还没保存的修改：最多 200 项（服务端同一个上限，多了整个请求 422），多出来的只交最近的 200 项 */
   pending: CatalogPatchSubmit[]
 }
 

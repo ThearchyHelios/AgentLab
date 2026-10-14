@@ -661,7 +661,8 @@ export function TableDetail({
       )}
       {assistantOpen && detail.in_schema && (
         <TableAssistant key={`${sourceId}\u0000${table}`} sourceId={sourceId} table={table} tableLabel={label ?? detail.table_name} detail={detail}
-                        profileEnabled={profileEnabled} lastBlank={lastBlank} editing={!!edit}
+                        profileEnabled={profileEnabled} lastBlank={{ n: lastBlank, earlier: blankInfo.earlier, jobId: lastDraft?.job_id ?? null }}
+                        editing={!!edit}
                         onSaved={(d) => {
                           setDetail(d)
                           setConflict(null)

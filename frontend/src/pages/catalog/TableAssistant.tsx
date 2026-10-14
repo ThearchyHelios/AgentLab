@@ -11,8 +11,8 @@ import { CATALOG_ASSISTANT_TEXT as T, CATALOG_STATUS_LABEL } from '../../lib/ter
 import { Markdown } from '../../run/Markdown'
 import { patchValueText } from '../../run/catalogPatch'
 import {
-  ASSISTANT_MAX_CHARS, ASSISTANT_MAX_SAVE, QUERY_ROWS_SHOWN, applyEvent, applyPreview, assistantChangesOf, blankColumnsOf, changeStateOf,
-  changeWhere, dropPending, historyOf, mergeProposal, pendingSubmit, pendingVersion, savedKey,
+  ASSISTANT_MAX_CHARS, ASSISTANT_MAX_SAVE, QUERY_ROWS_SHOWN, applyEvent, applyPreview, assistantChangesOf, blankColumnsOf, blankLeadOf,
+  changeStateOf, changeWhere, dropPending, historyOf, mergeProposal, pendingForAssistant, pendingSubmit, pendingVersion, savedKey,
 } from './assistant'
 import type { AssistantTurn, ChangeState, PendingChange, Turn, TurnPart } from './assistant'
 
@@ -22,7 +22,10 @@ import type { AssistantTurn, ChangeState, PendingChange, Turn, TurnPart } from '
 // 回答流式显示，能停止；助手跑过的只读查询（只有开了数据剖析的源才有）写 SQL 和前几行，默认收起；修改提案逐项写改前、
 // 改后、依据，可以逐项去掉、加回。提案并进「待保存的修改」：跨多轮累积，同一项以最后一次提案为准，一键保存（最多 200 项）。
 // 保存带待保存的修改里最早那条提案对照的版本：别人在那之后改过就 409，按最新内容重算（预览接口，只读）后停下来让人再看
-// 一眼。对话不存服务端：每一轮把前面的对话和待保存的修改一起交上去；关闭、换表、离开页面就没有了，有待保存的修改时先问。
+// 一眼；只重算交去保存的那几项，保存期间回答里又到的提案原样留着。对话不存服务端：每一轮把前面的对话和待保存的修改
+// （最多 200 项）一起交上去；关闭、换表、离开页面就没有了，有待保存的修改时先问。
+// 开场：上次起草有留空的列时，引导先问这几列——列名取那次起草记下的（任务里这张表的 blank_sample），拿不到时改说目录里
+// 还没有中文名和含义的列。
 // ===========================================================================
 
 type SaveState =
@@ -42,8 +45,11 @@ export function TableAssistant({ sourceId, table, tableLabel, detail, profileEna
   detail: CatalogDetail
   /** 数据源开了数据剖析：助手才能发只读查询 */
   profileEnabled: boolean
-  /** 上次起草模型拿不准、留空的列数：开场引导先问这几列 */
-  lastBlank: number
+  /**
+   * 上次起草模型拿不准、留空的列数（n）和出处：开场引导先问这几列。jobId 是那次起草的任务（从中取起草时记下的列名）；
+   * earlier：最近一次停止了，n 是再之前那次起草记下的（不知道是哪一次，取不到列名）
+   */
+  lastBlank: { n: number; earlier: boolean; jobId: string | null }
   /** 正在编辑这张表：先不让保存（同一张表两处同时改，保存会撞上版本冲突） */
   editing: boolean
   /** 保存成功：页面换上返回的目录 */
@@ -88,7 +94,23 @@ export function TableAssistant({ sourceId, table, tableLabel, detail, profileEna
     lastLen.current = size
   }, [turns])
 
-  const blankCols = useMemo(() => (lastBlank > 0 ? blankColumnsOf(detail) : []), [lastBlank, detail])
+  // 上次起草记下的留空列名：从那次起草的任务里取（null 是还没取回来；取不到是空数组，改说目录里还没有中文名和含义的列）
+  const blankN = lastBlank.n
+  const blankJob = blankN > 0 && !lastBlank.earlier ? lastBlank.jobId : null
+  const [blankSample, setBlankSample] = useState<string[] | null>(null)
+  useEffect(() => {
+    if (!blankJob) return
+    let live = true
+    setBlankSample(null)
+    api.dataCatalog.draftJob(sourceId, blankJob)
+      .then(({ job }) => job.tasks.find((t) => t.table_name === table)?.blank_sample?.filter(Boolean) ?? [])
+      .catch(() => [] as string[])
+      .then((cols) => { if (live) setBlankSample(cols) })
+    return () => { live = false }
+  }, [sourceId, table, blankJob])
+  // 没有留空的列、还在取那次起草记下的列名时不写
+  const blankLead = useMemo(() => (blankN <= 0 || (blankJob && blankSample == null)
+    ? null : blankLeadOf(blankN, blankJob ? blankSample : null, blankColumnsOf(detail))), [blankN, blankJob, blankSample, detail])
   const hasProposed = useMemo(() => {
     const n = detail.notes
     const items = [n.label, n.description, n.grain, n.keys, n.kind, n.business_date, n.valid_filter, n.dedup,
@@ -113,7 +135,7 @@ export function TableAssistant({ sourceId, table, tableLabel, detail, profileEna
     let proposals = 0
     // 这一轮已经收尾（done、error）：之后再来的事件不认
     let ended = false
-    stopRef.current = streamCatalogAssistant(sourceId, table, { messages, pending: pendingSubmit(pendingRef.current) }, (ev) => {
+    stopRef.current = streamCatalogAssistant(sourceId, table, { messages, pending: pendingForAssistant(pendingRef.current) }, (ev) => {
       if (ended) return
       if (ev.type === 'done' || ev.type === 'error') ended = true
       if (ev.type === 'proposal') {
@@ -123,8 +145,8 @@ export function TableAssistant({ sourceId, table, tableLabel, detail, profileEna
         if (changes.length) {
           const version = typeof ev.version === 'number' && Number.isFinite(ev.version) ? ev.version : detail.version
           setPending((cur) => mergeProposal(cur, changes, pid, version))
-          // 待保存的修改变了：上一次保存的结果、冲突的说明都不再对
-          setSave({ phase: 'idle' })
+          // 待保存的修改变了：上一次保存的结果、冲突的说明都不再对。正在保存、重算的不动（按钮照旧不能点，结果出来再说）
+          setSave((s) => (s.phase === 'saving' || s.phase === 'reloading' ? s : { phase: 'idle' }))
         }
         return
       }
@@ -179,7 +201,8 @@ export function TableAssistant({ sourceId, table, tableLabel, detail, profileEna
         setSave({ phase: 'reloading' })
         try {
           const p = await api.dataCatalog.patchPreview(sourceId, table, pendingSubmit(list))
-          setPending((cur) => applyPreview(cur, p))
+          // 只重算交去保存的那几项：保存、重算期间回答里又到的提案不在预览里，原样留着
+          setPending((cur) => applyPreview(cur, p, list))
           setSave({ phase: 'conflict', problems: p.problems })
         } catch {
           setSave({ phase: 'idle', error: T.conflictFailed })
@@ -210,7 +233,6 @@ export function TableAssistant({ sourceId, table, tableLabel, detail, profileEna
   const over = len > ASSISTANT_MAX_CHARS
   const lastAssistant = [...turns].reverse().find((t): t is AssistantTurn => t.role === 'assistant')
   const status = streaming ? T.answering : lastAssistant?.state === 'stopped' ? T.stopped : lastAssistant ? T.answered : ''
-  const sampleCols = blankCols.slice(0, Math.min(Math.max(lastBlank, 1), 5))
 
   return (
     <aside
@@ -252,15 +274,15 @@ export function TableAssistant({ sourceId, table, tableLabel, detail, profileEna
            aria-busy={streaming} aria-label={T.logLabel} data-assistant-log="">
         <div className="space-y-2 rounded-lg border bg-bg px-3 py-2.5 text-xs leading-relaxed" data-assistant-msg="intro">
           <p className="text-dim" data-assistant-greeting="">{T.greeting}</p>
-          {lastBlank > 0 && <p className="text-dim" data-assistant-blank="">{T.blankLead(lastBlank, sampleCols)}</p>}
+          {blankLead && <p className="text-dim" data-assistant-blank={blankLead.from}>{T.blankLead(blankLead)}</p>}
           <p className="text-2xs text-faint">{T.notStored}</p>
           {fresh && (
             <div className="space-y-1 pt-0.5">
               <p className="text-2xs text-faint">{T.suggestLabel}</p>
               <div className="flex flex-wrap gap-1.5">
-                {lastBlank > 0 && blankCols.length > 0 && (
-                  <SuggestButton kind="blank" label={T.suggestBlank(lastBlank)}
-                                 onClick={() => send(T.suggestBlankText(blankCols.slice(0, 20), blankCols.length))} />
+                {blankLead?.ask && (
+                  <SuggestButton kind="blank" label={T.suggestBlank(blankLead.from, blankLead.ask.total)}
+                                 onClick={() => send(T.suggestBlankText(blankLead.from, blankLead.ask!.columns, blankLead.ask!.total))} />
                 )}
                 <SuggestButton kind="facts" label={T.suggestFacts} onClick={() => send(T.suggestFactsText)} />
                 {hasProposed && <SuggestButton kind="pending" label={T.suggestPending} onClick={() => send(T.suggestPendingText)} />}
@@ -383,7 +405,7 @@ function QueryBlock({ part }: { part: Extract<TurnPart, { kind: 'query' }> }) {
     <details className="group rounded-lg border bg-bg text-2xs" data-assistant-part="query" data-assistant-query={failed ? 'error' : 'ok'}>
       <summary className="flex cursor-pointer select-none items-start gap-1.5 px-2.5 py-1.5 text-dim outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-[var(--accent)]">
         <Database size={11} className="mt-0.5 shrink-0" style={{ color: failed ? 'var(--err)' : 'var(--accent)' }} aria-hidden />
-        <span className="min-w-0 break-words">{failed ? `${T.queryFailed}：${part.error}` : T.query(part.rowCount)}</span>
+        <span className="min-w-0 break-words">{failed ? `${T.queryFailed}：${part.error}` : T.query(part.rowCount, part.truncated)}</span>
       </summary>
       <div className="space-y-1.5 border-t px-2.5 py-2">
         <pre className="mono max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-panel px-2 py-1.5 text-2xs" data-assistant-query-sql="">{part.sql}</pre>
@@ -391,7 +413,9 @@ function QueryBlock({ part }: { part: Extract<TurnPart, { kind: 'query' }> }) {
           ? (
             <div className="overflow-x-auto">
               <table className="w-full border-collapse text-2xs" data-assistant-query-rows="">
-                <caption className="pb-1 text-left text-faint">{T.queryRows(Math.min(part.rows.length, QUERY_ROWS_SHOWN), part.rowCount)}</caption>
+                <caption className="pb-1 text-left text-faint">
+                  {T.queryRows(Math.min(part.rows.length, QUERY_ROWS_SHOWN), part.rowCount, part.truncated)}
+                </caption>
                 <thead>
                   <tr className="border-b text-left text-faint">
                     {part.columns.map((c) => <th key={c} scope="col" className="mono px-1.5 py-1 font-medium">{c}</th>)}
@@ -407,7 +431,7 @@ function QueryBlock({ part }: { part: Extract<TurnPart, { kind: 'query' }> }) {
               </table>
             </div>
           )
-          : <p className="text-faint">{part.rowCount > 0 ? T.queryRows(0, part.rowCount) : T.queryEmpty}</p>)}
+          : <p className="text-faint">{part.rowCount > 0 ? T.queryRows(0, part.rowCount, part.truncated) : T.queryEmpty}</p>)}
       </div>
     </details>
   )

@@ -3002,13 +3002,36 @@ export const CATALOG_ASSISTANT_TEXT = {
   profileOn: '这个数据源开了数据剖析：助手可以发少量只读查询核对数据，遮罩列不取值',
   notStored: '对话不保存在服务端，关闭表助手或离开页面后就没有了',
   greeting: '说出你知道的业务事实（某一列的含义、码值、有效记录条件……），助手整理成修改提案，你确认后才写进数据目录。助手只记数据事实，不写计算公式。',
-  /** 上次起草有留空的列：开场引导先问这几列 */
-  blankLead: (n: number, cols: string[]) =>
-    `上次起草有 ${formatNumber(n)} 列模型拿不准、留空了${cols.length ? `，例如 ${cols.join('、')}` : ''}。可以先从这几列开始。`,
+  /**
+   * 上次起草有留空的列：开场引导先问这几列（assistant.ts 的 blankLeadOf）。例子只举起草时记下的留空列里还没补上的；
+   * 拿不到起草时记下的列名时，改说目录里还没有中文名和含义的列——那里面还有没写出来的列，不能说成留空的列
+   */
+  blankLead: (b: { from: 'draft' | 'catalog'; n: number; examples: string[]; remaining: number | null; unnamed: number }) => {
+    const head = `上次起草有 ${formatNumber(b.n)} 列模型拿不准、留空了`
+    const cols = b.examples.join('、')
+    if (b.from === 'catalog') {
+      return b.unnamed > 0
+        ? `${head}。目录里还有 ${formatNumber(b.unnamed)} 列没有中文名和含义${cols ? `，例如 ${cols}` : ''}，可以先从这些列开始。`
+        : `${head}，现在目录里的列都已有中文名或含义。`
+    }
+    if (b.remaining === 0) return `${head}，现在都已补上中文名或含义。`
+    if (!cols) return `${head}。`
+    if (b.remaining == null) return `${head}，例如 ${cols}。可以先从这几列开始。`
+    return b.remaining < b.n
+      ? `${head}，还有 ${formatNumber(b.remaining)} 列没补上：${cols}。可以先从这几列开始。`
+      : `${head}：${cols}。可以先从这几列开始。`
+  },
   suggestLabel: '可以这样开始',
-  suggestBlank: (n: number) => `补上留空的 ${formatNumber(n)} 列`,
-  suggestBlankText: (cols: string[], total: number) =>
-    `请帮我补上这几列的中文名和含义：${cols.join('、')}${total > cols.length ? ` 等 ${formatNumber(total)} 列` : ''}。拿不准的地方先问我。`,
+  /** 「补上……」按钮：上面的数字就是点名的列数（不知道一共几列时不写数字） */
+  suggestBlank: (from: 'draft' | 'catalog', total: number | null) => (from === 'catalog'
+    ? `补上没有中文名和含义的 ${formatNumber(total ?? 0)} 列`
+    : total == null ? '补上留空的列' : `补上留空的 ${formatNumber(total)} 列`),
+  suggestBlankText: (from: 'draft' | 'catalog', cols: string[], total: number | null) => {
+    const named = cols.join('、')
+    if (from === 'draft' && total == null) return `请帮我补上上次起草时模型留空的列的中文名和含义，例如 ${named}。拿不准的地方先问我。`
+    const more = total != null && total > cols.length ? ` 等 ${formatNumber(total)} 列` : ''
+    return `请帮我补上这几列的中文名和含义：${named}${more}。拿不准的地方先问我。`
+  },
   suggestFacts: '核对有效记录条件和去重规则',
   suggestFactsText: '这张表的有效记录条件和去重规则应该怎么写？拿不准的地方先问我。',
   suggestPending: '看看哪些推断可以确认',
@@ -3031,11 +3054,14 @@ export const CATALOG_ASSISTANT_TEXT = {
   usage: (input: number, output: number) =>
     `输入 ${formatTokens(input, { compact: true })}、输出 ${formatTokens(output, { compact: true })}`,
   queries: (n: number) => `查询 ${formatNumber(n)} 次`,
-  // ---- 只读查询
-  query: (rows: number) => `查询了数据（${formatNumber(rows)} 行）`,
+  // ---- 只读查询（rows 是取回的行数；truncated：后面还有行，取回的只是前一截，不是结果的总行数）
+  query: (rows: number, truncated = false) => (truncated
+    ? `查询了数据（取回前 ${formatNumber(rows)} 行，后面还有）` : `查询了数据（${formatNumber(rows)} 行）`),
   queryFailed: '查询没有成功',
-  queryRows: (shown: number, total: number) => (total > shown
-    ? `共 ${formatNumber(total)} 行，显示前 ${formatNumber(shown)} 行` : `共 ${formatNumber(total)} 行`),
+  queryRows: (shown: number, total: number, truncated = false) => {
+    const head = truncated ? `取回前 ${formatNumber(total)} 行（后面还有）` : `共 ${formatNumber(total)} 行`
+    return total > shown ? `${head}，显示前 ${formatNumber(shown)} 行` : head
+  },
   queryEmpty: '没有返回行',
   // ---- 修改提案
   proposal: (n: number) => `修改提案（${formatNumber(n)} 项）`,

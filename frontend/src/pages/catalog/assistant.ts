@@ -18,13 +18,16 @@ export const ASSISTANT_MAX_MESSAGES = 40
 export const ASSISTANT_MAX_CHARS = 4000
 /** 一次最多保存几项（服务端 PATCH_MAX_CHANGES） */
 export const ASSISTANT_MAX_SAVE = 200
+/** 每一轮最多交几项待保存的修改（服务端同一个上限，多了整个请求 422）：多出来的只交最近的这么多项 */
+export const ASSISTANT_MAX_PENDING = 200
 /** 查询结果在界面上显示前几行（服务端最多给 10 行） */
 export const QUERY_ROWS_SHOWN = 10
 
 /** 一轮回答里按先后到来的几块：正文、它跑的只读查询、修改提案 */
 export type TurnPart =
   | { kind: 'text'; text: string }
-  | { kind: 'query'; sql: string; columns: string[]; rows: unknown[][]; rowCount: number; error: string | null }
+  /** rowCount 是取回的行数；truncated 为真时后面还有行（取回的只是前一截） */
+  | { kind: 'query'; sql: string; columns: string[]; rows: unknown[][]; rowCount: number; truncated: boolean; error: string | null }
   | { kind: 'proposal'; id: string; version: number; changes: CatalogAssistantChange[] }
 
 export interface UserTurn { id: string; role: 'user'; text: string }
@@ -77,7 +80,7 @@ export function applyEvent(turn: AssistantTurn, ev: CatalogAssistantEvent, propo
       const rows = Array.isArray(ev.rows) ? ev.rows.filter(Array.isArray).slice(0, QUERY_ROWS_SHOWN) as unknown[][] : []
       parts.push({
         kind: 'query', sql: typeof ev.sql === 'string' ? ev.sql : '', columns, rows, rowCount: num(ev.row_count, rows.length),
-        error: typeof ev.error === 'string' && ev.error.trim() ? ev.error : null,
+        truncated: ev.truncated === true, error: typeof ev.error === 'string' && ev.error.trim() ? ev.error : null,
       })
       return { ...turn, parts }
     }
@@ -166,6 +169,13 @@ export function pendingSubmit(pending: PendingChange[]): CatalogPatchSubmit[] {
   return pending.map((p) => ({ path: p.path, value: p.value, ...(p.reason ? { reason: p.reason } : {}) }))
 }
 
+/**
+ * 交给助手的待保存的修改：最多 ASSISTANT_MAX_PENDING 项（服务端同一个上限，多了整个请求 422）。超出时交最近的那些
+ * （列表按头一次提出的先后排，后面的是新近提出的）；没交上去的模型不知道，再提同一项时以新的提案为准，不会丢
+ */
+export const pendingForAssistant = (pending: PendingChange[]): CatalogPatchSubmit[] =>
+  pendingSubmit(pending.length > ASSISTANT_MAX_PENDING ? pending.slice(-ASSISTANT_MAX_PENDING) : pending)
+
 /** 保存时带的版本：待保存的修改里最早的那条提案对照的版本 */
 export const pendingVersion = (pending: PendingChange[]): number =>
   (pending.length ? Math.min(...pending.map((p) => p.version)) : 0)
@@ -184,12 +194,20 @@ export const savedKey = (origin: string, path: string) => `${origin}\u0000${path
 
 /**
  * 保存遇到 409（别人刚改过这张表）后按预览重算：预览里有的项换上最新的改前、改后和状态，版本记成预览的；
- * 预览里没有的（已经不合法了，原因在 problems 里）去掉；已经是这个值且已确认的（same）也去掉，不用再存
+ * 预览里没有的（已经不合法了，原因在 problems 里）去掉；已经是这个值且已确认的（same）也去掉，不用再存。
+ *
+ * submitted：交去保存、预览的那几项（同一个对象）。只重算它们：保存、重算期间又到的提案（新的项、同一项换成的新
+ * 提案）不在预览里，原样留着，不能当成「已经不合法」悄悄去掉。不给时重算全部
  */
-export function applyPreview(pending: PendingChange[], preview: CatalogPatchPreview): PendingChange[] {
+export function applyPreview(pending: PendingChange[], preview: CatalogPatchPreview, submitted?: readonly PendingChange[]): PendingChange[] {
   const byPath = new Map(preview.changes.map((c) => [c.path, c]))
+  const mine = submitted ? new Set(submitted) : null
   const out: PendingChange[] = []
   for (const p of pending) {
+    if (mine && !mine.has(p)) {
+      out.push(p)
+      continue
+    }
     const c: CatalogPatchChange | undefined = byPath.get(p.path)
     if (!c || c.state === 'same') continue
     out.push({ ...p, before: c.before, before_status: c.before_status, after: c.after, value: c.value, state: c.state,
@@ -201,6 +219,49 @@ export function applyPreview(pending: PendingChange[], preview: CatalogPatchPrev
 // ---------------------------------------------------------------------------
 // 开场：上次起草有留空的列时，引导先问这几列
 // ---------------------------------------------------------------------------
+
+/** 「补上……」按钮一次最多点名几列（再多的写「等 N 列」） */
+export const BLANK_ASK_MAX = 20
+/** 开场里最多举几列做例子 */
+export const BLANK_EXAMPLES = 5
+
+/**
+ * 开场引导的写法。留空的列（模型列出了、中文名和含义却都没给）只有起草时记下的那几个列名（blank_sample，最多 5 个）
+ * 靠得住：目录里还没有中文名和含义的列里，还有没写出来的列（部分完成的宽表）、库注释已经说清的列，不能当成留空的列举例。
+ * - draft：拿到了起草时记下的列名。例子是其中还没补上的。记全了（列名数不少于留空的列数）时 remaining 是还没补上的
+ *   几列，按钮写这个数、点名的正是这几列；没记全时 remaining 为 null，按钮不写数字、只点名这几列（模型那边另有背景）。
+ * - catalog：拿不到（最近一次停止了、用的是再之前那次的留空列数；取任务失败；老服务端没有列名）。例子和按钮都改说
+ *   「目录里还没有中文名和含义的列」，按钮上的数字就是这些列的总数，点名其中前 BLANK_ASK_MAX 列、再写「等 N 列」。
+ * ask 为 null：没有可以点名的列，不给按钮
+ */
+export interface BlankLead {
+  from: 'draft' | 'catalog'
+  /** 上次起草留空的列数 */
+  n: number
+  examples: string[]
+  /** 记全了时，留空的列里还没补上的几列；没记全、拿不到列名时为 null */
+  remaining: number | null
+  /** 目录里还没有中文名和含义的列数 */
+  unnamed: number
+  ask: { columns: string[]; total: number | null } | null
+}
+
+export function blankLeadOf(n: number, sample: readonly string[] | null, unnamed: readonly string[]): BlankLead {
+  const named = sample?.filter((c) => !!c) ?? []
+  if (named.length) {
+    const open = new Set(unnamed)
+    const still = named.filter((c) => open.has(c))
+    const remaining = named.length >= n ? still.length : null
+    return {
+      from: 'draft', n, examples: still.slice(0, BLANK_EXAMPLES), remaining, unnamed: unnamed.length,
+      ask: still.length ? { columns: still, total: remaining } : null,
+    }
+  }
+  return {
+    from: 'catalog', n, examples: unnamed.slice(0, BLANK_EXAMPLES), remaining: null, unnamed: unnamed.length,
+    ask: unnamed.length ? { columns: unnamed.slice(0, BLANK_ASK_MAX), total: unnamed.length } : null,
+  }
+}
 
 /** 还没有中文名和含义的列（表结构里的顺序；被驳回的不算有） */
 export function blankColumnsOf(detail: CatalogDetail): string[] {

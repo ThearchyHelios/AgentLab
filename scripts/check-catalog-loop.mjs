@@ -182,12 +182,23 @@ function scenicTables() {
 }
 function profiledTables() {
   return [
-    // 上一次起草留了 2 列空：开场引导先问这几列
-    table('gates', 12, [pk(), col('gate_code', 'TEXT'), col('gate_kind', 'TEXT'), col('park_id')], {
+    // 上一次起草留了 2 列空（gate_code、gate_kind）：开场引导先问这几列。opened_on 也还没有中文名和含义，但它是那次
+    // 没写出来的列、不是模型留空的——排在表结构的前面，按「目录里还没有中文名和含义的前几列」举例就会举错
+    table('gates', 12, [pk(), col('opened_on', 'TEXT'), col('gate_code', 'TEXT'), col('gate_kind', 'TEXT'), col('park_id')], {
       label: item('闸机'), columns: { id: { label: item('编号') }, park_id: { label: item('景区编号') } },
     }, { lastDraft: { status: 'ok', job_id: 'check-job-old', finished_at: T0, error: null, model_error: null, blank_columns: 2 } }),
     table('stores', 4, [pk(), col('store_code', 'TEXT')], null),
   ]
+}
+/** 那次起草的任务（GET draft-jobs/{id}）：只有闸机表这一行要紧——起草时记下的留空列名 */
+const OLD_JOB = {
+  id: 'check-job-old', source_id: 'check-loop-profiled', status: 'succeeded', use_model: true, model: 'check-model', guidance: null, note: null,
+  created_at: T0, started_at: T0, finished_at: T0, created_by: '检查脚本', total: 1, done: 1,
+  counts: { pending: 0, running: 0, ok: 1, partial: 0, failed: 0, skipped: 0, cancelled: 0 }, added: 3, updated: 0, removed: 0,
+  usage: { calls: 1, input_tokens: 1000, output_tokens: 200 }, error: null, blank_columns: 2,
+  tasks: [{ table_name: 'gates', status: 'ok', columns: 5, parts_total: 1, parts_done: 1, parts_written: 1, chunks_total: 1, chunks_done: 1,
+    added: 3, updated: 0, removed: 0, version: 2, model_items: 3, blank_columns: 2, blank_sample: ['gate_code', 'gate_kind'],
+    error: null, model_error: null, started_at: T0, finished_at: T0 }],
 }
 
 const blank = {
@@ -301,10 +312,14 @@ function previewOf(t, changes) {
   }
 }
 
-/** 表助手的事件流：每个事件一行 data: <JSON> */
+/**
+ * 表助手的事件流：每个事件一行 data: <JSON>。服务端等模型时发 SSE 注释行（「: keep-alive」，不是事件）：开头、每个事件
+ * 之间都夹一行，读流时得跳过
+ */
+const KEEP_ALIVE = ': keep-alive\n\n'
 const sse = (events) => (route) => route.fulfill({
   status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' },
-  body: events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(''),
+  body: KEEP_ALIVE + events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(KEEP_ALIVE),
 })
 const done = (queries = 0) => ({ type: 'done', usage: { input_tokens: 2400, output_tokens: 600 }, queries })
 const MODEL_DOWN = { detail: '未配置模型接入，无法由模型起草数据目录。请到「设置 → 模型接入」添加', code: 'catalog_draft_model_unavailable' }
@@ -320,6 +335,12 @@ function loopHandlers(state, replies = {}) {
     [/^GET \/datasources$/, (route) => json(state.sources)(route)],
     [/^GET \/datasources\/check-loop-[a-z]+\/catalog$/, (route, { key }) => json(listOf(state, parts(key)[2]))(route)],
     [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/draft-jobs\/(active|latest)$/, json({ job: null })],
+    // 某一次起草任务：表助手开场从中取起草时记下的留空列名。只认 state.jobs 里有的，别的 404（同服务端：任务不在了）
+    [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/draft-jobs\/[^/]+$/, (route, { key }) => {
+      const id = parts(key)[5]
+      const job = (state.jobs ?? [OLD_JOB]).find((j) => j.id === id)
+      return job ? json({ job })(route) : json({ detail: '找不到这次起草任务' }, 404)(route)
+    }],
     // 审阅队列、进度、成批审阅、导出导入：放在单表的 GET 前面
     [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/review-queue$/, reply('queue', (route, { key, url }) => {
       const src = parts(key)[2]
@@ -377,8 +398,14 @@ function loopHandlers(state, replies = {}) {
       const runs = state.usage?.[parts(key)[4]] ?? []
       return json({ total: runs.length, runs: runs.slice(0, Number(url.searchParams.get('limit') ?? 20)) })(route)
     })],
-    // 表助手：每一轮按 replies.assistant 依次答（没配就是 503，检查不能让请求落到真服务端）
-    [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+\/assistant$/, reply('assistant', json({ detail: '检查脚本没有为这一轮准备答复' }, 503))],
+    // 表助手：每一轮按 replies.assistant 依次答（没配就是 503，检查不能让请求落到真服务端）。请求不合规的照服务端的
+    // 校验回 422：对话最多 40 条、每条最多 4000 字，待保存的修改最多 200 项
+    [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+\/assistant$/, (route, ctx) => {
+      const b = ctx.body ?? {}
+      const bad = (b.messages?.length ?? 0) > 40 || (b.messages ?? []).some((m) => [...(m.content ?? '')].length > 4000) || (b.pending?.length ?? 0) > 200
+      if (bad) return json({ detail: [{ type: 'too_long', loc: ['body', (b.pending?.length ?? 0) > 200 ? 'pending' : 'messages'], msg: 'too long' }] }, 422)(route)
+      return reply('assistant', json({ detail: '检查脚本没有为这一轮准备答复' }, 503))(route, ctx)
+    }],
     [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+\/patch\/preview$/, reply('preview', (route, { key, body }) => {
       const { t } = findTable(state, key)
       return json(previewOf(t, body.changes))(route)
@@ -599,6 +626,32 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
     ]
     // 审阅进度：三行同一个口径——已确认 ÷（已确认 + 待确认）；不知道待确认几项时不算百分比
     out.progress = [rv.confirmProgress(120, 150), rv.confirmProgress(30, 0), rv.confirmProgress(0, 0), rv.confirmProgress(5, undefined)]
+    // 409 后只重算交去保存的那几项：保存期间又到的提案原样留着
+    const A = { ...c('label', '甲'), origin: 'p1', version: 2 }
+    const B = { ...c('grain', '一行'), origin: 'p2', version: 3 }
+    const pv2 = { table_name: 't', version: 9, problems: [], changes: [{ ...c('label', '甲'), before: '丙', before_status: 'proposed' }] }
+    out.only = { kept: a.applyPreview([A, B], pv2, [A]).map((x) => `${x.path}@${x.version}`).join(','),
+      all: a.applyPreview([A, B], pv2).map((x) => x.path).join(',') }
+    // 交给助手的待保存的修改最多 200 项：只交最近的
+    const many = Array.from({ length: 202 }, (_, i) => ({ ...c(`columns.c${i}.label`, `列 ${i}`), origin: 'p', version: 1 }))
+    const capped = a.pendingForAssistant(many)
+    out.capped = { n: capped.length, first: capped[0].path, last: capped.at(-1).path, few: a.pendingForAssistant(many.slice(0, 3)).length }
+    // 开场的留空列：只举起草时记下的；拿不到时改说目录里还没有中文名和含义的列，按钮上的数字就是点名的列数
+    const T = (await import('/src/lib/terms.ts')).CATALOG_ASSISTANT_TEXT
+    const lead = (n, sample, unnamed) => {
+      const b = a.blankLeadOf(n, sample, unnamed)
+      return { from: b.from, text: T.blankLead(b), button: b.ask ? T.suggestBlank(b.from, b.ask.total) : null,
+        ask: b.ask ? T.suggestBlankText(b.from, b.ask.columns, b.ask.total) : null }
+    }
+    out.blankLead = [
+      lead(2, ['gate_code', 'gate_kind'], ['opened_on', 'gate_code', 'gate_kind']),
+      lead(2, ['gate_code', 'gate_kind'], ['opened_on', 'gate_kind']),
+      lead(2, ['gate_code', 'gate_kind'], ['opened_on']),
+      lead(12, ['c1', 'c2', 'c3', 'c4', 'c5'], ['c0', 'c2', 'c5', 'c9']),
+      lead(2, null, ['opened_on', 'gate_code', 'gate_kind']),
+      lead(2, [], []),
+      lead(2, null, Array.from({ length: 25 }, (_, i) => `k${i}`)),
+    ]
     return out
   })
   // 51 条取后 40 条，打头的那条是助手的回答，去掉：39 条
@@ -630,13 +683,35 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
   check('审阅进度三行同一个口径：已确认 ÷（已确认 + 待确认），审完是 100%，没有可确认的、不知道待确认几项时不算',
     JSON.stringify(r.progress.map((x) => x.pct)) === JSON.stringify([44, 100, null, null]) && r.progress[3].proposed === null,
     JSON.stringify(r.progress))
+  check('409 后只重算交去保存的那几项：保存期间又到的提案（粒度）原样留着、版本不变；不给时照旧全部重算',
+    r.only.kept === 'label@9,grain@3' && r.only.all === 'label', JSON.stringify(r.only))
+  check('交给助手的待保存的修改最多 200 项，只交最近的；不到 200 项的全交', r.capped.n === 200 && r.capped.first === 'columns.c2.label'
+        && r.capped.last === 'columns.c201.label' && r.capped.few === 3, JSON.stringify(r.capped))
+  const bl = r.blankLead
+  check('留空列（记全了）：举的就是起草时记下的列，没写出来的 opened_on 不算；按钮上的 2 列就是点名的 2 列',
+    bl[0].from === 'draft' && bl[0].text === '上次起草有 2 列模型拿不准、留空了：gate_code、gate_kind。可以先从这几列开始。'
+        && bl[0].button === '补上留空的 2 列' && bl[0].ask === '请帮我补上这几列的中文名和含义：gate_code、gate_kind。拿不准的地方先问我。', JSON.stringify(bl[0]))
+  check('……补上了一列：写还有 1 列没补上，按钮是「补上留空的 1 列」、只点名它', bl[1].text === '上次起草有 2 列模型拿不准、留空了，还有 1 列没补上：gate_kind。可以先从这几列开始。'
+        && bl[1].button === '补上留空的 1 列' && bl[1].ask === '请帮我补上这几列的中文名和含义：gate_kind。拿不准的地方先问我。', JSON.stringify(bl[1]))
+  check('……都补上了：写明都已补上，不给按钮', bl[2].text === '上次起草有 2 列模型拿不准、留空了，现在都已补上中文名或含义。' && bl[2].button === null, JSON.stringify(bl[2]))
+  check('……没记全（12 列只记了 5 个）：举还没补上的那几个，按钮不写数字',
+    bl[3].text === '上次起草有 12 列模型拿不准、留空了，例如 c2、c5。可以先从这几列开始。' && bl[3].button === '补上留空的列'
+        && bl[3].ask === '请帮我补上上次起草时模型留空的列的中文名和含义，例如 c2、c5。拿不准的地方先问我。', JSON.stringify(bl[3]))
+  check('拿不到起草时记下的列名：改说目录里还没有中文名和含义的列，按钮上的数字就是这些列的总数',
+    bl[4].from === 'catalog' && bl[4].text === '上次起草有 2 列模型拿不准、留空了。目录里还有 3 列没有中文名和含义，例如 opened_on、gate_code、gate_kind，可以先从这些列开始。'
+        && bl[4].button === '补上没有中文名和含义的 3 列' && bl[4].ask === '请帮我补上这几列的中文名和含义：opened_on、gate_code、gate_kind。拿不准的地方先问我。',
+    JSON.stringify(bl[4]))
+  check('……目录里的列都有了：不给按钮', bl[5].text === '上次起草有 2 列模型拿不准、留空了，现在目录里的列都已有中文名或含义。' && bl[5].button === null, JSON.stringify(bl[5]))
+  check('……超过 20 列：点名前 20 列、写「等 25 列」，和按钮上的 25 列一致', bl[6].button === '补上没有中文名和含义的 25 列'
+        && bl[6].ask.includes('k19 等 25 列') && !bl[6].ask.includes('k20'), JSON.stringify(bl[6]))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })
 
 // 第一轮：用户说出码值，助手整理成两项提案
+// 形状照服务端：另带 source（数据源名）、table_label（表的中文名），界面不用
 const PROPOSAL_1 = {
-  type: 'proposal', source_id: S1, table: 'visits', version: 2, changes: [
+  type: 'proposal', source: NAME1, source_id: S1, table: 'visits', table_label: '入园记录', version: 2, changes: [
     { path: 'columns.status.codes', label: '列 status 的码值', before: { 1: '已入园' }, before_status: 'proposed', after: { 1: '已入园', 9: '已作废' },
       value: { 9: '已作废' }, reason: '用户说「status 为 9 表示作废」', state: 'change' },
     { path: 'columns.status.meaning', label: '列 status 的含义', before: null, before_status: null, after: '入园状态：1 已入园，9 已作废',
@@ -645,7 +720,7 @@ const PROPOSAL_1 = {
 }
 // 第二轮：码值再补一个（同一项，以这一次为准），有效记录条件跟着改
 const PROPOSAL_2 = {
-  type: 'proposal', source_id: S1, table: 'visits', version: 2, changes: [
+  type: 'proposal', source: NAME1, source_id: S1, table: 'visits', table_label: '入园记录', version: 2, changes: [
     { path: 'columns.status.codes', label: '列 status 的码值', before: { 1: '已入园' }, before_status: 'proposed', after: { 1: '已入园', 8: '已退票', 9: '已作废' },
       value: { 8: '已退票', 9: '已作废' }, reason: '用户说「8 是退票」', state: 'change' },
     { path: 'valid_filter', label: '有效记录条件', before: 'status NOT IN (9)', before_status: 'proposed', after: 'status NOT IN (8, 9)',
@@ -779,7 +854,7 @@ await section('表助手 · 停止、出错、模型用不了与离开前确认'
       // 一直不答完：等着点「停止回答」
       async (route) => { await held; await route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' }).catch(() => {}) },
       // 流里出错
-      sse([{ type: 'text', delta: '我先看一下这张表' }, { type: 'error', message: '调用模型出错：服务暂时不可用', code: 'model_error' }]),
+      sse([{ type: 'text', delta: '我先看一下这张表' }, { type: 'error', message: '调用模型出错：服务暂时不可用', code: 'assistant_model_error' }]),
       // 有一项提案：之后离开、关闭时要先问
       sse([{ type: 'text', delta: '整理好了：' }, PROPOSAL_1, done()]),
     ],
@@ -829,13 +904,77 @@ await section('表助手 · 停止、出错、模型用不了与离开前确认'
   await close()
 })
 
+await section('表助手 · 回答进行中保存、撞上 409 时新到的提案不丢', async () => {
+  const state = freshState()
+  const t = state.tables[S1].find((x) => x.name === 'visits')
+  let releaseStream = null
+  const streamGate = new Promise((r) => { releaseStream = r })
+  let releasePreview = null
+  const previewGate = new Promise((r) => { releasePreview = r })
+  // 第二轮回答里的提案：别人改过之后才提的，对照第 3 版
+  const GRAIN = {
+    type: 'proposal', source: NAME1, source_id: S1, table: 'visits', table_label: '入园记录', version: 3, changes: [
+      { path: 'grain', label: '表的粒度', before: '一张门票的一次入园', before_status: 'proposed', after: '一次刷闸', value: '一次刷闸',
+        reason: '用户说「一次刷闸记一行」', state: 'change' },
+    ],
+  }
+  const replies = {
+    assistant: [
+      sse([{ type: 'text', delta: '整理好了：' }, PROPOSAL_1, done()]),
+      // 第二轮：等点了保存、撞上 409、正在按最新内容重算时才答出来
+      async (route) => { await streamGate; await sse([{ type: 'text', delta: '粒度也改一下：' }, GRAIN, done()])(route).catch(() => {}) },
+    ],
+    // 重算（预览）：等第二轮的提案到了再答
+    preview: [async (route, { key, body }) => { await previewGate; await json(previewOf(findTable(state, key).t, body.changes))(route).catch(() => {}) }],
+  }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state, replies) })
+  await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
+  await page.locator('[data-catalog-assistant-open="header"]').click()
+  await panel(page).waitFor()
+  await say(page, SAY_1)
+  check('第一轮：待保存 2 项', await pendingCount(page) === 2)
+  // 别人刚改过这张表（第 3 版）；接着问第二轮，回答还没出来时点保存
+  writeEntry(t, { ...t.notes, description: item('别人刚补的说明', 'human') })
+  await say(page, '一次刷闸记一行', { wait: false })
+  await until(async () => (await streaming(page)) === 'true')
+  const save = panel(page).locator('[data-assistant-save]')
+  await save.click()
+  check('回答进行中点保存：带提案对照的第 2 版，撞上 409，按最新内容重算（预览）', await until(async () => count(sent, /\/visits\/patch\/preview$/) === 1)
+        && lastSent(sent, /\/visits\/patch$/)?.body?.if_version === 2 && lastSent(sent, /\/visits\/patch\/preview$/)?.body?.changes?.length === 2)
+  // 重算还没回来时，第二轮的提案到了
+  releaseStream()
+  check('重算期间第二轮的提案到了：待保存 3 项', await until(async () => (await pendingCount(page)) === 3))
+  check('……保存按钮照旧是「正在保存…」、不能点（提案到了不把正在进行的保存翻回可以点）', await save.isDisabled()
+        && (await textOf(save)).includes('正在保存'), await textOf(save))
+  releasePreview()
+  const conflict = panel(page).locator('[data-assistant-conflict]')
+  check('重算回来：写明这张表刚被修改过、已按最新内容重算', await until(async () => (await conflict.count()) === 1))
+  check('……重算期间新到的提案（粒度）还在待保存的修改里，没被当成不合法悄悄去掉', await pendingCount(page) === 3
+        && await panel(page).locator('[data-assistant-pending-item="grain"]').count() === 1 && (await changeState(page, 'grain')) === 'pending',
+    `${await pendingCount(page)} · ${await changeState(page, 'grain')}`)
+  check('……没有说有哪几项已无法保存（预览里的都还合法）', await conflict.locator('[data-assistant-problems]').count() === 0)
+  await save.click()
+  const body = await until(async () => (count(sent, /\/visits\/patch$/) === 2 ? lastSent(sent, /\/visits\/patch$/)?.body : null))
+  check('再点保存：带最新的第 3 版，3 项都交上去（含新到的粒度）', body?.if_version === 3 && JSON.stringify(body.changes.map((c) => c.path))
+    === JSON.stringify(['columns.status.codes', 'columns.status.meaning', 'grain']), JSON.stringify(body))
+  check('……存上了：待保存的清空，写明已保存 3 项（第 4 版）', await until(async () => (await panel(page).locator('[data-assistant-saved]').count()) === 1)
+        && (await textOf(panel(page).locator('[data-assistant-saved]'))).includes('已保存 3 项修改（第 4 版）'))
+  check('只发过表助手、保存、预览的写请求', writes(sent).every((s) => /\/(assistant|patch|patch\/preview)$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
 await section('表助手 · 开了剖析的源：只读查询与留空列的引导', async () => {
   const state = freshState()
+  // 形状照服务端：query 带 truncated（后面还有行时为真，row_count 只是取回的行数）
   const QUERY = { type: 'query', sql: 'SELECT gate_kind, COUNT(*) AS n FROM gates GROUP BY gate_kind', columns: ['gate_kind', 'n', 'gate_code'],
-    rows: [['E', 6, '已遮罩'], ['X', 2, '已遮罩']], row_count: 2, error: null }
+    rows: [['E', 6, '已遮罩'], ['X', 2, '已遮罩']], row_count: 2, truncated: false, error: null }
+  const LONG = { type: 'query', sql: 'SELECT gate_code, park_id FROM gates', columns: ['gate_code', 'park_id'],
+    rows: Array.from({ length: 10 }, (_, i) => ['已遮罩', i + 1]), row_count: 50, truncated: true, error: null }
   const replies = {
-    assistant: [sse([QUERY, { type: 'query', sql: 'SELECT COUNT(*) FROM gates WHERE park_id IS NULL', columns: [], rows: [], row_count: 0, error: '查询超时（10 秒）' },
-      { type: 'text', delta: 'gate_kind 只有 E、X 两种取值，分别是什么意思？' }, done(2)])],
+    assistant: [sse([QUERY, { type: 'query', sql: 'SELECT COUNT(*) FROM gates WHERE park_id IS NULL', columns: [], rows: [], row_count: 0, truncated: false, error: '查询超时（10 秒）' },
+      LONG, { type: 'text', delta: 'gate_kind 只有 E、X 两种取值，分别是什么意思？' }, done(3)])],
   }
   const { page, sent, errors, close } = await open(`/data/catalog/${S2}/gates`, { handlers: loopHandlers(state, replies) })
   await until(async () => (await page.locator('[data-catalog-detail="gates"][data-version]').count()) > 0)
@@ -845,28 +984,79 @@ await section('表助手 · 开了剖析的源：只读查询与留空列的引�
   await panel(page).waitFor()
   check('开了剖析的源：不写「不能查数据」，写明可以发少量只读查询', await panel(page).locator('[data-assistant-no-profile]').count() === 0
         && (await textOf(panel(page).locator('[data-assistant-profile-on]'))).includes('只读查询'))
-  const lead = await textOf(panel(page).locator('[data-assistant-blank]'))
-  check('开场引导先问留空的列：写明上次起草有 2 列留空，例如 gate_code、gate_kind', lead.includes('上次起草有 2 列模型拿不准、留空了') && lead.includes('gate_code、gate_kind'), lead)
+  // 留空的列名取那次起草记下的（任务里这张表的 blank_sample），不取「目录里还没有中文名和含义的列」——那里面还有没写出来的 opened_on
+  const leadBox = panel(page).locator('[data-assistant-blank]')
+  // 开发模式的 StrictMode 会把副作用多跑一遍，取任务可能是两次
+  check('开场先取那次起草的任务（从中取起草时记下的留空列名）', await until(async () => count(sent, /draft-jobs\/check-job-old$/) >= 1)
+        && await until(async () => (await leadBox.getAttribute('data-assistant-blank').catch(() => null)) === 'draft'))
+  const lead = await textOf(leadBox)
+  check('开场引导先问留空的列：写明上次起草有 2 列留空，就是 gate_code、gate_kind，不把没写出来的 opened_on 当成留空的列',
+    lead === '上次起草有 2 列模型拿不准、留空了：gate_code、gate_kind。可以先从这几列开始。' && !lead.includes('opened_on'), lead)
   const suggest = panel(page).locator('[data-assistant-suggest="blank"]')
-  check('……给一个按钮「补上留空的 2 列」', (await textOf(suggest)) === '补上留空的 2 列')
+  check('……给一个按钮「补上留空的 2 列」', (await textOf(suggest)) === '补上留空的 2 列', await textOf(suggest))
   await suggest.click()
   await until(async () => (await streaming(page)) === 'false' && count(sent, /\/assistant$/) === 1)
   const first = lastSent(sent, /\/assistant$/)?.body?.messages?.[0]?.content ?? ''
-  check('……点了就把这几列交给助手', first.includes('gate_code、gate_kind') && first.includes('拿不准的地方先问我'), first)
+  check('……点了就把这 2 列交给助手：点名的正是按钮上说的 2 列，没有别的列', first === '请帮我补上这几列的中文名和含义：gate_code、gate_kind。拿不准的地方先问我。', first)
   const q = lastTurn(page).locator('[data-assistant-query]')
-  check('跑过的只读查询：两条，默认收起，摘要写行数', await until(async () => (await q.count()) === 2)
+  check('跑过的只读查询：三条，默认收起，摘要写行数（服务端等模型时发的注释行跳过了）', await until(async () => (await q.count()) === 3)
         && !(await q.first().evaluate((el) => el.open)) && (await textOf(q.first().locator('summary'))).includes('查询了数据（2 行）'))
   check('……查询没成功的写明原因', (await textOf(q.nth(1).locator('summary'))).includes('查询没有成功') && (await textOf(q.nth(1))).includes('查询超时（10 秒）'))
+  check('……后面还有行的（truncated）：写「取回前 50 行，后面还有」，不说成结果一共 50 行', (await textOf(q.nth(2).locator('summary'))).includes('查询了数据（取回前 50 行，后面还有）'),
+    await textOf(q.nth(2).locator('summary')))
   await q.first().locator('summary').click()
   check('……展开：SQL 和前几行，遮罩列的值写「已遮罩」', await until(async () => q.first().locator('[data-assistant-query-sql]').isVisible())
         && (await textOf(q.first().locator('[data-assistant-query-sql]'))).startsWith('SELECT gate_kind')
         && await q.first().locator('[data-assistant-query-rows] tbody tr').count() === 2
         && (await textOf(q.first().locator('[data-assistant-query-rows]'))).includes('已遮罩'))
-  check('……写明这一轮查询了 2 次', (await textOf(lastTurn(page).locator('[data-assistant-turn-status]'))).includes('查询 2 次'),
+  await q.nth(2).locator('summary').click()
+  check('……后面还有行的展开：写取回前 50 行（后面还有），显示前 10 行', await until(async () => q.nth(2).locator('[data-assistant-query-rows]').isVisible())
+        && (await textOf(q.nth(2).locator('[data-assistant-query-rows] caption'))) === '取回前 50 行（后面还有），显示前 10 行',
+    await textOf(q.nth(2).locator('[data-assistant-query-rows] caption')))
+  check('……写明这一轮查询了 3 次', (await textOf(lastTurn(page).locator('[data-assistant-turn-status]'))).includes('查询 3 次'),
     await textOf(lastTurn(page).locator('[data-assistant-turn-status]')))
   await shot(page, 'catalog-assistant-query')
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
+})
+
+await section('表助手 · 拿不到起草时记下的留空列名', async () => {
+  const state = freshState()
+  const gates = state.tables[S2].find((t) => t.name === 'gates')
+  const leadOf = async (page) => {
+    await page.locator('[data-catalog-assistant-open="header"]').click()
+    await panel(page).waitFor()
+    const box = panel(page).locator('[data-assistant-blank]')
+    await until(async () => (await box.getAttribute('data-assistant-blank').catch(() => null)) !== null)
+    return { from: await box.getAttribute('data-assistant-blank').catch(() => null), text: await textOf(box) }
+  }
+  // 那次起草的任务已经不在了（404）：改说目录里还没有中文名和含义的列，按钮上的数字就是点名的列数
+  gates.lastDraft = { ...gates.lastDraft, job_id: 'check-job-gone' }
+  const replies = { assistant: [sse([{ type: 'text', delta: '好的。' }, done()])] }
+  const { page, sent, errors, close } = await open(`/data/catalog/${S2}/gates`, { handlers: loopHandlers(state, replies) })
+  await until(async () => (await page.locator('[data-catalog-detail="gates"][data-version]').count()) > 0)
+  const gone = await leadOf(page)
+  check('任务不在了：不再说这几列是留空的列，改说目录里还有 3 列没有中文名和含义', gone.from === 'catalog'
+        && gone.text === '上次起草有 2 列模型拿不准、留空了。目录里还有 3 列没有中文名和含义，例如 opened_on、gate_code、gate_kind，可以先从这些列开始。', gone.text)
+  const suggest = panel(page).locator('[data-assistant-suggest="blank"]')
+  check('……按钮写「补上没有中文名和含义的 3 列」（不写成「补上留空的 2 列」）', (await textOf(suggest)) === '补上没有中文名和含义的 3 列', await textOf(suggest))
+  await suggest.click()
+  await until(async () => (await streaming(page)) === 'false' && count(sent, /\/assistant$/) === 1)
+  const msg = lastSent(sent, /\/assistant$/)?.body?.messages?.[0]?.content ?? ''
+  check('……点名的就是这 3 列', msg === '请帮我补上这几列的中文名和含义：opened_on、gate_code、gate_kind。拿不准的地方先问我。', msg)
+  await close()
+
+  // 最近一次停止了、没有新写入：留空列数是再之前那次的，不知道是哪一次——不去取停止的那次任务，改说目录里的
+  gates.lastDraft = { status: 'cancelled', job_id: 'check-job-stopped', finished_at: T0, error: null, model_error: null,
+    blank_columns: 0, blank_columns_from: 2, parts_written: 0 }
+  const again = await open(`/data/catalog/${S2}/gates`, { handlers: loopHandlers(state, {}) })
+  await until(async () => (await again.page.locator('[data-catalog-detail="gates"][data-version]').count()) > 0)
+  const earlier = await leadOf(again.page)
+  check('最近一次停止了：用再之前那次的留空列数，不去取停止的那次任务，改说目录里还没有中文名和含义的列',
+    earlier.from === 'catalog' && earlier.text.startsWith('上次起草有 2 列模型拿不准、留空了。目录里还有 3 列没有中文名和含义')
+        && count(again.sent, /draft-jobs\/check-job-stopped$/) === 0, `${earlier.text} · ${count(again.sent, /draft-jobs\//)}`)
+  check('没有运行时报错', errors.length === 0 && again.errors.length === 0, errors[0] ?? again.errors[0] ?? '')
+  await again.close()
 })
 
 await section('表助手 · 一次最多保存 200 项', async () => {
@@ -877,7 +1067,12 @@ await section('表助手 · 一次最多保存 200 项', async () => {
     changes.push({ path: `columns.${c}.label`, before: null, before_status: null, after: `属性 ${i}`, value: `属性 ${i}`, reason: '按列名推断', state: 'change' })
     changes.push({ path: `columns.${c}.meaning`, before: null, before_status: null, after: `促销属性 ${i}`, value: `促销属性 ${i}`, reason: '按列名推断', state: 'change' })
   }
-  const replies = { assistant: [sse([{ type: 'proposal', source_id: S1, table: 'promo_attrs', version: 2, changes }, done()])] }
+  const replies = {
+    assistant: [
+      sse([{ type: 'proposal', source_id: S1, table: 'promo_attrs', version: 2, changes }, done()]),
+      sse([{ type: 'text', delta: '好的，先说这几列。' }, done()]),
+    ],
+  }
   const { page, sent, errors, close } = await open(`/data/catalog/${S1}/promo_attrs`, { handlers: loopHandlers(state, replies) })
   await until(async () => (await page.locator('[data-catalog-detail="promo_attrs"][data-version]').count()) > 0)
   await page.locator('[data-catalog-assistant-open="header"]').click()
@@ -885,6 +1080,13 @@ await section('表助手 · 一次最多保存 200 项', async () => {
   await say(page, '把这些列都补上中文名和含义')
   check('202 项待保存：保存按钮不能点，写明一次最多 200 项', await pendingCount(page) === 202 && await panel(page).locator('[data-assistant-save]').isDisabled()
         && (await textOf(panel(page).locator('[data-assistant-too-many]'))).includes('一次最多保存 200 项'))
+  // 待保存的超过 200 项时接着问：服务端一轮最多收 200 项待保存的修改（多了整个请求 422），只交最近的 200 项
+  await say(page, '先说 attr_101 是什么')
+  const asked = lastSent(sent, /\/assistant$/)?.body?.pending ?? []
+  check('……接着问：只交最近的 200 项待保存的修改，这一轮照常答出来', asked.length === 200 && asked[0]?.path === 'columns.attr_002.label'
+        && asked.at(-1)?.path === 'columns.attr_101.meaning' && (await lastTurn(page).getAttribute('data-turn-state')) === 'done',
+    `${asked.length} · ${asked[0]?.path} · ${asked.at(-1)?.path} · ${await lastTurn(page).getAttribute('data-turn-state')}`)
+  check('……界面上的待保存照旧 202 项（只是没全交给助手）', await pendingCount(page) === 202)
   for (const p of ['columns.attr_101.meaning', 'columns.attr_101.label']) {
     await panel(page).locator(`[data-assistant-pending-item="${p}"] [data-assistant-pending-remove]`).click()
   }
