@@ -101,6 +101,21 @@ export function statusOf(item: CatalogReviewItem, outcome: ItemOutcome | undefin
 }
 
 /**
+ * 列表里已经不是推断的项（审阅成功过：成批审阅、表详情里改过）。它们还留在列表里、刷新后才移除，服务端的队列里已经没有了。
+ * 撤销审阅回到推断的、冲突的不算
+ */
+export const reviewedCount = (items: readonly CatalogReviewItem[], outcomes: ReadonlyMap<string, ItemOutcome>): number =>
+  items.filter((i) => statusOf(i, outcomes.get(itemKey(i))) !== 'proposed').length
+
+/**
+ * 列表头「N 项待确认」：总数减掉列表里已经不是推断的项。total 是「列表里的项 + 服务端还没载入的项」（载入下一页时按
+ * 服务端的新总数加回列表里审阅过的项，见 ReviewQueue），所以减完就是服务端现在的待确认项数，和视图标签、按表筛选的计数
+ * 同一个口径。以前只在载入时设一次，成批审阅之后还写着审阅前的数
+ */
+export const pendingTotal = (total: number, items: readonly CatalogReviewItem[], outcomes: ReadonlyMap<string, ItemOutcome>): number =>
+  Math.max(0, total - reviewedCount(items, outcomes))
+
+/**
  * 一批选中的项里，这个动作要发哪几条：确认发还不是已确认的，驳回发还不是已驳回的，撤销审阅只发这一页上审阅成功过的
  * （队列里本来都是推断，没审阅过的撤销了也没有变化）。冲突过的照旧可以再发
  */

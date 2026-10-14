@@ -10,15 +10,16 @@ import { errorMessage } from '../../lib/errors'
 import { CATALOG_REVIEW_TEXT as RT } from '../../lib/terms'
 import { StatusChip } from './parts'
 import {
-  REVIEW_BATCH_MAX, REVIEW_KINDS, REVIEW_PAGE, applyResults, batchTargets, confirmProgress, itemKey, reviewWhere, statusOf,
-  syncFromDetail,
+  REVIEW_BATCH_MAX, REVIEW_KINDS, REVIEW_PAGE, applyResults, batchTargets, confirmProgress, itemKey, pendingTotal, reviewWhere,
+  reviewedCount, statusOf, syncFromDetail,
 } from './review'
 import type { ItemOutcome } from './review'
 
 // ===========================================================================
 // 审阅队列（数据目录页的「审阅队列」视图，左栏）：跨表列出推断项，顺序由服务端排好（所在表的使用次数 × 这一项对数字的
 // 影响 × 来源），每一项写为什么排在这里。可以按项（影响数字的项 / 名称和含义）和表筛选；多选后成批确认、驳回，审阅过的
-// 原地标出结果（冲突的标出来），选中可以撤销审阅；刷新队列后审阅过的才移除。顶上是审阅进度：常用表（使用次数最多、
+// 原地标出结果（冲突的标出来），选中可以撤销审阅；刷新队列后审阅过的才移除，列表头的「N 项待确认」审阅成功一项就少一项
+// （pendingTotal，和视图标签、按表筛选的计数同一个口径）。顶上是审阅进度：常用表（使用次数最多、
 // 被运行用过的前 20 张）、全部表、影响数字的项各确认了多少，三行同一个口径。点开一项，右栏是所在表的详情（滚到那一项、
 // 标出来）和用过这张表的运行。
 // ===========================================================================
@@ -96,7 +97,7 @@ export function ReviewQueue({ sourceId, rows, kind, table, activeKey, detailSync
   const loadMore = async () => {
     const list = itemsRef.current
     if (!list || loadingMore) return
-    const gone = list.filter((i) => statusOf(i, outcomes.get(itemKey(i))) !== 'proposed').length
+    const gone = reviewedCount(list, outcomes)
     setLoadingMore(true)
     try {
       const q = await api.dataCatalog.reviewQueue(sourceId, { limit: REVIEW_PAGE, offset: list.length - gone, kind, table: table || null })
@@ -193,7 +194,9 @@ export function ReviewQueue({ sourceId, rows, kind, table, activeKey, detailSync
     reset: batchTargets(loaded, selected, 'reset', outcomes).length,
   }
   const filtered = kind !== 'all' || !!table
+  // 还没载入的项（total 里含列表里审阅过、刷新前还留着的项）；列表头写的是还待确认的（审阅过的减掉）
   const remaining = Math.max(0, total - loaded.length)
+  const pending = pendingTotal(total, loaded, outcomes)
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-review-queue="" aria-label={RT.queueLabel}>
@@ -228,7 +231,7 @@ export function ReviewQueue({ sourceId, rows, kind, table, activeKey, detailSync
           <input ref={allRef} type="checkbox" checked={all} onChange={toggleAll} disabled={!loaded.length}
                  aria-label={RT.selectAll} title={RT.selectAll} data-review-select-all="" />
           <span className="tnum min-w-0 flex-1 truncate" data-review-total="">
-            {selected.size ? RT.selected(selected.size) : items ? RT.total(total) : RT.loading}
+            {selected.size ? RT.selected(selected.size) : items ? RT.total(pending) : RT.loading}
           </span>
           {selected.size > 0 && (
             <button type="button" className="inline-flex items-center gap-0.5 rounded px-1 hover:bg-hover hover:text-fg"

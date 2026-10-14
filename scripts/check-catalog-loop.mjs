@@ -625,6 +625,9 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
       dedup: { value: 'y', source: 'llm', status: 'rejected' } }, 4, res.outcomes, res.versions)
     out.sync = { grain: synced.outcomes.get(rv.itemKey(items[0])), dedup: synced.outcomes.get(rv.itemKey(items[1]))?.status, v: synced.versions.get('t1') }
     out.pct = [rv.percentOf(120, 286), rv.percentOf(0, 0)]
+    // 列表头「N 项待确认」：这一页上审阅成功、不再是推断的项从总数里减掉；撤销审阅回到推断的、冲突的照算
+    out.pendingTotal = [rv.pendingTotal(57, items, new Map()), rv.pendingTotal(57, items, res.outcomes),
+      rv.pendingTotal(57, items, synced.outcomes), rv.pendingTotal(1, items, res.outcomes)]
     // 提案的改前：被驳回的原值也写出来（同导入预览「目标里这一项已经驳回」）
     const cp = await import('/src/run/catalogPatch.ts')
     out.before = [
@@ -696,6 +699,8 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
   check('表详情改过之后：回到推断的记成撤销审阅，驳回的记成已驳回，版本换成最新的', r.sync.grain?.action === 'reset' && r.sync.dedup === 'rejected' && r.sync.v === 4,
     JSON.stringify(r.sync))
   check('进度的百分比四舍五入，分母为 0 时不写', r.pct[0] === 42 && r.pct[1] === null, JSON.stringify(r.pct))
+  check('列表头的待确认项数：这一页上审阅成功的从总数里减掉，撤销审阅、冲突的照算，不会减成负数',
+    JSON.stringify(r.pendingTotal) === JSON.stringify([57, 55, 56, 0]), JSON.stringify(r.pendingTotal))
   check('提案的改前：被驳回的写「已驳回：原值」（值按界面上的说法），别的照原样，没有值写「未填写」',
     JSON.stringify(r.before) === JSON.stringify(['已驳回：元', '元', '未填写', '已驳回：明细表', '已驳回：1=有效']), JSON.stringify(r.before))
   check('队列一项的位置写到列：列 status 的码值、表的有效记录条件、指向 parks 的关联关系；列名里有句点、认不出的路径也说得通',
@@ -1253,6 +1258,11 @@ await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所�
   const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}?view=review`, { handlers: loopHandlers(state) })
   const queue = page.locator('[data-review-queue]')
   await until(async () => (await queue.locator('[data-review-item]').count()) === 50)
+  // 列表头的「N 项待确认」和视图标签上的计数（清单里各表的推断项）：成批审阅之后一起变
+  const headTotal = () => textOf(queue.locator('[data-review-total]'))
+  const tabCount = async () => Number((await textOf(page.locator('[data-catalog-view-tab="review"]'))).replace(/\D/g, ''))
+  const tab0 = await tabCount()
+  check('还没审阅：列表头写「57 项待确认」', (await headTotal()) === '57 项待确认' && tab0 > 0, `${await headTotal()} · 标签 ${tab0}`)
   const sel = (k) => queue.locator(`[data-review-item="${k}"] [data-review-select]`)
   await sel('visits::valid_filter').check()
   await sel('visits::dedup').check()
@@ -1280,6 +1290,9 @@ await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所�
   check('……汇总：已确认 2 项；1 项未生效（所在表刚被修改过），请刷新队列后再审阅', summary.includes('已确认 2 项') && summary.includes('1 项未生效（所在表刚被修改过）'), summary)
   check('……清单里那张表的计数跟着重取', await until(async () => count(sent, /^GET \/datasources\/check-loop-scenic\/catalog$/) >= 2))
   check('……审阅进度跟着重取', count(sent, /review-progress$/) >= 2)
+  check('……列表头跟着减：确认了的 2 项不再待确认、冲突的那项照算（57 → 55），和视图标签上的计数一起少 2',
+    await until(async () => (await headTotal()) === '55 项待确认') && await until(async () => (await tabCount()) === tab0 - 2),
+    `${await headTotal()} · 标签 ${tab0} → ${await tabCount()}`)
   // 撤销审阅：只发这一页上审阅成功的，带这张表写入后的版本
   await sel('visits::valid_filter').check()
   await sel('visits::dedup').check()
@@ -1290,6 +1303,8 @@ await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所�
     { table_name: 'visits', path: 'dedup', action: 'reset', if_version: 3 },
   ] }), JSON.stringify(undo))
   check('……回到推断，标「已撤销审阅」', await until(async () => (await textOf(queue.locator('[data-review-item="visits::dedup"] [data-review-outcome]'))).includes('已撤销审阅')))
+  check('……列表头加回去：又是「57 项待确认」，视图标签也回到原来的数', await until(async () => (await headTotal()) === '57 项待确认')
+        && await until(async () => (await tabCount()) === tab0), `${await headTotal()} · 标签 ${await tabCount()}`)
 
   // 打开所在表：右栏是这张表的详情，滚到那一项、标出来，并列出用过这张表的运行
   await queue.locator('[data-review-item="visits::dedup"] [data-review-open]').click()
@@ -1310,9 +1325,11 @@ await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所�
   await page.locator('[data-item-mark="dedup"]').first().click()
   await page.locator('[data-item-panel] [data-review-action="confirm"]').click()
   check('在详情里确认那一项：队列里跟着标「已确认」', await until(async () => (await textOf(queue.locator('[data-review-item="visits::dedup"] [data-review-outcome]'))).includes('已确认')))
+  check('……列表头跟着少一项：「56 项待确认」', await until(async () => (await headTotal()) === '56 项待确认'), await headTotal())
   // 刷新：审阅过的移除
   await queue.locator('[data-review-refresh]').click()
   check('刷新队列：已确认的那一项移除', await until(async () => (await queue.locator('[data-review-item="visits::dedup"]').count()) === 0))
+  check('……服务端的总数和刷新前列表头写的一样：「56 项待确认」', (await headTotal()) === '56 项待确认', await headTotal())
   await cleanCopy(page, '成批审阅')
   check('只发过成批审阅、单项审阅的写请求', writes(sent).every((s) => /\/review(\/batch)?$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
