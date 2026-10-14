@@ -85,7 +85,8 @@ async function open(state) {
     if (p === '/api/health') return route.continue()
     if (p === '/api/auth/me') {
       if (state.mode === 'off') return route.fulfill({ json: { mode: 'off', username: null, display_name: null, role: 'admin', groups: [], verified: false } })
-      if (!state.who) return route.fulfill({ status: 401, json: { detail: '请先登录', code: 'auth_required', mode: state.mode } })
+      // 会话过期时认人接口也回 401（同服务端）：不然登录页认得出人、又把人送回原处，来回跳
+      if (!state.who || state.expire) return route.fulfill({ status: 401, json: { detail: '请先登录', code: 'auth_required', mode: state.mode } })
       return route.fulfill({ json: { mode: state.mode, ...PEOPLE[state.who], verified: true, user_can_chat: !!state.chat } })
     }
     state.reads?.push(p)
@@ -170,7 +171,8 @@ await section('会话中途失效：401 整页跳登录', async () => {
   await page.goto(`${WEB}/apps?tab=apps`)
   await nav(page).waitFor({ timeout: 15000 })
   state.expire = true
-  await page.getByRole('tab', { name: '我发起的' }).click()
+  // 点一下触发一次取数；外壳的心跳可能先收到 401、整页已经跳走了，那时点不到也不要紧——要核对的是跳到了哪里
+  await page.getByRole('tab', { name: '我发起的' }).click({ timeout: 3000 }).catch(() => {})
   check('任何接口回 401 都跳 /login，带上原处', await page.waitForURL(/\/login\?next=/, { timeout: 15000 }).then(() => true, () => false), page.url())
 })
 
