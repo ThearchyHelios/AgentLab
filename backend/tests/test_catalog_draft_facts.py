@@ -3,6 +3,7 @@
 - 提示词写清两项只在表结构、注释、码值能看出来时才写；结构化输出、纯文本两条路都认这两项；
 - 有效行过滤按数据源的方言用 sqlglot 解析成一个条件：只能引用这张表的列，不能有子查询、聚合、窗口函数、分号，只允许
   比较、IN、BETWEEN、LIKE、IS NULL、AND / OR / NOT 和 UPPER / LOWER / TRIM / COALESCE，不超过 500 字。不过就丢掉；
+  存的是整理过的写法：原文照旧，列换成表结构里的真名、不带表名、按方言加引号（剖析核对的也是这一条）；
 - 开了数据剖析、能连上的源：经剖析的只读守卫数出排除比例，排除 0% 或 100% 的不收，收下的在 note 里写剖析核对的结果；
   没开剖析、连不上的照收，note 写没有核对的原因；
 - 开了剖析的源，目录里记下的码值交给模型做背景（遮罩的列不给；「已确认的目录项」里遮罩列的码值也不给）；
@@ -152,6 +153,54 @@ def test_the_condition_is_rendered_with_the_columns_quoted_like_the_source():
     assert parsed.problem is None
     rendered = sqlcheck.render_valid_filter(parsed, quoted=lambda name: name != name.lower())
     assert rendered == "`isTest` = 0 AND status <> 'C'"
+
+
+#: 带一列混合大小写列名的订单表（ORM 建的 PostgreSQL 库里常见）
+MIXED = {**META, "columns": [*META["columns"], _col("OrderStatus", "TEXT")]}
+
+
+@pytest.mark.parametrize("kind, condition, stored", [
+    # PostgreSQL 把没加引号的名字折成小写：混合大小写的列一律加引号，不论模型写的大小写对不对
+    ("postgresql", "orderstatus <> 'X' AND STATUS NOT IN ('C', 'X')",
+     "\"OrderStatus\" <> 'X' AND status NOT IN ('C', 'X')"),
+    ("postgresql", "OrderStatus <> 'X'", "\"OrderStatus\" <> 'X'"),
+    ("postgresql", "orders.\"OrderStatus\" IS NOT NULL", "\"OrderStatus\" IS NOT NULL"),
+    ("mysql", "orderstatus <> 'X'", "`OrderStatus` <> 'X'"),
+    ("oracle", "ORDERS.STATUS <> 'C'", "status <> 'C'"),
+    # 不用改的照原文：NOT IN、IS NOT NULL 这些写法不被改写
+    ("sqlite", "status NOT IN ('C', 'X') AND updated_at IS NOT NULL",
+     "status NOT IN ('C', 'X') AND updated_at IS NOT NULL"),
+])
+def test_the_stored_filter_names_its_columns_the_way_the_source_needs(kind, condition, stored):
+    """存进目录的有效记录条件：原文照旧，只把列换成表结构里的真名、不带表名，按数据源的需要加引号（和剖析核对查询的写法
+    一致）。以前存的是模型的原文：PostgreSQL 上 orderstatus 会被当成另一列，核对时却按真名加了引号，存下的和核对过的
+    不是同一条，SQL 检查还会让模型照抄这一句。"""
+    entry = {"table": "orders", "valid_filter": {"condition": condition, "reason": "注释写明"}}
+    notes = catalog._from_model(entry, MIXED, system=False, source_kind=kind, table="orders")
+    assert notes["valid_filter"]["value"] == stored
+    again = sqlcheck.parse_valid_filter(stored, MIXED, kind=kind, table="orders")
+    assert again.problem is None and sqlcheck.stored_valid_filter(again, kind) == stored, "存下的再整理一遍不变"
+
+
+def test_a_filter_that_grows_past_the_limit_once_quoted_is_dropped_not_written():
+    """整理时加了引号、超过 500 字的不收：目录里这一项最多 500 字，写进去会让整张表写入失败。"""
+    condition = "orderstatus IN (" + ", ".join(f"'{i:03d}'" for i in range(66)) + ") OR updated_at IS NULL"
+    assert len(condition) == 499
+    notes = catalog._from_model({"table": "orders", "label": "订单", "valid_filter": condition}, MIXED, system=False,
+                                source_kind="postgresql", table="orders")
+    assert "valid_filter" not in notes and notes["label"]["value"] == "订单"
+    assert not catalog.validate_notes(notes)
+
+
+def test_columns_that_differ_only_in_case_must_be_named_exactly():
+    """表结构里有只差大小写的两列：写得和其中一列一模一样的认那一列，否则说不清是哪一列，不收。"""
+    meta = {**META, "columns": [*META["columns"], _col("Status", "TEXT")]}
+    problem = sqlcheck.valid_filter_problem("STATUS = 'C'", meta, kind="postgresql", table="orders")
+    assert problem == ("有效记录条件里的列「STATUS」在表结构里有只差大小写的几列（status、Status），"
+                       "要照表结构的写法写清是哪一列")
+    for condition, stored in (("\"Status\" = 'C'", "\"Status\" = 'C'"), ("status = 'C'", "status = 'C'")):
+        parsed = sqlcheck.parse_valid_filter(condition, meta, kind="postgresql", table="orders")
+        assert parsed.problem is None and sqlcheck.stored_valid_filter(parsed, "postgresql") == stored
 
 
 # --------------------------------------------------------------------------
@@ -316,6 +365,25 @@ async def test_the_check_counts_excluded_rows_through_the_read_only_guard(scenic
     assert found.note == f"剖析核对：排除 {share} 的行（共 {total:,} 行）"
     assert len(seen) == 1 and seen[0][1] is True, "一条查询，过只读守卫"
     assert "COUNT(*)" in seen[0][0] and "status = 1" in seen[0][0]
+
+
+async def test_the_check_runs_the_condition_as_it_is_stored(scenic, monkeypatch):
+    """剖析核对的就是存进目录的那一条：表名去掉、列换成表结构里的真名，别的照原文（NOT IN 不被改写成 NOT x IN）。"""
+    seen: list[str] = []
+    real = catalog_profile.guard.check
+
+    def spy(sql, **kw):
+        seen.append(sql)
+        return real(sql, **kw)
+
+    monkeypatch.setattr(catalog_profile.guard, "check", spy)
+    source = await scenic()
+    reply = {"label": "入园记录", "valid_filter": {"condition": "VISITS.STATUS NOT IN (0)", "reason": "0 是作废的检票"}}
+    got = await D.run_model_draft(FakeModel({"visits": reply}), source, ["visits"])
+    vf = got["visits"].notes["valid_filter"]
+    assert vf["value"] == "status NOT IN (0)"
+    assert len(seen) == 1 and f"CASE WHEN {vf['value']} THEN 0 ELSE 1 END" in seen[0]
+    assert "剖析核对：排除" in vf["note"]
 
 
 @pytest.mark.parametrize("condition", ["status IN (0, 1)", "status = 7"])

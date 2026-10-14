@@ -1428,7 +1428,8 @@ async def check_valid_filter(source: Any, table: str, meta: dict[str, Any] | Non
     except ValueError as e:
         return _unchecked(str(e))
     cap = max(int(settings.sample_size), int(settings.max_scan_rows))
-    cond = sqlcheck.render_valid_filter(parsed, quoted=lambda name: dialect.quote(name) != name)
+    # 和存进目录的是同一条（catalog._model_facts 存的就是这个写法）：列换成真名、按方言加引号，别的照原文
+    cond = sqlcheck.canonical_valid_filter(parsed, quote=dialect.quote)
     cols = ", ".join(dialect.quote(c) for c in parsed.columns)
     inner = dialect.limit(f"SELECT {cols} FROM {dialect.table(meta, table)}", cap)
     sql = f"SELECT COUNT(*) AS n, SUM(CASE WHEN {cond} THEN 0 ELSE 1 END) AS x FROM ({inner}) s"

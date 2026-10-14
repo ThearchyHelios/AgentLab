@@ -1738,6 +1738,8 @@ def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
 
 #: 模型给的依据（有效行过滤、去重规则的 reason）写进这一项的 note
 FACT_REASON_NOTE = "依据：{reason}"
+#: 有效行过滤按数据源的写法整理（列名加了引号）以后超过目录里这一项的长度上限
+FACT_FILTER_TOO_LONG = "{label}按数据源的写法整理后超过 {limit} 字"
 
 
 def _model_fact(raw: Any, key: str) -> tuple[str, str | None] | None:
@@ -1765,17 +1767,24 @@ def _model_facts(entry: Mapping[str, Any], meta: Mapping[str, Any], *, kind: str
     """模型提议的有效行过滤、去重规则（llm / proposed，依据写进 note）。
 
     有效行过滤按数据源的方言解析成一个条件、只能用这张表的列（sqlcheck.parse_valid_filter），不过就丢掉、日志记一条，
-    不算这张表失败；存的是模型写的原文（只去掉首尾空白，字符串里的空格不动）。去重规则是一句话，同文字项的规矩。"""
+    不算这张表失败。存的是 sqlcheck.stored_valid_filter 整理过的写法：原文照旧，只把列换成表结构里的真名、不带
+    表名，按数据源的需要加引号——剖析核对的、SQL 检查让模型照着加的都是这一条。去重规则是一句话，同文字项的规矩。"""
     from app.data import sqlcheck
 
     out: dict[str, Any] = {}
     found = _model_fact(entry.get("valid_filter"), "condition")
     if found is not None:
         text, reason = found
-        problem = sqlcheck.valid_filter_problem(text, meta, kind=kind, table=table)
+        parsed = sqlcheck.parse_valid_filter(text, meta, kind=kind, table=table)
+        problem = parsed.problem
         if problem is None:
-            out["valid_filter"] = _fact_item(text, reason)
-        else:
+            stored = sqlcheck.stored_valid_filter(parsed, kind)
+            if _text_ok(stored):
+                out["valid_filter"] = _fact_item(stored, reason)
+            else:
+                # 加了引号以后超过上限：写进去会让整张表写入失败（validate_notes），不收
+                problem = FACT_FILTER_TOO_LONG.format(label=TABLE_FIELD_LABEL["valid_filter"], limit=_TEXT_MAX)
+        if problem is not None:
             import logging
 
             logging.getLogger(__name__).info("起草数据目录：表 %s 的有效行过滤没有通过校验，已丢掉：%s（%s）",
