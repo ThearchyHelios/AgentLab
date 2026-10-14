@@ -524,6 +524,19 @@ async def test_errors_end_the_stream_without_done(client, tmp_path, monkeypatch)
     assert "上限" in events[-1]["message"]
 
 
+async def test_a_model_without_tools_reports_an_error_event(client, tmp_path, monkeypatch):
+    sid = await _source(client, tmp_path)
+
+    class NoTools(Scripted):
+        def bind_tools(self, tools, **_):
+            raise NotImplementedError("这个模型不支持工具调用")
+
+    use(monkeypatch, NoTools([]))
+    events, _ = await _talk(client, sid, _ask("你好"))
+    assert events == [{"type": "error", "code": "assistant_failed", "message": events[0]["message"]}]
+    assert "工具调用" in events[0]["message"]
+
+
 async def test_transient_errors_are_retried_before_any_output(client, tmp_path, monkeypatch):
     sid = await _source(client, tmp_path)
     monkeypatch.setattr(catalog_assistant, "RETRY_DELAYS_S", (0.0, 0.0))

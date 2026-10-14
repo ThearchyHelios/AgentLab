@@ -813,11 +813,12 @@ async def stream(model: Any, model_id: str, ctx: AssistantContext,
 
     history: list[Any] = [SystemMessage(content=ctx.system), *_history(messages)]
     tools = _Tools(ctx)
-    runner = model.bind_tools(ctx.tools())
     usage = {"input_tokens": 0, "output_tokens": 0}
     wrote = ""
     names = [t["function"]["name"] for t in ctx.tools()]
     try:
+        # 绑工具也放在这里面：响应头已经发出去了，出了错要照实交一条错误事件，不能让流半路断掉
+        runner = model.bind_tools(ctx.tools())
         for round_no in range(MAX_ROUNDS):
             fresh = True
             message: Any = None
