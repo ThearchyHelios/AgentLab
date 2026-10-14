@@ -8,7 +8,7 @@ import { Modal, Notice, Spinner } from '../../components/ui'
 import { errorMessage } from '../../lib/errors'
 import { formatDateTime, formatNumber } from '../../lib/format'
 import { CATALOG_TRANSFER_TEXT as T } from '../../lib/terms'
-import { patchValueText } from '../../run/catalogPatch'
+import { patchTarget, patchValueText, patchWhere } from '../../run/catalogPatch'
 
 // ===========================================================================
 // 导入数据目录（数据目录页的「导入目录」）：选文件 → 预览（只读：对上了哪些表，各有几项新增、更新、保留、冲突、跳过，
@@ -29,6 +29,12 @@ interface Chosen {
 }
 
 const COUNT_KEYS = ['add', 'update', 'keep', 'conflicts', 'skipped'] as const
+
+/** 跳过的那一项写成界面上的说法（「列 gate_code 的中文名」）；关联关系只有编号，照原样写 */
+const pathText = (path: string) => {
+  const t = patchTarget(path)
+  return t && t.kind !== 'relation' ? patchWhere({ path, before: null, after: null }) : path
+}
 
 export function ImportDialog({ sourceId, onClose, onImported }: {
   sourceId: string
@@ -245,7 +251,7 @@ function ReportView({ report, done = false }: { report: CatalogImportReport; don
           <ul className="divide-y divide-[var(--hairline)] rounded-md border">
             {skipped.map(({ t, s }) => (
               <li key={`${t.table_name}:${s.path}`} className="px-2.5 py-1.5 text-2xs leading-relaxed text-dim" data-import-skipped={`${t.table_name}:${s.path}`}>
-                <span className="mono text-faint">{t.table_name} · {s.path}</span>：{s.why}
+                <span className="text-faint"><span className="mono">{t.table_name}</span> · {pathText(s.path)}</span>：{s.why}
               </li>
             ))}
           </ul>

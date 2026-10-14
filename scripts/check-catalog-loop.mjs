@@ -941,7 +941,7 @@ await section('审阅队列 · 视图、顺序与原因、筛选、进度', asyn
   check('表清单的概览里也有「打开审阅队列」', queueText === '打开审阅队列' && await until(async () => new URL(page.url()).searchParams.get('view') === 'review'
         && (await page.locator('[data-catalog-view-tab="review"]').getAttribute('aria-selected')) === 'true'), `${queueText} · ${page.url()}`)
   await page.locator('[data-catalog-view-tab="review"]').press('ArrowLeft')
-  check('视图标签可以用方向键切换', await until(async () => !new URL(page.url()).searchParams.get('view'))
+  check('视图标签可以用方向键切换', await until(async () => !new URL(page.url()).searchParams.get('view') && page.locator('[data-catalog-list]').isVisible())
         && await page.evaluate(() => document.activeElement?.getAttribute('data-catalog-view-tab') === 'list'))
   await shot(page, 'catalog-review')
   await cleanCopy(page, '审阅队列')
@@ -1072,7 +1072,7 @@ await section('导出导入 · 导出文件、导入先预览再写入', async (
   const conflict = await textOf(dlg.locator('[data-import-conflict]'))
   check('……冲突逐条列出：位置、文件中的值、这里的值、原因', conflict.includes('表的中文名') && conflict.includes('入园流水') && conflict.includes('入园记录')
         && conflict.includes('这里已确认，以这里为准'), conflict)
-  check('……跳过的写原因，对不上的表列出来', (await textOf(dlg.locator('[data-import-skipped]'))).includes('表结构里没有列 gate_code')
+  check('……跳过的写界面上的说法和原因，对不上的表列出来', (await textOf(dlg.locator('[data-import-skipped]'))).includes('列 gate_code 的中文名：表结构里没有列 gate_code')
         && (await textOf(dlg.locator('[data-import-unmatched]'))).includes('legacy_tickets'))
   check('……起草要求：这里已有，保留不覆盖', (await textOf(dlg.locator('[data-import-guidance-action]'))).includes('保留这个数据源现有的'))
   check('……预览不写库', count(sent, /catalog\/import$/) === 0)
