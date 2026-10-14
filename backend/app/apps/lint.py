@@ -25,6 +25,8 @@ RUN_FIELDS = ("status", "tier", "finished_at")
 USER_FIELDS = ("username", "display_name")
 
 _DIGIT = re.compile(r"\d")
+#: 文字里的一个数：千分位的逗号算在数里（「5,000」就是 5000）
+_NUMBER = re.compile(r"\d[\d,，]*(?:\.\d+)?")
 _REPORT_TEXT = re.compile(r"^\s*\{\{\s*nodes\.([A-Za-z0-9_-]+)\.text\s*\}\}\s*$")
 _PLACEHOLDER = re.compile(r"\{([A-Za-z0-9_㐀-鿿]+)\}")
 
@@ -245,6 +247,7 @@ def _lint_components(spec: dict[str, Any], pins: dict[str, Any], views: dict[str
 
     from app.apps.catalog import BY_NAME
 
+    constants = _graph_numbers(pins)
     for comp, _, at in components(spec):
         ctype = comp.get("type")
         entry = BY_NAME.get(str(ctype))
@@ -257,20 +260,59 @@ def _lint_components(spec: dict[str, Any], pins: dict[str, Any], views: dict[str
                       f"{at}.props{('.' + where) if where else ''}")
         if comp.get("children") and not entry["children"]:
             out.error("app.props_invalid", f"组件「{comp.get('id')}」（{entry['label']}）不能放子组件", f"{at}.children")
-        _lint_text(comp, entry, at, level, out)
+        _lint_text(comp, entry, at, level, out, constants)
         _lint_bind(spec, comp, entry, pins, views, at, out)
         _lint_visible(comp, views, at, out)
         _lint_refs(spec, comp, at, out)
 
 
-def _lint_text(comp: dict[str, Any], entry: dict[str, Any], at: str, level: str, out: _Issues) -> None:
-    """静态文字里有数字：叙述层无算术、数字只来自证据。受管级报错，已发布级警告。"""
+def _numbers(text: str) -> list[str]:
+    return [m.replace(",", "").replace("，", "").rstrip(".") for m in _NUMBER.findall(text)]
+
+
+def _graph_numbers(pins: dict[str, Any]) -> set[str]:
+    """固定的版本里节点配置写着的数：条件里的金额线、时限、会签人数、表单的上下限这些流程规则。只看 config，不看标题。"""
+    found: set[str] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)):
+            found.update(_numbers(f"{value:g}" if isinstance(value, float) else str(value)))
+        elif isinstance(value, str):
+            found.update(_numbers(value))
+        elif isinstance(value, dict):
+            for v in value.values():
+                walk(v)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v)
+
+    for state in pins.values():
+        if getattr(state, "row", None) is None:
+            continue
+        for node in node_map(state.graph).values():
+            walk(node.get("config"))
+    return found
+
+
+def _lint_text(comp: dict[str, Any], entry: dict[str, Any], at: str, level: str, out: _Issues,
+               constants: set[str]) -> None:
+    """静态文字里有数字：叙述层无算术、数字只来自证据。受管级报错，已发布级警告。
+
+    数据要绑定指标或单元格；流程规则（审批的金额线、时限、会签人数）的出处是固定版本里的节点配置——文字里的每个数都在
+    那里写着才算有出处。规则只写在说明里、流程并不照着执行的，照样报：那句话是假的。"""
     props = comp.get("props") or {}
     text = props.get("markdown") if comp.get("type") == "text" else props.get("text") if comp.get("type") == "notice" else None
-    if isinstance(text, str) and _DIGIT.search(text):
-        add = out.error if level == "governed" else out.warning
-        add("app.text_number", f"组件「{comp.get('id')}」（{entry['label']}）的静态文字里写了数字：数字没有出处，"
-            "请改为绑定指标或单元格", f"{at}.props")
+    if not isinstance(text, str) or not _DIGIT.search(text):
+        return
+    loose = [n for n in dict.fromkeys(_numbers(text)) if n not in constants]
+    if not loose:
+        return
+    add = out.error if level == "governed" else out.warning
+    add("app.text_number", f"组件「{comp.get('id')}」（{entry['label']}）的静态文字里写了数字「{'、'.join(loose[:5])}」，"
+        "没有出处：数据请改为绑定指标或单元格；流程规则（如审批的金额线、时限）要先写进工作流，文字里的数和工作流里的一致"
+        "才算有出处", f"{at}.props")
 
 
 def _lint_bind(spec: dict[str, Any], comp: dict[str, Any], entry: dict[str, Any], pins: dict[str, Any],

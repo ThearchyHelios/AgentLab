@@ -374,3 +374,19 @@ class _Grant:
 ])
 def test_app_roles(principal, grants, want):
     assert role_of(principal, _App(), grants) == want
+
+
+async def test_text_numbers_from_the_pinned_process_have_a_source():
+    """流程规则的数（金额线、时限）出处是固定版本里的节点配置：对得上就不报；流程里没有的规则写在说明里照样报——那句话是假的。"""
+    graph = approval()
+    graph["nodes"][1]["data"]["config"].update(due="PT48H", condition="input.amount > 5000")
+    wf, info = await make_workflow(graph)
+    text = lambda md: base_spec(wf, info, pages=[{"id": "home", "title": "首页", "body": [  # noqa: E731
+        {"id": "t", "type": "text", "props": {"markdown": md}}]}])
+    async with SessionLocal() as session:
+        ok = await lint_app(session, text("金额超过 5,000 元由财务审批，48 小时内处理"), {})
+        bad = await lint_app(session, text("金额超过 8000 元需要总监会签，48 小时内处理"), {})
+    assert "app.text_number" not in codes(ok)
+    issue = next(i for i in bad if i["code"] == "app.text_number")
+    # 只列对不上的那个数，48 小时在节点配置里写着
+    assert issue["level"] == "error" and "「8000」" in issue["message"] and "48" not in issue["message"]
