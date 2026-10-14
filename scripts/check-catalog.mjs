@@ -511,10 +511,11 @@ function finishJob(job, status) {
 function stopJob(job, status = 'cancelled', error = null) {
   for (const t of job.tasks) {
     if (t.status !== 'pending' && t.status !== 'running') continue
-    // 写过段的表照旧记已停止，原因写一句已写进目录几段、剩下几段没起草（服务端停止时的说法）
+    // 写过段的表照旧记已停止，原因写一句已写进目录几段、剩下几段没起草（服务端停止、中断时的说法：catalog_jobs 的
+    // STOPPED_WRITTEN、INTERRUPTED_WRITTEN）
     const written = t.parts_written ?? 0
     const modelError = written > 0 && t.parts_total
-      ? `已停止：已写进目录 ${written} 段，剩下 ${t.parts_total - written} 段没起草` : t.model_error
+      ? `${status === 'interrupted' ? '已中断' : '已停止'}：已写进目录 ${written} 段，剩下 ${t.parts_total - written} 段没起草` : t.model_error
     Object.assign(t, { status: 'cancelled', error, model_error: modelError, finished_at: isoNow() })
   }
   if (error) job.error = error
@@ -1214,8 +1215,10 @@ await section('数据目录 · 起草：已有任务（409）、服务重启中�
   check('上一次起草因服务重启中断：设置阶段写明，给「查看」', await until(async () => (await draftText(page, '[data-draft-last]')).includes('服务重启')),
     await draftText(page, '[data-draft-last]'))
   await draftBox(page).locator('[data-draft-last-open]').click()
-  check('……点开：结果写明服务重启中断，可以接着重试', await until(async () => (await draftPhase(page)) === 'done')
-        && (await draftText(page, '[data-draft-title]')) === '服务重启，起草中断' && (await draftText(page, '[data-draft-interrupted]')).includes('重试'),
+  // 重试不是续跑：服务端把这些表整张重新分段起草（不跳过已写进目录的段），不能说成「接着起草」剩下的部分
+  check('……点开：结果写明服务重启中断，可以只重试这些表、会重新起草整张表（不说接着起草）', await until(async () => (await draftPhase(page)) === 'done')
+        && (await draftText(page, '[data-draft-title]')) === '服务重启，起草中断' && (await draftText(page, '[data-draft-interrupted]')).includes('会重新起草整张表')
+        && (await draftText(page, '[data-draft-interrupted]')).includes('已写进目录的内容不会丢') && !(await draftText(page, '[data-draft-interrupted]')).includes('接着起草'),
     `${await draftText(page, '[data-draft-title]')} · ${await draftText(page, '[data-draft-interrupted]')}`)
   // 服务端把任务和没写完的表都记「服务重启，起草中断」：标题、提示已经写了，逐表只写「已停止」，不再各写一遍
   check('……没写的 2 张记「已停止」，原因不再逐张重复', (await draftText(page, '[data-draft-task="orders"] [data-draft-task-status]')) === '已停止'
@@ -1599,8 +1602,10 @@ await section('数据目录 · 起草：逐段写进目录、块进度与停止�
     `${await text('store_sales', '[data-draft-task-status]')} · ${await text('store_sales', '[data-draft-task-reason]')}`)
   check('……服务端的原因已经写了，界面不再重复一行「已写进目录」', await task('store_sales').locator('[data-draft-task-written]').count() === 0)
   const cancelled = await draftText(page, '[data-draft-cancelled]')
-  check('……汇总写明已写进的段保留：其中 1 张表已写进目录 2 段，只重试这些表时接着起草', cancelled.includes('每写完一段就写进目录')
-        && cancelled.includes('其中 1 张表已写进目录 2 段') && cancelled.includes('接着起草'), cancelled)
+  // 重试会把这张宽表整张重新起草（服务端不跳过已写进目录的段），不能说成「接着起草剩下的段」
+  check('……汇总写明已写进的段保留：其中 1 张表已写进目录 2 段，只重试这些表时会重新起草整张表', cancelled.includes('每写完一段就写进目录')
+        && cancelled.includes('其中 1 张表已写进目录 2 段') && cancelled.includes('只重试这些表时会重新起草整张表，已写进的不会丢')
+        && !cancelled.includes('接着起草'), cancelled)
   check('……可以只重试这 2 张', (await page.locator('[data-draft-retry]').innerText().catch(() => '')).includes('（2 张）'))
   await page.locator('[data-draft-close]').click()
 
@@ -1618,6 +1623,23 @@ await section('数据目录 · 起草：逐段写进目录、块进度与停止�
     await text('store_sales', '[data-draft-task-written]'))
   check('……部分完成的表写「已写进目录 1 段」，原因照旧', (await text('members', '[data-draft-task-written]')) === '已写进目录 1 段'
         && (await text('members', '[data-draft-task-reason]')).includes(CALL_ERR), await text('members', '[data-draft-task-written]'))
+  await page.locator('[data-draft-close]').click()
+  state.jobs.pop()
+
+  // 服务重启中断：写过段的宽表原因写「已中断：已写进目录 1 段，剩下 2 段没起草」（服务端中断时的说法），界面不再补一行；
+  // 提示写明重试会重新起草整张表，不说接着起草
+  const crashed = newJob(state, S1, { tables: ['store_sales'], use_model: true })
+  settle(state, crashed, 'store_sales', { status: 'running', parts_done: 1, parts_written: 1 })
+  stopJob(crashed, 'interrupted', '服务重启，起草中断')
+  await page.locator('[data-catalog-draft]').first().click()
+  await draftBox(page).waitFor()
+  await until(async () => (await draftBox(page).locator('[data-draft-last-open]').count()) === 1)
+  await draftBox(page).locator('[data-draft-last-open]').click()
+  check('服务重启中断：宽表的原因写「已中断：已写进目录 1 段，剩下 2 段没起草」，不再补一行「已写进目录」',
+    await until(async () => (await text('store_sales', '[data-draft-task-reason]')) === '已中断：已写进目录 1 段，剩下 2 段没起草')
+        && await task('store_sales').locator('[data-draft-task-written]').count() === 0, await text('store_sales', '[data-draft-task-reason]'))
+  check('……提示写明只重试这些表会重新起草整张表，已写进目录的内容不会丢', (await draftText(page, '[data-draft-interrupted]')).includes('会重新起草整张表，已写进目录的内容不会丢'),
+    await draftText(page, '[data-draft-interrupted]'))
   await page.locator('[data-draft-close]').click()
   state.jobs.pop()
 
