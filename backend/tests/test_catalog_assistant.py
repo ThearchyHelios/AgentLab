@@ -101,7 +101,7 @@ def _shop_db(path) -> str:
     conn.executescript("""
         CREATE TABLE members (id INTEGER PRIMARY KEY, nick TEXT);
         CREATE TABLE orders (id INTEGER PRIMARY KEY, order_no TEXT NOT NULL, status INTEGER NOT NULL,
-                             amount REAL, contact_phone TEXT, created_at TEXT,
+                             amount REAL, buyer_phone TEXT, created_at TEXT,
                              member_id INTEGER REFERENCES members(id));
     """)
     conn.executemany("INSERT INTO members VALUES (?, ?)", [(i, f"会员{i}") for i in range(1, 6)])
@@ -119,7 +119,7 @@ ORDERS_NOTES = {
     "kind": make_item("fact", "llm", "rejected"),
     "columns": {
         "status": {"codes": make_item({"1": "已支付"}, "profile", note="数据剖析：全表 30 行，2 个取值")},
-        "contact_phone": {"label": make_item("联系电话", "llm"),
+        "buyer_phone": {"label": make_item("联系电话", "llm"),
                           "codes": make_item({PHONES[0]: "测试号"}, "human", "confirmed")},
     },
 }
@@ -142,7 +142,7 @@ async def client():
 
 async def _source(client, tmp_path, *, profile: bool = True, guidance: str | None = "金额一律按元",
                   notes: dict | None = None) -> str:
-    options: dict[str, Any] = {"mask_columns": "contact_phone"}
+    options: dict[str, Any] = {"mask_columns": "buyer_phone"}
     if profile:
         options["catalog_profile"] = {"enabled": True}
     if guidance:
@@ -346,7 +346,7 @@ async def test_background_has_structure_catalog_and_hides_masked_values(client, 
     # 界面上还没保存的修改
     assert "columns.amount.unit" in system and "用户说：金额是元" in system
     # 遮罩列只给列名：码值、取值一个都不给
-    assert "contact_phone" in system
+    assert "buyer_phone" in system
     assert not any(p in system for p in PHONES) and "测试号" not in system
     # 没开剖析的源才写不能查数据；这里开了，给了查询工具
     assert model.tool_names() == ["run_query", "propose_changes"]
@@ -422,7 +422,7 @@ async def test_proposals_are_checked_and_never_written(client, tmp_path, monkeyp
         {"path": "valid_filter", "value": "status <> 9", "reason": "用户说：统计时排除作废"},
         {"path": "columns.amount.meaning", "value": "实收=单价*数量", "reason": "x"},          # 公式：不收
         {"path": "columns.ghost.label", "value": "幽灵", "reason": "x"},                      # 列不存在：不收
-        {"path": "columns.contact_phone.codes", "value": {PHONES[1]: "客服"}, "reason": "x"},  # 遮罩列：不给码值
+        {"path": "columns.buyer_phone.codes", "value": {PHONES[1]: "客服"}, "reason": "x"},  # 遮罩列：不给码值
         {"path": "grain", "value": "每笔订单一行", "reason": "x"},                             # 已经是这个值：不用提
     ]
     model = Scripted([Turn(text=["好的，"], calls=[("propose_changes", {"changes": changes})]),
@@ -562,7 +562,7 @@ async def test_queries_are_read_only_masked_and_capped(client, tmp_path, monkeyp
     sid = await _source(client, tmp_path)
     queries = [
         ("run_query", {"sql": "SELECT status, COUNT(*) AS n FROM orders GROUP BY status ORDER BY status"}),
-        ("run_query", {"sql": "SELECT id, contact_phone AS phone, amount FROM orders ORDER BY id"}),
+        ("run_query", {"sql": "SELECT id, buyer_phone AS phone, amount FROM orders ORDER BY id"}),
         ("run_query", {"sql": "DELETE FROM orders"}),
     ]
     model = Scripted([Turn(text=["我查一下。"], calls=queries),

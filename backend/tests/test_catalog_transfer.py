@@ -49,7 +49,7 @@ def _tables(*, upper: bool = False) -> dict:
         n("orders"): {"qualified": n("orders"), "primary_key": [n("id")], "comment": None, "is_view": False,
                       "foreign_keys": [], "unique": [],
                       "columns": [_col(n("id")), _col(n("status")), _col(n("amount"), "REAL"), _col(n("member_id")),
-                                  _col(n("contact_phone"), "TEXT")]},
+                                  _col(n("buyer_phone"), "TEXT")]},
         n("members"): {"qualified": n("members"), "primary_key": [n("id")], "comment": None, "is_view": False,
                        "foreign_keys": [], "unique": [], "columns": members_cols},
         n("refunds"): {"qualified": n("refunds"), "primary_key": [n("id")], "comment": None, "is_view": False,
@@ -75,7 +75,7 @@ SOURCE_ORDERS = {
         "status": {"codes": make_item({"1": "已支付", "9": "作废"}, "human", "confirmed", complete=True),
                    "label": make_item("状态", "llm")},
         "amount": {"unit": make_item("元", "human", "confirmed"), "measure": make_item("flow", "llm")},
-        "contact_phone": {"codes": make_item({"13900000001": "测试号"}, "human", "confirmed"),
+        "buyer_phone": {"codes": make_item({"13900000001": "测试号"}, "human", "confirmed"),
                           "label": make_item("联系电话", "human", "confirmed")},
         # 目标表结构里没有这一列
         "gift_flag": {"label": make_item("赠品标记", "human", "confirmed")},
@@ -139,7 +139,7 @@ async def _pair() -> tuple[str, str]:
                           {"orders": SOURCE_ORDERS, "members": SOURCE_MEMBERS, "ghost_table": SOURCE_GHOST},
                           options={CATALOG_DRAFT_GUIDANCE_OPTION: "金额一律按元"})
     remote = await _source(f"deploy_{uuid.uuid4().hex[:6]}", _tables(upper=True), {"ORDERS": TARGET_ORDERS},
-                           options={"mask_columns": "contact_phone"})
+                           options={"mask_columns": "buyer_phone"})
     return local, remote
 
 
@@ -212,7 +212,7 @@ async def test_preview_reports_and_writes_nothing(client):
     assert "保留" in label["why"]
     skipped = {s["path"]: s["why"] for s in orders["skipped"]}
     assert "columns.gift_flag.label" in skipped and "表结构里没有列 gift_flag" in skipped["columns.gift_flag.label"]
-    assert "遮罩" in skipped["columns.contact_phone.codes"]
+    assert "遮罩" in skipped["columns.buyer_phone.codes"]
     stores = next(p for p in skipped if p.startswith("relations."))
     assert "stores" in skipped[stores]
     # 新增：dedup（驳回的照带）、status 码值、amount 两项、联系电话的中文名、关联关系；更新：有效记录条件
@@ -257,7 +257,7 @@ async def test_import_writes_by_the_rules_and_reports_versions(client):
     assert notes["columns"]["STATUS"]["label"]["value"] == "状态码"
     assert notes["columns"]["AMOUNT"]["measure"] == SOURCE_ORDERS["columns"]["amount"]["measure"]
     # 遮罩列：中文名照带，码值不导入
-    assert notes["columns"]["CONTACT_PHONE"] == {"label": SOURCE_ORDERS["columns"]["contact_phone"]["label"]}
+    assert notes["columns"]["BUYER_PHONE"] == {"label": SOURCE_ORDERS["columns"]["buyer_phone"]["label"]}
     assert "GIFT_FLAG" not in notes["columns"] and "gift_flag" not in notes["columns"]
     [rel] = notes["relations"]
     assert rel["id"] == catalog.relation_id("ORDERS", ["MEMBER_ID"], "MEMBERS", ["ID"])
@@ -380,7 +380,7 @@ async def test_valid_filter_columns_must_be_in_the_target_table(client):
     assert why and "子查询" in why
     why, _ = await outcome("status <> 9; DELETE FROM orders")
     assert why and "条件" in why
-    for fine in ("orders.status <> 9", "ORDERS.STATUS <> 9 AND ABS(amount) > 0", "contact_phone IS NOT NULL"):
+    for fine in ("orders.status <> 9", "ORDERS.STATUS <> 9 AND ABS(amount) > 0", "buyer_phone IS NOT NULL"):
         why, update = await outcome(fine)
         assert why is None and update == 1, fine
 
