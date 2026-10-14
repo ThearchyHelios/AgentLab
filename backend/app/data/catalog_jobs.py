@@ -693,8 +693,11 @@ class _JobRun:
         if result.version:
             values["version"] = result.version
         if outcome is not None:
-            values.update(parts_done=outcome.parts_done, parts_written=outcome.parts_written,
-                          chunks_total=outcome.chunks_total, chunks_done=outcome.chunks_done)
+            values.update(parts_done=outcome.parts_done, chunks_total=outcome.chunks_total,
+                          chunks_done=outcome.chunks_done)
+            if not result.error:
+                # 收尾写进去了：写出内容的段都在目录里了。没写进去（一直撞上别人刚改过）的照库里逐段写进去的段数
+                values["parts_written"] = outcome.parts_written
         await session.execute(self._task(CatalogDraftTask.table_name == table, CatalogDraftTask.status.in_(_OPEN))
                               .values(**values))
         await session.commit()

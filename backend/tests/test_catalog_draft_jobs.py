@@ -1012,3 +1012,26 @@ async def test_a_sync_draft_and_draft_jobs_exclude_each_other(client, monkeypatc
     after = await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["gates"]})
     assert after.status_code == 202, after.text
     await finished(after.json()["job"]["id"])
+
+
+async def test_a_wide_table_whose_closing_write_fails_keeps_the_count_of_parts_on_disk(client, monkeypatch):
+    """整张表收尾那一次写不进去（一直撞上别人刚改过）：已经逐段写进去的段留着，写进目录的段数照库里的记，不按引擎写出来
+    的段数虚报。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)          # 一段一段来：最后一段只在收尾那次写
+    sid = await _source(_wide())
+    use(monkeypatch, FakeModel(_wide_reply()))
+    real = catalog.write_draft
+
+    async def conflicted(session, source, table, modeled=None, *, at, actor):
+        result = await real(session, source, table, None, at=at, actor=actor)
+        result.error, result.status = catalog.WRITE_CONFLICT_ERROR, "failed"
+        result.added = result.updated = result.removed = 0
+        return result
+
+    monkeypatch.setattr(catalog, "write_draft", conflicted)
+    job = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["wide"], "use_model": True})).json()["job"]
+    await finished(job["id"])
+    task = await _task(client, sid, job["id"], "wide")
+    assert task["status"] == "failed" and task["error"] == catalog.WRITE_CONFLICT_ERROR
+    assert task["parts_written"] == 3, "最后一段没写进去"
+    assert len((await client.get(f"{_base(sid)}/wide")).json()["notes"]["columns"]) == 64
