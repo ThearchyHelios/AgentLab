@@ -228,6 +228,69 @@ async def test_unavailable_draft_model_is_409_with_the_draft_wording(client, tmp
     assert r.json()["code"] == "catalog_draft_model_unavailable" and "模型接入" in r.json()["detail"]
 
 
+@pytest.fixture
+async def mem(monkeypatch):
+    """单独的内存库：接入和设置只在这个用例里。"""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app.db.base import Base
+
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)()
+    yield session
+    await session.close()
+    await engine.dispose()
+
+
+async def _provider(session, kind: str) -> None:
+    from app.core.crypto import encrypt
+    from app.data import draft_model
+    from app.db.models import Provider, Setting
+
+    session.add(Provider(name="起草网关", kind=kind, base_url="http://gw.example.test/v1" if kind != "anthropic" else None,
+                         api_key=encrypt("sk-test"), models=[{"id": "模型甲"}], default_model="模型甲", enabled=True,
+                         extra={}))
+    session.add(Setting(key=draft_model.CATALOG_DRAFT_SETTING_KEY, value={"provider": "起草网关", "model": None}))
+    await session.commit()
+
+
+async def test_model_follows_the_draft_setting_keeps_thinking_and_a_big_budget(mem, monkeypatch):
+    from app.providers import factory
+
+    await _provider(mem, "openai_compatible")
+    specs: list[Any] = []
+    real = factory.build_chat_model
+
+    def spy(provider, spec):
+        specs.append(spec)
+        return real(provider, spec)
+
+    monkeypatch.setattr(factory, "build_chat_model", spy)
+    model, model_id = await catalog_assistant.resolve_model(mem)
+    assert model_id == "模型甲" and model.max_tokens == catalog.MODEL_MAX_TOKENS == 32768
+    mine = specs[-2:]                      # 前两份是 catalog.resolve_draft_model 查能不能用时建的
+    assert [s.max_tokens for s in mine] == [catalog.MODEL_MAX_TOKENS, catalog.MODEL_FALLBACK_MAX_TOKENS]
+    assert all(s.thinking is None and s.temperature == 0 and s.max_retries == 0 for s in mine)
+    assert all(s.timeout == catalog.MODEL_TIMEOUT_S for s in mine)
+
+
+@pytest.mark.parametrize("kind", ["openai_compatible", "anthropic"])
+async def test_tools_bind_on_real_chat_models(mem, kind):
+    """两个工具的定义各家的模型都收（只绑定，不发请求）。"""
+    await _provider(mem, kind)
+    model, _ = await catalog_assistant.resolve_model(mem)
+    tools = [catalog_assistant.QUERY_TOOL_PROMPT, catalog_assistant.PROPOSE_TOOL_PROMPT]
+    bound = model.bind_tools(tools)
+    given = bound.model.kwargs["tools"]
+    names = [t.get("name") or t["function"]["name"] for t in given]
+    assert names == ["run_query", "propose_changes"]
+
+
 # --------------------------------------------------------------------------
 # 背景
 # --------------------------------------------------------------------------

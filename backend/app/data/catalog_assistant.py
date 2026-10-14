@@ -75,8 +75,8 @@ QUERY_ROWS = 50
 SHOWN_ROWS = 10
 CELL_MAX = 300
 TOOL_CHARS = 12_000
-#: 网络错误、429、5xx 重试前等几秒（依次取用，个数就是最多重试几次）
-RETRY_DELAYS_S = (2.0, 5.0)
+#: 网络错误、429、5xx 重试前等几秒（依次取用，个数就是最多重试几次）。在对话里等，比起草（10、30 秒）短
+RETRY_DELAYS_S = (3.0, 10.0)
 #: 等模型的时候每隔几秒发一行 SSE 注释
 HEARTBEAT_S = 10.0
 #: 背景里「目录里还没有中文名和含义的列」最多列几个；别的表指过来的关联关系最多列几条
@@ -257,8 +257,9 @@ async def resolve_model(session: AsyncSession) -> tuple[Any, str]:
         provider, choice = await resolve_draft_provider(session, none_reason=ERROR_NO_MODEL, mock_reason=ERROR_NO_MODEL)
     except DraftModelUnavailable as e:
         raise catalog.CatalogModelUnavailable(str(e)) from e
+    # SDK 自己不重试（同起草）：网络错误、429、5xx 由这里在还没输出时重试，两层叠起来实际次数就对不上了
     spec = ModelSpec(provider=choice.provider, model=choice.model, max_tokens=catalog.MODEL_MAX_TOKENS, temperature=0,
-                     timeout=int(catalog.MODEL_TIMEOUT_S))
+                     timeout=int(catalog.MODEL_TIMEOUT_S), max_retries=0)
     try:
         big = build_chat_model(provider, spec)
         small = build_chat_model(provider, spec.model_copy(update={"max_tokens": catalog.MODEL_FALLBACK_MAX_TOKENS}))
