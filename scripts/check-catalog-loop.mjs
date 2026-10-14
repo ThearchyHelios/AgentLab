@@ -411,33 +411,40 @@ const tableVersion = (state, src, name) => state.tables[src].find((t) => t.name 
 // ---------------------------------------------------------------------------
 // 审阅队列的夹具：服务端排好的顺序（常用表里影响数字的推断在前）。kind 只是假服务端按筛选挑项用，不回给页面
 // ---------------------------------------------------------------------------
+// 形状照服务端（data/catalog_review.py）：field_label 只是字段的叫法（「中文名」「度量类型」），列级的项另给 column；
+// reasons 的说法同服务端（「常用表（使用 42 次）」「影响数字的项（有效记录条件）」）
 const qItem = (table_name, path, field, field_label, value, display, kind, priority, reasons, table_usage, extra = {}) => ({
-  table_name, path, field, field_label, value, display, source: 'llm', status: 'proposed', note: null, priority, reasons, table_usage, kind, ...extra,
+  table_name, path, field, field_label, column: path.startsWith('columns.') ? path.slice(8, path.lastIndexOf('.')) : null,
+  value, display, source: 'llm', status: 'proposed', note: null, priority, reasons, table_usage, kind, ...extra,
 })
+const MEMBER_REL = { columns: ['member_id'], to_table: 'members', to_columns: ['id'], cardinality: 'many_to_one', coverage: 0.98 }
 function queueOf() {
   const list = [
     qItem('visits', 'valid_filter', 'valid_filter', '有效记录条件', 'status NOT IN (9)', 'status NOT IN (9)', 'facts', 9.6,
-      ['常用表（被 42 次运行用到）', '影响数字的项（有效行过滤）', '模型起草，未确认'], 42, { note: FILTER_NOTE }),
+      ['常用表（使用 42 次）', '影响数字的项（有效记录条件）', '模型起草，未确认'], 42, { note: FILTER_NOTE }),
     qItem('visits', 'dedup', 'dedup', '去重规则', '按 ticket_no 去重', '按 ticket_no 去重', 'facts', 9.5,
-      ['常用表（被 42 次运行用到）', '影响数字的项（去重规则）', '模型起草，未确认'], 42, { note: DEDUP_NOTE }),
-    qItem('orders', 'kind', 'kind', '表类型', 'fact', '明细表', 'names', 6.2, ['常用表（被 30 次运行用到）', '模型起草，未确认'], 30),
-    qItem('visits', 'columns.ticket_no.measure', 'measure', '列 ticket_no 的度量类型', 'identifier', '标识', 'facts', 5.1,
-      ['常用表（被 42 次运行用到）', '影响数字的项（度量类型）', '命名推断，未确认'], 42, { source: 'name' }),
+      ['常用表（使用 42 次）', '影响数字的项（去重规则）', '模型起草，未确认'], 42, { note: DEDUP_NOTE }),
+    qItem('orders', 'kind', 'kind', '表类型', 'fact', '明细表', 'names', 6.2, ['常用表（使用 30 次）', '帮助理解取值的项（表类型）', '模型起草，未确认'], 30),
+    qItem('orders', 'relations.r_member', 'relation', '关联关系', MEMBER_REL, 'member_id → members.id（多对一，覆盖率 98%）', 'facts', 5.5,
+      ['常用表（使用 30 次）', '影响数字的项（关联关系）', '命名推断，未确认'], 30, { source: 'name' }),
+    qItem('visits', 'columns.ticket_no.measure', 'measure', '度量类型', 'identifier', '标识', 'facts', 5.1,
+      ['常用表（使用 42 次）', '影响计数和汇总的项（度量类型）', '命名推断，未确认'], 42, { source: 'name' }),
     qItem('visits', 'grain', 'grain', '粒度', '一张门票的一次入园', '一张门票的一次入园', 'names', 4.4,
-      ['常用表（被 42 次运行用到）', '模型起草，未确认'], 42),
+      ['常用表（使用 42 次）', '帮助理解取值的项（粒度）', '模型起草，未确认'], 42),
   ]
   // 余下的：促销属性表的列中文名（使用次数少，排在后面）。总数 57，一页 50
-  for (let i = 1; i <= 52; i++) {
+  for (let i = 1; i <= 51; i++) {
     const c = `attr_${String(i).padStart(3, '0')}`
-    list.push(qItem('promo_attrs', `columns.${c}.label`, 'label', `列 ${c} 的中文名`, `属性 ${i}`, `属性 ${i}`, 'names', 1 - i / 100,
-      ['模型起草，未确认'], 6))
+    list.push(qItem('promo_attrs', `columns.${c}.label`, 'label', '中文名', `属性 ${i}`, `属性 ${i}`, 'names', 1 - i / 100,
+      ['使用 6 次', '名称和说明（中文名）', '模型起草，未确认'], 6))
   }
   return list
 }
+// 形状照服务端：top 只算被运行用过的表（5 张，不到 20），另带 items_proposed、items_verified
 const PROGRESS = {
   top_n: 20,
-  top: { tables: 5, items_total: 286, items_confirmed: 120 },
-  all: { items_total: 1460, items_confirmed: 262, items_proposed: 1234, items_rejected: 12 },
+  top: { tables: 5, items_total: 286, items_confirmed: 120, items_proposed: 150, items_verified: 10 },
+  all: { items_total: 1460, items_confirmed: 262, items_proposed: 1180, items_rejected: 12, items_verified: 6 },
   facts: { proposed: 56, confirmed: 12 },
 }
 const USAGE_RUNS = [
@@ -458,11 +465,15 @@ const IMPORT_FILE = {
     legacy_tickets: { version: 1, notes: { label: item('旧票', 'human') } },
   },
 }
+// 形状照服务端（data/catalog_transfer.py）：matched_as 总有值（对不上的表只在 unmatched_tables 里），每张表另带 version、
+// error（预览里也带），冲突另带 file_status、target_status；界面只在导入的结果里写版本
 const IMPORT_PREVIEW = {
   tables: [
-    { table_name: 'visits', matched_as: 'visits', add: 1, update: 0, keep: 4, skipped: [{ path: 'columns.gate_code.label', why: '表结构里没有列 gate_code' }],
-      conflicts: [{ path: 'label', label: '表的中文名', file_value: '入园流水', target_value: '入园记录', why: '这里已确认，以这里为准' }] },
-    { table_name: 'ORDERS', matched_as: 'orders', add: 0, update: 1, keep: 1, conflicts: [], skipped: [] },
+    { table_name: 'visits', matched_as: 'visits', add: 1, update: 0, keep: 4, version: 2, error: null,
+      skipped: [{ path: 'columns.gate_code.label', why: '表结构里没有列 gate_code' }],
+      conflicts: [{ path: 'label', label: '表的中文名', file_value: '入园流水', target_value: '入园记录', why: '这里已确认，以这里为准',
+        file_status: 'confirmed', target_status: 'confirmed' }] },
+    { table_name: 'ORDERS', matched_as: 'orders', add: 0, update: 1, keep: 1, version: 2, error: null, conflicts: [], skipped: [] },
   ],
   unmatched_tables: ['legacy_tickets'],
   totals: { tables: 2, add: 1, update: 1, keep: 5, conflicts: 1, skipped: 1 },
@@ -577,6 +588,17 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
       dedup: { value: 'y', source: 'llm', status: 'rejected' } }, 4, res.outcomes, res.versions)
     out.sync = { grain: synced.outcomes.get(rv.itemKey(items[0])), dedup: synced.outcomes.get(rv.itemKey(items[1]))?.status, v: synced.versions.get('t1') }
     out.pct = [rv.percentOf(120, 286), rv.percentOf(0, 0)]
+    // 审阅队列一项的位置：按 path 说到列（服务端的 field_label 只是字段的叫法）
+    out.where = [
+      rv.reviewWhere({ path: 'columns.status.codes', field_label: '码值', column: 'status', value: { 1: '有效' } }),
+      rv.reviewWhere({ path: 'valid_filter', field_label: '有效记录条件', column: null, value: 'status <> 9' }),
+      rv.reviewWhere({ path: 'relations.r1', field_label: '关联关系', column: null, value: { columns: ['park_id'], to_table: 'parks', to_columns: ['id'] } }),
+      rv.reviewWhere({ path: 'columns.a.b.label', field_label: '中文名', column: 'a.b', value: '甲' }),
+      rv.reviewWhere({ path: 'columns.x.weird', field_label: '怪字段', column: 'x', value: 1 }),
+      rv.reviewWhere({ path: 'weird', field_label: '怪字段', value: 1 }),
+    ]
+    // 审阅进度：三行同一个口径——已确认 ÷（已确认 + 待确认）；不知道待确认几项时不算百分比
+    out.progress = [rv.confirmProgress(120, 150), rv.confirmProgress(30, 0), rv.confirmProgress(0, 0), rv.confirmProgress(5, undefined)]
     return out
   })
   // 51 条取后 40 条，打头的那条是助手的回答，去掉：39 条
@@ -602,6 +624,12 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
   check('表详情改过之后：回到推断的记成撤销审阅，驳回的记成已驳回，版本换成最新的', r.sync.grain?.action === 'reset' && r.sync.dedup === 'rejected' && r.sync.v === 4,
     JSON.stringify(r.sync))
   check('进度的百分比四舍五入，分母为 0 时不写', r.pct[0] === 42 && r.pct[1] === null, JSON.stringify(r.pct))
+  check('队列一项的位置写到列：列 status 的码值、表的有效记录条件、指向 parks 的关联关系；列名里有句点、认不出的路径也说得通',
+    JSON.stringify(r.where) === JSON.stringify(['列 status 的码值', '表的有效记录条件', '指向 parks 的关联关系', '列 a.b 的中文名', '列 x 的怪字段', '怪字段']),
+    JSON.stringify(r.where))
+  check('审阅进度三行同一个口径：已确认 ÷（已确认 + 待确认），审完是 100%，没有可确认的、不知道待确认几项时不算',
+    JSON.stringify(r.progress.map((x) => x.pct)) === JSON.stringify([44, 100, null, null]) && r.progress[3].proposed === null,
+    JSON.stringify(r.progress))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })
@@ -912,22 +940,51 @@ await section('审阅队列 · 视图、顺序与原因、筛选、进度', asyn
   check('……照服务端排好的顺序列（常用表里影响数字的在前）', keys.slice(0, 3).join(' | ') === 'visits::valid_filter | visits::dedup | orders::kind', keys.slice(0, 3).join(' | '))
   const first = queue.locator('[data-review-item="visits::valid_filter"]')
   const firstText = await textOf(first)
-  check('第一项：写位置、所在表的中文名、值、来源和状态、所在表的使用次数', firstText.includes('有效记录条件') && firstText.includes('入园记录')
+  check('第一项：写位置、所在表的中文名、值、来源和状态、所在表的使用次数', firstText.includes('表的有效记录条件') && firstText.includes('入园记录')
         && firstText.includes('status NOT IN (9)') && firstText.includes('推断') && firstText.includes('模型起草') && firstText.includes('使用 42 次'), firstText)
-  check('……写为什么排在这里', (await textOf(first.locator('[data-review-reasons]'))).includes('影响数字的项（有效行过滤）'))
+  check('……写为什么排在这里（服务端的原话）', (await textOf(first.locator('[data-review-reasons]'))).includes('影响数字的项（有效记录条件）'))
   check('……有效记录条件写剖析核对的排除比例', (await textOf(first.locator('[data-review-note]'))).includes(FILTER_NOTE))
   check('……一共 57 项，还能再载入 7 项', (await textOf(queue.locator('[data-review-total]'))).includes('57 项待确认') && (await textOf(queue.locator('[data-review-more]'))).includes('再载入 7 项'))
-  // 进度
+  // 位置：服务端的 field_label 只是字段的叫法（「度量类型」「中文名」），列级的项要写出是哪一列，不然成批确认时分不清
+  const whereOf = (k) => textOf(queue.locator(`[data-review-item="${k}"] [data-review-where]`))
+  const box = (k) => queue.locator(`[data-review-item="${k}"] [data-review-select]`)
+  check('列级的项写明是哪一列：「列 ticket_no 的度量类型」「列 attr_001 的中文名」', (await whereOf('visits::columns.ticket_no.measure')) === '列 ticket_no 的度量类型'
+        && (await whereOf('promo_attrs::columns.attr_001.label')) === '列 attr_001 的中文名',
+    `${await whereOf('visits::columns.ticket_no.measure')} · ${await whereOf('promo_attrs::columns.attr_001.label')}`)
+  check('……表级的项写「表的……」，关联关系写指向哪张表', (await whereOf('visits::valid_filter')) === '表的有效记录条件'
+        && (await whereOf('orders::relations.r_member')) === '指向 members 的关联关系', `${await whereOf('visits::valid_filter')} · ${await whereOf('orders::relations.r_member')}`)
+  check('……复选框的读屏名也写到列：「选择：visits 列 ticket_no 的度量类型」',
+    (await box('visits::columns.ticket_no.measure').getAttribute('aria-label')) === '选择：visits 列 ticket_no 的度量类型'
+        && (await box('promo_attrs::columns.attr_002.label').getAttribute('aria-label')) === '选择：promo_attrs 列 attr_002 的中文名',
+    await box('visits::columns.ticket_no.measure').getAttribute('aria-label'))
+  const promoWhere = await queue.locator('[data-review-item^="promo_attrs::"] [data-review-where]').evaluateAll((els) => els.map((e) => e.textContent))
+  check('……促销属性表的几十项中文名各写各的列，没有两行一样', promoWhere.length === 44 && new Set(promoWhere).size === promoWhere.length, `${promoWhere.length} · ${new Set(promoWhere).size}`)
+  // 进度：三行同一个口径（已确认 ÷（已确认 + 待确认）），常用表写实际几张
   const prog = queue.locator('[data-review-progress]')
-  check('进度：常用 20 张表已确认 42%（120 / 286 项）', (await textOf(prog.locator('[data-review-progress-top]'))).includes('常用 20 张表')
-        && (await textOf(prog.locator('[data-review-progress-top]'))).includes('已确认 42%') && (await textOf(prog.locator('[data-review-progress-top]'))).includes('120 / 286 项'),
-    await textOf(prog))
-  check('……全部表已确认 18%，影响数字的项待确认 56、已确认 12', (await textOf(prog.locator('[data-review-progress-all]'))).includes('已确认 18%')
-        && (await textOf(prog.locator('[data-review-progress-facts]'))).includes('待确认 56 项、已确认 12 项'), await textOf(prog))
+  const line = (k) => textOf(prog.locator(`[data-review-progress-${k}]`))
+  const pct = (k) => prog.locator(`[data-review-progress-${k}]`).getAttribute('data-review-progress-pct')
+  check('进度：常用表写实际几张（被运行用过的 5 张，不写死 20 张），已确认 44%、待确认 150 项', (await line('top')).includes('常用 5 张表')
+        && !(await line('top')).includes('20 张') && (await line('top')).includes('已确认 44% · 待确认 150 项') && (await pct('top')) === '44', await line('top'))
+  check('……全部表、影响数字的项同一个口径：已确认 18%、待确认 1,180 项；已确认 18%、待确认 56 项', (await line('all')).includes('已确认 18% · 待确认 1,180 项')
+        && (await line('facts')).includes('已确认 18% · 待确认 56 项') && (await pct('all')) === '18' && (await pct('facts')) === '18', `${await line('all')} · ${await line('facts')}`)
+  check('……悬停写明口径：已驳回的、有确证的不计入', ((await prog.locator('[data-review-progress-all] span').last().getAttribute('title')) ?? '').includes('已驳回的、有确证的（外键约束）不用再确认'))
+  // 审完了（待确认 0 项）三行都是 100%：已驳回的、有确证的项不会让「全部表」永远到不了 100%；没有运行用过的表时写明
+  state.progress = {
+    top_n: 20, top: { tables: 0, items_total: 0, items_confirmed: 0, items_proposed: 0, items_verified: 0 },
+    all: { items_total: 40, items_confirmed: 30, items_proposed: 0, items_rejected: 6, items_verified: 4 }, facts: { proposed: 0, confirmed: 9 },
+  }
+  await queue.locator('[data-review-refresh]').click()
+  check('审完了：全部表、影响数字的项都是已确认 100%（6 项驳回、4 项有确证不计入）', await until(async () => (await pct('all')) === '100')
+        && (await line('all')).includes('已确认 100% · 待确认 0 项') && (await pct('facts')) === '100', `${await line('all')} · ${await line('facts')}`)
+  check('……没有运行用过的表：常用表那一行写「还没有运行用过的表」，不写「常用 20 张表」', (await line('top')).includes('还没有运行用过的表')
+        && !(await line('top')).includes('20 张') && !(await line('top')).includes('还没有目录项'), await line('top'))
+  state.progress = null
+  await queue.locator('[data-review-refresh]').click()
+  await until(async () => (await pct('top')) === '44')
   // 筛选
   await queue.locator('[data-review-kind="facts"]').click()
   check('按项筛选「影响数字的项」：请求带 kind=facts，地址也记着', await until(async () => lastSent(sent, /review-queue$/)?.query?.kind === 'facts')
-        && new URL(page.url()).searchParams.get('kind') === 'facts' && await until(async () => (await queue.locator('[data-review-item]').count()) === 3))
+        && new URL(page.url()).searchParams.get('kind') === 'facts' && await until(async () => (await queue.locator('[data-review-item]').count()) === 4))
   await queue.locator('[data-review-table]').selectOption('visits')
   check('按表筛选：请求带 table=visits，地址记成 rtable', await until(async () => lastSent(sent, /review-queue$/)?.query?.table === 'visits')
         && new URL(page.url()).searchParams.get('rtable') === 'visits')
@@ -1015,6 +1072,10 @@ await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所�
         && (await usage.locator('[data-usage-run] a').first().getAttribute('href')) === '/runs/run-check-0003'
         && (await textOf(usage.locator('[data-usage-run]').first())).includes('每日入园统计'))
   check('……请求带 limit=20', lastSent(sent, /\/visits\/usage$/)?.query?.limit === '20')
+  // 两个数口径不同：表头「使用 42 次」按查询算，这里按运行算（3 次运行），各写各的单位，悬停说明为什么不一样
+  const usageCount = usage.locator('[data-table-usage-count]')
+  check('……写「共 3 次运行」（按运行算），悬停说明和表头的使用次数（按查询算）不是一个数', (await textOf(usageCount)) === '共 3 次运行'
+        && ((await usageCount.getAttribute('title')) ?? '').includes('表头的使用次数按查询算'), await textOf(usageCount))
   // 在详情里单项确认：队列里那一项跟着标已确认
   await page.locator('[data-item-mark="dedup"]').first().click()
   await page.locator('[data-item-panel] [data-review-action="confirm"]').click()
@@ -1086,6 +1147,8 @@ await section('导出导入 · 导出文件、导入先预览再写入', async (
         && (await textOf(dlg.locator('[data-import-unmatched]'))).includes('legacy_tickets'))
   check('……起草要求：这里已有，保留不覆盖', (await textOf(dlg.locator('[data-import-guidance-action]'))).includes('保留这个数据源现有的'))
   check('……预览不写库', count(sent, /catalog\/import$/) === 0)
+  check('……预览里不写版本（服务端的预览也带 version，只有导入的结果才写第几版）', !(await textOf(dlg.locator('[data-import-table="visits"]'))).includes('第 2 版'),
+    await textOf(dlg.locator('[data-import-table="visits"]')))
   await shot(page, 'catalog-import-preview')
   const lists = count(sent, /^GET \/datasources\/check-loop-scenic\/catalog$/)
   await page.locator('[data-import-confirm]').click()

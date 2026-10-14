@@ -66,7 +66,7 @@ export function TableUsageList({ sourceId, table, usage, autoLoad = false }: {
   if (!data.runs.length) return <p className="rounded-lg border px-3 py-4 text-xs text-faint" data-table-usage="0">{T.none}</p>
   return (
     <div data-table-usage={data.total}>
-      <p className="mb-1 text-2xs text-faint">{T.count(data.runs.length, data.total)}</p>
+      <p className="mb-1 text-2xs text-faint" title={T.countHint} data-table-usage-count="">{T.count(data.runs.length, data.total)}</p>
       <ul className="divide-y divide-[var(--hairline)] rounded-lg border bg-panel">
         {data.runs.map((r) => {
           const name = r.workflow_name?.trim() || T.unnamed

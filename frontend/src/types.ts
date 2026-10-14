@@ -3077,10 +3077,15 @@ export interface CatalogReviewItem {
   table_name: string
   /** 审阅接口的路径写法 */
   path: string
-  /** 字段名（valid_filter、label……） */
+  /** 字段名（valid_filter、label……；关联关系是 relation） */
   field: string
-  /** 给人看的位置（服务端写好的，比如「列 status 的码值」） */
+  /**
+   * 字段的界面叫法（服务端写好的「中文名」「码值」「有效记录条件」「关联关系」），不含是哪一列：界面上的位置按 path
+   * 说（「列 status 的码值」，review.ts 的 reviewWhere）
+   */
   field_label: string
+  /** 列级的项是哪一列；表级的项、关联关系为 null。接口约定里没有写明，服务端给了才用 */
+  column?: string | null
   value: unknown
   /** 值写成一行字（服务端写好的） */
   display: string
@@ -3137,11 +3142,16 @@ export interface CatalogTableUsage {
   runs: CatalogUsageRun[]
 }
 
-/** GET /catalog/review-progress：常用的前 top_n 张表、全部表、影响数字的项各审阅到哪儿 */
+/**
+ * GET /catalog/review-progress：常用的前 top_n 张表、全部表、影响数字的项各审阅到哪儿。
+ * 「常用表」只算被运行用过的：tables 可能比 top_n 少，没有运行时是 0。三行的进度都按「已确认 ÷（已确认 + 待确认）」算
+ * （review.ts 的 confirmProgress）：已驳回的、有确证的（外键约束）不用再确认，不计入
+ */
 export interface CatalogReviewProgress {
   top_n: number
-  top: { tables: number; items_total: number; items_confirmed: number }
-  all: { items_total: number; items_confirmed: number; items_proposed: number; items_rejected: number }
+  /** items_proposed、items_verified：接口约定里没有写明，服务端给了才用（没有待确认数时只写已确认几项） */
+  top: { tables: number; items_total: number; items_confirmed: number; items_proposed?: number; items_verified?: number }
+  all: { items_total: number; items_confirmed: number; items_proposed: number; items_rejected: number; items_verified?: number }
   facts: { proposed: number; confirmed: number }
 }
 

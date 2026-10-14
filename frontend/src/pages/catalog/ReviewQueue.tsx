@@ -10,15 +10,17 @@ import { errorMessage } from '../../lib/errors'
 import { CATALOG_REVIEW_TEXT as RT } from '../../lib/terms'
 import { StatusChip } from './parts'
 import {
-  REVIEW_BATCH_MAX, REVIEW_KINDS, REVIEW_PAGE, applyResults, batchTargets, itemKey, percentOf, statusOf, syncFromDetail,
+  REVIEW_BATCH_MAX, REVIEW_KINDS, REVIEW_PAGE, applyResults, batchTargets, confirmProgress, itemKey, reviewWhere, statusOf,
+  syncFromDetail,
 } from './review'
 import type { ItemOutcome } from './review'
 
 // ===========================================================================
 // 审阅队列（数据目录页的「审阅队列」视图，左栏）：跨表列出推断项，顺序由服务端排好（所在表的使用次数 × 这一项对数字的
 // 影响 × 来源），每一项写为什么排在这里。可以按项（影响数字的项 / 名称和含义）和表筛选；多选后成批确认、驳回，审阅过的
-// 原地标出结果（冲突的标出来），选中可以撤销审阅；刷新队列后审阅过的才移除。顶上是审阅进度：常用 20 张表、全部表、
-// 影响数字的项各确认了多少。点开一项，右栏是所在表的详情（滚到那一项、标出来）和用过这张表的运行。
+// 原地标出结果（冲突的标出来），选中可以撤销审阅；刷新队列后审阅过的才移除。顶上是审阅进度：常用表（使用次数最多、
+// 被运行用过的前 20 张）、全部表、影响数字的项各确认了多少，三行同一个口径。点开一项，右栏是所在表的详情（滚到那一项、
+// 标出来）和用过这张表的运行。
 // ===========================================================================
 
 export function ReviewQueue({ sourceId, rows, kind, table, activeKey, detailSync, onParams, onOpenItem, onChanged }: {
@@ -313,7 +315,8 @@ const QueueRow = memo(function QueueRow({ item: i, itemKeyText, tableLabel, outc
   onOpen: (item: CatalogReviewItem) => void
 }) {
   const status = statusOf(i, outcome)
-  const where = i.field_label || i.path
+  // 位置按 path 说（「列 status 的码值」）：服务端的 field_label 只是字段的叫法，列级的项只写它分不清是哪一列
+  const where = reviewWhere(i)
   const tableText = tableLabel ? `${tableLabel}（${i.table_name}）` : i.table_name
   const mono = i.field === 'valid_filter' || i.field === 'keys'
   return (
@@ -327,7 +330,7 @@ const QueueRow = memo(function QueueRow({ item: i, itemKeyText, tableLabel, outc
       <button type="button" className="min-w-0 flex-1 px-2 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--accent)]"
               onClick={() => onOpen(i)} aria-current={active ? 'true' : undefined} title={RT.open(where, i.table_name)} data-review-open="">
         <span className="flex items-baseline gap-2">
-          <span className="min-w-0 flex-1 truncate text-xs font-medium text-fg">{where}</span>
+          <span className="min-w-0 flex-1 truncate text-xs font-medium text-fg" data-review-where="">{where}</span>
           <span className="tnum shrink-0 text-2xs text-faint" title={RT.usageHint}>{RT.usage(i.table_usage)}</span>
         </span>
         <span className="mt-0.5 block truncate text-2xs text-faint" title={tableText}>{tableText}</span>
@@ -354,7 +357,11 @@ const QueueRow = memo(function QueueRow({ item: i, itemKeyText, tableLabel, outc
   )
 })
 
-/** 审阅进度：常用 20 张表、全部表、影响数字的项。数字写在字里，色条只给眼睛看 */
+/**
+ * 审阅进度：常用表、全部表、影响数字的项，三行同一个口径——已确认 ÷（已确认 + 待确认），已驳回的、有确证的不计入，
+ * 审完了就是 100%。常用表只算被运行用过的（最多 top_n 张），标签写实际几张，一张都没有时写明还没有运行用过的表。
+ * 数字写在字里，色条只给眼睛看
+ */
 function ProgressBlock({ progress, failed }: { progress: CatalogReviewProgress | null; failed: boolean }) {
   if (!progress) {
     return (
@@ -364,33 +371,53 @@ function ProgressBlock({ progress, failed }: { progress: CatalogReviewProgress |
     )
   }
   const { top, all, facts } = progress
-  const topPct = percentOf(top.items_confirmed, top.items_total)
-  const allPct = percentOf(all.items_confirmed, all.items_total)
-  const factsPct = percentOf(facts.confirmed, facts.proposed + facts.confirmed)
+  const topTables = Math.max(0, top.tables ?? 0)
+  const topLine = confirmProgress(top.items_confirmed, top.items_proposed)
+  const allLine = confirmProgress(all.items_confirmed, all.items_proposed)
+  const factsLine = confirmProgress(facts.confirmed, facts.proposed)
   return (
     <section className="space-y-1.5 border-b px-3 py-2.5" aria-label={RT.progressTitle} data-review-progress="">
-      <ProgressLine label={RT.progressTop(progress.top_n)} hint={RT.progressTopHint(progress.top_n)} pct={topPct}
-                    text={`${RT.confirmedPct(topPct)} · ${RT.itemsOf(top.items_confirmed, top.items_total)}`} attr="top" />
-      <ProgressLine label={RT.progressAll} pct={allPct}
-                    text={`${RT.confirmedPct(allPct)} · ${RT.allDetail(all.items_proposed, all.items_rejected)}`} attr="all" />
-      <ProgressLine label={RT.progressFacts} hint={RT.progressFactsHint} pct={factsPct}
-                    text={RT.factsDetail(facts.proposed, facts.confirmed)} attr="facts" warn={facts.proposed > 0} />
+      {topTables > 0
+        ? (
+          <ProgressLine label={RT.progressTop(topTables)} hint={RT.progressTopHint(topTables, progress.top_n)} line={topLine}
+                        total={top.items_total} attr="top" />
+        )
+        : (
+          <div className="flex items-baseline gap-2 text-2xs" data-review-progress-line="top" data-review-progress-top="" data-review-progress-none="">
+            <span className="shrink-0 font-medium text-dim" title={RT.progressTopHint(0, progress.top_n)}>{RT.progressTopNone}</span>
+            <span className="min-w-0 flex-1 truncate text-right text-faint">{RT.progressTopEmpty}</span>
+          </div>
+        )}
+      <ProgressLine label={RT.progressAll} hint={RT.progressAllHint} line={allLine} total={all.items_total} attr="all" />
+      <ProgressLine label={RT.progressFacts} hint={RT.progressFactsHint} line={factsLine} total={null} attr="facts"
+                    warn={facts.proposed > 0} />
     </section>
   )
 }
 
-function ProgressLine({ label, hint, pct, text, attr, warn = false }: {
-  label: string; hint?: string; pct: number | null; text: string; attr: string; warn?: boolean
+function ProgressLine({ label, hint, line, total, attr, warn = false }: {
+  label: string
+  hint: string
+  line: ReturnType<typeof confirmProgress>
+  /** 这一行一共几项（全部状态）：0 时写还没有目录项；不知道时为 null */
+  total: number | null
+  attr: string
+  warn?: boolean
 }) {
+  const text = RT.progressText(line.pct, line.confirmed, line.proposed, total)
   return (
-    <div className="text-2xs" data-review-progress-line={attr} {...{ [`data-review-progress-${attr}`]: '' }}>
+    <div className="text-2xs" data-review-progress-line={attr} {...{ [`data-review-progress-${attr}`]: '' }}
+         data-review-progress-pct={line.pct ?? ''}>
       <div className="flex items-baseline gap-2">
-        <span className="shrink-0 font-medium text-dim" title={hint}>{label}</span>
-        <span className={clsx('tnum min-w-0 flex-1 truncate text-right', warn ? 'text-[var(--st-waiting)]' : 'text-faint')} title={text}>{text}</span>
+        <span className="shrink-0 font-medium text-dim" title={`${hint}\n${RT.progressRule}`}>{label}</span>
+        <span className={clsx('tnum min-w-0 flex-1 truncate text-right', warn ? 'text-[var(--st-waiting)]' : 'text-faint')}
+              title={`${text}\n${RT.progressRule}`}>{text}</span>
       </div>
-      <div className="mt-0.5 h-1 overflow-hidden rounded-full bg-hover" aria-hidden>
-        <div className="h-full rounded-full bg-[var(--st-done)]" style={{ width: `${pct ?? 0}%` }} />
-      </div>
+      {line.pct != null && (
+        <div className="mt-0.5 h-1 overflow-hidden rounded-full bg-hover" aria-hidden>
+          <div className="h-full rounded-full bg-[var(--st-done)]" style={{ width: `${line.pct}%` }} />
+        </div>
+      )}
     </div>
   )
 }

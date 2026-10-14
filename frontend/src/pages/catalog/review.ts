@@ -1,6 +1,8 @@
 import type {
   CatalogNotes, CatalogReviewAction, CatalogReviewBatchResult, CatalogReviewItem, CatalogReviewKind, CatalogStatus,
 } from '../../types'
+import { CATALOG_TEXT } from '../../lib/terms'
+import { patchTarget, patchWhere } from '../../run/catalogPatch'
 import { slotsOf } from './model'
 
 // ===========================================================================
@@ -47,6 +49,18 @@ export function writeReviewParams(p: URLSearchParams, s: Partial<ReviewParams>):
 
 /** 队列一项的键（表名里、路径里都可能有句点，中间用一个不会出现的字符隔开） */
 export const itemKey = (i: { table_name: string; path: string }) => `${i.table_name}\u0000${i.path}`
+
+/**
+ * 队列里一项的位置，说法同提案卡片：「列 status 的码值」「表的有效记录条件」「指向 parks 的关联关系」。服务端的
+ * field_label 只是字段的叫法（「码值」），列级的项占了队列的大半，只写它分不清是哪一列，所以按 path 说；认不出的
+ * 路径再用 column 加 field_label
+ */
+export function reviewWhere(i: Pick<CatalogReviewItem, 'path' | 'value' | 'field_label'> & { column?: string | null }): string {
+  if (patchTarget(i.path)) return patchWhere({ path: i.path, before: i.value ?? null, after: i.value ?? null })
+  const label = i.field_label?.trim()
+  if (i.column && label) return CATALOG_TEXT.whereColumn(i.column, label)
+  return label || i.path
+}
 
 /** 一项审阅过之后的处境：成功（现在的状态、这张表写入后的版本）、冲突（这张表刚被改过）、没成功（服务端的原因） */
 export type ItemOutcome =
@@ -130,3 +144,16 @@ export function syncFromDetail(items: CatalogReviewItem[], table: string, notes:
 
 /** 百分比（四舍五入到整数）；分母为 0 时为 null */
 export const percentOf = (n: number, total: number): number | null => (total > 0 ? Math.round((n / total) * 100) : null)
+
+/**
+ * 审阅进度的一行（常用表、全部表、影响数字的项同一个口径）：已确认 ÷（已确认 + 待确认）。已驳回的、有确证的（外键约束）
+ * 不用再确认，不计入，审完了就是 100%。不知道待确认几项（服务端没给）时 pct 为 null，只写已确认几项
+ */
+export function confirmProgress(confirmed: number, proposed: number | null | undefined): {
+  pct: number | null; confirmed: number; proposed: number | null
+} {
+  const c = Math.max(0, confirmed || 0)
+  if (typeof proposed !== 'number' || !Number.isFinite(proposed)) return { pct: null, confirmed: c, proposed: null }
+  const p = Math.max(0, proposed)
+  return { pct: percentOf(c, c + p), confirmed: c, proposed: p }
+}

@@ -3082,7 +3082,11 @@ export const CATALOG_ASSISTANT_TEXT = {
 // - 「影响数字的项」：有效记录条件、去重规则、业务日期、关联关系、业务主键、度量类型——写错了查出来的数就不对，排在最前；
 //   「名称和含义」：中文名、含义、单位、码值、粒度、表类型。
 // - 审阅过的项原地标出结果（已确认、已驳回、未生效），刷新队列后才移除；「撤销审阅」回到起草时的状态（推断）。
-// - 「常用 20 张表」：使用次数最多的 20 张。进度写「已确认 42%」。
+// - 每一项的位置写「列 status 的码值」「表的有效记录条件」「指向 parks 的关联关系」（同提案卡片），不只写字段名。
+// - 「常用 N 张表」：被运行用过、使用次数最多的前几张（最多 20 张），N 写实际张数；没有运行用过的表时写明。
+// - 进度写「已确认 42%」，三行同一个口径：已确认 ÷（已确认 + 待确认）；已驳回的、有确证的（外键约束）不计入。
+// - 「使用 N 次」是所在表被运行查询过的次数（按查询算，同表清单）；「用过这张表的运行」写「共 N 次运行」（按运行算），
+//   两个数不一样，各自写明单位。
 // ===========================================================================
 
 export const CATALOG_REVIEW_TEXT = {
@@ -3120,7 +3124,7 @@ export const CATALOG_REVIEW_TEXT = {
   selected: (n: number) => `已选 ${formatNumber(n)} 项`,
   clearSelection: '取消选择',
   usage: (n: number) => `使用 ${formatNumber(n)} 次`,
-  usageHint: '所在表被运行查询过的次数',
+  usageHint: '所在表被运行查询过的次数，同一次运行中结果相同的重复查询只算一次',
   open: (where: string, table: string) => `打开「${table}」，查看${where}`,
   reasonsLabel: '排在这里的原因',
   // ---- 成批审阅
@@ -3151,15 +3155,25 @@ export const CATALOG_REVIEW_TEXT = {
   failedAll: (reason: string) => `未能提交：${reason}`,
   // ---- 进度
   progressTitle: '审阅进度',
+  /** 常用表：被运行用过、使用次数最多的前几张（最多 topN 张），n 是实际张数 */
   progressTop: (n: number) => `常用 ${formatNumber(n)} 张表`,
-  progressTopHint: (n: number) => `使用次数最多的 ${formatNumber(n)} 张表里的项`,
+  progressTopHint: (n: number, topN: number) => (n > 0
+    ? `被运行用过、使用次数最多的 ${formatNumber(n)} 张表里的项（最多取 ${formatNumber(topN)} 张）`
+    : `被运行用过、使用次数最多的表里的项（最多取 ${formatNumber(topN)} 张）`),
+  progressTopNone: '常用表',
+  progressTopEmpty: '还没有运行用过的表',
   progressAll: '全部表',
+  progressAllHint: '这个数据源全部表里的项',
   progressFacts: '影响数字的项',
   progressFactsHint: '有效记录条件、去重规则、业务日期、关联关系、业务主键、度量类型',
-  confirmedPct: (pct: number | null) => (pct == null ? '还没有目录项' : `已确认 ${formatNumber(pct)}%`),
-  itemsOf: (confirmed: number, total: number) => `${formatNumber(confirmed)} / ${formatNumber(total)} 项`,
-  allDetail: (proposed: number, rejected: number) => `推断 ${formatNumber(proposed)} 项、已驳回 ${formatNumber(rejected)} 项`,
-  factsDetail: (proposed: number, confirmed: number) => `待确认 ${formatNumber(proposed)} 项、已确认 ${formatNumber(confirmed)} 项`,
+  progressRule: '已确认 ÷（已确认 + 待确认）：已驳回的、有确证的（外键约束）不用再确认，不计入',
+  /** 一行进度：已确认百分比和待确认几项；不知道待确认几项时只写已确认几项 */
+  progressText: (pct: number | null, confirmed: number, proposed: number | null, total: number | null) => {
+    if (total === 0) return '还没有目录项'
+    if (proposed == null) return `已确认 ${formatNumber(confirmed)} 项`
+    if (pct == null) return '没有待确认的项'
+    return `已确认 ${formatNumber(pct)}% · 待确认 ${formatNumber(proposed)} 项`
+  },
   progressFailed: '无法读取审阅进度',
   // ---- 没选中项时的右栏
   overviewTitle: '从左侧队列挑一项开始审阅',
@@ -3178,8 +3192,10 @@ export const CATALOG_USAGE_TEXT = {
   show: '查看用过这张表的运行',
   hide: '收起',
   none: '还没有运行查询过这张表',
+  /** 按运行算（一次运行查询了几次这张表都只算一次），和表头按查询算的「使用 N 次」不是一个数 */
   count: (shown: number, total: number) => (total > shown
-    ? `最近 ${formatNumber(shown)} 次，共 ${formatNumber(total)} 次` : `共 ${formatNumber(total)} 次`),
+    ? `共 ${formatNumber(total)} 次运行，显示最近 ${formatNumber(shown)} 次` : `共 ${formatNumber(total)} 次运行`),
+  countHint: '按运行算：一次运行查询了几次这张表都只算一次；表头的使用次数按查询算，两个数可能不一样',
   error: '无法读取用过这张表的运行',
   retry: '重试',
   unnamed: '未保存的工作流',
