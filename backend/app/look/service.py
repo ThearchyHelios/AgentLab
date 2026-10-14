@@ -4,7 +4,9 @@
   1. need 没写：回「look 要写 need」，不算次数；次数用完：回「按已查看的结构完成」，不再查看。
   2. targets 按类型分组（旧写法 tables:[{source, table}] 读进来换成 kind=table）。写了 name 的点名直取，不调挑选模型；
      只写了 kind（和 source）的、或者整个没写 targets 的，按 need 在那一类里挑（没写时挑这个入口的第一类）。
-  3. 挑选失败或挑出来是空的：交回那一类的目录（status=index），写明原因，请模型点名再看。
+  3. 挑选失败或挑出来是空的：交回那一类的目录（status=index），写明原因，请模型点名再看。点名的一个都没认出来时，
+     按 need 在那几个来源里挑（同只写类别），没认出来的照样写「没找到」；候选里一个能查看的都没有（库还没探查表
+     结构）时没有目录可交，status=failed，照实说原因。
   4. 这一批对象这一轮都已经看过：回「已在上面」，不重新排一遍。
   5. 各类给详情，合计受 LOOK_RESULT_CHARS 约束；记一条记录（id、by、need、status、objects、用时）。
 
@@ -36,6 +38,7 @@ INDEX_PROMPT = ("没能按需求挑出{what}：{reason}。下面是候选的{wha
 EMPTY_PROMPT = ("按这个需求没有挑出相关的{what}。这一步确实要用到{what}的话，从下面的目录里点名再 look；"
                 "不需要就接着写：\n{index}")
 FAILED_PROMPT = "这一次查看出错了：{reason}。按已有的信息接着写"
+UNAVAILABLE_PROMPT = "没有可查看的{what}：{reason}。按已有的信息接着写，不要猜{what}的名字和字段"
 #: 按需求挑出来是空的：写进 look 事件的 reason，界面上照原话显示
 EMPTY_REASON = "按这个需求没有挑出相关的{what}"
 UNKNOWN_KIND_PROMPT = "这一轮不能查看这一类对象：{kinds}（能查看的：{allowed}）"
@@ -184,21 +187,33 @@ class LookService:
         keys: set[str] = set()
         indexed: list[str] = []
         empty: list[str] = []
+        unavailable: list[str] = []
         budget = LOOK_RESULT_CHARS
         for kind_name in dict.fromkeys([*named, *picks]):
             kind = self.kinds[kind_name]
             found, missing = await kind.resolve(named.get(kind_name, [])) if kind_name in named else ([], [])
+            fallback = bool(missing) and not found and kind_name not in picks
+            if fallback:
+                # 点名的一个都没认出来（常见的是拿说明里的中文词当表名）：按 need 在那几个来源里挑，和只写类别时一样，
+                # 不让模型为了拿到真名再 look 一次。没认出来的照样写进「没找到」，不拿挑出来的冒充点名的
+                picks[kind_name] = list(dict.fromkeys(str(t["source"]) for t in missing if t.get("source"))) or None
             if kind_name in picks:
                 within = picks[kind_name] or sources
                 chosen, reason = await kind.pick(need, within)
                 if reason is not None or not chosen:
                     index = await kind.index(within)
-                    indexed.append(INDEX_PROMPT.format(what=kind.label, reason=reason, index=index) if reason
-                                   else EMPTY_PROMPT.format(what=kind.label, index=index))
-                    if reason is not None:
+                    if not index and reason is not None:
+                        # 候选里一个能查看的都没有（库还没探查表结构）：没有目录可交，照实说原因，算查看没完成
+                        unavailable.append(UNAVAILABLE_PROMPT.format(what=kind.label, reason=reason))
                         record["reason"] = reason
-                    else:
-                        empty.append(kind.label)
+                    elif index or not fallback:
+                        # 点名的来源本身不在这一轮里（目录是空的）：「没找到数据源」已经说清楚了，不再补一段空目录
+                        indexed.append(INDEX_PROMPT.format(what=kind.label, reason=reason, index=index) if reason
+                                       else EMPTY_PROMPT.format(what=kind.label, index=index))
+                        if reason is not None:
+                            record["reason"] = reason
+                        else:
+                            empty.append(kind.label)
                 found += [o for o in chosen if kind.key(o) not in {kind.key(f) for f in found}]
             if not found and not missing:
                 continue
@@ -210,8 +225,10 @@ class LookService:
         if unknown:
             parts.append(UNKNOWN_KIND_PROMPT.format(kinds="、".join(dict.fromkeys(unknown)),
                                                     allowed="、".join(self.kinds)))
-        parts += indexed
-        if indexed and not keys:
+        parts += indexed + unavailable
+        if unavailable and not indexed and not keys:
+            record["status"] = "failed"
+        elif indexed and not keys:
             # 一个对象都没给出详情、交回的是目录：挑选失败（有原因）或按需求没挑出来（返回空）
             record["status"] = "index"
             record.setdefault("reason", EMPTY_REASON.format(what="、".join(empty)))

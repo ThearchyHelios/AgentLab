@@ -458,3 +458,49 @@ async def test_the_old_tables_field_still_looks(scenic_source):
     result = await looks.look({"op": "look", "need": "门店",
                                "tables": [{"source": scenic_source.name, "table": "stores"}]}, LookBudget())
     assert result.record["objects"][0]["named"] == ["stores"] and "store_code  TEXT" in result.text
+
+
+async def test_names_that_match_nothing_fall_back_to_picking_by_need(monkeypatch, small_source):
+    """模型拿说明里的中文词点名（「订单」「客户」）一个都没认出来：同一次查看里按需求挑，不让它为了拿到真名再看一次。
+    小库不调挑选模型、全部给出；没认出来的照样写进「没找到」，不拿挑出来的冒充点名的。"""
+    fake = FakePicker(error=AssertionError("小库不该调挑选模型"))
+    _use_picker(monkeypatch, fake)
+    looks = await _service([small_source])
+    result = await looks.look({"op": "look", "need": "每位客户的订单金额", "targets": [
+        {"kind": "table", "source": small_source.name, "name": "订单"},
+        {"kind": "table", "source": small_source.name, "name": "客户"}]}, LookBudget())
+    record = result.record
+    assert record["status"] == "ok" and not fake.calls
+    (block,) = record["objects"]
+    assert block["named"] == [] and sorted(block["picked"]) == ["customers", "orders"]
+    assert block["missing"] == ["订单", "客户"]
+    assert "customer_id" in result.text and f"没找到：{small_source.name} 的 订单" in result.text
+
+
+async def test_names_in_an_unknown_source_do_not_hand_back_an_empty_index(small_source):
+    looks = await _service([small_source])
+    result = await looks.look({"op": "look", "need": "退款", "targets": [
+        {"kind": "table", "source": "没有这个库", "name": "refunds"}]}, LookBudget())
+    assert "没找到数据源「没有这个库」" in result.text
+    assert "目录" not in result.text and result.record["status"] == "ok"
+
+
+async def test_a_source_never_introspected_says_so_instead_of_an_empty_pick():
+    """库接上了但还没探查表结构：不是「按需求没挑出来」，照实说为什么是空的，查看算没完成（不交空目录）。"""
+    async with SessionLocal() as session:
+        row = DataSource(name=f"look_bare_{uuid.uuid4().hex[:8]}", kind="sqlite", database="/nonexistent.db",
+                         description="门店、订单、客户")
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        session.expunge(row)
+    try:
+        looks = await _service([row])
+        for line in ({"op": "look", "need": "各地区销售额"},
+                     {"op": "look", "need": "各地区销售额", "targets": [{"kind": "table", "name": "订单"}]}):
+            result = await looks.look(line, LookBudget())
+            assert result.record["status"] == "failed", line
+            assert result.record["reason"] == f"数据源「{row.name}」尚未探查结构"
+            assert "尚未探查结构" in result.text and "目录" not in result.text
+    finally:
+        await drop_source(row.id)

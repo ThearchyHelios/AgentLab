@@ -236,6 +236,12 @@ class TableKind:
 
     async def pick(self, need: str, sources: list[str] | None) -> tuple[list[TableRef], str | None]:
         candidates, _ = self._candidates(sources)
+        if not any(self.plans[i].tables for i in candidates):
+            # 候选库一张表都没探查到：不是「按需求没挑出来」，照实说为什么是空的（和概览行同一句）
+            bare = [self.plans[i] for i in candidates] if sources else self.plans
+            if bare:
+                return [], "；".join(f"数据源「{p.name}」{introspect.why_empty(p.source.schema_cache or {})}"
+                                    for p in bare)
         pool = [TableRef(i, key, "picked") for i in candidates for key in self.plans[i].tables]
         if len(pool) <= PICK_LIMIT:
             return pool, None
