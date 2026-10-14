@@ -474,7 +474,6 @@ class _JobRun:
         self._started: set[str] = set()
         self.source: Any = None
         self.actor: str | None = None
-        self.at = ""
 
     # ---------------------------------------------------------------- 库写入
 
@@ -553,7 +552,7 @@ class _JobRun:
                 except catalog.CatalogModelUnavailable as e:
                     raise _JobFailed(str(e)) from e
                 existing = {t: e.notes for t, e in (await catalog.read_catalog(session, source.id)).items()}
-        self.source, self.at = source, catalog.now_iso()
+        self.source = source
         all_tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
         names = [n for n in pending if isinstance(all_tables.get(n), dict)]
         gone = [n for n in pending if n not in names]
@@ -653,9 +652,12 @@ class _JobRun:
 
     async def _write_part(self, session: AsyncSession, table: str, written: catalog_draft.PartWrite) -> None:
         """宽表写出了一段：马上并入目录（这一次不删任何东西），记下写进去的段数、累加计数。写不进去只记日志：整张表结束
-        时收尾那次还会把它带上。"""
+        时收尾那次还会把它带上。
+
+        新增、更新的项的修改时间是这一次写入的时间（每次写入各取一次）：以前整个任务只在开始时取一次，起草了几十分钟的宽表，
+        每一段写进去的项都记成任务开始那一刻，比任务的开始时间还早。"""
         try:
-            found = await write_part(session, self.source, table, written.notes, at=self.at, actor=self.actor)
+            found = await write_part(session, self.source, table, written.notes, at=catalog.now_iso(), actor=self.actor)
         except Exception:  # noqa: BLE001 - 这一段写不进去不影响起草
             logger.exception("起草任务 %s 把表 %s 写出来的一段并入数据目录时出错", self.job_id, table)
             await session.rollback()
@@ -674,9 +676,10 @@ class _JobRun:
     async def _write_table(self, session: AsyncSession, table: str,
                            outcome: catalog_draft.ModelOutcome | None) -> None:
         """一张表结束：并入目录、写入（宽表写过的段已经并入过，这里是整张表的收尾），记下这张表的结果。计数加在逐段写入
-        的计数上。"""
+        的计数上。修改时间取这一次写入的时间（同 _write_part）：逐段写进去、内容没变的项留着那一段的时间。"""
         try:
-            result = await catalog.write_draft(session, self.source, table, outcome, at=self.at, actor=self.actor)
+            result = await catalog.write_draft(session, self.source, table, outcome, at=catalog.now_iso(),
+                                               actor=self.actor)
         except Exception as e:  # noqa: BLE001 - 这一张写不进去不影响别的表
             from app.core.errors import describe_exception, first_line
 

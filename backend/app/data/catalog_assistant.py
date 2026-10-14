@@ -3,7 +3,12 @@
 **为什么要有它。** 模型起草只看表结构，缩写列名、状态码的意思常常拿不准而留空；审阅时人知道答案，却要一项一项填。表助手
 把这张表的结构、目录现状（每项的来源和状态）、关联关系、剖析结果、起草要求、使用次数、上次起草留空的列交给模型，让它主动
 问拿不准的地方；使用者说出一条业务事实，它整理成成批的修改提案（形状同助手流里的 catalog_patch），使用者在界面上逐项看过、
-一次保存（PATCH /catalog/{table}/patch，记为人工确认）。
+一次保存（PATCH /catalog/{table}/patch，记为人工确认，每项的 reason 另存成这一项的确认时的依据，见 catalog.apply_patch）。
+
+**依据只引用这次对话。** 数据源的起草要求是以前写在数据源上的背景，背景里标明「不是这次对话里使用者说的话」；目录项上以前
+保存时记下的依据也一样，背景里写成「以前确认时的依据：……」，和备注分开。提示词要求 reason 里的原话只引用这次对话里使用者的
+消息，依据来自起草要求的写「起草要求写着：……」，来自以前的依据的写「以前确认时的依据写着：……」。验收时模型把起草要求写成了
+「使用者说：……」，保存之后看起来像是使用者亲口确认过。
 
 **只改目录、不改业务库。** 模型只有两个工具：
 - propose_changes：一批修改提案。按 catalog.plan_patch 核对（取值格式、列名必须在表结构里、公式不收），遮罩列不给码值，已经
@@ -16,8 +21,8 @@
   取自遮罩列的结果列整列换成「已遮罩」，改了名字的也认；这一次请求里前面遮掉的值按值换），报错原话里的值也换。没开剖析时
   提示词里写明只能根据表结构和目录推断。
 
-**遮罩列只给列名。** 表结构里遮罩的列只写列名和类型（不给注释），目录里这些列的码值、带着取值的备注一律不给（剖析的备注里
-有取值范围）；界面上还没保存的修改里这些列的码值也不给。
+**遮罩列只给列名。** 表结构里遮罩的列只写列名和类型（不给注释），目录里这些列的码值、带着取值的备注和确认时的依据一律不给
+（剖析的备注里有取值范围，使用者的原话里也可能有）；界面上还没保存的修改里这些列的码值也不给。
 
 **模型。** 取模型的顺序同起草（data/draft_model.py：起草模型 → 助手的模型 → 默认接入），用不了时的说法也同起草
 （先过 catalog.resolve_draft_model，接口回 409 catalog_draft_model_unavailable）。保留思考、温度 0，额度
@@ -123,7 +128,10 @@ ASSISTANT_SYSTEM = """你是 AgentLab 的「表助手」，和使用者一起完
 - 拿不准就问，不要猜。一次只问一两件最要紧的事，问得具体（例如「status 为 9 的行是不是作废的单子？」）。目录里留空的列、\
 标着「推断」的项是最值得问的。
 - 使用者说出一条业务事实时，用 propose_changes 把它整理成修改提案，reason 里引用使用者的原话（例如「使用者说：9 是作废」）。\
-一次可以提多项。提案只是建议：使用者在界面上看过、保存之后才写进数据目录，记为人工确认。
+reason 里引用使用者原话只能引用这次对话里使用者的消息；依据来自下面背景里的数据源起草要求时写「起草要求写着：……」，\
+来自背景里目录项下面的「以前确认时的依据」时写「以前确认时的依据写着：……」（那是以前保存时记下的，不是这次对话里\
+使用者说的话），都不要写成「使用者说」。一次可以提多项。提案只是建议：使用者在界面上看过、保存之后才写进数据目录，\
+记为人工确认，reason 会作为这一项确认时的依据一起保存。
 - 表名、列名照原样写，只能用下面表结构里有的列。
 - 标着「已确认」的项由人工确认过，使用者没有明确要改就不要提修改；标着「已驳回」的项使用者驳回过，不要再提。
 - 「界面上还没保存的修改」是使用者已经接受、还没保存的提案：不要重复提；要改其中一项就再提一次，写完整的新值。
@@ -162,7 +170,7 @@ ASSISTANT_PROMPT_LABELS = {
     "usage": "这张表被 {runs} 次运行用到（查询 {n} 次）。",
     "usage_none": "这张表还没有被运行用到过。",
     "description": "数据源说明：{text}",
-    "guidance": "数据源的起草要求（使用者补充的背景和要求）：{text}",
+    "guidance": "数据源的起草要求（不是这次对话里使用者说的话）：{text}",
     "structure": "表结构：",
     "column": "- {name} {type}{marks}",
     "pk": "主键",
@@ -175,6 +183,7 @@ ASSISTANT_PROMPT_LABELS = {
     "catalog_empty": "这张表还没有数据目录。",
     "item": "- {path}（{label}）：{value}〔{source}，{status}〕",
     "item_note": "  备注：{text}",
+    "item_reason": "  以前确认时的依据：{text}",
     "catalog_more": "（还有 {n} 项没有列出：这张表的目录太长。要改的项照上面的路径写法提，核对时按当前目录算）",
     "relation": "{columns} → {to_table}.{to_columns}{extra}",
     "relation_extra": "（{text}）",
@@ -238,7 +247,10 @@ PROPOSE_TOOL_PROMPT: dict[str, Any] = {
                         "properties": {
                             "path": {"type": "string", "description": "要改的项，写法见系统提示"},
                             "value": {"description": "新的值：文字、列名列表、码值对照或关联关系"},
-                            "reason": {"type": "string", "description": "一句话依据，引用使用者的原话"},
+                            "reason": {"type": "string",
+                                       "description": "一句话依据：引用这次对话里使用者的原话（「使用者说：……」）；"
+                                                      "来自数据源起草要求的写「起草要求写着：……」，来自以前确认时的依据"
+                                                      "的写「以前确认时的依据写着：……」"},
                         },
                         "required": ["path", "value", "reason"],
                     },
@@ -364,8 +376,9 @@ def _touches_masked(key: catalog.Slot, item: Mapping[str, Any], masked: set[str]
 
 
 def _catalog_lines(notes: Mapping[str, Any] | None, masked: set[str]) -> list[str]:
-    """这张表的目录，每项一行：路径、字段、值、来源和状态，有备注的另起一行。遮罩列上的码值不给，说到遮罩列的项不给备注
-    （剖析的备注里有取值范围）。"""
+    """这张表的目录，每项一行：路径、字段、值、来源和状态，有备注、有确认时的依据的各另起一行。依据是以前保存时记下的，
+    写成「以前确认时的依据：……」，不让模型当成这次对话里使用者说的话。遮罩列上的码值不给，说到遮罩列的项不给备注和
+    依据（剖析的备注里有取值范围，使用者的原话里也可能有）。"""
     labels = ASSISTANT_PROMPT_LABELS
     lines: list[str] = []
     # 表级的项、关联关系在前，列的项在后（稳定排序，各自照目录里的顺序）；遮罩列上的码值不算
@@ -387,6 +400,9 @@ def _catalog_lines(notes: Mapping[str, Any] | None, masked: set[str]) -> list[st
         note = item.get("note")
         if isinstance(note, str) and note.strip() and not hidden:
             lines.append(labels["item_note"].format(text=note.strip()))
+        reason = item.get("reason")
+        if isinstance(reason, str) and reason.strip() and not hidden:
+            lines.append(labels["item_reason"].format(text=reason.strip()))
     return lines
 
 

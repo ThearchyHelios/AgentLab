@@ -9,7 +9,7 @@ import { Notice, Spinner, confirmDialog, isComposing, toast } from '../../compon
 import { useLeaveGuard } from '../../lib/leave'
 import { CATALOG_ASSISTANT_TEXT as T, CATALOG_STATUS_LABEL } from '../../lib/terms'
 import { Markdown } from '../../run/Markdown'
-import { patchValueText } from '../../run/catalogPatch'
+import { beforeStatusShown, patchBeforeText, patchValueText } from '../../run/catalogPatch'
 import {
   ASSISTANT_MAX_CHARS, ASSISTANT_MAX_SAVE, QUERY_ROWS_SHOWN, applyEvent, applyPreview, assistantChangesOf, blankColumnsOf, blankLeadOf,
   changeStateOf, changeWhere, dropPending, historyOf, mergeProposal, pendingForAssistant, pendingSubmit, pendingVersion, savedKey,
@@ -495,9 +495,10 @@ function ChangeRow({ change: c, state, onToggle }: {
       </div>
       <dl className={clsx('mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 leading-relaxed', off && 'opacity-70')}>
         <dt className="text-faint">{T.before}</dt>
-        <dd className={clsx('break-words', c.before == null ? 'text-faint' : 'text-dim')} data-change-before="">
-          {valueText(c.path, c.before)}
-          {c.before != null && c.before_status && <span className="text-faint">（{CATALOG_STATUS_LABEL[c.before_status]}）</span>}
+        <dd className={clsx('break-words', c.before == null || c.before_status === 'rejected' ? 'text-faint' : 'text-dim')} data-change-before=""
+            data-change-before-status={c.before_status ?? undefined}>
+          {patchBeforeText(c)}
+          {beforeStatusShown(c) && <span className="text-faint">（{CATALOG_STATUS_LABEL[c.before_status!]}）</span>}
         </dd>
         <dt className="text-faint">{T.after}</dt>
         <dd className="break-words text-fg" data-change-after="">
@@ -585,7 +586,7 @@ function PendingTray({ pending, open, onToggle, save, editing, onDrop, onClear, 
                 <div className="min-w-0 flex-1 leading-relaxed">
                   <p className="break-words font-medium text-fg">{where}</p>
                   <p className="break-words text-dim">
-                    <span className="text-faint">{T.before} </span>{valueText(p.path, p.before)}
+                    <span className="text-faint">{T.before} </span>{patchBeforeText(p)}
                     <span className="text-faint"> → {T.after} </span><span className="text-fg">{valueText(p.path, p.after)}</span>
                   </p>
                   {p.reason && <p className="break-words text-faint"><span>{T.reason}：</span>{p.reason}</p>}

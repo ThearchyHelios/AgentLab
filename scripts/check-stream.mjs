@@ -822,12 +822,14 @@ await section('建议更新数据目录：卡片的保存、忽略和 409（cata
     const body = req.postDataJSON()
     sent.push({ url: req.url(), body, actor: req.headers()['x-actor'] })
     if (req.url().endsWith('/patch/preview')) {
-      // 重新载入：别人刚把码值补了一个 8，改前改后按最新的算
+      // 重新载入：别人刚把码值补了一个 8、把度量类型驳回了，改前改后按最新的算（驳回的项改前照样写出原值）
       return route.fulfill({ json: { table_name: 'visits', version: 4, problems: [], changes: [
         { path: 'columns.status.codes', before: { 1: '有效', 0: '作废', 8: '退票' }, before_status: 'confirmed',
           after: { 1: '有效', 0: '作废', 8: '退票', 9: '作废' }, value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' },
         { path: 'valid_filter', before: 'status = 1', before_status: 'proposed', after: 'status = 1 AND status <> 9',
           value: 'status = 1 AND status <> 9', reason: '统计时要排除作废记录', state: 'change' },
+        { path: 'columns.visitor_count.measure', before: 'flow', before_status: 'rejected', after: 'flow', value: 'flow',
+          reason: '', state: 'change' },
       ] } })
     }
     if (conflictOnce) {
@@ -871,6 +873,8 @@ await section('建议更新数据目录：卡片的保存、忽略和 409（cata
   check('重新载入交回的是助手原来的提案', sent[1]?.url.endsWith('/patch/preview')
     && JSON.stringify(sent[1]?.body?.changes?.[0]?.value) === '{"9":"作废"}', JSON.stringify(sent[1]))
   check('重新载入后改前按最新的目录写', (await codes.locator('[data-patch-before]').innerText()).includes('8=退票'))
+  check('……刚被驳回的项：改前写「已驳回：可累加」，不写「未填写」', (await card.locator('[data-patch-change="columns.visitor_count.measure"] [data-patch-before]')
+    .innerText()) === '已驳回：可累加', await card.locator('[data-patch-change="columns.visitor_count.measure"]').innerText())
   await card.locator('[data-patch-save]').click()
   await card.locator('[data-patch-done]').waitFor({ timeout: 3000 })
   check('再保存带新版本', sent[2]?.body?.if_version === 4, JSON.stringify(sent[2]?.body))

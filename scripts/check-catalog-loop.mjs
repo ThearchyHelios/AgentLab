@@ -285,25 +285,42 @@ const writeEntry = (t, notes) => {
   t.updated_by = ACTOR
 }
 const conflictDetail = (name) => ({ detail: `表「${name}」的数据目录刚被修改过，请重新载入后再提交` })
+/** 单项审阅（catalog.review_item）：确认、驳回留着确认时的依据（reason），撤销审阅回到推断时去掉；人工填写的撤销即删除 */
 function applyReview(notes, path, action) {
   const map = slots(clone(notes ?? {}))
   const it = map.get(path)
   if (!it) return null
   if (action === 'reset' && it.source === 'human') map.delete(path)
-  else it.status = action === 'confirm' ? 'confirmed' : action === 'reject' ? 'rejected' : INIT[it.source] ?? 'proposed'
+  else {
+    it.status = action === 'confirm' ? 'confirmed' : action === 'reject' ? 'rejected' : INIT[it.source] ?? 'proposed'
+    if (action === 'reset') delete it.reason
+  }
   return assemble(map)
 }
-/** 保存提案（catalog.apply_patch 的简化）：码值是补充，其余整项替换；改动的项记为人工填写、已确认 */
+/**
+ * 保存提案（catalog.apply_patch 的简化）：码值是补充（驳回的码值不算），其余整项替换。值改了的项记为人工填写、已确认；
+ * 值不变的只改成已确认（来源、备注不变）。写了依据的项依据另存在 reason（确认时的依据），和备注分开，每次整句换掉：
+ * 这次没写的去掉旧的
+ */
 function applyPatch(notes, changes) {
   const map = slots(clone(notes ?? {}))
   for (const c of changes) {
     const prev = map.get(c.path)
-    const value = c.path.endsWith('.codes') && prev ? { ...prev.value, ...c.value } : c.value
-    map.set(c.path, { value, source: 'human', status: 'confirmed', updated_at: new Date().toISOString() })
+    const live = prev && prev.status !== 'rejected' ? prev : null
+    const value = c.path.endsWith('.codes') && live ? { ...live.value, ...c.value } : c.value
+    const reason = c.reason ? { reason: c.reason } : {}
+    const at = new Date().toISOString()
+    if (live && JSON.stringify(live.value) === JSON.stringify(value)) {
+      if (live.status === 'confirmed') continue
+      const { reason: _old, ...kept } = live
+      map.set(c.path, { ...kept, status: 'confirmed', updated_at: at, ...reason })
+      continue
+    }
+    map.set(c.path, { value, source: 'human', status: 'confirmed', updated_at: at, ...reason })
   }
   return assemble(map)
 }
-/** 预览：对着当前目录算改前、改后（只读） */
+/** 预览：对着当前目录算改前、改后（只读）。被驳回的项改前照样写出原值、状态写已驳回，改后和状态按没有这一项算 */
 function previewOf(t, changes) {
   const map = slots(t.notes ?? {})
   return {
@@ -312,8 +329,8 @@ function previewOf(t, changes) {
       const prev = map.get(c.path)
       const live = prev && prev.status !== 'rejected' ? prev : null
       const after = c.path.endsWith('.codes') && live ? { ...live.value, ...c.value } : c.value
-      return { path: c.path, before: live?.value ?? null, before_status: live?.status ?? null, after, value: c.value, reason: c.reason ?? '',
-        state: JSON.stringify(live?.value) === JSON.stringify(after) ? (live.status === 'confirmed' ? 'same' : 'confirm') : 'change' }
+      return { path: c.path, before: prev?.value ?? null, before_status: prev?.status ?? null, after, value: c.value, reason: c.reason ?? '',
+        state: live && JSON.stringify(live.value) === JSON.stringify(after) ? (live.status === 'confirmed' ? 'same' : 'confirm') : 'change' }
     }),
   }
 }
@@ -621,6 +638,18 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
       dedup: { value: 'y', source: 'llm', status: 'rejected' } }, 4, res.outcomes, res.versions)
     out.sync = { grain: synced.outcomes.get(rv.itemKey(items[0])), dedup: synced.outcomes.get(rv.itemKey(items[1]))?.status, v: synced.versions.get('t1') }
     out.pct = [rv.percentOf(120, 286), rv.percentOf(0, 0)]
+    // 列表头「N 项待确认」：这一页上审阅成功、不再是推断的项从总数里减掉；撤销审阅回到推断的、冲突的照算
+    out.pendingTotal = [rv.pendingTotal(57, items, new Map()), rv.pendingTotal(57, items, res.outcomes),
+      rv.pendingTotal(57, items, synced.outcomes), rv.pendingTotal(1, items, res.outcomes)]
+    // 提案的改前：被驳回的原值也写出来（同导入预览「目标里这一项已经驳回」）
+    const cp = await import('/src/run/catalogPatch.ts')
+    out.before = [
+      cp.patchBeforeText({ path: 'columns.amount.unit', before: '元', before_status: 'rejected' }),
+      cp.patchBeforeText({ path: 'columns.amount.unit', before: '元', before_status: 'proposed' }),
+      cp.patchBeforeText({ path: 'columns.amount.unit', before: null, before_status: null }),
+      cp.patchBeforeText({ path: 'kind', before: 'fact', before_status: 'rejected' }),
+      cp.patchBeforeText({ path: 'columns.status.codes', before: { 1: '有效' }, before_status: 'rejected' }),
+    ]
     // 审阅队列一项的位置：按 path 说到列（服务端的 field_label 只是字段的叫法）
     out.where = [
       rv.reviewWhere({ path: 'columns.status.codes', field_label: '码值', column: 'status', value: { 1: '有效' } }),
@@ -683,6 +712,10 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
   check('表详情改过之后：回到推断的记成撤销审阅，驳回的记成已驳回，版本换成最新的', r.sync.grain?.action === 'reset' && r.sync.dedup === 'rejected' && r.sync.v === 4,
     JSON.stringify(r.sync))
   check('进度的百分比四舍五入，分母为 0 时不写', r.pct[0] === 42 && r.pct[1] === null, JSON.stringify(r.pct))
+  check('列表头的待确认项数：这一页上审阅成功的从总数里减掉，撤销审阅、冲突的照算，不会减成负数',
+    JSON.stringify(r.pendingTotal) === JSON.stringify([57, 55, 56, 0]), JSON.stringify(r.pendingTotal))
+  check('提案的改前：被驳回的写「已驳回：原值」（值按界面上的说法），别的照原样，没有值写「未填写」',
+    JSON.stringify(r.before) === JSON.stringify(['已驳回：元', '元', '未填写', '已驳回：明细表', '已驳回：1=有效']), JSON.stringify(r.before))
   check('队列一项的位置写到列：列 status 的码值、表的有效记录条件、指向 parks 的关联关系；列名里有句点、认不出的路径也说得通',
     JSON.stringify(r.where) === JSON.stringify(['列 status 的码值', '表的有效记录条件', '指向 parks 的关联关系', '列 a.b 的中文名', '列 x 的怪字段', '怪字段']),
     JSON.stringify(r.where))
@@ -840,6 +873,16 @@ await section('表助手 · 入口、开场、提案与待保存的修改', asyn
     await textOf(panel(page).locator('[data-assistant-saved]')))
   check('……表详情换上最新的目录（第 4 版），有效记录条件是新的值', await until(async () => (await version(page)) === 4) && v0 === 2
         && (await textOf(page.locator('[data-field="valid_filter"]'))).includes('status NOT IN (8, 9)'))
+  // 保存的修改把依据另存成这一项确认时的依据（服务端的 reason，和备注分开）：表级的项写在值下面，列的一格悬停看得到
+  check('……确认时的依据看得到：有效记录条件的值下面写「确认时的依据：用户说……」',
+    (await textOf(page.locator('[data-field="valid_filter"] [data-field-reason]'))) === '确认时的依据：用户说「统计时退票和作废的都要排除」',
+    await textOf(page.locator('[data-field="valid_filter"]')))
+  check('……依据不拼进说明：改了值的有效记录条件不再有说明（剖析核对的排除比例说的是旧条件）',
+    await page.locator('[data-field="valid_filter"] [data-field-note]').count() === 0, await textOf(page.locator('[data-field="valid_filter"]')))
+  const savedReason = page.locator('[data-column="status"] [data-cell="codes"] [data-cell-reason]')
+  check('……码值那一格悬停写确认时的依据', ((await savedReason.getAttribute('title').catch(() => '')) ?? '') === '确认时的依据：用户说「8 是退票」',
+    String(await savedReason.getAttribute('title').catch(() => null)))
+  check('……那一格没有另挂说明', await page.locator('[data-column="status"] [data-cell="codes"] [data-cell-note]').count() === 0)
   check('……卡片上存了的项标「已保存」，不能再加回', (await changeState(page, 'valid_filter')) === 'saved'
         && await panel(page).locator('[data-assistant-change="valid_filter"] [data-assistant-change-toggle]').count() === 0)
   await cleanCopy(page, '表助手')
@@ -1231,6 +1274,11 @@ await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所�
   const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}?view=review`, { handlers: loopHandlers(state) })
   const queue = page.locator('[data-review-queue]')
   await until(async () => (await queue.locator('[data-review-item]').count()) === 50)
+  // 列表头的「N 项待确认」和视图标签上的计数（清单里各表的推断项）：成批审阅之后一起变
+  const headTotal = () => textOf(queue.locator('[data-review-total]'))
+  const tabCount = async () => Number((await textOf(page.locator('[data-catalog-view-tab="review"]'))).replace(/\D/g, ''))
+  const tab0 = await tabCount()
+  check('还没审阅：列表头写「57 项待确认」', (await headTotal()) === '57 项待确认' && tab0 > 0, `${await headTotal()} · 标签 ${tab0}`)
   const sel = (k) => queue.locator(`[data-review-item="${k}"] [data-review-select]`)
   await sel('visits::valid_filter').check()
   await sel('visits::dedup').check()
@@ -1258,6 +1306,9 @@ await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所�
   check('……汇总：已确认 2 项；1 项未生效（所在表刚被修改过），请刷新队列后再审阅', summary.includes('已确认 2 项') && summary.includes('1 项未生效（所在表刚被修改过）'), summary)
   check('……清单里那张表的计数跟着重取', await until(async () => count(sent, /^GET \/datasources\/check-loop-scenic\/catalog$/) >= 2))
   check('……审阅进度跟着重取', count(sent, /review-progress$/) >= 2)
+  check('……列表头跟着减：确认了的 2 项不再待确认、冲突的那项照算（57 → 55），和视图标签上的计数一起少 2',
+    await until(async () => (await headTotal()) === '55 项待确认') && await until(async () => (await tabCount()) === tab0 - 2),
+    `${await headTotal()} · 标签 ${tab0} → ${await tabCount()}`)
   // 撤销审阅：只发这一页上审阅成功的，带这张表写入后的版本
   await sel('visits::valid_filter').check()
   await sel('visits::dedup').check()
@@ -1268,6 +1319,8 @@ await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所�
     { table_name: 'visits', path: 'dedup', action: 'reset', if_version: 3 },
   ] }), JSON.stringify(undo))
   check('……回到推断，标「已撤销审阅」', await until(async () => (await textOf(queue.locator('[data-review-item="visits::dedup"] [data-review-outcome]'))).includes('已撤销审阅')))
+  check('……列表头加回去：又是「57 项待确认」，视图标签也回到原来的数', await until(async () => (await headTotal()) === '57 项待确认')
+        && await until(async () => (await tabCount()) === tab0), `${await headTotal()} · 标签 ${await tabCount()}`)
 
   // 打开所在表：右栏是这张表的详情，滚到那一项、标出来，并列出用过这张表的运行
   await queue.locator('[data-review-item="visits::dedup"] [data-review-open]').click()
@@ -1288,9 +1341,11 @@ await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所�
   await page.locator('[data-item-mark="dedup"]').first().click()
   await page.locator('[data-item-panel] [data-review-action="confirm"]').click()
   check('在详情里确认那一项：队列里跟着标「已确认」', await until(async () => (await textOf(queue.locator('[data-review-item="visits::dedup"] [data-review-outcome]'))).includes('已确认')))
+  check('……列表头跟着少一项：「56 项待确认」', await until(async () => (await headTotal()) === '56 项待确认'), await headTotal())
   // 刷新：审阅过的移除
   await queue.locator('[data-review-refresh]').click()
   check('刷新队列：已确认的那一项移除', await until(async () => (await queue.locator('[data-review-item="visits::dedup"]').count()) === 0))
+  check('……服务端的总数和刷新前列表头写的一样：「56 项待确认」', (await headTotal()) === '56 项待确认', await headTotal())
   await cleanCopy(page, '成批审阅')
   check('只发过成批审阅、单项审阅的写请求', writes(sent).every((s) => /\/review(\/batch)?$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
@@ -1386,6 +1441,169 @@ await section('导出导入 · 导出文件、导入先预览再写入', async (
   await cleanCopy(page, '导入预览')
   check('只发过导入的写请求（预览、导入）', writes(sent).every((s) => /catalog\/import(\/preview)?$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('导出导入 · 导入结果只数真正写进去的表', async () => {
+  // 文件里的两张表都对得上：visits 有一项新增（写进去，第 2 版 → 第 3 版）；ORDERS 文件里的项这里都有了（没有变化，还是第 2 版）。
+  // 第二次导入两张表都没有变化。合计按服务端的写法：tables 是对上的表数，不是写进去的表数
+  const report = (visitsAdd, after) => ({
+    ...clone(IMPORT_PREVIEW),
+    tables: [
+      { ...clone(IMPORT_PREVIEW.tables[0]), add: visitsAdd, version: after && visitsAdd ? 3 : 2 },
+      { ...clone(IMPORT_PREVIEW.tables[1]), update: 0, keep: 2, version: 2 },
+    ],
+    totals: { tables: 2, add: visitsAdd, update: 0, keep: 6, conflicts: 1, skipped: 1 },
+  })
+  const replies = {
+    importPreview: [json(report(1, false)), json(report(0, false))],
+    import: [json(report(1, true)), json(report(0, true))],
+  }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: loopHandlers(freshState(), replies) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  const dlg = page.locator('[data-import-dialog]')
+  const importOnce = async () => {
+    await page.locator('[data-catalog-import]').click()
+    await until(async () => (await dlg.getAttribute('data-step').catch(() => '')) === 'choose')
+    await dlg.locator('[data-import-file]').setInputFiles({ name: 'other.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(IMPORT_FILE)) })
+    await until(async () => (await textOf(dlg.locator('[data-import-file-meta]'))).includes('zzloopother'))
+    await page.locator('[data-import-preview]').click()
+    await until(async () => (await dlg.getAttribute('data-step')) === 'preview')
+    await page.locator('[data-import-confirm]').click()
+    return until(async () => (await dlg.getAttribute('data-step')) === 'done')
+  }
+  check('导入完成', await importOnce())
+  const doneText = await textOf(dlg.locator('[data-import-done]'))
+  check('合计只数真正写进去的表：「写入 1 张表」，没有变化的 ORDERS 不算', doneText.includes('写入 1 张表：新增 1 项、更新 0 项')
+        && !doneText.includes('写入 2 张表') && doneText.includes('冲突 1 项以这里为准'), doneText)
+  await shot(page, 'catalog-import-written')
+  check('……逐表：写进去的写第几版，没有变化的写「没有变化」', (await textOf(dlg.locator('[data-import-table="visits"]'))).includes('第 3 版')
+        && (await textOf(dlg.locator('[data-import-table="ORDERS"]'))).includes('没有变化')
+        && !(await textOf(dlg.locator('[data-import-table="ORDERS"]'))).includes('第 2 版'),
+    `${await textOf(dlg.locator('[data-import-table="visits"]'))} · ${await textOf(dlg.locator('[data-import-table="ORDERS"]'))}`)
+  await page.locator('[data-import-close]').click()
+  await until(async () => (await dlg.count()) === 0)
+  check('再导入一次，两张表都没有变化', await importOnce())
+  const nothing = await textOf(dlg.locator('[data-import-done]'))
+  await shot(page, 'catalog-import-nothing')
+  check('……一张都没写进去：说清「没有需要写入的内容」，不写「写入 2 张表」', nothing.includes('没有需要写入的内容') && !nothing.includes('写入 2 张表')
+        && !nothing.includes('新增 0 项'), nothing)
+  check('……两张表都写「没有变化」', (await textOf(dlg.locator('[data-import-table="visits"]'))).includes('没有变化')
+        && (await textOf(dlg.locator('[data-import-table="ORDERS"]'))).includes('没有变化'))
+  await cleanCopy(page, '导入结果')
+  check('只发过导入的写请求（预览、导入）', writes(sent).every((s) => /catalog\/import(\/preview)?$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('表详情 · 确认时的依据和人工确认的项的说明', async () => {
+  // 保存修改提案时记下的依据（项上的 reason，界面上叫「确认时的依据」）和备注（note：起草的依据、剖析的测量、双盲复算的
+  // 出处）分开写：表级的项写在值下面各一行，列的一格、关联关系各一个悬停的小图标，读屏念「确认时的依据：……」「说明：……」；
+  // 状态弹层里也写依据。只在已确认的项上就近写，驳回的只在弹层里写。推断的项照旧只有有效记录条件、去重规则在值下面写说明
+  const state = freshState()
+  const visits = state.tables[S1].find((t) => t.name === 'visits')
+  const LABEL_REASON = '使用者说：这张表一次刷闸记一行'
+  const FILTER_REASON = '使用者说：只算有效的'
+  const KEYS_REASON = '使用者说：票号不会重复'
+  const UNIT_REASON = '使用者说：入园人数按人计'
+  const DATE_NOTE = '双盲复算（运行 run-check-0003，节点「复核入园人数」）：审核人在指标「入园人数」上采用了盲算的写法'
+  const CODES_NOTE = '数据剖析：整表 12,345 行，1 个取值'
+  const CODES_REASON = '使用者说：1 是已入园'
+  const REL_NOTE = '数据剖析：抽样 2,000 行，覆盖率 98%'
+  const REL_REASON = '使用者说：每条入园记录对应一个景区'
+  visits.notes.label = item('入园记录', 'human', undefined, { reason: LABEL_REASON })
+  // 值不变、保存即确认的模型起草项：起草时的说明照旧，依据另写一行
+  visits.notes.valid_filter = item('status NOT IN (9)', 'llm', 'confirmed', { note: FILTER_NOTE, reason: FILTER_REASON })
+  visits.notes.grain = item('一张门票的一次入园', 'llm', 'proposed', { note: '依据：表名和票号列' })
+  visits.notes.keys = item(['ticket_no'], 'llm', 'rejected', { reason: KEYS_REASON })
+  visits.notes.columns.visitor_count.unit = item('人', 'human', undefined, { reason: UNIT_REASON })
+  visits.notes.columns.visitor_count.label = item('入园人数', 'llm', 'proposed', { note: '依据：列名' })
+  // 双盲复算写进来的人工确认项：只有备注（出处），没有确认时的依据
+  visits.notes.business_date = item({ column: 'visit_time' }, 'human', undefined, { note: DATE_NOTE })
+  visits.notes.columns.status.codes = item({ 1: '已入园' }, 'profile', 'confirmed', { note: CODES_NOTE, reason: CODES_REASON })
+  visits.notes.relations = [{ id: 'r_park', columns: ['park_id'], to_table: 'parks', to_columns: ['id'], cardinality: 'many_to_one', coverage: 0.98,
+    source: 'human', status: 'confirmed', updated_at: T0, note: REL_NOTE, reason: REL_REASON }]
+  const { page, errors, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state) })
+  await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
+  await shot(page, 'catalog-confirmed-notes')
+  const field = (f, part) => page.locator(`[data-field="${f}"] [data-field-${part}]`)
+  check('表级的项：值下面写确认时的依据（中文名）', (await textOf(field('label', 'reason'))) === `确认时的依据：${LABEL_REASON}`,
+    await textOf(page.locator('[data-field="label"]')))
+  check('……没有备注的不另写说明', await field('label', 'note').count() === 0)
+  check('依据和说明分开写：有效记录条件下面一行依据、一行起草时的说明', (await textOf(field('valid_filter', 'reason'))) === `确认时的依据：${FILTER_REASON}`
+        && (await textOf(field('valid_filter', 'note'))) === `说明：${FILTER_NOTE}`, await textOf(page.locator('[data-field="valid_filter"]')))
+  check('人工确认的项只有备注（双盲复算的出处）：写说明，不写依据（业务日期）', (await textOf(field('business_date', 'note'))) === `说明：${DATE_NOTE}`
+        && await field('business_date', 'reason').count() === 0, await textOf(page.locator('[data-field="business_date"]')))
+  check('……推断的表级项照旧不在值下面写（粒度）', await field('grain', 'note').count() === 0 && await field('grain', 'reason').count() === 0)
+  check('……驳回的项不在值下面写依据（业务主键）', await field('keys', 'reason').count() === 0, await textOf(page.locator('[data-field="keys"]')))
+  const cell = (c, f, part) => page.locator(`[data-column="${c}"] [data-cell="${f}"] [data-cell-${part}]`)
+  const titleOf = async (loc) => (await loc.getAttribute('title').catch(() => null)) ?? ''
+  check('列的一格：悬停写确认时的依据（单位）', (await titleOf(cell('visitor_count', 'unit', 'reason'))) === `确认时的依据：${UNIT_REASON}`,
+    await titleOf(cell('visitor_count', 'unit', 'reason')))
+  check('……读屏念「确认时的依据：……」', (await cell('visitor_count', 'unit', 'reason').innerText().catch(() => '')).includes(`确认时的依据：${UNIT_REASON}`))
+  check('……没有备注的那一格不挂说明的图标', await cell('visitor_count', 'unit', 'note').count() === 0)
+  check('依据和说明各一个图标（码值：剖析的说明、确认时的依据）', (await titleOf(cell('status', 'codes', 'reason'))) === `确认时的依据：${CODES_REASON}`
+        && (await titleOf(cell('status', 'codes', 'note'))) === `说明：${CODES_NOTE}`)
+  check('……推断的列级项不加（中文名）', await cell('visitor_count', 'label', 'note').count() === 0 && await cell('visitor_count', 'label', 'reason').count() === 0)
+  if (SHOTS) {
+    await page.locator('[data-column="visitor_count"]').scrollIntoViewIfNeeded()
+    await shot(page, 'catalog-confirmed-notes-columns')
+    await page.locator('[data-relation="r_park"]').scrollIntoViewIfNeeded()
+    await shot(page, 'catalog-confirmed-notes-relations')
+  }
+  check('关联关系：依据、测量的说明各悬停一个', (await titleOf(page.locator('[data-relation="r_park"] [data-relation-reason]'))) === `确认时的依据：${REL_REASON}`
+        && (await titleOf(page.locator('[data-relation="r_park"] [data-relation-note]'))) === `说明：${REL_NOTE}`)
+  // 状态弹层：依据单独一块，写明是确认时的依据；驳回的项也在这里看得到当初确认时的依据
+  const popover = async (path) => {
+    await page.locator(`[data-item-mark="${path}"]`).first().click()
+    const box = page.locator(`[data-item-panel="${path}"]`)
+    await box.waitFor({ timeout: 2000 }).catch(() => {})
+    const text = await textOf(box.locator('[data-item-reason]'))
+    await page.keyboard.press('Escape')
+    await box.waitFor({ state: 'detached', timeout: 2000 }).catch(() => {})
+    return text
+  }
+  check('状态弹层里写确认时的依据（中文名）', (await popover('label')) === `确认时的依据：${LABEL_REASON}`)
+  check('……驳回的项只在弹层里写（业务主键）', (await popover('keys')) === `确认时的依据：${KEYS_REASON}`)
+  check('……没有依据的项弹层里不写（粒度）', (await popover('grain')) === '')
+  await cleanCopy(page, '确认时的依据')
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('表助手 · 改前是已驳回的值', async () => {
+  // 单位「元」被驳回过：助手提「人」，改前写「已驳回：元」（不是「未填写」），和导入预览「目标里这一项已经驳回」一致
+  const state = freshState()
+  const visits = state.tables[S1].find((t) => t.name === 'visits')
+  visits.notes.columns.visitor_count.unit = item('元', 'llm', 'rejected')
+  const PROPOSAL_R = {
+    type: 'proposal', source: NAME1, source_id: S1, table: 'visits', table_label: '入园记录', version: 2, changes: [
+      { path: 'columns.visitor_count.unit', label: '列 visitor_count 的单位', before: '元', before_status: 'rejected', after: '人', value: '人',
+        reason: '使用者说：入园人数按人计', state: 'change' },
+      { path: 'kind', label: '表的表类型', before: null, before_status: null, after: 'fact', value: 'fact', reason: '使用者说：一行一次入园', state: 'change' },
+    ],
+  }
+  const replies = { assistant: [sse([{ type: 'text', delta: '好的，单位按人计。' }, PROPOSAL_R, done()])] }
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state, replies) })
+  await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
+  await page.locator('[data-catalog-assistant-open="header"]').click()
+  await until(async () => panel(page).isVisible())
+  await say(page, '入园人数按人计')
+  const unit = panel(page).locator('[data-assistant-change="columns.visitor_count.unit"]')
+  await shot(page, 'catalog-assistant-rejected')
+  check('提案卡片的改前：「已驳回：元」，不写「未填写」', (await textOf(unit.locator('[data-change-before]'))) === '已驳回：元', await textOf(unit))
+  check('……原来没有的照旧写「未填写」', (await textOf(panel(page).locator('[data-assistant-change="kind"] [data-change-before]'))) === '未填写')
+  const tray = panel(page).locator('[data-assistant-pending-item="columns.visitor_count.unit"]')
+  check('待保存的修改里同样写「改前 已驳回：元」', (await textOf(tray)).includes('改前 已驳回：元'), await textOf(tray))
+  await panel(page).locator('[data-assistant-save]').click()
+  check('保存：交回原样取值和依据', await until(async () => count(sent, /\/visits\/patch$/) === 1)
+        && JSON.stringify(lastSent(sent, /\/visits\/patch$/)?.body?.changes?.[0]) === JSON.stringify({ path: 'columns.visitor_count.unit', value: '人', reason: '使用者说：入园人数按人计' }))
+  check('……存上以后那一格是人工确认的「人」，悬停写确认时的依据', await until(async () => (await version(page)) === 3)
+        && (await textOf(page.locator('[data-column="visitor_count"] [data-cell="unit"]'))).includes('人')
+        && ((await page.locator('[data-column="visitor_count"] [data-cell="unit"] [data-cell-reason]').getAttribute('title').catch(() => '')) ?? '') === '确认时的依据：使用者说：入园人数按人计')
+  await cleanCopy(page, '改前是已驳回的值')
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })

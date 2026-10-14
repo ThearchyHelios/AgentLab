@@ -12,10 +12,11 @@ tables: {表名: {notes, version}}}，含全部状态的项，表结构里已经
   只对目标数据源表结构里的表；对不上的列在 unmatched_tables。文件里两张表对上目标的同一张时，写法完全一样的那张优先，
   另一张算对不上。列名同样按表结构的写法、再忽略大小写对；业务主键、业务日期、关联关系两端的列和指向的表都换成目标的写法，
   关联关系的编号按目标的表名、列名重算（catalog.relation_id）。
-- 文件里已确认、已驳回的项照带：来源、状态、备注、修改时间都不变。目标那一格空着就新增；目标是推断、有确证的就更新；
-  目标也是已确认、已驳回的，和文件一样就保留，不一样（值或状态不同）就保留目标的、记一条冲突。关联关系的「一样」看两端和
-  基数，覆盖率是测量值、不算。
-- 文件里推断、有确证的项只填目标的空缺，目标那一格有东西（哪怕是驳回）就保留目标的，不算冲突。
+- 文件里已确认、已驳回的项照带：来源、状态、备注、确认时的依据（reason）、修改时间都不变。目标那一格空着就新增；目标是
+  推断、有确证的就更新；目标也是已确认、已驳回的，和文件一样就保留，不一样（值或状态不同）就保留目标的、记一条冲突。关联
+  关系的「一样」看两端和基数，覆盖率是测量值、不算。
+- 文件里推断、有确证的项只填目标的空缺，目标那一格有东西（哪怕是驳回）就保留目标的，不算冲突。这样的项不带确认时的依据
+  （文件被手改过才会有）：推断项上挂着依据，看起来像使用者确认过它。
 - 跳过并写原因：表结构里没有的列、业务主键和业务日期指着的列没有的、关联关系两端对不上的（指向的表、两端的列）、
   目标数据源遮罩的列上的码值（码值就是这一列的取值，遮罩了就不该进目录）、不认识的字段、取值不合规的项（说法同
   catalog.validate_notes）。
@@ -395,6 +396,9 @@ def plan_table(table_name: str, target: str, file_notes: Mapping[str, Any], targ
         if why is not None:
             plan.skipped.append({"path": path, "why": why})
             continue
+        if isinstance(item, dict) and item.get("status") not in _LOCKED and "reason" in item:
+            # 推断、有确证的项不带确认时的依据：在校验之前去掉，手改的文件里依据不合规也不把整项跳过
+            item = {k: v for k, v in item.items() if k != "reason"}
         problem = _item_problem(mapped or key, item)
         if problem is not None or mapped is None:
             plan.skipped.append({"path": path, "why": problem or "无法识别这一项"})

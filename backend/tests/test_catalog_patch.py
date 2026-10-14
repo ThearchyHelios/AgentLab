@@ -169,6 +169,39 @@ async def test_apply_patch_records_human_confirmed(scenic_db):
         catalog.apply_patch(proposed, [{"path": "kind", "value": "nope"}], table="visits", tables=tables)
 
 
+_PARKS = catalog.relation_id("visits", ["park_id"], "parks", ["id"])
+
+
+async def test_rejected_items_show_their_value_before(scenic_db):
+    """提案落在已驳回的项上：改前带上被驳回的原值、状态写已驳回（同导入预览「目标里这一项已经驳回」）。只改预览给出的
+    信息，保存的规矩不变：照旧换成人工确认的新值；码值不在驳回的码值上补；和驳回的值一样的也不算「值不变」，照样存成
+    人工确认。"""
+    tables = (await _schema(scenic_db))["tables"]
+    rejected = scenic_notes.notes("rejected")["visits"]
+    rel_value = {"columns": ["park_id"], "to_table": "parks", "to_columns": ["id"], "cardinality": "many_to_one"}
+    changes = [
+        {"path": "columns.visitor_count.measure", "value": "stock"},
+        {"path": "columns.status.codes", "value": {"9": "作废"}},
+        {"path": "valid_filter", "value": "status = 1"},                    # 和驳回的值一样
+        {"path": f"relations.{_PARKS}", "value": rel_value},                  # 两端、基数都和驳回的那条一样
+    ]
+    plan = catalog.plan_patch(rejected, changes, table="visits", tables=tables)
+    assert plan.problems == []
+    measure, codes, valid, rel = plan.changes
+    assert (measure.before, measure.before_status, measure.state) == ("flow", "rejected", "change")
+    assert (codes.before, codes.before_status, codes.state) == ({"1": "有效", "0": "作废"}, "rejected", "change")
+    assert codes.after == {"9": "作废"}, "码值不在驳回的码值上补"
+    assert (valid.before, valid.before_status, valid.state) == ("status = 1", "rejected", "change")
+    assert (rel.before, rel.before_status, rel.state) == ({**rel_value, "coverage": None}, "rejected", "change")
+    assert rel.as_dict()["before_status"] == "rejected" and rel.as_dict()["before"]["to_table"] == "parks"
+    out = catalog.apply_patch(rejected, changes, table="visits", tables=tables)
+    saved = [out["columns"]["visitor_count"]["measure"], out["columns"]["status"]["codes"], out["valid_filter"],
+             next(r for r in out["relations"] if r["id"] == _PARKS)]
+    assert all((item["source"], item["status"]) == ("human", "confirmed") for item in saved)
+    codes = out["columns"]["status"]["codes"]
+    assert codes["value"] == {"9": "作废"} and "complete" not in codes
+
+
 # --------------------------------------------------------------------------
 # 协议
 # --------------------------------------------------------------------------
@@ -337,6 +370,8 @@ async def test_preview_and_save(scenic_source):
         assert detail["version"] == version + 1 and detail["updated_by"] == "王敏"
         codes = detail["notes"]["columns"]["status"]["codes"]
         assert codes["value"]["9"] == "作废" and (codes["source"], codes["status"]) == ("human", "confirmed")
+        # 依据随项另存（确认时的依据，规则见 test_catalog_reason.py），不拼进备注
+        assert codes["reason"] == "作废单" and "note" not in codes
 
         # 拿旧版本再存：409，什么都不写
         r = await client.post(f"{base}/patch", json={"changes": changes, "if_version": version})

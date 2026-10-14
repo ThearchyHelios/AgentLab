@@ -141,6 +141,20 @@ export function patchValueText(path: string, v: unknown): string {
   return typeof v === 'string' ? v : JSON.stringify(v)
 }
 
+/**
+ * 改前那一格（卡片、表助手的提案和待保存的修改都用它）：被驳回的项写「已驳回：原值」——服务端把驳回的原值也交回来
+ * （before_status 为 rejected），保存时照旧换成人工确认的新值；只写「未填写」就看不出原来有一个被驳回的值，和导入预览
+ * 「目标里这一项已经驳回」对不上。别的照 patchValueText 写，没有值写「未填写」
+ */
+export function patchBeforeText(change: Pick<CatalogPatchChange, 'path' | 'before' | 'before_status'>): string {
+  const text = patchValueText(change.path, change.before)
+  return change.before_status === 'rejected' && change.before != null ? CATALOG_PATCH_TEXT.beforeRejected(text) : text
+}
+
+/** 改前要不要跟一个状态（「（推断）」）：有值、不是被驳回的（被驳回的状态已经写在 patchBeforeText 里） */
+export const beforeStatusShown = (change: Pick<CatalogPatchChange, 'before' | 'before_status'>) =>
+  change.before != null && !!change.before_status && change.before_status !== 'rejected'
+
 /** 交回保存、预览的那一份：路径、原样取值、理由 */
 export function patchSubmit(changes: CatalogPatchChange[]) {
   return changes.map((c) => ({ path: c.path, value: c.value, ...(c.reason ? { reason: c.reason } : {}) }))
