@@ -234,3 +234,27 @@ def test_importing_carries_the_reason_of_confirmed_and_rejected_items_only():
     assert writes["label"]["reason"] == "使用者说：就叫入园记录"
     assert writes["grain"]["reason"] == "使用者说：一张票一行"
     assert writes["description"]["value"] == "每次刷闸记一行" and "reason" not in writes["description"]
+
+
+def test_profiling_keeps_the_cardinality_of_a_confirmed_foreign_key():
+    """外键来的关联关系经「值不变、保存即确认」带依据确认之后，来源仍是 fk。再剖析时数据核实出的基数不同：以前 _patch_fk
+    不看状态，直接改写人确认过的基数，依据还挂着，前后矛盾。现在同 _patch_confirmed，不改人定的基数、也不标「用数据核实过」，
+    依据留着；测量的说法照常写进备注。没确认过的外键关系照旧按数据改基数、标核实过。"""
+    fk = {k: v for k, v in _rel(source="fk", status="verified").items() if k not in ("coverage", "note")}
+    saved = _patch({"relations": [fk]}, [
+        {"path": f"relations.{PARKS}", "value": {**PARK_ENDS, "cardinality": "many_to_one"},
+         "reason": "使用者说：一个景区有多条入园记录"},
+    ])
+    rel = saved["relations"][0]
+    assert (rel["source"], rel["status"], rel["reason"]) == ("fk", "confirmed", "使用者说：一个景区有多条入园记录")
+    outcome = catalog_profile._TableOutcome(relations=[catalog_profile._RelationOutcome(
+        rid=PARKS, target="parks.id", coverage=None, cardinality="one_to_one", cardinality_checked=True, holds=True,
+        sample=1000, matched=1000, note="数据剖析：子表一侧每个键都只有一行。")])
+    rel = catalog_profile._apply(saved, outcome, at=LATER)[0]["relations"][0]
+    assert rel["cardinality"] == "many_to_one" and rel.get("cardinality_checked") is not True
+    assert (rel["source"], rel["status"], rel["reason"]) == ("fk", "confirmed", "使用者说：一个景区有多条入园记录")
+    assert rel["note"] == "数据剖析：子表一侧每个键都只有一行。"
+
+    plain = catalog_profile._apply({"relations": [fk]}, outcome, at=LATER)[0]["relations"][0]
+    assert plain["cardinality"] == "one_to_one" and plain["cardinality_checked"] is True
+    assert (plain["source"], plain["status"]) == ("fk", "verified")

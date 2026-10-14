@@ -1021,9 +1021,12 @@ def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
 
 def _patch_fk(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
     """外键关系只补基数和「用数据核实过」：外键结构推的多对一可能其实是一对一，数据说了算。来源、状态、
-    覆盖率都不动；备注同 _patch_confirmed（只是旧备注的日期不同不换）。返回改没改。"""
+    覆盖率都不动；备注同 _patch_confirmed（只是旧备注的日期不同不换）。人工确认过的（值不变、保存即确认的外键关系，
+    来源仍是 fk）同 _patch_confirmed：不改人定的基数，数据核实出的不一样时也不标「用数据核实过」，测量的说法照常写进
+    备注。返回改没改。"""
     changed = False
-    if o.cardinality_checked:
+    overruled = rel.get("status") == "confirmed" and rel.get("cardinality") not in (None, o.cardinality)
+    if o.cardinality_checked and not overruled:
         if rel.get("cardinality") != o.cardinality:
             rel["cardinality"] = o.cardinality
             changed = True
