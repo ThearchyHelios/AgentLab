@@ -75,8 +75,15 @@
 一张表的模型部分全部结束。后台起草任务据此落库（data/catalog_jobs.py）。块：这张表实际分成几块来问——一开始是段数，
 一段被缩小的上限分开成几块、被拆成两半，块数就多几块；一块问完（写没写出来都算）算结束一块。
 
-交给模型的只有表结构（列、类型、主键、外键、唯一约束、注释）和使用者补充的背景，不发任何数据值。写给模型的文字都在
-catalog.py 名字带 _SYSTEM / _PROMPT 的常量里；这里的 REASON_* 是给人看的（拼进这张表的 model_error）。
+**防错事实。** 表级的项里模型可以提议有效行过滤（valid_filter）和去重规则（dedup），各附一句依据（写进这一项的 note），
+校验见 catalog._from_model（有效行过滤按方言解析，不过就丢掉）。开了数据剖析的源（catalog_profile.profile_settings）：
+目录里记下的码值交给模型做背景（遮罩的列不给），表级那段写完后经剖析的只读守卫数一数有效行过滤排除了多少行
+（catalog_profile.check_valid_filter），排除 0% 或 100% 的不收，收下的 note 写上排除比例；没开剖析、连不上的照收，
+note 写没有核对的原因。
+
+交给模型的是表结构（列、类型、主键、外键、唯一约束、注释）和使用者补充的背景；开了数据剖析的源另给目录里记下的码值
+（剖析取过的取值和含义，遮罩的列不给），别的数据值一概不发。写给模型的文字都在 catalog.py 名字带 _SYSTEM / _PROMPT
+的常量里；这里的 REASON_* 是给人看的（拼进这张表的 model_error）。
 """
 from __future__ import annotations
 
@@ -749,6 +756,8 @@ class _Table:
     #: 块进度：实际分成几块、结束了几块
     chunks_total: int = 0
     chunks_done: int = 0
+    #: 有效行过滤核对过了（表级那段写完核对一次）
+    vetted: bool = False
 
     def whole(self, piece: _Piece) -> bool:
         return piece.table_level and len(piece.columns) == len(self.columns)
@@ -863,6 +872,15 @@ class _Run:
         self.was_halted = False
         #: 这次起草里结构化输出只给空壳时换纯文本问过没有（止损期间只问这一次）
         self.text_probed = False
+        #: 数据源：开了数据剖析的源把码值交给模型、核对有效行过滤的排除比例（遮罩的列都不碰）
+        from app.data import catalog_profile
+        from app.data.engine import masked_columns
+
+        self.source = source
+        self.kind = getattr(source, "kind", None)
+        options = getattr(source, "options", None)
+        self.profiling = catalog_profile.profile_settings(options if isinstance(options, dict) else None)
+        self.masked = {c.lower() for c in masked_columns(options if isinstance(options, dict) else None)}
 
     def _halted(self) -> bool:
         """止损：最近 MODEL_HALT_WINDOW 次调用里有 MODEL_HALT_ON 次以上没写出来。之后的段不再拆小、每块只问一次，直到
@@ -949,15 +967,18 @@ class _Run:
         """起草一段；它之后的段（宽表的列分段）排到队尾；一张表的段都结束了，这张表的模型部分就结束了。
 
         这一段（原始段：计划里的整表段、表级那段或一个列分段）连同按缩小后的上限分开的各块、拆出来的、补问的、重试的，
-        一共最多调用 MODEL_PART_MAX_CALLS 次（各块共用一个 _Budget）。接连几段没写出来的表（_tally），剩下的段跳过不问。
-        宽表写出了一段、后面还有段没结束，就把这张表到这时拿到的内容交给调用方并入目录（part_written）；最后一段结束由
-        table_done 收尾。"""
+        一共最多调用 MODEL_PART_MAX_CALLS 次（各块共用一个 _Budget）。表级那段写完先核对模型提议的有效行过滤（_vet），
+        再交出去。接连几段没写出来的表（_tally），剩下的段跳过不问。宽表写出了一段、后面还有段没结束，就把这张表到这时
+        拿到的内容交给调用方并入目录（part_written）；最后一段结束由 table_done 收尾。"""
         asked = [p for p in work.pieces if not self.tables[p.table].abandoned]
         for piece in work.pieces:
             if self.tables[piece.table].abandoned:
                 await self._skip_part(piece)
         if asked:
             await self._start(asked, _Budget(max(1, int(C.MODEL_PART_MAX_CALLS))))
+            for piece in asked:
+                if piece.table_level:
+                    await self._vet(self.tables[piece.table])
             self._tally(asked)
         for piece in work.pieces:
             await self._part_done(piece.table)
@@ -1408,7 +1429,8 @@ class _Run:
             gain = _Gain()
             for entry in by_table.get(piece.table, []):
                 gain.named = st.named = True
-                notes = _restrict(C._from_model(entry, st.meta, system=self.system), piece)
+                drafted = C._from_model(entry, st.meta, system=self.system, source_kind=self.kind, table=st.name)
+                notes = _restrict(drafted, piece)
                 cols = entry.get("columns") if isinstance(entry.get("columns"), list) else []
                 gain.answered |= {c.get("name") for c in cols if isinstance(c, dict) and c.get("name") in piece.columns}
                 slots = C._slots(notes)
@@ -1572,6 +1594,47 @@ class _Run:
         st = self.tables[name]
         await self._hook(self.hooks.part_written, name, PartWrite(copy.deepcopy(st.notes), len(st.written_parts)))
 
+    # ---------------------------------------------------------------- 防错事实：核对有效行过滤
+
+    async def _vet(self, st: _Table) -> None:
+        """表级那段写完，核对模型提议的有效行过滤（只核对一次）。
+
+        - 目录里人工确认、驳回过的有效行过滤：并入时不会采用这次的提议，不必再查库；
+        - 没开数据剖析：照收，note 写「没有核对排除比例（数据源没有开数据剖析）」；
+        - 开了：经剖析的只读守卫数排除比例（catalog_profile.check_valid_filter）。排除 0% 或 100% 的不收（日志记一条，
+          不算失败）；收下的 note 在依据后面写上剖析核对的结果，或者没有核对的原因。"""
+        if st.vetted:
+            return
+        st.vetted = True
+        item = st.notes.get("valid_filter")
+        if not isinstance(item, dict):
+            return
+        held = (st.existing or {}).get("valid_filter")
+        if isinstance(held, Mapping) and held.get("status") in ("confirmed", "rejected"):
+            return
+        from app.data import catalog_profile
+
+        if not self.profiling.enabled:
+            found = catalog_profile.FilterCheck(True, catalog_profile.FILTER_UNCHECKED.format(
+                why=catalog_profile.FILTER_NOT_ENABLED))
+        else:
+            try:
+                found = await catalog_profile.check_valid_filter(self.source, st.name, dict(st.meta),
+                                                                 str(item.get("value") or ""), settings=self.profiling)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - 核对是附加的：出了意外照收，写明没有核对
+                from app.core.errors import describe_exception, first_line
+
+                logger.exception("起草数据目录：核对表 %s 的有效行过滤时出错", st.name)
+                found = catalog_profile.FilterCheck(True, catalog_profile.FILTER_UNCHECKED.format(
+                    why=f"核对时出错：{first_line(e) or describe_exception(e)}"))
+        if not found.keep:
+            logger.info("起草数据目录：表 %s 的有效行过滤 %s 没有收下：%s", st.name, item.get("value"), found.dropped)
+            st.notes.pop("valid_filter", None)
+            return
+        item["note"] = _sentences(item.get("note"), found.note)
+
     @staticmethod
     async def _hook(fn: Callable[..., Awaitable[None]] | None, *args: Any) -> None:
         if fn is None:
@@ -1650,7 +1713,12 @@ class _Run:
             for group in meta.get("unique") or []:
                 if isinstance(group, list) and group:
                     lines.append(labels["unique"].format(cols="、".join(group)))
-        confirmed = self._confirmed_lines(st, piece)
+        shown = self._confirmed_for(st, piece)
+        codes = self._codes_lines(st, piece, shown)
+        if codes:
+            lines.append(labels["codes"])
+            lines += codes
+        confirmed = C._notes_lines(shown, meta=st.meta, system_notes=False)
         if confirmed:
             lines.append(labels["confirmed"])
             lines += confirmed
@@ -1671,7 +1739,7 @@ class _Run:
         return line + ("，" + "，".join(marks) if marks else "")
 
     @staticmethod
-    def _confirmed_lines(st: _Table, piece: _Piece) -> list[str]:
+    def _confirmed_for(st: _Table, piece: _Piece) -> dict[str, Any]:
         """已确认、有确证的项（以此为准的背景）：整表全给；其余给表级的项和这一段的列，关系只在要写表级的项时给。"""
         confirmed = C._confirmed_only(st.existing)
         if not st.whole(piece):
@@ -1679,7 +1747,32 @@ class _Run:
             kept = {key: item for key, item in C._slots(confirmed).items()
                     if key[0] == "t" or (key[0] == "c" and key[1] in wanted) or (key[0] == "r" and piece.table_level)}
             confirmed = C._assemble(kept)
-        return C._notes_lines(confirmed, meta=st.meta, system_notes=False)
+        return confirmed
+
+    def _codes_lines(self, st: _Table, piece: _Piece, shown: Mapping[str, Any]) -> list[str]:
+        """开了数据剖析的源：目录里记下的码值（剖析取过的取值和已知含义）交给模型，判断有效行过滤、列的含义用。要写表级
+        的项的给全部列的，只写几列的给这几列的；遮罩的列、驳回的码值不给；「已确认的目录项」里已经有的不重复。"""
+        if not self.profiling.enabled:
+            return []
+        labels = C.CATALOG_DRAFT_PROMPT_LABELS
+        wanted = set(st.columns) if piece.table_level else set(piece.columns)
+        known = C.visible_notes(st.existing).get("columns") or {}
+        given = (shown.get("columns") or {}) if isinstance(shown.get("columns"), Mapping) else {}
+        out: list[str] = []
+        for col in st.columns:
+            item = (known.get(col) or {}).get("codes")
+            if col not in wanted or col.lower() in self.masked or not isinstance(item, Mapping):
+                continue
+            if "codes" in (given.get(col) or {}) or not isinstance(item.get("value"), Mapping) or not item["value"]:
+                continue
+            out.append(labels["code"].format(name=col, codes=C._codes_text(item["value"])))
+        return out
+
+
+def _sentences(*parts: Any) -> str:
+    """几句话连成一段：各句去掉句末的句号，用句号隔开（「依据：……。剖析核对：……」）。"""
+    texts = [str(p).strip().rstrip("。") for p in parts if isinstance(p, str) and p.strip()]
+    return "。".join(texts)
 
 
 __all__ = ["BUDGET_WORDS", "Background", "CallReport", "FAILURE_LABEL", "Hooks", "ModelOutcome", "NOTICE", "PartWrite",

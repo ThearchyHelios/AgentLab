@@ -155,6 +155,124 @@ def test_the_condition_is_rendered_with_the_columns_quoted_like_the_source():
 
 
 # --------------------------------------------------------------------------
+# 模型给的两项：校验、依据
+# --------------------------------------------------------------------------
+
+
+def test_the_model_fields_become_llm_items_with_their_reason():
+    entry = {"table": "orders", "label": "订单",
+             "valid_filter": {"condition": "status NOT IN ('C', 'X')", "reason": "状态注释写明 C 作废、X 测试单"},
+             "dedup": {"rule": "同一订单号有多行时只取最后修改的一行", "reason": "订单号可能重复导出"}}
+    notes = catalog._from_model(entry, META, system=False, source_kind="sqlite", table="orders")
+    vf, dd = notes["valid_filter"], notes["dedup"]
+    assert (vf["value"], vf["source"], vf["status"]) == ("status NOT IN ('C', 'X')", "llm", "proposed")
+    assert vf["note"] == "依据：状态注释写明 C 作废、X 测试单"
+    assert (dd["value"], dd["source"], dd["status"]) == ("同一订单号有多行时只取最后修改的一行", "llm", "proposed")
+    assert dd["note"] == "依据：订单号可能重复导出"
+    assert not catalog.validate_notes(notes)
+
+
+def test_plain_strings_are_accepted_and_bad_filters_dropped(caplog):
+    entry = {"table": "orders", "label": "订单", "valid_filter": "status <> 'C'", "dedup": "按订单号去重"}
+    notes = catalog._from_model(entry, META, system=False, source_kind="sqlite", table="orders")
+    assert notes["valid_filter"]["value"] == "status <> 'C'" and "note" not in notes["valid_filter"]
+    assert notes["dedup"]["value"] == "按订单号去重"
+
+    with caplog.at_level(logging.INFO, logger="app.data.catalog"):
+        notes = catalog._from_model({"table": "orders", "label": "订单",
+                                     "valid_filter": {"condition": "status IN (SELECT 1)", "reason": "猜的"}},
+                                    META, system=False, source_kind="sqlite", table="orders")
+    assert "valid_filter" not in notes and notes["label"]["value"] == "订单", "丢掉这一项，别的照收"
+    assert any("有效行过滤" in r.getMessage() and "orders" in r.getMessage() for r in caplog.records), "日志记一条"
+    for junk in ({"condition": ""}, {"reason": "只有依据"}, ["status = 1"], 3):
+        notes = catalog._from_model({"table": "orders", "valid_filter": junk, "dedup": junk}, META, system=False,
+                                    source_kind="sqlite", table="orders")
+        assert "valid_filter" not in notes and "dedup" not in notes, junk
+
+
+def test_the_prompt_asks_for_the_two_facts_only_when_evident():
+    system = catalog.CATALOG_DRAFT_SYSTEM
+    assert "valid_filter" in system and "dedup" in system
+    assert "拿不准就不写" in system and "reason" in system
+    assert "UPPER、LOWER、TRIM、COALESCE" in system
+    props = catalog.CATALOG_DRAFT_PROMPT_SCHEMA["properties"]["tables"]["items"]["properties"]
+    assert set(props["valid_filter"]["properties"]) == {"condition", "reason"}
+    assert set(props["dedup"]["properties"]) == {"rule", "reason"}
+    assert '"valid_filter": {"condition"' in catalog.CATALOG_DRAFT_TEXT_PROMPT
+    assert '"dedup": {"rule"' in catalog.CATALOG_DRAFT_TEXT_PROMPT
+    assert "有效行过滤" in catalog.CATALOG_DRAFT_PROMPT_LABELS["only_table"]
+
+
+# --------------------------------------------------------------------------
+# 引擎：没开剖析照收、写明没有核对；开了剖析的源把码值交给模型
+# --------------------------------------------------------------------------
+
+REPLY = {"label": "订单", "grain": "每笔订单一行",
+         "valid_filter": {"condition": "status NOT IN ('C', 'X')", "reason": "状态注释写明 C 作废、X 测试单"},
+         "dedup": {"rule": "同一订单号只取最后一行", "reason": "订单号可能重复"},
+         "columns": [{"name": "status", "label": "订单状态"}]}
+
+
+async def test_without_profiling_the_filter_is_kept_and_says_it_was_not_checked():
+    model = FakeModel({"orders": REPLY})
+    got = await D.run_model_draft(model, _plain({"orders": _orders()}), ["orders"])
+    o = got["orders"]
+    assert o.status == "ok"
+    vf = o.notes["valid_filter"]
+    assert (vf["source"], vf["status"]) == ("llm", "proposed")
+    assert vf["note"] == "依据：状态注释写明 C 作废、X 测试单。没有核对排除比例（数据源没有开数据剖析）"
+    assert o.notes["dedup"]["note"] == "依据：订单号可能重复"
+
+
+async def test_an_invalid_filter_from_the_model_is_dropped_not_failed():
+    reply = {**REPLY, "valid_filter": {"condition": "status IN (SELECT code FROM bad_codes)", "reason": "猜的"}}
+    got = await D.run_model_draft(FakeModel({"orders": reply}), _plain({"orders": _orders()}), ["orders"])
+    o = got["orders"]
+    assert o.status == "ok" and o.error is None, "不算失败"
+    assert "valid_filter" not in o.notes and o.notes["dedup"]["value"] == "同一订单号只取最后一行"
+
+
+def _codes_existing() -> dict:
+    return {"orders": {"columns": {
+        "status": {"codes": make_item({"C": "作废", "X": "", "P": "已支付"}, "profile", "proposed")},
+        "order_no": {"codes": make_item({"A1": "甲"}, "profile", "proposed")},
+        "amount": {"codes": make_item({"0": "零"}, "profile", "rejected")},
+    }}}
+
+
+async def test_codes_go_to_the_model_when_profiling_is_on_but_not_masked_ones():
+    on = {PROFILE_OPTION: {"enabled": True}, MASK_COLUMNS_OPTION: ["ORDER_NO"]}
+    model = FakeModel({"orders": REPLY})
+    await D.run_model_draft(model, _plain({"orders": _orders()}, options=on), ["orders"], existing=_codes_existing())
+    text = model.calls[0]
+    head = catalog.CATALOG_DRAFT_PROMPT_LABELS["codes"]
+    assert head in text
+    block = text[text.index(head):]
+    assert "- status：C=作废、P=已支付，X 的含义待填写" in block
+    assert "A1" not in text, "遮罩的列不给码值"
+    assert "零" not in text, "驳回的码值不给"
+
+    plain = FakeModel({"orders": REPLY})
+    await D.run_model_draft(plain, _plain({"orders": _orders()}), ["orders"], existing=_codes_existing())
+    assert head not in plain.calls[0] and "已支付" not in plain.calls[0], "没开剖析不给码值"
+
+
+async def test_codes_reach_the_table_part_of_a_wide_table_and_only_their_column_part():
+    cols = [_col(f"c{i:03d}") for i in range(1, 46)] + [_col("state", "TEXT")]
+    wide = {"qualified": "wide", "schema": None, "is_view": False, "primary_key": ["c001"], "foreign_keys": [],
+            "comment": None, "columns": cols}
+    existing = {"wide": {"columns": {"state": {"codes": make_item({"9": "作废"}, "profile", "proposed")}}}}
+    on = {PROFILE_OPTION: {"enabled": True}}
+    model = FakeModel({"wide": {"label": "宽表"}})
+    await D.run_model_draft(model, _plain({"wide": wide}, options=on), ["wide"], existing=existing)
+    head = catalog.CATALOG_DRAFT_PROMPT_LABELS["codes"]
+    with_codes = [requested(c)["wide"] for c in model.calls if "9=作废" in c]
+    assert ("table", None) in with_codes, "表级那段要提议有效行过滤：给全部码值"
+    assert all(part == "table" or "state" in (cols or []) for part, cols in with_codes)
+    assert any(head not in c for c in model.calls), "不含这一列的列分段不给"
+
+
+# --------------------------------------------------------------------------
 # 剖析核对排除比例
 # --------------------------------------------------------------------------
 
@@ -213,3 +331,55 @@ async def test_unchecked_filters_are_kept_with_the_reason(scenic, tmp_path):
     gone = await scenic(database=str(tmp_path / "missing" / "nope.db"))
     found = await catalog_profile.check_valid_filter(gone, "visits", meta_of(gone), "status = 1")
     assert found.keep and found.note.startswith("没有核对排除比例（查询失败：")
+
+
+async def test_the_engine_checks_the_filter_on_a_profiled_source(scenic, scenic_db):
+    source = await scenic()
+    good = {"label": "入园记录", "valid_filter": {"condition": "status = 1", "reason": "0 是作废的检票"}}
+    got = await D.run_model_draft(FakeModel({"visits": good}), source, ["visits"])
+    vf = got["visits"].notes["valid_filter"]
+    total, excluded = _count(scenic_db, "status = 1")
+    share = catalog_profile.excluded_share(excluded, total)
+    assert vf["note"] == f"依据：0 是作废的检票。剖析核对：排除 {share} 的行（共 {total:,} 行）"
+
+    useless = {"label": "入园记录", "valid_filter": {"condition": "status IN (0, 1)", "reason": "猜的"}}
+    got = await D.run_model_draft(FakeModel({"visits": useless}), source, ["visits"])
+    assert got["visits"].status == "ok" and "valid_filter" not in got["visits"].notes, "排除 0% 的不收"
+    assert got["visits"].notes["label"]["value"] == "入园记录"
+
+
+async def test_a_confirmed_filter_is_not_checked_again(scenic, monkeypatch):
+    source = await scenic()
+    called: list[str] = []
+
+    async def counting(*args, **kw):
+        called.append("x")
+        return catalog_profile.FilterCheck(True, "不该用到")
+
+    monkeypatch.setattr(catalog_profile, "check_valid_filter", counting)
+    existing = {"visits": {"valid_filter": make_item("status = 1", "human", "confirmed")}}
+    reply = {"label": "入园记录", "valid_filter": {"condition": "status <> 0", "reason": "0 是作废"}}
+    await D.run_model_draft(FakeModel({"visits": reply}), source, ["visits"], existing=existing)
+    assert called == [], "人工确认过的有效行过滤，起草的提议并入时不会采用，不必再查库"
+
+
+# --------------------------------------------------------------------------
+# SQL 检查：推断的有效行过滤只是提示，确认后才是警告
+# --------------------------------------------------------------------------
+
+
+async def test_a_drafted_filter_only_hints_until_someone_confirms_it(scenic):
+    source = await scenic(options={})
+    entry = {"table": "visits", "valid_filter": {"condition": "status = 1", "reason": "0 是作废"}}
+    meta = source.schema_cache["tables"]["visits"]
+    notes = catalog._from_model(entry, meta, system=False, source_kind="sqlite", table="visits")
+    sql = "SELECT COUNT(*) FROM visits"
+
+    def levels(table_notes: dict) -> list[tuple[str, str]]:
+        checker = sqlcheck.SqlChecker(kind="sqlite", schema_cache=source.schema_cache, notes={"visits": table_notes})
+        return [(c.code, c.level) for c in checker.check(sql)]
+
+    assert levels(notes) == [("missing_valid_filter", "info")]
+    confirmed = catalog.review_item(notes, "valid_filter", "confirm")
+    assert levels(confirmed) == [("missing_valid_filter", "warning")]
+    assert levels(catalog.review_item(notes, "valid_filter", "reject")) == []
