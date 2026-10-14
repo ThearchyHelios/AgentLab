@@ -16,9 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import copilot_context
 from app.api.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
-# 摘要的预算和截断阈值随数据源上下文搬到了 copilot_context，这里留着老名字
-from app.api.copilot_context import DATASOURCE_BUDGET_CHARS as _DATASOURCE_BUDGET_CHARS  # noqa: F401
-from app.api.copilot_context import DETAIL_TABLE_LIMIT as _DETAIL_TABLE_LIMIT  # noqa: F401
+# 读流、解析、落地搬到了生成过程（copilot_gen），这里留着老名字：测试和别处照旧从这里取
+from app.api.copilot_gen import (  # noqa: F401
+    AppApplier, AppChecker, CopilotIncomplete, Generation, GraphApplier, GraphChecker, _apply_op, _iter_ops,
+    _member_key, _NODE_TYPES, _parse_op_line, merge_node_config,
+)
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
 from app.core.errors import explain as explain_error, graph_error, raw as raw_error
 from app.data.sqlcheck import CHECK_CODES
@@ -72,15 +74,14 @@ def _scope_note(rows: list[Any], scoped: bool) -> str:
             "db_schema__ 工具；前几轮用过别的库，这一轮也不要沿用")
 
 
-def _tool_catalog(rows: list[Any], context: copilot_context.DatasourceContext | None = None) -> str:
-    """给 Copilot 看的工具清单。
+def _tool_catalog(rows: list[Any]) -> str:
+    """给助手看的工具清单。
 
     all_specs() 只有静态注册的内置工具，数据源工具是运行时按库动态生成的
-    （db_query__<源>），不补进来 Copilot 就不知道它们存在，只会退回让用户
+    （db_query__<源>），不补进来助手就不知道它们存在，只会退回让用户
     自己写 SQL 的代码节点——接了数据库等于白接。
 
-    「可查」后面列前 12 个对象。给了这一轮的数据源上下文时按它排：大库里按需求挑中的表排在前面
-    （DatasourceContext.listed），不然列出来的是表结构里排在最前的那几张，和需求未必相干。
+    不列表名（look 文档 D3）：以前每个库列前 12 个表名，和这一轮要做什么无关，闲聊也带着；表数写一句，字段要用时 look。
     """
     lines = [
         f"- {name}（{spec.category}）：{spec.description}"
@@ -91,12 +92,11 @@ def _tool_catalog(rows: list[Any], context: copilot_context.DatasourceContext | 
     from app.tools.datasource import QUERY_PREFIX, SCHEMA_PREFIX
 
     for row in rows:
-        tables = context.listed(row) if context is not None else _introspect.table_names(row)
-        listed = "、".join(tables[:12]) + (f" 等 {len(tables)} 个对象" if len(tables) > 12 else "")
+        tables = _introspect.table_names(row)
         lines.append(
             f"- {QUERY_PREFIX}{row.name}（数据库）：在「{row.name}」上执行 SQL。"
             f"{row.description or ''}"
-            + (f" 可查：{listed}" if tables else " ⚠ 结构未探查")
+            + (f" 共 {len(tables)} 张表，字段要用时 look" if tables else " ⚠ 结构未探查")
         )
         lines.append(
             f"- {SCHEMA_PREFIX}{row.name}（数据库）：查看「{row.name}」的表结构"
@@ -104,45 +104,13 @@ def _tool_catalog(rows: list[Any], context: copilot_context.DatasourceContext | 
     return "\n".join(lines)
 
 
-#: 带进挑表需求里的前几轮问题：追问常常只说「那上上个月呢」，光看这一句挑不出表
-_PICK_HISTORY_TURNS = 3
-
-
-async def _pick_need(session: AsyncSession, payload: GenerateIn) -> str:
-    """挑表用的需求：这一轮的原话，问数据追问时再带上这次对话前几轮的问题。"""
-    from app.api.conversations import recent_turns
-
-    if not payload.conversation_id:
-        return payload.instruction
-    turns = await recent_turns(session, payload.conversation_id)
-    asked = [t.question for t in turns if t.question][-_PICK_HISTORY_TURNS:]
-    return payload.instruction + (PICK_HISTORY_PROMPT.format(questions="；".join(asked)) if asked else "")
-
-
-PICK_HISTORY_PROMPT = "\n（这次对话之前问过：{questions}）"
-
-
-async def _picker(session: AsyncSession, payload: GenerateIn,
-                  plan: copilot_context.ContextPlan) -> tuple[Any | None, str | None]:
-    """挑表用的模型：同一个助手模型（copilot_model_spec），思考、额度在 pick_model 里调。不用挑表时不拿。"""
-    if not plan.needs_pick:
-        return None, None
+async def _look_service(session: AsyncSession, payload: GenerateIn, sources: list[Any], *,
+                        graph: dict[str, Any] | None, kinds: tuple[str, ...] = ("table", "capability"),
+                        ) -> Any:
+    """这一轮的查看服务（copilot_context.look_service）。挑选模型用同一个助手模型，第一次要挑时才拿。"""
     spec = await copilot_model_spec(session, payload, max_tokens=copilot_context.PICK_MAX_TOKENS)
-    return await copilot_context.pick_model(session, spec)
-
-
-async def _datasource_context(
-    session: AsyncSession, sources: list[Any], payload: GenerateIn, *, need: str,
-    graph: dict[str, Any] | None,
-) -> copilot_context.DatasourceContext:
-    """这一轮的数据源上下文：读目录、大库按需求挑表、组装（copilot_context）。挑表失败退回只列表名，不抛异常。
-
-    非流式生成、发布前修复、升级都走这里；流式生成把三步拆开，挑表放进流里（期间发心跳、挑完发 context 操作）。
-    graph 是现有工作流：它的 SQL 查过的表一律给全字段。
-    """
-    plan = await copilot_context.plan_context(sources, graph=graph)
-    picker, unavailable = await _picker(session, payload, plan)
-    return await plan.resolve(picker, need=need, unavailable=unavailable)
+    return await copilot_context.look_service(sources, spec=spec, graph=graph, kinds=kinds,
+                                              answer=payload.intent == "answer")
 
 
 NODE_REFERENCE = """\
@@ -174,6 +142,11 @@ NODE_REFERENCE = """\
 - supervisor：多 agent 协作。config: {goal, agents:[{name, description, system, tools, model}], max_rounds}
   成员停不下来等人：需要审批的 MCP / 自定义工具在成员手里不会执行。要用这类工具，交给团队外的 agent 节点
 - tool：直接调一个工具。config: {tool: 工具名, args: {...}, assign_to}
+  **写外部系统的能力**（能力登记里读写是「写入」的，look 能力时看得到）只能放在 tool 节点里，不能绑给 agent、协作团队
+  （发布检查会拦，运行时也会拒）。写入一律先确认再发送：运行停在这个节点开头等人确认，确认卡上是按 args 渲染出来的
+  参数（遮罩后）和它的哈希，确认后按同一份参数发出，参数变了就拒绝发送。args 按引用写上游的值（{{ input.x }}、
+  {{ vars.x.字段 }}），不要让 agent 拼好整段参数再传过来；要改参数就改上游的表单，确认时不能改。结果未知时系统去核实，
+  不会自动重发。探索运行里端点没有测试环境的只演练、不真发
 - merge：合并查询，把几次查询的结果在库外按键合并成一张表。config: {inputs: {别名: 上游查询节点id}, sql, assign_to}
   **只在数据分在不同的库、要按行对齐时用**：先在各自的库里用 SQL 聚合到相同的键和粒度（比如「日期 + 门店」），
   再由 merge 按键合并。同一个库里的数据写成一条 SQL（JOIN / WITH），不要拆成两次查询再合并；只组合几个单值时
@@ -201,7 +174,19 @@ NODE_REFERENCE = """\
   **不要写 scope**。记忆域由平台给（当前统一是 default）。自己起一个域的后果是
   写进去再也读不回来——真发生过：一轮写进 scope"user"，下一轮没写 scope 落回
   default，于是「我叫张三」存下来了，问「我是谁」却答不上来
-- human：人工审批。config: {mode: approve|input|edit, title, message}
+- human：人工审批。config: {mode: approve|input|edit, title, message, assignee, policy, due, on_timeout, form, form_from,
+  correlation}。后面几项是流程应用用的（写在图里，属于流程语义）；画布试运行、定时任务里没有应用绑定，一律派给任何人，
+  和不写一样：
+  · assignee 谁来处理：{kind:"slot", slot:"finance"}（岗位：图里只写岗位名，岗位绑到哪些人或组由人在应用里做，不要写
+    具体的人）/ {kind:"initiator"}（发起人）/ {kind:"expression", expr:"input.manager"}（只能取输入和变量，结果是用户名
+    或组名）/ {kind:"hook", correlation:"…"}（等外部系统回调）
+  · policy 怎么汇总：any（默认，第一个人处理就算）/ all（全体同意才通过，任何一人驳回即否决）/ {quorum: m}（m 人同意
+    即通过）。all 和 quorum 只用于 approve 模式
+  · due 时限，ISO 8601 时长（PT4H、P2D），从待办打开时算起；on_timeout 超时怎么办：{action:"remind", every:"PT1H"} /
+    {action:"escalate", to_slot:"director"}（写明升级给哪个岗位）/ {action:"reject"}，没有自动批准
+  · form 静态表单（agentlab.form/1：{type:"object", properties:{字段:{type, title, enum…}}, required:[…]}，只有一层，
+    不支持 pattern）；form_from 引用上游 agent 拟的表单（"nodes.agent1.form"），不合规时退回 form
+  · correlation 只用于 assignee 是 hook 的：模板如 "{{ input.order_id }}"，外部系统按它找到这条待办
   title、message 说批了会怎样时写「批准后输出」「批准后继续」，**不要写「正式出具」「批准后才会出具」**：出具只发生在
   成果节点配了出具契约、并且从已发布版本发起的正式运行里；画布上试运行、问数据都是探索运行，批准后只是输出。
   这次是探索运行还是正式运行，审批卡会自己标明。审的是报告时把 human 接在 report 后面（message 里可以引用
@@ -464,6 +449,8 @@ async def _history_section(session: AsyncSession, conversation_id: str | None) -
     实测这种重建经常接到另一张表上，答案对不上前一轮，用户完全无从判断。
 
     图走 _slim 去掉坐标噪音，和 base_graph 那条路径用的是同一份。
+
+    上一轮查看过的对象（前端存在这一轮的 meta.looks 里）写一行：追问时模型直接点名看，不用再按需求挑（look 文档 D7）。
     """
     from app.api.conversations import _answer_of, recent_turns
 
@@ -489,7 +476,34 @@ async def _history_section(session: AsyncSession, conversation_id: str | None) -
             "\n\n上一轮用的工作流（数据源和表都已经对好了）：\n"
             f"{json.dumps(_slim(last_graph), ensure_ascii=False, indent=2)}"
         )
+    if looked := _looked_line(turns[-1]):
+        block += "\n\n" + looked
     return block
+
+
+LOOKED_PROMPT = "上一轮查看过：{items}（要再看时直接点名）"
+LOOKED_KIND_PROMPT = {"capability": "能力 {names}", "workflow_version": "工作流版本 {names}"}
+
+
+def _looked_line(turn: Any) -> str:
+    """上一轮 meta.looks 里查看过的对象，一行：「上一轮查看过：库 B 的 refunds、orders；能力 x」。没查看过是空串。"""
+    from app.api.conversations import turn_meta
+
+    looks = (turn_meta(turn) or {}).get("looks")
+    parts: list[str] = []
+    for look in looks if isinstance(looks, list) else []:
+        for obj in (look.get("objects") or []) if isinstance(look, dict) else []:
+            if not isinstance(obj, dict):
+                continue
+            names = [n for key in ("named", "picked", "joined") for n in obj.get(key) or [] if isinstance(n, str)]
+            if not names:
+                continue
+            kind = obj.get("kind")
+            text = (f"{obj.get('source')} 的 " + "、".join(names) if kind == "table" and obj.get("source")
+                    else LOOKED_KIND_PROMPT.get(str(kind), "{names}").format(names="、".join(names)))
+            if text not in parts:
+                parts.append(text)
+    return LOOKED_PROMPT.format(items="；".join(parts)) if parts else ""
 
 
 def _with_history(user: str, history: str) -> str:
@@ -727,90 +741,96 @@ GRAPH_SCHEMA: dict[str, Any] = {
 }
 
 
+def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, looks: Any) -> str:
+    """画布、问数据（流式和非流式）共用的 system：节点手册、工具清单、数据源概览、结构要求、输出协议、查看的用法。
+    这一份一直用到自查修正结束（接着写、修正轮都不换），模型前后看到的是同一套说法。"""
+    return (
+        "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources)}"
+        f"{datasources}{_scope_note(sources, scope is not None)}\n\n"
+        "结构要求：\n"
+        "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
+        "2. 节点 id 用简短英文小写下划线；label 用中文，一眼看懂\n"
+        "3. 用 assign_to 传结果，下游 {{ vars.变量名 }} 引用\n"
+        "4. 只能用上面列出的工具名\n"
+        "5. 能用 3 个节点解决就别堆 8 个\n\n"
+        f"{_STREAM_PROTOCOL}"
+        + (f"\n\n{looks.guide()}\n{copilot_context.LOOK_WHEN_PROMPT}" if looks.kinds else "")
+    )
+
+
+def _graph_request(payload: GenerateIn) -> str:
+    """这一轮的请求：改现有图时附上原图、只要改动操作；新建时按入口包好（_user_message）。"""
+    if payload.base_graph and payload.base_graph.get("nodes"):
+        return (
+            "这是当前的工作流：\n"
+            f"{json.dumps(_slim(payload.base_graph), ensure_ascii=False, indent=2)}\n\n"
+            f"请按下面的要求修改它（只输出改动操作）：\n{payload.instruction}"
+        )
+    return _user_message(payload, patch=False)
+
+
+def _start_graph(payload: GenerateIn) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """服务端维护的图状态：修改场景从 base_graph 起步（拷一份再改：改之前的样子还要留着比对工具绑定），新建从空图起步。"""
+    if not (payload.base_graph and payload.base_graph.get("nodes")):
+        return {}, []
+    nodes = {n["id"]: copy.deepcopy(n) for n in payload.base_graph["nodes"]}
+    edges = [{k: v for k, v in e.items() if k in ("source", "target", "sourceHandle")}
+             for e in payload.base_graph.get("edges") or []]
+    return nodes, edges
+
+
 @router.post("/generate", response_model=GenerateOut)
 async def generate(
     payload: GenerateIn, session: AsyncSession = Depends(get_session)
 ) -> GenerateOut:
-    """用自然语言生成或改写一张工作流图。
+    """用自然语言生成或改写一张工作流图，一次返回整张图。
 
-    产物会经过和手工编排完全相同的校验与排版，所以生成完就是可运行、可读的，
-    而不是一段还要人去修的 JSON。
+    和流式生成走同一个生成过程（copilot_gen：起草、按需查看、自查修正），只是不推送过程，收完再排版、校验后返回。
+    产物会经过和手工编排完全相同的校验与排版，所以生成完就是可运行、可读的。
     """
+    from app.data.sqlcheck import load_checkers
+
     sources = await _sources(session, payload.datasource_ids)
     scope = {r.name for r in sources} if payload.datasource_ids else None
-    # 先拿模型：没配好就直接 400，不白花一次挑表
+    # 先拿模型：没配好就直接 400，不白读一遍目录
     try:
-        model, _ = await get_chat_model(session, await copilot_model_spec(session, payload))
+        model, _ = await _op_model(session, payload)
     except ProviderNotConfigured as e:
         raise HTTPException(400, _unconfigured(e)) from e
-    # 和流式生成同一套数据源上下文，只是不发 context 操作（这条接口一次返回整张图）
-    context = await _datasource_context(
-        session, sources, payload, need=await _pick_need(session, payload),
-        graph=payload.base_graph if (payload.base_graph or {}).get("nodes")
-        else await _previous_graph(session, payload.conversation_id))
-    tool_list = _tool_catalog(sources, context)
-    datasources = context.section() + _scope_note(sources, scope is not None)
-
-    system = (
-        "你是一个 agent 工作流编排专家。根据用户需求产出一张可执行的工作流图。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{tool_list}{datasources}\n\n"
-        "要求：\n"
-        "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
-        "2. 节点 id 用简短英文小写下划线，例如 fetch_data、summarize\n"
-        "3. 每个节点写清楚 label（中文），让人在画布上一眼看懂它干什么\n"
-        "4. 需要把结果传给下游时，用 assign_to 命名变量，下游用 {{ vars.变量名 }} 引用\n"
-        "5. 不要凭空发明工具名，只能用上面列出的\n"
-        "6. 结构尽量简单：能用 3 个节点解决就别堆 8 个"
-    )
-
-    if payload.base_graph and payload.base_graph.get("nodes"):
-        user = (
-            "这是当前的工作流：\n"
-            f"{json.dumps(_slim(payload.base_graph), ensure_ascii=False, indent=2)}\n\n"
-            f"请按下面的要求修改它，返回完整的新图（不是补丁）：\n{payload.instruction}"
-        )
-    else:
-        user = _user_message(payload, patch=False)
-
-    messages = [("system", system),
-                ("human", _with_history(user, await _history_section(session, payload.conversation_id)))]
+    checkers = await load_checkers(session, sources)
+    prev_graph = await _previous_graph(session, payload.conversation_id)
+    looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
+        payload.base_graph or {}).get("nodes") else prev_graph)
+    system = _graph_system(sources, scope, await copilot_context.section(looks), looks)
+    nodes, edges = _start_graph(payload)
+    baseline = copy.deepcopy((payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
+    applier = GraphApplier(nodes, edges, patches=False)
+    gen = Generation(model, system=system, applier=applier, looks=looks,
+                     checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers))
+    human = _with_history(_graph_request(payload), await _history_section(session, payload.conversation_id))
     try:
-        raw = await model.with_structured_output(GRAPH_SCHEMA).ainvoke(messages)
-        if not isinstance(raw, dict):
-            raw = json.loads(message_text(raw))
-    except Exception:  # noqa: BLE001 - 不支持结构化输出的模型退回文本解析
-        try:
-            text = message_text(await model.ainvoke(messages))
-            raw = _extract_json(text)
-        except Exception as e:  # noqa: BLE001
-            reason, _ = explain_error(e)
-            raise HTTPException(
-                502, f"模型未返回可用的工作流（{reason}）。请换一种描述重试；如反复出现，"
-                     "请在输入框的「助手使用的模型」中换用指令遵循能力更强的模型",
-            ) from e
-
-    graph = {
-        "nodes": [
-            {
-                "id": n.get("id") or f"node{i}",
-                "type": n.get("type") or "llm",
-                "position": {"x": 0, "y": 0},
-                "data": {"label": n.get("label") or "", "config": n.get("config") or {}},
-            }
-            for i, n in enumerate(raw.get("nodes") or [])
-        ],
-        "edges": [
-            {
-                "source": e.get("source", ""),
-                "target": e.get("target", ""),
-                "sourceHandle": e.get("sourceHandle"),
-            }
-            for e in (raw.get("edges") or [])
-        ],
-    }
+        async for _op in gen.draft(human):
+            pass
+        if applier.replied is None and gen.asked is None and all(o.get("op") == "plan" for o in applier.seen):
+            raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因")
+    except Exception as e:  # noqa: BLE001
+        reason, _ = explain_error(e)
+        raise HTTPException(
+            502, f"模型未返回可用的工作流（{reason}）。请换一种描述重试；如反复出现，"
+                 "请在输入框的「助手使用的模型」中换用指令遵循能力更强的模型",
+        ) from e
+    if applier.replied is not None:
+        # 这句话不需要工作流：原图照旧，回答放在说明里
+        return GenerateOut(graph=payload.base_graph or {"nodes": [], "edges": []},
+                           explanation=str(applier.replied.get("text") or ""))
+    if not nodes and prev_graph:
+        applier.replay_onto(prev_graph)
+    async for _op in gen.repair():
+        pass
 
     try:
-        spec = GraphSpec.model_validate(graph)
+        spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
     except Exception as e:  # noqa: BLE001
         raise HTTPException(
             502, f"模型返回的工作流结构有误：{graph_error(e)}。请重试，或把需求描述得更具体",
@@ -819,10 +839,11 @@ async def generate(
     spec, layout = _layout_keeping(spec, _pinned_positions(payload.base_graph))
     report = validate_graph(spec)
     out = spec.model_dump(mode="json")
-    changes = tool_changes((payload.base_graph or {}).get("nodes") or [], out["nodes"])
+    changes = tool_changes(baseline, out["nodes"])
     return GenerateOut(
         graph=out,
-        explanation=str(raw.get("explanation", "")),
+        # 模型问了用户（ask）：这一轮到此为止，问题放在说明里
+        explanation=applier.explanation or str((gen.asked or {}).get("question") or ""),
         issues=[i.model_dump() for i in report.issues if i.level != "info"]
         + _issue_dicts(scope_issues(out["nodes"], scope), "datasource_out_of_scope")
         + dropped_tool_warnings(changes, payload.instruction),
@@ -858,6 +879,10 @@ _STREAM_PROTOCOL = """\
 - 如果这句话根本不需要工作流（见下面的路径约定），**第一行也是最后一行**就输出：
   {"op":"reply","text":"直接回答的内容"}
   这时除了下面的 catalog_patch，不要输出任何别的操作
+- 要看表结构、能力的参数这类详情时输出一行 look（用法见后面的「按需查看」），输出之后就停下等查看结果，
+  拿到结果再接着写；已经输出的操作不要重复
+- 必须先问清用户才能动手时，输出一行 {"op":"ask","question":"要问的话，把候选列出来"}，这一轮就此结束：已经输出的改动
+  照常交付，用户的回答是下一轮。能按常理定的不要问
 - 数据目录修改提案（可选）：用户在这句话里**明确陈述了一条数据事实**时，另输出一行
   {"op":"catalog_patch","source":"数据源名","table":"表名","changes":[{"path":"…","value":…,"reason":"一句话依据"}]}
   它只是提案，用户确认后才写进数据目录。可以和图操作一起出现（写在 done 之前），也可以只配一行 reply（写在 reply 之前）
@@ -871,23 +896,9 @@ _STREAM_PROTOCOL = """\
   · 例：「在园人数是存量，不能跨天相加」→ columns.<那一列>.measure 写 stock；「status=9 表示作废，统计时要排除」→
     columns.status.codes 写 {"9":"作废"}，再把 valid_filter 补上排除条件；「channel_visits 是渠道和入园记录的关联表」→
     description 和两条 relations.new
-  · 只有用户明确说出了数据事实才提，不要从自己的推测、查询结果或提问里提；表名、列名必须是上面数据源里真实存在的
+  · 只有用户明确说出了数据事实才提，不要从自己的推测、查询结果或提问里提；表名、列名必须是数据源里真实存在的
+    （先 look 那张表，看清现有目录再提）
   · 计算公式不进数据目录：「转化率=下单数/访问数」这类指标怎么算的说法属于口径卡，不要提"""
-
-
-def _parse_op_line(line: str) -> dict[str, Any] | None:
-    """解析一行操作。围栏行、空行、解析失败、缺 op 的一律返回 None——
-    模型偶尔犯规不该毁掉整条流，跳过就是。"""
-    text = line.strip()
-    if not text or text.startswith("```"):
-        return None
-    try:
-        obj = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(obj, dict) or "op" not in obj:
-        return None
-    return obj
 
 
 #: 模型只发了目录修改提案、既没回答也没改图时，补的那句回答
@@ -940,137 +951,6 @@ async def catalog_patch_op(op: dict[str, Any], sources: list[Any]) -> dict[str, 
     }
 
 
-_NODE_TYPES = frozenset(t.value for t in NodeType)
-
-#: 协作成员条目里写 "remove": true 就把这个成员拿掉。不复用 null：null 在合并里
-#: 的意思是「删这个字段」，成员本身不是一个字段
-_REMOVE_MEMBER = "remove"
-
-
-def _member_key(member: dict[str, Any], index: int) -> str:
-    # 和 engine/nodes/multi.py 的叫法一致：没起名字的成员按位置叫 agentN
-    return str(member.get("name") or f"agent{index}")
-
-
-def _merge_fields(old: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
-    """按字段合并：写了的覆盖，写 null 的删掉，没写的原样保留。返回新 dict。"""
-    out = dict(old)
-    for key, value in patch.items():
-        if value is None:
-            out.pop(key, None)
-        else:
-            out[key] = value
-    return out
-
-
-def _merge_members(old: list[Any], patch: list[Any]) -> list[Any]:
-    """协作成员按 name 合并。原有成员保持原来的次序，新名字接在后面。"""
-    merged: list[Any] = list(old)
-    where = {_member_key(m, i): i for i, m in enumerate(merged) if isinstance(m, dict)}
-    dropped: set[int] = set()
-    for i, entry in enumerate(patch):
-        if not isinstance(entry, dict):
-            continue
-        key = _member_key(entry, i)
-        if entry.get(_REMOVE_MEMBER) is True:
-            if key in where:
-                dropped.add(where[key])
-            continue
-        fields = {k: v for k, v in entry.items() if k != _REMOVE_MEMBER}
-        if key in where:
-            merged[where[key]] = _merge_fields(merged[where[key]], fields)
-        else:
-            where[key] = len(merged)
-            merged.append({k: v for k, v in fields.items() if v is not None})
-    return [m for i, m in enumerate(merged) if i not in dropped]
-
-
-def merge_node_config(
-    node_type: str, old: dict[str, Any], patch: dict[str, Any]
-) -> dict[str, Any]:
-    """update_node 的 config 怎么落到节点上。前端 store/studio.ts 必须是同一套规则。
-
-    以前是整体替换：模型只想改一句提示词，照协议也得把整份 config 抄一遍，
-    漏抄的字段就没了。真出过事——改写提示词时漏了 tools，三个要查库的 agent
-    全丢了工具，一次库都没查，最后把一堆工具调用的原始标记当答案交了出去。
-    改成按字段合并之后，漏写等于不改；真要删一个字段得显式写 null。
-    """
-    if node_type == NodeType.SUPERVISOR.value and isinstance(patch.get("agents"), list):
-        members = old.get("agents") if isinstance(old.get("agents"), list) else []
-        patch = {**patch, "agents": _merge_members(members, patch["agents"])}
-    return _merge_fields(old, patch)
-
-
-def _apply_op(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], op: dict[str, Any]) -> bool:
-    """把一个操作应用到服务端维护的图状态。返回是否真的改了图。"""
-    kind = op.get("op")
-    if kind == "add_node":
-        node = op.get("node") or {}
-        # 类型不认识的节点不进图、也不转给前端：前端按类型查节点定义，查不到
-        # 以前是整站白屏，连带没保存的编辑一起丢
-        if not node.get("id") or node.get("type") not in _NODE_TYPES:
-            return False
-        nodes[node["id"]] = {
-            "id": node["id"],
-            "type": node["type"],
-            "position": {"x": 0, "y": 0},
-            "data": {"label": node.get("label") or "", "config": node.get("config") or {}},
-        }
-        return True
-    if kind == "update_node":
-        node = nodes.get(op.get("id") or "")
-        if not node:
-            return False
-        data = node.setdefault("data", {})
-        if op.get("label") is not None:
-            data["label"] = op["label"]
-        if isinstance(op.get("config"), dict):
-            data["config"] = merge_node_config(
-                str(node.get("type") or ""), data.get("config") or {}, op["config"])
-        return True
-    if kind == "remove_node":
-        node_id = op.get("id")
-        if node_id not in nodes:
-            return False
-        nodes.pop(node_id)
-        edges[:] = [e for e in edges if e["source"] != node_id and e["target"] != node_id]
-        return True
-    if kind == "add_edge":
-        edge = op.get("edge") or {}
-        if not edge.get("source") or not edge.get("target"):
-            return False
-        edges.append(
-            {
-                "source": edge["source"],
-                "target": edge["target"],
-                "sourceHandle": edge.get("sourceHandle"),
-            }
-        )
-        return True
-    if kind == "remove_edge":
-        before = len(edges)
-        edges[:] = [
-            e
-            for e in edges
-            if not (
-                e["source"] == op.get("source")
-                and e["target"] == op.get("target")
-                and (op.get("sourceHandle") is None or e.get("sourceHandle") == op.get("sourceHandle"))
-            )
-        ]
-        return len(edges) != before
-    return False
-
-
-class CopilotIncomplete(Exception):
-    """模型这一轮没说完：输出被截断，或者一个操作都没给。画布不能按「无需修改」交付。"""
-
-    def __init__(self, reason: str, *, hint: str = "", detail: str = "") -> None:
-        super().__init__(reason)
-        self.hint = hint or "画布未修改。可以重试，或把需求拆成几步分别提出"
-        self.detail = detail
-
-
 #: 流式改图的输出额度。会思考的模型（DeepSeek、Claude 的 adaptive thinking）思考也算在里面：
 #: 8192 时复杂的改图常常想完就没额度了，正文一个字没写（2026-09 部署实例上同类请求 5 轮坏了 4 轮）
 COPILOT_MAX_TOKENS = 32768
@@ -1087,53 +967,6 @@ async def _op_model(session: AsyncSession, payload: GenerateIn) -> tuple[Any, st
     return _BudgetFallback(big, small), model_id
 
 
-async def _iter_ops(model: Any, messages: list[Any]):
-    """流式读模型输出，按行切出操作。done 之后即停——后面就算有闲话也不要了。
-
-    除了操作，还把模型的思考原样转出去。原先这里只取正文、丢掉其余一切，
-    于是从请求发出到第一个操作到达之间（实测 5~30 秒）前端一个字都收不到，
-    只能干挂着"正在起草…"——用户没法判断是在想、还是已经卡死了。
-
-    思考走 thinking_text()（Claude 4.6+ 的 thinking 块），不是"把非 JSON 行
-    当成思考"：后者会把模型的 markdown 注释、协议跑偏时的乱输出一并当作思考
-    展示出来，反而误导。不支持 thinking 的模型就只有心跳，不硬凑。
-
-    没等到 done 就因为额度用完停下的，抛 CopilotIncomplete：截断之前的操作照常转出去，
-    由调用方决定整轮作废。
-    """
-    from app.engine.state import message_text as _text
-    from app.engine.state import thinking_text
-
-    buffer = ""
-    cut = ""
-    async for chunk in model.astream(messages):
-        reasoning = thinking_text(chunk)
-        if reasoning:
-            yield {"op": "thinking", "delta": reasoning}
-
-        buffer += _text(chunk)
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            op = _parse_op_line(line)
-            if op:
-                yield op
-                if op.get("op") == "done":
-                    return
-        cut = _cut_off(chunk) or cut
-    op = _parse_op_line(buffer)
-    if op:
-        yield op
-        if op.get("op") == "done":
-            return
-    if cut:
-        # 截断的流和说完了的流读起来一模一样：不在这里拦下，上面就会拿原图（或半张图）
-        # 去自查、交付，界面上写「无需修改」
-        limit = getattr(model, "max_tokens", None)
-        raise CopilotIncomplete(
-            "模型的输出超出了长度上限，修改没有写完",
-            detail=f"finish_reason={cut}" + (f"，本轮输出上限 {limit} token" if limit else ""))
-
-
 # 多久没动静就补一拍心跳。3 秒是"用户开始怀疑是不是卡了"的量级。
 _HEARTBEAT_SECONDS = 3.0
 
@@ -1144,8 +977,8 @@ async def _with_heartbeat(source: Any, phase: str = "planning", *, started: floa
     必须在这一层做而不是在 _iter_ops 里判断时间差：模型不吐 chunk 时那个
     async for 的循环体根本不执行，压根轮不到检查。
 
-    started 给了就从那一刻算已用时长：流式生成先挑表、再起草，两段的心跳要接着算，
-    不能起草一开始就跳回 0 秒。
+    started 给了就从那一刻算已用时长：起草、查看、接着写、自查修正几段的心跳要接着算，
+    不能每一段一开始就跳回 0 秒。
     """
     started = time.monotonic() if started is None else started
     iterator = source.__aiter__()
@@ -1159,13 +992,17 @@ async def _with_heartbeat(source: Any, phase: str = "planning", *, started: floa
                 except StopAsyncIteration:
                     return
                 kind = op.get("op")
-                # 阶段跟着实际操作走，前端据此换文案
-                if kind == "add_node":
+                # 阶段跟着实际操作走，前端据此换文案。查看时生成过程自己发一拍 looking，查看完回到 planning
+                if kind == "add_node" or kind in APP_OPS:
                     phase = "building"
                 elif kind in ("add_edge", "connect"):
                     phase = "wiring"
                 elif kind == "done":
                     phase = "finalizing"
+                elif kind == "heartbeat":
+                    phase = op.get("phase") or phase
+                elif kind == "look":
+                    phase = "planning"
                 yield op
                 break
             yield {
@@ -1173,23 +1010,6 @@ async def _with_heartbeat(source: Any, phase: str = "planning", *, started: floa
                 "phase": phase,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             }
-
-
-async def _heartbeat_until(task: asyncio.Future, *, started: float, phase: str = "planning"):
-    """等 task 做完，期间按拍出心跳（同 _with_heartbeat）。结果由调用方取 task.result()。
-
-    流式生成在流里挑表时用：挑表最长要等 copilot_context.PICK_TIMEOUT_S，这段时间不出声，
-    前端就只能干挂着「正在连接模型」。阶段算「理解需求」：挑表正是在读需求。
-    """
-    while not task.done():
-        done, _ = await asyncio.wait({task}, timeout=_HEARTBEAT_SECONDS)
-        if not done:
-            yield {"op": "heartbeat", "phase": phase, "elapsed_ms": int((time.monotonic() - started) * 1000)}
-
-
-#: 自查最多交回去改几轮。一轮只花一次"只输出改动"的调用；两轮还改不好，多半是
-#: 需求本身有歧义，该让人看了，而不是继续替他烧钱
-_SELF_CHECK_ROUNDS = 2
 
 
 def _sse(obj: dict[str, Any]) -> str:
@@ -1777,13 +1597,13 @@ def dropped_tool_warnings(changes: list[dict[str, Any]], instruction: str) -> li
 
 
 def _repair_request(
-    nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], errors: list[dict[str, Any]],
+    nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], errors: list[dict[str, Any]], *, looks: str = "",
 ) -> str:
-    """自查交回修正的请求：只写图和问题。
+    """自查交回修正的请求：图、问题，和这一轮查看过的结果（look 文档 D8：和起草时看到的是同一份文字）。
 
-    数据源上下文（挑中的表、字段、目录、连接条件）在 system 里，修正轮和起草用同一条 system，
-    不重新挑表：两次挑出来的表不一样，模型前后看到的结构就对不上，改着改着换了一张表。
-    猜错的列名由 sql_unknown_column 的 for_model 带回那几张表的真实列。
+    修正轮和起草用同一条 system；查看结果在起草那段对话里，修正是另起的一段，所以原样带上，模型不用再看一遍。
+    修正时还可以再看 1 次（比如 sql_unknown_column 指向了一张没看过的表）。猜错的列名由 sql_unknown_column 的
+    for_model 带回那几张表的真实列。
     """
     graph = {"nodes": list(nodes.values()), "edges": edges}
     return (
@@ -1794,6 +1614,7 @@ def _repair_request(
         + "\n\n只修这些问题，别的不要动。用操作流输出修正：改节点用 update_node"
           "（config 只写要改的字段，没写的保持原样；要删掉一个字段写 null）；"
           "缺节点、缺边就补上。最后一行输出 done。"
+        + (f"\n\n这一轮查看过的结构（和起草时看到的是同一份）：\n{looks}" if looks else "")
     )
 
 
@@ -1801,8 +1622,9 @@ def _repair_request(
 async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(get_session)):
     """流式版生成：SSE 逐操作推送，前端边收边把节点摆上画布。
 
-    结束时（done 或流断）发一条 final：服务端把累积的图排版、校验后整体给出——
-    过程可见性来自操作流，最终质量仍由和手工编排相同的 layout + validate 保证。
+    生成过程（copilot_gen）读到 look 就停下、查看、接着写，查看记录作为 look 事件发给前端（前端存进这一轮的
+    meta.looks）。结束时（done 或流断）发一条 final：服务端把累积的图排版、校验后整体给出——过程可见性来自操作流，
+    最终质量仍由和手工编排相同的 layout + validate 保证。模型问了用户（ask）的，这一轮到此为止，不自查修正、不自动运行。
     """
     from fastapi.responses import StreamingResponse
 
@@ -1812,134 +1634,59 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     scope = {r.name for r in sources} if payload.datasource_ids else None
     # 基于数据目录的 SQL 检查器：在开流之前读好目录（流里不再碰这个会话），自查和收尾共用
     checkers = await load_checkers(session, sources)
-
-    def system_for(context: copilot_context.DatasourceContext) -> str:
-        return (
-            "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
-            f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, context)}"
-            f"{context.section()}{_scope_note(sources, scope is not None)}\n\n"
-            "结构要求：\n"
-            "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
-            "2. 节点 id 用简短英文小写下划线；label 用中文，一眼看懂\n"
-            "3. 用 assign_to 传结果，下游 {{ vars.变量名 }} 引用\n"
-            "4. 只能用上面列出的工具名\n"
-            "5. 能用 3 个节点解决就别堆 8 个\n\n"
-            f"{_STREAM_PROTOCOL}"
-        )
-
-    # 现有图状态：修改场景从 base_graph 起步，新建场景从空图起步
-    nodes: dict[str, dict[str, Any]] = {}
-    edges: list[dict[str, Any]] = []
+    nodes, edges = _start_graph(payload)
     # 用户摆好的坐标，收尾排版时原样留着
     pinned = _pinned_positions(payload.base_graph)
-    if payload.base_graph and payload.base_graph.get("nodes"):
-        # 拷一份再改：改之前的样子还要留着比对工具绑定有没有被改掉
-        for n in payload.base_graph["nodes"]:
-            nodes[n["id"]] = copy.deepcopy(n)
-        edges = [
-            {k: v for k, v in e.items() if k in ("source", "target", "sourceHandle")}
-            for e in payload.base_graph.get("edges") or []
-        ]
-        user = (
-            "这是当前的工作流：\n"
-            f"{json.dumps(_slim(payload.base_graph), ensure_ascii=False, indent=2)}\n\n"
-            f"请按下面的要求修改它（只输出改动操作）：\n{payload.instruction}"
-        )
-    else:
-        user = _user_message(payload, patch=False)
 
     try:
         model, model_id = await _op_model(session, payload)
     except ProviderNotConfigured as e:
         raise HTTPException(400, _unconfigured(e)) from e
 
-    human = _with_history(user, await _history_section(session, payload.conversation_id))
+    human = _with_history(_graph_request(payload), await _history_section(session, payload.conversation_id))
     # 兜底用：模型只发了改动操作时，把它们重放到这张图上
     prev_graph = await _previous_graph(session, payload.conversation_id)
     # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
     baseline = copy.deepcopy(
         (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
-    # 数据源上下文：读目录、拿挑表模型都要用请求的会话，开流之前做完；挑表本身放进流里，期间照常发心跳。
-    # 现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表一律给全字段
-    plan = await copilot_context.plan_context(
-        sources, graph=payload.base_graph if (payload.base_graph or {}).get("nodes") else prev_graph)
-    picker, unavailable = await _picker(session, payload, plan)
-    need = await _pick_need(session, payload)
+    # 查看服务：读目录、读能力登记在开流之前做完。现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表列在概览里
+    looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
+        payload.base_graph or {}).get("nodes") else prev_graph)
+    # 这一份 system 一直用到最后：接着写、自查修正都沿用，不换
+    system = _graph_system(sources, scope, await copilot_context.section(looks), looks)
+    applier = GraphApplier(nodes, edges)
+    started = time.monotonic()
+    gen = Generation(model, system=system, applier=applier, looks=looks, started=started,
+                     checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers))
 
     async def event_stream():
-        explanation = ""
-        seen_ops: list[dict[str, Any]] = []
-        skipped_types: list[str] = []
-        # 建完要不要跑，由模型在 done.run 里表态
-        autorun = True
-        yield f"data: {json.dumps({'op': 'model', 'model': model_id}, ensure_ascii=False)}\n\n"
-        # 大库先按需求挑表。resolve 自己兜住了挑表的所有失败（退回只列表名），这里的 except 只防组装出意外：
-        # 挑表是让模型少猜，不能因为它让这一轮生成失败
-        started = time.monotonic()
-        pending = asyncio.ensure_future(plan.resolve(picker, need=need, unavailable=unavailable))
-        try:
-            async for beat in _heartbeat_until(pending, started=started):
-                yield _sse(beat)
-            context = pending.result()
-        except Exception as e:  # noqa: BLE001
-            context = plan.fallback(f"组装数据源上下文时出错：{explain_error(e)[0]}")
-        finally:
-            # 用户中途断开时流在上面的 yield 处被关掉，挑表的调用不能留在后台接着等
-            if not pending.done():
-                pending.cancel()
-        # 这一份 system 一直用到最后：自查交回修正时沿用同一份上下文，不重新挑表
-        system = system_for(context)
-        messages = [("system", system), ("human", human)]
-        if (shown := context.op()) is not None:
-            yield _sse(shown)
-        # reply 先压着：模型可能把目录修改提案写在 reply 后面，而前端收到 reply 就收尾（画布那边之后的操作一律不收），
-        # 提案得排在它前面转出。reply 之后只再认 catalog_patch，其余一概不理
-        replied: dict[str, Any] | None = None
+        yield _sse({"op": "model", "model": model_id})
         patches = 0
         try:
-            async for op in _with_heartbeat(_iter_ops(model, messages), started=started):
-                kind = op.get("op")
-                # 思考和心跳不是图操作，不进 _apply_op，直接转给前端
-                if kind in ("thinking", "heartbeat"):
-                    yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
-                    continue
-                if kind == "catalog_patch":
-                    # 目录修改提案：核对后转给前端做成卡片，人点「保存」才写。不进图，也不算这一轮的图操作
+            async for op in _with_heartbeat(gen.draft(human), started=started):
+                if op.get("op") == "catalog_patch":
+                    # 目录修改提案：核对后转给前端做成卡片，人点「保存」才写。不进图，也不算这一轮的图操作。
+                    # reply 先压着（applier.replied）：前端收到 reply 就收尾，提案得排在它前面转出
                     if (checked := await catalog_patch_op(op, sources)) is not None:
                         patches += 1
                         yield _sse(checked)
                     continue
-                if replied is not None:
-                    continue
-                if kind == "reply":
-                    # 这句话不需要工作流：等模型说完（只收它后面的提案）再转给前端、收流——后面那套
-                    # 排版校验对着一张空图跑，只会得到"图是空的，先拖一个节点进来"
-                    replied = op
-                    continue
-                if kind == "done":
-                    explanation = str(op.get("explanation", ""))
-                    # 用户要的是流程本身时（"设计一个每天跑的工作流"），
-                    # 建完就跑等于替他多花一次钱，而他要的是那张图
-                    autorun = op.get("run") is not False
-                seen_ops.append(op)
-                changed = _apply_op(nodes, edges, op)
-                if kind == "add_node" and not changed:
-                    bad_type = (op.get("node") or {}).get("type")
-                    if bad_type and bad_type not in _NODE_TYPES:
-                        skipped_types.append(str(bad_type))
-                if changed or kind in ("plan", "done"):
-                    yield f"data: {json.dumps(op, ensure_ascii=False)}\n\n"
-            if replied is not None:
-                yield _sse(replied)
+                yield _sse(op)
+            if applier.replied is not None:
+                # 这句话不需要工作流：后面那套排版校验对着一张空图跑，只会得到"图是空的，先拖一个节点进来"
+                yield _sse(applier.replied)
+                return
+            if gen.asked is not None and not applier.effective:
+                # 先问清楚才能动手，什么都还没改：问题已经转出去了，这一轮到此为止
                 return
             # 只发了目录修改提案，既没回答也没改图（用户只是在说一条数据事实）：补一句回答收尾，
             # 不能按下面的「模型没有给出任何修改」报错——提案已经摆在用户面前了
-            if patches and all(o.get("op") == "plan" for o in seen_ops):
+            if patches and all(o.get("op") == "plan" for o in applier.seen):
                 yield _sse({"op": "reply", "text": PATCH_ONLY_REPLY})
                 return
             # 流正常结束，却没有 done、也没有一个操作能认（格式跑偏，每一行都被跳过）：
             # 往下走就是拿原图去自查、交付，界面上写「无需修改」——而模型什么都没说
-            if all(o.get("op") == "plan" for o in seen_ops):
+            if gen.asked is None and all(o.get("op") == "plan" for o in applier.seen):
                 raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
                                         hint="画布未修改。可以重试，或把需求描述得更具体")
         except CopilotIncomplete as e:
@@ -1957,49 +1704,21 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 而累加器是从空图起步的，那些操作全落在不存在的节点上。上面的 prompt
         # 已经要求它完整重发，但那是约定，不是保证——约定落空的代价是用户收到
         # 一句"图是空的，先拖一个节点进来"，而他只是问了句追问。
-        #
-        # 与其报错，不如按它本来的意思做：把这些操作重放到上一轮那张图上。
-        if not nodes and prev_graph and seen_ops:
-            for n in prev_graph.get("nodes") or []:
-                if n.get("id"):
-                    nodes[n["id"]] = copy.deepcopy(n)
-            # 原地改，不能重新绑定：给 edges 赋值会让它变成 event_stream 的局部
-            # 变量，而它在上面 _apply_op 那一路已经被读过了 —— UnboundLocalError
-            edges[:] = [
-                {k: v for k, v in e.items() if k in ("source", "target", "sourceHandle") and v}
-                for e in prev_graph.get("edges") or []
-            ]
-            for op in seen_ops:
-                _apply_op(nodes, edges, op)
+        if not nodes and prev_graph and applier.seen:
+            applier.replay_onto(prev_graph)
 
         # 自查：按运行时同一套规则把图过一遍，挡住运行的问题交回模型改，改完再查。
         # 以前这些问题照样交付、照样自动开跑——跑到那一步才炸（开发库里四次运行死在
         # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
-        repaired = 0
-        for round_no in range(1, _SELF_CHECK_ROUNDS + 1):
-            errors = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers)
-            if not errors:
-                break
-            yield _sse({"op": "check", "status": "repairing", "round": round_no, "issues": errors})
-            fix = [("system", system), ("human", _repair_request(nodes, edges, errors))]
-            try:
-                async for op in _with_heartbeat(_iter_ops(model, fix), phase="repairing"):
-                    kind = op.get("op")
-                    if kind in ("thinking", "heartbeat"):
-                        yield _sse(op)
-                    # plan / done 是修补轮自己的开场和收尾，不是新方案，不覆盖原来的说明
-                    elif kind not in ("plan", "done", "reply") and _apply_op(nodes, edges, op):
-                        yield _sse(op)
-            except Exception as e:  # noqa: BLE001 - 修不成就照实交付，下面列出剩下的问题
-                yield _sse({"op": "check", "status": "error",
-                            "message": f"自查修正失败：{explain_error(e)[0]}", "detail": raw_error(e)})
-                break
-            repaired = round_no
+        async for op in _with_heartbeat(gen.repair(), phase="repairing"):
+            yield _sse(op)
         remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
         warnings = dropped_tool_warnings(changes, payload.instruction)
+        # 建完要不要跑，由模型在 done.run 里表态；问了用户的不跑：要等他回答
+        autorun = applier.autorun and gen.asked is None
         if remaining:
             # 改不好也照实交付、列出问题，但不自动运行：明知跑不起来的图，开跑只会
             # 在半路报一个用户看不懂的错
@@ -2007,7 +1726,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             yield _sse({"op": "check", "status": "failed", "issues": remaining,
                         "warnings": warnings})
         elif remaining is not None:
-            yield _sse({"op": "check", "status": "passed", "repaired": repaired,
+            yield _sse({"op": "check", "status": "passed", "repaired": gen.repaired,
                         "warnings": warnings})
 
         # 收尾：排版 + 校验，把最终图整体交付。改图时旧节点留在原处，只排新节点
@@ -2030,13 +1749,13 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 {"level": "warning", "node_id": None, "edge_id": None,
                  "code": "unknown_node_type", "type": t,
                  "message": f"模型使用了不存在的节点类型「{t}」，已跳过这一步"}
-                for t in dict.fromkeys(skipped_types)
+                for t in dict.fromkeys(applier.skipped_types)
             ]
             final = {
                 "op": "final",
                 "graph": spec.model_dump(mode="json"),
                 "issues": issues + warnings,
-                "explanation": explanation,
+                "explanation": applier.explanation,
                 "autorun": autorun,
                 "layout": layout,
                 # 改图回执：哪些节点、成员的工具变了。画布上看不出来，得明说
@@ -2045,7 +1764,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         except Exception as e:  # noqa: BLE001
             final = {"op": "error", "message": f"模型返回的工作流结构有误：{graph_error(e)}",
                      "hint": "请重试，或把需求描述得更具体", "detail": raw_error(e)}
-        yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+        yield _sse(final)
 
     return StreamingResponse(
         event_stream(),
@@ -2105,24 +1824,51 @@ def _publish_fix_request(graph: dict[str, Any], errors: list[dict[str, Any]], le
     )
 
 
-def _publish_fix_need(errors: list[dict[str, Any]], level: str) -> str:
-    """发布前修复挑表用的需求：要过哪一级的发布前检查、挡着的是哪些问题。"""
-    return (f"让这张工作流通过「{_LEVEL_WORD.get(level, level)}」级别的发布前检查，挡住发布的问题：\n"
-            + "\n".join(f"- {_issue_line(i)}" for i in errors))
+def _assist_system(task: str, sources: list[Any], datasources: str, looks: Any) -> str:
+    """发布前修复、升级证据的 system：模型、工具目录、操作流协议都和画布上改图是同一套，另可以输出 question。"""
+    return (
+        f"你是一个 agent 工作流编排专家。现在要做的是：{task}，以操作流的方式输出修改。\n\n"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources)}{datasources}\n\n"
+        f"{_STREAM_PROTOCOL}\n\n另外可以输出 question 操作：{{\"op\":\"question\",\"node_id\":\"…\",\"text\":\"…\"}}"
+        + (f"\n\n{looks.guide()}" if looks.kinds else "")
+    )
+
+
+async def _with_system_look(looks: Any, request: str, graph: dict[str, Any], sources: list[Any], *,
+                            need: str) -> str:
+    """不需要人参与的路径由系统代为查看要修的 SQL 用到的表（look 文档 D5），结果接在请求后面：要查哪些表是确定的，
+    系统直接查能省掉一轮。记录和模型自己查看的一样，留在 looks.records 里。"""
+    looked = await copilot_context.system_look(looks, graph, sources, need=need)
+    return f"{request}\n\n{looked.text}" if looked is not None else request
+
+
+def _questions(applier: GraphApplier, before_nodes: dict[str, dict[str, Any]],
+               asked: dict[str, Any] | None = None) -> list[str]:
+    """模型要人拿主意的话，原样交给人看，前面标上是哪个节点的事（界面上认节点标题，不认 id）。模型用 ask 问的（这一轮
+    就此结束）也算一条。"""
+    out: list[str] = []
+    ops = [*applier.questions, *([{"text": asked.get("question")}] if asked else [])]
+    for op in ops:
+        text = str(op.get("text") or "").strip()
+        where = before_nodes.get(str(op.get("node_id") or ""))
+        title = str((where.get("data") or {}).get("label") or where.get("id")) if where else ""
+        if text:
+            out.append(f"「{title}」：{text}" if title and title not in text else text)
+    return out
 
 
 async def assist_publish_fix(
     session: AsyncSession, graph: dict[str, Any], *, level: str,
     provider: str | None = None, model: str | None = None,
 ) -> dict[str, Any]:
-    """把挡住发布的 error 交给 Copilot 修。模型、工具目录、操作流协议都和画布上改图是同一套。
+    """把挡住发布的 error 交给助手修。模型、工具目录、操作流协议都和画布上改图是同一套（生成过程 copilot_gen）。
 
-    拿回的操作在副本上应用，再按同一套规则复核（_blocking_issues 带上发布级别：validate、门禁，
-    以及这一轮改过的节点里有没有凭空猜的列名）：error 变少、没有新 error、没有降低要求的改动
-    （autofix.forbidden_changes）才采纳，否则整个作废并写明原因。模型认为要人拿主意的，放进
+    要修的 SQL 用到的表由系统代为查看（look 文档 D5），模型仍然可以再看。拿回的操作在副本上应用，再按同一套规则复核
+    （_blocking_issues 带上发布级别：validate、门禁，以及这一轮改过的节点里有没有凭空猜的列名）：error 变少、没有新
+    error、没有降低要求的改动（autofix.forbidden_changes）才采纳，否则整个作废并写明原因。模型认为要人拿主意的，放进
     questions 原样交给人，不硬改。
 
-    返回 {accepted, reason, summary, questions（一句一条的文字）, graph, ops}。不落库。
+    返回 {accepted, reason, summary, questions（一句一条的文字）, graph, ops, looks}。不落库。
     """
     from app.engine.autofix import forbidden_changes, judge
 
@@ -2138,7 +1884,7 @@ async def assist_publish_fix(
     errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level,
                               defaults=base.get("defaults"), checkers=checkers) or []
     out: dict[str, Any] = {"accepted": False, "reason": None, "summary": "", "questions": [], "graph": graph,
-                           "ops": []}
+                           "ops": [], "looks": []}
     if not errors:
         out["summary"] = "没有阻止发布的错误，无需交给助手"
         return out
@@ -2148,52 +1894,33 @@ async def assist_publish_fix(
     except ProviderNotConfigured as e:
         out["summary"] = _unconfigured(e)
         return out
-    # 和画布上改图同一套数据源上下文：挑表的需求是挡住发布的这些问题，图里查过的表一律给全字段
-    context = await _datasource_context(session, sources, request, need=_publish_fix_need(errors, level), graph=base)
-
-    system = (
-        "你是一个 agent 工作流编排专家。现在要做的是：让一张工作流过发布前检查，以操作流的方式输出修改。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, context)}{context.section()}\n\n"
-        f"{_STREAM_PROTOCOL}\n\n另外可以输出 question 操作：{{\"op\":\"question\",\"node_id\":\"…\",\"text\":\"…\"}}"
-    )
+    looks = await _look_service(session, request, sources, graph=base, kinds=("table",))
+    system = _assist_system("让一张工作流过发布前检查", sources, await copilot_context.section(looks), looks)
+    human = await _with_system_look(looks, _publish_fix_request(base, errors, level), base, sources,
+                                    need=copilot_context.SYSTEM_LOOK_FIX_NEED)
     nodes = copy.deepcopy(before_nodes)
     edges = copy.deepcopy(before_edges)
-    tried: list[dict[str, Any]] = []
-    effective: list[dict[str, Any]] = []
-    plan = ""
+    # 目录修改提案只在用户亲口陈述数据事实时才有；这里的「用户消息」是系统拼的修复请求，提了也不转
+    applier = GraphApplier(nodes, edges, patches=False, questions=True)
+    gen = Generation(chat, system=system, applier=applier, looks=looks)
     try:
-        async for op in _iter_ops(chat, [("system", system), ("human", _publish_fix_request(base, errors, level))]):
-            kind = op.get("op")
-            # 目录修改提案只在用户亲口陈述数据事实时才有；这里的「用户消息」是系统拼的修复请求，提了也不转
-            if kind in ("thinking", "heartbeat", "catalog_patch"):
-                continue
-            if kind == "plan":
-                plan = str(op.get("summary") or "")
-            elif kind == "done":
-                out["summary"] = str(op.get("explanation") or "")
-            elif kind in ("question", "reply"):
-                text = str(op.get("text") or "").strip()
-                # 原样交给人看，前面标上是哪个节点的事（界面上认节点标题，不认 id）
-                where = before_nodes.get(str(op.get("node_id") or ""))
-                title = str((where.get("data") or {}).get("label") or where.get("id")) if where else ""
-                if text:
-                    out["questions"].append(f"「{title}」：{text}" if title and title not in text else text)
-            else:
-                tried.append(op)
-                if _apply_op(nodes, edges, op):
-                    effective.append(op)
+        async for _op in gen.draft(human):
+            pass
     except Exception as e:  # noqa: BLE001 - 修不成就照实说，确定性修复的结果照样交给人
         out["summary"] = f"助手本轮未完成：{explain_error(e)[0]}"
         return out
-    out["summary"] = out["summary"] or plan
-    if not effective:
+    finally:
+        out["looks"] = list(looks.records)
+    out["questions"] = _questions(applier, before_nodes, gen.asked)
+    out["summary"] = applier.explanation or str((applier.plan or {}).get("summary") or "")
+    if not applier.effective:
         # 没动图：要么全是要人拿主意的问题，要么它没给出能用的修改。都不算「拒绝」
         out["summary"] = out["summary"] or ("助手认为这些问题需要由你决定" if out["questions"]
                                             else "助手本轮没有给出修改")
         return out
 
     proposed = _proposed_graph(base, nodes, edges)
-    reasons = forbidden_changes(base, proposed, tried)
+    reasons = forbidden_changes(base, proposed, applier.tried)
     after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
                              baseline=baseline, level=level, defaults=proposed.get("defaults"), checkers=checkers)
     if reasons:
@@ -2203,7 +1930,7 @@ async def assist_publish_fix(
     elif why := judge(errors, after):
         out["reason"] = f"助手的修改未能改善工作流，已作废：{why}"
     else:
-        out.update(accepted=True, graph=proposed, ops=effective)
+        out.update(accepted=True, graph=proposed, ops=applier.effective)
     return out
 
 
@@ -2277,12 +2004,6 @@ def _upgrade_assist_request(graph: dict[str, Any], spec: GraphSpec, feeders: lis
     )
 
 
-def _upgrade_need(feeders: list[Any]) -> str:
-    """升级挑表用的需求：哪几段沙箱代码要改写成口径卡表达式（改写要用到上游查库节点查出的列）。"""
-    return ("把喂给口径卡的纯算术沙箱代码改写成口径卡表达式，表达式直接读上游查库节点查出的列。涉及的代码节点："
-            + "、".join(f"「{code.title}」" for code, _cards in feeders))
-
-
 def _kept_code(spec: GraphSpec) -> list[str]:
     """assist 之后仍然喂着口径卡的计算角色沙箱代码：不是纯算术、或者 Copilot 拿不准的，保留原样并警告。"""
     from app.engine.upgrade import compute_feeders
@@ -2297,13 +2018,14 @@ async def assist_upgrade(
     session: AsyncSession, graph: dict[str, Any], *, level: str,
     provider: str | None = None, model: str | None = None,
 ) -> dict[str, Any]:
-    """升级的语义层：请 Copilot 把喂口径卡的纯算术沙箱代码改写成口径卡表达式，不是纯算术的保留并警告。
+    """升级的语义层：请助手把喂口径卡的纯算术沙箱代码改写成口径卡表达式，不是纯算术的保留并警告。
 
-    模型、工具目录、操作流协议都和画布上改图是同一套；改完按搭图时同一套自查循环修正（只把这一轮冒出来的
-    error 交回去，图上原来就有的不算），最后复核：没有降低要求的改动（autofix.forbidden_changes，这里没有例外：
-    Copilot 不换类型、不删连线）、没有比确定性改写的结果更糟（autofix.worse）才采纳，否则整个作废并写明原因。
+    模型、工具目录、操作流协议都和画布上改图是同一套（生成过程 copilot_gen）；取数节点用到的表由系统代为查看（look
+    文档 D5）。改完按搭图时同一套自查循环修正（只把这一轮冒出来的 error 交回去，图上原来就有的不算），最后复核：没有
+    降低要求的改动（autofix.forbidden_changes，这里没有例外：助手不换类型、不删连线）、没有比确定性改写的结果更糟
+    （autofix.worse）才采纳，否则整个作废并写明原因。
 
-    返回 {ok, accepted, reason, summary, questions, warnings, graph, ops}。不落库。
+    返回 {ok, accepted, reason, summary, questions, warnings, graph, ops, looks}。不落库。
     """
     from app.engine.autofix import _sig, forbidden_changes, worse
     from app.engine.upgrade import compute_feeders
@@ -2311,7 +2033,7 @@ async def assist_upgrade(
     base = copy.deepcopy(graph)
     spec = GraphSpec.model_validate(base)
     out: dict[str, Any] = {"ok": True, "accepted": False, "reason": None, "summary": "", "questions": [],
-                           "warnings": [], "graph": graph, "ops": []}
+                           "warnings": [], "graph": graph, "ops": [], "looks": []}
     feeders = compute_feeders(spec)
     if not feeders:
         out["summary"] = "口径卡的输入均不来自负责计算的沙箱代码，无需交给助手改写"
@@ -2328,7 +2050,6 @@ async def assist_upgrade(
     defaults = base.get("defaults")
     base_errors = _blocking_issues(before_nodes, before_edges, sources=sources, baseline=baseline, level=level,
                                    defaults=defaults, checkers=checkers) or []
-    known = {_sig(e) for e in base_errors}
     out["warnings"] = _kept_code(spec)
     request = GenerateIn(instruction="升级为可追溯结构", provider=provider, model=model)
     try:
@@ -2336,66 +2057,39 @@ async def assist_upgrade(
     except ProviderNotConfigured as e:
         out.update(ok=False, summary=_unconfigured(e))
         return out
-    # 同一套数据源上下文：改写时要用到查库节点查出的列，图里查过的表一律给全字段
-    context = await _datasource_context(session, sources, request, need=_upgrade_need(feeders), graph=base)
-
-    system = (
-        "你是一个 agent 工作流编排专家。现在要做的是：把一张工作流里喂给口径卡的纯算术沙箱代码改写成口径卡表达式，"
-        "以操作流的方式输出修改。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, context)}{context.section()}\n\n"
-        f"{_STREAM_PROTOCOL}\n\n另外可以输出 question 操作：{{\"op\":\"question\",\"node_id\":\"…\",\"text\":\"…\"}}"
-    )
+    looks = await _look_service(session, request, sources, graph=base, kinds=("table",))
+    system = _assist_system("把一张工作流里喂给口径卡的纯算术沙箱代码改写成口径卡表达式", sources,
+                            await copilot_context.section(looks), looks)
+    human = await _with_system_look(looks, _upgrade_assist_request(base, spec, feeders), base, sources,
+                                    need=copilot_context.SYSTEM_LOOK_UPGRADE_NEED)
     nodes = copy.deepcopy(before_nodes)
     edges = copy.deepcopy(before_edges)
-    tried: list[dict[str, Any]] = []
-    effective: list[dict[str, Any]] = []
-    plan = ""
-
-    async def collect(request: str, *, first: bool) -> None:
-        nonlocal plan
-        async for op in _iter_ops(chat, [("system", system), ("human", request)]):
-            kind = op.get("op")
-            # 同发布修复：这里没有用户陈述的数据事实，目录修改提案不收
-            if kind in ("thinking", "heartbeat", "catalog_patch"):
-                continue
-            if kind in ("plan", "done"):
-                # 修补轮的开场和收尾不是新方案，不覆盖第一轮的说明
-                if first and kind == "plan":
-                    plan = str(op.get("summary") or "")
-                elif first:
-                    out["summary"] = str(op.get("explanation") or "")
-            elif kind in ("question", "reply"):
-                text = str(op.get("text") or "").strip()
-                where = before_nodes.get(str(op.get("node_id") or ""))
-                title = str((where.get("data") or {}).get("label") or where.get("id")) if where else ""
-                if text:
-                    out["questions"].append(f"「{title}」：{text}" if title and title not in text else text)
-            else:
-                tried.append(op)
-                if _apply_op(nodes, edges, op):
-                    effective.append(op)
-
+    # 同发布修复：这里没有用户陈述的数据事实，目录修改提案不收
+    applier = GraphApplier(nodes, edges, patches=False, questions=True)
+    # 自查：和搭图同一套规则，只把这一轮冒出来的 error 交回去改（原来就有的不归这一轮管）
+    checker = GraphChecker(applier, sources=sources, baseline=baseline, level=level, defaults=defaults,
+                           checkers=checkers, known={_sig(e) for e in base_errors})
+    gen = Generation(chat, system=system, applier=applier, checker=checker, looks=looks)
     try:
-        await collect(_upgrade_assist_request(base, spec, feeders), first=True)
-        # 自查：和搭图同一套规则，只把这一轮冒出来的 error 交回去改（原来就有的不归这一轮管）
-        for _ in range(_SELF_CHECK_ROUNDS):
-            now = _blocking_issues(nodes, edges, sources=sources, baseline=baseline, level=level, defaults=defaults,
-                                   checkers=checkers)
-            fresh = [e for e in now or [] if _sig(e) not in known]
-            if not effective or not fresh:
-                break
-            await collect(_repair_request(nodes, edges, fresh), first=False)
+        async for _op in gen.draft(human):
+            pass
+        async for _op in gen.repair():
+            pass
+        if gen.repair_error is not None:
+            raise gen.repair_error
     except Exception as e:  # noqa: BLE001 - 改不成就照实说，确定性改写的结果照样交给人
-        out.update(ok=False, summary=f"助手本轮未完成：{explain_error(e)[0]}")
+        out.update(ok=False, summary=f"助手本轮未完成：{explain_error(e)[0]}", looks=list(looks.records))
         return out
-    out["summary"] = out["summary"] or plan
-    if not effective:
+    out["looks"] = list(looks.records)
+    out["questions"] = _questions(applier, before_nodes, gen.asked)
+    out["summary"] = applier.explanation or str((applier.plan or {}).get("summary") or "")
+    if not applier.effective:
         out["summary"] = out["summary"] or ("助手认为这些代码不是纯算术，均保留原样" if out["questions"]
                                             else "助手本轮没有给出修改")
         return out
 
     proposed = _proposed_graph(base, nodes, edges)
-    reasons = forbidden_changes(base, proposed, tried)
+    reasons = forbidden_changes(base, proposed, applier.tried)
     after = _blocking_issues(_nodes_by_id(proposed), proposed.get("edges") or [], sources=sources,
                              baseline=baseline, level=level, defaults=proposed.get("defaults"), checkers=checkers)
     if reasons:
@@ -2405,7 +2099,8 @@ async def assist_upgrade(
     elif why := worse(base_errors, after):
         out["reason"] = f"助手的修改未能改善工作流，已作废：{why}"
     else:
-        out.update(accepted=True, graph=proposed, ops=effective, warnings=_kept_code(GraphSpec.model_validate(proposed)))
+        out.update(accepted=True, graph=proposed, ops=applier.effective,
+                   warnings=_kept_code(GraphSpec.model_validate(proposed)))
     out["ok"] = out["reason"] is None
     return out
 
@@ -2444,7 +2139,8 @@ async def upgrade_evidence(payload: UpgradeIn, session: AsyncSession = Depends(g
 
     返回 {graph, changes, ops, notes, issues, applied, rejected, assist, ok}：changes / notes / rejected 的形状见
     engine/upgrade.upgrade_for_evidence；issues 是升级后的图按 level 重跑 validate 和门禁的结果（和发布同一套口径）；
-    assist 只在请求带 assist: true 时有：{ok, summary, questions, warnings}，warnings 是保留没改的沙箱代码。
+    assist 只在请求带 assist: true 时有：{ok, summary, questions, warnings, looks}，warnings 是保留没改的沙箱代码，
+    looks 是这一次的查看记录（系统按取数节点的 SQL 代为查看的那一条在前）。
     """
     from app.engine.autofix import diff_changes
     from app.engine.governance import publish_issues
@@ -2464,7 +2160,7 @@ async def upgrade_evidence(payload: UpgradeIn, session: AsyncSession = Depends(g
         helped = await assist_upgrade(session, out["graph"], level=payload.level, provider=payload.provider,
                                       model=payload.model)
         out["assist"] = {"ok": helped["ok"], "summary": helped["summary"], "questions": helped["questions"],
-                         "warnings": helped["warnings"]}
+                         "warnings": helped["warnings"], "looks": helped["looks"]}
         if helped["accepted"]:
             from app.engine.upgrade import compute_feeders
 
@@ -2488,9 +2184,195 @@ async def upgrade_evidence(payload: UpgradeIn, session: AsyncSession = Depends(g
     return out
 
 
+# --------------------------------------------------------------------------
+# 应用润色（总方案 A8）：应用草稿由工作流版本确定性派生（app/apps/derive.py），助手只改布局、文案、控件选择。
+# 走同一个生成过程：系统先代为查看钉住的版本，模型可以再看别的版本和能力；落地调 app/apps/ops.apply_app_op，
+# 自查调 app/apps/lint.lint_app。岗位绑定只能由人来做：助手只留空并在说明里提醒
+# --------------------------------------------------------------------------
+
+APP_SYSTEM_PROMPT = """\
+你是应用润色助手。应用是已发布工作流版本的使用面：入口（发起用的表单）、视图（看运行产物）、实例、待办。
+应用草稿已经按钉住的工作流版本确定性派生好了，你只负责润色：布局（页面、分区、分栏、页签、组件顺序）、文案（标题、
+说明、按钮文字）、控件选择（表单字段的 x-widget、x-order，或者换成目录里更合适的组件）。
+
+硬性约定：
+- 只能用下面组件目录里的组件，props 按目录里写的字段和类型写，不要编造组件和属性
+- 绑定（bind）只取钉住的版本里已有的值：绑定的节点、指标、报告都要在钉住的版本里存在，拿不准就先 look 那一版；
+  文字组件里不要写数字，也不要拼算式——数字只来自绑定，界面层不做任何计算
+- 可见性表达式（visible）只能用 run、input、metric、instance、task、user、view 这几个根名字，只能比较、取值、in 和
+  and / or / not，不能写算术
+- 不改钉住的版本（pins），不改入口表单的数据约束（类型、必填、枚举、取值范围），只改外观
+- 岗位（slots）绑定到哪些人或组只能由人来做：岗位留着，不要替人绑定；done 的说明里提醒还有哪些岗位等着绑定
+- 能按常理定的直接改，必须由用户拿主意的才 ask"""
+
+APP_PROTOCOL_PROMPT = """\
+输出格式（严格遵守）：
+- 每行一个完整的 JSON 对象，除此之外不输出任何东西——不要 markdown 围栏、不要解释文字
+- 可用操作：
+  {"op":"plan","summary":"一句话说明打算怎么改"}          ← 第一行
+  {"op":"app_add","parent":"组件 id 或页面 id","index":0,"component":{"id":"…","type":"组件名","props":{},"bind":{}}}
+  {"op":"app_update","id":"组件 id","props":{},"bind":{},"visible":"…"}   ← 只写要改的那几项
+  {"op":"app_remove","id":"组件 id"}
+  {"op":"app_move","id":"组件 id","parent":"组件 id 或页面 id","index":0}
+  {"op":"app_page","page":{"id":"…","title":"…"}}          ← 新增页面，或改已有页面的标题
+  {"op":"app_set","path":"entries|views|forms|slots|task_ui","key":"…","value":{}}
+  {"op":"done","explanation":"两三句话说明改了什么，还有哪些岗位等着绑定"}    ← 最后一行
+- 组件 id 用简短英文小写下划线，同一个应用里不重复；已有的组件用 app_update 改，不要删了重建
+- 这句话不需要改应用（只是问个问题）时，第一行也是最后一行输出 {"op":"reply","text":"直接回答的内容"}
+- 要看工作流版本、能力的详情时输出一行 look（用法见下），输出之后就停下等查看结果，拿到结果再接着写
+- 必须先问清用户才能动手时，输出一行 {"op":"ask","question":"要问的话"}，这一轮就此结束：已经输出的改动照常交付"""
+
+APP_CATALOG_PROMPT = "组件目录（只能用这些）：\n{components}"
+APP_COMPONENT_PROMPT = "- {name}（{label}，{category}）{children}：绑定 {bindings}；props {props}"
+APP_DERIVED_PROMPT = "按钉住的版本确定性派生出的草稿（参考：组件该绑哪些节点、指标、报告，以它为准）：\n{drafts}"
+APP_REQUEST_PROMPT = "这是应用现在的草稿：\n{spec}\n\n请按下面的要求润色它（只输出改动操作）：\n{instruction}"
+APP_LOOK_WHEN_PROMPT = """\
+什么时候看：要绑定的节点、指标、报告在钉住的版本里有没有、叫什么，以系统代为查看的那一版为准，不够再看；要放动作状态、
+写入相关的组件时看能力。只改文案、顺序的不看"""
+#: 系统代为查看钉住的版本时写进记录的需求（界面上显示）
+APP_SYSTEM_LOOK_NEED = "应用引用的工作流版本"
+APP_OPS = ("app_add", "app_update", "app_remove", "app_move", "app_page", "app_set")
+
+
+class AppStreamIn(BaseModel):
+    instruction: str = Field(min_length=1, description="用自然语言说想怎么改这个应用")
+    #: 哪个应用。spec / bindings 不给时读它的草稿
+    app_id: str | None = None
+    #: 编辑器里当前的草稿（agentlab.app/1）：编辑器里还没保存的改动以它为准
+    spec: dict[str, Any] | None = None
+    #: 草稿里的岗位绑定（不进 spec）：应用检查按它判断岗位绑没绑
+    bindings: dict[str, Any] | None = None
+    conversation_id: str | None = None
+    provider: str | None = None
+    model: str | None = None
+
+
+def _app_catalog() -> str:
+    """组件目录：名字、中文名、类别、能不能有子组件、允许的绑定、props（只给字段和类型，app/apps/catalog.py）。"""
+    from app.apps.catalog import CATEGORY_LABEL, catalog_payload
+
+    lines = []
+    for c in catalog_payload()["components"]:
+        props = {k: v.get("type") or v.get("enum") or "string" for k, v in
+                 ((c.get("props") or {}).get("properties") or {}).items()}
+        lines.append(APP_COMPONENT_PROMPT.format(
+            name=c["name"], label=c["label"], category=CATEGORY_LABEL.get(c["category"], c["category"]),
+            children="，可放子组件" if c.get("children") else "",
+            bindings=" / ".join(c.get("bindings") or []) or "无", props=json.dumps(props, ensure_ascii=False)))
+    return APP_CATALOG_PROMPT.format(components="\n".join(lines))
+
+
+async def _derived_drafts(session: AsyncSession, pins: list[dict[str, Any]]) -> str:
+    """每个钉住的版本确定性派生出的草稿，给模型对照着润色。派生是参考：哪一个派生不出来（版本没了、派生出错）就不给
+    那一份，不挡润色（P3），应用检查照样把问题列出来。"""
+    from app.apps import derive
+
+    drafts = []
+    for pin in pins:
+        try:
+            spec = await derive.derive_app(session, str(pin.get("workflow_id")), int(pin.get("version") or 0))
+        except Exception:  # noqa: BLE001 - 派生只是参考
+            logger.exception("应用润色：钉住的版本 %s v%s 派生不出草稿", pin.get("workflow_id"), pin.get("version"))
+            continue
+        drafts.append(f"「{pin.get('alias')}」：{json.dumps(spec, ensure_ascii=False)}")
+    return APP_DERIVED_PROMPT.format(drafts="\n".join(drafts)) if drafts else ""
+
+
+@router.post("/app-stream")
+async def app_stream(payload: AppStreamIn, session: AsyncSession = Depends(get_session)):
+    """应用润色：SSE 推送，形状同 /generate-stream。
+
+    事件：model；系统代为查看钉住版本的 look（by=system）；模型的 plan、应用操作（app_add / app_update / app_remove /
+    app_move / app_page / app_set，已经落到服务端维护的草稿上）、look、ask、thinking、heartbeat；自查的 check；最后
+    final {spec, issues, explanation}——spec 是润色后的整份草稿，issues 是应用检查的全部问题（只有人能处理的，比如
+    岗位没绑，也在里面）。只回答了一句的发 reply 收尾；问了用户、什么都还没改的发完 ask 收尾。不落库：编辑器收到
+    final 后照常保存草稿。
+    """
+    from fastapi.responses import StreamingResponse
+
+    from app.db.models import App
+    from app.look.capabilities import CapabilityKind
+    from app.look.pick import Picker
+    from app.look.service import LookService
+    from app.look.versions import VersionKind
+
+    row = await session.get(App, payload.app_id) if payload.app_id else None
+    if payload.app_id and row is None:
+        raise HTTPException(404, "应用不存在，可能已被删除")
+    spec = copy.deepcopy(payload.spec if payload.spec is not None else (row.draft if row is not None else None))
+    if not spec:
+        raise HTTPException(400, "没有可润色的应用草稿。请先从工作流版本生成草稿，再请助手润色")
+    bindings = payload.bindings if payload.bindings is not None else (row.draft_bindings if row is not None else {})
+    request = GenerateIn(instruction=payload.instruction, provider=payload.provider, model=payload.model,
+                         conversation_id=payload.conversation_id)
+    try:
+        model, model_id = await _op_model(session, request)
+    except ProviderNotConfigured as e:
+        raise HTTPException(400, _unconfigured(e)) from e
+    picker = Picker(await copilot_model_spec(session, request, max_tokens=copilot_context.PICK_MAX_TOKENS))
+    looks = LookService([await VersionKind.load(session, picker=picker), await CapabilityKind.load(picker=picker)])
+    pins = [p for p in spec.get("pins") or [] if isinstance(p, dict)]
+    overview = await looks.overview()
+    system = "\n\n".join(part for part in (
+        APP_SYSTEM_PROMPT, _app_catalog(), await _derived_drafts(session, pins), overview, APP_PROTOCOL_PROMPT,
+        looks.guide(), APP_LOOK_WHEN_PROMPT) if part)
+    human = _with_history(
+        APP_REQUEST_PROMPT.format(spec=json.dumps(spec, ensure_ascii=False, indent=2), instruction=payload.instruction),
+        await _history_section(session, payload.conversation_id))
+    applier = AppApplier(spec)
+    checker = AppChecker(applier, bindings=bindings)
+    started = time.monotonic()
+    gen = Generation(model, system=system, applier=applier, checker=checker, looks=looks, started=started)
+
+    async def event_stream():
+        yield _sse({"op": "model", "model": model_id})
+        try:
+            # 系统先代为查看钉住的版本（look 文档 D5 的做法）：润色绕不开它们，直接查省掉一轮
+            first = human
+            targets = [{"kind": "workflow_version", "source": str(p.get("workflow_id")), "name": f"v{p.get('version')}"}
+                       for p in pins]
+            if targets:
+                looked = await looks.look({"op": "look", "need": APP_SYSTEM_LOOK_NEED, "targets": targets}, by="system")
+                if looked.record is not None:
+                    yield _sse(looked.record)
+                first = f"{human}\n\n{looked.text}"
+            async for op in _with_heartbeat(gen.draft(first), started=started):
+                yield _sse(op)
+            if applier.replied is not None:
+                yield _sse(applier.replied)
+                return
+            if gen.asked is not None and not applier.effective:
+                return
+            if gen.asked is None and gen.done is None and not applier.effective:
+                # 流正常结束，却没有 done、也没有一个操作落地：不能按「无需修改」交付
+                raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
+                                        hint="应用草稿未修改。可以重试，或把要求描述得更具体")
+            async for op in _with_heartbeat(gen.repair(), phase="repairing"):
+                yield _sse(op)
+            remaining = await checker.issues()
+            yield _sse({"op": "check", "status": "failed" if remaining else "passed", "repaired": gen.repaired,
+                        **({"issues": remaining} if remaining else {})})
+            yield _sse({"op": "final", "spec": applier.spec, "issues": await checker.lint(),
+                        "explanation": applier.explanation})
+        except CopilotIncomplete as e:
+            yield _sse({"op": "error", "message": f"助手本轮未完成：{e}", "hint": e.hint, "detail": e.detail})
+        except Exception as e:  # noqa: BLE001
+            reason, hint = explain_error(e)
+            yield _sse({"op": "error", "message": f"助手本轮未完成：{reason}", "hint": hint, "detail": raw_error(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 class FromRunIn(BaseModel):
     run_id: str
     name: str = ""
+    #: 问数据回答上点「做成应用」时带上：这次运行出自哪段对话的哪一轮，记进新工作流的来源（workflows.origin）
+    conversation_id: str | None = None
+    turn_id: str | None = None
 
 
 @router.post("/from-run")
@@ -2503,6 +2385,9 @@ async def extract_template(
     提取是确定性的：只保留真正执行过的节点和它们之间的边，分支上
     没走的岔路剪掉；输入值参数化成 input 字段默认值。产物落成 draft，
     人审、改名、发布之后才成为正式模板——提取器是模板的作者，不是发布者。
+
+    新工作流记下来源（workflows.origin = {run_id, conversation_id?, turn_id?}）：从这里发布、再做成应用的那条路
+    （总方案 A8）事后查得到它出自哪次运行、哪段对话。
     """
     from sqlalchemy import select as _sel
 
@@ -2570,6 +2455,9 @@ async def extract_template(
         graph=graph,
         tags=["extracted"],
         status="draft",
+        origin={"run_id": run.id,
+                **({"conversation_id": payload.conversation_id} if payload.conversation_id else {}),
+                **({"turn_id": payload.turn_id} if payload.turn_id else {})},
     )
     session.add(workflow)
     await session.flush()

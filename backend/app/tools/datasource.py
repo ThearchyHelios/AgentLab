@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import EventType
 from app.data import catalog as data_catalog
-from app.data import introspect, table_versions
+from app.data import introspect, schema_view, table_versions
 from app.data.sqlcheck import SqlChecker
 from app.data.engine import SnapshotTampered, masked_columns, query_timeout, run_query
 from app.data.guard import QueryLimits, SqlRejected, check, is_write
@@ -91,6 +91,17 @@ def source_of_tool(name: str) -> str | None:
         if name.startswith(prefix):
             return name[len(prefix):]
     return None
+
+
+#: Run.options 里的键：这次运行的查询结果先遮再交给模型（api/runs.py：开登录后 user 角色发起的问数据运行）。发起时定下、
+#: 随 run.started 封存，续跑、审批恢复沿用
+MASK_RESULTS_OPTION = "mask_results"
+
+
+def run_masks_results(run_ctx: Any) -> bool:
+    """这次运行的查询结果要不要在工具边界就遮（见 MASK_RESULTS_OPTION）。构造 ToolContext 时传进去。"""
+    options = (getattr(run_ctx, "extra", None) or {}).get("run_options") or {}
+    return bool(options.get(MASK_RESULTS_OPTION))
 
 
 def run_versions(run_ctx: Any) -> dict[str, Any] | Versions | None:
@@ -682,7 +693,8 @@ def _make_schema_tool(source: Any, *, fixed: bool = False,
                       catalog: Mapping[str, data_catalog.CatalogEntry] | None = None) -> StructuredTool:
     """source 同 _make_query_tool：上传源的表结构取绑定快照里冻结的那份。
 
-    catalog：建工具时读到的数据目录，查单表时附在字段清单后面（introspect.describe_table）。
+    catalog：建工具时读到的数据目录，查单表时附在字段清单后面。单表的说法和助手查看、/schema 接口是同一份
+    （data/schema_view.table_detail）：遮罩列只给列名和类型，它的注释和目录项都不给（look 文档 D6）。
     """
     notes = {name: entry.notes for name, entry in (catalog or {}).items()}
 
@@ -691,7 +703,7 @@ def _make_schema_tool(source: Any, *, fixed: bool = False,
             return f"{DATA_UNAVAILABLE}{gone}"
         wanted = _schema_tables(table)
         if wanted:
-            return "\n\n".join(introspect.describe_table(source, t, catalog=notes) for t in wanted)
+            return "\n\n".join(schema_view.table_detail(source, t, catalog_notes=notes) for t in wanted)
         tables = introspect.table_names(source)
         if not tables:
             # 把实情交出去，而不是让它去点一个它点不到的按钮

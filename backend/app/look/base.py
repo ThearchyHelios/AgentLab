@@ -35,14 +35,26 @@ class LookTarget(TypedDict, total=False):
 
 @dataclass
 class LookResult:
+    """一次查看交回给模型的文字，和发给前端、存进 meta.looks 的记录。
+
+    记录为 None 的是没真正查看的那几种回话（need 没写、次数用完、重复查看），不发事件。counted：占不占这一轮的次数。
+    """
+
     text: str
-    record: dict[str, Any]
+    record: dict[str, Any] | None
+    counted: bool = True
 
 
 class LookKind(Protocol):
-    """每种可查看的对象都实现同一组方法（L3）。遮罩按类型各自处理。"""
+    """每种可查看的对象都实现同一组方法（L3）。遮罩按类型各自处理。
+
+    detail 交回的记录块是 objects[] 里的若干项（表按库各一项，能力、工作流版本各一项）；missing 是 resolve 认不出的
+    点名，由 detail 写进文字和记录。key 是一个对象在这一轮里的身份，重复查看靠它短路。
+    """
 
     kind: str
+    #: 写给模型的类别名：表、能力、工作流版本
+    label: str
 
     async def overview(self) -> list[str]:
         """概览：进 system，每个来源一行。"""
@@ -60,8 +72,12 @@ class LookKind(Protocol):
         """按需求挑选：(挑出的对象, 失败原因)。返回空列表且原因为 None 表示「按这个需求没有相关的」。"""
         ...
 
-    async def detail(self, objects: list[Any], budget: int) -> tuple[str, dict[str, Any]]:
-        """详情文字（受字数上限约束）和这一类的记录块（objects[] 里的一项）。"""
+    async def detail(self, objects: list[Any], budget: int, *,
+                     missing: list[LookTarget] = ()) -> tuple[str, list[dict[str, Any]]]:
+        """详情文字（受字数上限约束）和这一类的记录块（objects[] 里的项）。"""
+        ...
+
+    def key(self, obj: Any) -> str:
         ...
 
 
@@ -84,6 +100,10 @@ class Applier(Protocol):
 
     def continuing(self) -> None:
         """进入「接着写」：之后和已落地完全相同的操作忽略、不转发（look §2.5.5）。"""
+        ...
+
+    def repairing(self) -> None:
+        """进入自查修正：plan、done 由循环吃掉；回答、目录修改提案这类只在起草时有意义的不再收。"""
         ...
 
 

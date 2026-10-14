@@ -828,14 +828,16 @@ async def get_schema(source_id: str, table: str | None = None,
     except table_versions.SnapshotMissing as e:
         raise HTTPException(409, str(e)) from e
     if table:
+        from app.data import schema_view
+
         meta = introspect_mod.find_table(row, table)
-        # 和 db_schema 工具同一个说法：有数据目录的表，字段清单后面附上目录
+        # 和 db_schema 工具、助手查看同一个说法（schema_view.table_detail）：有数据目录的表，字段清单后面附上目录；
+        # 遮罩列只给列名和类型
         entries = await data_catalog.read_catalog(session, found.id)
         return {
             "table": table,
-            # 给模型看的那段文本照旧；界面画表格用下面的结构化字段
-            "detail": introspect_mod.describe_table(row, table,
-                                                    catalog={n: e.notes for n, e in entries.items()}),
+            # 给模型看的那段文本；界面画表格用下面的结构化字段
+            "detail": schema_view.table_detail(row, table, catalog_notes={n: e.notes for n, e in entries.items()}),
             "found": meta is not None,
             "qualified": meta.get("qualified", table) if meta else None,
             "kind": ("view" if meta.get("is_view") else "table") if meta else None,

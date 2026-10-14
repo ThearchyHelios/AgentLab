@@ -2,14 +2,15 @@
 
 这组守的是"Copilot 知道有哪些库、写得出能跑的 SQL"。断了的表现很隐蔽：
 它不会报错，只会退回让用户自己写 SQL 的代码节点——接了数据库等于白接。
+
+按库的大小定「给详细摘要还是只列表名」的那一套（预算、40 张表的阈值）已经拿掉：system 里每个库一行概览，
+要看表时模型自己 look（look 文档 D3，见 test_copilot_table_pick.py）。这里留着结构化输出和摘要本身的几条。
 """
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
-from app.api.copilot import GRAPH_SCHEMA, _DATASOURCE_BUDGET_CHARS
+from app.api.copilot import GRAPH_SCHEMA
 from app.data.introspect import summary
 
 
@@ -56,32 +57,3 @@ def test_summary_without_schema_uses_bare_names():
     """没有 schema 概念的库不要硬拼前缀，否则生成的 SQL 反而错。"""
     text = summary(_source(2, schema=None))
     assert "t0" in text and "None.t0" not in text
-
-
-def test_budget_constant_is_sane():
-    """预算太小会让单个库就触发降级，太大等于没有预算。"""
-    assert 3000 <= _DATASOURCE_BUDGET_CHARS <= 20000
-
-
-@pytest.mark.parametrize("n_tables,expect_detail", [(3, True), (40, True), (53, False)])
-def test_object_count_decides_detail_level(n_tables, expect_detail):
-    """对象超过截断阈值就切紧凑模式。
-
-    关键取舍：detail 模式每库只列 40 个对象，多出来的 Copilot 根本看不见。
-    对 53 个对象的库，"40 张表带字段"不如"53 张表只给名字"——找不到那张表，
-    字段写得再全也没用。截断丢信息比省 token 更糟。
-    """
-    from app.api.copilot import _DETAIL_TABLE_LIMIT
-    from app.data.introspect import table_names
-
-    src = _source(n_tables)
-    assert (len(table_names(src)) <= _DETAIL_TABLE_LIMIT) is expect_detail
-
-
-def test_many_sources_trigger_compact_mode():
-    """单库不超标，几个库加起来超预算时整体降级。"""
-    sources = [_source(35, name=f"db{i}") for i in range(6)]
-    full = sum(len(summary(s)) for s in sources)
-    assert full > _DATASOURCE_BUDGET_CHARS
-    compact = sum(len(summary(s, detail=False)) for s in sources)
-    assert compact < _DATASOURCE_BUDGET_CHARS

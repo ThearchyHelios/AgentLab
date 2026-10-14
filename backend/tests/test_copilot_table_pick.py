@@ -1,34 +1,37 @@
-"""助手建图时按需求挑表、组装数据源上下文（数据目录阶段 1B）。
+"""助手按需查看表结构：查看服务的表这一类（look 文档 §2.4 D2、D3、D6，§2.5.3–§2.5.7）。
 
-背景：大库（几十上百张表）超出详细摘要的阈值时，以前只给模型看表名，助手一个字段都看不到，只能照着
-名字编字段、猜怎么连表。现在先用一次轻量的模型调用按需求挑出相关的表，再沿关系图补上连接用的中间表，
-挑中的表给全部字段、数据目录和可以照抄的连接条件，其余表只列名字。
+以前每一轮开始前服务端按库的大小挑表、塞进 system；现在 system 里每个库一行概览，模型要看表时输出一行 look，
+查看服务一次给齐。这组守的是（合成景区库：入园记录和渠道之间要经关联表 channel_visits）：
 
-这组守的是：
-- 挑表、补路径、组装的结果（合成景区库：入园记录和渠道之间要经关联表 channel_visits）
-- 挑表失败（报错、超时、返回不存在的表、返回为空）一律退回只列表名，生成照常进行
-- 小库保持详细模式，额外带上目录
-- 流式输出里有 context 操作；自查修正沿用同一份上下文，不再重新挑表
-- 非流式生成、发布前修复、升级共用同一套组装
+- 概览：每个库一行，不列表名、不列字段；现有工作流用到的表只列名字
+- 点名直取，不调挑选模型；只给需求时候选不超过 12 张全给，否则按需求挑（关思考、额度小）
+- 补两跳以内的中间表，合计不超过 16 张；连接条件、连接路径、数据目录照抄；推断的标出来，驳回的关系不用
+- 挑选失败（报错、超时、挑出的表都不存在、回复认不出）交回表目录（status=index），挑出来是空的照实说
+- 没找到的点名、认不出的库名写进结果和记录；限定的数据源之外的不看
+- 遮罩列只给列名和类型（D6），db_schema__ 和 /schema 接口是同一份说法
+- 字数上限之外的表只给字段名；同一批表这一轮看过就不再重排
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.data import catalog
+from app.data import catalog, schema_view
 from app.data.catalog import INFERRED_MARK, make_item
-from app.data.engine import engines
 from app.data.introspect import introspect
 from app.db.base import SessionLocal
 from app.db.models import DataSource
+from app.look.base import CONTEXT_TABLE_LIMIT, LookBudget
+from app.look.pick import Picker
+from app.look.service import LookService, parse_targets
+from app.look.tables import TableKind
 from app.main import app
 from tests.fixtures.catalog import scenic
+from tests.fixtures.sources import drop_source
 
 
 @pytest.fixture
@@ -37,10 +40,10 @@ async def client():
         yield c
 
 
-async def _add_source(database: str, *, prefix: str = "p1b") -> DataSource:
+async def _add_source(database: str, *, prefix: str = "look", options: dict | None = None) -> DataSource:
     async with SessionLocal() as session:
         row = DataSource(name=f"{prefix}_{uuid.uuid4().hex[:8]}", kind="sqlite", database=database,
-                         description="景区业务库")
+                         description="景区业务库", options=options or {})
         session.add(row)
         await session.commit()
         row.schema_cache = await introspect(row)
@@ -50,21 +53,12 @@ async def _add_source(database: str, *, prefix: str = "p1b") -> DataSource:
         return row
 
 
-async def _drop_source(row: DataSource) -> None:
-    await engines.invalidate(row.id)
-    async with SessionLocal() as session:
-        live = await session.get(DataSource, row.id)
-        if live is not None:
-            await session.delete(live)
-            await session.commit()
-
-
 @pytest.fixture
 async def scenic_source(scenic_db):
-    """接上合成景区库（50 张表 + 1 个视图），用完删掉：留着会让同一进程里别的测试也进入大库模式。"""
+    """接上合成景区库（50 张表 + 1 个视图），用完删掉。"""
     row = await _add_source(scenic_db)
     yield row
-    await _drop_source(row)
+    await drop_source(row.id)
 
 
 @pytest.fixture
@@ -78,13 +72,33 @@ async def small_source(tmp_path):
         " ordered_at TEXT NOT NULL);")
     db.commit()
     db.close()
-    row = await _add_source(str(path), prefix="p1b_small")
+    row = await _add_source(str(path), prefix="look_small")
     yield row
-    await _drop_source(row)
+    await drop_source(row.id)
 
 
-class Picker:
-    """挑表用的假模型：结构化输出返回自己，ainvoke 记下收到的提示词，按设定回复、报错或拖延。"""
+@pytest.fixture
+async def masked_source(tmp_path):
+    """设了遮罩列 phone 的库，phone 上记了中文名和码值。"""
+    path = tmp_path / "masked.db"
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE members (id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT, level INTEGER);")
+    db.commit()
+    db.close()
+    row = await _add_source(str(path), prefix="look_mask", options={"mask_columns": "phone"})
+    async with SessionLocal() as session:
+        await catalog.write_entry(session, row.id, "members", {
+            "label": make_item("会员", "human"),
+            "columns": {"phone": {"label": make_item("手机号", "human"), "codes": make_item({"138": "移动号段"}, "human"),
+                                  "meaning": make_item("会员登记的手机号，例如 13800000000", "human")},
+                        "level": {"codes": make_item({"1": "普通", "2": "金卡"}, "human")}}},
+            if_version=0, actor="王敏")
+    yield row
+    await drop_source(row.id)
+
+
+class FakePicker:
+    """挑选用的假模型：结构化输出返回自己，ainvoke 记下收到的提示词，按设定回复、报错或拖延。"""
 
     def __init__(self, reply=None, *, error: Exception | None = None, delay: float = 0.0) -> None:
         self.reply, self.error, self.delay = reply, error, delay
@@ -103,454 +117,344 @@ class Picker:
         return self.reply
 
 
-def _use_picker(monkeypatch, picker: Picker) -> list:
-    """挑表模型换成假的，返回每次拿模型时的规格（核对思考关、额度小）。"""
-    import app.api.copilot_context as copilot_context
+def _use_picker(monkeypatch, fake: FakePicker) -> list:
+    """挑选模型换成假的，返回每次拿模型时的规格（核对思考关、额度小）。"""
+    import app.look.pick as pick
 
     specs: list = []
 
     async def _model(_session, spec):
         specs.append(spec)
-        return picker, "fake-pick"
+        return fake, "fake-pick"
 
-    monkeypatch.setattr(copilot_context, "get_chat_model", _model)
+    monkeypatch.setattr(pick, "get_chat_model", _model)
     return specs
 
 
-class Scripted:
-    """按剧本吐操作流的建图模型：第一轮吐 first，收到自查请求时吐 fix。记下每次的 system 和 human。"""
+async def _service(sources, *, graph=None, picker: Picker | None = None) -> LookService:
+    from app.providers.factory import ModelSpec
 
-    def __init__(self, first: list[dict], fix: list[dict] | None = None) -> None:
-        self.first = [json.dumps(o, ensure_ascii=False) for o in first]
-        self.fix = [json.dumps(o, ensure_ascii=False) for o in (fix or [{"op": "done"}])]
-        self.systems: list[str] = []
-        self.humans: list[str] = []
-
-    async def astream(self, messages):
-        from langchain_core.messages import AIMessageChunk
-
-        self.systems.append(next(t for r, t in messages if r == "system"))
-        human = next(t for r, t in messages if r == "human")
-        self.humans.append(human)
-        for line in (self.fix if "上线前自查" in human else self.first):
-            yield AIMessageChunk(content=line + "\n")
-
-
-def _graph_using(tool: str) -> list[dict]:
-    return [
-        {"op": "add_node", "node": {"id": "start", "type": "input", "label": "输入", "config": {}}},
-        {"op": "add_node", "node": {"id": "ask", "type": "agent", "label": "查库", "config": {
-            "prompt": "{{ input.question }}", "tools": [tool], "assign_to": "answer"}}},
-        {"op": "add_edge", "edge": {"source": "start", "target": "ask"}},
-        {"op": "add_node", "node": {"id": "out", "type": "output", "label": "成果", "config": {
-            "fields": [{"name": "answer", "value": "{{ vars.answer }}"}]}}},
-        {"op": "add_edge", "edge": {"source": "ask", "target": "out"}},
-        {"op": "done", "explanation": "查一下", "run": True},
-    ]
-
-
-async def _stream(client, monkeypatch, model, body: dict) -> list[dict]:
-    import app.api.copilot as copilot
-
-    async def _model(*_a, **_k):
-        return model, "mock-fast"
-
-    monkeypatch.setattr(copilot, "get_chat_model", _model)
-    events: list[dict] = []
-    async with client.stream("POST", "/api/copilot/generate-stream", json=body) as r:
-        assert r.status_code == 200, await r.aread()
-        async for line in r.aiter_lines():
-            if line.startswith("data: "):
-                events.append(json.loads(line[6:]))
-    return events
+    return LookService([await TableKind.load(sources, graph=graph,
+                                             picker=picker or Picker(ModelSpec(provider=None, model=None)))])
 
 
 #: 需求和假模型挑出的表：入园记录、渠道。两者之间没有直接关联，要经关联表 channel_visits
 NEED = "各渠道上月的入园人次"
-PICKED = {"tables": [{"table": "visits"}, {"table": "channels"}]}
-#: 三张表各自独有的字段（describe_table 的写法：列名两个空格类型）
+PICKED = {"items": [{"name": "visits"}, {"name": "channels"}]}
+#: 三张表各自独有的字段（表详情的写法：列名两个空格类型）
 SELECTED_COLUMNS = ("visitor_count  INTEGER", "visit_time  TEXT", "ticket_no  TEXT", "channel_type  TEXT",
                     "channel_code  TEXT", "attributed_share  REAL")
-#: 没挑中的表独有的字段：不该出现在提示词里
+#: 没挑中的表独有的字段：不该出现在结果里
 OTHER_COLUMNS = ("store_code", "sku", "on_hand", "refund_amount")
 JOINS = ("channel_visits.visit_id = visits.id", "channel_visits.channel_id = channels.id")
 
 
-def _context_op(events: list[dict]) -> dict:
-    found = [e for e in events if e.get("op") == "context"]
-    assert len(found) == 1, [e.get("op") for e in events]
-    return found[0]
+# ---------------------------------------------------------------- 概览
 
 
-# ---------------------------------------------------------------- 组装
+async def test_overview_is_one_line_per_source_without_tables(scenic_source, small_source):
+    graph = {"nodes": [{"id": "q", "type": "tool", "data": {"label": "查门店", "config": {
+        "tool": f"db_query__{scenic_source.name}", "args": {"sql": "SELECT s.name FROM stores s"}}}}], "edges": []}
+    looks = await _service([scenic_source, small_source], graph=graph)
+    text = await looks.overview()
+    total = scenic.TABLE_COUNT + len(scenic.VIEWS)
+    assert f"- {scenic_source.name}（sqlite，只读）：景区业务库｜共 {total} 张表，还没有数据目录" in text
+    assert f"- {small_source.name}（sqlite，只读）：景区业务库｜共 2 张表，还没有数据目录" in text
+    # 不列表名、不列字段；现有工作流用到的表只列名字
+    assert "channel_visits" not in text and "visitor_count" not in text
+    assert f"现有工作流用到的表：{scenic_source.name} 的 stores" in text
 
 
-async def test_pick_brings_in_the_bridge_table_and_spells_out_fields_and_joins(scenic_source):
-    from app.api import copilot_context
+# ---------------------------------------------------------------- 点名、挑选
 
-    picker = Picker(PICKED)
-    plan = await copilot_context.plan_context([scenic_source])
-    assert plan.needs_pick
-    ctx = await plan.resolve(picker, need=NEED)
-    text = ctx.section()
 
-    assert len(picker.calls) == 1
-    # 挑表的输入是需求加紧凑表目录（每张表一行），不是全部字段
-    assert NEED in picker.calls[0] and "channel_visits" in picker.calls[0]
-    assert "attributed_share" not in picker.calls[0]
+async def test_named_look_brings_in_the_bridge_without_the_picker(monkeypatch, scenic_source):
+    fake = FakePicker(error=AssertionError("点名不该调挑选模型"))
+    _use_picker(monkeypatch, fake)
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": NEED, "targets": [
+        {"kind": "table", "name": "visits"}, {"kind": "table", "name": "CHANNELS"}]}, LookBudget())
 
-    (source,) = ctx.sources
-    assert source.selected_by == "model"
-    assert source.tables == ["visits", "channels", "channel_visits"]
+    assert not fake.calls
+    assert result.text.startswith("查看结果（第 1 次，这一轮最多 3 次）\n需求：" + NEED)
     for col in SELECTED_COLUMNS:
-        assert col in text, col
+        assert col in result.text, col
     for col in OTHER_COLUMNS:
-        assert col not in text, col
+        assert col not in result.text, col
     for cond in JOINS:
-        assert cond in text, cond
-    # 其余表只给名字，让模型知道还有别的表
-    assert "stores" in text and "parks" in text and "v_daily_visits" in text
-    # 写 SQL 的硬性要求保留
-    assert "写 SQL 的硬性要求" in text and "FETCH FIRST n ROWS ONLY" in text
+        assert cond in result.text, cond
+    assert "表 channel_visits（为连接补上）" in result.text
+    record = result.record
+    assert record["op"] == "look" and record["id"] == "L1" and record["by"] == "model" and record["status"] == "ok"
+    assert isinstance(record["elapsed_ms"], int)
+    (block,) = record["objects"]
+    assert block["kind"] == "table" and block["source"] == scenic_source.name
+    assert block["source_id"] == scenic_source.id
+    assert (block["named"], block["picked"], block["joined"], block["missing"]) == (
+        ["visits", "channels"], [], ["channel_visits"], [])
+    assert block["total"] == scenic.TABLE_COUNT + len(scenic.VIEWS) and block["catalog_tables"] == 0
+
+
+async def test_need_only_look_picks_with_a_small_fast_model(monkeypatch, scenic_source):
+    fake = FakePicker(PICKED)
+    specs = _use_picker(monkeypatch, fake)
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": NEED}, LookBudget())
+
+    assert len(fake.calls) == 1
+    # 挑选的输入是需求加紧凑的表目录（每张表一行），不是全部字段
+    assert NEED in fake.calls[0] and "channel_visits" in fake.calls[0] and "attributed_share" not in fake.calls[0]
+    (spec,) = specs
+    assert spec.thinking == "off" and spec.max_tokens <= 2048
+    (block,) = result.record["objects"]
+    assert (block["named"], block["picked"], block["joined"]) == ([], ["visits", "channels"], ["channel_visits"])
+    assert f"按需求从 {scenic.TABLE_COUNT + len(scenic.VIEWS)} 张表中挑出 2 张，另为连接补上 1 张" in result.text
+
+
+async def test_a_small_pool_is_given_whole_without_picking(monkeypatch, small_source):
+    fake = FakePicker(error=AssertionError("候选不超过 12 张不该挑"))
+    _use_picker(monkeypatch, fake)
+    looks = await _service([small_source])
+    result = await looks.look({"op": "look", "need": "订单总额"}, LookBudget())
+    assert not fake.calls
+    assert "候选只有 2 张表，全部给出" in result.text
+    assert "表 customers" in result.text and "表 orders" in result.text
+    assert f"orders.customer_id = customers.id（多对一）{INFERRED_MARK}" in result.text
+    assert result.record["objects"][0]["picked"] == ["customers", "orders"]
+
+
+@pytest.mark.parametrize("fake", [
+    FakePicker(error=RuntimeError("网关超时")),
+    FakePicker(PICKED, delay=5),
+    FakePicker({"items": [{"name": "no_such_table"}, {"name": "也没有这张"}]}),
+    FakePicker("我觉得都需要"),
+], ids=["error", "timeout", "unknown", "garbage"])
+async def test_pick_failures_hand_back_the_index(monkeypatch, scenic_source, fake):
+    import app.look.pick as pick
+
+    monkeypatch.setattr(pick, "PICK_TIMEOUT_S", 0.2)
+    _use_picker(monkeypatch, fake)
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": NEED}, LookBudget())
+
+    record = result.record
+    assert record["status"] == "index" and record["reason"] and record["objects"] == []
+    # 交回的是表目录（每张表一行），请模型点名再看；不给字段
+    assert "没能按需求挑出表" in result.text and record["reason"] in result.text
+    assert "channel_visits" in result.text and "attributed_share" not in result.text
+    assert "点名" in result.text
+
+
+async def test_an_empty_pick_is_reported_as_such(monkeypatch, scenic_source):
+    """挑选模型照提示说「需求和这份目录无关」返回空：照实说没挑出来，不当成失败、不塞表。"""
+    _use_picker(monkeypatch, FakePicker({"items": []}))
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": "你好"}, LookBudget())
+    assert result.record["status"] == "index"
+    assert result.record["reason"] == "按这个需求没有挑出相关的表"
+    assert "按这个需求没有挑出相关的表" in result.text and "attributed_share" not in result.text
+
+
+async def test_the_demo_model_cannot_pick(monkeypatch, scenic_source):
+    """没配接入时挑选模型是演示模型：照实说挑不了，交回目录。"""
+    import app.look.pick as pick
+    from app.providers.mock_model import MockChatModel
+
+    async def _demo(_session, _spec):
+        return MockChatModel(model_name="mock-fast"), "mock-fast"
+
+    monkeypatch.setattr(pick, "get_chat_model", _demo)
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": NEED}, LookBudget())
+    assert result.record["status"] == "index" and "演示模型" in result.record["reason"]
+
+
+# ---------------------------------------------------------------- 没找到、限定范围、多个库
+
+
+async def test_missing_tables_and_sources_are_named(scenic_source):
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": "退款明细", "targets": [
+        {"kind": "table", "name": "refunds"}, {"kind": "table", "name": "refund_detail"},
+        {"kind": "table", "source": "没有这个库", "name": "refunds"}]}, LookBudget())
+    assert "表 refunds" in result.text
+    assert f"没找到：{scenic_source.name} 的 refund_detail" in result.text and "别拿名字相近的表顶替" in result.text
+    assert "没找到数据源「没有这个库」" in result.text
+    blocks = {b["source"]: b for b in result.record["objects"]}
+    assert blocks[scenic_source.name]["named"] == ["refunds"]
+    assert blocks[scenic_source.name]["missing"] == ["refund_detail"]
+    assert blocks["没有这个库"]["source_id"] is None and blocks["没有这个库"]["missing"] == ["refunds"]
+
+
+async def test_several_sources_and_the_sources_field(monkeypatch, scenic_db, tmp_path):
+    a = await _add_source(scenic_db)
+    b = await _add_source(str(scenic.build(tmp_path / "b.db")))
+    try:
+        fake = FakePicker({"items": [{"source": a.name, "name": "visits"}, {"source": b.name, "name": "orders"},
+                                     f"{b.name}.payments", {"source": "没有这个库", "name": "refunds"}]})
+        _use_picker(monkeypatch, fake)
+        looks = await _service([a, b])
+        result = await looks.look({"op": "look", "need": "订单和入园"}, LookBudget())
+        assert f"数据源「{a.name}」" in fake.calls[0] and f"数据源「{b.name}」" in fake.calls[0]
+        blocks = {o["source"]: o for o in result.record["objects"]}
+        assert blocks[a.name]["picked"] == ["visits"]
+        assert blocks[b.name]["picked"] == ["orders", "payments"]
+
+        # sources 限定只在 b 里挑：挑选的目录里只有 b
+        fake.calls.clear()
+        fake.reply = {"items": [{"name": "refunds"}]}
+        result = await looks.look({"op": "look", "need": "退款", "sources": [b.name]}, LookBudget())
+        assert f"数据源「{a.name}」" not in fake.calls[0]
+        assert [o["source"] for o in result.record["objects"]] == [b.name]
+    finally:
+        await drop_source(a.id)
+        await drop_source(b.id)
+
+
+async def test_tables_outside_the_users_scope_are_not_found(scenic_db, small_source):
+    """用户限定了数据源：查看服务只认这一轮的源，别的库里的表按没找到回。"""
+    looks = await _service([small_source])
+    result = await looks.look({"op": "look", "need": "入园", "targets": [
+        {"kind": "table", "name": "visits"}]}, LookBudget())
+    assert "没找到" in result.text and "visitor_count" not in result.text
+
+
+# ---------------------------------------------------------------- 连接条件、目录
 
 
 async def test_inferred_relations_are_marked_and_catalog_is_attached(scenic_source):
     """visits.gate_id → gates 没有外键约束，是按列名推断的，连接条件要标出来；目录里推断的项同样要标。"""
-    from app.api import copilot_context
-
     async with SessionLocal() as session:
         await catalog.write_entry(session, scenic_source.id, "visits", {
             "label": make_item("入园记录", "llm"), "grain": make_item("每张门票每次检票一行", "human")},
             if_version=0, actor="王敏")
-    plan = await copilot_context.plan_context([scenic_source])
-    ctx = await plan.resolve(Picker({"tables": [{"table": "visits"}, {"table": "gates"}]}), need="各入口闸机的入园人次")
-    text = ctx.section()
-    assert f"visits.gate_id = gates.id（多对一）{INFERRED_MARK}" in text
-    assert f"中文名：入园记录{INFERRED_MARK}" in text
-    assert "粒度：每张门票每次检票一行" in text and f"每张门票每次检票一行{INFERRED_MARK}" not in text
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": "各入口闸机的入园人次", "targets": [
+        {"kind": "table", "name": "visits"}, {"kind": "table", "name": "gates"}]}, LookBudget())
+    assert f"visits.gate_id = gates.id（多对一）{INFERRED_MARK}" in result.text
+    assert f"中文名：入园记录{INFERRED_MARK}" in result.text
+    assert "粒度：每张门票每次检票一行" in result.text and f"每张门票每次检票一行{INFERRED_MARK}" not in result.text
+    assert "推断，未确认」的说明和连接条件" in result.text
+    (block,) = result.record["objects"]
+    assert block["catalog_tables"] == 1 and set(block["catalog_versions"]) == {"visits"}
 
 
 async def test_rejected_relations_are_not_used_for_join_paths(scenic_source):
     """人工驳回的关系不能拿来补路径：驳回 channel_visits → visits 后，关联表不会因为补路径被带进来。"""
-    from app.api import copilot_context
-
     rels = [dict(r, status="rejected") if r["to_table"] == "visits" else r
             for r in catalog.fk_relations(scenic_source.schema_cache, "channel_visits")]
     async with SessionLocal() as session:
         await catalog.write_entry(session, scenic_source.id, "channel_visits", {"relations": rels},
                                   if_version=0, actor="王敏")
-    plan = await copilot_context.plan_context([scenic_source])
-    ctx = await plan.resolve(Picker(PICKED), need=NEED)
-    assert ctx.sources[0].tables == ["visits", "channels"]
-    assert "channel_visits.visit_id = visits.id" not in ctx.section()
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": NEED, "targets": [
+        {"kind": "table", "name": "visits"}, {"kind": "table", "name": "channels"}]}, LookBudget())
+    assert result.record["objects"][0]["joined"] == []
+    assert "channel_visits.visit_id = visits.id" not in result.text
 
 
-async def test_picks_are_capped_and_paths_respect_the_total_limit(scenic_source):
-    from app.api import copilot_context
-
+async def test_bridges_respect_the_total_limit(scenic_source):
     names = list(scenic_source.schema_cache["tables"])
-    plan = await copilot_context.plan_context([scenic_source])
-    ctx = await plan.resolve(Picker({"tables": [{"table": n} for n in reversed(names)]}), need="全部都要")
-    # 挑中的按模型给的顺序截到上限；补中间表之后合计也不超过总上限
-    assert ctx.sources[0].picked == list(reversed(names))[:copilot_context.PICK_LIMIT]
-    assert ctx.sources[0].tables[:copilot_context.PICK_LIMIT] == ctx.sources[0].picked
-    assert len(ctx.sources[0].tables) <= copilot_context.CONTEXT_TABLE_LIMIT
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": "全部都要", "targets": [
+        {"kind": "table", "name": n} for n in names]}, LookBudget())
+    (block,) = result.record["objects"]
+    assert len(block["named"]) + len(block["joined"]) <= CONTEXT_TABLE_LIMIT
+    assert f"一次最多查看 {CONTEXT_TABLE_LIMIT} 张表" in result.text
 
-    # 两两都要补中间表的一组：总数不超过上限
     spread = ["reviews", "channels", "stores", "tour_groups", "coupons", "products"]
-    ctx = await plan.resolve(Picker({"tables": [{"table": n} for n in spread]}), need="x")
-    assert set(spread) <= set(ctx.sources[0].tables)
-    assert len(ctx.sources[0].tables) <= copilot_context.CONTEXT_TABLE_LIMIT
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": "x", "targets": [
+        {"kind": "table", "name": n} for n in spread]}, LookBudget())
+    (block,) = result.record["objects"]
+    assert set(spread) <= set(block["named"])
+    assert len(block["named"]) + len(block["joined"]) <= CONTEXT_TABLE_LIMIT
 
 
-async def test_tables_used_by_the_current_graph_are_always_included(scenic_source):
-    """改图、追问时现有工作流已经查了哪些表是确定的事实：挑表成功时并进来，挑表失败时也给它们的字段。"""
-    from app.api import copilot_context
-
-    graph = {"nodes": [{"id": "q", "type": "tool", "data": {"label": "查门店", "config": {
-        "tool": f"db_query__{scenic_source.name}", "args": {"sql": "SELECT s.name FROM stores s"}}}}], "edges": []}
-    plan = await copilot_context.plan_context([scenic_source], graph=graph)
-    picker = Picker({"tables": [{"table": "visits"}]})
-    ctx = await plan.resolve(picker, need="再按入园人次排一下")
-    assert ctx.sources[0].tables[:2] == ["stores", "visits"]
-    assert "当前工作流已用到" in picker.calls[0] and "stores" in picker.calls[0]
-
-    failed = await plan.resolve(Picker(error=RuntimeError("网关超时")), need="再按入园人次排一下")
-    assert failed.sources[0].selected_by == "fallback"
-    assert failed.sources[0].tables == ["stores"]
-    assert "store_code  TEXT" in failed.section()
+# ---------------------------------------------------------------- 遮罩（D6）
 
 
-async def test_several_sources_pick_with_source_names(scenic_db, tmp_path):
-    from app.api import copilot_context
+async def test_masked_columns_give_only_name_and_type_everywhere(client, masked_source):
+    """遮罩列只给列名和类型：目录里这一列的中文名、码值、带取值的含义都不给。助手查看、db_schema__、/schema 接口
+    是同一份说法（look 文档 D6）。"""
+    from app.tools.datasource import _catalog_of, _make_schema_tool
 
-    a = await _add_source(scenic_db)
-    b = await _add_source(str(scenic.build(tmp_path / "b.db")))
-    try:
-        plan = await copilot_context.plan_context([a, b])
-        picker = Picker({"tables": [{"source": a.name, "table": "visits"}, {"source": b.name, "table": "orders"},
-                                    f"{b.name}.payments", {"source": "没有这个库", "table": "refunds"}]})
-        ctx = await plan.resolve(picker, need="订单和入园")
-        assert f"数据源「{a.name}」" in picker.calls[0] and f"数据源「{b.name}」" in picker.calls[0]
-        by_name = {s.source.name: s for s in ctx.sources}
-        assert by_name[a.name].tables == ["visits"]
-        assert by_name[b.name].tables == ["orders", "payments"]
-        op = ctx.op()
-        assert [s["source"] for s in op["sources"]] == [a.name, b.name]
-        assert all(s["selected_by"] == "model" for s in op["sources"])
-    finally:
-        await _drop_source(a)
-        await _drop_source(b)
+    entries = await _catalog_of(masked_source)
+    detail = schema_view.table_detail(masked_source, "members",
+                                      catalog_notes={t: e.notes for t, e in entries.items()})
+    assert "phone  TEXT  已遮罩，只给列名和类型" in detail
+    assert "手机号" not in detail and "移动号段" not in detail and "13800000000" not in detail
+    # 别的列的目录照给
+    assert "1=普通" in detail and "中文名：会员" in detail
 
+    tool = _make_schema_tool(masked_source, catalog=entries)
+    assert await tool.coroutine(table="members") == detail
+    body = (await client.get(f"/api/datasources/{masked_source.id}/schema", params={"table": "members"})).json()
+    assert body["detail"] == detail
 
-async def test_small_source_keeps_detail_and_carries_the_catalog(small_source):
-    from app.api import copilot_context
-
-    async with SessionLocal() as session:
-        await catalog.write_entry(session, small_source.id, "orders", {
-            "label": make_item("订单", "llm"),
-            "columns": {"amount": {"unit": make_item("元", "human")}}}, if_version=0, actor="王敏")
-    picker = Picker(error=AssertionError("小库不该挑表"))
-    plan = await copilot_context.plan_context([small_source])
-    assert not plan.needs_pick
-    ctx = await plan.resolve(picker, need="订单总额")
-    text = ctx.section()
-    assert not picker.calls
-    # 详细模式的写法照旧：每张表一行带字段
-    assert "· orders[表]" in text and "· customers[表]" in text
-    # 额外带上目录和连接条件
-    assert f"中文名：订单{INFERRED_MARK}" in text and "单位：元" in text
-    assert f"orders.customer_id = customers.id（多对一）{INFERRED_MARK}" in text
-    op = ctx.op()
-    assert op["sources"] == [{"source": small_source.name, "source_id": small_source.id,
-                              "tables": ["customers", "orders"], "selected_by": "all", "total": 2,
-                              "catalog_tables": 1}]
+    looks = await _service([masked_source])
+    result = await looks.look({"op": "look", "need": "会员", "targets": [
+        {"kind": "table", "name": "members"}]}, LookBudget())
+    assert "已遮罩，只给列名和类型" in result.text and "手机号" not in result.text and "移动号段" not in result.text
+    assert "设了遮罩" in await looks.overview()
 
 
-# ---------------------------------------------------------------- 回退：绝不阻断生成
+# ---------------------------------------------------------------- 字数上限、重复查看、次数
 
 
-@pytest.mark.parametrize("picker", [
-    Picker(error=RuntimeError("网关超时")),
-    Picker(PICKED, delay=5),
-    Picker({"tables": [{"table": "no_such_table"}, {"table": "也没有这张"}]}),
-    Picker({"tables": []}),
-    Picker("我觉得都需要"),
-], ids=["error", "timeout", "unknown", "empty", "garbage"])
-async def test_pick_failures_fall_back_to_names_only(client, monkeypatch, scenic_source, picker):
-    import app.api.copilot_context as copilot_context
+async def test_tables_over_the_char_limit_only_get_column_names(monkeypatch, scenic_source):
+    import app.look.service as service
 
-    monkeypatch.setattr(copilot_context, "PICK_TIMEOUT_S", 0.2)
-    _use_picker(monkeypatch, picker)
-    model = Scripted(_graph_using(f"db_query__{scenic_source.name}"))
-    events = await _stream(client, monkeypatch, model, {
-        "instruction": NEED, "intent": "answer", "datasource_ids": [scenic_source.id]})
-
-    op = _context_op(events)
-    assert op["sources"] == [{"source": scenic_source.name, "source_id": scenic_source.id, "tables": [],
-                              "selected_by": "fallback", "total": scenic.TABLE_COUNT + len(scenic.VIEWS),
-                              "catalog_tables": 0, "reason": op["sources"][0]["reason"]}]
-    assert op["sources"][0]["reason"]
-    system = model.systems[0]
-    # 和以前一样只列表名、提醒先查字段
-    assert "channel_visits" in system and "attributed_share" not in system
-    assert "写 SQL 前用 db_schema 工具确认字段" in system
-    # 生成照常进行
-    assert events[-1]["op"] == "final", events[-1]
+    monkeypatch.setattr(service, "LOOK_RESULT_CHARS", 400)
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": "订单", "targets": [
+        {"kind": "table", "name": n} for n in ("orders", "order_items", "payments", "refunds")]}, LookBudget())
+    assert "字数超了只给字段名" in result.text and "后面的表只给了字段名" in result.text
+    # 第一张表给全了，后面的只给字段名
+    assert "total_amount  REAL" in result.text
+    assert "refunds[表]：" in result.text
 
 
-
-# ---------------------------------------------------------------- 流式：context 操作、自查沿用同一份上下文
-
-
-async def test_stream_reports_the_context_and_prompt_carries_selected_tables(client, monkeypatch, scenic_source):
-    from app.api import copilot_context
-
-    picker = Picker(PICKED)
-    specs = _use_picker(monkeypatch, picker)
-    model = Scripted(_graph_using(f"db_query__{scenic_source.name}"))
-    events = await _stream(client, monkeypatch, model, {
-        "instruction": NEED, "intent": "answer", "datasource_ids": [scenic_source.id]})
-
-    op = _context_op(events)
-    assert op["sources"] == [{"source": scenic_source.name, "source_id": scenic_source.id,
-                              "tables": ["visits", "channels", "channel_visits"], "selected_by": "model",
-                              "total": scenic.TABLE_COUNT + len(scenic.VIEWS), "catalog_tables": 0}]
-    assert isinstance(op["elapsed_ms"], int) and op["elapsed_ms"] >= 0
-    # context 在模型首帧之后、第一条图操作之前
-    kinds = [e["op"] for e in events]
-    assert kinds.index("model") < kinds.index("context") < kinds.index("add_node")
-
-    # 挑表用同一个助手模型，关掉思考、额度取小
-    (spec,) = specs
-    assert spec.thinking == "off" and spec.max_tokens == copilot_context.PICK_MAX_TOKENS
-    assert spec.max_tokens <= 2048
-
-    system = model.systems[0]
-    for col in SELECTED_COLUMNS:
-        assert col in system, col
-    for col in OTHER_COLUMNS:
-        assert col not in system, col
-    for cond in JOINS:
-        assert cond in system, cond
-    # 工具清单里列出的可查对象，先列挑中的表
-    tool_line = next(line for line in system.splitlines() if line.startswith(f"- db_query__{scenic_source.name}"))
-    assert "可查：visits、channels、channel_visits" in tool_line
+async def test_looking_at_the_same_tables_again_is_short_circuited(scenic_source):
+    looks = await _service([scenic_source])
+    budget = LookBudget()
+    line = {"op": "look", "need": "门店", "targets": [{"kind": "table", "name": "stores"}]}
+    first = await looks.look(line, budget)
+    again = await looks.look(line, budget)
+    assert first.record is not None and again.record is None and again.counted
+    assert "已经在上面" in again.text and "store_code" not in again.text
+    assert budget.used == 2 and [r["id"] for r in looks.records] == ["L1"]
+    # 多了一张没看过的就照常查看
+    more = await looks.look({**line, "targets": [{"kind": "table", "name": "stores"},
+                                                 {"kind": "table", "name": "parks"}]}, budget)
+    assert more.record["id"] == "L2"
 
 
-async def test_self_check_repair_reuses_the_same_context(client, monkeypatch, scenic_source):
-    picker = Picker(PICKED)
-    _use_picker(monkeypatch, picker)
-    tool = f"db_query__{scenic_source.name}"
-    first = [
-        {"op": "add_node", "node": {"id": "start", "type": "input", "label": "输入", "config": {}}},
-        {"op": "add_node", "node": {"id": "q", "type": "tool", "label": "查入园", "config": {
-            "tool": tool, "args": {"sql": "SELECT v.no_such_col FROM visits v"}, "assign_to": "rows"}}},
-        {"op": "add_edge", "edge": {"source": "start", "target": "q"}},
-        {"op": "add_node", "node": {"id": "out", "type": "output", "label": "成果", "config": {
-            "fields": [{"name": "rows", "value": "{{ vars.rows }}"}]}}},
-        {"op": "add_edge", "edge": {"source": "q", "target": "out"}},
-        {"op": "done", "explanation": "查一下", "run": False},
+async def test_need_is_required_and_the_limit_is_kept(scenic_source):
+    looks = await _service([scenic_source])
+    budget = LookBudget(limit=1)
+    nothing = await looks.look({"op": "look", "targets": [{"kind": "table", "name": "stores"}]}, budget)
+    assert "look 要写 need" in nothing.text and not nothing.counted and budget.used == 0
+    await looks.look({"op": "look", "need": "门店", "targets": [{"kind": "table", "name": "stores"}]}, budget)
+    over = await looks.look({"op": "look", "need": "园区", "targets": [{"kind": "table", "name": "parks"}]}, budget)
+    assert "查看次数已用完" in over.text and over.record is None and not over.counted
+
+
+# ---------------------------------------------------------------- 旧写法
+
+
+def test_the_old_tables_field_is_read_as_table_targets():
+    """look 文档初稿的写法 tables:[{source, table}]（以及只写表名的字符串）读进来换成 kind=table 的 targets。"""
+    assert parse_targets({"op": "look", "need": "x", "tables": [{"source": "库 B", "table": "refunds"}, "orders"],
+                          "targets": [{"kind": "capability", "name": "db_query__b"}, {"name": "没写类别"}]}) == [
+        {"kind": "capability", "name": "db_query__b"},
+        {"kind": "table", "name": "refunds", "source": "库 B"},
+        {"kind": "table", "name": "orders"},
     ]
-    fix = [{"op": "update_node", "id": "q", "config": {"args": {"sql": "SELECT v.visitor_count FROM visits v"}}},
-           {"op": "done"}]
-    model = Scripted(first, fix)
-    events = await _stream(client, monkeypatch, model, {
-        "instruction": NEED, "datasource_ids": [scenic_source.id]})
-
-    assert any(e.get("op") == "check" and e.get("status") == "repairing" for e in events)
-    assert len(model.systems) == 2 and "上线前自查" in model.humans[1]
-    # 修正轮带的是同一份上下文，没有重新挑表
-    assert model.systems[1] == model.systems[0]
-    assert "attributed_share  REAL" in model.systems[1]
-    assert len(picker.calls) == 1
 
 
-async def test_context_op_says_how_much_of_each_source_has_a_catalog(scenic_source):
-    """context 操作里每个源带上有数据目录的表数（catalog_tables）和源的 id：没有目录的大库，界面提示先去起草目录。
-
-    真实运行里数据源一张目录都没有，挑表和 SQL 检查都用不上目录，用户也不知道该先去起草。只算有可见项的表：
-    整份被驳回的不算有目录。"""
-    from app.api import copilot_context
-
-    async def op() -> dict:
-        plan = await copilot_context.plan_context([scenic_source])
-        return (await plan.resolve(Picker(PICKED), need=NEED)).op()["sources"][0]
-
-    first = await op()
-    assert first["catalog_tables"] == 0 and first["source_id"] == scenic_source.id
-    async with SessionLocal() as session:
-        await catalog.write_entry(session, scenic_source.id, "visits", {
-            "label": make_item("入园记录", "llm")}, if_version=0, actor="王敏")
-        rejected = make_item("门店", "llm")
-        rejected["status"] = "rejected"
-        await catalog.write_entry(session, scenic_source.id, "stores", {"label": rejected}, if_version=0, actor="王敏")
-    assert (await op())["catalog_tables"] == 1
-
-
-async def test_small_sources_do_not_call_the_picker(client, monkeypatch, small_source):
-    picker = Picker(error=AssertionError("小库不该挑表"))
-    _use_picker(monkeypatch, picker)
-    model = Scripted(_graph_using(f"db_query__{small_source.name}"))
-    events = await _stream(client, monkeypatch, model, {
-        "instruction": "订单总额", "intent": "answer", "datasource_ids": [small_source.id]})
-    op = _context_op(events)
-    assert op["sources"][0]["selected_by"] == "all" and "elapsed_ms" not in op
-    assert not picker.calls
-    assert "· orders[表]" in model.systems[0]
-
-
-# ---------------------------------------------------------------- 非流式和两个兜底入口：同一套组装，不发 context
-
-
-async def test_one_shot_generate_uses_the_same_context(client, monkeypatch, scenic_source):
-    import app.api.copilot as copilot
-
-    picker = Picker(PICKED)
-    _use_picker(monkeypatch, picker)
-    seen: list = []
-
-    class _OneShot:
-        def with_structured_output(self, *_a, **_k):
-            return self
-
-        async def ainvoke(self, messages):
-            seen.append(messages)
-            return {"nodes": [], "edges": []}
-
-    async def _model(*_a, **_k):
-        return _OneShot(), "mock-fast"
-
-    monkeypatch.setattr(copilot, "get_chat_model", _model)
-    r = await client.post("/api/copilot/generate", json={"instruction": NEED, "datasource_ids": [scenic_source.id]})
-    assert r.status_code == 200, r.text
-    assert len(picker.calls) == 1 and NEED in picker.calls[0]
-    system = next(t for role, t in seen[0] if role == "system")
-    for cond in JOINS:
-        assert cond in system
-    assert "attributed_share  REAL" in system
-
-
-def _node(nid, ntype, label, **config):
-    return {"id": nid, "type": ntype, "position": {"x": 0, "y": 0}, "data": {"label": label, "config": config}}
-
-
-async def test_publish_fix_shares_the_context(monkeypatch, scenic_source):
-    """发布前修复：现有图查的表一定带上，需求写的是挡住发布的问题；不发 context 操作（返回值里没有）。"""
-    import app.api.copilot as copilot
-
-    picker = Picker({"tables": [{"source": scenic_source.name, "table": "visits"},
-                                {"source": scenic_source.name, "table": "channels"}]})
-    _use_picker(monkeypatch, picker)
-    model = Scripted([{"op": "plan", "summary": "看一下"}, {"op": "done", "explanation": "无法修改"}])
-
-    async def _model(*_a, **_k):
-        return model, "mock-fast"
-
-    monkeypatch.setattr(copilot, "get_chat_model", _model)
-    graph = {"nodes": [
-        _node("start", "input", "周期"),
-        _node("fetch", "tool", "取数", tool=f"db_query__{scenic_source.name}",
-              args={"sql": "SELECT SUM(amount) AS gmv FROM store_sales"}),
-        _node("write", "report", "报告撰写", instructions="写周报", numbers="strict", on_violation="fail"),
-        _node("done", "output", "出具", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
-        _node("raw", "output", "原始数", fields=[{"name": "数", "value": "{{ nodes.fetch }}"}]),
-    ], "edges": [{"id": f"e{i}", "source": a, "target": b} for i, (a, b) in enumerate(
-        [("start", "fetch"), ("fetch", "write"), ("write", "done"), ("fetch", "raw")])]}
-    async with SessionLocal() as session:
-        out = await copilot.assist_publish_fix(session, graph, level="governed")
-    assert model.systems, out
-    assert len(picker.calls) == 1 and "发布前检查" in picker.calls[0]
-    system = model.systems[0]
-    assert "attributed_share  REAL" in system and "sold_at  TEXT" in system
-    assert "context" not in json.dumps(out, ensure_ascii=False)
-
-
-async def test_upgrade_shares_the_context(monkeypatch, scenic_source):
-    import app.api.copilot as copilot
-
-    picker = Picker({"tables": [{"source": scenic_source.name, "table": "no_such_table"}]})
-    _use_picker(monkeypatch, picker)
-    model = Scripted([{"op": "plan", "summary": "看一下"}, {"op": "done", "explanation": "不改"}])
-
-    async def _model(*_a, **_k):
-        return model, "mock-fast"
-
-    monkeypatch.setattr(copilot, "get_chat_model", _model)
-    graph = {"nodes": [
-        _node("start", "input", "输入"),
-        _node("fetch", "tool", "查库", tool=f"db_query__{scenic_source.name}",
-              args={"sql": "SELECT SUM(amount) AS a, COUNT(*) AS b FROM store_sales"}),
-        _node("calc", "code", "算比率", language="python", assign_to="calc",
-              code="import json\nprint(json.dumps({'ratio': 3 / 4}))"),
-        _node("card", "metrics", "口径卡", metrics=[{"id": "ratio", "name": "客单价", "expression": "vars.calc.ratio"}]),
-        _node("write", "report", "报告撰写", instructions="写一句话"),
-        _node("out", "output", "成果", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
-    ], "edges": [{"id": f"e{i}", "source": a, "target": b} for i, (a, b) in enumerate(
-        [("start", "fetch"), ("fetch", "calc"), ("calc", "card"), ("card", "write"), ("write", "out")])]}
-    async with SessionLocal() as session:
-        await copilot.assist_upgrade(session, graph, level="published")
-    assert model.systems and len(picker.calls) == 1
-    # 挑表失败也不挡：现有图查的表照样给全字段，其余表只列名字
-    system = model.systems[0]
-    assert "sold_at  TEXT" in system and "attributed_share" not in system
+async def test_the_old_tables_field_still_looks(scenic_source):
+    looks = await _service([scenic_source])
+    result = await looks.look({"op": "look", "need": "门店",
+                               "tables": [{"source": scenic_source.name, "table": "stores"}]}, LookBudget())
+    assert result.record["objects"][0]["named"] == ["stores"] and "store_code  TEXT" in result.text
