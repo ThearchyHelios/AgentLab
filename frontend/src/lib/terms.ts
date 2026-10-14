@@ -2445,14 +2445,24 @@ export const CATALOG_DRAFT_TEXT = {
   queued: '排队中，等待开始…',
   running: '正在起草…',
   // 服务端点了停止就取消进行中的模型调用（不等它答完，一次调用可能要几分钟），只等手上正在写入目录的那张表写完
-  stopping: '正在停止：取消进行中的模型调用，正在写入目录的表写完后停止…',
+  // 宽表每写完一段就写进目录：停下来时已写进的段保留，只停掉进行中的调用
+  stopping: '正在停止：取消进行中的模型调用，已写进目录的段保留…',
   progress: (done: number, total: number) => `已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
   /** 结束以后：全部写出来的表有几张（停止、失败、部分完成的不算） */
   progressDone: (ok: number, total: number) => `写完 ${formatNumber(ok)} / ${formatNumber(total)} 张表`,
   parts: (done: number, total: number) => `${formatNumber(done)} / ${formatNumber(total)} 段`,
-  partsHint: '超过 40 列的表拆成表级一段和若干列分段，逐段起草',
+  partsHint: '超过 40 列的表拆成表级一段和若干列分段，逐段起草，每写完一段就写进目录',
+  /** 段被缩小、拆半后实际分成的块（比段多时才写） */
+  chunks: (done: number, total: number) => `${formatNumber(done)} / ${formatNumber(total)} 块`,
+  chunksHint: (total: number) => `模型用完额度或超时后，段被缩小、拆半：这张表实际分成 ${formatNumber(total)} 块起草`,
+  /** 已经写进目录的段（停止、服务重启时保留） */
+  partsWritten: (n: number) => `已写进目录 ${formatNumber(n)} 段`,
+  partsWrittenHint: '每写完一段就写进目录，停止或服务重启时已写进的段保留',
+  /** 停下来的宽表：服务端的原因里没写时，界面补这一句 */
+  partsWrittenStopped: (n: number, rest: number) => (rest > 0
+    ? `已写进目录 ${formatNumber(n)} 段，剩下 ${formatNumber(rest)} 段没起草` : `已写进目录 ${formatNumber(n)} 段`),
   hide: '在后台继续',
-  hideHint: '关闭对话框不会停止起草，进度显示在目录页上方；每张表起草完就写进目录',
+  hideHint: '关闭对话框不会停止起草，进度显示在目录页上方；每写完一段就写进目录',
   stop: '停止',
   busy: '这个数据源已有进行中的起草任务，下面显示的是它的进度',
   modelUsed: (model: string) => `模型：${model}`,
@@ -2490,8 +2500,11 @@ export const CATALOG_DRAFT_TEXT = {
     cancelled: '已停止',
     interrupted: '服务重启，起草中断',
   } as Record<CatalogDraftJobStatus, string>,
-  interrupted: '服务重启时这次起草还没有完成，没写完的表未起草。已写进目录的内容保留；可以只重试这些表，接着起草',
-  cancelled: '已写进目录的内容保留，没写完的表未起草',
+  interrupted: '服务重启时这次起草还没有完成，没写完的部分未起草。已写进目录的内容保留（每写完一段就写进目录）；可以只重试这些表，接着起草',
+  cancelled: '已写进目录的内容保留（每写完一段就写进目录），没写完的部分未起草',
+  /** 停下来时有表已经写进了一部分段 */
+  cancelledParts: (tables: number, parts: number) =>
+    `其中 ${formatNumber(tables)} 张表已写进目录 ${formatNumber(parts)} 段；只重试这些表时接着起草剩下的段，已写进的不会丢`,
   // 任务整体出错的原因（job.error）照服务端的原话写在标题「起草失败」下面，不再加前缀：服务端的原因有的已经是整句
   // （「数据源不存在……」），有的自带「起草任务出错：」开头。没结束的表记失败、原因同任务的，逐表不再重复
   /** 没写全的表：失败、部分完成、已停止各几张；跳过的（表结构里没有）另说 */
@@ -2539,6 +2552,8 @@ export const CATALOG_DRAFT_TEXT = {
   /** 上次起草有留空的列：清单上是轻提示（不是失败标记），表详情顶部同一句 */
   lastBlank: (n: number) => `上次起草有 ${formatNumber(n)} 列模型拿不准、留空了`,
   lastBlankAdvice: '可以在起草要求里补充缩写和术语的含义，再重新起草这张表，已有的内容不会丢',
+  /** 最近一次起草停止了、没有新写入：留空的列是再之前那次写完的起草记下的 */
+  lastBlankEarlier: '最近一次起草已停止，留空的列按再之前那次起草记下的',
   draftGuidance: '补充起草要求',
   draftGuidanceHint: '打开起草设置，范围是这张表：先在起草要求里补充缩写和术语的含义，再开始起草',
   redraft: '重新起草这张表',
@@ -2953,6 +2968,285 @@ export const CATALOG_UI_TEXT = {
   cardinalityCheckedShort: '已核实',
   cardinalityCheckedHint: '基数由数据剖析用数据核实（子表一侧确有重复或确实唯一），一对多关联后重复计算的检查据此报错误',
   emptyTables: (n: number) => `挑表时跳过 ${formatNumber(n)} 张空表`,
+  // ---- 表详情里有效记录条件、去重规则的说明（模型起草时附的依据、数据剖析核对的排除比例）
+  fieldNote: '说明',
+}
+
+// ===========================================================================
+// 表助手（表详情里「和助手一起完善」）：和助手对话完善一张表的数据目录。
+//
+// 术语：
+// - 面板叫「表助手」，入口写「和助手一起完善」。助手只改数据目录、不改业务库；只记数据事实，不写公式。
+// - 助手提出的修改叫「修改提案」，每一项写「改前 / 改后 / 依据」，可以逐项「去掉」「加回」。
+// - 「待保存的修改」：跨多轮累积，同一项以最后一次提案为准；「保存 N 项修改」一次写入，改动的项记为人工填写、已确认。
+// - 只读查询只在开了数据剖析的源上有：写「查询了数据」，SQL 和前几行可以展开；遮罩列的值写「已遮罩」（服务端给的）。
+// - 对话不保存在服务端：关闭表助手、换表、离开页面后就没有了。
+// ===========================================================================
+
+export const CATALOG_ASSISTANT_TEXT = {
+  open: '和助手一起完善',
+  openHint: '和表助手对话完善这张表的数据目录：说出业务事实，助手整理成修改提案，确认后再保存',
+  openMissing: '表结构中已没有这张表，不能和助手一起完善',
+  title: '表助手',
+  subtitle: (table: string) => `完善「${table}」的数据目录`,
+  close: '关闭表助手',
+  closeTitle: '关闭表助手？',
+  closeConsequences: ['待保存的修改和这段对话都会丢失'],
+  closeConfirm: '放弃并关闭',
+  leaveTitle: '表助手有未保存的修改',
+  leaveConsequences: ['离开后待保存的修改和这段对话都会丢失'],
+  leaveConfirm: '放弃并离开',
+  noProfile: '这个数据源没开数据剖析，助手只能根据表结构和目录推断，不能查数据',
+  profileOn: '这个数据源开了数据剖析：助手可以发少量只读查询核对数据，遮罩列不取值',
+  notStored: '对话不保存在服务端，关闭表助手或离开页面后就没有了',
+  greeting: '说出你知道的业务事实（某一列的含义、码值、有效记录条件……），助手整理成修改提案，你确认后才写进数据目录。助手只记数据事实，不写计算公式。',
+  /** 上次起草有留空的列：开场引导先问这几列 */
+  blankLead: (n: number, cols: string[]) =>
+    `上次起草有 ${formatNumber(n)} 列模型拿不准、留空了${cols.length ? `，例如 ${cols.join('、')}` : ''}。可以先从这几列开始。`,
+  suggestLabel: '可以这样开始',
+  suggestBlank: (n: number) => `补上留空的 ${formatNumber(n)} 列`,
+  suggestBlankText: (cols: string[]) => `请帮我补上这几列的中文名和含义：${cols.join('、')}。拿不准的地方先问我。`,
+  suggestFacts: '核对有效记录条件和去重规则',
+  suggestFactsText: '这张表的有效记录条件和去重规则应该怎么写？拿不准的地方先问我。',
+  suggestPending: '看看哪些推断可以确认',
+  suggestPendingText: '这张表还没确认的推断项里，哪些可以直接确认、哪些需要我补充？',
+  you: '你',
+  assistant: '助手',
+  logLabel: '和表助手的对话',
+  inputLabel: '给表助手的消息',
+  inputPlaceholder: '例如：status 为 9 表示作废，统计时要排除',
+  inputHint: 'Enter 发送，Shift+Enter 换行',
+  count: (n: number, max: number) => `${formatNumber(n)} / ${formatNumber(max)} 字`,
+  tooLong: (max: number) => `一条消息不超过 ${formatNumber(max)} 字`,
+  send: '发送',
+  stop: '停止回答',
+  answering: '助手正在回答…',
+  answered: '助手已回答',
+  stopped: '已停止回答',
+  interrupted: '连接中断，这一轮没有答完',
+  failed: (reason: string) => `这一轮没有完成：${reason}`,
+  usage: (input: number, output: number) =>
+    `输入 ${formatTokens(input, { compact: true })}、输出 ${formatTokens(output, { compact: true })}`,
+  queries: (n: number) => `查询 ${formatNumber(n)} 次`,
+  // ---- 只读查询
+  query: (rows: number) => `查询了数据（${formatNumber(rows)} 行）`,
+  queryFailed: '查询没有成功',
+  queryRows: (shown: number, total: number) => (total > shown
+    ? `共 ${formatNumber(total)} 行，显示前 ${formatNumber(shown)} 行` : `共 ${formatNumber(total)} 行`),
+  queryEmpty: '没有返回行',
+  // ---- 修改提案
+  proposal: (n: number) => `修改提案（${formatNumber(n)} 项）`,
+  before: '改前',
+  after: '改后',
+  reason: '依据',
+  drop: '去掉',
+  dropLabel: (where: string) => `去掉：${where}`,
+  restore: '加回',
+  restoreLabel: (where: string) => `加回：${where}`,
+  state: {
+    pending: '待保存',
+    replaced: '已改用另一条提案的值',
+    dropped: '已去掉',
+    saved: '已保存',
+  } as Record<'pending' | 'replaced' | 'dropped' | 'saved', string>,
+  stateConfirm: '值不变，保存即确认',
+  // ---- 待保存的修改
+  pending: (n: number) => `待保存的修改（${formatNumber(n)} 项）`,
+  pendingEmpty: '还没有待保存的修改',
+  pendingHint: '跨多轮累积，同一项以最后一次提案为准。保存后改动的项记为人工填写、已确认',
+  pendingShow: '展开待保存的修改',
+  pendingHide: '收起待保存的修改',
+  save: (n: number) => `保存 ${formatNumber(n)} 项修改`,
+  saving: '正在保存…',
+  clear: '全部去掉',
+  clearTitle: (n: number) => `去掉全部 ${formatNumber(n)} 项待保存的修改？`,
+  clearConfirm: '全部去掉',
+  tooMany: (n: number, max: number) => `有 ${formatNumber(n)} 项，一次最多保存 ${formatNumber(max)} 项，请先去掉一些`,
+  editing: '正在编辑这张表，保存或取消后再保存助手的修改',
+  saved: (n: number, version: number) => `已保存 ${formatNumber(n)} 项修改（第 ${formatNumber(version)} 版）`,
+  savedToast: (n: number, table: string) => `已保存 ${formatNumber(n)} 项修改到「${table}」的数据目录`,
+  conflictTitle: '这张表刚被修改过',
+  conflictBody: '已按最新内容重算改前和改后，请核对后再保存。',
+  conflictFailed: '无法按最新内容重算改前和改后，请稍后重试',
+  problems: '以下几项已无法保存，已从待保存的修改中去掉：',
+}
+
+// ===========================================================================
+// 审阅队列（数据目录页的「审阅队列」视图）：跨表列出推断项，按表的使用次数、这一项对数字的影响和来源排好，
+// 可以成批确认、驳回、撤销审阅。
+//
+// 术语：
+// - 「影响数字的项」：有效记录条件、去重规则、业务日期、关联关系、业务主键、度量类型——写错了查出来的数就不对，排在最前；
+//   「名称和含义」：中文名、含义、单位、码值、粒度、表类型。
+// - 审阅过的项原地标出结果（已确认、已驳回、未生效），刷新队列后才移除；「撤销审阅」回到起草时的状态（推断）。
+// - 「常用 20 张表」：使用次数最多的 20 张。进度写「已确认 42%」。
+// ===========================================================================
+
+export const CATALOG_REVIEW_TEXT = {
+  viewLabel: '数据目录的视图',
+  view: { list: '表清单', review: '审阅队列' } as Record<'list' | 'review', string>,
+  viewHint: {
+    list: '逐表查看和编辑数据目录',
+    review: '跨表列出待确认的推断项，按使用次数和对数字的影响排好，可以成批确认、驳回',
+  } as Record<'list' | 'review', string>,
+  queueLabel: '待确认的推断项',
+  kindLabel: '按项筛选',
+  kind: { all: '全部', facts: '影响数字的项', names: '名称和含义' } as Record<'all' | 'facts' | 'names', string>,
+  kindHint: {
+    all: '全部待确认的推断项',
+    facts: '有效记录条件、去重规则、业务日期、关联关系、业务主键、度量类型：写错了查出来的数就不对',
+    names: '中文名、含义、单位、码值、粒度、表类型',
+  } as Record<'all' | 'facts' | 'names', string>,
+  tableLabel: '按表筛选',
+  tableAll: '全部表',
+  tableOption: (label: string | null, table: string, n: number) => `${label ? `${label}（${table}）` : table} · ${formatNumber(n)} 项`,
+  total: (n: number) => `${formatNumber(n)} 项待确认`,
+  shown: (shown: number, total: number) => `显示 ${formatNumber(shown)} / ${formatNumber(total)} 项`,
+  empty: '没有待确认的推断项',
+  emptyBody: '推断的项都审阅过了。之后起草出的新推断会出现在这里。',
+  emptyFiltered: '没有符合条件的待确认项',
+  emptyFilteredBody: '请换个筛选条件。',
+  loadFailed: '无法读取审阅队列',
+  retry: '重试',
+  refresh: '刷新队列',
+  refreshHint: '审阅过的项刷新后从队列中移除',
+  more: (n: number) => `再载入 ${formatNumber(n)} 项`,
+  loading: '正在载入…',
+  selectAll: '全选当前列表',
+  select: (where: string, table: string) => `选择：${table} ${where}`,
+  selected: (n: number) => `已选 ${formatNumber(n)} 项`,
+  clearSelection: '取消选择',
+  usage: (n: number) => `使用 ${formatNumber(n)} 次`,
+  usageHint: '所在表被运行查询过的次数',
+  open: (where: string, table: string) => `打开「${table}」，查看${where}`,
+  reasonsLabel: '排在这里的原因',
+  // ---- 成批审阅
+  confirm: (n: number) => `确认（${formatNumber(n)}）`,
+  reject: (n: number) => `驳回（${formatNumber(n)}）`,
+  reset: (n: number) => `撤销审阅（${formatNumber(n)}）`,
+  resetHint: '把这一页上审阅过的项回到起草时的状态（推断）',
+  confirmTitle: (n: number) => `确认 ${formatNumber(n)} 项推断？`,
+  confirmConsequences: ['确认后这些项参与 SQL 检查', '来源保持不变，状态改为已确认', '之后仍可撤销审阅'],
+  confirmAction: (n: number) => `确认 ${formatNumber(n)} 项`,
+  rejectTitle: (n: number) => `驳回 ${formatNumber(n)} 项推断？`,
+  rejectConsequences: ['驳回后不提供给助手、不参与 SQL 检查', '之后起草也不会再提出', '之后仍可撤销审阅'],
+  rejectAction: (n: number) => `驳回 ${formatNumber(n)} 项`,
+  tooMany: (max: number) => `一次最多审阅 ${formatNumber(max)} 项，请少选一些`,
+  working: '正在提交…',
+  done: { confirm: '已确认', reject: '已驳回', reset: '已撤销审阅' } as Record<'confirm' | 'reject' | 'reset', string>,
+  conflict: '未生效：这张表刚被修改过，请刷新队列后再审阅',
+  failed: '未生效',
+  /** 一批的结果：成功几项、冲突几项、别的原因没成功几项 */
+  summary: (action: 'confirm' | 'reject' | 'reset', ok: number, conflicts: number, failed: number) => {
+    const head = `${{ confirm: '已确认', reject: '已驳回', reset: '已撤销审阅' }[action]} ${formatNumber(ok)} 项`
+    const bad = [
+      conflicts ? `${formatNumber(conflicts)} 项未生效（所在表刚被修改过）` : '',
+      failed ? `${formatNumber(failed)} 项未生效` : '',
+    ].filter(Boolean)
+    return bad.length ? `${head}；${bad.join('、')}，请刷新队列后再审阅` : head
+  },
+  failedAll: (reason: string) => `未能提交：${reason}`,
+  // ---- 进度
+  progressTitle: '审阅进度',
+  progressTop: (n: number) => `常用 ${formatNumber(n)} 张表`,
+  progressTopHint: (n: number) => `使用次数最多的 ${formatNumber(n)} 张表里的项`,
+  progressAll: '全部表',
+  progressFacts: '影响数字的项',
+  progressFactsHint: '有效记录条件、去重规则、业务日期、关联关系、业务主键、度量类型',
+  confirmedPct: (pct: number | null) => (pct == null ? '还没有目录项' : `已确认 ${formatNumber(pct)}%`),
+  itemsOf: (confirmed: number, total: number) => `${formatNumber(confirmed)} / ${formatNumber(total)} 项`,
+  allDetail: (proposed: number, rejected: number) => `推断 ${formatNumber(proposed)} 项、已驳回 ${formatNumber(rejected)} 项`,
+  factsDetail: (proposed: number, confirmed: number) => `待确认 ${formatNumber(proposed)} 项、已确认 ${formatNumber(confirmed)} 项`,
+  progressFailed: '无法读取审阅进度',
+  // ---- 没选中项时的右栏
+  overviewTitle: '从左侧队列挑一项开始审阅',
+  overviewBody: '队列按所在表的使用次数、这一项对数字的影响和来源排序：常用表里影响数字的推断排在最前，模型起草、命名推断的比数据库注释的靠前。点开一项可以看它所在表的详情和用过这张表的运行。',
+  // ---- 从队列打开的项
+  focusMark: '从审阅队列打开',
+  // ---- 表清单视图概览里的入口
+  openQueue: '打开审阅队列',
+  openQueueHint: '跨表按使用次数和对数字的影响排好，可以成批确认、驳回',
+}
+
+/** 表详情里「用过这张表的运行」（GET /catalog/{table}/usage） */
+export const CATALOG_USAGE_TEXT = {
+  title: '用过这张表的运行',
+  hint: '新的在前',
+  show: '查看用过这张表的运行',
+  hide: '收起',
+  none: '还没有运行查询过这张表',
+  count: (shown: number, total: number) => (total > shown
+    ? `最近 ${formatNumber(shown)} 次，共 ${formatNumber(total)} 次` : `共 ${formatNumber(total)} 次`),
+  error: '无法读取用过这张表的运行',
+  retry: '重试',
+  unnamed: '未保存的工作流',
+  open: (name: string) => `打开运行记录：${name}`,
+}
+
+// ===========================================================================
+// 导出导入数据目录（数据目录页的「导出目录」「导入目录」）：本机整理好的目录带到另一个实例。
+//
+// 术语：
+// - 导出的是一个 .json 文件，含全部状态的项和起草要求。导入先「预览」（只读），确认后才写入。
+// - 预览逐表写「新增 / 更新 / 保留 / 冲突 / 跳过」：冲突是这里已确认、已驳回的项和文件里不一样，以这里为准；
+//   跳过是表结构里没有的列、两端对不上的关联关系。
+// ===========================================================================
+
+export const CATALOG_TRANSFER_TEXT = {
+  export: '导出目录',
+  exportHint: '把这个数据源的数据目录导出成文件（含全部状态的项和起草要求），可以导入到另一个实例',
+  exporting: '正在导出…',
+  exported: (name: string) => `已导出「${name}」`,
+  exportFailed: (reason: string) => `未能导出数据目录：${reason}`,
+  fileName: (source: string) => `${source}-数据目录.json`,
+  import: '导入目录',
+  importHint: '从导出的文件导入数据目录：先预览，确认后再写入',
+  title: '导入数据目录',
+  chooseLabel: '导出的数据目录文件',
+  chooseHint: '「导出目录」得到的 .json 文件',
+  choose: '选择文件',
+  chosen: (name: string) => `已选择：${name}`,
+  includeGuidance: '同时导入起草要求',
+  includeGuidanceHint: '这个数据源还没有起草要求时才写入，已有的不覆盖',
+  rulesTitle: '导入的规矩',
+  rules: [
+    '表按名字对上：不分大小写；带 schema 前缀的对不上时去掉前缀再对',
+    '文件中已确认、已驳回的项照原样带入，来源和状态不变',
+    '这里已确认、已驳回的项和文件中的不一样时以这里为准，记为冲突',
+    '文件中推断、已验证的项只填补这里的空缺，不覆盖已有的',
+    '表结构里没有的列、两端对不上的关联关系跳过，写明原因',
+  ],
+  preview: '预览',
+  previewing: '正在预览…',
+  notJson: '文件不是有效的 JSON，请选择「导出目录」得到的文件',
+  readFailed: '无法读取这个文件',
+  fileMeta: (source: string, at: string) => `导出自「${source}」 · ${at}`,
+  totals: (t: { tables: number; add: number; update: number; keep: number; conflicts: number; skipped: number }) =>
+    `${formatNumber(t.tables)} 张表：新增 ${formatNumber(t.add)} 项、更新 ${formatNumber(t.update)} 项、保留 ${formatNumber(t.keep)} 项、`
+      + `冲突 ${formatNumber(t.conflicts)} 项、跳过 ${formatNumber(t.skipped)} 项`,
+  head: { table: '表', add: '新增', update: '更新', keep: '保留', conflicts: '冲突', skipped: '跳过' },
+  matchedAs: (name: string) => `对上「${name}」`,
+  unmatched: (n: number) => `${formatNumber(n)} 张表在这个数据源里对不上，不导入：`,
+  conflictsTitle: (n: number) => `冲突 ${formatNumber(n)} 项：以这里为准，不导入`,
+  conflictFile: '文件中',
+  conflictTarget: '这里',
+  skippedTitle: (n: number) => `跳过 ${formatNumber(n)} 项`,
+  guidance: {
+    replace: '起草要求：写入文件中的起草要求（这个数据源还没有）',
+    keep: '起草要求：保留这个数据源现有的，不覆盖',
+    none: '起草要求：不导入',
+  } as Record<'keep' | 'replace' | 'none', string>,
+  confirm: (n: number) => `导入 ${formatNumber(n)} 张表`,
+  importing: '正在导入…',
+  nothing: '没有可以导入的内容：文件中的表在这个数据源里都对不上',
+  done: '导入完成',
+  doneTotals: (t: { tables: number; add: number; update: number; conflicts: number }) =>
+    `写入 ${formatNumber(t.tables)} 张表：新增 ${formatNumber(t.add)} 项、更新 ${formatNumber(t.update)} 项；冲突 ${formatNumber(t.conflicts)} 项以这里为准`,
+  version: (v: number) => `第 ${formatNumber(v)} 版`,
+  tableFailed: (reason: string) => `这张表未导入：${reason}`,
+  back: '重新选择文件',
+  cancel: '取消',
+  close: '完成',
 }
 
 // ===========================================================================
