@@ -19,6 +19,9 @@ tables: {表名: {notes, version}}}，含全部状态的项，表结构里已经
 - 跳过并写原因：表结构里没有的列、业务主键和业务日期指着的列没有的、关联关系两端对不上的（指向的表、两端的列）、
   目标数据源遮罩的列上的码值（码值就是这一列的取值，遮罩了就不该进目录）、不认识的字段、取值不合规的项（说法同
   catalog.validate_notes）。
+- 有效记录条件是表级的一项、却写着列名，按列跳过的规矩拦不住它：按目标数据源的方言解析出用到的列
+  （filter_columns_problem），不在目标的表结构里、是别的表的列、解析不了或不是一个条件、带子查询（没法核对子查询用到的表
+  和列）的跳过。人工写的条件不限函数（模型起草时的那套白名单只管模型写的条件）；列名大小写和目标不同、带本表表名的照带。
 - 逐表写（乐观锁，撞上别人刚改过就重读重算，最多三次），一张表写不进去只记在那张表上，不影响别的表。
 - 起草要求：勾了 include_guidance、文件里有、目标还没有时才写（action: replace）；目标已有的不覆盖（keep）；没勾或文件里
   没有是 none。
@@ -32,7 +35,7 @@ from __future__ import annotations
 import copy
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +45,7 @@ from app.data import catalog, catalog_jobs
 from app.data.catalog_review import item_label, slot_path
 from app.data.engine import masked_columns
 from app.data.names import name_key
+from app.data.sqlcheck import dialect_of
 
 FORMAT = "agentlab-catalog"
 VERSION = 1
@@ -182,6 +186,50 @@ class _Columns:
         return found[0] if len(found) == 1 else None
 
 
+def filter_columns_problem(condition: Any, meta: Mapping[str, Any] | None, *, kind: str | None, table: str,
+                           also: Iterable[str] = (), where: str = "表结构") -> str | None:
+    """有效记录条件用到的列是不是都在这张表的表结构里（给人看的一句话；没问题返回 None）。
+
+    按数据源的方言（sqlcheck.dialect_of）解析成一个条件：解析不了、不止一句、是一条查询、带子查询（没法核对子查询用到的
+    表和列）的不收；列不带表名，或带这张表的表名（table、表结构里的 qualified、also 里的写法，比如文件里的表名；忽略大小写、
+    去掉 schema 前缀），列名忽略大小写在表结构里。不限函数、运算。不是文字的交给合规检查说（返回 None）；数据源类型
+    没有对应的方言时没法解析，不核对。where 是说法里「表结构」的叫法（导入时是「目标的表结构」）。"""
+    if not isinstance(condition, str) or not condition.strip():
+        return None
+    dialect = dialect_of(kind)
+    if dialect is None:
+        return None
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        parsed = [s for s in sqlglot.parse(condition.strip(), read=dialect) if s is not None]
+    except Exception:  # noqa: BLE001 - 语法错、方言不支持的写法
+        parsed = []
+    if len(parsed) != 1 or isinstance(parsed[0], exp.Query) or not isinstance(parsed[0], exp.Condition):
+        return f"有效记录条件不是一个能解析的 SQL 条件（按 {kind} 的写法），没法核对它用到的列"
+    expression = parsed[0]
+    if any(isinstance(node, (exp.Query, exp.Subquery)) for node in expression.walk()):
+        return "有效记录条件里有子查询，没法核对子查询用到的表和列"
+    own = {name_key(str(n).rsplit(".", 1)[-1]) for n in (table, (meta or {}).get("qualified"), *also) if n}
+    columns = {str(c.get("name")).lower() for c in (meta or {}).get("columns") or []
+               if isinstance(c, Mapping) and c.get("name") is not None}
+    foreign: list[str] = []
+    missing: list[str] = []
+    for column in expression.find_all(exp.Column):
+        if column.is_star:
+            continue
+        if column.table and name_key(column.table) not in own:
+            foreign.append(column.sql(dialect=dialect))
+        elif column.name.lower() not in columns:
+            missing.append(column.name)
+    if foreign:
+        return f"有效记录条件引用了别的表的列（{'、'.join(dict.fromkeys(foreign))}），只能用这张表的列"
+    if missing:
+        return f"有效记录条件里的列「{'、'.join(dict.fromkeys(missing))}」不在{where}里"
+    return None
+
+
 # ==========================================================================
 # 一张表怎么并
 # ==========================================================================
@@ -270,14 +318,18 @@ def _conflict_why(file_status: str, target_status: str) -> str:
 
 
 class _Mapper:
-    """把文件里的一项换成目标的写法：列名、业务主键和业务日期的列、关联关系两端和编号。对不上返回原因。"""
+    """把文件里的一项换成目标的写法：列名、业务主键和业务日期的列、关联关系两端和编号；有效记录条件核对用到的列。对不上
+    返回原因。name 是文件里的表名（条件里带它当表名也认），kind 是目标数据源的类型（解析条件用它的方言）。"""
 
-    def __init__(self, target: str, schema_cache: Mapping[str, Any], masked: set[str]) -> None:
+    def __init__(self, name: str, target: str, schema_cache: Mapping[str, Any], masked: set[str],
+                 kind: str | None) -> None:
+        self.name = name
         self.target = target
         self.cache = schema_cache
         self.tables = (schema_cache or {}).get("tables") or {}
         self.columns = _Columns(self.tables.get(target))
         self.masked = masked
+        self.kind = kind
 
     def __call__(self, key: catalog.Slot, item: Any) -> tuple[catalog.Slot | None, Any, str | None]:
         if not isinstance(item, Mapping):
@@ -302,6 +354,11 @@ class _Mapper:
                 if col is None:
                     return None, item, f"业务日期的列「{value['column']}」不在目标的表结构里，跳过"
                 item["value"] = {**value, "column": col}
+            elif key[1] == "valid_filter":
+                problem = filter_columns_problem(value, self.tables.get(self.target), kind=self.kind,
+                                                 table=self.target, also=(self.name,), where="目标的表结构")
+                if problem is not None:
+                    return None, item, f"{problem}，跳过"
             return key, item, None
         return self._relation(item)
 
@@ -324,11 +381,11 @@ class _Mapper:
 
 
 def plan_table(table_name: str, target: str, file_notes: Mapping[str, Any], target_notes: Mapping[str, Any] | None,
-               schema_cache: Mapping[str, Any], masked: set[str]) -> TablePlan:
-    """文件里一张表并进目标那张表的计划（纯函数，不写库）。"""
+               schema_cache: Mapping[str, Any], masked: set[str], kind: str | None = None) -> TablePlan:
+    """文件里一张表并进目标那张表的计划（纯函数，不写库）。kind 是目标数据源的类型（解析有效记录条件用）。"""
     plan = TablePlan(table_name=table_name, matched_as=target)
     existing = catalog._slots(target_notes)
-    mapper = _Mapper(target, schema_cache, masked)
+    mapper = _Mapper(table_name, target, schema_cache, masked, kind)
     seen: set[catalog.Slot] = set()
     for path, key, item, why in _raw_items(file_notes):
         if why is not None or key is None:
@@ -422,7 +479,7 @@ async def plan_import(session: AsyncSession, row: Any, source: Any, content: Any
     plans: list[TablePlan] = []
     for name, target in matched.items():
         entry = await catalog.read_entry(session, source.id, target)
-        plan = plan_table(name, target, file.tables[name], entry.notes if entry else None, cache, masked)
+        plan = plan_table(name, target, file.tables[name], entry.notes if entry else None, cache, masked, row.kind)
         plan.version = entry.version if entry else 0
         plans.append(plan)
     return ImportReport(plans, unmatched, _guidance(file, row, include_guidance))
@@ -438,7 +495,8 @@ async def run_import(session: AsyncSession, row: Any, source: Any, content: Any,
     masked = {c.lower() for c in masked_columns(getattr(row, "options", None))}
     plans: list[TablePlan] = []
     for name, target in matched.items():
-        plans.append(await _import_table(session, source, name, target, file.tables[name], cache, masked, actor))
+        plans.append(await _import_table(session, source, name, target, file.tables[name], cache, masked, row.kind,
+                                         actor))
     guidance = _guidance(file, row, include_guidance)
     if guidance["action"] == "replace":
         await catalog_jobs.save_guidance(session, row, file.guidance)
@@ -446,13 +504,13 @@ async def run_import(session: AsyncSession, row: Any, source: Any, content: Any,
 
 
 async def _import_table(session: AsyncSession, source: Any, name: str, target: str, notes: Mapping[str, Any],
-                        cache: Mapping[str, Any], masked: set[str], actor: str | None) -> TablePlan:
+                        cache: Mapping[str, Any], masked: set[str], kind: str | None, actor: str | None) -> TablePlan:
     plan = TablePlan(table_name=name, matched_as=target)
     try:
         for _attempt in range(3):
             entry = await catalog.read_entry(session, source.id, target)
             version = entry.version if entry else 0
-            plan = plan_table(name, target, notes, entry.notes if entry else None, cache, masked)
+            plan = plan_table(name, target, notes, entry.notes if entry else None, cache, masked, kind)
             plan.version = version
             if not plan.writes:
                 return plan
@@ -479,5 +537,5 @@ async def _import_table(session: AsyncSession, source: Any, name: str, target: s
 
 
 __all__ = ["FORMAT", "ImportFile", "ImportReport", "TablePlan", "TransferInvalid", "VERSION", "attachment_name",
-           "content_disposition", "export_catalog", "match_tables", "plan_import", "plan_table", "read_file",
-           "run_import"]
+           "content_disposition", "export_catalog", "filter_columns_problem", "match_tables", "plan_import",
+           "plan_table", "read_file", "run_import"]

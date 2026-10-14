@@ -7,7 +7,8 @@
   - 表按名字对（忽略大小写；带 schema 前缀的对不上时去掉前缀再对），对不上的列在 unmatched_tables
   - 文件里已确认、已驳回的项照带（来源、状态不变）；目标里已确认、已驳回的项和文件不一样时保留目标的、记冲突
   - 文件里推断、有确证的项只填目标的空缺，不覆盖目标已有的
-  - 表结构里没有的列、关系两端对不上的跳过并写原因；目标数据源遮罩的列，码值不导入
+  - 表结构里没有的列、关系两端对不上的跳过并写原因；目标数据源遮罩的列，码值不导入；有效记录条件用到的列（按目标的方言
+    解析）不在目标的表结构里、引用别的表的列、带子查询的跳过（人工写的条件不限函数）
   - 逐表乐观锁，一张表写不进去不影响别的；有排队或进行中的起草任务时 409 catalog_draft_busy；文件格式不对 422
   - 起草要求：勾了导入、目标还没有时才写；目标已有的不覆盖
 
@@ -355,6 +356,33 @@ async def test_invalid_items_are_skipped_not_fatal(client):
     skipped = {s["path"]: s["why"] for s in _by(report)["ORDERS"]["skipped"]}
     assert "明细表" in skipped["kind"]
     assert "formula" in skipped["formula"] and "columns.amount.colour" in skipped
+
+
+async def test_valid_filter_columns_must_be_in_the_target_table(client):
+    """有效记录条件是表级的一项，按列跳过的规矩拦不住它：解析出用到的列，不在目标的表结构里、是别的表的列、带子查询的都跳过
+    并写原因。人工写的条件不限函数；带本表表名（文件里的写法、目标的写法都认）、大小写不同的照带。"""
+    local, remote = await _pair()
+    content = await _export(client, local)
+
+    async def outcome(condition: str) -> tuple[str | None, int]:
+        body = copy.deepcopy(content)
+        body["tables"]["orders"]["notes"]["valid_filter"] = make_item(condition, "human", "confirmed")
+        report = (await client.post(f"{_base(remote)}/import/preview", json={"content": body})).json()
+        orders = _by(report)["ORDERS"]
+        why = {s["path"]: s["why"] for s in orders["skipped"]}.get("valid_filter")
+        return why, orders["update"]
+
+    why, update = await outcome("gift_flag = 0 AND status <> 9")
+    assert why and "gift_flag" in why and "目标的表结构" in why and update == 0
+    why, _ = await outcome("members.tier = 1")
+    assert why and "members.tier" in why and "别的表" in why
+    why, _ = await outcome("member_id IN (SELECT id FROM members)")
+    assert why and "子查询" in why
+    why, _ = await outcome("status <> 9; DELETE FROM orders")
+    assert why and "条件" in why
+    for fine in ("orders.status <> 9", "ORDERS.STATUS <> 9 AND ABS(amount) > 0", "contact_phone IS NOT NULL"):
+        why, update = await outcome(fine)
+        assert why is None and update == 1, fine
 
 
 async def test_import_needs_a_schema(client):
