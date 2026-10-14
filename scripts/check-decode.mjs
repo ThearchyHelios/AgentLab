@@ -759,6 +759,17 @@ await section('Copilot：建议更新数据目录（catalog_patch 操作）', as
     && row.detail.includes('列 visitor_count 的度量类型：可累加 → 可累加'), row?.detail)
   check('是看表结构那一类、标着规划阶段', row?.kind === 'schema' && row?.stage === 'plan' && row?.status === 'done')
   check('结局仍是「只回答」', mod.copilotOutcome(synthetic.COPILOT_CATALOG_PATCH).kind === 'reply')
+  // 提案落在已驳回的项上（服务端照样交回驳回的原值，before_status 为 rejected）：展开的明细和同一轮下面的卡片同一个说法
+  // 「已驳回：可累加」，不写成像是当前值的「可累加 → 存量」
+  const onRejected = mod.decodeCopilot([{ op: 'catalog_patch', source: 'scenic', source_id: 'src-scenic', table: 'visits', table_label: '入园记录',
+    version: 3, changes: [
+      { path: 'columns.visitor_count.measure', before: 'flow', before_status: 'rejected', after: 'stock', value: 'stock', reason: '', state: 'change' },
+      { path: 'kind', before: null, before_status: null, after: 'fact', value: 'fact', reason: '', state: 'change' },
+    ] }], { context: 'canvas' }).find((s) => s.code === 'catalog_patch')
+  check('改前是已驳回的值：展开写「已驳回：可累加 → 存量」，和卡片一致',
+    !!onRejected?.detail?.split('\n').includes('列 visitor_count 的度量类型：已驳回：可累加 → 存量')
+    && cp.patchBeforeText({ path: 'columns.visitor_count.measure', before: 'flow', before_status: 'rejected' }) === '已驳回：可累加', onRejected?.detail)
+  check('……原来没有的照旧写「未填写」', !!onRejected?.detail?.split('\n').includes('表的表类型：未填写 → 明细表'), onRejected?.detail)
 
   const [patch] = cp.catalogPatchesOf(synthetic.COPILOT_CATALOG_PATCH)
   check('卡片拿到版本、数据源 id、表和中文名', patch?.version === 3 && patch.sourceId === 'src-scenic' && patch.table === 'visits'

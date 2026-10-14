@@ -8,7 +8,7 @@ import {
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
-import { catalogPatchOf, patchValueText, patchWhere } from './catalogPatch'
+import { catalogPatchOf, patchBeforeText, patchValueText, patchWhere } from './catalogPatch'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
 import { isSqlCheckCode, sortSqlChecks, sqlCheckOf, sqlChecksOf, sqlCheckWhere, sqlRuleLabel } from '../lib/sqlcheck'
 
@@ -3268,13 +3268,14 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         break
       }
       case 'catalog_patch': {
-        // 目录修改提案：过程里记一行（哪张表、几项，展开看改前改后），保存、忽略在轮次里的卡片上做（catalogPatchesOf）
+        // 目录修改提案：过程里记一行（哪张表、几项，展开看改前改后），保存、忽略在轮次里的卡片上做（catalogPatchesOf）。
+        // 改前和卡片同一个写法（patchBeforeText）：落在已驳回的项上写「已驳回：<原值>」，不写成像是当前值的原值
         const patch = catalogPatchOf(op, String(i - 1))
         if (!patch) break
         add({ id: `cpt-${i}`, seq: i, kind: 'schema', status: 'done', code: 'catalog_patch',
               title: CATALOG_PATCH_TEXT.step(patch.tableLabel ?? patch.table, patch.changes.length),
               sub: CATALOG_PATCH_TEXT.stepSub,
-              detail: patch.changes.map((c) => `${patchWhere(c)}：${patchValueText(c.path, c.before)} → ${patchValueText(c.path, c.after)}`)
+              detail: patch.changes.map((c) => `${patchWhere(c)}：${patchBeforeText(c)} → ${patchValueText(c.path, c.after)}`)
                 .join('\n') })
         break
       }
