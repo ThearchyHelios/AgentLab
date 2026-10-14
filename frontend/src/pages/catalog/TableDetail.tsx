@@ -18,7 +18,10 @@ import {
   CATALOG_USAGE_TEXT, CODES_TEXT as KT,
 } from '../../lib/terms'
 import { CatalogImpactList } from '../../components/CatalogImpact'
-import { CountBadges, FOCUS_RING, FOCUS_STYLE, ItemMark, NoteHint, StatusChip, StatusLegend, SystemNotesNotice, confirmedNote } from './parts'
+import {
+  CountBadges, FOCUS_RING, FOCUS_STYLE, ItemMark, NoteHint, REASON_ICON, ReasonHint, StatusChip, StatusLegend, SystemNotesNotice, confirmedNote,
+  confirmedReason,
+} from './parts'
 import type { ReviewTarget } from './parts'
 import { ColumnTable, NARROW, Value, pendingCodes } from './ColumnTable'
 import type { ColumnModel } from './ColumnTable'
@@ -697,7 +700,8 @@ function blankCodes(notes: CatalogDetail['notes'], pick: (path: string) => boole
 
 /**
  * 推断时也在值下面写说明的项：有效记录条件、去重规则（模型起草时附的依据、数据剖析核对的排除比例或没有核对的原因）。
- * 别的项人工确认过、带着备注（保存提案时附的依据……）时也写
+ * 别的项人工确认过、带着备注（剖析的说明、双盲复算的出处……）时也写。确认时的依据（保存修改提案时记下的）另起一行写，
+ * 不和说明混在一起
  */
 const NOTED_FIELDS = new Set<TableField>(['valid_filter', 'dedup'])
 
@@ -771,6 +775,7 @@ function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, o
   const unknown = edit && field === 'keys' ? unknownKeys(edit.form.table.keys ?? '', columns) : []
   const note = edit || !item || item.status === 'rejected' ? ''
     : NOTED_FIELDS.has(field) ? item.note?.trim() ?? '' : confirmedNote(item)
+  const reason = edit ? '' : confirmedReason(item)
 
   return (
     <div className={clsx('grid gap-x-4 gap-y-1 px-3 py-2.5 sm:grid-cols-[7.5rem_minmax(0,1fr)]', focused && FOCUS_RING)}
@@ -785,12 +790,19 @@ function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, o
         <div className="flex items-start gap-2">
           <div className="min-w-0 flex-1 text-xs">{edit ? input : <FieldValue field={field} item={item} />}</div>
           {item && !changed && (
-            <ItemMark target={{ path: tablePath(field), where, source: item.source, status: item.status, note: item.note, updated_at: item.updated_at }}
+            <ItemMark target={{ path: tablePath(field), where, source: item.source, status: item.status, note: item.note, reason: item.reason,
+                                updated_at: item.updated_at }}
                       disabled={busy || !!edit} disabledHint={edit ? CT.reviewWhileEditing : undefined}
                       onReview={(a) => onReview({ path: tablePath(field), where, source: item.source, status: item.status }, a)} />
           )}
           {changed && <span className="chip shrink-0 !text-2xs" style={{ color: 'var(--accent)' }} data-changed="">{CT.changedMark}</span>}
         </div>
+        {reason && (
+          <p className="mt-1 flex items-start gap-1 text-2xs leading-relaxed text-dim" data-field-reason="">
+            <REASON_ICON size={10} className="mt-[3px] shrink-0 text-faint" aria-hidden />
+            <span className="min-w-0 break-words"><span className="text-faint">{UT.fieldReason}：</span>{reason}</span>
+          </p>
+        )}
         {note && (
           <p className="mt-1 flex items-start gap-1 text-2xs leading-relaxed text-dim" data-field-note="">
             <Info size={10} className="mt-[3px] shrink-0 text-faint" aria-hidden />
@@ -923,9 +935,11 @@ function RelationList({ relations, busy, targetOf, onOpen, onReview, focusPath =
                 </td>
                 <td className={clsx(cell, '@max-[40rem]:order-first @max-[40rem]:pb-1')} data-relation-status="">
                   <span className="inline-flex items-start gap-1.5">
-                    <ItemMark target={{ path: relationPath(r.id), where, source: r.source, status: r.status, note: r.note, updated_at: r.updated_at }}
+                    <ItemMark target={{ path: relationPath(r.id), where, source: r.source, status: r.status, note: r.note, reason: r.reason,
+                                        updated_at: r.updated_at }}
                               disabled={busy} onReview={(a) => onReview({ path: relationPath(r.id), where, source: r.source, status: r.status }, a)} />
-                    {/* 人工确认的关系的备注（保存时的依据、沿用的测量说明）：悬停看 */}
+                    {/* 人工确认的关系：确认时的依据、备注（沿用的测量说明）各一个图标，悬停看 */}
+                    <ReasonHint reason={confirmedReason(r)} attr="data-relation-reason" />
                     {confirmedNote(r) && <NoteHint note={confirmedNote(r)} attr="data-relation-note" />}
                   </span>
                 </td>

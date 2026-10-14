@@ -285,17 +285,22 @@ const writeEntry = (t, notes) => {
   t.updated_by = ACTOR
 }
 const conflictDetail = (name) => ({ detail: `表「${name}」的数据目录刚被修改过，请重新载入后再提交` })
+/** 单项审阅（catalog.review_item）：确认、驳回留着确认时的依据（reason），撤销审阅回到推断时去掉；人工填写的撤销即删除 */
 function applyReview(notes, path, action) {
   const map = slots(clone(notes ?? {}))
   const it = map.get(path)
   if (!it) return null
   if (action === 'reset' && it.source === 'human') map.delete(path)
-  else it.status = action === 'confirm' ? 'confirmed' : action === 'reject' ? 'rejected' : INIT[it.source] ?? 'proposed'
+  else {
+    it.status = action === 'confirm' ? 'confirmed' : action === 'reject' ? 'rejected' : INIT[it.source] ?? 'proposed'
+    if (action === 'reset') delete it.reason
+  }
   return assemble(map)
 }
 /**
- * 保存提案（catalog.apply_patch 的简化）：码值是补充（驳回的码值不算），其余整项替换；改动的项记为人工填写、已确认，
- * 写了依据的项依据进备注「依据：……」
+ * 保存提案（catalog.apply_patch 的简化）：码值是补充（驳回的码值不算），其余整项替换。值改了的项记为人工填写、已确认；
+ * 值不变的只改成已确认（来源、备注不变）。写了依据的项依据另存在 reason（确认时的依据），和备注分开，每次整句换掉：
+ * 这次没写的去掉旧的
  */
 function applyPatch(notes, changes) {
   const map = slots(clone(notes ?? {}))
@@ -303,7 +308,15 @@ function applyPatch(notes, changes) {
     const prev = map.get(c.path)
     const live = prev && prev.status !== 'rejected' ? prev : null
     const value = c.path.endsWith('.codes') && live ? { ...live.value, ...c.value } : c.value
-    map.set(c.path, { value, source: 'human', status: 'confirmed', updated_at: new Date().toISOString(), ...(c.reason ? { note: `依据：${c.reason}` } : {}) })
+    const reason = c.reason ? { reason: c.reason } : {}
+    const at = new Date().toISOString()
+    if (live && JSON.stringify(live.value) === JSON.stringify(value)) {
+      if (live.status === 'confirmed') continue
+      const { reason: _old, ...kept } = live
+      map.set(c.path, { ...kept, status: 'confirmed', updated_at: at, ...reason })
+      continue
+    }
+    map.set(c.path, { value, source: 'human', status: 'confirmed', updated_at: at, ...reason })
   }
   return assemble(map)
 }
@@ -860,13 +873,16 @@ await section('表助手 · 入口、开场、提案与待保存的修改', asyn
     await textOf(panel(page).locator('[data-assistant-saved]')))
   check('……表详情换上最新的目录（第 4 版），有效记录条件是新的值', await until(async () => (await version(page)) === 4) && v0 === 2
         && (await textOf(page.locator('[data-field="valid_filter"]'))).includes('status NOT IN (8, 9)'))
-  // 保存的修改在依据里附上原话（服务端记成这一项的备注「依据：……」）：表级的项写在值下面，列的一格悬停看得到
-  check('……保存时的依据看得到：有效记录条件的值下面写「依据：用户说……」',
-    (await textOf(page.locator('[data-field="valid_filter"] [data-field-note]'))).includes('依据：用户说「统计时退票和作废的都要排除」'),
+  // 保存的修改把依据另存成这一项确认时的依据（服务端的 reason，和备注分开）：表级的项写在值下面，列的一格悬停看得到
+  check('……确认时的依据看得到：有效记录条件的值下面写「确认时的依据：用户说……」',
+    (await textOf(page.locator('[data-field="valid_filter"] [data-field-reason]'))) === '确认时的依据：用户说「统计时退票和作废的都要排除」',
     await textOf(page.locator('[data-field="valid_filter"]')))
-  const savedNote = page.locator('[data-column="status"] [data-cell="codes"] [data-cell-note]')
-  check('……码值那一格悬停写保存时的依据', ((await savedNote.getAttribute('title').catch(() => '')) ?? '').includes('依据：用户说「8 是退票」'),
-    String(await savedNote.getAttribute('title').catch(() => null)))
+  check('……依据不拼进说明：改了值的有效记录条件不再有说明（剖析核对的排除比例说的是旧条件）',
+    await page.locator('[data-field="valid_filter"] [data-field-note]').count() === 0, await textOf(page.locator('[data-field="valid_filter"]')))
+  const savedReason = page.locator('[data-column="status"] [data-cell="codes"] [data-cell-reason]')
+  check('……码值那一格悬停写确认时的依据', ((await savedReason.getAttribute('title').catch(() => '')) ?? '') === '确认时的依据：用户说「8 是退票」',
+    String(await savedReason.getAttribute('title').catch(() => null)))
+  check('……那一格没有另挂说明', await page.locator('[data-column="status"] [data-cell="codes"] [data-cell-note]').count() === 0)
   check('……卡片上存了的项标「已保存」，不能再加回', (await changeState(page, 'valid_filter')) === 'saved'
         && await panel(page).locator('[data-assistant-change="valid_filter"] [data-assistant-change-toggle]').count() === 0)
   await cleanCopy(page, '表助手')
@@ -1482,40 +1498,77 @@ await section('导出导入 · 导入结果只数真正写进去的表', async (
   await close()
 })
 
-await section('表详情 · 人工确认的项的说明', async () => {
-  // 人工确认的项带着备注（保存提案时的依据、数据剖析的说明）：表级的项写在值下面（同有效记录条件的说明），列的一格、
-  // 关联关系悬停看得到。推断的项照旧只有有效记录条件、去重规则在值下面写说明
+await section('表详情 · 确认时的依据和人工确认的项的说明', async () => {
+  // 保存修改提案时记下的依据（项上的 reason，界面上叫「确认时的依据」）和备注（note：起草的依据、剖析的测量、双盲复算的
+  // 出处）分开写：表级的项写在值下面各一行，列的一格、关联关系各一个悬停的小图标，读屏念「确认时的依据：……」「说明：……」；
+  // 状态弹层里也写依据。只在已确认的项上就近写，驳回的只在弹层里写。推断的项照旧只有有效记录条件、去重规则在值下面写说明
   const state = freshState()
   const visits = state.tables[S1].find((t) => t.name === 'visits')
-  const LABEL_NOTE = '依据：使用者说：这张表一次刷闸记一行'
-  const COL_NOTE = '依据：使用者说：入园人数按人计'
-  const REL_NOTE = '依据：使用者说：每条入园记录对应一个景区。数据剖析：抽样 2,000 行，覆盖率 98%'
-  visits.notes.label = item('入园记录', 'human', undefined, { note: LABEL_NOTE })
+  const LABEL_REASON = '使用者说：这张表一次刷闸记一行'
+  const FILTER_REASON = '使用者说：只算有效的'
+  const KEYS_REASON = '使用者说：票号不会重复'
+  const UNIT_REASON = '使用者说：入园人数按人计'
+  const DATE_NOTE = '双盲复算（运行 run-check-0003，节点「复核入园人数」）：审核人在指标「入园人数」上采用了盲算的写法'
+  const CODES_NOTE = '数据剖析：整表 12,345 行，1 个取值'
+  const CODES_REASON = '使用者说：1 是已入园'
+  const REL_NOTE = '数据剖析：抽样 2,000 行，覆盖率 98%'
+  const REL_REASON = '使用者说：每条入园记录对应一个景区'
+  visits.notes.label = item('入园记录', 'human', undefined, { reason: LABEL_REASON })
+  // 值不变、保存即确认的模型起草项：起草时的说明照旧，依据另写一行
+  visits.notes.valid_filter = item('status NOT IN (9)', 'llm', 'confirmed', { note: FILTER_NOTE, reason: FILTER_REASON })
   visits.notes.grain = item('一张门票的一次入园', 'llm', 'proposed', { note: '依据：表名和票号列' })
-  visits.notes.columns.visitor_count.unit = item('人', 'human', undefined, { note: COL_NOTE })
+  visits.notes.keys = item(['ticket_no'], 'llm', 'rejected', { reason: KEYS_REASON })
+  visits.notes.columns.visitor_count.unit = item('人', 'human', undefined, { reason: UNIT_REASON })
   visits.notes.columns.visitor_count.label = item('入园人数', 'llm', 'proposed', { note: '依据：列名' })
+  // 双盲复算写进来的人工确认项：只有备注（出处），没有确认时的依据
+  visits.notes.business_date = item({ column: 'visit_time' }, 'human', undefined, { note: DATE_NOTE })
+  visits.notes.columns.status.codes = item({ 1: '已入园' }, 'profile', 'confirmed', { note: CODES_NOTE, reason: CODES_REASON })
   visits.notes.relations = [{ id: 'r_park', columns: ['park_id'], to_table: 'parks', to_columns: ['id'], cardinality: 'many_to_one', coverage: 0.98,
-    source: 'human', status: 'confirmed', updated_at: T0, note: REL_NOTE }]
+    source: 'human', status: 'confirmed', updated_at: T0, note: REL_NOTE, reason: REL_REASON }]
   const { page, errors, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state) })
   await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
   await shot(page, 'catalog-confirmed-notes')
-  check('人工确认的表级项：值下面写备注（中文名）', (await textOf(page.locator('[data-field="label"] [data-field-note]'))).includes(LABEL_NOTE),
+  const field = (f, part) => page.locator(`[data-field="${f}"] [data-field-${part}]`)
+  check('表级的项：值下面写确认时的依据（中文名）', (await textOf(field('label', 'reason'))) === `确认时的依据：${LABEL_REASON}`,
     await textOf(page.locator('[data-field="label"]')))
-  check('……推断的表级项照旧不在值下面写（粒度）', await page.locator('[data-field="grain"] [data-field-note]').count() === 0)
-  const cellNote = page.locator('[data-column="visitor_count"] [data-cell="unit"] [data-cell-note]')
-  check('人工确认的列级项：那一格悬停写备注', ((await cellNote.getAttribute('title').catch(() => '')) ?? '').includes(COL_NOTE),
-    String(await cellNote.getAttribute('title').catch(() => null)))
-  check('……读屏也念得到', (await cellNote.innerText().catch(() => '')).includes(COL_NOTE))
-  check('……推断的列级项不加（中文名）', await page.locator('[data-column="visitor_count"] [data-cell="label"] [data-cell-note]').count() === 0)
-  const relNote = page.locator('[data-relation="r_park"] [data-relation-note]')
+  check('……没有备注的不另写说明', await field('label', 'note').count() === 0)
+  check('依据和说明分开写：有效记录条件下面一行依据、一行起草时的说明', (await textOf(field('valid_filter', 'reason'))) === `确认时的依据：${FILTER_REASON}`
+        && (await textOf(field('valid_filter', 'note'))) === `说明：${FILTER_NOTE}`, await textOf(page.locator('[data-field="valid_filter"]')))
+  check('人工确认的项只有备注（双盲复算的出处）：写说明，不写依据（业务日期）', (await textOf(field('business_date', 'note'))) === `说明：${DATE_NOTE}`
+        && await field('business_date', 'reason').count() === 0, await textOf(page.locator('[data-field="business_date"]')))
+  check('……推断的表级项照旧不在值下面写（粒度）', await field('grain', 'note').count() === 0 && await field('grain', 'reason').count() === 0)
+  check('……驳回的项不在值下面写依据（业务主键）', await field('keys', 'reason').count() === 0, await textOf(page.locator('[data-field="keys"]')))
+  const cell = (c, f, part) => page.locator(`[data-column="${c}"] [data-cell="${f}"] [data-cell-${part}]`)
+  const titleOf = async (loc) => (await loc.getAttribute('title').catch(() => null)) ?? ''
+  check('列的一格：悬停写确认时的依据（单位）', (await titleOf(cell('visitor_count', 'unit', 'reason'))) === `确认时的依据：${UNIT_REASON}`,
+    await titleOf(cell('visitor_count', 'unit', 'reason')))
+  check('……读屏念「确认时的依据：……」', (await cell('visitor_count', 'unit', 'reason').innerText().catch(() => '')).includes(`确认时的依据：${UNIT_REASON}`))
+  check('……没有备注的那一格不挂说明的图标', await cell('visitor_count', 'unit', 'note').count() === 0)
+  check('依据和说明各一个图标（码值：剖析的说明、确认时的依据）', (await titleOf(cell('status', 'codes', 'reason'))) === `确认时的依据：${CODES_REASON}`
+        && (await titleOf(cell('status', 'codes', 'note'))) === `说明：${CODES_NOTE}`)
+  check('……推断的列级项不加（中文名）', await cell('visitor_count', 'label', 'note').count() === 0 && await cell('visitor_count', 'label', 'reason').count() === 0)
   if (SHOTS) {
     await page.locator('[data-column="visitor_count"]').scrollIntoViewIfNeeded()
     await shot(page, 'catalog-confirmed-notes-columns')
     await page.locator('[data-relation="r_park"]').scrollIntoViewIfNeeded()
     await shot(page, 'catalog-confirmed-notes-relations')
   }
-  check('人工确认的关联关系：悬停写备注', ((await relNote.getAttribute('title').catch(() => '')) ?? '').includes(REL_NOTE),
-    String(await relNote.getAttribute('title').catch(() => null)))
+  check('关联关系：依据、测量的说明各悬停一个', (await titleOf(page.locator('[data-relation="r_park"] [data-relation-reason]'))) === `确认时的依据：${REL_REASON}`
+        && (await titleOf(page.locator('[data-relation="r_park"] [data-relation-note]'))) === `说明：${REL_NOTE}`)
+  // 状态弹层：依据单独一块，写明是确认时的依据；驳回的项也在这里看得到当初确认时的依据
+  const popover = async (path) => {
+    await page.locator(`[data-item-mark="${path}"]`).first().click()
+    const box = page.locator(`[data-item-panel="${path}"]`)
+    await box.waitFor({ timeout: 2000 }).catch(() => {})
+    const text = await textOf(box.locator('[data-item-reason]'))
+    await page.keyboard.press('Escape')
+    await box.waitFor({ state: 'detached', timeout: 2000 }).catch(() => {})
+    return text
+  }
+  check('状态弹层里写确认时的依据（中文名）', (await popover('label')) === `确认时的依据：${LABEL_REASON}`)
+  check('……驳回的项只在弹层里写（业务主键）', (await popover('keys')) === `确认时的依据：${KEYS_REASON}`)
+  check('……没有依据的项弹层里不写（粒度）', (await popover('grain')) === '')
+  await cleanCopy(page, '确认时的依据')
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })
@@ -1547,9 +1600,9 @@ await section('表助手 · 改前是已驳回的值', async () => {
   await panel(page).locator('[data-assistant-save]').click()
   check('保存：交回原样取值和依据', await until(async () => count(sent, /\/visits\/patch$/) === 1)
         && JSON.stringify(lastSent(sent, /\/visits\/patch$/)?.body?.changes?.[0]) === JSON.stringify({ path: 'columns.visitor_count.unit', value: '人', reason: '使用者说：入园人数按人计' }))
-  check('……存上以后那一格是人工确认的「人」，悬停写保存时的依据', await until(async () => (await version(page)) === 3)
+  check('……存上以后那一格是人工确认的「人」，悬停写确认时的依据', await until(async () => (await version(page)) === 3)
         && (await textOf(page.locator('[data-column="visitor_count"] [data-cell="unit"]'))).includes('人')
-        && ((await page.locator('[data-column="visitor_count"] [data-cell="unit"] [data-cell-note]').getAttribute('title').catch(() => '')) ?? '').includes('依据：使用者说：入园人数按人计'))
+        && ((await page.locator('[data-column="visitor_count"] [data-cell="unit"] [data-cell-reason]').getAttribute('title').catch(() => '')) ?? '') === '确认时的依据：使用者说：入园人数按人计')
   await cleanCopy(page, '改前是已驳回的值')
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()

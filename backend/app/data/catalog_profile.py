@@ -999,7 +999,8 @@ def _codes_finding(c: _CodesOutcome, value: dict[str, str]) -> dict[str, Any]:
 
 def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
     """人工确认过的关系只补覆盖率和基数：覆盖率是测量值，照新的写；基数只在原来没有时补，不改人定的；
-    备注只在原来为空、或者是剖析自己写的时候换成新的（只是日期变了不换）。状态、来源不动。返回改没改。"""
+    备注只在原来为空、或者是剖析自己写的时候换成新的（只是日期变了不换）。状态、来源、确认时的依据（reason，保存提案时
+    另存，不在备注里）不动。返回改没改。"""
     changed = False
     if rel.get("coverage") != o.coverage:
         rel["coverage"] = o.coverage

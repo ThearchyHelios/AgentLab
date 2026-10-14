@@ -631,6 +631,20 @@ async def test_a_rejected_item_is_not_brought_back_but_a_rejected_other_value_do
     assert (await entry_of(source_id)).notes["business_date"]["value"] == {"column": "order_date"}
 
 
+async def test_writing_over_an_item_drops_the_reason_it_was_confirmed_with(shop):
+    """双盲复算的选择改写这一项（值变了）：以前确认时记下的依据说的是旧值，不留；出处照旧写在备注里。"""
+    name, source_id = shop
+    await seed(source_id, {"business_date": catalog.make_item({"column": "paid_date"}, "llm", "rejected",
+                                                              reason="使用者说：按支付日算")})
+    out = await record_choices([candidate(BY_ORDER_DATE, RIGHT, "a", source=name)], run_id="run-7",
+                               node_title="复核", actor=None)
+    assert out["written"] == [{"source": name, "table": "orders", "item": "business_date",
+                              "value": {"column": "order_date"}}]
+    item = (await entry_of(source_id)).notes["business_date"]
+    assert item["value"] == {"column": "order_date"} and (item["source"], item["status"]) == ("human", "confirmed")
+    assert "reason" not in item and "run-7" in item["note"]
+
+
 async def test_contradictory_choices_in_one_decision_write_nothing(shop):
     """同一次裁决里，一个指标采纳了按下单日、另一个采纳了按支付日：一张表只有一个业务日期，写哪个都是替人拿主意，
     都不写。"""

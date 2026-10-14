@@ -370,6 +370,30 @@ async def test_the_draft_guidance_is_not_what_the_user_said(client, tmp_path, mo
     assert "这次对话里使用者" in reason and "起草要求写着" in reason
 
 
+async def test_reasons_saved_earlier_are_not_what_the_user_said(client, tmp_path, monkeypatch):
+    """目录项上以前保存时记下的依据（reason）不是这次对话里使用者说的话：背景里在这一项下面标成「以前确认时的依据：……」，
+    和备注分开；系统提示词、propose_changes 的说明写清 reason 里引用的原话只能是这次对话里使用者的消息，来自以前的依据时写
+    「以前确认时的依据写着：……」。说到遮罩列的项不给依据（同备注：里面可能有取值）。"""
+    notes = {**ORDERS_NOTES,
+             "grain": make_item("每笔订单一行", "human", "confirmed", reason="使用者说：一笔订单一行"),
+             "columns": {**ORDERS_NOTES["columns"],
+                         "buyer_phone": {"label": make_item("联系电话", "human", "confirmed",
+                                                            reason=f"使用者说：{PHONES[1]} 是客服电话")}}}
+    sid = await _source(client, tmp_path, notes=notes)
+    model = Scripted([Turn(text=["好。"])])
+    use(monkeypatch, model)
+    await _talk(client, sid, _ask("看看还缺什么"))
+    system = model.seen[0][0].content
+    assert "- grain（粒度）：每笔订单一行〔人工填写，已确认〕\n  以前确认时的依据：使用者说：一笔订单一行" in system
+    # 备注照旧另起一行，不和依据混在一起
+    assert "  备注：数据剖析：全表 30 行，2 个取值" in system and "备注：使用者说" not in system
+    assert PHONES[1] not in system and "客服电话" not in system
+    assert "只能引用这次对话里使用者的消息" in system and "以前确认时的依据写着：" in system
+    reason = (catalog_assistant.PROPOSE_TOOL_PROMPT["function"]["parameters"]["properties"]["changes"]["items"]
+              ["properties"]["reason"]["description"])
+    assert "以前确认时的依据写着" in reason
+
+
 async def test_background_says_how_many_runs_used_the_table(client, tmp_path, monkeypatch):
     """使用次数的口径同审阅队列：被几次运行用到（同「用过这张表的运行」的 total），查询几次（同目录清单的「使用 N 次」）。"""
     from app.db.models import Artifact, Run

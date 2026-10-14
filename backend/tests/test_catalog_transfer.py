@@ -68,8 +68,9 @@ def _rel(to_table: str, columns: list[str], to_columns: list[str], *, status: st
 SOURCE_ORDERS = {
     "label": make_item("订单", "human", "confirmed", at="2026-10-01T08:00:00+00:00"),
     "grain": make_item("每笔订单一行", "llm"),
-    "valid_filter": make_item("status <> 9", "human", "confirmed"),
-    "dedup": make_item("同一订单号取最后一次", "llm", "rejected"),
+    # 确认、驳回过的项带着保存提案时记下的依据：导出、导入照带
+    "valid_filter": make_item("status <> 9", "human", "confirmed", reason="使用者说：9 是作废，统计时排除"),
+    "dedup": make_item("同一订单号取最后一次", "llm", "rejected", reason="使用者说：同一订单号只有一行"),
     "kind": make_item("fact", "llm", "confirmed"),
     "columns": {
         "status": {"codes": make_item({"1": "已支付", "9": "作废"}, "human", "confirmed", complete=True),
@@ -250,8 +251,9 @@ async def test_import_writes_by_the_rules_and_reports_versions(client):
     assert orders.updated_by == "沈岚"
     assert notes["label"]["value"] == "订单表"                                   # 冲突：保留目标的
     assert notes["grain"]["value"] == "一行一单"                                 # 推断只填空缺
-    assert notes["valid_filter"] == {**SOURCE_ORDERS["valid_filter"]}            # 照带：来源、状态不变
+    assert notes["valid_filter"] == {**SOURCE_ORDERS["valid_filter"]}            # 照带：来源、状态、依据不变
     assert notes["dedup"]["status"] == "rejected" and notes["dedup"]["source"] == "llm"
+    assert notes["dedup"]["reason"] == "使用者说：同一订单号只有一行"
     codes = notes["columns"]["STATUS"]["codes"]
     assert codes["value"] == {"1": "已支付", "9": "作废"} and codes["complete"] is True
     assert notes["columns"]["STATUS"]["label"]["value"] == "状态码"

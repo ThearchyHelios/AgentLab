@@ -2712,7 +2712,13 @@ export interface CatalogItem<T = unknown> {
   value: T
   source: CatalogSource
   status: CatalogStatus
+  /** 备注：机器写的说明（模型起草的依据、数据剖析的测量、双盲复算的出处……） */
   note?: string
+  /**
+   * 确认时的依据：保存修改提案（表助手、助手流里「建议更新数据目录」）时使用者确认的依据，和备注分开存。值改了换成那一次的，
+   * 撤销审阅回到推断时去掉；只由服务端写，整份提交时带上也不作数
+   */
+  reason?: string
   updated_at?: string
 }
 
@@ -2745,6 +2751,8 @@ export interface CatalogRelation {
   source: CatalogSource
   status: CatalogStatus
   note?: string
+  /** 确认时的依据（同 CatalogItem.reason） */
+  reason?: string
   updated_at?: string
   /**
    * 基数是数据剖析用数据核实的（子表一侧数过是否唯一），只由剖析写。外键、命名推断的基数没有这个键。

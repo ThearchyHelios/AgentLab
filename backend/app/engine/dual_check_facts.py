@@ -50,8 +50,9 @@ is_test = 0、is_valid = 1、deleted_at IS NULL）；只涉及一张表。拿不
 原因，只有审批停下期间目录被人改了、数据源换了版本时才会和最后写的不一样：真写按写入时的目录、表结构和导入时认作
 日期的列判断。组合太多的（JOINT_LIMIT）那一项不预告，卡上有条件地说。
 
-catalog.save_patch 只把提案的依据写成「依据：……」的备注，这里的备注是出处（哪次运行、哪个节点），所以用它的同一套原料
-（read_entry、apply_patch、write_entry 的乐观锁）写，再把这一项换成带出处备注的人工确认项。
+catalog.save_patch 把提案的依据另存成这一项确认时的依据（reason），这里要写的是备注里的出处（哪次运行、哪个节点），
+所以用它的同一套原料（read_entry、apply_patch、write_entry 的乐观锁）写，再把这一项整个换成带出处备注的人工确认项：
+以前确认时记下的依据说的是旧值，不留。
 """
 from __future__ import annotations
 
@@ -1052,11 +1053,11 @@ async def _write(session: Any, row: DataSource, fact: Fact, *, run_id: str, node
         note = note_of(kept, run_id=run_id, node_title=node_title)
         at = catalog.now_iso()
         try:
-            merged = catalog.apply_patch(notes, [{"path": kept.item, "value": value, "reason": note}],
+            merged = catalog.apply_patch(notes, [{"path": kept.item, "value": value}],
                                          table=kept.table, tables=tables, at=at)
         except catalog.CatalogInvalid as e:
             return None, [*reasons, f"「{kept.table}」的{label}未写入数据目录：{e}"]
-        # 不论原来是谁提的：这一项现在出自人的选择，记为人工填写、已确认，备注写明出处
+        # 不论原来是谁提的：这一项现在出自人的选择，记为人工填写、已确认，备注写明出处（整项换掉：以前确认时的依据不留）
         merged[kept.item] = catalog.make_item(value, "human", "confirmed", note=note, at=at)
         try:
             await catalog.write_entry(session, row.id, kept.table, merged, if_version=version, actor=actor)

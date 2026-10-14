@@ -7,7 +7,7 @@
 **只记数据事实，不放计算公式。** 公式（指标怎么算）在口径卡里；这里只描述数据本身。所以 notes 的
 字段是固定的一组，不认识的字段一律拒收（validate_notes）。
 
-notes 结构（每个「项」都是 {value, source, status}，可选 note、updated_at）::
+notes 结构（每个「项」都是 {value, source, status}，可选 note、reason、updated_at）::
 
     {"label": 项(str), "description": 项(str), "grain": 项(str), "keys": 项(list[str]),
      "kind": 项("fact"|"dimension"|"snapshot"|"log"|"config"),
@@ -18,7 +18,10 @@ notes 结构（每个「项」都是 {value, source, status}，可选 note、upd
                        "codes": 项(dict[码值, 含义]；含义可为空串，表示待填写；项上可带 complete: true，
                                   表示已列出全部取值)}},
      "relations": [{"id", "columns", "to_table", "to_columns", "cardinality", "coverage",
-                    "source", "status", "note"?, "cardinality_checked"?}]}
+                    "source", "status", "note"?, "reason"?, "cardinality_checked"?}]}
+
+note 是机器写的说明（模型起草的依据、数据剖析的测量、双盲复算的出处……）；reason 是保存修改提案时使用者确认的依据
+（界面上叫「确认时的依据」，最多 500 字），只由 apply_patch 写，两者分开存，规矩见 apply_patch。
 
 关系上的 cardinality_checked: true 只由数据剖析写：基数是用数据核实的（子表一侧数过 COUNT 和 COUNT(DISTINCT)，
 或者有主键、唯一约束）。外键约束、命名推断给的基数是按表结构推的，子表一侧可能每个键恰好一行；SQL 检查只在
@@ -87,16 +90,18 @@ COLUMN_FIELD_LABEL = {"label": "中文名", "meaning": "含义", "unit": "单位
 #: 各来源起草出来的项的初始状态：外键约束是数据库强制的，算有确证；人工填写即确认；其余都是推断
 _INITIAL_STATUS = {"fk": "verified", "human": "confirmed"}
 
-_ITEM_KEYS = frozenset({"value", "source", "status", "note", "updated_at"})
+_ITEM_KEYS = frozenset({"value", "source", "status", "note", "reason", "updated_at"})
 #: 码值项另有一个「已列全」标记（complete: true）：码值表列出了这一列的全部取值。只有人工明确确认、或者数据剖析
 #: 没截断地看完了全表取值时才有；没有它的码值表只是「已知的一部分」，SQL 检查不能拿它判断某个值「不在码值表里」
 _CODES_ITEM_KEYS = _ITEM_KEYS | {"complete"}
 _RELATION_KEYS = frozenset({"id", "columns", "to_table", "to_columns", "cardinality", "coverage", "source",
-                            "status", "note", "updated_at", "cardinality_checked"})
+                            "status", "note", "reason", "updated_at", "cardinality_checked"})
 _BUSINESS_DATE_KEYS = frozenset({"column", "rule", "timezone"})
 #: 文本项的长度上限。目录是给模型和人读的短说明，长篇大论放口径卡或知识库
 _TEXT_MAX = 500
 _LONG_TEXT_MAX = 2000
+#: 确认时的依据（项上的 reason）的长度上限：同文本项
+REASON_MAX = _TEXT_MAX
 
 
 def now_iso() -> str:
@@ -137,17 +142,29 @@ def unreviewed_status(item: Mapping[str, Any]) -> str:
 
 
 def make_item(value: Any, source: str, status: str | None = None, *, note: str | None = None,
-              at: str | None = None, complete: bool = False) -> dict[str, Any]:
+              at: str | None = None, complete: bool = False, reason: str | None = None) -> dict[str, Any]:
     """构造一个项。status 不给时按来源取初始状态（initial_status）。complete 只用于码值项（已列出全部取值），
-    为假时不写这个键：没有标记和标记为否是一回事，写法统一，冻结进快照的哈希才稳定。"""
+    为假时不写这个键：没有标记和标记为否是一回事，写法统一，冻结进快照的哈希才稳定。reason 是确认时的依据
+    （apply_patch 写），没有时不写这个键。"""
     out: dict[str, Any] = {"value": value, "source": source, "status": status or initial_status(source)}
     if note:
         out["note"] = note
+    if reason:
+        out["reason"] = reason
     if at:
         out["updated_at"] = at
     if complete:
         out["complete"] = True
     return out
+
+
+def clip_reason(reason: Any) -> str | None:
+    """提案里的依据 → 存进项里的 reason：去掉首尾空白，超过 REASON_MAX 字截成 REASON_MAX - 1 字加「…」。没有（空的、
+    不是文字）为 None。预览（plan_patch）和保存（apply_patch）用的是同一句。"""
+    text = reason.strip() if isinstance(reason, str) else ""
+    if not text:
+        return None
+    return text if len(text) <= REASON_MAX else text[:REASON_MAX - 1] + "…"
 
 
 def codes_complete(item: Any) -> bool:
@@ -256,9 +273,18 @@ def _item_problems(where: str, item: Any, rule: tuple[Any, str], *,
         problems.append(f"{where}{hint}")
     if "note" in item and not isinstance(item["note"], str):
         problems.append(f"{where}的备注应为文字")
+    if "reason" in item and not _reason_ok(item["reason"]):
+        problems.append(f"{where}{_REASON_HINT}")
     if "updated_at" in item and not isinstance(item["updated_at"], str):
         problems.append(f"{where}的修改时间应为文字")
     return problems
+
+
+def _reason_ok(value: Any) -> bool:
+    return isinstance(value, str) and len(value) <= REASON_MAX
+
+
+_REASON_HINT = f"确认时的依据应为不超过 {REASON_MAX} 字的文字"
 
 
 def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
@@ -297,6 +323,8 @@ def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
         problems.append(f"{where}的状态「{rel.get('status')}」不在可选值内")
     if "note" in rel and not isinstance(rel["note"], str):
         problems.append(f"{where}的备注应为文字")
+    if "reason" in rel and not _reason_ok(rel["reason"]):
+        problems.append(f"{where}{_REASON_HINT}")
     if "cardinality_checked" in rel and not isinstance(rel["cardinality_checked"], bool):
         problems.append(f"{where}的「基数已用数据核实」应为是或否")
     if "updated_at" in rel and not isinstance(rel["updated_at"], str):
@@ -609,7 +637,7 @@ def merge_notes(existing: Mapping[str, Any] | None, draft: Mapping[str, Any] | N
     """把起草结果并入已有目录，返回 (新目录, 计数)。不改入参。
 
     规则（逐个槽位）：
-    - 已有项是 confirmed 或 rejected：不动。驳回的留着，同一项下次起草就不会再冒出来。
+    - 已有项是 confirmed 或 rejected：不动（确认时的依据 reason 跟着留着）。驳回的留着，同一项下次起草就不会再冒出来。
     - 起草结果里没有这一项：
       - 模型起草的项（llm）留着。模型这次留空、给的值没通过校验（_from_model 里就丢掉了），都不能把以前起草好的
         删掉——实测整库重跑一次，模型这次没给的几百项全被删掉，有的表覆盖率从八成多掉到五成。只有这一轮完整起草过
@@ -698,7 +726,10 @@ def describe_slot(key: Slot) -> str:
 
 
 def review_item(notes: Mapping[str, Any] | None, path: str, action: str, *, at: str | None = None) -> dict[str, Any]:
-    """对一项做审阅，返回新目录（不改入参）。路径不对、项不存在、操作不认识都抛 CatalogPathError。"""
+    """对一项做审阅，返回新目录（不改入参）。路径不对、项不存在、操作不认识都抛 CatalogPathError。
+
+    确认时的依据（reason）：确认、驳回不带依据，原有的留着；撤销审阅回到推断，去掉——推断项上挂着「使用者说：……」，
+    看起来像使用者确认过它。"""
     if action not in REVIEW_ACTIONS:
         raise CatalogPathError("不支持这种审阅操作，只能确认、驳回或撤销审阅")
     key = parse_path(path)
@@ -711,6 +742,8 @@ def review_item(notes: Mapping[str, Any] | None, path: str, action: str, *, at: 
         del slots[key]
         return _assemble(slots)
     item["status"] = {"confirm": "confirmed", "reject": "rejected"}.get(action) or unreviewed_status(item)
+    if action == "reset":
+        item.pop("reason", None)
     item["updated_at"] = at or now_iso()
     return _assemble(slots)
 
@@ -755,6 +788,8 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
       或数据剖析。码值的「已列全」标记跟着值走：只勾上或取消它也算改过（_edit_value）。
     - 值没动的项：保持原来的来源和状态；提交里把状态改成确认、驳回或来源的初始状态的，照改（等同单项审阅）；
       改成别的状态的不认（不能把推断改成「有确证」）。
+    - 确认时的依据（reason）只由保存修改提案写（apply_patch），提交里带的不作数：值改过、新填的项去掉（原来的依据说的
+      是旧值，界面原样带回来的也不认）；值没动的留着库里的；状态改回来源的初始状态（等同撤销审阅）的去掉。
     - 已有、但提交里没有的表级项、列级项：删掉。
     - 已有、但提交里没有的关联关系：外键约束、命名推断、数据剖析、模型起草来的，转为驳回、保留编号；只有人工
       新建的才真正删掉。删掉的推断关系下次起草会再提出来，关系图（助手挑表、SQL 检查）也会按表结构现推回来，
@@ -785,8 +820,9 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
     for key, item in new.items():
         prev = old.get(key)
         if prev is None or _edit_value(key, item) != _edit_value(key, prev):
-            # 「基数已用数据核实」只由数据剖析写：人工改过的关系记成人工确认，提交里带的这个标记不作数
-            fresh = {k: v for k, v in item.items() if k not in ("updated_at", "cardinality_checked")}
+            # 「基数已用数据核实」只由数据剖析写：人工改过的关系记成人工确认，提交里带的这个标记不作数；确认时的依据只由
+            # 保存修改提案写，说的是旧值，不留
+            fresh = {k: v for k, v in item.items() if k not in ("updated_at", "cardinality_checked", "reason")}
             fresh.update(source="human", status="confirmed", updated_at=at)
             out[key] = fresh
             continue
@@ -795,6 +831,8 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
         if status != prev.get("status") and status in ("confirmed", "rejected", unreviewed_status(prev)):
             kept["status"] = status
             kept["updated_at"] = at
+            if status not in ("confirmed", "rejected"):
+                kept.pop("reason", None)                     # 等同撤销审阅：回到推断，确认时的依据不留
         if item.get("note") != prev.get("note"):
             if item.get("note"):
                 kept["note"] = item["note"]
@@ -863,7 +901,6 @@ NEW_RELATION_PATH = "relations.new"
 #: 一条提案最多几项（预览、保存都按它）。对话里的纠正通常是一两条事实；表助手（data/catalog_assistant.py）会逐列补中文名、
 #: 含义，界面上跨几轮攒下的待保存修改一次保存，宽表上常常几十上百项，所以放到 200
 PATCH_MAX_CHANGES = 200
-_REASON_MAX = 500
 #: 看起来像计算公式的文字：「转化率=下单数/访问数」「= SUM(amount)」。公式进口径卡，目录只记数据事实。
 #: 不认减号：「上线日期=2024-01-01」不是公式。有效记录条件本来就是 SQL 条件，不查它。
 #: 对话提案（plan_patch）、人工整份提交（apply_human_edit，只查改动过的项）、模型起草（_from_model，丢掉这一项）
@@ -882,6 +919,7 @@ class PatchChange:
       （同导入预览「目标里这一项已经驳回」）：只是给人看的，算改后、算 state 都按没有这一项，保存时换成人工确认的新值；
     - after：保存后的值（码值是补充后的完整对照）；value：要交回保存的原样取值（码值只有补充的那几个，
       409 之后在最新的目录上重新补）；
+    - reason：提案的依据，按保存时的样子截过（clip_reason），没有为空串；
     - state：change 值有变化；confirm 值相同、但还不是已确认（保存即确认）；same 已经是这个值且已确认。
     - note：服务端对这一项的说明，给人看；没有时为 None，as_dict 里也不出现。目前只有一种：新增的关联关系没写
       基数、又推算不出来（_relation_after）。
@@ -1037,8 +1075,7 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
             continue
         path = raw["path"].strip()
         value = copy.deepcopy(raw["value"])
-        reason = raw.get("reason")
-        reason = reason.strip()[:_REASON_MAX] if isinstance(reason, str) else ""
+        reason = clip_reason(raw.get("reason")) or ""
         if path == NEW_RELATION_PATH:
             rel, problem = _patch_relation(table, value, None, tables, columns)
             if problem:
@@ -1105,22 +1142,6 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
     return PatchPlan(out, problems)
 
 
-def _reason_note(reason: str | None) -> str | None:
-    """提案的依据 → 保存时这一项的备注「依据：……」（同模型起草的依据，FACT_REASON_NOTE）。超出目录文字项的上限
-    （_TEXT_MAX）时截断、末尾写省略号。没有依据为 None。"""
-    text = (reason or "").strip()
-    if not text:
-        return None
-    note = FACT_REASON_NOTE.format(reason=text)
-    return note if len(note) <= _TEXT_MAX else note[:_TEXT_MAX - 1] + "…"
-
-
-def _join_notes(*parts: Any) -> str | None:
-    """几段备注连成一段：各段去掉句末的句号，用句号隔开（同起草里「依据：……。剖析核对：……」的写法）。都空为 None。"""
-    texts = [p.strip().rstrip("。") for p in parts if isinstance(p, str) and p.strip()]
-    return "。".join(texts) or None
-
-
 def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
                 tables: Mapping[str, Any] | None = None, at: str | None = None) -> dict[str, Any]:
     """把一条提案并进目录，返回新目录（不改入参）。有一项不合法就整条不收，抛 CatalogInvalid。
@@ -1128,10 +1149,10 @@ def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
     值有变化的项记为人工填写、已确认（和人工编辑同一条规矩：改动出自人的确认，不是模型起草）；值没变的只把
     状态改成已确认、来源不变（等同单项确认）；已经确认过的原样不动。
 
-    提案里写了依据（reason）的项，依据写进这一项的备注「依据：……」（_reason_note）：保存的修改附上使用者的原话，保存之后
-    看得到当初为什么这么改。改了值的项备注就是这一句（原来的备注说的是旧值）；值不变、保存即确认的项，和沿用了测量备注的
-    关联关系，依据写在原来的备注前面——原来的备注说的还是这个值；关联关系的测量备注以「数据剖析：」开头，再剖析时整段
-    换成新的（catalog_profile._patch_confirmed），依据放在前面才不会被一起换掉。没写依据的照旧。
+    提案里的依据（reason，clip_reason 截过）记进这一项的 reason（确认时的依据），和备注 note 分开：note 是起草的依据、
+    剖析的测量这类机器写的说明，照旧不拼依据——以前拼进 note，再剖析时测量的说法换不了新（catalog_profile._patch_confirmed
+    只换剖析自己写的备注）、旧依据叠在新依据后面、撤销审阅后还挂在推断项上。依据每次保存整句换掉、不叠加：值改了的项
+    （关联关系改了值也一样）是这一次的依据，没写就没有（原来的说的是旧值）；值不变、保存即确认的也换成这一次的。
     """
     plan = plan_patch(notes, changes, table=table, tables=tables)
     if plan.problems:
@@ -1143,26 +1164,25 @@ def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
         if change.state == "same":
             continue
         prev = slots.get(key)
-        said = _reason_note(change.reason)
+        reason = change.reason or None
         if change.state == "confirm" and prev is not None:
-            item = {**prev, "status": "confirmed", "updated_at": at}
-            if said:
-                item["note"] = _join_notes(said, prev.get("note"))
+            item = {k: v for k, v in prev.items() if k != "reason"}
+            item.update(status="confirmed", updated_at=at, **({"reason": reason} if reason else {}))
             slots[key] = item
             continue
         if key[0] == "r":
             rel = {"id": key[1], **change.after, "source": "human", "status": "confirmed", "updated_at": at}
-            # 覆盖率沿用了，说明它怎么测的那段备注也留着
-            kept = prev.get("note") if prev is not None else None
-            if note := (_join_notes(said, kept) if said else kept):
-                rel["note"] = note
+            if prev is not None and prev.get("note"):
+                rel["note"] = prev["note"]       # 覆盖率沿用了，说明它怎么测的那段备注也留着
+            if reason:
+                rel["reason"] = reason
             slots[key] = rel
         else:
             # 码值是补充、不删已有的码：原来标了「已列全」的，补充之后仍然列全。提案自己不能标「已列全」——
             # 用户在对话里说一个码值的意思，不等于确认这一列只有这些取值
             done = key[0] == "c" and key[2] == "codes" and prev is not None and prev.get("status") != "rejected" \
                 and codes_complete(prev)
-            slots[key] = make_item(change.after, "human", "confirmed", note=said, at=at, complete=done)
+            slots[key] = make_item(change.after, "human", "confirmed", at=at, complete=done, reason=reason)
     out = _assemble(slots)
     if problems := validate_notes(out):
         raise CatalogInvalid(problems)
@@ -2471,7 +2491,7 @@ __all__ = [
     "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON", "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS",
     "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER", "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS",
     "MODEL_TABLE_GIVE_UP_AFTER", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
-    "PATCH_MAX_CHANGES",
+    "PATCH_MAX_CHANGES", "REASON_MAX", "clip_reason",
     "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE", "WRITE_CONFLICT_ERROR", "default_tables",
     "missing_table_error", "pick_tables", "write_draft",
     "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL",
