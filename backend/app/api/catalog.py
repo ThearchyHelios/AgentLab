@@ -16,6 +16,8 @@
 - GET    /catalog/review-queue   审阅队列：推断的项按使用次数、风险、来源排好；POST /catalog/review/batch 批量审阅，
                                  GET /catalog/review-progress 审阅进度，GET /catalog/{table}/usage 用过这张表的运行
                                  （data/catalog_review.py）
+- GET    /catalog/export         导出数据目录（JSON 附件）；POST /catalog/import/preview 导入预览（只读），
+                                 POST /catalog/import 导入（data/catalog_transfer.py）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
 不对 422，源或表不存在 404。所有写操作记录请求头 X-Actor 的署名（自报、未认证）。剖析没开启、正在剖析 409。
@@ -38,7 +40,7 @@ from app.api.coded import (
 )
 from app.api.runs import actor_of
 from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, introspect, table_versions
-from app.data import catalog_review
+from app.data import catalog_review, catalog_transfer
 from app.data.engine import SnapshotTampered
 from app.db.base import get_session
 from app.db.models import DataSource
@@ -260,6 +262,68 @@ async def catalog_review_progress(source_id: str, session: AsyncSession = Depend
     """审阅进度：常用 20 张表、全部、影响数字的项各自确认了多少。"""
     _, source = await _resolved(session, source_id)
     return await catalog_review.review_progress(session, source)
+
+
+# ---- 导出导入（导出同样要登记在 GET /catalog/{table} 前面）
+
+
+@router.get("/{source_id}/catalog/export")
+async def export_catalog(source_id: str, session: AsyncSession = Depends(get_session)) -> Any:
+    """导出这个数据源的数据目录：JSON 附件「<数据源名>-数据目录.json」，含全部状态的项（data/catalog_transfer.py）。"""
+    from fastapi.responses import JSONResponse
+
+    row = await _source_row(session, source_id)
+    body = await catalog_transfer.export_catalog(session, row)
+    name = catalog_transfer.attachment_name(row.name)
+    return JSONResponse(body, headers={"Content-Disposition": catalog_transfer.content_disposition(name, row.id)})
+
+
+class CatalogImportIn(BaseModel):
+    #: 导出的那个对象（格式在 data/catalog_transfer.read_file 里核对，不对 422，说明是中文）
+    content: Any = None
+    #: 目标还没有起草要求时，是否写入文件里的起草要求
+    include_guidance: bool = False
+
+
+async def _import_source(session: AsyncSession, source_id: str) -> tuple[DataSource, Any]:
+    row, source = await _resolved(session, source_id)
+    cache = source.schema_cache or {}
+    if not cache.get("tables"):
+        raise CodedHTTPException(409, f"{introspect.why_empty(cache)}，无法导入数据目录。请先在数据源卡片上点「探查结构」",
+                                 SCHEMA_MISSING)
+    return row, source
+
+
+@router.post("/{source_id}/catalog/import/preview")
+async def preview_catalog_import(source_id: str, payload: CatalogImportIn,
+                                 session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """导入预览（只读）：每张对上的表新增、更新、保留几项，冲突和跳过的逐条列出。文件格式不对 422；没有表结构 409。"""
+    row, source = await _import_source(session, source_id)
+    try:
+        report = await catalog_transfer.plan_import(session, row, source, payload.content,
+                                                    include_guidance=payload.include_guidance)
+    except catalog_transfer.TransferInvalid as e:
+        raise HTTPException(422, str(e)) from e
+    return report.as_dict()
+
+
+@router.post("/{source_id}/catalog/import")
+async def import_catalog(source_id: str, payload: CatalogImportIn, x_actor: str | None = Header(default=None),
+                         session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """导入：规则同预览，逐表写入（乐观锁），返回同样形状的报告和每张表写入后的版本。有排队或进行中的起草任务
+    409 catalog_draft_busy；文件格式不对 422；没有表结构 409。"""
+    row, source = await _import_source(session, source_id)
+    try:
+        await catalog_jobs.ensure_idle(session, row)
+    except catalog_jobs.DraftBusy as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
+    try:
+        report = await catalog_transfer.run_import(session, row, source, payload.content,
+                                                   include_guidance=payload.include_guidance,
+                                                   actor=actor_of(x_actor))
+    except catalog_transfer.TransferInvalid as e:
+        raise HTTPException(422, str(e)) from e
+    return report.as_dict()
 
 
 @router.get("/{source_id}/catalog/{table}")
