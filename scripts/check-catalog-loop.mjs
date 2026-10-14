@@ -1429,6 +1429,59 @@ await section('导出导入 · 导出文件、导入先预览再写入', async (
   await close()
 })
 
+await section('导出导入 · 导入结果只数真正写进去的表', async () => {
+  // 文件里的两张表都对得上：visits 有一项新增（写进去，第 2 版 → 第 3 版）；ORDERS 文件里的项这里都有了（没有变化，还是第 2 版）。
+  // 第二次导入两张表都没有变化。合计按服务端的写法：tables 是对上的表数，不是写进去的表数
+  const report = (visitsAdd, after) => ({
+    ...clone(IMPORT_PREVIEW),
+    tables: [
+      { ...clone(IMPORT_PREVIEW.tables[0]), add: visitsAdd, version: after && visitsAdd ? 3 : 2 },
+      { ...clone(IMPORT_PREVIEW.tables[1]), update: 0, keep: 2, version: 2 },
+    ],
+    totals: { tables: 2, add: visitsAdd, update: 0, keep: 6, conflicts: 1, skipped: 1 },
+  })
+  const replies = {
+    importPreview: [json(report(1, false)), json(report(0, false))],
+    import: [json(report(1, true)), json(report(0, true))],
+  }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: loopHandlers(freshState(), replies) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  const dlg = page.locator('[data-import-dialog]')
+  const importOnce = async () => {
+    await page.locator('[data-catalog-import]').click()
+    await until(async () => (await dlg.getAttribute('data-step').catch(() => '')) === 'choose')
+    await dlg.locator('[data-import-file]').setInputFiles({ name: 'other.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(IMPORT_FILE)) })
+    await until(async () => (await textOf(dlg.locator('[data-import-file-meta]'))).includes('zzloopother'))
+    await page.locator('[data-import-preview]').click()
+    await until(async () => (await dlg.getAttribute('data-step')) === 'preview')
+    await page.locator('[data-import-confirm]').click()
+    return until(async () => (await dlg.getAttribute('data-step')) === 'done')
+  }
+  check('导入完成', await importOnce())
+  const doneText = await textOf(dlg.locator('[data-import-done]'))
+  check('合计只数真正写进去的表：「写入 1 张表」，没有变化的 ORDERS 不算', doneText.includes('写入 1 张表：新增 1 项、更新 0 项')
+        && !doneText.includes('写入 2 张表') && doneText.includes('冲突 1 项以这里为准'), doneText)
+  await shot(page, 'catalog-import-written')
+  check('……逐表：写进去的写第几版，没有变化的写「没有变化」', (await textOf(dlg.locator('[data-import-table="visits"]'))).includes('第 3 版')
+        && (await textOf(dlg.locator('[data-import-table="ORDERS"]'))).includes('没有变化')
+        && !(await textOf(dlg.locator('[data-import-table="ORDERS"]'))).includes('第 2 版'),
+    `${await textOf(dlg.locator('[data-import-table="visits"]'))} · ${await textOf(dlg.locator('[data-import-table="ORDERS"]'))}`)
+  await page.locator('[data-import-close]').click()
+  await until(async () => (await dlg.count()) === 0)
+  check('再导入一次，两张表都没有变化', await importOnce())
+  const nothing = await textOf(dlg.locator('[data-import-done]'))
+  await shot(page, 'catalog-import-nothing')
+  check('……一张都没写进去：说清「没有需要写入的内容」，不写「写入 2 张表」', nothing.includes('没有需要写入的内容') && !nothing.includes('写入 2 张表')
+        && !nothing.includes('新增 0 项'), nothing)
+  check('……两张表都写「没有变化」', (await textOf(dlg.locator('[data-import-table="visits"]'))).includes('没有变化')
+        && (await textOf(dlg.locator('[data-import-table="ORDERS"]'))).includes('没有变化'))
+  await cleanCopy(page, '导入结果')
+  check('只发过导入的写请求（预览、导入）', writes(sent).every((s) => /catalog\/import(\/preview)?$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
 await section('表详情 · 人工确认的项的说明', async () => {
   // 人工确认的项带着备注（保存提案时的依据、数据剖析的说明）：表级的项写在值下面（同有效记录条件的说明），列的一格、
   // 关联关系悬停看得到。推断的项照旧只有有效记录条件、去重规则在值下面写说明

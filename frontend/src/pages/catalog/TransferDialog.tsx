@@ -36,6 +36,20 @@ const pathText = (path: string) => {
   return t && t.kind !== 'relation' ? patchWhere({ path, before: null, after: null }) : path
 }
 
+/**
+ * 导入真正写进去的表（文件中的表名）：没出错、有新增或更新的项、版本比预览时前进了。服务端合计里的 tables 是对上的表数，
+ * 文件中的项这里都有了的表也算在里面，不能拿它说「写入 N 张表」。preview 是确认导入之前那次预览（版本是导入前的）；
+ * 拿不到某张表导入前的版本、或者服务端没给版本时只看新增和更新
+ */
+export function writtenTables(result: CatalogImportReport, preview: CatalogImportReport | null): Set<string> {
+  const before = new Map((preview?.tables ?? []).map((t) => [t.table_name, t.version]))
+  return new Set(result.tables.filter((t) => {
+    if (t.error || t.add + t.update <= 0) return false
+    const was = before.get(t.table_name)
+    return typeof t.version !== 'number' || typeof was !== 'number' || t.version > was
+  }).map((t) => t.table_name))
+}
+
 export function ImportDialog({ sourceId, onClose, onImported }: {
   sourceId: string
   onClose: () => void
@@ -102,7 +116,8 @@ export function ImportDialog({ sourceId, onClose, onImported }: {
       const r = await api.dataCatalog.importCatalog(sourceId, { content: file.content, include_guidance: includeGuidance })
       setResult(r)
       setStep('done')
-      onImported(r.tables.filter((t) => !t.error).map((t) => t.matched_as ?? t.table_name))
+      const written = writtenTables(r, report)
+      onImported(r.tables.filter((t) => written.has(t.table_name)).map((t) => t.matched_as ?? t.table_name))
     } catch (e) {
       // 有起草任务在进行（409）、别的原因：写服务端那句话，留在预览
       setError(errorMessage(e))
@@ -179,15 +194,7 @@ export function ImportDialog({ sourceId, onClose, onImported }: {
 
         {step === 'preview' && report && <ReportView report={report} />}
 
-        {step === 'done' && result && (
-          <>
-            <Notice tone="info" attr={{ 'data-import-done': '' }}>
-              <p className="font-medium">{T.done}</p>
-              <p className="mt-0.5 text-dim">{T.doneTotals(result.totals)}</p>
-            </Notice>
-            <ReportView report={result} done />
-          </>
-        )}
+        {step === 'done' && result && <DoneView result={result} preview={report} />}
 
         {error && <Notice tone="err" attr={{ 'data-import-error': '' }}>{error}</Notice>}
       </div>
@@ -195,8 +202,26 @@ export function ImportDialog({ sourceId, onClose, onImported }: {
   )
 }
 
-/** 预览、导入结果：合计、逐表的计数（导入后写第几版）、对不上的表、冲突逐条、跳过的原因、起草要求怎么处理 */
-function ReportView({ report, done = false }: { report: CatalogImportReport; done?: boolean }) {
+/** 导入结果：合计只数真正写进去的表，一张都没写进去时说清没有需要写入的内容；逐表写第几版或没有变化 */
+function DoneView({ result, preview }: { result: CatalogImportReport; preview: CatalogImportReport | null }) {
+  const written = writtenTables(result, preview)
+  const failed = result.tables.filter((t) => !!t.error).length
+  return (
+    <>
+      <Notice tone="info" attr={{ 'data-import-done': '', 'data-import-written': String(written.size) }}>
+        <p className="font-medium">{T.done}</p>
+        <p className="mt-0.5 text-dim">{T.doneTotals(written.size, result.totals, failed, result.guidance.action === 'replace')}</p>
+      </Notice>
+      <ReportView report={result} done written={written} />
+    </>
+  )
+}
+
+/**
+ * 预览、导入结果：合计、逐表的计数（导入后写第几版，没写进去的写没有变化）、对不上的表、冲突逐条、跳过的原因、起草要求
+ * 怎么处理。written：导入结果里真正写进去的表
+ */
+function ReportView({ report, done = false, written }: { report: CatalogImportReport; done?: boolean; written?: ReadonlySet<string> }) {
   const conflicts = report.tables.flatMap((t) => t.conflicts.map((c) => ({ t, c })))
   const skipped = report.tables.flatMap((t) => t.skipped.map((s) => ({ t, s })))
   return (
@@ -213,7 +238,7 @@ function ReportView({ report, done = false }: { report: CatalogImportReport; don
                 </tr>
               </thead>
               <tbody>
-                {report.tables.map((t) => <TableRow key={t.table_name} t={t} done={done} />)}
+                {report.tables.map((t) => <TableRow key={t.table_name} t={t} done={done} written={!!written?.has(t.table_name)} />)}
               </tbody>
             </table>
           </div>
@@ -262,16 +287,18 @@ function ReportView({ report, done = false }: { report: CatalogImportReport; don
   )
 }
 
-function TableRow({ t, done }: { t: CatalogImportTable; done: boolean }) {
+function TableRow({ t, done, written }: { t: CatalogImportTable; done: boolean; written: boolean }) {
   const renamed = t.matched_as && t.matched_as !== t.table_name ? t.matched_as : null
   const n = (k: typeof COUNT_KEYS[number]) => (k === 'conflicts' || k === 'skipped' ? t[k].length : t[k])
   return (
-    <tr className="border-b border-hairline last:border-b-0" data-import-table={t.table_name}>
+    <tr className="border-b border-hairline last:border-b-0" data-import-table={t.table_name} data-import-written={done ? String(written) : undefined}>
       <th scope="row" className="px-2.5 py-1.5 text-left align-top font-normal">
         <span className="mono break-all text-fg">{t.table_name}</span>
         {renamed && <span className="ml-1.5 text-faint">{T.matchedAs(renamed)}</span>}
         {done && t.error && <span className="block text-[var(--err)]">{T.tableFailed(t.error)}</span>}
-        {done && !t.error && typeof t.version === 'number' && <span className="block text-faint">{T.version(t.version)}</span>}
+        {done && !t.error && (written
+          ? typeof t.version === 'number' && <span className="block text-faint">{T.version(t.version)}</span>
+          : <span className="block text-faint">{T.unchanged}</span>)}
       </th>
       {COUNT_KEYS.map((k) => (
         <td key={k} className={clsx('tnum px-2 py-1.5 text-right align-top', k === 'conflicts' && n(k) > 0 ? 'text-[var(--warn)]' : 'text-dim')}

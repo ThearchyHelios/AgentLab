@@ -3287,9 +3287,23 @@ export const CATALOG_TRANSFER_TEXT = {
   importing: '正在导入…',
   nothing: '没有可以导入的内容：文件中的表在这个数据源里都对不上',
   done: '导入完成',
-  doneTotals: (t: { tables: number; add: number; update: number; conflicts: number }) =>
-    `写入 ${formatNumber(t.tables)} 张表：新增 ${formatNumber(t.add)} 项、更新 ${formatNumber(t.update)} 项；冲突 ${formatNumber(t.conflicts)} 项以这里为准`,
+  /**
+   * 导入结果的合计。written 只数真正写进去的表（有新增或更新的项、版本前进了），没有变化的表不算（服务端的 totals.tables
+   * 是对上的表数）；一张都没写进去时说清没有需要写入的内容。failed 是写入出错、没有导入的表；guidance 为真时起草要求写进去了
+   */
+  doneTotals: (written: number, t: { add: number; update: number; conflicts: number }, failed: number, guidance: boolean) => {
+    const head = written
+      ? `写入 ${formatNumber(written)} 张表：新增 ${formatNumber(t.add)} 项、更新 ${formatNumber(t.update)} 项`
+      : failed ? '没有写入任何表' : guidance ? '目录里没有需要写入的内容，只写入了起草要求' : '没有需要写入的内容'
+    const tail = [
+      t.conflicts ? `冲突 ${formatNumber(t.conflicts)} 项以这里为准` : '',
+      failed ? `${formatNumber(failed)} 张表没有导入，原因见下` : '',
+    ].filter(Boolean)
+    return [head, ...tail].join('；')
+  },
   version: (v: number) => `第 ${formatNumber(v)} 版`,
+  /** 导入结果里没有写进任何内容的表 */
+  unchanged: '没有变化',
   tableFailed: (reason: string) => `这张表未导入：${reason}`,
   back: '重新选择文件',
   cancel: '取消',
