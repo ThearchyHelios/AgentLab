@@ -1285,15 +1285,17 @@ async def test_a_wide_table_that_wrote_nothing_names_every_part():
 
 
 async def test_a_halted_part_that_could_be_split_is_not_asked_again_in_text_mode(monkeypatch):
-    """止损以后每块只问一次：已经走纯文本的空壳不再原样再问、也不拆小。t1：结构化不支持 1 次、纯文本 1 次、拆成两半各问
-    一次再原样再问一次（6 次都没写出来）；t2 的第一次是第 7 次没写出来，之后止损。"""
+    """止损以后每块只问一次：已经走纯文本的空壳不再原样再问、也不拆小。t1：结构化不支持 1 次（只管通信的重来，不进
+    止损的窗口）、纯文本 1 次、拆成两半各问一次再原样再问一次（5 次没写出来）；t2 的第一次是第 6 次，照常拆小，前一半
+    是第 7 次没写出来，之后止损：后一半不再问；t3 只问一次、不拆小。"""
     monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
     monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
     tables = {f"t{i}": _table(10) for i in range(1, 5)}
     model = Scripted(_text_only(_hollow))
     got = await D.run_model_draft(model, _source(tables), list(tables))
-    assert _by_table(model) == {"t1": 6, "t2": 1, "t3": 1, "t4": 1}
-    assert got["t2"].error == catalog.MODEL_EMPTY_REASON + HALTED
+    assert _by_table(model) == {"t1": 6, "t2": 2, "t3": 1, "t4": 1}
+    assert got["t2"].error == D.REASON_HOLLOW + D.REASON_SPLIT + HALTED
+    assert got["t3"].error == catalog.MODEL_EMPTY_REASON + HALTED
 
 
 async def test_while_halted_structured_output_still_gets_one_probe_in_text(monkeypatch):
@@ -1524,3 +1526,114 @@ async def test_only_the_parts_that_were_split_say_so(monkeypatch):
     assert o.status == "partial"
     assert o.error == ("这张表 95 列，分 4 段起草，第 3 段（c033 到 c064，共 32 列）、第 4 段（c065 到 c095，共 31 列）没写出来："
                        + _exhausted() + "；调用模型出错：网关拒绝；其中第 3 段已拆小重试仍没写出。可以只重试这张表")
+
+
+# --------------------------------------------------------------------------
+# 复核后的修正：止损的窗口只记每次调用的最终结局。通信层的重来（服务方嫌额度太大退回 8192、结构化输出不支持或回了
+# 说明文字改走纯文本、429 / 5xx 退避重试）不花额度，也说明不了模型写不出来：照旧报给进度回调（用量、提醒照算），
+# 不进止损的窗口。以前都记成没写出来，OpenAI 兼容网关（额度上限 8192、不支持 json_schema）上并发的头几次调用全是
+# 重来，第一次额度用完就凑满 10 次里 7 次，那一段直接记没写出来、不再拆小。
+# --------------------------------------------------------------------------
+
+
+def _six_tables() -> dict:
+    """6 张 40 列的表：每张自成一段，默认并发 3 段同时起草。"""
+    return {f"t{i}": _table(40, prefix=f"t{i}_") for i in range(6)}
+
+
+def _halved(model: Scripted, table: str) -> bool:
+    """这张表被拆成两半问过（表级的项加前 20 列那一半）。"""
+    return any(part == "table+columns" and len(cols or []) == 20
+               for call in model.calls for name, (part, cols) in call.asked.items() if name == table)
+
+
+async def test_budget_and_structured_output_fallbacks_do_not_halt_a_concurrent_draft():
+    tables = _six_tables()
+    ok = answering(tables)
+    spent: set[str] = set()
+
+    async def refuse(call: Call) -> Reply:
+        await asyncio.sleep(0.01)
+        raise _Status(400, "max_tokens: 32768 > 8192, which is the maximum allowed number of output tokens")
+
+    async def small(call: Call) -> Reply:
+        await asyncio.sleep(0.01)
+        if call.mode == "structured":
+            raise _Status(400, "This response_format type is unavailable now")
+        if "t0" in call.asked and "t0" not in spent:
+            spent.add("t0")
+            return EXHAUSTED
+        return ok(call)
+
+    big, sm, reports = Scripted(refuse), Scripted(small), Reports()
+    got = await D.run_model_draft(catalog.DraftModel(big, sm, "m"), _source(tables), list(tables),
+                                  hooks=reports.hooks())
+    assert _status(got) == dict.fromkeys(tables, "ok"), {t: o.error for t, o in got.items()}
+    assert _halved(sm, "t0"), "额度用完的那一段照常拆小重试"
+    assert len(big.calls) == 3 and reports.failures.count("error") == 6, "退回小额度、改走纯文本的重来照旧报给进度回调"
+    assert reports.failures.count("exhausted") == 1
+
+
+async def test_rate_limit_retries_do_not_halt_the_draft():
+    tables = _six_tables()
+    ok = answering(tables)
+    limited: dict[str, int] = {}
+    spent: set[str] = set()
+
+    async def handle(call: Call) -> Reply:
+        await asyncio.sleep(0.01)
+        name = next(iter(call.asked))
+        if name in ("t0", "t1", "t2") and limited.get(name, 0) < 2:
+            limited[name] = limited.get(name, 0) + 1
+            raise _Status(429, "Too Many Requests")
+        if name == "t0" and not spent:
+            spent.add(name)
+            return EXHAUSTED
+        return ok(call)
+
+    model, reports = Scripted(handle), Reports()
+    got = await D.run_model_draft(model, _source(tables), list(tables), hooks=reports.hooks())
+    assert _status(got) == dict.fromkeys(tables, "ok"), {t: o.error for t, o in got.items()}
+    assert _halved(model, "t0"), "额度用完的那一段照常拆小重试"
+    assert reports.failures.count("error") == 6, "429 之后重试成功的那几次照旧报给进度回调"
+
+
+async def test_structured_output_that_comes_back_as_prose_does_not_count_toward_halting(monkeypatch):
+    """结构化输出回了说明文字、这一块改走纯文本再问：也是通信方式的问题，那一次不进止损的窗口（止损门槛调低到 3 次，
+    并发的 3 块都回说明文字也不止损）；纯文本写出来的、没写出来的照常算。"""
+    monkeypatch.setattr(catalog, "MODEL_HALT_ON", 3)
+    tables = _six_tables()
+    ok = answering(tables)
+    spent: set[str] = set()
+
+    async def handle(call: Call) -> Reply:
+        await asyncio.sleep(0.01)
+        if call.mode == "structured":
+            return Reply(text="好的。这张表记录的是一笔笔业务，各列的含义如下：第一列是编号……")
+        if "t0" in call.asked and "t0" not in spent:
+            spent.add("t0")
+            return EXHAUSTED
+        return ok(call)
+
+    model, reports = Scripted(handle), Reports()
+    got = await D.run_model_draft(model, _source(tables), list(tables), hooks=reports.hooks())
+    assert _status(got) == dict.fromkeys(tables, "ok"), {t: o.error for t, o in got.items()}
+    assert _halved(model, "t0")
+    assert reports.failures.count("error") == 3, "回了说明文字的那几次照旧报给进度回调"
+
+
+async def test_a_call_that_still_fails_after_its_retries_counts_toward_halting(monkeypatch):
+    """重试用完仍然出错的那一次是这次调用的最终结局，照常进止损的窗口：一直 503 的网关，止损照样起作用。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)
+    tables = {f"t{i}": _table(10) for i in range(1, 9)}
+    ok = answering(tables)
+
+    def handle(call: Call) -> Reply:
+        if set(call.asked) & {"t1", "t2", "t3", "t4", "t5", "t6", "t7"}:
+            raise _Status(503, "Service Unavailable")
+        return EXHAUSTED if "t8" in call.asked else ok(call)
+
+    got = await D.run_model_draft(Scripted(handle), _source(tables), list(tables))
+    assert got["t7"].error == "调用模型出错：Service Unavailable（已重试 2 次）"
+    assert got["t8"].error == _exhausted() + HALTED, "最近 10 次的最终结局有 7 次以上没写出来：t8 不再拆小"

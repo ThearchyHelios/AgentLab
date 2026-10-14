@@ -47,7 +47,10 @@
   的块也不再问），报错建议更换起草模型，直到比例降下去。以前按「连续几段拆到底」「接连超时」算，偶尔一次写出来就清零：
   实测会思考的模型在宽表上单次 1 到 7 分钟、四分之一超时，90 分钟停不下来。几处只管通信的调整照旧：服务方嫌额度
   太大退回小额度、结构化输出不支持或回了说明文字改走纯文本、网络错误退避重试；结构化输出只给空壳的，这次起草还没换
-  纯文本问过的照旧问一次（看看是不是结构化输出的问题）。
+  纯文本问过的照旧问一次（看看是不是结构化输出的问题）。止损的窗口只记每次调用的最终结局：上面这几种重来之前的那次
+  不花额度、也说明不了模型写不出来，照旧报给进度回调（用量、提醒照算），不进止损的窗口——以前都记成没写出来，额度上限
+  8192、不支持 json_schema 的 OpenAI 兼容网关上，并发的头几次调用全是这种重来，第一次额度用完就凑满 10 次里 7 次，
+  那一段直接记没写出来、不再拆小。重试用完仍出错的那一次是最终结局，照常算。
 - 同一张表连续 MODEL_TABLE_GIVE_UP_AFTER 个原始段都一项没写出来：这张表剩下还没开始的段跳过不问（宽表一段一段问下去
   只是烧额度），原因写清跳过了几段、可以换一个起草模型后只重试这张表。中间有一段写出来了就不算「接连」。
 - 提醒：最近 MODEL_NOTICE_WINDOW 次调用里有 MODEL_NOTICE_ON 次以上没写出来（额度用完、超时、空壳、出错），给一句
@@ -1093,8 +1096,10 @@ class _Run:
             await self._split(pieces, depth, "timeout", followup, budget, halved, chunk)
             return
         if reply.error is not None:
-            await self._report(reply, wrote=False)
-            if reply.prose and not last:
+            # 结构化输出回了说明文字、这一块马上改走纯文本再问：只管通信的重来，不进止损的窗口
+            redo = reply.prose and not last
+            await self._report(reply, wrote=False, halting=not redo)
+            if redo:
                 await self._prose_to_text(pieces, depth, followup, budget, halved, chunk)
                 return
             self._fail(pieces, _Why(reply.error, split=halved))
@@ -1265,8 +1270,9 @@ class _Run:
 
         这一段的调用次数用完了交回 capped（不调用）。optional（拆出来的块）：拿到名额时已经止损，交回 skipped（不调用，
         次数退回）——等名额的时候前面的调用多数没写出来，不再拆小重试。超时不原样重试：交回 timeout，由调用方当作这一段
-        太大、拆小再问。重来之前的那次调用在这里就报给进度回调；交回的那次由调用方读完内容再报（写没写出来要看校验之后
-        的内容）。服务方嫌额度太大、结构化输出不支持、网络错误的重来止损期间照旧（只管通信，不是模型写不出来）。"""
+        太大、拆小再问。重来之前的那次调用在这里就报给进度回调（记进用量和提醒，不进止损的窗口：halting=False）；交回的
+        那次由调用方读完内容再报（写没写出来要看校验之后的内容）。服务方嫌额度太大、结构化输出不支持、网络错误的重来止损
+        期间照旧（只管通信，不是模型写不出来）。"""
         mode = mode or self.mode
         retried = 0
         while True:
@@ -1293,16 +1299,16 @@ class _Run:
                 if kind == "timeout":
                     return _Reply(timeout=True, usage=(0, 0))
                 if kind == "budget" and (getattr(self.model, "budget", None) != used or self._shrink()):
-                    await self._called((0, 0), "error")
+                    await self._called((0, 0), "error", halting=False)
                     continue
                 if kind == "unsupported" and mode == "structured":
                     if self.mode == "structured":
                         logger.info("起草数据目录：结构化输出用不了（%s），后面改走纯文本", str(e)[:200])
                     self.mode = mode = "text"
-                    await self._called((0, 0), "error")
+                    await self._called((0, 0), "error", halting=False)
                     continue
                 if kind == "transient" and retried < int(C.MODEL_RETRIES):
-                    await self._called((0, 0), "error")
+                    await self._called((0, 0), "error", halting=False)
                     delays = tuple(C.MODEL_RETRY_DELAYS_S) or (0.0,)
                     await _sleep(delays[min(retried, len(delays) - 1)])
                     retried += 1
@@ -1354,8 +1360,9 @@ class _Run:
 
     # ---------------------------------------------------------------- 每次调用之后：用量、段大小、提醒
 
-    async def _report(self, reply: _Reply, *, wrote: bool) -> None:
-        """交回的那次调用读完内容之后报给进度回调。"""
+    async def _report(self, reply: _Reply, *, wrote: bool, halting: bool = True) -> None:
+        """交回的那次调用读完内容之后报给进度回调。halting：这次是不是这一块这次调用的最终结局（进不进止损的窗口，见
+        _called）。"""
         if reply.usage is None:
             return
         if reply.timeout:
@@ -1366,13 +1373,18 @@ class _Run:
             failure = None
         else:
             failure = "exhausted" if reply.exhausted else "hollow"
-        await self._called(reply.usage, failure, strike=reply.timeout or reply.exhausted)
+        await self._called(reply.usage, failure, strike=reply.timeout or reply.exhausted, halting=halting)
 
-    async def _called(self, usage: tuple[int, int], failure: str | None, *, strike: bool = False) -> None:
+    async def _called(self, usage: tuple[int, int], failure: str | None, *, strike: bool = False,
+                      halting: bool = True) -> None:
         """记下一次调用：额度用完或超时（strike）累计 MODEL_SHRINK_AFTER 次，新开始的段列数上限减半；最近几次调用多数
-        没写出来时提醒，少了清掉；止损按最近 MODEL_HALT_WINDOW 次调用的比例（_halted）。报给进度回调。"""
+        没写出来时提醒，少了清掉；止损按最近 MODEL_HALT_WINDOW 次调用的比例（_halted）。报给进度回调。
+
+        halting=False：只管通信的重来之前的那次（服务方嫌额度太大、结构化输出不支持或回了说明文字、429 / 5xx 退避重试）。
+        照旧记进用量和提醒，不进止损的窗口：它不花额度，也说明不了模型写不出来；止损只看每次调用的最终结局。"""
         self.recent.append(failure)
-        self.window.append(failure is not None)
+        if halting:
+            self.window.append(failure is not None)
         halted = self._halted()
         if halted != self.was_halted:
             self.was_halted = halted
