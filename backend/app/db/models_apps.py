@@ -107,6 +107,7 @@ class HookReceipt(Base):
     idem_key: Mapped[str] = mapped_column(String(200))
     run_id: Mapped[str | None] = mapped_column(String(32), default=None)
     task_id: Mapped[str | None] = mapped_column(String(32), default=None)
-    status: Mapped[str] = mapped_column(String(20))  # accepted | rejected
+    # processing（按幂等键认领、处理中）| accepted | rejected | signature（idem_key 以 sig: 开头：记一个签名用过了，防换键重放）
+    status: Mapped[str] = mapped_column(String(20))
     detail: Mapped[str | None] = mapped_column(Text, default=None)
     received_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

@@ -247,6 +247,8 @@ export interface LintIssue {
 export interface PublishResult {
   ok: boolean
   version?: number
+  level?: AppLevel | null
+  spec_hash?: string
   issues: LintIssue[]
   /** 钉住项相对上一版升了版、需要选处置的：[{alias, from, to}] */
   needs_disposition?: { alias: string; from: number; to: number }[]
@@ -271,6 +273,8 @@ export interface Stamp {
 }
 
 export interface ViewSourceState {
+  /** 来源的种类：按需视图（on_demand）才有「刷新」 */
+  kind?: 'latest_sealed' | 'on_demand' | 'instance'
   state: 'ok' | 'empty' | 'running' | 'stale' | 'error'
   run_id: string | null
   stamp: Stamp | null
@@ -292,7 +296,18 @@ export interface ViewNode {
   id: string
   type: string
   props: Record<string, any>
-  /** 服务端解析好的数据；形状随组件而定（metric：{text, state, evidence}；table：{columns, rows, masked}……） */
+  /**
+   * 服务端解析好的数据（backend/app/apps/resolve.py 的 _data），形状随组件而定；绑定了视图的都带 state 和可选的 message：
+   * - stamp：{view, state, stamp}；metric：{state, text, name, unit, evidence}
+   * - series：{state, mode: single|dual|incomparable|recompute, unit, series: [{version, label, points: [{run_id, as_of,
+   *   value, text, evidence}]}], breaks: [{after_run?, from, to, text}]}
+   * - table、chart：{state, columns, rows（遮罩的格子已换成「已遮罩」）, column_types, masked, total_rows, truncated, evidence}
+   * - report：{state, node, doc_artifact, evidence}；field：{state, text, value?, evidence?}；status：{state, value, text}
+   * - form：{form}；entry_button：{entry, label, disabled, reason?}；instance_list：{who, entry, items}
+   * - instance_header：InstanceRow + {state, status_text, stamp}；instance_timeline：{state, status, status_text, steps}
+   * - task_list：{scope, items}；task_form、signoffs：{state, task, task_ui, assignments?}
+   * - action_status：{state, node, records: [{id, state, environment, attempt, payload_hash, error, receipt?}]}
+   */
   data?: Record<string, any> | null
   children?: ViewNode[]
 }
@@ -347,6 +362,10 @@ export interface Task {
   approval_id: string | null
   run_id: string
   node_id: string | null
+  /** 节点在图上的名字 */
+  node_label?: string | null
+  run_class?: 'formal' | 'exploratory' | null
+  workflow_id?: string | null
   app_id: string | null
   app_name?: string | null
   app_version: number | null
@@ -389,6 +408,15 @@ export interface ActionRecordRow {
   id: string
   run_id: string
   node_id: string
+  idem_key?: string
+  endpoint_id?: string | null
+  request_at?: string | null
+  response_status?: number | null
+  lookup_attempts?: number
+  confirm_task_id?: string | null
+  workflow_id?: string | null
+  workflow_version?: number | null
+  capability_version?: number | null
   app_id: string | null
   capability: string
   environment: 'prod' | 'test' | 'simulated'
@@ -477,7 +505,8 @@ export type OriginKind =
 export interface LookObject {
   kind: 'table' | 'capability' | 'workflow_version'
   source?: string
-  source_id?: string
+  /** 点名了不在这一轮范围里的数据源时为 null，missing 里是点名的表 */
+  source_id?: string | null
   named: string[]
   picked?: string[]
   joined?: string[]
@@ -499,4 +528,43 @@ export interface LookEvent {
   reason?: string
   elapsed_ms: number
   objects: LookObject[]
+}
+
+// ---------------------------------------------------------------------------
+// 入站钩子（§2.4）与助手流（§2.9 L1、§3.11）
+// ---------------------------------------------------------------------------
+
+export interface AppHookRow {
+  id: string
+  name: string
+  kind: 'start' | 'signal'
+  entry_id: string | null
+  enabled: boolean
+  created_at: string
+  /** 只在新建和轮换时出现一次 */
+  secret?: string
+}
+
+/** 助手问澄清问题：这一轮就此结束（已经改了的，后面跟 final，autorun 为 false） */
+export interface AskEvent {
+  op: 'ask'
+  question: string
+}
+
+/** POST /api/copilot/app-stream 的请求体；流里的应用操作就是 app_add / app_update / app_remove / app_move / app_page / app_set */
+export interface AppStreamRequest {
+  instruction: string
+  app_id?: string
+  spec?: AppSpec
+  bindings?: AppBindings
+  conversation_id?: string
+  provider?: string
+  model?: string
+}
+
+export interface AppStreamFinal {
+  op: 'final'
+  spec: AppSpec
+  issues: LintIssue[]
+  explanation: string
 }

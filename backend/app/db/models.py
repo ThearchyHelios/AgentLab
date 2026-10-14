@@ -813,6 +813,9 @@ class Conversation(Base, TimestampMixin):
     archived: Mapped[bool] = mapped_column(default=False)
     # 应用编辑时助手对话归属的应用（kind=app）。其余为空
     app_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    # 谁建的这段对话（api/deps.actor_of：开登录时是认证过的用户名）。开登录后 user 角色只看得到、只改得动自己的对话；
+    # 存量为空：关登录时建的，开登录后只有 builder 以上看得到
+    created_by: Mapped[str | None] = mapped_column(String(100), default=None, index=True)
     # 列表按活跃度排。不能用 updated_at —— 改个标题就会把这条顶到最前面，
     # 而用户对"最近聊过的"的预期是按说话时间排，不是按编辑时间
     last_active_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, index=True)

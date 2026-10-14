@@ -234,6 +234,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("mcp_servers", "headers", "JSON DEFAULT '{}'"),
     ("mcp_servers", "endpoint_id", "VARCHAR(32)"),
     ("conversations", "app_id", "VARCHAR(32)"),
+    ("conversations", "created_by", "VARCHAR(100)"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。
@@ -247,6 +248,7 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str | tuple[str, ...]]] = [
     ("ix_runs_app_id", "runs", "app_id"),
     ("ix_runs_wf_ver_status", "runs", ("workflow_id", "version", "status")),
     ("ix_conversations_app_id", "conversations", "app_id"),
+    ("ix_conversations_created_by", "conversations", "created_by"),
 ]
 
 

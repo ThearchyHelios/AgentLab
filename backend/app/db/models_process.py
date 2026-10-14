@@ -131,7 +131,7 @@ class NotifyDelivery(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     channel_id: Mapped[str] = mapped_column(ForeignKey("notify_channels.id", ondelete="CASCADE"), index=True)
-    subject_kind: Mapped[str] = mapped_column(String(20))  # task | run | action
+    subject_kind: Mapped[str] = mapped_column(String(20))  # task | run | action | channel（渠道的测试消息）
     subject_id: Mapped[str] = mapped_column(String(32))
     event: Mapped[str] = mapped_column(String(40))
     run_id: Mapped[str | None] = mapped_column(String(32), default=None)
