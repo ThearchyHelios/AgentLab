@@ -252,8 +252,8 @@ async def test_hook_management_functions():
 
 
 async def test_one_name_one_row_even_under_races(client, monkeypatch):
-    """库里还没有 (app_id, name) 的唯一约束：并发生成只留一行；插入后发现别人抢先插了，删掉自己、改去轮换那一行；万一
-    多出一行，收请求只认最早那一行，停用按名字改全部行。"""
+    """(app_id, name) 有唯一索引：并发生成只留一行；插入时发现别人抢先插了（库拒掉），改去轮换那一行；库里不可能
+    多出第二行，停用按名字改。"""
     from app.db.base import utcnow
     from app.db.models import AppHook
 
@@ -269,7 +269,7 @@ async def test_one_name_one_row_even_under_races(client, monkeypatch):
         rows = list((await session.execute(select(AppHook).where(AppHook.app_id == app_id))).scalars())
     assert len(rows) == 1
 
-    # 另一个进程在「读不到行」和「插入」之间抢先插好了：这一次插入后再查，删掉自己、轮换最早那一行
+    # 另一个进程在「读不到行」和「插入」之间抢先插好了：这一次插入被唯一索引拒掉，改去轮换已有的那一行
     real = hooks.hook_row
     calls = {"n": 0}
 
@@ -286,21 +286,17 @@ async def test_one_name_one_row_even_under_races(client, monkeypatch):
     async with SessionLocal() as session:
         assert len(list((await session.execute(select(AppHook).where(AppHook.app_id == app_id))).scalars())) == 1
 
-    # 真的多出一行（多进程各自插入）：它的密钥收不到请求；停用两行一起停
-    from app.core.crypto import encrypt
+    # 库不许多出第二行：多进程各自插入时，后插的那一次被唯一索引拒掉
+    from sqlalchemy.exc import IntegrityError
 
     async with SessionLocal() as session:
-        stray = AppHook(app_id=app_id, name="paid", kind="signal", enabled=True, secret=encrypt("stray-secret") or "",
-                        created_at=utcnow())
-        session.add(stray)
-        await session.commit()
-        stray_id = stray.id
-    headers, body = signed("stray-secret", {"correlation": "x"}, key="k-stray")
-    assert (await client.post(f"/api/hooks/{stray_id}", content=body, headers=headers)).status_code == 404
+        session.add(AppHook(app_id=app_id, name="paid", kind="signal", enabled=True, secret="x", created_at=utcnow()))
+        with pytest.raises(IntegrityError):
+            await session.commit()
     assert (await client.patch(f"/api/apps/{app_id}/hooks/paid", json={"enabled": False})).status_code == 200
     async with SessionLocal() as session:
         states = [r.enabled for r in (await session.execute(select(AppHook).where(AppHook.app_id == app_id))).scalars()]
-    assert states == [False, False]
+    assert states == [False]
 
 
 async def test_a_hook_works_by_what_the_published_version_declares(client, monkeypatch):

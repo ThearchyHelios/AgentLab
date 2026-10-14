@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TimestampMixin, UTCDateTime, new_id, utcnow
@@ -86,6 +86,8 @@ class AppHook(Base, TimestampMixin):
     """入站钩子。start：按入口发起实例；signal：按 correlation 解决一条「等外部系统」的待办。"""
 
     __tablename__ = "app_hooks"
+    # 一个名字一行（D-g）：并发「生成密钥」不会多出第二把能用的密钥。存量库由 db/base.py 的 _UNIQUE_INDEX_MIGRATIONS 补建
+    __table_args__ = (Index("ux_app_hooks_app_name", "app_id", "name", unique=True),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     app_id: Mapped[str] = mapped_column(ForeignKey("apps.id", ondelete="CASCADE"), index=True)

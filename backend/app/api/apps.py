@@ -302,18 +302,22 @@ async def assistant_conversation(app_id: str, session: AsyncSession = Depends(ge
     lookup = (select(Conversation).where(Conversation.kind == "app", Conversation.app_id == app.id,
                                          Conversation.archived.is_(False), mine)
               .order_by(Conversation.last_active_at.desc()).limit(1))
-    # 取或建在进程里按 (应用, 人) 串行：编辑器开发模式下 effect 执行两次、同一个人开两个标签页，都会同时来取。库里没有
-    # 唯一约束，建完再查一遍：别处（另一个进程）抢先建了的，删掉刚建的这段（还没有轮次），用那一段——历史才不会被拆开
+    # 取或建在进程里按 (应用, 人) 串行：编辑器开发模式下 effect 执行两次、同一个人开两个标签页，都会同时来取。库里有
+    # (app_id, created_by) 的部分唯一索引（ux_conversations_app_owner）：别处（另一个进程）抢先建了的，这次插入在保存点里
+    # 被拒，改用那一段——历史才不会被拆开。没署名（关登录又没填）的不受索引约束，靠这把进程内的锁
     async with _assistant_lock(app.id, who):
         row = await session.scalar(lookup)
         if row is None:
-            row = Conversation(kind="app", app_id=app.id, created_by=who, title=f"「{app.name}」的助手")
-            session.add(row)
-            await session.flush()
-            other = await session.scalar(lookup.where(Conversation.id != row.id))
-            if other is not None:
-                await session.delete(row)
-                row = other
+            fresh = Conversation(kind="app", app_id=app.id, created_by=who, title=f"「{app.name}」的助手")
+            try:
+                async with session.begin_nested():
+                    session.add(fresh)
+                    await session.flush()
+                row = fresh
+            except IntegrityError:
+                row = await session.scalar(lookup)
+                if row is None:
+                    raise
             await session.commit()
             await session.refresh(row)
     turns = list((await session.execute(select(ConversationTurn).where(

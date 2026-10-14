@@ -140,8 +140,9 @@ async def upstream_with_two_versions() -> str:
         lib = Workflow(name=f"口径库-{_tag()}", graph=library(), status="published", published_version=2, version=2)
         session.add(lib)
         await session.flush()
-        session.add(WorkflowVersion(workflow_id=lib.id, version=1, graph=library()))
-        session.add(WorkflowVersion(workflow_id=lib.id, version=2, graph=library(version="v4")))
+        # 两版都发布过（level 记着）：口径卡固定的版本须「已发布且未退役」（D-q）
+        session.add(WorkflowVersion(workflow_id=lib.id, version=1, graph=library(), level="published"))
+        session.add(WorkflowVersion(workflow_id=lib.id, version=2, graph=library(version="v4"), level="published"))
         await session.commit()
         return lib.id
 

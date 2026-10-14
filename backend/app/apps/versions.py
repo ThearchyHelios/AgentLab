@@ -80,10 +80,13 @@ async def version_row(session: AsyncSession, workflow_id: str, version: int) -> 
 # 子工作流固定的版本（D-q）
 # --------------------------------------------------------------------------
 
-#: 子工作流节点固定的版本不能用的机器码。发起正式运行（engine/launch.py）、发布工作流与发布前检查（engine/lint_process.py
-#: 的 lint_subgraph_pins）、应用检查（apps/lint.py）都按 subgraph_pin_problems 判，机器码相同
+#: 固定的上游版本不能用的机器码：子工作流节点（workflow_version）、口径卡转抄别处的口径（caliber_from）。发起正式运行
+#: （engine/launch.py）、发布工作流与发布前检查（engine/lint_process.py 的 lint_subgraph_pins）、应用检查（apps/lint.py）
+#: 都按 subgraph_pin_problems 判，机器码相同
 SUBGRAPH_UNPUBLISHED = "subgraph_version_unpublished"
 SUBGRAPH_RETIRED = "subgraph_version_retired"
+CALIBER_UNPUBLISHED = "caliber_version_unpublished"
+CALIBER_RETIRED = "caliber_version_retired"
 
 
 @dataclass(frozen=True)
@@ -99,38 +102,82 @@ class SubgraphPinProblem:
     reason: str
     #: 怎么改
     advice: str
+    #: 句子的主语：「子工作流「…」」或「口径卡「…」」
+    who: str = ""
+    #: 节点上哪个配置项固定了版本（问题定位到它）
+    field: str = "workflow_version"
+
+
+def pinned_upstream(node: Any) -> tuple[str, str, int] | None:
+    """节点固定的上游版本：(种类 subgraph / caliber, 工作流 id, 版本)；没固定就是 None。子工作流写在 workflow_id /
+    workflow_version，口径卡转抄别处的口径写在 caliber_from 里。"""
+    from app.engine.schema import NodeType
+
+    cfg = node.config
+    if node.type == NodeType.SUBGRAPH:
+        wid, pinned = cfg.get("workflow_id"), cfg.get("workflow_version")
+        kind = "subgraph"
+    elif node.type == NodeType.METRICS and isinstance(cfg.get("caliber_from"), dict):
+        wid, pinned = cfg["caliber_from"].get("workflow_id"), cfg["caliber_from"].get("workflow_version")
+        kind = "caliber"
+    else:
+        return None
+    if not wid or not str(pinned or "").isdigit():
+        return None
+    return kind, str(wid), int(pinned)
 
 
 async def subgraph_pin_problems(session: AsyncSession, spec: Any) -> list[SubgraphPinProblem]:
-    """图里每个固定了版本的子工作流节点，固定的那一版必须「已发布且未退役」（is_published）；不是的逐个交回。
+    """图里每个固定了上游版本的节点（子工作流、转抄别处口径的口径卡），固定的那一版必须「已发布且未退役」
+    （is_published）；不是的逐个交回。
 
-    子工作流固定版本就是方法卡的机制：外层发布时认可的是「用它的 vN」。vN 只是一张保存出来的草稿快照、或者已经退役，
-    正式运行照样执行它，就等于绕过了发布门禁、绕过了退役。发起时拦（launch.py），发布时也按同一条拦——不然钉在草稿上的
-    工作流照样发得出去，之后每一次正式运行（定时任务、应用入口、按需视图、补算）都在发起时才被拒。
-    没固定版本的子工作流跟随最新，那是受管级门禁管的事（governed.subgraph_unpinned），这里不管。"""
-    from app.engine.schema import NodeType
-
+    固定版本就是方法卡的机制：外层发布时认可的是「用它的 vN」。vN 只是一张保存出来的草稿快照、或者已经退役，正式运行
+    照样执行它、照样按它的口径算，就等于绕过了发布门禁、绕过了退役。发起时拦（launch.py），发布时也按同一条拦——不然钉在
+    草稿上的工作流照样发得出去，之后每一次正式运行（定时任务、应用入口、按需视图、补算）都在发起时才被拒。
+    没固定版本的跟随最新，那是受管级门禁管的事（governed.subgraph_unpinned），这里不管。"""
     out: list[SubgraphPinProblem] = []
     for node in spec.nodes:
-        if node.type != NodeType.SUBGRAPH:
+        pin = pinned_upstream(node)
+        if pin is None:
             continue
-        wid, pinned = node.config.get("workflow_id"), node.config.get("workflow_version")
-        if not wid or not str(pinned or "").isdigit():
-            continue
-        version = int(pinned)
-        workflow = await session.get(Workflow, str(wid))
-        row = await version_row(session, str(wid), version) if workflow is not None else None
+        kind, wid, version = pin
+        caliber = kind == "caliber"
+        who = f"口径卡「{node.title}」" if caliber else f"子工作流「{node.title}」"
+        field = "caliber_from" if caliber else "workflow_version"
+        unpublished, retired = (CALIBER_UNPUBLISHED, CALIBER_RETIRED) if caliber else (SUBGRAPH_UNPUBLISHED, SUBGRAPH_RETIRED)
+        workflow = await session.get(Workflow, wid)
+        row = await version_row(session, wid, version) if workflow is not None else None
         if workflow is None or row is None:
-            out.append(SubgraphPinProblem(node.id, node.title, SUBGRAPH_UNPUBLISHED, str(wid), version,
-                                          f"工作流版本 v{version} 不存在", "请在节点中重新选择版本"))
+            out.append(SubgraphPinProblem(node.id, node.title, unpublished, wid, version,
+                                          f"工作流版本 v{version} 不存在", "请在节点中重新选择版本", who, field))
         elif row.retired_at is not None:
-            out.append(SubgraphPinProblem(node.id, node.title, SUBGRAPH_RETIRED, str(wid), version,
-                                          f"「{workflow.name}」v{version} 已退役", "请把节点改为固定一个在用的发布版本"))
+            out.append(SubgraphPinProblem(node.id, node.title, retired, wid, version,
+                                          f"「{workflow.name}」v{version} 已退役", "请把节点改为固定一个在用的发布版本",
+                                          who, field))
         elif not is_published(row, current=workflow.published_version):
-            out.append(SubgraphPinProblem(node.id, node.title, SUBGRAPH_UNPUBLISHED, str(wid), version,
+            out.append(SubgraphPinProblem(node.id, node.title, unpublished, wid, version,
                                           f"「{workflow.name}」v{version} 没有发布过",
-                                          "请先发布那个工作流，或把节点改为固定一个已发布的版本"))
+                                          "请先发布那个工作流，或把节点改为固定一个已发布的版本", who, field))
     return out
+
+
+async def backfill_legacy_levels(session: AsyncSession) -> int:
+    """给记级别之前发布过的老版本补上 level（启动时跑一次，幂等）。
+
+    level 是后来才加的列：那之前发布过的版本都是空的，按 is_published 只认当前发布版——而子工作流、口径卡钉住的往往是
+    更早的某一版，新规则会把它们误判成「没发布过」。补的依据只有一条，有据可查：这一版发起过正式运行。老代码里正式运行
+    只能从当时的发布版发起，所以它一定发布过。级别记 published：当时是不是受管级查不出来，往低处记（应用的级别取最低，
+    只会少给信任，不会多给）。没有正式运行凭据的照旧为空，不猜。"""
+    from sqlalchemy import exists, update
+
+    from app.db.models import Run
+
+    evidence = exists().where(Run.workflow_id == WorkflowVersion.workflow_id, Run.version == WorkflowVersion.version,
+                              Run.run_class == "formal")
+    result = await session.execute(update(WorkflowVersion)
+                                   .where(WorkflowVersion.level.is_(None), WorkflowVersion.retired_at.is_(None), evidence)
+                                   .values(level="published").execution_options(synchronize_session=False))
+    return result.rowcount or 0
 
 
 # --------------------------------------------------------------------------

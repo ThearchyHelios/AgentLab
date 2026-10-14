@@ -825,15 +825,22 @@ async def list_tasks(principal: Any, *, assigned: str = "me", statuses: list[str
         return await _describe(session, tasks, principal)
 
 
-async def count(principal: Any) -> dict[str, int]:
-    """导航徽标：派给我的、待处理的待办数。apps 是应用里的，other 是不属于应用的（画布、定时任务的审批）。"""
+async def count(principal: Any) -> dict[str, Any]:
+    """导航徽标：派给我的、待处理的待办数。apps 是应用里的，other 是不属于应用的（画布、定时任务的审批）。
+
+    latest 是其中最新一条的开出时间：前端的新待办通知看它变没变，而不只看数——同一拍里一条处理掉、一条新来，数不变，
+    新的那条照样要通知。"""
     async with SessionLocal() as session:
-        stmt = select(Task.app_id.is_not(None), func.count()).where(Task.status == "pending")
+        stmt = select(Task.app_id.is_not(None), func.count(), func.max(Task.created_at)).where(Task.status == "pending")
         if (clause := _mine(principal)) is not None:
             stmt = stmt.where(clause)
-        rows = dict((await session.execute(stmt.group_by(Task.app_id.is_not(None)))).all())
-    apps, other = int(rows.get(True, 0)), int(rows.get(False, 0))
-    return {"mine": apps + other, "apps": apps, "other": other}
+        rows = {has_app: (n, latest) for has_app, n, latest in
+                (await session.execute(stmt.group_by(Task.app_id.is_not(None)))).all()}
+    apps, other = int(rows.get(True, (0, None))[0]), int(rows.get(False, (0, None))[0])
+    stamps = [latest for _, latest in rows.values() if latest is not None]
+    latest = max(stamps) if stamps else None
+    return {"mine": apps + other, "apps": apps, "other": other,
+            "latest": latest.isoformat() if hasattr(latest, "isoformat") else latest}
 
 
 async def detail(task_id: str, principal: Any) -> dict[str, Any] | None:

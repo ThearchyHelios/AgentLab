@@ -443,7 +443,7 @@ async def test_count_and_list_api(client):
     await _wait(run.id, ("interrupted",))
     task = await _task(run.id)
     count = (await client.get("/api/tasks/count?mine=1")).json()
-    assert set(count) == {"mine", "apps", "other"} and count["other"] >= 1
+    assert set(count) == {"mine", "apps", "other", "latest"} and count["other"] >= 1 and count["latest"]
     listed = (await client.get(f"/api/tasks?assigned=me&run_id={run.id}")).json()["items"]
     assert [t["id"] for t in listed] == [task.id]
     item = listed[0]

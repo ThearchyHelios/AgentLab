@@ -421,7 +421,7 @@ async def _refuse_unpublished_subgraphs(session: AsyncSession, spec: GraphSpec) 
     """正式运行里，每个固定了版本的子工作流节点，固定的那一版必须「已发布且未退役」（D-q）。规则在
     apps/versions.subgraph_pin_problems，发布门禁按同一条拦；这里是发起这一刻的那一道（发布之后那一版才退役的）。"""
     for problem in await subgraph_pin_problems(session, spec):
-        raise LaunchRefused(409, f"子工作流「{problem.title}」固定的{problem.reason}，不能发起正式运行。"
+        raise LaunchRefused(409, f"{problem.who}固定的{problem.reason}，不能发起正式运行。"
                                  f"{problem.advice}，再发布这个工作流", problem.code)
 
 

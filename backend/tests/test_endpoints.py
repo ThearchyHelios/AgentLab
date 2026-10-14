@@ -266,3 +266,14 @@ def test_run_compare_reads_endpoint_requests():
     assert _compare_request(q("erp", "/orders", {"d": "1"}), q("erp", "/orders", {"d": "1"})).structure == "same"
     assert _compare_request(q("erp", "/orders", {"d": "1"}), q("erp", "/orders", {"d": "2"})).structure == "params_only"
     assert _compare_request(q("erp", "/orders", {}), q("erp", "/refunds", {})).structure == "changed"
+
+
+async def test_evidence_panel_masks_an_endpoint_snapshot_by_column():
+    """证据面板认端点快照：按列名遮（落快照时记下的加能力现在的遮罩字段），不按数据源找、不把整张表当成「数据源不在了」
+    遮掉。能力登记里查不到的只按快照记下的遮。"""
+    from app.api.evidence import _mask_sets, _Masks
+
+    snap = {"capability": "erp_orders", "source": "erp", "columns": ["单号", "电话", "金额"],
+            "rows": [["A1", "13800000000", 12]], "mask_columns": ["电话"]}
+    sets = await _mask_sets(snap, "erp", _Masks())
+    assert sets.hidden == {"电话"} and sets.sure == {"电话"} and not sets.gone

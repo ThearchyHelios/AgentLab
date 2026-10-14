@@ -213,9 +213,36 @@ export interface AppSummary {
 }
 
 export interface AppDetail extends AppSummary {
-  draft: AppSpec
-  draft_bindings: AppBindings
-  created_by: string | null
+  /** 草稿和岗位绑定只给 manage（D-m）；use / observe 拿到的详情里没有 */
+  draft?: AppSpec
+  draft_bindings?: AppBindings
+  created_by?: string | null
+  /** 当前发布版的页面和入口目录：没有 manage 的人靠它找首页、入口名 */
+  published?: { version: number; pages: { id: string; title: string }[]; entries: { id: string; label: string }[] } | null
+  /** 能按新口径补算的视图（只在 manage 取详情时算，D-f） */
+  backfill?: BackfillPlan[]
+}
+
+/** 按新口径补算会发起几次（GET /api/apps/{id}/views/{view}/backfill，不发起运行） */
+export interface BackfillPlan {
+  view: string
+  alias: string
+  /** schedule:<id> 或 formal */
+  source: string
+  from_version: number
+  to_version: number
+  /** 趋势画几期 */
+  periods: number
+  will_launch: number
+  will_skip: number
+}
+
+/** POST 同一路径的结果：发起了几次、跳过了几次（同一输入已经补算过）；发起到一半被拒的原因照实交回 */
+export interface BackfillResult extends BackfillPlan {
+  launched: number
+  skipped: number
+  run_ids: string[]
+  refused?: string | null
 }
 
 export interface AppVersionRow {
@@ -534,14 +561,23 @@ export interface LookEvent {
 // 入站钩子（§2.4）与助手流（§2.9 L1、§3.11）
 // ---------------------------------------------------------------------------
 
+/** 钩子管理里的一行（D-g）：草稿或发布版里声明的 ∪ 已经生成过密钥的，按名字一行 */
 export interface AppHookRow {
-  id: string
+  /** app_hooks 那一行的 id；还没生成密钥时为 null */
+  id: string | null
   name: string
-  kind: 'start' | 'signal'
+  kind: 'start' | 'signal' | null
   entry_id: string | null
   enabled: boolean
-  created_at: string
-  /** 只在新建和轮换时出现一次 */
+  has_secret: boolean
+  /** 草稿的 spec.hooks 里有这个名字 */
+  in_draft: boolean
+  /** 当前发布版里有（入站请求按发布版认种类和入口，没有就拒收） */
+  in_published: boolean
+  /** 收请求的地址 /api/hooks/{id}；还没生成密钥时为 null */
+  url_path: string | null
+  created_at: string | null
+  /** 只在生成、轮换的回包里出现一次 */
   secret?: string
 }
 
@@ -567,4 +603,43 @@ export interface AppStreamFinal {
   spec: AppSpec
   issues: LintIssue[]
   explanation: string
+}
+
+// ---------------------------------------------------------------------------
+// 能力字段语义的审阅（D-i，GET /api/capabilities/review-queue、POST /api/capabilities/review/batch）
+// ---------------------------------------------------------------------------
+
+export interface CapabilityReviewRow {
+  capability: string
+  system: string
+  title: string
+  effect: CapabilityEffect
+  /** 返回里的位置（JSON 指针） */
+  pointer: string
+  /** label / meaning / unit / measure / codes */
+  field: string
+  field_text: string
+  /** 服务端写好的位置说法（「返回字段 /amount 的单位」） */
+  field_label: string
+  value: unknown
+  display: string
+  source: string
+  status: string
+  note: string | null
+  priority: number
+  reasons: string[]
+  /** 用到这个能力的运行次数 */
+  runs: number
+  /** 能力的治理版本：成批审阅时带上（乐观锁） */
+  version: number
+}
+
+export interface CapabilityReviewOutcome {
+  capability: string
+  pointer: string
+  field: string
+  ok: boolean
+  version: number | null
+  error: string | null
+  code: string | null
 }

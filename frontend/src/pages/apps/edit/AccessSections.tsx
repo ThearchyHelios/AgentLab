@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { KeyRound, Plus } from 'lucide-react'
 import { api } from '../../../api/client'
-import type { AppHookState } from '../../../api/apps'
+import type { AppHookRow } from '../../../typesApp'
 import {
   CopyButton, DeleteButton, EmptyState, ErrorState, Field, SectionBar, Skeleton, Spinner, confirmDialog, toast,
 } from '../../../components/ui'
@@ -133,7 +133,7 @@ function Grants() {
  */
 export function HooksSection() {
   const { appId, draft, setDraft, dirty, save } = useEditor()
-  const [rows, setRows] = useState<AppHookState[] | null>(null)
+  const [rows, setRows] = useState<AppHookRow[] | null>(null)
   const [loadError, setLoadError] = useState<unknown>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [shown, setShown] = useState<{ name: string; secret: string; path: string | null } | null>(null)
@@ -261,7 +261,7 @@ export function HooksSection() {
 /** 一行钩子的服务端状态：发布版里有没有、生成过密钥没有、启用；生成 / 轮换、删除密钥 */
 function HookStatus({ name, state, declared, busy, loaded, onRotate, onToggle, onRemove }: {
   name: string
-  state: AppHookState | undefined
+  state: AppHookRow | undefined
   declared: boolean
   busy: boolean
   loaded: boolean
@@ -273,13 +273,13 @@ function HookStatus({ name, state, declared, busy, loaded, onRotate, onToggle, o
   const has = !!state?.has_secret
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs" data-app-hook-state={has ? 'secret' : 'none'}
-         data-app-hook-published={state?.published ? '1' : '0'}>
+         data-app-hook-published={state?.in_published ? '1' : '0'}>
       <span className="chip" style={has ? { color: 'var(--ok)', borderColor: 'var(--ok)' } : undefined}>
         {has ? T.hookSecretSet : T.hookSecretNone}
       </span>
       {!declared
         ? <span style={{ color: 'var(--st-waiting)' }}>{T.hookNotDeclared}</span>
-        : state?.published ? <span className="text-faint">{T.hookPublished}</span>
+        : state?.in_published ? <span className="text-faint">{T.hookPublished}</span>
         : <span style={{ color: 'var(--st-waiting)' }}>{T.hookNotPublished}</span>}
       <span className="flex-1" />
       {has && (

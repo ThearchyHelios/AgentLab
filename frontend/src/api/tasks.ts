@@ -11,7 +11,8 @@ export const tasks = {
   list: (params?: { assigned?: 'me' | 'all'; status?: string; app_id?: string; run_id?: string; limit?: number },
     opts?: RequestOptions) => get<{ items: Task[] }>(`/tasks${qs(params)}`, opts),
   /** 导航徽标：派给我的、待处理的待办数（按来源分：应用里的 / 不属于应用的） */
-  count: (opts?: RequestOptions) => get<{ mine: number; apps: number; other: number }>('/tasks/count?mine=1', opts),
+  count: (opts?: RequestOptions) =>
+    get<{ mine: number; apps: number; other: number; latest: string | null }>('/tasks/count?mine=1', opts),
   get: (id: string, opts?: RequestOptions) => get<Task>(at(id), opts),
   respond: (id: string, body: TaskRespond) => post<{ task: Task; resolved: boolean }>(`${at(id)}/respond`, body),
   reassign: (id: string, body: { to: { kind: 'user' | 'group'; name: string }[]; note?: string }) =>

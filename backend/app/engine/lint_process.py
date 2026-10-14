@@ -264,16 +264,18 @@ def lint_process(spec: GraphSpec, flag: Callable[..., None], *, level: str, stri
 def lint_subgraph_pins(spec: GraphSpec, flag: Callable[..., None], *, level: str, strict: bool) -> None:
     """子工作流固定的版本不是「已发布且未退役」的（D-q）：各级都报错（always），机器码和发起时拒绝的一样。
     load_subgraphs 没读好、没放进来时不查（门禁本身不查库）。"""
+    from app.apps.versions import pinned_upstream
+
     graphs = _SUBGRAPHS.get()
     nodes = spec.node_map()
     for problem in getattr(graphs, "pin_problems", None) or []:
         node = nodes.get(problem.node_id)
         # 读好的结果对的是读的那张图；拿去查改过的图（自动修复的预览）时，节点改了固定的版本就不再算它
-        if node is None or str(node.config.get("workflow_id") or "") != problem.workflow_id \
-                or str(node.config.get("workflow_version") or "") != str(problem.version):
+        if node is None or pinned_upstream(node) is None \
+                or pinned_upstream(node)[1:] != (problem.workflow_id, problem.version):
             continue
-        flag(f"子工作流「{problem.title}」固定的{problem.reason}：正式运行发起时会被拒绝。{problem.advice}",
-             code=problem.code, node_id=problem.node_id, field="workflow_version", always=True)
+        flag(f"{problem.who}固定的{problem.reason}：正式运行发起时会被拒绝。{problem.advice}",
+             code=problem.code, node_id=problem.node_id, field=problem.field, always=True)
 
 
 def _register() -> None:

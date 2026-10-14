@@ -334,3 +334,52 @@ async def test_a_workflow_in_use_cannot_be_deleted(client):
     assert res.status_code == 409 and "v1 有 1 条生效记录" in res.json()["detail"]
     plain = await workflow({1: "published"}, current=1)
     assert (await client.delete(f"/api/workflows/{plain}")).status_code == 204
+
+
+async def test_caliber_pins_follow_the_same_rule_as_subgraphs():
+    """D-q 延伸到口径卡：转抄别处口径的口径卡固定的那一版，同样必须已发布且未退役；机器码各用一套。"""
+    from types import SimpleNamespace
+
+    from app.apps.versions import CALIBER_UNPUBLISHED, subgraph_pin_problems
+    from app.db.base import SessionLocal
+    from app.db.models import Workflow, WorkflowVersion
+    from app.engine.schema import GraphSpec
+
+    async with SessionLocal() as session:
+        wf = Workflow(name="周销售口径", graph={}, published_version=2)
+        session.add(wf)
+        await session.flush()
+        session.add_all([WorkflowVersion(workflow_id=wf.id, version=1, graph={}),
+                         WorkflowVersion(workflow_id=wf.id, version=2, graph={}, level="published")])
+        await session.commit()
+        graph = GraphSpec.model_validate({"nodes": [
+            {"id": "in", "type": "input", "data": {"label": "入口", "config": {}}},
+            {"id": "kpi", "type": "metrics", "data": {"label": "指标", "config": {
+                "caliber_from": {"workflow_id": wf.id, "workflow_version": 1, "node_id": "card"}}}},
+        ], "edges": [{"source": "in", "target": "kpi"}]})
+        problems = await subgraph_pin_problems(session, graph)
+        assert [(p.code, p.field) for p in problems] == [(CALIBER_UNPUBLISHED, "caliber_from")]
+        assert problems[0].who == "口径卡「指标」"
+        graph.nodes[1].config["caliber_from"]["workflow_version"] = 2
+        assert await subgraph_pin_problems(session, graph) == []
+
+
+async def test_legacy_versions_with_formal_runs_are_backfilled_as_published():
+    """记级别之前发布过的老版本：有正式运行凭据的补记为 published（幂等），没有凭据的不猜。"""
+    from app.apps.versions import backfill_legacy_levels
+    from app.db.base import SessionLocal
+    from app.db.models import Run, Workflow, WorkflowVersion
+
+    async with SessionLocal() as session:
+        wf = Workflow(name="老方法卡", graph={}, published_version=3)
+        session.add(wf)
+        await session.flush()
+        session.add_all([WorkflowVersion(workflow_id=wf.id, version=v, graph={}) for v in (1, 2, 3)])
+        session.add(Run(workflow_id=wf.id, run_class="formal", version=1, graph={}, input={}))
+        await session.commit()
+        assert await backfill_legacy_levels(session) >= 1
+        await session.commit()
+        levels = {v.version: v.level for v in (await session.execute(
+            WorkflowVersion.__table__.select().where(WorkflowVersion.workflow_id == wf.id))).all()}
+        assert levels == {1: "published", 2: None, 3: None}
+        assert await backfill_legacy_levels(session) == 0

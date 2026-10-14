@@ -45,6 +45,8 @@ export interface TaskCounts {
   mine: number
   apps: number
   other: number
+  /** 其中最新一条的开出时间：数不变、却换了一条（一条处理掉、一条新来）时，新待办通知看它 */
+  latest?: string | null
 }
 
 /** 心跳间隔：连着时复用 4 秒一次的待审批轮询，不另起请求 */

@@ -340,8 +340,8 @@ async def rotate_hook(session: AsyncSession, app_id: str, name: str, *, kind: st
     """生成或轮换这个名字的密钥，返回 (行, 密钥明文, 是不是新生成的)。密钥只在这一次交回，库里存密文。
 
     kind / entry 只是照声明记在行上给人看；收请求时以当前发布版的声明为准（published_declaration）。调用方提交。
-    新插入一行之后再查一遍：别人抢先插了（并发生成，hook_lock 管不到的另一个进程），删掉自己这行、改去轮换最早那一行，
-    交回的仍是这一次的密钥——和两个人先后点「轮换」一样，后点的那把生效。"""
+    (app_id, name) 有唯一索引（ux_app_hooks_app_name）：别人抢先插了这个名字（并发生成，hook_lock 管不到的另一个进程），
+    这次插入在保存点里被库拒掉，改去轮换已有的那一行，交回的仍是这一次的密钥——和两个人先后点「轮换」一样，后点的那把生效。"""
     from app.core.crypto import encrypt
 
     if kind not in KINDS:
@@ -350,13 +350,16 @@ async def rotate_hook(session: AsyncSession, app_id: str, name: str, *, kind: st
     row = await hook_row(session, app_id, name)
     created = row is None
     if row is None:
-        row = AppHook(app_id=app_id, name=name[:100], kind=kind, enabled=True, secret="")
-        session.add(row)
-        await session.flush()
-        first = await hook_row(session, app_id, name)
-        if first is not None and first.id != row.id:
-            await session.delete(row)
-            row, created = first, False
+        fresh = AppHook(app_id=app_id, name=name[:100], kind=kind, enabled=True, secret="")
+        try:
+            async with session.begin_nested():
+                session.add(fresh)
+                await session.flush()
+            row = fresh
+        except IntegrityError:
+            row, created = await hook_row(session, app_id, name), False
+            if row is None:
+                raise
     row.kind, row.entry_id = kind, (entry if kind == "start" else None)
     row.secret = encrypt(secret) or ""
     await session.flush()

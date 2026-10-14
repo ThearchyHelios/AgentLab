@@ -1,12 +1,12 @@
 import { createContext, useContext } from 'react'
-import type { AppDetailOut } from '../../../api/apps'
+import type { AppDetail } from '../../../typesApp'
 import type { AppBindings, AppSpec, ComponentCatalog } from '../../../typesApp'
 
 /** 应用编辑器各节共用的状态：草稿、岗位绑定、组件目录、保存、选中的组件、切到哪一节 */
 export interface EditorState {
   appId: string
   /** 应用详情（manage）：带着草稿、岗位绑定和能按新口径补算的视图 */
-  detail: AppDetailOut
+  detail: AppDetail
   draft: AppSpec
   /** 改草稿：传函数拿到最新的那一份（助手的操作和人的编辑可能挨着到） */
   setDraft: (fn: (spec: AppSpec) => AppSpec) => void

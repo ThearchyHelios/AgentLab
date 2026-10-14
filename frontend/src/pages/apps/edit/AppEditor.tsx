@@ -20,8 +20,7 @@ import { matchShortcut } from '../../../lib/keys'
 import { useLeaveGuard } from '../../../lib/leave'
 import { APP_EDITOR_TEXT as T } from '../../../lib/terms'
 import { useCatalog } from '../../../store/catalog'
-import type { AppDetailOut } from '../../../api/apps'
-import type { AppBindings, AppSpec, ComponentCatalog } from '../../../typesApp'
+import type { AppBindings, AppDetail, AppSpec, ComponentCatalog } from '../../../typesApp'
 import { EditorContext, type EditorState } from './context'
 import { PinsSection, PublishedVersionPicker } from './PinsSection'
 import { PagesSection } from './PagesSection'
@@ -117,7 +116,7 @@ function EditApp({ appId }: { appId: string }) {
   const { section: raw } = useParams()
   const navigate = useNavigate()
   const section: Section = (SECTIONS as readonly string[]).includes(raw ?? '') ? raw as Section : 'pages'
-  const [detail, setDetail] = useState<AppDetailOut | null>(null)
+  const [detail, setDetail] = useState<AppDetail | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [draft, setDraftState] = useState<AppSpec | null>(null)
   const [bindings, setBindingsState] = useState<AppBindings>({ slots: {} })
@@ -136,7 +135,7 @@ function EditApp({ appId }: { appId: string }) {
     try {
       const d = await api.apps.get(appId)
       setDetail(d)
-      setDraftState(d.draft)
+      setDraftState(d.draft ?? null)
       setBindingsState(d.draft_bindings ?? { slots: {} })
       setDirty(false)
       setError(null)

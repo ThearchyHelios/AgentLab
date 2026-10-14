@@ -2139,6 +2139,13 @@ async def _mask_sets(snap: dict[str, Any] | None, source: Any, masks: _Masks, *,
     artifact 是 snap 的工件 id：给了的，分析结果按快照记在进程里（_MEMO，键见 _Masks.memo_key），之后的请求不再分析。"""
     if snap is not None and snap.get("source") == MERGE_SOURCE:
         return await _merge_mask_sets(snap, masks, depth=depth)
+    if snap is not None and snap.get("capability"):
+        # 端点快照：列是能力登记的表格映射排出来的，没有 SQL 可认、也不该按数据源认（端点不是数据源，按数据源找不到会把
+        # 整张表都当成「数据源不在了」遮掉）。按列名遮：落快照时记下的加能力现在的遮罩字段，确定就是这几列
+        from app.capabilities.registry import snapshot_masked_columns
+
+        base = await snapshot_masked_columns(snap)
+        return _MaskSets(set(base), set(base), base)
     name = source or (snap or {}).get("source")
     current, found = await masks.of(name)
     base = set(current) | (_recorded_masks(snap) if snap is not None else set())

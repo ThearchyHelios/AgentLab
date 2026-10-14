@@ -803,6 +803,10 @@ class Conversation(Base, TimestampMixin):
     """
 
     __tablename__ = "conversations"
+    # 一个人在一个应用里只有一段（未归档的）助手对话（D-e）。存量库由 db/base.py 的 _UNIQUE_INDEX_MIGRATIONS 补建。
+    # created_by 为空（关登录又没填署名）的不受约束：SQLite 的唯一索引里 NULL 互不相等，那种情况靠接口里的进程内锁
+    __table_args__ = (Index("ux_conversations_app_owner", "app_id", "created_by", unique=True,
+                            sqlite_where=text("kind = 'app' AND archived = 0")),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     title: Mapped[str] = mapped_column(String(200), default="")

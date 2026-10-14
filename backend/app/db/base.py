@@ -252,6 +252,21 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str | tuple[str, ...]]] = [
 ]
 
 
+#: 迁移补建的唯一索引：(索引名, 表, 列, 部分索引的条件, 建之前的去重语句)。只在索引还不存在时先去重再建——存量库里可能
+#: 已经有并发留下的重复行，直接建会失败。去重的规矩写在各自的语句里：多出的钩子行删掉（只留最早的那一行，它的密钥照旧
+#: 能用），多出的助手对话归档（不删，历史还在）
+_UNIQUE_INDEX_MIGRATIONS: list[tuple[str, str, tuple[str, ...], str | None, str]] = [
+    ("ux_app_hooks_app_name", "app_hooks", ("app_id", "name"), None,
+     "DELETE FROM app_hooks WHERE id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER "
+     "(PARTITION BY app_id, name ORDER BY created_at, id) AS rn FROM app_hooks) WHERE rn = 1)"),
+    ("ux_conversations_app_owner", "conversations", ("app_id", "created_by"), "kind = 'app' AND archived = 0",
+     "UPDATE conversations SET archived = 1 WHERE kind = 'app' AND archived = 0 AND created_by IS NOT NULL "
+     "AND id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY app_id, created_by "
+     "ORDER BY last_active_at DESC, id) AS rn FROM conversations WHERE kind = 'app' AND archived = 0 "
+     "AND created_by IS NOT NULL) WHERE rn = 1)"),
+]
+
+
 def _migrate(conn) -> None:  # pragma: no cover - 同步回调
     from sqlalchemy import text
 
@@ -264,6 +279,14 @@ def _migrate(conn) -> None:  # pragma: no cover - 同步回调
         cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
         if all(c in cols for c in wanted):
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({', '.join(wanted)})"))
+    for name, table, columns, where, dedupe in _UNIQUE_INDEX_MIGRATIONS:
+        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+        exists = conn.execute(text("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = :n"), {"n": name}).first()
+        if exists or not all(c in cols for c in columns):
+            continue
+        conn.execute(text(dedupe))
+        conn.execute(text(f"CREATE UNIQUE INDEX {name} ON {table} ({', '.join(columns)})"
+                          + (f" WHERE {where}" if where else "")))
 
 
 async def init_db() -> None:

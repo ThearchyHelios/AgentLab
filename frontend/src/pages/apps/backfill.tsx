@@ -10,7 +10,7 @@
 import { useEffect, useState } from 'react'
 import { History } from 'lucide-react'
 import { api } from '../../api/client'
-import type { BackfillPlan } from '../../api/apps'
+import type { BackfillPlan } from '../../typesApp'
 import { Spinner, confirmDialog, toast } from '../../components/ui'
 import { APP_EDITOR_TEXT as T } from '../../lib/terms'
 import { useAtLeast } from '../../store/auth'
@@ -121,7 +121,7 @@ export function BackfillButton({ appId, target, onDone }: { appId: string; targe
     setBusy(true)
     try {
       const res = await api.apps.backfill(appId, target.view)
-      toast.ok(T.backfillDone(res.started, res.skipped))
+      toast.ok(T.backfillDone(res.launched, res.skipped))
       if (res.refused) toast.warn(res.refused)
       onDone?.()
     } catch (e) {

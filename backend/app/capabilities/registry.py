@@ -305,6 +305,24 @@ async def endpoint_request(session: AsyncSession, capability: Any, args: dict[st
                      run_id=run_id, node_id=node_id)
 
 
+async def snapshot_masked_columns(snap: dict[str, Any]) -> set[str]:
+    """一份端点快照要遮的列（小写）：落快照时记下的（mask_columns），加上能力现在的遮罩字段按表格映射落到的列。
+
+    端点快照的列是能力登记的表格映射排出来的，没有 SQL 改名这回事，按列名遮就是准的。管理员事后给能力加了遮罩字段，
+    来源运行没换，证据面板和视图也得跟着遮（P4，同数据源事后加遮罩列）。能力删掉了的只能按快照记下的遮。
+    证据面板（api/evidence._mask_sets）和应用视图（apps/resolve._snapshot）共用这一份。"""
+    from app.capabilities.endpoints import masked_columns_of
+    from app.db.base import SessionLocal
+
+    recorded = snap.get("mask_columns")
+    out = {c.lower() for c in recorded if isinstance(c, str)} if isinstance(recorded, list) else set()
+    async with SessionLocal() as session:
+        cap = await get_capability(session, str(snap.get("capability") or ""))
+    if cap is not None:
+        out |= {c.lower() for c in masked_columns_of(cap.tabular or {}, masked_paths(cap))}
+    return out
+
+
 def masked_paths(capability: Any) -> list[str]:
     """能力的遮罩字段（JSON 指针）。"""
     return list(getattr(capability, "masked", None) or [])

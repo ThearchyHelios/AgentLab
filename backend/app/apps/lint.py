@@ -164,7 +164,7 @@ async def _lint_subgraph_pins(session: AsyncSession, spec: dict[str, Any], pins:
         except ValueError:
             continue
         for problem in await subgraph_pin_problems(session, graph):
-            out.error(problem.code, f"「{state.label}」里的子工作流「{problem.title}」固定的{problem.reason}：这一版的正式运行"
+            out.error(problem.code, f"「{state.label}」里的{problem.who}固定的{problem.reason}：这一版的正式运行"
                       "发起时会被拒绝。请在那个工作流里改好并发布新版本，再把这里的引用换成新版本", f"pins[{i}]",
                       node_id=problem.node_id)
 

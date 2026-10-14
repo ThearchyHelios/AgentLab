@@ -107,6 +107,8 @@ function ProvidersTab() {
   const loaded = useCatalog((s) => s.loaded)
   const [catalog, setCatalog] = useState<any>(null)
   const [editing, setEditing] = useState<Provider | 'new' | null>(null)
+  // 模型接入只有管理员能改（服务端 role_by_method(write=admin)）；开登录的搭建者只看，不出改动的按钮，免得点了才 403
+  const canWrite = atLeast(usePrincipal(), 'admin')
 
   const loadCatalog = () => api.providers.catalog().then(setCatalog, () => {})
   useEffect(() => { void loadCatalog() }, [])
@@ -144,10 +146,13 @@ function ProvidersTab() {
 
   return (
     <div>
-      <SectionBar title="模型接入" hint="API Key 加密保存在本地，不会返回给浏览器。状态圆点表示上次连接测试的结果，与是否启用无关。">
-        <button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}>
-          <Plus size={12} aria-hidden /> 添加接入
-        </button>
+      <SectionBar title="模型接入" hint={`API Key 加密保存在本地，不会返回给浏览器。状态圆点表示上次连接测试的结果，与是否启用无关。${
+        canWrite ? '' : '只有管理员能添加、修改和测试模型接入。'}`}>
+        {canWrite && (
+          <button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}>
+            <Plus size={12} aria-hidden /> 添加接入
+          </button>
+        )}
       </SectionBar>
 
       {!loaded ? (
@@ -158,12 +163,14 @@ function ProvidersTab() {
           title="还没有配置模型"
           source="providers"
           body="接入 Anthropic、OpenAI 或任何 OpenAI 兼容的服务（DeepSeek、通义、本机 Ollama…）后，Agent 才能运行。"
-          action={<button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}><Plus size={12} aria-hidden /> 添加接入</button>}
+          action={canWrite
+            ? <button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}><Plus size={12} aria-hidden /> 添加接入</button>
+            : undefined}
         />
       ) : (
         <div className="space-y-2.5">
           {providers.map((p) => (
-            <ProviderCard key={p.id} provider={p} kindLabel={kindLabel(p.kind)}
+            <ProviderCard key={p.id} provider={p} kindLabel={kindLabel(p.kind)} canWrite={canWrite}
                           onEdit={() => setEditing(p)} onRemove={() => void remove(p)} />
           ))}
         </div>
@@ -189,8 +196,8 @@ function ProvidersTab() {
   )
 }
 
-function ProviderCard({ provider: p, kindLabel, onEdit, onRemove }: {
-  provider: Provider; kindLabel: string; onEdit: () => void; onRemove: () => void
+function ProviderCard({ provider: p, kindLabel, canWrite, onEdit, onRemove }: {
+  provider: Provider; kindLabel: string; canWrite: boolean; onEdit: () => void; onRemove: () => void
 }) {
   const key = `provider:${p.id}`
   // 后端记着上次测的结果：换了浏览器、清了缓存也还在。本机刚测过的更新就用本机的
@@ -213,14 +220,16 @@ function ProviderCard({ provider: p, kindLabel, onEdit, onRemove }: {
         {!p.enabled && <span className="chip" title={PROVIDER_REF_TEXT.disabledChip}>已停用</span>}
         <span className="flex-1" />
         <HealthPill record={record} checkingSince={checkingSince} />
-        <div className="flex items-center gap-1">
-          <button className="btn btn-sm" disabled={!!checkingSince} onClick={() => void test()}
-                  title={`向 ${p.default_model || '默认模型'} 发送一条测试消息`}>
-            <Plug size={11} aria-hidden /> 测试连接
-          </button>
-          <button className="btn btn-sm btn-ghost" onClick={onEdit}>编辑</button>
-          <DeleteButton label={`删除模型接入 ${p.name}`} onClick={onRemove} />
-        </div>
+        {canWrite && (
+          <div className="flex items-center gap-1">
+            <button className="btn btn-sm" disabled={!!checkingSince} onClick={() => void test()}
+                    title={`向 ${p.default_model || '默认模型'} 发送一条测试消息`}>
+              <Plug size={11} aria-hidden /> 测试连接
+            </button>
+            <button className="btn btn-sm btn-ghost" onClick={onEdit}>编辑</button>
+            <DeleteButton label={`删除模型接入 ${p.name}`} onClick={onRemove} />
+          </div>
+        )}
       </div>
       <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-2xs text-faint">
         {p.base_url && <span className="mono break-all">{p.base_url}</span>}

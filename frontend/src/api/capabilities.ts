@@ -3,7 +3,9 @@
  * api.endpoints / api.notify 上。形状见 typesApp.ts。端点和渠道的密钥只回掩码；提交掩码值表示保持原值。
  */
 import type { CatalogReviewAction, CatalogSource, CatalogStatus } from '../types'
-import type { CapabilityEffect, CapabilityRow, EndpointRow, NotifyChannelRow } from '../typesApp'
+import type {
+  CapabilityEffect, CapabilityReviewOutcome, CapabilityReviewRow, CapabilityRow, EndpointRow, NotifyChannelRow,
+} from '../typesApp'
 import { del, get, patch, post, put, qs, type RequestOptions } from './http'
 
 /**
@@ -45,8 +47,6 @@ export interface CapabilityReviewResult {
   code?: string | null
 }
 
-const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : null)
-const num = (...vs: unknown[]): number => Number(vs.find((v) => typeof v === 'number') ?? 0)
 
 /** 队列一项的键：字段@位置。字段只有几个固定的英文名，不含 @，拆的时候按第一个 @ 拆 */
 export const reviewPathOf = (field: string, pointer: string) => `${field}@${pointer}`
@@ -55,28 +55,24 @@ export function splitReviewPath(path: string): { field: string; pointer: string 
   return at < 0 ? { field: '', pointer: path } : { field: path.slice(0, at), pointer: path.slice(at + 1) }
 }
 
-function reviewItemOf(raw: Record<string, any>): CapabilityReviewItem {
-  const pointer = String(raw.pointer ?? '')
-  const field = String(raw.field ?? '')
-  const short = String(raw.field_text ?? raw.field ?? '')
+function reviewItemOf(raw: CapabilityReviewRow): CapabilityReviewItem {
   return {
-    name: String(raw.capability ?? raw.name ?? ''),
-    title: str(raw.title),
-    path: reviewPathOf(field, pointer),
-    pointer,
-    field,
-    // 服务端写好的位置说法；老写法只给了字段名时自己拼
-    where: str(raw.field_label) ?? (pointer ? `${pointer} 的${short}` : short),
+    name: raw.capability,
+    title: raw.title,
+    path: reviewPathOf(raw.field, raw.pointer),
+    pointer: raw.pointer,
+    field: raw.field,
+    where: raw.field_label,
     value: raw.value,
-    display: typeof raw.display === 'string' ? raw.display : raw.value == null ? '' : String(raw.value),
-    source: raw.source,
-    status: raw.status ?? 'proposed',
-    note: str(raw.note),
-    priority: num(raw.priority),
-    reasons: Array.isArray(raw.reasons) ? raw.reasons.map(String) : [],
-    usage: num(raw.runs, raw.usage, raw.run_count),
-    effect: raw.effect ?? null,
-    version: num(raw.version),
+    display: raw.display,
+    source: raw.source as CatalogSource,
+    status: raw.status as CatalogStatus,
+    note: raw.note,
+    priority: raw.priority,
+    reasons: raw.reasons,
+    usage: raw.runs,
+    effect: raw.effect,
+    version: raw.version,
   }
 }
 
@@ -91,25 +87,22 @@ export const capabilities = {
   sync: () => post<{ changed: number }>('/capabilities/sync'),
   /** 待审阅的能力字段（D-i）：顺序服务端排好；capability 只看这一个能力 */
   reviewQueue: async (params: { limit?: number; offset?: number; capability?: string | null }, opts?: RequestOptions) => {
-    const raw = await get<{ total?: number; items?: Record<string, any>[] }>(`/capabilities/review-queue${qs({
+    const raw = await get<{ total: number; items: CapabilityReviewRow[] }>(`/capabilities/review-queue${qs({
       limit: params.limit, offset: params.offset, capability: params.capability || undefined,
     })}`, opts)
-    const items = (raw?.items ?? []).map(reviewItemOf).filter((i) => i.name && i.field)
-    return { total: typeof raw?.total === 'number' ? raw.total : items.length, items }
+    return { total: raw.total, items: raw.items.map(reviewItemOf) }
   },
   /**
    * 成批审阅（只给管理员）：逐个能力按治理版本做乐观锁，逐条交回结果（一个能力冲突只记在那几条上，code 为
    * capability_conflict）；写审计。path 是队列一项的键（字段@位置），这里拆回位置和字段
    */
   reviewBatch: async (items: { name: string; path: string; action: CatalogReviewAction; if_version: number }[]) => {
-    const raw = await post<{ results?: Record<string, any>[] }>('/capabilities/review/batch', {
+    const raw = await post<{ results: CapabilityReviewOutcome[] }>('/capabilities/review/batch', {
       items: items.map((i) => ({ capability: i.name, ...splitReviewPath(i.path), action: i.action, if_version: i.if_version })),
     })
     return {
-      results: (raw?.results ?? []).map((r): CapabilityReviewResult => ({
-        name: String(r.capability ?? r.name ?? ''), path: reviewPathOf(String(r.field ?? ''), String(r.pointer ?? '')),
-        ok: r.ok === true, version: typeof r.version === 'number' ? r.version : null,
-        error: str(r.error) ?? str(r.message), code: str(r.code),
+      results: raw.results.map((r): CapabilityReviewResult => ({
+        name: r.capability, path: reviewPathOf(r.field, r.pointer), ok: r.ok, version: r.version, error: r.error, code: r.code,
       })),
     }
   },

@@ -61,8 +61,8 @@ async def list_tasks(
 
 
 @router.get("/count")
-async def count_tasks(mine: int = 1, x_actor: str | None = Header(default=None)) -> dict[str, int]:
-    """导航徽标：派给我的、待处理的待办数，按来源分开（apps：应用里的；other：画布、定时任务的审批）。"""
+async def count_tasks(mine: int = 1, x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """导航徽标：派给我的、待处理的待办数，按来源分开（apps：应用里的；other：画布、定时任务的审批）；latest 是最新一条的开出时间。"""
     return await task_service.count(principal_of(x_actor))
 
 

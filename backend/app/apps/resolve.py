@@ -869,34 +869,18 @@ def _query_artifact(source: Source, node_id: str, exec_no: Any = None) -> str | 
 async def _snapshot(source: Source, artifact: str) -> tuple[dict[str, Any] | None, set[str]]:
     """查询快照和要遮的列（小写）：查询当时记下的加数据源现在设的，按 SQL 认出改了名字的也遮（同证据面板）。端点快照
     按列名遮（见下）。"""
-    from app.api.evidence import _fetch, _recorded_masks
+    from app.api.evidence import _fetch
 
     snap, ok = _fetch(artifact)
     if ok is not True or not isinstance(snap, dict) or not isinstance(snap.get("rows"), list):
         return None, set()
     if snap.get("capability"):
-        # 端点快照：列是能力登记的表格映射排出来的，没有 SQL 改名这回事，按列名遮就是准的——落快照时记下的，加上能力
-        # 现在的遮罩字段。查询快照那一套（按 SQL 认改了名字的遮罩列）在这里认不出出处，会把整张表都遮掉
-        return snap, _recorded_masks(snap) | await _capability_masks(str(snap["capability"]))
+        # 端点快照：按列名遮（落快照时记下的，加上能力现在的遮罩字段），证据面板用的是同一个函数
+        from app.capabilities.registry import snapshot_masked_columns
+
+        return snap, await snapshot_masked_columns(snap)
     sets = await source.masks.sets(artifact, snap.get("source"), snap)
     return snap, set(sets.hidden)
-
-
-async def _capability_masks(name: str) -> set[str]:
-    """端点快照（capabilities/endpoints.py 落的 endpoint_snapshot）按能力现在的遮罩字段要遮的列（小写）。
-
-    快照里的 mask_columns 是落快照那一刻的遮罩（调用方另外并进来）；管理员事后给能力加了遮罩字段，来源运行没换，
-    视图也得跟着遮（P4，同数据源事后加遮罩列）。遮罩字段是 JSON 指针，按能力登记的表格映射认它落在哪几列
-    （masked_columns_of，落快照时记 mask_columns 用的同一个函数）。能力删掉了的只能按快照记下的遮。"""
-    from app.capabilities.endpoints import masked_columns_of
-    from app.capabilities.registry import get_capability, masked_paths
-    from app.db.base import SessionLocal
-
-    async with SessionLocal() as session:
-        cap = await get_capability(session, name)
-    if cap is None:
-        return set()
-    return {c.lower() for c in masked_columns_of(cap.tabular or {}, masked_paths(cap))}
 
 
 async def _cell(ctx: _Page, source: Source, cid: str, ref: Any, conv: Any) -> dict[str, Any]:

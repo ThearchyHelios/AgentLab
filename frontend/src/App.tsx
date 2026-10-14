@@ -1155,7 +1155,7 @@ function watchApprovals(go: Go): () => void {
 
 /**
  * 派给自己的新待办：规则同待审批——拿到过一次真列表才记底，之后新来的、标签页在后台时发系统通知。不每拍都取列表：
- * 心跳取的「派给我的」待办数（taskCounts.mine）变了才取一次派给我的待处理待办。搭建者以上已经按待审批发过通知的
+ * 心跳取的「派给我的」待办数或最新一条的时间（taskCounts.mine / latest）变了才取一次派给我的待处理待办。搭建者以上已经按待审批发过通知的
  * （待办带着那条审批）不再发第二条；核实、等外部系统这类没有审批的待办只在这里通知
  */
 function watchTasks(go: Go): () => void {
@@ -1192,7 +1192,7 @@ function watchTasks(go: Go): () => void {
   }
   return useCatalog.subscribe((s, p) => {
     if (s.taskCounts === p.taskCounts || !s.taskCounts) return
-    if (seen && s.taskCounts.mine === p.taskCounts?.mine) return
+    if (seen && s.taskCounts.mine === p.taskCounts?.mine && s.taskCounts.latest === p.taskCounts?.latest) return
     if (needsLogin(useAuth.getState().me)) return
     void pull()
   })

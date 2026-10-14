@@ -42,6 +42,15 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings.ensure_dirs()
     await init_db()
     await seed_defaults()
+
+    # 记级别之前发布过的老版本：有正式运行凭据的补记为已发布，免得子工作流、口径卡钉住它们的正式运行被误判成「没发布过」
+    from app.apps.versions import backfill_legacy_levels
+    from app.db.base import SessionLocal as _Sessions
+
+    async with _Sessions() as _s:
+        if levelled := await backfill_legacy_levels(_s):
+            logger.info("给 %d 个老的发布版本补记了级别（有正式运行凭据）", levelled)
+        await _s.commit()
     await _platform_startup()
 
     # 把存的 embedding 配置读进来。不读的话重启后会悄悄退回本地哈希向量，
