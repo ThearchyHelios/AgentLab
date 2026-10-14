@@ -468,7 +468,7 @@ await section('实例页：状态、进度、待办卡、动作状态', async ()
   await page.locator('[data-view-renderer]').waitFor({ timeout: 15000 })
   check('写出发起人', (await page.locator('[data-instance-page]').innerText()).includes('由「张三」发起'))
   check('实例状态按服务端的说法写（结果未知：等待核实写入结果，不是「等待审批」）',
-    (await page.locator('[data-component="instance_header"] [data-status]').innerText()).includes('等待核实写入结果')
+    (await page.locator('[data-component="instance_header"] span[data-status]').first().innerText()).includes('等待核实写入结果')
     && !(await page.locator('[data-component="instance_header"]').innerText()).includes('等待审批'))
   check('进度按节点列出', (await page.locator('[data-timeline-step]').count()) === 3)
   check('结果未知的那一步写「结果未知」，不写「完成」',

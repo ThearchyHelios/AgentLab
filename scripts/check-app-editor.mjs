@@ -585,7 +585,8 @@ await section('岗位与授权：三档各写标题和说明；搭建者从名�
     && (await rows.nth(1).innerText()).includes('全部实例') && (await rows.nth(2).innerText()).includes('编辑、发布'))
   const use = rows.first()
   check('已选的名录里没有：标签上标出来', await waitFor(page, async () => await use.locator('[data-principal-problem="missing"]').count() === 1))
-  const input = use.getByRole('textbox')
+  // 挂了候选列表（list）的输入框角色是 combobox，不是 textbox
+  const input = use.locator('input').first()
   const chips = () => use.locator('li[data-principal]').count()
   await input.fill('nobody')
   await input.press('Enter')

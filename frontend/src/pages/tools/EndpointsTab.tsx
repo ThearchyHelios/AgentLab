@@ -30,10 +30,11 @@ const rowsOf = (env?: EndpointEnv): HeaderRow[] => Object.entries(env?.headers ?
 
 /** 请求头名称：HTTP 的 token（和服务端 capabilities/secrets.header_problem 同一条规矩，服务端为准） */
 const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
-function headerProblem(row: HeaderRow, rows: HeaderRow[]): string | null {
+/** 一行认证头的问题。重名只标后来的那一行：前面那一行本身没错，删掉或改掉后加的就好 */
+function headerProblem(row: HeaderRow, rows: HeaderRow[], index: number): string | null {
   if (!row.k.trim()) return T.headerEmpty
   if (!HEADER_NAME.test(row.k)) return T.headerInvalid
-  if (rows.filter((r) => r.k.toLowerCase() === row.k.toLowerCase()).length > 1) return T.headerDuplicate
+  if (rows.slice(0, index).some((r) => r.k.toLowerCase() === row.k.toLowerCase())) return T.headerDuplicate
   return null
 }
 
@@ -168,7 +169,7 @@ function EndpointEditor({ row, onClose, onSaved, onConflict }: {
   const [timeout, setTimeoutS] = useState(row?.timeout_s ?? 20)
   const [busy, setBusy] = useState(false)
   // 配了的环境里有标红的请求头（名称空、不合法、重复）：不让保存
-  const headerBlocked = ENVS.some((env) => envs[env] && headers[env].some((r) => headerProblem(r, headers[env])))
+  const headerBlocked = ENVS.some((env) => envs[env] && headers[env].some((r, i) => headerProblem(r, headers[env], i)))
   const idemProblem = HEADER_NAME.test(idem) ? null : T.headerInvalid
   const setEnv = (env: EnvKey, patch: Partial<EndpointEnv> | null) =>
     setEnvs((cur) => {
@@ -259,7 +260,7 @@ function EnvEditor({ env, value, onChange, headers, onHeaders }: {
       <div>
         <div className="mb-1 text-2xs text-faint">{T.headers} · {T.headersHint}</div>
         {headers.map((r, i) => {
-          const problem = headerProblem(r, headers)
+          const problem = headerProblem(r, headers, i)
           const errorId = `endpoint-${env}-header-${i}-error`
           return (
             <div key={i} className="mb-1" data-endpoint-header={i}>
