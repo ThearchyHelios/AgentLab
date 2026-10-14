@@ -813,6 +813,40 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
     }
 
 
+METRIC_NOT_FOUND = "evidence_metric_not_found"
+
+
+@router.get("/{run_id}/evidence/metrics/{node}/{metric}")
+async def evidence_metric(run_id: str, node: str, metric: str) -> dict[str, Any]:
+    """点开应用页上的一个指标（应用平台 §3.6）：指标 → 输入 → 查询快照的出处链，和报告片段的指标链同一套（_metric_chain）。
+
+    没有报告也能点：指标从口径卡节点最后一次封存的指标集里取。值取自遮罩列的（_metric_masks），指标步骤和展示的字都写
+    「已遮罩」，同报告撰写时认出来的那样。"""
+    sealed = await _sealed(run_id)
+    cards = [(art, card) for node_id, art, card in _sealed_cards(sealed) if node_id == node]
+    found = _metric_in(cards[-1][1], metric) if cards else None
+    if found is None:
+        raise CodedHTTPException(404, "这次运行封存的口径卡里没有这个指标", METRIC_NOT_FOUND)
+    artifact, card = cards[-1]
+    masks = _Masks(sealed)
+    _, word = await _metric_masks(found, node, artifact, sealed, masks, card=card)
+    try:
+        shown = word or render_metric(found)
+    except RenderError:
+        shown = MISSING
+    eid = make_eid("metric", artifact, {"metric": metric})
+    entry = {"kind": "metric", "artifact": artifact, "node_id": node, "eid": eid,
+             **({"masked": True, "rendered": word} if word else {})}
+    chain = await _metric_chain({"text": shown}, {"kind": "metric", "locator": {"metric": metric}, "eid": eid},
+                                entry, {"catalog": {}}, sealed, masks)
+    covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
+    masked = list(dict.fromkeys(c for step in chain if step.get("step") in ("query", "input")
+                                for c in step.get("masked") or []))
+    return {"run_id": run_id, "node": node, "metric": metric, "rendered": shown, "eid": eid, "chain": chain,
+            "seal": {"sealed": sealed.sealed, "ok": sealed.seal["ok"], "covered": covered},
+            "redacted": {"columns": masked, "note": MASK_NOTE} if masked else {"columns": []}}
+
+
 def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
                   ) -> tuple[_Report, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
     """选报告、确认文档完好、找到片段：(报告, (块, 句子, 片段))。片段接口和推断来源接口共用同一套错误码。"""

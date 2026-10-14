@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any, Callable
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.engine.labels import contract_label, field_label, judge_label, option_label, q
@@ -69,8 +69,9 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
     strict = level == "governed"
 
     def flag(message: str, *, code: str, node_id: str | None = None, hard: bool = False,
-             field: str | None = None, sql_level: str | None = None) -> None:
-        result.add(message, level="error" if (hard and strict) else "warning", node_id=node_id,
+             field: str | None = None, sql_level: str | None = None, always: bool = False) -> None:
+        # always：各级都报错（§3.13 的 action.write_in_agent、action.prod_missing），不只受管级
+        result.add(message, level="error" if (always or (hard and strict)) else "warning", node_id=node_id,
                    field=field, code=code, sql_level=sql_level)
 
     has_contract_output = False
@@ -639,7 +640,7 @@ async def unresolved_caliber_upgrades(
     返回 (阻断性错误, 需记录的升版事件)。有新版本但没声明 upgrade_policy
     的直接阻断 formal 启动 —— 这是"被迫处置"，不是提醒。
     """
-    from app.db.models import WorkflowVersion
+    from app.apps.versions import latest_published
 
     errors: list[str] = []
     events: list[dict[str, Any]] = []
@@ -658,13 +659,9 @@ async def unresolved_caliber_upgrades(
             continue
         if not pinned or not wf_id or not str(pinned).isdigit():
             continue
-        latest = (
-            await session.execute(
-                select(func.max(WorkflowVersion.version)).where(
-                    WorkflowVersion.workflow_id == wf_id
-                )
-            )
-        ).scalar()
+        # 只看已发布且未退役的版本（F3）：工作流每保存一次就留一个快照，上游改一下画布不算升版，不该逼下游处置
+        newest = await latest_published(session, str(wf_id))
+        latest = newest.version if newest is not None else None
         if latest is None or latest <= int(pinned):
             continue
         policy = node.config.get("upgrade_policy")

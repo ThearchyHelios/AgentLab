@@ -98,9 +98,12 @@ async def case_formal_never_published():
 
 
 async def case_formal_not_the_published_version():
+    """v1 是草稿快照（没有发布级别，也不是当前发布版）。应用平台之后正式运行接受「已发布且未退役」的版本，草稿照旧不行，
+    拒绝带上机器码 run_version_unpublished（F1）。"""
     wf, _ = await workflow(published=2, versions=(1, 2))
     return ({"run_class": "formal", "workflow_id": wf, "version": 1},
-            (409, "v1 不是当前发布版本（v2）。正式运行只能使用当前发布版本；如需运行这一版，请先发布它。", None))
+            (409, "v1 没有发布过（当前发布版本为 v2）。正式运行只能使用已发布的版本；如需运行这一版，请先发布它。",
+             "run_version_unpublished"))
 
 
 async def case_formal_snapshot_missing():

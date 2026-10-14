@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import graph_error
+from app.api.coded import CodedHTTPException
 from app.api.runs import actor_of
 from app.core.artifact_store import graph_hash
 from app.data.catalog_impact import catalog_drift, catalog_versions_for, recorded_versions
@@ -20,6 +21,10 @@ from app.engine.schema import GraphSpec, NodeType, validate_graph
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 
 _GONE = "工作流不存在，可能已被删除"
+#: 删除被拒：还有应用固定着、或者发布过的版本有生效记录（F4）
+WORKFLOW_IN_USE = "workflow_in_use"
+#: 受管级发布、版本退役只给管理员（Q8）
+ADMIN_ONLY = "admin_only"
 _LEVELS = ("published", "governed")
 _BAD_LEVEL = "发布级别只能是「已发布」或「受管」"
 #: 剩下的挡住发布的只有模型接入的问题、人又要交给助手时的说明：换成哪个接入要人拿主意，助手处理不了。发布弹窗里
@@ -179,8 +184,22 @@ async def delete_workflow(
     )
     if live:
         raise HTTPException(409, f"该工作流还有 {live} 次运行正在进行，现在删除会使这些运行失去所属工作流。请先停止运行，再删除")
+    # 版本随工作流级联删除（F4）：应用固定着的版本、带生效记录的版本删掉，应用发起不了、生效记录对不上承诺。这两种拒绝
+    if reasons := await _delete_blockers(session, workflow_id):
+        raise CodedHTTPException(409, "该工作流还在使用中，不能删除：" + "；".join(reasons), WORKFLOW_IN_USE)
     await session.delete(workflow)
     await session.commit()
+
+
+async def _delete_blockers(session: AsyncSession, workflow_id: str) -> list[str]:
+    from app.apps.versions import effect_count, pinning_apps, published_versions
+
+    reasons = [f"应用「{a['name']}」v{a['app_version']} 固定了 v{a['version']}"
+               for a in await pinning_apps(session, workflow_id)]
+    for row in await published_versions(session, workflow_id):
+        if count := await effect_count(session, workflow_id, row.version):
+            reasons.append(f"v{row.version} 有 {count} 条生效记录")
+    return reasons
 
 
 @router.post("/{workflow_id}/duplicate", response_model=WorkflowOut, status_code=201)
@@ -209,6 +228,11 @@ class VersionOut(BaseModel):
     created_at: Any = None
     #: 这一版按哪一档发布的（published / governed）。没发布过、或者是记级别之前发布的为 null
     level: str | None = None
+    #: 这一版是谁、什么时候发布的；退役了的是什么时候、谁退的。存量为 null
+    published_at: Any = None
+    published_by: str | None = None
+    retired_at: Any = None
+    retired_by: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -239,6 +263,11 @@ class VersionDetailOut(VersionOut):
     catalog_versions: dict[str, Any] | None = None
     #: 发布之后目录有变化的表：[{source, source_id, table, label, published, current, impact}]
     catalog_changes: list[dict[str, Any]] = Field(default_factory=list)
+    #: 入口字段换成表单（agentlab.form/1）：发起表单、应用入口用同一个渲染器（X2）
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    retire_note: str | None = None
+    #: 账本（L4）：固定这一版的应用、生效记录数、正式运行数
+    usage: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("/{workflow_id}/versions/{version}", response_model=VersionDetailOut)
@@ -268,6 +297,9 @@ async def get_version(
                 f for f in ((node.get("data") or {}).get("config") or {}).get("fields") or []
                 if isinstance(f, dict)
             )
+    from app.apps.forms import input_schema
+    from app.apps.versions import usage
+
     return VersionDetailOut(
         id=snapshot.id, version=snapshot.version, note=snapshot.note,
         created_at=snapshot.created_at, workflow_id=workflow_id, graph=graph,
@@ -275,7 +307,40 @@ async def get_version(
         published=workflow.published_version == snapshot.version, level=snapshot.level,
         catalog_versions=recorded_versions(snapshot.catalog_versions),
         catalog_changes=await catalog_drift(session, snapshot.catalog_versions),
+        input_schema=input_schema(fields), published_at=snapshot.published_at, published_by=snapshot.published_by,
+        retired_at=snapshot.retired_at, retired_by=snapshot.retired_by, retire_note=snapshot.retire_note,
+        usage=await usage(session, workflow_id, snapshot.version),
     )
+
+
+class RetireIn(BaseModel):
+    note: str = Field(default="", max_length=2000)
+
+
+@router.post("/{workflow_id}/versions/{version}/retire")
+async def retire_version(
+    workflow_id: str, version: int, payload: RetireIn, session: AsyncSession = Depends(get_session),
+    x_actor: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """退役一个发布过的版本：不再接受新的正式运行，进行中的实例照常走完。当前发布版不能退役；返回受影响的应用
+    （它们标「需升级」）。只有管理员能做（Q8），关登录时放行。"""
+    from app.apps.versions import RetireRefused, retire_version as retire
+
+    _require_admin("退役版本")
+    try:
+        return await retire(session, workflow_id, version, actor=actor_of(x_actor), note=payload.note)
+    except RetireRefused as e:
+        if e.code:
+            raise CodedHTTPException(e.status_code, e.message, e.code) from e
+        raise HTTPException(e.status_code, e.message) from e
+
+
+def _require_admin(what: str) -> None:
+    """受管级发布、版本退役只给管理员（Q8）。关登录时所有人等同管理员。"""
+    from app.api.deps import current_principal
+
+    if not current_principal().at_least("admin"):
+        raise CodedHTTPException(403, f"{what}需要管理员权限", ADMIN_ONLY)
 
 
 @router.post("/{workflow_id}/versions/{version}/restore", response_model=WorkflowOut)
@@ -335,6 +400,8 @@ async def publish_workflow(
     """
     if payload.level not in _LEVELS:
         raise HTTPException(400, _BAD_LEVEL)
+    if payload.level == "governed":
+        _require_admin("以受管级别发布")
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
@@ -362,12 +429,24 @@ async def publish_workflow(
     if any(i["level"] == "error" for i in issues):
         return {"ok": False, "level": payload.level, "version": version, "issues": issues}
 
+    # 发布时用到的能力的治理版本（F5）。在改这一版之前取：能力登记缺了的要另开会话同步、提交，这个会话手里不能先有写
+    from app.capabilities.registry import capability_versions_for
+    from app.db.base import utcnow
+    from app.engine.launch import graph_tool_names
+
+    capabilities = await capability_versions_for(session, graph_tool_names(snapshot.graph))
     if not snapshot.graph_hash:
         snapshot.graph_hash = graph_hash(snapshot.graph)
     # 级别记在这一版上：之后改画布（status 退回 draft），从这一版发起的正式运行照样按发布时的级别出具
     snapshot.level = payload.level
     # 发布时的目录版本也记在这一版上：重新发布同一版等于按现在的目录重新认可它，跟着更新
     snapshot.catalog_versions = await catalog_versions_for(session, spec)
+    # 发布人、发布时间、用到的能力版本也记在这一版上（F5）：工作流上的 published_by 只记最近一次。退役过的版本重新
+    # 发布等于重新认可它，退役信息清掉
+    snapshot.published_at = utcnow()
+    snapshot.published_by = actor_of(x_actor)
+    snapshot.capability_versions = capabilities
+    snapshot.retired_at = snapshot.retired_by = snapshot.retire_note = None
     workflow.status = payload.level
     workflow.published_version = version
     workflow.published_by = actor_of(x_actor)
@@ -520,7 +599,8 @@ async def autofix(
 
         helped = await assist_publish_fix(session, out["graph"], level=payload.level,
                                           provider=payload.provider, model=payload.model)
-        out["assist"] = {"ok": helped["accepted"], "summary": helped["summary"], "questions": helped["questions"]}
+        out["assist"] = {"ok": helped["accepted"], "summary": helped["summary"], "questions": helped["questions"],
+                         "looks": helped["looks"]}
         if helped["accepted"]:
             fixed = helped["graph"]
             out["changes"] += diff_changes(out["graph"], fixed, fix_id="assist", label="助手的修改")
