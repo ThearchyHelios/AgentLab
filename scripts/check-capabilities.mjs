@@ -2,7 +2,8 @@
 //
 // 守的是：
 //   - 能力列表标出读写效果，同步得出和治理后不一致时标出来；治理带 version 保存（乐观锁），409 时载入最新的、不覆盖；
-//   - 端点的认证头只显示掩码，提交掩码值表示保持原值；允许访问内网只有管理员能开；测试连接按环境发；
+//   - 端点的认证头只显示掩码，提交掩码值表示保持原值；名称空着、不合法、重名的那一行标红、不让保存；允许访问内网只有
+//     管理员能开；测试连接按环境发，照服务端的话写（2xx 才是成功，能连上但 404 是提醒）；
 //   - 关登录（默认）时所有人等同管理员：治理、退役、身份设置都能改；
 //   - 设置页的身份、通知、审计三个页签在，通知渠道的地址只显示主机名；
 //   - 能力字段的待审阅（D-i）复用数据目录的审阅队列：成批确认逐项带能力的治理版本；
@@ -155,7 +156,8 @@ async function open(path, { conflict = false, me = OFF } = {}) {
     const parts = url.pathname.split('/')
     if (parts[4] === 'test') {
       state.tests.push({ id: parts[3], env: url.searchParams.get('env') })
-      return json(route, { ok: true, status: 200, message: '' })
+      // 服务端按状态码照实说（capabilities/endpoints.probe）：2xx 才 ok；能连上但 404 的 reachable 为真、ok 为假
+      return json(route, state.probe ?? { ok: true, reachable: true, status: 200, message: '连接成功：基础地址返回 HTTP 200' })
     }
     if (req.method() === 'GET') return json(route, { items: state.endpoints })
     state.endpointWrites.push({ method: req.method(), body: req.postDataJSON?.() ?? null })
@@ -221,6 +223,20 @@ await section('能力治理：带 version 保存；别人刚改过时载入最�
   check('载入的是最新版本', await waitFor(page, async () => (await page.locator('[data-capability-editor="erp_pay"]').innerText()).includes('v2')))
 })
 
+// 查询能力由平台按登记的端点替它按幂等键去查：只能是同一端点上、绑定这个端点的只读能力。写记忆这类改平台自身状态的
+// 内置工具不是只读，也不是端点上的读取，不能出现在候选里
+await section('能力治理：查询能力只列同一端点上的只读能力', async () => {
+  const { page, state } = await open('/tools/capabilities/erp_pay')
+  for (const c of state.caps) if (['erp_pay', 'erp_query', 'mcp:crm/find'].includes(c.name)) c.endpoint_id = 'ep1'
+  state.caps.push(cap('memory_write', { system: 'builtin', effect_system: 'dynamic' }), cap('memory_recall', { system: 'builtin' }),
+    cap('crm_read', { system: 'crm', endpoint_id: 'ep2' }))
+  await page.reload({ waitUntil: 'networkidle' })
+  const ed = page.locator('[data-capability-editor="erp_pay"]')
+  await ed.waitFor()
+  const opts = await ed.locator('[data-capability-lookup] option').evaluateAll((els) => els.map((e) => e.value).filter(Boolean))
+  check('只列同一端点上的只读能力：写记忆、别的端点、MCP、没绑端点的都不列', opts.join(',') === 'erp_query', opts.join(','))
+})
+
 await section('端点：两个环境、认证头只显示掩码、测试连接', async () => {
   const { page, state } = await open('/tools/endpoints')
   const ep = page.locator('[data-endpoint="erp"]')
@@ -229,13 +245,37 @@ await section('端点：两个环境、认证头只显示掩码、测试连接',
   check('没有测试环境照实写', (await ep.locator('[data-endpoint-env="test"]').innerText()).includes('未配置'))
   await ep.locator('[data-endpoint-test="prod"]').click()
   check('测试连接按环境发', await waitFor(page, async () => state.tests.length === 1) && state.tests[0].env === 'prod', JSON.stringify(state.tests))
+  check('2xx：成功，照服务端的话写', await waitFor(page, async () =>
+    (await page.locator('[data-toast="ok"]').last().innerText().catch(() => '')).includes('连接成功：基础地址返回 HTTP 200')))
+  // 能连上但基础地址回 404：不是「连接成功（HTTP 404）」，是提醒，照服务端的话写清楚
+  state.probe = { ok: false, reachable: true, status: 404, message: '能连上，但对方系统上没有这个地址（HTTP 404）' }
+  await ep.locator('[data-endpoint-test="prod"]').click()
+  const warned = await waitFor(page, async () =>
+    (await page.locator('[data-toast="warn"]').last().innerText().catch(() => '')).includes('能连上，但对方系统上没有这个地址（HTTP 404）'))
+  check('能连上但 404：提醒，不说连接成功', warned
+    && !(await page.locator('[data-toast="warn"]').last().innerText()).includes('连接成功'))
   await ep.getByRole('button', { name: '编辑' }).click()
   const ed = page.locator('[data-endpoint-editor]')
   await ed.waitFor()
   check('关登录时（所有人等同管理员）允许访问内网可以开', await ed.locator('[data-endpoint-intranet="prod"]').isEnabled())
+  // 认证头名称空着不让存：存成 {"": ""} 之后这个环境的每个请求都发不出去（V2-04）
+  const prod = ed.locator('[data-endpoint-env-editor="prod"]')
+  await prod.getByRole('button', { name: '添加认证头' }).click()
+  check('新加一行、名称空着：标红并说明，不让保存', await prod.locator('[data-endpoint-header-error]').innerText().catch(() => '') === '请填写请求头名称，或删掉这一行'
+    && await page.locator('[data-endpoint-save]').isDisabled())
+  const names = prod.getByRole('textbox', { name: '请求头名称', exact: true })
+  await names.last().fill('X Token')
+  check('名称带空格：说明只能用哪些字符，仍不让保存', (await prod.locator('[data-endpoint-header-error]').innerText()).includes('只能用英文字母')
+    && await page.locator('[data-endpoint-save]').isDisabled())
+  await names.last().fill('authorization')
+  check('和已有的重名（不分大小写）：标出来', (await prod.locator('[data-endpoint-header-error]').innerText()) === '名称重复'
+    && await page.locator('[data-endpoint-save]').isDisabled())
+  await prod.getByRole('button', { name: '删除请求头 authorization', exact: true }).click()
+  check('删掉那一行：可以保存', await prod.locator('[data-endpoint-header-error]').count() === 0 && await page.locator('[data-endpoint-save]').isEnabled())
   await page.locator('[data-endpoint-save]').click()
   check('不改认证头：原样提交掩码值（服务端认作保持原值）', await waitFor(page, async () => state.endpointWrites.length === 1)
     && state.endpointWrites[0].body?.environments?.prod?.headers?.Authorization === 'Bearer ****1234'
+    && Object.keys(state.endpointWrites[0].body?.environments?.prod?.headers ?? {}).length === 1
     && state.endpointWrites[0].body?.version === 3, JSON.stringify(state.endpointWrites[0]?.body))
 })
 

@@ -6,7 +6,7 @@
 
 **写操作一律要 confirm: true 和界面看到的当前版本（expected_current_snapshot_id）**（7.7）：确认框是按那个版本
 写的后果，别人在这期间提交、启用过，锁内比对不上就 409 base_changed，不能照旧切过去。移除、作废还要写理由。
-署名取请求体的 signed_by，其次请求头 X-Actor，只原样记下（未认证）。
+署名：开了登录是登录的人；关登录时取请求体的 signed_by，其次请求头 X-Actor，只原样记下（未认证）。
 
 路径都是 /{source_id}/snapshots… 和 /{source_id}/imports/{import_id}/(manifest|remove|revoke-acceptance)，与
 datasources.py 的 /{source_id}/imports（GET）、/{source_id}/imports/{import_id}/purge-raw 不重叠；在 main.py 里
@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
 from app.api.datasources import _out
-from app.api.runs import actor_of
+from app.api.deps import signer_of
 from app.data import source_versions, table_versions
 from app.data.recipe_imports import ImportRefused
 from app.db.base import get_session
@@ -55,10 +55,8 @@ async def _body(request: Request) -> dict[str, Any]:
 
 
 def _signed(body: dict[str, Any], header: str | None) -> str | None:
-    raw = body.get("signed_by")
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()[:_SIGNED_MAX]
-    return actor_of(header)
+    """开了登录是登录的人；关登录时请求体的 signed_by 优先，其次 X-Actor（api/deps.signer_of）。"""
+    return signer_of(body.get("signed_by"), header, _SIGNED_MAX)
 
 
 async def _source(session: AsyncSession, source_id: str) -> DataSource:

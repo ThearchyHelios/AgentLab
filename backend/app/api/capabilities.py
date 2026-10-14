@@ -7,7 +7,8 @@ require_role("builder")，写接口在里面再要 admin。
 - 治理带 version 乐观锁：读到的是 v3、提交时已经是 v4 的回 409，界面重新读一遍再改；
 - 字段语义沿用数据目录「项」的状态和审阅（data/capability_review.py）：GET /capabilities/review-queue 列推断的项，
   POST /capabilities/review/batch 批量确认、驳回、撤销审阅（逐个能力按 version 乐观锁，写审计）；
-- 端点的认证头只回掩码，提交掩码值表示保持原值；allow_intranet 只有管理员能开（写接口本身只给管理员）。
+- 端点的认证头只回掩码，提交掩码值表示保持原值；头的名字和值不合法（空名字、带空格、换行、中文）的 422 说清是哪一项；
+  allow_intranet 只有管理员能开（写接口本身只给管理员）。
 """
 from __future__ import annotations
 
@@ -175,6 +176,8 @@ async def create_endpoint(payload: EndpointIn, session: AsyncSession = Depends(g
     ensure_role("admin")
     if (await session.execute(select(Endpoint.id).where(Endpoint.name == payload.name))).first():
         raise HTTPException(409, f"已存在名为「{payload.name}」的端点，请换一个名称")
+    if problem := ep.idempotency_header_problem(payload.idempotency_header):
+        raise HTTPException(422, problem)
     try:
         envs = ep.seal_environments(payload.environments, None)
     except ep.EndpointError as e:
@@ -202,6 +205,8 @@ async def update_endpoint(endpoint_id: str, payload: EndpointPatch, session: Asy
         if (await session.execute(select(Endpoint.id).where(Endpoint.name == payload.name))).first():
             raise HTTPException(409, f"已存在名为「{payload.name}」的端点，请换一个名称")
         values["name"] = payload.name
+    if payload.idempotency_header is not None and (problem := ep.idempotency_header_problem(payload.idempotency_header)):
+        raise HTTPException(422, problem)
     if payload.environments is not None:
         try:
             values["environments"] = ep.seal_environments(payload.environments, row.environments)

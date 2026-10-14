@@ -92,6 +92,17 @@ def actor_of(header: str | None) -> str | None:
     return decode_actor(header)
 
 
+def signer_of(given: Any, header: str | None, limit: int = 100) -> str | None:
+    """请求体里自带署名（signed_by）的留痕记谁：开了登录一律是认证过的用户名，请求体里填的不看——不然随手填一个名字就
+    盖掉了登录的人；关登录时请求体里填的优先（截到 limit 个字），其次 X-Actor，都只原样记下（未认证）。"""
+    principal = _principal.get()
+    if principal is not None and principal.mode != "off":
+        return principal.username
+    if isinstance(given, str) and given.strip():
+        return given.strip()[:limit]
+    return decode_actor(header)
+
+
 def current_principal() -> Principal:
     """这次请求的完整身份。关登录时：等同 admin、未认证，username 是中间件按 X-Actor 解出的自报署名；中间件没写
     （不在请求里，比如测试直接调函数、启动时的整理、调度循环）时同样等同 admin、未认证，username 为空。"""

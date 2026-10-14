@@ -21,9 +21,10 @@ import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } fro
 import type { HealthRecord } from '../lib/health'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
 import {
-  CATALOG_TEXT, PROFILE_TEXT, RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT,
-  VERSIONS_TEXT,
+  CATALOG_TEXT, MASK_BOUNDARY_TEXT, PROFILE_TEXT, RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL,
+  UPLOAD_SHAPE_LABEL, UPLOAD_TEXT, VERSIONS_TEXT,
 } from '../lib/terms'
+import { useLoginOn } from '../store/auth'
 import { useRunClock } from '../run/useRunClock'
 import { focusProfileField, ProfileSettingsDialog, ProfileSettingsSection } from './catalog/ProfileSettings'
 import type { ProfileErrorKey } from './catalog/ProfileSettings'
@@ -1505,13 +1506,15 @@ function useSchemaColumns(sourceId: string | undefined, active: boolean) {
 
 /**
  * 遮罩的列：列名一个个加成标签，可以从已探查的结构里挑，也可以直接输。
- * 用户拍板写明：在有身份体系之前，遮罩只减少暴露，不是安全边界
+ * 用户拍板写明遮罩的边界，口径同 README「哪些角色看得到原值」：对开了登录的使用者是边界；对搭建者、管理员，以及未开启
+ * 登录时的所有人，只减少暴露（MASK_BOUNDARY_TEXT）
  */
 function MaskColumnsInput({ id, sourceId, synced, value, onChange }: {
   id: string; sourceId?: string; synced: boolean; value: string[]; onChange: (v: string[]) => void
 }) {
   const [draft, setDraft] = useState('')
   const [touched, setTouched] = useState(false)
+  const loginOn = useLoginOn()
   const known = useSchemaColumns(sourceId, touched && synced)
   const add = (text: string) => {
     const next = maskList([...value, ...maskList(text)])
@@ -1569,8 +1572,8 @@ function MaskColumnsInput({ id, sourceId, synced, value, onChange }: {
       </datalist>
       <div id={`${id}-hint`} className="mt-1 space-y-0.5 text-2xs leading-relaxed text-faint">
         <div>证据面板展示查询结果的原始行时，这些列（不区分大小写）一律显示为「已遮罩」。{state}</div>
-        <div style={{ color: 'var(--st-waiting)' }} data-mask-boundary="">
-          遮罩只减少暴露，不是安全边界：完整快照仍可通过工件获取，在 SQL 中为列设置别名也可绕过
+        <div style={{ color: 'var(--st-waiting)' }} data-mask-boundary={loginOn ? 'login' : 'off'}>
+          {loginOn ? MASK_BOUNDARY_TEXT.loginOn : MASK_BOUNDARY_TEXT.loginOff}
         </div>
       </div>
     </div>

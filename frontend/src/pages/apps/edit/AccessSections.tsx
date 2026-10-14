@@ -6,7 +6,7 @@ import {
   CopyButton, DeleteButton, EmptyState, ErrorState, Field, SectionBar, Skeleton, Spinner, confirmDialog, toast,
 } from '../../../components/ui'
 import { PrincipalPicker, type Principal as Picked } from '../../../components/PrincipalPicker'
-import { APP_EDITOR_TEXT as T, GRANT_ROLE_LABEL, NOTIFY_TEXT } from '../../../lib/terms'
+import { APP_EDITOR_TEXT as T, GRANT_ROLE_HINT, GRANT_ROLE_LABEL, NOTIFY_TEXT } from '../../../lib/terms'
 import { useLoginOn } from '../../../store/auth'
 import type { AppGrant, GrantRole, NotifyChannelRow } from '../../../typesApp'
 import { applyAppOp } from './appOps'
@@ -109,7 +109,12 @@ function Grants() {
       {!items ? <Skeleton rows={3} /> : (
         <div className="space-y-3">
           {ROLES.map((role) => (
-            <div key={role} data-app-grant-role={role}>
+            // 每一档写明叫什么、管什么：三行选择器长得一样，不写就分不出哪一行是哪一档
+            <div key={role} className="rounded-lg border bg-panel px-3 py-2" data-app-grant-role={role}>
+              <div className="mb-1.5">
+                <div className="text-xs font-medium" data-app-grant-title="">{GRANT_ROLE_LABEL[role]}</div>
+                <p className="mt-0.5 text-2xs leading-relaxed text-faint">{GRANT_ROLE_HINT[role]}</p>
+              </div>
               <PrincipalPicker label={GRANT_ROLE_LABEL[role]} allowEveryone={role !== 'manage'}
                                value={items.filter((g) => g.role === role).map((g) => ({ kind: g.principal_kind, name: g.principal }))}
                                onChange={(v) => {

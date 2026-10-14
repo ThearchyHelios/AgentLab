@@ -7,18 +7,18 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { ArrowRight, Hourglass, Inbox, LayoutGrid, PencilLine, TriangleAlert } from 'lucide-react'
+import { ArrowRight, Hourglass, Inbox, LayoutGrid, PencilLine, Plus, TriangleAlert } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../api/client'
 import { EmptyState, Notice, PageHeader, Skeleton, StatusPill, TabPanel, Tabs, useTicker } from '../../components/ui'
 import { Due } from '../../run/TaskCard'
 import { useCatalog } from '../../store/catalog'
 import { useAtLeast, useLoginOn } from '../../store/auth'
-import { formatDateTime, formatRelative, formatSpan, parseServerTime } from '../../lib/format'
+import { formatDateTime, formatRelative, formatSpan, formatTime, parseServerTime } from '../../lib/format'
 import { runName } from '../../lib/terms'
 import { APP_HOME_TEXT, APP_TEXT, TASK_KIND_LABEL, TASK_STATUS_LABEL, TASK_TEXT } from '../../lib/termsApp'
 import type { AppSummary, InstanceRow, Task } from '../../typesApp'
-import { LoadError, appPath, useLoad } from './shared'
+import { LoadError, appPath, newAppPath, useLoad } from './shared'
 
 const TABS = ['inbox', 'apps', 'mine'] as const
 type Tab = (typeof TABS)[number]
@@ -28,10 +28,17 @@ export function AppsHome() {
   const [search, setSearch] = useSearchParams()
   const tab: Tab = (TABS as readonly string[]).includes(search.get('tab') ?? '') ? search.get('tab') as Tab : 'inbox'
   const loginOn = useLoginOn()
+  const builder = useAtLeast('builder')
   const inboxCount = useCatalog((s) => s.taskCounts?.mine ?? 0)
+  // 新建应用给搭建者及以上：是新建向导的起点，现在从已有的工作流开始（选一个已发布且未退役的版本 → 派生 → 进编辑器）
+  const create = builder && (
+    <Link to={newAppPath()} className="btn btn-primary btn-sm" title={APP_TEXT.createHint} data-app-create="">
+      <Plus size={12} aria-hidden /> {APP_TEXT.create}
+    </Link>
+  )
   return (
     <div className="flex h-full flex-col" data-apps-home={tab}>
-      <PageHeader icon={<LayoutGrid size={14} />} title={APP_TEXT.title} subtitle={APP_TEXT.hint} />
+      <PageHeader icon={<LayoutGrid size={14} />} title={APP_TEXT.title} subtitle={APP_TEXT.hint} actions={create || undefined} />
       <Tabs label={APP_TEXT.title} idPrefix={PREFIX} active={tab}
             tabs={TABS.map((key) => ({ key, label: APP_TEXT.tabs[key], badge: key === 'inbox' ? inboxCount : undefined }))}
             onChange={(key) => setSearch((prev) => { const next = new URLSearchParams(prev); next.set('tab', key); return next }, { replace: true })} />
@@ -100,10 +107,18 @@ function InboxRow({ task }: { task: Task }) {
   const now = useTicker(60_000)
   const created = parseServerTime(task.created_at)
   const age = created ? now - created.getTime() : 0
-  const voters = task.assignments.filter((a) => a.status !== 'withdrawn')
-  const agreed = voters.filter((a) => a.status === 'responded' && a.decision !== 'reject').length
+  // 会签进度按服务端给的（升级加派的那一份不算进会签人数）；老服务端没给的按没撤回的算
+  const voters = task.assignments.filter((a) => a.status !== 'withdrawn' && a.source !== 'escalation')
+  const progress = task.progress ?? {
+    agreed: voters.filter((a) => a.status === 'responded' && a.decision !== 'reject').length, need: voters.length, voters: voters.length,
+  }
   const pending = task.status === 'pending'
   const where = task.node_label
+  // 标题之外写所属实例、节点和开出的时间：同一个节点开出的待办标题一样（「报销审批：钱七」两单），靠它们分开
+  const meta = [
+    !task.app_id && task.workflow_name ? runName(task) : null, task.instance_title, where && TASK_TEXT.node(where),
+    created ? TASK_TEXT.createdAt(formatTime(created)) : null,
+  ].filter(Boolean)
   return (
     <li>
       <Link to={`/apps/inbox/${encodeURIComponent(task.id)}`} data-inbox-task={task.id} data-task-kind={task.kind}
@@ -111,12 +126,10 @@ function InboxRow({ task }: { task: Task }) {
         <span className="chip shrink-0">{TASK_KIND_LABEL[task.kind] ?? task.kind}</span>
         <span className="min-w-0 flex-1">
           <span className="block truncate text-fg">{task.title || TASK_TEXT.untitled}</span>
-          <span className="block truncate text-2xs text-faint">
-            {[!task.app_id && task.workflow_name ? runName(task) : null, where && TASK_TEXT.node(where)].filter(Boolean).join(' · ')}
-          </span>
+          <span className="block truncate text-2xs text-faint" data-inbox-meta="">{meta.join(' · ')}</span>
         </span>
-        {task.policy.kind !== 'any' && voters.length > 1 && (
-          <span className="chip shrink-0 tnum" data-inbox-signoffs="">{TASK_TEXT.signoffCount(agreed, voters.length)}</span>
+        {task.policy.kind !== 'any' && progress.voters > 1 && (
+          <span className="chip shrink-0 tnum" data-inbox-signoffs="">{TASK_TEXT.signoffCount(progress.agreed, progress.need)}</span>
         )}
         {task.escalation_level > 0 && (
           <span className="chip shrink-0" style={{ color: 'var(--st-waiting)' }} title={TASK_TEXT.escalatedHint}>
@@ -143,7 +156,14 @@ function AppsTab() {
   if (error && !data) return <LoadError error={error} onRetry={reload} />
   if (!data) return <Skeleton rows={4} />
   if (!data.items.length) {
-    return <EmptyState icon={<LayoutGrid size={28} />} title={APP_TEXT.noApps} body={builder ? APP_TEXT.noAppsBody : APP_TEXT.noAppsUser} />
+    return (
+      <EmptyState icon={<LayoutGrid size={28} />} title={APP_TEXT.noApps} body={builder ? APP_TEXT.noAppsBody : APP_TEXT.noAppsUser}
+                  action={builder ? (
+                    <Link to={newAppPath()} className="btn btn-sm" data-app-create-empty="">
+                      <Plus size={12} aria-hidden /> {APP_TEXT.create}
+                    </Link>
+                  ) : undefined} />
+    )
   }
   return (
     <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" data-app-list="">
@@ -223,7 +243,7 @@ function MineTab() {
                 <Hourglass size={10} aria-hidden /> {APP_TEXT.pendingTasks(r.pending_tasks)}
               </span>
             )}
-            <StatusPill status={r.status} short />
+            <StatusPill status={r.status_code ?? r.status} label={r.status_text} short />
             <span className="shrink-0 text-2xs text-faint" title={formatDateTime(r.created_at)}>{formatRelative(r.created_at)}</span>
           </Link>
         </li>

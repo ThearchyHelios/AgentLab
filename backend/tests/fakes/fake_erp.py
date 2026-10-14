@@ -74,7 +74,7 @@ def endpoint_request_for(erp: FakeErp, *, lookup_capability: str = "erp_lookup")
 
     async def fake(session: Any, capability: Any, args: dict[str, Any], *, environment: str,
                    idem_key: str | None = None, on_behalf: str | None = None, run_id: str | None = None,
-                   node_id: str | None = None) -> EndpointResult:
+                   node_id: str | None = None, tool: Any = None) -> EndpointResult:
         if environment == "simulated":
             return EndpointResult(status=None, body={"simulated": True}, environment="simulated")
         if capability.name == lookup_capability:

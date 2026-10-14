@@ -8,7 +8,9 @@
 //   - 核实待办：三个选项（已生效 + 外部单号 / 未生效重新发送 / 未生效放弃），没选不提交，选了已生效不填单号不提交；
 //     提交的结论和单号照约定交给待办接口；
 //   - 等外部系统（signal）：只有说明和关联键，没有批准、驳回；
-//   - 不是派给我的（can_respond 为假）：只读，写明原因；
+//   - 不是派给我的（can_respond 为假）：只读，写明原因；同意过、还在等别人的写「你已处理：同意」，不写「没有派给你」；
+//   - 升级之后：升级加派的那一份不算进会签人数，另写升级后的规则（升级给谁、其中一人说了算），名单里标「升级」；
+//     待办箱一行写所属实例，同标题的分得开；
 //   - 补充输入带表单的：本地校验，服务端 422 的错误挂回字段；
 //   - 关登录时签批人一行写本机署名；会签只记下一票（resolved 为假）时提示「等待其他人处理」。
 //
@@ -90,6 +92,23 @@ const TASKS = {
   readonly: {
     ...base, id: 'readonly', approval_id: 'ap4', kind: 'approve', title: '总监审批', can_respond: false,
     payload: { kind: 'human_node', message: '金额超过一万，需要总监批准' },
+  },
+  // 同意过、还在等别人：不能再回复，写「你已处理：同意」，不写「没有派给你」
+  voted: {
+    ...base, id: 'voted', approval_id: 'ap6', kind: 'approve', title: '财务会签（已同意）', policy: { kind: 'all' },
+    can_respond: false, my_response: { decision: 'approve', at: ago(600_000), verified: true },
+    assignments: [assignment('v1', 'zhangsan', 'responded', 'approve', { verified: true }), assignment('v2', 'wangwu', 'pending')],
+    payload: { kind: 'human_node', message: '钱七报销 1,280.5 元' },
+  },
+  // 超时升级之后：升级加派的那一份不算进会签人数（还是 0/2），另写升级给了谁、其中一人说了算
+  escalated: {
+    ...base, id: 'escalated', approval_id: 'ap7', kind: 'approve', title: '报销审批：钱七 · 300 元', policy: { kind: 'all' },
+    due_at: ago(600_000), escalation_level: 1, instance_title: '报销审批·钱七·第二笔', node_label: '财务会签',
+    assignments: [assignment('e1', 'zhangsan', 'pending'), assignment('e2', 'wangwu', 'pending'),
+      assignment('e3', 'zhaoliu', 'pending', null, { source: 'escalation' })],
+    progress: { policy: 'all', voters: 2, need: 2, agreed: 0, rejected: 0,
+      escalation: { slot: 'director', assignees: [{ kind: 'user', name: 'zhaoliu' }], decided: null, by: null } },
+    payload: { kind: 'human_node', message: '钱七报销 300 元' },
   },
   input: {
     ...base, id: 'input', approval_id: 'ap5', kind: 'input', title: '补填发票信息',
@@ -219,6 +238,27 @@ await section('等外部系统、只读', async () => {
   await page.locator('[data-task-readonly]').waitFor({ timeout: 15000 })
   check('不是派给我的：只读并写明', (await page.locator('[data-task-readonly]').innerText()).includes('没有派给你'))
   check('没有批准、驳回', (await page.locator('[data-task-approve], [data-task-reject]').count()) === 0)
+  await page.goto(`${WEB}/apps/inbox/voted`)
+  await page.locator('[data-task-readonly="responded"]').waitFor({ timeout: 15000 })
+  const voted = await page.locator('[data-task-readonly]').innerText()
+  check('同意过的人再打开：写「你已处理：同意」，不写「没有派给你」', voted.includes('你已处理：同意') && !voted.includes('没有派给你'), voted)
+})
+
+await section('升级之后的会签进度', async () => {
+  const page = await open({ writes: [] })
+  await page.goto(`${WEB}/apps/inbox/escalated`)
+  const s = page.locator('[data-signoffs]')
+  await s.waitFor({ timeout: 15000 })
+  const text = await s.innerText()
+  check('升级加派的不算进会签人数：0/2，不是 0/3', text.includes('0/2 已同意') && (await s.getAttribute('data-signoffs-need')) === '2', text)
+  check('另写升级后的规则：升级给谁、其中一人说了算',
+    (await s.locator('[data-signoffs-escalation="open"]').innerText()).includes('已升级给岗位「director」：其中任一人同意即通过'))
+  check('升级加派的那一份在名单里标「升级」', (await s.locator('li', { hasText: 'zhaoliu' }).innerText()).includes('升级'))
+  await page.goto(`${WEB}/apps?tab=inbox`)
+  const row = page.locator('[data-inbox-task="escalated"]')
+  await row.waitFor({ timeout: 15000 })
+  check('待办箱里也是 0/2', (await row.locator('[data-inbox-signoffs]').innerText()).includes('0/2 已同意'))
+  check('待办一行写所属实例（同标题的分得开）', (await row.locator('[data-inbox-meta]').innerText()).includes('报销审批·钱七·第二笔'))
 })
 
 await section('补充输入：表单校验、422 挂回字段', async () => {

@@ -7,7 +7,9 @@
 - 带幂等头；service_on_behalf 带 EdDSA 身份断言，公钥在 /api/auth/jwks；
 - 超时 → 结果未知；连接没建立 → 确定的失败；
 - 声明了表格的读取落成查询快照同一个形状的端点快照，台账照 query 处理；
-- 运行里的写入不从自定义工具直接发；
+- 运行里的写入不从自定义工具直接发；工具页试运行、工具库执行写入能力一律演练（不发送，交回将要发送的请求）；
+- 试运行、测试连接按 HTTP 状态照实说：2xx 才算成功，能连上但 404 / 401 和连不上分开说；
+- 认证头名字为空、不合法的存不进去（422 说人话），存量的坏头发请求时照实说是哪一项，不是 LocalProtocolError；
 - 自定义工具请求头、MCP env 和请求头：加密存、掩码回、启动时存量明文加密一遍（幂等）；MCP http 地址过 SSRF 检查或绑定端点。
 """
 from __future__ import annotations
@@ -39,11 +41,15 @@ class Recorder:
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.raise_: Exception | None = None
+        #: 按路径改回的状态码（测 4xx、404 时用）
+        self.status: dict[str, int] = {}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if self.raise_ is not None:
             raise self.raise_
+        if (code := self.status.get(request.url.path)) is not None:
+            return httpx.Response(code, json={"error": "nope"})
         if request.url.path.startswith("/orders"):
             return httpx.Response(200, json={"items": [{"id": "A1", "amount": 12.5, "phone": "13900000001"},
                                                        {"id": "A2", "amount": 7, "phone": "13900000002"}]})
@@ -277,3 +283,124 @@ async def test_evidence_panel_masks_an_endpoint_snapshot_by_column():
             "rows": [["A1", "13800000000", 12]], "mask_columns": ["电话"]}
     sets = await _mask_sets(snap, "erp", _Masks())
     assert sets.hidden == {"电话"} and sets.sure == {"电话"} and not sets.gone
+
+
+async def test_header_names_are_checked_when_saved_and_when_sent(erp):
+    c, endpoint = erp["client"], erp["endpoint"]
+    for headers, words in (({"": ""}, "名称不能为空"), ({"X Token": "1"}, "不合法"), ({"X-Token": "第一\n第二"}, "不能换行")):
+        r = await c.patch(f"/api/endpoints/{endpoint['id']}", json={"version": 1, "environments": {
+            "prod": {"base_url": BASE, "headers": headers, "allow_intranet": True}}})
+        assert r.status_code == 422 and "生产环境的认证头有误" in r.json()["detail"] and words in r.json()["detail"], r.text
+    r = await c.post("/api/endpoints", json={"name": "erp2", "idempotency_header": "Idem Key", "environments": {
+        "prod": {"base_url": BASE}}})
+    assert r.status_code == 422 and "幂等请求头" in r.json()["detail"]
+    # 加校验之前存进去的 {"": ""}：发请求、测连接都照实说是认证头的事，请求没有发出，也不当成结果未知
+    async with SessionLocal() as s:
+        row = await s.get(Endpoint, endpoint["id"])
+        row.environments = {"prod": {**row.environments["prod"], "headers": {"": ""}}}
+        await s.commit()
+        before = len(erp["recorder"].requests)
+        cap = await s.get(Capability, "erp_pay")
+        result = await ep.endpoint_request(s, cap, {"amount": 1}, environment="prod", idem_key="k:9")
+    assert not result.unknown and "认证头有误" in result.error and "名称不能为空" in result.error
+    probe = (await c.post(f"/api/endpoints/{endpoint['id']}/test?env=prod")).json()
+    assert probe["ok"] is False and probe["reachable"] is False and "认证头有误" in probe["message"]
+    assert len(erp["recorder"].requests) == before, "坏头的请求一个都没发"
+
+
+async def test_probe_tells_reachable_apart_from_ok(erp):
+    c, endpoint, recorder = erp["client"], erp["endpoint"], erp["recorder"]
+    ok = (await c.post(f"/api/endpoints/{endpoint['id']}/test?env=prod")).json()
+    assert ok["ok"] is True and ok["status"] == 201 and "连接成功" in ok["message"]
+    recorder.status["/"] = 404
+    missing = (await c.post(f"/api/endpoints/{endpoint['id']}/test?env=prod")).json()
+    assert (missing["ok"], missing["reachable"], missing["status"]) == (False, True, 404)
+    assert "能连上" in missing["message"] and "404" in missing["message"] and "成功" not in missing["message"], \
+        "能连上但路径不存在，不能说成连接成功"
+    recorder.status["/"] = 401
+    denied = (await c.post(f"/api/endpoints/{endpoint['id']}/test?env=prod")).json()
+    assert denied["ok"] is False and "认证" in denied["message"]
+    recorder.raise_ = httpx.ConnectError("refused")
+    down = (await c.post(f"/api/endpoints/{endpoint['id']}/test?env=prod")).json()
+    assert (down["ok"], down["reachable"]) == (False, False) and "无法连接" in down["message"]
+
+
+async def test_trying_a_write_capability_rehearses_instead_of_sending(erp):
+    c, endpoint, recorder = erp["client"], erp["endpoint"], erp["recorder"]
+    tool = next(t for t in (await c.get("/api/custom-tools")).json() if t["name"] == "erp_pay")
+    before = len(recorder.requests)
+    trial = (await c.post(f"/api/custom-tools/{tool['id']}/test", json={"args": {"amount": 3}})).json()
+    assert trial["ok"] is True and trial["rehearsal"] is True, trial
+    req = trial["result"]["request"]
+    assert (req["method"], req["url"], req["body"]) == ("POST", f"{BASE}/payments", {"amount": 3})
+    assert trial["result"]["environment"] == "prod", "端点没有测试环境：写正式运行要发往的生产环境"
+    assert req["headers"] == ["Authorization", "Idempotency-Key"], "只交回请求头的名字"
+    assert "prod-secret-token" not in json.dumps(trial, ensure_ascii=False)
+    draft = (await c.post("/api/custom-tools/test", json={**tool, "args": {"amount": 3}})).json()
+    assert draft["rehearsal"] is True, "没保存的草稿同样只演练"
+    # 工具库执行：同样演练，没有副作用也就不先要确认
+    run = await c.post("/api/tools/erp_pay/run", json={"args": {"amount": 3}})
+    assert run.status_code == 200 and run.json()["rehearsal"] is True and run.json()["result"]["request"]["method"] == "POST"
+    assert len(recorder.requests) == before, "写入能力在工具页一个请求都没发"
+    # 读取照旧真的发，对方回 4xx 时照实说失败和状态码
+    recorder.status["/orders"] = 400
+    read = (await c.post("/api/tools/erp_orders/run?confirm=true", json={"args": {"q": "x"}})).json()
+    assert read["ok"] is False and "HTTP 400" in read["error"] and "nope" in read["detail"]
+    orders = next(t for t in (await c.get("/api/custom-tools")).json() if t["name"] == "erp_orders")
+    tried = (await c.post(f"/api/custom-tools/{orders['id']}/test", json={"args": {"q": "x"}})).json()
+    assert tried["ok"] is False and "HTTP 400" in tried["error"] and not tried.get("rehearsal")
+    assert len(recorder.requests) == before + 2
+
+
+async def test_a_draft_trial_sends_the_draft_not_the_saved_tool(erp):
+    """工具页试运行的草稿按草稿的配置拼请求，读写按已保存的治理和草稿的方法里更严的一个认。以前按名字找已保存的那一版：
+    把已保存的 GET /orders 改成草稿 POST /payments 去试，真发出去的是 GET /orders，结果写「成功」。"""
+    c, recorder = erp["client"], erp["recorder"]
+    orders = next(t for t in (await c.get("/api/custom-tools")).json() if t["name"] == "erp_orders")
+    before = len(recorder.requests)
+    post = {**orders, "config": {**orders["config"], "method": "POST", "path": "/payments", "query": {}}}
+    trial = (await c.post("/api/custom-tools/test", json={**post, "args": {"q": "x"}})).json()
+    assert trial["ok"] is True and trial["rehearsal"] is True, trial
+    req = trial["result"]["request"]
+    assert (req["method"], req["url"]) == ("POST", f"{BASE}/payments"), req
+    assert len(recorder.requests) == before, "草稿改成了写入：已保存的那一版是只读也只演练，一个请求都不发"
+
+    # 草稿只改了路径和查询参数（还是读取）：真的发，发的是草稿的
+    moved = {**orders, "config": {**orders["config"], "path": "/orders/open", "query": {"status": "{{ q }}"}}}
+    read = (await c.post("/api/custom-tools/test", json={**moved, "args": {"q": "x"}})).json()
+    assert read["ok"] is True and not read.get("rehearsal"), read
+    [sent] = recorder.requests[before:]
+    assert (sent.method, sent.url.path, dict(sent.url.params)) == ("GET", "/orders/open", {"status": "x"})
+
+    # 还没保存过的绑定端点的读取：同样按草稿发（以前按名字找不到已保存的工具，报没有绑定端点）
+    fresh = (await c.post("/api/custom-tools/test", json={**moved, "name": "erp_orders_new", "args": {"q": "y"}})).json()
+    assert fresh["ok"] is True, fresh
+    assert recorder.requests[-1].url.path == "/orders/open" and len(recorder.requests) == before + 2
+
+    # 保存过的那一行和登记对得上：照治理的走（管理员把 POST 的查询接口治理成只读，是他的决定）
+    async with SessionLocal() as s:
+        from app.tools.custom import _effect_of
+
+        pay_cap = await s.get(Capability, "erp_pay")
+        pay = (await s.execute(select(CustomTool).where(CustomTool.name == "erp_pay"))).scalar_one()
+        pay_cap.effect = "read"
+        assert _effect_of(pay, pay_cap) == "read"
+        draft = CustomTool(name="erp_pay", kind="http", config={**pay.config, "method": "GET"})
+        assert _effect_of(draft, pay_cap) == "read"
+        pay_cap.effect = None
+        assert _effect_of(draft, pay_cap) == "write", "草稿改成了 GET：已保存的那一版是写入，取更严的"
+        await s.rollback()
+
+
+async def test_custom_tool_header_names_are_checked():
+    c = auth_env.client()
+    r = await c.post("/api/custom-tools", json={"name": "bad_headers", "kind": "http", "parameters": {},
+                                                "config": {"url": "https://crm.example.com", "headers": {"": "x"}}})
+    assert r.status_code == 422 and "名称不能为空" in r.json()["detail"]
+    r = await c.post("/api/custom-tools", json={"name": "bad_headers", "kind": "http", "parameters": {},
+                                                "config": {"url": "https://crm.example.com",
+                                                           "headers": {"Authorization": "Bearer {{ 令牌 }}"}}})
+    assert r.status_code == 201, "值里的模板不查"
+    async with SessionLocal() as s:
+        await s.execute(delete(CustomTool).where(CustomTool.name == "bad_headers"))
+        await s.commit()

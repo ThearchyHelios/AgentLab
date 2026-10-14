@@ -100,7 +100,10 @@ export function MetricBlock({ node }: NodeProps) {
   const label = str(node.props.label) || str(data.name) || node.id
   const state = blockState(node)
   const text = str(data.text)
-  const unit = str(node.props.unit) || str(data.unit)
+  // 单位只写一处。口径卡写了单位的，服务端交来的字已经带着它（render_metric：「18,218.54元」），data.unit 只是说明是哪个
+  // 单位，不再在下面另写一行；口径卡没写单位（data.unit 是空串）、绑定单元格（字不带单位，render_cell）的，写搭建者在
+  // 属性里填的单位
+  const unit = str(data.unit) ? '' : str(node.props.unit)
   return (
     <div className="rounded-lg border bg-panel p-3" data-component="metric" data-metric-state={str(data.state) || 'ok'}>
       <div className="text-2xs text-faint">{label}</div>

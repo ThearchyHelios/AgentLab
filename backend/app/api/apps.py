@@ -691,7 +691,7 @@ async def list_instances(app_id: str, who: str = "mine", entry: str | None = Non
 async def get_instance(app_id: str, run_id: str, session: AsyncSession = Depends(get_session),
                        x_actor: str | None = Header(default=None)) -> dict[str, Any]:
     """一个实例：列表里的那一行，加上实例页的视图模型（应用里叫 instance 的页；没有就给一页默认的）。"""
-    from app.apps.resolve import ViewRefused, instance_page, instance_row, pending_counts, resolve_page
+    from app.apps.resolve import ViewRefused, instance_page, instance_rows, resolve_page
 
     principal = _principal(x_actor)
     app, role = await _app(session, app_id, principal, "use")
@@ -715,8 +715,7 @@ async def get_instance(app_id: str, run_id: str, session: AsyncSession = Depends
                                   version=version, actor=actor_of(x_actor))
     except ViewRefused as e:
         raise _view_refused(e) from e
-    counts = await pending_counts(session, [run.id])
-    return {**instance_row(run, counts.get(run.id, 0)), "view": view}
+    return {**(await instance_rows(session, [run]))[0], "view": view}
 
 
 class RefreshIn(BaseModel):

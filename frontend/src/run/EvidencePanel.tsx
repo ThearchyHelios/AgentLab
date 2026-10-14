@@ -22,12 +22,13 @@ import {
   ABSENCE_CLAIM_TEXT, CHALLENGE_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MASKED_CELL_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, RUN_SQL_CHECK_TEXT,
   SQL_CHECK_TEXT, nodeTypeLabel,
 } from '../lib/terms'
+import { useAtLeast, useLoginOn } from '../store/auth'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
   ApprovalReport, EvidenceBlock, EvidenceChallengeVerdicts, EvidenceDocData, EvidenceDualCheck, EvidenceInput, EvidenceMerge,
   EvidenceOnDemand, EvidenceQuoteSource, EvidenceSeal, EvidenceSegment, EvidenceSegmentDetail, EvidenceStep, EvidenceUnit,
-  EvidenceUnitChallenge, EvidenceVerdict, EvidenceViolation,
+  EvidenceUnitChallenge, EvidenceUntraced, EvidenceVerdict, EvidenceViolation,
 } from '../types'
 import { ArtifactViewer, ResultTable } from './AssistantStream'
 import { ChallengeSummary, ClaimVerdictPending, type ClaimWait } from './ChallengeSummary'
@@ -370,8 +371,12 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
   const whatifMetric = entry?.kind === 'metric' ? entry.locator?.metric : metricStep?.metric
   const whatif = useWhatIfDraft(runId && isMetric && whatifCard && whatifMetric
     ? [runId, report ?? '', whatifCard, whatifMetric].join('\u0000') : '')
-  // 证据链回来了、正文就是封存的那一份才给推演：链是别的报告的，推演出来的数也对不上正文
-  const whatifReady = !!runId && !docIssue && !!metricStep && !!whatifCard && !!whatifMetric
+  // 证据链回来了、正文就是封存的那一份才给推演：链是别的报告的，推演出来的数也对不上正文。推演只给搭建者及以上（接口
+  // 同样只给，main.py 的 whatif 路由）：开了登录的使用者看不到这个按钮，不让人点了再被拒
+  const builder = useAtLeast('builder')
+  // 开了登录的使用者：遮罩对他是边界（原值不给），面板底下的遮罩说明换一句
+  const maskedForMe = useLoginOn() && !builder
+  const whatifReady = builder && !!runId && !docIssue && !!metricStep && !!whatifCard && !!whatifMetric
   const whatifOpen = whatif.open && whatifReady
   const whatifId = `${panelId}-whatif`
   // 推演的请求和答复也放在这一层：查询步骤里勾行的表格底下要带着推演结果，和推演区是同一份
@@ -549,9 +554,10 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
       )}
 
       {!!masked.length && (
-        // 用户拍板：界面上写明遮罩不是安全边界。放在最后，读完证据再看到这句
-        <p className="border-t pt-2 text-2xs leading-relaxed text-faint" data-ev-mask-note="">
-          {EVIDENCE_TEXT.maskNote(masked)}
+        // 用户拍板：界面上写明遮罩的边界。放在最后，读完证据再看到这句。对开了登录的使用者遮罩是边界（原值不给），
+        // 对搭建者、管理员和未开启登录时只减少暴露——同一句话不能对两种人都说
+        <p className="border-t pt-2 text-2xs leading-relaxed text-faint" data-ev-mask-note={maskedForMe ? 'user' : ''}>
+          {maskedForMe ? EVIDENCE_TEXT.maskNoteUser(masked) : EVIDENCE_TEXT.maskNote(masked)}
         </p>
       )}
     </>
@@ -762,7 +768,11 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, answered, pend
   // 片段接口说这句封存后追加的判定早于当前的裁判规则（旧取值、改造前判的）：照常给按钮，旧判定旁边注明「按旧规则判定」。
   // 这一页里已经按当前规则重判过（眼前的判定不再是接口答的那一条）就不算了；重判没判成时答复交回的还是那条旧判定
   const outdated = known?.reason === 'outdated' && !!known.available && isJudged(verdict) && sameVerdict(verdict, answered)
-  const canAsk = !!runId && (outdated || (!isJudged(verdict) && (known ? !!known.available : eligible && explore === true)))
+  // 请模型判断（POST …/evidence/judge）只给搭建者及以上（api/deps 的 evidence_scope：使用者只读）：使用者不给按钮，
+  // 判过的判定照常看
+  const builder = useAtLeast('builder')
+  const canAsk = builder && !!runId
+    && (outdated || (!isJudged(verdict) && (known ? !!known.available : eligible && explore === true)))
   // 探索运行里暂时判不了（还没跑完封存、封存被改过、升级前的运行）：照接口的原话说为什么没有按钮
   const blocked = known && !known.available && BLOCKED.has(known.reason ?? '') ? known.message || '' : ''
   // 这一次按需裁判的答复里没有这一句的判定：接口说了为什么（跳过了、触顶）就照说
@@ -872,7 +882,7 @@ function JudgePart({ doc, unit, block, runId, runClass, onDemand, answered, pend
           {how && (
             <p className="mt-0.5 text-2xs text-dim" data-ev-judge-how="">
               {how}
-              {pointsToSettings(how) && (
+              {pointsToSettings(how) && builder && (
                 <> <Link to="/settings/prefs" className="text-[var(--accent)] underline-offset-2 hover:underline" data-ev-judge-settings="">去设置</Link></>
               )}
             </p>
@@ -1323,6 +1333,12 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
   const sqlReason = step?.sql_check_reason || entry?.sql_check_reason || EVIDENCE_TEXT.sqlCheckFallback
   // 期 4：双盲复算复核过这个指标才有
   const dualCheck = dualCheckOf(step)
+  // 输入追没追到原始数据：和「有出处」（确定性复算一致）分开说。卡上没有输入、老服务端没给时不说
+  const untraced = Array.isArray(step?.untraced) ? step.untraced.filter((u) => u && typeof u === 'object') : null
+  const stopAt = (u: EvidenceUntraced) => (u.node_id
+    ? EVIDENCE_TEXT.originStop(u.path,
+      EVIDENCE_TEXT.originNode(host.nodeLabel?.(u.node_id) || u.label || u.node_id, u.type ? nodeTypeLabel(u.type) : ''))
+    : EVIDENCE_TEXT.originUnknown(u.path))
 
   return (
     <Part title={EVIDENCE_TEXT.metric} data-ev-metric="">
@@ -1339,6 +1355,12 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
           <span className="chip" data-ev-sql-check-failed="" title={sqlReason}
                 style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>
             {EVIDENCE_TEXT.sqlCheckFailed}
+          </span>
+        )}
+        {!!untraced?.length && (
+          <span className="chip" data-ev-untraced-chip="" title={EVIDENCE_TEXT.originChipHint}
+                style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>
+            {EVIDENCE_TEXT.originChip}
           </span>
         )}
         {whatif && <WhatIfToggle open={whatif.open} onToggle={whatif.onToggle} controls={whatif.controls} />}
@@ -1400,6 +1422,21 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
                 : step.recompute_ok ? EVIDENCE_TEXT.recomputeOk : EVIDENCE_TEXT.recomputeBad}
             </dd>
           </div>
+          {untraced && (
+            <div>
+              <dt className="text-2xs text-faint">{EVIDENCE_TEXT.origin}</dt>
+              <dd data-ev-origin={untraced.length ? 'untraced' : 'traced'}
+                  style={{ color: untraced.length ? 'var(--st-waiting)' : 'var(--st-done)' }}>
+                {untraced.length ? (
+                  <ul className="space-y-0.5">
+                    {untraced.map((u, i) => (
+                      <li key={`${u.path}-${i}`} data-ev-origin-stop={u.node_id ?? ''}>{stopAt(u)}</li>
+                    ))}
+                  </ul>
+                ) : EVIDENCE_TEXT.originTraced}
+              </dd>
+            </div>
+          )}
         </dl>
       ) : resolved && (
         <p className="mt-1.5 text-2xs text-faint" data-ev-chain={pending ? 'loading' : 'missing'}>
@@ -1488,7 +1525,9 @@ function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) 
   const cut = !missing && input.truncated === true
   const node = input.node_id ? host.nodeLabel?.(input.node_id) || input.node_id : ''
   const via = input.via ? VIA_TEXT[input.via] ?? nodeTypeLabel(input.via) : ''
-  const from = [node && `来自节点「${node}」`, via && `（${via}）`, input.role && ` · ${ROLE_TEXT[input.role] ?? input.role}`,
+  const through = throughText(input, host.nodeLabel)
+  const from = [node && `来自节点「${node}」`, via && `（${via}）`, through && ` · ${through}`,
+    input.role && ` · ${ROLE_TEXT[input.role] ?? input.role}`,
     cut && ` · ${EVIDENCE_TEXT.inputTruncated}`,
     masked && ` · ${unverified ? EVIDENCE_TEXT.unverifiedInput(unverified) : EVIDENCE_TEXT.maskedInput}`].filter(Boolean).join('')
   const style = missing || cut ? { color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' } : { color: 'var(--text)' }
@@ -1523,6 +1562,12 @@ function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) 
 
 /** 取值来源的方式：能追到快照的两种写中文，其余是产出节点的类型 */
 const VIA_TEXT: Record<string, string> = { agent_field: 'Agent 字段', tool_cell: '单元格取数' }
+
+/** 按位置取的格穿过了原样解析查询结果的整形节点：「经「解析查询结果」原样解析」。cell() 取的格、别的输入没有 */
+function throughText(input: EvidenceInput, nodeLabel?: (id: string) => string | undefined): string {
+  if (!input.through) return ''
+  return EVIDENCE_TEXT.through(nodeLabel?.(input.through) || input.through_label || input.through)
+}
 /** 代码节点输入的角色 */
 const ROLE_TEXT: Record<string, string> = { source: '取数', compute: '计算' }
 
@@ -1539,6 +1584,7 @@ const TONE: Record<SourceTone, { color: string; border: string; background?: str
  * 路径、从哪个节点哪一格来、核对结果。能对到查询步骤的给「看查询 Qn」
  */
 function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (input: EvidenceInput) => InputLink }) {
+  const host = useEvidenceHost()
   return (
     <Part title={EVIDENCE_TEXT.sources} data-ev-sources="">
       <ul className="space-y-1.5">
@@ -1551,6 +1597,7 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
           const alias = link?.alias || inp.query || (typeof inp.cell === 'string' ? inp.cell.split('.')[0] : '')
           const where = [
             inp.field && (inp.via === 'agent_field' ? `字段 ${inp.field}` : inp.field),
+            throughText(inp, host.nodeLabel),
             [alias, locatorText(inp.locator)].filter(Boolean).join(' · '),
           ].filter(Boolean).join(' · ')
           return (

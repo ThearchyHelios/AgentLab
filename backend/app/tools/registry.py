@@ -59,6 +59,9 @@ class ToolSpec:
     dangerous: bool = False
     # 函数第一个参数是否接收 ToolContext
     needs_context: bool = True
+    # 改平台自身的状态（写记忆）：不危险到默认要人确认，但也不是只读——能力登记里不能记成只读（只读的才能正式运行免审批、
+    # 才能当写入的查询能力），见 capabilities.registry._discover
+    writes_state: bool = False
 
     def json_schema(self) -> dict[str, Any]:
         return self.args_schema.model_json_schema()
@@ -75,6 +78,7 @@ def register(
     *,
     dangerous: bool = False,
     needs_context: bool = True,
+    writes_state: bool = False,
 ) -> Callable[[ToolFunc], ToolFunc]:
     def deco(func: ToolFunc) -> ToolFunc:
         _REGISTRY[name] = ToolSpec(
@@ -85,6 +89,7 @@ def register(
             func=func,
             dangerous=dangerous,
             needs_context=needs_context,
+            writes_state=writes_state,
         )
         return func
 

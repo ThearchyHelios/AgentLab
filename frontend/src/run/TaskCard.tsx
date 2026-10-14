@@ -36,7 +36,9 @@ import {
   TASK_TEXT, TOOL_TRUST_TEXT, runName,
 } from '../lib/terms'
 import type { Approval, ApprovalReport } from '../types'
-import type { FormError, Task, TaskAssignment, TaskKind, TaskRespond } from '../typesApp'
+import type {
+  FormError, Task, TaskAssignment, TaskKind, TaskMyResponse, TaskProgress, TaskRespond,
+} from '../typesApp'
 import { Markdown } from './Markdown'
 import { ApprovalReports, ApprovalRunClass } from './ApprovalReport'
 import { ChallengeSummary } from './ChallengeSummary'
@@ -256,7 +258,9 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
         </>
       )}
       {pending && !task.can_respond && kind !== 'signal' && (
-        <div className="mt-1 text-2xs leading-relaxed text-dim" data-task-readonly="">{TASK_TEXT.cannotRespond}</div>
+        task.my_response
+          ? <div className="mt-1 text-2xs leading-relaxed text-dim" data-task-readonly="responded">{respondedText(task.my_response)}</div>
+          : <div className="mt-1 text-2xs leading-relaxed text-dim" data-task-readonly="">{TASK_TEXT.cannotRespond}</div>
       )}
 
       {canAct && kind !== 'signal' && !compact && <Signer />}
@@ -328,8 +332,8 @@ export function Due({ dueAt, now }: { dueAt: string | null; now: number }) {
   )
 }
 
-/** 处理过的：谁、什么时候、结果 */
-function Resolved({ task }: { task: Task }) {
+/** 处理过的：谁、什么时候、结果（实例页上不是处理人的人看这一步的状态也用它） */
+export function Resolved({ task }: { task: Pick<Task, 'status' | 'outcome' | 'resolved_by' | 'resolved_at'> }) {
   const decision = typeof task.outcome?.decision === 'string' ? TASK_TEXT.decision[task.outcome.decision] ?? task.outcome.decision : null
   const at = task.resolved_at ? formatDateTime(task.resolved_at) : ''
   return (
@@ -343,35 +347,81 @@ function Resolved({ task }: { task: Task }) {
   )
 }
 
+/** 「你已处理：同意（01:06）」：处理过的人再打开、还在等别人时，不说「没有派给你」 */
+export function respondedText(mine: TaskMyResponse): string {
+  const decision = TASK_TEXT.decision[mine.decision ?? ''] ?? TASK_TEXT.assignmentStatus.responded
+  return TASK_TEXT.youResponded(decision, mine.at ? formatTime(mine.at) : '')
+}
+
 // ---------------------------------------------------------------- 会签进度
 
 const agreed = (a: TaskAssignment) => a.status === 'responded' && a.decision !== 'reject'
 const rejected = (a: TaskAssignment) => a.status === 'responded' && a.decision === 'reject'
+const escalated = (a: TaskAssignment) => a.source === 'escalation'
 
-function assigneeName(a: TaskAssignment): string {
+/** 服务端没给进度时（由审批记录拼出来的待办）按派给谁算：口径同服务端，升级加派的不算进会签人数 */
+function progressOf(task: Pick<Task, 'progress' | 'policy' | 'assignments'>): TaskProgress {
+  if (task.progress) return task.progress
+  const own = task.assignments.filter((a) => !escalated(a) && a.status !== 'withdrawn')
+  const voters = own.length
+  const need = task.policy.kind === 'quorum' ? Math.min(task.policy.m, voters) : task.policy.kind === 'all' ? voters : 1
+  return { policy: task.policy.kind, voters, need, agreed: own.filter(agreed).length, rejected: own.filter(rejected).length }
+}
+
+/** 升级之后的规则：升级给谁、其中一人说了算；有人定了就写谁定了什么 */
+function escalationText(p: TaskProgress): string | null {
+  const e = p.escalation
+  if (!e) return null
+  if (e.decided && e.by) return TASK_TEXT.escalationDecided(e.by, TASK_TEXT.decision[e.decided] ?? e.decided)
+  const who = e.slot ? TASK_TEXT.slot(e.slot) : e.assignees.map((a) => a.name || TASK_TEXT.assignee.anyone).join('、')
+  return TASK_TEXT.escalationRule(who)
+}
+
+export function assigneeName(a: Pick<TaskAssignment, 'principal_kind' | 'principal' | 'responded_by'>): string {
   if (a.principal_kind === 'anyone') return TASK_TEXT.assignee.anyone
   if (a.principal_kind === 'hook') return TASK_TEXT.assignee.hook
   if (a.principal_kind === 'group') return a.responded_by ? `${a.responded_by}（${TASK_TEXT.assignee.group(a.principal)}）` : TASK_TEXT.assignee.group(a.principal)
   return a.principal
 }
 
-/** 会签：策略、几人同意了、每个人的回复。撤回的（改派、升级、已判定）列在最后、淡显 */
-export function Signoffs({ task }: { task: Task }) {
-  const live = task.assignments.filter((a) => a.status !== 'withdrawn')
-  const ok = live.filter(agreed).length
-  const no = live.filter(rejected).length
+/** 会签进度的那一行（几人同意了、几人驳回、规则），升级了另写一行升级后的规则。不列名单：实例页上只看状态的人用它 */
+export function SignoffHead({ task }: { task: Pick<Task, 'progress' | 'policy' | 'assignments'> }) {
+  const p = progressOf(task)
   const policy = task.policy.kind === 'all' ? TASK_TEXT.policy.all
     : task.policy.kind === 'quorum' ? TASK_TEXT.policy.quorum(task.policy.m) : TASK_TEXT.policy.any
-  const need = task.policy.kind === 'quorum' ? task.policy.m : task.policy.kind === 'all' ? live.length : 1
-  const ordered = [...live, ...task.assignments.filter((a) => a.status === 'withdrawn')]
+  const up = escalationText(p)
   return (
-    <div className="mb-2 rounded border bg-bg p-2" data-signoffs="" data-signoffs-agreed={ok} data-signoffs-need={need}>
-      <div className="mb-1 flex flex-wrap items-center gap-x-2 text-2xs">
+    <>
+      <div className="mb-1 flex flex-wrap items-center gap-x-2 text-2xs" data-signoff-head="">
         <span className="font-medium text-faint">{TASK_TEXT.signoffs}</span>
-        <span className="tnum text-fg">{TASK_TEXT.signoffCount(ok, need)}</span>
-        {no > 0 && <span className="tnum" style={{ color: 'var(--err)' }}>{TASK_TEXT.signoffRejected(no)}</span>}
+        <span className="tnum text-fg">{TASK_TEXT.signoffCount(p.agreed, p.need)}</span>
+        {p.rejected > 0 && <span className="tnum" style={{ color: 'var(--err)' }}>{TASK_TEXT.signoffRejected(p.rejected)}</span>}
         <span className="text-dim">{policy}</span>
       </div>
+      {up && (
+        <div className="mb-1 flex items-start gap-1 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }}
+             data-signoffs-escalation={p.escalation?.decided ? 'decided' : 'open'}>
+          <TriangleAlert size={10} aria-hidden className="mt-[3px] shrink-0" /> <span>{up}</span>
+        </div>
+      )}
+    </>
+  )
+}
+
+/**
+ * 会签：策略、几人同意了、每个人的回复。人数按服务端给的进度（task.progress）：升级加派的那几份不算进会签人数，它们
+ * 一人说了算，单写一行规则、在名单里标「升级」。撤回的（改派、升级、已判定）列在最后、淡显
+ */
+export function Signoffs({ task }: { task: Task }) {
+  const p = progressOf(task)
+  const ok = p.agreed
+  const need = p.need
+  const live = task.assignments.filter((a) => a.status !== 'withdrawn')
+  const ordered = [...live.filter((a) => !escalated(a)), ...live.filter(escalated),
+    ...task.assignments.filter((a) => a.status === 'withdrawn')]
+  return (
+    <div className="mb-2 rounded border bg-bg p-2" data-signoffs="" data-signoffs-agreed={ok} data-signoffs-need={need}>
+      <SignoffHead task={task} />
       <div aria-hidden className="mb-1.5 flex h-1 gap-0.5 overflow-hidden rounded-full">
         {Array.from({ length: Math.max(need, 1) }, (_, i) => (
           <span key={i} className="flex-1 rounded-full"
@@ -386,6 +436,7 @@ export function Signoffs({ task }: { task: Task }) {
               {agreed(a) ? '✓' : rejected(a) ? '✕' : '○'}
             </span>
             <span className="text-fg">{assigneeName(a)}</span>
+            {escalated(a) && <span className="chip" style={{ color: 'var(--st-waiting)' }}>{TASK_TEXT.escalationTag}</span>}
             <span className="text-dim">
               {a.status === 'responded'
                 ? TASK_TEXT.decision[a.decision ?? ''] ?? TASK_TEXT.assignmentStatus.responded

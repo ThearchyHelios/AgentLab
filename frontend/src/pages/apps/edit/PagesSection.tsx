@@ -1,12 +1,12 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { cloneElement, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react'
 import { ArrowDown, ArrowUp, Plus, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../../api/client'
-import { DeleteButton, EmptyState, Field, SectionBar } from '../../../components/ui'
-import { APP_EDITOR_TEXT as T } from '../../../lib/terms'
+import { DeleteButton, EmptyState, Field, SectionBar, confirmDialog, isComposing, toast } from '../../../components/ui'
+import { APP_EDITOR_TEXT as T, APP_TERM_TEXT } from '../../../lib/terms'
 import type { AppBinding, AppComponent, AppSpec, AppViewSource, CatalogComponent } from '../../../typesApp'
 import { BackfillButton, useBackfillTargets } from '../backfill'
-import { applyAppOp, findComponent, freshId } from './appOps'
+import { applyAppOp, componentsOfView, findComponent, freshId } from './appOps'
 import { useEditor } from './context'
 
 /*
@@ -218,7 +218,8 @@ function ComponentInspector({ node, entry }: { node: AppComponent; entry?: Catal
 
 /**
  * 按组件目录里的 props schema 画表单。entry / form 两个键指向应用里已有的入口、表单，给下拉；其余按类型
- * （改的是一份浅拷贝，写回整份 props：app_update 按键合并）
+ * （改的是一份浅拷贝，写回整份 props：app_update 按键合并）。属性名用目录里的 title（中文名），取值不直观的
+ * 在下面写目录给的 description；枚举的选项写 x-enum-labels（同表单的写法），目录没给的才露出键名和值本身
  */
 function PropsForm({ schema, value, onChange }: {
   schema: Record<string, any>; value: Record<string, any>; onChange: (v: Record<string, any>) => void
@@ -245,10 +246,11 @@ function PropsForm({ schema, value, onChange }: {
         </select>
       )
     } else if (Array.isArray(prop.enum)) {
+      const labels: unknown[] = Array.isArray(prop['x-enum-labels']) ? prop['x-enum-labels'] : []
       control = (
         <select id={id} className="field" value={cur ?? ''} onChange={(e) => set(key, e.target.value)}>
           <option value="">—</option>
-          {prop.enum.map((o: string) => <option key={o} value={o}>{o}</option>)}
+          {prop.enum.map((o: string, i: number) => <option key={o} value={o}>{typeof labels[i] === 'string' && labels[i] ? labels[i] as string : o}</option>)}
         </select>
       )
     } else if (prop.type === 'boolean') {
@@ -267,10 +269,12 @@ function PropsForm({ schema, value, onChange }: {
     } else {
       control = <input id={id} className="field" value={cur ?? ''} maxLength={prop.maxLength} onChange={(e) => set(key, e.target.value)} />
     }
+    const hint = typeof prop.description === 'string' && prop.description ? `${id}-hint` : undefined
     rows.push(
       <div key={key} data-app-prop={key}>
-        <label className="label" htmlFor={id}>{prop.title ?? key}</label>
-        {control}
+        <label className="label" htmlFor={id} title={key}>{prop.title ?? key}</label>
+        {hint ? cloneElement(control as ReactElement<{ 'aria-describedby'?: string }>, { 'aria-describedby': hint }) : control}
+        {hint && <p id={hint} className="mt-0.5 text-2xs leading-relaxed text-faint">{prop.description}</p>}
       </div>,
     )
   }
@@ -382,11 +386,43 @@ function useViewNodes(view: string): { id: string; label: string }[] {
  * 当前发布版把某个视图固定的版本升了版、处置为按新口径重算时，那个视图下面给「按新口径补算历史」（D-f，按发布版补算）
  */
 function ViewsPanel() {
-  const { appId, detail, draft, setDraft } = useEditor()
+  const { appId, detail, draft, setDraft, catalog } = useEditor()
   const [open, setOpen] = useState(false)
+  const [name, setName] = useState('')
   const targets = useBackfillTargets(appId, detail.published_version, true, detail.backfill ?? null)
   const set = (key: string, value: { source: AppViewSource } | null) =>
     setDraft((s: AppSpec) => applyAppOp(s, { op: 'app_set', path: 'views', key, value }))
+  // 视图名同服务端的规矩（apps/ops.py 的 app_set）：去掉首尾空白后不能为空；重名会盖掉已有的视图，这里先拦下
+  const fresh = freshViewKey(draft)
+  const wanted = name.trim()
+  const taken = !!wanted && wanted in draft.views
+  const add = () => {
+    if (taken) return
+    set(wanted || fresh, { source: { kind: 'latest_sealed', pin: draft.pins[0]?.alias ?? null, from: 'formal' } })
+    setName('')
+  }
+  /** 删视图：先确认、写明用到它的组件（它们会失去数据来源），删完给一次撤销 */
+  const remove = async (key: string) => {
+    const label = (c: AppComponent) => {
+      const text = String(c.props?.label ?? c.props?.title ?? '')
+      return `${catalog?.components.find((x) => x.name === c.type)?.label ?? c.type}「${text || c.id}」`
+    }
+    const used = componentsOfView(draft, key).map(({ node }) => label(node))
+    const ok = await confirmDialog({
+      title: T.viewRemoveTitle(key),
+      body: used.length ? T.viewRemoveBody : T.viewRemoveUnused,
+      consequences: used.length ? [T.viewRemoveBound(used)] : undefined,
+      confirmLabel: T.viewRemoveConfirm,
+      danger: true,
+    })
+    if (!ok) return
+    const before = draft.views[key]
+    set(key, null)
+    toast(T.viewRemoved(key), 'ok', {
+      key: `app-view-remove:${key}`, duration: 8000,
+      action: { label: T.viewRemoveUndo, onClick: () => set(key, before) },
+    })
+  }
   return (
     <details className="border-t" open={open || targets.length > 0} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
              data-app-views="" data-app-views-backfill={targets.length || undefined}>
@@ -394,18 +430,24 @@ function ViewsPanel() {
         {T.views}（{Object.keys(draft.views).length}）
       </summary>
       <div className="max-h-72 space-y-2 overflow-y-auto px-2 pb-2">
-        {Object.entries(draft.views).map(([key, v]) => (
+        {Object.entries(draft.views).map(([key, v], i) => (
           <div key={key} className="space-y-1 rounded border p-1.5 text-2xs" data-app-view={key}>
             <div className="flex items-center gap-1">
               <span className="mono min-w-0 flex-1 truncate font-medium">{key}</span>
-              <DeleteButton label={`删除视图 ${key}`} onClick={() => set(key, null)} />
+              <DeleteButton label={T.viewRemove(key)} onClick={() => void remove(key)} />
             </div>
             <select className="field h-7 py-0 text-xs" value={v.source.kind} aria-label={T.views}
+                    aria-describedby={APP_TERM_TEXT.viewKinds[v.source.kind] ? `app-view-${i}-kind` : undefined}
                     onChange={(e) => set(key, { source: { ...v.source, kind: e.target.value as AppViewSource['kind'] } })}>
               {Object.entries(T.viewKinds).map(([k, label]) => <option key={k} value={k}>{label}</option>)}
             </select>
+            {APP_TERM_TEXT.viewKinds[v.source.kind] && (
+              <p id={`app-view-${i}-kind`} className="leading-relaxed text-faint" data-app-view-kind-hint={v.source.kind}>
+                {APP_TERM_TEXT.viewKinds[v.source.kind]}
+              </p>
+            )}
             {v.source.kind !== 'instance' && (
-              <select className="field h-7 py-0 text-xs" value={v.source.pin ?? ''} aria-label={T.viewPin}
+              <select className="field h-7 py-0 text-xs" value={v.source.pin ?? ''} aria-label={T.viewPin} title={APP_TERM_TEXT.pin}
                       onChange={(e) => set(key, { source: { ...v.source, pin: e.target.value || null } })}>
                 <option value="">{T.viewPin}</option>
                 {draft.pins.map((p) => <option key={p.alias} value={p.alias}>{p.alias} · v{p.version}</option>)}
@@ -435,10 +477,17 @@ function ViewsPanel() {
             )}
           </div>
         ))}
-        <button type="button" className="btn btn-xs w-full justify-center" data-app-view-add=""
-                onClick={() => set(freshViewKey(draft), { source: { kind: 'latest_sealed', pin: draft.pins[0]?.alias ?? null, from: 'formal' } })}>
-          <Plus size={10} aria-hidden /> {T.viewAdd}
-        </button>
+        <div className="space-y-1">
+          <div className="flex gap-1">
+            <input className="field mono h-7 min-w-0 flex-1 py-0 text-xs" value={name} placeholder={T.viewNamePlaceholder(fresh)}
+                   aria-label={T.viewName} aria-invalid={taken || undefined} spellCheck={false} data-app-view-name=""
+                   onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !isComposing(e)) add() }} />
+            <button type="button" className="btn btn-xs shrink-0" disabled={taken} data-app-view-add="" onClick={add}>
+              <Plus size={10} aria-hidden /> {T.viewAdd}
+            </button>
+          </div>
+          {taken && <p className="text-2xs" style={{ color: 'var(--err)' }} data-app-view-name-taken="">{T.viewNameTaken(wanted)}</p>}
+        </div>
       </div>
     </details>
   )

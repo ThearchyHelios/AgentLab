@@ -2,6 +2,7 @@
 
 - 变量都按 fire_at（计划触发时间）在任务时区算，不按「现在」：补跑晚了一小时，昨天还是计划那天的昨天
 - 跨月、跨年、跨时区（同一时刻在上海已经是周一，在纽约还是周日）；周从周一算起
+- ISO 周（2026-W42）的年份跟着周走：2026-12-31、2027-01-01 都是 2026-W53，2025-12-29 是 2026-W01；月份写 YYYY-MM
 - schedule.last_fire_time 是上一次计划触发的时间（按 cron 往前找），和本次一样写成带偏移的 ISO 时间
 - 模板写错（未知变量、未知过滤器、{{ }} 不成对、空的 {{ }}、值不是文本）抛 TemplateError，中文说明哪个输入
 - 声明了入口字段的工作流：模板里多出来的字段名、缺的必填输入（没有默认值）都拦下
@@ -34,9 +35,15 @@ def test_monday_morning_in_shanghai():
     assert v == {
         "today": "2026-10-05",
         "yesterday": "2026-10-04",
+        "this_week": "2026-W41",
+        "last_week": "2026-W40",
+        "week_before_last": "2026-W39",
         "this_week_start": "2026-10-05",
         "last_week_start": "2026-09-28",
         "last_week_end": "2026-10-04",
+        "this_month": "2026-10",
+        "last_month": "2026-09",
+        "month_before_last": "2026-08",
         "this_month_start": "2026-10-01",
         "last_month_start": "2026-09-01",
         "last_month_end": "2026-09-30",
@@ -60,6 +67,45 @@ def test_across_a_year_boundary():
     assert (v["this_week_start"], v["last_week_start"], v["last_week_end"]) == ("2026-12-28", "2026-12-21", "2026-12-27")
     assert (v["this_month_start"], v["last_month_start"], v["last_month_end"]) == ("2027-01-01", "2026-12-01", "2026-12-31")
     assert v["last_fire_time"] == "2026-12-01T08:00:00+08:00"
+
+
+@pytest.mark.parametrize("day, this_week, last_week, before_last", [
+    # 2026 年 1 月 1 日是周四，这一年有 53 周：年底那几天、2027 年开头的周五到周日都还在 2026-W53
+    ((2026, 12, 31), "2026-W53", "2026-W52", "2026-W51"),
+    ((2027, 1, 1), "2026-W53", "2026-W52", "2026-W51"),
+    ((2027, 1, 3), "2026-W53", "2026-W52", "2026-W51"),
+    # 周一换周：上周是上一年的最后一周
+    ((2027, 1, 4), "2027-W01", "2026-W53", "2026-W52"),
+    # 反过来，2025 年最后几天已经算 2026 年的第 1 周
+    ((2025, 12, 29), "2026-W01", "2025-W52", "2025-W51"),
+    ((2026, 1, 5), "2026-W02", "2026-W01", "2025-W52"),
+])
+def test_iso_weeks_across_the_year(day, this_week, last_week, before_last):
+    """ISO 周的年份是周所在的年，不是日历年；周号补足两位"""
+    y, m, d = day
+    v = values(datetime(y, m, d, 1, 0, tzinfo=UTC))       # 上海当天 09:00
+    assert (v["this_week"], v["last_week"], v["week_before_last"]) == (this_week, last_week, before_last)
+
+
+def test_iso_week_and_month_follow_the_schedule_timezone():
+    """UTC 2026-12-31 16:30：上海已经是 2027-01-01 00:30（周五，仍在 2026-W53），伦敦还是 2026-12-31"""
+    moment = datetime(2026, 12, 31, 16, 30, tzinfo=UTC)
+    shanghai = values(moment, "Asia/Shanghai", "30 0 * * *")
+    london = values(moment, "Europe/London", "30 16 * * *")
+    assert (shanghai["this_week"], shanghai["this_month"], shanghai["last_month"], shanghai["month_before_last"]) == (
+        "2026-W53", "2027-01", "2026-12", "2026-11")
+    assert (london["this_week"], london["this_month"], london["last_month"]) == ("2026-W53", "2026-12", "2026-11")
+    # 跨到周一那一刻：上海已经是 2027-W01，纽约还在 2026-W53
+    monday = datetime(2027, 1, 3, 20, 0, tzinfo=UTC)
+    assert values(monday, "Asia/Shanghai", "0 4 * * *")["this_week"] == "2027-W01"
+    assert values(monday, "America/New_York", "0 15 * * *")["this_week"] == "2026-W53"
+
+
+def test_months_across_a_year_boundary():
+    v = values(datetime(2027, 2, 1, 1, 0, tzinfo=UTC), cron="0 9 1 * *")
+    assert (v["this_month"], v["last_month"], v["month_before_last"]) == ("2027-02", "2027-01", "2026-12")
+    v = values(datetime(2027, 1, 1, 1, 0, tzinfo=UTC), cron="0 9 1 * *")
+    assert (v["this_month"], v["last_month"], v["month_before_last"]) == ("2027-01", "2026-12", "2026-11")
 
 
 def test_leap_february_ends_on_the_29th():
@@ -98,6 +144,11 @@ def test_render_inputs():
         "tag": "{{ schedule.today | upper }}",
     }, v)
     assert out == {"stat_date": "2026-10-04", "week": "2026-09-28~2026-10-04", "region": "华东", "tag": "2026-10-05"}
+    # 按周统计的周报：周一早上出上周的报告，和上上周比
+    weekly = service.render_inputs({"week": "{{ schedule.last_week }}", "prev_week": "{{ schedule.week_before_last }}",
+                                    "month": "{{ schedule.last_month }}"}, v)
+    assert weekly == {"week": "2026-W40", "prev_week": "2026-W39", "month": "2026-09"}
+    assert service.check_template({"week": "{{ schedule.this_week }}", "month": "{{ schedule.this_month }}"})
 
 
 def test_valid_templates_pass():
@@ -135,12 +186,17 @@ def test_variable_catalog():
     items = service.variables(datetime(2026, 10, 5, 1, 0, tzinfo=UTC), "Asia/Shanghai")
     names = [i["name"] for i in items]
     assert names == [f"schedule.{key}" for key in (
-        "today", "yesterday", "this_week_start", "last_week_start", "last_week_end",
-        "this_month_start", "last_month_start", "last_month_end", "fire_time", "last_fire_time")]
+        "today", "yesterday", "this_week", "last_week", "week_before_last", "this_week_start", "last_week_start",
+        "last_week_end", "this_month", "last_month", "month_before_last", "this_month_start", "last_month_start",
+        "last_month_end", "fire_time", "last_fire_time")]
     by_name = {i["name"]: i for i in items}
     assert by_name["schedule.yesterday"] == {"name": "schedule.yesterday", "label": "昨天（YYYY-MM-DD）",
-                                             "example": "2026-10-04"}
+                                             "example": "2026-10-04", "note": ""}
+    assert by_name["schedule.last_week"]["example"] == "2026-W40" and "2026-W53" in by_name["schedule.last_week"]["note"]
+    assert by_name["schedule.this_month"]["example"] == "2026-10"
     assert all(i["label"] and i["example"] for i in items)
+    # 补充说明只写在 ISO 周上
+    assert [i["name"] for i in items if i["note"]] == ["schedule.this_week", "schedule.last_week", "schedule.week_before_last"]
 
 
 # --------------------------------------------------------------------------

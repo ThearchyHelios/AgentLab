@@ -1357,6 +1357,9 @@ await section('数据 · 遮罩列（证据面板的 mask_columns）', async () 
     && await field.locator('[data-mask-chip="phone"]').count() === 1)
   const boundary = await field.locator('[data-mask-boundary]').innerText().catch(() => '')
   check('写明遮罩只减少暴露、不是安全边界', boundary.includes('遮罩只减少暴露，不是安全边界'), boundary)
+  // 口径同 README「哪些角色看得到原值」：未开启登录时对谁都只减少暴露，开了登录对使用者是边界——两头都说清
+  check('……并写明开启登录后对使用者是边界', await field.locator('[data-mask-boundary]').getAttribute('data-mask-boundary') === 'off'
+    && boundary.includes('开启登录后，遮罩对使用者是边界'), boundary)
   check('高级连接参数里不再另摆一个遮罩的文本框（只有这一处）', await ed.locator('#ds-adv-mask_columns').count() === 0)
   const before = sent.filter((r) => r.key === 'GET /datasources/check-manage-mask/schema').length
   await ed.locator('#ds-mask-columns').focus()
@@ -3986,7 +3989,12 @@ await section('工具', async () => {
           : json({ detail: '将在工作目录中写入「x.txt」，同名文件会被覆盖。在工具库中执行不经过审批，确认后才会执行。' }, 409)(route)
       }],
       [/^POST \/mcp\/refresh$/, (route) => route.abort()],
-      [/^POST \/custom-tools\/test$/, (route, { body }) => json(body?.config?.url?.includes('fail')
+      // 写入能力（服务端 tools/custom.held_write）：不发送，交回将要发送的请求，标 rehearsal
+      [/^POST \/custom-tools\/test$/, (route, { body }) => json(body?.config?.url?.includes('pay') ? { ok: true, rehearsal: true, duration_ms: 3,
+        result: { rehearsal: true, message: '演练：写入能力不在这里真的发送，下面是将要发送的请求', endpoint: 'erp', environment: 'test',
+          request: { method: 'POST', url: 'https://erp.example.com/test/payments', query: {}, body: { amount: 3 },
+            headers: ['Authorization', 'Idempotency-Key'] } } }
+        : body?.config?.url?.includes('fail')
         ? { ok: false, error: '工具执行失败：HTTP 404', hint: '核对接口地址', detail: '', duration_ms: 12 }
         : { ok: true, result: { echo: body?.args ?? {} }, duration_ms: 34, note: '参数名 qurey 不存在，已按唯一候选 query 执行' })(route)],
       // 沙箱里没有 MCP 服务：两台假的，一台后端记着 5 分钟前连上过，一台老数据只有 status、没有测连接记录
@@ -4075,6 +4083,15 @@ await section('工具', async () => {
   await tryBtn.click()
   await page.waitForTimeout(400)
   check('……失败：原因和怎么办写在试运行区', (await trialBox.innerText()).includes('HTTP 404') && (await trialBox.innerText()).includes('核对接口地址'))
+  // 写入能力：工具页试运行只演练（对外写入只经调用工具节点：要确认、带幂等键、留生效记录），不说「成功」（V2-13）
+  await ed.getByLabel(/^URL/).fill('https://api.example.com/pay')
+  await tryBtn.click()
+  const rehearsed = trialBox.locator('[data-tool-result="rehearsal"]')
+  check('……写入能力：写明演练、不在这里真的发送，不说成功', await rehearsed.waitFor({ timeout: 3000 }).then(() => true, () => false)
+    && (await rehearsed.innerText()).includes('演练：写入能力不在这里真的发送') && !(await rehearsed.innerText()).includes('成功'))
+  const plan = await rehearsed.locator('[data-tool-rehearsal]').innerText().catch(() => '')
+  check('……列出将要发送的方法和地址、环境、请求头的名字、请求体', plan.includes('POST https://erp.example.com/test/payments')
+    && plan.includes('测试环境') && plan.includes('Authorization、Idempotency-Key') && plan.includes('"amount": 3'), plan.replace(/\s+/g, ' '))
   await ed.getByRole('button', { name: '取消' }).click()
   await page.waitForTimeout(200)
   const discard = dialog(page).getByRole('button', { name: '放弃修改' })
@@ -4221,7 +4238,11 @@ await section('工具 · 信任三档', async () => {
     (await detail.getByRole('radio').allInnerTexts()).join('|') === '需审批|始终允许 · 门控把关|始终允许',
     (await detail.getByRole('radio').allInnerTexts().catch(() => [])).join('|'))
   check('……现在选中的是后端给的「需审批」', await checkedIn(detail) === '需审批', await checkedIn(detail))
-  check('……旁边说清三档的差别，写明正式运行不看这个设置', (await page.locator('[data-trust-block]').innerText()).includes('正式运行不受此设置影响'))
+  // 和能力治理同一种说法（P5）：三档只用于探索运行；正式运行一律问人，能力登记里「正式运行免审批」的只读能力除外
+  const trustText = await page.locator('[data-trust-block]').innerText()
+  check('……旁边说清三档的差别，写明正式运行不看这个设置、和能力治理的免审批一致',
+    trustText.includes('这里的设置只用于探索运行') && trustText.includes('「正式运行免审批」的只读能力除外')
+    && !trustText.includes('一律需人工审批。'), trustText.replace(/\s+/g, ' '))
   check('徽标按信任档：需审批挂「运行时需审批」', (await listItem('crm_lookup').innerText()).includes('运行时需审批'))
   check('……门控把关挂「门控把关」', (await listItem('search').innerText()).includes('门控把关')
     && !(await listItem('search').innerText()).includes('运行时需审批'))

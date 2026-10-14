@@ -132,6 +132,9 @@ async def _run_http(row: CustomTool, args: dict[str, Any]) -> Any:
     ctx = dict(args)
     url = render_template(config.get("url", ""), ctx)
     headers = render_deep(vault.reveal(config.get("headers")), ctx)
+    if problem := vault.header_problem(headers):
+        # 发不出去的头（空名字、换行）：照实说是哪一项，不是一句 LocalProtocolError
+        return ToolFailure(error=f"自定义工具「{row.name}」的{problem}，请到「工具」页修改请求头")
     body = config.get("body")
     json_body = None
     if body:
@@ -171,13 +174,69 @@ async def _run_info(session: AsyncSession, run_id: str) -> tuple[bool, str | Non
     return run.run_class == "formal", run.started_by, True
 
 
+#: 效果从宽到严：只读、视参数而定、写入
+_STRICTNESS = {"read": 0, "dynamic": 1, "write": 2}
+
+
+def _system_effect(row: CustomTool) -> str:
+    """按同步的规矩（capabilities.registry.sync_all）算这一行的效果：绑定端点的按方法，GET / HEAD 为只读、其余为写入；
+    别的视参数而定。"""
+    if bound_endpoint_ref(row):
+        return "read" if str((row.config or {}).get("method") or "GET").upper() in ("GET", "HEAD") else "write"
+    return "dynamic"
+
+
+def _effect_of(row: CustomTool, cap: Any) -> str:
+    """治理后的效果；登记里还没有（刚建、没保存的草稿）按同步的规矩算。
+
+    治理是对登记时的那个样子做的：手上这一行按同步的规矩算出来的和登记里的（effect_system）对不上——工具页试运行的草稿
+    把 GET 改成了 POST——取两者里更严的一个，不然草稿凭已保存那一版的「只读」把写入真发出去。对得上的（保存过的那一行）
+    照治理的走：管理员把一个用 POST 的查询接口治理成只读，是他的决定。"""
+    from app.capabilities.registry import effective_effect
+
+    own = _system_effect(row)
+    if cap is None:
+        return own
+    governed = effective_effect(cap)
+    if own == getattr(cap, "effect_system", own):
+        return governed
+    return max(governed, own, key=lambda e: _STRICTNESS.get(e, len(_STRICTNESS)))
+
+
+async def held_write(session: AsyncSession, row: CustomTool) -> bool:
+    """这个自定义工具是不是写外部系统的能力（capabilities.registry.writes_externally，和运行时、发布检查同一个判断）。
+    是的话不在运行里（工具页试运行、工具库执行）一律演练、不发送：对外写入只经调用工具节点，要确认、带幂等键、留生效
+    记录（A5）。绑定的端点已经没了的不算：执行时照实报端点不存在。"""
+    from app.capabilities.registry import get_capability
+
+    ref = bound_endpoint_ref(row)
+    endpoint = await find_endpoint(session, ref) if ref else None
+    if ref and endpoint is None:
+        return False
+    return _holds(row, await get_capability(session, row.name), endpoint.id if endpoint else None)
+
+
+def _holds(row: CustomTool, cap: Any, endpoint_id: str | None) -> bool:
+    from app.capabilities.registry import writes_externally
+
+    return writes_externally(row.name, _effect_of(row, cap), endpoint_id)
+
+
+def _write_refused(name: str) -> ToolFailure:
+    """写入能力只能经调用工具节点发送：运行里别的路（Agent、直接调用）碰到它时的报错。"""
+    return ToolFailure(error=f"「{name}」是写入能力，只能经「调用工具」节点的动作确认后发送")
+
+
 async def _run_endpoint(row: CustomTool, args: dict[str, Any], ctx: ToolContext) -> Any:
     """绑定登记端点的 HTTP 工具：由平台执行器发请求（capabilities/endpoints.py），模型只给参数、拿不到任意地址。
 
-    写入（capabilities.registry.writes_externally：治理后效果为 write，或者视参数而定——执行器分不出读写）在运行里不从这里发：它要先留生效记录、按幂等键发送、结果未知时转核实，那是调用工具节点
-    的动作流程（app/process/actions.py）。这里只给工具库试用、试跑发写入，按探索运行走测试环境或演练。"""
+    写入（held_write：治理后效果为 write，或者视参数而定——执行器分不出读写）不从这里发：运行里它要先留生效记录、按幂等键
+    发送、结果未知时转核实，那是调用工具节点的动作流程（app/process/actions.py）；工具页试运行、工具库执行（不在运行里）
+    只演练，交回将要发送的请求（endpoints.rehearsal）。读取照常发，按探索运行走测试环境，没有测试环境时走生产环境。
+
+    请求按手上这一行拼（tool=row）：工具页试运行的草稿发的是眼前编辑的方法、路径和请求体，不是按名字找到的已保存的那一版。"""
     from app.capabilities import endpoints as ep
-    from app.capabilities.registry import effective_effect, endpoint_request, get_capability, writes_externally
+    from app.capabilities.registry import endpoint_request, get_capability
     from app.db.base import SessionLocal
 
     async with SessionLocal() as session:
@@ -185,15 +244,19 @@ async def _run_endpoint(row: CustomTool, args: dict[str, Any], ctx: ToolContext)
         if endpoint is None:
             return ToolFailure(error=f"自定义工具「{row.name}」绑定的端点不存在，可能已被删除。请到「工具」页重新选择端点")
         cap = await get_capability(session, row.name)
-        method = str((row.config or {}).get("method") or "GET").upper()
-        effect = effective_effect(cap) if cap is not None else ("read" if method in ("GET", "HEAD") else "write")
+        effect = _effect_of(row, cap)
         formal, starter, in_run = await _run_info(session, ctx.run_id)
-        if writes_externally(row.name, effect, endpoint.id) and in_run:
-            return ToolFailure(error=f"「{row.name}」是写入能力，只能经「调用工具」节点的动作确认后发送")
+        if _holds(row, cap, endpoint.id):
+            if in_run:
+                return _write_refused(row.name)
+            try:
+                return ep.rehearsal(endpoint, row.config or {}, cap, args)
+            except ep.EndpointError as e:
+                return ToolFailure(error=str(e))
         environment = ep.pick_environment(endpoint, formal=formal, effect=effect)
         result = await endpoint_request(session, cap if cap is not None else row.name, args,
                                         environment=environment, on_behalf=starter,
-                                        run_id=ctx.run_id if in_run else None, node_id=ctx.node_id)
+                                        run_id=ctx.run_id if in_run else None, node_id=ctx.node_id, tool=row)
     out = ep.tool_result(result)
     return ToolFailure(out) if "error" in out else out
 
@@ -274,12 +337,63 @@ async def build_custom_tools(
     return tools
 
 
-async def _execute(row: CustomTool, args: dict[str, Any], ctx: ToolContext) -> Any:
+def _rehearse_unbound(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
+    """没绑定端点、被治理为写入的自定义工具在工具页试运行、工具库执行时的演练回执：HTTP 工具交回将要发送的方法、地址、
+    请求体和请求头的名字；Python 工具不执行代码，交回这次的参数。"""
+    from app.capabilities.endpoints import REHEARSAL_MESSAGE
+
+    config = row.config or {}
     if row.kind == "python":
-        return await _run_python(row, args, ctx)
+        return {"rehearsal": True, "message": "演练：写入能力不在这里真的执行，代码没有运行", "args": args}
+    body = config.get("body")
+    if body:
+        rendered = render_deep(body, args) if isinstance(body, dict) else render_template(str(body), args)
+        try:
+            body = rendered if isinstance(rendered, dict) else json.loads(rendered or "null")
+        except json.JSONDecodeError:
+            body = rendered
+    return {"rehearsal": True, "message": REHEARSAL_MESSAGE,
+            "request": {"method": str(config.get("method") or "GET").upper(),
+                        "url": render_template(config.get("url", ""), args), "body": body or None,
+                        "headers": sorted(config.get("headers") or {})}}
+
+
+async def _execute(row: CustomTool, args: dict[str, Any], ctx: ToolContext) -> Any:
     if bound_endpoint_ref(row):
         return await _run_endpoint(row, args, ctx)
+    from app.db.base import SessionLocal
+
+    # 没绑定端点、被治理为写入的（effect=write）：和绑定端点的写入一样，运行里不从这里发，试运行只演练
+    async with SessionLocal() as session:
+        if await held_write(session, row):
+            return _write_refused(row.name) if (await _run_info(session, ctx.run_id))[2] else _rehearse_unbound(row, args)
+    if row.kind == "python":
+        return await _run_python(row, args, ctx)
     return await _run_http(row, args)
+
+
+def http_failure(row: CustomTool, result: Any) -> dict[str, Any] | None:
+    """HTTP 工具（绑定端点的、模板的）交回的结果带着非 2xx 的状态码：试运行、工具库执行照实说失败和状态码，
+    交回 {error, hint, detail}；2xx 和别的结果交回 None。运行里照旧原样交给模型，它看得到状态码。结果的形状是平台拼的
+    （{status, data | body}），工具库执行经 call_tool 拿到的是它的 JSON 文本，一并认。"""
+    from app.capabilities.endpoints import describe_status
+
+    if row.kind != "http":
+        return None
+    value = result
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    status = value.get("status") if isinstance(value, dict) else None
+    if not isinstance(status, int) or isinstance(status, bool) or 200 <= status < 300:
+        return None
+    hint = ("请检查认证头" if status in (401, 403) else "请检查路径和地址" if status == 404
+            else "请对照对方返回的内容（见技术细节）检查参数和请求体" if 400 <= status < 500
+            else "通常是对方系统的问题，请稍后重试或联系对方" if status >= 500 else "")
+    return {"error": f"请求失败：{describe_status(status)}", "hint": hint,
+            "detail": json.dumps(value, ensure_ascii=False, default=str)[:4000]}
 
 
 async def trial(row: CustomTool, args: dict[str, Any], ctx: ToolContext) -> tuple[Any, str | None]:

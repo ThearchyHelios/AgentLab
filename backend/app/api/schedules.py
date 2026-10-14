@@ -410,7 +410,8 @@ async def _get(session: AsyncSession, schedule_id: str) -> Schedule:
 
 @router.get("/variables")
 async def list_variables(tz: str | None = Query(default=None, alias="timezone")) -> list[dict[str, str]]:
-    """输入模板能用的变量：[{name, label, example}]。示例按现在这一刻、timezone（默认 Asia/Shanghai）触发算。"""
+    """输入模板能用的变量：[{name, label, example, note}]。示例按现在这一刻、timezone（默认 Asia/Shanghai）触发算；
+    note 是补充说明（ISO 周的跨年规则），没有的是空串。"""
     zone = _timezone(tz) if tz is not None else service.DEFAULT_TIMEZONE
     return service.variables(tz=zone)
 

@@ -18,7 +18,7 @@ import httpx
 import pytest
 from sqlalchemy import select, update
 
-from app.api.deps import Principal, actor_of, reset_principal, set_principal
+from app.api.deps import Principal, actor_of, reset_principal, set_principal, signer_of
 from app.db.base import SessionLocal, utcnow
 from app.db.models import AuditEvent, AuthSession, Group, User
 from tests.fakes import auth_env
@@ -55,9 +55,12 @@ async def test_actor_of_ignores_header_once_logged_in():
     token = set_principal(Principal(username="alice", role="user", verified=True, mode="local"))
     try:
         assert actor_of("mallory") == "alice"
+        assert signer_of("请求体署名", "mallory") == "alice", "开了登录：数据导入这类请求体里自带的署名也不看"
     finally:
         reset_principal(token)
     assert actor_of("mallory") == "mallory"
+    assert signer_of("  请求体署名  ", "mallory") == "请求体署名" and signer_of("", "mallory") == "mallory", \
+        "关登录：请求体里填的优先，其次 X-Actor"
 
 
 # ---------------------------------------------------------------- local
@@ -90,6 +93,7 @@ async def test_roles_401_403_and_forged_actor():
     assert r.status_code == 401
     me = await anon.get("/api/auth/me")
     assert me.status_code == 401 and me.json()["mode"] == "local", "登录页据此显示账号密码"
+    assert me.json()["can_bootstrap"] is False, "已经有管理员：登录页不给建管理员"
 
     uma = await auth_env.login("uma")
     assert (await uma.get("/api/workflows")).status_code == 403
@@ -103,6 +107,27 @@ async def test_roles_401_403_and_forged_actor():
     async with SessionLocal() as s:
         audit = (await s.execute(select(AuditEvent).where(AuditEvent.action == "group.create"))).scalar_one()
     assert (audit.actor, audit.verified) == ("root", True), "伪造的 X-Actor 被忽略，审计照实记"
+
+
+async def test_directory_is_read_only_for_builders_and_leaves_out_the_rest():
+    admin = await auth_env.turn_on_local()
+    await auth_env.make_user("bob", "builder", email="bob@example.com")
+    await auth_env.make_user("uma", "user", disabled=True)
+    assert (await admin.post("/api/groups", json={"name": "fin", "label": "财务"})).status_code == 201
+    bob = await auth_env.login("bob")
+    r = await bob.get("/api/directory")
+    assert r.status_code == 200, "搭建者绑岗位、授权要选人：名录给搭建者"
+    body = r.json()
+    assert {u["username"]: u["disabled"] for u in body["users"]} == {"root": False, "bob": False, "uma": True}, \
+        "停用的人也列出来，标明停用"
+    assert set(body["users"][0]) == {"username", "display_name", "disabled"}, "不含邮箱、角色这些"
+    assert body["groups"] == [{"name": "fin", "label": "财务"}]
+    assert (await bob.post("/api/directory", json={})).status_code == 405, "只读"
+    async with SessionLocal() as s:
+        await s.execute(update(User).where(User.username == "uma").values(disabled=False))
+        await s.commit()
+    uma = await auth_env.login("uma")
+    assert (await uma.get("/api/directory")).status_code == 403, "使用者不给"
 
 
 async def test_csrf_header_and_origin():
@@ -163,8 +188,12 @@ async def test_env_mode_wins_and_bootstrap(monkeypatch):
     monkeypatch.setenv("AGENTLAB_AUTH_MODE", "local")
     c = auth_env.client()
     assert (await c.get("/api/workflows")).status_code == 401
+    me = await c.get("/api/auth/me")
+    assert me.status_code == 401 and me.json()["can_bootstrap"] is True, "新部署：登录页据此给「建第一个管理员」"
     r = await c.post("/api/auth/bootstrap", json={"username": "first", "password": "password-123"})
     assert r.status_code == 200 and r.json()["role"] == "admin"
+    me = await auth_env.client().get("/api/auth/me")
+    assert me.status_code == 401 and me.json()["can_bootstrap"] is False, "有了管理员就不再给"
     assert (await c.post("/api/auth/bootstrap", json={"username": "second", "password": "password-123"})
             ).status_code == 409
     r = await c.put("/api/auth/settings", json={"mode": "off"})

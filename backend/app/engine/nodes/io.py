@@ -63,7 +63,8 @@ async def run_output(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
             governed = await governed_formal(ctx.run.run_id)
             cells = cells_allowed(contract, governed=governed)
-        result["_issuance"] = _apply_contract(contract, state, ctx, reports=reports, cells=cells, governed=governed)
+        result["_issuance"] = _apply_contract(contract, state, ctx, reports=reports, cells=cells, governed=governed,
+                                              fields=result)
     evidence = _evidence_of(reports, contract)
     if evidence:
         result["_evidence"] = evidence
@@ -144,9 +145,11 @@ def _evidence_of(reports: list[dict[str, Any]], contract: Any) -> dict[str, Any]
 def _apply_contract(
     contract: dict[str, Any], state: GraphState, ctx: NodeContext,
     *, reports: list[dict[str, Any]] | None = None, cells: bool = True, governed: bool = False,
+    fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from datetime import datetime, timezone
 
+    from app.engine.governance import board_only
     from app.engine.issuance import decide_tier, incomplete_gaps, sql_check_findings, trace_numbers
 
     nodes = state.get("nodes") or {}
@@ -200,11 +203,19 @@ def _apply_contract(
 
     trace = None
     cited: dict[str, Any] = {}
+    by_metrics = not citations and board_only(contract, ctx.run.spec, ctx.node.id)
     if citations:
         cited = _check_citations(str(report_from), contract, state, ctx, reports or [], cells=cells,
                                  governed=governed)
         gaps.extend(cited["gaps"])
         unmatched = cited["unmatched"]
+    elif by_metrics:
+        # 指标出具：没有叙述，给人看的是成果字段——字段里的数回指指标集，和叙述同一套规则；每个指标的输入要追到原始
+        # 数据，追不到的是「这个数有算式、没出处」，照实记成缺口
+        shown = _shown_text(fields or {})
+        trace = trace_numbers(shown, metrics, allow=contract.get("allow_numbers")) if shown.strip() else None
+        unmatched = trace.unmatched if trace else []
+        gaps.extend(_untraced_gaps(metrics, ctx))
     else:
         # 2) 叙述数字回指
         declared_narrative = str(contract.get("narrative", ""))
@@ -286,6 +297,7 @@ def _apply_contract(
     ][:50]
     issuance = {
         "tier": tier,
+        **({"mode": "metrics"} if by_metrics else {}),
         "calibers": calibers,  # 口径版本照常印
         "metrics_checked": len(metrics),
         "missing_required": missing_required,
@@ -301,6 +313,7 @@ def _apply_contract(
     ctx.emit(
         EventType.ISSUANCE,
         tier=tier,
+        **({"mode": "metrics"} if by_metrics else {}),
         missing_required=missing_required,
         missing_expected=missing_expected,
         unmatched=len(unmatched),
@@ -314,6 +327,34 @@ def _apply_contract(
         **({"sql_checks": sql_checks} if sql_checks else {}),
     )
     return issuance
+
+
+def _shown_text(fields: dict[str, Any]) -> str:
+    """指标出具时给人看的文字：成果字段里的文字和数（成果自己的 _issuance、_evidence 不算）。表格、对象这类结构化的值不在
+    这里核：它们是查询结果，出处是自己的快照，不是口径卡的指标。"""
+    parts = []
+    for name, value in fields.items():
+        if str(name).startswith("_") or isinstance(value, bool):
+            continue
+        if isinstance(value, (str, int, float)):
+            parts.append(str(value))
+    return "\n".join(parts)
+
+
+def _untraced_gaps(metrics: list[dict[str, Any]], ctx: NodeContext) -> list[str]:
+    """指标出具的缺口：输入没追到原始数据的指标，每个一句，说清停在哪个节点（engine/lineage 的认法）。"""
+    from app.engine.lineage import untraced
+
+    titles = {n.id: n.title for n in ctx.run.spec.nodes}
+    out = []
+    for m in metrics:
+        stops = untraced(m.get("inputs") or [])
+        if not stops:
+            continue
+        where = "、".join(dict.fromkeys(f"{s.get('path')}（停在「{titles.get(s.get('node_id') or '', s.get('node_id') or '未知来源')}」）"
+                                        for s in stops[:3]))
+        out.append(f"指标「{m.get('name') or m.get('id')}」的输入没追到原始数据：{where}")
+    return out
 
 
 def _upstream_issuance_gaps(state: GraphState, ctx: NodeContext) -> list[str]:

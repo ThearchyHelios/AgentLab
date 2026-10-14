@@ -43,6 +43,12 @@ export interface GroupRow {
   members: string[]
 }
 
+/** 选人用的名录（GET /api/directory，搭建者及以上只读）：只有用户名、显示名、是否停用和组名 */
+export interface Directory {
+  users: { username: string; display_name: string; disabled: boolean }[]
+  groups: { name: string; label: string }[]
+}
+
 export interface AuditRow {
   id: string
   at: string
@@ -331,9 +337,9 @@ export interface ViewNode {
    * - table、chart：{state, columns, rows（遮罩的格子已换成「已遮罩」）, column_types, masked, total_rows, truncated, evidence}
    * - report：{state, node, doc_artifact, evidence}；field：{state, text, value?, evidence?}；status：{state, value, text}
    * - form：{form}；entry_button：{entry, label, disabled, reason?}；instance_list：{who, entry, items}
-   * - instance_header：InstanceRow + {state, status_text, stamp}；instance_timeline：{state, status, status_text, steps}
-   * - task_list：{scope, items}；task_form、signoffs：{state, task, task_ui, assignments?}
-   * - action_status：{state, node, records: [{id, state, environment, attempt, payload_hash, error, receipt?}]}
+   * - instance_header：InstanceRow + {state, stamp}；instance_timeline：{state, status, status_code, status_text, steps}
+   * - task_list：{scope, items}；task_form、signoffs：{state, task, task_ui, handler, assignments, progress, my_response}
+   * - action_status：{state, node, records: [{id, state, environment, attempt, payload_hash, error?, note?, receipt?}]}
    */
   data?: Record<string, any> | null
   children?: ViewNode[]
@@ -360,6 +366,10 @@ export interface InstanceRow {
   finished_at: string | null
   pending_tasks: number
   tier?: string | null
+  /** 给人看的状态（服务端 apps/resolve.instance_state）：status_text 说办到哪了、结论是什么（「已退回」「等待核实写入
+   *  结果」「「付款」未确认（被驳回）」），status_code 是状态标记画哪种（运行状态那几种，加 held） */
+  status_code?: string
+  status_text?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +391,32 @@ export interface TaskAssignment {
   responded_at: string | null
   /** 回复的决定（approve / reject / 提交的值），会签进度用 */
   decision?: string | null
+  verified: boolean
+}
+
+/**
+ * 会签进度（服务端 process/tasks.progress，界面照着画）：voters 是会签人数（判定之后按判定那一刻的人数），升级加派的
+ * 那几份不算进去——它们一人说了算，单列在 escalation 里
+ */
+export interface TaskProgress {
+  policy: TaskPolicy['kind']
+  voters: number
+  need: number
+  agreed: number
+  rejected: number
+  escalation?: {
+    slot: string | null
+    assignees: { kind: string; name: string }[]
+    /** 升级加派的人里有人回复了：他一人的决定 */
+    decided: string | null
+    by: string | null
+  }
+}
+
+/** 这个人在这条待办上的回复（处理过的人再打开时写「你已处理」） */
+export interface TaskMyResponse {
+  decision: string | null
+  at: string | null
   verified: boolean
 }
 
@@ -409,6 +445,12 @@ export interface Task {
   assignments: TaskAssignment[]
   /** 当前用户能不能回复这一条 */
   can_respond: boolean
+  /** 会签进度；只有批准 / 驳回这一类有 */
+  progress?: TaskProgress | null
+  /** 当前用户回复过的话，他的回复 */
+  my_response?: TaskMyResponse | null
+  /** 所属实例的标题：同一个节点开出的待办标题一样，列表里靠它分开 */
+  instance_title?: string | null
   outcome: Record<string, any> | null
   resolved_by: string | null
   resolved_at: string | null

@@ -114,3 +114,23 @@ async def reads_live(session: AsyncSession, graph: dict[str, Any]) -> bool:
     origins = dict((await session.execute(select(DataSource.name, DataSource.origin)
                                           .where(DataSource.name.in_(sorted(sources))))).all())
     return any(origins.get(s) != "upload" for s in sources)
+
+
+async def write_nodes(session: AsyncSession, graph: dict[str, Any]) -> dict[str, Any]:
+    """图里写外部系统的调用工具节点：{节点 id: 能力登记}，按节点出现的顺序。认法和运行时同一个（调用工具节点
+    engine/nodes/tools._write_capability → capabilities.registry.writes_externally：治理后效果为 write，或绑定端点、视参数
+    而定）：只有它们走动作流程——开发送确认卡、留生效记录、结果未知时要人核实。派生（动作状态、核实岗位）和检查（发送
+    确认派给的岗位、核实岗位）共用这一份。只读的调用工具节点从不开确认卡，它写的（或取图级默认的）「派给谁」用不到岗位。
+    登记里没有的不算：运行时同样不按写入走。"""
+    from app.apps.tree import node_map
+    from app.capabilities.registry import effective_effect, get_capability, writes_externally
+
+    out: dict[str, Any] = {}
+    for node_id, node in node_map(graph).items():
+        name = node["config"].get("tool") if node["type"] == "tool" else None
+        if not isinstance(name, str) or not name:
+            continue
+        cap = await get_capability(session, name)
+        if cap is not None and writes_externally(name, effective_effect(cap), getattr(cap, "endpoint_id", None)):
+            out[node_id] = cap
+    return out

@@ -5,9 +5,13 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.core import crypto
+
+#: HTTP 请求头名能用的字符（RFC 9110 的 token）
+_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
 def seal(values: dict[str, Any] | None, previous: dict[str, Any] | None = None) -> dict[str, str]:
@@ -21,6 +25,21 @@ def seal(values: dict[str, Any] | None, previous: dict[str, Any] | None = None) 
             text = old
         out[str(key)] = crypto.encrypt(text) or ""
     return out
+
+
+def header_problem(values: dict[str, Any] | None, *, check_values: bool = True) -> str | None:
+    """请求头（名字 → 明文值）哪里不合法，没问题交回 None。名字不能为空、只能是 HTTP 的 token：存成 {"": ""} 时，这一组
+    头的每个请求都在发出之前就失败，报出来的只是一句 LocalProtocolError。值不能换行、只能是可打印的英文字符（中文、全角
+    字符编不进请求头）；值里写了 {{ 参数 }} 模板的（自定义工具）由调用方关掉值的检查。"""
+    for name, value in (values or {}).items():
+        key = str(name)
+        if not key.strip():
+            return "请求头名称不能为空"
+        if not _HEADER_NAME.match(key):
+            return f"请求头名称「{key}」不合法：只能用英文字母、数字和 - _ . 这类符号，不能有空格、冒号或中文"
+        if check_values and any(not (" " <= ch <= "~" or ch == "\t") for ch in str(value or "")):
+            return f"请求头「{key}」的值不合法：只能用英文字母、数字、空格和常用符号，不能换行，也不能用中文或全角字符"
+    return None
 
 
 def masked(values: dict[str, Any] | None) -> dict[str, str]:

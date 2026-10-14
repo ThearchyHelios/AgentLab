@@ -12,15 +12,30 @@ import type { EndpointEnv, EndpointRow } from '../../typesApp'
 /*
  * 工具页的「端点」页签（A6、§3.9）：管理员登记的外部系统地址和凭据，分测试、生产两个环境。
  *
- * 认证头加密保存，接口只回掩码；编辑时不动的那一项保持掩码原样提交，服务端认作「保持原值」。允许访问内网只有管理员
- * 能开，而且只有登记的端点能访问内网（开了也照样拦元数据地址和高危端口）。带 version 保存，别人刚改过时 409，
- * 载入最新的再改。搭建者只读（§3.12）
+ * 认证头加密保存，接口只回掩码；编辑时不动的那一项保持掩码原样提交，服务端认作「保持原值」。认证头按行编辑：名称为空、
+ * 不合法、重复的那一行标红，不让保存——存成 {"": ""} 之后这个环境的每个请求都在发出之前失败（服务端同样拒收）。
+ * 允许访问内网只有管理员能开，而且只有登记的端点能访问内网（开了也照样拦元数据地址和高危端口）。带 version 保存，
+ * 别人刚改过时 409，载入最新的再改。搭建者只读（§3.12）。
+ * 测试连接照服务端说的写：2xx 才是成功；能连上但基础地址回 404、401 的是提醒，不说成「连接成功」
  */
 
 type EnvKey = 'test' | 'prod'
 const ENVS: EnvKey[] = ['test', 'prod']
 
 const blankEnv = (): EndpointEnv => ({ base_url: '', headers: {}, allow_intranet: false, verify_tls: true })
+
+/** 认证头的一行。按行存而不是按名字存：名字还空着、两行同名时也要能画出来、标出来 */
+interface HeaderRow { k: string; v: string }
+const rowsOf = (env?: EndpointEnv): HeaderRow[] => Object.entries(env?.headers ?? {}).map(([k, v]) => ({ k, v }))
+
+/** 请求头名称：HTTP 的 token（和服务端 capabilities/secrets.header_problem 同一条规矩，服务端为准） */
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+function headerProblem(row: HeaderRow, rows: HeaderRow[]): string | null {
+  if (!row.k.trim()) return T.headerEmpty
+  if (!HEADER_NAME.test(row.k)) return T.headerInvalid
+  if (rows.filter((r) => r.k.toLowerCase() === row.k.toLowerCase()).length > 1) return T.headerDuplicate
+  return null
+}
 
 export function EndpointsTab() {
   const admin = useAtLeast('admin')
@@ -44,9 +59,11 @@ export function EndpointsTab() {
   const test = async (row: EndpointRow, env: EnvKey) => {
     setTesting(`${row.id}/${env}`)
     try {
+      // 服务端按状态码照实说：2xx 才是成功；连上了但回 404、401 的，和连不上的一样是提醒
       const res = await api.endpoints.test(row.id, env)
-      if (res.ok) toast.ok(`${row.name} · ${T.envs[env]}：${T.testOk(res.status)}`)
-      else toast.warn(`${row.name} · ${T.envs[env]}：${res.message}`)
+      const text = `${row.name} · ${T.envs[env]}：${res.message}`
+      if (res.ok) toast.ok(text)
+      else toast.warn(text)
     } catch (e) {
       toast.error(e)
     } finally {
@@ -145,9 +162,14 @@ function EndpointEditor({ row, onClose, onSaved, onConflict }: {
   const [description, setDescription] = useState(row?.description ?? '')
   const [envs, setEnvs] = useState<{ test?: EndpointEnv; prod?: EndpointEnv }>(
     () => row?.environments ?? { prod: blankEnv() })
+  const [headers, setHeaders] = useState<Record<EnvKey, HeaderRow[]>>(
+    () => ({ test: rowsOf(row?.environments.test), prod: rowsOf(row?.environments.prod) }))
   const [idem, setIdem] = useState(row?.idempotency_header ?? 'Idempotency-Key')
   const [timeout, setTimeoutS] = useState(row?.timeout_s ?? 20)
   const [busy, setBusy] = useState(false)
+  // 配了的环境里有标红的请求头（名称空、不合法、重复）：不让保存
+  const headerBlocked = ENVS.some((env) => envs[env] && headers[env].some((r) => headerProblem(r, headers[env])))
+  const idemProblem = HEADER_NAME.test(idem) ? null : T.headerInvalid
   const setEnv = (env: EnvKey, patch: Partial<EndpointEnv> | null) =>
     setEnvs((cur) => {
       const next = { ...cur }
@@ -158,7 +180,10 @@ function EndpointEditor({ row, onClose, onSaved, onConflict }: {
 
   const save = async () => {
     setBusy(true)
-    const body = { name: name.trim(), description, environments: envs, idempotency_header: idem, timeout_s: timeout }
+    const environments = Object.fromEntries(ENVS.filter((env) => envs[env]).map((env) => [env, {
+      ...envs[env]!, headers: Object.fromEntries(headers[env].map((r) => [r.k, r.v])),
+    }]))
+    const body = { name: name.trim(), description, environments, idempotency_header: idem, timeout_s: timeout }
     try {
       const saved = row ? await api.endpoints.update(row.id, { ...body, version: row.version }) : await api.endpoints.create(body)
       onSaved(saved)
@@ -174,8 +199,8 @@ function EndpointEditor({ row, onClose, onSaved, onConflict }: {
     <Modal open onClose={onClose} title={row ? T.edit(row.name) : T.create} width={680} dirty
            footer={<>
              <button className="btn" onClick={onClose}>取消</button>
-             <button className="btn btn-primary" disabled={busy || !name.trim() || !Object.keys(envs).length}
-                     onClick={() => void save()} data-endpoint-save="">
+             <button className="btn btn-primary" disabled={busy || !name.trim() || !Object.keys(envs).length || headerBlocked || !!idemProblem}
+                     title={headerBlocked ? T.headerBlocked : undefined} onClick={() => void save()} data-endpoint-save="">
                {busy ? <Spinner size={11} /> : null} 保存
              </button>
            </>}>
@@ -187,7 +212,7 @@ function EndpointEditor({ row, onClose, onSaved, onConflict }: {
           <Field label={T.description}>
             {(p) => <input {...p} className="field" value={description} onChange={(e) => setDescription(e.target.value)} />}
           </Field>
-          <Field label={T.idempotency}>
+          <Field label={T.idempotency} error={idemProblem ?? undefined}>
             {(p) => <input {...p} className="field mono text-xs" value={idem} onChange={(e) => setIdem(e.target.value)} />}
           </Field>
           <Field label={T.timeout}>
@@ -196,19 +221,20 @@ function EndpointEditor({ row, onClose, onSaved, onConflict }: {
           </Field>
         </div>
         {ENVS.map((env) => (
-          <EnvEditor key={env} env={env} value={envs[env]} onChange={(patch) => setEnv(env, patch)} />
+          <EnvEditor key={env} env={env} value={envs[env]} onChange={(patch) => setEnv(env, patch)}
+                     headers={headers[env]} onHeaders={(next) => setHeaders((cur) => ({ ...cur, [env]: next }))} />
         ))}
       </div>
     </Modal>
   )
 }
 
-/** 一个环境：基础地址、认证头（掩码）、允许访问内网、校验证书。没配置时只给「添加」 */
-function EnvEditor({ env, value, onChange }: {
+/** 一个环境：基础地址、认证头（掩码，按行）、允许访问内网、校验证书。没配置时只给「添加」 */
+function EnvEditor({ env, value, onChange, headers, onHeaders }: {
   env: EnvKey; value?: EndpointEnv; onChange: (patch: Partial<EndpointEnv> | null) => void
+  headers: HeaderRow[]; onHeaders: (rows: HeaderRow[]) => void
 }) {
   const admin = useAtLeast('admin')
-  const headers = Object.entries(value?.headers ?? {})
   if (!value) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-xs" data-endpoint-env-editor={env}>
@@ -218,8 +244,8 @@ function EnvEditor({ env, value, onChange }: {
       </div>
     )
   }
-  const setHeader = (i: number, k: string, v: string) =>
-    onChange({ headers: Object.fromEntries(headers.map(([hk, hv], j) => (j === i ? [k, v] : [hk, hv]))) })
+  const setHeader = (i: number, patch: Partial<HeaderRow>) =>
+    onHeaders(headers.map((r, j) => (j === i ? { ...r, ...patch } : r)))
   return (
     <fieldset className="space-y-2 rounded-lg border px-3 py-2" data-endpoint-env-editor={env}>
       <legend className="px-1 text-xs font-medium">{T.envs[env]}</legend>
@@ -232,19 +258,29 @@ function EnvEditor({ env, value, onChange }: {
       </div>
       <div>
         <div className="mb-1 text-2xs text-faint">{T.headers} · {T.headersHint}</div>
-        {headers.map(([k, v], i) => (
-          <div key={i} className="mb-1 flex gap-1.5">
-            <input className="field mono w-44 shrink-0 text-xs" value={k} aria-label="请求头名称"
-                   onChange={(e) => setHeader(i, e.target.value, v)} />
-            <input className="field mono min-w-0 flex-1 text-xs" value={v} aria-label="请求头的值"
-                   onChange={(e) => setHeader(i, k, e.target.value)} />
-            <button type="button" className="btn btn-xs btn-ghost" aria-label={`删除请求头 ${k}`}
-                    onClick={() => onChange({ headers: Object.fromEntries(headers.filter((_, j) => j !== i)) })}>
-              <X size={11} aria-hidden />
-            </button>
-          </div>
-        ))}
-        <button type="button" className="btn btn-xs" onClick={() => onChange({ headers: { ...value.headers, '': '' } })}>
+        {headers.map((r, i) => {
+          const problem = headerProblem(r, headers)
+          const errorId = `endpoint-${env}-header-${i}-error`
+          return (
+            <div key={i} className="mb-1" data-endpoint-header={i}>
+              <div className="flex gap-1.5">
+                <input className="field mono w-44 shrink-0 text-xs" value={r.k} aria-label={T.headerName}
+                       aria-invalid={problem ? true : undefined} aria-describedby={problem ? errorId : undefined}
+                       onChange={(e) => setHeader(i, { k: e.target.value })} />
+                <input className="field mono min-w-0 flex-1 text-xs" value={r.v} aria-label={T.headerValue}
+                       onChange={(e) => setHeader(i, { v: e.target.value })} />
+                <button type="button" className="btn btn-xs btn-ghost" aria-label={T.removeHeader(r.k)}
+                        onClick={() => onHeaders(headers.filter((_, j) => j !== i))}>
+                  <X size={11} aria-hidden />
+                </button>
+              </div>
+              {problem && (
+                <p id={errorId} className="mt-0.5 text-2xs" style={{ color: 'var(--err)' }} data-endpoint-header-error="">{problem}</p>
+              )}
+            </div>
+          )
+        })}
+        <button type="button" className="btn btn-xs" onClick={() => onHeaders([...headers, { k: '', v: '' }])}>
           <Plus size={10} aria-hidden /> {T.addHeader}
         </button>
       </div>

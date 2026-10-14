@@ -61,6 +61,19 @@ export function componentIds(spec: AppSpec): Set<string> {
   return ids
 }
 
+/** 用到某个视图的组件（绑定的视图、可见性表达式所指的视图是它），按页面树的顺序：删视图前说清哪些组件会失去数据来源 */
+export function componentsOfView(spec: AppSpec, view: string): { page: AppPage; node: AppComponent }[] {
+  const out: { page: AppPage; node: AppComponent }[] = []
+  for (const page of spec.pages) {
+    const walk = (list: AppComponent[]) => list.forEach((c) => {
+      if (c.bind?.view === view || c.scope === view) out.push({ page, node: c })
+      if (c.children) walk(c.children)
+    })
+    walk(page.body)
+  }
+  return out
+}
+
 export function freshId(spec: AppSpec, base: string): string {
   const ids = componentIds(spec)
   if (!ids.has(base)) return base

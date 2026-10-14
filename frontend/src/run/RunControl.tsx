@@ -7,10 +7,10 @@ import { NODE_DEFS } from '../canvas/nodeDefs'
 import { hintOf } from '../canvas/shortcuts'
 import { Kbd, Skeleton, Spinner, toast } from '../components/ui'
 import { SchemaForm } from '../components/SchemaForm'
-import { useLocalActor } from '../lib/actor'
 import { errorMessage } from '../lib/errors'
 import { explainStartError } from '../lib/explain'
-import { runClassLabel } from '../lib/terms'
+import { SIGNER_TEXT, runClassLabel } from '../lib/terms'
+import { useSigner } from '../store/auth'
 import { useStudio, type FlowNode } from '../store/studio'
 import type { ValidationIssue, WorkflowVersion } from '../types'
 import type { FormSchema } from '../typesApp'
@@ -206,8 +206,8 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
   const dirty = useStudio((s) => s.dirty)
   const canvasVersion = useStudio((s) => s.workflow?.version)
   const startFormalRun = useStudio((s) => s.startFormalRun)
-  // 正式运行记在署名下（请求头 X-Actor）：和发布、审批一样写明以谁的名义
-  const actor = useLocalActor()
+  // 正式运行记在谁的名下：开了登录是登录的人（服务端不看署名），关登录是本机署名（请求头 X-Actor）。和发布、审批一样写明
+  const signer = useSigner()
   const key = `${workflowId}@${version}`
   const [open, setOpen] = useState(false)
   const [schema, setSchema] = useState<FormSchema | null>(versionForms.get(key) ?? null)
@@ -301,9 +301,11 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
           {schema && (
             <LaunchForm schema={schema} values={values} onChange={setValues} onSubmit={() => void launch()} idPrefix="run-formal" />
           )}
-          {actor ? (
+          {signer.verified ? (
+            <div className="sf-pop-sign" data-signer="verified">{SIGNER_TEXT.launchAs(signer.name)}</div>
+          ) : signer.name ? (
             <div className="sf-pop-sign" data-signer="signed">
-              将以「<b>{actor}</b>」的名义发起，并记入运行记录
+              将以「<b>{signer.name}</b>」的名义发起，并记入运行记录
             </div>
           ) : (
             <div className="sf-pop-sign is-unsigned" data-signer="unsigned">

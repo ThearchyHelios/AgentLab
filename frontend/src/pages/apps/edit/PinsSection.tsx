@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Plus, RefreshCw } from 'lucide-react'
 import { api } from '../../../api/client'
 import { DeleteButton, EmptyState, Field, SectionBar, confirmDialog, toast } from '../../../components/ui'
-import { APP_EDITOR_TEXT as T, WORKFLOW_STATUS_LABEL } from '../../../lib/terms'
+import { APP_EDITOR_TEXT as T, APP_TERM_TEXT, WORKFLOW_STATUS_LABEL } from '../../../lib/terms'
 import { useCatalog } from '../../../store/catalog'
 import type { WorkflowVersion } from '../../../types'
 import type { AppPin, PinUse } from '../../../typesApp'
@@ -93,6 +93,11 @@ export function PinsSection() {
           <Plus size={12} aria-hidden /> {T.pinAdd}
         </button>
       </SectionBar>
+      {/* 这一节里两个要先懂的词：固定版本、处置（上面那句提到的） */}
+      <div className="-mt-1 mb-3 space-y-0.5 text-2xs leading-relaxed text-dim" data-app-terms="">
+        <p data-app-term="pin">{APP_TERM_TEXT.pin}</p>
+        <p data-app-term="disposition">{APP_TERM_TEXT.disposition}</p>
+      </div>
       {!draft.pins.length && !adding && <EmptyState title={T.pinsEmpty} body={T.newIntro} />}
       <div className="space-y-2">
         {draft.pins.map((pin, i) => (

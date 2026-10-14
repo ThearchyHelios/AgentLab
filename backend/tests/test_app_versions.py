@@ -383,3 +383,20 @@ async def test_legacy_versions_with_formal_runs_are_backfilled_as_published():
             WorkflowVersion.__table__.select().where(WorkflowVersion.workflow_id == wf.id))).all()}
         assert levels == {1: "published", 2: None, 3: None}
         assert await backfill_legacy_levels(session) == 0
+
+
+async def test_only_an_admin_downgrades_a_governed_workflow(client, monkeypatch):
+    """当前发布版是受管级的工作流，以「已发布」发布新版本就是降级——之后的正式运行不再过治理门禁，和以受管级别发布
+    同一级的决定（Q8）：开登录时只给管理员。画布上改过之后 status 回到 draft，按当前发布版的级别认（published_level）。"""
+    from app.api import deps
+
+    wf = await workflow({1: "governed", 2: None}, current=1, status="draft")
+    assert (await client.get(f"/api/workflows/{wf}")).json()["published_level"] == "governed"
+    monkeypatch.setattr(deps, "current_principal",
+                        lambda: deps.Principal(username="bob", role="builder", verified=True, mode="local"))
+    res = await client.post(f"/api/workflows/{wf}/publish", json={"level": "published", "version": 2})
+    assert res.status_code == 403 and res.json()["code"] == "admin_only" and "降为已发布" in res.json()["detail"]
+    # 已发布级的工作流照旧由搭建者发布
+    plain = await workflow({1: "published", 2: None}, current=1, status="draft")
+    ok = await client.post(f"/api/workflows/{plain}/publish", json={"level": "published", "version": 2})
+    assert ok.status_code == 200, ok.text

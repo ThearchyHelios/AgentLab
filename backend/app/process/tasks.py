@@ -221,8 +221,11 @@ async def announce(task_id: str, event: EventType = EventType.TASK_OPENED) -> No
 
 
 def _matches(a: TaskAssignment, principal: Any) -> bool:
-    if a.status != "pending":
-        return False
+    return a.status == "pending" and _for(a, principal)
+
+
+def _for(a: TaskAssignment, principal: Any) -> bool:
+    """这一份派的是不是这个人（不看回没回复）。"""
     if getattr(principal, "mode", "off") == "off":
         return True
     if a.principal_kind == "user":
@@ -232,6 +235,14 @@ def _matches(a: TaskAssignment, principal: Any) -> bool:
     if a.principal_kind == "anyone":
         return principal.at_least("builder")
     return a.principal_kind == "hook" and principal.at_least("admin")
+
+
+def handles(rows: list[TaskAssignment], principal: Any) -> bool:
+    """这个人是不是这条待办的处理人：有一份没撤回的派给他（已经回复过的也算）。关登录时人人都算。
+
+    实例页的待办组件按它分：处理人给待办卡（能处理的给表单），别人只看这一步的状态，不去取待办——待办里带着中断内容
+    （报告概况、动作预览），按 id 读只给处理人和搭建者以上（visible）。"""
+    return any(a.status != "withdrawn" and _for(a, principal) for a in rows)
 
 
 def _pick(task: Task, rows: list[TaskAssignment], principal: Any) -> TaskAssignment:
@@ -344,6 +355,36 @@ def _tally(task: Task, rows: list[TaskAssignment], mine: TaskAssignment, verdict
     return "approve" if yes >= m else "reject" if no > n - m else None
 
 
+def progress(task: Task, rows: list[TaskAssignment]) -> dict[str, Any] | None:
+    """会签进度（给人看的那一份，界面照着画）：只算批准 / 驳回这一类。口径同 _tally——升级加派的那一份不算进会签人数，
+    它一人说了算；以前界面把它和原来的人算在一起，升级后写「0/3 已同意」，其实总监一人同意就通过。
+
+    voters 是会签的人数：待处理时按没撤回的算；判定之后剩下没回复的都撤回了，按判定那一刻记下的人数（outcome.voters），
+    老数据没记的按回复过的算。escalation 是升级加派的那几份：升级给的岗位、派给了谁、谁一人定了什么。"""
+    if task.kind not in VOTING:
+        return None
+    policy = task.policy or {"kind": "any"}
+    own = [a for a in rows if a.source != "escalation"]
+    said = [(a.response or {}).get("decision") for a in own if a.status == "responded"]
+    recorded = (task.outcome or {}).get("voters")
+    if task.status == "pending":
+        voters = len([a for a in own if a.status != "withdrawn"])
+    else:
+        voters = recorded if isinstance(recorded, int) else max(len(said), 1)
+    kind = policy.get("kind", "any")
+    need = voters if kind == "all" else min(int(policy.get("m") or 1), voters) if kind == "quorum" else 1
+    out: dict[str, Any] = {"policy": kind, "voters": voters, "need": need, "agreed": said.count("approve"),
+                           "rejected": said.count("reject")}
+    escalated = [a for a in rows if a.source == "escalation"]
+    if escalated:
+        decider = next((a for a in escalated if a.status == "responded"), None)
+        out["escalation"] = {"slot": str((task.on_timeout or {}).get("to_slot") or "").strip() or None,
+                             "assignees": [_who(a) for a in escalated],
+                             "decided": (decider.response or {}).get("decision") if decider else None,
+                             "by": decider.responded_by if decider else None}
+    return out
+
+
 def _signoffs(rows: list[TaskAssignment]) -> list[dict[str, Any]]:
     return [{"by": a.responded_by, "decision": (a.response or {}).get("decision"),
              "note": (a.response or {}).get("note") or "", "at": _iso(a.responded_at), "verified": a.verified,
@@ -396,10 +437,12 @@ async def respond(task_id: str, principal: Any, *, decision: Any, values: dict[s
                 final = {"approved": decided == "approve",
                          "note": "；".join(s["note"] for s in signoffs if s["note"]),
                          "signoffs": signoffs, "policy": task.policy}
+            # 会签人数记在结论里：判定之后没回复的都撤回了，进度要按判定那一刻的人数说（progress）
             claimed = await session.execute(
                 update(Task).where(Task.id == task.id, Task.status == "pending")
                 .values(status="resolving", resolved_by=principal.username,
-                        outcome={"decision": decided, "by_assignment": mine.id, "signoffs": _signoffs(rows)}))
+                        outcome={"decision": decided, "by_assignment": mine.id, "signoffs": _signoffs(rows),
+                                 "voters": len([a for a in voters if a.source != "escalation"])}))
             if claimed.rowcount != 1:
                 await session.rollback()
                 raise TaskRefused(_closed("resolving"))
@@ -650,7 +693,8 @@ async def _on_timeout(task_id: str, now: datetime) -> int:
             spawn(_notify(task_id, "task.reminded", [a.principal for a in pending if a.principal_kind == "user"]))
             return 1
         if action == "escalate" and task.escalation_level == 0:
-            slot = str(timeout.get("to_slot") or "")
+            # 和派生、检查认的是同一个岗位名（apps/tree.slot_refs 去掉了首尾空白）
+            slot = str(timeout.get("to_slot") or "").strip()
             claimed = await session.execute(update(Task).where(
                 Task.id == task_id, Task.status == "pending", Task.escalation_level == 0)
                 .values(escalation_level=Task.escalation_level + 1))
@@ -668,8 +712,11 @@ async def _on_timeout(task_id: str, now: datetime) -> int:
             return 1
         if action != "reject" or task.due_at is None or _aware(task.due_at) > now:
             return 0
+        rows = (await _assignments(session, [task_id])).get(task_id, [])
+        voters = len([a for a in rows if a.status != "withdrawn" and a.source != "escalation"])
         claimed = await session.execute(update(Task).where(Task.id == task_id, Task.status == "pending")
-                                        .values(status="resolving", outcome={"decision": "expired_reject"}))
+                                        .values(status="resolving",
+                                                outcome={"decision": "expired_reject", "voters": voters}))
         await session.commit()
         if claimed.rowcount != 1:
             return 0
@@ -858,7 +905,8 @@ async def _describe(session: AsyncSession, tasks: list[Task], principal: Any) ->
     approvals = {a.id: a for a in (await session.execute(
         select(Approval).where(Approval.id.in_([t.approval_id for t in tasks if t.approval_id])))).scalars()}
     runs = {r.id: r for r in (await session.execute(
-        select(Run.id, Run.workflow_name, Run.graph).where(Run.id.in_({t.run_id for t in tasks})))).all()}
+        select(Run.id, Run.workflow_name, Run.graph, Run.origin)
+        .where(Run.id.in_({t.run_id for t in tasks})))).all()}
     apps = dict((await session.execute(select(App.id, App.name).where(
         App.id.in_({t.app_id for t in tasks if t.app_id})))).all())
     out = []
@@ -872,7 +920,10 @@ async def _describe(session: AsyncSession, tasks: list[Task], principal: Any) ->
             "id": task.id, "approval_id": task.approval_id, "run_id": task.run_id, "node_id": task.node_id,
             "node_label": _node_label(run.graph if run else None, task.node_id),
             "app_id": task.app_id, "app_name": apps.get(task.app_id), "app_version": task.app_version,
-            "workflow_name": run.workflow_name if run else None, "kind": task.kind, "title": task.title,
+            "workflow_name": run.workflow_name if run else None,
+            # 实例的标题（应用入口按 instance_title 起的）：同一个人工节点的待办标题一样，列表里靠它分开
+            "instance_title": str((run.origin or {}).get("title") or "") or None if run else None,
+            "kind": task.kind, "title": task.title,
             "form": task.form, "policy": task.policy or {"kind": "any"}, "status": task.status,
             "due_at": _iso(task.due_at), "escalation_level": task.escalation_level, "payload": payload,
             "assignments": [{
@@ -881,6 +932,8 @@ async def _describe(session: AsyncSession, tasks: list[Task], principal: Any) ->
                 "decision": (a.response or {}).get("decision"), "verified": a.verified} for a in rows],
             "can_respond": task.status == "pending" and any(_matches(a, principal) for a in rows)
                            and not _voted(task, rows, principal),
+            "progress": progress(task, rows),
+            "my_response": my_response(rows, principal),
             "outcome": task.outcome, "resolved_by": task.resolved_by, "resolved_at": _iso(task.resolved_at),
             "created_at": _iso(task.created_at),
         })
@@ -896,6 +949,16 @@ def visible(item: dict[str, Any], principal: Any) -> bool:
         (a["principal_kind"] == "user" and a["principal"] == principal.username)
         or (a["principal_kind"] == "group" and a["principal"] in (principal.groups or ())))
         for a in item["assignments"])
+
+
+def my_response(rows: list[TaskAssignment], principal: Any) -> dict[str, Any] | None:
+    """这个人在这条待办上的回复（决定、时间、是否登录核实）：处理过的人再打开，写「你已处理：同意（时间）」，不写
+    「没有派给你」。认不出是谁（关登录又没署名）的是 None。"""
+    name = getattr(principal, "username", None)
+    mine = next((a for a in rows if name and a.status == "responded" and a.responded_by == name), None)
+    if mine is None:
+        return None
+    return {"decision": (mine.response or {}).get("decision"), "at": _iso(mine.responded_at), "verified": mine.verified}
 
 
 def _voted(task: Task, rows: list[TaskAssignment], principal: Any) -> bool:

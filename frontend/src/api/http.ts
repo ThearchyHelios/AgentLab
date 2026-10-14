@@ -97,10 +97,12 @@ export function actorHeader(): Record<string, string> {
 
 /**
  * 开了登录、会话没了（过期、被注销）：服务端回 401，整页跳到登录页，登录后回到原处。整页跳而不是路由跳：
- * 外壳里各个 store 拿的都是上一个人的数据，重新加载一遍最干净。登录接口自己的 401（密码不对）和登录页上的请求不跳
+ * 外壳里各个 store 拿的都是上一个人的数据，重新加载一遍最干净。登录接口自己的 401（密码不对）和登录页上的请求不跳。
+ * 认人接口（/auth/me）的 401 也不跳：它是「还没登录」的回答，外壳拿到后自己去登录页（App 启动时）——在这里再整页跳一次，
+ * 登录页加载起来又认一遍人，同一次进门要请求好几次
  */
 function toLogin(path?: string) {
-  if (typeof window === 'undefined' || path === '/auth/login') return
+  if (typeof window === 'undefined' || path === '/auth/login' || path === '/auth/me') return
   const { pathname, search } = window.location
   if (pathname === '/login') return
   const back = `${pathname}${search}`

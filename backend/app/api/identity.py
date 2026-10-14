@@ -1,4 +1,5 @@
-"""用户、组、审计（BE-1，只给管理员：main.py 挂 require_role("admin")）。设计文档 §2.7、§3.10。
+"""用户、组、审计（BE-1，只给管理员：main.py 挂 require_role("admin")）；人和组的名录（只读，给搭建者及以上）。
+设计文档 §2.7、§3.10。
 
 - 用户名一经建立就不改（各「人」列开了登录就写它）；改叫法改显示名。单点登录来的用户角色每次登录按映射重算，这里改了
   下次登录会被映射盖掉；
@@ -23,6 +24,9 @@ from app.db.models import AuditEvent, Group, GroupMember, User
 from app.db.models_identity import ROLES
 
 router = APIRouter(prefix="/api", tags=["identity"])
+#: 人和组的名录（GET /api/directory）：只读、给搭建者及以上（main.py 挂 require_role("builder")），岗位绑定、应用授权的
+#: 选人控件据此给候选、核对填的名字在不在。只有用户名、显示名、是否停用和组名，不含邮箱、角色、登录时间
+directory_router = APIRouter(prefix="/api", tags=["identity"])
 
 
 def _iso(value: Any) -> str | None:
@@ -203,6 +207,19 @@ async def delete_group(group_id: str, session: AsyncSession = Depends(get_sessio
     await record(session, "group.delete", "group", row.id, data={"name": row.name})
     await session.delete(row)
     await session.commit()
+
+
+# ---------------------------------------------------------------- 名录
+
+
+@directory_router.get("/directory")
+async def directory(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """选人用的名录。停用的人也列出来（标 disabled）：已经绑着他的岗位、授权要能认出「这个人停用了」，不是「没有这个人」。"""
+    users = (await session.execute(select(User).order_by(User.username))).scalars()
+    groups = (await session.execute(select(Group).order_by(Group.name))).scalars()
+    return {"users": [{"username": u.username, "display_name": u.display_name or u.username, "disabled": u.disabled}
+                      for u in users],
+            "groups": [{"name": g.name, "label": g.label or g.name} for g in groups]}
 
 
 # ---------------------------------------------------------------- 审计

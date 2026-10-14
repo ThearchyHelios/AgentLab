@@ -145,6 +145,14 @@ export function issuanceLabel(tier: string | null | undefined): string {
 }
 
 /**
+ * 指标出具（出具声明的 mode = metrics）：契约只写了「指标来自」，没有叙述也没有报告——纯指标看板，出具的就是指标本身。
+ * 出具横幅上说清这一档是按什么核的，读的人才知道「完整出具」不是没核
+ */
+export const ISSUANCE_MODE_TEXT = {
+  metrics: '按指标出具：没有叙述，核对的是指标本身——必需指标是否齐全、每个指标的输入是否追到原始数据、成果字段里的数是否都能回指到指标',
+}
+
+/**
  * 节点类型的中文名。画布节点库、运行流、门禁报错、GraphPeek 的 chip 都用这一张。
  *
  * 这是短名：节点库条目上的「成果 / 出具」是在短名后面补了一句用途，那是节点库
@@ -279,6 +287,19 @@ export const EVIDENCE_TEXT = {
   recomputeOk: '复算一致',
   recomputeBad: '复算不一致：代入式的计算结果与记录值不符',
   recomputeNone: '无法复算',
+  /**
+   * 输入追没追到原始数据（查询快照里的格、运行输入）。和「有出处」是两件事：有出处说的是这个数由口径卡确定性算出、
+   * 复算一致；追到原始数据说的是算式用到的输入能一路对到查询快照
+   */
+  origin: '原始数据',
+  originTraced: '输入都追到了原始数据（查询快照里的格或运行输入）',
+  originStop: (path: string, where: string) => `${path} 的出处追到${where}为止，没追到原始数据`,
+  originNode: (label: string, type: string) => (type ? `「${label}」（${type}）` : `「${label}」`),
+  originUnknown: (path: string) => `${path} 无法确定来自哪个节点，没追到原始数据`,
+  originChip: '未追到原始数据',
+  originChipHint: '这个数由口径卡确定性算出、复算一致，但算式用到的输入没有一路追到查询快照',
+  /** 按位置取的格穿过了原样解析查询结果的整形节点 */
+  through: (label: string) => `经「${label}」原样解析`,
   input: '运行输入',
   seal: '封存',
   sealOk: '已封存 · 核对一致',
@@ -343,9 +364,14 @@ export const EVIDENCE_TEXT = {
   masked: '已遮罩',
   /** 遮没遮核对不了、不显示的值（快照、取值链上的产出读不出来）：和「已遮罩」分开，数据源可能根本没设遮罩 */
   unverifiedValue: '无法核对',
-  /** 面板底部：被遮罩的列 + 遮罩不是安全边界（用户拍板写明） */
+  /**
+   * 面板底部：被遮罩的列 + 遮罩对谁是边界（用户拍板写明；口径同 README「哪些角色看得到原值」）。搭建者、管理员和未开启登录时
+   * 的所有人：只减少暴露，完整快照和原始工件中仍为原值；开了登录的使用者：是边界，原值不给
+   */
   maskNote: (cols: string[]) =>
     `已遮罩的列：${cols.join('、')}。遮罩只减少暴露，不是安全边界：完整快照和原始工件中仍为原值`,
+  maskNoteUser: (cols: string[]) =>
+    `已遮罩的列：${cols.join('、')}。这些列的原值不对使用者开放：你看到的查询结果、快照和工件都已按遮罩处理`,
   queryMissing: '未能获取查询结果的行',
   queryPending: '正在加载查询结果的行…',
   queryHash: '查询快照哈希校验失败，可能已被修改：这些行不能作为证据',
@@ -1103,11 +1129,13 @@ export const TOOL_TRUST_TEXT = {
   title: '运行时审批',
   /** 三选一的读屏名字 */
   groupLabel: (tool: string) => `${tool} 的运行时审批`,
-  explain: '默认每次调用都需人工审批；门控把关指每次先由小模型检查参数，可疑的调用仍转人工审批。正式运行不受此设置影响，一律需人工审批。',
+  // 和能力治理同一套规矩（tools/trust.py）：这三档只管探索运行；正式运行一律问人，能力登记里只读且设为「正式运行免审批」的
+  // 除外；设为「每次都要确认」的在哪种运行里都问
+  explain: '默认每次调用都需人工审批；门控把关指每次先由小模型检查参数，可疑的调用仍转人工审批。这里的设置只用于探索运行：正式运行一律需人工审批，能力登记中设为「正式运行免审批」的只读能力除外；设为「每次都要确认」的能力在哪种运行里都要审批。',
   /** 工具徽标：ask 和 gated 各一个，always 不挂 */
   badgeAsk: '运行时需审批',
   badgeGated: '门控把关',
-  badgeGatedHint: '探索运行中调用前先由门控模型检查参数，判定可疑时仍暂停等待人工审批。正式运行一律需人工审批。',
+  badgeGatedHint: '探索运行中调用前先由门控模型检查参数，判定可疑时仍暂停等待人工审批。正式运行不看这项设置：一律需人工审批，能力登记中设为「正式运行免审批」的只读能力除外。',
   saveFailed: (tool: string) => `「${tool}」的运行时审批修改失败，已恢复原设置`,
   /** 审批卡 */
   alwaysButton: '始终允许',
@@ -5010,8 +5038,10 @@ export const CAPABILITY_TEXT = {
   endpoint: '端点',
   endpointNone: '不绑定端点',
   lookup: '查询能力',
-  lookupHint: '写入结果未知时，用它按幂等键查询实际结果',
+  lookupHint: '写入结果未知时，用它按幂等键查询实际结果。只能选同一端点上、绑定这个端点的只读能力',
   lookupNone: '未登记',
+  lookupEmpty: '这个端点上还没有绑定它的只读能力可选',
+  lookupNoEndpoint: '没有绑定端点：查询能力由平台按登记的端点去查，绑定端点后才能选',
   version: (v: number) => `治理版本 v${formatNumber(v)}`,
   missing: '已不存在',
   missingHint: '上次同步时已找不到这个能力（工具被删除或改名），治理设置保留',
@@ -5047,7 +5077,6 @@ export const ENDPOINT_TEXT = {
   idempotency: '幂等请求头',
   timeout: '超时（秒）',
   test: (env: string) => `测试${env}连接`,
-  testOk: (status: number | null) => `连接成功${status != null ? `（HTTP ${status}）` : ''}`,
   saved: (name: string) => `已保存端点「${name}」`,
   removeTitle: (name: string) => `删除端点「${name}」？`,
   removeBody: '绑定了这个端点的能力将无法执行。',
@@ -5055,6 +5084,14 @@ export const ENDPOINT_TEXT = {
   noProd: '没有生产环境：正式运行写入时会被发布检查拦下',
   readOnlyHint: '只有管理员可以修改端点',
   addHeader: '添加认证头',
+  headerName: '请求头名称',
+  headerValue: '请求头的值',
+  removeHeader: (name: string) => `删除请求头 ${name}`,
+  /** 请求头名称不合法时不让保存（服务端同样拒收）：存进去之后这个环境的每个请求都发不出去 */
+  headerEmpty: '请填写请求头名称，或删掉这一行',
+  headerInvalid: '名称只能用英文字母、数字和 - _ . 这类符号，不能有空格、冒号或中文',
+  headerDuplicate: '名称重复',
+  headerBlocked: '请先改好标红的请求头',
   name: '名称',
   description: '说明',
 }
@@ -5237,6 +5274,9 @@ export const INPUT_FIELD_TEXT = {
   formats: { '': '不限', date: '日期', 'date-time': '日期时间', email: '邮箱', uri: '网址' } as Record<string, string>,
   enum: '可选值',
   enumHint: '每行一个；填写后变成下拉选择',
+  minimum: '最小值',
+  maximum: '最大值',
+  rangeHint: '包含边界；不能为 0 的金额写 0.01',
 }
 
 /** 工作流版本的退役与使用情况（A1、L4） */
@@ -5299,7 +5339,8 @@ export const APP_EDITOR_TEXT = {
   open: '打开应用',
   assistant: '助手',
   assistantToggle: '显示或隐藏助手',
-  // ---- 新建
+  // ---- 新建（向导的起点：现在只有「从已有的工作流开始」一种）
+  startFromWorkflow: '从已有的工作流开始',
   newIntro: '从一个已发布的工作流版本确定性地派生应用：入口表单、待办、指标、报告和表格按图生成，之后再调整布局和文案。',
   pickWorkflow: '工作流',
   pickVersion: '版本',
@@ -5375,6 +5416,17 @@ export const APP_EDITOR_TEXT = {
   viewsHint: '最近封存：固定版本最近一次封存的正式运行；按需：点刷新才发起；本实例：实例自己的那次运行',
   viewKinds: { latest_sealed: '最近封存', on_demand: '按需', instance: '本实例' } as Record<string, string>,
   viewAdd: '新增视图',
+  viewName: '视图名',
+  viewNamePlaceholder: (fresh: string) => `视图名，不填叫 ${fresh}`,
+  viewNameTaken: (key: string) => `已有名为「${key}」的视图，请换一个名字`,
+  viewRemove: (key: string) => `删除视图「${key}」`,
+  viewRemoveTitle: (key: string) => `删除视图「${key}」？`,
+  viewRemoveBody: '用到它的组件会失去数据来源：页面上不再显示这些组件的数据，发布检查会报绑定的视图不存在。',
+  viewRemoveBound: (names: string[]) => `用到它的组件：${names.join('、')}`,
+  viewRemoveUnused: '没有组件用到这个视图',
+  viewRemoveConfirm: '删除视图',
+  viewRemoved: (key: string) => `已删除视图「${key}」，保存草稿后生效`,
+  viewRemoveUndo: '撤销',
   viewPin: '固定版本',
   viewFrom: '取自',
   viewTtl: '缓存时效（秒）',
@@ -5566,6 +5618,32 @@ export const TOOL_ENDPOINT_TEXT = {
   query: '查询参数（JSON，可插值）',
   body: '请求体（JSON，可插值）',
   noEndpoints: '还没有登记的端点，在「工具 → 端点」中登记',
+}
+
+/**
+ * 数据源「遮罩的列」下面那句边界说明，口径同 README「哪些角色看得到原值」：对开了登录的使用者是边界（查询结果按派生遮罩
+ * 处理后才给，工具快照原文、运行事件里的结果预览不给，工件按白名单给）；对搭建者、管理员，以及未开启登录时的所有人，
+ * 只减少暴露
+ */
+export const MASK_BOUNDARY_TEXT = {
+  loginOn: '对使用者，遮罩是边界：查询结果按遮罩处理后才给，看不到原始快照和工件。对搭建者和管理员，遮罩只减少暴露：完整快照仍可通过工件获取，在 SQL 中为列设置别名也可绕过',
+  loginOff: '未开启登录：遮罩只减少暴露，不是安全边界——完整快照仍可通过工件获取，在 SQL 中为列设置别名也可绕过。开启登录后，遮罩对使用者是边界',
+}
+
+/**
+ * 写入能力在工具页试运行、工具库执行时只演练（A5）：对外写入只经「调用工具」节点发送——要确认、带幂等键、留生效记录。
+ * 交回的是将要发送的请求：方法、地址（哪个环境）、请求头的名字（值不显示）、请求体
+ */
+export const TOOL_REHEARSAL_TEXT = {
+  badge: '演练：写入能力不在这里真的发送',
+  hint: '对外写入只经「调用工具」节点发送：要确认、带幂等键、记入生效记录。下面是将要发送的请求',
+  hintArgs: '对外写入只经「调用工具」节点发送，这里没有执行。下面是这次的参数',
+  request: '请求',
+  environment: '环境',
+  headers: '请求头',
+  body: '请求体',
+  args: '参数',
+  none: '无',
 }
 
 /** MCP 服务的认证头、端点绑定和本地子进程的权限（A6 第 6 条） */

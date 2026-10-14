@@ -7,7 +7,7 @@
  */
 import type { FormField, FormSchema } from '../typesApp'
 
-/** 输入节点的一个字段（canvas/nodeDefs 的 ioFields；type / enum / format 是应用平台新加的，老图没有） */
+/** 输入节点的一个字段（canvas/nodeDefs 的 ioFields；type / enum / format / 上下限是应用平台新加的，老图没有） */
 export interface InputField {
   name: string
   required?: boolean
@@ -17,6 +17,9 @@ export interface InputField {
   type?: FormField['type']
   enum?: (string | number)[]
   format?: FormField['format']
+  /** 数字类型的上下限（闭区间，表单子集没有 exclusiveMinimum：「大于 0」的金额写 0.01） */
+  minimum?: number
+  maximum?: number
 }
 
 const TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array'])
@@ -40,6 +43,10 @@ export function inputSchemaOf(fields: InputField[]): FormSchema {
       field.enum = options
     }
     if (type === 'string' && f.format && FORMATS.has(f.format)) field.format = f.format
+    if (type === 'number' || type === 'integer') {
+      if (typeof f.minimum === 'number' && Number.isFinite(f.minimum)) field.minimum = f.minimum
+      if (typeof f.maximum === 'number' && Number.isFinite(f.maximum)) field.maximum = f.maximum
+    }
     // 老图的字段都是文本，多行框更好填（以前每个字段都是两行的文本框）
     if (field.type === 'string' && !field.enum && !field.format) field['x-widget'] = 'textarea'
     properties[f.name] = field

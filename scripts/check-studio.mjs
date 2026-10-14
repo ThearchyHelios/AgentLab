@@ -2944,6 +2944,15 @@ await section('应用平台：人工节点的流程配置、入口字段的类�
     check('入口字段可以选类型', await types.first().waitFor({ timeout: 4000 }).then(() => true, () => false))
     await page.locator('[data-sub="type"] select').first().selectOption('number')
     check('选了数字：写进字段的 type', (await cfg('in')).fields[0].type === 'number', JSON.stringify((await cfg('in')).fields[0]))
+    // 数字字段的上下限（表单子集只有闭区间：「大于 0」的金额写 0.01）：框里的字离开时才写回，「0.」打得出来
+    const min = page.locator('[data-input-field-range] [data-sub="minimum"] input').first()
+    check('数字字段有最小值、最大值两栏', await min.waitFor({ timeout: 3000 }).then(() => true, () => false)
+      && await page.locator('[data-input-field-range] [data-sub="maximum"] input').count() === 1)
+    await min.fill('0.')
+    check('最小值框能打出小数点', (await min.inputValue()) === '0.')
+    await min.fill('0.01')
+    await min.blur()
+    check('最小值写进字段的 minimum', (await cfg('in')).fields[0].minimum === 0.01, JSON.stringify((await cfg('in')).fields[0]))
     await page.locator('[data-sub="enum"] textarea').nth(1).fill('差旅\n办公')
     await page.locator('[data-sub="enum"] textarea').nth(1).blur()
     check('可选值一行一个', JSON.stringify((await cfg('in')).fields[1].enum) === JSON.stringify(['差旅', '办公']), JSON.stringify((await cfg('in')).fields[1]))
@@ -2959,6 +2968,7 @@ await section('应用平台：人工节点的流程配置、入口字段的类�
     const form = page.locator('[data-launch-form]')
     check('发起表单用 SchemaForm 画', await form.waitFor({ timeout: 3000 }).then(() => true, () => false))
     check('有可选值的字段是下拉', await form.locator('select').count() >= 1)
+    check('数字字段的下限带进发起表单', await form.locator('[data-field="amount"] input').getAttribute('aria-valuemin') === '0.01')
     await page.locator('.sf-pop button.btn-primary').last().click()
     check('试运行带上来源 canvas', await (async () => { for (let i = 0; i < 30 && !starts.length; i++) await page.waitForTimeout(100); return starts[0]?.origin === 'canvas' })(),
       JSON.stringify(starts[0]?.origin))

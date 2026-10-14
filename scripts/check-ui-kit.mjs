@@ -214,6 +214,16 @@ await section('lib：格式、状态、快捷键、术语、报错', async () =>
     ok('中文人话里的「超时」不套「操作超时」', zh.title !== '操作超时' && !(zh.reason ?? '').includes('操作超时')
       && !(zh.reason && zh.reason.includes(zh.title)), JSON.stringify(zh))
     eq('英文 timeout 原文照样翻成「操作超时」', e.humanizeError('ReadTimeout: timed out').title, '操作超时')
+    // 403 的「怎么办」按开没开登录说：关登录时是署名和权限设置的事；开了登录按角色和授权定，找管理员，不提署名
+    const denied = () => e.humanizeError(new ApiError(403, '没有权限：这项操作需要搭建者及以上的角色'))
+    eq('关登录的 403：检查署名和权限', denied().action, '请检查设置中的署名和权限。')
+    const { useAuth } = window.__ui
+    const was = useAuth.getState()
+    useAuth.setState({ me: { mode: 'local', username: 'u1', display_name: 'u1', role: 'user', groups: [], verified: true }, ready: true })
+    const on = denied()
+    useAuth.setState({ me: was.me, ready: was.ready })
+    ok('开了登录的 403：找管理员调整角色或授权，不提署名', on.action.includes('管理员') && !on.action.includes('署名')
+      && on.title.includes('搭建者'), JSON.stringify(on))
     ok('……原因里不带异常类名', !/ReadTimeout/.test(e.humanizeError('ReadTimeout: timed out').reason ?? ''))
 
     // 失败说明（lib/explain）：记录页、助手流、问数据页共用一份

@@ -114,8 +114,10 @@ export const endpoints = {
   update: (id: string, body: Partial<EndpointRow> & { version: number }) =>
     patch<EndpointRow>(`/endpoints/${encodeURIComponent(id)}`, body),
   remove: (id: string) => del(`/endpoints/${encodeURIComponent(id)}`),
+  /** ok：基础地址回了 2xx；reachable：连上了、拿到了响应（回 404、401 时连上了但不算成功）。message 是服务端照实写的那句 */
   test: (id: string, env: 'test' | 'prod') =>
-    post<{ ok: boolean; status: number | null; message: string }>(`/endpoints/${encodeURIComponent(id)}/test${qs({ env })}`),
+    post<{ ok: boolean; reachable?: boolean; status: number | null; message: string }>(
+      `/endpoints/${encodeURIComponent(id)}/test${qs({ env })}`),
 }
 
 export const notify = {

@@ -64,11 +64,22 @@ class WorkflowOut(BaseModel):
     status: str = "draft"
     published_version: int | None = None
     published_by: str | None = None
+    #: 当前发布版本的级别（published / governed）。status 在画布上改过之后会回到 draft，「这是不是受管工作流」看这一项
+    published_level: str | None = None
     created_at: Any = None
     updated_at: Any = None
     run_count: int = 0
 
     model_config = {"from_attributes": True}
+
+
+async def _published_levels(session: AsyncSession, ids: list[str] | None = None) -> dict[str, str]:
+    """各工作流当前发布版本的级别 {工作流 id: level}。没发布过、或老数据没记级别的不在里面。"""
+    stmt = select(WorkflowVersion.workflow_id, WorkflowVersion.level).join(
+        Workflow, (Workflow.id == WorkflowVersion.workflow_id) & (Workflow.published_version == WorkflowVersion.version))
+    if ids is not None:
+        stmt = stmt.where(WorkflowVersion.workflow_id.in_(ids))
+    return {wid: level for wid, level in (await session.execute(stmt)).all() if level}
 
 
 async def _run_counts(session: AsyncSession, ids: list[str] | None = None) -> dict[str, int]:
@@ -84,6 +95,7 @@ async def _workflow_out(session: AsyncSession, workflow: Workflow) -> WorkflowOu
     """返回单个工作流的接口都走这里，run_count 和列表一致。"""
     item = WorkflowOut.model_validate(workflow)
     item.run_count = (await _run_counts(session, [workflow.id])).get(workflow.id, 0)
+    item.published_level = (await _published_levels(session, [workflow.id])).get(workflow.id)
     return item
 
 
@@ -93,10 +105,12 @@ async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[W
         (await session.execute(select(Workflow).order_by(Workflow.updated_at.desc()))).scalars()
     )
     counts = await _run_counts(session)
+    levels = await _published_levels(session)
     out: list[WorkflowOut] = []
     for row in rows:
         item = WorkflowOut.model_validate(row)
         item.run_count = counts.get(row.id, 0)
+        item.published_level = levels.get(row.id)
         out.append(item)
     return out
 
@@ -240,11 +254,12 @@ class VersionOut(BaseModel):
     created_at: Any = None
     #: 这一版按哪一档发布的（published / governed）。没发布过、或者是记级别之前发布的为 null
     level: str | None = None
-    #: 这一版是谁、什么时候发布的；退役了的是什么时候、谁退的。存量为 null
+    #: 这一版是谁、什么时候发布的；退役了的是什么时候、谁退的、退役时写的说明（没写为 null）。存量为 null
     published_at: Any = None
     published_by: str | None = None
     retired_at: Any = None
     retired_by: str | None = None
+    retire_note: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -277,7 +292,6 @@ class VersionDetailOut(VersionOut):
     catalog_changes: list[dict[str, Any]] = Field(default_factory=list)
     #: 入口字段换成表单（agentlab.form/1）：发起表单、应用入口用同一个渲染器（X2）
     input_schema: dict[str, Any] = Field(default_factory=dict)
-    retire_note: str | None = None
     #: 账本（L4）：固定这一版的应用、生效记录数、正式运行数
     usage: dict[str, Any] = Field(default_factory=dict)
 
@@ -417,6 +431,10 @@ async def publish_workflow(
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
+    if payload.level != "governed" and workflow.published_version and \
+            (await _published_levels(session, [workflow_id])).get(workflow_id) == "governed":
+        # 把受管工作流降成已发布，之后的正式运行就不再过治理门禁：和以受管级别发布是同一级的决定（Q8）
+        _require_admin("把受管工作流降为已发布")
 
     version = payload.version or workflow.version
     snapshot = (

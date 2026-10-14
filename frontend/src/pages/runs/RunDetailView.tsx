@@ -17,10 +17,10 @@ import { runStatusOf, type RunPhase } from '../../run/trace'
 import { useCatalog } from '../../store/catalog'
 import type { Approval, Run, RunEvent } from '../../types'
 import { CatalogDriftBanner, FailedBanner, FeedbackStrip, HeldBanner, WaitingBanner, type Feedback } from './Banners'
-import { localActor } from '../../lib/actor'
+import { signerNow } from '../../store/auth'
 import { explainRunError, explainStartError } from '../../lib/explain'
 import { canLeave, leavePass } from '../../lib/leave'
-import { UNSAVED_HINT, isUnsaved, runName } from '../../lib/terms'
+import { SIGNER_TEXT, UNSAVED_HINT, isUnsaved, runName } from '../../lib/terms'
 import {
   asView, duplicateNames, graphShape, idTail, isLiveRun, runScope, type DetailView,
 } from './model'
@@ -225,14 +225,16 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   // 等审批、挂起的运行不再往下跑：收成已取消，待审批一并关闭（后端记下署名）
   const abandon = async () => {
     const n = d.pending?.length ?? 0
-    const actor = localActor()
+    // 开了登录：留痕记登录的人（服务端不看署名）；关登录：本机署名
+    const who = signerNow()
     const ok = await confirmDialog({
       title: '放弃这次运行？',
       body: code === 'waiting'
         ? `「${runName(run)}」正在等待审批。放弃后运行将终止，且无法恢复。`
         : `「${runName(run)}」已在断点处挂起。放弃后将无法继续运行。`,
       consequences: [
-        ...(n ? [`${n} 条待审批一并关闭，${actor ? `留痕署名「${actor}」` : '留痕记为未署名（可在「设置 → 偏好设置」中填写署名）'}`] : []),
+        ...(n ? [`${n} 条待审批一并关闭，${who.verified ? `留痕记为${SIGNER_TEXT.signedIn(who.name)}`
+          : who.name ? `留痕署名「${who.name}」` : '留痕记为未署名（可在「设置 → 偏好设置」中填写署名）'}`] : []),
         '运行记为已取消；已完成的节点、产出和事件仍会保留',
       ],
       danger: true,

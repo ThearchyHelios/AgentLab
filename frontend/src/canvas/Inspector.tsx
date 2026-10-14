@@ -1392,7 +1392,9 @@ function InputFieldType({ uid, field, onChange }: {
         <Sub label={INPUT_FIELD_TEXT.type} htmlFor={`${uid}-type`} className="flex-1" sub="type">
           <select id={`${uid}-type`} className="field" value={type}
                   onChange={(e) => onChange({ type: e.target.value === 'string' ? undefined : e.target.value,
-                                              ...(e.target.value !== 'string' ? { format: undefined } : {}) })}>
+                                              ...(e.target.value !== 'string' ? { format: undefined } : {}),
+                                              ...(e.target.value !== 'number' && e.target.value !== 'integer'
+                                                ? { minimum: undefined, maximum: undefined } : {}) })}>
             {Object.entries(INPUT_FIELD_TEXT.types).map(([k, label]) => <option key={k} value={k}>{label}</option>)}
           </select>
         </Sub>
@@ -1405,6 +1407,15 @@ function InputFieldType({ uid, field, onChange }: {
           </Sub>
         )}
       </div>
+      {(type === 'number' || type === 'integer') && (
+        <div className="flex gap-2" data-input-field-range="">
+          {(['minimum', 'maximum'] as const).map((key) => (
+            <Sub key={key} label={INPUT_FIELD_TEXT[key]} htmlFor={`${uid}-${key}`} className="flex-1" sub={key}>
+              <RangeInput id={`${uid}-${key}`} value={field[key]} onChange={(n) => onChange({ [key]: n })} />
+            </Sub>
+          ))}
+        </div>
+      )}
       {type !== 'boolean' && (
         <Sub label={INPUT_FIELD_TEXT.enum} htmlFor={`${uid}-enum`} sub="enum">
           <textarea id={`${uid}-enum`} className="field text-xs" rows={2} value={enumText}
@@ -1418,6 +1429,25 @@ function InputFieldType({ uid, field, onChange }: {
         </Sub>
       )}
     </div>
+  )
+}
+
+/**
+ * 数字字段的上下限：框里的字自己留一份，离开时才写回（「0.」这类打到一半的写法不被回写成 0）；读不成数的、清空的写回时
+ * 删掉这个键，不在配置里留空值
+ */
+function RangeInput({ id, value, onChange }: { id: string; value: unknown; onChange: (n: number | undefined) => void }) {
+  const shown = typeof value === 'number' && Number.isFinite(value) ? String(value) : ''
+  const [text, setText] = useState(shown)
+  useEffect(() => { setText(shown) }, [shown])
+  return (
+    <input id={id} type="text" inputMode="decimal" className="field tnum" title={INPUT_FIELD_TEXT.rangeHint} value={text}
+           onChange={(e) => setText(e.target.value)}
+           onBlur={() => {
+             const n = text.trim() === '' ? undefined : Number(text.trim())
+             onChange(n != null && Number.isFinite(n) ? n : undefined)
+             if (n == null || !Number.isFinite(n)) setText('')
+           }} />
   )
 }
 

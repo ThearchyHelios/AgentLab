@@ -16,7 +16,8 @@ import type { HealthRecord } from '../lib/health'
 import { ariaShortcut, matchShortcut } from '../lib/keys'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
 import {
-  CAPABILITY_TEXT, ENDPOINT_TEXT, MCP_AUTH_TEXT, TOOL_ENDPOINT_TEXT, TOOL_TRUST_HINT, TOOL_TRUST_LABEL, TOOL_TRUST_TEXT, TOOL_TRUST_VALUES,
+  CAPABILITY_TEXT, ENDPOINT_TEXT, MCP_AUTH_TEXT, TOOL_ENDPOINT_TEXT, TOOL_REHEARSAL_TEXT, TOOL_TRUST_HINT, TOOL_TRUST_LABEL,
+  TOOL_TRUST_TEXT, TOOL_TRUST_VALUES,
 } from '../lib/terms'
 import { useAtLeast } from '../store/auth'
 import type { EndpointRow } from '../typesApp'
@@ -409,20 +410,26 @@ function TrustControl({ tool }: { tool: ToolInfo | null | undefined }) {
  *
  * note：后端把拼错的参数名按唯一候选纠正了（「参数名 cuont 不存在，已按唯一候选
  * count 执行」）。跑是跑通了，但人会照着这份参数去配工作流，所以跟在结果下面
- * 用 warn 写出来，不能只当成功
+ * 用 warn 写出来，不能只当成功。
+ *
+ * rehearsal：写入能力在这里只演练、不发送（服务端 tools/custom.held_write），结果是将要发送的请求，不说「成功」。
+ * HTTP 工具对方回了非 2xx 的，服务端已经按失败交回（写明状态码），这里照常画失败
  */
 function ToolResult({ result, stale = false }: { result: any; stale?: boolean }) {
   const failed = result.ok === false
+  const rehearsal = !failed && result.rehearsal === true
   // 新结果常落在弹窗或详情区的可视范围以外（试跑区在编辑框最底下），note 的提醒不滚就
   // 看不见——而它就是要人在抄参数之前看到。每来一份新结果带进视野一次；不加 smooth，
   // reduced-motion 下也不会有滚动动画
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => { ref.current?.scrollIntoView({ block: 'nearest' }) }, [result])
   return (
-    <div ref={ref} className={clsx('mt-3', stale && 'opacity-60')} data-tool-result={failed ? 'fail' : 'ok'}>
+    <div ref={ref} className={clsx('mt-3', stale && 'opacity-60')} data-tool-result={failed ? 'fail' : rehearsal ? 'rehearsal' : 'ok'}>
       <div className="mb-1 flex items-center gap-1.5 text-xs">
-        <StatusBadge status={failed ? 'failed' : 'done'} size={12} decorative />
-        <span style={{ color: failed ? 'var(--err)' : 'var(--text-dim)' }}>{failed ? '失败' : '成功'}</span>
+        <StatusBadge status={failed ? 'failed' : rehearsal ? 'waiting' : 'done'} size={12} decorative />
+        <span style={{ color: failed ? 'var(--err)' : rehearsal ? 'var(--st-waiting)' : 'var(--text-dim)' }}>
+          {failed ? '失败' : rehearsal ? TOOL_REHEARSAL_TEXT.badge : '成功'}
+        </span>
         {result.duration_ms != null && <span className="tnum text-faint">· {formatDuration(result.duration_ms)}</span>}
         {stale && <span className="text-faint">· 配置或参数已修改，这是修改前的结果</span>}
       </div>
@@ -438,10 +445,44 @@ function ToolResult({ result, stale = false }: { result: any; stale?: boolean })
       )}
       {failed ? (
         <ErrorState compact error={result.thrown ?? result} />
+      ) : rehearsal ? (
+        <Rehearsal value={result.result} />
       ) : (
         <pre className="mono max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg border bg-panel p-2.5 text-xs leading-relaxed">
           {typeof result.result === 'string' ? result.result : JSON.stringify(result.result, null, 2)}
         </pre>
+      )}
+    </div>
+  )
+}
+
+/** 演练回执：将要发送的方法和地址、环境、请求头的名字、请求体；拼不出请求的（Python、MCP、数据源）没有执行，列这次的参数 */
+function Rehearsal({ value }: { value: any }) {
+  const req = value?.request
+  const T = TOOL_REHEARSAL_TEXT
+  const json = (v: unknown) => (v == null ? T.none : JSON.stringify(v, null, 2))
+  return (
+    <div className="space-y-1.5 rounded-lg border bg-panel p-2.5 text-xs" data-tool-rehearsal="">
+      <p className="text-2xs leading-relaxed text-dim">{req ? T.hint : T.hintArgs}</p>
+      {req ? (
+        <dl className="grid grid-cols-[4.5rem_1fr] gap-x-2 gap-y-1">
+          <dt className="text-faint">{T.request}</dt>
+          <dd className="mono min-w-0 break-all" data-tool-rehearsal-request="">{req.method} {req.url}</dd>
+          {value.environment && (
+            <>
+              <dt className="text-faint">{T.environment}</dt>
+              <dd>{ENDPOINT_TEXT.envs[value.environment] ?? value.environment}{value.endpoint ? ` · ${value.endpoint}` : ''}</dd>
+            </>
+          )}
+          <dt className="text-faint">{T.headers}</dt>
+          <dd className="mono min-w-0 break-all">{req.headers?.length ? req.headers.join('、') : T.none}</dd>
+          <dt className="text-faint">{T.body}</dt>
+          <dd className="min-w-0">
+            <pre className="mono max-h-60 overflow-auto whitespace-pre-wrap break-words">{json(req.body)}</pre>
+          </dd>
+        </dl>
+      ) : (
+        <pre className="mono max-h-60 overflow-auto whitespace-pre-wrap break-words">{json(value?.args)}</pre>
       )}
     </div>
   )

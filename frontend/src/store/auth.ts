@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { ApiError, api } from '../api/client'
+import { localActor, useLocalActor } from '../lib/actor'
 import type { AuthMode, Principal, Role } from '../typesApp'
 
 /**
@@ -18,37 +19,50 @@ interface AuthState {
   me: Principal | null
   /** 取过一次（成功或按 off 兜底）。网络失败时保持 false */
   ready: boolean
-  /** 取 /me；返回取到的身份，网络失败返回 null */
+  /**
+   * 还没登录、而且服务端说能建第一个管理员（账号密码登录的新部署，库里还没有能登录的管理员：/me 的 401 带 can_bootstrap）。
+   * 登录页据此给「建第一个管理员」的表单
+   */
+  canBootstrap: boolean
+  /** 取 /me；返回取到的身份，网络失败返回 null。同一时刻只发一个请求，后来的共用它 */
   load: () => Promise<Principal | null>
   set: (me: Principal) => void
   logout: () => Promise<void>
 }
 
+/** 在路上的那一次认人：启动时的认人、开发模式下 effect 执行两次、恢复连接时的补取撞在一起，共用这一个请求 */
+let loading: Promise<Principal | null> | null = null
+
 export const useAuth = create<AuthState>((set) => ({
   me: null,
   ready: false,
-  load: async () => {
-    try {
-      const me = await api.auth.me({ timeoutMs: 15_000 })
-      set({ me, ready: true })
-      return me
-    } catch (e) {
-      if (e instanceof ApiError && (e.status === 404 || e.status === 405) && !e.code) {
-        set({ me: OFF_PRINCIPAL, ready: true })
-        return OFF_PRINCIPAL
-      }
-      // 开了登录、还没登录：服务端回 401 并说明登录方式（登录页据此给账号密码表单还是单点登录按钮）
-      if (e instanceof ApiError && e.status === 401) {
-        const raw = (e.body as { mode?: unknown } | undefined)?.mode
-        const mode: AuthMode = raw === 'oidc' ? 'oidc' : 'local'
-        const me: Principal = { ...OFF_PRINCIPAL, mode, role: 'user', verified: false }
-        set({ me, ready: true })
+  canBootstrap: false,
+  load: () => {
+    loading ??= (async (): Promise<Principal | null> => {
+      try {
+        const me = await api.auth.me({ timeoutMs: 15_000 })
+        set({ me, ready: true, canBootstrap: false })
         return me
+      } catch (e) {
+        if (e instanceof ApiError && (e.status === 404 || e.status === 405) && !e.code) {
+          set({ me: OFF_PRINCIPAL, ready: true, canBootstrap: false })
+          return OFF_PRINCIPAL
+        }
+        // 开了登录、还没登录：服务端回 401 并说明登录方式（登录页据此给账号密码表单还是单点登录按钮），新部署还说能不能
+        // 建第一个管理员
+        if (e instanceof ApiError && e.status === 401) {
+          const body = e.body as { mode?: unknown; can_bootstrap?: unknown } | undefined
+          const mode: AuthMode = body?.mode === 'oidc' ? 'oidc' : 'local'
+          const me: Principal = { ...OFF_PRINCIPAL, mode, role: 'user', verified: false }
+          set({ me, ready: true, canBootstrap: mode === 'local' && body?.can_bootstrap === true })
+          return me
+        }
+        return null
       }
-      return null
-    }
+    })().finally(() => { loading = null })
+    return loading
   },
-  set: (me) => set({ me, ready: true }),
+  set: (me) => set({ me, ready: true, canBootstrap: false }),
   logout: async () => {
     await api.auth.logout()
     set({ me: null, ready: false })
@@ -81,6 +95,25 @@ export function principalName(me: Principal | null | undefined): string {
   const user = me.username?.trim() ?? ''
   return name && user && name !== user ? `${name}（${user}）` : name || user
 }
+
+/**
+ * 发布、发起、导入确认这些留痕记在谁的名下：开了登录是登录的人（verified，没有署名框——服务端开登录时只认登录的人，
+ * api/deps.actor_of、signer_of）；关登录是本机署名（自报、未认证，可能还没填，name 为空串）
+ */
+export interface Signer { verified: boolean; name: string }
+
+export function signerOf(me: Principal | null | undefined, actor: string | null): Signer {
+  return loginOn(me) ? { verified: true, name: principalName(me) } : { verified: false, name: actor ?? '' }
+}
+
+/** 订阅版：登录身份、本机署名变了跟着变 */
+export function useSigner(): Signer {
+  const me = useAuth((s) => s.me)
+  return signerOf(me, useLocalActor())
+}
+
+/** 不在组件里（确认框的文字、请求体）：取此刻的 */
+export const signerNow = (): Signer => signerOf(useAuth.getState().me, localActor())
 
 /** 登录页的地址，带上回来的路：/login?next=/apps/x */
 export function loginUrl(next?: string): string {

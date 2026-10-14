@@ -259,6 +259,10 @@ async def test_dashboard_app_on_a_schedule(client, source):
     res = await client.post(f"/api/workflows/{wf_id}/versions/1/retire", json={"note": "改按支付日"})
     assert res.status_code == 200, res.text
     assert [a["app_id"] for a in res.json()["affected_apps"]] == [old_app]
+    # 版本列表照样给退役的人、时间和说明：版本历史的列表里直接看得到，不用逐个点开
+    listed = {v["version"]: v for v in (await client.get(f"/api/workflows/{wf_id}/versions")).json()}
+    assert listed[1]["retired_at"] and listed[1]["retire_note"] == "改按支付日" and "retired_by" in listed[1]
+    assert listed[2]["retired_at"] is None and listed[2]["retire_note"] is None
     apps = {a["id"]: a for a in (await client.get("/api/apps")).json()["items"]}
     assert apps[old_app]["needs_upgrade"] is True and apps[app_id]["needs_upgrade"] is False
     assert apps[app_id]["my_role"] == "manage"
@@ -301,7 +305,10 @@ async def test_a_draft_preview_reads_sealed_runs_without_launching(client, sourc
     vm = (await client.get(f"/api/apps/{app_id}/pages/home", params={"draft": 1})).json()
     assert vm["app"]["version"] == 0 and vm["sources"]["latest"]["state"] == "empty"
     assert vm["sources"]["od"]["state"] == "empty"
-    assert {p["code"] for p in vm["problems"]} == {"view.source_empty"}
+    # 还没有数据是安静的空态，不进「无法显示」；印章上写明还没有、什么时候会有
+    assert vm["problems"] == []
+    assert vm["sources"]["latest"]["message"].startswith("还没有数据：") and "正式运行成功并封存后" in \
+        vm["sources"]["latest"]["message"]
     async with SessionLocal() as session:
         after = len((await session.execute(select(Run.id).where(Run.workflow_id == wf_id))).all())
     assert after == before, "草稿预览不该发起运行"

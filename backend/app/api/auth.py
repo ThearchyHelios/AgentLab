@@ -42,16 +42,18 @@ def principal_out(p: Principal) -> dict[str, Any]:
 
 
 @router.get("/me")
-async def me(x_actor: str | None = Header(default=None)) -> Any:
+async def me(x_actor: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> Any:
     """当前是谁。关登录：mode=off、role=admin、username 是自报的署名。开登录没登录：401，带 mode（登录页据此显示
-    账号密码还是单点登录）。"""
+    账号密码还是单点登录）和 can_bootstrap：账号密码登录、库里还没有能登录的管理员时为真（环境变量直接指定了 local
+    的新部署），登录页据此给「建第一个管理员」——条件和 POST /bootstrap 同一个，不多说别的。"""
     principal = current_principal()
     if principal.mode == "off":
         actor = decode_actor(x_actor)
         return principal_out(Principal(username=actor, display_name=actor, role="admin", mode="off"))
     if not principal.username:
+        can_bootstrap = principal.mode == "local" and not await _local_admin_exists(session)
         return JSONResponse(status_code=401, content={"detail": "请先登录", "code": "auth_required",
-                                                      "mode": principal.mode})
+                                                      "mode": principal.mode, "can_bootstrap": can_bootstrap})
     return principal_out(principal)
 
 

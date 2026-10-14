@@ -1398,11 +1398,13 @@ function BadgeShape({ shape, maskId, animate }: { shape: StatusShape; maskId: st
  * 徽标加中文。正常态安静（只有字色），异常态（失败、等人、挂起、阻断）才铺淡底。
  * 文字从 lib/status 取，全站只有这一份说法。
  */
-export function StatusPill({ status, pendingApproval, short = false, plain = false, title, className }: {
+export function StatusPill({ status, pendingApproval, short = false, plain = false, label, title, className }: {
   status: string
   pendingApproval?: boolean
   /** 用短叫法：「待审批」「完成」 */
   short?: boolean
+  /** 服务端给的说法（流程实例的结论，如「已退回」「等待核实写入结果」）：剪影和颜色仍按 status，文字用它 */
+  label?: string
   /** 不要底色和内边距，行内用 */
   plain?: boolean
   title?: string
@@ -1422,7 +1424,7 @@ export function StatusPill({ status, pendingApproval, short = false, plain = fal
       data-status={meta.code}
     >
       <StatusBadge status={status} pendingApproval={pendingApproval} size={12} decorative />
-      {short ? meta.short : meta.label}
+      {label || (short ? meta.short : meta.label)}
     </span>
   )
 }

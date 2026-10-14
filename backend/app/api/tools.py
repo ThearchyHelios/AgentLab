@@ -15,7 +15,7 @@ from app.capabilities.endpoints import bound_endpoint_ref, find_endpoint
 from app.core.errors import explain, raw
 from app.db.base import get_session
 from app.db.models import CustomTool, Endpoint, McpServer
-from app.tools.custom import ToolFailure, schema_problem, trial
+from app.tools.custom import ToolFailure, held_write, http_failure, schema_problem, trial
 from app.tools.mcp_manager import mcp_manager
 from app.tools.registry import (
     ToolArgsError, ToolBuildError, ToolContext, Versions, all_specs, build_tools, call_is_dangerous,
@@ -138,7 +138,7 @@ async def _side_effect(name: str, args: dict[str, Any], session: AsyncSession) -
         if ref := bound_endpoint_ref(row):
             endpoint = await find_endpoint(session, ref)
             return (f"将经登记的端点「{endpoint.name if endpoint else ref}」发送 {cfg.get('method') or 'GET'} 请求"
-                    "（试用按探索运行处理：有测试环境时发往测试环境，写入在没有测试环境时只演练、不发送）")
+                    "（试用按探索运行处理：有测试环境时发往测试环境，没有时发往生产环境）")
         if row.kind == "http":
             return (f"将调用自定义接口「{name}」"
                     f"（{cfg.get('method') or 'GET'} {cfg.get('url') or '（未填写地址）'}）")
@@ -150,6 +150,16 @@ async def _side_effect(name: str, args: dict[str, Any], session: AsyncSession) -
     if tools and call_is_dangerous(tools[0], name, args):
         return f"将在可写数据源上执行写操作：{str(args.get('sql') or '')[:120]}"
     return None
+
+
+async def _held(name: str, custom: CustomTool | None, session: AsyncSession) -> bool:
+    """在工具库里执行它是不是只演练：写外部系统的能力。自定义工具按它绑定的端点认（tools/custom.held_write），别的按
+    能力登记的治理认。"""
+    if custom is not None:
+        return await held_write(session, custom)
+    cap = await capability_registry.get_capability(session, name)
+    return cap is not None and capability_registry.writes_externally(
+        name, capability_registry.effective_effect(cap), cap.endpoint_id)
 
 
 @router.post("/{tool_name:path}/run")
@@ -164,8 +174,20 @@ async def run_tool(
     有副作用的工具先 409 说清它会做什么，带上 confirm 再来一次才执行。工作流里
     同一个「需确认」意味着要人工审批，在这里却点一下就真跑了——同一个标签两种
     含义，工具库里试 file_write、shell_exec 的人会以为还有一道关。
+
+    写入外部系统的能力（capabilities.registry.writes_externally，和运行时同一个判断）在这里一律演练、不发送，结果标
+    rehearsal：对外写入只经调用工具节点（要确认、带幂等键、留生效记录，A5）。没有副作用，也就不先 409。
     """
-    if not (confirm or payload.confirm):
+    import json
+    import time
+
+    custom = (await session.execute(select(CustomTool).where(CustomTool.name == tool_name))).scalar_one_or_none()
+    rehearsal = await _held(tool_name, custom, session)
+    if rehearsal and custom is None:
+        # 被治理为写入的 MCP、数据源、内置工具：拼不出将要发送的请求，不执行，交回这次的参数
+        return {"ok": True, "rehearsal": True, "duration_ms": 0,
+                "result": {"rehearsal": True, "message": "演练：写入能力不在这里真的执行", "args": payload.args}}
+    if not (rehearsal or confirm or payload.confirm):
         effect = await _side_effect(tool_name, payload.args, session)
         if effect:
             # 只说后果，不说怎么确认：弹窗还是再点一次是界面的事，写死在这里
@@ -175,8 +197,6 @@ async def run_tool(
     # 不在运行里：上传表格查当前版本（运行里查的是发起时固定的那一版）
     ctx = ToolContext(run_id="playground", node_id="playground",
                       sandbox_session=payload.sandbox_session, data_versions=Versions.CURRENT)
-    import time
-
     started = time.perf_counter()
     notes: list[str] = []
     try:
@@ -196,13 +216,23 @@ async def run_tool(
             "detail": raw(e),
             "duration_ms": int((time.perf_counter() - started) * 1000),
         }
-    return {
-        "ok": True,
-        "result": result,
-        "duration_ms": int((time.perf_counter() - started) * 1000),
-        # 参数名写错、被替换成唯一候选跑通了：运行时会报出来，这里也得说
-        **({"note": notes[0]} if notes else {}),
-    }
+    took = int((time.perf_counter() - started) * 1000)
+    # 参数名写错、被替换成唯一候选跑通了：运行时会报出来，这里也得说
+    extra = {"note": notes[0]} if notes else {}
+    if rehearsal:
+        # 演练回执是平台拼的 JSON：按对象交回，界面逐项画（方法、地址、请求头、请求体）。拼不出请求（路径参数不合法）的
+        # 交回的是 {error}：照实说失败
+        try:
+            value = json.loads(result) if isinstance(result, str) else result
+        except ValueError:
+            value = None
+        if not (isinstance(value, dict) and value.get("rehearsal")):
+            error = value.get("error") if isinstance(value, dict) else None
+            return {"ok": False, "error": str(error or result), "hint": "", "detail": "", "duration_ms": took, **extra}
+        return {"ok": True, "rehearsal": True, "result": value, "duration_ms": took, **extra}
+    if custom is not None and (failed := http_failure(custom, result)):
+        return {"ok": False, **failed, "duration_ms": took, **extra}
+    return {"ok": True, "result": result, "duration_ms": took, **extra}
 
 
 # --------------------------------------------------------------------------
@@ -249,10 +279,16 @@ def _refuse_bad_schema(parameters: Any) -> None:
 
 
 def _seal_config(config: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
-    """请求头的值加密；提交的是原值的掩码时保持原值。"""
+    """请求头的值加密；提交的是原值的掩码时保持原值。名字不合法（空的、带空格、冒号、中文）的不让存：存进去之后每次
+    调用都在发出之前失败。值里可以写 {{ 参数 }} 模板，不查。"""
     if "headers" not in config:
         return config
-    return {**config, "headers": vault.seal(config.get("headers"), (previous or {}).get("headers"))}
+    headers = config.get("headers")
+    if headers is not None and not isinstance(headers, dict):
+        raise HTTPException(422, "请求头需要写成 JSON 对象，每个请求头名称对应一个值")
+    if problem := vault.header_problem(headers, check_values=False):
+        raise HTTPException(422, problem)
+    return {**config, "headers": vault.seal(headers, (previous or {}).get("headers"))}
 
 
 async def _refuse_bad_binding(session: AsyncSession, kind: str, config: dict[str, Any]) -> None:
@@ -322,8 +358,9 @@ async def delete_custom(tool_id: str, session: AsyncSession = Depends(get_sessio
     await capability_registry.sync_all(session)
 
 
-async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
-    """试跑一次，返回和工具库「执行」同一种形状：{ok, result | error/hint/detail, duration_ms, note?}。"""
+async def _trial(row: CustomTool, args: dict[str, Any], session: AsyncSession) -> dict[str, Any]:
+    """试跑一次，返回和工具库「执行」同一种形状：{ok, result | error/hint/detail, duration_ms, note?, rehearsal?}。
+    写入能力只演练（rehearsal: true，结果是将要发送的请求）；HTTP 工具的结果按状态码说成败，非 2xx 是失败。"""
     import json
     import time
 
@@ -341,6 +378,7 @@ async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
                 "hint": '参数定义是 JSON Schema，格式如 {"type": "object", "properties": '
                         '{"n": {"type": "integer", "description": "…"}}, "required": ["n"]}',
                 "detail": "", "duration_ms": 0}
+    rehearsal = await held_write(session, row)
     try:
         result, note = await trial(row, args, ctx)
     except ToolArgsError as e:
@@ -363,6 +401,10 @@ async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": error, "hint": hint,
                 "detail": json.dumps(dict(result), ensure_ascii=False), "duration_ms": took(),
                 **extra}
+    if rehearsal:
+        return {"ok": True, "rehearsal": True, "result": result, "duration_ms": took(), **extra}
+    if failed := http_failure(row, result):
+        return {"ok": False, **failed, "duration_ms": took(), **extra}
     return {"ok": True, "result": result, "duration_ms": took(), **extra}
 
 
@@ -395,6 +437,8 @@ async def test_custom_draft(payload: CustomToolDraftIn, session: AsyncSession = 
     立刻用上一个还没试过的版本。
 
     编辑已保存的工具时，界面上的请求头是掩码：按同名工具存着的值认回来，不然试跑带着掩码去请求。
+    绑定端点的草稿按草稿的方法、路径、请求体拼请求（不是同名的已保存那一版）；读写按已保存的治理和草稿的方法里更严的
+    一个认（tools/custom._effect_of）：把只读的改成 POST 去试，只演练、不发送。
     """
     problem = _draft_problem(payload.kind, payload.config)
     if problem:
@@ -402,7 +446,7 @@ async def test_custom_draft(payload: CustomToolDraftIn, session: AsyncSession = 
     saved = (await session.execute(select(CustomTool).where(CustomTool.name == payload.name))).scalar_one_or_none()
     draft = CustomTool(name=payload.name or "draft_tool", kind=payload.kind, parameters=payload.parameters,
                        config=_seal_config(payload.config, saved.config if saved else None))
-    return await _trial(draft, payload.args)
+    return await _trial(draft, payload.args, session)
 
 
 @custom_router.post("/{tool_id}/test")
@@ -412,7 +456,7 @@ async def test_custom(
     row = await session.get(CustomTool, tool_id)
     if not row:
         raise HTTPException(404, "工具不存在，可能已被删除")
-    return await _trial(row, payload.args)
+    return await _trial(row, payload.args, session)
 
 
 # --------------------------------------------------------------------------

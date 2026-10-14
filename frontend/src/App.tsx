@@ -44,6 +44,7 @@ import {
   composeTitle, flagAttention, notifyInBackground, notifySupported, paintFavicon, useSignals,
 } from './lib/notify'
 import type { Attention, FaviconDot } from './lib/notify'
+import type { Principal } from './typesApp'
 import { useLeaveBlocker } from './lib/leave'
 import { useLocalActor } from './lib/actor'
 import { APP_TEXT, AUTH_MODE_LABEL, AUTH_TEXT, ROLE_LABEL, RUN_COMPARE_TEXT, TASK_NOTIFY_TEXT, runName } from './lib/terms'
@@ -65,15 +66,20 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       // 认人最多等 AUTH_WAIT_MS：服务端卡着不回时不能把目录也一起拖住（启动页的「比平时慢」要点得出是哪几张表）。
-      // 晚到的 401 自己会整页跳登录页（api/http）
-      const me = await Promise.race([
-        useAuth.getState().load(),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), AUTH_WAIT_MS)),
-      ])
-      if (needsLogin(me)) {
+      // 晚到的「还没登录」照样送去登录页（认人接口的 401 不整页跳，见 api/http）。load 同一时刻只发一个请求：
+      // 开发模式下这个 effect 执行两次，也只认一次人
+      const loading = useAuth.getState().load()
+      const toLoginPage = (who: Principal | null) => {
+        if (!needsLogin(who)) return false
         if (window.location.pathname !== '/login') navigate(loginUrl(), { replace: true })
-        return
+        return true
       }
+      const me = await Promise.race([
+        loading,
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), AUTH_WAIT_MS)),
+      ])
+      if (me === undefined) void loading.then(toLoginPage)
+      else if (toLoginPage(me)) return
       void useCatalog.getState().refresh()
     })()
     // 只在启动时认一次；登录、退出都整页重新加载

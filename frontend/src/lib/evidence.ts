@@ -862,7 +862,8 @@ export function evidenceTrace(
   for (const a of aliases) if (typeof a === 'string') add(catalog[a]?.node_id)
   for (const step of chain) {
     add(step.node_id)
-    for (const inp of step.inputs ?? []) add(inp.node_id)
+    // 按位置取的格穿过的整形节点（through）也在出处的路径上
+    for (const inp of step.inputs ?? []) { add(inp.node_id); add(inp.through) }
     for (const q of step.queries ?? []) if (typeof q === 'string') add(catalog[q]?.node_id)
   }
   const consumers = doc.node_id ? [doc.node_id] : []

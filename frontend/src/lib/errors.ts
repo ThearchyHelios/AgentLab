@@ -9,6 +9,7 @@
  */
 
 import { ApiError } from '../api/client'
+import { loginOn, useAuth } from '../store/auth'
 import { VALIDATION_TITLE } from './validation'
 
 export interface HumanError {
@@ -109,7 +110,12 @@ export function humanizeError(e: unknown): HumanError {
     const status = e.status
     let action = parsed.action
     if (!action && status >= 500) action = '请稍后重试；如反复出现，请查看服务端日志。'
-    if (!action && (status === 401 || status === 403)) action = '请检查设置中的署名和权限。'
+    // 开了登录：权限按登录的角色和应用授权定，服务端的原话已经说了要什么角色，这里只说找谁；关登录时没有角色这回事，
+    // 401 / 403 多半是署名或权限设置的事
+    if (!action && (status === 401 || status === 403)) {
+      action = !loginOn(useAuth.getState().me) ? '请检查设置中的署名和权限。'
+        : status === 401 ? '请重新登录后再试。' : '如需这项权限，请联系管理员调整你的角色或授权。'
+    }
     return {
       ...parsed,
       action,

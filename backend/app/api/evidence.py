@@ -128,6 +128,7 @@ from app.engine.evidence import (
     withhold_metrics,
 )
 from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candidates, outdated
+from app.engine.lineage import untraced
 from app.engine.merge_query import MERGE_SOURCE, trace_cell
 from app.engine.schema import CLAIMS_JUDGE, GraphSpec, challenge_report, dual_check_card
 from app.engine.toolcalls import QUERY_PREFIX
@@ -962,6 +963,10 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     # 期 4：这个指标做没做过双盲复算、结果如何。没有双盲复算复核过这份指标集时没有这个键，老运行一字不差
     if checked := _dual_check_of(sealed, str(entry.get("node_id") or ""), artifact, metric_id, metric):
         step["dual_check"] = checked
+    if metric is not None and metric.get("inputs"):
+        # 输入追没追到原始数据（engine/lineage.py）：和「有出处」（确定性复算一致）是两件事，面板分开说。追不到的照实说
+        # 出处追到哪个节点为止；卡上没有输入（常量）的没有可追的，不给这个键
+        step["untraced"] = _untraced_steps(metric, sealed)
     catalog = doc.get("catalog") or {}
     inputs: list[dict[str, Any]] = []
     #: 输入指到的查询快照 → 被引用的格；同一份快照只给一个查询步骤，格合在一起高亮
@@ -969,6 +974,9 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     held, word = await _metric_masks(metric or {}, str(entry.get("node_id") or ""), artifact, sealed, masks, card=card)
     for item in (metric or {}).get("inputs") or []:
         one = {"step": "input", **item}
+        if item.get("through"):
+            # 穿过原样解析查询结果的整形节点按位置取的格：面板写明经过的是哪个节点（图里的名字）
+            one["through_label"] = _node_label(sealed, item["through"])
         artifact_of = item.get("artifact")
         if artifact_of and item.get("via") in ("tool_cell", "agent_field"):
             one["query"] = _query_alias(catalog, artifact_of)
@@ -989,6 +997,26 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         step["value"] = word or MASKED
     queries = [s for a, cells in wanted.items() for s in await _query_steps(a, cells, doc, sealed, masks)]
     return [step, *inputs, *queries]
+
+
+def _node_label(sealed: _Sealed, node_id: Any) -> str:
+    """封存的图里这个节点的名字，没有名字的写 id。"""
+    node = next((n for n in (sealed.graph or {}).get("nodes") or [] if isinstance(n, dict) and n.get("id") == node_id), {})
+    return str((node.get("data") or {}).get("label") or node_id or "")
+
+
+def _untraced_steps(metric: dict[str, Any], sealed: _Sealed) -> list[dict[str, Any]]:
+    """指标的输入里追不到原始数据的：[{path, node_id, label, type}]，label 是封存的图里那个节点的名字、type 是节点类型
+    （面板按它写「数据整形」「沙箱代码」）。认不出是哪个节点的，node_id、label 为 None。"""
+    nodes = {n.get("id"): n for n in (sealed.graph or {}).get("nodes") or [] if isinstance(n, dict)}
+    out = []
+    for item in untraced(metric.get("inputs") or []):
+        node_id = item.get("node_id")
+        node = nodes.get(node_id) or {}
+        out.append({"path": item.get("path"), "node_id": node_id,
+                    "label": _node_label(sealed, node_id) if node_id else None,
+                    "type": node.get("type") or None})
+    return out
 
 
 @dataclass(frozen=True)

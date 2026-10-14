@@ -1,8 +1,9 @@
-"""内置模板「⑨ 可追溯周报」：tool 查库 → 解析 → 口径卡 → 报告撰写 → 出具（引用模式）。
+"""内置模板「⑨ 可追溯周报」：tool 查库 → 口径卡 → 报告撰写 → 出具（引用模式）。
 
 模板既是示范也是活文档：它要能通过 validate_graph，接上一个真实的库（这里用
 SQLite 建一个示例 shop 库）要能从头跑到尾、完整出具，报告里每个数都点得开。
-模板里只许出现通用示例名。
+口径卡用 cell() 按列名取查询结果的格，每个指标的输入都一路追到查询快照（engine/lineage.py）：
+模板教的就是这种写法。模板里只许出现通用示例名。
 """
 from __future__ import annotations
 
@@ -44,10 +45,55 @@ def test_template_passes_validation():
     assert {"name": "周报", "value": f"{{{{ nodes.{report_id}.text }}}}"} in out["data"]["config"]["fields"]
 
 
+def test_every_metric_of_the_template_reaches_the_query_snapshot():
+    """口径卡的每个指标都用 cell() 取数：静态地认（和应用检查同一套），没有一个输入停在半路。"""
+    from app.apps.tree import node_map
+    from app.engine.lineage import static_stops
+
+    nodes = node_map(graph())
+    [card] = [n for n in nodes.values() if n["type"] == "metrics"]
+    metrics = card["config"]["metrics"]
+    assert metrics and all("cell(nodes.fetch" in m["expression"] for m in metrics)
+    assert {m["id"]: static_stops(nodes, m["expression"]) for m in metrics} == {m["id"]: [] for m in metrics}
+
+
+async def test_every_metric_of_a_run_is_traced_to_the_snapshot(engine_up, shop, monkeypatch, client):
+    """跑一遍：每个指标的输入都是单元格取数、与快照一致；证据接口的指标步骤说输入都追到了原始数据。"""
+    from app.providers import mock_model
+
+    monkeypatch.setattr(mock_model.MockChatModel, "_decide",
+                        lambda self, messages: AIMessage(content="销售额 [[m:gmv]]。[[see:m:gmv]]"))
+    run = await run_manager.start(graph=graph(), input_payload={})
+    for _ in range(400):
+        await asyncio.sleep(0.05)
+        async with SessionLocal() as session:
+            row = await session.get(Run, run.id)
+        if row.status in ("succeeded", "failed") and row.manifest_seq is not None:
+            break
+    assert row.status == "succeeded", row.error
+    for metric in ("gmv", "orders", "wow", "aov", "refund_rate"):
+        chain = (await client.get(f"/api/runs/{run.id}/evidence/metrics/caliber/{metric}")).json()["chain"]
+        step = chain[0]
+        assert step["step"] == "metric" and step["untraced"] == [], (metric, step.get("untraced"))
+        inputs = [s for s in chain if s["step"] == "input"]
+        assert inputs and all(i["via"] == "tool_cell" and i["status"] == "verified" for i in inputs), metric
+        assert chain[-1]["step"] == "query"
+
+
 def test_template_is_listed_once_and_keeps_template_eight():
     names = [t["name"] for t in TEMPLATES]
     assert names.count(NAME) == 1
     assert any(n.startswith("⑧ 周报") for n in names)     # 老模板不改，免得覆盖用户复制过的那一份
+
+
+@pytest.fixture
+async def client():
+    from httpx import ASGITransport, AsyncClient
+
+    from app.main import app
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
 
 
 @pytest.fixture

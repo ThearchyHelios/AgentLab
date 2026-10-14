@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Archive, ChevronLeft, History, RotateCcw, ShieldCheck } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { Archive, ChevronLeft, History, LayoutGrid, RotateCcw, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import {
@@ -12,6 +13,7 @@ import { CATALOG_DRIFT_TEXT, VERSION_USAGE_TEXT, WORKFLOW_STATUS_LABEL } from '.
 import { useAtLeast } from '../store/auth'
 import { RetiredNote, VersionUsageLine, retireBlocked, retireVersion, useVersionUsage } from './versionUsage'
 import { hintOf } from './shortcuts'
+import { newAppPath } from '../pages/apps/shared'
 import type { Edge } from '@xyflow/react'
 import type { CatalogDriftTable, CatalogVersions as CatalogVersionsRecord, GraphSpec, Workflow, WorkflowVersion } from '../types'
 
@@ -144,6 +146,12 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
                             </span>
                           )}
                         </span>
+                        {/* 谁、什么时候退的，退役时写的说明：列表上直接看得到，不用逐个点开 */}
+                        {v.retired_at && (
+                          <span className="mt-0.5 block">
+                            <RetiredNote by={v.retired_by} at={v.retired_at} note={v.retire_note} />
+                          </span>
+                        )}
                       </span>
                     </button>
                     {open && (
@@ -229,16 +237,19 @@ function VersionPreview({ version, target, diff, lock, onRestore }: {
 const DIFF_COLOR = { add: 'var(--ok)', del: 'var(--err)', mod: 'var(--warn)' } as const
 
 /**
- * 发布过的版本：被哪些应用固定、生效记录和正式运行各有多少（L4），以及退役（A1）。草稿版本两样都没有，不画。
- * 退役之后这一版不能再发起正式运行；固定它的应用标「需升级」，进行中的实例照常走完
+ * 发布过的版本：被哪些应用固定、生效记录和正式运行各有多少（L4），做成应用，以及退役（A1）。草稿版本都没有，不画。
+ * 退役之后这一版不能再发起正式运行，也不能再做成应用（应用只能固定已发布且未退役的版本）；固定它的应用标「需升级」，
+ * 进行中的实例照常走完。退役的人、时间和说明写在列表那一行上，这里不再重复
  */
 function VersionLifecycle({ workflowId, version, current, onRetired }: {
   workflowId: string; version: WorkflowVersion; current: boolean; onRetired: () => void
 }) {
+  const navigate = useNavigate()
   const publishedLevel = !!version.level || current
   const usage = useVersionUsage(workflowId, publishedLevel ? version.version : null)
-  // 退役只给管理员（Q8）；关登录时所有人等同管理员
+  // 退役只给管理员（Q8）；关登录时所有人等同管理员。做成应用给搭建者及以上（同应用首页的「新建应用」）
   const admin = useAtLeast('admin')
+  const builder = useAtLeast('builder')
   if (!publishedLevel) return null
   const blocked = retireBlocked({ current, publishedLevel, retired: !!version.retired_at, admin })
   return (
@@ -247,10 +258,15 @@ function VersionLifecycle({ workflowId, version, current, onRetired }: {
       <div className="mt-1">
         {usage ? <VersionUsageLine usage={usage} /> : <span className="text-faint">…</span>}
       </div>
-      {version.retired_at ? (
-        <div className="mt-1.5"><RetiredNote by={version.retired_by} at={version.retired_at} note={version.retire_note} /></div>
-      ) : (
+      {!version.retired_at && (
         <>
+          {builder && (
+            <button type="button" className="btn btn-sm mt-2 w-full justify-center" title={VERSION_USAGE_TEXT.makeAppHint}
+                    data-version-make-app={version.version}
+                    onClick={() => navigate(newAppPath({ workflow: workflowId, version: version.version }))}>
+              <LayoutGrid size={11} aria-hidden /> {VERSION_USAGE_TEXT.makeApp}
+            </button>
+          )}
           <button type="button" className="btn btn-sm mt-2 w-full justify-center" disabled={!!blocked}
                   title={blocked ?? undefined} data-version-retire={version.version}
                   onClick={async () => { if (await retireVersion(workflowId, version.version, usage)) onRetired() }}>

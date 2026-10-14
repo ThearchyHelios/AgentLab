@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
 from app.api.coded import PROFILE_SETTINGS_INVALID, CodedHTTPException
-from app.api.runs import actor_of
+from app.api.deps import signer_of
 from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
@@ -1065,8 +1065,8 @@ async def purge_raw(
         raise CodedHTTPException(422, "请填写清除原件的理由", "reason_required")
     if len(reason) > _PURGE_REASON_MAX:
         raise CodedHTTPException(422, f"理由不能超过 {_PURGE_REASON_MAX} 字", "reason_required")
-    signed = body.get("signed_by")
-    signed_by = signed.strip()[:_SIGNED_MAX] if isinstance(signed, str) and signed.strip() else actor_of(x_actor)
+    # 开了登录是登录的人；关登录时请求体的 signed_by 优先，其次 X-Actor（signer_of）
+    signed_by = signer_of(body.get("signed_by"), x_actor, _SIGNED_MAX)
     if imp.raw_state == "absent":
         raise CodedHTTPException(409, "这次导入没有保存原件", "raw_absent")
     if imp.raw_state == "purged":

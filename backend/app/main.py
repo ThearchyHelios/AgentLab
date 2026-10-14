@@ -217,6 +217,8 @@ for router, guard in (
     # 应用平台。登录、登出、OIDC、JWKS 匿名可用，设置在接口里要管理员；入站钩子只认签名
     (auth_api.router, []),
     (identity_api.router, _ADMIN),
+    # 选人用的名录（用户名、显示名、是否停用、组名）：岗位绑定、应用授权由搭建者做，只读
+    (identity_api.directory_router, _BUILDER),
     # 能力登记、端点：搭建者只读，改动在接口里要管理员
     (capabilities_api.router, _BUILDER),
     # 应用、待办、生效记录、通知：各自按应用授权、派给谁再判断

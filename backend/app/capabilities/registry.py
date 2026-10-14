@@ -7,7 +7,9 @@ capabilities 一行 = 图里一个可调用的工具（主键就是图里写的�
   endpoint_id。每改一次 version 加一，写审计。
 
 同步得出的效果（effect_system）只说系统知道的：
-- 内置工具：有副作用的（ToolSpec.dangerous）为 dynamic，别的为 read；
+- 内置工具：有副作用的（ToolSpec.dangerous，以及改平台自身状态的 ToolSpec.writes_state，如写记忆）为 dynamic，别的为
+  read。写平台自身的状态不是对外写入（writes_externally 只认写入和绑定端点的），照旧能给 Agent 用；
+  只是不能记成只读：只读的才能正式运行免审批、才能当写入的查询能力；
 - 数据源：只读源的查询、查表结构为 read；可写源的查询为 dynamic（SELECT 只读、DML 是写，看这一次的 SQL）；
 - 自定义工具：python 和没绑定端点的 http 为 dynamic（平台不知道它做什么）；绑定端点的 http 按方法，GET / HEAD 为 read，
   其余为 write——「写」只出在登记的端点上，老工具一个都不会因为升级被当成写入能力拒掉；
@@ -79,7 +81,7 @@ async def _discover(session: AsyncSession) -> dict[str, dict[str, Any]]:
     for name, spec in all_specs().items():
         found[name] = {"system": "builtin", "title": name, "description": spec.description,
                        "params_schema": _json_schema(spec.args_schema),
-                       "effect_system": "dynamic" if spec.dangerous else "read"}
+                       "effect_system": "dynamic" if spec.dangerous or spec.writes_state else "read"}
 
     for src in (await session.execute(select(DataSource))).scalars():
         found[f"{QUERY_PREFIX}{src.name}"] = {
@@ -296,13 +298,14 @@ async def snapshot_owned(artifact_id: str, run_id: str, name: str) -> bool:
 
 async def endpoint_request(session: AsyncSession, capability: Any, args: dict[str, Any], *, environment: str,
                            idem_key: str | None = None, on_behalf: str | None = None,
-                           run_id: str | None = None, node_id: str | None = None) -> EndpointResult:
+                           run_id: str | None = None, node_id: str | None = None,
+                           tool: Any = None) -> EndpointResult:
     """平台执行器：按登记的端点发请求（只认登记的 base_url，参数按路径段编码代入），声明了 tabular 的读取落快照。
-    实现在 capabilities/endpoints.py。"""
+    实现在 capabilities/endpoints.py。tool：按这一行自定义工具拼请求（工具页试运行的草稿），不给按能力名找已保存的。"""
     from app.capabilities.endpoints import endpoint_request as run
 
     return await run(session, capability, args, environment=environment, idem_key=idem_key, on_behalf=on_behalf,
-                     run_id=run_id, node_id=node_id)
+                     run_id=run_id, node_id=node_id, tool=tool)
 
 
 async def snapshot_masked_columns(snap: dict[str, Any]) -> set[str]:
@@ -372,6 +375,21 @@ def validate_governance(changes: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+async def _check_lookup(session: AsyncSession, name: str, endpoint_id: str | None, lookup: Any) -> None:
+    """查询能力（写入结果未知时按幂等键去查实际结果，process/actions._lookup）由平台按登记的端点替它发请求
+    （endpoint_request），所以只能是同一个端点上、绑定端点的只读能力：写记忆这类平台自身的写、别的系统上的读取、
+    MCP 和 Python 工具都查不了这一笔写入。能力页的候选按同一条规矩列。"""
+    from app.capabilities.endpoints import bound_endpoint_ref
+    from app.db.models import Capability, CustomTool
+
+    ref = str(lookup)
+    finder = await session.get(Capability, ref)
+    tool = (await session.execute(select(CustomTool).where(CustomTool.name == ref))).scalar_one_or_none()
+    if (ref == name or finder is None or finder.missing or effective_effect(finder) != "read" or tool is None
+            or not bound_endpoint_ref(tool) or not endpoint_id or finder.endpoint_id != endpoint_id):
+        raise GovernanceError("查询能力只能选同一端点上、绑定这个端点的只读能力：平台按登记的端点替它按幂等键去查")
+
+
 class VersionConflict(Exception):
     """治理字段在读到之后被别人改过（version 对不上）。"""
 
@@ -404,6 +422,8 @@ async def govern(session: AsyncSession, name: str, changes: dict[str, Any], *, v
         raise GovernanceError("绑定登记端点的能力由平台按登记发请求，分不出某一次是读还是写：效果只能是只读或写入")
     if clean.get("approval", row.approval) == "none" and effect != "read":
         raise GovernanceError("只有只读能力可以免审批：写入和视参数而定的能力，审批至少要跟随信任设置")
+    if clean.get("lookup"):
+        await _check_lookup(session, name, endpoint_id, clean["lookup"])
     before = {k: getattr(row, k) for k in clean}
     done = await session.execute(
         update(Capability).where(Capability.name == name, Capability.version == version)

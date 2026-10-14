@@ -78,13 +78,21 @@ def seal_environments(given: dict[str, Any] | None, previous: dict[str, Any] | N
             raise EndpointError(f"{_ENV_LABEL[key]}的地址需要以 http:// 或 https:// 开头")
         if "?" in base or "#" in base:
             raise EndpointError(f"{_ENV_LABEL[key]}的地址不能带查询参数，参数请写在能力的配置里")
-        out[key] = {"base_url": base,
-                    "headers": vault.seal(env.get("headers"), (before.get(key) or {}).get("headers")),
-                    "allow_intranet": bool(env.get("allow_intranet")),
+        headers = vault.seal(env.get("headers"), (before.get(key) or {}).get("headers"))
+        # 按掩码换回原值之后再查：界面提交的是掩码，查的是真正要发出去的那一份
+        if problem := vault.header_problem(vault.reveal(headers)):
+            raise EndpointError(f"{_ENV_LABEL[key]}的认证头有误：{problem}")
+        out[key] = {"base_url": base, "headers": headers, "allow_intranet": bool(env.get("allow_intranet")),
                     "verify_tls": env.get("verify_tls", True) is not False}
     if not out:
         raise EndpointError("端点至少需要配置一个环境")
     return out
+
+
+def idempotency_header_problem(name: str) -> str | None:
+    """幂等请求头的名字合不合法：写入时按它带上幂等键，名字不合法每次写入都发不出去。"""
+    problem = vault.header_problem({name: ""})
+    return f"幂等请求头有误：{problem}" if problem else None
 
 
 _ENV_LABEL = {"test": "测试环境", "prod": "生产环境"}
@@ -217,10 +225,14 @@ def _parse(resp: httpx.Response) -> Any:
         return text
 
 
-async def _resolve(session: AsyncSession, capability: Any) -> tuple[Capability | None, CustomTool, Endpoint]:
+async def _resolve(session: AsyncSession, capability: Any, tool: CustomTool | None = None
+                   ) -> tuple[Capability | None, CustomTool, Endpoint]:
+    """能力 → (登记行, 自定义工具, 端点)。给了 tool 就按它拼请求（工具页试运行的草稿：发的是眼前编辑的配置），没给按能力名
+    找已保存的那一行。"""
     name = capability if isinstance(capability, str) else capability.name
     cap = capability if isinstance(capability, Capability) else await session.get(Capability, name)
-    tool = (await session.execute(select(CustomTool).where(CustomTool.name == name))).scalar_one_or_none()
+    if tool is None:
+        tool = (await session.execute(select(CustomTool).where(CustomTool.name == name))).scalar_one_or_none()
     if tool is None or bound_endpoint_ref(tool) is None:
         raise EndpointError(f"能力「{name}」没有绑定登记的端点，不能由平台执行")
     endpoint = await find_endpoint(session, bound_endpoint_ref(tool))
@@ -237,6 +249,58 @@ async def preview_request(session: AsyncSession, capability: Any, args: dict[str
     return {**req, "endpoint": endpoint.name, "environment": environment}
 
 
+REHEARSAL_MESSAGE = "演练：写入能力不在这里真的发送，下面是将要发送的请求"
+
+
+def rehearsal(endpoint: Endpoint, config: dict[str, Any], capability: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """写入能力在工具页试运行、工具库执行（不在运行里）时交回的演练回执：不发送，交回将要发送的方法、地址、查询参数、
+    请求体和请求头的名字（值不交回）。地址按探索运行定环境：有测试环境写测试环境的，没有时写正式运行要发往的生产环境。
+    对外写入只经调用工具节点发送：要确认、带幂等键、留生效记录（A5）——试运行绕过这些真发一次，打到的就是对方的系统。"""
+    envs = endpoint.environments or {}
+    environment = "test" if envs.get("test") else "prod"
+    req = build_request(endpoint, environment, config, args)
+    headers = sorted((envs.get(environment) or {}).get("headers") or {})
+    headers.append(endpoint.idempotency_header or "Idempotency-Key")
+    if capability is not None and getattr(capability, "credential_mode", None) == "service_on_behalf":
+        from app.auth.signing import ASSERTION_HEADER
+
+        headers.append(ASSERTION_HEADER)
+    return {"rehearsal": True, "message": REHEARSAL_MESSAGE, "endpoint": endpoint.name, "environment": environment,
+            "request": {"method": req["method"], "url": req["url"], "query": req["query"], "body": req["body"],
+                        "headers": headers}}
+
+
+def describe_status(status: int) -> str:
+    """对方回的 HTTP 状态码怎么说（非 2xx）。试运行、工具库执行和端点的测试连接共用，说法只有这一份。"""
+    if 300 <= status < 400:
+        return f"对方返回跳转（HTTP {status}），平台不跟随跳转"
+    if status in (401, 403):
+        return f"对方拒绝了认证（HTTP {status}）"
+    if status == 404:
+        return "对方系统上没有这个地址（HTTP 404）"
+    if 400 <= status < 500:
+        return f"对方拒绝了这个请求（HTTP {status}）"
+    if status >= 500:
+        return f"对方系统出错（HTTP {status}）"
+    return f"对方返回 HTTP {status}"
+
+
+def not_sent_reason(e: BaseException, timeout_s: float) -> str:
+    """请求没拿到响应的原因（测试连接用）。连接没建立、请求在发出之前就被拒（头不合法）和发出之后没回分开说。"""
+    text = str(e).lower()
+    if isinstance(e, httpx.ConnectTimeout):
+        return f"无法连接：{timeout_s:g} 秒内没有连上，请检查地址、端口和网络"
+    if isinstance(e, httpx.ConnectError):
+        if "certificate" in text or "ssl" in text:
+            return "无法连接：对方证书校验没有通过。内网自签的证书可在端点里关闭「校验证书」"
+        return "无法连接：地址无法解析、端口上没有服务，或网络不通"
+    if isinstance(e, httpx.LocalProtocolError):
+        return "请求没有发出：请求头的名称或值不合法，请检查认证头"
+    if isinstance(e, httpx.TimeoutException):
+        return f"已连接，但对方 {timeout_s:g} 秒内没有响应"
+    return "连接中途断开，没有拿到响应"
+
+
 def on_behalf_parts(on_behalf: Any) -> tuple[str | None, str | None]:
     """on_behalf 的两种写法 → (发起人, 确认人)。
 
@@ -250,12 +314,13 @@ def on_behalf_parts(on_behalf: Any) -> tuple[str | None, str | None]:
 
 async def endpoint_request(session: AsyncSession, capability: Any, args: dict[str, Any], *, environment: str,
                            idem_key: str | None = None, on_behalf: str | dict[str, Any] | None = None,
-                           run_id: str | None = None, node_id: str | None = None) -> EndpointResult:
+                           run_id: str | None = None, node_id: str | None = None,
+                           tool: CustomTool | None = None) -> EndpointResult:
     """平台执行器（registry.endpoint_request 的实现，签名同附录 C）。environment 由调用方按运行类别定（pick_environment）；
     传 test 而端点没有测试环境时演练。超时、连接中断交 unknown=True：对方可能已经处理了，写入要转核实，不能重发。
-    on_behalf 是发起人（字符串），或者 {"sub": 发起人, "act": 确认人}（on_behalf_parts）。"""
+    on_behalf 是发起人（字符串），或者 {"sub": 发起人, "act": 确认人}（on_behalf_parts）。tool 见 _resolve。"""
     try:
-        cap, tool, endpoint = await _resolve(session, capability)
+        cap, tool, endpoint = await _resolve(session, capability, tool)
         envs = endpoint.environments or {}
         if environment == "test" and not envs.get("test"):
             environment = "simulated"
@@ -287,6 +352,11 @@ async def endpoint_request(session: AsyncSession, capability: Any, args: dict[st
         # 开了登录，发起人就是认证过的用户名；关登录时是自报的署名，断言里照实写 verified=false
         headers[ASSERTION_HEADER] = assertion(endpoint.name, subject, actor=actor,
                                               verified=bool(subject) and current_mode() != "off")
+    if problem := vault.header_problem(headers):
+        # 存量的坏头（加校验之前存进去的 {"": ""}）：发不出去，照实说是哪一项、去哪里改，不是一句 LocalProtocolError
+        return EndpointResult(status=None, body=None, environment=environment,
+                              error=f"端点「{endpoint.name}」的{_ENV_LABEL.get(environment, environment)}认证头有误："
+                                    f"{problem}。请到「工具 → 端点」修改")
     try:
         async with _client(timeout=endpoint.timeout_s or settings.http_tool_timeout, follow_redirects=False,
                            trust_env=False, verify=env.get("verify_tls", True) is not False) as client:
@@ -296,6 +366,11 @@ async def endpoint_request(session: AsyncSession, capability: Any, args: dict[st
         # 连接没建立：请求没发出去，是确定的失败
         return EndpointResult(status=None, body=None, error=f"无法连接端点「{endpoint.name}」：{e}",
                               environment=environment)
+    except httpx.LocalProtocolError:
+        # 请求在发出之前就被拒（头、地址不合法）：同样没发出去，不能当成结果未知去核实
+        return EndpointResult(status=None, body=None, environment=environment,
+                              error=f"端点「{endpoint.name}」的请求没有发出：请求头的名称或值不合法，"
+                                    "请到「工具 → 端点」检查认证头")
     except httpx.HTTPError as e:
         # 发出去之后超时、连接中断：对方可能已经处理了，结果未知
         return EndpointResult(status=None, body=None, unknown=True, environment=environment,
@@ -345,18 +420,32 @@ def tool_result(result: EndpointResult) -> dict[str, Any]:
 
 
 async def probe(endpoint: Endpoint, environment: str) -> dict[str, Any]:
-    """测一下这个环境连不连得上：对 base_url 发一个 GET，只看有没有回应，不看状态码。"""
+    """测一下这个环境：对 base_url 带认证头发一个 GET。{ok, reachable, status, message}：reachable 是连没连上、拿没拿到
+    响应；ok 只在 2xx 时为真——能连上但对方回 404（基础地址上没有内容）、401（认证没过）不能说成「连接成功」。"""
     env = (endpoint.environments or {}).get(environment)
     if not env:
-        return {"ok": False, "status": None,
+        return {"ok": False, "reachable": False, "status": None,
                 "message": f"端点「{endpoint.name}」没有配置{_ENV_LABEL.get(environment, environment)}"}
+    headers = vault.reveal(env.get("headers"))
+    if problem := vault.header_problem(headers):
+        return {"ok": False, "reachable": False, "status": None, "message": f"认证头有误，请求没有发出：{problem}"}
+    timeout = endpoint.timeout_s or settings.http_tool_timeout
     try:
         await assert_safe_url(env["base_url"], allow_intranet=bool(env.get("allow_intranet")))
-        async with _client(timeout=endpoint.timeout_s or settings.http_tool_timeout, follow_redirects=False,
-                           trust_env=False, verify=env.get("verify_tls", True) is not False) as client:
-            resp = await client.get(env["base_url"], headers=vault.reveal(env.get("headers")))
+        async with _client(timeout=timeout, follow_redirects=False, trust_env=False,
+                           verify=env.get("verify_tls", True) is not False) as client:
+            resp = await client.get(env["base_url"], headers=headers)
     except UnsafeUrlError as e:
-        return {"ok": False, "status": None, "message": str(e)}
+        return {"ok": False, "reachable": False, "status": None, "message": str(e)}
     except httpx.HTTPError as e:
-        return {"ok": False, "status": None, "message": f"无法连接：{type(e).__name__}"}
-    return {"ok": True, "status": resp.status_code, "message": f"已连接，返回状态码 {resp.status_code}"}
+        return {"ok": False, "reachable": False, "status": None, "message": not_sent_reason(e, timeout)}
+    status = resp.status_code
+    if 200 <= status < 300:
+        return {"ok": True, "reachable": True, "status": status, "message": f"连接成功：基础地址返回 HTTP {status}"}
+    message = f"能连上，但{describe_status(status)}"
+    if status == 404:
+        # 不少系统只在具体路径上提供接口，基础地址本身就是 404：说清这一点，别让人以为端点配错了
+        message += "。对方只在具体路径上提供接口时这不影响调用，可用一个读取能力试运行确认"
+    elif status in (401, 403):
+        message += "，请检查认证头"
+    return {"ok": False, "reachable": True, "status": status, "message": message}

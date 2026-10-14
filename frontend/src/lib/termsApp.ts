@@ -18,7 +18,10 @@ export const APP_TEXT = {
   authOff: '未开启登录：所有人都能使用全部功能，审批和发起记录的是各自在设置中填写的署名，未经核实。',
   authOffLink: '前往设置署名',
   noApps: '还没有可用的应用',
-  noAppsBody: '应用由已发布的工作流生成。在编排页发布工作流后，可在发布成功的提示中做成应用。',
+  noAppsBody: '应用由已发布的工作流生成：点「新建应用」，从一个已发布的工作流版本开始。',
+  /** 应用首页页头的「新建应用」（搭建者及以上）：新建向导的起点，现在从已有的工作流开始 */
+  create: '新建应用',
+  createHint: '从一个已发布的工作流版本派生应用，之后再调整布局和文案',
   noAppsUser: '还没有授权给你的应用，请联系管理员。',
   archived: '已归档',
   unpublished: '未发布',
@@ -127,6 +130,13 @@ export const TASK_TEXT = {
   doneVote: '已记下你的意见，等待其他人处理',
   formInvalid: (n: number) => `有 ${n} 项需要修改`,
   cannotRespond: '这一项没有派给你，只能查看',
+  youResponded: (decision: string, at: string) => `你已处理：${decision}${at ? `（${at}）` : ''}`,
+  // 升级：升级加派的那几份一人说了算（服务端 process/tasks._tally）
+  escalationTag: '升级',
+  escalationRule: (who: string) => `已升级给${who}：其中任一人同意即通过、驳回即否决，原来的人仍可按原规则处理`,
+  escalationDecided: (who: string, decision: string) => `已升级，由「${who}」一人决定：${decision}`,
+  slot: (name: string) => `岗位「${name}」`,
+  waitingOn: (names: string) => `等待 ${names} 处理`,
   notPending: (status: string) => `这一项${status}`,
   resolvedBy: (who: string, at: string) => `由「${who}」于 ${at} 处理`,
   resolvedAt: (at: string) => `于 ${at} 处理`,
@@ -225,6 +235,21 @@ export const STAMP_TEXT = {
   unsealed: '尚未封存',
   sealed: '已封存',
   noStamp: '暂无可读的运行',
+}
+
+/**
+ * 搭建面几个术语的一句话解释：应用编辑里视图来源、固定版本、处置旁边写的那一句（不只放在悬停里）。说的是使用者
+ * 看到的效果，和服务端的行为一致：最近封存读已封存的正式运行、不发起；按需按参数发起、缓存时效内同样的参数复用；
+ * 本实例读实例自己的运行；固定版本按哈希发起正式运行；处置决定升版前后的趋势怎么画
+ */
+export const APP_TERM_TEXT = {
+  viewKinds: {
+    latest_sealed: '最近封存：读固定版本最近一次已封存的正式运行（可限定为某个定时任务发起的），打开页面不发起运行',
+    on_demand: '按需：点「刷新」或打开页面时按页面上的参数发起一次正式运行；缓存时效内同样的参数直接用上次的结果',
+    instance: '本实例：在实例页上读这个实例自己的那次运行',
+  } as Record<string, string>,
+  pin: '固定版本：应用引用的某个工作流的一个已发布版本。应用只按这一版发起正式运行、读它的结果，工作流发了新版本也不会自动换',
+  disposition: '处置：固定版本升了版之后，升版前后的数据怎么放在一起看——按新口径重算、两版并列，或前后不可比。发布新的应用版本时必须选',
 }
 
 /** 视图来源的状态 */
@@ -331,6 +356,16 @@ export const PRINCIPAL_TEXT = {
   kind: '类型',
   empty: '未选择',
   manualHint: '未开启登录时没有用户列表，请直接填写名字',
+  /** 名录（搭建者及以上可读）里核对填的名字 */
+  unknownUser: (name: string) => `名录里没有用户「${name}」，请从候选中选择`,
+  unknownGroup: (name: string) => `名录里没有组「${name}」，请从候选中选择`,
+  disabledUser: (name: string) => `用户「${name}」已停用`,
+  /** 单点登录：人和组在第一次登录后才进名录，名录里没有的可以照填，但要确认 */
+  unknownOidc: (name: string) => `名录里还没有「${name}」：单点登录的人和组第一次登录后才进名录。名字要和身份提供方里的一致才生效`,
+  addAnyway: '仍然添加',
+  /** 已选的那一项不在名录里、或已停用：标在标签上 */
+  missingTag: '名录里没有',
+  disabledTag: '已停用',
 }
 
 /** 身份：登录、账户菜单、角色（§4.4 AUTH_TEXT） */
@@ -344,6 +379,13 @@ export const GRANT_ROLE_LABEL: Record<GrantRole, string> = {
   use: '使用',
   observe: '查看全部实例',
   manage: '管理',
+}
+
+/** 授权三档各管什么（apps/access.py）：应用编辑「岗位与授权」里每一行的说明 */
+export const GRANT_ROLE_HINT: Record<GrantRole, string> = {
+  use: '能打开应用、从入口发起、处理派给自己的待办；实例只看得到自己发起或参与的',
+  observe: '在「使用」之外，还能查看这个应用的全部实例',
+  manage: '能编辑、发布这个应用，绑定岗位、授权、管理钩子。只对搭建者生效：授给使用者的按「查看全部实例」算',
 }
 
 export const AUTH_MODE_LABEL: Record<AuthMode, string> = {
@@ -376,4 +418,40 @@ export const AUTH_TEXT = {
   groupsLabel: '所在组',
   forgot: '忘记密码请联系管理员重置',
   useLocal: '使用账号密码登录',
+  /** 新部署（账号密码登录、还没有能登录的管理员）：登录页先建第一个管理员 */
+  bootstrapTitle: '建第一个管理员',
+  bootstrapHint: '这是新部署，还没有能登录的管理员。先建一个管理员账号，建好后直接以它登录；其他账号在「设置 → 身份」中添加。',
+  displayName: '显示名',
+  displayNameHint: '选填，界面上显示的名字，不填时用用户名',
+  confirmPassword: '确认密码',
+  passwordMismatch: '两次输入的密码不一致',
+  bootstrap: '建立并登录',
+  bootstrapping: '正在建立…',
+  haveAccount: '已有账号，直接登录',
+}
+
+/**
+ * 发布、发起正式运行、导入确认这些留痕记在谁的名下（store/auth 的 useSigner）：开了登录是登录的人，没有署名框（服务端
+ * 只认登录的人，填了也不看）；关登录是本机署名（未认证），那一套说法在各处原样保留
+ */
+export const SIGNER_TEXT = {
+  publishAs: (name: string) => `以登录身份发布：${name}`,
+  launchAs: (name: string) => `以登录身份发起：${name}`,
+  confirmAs: (name: string) => `以登录身份确认：${name}`,
+  /** 确认框里那一行（数据导入的启用、回滚、移除、清除原件） */
+  signedIn: (name: string) => `登录身份：${name}`,
+  record: '记入留痕',
+}
+
+/** 发布弹窗按角色收起的档位（Q8：受管级发布只给管理员，服务端 api/workflows 同样拒） */
+export const PUBLISH_ROLE_TEXT = {
+  governedAdminOnly: '需要管理员：以受管级发布只给管理员，请联系管理员发布',
+  /** 受管工作流降成已发布：和以受管级发布同一级的决定，只给管理员（服务端同样拦） */
+  downgradeAdminOnly: '需要管理员：这是受管工作流，降为「已发布」会让此后的正式运行不再过治理门禁，请联系管理员发布',
+  governedWorkflowAdminOnly: '这是受管工作流，新版本只有管理员能发布',
+  pickLevel: '请先选择发布等级',
+  /** 降级（受管 → 已发布）点发布时再确认一次 */
+  downgradeTitle: (name: string) => `以「已发布」等级发布「${name}」？`,
+  downgradeConsequences: ['当前为受管工作流，发布后降为已发布', '此后从这一版发起的正式运行不再受治理门禁约束'],
+  downgradeConfirm: '降级并发布',
 }

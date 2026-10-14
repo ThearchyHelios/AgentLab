@@ -2,7 +2,9 @@
 recompute 的还原（_positional），用 recompute 的地方都跟着变，这里把变化钉住。
 
 - 双盲复算的预检（dual_check._plan_metric 什么都不改先重算一遍）：以前这种指标照常盲算，遮着的那一格还会作为字面量
-  写进给盲算模型的计算式；现在预检判它用到了遮罩列，按无法复算记，原因不说「推演」（这里不是推演）
+  写进给盲算模型的计算式；现在预检判它用到了遮罩列，按无法复算记，原因不说「推演」（这里不是推演）。数据整形只是原样
+  解析查询结果时（模板整串就是 {{ nodes.fetch }}），这一格卡上直接记成单元格取数（engine/lineage.py），和 cell() 取的
+  遮罩格同一个说法；模板带了过滤器的不算原样解析，走顺着取值链认遮罩的那条路——两种写法都守
 - 运行对比（engine/compare.py）：这种输入两边的值都不给，标 masked，和 cell() 取的遮罩格一样
 
 库和数字都是编的：号码写成带横线的文本，区域名是「东区」这类。
@@ -10,6 +12,8 @@ recompute 的还原（_positional），用 recompute 的地方都跟着变，这
 from __future__ import annotations
 
 import json
+
+import pytest
 
 from app.engine import compare
 from app.engine.runner import run_manager
@@ -26,12 +30,17 @@ from tests.test_evidence_metric_masks import (  # noqa: F401 - 夹具按名字�
 )
 
 
-def dual_graph():
+#: 数据整形的两种写法：原样解析、模板带过滤器（不算原样解析）
+PARSED = "{{ nodes.fetch }}"
+FILTERED = "{{ nodes.fetch | trim }}"
+
+
+def dual_graph(template: str = PARSED):
     """取数 → 数据整形（vars.res）→ 口径卡 → 双盲复算（只复算 mix）→ 成果。"""
     nodes = [
         node("start", "input"),
         node("fetch", "tool", tool="db_query__shop", args={"sql": SQL}),
-        node("parse", "transform", mode="json", template="{{ nodes.fetch }}", assign_to="res"),
+        node("parse", "transform", mode="json", template=template, assign_to="res"),
         node("card", "metrics", caliber="遮罩口径", caliber_version="v1", metrics=METRICS),
         node("dual", "dual_check", metrics=["mix"]),
         node("out", "output", fields=[{"name": "结果", "value": "{{ nodes.card.text }}"}]),
@@ -52,9 +61,11 @@ async def dual_output(run_id: str) -> dict:
     return artifact_store.load(finished.data["artifact"])
 
 
-async def test_the_dual_check_does_not_blind_compute_a_metric_reading_a_masked_cell_by_position(shop):
+@pytest.mark.parametrize("template", [PARSED, FILTERED])
+async def test_the_dual_check_does_not_blind_compute_a_metric_reading_a_masked_cell_by_position(shop, template):
     """mix = round(cell(nodes.fetch, 1, 'amount') + len(vars.res.rows[1][2]), 1)：cell() 那一格不在遮罩列上，按位置取的
-    号码在。认出它取自遮罩列，按无法复算记缺口，原因点名是哪个输入、不说「推演」；没遮罩时预检照常通过、指标进入盲算。"""
+    号码在。认出它取自遮罩列，按无法复算记缺口，原因点名是哪个输入、不说「推演」。没遮罩时：原样解析的那一格是查询来的
+    文本，和 cell() 取的文本格一样不能单独复算，照实说不是数值；模板带了过滤器的，预检照常通过、指标进入盲算。"""
     import asyncio
 
     from app.db.base import SessionLocal
@@ -62,7 +73,7 @@ async def test_the_dual_check_does_not_blind_compute_a_metric_reading_a_masked_c
 
     async def run(options):
         await set_source(shop, options)
-        run_id = (await run_manager.start(graph=dual_graph(), input_payload={})).id
+        run_id = (await run_manager.start(graph=dual_graph(template), input_payload={})).id
         for _ in range(400):
             await asyncio.sleep(0.05)
             async with SessionLocal() as session:
@@ -81,10 +92,15 @@ async def test_the_dual_check_does_not_blind_compute_a_metric_reading_a_masked_c
     assert not [p for p in PHONES if p in json.dumps(masked, ensure_ascii=False)]
     assert any("遮罩" in gap for gap in masked["issuance_gaps"])
 
-    # 没遮罩：预检通过，原因不再是遮罩（盲算模型没配，按盲算没交回数记，但已经走到了盲算这一步）
     plain = await run({})
     [mix] = plain["metrics"]
-    assert "遮罩" not in (mix.get("reason") or "") and "无法按原表达式重算" not in (mix.get("reason") or "")
+    if template == PARSED:
+        # 原样解析：号码那一格是查询快照里的文本，和 cell() 取的文本格同一个说法
+        assert mix["status"] == "unchecked" and mix["reason"] == "输入 vars.res.rows[1][2] 不是数值", mix
+    else:
+        # 没遮罩：预检通过，原因不再是遮罩（盲算模型没配，按盲算没交回数记，但已经走到了盲算这一步）
+        assert "遮罩" not in (mix.get("reason") or "") and "无法按原表达式重算" not in (mix.get("reason") or "")
+        assert "不是数值" not in (mix.get("reason") or ""), mix
 
 
 def region_len(fetch, bot, rows, bot_rows):

@@ -64,7 +64,7 @@ export function InstancePage() {
               <>
                 <AppMeta app={view.app} back={<BackLink to={appPath(appId)} label={view.app.name} />} />
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-dim">
-                  <StatusPill status={data.status} />
+                  <StatusPill status={data.status_code ?? data.status} label={data.status_text} />
                   {data.started_by && <span>{INSTANCE_TEXT.startedBy(data.started_by)}</span>}
                   <span title={formatDateTime(data.created_at)}>{INSTANCE_TEXT.startedAt(formatRelative(data.created_at))}</span>
                   {data.finished_at && <span title={formatDateTime(data.finished_at)}>{INSTANCE_TEXT.finishedAt(formatRelative(data.finished_at))}</span>}

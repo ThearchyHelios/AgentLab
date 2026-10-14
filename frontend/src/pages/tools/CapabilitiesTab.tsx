@@ -282,6 +282,10 @@ function CapabilityEditor({ row, all, focus = '', onSaved, onConflict }: {
   const set = <K extends keyof Governance>(k: K, v: Governance[K]) => setForm((f) => ({ ...f, [k]: v }))
   const effect = form.effect ?? row.effect_system
   const writes = effect !== 'read'
+  // 查询能力的候选：同一端点上、绑定端点的只读能力（平台按登记的端点替它按幂等键去查；服务端 registry._check_lookup
+  // 同一条规矩，以服务端为准）。写记忆这类平台自身的写、别的系统上的读取、MCP 都不列
+  const lookups = all.filter((c) => c.name !== row.name && !c.missing && (c.effect ?? c.effect_system) === 'read'
+    && !!form.endpoint_id && c.endpoint_id === form.endpoint_id && !c.name.startsWith('mcp:'))
   const dirty = JSON.stringify({ ...form, masked: masked.split('\n').map((x) => x.trim()).filter(Boolean) })
     !== JSON.stringify(governanceOf(row))
   const readonly = !admin
@@ -378,13 +382,18 @@ function CapabilityEditor({ row, all, focus = '', onSaved, onConflict }: {
           </Field>
         </div>
         {writes && (
-          <Field label={T.lookup} hint={T.lookupHint}>
+          <Field label={T.lookup} hint={lookups.length ? T.lookupHint
+            : `${T.lookupHint}。${form.endpoint_id ? T.lookupEmpty : T.lookupNoEndpoint}`}>
             {(p) => (
-              <select {...p} className="field" value={form.lookup ?? ''} onChange={(e) => set('lookup', e.target.value || null)}>
+              <select {...p} className="field" value={form.lookup ?? ''} onChange={(e) => set('lookup', e.target.value || null)}
+                      data-capability-lookup="">
                 <option value="">{T.lookupNone}</option>
-                {all.filter((c) => c.name !== row.name && (c.effect ?? c.effect_system) === 'read').map((c) => (
+                {lookups.map((c) => (
                   <option key={c.name} value={c.name}>{c.name}</option>
                 ))}
+                {form.lookup && !lookups.some((c) => c.name === form.lookup) && (
+                  <option value={form.lookup} disabled>{form.lookup}</option>
+                )}
               </select>
             )}
           </Field>

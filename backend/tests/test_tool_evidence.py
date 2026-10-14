@@ -349,6 +349,40 @@ async def test_cell_lineage_points_at_the_exact_cell(engine_up, shop):
     assert prev["eid"] == make_eid("cell", query["artifact"], {"row": 0, "column": "gmv_prev"})
 
 
+async def test_a_positional_cell_through_a_plain_parse_reaches_the_snapshot(engine_up, shop):
+    """数据整形只是把调用工具节点的结果原样按 JSON 解析（模板整串就是 {{ nodes.fetch }}）：vars.q.rows[0][0] 确定地对到
+    查询快照的第 0 行第 0 列，和 cell() 一样核对快照、带 locator / artifact / eid，through 记下穿过的整形节点。
+    nodes.parse.rows[0]['gmv'] 按列名取也一样。模板带了过滤器、或者多包了一层的，不算原样解析：照旧记成数据整形的产出。"""
+    card = node("card", "metrics", caliber="周报口径", metrics=[
+        {"id": "gmv", "name": "销售额", "unit": "元", "decimals": 2, "format": "thousands",
+         "expression": "vars.q.rows[0][0]"},
+        {"id": "prev", "name": "上期", "decimals": 1, "format": "plain", "expression": "nodes.parse.rows[0]['gmv_prev']"},
+        {"id": "raw", "name": "过滤器", "decimals": 1, "format": "plain", "expression": "vars.raw.rows[0][0]"},
+        {"id": "wrap", "name": "包一层", "decimals": 1, "format": "plain", "expression": "vars.w.res.rows[0][0]"},
+    ])
+    parse = node("parse", "transform", mode="json", template="{{ nodes.fetch }}", assign_to="q")
+    raw = node("parse_raw", "transform", mode="json", template="{{ nodes.fetch | trim }}", assign_to="raw")
+    wrap = node("wrap_n", "transform", mode="json", template='{"res": {{ nodes.fetch }}}', assign_to="w")
+    row = await finish(fetch_graph(parse, raw, wrap, card))
+    assert row.status == "succeeded", row.error
+    query = next(e for e in await ledger(row.id) if e["kind"] == "query")
+    finished = (await events(row.id, "node.finished", "card"))[0]
+    metrics = {m["id"]: m for m in artifact_store.load(finished.data["artifact"])["metrics"]}
+
+    gmv = metrics["gmv"]
+    assert gmv["value"] == 600.5 and gmv["recompute_ok"] is True
+    [cell] = gmv["inputs"]
+    assert cell == {"path": "vars.q.rows[0][0]", "value": 600.5, "node_id": "fetch", "via": "tool_cell",
+                    "through": "parse", "status": "verified", "locator": {"row": 0, "column": "gmv"},
+                    "artifact": query["artifact"], "eid": make_eid("cell", query["artifact"], {"row": 0, "column": "gmv"})}
+    [by_name] = metrics["prev"]["inputs"]
+    assert (by_name["via"], by_name["through"], by_name["locator"], by_name["status"]) == (
+        "tool_cell", "parse", {"row": 0, "column": "gmv_prev"}, "verified")
+    for metric_id, writer in (("raw", "parse_raw"), ("wrap", "wrap_n")):
+        [item] = metrics[metric_id]["inputs"]
+        assert (item["via"], item["node_id"]) == ("transform", writer) and "through" not in item, item
+
+
 async def test_card_computes_on_integer_decimal_text(engine_up, shop):
     """sqlite 没有 DECIMAL：CAST(… AS TEXT) 落进快照的，和 MySQL 整数列 SUM() 的 str(Decimal) 一模一样。"""
     sql = ("SELECT CAST(SUM(refunded) AS TEXT) AS refunds, CAST(COUNT(*) AS TEXT) AS orders "

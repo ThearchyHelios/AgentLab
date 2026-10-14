@@ -215,7 +215,8 @@ async def test_on_demand_views(client):
     app_id = await published_app(client, kpi_spec(wf, hash_), name="按需看板")
     params = {"params": '{"week": "W40"}'}
     vm = (await client.get(f"/api/apps/{app_id}/pages/home", params=params)).json()
-    assert vm["sources"]["od"]["state"] == "empty" and vm["problems"][0]["code"] == "view.source_empty"
+    assert vm["sources"]["od"]["state"] == "empty" and vm["problems"] == []
+    assert "刷新" in vm["sources"]["od"]["message"]
     assert find(vm, "gmv")["data"]["state"] == "empty"
 
     bad = await client.post(f"/api/apps/{app_id}/views/od/refresh", json={"params": {}})

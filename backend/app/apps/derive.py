@@ -1,9 +1,11 @@
 """从工作流版本确定性派生应用（A8）：不靠模型，助手失败了也有可用的应用（P3）。
 
-入口字段 → 入口表单；人工节点 → 待办（岗位留空等人绑定）；口径卡 → 指标块；报告 → 报告块；取数节点 → 表格；
-写入的调用工具节点 → 动作确认待办 + 动作状态。
+入口字段 → 入口表单；人工节点 → 待办；图里引用到的岗位（派给谁、超时升级给谁、动作确认派给谁，tree.slot_refs）→
+岗位，留空等人绑定；口径卡 → 指标块；报告 → 报告块；取数节点 → 表格；写入的调用工具节点 → 动作确认待办 + 动作状态。
 
-视图优先绑定已有的定时任务（同一工作流、正式运行、启用着的）：看板的数从定时任务的封存运行来，打开页面不发起运行。
+看板（use=view）的首页看「最近封存运行」，视图优先绑定已有的定时任务（同一工作流、正式运行、启用着的）：数从定时任务的
+封存运行来，打开页面不发起运行。流程（use=process）的首页只放发起和我发起的：每件事的结果在它自己的实例页看，首页没有
+「最近一次」可看——派生出来只会挂一块永远空着的印章。
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.apps.forms import input_schema
 from app.apps.spec import APP_FORMAT, parse_spec
-from app.apps.tree import input_fields, node_map
+from app.apps.tree import input_fields, node_map, slot_refs
 
 PIN = "main"
 VIEW = "latest"
@@ -37,9 +39,8 @@ def _safe(text: str) -> str:
 
 async def derive_app(session: AsyncSession, workflow_id: str, version: int, *, name: str | None = None) -> dict[str, Any]:
     """返回一份 agentlab.app/1 spec（未发布的草稿）。"""
-    from app.apps.pins import PinState
+    from app.apps.pins import PinState, write_nodes
     from app.apps.versions import version_row
-    from app.capabilities.registry import effective_effect, get_capability
     from app.db.models import Schedule, Workflow
 
     workflow = await session.get(Workflow, workflow_id)
@@ -53,15 +54,10 @@ async def derive_app(session: AsyncSession, workflow_id: str, version: int, *, n
     nodes = node_map(graph)
     fields = input_fields(graph)
     humans = {nid: n for nid, n in nodes.items() if n["type"] == "human"}
-    writes: dict[str, dict[str, Any]] = {}
-    lookups = True
-    for nid, node in nodes.items():
-        tool = node["config"].get("tool") if node["type"] == "tool" else None
-        if isinstance(tool, str):
-            cap = await get_capability(session, tool)
-            if cap is not None and effective_effect(cap) == "write":
-                writes[nid] = node
-                lookups = lookups and bool(getattr(cap, "lookup", None))
+    # 写外部系统的调用工具节点：和运行时同一个认法（pins.write_nodes），只有它们开发送确认卡、结果未知时要人核实
+    caps = await write_nodes(session, graph)
+    writes = {nid: nodes[nid] for nid in caps}
+    lookups = all(getattr(cap, "lookup", None) for cap in caps.values())
     process = bool(humans or writes)
     spec: dict[str, Any] = {
         "format": APP_FORMAT, "name": name or workflow.name, "description": workflow.description or "",
@@ -70,10 +66,9 @@ async def derive_app(session: AsyncSession, workflow_id: str, version: int, *, n
                   "level": state.level, "use": "process" if process else "view"}],
         "slots": {}, "entries": [], "forms": {}, "task_ui": {}, "views": {}, "pages": [], "hooks": [], "notify": [],
     }
+    for ref in slot_refs(graph, writes):
+        spec["slots"].setdefault(ref["slot"], {"label": ref["slot"]})
     for nid, node in humans.items():
-        assignee = node["config"].get("assignee")
-        if isinstance(assignee, dict) and assignee.get("kind") == "slot" and assignee.get("slot"):
-            spec["slots"].setdefault(str(assignee["slot"]), {"label": str(assignee["slot"])})
         spec["task_ui"][nid] = {"title": node["title"]}
     if writes and not lookups:
         spec["slots"][RECONCILER] = {"label": "动作核实"}
@@ -87,15 +82,16 @@ async def derive_app(session: AsyncSession, workflow_id: str, version: int, *, n
             **({"instance_title": {"pattern": f"{workflow.name}·{{{first}}}", "fields": [first]}}
                if first and re.fullmatch(r"[A-Za-z0-9_㐀-鿿]+", first) else {}),
         })
-    schedule = (await session.execute(select(Schedule).where(
-        Schedule.workflow_id == workflow_id, Schedule.run_class == "formal", Schedule.enabled.is_(True))
-        .order_by(Schedule.created_at))).scalars().first()
-    spec["views"][VIEW] = {"source": {"kind": "latest_sealed", "pin": PIN,
-                                      "from": f"schedule:{schedule.id}" if schedule else "formal"}}
+    if not process:
+        schedule = (await session.execute(select(Schedule).where(
+            Schedule.workflow_id == workflow_id, Schedule.run_class == "formal", Schedule.enabled.is_(True))
+            .order_by(Schedule.created_at))).scalars().first()
+        spec["views"][VIEW] = {"source": {"kind": "latest_sealed", "pin": PIN,
+                                          "from": f"schedule:{schedule.id}" if schedule else "formal"}}
     if spec["entries"]:
         spec["views"][INSTANCE_VIEW] = {"source": {"kind": "instance"}}
-    spec["pages"].append({"id": "home", "title": workflow.name, "body": _results(nodes, VIEW, "home")
-                          + _entries(spec)})
+    spec["pages"].append({"id": "home", "title": workflow.name,
+                          "body": ([] if process else _results(nodes, VIEW, "home")) + _entries(spec)})
     if spec["entries"]:
         spec["pages"].append({"id": "instance", "title": "实例", "body": [
             {"id": "inst_header", "type": "instance_header"},

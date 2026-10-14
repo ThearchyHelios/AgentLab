@@ -522,7 +522,7 @@ async def test_variables(client):
     res = await client.get("/api/schedules/variables")
     assert res.status_code == 200
     items = res.json()
-    assert len(items) == 10 and all(set(i) == {"name", "label", "example"} for i in items)
+    assert len(items) == 16 and all(set(i) == {"name", "label", "example", "note"} for i in items)
     assert {"name": "schedule.yesterday", "label": "昨天（YYYY-MM-DD）"}.items() <= next(
         i for i in items if i["name"] == "schedule.yesterday").items()
     assert (await client.get("/api/schedules/variables", params={"timezone": "Nowhere/City"})).status_code == 422

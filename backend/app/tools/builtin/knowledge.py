@@ -65,6 +65,8 @@ class MemoryWriteArgs(BaseModel):
     description="把一条值得长期记住的信息写入记忆。相似内容会自动去重。",
     args_schema=MemoryWriteArgs,
     dangerous=False,
+    # 写的是平台自己的记忆：默认不用人确认，但不是只读
+    writes_state=True,
 )
 async def memory_write(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
     args = MemoryWriteArgs(**kwargs)

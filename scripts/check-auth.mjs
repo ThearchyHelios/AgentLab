@@ -3,6 +3,9 @@
 // 守的是这些「看着没坏、其实不对」的地方：
 //   - 开了登录、没登录：任何页面都送到 /login?next=原处，登录成功后回到原处；登录页按服务端说的登录方式给账号密码表单
 //     或单点登录按钮（单点登录时本地账号收在下面）；密码不对写人话；单点登录回调失败带回的原因照写；next 只认站内路径；
+//     进门只认一次人（/auth/me 只请求一次：认人接口的 401 不整页跳，开发模式下 effect 执行两次也共用一个请求）；
+//   - 账号密码登录的新部署（/auth/me 的 401 带 can_bootstrap）：登录页给「建第一个管理员」，确认密码对不上不让提交，
+//     建好即登录、回到原处；已有账号的人可以展开登录表单；
 //   - 会话中途失效：任何接口回 401 都整页跳登录页，带上原处；
 //   - 非 GET 请求都带 X-AgentLab-Request 头（服务端开登录时据此防跨站）；
 //   - 使用者（user 角色）：导航只有「应用」和「设置」，别的地址送回应用首页，⌥ 数字切不到看不见的页；没有署名框，
@@ -45,6 +48,7 @@ async function section(name, fn) {
 const PEOPLE = {
   user: { username: 'zhangsan', display_name: '张三', role: 'user', groups: ['财务'] },
   builder: { username: 'lisi', display_name: '李四', role: 'builder', groups: [] },
+  admin: { username: 'root', display_name: '管理员甲', role: 'admin', groups: [] },
 }
 
 const TASK = {
@@ -80,13 +84,25 @@ async function open(state) {
         return route.fulfill({ json: { mode: state.mode, ...PEOPLE[state.who], verified: true } })
       }
       if (p === '/api/auth/logout') { state.who = null; return route.fulfill({ status: 204, body: '' }) }
+      if (p === '/api/auth/bootstrap') {
+        if (!state.bootstrap) return route.fulfill({ status: 409, json: { detail: '已经有管理员了，请用管理员账号登录' } })
+        const body = JSON.parse(r.postData() || '{}')
+        state.bootstrap = false
+        state.who = 'admin'
+        return route.fulfill({ json: { mode: state.mode, ...PEOPLE.admin, username: body.username,
+          display_name: body.display_name || body.username, verified: true } })
+      }
       return route.fulfill({ json: {} })
     }
     if (p === '/api/health') return route.continue()
     if (p === '/api/auth/me') {
+      state.meHits = (state.meHits ?? 0) + 1
       if (state.mode === 'off') return route.fulfill({ json: { mode: 'off', username: null, display_name: null, role: 'admin', groups: [], verified: false } })
       // 会话过期时认人接口也回 401（同服务端）：不然登录页认得出人、又把人送回原处，来回跳
-      if (!state.who || state.expire) return route.fulfill({ status: 401, json: { detail: '请先登录', code: 'auth_required', mode: state.mode } })
+      if (!state.who || state.expire) {
+        return route.fulfill({ status: 401, json: { detail: '请先登录', code: 'auth_required', mode: state.mode,
+          can_bootstrap: !!state.bootstrap } })
+      }
       return route.fulfill({ json: { mode: state.mode, ...PEOPLE[state.who], verified: true, user_can_chat: !!state.chat } })
     }
     state.reads?.push(p)
@@ -122,7 +138,10 @@ await section('没登录：送到登录页，登录后回原处', async () => {
   await page.goto(`${WEB}/apps?tab=inbox`)
   check('送到 /login 并带上原处', await page.waitForURL(/\/login\?next=%2Fapps%3Ftab%3Dinbox/, { timeout: 15000 }).then(() => true, () => false), page.url())
   await page.locator('[data-login-form]').waitFor({ timeout: 8000 })
+  await page.waitForTimeout(500)
+  check('进门只认一次人（/auth/me 只请求一次）', state.meHits === 1, `${state.meHits} 次`)
   check('账号密码登录：有表单、没有单点登录按钮', (await page.locator('[data-login-oidc]').count()) === 0)
+  check('已有管理员：不给建管理员的表单', (await page.locator('[data-login-bootstrap]').count()) === 0)
   check('登录页不在外壳里（没有导航）', (await nav(page).count()) === 0)
   await page.locator('#login-username').fill('zhangsan')
   await page.locator('#login-password').fill('wrong')
@@ -134,6 +153,40 @@ await section('没登录：送到登录页，登录后回原处', async () => {
   await page.locator('#login-password').fill('right')
   await page.getByRole('button', { name: '登录' }).click()
   check('登录后回到原处', await page.waitForURL(/\/apps\?tab=inbox/, { timeout: 15000 }).then(() => true, () => false), page.url())
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+})
+
+await section('新部署：登录页建第一个管理员，建好即登录、回原处', async () => {
+  const state = { mode: 'local', who: null, bootstrap: true, writes: [] }
+  const page = await open(state)
+  await page.goto(`${WEB}/apps`)
+  check('送到 /login 并带上原处', await page.waitForURL(/\/login\?next=%2Fapps/, { timeout: 15000 }).then(() => true, () => false), page.url())
+  const form = page.locator('[data-login-bootstrap]')
+  check('给「建第一个管理员」的表单', await form.waitFor({ timeout: 8000 }).then(() => true, () => false))
+  check('不先给登录表单', (await page.locator('[data-login-form]').count()) === 0)
+  check('写明这是新部署、建好直接登录', (await form.innerText()).includes('还没有能登录的管理员'))
+  const submit = form.getByRole('button', { name: '建立并登录' })
+  await page.locator('#boot-username').fill('root')
+  await page.locator('#boot-display').fill('管理员甲')
+  await page.locator('#boot-password').fill('password-123')
+  await page.locator('#boot-confirm').fill('password-124')
+  check('两次密码不一致：当场说、不让提交', (await form.locator('[data-login-mismatch]').count()) === 1 && await submit.isDisabled())
+  // 已有别的账号的人：展开登录表单，再收回来
+  await page.locator('[data-login-have-account]').click()
+  check('「已有账号」展开登录表单', await page.locator('[data-login-form]').waitFor({ timeout: 3000 }).then(() => true, () => false)
+    && (await page.locator('[data-login-bootstrap]').count()) === 0)
+  await page.reload()
+  await form.waitFor({ timeout: 8000 })
+  await page.locator('#boot-username').fill('root')
+  await page.locator('#boot-display').fill('管理员甲')
+  await page.locator('#boot-password').fill('password-123')
+  await page.locator('#boot-confirm').fill('password-123')
+  await submit.click()
+  check('建好即登录、回到原处', await page.waitForURL(/\/apps(\?|$)/, { timeout: 15000 }).then(() => true, () => false), page.url())
+  const sent = state.writes.find((w) => w.path === '/api/auth/bootstrap')
+  const body = JSON.parse(sent?.body || '{}')
+  check('请求带用户名、显示名、密码，带 X-AgentLab-Request 头', body.username === 'root' && body.display_name === '管理员甲'
+    && body.password === 'password-123' && !('confirm' in body) && sent?.csrf === '1', sent?.body)
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
 })
 

@@ -8,7 +8,8 @@
  * 各组件的 data（ViewNode.data，照 backend/app/apps/resolve.py 的 _data），没有的键都可以缺。绑定了视图的组件都带
  * state（ok / missing / masked / withheld / empty / running / error）和可选的 message，说这一块为什么没有数据：
  * - stamp：{view, state, stamp, message?}
- * - metric：{state, text, name, unit, evidence}（evidence 的 kind 为 metric，点开走指标链接口）
+ * - metric：{state, text, name, unit, evidence}（evidence 的 kind 为 metric，点开走指标链接口）。text 已按口径卡带着
+ *   单位，unit 只说明是哪个单位；绑定单元格时是 {state, text, evidence}，text 不带单位
  * - series：{state, mode（single / dual / incomparable / recompute）, unit, series: [{version, label, points: [{run_id,
  *   as_of, value, text, evidence}]}], breaks: [{after_run?, from, to, text}]}
  * - table、chart：{state, columns, rows（二维数组，遮罩的格子服务端已换成「已遮罩」）, masked, total_rows, truncated,
@@ -18,11 +19,14 @@
  * - form：{form}（表单名，表单在 ViewModel.forms 里）。提交即按这些值重新解析本页（按需视图的参数），见 input.tsx
  * - entry_button：{entry, label, disabled, reason?}
  * - instance_list：{who, entry, items: InstanceRow[]}
- * - instance_header：InstanceRow 的各项加 {state, status_text, stamp}
- * - instance_timeline：{state, status, status_text, steps: [{node, title, state, started_at, at}]}
- * - task_list：{scope, items}（待办的摘要，不是完整的待办；要处理时按 id 取完整的）
- * - task_form、signoffs：{state, task（摘要）, task_ui, assignments?}
- * - action_status：{state, node, records: [{id, state, environment, attempt, payload_hash（前 8 位）, error, receipt?}]}
+ * - instance_header：InstanceRow 的各项（含 status_code、status_text：给人看的状态和结论）加 {state, stamp}
+ * - instance_timeline：{state, status, status_code, status_text, steps: [{node, title, state, text, started_at, at}]}
+ *   （state 另有 unknown：写入结果未知；rejected：被人驳回而结束。text 是这一步给人看的说法）
+ * - task_list：{scope, items}（待办的摘要，带 instance_title、created_at；要处理时按 id 取完整的）
+ * - task_form、signoffs：{state, task（摘要）, task_ui, handler（读者是不是处理人）, assignments, progress, my_response}
+ *   ——不是处理人的不取待办，只画这一步的状态
+ * - action_status：{state, node, records: [{id, state, environment, attempt, payload_hash（前 8 位）, error?（确定没生效
+ *   的原因）, note?（结果未知、事后核实的经过）, receipt?}]}
  */
 import { createContext, useContext } from 'react'
 import type { ReactNode } from 'react'

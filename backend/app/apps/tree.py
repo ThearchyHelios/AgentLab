@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from typing import Any
 
 from app.core.artifact_store import canonical_json
@@ -80,6 +80,44 @@ def node_map(graph: Any) -> dict[str, dict[str, Any]]:
             data = n.get("data") or {}
             out[str(n["id"])] = {"type": n.get("type"), "title": data.get("label") or n["id"],
                                  "config": data.get("config") or {}}
+    return out
+
+
+#: 图里引用岗位的几处：人工节点派给谁、人工节点超时升级给谁、调用工具节点（写入动作）的发送确认派给谁
+SLOT_ROLES = ("assignee", "escalation", "confirm")
+
+
+def slot_refs(graph: Any, writes: Collection[str] = ()) -> list[dict[str, str]]:
+    """图里引用到的岗位：[{slot, node_id, title, role}]，role 见 SLOT_ROLES，按节点出现的顺序。派生（列出岗位）和检查
+    （岗位没声明、没绑定）共用这一份：以前两边都只认人工节点的派给谁，超时升级的岗位、动作确认的岗位一个也没列，发布后
+    升级、确认悄悄派给了任何人。
+
+    writes 是写外部系统的调用工具节点（pins.write_nodes，和运行时同一个认法）：只有它们开发送确认卡，派给谁才算用到岗位。
+    只读的调用工具节点从不开确认卡，它写的（或从图级 defaults 继承来的）派给谁不算——不然派生多出用不到的岗位，检查说
+    「调用工具节点「取数」的发送确认派给它」，可取数从不要人确认。
+
+    取值规则和运行时一样（NodeContext.cfg）：节点上没写的取图级 defaults。核实岗位（reconciler）不在图里——写入能力没登记
+    查询时才要，派生和检查按能力另算。"""
+    defaults = (graph or {}).get("defaults") or {}
+    out: list[dict[str, str]] = []
+    for nid, node in node_map(graph).items():
+        if node["type"] != "human" and not (node["type"] == "tool" and nid in writes):
+            continue
+        cfg = node["config"]
+
+        def pick(key: str) -> Any:
+            value = cfg.get(key)
+            return defaults.get(key) if value in (None, "") else value
+
+        assignee = pick("assignee")
+        if isinstance(assignee, dict) and assignee.get("kind") == "slot" and str(assignee.get("slot") or "").strip():
+            out.append({"slot": str(assignee["slot"]).strip(), "node_id": nid, "title": node["title"],
+                        "role": "assignee" if node["type"] == "human" else "confirm"})
+        timeout = pick("on_timeout") if node["type"] == "human" else None
+        if isinstance(timeout, dict) and timeout.get("action") == "escalate" \
+                and str(timeout.get("to_slot") or "").strip():
+            out.append({"slot": str(timeout["to_slot"]).strip(), "node_id": nid, "title": node["title"],
+                        "role": "escalation"})
     return out
 
 

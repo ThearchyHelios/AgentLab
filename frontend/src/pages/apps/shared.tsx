@@ -101,3 +101,10 @@ export function BackLink({ to, label }: { to: string; label: string }) {
 }
 
 export const appPath = (appId: string) => `/apps/${encodeURIComponent(appId)}`
+
+/**
+ * 新建应用的地址（应用编辑的 new）。新建是向导的起点，现在只有「从已有的工作流开始」一种：带上工作流和版本时进来就按
+ * 那一版派生（发布成功的弹窗、版本历史里的「做成应用」），不带时先在页上选（应用首页的「新建应用」）
+ */
+export const newAppPath = (from?: { workflow: string; version: number }) =>
+  `/apps/new/edit${from ? `?${new URLSearchParams({ workflow: from.workflow, version: String(from.version) })}` : ''}`

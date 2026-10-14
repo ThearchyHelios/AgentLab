@@ -99,6 +99,40 @@ def test_input_fields_become_a_form():
     assert validate_form_schema(form) == []
 
 
+def test_number_bounds_carry_into_the_form_and_are_enforced():
+    """数字字段的上下限带进表单（只带数字类型、写成数的）；服务端校验照它拦，前端同一份子集（lib/schemaForm.ts）照它拦。"""
+    form = input_schema([
+        {"name": "amount", "type": "number", "minimum": 0.01, "maximum": 50000, "required": True},
+        {"name": "count", "type": "integer", "minimum": 1},
+        {"name": "note", "minimum": 3},
+        {"name": "bad", "type": "number", "minimum": "零"},
+    ])
+    props = form["properties"]
+    assert (props["amount"]["minimum"], props["amount"]["maximum"]) == (0.01, 50000) and props["count"]["minimum"] == 1
+    assert "minimum" not in props["note"] and "minimum" not in props["bad"]
+    assert validate_form_schema(form) == []
+    assert [e["code"] for e in validate_form(form, {"amount": -5})] == ["minimum"]
+    assert [e["code"] for e in validate_form(form, {"amount": 0})] == ["minimum"]
+    assert validate_form(form, {"amount": 60000})[0]["message"] == "「amount」不能大于 50000"
+    assert validate_form(form, {"amount": 0.01, "count": 1}) == []
+
+
+def test_the_seeded_expense_template_refuses_a_negative_amount():
+    """样例⑩：金额是数、不能小于 0.01（表单子集没有 exclusiveMinimum，「大于 0」写成 0.01）；待办标题带上金额。"""
+    from app.apps.tree import input_fields
+    from app.seed import TEMPLATES
+
+    template = next(t for t in TEMPLATES if t["name"] == "⑩ 报销审批（会签）")
+    form = input_schema(input_fields({"nodes": template["nodes"]}))
+    assert form["properties"]["amount"] == {"type": "number", "title": "amount", "description": "金额（元）",
+                                            "minimum": 0.01}
+    assert validate_form(form, {"applicant": "钱七", "amount": -5, "reason": "出差"})[0]["code"] == "minimum"
+    assert validate_form(form, {"applicant": "钱七", "amount": "很多", "reason": "出差"})[0]["code"] == "type"
+    assert validate_form(form, {"applicant": "钱七", "amount": 1280.5, "reason": "出差"}) == []
+    review = next(n for n in template["nodes"] if n["id"] == "review")["data"]["config"]
+    assert "{{ input.amount }}" in review["title"] and "{{ input.amount }}" in review["message"]
+
+
 # --------------------------------------------------------------------------
 # 表达式
 # --------------------------------------------------------------------------

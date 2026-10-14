@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.apps.spec import APP_ROOTS, DISPOSITIONS, parse_spec
-from app.apps.tree import bind_kind, components, input_fields, node_map, pins_by_alias, resolve_form
+from app.apps.tree import bind_kind, components, input_fields, node_map, pins_by_alias, resolve_form, slot_refs
 
 #: 按需视图缓存时效：默认 600 秒，最多一天（§2.3）
 TTL_DEFAULT = 600
@@ -27,6 +27,9 @@ USER_FIELDS = ("username", "display_name")
 _DIGIT = re.compile(r"\d")
 #: 文字里的一个数：千分位的逗号算在数里（「5,000」就是 5000）
 _NUMBER = re.compile(r"\d[\d,，]*(?:\.\d+)?")
+#: 岗位在图里的用处（tree.SLOT_ROLES），检查的说明里写清是哪一步要它
+_SLOT_USE = {"assignee": "人工节点「{title}」派给", "escalation": "人工节点「{title}」超时升级给",
+             "confirm": "调用工具节点「{title}」的发送确认派给"}
 _REPORT_TEXT = re.compile(r"^\s*\{\{\s*nodes\.([A-Za-z0-9_-]+)\.text\s*\}\}\s*$")
 _PLACEHOLDER = re.compile(r"\{([A-Za-z0-9_㐀-鿿]+)\}")
 
@@ -262,6 +265,8 @@ def _lint_components(spec: dict[str, Any], pins: dict[str, Any], views: dict[str
             out.error("app.props_invalid", f"组件「{comp.get('id')}」（{entry['label']}）不能放子组件", f"{at}.children")
         _lint_text(comp, entry, at, level, out, constants)
         _lint_bind(spec, comp, entry, pins, views, at, out)
+        if level == "governed":
+            _lint_metric_origin(spec, comp, pins, at, out)
         _lint_visible(comp, views, at, out)
         _lint_refs(spec, comp, at, out)
 
@@ -344,6 +349,42 @@ def _lint_bind(spec: dict[str, Any], comp: dict[str, Any], entry: dict[str, Any]
     target = bind[kind]
     if not any(_target_ok(kind, target, g, out, cid, where) for g in graphs):
         out.error("app.binding_target_missing", f"组件「{cid}」绑定的{_KIND_LABEL[kind]}在引用的工作流版本里不存在", where)
+
+
+def _lint_metric_origin(spec: dict[str, Any], comp: dict[str, Any], pins: dict[str, Any], at: str, out: _Issues) -> None:
+    """受管级应用里绑定的指标（指标块、趋势）：表达式的输入追不到原始数据（查询快照里的格、运行输入）的给提示。
+
+    指标照样是口径卡确定性算出来的、面板上照样「有出处」，但点开追到某个节点就断了：受管级的应用要的是一路追到数据。
+    和运行时、证据面板同一套认法（engine/lineage.static_stops），只看图不看值。转抄别处口径卡的指标在上游那一版里，
+    不在这里追；目标不存在的由 _lint_bind 报。"""
+    from app.engine.labels import type_label
+    from app.engine.lineage import static_stops
+
+    bind = comp.get("bind")
+    kind = bind_kind(bind) if isinstance(bind, dict) else None
+    if kind not in ("metric", "series"):
+        return
+    node_id, _, metric_id = str(bind.get(kind) or "").partition(".")
+    for graph in _view_graphs(spec, pins, bind.get("view")):
+        nodes = node_map(graph)
+        card = nodes.get(node_id)
+        if card is None or card["type"] != "metrics" or isinstance(card["config"].get("caliber_from"), dict):
+            continue
+        metric = next((m for m in card["config"].get("metrics") or [] if isinstance(m, dict) and m.get("id") == metric_id),
+                      None)
+        if metric is None:
+            continue
+        stops = static_stops(nodes, str(metric.get("expression") or ""))
+        if not stops:
+            continue
+        where = "；".join(
+            f"{s.path} 停在「{nodes[s.node_id]['title']}」（{type_label(nodes[s.node_id]['type'])}）" if s.node_id in nodes
+            else f"{s.path} 无法确定来自哪个节点" for s in stops[:3])
+        out.warning("app.metric_untraced",
+                    f"组件「{comp.get('id')}」绑定的指标「{metric.get('name') or metric_id}」的输入没有追到原始数据（{where}）："
+                    "数是口径卡算出来的，但点开出处只能追到那里，看不到查询快照里的格。请在口径卡里用 cell() 按格取数，"
+                    "或让数据整形只原样解析调用工具节点的结果", f"{at}.bind", node_id=node_id)
+        return
 
 
 _KIND_LABEL = {"metric": "指标", "series": "指标", "cell": "单元格", "query": "查询结果", "report": "报告",
@@ -480,8 +521,11 @@ def _lint_entries(spec: dict[str, Any], pins: dict[str, Any], out: _Issues) -> N
 
 async def _lint_process(session: AsyncSession, spec: dict[str, Any], pins: dict[str, Any], bindings: dict[str, Any],
                         out: _Issues) -> None:
-    """流程钉住项：岗位都绑了人、写入动作有人核实、图本身经得起升级（process.* 升成 app.process_unsafe）。"""
-    from app.capabilities.registry import effective_effect, get_capability
+    """流程钉住项：图里引用到的岗位（tree.slot_refs：派给谁、超时升级给谁、动作确认派给谁）都声明了、绑了人，写入动作
+    有人核实，图本身经得起升级（process.* 升成 app.process_unsafe）。岗位没人，流程走到那一步就派给了「任何人」：升级、
+    确认悄悄失效，所以报错。哪些调用工具节点是写入（开发送确认卡、要人核实）按 pins.write_nodes 认，和运行时、派生同一个
+    认法。"""
+    from app.apps.pins import write_nodes
     from app.engine.governance import publish_issues
     from app.engine.lint_process import load_subgraphs, with_subgraphs
     from app.engine.schema import GraphSpec
@@ -491,29 +535,30 @@ async def _lint_process(session: AsyncSession, spec: dict[str, Any], pins: dict[
         return
     bound = (bindings or {}).get("slots") or {}
     slots = dict(spec.get("slots") or {})
+    used: dict[str, list[str]] = {}
+    writes = {state.alias: await write_nodes(session, state.graph) for state in process}
     for state in process:
-        for node_id, node in node_map(state.graph).items():
-            assignee = node["config"].get("assignee") if node["type"] == "human" else None
-            if isinstance(assignee, dict) and assignee.get("kind") == "slot" and assignee.get("slot"):
-                slot = str(assignee["slot"])
-                if slot not in slots:
-                    out.error("app.slot_unbound", f"「{state.label}」的人工节点「{node['title']}」派给岗位「{slot}」，"
-                              "应用里没有声明这个岗位", "slots", node_id=node_id)
-                    slots[slot] = {"label": slot}
+        for ref in slot_refs(state.graph, writes[state.alias]):
+            slot, title = ref["slot"], ref["title"]
+            what = _SLOT_USE[ref["role"]].format(title=title)
+            used.setdefault(slot, [])
+            if f"{what}它" not in used[slot]:
+                used[slot].append(f"{what}它")
+            if slot not in slots:
+                out.error("app.slot_unbound", f"「{state.label}」里{what}岗位「{slot}」，应用里没有声明这个岗位",
+                          "slots", node_id=ref["node_id"])
+                slots[slot] = {"label": slot}
     for slot, info in slots.items():
         if not bound.get(slot):
             label = (info or {}).get("label") or slot
-            out.error("app.slot_unbound", f"岗位「{label}」还没有绑定到人或组", f"slots.{slot}")
+            why = f"（{'；'.join(used[slot][:3])}）：没有人，流程走到这一步就派给了任何人" if used.get(slot) else ""
+            out.error("app.slot_unbound", f"岗位「{label}」还没有绑定到人或组{why}", f"slots.{slot}")
     for state in process:
         nodes = node_map(state.graph)
-        for node_id, node in nodes.items():
-            if node["type"] != "tool" or not isinstance(node["config"].get("tool"), str):
-                continue
-            cap = await get_capability(session, node["config"]["tool"])
-            if cap is not None and effective_effect(cap) == "write" and not getattr(cap, "lookup", None) \
-                    and not bound.get("reconciler"):
-                out.error("app.reconciler_unbound", f"「{state.label}」的「{node['title']}」会写外部系统，写入的能力没有登记查询，"
-                          "结果未知时要人核实：请绑定核实岗位", "slots", node_id=node_id)
+        for node_id, cap in writes[state.alias].items():
+            if not getattr(cap, "lookup", None) and not bound.get("reconciler"):
+                out.error("app.reconciler_unbound", f"「{state.label}」的「{nodes[node_id]['title']}」会写外部系统，写入的能力"
+                          "没有登记查询，结果未知时要人核实：请绑定核实岗位", "slots", node_id=node_id)
         try:
             graph = GraphSpec.model_validate(state.graph)
         except ValueError:

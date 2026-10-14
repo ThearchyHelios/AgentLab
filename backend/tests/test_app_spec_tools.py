@@ -325,7 +325,10 @@ async def test_derive_a_process_leaves_slots_empty(monkeypatch):
         spec = await derive_app(session, wf, 1, name="报销审批")
     assert spec["name"] == "报销审批" and spec["pins"][0]["use"] == "process"
     assert spec["slots"] == {"finance": {"label": "finance"}, "reconciler": {"label": "动作核实"}}
-    assert spec["views"]["latest"]["source"]["from"] == "formal" and spec["views"]["inst"]["source"]["kind"] == "instance"
+    # 流程的首页只放发起和我发起的：结果在实例页看，不派生「最近封存运行」（派生出来只会挂一块永远空着的印章）
+    assert "latest" not in spec["views"] and spec["views"]["inst"]["source"]["kind"] == "instance"
+    home = next(p for p in spec["pages"] if p["id"] == "home")
+    assert [c["type"] for c in home["body"]] == ["entry_button", "instance_list"]
     inst = next(p for p in spec["pages"] if p["id"] == "instance")
     assert {"task_form", "signoffs", "action_status", "instance_header"} <= {c["type"] for c in inst["body"]}
     assert spec["task_ui"] == {"check": {"title": "财务审批"}}
@@ -333,6 +336,125 @@ async def test_derive_a_process_leaves_slots_empty(monkeypatch):
         issues = await lint_app(session, spec, {})
     # 岗位留空等人绑定：检查拦着
     assert {"app.slot_unbound", "app.reconciler_unbound"} <= codes(issues, "error")
+
+
+async def test_an_empty_dashboard_says_when_data_will_come():
+    """看板还没有封存运行：不是解析出错，写明还没有数据、什么时候会有（定时任务下次运行的时间，或者要等一次正式运行）。"""
+    from datetime import datetime, timezone
+
+    from app.apps.pins import load_pins
+    from app.apps.resolve import _empty_text
+
+    wf, info = await make_workflow(weekly())
+    async with SessionLocal() as session:
+        on = Schedule(name="周一早上", workflow_id=wf, cron="0 9 * * 1", timezone="Asia/Shanghai", run_class="formal",
+                      next_run_at=datetime(2026, 10, 19, 1, 0, tzinfo=timezone.utc))
+        paused = Schedule(name="停着的", workflow_id=wf, cron="0 9 * * 1", timezone="Asia/Shanghai",
+                          run_class="formal", enabled=False)
+        session.add_all([on, paused])
+        await session.commit()
+        state = (await load_pins(session, base_spec(wf, info)))["main"]
+        assert "定时任务「周一早上」下一次在 2026-10-19" in await _empty_text(session, state, f"schedule:{on.id}")
+        assert "定时任务「停着的」已停用" in await _empty_text(session, state, f"schedule:{paused.id}")
+        assert "已删除" in await _empty_text(session, state, "schedule:gone")
+        assert (await _empty_text(session, state, "formal")).endswith(f"「{info['name']} v1」有一次正式运行成功并封存后这里就有数")
+
+
+def test_slot_refs_cover_every_place_a_graph_names_a_slot():
+    """派给谁、超时升级给谁、动作确认派给谁，加上节点上没写、取图级 defaults 的：派生和检查认的是同一份。调用工具节点只有
+    写入的（会开发送确认卡）才算用到岗位：只读的写了派给谁、或者从 defaults 继承来的，都不算。"""
+    from app.apps.tree import slot_refs
+
+    graph = chain(
+        node("a", "human", "财务会签", assignee={"kind": "slot", "slot": " finance "}, due="PT1H",
+             on_timeout={"action": "escalate", "to_slot": "director"}),
+        node("b", "human", "复核"),
+        node("pay", "tool", "付款", tool="erp_pay", assignee={"kind": "slot", "slot": "cashier"}),
+        node("fetch", "tool", "取数", tool="erp_orders", assignee={"kind": "slot", "slot": "clerk"}),
+        node("sync", "tool", "同步", tool="erp_sync"),
+        node("c", "human", "补材料", assignee={"kind": "initiator"}, due="PT1H",
+             on_timeout={"action": "remind", "to_slot": "不算"}),
+    )
+    graph["defaults"] = {"assignee": {"kind": "slot", "slot": "auditor"}}
+    assert [(r["slot"], r["node_id"], r["role"]) for r in slot_refs(graph, {"pay", "sync"})] == [
+        ("finance", "a", "assignee"), ("director", "a", "escalation"), ("auditor", "b", "assignee"),
+        ("cashier", "pay", "confirm"), ("auditor", "sync", "confirm")]
+    # 没有写入节点：调用工具节点一个都不算
+    assert [r["node_id"] for r in slot_refs(graph)] == ["a", "a", "b"]
+
+
+async def test_read_only_tool_nodes_do_not_use_slots_and_writes_follow_the_runtime_rule(monkeypatch):
+    """只读的调用工具节点从不开确认卡：它写的派给谁（或图级默认的）不派生岗位、检查也不说「发送确认派给它」。哪些是写入
+    和运行时同一个认法（writes_externally）：绑定端点、视参数而定的也是写入，要动作状态、要人核实。"""
+    from types import SimpleNamespace
+
+    from app.capabilities import registry
+
+    caps = {"erp_pay": SimpleNamespace(effect="write", endpoint_id=None, lookup="erp_lookup"),
+            "erp_orders": SimpleNamespace(effect="read", endpoint_id="ep-1", lookup=None),
+            "erp_sync": SimpleNamespace(effect="dynamic", endpoint_id="ep-1", lookup=None)}
+
+    async def get_capability(session, name):
+        return caps.get(name)
+
+    monkeypatch.setattr(registry, "get_capability", get_capability)
+    graph = chain(
+        node("start", "input", "开始", fields=[{"name": "amount", "type": "number", "required": True}]),
+        node("fetch", "tool", "取数", tool="erp_orders", args={}, assignee={"kind": "slot", "slot": "clerk"}),
+        node("check", "human", "财务审批", mode="approve", assignee={"kind": "slot", "slot": "finance"}),
+        node("pay", "tool", "付款", tool="erp_pay", args={}),
+        node("sync", "tool", "同步", tool="erp_sync", args={}),
+        node("out", "output", "成果", fields=[{"name": "r", "value": "完成"}]),
+    )
+    graph["defaults"] = {"assignee": {"kind": "slot", "slot": "cashier"}}
+    wf, _ = await make_workflow(graph)
+    async with SessionLocal() as session:
+        spec = await derive_app(session, wf, 1)
+        assert set(spec["slots"]) == {"finance", "cashier", "reconciler"}
+        inst = next(p for p in spec["pages"] if p["id"] == "instance")
+        assert [c["bind"]["action"] for c in inst["body"] if c["type"] == "action_status"] == ["pay", "sync"]
+        issues = await lint_app(session, spec, {"slots": {"finance": [{"kind": "user", "name": "u"}]}})
+    unbound = [i for i in issues if i["code"] == "app.slot_unbound"]
+    cashier = next(i for i in unbound if i["path"] == "slots.cashier")
+    assert "调用工具节点「付款」的发送确认派给它" in cashier["message"] and "「同步」" in cashier["message"]
+    assert not any("取数" in i["message"] for i in issues), [i["message"] for i in issues]
+    [reconcile] = [i for i in issues if i["code"] == "app.reconciler_unbound"]
+    assert reconcile["node_id"] == "sync" and "「同步」会写外部系统" in reconcile["message"]
+
+
+async def test_escalation_and_confirm_slots_are_derived_and_must_be_bound(monkeypatch):
+    """超时升级的岗位、动作确认的岗位以前既不派生也不检查：发布后升级、确认悄悄派给了任何人。"""
+    from app.capabilities import registry
+
+    class Cap:
+        effect = "write"
+        lookup = "erp_lookup"
+
+    async def get_capability(session, name):
+        return Cap() if name == "erp_pay" else None
+
+    monkeypatch.setattr(registry, "get_capability", get_capability)
+    graph = approval()
+    graph["nodes"][1]["data"]["config"].update(due="PT1H", on_timeout={"action": "escalate", "to_slot": "director"})
+    graph["nodes"][2]["data"]["config"]["assignee"] = {"kind": "slot", "slot": "cashier"}
+    wf, info = await make_workflow(graph)
+    async with SessionLocal() as session:
+        spec = await derive_app(session, wf, 1)
+        assert set(spec["slots"]) == {"finance", "director", "cashier"}
+        everyone = {"slots": {s: [{"kind": "user", "name": "u"}] for s in ("finance", "director", "cashier")}}
+        assert not codes(await lint_app(session, spec, everyone)) & {"app.slot_unbound"}
+
+        # 绑了两个、升级给的总监没绑：报错，说清是哪一步要它
+        issues = await lint_app(session, spec, {"slots": {k: v for k, v in everyone["slots"].items() if k != "director"}})
+        [unbound] = [i for i in issues if i["code"] == "app.slot_unbound"]
+        assert unbound["level"] == "error" and unbound["path"] == "slots.director"
+        assert "人工节点「财务审批」超时升级给它" in unbound["message"]
+
+        # 应用里根本没声明：按引用它的那一步报，落到节点上
+        del spec["slots"]["cashier"]
+        issues = await lint_app(session, spec, everyone)
+        undeclared = next(i for i in issues if i["code"] == "app.slot_unbound" and i.get("node_id") == "pay")
+        assert "调用工具节点「付款」的发送确认派给岗位「cashier」" in undeclared["message"]
 
 
 async def test_describe_a_version_has_no_secrets():

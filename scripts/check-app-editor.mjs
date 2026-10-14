@@ -59,10 +59,13 @@ const CATALOG = {
   components: [
     { name: 'columns', label: '分栏', category: 'layout', version: 1, children: true, bindings: [],
       props: { type: 'object', properties: { count: { type: 'integer', minimum: 1, maximum: 4 } } } },
+    // 属性的 title、description、x-enum-labels 照服务端目录（apps/catalog.py）的写法
     { name: 'metric', label: '指标块', category: 'display', version: 1, children: false, bindings: ['metric', 'cell'],
-      props: { type: 'object', properties: { label: { type: 'string', maxLength: 200 }, unit: { type: 'string', maxLength: 200 } } } },
+      props: { type: 'object', properties: { label: { type: 'string', maxLength: 200, title: '名称' },
+        unit: { type: 'string', maxLength: 200, title: '单位', description: '绑定单元格时写在数下面；绑定指标时数里已经带着口径卡的单位' } } } },
     { name: 'notice', label: '提示', category: 'display', version: 1, children: false, bindings: [],
-      props: { type: 'object', properties: { text: { type: 'string', maxLength: 4000 }, tone: { enum: ['info', 'warn', 'error'] } } } },
+      props: { type: 'object', properties: { text: { type: 'string', maxLength: 4000, title: '提示文字' },
+        tone: { enum: ['info', 'warn', 'error'], 'x-enum-labels': ['说明', '提醒', '错误'], title: '样式' } } } },
     { name: 'report', label: '报告', category: 'display', version: 1, children: false, bindings: ['report'],
       props: { type: 'object', properties: { title: { type: 'string', maxLength: 200 } } } },
     { name: 'entry_button', label: '发起按钮', category: 'process', version: 1, children: false, bindings: [],
@@ -234,12 +237,28 @@ await section('新建：从发布弹窗带着工作流和版本进来，直接�
 })
 
 await section('新建：不带参数时先选工作流和版本，只列已发布且未退役的', async () => {
-  const { page } = await open({ path: '/apps/new/edit' })
+  const { page, state, errors } = await open({ path: '/apps/new/edit' })
+  // 应用首页的「新建应用」到这里：新建向导的起点，现在只有「从已有的工作流开始」一种
+  const start = page.locator('[data-app-editor="new"] [data-app-new-start="workflow"]')
+  check('写明从已有的工作流开始', await start.count() === 1 && (await start.locator('h2').innerText()) === '从已有的工作流开始')
   check('有派生说明', (await page.locator('[data-app-editor="new"]').innerText()).includes('确定性地派生'))
+  check('没选之前不派生、不能点', state.derives.length === 0 && await page.locator('[data-app-derive]').isDisabled())
   await page.locator('[data-app-editor="new"] select').first().selectOption('ae-wf')
   const opts = await page.locator('[data-app-editor="new"] select').nth(1).locator('option').allInnerTexts()
   check('版本只列已发布且未退役的（v5 退役、v4 没发布不列）', opts.some((t) => t.startsWith('v7')) && opts.some((t) => t.startsWith('v6'))
     && !opts.some((t) => t.startsWith('v5')) && !opts.some((t) => t.startsWith('v4')), opts.join(' | '))
+  // 选好版本、起个名字：按这一版派生、建应用、进编辑器，和「做成应用」走同一条路
+  await page.locator('[data-app-editor="new"] select').nth(1).selectOption('6')
+  await page.locator('[data-app-editor="new"] input').fill('门店周报看板')
+  await page.locator('[data-app-derive]').click()
+  check('按选的版本派生，带上起的名字', await waitFor(page, async () => state.derives.length === 1)
+    && state.derives[0].workflow_id === 'ae-wf' && state.derives[0].version === 6 && state.derives[0].name === '门店周报看板',
+    JSON.stringify(state.derives))
+  check('派生的 spec 原样建成应用', await waitFor(page, async () => state.creates.length === 1)
+    && state.creates[0].spec?.pins?.[0]?.version === 6, JSON.stringify(state.creates[0]?.spec?.pins))
+  await page.waitForURL('**/apps/app-new/edit/pages')
+  check('建好跳进编辑器的页面一节', new URL(page.url()).pathname === '/apps/app-new/edit/pages')
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
 })
 
 await section('固定版本：别名、用途、改版本取新的哈希', async () => {
@@ -262,12 +281,20 @@ await section('页面树和属性面板：目录驱动、绑定、可见性', as
   const insp = page.locator('[data-app-inspector="gmv"]')
   check('属性面板按目录的 props 画：标签、单位', await insp.locator('[data-app-prop="label"]').count() === 1
     && await insp.locator('[data-app-prop="unit"]').count() === 1)
+  check('属性名写目录里的中文名，不露键名', await insp.locator('[data-app-prop="label"] label').innerText() === '名称'
+    && await insp.locator('[data-app-prop="unit"] label').innerText() === '单位',
+    `${await insp.locator('[data-app-prop="label"] label').innerText()} ｜ ${await insp.locator('[data-app-prop="unit"] label').innerText()}`)
+  const unitHint = insp.locator('[data-app-prop="unit"] p')
+  check('取值不直观的属性下面写目录给的说明，接到读屏', (await unitHint.innerText()).includes('绑定指标时数里已经带着')
+    && await insp.locator('[data-app-prop="unit"] input').getAttribute('aria-describedby') === await unitHint.getAttribute('id'))
   const kinds = await insp.locator('[data-app-bind-kind] option').allInnerTexts()
   check('绑定种类只给目录登记的（指标、单元格）', kinds.includes('指标') && kinds.includes('单元格') && !kinds.includes('报告'), kinds.join(' | '))
   await insp.locator('[data-app-prop="unit"] input').fill('元')
   await page.locator('[data-app-component="warn"]').click()
   const vis = page.locator('[data-app-inspector="warn"] [data-app-visible]')
   check('可见性表达式照原样显示，可编辑', await vis.inputValue() === "run.tier != 'formal'")
+  const tones = await page.locator('[data-app-inspector="warn"] [data-app-prop="tone"] option').allInnerTexts()
+  check('枚举的选项写目录给的中文（x-enum-labels），不写 info / warn / error', tones.join(',') === '—,说明,提醒,错误', tones.join(' | '))
   await page.locator('[data-app-palette]').click()
   await page.locator('[data-app-palette-item="report"]').click()
   check('从目录添加组件，新组件选中', await page.locator('[data-app-inspector^="report"]').count() === 1)
@@ -276,6 +303,68 @@ await section('页面树和属性面板：目录驱动、绑定、可见性', as
   const body = state.patches[0]?.draft?.pages?.[0]?.body ?? []
   check('保存的草稿里有改过的属性和新组件', JSON.stringify(body).includes('"unit":"元"') && JSON.stringify(body).includes('"type":"report"'),
     JSON.stringify(body).slice(0, 200))
+})
+
+await section('视图来源：每种来源写一句解释；新增时起名，删除先确认、写明用到它的组件、可以撤销', async () => {
+  const { page, state } = await open()
+  const panel = page.locator('[data-app-views]')
+  await panel.locator('summary').click()
+  const wk = panel.locator('[data-app-view="wk"]')
+  check('最近封存写一句解释（不只放在悬停里）', (await wk.locator('[data-app-view-kind-hint="latest_sealed"]').innerText()).includes('不发起运行'))
+  await wk.locator('select').first().selectOption('on_demand')
+  check('换成按需：解释跟着换', await waitFor(page, async () => (await wk.locator('[data-app-view-kind-hint]').getAttribute('data-app-view-kind-hint')) === 'on_demand'
+    && (await wk.locator('[data-app-view-kind-hint]').innerText()).includes('缓存时效')))
+  await wk.locator('select').first().selectOption('latest_sealed')
+
+  // 新增：起名；重名不让加（会盖掉已有的视图），不起名叫 vN
+  const name = panel.locator('[data-app-view-name]')
+  await name.fill('wk')
+  check('重名：不让加，写明已有同名视图', await panel.locator('[data-app-view-add]').isDisabled()
+    && (await panel.locator('[data-app-view-name-taken]').innerText()).includes('已有名为「wk」的视图'))
+  await name.fill(' detail ')
+  await panel.locator('[data-app-view-add]').click()
+  check('起了名：按名字新增（去掉首尾空白），输入框清空', await panel.locator('[data-app-view="detail"]').count() === 1 && await name.inputValue() === '')
+  await panel.locator('[data-app-view-add]').click()
+  check('不起名：照旧叫 vN', await panel.locator('[data-app-view="v3"]').count() === 1,
+    (await panel.locator('[data-app-view]').evaluateAll((els) => els.map((e) => e.getAttribute('data-app-view')))).join(','))
+
+  // 删除：先确认，写明用到它的组件；取消不删
+  await wk.getByRole('button', { name: '删除视图「wk」' }).click()
+  const dlg = page.locator('[role="dialog"], [role="alertdialog"]').filter({ hasText: '删除视图「wk」？' }).first()
+  await dlg.waitFor({ timeout: 4000 })
+  const said = await dlg.innerText()
+  check('确认框写明用到它的组件（绑定的、可见条件指它的）和后果', said.includes('指标块「销售额」') && said.includes('提示「warn」')
+    && said.includes('失去数据来源'), said.replace(/\s+/g, ' '))
+  await dlg.getByRole('button', { name: '取消' }).click()
+  check('取消：视图还在', await panel.locator('[data-app-view="wk"]').count() === 1)
+  await wk.getByRole('button', { name: '删除视图「wk」' }).click()
+  await dlg.waitFor({ timeout: 4000 })
+  await dlg.getByRole('button', { name: '删除视图' }).click()
+  check('确认后删掉', await waitFor(page, async () => await panel.locator('[data-app-view="wk"]').count() === 0))
+  const undo = page.locator('[data-toast]').filter({ hasText: '已删除视图「wk」' }).getByRole('button', { name: '撤销' })
+  check('删完给一次撤销', await waitFor(page, async () => await undo.count() === 1))
+  await undo.click()
+  check('撤销：视图回来了，来源照旧', await waitFor(page, async () => await panel.locator('[data-app-view="wk"]').count() === 1)
+    && await panel.locator('[data-app-view="wk"] select').first().inputValue() === 'latest_sealed')
+  // 没人用的视图：确认框照实说没有组件用到
+  await panel.locator('[data-app-view="detail"]').getByRole('button', { name: '删除视图「detail」' }).click()
+  const idle = page.locator('[role="dialog"], [role="alertdialog"]').filter({ hasText: '删除视图「detail」？' }).first()
+  await idle.waitFor({ timeout: 4000 })
+  check('没人用的视图：写明没有组件用到', (await idle.innerText()).includes('没有组件用到这个视图'))
+  await idle.getByRole('button', { name: '删除视图' }).click()
+  await page.locator('[data-app-save]').click()
+  await waitFor(page, async () => state.patches.length === 1)
+  const views = Object.keys(state.patches[0]?.draft?.views ?? {}).sort()
+  check('保存的草稿：wk 撤销回来了、detail 删了、v3 新增了', views.join(',') === 'v3,wk', views.join(','))
+})
+
+await section('固定版本：「固定版本」「处置」各写一句解释', async () => {
+  const { page } = await open({ path: '/apps/app-ae/edit/pins' })
+  const terms = page.locator('[data-app-terms]')
+  check('固定版本：写明应用只按这一版发起、工作流发新版不自动换', (await terms.locator('[data-app-term="pin"]').innerText()).includes('不会自动换'))
+  const disposition = await terms.locator('[data-app-term="disposition"]').innerText()
+  check('处置：写明是升版前后怎么放在一起看、三种选法', ['升版前后', '按新口径重算', '两版并列', '前后不可比'].every((w) => disposition.includes(w)),
+    disposition)
 })
 
 await section('检查：和发布同一套规则，点一条定位到组件', async () => {
@@ -470,6 +559,47 @@ await section('按新口径补算：处置不是按新口径重算时不给按�
   const { page } = await open({ versions })
   await page.waitForTimeout(500)
   check('两版并列：没有补算按钮', await page.locator('[data-app-backfill]').count() === 0)
+})
+
+// 授权三行长得一样，不写标题分不出哪一行是哪一档；搭建者读不到 /users、/groups（只给管理员），选人走只读的名录
+// （/api/directory），填错的名字当场标出来，不静默存进授权
+await section('岗位与授权：三档各写标题和说明；搭建者从名录选人，名录里没有的不让加、已选的标出来', async () => {
+  const { page } = await open({ path: '/apps/app-ae/edit/access' })
+  const asked = []
+  await page.route(/\/api\/auth\/me$/, (route) => route.fulfill({ json: {
+    mode: 'local', username: 'lisi', display_name: '李四', role: 'builder', groups: [], verified: true } }))
+  await page.route(/\/api\/directory$/, (route) => {
+    asked.push(1)
+    return route.fulfill({ json: { users: [{ username: 'zhangsan', display_name: '张三', disabled: false },
+      { username: 'wangwu', display_name: '王五', disabled: true }], groups: [{ name: 'fin', label: '财务' }] } })
+  })
+  await page.route(/\/api\/(users|groups)$/, (route) => route.fulfill({ status: 403, json: { detail: '没有权限' } }))
+  await page.route(/\/api\/apps\/app-ae\/grants$/, (route) => (route.request().method() === 'GET'
+    ? route.fulfill({ json: { items: [{ principal_kind: 'user', principal: 'ghost', role: 'use' }] } }) : route.fallback()))
+  await page.reload({ waitUntil: 'networkidle' })
+  const rows = page.locator('[data-app-grant-role]')
+  await rows.first().waitFor({ timeout: 8000 })
+  const titles = await page.locator('[data-app-grant-title]').allInnerTexts()
+  check('三行写明使用 / 查看全部实例 / 管理', titles.join(',') === '使用,查看全部实例,管理', titles.join(','))
+  check('每行带一句管什么的说明', (await rows.nth(0).innerText()).includes('派给自己的待办')
+    && (await rows.nth(1).innerText()).includes('全部实例') && (await rows.nth(2).innerText()).includes('编辑、发布'))
+  const use = rows.first()
+  check('已选的名录里没有：标签上标出来', await waitFor(page, async () => await use.locator('[data-principal-problem="missing"]').count() === 1))
+  const input = use.getByRole('textbox')
+  const chips = () => use.locator('li[data-principal]').count()
+  await input.fill('nobody')
+  await input.press('Enter')
+  check('名录里没有的人不让加，说清是谁', (await use.locator('[data-principal-refused="hard"]').innerText().catch(() => '')).includes('nobody')
+    && await chips() === 1)
+  await input.fill('wangwu')
+  await input.press('Enter')
+  check('停用的人不让加', (await use.locator('[data-principal-refused]').innerText().catch(() => '')).includes('已停用') && await chips() === 1)
+  const options = await use.locator('datalist option').evaluateAll((els) => els.map((e) => e.value))
+  check('候选来自名录，停用的不列', options.join(',') === 'zhangsan', options.join(','))
+  await input.fill('zhangsan')
+  await input.press('Enter')
+  check('名录里有的照常加上', await chips() === 2 && await use.locator('[data-principal-refused]').count() === 0)
+  check('名录只取一次，几个选择器共用', asked.length === 1, String(asked.length))
 })
 
 check('检查没有写库（兜底拦下的写请求）', writes.length === 0, writes.slice(0, 4).join('、'))

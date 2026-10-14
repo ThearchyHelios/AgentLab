@@ -2,7 +2,8 @@
 
 - 同步：主键是图里的工具名；同步得出的效果只说系统知道的（可写数据源为视参数而定，绑定端点的非 GET 为写入）；
   source_hash 没变不动；来源没了记 missing、不删行；
-- 治理：version 乐观锁、写审计；只读能力才能免审批；
+- 治理：version 乐观锁、写审计；只读能力才能免审批；查询能力只能是同一端点上、绑定端点的只读能力；
+- 写记忆这类改平台自身状态的内置工具不记成只读（不能免审批、不能当查询能力），照旧能给 Agent 用；
 - is_platform_query：数据源查询，和绑定端点、声明了表格、治理后只读的 http 工具；Python 工具写了表格也不算；
 - build_tools(allow_write=False) 拒绝写入能力，视参数而定的照旧放行；
 - 正式运行：只读 + 免审批的能力直接放行（修 F7），其余照旧问人；总要确认的探索运行里也问；
@@ -68,11 +69,12 @@ async def _row(name: str) -> Capability:
 
 async def test_sync_derives_effects_and_only_touches_what_changed(world):
     effects = {n: (await _row(n)).effect_system for n in (
-        "calculator", "shell_exec", "db_query__sales_ro", "db_query__sales_rw", "db_schema__sales_rw",
-        "erp_orders", "erp_pay", "calc_py", "mcp:kb/search")}
-    assert effects == {"calculator": "read", "shell_exec": "dynamic", "db_query__sales_ro": "read",
-                       "db_query__sales_rw": "dynamic", "db_schema__sales_rw": "read", "erp_orders": "read",
-                       "erp_pay": "write", "calc_py": "dynamic", "mcp:kb/search": "dynamic"}
+        "calculator", "shell_exec", "memory_recall", "memory_write", "db_query__sales_ro", "db_query__sales_rw",
+        "db_schema__sales_rw", "erp_orders", "erp_pay", "calc_py", "mcp:kb/search")}
+    assert effects == {"calculator": "read", "shell_exec": "dynamic", "memory_recall": "read", "memory_write": "dynamic",
+                       "db_query__sales_ro": "read", "db_query__sales_rw": "dynamic", "db_schema__sales_rw": "read",
+                       "erp_orders": "read", "erp_pay": "write", "calc_py": "dynamic", "mcp:kb/search": "dynamic"}, \
+        "写记忆改的是平台自己的状态：不是只读"
     pay = await _row("erp_pay")
     assert (pay.system, pay.endpoint_id) == ("erp", world["erp"])
     async with SessionLocal() as s:
@@ -105,6 +107,37 @@ async def test_governance_lock_audit_and_rules(world):
     assert snap["mcp:kb/search"] == {**snap["mcp:kb/search"], "effect": "read", "approval": "none", "version": 2,
                                       "masked": ["/phone"]}
     assert "nope" not in snap and versions == {"mcp:kb/search": 2, "erp_pay": 1}
+
+
+async def test_lookup_is_a_read_on_the_same_endpoint(world):
+    c = auth_env.client()
+    for wrong in ("memory_write", "db_query__sales_ro", "mcp:kb/search", "erp_pay", "nope"):
+        r = await c.put("/api/capabilities/erp_pay/governance", json={"version": 1, "lookup": wrong})
+        assert r.status_code == 422 and "同一端点" in r.json()["detail"], wrong
+    r = await c.put("/api/capabilities/erp_pay/governance", json={"version": 1, "lookup": "erp_orders"})
+    assert r.status_code == 200 and r.json()["lookup"] == "erp_orders", r.text
+    r = await c.put("/api/capabilities/erp_pay/governance", json={"version": 2, "lookup": None})
+    assert r.status_code == 200 and r.json()["lookup"] is None, "清掉照旧可以"
+    async with SessionLocal() as s:
+        await s.execute(update(Capability).where(Capability.name == "memory_write").values(effect="read"))
+        await s.commit()
+    r = await c.put("/api/capabilities/erp_pay/governance", json={"version": 3, "lookup": "memory_write"})
+    assert r.status_code == 422, "治理成只读的内置工具也不是端点上的读取，查不了这一笔写入"
+    ctx = ToolContext(run_id="t", node_id="n", data_versions=Versions.CURRENT)
+    async with SessionLocal() as s:
+        await s.execute(update(Capability).where(Capability.name == "memory_write").values(effect=None))
+        await s.commit()
+        assert [t.name for t in await build_tools(["memory_write"], ctx, session=s)] == ["memory_write"], \
+            "写记忆不是对外写入，Agent 照旧能用"
+
+
+async def test_tool_library_rehearses_anything_governed_as_a_write(world):
+    c = auth_env.client()
+    r = await c.put("/api/capabilities/mcp:kb/search/governance", json={"version": 1, "effect": "write"})
+    assert r.status_code == 200, r.text
+    out = await c.post("/api/tools/mcp:kb/search/run", json={"args": {"q": "x"}})
+    assert out.status_code == 200, "演练不发送，没有副作用，不先要确认"
+    assert out.json()["rehearsal"] is True and out.json()["result"]["args"] == {"q": "x"}
 
 
 async def test_platform_query_is_by_identity_not_by_shape(world):

@@ -3,8 +3,8 @@
 ActionRecord 是权威记录：先写记录再发送，结果未知永不自动重发。调用工具节点（engine/nodes/tools.py）在能力治理后
 效果为 write 时走这里：
 
-  1. prepare：渲染好的参数 → payload_hash；按 action_key 查记录——已生效的交回存下的回执，已发出 / 结果未知的挂起，
-     失败且有人核实为「未生效，重新发送」的 attempt 加一；
+  1. prepare：先按 action_key 查记录——已生效的交回存下的回执，已发出 / 结果未知的挂起，失败且有人核实为「未生效，重新
+     发送」的 attempt 加一；真要发送时才把渲染好的参数按能力的参数定义收成声明的类型（typed_args）→ payload_hash；
   2. （节点）需要确认时在 tool.start 之前中断（kind=action_confirm），恢复后重算哈希，对不上拒绝发送；
   3. send：先写 pending 并提交 → 改成 sent 并提交 → 发请求（幂等键 {action_key}:{attempt}）→ 2xx confirmed（回执落工件）、
      4xx（429 除外）failed、超时 / 中断 / 5xx unknown（抛 ActionPending，运行挂起、不封存）。
@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import logging
+import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -91,6 +94,130 @@ def masked(doc: Any, pointers: list[str]) -> Any:
 
 
 # --------------------------------------------------------------------------
+# 参数按声明的类型收好
+# --------------------------------------------------------------------------
+
+#: 参数类型的叫法（收不成声明的类型时说给人听）
+_TYPE_TEXT = {"number": "数", "integer": "整数", "boolean": "是或否（true / false）", "object": "对象（JSON）",
+              "array": "列表（JSON）"}
+_INTEGER = re.compile(r"[+-]?\d+")
+#: 文字里的数：和前端表单读数的写法一样（lib/schemaForm），不认 nan、inf、带下划线的
+_NUMBER = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+class _Untyped(Exception):
+    def __init__(self, where: str, kind: str, value: Any) -> None:
+        super().__init__(where)
+        self.where, self.kind, self.value = where, kind, value
+
+
+def typed_args(capability: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """按能力登记的参数定义（params_schema，JSON Schema）把渲染好的参数收成声明的类型。确认卡的预览、内容指纹、发出去的
+    请求都用收好的这一份：看过的就是发出去的。
+
+    模板渲染出来的一律是文字：{"amount": "{{ input.amount }}"} 得到 "1280.5"，照原样发，外部系统收到的金额是字符串。
+    这里只收 number / integer / boolean，以及 object / array（是 JSON 文字的先解开，再按里面的定义逐层收）；声明为文字、
+    没写类型的原样不动，参数定义里没有的键也原样不动——没登记参数定义的能力发出去的和以前一字不差。
+    可选参数渲染出来是空的（模板没取到值）：不发这个键，不拿空串冒充数；必填的空着照实失败。
+    收不成（"abc" 填给数）抛 ActionFailed，说清是哪个参数，一次都不发。"""
+    schema = getattr(capability, "params_schema", None)
+    if not isinstance(args, dict) or not isinstance(schema, dict) or not isinstance(schema.get("properties"), dict):
+        return args
+    try:
+        return _typed_object(schema, args, "")
+    except _Untyped as e:
+        title = getattr(capability, "title", None) or capability.name
+        shown = e.value if isinstance(e.value, str) else json.dumps(e.value, ensure_ascii=False, default=str)
+        if e.kind == "required":
+            raise ActionFailed(f"「{title}」的必填参数 {e.where} 是空的（参数模板没有取到值），没有发送。"
+                               "请检查节点里的参数和上游填的值") from e
+        raise ActionFailed(f"「{title}」的参数 {e.where} 应为{_TYPE_TEXT.get(e.kind, e.kind)}，实际是「{shown[:80]}」，"
+                           "没有发送。请检查节点里的参数和上游填的值") from e
+
+
+def _kinds(spec: dict[str, Any]) -> list[str]:
+    kind = spec.get("type")
+    if isinstance(kind, list):
+        return [k for k in kind if isinstance(k, str)]
+    return [kind] if isinstance(kind, str) else []
+
+
+def _typed_object(spec: dict[str, Any], obj: dict[str, Any], path: str) -> dict[str, Any]:
+    props = spec.get("properties") if isinstance(spec.get("properties"), dict) else {}
+    required = set(spec.get("required") or []) if isinstance(spec.get("required"), list) else set()
+    out: dict[str, Any] = {}
+    for key, value in obj.items():
+        sub = props.get(key)
+        where = f"{path}.{key}" if path else str(key)
+        kinds = _kinds(sub) if isinstance(sub, dict) else []
+        blank = value is None or (isinstance(value, str) and not value.strip())
+        if blank and kinds and "string" not in kinds:
+            if "null" in kinds:
+                out[key] = None
+            elif key in required:
+                raise _Untyped(where, "required", value)
+            continue
+        out[key] = _typed(value, sub, where) if isinstance(sub, dict) else value
+    return out
+
+
+def _typed(value: Any, spec: dict[str, Any], where: str) -> Any:
+    kinds = [k for k in _kinds(spec) if k != "null"]
+    if not kinds or ("string" in kinds and isinstance(value, str)):
+        return value
+    first: _Untyped | None = None
+    for kind in kinds:
+        try:
+            return _as(kind, value, spec, where)
+        except _Untyped as e:
+            first = first or e
+    raise first or _Untyped(where, kinds[0], value)
+
+
+def _as(kind: str, value: Any, spec: dict[str, Any], where: str) -> Any:
+    if kind == "string":
+        return value
+    if kind in ("number", "integer"):
+        number: Any = None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if _INTEGER.fullmatch(text):
+                number = int(text)
+            elif _NUMBER.fullmatch(text):
+                number = float(text)
+        if number is None or isinstance(number, float) and not math.isfinite(number):
+            raise _Untyped(where, kind, value)
+        if kind == "integer":
+            if isinstance(number, float) and not number.is_integer():
+                raise _Untyped(where, kind, value)
+            return int(number)
+        return number
+    if kind == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        raise _Untyped(where, kind, value)
+    if kind in ("object", "array"):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                raise _Untyped(where, kind, value) from None
+        if kind == "object" and isinstance(value, dict):
+            return _typed_object(spec, value, where)
+        if kind == "array" and isinstance(value, list):
+            items = spec.get("items")
+            if not isinstance(items, dict):
+                return value
+            return [_typed(v, items, f"{where}[{i}]") for i, v in enumerate(value)]
+        raise _Untyped(where, kind, value)
+    return value
+
+
+# --------------------------------------------------------------------------
 # 准备与发送（调用工具节点用）
 # --------------------------------------------------------------------------
 
@@ -107,6 +234,8 @@ class Prepared:
     #: 已经生效（或演练过）的：存下的回执，节点直接交回，不再发
     receipt: dict[str, Any] | None = None
     run: dict[str, Any] = field(default_factory=dict)
+    #: 按参数定义收好类型的参数（typed_args）：哈希、预览按它算，send 发的也是它
+    args: dict[str, Any] = field(default_factory=dict)
 
     @property
     def idem_key(self) -> str:
@@ -121,47 +250,53 @@ async def latest(session: AsyncSession, key: str) -> ActionRecord | None:
 async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, args: dict[str, Any]) -> Prepared:
     """节点每次执行都先走这里：按 action_key 查记录，决定发不发、第几次发、走哪个环境。
 
-    sent / unknown 抛 ActionPending（不发）；failed 且没有人核实为「重新发送」的抛 ActionFailed。"""
+    sent / unknown 抛 ActionPending（不发）；failed 且没有人核实为「重新发送」的抛 ActionFailed。先查记录再收类型：已生效
+    （演练过）的交回存下的回执、已发出 / 结果未知的挂起，都和这一次渲染出来的参数无关——发出之后能力的参数定义改了、手上的
+    值收不成声明的类型（升级时停在结果未知的运行），已经生效的写入照样交回回执，不判成失败。只有真要发送（头一次、记下了
+    还没发出去、核实为未生效要重发）时才按参数定义收成声明的类型（typed_args），收不成的抛 ActionFailed；之后的哈希、
+    预览、发送都用收好的那一份（Prepared.args）。"""
     from app.capabilities.registry import masked_paths
 
     name = capability.name
     key = action_key(run_id, node_id, exec_no)
-    digest = payload_hash(name, args)
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         endpoint = await _endpoint(session, capability)
         prev = await latest(session, key)
+    facts = {"app_id": run.app_id, "workflow_id": run.workflow_id, "workflow_version": run.version,
+             "graph_hash": run.version_hash, "started_by": run.started_by} if run is not None else {}
+    endpoint_name = endpoint.name if endpoint is not None else None
+    if prev is not None and prev.state in ("confirmed", "simulated"):
+        # 交回的是生效的那一次：指纹、预览、环境、第几次都照记录，不按这一次的参数重算
+        return Prepared(key=key, attempt=prev.attempt, payload_hash=prev.payload_hash, preview=prev.preview,
+                        environment=prev.environment, endpoint=endpoint_name, receipt=_receipt_of(prev), run=facts)
+    if prev is not None and prev.state in ("sent", "unknown"):
+        raise ActionPending(prev.id)
     formal = run is not None and run.run_class == "formal"
+    attempt = 1
     environment = "prod" if formal else "test" if endpoint is not None and (endpoint.environments or {}).get("test") \
         else "simulated"
-    prep = Prepared(key=key, attempt=1, payload_hash=digest, preview=masked(args, masked_paths(capability)),
-                    environment=environment, endpoint=endpoint.name if endpoint is not None else None,
-                    run={"app_id": run.app_id, "workflow_id": run.workflow_id, "workflow_version": run.version,
-                         "graph_hash": run.version_hash, "started_by": run.started_by} if run is not None else {})
-    if prev is None:
-        return prep
-    if prev.state in ("confirmed", "simulated"):
-        prep.receipt = _receipt_of(prev)
-        return prep
-    if prev.state in ("sent", "unknown"):
-        raise ActionPending(prev.id)
-    if prev.state == "pending":
+    if prev is not None and prev.state == "pending":
         # 记下了、还没发出去（发之前进程没了）：照原样再发，同一个幂等键
-        prep.attempt, prep.environment = prev.attempt, prev.environment
-        return prep
-    outcome = (prev.resolution or {}).get("outcome")
-    if outcome == "resend":
-        prep.attempt = prev.attempt + 1
-        return prep
-    if outcome == "abandon":
-        raise ActionFailed(f"「{name}」这次写入核实为未生效，已选择放弃发送")
-    raise ActionFailed(f"「{name}」上一次发送被外部系统拒绝（{prev.error or '未生效'}），不会自动重发。"
-                       "请检查上游的数据后重新发起运行")
+        attempt, environment = prev.attempt, prev.environment
+    elif prev is not None:
+        outcome = (prev.resolution or {}).get("outcome")
+        if outcome == "abandon":
+            raise ActionFailed(f"「{name}」这次写入核实为未生效，已选择放弃发送")
+        if outcome != "resend":
+            raise ActionFailed(f"「{name}」上一次发送被外部系统拒绝（{prev.error or '未生效'}），不会自动重发。"
+                               "请检查上游的数据后重新发起运行")
+        attempt = prev.attempt + 1
+    args = typed_args(capability, args)
+    return Prepared(key=key, attempt=attempt, payload_hash=payload_hash(name, args),
+                    preview=masked(args, masked_paths(capability)), environment=environment, endpoint=endpoint_name,
+                    run=facts, args=args)
 
 
-async def send(prep: Prepared, capability: Any, args: dict[str, Any], *, run_id: str, node_id: str, exec_no: int,
+async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, exec_no: int,
                emit: Callable[..., None], on_behalf: str | dict[str, Any] | None = None) -> dict[str, Any]:
-    """先写记录再发送。返回节点的产出；结果未知抛 ActionPending，确定失败抛 ActionFailed。
+    """先写记录再发送。返回节点的产出；结果未知抛 ActionPending，确定失败抛 ActionFailed。发的是 prepare 收好类型的
+    那一份参数（prep.args），和确认卡上的哈希是同一份。
 
     on_behalf 原样交给平台执行器写身份断言：{"sub": 运行的发起人, "act": 确认人}（capabilities.endpoints.on_behalf_parts）。"""
     from app.capabilities.registry import endpoint_request, masked_paths
@@ -200,7 +335,7 @@ async def send(prep: Prepared, capability: Any, args: dict[str, Any], *, run_id:
          environment=prep.environment)
     try:
         async with SessionLocal() as session:
-            result = await endpoint_request(session, capability, args, environment=prep.environment,
+            result = await endpoint_request(session, capability, prep.args, environment=prep.environment,
                                             idem_key=prep.idem_key, on_behalf=on_behalf, run_id=run_id,
                                             node_id=node_id)
     except Exception as e:  # noqa: BLE001 - 请求可能已经发出去了：一律按结果未知处理，不能当成失败再发

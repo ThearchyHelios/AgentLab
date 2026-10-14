@@ -4,7 +4,8 @@ import clsx from 'clsx'
 import type { CheckResult, ConfirmItem, FixProposal, PriorAcceptance } from '../../types'
 import { Spinner } from '../../components/ui'
 import { localActor } from '../../lib/actor'
-import { CONFIRM_SOURCE_LABEL, PROBLEM_CATEGORY_LABEL, RECIPE_TEXT } from '../../lib/terms'
+import { CONFIRM_SOURCE_LABEL, PROBLEM_CATEGORY_LABEL, RECIPE_TEXT, SIGNER_TEXT } from '../../lib/terms'
+import { useSigner } from '../../store/auth'
 import { FixButtons } from './FixPanel'
 import { CheckStatusChip, PriorAcceptances, renameFixIds } from './ImportReceipt'
 
@@ -86,6 +87,8 @@ export function ConfirmList({ items, checks, acceptable, reupload, busy, missing
   const [checked, setChecked] = useState<Set<string>>(() => new Set())
   const [reasons, setReasons] = useState<Record<string, string>>({})
   const [signer, setSigner] = useState(() => localActor() ?? '')
+  // 开了登录：记登录的人（服务端不看请求体里的署名），没有署名框
+  const verified = useSigner()
   const signId = useId()
   // 换了一次试运行（确认项变了）：勾过的里面只留还在的
   useEffect(() => {
@@ -106,7 +109,7 @@ export function ConfirmList({ items, checks, acceptable, reupload, busy, missing
     onSubmit({
       confirmations: sorted.filter((it) => checked.has(it.id)).map((it) => it.id),
       acceptances: accepts.map(({ id }) => ({ check_id: id, reason: reasons[id].trim() })),
-      signed_by: signer.trim() || null,
+      signed_by: verified.verified ? null : signer.trim() || null,
     })
   }
 
@@ -185,13 +188,17 @@ export function ConfirmList({ items, checks, acceptable, reupload, busy, missing
         </section>
       )}
       <div className="flex flex-wrap items-end gap-3 border-t pt-3">
-        <div className="min-w-0">
-          <label className="label" htmlFor={signId}>{RECIPE_TEXT.signLabel}</label>
-          <div className="flex items-center gap-2">
-            <input id={signId} className="field !w-48" value={signer} onChange={(e) => setSigner(e.target.value)} disabled={busy} />
-            <span className="text-2xs text-faint" data-sign-note>{RECIPE_TEXT.signNote}</span>
+        {verified.verified ? (
+          <div className="min-w-0 text-xs text-dim" data-sign-verified="">{SIGNER_TEXT.confirmAs(verified.name)}</div>
+        ) : (
+          <div className="min-w-0">
+            <label className="label" htmlFor={signId}>{RECIPE_TEXT.signLabel}</label>
+            <div className="flex items-center gap-2">
+              <input id={signId} className="field !w-48" value={signer} onChange={(e) => setSigner(e.target.value)} disabled={busy} />
+              <span className="text-2xs text-faint" data-sign-note>{RECIPE_TEXT.signNote}</span>
+            </div>
           </div>
-        </div>
+        )}
         <span className="flex-1" />
         {!ready && !busy && !blocked && <span className="text-2xs text-faint">{RECIPE_TEXT.commitBlocked}</span>}
         {blocked && <span className="text-2xs text-[var(--err)]" data-commit-conflict>{RECIPE_TEXT.commitConflict}</span>}

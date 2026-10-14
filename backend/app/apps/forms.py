@@ -201,8 +201,9 @@ def _error(path: str, code: str, field: dict[str, Any]) -> FormError:
 
 
 def input_schema(fields: list[dict[str, Any]]) -> dict[str, Any]:
-    """输入节点的 fields（name / required / default / description / example，以及新增的 type / enum / format）→
-    agentlab.form/1。没写 type 的按 string。
+    """输入节点的 fields（name / required / default / description / example，以及新增的 type / enum / format，数字类型的
+    minimum / maximum）→ agentlab.form/1。没写 type 的按 string。上下限只带数字类型的、写成数的那几个：表单子集只有闭区间的
+    minimum / maximum（没有 exclusiveMinimum），「大于 0」的金额写成 minimum 0.01。
 
     有默认值的必填字段不进 required：没填时入口节点补默认值（engine/nodes/io.py 的 run_input），表单不该逼人填。
     不认识的 type、format 退回文字：老图里随手写的值不该让整张表单作废。"""
@@ -227,6 +228,8 @@ def input_schema(fields: list[dict[str, Any]]) -> dict[str, Any]:
             prop["type"] = kind = "string"
         if kind == "string" and f.get("format") in FORM_FORMATS:
             prop["format"] = f["format"]
+        if kind in ("number", "integer"):
+            prop.update({k: f[k] for k in _NUMBER_KEYS if _number(f.get(k))})
         default = f.get("default")
         if default not in (None, ""):
             prop["default"] = default

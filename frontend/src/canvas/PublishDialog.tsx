@@ -10,15 +10,18 @@ import {
   EDIT_LOCK_TEXT, diffGraphs, editLockOf, toFlow, toGraph, useEditLock, useStudio, type GraphDiff,
 } from '../store/studio'
 import { useCatalog } from '../store/catalog'
-import { Modal, Spinner, toast, useRadioGroup } from '../components/ui'
+import { Modal, Spinner, confirmDialog, toast, useRadioGroup } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import {
   CATALOG_UI_TEXT as UT, PROVIDER_REF_TEXT, PUBLISH_FIX_TEXT as T, VERSION_USAGE_TEXT, WORKFLOW_STATUS_HINT, WORKFLOW_STATUS_LABEL,
 } from '../lib/terms'
 import { VersionUsageLine, useVersionUsage } from './versionUsage'
+import { newAppPath } from '../pages/apps/shared'
 import { isSqlCheckCode, sqlRuleLabel } from '../lib/sqlcheck'
 import { SqlLevelBadge } from '../run/SqlChecks'
 import { setLocalActor, useLocalActor } from '../lib/actor'
+import { PUBLISH_ROLE_TEXT, SIGNER_TEXT } from '../lib/termsApp'
+import { useAtLeast, useSigner } from '../store/auth'
 import {
   autoFixIds, choiceReady, contentSig, fixFieldLabel, fixFor, fixValueLines, fixValueText, isMissingEndpoint, mergeIssues,
   normalizeAutofix, normalizeCheck, type NodeNameOf,
@@ -35,8 +38,10 @@ const LEVEL_DETAIL: Record<PublishLevel, string> = {
  * 发布弹窗。
  *
  * 等级的初值跟着工作流现在的等级走：以前写死「已发布」，对一张受管工作流直接点
- * 「发布」，后端照 level 改写状态，它就被悄悄降了级。选中态用底色 + 勾，不只靠一圈
- * 1px 描边。发布是要留痕的动作，所以写明以谁的名义发布；没署名就就地填。
+ * 「发布」，后端照 level 改写状态，它就被悄悄降了级。受管工作流、自己又发不了受管级的
+ * （搭建者）不预选：能选的只有「已发布」，那是降级，要他自己点了这一档才能发。降级（谁都
+ * 一样）点发布时再确认一次。选中态用底色 + 勾，不只靠一圈 1px 描边。发布是要留痕的动作，
+ * 所以写明以谁的名义发布；没署名就就地填。
  *
  * 打开就先做一遍发布前检查（和真正发布同一套口径），问题先列出来，能修的就地给修法：
  * 以前红字只能一条条抄进助手里描述一遍。修复一律先出预览，人点「应用并重新检查」才存草稿、
@@ -52,20 +57,27 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
 }) {
   const load = useStudio((s) => s.load)
   const dirty = useStudio((s) => s.dirty)
-  const [level, setLevel] = useState<PublishLevel>(workflow.status === 'governed' ? 'governed' : 'published')
+  // 受管级发布只给管理员（Q8）：搭建者那一档当场置灰、写明原因，不等点了发布才被拒
+  const canGovern = useAtLeast('admin')
+  // 受管工作流：当前发布版是受管级（画布上改过之后 status 回到 draft，看 published_level）。它的新版本不论哪一档都只有
+  // 管理员能发——降成「已发布」和以受管级发布是同一级的决定（Q8，服务端同样拦）。搭建者两档都锁住，写明找管理员
+  const governedWf = workflow.status === 'governed' || workflow.published_level === 'governed'
+  const [level, setLevel] = useState<PublishLevel | null>(!governedWf ? 'published' : canGovern ? 'governed' : null)
   const [busy, setBusy] = useState(false)
   /** 真的点了发布、被门禁拦下时它回的问题。和检查同一套口径，拦下之后以它为准 */
   const [gate, setGate] = useState<ValidationIssue[] | null>(null)
-  // 署名只存在这台浏览器里（和请求头 X-Actor 是同一份，见 lib/actor）。存不进去（隐私模式）
-  // 时这一次弹窗里先记着，照样写得进发布提示
+  // 开了登录：以登录的人发布（服务端记 published_by，不看署名），没有署名框。关登录：署名只存在这台浏览器里（和请求头
+  // X-Actor 是同一份，见 lib/actor）。存不进去（隐私模式）时这一次弹窗里先记着，照样写得进发布提示
+  const signer = useSigner()
   const stored = useLocalActor()
   const [unsaved, setUnsaved] = useState<string | null>(null)
-  const actor = stored ?? unsaved ?? ''
+  const actor = signer.verified ? signer.name : stored ?? unsaved ?? ''
   const [signing, setSigning] = useState('')
   const [delta, setDelta] = useState<GraphDiff | null>(null)
   const published = workflow.published_version
-  const downgrade = workflow.status === 'governed' && level === 'published'
-  const pf = usePreflight(workflow.id, level, { onRechecked: () => setGate(null) })
+  const downgrade = governedWf && level === 'published'
+  // 还没选档时按「已发布」查：能选的只有这一档，问题先列出来
+  const pf = usePreflight(workflow.id, level ?? 'published', { onRechecked: () => setGate(null) })
   /** 发布成功：弹窗不立刻关，给「做成应用」的入口（A8）。关掉时才算完成（onDone） */
   const [done, setDone] = useState<number | null>(null)
   const navigate = useNavigate()
@@ -94,6 +106,12 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
   }
 
   const publish = async () => {
+    if (!level) return
+    // 降级先确认一次：发出去之后，从这一版发起的正式运行就不再过治理门禁
+    if (downgrade && !(await confirmDialog({
+      title: PUBLISH_ROLE_TEXT.downgradeTitle(workflow.name), consequences: PUBLISH_ROLE_TEXT.downgradeConsequences,
+      confirmLabel: PUBLISH_ROLE_TEXT.downgradeConfirm, danger: true,
+    }))) return
     setBusy(true)
     setGate(null)
     try {
@@ -121,6 +139,9 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
   // 预览摆着、正在存、存失败了：这时发布的是还没修的那一版，先让人把修复这件事办完。
   // 存失败（或被锁没存上）时预览可能已经收起（换过等级），说「先应用或放弃预览」就不对了
   const held = unsavedFix(pf) ? T.unsaved : pf.pending ? T.pendingPreview : dirty ? T.unsaved : ''
+  // 发不了的原因写在按钮的悬停里：先把修复办完，或者还没选档
+  const blocked = held || (level ? '' : governedWf && !canGovern ? PUBLISH_ROLE_TEXT.governedWorkflowAdminOnly
+    : PUBLISH_ROLE_TEXT.pickLevel)
 
   if (done != null) {
     return (
@@ -130,7 +151,7 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
                <button className="btn btn-primary" data-publish-make-app=""
                        onClick={() => {
                          onDone()
-                         navigate(`/apps/new/edit?${new URLSearchParams({ workflow: workflow.id, version: String(done) })}`)
+                         navigate(newAppPath({ workflow: workflow.id, version: done }))
                        }}>
                  <LayoutGrid size={12} aria-hidden /> {VERSION_USAGE_TEXT.makeApp}
                </button>
@@ -147,8 +168,8 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
     <Modal open onClose={onClose} title={`发布「${workflow.name}」v${workflow.version}`} width={560}
            footer={<>
              <button className="btn" onClick={onClose}>取消</button>
-             <button className="btn btn-primary" onClick={publish} disabled={busy || !!held} title={held || undefined}
-                     data-autofocus="" data-publish-submit="">
+             <button className="btn btn-primary" onClick={() => void publish()} disabled={busy || !!blocked}
+                     title={blocked || undefined} data-autofocus="" data-publish-submit="">
                {busy ? <Spinner size={12} /> : <ShieldCheck size={12} />}
                {level === 'governed' ? '发布为受管' : '发布'}
              </button>
@@ -156,6 +177,8 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
       <div className="mb-3 grid grid-cols-2 gap-2" role="radiogroup" aria-label="发布等级">
         {(['published', 'governed'] as PublishLevel[]).map((l) => {
           const on = level === l
+          // 搭建者发不了受管级，也不能把受管工作流降成已发布：置灰，原因写在卡上（不只放在悬停里）
+          const locked = !canGovern && (l === 'governed' || governedWf)
           return (
             <button
               key={l}
@@ -164,7 +187,10 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
               aria-checked={on}
               // 修复正在出预览、存草稿、重查时不换档：换档会把这一次的预览和状态清掉，
               // 在途的保存要是失败了，就没有地方再给「重试保存」
-              disabled={pf.working}
+              disabled={pf.working || locked}
+              aria-describedby={locked ? 'publish-governed-locked' : undefined}
+              data-publish-level={l}
+              data-publish-locked={locked ? '' : undefined}
               onClick={() => setLevel(l)}
               // 两张卡说明长短不一，grid 把它们拉成一样高；按钮默认把内容竖直居中，标题就对不齐了
               className={clsx('relative flex flex-col justify-start rounded-lg border px-3 py-2.5 text-left transition-colors',
@@ -184,6 +210,11 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
                 {WORKFLOW_STATUS_HINT[l]}
               </div>
               <div className="mt-1 text-2xs leading-relaxed text-faint">{LEVEL_DETAIL[l]}</div>
+              {locked && (
+                <div id="publish-governed-locked" className="mt-1.5 text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }}>
+                  {l === 'governed' ? PUBLISH_ROLE_TEXT.governedAdminOnly : PUBLISH_ROLE_TEXT.downgradeAdminOnly}
+                </div>
+              )}
             </button>
           )
         })}
@@ -191,7 +222,8 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
 
       {downgrade && (
         <div className="mb-3 flex items-start gap-1.5 rounded-md border px-2.5 py-2 text-2xs leading-relaxed"
-             style={{ borderColor: 'var(--warn)', color: 'var(--warn)', background: 'var(--st-waiting-soft)' }}>
+             style={{ borderColor: 'var(--warn)', color: 'var(--warn)', background: 'var(--st-waiting-soft)' }}
+             data-publish-downgrade="">
           <AlertTriangle size={12} className="mt-px shrink-0" />
           当前为受管工作流。以「已发布」等级发布将降级，此后的正式运行不再受治理门禁约束。
         </div>
@@ -222,10 +254,13 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
             </dd>
           </div>
         )}
-        <div className="flex items-start gap-2">
-          <dt className="w-14 shrink-0 pt-px text-faint">署名</dt>
+        <div className="flex items-start gap-2" data-publish-signer={signer.verified ? 'verified' : actor ? 'actor' : 'unsigned'}>
+          <dt className="w-14 shrink-0 pt-px text-faint">{signer.verified ? '发布人' : '署名'}</dt>
           <dd className="min-w-0 flex-1">
-            {actor ? (
+            {signer.verified ? (
+              // 开了登录：服务端记登录的人（published_by），没有署名框
+              <span>{SIGNER_TEXT.publishAs(signer.name)}</span>
+            ) : actor ? (
               <span>将以「<b className="font-semibold">{actor}</b>」的名义发布，并记入发布记录
                 <Link to="/settings/prefs" className="ml-1.5 text-faint underline-offset-2 hover:underline">修改署名</Link>
               </span>

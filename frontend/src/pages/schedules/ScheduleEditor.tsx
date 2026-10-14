@@ -687,13 +687,19 @@ function InputsSection({ workflow, fields, inputs, variables, preview, recheck, 
                 </button>
               </div>
               {open === field.name && (
-                <div id={varsId} role="group" aria-label={T.variablesLabel(field.name)} className="mt-1.5 flex flex-wrap gap-1">
-                  {variables === null ? <Spinner size={11} /> : variables.length ? variables.map((v) => (
-                    <button key={v.name} type="button" className="btn btn-xs" title={T.variableTitle(v.name, v.example)}
-                            onClick={() => insert(field.name, `{{ ${v.name} }}`)} data-var={v.name}>
-                      {v.label}
-                    </button>
-                  )) : <span className="text-2xs text-faint">{T.variablesEmpty}</span>}
+                <div id={varsId} role="group" aria-label={T.variablesLabel(field.name)} className="mt-1.5">
+                  <div className="flex flex-wrap gap-1">
+                    {variables === null ? <Spinner size={11} /> : variables.length ? variables.map((v) => (
+                      <button key={v.name} type="button" className="btn btn-xs" title={T.variableTitle(v.name, v.example)}
+                              onClick={() => insert(field.name, `{{ ${v.name} }}`)} data-var={v.name}>
+                        {v.label}
+                      </button>
+                    )) : <span className="text-2xs text-faint">{T.variablesEmpty}</span>}
+                  </div>
+                  {/* 补充说明（ISO 周的跨年规则）：几个变量同一句的只写一遍，写在按钮下面，触屏也看得到 */}
+                  {[...new Set((variables ?? []).map((v) => v.note?.trim() ?? '').filter(Boolean))].map((note) => (
+                    <p key={note} className="mt-1 text-2xs leading-relaxed text-faint" data-var-note="">{note}</p>
+                  ))}
                 </div>
               )}
               {out != null && (

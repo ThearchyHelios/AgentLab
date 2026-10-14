@@ -6,8 +6,8 @@
  * 草稿存在应用上（PATCH /api/apps/{id}），只在发布时生成不可变的应用版本——草稿不进版本表（F3 的教训）。
  * 预览按草稿解析布局、不发起运行；检查和发布同一套规则，都读服务端那份草稿，所以先保存再查。
  *
- * /apps/new/edit?workflow=<id>&version=<v>：从一个已发布的工作流版本确定性地派生、新建应用（发布成功的弹窗里点
- * 「做成应用」到这里）。不带参数时先选工作流和版本。
+ * /apps/new/edit?workflow=<id>&version=<v>：从一个已发布的工作流版本确定性地派生、新建应用（发布成功的弹窗、画布版本历史
+ * 里点「做成应用」到这里）。不带参数时先选工作流和版本（应用首页的「新建应用」到这里）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
@@ -46,7 +46,12 @@ export function AppEditor() {
 
 // -------------------------------------------------------------------------
 
-/** 新建：选一个已发布的版本，派生出 spec，建应用，跳进编辑器 */
+/**
+ * 新建：选一个已发布的版本，派生出 spec，建应用，跳进编辑器。
+ *
+ * 这一页是新建向导的起点。现在只有一种开始方式——从已有的工作流开始（data-app-new-start="workflow"）；以后给使用者的
+ * 向导再加别的开始方式时，并排放在这里，每一种走到最后都是「派生出 spec → 建应用 → 进编辑器」这同一条路
+ */
 function NewApp() {
   const [params] = useSearchParams()
   const navigate = useNavigate()
@@ -81,8 +86,11 @@ function NewApp() {
   return (
     <div className="flex h-full flex-col" data-app-editor="new">
       <PageHeader icon={<LayoutGrid size={14} />} title={T.newTitle} />
-      <div className="mx-auto w-full max-w-xl space-y-3 p-6">
-        <p className="text-xs leading-relaxed text-dim">{T.newIntro}</p>
+      <section className="mx-auto w-full max-w-xl space-y-3 p-6" data-app-new-start="workflow" aria-labelledby="app-new-start-workflow">
+        <div>
+          <h2 id="app-new-start-workflow" className="text-sm font-semibold">{T.startFromWorkflow}</h2>
+          <p className="mt-0.5 text-xs leading-relaxed text-dim">{T.newIntro}</p>
+        </div>
         <Field label={T.pickWorkflow}>
           {(p) => (
             <select {...p} className="field" value={workflowId} disabled={busy}
@@ -105,7 +113,7 @@ function NewApp() {
             {busy ? <Spinner size={11} /> : <LayoutGrid size={11} aria-hidden />} {busy ? T.deriving : T.derive}
           </button>
         </div>
-      </div>
+      </section>
     </div>
   )
 }

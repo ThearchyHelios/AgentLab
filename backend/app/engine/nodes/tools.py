@@ -290,7 +290,10 @@ async def _run_write(state: GraphState, ctx: NodeContext, name: str, args: dict[
         await once(ctx, EventType.HUMAN_RESOLVED, tool=name, approved=decision.approved, note=decision.note,
                    actor=ctx.actor(), payload_hash=confirmed)
         if not decision.approved:
-            raise NodeError(ctx.node.id, f"「{name}」的发送已被驳回" + (f"：{decision.note}" if decision.note else ""))
+            # 驳回是人的决定，不是故障：运行到这里结束（状态记失败，没有可走的出口），说法写成「未确认（被驳回）」，
+            # 实例页按待办的结论另说（apps/resolve.instance_states）
+            raise NodeError(ctx.node.id, f"「{ctx.node.title}」未确认（被驳回），没有发送"
+                            + (f"：{decision.note}" if decision.note else ""))
         if confirmed != prep.payload_hash:
             # 动作确认不接受改参数：要改在上游的表单里改。确认之后上游的数据变了，看过的就不是要发的，拒发
             raise NodeError(ctx.node.id, f"「{name}」确认时看到的内容和现在要发送的不一致（内容指纹对不上），"
@@ -300,7 +303,7 @@ async def _run_write(state: GraphState, ctx: NodeContext, name: str, args: dict[
     # 外部系统会把审批人当成申请人；无人值守的写入没有人确认，不写 act
     on_behalf = {"sub": prep.run.get("started_by"), "act": confirmer}
     try:
-        result = await actions.send(prep, capability, args, run_id=ctx.run.run_id, node_id=ctx.node.id,
+        result = await actions.send(prep, capability, run_id=ctx.run.run_id, node_id=ctx.node.id,
                                     exec_no=exec_no, emit=ctx.emit, on_behalf=on_behalf)
     except actions.ActionFailed as e:
         raise NodeError(ctx.node.id, str(e)) from e

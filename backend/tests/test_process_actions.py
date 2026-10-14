@@ -316,3 +316,178 @@ def test_masking_by_json_pointer():
     out = actions.masked(doc, ["/a/b", "/a/c/1", "/d~0e", "/f~1g", "/missing/x"])
     assert out == {"a": {"b": "••••", "c": [1, "••••"]}, "d~e": "••••", "f/g": "••••"}
     assert doc["a"]["b"] == "secret"
+
+
+# --------------------------------------------------------------------------
+# 参数按能力的参数定义收好类型（typed_args）：哈希、预览、发出去的都是收好的那一份
+# --------------------------------------------------------------------------
+
+PARAMS = {"type": "object", "required": ["amount"], "properties": {
+    "amount": {"type": "number"}, "count": {"type": "integer"}, "urgent": {"type": "boolean"},
+    "card": {"type": "string"}, "memo": {"type": "number"},
+    "payee": {"type": "object", "properties": {"id": {"type": "integer"}, "vip": {"type": "boolean"}}},
+    "splits": {"type": "array", "items": {"type": "number"}}}}
+
+
+def _cap(schema=PARAMS):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(name=PAY, title="付款", params_schema=schema)
+
+
+def test_typed_args_follow_the_declared_types():
+    out = actions.typed_args(_cap(), {
+        "amount": "1280.5", "count": "3", "urgent": "true", "card": "6222", "extra": "原样",
+        "payee": '{"id": "42", "vip": "false", "name": "钱七"}', "splits": ["1", 2.5], "memo": ""})
+    assert out == {"amount": 1280.5, "count": 3, "urgent": True, "card": "6222", "extra": "原样",
+                   "payee": {"id": 42, "vip": False, "name": "钱七"}, "splits": [1, 2.5]}
+    assert actions.typed_args(_cap(), {"amount": "120"})["amount"] == 120 and \
+        isinstance(actions.typed_args(_cap(), {"amount": "120"})["amount"], int)
+    assert actions.typed_args(_cap(), {"amount": 7, "count": "4.0"}) == {"amount": 7, "count": 4}
+    # 没登记参数定义的能力：原样不动，发出去的和以前一字不差
+    assert actions.typed_args(_cap({}), {"amount": "1280.5"}) == {"amount": "1280.5"}
+
+
+@pytest.mark.parametrize("args, where, want", [
+    ({"amount": "abc"}, "amount", "应为数"),
+    ({"amount": "nan"}, "amount", "应为数"),
+    ({"amount": "1", "count": "2.5"}, "count", "应为整数"),
+    ({"amount": "1", "urgent": "yes"}, "urgent", "应为是或否"),
+    ({"amount": "1", "payee": {"id": "x"}}, "payee.id", "应为整数"),
+    ({"amount": "1", "splits": ["1", "两元"]}, "splits[1]", "应为数"),
+    ({"amount": "1", "payee": "{坏的"}, "payee", "应为对象（JSON）"),
+    ({"amount": "  "}, "amount", "必填参数"),
+])
+def test_typed_args_refuse_what_cannot_be_the_declared_type(args, where, want):
+    with pytest.raises(actions.ActionFailed) as refused:
+        actions.typed_args(_cap(), args)
+    assert f" {where} " in str(refused.value) and want in str(refused.value) and "没有发送" in str(refused.value)
+
+
+async def test_a_template_amount_is_sent_as_a_number_and_the_hash_covers_what_is_sent(erp, capabilities):
+    caps = capabilities(await _endpoint(test=True), lookup=False)
+    caps[PAY].params_schema = {"type": "object", "properties": {"amount": {"type": "number"},
+                                                                "card": {"type": "string"}}}
+    run_id = await _formal(pay_graph(), amount=1280.5)
+    task = await _task(run_id, "action_confirm")
+    card = (await tasks.detail(task.id, ANN))["payload"]
+    assert card["preview"] == {"amount": 1280.5, "card": "••••"}
+    sent = {"amount": 1280.5, "card": "6222020200112233"}
+    assert card["payload_hash"] == actions.payload_hash(PAY, sent)
+    assert card["payload_hash"] != actions.payload_hash(PAY, {**sent, "amount": "1280.5"})
+    await _confirm(run_id)
+    final = await _wait(run_id, ("succeeded", "failed"))
+    assert final.status == "succeeded", final.error
+    [request] = erp.writes("prod")
+    assert request["body"] == sent and isinstance(request["body"]["amount"], float)
+    [rec] = await _records(run_id)
+    assert rec.payload_hash == card["payload_hash"] and rec.preview["amount"] == 1280.5
+
+
+async def test_an_untyped_value_fails_the_node_without_sending(erp, capabilities):
+    caps = capabilities(await _endpoint(test=True), lookup=False)
+    caps[PAY].params_schema = {"type": "object", "properties": {"amount": {"type": "number"}}}
+    run_id = await _formal(pay_graph(), amount="abc")
+    final = await _wait(run_id, ("succeeded", "failed", "interrupted"))
+    assert final.status == "failed" and "参数 amount 应为数" in final.error and "「abc」" in final.error
+    assert erp.requests == [] and await _records(run_id) == []
+    async with SessionLocal() as session:   # 收不成的在确认之前就停下：不开确认卡，看过的不会是发不出去的
+        assert (await session.execute(select(Task).where(Task.run_id == run_id))).scalars().all() == []
+
+
+async def test_a_changed_params_schema_does_not_fail_a_write_that_already_went_out(erp, capabilities):
+    """发出之后能力的参数定义改了（升级时停在结果未知的运行）：先查记录再收类型。结果未知的照旧挂起等核实，核实为已生效
+    之后节点重新执行交回存下的回执——手上的「1,280」收不成新声明的数，也不把已经生效的写入判成失败。"""
+    caps = capabilities(await _endpoint(test=True), lookup=True)
+    erp.mode = "timeout_after_write"
+    run_id = await _formal(pay_graph(), amount="1,280")
+    await _confirm(run_id)
+    assert (await _wait(run_id, ("interrupted", "failed", "succeeded"))).status == "interrupted"
+    [rec] = await _records(run_id)
+    assert rec.state == "unknown" and rec.preview["amount"] == "1,280"
+    caps[PAY].params_schema = {"type": "object", "properties": {"amount": {"type": "number"}}}
+    args = {"amount": "1,280", "card": "6222020200112233"}
+    with pytest.raises(actions.ActionPending):
+        await actions.prepare(run_id=run_id, node_id="pay", exec_no=1, capability=caps[PAY], args=args)
+
+    assert await actions.tick(utcnow() + timedelta(minutes=2)) == 1
+    final = await _wait(run_id, ("succeeded", "failed"))
+    assert final.status == "succeeded", final.error
+    assert len(erp.writes()) == 1
+    [rec] = await _records(run_id)
+    assert rec.state == "confirmed"
+    # 再执行一次（接着跑、重放）：交回生效那一次的回执，指纹、预览照记录，不按这一次的参数重算
+    prep = await actions.prepare(run_id=run_id, node_id="pay", exec_no=1, capability=caps[PAY], args=args)
+    assert prep.receipt is not None and prep.receipt["receipt"]["id"] == final.output["单号"]
+    assert (prep.payload_hash, prep.preview["amount"], prep.attempt) == (rec.payload_hash, "1,280", 1)
+    # 真要发的（新的一次执行）照旧按参数定义收类型：收不成的不发
+    with pytest.raises(actions.ActionFailed, match="参数 amount 应为数"):
+        await actions.prepare(run_id=run_id, node_id="pay", exec_no=2, capability=caps[PAY], args=args)
+    assert len(erp.writes()) == 1
+
+
+# --------------------------------------------------------------------------
+# 实例页怎么说：驳回动作确认、结果未知、核实之后
+# --------------------------------------------------------------------------
+
+
+async def _instance_view(run_id: str) -> dict:
+    """按一页实例页（概况、进度、付款的动作状态）解析这次运行：{组件 id: data}。"""
+    from app.apps.resolve import resolve_page
+    from app.db.models import App, AppVersion
+
+    spec = {"format": "agentlab.app/1", "name": "付款", "pages": [{"id": "instance", "title": "实例", "body": [
+        {"id": "hdr", "type": "instance_header"}, {"id": "tl", "type": "instance_timeline"},
+        {"id": "act", "type": "action_status", "props": {"label": "付款"}, "bind": {"action": "pay"}}]}]}
+    async with SessionLocal() as session:
+        app = App(name="付款", published_version=1)
+        session.add(app)
+        await session.flush()
+        version = AppVersion(app_id=app.id, version=1, spec=spec, spec_hash="x" * 64)
+        session.add(version)
+        await session.commit()
+        run = await session.get(Run, run_id)
+        vm = await resolve_page(session, app, page_id="instance", principal=ANN, role="manage", instance=run,
+                                version=version)
+    return {n["id"]: n.get("data") for n in vm["tree"]}
+
+
+async def test_a_rejected_confirmation_reads_as_a_decision_not_a_fault(erp, capabilities):
+    capabilities(await _endpoint(test=True), lookup=False)
+    run_id = await _formal(pay_graph())
+    task = await _task(run_id, "action_confirm")
+    await tasks.respond(task.id, ANN, decision="reject", note="金额不对")
+    final = await _wait(run_id, ("succeeded", "failed"))
+    # 引擎里驳回就是节点失败、运行结束（没有可走的出口）；说法写成未确认（被驳回），实例页按人的决定说
+    assert final.status == "failed" and final.error.startswith("「pay」未确认（被驳回），没有发送：金额不对")
+    view = await _instance_view(run_id)
+    assert (view["hdr"]["status_code"], view["hdr"]["status_text"]) == ("cancelled", "「pay」未确认（被驳回）")
+    step = next(s for s in view["tl"]["steps"] if s["node"] == "pay")
+    assert (step["state"], step["text"]) == ("rejected", "未确认（被驳回）")
+    assert erp.requests == []
+
+
+async def test_unknown_then_reconciled_reads_as_waiting_then_a_footnote(erp, capabilities):
+    capabilities(await _endpoint(test=True), lookup=True)
+    erp.mode = "timeout_after_write"
+    run_id = await _formal(pay_graph())
+    await _confirm(run_id)
+    await _wait(run_id, ("interrupted",))
+    view = await _instance_view(run_id)
+    # 结果未知：在等核实，不是「等待审批」；付款这一步不是「完成」
+    assert (view["hdr"]["status_code"], view["hdr"]["status_text"]) == ("waiting", "等待核实写入结果")
+    step = next(s for s in view["tl"]["steps"] if s["node"] == "pay")
+    assert (step["state"], step["text"]) == ("unknown", "结果未知，等待核实")
+    [row] = view["act"]["records"]
+    assert row["state"] == "unknown" and "error" not in row and "ReadTimeout" in row["note"]
+
+    assert await actions.tick(utcnow() + timedelta(minutes=2)) == 1
+    final = await _wait(run_id, ("succeeded", "failed"))
+    assert final.status == "succeeded", final.error
+    view = await _instance_view(run_id)
+    assert view["hdr"]["status_text"] == "已完成"
+    assert next(s for s in view["tl"]["steps"] if s["node"] == "pay")["state"] == "done"
+    [row] = view["act"]["records"]
+    # 核实为已生效之后：第一次发送超时只作历史记一笔，不再当失败原因
+    assert row["state"] == "confirmed" and "error" not in row
+    assert "ReadTimeout" in row["note"] and "按幂等键查询核实为已生效" in row["note"]

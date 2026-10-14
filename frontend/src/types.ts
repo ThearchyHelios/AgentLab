@@ -36,6 +36,8 @@ export interface Workflow {
   is_template: boolean
   status?: 'draft' | 'published' | 'governed'
   published_version?: number | null
+  /** 当前发布版本的级别。画布上改过之后 status 回到 draft，「这是不是受管工作流」看这一项（老服务端不给） */
+  published_level?: 'published' | 'governed' | null
   /** 最近一次发布的署名。发布时没有署名为 null */
   published_by?: string | null
   run_count?: number
@@ -2095,6 +2097,12 @@ export interface EvidenceInput {
   model_value?: unknown
   /** tool_cell mismatch：快照里的值（value 是算的时候用的） */
   snapshot_value?: unknown
+  /**
+   * tool_cell：按位置取的格（vars.q.rows[0][0]）穿过了「只是把调用工具节点的结果原样按 JSON 解析」的整形节点，这是那个
+   * 节点的 id；through_label 是它在图里的名字（证据接口补的）。cell() 取的格没有这两个键
+   */
+  through?: string | null
+  through_label?: string
   /** unresolved 的原因（人话） */
   reason?: string
   /** 输入对到的查询在报告目录里的编号（Q3）：接口按工件补的全局编号 */
@@ -2249,6 +2257,16 @@ export interface EvidenceMerge {
   traced: EvidenceMergeTrace[]
 }
 
+/** 指标的一个输入追不到原始数据：出处追到哪个节点为止。认不出是哪个节点时 node_id、label 为 null */
+export interface EvidenceUntraced {
+  path: string
+  node_id: string | null
+  /** 封存的图里那个节点的名字 */
+  label: string | null
+  /** 节点类型（transform、code、llm……） */
+  type: string | null
+}
+
 export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   step: string
   metric?: string
@@ -2287,6 +2305,11 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   sql_check_reason?: string
   /** metric（期 4）：这个指标的双盲复算状态。没有双盲复算复核过这份指标集时没有这个键 */
   dual_check?: EvidenceDualCheck
+  /**
+   * metric：输入里追不到原始数据（查询快照里的格、运行输入）的，空数组是都追到了；卡上没有输入、老服务端没有这个键。
+   * 和「有出处」（口径卡确定性复算一致）是两件事，面板分开说（服务端 engine/lineage.py）
+   */
+  untraced?: EvidenceUntraced[]
   /** query：这次查询对照数据目录查出的问题。没查出问题时没有这个键 */
   checks?: SqlCheckItem[]
   /** query：查询当时冻结的表结构快照（工件 id）。合并查询、老快照没有 */
@@ -3717,6 +3740,8 @@ export interface ScheduleVariable {
   /** 如「昨天（YYYY-MM-DD）」 */
   label: string
   example: string
+  /** 补充说明（ISO 周的跨年规则），没有的是空串；老服务端没有这个键 */
+  note?: string
 }
 
 /** POST /api/schedules/{id}/run：这次手动触发和它发起的运行（没发起时为 null） */

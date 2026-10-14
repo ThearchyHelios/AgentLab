@@ -45,7 +45,6 @@ PAGE_CACHE_SIZE = 256
 #: 按新口径补算的运行来源（engine/origin.py）
 BACKFILL_ORIGIN = "app_backfill"
 
-VIEW_EMPTY = "view.source_empty"
 VIEW_REFUSED = "app_view_refused"
 DAILY_LIMIT = "app_view_daily_limit"
 NEEDS_UPGRADE = "app_needs_upgrade"
@@ -54,7 +53,8 @@ STATUS_TEXT = {"queued": "排队中", "running": "运行中", "interrupted": "�
                "failed": "失败", "cancelled": "已取消"}
 TIER_TEXT = {"formal": "完整出具", "degraded": "降档出具", "withheld": "不予出具"}
 NO_TIER = "未声明出具契约"
-EMPTY_TEXT = "还没有可读的封存运行"
+TIER_BY_METRICS = "（按指标）"
+EMPTY_TEXT = "还没有数据"
 _ACTIVE = ("queued", "running", "interrupted")
 _PERIOD = re.compile(r"(period|week|month|quarter|year|date|day|期|周|月|季|年|日)", re.I)
 _DIGIT = re.compile(r"\d")
@@ -265,7 +265,9 @@ async def stamp_of(session: AsyncSession, source: Source) -> dict[str, Any]:
         "graph_hash": (run.version_hash or "")[:8],
         "calibers": calibers,
         "tier": tier if tier in TIER_TEXT else None,
-        "tier_text": TIER_TEXT.get(str(tier), NO_TIER),
+        # 纯指标看板按指标出具（issuance.metrics_only）：印章上说清这一档核的是指标本身，不是没核
+        "tier_text": TIER_TEXT.get(str(tier), NO_TIER) + (TIER_BY_METRICS if tier in TIER_TEXT and isinstance(
+            issuance, dict) and issuance.get("mode") == "metrics" else ""),
         "from": await _from_text(session, source),
         "sealed": bool(sealed.trusted),
         **({"notes": notes} if notes else {}),
@@ -463,7 +465,7 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
     # 键：应用版本、页面、各来源取的那次运行、角色。另加各钉住项所在工作流的当前发布版和退役与否：印章上「定时任务已改为
     # 运行 vN」「已退役」随它们变，运行没换也得重新算；遮罩设置的指纹同理（_mask_fingerprint）
     key = (app.id, "draft" if draft else (version.version if version else None), page_id,
-           tuple((v, s.run.id if s.run else None, s.state) for v, s in sorted(ctx.sources.items())),
+           tuple((v, s.run.id if s.run else None, s.state, s.message) for v, s in sorted(ctx.sources.items())),
            tuple((a, p.workflow.published_version if p.workflow else None, p.retired)
                  for a, p in sorted(ctx.pins.items())),
            role, principal.username, principal.role, await _mask_fingerprint(session),
@@ -473,11 +475,10 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
     if cacheable and key in _PAGE_CACHE:
         _PAGE_CACHE.move_to_end(key)
         return copy.deepcopy(_PAGE_CACHE[key])
+    # 还没有数据（没有封存运行、按需视图没刷新、不在实例里）是正常的空态，不是解析出错：各块就地写明还没有数据、什么时候
+    # 会有（Source.message），不进 problems——进了，页面顶上挂一块「无法显示」，使用者以为应用坏了
     for source in ctx.sources.values():
         await _load(session, source)
-    for vid, source in ctx.sources.items():
-        if source.state == "empty":
-            ctx.problem(vid, VIEW_EMPTY, source.message or EMPTY_TEXT)
     for entry in spec.get("entries") or []:
         form = resolve_form(spec, entry.get("form"))
         if form is not None and entry.get("id"):
@@ -546,7 +547,8 @@ async def _source(session: AsyncSession, ctx: _Page, vid: str) -> Source:
     elif kind == "latest_sealed":
         run = await latest_sealed_run(session, state, src.get("from"))
         if run is None:
-            return Source(id=vid, kind=kind, state="empty", pin=state, message=EMPTY_TEXT, origin=src.get("from"))
+            return Source(id=vid, kind=kind, state="empty", pin=state, origin=src.get("from"),
+                          message=await _empty_text(session, state, src.get("from")))
     else:
         run = await _on_demand_run(session, ctx, vid, src, state)
         if run is None:
@@ -559,6 +561,20 @@ async def _source(session: AsyncSession, ctx: _Page, vid: str) -> Source:
     if run.status != "succeeded":
         source.message = f"这次运行{STATUS_TEXT.get(run.status, run.status)}"
     return source
+
+
+async def _empty_text(session: AsyncSession, state: PinState, origin: Any) -> str:
+    """最近封存运行的视图还没有数据时说什么：还没有、什么时候会有（定时任务的下次运行时间，或者要等一次正式运行）。"""
+    if isinstance(origin, str) and origin.startswith("schedule:"):
+        schedule = await session.get(Schedule, origin[len("schedule:"):])
+        if schedule is None:
+            return f"{EMPTY_TEXT}：取数的定时任务已删除，请管理应用的人换一个来源"
+        if not schedule.enabled:
+            return f"{EMPTY_TEXT}：定时任务「{schedule.name}」已停用，启用并运行完成一次后这里才有数"
+        if schedule.next_run_at is not None:
+            return f"{EMPTY_TEXT}：定时任务「{schedule.name}」下一次在 {_when(schedule.next_run_at)} 运行，完成并封存后这里就有数"
+        return f"{EMPTY_TEXT}：定时任务「{schedule.name}」运行完成并封存后这里就有数"
+    return f"{EMPTY_TEXT}：「{state.label}」有一次正式运行成功并封存后这里就有数"
 
 
 async def _load(session: AsyncSession, source: Source) -> None:
@@ -823,8 +839,7 @@ async def _series(session: AsyncSession, ctx: _Page, source: Source, cid: str, r
     if mode == "recompute":
         breaks.append({"from": None, "to": series[-1]["version"],
                        "text": f"升版到 v{series[-1]['version']} 时选择了按新口径重算：只画新版本的数"})
-    if not any(s["points"] for s in series):
-        ctx.problem(cid, VIEW_EMPTY, EMPTY_TEXT)
+    # 一个点都没有是空态（界面写「还没有数据点」），不是解析出错，不进 problems
     return {"state": "ok", "mode": mode, "unit": unit, "series": series, "breaks": breaks}
 
 
@@ -1030,14 +1045,122 @@ async def pending_counts(session: AsyncSession, run_ids: list[str]) -> dict[str,
     return dict(rows.all())
 
 
-def instance_row(run: Run, pending: int = 0) -> dict[str, Any]:
+#: 等人处理时，按在等的那条待办的种类说在等什么
+WAITING_TEXT = {"approve": "等待审批", "tool": "等待审批", "code": "等待审批", "input": "等待补充输入",
+                "edit": "等待改稿", "dual_check": "等待复核", "action_confirm": "等待确认发送",
+                "reconcile": "等待核实写入结果", "signal": "等待外部系统"}
+#: 写入外部系统的结果未知（已发出、没拿到确定的结果），等查询或人工核实
+UNKNOWN_TEXT = "等待核实写入结果"
+HELD_TEXT = "已挂起，等待继续运行"
+
+
+@dataclass
+class _Trail:
+    """一次运行里说得清「办到哪了」的几样：待办（按开出的先后）、动作记录（按先后）、节点事件（按先后）。"""
+    tasks: list[Any] = field(default_factory=list)
+    actions: list[Any] = field(default_factory=list)
+    events: list[tuple[str, str]] = field(default_factory=list)
+
+
+async def _trails(session: AsyncSession, runs: list[Run]) -> dict[str, _Trail]:
+    from app.db.models_process import ActionRecord, Task
+
+    ids = [r.id for r in runs]
+    out = {run_id: _Trail() for run_id in ids}
+    if not ids:
+        return out
+    for row in (await session.execute(select(Task.run_id, Task.node_id, Task.kind, Task.status, Task.outcome)
+                                      .where(Task.run_id.in_(ids)).order_by(Task.created_at))).all():
+        out[row.run_id].tasks.append(row)
+    for row in (await session.execute(select(ActionRecord).where(ActionRecord.run_id.in_(ids))
+                                      .order_by(ActionRecord.created_at, ActionRecord.attempt))).scalars():
+        out[row.run_id].actions.append(row)
+    # 节点事件只有结束了的运行要看（走到了哪个成果节点、停在哪个节点上）
+    wanted = [r.id for r in runs if r.status in ("succeeded", "failed")]
+    if wanted:
+        for run_id, etype, node_id in (await session.execute(
+                select(RunEvent.run_id, RunEvent.type, RunEvent.node_id).where(
+                    RunEvent.run_id.in_(wanted), RunEvent.type.in_(("node.finished", "node.failed")))
+                .order_by(RunEvent.seq))).all():
+            if node_id:
+                out[run_id].events.append((etype, node_id))
+    return out
+
+
+def _decision(trail: _Trail, node_id: str) -> tuple[str | None, str | None]:
+    """这个节点最近一条处理完的待办：(种类, 结论 approve / reject / expired_reject / submit)。"""
+    done = [t for t in trail.tasks if t.node_id == node_id and t.status in ("resolving", "resolved")]
+    if not done:
+        return None, None
+    return done[-1].kind, (done[-1].outcome or {}).get("decision")
+
+
+def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
+    """实例给人看的状态 {code, text}：code 是界面画状态标记用的状态（运行的那几种，加 held），text 说这件事办到哪了、
+    结论是什么，不只是运行状态（P1）。
+
+    - 走完了：图里有几个成果节点（分支的几种结局，如「已通过」「已退回」）、恰好走到了其中一个的，写走到的那一个；只有
+      一个成果节点的、几个成果节点并行都走到了的（「周报」「明细」一起出）写「已完成」——那不是哪一种结局；
+    - 停着：有已发出、结果未知的动作，写「等待核实写入结果」；否则按在等的待办说（等待审批、等待确认发送……）；
+    - 失败：停在一个被人驳回的待办上的——动作确认被驳回（「付款」未确认（被驳回））、审批设了驳回即终止、补充输入被
+      驳回——是人的决定，不是故障，code 记 cancelled；核实为未生效、选了放弃的同理。外部系统拒绝之类照写失败。
+
+    运行本身的状态不改（驳回动作确认在引擎里就是节点失败、运行结束）：这里只是把它说清楚。"""
+    from app.apps.tree import node_map
+
+    nodes = node_map(run.graph)
+
+    def title(node_id: str) -> str:
+        return (nodes.get(node_id) or {}).get("title") or node_id
+
+    if run.status == "interrupted":
+        if any(a.state in ("sent", "unknown") for a in trail.actions):
+            return {"code": "waiting", "text": UNKNOWN_TEXT}
+        pending = [t for t in trail.tasks if t.status == "pending"]
+        if pending:
+            return {"code": "waiting", "text": WAITING_TEXT.get(pending[-1].kind, STATUS_TEXT["interrupted"])}
+        return {"code": "held", "text": HELD_TEXT}
+    if run.status == "succeeded":
+        outputs = {nid for nid, n in nodes.items() if n["type"] == "output"}
+        reached = [nid for etype, nid in trail.events if etype == "node.finished" and nid in outputs]
+        if len(outputs) > 1 and len(set(reached)) == 1:
+            return {"code": "succeeded", "text": title(reached[0])}
+        return {"code": "succeeded", "text": STATUS_TEXT["succeeded"]}
+    if run.status == "failed":
+        failed = [nid for etype, nid in trail.events if etype == "node.failed"]
+        if failed:
+            node_id = failed[-1]
+            kind, decision = _decision(trail, node_id)
+            if kind == "action_confirm" and decision == "reject":
+                return {"code": "cancelled", "text": f"「{title(node_id)}」未确认（被驳回）"}
+            if decision in ("reject", "expired_reject"):
+                return {"code": "cancelled", "text": f"「{title(node_id)}」被驳回"}
+            record = next((a for a in reversed(trail.actions) if a.node_id == node_id), None)
+            if record is not None and record.state == "failed":
+                if (record.resolution or {}).get("outcome") == "abandon":
+                    return {"code": "cancelled", "text": f"「{title(node_id)}」核实为未生效，已放弃发送"}
+                return {"code": "failed", "text": f"「{title(node_id)}」写入没有生效"}
+        return {"code": "failed", "text": STATUS_TEXT["failed"]}
+    return {"code": run.status, "text": STATUS_TEXT.get(run.status, run.status)}
+
+
+def instance_row(run: Run, pending: int = 0, state: dict[str, str] | None = None) -> dict[str, Any]:
     output = run.output if isinstance(run.output, dict) else {}
     issuance = output.get("_issuance") if isinstance(output.get("_issuance"), dict) else {}
+    state = state or {"code": run.status, "text": STATUS_TEXT.get(run.status, run.status)}
     return {"run_id": run.id, "title": instance_title(run), "entry_id": (run.origin or {}).get("entry"),
-            "status": run.status, "started_by": run.started_by,
+            "status": run.status, "status_code": state["code"], "status_text": state["text"],
+            "started_by": run.started_by,
             "created_at": run.created_at.isoformat() if run.created_at else None,
             "finished_at": run.finished_at.isoformat() if run.finished_at else None,
             "pending_tasks": pending, "tier": issuance.get("tier")}
+
+
+async def instance_rows(session: AsyncSession, runs: list[Run]) -> list[dict[str, Any]]:
+    """实例列表的那几行（列表、实例页的头）：待处理的待办数和给人看的状态（instance_state）一次取齐。"""
+    counts = await pending_counts(session, [r.id for r in runs])
+    trails = await _trails(session, runs)
+    return [instance_row(r, counts.get(r.id, 0), instance_state(r, trails[r.id])) for r in runs]
 
 
 async def list_instances(session: AsyncSession, app_id: str, *, mine: str | None, entry: str | None = None,
@@ -1052,9 +1175,7 @@ async def list_instances(session: AsyncSession, app_id: str, *, mine: str | None
                 .scalars())
     if entry:
         rows = [r for r in rows if (r.origin or {}).get("entry") == entry]
-    rows = rows[:max(1, min(limit, 200))]
-    counts = await pending_counts(session, [r.id for r in rows])
-    return [instance_row(r, counts.get(r.id, 0)) for r in rows]
+    return await instance_rows(session, rows[:max(1, min(limit, 200))])
 
 
 async def _instance_list(session: AsyncSession, ctx: _Page, props: dict[str, Any]) -> dict[str, Any]:
@@ -1075,18 +1196,23 @@ async def _instance_header(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
     run = ctx.instance
     if run is None:
         return {"state": "empty"}
-    counts = await pending_counts(session, [run.id])
     stamp = next((s.stamp for s in ctx.sources.values() if s.kind == "instance" and s.stamp), None)
-    return {"state": "ok", **instance_row(run, counts.get(run.id, 0)),
-            "status_text": STATUS_TEXT.get(run.status, run.status), "stamp": stamp}
+    return {"state": "ok", **(await instance_rows(session, [run]))[0], "stamp": stamp}
 
 
+#: 节点事件 → 进度里这一步的状态。人回复了（human.resolved）只说明这一步接着往下办：人工节点紧接着就结束，调用工具节点
+#: 确认之后还要发送——以前把它记成「完成」，结果未知时进度上写「付款 完成」
 _STEP_STATE = {"node.started": "running", "node.finished": "done", "node.failed": "failed", "node.skipped": "skipped",
-               "human.requested": "waiting", "human.resolved": "done"}
+               "human.requested": "waiting", "human.resolved": "running"}
+_STEP_TEXT = {"running": "进行中", "done": "完成", "failed": "失败", "skipped": "已跳过", "waiting": "等待处理",
+              "unknown": "结果未知，等待核实", "rejected": "被驳回"}
+_DECISION_TEXT = {"approve": "已同意", "reject": "已驳回", "expired_reject": "超时驳回"}
 
 
 async def _timeline(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
-    """实例进度：服务端摘要，按节点给一行（标题、状态、时间），不下发原始事件。"""
+    """实例进度：服务端摘要，按节点给一行（标题、状态、给人看的说法、时间），不下发原始事件。
+
+    写入动作这一步按生效记录说（结果未知、核实为未生效）；有待办的步骤按待办说（在等什么、同意还是驳回）。"""
     from app.apps.tree import node_map
 
     run = ctx.instance
@@ -1095,6 +1221,7 @@ async def _timeline(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
     titles = {k: v["title"] for k, v in node_map(run.graph).items()}
     rows = (await session.execute(select(RunEvent.type, RunEvent.node_id, RunEvent.ts).where(
         RunEvent.run_id == run.id, RunEvent.type.in_(tuple(_STEP_STATE))).order_by(RunEvent.seq))).all()
+    trail = (await _trails(session, [run]))[run.id]
     steps: dict[str, dict[str, Any]] = {}
     for etype, node_id, ts in rows:
         if not node_id:
@@ -1103,14 +1230,36 @@ async def _timeline(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
                                           "started_at": datetime.fromtimestamp(ts, timezone.utc).isoformat()})
         step["state"] = _STEP_STATE[etype]
         step["at"] = datetime.fromtimestamp(ts, timezone.utc).isoformat()
-    return {"state": "ok", "status": run.status, "status_text": STATUS_TEXT.get(run.status, run.status),
+    for node_id, step in steps.items():
+        text = None
+        record = next((a for a in reversed(trail.actions) if a.node_id == node_id), None)
+        kind, decision = _decision(trail, node_id)
+        pending = [t for t in trail.tasks if t.node_id == node_id and t.status == "pending"]
+        if record is not None and record.state in ("sent", "unknown"):
+            step["state"] = "unknown"
+        elif step["state"] == "waiting" and pending:
+            text = WAITING_TEXT.get(pending[-1].kind)
+        elif step["state"] == "failed" and kind == "action_confirm" and decision == "reject":
+            step["state"], text = "rejected", "未确认（被驳回）"
+        elif step["state"] == "failed" and decision in ("reject", "expired_reject"):
+            step["state"], text = "rejected", _DECISION_TEXT[decision]
+        elif step["state"] == "failed" and record is not None and (record.resolution or {}).get("outcome") == "abandon":
+            step["state"], text = "rejected", "核实为未生效，已放弃发送"
+        elif step["state"] == "done" and kind == "approve" and decision in _DECISION_TEXT:
+            text = _DECISION_TEXT[decision]
+        step["text"] = text or _STEP_TEXT[step["state"]]
+    state = instance_state(run, trail)
+    return {"state": "ok", "status": run.status, "status_code": state["code"], "status_text": state["text"],
             "steps": list(steps.values())}
 
 
-def _task_row(task: Any) -> dict[str, Any]:
+def _task_row(task: Any, instance: str | None = None) -> dict[str, Any]:
+    """待办的摘要。instance 是所属实例的标题：同一个人工节点开出的待办标题一样，列表里靠它（和开出的时间）分开。"""
     return {"id": task.id, "run_id": task.run_id, "node_id": task.node_id, "kind": task.kind, "title": task.title,
             "status": task.status, "due_at": task.due_at.isoformat() if task.due_at else None,
-            "policy": task.policy, "escalation_level": task.escalation_level}
+            "policy": task.policy, "escalation_level": task.escalation_level,
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+            **({"instance_title": instance} if instance else {})}
 
 
 async def _task_list(session: AsyncSession, ctx: _Page, props: dict[str, Any]) -> dict[str, Any]:
@@ -1132,11 +1281,52 @@ async def _task_list(session: AsyncSession, ctx: _Page, props: dict[str, Any]) -
                 | ((TaskAssignment.principal_kind == "group") & TaskAssignment.principal.in_(list(p.groups) or [""])))
             query = query.where(Task.id.in_(mine))
     rows = list((await session.execute(query.order_by(Task.created_at.desc()).limit(100))).scalars())
-    return {"scope": scope, "items": [_task_row(t) for t in rows]}
+    runs = {run_id: str((origin or {}).get("title") or name or "") for run_id, origin, name in (await session.execute(
+        select(Run.id, Run.origin, Run.workflow_name).where(Run.id.in_({t.run_id for t in rows})))).all()}
+    return {"scope": scope, "items": [_task_row(t, runs.get(t.run_id)) for t in rows]}
+
+
+def _assignment_row(a: Any) -> dict[str, Any]:
+    return {"id": a.id, "principal_kind": a.principal_kind, "principal": a.principal, "source": a.source,
+            "status": a.status, "responded_by": a.responded_by,
+            "responded_at": _aware(a.responded_at).isoformat() if a.responded_at else None,
+            "decision": (a.response or {}).get("decision") if isinstance(a.response, dict) else None,
+            "verified": bool(a.verified)}
+
+
+def _action_row(record: Any, *, user: bool) -> dict[str, Any]:
+    """一条生效记录给人看的样子。error 只放确定没生效的原因（失败原因）；结果未知、事后核实的经过放 note：核实为已生效
+    之后还挂着第一次发送时的「ReadTimeout」当失败原因，看的人会以为钱没付出去。"""
+    resolution = record.resolution or {}
+    how = resolution.get("how")
+    who = "按幂等键查询" if how == "lookup" else f"「{resolution.get('by')}」" if resolution.get("by") else "人工"
+    out: dict[str, Any] = {"id": record.id, "state": record.state, "environment": record.environment,
+                           "attempt": record.attempt, "payload_hash": (record.payload_hash or "")[:8]}
+    first = f"发送时没有拿到确定的结果（{record.error}）" if record.error else "发送时没有拿到确定的结果"
+    if record.state in ("sent", "unknown"):
+        out["note"] = f"{first}，等待核实：在外部系统里可能已经生效，不会自动重发"
+    elif record.state == "confirmed" and how:
+        external = resolution.get("external_id")
+        out["note"] = f"{first}，经{who}核实为已生效" + (f"（外部单号 {external}）" if external else "")
+    elif record.state == "failed" and resolution.get("outcome") == "resend":
+        out["note"] = f"{first}，经{who}核实为未生效，已重新发送"
+    elif record.state == "failed" and resolution.get("outcome") == "abandon":
+        out["note"] = f"{first}，经{who}核实为未生效，已放弃发送"
+    elif record.state == "failed":
+        out["error"] = record.error or "没有生效"
+    # 回执是外部系统的原文：user 角色不给（P4），给哈希和状态就够核对
+    if not user:
+        out["receipt"] = record.receipt
+    return out
 
 
 async def _process_data(session: AsyncSession, ctx: _Page, ctype: Any, kind: str, node_id: str) -> dict[str, Any]:
+    """待办（task_form、signoffs）、动作（action_status）。
+
+    待办这里就判定读者是不是这条待办的处理人（process.tasks.handles）：是的，界面按 id 取完整的待办画待办卡（能处理的
+    给表单）；不是的（发起人、旁观的人）只看这一步的状态——派给了谁、会签进度、时限——不去取待办（取了也是 404）。"""
     from app.db.models_process import ActionRecord, Task, TaskAssignment
+    from app.process.tasks import handles, my_response, principal_with_actor, progress
 
     run = ctx.instance
     if run is None:
@@ -1146,25 +1336,22 @@ async def _process_data(session: AsyncSession, ctx: _Page, ctype: Any, kind: str
                                       .order_by(Task.created_at.desc()))).scalars().first()
         if task is None:
             return {"state": "empty", "node": node_id}
-        out: dict[str, Any] = {"state": "ok", "task": {**_task_row(task), "form": task.form},
-                               "task_ui": (ctx.spec.get("task_ui") or {}).get(node_id) or {}}
-        if ctype == "signoffs":
-            assignments = (await session.execute(select(TaskAssignment).where(TaskAssignment.task_id == task.id)
-                                                 .order_by(TaskAssignment.created_at))).scalars()
-            out["assignments"] = [{"principal_kind": a.principal_kind, "principal": a.principal, "status": a.status,
-                                   "responded_by": a.responded_by,
-                                   "decision": (a.response or {}).get("decision") if isinstance(a.response, dict)
-                                   else None} for a in assignments]
-        return out
+        rows = list((await session.execute(select(TaskAssignment).where(TaskAssignment.task_id == task.id)
+                                           .order_by(TaskAssignment.created_at))).scalars())
+        reader = principal_with_actor(ctx.principal, ctx.actor)
+        resolved_at = _aware(task.resolved_at).isoformat() if task.resolved_at else None
+        return {"state": "ok", "task": {**_task_row(task, instance_title(run)), "form": task.form,
+                                        "resolved_by": task.resolved_by, "resolved_at": resolved_at,
+                                        "outcome": {"decision": (task.outcome or {}).get("decision")}
+                                        if task.outcome else None},
+                "task_ui": (ctx.spec.get("task_ui") or {}).get(node_id) or {},
+                "handler": handles(rows, reader), "assignments": [_assignment_row(a) for a in rows],
+                "progress": progress(task, rows), "my_response": my_response(rows, reader)}
     records = (await session.execute(select(ActionRecord).where(ActionRecord.run_id == run.id,
                                                                 ActionRecord.node_id == node_id)
-                                     .order_by(ActionRecord.created_at))).scalars()
+                                     .order_by(ActionRecord.created_at, ActionRecord.attempt))).scalars()
     user = ctx.principal.mode != "off" and ctx.principal.role == "user"
-    return {"state": "ok", "node": node_id, "records": [
-        {"id": r.id, "state": r.state, "environment": r.environment, "attempt": r.attempt,
-         "payload_hash": (r.payload_hash or "")[:8], "error": r.error,
-         # 回执是外部系统的原文：user 角色不给（P4），给哈希和状态就够核对
-         **({} if user else {"receipt": r.receipt})} for r in records]}
+    return {"state": "ok", "node": node_id, "records": [_action_row(r, user=user) for r in records]}
 
 
 def instance_page(spec: dict[str, Any]) -> str | None:

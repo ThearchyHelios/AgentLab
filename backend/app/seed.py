@@ -238,7 +238,7 @@ TEMPLATES: list[dict[str, Any]] = [
             _n("start", "input", "周期", fields=[
                 {"name": "week", "default": "2026-W37", "description": "报告周期（ISO 周）"},
                 {"name": "prev_week", "default": "2026-W36", "description": "对比的上一周期"}]),
-            # 聚合放在 SQL 里做完，口径卡只做标量运算。列的顺序就是口径卡里 rows[0][n] 的 n
+            # 聚合放在 SQL 里做完，口径卡只做标量运算
             _n("fetch", "tool", "取数（查库）", tool="db_query__shop", args={"sql": (
                 "SELECT\n"
                 "  SUM(CASE WHEN week = '{{ input.week }}' THEN amount ELSE 0 END) AS gmv,\n"
@@ -246,23 +246,25 @@ TEMPLATES: list[dict[str, Any]] = [
                 "  SUM(CASE WHEN week = '{{ input.week }}' THEN 1 ELSE 0 END) AS order_cnt,\n"
                 "  SUM(CASE WHEN week = '{{ input.week }}' AND refunded = 1 THEN 1 ELSE 0 END) AS refund_cnt\n"
                 "FROM orders")}),
-            # 查询工具交回来的是 JSON 文本 {columns, rows}，解析成对象口径卡才取得到里面的数
-            _n("parse", "transform", "解析查询结果", mode="json", template="{{ nodes.fetch }}",
-               assign_to="q"),
+            # 口径卡用 cell(查询节点, 行, 列名) 直接取查询结果的一格：每个数点开都追到这次查询的那一格（查询快照），
+            # 列的顺序改了也取不错。不必先经数据整形解析
             _n("caliber", "metrics", "周报口径卡", caliber="周报口径", caliber_version="v1",
                metrics=[
                    {"id": "gmv", "name": "销售额", "unit": "元", "decimals": 2, "format": "thousands",
-                    "expression": "vars.q.rows[0][0]"},
+                    "expression": "cell(nodes.fetch, 0, 'gmv')"},
                    {"id": "orders", "name": "订单数", "unit": "单", "format": "thousands",
-                    "expression": "vars.q.rows[0][2]"},
+                    "expression": "cell(nodes.fetch, 0, 'order_cnt')"},
                    # 分母为 0 时记为空值（缺输入），交给契约按 expected 降档，而不是整张卡失败
                    {"id": "wow", "name": "环比增幅", "unit": "%", "decimals": 1, "format": "plain",
-                    "expression": "round((vars.q.rows[0][0] - vars.q.rows[0][1]) / vars.q.rows[0][1] * 100, 1)"
-                                  " if vars.q.rows[0][1] else None"},
+                    "expression": "round((cell(nodes.fetch, 0, 'gmv') - cell(nodes.fetch, 0, 'gmv_prev'))"
+                                  " / cell(nodes.fetch, 0, 'gmv_prev') * 100, 1)"
+                                  " if cell(nodes.fetch, 0, 'gmv_prev') else None"},
                    {"id": "aov", "name": "客单价", "unit": "元", "decimals": 2, "format": "thousands",
-                    "expression": "round(vars.q.rows[0][0] / vars.q.rows[0][2], 2) if vars.q.rows[0][2] else None"},
+                    "expression": "round(cell(nodes.fetch, 0, 'gmv') / cell(nodes.fetch, 0, 'order_cnt'), 2)"
+                                  " if cell(nodes.fetch, 0, 'order_cnt') else None"},
                    {"id": "refund_rate", "name": "退款率", "decimals": 4, "format": "percent_of_ratio",
-                    "expression": "vars.q.rows[0][3] / vars.q.rows[0][2] if vars.q.rows[0][2] else None"},
+                    "expression": "cell(nodes.fetch, 0, 'refund_cnt') / cell(nodes.fetch, 0, 'order_cnt')"
+                                  " if cell(nodes.fetch, 0, 'order_cnt') else None"},
                ]),
             # 受管出具要求报告撰写节点写明最严的三项（发布门禁 G3），模板照着写，拿来就能发布成受管
             _n("write", "report", "报告撰写", metrics_from=["caliber"],
@@ -281,7 +283,7 @@ TEMPLATES: list[dict[str, Any]] = [
                }),
         ],
         "edges": [
-            _e("start", "fetch"), _e("fetch", "parse"), _e("parse", "caliber"),
+            _e("start", "fetch"), _e("fetch", "caliber"),
             _e("caliber", "write"), _e("write", "done"),
         ],
     },
@@ -321,10 +323,11 @@ TEMPLATES: list[dict[str, Any]] = [
         "nodes": [
             _n("start", "input", "发起报销", fields=[
                 {"name": "applicant", "required": True, "description": "报销人"},
-                {"name": "amount", "required": True, "description": "金额（元）"},
+                {"name": "amount", "type": "number", "minimum": 0.01, "required": True, "description": "金额（元）"},
                 {"name": "reason", "required": True, "description": "事由"}]),
+            # 标题带上金额：同一个人的两笔报销，待办列表里一眼分得开
             _n("review", "human", "财务会签", mode="approve",
-               title="报销审批：{{ input.applicant }}",
+               title="报销审批：{{ input.applicant }} · {{ input.amount }} 元",
                message="报销人：{{ input.applicant }}\n金额（元）：{{ input.amount }}\n事由：{{ input.reason }}",
                assignee={"kind": "slot", "slot": "finance"}, policy="all", due="PT1H",
                on_timeout={"action": "escalate", "to_slot": "director"}),
