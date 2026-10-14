@@ -49,6 +49,13 @@ export interface TaskCardProps {
   onResolved: (result: { task: Task; resolved: boolean }) => void
   /** 列表里用：不画「批了会怎样」的说明、签批人那一行和底部的链接 */
   compact?: boolean
+  /**
+   * 把回复发出去。默认 POST /api/tasks/{id}/respond；审批卡在老服务端（审批上没有 task_id）上改走老的审批接口，
+   * 按这里的形状交回结果
+   */
+  send?: (body: TaskRespond) => Promise<{ task: Task; resolved: boolean }>
+  /** 卡头写不写应用或工作流名。画布上工作流就是眼前这张，不用再说一遍 */
+  showOwner?: boolean
 }
 
 const KIND_ICON: Record<TaskKind, typeof Hand> = {
@@ -59,7 +66,7 @@ const KIND_ICON: Record<TaskKind, typeof Hand> = {
 /** 一天没人处理就用琥珀色写等了多久，同审批卡 */
 const STALE_MS = 24 * 3_600_000
 
-export function TaskCard({ task, onResolved, compact = false }: TaskCardProps) {
+export function TaskCard({ task, onResolved, compact = false, send, showOwner = true }: TaskCardProps) {
   const toast = useToast()
   const payload: Record<string, any> = task.payload ?? {}
   const kind = task.kind
@@ -71,6 +78,7 @@ export function TaskCard({ task, onResolved, compact = false }: TaskCardProps) {
   const [errors, setErrors] = useState<FormError[]>([])
   const [values, setValues] = useState<Record<string, unknown>>(() => (task.form ? withDefaults(task.form, {}) : {}))
   const [text, setText] = useState(() => (payload.draft != null ? String(payload.draft) : ''))
+  const post = (body: TaskRespond) => (send ? send(body) : api.tasks.respond(task.id, body))
 
   // 运行类别服务端在待办上给（run_class）；老服务端不给时：应用里的运行一律是固定版本的正式运行，别处的看中断内容
   // 自己带的运行类别，都没有就不画那一行
@@ -89,7 +97,7 @@ export function TaskCard({ task, onResolved, compact = false }: TaskCardProps) {
     if (busy) return
     setBusy(true)
     try {
-      const res = await api.tasks.respond(task.id, { ...body, ...(note.trim() && !body.note ? { note: note.trim() } : {}) })
+      const res = await post({ ...body, ...(note.trim() && !body.note ? { note: note.trim() } : {}) })
       setErrors([])
       void useCatalog.getState().refreshApprovals()
       toast(res.resolved ? done : TASK_TEXT.doneVote, 'ok')
@@ -135,7 +143,7 @@ export function TaskCard({ task, onResolved, compact = false }: TaskCardProps) {
            style={{ color: pending ? 'var(--warn)' : 'var(--text-dim)' }}>
         <Icon size={13} aria-hidden /> <span className="min-w-0 truncate">{task.title || TASK_TEXT.untitled}</span>
       </div>
-      <TaskMeta task={task} />
+      <TaskMeta task={task} showOwner={showOwner} />
 
       {!pending && <Resolved task={task} />}
       {(task.assignments.length > 1 || task.policy.kind !== 'any') && <Signoffs task={task} />}
@@ -153,7 +161,7 @@ export function TaskCard({ task, onResolved, compact = false }: TaskCardProps) {
       {kind === 'dual_check' && (
         <DualCheckApproval approval={asApproval(task, runClass)}
                            decide={async (ok, reply) => {
-                             const res = await api.tasks.respond(task.id, ok
+                             const res = await post(ok
                                ? { decision: 'submit', values: { value: reply }, note: reply.note }
                                : { decision: 'reject', note: reply.note })
                              void useCatalog.getState().refreshApprovals()
@@ -217,7 +225,8 @@ export function TaskCard({ task, onResolved, compact = false }: TaskCardProps) {
             </button>
             {trustKey && (
               <button type="button" className="btn flex-1 justify-center" disabled={busy || inquiring} data-approval-always=""
-                      title={TOOL_TRUST_TEXT.alwaysHint(trustKey)} onClick={() => void always()}>
+                      title={TOOL_TRUST_TEXT.alwaysHint(trustKey)} aria-describedby={`task-always-${task.id}`}
+                      onClick={() => void always()}>
                 <CheckCheck size={12} aria-hidden /> {TOOL_TRUST_TEXT.alwaysButton}
               </button>
             )}
@@ -236,6 +245,12 @@ export function TaskCard({ task, onResolved, compact = false }: TaskCardProps) {
           {!compact && (
             <div className="mt-1.5 text-2xs leading-relaxed text-dim">
               {binary ? TASK_TEXT.approveHint : TASK_TEXT.inputHint}
+            </div>
+          )}
+          {/* 「始终允许」会改工具的信任档、影响之后的运行：常显同一句旁注，不只藏在悬停里 */}
+          {trustKey && (
+            <div id={`task-always-${task.id}`} className="mt-0.5 text-2xs leading-relaxed text-dim">
+              {TOOL_TRUST_TEXT.alwaysButton}：{TOOL_TRUST_TEXT.alwaysHint(trustKey)}
             </div>
           )}
         </>
@@ -263,7 +278,7 @@ function asApproval(task: Task, runClass: 'formal' | 'exploratory' | null): Appr
 // ---------------------------------------------------------------- 卡头
 
 /** 种类 · 应用或工作流 · 节点 · 什么时候发起、等了多久 · 时限 · 升级 */
-function TaskMeta({ task }: { task: Task }) {
+function TaskMeta({ task, showOwner }: { task: Task; showOwner: boolean }) {
   const now = useTicker(60_000)
   const created = parseServerTime(task.created_at)
   const age = created ? now - created.getTime() : undefined
@@ -271,7 +286,7 @@ function TaskMeta({ task }: { task: Task }) {
   // 节点的名字：服务端在待办上给（node_label），老的中断内容里也可能带着
   const label = task.node_label ?? task.payload?.node_label
   const where = typeof label === 'string' && label ? label : task.node_id
-  const owner = task.app_name ? task.app_name : task.workflow_name ? runName(task) : null
+  const owner = !showOwner ? null : task.app_name ? task.app_name : task.workflow_name ? runName(task) : null
   return (
     <div className="tnum mb-2 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-2xs text-dim">
       <span>{TASK_KIND_LABEL[task.kind] ?? task.kind}</span>

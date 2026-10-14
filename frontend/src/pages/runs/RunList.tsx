@@ -533,7 +533,9 @@ export function TaskRows({ queue, filter, onOpen, selectedId, dupNames }: {
         const overdue = due != null && due.getTime() < now
         const responded = t.assignments.filter((a) => a.status === 'responded').length
         const counted = t.assignments.filter((a) => a.status !== 'withdrawn').length
-        const name = t.workflow_name ?? ''
+        // 应用里的待办写应用名；别处的同审批行：没保存就跑的写「未保存的工作流」，不露服务端记的「临时图」
+        const name = t.app_name || runName(t)
+        const unsaved = !t.app_name && isUnsaved(t)
         return (
           <button
             key={t.id}
@@ -566,9 +568,9 @@ export function TaskRows({ queue, filter, onOpen, selectedId, dupNames }: {
               </span>
             </div>
             <div className="min-w-0 truncate text-2xs text-dim">
-              <span>{name || '—'}</span>
-              {t.node_id && <><span className="text-faint"> · 节点</span>「{t.node_id}」</>}
-              {name && dupNames.has(name) && <span className="mono text-faint"> {idTail(t.run_id)}</span>}
+              <span className={unsaved ? 'text-faint' : undefined}>{name || '—'}</span>
+              {t.node_id && <><span className="text-faint"> · 节点</span>「{t.node_label ?? t.node_id}」</>}
+              {name && !unsaved && dupNames.has(name) && <span className="mono text-faint"> {idTail(t.run_id)}</span>}
             </div>
             <div className="flex items-center gap-2 text-2xs text-faint">
               <span className="chip shrink-0" data-task-kind-chip="">{TASK_KIND_LABEL[t.kind]}</span>

@@ -77,7 +77,8 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const run = d.run
   // 待办卡：这次运行待处理的待办（含没有审批的核实动作结果、等外部系统）。待审批、运行状态、待办和动作的事件变了就重新取
   const taskEvents = d.events.filter((e) => e.type.startsWith('task.') || e.type.startsWith('action.')).length
-  const runTasks = useRunTasks(runId, `${(d.pending ?? []).map((a) => a.id).join(',')}|${run?.status ?? ''}|${taskEvents}`)
+  const pendingIds = (d.pending ?? []).map((a) => a.id)
+  const runTasks = useRunTasks(runId, `${pendingIds.join(',')}|${run?.status ?? ''}|${taskEvents}`, pendingIds)
   // 停着等人的不只有审批：动作结果未知时运行挂起、开一条核实待办，那也是在等人，不是服务重启打断的「已挂起」
   const pendingFlag = d.pending == null ? undefined : d.pending.length > 0 || !!runTasks.tasks?.length
   // 接着流时事件就是事实；不接流时把 GET 到的状态和有没有待审批交给解码器收尾：
@@ -527,9 +528,15 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       : phase !== 'waiting' && clocks.wall != null ? { elapsedMs: paused ? clocks.active ?? clocks.wall : clocks.wall } : {}),
   }
 
-  // 待办卡（TaskCard）：一次中断一条待办；凑齐了运行恢复，接上实时流。没凑齐（会签里记下一票）只刷新这几张卡
-  const cards = runTasks.tasks?.length ? (
-    <RunTaskCards tasks={runTasks.tasks} onResolved={async (task, resolved) => {
+  // 待办卡（TaskCard）：一次中断一条待办；凑齐了运行恢复，接上实时流。没凑齐（会签里记下一票）只刷新这几张卡。
+  // 待审批里对不上待办的（开待办出过错还没补上、老服务端没有待办接口）按审批画审批卡。只认取待办那一刻就在的审批：
+  // 刚来的那条，待办还在路上，不先按审批画一张、取回来又换成待办卡
+  const covered = new Set((runTasks.tasks ?? []).map((t) => t.approval_id).filter(Boolean))
+  const orphans = (d.pending ?? []).filter((a) => runTasks.asked.has(a.id) && !covered.has(a.id))
+  const cards = runTasks.tasks?.length || orphans.length ? (
+    <RunTaskCards tasks={runTasks.tasks ?? []} approvals={orphans}
+                  onApprovalResolved={async (a) => { await onResolved(a); runTasks.reload() }}
+                  onResolved={async (task, resolved) => {
       if (!resolved) { runTasks.reload(); return }
       const approval = task.approval_id ? d.pending?.find((a) => a.id === task.approval_id) : undefined
       if (approval) await onResolved(approval)

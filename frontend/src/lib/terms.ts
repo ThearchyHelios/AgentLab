@@ -4937,8 +4937,6 @@ export const TASK_LOG_TEXT = {
   assignTo: (who: string[]) => `派给 ${who.join('、')}`,
   anyone: '任何人',
   initiator: '发起人',
-  loadFailed: '未能读取这条审批对应的待办',
-  retry: '重试',
   // ---- 时间线（task.* 事件）
   opened: (title: string) => `待办「${title}」已打开`,
   responded: (who: string, decision: string, i?: number, n?: number) =>

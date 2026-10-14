@@ -1994,14 +1994,17 @@ await section('应用平台：发布成功做成应用；已发布版本的使�
     })
     await page.route(/\/api\/ledger\/workflow-versions\/.+$/, (route) =>
       route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(usage) }))
-    await page.keyboard.press('Alt+h')
+    // 编排页一进来焦点在助手输入框里，那时的 ⌥H 是打字：先把焦点放回页面（同 check-studio）
+    await page.evaluate(() => document.activeElement?.blur?.())
+    await page.keyboard.press('Alt+KeyH')
     const sheet = page.locator('[role="dialog"][aria-label="版本历史"]')
     await sheet.waitFor()
     check('版本列表标出已退役的版本', await sheet.locator('[data-version-retired-chip]').count() === 1)
     await sheet.locator('ol button', { hasText: 'v4' }).first().click()
     const cur = sheet.locator('[data-version-lifecycle="4"]')
-    check('展开当前发布版：写使用情况', await waitFor(page, async () => await cur.count() === 1)
-      && (await cur.innerText()).includes('被 1 个应用固定'))
+    // 使用情况是展开之后另取的（账本接口）：等它回来再读，别读到占位的「…」
+    check('展开当前发布版：写使用情况', await waitFor(page, async () => await cur.count() === 1
+      && (await cur.innerText().catch(() => '')).includes('被 1 个应用固定')), await cur.innerText().catch(() => ''))
     check('……当前发布版的退役按钮不可点，写明原因', await cur.locator('[data-version-retire]').isDisabled()
       && (await cur.innerText()).includes('当前发布版不能退役'))
     await sheet.locator('ol button', { hasText: 'v3' }).first().click()

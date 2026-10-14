@@ -150,6 +150,14 @@ const FETCHERS: Record<CatalogKey, () => Promise<unknown[]>> = {
 
 export const useCatalog = create<CatalogState>((set, get) => {
   let backoffStep = 0
+  // 待办数：启动时随目录取一次、之后每拍心跳取。后发的请求先回来时，先发的那份晚到了不再盖掉它
+  let countReq = 0
+  let countApplied = 0
+  const applyCounts = (seq: number, counts: TaskCounts) => {
+    if (seq < countApplied) return
+    countApplied = seq
+    set({ taskCounts: counts })
+  }
 
   const markDown = (error: string) => {
     // 已经断着再失败一次，就把下一次重试往后推一档。所以"发现断开"的各条路
@@ -235,6 +243,10 @@ export const useCatalog = create<CatalogState>((set, get) => {
           })
         }
       }
+      // 待办数和目录一起取一次：导航上「应用」「记录」的徽标、新待办通知的记底都等它，不该等到第一拍心跳（4 秒后）。
+      // 不算进清单：取不到时徽标退回按待审批数，下一拍心跳再取
+      const countSeq = ++countReq
+      void api.tasks.count(catalogOpts).then((c) => applyCounts(countSeq, c)).catch(() => undefined)
       const t0 = performance.now()
       await Promise.all(keys.map(track))
       if (!get().loaded) set({ loaded: true })
@@ -260,11 +272,12 @@ export const useCatalog = create<CatalogState>((set, get) => {
       // 留空，「记录」的徽标退回按待审批数
       const builder = atLeast(useAuth.getState().me, 'builder')
       const seq = ++fetchSeq
+      const countSeq = ++countReq
       const [approvals, counts] = await Promise.allSettled([
         builder ? api.approvals.list('pending', catalogOpts) : Promise.resolve(null),
         api.tasks.count(catalogOpts),
       ])
-      if (counts.status === 'fulfilled') set({ taskCounts: counts.value })
+      if (counts.status === 'fulfilled') applyCounts(countSeq, counts.value)
       // 心跳测的是这一拍的往返；使用者不取待审批，看待办数那一个请求
       const probe = builder ? approvals : counts
       if (probe.status === 'fulfilled') set({ latencyMs: Math.round(performance.now() - t0), lastOkAt: Date.now() })

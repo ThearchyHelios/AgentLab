@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, CheckCircle2, Crosshair, RotateCw, ShieldCheck, XCircle } from 'lucide-react'
 import { api } from '../../../api/client'
 import { EmptyState, ErrorState, Field, Modal, Notice, SectionBar, Skeleton, Spinner, toast } from '../../../components/ui'
@@ -80,7 +80,11 @@ export function CheckSection() {
   const [result, setResult] = useState<{ issues: LintIssue[]; level: string | null } | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [busy, setBusy] = useState(false)
+  // 一次只跑一遍：上一遍没回来又来一次（开发时 StrictMode 的二次挂载）不另发，免得两份结果先后覆盖
+  const running = useRef(false)
   const run = useCallback(async () => {
+    if (running.current) return
+    running.current = true
     setBusy(true)
     setError(null)
     try {
@@ -89,6 +93,7 @@ export function CheckSection() {
     } catch (e) {
       setError(e)
     } finally {
+      running.current = false
       setBusy(false)
     }
   }, [appId, dirty, save])

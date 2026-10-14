@@ -92,11 +92,13 @@ async function open({ theme = 'dark', state }) {
     // 主题以本地为准，别让沙箱库里存的偏好把这次检查的主题改掉
     if (url.pathname === '/api/settings') return route.fulfill({ json: { ui: { theme } } })
     if (url.pathname === '/api/approvals') return route.fulfill({ json: state.approvals })
-    // 导航上的两个徽标按来源分开数：「记录」数不属于应用的（other），「应用」数应用里的（apps）。这里的待审批都不属于应用
+    // 导航上的两个徽标按来源分开数：「记录」数不属于应用的（other），「应用」数应用里的（apps）。这里的待审批都不属于应用。
+    // latest 同服务端：派给我的待处理待办里最新一条的开出时间（数不变、却换了一条时，新待办通知看它）
     if (url.pathname === '/api/tasks/count') {
       const other = state.approvals.filter((a) => a.status === 'pending').length
       const apps = state.appTasks ?? 0
-      return route.fulfill({ json: { mine: state.tasks ? state.tasks.length : other + apps, apps, other } })
+      const latest = state.tasks?.length ? state.tasks.map((t) => t.created_at).sort().at(-1) : null
+      return route.fulfill({ json: { mine: state.tasks ? state.tasks.length : other + apps, apps, other, latest } })
     }
     // 派给我的待办（外壳只在待办数变了时取一次，拿来判断哪些是新来的）
     if (url.pathname === '/api/tasks' && state.tasks) return route.fulfill({ json: { items: state.tasks } })
@@ -566,6 +568,12 @@ await section('新的待办', '\n=== 派给自己的新待办：后台时发系�
   const notes = await page.evaluate(() => window.__notes)
   check('已按待审批通知过的那一条不再发第二条', notes.some((n) => n.tag === 'approval:shell-ap-task')
     && !notes.some((n) => n.tag === 'task:shell-task-ap'), notes.map((n) => n.tag).join(','))
+  // 数不变、却换了一条（核实的那条处理掉了，又来一条新的）：派给我的还是 2 条，靠最新一条的时间（latest）认出来
+  state.tasks = [state.tasks[1], taskOf('shell-task-swap', { title: '退款结果未知，请核实', created_at: new Date().toISOString() })]
+  const swapped = await page.waitForFunction(() => window.__notes.some((n) => n.tag === 'task:shell-task-swap'), null, { timeout: 12000 })
+    .then(() => true, () => false)
+  check('数不变、换了一条：按最新一条的时间认出新来的，照样发通知', swapped,
+    (await page.evaluate(() => window.__notes.map((n) => n.tag))).join(','))
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
   await ctx.close()
 })

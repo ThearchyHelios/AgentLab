@@ -285,11 +285,13 @@ await section('检查：和发布同一套规则，点一条定位到组件', as
   check('列出错误和提醒', await waitFor(page, async () => await issues.count() === 3))
   await page.locator('[data-app-issue="app.binding_target_missing"] [data-app-issue-locate]').click()
   await page.waitForURL('**/edit/pages')
-  check('点「定位」：跳到页面一节、选中那个组件（点号加下标的 path）', await page.locator('[data-app-inspector="gmv"]').count() === 1)
+  // 页面一节要等组件目录到了才画页面树和属性面板：等它出来再判，别读到骨架屏
+  const shows = (sel) => page.locator(sel).waitFor({ timeout: 4000 }).then(async () => await page.locator(sel).count() === 1, () => false)
+  check('点「定位」：跳到页面一节、选中那个组件（点号加下标的 path）', await shows('[data-app-inspector="gmv"]'))
   await page.goto(`${WEB}/apps/app-ae/edit/check`, { waitUntil: 'networkidle' })
   await page.locator('[data-app-issue="app.expr_arith"] [data-app-issue-locate]').click()
   await page.waitForURL('**/edit/pages')
-  check('JSON 指针的 path 也认得', await page.locator('[data-app-inspector="warn"]').count() === 1)
+  check('JSON 指针的 path 也认得', await shows('[data-app-inspector="warn"]'))
 })
 
 await section('发布：固定版本升了版，必须为每一项选处置', async () => {

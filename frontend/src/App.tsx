@@ -126,7 +126,9 @@ export default function App() {
   if (booting) return <BootScreen onEnterOffline={() => setOfflineOk(true)} />
 
   return (
-    <div className="flex h-full">
+    // 横向裁掉：导航项的悬停提示（不可见时也占位）在窄屏上伸出视口，整页就能左右滚出一块空白。clip 不建滚动容器，
+    // 粘性定位和纵向都照旧
+    <div className="flex h-full overflow-x-clip">
       <Nav stalled={stalled} />
 
       <main className="flex min-w-0 flex-1 flex-col">
@@ -319,9 +321,9 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
 
   const pages = usePages()
   // 整条导航约 640px 高（九个导航项），窗口再矮，最底下的遥测点和署名就被切掉、够不着。
-  // 矮窗口（≤660px）按高度收紧到 500px 左右（导航项 36px），≤520px 再收一档到 460px 左右（导航项 32px、
+  // 矮窗口（521–660px）按高度收紧到 500px 左右（导航项 36px），≤520px 再收一档到 460px 左右（导航项 32px、
   // 图标和字之间只留 2px），而不是让导航滚动：导航一旦 overflow，挂在右侧的悬停提示和遥测浮层也会被
-  // 一起裁掉。加导航项时在 600px、480px 高的窗口里量一遍（check-shell 的「窗口高 …px」）
+  // 一起裁掉。加导航项时在 600px、520px、480px 高的窗口里量一遍（check-shell 的「窗口高 …px」）
   return (
     <nav aria-label="主导航" className="relative z-30 flex w-16 shrink-0 flex-col border-r bg-panel">
       <Link
@@ -345,7 +347,9 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
               aria-keyshortcuts={ariaShortcut(p.shortcut)}
               className={({ isActive }) => clsx(
                 'group relative flex h-12 w-full flex-col items-center justify-center gap-1 rounded-md text-2xs leading-none outline-none',
-                '[@media(max-height:660px)]:h-9 [@media(max-height:520px)]:h-8 [@media(max-height:520px)]:gap-0.5',
+                // 两档的高度不能叠在同一个窗口高度上：同时命中时后出的那条赢，而 Tailwind 把 660 那条排在后面，
+                // ≤520px 的 32px 就一直没生效（九项在 480px 高的窗口里放不下）。所以 36px 那档只管 521–660px
+                '[@media(min-height:521px)_and_(max-height:660px)]:h-9 [@media(max-height:520px)]:h-8 [@media(max-height:520px)]:gap-0.5',
                 'transition-colors focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
                 isActive ? 'bg-hover font-medium text-fg' : 'text-dim hover:bg-hover hover:text-fg',
               )}
@@ -621,6 +625,10 @@ const NO_CHECKS: CatalogCheck[] = []
 
 /** 请求发出去这么久还没回来，就不算「还在加载」，算卡住了 */
 const STALL_MS = 3000
+/** 页面开始加载外壳的时刻（头一回取目录的卡住从这里算，见 useStalledChecks） */
+const BOOT_AT = performance.now()
+/** 头一回取目录还没有着落 */
+let bootLoad = true
 
 /**
  * 卡着没回来的 catalog 请求（后端没断时）。
@@ -636,10 +644,17 @@ function useStalledChecks(): CatalogCheck[] {
   const checks = useCatalog((s) => s.checks)
   const [stalled, setStalled] = useState(false)
   useEffect(() => {
-    if (!waiting) return
-    const t = setTimeout(() => setStalled(true), STALL_MS)
+    if (!waiting) {
+      // 头一回取目录有了着落（取回来了或出错了）：之后的刷新都从发出请求算
+      if (checks.length) bootLoad = false
+      return
+    }
+    // 启动时先认人（最多等 AUTH_WAIT_MS）再取目录：头一回加载从启动算起，认人等掉的那段也算——人已经在启动页上
+    // 等了那么久，进来以后不能还说「在线」
+    const wait = bootLoad ? Math.max(0, STALL_MS - (performance.now() - BOOT_AT)) : STALL_MS
+    const t = setTimeout(() => setStalled(true), wait)
     return () => { clearTimeout(t); setStalled(false) }
-  }, [waiting])
+  }, [waiting, checks.length])
   // 断开时归离线横幅说，这里不再叠一层
   return stalled && waiting && !down ? checks.filter((c) => c.state === 'pending') : NO_CHECKS
 }
@@ -1190,6 +1205,9 @@ function watchTasks(go: Go): () => void {
       if (again) { again = false; void pull() }
     }
   }
+  // 待办数随目录在启动时就取了，常常早于外壳挂上这个订阅：已经有数时当场记底，别等到它下一次变——那时新来的
+  // 已经在列表里，会被当成「已有的」记进底里，一条通知都不发
+  if (useCatalog.getState().taskCounts && !needsLogin(useAuth.getState().me)) void pull()
   return useCatalog.subscribe((s, p) => {
     if (s.taskCounts === p.taskCounts || !s.taskCounts) return
     if (seen && s.taskCounts.mine === p.taskCounts?.mine && s.taskCounts.latest === p.taskCounts?.latest) return

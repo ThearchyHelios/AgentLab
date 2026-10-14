@@ -81,6 +81,22 @@ export function EvidenceDrawer({ target, onClose }: { target: EvidenceTarget | n
   )
 }
 
+/**
+ * 正在取的指标链，按缓存键记一份：同一个指标块在取的途中又挂了一次（开发时 StrictMode 的二次挂载、上层重画换了 target
+ * 对象）不另发一次请求，等同一个结果。取完（成也好败也好）就摘掉，重试时重新发
+ */
+const inflight = new Map<string, ReturnType<typeof api.apps.metricEvidence>>()
+function fetchMetric(key: string, ev: ViewEvidence) {
+  let p = inflight.get(key)
+  if (!p) {
+    p = api.apps.metricEvidence(ev.run_id, ev.node!, ev.metric!)
+    inflight.set(key, p)
+    const drop = () => { if (inflight.get(key) === p) inflight.delete(key) }
+    p.then(drop, drop)
+  }
+  return p
+}
+
 function MetricChain({ target, onClose }: { target: EvidenceTarget; onClose: () => void }) {
   const ev = target.evidence
   const segId = segIdOf(ev)
@@ -94,7 +110,7 @@ function MetricChain({ target, onClose }: { target: EvidenceTarget; onClose: () 
     if (seeded) return
     let alive = true
     setError(null)
-    api.apps.metricEvidence(ev.run_id, ev.node!, ev.metric!).then(
+    fetchMetric(key, ev).then(
       (detail) => {
         if (!alive) return
         // 接口答的是这个指标，不是报告里的片段：片段的说法换成这一份文档里的，面板才不会当成「另一份报告」

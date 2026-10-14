@@ -118,7 +118,14 @@ async function countNotice(page, text, settle = 1200) {
 }
 
 await section('画布助手栏', async () => {
-  const { page, errors } = await visit('/studio')
+  // 守的是空态（还没跟助手说过话）：/studio 落到最近改过的那张图，真数据里它常常已经有几轮对话，空态就不出来。
+  // 这张图的助手对话按「没有」回，和一张新图一样（建对话的 POST 照旧被写闸门掐掉）
+  const { page, errors } = await newPage()
+  await page.route((url) => url.pathname === '/api/conversations' && url.searchParams.get('kind') === 'canvas',
+    (route) => (route.request().method() === 'GET'
+      ? route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }) : route.fallback()))
+  await page.goto(`${WEB}/studio`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(700)
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 
   const body = await page.locator('body').innerText()

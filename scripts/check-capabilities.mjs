@@ -191,13 +191,17 @@ const browser = await chromium.launch({ executablePath: CHROME })
 // ================================================================
 await section('能力列表：效果、筛选、同步', async () => {
   const { page, state, errors } = await open('/tools/capabilities')
-  check('工具页有「能力」页签', await page.locator('[role=tab]', { hasText: '能力' }).count() === 1)
+  // 「能力」页签里还有「全部能力 / 待审阅」两个子页签（D-i），按名字整字匹配
+  check('工具页有「能力」页签', await page.getByRole('tab', { name: '能力', exact: true }).count() === 1,
+    (await page.locator('[role=tab]').allInnerTexts()).join(' | '))
   check('列出全部能力', await page.locator('[data-capability]').count() === CAPS.length)
   const pay = page.locator('[data-capability="erp_pay"] [data-capability-effect]')
   check('治理后的效果和同步得出的不一致时标出来', (await pay.innerText()).includes('写入') && (await pay.innerText()).includes('*'))
   check('没治理过的按同步得出的效果显示', (await page.locator('[data-capability="erp_query"] [data-capability-effect]').innerText()).includes('只读'))
   await page.locator('[data-capability="mcp:crm/find"]').click()
-  check('能力名带斜杠也能打开（地址转义）', await page.locator('[data-capability-editor="mcp:crm/find"]').count() === 1)
+  // 右栏的治理设置是点开之后另取的：等它出来再判
+  check('能力名带斜杠也能打开（地址转义）', await waitFor(page, async () =>
+    await page.locator('[data-capability-editor="mcp:crm/find"]').count() === 1), page.url())
   await page.locator('[data-capability-sync]').click()
   check('立即同步', await waitFor(page, async () => state.syncs === 1))
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
@@ -273,7 +277,8 @@ await section('能力：待审阅复用数据目录的审阅队列，成批确�
   check('冲突的那项照实标出（说的是能力，不是表）', await waitFor(page, async () =>
     (await page.locator('[data-review-summary]').innerText()).includes('所在能力刚被修改过')))
   await rows.first().locator('[data-review-open]').click()
-  check('点开一项：右栏是这个能力的治理设置，标出那个位置', await page.locator('[data-capability-editor="erp_pay"] [data-capability-focus="/amount"]').count() === 1)
+  check('点开一项：右栏是这个能力的治理设置，标出那个位置', await waitFor(page, async () =>
+    await page.locator('[data-capability-editor="erp_pay"] [data-capability-focus="/amount"]').count() === 1), page.url())
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
 })
 

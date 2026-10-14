@@ -2901,7 +2901,8 @@ await section('应用平台：人工节点的流程配置、入口字段的类�
     nodes: [
       node('in', 'input', 0, 200, '入口', { fields: [{ name: 'amount', required: true }, { name: 'kind' }] }),
       node('h', 'human', 300, 200, '财务审批', { mode: 'approve', title: '审批', message: '{{ input.amount }}' }),
-      node('pay', 'tool', 600, 200, '付款', { args: {} }),
+      // 选了工具：调用工具节点没选工具时「运行」按钮被挡住（错误级问题），发起表单就打不开
+      node('pay', 'tool', 600, 200, '付款', { tool: 'http_request', args: {} }),
       node('out', 'output', 900, 200, '成果', { fields: [{ name: '结果', value: '{{ last_message }}' }] }),
     ],
     edges: [edge('in', 'h'), edge('h', 'pay', 'approved'), edge('pay', 'out')],

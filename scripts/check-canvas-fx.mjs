@@ -945,9 +945,11 @@ await section('正式运行：入口看 published_version；运行期间画布�
   await page.waitForTimeout(400)
   const pop = (await page.locator('.sf-pop').innerText()).replace(/\s+/g, ' ')
   check('提示不含画布改动', pop.includes('不含画布改动'), pop.slice(0, 80))
+  // 发起表单统一用 SchemaForm 画（X2）：字段按名字挂 data-field，id 是 run-formal-<字段名>
   check('表单字段取已发布版本的（topic），不取画布的（q）',
-    await page.locator('.sf-pop textarea#run-field-topic').count() === 1
-    && await page.locator('.sf-pop textarea#run-field-q').count() === 0)
+    await page.locator('.sf-pop [data-launch-form] [data-field="topic"] #run-formal-topic').count() === 1
+    && await page.locator('.sf-pop [data-field="q"]').count() === 0,
+    (await page.locator('.sf-pop [data-field]').evaluateAll((els) => els.map((e) => e.getAttribute('data-field')))).join(','))
   const formalPop = await marks('.sf-pop')
   check('正式运行浮层的标题和确认按钮都是实心圆点', formalPop.formal === 2 && formalPop.exploratory === 0 && formalPop.shield === 0,
     JSON.stringify(formalPop))

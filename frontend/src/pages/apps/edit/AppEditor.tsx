@@ -245,7 +245,8 @@ function EditApp({ appId }: { appId: string }) {
               </Link>
             ))}
           </nav>
-          <main className="min-w-0 flex-1 overflow-y-auto" data-app-pane={section}>
+          {/* 外壳已经有 <main>，这里再套一个就是两个主区域地标（同记录页） */}
+          <section className="min-w-0 flex-1 overflow-y-auto" data-app-pane={section} aria-label={T.sections[section]}>
             {section === 'pins' && <PinsSection />}
             {section === 'pages' && (ctx.catalog ? <PagesSection /> : <div className="p-4"><Skeleton rows={4} /></div>)}
             {section === 'forms' && <FormsSection />}
@@ -255,7 +256,7 @@ function EditApp({ appId }: { appId: string }) {
             {section === 'access' && <AccessSection />}
             {section === 'hooks' && <HooksSection />}
             {section === 'notify' && <NotifySection />}
-          </main>
+          </section>
           {assistant && (
             <aside className="flex w-[360px] shrink-0 flex-col border-l bg-panel" aria-label={T.assistant}>
               <AppAssistant />
