@@ -4217,3 +4217,36 @@ export interface InquirySnapshot {
   masked: string[]
   source: string | null
 }
+
+// ---------------------------------------------------------------------------
+// 应用平台（docs/design/app-platform-and-look.md）：运行来源、版本的发布 / 退役与使用情况、从运行提取的来源。
+// 接口约定的主体在 typesApp.ts（冻结）；这里只往已有的类型上补字段，同名接口会合并
+// ---------------------------------------------------------------------------
+
+/** 运行来源（X3）。老运行四项都为空，界面写「来源未记录」 */
+export interface Run {
+  origin_kind?: import('./typesApp').OriginKind | null
+  /** run.origin 事件的数据：kind、app_id、entry / view、hook、actor、actor_verified…… */
+  origin?: Record<string, any> | null
+  app_id?: string | null
+  app_version?: number | null
+}
+
+/** 每个版本各自记发布、退役（A1、F5）；VersionDetailOut 另带入口表单和使用情况 */
+export interface WorkflowVersion {
+  level?: 'published' | 'governed' | null
+  published_at?: string | null
+  published_by?: string | null
+  retired_at?: string | null
+  retired_by?: string | null
+  retire_note?: string | null
+  /** 入口字段按 agentlab.form/1 转好的表单（服务端 input_schema(fields)），发起表单照它画 */
+  input_schema?: import('./typesApp').FormSchema | null
+  /** 被哪些应用固定、生效记录数、正式运行数（同 GET /api/ledger/workflow-versions/{wf}/{v}） */
+  usage?: { apps: { app_id: string; name: string; app_version: number }[]; effects: number; formal_runs: number } | null
+}
+
+/** 从运行提取时的来源：run_id、对话、轮次（/copilot/from-run 写） */
+export interface Workflow {
+  origin?: Record<string, any> | null
+}

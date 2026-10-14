@@ -48,7 +48,9 @@ const H = '[\\u3400-\\u9fff]'
 // 句子里不该裸写的配置键名和枚举值（配置界面字段旁边附的键名是单独的字符串，不带中文，不会命中）
 const KEYS = ['report_from', 'require_citation', 'on_violation', 'on_uncited', 'on_unsupported', 'on_exhausted',
   'allow_numbers', 'caliber_from', 'metrics_from', 'cite_fields', 'upgrade_policy', 'evidence_role', 'max_repairs',
-  'max_rounds', 'skip_if', 'budget_tokens', 'workflow_version', 'output_schema']
+  'max_rounds', 'skip_if', 'budget_tokens', 'workflow_version', 'output_schema',
+  // 应用平台的新配置键（人工节点的超时处理、表单来自、派给谁，能力的无人值守写入）：句子里写中文标签
+  'on_timeout', 'form_from', 'assignee', 'unattended_write']
 // 前面是「{」的是 str.format 的占位符（{budget_tokens:,}），不算
 const KEY_RE = new RegExp(`(?<![A-Za-z0-9_.${'$'}{])(?:${KEYS.join('|')})(?![A-Za-z0-9_])`
   + '|cells\\s*:\\s*true|numbers\\s*:\\s*(?:strict|off|flag)\\b|claims\\s*:\\s*(?:off|judge|require_citation)\\b')

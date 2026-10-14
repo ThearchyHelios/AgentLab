@@ -1,4 +1,4 @@
-// 记录页（/runs）的检查：页签、状态筛选、分页、时间、待审批、删除保护、运行中接流、
+// 记录页（/runs）的检查：页签、状态筛选、分页、时间、待办、运行来源、生效记录、删除保护、运行中接流、
 // 失败的排错路径、封存凭证、提取模板。
 //
 // 守的是审查里抓到的几条死路：待审批的运行排在第 145 位、列表只取 100 条，点了
@@ -122,6 +122,10 @@ const recordedCodes = () => page.evaluate(() => window.__runCodes ?? [])
 // 各节共用的真数据，只读，在所有节之前取好。放在某一节里取的话，那一节的界面一出错，
 // 后面十几节都拿着 undefined 报「中途出错」，各自真正的状态就看不见了
 const pending = await getJson('/approvals?status=pending&limit=500')
+// 「待办」页签列的是不属于应用的运行里待处理的待办（应用平台：一次中断对应一条审批和一条待办，存量的待审批服务端
+// 启动时补建了待办）。应用里的待办在「应用 → 待办」里，不在这里
+const pendingTasks = ((await getJson('/tasks?assigned=all&status=pending&limit=500').catch(() => ({ items: [] }))).items ?? [])
+  .filter((t) => !t.app_id)
 const allRuns = await getJson('/runs?limit=200')
 const listTop = await getJson('/runs?limit=50')
 const wfHost = (await getJson('/workflows'))[0]
@@ -163,9 +167,9 @@ await section('页签与地址', async () => {
   check('认不出的页签落回「全部」并纠正地址', !new URL(page.url()).searchParams.has('tab'))
 })
 
-// ------------------------------------------------------------------ 待审批
+// ------------------------------------------------------------------ 待办（以前叫待审批）
 
-await section('待审批页签', async () => {
+await section('待办页签', async () => {
   // 「别处批掉了」要用的实时流：routeWebSocket 只管注册之后加载的页面，先挂上
   let resumeSocket = false
   if (pending.length) {
@@ -180,33 +184,38 @@ await section('待审批页签', async () => {
   }
   await page.goto(`${WEB}/runs?tab=approvals`, { waitUntil: 'networkidle' })
   await page.waitForTimeout(400)
-  const approvalRows = page.locator('[data-approvals-list] [data-approval-id]')
-  const shownApprovals = await approvalRows.evaluateAll((els) => els.map((e) => e.getAttribute('data-approval-id')))
-  check('沙箱里的待审批都在页签里', pending.length > 0 && pending.every((a) => shownApprovals.includes(a.id)),
-    `API ${pending.length} 条 / 页面 ${shownApprovals.length} 条`)
-  const deep = pending.filter((a) => allRuns.findIndex((r) => r.id === a.run_id) >= 100)
-  check('排在最近 100 条之外的待审批也看得到（原来的死路）', deep.every((a) => shownApprovals.includes(a.id)),
+  check('页签叫「待办」', (await page.locator('[role=tab][data-tab=approvals]').innerText()).includes('待办'))
+  const taskRows = page.locator('[data-tasks-list] [data-task-id]')
+  const shownTasks = await taskRows.evaluateAll((els) => els.map((e) => e.getAttribute('data-task-id')))
+  check('沙箱里不属于应用的待办都在页签里', pendingTasks.length > 0 && pendingTasks.every((t) => shownTasks.includes(t.id)),
+    `API ${pendingTasks.length} 条 / 页面 ${shownTasks.length} 条`)
+  check('存量的待审批都补建了待办', pending.every((a) => pendingTasks.some((t) => t.approval_id === a.id)),
+    `${pending.filter((a) => !pendingTasks.some((t) => t.approval_id === a.id)).length} 条没有对应的待办`)
+  const deep = pendingTasks.filter((t) => allRuns.findIndex((r) => r.id === t.run_id) >= 100)
+  check('排在最近 100 条之外的待办也看得到（原来的死路）', deep.every((t) => shownTasks.includes(t.id)),
     `${deep.length} 条在第 100 名之后`)
-  check('每条都写着等了多久', await page.locator('[data-approvals-list] [data-approval-age]').count() === shownApprovals.length)
-  if (pending.length) {
-    const rowText = await page.locator(`[data-approval-id="${pending[0].id}"]`).innerText()
-    const hasWf = rowText.includes(pending[0].workflow_name ?? '')
-    const hasNode = rowText.includes(pending[0].node_label ?? pending[0].node_id)
+  check('每条都写着等了多久', await page.locator('[data-tasks-list] [data-task-age]').count() === shownTasks.length)
+  check('每条标着待办的种类', await page.locator('[data-tasks-list] [data-task-kind-chip]').count() === shownTasks.length)
+  if (pendingTasks.length) {
+    const rowText = await page.locator(`[data-task-id="${pendingTasks[0].id}"]`).innerText()
+    const hasWf = rowText.includes(pendingTasks[0].workflow_name ?? '')
     // 名字来自沙箱库，只报在不在
-    check('每条写着工作流名和节点', hasWf && hasNode, `工作流名 ${hasWf ? '在' : '缺'} · 节点 ${hasNode ? '在' : '缺'}`)
+    check('每条写着工作流名', hasWf, `工作流名 ${hasWf ? '在' : '缺'}`)
     check('每条有处理入口', rowText.includes('去处理'))
   }
+  check('列表下面写明应用里的待办在哪里处理', (await page.locator('[data-tasks-list]').innerText().catch(() => '')).includes('应用 → 待办'))
   const badge = await page.locator('[role=tab][data-tab=approvals]').innerText()
-  check('页签上的数和待审批条数一致', badge.includes(String(pending.length)), badge.replace(/\s+/g, ' '))
+  check('页签上的数和待办条数一致', badge.includes(String(pendingTasks.length)), badge.replace(/\s+/g, ' '))
   if (pending.length) {
     const target = pending[0]
-    await page.locator(`[data-approval-id="${target.id}"]`).click()
+    const task = pendingTasks.find((t) => t.approval_id === target.id)
+    await page.locator(`[data-task-id="${task?.id}"]`).click()
     await page.waitForURL(`**/runs/${target.run_id}**`)
     await page.locator('[data-run-detail]').waitFor()
     await page.waitForTimeout(500)
     check('点进去是那次运行，地址保留 ?tab=approvals', new URL(page.url()).searchParams.get('tab') === 'approvals')
     check('详情显示等审批的横幅', await page.locator('[data-run-banner=waiting]').count() === 1)
-    check('审批卡在时间线里', await page.locator(`[data-approval-card="${target.id}"]`).count() === 1)
+    check('待办卡（TaskCard）在时间线里，按审批 id 定位得到', await page.locator(`[data-approval-card="${target.id}"][data-task-card]`).count() === 1)
     check('详情头的状态是「等待审批」', await page.locator('[data-run-detail]').getAttribute('data-run-code') === 'waiting')
     const docScroll = await page.evaluate(() => document.scrollingElement.scrollHeight - innerHeight)
     check('整页不滚动：滚的是时间线自己', docScroll <= 0, `溢出 ${docScroll}px`)
@@ -2272,6 +2281,69 @@ await section('证据页签：没有逐段证据的运行给升级横幅，跳�
   }
   for (const k of ['GET /api/workflows', 'GET /api/conversations', 'POST /api/workflows/validate', 'POST /api/workflows/variables',
     'POST /api/copilot/upgrade-evidence']) fakes.delete(k)
+})
+
+// ------------------------------------------------------------------ 应用平台：运行来源、生效记录
+
+await section('运行来源：标签与筛选', async () => {
+  // X3：运行记着从哪里发起；老运行没有来源，详情写「来源未记录」，列表里不标。筛选按 origin_kind 查服务端
+  const seen = []
+  const fake = (id, kind, hours) => ({ ...base, id, origin_kind: kind, origin: kind ? { kind } : null,
+    created_at: new Date(Date.now() - hours * 3_600_000).toISOString() })
+  const rows = [fake('fake0origin0chat', 'chat', 1), fake('fake0origin0canvas', 'canvas', 2), fake('fake0origin0none', null, 3)]
+  fakes.set('GET /api/runs', (url) => {
+    seen.push(url.searchParams.get('origin_kind'))
+    const kind = url.searchParams.get('origin_kind')
+    const json = kind === 'none' ? rows.filter((r) => !r.origin_kind) : kind ? rows.filter((r) => r.origin_kind === kind) : rows
+    return { status: 200, json }
+  })
+  await page.goto(`${WEB}/runs`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(300)
+  check('列表行标出来源', await page.locator('[data-run-id="fake0origin0chat"] [data-run-origin="chat"]').count() === 1
+    && (await page.locator('[data-run-id="fake0origin0chat"] [data-run-origin]').innerText()).includes('问数据'))
+  check('来源未记录的老运行在列表里不标', await page.locator('[data-run-id="fake0origin0none"] [data-run-origin]').count() === 0)
+  const sel = page.locator('[data-runs-origin]')
+  check('筛选条里有来源下拉，含「来源未记录」', await sel.count() === 1
+    && (await sel.locator('option').allInnerTexts()).includes('来源未记录'))
+  await sel.selectOption('canvas')
+  await settle()
+  check('选了来源按 origin_kind 查服务端', seen.includes('canvas'), seen.join(','))
+  check('地址里记着来源', new URL(page.url()).searchParams.get('origin') === 'canvas')
+  check('只剩那一种来源', (await ids()).join(',') === 'fake0origin0canvas', (await ids()).join(','))
+  await sel.selectOption('')
+  await settle()
+  fakes.delete('GET /api/runs')
+  if (base) {
+    await page.goto(`${WEB}/runs/${base.id}`, { waitUntil: 'networkidle' })
+    await page.locator('[data-run-detail]').waitFor()
+    const chip = page.locator('[data-run-detail] header [data-run-origin]')
+    check('详情头写来源；老运行写「来源未记录」', await chip.count() === 1
+      && (base.origin_kind ? true : (await chip.innerText()).includes('来源未记录')), await chip.innerText().catch(() => ''))
+  }
+})
+
+await section('生效记录面板', async () => {
+  // §3.8：调用工具节点对外部系统的每次写入。权威记录在服务端，详情里单独一个视图
+  if (!base) { check('沙箱里有一条成功的运行', false); return }
+  const t = new Date().toISOString()
+  const rec = (id, state, attempt = 1) => ({ id, run_id: base.id, node_id: 'pay', app_id: null, capability: 'erp_pay',
+    environment: state === 'simulated' ? 'simulated' : 'prod', state, attempt, payload_hash: `${id}abcdef0123456789`,
+    preview: { amount: '***' }, receipt: state === 'confirmed' ? { order: 'ERP-1' } : null, error: null, resolution: null,
+    created_at: t, updated_at: t })
+  fakes.set('GET /api/actions', () => ({ status: 200, json: { items: [rec('a1', 'confirmed'), rec('a2', 'unknown', 2), rec('a3', 'simulated')] } }))
+  await page.goto(`${WEB}/runs/${base.id}?view=effects`, { waitUntil: 'networkidle' })
+  const pane = page.locator('[data-effects-pane]')
+  check('「生效记录」视图列出每次写入', await pane.waitFor({ timeout: 5000 }).then(() => true, () => false)
+    && await pane.locator('[data-effect]').count() === 3)
+  check('状态照实写：已生效、结果未知、演练', (await pane.innerText()).includes('已生效') && (await pane.innerText()).includes('结果未知')
+    && (await pane.innerText()).includes('演练'))
+  check('哈希只露前 8 位', (await pane.locator('[data-effect="a1"]').innerText()).includes('a1abcdef'))
+  await pane.locator('[data-effect="a1"] summary').click()
+  check('展开看到遮罩后的发送内容和回执', (await pane.locator('[data-effect="a1"]').innerText()).includes('ERP-1'))
+  fakes.set('GET /api/actions', () => ({ status: 200, json: { items: [] } }))
+  await page.goto(`${WEB}/runs/${base.id}?view=effects`, { waitUntil: 'networkidle' })
+  check('没有写入时说清楚', (await page.locator('[data-view-pane="effects"]').innerText()).includes('这次运行没有写入外部系统'))
+  fakes.delete('GET /api/actions')
 })
 
 await section('收尾', async () => {

@@ -15,7 +15,9 @@ import { checkHealth, forgetHealth, healthFromServer, useHealth } from '../lib/h
 import type { HealthRecord } from '../lib/health'
 import { ariaShortcut, matchShortcut } from '../lib/keys'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
-import { TOOL_TRUST_HINT, TOOL_TRUST_LABEL, TOOL_TRUST_TEXT, TOOL_TRUST_VALUES } from '../lib/terms'
+import { CAPABILITY_TEXT, ENDPOINT_TEXT, TOOL_TRUST_HINT, TOOL_TRUST_LABEL, TOOL_TRUST_TEXT, TOOL_TRUST_VALUES } from '../lib/terms'
+import { CapabilitiesTab } from './tools/CapabilitiesTab'
+import { EndpointsTab } from './tools/EndpointsTab'
 import { useRunClock } from '../run/useRunClock'
 import type { ToolInfo, ToolTrust } from '../types'
 
@@ -27,6 +29,9 @@ const TABS = [
   { key: 'sandbox', label: '沙箱试验台' },
   { key: 'custom', label: '自定义工具' },
   { key: 'mcp', label: 'MCP 接入' },
+  // 应用平台（A6）：能力登记和端点。/tools/capabilities/<能力名> 直接打开那一个的治理设置
+  { key: 'capabilities', label: CAPABILITY_TEXT.tab },
+  { key: 'endpoints', label: ENDPOINT_TEXT.tab },
 ]
 
 export function ToolsPage() {
@@ -36,7 +41,7 @@ export function ToolsPage() {
       <PageHeader
         icon={<Wrench size={13} />}
         title="工具"
-        subtitle="无需搭建工作流即可单独执行工具；接入自定义工具和 MCP 服务后，可在节点中直接使用"
+        subtitle="无需搭建工作流即可单独执行工具；接入自定义工具和 MCP 服务后，可在节点中直接使用；能力和端点在这里治理"
       />
       <Tabs tabs={TABS} active={tab} onChange={setTab} label="工具" idPrefix="tools" />
       <TabPanel idPrefix="tools" tabKey={tab} className="min-h-0 flex-1 overflow-y-auto">
@@ -44,6 +49,8 @@ export function ToolsPage() {
         {tab === 'sandbox' && <SandboxLab />}
         {tab === 'custom' && <CustomTools />}
         {tab === 'mcp' && <McpServers />}
+        {tab === 'capabilities' && <CapabilitiesTab />}
+        {tab === 'endpoints' && <EndpointsTab />}
       </TabPanel>
     </div>
   )

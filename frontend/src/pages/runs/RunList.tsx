@@ -6,9 +6,13 @@ import { STATUS, statusMeta, type StatusCode } from '../../lib/status'
 import {
   formatCost, formatDateTime, formatDay, formatSpan, formatTime, formatTokens, parseServerTime, shortId,
 } from '../../lib/format'
-import { RUN_CLASS_LABEL, UNSAVED_HINT, UNSAVED_NAME, isUnsaved, runClassLabel, runName } from '../../lib/terms'
+import {
+  ORIGIN_LABEL, ORIGIN_TEXT, RUN_CLASS_LABEL, TASK_KIND_LABEL, TASK_LOG_TEXT, UNSAVED_HINT, UNSAVED_NAME, isUnsaved, originLabel,
+  runName,
+} from '../../lib/terms'
 import { summarizeRun } from '../../run/decode'
 import type { Approval, Run, Workflow } from '../../types'
+import type { OriginKind, Task } from '../../typesApp'
 import { UNSAVED_WORKFLOW_ID } from '../../api/client'
 import { explainRunError } from '../../lib/explain'
 import {
@@ -17,14 +21,14 @@ import {
 } from './model'
 import { ClassChip, LiveElapsed, TierChip } from './parts'
 import { ScheduleTag, useScheduleNames } from '../schedules/parts'
-import type { ApprovalQueue, RunList, StatusCounts } from './useRunsData'
+import type { RunList, StatusCounts, TaskQueue } from './useRunsData'
 
 // -------------------------------------------------------------------------
 // 筛选条
 // -------------------------------------------------------------------------
 
 export function FilterBar({
-  text, onText, parsed, runClass, onRunClass, workflowId, onWorkflow, workflows, dupNames,
+  text, onText, parsed, runClass, onRunClass, workflowId, onWorkflow, workflows, dupNames, origin, onOrigin,
 }: {
   text: string
   onText: (v: string) => void
@@ -35,6 +39,9 @@ export function FilterBar({
   onWorkflow: (id: string) => void
   workflows: Workflow[]
   dupNames: Set<string>
+  /** 运行来源（X3）。none = 来源未记录的老运行 */
+  origin: string
+  onOrigin: (v: string) => void
 }) {
   const options = useMemo(
     () => [...workflows].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN')),
@@ -102,6 +109,18 @@ export function FilterBar({
           )}
         </select>
       </div>
+      <select
+        className="field"
+        aria-label={ORIGIN_TEXT.filterLabel}
+        title={ORIGIN_TEXT.hint}
+        value={origin}
+        onChange={(e) => onOrigin(e.target.value)}
+        data-runs-origin=""
+      >
+        <option value="">{ORIGIN_TEXT.filterAll}</option>
+        {(Object.keys(ORIGIN_LABEL) as OriginKind[]).map((k) => <option key={k} value={k}>{ORIGIN_LABEL[k]}</option>)}
+        <option value="none">{ORIGIN_TEXT.unknown}</option>
+      </select>
       {parsed.words.length > 0 && (
         <div className="text-2xs text-faint" aria-live="polite" data-runs-hint="">
           按状态「<span className="text-dim">{parsed.words.join('、')}</span>」筛选
@@ -348,6 +367,8 @@ function RunRow({ run, code, approval, selected, dup, flash, now, onOpen, schedu
           </span>
         )}
         {run.schedule_id && <ScheduleTag scheduleId={run.schedule_id} name={scheduleName} />}
+        {/* 来源：定时任务那一种上面的标记已经说了；来源未记录的老运行在列表里不标，详情页照实写 */}
+        {run.origin_kind && run.origin_kind !== 'schedule' && <OriginChip kind={run.origin_kind} />}
         <span className="flex-1" />
         <ClassChip runClass={run.run_class} version={run.version} />
         <TierChip tier={tier} />
@@ -455,22 +476,31 @@ function RowContext({ run, code, approval, now }: {
 }
 
 // -------------------------------------------------------------------------
-// 待审批
+// 来源
 // -------------------------------------------------------------------------
 
-const MODE_ASK: Record<string, string> = {
-  approve: '需要你决定批准或驳回',
-  input: '需要你补充输入',
-  edit: '需要你修改并确认草稿',
+/** 运行来源的小标签（X3）。来源未记录的老运行写「来源未记录」，不猜 */
+export function OriginChip({ kind, always = false }: { kind?: string | null; always?: boolean }) {
+  if (!kind && !always) return null
+  return (
+    <span className={clsx('chip shrink-0', !kind && 'text-faint')} title={kind ? ORIGIN_TEXT.hint : ORIGIN_TEXT.unknownHint}
+          data-run-origin={kind || 'none'}>
+      {originLabel(kind)}
+    </span>
+  )
 }
 
+// -------------------------------------------------------------------------
+// 待办
+// -------------------------------------------------------------------------
+
 /**
- * 全局待审批。最久的排最前：这是工作队列，等了 8 天的那条不能沉在底下。
- * 每行点进去就是那次运行的详情，审批卡就在时间线里。
+ * 全局待办（以前是「待审批」）：等人处理的审批、补充输入、动作确认、核实。最久的排最前：这是工作队列，
+ * 等了 8 天的那条不能沉在底下。每行点进去就是那次运行的详情，待办卡（TaskCard）就在时间线里
  */
-export function ApprovalRows({ queue, filter, onOpen, selectedId, dupNames }: {
-  queue: ApprovalQueue
-  filter: (a: Approval) => boolean
+export function TaskRows({ queue, filter, onOpen, selectedId, dupNames }: {
+  queue: TaskQueue
+  filter: (t: Task) => boolean
   onOpen: (runId: string) => void
   selectedId?: string
   dupNames: Set<string>
@@ -483,76 +513,86 @@ export function ApprovalRows({ queue, filter, onOpen, selectedId, dupNames }: {
     return <ErrorState error={queue.error} onRetry={() => void queue.reload()} compact className="m-3" />
   }
   const items = queue.items.filter(filter).sort(
-    (a, b) => (parseServerTime(a.created_at ?? null)?.getTime() ?? 0) - (parseServerTime(b.created_at ?? null)?.getTime() ?? 0),
+    (a, b) => (parseServerTime(a.created_at)?.getTime() ?? 0) - (parseServerTime(b.created_at)?.getTime() ?? 0),
   )
   if (!items.length) {
     return (
       <EmptyState
         icon={<Inbox size={22} />}
-        title={queue.items.length ? '没有匹配的待审批' : '没有待处理的审批'}
-        body={queue.items.length ? '请尝试其他筛选条件' : '等待人工审批的运行会显示在这里，处理后将从列表中移除。'}
+        title={queue.items.length ? TASK_LOG_TEXT.emptyFiltered : TASK_LOG_TEXT.emptyTitle}
+        body={queue.items.length ? '请尝试其他筛选条件' : `${TASK_LOG_TEXT.emptyBody}${TASK_LOG_TEXT.appNote}。`}
       />
     )
   }
   return (
-    <div data-approvals-list="">
-      {items.map((a) => {
-        const age = ageMs(a.created_at, now)
+    <div data-tasks-list="">
+      {items.map((t) => {
+        const age = ageMs(t.created_at, now)
         const long = age != null && age >= LONG_WAIT_MS
-        const stale = a.run_status && a.run_status !== 'interrupted'
-        const unsaved = isUnsaved(a)
+        const due = parseServerTime(t.due_at)
+        const overdue = due != null && due.getTime() < now
+        const responded = t.assignments.filter((a) => a.status === 'responded').length
+        const counted = t.assignments.filter((a) => a.status !== 'withdrawn').length
+        const name = t.workflow_name ?? ''
         return (
           <button
-            key={a.id}
+            key={t.id}
             type="button"
-            onClick={() => onOpen(a.run_id)}
-            data-approval-id={a.id}
-            data-run-id={a.run_id}
-            aria-current={a.run_id === selectedId ? 'true' : undefined}
+            onClick={() => onOpen(t.run_id)}
+            data-task-id={t.id}
+            data-run-id={t.run_id}
+            data-task-kind={t.kind}
+            aria-current={t.run_id === selectedId ? 'true' : undefined}
             className={clsx(
               'relative flex w-full flex-col gap-0.5 border-b py-2 pl-3.5 pr-3 text-left outline-none transition-colors',
               'hover:bg-hover focus-visible:bg-hover focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[var(--accent)]',
-              a.run_id === selectedId && 'bg-hover',
+              t.run_id === selectedId && 'bg-hover',
             )}
-            style={a.run_id === selectedId ? { boxShadow: 'inset 0 0 0 1px var(--border-strong)' } : undefined}
+            style={t.run_id === selectedId ? { boxShadow: 'inset 0 0 0 1px var(--border-strong)' } : undefined}
           >
-            <span aria-hidden className="absolute inset-y-0 left-0 w-0.5" style={{ background: 'var(--st-waiting)' }} />
+            <span aria-hidden className="absolute inset-y-0 left-0 w-0.5"
+                  style={{ background: overdue ? 'var(--st-failed)' : 'var(--st-waiting)' }} />
             <div className="flex min-w-0 items-center gap-1.5">
               <StatusBadge status="waiting" size={13} />
-              <span className="min-w-0 truncate text-xs font-medium text-fg">{a.title || '人工审批'}</span>
+              <span className="min-w-0 truncate text-xs font-medium text-fg">{t.title || TASK_KIND_LABEL[t.kind]}</span>
               <span className="flex-1" />
               <span
                 className={clsx('tnum shrink-0 text-2xs', long ? 'font-medium' : 'text-faint')}
                 style={long ? { color: 'var(--st-waiting)' } : undefined}
-                title={`${formatDateTime(a.created_at ?? null)} 发起`}
-                data-approval-age=""
+                title={`${formatDateTime(t.created_at)} 发起`}
+                data-task-age=""
               >
-                已等待 {formatSpan(age, { coarse: true })}
+                {TASK_LOG_TEXT.waited(formatSpan(age, { coarse: true }))}
               </span>
             </div>
             <div className="min-w-0 truncate text-2xs text-dim">
-              <span className={unsaved ? 'text-faint' : undefined}>
-                {runName(a) || '—'}
-              </span>
-              {a.workflow_id && a.workflow_name && dupNames.has(a.workflow_name) && (
-                <span className="mono text-faint"> {idTail(a.workflow_id)}</span>
-              )}
-              <span className="text-faint"> · 节点</span>「{a.node_label ?? a.node_id}」
+              <span>{name || '—'}</span>
+              {t.node_id && <><span className="text-faint"> · 节点</span>「{t.node_id}」</>}
+              {name && dupNames.has(name) && <span className="mono text-faint"> {idTail(t.run_id)}</span>}
             </div>
             <div className="flex items-center gap-2 text-2xs text-faint">
-              <span className="tnum">{formatTime(a.created_at ?? null, new Date(now))} 发起</span>
-              <span>· {runClassLabel(a.run_class ?? undefined)}</span>
-              <span className="min-w-0 truncate">· {stale ? `运行已${statusMeta(a.run_status).label}` : MODE_ASK[a.mode] ?? ''}</span>
+              <span className="chip shrink-0" data-task-kind-chip="">{TASK_KIND_LABEL[t.kind]}</span>
+              {t.policy.kind !== 'any' && (
+                <span className="tnum shrink-0" title={TASK_LOG_TEXT.policy(t.policy)}>
+                  {TASK_LOG_TEXT.progress(responded, counted)}
+                </span>
+              )}
+              {due && (
+                <span className={clsx('tnum shrink-0', overdue && 'font-medium')} style={overdue ? { color: 'var(--st-failed)' } : undefined}>
+                  {overdue ? TASK_LOG_TEXT.overdue : TASK_LOG_TEXT.due(formatSpan(due.getTime() - now, { coarse: true }))}
+                </span>
+              )}
               <span className="flex-1" />
               <span className="flex shrink-0 items-center text-[var(--accent)]">
-                去处理 <ChevronRight size={11} aria-hidden />
+                {TASK_LOG_TEXT.open} <ChevronRight size={11} aria-hidden />
               </span>
             </div>
           </button>
         )
       })}
       <div className="px-3 py-3 text-center text-2xs text-faint">
-        共 <span className="tnum">{items.length}</span> 条待审批 · 最久的排在最前
+        {TASK_LOG_TEXT.listFoot(items.length)}
+        <div className="mt-0.5">{TASK_LOG_TEXT.appNote}</div>
       </div>
     </div>
   )

@@ -23,7 +23,7 @@ import { normalizeTheme } from '../lib/theme'
 import { useLeaveGuard } from '../lib/leave'
 import { localActor, setLocalActor } from '../lib/actor'
 import {
-  AGENT_GUARD_TEXT, DRAFT_MODEL_SETTING_TEXT, JUDGE_SETTING_TEXT, PROVIDER_REF_TEXT, TOOL_GATE_TEXT, VERIFY_SETTING_TEXT, judgeByModelText,
+  AGENT_GUARD_TEXT, DRAFT_MODEL_SETTING_TEXT, IDENTITY_TEXT, JUDGE_SETTING_TEXT, NOTIFY_TEXT, PROVIDER_REF_TEXT, TOOL_GATE_TEXT, VERIFY_SETTING_TEXT, judgeByModelText,
   judgeUnlimitedText,
 } from '../lib/terms'
 import type { ThemePref } from '../lib/theme'
@@ -31,6 +31,9 @@ import {
   ProviderOptions, VerifySection, verifyChanged, verifyDraftOf, verifyErrors, verifyLabels, verifyPayload, type VerifyDraft,
 } from './VerifySettings'
 import { DraftModelSection } from './DraftModelSettings'
+import { IdentityTab } from './settings/IdentityTab'
+import { NotifyTab } from './settings/NotifyTab'
+import { AuditTab } from './settings/AuditTab'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
 // 数据源搬去了顶级的「数据」页（/data），/settings/datasources 跳过去
@@ -38,6 +41,10 @@ const TABS = [
   { key: 'providers', label: '模型接入' },
   { key: 'prefs', label: '偏好设置' },
   { key: 'system', label: '运行环境' },
+  // 应用平台（A7）：登录方式和人、通知渠道、管理类操作的留痕
+  { key: 'identity', label: IDENTITY_TEXT.tab },
+  { key: 'notify', label: NOTIFY_TEXT.tab },
+  { key: 'audit', label: IDENTITY_TEXT.audit },
 ]
 
 export function SettingsPage() {
@@ -55,13 +62,16 @@ export function SettingsPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <PageHeader icon={<SettingsIcon size={13} />} title="设置" subtitle="模型接入、偏好和运行环境" />
+      <PageHeader icon={<SettingsIcon size={13} />} title="设置" subtitle="模型接入、偏好、运行环境、身份和通知" />
       <Tabs tabs={TABS} active={tab} onChange={change} label="设置" idPrefix="settings" />
       <TabPanel idPrefix="settings" tabKey={tab} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-4xl p-4">
           {tab === 'providers' && <ProvidersTab />}
           {tab === 'prefs' && <PrefsTab />}
           {tab === 'system' && <SystemTab />}
+          {tab === 'identity' && <IdentityTab />}
+          {tab === 'notify' && <NotifyTab />}
+          {tab === 'audit' && <AuditTab />}
         </div>
       </TabPanel>
     </div>

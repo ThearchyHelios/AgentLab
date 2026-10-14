@@ -1932,6 +1932,91 @@ await section('点名的模型接入：390px 下修复选项不伸出弹窗', as
   await shoot(page, 'publish-provider-390', page)
 })
 
+await section('应用平台：发布成功做成应用；已发布版本的使用情况与退役', async () => {
+  // A8：发布成功的弹窗里点「做成应用」→ 应用编辑，按这一版派生。L4：发布弹窗、版本历史写这一版被哪些应用固定、
+  // 生效记录和正式运行各有多少。A1：退役只给管理员（关登录时所有人），当前发布版不能退
+  const usage = { apps: [{ app_id: 'app-wk', name: '周报看板', app_version: 2 }], effects: 3, formal_runs: 14 }
+  {
+    const { page } = await open({ id: 'pf-hard' })
+    const ledger = []
+    await page.route(/\/api\/ledger\/workflow-versions\/.+$/, (route) => {
+      ledger.push(new URL(route.request().url()).pathname)
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(usage) })
+    })
+    await openDialog(page)
+    const line = dialog(page).locator('[data-publish-usage]')
+    check('发布弹窗：当前已发布版本的使用情况', await waitFor(page, async () => await line.count() === 1)
+      && (await line.innerText()).includes('被 1 个应用固定') && (await line.innerText()).includes('生效记录 3 条'),
+      await line.innerText().catch(() => ''))
+    check('……按当前已发布的版本问账本', ledger.some((p) => p.endsWith('/pf-hard/2')), ledger.join(','))
+  }
+  {
+    const { page, state } = await open({ id: 'pf-easy' })
+    const derived = []
+    await page.route(/\/api\/apps\/derive$/, (route) => {
+      derived.push(route.request().postDataJSON())
+      return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ detail: '检查脚本不建应用' }) })
+    })
+    await openDialog(page)
+    await dialog(page).locator('[data-fix-all]').waitFor()
+    await dialog(page).locator('[data-fix-all]').click()
+    await dialog(page).locator('[data-fix-preview="ready"]').waitFor()
+    await dialog(page).locator('[data-fix-apply]').click()
+    await waitFor(page, async () => await submit(page).isEnabled().catch(() => false))
+    await submit(page).click()
+    await waitFor(page, async () => state.publishes.length === 1)
+    const done = dialog(page).locator('[data-publish-done]')
+    check('发布成功：弹窗不关，换成成功的说明', await waitFor(page, async () => await done.count() === 1))
+    const make = dialog(page).locator('[data-publish-make-app]')
+    check('……给「做成应用」的入口', await make.count() === 1 && (await make.innerText()).includes('做成应用'))
+    await make.click()
+    await page.waitForURL('**/apps/new/edit**')
+    const u = new URL(page.url())
+    check('「做成应用」跳到应用编辑，带着工作流和刚发布的版本', u.searchParams.get('workflow') === 'pf-easy'
+      && Number(u.searchParams.get('version')) === state.version, u.pathname + u.search)
+    check('……进来就按这一版派生', await waitFor(page, async () => derived.length === 1)
+      && derived[0]?.workflow_id === 'pf-easy', JSON.stringify(derived))
+  }
+  {
+    const { page } = await open({ id: 'pf-lib' })
+    const retires = []
+    const versions = [4, 3, 2].map((n) => ({ id: `v${n}`, version: n, note: '', created_at: '2026-09-26T02:00:00Z',
+      published: n === 4, level: 'published', retired_at: n === 2 ? '2026-10-01T02:00:00Z' : null, retired_by: n === 2 ? '张工' : null }))
+    await page.route(/\/api\/workflows\/pf-lib\/versions(\/\d+)?(\/retire)?$/, (route) => {
+      const path = new URL(route.request().url()).pathname
+      const v = Number(path.split('/')[5])
+      if (path.endsWith('/retire')) {
+        retires.push({ v, body: route.request().postDataJSON() })
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ retired: true, affected_apps: usage.apps }) })
+      }
+      const body = v ? { ...versions.find((x) => x.version === v), workflow_id: 'pf-lib', graph: FAKES['pf-lib'].graph, graph_hash: 'x' } : versions
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
+    })
+    await page.route(/\/api\/ledger\/workflow-versions\/.+$/, (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(usage) }))
+    await page.keyboard.press('Alt+h')
+    const sheet = page.locator('[role="dialog"][aria-label="版本历史"]')
+    await sheet.waitFor()
+    check('版本列表标出已退役的版本', await sheet.locator('[data-version-retired-chip]').count() === 1)
+    await sheet.locator('ol button', { hasText: 'v4' }).first().click()
+    const cur = sheet.locator('[data-version-lifecycle="4"]')
+    check('展开当前发布版：写使用情况', await waitFor(page, async () => await cur.count() === 1)
+      && (await cur.innerText()).includes('被 1 个应用固定'))
+    check('……当前发布版的退役按钮不可点，写明原因', await cur.locator('[data-version-retire]').isDisabled()
+      && (await cur.innerText()).includes('当前发布版不能退役'))
+    await sheet.locator('ol button', { hasText: 'v3' }).first().click()
+    const old = sheet.locator('[data-version-lifecycle="3"]')
+    await old.waitFor()
+    await old.locator('[data-version-retire]').click()
+    const ask = page.locator('[role="alertdialog"], [role="dialog"]').filter({ hasText: '退役 v3' }).first()
+    check('退役前确认，列出受影响的应用', await waitFor(page, async () => (await ask.innerText().catch(() => '')).includes('周报看板')))
+    await ask.getByRole('button', { name: '退役这一版' }).click()
+    const note = page.locator('[role="alertdialog"], [role="dialog"]').filter({ hasText: '退役说明' }).first()
+    await note.getByRole('button', { name: '退役这一版' }).click().catch(() => {})
+    check('确认之后才发出退役请求', await waitFor(page, async () => retires.length === 1) && retires[0].v === 3, JSON.stringify(retires))
+  }
+})
+
 await section('360px 下不横向滚动', async () => {
   const { page } = await open({ width: 360, height: 780 })
   // 窄屏上「发布」收在「更多操作」里

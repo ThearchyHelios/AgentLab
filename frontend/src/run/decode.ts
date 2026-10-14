@@ -1,8 +1,10 @@
 import type { CatalogDriftTable, RunEvent, SqlCheckItem, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
+import type { LookEvent, LookObject, TaskKind } from '../typesApp'
 import { formatDuration, formatNumber } from '../lib/format'
 import {
-  ABSENCE_CLAIM_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, SCHEMA_PARTIAL_TEXT, SQL_CHECK_TEXT, TYPE_LABEL,
+  ABSENCE_CLAIM_TEXT, ACTION_CONFIRM_TEXT, ACTION_ENV_LABEL, ACTION_LOG_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, LOOK_TEXT, MERGE_TEXT,
+  ORIGIN_TEXT, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, TASK_KIND_LABEL, TASK_LOG_TEXT, TASK_STATUS_LABEL, TASK_TEXT, TYPE_LABEL, originLabel,
   CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, MASKED_CELL_TEXT, NODE_TYPE_LABEL,
   VERIFY_TRUNCATED_TEXT,
   claimTally,
@@ -1599,6 +1601,116 @@ export function reduceTeam(prev: TeamRun | undefined, event: RunEvent): TeamRunE
  * final 是事件之外知道的结局（见 decodePhase）：服务被强杀的运行事件停在半路，
  * 只有查到它是 interrupted、又没有待审批，才能把那几行转圈收成"挂起"。
  */
+/** run.origin 那一行：来源标签，展开写应用、入口 / 视图、钩子、发起人是否经过认证 */
+function originStep(d: Record<string, any>, seq: number): Step {
+  const kind = typeof d.kind === 'string' ? d.kind : ''
+  const who = typeof d.actor === 'string' && d.actor.trim() ? d.actor.trim() : ''
+  const detail = [
+    d.app_name || d.app_id ? ORIGIN_TEXT.app(String(d.app_name ?? d.app_id), num(d.app_version)) : '',
+    typeof d.entry === 'string' && d.entry ? ORIGIN_TEXT.entry(d.entry) : '',
+    typeof d.view === 'string' && d.view ? ORIGIN_TEXT.view(d.view) : '',
+    typeof d.hook === 'string' && d.hook ? ORIGIN_TEXT.hook(d.hook) : '',
+    who ? ORIGIN_TEXT.actor(who, d.actor_verified === true) : '',
+  ].filter(Boolean)
+  return {
+    id: `og-${seq}`, seq, kind: 'note', status: 'done', code: 'run_origin',
+    title: ORIGIN_TEXT.step(originLabel(kind)),
+    ...(detail.length ? { sub: detail.join(' · ') } : {}),
+  }
+}
+
+/** 派给谁：[{kind, name}]（服务端 process/tasks._who）→ 「组「finance」、李四」。任何人照术语写 */
+function principalsText(list: unknown): string[] {
+  if (!Array.isArray(list)) return []
+  return list.filter((x) => x && typeof x === 'object').map((x: any) => {
+    const kind = x.kind ?? x.principal_kind
+    const name = String(x.name ?? x.principal ?? '')
+    return kind === 'anyone' ? TASK_LOG_TEXT.anyone
+      : kind === 'hook' ? `外部系统「${name}」`
+      : kind === 'group' ? `组「${name}」`
+      : name
+  }).filter(Boolean)
+}
+
+/** 回复的决定的说法（同待办卡）；认不出的照原样写 */
+const decisionText = (d: unknown): string => TASK_TEXT.decision[String(d ?? '')] ?? String(d ?? '')
+
+/** task.* → 一行。事件只带摘要（谁、怎么决定的、第几人 / 共几人），表单内容不进时间线 */
+function taskStep(type: string, d: Record<string, any>, seq: number, nodeId?: string): Step {
+  const title = String(d.title ?? '') || (TASK_KIND_LABEL[d.kind as TaskKind] ?? '待办')
+  const who = typeof d.actor === 'string' ? d.actor : ''
+  const base = { id: `tk-${seq}`, seq, kind: 'human' as const, nodeId, status: 'done' as const, code: type.replace('.', '_') }
+  switch (type) {
+    case 'task.opened': {
+      const to = principalsText(d.assignees)
+      const policy = d.policy && typeof d.policy === 'object' && d.policy.kind !== 'any' ? TASK_LOG_TEXT.policy(d.policy) : ''
+      return { ...base, title: clip(TASK_LOG_TEXT.opened(title)),
+               sub: [to.length ? TASK_LOG_TEXT.assignTo(to) : '', policy].filter(Boolean).join(' · ') || undefined,
+               ...(typeof d.due_at === 'string' && d.due_at ? { detail: `时限：${d.due_at}` } : {}) }
+    }
+    case 'task.responded':
+      return { ...base, title: clip(TASK_LOG_TEXT.responded(who, decisionText(d.decision), num(d.index), num(d.of))) }
+    case 'task.reassigned':
+      return { ...base, title: clip(TASK_LOG_TEXT.reassigned(principalsText(d.to))),
+               ...(who ? { sub: `由 ${who} 改派` } : {}),
+               ...(typeof d.note === 'string' && d.note ? { detail: `备注：${d.note}` } : {}) }
+    case 'task.reminded':
+      return { ...base, title: TASK_LOG_TEXT.reminded(Array.isArray(d.to) ? d.to.length : undefined),
+               ...(d.overdue ? { level: 'warn' as const } : {}) }
+    case 'task.escalated':
+      return { ...base, level: 'warn', title: clip(TASK_LOG_TEXT.escalated(String(d.slot ?? ''))),
+               ...(principalsText(d.to).length ? { sub: TASK_LOG_TEXT.assignTo(principalsText(d.to)) } : {}) }
+    case 'task.expired':
+      return { ...base, level: 'warn', title: TASK_LOG_TEXT.expired }
+    case 'task.cancelled':
+      return { ...base, status: 'cancelled', title: TASK_LOG_TEXT.cancelled }
+    default: {
+      // task.resolved：会签的明细（谁、怎么决定的）放展开区
+      const signoffs: any[] = Array.isArray(d.signoffs) ? d.signoffs : []
+      const outcome = d.decision === 'expired_reject' ? TASK_LOG_TEXT.expired : decisionText(d.decision) || TASK_STATUS_LABEL.resolved
+      return { ...base, title: clip(TASK_LOG_TEXT.resolved(outcome)),
+               ...(signoffs.length ? { detail: signoffs.map((x) => `${x.by || '未署名'}：${decisionText(x.decision)}${x.note ? `（${x.note}）` : ''}`).join('\n') } : {}) }
+    }
+  }
+}
+
+/** action.* → 一行。哈希、环境、尝试次数放副标题；遮罩后的预览、回执放展开区 */
+function actionStep(type: string, d: Record<string, any>, seq: number, nodeId?: string): Step {
+  const cap = String(d.capability ?? d.tool ?? '')
+  const env = ACTION_ENV_LABEL[String(d.environment ?? '')] ?? ''
+  const hash = typeof d.payload_hash === 'string' && d.payload_hash ? `${ACTION_LOG_TEXT.hash} ${d.payload_hash.slice(0, 8)}` : ''
+  const attempt = num(d.attempt)
+  const sub = [env, hash, attempt && attempt > 1 ? ACTION_CONFIRM_TEXT.attempt(attempt) : ''].filter(Boolean).join(' · ') || undefined
+  const json = (v: unknown) => (v == null ? '' : typeof v === 'string' ? v : JSON.stringify(v, null, 2).slice(0, 1500))
+  const base = { id: `ac-${seq}`, seq, kind: 'tool' as const, nodeId, status: 'done' as const, code: type.replace('.', '_'), sub }
+  switch (type) {
+    case 'action.prepared':
+      return { ...base, title: clip(ACTION_LOG_TEXT.prepared(cap)),
+               ...(d.preview != null ? { detail: `${ACTION_LOG_TEXT.preview}：\n${json(d.preview)}` } : {}) }
+    case 'action.sent':
+      return { ...base, title: clip(ACTION_LOG_TEXT.sent(cap)) }
+    case 'action.confirmed':
+      return { ...base, title: clip(ACTION_LOG_TEXT.confirmed(cap)),
+               ...(d.receipt != null ? { result: json(d.receipt) } : {}),
+               ...(typeof d.artifact === 'string' && d.artifact ? { artifact: d.artifact } : {}) }
+    case 'action.failed':
+      return { ...base, status: 'failed', level: 'error', title: clip(ACTION_LOG_TEXT.failed(cap)),
+               ...(d.error || d.status ? { detail: String(d.error ?? `HTTP ${d.status}`) } : {}) }
+    case 'action.unknown':
+      return { ...base, status: 'waiting', level: 'warn', title: clip(ACTION_LOG_TEXT.unknown(cap)), next: ACTION_LOG_TEXT.unknownNext }
+    case 'action.reconciled': {
+      // 人核实（how=manual）写谁、怎么定的、外部单号；按查询能力自动核实（how=lookup）写查了几次
+      const outcome = d.outcome === 'confirmed' ? ACTION_LOG_TEXT.reconciledApplied
+        : d.outcome === 'resend' ? ACTION_LOG_TEXT.reconciledResend
+        : d.outcome === 'abandon' ? ACTION_LOG_TEXT.reconciledAbandon : String(d.outcome ?? '')
+      return { ...base, title: clip(ACTION_LOG_TEXT.reconciled(cap, d.how === 'lookup' ? ACTION_LOG_TEXT.byLookup : String(d.actor ?? ''))),
+               ...(outcome ? { detail: [outcome, d.external_id ? `外部单号：${d.external_id}` : ''].filter(Boolean).join('\n') } : {}) }
+    }
+    default:
+      return { ...base, title: clip(ACTION_LOG_TEXT.simulated(cap)), sub: ACTION_LOG_TEXT.simulatedSub }
+  }
+}
+
 export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOptions): Step[] {
   const out: Step[] = []
   /** node_id → 该节点的顶层 Step，用于把子步骤挂进去 */
@@ -2314,6 +2426,34 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         })
         break
 
+      case 'run.origin':
+        // 发起时就定下的来源（X3）：放在 notes 里、排在 run.started 前面，在封存范围内
+        out.push(originStep(d, seq))
+        break
+
+      case 'task.opened':
+      case 'task.responded':
+      case 'task.reassigned':
+      case 'task.reminded':
+      case 'task.escalated':
+      case 'task.expired':
+      case 'task.resolved':
+      case 'task.cancelled':
+        // 待办是一次中断面向人的那一面：谁被派到、谁回复了什么、超时怎么处置。挂在中断所在的节点下，和审批那一行挨着
+        push(taskStep(type, d, seq, nodeId), nodeId)
+        break
+
+      case 'action.prepared':
+      case 'action.sent':
+      case 'action.confirmed':
+      case 'action.failed':
+      case 'action.unknown':
+      case 'action.reconciled':
+      case 'action.simulated':
+        // 写外部系统的每一步都有记录：生效记录面板是权威，这里是它在时间线上的影子
+        push(actionStep(type, d, seq, nodeId), nodeId)
+        break
+
       case 'agent.route.start': {
         // 调度者决策前一条。它常常占掉团队节点大半的时间——几十秒里时间线上
         // 得有一行在走，不然看着像卡住了
@@ -2881,6 +3021,8 @@ export const COPILOT_PHASE_TEXT: Record<string, string> = {
   finalizing: '正在排版和校验',
   // 以「正在」开头：收尾时去掉「正在」就是完成态（按自查结果修正）
   repairing: '正在按自查结果修正',
+  // 读到 look 停下、执行查看的那段时间（look §2.6 的浮条）
+  looking: LOOK_TEXT.phase,
 }
 
 /**
@@ -3029,126 +3171,161 @@ export function catalogDrift(d: Record<string, any>): {
   }
 }
 
-/** context 操作里一个数据源的那一项（服务端 copilot_context.DatasourceContext.op） */
-export interface CopilotContextSource {
-  source: string
-  /** 模型看得到全部字段的表（全名）。只给了表名的不在这里 */
-  tables: string[]
-  /** model：按需求挑的；all：库不大，全部表都带字段；fallback：没能挑出来，只给了表名 */
-  selectedBy: 'model' | 'all' | 'fallback'
-  /** 这个库一共几张表（数据库里的真实总数） */
-  total?: number
-  /** 探查结构截断了时，探查到几张（服务端只在截断时给）：模型只看得到这几张 */
-  explored?: number
-  /** 没能挑出来的原因 */
-  reason?: string
-  /** 数据源 id：去数据目录页的入口用（老服务端不给） */
-  sourceId?: string
-  /** 有数据目录的表数（老服务端不给：不知道就不提示） */
-  catalogTables?: number
-}
-
-/** 挑表失败时的说法：模型这一轮只看到表名，字段要它自己去查 */
-export const CONTEXT_FALLBACK_TEXT = '未能按需求挑选，已提供全部表名'
-
-function contextSources(op: CopilotOp): CopilotContextSource[] {
-  const list: unknown[] = Array.isArray(op.sources) ? op.sources : []
-  return list
-    .filter((x): x is Record<string, any> => !!x && typeof x === 'object' && typeof (x as any).source === 'string')
+/**
+ * look 事件（L2，服务端 app/look/base.py 的形状）读进来：objects 按类型标记；字段缺了的补空，认不出的形状返回 null
+ * （不出这一行，也不报错）。旧写法 sources[] 当作表类型读
+ */
+export function lookEventOf(op: CopilotOp): LookEvent | null {
+  if (!op || op.op !== 'look') return null
+  if (!Array.isArray(op.objects) && !Array.isArray(op.sources)) return null
+  const list: unknown[] = Array.isArray(op.objects) ? op.objects : op.sources
+  const names = (v: unknown): string[] => (Array.isArray(v) ? v.map(String).filter(Boolean) : [])
+  const objects: LookObject[] = list
+    .filter((x): x is Record<string, any> => !!x && typeof x === 'object')
     .map((x) => {
+      const kind: LookObject['kind'] = x.kind === 'capability' || x.kind === 'workflow_version' ? x.kind : 'table'
       const total = num(x.total)
       const explored = num(x.explored)
       return {
-        source: x.source,
-        tables: Array.isArray(x.tables) ? x.tables.map(String) : [],
-        selectedBy: x.selected_by === 'model' || x.selected_by === 'fallback' ? x.selected_by : 'all',
+        kind,
+        ...(typeof x.source === 'string' && x.source ? { source: x.source } : {}),
+        ...(typeof x.source_id === 'string' && x.source_id ? { source_id: x.source_id } : {}),
+        named: names(x.named), picked: names(x.picked), joined: names(x.joined), missing: names(x.missing),
         ...(total != null ? { total } : {}),
         ...(total != null && explored != null && explored < total ? { explored } : {}),
-        ...(typeof x.reason === 'string' && x.reason ? { reason: x.reason } : {}),
-        ...(typeof x.source_id === 'string' && x.source_id ? { sourceId: x.source_id } : {}),
-        ...(num(x.catalog_tables) != null ? { catalogTables: num(x.catalog_tables) } : {}),
+        ...(num(x.catalog_tables) != null ? { catalog_tables: num(x.catalog_tables) } : {}),
       }
     })
-}
-
-/**
- * 没有数据目录的大库（要按需求挑表的那种）：挑表只能照表名猜，SQL 检查也没有目录可对照。真实运行里数据源一张目录
- * 都没有，用户也不知道该先去起草。只认服务端明说了 0 张的；小库全部表都带字段，不提示
- */
-function noCatalog(groups: CopilotContextSource[]): { next: string; fixTo?: string } | null {
-  const bare = groups.filter((g) => g.catalogTables === 0 && g.selectedBy !== 'all')
-  if (!bare.length) return null
-  const who = groups.length === 1 ? null : `「${bare.map((g) => g.source).join('」「')}」`
-  const to = bare.find((g) => g.sourceId)?.sourceId
-  return { next: COPILOT_CONTEXT_TEXT.noCatalog(who), ...(to ? { fixTo: `/data/catalog/${encodeURIComponent(to)}` } : {}) }
-}
-
-/**
- * 一个库在展开区里的那一行：怎么来的 + 表名。探查结构截断了的库写明「共 205 张，只探查了 200 张」：
- * 模型只看得到探查到的那些，用户说的表不在里面时，先得知道是没探查到，不是库里没有
- */
-function contextLine(g: CopilotContextSource): string {
-  const names = g.tables.join('、')
-  const partial = g.total != null && g.explored != null ? SCHEMA_PARTIAL_TEXT.context(g.total, g.explored) : ''
-  const of = partial || (g.total != null ? `共 ${g.total} 张表` : '')
-  switch (g.selectedBy) {
-    case 'all':
-      return `「${g.source}」全部 ${g.tables.length} 张表${partial ? `（${partial}）` : ''}：${names}`
-    case 'model':
-      return g.tables.length
-        ? partial
-          ? `「${g.source}」${partial}，按需求挑出 ${g.tables.length} 张：${names}`
-          : `「${g.source}」按需求${g.total != null ? `从 ${g.total} 张表中` : ''}挑出 ${g.tables.length} 张：${names}`
-        : `「${g.source}」${of ? `${of}，` : ''}未挑中与需求相关的表，已提供全部表名`
-    default:
-      return `「${g.source}」${of ? `${of}，` : ''}${CONTEXT_FALLBACK_TEXT}`
-        + (g.tables.length ? `；现有工作流用到的 ${g.tables.length} 张表附带全部字段：${names}` : '')
+  const status = op.status === 'index' || op.status === 'failed' ? op.status : 'ok'
+  return {
+    op: 'look', id: String(op.id ?? ''), by: op.by === 'system' ? 'system' : 'model',
+    need: String(op.need ?? ''), status,
+    ...(typeof op.reason === 'string' && op.reason ? { reason: op.reason } : {}),
+    elapsed_ms: num(op.elapsed_ms) ?? 0, objects,
   }
 }
 
+/** 这一类对象一共给了几个（表：点名的 + 挑出的 + 补上的，去重） */
+function lookCount(objects: LookObject[], kind: LookObject['kind']): number {
+  const seen = new Set<string>()
+  for (const o of objects) {
+    if (o.kind !== kind) continue
+    for (const n of [...o.named, ...(o.picked ?? []), ...(o.joined ?? [])]) seen.add(`${o.source ?? ''}\u0000${n}`)
+  }
+  return seen.size
+}
+
+/** 一个表类型的对象怎么来的：点名、按需求挑选；候选不多、整库都给了的写「全部查看」 */
+function lookHow(o: LookObject): string {
+  const picked = o.picked ?? []
+  if (picked.length && o.total != null && picked.length >= (o.explored ?? o.total)) return LOOK_TEXT.howAll
+  return picked.length ? LOOK_TEXT.howPicked : LOOK_TEXT.howNamed
+}
+
+/** 展开区里一个对象一行：库名、点名的、挑出的、补上的，探查截断了的写明 */
+function lookLine(o: LookObject): string {
+  const parts = [
+    o.named.length ? LOOK_TEXT.named(o.named) : '',
+    o.picked?.length ? LOOK_TEXT.picked(o.picked) : '',
+    o.joined?.length ? LOOK_TEXT.joined(o.joined) : '',
+  ].filter(Boolean)
+  const head = o.kind === 'table' ? `「${o.source ?? ''}」` : o.kind === 'capability' ? '能力' : '工作流版本'
+  const partial = o.total != null && o.explored != null ? `（${LOOK_TEXT.partial(o.total, o.explored)}）` : ''
+  return parts.length ? `${head}${partial}：${parts.join('；')}` : ''
+}
+
 /**
- * 助手这一轮参考了哪些表（context 操作）→ 过程里的一行。
+ * 一次查看 → 过程里的一行（look §2.6）。
  *
- * 大库放不下全部字段，服务端先按需求挑表，挑中的表给模型全部字段。这件事要看得见：生成的 SQL 用错了表，
- * 先得知道模型当时看到的是哪几张。标题只说几张（「参考了 8 张表」），展开按数据源分组列表名；挑表失败时
- * 标题直说只给了表名，原因放在展开区。认不出的形状返回 null：不出这一行，也不报错。
+ * 标题说看了什么：「查看了 4 张表」「查看了 2 张表、1 个能力」；副标题说在哪、怎么来的（「库 B · 按需求挑选」）。
+ * 挑表失败交回了表目录时，标题直说「没挑出来，已把表目录交给助手」，原因放展开区——后面通常紧跟一行点名查看。
+ * 系统代为查看（发布前修复、升级证据、应用润色）照实说是按什么看的
  */
-export function copilotContext(op: CopilotOp):
-  { title: string; sub?: string; detail: string; ms?: number; next?: string; fixTo?: string } | null {
-  // 展开区里按需求挑过表的库排在前面：请求里点名的那个库往往就是它，排在一串小库后面得在内层滚动框里翻才看得到
-  const order: Record<CopilotContextSource['selectedBy'], number> = { model: 0, all: 1, fallback: 2 }
-  const groups = contextSources(op).map((g, i) => ({ g, i }))
-    .sort((a, b) => order[a.g.selectedBy] - order[b.g.selectedBy] || a.i - b.i).map((x) => x.g)
-  if (!groups.length) return null
-  // 两个数分开说：带着全部字段的表（count），和只提供了表名的表（namesOnly：没挑成的库、一张没挑中的库）。
-  // 以前标题只写前者，「参考了 26 张表」看不出另有 206 张只给了表名
-  const count = groups.reduce((n, g) => n + g.tables.length, 0)
-  const namesOnly = groups.reduce((n, g) => n + namesOnlyOf(g), 0)
-  const failed = groups.filter((g) => g.selectedBy === 'fallback')
-  // 有表带着字段（小库，或者现有工作流用到的表）时标题仍说几张，没挑成的事放副标题
-  const who = failed.length && failed.length < groups.length ? `「${failed.map((g) => g.source).join('」「')}」` : ''
-  const sub = count && failed.length
-    ? namesOnly ? `${who}${COPILOT_CONTEXT_TEXT.notPicked}，${COPILOT_CONTEXT_TEXT.namesOnly(namesOnly)}` : `${who}${CONTEXT_FALLBACK_TEXT}`
-    : count && namesOnly ? COPILOT_CONTEXT_TEXT.namesOnly(namesOnly) : undefined
-  const reasons = [...new Set(failed.map((g) => g.reason).filter(Boolean))]
-  // 挑过表才有 elapsed_ms：挑表是生成之前多出来的一次模型调用，没挑成（比如超时）也要让人看到等了多久
-  const ms = num(op.elapsed_ms)
-  const hint = noCatalog(groups)
+export function copilotLook(op: CopilotOp):
+  { title: string; sub?: string; detail?: string; ms?: number; level?: 'warn'; next?: string; fixTo?: string } | null {
+  const look = lookEventOf(op)
+  if (!look) return null
+  const tables = lookCount(look.objects, 'table')
+  const caps = lookCount(look.objects, 'capability')
+  const versions = lookCount(look.objects, 'workflow_version')
+  const what = [tables ? LOOK_TEXT.tables(tables) : '', caps ? LOOK_TEXT.capabilities(caps) : '',
+    versions ? LOOK_TEXT.versions(versions) : ''].filter(Boolean).join('、')
+  const tableObjs = look.objects.filter((o) => o.kind === 'table' && o.source)
+  const missing = look.objects.filter((o) => o.missing.length)
+    .map((o) => LOOK_TEXT.missing(o.kind === 'table' ? `「${o.source ?? ''}」` : '', o.missing))
+  const detail = [
+    look.need ? LOOK_TEXT.need(look.need) : '',
+    ...look.objects.map(lookLine),
+    ...missing,
+    look.reason ? LOOK_TEXT.reason(look.reason) : '',
+  ].filter(Boolean).join('\n') || undefined
+  const ms = look.elapsed_ms >= 10 ? look.elapsed_ms : undefined
+  if (look.status === 'failed') return { title: LOOK_TEXT.failed, level: 'warn', detail, ms }
+  if (look.status === 'index') {
+    return { title: look.reason ? LOOK_TEXT.index : LOOK_TEXT.indexEmpty, level: 'warn', detail, ms,
+             ...(tableObjs.length ? { sub: [...new Set(tableObjs.map((o) => o.source))].join('、') } : {}) }
+  }
+  const title = !what ? LOOK_TEXT.nothing
+    : look.by === 'system'
+      ? tables && !caps && !versions ? LOOK_TEXT.systemTables(what)
+        : versions && !tables && !caps ? LOOK_TEXT.systemVersions(what) : LOOK_TEXT.system(what)
+      : LOOK_TEXT.title(what)
+  const where = [...new Set(tableObjs.map((o) => o.source))].join('、')
+  const how = [...new Set(tableObjs.map(lookHow))].join('、')
+  const hint = lookNoCatalog(tableObjs)
   return {
-    title: count ? (namesOnly ? COPILOT_CONTEXT_TEXT.withFields(count) : `参考了 ${count} 张表`) : CONTEXT_FALLBACK_TEXT,
-    ...(sub ? { sub } : {}),
-    detail: [...groups.map(contextLine), ...reasons.map((r) => `原因：${r}`)].join('\n'),
-    ...(ms != null && ms >= 10 ? { ms } : {}),
+    title,
+    ...(where ? { sub: `${where} · ${how}` } : {}),
+    detail, ms,
     ...(hint ?? {}),
   }
 }
 
-/** 这个库里只提供了表名、没带字段的表有几张（模型看得到的那些：探查截断了的按探查到的算） */
-function namesOnlyOf(g: CopilotContextSource): number {
-  const seen = g.explored ?? g.total
-  if (seen == null) return 0
-  if (g.selectedBy === 'fallback' || (g.selectedBy === 'model' && !g.tables.length)) return Math.max(0, seen - g.tables.length)
-  return 0
+/**
+ * 没有数据目录的库：挑表只能照表名猜，SQL 检查也没有目录可对照。只认服务端明说了 0 张的；老服务端不给就不提示
+ */
+function lookNoCatalog(objects: LookObject[]): { next: string; fixTo?: string } | null {
+  const bare = objects.filter((o) => o.catalog_tables === 0 && (o.picked?.length || o.named.length))
+  if (!bare.length) return null
+  const who = objects.length === 1 ? null : `「${bare.map((o) => o.source).join('」「')}」`
+  const to = bare.find((o) => o.source_id)?.source_id
+  return { next: COPILOT_CONTEXT_TEXT.noCatalog(who), ...(to ? { fixTo: `/data/catalog/${encodeURIComponent(to)}` } : {}) }
+}
+
+/**
+ * 老服务端的 context 操作（按需求挑表、预先塞进 system）→ 当作一次模型查看来说。新前端连老服务端时照常显示这一行，
+ * 说法和 look 同一套：按需求挑的算挑出的，小库整库给了的写「全部查看」，挑表失败写「没挑出来」
+ */
+export function contextAsLook(op: CopilotOp): CopilotOp | null {
+  const list: unknown[] = Array.isArray(op.sources) ? op.sources : []
+  const groups = list.filter((x): x is Record<string, any> =>
+    !!x && typeof x === 'object' && typeof (x as any).source === 'string')
+  if (!groups.length) return null
+  const failed = groups.filter((g) => g.selected_by === 'fallback')
+  return {
+    op: 'look', id: 'context', by: 'model', need: '',
+    status: failed.length === groups.length && !groups.some((g) => Array.isArray(g.tables) && g.tables.length) ? 'index' : 'ok',
+    ...(failed.find((g) => g.reason)?.reason ? { reason: String(failed.find((g) => g.reason)!.reason) } : {}),
+    elapsed_ms: num(op.elapsed_ms) ?? 0,
+    objects: groups.map((g) => {
+      const tables = Array.isArray(g.tables) ? g.tables.map(String) : []
+      // fallback 时带着字段的是现有工作流用到的表：算点名的
+      return { kind: 'table', source: g.source, source_id: g.source_id, total: g.total, explored: g.explored,
+               catalog_tables: g.catalog_tables, missing: [],
+               ...(g.selected_by === 'fallback' ? { named: tables, picked: [] } : { named: [], picked: tables }) }
+    }),
+  }
+}
+
+/** 老服务端的 context 操作 → 过程里的一行（同 copilotLook）。认不出的形状返回 null */
+export function copilotContext(op: CopilotOp): ReturnType<typeof copilotLook> {
+  const look = contextAsLook(op)
+  return look ? copilotLook(look) : null
+}
+
+/** 这一轮的查看记录：存进 meta.looks（look §2.5.8，原样存 look 事件），下一轮服务端据此写「上一轮查看过」 */
+export function looksOf(ops: CopilotOp[]): LookEvent[] {
+  return ops.map(lookEventOf).filter((x): x is LookEvent => !!x)
 }
 
 /** 用了限定范围之外的数据源：自查交回模型改也改不掉时，人要知道是范围的事，不是图写错了 */
@@ -3168,13 +3345,37 @@ const OUT_OF_SCOPE_NEXT = '本轮限定了查询的数据源，但工作流使�
  * unchanged：收到了 final，但画布一处都没变（store 比对出来的，操作流里看不出）。
  * 那一行不能再说「流程搭好了」。
  */
+/** 应用操作 → 一句话。组件写中文名（目录里的 label 由调用方给不了，这里按组件 id 和类型说） */
+function appOpTitle(op: CopilotOp): string {
+  const comp = op.component && typeof op.component === 'object' ? op.component : null
+  switch (op.op) {
+    case 'app_add':
+      return comp ? `添加了组件「${String(comp.props?.label ?? comp.props?.title ?? comp.id ?? comp.type ?? '')}」` : ''
+    case 'app_update':
+      return `调整了组件「${String(op.id ?? '')}」`
+    case 'app_remove':
+      return `移除了组件「${String(op.id ?? '')}」`
+    case 'app_page':
+      return `设置了页面「${String(op.page?.title ?? op.page?.id ?? '')}」`
+    default:
+      return op.path ? `设置了${APP_SET_LABEL[String(op.path)] ?? '应用描述'}「${String(op.key ?? '')}」` : ''
+  }
+}
+
+/** app_set 改的是 spec 的哪一部分 */
+const APP_SET_LABEL: Record<string, string> = {
+  entries: '入口', views: '视图', forms: '表单', slots: '岗位', task_ui: '待办外观',
+}
+
 export function decodeCopilot(ops: CopilotOp[], opts?: {
-  context?: 'canvas' | 'chat'
+  /** app：应用编辑器里的助手（应用润色），操作是应用操作，结局说的是应用草稿 */
+  context?: 'canvas' | 'chat' | 'app'
   unchanged?: boolean
   /** 画布上的节点名。自查问题、「去掉了」这类只带 id 的行据此写成名字 */
   labelOf?: (id: string) => string | undefined
 }): Step[] {
   const canvas = opts?.context === 'canvas'
+  const app = opts?.context === 'app'
   const labels = labelsOf(ops, opts?.labelOf)
   const out: Step[] = []
   let i = 0
@@ -3255,16 +3456,35 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
               ...(elapsed ? { ms: elapsed, meta: formatDuration(elapsed) } : {}) })
         break
       }
+      case 'look':
       case 'context': {
-        // 这一轮参考了哪些表：标题说几张，展开看按数据源分组的表名
-        const ctx = copilotContext(op)
-        if (!ctx) break
-        add({ id: `cx-${i}`, seq: i, kind: 'schema', status: 'done', code: 'copilot_context',
-              title: ctx.title, detail: ctx.detail,
-              ...(ctx.sub ? { sub: ctx.sub } : {}),
-              ...(ctx.ms != null ? { ms: ctx.ms, meta: formatDuration(ctx.ms) } : {}),
-              // 没有数据目录的大库：下一步去起草目录，入口直达那个数据源的目录页
-              ...(ctx.next ? { next: ctx.next, ...(ctx.fixTo ? { fix: 'catalog' as const, fixTo: ctx.fixTo } : {}) } : {}) })
+        // 助手查看了哪些表、能力、工作流版本（look §2.6）：一次查看一行，按先后排。老服务端的 context 操作照同一套说法
+        const look = op.op === 'look' ? copilotLook(op) : copilotContext(op)
+        if (!look) break
+        add({ id: `cx-${i}`, seq: i, kind: 'schema', status: 'done', code: op.op === 'look' ? 'copilot_look' : 'copilot_context',
+              title: look.title,
+              ...(look.detail ? { detail: look.detail } : {}),
+              ...(look.sub ? { sub: look.sub } : {}),
+              ...(look.level ? { level: look.level } : {}),
+              ...(look.ms != null ? { ms: look.ms, meta: formatDuration(look.ms) } : {}),
+              // 没有数据目录的库：下一步去起草目录，入口直达那个数据源的目录页
+              ...(look.next ? { next: look.next, ...(look.fixTo ? { fix: 'catalog' as const, fixTo: look.fixTo } : {}) } : {}) })
+        break
+      }
+      case 'ask':
+        // 助手问回来一句（L1）：这一轮到此结束，已经落地的改动照常交付，用户的回答就是下一轮
+        settleAll('done')
+        add({ id: `ca-${i}`, seq: i, kind: 'note', status: 'done', code: 'copilot_ask',
+              title: LOOK_TEXT.ask, detail: String(op.question ?? '') || undefined, next: LOOK_TEXT.askNext })
+        break
+      case 'app_add':
+      case 'app_update':
+      case 'app_remove':
+      case 'app_page':
+      case 'app_set': {
+        // 应用润色的操作（服务端 app/apps/ops.py）：一行一个，说改了哪个组件。挪位置不单独成行，同连线
+        const title = appOpTitle(op)
+        if (title) add({ id: `ao-${i}`, seq: i, kind: 'note', status: 'done', code: 'app_op', title: clip(title) })
         break
       }
       case 'catalog_patch': {
@@ -3310,7 +3530,7 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         // 心跳那条"正在理解需求…"要收尾，否则生成完了它还在转圈
         settleAll('done')
         add({ id: `cd-${i}`, seq: i, kind: 'lifecycle', status: 'done',
-              title: `工作流已搭建完成，新增 ${nodeCount} 个步骤`,
+              title: app ? '应用草稿已调整完成' : `工作流已搭建完成，新增 ${nodeCount} 个步骤`,
               detail: String(op.explanation ?? '') || undefined })
         break
       case 'check': {

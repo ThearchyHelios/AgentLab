@@ -1120,9 +1120,11 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   }
   state.stream = [
     { op: 'model', model: 'fake-model' },
-    // 服务端按需求挑了表（copilot_context）：过程里多一行「参考了 N 张表」
-    { op: 'context', elapsed_ms: 1500, sources: [
-      { source: 'shop', tables: ['orders', 'order_items', 'customers'], selected_by: 'model', total: 48 }] },
+    // 助手按需查看了表（look 事件）：过程里多一行「查看了 N 张表」，浮条先说「正在查看表结构…」
+    { op: 'heartbeat', phase: 'looking', elapsed_ms: 900 },
+    { op: 'look', id: 'L1', by: 'model', need: '润色要用到的订单字段', status: 'ok', elapsed_ms: 1500, objects: [
+      { kind: 'table', source: 'shop', named: [], picked: ['orders', 'order_items', 'customers'], joined: [], missing: [],
+        total: 48 }] },
     { op: 'plan', summary: '加一步润色' },
     { op: 'update_node', id: 'answer', config: finalGraph.nodes[3].data.config },
     { op: 'add_node', node: { id: 'polish', type: 'llm', label: '润色', config: { prompt: '{{ nodes.answer.text }}' } } },
@@ -1139,11 +1141,11 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   const t1 = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
   check('开始了就告诉输入框（runCopilot 返回 true）', began === true, String(began))
   check('收到 final：这一轮是「已应用」', t1.outcome === 'applied', t1.outcome)
-  const ctxRow = page.locator('[data-step-code="copilot_context"]').last()
-  check('助手栏的过程里一行说参考了几张表', await ctxRow.waitFor({ timeout: 3000 }).then(() => true, () => false)
-    && (await ctxRow.innerText()).includes('参考了 3 张表'))
+  const ctxRow = page.locator('[data-step-code="copilot_look"]').last()
+  check('助手栏的过程里一行说查看了几张表', await ctxRow.waitFor({ timeout: 3000 }).then(() => true, () => false)
+    && (await ctxRow.innerText()).includes('查看了 3 张表'))
   await ctxRow.locator('button').first().click()
-  check('点开看到按数据源分组的表名', await ctxRow.getByText('「shop」按需求从 48 张表中挑出 3 张：orders、order_items、customers')
+  check('点开看到每个库一行的表名', await ctxRow.getByText('「shop」：按需求挑出 orders、order_items、customers')
     .waitFor({ timeout: 3000 }).then(() => true, () => false))
   check('diff 记下新增和改动', t1.diff?.added.includes('polish') && t1.diff?.changed.includes('answer'), JSON.stringify(t1.diff))
   check('final.issues 进了这一轮（少了一步）', t1.issues?.some((i) => i.code === 'unknown_node_type'))
@@ -2882,6 +2884,80 @@ await section('点名的模型接入：检查器模型一栏说清留空用哪�
     delete FAKES['st-model']
     delete FAKES['st-modeldef']
     delete FAKES['st-modeldm']
+  }
+})
+
+await section('应用平台：人工节点的流程配置、入口字段的类型、写入确认、发起表单和运行来源', async () => {
+  // §3.7：人工节点多了派给谁、会签方式、时限、超时处理、表单、表单来自；§3.8：调用工具节点的写入确认；
+  // X2：入口字段有类型、格式、可选值，发起表单统一用 SchemaForm；X3：画布试运行带 origin=canvas
+  FAKES['st-proc'] = wf('st-proc', { name: '__studio_check_process__', version: 1, graph: {
+    nodes: [
+      node('in', 'input', 0, 200, '入口', { fields: [{ name: 'amount', required: true }, { name: 'kind' }] }),
+      node('h', 'human', 300, 200, '财务审批', { mode: 'approve', title: '审批', message: '{{ input.amount }}' }),
+      node('pay', 'tool', 600, 200, '付款', { args: {} }),
+      node('out', 'output', 900, 200, '成果', { fields: [{ name: '结果', value: '{{ last_message }}' }] }),
+    ],
+    edges: [edge('in', 'h'), edge('h', 'pay', 'approved'), edge('pay', 'out')],
+  } })
+  try {
+    const { ctx, page, errors } = await open({ path: '/studio/st-proc' })
+    const cfg = (id) => S(page, (x) => window.__studio.getState().nodes.find((n) => n.id === x)?.data.config, id)
+    await S(page, () => window.__studio.getState().select('h'))
+    const panel = page.locator('[data-inspector-sheet], aside').first()
+    for (const key of ['assignee', 'policy', 'due']) {
+      check(`人工节点有「${{ assignee: '派给谁', policy: '会签方式', due: '时限' }[key]}」一栏`,
+        await page.locator(`[data-field="${key}"]`).first().waitFor({ timeout: 4000 }).then(() => true, () => false))
+    }
+    check('没填时限时不出超时处理', await page.locator('[data-field="on_timeout"]').count() === 0)
+    await page.locator('[data-field="assignee"] select').first().selectOption('slot')
+    await page.locator('[data-field="assignee"] input').first().fill('finance')
+    check('派给岗位：写成 {kind: slot, slot}', JSON.stringify((await cfg('h')).assignee) === JSON.stringify({ kind: 'slot', slot: 'finance' }),
+      JSON.stringify((await cfg('h')).assignee))
+    await page.locator('[data-field="policy"] select').first().selectOption('quorum')
+    check('会签按人数：写成 {quorum: m}', typeof (await cfg('h')).policy?.quorum === 'number', JSON.stringify((await cfg('h')).policy))
+    await page.locator('[data-field="due"] input').first().fill('PT4H')
+    await page.locator('[data-field="on_timeout"] select').first().waitFor({ timeout: 3000 })
+    await page.locator('[data-field="on_timeout"] select').first().selectOption('escalate')
+    await page.locator('[data-field="on_timeout"] input').first().fill('director')
+    check('超时升级：写成 {action: escalate, to_slot}', JSON.stringify((await cfg('h')).on_timeout) === JSON.stringify({ action: 'escalate', to_slot: 'director' }),
+      JSON.stringify((await cfg('h')).on_timeout))
+    check('超时处理里没有「自动批准」', !(await page.locator('[data-field="on_timeout"] select option').allInnerTexts()).some((t) => t.includes('批准')))
+    await page.locator('[data-field="assignee"] select').first().selectOption('hook')
+    check('外部系统：关联键写在派给谁里', 'correlation' in ((await cfg('h')).assignee ?? {}), JSON.stringify((await cfg('h')).assignee))
+    check('界面上不裸写配置键名', !/on_timeout|form_from|assignee/.test(await panel.innerText()))
+
+    await S(page, () => window.__studio.getState().select('pay'))
+    check('调用工具节点有「确认派给谁」，帮助里写清写入要先确认、环境按运行类别', await page.locator('[data-field="assignee"]').first()
+      .waitFor({ timeout: 4000 }).then(() => true, () => false)
+      && (await page.locator('[data-field="assignee"]').first().innerText()).includes('生产环境'))
+
+    await S(page, () => window.__studio.getState().select('in'))
+    const types = page.locator('[data-input-field-type]')
+    check('入口字段可以选类型', await types.first().waitFor({ timeout: 4000 }).then(() => true, () => false))
+    await page.locator('[data-sub="type"] select').first().selectOption('number')
+    check('选了数字：写进字段的 type', (await cfg('in')).fields[0].type === 'number', JSON.stringify((await cfg('in')).fields[0]))
+    await page.locator('[data-sub="enum"] textarea').nth(1).fill('差旅\n办公')
+    await page.locator('[data-sub="enum"] textarea').nth(1).blur()
+    check('可选值一行一个', JSON.stringify((await cfg('in')).fields[1].enum) === JSON.stringify(['差旅', '办公']), JSON.stringify((await cfg('in')).fields[1]))
+
+    // 发起表单：SchemaForm 按入口字段画（可选值变成下拉），试运行带 origin=canvas
+    const starts = []
+    await page.route(/\/api\/runs$/, (route) => {
+      if (route.request().method() !== 'POST') return route.fallback()
+      starts.push(route.request().postDataJSON())
+      return route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ detail: '检查脚本不发起运行' }) })
+    })
+    await page.getByRole('button', { name: '运行', exact: true }).click()
+    const form = page.locator('[data-launch-form]')
+    check('发起表单用 SchemaForm 画', await form.waitFor({ timeout: 3000 }).then(() => true, () => false))
+    check('有可选值的字段是下拉', await form.locator('select').count() >= 1)
+    await page.locator('.sf-pop button.btn-primary').last().click()
+    check('试运行带上来源 canvas', await (async () => { for (let i = 0; i < 30 && !starts.length; i++) await page.waitForTimeout(100); return starts[0]?.origin === 'canvas' })(),
+      JSON.stringify(starts[0]?.origin))
+    check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+    await ctx.close()
+  } finally {
+    delete FAKES['st-proc']
   }
 })
 

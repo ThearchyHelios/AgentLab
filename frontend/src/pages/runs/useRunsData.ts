@@ -3,6 +3,7 @@ import { api } from '../../api/client'
 import { toast } from '../../components/ui'
 import type { StatusCode } from '../../lib/status'
 import type { Approval, Run } from '../../types'
+import type { Task } from '../../typesApp'
 import { useCatalog } from '../../store/catalog'
 import { runCode, serverStatuses } from './model'
 
@@ -15,6 +16,8 @@ export interface ListFilters {
   runClass: '' | 'formal' | 'exploratory'
   workflowId: string
   q: string
+  /** 运行来源（X3）。none = 来源未记录的老运行；空 = 不限 */
+  origin?: string
 }
 
 export interface RunList {
@@ -36,6 +39,7 @@ const paramsOf = (f: ListFilters) => ({
   run_class: f.runClass || undefined,
   workflow_id: f.workflowId || undefined,
   q: f.q.trim() || undefined,
+  origin_kind: f.origin || undefined,
 })
 
 /**
@@ -191,6 +195,48 @@ export function useApprovalQueue(epoch: number): ApprovalQueue {
     try {
       const list = await api.approvals.list({ status: 'pending', limit: 500 })
       setItems(list.filter((a) => a.status === 'pending'))
+      setError(null)
+      setState('ok')
+      first.current = false
+    } catch (e) {
+      setError(e)
+      setState('error')
+    }
+  }, [])
+
+  useEffect(() => { void reload() }, [reload, signature, epoch])
+
+  return { items, state, error, reload }
+}
+
+// -------------------------------------------------------------------------
+// 待办
+// -------------------------------------------------------------------------
+
+export interface TaskQueue {
+  items: Task[]
+  state: 'loading' | 'ok' | 'error'
+  error: unknown
+  reload: () => Promise<void>
+}
+
+/**
+ * 记录页的「待办」页签：不属于应用的运行里待处理的待办（画布、问数据、定时任务、正式运行）。应用里的待办在
+ * 「应用 → 待办」里处理，导航徽标也按来源分开数，这里不重复列。待审批变了（catalog 那份 4 秒一轮询）就跟着刷：
+ * 一次中断对应一条审批和一条待办。核实结果未知的动作没有审批，靠手动刷新和断网恢复
+ */
+export function useTaskQueue(epoch: number): TaskQueue {
+  const [items, setItems] = useState<Task[]>([])
+  const [state, setState] = useState<TaskQueue['state']>('loading')
+  const [error, setError] = useState<unknown>(null)
+  const signature = useCatalog((s) => s.approvals.map((a) => a.id).join(','))
+  const first = useRef(true)
+
+  const reload = useCallback(async () => {
+    if (first.current) setState('loading')
+    try {
+      const { items: list } = await api.tasks.list({ assigned: 'all', status: 'pending', limit: 500 })
+      setItems(list.filter((t) => !t.app_id && (t.status === 'pending' || t.status === 'resolving')))
       setError(null)
       setState('ok')
       first.current = false

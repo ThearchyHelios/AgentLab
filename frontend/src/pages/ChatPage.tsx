@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
-  AlertCircle, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, CloudOff, Database, History, ListTree,
+  AlertCircle, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, CloudOff, Database, History, LayoutGrid, ListTree,
   MessageSquare, PenLine, Play, RotateCw, Settings2, StepForward, Trash2, Wrench,
 } from 'lucide-react'
 import clsx from 'clsx'
@@ -17,6 +17,7 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { canLeave, leavePass } from '../lib/leave'
 import { formatNumber, formatTime } from '../lib/format'
+import { MAKE_APP_TEXT } from '../lib/terms'
 import { useCatalog, useCatalogListState, useDatasources, useOnReconnect, type CatalogListState } from '../store/catalog'
 import {
   agentSteps, busyTurn, isBusy, stepsVisible, useChat, type Attempt, type ChatTurn, type Failure, type ScopeSource,
@@ -469,6 +470,36 @@ function lastSentence(text: string): string {
  * 从库里恢复的轮次没有事件流——一次会话几十轮，把每轮的事件都预加载回来
  * 是几十个请求换一堆没人看的步骤。所以默认只显示问题和答案，想看过程再取。
  */
+/**
+ * 回答上的「做成应用」（A8）：从这次运行提取工作流（/copilot/from-run，只保留实际执行的步骤，新工作流记下来源），
+ * 跳到画布去发布——应用只能固定已发布的版本；发布成功的提示里再点「做成应用」进入应用编辑。
+ * 「在画布里打开」照旧在回答的流程图上
+ */
+function MakeAppButton({ runId, conversationId, turnId }: { runId: string; conversationId: string; turnId: string | null }) {
+  const navigate = useNavigate()
+  const refreshCatalog = useCatalog((s) => s.refresh)
+  const [busy, setBusy] = useState(false)
+  return (
+    <button className="btn btn-xs btn-ghost" disabled={busy} title={MAKE_APP_TEXT.hint} data-make-app=""
+            onClick={async () => {
+              if (!(await canLeave('/studio/'))) return
+              setBusy(true)
+              try {
+                const res = await api.copilot.fromRun(runId, undefined, { conversation_id: conversationId, turn_id: turnId })
+                void refreshCatalog()
+                navigate(`/studio/${res.workflow_id}`, leavePass())
+                toast.ok(MAKE_APP_TEXT.done)
+              } catch (e) {
+                toast.error(e)
+              } finally {
+                setBusy(false)
+              }
+            }}>
+      {busy ? <Spinner size={11} /> : <LayoutGrid size={11} aria-hidden />} {busy ? MAKE_APP_TEXT.busy : MAKE_APP_TEXT.button}
+    </button>
+  )
+}
+
 function TurnExtras({ turnId, readOnly }: {
   turnId: string
   /** 会话在回收站里：只能看，不发起运行，审批也等恢复之后再处理 */
@@ -484,8 +515,10 @@ function TurnExtras({ turnId, readOnly }: {
   const pending = runId ? approvals.filter((a) => a.run_id === runId && a.status === 'pending') : []
   const canSteps = !!turn.restored && !!runId && !BUSY.has(turn.phase)
   const scoped = !!turn.scope?.length
+  // 回答成功、有运行的轮次可以做成应用（A8）：先从这次运行提取工作流，在画布上发布后再做成应用
+  const canApp = !!runId && turn.phase === 'done' && !readOnly
 
-  if (!pending.length && !turn.pendingRun && !canSteps && !scoped) return null
+  if (!pending.length && !turn.pendingRun && !canSteps && !scoped && !canApp) return null
   return (
     <>
       {/* 和「没查库」一样，写在结论前面：这个答案只看了这几个库 */}
@@ -495,7 +528,7 @@ function TurnExtras({ turnId, readOnly }: {
           <span className="min-w-0 truncate">本轮只查 {turn.scope!.map((s) => s.name).join('、')}</span>
         </div>
       )}
-      {(turn.pendingRun || canSteps) && (
+      {(turn.pendingRun || canSteps || canApp) && (
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
           {turn.pendingRun && (
             <button className="btn btn-xs btn-primary" disabled={busy || readOnly}
@@ -512,13 +545,14 @@ function TurnExtras({ turnId, readOnly }: {
               {turn.steps === 'loading' ? '正在加载执行过程…' : stepsVisible(turn) ? '收起执行过程' : '查看执行过程'}
             </button>
           )}
+          {canApp && <MakeAppButton runId={runId!} conversationId={conversationId} turnId={turn.serverId} />}
         </div>
       )}
       {/* 通过了运行就接着跑：回收站里的会话左栏找不到，跑起来没人看着 */}
       {!!pending.length && readOnly && (
         <div className="mt-2 flex items-center gap-1.5 text-2xs text-faint" data-pending-approval="">
           <StatusBadge status="waiting" size={11} decorative />
-          <span className="min-w-0 flex-1">本轮正在等待审批。恢复对话后可在此处理，也可以在「记录」的「待审批」中处理。</span>
+          <span className="min-w-0 flex-1">本轮正在等待审批。恢复对话后可在此处理，也可以在「记录」的「待办」中处理。</span>
           <Link to="/runs?tab=approvals" className="shrink-0 text-[var(--accent)] hover:underline">去审批</Link>
         </div>
       )}

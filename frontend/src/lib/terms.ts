@@ -48,6 +48,7 @@ import type {
   SqlCheckCode, SqlCheckLevel, ToolTrust,
 } from '../types'
 import { formatCost, formatNumber, formatTokens } from './format'
+import type { CapabilityEffect, OriginKind } from '../typesApp'
 
 export const TERMS = {
   workflow: '工作流',
@@ -3415,11 +3416,9 @@ export const RUN_SQL_CHECK_TEXT = {
   otherGaps: '校验未全部完成：',
 }
 
+// 助手按需查看（look §2.6）之后，「参考了 N 张表的字段」「另有 N 张表只提供了表名」「未能按需求挑选，已提供全部表名」
+// 三句不再用：过程里那一行的说法在 LOOK_TEXT，老服务端的 context 操作也按它翻（run/decode.ts 的 copilotContext）
 export const COPILOT_CONTEXT_TEXT = {
-  /** 标题：另有只提供了表名的表时，写明这个数只算带着字段的表 */
-  withFields: (n: number) => `参考了 ${formatNumber(n)} 张表的字段`,
-  namesOnly: (n: number) => `另有 ${formatNumber(n)} 张表只提供了表名`,
-  notPicked: '未能按需求挑选',
   /** 没有数据目录的大库：只有一个数据源时说「这个数据源」，几个时点名 */
   noCatalog: (who: string | null) => `${who ?? '这个数据源'}还没有数据目录，起草后挑表和 SQL 检查会更准`,
   toCatalog: '去数据目录起草',
@@ -4868,6 +4867,588 @@ export const VERIFY_SETTING_TEXT = {
     unpriced: (n: number) => `另有 ${formatNumber(n)} 次调用无法估算金额（模型不在价格目录中），未计入`,
     saveInvalid: '核查设置中有无效值，请修正后再保存',
   },
+}
+
+// ===========================================================================
+// 应用平台：搭建面的文案（docs/design/app-platform-and-look.md 第四部分）。使用面（应用首页、应用页、发起、实例、待办、
+// 登录）的文案在 termsApp.ts，同一个词不在两处定义。
+//
+// - 版本写「固定版本」：应用固定了哪几个工作流版本。不写钉住。
+// - 运行来源照 ORIGIN_LABEL 写；老运行发起时还没有记来源，写「来源未记录」，不猜。
+// - 待办是一次中断面向人的那一面；审批结果仍是批准 / 驳回。
+// - 动作是调用工具节点对外部系统的一次写入，它的权威记录叫「生效记录」；拿不到确定结果时叫「结果未知」，只能核实。
+// - 能力是图里任何一个可调用的工具；端点是管理员登记的外部系统地址和凭据，分测试、生产两个环境。
+// ===========================================================================
+
+/** 运行来源（X3）。顺序同服务端 engine/origin.ORIGIN_KINDS，筛选下拉照这个顺序 */
+export const ORIGIN_LABEL: Record<OriginKind, string> = {
+  chat: '问数据',
+  canvas: '画布试运行',
+  launcher: '正式运行（手动）',
+  schedule: '定时任务',
+  app_entry: '应用入口',
+  app_view: '应用视图',
+  app_backfill: '按新口径补算',
+  hook: '外部系统触发',
+  api: '接口',
+}
+
+export const ORIGIN_TEXT = {
+  unknown: '来源未记录',
+  unknownHint: '这次运行发起时还没有记录来源',
+  hint: '这次运行从哪里发起。发起时写进运行记录，在封存范围内',
+  filterAll: '全部来源',
+  filterLabel: '按运行来源筛选',
+  /** 时间线里 run.origin 那一行 */
+  step: (label: string) => `来源：${label}`,
+  app: (name: string, version?: number | null) => `应用「${name}」${version != null ? ` v${version}` : ''}`,
+  entry: (id: string) => `入口「${id}」`,
+  view: (id: string) => `视图「${id}」`,
+  hook: (name: string) => `钩子「${name}」`,
+  actor: (who: string, verified: boolean) => `${verified ? '已登录用户' : '署名'}「${who}」`,
+}
+
+/** 来源标签：老运行没有来源时写「来源未记录」 */
+export const originLabel = (kind: string | null | undefined): string =>
+  kind && kind in ORIGIN_LABEL ? ORIGIN_LABEL[kind as OriginKind] : ORIGIN_TEXT.unknown
+
+/**
+ * 待办在搭建面的说法：记录页的「待办」页签、时间线里的 task.* 事件。种类、状态、决定的叫法用使用面那一份
+ * （termsApp.ts 的 TASK_KIND_LABEL、TASK_STATUS_LABEL、TASK_TEXT.decision），不另写
+ */
+export const TASK_LOG_TEXT = {
+  /** 记录页的页签：以前叫「待审批」 */
+  tab: '待办',
+  emptyTitle: '没有待处理的待办',
+  emptyBody: '等待人处理的审批、补充输入、动作确认和核实会显示在这里，处理后从列表中移除。',
+  emptyFiltered: '没有匹配的待办',
+  appNote: '应用里的待办在「应用 → 待办」中处理',
+  listFoot: (n: number) => `共 ${formatNumber(n)} 条待办 · 最久的排在最前`,
+  open: '去处理',
+  waited: (span: string) => `已等待 ${span}`,
+  due: (span: string) => `${span}后到期`,
+  overdue: '已过时限',
+  /** 会签策略 */
+  policy: (p: { kind: string; m?: number } | null | undefined): string =>
+    p?.kind === 'all' ? '全体同意才通过' : p?.kind === 'quorum' ? `${formatNumber(p.m ?? 0)} 人同意即通过` : '任一人处理即可',
+  progress: (done: number, total: number) => `已回复 ${formatNumber(done)} / ${formatNumber(total)}`,
+  assignTo: (who: string[]) => `派给 ${who.join('、')}`,
+  anyone: '任何人',
+  initiator: '发起人',
+  loadFailed: '未能读取这条审批对应的待办',
+  retry: '重试',
+  // ---- 时间线（task.* 事件）
+  opened: (title: string) => `待办「${title}」已打开`,
+  responded: (who: string, decision: string, i?: number, n?: number) =>
+    `${who || '未署名'} ${decision}${i != null && n != null && n > 1 ? `（第 ${formatNumber(i)} / ${formatNumber(n)} 人）` : ''}`,
+  reassigned: (who: string[]) => `已改派给 ${who.join('、')}`,
+  reminded: (n?: number) => (n ? `已提醒 ${formatNumber(n)} 人` : '已提醒处理人'),
+  escalated: (to: string) => `超过时限，已升级给「${to}」`,
+  expired: '超过时限，按设置驳回',
+  resolved: (outcome: string) => `待办已处理：${outcome}`,
+  cancelled: '运行已取消，待办随之撤回',
+}
+
+/** 生效记录在搭建面的说法：记录页的生效记录面板、时间线里的 action.* 事件。状态和环境的叫法用 termsApp.ts 那一份 */
+export const ACTION_LOG_TEXT = {
+  panel: '生效记录',
+  panelHint: '调用工具节点对外部系统的每次写入。先留记录再发送；结果未知时只能核实，不会自动重发',
+  empty: '这次运行没有写入外部系统',
+  hash: '内容哈希',
+  hashHint: '确认时看到的内容的哈希。发送前重新计算，对不上就不发送',
+  preview: '发送内容（已遮罩）',
+  receipt: '回执',
+  capability: '能力',
+  // ---- 时间线（action.* 事件）
+  prepared: (cap: string) => `准备写入「${cap}」`,
+  sent: (cap: string) => `已向「${cap}」发送`,
+  confirmed: (cap: string) => `「${cap}」已生效`,
+  failed: (cap: string) => `写入「${cap}」失败`,
+  unknown: (cap: string) => `写入「${cap}」结果未知`,
+  unknownNext: '请求已发出，但没有拿到确定结果。运行已挂起；登记了查询能力的会自动核实，否则请在待办中核实，不会自动重发',
+  reconciled: (cap: string, who: string) => `「${cap}」的结果已核实${who ? `（${who}）` : ''}`,
+  byLookup: '按查询能力自动核实',
+  reconciledApplied: '已生效',
+  reconciledResend: '未生效，重新发送',
+  reconciledAbandon: '未生效，放弃',
+  simulated: (cap: string) => `演练：未向「${cap}」发送`,
+  simulatedSub: '探索运行，端点没有测试环境：只记录，不发送',
+}
+
+/** 能力的读写效果 */
+export const CAPABILITY_EFFECT_LABEL: Record<CapabilityEffect, string> = {
+  read: '只读',
+  write: '写入',
+  dynamic: '视参数而定',
+}
+
+export const CAPABILITY_TEXT = {
+  tab: '能力',
+  title: '能力登记',
+  hint: '图里每个可调用的工具在这里登记读写效果、审批方式和字段语义。系统同步的部分自动更新，治理部分由管理员维护',
+  effect: CAPABILITY_EFFECT_LABEL,
+  effectSystem: '同步得出',
+  effectGoverned: '治理后',
+  effectMismatch: (sys: string, gov: string) => `同步得出的效果是「${sys}」，治理后为「${gov}」`,
+  effectUnset: '未治理：按同步得出的效果处理',
+  approval: { inherit: '跟随审批策略', confirm: '每次都要确认', none: '正式运行免审批' } as Record<string, string>,
+  approvalHint: '只读且设为「正式运行免审批」的能力，在正式运行里直接执行；其余照旧按审批策略',
+  unattended: '允许无人值守写入',
+  unattendedHint: '关闭时，调用工具节点不能把这个能力设成「不需确认」直接写入',
+  returns: '返回结构',
+  tabular: '表格化',
+  tabularHint: '声明行在返回里的位置和列的映射之后，读取结果才能作为证据进入报告',
+  tabularRows: '行的位置',
+  tabularColumns: '列映射',
+  fields: '字段语义',
+  fieldsHint: '按返回里的位置写字段的含义、单位，形状同数据目录的项',
+  masked: '遮罩字段',
+  maskedHint: '查看、快照、应用视图都按这里遮罩，每行一个位置',
+  credential: { service: '服务凭据', service_on_behalf: '服务凭据 + 身份断言' } as Record<string, string>,
+  credentialLabel: '凭据方式',
+  credentialHint: '身份断言由平台签发，五分钟有效，端点据此知道是谁发起的。平台不保存用户自己的凭据',
+  endpoint: '端点',
+  endpointNone: '不绑定端点',
+  lookup: '查询能力',
+  lookupHint: '写入结果未知时，用它按幂等键查询实际结果',
+  lookupNone: '未登记',
+  version: (v: number) => `治理版本 v${formatNumber(v)}`,
+  missing: '已不存在',
+  missingHint: '上次同步时已找不到这个能力（工具被删除或改名），治理设置保留',
+  sync: '立即同步',
+  synced: (n: number) => (n ? `已同步，${formatNumber(n)} 项有变化` : '已同步，没有变化'),
+  syncedAt: (t: string) => `最近同步：${t}`,
+  conflict: '这个能力刚被其他人修改过，已载入最新内容，请重新修改',
+  saved: (name: string) => `已保存「${name}」的治理设置`,
+  readOnlyHint: '只有管理员可以修改能力治理',
+  empty: '还没有登记的能力',
+  emptyBody: '接入数据源、自定义工具或 MCP 服务后会自动同步到这里。',
+  search: '搜索能力名称或系统',
+  filterEffect: '全部效果',
+  filterSystem: '全部系统',
+}
+
+export const ENDPOINT_TEXT = {
+  tab: '端点',
+  title: '登记的端点',
+  hint: '外部系统的地址和凭据，分测试、生产两个环境。只有登记的端点能访问内网',
+  empty: '还没有登记的端点',
+  emptyBody: '登记外部系统的地址和认证头后，HTTP 能力可以绑定端点，只填路径。',
+  create: '登记端点',
+  edit: (name: string) => `编辑端点「${name}」`,
+  envs: { test: '测试环境', prod: '生产环境' } as Record<string, string>,
+  envMissing: '未配置',
+  baseUrl: '基础地址',
+  headers: '认证头',
+  headersHint: '值加密保存，界面上只显示掩码；不改的保持掩码即可',
+  allowIntranet: '允许访问内网',
+  allowIntranetHint: '只有管理员可以开启。开启后仍拦截元数据地址和高危端口',
+  verifyTls: '校验证书',
+  idempotency: '幂等请求头',
+  timeout: '超时（秒）',
+  test: (env: string) => `测试${env}连接`,
+  testOk: (status: number | null) => `连接成功${status != null ? `（HTTP ${status}）` : ''}`,
+  saved: (name: string) => `已保存端点「${name}」`,
+  removeTitle: (name: string) => `删除端点「${name}」？`,
+  removeBody: '绑定了这个端点的能力将无法执行。',
+  conflict: '这个端点刚被其他人修改过，已载入最新内容，请重新修改',
+  noProd: '没有生产环境：正式运行写入时会被发布检查拦下',
+  readOnlyHint: '只有管理员可以修改端点',
+  addHeader: '添加认证头',
+  name: '名称',
+  description: '说明',
+}
+
+/** 身份设置（设置 → 身份、审计）。登录页、账户菜单、角色和登录方式的叫法在 termsApp.ts（AUTH_TEXT、ROLE_LABEL、AUTH_MODE_LABEL） */
+export const IDENTITY_TEXT = {
+  tab: '身份',
+  mode: '登录方式',
+  modeHint: {
+    off: '不需要登录。署名为自报，所有人等同管理员',
+    local: '用户名加密码登录，账号在这里建',
+    oidc: '经单点登录服务登录，组可以从声明同步',
+  } as Record<string, string>,
+  envLocked: '登录方式由服务端环境变量指定，这里不能修改',
+  bootstrap: '第一个管理员',
+  bootstrapHint: '切换到本地账号时必须同时建出第一个管理员，否则切换后没有人能登录',
+  oidcTitle: '单点登录设置',
+  oidcIssuer: '签发方地址',
+  oidcClientId: '客户端标识',
+  oidcClientSecret: '客户端密钥',
+  oidcGroupsClaim: '组声明',
+  oidcAdminGroups: '映射为管理员的组',
+  oidcBuilderGroups: '映射为搭建者的组',
+  oidcAdminRequired: '切换到单点登录时，至少要配置一个映射为管理员的组',
+  userCanChat: '使用者可以问数据',
+  userCanChatHint: '问数据可以查询任何已接入的数据源，目前没有按数据源的权限控制；查询结果中设了遮罩的列对使用者显示为已遮罩。使用者之间的问数据对话记录暂未隔离，彼此可以看到。默认关闭',
+  saved: '已保存身份设置',
+  users: '用户',
+  groups: '组',
+  createUser: '新建用户',
+  createGroup: '新建组',
+  username: '用户名',
+  usernameHint: '登录用的名字，建好后不能修改',
+  displayName: '显示名',
+  email: '邮箱',
+  role: '角色',
+  password: '密码',
+  passwordReset: '重设密码',
+  disabled: '已停用',
+  disable: '停用',
+  enable: '启用',
+  lastLogin: (t: string) => `最近登录：${t}`,
+  neverLogin: '从未登录',
+  sourceOidc: '单点登录同步',
+  syncedReadOnly: '从单点登录同步的组只读',
+  members: '成员',
+  membersHint: '每行一个用户名',
+  groupLabel: '显示名',
+  groupName: '组名',
+  removeGroup: (name: string) => `删除组「${name}」？`,
+  removeGroupBody: '应用里绑定到这个组的岗位和授权将失效。',
+  offNote: '当前关闭登录：用户和组仅在开启登录后生效',
+  adminOnly: '只有管理员可以管理身份',
+  audit: '审计',
+  auditHint: '管理类操作的留痕：登录方式、角色、组、授权、应用发布、端点、能力治理、版本退役',
+  auditEmpty: '还没有审计记录',
+  auditVerified: '已登录',
+  auditUnverified: '自报署名',
+  auditFilter: '全部对象',
+}
+
+export const NOTIFY_TEXT = {
+  tab: '通知',
+  title: '通知渠道',
+  hint: '待办打开、超时、动作结果未知等事件推送到这些地址。消息里只放标题、状态和链接，不放报告里的数字',
+  empty: '还没有通知渠道',
+  emptyBody: '添加群机器人或通用 Webhook 地址后，应用可以订阅待办和动作的事件。',
+  create: '添加渠道',
+  name: '名称',
+  url: '地址',
+  urlHint: '地址加密保存，之后只显示主机名',
+  secret: '签名密钥（可选）',
+  format: '格式',
+  formats: { generic: '通用 JSON', feishu: '飞书群机器人', wecom: '企业微信群机器人', dingtalk: '钉钉群机器人' } as Record<string, string>,
+  scope: '范围',
+  scopes: { global: '全局', app: '应用', user: '个人' } as Record<string, string>,
+  events: '订阅的事件',
+  eventLabel: {
+    'task.opened': '待办打开', 'task.escalated': '待办升级', 'task.expired': '待办超时', 'task.resolved': '待办处理完',
+    'action.unknown': '动作结果未知', 'action.failed': '动作失败', 'action.confirmed': '动作已生效',
+    'run.failed': '运行失败', 'run.finished': '运行结束',
+  } as Record<string, string>,
+  enabled: '启用',
+  signed: '已签名',
+  test: '发送测试消息',
+  testOk: '测试消息已发送',
+  saved: (name: string) => `已保存渠道「${name}」`,
+  removeTitle: (name: string) => `删除渠道「${name}」？`,
+  removeBody: '订阅了这个渠道的应用将不再收到通知。',
+  deliveries: '最近的投递',
+  deliveriesEmpty: '还没有投递记录',
+}
+
+/**
+ * 助手按需查看（look §2.6、L2）：过程里一次查看一行。
+ *
+ * 标题说看了什么（「查看了 4 张表」），副标题说在哪、怎么挑的（「库 B · 按需求挑选」）；挑选失败时直说「没挑出来，
+ * 已把表目录交给助手」，原因放展开区；系统代为查看写「按要修的 SQL 查看了 3 张表」。多次查看各一行
+ */
+export const LOOK_TEXT = {
+  /** 浮条：查看进行中 */
+  running: '正在查看表结构…',
+  phase: '正在查看表结构',
+  tables: (n: number) => `${formatNumber(n)} 张表`,
+  capabilities: (n: number) => `${formatNumber(n)} 个能力`,
+  versions: (n: number) => `${formatNumber(n)} 个工作流版本`,
+  title: (what: string) => `查看了 ${what}`,
+  /** 系统代为查看：发布前修复、升级证据按要修的 SQL 点名；应用润色先查看固定的版本 */
+  systemTables: (what: string) => `按要修的 SQL 查看了 ${what}`,
+  systemVersions: (what: string) => `按固定版本查看了 ${what}`,
+  system: (what: string) => `系统代为查看了 ${what}`,
+  index: '没挑出来，已把表目录交给助手',
+  indexEmpty: '按这个需求没有挑出相关的表，已把表目录交给助手',
+  failed: '查看未完成',
+  nothing: '没有找到要查看的对象',
+  howNamed: '点名查看',
+  howPicked: '按需求挑选',
+  howAll: '候选不多，全部查看',
+  need: (text: string) => `需求：${text}`,
+  named: (names: string[]) => `点名的 ${names.join('、')}`,
+  picked: (names: string[]) => `按需求挑出 ${names.join('、')}`,
+  joined: (names: string[]) => `为连接补上 ${names.join('、')}`,
+  missing: (where: string, names: string[]) => `没找到：${where}${where ? '的 ' : ''}${names.join('、')}`,
+  partial: (total: number, explored: number) => `共 ${formatNumber(total)} 张，只探查了 ${formatNumber(explored)} 张`,
+  reason: (text: string) => `原因：${text}`,
+  /** 应用润色时助手问回来的话：这一轮到此结束，回答就是下一轮 */
+  ask: '助手需要你确认',
+  askNext: '在下方输入框回答后，助手接着修改',
+}
+
+/** 人工节点的新配置（§3.7）：派给谁、会签方式、时限、超时处理、表单、关联键。叫法同服务端 engine/lint_process.py 的报错 */
+export const HUMAN_NODE_TEXT = {
+  assignee: '派给谁',
+  assigneeHint: '图里只写岗位名；岗位绑定到哪些人或组，在应用里设置。没有应用的运行派给任何人',
+  assigneeKind: {
+    '': '任何人', slot: '岗位', initiator: '发起人', expression: '按表达式', hook: '外部系统',
+  } as Record<string, string>,
+  slot: '岗位名',
+  slotPlaceholder: '例如 finance',
+  expression: '表达式',
+  expressionHint: '只能取输入和变量，结果须为用户名或组名',
+  correlation: '关联键',
+  correlationHint: '外部系统回调时按它找到这条待办，例如 {{ input.order_id }}',
+  policy: '会签方式',
+  policyKind: { any: '任一人处理即可', all: '全体同意才通过', quorum: '达到人数即通过' } as Record<string, string>,
+  policyHint: '全体同意和按人数只用于批准 / 驳回方式；任何一人驳回即否决，驳回人数超过余量也否决',
+  quorum: '需要同意的人数',
+  due: '时限',
+  dueHint: '从待办打开时算起，写 ISO 8601 时长：PT4H 是 4 小时，P2D 是 2 天',
+  duePlaceholder: '例如 PT4H',
+  onTimeout: '超时处理',
+  onTimeoutKind: { '': '不处理', remind: '提醒处理人', escalate: '升级给另一个岗位', reject: '按驳回处理' } as Record<string, string>,
+  onTimeoutHint: '没有「超时自动批准」这个选项',
+  remindEvery: '提醒间隔',
+  escalateTo: '升级给岗位',
+  form: '表单',
+  formHint: 'agentlab.form/1 表单：补充输入时让处理人填的字段',
+  formFrom: '表单来自',
+  formFromHint: '上游 Agent 拟的表单，例如 nodes.agent1.form。不合规时退回上面的静态表单',
+}
+
+/**
+ * 调用工具节点写外部系统（§3.8）。要不要先确认沿用节点的「审批策略」：写入能力默认发送前要人确认，只有审批策略是
+ * 「全部无需审批」、而且能力允许无人值守写入时才直接发送（服务端 engine/nodes/tools.py）
+ */
+export const TOOL_WRITE_TEXT = {
+  assignee: '确认派给谁',
+  assigneeHint: '只对写入能力生效：发送前出一张确认卡（遮罩后的发送内容和哈希），确认后内容变了就不发送。'
+    + '审批策略为「全部无需审批」、且能力允许无人值守写入时不出确认卡',
+  envHint: '正式运行写生产环境；探索运行写测试环境，端点没有测试环境时只演练、不发送',
+}
+
+/** 输入节点字段的类型（转成 agentlab.form/1 时用）。没写类型的按文本处理，老图照常运行 */
+export const INPUT_FIELD_TEXT = {
+  type: '类型',
+  types: { string: '文本', number: '数字', integer: '整数', boolean: '是 / 否', array: '多选' } as Record<string, string>,
+  format: '格式',
+  formats: { '': '不限', date: '日期', 'date-time': '日期时间', email: '邮箱', uri: '网址' } as Record<string, string>,
+  enum: '可选值',
+  enumHint: '每行一个；填写后变成下拉选择',
+}
+
+/** 工作流版本的退役与使用情况（A1、L4） */
+export const VERSION_USAGE_TEXT = {
+  usage: '使用情况',
+  apps: (n: number) => (n ? `被 ${formatNumber(n)} 个应用固定` : '没有应用固定这一版'),
+  effects: (n: number) => `生效记录 ${formatNumber(n)} 条`,
+  formalRuns: (n: number) => `正式运行 ${formatNumber(n)} 次`,
+  loadFailed: '无法读取使用情况',
+  retired: '已退役',
+  retiredBy: (who: string | null | undefined, at: string) => `${who ? `「${who}」于 ` : ''}${at} 退役`,
+  retire: '退役这一版',
+  retireTitle: (v: number) => `退役 v${v}？`,
+  retireBody: '退役后不能再从这一版发起正式运行；进行中的实例照常走完。固定这一版的应用会标「需升级」：入口不再发起新实例，视图保留最后一次的数据。',
+  retireAffected: (names: string[]) => `受影响的应用：${names.join('、')}`,
+  retireNote: '退役说明（可选）',
+  retireCurrent: '当前发布版不能退役，请先发布新版本',
+  retireAdmin: '只有管理员可以退役版本',
+  retireDraft: '这一版没有发布过',
+  retired_ok: (v: number) => `已退役 v${v}`,
+  makeApp: '做成应用',
+  makeAppHint: '从这一版确定性地派生一个应用草稿，之后在应用编辑中调整',
+  published: (v: number) => `已发布 v${v}`,
+  publishedNext: '可以从这一版做成应用：入口表单、待办、指标和报告按图确定性派生，之后再调整布局和文案',
+}
+
+/** 问数据回答上的「做成应用」（A8）：先从这次运行提取工作流，在画布上发布后再做成应用 */
+export const MAKE_APP_TEXT = {
+  button: '做成应用',
+  hint: '从这次回答提取工作流（只保留实际执行的步骤），在画布上发布后做成应用',
+  busy: '正在提取工作流…',
+  done: '已提取工作流。发布后，在发布成功的提示中点「做成应用」',
+  noRun: '这一轮没有运行记录，不能做成应用',
+}
+
+
+/**
+ * 应用编辑（搭建面，/apps/:appId/edit）：固定版本、页面、预览、检查、发布、岗位与授权、钩子、通知、助手。
+ *
+ * - 「固定版本」：应用固定了哪几个已发布的工作流版本。只能固定已发布且未退役的版本。
+ * - 升版要处置：新的应用版本把某个固定版本从 vN 升到 vM 时，必须选一种处置，写清后果。
+ * - 草稿只预览布局和派生结果，不发起运行；应用里的运行永远是固定版本的正式运行。
+ */
+export const APP_EDITOR_TEXT = {
+  title: '应用编辑',
+  newTitle: '新建应用',
+  loadFailed: '无法加载应用',
+  sections: {
+    pins: '固定版本', pages: '页面', preview: '预览', check: '检查', publish: '发布', access: '岗位与授权',
+    hooks: '钩子', notify: '通知',
+  } as Record<string, string>,
+  save: '保存草稿',
+  saved: '草稿已保存',
+  saving: '正在保存…',
+  unsaved: '有未保存的修改',
+  leaveBody: '离开应用编辑将丢失这些修改。',
+  savedAt: (t: string) => `草稿保存于 ${t}`,
+  open: '打开应用',
+  assistant: '助手',
+  assistantToggle: '显示或隐藏助手',
+  // ---- 新建
+  newIntro: '从一个已发布的工作流版本确定性地派生应用：入口表单、待办、指标、报告和表格按图生成，之后再调整布局和文案。',
+  pickWorkflow: '工作流',
+  pickVersion: '版本',
+  pickWorkflowFirst: '先选择工作流',
+  noPublished: '这个工作流还没有已发布且未退役的版本，请先在画布上发布',
+  appName: '应用名称',
+  derive: '派生并新建',
+  deriving: '正在派生…',
+  created: (name: string) => `已新建应用「${name}」`,
+  // ---- 固定版本
+  pinsHint: '应用只读这些版本的运行产物；正式运行按固定版本的哈希发起。升级固定版本要发布新的应用版本，并为每个升版的固定项选处置',
+  pinAdd: '添加固定版本',
+  pinAlias: '别名',
+  pinUse: '用途',
+  pinUses: { view: '视图', entry: '入口', process: '流程' } as Record<string, string>,
+  pinUseHint: '流程：发布时按流程规则检查（人工节点、写入动作）',
+  pinVersion: (v: number) => `v${v}`,
+  pinHash: (h: string) => `哈希 ${h.slice(0, 8)}`,
+  pinRetired: '已退役',
+  pinUpgrade: '改为版本',
+  pinRemove: (alias: string) => `移除固定版本「${alias}」`,
+  pinsEmpty: '还没有固定的版本',
+  rederive: '按这一版重新派生',
+  rederiveTitle: '按固定版本重新派生页面？',
+  rederiveBody: '入口、表单、视图和页面将换成派生的结果，当前草稿里的布局和文案修改会丢失。岗位绑定和授权不受影响。',
+  rederiveDone: '已按固定版本重新派生',
+  // ---- 页面
+  pagesHint: '页面由受信组件拼成。界面层不放逻辑：绑定只取已有的值，可见性表达式不允许算术',
+  pageAdd: '新增页面',
+  pageTitle: '页面标题',
+  pageRemove: (title: string) => `删除页面「${title}」`,
+  componentAdd: '添加组件',
+  componentAddTo: (where: string) => `添加到「${where}」`,
+  componentRoot: '页面顶层',
+  componentRemove: '删除组件',
+  componentUp: '上移',
+  componentDown: '下移',
+  componentUnknown: (type: string) => `组件目录里没有「${type}」`,
+  inspectorEmpty: '在左侧选择一个组件',
+  props: '属性',
+  bind: '绑定',
+  bindKind: '绑定种类',
+  bindNone: '不绑定',
+  bindView: '视图',
+  bindViewNone: '不指定视图',
+  bindKinds: {
+    metric: '指标', series: '趋势', cell: '单元格', query: '表格', report: '报告', input: '输入', run: '运行信息',
+    output: '成果字段', task: '待办', action: '动作',
+  } as Record<string, string>,
+  bindHint: {
+    metric: '写「节点.指标」，例如 kpi.gmv',
+    series: '写「节点.指标」；取同一来源最近几次封存运行',
+    cell: '取数节点、行号、列名',
+    query: '取数节点，可选第几次执行',
+    report: '报告撰写节点',
+    input: '入口字段名',
+    run: '运行状态、出具档位或结束时间',
+    output: '只能绑定逐字取自报告的字段，或不含数字的文本',
+    task: '人工节点',
+    action: '写入的调用工具节点',
+  } as Record<string, string>,
+  bindLast: '最近几次',
+  bindNode: '节点',
+  bindRow: '行',
+  bindCol: '列',
+  bindExec: '第几次执行',
+  runFields: { status: '运行状态', tier: '出具档位', finished_at: '结束时间' } as Record<string, string>,
+  visible: '可见性',
+  visibleHint: '表达式，只能比较、布尔运算和取值，不允许算术。根名字：run、input、metric、instance、task、user、view',
+  visiblePlaceholder: "run.tier != 'formal'",
+  scope: '表达式所指的视图',
+  views: '视图来源',
+  viewsHint: '最近封存：固定版本最近一次封存的正式运行；按需：点刷新才发起；本实例：实例自己的那次运行',
+  viewKinds: { latest_sealed: '最近封存', on_demand: '按需', instance: '本实例' } as Record<string, string>,
+  viewAdd: '新增视图',
+  viewPin: '固定版本',
+  viewFrom: '取自',
+  viewTtl: '缓存时效（秒）',
+  viewAuto: '打开页面时自动发起（仅在没有缓存时）',
+  // ---- 预览
+  previewHint: '按草稿解析布局；不发起运行，视图取固定版本已有的封存运行',
+  previewSaveFirst: '预览的是已保存的草稿，有未保存的修改时先保存',
+  previewReload: '重新解析',
+  previewPage: '页面',
+  previewFailed: '无法预览这一页',
+  // ---- 检查
+  checkRun: '运行检查',
+  checkHint: '和发布同一套检查：格式、组件、绑定、表达式、固定版本、岗位、入口……点一条定位到出处',
+  checkPassed: '没有发现问题',
+  checkCounts: (errors: number, warnings: number) =>
+    [errors ? `${errors} 处错误` : '', warnings ? `${warnings} 处提醒` : ''].filter(Boolean).join('、'),
+  checkLevel: (level: string | null) => (level === 'governed' ? '可发布为受管级' : level === 'published' ? '可发布为已发布级' : ''),
+  locate: '定位',
+  // ---- 发布
+  publishHint: '发布生成一个不可变的应用版本：页面、固定版本和岗位绑定一起定下。改授权和组成员不需要发新版本',
+  publishNote: '版本说明（可选）',
+  publish: '发布',
+  publishing: '正在发布…',
+  published: (v: number) => `已发布应用版本 v${v}`,
+  publishBlocked: '发布未通过检查，请先处理下面的问题',
+  dispositionTitle: '固定版本升了版，请为每一项选处置',
+  dispositionIntro: '口径升版是必须处置的事件。趋势类组件按这里的选择来画，发布后记进应用版本',
+  dispositionRow: (alias: string, from: number, to: number) => `「${alias}」v${from} → v${to}`,
+  dispositions: {
+    recompute: '按新口径重算',
+    dual: '两版并列',
+    incomparable: '前后不可比',
+  } as Record<string, string>,
+  dispositionHint: {
+    recompute: '趋势只取新版本；可以按历次触发的输入补算历史，补算的运行来源记为「按新口径补算」，会产生运行费用',
+    dual: '趋势同时画旧版和新版两条线，各自来自自己的封存运行，不混算',
+    incomparable: '趋势在升版处断开并标注，前后不放在一起比较',
+  } as Record<string, string>,
+  dispositionPick: '请为每个升版的固定版本选择处置',
+  publishWithDispositions: '按所选处置发布',
+  versions: '应用版本',
+  versionsEmpty: '还没有发布过',
+  versionRow: (v: number, who: string | null, at: string) => `v${v} · ${who ? `「${who}」` : '未署名'} · ${at}`,
+  // ---- 岗位与授权
+  slots: '岗位',
+  slotsHint: '图里人工节点写的岗位名，在这里绑定到人或组。人员变动只改组成员，不需要发新版本',
+  slotAdd: '新增岗位',
+  slotName: '岗位名',
+  slotLabel: '显示名',
+  slotUnbound: '未绑定：发布检查会拦下流程应用',
+  slotRemove: (name: string) => `删除岗位「${name}」`,
+  grants: '授权',
+  grantsHint: '谁能使用、查看全部实例、管理这个应用。授权即时生效，不需要发新版本',
+  grantsSave: '保存授权',
+  grantsSaved: '授权已保存',
+  grantsOff: '未开启登录：授权在开启登录后生效',
+  // ---- 钩子
+  hooksHint: '外部系统经签名的入站钩子触发：发起按入口发起实例，回调按关联键解决等外部系统的待办。签名密钥由服务端保管',
+  hookAdd: '新增钩子',
+  hookName: '名称',
+  hookKind: '种类',
+  hookKinds: { start: '发起实例', signal: '回调' } as Record<string, string>,
+  hookEntry: '入口',
+  hookRemove: (name: string) => `删除钩子「${name}」`,
+  hooksEmpty: '还没有钩子',
+  // ---- 通知
+  notifyHint: '订阅的事件推送到通知渠道。渠道在「设置 → 通知」中管理',
+  notifyAdd: '新增订阅',
+  notifyChannel: '渠道',
+  notifyChannelMissing: '渠道已不存在',
+  notifyEmpty: '还没有订阅',
+  notifyRemove: '删除订阅',
+  // ---- 助手
+  assistantPlaceholder: '描述想怎么调整，例如：首页先看指标再看报告',
+  assistantHint: '助手只调整布局、文案和控件；岗位绑定只能由人来做',
+  assistantEmpty: '让助手调整这个应用的页面：先查看固定的版本，再改布局和文案',
+  assistantApplied: '助手的修改已落到草稿上，保存后生效',
+  assistantStop: '停止',
 }
 
 // 应用平台使用面的文案（FE-5 维护）。调用方照旧从 lib/terms 导入

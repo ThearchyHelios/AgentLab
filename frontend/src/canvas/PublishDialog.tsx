@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import {
-  AlertTriangle, ArrowRight, Check, CheckCircle2, CornerDownRight, PenLine, RotateCw, ShieldCheck, Sparkles, Wand2,
+  AlertTriangle, ArrowRight, Check, CheckCircle2, CornerDownRight, LayoutGrid, PenLine, RotateCw, ShieldCheck, Sparkles, Wand2,
   XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
@@ -13,8 +13,9 @@ import { useCatalog } from '../store/catalog'
 import { Modal, Spinner, toast, useRadioGroup } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import {
-  CATALOG_UI_TEXT as UT, PROVIDER_REF_TEXT, PUBLISH_FIX_TEXT as T, WORKFLOW_STATUS_HINT, WORKFLOW_STATUS_LABEL,
+  CATALOG_UI_TEXT as UT, PROVIDER_REF_TEXT, PUBLISH_FIX_TEXT as T, VERSION_USAGE_TEXT, WORKFLOW_STATUS_HINT, WORKFLOW_STATUS_LABEL,
 } from '../lib/terms'
+import { VersionUsageLine, useVersionUsage } from './versionUsage'
 import { isSqlCheckCode, sqlRuleLabel } from '../lib/sqlcheck'
 import { SqlLevelBadge } from '../run/SqlChecks'
 import { setLocalActor, useLocalActor } from '../lib/actor'
@@ -65,6 +66,11 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
   const published = workflow.published_version
   const downgrade = workflow.status === 'governed' && level === 'published'
   const pf = usePreflight(workflow.id, level, { onRechecked: () => setGate(null) })
+  /** 发布成功：弹窗不立刻关，给「做成应用」的入口（A8）。关掉时才算完成（onDone） */
+  const [done, setDone] = useState<number | null>(null)
+  const navigate = useNavigate()
+  // 当前已发布的那一版被哪些应用固定、有几条生效记录（L4）：发布新版之后它们仍然固定在旧版上，发布前先知道
+  const usage = useVersionUsage(workflow.id, published ?? null)
 
   // 换了等级：上一档被拦下的那张单子不再适用
   useEffect(() => { setGate(null) }, [level])
@@ -100,7 +106,7 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
         // 版本对不上（这期间别处又存过）才整张重载，画布这时没有未保存的改动（有就发不了）
         if (fresh.version === useStudio.getState().workflow?.version) useStudio.setState({ workflow: fresh })
         else load(fresh)
-        onDone()
+        setDone(res.version ?? fresh.published_version ?? workflow.version)
       } else {
         setGate(normalizeCheck({ issues: res.issues }, level).issues)
         toast.warn('发布未通过门禁检查。请查看下方问题清单，点击条目可定位到对应节点')
@@ -115,6 +121,27 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
   // 预览摆着、正在存、存失败了：这时发布的是还没修的那一版，先让人把修复这件事办完。
   // 存失败（或被锁没存上）时预览可能已经收起（换过等级），说「先应用或放弃预览」就不对了
   const held = unsavedFix(pf) ? T.unsaved : pf.pending ? T.pendingPreview : dirty ? T.unsaved : ''
+
+  if (done != null) {
+    return (
+      <Modal open onClose={onDone} title={VERSION_USAGE_TEXT.published(done)} width={480}
+             footer={<>
+               <button className="btn" onClick={onDone} data-autofocus="">完成</button>
+               <button className="btn btn-primary" data-publish-make-app=""
+                       onClick={() => {
+                         onDone()
+                         navigate(`/apps/new/edit?${new URLSearchParams({ workflow: workflow.id, version: String(done) })}`)
+                       }}>
+                 <LayoutGrid size={12} aria-hidden /> {VERSION_USAGE_TEXT.makeApp}
+               </button>
+             </>}>
+        <div className="flex items-start gap-2 text-xs leading-relaxed" data-publish-done={done}>
+          <CheckCircle2 size={14} className="mt-0.5 shrink-0" style={{ color: 'var(--ok)' }} aria-hidden />
+          <span>{VERSION_USAGE_TEXT.publishedNext}</span>
+        </div>
+      </Modal>
+    )
+  }
 
   return (
     <Modal open onClose={onClose} title={`发布「${workflow.name}」v${workflow.version}`} width={560}
@@ -187,6 +214,14 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
             )}
           </dd>
         </div>
+        {published != null && usage && (
+          <div className="flex gap-2" data-publish-usage="">
+            <dt className="w-14 shrink-0 text-faint">{VERSION_USAGE_TEXT.usage}</dt>
+            <dd className="min-w-0 flex-1">
+              <VersionUsageLine usage={usage} />
+            </dd>
+          </div>
+        )}
         <div className="flex items-start gap-2">
           <dt className="w-14 shrink-0 pt-px text-faint">署名</dt>
           <dd className="min-w-0 flex-1">

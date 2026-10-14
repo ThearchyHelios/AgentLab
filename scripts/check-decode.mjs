@@ -660,91 +660,110 @@ await section('从 SQL 认表名', async () => {
   check('不是查询就不硬认', g('这不是 SQL') === null)
 })
 
-await section('Copilot：这一轮参考了哪些表（context 操作）', async () => {
-  // 大库先按需求挑表，挑中的表给模型全部字段。生成的 SQL 用错了表时，先得知道模型当时看到的是哪几张
+await section('Copilot：助手按需查看（look 事件）', async () => {
+  // look §2.6：一次查看一行。标题说看了什么，副标题说在哪、怎么来的；挑表失败直说交回了表目录
   const steps = mod.decodeCopilot(synthetic.COPILOT_CONTEXT, { context: 'canvas' })
-  const row = steps.find((s) => s.code === 'copilot_context')
-  check('一行说清参考了几张表', row?.title === '参考了 5 张表', row?.title)
-  check('展开按数据源分组列出表名', !!row?.detail?.includes('「scenic」按需求从 51 张表中挑出 3 张：visits、channels、channel_visits')
-    && row.detail.includes('「shop」全部 2 张表：orders、customers'), row?.detail)
-  check('挑表的耗时挂在行尾', row?.ms === 3420 && !!row?.meta, `${row?.ms} ${row?.meta}`)
+  const row = steps.find((s) => s.code === 'copilot_look')
+  check('标题说查看了几张表（点名的、挑出的、补上的一起数）', row?.title === '查看了 5 张表', row?.title)
+  check('副标题写库名和怎么来的', row?.sub === 'scenic、shop · 按需求挑选、点名查看', row?.sub)
+  check('展开写需求、每个库一行、没找到的表', !!row?.detail?.includes('需求：按渠道统计上月的入园人次')
+    && row.detail.includes('「scenic」：按需求挑出 visits、channels；为连接补上 channel_visits')
+    && row.detail.includes('「shop」：点名的 orders、customers') && row.detail.includes('没找到：「shop」的 refund_detail'), row?.detail)
+  check('查看用时挂在行尾', row?.ms === 3420 && !!row?.meta, `${row?.ms} ${row?.meta}`)
   check('是看表结构那一类、标着规划阶段', row?.kind === 'schema' && row?.stage === 'plan' && row?.status === 'done')
-  check('排在思考之前，心跳仍然只更新那一条阶段行',
-    steps.indexOf(row) < steps.findIndex((s) => s.kind === 'think')
-    && steps.filter((s) => s.kind === 'lifecycle' && s.id.startsWith('hb-')).length === 1,
+  check('「正在查看」的心跳只更新那一条阶段行，不另起一行',
+    steps.filter((s) => s.kind === 'lifecycle' && s.id.startsWith('hb-')).length === 1,
     steps.map((s) => `${s.kind}:${s.title}`).join(' | '))
-  check('收尾后没有还在转的行', !steps.some((s) => s.status === 'running'),
-    steps.filter((s) => s.status === 'running').map((s) => s.title).join(','))
+  check('心跳阶段 looking 有说法', mod.COPILOT_PHASE_TEXT.looking === '正在查看表结构', mod.COPILOT_PHASE_TEXT.looking)
+  check('收尾后没有还在转的行', !steps.some((s) => s.status === 'running'))
   check('结局不受影响', mod.copilotOutcome(synthetic.COPILOT_CONTEXT).kind === 'built')
+  check('没有数据目录的库：下一步提示起草目录，入口直达那个源的目录页',
+    row?.next === '「shop」还没有数据目录，起草后挑表和 SQL 检查会更准' && row?.fix === 'catalog'
+    && row?.fixTo === '/data/catalog/src-shop', JSON.stringify({ next: row?.next, fixTo: row?.fixTo }))
 
-  const fb = mod.decodeCopilot(synthetic.COPILOT_CONTEXT_FALLBACK, { context: 'chat' }).find((s) => s.code === 'copilot_context')
-  check('挑表失败：标题直说只给了表名', fb?.title === '未能按需求挑选，已提供全部表名', fb?.title)
-  check('挑表失败：原因和库的规模放在展开区', !!fb?.detail?.includes('原因：挑选数据表超过 20 秒未完成')
-    && fb.detail.includes('「scenic」共 51 张表'), fb?.detail)
-  check('挑表失败也说等了多久', fb?.ms === 20004, String(fb?.ms))
-  // 真实运行里数据源一张目录都没有，挑表、SQL 检查都用不上目录，用户也不知道该先去起草
-  check('没有数据目录的大库：下一步提示起草目录，入口直达那个源的目录页',
-    fb?.next === '这个数据源还没有数据目录，起草后挑表和 SQL 检查会更准' && fb?.fix === 'catalog'
-    && fb?.fixTo === '/data/catalog/src-scenic', JSON.stringify({ next: fb?.next, fix: fb?.fix, fixTo: fb?.fixTo }))
-  check('有目录的大库、没有目录的小库：不提示', !row?.next && !row?.fix && !row?.fixTo, JSON.stringify({ next: row?.next }))
-  const bare = mod.copilotContext({ op: 'context', sources: [
-    { source: 'a', source_id: 'id-a', tables: ['x'], selected_by: 'model', total: 60, catalog_tables: 0 },
-    { source: 'b', source_id: 'id-b', tables: ['y'], selected_by: 'all', total: 3, catalog_tables: 0 },
-    { source: 'c', source_id: 'id c', tables: [], selected_by: 'fallback', total: 90, catalog_tables: 0, reason: 'r' }] })
-  check('几个数据源：点名没有目录的大库，入口去第一个', bare?.next === '「a」「c」还没有数据目录，起草后挑表和 SQL 检查会更准'
-    && bare?.fixTo === '/data/catalog/id-a', JSON.stringify({ next: bare?.next, fixTo: bare?.fixTo }))
-  const partly = mod.copilotContext({ op: 'context', sources: [
-    { source: 'a', source_id: 'id-a', tables: ['x'], selected_by: 'model', total: 60, catalog_tables: 3 }] })
-  check('起草过一部分目录：不再提示', !partly?.next, partly?.next)
-  const old = mod.copilotContext({ op: 'context', sources: [{ source: 'a', tables: ['x'], selected_by: 'model', total: 60 }] })
-  check('老服务端不给目录表数：不猜，不提示', !old?.next && !old?.fixTo, old?.next)
-  const noId = mod.copilotContext({ op: 'context', sources: [
-    { source: 'a', tables: [], selected_by: 'fallback', total: 60, catalog_tables: 0 }] })
-  check('没给数据源 id：照样提示，只是不给入口', !!noId?.next && !noId?.fixTo, JSON.stringify(noId))
-  const step = mod.decodeCopilot([{ op: 'context', sources: [
-    { source: 'a', tables: [], selected_by: 'fallback', total: 60, catalog_tables: 0 }] }]).find((s) => s.code === 'copilot_context')
-  check('没有入口时不带 fix：不画一个点了没处去的按钮', !!step?.next && !step?.fix, JSON.stringify(step))
+  const fb = mod.decodeCopilot(synthetic.COPILOT_CONTEXT_FALLBACK, { context: 'chat' }).filter((s) => s.code === 'copilot_look')
+  check('多次查看各一行，按先后排', fb.length === 2, fb.map((s) => s.title).join(' | '))
+  check('挑表失败：标题直说没挑出来、已交回表目录', fb[0]?.title === '没挑出来，已把表目录交给助手' && fb[0]?.level === 'warn',
+    fb[0]?.title)
+  check('挑表失败：原因放在展开区', !!fb[0]?.detail?.includes('原因：挑选数据表超过 20 秒未完成'), fb[0]?.detail)
+  check('紧跟着的点名查看说点名', fb[1]?.title === '查看了 2 张表' && fb[1]?.sub === 'scenic · 点名查看', `${fb[1]?.title} / ${fb[1]?.sub}`)
 
-  const seeded = mod.copilotContext({ op: 'context', sources: [
-    { source: 'scenic', tables: ['stores'], selected_by: 'fallback', total: 51, reason: '模型未挑出任何表' }] })
-  check('没挑成但现有工作流的表带着字段：标题说几张带字段、副标题说没挑成和只给了表名的张数',
-    seeded?.title === '参考了 1 张表的字段' && seeded?.sub === '未能按需求挑选，另有 50 张表只提供了表名'
-    && seeded.detail.includes('现有工作流用到的 1 张表附带全部字段：stores'), JSON.stringify(seeded))
-  const mixed = mod.copilotContext({ op: 'context', sources: [
-    { source: 'a', tables: ['x'], selected_by: 'all', total: 1 },
-    { source: 'b', tables: [], selected_by: 'fallback', total: 80, reason: 'r' }] })
-  check('只有一个库没挑成：副标题点名是哪个库，并写只提供了表名的张数', mixed?.title === '参考了 1 张表的字段'
-    && mixed?.sub === '「b」未能按需求挑选，另有 80 张表只提供了表名', `${mixed?.title} / ${mixed?.sub}`)
-  const none = mod.copilotContext({ op: 'context', sources: [
-    { source: 'a', tables: ['x'], selected_by: 'model', total: 60 },
-    { source: 'b', tables: [], selected_by: 'model', total: 70 }] })
-  check('挑表成功但某个库一张没挑中：说清只给了表名', !!none?.detail.includes('「b」共 70 张表，未挑中与需求相关的表，已提供全部表名')
-    && none.title === '参考了 1 张表的字段' && none.sub === '另有 70 张表只提供了表名', `${none?.title} / ${none?.sub} / ${none?.detail}`)
-  // R2 走查（B14）：几个小库全给、点名的大库按需求挑、另一个大库没挑成。展开后挑表的库排在最前面，
-  // 两个数分开说：26 张带字段，206 张只给了表名
-  const r2 = mod.copilotContext({ op: 'context', sources: [
-    { source: 'small_a', tables: Array.from({ length: 12 }, (_, i) => `a${i}`), selected_by: 'all', total: 12 },
-    { source: 'small_b', tables: Array.from({ length: 11 }, (_, i) => `b${i}`), selected_by: 'all', total: 11 },
-    { source: 'big', tables: [], selected_by: 'fallback', total: 206, reason: '超时' },
-    { source: 'named', tables: ['visits', 'channels', 'parks'], selected_by: 'model', total: 51 }] })
-  check('展开后按需求挑表的库排在第一行，没挑成的排在最后', r2?.detail.split('\n')[0].startsWith('「named」按需求从 51 张表中挑出 3 张')
-    && r2.detail.split('\n')[3].startsWith('「big」'), r2?.detail.split('\n').map((l) => l.slice(0, 12)).join(' | '))
-  check('两个数分开说：带字段的 26 张、只提供了表名的 206 张', r2?.title === '参考了 26 张表的字段'
-    && r2.sub === '「big」未能按需求挑选，另有 206 张表只提供了表名', `${r2?.title} / ${r2?.sub}`)
-  // 探查结构截断了（每个数据源最多取 200 张表）：total 是数据库里的总数，explored 是探查到的
+  const sys = mod.decodeCopilot(synthetic.COPILOT_LOOK_SYSTEM, { context: 'canvas' }).find((s) => s.code === 'copilot_look')
+  check('系统代为查看：按要修的 SQL 查看了几张表', sys?.title === '按要修的 SQL 查看了 3 张表', sys?.title)
+
+  const app = mod.decodeCopilot(synthetic.COPILOT_APP_ASK, { context: 'app' })
+  check('应用润色：系统按固定版本查看工作流版本', app.some((s) => s.title === '按固定版本查看了 1 个工作流版本'),
+    app.map((s) => s.title).join(' | '))
+  check('应用润色：模型查看能力，没找到的写出来', app.some((s) => s.title === '查看了 1 个能力' && s.detail?.includes('没找到：erp_refund')))
+  check('应用操作成行', app.some((s) => s.code === 'app_op' && s.title === '添加了组件「销售额」'))
+  const ask = app.find((s) => s.code === 'copilot_ask')
+  check('ask 结束这一轮：问题在展开区、下一步说回答', ask?.detail === '报告放在指标下面还是单独一页？' && !!ask?.next, JSON.stringify(ask))
+
+  check('查看记录原样存进 meta.looks', mod.looksOf(synthetic.COPILOT_CONTEXT_FALLBACK).length === 2
+    && mod.looksOf(synthetic.COPILOT_CONTEXT_FALLBACK)[0].objects[0].kind === 'table')
+  check('旧写法 sources[] 当作表类型读', mod.lookEventOf({ op: 'look', sources: [{ source: 'a', named: ['x'], missing: [] }] })
+    ?.objects[0]?.kind === 'table')
+  check('形状不对不出行、不报错', mod.decodeCopilot([{ op: 'look' }, { op: 'look', objects: 'x' }]).length === 0)
+  check('认不出的操作照旧忽略', mod.decodeCopilot([{ op: 'something_new', x: 1 }]).length === 0)
+  // 三条旧说法删掉了（look §2.6），界面上哪里都不该再出现
+  const all = [...steps, ...fb, ...mod.decodeCopilot(synthetic.COPILOT_CONTEXT_LEGACY)].map((s) => `${s.title}${s.sub ?? ''}${s.detail ?? ''}`).join('\n')
+  check('旧文案不再出现', !/参考了 \d+ 张表的字段|只提供了表名|未能按需求挑选/.test(all))
+})
+
+await section('Copilot：老服务端的 context 操作照 look 的说法显示', async () => {
+  const steps = mod.decodeCopilot(synthetic.COPILOT_CONTEXT_LEGACY, { context: 'canvas' })
+  const row = steps.find((s) => s.code === 'copilot_context')
+  check('一行说查看了几张表', row?.title === '查看了 5 张表', row?.title)
+  check('小库整库给了的写「全部查看」', !!row?.sub?.includes('候选不多，全部查看'), row?.sub)
+  const fb = mod.copilotContext({ op: 'context', sources: [
+    { source: 'a', source_id: 'id-a', tables: [], selected_by: 'fallback', total: 60, catalog_tables: 0, reason: '超时' }] })
+  check('挑表失败：同 look 的说法', fb?.title === '没挑出来，已把表目录交给助手' && !!fb?.detail?.includes('原因：超时'), JSON.stringify(fb))
   const partial = mod.copilotContext({ op: 'context', sources: [
-    { source: 'wide', tables: ['t001', 't002'], selected_by: 'model', total: 205, explored: 200 },
-    { source: 'wide2', tables: [], selected_by: 'fallback', total: 260, explored: 200, reason: 'r' }] })
-  check('截断了的库写「共 N 张，只探查了 200 张」', !!partial?.detail.includes('「wide」共 205 张，只探查了 200 张，按需求挑出 2 张：t001、t002')
-    && partial.detail.includes('「wide2」共 260 张，只探查了 200 张，未能按需求挑选'), partial?.detail)
-  const whole = mod.copilotContext({ op: 'context', sources: [
-    { source: 'a', tables: ['x'], selected_by: 'model', total: 60, explored: 60 }] })
-  check('探查到的和总数一样：照旧写「从 N 张表中挑出」', !!whole?.detail.includes('「a」按需求从 60 张表中挑出 1 张') && !whole.detail.includes('只探查了'),
-    whole?.detail)
+    { source: 'wide', tables: ['t001', 't002'], selected_by: 'model', total: 205, explored: 200 }] })
+  check('探查截断了的库写「共 N 张，只探查了 200 张」', !!partial?.detail?.includes('共 205 张，只探查了 200 张'), partial?.detail)
   check('形状不对不出行、不报错', mod.decodeCopilot([
     { op: 'context' }, { op: 'context', sources: 'x' }, { op: 'context', sources: [null, 3, { tables: ['t'] }] },
   ]).length === 0)
-  check('认不出的操作照旧忽略', mod.decodeCopilot([{ op: 'something_new', x: 1 }]).length === 0)
+})
+
+await section('运行来源、待办、动作（run.origin、task.*、action.*）', async () => {
+  const ev = (seq, type, data, node_id = null) => ({ seq, type, data, node_id, ts: 1000 + seq })
+  const steps = mod.decodeRun([
+    ev(1, 'run.origin', { kind: 'app_entry', app_id: 'a1', app_name: '报销审批', app_version: 3, entry: 'apply', actor: '张三', actor_verified: true }),
+    ev(2, 'run.started', { nodes: 3 }),
+    ev(3, 'node.started', { label: '财务审批', node_type: 'human' }, 'h'),
+    ev(4, 'human.requested', { payload: { title: '财务审批', node_id: 'h' } }, 'h'),
+    // 事件数据的形状同服务端 process/tasks.py、process/actions.py 记下的
+    ev(5, 'task.opened', { title: '财务审批', kind: 'approve', policy: { kind: 'all' }, due_at: '2026-10-15T10:00:00+00:00',
+      assignees: [{ kind: 'group', name: 'finance' }, { kind: 'user', name: '李四' }] }, 'h'),
+    ev(6, 'task.responded', { actor: '李四', verified: false, decision: 'approve', index: 1, of: 2 }, 'h'),
+    ev(7, 'task.escalated', { slot: 'director', level: 1, to: [{ kind: 'user', name: '王五' }] }, 'h'),
+    ev(8, 'task.resolved', { decision: 'reject', actor: '王五', signoffs: [{ by: '李四', decision: 'approve' }, { by: '王五', decision: 'reject', note: '金额不对' }] }, 'h'),
+    ev(9, 'action.prepared', { capability: 'erp_pay', environment: 'prod', payload_hash: 'abcdef1234567890', preview: { amount: '***' }, attempt: 1 }, 't'),
+    ev(10, 'action.unknown', { capability: 'erp_pay', environment: 'prod', lookup: false, message: '写入外部系统的结果未知，等待人工核实' }, 't'),
+    ev(11, 'action.reconciled', { capability: 'erp_pay', how: 'manual', outcome: 'confirmed', actor: '张三', external_id: 'ERP-9' }, 't'),
+    ev(12, 'action.simulated', { capability: 'erp_pay', message: '演练' }, 't'),
+  ])
+  const all = flatten(steps)
+  const by = (code) => all.find((s) => s.code === code)
+  check('来源：一行写来源，副标题写应用、入口、发起人', by('run_origin')?.title === '来源：应用入口'
+    && by('run_origin')?.sub === '应用「报销审批」 v3 · 入口「apply」 · 已登录用户「张三」', JSON.stringify(by('run_origin')))
+  check('待办打开：派给谁、会签方式', by('task_opened')?.sub === '派给 组「finance」、李四 · 全体同意才通过', by('task_opened')?.sub)
+  check('待办回复：第几人 / 共几人', by('task_responded')?.title === '李四 同意（第 1 / 2 人）', by('task_responded')?.title)
+  check('待办升级：写升级给哪个岗位、加派给谁', by('task_escalated')?.level === 'warn'
+    && by('task_escalated')?.title === '超过时限，已升级给「director」' && by('task_escalated')?.sub === '派给 王五', JSON.stringify(by('task_escalated')))
+  check('待办处理完：会签明细在展开区', by('task_resolved')?.title === '待办已处理：驳回'
+    && !!by('task_resolved')?.detail?.includes('王五：驳回（金额不对）'), JSON.stringify(by('task_resolved')))
+  check('待办挂在中断所在的节点下', all.find((s) => s.nodeId === 'h' && s.kind === 'node')?.children?.some((c) => c.code === 'task_opened'))
+  check('动作准备：副标题写环境和哈希前 8 位，展开是遮罩后的预览',
+    by('action_prepared')?.sub === '生产环境 · 内容哈希 abcdef12' && !!by('action_prepared')?.detail?.includes('***'), JSON.stringify(by('action_prepared')))
+  check('结果未知：等待态、写明不会自动重发', by('action_unknown')?.status === 'waiting' && !!by('action_unknown')?.next?.includes('不会自动重发'),
+    JSON.stringify(by('action_unknown')))
+  check('核实：谁核实的、已生效、外部单号', by('action_reconciled')?.title === '「erp_pay」的结果已核实（张三）'
+    && !!by('action_reconciled')?.detail?.includes('外部单号：ERP-9'), JSON.stringify(by('action_reconciled')))
+  check('演练：照实说没有发送', by('action_simulated')?.title === '演练：未向「erp_pay」发送')
+  check('老运行没有来源：不出这一行', !flatten(mod.decodeRun([ev(1, 'run.started', { nodes: 1 })])).some((s) => s.code === 'run_origin'))
+  check('新事件不再落成「未识别的事件」', !all.some((s) => s.title === '未识别的事件'))
 })
 
 await section('Copilot：建议更新数据目录（catalog_patch 操作）', async () => {

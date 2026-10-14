@@ -232,6 +232,10 @@ export const api = {
     /** 某个版本的完整快照（含 graph）。正式运行的输入字段要从已发布版本取，不能取画布 */
     version: (id: string, v: number) => get<WorkflowVersion>(`/workflows/${id}/versions/${v}`),
     restore: (id: string, v: number) => post<Workflow>(`/workflows/${id}/versions/${v}/restore`),
+    /** 退役一个已发布的版本（A1）：当前发布版 409；返回受影响的应用。只有管理员（关登录时所有人） */
+    retire: (id: string, v: number, note?: string) =>
+      post<{ retired: boolean; affected_apps: { app_id: string; name: string; app_version: number }[] }>(
+        `/workflows/${id}/versions/${v}/retire`, { note: note ?? null }),
     publish: (id: string, level: 'published' | 'governed', version?: number) =>
       post<{ ok: boolean; level?: string; version?: number; issues: any[] }>(
         `/workflows/${id}/publish`, { level, version }),
@@ -513,6 +517,8 @@ export const api = {
     list: (params?: {
       workflow_id?: string; status?: RunStatus | RunStatus[] | string; run_class?: 'formal' | 'exploratory'
       q?: string; limit?: number; before?: string
+      /** 按运行来源筛（X3）；none 是来源未记录的老运行 */
+      origin_kind?: string
     }) => get<Run[]>(`/runs${qs(params)}`),
     get: (id: string) => get<Run>(`/runs/${id}`),
     /** 这次运行实际跑的那张图（运行时的快照），不是工作流现在的样子 */
@@ -522,6 +528,8 @@ export const api = {
       workflow_id?: string; graph?: GraphSpec; input?: Record<string, any>
       memory_scope?: string; collection?: string
       run_class?: 'formal' | 'exploratory'; version?: number
+      /** 运行来源（X3）：客户端只能声明 chat、canvas、launcher、api（不传按 api 记），其余由服务端写 */
+      origin?: 'chat' | 'canvas' | 'launcher' | 'api'
     }) => post<Run>('/runs', body),
     artifacts: (id: string) => get<any[]>(`/runs/${id}/artifacts`),
     /** 从失败的节点接着跑。graph 只能带改过配置的同一张图，结构必须一致 */
@@ -813,8 +821,9 @@ export const api = {
       }>('/copilot/generate', body),
     explain: (graph: GraphSpec) => post<{ explanation: string }>('/copilot/explain', { graph }),
     layout: (graph: GraphSpec) => post<GraphSpec>('/copilot/layout', { graph }),
-    fromRun: (runId: string, name?: string) =>
-      post<any>('/copilot/from-run', { run_id: runId, name }),
+    /** from：问数据回答上点「做成应用」时带上这次运行出自哪段对话的哪一轮，记进新工作流的来源 */
+    fromRun: (runId: string, name?: string, from?: { conversation_id?: string | null; turn_id?: string | null }) =>
+      post<any>('/copilot/from-run', { run_id: runId, name, ...(from ?? {}) }),
     getModel: () => get<CopilotModel>('/copilot/model'),
     setModel: (body: { provider?: string | null; model?: string | null }) =>
       put<CopilotModel>('/copilot/model', body),

@@ -24,8 +24,9 @@ import { hasPendingApproval } from '../../store/catalog'
  */
 export type RunsTab = 'all' | 'approvals' | 'running' | 'failed'
 export const RUNS_TABS: readonly RunsTab[] = ['all', 'approvals', 'running', 'failed']
+// approvals 这个键留着：导航徽标、老链接都指向 ?tab=approvals。页签列的是待办（审批、补充输入、动作确认、核实）
 export const TAB_LABEL: Record<RunsTab, string> = {
-  all: '全部', approvals: '待审批', running: '运行中', failed: '失败',
+  all: '全部', approvals: '待办', running: '运行中', failed: '失败',
 }
 /** 这两个页签固定的状态范围（显示码） */
 export const TAB_CODES: Record<'running' | 'failed', StatusCode[]> = {
@@ -296,8 +297,9 @@ export function cancelReason(error: string | null | undefined): string | null {
  * stream：时间线（逐步的文字）；trace：航迹（按时间摊开、可回放）；evidence：证据（报告、常驻面板、
  * 审计表）；artifacts：工件
  */
-export type DetailView = 'stream' | 'trace' | 'evidence' | 'artifacts'
-export const DETAIL_VIEWS: readonly DetailView[] = ['stream', 'trace', 'evidence', 'artifacts']
+/** effects：生效记录（这次运行对外部系统的写入，§3.8） */
+export type DetailView = 'stream' | 'trace' | 'evidence' | 'artifacts' | 'effects'
+export const DETAIL_VIEWS: readonly DetailView[] = ['stream', 'trace', 'evidence', 'artifacts', 'effects']
 export const asView = (v: string | null | undefined): DetailView =>
   (DETAIL_VIEWS as readonly string[]).includes(v ?? '') ? (v as DetailView) : 'stream'
 
