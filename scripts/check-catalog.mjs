@@ -1589,6 +1589,12 @@ await section('数据目录 · 起草：逐段写进目录、块进度与停止�
   check('……接着写：「已写进目录 2 段」「2 / 3 段」「4 / 5 块」', await until(async () => (await text('store_sales', '[data-draft-task-written]')) === '已写进目录 2 段')
         && (await text('store_sales', '[data-draft-task-parts]')) === '2 / 3 段' && (await text('store_sales', '[data-draft-task-chunks]')) === '4 / 5 块')
   check('……还没开始的表不写段进度、块进度、已写进目录', await task('members').locator('[data-draft-task-parts], [data-draft-task-chunks], [data-draft-task-written]').count() === 0)
+  // 起草时记下的几句话（服务端原话）：没收下的有效记录条件和原因，列在这张表下面，不算失败
+  settle(state, job, 'store_sales', { status: 'running', parts_done: 2, parts_written: 2, chunks_total: 5, chunks_done: 4,
+    log: ['有效记录条件按剖析核对排除了全部行（共 1,200 行），模型提议的这一条没有收下：status <> 9'] })
+  check('……起草时记下的说明（没收下的有效记录条件）照原话列在这张表下面', await until(async () => (await text('store_sales', '[data-draft-task-log]')).includes('模型提议的这一条没有收下：status <> 9')),
+    await text('store_sales', '[data-draft-task-log]'))
+  check('……没有说明的表不写这一行', await task('members').locator('[data-draft-task-log]').count() === 0)
   await shot(page, 'catalog-draft-chunks')
 
   // 停止：已写进的段保留。说法照服务端：写过段的表记已停止，原因写已写进几段、剩下几段没起草

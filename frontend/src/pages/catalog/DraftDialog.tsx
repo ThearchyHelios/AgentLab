@@ -543,6 +543,8 @@ function TaskRow({ task: t, jobError }: { task: CatalogDraftTask; jobError: stri
   const changes = DT.taskAdded(t.added, t.updated)
   const blank = blankOf(t)
   const sample = t.blank_sample?.filter(Boolean) ?? []
+  // 起草时记下的几句话（服务端原话，不算失败）：没收下的有效记录条件和原因，照原样列在这张表下面
+  const notes = t.log?.filter(Boolean) ?? []
   return (
     <li className="min-w-0 px-3 py-1.5" data-draft-task={t.table_name} data-status={t.status}>
       <div className="flex min-w-0 items-center gap-2 text-xs">
@@ -582,6 +584,9 @@ function TaskRow({ task: t, jobError }: { task: CatalogDraftTask; jobError: stri
           </details>
         )
         : <p className="mt-0.5 pl-5 text-2xs leading-relaxed text-dim" data-draft-task-blank={blank}>{DT.blank(blank)}</p>)}
+      {notes.map((line, i) => (
+        <p key={i} className="mt-0.5 break-words pl-5 text-2xs leading-relaxed text-faint" data-draft-task-log="">{line}</p>
+      ))}
     </li>
   )
 }
