@@ -9,7 +9,7 @@ import { IconButton } from '../../components/ui'
 import {
   CATALOG_COLUMN_FIELD_LABEL, CATALOG_MEASURE_HINT, CATALOG_MEASURE_LABEL, CATALOG_TEXT as CT, CODES_TEXT as KT,
 } from '../../lib/terms'
-import { ItemMark } from './parts'
+import { FOCUS_RING, FOCUS_STYLE, ItemMark } from './parts'
 import type { ReviewTarget } from './parts'
 import { COLUMN_FIELDS, codesComplete, columnPath, completeOf } from './model'
 import type { ColumnDraft, ColumnField } from './model'
@@ -50,7 +50,16 @@ export interface ColumnModel {
 
 type ColumnTexts = ColumnDraft
 
-export function ColumnTable({ columns, form, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onFillCodes, onChange, onCodesComplete }: {
+/** 审阅路径 columns.<列名>.<字段> → [列名, 字段]（列名里可以有句点，按最后一个句点切）；不是列级项为 null */
+function columnOfPath(path: string | null | undefined): [string, string] | null {
+  if (!path?.startsWith('columns.')) return null
+  const rest = path.slice('columns.'.length)
+  const at = rest.lastIndexOf('.')
+  return at > 0 ? [rest.slice(0, at), rest.slice(at + 1)] : null
+}
+
+export function ColumnTable({ columns, form, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onFillCodes, onChange, onCodesComplete,
+  focusPath = null }: {
   columns: ColumnModel[]
   /** 编辑中：列名 → 字段 → 文字（form 是当前的，initial 是进入编辑时的）；不在编辑时为 null */
   form: Record<string, ColumnTexts> | null
@@ -67,7 +76,10 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
   onChange: (col: string, field: ColumnField, value: string) => void
   /** 编辑中勾选或取消码值的「已列出全部取值」 */
   onCodesComplete: (col: string, value: boolean) => void
+  /** 从审阅队列打开的那一项（列级项的审阅路径）：那一格标出来 */
+  focusPath?: string | null
 }) {
+  const focus = columnOfPath(focusPath)
   return (
     <div className="@container relative overflow-x-auto rounded-lg border" data-catalog-columns="">
       <table className={clsx('w-full border-collapse text-xs', NARROW.table)}>
@@ -89,7 +101,7 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
           {columns.map((c) => (
             <ColumnRow key={c.name} col={c} editing={!!form} draft={form?.[c.name]} initial={initial?.[c.name]} problems={problems} busy={busy}
                        systemNotes={systemNotes} onReview={onReview} onConfirmColumn={onConfirmColumn} onFillCodes={onFillCodes} onChange={onChange}
-                       onCodesComplete={onCodesComplete} />
+                       onCodesComplete={onCodesComplete} focusField={focus && focus[0] === c.name ? focus[1] : null} />
           ))}
         </tbody>
       </table>
@@ -98,7 +110,7 @@ export function ColumnTable({ columns, form, initial, problems, busy, systemNote
 }
 
 const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, problems, busy, systemNotes, onReview, onConfirmColumn, onFillCodes, onChange,
-  onCodesComplete }: {
+  onCodesComplete, focusField }: {
   col: ColumnModel
   editing: boolean
   /** 这一列的表单。只有改了这一列时引用才会变，别的行不重画 */
@@ -112,6 +124,8 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
   onFillCodes: (col: string) => void
   onChange: (col: string, field: ColumnField, value: string) => void
   onCodesComplete: (col: string, value: boolean) => void
+  /** 从审阅队列打开的是这一列的哪一项 */
+  focusField: string | null
 }) {
   const { name, structure, items } = col
   const pending = COLUMN_FIELDS.filter((f) => items?.[f]?.status === 'proposed').length
@@ -121,9 +135,12 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
     const where = CT.whereColumn(name, CATALOG_COLUMN_FIELD_LABEL[f])
     const problem = problems[`c:${name}:${f}`]
     const changed = editing && ((draft?.[f] ?? '') !== (initial?.[f] ?? '') || (f === 'codes' && completeOf(draft) !== completeOf(initial)))
+    const focused = focusField === f
     return (
       // 窄框下没填的项不占行（编辑时照常列出来好填）
-      <td className={clsx('px-2 py-1.5 align-top', NARROW.cell, !it && !editing && '@max-[40rem]:hidden')} data-cell={f} data-status={it?.status}>
+      <td className={clsx('px-2 py-1.5 align-top', NARROW.cell, !it && !editing && '@max-[40rem]:hidden', focused && FOCUS_RING)}
+          style={focused ? FOCUS_STYLE : undefined} data-cell={f} data-status={it?.status}
+          data-review-focus={focused ? columnPath(name, f) : undefined}>
         <span className={NARROW.label}>{CT.columnHead[f]}</span>
         <div className="flex min-w-0 flex-1 items-start gap-1.5">
           <div className="min-w-0 flex-1">{editing ? input : view}</div>
@@ -223,6 +240,7 @@ const ColumnRow = memo(function ColumnRow({ col, editing, draft, initial, proble
     </tr>
   )
 }, (a, b) => a.col === b.col && a.editing === b.editing && a.draft === b.draft && a.initial === b.initial && a.busy === b.busy
+  && a.focusField === b.focusField
   && a.systemNotes === b.systemNotes && a.onReview === b.onReview && a.onConfirmColumn === b.onConfirmColumn && a.onFillCodes === b.onFillCodes
   && a.onChange === b.onChange && a.onCodesComplete === b.onCodesComplete
   // 格式问题每次都是新对象：只比这一列的几格

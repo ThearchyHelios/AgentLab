@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { AlertTriangle, ArrowLeft, ChevronLeft, ChevronRight, GitBranch, ListChecks, Lock, Pencil, Plus, RotateCw, Search, Sparkles, X } from 'lucide-react'
+import {
+  AlertTriangle, ArrowLeft, ChevronLeft, ChevronRight, GitBranch, Info, ListChecks, Lock, MessagesSquare, Pencil, Plus, RotateCw, Search, Sparkles, X,
+} from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import type {
@@ -11,17 +13,20 @@ import { DeleteButton, EmptyState, ErrorState, Notice, Skeleton, Spinner, confir
 import { useLeaveGuard } from '../../lib/leave'
 import { formatDateTime, formatNumber, formatTime } from '../../lib/format'
 import {
-  CATALOG_CARDINALITY_LABEL, CATALOG_DRAFT_TEXT as DT, CATALOG_IMPACT_TEXT, CATALOG_KIND_HINT, CATALOG_KIND_LABEL, CATALOG_TABLE_FIELD_HINT,
-  CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT, CODES_TEXT as KT,
+  CATALOG_ASSISTANT_TEXT as AT, CATALOG_CARDINALITY_LABEL, CATALOG_DRAFT_TEXT as DT, CATALOG_IMPACT_TEXT, CATALOG_KIND_HINT, CATALOG_KIND_LABEL,
+  CATALOG_REVIEW_TEXT as RT, CATALOG_TABLE_FIELD_HINT, CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT,
+  CATALOG_USAGE_TEXT, CODES_TEXT as KT,
 } from '../../lib/terms'
 import { CatalogImpactList } from '../../components/CatalogImpact'
-import { CountBadges, ItemMark, StatusChip, StatusLegend, SystemNotesNotice } from './parts'
+import { CountBadges, FOCUS_RING, FOCUS_STYLE, ItemMark, StatusChip, StatusLegend, SystemNotesNotice } from './parts'
 import type { ReviewTarget } from './parts'
 import { ColumnTable, NARROW, Value, pendingCodes } from './ColumnTable'
 import type { ColumnModel } from './ColumnTable'
 import { CodesDialog } from './CodesDialog'
 import { coverageText } from './profile'
-import { lastBlankOf, taskReason } from './draftJob'
+import { lastBlankInfo, taskReason } from './draftJob'
+import { TableAssistant } from './TableAssistant'
+import { TableUsageList } from './TableUsage'
 import {
   COLUMN_FIELDS, DATE_KEYS, TABLE_FIELDS, buildNotes, changeCount, columnPath, confirmProposed, countsOf, formFromNotes,
   relationDraft, relationPath, relationRemoval, tablePath, unknownKeys, validateForm,
@@ -54,6 +59,7 @@ type Conflict = 'edit' | 'review'
 
 export function TableDetail({
   sourceId, table, rows, drafted, fillCodes, onFillDone, prev, next, onOpen, onBack, onDetail, draftBusy = false, onRedraft, onDraftGuidance,
+  profileEnabled = false, focusPath = null, usageOpen = false,
 }: {
   sourceId: string
   table: string
@@ -84,6 +90,12 @@ export function TableDetail({
   onRedraft?: (table: string) => Promise<void>
   /** 上次起草有留空列时的「补充起草要求」：打开起草设置，范围只有这张表，先补起草要求再开始。表结构里已经没有的表不给 */
   onDraftGuidance?: (table: string) => void
+  /** 数据源开了数据剖析：表助手才能发只读查询 */
+  profileEnabled?: boolean
+  /** 从审阅队列打开的那一项（审阅路径）：载入后滚到那一项、标出来 */
+  focusPath?: string | null
+  /** 「用过这张表的运行」直接取（从审阅队列打开时） */
+  usageOpen?: boolean
 }) {
   const [detail, setDetail] = useState<CatalogDetail | null>(null)
   const [loadError, setLoadError] = useState<unknown>(null)
@@ -114,6 +126,10 @@ export function TableDetail({
   const [savedAt, setSavedAt] = useState<number | null>(null)
   const [impact, setImpact] = useState<{ version: number; n: number } | null>(null)
   const [redrafting, setRedrafting] = useState(false)
+  /** 表助手开着没有：换表时照旧开着（对话按表重新开始） */
+  const [assistantOpen, setAssistantOpen] = useState(false)
+  const assistantEntry = useRef<HTMLButtonElement>(null)
+  const focusAssistant = () => document.querySelector<HTMLElement>('[data-table-assistant] [data-assistant-input]')?.focus()
   const loadSeq = useRef(0)
   const onDetailRef = useRef(onDetail)
   onDetailRef.current = onDetail
@@ -175,6 +191,18 @@ export function TableDetail({
     if (editingRef.current) toast.warn(UT.fillWhileEditing)
     onFillDoneRef.current?.(fillCodes.seq, null)
   }, [fillCodes, table, detail])
+
+  // 从审阅队列打开的那一项：载入后滚过去（标出来的样式在各行上）
+  const focusSeen = useRef('')
+  useEffect(() => {
+    if (!focusPath || !detail || detail.table_name !== table) return
+    const key = `${table}\u0000${focusPath}`
+    if (focusSeen.current === key) return
+    focusSeen.current = key
+    requestAnimationFrame(() => {
+      document.querySelector(`[data-review-focus="${CSS.escape(focusPath)}"]`)?.scrollIntoView({ block: 'center' })
+    })
+  }, [focusPath, detail, table])
 
   const changes = edit ? changeCount(edit.initial, edit.form) : 0
   const problems = useMemo(() => (edit ? validateForm(edit.form, PROBLEM_TEXT) : {}), [edit])
@@ -325,7 +353,8 @@ export function TableDetail({
   const lastDraft = rows.find((r) => r.table_name === table)?.last_draft ?? null
   /** 没写全（失败、部分完成）；有留空的列（模型拿不准，表照样写完了） */
   const lastBad = lastDraft && (lastDraft.status === 'failed' || lastDraft.status === 'partial') ? lastDraft : null
-  const lastBlank = lastBlankOf(lastDraft)
+  const blankInfo = lastBlankInfo(lastDraft)
+  const lastBlank = blankInfo.n
   const label = notes.label && notes.label.status !== 'rejected' ? notes.label.value : null
   const kind = notes.kind && notes.kind.status !== 'rejected' ? notes.kind.value : null
   const st = detail.structure
@@ -384,8 +413,9 @@ export function TableDetail({
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col" data-catalog-detail={table} data-version={detail.version}
-         data-editing={edit ? 'true' : 'false'}>
+    // 表助手开着时：宽屏（xl 起）停在右边，详情让出那一栏的宽度；窄一些的屏幕盖在详情上面
+    <div className={clsx('relative flex min-h-0 flex-1 flex-col', assistantOpen && detail.in_schema && 'xl:pr-[380px] 2xl:pr-[420px]')}
+         data-catalog-detail={table} data-version={detail.version} data-editing={edit ? 'true' : 'false'}>
       <header className="space-y-2 border-b bg-panel px-4 py-3">
         <div className="flex items-start gap-2">
           <button type="button" className="btn btn-sm btn-ghost -ml-1 shrink-0 lg:hidden" onClick={onBack} aria-label={CT.backToList} data-catalog-detail-back="">
@@ -446,6 +476,14 @@ export function TableDetail({
             <button type="button" className="btn btn-sm" disabled={!!busy} onClick={startEdit} data-catalog-edit="">
               <Pencil size={11} aria-hidden /> {CT.edit}
             </button>
+            {detail.in_schema && (
+              // 开着时再点：焦点回到表助手的输入框（关上走面板自己的「关闭」，有待保存的修改时先问）
+              <button ref={assistantEntry} type="button" className={clsx('btn btn-sm', assistantOpen && 'border-[var(--accent)] text-fg')}
+                      onClick={() => (assistantOpen ? focusAssistant() : setAssistantOpen(true))} aria-expanded={assistantOpen} title={AT.openHint}
+                      data-catalog-assistant-open="header">
+                <MessagesSquare size={11} aria-hidden /> {AT.open}
+              </button>
+            )}
             <span className="text-2xs text-faint">{CT.editHint}</span>
           </div>
         )}
@@ -478,6 +516,7 @@ export function TableDetail({
               {lastBlank > 0 && (
                 <>
                   <p className={lastBad ? 'mt-0.5 text-dim' : 'font-medium'} data-catalog-last-draft-blank={lastBlank}>{DT.lastBlank(lastBlank)}</p>
+                  {blankInfo.earlier && <p className="mt-0.5 text-2xs text-faint" data-catalog-last-draft-earlier="">{DT.lastBlankEarlier}</p>}
                   {detail.in_schema && <p className="mt-0.5 text-dim">{DT.lastBlankAdvice}</p>}
                 </>
               )}
@@ -498,6 +537,11 @@ export function TableDetail({
                         <Pencil size={11} aria-hidden /> {DT.draftGuidance}
                       </button>
                     )}
+                    {/* 和助手一起完善：对话补上留空、拿不准的列，不用重新起草 */}
+                    <button type="button" className="btn btn-sm btn-ghost" onClick={() => (assistantOpen ? focusAssistant() : setAssistantOpen(true))}
+                            title={AT.openHint} data-catalog-assistant-open="notice">
+                      <MessagesSquare size={11} aria-hidden /> {AT.open}
+                    </button>
                   </div>
                   <p className="mt-1 text-2xs text-faint">{edit ? DT.redraftEditing : draftBusy ? DT.redraftBusy : DT.redraftHint}</p>
                 </>
@@ -529,7 +573,8 @@ export function TableDetail({
               <dl className="divide-y divide-[var(--hairline)]">
                 {TABLE_FIELDS.map((f) => (
                   <TableFieldRow key={f} field={f} item={notes[f] as CatalogItem | undefined} edit={edit} busy={!!busy}
-                                 problems={problems} columns={st?.columns ?? []} onChange={setTable} onReview={review} />
+                                 problems={problems} columns={st?.columns ?? []} onChange={setTable} onReview={review}
+                                 focused={focusPath === tablePath(f)} />
                 ))}
               </dl>
             </div>
@@ -553,7 +598,7 @@ export function TableDetail({
             {shownColumns.length
               ? (
                 <ColumnTable columns={shownColumns} form={edit?.form.columns ?? null} initial={edit?.initial.columns ?? null}
-                             problems={problems} busy={!!busy} systemNotes={detail.system_notes}
+                             problems={problems} busy={!!busy} systemNotes={detail.system_notes} focusPath={focusPath}
                              onReview={review} onConfirmColumn={confirmColumn} onFillCodes={fillCodesOf} onChange={setColumn}
                              onCodesComplete={setCodesComplete} />
               )
@@ -568,7 +613,8 @@ export function TableDetail({
             {edit
               ? <RelationEditor drafts={edit.form.relations} initial={edit.initial.relations} problems={problems} rows={rows}
                                 onChange={setRelations} />
-              : <RelationList relations={notes.relations ?? []} busy={!!busy} targetOf={targetOf} onOpen={onOpen} onReview={review} />}
+              : <RelationList relations={notes.relations ?? []} busy={!!busy} targetOf={targetOf} onOpen={onOpen} onReview={review}
+                              focusPath={focusPath} />}
           </section>
 
           <section aria-labelledby="catalog-sec-impact" data-catalog-section="impact">
@@ -578,6 +624,14 @@ export function TableDetail({
             </div>
             <CatalogImpactList sourceId={sourceId} table={detail.table_name} refreshKey={detail.version}
                                onLoad={(d) => setImpact({ version: detail.version, n: d.templates.length })} />
+          </section>
+
+          <section aria-labelledby="catalog-sec-usage" data-catalog-section="usage">
+            <div className="mb-2 flex flex-wrap items-baseline gap-2">
+              <h3 id="catalog-sec-usage" className="text-xs font-semibold">{CATALOG_USAGE_TEXT.title}</h3>
+              <span className="text-2xs text-faint">{CATALOG_USAGE_TEXT.hint}</span>
+            </div>
+            <TableUsageList sourceId={sourceId} table={detail.table_name} usage={detail.usage} autoLoad={usageOpen} />
           </section>
         </div>
       </div>
@@ -605,6 +659,20 @@ export function TableDetail({
           </button>
         </footer>
       )}
+      {assistantOpen && detail.in_schema && (
+        <TableAssistant key={`${sourceId}\u0000${table}`} sourceId={sourceId} table={table} tableLabel={label ?? detail.table_name} detail={detail}
+                        profileEnabled={profileEnabled} lastBlank={lastBlank} editing={!!edit}
+                        onSaved={(d) => {
+                          setDetail(d)
+                          setConflict(null)
+                          onDetailRef.current(d)
+                          setSavedAt(d.version)
+                        }}
+                        onClose={() => {
+                          setAssistantOpen(false)
+                          requestAnimationFrame(() => assistantEntry.current?.focus())
+                        }} />
+      )}
     </div>
   )
 }
@@ -626,7 +694,10 @@ function blankCodes(notes: CatalogDetail['notes'], pick: (path: string) => boole
 // 表级各项
 // ---------------------------------------------------------------------------
 
-function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, onReview }: {
+/** 值下面写说明的项：有效记录条件、去重规则（模型起草时附的依据、数据剖析核对的排除比例或没有核对的原因） */
+const NOTED_FIELDS = new Set<TableField>(['valid_filter', 'dedup'])
+
+function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, onReview, focused = false }: {
   field: TableField
   item: CatalogItem | undefined
   edit: Editing | null
@@ -636,6 +707,8 @@ function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, o
   columns: { name: string }[]
   onChange: (k: TableKey, v: string) => void
   onReview: (t: ReviewTarget, a: CatalogReviewAction) => void
+  /** 从审阅队列打开的就是这一项：标出来 */
+  focused?: boolean
 }) {
   const where = CT.whereTable(CATALOG_TABLE_FIELD_LABEL[field])
   const keys: TableKey[] = field === 'business_date' ? [...DATE_KEYS] : [field as TableKey]
@@ -692,9 +765,12 @@ function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, o
     }
   }
   const unknown = edit && field === 'keys' ? unknownKeys(edit.form.table.keys ?? '', columns) : []
+  const note = !edit && item && item.status !== 'rejected' && NOTED_FIELDS.has(field) ? item.note?.trim() ?? '' : ''
 
   return (
-    <div className="grid gap-x-4 gap-y-1 px-3 py-2.5 sm:grid-cols-[7.5rem_minmax(0,1fr)]" data-field={field} data-status={item?.status}>
+    <div className={clsx('grid gap-x-4 gap-y-1 px-3 py-2.5 sm:grid-cols-[7.5rem_minmax(0,1fr)]', focused && FOCUS_RING)}
+         style={focused ? FOCUS_STYLE : undefined} data-field={field} data-status={item?.status}
+         data-review-focus={focused ? tablePath(field) : undefined} title={focused ? RT.focusMark : undefined}>
       <dt className="pt-0.5 text-2xs text-faint" title={CATALOG_TABLE_FIELD_HINT[field]}>
         {edit && field !== 'business_date'
           ? <label htmlFor={inputId}>{CATALOG_TABLE_FIELD_LABEL[field]}</label>
@@ -710,6 +786,12 @@ function TableFieldRow({ field, item, edit, busy, problems, columns, onChange, o
           )}
           {changed && <span className="chip shrink-0 !text-2xs" style={{ color: 'var(--accent)' }} data-changed="">{CT.changedMark}</span>}
         </div>
+        {note && (
+          <p className="mt-1 flex items-start gap-1 text-2xs leading-relaxed text-dim" data-field-note="">
+            <Info size={10} className="mt-[3px] shrink-0 text-faint" aria-hidden />
+            <span className="min-w-0 break-words"><span className="text-faint">{UT.fieldNote}：</span>{note}</span>
+          </p>
+        )}
         {problem && <div className="mt-1 text-2xs text-[var(--err)]" role="alert">{problem}</div>}
         {!problem && unknown.length > 0 && (
           <div className="mt-1 text-2xs text-[var(--warn)]" data-keys-unknown="">{CT.keysUnknown(unknown.join('、'))}</div>
@@ -760,12 +842,14 @@ function FieldValue({ field, item }: { field: TableField; item: CatalogItem | un
 // 关联关系
 // ---------------------------------------------------------------------------
 
-function RelationList({ relations, busy, targetOf, onOpen, onReview }: {
+function RelationList({ relations, busy, targetOf, onOpen, onReview, focusPath = null }: {
   relations: CatalogRelation[]
   busy: boolean
   targetOf: (name: string) => CatalogTableRow | undefined
   onOpen: (table: string) => void
   onReview: (t: ReviewTarget, a: CatalogReviewAction) => void
+  /** 从审阅队列打开的那一项 */
+  focusPath?: string | null
 }) {
   if (!relations.length) return <p className="rounded-lg border px-3 py-4 text-xs text-faint" data-relations-empty="">{CT.noRelations}</p>
   // 窄框（< 40rem）下和列表格一样排成卡片：状态在第一行，下面每项一行「字段名 值」，不用横向滚动
@@ -789,8 +873,11 @@ function RelationList({ relations, busy, targetOf, onOpen, onReview }: {
             const target = targetOf(r.to_table)
             const where = CT.whereRelation(r.to_table)
             const rejected = r.status === 'rejected'
+            const focused = focusPath === relationPath(r.id)
             return (
-              <tr key={r.id} className={clsx('border-b border-hairline last:border-b-0', NARROW.row)} data-relation={r.id} data-status={r.status}>
+              <tr key={r.id} className={clsx('border-b border-hairline last:border-b-0', NARROW.row, focused && FOCUS_RING)}
+                  style={focused ? FOCUS_STYLE : undefined} data-relation={r.id} data-status={r.status}
+                  data-review-focus={focused ? relationPath(r.id) : undefined}>
                 <td className={clsx(cell, 'px-3')}>
                   {label(CT.relationHead.from)}
                   <span className={clsx('mono min-w-0 break-all', rejected && 'text-faint line-through')}>{r.columns.join(', ')}</span>
