@@ -96,8 +96,10 @@ async function open({ theme = 'dark', state }) {
     if (url.pathname === '/api/tasks/count') {
       const other = state.approvals.filter((a) => a.status === 'pending').length
       const apps = state.appTasks ?? 0
-      return route.fulfill({ json: { mine: other + apps, apps, other } })
+      return route.fulfill({ json: { mine: state.tasks ? state.tasks.length : other + apps, apps, other } })
     }
+    // 派给我的待办（外壳只在待办数变了时取一次，拿来判断哪些是新来的）
+    if (url.pathname === '/api/tasks' && state.tasks) return route.fulfill({ json: { items: state.tasks } })
     if (url.pathname === '/api/runs' && state.runs) return route.fulfill({ json: state.runs })
     if (state.broken === url.pathname) return route.fulfill({ status: 500, json: { detail: '数据库锁住了，稍后重试' } })
     return route.continue()
@@ -529,6 +531,41 @@ await section('未保存的工作流', '\n=== 未保存的工作流：命令面�
   check('命令面板的最近运行：名字是「未保存的工作流」', runText.includes('未保存的工作流') && !runText.includes('临时图'),
     runText.replace(/\s+/g, ' '))
   await page.keyboard.press('Escape')
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+  await ctx.close()
+})
+
+// ---------------------------------------------------------------------------
+await section('新的待办', '\n=== 派给自己的新待办：后台时发系统通知，已按待审批通知过的不重复 ===', async () => {
+  const at = ago(60_000)
+  const taskOf = (id, extra) => ({ id, approval_id: null, run_id: `run-${id}`, node_id: 'n', node_label: '核实付款', run_class: 'formal',
+    workflow_id: null, workflow_name: '报销流程', app_id: 'app_claim', app_name: '报销审批', app_version: 1, kind: 'reconcile',
+    title: '付款结果未知，请核实', form: null, policy: { kind: 'any' }, status: 'pending', due_at: null, escalation_level: 0,
+    payload: {}, assignments: [], can_respond: true, outcome: null, resolved_by: null, resolved_at: null, created_at: at, ...extra })
+  const approval = { ...PENDING[1], id: 'shell-ap-task', run_id: 'run-shell-ap-task', title: '这笔报销可以批吗？', created_at: at }
+  const state = { approvals: [], tasks: [], offline: false, writes: [] }
+  const { ctx, page } = await open({ state })
+  await page.goto(`${WEB}/apps`)
+  await waitNav(page)
+  await page.waitForTimeout(800)
+  await nav(page).getByRole('button', { name: '后台提醒' }).click()
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true })
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  // 一条没有审批的核实待办，一条带着待审批的（搭建者已经按待审批收到通知）
+  state.tasks = [taskOf('shell-task-new'), taskOf('shell-task-ap', { approval_id: approval.id, kind: 'approve', title: approval.title })]
+  state.approvals = [approval]
+  const noted = await page.waitForFunction(() => window.__notes.some((n) => n.tag === 'task:shell-task-new'), null, { timeout: 12000 })
+    .then(() => true, () => false)
+  const note = (await page.evaluate(() => window.__notes.find((n) => n.tag === 'task:shell-task-new'))) ?? {}
+  check('后台来了派给自己的新待办：发系统通知', noted && String(note.title).startsWith('新的待办：') && String(note.title).includes('请核实'),
+    JSON.stringify(note))
+  check('……正文写应用名和节点名', String(note.body).includes('报销审批') && String(note.body).includes('核实付款'), String(note.body))
+  await page.waitForTimeout(500)
+  const notes = await page.evaluate(() => window.__notes)
+  check('已按待审批通知过的那一条不再发第二条', notes.some((n) => n.tag === 'approval:shell-ap-task')
+    && !notes.some((n) => n.tag === 'task:shell-task-ap'), notes.map((n) => n.tag).join(','))
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
   await ctx.close()
 })

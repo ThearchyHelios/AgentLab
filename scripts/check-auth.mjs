@@ -8,7 +8,9 @@
 //   - 使用者（user 角色）：导航只有「应用」和「设置」，别的地址送回应用首页，⌥ 数字切不到看不见的页；没有署名框，
 //     账户菜单写显示名、角色、退出登录；待办卡写「以登录身份处理」；
 //   - 搭建者：导航九项都在，账户菜单写搭建者；
-//   - 关登录：/login 直接回首页；导航底部是署名入口，没有账户菜单；应用首页挂「未开启登录」的说明。
+//   - 关登录：/login 直接回首页；导航底部是署名入口，没有账户菜单；应用首页挂「未开启登录」的说明；
+//   - 管理员允许使用者问数据时（D-c）：问数据页只取数据源的名字（/api/datasources/names），不取完整列表和表结构；
+//   - 使用者的设置页只剩偏好设置（主题）和通知，换主题只存本机、不写服务端（D-s）。
 //
 // 身份接口在浏览器层答掉（/api/auth/**），按 state 切登录方式和角色；其余 GET 放行（外壳要它），写请求拦下记在探针里。
 // 编排者的完整关口另起一套开着 local 登录的服务跑真接口，见 docs/design §6.3。
@@ -84,8 +86,9 @@ async function open(state) {
     if (p === '/api/auth/me') {
       if (state.mode === 'off') return route.fulfill({ json: { mode: 'off', username: null, display_name: null, role: 'admin', groups: [], verified: false } })
       if (!state.who) return route.fulfill({ status: 401, json: { detail: '请先登录', code: 'auth_required', mode: state.mode } })
-      return route.fulfill({ json: { mode: state.mode, ...PEOPLE[state.who], verified: true } })
+      return route.fulfill({ json: { mode: state.mode, ...PEOPLE[state.who], verified: true, user_can_chat: !!state.chat } })
     }
+    state.reads?.push(p)
     if (state.mode !== 'off' && (!state.who || state.expire)) {
       return route.fulfill({ status: 401, json: { detail: '请先登录', code: 'auth_required', mode: state.mode } })
     }
@@ -93,6 +96,13 @@ async function open(state) {
     if (p === '/api/tasks/count') return route.fulfill({ json: { mine: 1, apps: 1, other: 0 } })
     if (p === '/api/tasks') return route.fulfill({ json: { items: [TASK] } })
     if (p === '/api/tasks/task_x') return route.fulfill({ json: TASK })
+    // 管理员允许使用者问数据时，问数据页只拿得到数据源的名字和说明
+    if (p === '/api/datasources/names') {
+      return state.chat ? route.fulfill({ json: { items: [{ id: 'src1', name: 'shop', description: '门店销售' }] } })
+        : route.fulfill({ status: 403, json: { detail: '没有权限' } })
+    }
+    if (p === '/api/conversations') return route.fulfill({ json: [] })
+    if (p === '/api/settings' && state.who === 'user') return route.fulfill({ status: 403, json: { detail: '没有权限' } })
     // 使用者碰不到这些：服务端回 403
     if (state.who === 'user' && /^\/api\/(workflows|approvals|runs|tools|providers|skills|kb|datasources)/.test(p)) {
       return route.fulfill({ status: 403, json: { detail: '没有权限' } })
@@ -200,6 +210,35 @@ await section('关登录：登录页回首页、署名入口、说明行', async
   await page.goto(`${WEB}/apps`)
   check('应用首页挂「未开启登录」的说明', await page.locator('[data-auth-off]').waitFor({ timeout: 8000 }).then(() => true, () => false))
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+})
+
+await section('使用者问数据（管理员开了）：只取数据源的名字，不取完整列表和表结构', async () => {
+  const state = { mode: 'local', who: 'user', chat: true, writes: [], reads: [] }
+  const page = await open(state)
+  await page.goto(`${WEB}/chat`)
+  await nav(page).waitFor({ timeout: 15000 })
+  check('导航有「问数据」', (await navLabels(page)).includes('问数据'), (await navLabels(page)).join(','))
+  await page.waitForTimeout(1200)
+  check('取了数据源的名字', state.reads.includes('/api/datasources/names'), state.reads.filter((x) => x.includes('datasources')).join(','))
+  check('没取完整的数据源列表和表结构', !state.reads.some((x) => x === '/api/datasources' || /^\/api\/datasources\/[^/]+\/schema/.test(x)),
+    state.reads.filter((x) => x.includes('datasources')).join(','))
+  check('没取只给搭建者的目录（工作流、工具、模型接入）', !state.reads.some((x) => /^\/api\/(workflows|tools|providers|skills)$/.test(x)),
+    state.reads.filter((x) => /workflows|tools|providers|skills/.test(x)).join(','))
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+})
+
+await section('使用者的设置页：只剩偏好设置和通知，换主题只存本机', async () => {
+  const state = { mode: 'local', who: 'user', writes: [], reads: [] }
+  const page = await open(state)
+  await page.goto(`${WEB}/settings`)
+  await page.locator('[role=tab]').first().waitFor({ timeout: 15000 })
+  const tabs = (await page.locator('[role=tab]').allInnerTexts()).map((t) => t.trim())
+  check('页签只剩偏好设置和通知', tabs.length === 2 && tabs.some((t) => t.includes('偏好')) && tabs.some((t) => t.includes('通知')), tabs.join(' | '))
+  await page.getByRole('radio', { name: /深色/ }).click()
+  await page.waitForTimeout(400)
+  check('换主题不往服务端写', !state.writes.some((w) => w.path === '/api/settings'), state.writes.map((w) => w.path).join(','))
+  check('不提示「未能保存到设置」', !(await page.locator('body').innerText()).includes('未能保存到设置'))
+  check('启动时也不去读服务端的设置', !state.reads.includes('/api/settings'))
 })
 
 await browser.close()

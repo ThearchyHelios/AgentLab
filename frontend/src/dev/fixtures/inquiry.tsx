@@ -4,6 +4,7 @@ import { parseServerTime } from '../../lib/format'
 import { ArtifactsPane, useRunArtifacts } from '../../pages/runs/ArtifactsPane'
 import { EvidencePane } from '../../pages/runs/EvidencePane'
 import { ApprovalCard } from '../../run/RunPanel'
+import { withTask } from '../taskOf'
 import { emptyTrace } from '../../run/trace'
 import type { Approval, ApprovalReport, Run } from '../../types'
 import fx from './inquiry.json'
@@ -54,7 +55,7 @@ function Card({ approval, name, dense = false }: { approval: Approval; name: str
   return (
     <div className={dense ? 'w-[360px] max-w-full border-r bg-panel' : 'mx-auto max-w-3xl p-4'} data-fixture={name}>
       <div className="overflow-hidden rounded-lg border" style={{ borderColor: 'var(--warn)' }}>
-        <ApprovalCard approval={approval} onResolved={() => undefined} />
+        <ApprovalCard approval={withTask(approval)} onResolved={() => undefined} />
       </div>
     </div>
   )
@@ -68,7 +69,7 @@ function TwoPlaces({ approval }: { approval: Approval }) {
       {pop && createPortal(
         <div role="dialog" aria-label="审批卡" data-fixture-pop=""
              className="fixed left-4 top-4 z-50 max-h-[90vh] w-[380px] overflow-y-auto rounded-lg border bg-panel shadow-elev-3">
-          <ApprovalCard approval={approval} showWorkflow={false} />
+          <ApprovalCard approval={withTask(approval)} showWorkflow={false} />
         </div>,
         document.body,
       )}
@@ -78,7 +79,7 @@ function TwoPlaces({ approval }: { approval: Approval }) {
         </button>
       </div>
       <aside className="w-[380px] shrink-0 border-l bg-panel" data-fixture-panel="">
-        <ApprovalCard approval={approval} showWorkflow={false} />
+        <ApprovalCard approval={withTask(approval)} showWorkflow={false} />
       </aside>
     </div>
   )
@@ -97,8 +98,8 @@ function Steps({ name, keyed }: { name: string; keyed: boolean }) {
       <button type="button" className="btn btn-xs mb-2" data-fixture-next="" onClick={() => setAt((n) => n + 1)}>处理掉这张</button>
       <div className="overflow-hidden rounded-lg border" style={{ borderColor: 'var(--warn)' }}>
         {keyed
-          ? <ApprovalCard key={approval.id} approval={approval} onResolved={() => undefined} />
-          : <ApprovalCard approval={approval} onResolved={() => undefined} />}
+          ? <ApprovalCard key={approval.id} approval={withTask(approval)} onResolved={() => undefined} />
+          : <ApprovalCard approval={withTask(approval)} onResolved={() => undefined} />}
       </div>
     </div>
   )
@@ -133,7 +134,7 @@ function Waiting({ approval, run }: { approval: Approval; run: Run }) {
     <div className="flex min-h-screen min-w-0 flex-col" data-fixture="inquiry-run-waiting">
       <div className="mx-auto w-full max-w-3xl p-4" data-fixture-card="">
         <div className="overflow-hidden rounded-lg border" style={{ borderColor: 'var(--warn)' }}>
-          <ApprovalCard approval={approval} onResolved={() => undefined} showWorkflow={false} />
+          <ApprovalCard approval={withTask(approval)} onResolved={() => undefined} showWorkflow={false} />
         </div>
       </div>
       <div className="h-[80vh] min-w-0 border-t" data-fixture-evidence="">

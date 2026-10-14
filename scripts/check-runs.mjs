@@ -2285,6 +2285,42 @@ await section('证据页签：没有逐段证据的运行给升级横幅，跳�
 
 // ------------------------------------------------------------------ 应用平台：运行来源、生效记录
 
+await section('待办页签：审批带着 task_id，新来的审批按 id 补取待办，不整表重取', async () => {
+  // D-r：/api/approvals 每项带 task_id。待审批变了时，记录页的「待办」页签按 task_id 只取新来的那几条
+  check('审批列表的每一项都带着对应待办的 task_id', pending.every((a) => typeof a.task_id === 'string'
+    && pendingTasks.some((t) => t.id === a.task_id && t.approval_id === a.id)),
+  `${pending.filter((a) => !a.task_id).length} 条没带`)
+  const lists = []
+  const byId = []
+  const onRequest = (req) => {
+    const u = new URL(req.url())
+    if (u.pathname === '/api/tasks') lists.push(u.search)
+    const m = u.pathname.match(/^\/api\/tasks\/([^/]+)$/)
+    if (m && m[1] !== 'count') byId.push(m[1])
+  }
+  fakes.set('GET /api/approvals', () => ({ status: 200, json: pending }))
+  await page.goto(`${WEB}/runs?tab=approvals`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(600)
+  page.on('request', onRequest)
+  const at = new Date().toISOString()
+  const extra = { id: 'fake0appr0byid', run_id: 'fake0run0byid', node_id: 'gate', mode: 'approve', title: '按 id 补取的待审批',
+    payload: { kind: 'human_node' }, status: 'pending', response: {}, created_at: at, workflow_id: null, workflow_name: '订单日报',
+    node_label: '人工审批', run_status: 'interrupted', run_class: 'exploratory', task_id: 'fake0task0byid' }
+  const task = { id: 'fake0task0byid', approval_id: extra.id, run_id: extra.run_id, node_id: 'gate', node_label: '人工审批',
+    run_class: 'exploratory', workflow_id: null, workflow_name: '订单日报', app_id: null, app_version: null, kind: 'approve',
+    title: extra.title, form: null, policy: { kind: 'any' }, status: 'pending', due_at: null, escalation_level: 0, payload: {},
+    assignments: [], can_respond: true, outcome: null, resolved_by: null, resolved_at: null, created_at: at }
+  fakes.set('GET /api/approvals', () => ({ status: 200, json: [...pending, extra] }))
+  fakes.set('GET /api/tasks/fake0task0byid', () => ({ status: 200, json: task }))
+  const shown = await page.locator('[data-tasks-list] [data-task-id="fake0task0byid"]').waitFor({ timeout: 9000 }).then(() => true, () => false)
+  check('新来的审批：待办按 task_id 补进列表', shown)
+  check('……按 id 取了那一条', byId.includes('fake0task0byid'), byId.join(','))
+  check('……没有整表重取待办', lists.length === 0, lists.join(' | '))
+  page.off('request', onRequest)
+  fakes.delete('GET /api/approvals')
+  fakes.delete('GET /api/tasks/fake0task0byid')
+})
+
 await section('运行来源：标签与筛选', async () => {
   // X3：运行记着从哪里发起；老运行没有来源，详情写「来源未记录」，列表里不标。筛选按 origin_kind 查服务端
   const seen = []

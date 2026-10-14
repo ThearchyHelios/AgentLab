@@ -8,7 +8,7 @@ import type {
   RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
 } from '../types'
 import type {
-  Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
+  Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, DataSourceName, EvidenceGraph,
   EvidenceAudit, EvidenceJudgeResult, EvidenceProvenance, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
   RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, UploadDecision, UploadMixedColumn, UploadResult,
   UploadShapeReason, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
@@ -261,6 +261,14 @@ export const api = {
   // ---- 运行 ----
   datasources: {
     list: (opts?: RequestOptions) => get<DataSource[]>('/datasources', opts),
+    /**
+     * 只有名字和说明（D-c）：开了登录、管理员允许使用者问数据时，使用者的问数据页按它列数据源（完整列表只给搭建者）。
+     * 形状按 {items} 或数组两种都认
+     */
+    names: async (opts?: RequestOptions): Promise<DataSourceName[]> => {
+      const raw = await get<DataSourceName[] | { items: DataSourceName[] }>('/datasources/names', opts)
+      return Array.isArray(raw) ? raw : raw?.items ?? []
+    },
     kinds: () => get<any>('/datasources/kinds'),
     create: (body: any) => post<any>('/datasources', body),
     update: (id: string, body: any) => patch<any>(`/datasources/${id}`, body),
@@ -1025,7 +1033,16 @@ export function streamCatalogAssistant(
  * 审批恢复时会重新 attachRun，不传 after 就是 after=0，后端按 `seq > after`
  * 把整条历史再推一遍，而消费方多半是无条件追加——事件就这么重复累积了。
  * 已经有事件在手的场景（重新接上一条运行）应当传当前最大 seq。
+ *
+ * 连不上 WebSocket 时退回轮询（应用平台 D-c）：握手连续 WS_GIVE_UP 次都没打开（服务端按运行判权限，拒绝时握手
+ * 直接断开；代理不转发 WebSocket 也是这样），改为每 POLL_MS 取一次 /runs/{id}/events?after= 和运行状态，运行不在
+ * 进行中时照 stream.end 的样子收尾。第一批是补的历史，同 WebSocket 的回放一样标 replay
  */
+const WS_GIVE_UP = 2
+const POLL_MS = 1500
+/** 不在进行中的状态：同服务端 api/runs._SETTLED，另加服务重启挂起的 suspended（轮询时没有后续事件会来） */
+const SETTLED_STATUS = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'suspended'])
+
 export function streamRun(
   runId: string,
   onEvent: (event: RunEvent) => void,
@@ -1038,19 +1055,62 @@ export function streamRun(
   let closed = false
   let lastSeq = after
   let retry = 0
+  /** 握手连续失败（一次都没打开过就断了）几次 */
+  let refused = 0
+  let pollTimer: ReturnType<typeof setTimeout> | undefined
+
+  const finish = (status?: string) => {
+    if (closed) return
+    closed = true
+    onClose?.({ status })
+  }
+
+  const poll = async (first: boolean) => {
+    if (closed) return
+    let delay = POLL_MS
+    try {
+      const events = await api.runs.events(runId, lastSeq)
+      if (closed) return
+      for (const event of events) {
+        if (event.seq) lastSeq = Math.max(lastSeq, event.seq)
+        onEvent(first ? { ...event, replay: true } : event)
+      }
+      // 这一批没有新事件时才看状态：运行刚结束时最后几条事件和状态可能前后脚落库，先把事件收完
+      if (!events.length) {
+        const run = await api.runs.get(runId)
+        if (closed) return
+        if (SETTLED_STATUS.has(String(run.status))) {
+          // 状态落了、最后几条事件可能刚落库：再补一次再收尾
+          const rest = await api.runs.events(runId, lastSeq).catch(() => [] as RunEvent[])
+          for (const event of rest) {
+            if (event.seq) lastSeq = Math.max(lastSeq, event.seq)
+            onEvent(event)
+          }
+          finish(run.status)
+          return
+        }
+      }
+      retry = 0
+    } catch {
+      // 断线、服务重启：退避重试，最多等 10 秒
+      retry += 1
+      delay = Math.min(POLL_MS * 2 ** retry, 10_000)
+    }
+    if (!closed) pollTimer = setTimeout(() => void poll(false), delay)
+  }
 
   const connect = () => {
     if (closed) return
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    let opened = false
     socket = new WebSocket(`${proto}://${location.host}/api/runs/${runId}/stream?after=${lastSeq}`)
 
     socket.onmessage = (ev) => {
       const event = parseBody(ev.data) as RunEvent & { type: string; status?: string }
       if (event.type === 'stream.end') {
-        closed = true
         socket?.close()
         // 新后端放在 data.status，老后端放在顶层 status
-        onClose?.({ status: event.data?.status ?? event.status })
+        finish(event.data?.status ?? event.status)
         return
       }
       if (event.seq) lastSeq = Math.max(lastSeq, event.seq)
@@ -1058,11 +1118,19 @@ export function streamRun(
     }
     socket.onclose = () => {
       if (closed) return
+      if (!opened) refused += 1
+      if (refused >= WS_GIVE_UP) {
+        socket = null
+        void poll(true)
+        return
+      }
       // 指数退避重连，最多等 5 秒
       retry += 1
       setTimeout(connect, Math.min(300 * 2 ** retry, 5000))
     }
     socket.onopen = () => {
+      opened = true
+      refused = 0
       retry = 0
       report(true)
     }
@@ -1071,6 +1139,7 @@ export function streamRun(
 
   return () => {
     closed = true
+    clearTimeout(pollTimer)
     socket?.close()
   }
 }

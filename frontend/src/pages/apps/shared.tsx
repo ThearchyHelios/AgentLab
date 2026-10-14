@@ -20,8 +20,9 @@ export async function loadHome(appId: string, params?: Record<string, unknown>, 
     return await api.apps.page(appId, 'home', { params }, opts)
   } catch (e) {
     if (!(e instanceof ApiError && e.status === 404 && e.code === 'app_page_not_found')) throw e
+    // use / observe 拿不到草稿（D-m）：按当前发布版的页面目录（published）退；老服务端只有草稿
     const app = await api.apps.get(appId, opts)
-    const first = app.draft.pages.find((p) => p.id !== 'home')?.id
+    const first = (app.published?.pages ?? app.draft?.pages ?? []).find((p) => p.id !== 'home')?.id
     if (!first) throw e
     return api.apps.page(appId, first, { params }, opts)
   }

@@ -149,7 +149,7 @@ export function applyAppOp(spec: AppSpec, op: Record<string, any>): AppSpec {
  * 检查问题的 path → 它落在哪里。认三种写法：JSON 指针（/pages/0/body/2）、点号加下标（pages[0].body[2]）、
  * 纯点号（pages.0.body.2）。落到组件上返回组件 id，落到别处返回所在的那一节（固定版本、入口、岗位……）
  */
-export function locatePath(spec: AppSpec, path: string | null | undefined): { section: string; component?: string } | null {
+export function locatePath(spec: AppSpec, path: string | null | undefined): { section: string; component?: string; path?: string } | null {
   if (!path) return null
   const parts = path.replace(/^\//, '').replace(/\[(\d+)\]/g, '.$1').split(/[./]/).filter(Boolean)
   const head = parts[0]
@@ -170,8 +170,128 @@ export function locatePath(spec: AppSpec, path: string | null | undefined): { se
   if (head === 'slots' || head === 'bindings' || head === 'grants') return { section: 'access' }
   if (head === 'hooks') return { section: 'hooks' }
   if (head === 'notify') return { section: 'notify' }
-  if (head === 'entries' || head === 'forms' || head === 'views' || head === 'task_ui') return { section: 'pages' }
+  // 入口、表单、待办外观在「入口与表单」一节按 JSON 编辑，带着 path 去定位；视图来源在页面一节左栏下方
+  if (head === 'entries' || head === 'forms' || head === 'task_ui') return { section: 'forms', path }
+  if (head === 'views') return { section: 'pages' }
   // 只写了组件 id 的（服务端按 id 报）
   const at = findComponent(spec, head ?? '')
   return at ? { section: 'pages', component: at.node.id } : null
+}
+
+// ---------------------------------------------------------------------------
+// 入口与表单一节的 JSON 编辑：path 拆成键、在排好版的 JSON 里找行、按目录的子集查形状
+// ---------------------------------------------------------------------------
+
+/** 检查问题的 path → 键的序列（同 locatePath 认的三种写法）。entries 后面写的是入口编号时换成下标 */
+export function pathParts(spec: AppSpec, path: string): string[] {
+  const parts = path.replace(/^\//, '').replace(/\[(\d+)\]/g, '.$1').split(/[./]/).filter(Boolean)
+    .map((p) => p.replace(/~1/g, '/').replace(/~0/g, '~'))
+  if (parts[0] === 'entries' && parts[1] != null && !/^\d+$/.test(parts[1])) {
+    const i = spec.entries.findIndex((e) => e.id === parts[1])
+    if (i >= 0) parts[1] = String(i)
+  }
+  return parts
+}
+
+const SENTINEL = '\u0000agentlab-locate\u0000'
+
+/**
+ * value 按 JSON.stringify(value, null, 2) 排版后，keys 指的那一项从第几行开始（0 起）；找不到最深的那一层就退回能找到的
+ * 那一层，一层都找不到为 -1。做法：把那一项换成一个不会出现的标记再排一遍版，数标记前面有几行——之前的行和原文一模一样
+ */
+export function lineOfPath(value: unknown, keys: string[]): number {
+  for (let depth = keys.length; depth > 0; depth--) {
+    const copy = JSON.parse(JSON.stringify(value ?? null))
+    let cur: any = copy
+    let ok = true
+    for (let i = 0; i < depth - 1; i++) {
+      if (cur == null || typeof cur !== 'object' || !(keys[i] in cur)) { ok = false; break }
+      cur = cur[keys[i]]
+    }
+    const last = keys[depth - 1]
+    if (!ok || cur == null || typeof cur !== 'object' || !(last in cur)) continue
+    cur[last] = SENTINEL
+    const text = JSON.stringify(copy, null, 2)
+    const at = text.indexOf(JSON.stringify(SENTINEL))
+    if (at >= 0) return text.slice(0, at).split('\n').length - 1
+  }
+  return -1
+}
+
+/** JSON.parse 的报错 → 第几行第几列（浏览器说法不一：有的给 position，有的给 line/column） */
+export function jsonErrorAt(text: string, message: string): { line: number; col: number } | null {
+  const lc = message.match(/line (\d+) column (\d+)/i)
+  if (lc) return { line: Number(lc[1]), col: Number(lc[2]) }
+  const pos = message.match(/position (\d+)/i)
+  if (!pos) return null
+  const before = text.slice(0, Number(pos[1])).split('\n')
+  return { line: before.length, col: before[before.length - 1].length + 1 }
+}
+
+const FIELD_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array'])
+
+export interface ShapeIssue { message: string; keys: string[] }
+
+/**
+ * 入口、表单、待办外观的形状检查（只查结构，规则以服务端的发布检查为准）：
+ * - 入口：数组；每项有编号（不重复）、固定版本的别名在固定版本里、表单内联或引用表单一节里有的、字段映射是「名字 → 文字」；
+ * - 表单：名字 → agentlab.form/1：对象类型、列出字段，字段类型在子集里，不许正则；
+ * - 待办外观：节点 → 对象。
+ * forms 给的是同一份草稿里的表单（入口引用的表单在不在按它查）
+ */
+export function shapeIssues(kind: 'entries' | 'forms' | 'task_ui', value: unknown, spec: AppSpec,
+  T: {
+    shapeArray: string; shapeObject: string; entryNotObject: (i: number) => string; entryId: (i: number) => string
+    entryDup: (id: string) => string; entryPin: (id: string, pin: string) => string; entryPinMissing: (id: string) => string
+    entryForm: (id: string, ref: string) => string; entryMap: (id: string) => string; formShape: (name: string) => string
+    formFieldType: (name: string, field: string) => string; formPattern: (name: string, field: string) => string
+    taskUiShape: (node: string) => string
+  }, forms: Record<string, unknown> = spec.forms): ShapeIssue[] {
+  const out: ShapeIssue[] = []
+  const isObj = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v)
+  if (kind === 'entries') {
+    if (!Array.isArray(value)) return [{ message: T.shapeArray, keys: [] }]
+    const seen = new Set<string>()
+    value.forEach((e, i) => {
+      if (!isObj(e)) { out.push({ message: T.entryNotObject(i + 1), keys: [String(i)] }); return }
+      const id = typeof e.id === 'string' ? e.id.trim() : ''
+      if (!id) out.push({ message: T.entryId(i + 1), keys: [String(i)] })
+      else if (seen.has(id)) out.push({ message: T.entryDup(id), keys: [String(i), 'id'] })
+      seen.add(id)
+      const name = id || String(i + 1)
+      if (typeof e.pin !== 'string' || !e.pin) out.push({ message: T.entryPinMissing(name), keys: [String(i)] })
+      else if (!spec.pins.some((p) => p.alias === e.pin)) out.push({ message: T.entryPin(name, e.pin), keys: [String(i), 'pin'] })
+      const ref = isObj(e.form) && typeof e.form.$ref === 'string' ? e.form.$ref : null
+      if (ref) {
+        const target = ref.replace(/^#\/forms\//, '')
+        if (!(target in forms)) out.push({ message: T.entryForm(name, ref), keys: [String(i), 'form'] })
+      } else if (e.form != null) {
+        out.push(...formIssues(name, e.form, [String(i), 'form'], T))
+      }
+      if (e.map != null && (!isObj(e.map) || Object.values(e.map).some((v) => typeof v !== 'string'))) {
+        out.push({ message: T.entryMap(name), keys: [String(i), 'map'] })
+      }
+    })
+    return out
+  }
+  if (!isObj(value)) return [{ message: T.shapeObject, keys: [] }]
+  for (const [name, v] of Object.entries(value)) {
+    if (kind === 'forms') out.push(...formIssues(name, v, [name], T))
+    else if (!isObj(v)) out.push({ message: T.taskUiShape(name), keys: [name] })
+  }
+  return out
+}
+
+function formIssues(name: string, form: unknown, keys: string[], T: Parameters<typeof shapeIssues>[3]): ShapeIssue[] {
+  const f = form as Record<string, any> | null
+  if (!f || typeof f !== 'object' || Array.isArray(f) || f.type !== 'object' || !f.properties || typeof f.properties !== 'object') {
+    return [{ message: T.formShape(name), keys }]
+  }
+  const out: ShapeIssue[] = []
+  for (const [field, spec] of Object.entries(f.properties as Record<string, any>)) {
+    const at = [...keys, 'properties', field]
+    if (!spec || typeof spec !== 'object' || !FIELD_TYPES.has(spec.type)) out.push({ message: T.formFieldType(name, field), keys: at })
+    else if ('pattern' in spec) out.push({ message: T.formPattern(name, field), keys: [...at, 'pattern'] })
+  }
+  return out
 }

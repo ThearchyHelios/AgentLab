@@ -5,27 +5,31 @@ import {
   DeleteButton, EmptyState, ErrorState, Field, Modal, SectionBar, Skeleton, Spinner, confirmDialog, toast,
 } from '../../components/ui'
 import { formatDateTime } from '../../lib/format'
-import { NOTIFY_TEXT as T } from '../../lib/terms'
+import { NOTIFY_TEXT as T, SETTINGS_ROLE_TEXT } from '../../lib/terms'
 import { useAtLeast } from '../../store/auth'
 import type { NotifyChannelRow } from '../../typesApp'
 
 /*
  * 设置 → 通知（A4 第 7 条）：待办、动作的事件推送到哪些地址。格式只有 Webhook 的四种（Q6），发送核心和定时任务的
  * 通知共用；消息里只放标题、状态和链接，不放报告里的数字。地址和签名密钥加密保存，之后只显示主机名。
- * 全局渠道只给管理员建；个人渠道每个人都能建（§3.12）
+ * 全局渠道只给管理员建；个人渠道每个人都能建（§3.12）。开了登录的使用者只看、只建自己的个人渠道（scope=user），
+ * 投递记录只给搭建者以上
  */
 
 const FORMATS = ['generic', 'feishu', 'wecom', 'dingtalk'] as const
 const EVENTS = Object.keys(T.eventLabel)
 
 export function NotifyTab() {
+  const builder = useAtLeast('builder')
   const [rows, setRows] = useState<NotifyChannelRow[] | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [editing, setEditing] = useState<NotifyChannelRow | 'new' | null>(null)
   const [testing, setTesting] = useState<string | null>(null)
   const load = useCallback(() => {
-    api.notify.channels().then(({ items }) => { setRows(items); setError(null) }).catch(setError)
-  }, [])
+    api.notify.channels()
+      .then(({ items }) => { setRows(builder ? items : items.filter((c) => c.scope === 'user')); setError(null) })
+      .catch(setError)
+  }, [builder])
   useEffect(load, [load])
 
   const test = async (row: NotifyChannelRow) => {
@@ -61,7 +65,7 @@ export function NotifyTab() {
   return (
     <div className="space-y-8" data-notify="">
       <section>
-        <SectionBar title={T.title} hint={T.hint}>
+        <SectionBar title={T.title} hint={builder ? T.hint : `${T.hint}。${SETTINGS_ROLE_TEXT.notifyPersonal}`}>
           <button className="btn btn-primary btn-sm" onClick={() => setEditing('new')} data-notify-create="">
             <Plus size={12} aria-hidden /> {T.create}
           </button>
@@ -99,7 +103,7 @@ export function NotifyTab() {
           </div>
         )}
       </section>
-      <Deliveries />
+      {builder && <Deliveries />}
       {editing && <ChannelEditor row={editing === 'new' ? null : editing} onClose={() => setEditing(null)}
                                  onSaved={(name) => { setEditing(null); toast.ok(T.saved(name)); load() }} />}
     </div>
@@ -134,6 +138,7 @@ function ChannelEditor({ row, onClose, onSaved }: {
   row: NotifyChannelRow | null; onClose: () => void; onSaved: (name: string) => void
 }) {
   const admin = useAtLeast('admin')
+  const builder = useAtLeast('builder')
   const [form, setForm] = useState({
     name: row?.name ?? '', scope: row?.scope ?? (admin ? 'global' : 'user'), format: row?.format ?? 'generic',
     url: '', secret: '', events: row?.events ?? ['task.opened', 'action.unknown'],
@@ -184,7 +189,7 @@ function ChannelEditor({ row, onClose, onSaved }: {
           <Field label={T.scope}>
             {(p) => (
               <select {...p} className="field" value={form.scope} onChange={(e) => setForm({ ...form, scope: e.target.value as typeof form.scope })}>
-                {(['global', 'app', 'user'] as const).map((k) => (
+                {(['global', 'app', 'user'] as const).filter((k) => builder || k === 'user').map((k) => (
                   <option key={k} value={k} disabled={k === 'global' && !admin}>{T.scopes[k]}</option>
                 ))}
               </select>

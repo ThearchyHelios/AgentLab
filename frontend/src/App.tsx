@@ -33,7 +33,7 @@ import {
   CommandPalette, PAGES, ShortcutHelp, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
   toggleTheme, usePages, useTheme, visiblePages, waitedFor,
 } from './components/CommandPalette'
-import { atLeast, loginOn, loginUrl, needsLogin, principalName, useAuth } from './store/auth'
+import { atLeast, authSettled, loginOn, loginUrl, needsLogin, prefsLocalOnly, principalName, useAuth } from './store/auth'
 import { ErrorBoundary, Kbd, OfflineBanner, Spinner, StatusBadge, isComposing, toast, useTicker } from './components/ui'
 import { applyTheme, normalizeTheme } from './lib/theme'
 import { ariaShortcut, isTypingTarget, matchShortcut } from './lib/keys'
@@ -46,7 +46,7 @@ import {
 import type { Attention, FaviconDot } from './lib/notify'
 import { useLeaveBlocker } from './lib/leave'
 import { useLocalActor } from './lib/actor'
-import { APP_TEXT, AUTH_MODE_LABEL, AUTH_TEXT, ROLE_LABEL, RUN_COMPARE_TEXT, runName } from './lib/terms'
+import { APP_TEXT, AUTH_MODE_LABEL, AUTH_TEXT, ROLE_LABEL, RUN_COMPARE_TEXT, TASK_NOTIFY_TEXT, runName } from './lib/terms'
 
 /** 启动时认人（/auth/me）最多等多久再取目录 */
 const AUTH_WAIT_MS = 2500
@@ -89,14 +89,19 @@ export default function App() {
   // 主题的真源在后端设置里。启动时没连上就等恢复再读一次，不然这次会话一直用缓存。
   // 读到过、或者人在这台设备上换过（导航、⌘K 都派发 agentlab:theme），就不再读，
   // 路上的那一次读回来也不应用：断线时换的主题不能在重连时被服务端的旧值翻回去
+  // 开了登录、又不是管理员（D-s）：主题只存本机，不读服务端那份全站共用的（使用者也读不到），先等认出人再决定
   const themeSettled = useRef(false)
   const loadTheme = () => {
     if (themeSettled.current) return
-    api.settings.get().then((s) => {
+    void authSettled().then((me) => {
       if (themeSettled.current) return
-      themeSettled.current = true
-      applyTheme(normalizeTheme(s?.ui?.theme))
-    }).catch(() => {})
+      if (prefsLocalOnly(me)) { themeSettled.current = true; return }
+      api.settings.get().then((s) => {
+        if (themeSettled.current) return
+        themeSettled.current = true
+        applyTheme(normalizeTheme(s?.ui?.theme))
+      }).catch(() => {})
+    })
   }
   useEffect(loadTheme, [])
   useEffect(() => {
@@ -440,7 +445,7 @@ function NotifyToggle() {
   if (!notifySupported()) return null
   const Icon = notify ? Bell : BellOff
   const tip = notify
-    ? '后台提醒：已开启 · 运行结束、失败或有新的待审批时发送系统通知'
+    ? '后台提醒：已开启 · 运行结束、失败或有新的待审批、待办时发送系统通知'
     : permission === 'denied'
       ? '后台提醒：浏览器已拒绝通知权限，请在站点设置中允许'
       : '后台提醒：已关闭 · 开启时浏览器将请求通知权限'
@@ -1148,6 +1153,51 @@ function watchApprovals(go: Go): () => void {
   })
 }
 
+/**
+ * 派给自己的新待办：规则同待审批——拿到过一次真列表才记底，之后新来的、标签页在后台时发系统通知。不每拍都取列表：
+ * 心跳取的「派给我的」待办数（taskCounts.mine）变了才取一次派给我的待处理待办。搭建者以上已经按待审批发过通知的
+ * （待办带着那条审批）不再发第二条；核实、等外部系统这类没有审批的待办只在这里通知
+ */
+function watchTasks(go: Go): () => void {
+  let seen: Set<string> | null = null
+  let inflight = false
+  let again = false
+  const pull = async () => {
+    if (inflight) { again = true; return }
+    inflight = true
+    try {
+      const { items } = await api.tasks.list({ assigned: 'me', status: 'pending', limit: 100 })
+      const pending = items.filter((t) => t.status === 'pending')
+      if (!seen) { seen = new Set(pending.map((t) => t.id)); return }
+      const fresh = pending.filter((t) => !seen!.has(t.id))
+      fresh.forEach((t) => seen!.add(t.id))
+      const builder = atLeast(useAuth.getState().me, 'builder')
+      const approvals = useCatalog.getState().approvals
+      for (const t of fresh) {
+        if (builder && t.approval_id && approvals.some((a) => a.id === t.approval_id)) continue
+        const owner = t.app_name ?? (t.workflow_name || t.workflow_id ? runName(t) : null)
+        notifyInBackground({
+          title: `${TASK_NOTIFY_TEXT.title}${t.title || TASK_NOTIFY_TEXT.untitled}`,
+          body: [owner, t.node_label].filter(Boolean).join(' · ') || undefined,
+          tag: `task:${t.id}`,
+          onClick: () => go(t.app_id ? `/apps/inbox/${encodeURIComponent(t.id)}` : `/runs/${t.run_id}`),
+        })
+      }
+    } catch {
+      // 下次待办数变了再取；没记底之前不发通知
+    } finally {
+      inflight = false
+      if (again) { again = false; void pull() }
+    }
+  }
+  return useCatalog.subscribe((s, p) => {
+    if (s.taskCounts === p.taskCounts || !s.taskCounts) return
+    if (seen && s.taskCounts.mine === p.taskCounts?.mine) return
+    if (needsLogin(useAuth.getState().me)) return
+    void pull()
+  })
+}
+
 function ShellSignals() {
   const { pathname, search } = useLocation()
   const navigate = useNavigate()
@@ -1185,7 +1235,7 @@ function ShellSignals() {
   navRef.current = navigate
   useEffect(() => {
     const go: Go = (to) => { if (to) navRef.current(to) }
-    const stops = [watchStudio(go), watchChat(go), watchApprovals(go)]
+    const stops = [watchStudio(go), watchChat(go), watchApprovals(go), watchTasks(go)]
     return () => stops.forEach((stop) => stop())
   }, [])
   return null

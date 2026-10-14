@@ -68,7 +68,7 @@ export function StampBlock({ node }: NodeProps) {
   const src = sourceOf(model, node)
   const stamp = node.data?.stamp ?? src?.stamp
   const state = blockState(node)
-  const onDemand = (src as { kind?: string } | null)?.kind === 'on_demand'
+  const onDemand = src?.kind === 'on_demand'
   const refresh = async () => {
     setBusy(true)
     try {

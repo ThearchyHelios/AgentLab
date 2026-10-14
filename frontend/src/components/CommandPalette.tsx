@@ -10,7 +10,7 @@ import {
 } from 'lucide-react'
 import { ApiError, api } from '../api/client'
 import { hasPendingApproval, useCatalog } from '../store/catalog'
-import { atLeast, loginOn, useAuth } from '../store/auth'
+import { atLeast, loginOn, prefsLocalOnly, useAuth } from '../store/auth'
 import { useConversations } from '../store/conversations'
 import { createWorkflow } from '../canvas/WorkflowPicker'
 import { Kbd, Modal, StatusBadge, isComposing, toast } from './ui'
@@ -125,6 +125,9 @@ let unsavedTheme: ThemePref | null = null
 /**
  * 换主题并存进设置。主题的真源是后端 settings 的 ui.theme（App 启动时按它
  * 应用），只写 localStorage 的话下次打开又被改回去。
+ *
+ * 开了登录、又不是管理员（D-s）：服务端的 ui 一组全站共用，改它要管理员，这里只存本机（applyTheme 已经写了
+ * localStorage），不发请求、不提示失败
  */
 export async function setThemePref(pref: ThemePref): Promise<void> {
   applyTheme(pref)
@@ -132,6 +135,10 @@ export async function setThemePref(pref: ThemePref): Promise<void> {
   // 设置页的下拉若开着，听这个事件同步，免得它手上的旧值被再存回去；App 听它
   // 记下「人在这台设备上换过」，重连时就不再拿服务端的旧值翻回去
   window.dispatchEvent(new CustomEvent('agentlab:theme', { detail: pref }))
+  if (prefsLocalOnly(useAuth.getState().me)) {
+    unsavedTheme = null
+    return
+  }
   try {
     await saveTheme(pref)
   } catch (e) {
@@ -163,6 +170,10 @@ async function saveTheme(pref: ThemePref): Promise<void> {
  */
 export function flushThemePref(): boolean {
   if (!unsavedTheme) return false
+  if (prefsLocalOnly(useAuth.getState().me)) {
+    unsavedTheme = null
+    return true
+  }
   void saveTheme(unsavedTheme).catch(() => {})
   return true
 }
@@ -177,7 +188,7 @@ export async function toggleNotify(): Promise<void> {
     return
   }
   const permission = await enableNotify()
-  if (permission === 'granted') toast.ok('后台提醒已开启：标签页在后台时，运行结束、失败或有新的待审批将发送系统通知')
+  if (permission === 'granted') toast.ok('后台提醒已开启：标签页在后台时，运行结束、失败或有新的待审批、待办时发送系统通知')
   else if (permission === 'denied') {
     toast.warn('浏览器已拒绝通知权限', {
       detail: '请在地址栏左侧的站点设置中将「通知」改为允许，然后重新打开此开关。',
@@ -422,7 +433,7 @@ function PaletteView() {
     if (notifySupported()) {
       list.push({
         id: 'act:notify', group: 'actions', label: notify ? '关闭后台提醒' : '开启后台提醒',
-        hint: '标签页在后台时，运行结束、失败或有新的待审批将发送系统通知',
+        hint: '标签页在后台时，运行结束、失败或有新的待审批、待办时发送系统通知',
         keywords: 'notification 通知 提醒 后台', icon: notify ? <BellOff size={14} /> : <Bell size={14} />,
         run: () => void toggleNotify(),
       })

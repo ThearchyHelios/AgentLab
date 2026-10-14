@@ -126,7 +126,7 @@ export function CheckSection() {
                       <div className="mono text-2xs text-faint">{issue.code}{issue.path ? ` · ${issue.path}` : ''}</div>
                     </div>
                     {where && (
-                      <button type="button" className="btn btn-xs btn-ghost shrink-0" onClick={() => goto(where.section, where.component)}
+                      <button type="button" className="btn btn-xs btn-ghost shrink-0" onClick={() => goto(where.section, where.component, where.path)}
                               data-app-issue-locate="">
                         <Crosshair size={10} aria-hidden /> {T.locate}
                       </button>
@@ -160,7 +160,7 @@ export function PublishSection({ onPublished }: { onPublished: () => void }) {
       if (dirty && !(await save())) return
       const res = await api.apps.publish(appId, { note: note.trim() || undefined, ...(dispositions ? { dispositions } : {}) })
       if (res.ok && res.version != null) {
-        toast.ok(T.published(res.version))
+        toast.ok(T.published(res.version, res.level))
         setAsking(null)
         setNote('')
         loadVersions()
@@ -203,7 +203,7 @@ export function PublishSection({ onPublished }: { onPublished: () => void }) {
                   <XCircle size={13} className="mt-0.5 shrink-0" style={{ color: issue.level === 'error' ? 'var(--err)' : 'var(--warn)' }} aria-hidden />
                   <span className="min-w-0 flex-1">{issue.message}</span>
                   {where && (
-                    <button type="button" className="btn btn-xs btn-ghost" onClick={() => goto(where.section, where.component)}>
+                    <button type="button" className="btn btn-xs btn-ghost" onClick={() => goto(where.section, where.component, where.path)}>
                       {T.locate}
                     </button>
                   )}

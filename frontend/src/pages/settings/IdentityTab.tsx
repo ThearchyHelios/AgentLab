@@ -14,7 +14,7 @@ import type { AuthMode, GroupRow, Role, UserRow } from '../../typesApp'
  * 设置 → 身份（A7、§3.12）：登录方式、单点登录、使用者能否问数据、用户、组。只给管理员；关登录时所有人等同管理员。
  *
  * 从关闭登录切到本地账号时，必须在同一个请求里建出第一个管理员（否则切过去没有人能登录）；切到单点登录时至少
- * 配一个映射为管理员的组。环境变量指定了登录方式时这里只读。人员变动只改组成员，不发应用的新版本（写审计）
+ * 配一个映射为管理员的用户或组（admin_users、admin_groups 至少一项：小团队的单点登录服务常常没有组声明）。环境变量指定了登录方式时这里只读。人员变动只改组成员，不发应用的新版本（写审计）
  */
 
 const MODES: AuthMode[] = ['off', 'local', 'oidc']
@@ -56,7 +56,7 @@ function ModeSection({ settings, onSaved }: { settings: Settings; onSaved: () =>
     Array.isArray(oidc[key]) ? oidc[key].join('\n') : typeof oidc[key] === 'string' ? oidc[key] : ''
   const setList = (key: string, text: string) =>
     setOidc((o) => ({ ...o, [key]: text.split('\n').map((x) => x.trim()).filter(Boolean) }))
-  const missingAdmin = mode === 'oidc' && !oidcList('admin_groups').trim()
+  const missingAdmin = mode === 'oidc' && !oidcList('admin_groups').trim() && !oidcList('admin_users').trim()
   const changed = mode !== settings.mode || chat !== settings.user_can_chat || JSON.stringify(oidc) !== JSON.stringify(settings.oidc ?? {})
 
   const save = async () => {
@@ -122,11 +122,15 @@ function ModeSection({ settings, onSaved }: { settings: Settings; onSaved: () =>
                                value={oidc[k] ?? ''} onChange={(e) => setOidc((o) => ({ ...o, [k]: e.target.value }))} />}
               </Field>
             ))}
-            <Field label={T.oidcAdminGroups} error={missingAdmin ? T.oidcAdminRequired : undefined}>
-              {(p) => <textarea {...p} className="field mono text-xs" rows={2} value={oidcList('admin_groups')}
-                                onChange={(e) => setList('admin_groups', e.target.value)} />}
+            <Field label={T.oidcAdminUsers} hint={T.oidcListHint} error={missingAdmin ? T.oidcAdminRequired : undefined}>
+              {(p) => <textarea {...p} className="field mono text-xs" rows={2} value={oidcList('admin_users')}
+                                onChange={(e) => setList('admin_users', e.target.value)} data-identity-admin-users="" />}
             </Field>
-            <Field label={T.oidcBuilderGroups}>
+            <Field label={T.oidcAdminGroups} hint={T.oidcListHint}>
+              {(p) => <textarea {...p} className="field mono text-xs" rows={2} value={oidcList('admin_groups')}
+                                onChange={(e) => setList('admin_groups', e.target.value)} data-identity-admin-groups="" />}
+            </Field>
+            <Field label={T.oidcBuilderGroups} hint={T.oidcListHint}>
               {(p) => <textarea {...p} className="field mono text-xs" rows={2} value={oidcList('builder_groups')}
                                 onChange={(e) => setList('builder_groups', e.target.value)} />}
             </Field>

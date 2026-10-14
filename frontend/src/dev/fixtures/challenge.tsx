@@ -3,6 +3,7 @@ import { ReactFlow, ReactFlowProvider } from '@xyflow/react'
 import { Inspector } from '../../canvas/Inspector'
 import { NodeCard } from '../../canvas/NodeCard'
 import { ApprovalCard } from '../../run/RunPanel'
+import { withTask } from '../taskOf'
 import { ChallengeSummary } from '../../run/ChallengeSummary'
 import { useCatalog } from '../../store/catalog'
 import { useStudio } from '../../store/studio'
@@ -66,7 +67,7 @@ function Card({ approval, name, dense = false }: { approval: Approval; name: str
   return (
     <div className={dense ? 'w-[360px] max-w-full border-r bg-panel' : 'mx-auto max-w-3xl p-4'} data-fixture={name}>
       <div className="overflow-hidden rounded-lg border" style={{ borderColor: 'var(--warn)' }}>
-        <ApprovalCard approval={approval} onResolved={() => undefined} />
+        <ApprovalCard approval={withTask(approval)} onResolved={() => undefined} />
       </div>
     </div>
   )

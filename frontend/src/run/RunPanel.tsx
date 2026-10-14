@@ -59,8 +59,9 @@ type ApprovalTask =
   | { state: 'error'; message: string; reload: () => void }
 
 /**
- * 一条审批对应的待办。审批带着 task（检查脚本的桩数据、以后服务端直接带上）就直接用；否则按运行取待办、按
- * approval_id 对上。升级时服务端为存量的待审批补建了待办，找不到说明服务端还没建（旧版本）或者已经处理掉了
+ * 一条审批对应的待办。审批带着 task（预览的桩数据）就直接用；带着 task_id（服务端在审批列表上给，D-r）按 id 取那一条；
+ * 都没有（老服务端）才按运行取待办、按 approval_id 对上。升级时服务端为存量的待审批补建了待办，找不到说明服务端还没建
+ * （旧版本）或者已经处理掉了
  */
 function useApprovalTask(approval: Approval & { task?: Task }): ApprovalTask {
   const [state, setState] = useState<ApprovalTask>(approval.task ? { state: 'ok', task: approval.task } : { state: 'loading' })
@@ -69,15 +70,18 @@ function useApprovalTask(approval: Approval & { task?: Task }): ApprovalTask {
     if (approval.task) { setState({ state: 'ok', task: approval.task }); return }
     let alive = true
     const reload = () => setEpoch((n) => n + 1)
-    api.tasks.list({ run_id: approval.run_id, assigned: 'all' })
-      .then(({ items }) => {
+    const found = approval.task_id
+      ? api.tasks.get(approval.task_id)
+      : api.tasks.list({ run_id: approval.run_id, assigned: 'all' })
+        .then(({ items }) => items.find((t) => t.approval_id === approval.id) ?? null)
+    found
+      .then((task) => {
         if (!alive) return
-        const task = items.find((t) => t.approval_id === approval.id)
         setState(task ? { state: 'ok', task } : { state: 'error', message: '', reload })
       })
       .catch((e) => { if (alive) setState({ state: 'error', message: errorMessage(e), reload }) })
     return () => { alive = false }
-  }, [approval.id, approval.run_id, approval.task, epoch])
+  }, [approval.id, approval.run_id, approval.task, approval.task_id, epoch])
   return state
 }
 

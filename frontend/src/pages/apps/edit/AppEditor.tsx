@@ -1,7 +1,8 @@
 /**
  * 应用编辑（搭建面，docs/design/app-platform-and-look.md 第四部分、A1、A2、A8）：/apps/:appId/edit[/:section]。
  *
- * 分节：固定版本、页面（页面树 + 属性面板）、预览、检查、发布、岗位与授权、钩子、通知；右侧是助手（应用润色）。
+ * 分节：固定版本、页面（页面树 + 属性面板）、入口与表单（JSON 编辑）、预览、检查、发布、岗位与授权、钩子、通知；
+ * 右侧是助手（应用润色）。
  * 草稿存在应用上（PATCH /api/apps/{id}），只在发布时生成不可变的应用版本——草稿不进版本表（F3 的教训）。
  * 预览按草稿解析布局、不发起运行；检查和发布同一套规则，都读服务端那份草稿，所以先保存再查。
  *
@@ -13,21 +14,23 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Bot, ExternalLink, LayoutGrid, Save } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../../api/client'
-import { ErrorState, Field, PageHeader, Skeleton, Spinner, confirmDialog, isComposing, toast } from '../../../components/ui'
+import { EmptyState, ErrorState, Field, PageHeader, Skeleton, Spinner, confirmDialog, isComposing, toast } from '../../../components/ui'
 import { formatTime } from '../../../lib/format'
 import { matchShortcut } from '../../../lib/keys'
 import { useLeaveGuard } from '../../../lib/leave'
 import { APP_EDITOR_TEXT as T } from '../../../lib/terms'
 import { useCatalog } from '../../../store/catalog'
-import type { AppBindings, AppDetail, AppSpec, ComponentCatalog } from '../../../typesApp'
+import type { AppDetailOut } from '../../../api/apps'
+import type { AppBindings, AppSpec, ComponentCatalog } from '../../../typesApp'
 import { EditorContext, type EditorState } from './context'
 import { PinsSection, PublishedVersionPicker } from './PinsSection'
 import { PagesSection } from './PagesSection'
 import { CheckSection, PreviewSection, PublishSection } from './ReviewSections'
 import { AccessSection, HooksSection, NotifySection } from './AccessSections'
 import { AppAssistant } from './AppAssistant'
+import { FormsSection } from './FormsSection'
 
-const SECTIONS = ['pins', 'pages', 'preview', 'check', 'publish', 'access', 'hooks', 'notify'] as const
+const SECTIONS = ['pins', 'pages', 'forms', 'preview', 'check', 'publish', 'access', 'hooks', 'notify'] as const
 type Section = typeof SECTIONS[number]
 
 /** 组件目录整站一份，进一次编辑器取一次就够 */
@@ -114,7 +117,7 @@ function EditApp({ appId }: { appId: string }) {
   const { section: raw } = useParams()
   const navigate = useNavigate()
   const section: Section = (SECTIONS as readonly string[]).includes(raw ?? '') ? raw as Section : 'pages'
-  const [detail, setDetail] = useState<AppDetail | null>(null)
+  const [detail, setDetail] = useState<AppDetailOut | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [draft, setDraftState] = useState<AppSpec | null>(null)
   const [bindings, setBindingsState] = useState<AppBindings>({ slots: {} })
@@ -123,6 +126,7 @@ function EditApp({ appId }: { appId: string }) {
   const [savedAt, setSavedAt] = useState<number | null>(null)
   const [catalog, setCatalog] = useState<ComponentCatalog | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
+  const [focusPath, setFocusPath] = useState<string | null>(null)
   const [assistant, setAssistant] = useState(true)
   // 保存用的是最新的草稿：助手的操作和人的编辑挨着到时，闭包里那份可能已经旧了
   const latest = useRef<{ draft: AppSpec | null; bindings: AppBindings }>({ draft: null, bindings: { slots: {} } })
@@ -155,7 +159,8 @@ function EditApp({ appId }: { appId: string }) {
     try {
       const next = await api.apps.update(appId, { name: cur.draft.name, description: cur.draft.description,
                                                    draft: cur.draft, draft_bindings: cur.bindings })
-      setDetail(next)
+      // 保存草稿的回包不带补算计划（只看发布版，草稿改了也不变）：留着手上那份
+      setDetail((cur) => ({ ...next, backfill: next.backfill ?? cur?.backfill }))
       // 保存期间又改了的，那些改动还算没保存
       if (latest.current.draft === cur.draft && latest.current.bindings === cur.bindings) setDirty(false)
       setSavedAt(Date.now())
@@ -191,13 +196,23 @@ function EditApp({ appId }: { appId: string }) {
     setBindings: (fn) => { setBindingsState((cur) => fn(cur)); setDirty(true) },
     bindings, save,
     select: setSelected,
-    goto: (s, componentId) => {
+    goto: (s, componentId, path) => {
       if (componentId !== undefined) setSelected(componentId)
+      if (path !== undefined) setFocusPath(path)
       navigate(`/apps/${encodeURIComponent(appId)}/edit/${s}`)
     },
-  } : null), [appId, detail, draft, catalog, dirty, selected, bindings, save, navigate])
+    focusPath,
+    clearFocus: () => setFocusPath(null),
+  } : null), [appId, detail, draft, catalog, dirty, selected, bindings, save, navigate, focusPath])
 
   if (error) return <ErrorState error={error} onRetry={() => void load()} className="m-6" />
+  // 没有 manage 的人取不到草稿（D-m）：手动打开编辑地址时说清楚，别一直停在骨架屏
+  if (detail && (detail.my_role !== 'manage' || !detail.draft)) {
+    return (
+      <EmptyState icon={<LayoutGrid size={22} aria-hidden />} title={T.noManage} body={T.noManageBody} offline={false}
+                  className="m-6" action={<Link to={`/apps/${encodeURIComponent(appId)}`} className="btn btn-sm">{T.open}</Link>} />
+    )
+  }
   if (!ctx) return <div className="p-6"><Skeleton rows={6} height={28} /></div>
 
   return (
@@ -234,6 +249,7 @@ function EditApp({ appId }: { appId: string }) {
           <main className="min-w-0 flex-1 overflow-y-auto" data-app-pane={section}>
             {section === 'pins' && <PinsSection />}
             {section === 'pages' && (ctx.catalog ? <PagesSection /> : <div className="p-4"><Skeleton rows={4} /></div>)}
+            {section === 'forms' && <FormsSection />}
             {section === 'preview' && <PreviewSection />}
             {section === 'check' && <CheckSection />}
             {section === 'publish' && <PublishSection onPublished={() => void load()} />}

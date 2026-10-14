@@ -307,6 +307,22 @@ export function StudioPage() {
     void useStudio.getState().previewUpgrade()
   }, [upgradeParam, workflow, workflowId, setParams, location.key])
 
+  // ?publish=1：问数据回答上点「做成应用」，提取出工作流后跳过来（A8）。图打开之后直接打开发布弹窗，发布成功的提示里
+  // 再点「做成应用」进应用编辑。读完就摘掉，理由同上。有未保存的修改时不打开（发布按钮本来也要求先保存）
+  const publishParam = params.get('publish')
+  const publishAsked = useRef<string | null>(null)
+  useEffect(() => {
+    if (publishParam !== '1' || !workflow || workflow.id !== workflowId) return
+    if (publishAsked.current === location.key) return
+    publishAsked.current = location.key
+    setParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.delete('publish')
+      return next
+    }, { replace: true })
+    if (!useStudio.getState().dirty) setPublishing(true)
+  }, [publishParam, workflow, workflowId, setParams, location.key])
+
   // 开始跑图或生成时，属性面板让开——不然进展发生在一块被盖住的地方。
   // （选中节点即滑出属性面板，取消选中即收起，不再需要手动切 tab）
   useEffect(() => {

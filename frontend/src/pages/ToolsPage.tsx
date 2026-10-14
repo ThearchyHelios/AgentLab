@@ -15,7 +15,11 @@ import { checkHealth, forgetHealth, healthFromServer, useHealth } from '../lib/h
 import type { HealthRecord } from '../lib/health'
 import { ariaShortcut, matchShortcut } from '../lib/keys'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
-import { CAPABILITY_TEXT, ENDPOINT_TEXT, TOOL_TRUST_HINT, TOOL_TRUST_LABEL, TOOL_TRUST_TEXT, TOOL_TRUST_VALUES } from '../lib/terms'
+import {
+  CAPABILITY_TEXT, ENDPOINT_TEXT, MCP_AUTH_TEXT, TOOL_ENDPOINT_TEXT, TOOL_TRUST_HINT, TOOL_TRUST_LABEL, TOOL_TRUST_TEXT, TOOL_TRUST_VALUES,
+} from '../lib/terms'
+import { useAtLeast } from '../store/auth'
+import type { EndpointRow } from '../typesApp'
 import { CapabilitiesTab } from './tools/CapabilitiesTab'
 import { EndpointsTab } from './tools/EndpointsTab'
 import { useRunClock } from '../run/useRunClock'
@@ -575,6 +579,7 @@ function CustomTools() {
   const [rows, setRows] = useState<any[] | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [editing, setEditing] = useState<any | null>(null)
+  const endpoints = useEndpoints()
 
   // ?edit=<工具名>：运行失败说「参数定义写坏了」时直接打开那一个的编辑框，不用再翻列表。
   // 读完就从地址里摘掉，免得关了弹窗、刷新一下又弹出来
@@ -639,6 +644,12 @@ function CustomTools() {
                 <div className="flex items-center gap-2">
                   <span className="mono text-sm font-medium">{row.name}</span>
                   <span className="chip">{row.kind === 'python' ? 'Python' : 'HTTP'}</span>
+                  {row.kind === 'http' && row.config?.endpoint && (
+                    <span className="chip" title={TOOL_ENDPOINT_TEXT.hint} data-custom-tool-bound="">
+                      {TOOL_ENDPOINT_TEXT.bind} {endpoints?.find((e) => e.id === row.config.endpoint || e.name === row.config.endpoint)?.name
+                        ?? String(row.config.endpoint)}
+                    </span>
+                  )}
                   {row.problem && <ProblemChip problem={row.problem} />}
                   {!row.enabled && <span className="chip" title="停用的工具不出现在工具库和节点里">已停用</span>}
                 </div>
@@ -710,8 +721,14 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
 
   const nameError = form.name && !TOOL_NAME_RE.test(form.name) ? '只能包含英文字母、数字和下划线，且不能以数字开头' : null
   const dirty = JSON.stringify(form) !== JSON.stringify(initial)
-  const missingConfig = [form.kind === 'http' && !form.config.url && 'URL', form.kind === 'python' && !form.config.code && '代码']
-    .filter(Boolean) as string[]
+  // 绑定登记的端点（§3.9）：config 是 {endpoint, method, path, query, body}，只填路径，地址和认证头由端点按环境提供
+  const endpoints = useEndpoints()
+  const bound = form.kind === 'http' && !!form.config.endpoint
+  const missingConfig = [
+    form.kind === 'http' && !bound && !form.config.url && 'URL',
+    bound && !String(form.config.path ?? '').trim() && TOOL_ENDPOINT_TEXT.path,
+    form.kind === 'python' && !form.config.code && '代码',
+  ].filter(Boolean) as string[]
   const missing = [...(form.name ? [] : ['名称']), ...missingConfig]
   // 试跑结果对应的是哪一份配置和参数：之后改了就把结果标成旧的，免得拿旧结果当新配置的
   const trialSig = JSON.stringify([form.kind, form.parameters ?? {}, form.config, args ?? {}])
@@ -751,6 +768,22 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
   }
 
   const setConfig = (patch: any) => setForm((f: any) => ({ ...f, config: { ...f.config, ...patch } }))
+  /**
+   * 换绑端点：绑定时 config 换成 {endpoint, method, path, query, body}（地址、请求头不再用：端点提供），不绑定时换回
+   * {method, url, headers, body, parse_json}。方法和请求体两边都留着
+   */
+  const bindEndpoint = (ref: string) => setForm((f: any) => {
+    const { method, body } = f.config
+    return {
+      ...f,
+      config: ref
+        ? { endpoint: ref, method: method ?? 'GET', path: f.config.path ?? '', query: f.config.query ?? {}, ...(body !== undefined ? { body } : {}) }
+        : { method: method ?? 'GET', url: '', headers: {}, parse_json: true, ...(body !== undefined ? { body } : {}) },
+    }
+  })
+  const endpointValue = endpoints?.find((e) => e.id === form.config.endpoint || e.name === form.config.endpoint)?.id
+    ?? form.config.endpoint ?? ''
+  const endpointMissing = bound && !!endpoints && !endpoints.some((e) => e.id === form.config.endpoint || e.name === form.config.endpoint)
 
   return (
     <Modal open onClose={onClose} dirty={dirty} title={row.id ? `编辑工具「${row.name}」` : '新建工具'} width={640}
@@ -806,7 +839,45 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
         </Field>
         </div>
 
-        {form.kind === 'http' ? (
+        {form.kind === 'http' && (
+          <Field label={TOOL_ENDPOINT_TEXT.bind} hint={endpoints && !endpoints.length ? TOOL_ENDPOINT_TEXT.noEndpoints : TOOL_ENDPOINT_TEXT.hint}
+                 error={endpointMissing ? TOOL_ENDPOINT_TEXT.missing(String(form.config.endpoint)) : undefined}>
+            {(p) => (
+              <select {...p} className="field" value={endpointValue} onChange={(e) => bindEndpoint(e.target.value)}
+                      data-custom-tool-endpoint="">
+                <option value="">{TOOL_ENDPOINT_TEXT.none}</option>
+                {(endpoints ?? []).map((ep) => <option key={ep.id} value={ep.id}>{ep.name}</option>)}
+                {endpointMissing && <option value={endpointValue} disabled>{String(form.config.endpoint)}</option>}
+              </select>
+            )}
+          </Field>
+        )}
+        {form.kind === 'http' && bound ? (
+          <>
+            <div className="grid grid-cols-[110px_1fr] gap-3">
+              <Field label="方法">
+                {(p) => (
+                  <select {...p} className="field" value={form.config.method ?? 'GET'}
+                          onChange={(e) => setConfig({ method: e.target.value })}>
+                    {['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map((m) => <option key={m}>{m}</option>)}
+                  </select>
+                )}
+              </Field>
+              <Field label={TOOL_ENDPOINT_TEXT.path} required hint={TOOL_ENDPOINT_TEXT.pathHint}>
+                {(p) => (
+                  <input {...p} className="field mono text-xs" value={form.config.path ?? ''} placeholder="/orders/{{ order_id }}"
+                         onChange={(e) => setConfig({ path: e.target.value })} data-custom-tool-path="" />
+                )}
+              </Field>
+            </div>
+            <Field label={TOOL_ENDPOINT_TEXT.query}>
+              {(p) => <JsonInput id={p.id} value={form.config.query ?? {}} rows={3} onChange={(v) => setConfig({ query: v ?? {} })} />}
+            </Field>
+            <Field label={TOOL_ENDPOINT_TEXT.body}>
+              {(p) => <JsonInput id={p.id} value={form.config.body} rows={4} onChange={(v) => setConfig({ body: v })} />}
+            </Field>
+          </>
+        ) : form.kind === 'http' ? (
           <>
             <div className="grid grid-cols-[110px_1fr] gap-3">
               <Field label="方法">
@@ -893,7 +964,48 @@ function mcpServerRecord(row: any): HealthRecord | undefined {
 }
 
 /** 决定连哪个进程 / 地址的那几项。改了它们，上次探测的结果说的就是另一个服务了 */
-const mcpConnection = (f: any) => JSON.stringify([f.transport, f.command.trim(), f.args.trim(), f.env ?? {}, f.url.trim()])
+const mcpConnection = (f: any) => JSON.stringify([f.transport, f.command.trim(), f.args.trim(), f.env ?? {}, f.url.trim(),
+  f.headers ?? {}, f.endpoint_id ?? null])
+
+/** 登记的端点（绑定用）。取不到时为空列表，照样能不绑定 */
+function useEndpoints(): EndpointRow[] | null {
+  const [rows, setRows] = useState<EndpointRow[] | null>(null)
+  useEffect(() => { api.endpoints.list().then(({ items }) => setRows(items), () => setRows([])) }, [])
+  return rows
+}
+
+/**
+ * 认证头按行编辑：名称、值。已存的值服务端只回掩码，不改的保持掩码原样提交（表示保持原值）；新值加密保存
+ */
+function HeadersEditor({ value, onChange, disabled }: {
+  value: Record<string, string>; onChange: (v: Record<string, string>) => void; disabled?: boolean
+}) {
+  const [rows, setRows] = useState(() => Object.entries(value ?? {}).map(([k, v]) => ({ k, v })))
+  const push = (next: { k: string; v: string }[]) => {
+    setRows(next)
+    onChange(Object.fromEntries(next.filter((r) => r.k.trim()).map((r) => [r.k.trim(), r.v])))
+  }
+  return (
+    <div className="space-y-1.5" data-mcp-headers={rows.length}>
+      {rows.map((r, i) => (
+        <div key={i} className="flex items-center gap-2">
+          <input className="field mono w-44 text-xs" value={r.k} placeholder="Authorization" disabled={disabled}
+                 aria-label={`${MCP_AUTH_TEXT.headerName} ${i + 1}`}
+                 onChange={(e) => push(rows.map((x, j) => (j === i ? { ...x, k: e.target.value } : x)))} />
+          <input className="field mono min-w-0 flex-1 text-xs" value={r.v} disabled={disabled} autoComplete="off"
+                 aria-label={`${MCP_AUTH_TEXT.headerValue} ${i + 1}`} data-mcp-header-value=""
+                 onChange={(e) => push(rows.map((x, j) => (j === i ? { ...x, v: e.target.value } : x)))} />
+          <DeleteButton label={`${MCP_AUTH_TEXT.headerName} ${r.k || i + 1}`} disabled={disabled}
+                        onClick={() => push(rows.filter((_, j) => j !== i))} />
+        </div>
+      ))}
+      <button type="button" className="btn btn-xs" disabled={disabled} onClick={() => push([...rows, { k: '', v: '' }])}
+              data-mcp-header-add="">
+        <Plus size={10} aria-hidden /> {MCP_AUTH_TEXT.addHeader}
+      </button>
+    </div>
+  )
+}
 
 function McpServers() {
   const refresh = useCatalog((s) => s.refresh)
@@ -957,7 +1069,10 @@ function McpServers() {
     }
   }
 
-  const create = () => setEditing({ transport: 'stdio', args: [], env: {}, enabled: true })
+  // 本地子进程会在服务器上执行命令，只有管理员能建（A6 第 6 条）：别的角色新建时默认 HTTP
+  const admin = useAtLeast('admin')
+  const create = () => setEditing(admin ? { transport: 'stdio', args: [], env: {}, enabled: true }
+    : { transport: 'http', args: [], env: {}, headers: {}, enabled: true })
 
   return (
     <div className="mx-auto max-w-4xl p-4">
@@ -1074,17 +1189,22 @@ function McpEditor({ row, onClose, onSaved }: {
   /** reconnected：连接配置改过了，之前的探测结果不再代表它 */
   onSaved: (name: string, reconnected: boolean) => void
 }) {
+  const admin = useAtLeast('admin')
+  const endpoints = useEndpoints()
   const [initial] = useState(() => ({
     name: row.name ?? '', transport: row.transport ?? 'stdio', command: row.command ?? '',
     args: (row.args ?? []).join(' '), env: row.env ?? {}, url: row.url ?? '', enabled: row.enabled ?? true,
+    headers: row.headers ?? {}, endpoint_id: row.endpoint_id ?? null,
   }))
   const [form, setForm] = useState<any>(initial)
   const [busy, setBusy] = useState(false)
   const dirty = JSON.stringify(form) !== JSON.stringify(initial)
+  // 本地子进程只有管理员能建、能改：已有的本地子进程服务对别的角色只读
+  const locked = !admin && initial.transport === 'stdio' && !!row.id
   const missing = [
     !form.name.trim() && '名称',
     form.transport === 'stdio' && !form.command.trim() && '命令',
-    form.transport !== 'stdio' && !form.url.trim() && 'URL',
+    form.transport !== 'stdio' && !form.endpoint_id && !form.url.trim() && 'URL',
   ].filter(Boolean) as string[]
 
   const submit = async () => {
@@ -1106,12 +1226,15 @@ function McpEditor({ row, onClose, onSaved }: {
     <Modal open onClose={onClose} dirty={dirty} title={row.id ? `编辑 MCP 服务「${row.name}」` : '添加 MCP 服务'}
            footer={<>
              <button className="btn" onClick={onClose}>取消</button>
-             <button className="btn btn-primary" onClick={() => void submit()} disabled={busy || missing.length > 0}
-                     title={missing.length ? `还缺：${missing.join('、')}` : undefined}>
-               {busy ? <Spinner size={11} /> : null} 保存
-             </button>
+             {!locked && (
+               <button className="btn btn-primary" onClick={() => void submit()} disabled={busy || missing.length > 0}
+                       title={missing.length ? `还缺：${missing.join('、')}` : undefined}>
+                 {busy ? <Spinner size={11} /> : null} 保存
+               </button>
+             )}
            </>}>
-      <div className="space-y-3">
+      <fieldset disabled={locked} className="m-0 min-w-0 space-y-3 border-0 p-0" data-mcp-editor={form.transport}>
+        {locked && <p className="text-2xs" style={{ color: 'var(--st-waiting)' }} data-mcp-stdio-locked="">{MCP_AUTH_TEXT.stdioReadOnly}</p>}
         <div className="grid grid-cols-[1fr_200px] gap-3">
           <Field label="名称" required hint="节点里按 mcp:名称/工具名 引用">
             {(p) => (
@@ -1123,12 +1246,13 @@ function McpEditor({ row, onClose, onSaved }: {
             {(p) => (
               <select {...p} className="field" value={form.transport}
                       onChange={(e) => setForm({ ...form, transport: e.target.value })}>
-                <option value="stdio">stdio（本地子进程）</option>
+                <option value="stdio" disabled={!admin}>stdio（本地子进程）</option>
                 <option value="http">HTTP（远程）</option>
               </select>
             )}
           </Field>
         </div>
+        {!admin && !locked && <p className="text-2xs text-faint" data-mcp-stdio-admin="">{MCP_AUTH_TEXT.stdioAdmin}</p>}
         {form.transport === 'stdio' ? (
           <>
             <Field label="命令" required>
@@ -1149,18 +1273,36 @@ function McpEditor({ row, onClose, onSaved }: {
             </Field>
           </>
         ) : (
-          <Field label="URL" required>
-            {(p) => (
-              <input {...p} className="field mono text-xs" value={form.url} placeholder="https://example.com/mcp"
-                     onChange={(e) => setForm({ ...form, url: e.target.value })} />
-            )}
-          </Field>
+          <>
+            <Field label={MCP_AUTH_TEXT.endpoint} hint={MCP_AUTH_TEXT.endpointHint}>
+              {(p) => (
+                <select {...p} className="field" value={form.endpoint_id ?? ''} data-mcp-endpoint=""
+                        onChange={(e) => setForm({ ...form, endpoint_id: e.target.value || null })}>
+                  <option value="">{MCP_AUTH_TEXT.endpointNone}</option>
+                  {(endpoints ?? []).map((ep) => <option key={ep.id} value={ep.id}>{ep.name}</option>)}
+                  {form.endpoint_id && endpoints && !endpoints.some((ep) => ep.id === form.endpoint_id) && (
+                    <option value={form.endpoint_id} disabled>{TOOL_ENDPOINT_TEXT.missing(form.endpoint_id)}</option>
+                  )}
+                </select>
+              )}
+            </Field>
+            <Field label={form.endpoint_id ? TOOL_ENDPOINT_TEXT.path : 'URL'} required={!form.endpoint_id}>
+              {(p) => (
+                <input {...p} className="field mono text-xs" value={form.url}
+                       placeholder={form.endpoint_id ? '/mcp' : 'https://example.com/mcp'}
+                       onChange={(e) => setForm({ ...form, url: e.target.value })} />
+              )}
+            </Field>
+            <Field label={MCP_AUTH_TEXT.headers} hint={MCP_AUTH_TEXT.headersHint}>
+              {() => <HeadersEditor value={form.headers} disabled={locked} onChange={(v) => setForm((f: any) => ({ ...f, headers: v }))} />}
+            </Field>
+          </>
         )}
         <label className="flex items-center gap-2 text-xs">
           <input type="checkbox" checked={!!form.enabled} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} />
           启用
         </label>
-      </div>
+      </fieldset>
     </Modal>
   )
 }

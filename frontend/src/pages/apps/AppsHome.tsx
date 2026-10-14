@@ -103,7 +103,7 @@ function InboxRow({ task }: { task: Task }) {
   const voters = task.assignments.filter((a) => a.status !== 'withdrawn')
   const agreed = voters.filter((a) => a.status === 'responded' && a.decision !== 'reject').length
   const pending = task.status === 'pending'
-  const where = (task as Task & { node_label?: string | null }).node_label
+  const where = task.node_label
   return (
     <li>
       <Link to={`/apps/inbox/${encodeURIComponent(task.id)}`} data-inbox-task={task.id} data-task-kind={task.kind}

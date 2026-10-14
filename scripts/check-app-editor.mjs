@@ -5,7 +5,11 @@
 //   - 只能固定已发布且未退役的版本（A1）；新建应用从版本确定性派生，不靠模型（A8、P3）；
 //   - 属性面板由组件目录的 props schema 驱动；绑定种类只能从目录登记的里挑；可见性表达式只编辑、不在浏览器求值（A2、P7）；
 //   - 固定版本升版必须选处置，不给默认值，写清后果（口径升版是必须处置的事件）；
-//   - 助手只润色：应用操作到一条落一条，final 的整份 spec 为准；ask 结束这一轮。
+//   - 助手只润色：应用操作到一条落一条，final 的整份 spec 为准；ask 结束这一轮；
+//   - 助手对话按应用一段（D-e）：先取或建、请求带 conversation_id、每轮落一条（问题、说明、查看记录），之前的轮次显示出来；
+//   - 钩子按名字（D-g）：声明 ∪ 已有的行，标出发布版里有没有、生成过密钥没有；密钥只显示一次；
+//   - 入口、表单、待办外观按 JSON 编辑（带格式校验），检查的 path 落在这几块上时定位到 JSON 的那一行；
+//   - 按新口径补算（D-f）：固定版本升了版、处置为按新口径重算、视图里有趋势时才给按钮，确认框写明最多发起几次运行。
 //
 // 不写库：/api/apps、/api/workflows、/api/copilot/app-stream 全在浏览器里用 page.route 伪造，伪造的应用接口按收到的
 // 请求改一份内存里的应用（保存、检查、发布都读它）。其余写请求一律 409 并记账，检查结束时必须是空的。
@@ -86,7 +90,15 @@ const SPEC = {
   hooks: [], notify: [],
 }
 
-async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition', stream = [] } = {}) {
+const LINT = [
+  { level: 'error', code: 'app.expr_arith', message: '可见性表达式不能有算术', path: '/pages/0/body/1' },
+  { level: 'error', code: 'app.binding_target_missing', message: '绑定的指标在固定的版本里不存在', path: 'pages[0].body[0].children[0]' },
+  { level: 'warning', code: 'app.view_source_empty', message: '视图暂时没有可读的运行', path: 'views.wk' },
+]
+
+async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition', stream = [], spec = SPEC, lint = LINT,
+  versions = [], versionSpec = null, hooks = [], conversation = { id: 'conv-ae', kind: 'app', title: '', turns: [] },
+  backfill = undefined, plan = null } = {}) {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } })
   opened.add(ctx)
   await ctx.addInitScript(() => { try { localStorage.setItem('agentlab_actor', '检查脚本') } catch { /* noop */ } })
@@ -96,9 +108,10 @@ async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition',
   page.on('pageerror', (e) => errors.push(e.message))
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
   const app = { id: 'app-ae', name: SPEC.name, description: '', icon: 'app', status: 'active', published_version: 2, level: 'published',
-    needs_upgrade: false, pending_tasks: 0, my_role: 'manage', updated_at: '2026-10-10T02:00:00Z', draft: clone(SPEC),
-    draft_bindings: { slots: {} }, created_by: '检查脚本' }
-  const state = { app, patches: [], lints: 0, publishes: [], derives: [], creates: [], streams: [], pages: [] }
+    needs_upgrade: false, pending_tasks: 0, my_role: 'manage', updated_at: '2026-10-10T02:00:00Z', draft: clone(spec),
+    draft_bindings: { slots: {} }, created_by: '检查脚本', ...(backfill ? { backfill } : {}) }
+  const state = { app, patches: [], lints: 0, publishes: [], derives: [], creates: [], streams: [], pages: [],
+    hooks: clone(hooks), rotates: [], hookPatches: [], hookDeletes: [], backfills: [], turns: [], turnPatches: [], conversations: 0 }
 
   await page.route(/\/api\//, (route) => {
     const req = route.request()
@@ -137,11 +150,30 @@ async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition',
     }
     if (sub === 'lint') {
       state.lints += 1
-      return json(route, { level: null, issues: [
-        { level: 'error', code: 'app.expr_arith', message: '可见性表达式不能有算术', path: '/pages/0/body/1' },
-        { level: 'error', code: 'app.binding_target_missing', message: '绑定的指标在固定的版本里不存在', path: 'pages[0].body[0].children[0]' },
-        { level: 'warning', code: 'app.view_source_empty', message: '视图暂时没有可读的运行', path: 'views.wk' },
-      ] })
+      return json(route, { level: null, issues: lint })
+    }
+    if (sub === 'hooks') {
+      const [, , , , , name, action] = url.pathname.split('/')
+      if (!name) return json(route, { items: state.hooks })
+      const hook = decodeURIComponent(name)
+      if (action === 'rotate') {
+        state.rotates.push(hook)
+        return json(route, { id: `h-${hook}`, name: hook, kind: 'signal', entry_id: null, enabled: true, has_secret: true,
+          in_draft: true, in_published: false, url_path: `/api/hooks/h-${hook}`, created_at: '2026-10-14T02:00:00Z',
+          secret: `secret-of-${hook}-0123456789` })
+      }
+      if (req.method() === 'PATCH') { state.hookPatches.push({ hook, body: req.postDataJSON() }); return json(route, {}) }
+      if (req.method() === 'DELETE') { state.hookDeletes.push(hook); return route.fulfill({ status: 204, body: '' }) }
+    }
+    if (sub === 'assistant-conversation') {
+      state.conversations += 1
+      return json(route, conversation)
+    }
+    if (sub === 'views' && url.pathname.endsWith('/backfill')) {
+      // GET：补算计划（不发起运行）；POST：发起，回发起了几次、跳过几次
+      if (req.method() === 'GET') return plan ? json(route, plan) : json(route, { detail: '没有这个接口' }, 404)
+      state.backfills.push(url.pathname.split('/')[5])
+      return json(route, { view: 'wk', launched: 7, skipped: 1, run_ids: [] })
     }
     if (sub === 'publish') {
       const body = req.postDataJSON()
@@ -152,7 +184,10 @@ async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition',
       }
       return json(route, { ok: true, version: 3, issues: [] })
     }
-    if (sub === 'versions') return json(route, { items: [] })
+    if (sub === 'versions') {
+      return json(route, rest ? { ...versions.find((v) => v.version === Number(rest)), spec: versionSpec ?? spec, bindings: { slots: {} } }
+        : { items: versions })
+    }
     if (sub === 'grants') return json(route, { items: [] })
     if (sub === 'pages') {
       state.pages.push(url.search)
@@ -162,6 +197,17 @@ async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition',
     return route.fallback()
   })
   await page.route(/\/api\/notify\/channels$/, (route) => json(route, { items: [] }))
+  // 助手对话的轮次：开一轮、落说明和查看记录
+  await page.route(/\/api\/conversations\/conv-ae\/turns(\/[^/]+)?$/, (route) => {
+    const req = route.request()
+    if (req.method() === 'POST') {
+      state.turns.push(req.postDataJSON())
+      return json(route, { id: `turn-${state.turns.length}`, seq: state.turns.length, question: req.postDataJSON().question, answer: '',
+        explanation: '', status: 'running', error: '' })
+    }
+    state.turnPatches.push(req.postDataJSON())
+    return json(route, { id: 'turn-1', seq: 1, question: '', answer: '', explanation: '', status: 'done', error: '' })
+  })
   await page.route(/\/api\/copilot\/app-stream$/, (route) => {
     state.streams.push(route.request().postDataJSON())
     return route.fulfill({ status: 200, contentType: 'text/event-stream', body: stream.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
@@ -284,6 +330,144 @@ await section('助手：应用操作实时落到草稿上，look 和 ask 照 dec
   check('ask 结束这一轮，问题照实显示', (await steps.innerText()).includes('助手需要你确认'))
   check('助手改的草稿算未保存的修改', await page.locator('[data-app-save]').isEnabled())
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+})
+
+await section('助手对话：取或建这个应用的对话、请求带 conversation_id、每轮落一条，之前的轮次显示出来', async () => {
+  const look = { op: 'look', id: 'L1', by: 'system', need: '固定的工作流版本', status: 'ok', elapsed_ms: 60,
+    objects: [{ kind: 'workflow_version', named: ['周销售 v7'], missing: [] }] }
+  const conversation = { id: 'conv-ae', kind: 'app', title: '', turns: [
+    { id: 'old-1', seq: 1, question: '先前的问题：指标放最上面', answer: '', explanation: '把指标挪到了首页顶部', status: 'done', error: '',
+      meta: { looks: [look] } }] }
+  const stream = [look, { op: 'final', spec: clone(SPEC), issues: [], explanation: '调整了首页的顺序' }]
+  const { page, state, errors } = await open({ stream, conversation })
+  check('进编辑器取或建一次对话', await waitFor(page, async () => state.conversations === 1))
+  const panel = page.locator('[data-app-assistant]')
+  check('之前的轮次显示出来（问题）', await waitFor(page, async () => (await panel.innerText()).includes('先前的问题：指标放最上面')))
+  check('……带着当时查看了什么', (await panel.innerText()).includes('按固定版本查看了 1 个工作流版本'))
+  await page.locator('[data-app-assistant] textarea').fill('报告放到第二页')
+  await page.keyboard.press('Enter')
+  check('请求带上这段对话', await waitFor(page, async () => state.streams.length === 1) && state.streams[0].conversation_id === 'conv-ae',
+    JSON.stringify(state.streams[0]?.conversation_id))
+  check('这一轮落库：开一轮带问题', await waitFor(page, async () => state.turns.length === 1) && state.turns[0].question === '报告放到第二页',
+    JSON.stringify(state.turns))
+  check('……再落说明和查看记录', await waitFor(page, async () => state.turnPatches.length === 1)
+    && state.turnPatches[0].explanation === '调整了首页的顺序' && state.turnPatches[0].meta?.looks?.length === 1
+    && state.turnPatches[0].status === 'done', JSON.stringify(state.turnPatches[0]))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+})
+
+await section('钩子：按名字列出声明和密钥状态；生成的密钥只显示一次', async () => {
+  const spec = { ...clone(SPEC), hooks: [{ name: 'paid', kind: 'signal', entry: null }] }
+  // 形状同服务端 process/hooks.hook_out：声明在草稿 / 发布版里没有、密钥生成过没有、收请求的地址
+  const hooks = [
+    { id: null, name: 'paid', kind: 'signal', entry_id: null, enabled: false, has_secret: false, in_draft: true, in_published: false,
+      url_path: null, created_at: null },
+    { id: 'h-old', name: 'old', kind: 'start', entry_id: 'apply', enabled: true, has_secret: true, in_draft: false, in_published: false,
+      url_path: '/api/hooks/h-old', created_at: '2026-10-01T02:00:00Z' },
+  ]
+  const { page, state } = await open({ path: '/apps/app-ae/edit/hooks', spec, hooks })
+  const paid = page.locator('[data-app-hook="paid"]')
+  check('声明的钩子标出还没生成密钥、发布版里还没有', await waitFor(page, async () => await paid.locator('[data-app-hook-state="none"]').count() === 1)
+    && (await paid.innerText()).includes('发布版里还没有'))
+  check('草稿里没声明、但生成过密钥的单独列出', await page.locator('[data-app-hook="old"][data-app-hook-undeclared]').count() === 1)
+  await paid.locator('[data-app-hook-rotate="paid"]').click()
+  check('生成密钥按名字发', await waitFor(page, async () => state.rotates.length === 1) && state.rotates[0] === 'paid', JSON.stringify(state.rotates))
+  const shown = page.locator('[data-app-hook-secret="paid"]')
+  check('密钥只显示这一次：值、复制、说明', await waitFor(page, async () => await shown.count() === 1)
+    && (await shown.locator('[data-app-hook-secret-value]').innerText()).includes('secret-of-paid-0123456789')
+    && (await shown.innerText()).includes('只显示这一次') && await shown.getByRole('button', { name: '复制' }).count() >= 1)
+  check('……附入站地址', (await shown.locator('[data-app-hook-url]').innerText()).endsWith('/api/hooks/h-paid'))
+  await page.locator('[data-app-hook-delete="old"]').click()
+  await page.locator('[role="dialog"]').getByRole('button', { name: '删除密钥' }).click()
+  check('删除密钥按名字发', await waitFor(page, async () => state.hookDeletes.length === 1) && state.hookDeletes[0] === 'old')
+  await page.locator('[data-app-nav="pages"]').click()
+  await page.locator('[data-app-nav="hooks"]').click()
+  check('离开这一节再回来：密钥不再显示', await page.locator('[data-app-hook-secret]').count() === 0)
+})
+
+await section('入口与表单：JSON 编辑、格式校验、检查的 path 定位到那一行', async () => {
+  const spec = { ...clone(SPEC),
+    entries: [{ id: 'apply', label: '发起', pin: 'weekly', form: { $ref: '#/forms/apply' }, map: { amount: 'form.amount' } }],
+    forms: { apply: { format: 'agentlab.form/1', type: 'object', required: ['amount'],
+      properties: { amount: { type: 'number', title: '金额', minimum: 0 }, note: { type: 'string', title: '说明' } } } } }
+  const lint = [{ level: 'error', code: 'app.entry_form_mismatch', message: '入口表单和固定版本的入口字段对不上',
+    path: 'forms.apply.properties.note' }]
+  const { page, state } = await open({ path: '/apps/app-ae/edit/forms', spec, lint })
+  const entries = page.locator('[data-app-json="entries"]')
+  await entries.locator('textarea').fill('[{"id": "apply",')
+  check('JSON 格式不对：照实说，不能应用', await entries.locator('[data-app-json-error]').count() === 1
+    && await entries.locator('[data-app-json-apply]').isDisabled())
+  await entries.locator('textarea').fill(JSON.stringify([{ id: 'apply', label: '发起', pin: 'nope', form: { $ref: '#/forms/apply' }, map: {} }]))
+  check('形状检查：固定版本的别名不存在', (await entries.locator('[data-app-json-issues]').innerText()).includes('固定版本「nope」不存在'))
+  await entries.locator('[data-app-json-reset]').click()
+  const forms = page.locator('[data-app-json="forms"]')
+  const next = clone(spec.forms)
+  next.apply.properties.amount.maximum = 10000
+  await forms.locator('textarea').fill(JSON.stringify(next, null, 2))
+  await forms.locator('[data-app-json-apply]').click()
+  await page.locator('[data-app-save]').click()
+  check('应用到草稿后保存：表单的数据约束跟着存', await waitFor(page, async () => state.patches.length === 1)
+    && state.patches[0].draft?.forms?.apply?.properties?.amount?.maximum === 10000, JSON.stringify(state.patches[0]?.draft?.forms))
+  await page.locator('[data-app-nav="check"]').click()
+  await page.locator('[data-app-issue="app.entry_form_mismatch"] [data-app-issue-locate]').click()
+  await page.waitForURL('**/edit/forms')
+  const located = await waitFor(page, async () => Number(await page.locator('[data-app-json="forms"]').getAttribute('data-app-json-located')) > 0)
+  check('检查的 path 落在表单上：跳到入口与表单，在 JSON 里定位到那个字段', located,
+    await page.locator('[data-app-json="forms"]').getAttribute('data-app-json-located'))
+})
+
+await section('按新口径补算：服务端给了能补算的视图，确认框写明会发起几次、跳过几次', async () => {
+  const spec = { ...clone(SPEC), pins: [{ ...SPEC.pins[0], version: 6 }], pages: [{ id: 'home', title: '本周概览', body: [
+    { id: 'trend', type: 'metric', props: {}, bind: { view: 'wk', series: 'kpi.gmv', last: 8 } }] }] }
+  // 形状同服务端 apps/backfill.Plan.out：应用详情的 backfill 列出能补算的视图，GET …/backfill 是最新的计划
+  const planned = { view: 'wk', alias: 'weekly', source: 'formal', from_version: 5, to_version: 6, periods: 8, will_launch: 6, will_skip: 2 }
+  const { page, state } = await open({ spec, backfill: [planned], plan: planned })
+  const btn = page.locator('[data-app-backfill="wk"]')
+  check('视图来源下面给「按新口径补算历史」', await waitFor(page, async () => await btn.count() === 1))
+  check('次数照服务端算好的', await btn.getAttribute('data-app-backfill-max') === '6')
+  await btn.click()
+  const dlg = page.locator('[role="dialog"]')
+  await dlg.waitFor({ timeout: 4000 })
+  check('确认框写明会发起几次、跳过几次、从哪一版到哪一版', (await dlg.innerText()).includes('将发起 6 次正式运行')
+    && (await dlg.innerText()).includes('2 次的输入已经补算过') && (await dlg.innerText()).includes('v5') && (await dlg.innerText()).includes('v6'))
+  await dlg.getByRole('button', { name: '发起 6 次运行' }).click()
+  check('按视图发起补算', await waitFor(page, async () => state.backfills.length === 1) && state.backfills[0] === 'wk', JSON.stringify(state.backfills))
+  check('提示发起了几次、跳过几次', await waitFor(page, async () => (await page.locator('body').innerText()).includes('已发起 7 次补算，跳过 1 次')))
+  await page.goto(`${WEB}/apps/app-ae`, { waitUntil: 'networkidle' })
+  check('应用页（管理）也给补算入口', await waitFor(page, async () => await page.locator('[data-app-backfill-panel] [data-app-backfill="wk"]').count() === 1))
+})
+
+await section('按新口径补算：老服务端没给计划时按版本列表推，写明最多几次', async () => {
+  const spec = { ...clone(SPEC), pins: [{ ...SPEC.pins[0], version: 6 }], pages: [{ id: 'home', title: '本周概览', body: [
+    { id: 'trend', type: 'metric', props: {}, bind: { view: 'wk', series: 'kpi.gmv', last: 8 } }] }] }
+  const versions = [
+    { version: 2, spec_hash: 'h2', level: 'published', pins: [{ ...SPEC.pins[0], version: 6 }], dispositions: { weekly: 'recompute' },
+      note: '', published_by: '检查脚本', published_at: '2026-10-12T02:00:00Z' },
+    { version: 1, spec_hash: 'h1', level: 'published', pins: [{ ...SPEC.pins[0], version: 5 }], dispositions: {},
+      note: '', published_by: '检查脚本', published_at: '2026-10-01T02:00:00Z' },
+  ]
+  const { page, state } = await open({ spec, versions })
+  const btn = page.locator('[data-app-backfill="wk"]')
+  check('视图来源下面给「按新口径补算历史」', await waitFor(page, async () => await btn.count() === 1))
+  check('上限按趋势取的最近几次', await btn.getAttribute('data-app-backfill-max') === '8')
+  await btn.click()
+  const dlg = page.locator('[role="dialog"]')
+  await dlg.waitFor({ timeout: 4000 })
+  check('确认框写明最多发起几次运行', (await dlg.innerText()).includes('最多发起 8 次正式运行'))
+  await dlg.getByRole('button', { name: '发起最多 8 次运行' }).click()
+  check('按视图发起补算', await waitFor(page, async () => state.backfills.length === 1))
+})
+
+await section('按新口径补算：处置不是按新口径重算时不给按钮', async () => {
+  const versions = [
+    { version: 2, spec_hash: 'h2', level: 'published', pins: [{ ...SPEC.pins[0], version: 6 }], dispositions: { weekly: 'dual' },
+      note: '', published_by: null, published_at: '2026-10-12T02:00:00Z' },
+    { version: 1, spec_hash: 'h1', level: 'published', pins: [{ ...SPEC.pins[0], version: 5 }], dispositions: {},
+      note: '', published_by: null, published_at: '2026-10-01T02:00:00Z' },
+  ]
+  const { page } = await open({ versions })
+  await page.waitForTimeout(500)
+  check('两版并列：没有补算按钮', await page.locator('[data-app-backfill]').count() === 0)
 })
 
 check('检查没有写库（兜底拦下的写请求）', writes.length === 0, writes.slice(0, 4).join('、'))

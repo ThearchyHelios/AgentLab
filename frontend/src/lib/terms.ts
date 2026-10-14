@@ -3122,6 +3122,8 @@ export const CATALOG_ASSISTANT_TEXT = {
 
 export const CATALOG_REVIEW_TEXT = {
   viewLabel: '数据目录的视图',
+  /** 只能查看、不能成批审阅时（ReviewQueue 的 readOnly）列表头上的说明 */
+  readOnlyNote: '你只能查看待审阅的推断项，确认、驳回需要相应的权限',
   view: { list: '表清单', review: '审阅队列' } as Record<'list' | 'review', string>,
   viewHint: {
     list: '逐表查看和编辑数据目录',
@@ -5077,10 +5079,12 @@ export const IDENTITY_TEXT = {
   oidcClientSecret: '客户端密钥',
   oidcGroupsClaim: '组声明',
   oidcAdminGroups: '映射为管理员的组',
+  oidcAdminUsers: '映射为管理员的用户',
+  oidcListHint: '每行一个',
   oidcBuilderGroups: '映射为搭建者的组',
-  oidcAdminRequired: '切换到单点登录时，至少要配置一个映射为管理员的组',
+  oidcAdminRequired: '切换到单点登录时，至少要配置一个映射为管理员的用户或组',
   userCanChat: '使用者可以问数据',
-  userCanChatHint: '问数据可以查询任何已接入的数据源，目前没有按数据源的权限控制；查询结果中设了遮罩的列对使用者显示为已遮罩。使用者之间的问数据对话记录暂未隔离，彼此可以看到。默认关闭',
+  userCanChatHint: '问数据可以查询任何已接入的数据源，目前没有按数据源的权限控制；查询结果中设了遮罩的列对使用者显示为已遮罩。使用者只能发起探索运行，只用数据源和只读的内置工具；对话按人隔离，各自只看得到自己的。默认关闭',
   saved: '已保存身份设置',
   users: '用户',
   groups: '组',
@@ -5266,7 +5270,7 @@ export const MAKE_APP_TEXT = {
   button: '做成应用',
   hint: '从这次回答提取工作流（只保留实际执行的步骤），在画布上发布后做成应用',
   busy: '正在提取工作流…',
-  done: '已提取工作流。发布后，在发布成功的提示中点「做成应用」',
+  done: '已提取工作流，请在打开的发布窗口中发布；发布成功后点「做成应用」',
   noRun: '这一轮没有运行记录，不能做成应用',
 }
 
@@ -5282,8 +5286,10 @@ export const APP_EDITOR_TEXT = {
   title: '应用编辑',
   newTitle: '新建应用',
   loadFailed: '无法加载应用',
+  noManage: '需要这个应用的管理权限',
+  noManageBody: '编辑应用需要管理权限，可以请应用的创建者或管理员授予。你仍然可以打开这个应用使用它。',
   sections: {
-    pins: '固定版本', pages: '页面', preview: '预览', check: '检查', publish: '发布', access: '岗位与授权',
+    pins: '固定版本', pages: '页面', forms: '入口与表单', preview: '预览', check: '检查', publish: '发布', access: '岗位与授权',
     hooks: '钩子', notify: '通知',
   } as Record<string, string>,
   save: '保存草稿',
@@ -5375,6 +5381,27 @@ export const APP_EDITOR_TEXT = {
   viewFrom: '取自',
   viewTtl: '缓存时效（秒）',
   viewAuto: '打开页面时自动发起（仅在没有缓存时）',
+  // ---- 按新口径补算（D-f）
+  backfill: '按新口径补算历史',
+  backfillHint: (alias: string, from: number, to: number) =>
+    `「${alias}」从 v${from} 升到 v${to}，处置为按新口径重算：可以取旧版本最近几次封存运行的输入，用新版本逐个重新发起正式运行`,
+  backfillTitle: (view: string) => `按新口径补算视图「${view}」的历史？`,
+  backfillConsequences: (n: number, alias: string, from: number, to: number) => [
+    `最多发起 ${n} 次正式运行：按「${alias}」v${from} 最近 ${n} 次封存运行的输入，逐个用 v${to} 发起`,
+    '同一输入已经补算过的跳过',
+    '会产生运行费用；补算的运行来源记为「按新口径补算」，趋势按它对应的输入期排序',
+  ],
+  backfillConfirm: (n: number) => `发起最多 ${n} 次运行`,
+  backfillExact: (launch: number, skip: number, alias: string, from: number, to: number) => [
+    `将发起 ${launch} 次正式运行：按「${alias}」v${from} 最近几次封存运行的输入，逐个用 v${to} 发起`,
+    skip ? `${skip} 次的输入已经补算过，跳过` : '',
+    '会产生运行费用；补算的运行来源记为「按新口径补算」，趋势按它对应的输入期排序',
+  ].filter(Boolean),
+  backfillConfirmExact: (n: number) => `发起 ${n} 次运行`,
+  backfillNothing: (skip: number) => (skip ? `没有需要补算的历史：最近 ${skip} 次的输入都已按新口径补算过` : '没有需要补算的历史'),
+  backfillDone: (started: number, skipped: number) =>
+    started || skipped ? `已发起 ${started} 次补算${skipped ? `，跳过 ${skipped} 次（同一输入已补算过）` : ''}` : '没有需要补算的历史',
+  backfillPublishedOnly: '按已发布的应用版本补算：草稿里改过的视图要先发布',
   // ---- 预览
   previewHint: '按草稿解析布局；不发起运行，视图取固定版本已有的封存运行',
   previewSaveFirst: '预览的是已保存的草稿，有未保存的修改时先保存',
@@ -5394,7 +5421,7 @@ export const APP_EDITOR_TEXT = {
   publishNote: '版本说明（可选）',
   publish: '发布',
   publishing: '正在发布…',
-  published: (v: number) => `已发布应用版本 v${v}`,
+  published: (v: number, level?: string | null) => `已发布应用版本 v${v}${level === 'governed' ? '（受管级别）' : ''}`,
   publishBlocked: '发布未通过检查，请先处理下面的问题',
   dispositionTitle: '固定版本升了版，请为每一项选处置',
   dispositionIntro: '口径升版是必须处置的事件。趋势类组件按这里的选择来画，发布后记进应用版本',
@@ -5434,8 +5461,63 @@ export const APP_EDITOR_TEXT = {
   hookKind: '种类',
   hookKinds: { start: '发起实例', signal: '回调' } as Record<string, string>,
   hookEntry: '入口',
-  hookRemove: (name: string) => `删除钩子「${name}」`,
+  hookRemove: (name: string) => `删除钩子「${name}」的声明`,
   hooksEmpty: '还没有钩子',
+  hookStateLoadFailed: '无法读取钩子的密钥状态',
+  hookSecretNone: '未生成密钥',
+  hookSecretSet: '已生成密钥',
+  hookGenerate: '生成密钥',
+  hookRotate: '轮换密钥',
+  hookRotateTitle: (name: string) => `轮换钩子「${name}」的密钥？`,
+  hookRotateBody: '轮换后旧密钥立即失效，外部系统须换用新密钥签名。',
+  hookRotateConfirm: '轮换密钥',
+  hookRotated: (name: string) => `已生成钩子「${name}」的密钥`,
+  hookSaveFirst: '草稿有未保存的修改，生成密钥前先保存',
+  hookSecretTitle: (name: string) => `钩子「${name}」的签名密钥`,
+  hookSecretOnce: '密钥只显示这一次：请复制并保存到外部系统。离开这一页或刷新后不再显示，丢失只能轮换。',
+  hookSecretDismiss: '我已保存，关闭',
+  hookUrl: '入站地址',
+  hookSigning: '外部系统对「时间戳 + 请求体」做 HMAC-SHA256 签名，时间窗 5 分钟，按幂等键去重',
+  hookPublished: '发布版里有',
+  hookNotPublished: '发布版里还没有：外部请求会被拒收，发布后生效',
+  hookNotDeclared: '草稿里没有声明：发布新版本后，这个名字的外部请求会被拒收',
+  hookEnabled: '启用',
+  hookEnabledHint: '停用后外部请求一律拒收，密钥保留',
+  hookDeleteKey: '删除密钥',
+  hookDeleteTitle: (name: string) => `删除钩子「${name}」的密钥？`,
+  hookDeleteBody: '外部系统再用这个密钥签名的请求一律拒收。草稿里的声明保留，之后可以重新生成。',
+  hookDeleted: (name: string) => `已删除钩子「${name}」的密钥`,
+  hookDuplicate: (name: string) => `钩子名称「${name}」重复`,
+  // ---- 入口与表单（JSON 编辑）
+  formsHint: '入口、表单和待办外观按 JSON 编辑，改完点「应用到草稿」，保存后生效。发布检查以服务端为准，点问题定位到出处',
+  jsonEntries: '入口',
+  jsonEntriesHint: '每个入口写编号、名称、固定版本的别名、表单（内联，或引用下面「表单」里的一份）和字段映射',
+  jsonForms: '表单',
+  jsonFormsHint: 'agentlab.form/1 表单，按名称登记，入口和待办按名称引用',
+  jsonTaskUi: '待办外观',
+  jsonTaskUiHint: '按人工节点覆盖待办的标题、字段顺序和控件，不能改数据约束',
+  jsonApply: '应用到草稿',
+  jsonReset: '还原',
+  jsonDirty: '有未应用的修改',
+  jsonApplied: (what: string) => `已把「${what}」应用到草稿，保存后生效`,
+  jsonSyntax: (msg: string) => `JSON 格式有误：${msg}`,
+  jsonAt: (line: number, col: number) => `第 ${line} 行第 ${col} 列`,
+  jsonCheck: '检查这一节',
+  jsonChecked: (n: number) => (n ? `发布检查发现这一节有 ${n} 处问题` : '发布检查在这一节没有发现问题'),
+  jsonLocated: (path: string) => `已定位到 ${path}`,
+  shapeArray: '须为数组',
+  shapeObject: '须为对象（名称对应内容）',
+  entryNotObject: (i: number) => `第 ${i} 个入口须为对象`,
+  entryId: (i: number) => `第 ${i} 个入口缺少编号`,
+  entryDup: (id: string) => `入口编号「${id}」重复`,
+  entryPin: (id: string, pin: string) => `入口「${id}」引用的固定版本「${pin}」不存在`,
+  entryPinMissing: (id: string) => `入口「${id}」没有写固定版本`,
+  entryForm: (id: string, ref: string) => `入口「${id}」引用的表单「${ref}」不存在`,
+  entryMap: (id: string) => `入口「${id}」的字段映射须为对象，值写成文字`,
+  formShape: (name: string) => `表单「${name}」须为对象类型并列出字段`,
+  formFieldType: (name: string, field: string) => `表单「${name}」的字段「${field}」类型不在支持范围内`,
+  formPattern: (name: string, field: string) => `表单「${name}」的字段「${field}」用了正则校验：表单不支持（浏览器和服务端的正则写法不完全一致）`,
+  taskUiShape: (node: string) => `待办外观「${node}」须为对象`,
   // ---- 通知
   notifyHint: '订阅的事件推送到通知渠道。渠道在「设置 → 通知」中管理',
   notifyAdd: '新增订阅',
@@ -5449,6 +5531,100 @@ export const APP_EDITOR_TEXT = {
   assistantEmpty: '让助手调整这个应用的页面：先查看固定的版本，再改布局和文案',
   assistantApplied: '助手的修改已落到草稿上，保存后生效',
   assistantStop: '停止',
+  assistantHistoryFailed: '无法读取之前的对话：这一轮照常可用，但接不上前面聊过的内容',
+}
+
+/** 派给自己的新待办：标签页在后台时的系统通知（同新的待审批） */
+export const TASK_NOTIFY_TEXT = {
+  title: '新的待办：',
+  untitled: '有事项等待处理',
+}
+
+/** 设置页按角色收起的部分（§3.12）：使用者只剩个人的主题和通知；运行默认值、模型接入只有管理员能改 */
+export const SETTINGS_ROLE_TEXT = {
+  subtitleUser: '个人的主题和通知',
+  themeLocal: '主题只保存在当前浏览器中，更换设备后需重新选择',
+  prefsReadOnly: '运行默认值、证据裁判和核查的设置全站共用，只有管理员可以修改',
+  notifyPersonal: '个人渠道只推送派给你的待办和你发起的实例的事件',
+}
+
+/** 设置 → 偏好设置里的应用一组（D-j） */
+export const APP_SETTING_TEXT = {
+  title: '应用',
+  hint: '保存在服务端，所有应用共用',
+  onDemandLimit: '按需视图每日上限',
+  onDemandLimitHint: '每个应用每天最多按需发起几次运行，命中缓存的不计；填 0 表示不再发起按需运行。到上限后，视图提示次日再试',
+  onDemandLimitInvalid: '请填写 0 到 100,000 之间的整数',
+}
+
+/** 自定义工具绑定登记的端点（§3.9）：只填路径，地址和认证头由端点提供 */
+export const TOOL_ENDPOINT_TEXT = {
+  bind: '端点',
+  none: '不绑定（填写完整地址）',
+  hint: '绑定登记的端点后只填路径，参数逐段编码代入；地址和认证头由端点按环境提供，模型拿不到任意地址',
+  missing: (ref: string) => `端点「${ref}」已不存在`,
+  path: '路径',
+  pathHint: '以 / 开头，可用 {{ 参数名 }} 代入，参数逐段编码',
+  query: '查询参数（JSON，可插值）',
+  body: '请求体（JSON，可插值）',
+  noEndpoints: '还没有登记的端点，在「工具 → 端点」中登记',
+}
+
+/** MCP 服务的认证头、端点绑定和本地子进程的权限（A6 第 6 条） */
+export const MCP_AUTH_TEXT = {
+  headers: '认证头',
+  headersHint: '值加密保存，界面上只显示掩码；不改的保持掩码即可',
+  addHeader: '添加认证头',
+  headerName: '名称',
+  headerValue: '值',
+  endpoint: '端点',
+  endpointNone: '不绑定（填写地址）',
+  endpointHint: '绑定登记的端点时，地址和认证头取端点的生产环境；不绑定的地址须通过外网安全检查',
+  stdioAdmin: '本地子进程会在服务器上执行命令，只有管理员可以新建和修改',
+  stdioReadOnly: '这是本地子进程服务，只有管理员可以修改',
+}
+
+/**
+ * 能力字段语义的审阅（D-i）：沿用数据目录审阅队列的组件和说法，只换掉说的是「表」的那几句。
+ * 状态（推断 / 已确认 / 已驳回）、成批确认和驳回、撤销审阅、冲突的说法都和数据目录一致
+ */
+export const CAPABILITY_REVIEW_TEXT: typeof CATALOG_REVIEW_TEXT = {
+  ...CATALOG_REVIEW_TEXT,
+  viewLabel: '能力的视图',
+  view: { list: '全部能力', review: '待审阅' },
+  viewHint: {
+    list: '逐个查看和治理能力',
+    review: '列出待确认的字段语义推断，按被运行用过的次数、是否写入能力和来源排好，可以成批确认、驳回',
+  },
+  queueLabel: '待审阅的能力字段',
+  tableLabel: '按能力筛选',
+  tableAll: '全部能力',
+  tableOption: (label: string | null, name: string, n: number) => `${label ? `${label}（${name}）` : name} · ${formatNumber(n)} 项`,
+  empty: '没有待审阅的能力字段',
+  emptyBody: '能力字段的推断都审阅过了。同步出新的字段语义后会出现在这里。',
+  emptyFilteredBody: '请换一个能力。',
+  loadFailed: '无法读取待审阅的能力字段',
+  usage: (n: number) => `被 ${formatNumber(n)} 次运行用过`,
+  usageHint: '这个能力被运行调用过的次数',
+  open: (where: string, name: string) => `打开能力「${name}」，查看${where}`,
+  select: (where: string, name: string) => `选择：${name} ${where}`,
+  confirmConsequences: ['确认后作为字段语义提供给助手，并用于应用视图的列名和单位', '来源保持不变，状态改为已确认', '之后仍可撤销审阅'],
+  rejectConsequences: ['驳回后不提供给助手、不用于应用视图', '之后同步也不会再提出', '之后仍可撤销审阅'],
+  conflict: '未生效：这个能力刚被修改过，请刷新队列后再审阅',
+  summary: (action: 'confirm' | 'reject' | 'reset', ok: number, conflicts: number, failed: number) => {
+    const head = `${{ confirm: '已确认', reject: '已驳回', reset: '已撤销审阅' }[action]} ${formatNumber(ok)} 项`
+    const bad = [
+      conflicts ? `${formatNumber(conflicts)} 项未生效（所在能力刚被修改过）` : '',
+      failed ? `${formatNumber(failed)} 项未生效` : '',
+    ].filter(Boolean)
+    return bad.length ? `${head}；${bad.join('、')}，请刷新队列后再审阅` : head
+  },
+  overviewTitle: '从左侧队列挑一项开始审阅',
+  overviewBody: '队列按能力被运行用过的次数、是否写入外部系统和来源排序：常用的写入能力里的推断排在最前。点开一项，右侧是这个能力的治理设置。',
+  readOnlyNote: '确认、驳回能力的字段语义需要管理员角色，这里只能查看',
+  focusMark: '从待审阅打开',
+  openQueue: '打开待审阅',
+  openQueueHint: '列出待确认的字段语义推断，可以成批确认、驳回',
 }
 
 // 应用平台使用面的文案（FE-5 维护）。调用方照旧从 lib/terms 导入

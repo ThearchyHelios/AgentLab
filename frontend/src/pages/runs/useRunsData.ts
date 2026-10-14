@@ -222,21 +222,31 @@ export interface TaskQueue {
 
 /**
  * 记录页的「待办」页签：不属于应用的运行里待处理的待办（画布、问数据、定时任务、正式运行）。应用里的待办在
- * 「应用 → 待办」里处理，导航徽标也按来源分开数，这里不重复列。待审批变了（catalog 那份 4 秒一轮询）就跟着刷：
- * 一次中断对应一条审批和一条待办。核实结果未知的动作没有审批，靠手动刷新和断网恢复
+ * 「应用 → 待办」里处理，导航徽标也按来源分开数，这里不重复列。核实结果未知的动作没有审批，靠手动刷新和断网恢复。
+ *
+ * 待审批变了（catalog 那份 4 秒一轮询）就跟着变：一次中断对应一条审批和一条待办。审批上带着 task_id（D-r）时不再整表
+ * 重取——处理掉的审批，它的待办直接拿掉；新来的审批按 task_id 只取那几条待办。审批不带 task_id（老服务端）、或者
+ * 审批列表撞到了上限（看不全哪些还在），退回整表重取
  */
+const APPROVALS_LIMIT = 100
+
 export function useTaskQueue(epoch: number): TaskQueue {
   const [items, setItems] = useState<Task[]>([])
   const [state, setState] = useState<TaskQueue['state']>('loading')
   const [error, setError] = useState<unknown>(null)
-  const signature = useCatalog((s) => s.approvals.map((a) => a.id).join(','))
+  const approvals = useCatalog((s) => s.approvals)
+  const signature = approvals.map((a) => a.id).join(',')
   const first = useRef(true)
+  const itemsRef = useRef(items)
+  itemsRef.current = items
+
+  const keep = (t: Task) => !t.app_id && (t.status === 'pending' || t.status === 'resolving')
 
   const reload = useCallback(async () => {
     if (first.current) setState('loading')
     try {
       const { items: list } = await api.tasks.list({ assigned: 'all', status: 'pending', limit: 500 })
-      setItems(list.filter((t) => !t.app_id && (t.status === 'pending' || t.status === 'resolving')))
+      setItems(list.filter(keep))
       setError(null)
       setState('ok')
       first.current = false
@@ -246,7 +256,32 @@ export function useTaskQueue(epoch: number): TaskQueue {
     }
   }, [])
 
-  useEffect(() => { void reload() }, [reload, signature, epoch])
+  // 手动刷新、断网恢复（epoch 变了）：整表重取
+  useEffect(() => { void reload() }, [reload, epoch])
+
+  // 待审批变了：能按 task_id 对上的只补差，对不上的整表重取
+  const seenSig = useRef<string | null>(null)
+  useEffect(() => {
+    if (seenSig.current === null) { seenSig.current = signature; return }
+    if (seenSig.current === signature) return
+    seenSig.current = signature
+    const pending = approvals.filter((a) => a.status === 'pending')
+    if (first.current || pending.some((a) => !a.task_id) || approvals.length >= APPROVALS_LIMIT) {
+      void reload()
+      return
+    }
+    const live = new Set(pending.map((a) => a.id))
+    const have = new Set(itemsRef.current.map((t) => t.id))
+    const missing = [...new Set(pending.map((a) => a.task_id as string))].filter((id) => !have.has(id))
+    // 审批处理掉了：它的待办一起拿掉（没有审批的核实、等外部系统的待办留着）
+    setItems((cur) => cur.filter((t) => !t.approval_id || live.has(t.approval_id)))
+    if (!missing.length) return
+    void Promise.all(missing.map((id) => api.tasks.get(id).catch(() => null))).then((got) => {
+      const add = got.filter((t): t is Task => !!t && keep(t))
+      if (got.some((t) => t == null)) { void reload(); return }
+      if (add.length) setItems((cur) => [...cur.filter((t) => !add.some((x) => x.id === t.id)), ...add])
+    })
+  }, [signature]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return { items, state, error, reload }
 }

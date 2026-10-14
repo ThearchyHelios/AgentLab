@@ -803,13 +803,14 @@ await section('助手查看了哪些表：画布右栏和问数据页（look 事
   check('挑表失败：展开看到原因', (await fb.innerText()).includes('原因：挑选数据表超过 20 秒未完成'))
   await f.page.close()
 
-  // 问数据页的桩数据（dev/preview 的 syn=chat）还是老服务端的 context 操作：照 look 的说法显示
+  // 问数据页的桩数据（dev/preview 的 syn=chat）是一条 look 事件（按需查看了两张表）：照 look 的说法显示，不再出老的 context 行
   const q = await open('syn=chat', { w: 1100, h: 800, name: 'chat-look' })
   check('问数据页：执行开始后这一行随「规划」收起', !(await q.page.locator('body').innerText()).includes('查看了 2 张表'))
   await q.page.locator('button', { hasText: '规划' }).first().click()
   await q.page.waitForTimeout(200)
-  const qrow = q.page.locator('[data-step-code="copilot_context"], [data-step-code="copilot_look"]')
-  check('问数据页：点开「规划」看到查看了几张表', await qrow.count() === 1 && (await qrow.innerText()).includes('查看了 2 张表'))
+  const qrow = q.page.locator('[data-step-code="copilot_look"]')
+  check('问数据页：点开「规划」看到查看了几张表（look 行）', await qrow.count() === 1 && (await qrow.innerText()).includes('查看了 2 张表'))
+  check('问数据页：没有老的 context 行', await q.page.locator('[data-step-code="copilot_context"]').count() === 0)
   await qrow.locator('button').first().click()
   await q.page.waitForTimeout(150)
   check('问数据页：展开看到表名', (await qrow.innerText()).includes('v_device_kpi、dim_device'))

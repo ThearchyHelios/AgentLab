@@ -53,6 +53,10 @@ const root = new URL('..', import.meta.url).pathname
 const fx = JSON.parse(readFileSync(`${root}frontend/src/dev/fixtures/dual_check.json`, 'utf8'))
 const AP = fx.approval
 const CARD_ID = AP.payload.card_artifact
+// 审批卡的内容在待办卡里（应用平台 X4）：回复走 /api/tasks/{id}/respond。预览给合成审批带上的待办 id 是 task-<审批 id>
+// （frontend/src/dev/taskOf.ts）
+const TASK_ID = `task-${AP.id}`
+const RESPOND = `/api/tasks/${TASK_ID}/respond`
 
 let failed = 0
 const check = (name, cond, detail = '') => {
@@ -168,7 +172,7 @@ const browser = await chromium.launch({ executablePath: CHROME })
 
 /**
  * 开一个预览用例。完整对照的工件按 artifact 答（默认夹具里的那份；给函数可以延迟、出错），这次运行的图快照按 graph
- * 答（默认夹具里的图：双盲复算节点没写「未采用原流程时」，按缺省的计入缺口），审批回复记下请求体、回一个伪造的运行；
+ * 答（默认夹具里的图：双盲复算节点没写「未采用原流程时」，按缺省的计入缺口），待办回复记下请求体、回一个凑齐了的待办；
  * 审批列表回空；别的非 GET 一律拦掉，别的 GET 放行。query 接在预览页地址后面（用例认的参数见 dual_check.tsx）
  */
 async function preview(syn, { width = 1280, height = 900, theme = 'dark', artifact = null, graph = null, extra = null, query = '' } = {}) {
@@ -187,10 +191,11 @@ async function preview(syn, { width = 1280, height = 900, theme = 'dark', artifa
       const out = await extra(req, url)
       if (out) return route.fulfill({ status: out.status ?? 200, json: out.json })
     }
-    if (req.method() === 'POST' && url.pathname === `/api/approvals/${AP.id}/decide`) {
+    if (req.method() === 'POST' && url.pathname === RESPOND) {
       sent.push({ path: url.pathname, body: req.postDataJSON() })
-      return route.fulfill({ json: { id: AP.run_id, status: 'running', run_class: AP.run_class, input: {}, output: {}, usage: {} } })
+      return route.fulfill({ json: { task: { id: TASK_ID, approval_id: AP.id, run_id: AP.run_id, status: 'resolved' }, resolved: true } })
     }
+    if (url.pathname === '/api/tasks/count') return route.fulfill({ json: { mine: 0, apps: 0, other: 0 } })
     if (req.method() !== 'GET') {
       sent.push({ path: url.pathname, blocked: true, method: req.method() })
       return route.abort()
@@ -1087,8 +1092,10 @@ await section('审批卡：认不出任何指标时留一个出口', async () =>
   await page.locator('[data-dual-note]').fill('审批内容缺失，重新运行')
   await reject.click()
   await page.waitForFunction(() => window.__dualResolved != null)
-  const body = sent.find((s) => s.path === `/api/approvals/${AP.id}/decide`)?.body
-  check('……驳回：approved 为假、带上备注，不带 value', body?.approved === false && body.note === '审批内容缺失，重新运行' && !('value' in body), JSON.stringify(body))
+  const body = sent.find((s) => s.path === RESPOND)?.body
+  check('……驳回：走待办回复，决定是驳回、带上备注，不带裁决', body?.decision === 'reject' && body.note === '审批内容缺失，重新运行'
+    && !('values' in body), JSON.stringify(body))
+  check('……不再走老的审批回复接口', !sent.some((s) => /\/api\/approvals\/[^/]+\/decide$/.test(s.path)), JSON.stringify(sent))
   check('……提示已驳回、运行终止', (await text(page.locator('body'))).includes('已驳回，本次运行终止'))
   check('页面没有报错', errors.length === 0, errors.join('；'))
 })
@@ -1115,12 +1122,13 @@ await section('审批卡：不选全不能提交，提交的回复是 {choices, 
   await page.locator('[data-dual-note]').fill(note)
   await submit.click()
   await page.waitForFunction(() => window.__dualResolved != null)
-  const posts = sent.filter((s) => s.path === `/api/approvals/${AP.id}/decide`)
-  check('走审批回复接口，只发一次', posts.length === 1, String(posts.length))
+  const posts = sent.filter((s) => s.path === RESPOND)
+  check('走待办回复接口（/api/tasks/{id}/respond），只发一次', posts.length === 1, String(posts.length))
   const body = posts[0]?.body ?? {}
-  check('请求体：value 是 {choices, note}', JSON.stringify(body.value) === JSON.stringify({ choices: { gmv: 'a', refund_rate: 'neither' }, note }),
-    JSON.stringify(body.value))
-  check('……照 input 模式的写法：approved 为真、备注同时放在外层', body.approved === true && body.note === note, JSON.stringify(body))
+  check('请求体：决定是提交，values.value 是 {choices, note}', body.decision === 'submit'
+    && JSON.stringify(body.values?.value) === JSON.stringify({ choices: { gmv: 'a', refund_rate: 'neither' }, note }),
+    JSON.stringify(body.values))
+  check('……备注同时放在外层', body.note === note, JSON.stringify(body))
   check('提交后交给调用方重新接上运行', await page.evaluate(() => window.__dualResolved) === AP.run_id)
   check('……提示已提交、运行继续', (await text(page.locator('body'))).includes('已提交裁决，运行继续'))
   check('没有别的写请求', !sent.some((s) => s.blocked), JSON.stringify(sent.filter((s) => s.blocked)))
@@ -1139,8 +1147,8 @@ await section('审批卡：完整对照取不到时，按摘要照样能裁决',
   for (const id of ['gmv', 'refund_rate']) await metric(page, id).locator('label', { hasText: '采用盲算的结果' }).click()
   await page.locator('[data-dual-submit]').click()
   await page.waitForFunction(() => window.__dualResolved != null)
-  const body = sent.find((s) => s.path === `/api/approvals/${AP.id}/decide`)?.body
-  check('……照样能提交', JSON.stringify(body?.value?.choices) === JSON.stringify({ gmv: 'b', refund_rate: 'b' }), JSON.stringify(body))
+  const body = sent.find((s) => s.path === RESPOND)?.body
+  check('……照样能提交', JSON.stringify(body?.values?.value?.choices) === JSON.stringify({ gmv: 'b', refund_rate: 'b' }), JSON.stringify(body))
 })
 
 await section('审批卡：探索运行不提出具', async () => {

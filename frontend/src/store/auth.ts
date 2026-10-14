@@ -87,3 +87,27 @@ export function loginUrl(next?: string): string {
   const back = next ?? `${window.location.pathname}${window.location.search}`
   return back && back !== '/' && !back.startsWith('/login') ? `/login?next=${encodeURIComponent(back)}` : '/login'
 }
+
+/**
+ * 等身份认定（/auth/me 回来，成功或按 off 兜底）。启动时设置、主题这类请求和认人同时发出，回来时要先知道是谁才能决定
+ * 用不用它的结果。最多等 timeoutMs，到点还没认定按没认定（null）交回
+ */
+export function authSettled(timeoutMs = 15_000): Promise<Principal | null> {
+  const now = useAuth.getState()
+  if (now.ready) return Promise.resolve(now.me)
+  return new Promise((resolve) => {
+    const stop = useAuth.subscribe((s) => {
+      if (!s.ready) return
+      stop()
+      clearTimeout(timer)
+      resolve(s.me)
+    })
+    const timer = setTimeout(() => { stop(); resolve(null) }, timeoutMs)
+  })
+}
+
+/**
+ * 界面偏好（主题）只存本机、不写服务端（D-s）：开了登录、又不是管理员时。服务端设置里的 ui 一组是全站共用的，改它要
+ * 管理员；搭建者、使用者换主题只在这台设备上生效，也不拿服务端的值翻回去
+ */
+export const prefsLocalOnly = (me: Principal | null | undefined): boolean => loginOn(me) && !atLeast(me, 'admin')

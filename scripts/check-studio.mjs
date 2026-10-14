@@ -1313,6 +1313,13 @@ await section('入口：?run=&focus=、选择器、发布弹窗', async () => {
   await page.keyboard.press('Escape')
   await ctx.close()
 
+  // ?publish=1：问数据回答上点「做成应用」提取出工作流后跳过来，图打开之后直接打开发布弹窗；读完从地址里摘掉
+  const viaApp = await open({ path: '/studio/st-main?publish=1' })
+  const dialog = viaApp.page.locator('[role="dialog"]').filter({ has: viaApp.page.getByRole('button', { name: '发布', exact: true }) })
+  check('?publish=1：打开发布弹窗', await dialog.waitFor({ timeout: 5000 }).then(() => true, () => false))
+  check('……地址里的 publish 摘掉了（刷新、后退不再弹）', !new URL(viaApp.page.url()).searchParams.has('publish'), viaApp.page.url())
+  await viaApp.ctx.close()
+
   // 发布只换状态和发布人，图没动：撤销栈、镜头都留着
   const pub = await open()
   let published = false

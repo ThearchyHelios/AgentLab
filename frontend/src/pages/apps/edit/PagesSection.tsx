@@ -5,6 +5,7 @@ import { api } from '../../../api/client'
 import { DeleteButton, EmptyState, Field, SectionBar } from '../../../components/ui'
 import { APP_EDITOR_TEXT as T } from '../../../lib/terms'
 import type { AppBinding, AppComponent, AppSpec, AppViewSource, CatalogComponent } from '../../../typesApp'
+import { BackfillButton, useBackfillTargets } from '../backfill'
 import { applyAppOp, findComponent, freshId } from './appOps'
 import { useEditor } from './context'
 
@@ -376,14 +377,19 @@ function useViewNodes(view: string): { id: string; label: string }[] {
 // 视图来源
 // -------------------------------------------------------------------------
 
-/** 视图来源（§2.3）：最近封存 {pin, from} / 按需 {pin, params, ttl_s, auto} / 本实例 */
+/**
+ * 视图来源（§2.3）：最近封存 {pin, from} / 按需 {pin, params, ttl_s, auto} / 本实例。
+ * 当前发布版把某个视图固定的版本升了版、处置为按新口径重算时，那个视图下面给「按新口径补算历史」（D-f，按发布版补算）
+ */
 function ViewsPanel() {
-  const { draft, setDraft } = useEditor()
+  const { appId, detail, draft, setDraft } = useEditor()
   const [open, setOpen] = useState(false)
+  const targets = useBackfillTargets(appId, detail.published_version, true, detail.backfill ?? null)
   const set = (key: string, value: { source: AppViewSource } | null) =>
     setDraft((s: AppSpec) => applyAppOp(s, { op: 'app_set', path: 'views', key, value }))
   return (
-    <details className="border-t" open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)} data-app-views="">
+    <details className="border-t" open={open || targets.length > 0} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+             data-app-views="" data-app-views-backfill={targets.length || undefined}>
       <summary className="cursor-pointer px-2 py-1.5 text-2xs font-semibold text-faint" title={T.viewsHint}>
         {T.views}（{Object.keys(draft.views).length}）
       </summary>
@@ -409,6 +415,12 @@ function ViewsPanel() {
               <input className="field mono h-7 py-0 text-xs" value={v.source.from ?? ''} placeholder="formal" aria-label={T.viewFrom}
                      title={T.viewFrom} onChange={(e) => set(key, { source: { ...v.source, from: e.target.value || null } })} />
             )}
+            {targets.filter((t) => t.view === key).map((t) => (
+              <div key={t.view} className="space-y-1 rounded border border-dashed p-1" title={T.backfillPublishedOnly}>
+                <p className="leading-relaxed text-faint">{T.backfillHint(t.alias, t.from, t.to)}</p>
+                <BackfillButton appId={appId} target={t} />
+              </div>
+            ))}
             {v.source.kind === 'on_demand' && (
               <>
                 <input className="field tnum h-7 py-0 text-xs" type="number" min={1} max={86400} value={v.source.ttl_s ?? 600}

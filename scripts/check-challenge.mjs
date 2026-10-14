@@ -143,7 +143,7 @@ async function open(syn, { width = 1100, height = 900, theme = 'dark' } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
   ctx.setDefaultTimeout(6000)
   const page = await ctx.newPage()
-  const hits = { artifacts: [], runs: [], writes: [] }
+  const hits = { artifacts: [], runs: [], writes: [], responds: [], tasks: [] }
   const state = { broken: true, runFail: true, issues: [] }
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
@@ -159,10 +159,24 @@ async function open(syn, { width = 1100, height = 900, theme = 'dark' } = {}) {
     if (path === '/api/conversations') {
       return route.fulfill({ json: req.method() === 'GET' ? [] : { id: 'conv-challenge', kind: 'canvas', title: '', turns: [] } })
     }
+    // 审批卡的内容在待办卡里（应用平台 X4）：批准、驳回走 /api/tasks/{id}/respond。预览给合成审批带上了待办
+    // （task-<审批 id>，frontend/src/dev/taskOf.ts），记下请求体、回一条凑齐了的待办
+    const respond = path.match(/^\/api\/tasks\/([^/]+)\/respond$/)
+    if (respond && req.method() === 'POST') {
+      hits.responds.push({ task: decodeURIComponent(respond[1]), body: req.postDataJSON() })
+      return route.fulfill({ json: { task: { id: decodeURIComponent(respond[1]), status: 'resolved' }, resolved: true } })
+    }
     if (req.method() !== 'GET') {
       hits.writes.push(`${req.method()} ${path}`)
       return route.abort()
     }
+    // 审批带着待办：卡片不该再按运行去取待办列表
+    if (path === '/api/tasks') {
+      hits.tasks.push(new URL(req.url()).search)
+      return route.fulfill({ json: { items: [] } })
+    }
+    if (path === '/api/tasks/count') return route.fulfill({ json: { mine: 0, apps: 0, other: 0 } })
+    if (path === '/api/approvals') return route.fulfill({ json: [] })
     const art = path.match(/^\/api\/artifacts\/([^/]+)$/)
     if (art) {
       const id = decodeURIComponent(art[1])
@@ -919,6 +933,20 @@ await section('窄屏与深浅色', async () => {
 function CSS_ESC(id) {
   return String(id ?? '').replace(/([^a-zA-Z0-9_-])/g, '\\$1')
 }
+
+await section('审批卡的批准、驳回走待办回复（/api/tasks/{id}/respond）', async () => {
+  const { ctx, page, hits, errors } = await open('challenge-approval')
+  const card = page.locator('[data-fixture="challenge-approval"]')
+  await card.locator('[data-task-approve]').waitFor()
+  check('审批带着待办：卡片画出来，没有按运行去取待办列表', hits.tasks.length === 0, hits.tasks.join('、'))
+  await card.locator('[data-task-reject]').click()
+  await page.waitForTimeout(300)
+  check('驳回：只发一次待办回复，按审批对应的待办，决定是驳回', hits.responds.length === 1
+    && hits.responds[0].task === 'task-ap-chal-1' && hits.responds[0].body?.decision === 'reject', JSON.stringify(hits.responds))
+  check('……不再走老的审批回复、恢复运行接口', !hits.writes.some((w) => /\/decide$|\/resume$/.test(w)), hits.writes.join('、'))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+  await ctx.close()
+})
 
 await browser.close()
 console.log(failed ? `\n✗ 反方审稿：${failed} 项未通过` : '\n✓ 反方审稿：全部通过')

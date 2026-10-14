@@ -72,9 +72,10 @@ export function TaskCard({ task, onResolved, compact = false }: TaskCardProps) {
   const [values, setValues] = useState<Record<string, unknown>>(() => (task.form ? withDefaults(task.form, {}) : {}))
   const [text, setText] = useState(() => (payload.draft != null ? String(payload.draft) : ''))
 
-  // 应用里的运行一律是固定版本的正式运行；别处的看中断内容自己带的运行类别，没有就不画那一行
-  const runClass: 'formal' | 'exploratory' | null = task.app_id ? 'formal'
-    : payload.run_class === 'formal' || payload.run_class === 'exploratory' ? payload.run_class : null
+  // 运行类别服务端在待办上给（run_class）；老服务端不给时：应用里的运行一律是固定版本的正式运行，别处的看中断内容
+  // 自己带的运行类别，都没有就不画那一行
+  const runClass: 'formal' | 'exploratory' | null = task.run_class ?? (task.app_id ? 'formal'
+    : payload.run_class === 'formal' || payload.run_class === 'exploratory' ? payload.run_class : null)
   const binary = kind === 'approve' || kind === 'tool' || kind === 'code'
   const trustKey: string | undefined = kind === 'tool' && runClass !== 'formal'
     ? (typeof payload.trust_key === 'string' && payload.trust_key) || undefined : undefined
@@ -267,8 +268,8 @@ function TaskMeta({ task }: { task: Task }) {
   const created = parseServerTime(task.created_at)
   const age = created ? now - created.getTime() : undefined
   const pending = task.status === 'pending'
-  // 节点的名字：服务端在待办上给（node_label，契约之外多给的一项），老的中断内容里也可能带着
-  const label = (task as Task & { node_label?: string | null }).node_label ?? task.payload?.node_label
+  // 节点的名字：服务端在待办上给（node_label），老的中断内容里也可能带着
+  const label = task.node_label ?? task.payload?.node_label
   const where = typeof label === 'string' && label ? label : task.node_id
   const owner = task.app_name ? task.app_name : task.workflow_name ? runName(task) : null
   return (

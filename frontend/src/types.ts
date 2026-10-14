@@ -173,6 +173,11 @@ export interface Approval {
   /** 谁处理的。null 表示处理时没有署名，显示「未署名」 */
   resolved_by?: string | null
   resolved_at?: string | null
+  /**
+   * 这条审批对应的待办（一次中断对应一条 Approval 和一条 Task，应用平台 D-r）。有它审批卡直接按 id 取待办，
+   * 不必再按运行取一遍待办列表去对；老服务端不给
+   */
+  task_id?: string | null
 }
 
 /**
@@ -4249,4 +4254,16 @@ export interface WorkflowVersion {
 /** 从运行提取时的来源：run_id、对话、轮次（/copilot/from-run 写） */
 export interface Workflow {
   origin?: Record<string, any> | null
+}
+
+/**
+ * GET /api/datasources/names（应用平台 D-c）：开了登录、允许使用者问数据时，问数据页按它列可选的数据源。
+ * 只有名字和说明，没有连接信息、表结构
+ */
+export interface DataSourceName {
+  id: string
+  name: string
+  description?: string
+  kind?: string
+  enabled?: boolean
 }

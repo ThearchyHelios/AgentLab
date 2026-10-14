@@ -19,6 +19,7 @@ import { canLeave, leavePass } from '../lib/leave'
 import { formatNumber, formatTime } from '../lib/format'
 import { MAKE_APP_TEXT } from '../lib/terms'
 import { useCatalog, useCatalogListState, useDatasources, useOnReconnect, type CatalogListState } from '../store/catalog'
+import { useAtLeast } from '../store/auth'
 import {
   agentSteps, busyTurn, isBusy, stepsVisible, useChat, type Attempt, type ChatTurn, type Failure, type ScopeSource,
 } from '../store/chat'
@@ -487,7 +488,8 @@ function MakeAppButton({ runId, conversationId, turnId }: { runId: string; conve
               try {
                 const res = await api.copilot.fromRun(runId, undefined, { conversation_id: conversationId, turn_id: turnId })
                 void refreshCatalog()
-                navigate(`/studio/${res.workflow_id}`, leavePass())
+                // 带 publish=1：画布载入这张图后直接打开发布弹窗，发布成功的提示里点「做成应用」
+                navigate(`/studio/${res.workflow_id}?publish=1`, leavePass())
                 toast.ok(MAKE_APP_TEXT.done)
               } catch (e) {
                 toast.error(e)
@@ -510,13 +512,15 @@ function TurnExtras({ turnId, readOnly }: {
   const approvals = useCatalog((s) => s.approvals)
   const { reattach, runNow, toggleSteps } = useChat.getState()
   const busy = useChat((s) => (conversationId ? isBusy(s.byConversation[conversationId]) : false))
+  // 做成应用要去画布发布：只给搭建者以上（开了登录的使用者问数据时没有画布）
+  const builder = useAtLeast('builder')
   if (!turn || !conversationId) return null
   const runId = turn.run?.id
   const pending = runId ? approvals.filter((a) => a.run_id === runId && a.status === 'pending') : []
   const canSteps = !!turn.restored && !!runId && !BUSY.has(turn.phase)
   const scoped = !!turn.scope?.length
   // 回答成功、有运行的轮次可以做成应用（A8）：先从这次运行提取工作流，在画布上发布后再做成应用
-  const canApp = !!runId && turn.phase === 'done' && !readOnly
+  const canApp = !!runId && turn.phase === 'done' && !readOnly && builder
 
   if (!pending.length && !turn.pendingRun && !canSteps && !scoped && !canApp) return null
   return (
@@ -1233,7 +1237,10 @@ function useDataSources(): SourcesState {
   // 不用整页刷新就能出现在范围、例句里
   const { list, state: listState } = useDatasources()
   const [tables, setTables] = useState<Record<string, string[]>>({})
+  // 开了登录的使用者（D-c）只拿得到数据源的名字和说明，表结构接口只给搭建者：例句按名字和说明造，不去取表名
+  const builder = useAtLeast('builder')
   useEffect(() => {
+    if (!builder) return
     const todo = list.filter((r) => !(r.id in tables))
     if (!todo.length) return
     let alive = true
@@ -1244,7 +1251,7 @@ function useDataSources(): SourcesState {
     })).then((pairs) => { if (alive) setTables((t) => ({ ...t, ...Object.fromEntries(pairs) })) })
     return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [list])
+  }, [list, builder])
   return useMemo<SourcesState>(() => ({
     // 取失败和「没有数据源」是两回事：前者不能劝人去新建。取回来过一次就按手上的列表算
     state: listState === 'ok' ? 'ready' : listState === 'loading' ? 'loading' : list.length ? 'ready' : 'error',

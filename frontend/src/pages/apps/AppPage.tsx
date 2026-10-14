@@ -14,6 +14,7 @@ import { useAtLeast } from '../../store/auth'
 import { usePageTitle } from '../../lib/notify'
 import { APP_TEXT } from '../../lib/termsApp'
 import { AppMeta, BackLink, LoadError, appPath, loadHome, useLoad, usePoll } from './shared'
+import { BackfillPanel } from './backfill'
 
 const POLL_MS = 5000
 
@@ -68,6 +69,8 @@ export function AppPage() {
                     <span className="font-medium">{APP_TEXT.needsUpgrade}</span>：{APP_TEXT.needsUpgradeHint}
                   </Notice>
                 )}
+                {/* 按新口径补算（D-f）：只有 manage 看得到，固定版本升了版、处置为按新口径重算时才有 */}
+                <BackfillPanel appId={appId} publishedVersion={model.app.version} onDone={reload} />
                 <ViewRenderer model={model} appId={appId} onNavigate={go} onReload={reload} />
               </>
             )}

@@ -137,7 +137,13 @@ const FETCHERS: Record<CatalogKey, () => Promise<unknown[]>> = {
   collections: () => api.kb.collections(catalogOpts),
   workflows: () => api.workflows.list(catalogOpts),
   approvals: () => api.approvals.list('pending', catalogOpts),
-  datasources: () => api.datasources.list(catalogOpts),
+  // 开了登录、管理员允许使用者问数据（D-c）：使用者只拿得到名字和说明（/datasources/names），问数据页的范围选择照它列
+  datasources: () => (atLeast(useAuth.getState().me, 'builder')
+    ? api.datasources.list(catalogOpts)
+    : api.datasources.names(catalogOpts).then((rows) => rows.map((r) => ({
+      id: r.id, name: r.name, kind: r.kind ?? '', description: r.description ?? '', enabled: r.enabled ?? true,
+      host: null, port: null, database: null, username: null, options: {}, readonly: true, tools: [],
+    }) as DataSource))),
 }
 
 export const useCatalog = create<CatalogState>((set, get) => {
@@ -194,8 +200,10 @@ export const useCatalog = create<CatalogState>((set, get) => {
 
     refresh: async () => {
       const gen = ++refreshEpoch
-      // 开了登录的使用者（user 角色）用不到这几张表（接口也不给），一张都不取：导航只剩「应用」和「设置」
-      const keys = atLeast(useAuth.getState().me, 'builder') ? CATALOG_KEYS : []
+      // 开了登录的使用者（user 角色）用不到这几张表（接口也不给），一张都不取：导航只剩「应用」和「设置」。管理员允许
+      // 使用者问数据时（D-c）只取问数据要的那一张：数据源的名字和说明
+      const me = useAuth.getState().me
+      const keys: CatalogKey[] = atLeast(me, 'builder') ? CATALOG_KEYS : me?.user_can_chat ? ['datasources'] : []
       set({ checks: keys.map((key) => ({ key, label: CATALOG_LABELS[key], state: 'pending' })) })
       // 清单只归最新一次 refresh 写：交叠时早发的那次别把新清单的行改回去
       const update = (key: CatalogKey, patch: Partial<CatalogCheck>) => {
