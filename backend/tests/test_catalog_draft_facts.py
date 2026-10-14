@@ -5,7 +5,7 @@
   比较、IN、BETWEEN、LIKE、IS NULL、AND / OR / NOT 和 UPPER / LOWER / TRIM / COALESCE，不超过 500 字。不过就丢掉；
 - 开了数据剖析、能连上的源：经剖析的只读守卫数出排除比例，排除 0% 或 100% 的不收，收下的在 note 里写剖析核对的结果；
   没开剖析、连不上的照收，note 写没有核对的原因；
-- 开了剖析的源，目录里记下的码值交给模型做背景（遮罩的列不给）；
+- 开了剖析的源，目录里记下的码值交给模型做背景（遮罩的列不给；「已确认的目录项」里遮罩列的码值也不给）；
 - 这两项照旧记模型起草 / 推断；SQL 检查只在人工确认、有确证时才把漏了有效行过滤报成警告，推断的只是提示。
 
 用合成的景区业务库（tests/fixtures/catalog/scenic.py）和虚构的表结构，不调用真实模型。
@@ -255,6 +255,26 @@ async def test_codes_go_to_the_model_when_profiling_is_on_but_not_masked_ones():
     plain = FakeModel({"orders": REPLY})
     await D.run_model_draft(plain, _plain({"orders": _orders()}), ["orders"], existing=_codes_existing())
     assert head not in plain.calls[0] and "已支付" not in plain.calls[0], "没开剖析不给码值"
+
+
+@pytest.mark.parametrize("options", [
+    {PROFILE_OPTION: {"enabled": True}, MASK_COLUMNS_OPTION: ["ORDER_NO"]},
+    {MASK_COLUMNS_OPTION: "order_no"},
+], ids=["profiled", "not-profiled"])
+async def test_confirmed_codes_of_a_masked_column_do_not_reach_the_model_either(options):
+    """遮罩的列不给码值，人工确认过的也一样：码值就是这一列的取值。以前经「已确认的目录项」照给（开没开剖析都给）；
+    没遮罩的列确认过的码值照给（以此为准），遮罩列别的确认过的项（中文名）也照给。"""
+    existing = {"orders": {"columns": {
+        "order_no": {"codes": make_item({"ZX-0417": "内部测试单"}, "human", "confirmed"),
+                     "label": make_item("订单号", "human", "confirmed")},
+        "status": {"codes": make_item({"C": "作废"}, "human", "confirmed")},
+    }}}
+    model = FakeModel({"orders": REPLY})
+    await D.run_model_draft(model, _plain({"orders": _orders()}, options=options), ["orders"], existing=existing)
+    text = model.calls[0]
+    assert "ZX-0417" not in text and "内部测试单" not in text
+    confirmed = text[text.index(catalog.CATALOG_DRAFT_PROMPT_LABELS["confirmed"]):]
+    assert "status：码值：C=作废" in confirmed and "order_no：订单号" in confirmed
 
 
 async def test_codes_reach_the_table_part_of_a_wide_table_and_only_their_column_part():

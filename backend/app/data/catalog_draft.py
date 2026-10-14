@@ -80,9 +80,9 @@
 
 **防错事实。** 表级的项里模型可以提议有效行过滤（valid_filter）和去重规则（dedup），各附一句依据（写进这一项的 note），
 校验见 catalog._from_model（有效行过滤按方言解析，不过就丢掉）。开了数据剖析的源（catalog_profile.profile_settings）：
-目录里记下的码值交给模型做背景（遮罩的列不给），表级那段写完后经剖析的只读守卫数一数有效行过滤排除了多少行
-（catalog_profile.check_valid_filter），排除 0% 或 100% 的不收，收下的 note 写上排除比例；没开剖析、连不上的照收，
-note 写没有核对的原因。
+目录里记下的码值交给模型做背景（遮罩的列不给，「已确认的目录项」里遮罩列的码值同样不给），表级那段写完后经剖析的只读
+守卫数一数有效行过滤排除了多少行（catalog_profile.check_valid_filter），排除 0% 或 100% 的不收，收下的 note 写上排除
+比例；没开剖析、连不上的照收，note 写没有核对的原因。
 
 交给模型的是表结构（列、类型、主键、外键、唯一约束、注释）和使用者补充的背景；开了数据剖析的源另给目录里记下的码值
 （剖析取过的取值和含义，遮罩的列不给），别的数据值一概不发。写给模型的文字都在 catalog.py 名字带 _SYSTEM / _PROMPT
@@ -1750,16 +1750,18 @@ class _Run:
         line = labels["column"].format(name=col["name"], type=col.get("type") or "")
         return line + ("，" + "，".join(marks) if marks else "")
 
-    @staticmethod
-    def _confirmed_for(st: _Table, piece: _Piece) -> dict[str, Any]:
-        """已确认、有确证的项（以此为准的背景）：整表全给；其余给表级的项和这一段的列，关系只在要写表级的项时给。"""
-        confirmed = C._confirmed_only(st.existing)
-        if not st.whole(piece):
-            wanted = set(piece.columns)
-            kept = {key: item for key, item in C._slots(confirmed).items()
-                    if key[0] == "t" or (key[0] == "c" and key[1] in wanted) or (key[0] == "r" and piece.table_level)}
-            confirmed = C._assemble(kept)
-        return confirmed
+    def _confirmed_for(self, st: _Table, piece: _Piece) -> dict[str, Any]:
+        """已确认、有确证的项（以此为准的背景）：整表全给；其余给表级的项和这一段的列，关系只在要写表级的项时给。
+
+        遮罩的列上的码值不给，人工确认过的也一样：码值就是这一列的取值（同 _codes_lines，也同表助手的背景、导入目录的
+        规矩）。以前只有新加的码值背景挡住了，这里照给。这一列别的确认过的项（中文名、含义……）照给。"""
+        whole = st.whole(piece)
+        wanted = set(piece.columns)
+        kept = {key: item for key, item in C._slots(C._confirmed_only(st.existing)).items()
+                if not (key[0] == "c" and key[2] == "codes" and key[1].lower() in self.masked)
+                and (whole or key[0] == "t" or (key[0] == "c" and key[1] in wanted)
+                     or (key[0] == "r" and piece.table_level))}
+        return C._assemble(kept)
 
     def _codes_lines(self, st: _Table, piece: _Piece, shown: Mapping[str, Any]) -> list[str]:
         """开了数据剖析的源：目录里记下的码值（剖析取过的取值和已知含义）交给模型，判断有效行过滤、列的含义用。要写表级
