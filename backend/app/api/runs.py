@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 from datetime import datetime
 from typing import Any
-from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
@@ -12,6 +11,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
+# 「人」的唯一入口搬到了 api/deps.py（开登录时返回认证过的用户名）。别处照旧从这里导入 actor_of
+from app.api.deps import actor_of  # noqa: F401
 from app.core.bus import bus
 from app.db.base import SessionLocal, get_session
 from app.db.models import Approval, Artifact, Run, RunEvent
@@ -25,15 +26,6 @@ from app.engine.runner import run_manager
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
 
-def actor_of(header: str | None) -> str | None:
-    """请求头 X-Actor 里的署名（设置页填的那个），没填就是 None。
-
-    浏览器的请求头只能是 Latin-1：中文署名原样放进去，fetch 直接抛错、整个请求
-    发不出去。所以前端按 encodeURIComponent 编码后发，这里解回来；老客户端发的
-    纯 ASCII 署名解码前后一样。
-    """
-    value = unquote((header or "").strip()).strip()
-    return value[:100] or None
 
 
 class StartRunIn(BaseModel):

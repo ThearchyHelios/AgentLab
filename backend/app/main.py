@@ -12,6 +12,12 @@ from app.api import (
     artifacts, bundle, catalog, compare, conversations, copilot, datasources, evidence, governance, inquiry, knowledge,
     runs, sandbox, schedules, settings as settings_api, source_versions, table_imports, tools, whatif, workflows,
 )
+# 应用平台（docs/design/app-platform-and-look.md）。权限按 §3.12 在这里挂路由级依赖（api/deps.require_role），
+# 关登录时全部放行
+from app.api import (
+    actions as actions_api, apps as apps_api, auth as auth_api, capabilities as capabilities_api, hooks as hooks_api,
+    identity as identity_api, ledger as ledger_api, notify as notify_api, tasks as tasks_api,
+)
 from app.api.coded import CodedHTTPException, coded_handler
 from app.core.config import settings
 from app.db.base import init_db
@@ -147,6 +153,16 @@ for router in (
     source_versions.router,
     catalog.router,
     datasources.router,
+    # 应用平台
+    auth_api.router,
+    identity_api.router,
+    capabilities_api.router,
+    apps_api.router,
+    tasks_api.router,
+    actions_api.router,
+    hooks_api.router,
+    notify_api.router,
+    ledger_api.router,
 ):
     app.include_router(router)
 

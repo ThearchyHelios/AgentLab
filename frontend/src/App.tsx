@@ -20,6 +20,14 @@ import { KnowledgePage } from './pages/KnowledgePage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SchedulesPage } from './pages/schedules/SchedulesPage'
 import { NotFound } from './pages/NotFound'
+// 应用平台：使用面（FE-5）、搭建面的应用编辑（FE-6）
+import { AppsHome } from './pages/apps/AppsHome'
+import { AppPage } from './pages/apps/AppPage'
+import { EntryPage } from './pages/apps/EntryPage'
+import { InstancePage } from './pages/apps/InstancePage'
+import { TaskPage } from './pages/apps/TaskPage'
+import { AppEditor } from './pages/apps/edit/AppEditor'
+import { LoginPage } from './pages/LoginPage'
 import { Logo } from './components/Logo'
 import {
   CommandPalette, PAGES, ShortcutHelp, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
@@ -121,6 +129,16 @@ export default function App() {
               <Route path="/knowledge/:tab/:id" element={<KnowledgePage />} />
               <Route path="/schedules" element={<SchedulesPage />} />
               <Route path="/schedules/:id" element={<SchedulesPage />} />
+              {/* 应用：固定路径（inbox）写在 /apps/:appId 前面，读的人一眼看出它不是应用 id */}
+              <Route path="/apps" element={<AppsHome />} />
+              <Route path="/apps/inbox/:taskId" element={<TaskPage />} />
+              <Route path="/apps/:appId" element={<AppPage />} />
+              <Route path="/apps/:appId/p/:pageId" element={<AppPage />} />
+              <Route path="/apps/:appId/new/:entryId" element={<EntryPage />} />
+              <Route path="/apps/:appId/i/:runId" element={<InstancePage />} />
+              <Route path="/apps/:appId/edit" element={<AppEditor />} />
+              <Route path="/apps/:appId/edit/:section" element={<AppEditor />} />
+              <Route path="/login" element={<LoginPage />} />
               {/* 数据源搬到了顶级「数据」页；旧书签和各处「去设置 → 数据源」的链接还在 */}
               <Route path="/settings/datasources" element={<Navigate to="/data" replace />} />
               <Route path="/settings" element={<SettingsPage />} />

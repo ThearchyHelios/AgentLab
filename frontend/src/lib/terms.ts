@@ -4869,3 +4869,6 @@ export const VERIFY_SETTING_TEXT = {
     saveInvalid: '核查设置中有无效值，请修正后再保存',
   },
 }
+
+// 应用平台使用面的文案（FE-5 维护）。调用方照旧从 lib/terms 导入
+export * from './termsApp'

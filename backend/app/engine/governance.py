@@ -29,6 +29,23 @@ UPGRADE_POLICIES = {"recompute", "dual", "incomparable"}
 
 UPGRADE_POLICY_LABELS = {k: option_label("upgrade_policy", k) for k in ("recompute", "dual", "incomparable")}
 
+#: 发布门禁的扩展检查（应用平台 §3.13）：各包把自己的检查登记在这里，不改下面的主循环。
+#: 每个检查的签名：check(spec, flag, *, level, strict) -> None，flag 同 lint_for_publish 里的那个
+#: （message, code=, node_id=, hard=, field=）。登记见 engine/lint_process.py、engine/lint_capabilities.py
+EXTRA_LINTS: list[Callable[..., None]] = []
+
+
+def _load_extra_lints() -> None:
+    """导入各包的检查模块（它们导入时把自己登记进 EXTRA_LINTS）。还没建的模块跳过。"""
+    import importlib
+
+    for name in ("app.engine.lint_process", "app.engine.lint_capabilities"):
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError as e:
+            if e.name != name:
+                raise
+
 
 def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any] | None = None,
                      providers: list[Any] | None = None) -> ValidationResult:
@@ -110,6 +127,9 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
 
     _lint_evidence(spec, flag, strict=strict)
     _lint_sql(spec, flag, checkers)
+    _load_extra_lints()
+    for check in EXTRA_LINTS:
+        check(spec, flag, level=level, strict=strict)
     if providers is not None:
         from app.engine.provider_refs import issues as provider_issues
 

@@ -218,13 +218,35 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("catalog_draft_tasks", "chunks_done", "INTEGER"),
     # 复核后：逐表的日志（模型提议的有效记录条件没有收下的原因）。存量任务回填 NULL，接口给空列表
     ("catalog_draft_tasks", "log", "JSON"),
+    # 应用平台（docs/design/app-platform-and-look.md §3.1.2）。新表由 create_all 建；这些是已有表的新列，存量一律 NULL：
+    # 运行的来源未记录、版本的发布人和退役没记过、MCP 没有认证头、对话不属于任何应用
+    ("runs", "origin_kind", "VARCHAR(20)"),
+    ("runs", "origin", "JSON"),
+    ("runs", "app_id", "VARCHAR(32)"),
+    ("runs", "app_version", "INTEGER"),
+    ("workflow_versions", "published_at", "DATETIME"),
+    ("workflow_versions", "published_by", "VARCHAR(100)"),
+    ("workflow_versions", "retired_at", "DATETIME"),
+    ("workflow_versions", "retired_by", "VARCHAR(100)"),
+    ("workflow_versions", "retire_note", "TEXT"),
+    ("workflow_versions", "capability_versions", "JSON"),
+    ("workflows", "origin", "JSON"),
+    ("mcp_servers", "headers", "JSON DEFAULT '{}'"),
+    ("mcp_servers", "endpoint_id", "VARCHAR(32)"),
+    ("conversations", "app_id", "VARCHAR(32)"),
 ]
 
-#: 迁移补上的列要建的索引：(索引名, 表, 列)。create_all 不碰已有的表，表上新列的索引也就不会建。
-#: 索引名照 NAMING_CONVENTION 取，和新库 create_all 建出来的同名，IF NOT EXISTS 才不会重复建
-_INDEX_MIGRATIONS: list[tuple[str, str, str]] = [
+#: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。
+#: 索引名照 NAMING_CONVENTION 取（多列的照模型 __table_args__ 里写的名字），和新库 create_all 建出来的同名，
+#: IF NOT EXISTS 才不会重复建
+_INDEX_MIGRATIONS: list[tuple[str, str, str | tuple[str, ...]]] = [
     # 定时任务的触发历史按它找这个任务发起的运行
     ("ix_runs_schedule_id", "runs", "schedule_id"),
+    # 应用平台：按来源、按应用筛运行；按工作流、版本、状态找钉住版本最近一次封存的运行
+    ("ix_runs_origin_kind", "runs", "origin_kind"),
+    ("ix_runs_app_id", "runs", "app_id"),
+    ("ix_runs_wf_ver_status", "runs", ("workflow_id", "version", "status")),
+    ("ix_conversations_app_id", "conversations", "app_id"),
 ]
 
 
@@ -235,10 +257,11 @@ def _migrate(conn) -> None:  # pragma: no cover - 同步回调
         cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
         if cols and column not in cols:
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
-    for name, table, column in _INDEX_MIGRATIONS:
+    for name, table, columns in _INDEX_MIGRATIONS:
+        wanted = (columns,) if isinstance(columns, str) else columns
         cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
-        if column in cols:
-            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))
+        if all(c in cols for c in wanted):
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({', '.join(wanted)})"))
 
 
 async def init_db() -> None:
