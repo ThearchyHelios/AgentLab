@@ -1,0 +1,1131 @@
+// 数据目录闭环（/data/catalog/<源>）的交互回归：表助手、审阅队列、导出导入、防错事实的提议在表详情里的说明。
+//
+// 这几样都直接改数据目录：表助手的「保存 N 项修改」、审阅队列的成批确认 / 驳回、导入。查的是「请求里带没带读到的版本、
+// 该带的对话和待保存的修改」「同一项以最后一次提案为准」「别人刚改过（409）时有没有按最新内容重算、停下来让人再看一眼」
+// 「成批审阅逐条的结果、冲突的那几条标没标出来」「导入先预览、冲突逐条列出，确认后才写」——正常路径的页面检查一个字都
+// 不会说。
+//
+// 写法同 check-catalog：沙箱里的数据源多半没探查过结构，所以数据源列表、目录清单、单表目录、审阅队列、表助手的事件流、
+// 导出导入都用 page.route 伪造（虚构的景区业务库和一个开了数据剖析的库）；写请求在浏览器层答掉，照服务端的规则改这里的
+// 假状态。没配的写请求一律拦成 503，不写库；最后核对真库里的数据源和目录数量没有变化。表助手不调真模型：事件流是这里
+// 拼的。
+// 跑之前前后端都得起着（./scripts/dev.sh），默认连 5273 / 8000；对别的实例跑时带上地址：
+//   AGENTLAB_WEB=http://localhost:<前端端口> AGENTLAB_API=http://localhost:<后端端口>/api node scripts/check-catalog-loop.mjs
+// 只跑其中几节：CHECK_ONLY=表助手,审阅 node scripts/check-catalog-loop.mjs（按节名包含匹配）。
+// 截图：CHECK_SHOTS=/某个目录 时把关键状态存下来；CHECK_THEME=light 换浅色跑一遍。
+import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
+
+const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
+const API = process.env.AGENTLAB_API ?? 'http://localhost:8000/api'
+const SHOTS = process.env.CHECK_SHOTS ?? ''
+const THEME = process.env.CHECK_THEME === 'light' ? 'light' : 'dark'
+// 不用 playwright install：系统 Chrome 就够了
+const CHROME = process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const ACTOR = '检查脚本'
+
+let failed = 0
+const check = (name, cond, detail = '') => {
+  console.log(`  ${cond ? '✓' : '✗'} ${name}${detail ? ` — ${detail}` : ''}`)
+  if (!cond) failed++
+}
+
+try {
+  const r = await fetch(`${API}/datasources/kinds`)
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+} catch (e) {
+  console.error(`✗ 连不上后端（${API}）——先起沙箱后端\n  ${e.message}`)
+  process.exit(1)
+}
+
+// 真库的数量：开头记一次，最后再数一次，必须一样（检查本身不许写库）
+async function realCounts() {
+  const sources = await (await fetch(`${API}/datasources`)).json()
+  let entries = 0
+  let versions = 0
+  for (const s of sources) {
+    const r = await fetch(`${API}/datasources/${s.id}/catalog`)
+    if (!r.ok) continue
+    const d = await r.json()
+    for (const t of d.tables ?? []) {
+      if (t.version > 0) entries++
+      versions += t.version
+    }
+  }
+  return { sources: sources.length, entries, versions }
+}
+const before = await realCounts()
+
+const browser = await chromium.launch({ executablePath: CHROME })
+const opened = new Set()
+
+/** 开一页：handlers 按「METHOD 路径正则」匹配，没配的 GET 放行到后端，没配的写请求一律拦成 503。原生对话框都算失败 */
+async function open(path, { handlers = [], viewport = { width: 1440, height: 900 } } = {}) {
+  const ctx = await browser.newContext({ viewport, colorScheme: THEME, timezoneId: 'Asia/Shanghai', acceptDownloads: true })
+  opened.add(ctx)
+  ctx.setDefaultTimeout(6000)
+  ctx.setDefaultNavigationTimeout(30000)
+  await ctx.addInitScript(([t, actor]) => {
+    try {
+      localStorage.setItem('agentlab.theme', t)
+      localStorage.removeItem('agentlab.health')
+      localStorage.setItem('agentlab_actor', actor)
+    } catch { /* noop */ }
+  }, [THEME, ACTOR])
+  const page = await ctx.newPage()
+  const sent = []
+  const errors = []
+  const natives = []
+  page.on('pageerror', (e) => errors.push(e.message))
+  page.on('dialog', (d) => { natives.push(`${d.type()}: ${d.message().slice(0, 40)}`); void d.dismiss() })
+  await page.route((u) => new URL(u).pathname.startsWith('/api/'), async (route) => {
+    const r = route.request()
+    const url = new URL(r.url())
+    const key = `${r.method()} ${decodeURIComponent(url.pathname.replace(/^\/api/, ''))}`
+    for (const [pattern, handle] of handlers) {
+      if (pattern.test(key)) {
+        let body = null
+        try { body = r.postDataJSON() } catch { body = r.postData() }
+        sent.push({ key, body, query: Object.fromEntries(url.searchParams), actor: r.headers()['x-actor'] ?? null })
+        return handle(route, { body, url, key })
+      }
+    }
+    if (r.method() === 'GET') return route.continue()
+    sent.push({ key, body: null, blocked: true })
+    return route.fulfill({ status: 503, body: '' })
+  })
+  await page.goto(`${WEB}${path}`, { waitUntil: 'networkidle' })
+  await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), THEME)
+  await page.waitForTimeout(400)
+  return { page, sent, errors, natives, close: () => { opened.delete(ctx); return ctx.close() } }
+}
+const goto = async (page, path) => {
+  await page.goto(`${WEB}${path}`, { waitUntil: 'networkidle' })
+  await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), THEME)
+  await page.waitForTimeout(300)
+}
+const json = (data, status = 200) => (route) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) })
+const until = async (fn, ms = 6000, step = 120) => {
+  const end = Date.now() + ms
+  let v = await fn()
+  while (!v && Date.now() < end) { await new Promise((r) => setTimeout(r, step)); v = await fn() }
+  return v
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const shot = async (page, name) => { if (SHOTS) await page.screenshot({ path: `${SHOTS}/${name}.png` }) }
+const writes = (sent) => sent.filter((s) => !s.key.startsWith('GET '))
+const count = (sent, re) => sent.filter((s) => re.test(s.key)).length
+const lastSent = (sent, re) => sent.filter((s) => re.test(s.key)).at(-1) ?? null
+const textOf = (loc) => loc.first().innerText({ timeout: 800 }).then((t) => t.replace(/\s+/g, ' ').trim()).catch(() => '')
+
+const ONLY = process.env.CHECK_ONLY?.split(',').map((x) => x.trim()).filter(Boolean)
+async function section(name, fn) {
+  if (ONLY?.length && !ONLY.some((k) => name.includes(k))) return
+  console.log(`\n=== ${name} ===`)
+  try {
+    await fn()
+  } catch (e) {
+    check(`${name} 中途出错`, false, String(e?.message ?? e).split('\n')[0])
+  } finally {
+    for (const c of opened) await c.close().catch(() => {})
+    opened.clear()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 夹具：虚构的景区业务库（没开数据剖析）和一个开了数据剖析的库。名字、数字全是假的
+// ---------------------------------------------------------------------------
+const T0 = '2026-10-10T02:00:00+00:00'
+const INIT = { fk: 'verified', human: 'confirmed' }
+const item = (value, source = 'llm', status, extra = {}) => ({ value, source, status: status ?? INIT[source] ?? 'proposed', updated_at: T0, ...extra })
+const col = (name, type = 'INTEGER', extra = {}) => ({ name, type, pk: false, not_null: false, comment: null, ...extra })
+const pk = (name = 'id') => col(name, 'INTEGER', { pk: true, not_null: true })
+
+const S1 = 'check-loop-scenic'
+const S2 = 'check-loop-profiled'
+const NAME1 = 'zzloopscenic'
+const NAME2 = 'zzloopprofiled'
+
+/** 防错事实的提议：模型起草的有效记录条件、去重规则，附剖析核对的排除比例（或没核对的原因） */
+const FILTER_NOTE = '剖析核对：排除 3.2% 的行（共 12,345 行）'
+const DEDUP_NOTE = '按票号去重，同一张票重复刷闸只算一次；没有核对排除比例（数据源没有开数据剖析）'
+
+const VISITS_COLUMNS = [pk(), col('ticket_no', 'TEXT'), col('park_id'), col('gate_id'), col('visit_time', 'TEXT'), col('visitor_count'), col('status')]
+const visitsNotes = () => ({
+  label: item('入园记录', 'human'),
+  grain: item('一张门票的一次入园'),
+  keys: item(['ticket_no']),
+  valid_filter: item('status NOT IN (9)', 'llm', 'proposed', { note: FILTER_NOTE }),
+  dedup: item('按 ticket_no 去重', 'llm', 'proposed', { note: DEDUP_NOTE }),
+  columns: {
+    ticket_no: { label: item('票号'), measure: item('identifier', 'name') },
+    visitor_count: { label: item('入园人数'), unit: item('人'), measure: item('flow') },
+    status: { label: item('状态'), measure: item('status', 'human'), codes: item({ 1: '已入园' }) },
+  },
+})
+const PROMO_COLUMNS = [pk(), ...Array.from({ length: 110 }, (_, i) => col(`attr_${String(i + 1).padStart(3, '0')}`, 'TEXT'))]
+
+const table = (name, usage, columns, notes, extra = {}) => ({
+  name, usage, columns, notes, version: notes ? (extra.version ?? 2) : 0, comment: null, is_view: false,
+  updated_at: notes ? T0 : null, updated_by: notes ? '审核甲' : null, missing: false, ...extra,
+})
+
+function scenicTables() {
+  return [
+    table('visits', 42, VISITS_COLUMNS, visitsNotes()),
+    table('orders', 30, [pk(), col('order_no', 'TEXT'), col('member_id'), col('total_amount', 'REAL')], {
+      label: item('订单'), kind: item('fact'),
+    }),
+    table('parks', 18, [pk(), col('park_code', 'TEXT'), col('name', 'TEXT')], { label: item('景区', 'human') }),
+    table('promo_attrs', 6, PROMO_COLUMNS, { label: item('促销属性') }),
+    table('members', 3, [pk(), col('member_no', 'TEXT'), col('joined_on', 'TEXT')], null),
+  ]
+}
+function profiledTables() {
+  return [
+    // 上一次起草留了 2 列空：开场引导先问这几列
+    table('gates', 12, [pk(), col('gate_code', 'TEXT'), col('gate_kind', 'TEXT'), col('park_id')], {
+      label: item('闸机'), columns: { id: { label: item('编号') }, park_id: { label: item('景区编号') } },
+    }, { lastDraft: { status: 'ok', job_id: 'check-job-old', finished_at: T0, error: null, model_error: null, blank_columns: 2 } }),
+    table('stores', 4, [pk(), col('store_code', 'TEXT')], null),
+  ]
+}
+
+const blank = {
+  kind: 'sqlite', host: null, port: null, username: null, readonly: true, description: '', enabled: true,
+  password_masked: '', has_password: false, cached_schema: '', schema_error: '', available_schemas: [],
+  last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null, current_snapshot: null,
+}
+const manual = (id, name, count, options = {}) => ({
+  ...blank, id, name, origin: 'manual', database: `/tmp/check/${name}.db`, table_count: count, tools: [`db_query__${name}`],
+  schema_synced_at: T0, options,
+})
+const PROFILE_ON = { catalog_profile: { enabled: true, max_queries: 60, query_timeout_s: 10, sample_size: 2000, max_scan_rows: 100000, max_total_s: 120 } }
+const SOURCES = [manual(S1, NAME1, 5), manual(S2, NAME2, 2, PROFILE_ON)]
+const NAMES = SOURCES.map((s) => s.name)
+
+const freshState = () => ({ sources: SOURCES, tables: { [S1]: scenicTables(), [S2]: profiledTables() }, guidance: { [S1]: '金额单位是元' } })
+
+// ---------------------------------------------------------------------------
+// 假服务端：目录清单、单表目录、单项审阅、保存提案、预览（只做界面看得出来的部分）
+// ---------------------------------------------------------------------------
+const TABLE_FIELDS = ['label', 'description', 'grain', 'keys', 'kind', 'business_date', 'valid_filter', 'dedup']
+const COLUMN_FIELDS = ['label', 'meaning', 'unit', 'measure', 'codes']
+const clone = (x) => JSON.parse(JSON.stringify(x))
+
+function slots(notes) {
+  const out = new Map()
+  for (const f of TABLE_FIELDS) if (notes?.[f]) out.set(f, notes[f])
+  for (const [c, items] of Object.entries(notes?.columns ?? {})) for (const f of COLUMN_FIELDS) if (items?.[f]) out.set(`columns.${c}.${f}`, items[f])
+  for (const r of notes?.relations ?? []) out.set(`relations.${r.id}`, r)
+  return out
+}
+function assemble(map) {
+  const notes = {}
+  for (const [path, it] of map) {
+    if (path.startsWith('columns.')) {
+      const rest = path.slice('columns.'.length)
+      const cut = rest.lastIndexOf('.')
+      ;((notes.columns ??= {})[rest.slice(0, cut)] ??= {})[rest.slice(cut + 1)] = it
+    } else if (path.startsWith('relations.')) (notes.relations ??= []).push(it)
+    else notes[path] = it
+  }
+  return notes
+}
+function countsOf(notes) {
+  const c = { proposed: 0, verified: 0, confirmed: 0, rejected: 0 }
+  for (const it of slots(notes).values()) c[it.status]++
+  return c
+}
+function rowOf(t) {
+  const n = t.notes ?? {}
+  const live = (it) => (it && it.status !== 'rejected' ? it : null)
+  return {
+    table_name: t.name, qualified: t.name, is_view: t.is_view, in_schema: !t.missing,
+    label: live(n.label)?.value ?? null, label_status: live(n.label)?.status ?? null, kind: live(n.kind)?.value ?? null,
+    counts: countsOf(n), relations: (n.relations ?? []).filter((r) => r.status !== 'rejected').length,
+    usage: t.usage, version: t.version, updated_at: t.updated_at, updated_by: t.updated_by, last_draft: t.lastDraft ?? null,
+  }
+}
+const listOf = (state, src) => ({
+  tables: [...state.tables[src]].sort((a, b) => b.usage - a.usage).map(rowOf), system_notes: false, schema_note: null,
+  schema_truncated: false, schema_total: state.tables[src].length, guidance: state.guidance[src] ?? null, active_job: null,
+})
+const detailOf = (t) => ({
+  table_name: t.name, in_schema: !t.missing, notes: t.notes ?? {}, version: t.version, updated_at: t.updated_at, updated_by: t.updated_by,
+  structure: { qualified: t.name, is_view: false, comment: null, columns: t.columns, primary_key: t.columns.filter((c) => c.pk).map((c) => c.name),
+    foreign_keys: [], unique: [] },
+  system_notes: false, usage: t.usage,
+})
+const parts = (key) => key.split(' ')[1].split('/')  // ['', 'datasources', id, 'catalog', table?, …]
+const findTable = (state, key) => {
+  const [, , src, , name] = parts(key)
+  return { src, t: state.tables[src]?.find((x) => x.name === name) }
+}
+const writeEntry = (t, notes) => {
+  t.notes = notes
+  t.version += 1
+  t.updated_at = new Date().toISOString()
+  t.updated_by = ACTOR
+}
+const conflictDetail = (name) => ({ detail: `表「${name}」的数据目录刚被修改过，请重新载入后再提交` })
+function applyReview(notes, path, action) {
+  const map = slots(clone(notes ?? {}))
+  const it = map.get(path)
+  if (!it) return null
+  if (action === 'reset' && it.source === 'human') map.delete(path)
+  else it.status = action === 'confirm' ? 'confirmed' : action === 'reject' ? 'rejected' : INIT[it.source] ?? 'proposed'
+  return assemble(map)
+}
+/** 保存提案（catalog.apply_patch 的简化）：码值是补充，其余整项替换；改动的项记为人工填写、已确认 */
+function applyPatch(notes, changes) {
+  const map = slots(clone(notes ?? {}))
+  for (const c of changes) {
+    const prev = map.get(c.path)
+    const value = c.path.endsWith('.codes') && prev ? { ...prev.value, ...c.value } : c.value
+    map.set(c.path, { value, source: 'human', status: 'confirmed', updated_at: new Date().toISOString() })
+  }
+  return assemble(map)
+}
+/** 预览：对着当前目录算改前、改后（只读） */
+function previewOf(t, changes) {
+  const map = slots(t.notes ?? {})
+  return {
+    table_name: t.name, version: t.version, problems: [],
+    changes: changes.map((c) => {
+      const prev = map.get(c.path)
+      const live = prev && prev.status !== 'rejected' ? prev : null
+      const after = c.path.endsWith('.codes') && live ? { ...live.value, ...c.value } : c.value
+      return { path: c.path, before: live?.value ?? null, before_status: live?.status ?? null, after, value: c.value, reason: c.reason ?? '',
+        state: JSON.stringify(live?.value) === JSON.stringify(after) ? (live.status === 'confirmed' ? 'same' : 'confirm') : 'change' }
+    }),
+  }
+}
+
+/** 表助手的事件流：每个事件一行 data: <JSON> */
+const sse = (events) => (route) => route.fulfill({
+  status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' },
+  body: events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(''),
+})
+const done = (queries = 0) => ({ type: 'done', usage: { input_tokens: 2400, output_tokens: 600 }, queries })
+const MODEL_DOWN = { detail: '未配置模型接入，无法由模型起草数据目录。请到「设置 → 模型接入」添加', code: 'catalog_draft_model_unavailable' }
+const BUSY = { detail: `数据源「${NAME1}」正在起草数据目录，请等这次起草结束（或先停止它）再开始新的起草`, code: 'catalog_draft_busy' }
+
+function loopHandlers(state, replies = {}) {
+  const reply = (k, fallback) => (route, ctx) => {
+    const q = replies[k]
+    const next = Array.isArray(q) ? q.shift() : q
+    return (next ?? fallback)(route, ctx)
+  }
+  return [
+    [/^GET \/datasources$/, (route) => json(state.sources)(route)],
+    [/^GET \/datasources\/check-loop-[a-z]+\/catalog$/, (route, { key }) => json(listOf(state, parts(key)[2]))(route)],
+    [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/draft-jobs\/(active|latest)$/, json({ job: null })],
+    // 审阅队列、进度、成批审阅、导出导入：放在单表的 GET 前面
+    [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/review-queue$/, reply('queue', (route, { key, url }) => {
+      const src = parts(key)[2]
+      const kind = url.searchParams.get('kind') ?? 'all'
+      const only = url.searchParams.get('table') ?? ''
+      const limit = Number(url.searchParams.get('limit') ?? 50)
+      const offset = Number(url.searchParams.get('offset') ?? 0)
+      const all = (state.queue?.[src] ?? []).filter((i) => i.status === 'proposed' && (kind === 'all' || i.kind === kind) && (!only || i.table_name === only))
+      return json({ total: all.length, items: all.slice(offset, offset + limit).map(({ kind: _k, ...i }) => ({ ...i, version: tableVersion(state, src, i.table_name) })) })(route)
+    })],
+    [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/review-progress$/, reply('progress', (route) => json(state.progress ?? PROGRESS)(route))],
+    [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/review\/batch$/, reply('batch', (route, { key, body }) => {
+      const src = parts(key)[2]
+      const results = []
+      const byTable = new Map()
+      for (const it of body.items) (byTable.get(it.table_name) ?? byTable.set(it.table_name, []).get(it.table_name)).push(it)
+      for (const [name, list] of byTable) {
+        const t = state.tables[src].find((x) => x.name === name)
+        if (state.conflictTables?.has(name) || list.some((i) => i.if_version !== t.version)) {
+          for (const i of list) results.push({ table_name: name, path: i.path, ok: false, version: null, error: conflictDetail(name).detail, code: 'catalog_conflict' })
+          continue
+        }
+        let notes = t.notes
+        for (const i of list) notes = applyReview(notes, i.path, i.action) ?? notes
+        writeEntry(t, notes)
+        for (const i of list) {
+          const q = state.queue[src].find((x) => x.table_name === name && x.path === i.path)
+          if (q) q.status = i.action === 'confirm' ? 'confirmed' : i.action === 'reject' ? 'rejected' : 'proposed'
+          results.push({ table_name: name, path: i.path, ok: true, version: t.version, error: null, code: null })
+        }
+      }
+      return json({ results })(route)
+    })],
+    [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/export$/, reply('export', (route, { key }) => {
+      const src = parts(key)[2]
+      const source = state.sources.find((s) => s.id === src)
+      const file = { format: 'agentlab-catalog', version: 1, exported_at: T0, source: { name: source.name, kind: source.kind },
+        guidance: state.guidance[src] ?? null, tables: Object.fromEntries(state.tables[src].filter((t) => t.notes).map((t) => [t.name, { notes: t.notes, version: t.version }])) }
+      const name = `${source.name}-数据目录.json`
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(file, null, 2),
+        headers: { 'content-disposition': `attachment; filename="catalog.json"; filename*=UTF-8''${encodeURIComponent(name)}` } })
+    })],
+    [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/import\/preview$/, reply('importPreview', json(IMPORT_PREVIEW))],
+    [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/import$/, reply('import', (route, { key }) => {
+      const src = parts(key)[2]
+      const out = clone(IMPORT_PREVIEW)
+      for (const t of out.tables) {
+        const target = state.tables[src].find((x) => x.name === (t.matched_as ?? t.table_name))
+        if (target) { writeEntry(target, { ...(target.notes ?? {}), description: item('导入的说明', 'human') }); t.version = target.version }
+      }
+      return json(out)(route)
+    })],
+    [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+\/impact$/, (route, { key }) => json({ table: parts(key)[4], templates: [] })(route)],
+    [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+\/usage$/, reply('usage', (route, { key, url }) => {
+      const runs = state.usage?.[parts(key)[4]] ?? []
+      return json({ total: runs.length, runs: runs.slice(0, Number(url.searchParams.get('limit') ?? 20)) })(route)
+    })],
+    // 表助手：每一轮按 replies.assistant 依次答（没配就是 503，检查不能让请求落到真服务端）
+    [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+\/assistant$/, reply('assistant', json({ detail: '检查脚本没有为这一轮准备答复' }, 503))],
+    [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+\/patch\/preview$/, reply('preview', (route, { key, body }) => {
+      const { t } = findTable(state, key)
+      return json(previewOf(t, body.changes))(route)
+    })],
+    [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+\/patch$/, reply('patch', (route, { key, body }) => {
+      const { t } = findTable(state, key)
+      if (body.if_version !== t.version) return json(conflictDetail(t.name), 409)(route)
+      if (body.changes.length > 200) return json({ detail: [{ type: 'too_long', loc: ['body', 'changes'], msg: 'too long' }] }, 422)(route)
+      writeEntry(t, applyPatch(t.notes, body.changes))
+      return json(detailOf(t))(route)
+    })],
+    [/^POST \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+\/review$/, (route, { key, body }) => {
+      const { t } = findTable(state, key)
+      if (body.if_version !== t.version) return json(conflictDetail(t.name), 409)(route)
+      const notes = applyReview(t.notes, body.path, body.action)
+      if (!notes) return json({ detail: '找不到这一项，可能已被修改，请重新载入' }, 422)(route)
+      writeEntry(t, notes)
+      const q = state.queue?.[parts(key)[2]]?.find((x) => x.table_name === t.name && x.path === body.path)
+      if (q) q.status = body.action === 'confirm' ? 'confirmed' : body.action === 'reject' ? 'rejected' : 'proposed'
+      return json(detailOf(t))(route)
+    }],
+    [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/[^/]+$/, (route, { key }) => {
+      const { t } = findTable(state, key)
+      return t ? json(detailOf(t))(route) : json({ detail: `数据源中没有表 ${parts(key)[4]}` }, 404)(route)
+    }],
+  ]
+}
+const tableVersion = (state, src, name) => state.tables[src].find((t) => t.name === name)?.version ?? 0
+
+// ---------------------------------------------------------------------------
+// 审阅队列的夹具：服务端排好的顺序（常用表里影响数字的推断在前）。kind 只是假服务端按筛选挑项用，不回给页面
+// ---------------------------------------------------------------------------
+const qItem = (table_name, path, field, field_label, value, display, kind, priority, reasons, table_usage, extra = {}) => ({
+  table_name, path, field, field_label, value, display, source: 'llm', status: 'proposed', note: null, priority, reasons, table_usage, kind, ...extra,
+})
+function queueOf() {
+  const list = [
+    qItem('visits', 'valid_filter', 'valid_filter', '有效记录条件', 'status NOT IN (9)', 'status NOT IN (9)', 'facts', 9.6,
+      ['常用表（被 42 次运行用到）', '影响数字的项（有效行过滤）', '模型起草，未确认'], 42, { note: FILTER_NOTE }),
+    qItem('visits', 'dedup', 'dedup', '去重规则', '按 ticket_no 去重', '按 ticket_no 去重', 'facts', 9.5,
+      ['常用表（被 42 次运行用到）', '影响数字的项（去重规则）', '模型起草，未确认'], 42, { note: DEDUP_NOTE }),
+    qItem('orders', 'kind', 'kind', '表类型', 'fact', '明细表', 'names', 6.2, ['常用表（被 30 次运行用到）', '模型起草，未确认'], 30),
+    qItem('visits', 'columns.ticket_no.measure', 'measure', '列 ticket_no 的度量类型', 'identifier', '标识', 'facts', 5.1,
+      ['常用表（被 42 次运行用到）', '影响数字的项（度量类型）', '命名推断，未确认'], 42, { source: 'name' }),
+    qItem('visits', 'grain', 'grain', '粒度', '一张门票的一次入园', '一张门票的一次入园', 'names', 4.4,
+      ['常用表（被 42 次运行用到）', '模型起草，未确认'], 42),
+  ]
+  // 余下的：促销属性表的列中文名（使用次数少，排在后面）。总数 57，一页 50
+  for (let i = 1; i <= 52; i++) {
+    const c = `attr_${String(i).padStart(3, '0')}`
+    list.push(qItem('promo_attrs', `columns.${c}.label`, 'label', `列 ${c} 的中文名`, `属性 ${i}`, `属性 ${i}`, 'names', 1 - i / 100,
+      ['模型起草，未确认'], 6))
+  }
+  return list
+}
+const PROGRESS = {
+  top_n: 20,
+  top: { tables: 5, items_total: 286, items_confirmed: 120 },
+  all: { items_total: 1460, items_confirmed: 262, items_proposed: 1234, items_rejected: 12 },
+  facts: { proposed: 56, confirmed: 12 },
+}
+const USAGE_RUNS = [
+  { run_id: 'run-check-0003', workflow_id: 'wf-check-1', workflow_name: '每日入园统计', run_class: 'formal', status: 'succeeded', started_at: '2026-10-12T01:00:00+00:00' },
+  { run_id: 'run-check-0002', workflow_id: 'wf-check-2', workflow_name: '闸机异常排查', run_class: 'exploratory', status: 'failed', started_at: '2026-10-11T03:00:00+00:00' },
+  { run_id: 'run-check-0001', workflow_id: null, workflow_name: null, run_class: 'exploratory', status: 'succeeded', started_at: '2026-10-10T05:00:00+00:00' },
+]
+
+// ---------------------------------------------------------------------------
+// 导入的夹具：文件里的表 visits、ORDERS（大小写不同，对上 orders）、legacy_tickets（这里没有）
+// ---------------------------------------------------------------------------
+const IMPORT_FILE = {
+  format: 'agentlab-catalog', version: 1, exported_at: '2026-10-09T08:00:00+00:00', source: { name: 'zzloopother', kind: 'sqlite' },
+  guidance: '景区票务库：金额单位是元',
+  tables: {
+    visits: { version: 7, notes: { label: item('入园记录', 'human'), description: item('每次刷闸记一行', 'human') } },
+    ORDERS: { version: 3, notes: { kind: item('fact', 'human') } },
+    legacy_tickets: { version: 1, notes: { label: item('旧票', 'human') } },
+  },
+}
+const IMPORT_PREVIEW = {
+  tables: [
+    { table_name: 'visits', matched_as: 'visits', add: 1, update: 0, keep: 4, skipped: [{ path: 'columns.gate_code.label', why: '表结构里没有列 gate_code' }],
+      conflicts: [{ path: 'label', label: '表的中文名', file_value: '入园流水', target_value: '入园记录', why: '这里已确认，以这里为准' }] },
+    { table_name: 'ORDERS', matched_as: 'orders', add: 0, update: 1, keep: 1, conflicts: [], skipped: [] },
+  ],
+  unmatched_tables: ['legacy_tickets'],
+  totals: { tables: 2, add: 1, update: 1, keep: 5, conflicts: 1, skipped: 1 },
+  guidance: { file: '景区票务库：金额单位是元', target: '金额单位是元', action: 'keep' },
+}
+
+// ---------------------------------------------------------------------------
+// 页面上的定位
+// ---------------------------------------------------------------------------
+const detail = (page) => page.locator('[data-catalog-detail]')
+const version = async (page) => Number(await detail(page).getAttribute('data-version'))
+const openDetail = async (page, src, name, q = '') => {
+  await goto(page, `/data/catalog/${src}/${encodeURIComponent(name)}${q}`)
+  await until(async () => (await page.locator(`[data-catalog-detail="${name}"][data-version]`).count()) > 0)
+}
+const panel = (page) => page.locator('[data-table-assistant]')
+const input = (page) => panel(page).locator('[data-assistant-input]')
+const streaming = (page) => panel(page).getAttribute('data-streaming').catch(() => null)
+/** 发一句话，等这一轮答完（或出错、停止） */
+async function say(page, text, { wait = true } = {}) {
+  await input(page).fill(text)
+  await input(page).press('Enter')
+  if (wait) {
+    await until(async () => (await streaming(page)) === 'true', 1500)
+    await until(async () => (await streaming(page)) === 'false')
+  }
+}
+const lastTurn = (page) => panel(page).locator('[data-assistant-msg="assistant"]').last()
+const pendingCount = async (page) => Number(await panel(page).locator('[data-assistant-pending]').getAttribute('data-assistant-pending').catch(() => '-1'))
+const changeState = (page, path, turn = null) => (turn ?? panel(page)).locator(`[data-assistant-change="${path}"]`).last().getAttribute('data-change-state').catch(() => null)
+const confirmBox = (page) => page.locator('[role="dialog"]').filter({ hasNot: page.locator('[data-import-dialog]') }).last()
+
+const CODE_RE = /\b(?:proposed|verified|confirmed|rejected|many_to_one|identifier|fact|dimension|llm|fk|if_version|notes|facts|names|catalog_draft_busy|catalog_conflict)\b/
+async function cleanCopy(page, where) {
+  let t = await page.locator('[data-catalog-page]').innerText()
+  for (const n of [...NAMES, 'zzloopother']) t = t.replaceAll(n, '')
+  // 表名、列名、SQL 是库里的东西，照原样显示，先去掉再查
+  t = t.replace(/[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+/g, '').replace(/SELECT[^\n]*/g, '')
+  const code = t.match(CODE_RE)?.[0]
+  check(`${where}：不露机读码`, !code, code ?? '')
+}
+
+// ---------------------------------------------------------------------------
+
+try {
+  const probe = await open('/data')
+  const overlay = await probe.page.locator('vite-error-overlay').count()
+  await probe.close()
+  if (overlay) {
+    console.error('✗ 页面上是 vite 的报错层——有文件正在改，等一会儿再跑')
+    process.exit(1)
+  }
+} catch (e) {
+  console.error(`✗ 打不开前端（${WEB}）——先起沙箱前端\n  ${e.message}`)
+  process.exit(1)
+}
+
+await section('纯函数 · 对话怎么截、待保存的修改怎么累积、审阅结果怎么并', async () => {
+  const { page, errors, close } = await open('/data')
+  const r = await page.evaluate(async () => {
+    const a = await import('/src/pages/catalog/assistant.ts')
+    const rv = await import('/src/pages/catalog/review.ts')
+    const dj = await import('/src/pages/catalog/draftJob.ts')
+    const out = {}
+    // 对话：最多 40 条、每条最多 4000 字，总从用户的话开始；没有正文的回答写成占位
+    const turns = []
+    for (let i = 0; i < 25; i++) {
+      turns.push({ id: `u${i}`, role: 'user', text: i === 0 ? 'x'.repeat(5000) : `问 ${i}` })
+      turns.push({ id: `a${i}`, role: 'assistant', state: 'done', parts: i === 3 ? [] : [{ kind: 'text', text: `答 ${i}` }] })
+    }
+    const h = a.historyOf(turns, '最后一问')
+    out.history = { n: h.length, first: h[0].role, last: h.at(-1).content, max: Math.max(...h.map((m) => [...m.content].length)) }
+    const short = a.historyOf(turns.slice(0, 8), '再问')
+    out.short = { n: short.length, first: [...short[0].content].length, placeholder: short[7].content }
+    // 待保存的修改：同一路径换成后一条、位置不动；已经是这个值且已确认的不收
+    const c = (path, value, state = 'change') => ({ path, before: null, before_status: null, after: value, value, reason: '', state })
+    let p = a.mergeProposal([], [c('label', '甲'), c('grain', '一行'), c('kind', 'fact', 'same')], 'p1', 3)
+    p = a.mergeProposal(p, [c('label', '乙'), c('dedup', '按票号')], 'p2', 5)
+    out.pending = { paths: p.map((x) => x.path).join(','), label: p[0].value, origin: p[0].origin, version: a.pendingVersion(p) }
+    out.states = [a.changeStateOf(p, new Set(), 'p1', 'label'), a.changeStateOf(p, new Set(), 'p2', 'label'),
+      a.changeStateOf(a.dropPending(p, 'grain'), new Set(), 'p1', 'grain'), a.changeStateOf(p, new Set([a.savedKey('p1', 'grain')]), 'p1', 'grain')]
+    // 409 后按预览重算：预览里没有的、已经是这个值的去掉，版本换成预览的
+    const pv = a.applyPreview(p, { table_name: 't', version: 9, problems: ['x'], changes: [
+      { ...c('label', '乙'), before: '丙', before_status: 'proposed' }, { ...c('grain', '一行'), state: 'same' } ] })
+    out.preview = { paths: pv.map((x) => x.path).join(','), before: pv[0].before, version: pv[0].version }
+    // 上次起草的留空列：停了、没有新写入时用再之前那次的
+    out.blank = [
+      dj.lastBlankInfo({ status: 'ok', blank_columns: 4, blank_columns_from: 9 }),
+      dj.lastBlankInfo({ status: 'cancelled', blank_columns: 0, blank_columns_from: 6 }),
+      dj.lastBlankInfo({ status: 'cancelled', blank_columns: 0, blank_columns_from: 6, parts_written: 2 }),
+      dj.lastBlankInfo({ status: 'running', blank_columns: 3, blank_columns_from: 6 }),
+      dj.lastBlankInfo({ status: 'cancelled', blank_columns: 2, blank_columns_from: 6 }),
+    ]
+    out.chunks = [dj.chunksOf({ parts_total: 3, chunks_total: 3, chunks_done: 1 }), dj.chunksOf({ parts_total: 3, chunks_total: 5, chunks_done: 2 }),
+      dj.chunksOf({ parts_total: 1, chunks_total: 2, chunks_done: 0 }), dj.chunksOf({ parts_total: null, chunks_total: null })]
+    // 审阅：地址参数来回、成批的结果、撤销审阅只发审阅成功过的、表详情改过之后跟着换状态
+    const q = rv.writeReviewParams(new URLSearchParams('q=x&view=review'), { kind: 'facts', table: 'visits', item: 'columns.a.b.label' })
+    out.params = { qs: q.toString(), back: rv.reviewParamsOf(q), cleared: rv.writeReviewParams(q, { view: 'list', item: '' }).toString() }
+    const items = [{ table_name: 't1', path: 'grain', status: 'proposed', version: 2 }, { table_name: 't1', path: 'dedup', status: 'proposed', version: 2 },
+      { table_name: 't2', path: 'kind', status: 'proposed', version: 7 }]
+    const sel = new Set(items.map(rv.itemKey))
+    const res = rv.applyResults([
+      { table_name: 't1', path: 'grain', ok: true, version: 3, error: null, code: null },
+      { table_name: 't1', path: 'dedup', ok: true, version: 3, error: null, code: null },
+      { table_name: 't2', path: 'kind', ok: false, version: null, error: '刚被修改过', code: 'catalog_conflict' },
+    ], 'confirm', new Map(), new Map())
+    out.results = { t1: res.versions.get('t1'), t2: res.versions.get('t2') ?? null, kinds: items.map((i) => res.outcomes.get(rv.itemKey(i))?.kind).join(',') }
+    out.targets = { reset: rv.batchTargets(items, sel, 'reset', res.outcomes).map((i) => i.path).join(','),
+      confirm: rv.batchTargets(items, sel, 'confirm', res.outcomes).map((i) => i.path).join(','),
+      reject: rv.batchTargets(items, sel, 'reject', res.outcomes).length }
+    const synced = rv.syncFromDetail(items, 't1', { grain: { value: 'x', source: 'llm', status: 'proposed' },
+      dedup: { value: 'y', source: 'llm', status: 'rejected' } }, 4, res.outcomes, res.versions)
+    out.sync = { grain: synced.outcomes.get(rv.itemKey(items[0])), dedup: synced.outcomes.get(rv.itemKey(items[1]))?.status, v: synced.versions.get('t1') }
+    out.pct = [rv.percentOf(120, 286), rv.percentOf(0, 0)]
+    return out
+  })
+  // 51 条取后 40 条，打头的那条是助手的回答，去掉：39 条
+  check('对话最多交 40 条，从用户的话开始，最后一条是这一问', r.history.n === 39 && r.history.first === 'user' && r.history.last === '最后一问', JSON.stringify(r.history))
+  check('……每条最多 4000 字', r.history.max <= 4000 && r.short.first === 4000, JSON.stringify(r.short))
+  check('……没有正文的回答写成占位，保持一问一答', r.short.n === 9 && r.short.placeholder === '（没有回答）', JSON.stringify(r.short))
+  check('待保存的修改：同一路径换成后一条、位置不动，已是这个值且已确认的不收', r.pending.paths === 'label,grain,dedup' && r.pending.label === '乙'
+        && r.pending.origin === 'p2', JSON.stringify(r.pending))
+  check('……保存带最早那条提案对照的版本', r.pending.version === 3)
+  check('……提案卡片上一项的处境：被替换、待保存、去掉、已保存', r.states.join(',') === 'replaced,pending,dropped,saved', r.states.join(','))
+  check('409 后按预览重算：预览里没有的、已是这个值的去掉，换上最新的改前和版本', r.preview.paths === 'label' && r.preview.before === '丙' && r.preview.version === 9,
+    JSON.stringify(r.preview))
+  check('留空列：结束的起草用自己的；停了且没有新写入用再之前那次的；写进过段、还在起草的不用旧数',
+    JSON.stringify(r.blank) === JSON.stringify([{ n: 4, earlier: false }, { n: 6, earlier: true }, { n: 0, earlier: false }, { n: 0, earlier: false }, { n: 2, earlier: false }]),
+    JSON.stringify(r.blank))
+  check('块进度：块比段多才有', JSON.stringify(r.chunks) === JSON.stringify([null, { done: 2, total: 5 }, { done: 0, total: 2 }, null]), JSON.stringify(r.chunks))
+  check('审阅视图的地址参数：只动自己的键，来回一致', r.params.qs === 'q=x&view=review&kind=facts&rtable=visits&item=columns.a.b.label'
+        && r.params.back.kind === 'facts' && r.params.back.table === 'visits' && r.params.back.item === 'columns.a.b.label' && r.params.cleared === 'q=x&kind=facts&rtable=visits',
+    JSON.stringify(r.params))
+  check('成批审阅的结果：成功的记这张表写入后的版本，冲突的标出来', r.results.t1 === 3 && r.results.t2 === null && r.results.kinds === 'ok,ok,conflict', JSON.stringify(r.results))
+  check('……撤销审阅只发审阅成功过的，冲突的照旧可以再确认', r.targets.reset === 'grain,dedup' && r.targets.confirm === 'kind' && r.targets.reject === 3,
+    JSON.stringify(r.targets))
+  check('表详情改过之后：回到推断的记成撤销审阅，驳回的记成已驳回，版本换成最新的', r.sync.grain?.action === 'reset' && r.sync.dedup === 'rejected' && r.sync.v === 4,
+    JSON.stringify(r.sync))
+  check('进度的百分比四舍五入，分母为 0 时不写', r.pct[0] === 42 && r.pct[1] === null, JSON.stringify(r.pct))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+// 第一轮：用户说出码值，助手整理成两项提案
+const PROPOSAL_1 = {
+  type: 'proposal', source_id: S1, table: 'visits', version: 2, changes: [
+    { path: 'columns.status.codes', label: '列 status 的码值', before: { 1: '已入园' }, before_status: 'proposed', after: { 1: '已入园', 9: '已作废' },
+      value: { 9: '已作废' }, reason: '用户说「status 为 9 表示作废」', state: 'change' },
+    { path: 'columns.status.meaning', label: '列 status 的含义', before: null, before_status: null, after: '入园状态：1 已入园，9 已作废',
+      value: '入园状态：1 已入园，9 已作废', reason: '用户说「status 为 9 表示作废」', state: 'change' },
+  ],
+}
+// 第二轮：码值再补一个（同一项，以这一次为准），有效记录条件跟着改
+const PROPOSAL_2 = {
+  type: 'proposal', source_id: S1, table: 'visits', version: 2, changes: [
+    { path: 'columns.status.codes', label: '列 status 的码值', before: { 1: '已入园' }, before_status: 'proposed', after: { 1: '已入园', 8: '已退票', 9: '已作废' },
+      value: { 8: '已退票', 9: '已作废' }, reason: '用户说「8 是退票」', state: 'change' },
+    { path: 'valid_filter', label: '有效记录条件', before: 'status NOT IN (9)', before_status: 'proposed', after: 'status NOT IN (8, 9)',
+      value: 'status NOT IN (8, 9)', reason: '用户说「统计时退票和作废的都要排除」', state: 'change' },
+  ],
+}
+const SAY_1 = 'status 为 9 表示作废，统计时要排除'
+const SAY_2 = '8 是退票，统计时退票和作废的都要排除'
+const TEXT_1 = ['好的，', '我把码值和含义整理成了提案：']
+
+await section('表助手 · 入口、开场、提案与待保存的修改', async () => {
+  const state = freshState()
+  const replies = {
+    assistant: [
+      sse([{ type: 'text', delta: TEXT_1[0] }, { type: 'text', delta: TEXT_1[1] }, PROPOSAL_1, done()]),
+      sse([{ type: 'text', delta: '明白。退票也排除：' }, PROPOSAL_2, { type: 'text', delta: '请核对后保存。' }, done()]),
+    ],
+  }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state, replies) })
+  await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
+  const entry = page.locator('[data-catalog-assistant-open="header"]')
+  check('表详情顶部有「和助手一起完善」', await entry.count() === 1 && (await textOf(entry)).includes('和助手一起完善'), await textOf(entry))
+  await entry.click()
+  check('点开：表助手面板出现，焦点在输入框', await until(async () => panel(page).isVisible())
+        && await until(async () => page.evaluate(() => document.activeElement?.hasAttribute('data-assistant-input'))))
+  check('……入口按钮标为展开', (await entry.getAttribute('aria-expanded')) === 'true')
+  check('没开剖析的源：写明只能根据表结构和目录推断，不能查数据',
+    (await textOf(panel(page).locator('[data-assistant-no-profile]'))).includes('这个数据源没开数据剖析，助手只能根据表结构和目录推断，不能查数据'))
+  check('开场：说明整理成修改提案、确认后才写入、不写公式', await until(async () => (await textOf(panel(page).locator('[data-assistant-greeting]'))).includes('修改提案'))
+        && (await textOf(panel(page).locator('[data-assistant-greeting]'))).includes('不写计算公式'))
+  const log = panel(page).locator('[data-assistant-log]')
+  check('对话区是读屏会播报的 log（aria-live=polite）', (await log.getAttribute('role')) === 'log' && (await log.getAttribute('aria-live')) === 'polite')
+  check('输入框、发送按钮有名字', (await input(page).getAttribute('aria-label')) === '给表助手的消息'
+        && (await panel(page).locator('[data-assistant-send]').getAttribute('aria-label')) === '发送')
+  check('还没有待保存的修改：不给保存', await panel(page).locator('[data-assistant-save]').count() === 0)
+
+  // 第一轮：流式显示正文，提案逐项写改前、改后、依据，进待保存的修改
+  await say(page, SAY_1)
+  const req1 = lastSent(sent, /\/assistant$/)
+  check('第一轮的请求：对话只有这一句，还没有待保存的修改', JSON.stringify(req1?.body) === JSON.stringify({ messages: [{ role: 'user', content: SAY_1 }], pending: [] }),
+    JSON.stringify(req1?.body))
+  check('……用户的话出现在对话里', (await textOf(panel(page).locator('[data-assistant-msg="user"] [data-assistant-user-text]').last())) === SAY_1,
+    await textOf(panel(page).locator('[data-assistant-msg="user"]').last()))
+  check('回答的正文是几段增量接起来的', (await textOf(lastTurn(page).locator('[data-assistant-text]'))) === TEXT_1.join(''), await textOf(lastTurn(page).locator('[data-assistant-text]')))
+  const card1 = panel(page).locator('[data-assistant-msg="assistant"]').first().locator('[data-assistant-proposal]')
+  check('提案卡片：2 项，每项写改前、改后、依据', await card1.count() === 1 && await card1.locator('[data-assistant-change]').count() === 2
+        && (await textOf(card1.locator('[data-assistant-change="columns.status.codes"]'))).includes('改前')
+        && (await textOf(card1.locator('[data-assistant-change="columns.status.codes"]'))).includes('依据')
+        && (await textOf(card1.locator('[data-assistant-change="columns.status.codes"]'))).includes('用户说「status 为 9 表示作废」'),
+    await textOf(card1))
+  check('……码值写成「1=已入园、9=已作废」，位置用服务端给的说法', (await textOf(card1.locator('[data-assistant-change="columns.status.codes"] [data-change-after]'))).includes('1=已入园、9=已作废')
+        && (await textOf(card1.locator('[data-assistant-change="columns.status.codes"]'))).startsWith('列 status 的码值'))
+  check('待保存的修改：2 项，给「保存 2 项修改」', await pendingCount(page) === 2 && (await textOf(panel(page).locator('[data-assistant-save]'))) === '保存 2 项修改')
+  // 逐项去掉、加回
+  await card1.locator('[data-assistant-change="columns.status.meaning"] [data-assistant-change-toggle]').click()
+  check('提案里去掉一项：标「已去掉」，待保存的少一项', await until(async () => (await pendingCount(page)) === 1)
+        && (await changeState(page, 'columns.status.meaning', card1)) === 'dropped')
+  const toggle = card1.locator('[data-assistant-change="columns.status.meaning"] [data-assistant-change-toggle]')
+  check('……去掉以后按钮是「加回」，读屏名写明加回哪一项', (await textOf(toggle)) === '加回' && (await toggle.getAttribute('aria-label')) === '加回：列 status 的含义')
+  await toggle.click()
+  check('……加回：又是 2 项', await until(async () => (await pendingCount(page)) === 2) && (await changeState(page, 'columns.status.meaning', card1)) === 'pending')
+  await panel(page).locator('[data-assistant-pending-item="columns.status.meaning"] [data-assistant-pending-remove]').click()
+  check('在「待保存的修改」里去掉：剩 1 项，卡片上跟着标「已去掉」', await until(async () => (await pendingCount(page)) === 1)
+        && (await changeState(page, 'columns.status.meaning', card1)) === 'dropped')
+
+  // 第二轮：带上前面的对话和还没保存的修改；同一项以这一次为准
+  await say(page, SAY_2)
+  const req2 = lastSent(sent, /\/assistant$/)?.body
+  check('第二轮的请求：带上前面的对话（助手那句是它的正文）和待保存的修改', JSON.stringify(req2?.messages) === JSON.stringify([
+    { role: 'user', content: SAY_1 }, { role: 'assistant', content: TEXT_1.join('') }, { role: 'user', content: SAY_2 },
+  ]) && JSON.stringify(req2?.pending) === JSON.stringify([{ path: 'columns.status.codes', value: { 9: '已作废' }, reason: '用户说「status 为 9 表示作废」' }]),
+  JSON.stringify(req2))
+  check('……正文、提案、正文按到来的先后排', JSON.stringify(await lastTurn(page).locator('[data-assistant-part]').evaluateAll((els) => els.map((e) => e.getAttribute('data-assistant-part'))))
+    === JSON.stringify(['text', 'proposal', 'text']))
+  check('同一项以最后一次提案为准：待保存 2 项（码值换成这一轮的、加上有效记录条件）', await pendingCount(page) === 2
+        && (await textOf(panel(page).locator('[data-assistant-pending-item="columns.status.codes"]'))).includes('8=已退票'),
+    await textOf(panel(page).locator('[data-assistant-pending-item="columns.status.codes"]')))
+  check('……第一轮卡片上的码值标「已改用另一条提案的值」', (await changeState(page, 'columns.status.codes', card1)) === 'replaced'
+        && (await textOf(card1.locator('[data-assistant-change="columns.status.codes"]'))).includes('已改用另一条提案的值'))
+  await shot(page, 'catalog-assistant')
+
+  // 保存：带提案对照的版本；别人刚改过（409）就按最新内容重算，停下来让人再看一眼
+  const t = state.tables[S1].find((x) => x.name === 'visits')
+  writeEntry(t, { ...t.notes, description: item('别人刚补的说明', 'human') })
+  const v0 = await version(page)
+  await panel(page).locator('[data-assistant-save]').click()
+  const save1 = lastSent(sent, /\/visits\/patch$/)?.body
+  check('保存：交回 2 项的路径、原样取值和依据，带提案对照的版本 2', JSON.stringify(save1) === JSON.stringify({
+    changes: [{ path: 'columns.status.codes', value: { 8: '已退票', 9: '已作废' }, reason: '用户说「8 是退票」' },
+      { path: 'valid_filter', value: 'status NOT IN (8, 9)', reason: '用户说「统计时退票和作废的都要排除」' }], if_version: 2,
+  }), JSON.stringify(save1))
+  const conflict = panel(page).locator('[data-assistant-conflict]')
+  check('别人刚改过（409）：写明这张表刚被修改过，已按最新内容重算', await until(async () => (await conflict.count()) === 1)
+        && (await textOf(conflict)).includes('这张表刚被修改过') && (await textOf(conflict)).includes('已按最新内容重算'), await textOf(conflict))
+  check('……用预览接口重算（只读），没有直接再存一次', count(sent, /\/visits\/patch\/preview$/) === 1 && count(sent, /\/visits\/patch$/) === 1)
+  check('……待保存的修改照旧 2 项，没有丢', await pendingCount(page) === 2)
+  await panel(page).locator('[data-assistant-save]').click()
+  check('再点保存：带最新的版本 3，存上了', await until(async () => count(sent, /\/visits\/patch$/) === 2) && lastSent(sent, /\/visits\/patch$/)?.body?.if_version === 3)
+  check('……存上以后：待保存的清空，写明已保存 2 项（第 4 版）', await until(async () => (await panel(page).locator('[data-assistant-saved]').count()) === 1)
+        && (await textOf(panel(page).locator('[data-assistant-saved]'))).includes('已保存 2 项修改（第 4 版）') && await panel(page).locator('[data-assistant-pending]').count() === 0,
+    await textOf(panel(page).locator('[data-assistant-saved]')))
+  check('……表详情换上最新的目录（第 4 版），有效记录条件是新的值', await until(async () => (await version(page)) === 4) && v0 === 2
+        && (await textOf(page.locator('[data-field="valid_filter"]'))).includes('status NOT IN (8, 9)'))
+  check('……卡片上存了的项标「已保存」，不能再加回', (await changeState(page, 'valid_filter')) === 'saved'
+        && await panel(page).locator('[data-assistant-change="valid_filter"] [data-assistant-change-toggle]').count() === 0)
+  await cleanCopy(page, '表助手')
+  check('只发过表助手、保存、预览的写请求', writes(sent).every((s) => /\/(assistant|patch|patch\/preview)$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('表助手 · 停止、出错、模型用不了与离开前确认', async () => {
+  const state = freshState()
+  let release = null
+  const held = new Promise((r) => { release = r })
+  const replies = {
+    assistant: [
+      // 起草模型用不了：开流之前就回 409
+      json(MODEL_DOWN, 409),
+      // 一直不答完：等着点「停止回答」
+      async (route) => { await held; await route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' }).catch(() => {}) },
+      // 流里出错
+      sse([{ type: 'text', delta: '我先看一下这张表' }, { type: 'error', message: '调用模型出错：服务暂时不可用', code: 'model_error' }]),
+      // 有一项提案：之后离开、关闭时要先问
+      sse([{ type: 'text', delta: '整理好了：' }, PROPOSAL_1, done()]),
+    ],
+  }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state, replies) })
+  await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
+  await page.locator('[data-catalog-assistant-open="header"]').click()
+  await panel(page).waitFor()
+
+  await say(page, '你好')
+  const err = lastTurn(page).locator('[data-assistant-error]')
+  check('起草模型用不了（409）：照原样写服务端那句话', (await textOf(err)) === MODEL_DOWN.detail, await textOf(err))
+  check('……输入框还能用', !(await input(page).isDisabled()))
+
+  await say(page, '帮我看看这张表', { wait: false })
+  check('回答中：面板标为正在回答，发送换成「停止回答」', await until(async () => (await streaming(page)) === 'true')
+        && await panel(page).locator('[data-assistant-stop]').isVisible() && (await panel(page).locator('[data-assistant-stop]').getAttribute('aria-label')) === '停止回答')
+  check('……对话区标 aria-busy，答完再播报', (await panel(page).locator('[data-assistant-log]').getAttribute('aria-busy')) === 'true')
+  await panel(page).locator('[data-assistant-stop]').click()
+  check('点「停止回答」：这一轮标「已停止回答」，可以接着说', await until(async () => (await streaming(page)) === 'false')
+        && (await textOf(lastTurn(page).locator('[data-assistant-turn-status]'))).includes('已停止回答') && await panel(page).locator('[data-assistant-send]').isVisible())
+  release()
+
+  await say(page, '再试一次')
+  check('流里出错：已经写出的正文留着，写明这一轮没有完成和原因', (await textOf(lastTurn(page).locator('[data-assistant-text]'))) === '我先看一下这张表'
+        && (await textOf(lastTurn(page).locator('[data-assistant-error]'))).includes('调用模型出错：服务暂时不可用'))
+  const req = lastSent(sent, /\/assistant$/)?.body
+  check('……停止、出错的那几轮也交给服务端（没有正文的写成占位，保持一问一答）',
+    req?.messages?.length === 5 && req.messages.map((m) => m.role).join(',') === 'user,assistant,user,assistant,user', JSON.stringify(req?.messages))
+
+  await say(page, '码值 9 是作废')
+  check('有待保存的修改', await pendingCount(page) === 2)
+  await page.locator('[data-catalog-next]').click()
+  check('有待保存的修改时换表：先问一句（表助手有未保存的修改）', await until(async () => (await confirmBox(page).innerText().catch(() => '')).includes('表助手有未保存的修改')),
+    await confirmBox(page).innerText().catch(() => ''))
+  await confirmBox(page).getByRole('button', { name: '留下' }).or(confirmBox(page).getByRole('button', { name: '取消' })).first().click()
+  check('……选留下：还在这张表，待保存的修改还在', await until(async () => (await confirmBox(page).count()) === 0 || !(await confirmBox(page).isVisible()))
+        && new URL(page.url()).pathname.endsWith('/visits') && await pendingCount(page) === 2)
+  await panel(page).locator('[data-assistant-close]').click()
+  check('关闭表助手：有待保存的修改时先问', await until(async () => (await confirmBox(page).innerText().catch(() => '')).includes('关闭表助手')))
+  await confirmBox(page).getByRole('button', { name: '放弃并关闭' }).click()
+  check('……确认后面板收起，焦点回到入口', await until(async () => (await panel(page).count()) === 0)
+        && await until(async () => page.evaluate(() => document.activeElement?.getAttribute('data-catalog-assistant-open') === 'header')))
+  check('只发过表助手的请求，没有保存', writes(sent).every((s) => /\/assistant$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('表助手 · 开了剖析的源：只读查询与留空列的引导', async () => {
+  const state = freshState()
+  const QUERY = { type: 'query', sql: 'SELECT gate_kind, COUNT(*) AS n FROM gates GROUP BY gate_kind', columns: ['gate_kind', 'n', 'gate_code'],
+    rows: [['E', 6, '已遮罩'], ['X', 2, '已遮罩']], row_count: 2, error: null }
+  const replies = {
+    assistant: [sse([QUERY, { type: 'query', sql: 'SELECT COUNT(*) FROM gates WHERE park_id IS NULL', columns: [], rows: [], row_count: 0, error: '查询超时（10 秒）' },
+      { type: 'text', delta: 'gate_kind 只有 E、X 两种取值，分别是什么意思？' }, done(2)])],
+  }
+  const { page, sent, errors, close } = await open(`/data/catalog/${S2}/gates`, { handlers: loopHandlers(state, replies) })
+  await until(async () => (await page.locator('[data-catalog-detail="gates"][data-version]').count()) > 0)
+  const tip = page.locator('[data-catalog-last-draft]')
+  check('上次起草有留空的列：顶部提示里有「和助手一起完善」', await until(async () => (await tip.locator('[data-catalog-assistant-open="notice"]').count()) === 1))
+  await tip.locator('[data-catalog-assistant-open="notice"]').click()
+  await panel(page).waitFor()
+  check('开了剖析的源：不写「不能查数据」，写明可以发少量只读查询', await panel(page).locator('[data-assistant-no-profile]').count() === 0
+        && (await textOf(panel(page).locator('[data-assistant-profile-on]'))).includes('只读查询'))
+  const lead = await textOf(panel(page).locator('[data-assistant-blank]'))
+  check('开场引导先问留空的列：写明上次起草有 2 列留空，例如 gate_code、gate_kind', lead.includes('上次起草有 2 列模型拿不准、留空了') && lead.includes('gate_code、gate_kind'), lead)
+  const suggest = panel(page).locator('[data-assistant-suggest="blank"]')
+  check('……给一个按钮「补上留空的 2 列」', (await textOf(suggest)) === '补上留空的 2 列')
+  await suggest.click()
+  await until(async () => (await streaming(page)) === 'false' && count(sent, /\/assistant$/) === 1)
+  const first = lastSent(sent, /\/assistant$/)?.body?.messages?.[0]?.content ?? ''
+  check('……点了就把这几列交给助手', first.includes('gate_code、gate_kind') && first.includes('拿不准的地方先问我'), first)
+  const q = lastTurn(page).locator('[data-assistant-query]')
+  check('跑过的只读查询：两条，默认收起，摘要写行数', await until(async () => (await q.count()) === 2)
+        && !(await q.first().evaluate((el) => el.open)) && (await textOf(q.first().locator('summary'))).includes('查询了数据（2 行）'))
+  check('……查询没成功的写明原因', (await textOf(q.nth(1).locator('summary'))).includes('查询没有成功') && (await textOf(q.nth(1))).includes('查询超时（10 秒）'))
+  await q.first().locator('summary').click()
+  check('……展开：SQL 和前几行，遮罩列的值写「已遮罩」', await until(async () => q.first().locator('[data-assistant-query-sql]').isVisible())
+        && (await textOf(q.first().locator('[data-assistant-query-sql]'))).startsWith('SELECT gate_kind')
+        && await q.first().locator('[data-assistant-query-rows] tbody tr').count() === 2
+        && (await textOf(q.first().locator('[data-assistant-query-rows]'))).includes('已遮罩'))
+  check('……写明这一轮查询了 2 次', (await textOf(lastTurn(page).locator('[data-assistant-turn-status]'))).includes('查询 2 次'),
+    await textOf(lastTurn(page).locator('[data-assistant-turn-status]')))
+  await shot(page, 'catalog-assistant-query')
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('表助手 · 一次最多保存 200 项', async () => {
+  const state = freshState()
+  const changes = []
+  for (let i = 1; i <= 101; i++) {
+    const c = `attr_${String(i).padStart(3, '0')}`
+    changes.push({ path: `columns.${c}.label`, before: null, before_status: null, after: `属性 ${i}`, value: `属性 ${i}`, reason: '按列名推断', state: 'change' })
+    changes.push({ path: `columns.${c}.meaning`, before: null, before_status: null, after: `促销属性 ${i}`, value: `促销属性 ${i}`, reason: '按列名推断', state: 'change' })
+  }
+  const replies = { assistant: [sse([{ type: 'proposal', source_id: S1, table: 'promo_attrs', version: 2, changes }, done()])] }
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}/promo_attrs`, { handlers: loopHandlers(state, replies) })
+  await until(async () => (await page.locator('[data-catalog-detail="promo_attrs"][data-version]').count()) > 0)
+  await page.locator('[data-catalog-assistant-open="header"]').click()
+  await panel(page).waitFor()
+  await say(page, '把这些列都补上中文名和含义')
+  check('202 项待保存：保存按钮不能点，写明一次最多 200 项', await pendingCount(page) === 202 && await panel(page).locator('[data-assistant-save]').isDisabled()
+        && (await textOf(panel(page).locator('[data-assistant-too-many]'))).includes('一次最多保存 200 项'))
+  for (const p of ['columns.attr_101.meaning', 'columns.attr_101.label']) {
+    await panel(page).locator(`[data-assistant-pending-item="${p}"] [data-assistant-pending-remove]`).click()
+  }
+  check('去掉 2 项：200 项，可以保存', await until(async () => (await pendingCount(page)) === 200) && !(await panel(page).locator('[data-assistant-save]').isDisabled())
+        && await panel(page).locator('[data-assistant-too-many]').count() === 0)
+  await panel(page).locator('[data-assistant-save]').click()
+  check('……保存：一次交 200 项', await until(async () => count(sent, /\/promo_attrs\/patch$/) === 1) && lastSent(sent, /\/promo_attrs\/patch$/)?.body?.changes?.length === 200)
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('表助手 · 窄屏', async () => {
+  const state = freshState()
+  const replies = { assistant: [sse([{ type: 'text', delta: TEXT_1.join('') }, PROPOSAL_1, done()])] }
+  const { page, errors, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state, replies), viewport: { width: 390, height: 844 } })
+  const overflow = () => page.evaluate(() => {
+    const root = document.querySelector('[data-catalog-page]')
+    return root ? root.scrollWidth - root.clientWidth : 99
+  })
+  await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
+  await page.locator('[data-catalog-assistant-open="header"]').click()
+  await panel(page).waitFor()
+  const box = await panel(page).boundingBox()
+  check('390 宽：表助手铺满详情，在视口里，页面不横向滚动', !!box && box.x >= 0 && box.x + box.width <= 391 && await overflow() <= 1,
+    `${JSON.stringify(box)} ${await overflow()}`)
+  await say(page, SAY_1)
+  const inner = await panel(page).evaluate((el) => {
+    const log = el.querySelector('[data-assistant-log]')
+    return Math.max(el.scrollWidth - el.clientWidth, log ? log.scrollWidth - log.clientWidth : 0)
+  })
+  check('……回答、提案、待保存的修改都折行，面板不横向滚动', inner <= 1 && await overflow() <= 1 && await pendingCount(page) === 2, String(inner))
+  check('……保存按钮看得到', await panel(page).locator('[data-assistant-save]').isVisible())
+  await shot(page, 'catalog-assistant-narrow')
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('审阅队列 · 视图、顺序与原因、筛选、进度', async () => {
+  const state = { ...freshState(), queue: { [S1]: queueOf() }, usage: { visits: USAGE_RUNS } }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: loopHandlers(state) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  const tabs = page.locator('[data-catalog-view]')
+  check('清单上方有两个视图：表清单、审阅队列，默认表清单', await tabs.count() === 1
+        && (await page.locator('[data-catalog-view-tab="list"]').getAttribute('aria-selected')) === 'true'
+        && (await textOf(page.locator('[data-catalog-view-tab="review"]'))).includes('审阅队列'))
+  await page.locator('[data-catalog-view-tab="review"]').click()
+  const queue = page.locator('[data-review-queue]')
+  check('切到审阅队列：地址带 view=review，取第一页（50 项、全部）', await until(async () => (await queue.locator('[data-review-item]').count()) === 50)
+        && new URL(page.url()).searchParams.get('view') === 'review'
+        && JSON.stringify(lastSent(sent, /review-queue$/)?.query) === JSON.stringify({ limit: '50', offset: '0', kind: 'all' }),
+    `${page.url()} ${JSON.stringify(lastSent(sent, /review-queue$/)?.query)}`)
+  const keys = await queue.locator('[data-review-item]').evaluateAll((els) => els.map((e) => e.getAttribute('data-review-item')))
+  check('……照服务端排好的顺序列（常用表里影响数字的在前）', keys.slice(0, 3).join(' | ') === 'visits::valid_filter | visits::dedup | orders::kind', keys.slice(0, 3).join(' | '))
+  const first = queue.locator('[data-review-item="visits::valid_filter"]')
+  const firstText = await textOf(first)
+  check('第一项：写位置、所在表的中文名、值、来源和状态、所在表的使用次数', firstText.includes('有效记录条件') && firstText.includes('入园记录')
+        && firstText.includes('status NOT IN (9)') && firstText.includes('推断') && firstText.includes('模型起草') && firstText.includes('使用 42 次'), firstText)
+  check('……写为什么排在这里', (await textOf(first.locator('[data-review-reasons]'))).includes('影响数字的项（有效行过滤）'))
+  check('……有效记录条件写剖析核对的排除比例', (await textOf(first.locator('[data-review-note]'))).includes(FILTER_NOTE))
+  check('……一共 57 项，还能再载入 7 项', (await textOf(queue.locator('[data-review-total]'))).includes('57 项待确认') && (await textOf(queue.locator('[data-review-more]'))).includes('再载入 7 项'))
+  // 进度
+  const prog = queue.locator('[data-review-progress]')
+  check('进度：常用 20 张表已确认 42%（120 / 286 项）', (await textOf(prog.locator('[data-review-progress-top]'))).includes('常用 20 张表')
+        && (await textOf(prog.locator('[data-review-progress-top]'))).includes('已确认 42%') && (await textOf(prog.locator('[data-review-progress-top]'))).includes('120 / 286 项'),
+    await textOf(prog))
+  check('……全部表已确认 18%，影响数字的项待确认 56、已确认 12', (await textOf(prog.locator('[data-review-progress-all]'))).includes('已确认 18%')
+        && (await textOf(prog.locator('[data-review-progress-facts]'))).includes('待确认 56 项、已确认 12 项'), await textOf(prog))
+  // 筛选
+  await queue.locator('[data-review-kind="facts"]').click()
+  check('按项筛选「影响数字的项」：请求带 kind=facts，地址也记着', await until(async () => lastSent(sent, /review-queue$/)?.query?.kind === 'facts')
+        && new URL(page.url()).searchParams.get('kind') === 'facts' && await until(async () => (await queue.locator('[data-review-item]').count()) === 3))
+  await queue.locator('[data-review-table]').selectOption('visits')
+  check('按表筛选：请求带 table=visits，地址记成 rtable', await until(async () => lastSent(sent, /review-queue$/)?.query?.table === 'visits')
+        && new URL(page.url()).searchParams.get('rtable') === 'visits')
+  await goto(page, `/data/catalog/${S1}?view=review&kind=facts&rtable=visits`)
+  check('刷新页面：视图和筛选都还在', await until(async () => (await queue.locator('[data-review-item]').count()) === 3)
+        && (await queue.locator('[data-review-kind="facts"]').getAttribute('aria-checked')) === 'true'
+        && (await queue.locator('[data-review-table]').inputValue()) === 'visits')
+  await queue.locator('[data-review-kind="all"]').click()
+  await queue.locator('[data-review-table]').selectOption('')
+  check('筛选改回全部：又是第一页 50 项', await until(async () => (await queue.locator('[data-review-item]').count()) === 50),
+    `${page.url()} · ${await queue.locator('[data-review-item]').count()} · ${await textOf(queue.locator('[data-review-total]'))}`)
+  await queue.locator('[data-review-more]').click()
+  check('「再载入 7 项」：取第二页（offset=50），接在后面', await until(async () => (await queue.locator('[data-review-item]').count()) === 57)
+        && lastSent(sent, /review-queue$/)?.query?.offset === '50')
+  // 没有待确认项
+  await page.locator('[data-catalog-view-tab="list"]').click()
+  check('切回表清单：地址去掉 view，清单还在', await until(async () => page.locator('[data-catalog-list]').isVisible()) && !new URL(page.url()).searchParams.get('view'))
+  const openQueue = page.locator('[data-catalog-overview] [data-catalog-open-review]')
+  const queueText = await textOf(openQueue)
+  await openQueue.click()
+  check('表清单的概览里也有「打开审阅队列」', queueText === '打开审阅队列' && await until(async () => new URL(page.url()).searchParams.get('view') === 'review'
+        && (await page.locator('[data-catalog-view-tab="review"]').getAttribute('aria-selected')) === 'true'), `${queueText} · ${page.url()}`)
+  await page.locator('[data-catalog-view-tab="review"]').press('ArrowLeft')
+  check('视图标签可以用方向键切换', await until(async () => !new URL(page.url()).searchParams.get('view'))
+        && await page.evaluate(() => document.activeElement?.getAttribute('data-catalog-view-tab') === 'list'))
+  await shot(page, 'catalog-review')
+  await cleanCopy(page, '审阅队列')
+  check('没有写请求', writes(sent).length === 0, JSON.stringify(writes(sent).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('审阅队列 · 成批确认、冲突、撤销审阅、打开所在表', async () => {
+  const state = { ...freshState(), queue: { [S1]: queueOf() }, usage: { visits: USAGE_RUNS }, conflictTables: new Set(['orders']) }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}?view=review`, { handlers: loopHandlers(state) })
+  const queue = page.locator('[data-review-queue]')
+  await until(async () => (await queue.locator('[data-review-item]').count()) === 50)
+  const sel = (k) => queue.locator(`[data-review-item="${k}"] [data-review-select]`)
+  await sel('visits::valid_filter').check()
+  await sel('visits::dedup').check()
+  await sel('orders::kind').check()
+  const bar = queue.locator('[data-review-batch]')
+  check('选了 3 项：写「已选 3 项」，给确认、驳回', (await textOf(bar)).includes('已选 3 项') && (await textOf(bar.locator('[data-review-action="confirm"]'))) === '确认（3）'
+        && (await textOf(bar.locator('[data-review-action="reject"]'))) === '驳回（3）')
+  check('……还没审阅过的项不能撤销审阅', await bar.locator('[data-review-action="reset"]').isDisabled())
+  await bar.locator('[data-review-action="confirm"]').click()
+  check('成批确认：先问一句，写明后果', await until(async () => (await confirmBox(page).innerText().catch(() => '')).includes('确认 3 项推断'))
+        && (await confirmBox(page).innerText()).includes('参与 SQL 检查'))
+  await confirmBox(page).getByRole('button', { name: '确认 3 项' }).click()
+  const batch = await until(async () => lastSent(sent, /review\/batch$/)?.body)
+  check('请求逐条带表名、路径、动作和所在表读到的版本', JSON.stringify(batch) === JSON.stringify({ items: [
+    { table_name: 'visits', path: 'valid_filter', action: 'confirm', if_version: 2 },
+    { table_name: 'visits', path: 'dedup', action: 'confirm', if_version: 2 },
+    { table_name: 'orders', path: 'kind', action: 'confirm', if_version: 2 },
+  ] }), JSON.stringify(batch))
+  const result = (k) => queue.locator(`[data-review-item="${k}"]`).getAttribute('data-review-result').catch(() => null)
+  check('逐条的结果原地标出：入园记录的 2 项已确认，订单那项冲突', await until(async () => (await result('orders::kind')) === 'conflict')
+        && (await result('visits::valid_filter')) === 'ok' && (await result('visits::dedup')) === 'ok')
+  check('……冲突的那一项写明未生效、这张表刚被修改过', (await textOf(queue.locator('[data-review-item="orders::kind"] [data-review-outcome]'))).includes('这张表刚被修改过'))
+  check('……确认了的状态换成已确认', (await textOf(queue.locator('[data-review-item="visits::dedup"] [data-review-outcome]'))).includes('已确认'))
+  const summary = await textOf(queue.locator('[data-review-summary]'))
+  check('……汇总：已确认 2 项；1 项未生效（所在表刚被修改过），请刷新队列后再审阅', summary.includes('已确认 2 项') && summary.includes('1 项未生效（所在表刚被修改过）'), summary)
+  check('……清单里那张表的计数跟着重取', await until(async () => count(sent, /^GET \/datasources\/check-loop-scenic\/catalog$/) >= 2))
+  check('……审阅进度跟着重取', count(sent, /review-progress$/) >= 2)
+  // 撤销审阅：只发这一页上审阅成功的，带这张表写入后的版本
+  await sel('visits::valid_filter').check()
+  await sel('visits::dedup').check()
+  await bar.locator('[data-review-action="reset"]').click()
+  const undo = await until(async () => (count(sent, /review\/batch$/) === 2 ? lastSent(sent, /review\/batch$/)?.body : null))
+  check('撤销审阅：发这 2 项的撤销，带写入后的版本 3', JSON.stringify(undo) === JSON.stringify({ items: [
+    { table_name: 'visits', path: 'valid_filter', action: 'reset', if_version: 3 },
+    { table_name: 'visits', path: 'dedup', action: 'reset', if_version: 3 },
+  ] }), JSON.stringify(undo))
+  check('……回到推断，标「已撤销审阅」', await until(async () => (await textOf(queue.locator('[data-review-item="visits::dedup"] [data-review-outcome]'))).includes('已撤销审阅')))
+
+  // 打开所在表：右栏是这张表的详情，滚到那一项、标出来，并列出用过这张表的运行
+  await queue.locator('[data-review-item="visits::dedup"] [data-review-open]').click()
+  check('点开一项：地址带 item，右栏是入园记录的详情，左栏还是队列', await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) === 1)
+        && new URL(page.url()).searchParams.get('item') === 'dedup' && new URL(page.url()).searchParams.get('view') === 'review' && await queue.isVisible())
+  check('……那一项标出来', await until(async () => (await page.locator('[data-review-focus="dedup"]').count()) === 1))
+  const usage = page.locator('[data-table-usage]')
+  check('……用过这张表的运行：3 次，新的在前，点得进运行记录', await until(async () => (await usage.locator('[data-usage-run]').count()) === 3)
+        && (await usage.locator('[data-usage-run]').first().getAttribute('data-usage-run')) === 'run-check-0003'
+        && (await usage.locator('[data-usage-run] a').first().getAttribute('href')) === '/runs/run-check-0003'
+        && (await textOf(usage.locator('[data-usage-run]').first())).includes('每日入园统计'))
+  check('……请求带 limit=20', lastSent(sent, /\/visits\/usage$/)?.query?.limit === '20')
+  // 在详情里单项确认：队列里那一项跟着标已确认
+  await page.locator('[data-item-mark="dedup"]').first().click()
+  await page.locator('[data-item-panel] [data-review-action="confirm"]').click()
+  check('在详情里确认那一项：队列里跟着标「已确认」', await until(async () => (await textOf(queue.locator('[data-review-item="visits::dedup"] [data-review-outcome]'))).includes('已确认')))
+  // 刷新：审阅过的移除
+  await queue.locator('[data-review-refresh]').click()
+  check('刷新队列：已确认的那一项移除', await until(async () => (await queue.locator('[data-review-item="visits::dedup"]').count()) === 0))
+  await cleanCopy(page, '成批审阅')
+  check('只发过成批审阅、单项审阅的写请求', writes(sent).every((s) => /\/review(\/batch)?$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('审阅队列 · 窄屏', async () => {
+  const state = { ...freshState(), queue: { [S1]: queueOf() } }
+  const { page, errors, close } = await open(`/data/catalog/${S1}?view=review`, { handlers: loopHandlers(state), viewport: { width: 390, height: 844 } })
+  const overflow = () => page.evaluate(() => {
+    const root = document.querySelector('[data-catalog-page]')
+    return root ? root.scrollWidth - root.clientWidth : 99
+  })
+  const queue = page.locator('[data-review-queue]')
+  check('390 宽：只显示队列，没有横向滚动', await until(async () => (await queue.locator('[data-review-item]').count()) === 50) && await overflow() <= 1, String(await overflow()))
+  await queue.locator('[data-review-item="visits::valid_filter"] [data-review-open]').click()
+  check('……点开一项：只显示详情，有「返回」', await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) === 1)
+        && !(await queue.isVisible()) && await page.locator('[data-catalog-detail-back]').isVisible())
+  await page.locator('[data-catalog-detail-back]').click()
+  check('……返回：回到队列', await until(async () => queue.isVisible()))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('导出导入 · 导出文件、导入先预览再写入', async () => {
+  const state = freshState()
+  const replies = {}
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: loopHandlers(state, replies) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  const exp = page.locator('[data-catalog-export]')
+  check('页头有「导出目录」「导入目录」', await exp.count() === 1 && (await exp.getAttribute('aria-label')) === '导出目录'
+        && (await page.locator('[data-catalog-import]').getAttribute('aria-label')) === '导入目录')
+  const [download] = await Promise.all([page.waitForEvent('download', { timeout: 8000 }), exp.click()])
+  check('导出：下载的文件名同服务端（「<数据源名>-数据目录.json」）', download.suggestedFilename() === `${NAME1}-数据目录.json`, download.suggestedFilename())
+  const file = JSON.parse(await (await import('node:fs/promises')).readFile(await download.path(), 'utf8'))
+  check('……文件原样存下（导出格式、全部表）', file.format === 'agentlab-catalog' && Object.keys(file.tables).length === 4)
+
+  // 导入：选文件 → 预览 → 确认导入
+  await page.locator('[data-catalog-import]').click()
+  const dlg = page.locator('[data-import-dialog]')
+  check('「导入目录」：打开对话框，先选文件，写明导入的规矩', await until(async () => (await dlg.getAttribute('data-step').catch(() => '')) === 'choose')
+        && (await textOf(dlg)).includes('以这里为准') && (await textOf(dlg)).includes('只填补'))
+  check('……没选文件时不能预览', await page.locator('[data-import-preview]').isDisabled())
+  await dlg.locator('[data-import-file]').setInputFiles({ name: 'broken.json', mimeType: 'application/json', buffer: Buffer.from('{not json') })
+  check('文件不是 JSON：就地写明，不发请求', await until(async () => (await textOf(dlg.locator('[data-import-error]'))).includes('文件不是有效的 JSON'))
+        && count(sent, /import\/preview$/) === 0)
+  await dlg.locator('[data-import-file]').setInputFiles({ name: 'other-数据目录.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(IMPORT_FILE)) })
+  check('……换成导出的文件：写明来自哪个数据源，起草要求默认一起导入', await until(async () => (await textOf(dlg.locator('[data-import-file-meta]'))).includes('zzloopother'))
+        && await dlg.locator('[data-import-guidance] input').isChecked() && (await dlg.locator('[data-import-error]').count()) === 0)
+  await page.locator('[data-import-preview]').click()
+  check('预览：交回文件内容和要不要导入起草要求（只读接口）', await until(async () => (await dlg.getAttribute('data-step')) === 'preview')
+        && JSON.stringify(lastSent(sent, /import\/preview$/)?.body) === JSON.stringify({ content: IMPORT_FILE, include_guidance: true }))
+  check('……合计：2 张表，新增 1、更新 1、保留 5、冲突 1、跳过 1', (await textOf(dlg.locator('[data-import-totals]'))).includes('2 张表：新增 1 项、更新 1 项、保留 5 项、冲突 1 项、跳过 1 项'),
+    await textOf(dlg.locator('[data-import-totals]')))
+  check('……逐表的计数；名字不一样的写明对上了哪张', (await textOf(dlg.locator('[data-import-table="ORDERS"]'))).includes('对上「orders」')
+        && await dlg.locator('[data-import-table="visits"] [data-import-count="keep"]').innerText() === '4')
+  const conflict = await textOf(dlg.locator('[data-import-conflict]'))
+  check('……冲突逐条列出：位置、文件中的值、这里的值、原因', conflict.includes('表的中文名') && conflict.includes('入园流水') && conflict.includes('入园记录')
+        && conflict.includes('这里已确认，以这里为准'), conflict)
+  check('……跳过的写原因，对不上的表列出来', (await textOf(dlg.locator('[data-import-skipped]'))).includes('表结构里没有列 gate_code')
+        && (await textOf(dlg.locator('[data-import-unmatched]'))).includes('legacy_tickets'))
+  check('……起草要求：这里已有，保留不覆盖', (await textOf(dlg.locator('[data-import-guidance-action]'))).includes('保留这个数据源现有的'))
+  check('……预览不写库', count(sent, /catalog\/import$/) === 0)
+  await shot(page, 'catalog-import-preview')
+  const lists = count(sent, /^GET \/datasources\/check-loop-scenic\/catalog$/)
+  await page.locator('[data-import-confirm]').click()
+  check('确认导入：交同一份内容，结果写明写入了几张表、各是第几版', await until(async () => (await dlg.getAttribute('data-step')) === 'done')
+        && JSON.stringify(lastSent(sent, /catalog\/import$/)?.body) === JSON.stringify({ content: IMPORT_FILE, include_guidance: true })
+        && (await textOf(dlg.locator('[data-import-table="visits"]'))).includes('第 3 版'), await textOf(dlg))
+  check('……目录清单重取', await until(async () => count(sent, /^GET \/datasources\/check-loop-scenic\/catalog$/) > lists))
+  await page.locator('[data-import-close]').click()
+  check('……「完成」关上对话框', await until(async () => (await dlg.count()) === 0))
+
+  // 起草任务进行中（409）、文件格式不对（422）：照原样写服务端那句话，留在这一步
+  replies.importPreview = [json({ detail: '文件不是导出的数据目录：缺少 format（应为 agentlab-catalog）' }, 422)]
+  replies.import = [json(BUSY, 409)]
+  await page.locator('[data-catalog-import]').click()
+  await dlg.locator('[data-import-file]').setInputFiles({ name: 'x.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ tables: {} })) })
+  await page.locator('[data-import-preview]').click()
+  check('文件格式不对（422）：写服务端那句话，留在选文件这一步', await until(async () => (await textOf(dlg.locator('[data-import-error]'))).includes('文件不是导出的数据目录'))
+        && (await dlg.getAttribute('data-step')) === 'choose')
+  await dlg.locator('[data-import-file]').setInputFiles({ name: 'other.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(IMPORT_FILE)) })
+  await dlg.locator('[data-import-guidance] input').uncheck()
+  await page.locator('[data-import-preview]').click()
+  await until(async () => (await dlg.getAttribute('data-step')) === 'preview')
+  check('不导入起草要求：请求里写 false', lastSent(sent, /import\/preview$/)?.body?.include_guidance === false)
+  await page.locator('[data-import-confirm]').click()
+  check('有起草任务在进行（409）：写服务端那句话，留在预览', await until(async () => (await textOf(dlg.locator('[data-import-error]'))).includes('正在起草数据目录'))
+        && (await dlg.getAttribute('data-step')) === 'preview')
+  await cleanCopy(page, '导入预览')
+  check('只发过导入的写请求（预览、导入）', writes(sent).every((s) => /catalog\/import(\/preview)?$/.test(s.key)), JSON.stringify(writes(sent).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('防错事实的提议 · 表详情里的说明', async () => {
+  const state = freshState()
+  const { page, errors, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state) })
+  await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
+  check('有效记录条件的推断项：值下面写剖析核对的排除比例', (await textOf(page.locator('[data-field="valid_filter"] [data-field-note]'))).includes(FILTER_NOTE),
+    await textOf(page.locator('[data-field="valid_filter"]')))
+  check('去重规则的推断项：写起草的依据和没有核对的原因', (await textOf(page.locator('[data-field="dedup"] [data-field-note]'))).includes('没有核对排除比例'))
+  check('别的项不在值下面写说明', await page.locator('[data-field="grain"] [data-field-note]').count() === 0)
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await browser.close()
+
+const after = await realCounts()
+check('真库里的数据源和目录数量没有变化', JSON.stringify(after) === JSON.stringify(before), `${JSON.stringify(before)} → ${JSON.stringify(after)}`)
+check('检查用的假数据源没有写进真库', !(await (await fetch(`${API}/datasources`)).json()).some((s) => NAMES.includes(s.name)))
+
+console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 数据目录闭环全部通过')
+process.exit(failed ? 1 : 0)

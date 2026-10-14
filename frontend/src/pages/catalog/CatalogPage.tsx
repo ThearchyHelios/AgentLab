@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, BookMarked, Database, ListFilter as ListFilterIcon, ScanSearch, Sparkles, TriangleAlert } from 'lucide-react'
+import {
+  ArrowLeft, BookMarked, Database, Download, ListFilter as ListFilterIcon, ScanSearch, Sparkles, TriangleAlert, Upload,
+} from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
-import type { CatalogDetail, CatalogList, CatalogTableRow } from '../../types'
-import { EmptyState, ErrorState, PageHeader, Skeleton, Spinner, toast, useTicker } from '../../components/ui'
+import type { CatalogDetail, CatalogList, CatalogReviewItem, CatalogReviewKind, CatalogTableRow } from '../../types'
+import { EmptyState, ErrorState, PageHeader, Skeleton, Spinner, rovingTarget, toast, useTicker } from '../../components/ui'
 import { useCatalog, useDatasources, useOnReconnect } from '../../store/catalog'
+import { errorMessage } from '../../lib/errors'
+import { formatNumber } from '../../lib/format'
 import {
-  CATALOG_DRAFT_TEXT as DT, CATALOG_TEXT as CT, PROFILE_STOP_LABEL, PROFILE_TEXT as PT, SCHEMA_PARTIAL_TEXT as SPT,
+  CATALOG_DRAFT_TEXT as DT, CATALOG_REVIEW_TEXT as RT, CATALOG_TEXT as CT, CATALOG_TRANSFER_TEXT as XT, PROFILE_STOP_LABEL,
+  PROFILE_TEXT as PT, SCHEMA_PARTIAL_TEXT as SPT,
 } from '../../lib/terms'
 import { StatusLegend, SystemNotesNotice } from './parts'
 import { DraftDialog } from './DraftDialog'
@@ -20,6 +25,10 @@ import { ProfileSettingsDialog } from './ProfileSettings'
 import { fillKey, profileBlockOf, profileSettingsOf, secondsText } from './profile'
 import { TableDetail } from './TableDetail'
 import { TableIndex } from './TableIndex'
+import { ReviewOverview, ReviewQueue } from './ReviewQueue'
+import { ImportDialog } from './TransferDialog'
+import { itemKey, reviewParamsOf, writeReviewParams } from './review'
+import type { CatalogView } from './review'
 import { filterCounts, listParamsOf, progressOf, rowFromDetail, usageSummary, visibleRows, writeListParams } from './model'
 import type { ListFilter, ListParams, ListSort } from './model'
 
@@ -34,6 +43,10 @@ import type { ListFilter, ListParams, ListSort } from './model'
 //
 // 清单的搜索词、筛选、排序和「只看运行中查询过的表」记在地址的查询参数里（q / filter / sort / used），刷新、前进后退
 // 都不丢；在清单和表详情之间跳转时带着它们走。
+//
+// 左栏有两个视图：表清单（逐表看）和审阅队列（view=review：跨表按优先级列出推断项，成批确认、驳回，筛选记在 kind /
+// rtable 里）。从队列点开一项，右栏是所在表的详情，地址带着那一项（item），详情滚到那一项、列出用过这张表的运行。
+// 页头的「导出目录」「导入目录」把整理好的目录带到另一个实例（导入先预览，确认后才写）。
 // ===========================================================================
 
 export function CatalogPage() {
@@ -98,10 +111,20 @@ export function CatalogPage() {
   const setFilter = useCallback((f: ListFilter) => setList((c) => ({ ...c, filter: f })), [])
   const setSort = useCallback((v: ListSort) => setList((c) => ({ ...c, sort: v })), [])
   const setUsedOnly = useCallback((v: boolean) => setList((c) => ({ ...c, used: v })), [])
-  /** 跳到别的表、回到清单时带上清单的查询参数（按页面上的算：搜索词可能还没写进地址） */
+  /**
+   * 跳到别的表、回到清单时带上清单的查询参数（按页面上的算：搜索词可能还没写进地址）。审阅视图的参数（view、kind、rtable）
+   * 照旧带着，从审阅队列打开的那一项（item）不带：换了表就不是那一项了
+   */
   const searchRef = useRef('')
-  const search = writeListParams(params, list).toString()
+  const carried = writeListParams(params, list)
+  carried.delete('item')
+  const search = carried.toString()
   searchRef.current = search ? `?${search}` : ''
+  const carriedRef = useRef(carried)
+  carriedRef.current = carried
+  /** 审阅视图：view=review 时左栏是审阅队列；kind、rtable 是队列的筛选；item 是右栏从队列打开的那一项 */
+  const review = useMemo(() => reviewParamsOf(params), [params])
+  const inReview = review.view === 'review'
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
   /**
    * 起草对话框开着没有、打开时显示什么：setup 选范围开始；job 显示页面跟着的任务（进行中的进度、刚结束的结果）。
@@ -142,12 +165,15 @@ export function CatalogPage() {
   const backToList = useCallback(() => navigate(`${base}${searchRef.current}`), [navigate, base])
   const back = source?.origin === 'upload' ? '/data/tables' : '/data/databases'
 
+  /** 右栏的表详情载入、改过之后的目录：审阅队列里这张表的项跟着换状态 */
+  const [detailSync, setDetailSync] = useState<{ seq: number; detail: CatalogDetail } | null>(null)
   /** 写入、审阅之后按返回的单表目录更新清单里那一行 */
   const onDetail = useCallback((d: CatalogDetail) => {
     setData((cur) => cur && ({
       ...cur,
       tables: cur.tables.map((r) => (r.table_name === d.table_name ? rowFromDetail(d, r) : r)),
     }))
+    setDetailSync((cur) => ({ seq: (cur?.seq ?? 0) + 1, detail: d }))
   }, [])
 
   /**
@@ -306,6 +332,52 @@ export function CatalogPage() {
     return [list[i - 1]?.table_name ?? null, list[i + 1]?.table_name ?? null]
   }, [table, visible, rows, sort])
 
+  /**
+   * 改地址的查询参数，按地址栏现在的样子改：setSearchParams 的函数式写法拿的是上一次渲染时的参数，连着改两样（先点
+   * 「全部」、紧接着换表）时后一次会把前一次盖掉
+   */
+  const patchSearch = useCallback((fn: (p: URLSearchParams) => URLSearchParams, opts?: { replace?: boolean }) => {
+    const next = fn(new URLSearchParams(window.location.search)).toString()
+    navigate({ search: next ? `?${next}` : '' }, opts)
+  }, [navigate])
+  /** 换视图（表清单 / 审阅队列）：记进地址（后退回到上一个视图），右栏正在看的表不动 */
+  const setView = useCallback((v: CatalogView) => {
+    patchSearch((prev) => writeReviewParams(prev, { view: v, item: '' }))
+  }, [patchSearch])
+  /** 审阅队列的筛选：替换当前这条历史（筛选不该占满后退键） */
+  const setReviewParams = useCallback((p: { kind?: CatalogReviewKind; table?: string }) => {
+    patchSearch((prev) => writeReviewParams(prev, p), { replace: true })
+  }, [patchSearch])
+  /** 从审阅队列打开一项：右栏是所在表的详情，地址带着这一项 */
+  const openReviewItem = useCallback((i: CatalogReviewItem) => {
+    const q = writeReviewParams(carriedRef.current, { view: 'review', item: i.path }).toString()
+    navigate(`${base}/${encodeURIComponent(i.table_name)}${q ? `?${q}` : ''}`)
+  }, [navigate, base])
+  /** 成批审阅、导入写进了这些表：重取清单，正在看的表重新载入（编辑中的不动，保存时服务端会用版本号拦下） */
+  const onTablesWritten = useCallback((tables: string[]) => {
+    setDrafted((cur) => ({ seq: cur.seq + 1, tables: new Set(tables) }))
+    void load()
+  }, [load])
+  const activeReviewKey = inReview && table && review.item ? itemKey({ table_name: table, path: review.item }) : null
+  const proposedTotal = useMemo(() => rows.reduce((n, r) => n + (r.in_schema ? r.counts.proposed : 0), 0), [rows])
+
+  /** 导出目录：下载服务端给的文件，文件名按服务端的，没给就按数据源名补 */
+  const [exporting, setExporting] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const exportCatalog = useCallback(async () => {
+    setExporting(true)
+    try {
+      const { blob, name } = await api.dataCatalog.exportFile(sourceId)
+      const file = name ?? XT.fileName(source?.name ?? sourceId)
+      saveFile(file, blob)
+      toast.ok(XT.exported(file))
+    } catch (e) {
+      toast.error(XT.exportFailed(errorMessage(e)))
+    } finally {
+      setExporting(false)
+    }
+  }, [sourceId, source?.name])
+
   const usage = useMemo(() => usageSummary(rows), [rows])
   const wideHeader = useMedia('(min-width: 640px)')
   /**
@@ -375,42 +447,58 @@ export function CatalogPage() {
     body = (
       <div className="flex min-h-0 flex-1">
         <aside className={clsx('min-h-0 w-full flex-col border-r lg:flex lg:w-[380px] lg:shrink-0 xl:w-[420px]', table ? 'hidden' : 'flex')}>
-          {empty && (
-            // 窄屏没有右栏的概览，空目录的下一步写在清单上面
-            <div className="border-b px-3 py-2.5 text-xs lg:hidden" data-catalog-empty-banner="">
-              <p className="font-medium">{CT.emptyTitle}</p>
-              <p className="mt-0.5 text-2xs leading-relaxed text-faint">{CT.emptyBody}</p>
-              <div className="mt-2">{draftButton(true)}</div>
-            </div>
-          )}
-          <TableIndex
-            rows={visible}
-            total={rows.length}
-            counts={counts}
-            query={query}
-            onQuery={setQuery}
-            filter={filter}
-            onFilter={setFilter}
-            usedOnly={usedOnly}
-            onUsedOnly={setUsedOnly}
-            sort={sort}
-            onSort={setSort}
-            selected={selected}
-            onSelected={setSelected}
-            active={table}
-            onOpen={openTable}
-            onDraft={openDraft}
-            onProfile={openProfile}
-          />
+          <ViewTabs view={review.view} proposed={proposedTotal} onChange={setView} />
+          <div role="tabpanel" id="catalog-view-panel" aria-labelledby={`catalog-view-tab-${review.view}`} className="flex min-h-0 flex-1 flex-col">
+            {inReview
+              ? (
+                <ReviewQueue sourceId={sourceId} rows={rows} kind={review.kind} table={review.table} activeKey={activeReviewKey}
+                             detailSync={detailSync} onParams={setReviewParams} onOpenItem={openReviewItem} onChanged={onTablesWritten} />
+              )
+              : (
+                <>
+                  {empty && (
+                    // 窄屏没有右栏的概览，空目录的下一步写在清单上面
+                    <div className="border-b px-3 py-2.5 text-xs lg:hidden" data-catalog-empty-banner="">
+                      <p className="font-medium">{CT.emptyTitle}</p>
+                      <p className="mt-0.5 text-2xs leading-relaxed text-faint">{CT.emptyBody}</p>
+                      <div className="mt-2">{draftButton(true)}</div>
+                    </div>
+                  )}
+                  <TableIndex
+                    rows={visible}
+                    total={rows.length}
+                    counts={counts}
+                    query={query}
+                    onQuery={setQuery}
+                    filter={filter}
+                    onFilter={setFilter}
+                    usedOnly={usedOnly}
+                    onUsedOnly={setUsedOnly}
+                    sort={sort}
+                    onSort={setSort}
+                    selected={selected}
+                    onSelected={setSelected}
+                    active={table}
+                    onOpen={openTable}
+                    onDraft={openDraft}
+                    onProfile={openProfile}
+                  />
+                </>
+              )}
+          </div>
         </aside>
         <section className={clsx('min-h-0 min-w-0 flex-1 flex-col lg:flex', table ? 'flex' : 'hidden')} aria-label={table ?? CT.overviewTitle}>
           {table
             ? (
               <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} fillCodes={fillCodes} prev={prev} next={next}
                            onFillDone={onFillDone} onOpen={openTable} onBack={backToList} onDetail={onDetail}
-                           draftBusy={!!stripJob} onRedraft={redraftTable} onDraftGuidance={draftWithGuidance} />
+                           draftBusy={!!stripJob} onRedraft={redraftTable} onDraftGuidance={draftWithGuidance}
+                           profileEnabled={profileSettings.enabled} focusPath={inReview ? review.item || null : null} usageOpen={inReview} />
             )
-            : <Overview rows={rows} empty={empty} systemNotes={data.system_notes} draft={draftButton(true)} onOpen={openTable} />}
+            : inReview
+              ? <ReviewOverview />
+              : <Overview rows={rows} empty={empty} systemNotes={data.system_notes} draft={draftButton(true)} onOpen={openTable}
+                          onReview={() => setView('review')} />}
         </section>
       </div>
     )
@@ -427,6 +515,18 @@ export function CatalogPage() {
           <div className="flex shrink-0 items-center gap-1.5">
             {hasTables && headerProfile}
             {hasTables && headerDraft}
+            {hasTables && (
+              <button type="button" className="btn btn-sm" onClick={() => void exportCatalog()} disabled={exporting} aria-label={XT.export}
+                      title={XT.exportHint} data-catalog-export="">
+                {exporting ? <Spinner size={11} /> : <Download size={11} aria-hidden />} <span className="hidden md:inline">{XT.export}</span>
+              </button>
+            )}
+            {hasTables && (
+              <button type="button" className="btn btn-sm" onClick={() => setImporting(true)} aria-label={XT.import} title={XT.importHint}
+                      data-catalog-import="">
+                <Upload size={11} aria-hidden /> <span className="hidden md:inline">{XT.import}</span>
+              </button>
+            )}
             <button type="button" className="btn btn-sm btn-ghost" onClick={() => navigate(back)} aria-label={CT.back} data-catalog-back="">
               <ArrowLeft size={12} aria-hidden /> <span className="hidden sm:inline">{CT.back}</span>
             </button>
@@ -481,6 +581,9 @@ export function CatalogPage() {
           onReset={() => setJob(null)}
         />
       )}
+      {importing && (
+        <ImportDialog sourceId={sourceId} onClose={() => setImporting(false)} onImported={onTablesWritten} />
+      )}
       {profileSettingsOpen && source && (
         <ProfileSettingsDialog row={{ id: source.id, name: source.name, options }} onClose={() => setProfileSettingsOpen(false)}
                                onSaved={onProfileSettingsSaved} />
@@ -520,6 +623,51 @@ function DraftStrip({ job, notice, onOpen }: {
         </div>
       </div>
       <button type="button" className="btn btn-sm shrink-0" onClick={onOpen} data-catalog-draft-open="">{DT.stripOpen}</button>
+    </div>
+  )
+}
+
+/** 存成文件（同运行记录里的下载）：浏览器下载，文件名照给的 */
+function saveFile(name: string, blob: Blob) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+const VIEWS: CatalogView[] = ['list', 'review']
+
+/**
+ * 左栏上方的两个视图：表清单（逐表看）、审阅队列（跨表按优先级看推断项，带着还有几项待确认）。标签页语义，
+ * ←→ Home End 切换
+ */
+function ViewTabs({ view, proposed, onChange }: { view: CatalogView; proposed: number; onChange: (v: CatalogView) => void }) {
+  const refs = useRef<Record<string, HTMLButtonElement | null>>({})
+  const move = (e: ReactKeyboardEvent, i: number) => {
+    const j = rovingTarget(e, i, VIEWS.length, 'horizontal')
+    if (j < 0) return
+    e.preventDefault()
+    onChange(VIEWS[j])
+    refs.current[VIEWS[j]]?.focus()
+  }
+  return (
+    <div className="flex shrink-0 gap-1 border-b px-2" role="tablist" aria-label={RT.viewLabel} data-catalog-view={view}>
+      {VIEWS.map((v, i) => {
+        const selected = view === v
+        return (
+          <button key={v} ref={(el) => { refs.current[v] = el }} type="button" role="tab" id={`catalog-view-tab-${v}`} aria-selected={selected}
+                  aria-controls="catalog-view-panel" tabIndex={selected ? 0 : -1} title={RT.viewHint[v]}
+                  onClick={() => onChange(v)} onKeyDown={(e) => move(e, i)} data-catalog-view-tab={v}
+                  className={clsx('relative px-3 py-2 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--accent)]',
+                    selected ? 'text-fg' : 'text-faint hover:text-dim')}>
+            {RT.view[v]}
+            {v === 'review' && proposed > 0 && <span className="tnum ml-1.5 text-2xs text-faint">{formatNumber(proposed)}</span>}
+            {selected && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded bg-[var(--accent)]" aria-hidden />}
+          </button>
+        )
+      })}
     </div>
   )
 }
@@ -601,13 +749,14 @@ function UsageSummary({ used, pending, none, active, onFocus }: {
   )
 }
 
-/** 没有选中表时的右栏：空目录时引导起草；否则写审阅进度，给出下一张该审的表 */
-function Overview({ rows, empty, systemNotes, draft, onOpen }: {
+/** 没有选中表时的右栏：空目录时引导起草；否则写审阅进度，给出下一张该审的表，也可以去审阅队列跨表成批审阅 */
+function Overview({ rows, empty, systemNotes, draft, onOpen, onReview }: {
   rows: CatalogTableRow[]
   empty: boolean
   systemNotes: boolean
   draft: ReactNode
   onOpen: (table: string) => void
+  onReview: () => void
 }) {
   const pendingNext = rows.find((r) => r.in_schema && r.counts.proposed > 0)
   const stats = { pending: 0, done: 0, none: 0 }
@@ -632,6 +781,12 @@ function Overview({ rows, empty, systemNotes, draft, onOpen }: {
                     {CT.reviewNext(pendingNext.label ?? pendingNext.table_name)}
                   </button>
                   <span className="text-2xs text-faint">{CT.reviewNextHint}</span>
+                </div>
+              )}
+              {pendingNext && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <button type="button" className="btn btn-sm" onClick={onReview} data-catalog-open-review="">{RT.openQueue}</button>
+                  <span className="text-2xs text-faint">{RT.openQueueHint}</span>
                 </div>
               )}
             </div>
