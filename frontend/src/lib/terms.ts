@@ -2610,6 +2610,8 @@ export const CATALOG_PATCH_TEXT = {
   after: '改后',
   reason: '理由',
   empty: '未填写',
+  /** 改前是一个被驳回的值（保存后换成人工确认的新值）：同导入预览「目标里这一项已经驳回」 */
+  beforeRejected: (value: string) => `已驳回：${value}`,
   stateConfirm: '值不变，保存即确认',
   stateSame: '已是这个值',
   save: '保存到数据目录',

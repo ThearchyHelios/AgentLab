@@ -307,7 +307,7 @@ function applyPatch(notes, changes) {
   }
   return assemble(map)
 }
-/** 预览：对着当前目录算改前、改后（只读） */
+/** 预览：对着当前目录算改前、改后（只读）。被驳回的项改前照样写出原值、状态写已驳回，改后和状态按没有这一项算 */
 function previewOf(t, changes) {
   const map = slots(t.notes ?? {})
   return {
@@ -316,8 +316,8 @@ function previewOf(t, changes) {
       const prev = map.get(c.path)
       const live = prev && prev.status !== 'rejected' ? prev : null
       const after = c.path.endsWith('.codes') && live ? { ...live.value, ...c.value } : c.value
-      return { path: c.path, before: live?.value ?? null, before_status: live?.status ?? null, after, value: c.value, reason: c.reason ?? '',
-        state: JSON.stringify(live?.value) === JSON.stringify(after) ? (live.status === 'confirmed' ? 'same' : 'confirm') : 'change' }
+      return { path: c.path, before: prev?.value ?? null, before_status: prev?.status ?? null, after, value: c.value, reason: c.reason ?? '',
+        state: live && JSON.stringify(live.value) === JSON.stringify(after) ? (live.status === 'confirmed' ? 'same' : 'confirm') : 'change' }
     }),
   }
 }
@@ -625,6 +625,15 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
       dedup: { value: 'y', source: 'llm', status: 'rejected' } }, 4, res.outcomes, res.versions)
     out.sync = { grain: synced.outcomes.get(rv.itemKey(items[0])), dedup: synced.outcomes.get(rv.itemKey(items[1]))?.status, v: synced.versions.get('t1') }
     out.pct = [rv.percentOf(120, 286), rv.percentOf(0, 0)]
+    // 提案的改前：被驳回的原值也写出来（同导入预览「目标里这一项已经驳回」）
+    const cp = await import('/src/run/catalogPatch.ts')
+    out.before = [
+      cp.patchBeforeText({ path: 'columns.amount.unit', before: '元', before_status: 'rejected' }),
+      cp.patchBeforeText({ path: 'columns.amount.unit', before: '元', before_status: 'proposed' }),
+      cp.patchBeforeText({ path: 'columns.amount.unit', before: null, before_status: null }),
+      cp.patchBeforeText({ path: 'kind', before: 'fact', before_status: 'rejected' }),
+      cp.patchBeforeText({ path: 'columns.status.codes', before: { 1: '有效' }, before_status: 'rejected' }),
+    ]
     // 审阅队列一项的位置：按 path 说到列（服务端的 field_label 只是字段的叫法）
     out.where = [
       rv.reviewWhere({ path: 'columns.status.codes', field_label: '码值', column: 'status', value: { 1: '有效' } }),
@@ -687,6 +696,8 @@ await section('纯函数 · 对话怎么截、待保存的修改怎么累积、�
   check('表详情改过之后：回到推断的记成撤销审阅，驳回的记成已驳回，版本换成最新的', r.sync.grain?.action === 'reset' && r.sync.dedup === 'rejected' && r.sync.v === 4,
     JSON.stringify(r.sync))
   check('进度的百分比四舍五入，分母为 0 时不写', r.pct[0] === 42 && r.pct[1] === null, JSON.stringify(r.pct))
+  check('提案的改前：被驳回的写「已驳回：原值」（值按界面上的说法），别的照原样，没有值写「未填写」',
+    JSON.stringify(r.before) === JSON.stringify(['已驳回：元', '元', '未填写', '已驳回：明细表', '已驳回：1=有效']), JSON.stringify(r.before))
   check('队列一项的位置写到列：列 status 的码值、表的有效记录条件、指向 parks 的关联关系；列名里有句点、认不出的路径也说得通',
     JSON.stringify(r.where) === JSON.stringify(['列 status 的码值', '表的有效记录条件', '指向 parks 的关联关系', '列 a.b 的中文名', '列 x 的怪字段', '怪字段']),
     JSON.stringify(r.where))
@@ -1435,6 +1446,41 @@ await section('表详情 · 人工确认的项的说明', async () => {
   }
   check('人工确认的关联关系：悬停写备注', ((await relNote.getAttribute('title').catch(() => '')) ?? '').includes(REL_NOTE),
     String(await relNote.getAttribute('title').catch(() => null)))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('表助手 · 改前是已驳回的值', async () => {
+  // 单位「元」被驳回过：助手提「人」，改前写「已驳回：元」（不是「未填写」），和导入预览「目标里这一项已经驳回」一致
+  const state = freshState()
+  const visits = state.tables[S1].find((t) => t.name === 'visits')
+  visits.notes.columns.visitor_count.unit = item('元', 'llm', 'rejected')
+  const PROPOSAL_R = {
+    type: 'proposal', source: NAME1, source_id: S1, table: 'visits', table_label: '入园记录', version: 2, changes: [
+      { path: 'columns.visitor_count.unit', label: '列 visitor_count 的单位', before: '元', before_status: 'rejected', after: '人', value: '人',
+        reason: '使用者说：入园人数按人计', state: 'change' },
+      { path: 'kind', label: '表的表类型', before: null, before_status: null, after: 'fact', value: 'fact', reason: '使用者说：一行一次入园', state: 'change' },
+    ],
+  }
+  const replies = { assistant: [sse([{ type: 'text', delta: '好的，单位按人计。' }, PROPOSAL_R, done()])] }
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}/visits`, { handlers: loopHandlers(state, replies) })
+  await until(async () => (await page.locator('[data-catalog-detail="visits"][data-version]').count()) > 0)
+  await page.locator('[data-catalog-assistant-open="header"]').click()
+  await until(async () => panel(page).isVisible())
+  await say(page, '入园人数按人计')
+  const unit = panel(page).locator('[data-assistant-change="columns.visitor_count.unit"]')
+  await shot(page, 'catalog-assistant-rejected')
+  check('提案卡片的改前：「已驳回：元」，不写「未填写」', (await textOf(unit.locator('[data-change-before]'))) === '已驳回：元', await textOf(unit))
+  check('……原来没有的照旧写「未填写」', (await textOf(panel(page).locator('[data-assistant-change="kind"] [data-change-before]'))) === '未填写')
+  const tray = panel(page).locator('[data-assistant-pending-item="columns.visitor_count.unit"]')
+  check('待保存的修改里同样写「改前 已驳回：元」', (await textOf(tray)).includes('改前 已驳回：元'), await textOf(tray))
+  await panel(page).locator('[data-assistant-save]').click()
+  check('保存：交回原样取值和依据', await until(async () => count(sent, /\/visits\/patch$/) === 1)
+        && JSON.stringify(lastSent(sent, /\/visits\/patch$/)?.body?.changes?.[0]) === JSON.stringify({ path: 'columns.visitor_count.unit', value: '人', reason: '使用者说：入园人数按人计' }))
+  check('……存上以后那一格是人工确认的「人」，悬停写保存时的依据', await until(async () => (await version(page)) === 3)
+        && (await textOf(page.locator('[data-column="visitor_count"] [data-cell="unit"]'))).includes('人')
+        && ((await page.locator('[data-column="visitor_count"] [data-cell="unit"] [data-cell-note]').getAttribute('title').catch(() => '')) ?? '').includes('依据：使用者说：入园人数按人计'))
+  await cleanCopy(page, '改前是已驳回的值')
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })

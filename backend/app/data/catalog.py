@@ -878,7 +878,8 @@ class PatchChange:
     """提案里的一项，核对过的。
 
     - path：规范化后的路径（新增关系写成 relations.<编号>）；
-    - before / before_status：当前目录里这一项的值和状态（被驳回的和没有的都算没有，为 None）；
+    - before / before_status：当前目录里这一项的值和状态，没有这一项为 None。被驳回的照样给出原值、状态写 rejected
+      （同导入预览「目标里这一项已经驳回」）：只是给人看的，算改后、算 state 都按没有这一项，保存时换成人工确认的新值；
     - after：保存后的值（码值是补充后的完整对照）；value：要交回保存的原样取值（码值只有补充的那几个，
       409 之后在最新的目录上重新补）；
     - state：change 值有变化；confirm 值相同、但还不是已确认（保存即确认）；same 已经是这个值且已确认。
@@ -1014,6 +1015,8 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
       没有这个码时加进去，不会把已有的含义抹掉（_merge_codes）。
     - 关联关系不抹掉测量结果：覆盖率沿用目录里的，基数没写时沿用或推算（_relation_after）。两端、基数、覆盖率都和
       目录里一样时只是确认，来源不变。
+    - 被驳回的项算没有：码值不在驳回的码值上补，和驳回的值一样也是 change（保存时换成人工确认的新值）。改前照样写出
+      驳回的原值、before_status 为 rejected，不然界面上只看到「未填写」，看不出原来有一个被驳回的值。
     - 看起来像计算公式的文字不收（_FORMULA）：公式进口径卡。
     - 同一个路径出现两次只认第一次。
     """
@@ -1094,8 +1097,10 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
             state = "same" if live.get("status") == "confirmed" else "confirm"
         else:
             state = "change"
-        out.append(PatchChange(path=norm, before=copy.deepcopy(before),
-                               before_status=live.get("status") if live is not None else None,
+        # 改前给人看：被驳回的也写出原值（上面算改后、算 state 照旧按没有这一项）
+        shown = live if live is not None else prev
+        out.append(PatchChange(path=norm, before=copy.deepcopy(_value_of(key, shown)) if shown is not None else None,
+                               before_status=shown.get("status") if shown is not None else None,
                                after=after, value=value, reason=reason, state=state, note=note))
     return PatchPlan(out, problems)
 
