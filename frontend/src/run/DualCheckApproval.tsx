@@ -33,6 +33,10 @@ export interface DualCheckApprovalProps {
    * 两处都接会开两条订阅，各收一份事件
    */
   onResolved?: (runId: string) => void | Promise<void>
+  /**
+   * 待办卡（run/TaskCard）给：裁决交给它提交（走待办接口），不再调审批接口、不刷新审批列表、不接事件流。没给时照旧
+   */
+  decide?: (approved: boolean, reply: DualCheckReply) => Promise<void>
 }
 
 /** 一个不一致的指标在卡上要画的东西：先由 payload.summary 填，完整对照（card_artifact）到了再补全 */
@@ -408,7 +412,7 @@ function useOnReject(runId: string, nodeId: string | undefined, given: unknown):
  * 回复走审批接口：value 为 {choices, note}。摘要和工件里都认不出指标时没法裁决，只留「驳回并终止」（approved 为假，
  * 节点按人工驳回失败），免得运行一直挂着
  */
-export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalProps) {
+export function DualCheckApproval({ approval, onResolved, decide }: DualCheckApprovalProps) {
   const toast = useToast()
   const refreshApprovals = useCatalog((s) => s.refreshApprovals)
   const attachRun = useStudio((s) => s.attachRun)
@@ -455,10 +459,13 @@ export function DualCheckApproval({ approval, onResolved }: DualCheckApprovalPro
         note: note.trim(),
       }
       // 照 ApprovalCard 里 mode 为 input 时的写法：备注外层也放一份，节点拿到的是 {approved, note, value}
-      await api.approvals.decide(approval.id, approved ? { approved: true, note: value.note, value } : { approved: false, note: value.note })
-      await refreshApprovals()
-      if (onResolved) await onResolved(approval.run_id)
-      else await attachRun(approval.run_id)
+      if (decide) await decide(approved, value)
+      else {
+        await api.approvals.decide(approval.id, approved ? { approved: true, note: value.note, value } : { approved: false, note: value.note })
+        await refreshApprovals()
+        if (onResolved) await onResolved(approval.run_id)
+        else await attachRun(approval.run_id)
+      }
       // 采用盲算、两边都不对时，节点设为「判为失败」就会让运行终止：提示照节点的设置说，读不到设置时不替它下结论
       const rejected = Object.values(value.choices).some((c) => c !== 'a')
       toast(!approved ? T.rejected : !rejected || onReject === 'degrade' ? T.done : onReject === 'fail' ? T.doneFail : T.doneUnknown, 'ok')

@@ -8,6 +8,7 @@ import type {
   AppBindings, AppDetail, AppGrant, AppSpec, AppSummary, AppVersionRow, ComponentCatalog, Disposition, InstanceRow,
   LintIssue, PublishResult, ViewModel,
 } from '../typesApp'
+import type { EvidenceSegmentDetail } from '../types'
 import { get, patch, post, put, qs, type RequestOptions } from './http'
 
 const at = (id: string) => `/apps/${encodeURIComponent(id)}`
@@ -45,6 +46,13 @@ export const apps = {
   instances: (id: string, params?: { who?: 'mine' | 'all'; entry?: string; status?: string; limit?: number }) =>
     get<{ items: InstanceRow[] }>(`${at(id)}/instances${qs(params)}`),
   instance: (id: string, runId: string) => get<InstanceRow & { view: ViewModel }>(`${at(id)}/instances/${encodeURIComponent(runId)}`),
+  /**
+   * 应用页上点开一个指标块的出处（§3.6）：指标 → 输入 → 查询快照的出处链，形状同报告片段接口的 chain / seal / redacted，
+   * 证据面板照样画。单元格和报告沿用现有的证据接口
+   */
+  metricEvidence: (runId: string, node: string, metric: string, opts?: RequestOptions) =>
+    get<EvidenceSegmentDetail>(
+      `/runs/${encodeURIComponent(runId)}/evidence/metrics/${encodeURIComponent(node)}/${encodeURIComponent(metric)}`, opts),
   /** 按需视图：发起一次运行（或命中缓存） */
   refreshView: (id: string, view: string, params?: Record<string, unknown>) =>
     post<{ run_id: string; cached: boolean }>(`${at(id)}/views/${encodeURIComponent(view)}/refresh`, { params: params ?? {} }),

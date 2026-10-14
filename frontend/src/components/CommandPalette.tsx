@@ -5,11 +5,12 @@ import type { NavigateFunction } from 'react-router-dom'
 import { create } from 'zustand'
 import clsx from 'clsx'
 import {
-  Bell, BellOff, BookOpen, CalendarClock, Database, FlaskConical, History, Hourglass, Keyboard, MessageSquare,
-  MessageSquarePlus, Monitor, Plus, Search, Settings, SunMoon, Workflow as WorkflowIcon, Wrench,
+  Bell, BellOff, BookOpen, CalendarClock, Database, FlaskConical, History, Hourglass, Inbox, Keyboard, LayoutGrid,
+  MessageSquare, MessageSquarePlus, Monitor, Plus, Search, Settings, SunMoon, Workflow as WorkflowIcon, Wrench,
 } from 'lucide-react'
 import { ApiError, api } from '../api/client'
 import { hasPendingApproval, useCatalog } from '../store/catalog'
+import { atLeast, loginOn, useAuth } from '../store/auth'
 import { useConversations } from '../store/conversations'
 import { createWorkflow } from '../canvas/WorkflowPicker'
 import { Kbd, Modal, StatusBadge, isComposing, toast } from './ui'
@@ -19,11 +20,12 @@ import type { ThemePref } from '../lib/theme'
 import { isMac } from '../lib/keys'
 import { formatDateTime, formatTime, parseServerTime, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { SCHEDULE_TEXT, WORKFLOW_STATUS_LABEL, runClassLabel, runName } from '../lib/terms'
+import { APP_TEXT, SCHEDULE_TEXT, WORKFLOW_STATUS_LABEL, runClassLabel, runName } from '../lib/terms'
 import { errorMessage } from '../lib/errors'
 import { disableNotify, enableNotify, notifySupported, useSignals } from '../lib/notify'
 import { canLeave, leavePass } from '../lib/leave'
 import type { Run } from '../types'
+import type { Principal } from '../typesApp'
 
 /**
  * 外壳的命令表：导航、⌘K 命令面板、快捷键说明共用这一份。
@@ -53,6 +55,8 @@ export interface PageDef {
 export const PAGES: PageDef[] = [
   { to: '/chat', label: '问数据', hint: '描述需求，自动接入数据源、构建工作流并给出结论', icon: MessageSquare, shortcut: 'Alt+1', keywords: 'chat ask 对话 提问 首页' },
   { to: '/studio', label: '编排', hint: '在画布上构建、调试和发布工作流', icon: FlaskConical, shortcut: 'Alt+2', keywords: 'studio canvas 画布 工作流 workflow' },
+  // 应用是后加的，紧跟在「编排」后面（用的是编排发布出来的东西）；快捷键取下一个空着的 ⌥9，别的页一个都不动
+  { to: '/apps', label: APP_TEXT.nav, hint: APP_TEXT.hint, icon: LayoutGrid, shortcut: 'Alt+9', keywords: 'apps app 应用 待办 inbox 流程 看板 发起' },
   { to: '/runs', label: '记录', hint: '每次运行的过程、成果和待审批', icon: History, shortcut: 'Alt+3', keywords: 'runs history 运行 运行记录 历史 审批' },
   { to: '/data', label: '数据', hint: '接入数据库和表格，供问数据和工作流查询', icon: Database, shortcut: 'Alt+4', keywords: 'data datasource 数据源 数据库 表格 excel csv' },
   { to: '/tools', label: '工具', hint: '工具库、沙箱试验台、自定义工具、MCP', icon: Wrench, shortcut: 'Alt+5', keywords: 'tools mcp sandbox 沙箱 函数' },
@@ -61,6 +65,21 @@ export const PAGES: PageDef[] = [
   { to: '/schedules', label: SCHEDULE_TEXT.title, hint: SCHEDULE_TEXT.hint, icon: CalendarClock, shortcut: 'Alt+8', keywords: 'schedules schedule cron 定时 计划 周期 自动运行' },
   { to: '/settings', label: '设置', hint: '模型接入、偏好、运行环境', icon: Settings, shortcut: 'Alt+7', keywords: 'settings provider 模型 署名 主题 偏好' },
 ]
+
+/**
+ * 这个人看得到哪几页。开了登录的使用者（user 角色）只有「应用」和「设置」（个人那几项），管理员开了「使用者可以问数据」
+ * 时加上问数据（Q2）；搭建者以上和关登录时全部都在
+ */
+export function visiblePages(me: Principal | null | undefined): PageDef[] {
+  if (!loginOn(me) || atLeast(me, 'builder')) return PAGES
+  const keep = new Set(['/apps', '/settings', ...(me?.user_can_chat ? ['/chat'] : [])])
+  return PAGES.filter((p) => keep.has(p.to))
+}
+
+export function usePages(): PageDef[] {
+  const me = useAuth((s) => s.me)
+  return useMemo(() => visiblePages(me), [me])
+}
 
 // -------------------------------------------------------------------------
 // 外壳浮层的开关
@@ -205,7 +224,7 @@ type GroupKey = 'approvals' | 'pages' | 'actions' | 'conversations' | 'runs' | '
 
 const GROUPS: { key: GroupKey; label: string; idle: number }[] = [
   { key: 'approvals', label: '待审批', idle: 3 },
-  { key: 'pages', label: '页面', idle: 9 },
+  { key: 'pages', label: '页面', idle: 11 },
   { key: 'actions', label: '动作', idle: 6 },
   { key: 'conversations', label: '最近对话', idle: 4 },
   { key: 'runs', label: '最近运行', idle: 4 },
@@ -272,6 +291,10 @@ function PaletteView() {
   const [runs, setRuns] = useState<Run[] | null>(null)
   const theme = useTheme()
   const notify = useSignals((s) => s.notify)
+  const pages = usePages()
+  const builder = useAuth((s) => atLeast(s.me, 'builder'))
+  const canChat = pages.some((p) => p.to === '/chat')
+  const appTasks = useCatalog((s) => s.taskCounts?.apps ?? 0)
 
   // 打开前焦点在哪，在渲染时就记下：开发模式的 StrictMode 会把 effect 跑两遍，
   // 第二遍时焦点已经在面板的输入框里了
@@ -310,7 +333,8 @@ function PaletteView() {
 
   // 最近运行、最近会话是打开面板时才取：常驻轮询它们不值得
   useEffect(() => {
-    if (backend === 'down') return
+    // 使用者看不到记录和对话：不取
+    if (backend === 'down' || !builder) return
     let alive = true
     api.runs.list({ limit: 6 }).then((r) => { if (alive) setRuns(r) }, () => {})
     const conv = useConversations.getState()
@@ -340,11 +364,18 @@ function PaletteView() {
       })
     }
 
-    for (const p of PAGES) {
+    for (const p of pages) {
       list.push({
         id: `page:${p.to}`, group: 'pages', label: p.label, hint: p.hint, keywords: p.keywords,
         icon: <p.icon size={14} />, shortcut: p.shortcut, run: go(p.to),
       })
+      if (p.to === '/apps' && appTasks) {
+        list.push({
+          id: 'page:inbox', group: 'pages', label: `${APP_TEXT.tabs.inbox}（${appTasks}）`,
+          hint: APP_TEXT.inboxHint, keywords: 'inbox tasks 待办 审批 应用',
+          icon: <Inbox size={14} />, run: go('/apps?tab=inbox'),
+        })
+      }
       if (p.to === '/runs' && pending.length) {
         list.push({
           id: 'page:approvals', group: 'pages', label: `待审批（${pending.length}）`,
@@ -354,17 +385,21 @@ function PaletteView() {
       }
     }
 
-    list.push(
-      {
+    if (canChat) {
+      list.push({
         id: 'act:new-chat', group: 'actions', label: '新对话', hint: '在问数据中开始新的对话',
         keywords: 'new chat conversation 会话 对话 新建', icon: <MessageSquarePlus size={14} />,
         run: () => void newConversation(navigate),
-      },
-      {
+      })
+    }
+    if (builder) {
+      list.push({
         id: 'act:new-workflow', group: 'actions', label: '新建工作流', hint: '初始包含一个输入节点和一个成果节点',
         keywords: 'new workflow 画布 编排 创建', icon: <Plus size={14} />,
         run: () => void newWorkflow(navigate),
-      },
+      })
+    }
+    list.push(
       {
         id: 'act:theme', group: 'actions',
         label: theme.resolved === 'dark' ? '切换到浅色主题' : '切换到深色主题',
@@ -431,7 +466,7 @@ function PaletteView() {
       })
     }
     return list
-  }, [approvals, conversations, navigate, notify, runs, theme.pref, theme.resolved, workflows])
+  }, [approvals, appTasks, builder, canChat, conversations, navigate, notify, pages, runs, theme.pref, theme.resolved, workflows])
 
   const sections = useMemo(() => {
     const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
@@ -645,10 +680,11 @@ function studioShortcuts(): { rows: ShortcutRow[]; fromStudio: boolean } {
   return { rows: STUDIO_FALLBACK, fromStudio: false }
 }
 
-const GLOBAL_ROWS: ShortcutRow[] = [
+/** 全局快捷键：切页只列这个人看得到的那几页 */
+const globalRows = (pages: PageDef[]): ShortcutRow[] => [
   { keys: ['Mod+K'], label: '命令面板：切换页面，打开工作流、运行或对话' },
   { keys: ['?'], label: '快捷键说明' },
-  ...PAGES.map((p) => ({ keys: [p.shortcut], label: `前往「${p.label}」` })),
+  ...pages.map((p) => ({ keys: [p.shortcut], label: `前往「${p.label}」` })),
   { keys: ['Esc'], label: '关闭弹窗和浮层' },
 ]
 
@@ -708,6 +744,8 @@ export function ShortcutHelp() {
   const studio = useMemo(studioShortcuts, [])
   const onStudio = pathname.startsWith('/studio')
   const onChat = pathname.startsWith('/chat')
+  const pages = usePages()
+  const builder = pages.some((p) => p.to === '/studio')
 
   const studioSection = (
     <ShortcutSection
@@ -726,9 +764,9 @@ export function ShortcutHelp() {
     >
       <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
         {onStudio && studioSection}
-        <ShortcutSection title="全局" rows={GLOBAL_ROWS} />
-        {!onStudio && studioSection}
-        <ShortcutSection title="问数据" rows={CHAT_ROWS} here={onChat} />
+        <ShortcutSection title="全局" rows={globalRows(pages)} />
+        {!onStudio && builder && studioSection}
+        {pages.some((p) => p.to === '/chat') && <ShortcutSection title="问数据" rows={CHAT_ROWS} here={onChat} />}
       </div>
       <p className="mt-5 border-t border-hairline pt-3 text-2xs leading-relaxed text-faint">
         按 {isMac ? 'macOS' : 'Windows / Linux'} 的键位显示。焦点在输入框中时，除 <Kbd combo="Mod+K" /> 外的快捷键均不生效。

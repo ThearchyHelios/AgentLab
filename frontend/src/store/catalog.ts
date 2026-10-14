@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { create } from 'zustand'
 import { ApiError, api, onConnectivity } from '../api/client'
 import type { Approval, DataSource, Provider, Skill, ToolInfo, Workflow } from '../types'
+import { atLeast, useAuth } from './auth'
 
 /**
  * 后端连没连上。
@@ -39,6 +40,13 @@ const CATALOG_KEYS = Object.keys(CATALOG_LABELS) as CatalogKey[]
  */
 export const CATALOG_TIMEOUT_MS = 15_000
 
+/** 待办数（GET /tasks/count）：派给我的、待处理的，按来源分开——应用里的（导航「应用」的徽标）、不属于应用的（「记录」的徽标） */
+export interface TaskCounts {
+  mine: number
+  apps: number
+  other: number
+}
+
 /** 心跳间隔：连着时复用 4 秒一次的待审批轮询，不另起请求 */
 const HEARTBEAT_MS = 4000
 /** 断开后的重试退避 */
@@ -52,6 +60,8 @@ export interface CatalogState {
   collections: { collection: string; documents: number; chunks: number }[]
   workflows: Workflow[]
   approvals: Approval[]
+  /** 派给我的待办数，跟着心跳取。老服务端没有待办接口时是 null，徽标退回按待审批数 */
+  taskCounts: TaskCounts | null
   /**
    * 数据源，停用的也在（各行 enabled 区分）。它们的查询工具 db_query__<源> / db_schema__<源>
    * 不在 /api/tools 里，挑工具、问数据页的范围、助手的数据源提示都从这里取一份
@@ -93,7 +103,7 @@ export interface CatalogState {
   /** 立刻探一次 /health。「立即重试」按钮调它 */
   checkBackend: () => Promise<boolean>
   /**
-   * 开始心跳：连着时每 4 秒拉一次待审批（顺便测延迟）。断开后的重试不归它管，
+   * 开始心跳：连着时每 4 秒拉一次待审批和待办数（顺便测延迟）。断开后的重试不归它管，
    * catalog 自己按 4→8→16 秒退避探 /health，恢复后自动 refresh。返回停止函数。
    * 重复调用只会有一个心跳在跑。
    */
@@ -169,6 +179,7 @@ export const useCatalog = create<CatalogState>((set, get) => {
     collections: [],
     workflows: [],
     approvals: [],
+    taskCounts: null,
     datasources: [],
     loaded: false,
     loadedAt: {},
@@ -183,7 +194,8 @@ export const useCatalog = create<CatalogState>((set, get) => {
 
     refresh: async () => {
       const gen = ++refreshEpoch
-      const keys = CATALOG_KEYS
+      // 开了登录的使用者（user 角色）用不到这几张表（接口也不给），一张都不取：导航只剩「应用」和「设置」
+      const keys = atLeast(useAuth.getState().me, 'builder') ? CATALOG_KEYS : []
       set({ checks: keys.map((key) => ({ key, label: CATALOG_LABELS[key], state: 'pending' })) })
       // 清单只归最新一次 refresh 写：交叠时早发的那次别把新清单的行改回去
       const update = (key: CatalogKey, patch: Partial<CatalogCheck>) => {
@@ -234,19 +246,26 @@ export const useCatalog = create<CatalogState>((set, get) => {
         return
       }
       const t0 = performance.now()
-      try {
-        const seq = ++fetchSeq
-        const approvals = await api.approvals.list('pending', catalogOpts)
+      // 待办数和待审批一起取：导航上两个徽标（「应用」「记录」）按来源分开数。老服务端没有待办接口（404）时 taskCounts
+      // 留空，「记录」的徽标退回按待审批数
+      const builder = atLeast(useAuth.getState().me, 'builder')
+      const seq = ++fetchSeq
+      const [approvals, counts] = await Promise.allSettled([
+        builder ? api.approvals.list('pending', catalogOpts) : Promise.resolve(null),
+        api.tasks.count(catalogOpts),
+      ])
+      if (counts.status === 'fulfilled') set({ taskCounts: counts.value })
+      // 心跳测的是这一拍的往返；使用者不取待审批，看待办数那一个请求
+      const probe = builder ? approvals : counts
+      if (probe.status === 'fulfilled') set({ latencyMs: Math.round(performance.now() - t0), lastOkAt: Date.now() })
+      if (approvals.status === 'fulfilled' && approvals.value) {
         // 这一拍在路上时又发起了 refresh、而且那次已经填过了：以那次为准
-        if (!claim('approvals', seq)) return
-        set((s) => ({
-          approvals, latencyMs: Math.round(performance.now() - t0), lastOkAt: Date.now(),
-          loadedAt: { ...s.loadedAt, approvals: Date.now() },
-        }))
-      } catch (e) {
-        // 后端回了错误码说明它还活着，列表保持原样；够不着才去确认是否断开
-        if (e instanceof ApiError && e.kind === 'network' && get().backend !== 'down') await get().checkBackend()
+        const list = approvals.value
+        if (claim('approvals', seq)) set((s) => ({ approvals: list, loadedAt: { ...s.loadedAt, approvals: Date.now() } }))
       }
+      // 后端回了错误码说明它还活着，列表保持原样；够不着才去确认是否断开
+      const e = probe.status === 'rejected' ? probe.reason : null
+      if (e instanceof ApiError && e.kind === 'network' && get().backend !== 'down') await get().checkBackend()
     },
 
     reload: async (key) => {

@@ -92,6 +92,12 @@ async function open({ theme = 'dark', state }) {
     // 主题以本地为准，别让沙箱库里存的偏好把这次检查的主题改掉
     if (url.pathname === '/api/settings') return route.fulfill({ json: { ui: { theme } } })
     if (url.pathname === '/api/approvals') return route.fulfill({ json: state.approvals })
+    // 导航上的两个徽标按来源分开数：「记录」数不属于应用的（other），「应用」数应用里的（apps）。这里的待审批都不属于应用
+    if (url.pathname === '/api/tasks/count') {
+      const other = state.approvals.filter((a) => a.status === 'pending').length
+      const apps = state.appTasks ?? 0
+      return route.fulfill({ json: { mine: other + apps, apps, other } })
+    }
     if (url.pathname === '/api/runs' && state.runs) return route.fulfill({ json: state.runs })
     if (state.broken === url.pathname) return route.fulfill({ status: 500, json: { detail: '数据库锁住了，稍后重试' } })
     return route.continue()
@@ -135,11 +141,12 @@ await section('导航', '=== 导航 ===', async () => {
   const box = await nav(page).boundingBox()
   check('导航宽 64px（w-16）', Math.round(box.width) === 64, `${box.width}`)
   const labels = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').allInnerTexts()
-  // 定时任务是后加的，排在设置前面；设置留在最底下，快捷键还是 ⌥7（定时任务用 ⌥8）
-  check('导航项：问数据、编排、记录、数据、工具、知识、定时任务、设置',
-    labels.join(',') === '问数据,编排,记录,数据,工具,知识,定时任务,设置', labels.join(','))
+  // 定时任务是后加的，排在设置前面；设置留在最底下，快捷键还是 ⌥7（定时任务用 ⌥8）。应用（⌥9）排在编排后面
+  check('导航九项：问数据、编排、应用、记录、数据、工具、知识、定时任务、设置',
+    labels.join(',') === '问数据,编排,应用,记录,数据,工具,知识,定时任务,设置', labels.join(','))
   const keys = await nav(page).locator('li > a[aria-keyshortcuts]').evaluateAll((els) => els.map((el) => el.getAttribute('aria-keyshortcuts')))
-  check('设置仍是 ⌥7，定时任务是 ⌥8', keys[6] === 'Alt+8' && keys[7] === 'Alt+7', keys.join(','))
+  check('原有快捷键都没动：问数据 ⌥1、编排 ⌥2、记录 ⌥3 … 设置 ⌥7、定时任务 ⌥8；应用是 ⌥9',
+    keys.join(',') === 'Alt+1,Alt+2,Alt+9,Alt+3,Alt+4,Alt+5,Alt+6,Alt+8,Alt+7', keys.join(','))
   const fontSize = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').first()
     .evaluate((el) => getComputedStyle(el).fontSize)
   check('导航标签 11px', fontSize === '11px', fontSize)
@@ -168,6 +175,8 @@ await section('导航', '=== 导航 ===', async () => {
   check('⌥3 切到记录页', await page.waitForURL(/\/runs(\?|$)/, { timeout: 5000 }).then(() => true, () => false), page.url())
   await page.keyboard.press('Alt+Digit8')
   check('⌥8 切到定时任务页', await page.waitForURL(/\/schedules(\?|$)/, { timeout: 5000 }).then(() => true, () => false), page.url())
+  await page.keyboard.press('Alt+Digit9')
+  check('⌥9 切到应用页', await page.waitForURL(/\/apps(\?|$)/, { timeout: 5000 }).then(() => true, () => false), page.url())
 
   await page.goto(`${WEB}/settings/datasources`)
   check('旧地址 /settings/datasources 重定向到 /data', await page.waitForURL(/\/data(\/|$)/, { timeout: 8000 }).then(() => true, () => false), page.url())
@@ -184,7 +193,7 @@ await section('导航', '=== 导航 ===', async () => {
     const t = document.querySelector('[data-telemetry]').getBoundingClientRect()
     return { ok: n.scrollHeight <= innerHeight && t.bottom <= innerHeight, tel: Math.round(t.bottom), vh: innerHeight }
   })
-  for (const h of [600, 480]) {
+  for (const h of [600, 520, 480]) {
     await page.setViewportSize({ width: 1280, height: h })
     await page.waitForTimeout(150)
     const fit = await bottomFits()
@@ -237,7 +246,7 @@ await section('待审批徽标', '\n=== 待审批徽标 ===', async () => {
     })
     if (theme === 'dark') {
       check('徽标是链接，指向 /runs?tab=approvals', (await badge.getAttribute('href')) === '/runs?tab=approvals')
-      check('导航项「记录」本身仍然进 /runs', (await nav(page).locator('a[aria-keyshortcuts]').nth(2).getAttribute('href')) === '/runs')
+      check('导航项「记录」本身仍然进 /runs', (await nav(page).locator('a[aria-keyshortcuts]').nth(3).getAttribute('href')) === '/runs')
       const label = await badge.getAttribute('aria-label')
       check('徽标读屏文字：条数 + 最久等了多久', /2 项待审批/.test(label) && /最久已等待 8 天/.test(label), label)
       check('徽标至少 16×16', b.width >= 16 && b.height >= 16, `${b.width}×${b.height}`)
@@ -257,6 +266,27 @@ await section('待审批徽标', '\n=== 待审批徽标 ===', async () => {
     }
     await ctx.close()
   }
+})
+
+// ---------------------------------------------------------------------------
+await section('应用徽标', '\n=== 应用徽标：按来源分开数 ===', async () => {
+  // 应用里派给我的待办数在「应用」上，不属于应用的在「记录」上，同一条不在两处各数一次
+  const state = { approvals: PENDING, appTasks: 3, offline: false, writes: [] }
+  const { ctx, page } = await open({ state })
+  await page.goto(`${WEB}/chat`)
+  await waitNav(page)
+  const apps = page.locator('[data-apps-badge]')
+  await apps.waitFor({ timeout: 8000 })
+  check('「应用」上的徽标数应用里的待办', (await apps.innerText()).trim() === '3', await apps.innerText())
+  check('「应用」的徽标指向待办页签', (await apps.getAttribute('href')) === '/apps?tab=inbox', await apps.getAttribute('href'))
+  const runs = page.locator('[data-approval-badge]')
+  check('「记录」上的徽标只数不属于应用的', (await runs.innerText()).trim() === '2', await runs.innerText())
+  check('应用里有待办时「记录」的徽标不说最久等了多久（那份列表含应用里的）',
+    !/最久已等待/.test(await runs.getAttribute('aria-label')), await runs.getAttribute('aria-label'))
+  state.appTasks = 0
+  check('应用里的待办处理完，「应用」的徽标消失', await apps.waitFor({ state: 'detached', timeout: 10000 }).then(() => true, () => false))
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+  await ctx.close()
 })
 
 // ---------------------------------------------------------------------------
