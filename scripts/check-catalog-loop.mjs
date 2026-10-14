@@ -653,6 +653,16 @@ await section('表助手 · 入口、开场、提案与待保存的修改', asyn
   check('输入框、发送按钮有名字', (await input(page).getAttribute('aria-label')) === '给表助手的消息'
         && (await panel(page).locator('[data-assistant-send]').getAttribute('aria-label')) === '发送')
   check('还没有待保存的修改：不给保存', await panel(page).locator('[data-assistant-save]').count() === 0)
+  // 输入法组字时的回车是选词、Esc 是取消候选词：不发送、不关面板
+  await input(page).fill('status 为')
+  const fire = (init) => input(page).evaluate((el, i) => el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...i })), init)
+  await fire({ key: 'Enter', isComposing: true })
+  await fire({ key: 'Enter', keyCode: 229 })
+  await fire({ key: 'Escape', isComposing: true })
+  await sleep(300)
+  check('输入法组字时的回车不发送、Esc 不关面板，草稿还在', count(sent, /\/assistant$/) === 0 && await panel(page).isVisible()
+        && (await input(page).inputValue()) === 'status 为')
+  await input(page).fill('')
 
   // 第一轮：流式显示正文，提案逐项写改前、改后、依据，进待保存的修改
   await say(page, SAY_1)
