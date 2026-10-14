@@ -8,7 +8,10 @@
 - can_read_run / can_read_artifact：运行、工件的读权限（user 角色只能读有授权的应用视图运行、自己参与的实例）；
 - ensure_role / ensure_can_publish：接口内部按请求内容判定的权限（MCP 的 stdio、受管级发布、版本退役，Q8）；
 - restricted()：这次请求是不是开登录后的 user 角色（按请求内容收窄的接口用：问数据只能发起探索运行、工件按白名单给）；
+- run_events_readable(principal, run)：运行的原始记录、事件、实时流能不能读（user 只读查询结果在工具边界遮过的）；
+- ensure_conversation_access(session, conversation_id)：接受 conversation_id 的接口核对对话归属（对话按人隔离）；
 - run_scope / evidence_scope / chat_scope：main.py 挂在运行、证据、问数据几组路由上的依赖，按 run_id 判断能不能读。
+  run_scope 同样管运行的 WebSocket，握手时按运行判。
 
 关登录时：所有人等同 admin、全部放行，行为和加这一层之前一模一样（界面上挂横幅说明）。
 
@@ -144,46 +147,102 @@ def user_can_chat() -> bool:
     return allowed()
 
 
+async def ensure_conversation_access(session: Any, conversation_id: str | None) -> Any:
+    """接受 conversation_id 的接口（助手的 generate-stream、generate、app-stream、from-run……）在读这段对话的历史、记来源
+    之前调：这段对话这个人能不能用（对话按人隔离，D-d）。能用交回对话（Conversation）；没给 id、对话不存在交回 None
+    （和以前一样当没有历史，不报错）；存在但不能用回 403。规则见 api/conversations.py 的同名函数。"""
+    from app.api.conversations import ensure_conversation_access as check
+
+    return await check(session, conversation_id)
+
+
 def _forbidden() -> HTTPException:
     return HTTPException(403, "没有权限查看这次运行")
 
 
-#: user 角色在自己的问数据运行上能读的（GET /api/runs/{id} 之后的部分）：运行记录、事件、运行时的图。这几样就是问数据页
-#: 要的；状态、工件列表、checkpoint 历史不给
+#: user 角色在自己的问数据运行上能读的（GET /api/runs/{id} 之后的部分）：运行记录、事件、运行时的图，加上实时流
+#: （WebSocket /stream，握手时另判）。这几样就是问数据页要的；状态、工件列表、checkpoint 历史不给
 _CHAT_RUN_READS = ("", "/events", "/graph")
+_RUNS_FOR_BUILDERS = "没有权限：运行记录只对搭建者及以上的角色开放"
+
+
+def masked_at_boundary(run: Any) -> bool:
+    """这次运行的查询结果是不是发起时就定下在工具边界遮（tools/datasource.py 的 MASK_RESULTS_OPTION）。开登录后 user 角色
+    发起的问数据运行一定带它（api/runs.py 的 start_run），随运行记录沿用到续跑、审批恢复。"""
+    from app.tools.datasource import MASK_RESULTS_OPTION
+
+    options = getattr(run, "options", None)
+    return isinstance(options, dict) and bool(options.get(MASK_RESULTS_OPTION))
+
+
+async def run_events_readable(principal: Principal, run: Any) -> bool:
+    """能不能读这次运行的原始记录、事件和实时流（GET /api/runs/{id}、/events、/graph，WebSocket /stream）。
+
+    关登录、builder 及以上：能。user：这次运行它能读（can_read_run），而且查询结果在工具边界就遮过（masked_at_boundary）。
+    两个条件缺一不可：没在边界遮过的运行，事件里 tool.end 的预览、运行状态里是查询结果的原文，遮罩管不到——自己发起的
+    应用实例、有授权的应用视图运行经应用页和证据接口读（那两处按派生遮罩给）。实际上满足两条的就是它自己开登录后发起的
+    问数据运行；关登录时自报同名留下的老运行没在边界遮过，开了登录也读不到。"""
+    if principal.mode == "off" or principal.at_least("builder"):
+        return True
+    if run is None or not principal.username or not masked_at_boundary(run):
+        return False
+    return await can_read_run(principal, run)
+
+
+def _own_chat_run(principal: Principal, run: Any) -> bool:
+    return run is not None and bool(principal.username) and run.started_by == principal.username \
+        and run.origin_kind == "chat"
 
 
 async def _run_scope(conn: HTTPConnection) -> None:
-    """/api/runs 下的接口。builder 及以上全部放行；user 角色只在管理员开了问数据（Q2）时能碰这组接口，而且只碰自己的
-    问数据运行（origin_kind=chat）：
+    """/api/runs 下的接口和运行的实时流。builder 及以上全部放行；user 角色只在管理员开了问数据（Q2）时能碰这组接口：
     - 列表、别人的运行一律不给（记录页是给搭建者看的）；
-    - 能发起（只能是问数据的探索运行，start_run 里按请求体再查）、能停止、能读运行记录和事件。这种运行发起时就把查询
-      结果放在工具边界遮（tools/datasource.py 的 MASK_RESULTS_OPTION），事件、回答里只有遮过的值；
+    - 能发起（只能是问数据的探索运行，start_run 里按请求体再查）；能停止自己的问数据运行；
+    - 能读运行记录、事件、运行时的图，能连 WebSocket：按运行判（run_events_readable），握手时就判，不再一刀切只给
+      builder。能读的就是它自己发起、查询结果在工具边界遮过的问数据运行，事件、回答里只有遮过的值；
     - 自己发起的应用实例、有授权的应用视图运行、参与的实例，经应用页（/api/apps/{id}/instances）和证据接口
       （evidence_scope）读，这里不给原始事件和状态：tool.end 的预览、运行状态里是查询结果的原文，遮罩管不到。"""
     principal = current_principal()
-    if principal.mode == "off" or principal.at_least("builder") or conn.scope["type"] != "http":
+    if principal.mode == "off" or principal.at_least("builder"):
+        return
+    if conn.scope["type"] == "websocket":
+        # 握手前拒：服务端回 1008，不建立连接。没登录的中间件已经挡掉了，这里只剩按运行判
+        if not (principal.username and user_can_chat()
+                and await run_events_readable(principal, await _load_run(conn.path_params.get("run_id")))):
+            from fastapi import WebSocketException, status
+
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
         return
     ensure_role("user")
     if not user_can_chat():
-        raise HTTPException(403, "没有权限：运行记录只对搭建者及以上的角色开放")
+        raise HTTPException(403, _RUNS_FOR_BUILDERS)
     method = conn.scope.get("method", "GET")
     run_id = conn.path_params.get("run_id")
     if run_id is None:
         if method == "POST" and conn.url.path.rstrip("/") == "/api/runs":
             return
-        raise HTTPException(403, "没有权限：运行记录只对搭建者及以上的角色开放")
+        raise HTTPException(403, _RUNS_FOR_BUILDERS)
+    run = await _load_run(run_id)
+    rest = conn.url.path.rstrip("/").removeprefix(f"/api/runs/{run_id}")
+    if method == "GET" and rest in _CHAT_RUN_READS:
+        if await run_events_readable(principal, run):
+            return
+        raise _forbidden()
+    if not _own_chat_run(principal, run):
+        raise _forbidden()
+    if method == "POST" and rest == "/cancel":
+        return
+    raise HTTPException(403, "没有权限：这项操作需要搭建者及以上的角色")
+
+
+async def _load_run(run_id: str | None) -> Any:
+    if not run_id:
+        return None
     from app.db.base import SessionLocal
     from app.db.models import Run
 
     async with SessionLocal() as session:
-        run = await session.get(Run, run_id)
-    if run is None or run.started_by != principal.username or run.origin_kind != "chat":
-        raise _forbidden()
-    rest = conn.url.path.rstrip("/").removeprefix(f"/api/runs/{run_id}")
-    if (method == "GET" and rest in _CHAT_RUN_READS) or (method == "POST" and rest == "/cancel"):
-        return
-    raise HTTPException(403, "没有权限：这项操作需要搭建者及以上的角色")
+        return await session.get(Run, run_id)
 
 
 def restricted() -> bool:
@@ -207,20 +266,23 @@ async def _evidence_scope(conn: HTTPConnection) -> None:
 
 
 async def _chat_scope(conn: HTTPConnection) -> None:
-    """问数据和助手（对话、生成）：builder 及以上；user 角色要管理员开了问数据（Q2），而且只给问数据用得到的那几个接口。"""
+    """问数据和助手（对话、生成）：builder 及以上；user 角色要管理员开了问数据（Q2），而且只给问数据用得到的那几个接口。
+    对话按人隔离（只看得到、只改得动自己建的）在 api/conversations.py 里按对话判（ensure_conversation_access）。"""
     principal = current_principal()
     if principal.mode == "off" or principal.at_least("builder"):
         return
     ensure_role("user")
-    path = conn.url.path
+    path = conn.url.path.rstrip("/")
     method = conn.scope.get("method", "GET")
-    if user_can_chat() and (path.startswith("/api/conversations") or (method, path) in _CHAT_COPILOT):
+    if user_can_chat() and (path.startswith("/api/conversations") or (method, path) in _CHAT_ROUTES):
         return
     raise HTTPException(403, "没有权限：问数据和助手需要搭建者及以上的角色，或由管理员为使用者开启问数据")
 
 
-#: user 角色开了问数据时能用的助手接口：问数据的生成流和读当前助手模型
-_CHAT_COPILOT = frozenset({("POST", "/api/copilot/generate-stream"), ("GET", "/api/copilot/model")})
+#: user 角色开了问数据时能用的其余接口：问数据的生成流、读当前助手模型、问数据页选数据源用的数据源名单
+#: （GET /api/datasources/names，只有名字、说明和种类，不含连接信息）
+_CHAT_ROUTES = frozenset({("POST", "/api/copilot/generate-stream"), ("GET", "/api/copilot/model"),
+                          ("GET", "/api/datasources/names")})
 
 run_scope = Depends(_run_scope)
 evidence_scope = Depends(_evidence_scope)

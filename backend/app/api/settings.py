@@ -664,8 +664,61 @@ async def notify_settings(session: AsyncSession) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# 应用：按需视图的每日上限（D-j）
+# --------------------------------------------------------------------------
+
+#: 设置里 apps 这一组。on_demand_daily_limit：每个应用每天最多发起几次按需视图的正式运行（app/apps/resolve.py 的
+#: daily_limit 读它），点「刷新」才运行、同一个键只运行一份之外，再兜一道花费的底。0 表示不再发起按需运行
+APPS_GROUP = "apps"
+APPS_DEFAULTS: dict[str, Any] = {"on_demand_daily_limit": 200}
+APPS_SETTING_LABEL = {"on_demand_daily_limit": "按需视图每日上限"}
+#: 上限的上限：再大就等于不限，要不限的不该靠这一项
+APPS_DAILY_LIMIT_MAX = 100_000
+
+
+def _daily_limit_ok(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= APPS_DAILY_LIMIT_MAX
+
+
+def apps_problem(value: Any) -> str | None:
+    """设置页写进来的 apps 这一组有什么问题，没问题返回 None。"""
+    if not isinstance(value, dict):
+        return f"「应用」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key, item in value.items():
+        if key not in APPS_DEFAULTS:
+            return (f"「应用」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{APPS_SETTING_LABEL[k]}」" for k in APPS_DEFAULTS))
+        if not _daily_limit_ok(item):
+            return (f"「{APPS_SETTING_LABEL[key]}」需要是 0 到 {APPS_DAILY_LIMIT_MAX:,} 之间的整数（0 表示不再发起按需运行），"
+                    f"当前为「{item}」")
+    return None
+
+
+def apps_values(stored: Any) -> dict[str, Any]:
+    """库里存的（或刚写进来的）apps 一组 → 补齐默认；存坏了的项按默认。"""
+    stored = stored if isinstance(stored, dict) else {}
+    limit = stored.get("on_demand_daily_limit")
+    return {"on_demand_daily_limit": limit if _daily_limit_ok(limit) else APPS_DEFAULTS["on_demand_daily_limit"]}
+
+
+async def apps_settings(session: AsyncSession) -> dict[str, Any]:
+    """设置里的 apps 一组，没存过的补默认。按需视图发起前从这里读每日上限。"""
+    row = await session.get(Setting, APPS_GROUP)
+    return apps_values(row.value if row else None)
+
+
+# --------------------------------------------------------------------------
 # 用户设置
 # --------------------------------------------------------------------------
+
+#: 不经 /api/settings 读写的组：登录设置只经 /api/auth/settings 改（D-l）——那一组里有 OIDC 的客户端密钥、管理员映射，
+#: 而且改登录方式要在同一个请求里引导第一个管理员、刷新进程内的缓存；从这里写进去的那份既不校验也不生效，读出来的又
+#: 会把密钥带给搭建者
+def _hidden_groups() -> tuple[str, ...]:
+    from app.auth import SETTING_KEY as AUTH_KEY
+
+    return (AUTH_KEY,)
+
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "ui": {"theme": "system", "language": "zh", "canvas_snap": True, "autosave": True},
@@ -697,6 +750,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     NOTIFY_GROUP: notify_values(None),
     # 起草模型：数据目录起草、按配方导入的 AI 起草用的模型，留空沿用助手的模型
     CATALOG_DRAFT_GROUP: catalog_draft_values(None),
+    # 应用：按需视图的每日上限（管理员在设置页改）
+    APPS_GROUP: apps_values(None),
 }
 
 
@@ -748,12 +803,15 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     # 裁判、核查的每日计数是引擎记的账，不是用户设置：设置页整组回写时带着一份旧的，会把今天的花费清零
     stored.pop(JUDGE_SPEND, None)
     stored.pop(VERIFY_SPEND, None)
+    for key in _hidden_groups():
+        stored.pop(key, None)
     merged = {k: {**v, **(stored.get(k) or {})} for k, v in DEFAULT_SETTINGS.items()}
     # 裁判、核查设置按引擎实际生效的样子给：存坏了的项显示默认，存了 null 的上限显示不限
     merged[JUDGE_GROUP] = judge_values(stored.get(JUDGE_GROUP))
     merged[VERIFY_GROUP] = verify_values(stored.get(VERIFY_GROUP))
     merged[NOTIFY_GROUP] = notify_values(stored.get(NOTIFY_GROUP))
     merged[CATALOG_DRAFT_GROUP] = catalog_draft_values(stored.get(CATALOG_DRAFT_GROUP))
+    merged[APPS_GROUP] = apps_values(stored.get(APPS_GROUP))
     for key, value in stored.items():
         merged.setdefault(key, value)
     return merged
@@ -844,13 +902,17 @@ async def put_settings(
             raise HTTPException(422, problem)
         # 存规范化之后的：末尾带 / 的地址拼链接会多出一个斜杠
         payload.values[NOTIFY_GROUP] = notify_values(payload.values[NOTIFY_GROUP])
+    if APPS_GROUP in payload.values:
+        if problem := apps_problem(payload.values[APPS_GROUP]):
+            raise HTTPException(422, problem)
+        payload.values[APPS_GROUP] = apps_values(payload.values[APPS_GROUP])
     if found := await _provider_problem(session, payload.values):
         raise CodedHTTPException(422, found[1], PROVIDER_INVALID, field=found[0])
     for key, value in payload.values.items():
-        if key in (TRUST_KEY, "limits", JUDGE_SPEND, VERIFY_SPEND):
+        if key in (TRUST_KEY, "limits", JUDGE_SPEND, VERIFY_SPEND, *_hidden_groups()):
             # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，
             # 会把刚在工具页改的档位冲掉。limits 是环境变量定的，写进库也不生效。
-            # 裁判、核查的每日计数是引擎记的账，只有引擎自己写
+            # 裁判、核查的每日计数是引擎记的账，只有引擎自己写。登录设置只经 /api/auth/settings 改（_hidden_groups）
             continue
         row = await session.get(Setting, key)
         if row:

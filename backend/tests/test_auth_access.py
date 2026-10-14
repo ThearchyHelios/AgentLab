@@ -46,7 +46,12 @@ async def world():
                          pins=[{"alias": "w", "workflow_id": "wf-weekly", "version": 3, "use": "view"}]))
         runs = {
             "others": Run(workflow_name="别人的", started_by="bob", run_class="exploratory"),
-            "own": Run(workflow_name="自己的", started_by="uma", run_class="exploratory", origin_kind="chat"),
+            # 开登录后使用者发起的问数据运行：查询结果在工具边界遮（api/runs.py 发起时就定下）
+            "own": Run(workflow_name="自己的", started_by="uma", run_class="exploratory", origin_kind="chat",
+                       options={"mask_results": True}),
+            # 关登录时自报同名留下的老问数据运行：没在边界遮过，开了登录也不给原始事件
+            "own_unmasked": Run(workflow_name="自己的老运行", started_by="uma", run_class="exploratory",
+                                origin_kind="chat"),
             "own_instance": Run(workflow_name="自己发起的实例", run_class="formal", app_id=app_a.id,
                                 origin_kind="app_entry", started_by="uma"),
             "view": Run(workflow_name="视图", run_class="formal", app_id=app_a.id, origin_kind="app_view"),
@@ -105,6 +110,9 @@ async def test_run_routes_for_a_user(world):
     assert (await uma.get("/api/runs")).status_code == 403, "记录页的列表只给搭建者"
     assert (await uma.get(f"/api/runs/{runs['own']}")).status_code == 200
     assert (await uma.get(f"/api/runs/{runs['own']}/events")).status_code == 200
+    assert (await uma.get(f"/api/runs/{runs['own_unmasked']}/events")).status_code == 403, \
+        "查询结果没在工具边界遮过的运行，事件里是原文"
+    assert (await uma.post(f"/api/runs/{runs['own_unmasked']}/cancel")).status_code != 403, "停止自己的问数据运行照旧可以"
     assert (await uma.get(f"/api/runs/{runs['own']}/state")).status_code == 403, "运行状态是查询结果的原文"
     assert (await uma.get(f"/api/runs/{runs['own']}/artifacts")).status_code == 403
     assert (await uma.delete(f"/api/runs/{runs['own']}")).status_code == 403
@@ -188,7 +196,7 @@ async def test_a_manage_grant_does_not_make_a_user_an_app_builder(world):
         s.add(AppGrant(app_id=app_id, principal_kind="user", principal="uma", role="manage"))
         await s.commit()
     assert (await uma.post(f"/api/apps/{app_id}/publish", json={})).status_code == 403
-    assert (await uma.post(f"/api/apps/{app_id}/hooks", json={"name": "x", "kind": "signal"})).status_code == 403
+    assert (await uma.post(f"/api/apps/{app_id}/hooks/x/rotate")).status_code == 403
     assert (await uma.put(f"/api/apps/{app_id}/grants", json={"items": []})).status_code == 403
 
 
@@ -211,14 +219,15 @@ async def test_chat_is_off_for_users_until_an_admin_allows_it(world):
 
 
 async def test_a_users_chat_run_masks_query_results_at_the_tool_boundary(world, monkeypatch):
-    """开登录后使用者发起的问数据运行：发起时就定下查询结果在工具边界遮（run options），数据源工具按它建。"""
+    """开登录后使用者发起的问数据运行：发起时就定下查询结果在工具边界遮、数据源查询一律只读（run options），数据源工具
+    按它们建。"""
     from types import SimpleNamespace
 
     from app.api import runs as runs_api
     from app.engine.context import RunContext
     from app.engine.schema import GraphSpec
     from app.tools import datasource, registry
-    from app.tools.datasource import MASK_RESULTS_OPTION, run_masks_results
+    from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION, run_masks_results, run_reads_only
 
     seen: list[dict] = []
 
@@ -231,21 +240,25 @@ async def test_a_users_chat_run_masks_query_results_at_the_tool_boundary(world, 
     assert (await world["admin"].put("/api/auth/settings", json={"user_can_chat": True})).status_code == 200
     assert (await world["uma"].post("/api/runs", json={"origin": "chat", "graph": {}})).status_code == 201
     assert (await world["bob"].post("/api/runs", json={"origin": "chat", "graph": {}})).status_code == 201
-    assert seen[0]["options"] == {MASK_RESULTS_OPTION: True} and seen[1]["options"] is None, "搭建者照旧原样"
+    assert seen[0]["options"] == {MASK_RESULTS_OPTION: True, READ_ONLY_OPTION: True}
+    assert seen[1]["options"] is None, "搭建者照旧原样"
 
     spec = GraphSpec.model_validate({"nodes": [], "edges": []})
-    ctx = RunContext(run_id="r1", thread_id="r1", spec=spec, extra={"run_options": {MASK_RESULTS_OPTION: True}})
-    assert run_masks_results(ctx) and not run_masks_results(RunContext(run_id="r2", thread_id="r2", spec=spec))
-    built: list[bool] = []
+    ctx = RunContext(run_id="r1", thread_id="r1", spec=spec,
+                     extra={"run_options": {MASK_RESULTS_OPTION: True, READ_ONLY_OPTION: True}})
+    plain = RunContext(run_id="r2", thread_id="r2", spec=spec)
+    assert run_masks_results(ctx) and not run_masks_results(plain)
+    assert run_reads_only(ctx) and not run_reads_only(plain)
+    built: list[tuple[bool, bool]] = []
 
     async def build_datasource_tools(names, ctx, session, *, force_readonly=False, mask_results=False):
-        built.append(mask_results)
+        built.append((force_readonly, mask_results))
         return []
 
     monkeypatch.setattr(datasource, "build_datasource_tools", build_datasource_tools)
-    await registry.build_tools(["db_query__crm"], registry.ToolContext(run_id="r1", mask_results=True),
-                               session=object())
-    assert built == [True]
+    await registry.build_tools(["db_query__crm"], registry.ToolContext(run_id="r1", mask_results=True,
+                                                                         force_readonly=True), session=object())
+    assert built == [(True, True)]
 
 
 async def test_admin_only_areas(world):

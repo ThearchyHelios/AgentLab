@@ -42,6 +42,9 @@ class ToolContext:
     #: 数据源查询结果交给模型、落进快照之前先遮（tools/datasource.py 的 run_masks_results）：开登录后 user 角色发起的
     #: 问数据运行，对它来说遮罩就是边界，事件、回答里只能有遮过的值
     mask_results: bool = False
+    #: 数据源查询一律只读，可写源上的写语句也拒（tools/datasource.py 的 run_reads_only）：同样是 user 角色的问数据运行。
+    #: 不能交给审批去拦——Agent 的 approval 是发起人自己写在图里的
+    force_readonly: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -178,7 +181,8 @@ async def build_tools(
     if datasource_names and session is not None:
         from app.tools.datasource import build_datasource_tools
 
-        tools.extend(await build_datasource_tools(datasource_names, ctx, session, mask_results=ctx.mask_results))
+        tools.extend(await build_datasource_tools(datasource_names, ctx, session, force_readonly=ctx.force_readonly,
+                                                  mask_results=ctx.mask_results))
 
     if mcp_names:
         from app.tools.mcp_manager import mcp_manager

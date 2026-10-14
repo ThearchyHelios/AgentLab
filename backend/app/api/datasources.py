@@ -35,6 +35,9 @@ from app.db.models import DataSource, ImportStaging, SourceSnapshot, TableImport
 from app.tools.datasource import tool_names
 
 router = APIRouter(prefix="/api/datasources", tags=["datasources"])
+#: 问数据页选数据源用的名单（D-c）：main.py 挂 chat_scope，开了问数据的使用者也能读。整组 router 只给搭建者（连接信息、
+#: 表结构、数据目录都在里面），所以单独一个 router；要登记在 router 之前
+names_router = APIRouter(prefix="/api/datasources", tags=["datasources"])
 logger = logging.getLogger(__name__)
 
 # 名字会成为工具名的一部分（db_query__<name>），而模型的 function name 只认
@@ -329,6 +332,16 @@ def _locked_refusal(changed: list[str]) -> str:
     return f"上传的表格由系统维护连接信息，不能修改「{'」「'.join(changed)}」。如需更新数据，请重新上传"
 
 
+@names_router.get("/names")
+async def list_source_names(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """问数据页的数据源名单：{items: [{id, name, description, kind}]}，按名字排。只列启用着的（停用的问数据用不了），
+    只给名字、说明和种类：连接信息、表结构、数据目录都不在这里，使用者（开了问数据）也能读。"""
+    rows = (await session.execute(
+        select(DataSource.id, DataSource.name, DataSource.description, DataSource.kind)
+        .where(DataSource.enabled.is_(True)).order_by(DataSource.name))).all()
+    return {"items": [{"id": r.id, "name": r.name, "description": r.description or "", "kind": r.kind} for r in rows]}
+
+
 @router.get("", response_model=list[DataSourceOut])
 async def list_sources(session: AsyncSession = Depends(get_session)) -> list[DataSourceOut]:
     rows = list((await session.execute(select(DataSource).order_by(DataSource.name))).scalars())
@@ -347,8 +360,10 @@ _TIMEOUT_FIELD = {
 #: 证据面板展示原始行时遮掉的列。每种库都有：遮罩只看查询结果的列名，和方言无关
 _MASK_FIELD = {
     "key": MASK_COLUMNS_OPTION, "label": "遮罩的列", "placeholder": "phone, email",
+    # 开登录后对 user 角色遮罩就是边界（A7 第 6 条）：它的问数据运行在工具边界就遮，应用视图、证据、工件都按派生遮罩给。
+    # 对搭建者（和关登录时的所有人）仍只减少暴露——工件里是完整快照，界面上两句都照实说
     "help": "证据面板展示查询结果的原始行时，这些列显示为「已遮罩」。"
-            "遮罩只减少暴露，不是安全边界：完整快照仍可通过工件获取，SQL 中给列起别名也可绕过",
+            "对搭建者只减少暴露，不是安全边界：完整快照仍可通过工件获取；开启登录后，使用者看到的查询结果一律遮罩",
 }
 
 

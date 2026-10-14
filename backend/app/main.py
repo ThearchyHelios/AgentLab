@@ -198,6 +198,8 @@ for router, guard in (
     (artifacts.router, _USER),
     (governance.router, _BUILDER),
     (schedules.router, _BUILDER),
+    # 问数据页选数据源用的名单（只有名字、说明、种类）：开了问数据的使用者也能读，同样要在通配 /{source_id} 之前登记
+    (datasources.names_router, [chat_scope]),
     # 按配方导入的 /api/datasources/imports/… 要在 datasources 的通配 /{source_id} 之前登记
     (table_imports.router, _BUILDER),
     (source_versions.router, _BUILDER),

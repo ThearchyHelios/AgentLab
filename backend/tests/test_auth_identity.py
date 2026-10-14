@@ -189,7 +189,8 @@ async def test_reset_admin_recovers_access():
     assert actions == ["cli", "cli"]
 
 
-async def test_websocket_is_for_builders_only():
+async def test_websocket_needs_a_login_and_the_route_judges_the_run():
+    """中间件只挡没登录的 WebSocket；登录了的交给路由按运行判（api/deps.py 的 run_scope，见 test_user_chat_access.py）。"""
     from app.auth.middleware import AuthMiddleware
 
     await auth_env.turn_on_local()
@@ -208,16 +209,19 @@ async def test_websocket_is_for_builders_only():
     async def send(message):
         sent.append(message)
 
-    cookie = f"agentlab_session={uma.cookies.get('agentlab_session')}".encode()
-    scope = {"type": "websocket", "path": "/api/runs/r1/stream", "headers": [(b"cookie", cookie)]}
+    scope = {"type": "websocket", "path": "/api/runs/r1/stream", "headers": []}
     await AuthMiddleware(inner)(scope, receive, send)
-    assert not reached and sent == [{"type": "websocket.close", "code": 1008}]
+    assert not reached and sent == [{"type": "websocket.close", "code": 1008}], "没登录的握手前就关掉"
+
+    scope["headers"] = [(b"cookie", f"agentlab_session={uma.cookies.get('agentlab_session')}".encode())]
+    await AuthMiddleware(inner)(scope, receive, send)
+    assert reached == ["/api/runs/r1/stream"], "登录了的使用者交给路由按运行判，不再一刀切"
 
     await auth_env.make_user("bob", "builder")
     bob = await auth_env.login("bob")
     scope["headers"] = [(b"cookie", f"agentlab_session={bob.cookies.get('agentlab_session')}".encode())]
     await AuthMiddleware(inner)(scope, receive, send)
-    assert reached == ["/api/runs/r1/stream"]
+    assert reached == ["/api/runs/r1/stream"] * 2
 
 
 # ---------------------------------------------------------------- oidc

@@ -1,7 +1,11 @@
 """AgentLab 签发的身份断言（凭据模式 service_on_behalf，A6 第 3 条、Q3）。
 
 登记的端点用服务凭据访问外部系统；声明了 service_on_behalf 的能力另带一个短时的 EdDSA JWT，写明这次是替谁办的：
-iss=agentlab、aud=端点名、sub=发起人（有的话）、5 分钟有效。外部系统用 /api/auth/jwks 里的公钥核验。
+iss=agentlab、aud=端点名、sub=运行的发起人（有的话）、5 分钟有效。外部系统用 /api/auth/jwks 里的公钥核验。
+
+sub 一律是运行的发起人（Run.started_by）：这件事是替他办的，哪怕流程走了几天、中间换了几个人经手。确认这次发送的人
+另放在 act 声明里（RFC 8693 的 actor 声明：{"act": {"sub": 确认人}}）——外部系统据此分得清「替谁办」和「谁按的
+确认」，不会把确认人当成申请人。没有人确认（只读、免确认的无人值守写入）就不写 act。
 
 不存用户自己的 token：流程一等就是几天，会超过它的寿命；存刷新令牌会扩大泄露面。
 
@@ -59,8 +63,9 @@ def jwks() -> dict[str, Any]:
                       "alg": "EdDSA", "use": "sig"}]}
 
 
-def assertion(audience: str, subject: str | None, *, verified: bool) -> str:
-    """一次请求的身份断言。subject 为空（定时任务这类没有发起人的运行）时不写 sub，外部系统据此认出是服务自己发起的。"""
+def assertion(audience: str, subject: str | None, *, verified: bool, actor: str | None = None) -> str:
+    """一次请求的身份断言。subject 为空（定时任务这类没有发起人的运行）时不写 sub，外部系统据此认出是服务自己发起的。
+    actor 是确认这次发送的人，写成 act 声明；发起人自己确认的也照写（谁按的确认要说得清），没给就不写。"""
     import jwt
 
     now = int(time.time())
@@ -68,4 +73,6 @@ def assertion(audience: str, subject: str | None, *, verified: bool) -> str:
                               "jti": secrets.token_hex(12), "verified": verified}
     if subject:
         claims["sub"] = subject
+    if actor:
+        claims["act"] = {"sub": actor}
     return jwt.encode(claims, _private_key(), algorithm="EdDSA", headers={"kid": key_id()})

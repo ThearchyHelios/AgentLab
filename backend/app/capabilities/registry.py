@@ -346,6 +346,7 @@ def validate_governance(changes: dict[str, Any]) -> dict[str, Any]:
             if not (isinstance(value, list) and all(isinstance(v, str) and v.startswith("/") for v in value)):
                 raise GovernanceError("遮罩字段需要写成 JSON 指针的列表，每一项以 / 开头")
         elif key == "fields" and not isinstance(value, dict):
+            # 逐项的取值、状态在 govern 里按数据目录「项」的规矩查（data/capability_review.normalize_fields）
             raise GovernanceError("字段语义需要写成按 JSON 指针分项的对象")
         elif key == "unattended_write":
             value = bool(value)
@@ -370,6 +371,15 @@ async def govern(session: AsyncSession, name: str, changes: dict[str, Any], *, v
     if row is None:
         raise LookupError(name)
     clean = validate_governance(changes)
+    if "fields" in clean:
+        # 字段语义沿用数据目录「项」的规矩（data/capability_review.py）：人工新填、改过的记为已确认，没动的保持原状态，
+        # 推断的项留给审阅队列。不这样的话，界面整份回写时带着的状态、来源都会被原样当真
+        from app.data.capability_review import FieldsInvalid, normalize_fields
+
+        try:
+            clean["fields"] = normalize_fields(row.fields, clean["fields"])
+        except FieldsInvalid as e:
+            raise GovernanceError(str(e)) from e
     effect = (clean["effect"] if "effect" in clean else row.effect) or row.effect_system
     endpoint_id = clean["endpoint_id"] if "endpoint_id" in clean else row.endpoint_id
     if effect == "dynamic" and endpoint_id and not name.startswith("mcp:"):

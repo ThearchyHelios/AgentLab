@@ -11,7 +11,8 @@
   哪个路由忘了挂依赖，也不会对没登录的人敞开；
 - 非 GET 的请求必须带 X-AgentLab-Request 头，带了 Origin 的必须是本站或登记的前端地址（CSRF）。自定义请求头跨站发不出来
   （要过 CORS 预检，只放行配置里的前端地址），SameSite=Lax 的 cookie 也不随跨站的表单提交带过去；
-- WebSocket 只给 builder 及以上（user 角色的实例页改为轮询）。
+- WebSocket：没登录的握手前就关掉；登录了的交给路由，按运行判（api/deps.py 的 run_scope：user 角色只能连自己能读、
+  查询结果在工具边界遮过的运行，也就是自己的问数据运行；应用实例页照旧轮询）。
 """
 from __future__ import annotations
 
@@ -122,8 +123,8 @@ class AuthMiddleware:
                 return
 
         principal = await resolve(headers, mode)
-        if scope["type"] == "websocket" and not principal.at_least("builder"):
-            # 握手前关闭：服务端回 403，不建立连接
+        if scope["type"] == "websocket" and not principal.username:
+            # 握手前关闭：服务端回 403，不建立连接。登录了的不在这里一刀切：能不能连哪次运行要看运行（run_scope）
             await receive()
             await send({"type": "websocket.close", "code": 1008})
             return

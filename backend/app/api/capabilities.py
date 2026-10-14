@@ -5,13 +5,15 @@ require_role("builder")，写接口在里面再要 admin。
 
 - 能力列表每次都先同步一遍（sync_all 只改变了的行，几条查询）：刚建的数据源、刚加的自定义工具马上看得到；
 - 治理带 version 乐观锁：读到的是 v3、提交时已经是 v4 的回 409，界面重新读一遍再改；
+- 字段语义沿用数据目录「项」的状态和审阅（data/capability_review.py）：GET /capabilities/review-queue 列推断的项，
+  POST /capabilities/review/batch 批量确认、驳回、撤销审阅（逐个能力按 version 乐观锁，写审计）；
 - 端点的认证头只回掩码，提交掩码值表示保持原值；allow_intranet 只有管理员能开（写接口本身只给管理员）。
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +22,7 @@ from app.api.deps import current_principal, ensure_role
 from app.auth.audit import record
 from app.capabilities import endpoints as ep
 from app.capabilities import registry
+from app.data import capability_review
 from app.db.base import get_session
 from app.db.models import Capability, CustomTool, Endpoint, McpServer
 
@@ -55,6 +58,48 @@ async def list_capabilities(system: str | None = None, effect: str | None = None
 @router.post("/capabilities/sync")
 async def sync_capabilities(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     return {"changed": await registry.sync_all(session)}
+
+
+# ---- 字段语义的审阅（data/capability_review.py）。要登记在 /capabilities/{name:path} 前面：不然 review-queue 会被当成能力名
+
+
+@router.get("/capabilities/review-queue")
+async def capability_review_queue(limit: int = Query(50, ge=1, le=capability_review.QUEUE_LIMIT_MAX),
+                                  offset: int = Query(0, ge=0),
+                                  kind: Literal["all", "facts", "names"] = Query("all"),
+                                  capability: str | None = Query(None, max_length=200),
+                                  session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """待审阅的能力字段：只列推断的项，按用到它的运行次数、是不是写入能力、项的风险、来源排好。kind 筛影响数字的项
+    （facts：度量类型）或名称和说明（names），capability 只看一项能力。搭建者能看，审阅只给管理员。只读：不顺带同步，
+    来源删掉了的（missing）按上一次同步的结果不列——能力页先读列表（会同步），再读队列。"""
+    return await capability_review.review_queue(session, kind=kind, capability=capability or None, limit=limit,
+                                                offset=offset)
+
+
+class CapabilityReviewItem(BaseModel):
+    capability: str = Field(min_length=1, max_length=200)
+    pointer: str = Field(min_length=1, max_length=500)
+    field: Literal["label", "meaning", "unit", "measure", "codes"]
+    action: Literal["confirm", "reject", "reset"]
+    if_version: int = Field(ge=0)
+
+
+class CapabilityReviewBatchIn(BaseModel):
+    items: list[CapabilityReviewItem] = Field(min_length=1, max_length=capability_review.BATCH_MAX)
+
+
+@router.post("/capabilities/review/batch")
+async def review_capability_batch(payload: CapabilityReviewBatchIn, session: AsyncSession = Depends(get_session)
+                                  ) -> dict[str, Any]:
+    """批量审阅能力字段：逐条结果和请求一一对应。逐个能力按 if_version（能力的 version）乐观锁，同一个能力的几条一次写入、
+    version 加一、写审计；一个能力冲突、位置不对、能力不存在只记在那几条上（ok 为假，code 是 capability_conflict /
+    capability_path_invalid / capability_missing），不影响别的。能力治理只给管理员（§3.12），审阅同样。"""
+    ensure_role("admin")
+    principal = current_principal()
+    items = [capability_review.BatchItem(i.capability, i.pointer, i.field, i.action, i.if_version)
+             for i in payload.items]
+    return {"results": await capability_review.review_batch(session, items, actor=principal.username,
+                                                            verified=principal.verified)}
 
 
 @router.get("/capabilities/{name:path}")

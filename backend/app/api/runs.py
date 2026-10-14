@@ -73,6 +73,8 @@ class RunOut(BaseModel):
     schedule_id: str | None = None
     #: 运行来源（engine/origin.py 的 ORIGIN_KINDS）。为空是加这一列之前的运行：来源未记录
     origin_kind: str | None = None
+    #: run.origin 事件的数据（kind、app_id、entry / view、hook、actor、actor_verified……），和封存范围里那一条是同一份
+    origin: dict[str, Any] | None = None
     #: 应用发起的运行属于哪个应用版本
     app_id: str | None = None
     app_version: int | None = None
@@ -93,7 +95,7 @@ async def start_run(
     """发起规则全在 engine/launch.py（定时任务到点发起也用它），这里只把拒绝换回 HTTP 响应。"""
     from app.api.deps import restricted
     from app.engine.origin import CLIENT_ORIGINS
-    from app.tools.datasource import MASK_RESULTS_OPTION
+    from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
 
     origin = payload.origin or "api"
     if origin not in CLIENT_ORIGINS:
@@ -101,23 +103,35 @@ async def start_run(
         raise CodedHTTPException(422, "运行来源只能是问数据、画布上的试运行、正式运行（手动）或接口，应用、外部系统和定时任务"
                                       "发起的运行由服务端记录来源", ORIGIN_NOT_ALLOWED, field="origin")
     options = None
+    actor = actor_of(x_actor)
+    memory_scope = payload.memory_scope
     if restricted():
-        # user 角色（管理员开了问数据）只能发起问数据当场搭的探索运行：已发布工作流的正式运行、别的来源都是搭建者的事。
-        # 查询结果在工具边界就遮，事件、回答里只有遮过的值——它读得到自己这次运行的事件（api/deps.py 的 _run_scope）
+        # user 角色（管理员开了问数据）只能发起问数据当场搭的探索运行：已发布工作流的正式运行只经应用入口发起，别的来源
+        # 都是搭建者的事。图里只许读数据、整理、撰写这一类节点和只读工具（app/auth/chat_policy.py）。
+        # 查询结果在工具边界就遮，事件、回答里只有遮过的值——它读得到自己这次运行的事件（api/deps.py 的 _run_scope）；
+        # 数据源查询一律只读，写语句不交给审批（Agent 的 approval 是它自己写在图里的）
         if origin != "chat" or payload.run_class != "exploratory" or payload.workflow_id or payload.version is not None:
             raise HTTPException(403, "没有权限：使用者只能发起问数据的运行，工作流的运行需要搭建者及以上的角色")
-        options = {MASK_RESULTS_OPTION: True}
+        from app.auth.chat_policy import SCOPE_REFUSED, chat_graph_problem, chat_memory_scope
+
+        if problem := chat_graph_problem(payload.graph):
+            raise HTTPException(403, problem)
+        if payload.memory_scope or payload.collection:
+            raise HTTPException(403, SCOPE_REFUSED)
+        # 记忆固定为这位使用者自己的范围、知识库取设置里的默认值：记忆、知识库的内容不经遮罩（见 chat_policy 开头）
+        memory_scope = chat_memory_scope(actor)
+        options = {MASK_RESULTS_OPTION: True, READ_ONLY_OPTION: True}
     try:
         return await launch_run(
             session,
             workflow_id=payload.workflow_id,
             graph=payload.graph,
             input_payload=payload.input,
-            memory_scope=payload.memory_scope,
+            memory_scope=memory_scope,
             collection=payload.collection,
             run_class=payload.run_class,
             version=payload.version,
-            actor=actor_of(x_actor),
+            actor=actor,
             origin_kind=origin,
             options=options,
         )
@@ -623,6 +637,9 @@ class ApprovalOut(BaseModel):
     node_label: str | None = None
     run_status: str | None = None
     run_class: str | None = None
+    #: 这条审批对应的待办（app/process/tasks.py）。回复走 POST /api/tasks/{task_id}/respond；开待办时出过错、还没补上的
+    #: 为空，老接口 /decide 照旧能用（它会现补一条）
+    task_id: str | None = None
 
 
 @approvals_router.get("", response_model=list[ApprovalOut])
@@ -632,9 +649,12 @@ async def list_approvals(
     limit: int = Query(default=100, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> list[ApprovalOut]:
+    from app.db.models import Task
+
     stmt = (
-        select(Approval, Run)
+        select(Approval, Run, Task.id)
         .join(Run, Run.id == Approval.run_id, isouter=True)
+        .join(Task, Task.approval_id == Approval.id, isouter=True)
         .order_by(Approval.created_at.desc())
         .limit(limit)
     )
@@ -643,8 +663,9 @@ async def list_approvals(
     if run_id:
         stmt = stmt.where(Approval.run_id == run_id)
     out: list[ApprovalOut] = []
-    for approval, run in (await session.execute(stmt)).all():
+    for approval, run, task_id in (await session.execute(stmt)).all():
         item = ApprovalOut.model_validate(approval, from_attributes=True)
+        item.task_id = task_id
         if run is not None:
             item.workflow_id = run.workflow_id
             item.workflow_name = run.workflow_name

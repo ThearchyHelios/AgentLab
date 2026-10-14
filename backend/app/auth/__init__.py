@@ -4,7 +4,8 @@ api/deps.py 只定接口，这里给实现：
 - 登录方式：环境变量 AGENTLAB_AUTH_MODE 优先，没设时读设置（settings 表的 auth 一行，进程内缓存，改设置时刷新）；
 - middleware.py：按请求认出是谁（会话 cookie），写进 api/deps 的 contextvar；非 GET 请求核对 X-AgentLab-Request 头和 Origin；
 - sessions.py / passwords.py：会话（库里只存 token 的 sha256）、口令（hashlib.scrypt）、登录失败退避；
-- oidc.py：授权码 + PKCE；access.py：运行、工件的读权限；audit.py：管理类操作的留痕；signing.py：身份断言。
+- oidc.py：授权码 + PKCE；access.py：运行、工件的读权限；audit.py：管理类操作的留痕；signing.py：身份断言；
+- chat_policy.py：开了问数据的使用者能运行什么样的图（节点、工具的白名单）。
 
 关登录（off，默认）时：中间件什么都不做，所有依赖放行，行为和加这一层之前一模一样。
 """
