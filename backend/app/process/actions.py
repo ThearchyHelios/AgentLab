@@ -160,8 +160,10 @@ async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, a
 
 
 async def send(prep: Prepared, capability: Any, args: dict[str, Any], *, run_id: str, node_id: str, exec_no: int,
-               emit: Callable[..., None], on_behalf: str | None = None) -> dict[str, Any]:
-    """先写记录再发送。返回节点的产出；结果未知抛 ActionPending，确定失败抛 ActionFailed。"""
+               emit: Callable[..., None], on_behalf: str | dict[str, Any] | None = None) -> dict[str, Any]:
+    """先写记录再发送。返回节点的产出；结果未知抛 ActionPending，确定失败抛 ActionFailed。
+
+    on_behalf 原样交给平台执行器写身份断言：{"sub": 运行的发起人, "act": 确认人}（capabilities.endpoints.on_behalf_parts）。"""
     from app.capabilities.registry import endpoint_request, masked_paths
 
     name = capability.name
@@ -421,6 +423,9 @@ async def _continue(run_id: str, actor: str | None) -> Any:
         return await run_manager.continue_failed(run_id, actor=actor)
     except (ValueError, KeyError) as e:
         logger.warning("动作核实之后没能接着运行 %s：%s", run_id, e)
+        return None
+    except Exception:  # noqa: BLE001 - 核实本身已经落库：接着跑不成不该让核实报错，记日志，人可以在记录页接着运行
+        logger.exception("动作核实之后接着运行 %s 出错", run_id)
         return None
 
 

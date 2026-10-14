@@ -418,6 +418,16 @@ async def respond(task_id: str, principal: Any, *, decision: Any, values: dict[s
     except (ValueError, KeyError) as e:
         await _unclaim(task_id, mine.id)
         raise TaskRefused(str(e.args[0]) if e.args else str(e)) from e
+    except Exception as e:  # noqa: BLE001 - 判定之后恢复不成：不管是什么错，待办都不能卡在 resolving
+        # 以前只接 ValueError / KeyError：别的异常（库被锁、检查点读不出……）直接冒上去，待办停在 resolving，再也没人
+        # 能回复，只有重启时 startup 才收拾。这里一律退回待处理、这一票撤回，原因写进日志、交回调用方
+        logger.exception("待办 %s 判定后恢复运行 %s 出错", task_id, run_id)
+        closed = await _unclaim(task_id, mine.id)
+        from app.core.errors import describe_exception
+
+        after = "运行已经结束，这条待办随之关闭" if closed else "你的回复没有生效，待办已退回待处理，请稍后重试"
+        raise TaskRefused(f"恢复运行时出错：{describe_exception(e)}。{after}", status_code=500,
+                          code="task_resume_failed") from e
     await _settle(task_id)
     await record(run_id, EventType.TASK_RESOLVED, node_id=node_id, task_id=task_id, decision=decided,
                  actor=principal.username, signoffs=_signoffs(rows))
@@ -469,13 +479,13 @@ async def close_reconcile(session: AsyncSession, action_id: str, principal: Any,
     return task.id
 
 
-async def _unclaim(task_id: str, assignment_id: str) -> None:
-    """恢复没成：运行已经结束的，待办随之关闭；还停着的，退回 pending，这一票撤回、可以再回复。"""
+async def _unclaim(task_id: str, assignment_id: str) -> bool:
+    """恢复没成：运行已经结束的，待办随之关闭；还停着的，退回 pending，这一票撤回、可以再回复。返回是不是关闭了。"""
     async with SessionLocal() as session:
         task = await session.get(Task, task_id)
         status = await session.scalar(select(Run.status).where(Run.id == task.run_id)) if task else None
         if task is None:
-            return
+            return True
         if status in _TERMINAL_RUN or status is None:
             task.status = "cancelled"
             task.resolved_at = utcnow()
@@ -488,8 +498,9 @@ async def _unclaim(task_id: str, assignment_id: str) -> None:
                                   .values(status="pending", response=None, responded_by=None, responded_at=None,
                                           verified=False))
         await session.commit()
-    logger.warning("待办 %s 判定后恢复运行没有成功，已%s", task_id,
-                   "随运行关闭" if status in _TERMINAL_RUN else "退回待处理")
+    closed = status in _TERMINAL_RUN or status is None
+    logger.warning("待办 %s 判定后恢复运行没有成功，已%s", task_id, "随运行关闭" if closed else "退回待处理")
+    return closed
 
 
 async def _settle(task_id: str) -> None:
@@ -675,6 +686,13 @@ async def _on_timeout(task_id: str, now: datetime) -> int:
                                                                                resolved_at=utcnow()))
             await session.commit()
         return 1
+    except Exception:  # noqa: BLE001 - 同 respond：别的错不能让待办卡在 resolving，退回待处理，下一拍再驳回
+        logger.exception("待办 %s 超时驳回时恢复运行出错，退回待处理，下一拍再试", task_id)
+        async with SessionLocal() as session:
+            await session.execute(update(Task).where(Task.id == task_id, Task.status == "resolving")
+                                  .values(status="pending", outcome=None))
+            await session.commit()
+        return 0
     await _settle(task_id)
     await record(run_id, EventType.TASK_RESOLVED, node_id=node_id, task_id=task_id, decision="expired_reject",
                  actor=None)

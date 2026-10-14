@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import artifact_store
 from app.core.events import EventType
 from app.data.catalog_impact import catalog_drift
-from app.apps.versions import is_published
+from app.apps.versions import is_published, subgraph_pin_problems
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import governance_note, unresolved_caliber_upgrades
 from app.engine.runner import run_manager
@@ -36,6 +36,8 @@ VERSION_RETIRED = "run_version_retired"
 VERSION_HASH_MISMATCH = "run_version_hash_mismatch"
 #: 发布之后这一版用到的能力的治理版本变了：只提醒、不拦（同数据目录漂移）
 CAPABILITY_DRIFT = "capability_drift"
+#: 正式运行里子工作流节点固定的版本没有发布过、已经退役（D-q）的机器码，和发布门禁、应用检查同一套：见 apps/versions.py
+#: 的 SUBGRAPH_UNPUBLISHED / SUBGRAPH_RETIRED 和 subgraph_pin_problems
 
 
 class LaunchRefused(Exception):
@@ -156,6 +158,8 @@ async def launch_run(
         errors, upgrade_events = await unresolved_caliber_upgrades(session, spec)
         if errors:
             raise LaunchRefused(409, "；".join(errors))
+        # 处置声明了，固定的那一版本身还得在用（D-q）：两条都拦，先说升版是沿用以前的提示顺序
+        await _refuse_unpublished_subgraphs(session, spec)
         # 数据目录和口径卡不同：目录是给人和助手看的说明，不是运行的输入。发布之后变了只提醒、不拦——
         # 拦下来等于让一次文字修订卡住正式出具
         catalog_changes = await catalog_drift(session, snapshot.catalog_versions)
@@ -411,6 +415,14 @@ async def missing_tools(session: AsyncSession, spec: GraphSpec) -> list[tuple[st
         elif name not in custom:
             missing.append((who, name, "tools"))
     return missing
+
+
+async def _refuse_unpublished_subgraphs(session: AsyncSession, spec: GraphSpec) -> None:
+    """正式运行里，每个固定了版本的子工作流节点，固定的那一版必须「已发布且未退役」（D-q）。规则在
+    apps/versions.subgraph_pin_problems，发布门禁按同一条拦；这里是发起这一刻的那一道（发布之后那一版才退役的）。"""
+    for problem in await subgraph_pin_problems(session, spec):
+        raise LaunchRefused(409, f"子工作流「{problem.title}」固定的{problem.reason}，不能发起正式运行。"
+                                 f"{problem.advice}，再发布这个工作流", problem.code)
 
 
 async def _refuse_missing_tools(session: AsyncSession, graph: dict[str, Any]) -> None:

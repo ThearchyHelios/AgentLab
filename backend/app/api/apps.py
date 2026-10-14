@@ -7,9 +7,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
-import secrets
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -115,11 +115,38 @@ async def _summary(session: AsyncSession, app: App, principal: Principal, role: 
             "updated_at": app.updated_at.isoformat() if app.updated_at else None}
 
 
-async def _detail(session: AsyncSession, app: App, principal: Principal, role: str | None) -> dict[str, Any]:
+def _published_outline(version: AppVersion | None) -> dict[str, Any] | None:
+    """当前发布版里使用面要的那一点：有哪些页面、哪些入口（名字和标题）。页面内容走页面解析，表单走页面的 forms。"""
+    if version is None:
+        return None
+    spec = version.spec or {}
+    return {"version": version.version,
+            "pages": [{"id": p.get("id"), "title": p.get("title") or ""} for p in spec.get("pages") or []
+                      if isinstance(p, dict) and p.get("id")],
+            "entries": [{"id": e.get("id"), "label": e.get("label") or ""} for e in spec.get("entries") or []
+                        if isinstance(e, dict) and e.get("id")]}
+
+
+async def _detail(session: AsyncSession, app: App, principal: Principal, role: str | None, *,
+                  with_backfill: bool = False) -> dict[str, Any]:
+    """应用详情。草稿和草稿里的岗位绑定只给 manage（D-m）：草稿是还没发布、没过检查的东西，岗位绑定是这个部署里具体
+    的人和组；use / observe 只拿概况和当前发布版的页面、入口目录（published）。
+
+    with_backfill：另给管理者列出能按新口径补算的视图、各会发起几次（D-f）。要逐期查封存，只在打开详情时算；保存草稿、
+    归档这些改动的回包里不算（编辑器存一次草稿就算一遍太浪费，补算只看发布版，草稿改了也不变）。"""
     from app.apps.spec import empty_spec
 
-    return {**await _summary(session, app, principal, role), "draft": app.draft or empty_spec(app.name),
-            "draft_bindings": {"slots": {}, **(app.draft_bindings or {})}, "created_by": app.created_by}
+    out = {**await _summary(session, app, principal, role),
+           "published": _published_outline(await _previous(session, app))}
+    if not at_least(role, "manage"):
+        return out
+    out.update(draft=app.draft or empty_spec(app.name), draft_bindings={"slots": {}, **(app.draft_bindings or {})},
+               created_by=app.created_by)
+    if with_backfill:
+        from app.apps.backfill import backfillable
+
+        out["backfill"] = await backfillable(session, app)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -191,7 +218,7 @@ async def get_app(app_id: str, session: AsyncSession = Depends(get_session),
                   x_actor: str | None = Header(default=None)) -> dict[str, Any]:
     principal = _principal(x_actor)
     app, role = await _app(session, app_id, principal, "use")
-    return await _detail(session, app, principal, role)
+    return await _detail(session, app, principal, role, with_backfill=True)
 
 
 class AppPatch(BaseModel):
@@ -251,6 +278,49 @@ async def archive_app(app_id: str, session: AsyncSession = Depends(get_session),
     await session.commit()
     await session.refresh(app)
     return await _detail(session, app, principal, role)
+
+
+#: (应用 id, 人) → 取或建助手对话的锁。只增不减：编辑器打开过的应用 × 人
+_ASSISTANT_LOCKS: dict[tuple[str, str | None], asyncio.Lock] = {}
+
+
+def _assistant_lock(app_id: str, who: str | None) -> asyncio.Lock:
+    return _ASSISTANT_LOCKS.setdefault((app_id, who), asyncio.Lock())
+
+
+@router.get("/{app_id}/assistant-conversation")
+async def assistant_conversation(app_id: str, session: AsyncSession = Depends(get_session),
+                                 x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """应用编辑器里助手的那段对话：没有就建（D-e）。kind=app、归这个应用、建立人是现在这个人——对话按人隔离，同一个应用
+    几个人轮流改，各自的历史不串。编辑器每轮落一条 turn（问题、说明、meta.looks），润色接口按 conversation_id 带历史。"""
+    from app.api.conversations import _detail
+    from app.db.models import Conversation, ConversationTurn
+
+    app, _ = await _app(session, app_id, _principal(x_actor), "manage")
+    who = actor_of(x_actor)
+    mine = Conversation.created_by == who if who else Conversation.created_by.is_(None)
+    lookup = (select(Conversation).where(Conversation.kind == "app", Conversation.app_id == app.id,
+                                         Conversation.archived.is_(False), mine)
+              .order_by(Conversation.last_active_at.desc()).limit(1))
+    # 取或建在进程里按 (应用, 人) 串行：编辑器开发模式下 effect 执行两次、同一个人开两个标签页，都会同时来取。库里没有
+    # 唯一约束，建完再查一遍：别处（另一个进程）抢先建了的，删掉刚建的这段（还没有轮次），用那一段——历史才不会被拆开
+    async with _assistant_lock(app.id, who):
+        row = await session.scalar(lookup)
+        if row is None:
+            row = Conversation(kind="app", app_id=app.id, created_by=who, title=f"「{app.name}」的助手")
+            session.add(row)
+            await session.flush()
+            other = await session.scalar(lookup.where(Conversation.id != row.id))
+            if other is not None:
+                await session.delete(row)
+                row = other
+            await session.commit()
+            await session.refresh(row)
+    turns = list((await session.execute(select(ConversationTurn).where(
+        ConversationTurn.conversation_id == row.id).order_by(ConversationTurn.seq))).scalars())
+    # 形状同 GET /api/conversations/{id}（ConversationDetail）：编辑器拿它渲染历史、接着落轮次
+    return {**_detail(row, turns).model_dump(mode="json"), "turn_count": len(turns),
+            "last_question": turns[-1].question if turns else ""}
 
 
 # --------------------------------------------------------------------------
@@ -420,111 +490,109 @@ async def put_grants(app_id: str, payload: GrantsIn, session: AsyncSession = Dep
 
 
 # --------------------------------------------------------------------------
-# 入站钩子的管理（收请求在 /api/hooks/{hook_id}，BE-2）
+# 入站钩子的管理（收请求在 /api/hooks/{hook_id}，process/hooks.py）
+#
+# 按名字认（D-g）：spec.hooks 声明 {name, kind, entry}，app_hooks 按 (应用, 名字) 一行，只存密钥和启用与否。钩子做
+# 什么以当前发布版的声明为准：改草稿不改正在用的钩子，发布版里没声明的拒收。密钥只在生成、轮换时交回一次
 # --------------------------------------------------------------------------
 
 
-def _hook_out(h: AppHook, secret: str | None = None) -> dict[str, Any]:
-    return {"id": h.id, "name": h.name, "kind": h.kind, "entry_id": h.entry_id, "enabled": h.enabled,
-            "created_at": h.created_at.isoformat() if h.created_at else None, **({"secret": secret} if secret else {})}
-
-
-class HookIn(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    kind: str
-    entry_id: str | None = None
-
-
 class HookPatch(BaseModel):
-    enabled: bool | None = None
-    entry_id: str | None = None
+    enabled: bool
+
+
+async def _hook_state(session: AsyncSession, app: App) -> tuple[dict[str, Any], dict[str, Any], dict[str, AppHook]]:
+    """(草稿里的声明, 当前发布版里的声明, 已有的行)，都按名字。"""
+    from app.process.hooks import declarations
+
+    version = await _previous(session, app)
+    rows: dict[str, AppHook] = {}
+    for row in (await session.execute(select(AppHook).where(AppHook.app_id == app.id)
+                                      .order_by(AppHook.created_at))).scalars():
+        rows.setdefault(row.name, row)
+    return declarations(app.draft or {}), declarations(version.spec if version is not None else {}), rows
+
+
+def _hook_item(name: str, draft: dict[str, Any], published: dict[str, Any], rows: dict[str, AppHook],
+               secret: str | None = None) -> dict[str, Any]:
+    from app.process.hooks import hook_out
+
+    return hook_out(rows.get(name), name=name, declared=draft.get(name) or published.get(name),
+                    in_draft=name in draft, in_published=name in published, secret=secret)
 
 
 @router.get("/{app_id}/hooks")
 async def list_hooks(app_id: str, session: AsyncSession = Depends(get_session),
                      x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """草稿里声明的 ∪ 已经有行的：每个名字一行，标出密钥生成过没有、当前发布版里有没有（没有的收不到请求）。"""
     app, _ = await _app(session, app_id, _principal(x_actor), "manage")
-    rows = (await session.execute(select(AppHook).where(AppHook.app_id == app.id).order_by(AppHook.created_at))).scalars()
-    return {"items": [_hook_out(h) for h in rows]}
+    draft, published, rows = await _hook_state(session, app)
+    names = list(dict.fromkeys([*draft, *published, *rows]))
+    return {"items": [_hook_item(n, draft, published, rows) for n in names]}
 
 
-@router.post("/{app_id}/hooks", status_code=201)
-async def create_hook(app_id: str, payload: HookIn, session: AsyncSession = Depends(get_session),
+@router.post("/{app_id}/hooks/{name}/rotate")
+async def rotate_hook(app_id: str, name: str, session: AsyncSession = Depends(get_session),
                       x_actor: str | None = Header(default=None)) -> dict[str, Any]:
-    """建一个入站钩子。签名密钥只在这里交回一次（库里存密文），之后要换就轮换。"""
+    """生成或轮换这个名字的签名密钥，密钥只在这里交回一次（库里存密文）。名字要在草稿或当前发布版里声明过。"""
     from app.apps.audit import record
-    from app.core.crypto import encrypt
+    from app.process import hooks
 
     app, _ = await _app(session, app_id, _principal(x_actor), "manage")
-    if payload.kind not in ("start", "signal"):
-        raise HTTPException(422, "钩子只能是发起实例或回传信号两种")
-    if payload.kind == "start" and not payload.entry_id:
-        raise HTTPException(422, "发起实例的钩子需要指定入口")
-    secret = secrets.token_urlsafe(32)
-    hook = AppHook(app_id=app.id, name=payload.name, kind=payload.kind, entry_id=payload.entry_id,
-                   secret=encrypt(secret) or "")
-    session.add(hook)
-    await session.flush()
-    await record(session, action="app.hook_create", subject_kind="app_hook", subject_id=hook.id,
-                 actor=actor_of(x_actor), data={"app_id": app.id, "name": hook.name, "kind": hook.kind,
-                                                "entry_id": hook.entry_id})
-    await session.commit()
-    await session.refresh(hook)
-    return _hook_out(hook, secret)
+    draft, published, rows = await _hook_state(session, app)
+    declared = draft.get(name) or published.get(name)
+    if declared is None:
+        raise HTTPException(404, f"草稿和当前发布版里都没有声明钩子「{name}」，请先在「钩子」一节里声明它")
+    # 从读行锁到提交：两位管理者同时点「生成密钥」，后到的那次读得到前一次插入的行，只轮换它（见 process/hooks.py）
+    async with hooks.hook_lock(app.id, name):
+        row, secret, created = await hooks.rotate_hook(session, app.id, name, kind=declared["kind"],
+                                                        entry=declared.get("entry"))
+        await record(session, action="app.hook_create" if created else "app.hook_rotate", subject_kind="app_hook",
+                     subject_id=row.id, actor=actor_of(x_actor),
+                     data={"app_id": app.id, "name": name, "kind": declared["kind"], "entry": declared.get("entry")})
+        await session.commit()
+    await session.refresh(row)
+    return _hook_item(name, draft, published, {**rows, name: row}, secret)
 
 
-async def _hook(session: AsyncSession, app: App, hook_id: str) -> AppHook:
-    hook = await session.get(AppHook, hook_id)
-    if hook is None or hook.app_id != app.id:
-        raise HTTPException(404, "钩子不存在")
-    return hook
+async def _hook_named(session: AsyncSession, app: App, name: str) -> AppHook:
+    from app.process.hooks import hook_row
+
+    row = await hook_row(session, app.id, name)
+    if row is None:
+        raise HTTPException(404, f"钩子「{name}」还没有生成密钥")
+    return row
 
 
-@router.patch("/{app_id}/hooks/{hook_id}")
-async def update_hook(app_id: str, hook_id: str, payload: HookPatch, session: AsyncSession = Depends(get_session),
+@router.patch("/{app_id}/hooks/{name}")
+async def update_hook(app_id: str, name: str, payload: HookPatch, session: AsyncSession = Depends(get_session),
                       x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """启用、停用。停用的钩子收到请求一律拒收，密钥留着，重新启用就能接着用。"""
     from app.apps.audit import record
+    from app.process.hooks import set_enabled
 
     app, _ = await _app(session, app_id, _principal(x_actor), "manage")
-    hook = await _hook(session, app, hook_id)
-    if payload.enabled is not None:
-        hook.enabled = payload.enabled
-    if payload.entry_id is not None:
-        hook.entry_id = payload.entry_id or None
-    await record(session, action="app.hook_update", subject_kind="app_hook", subject_id=hook.id,
-                 actor=actor_of(x_actor), data=payload.model_dump(exclude_none=True))
+    row = await _hook_named(session, app, name)
+    await set_enabled(session, app.id, name, payload.enabled)
+    await record(session, action="app.hook_update", subject_kind="app_hook", subject_id=row.id,
+                 actor=actor_of(x_actor), data={"app_id": app.id, "name": name, "enabled": payload.enabled})
     await session.commit()
-    await session.refresh(hook)
-    return _hook_out(hook)
+    draft, published, rows = await _hook_state(session, app)
+    return _hook_item(name, draft, published, rows)
 
 
-@router.post("/{app_id}/hooks/{hook_id}/rotate")
-async def rotate_hook(app_id: str, hook_id: str, session: AsyncSession = Depends(get_session),
-                      x_actor: str | None = Header(default=None)) -> dict[str, Any]:
-    from app.apps.audit import record
-    from app.core.crypto import encrypt
-
-    app, _ = await _app(session, app_id, _principal(x_actor), "manage")
-    hook = await _hook(session, app, hook_id)
-    secret = secrets.token_urlsafe(32)
-    hook.secret = encrypt(secret) or ""
-    await record(session, action="app.hook_rotate", subject_kind="app_hook", subject_id=hook.id,
-                 actor=actor_of(x_actor), data={"app_id": app.id})
-    await session.commit()
-    await session.refresh(hook)
-    return _hook_out(hook, secret)
-
-
-@router.delete("/{app_id}/hooks/{hook_id}", status_code=204)
-async def delete_hook(app_id: str, hook_id: str, session: AsyncSession = Depends(get_session),
+@router.delete("/{app_id}/hooks/{name}", status_code=204)
+async def delete_hook(app_id: str, name: str, session: AsyncSession = Depends(get_session),
                       x_actor: str | None = Header(default=None)) -> None:
+    """删掉这个名字的密钥和去重记录。声明留在草稿里（要去掉在编辑器里删）；再生成就是一把新密钥、一个新地址。"""
     from app.apps.audit import record
+    from app.process import hooks
 
     app, _ = await _app(session, app_id, _principal(x_actor), "manage")
-    hook = await _hook(session, app, hook_id)
-    await record(session, action="app.hook_delete", subject_kind="app_hook", subject_id=hook.id,
-                 actor=actor_of(x_actor), data={"app_id": app.id, "name": hook.name})
-    await session.delete(hook)
+    row = await _hook_named(session, app, name)
+    await record(session, action="app.hook_delete", subject_kind="app_hook", subject_id=row.id,
+                 actor=actor_of(x_actor), data={"app_id": app.id, "name": name})
+    await hooks.delete_hook(session, app.id, name)
     await session.commit()
 
 
@@ -670,3 +738,44 @@ async def refresh_view(app_id: str, view_id: str, payload: RefreshIn, session: A
     except (ViewRefused, LaunchRefused) as e:
         raise _view_refused(e) from e
     return {"run_id": run.id, "cached": cached}
+
+
+# --------------------------------------------------------------------------
+# 按新口径补算（D-f）
+# --------------------------------------------------------------------------
+
+
+@router.get("/{app_id}/views/{view_id}/backfill")
+async def backfill_plan(app_id: str, view_id: str, session: AsyncSession = Depends(get_session),
+                        x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """补算会发起几次、跳过几次（不发起运行）：按钮上写明会发起几次运行用。"""
+    from app.apps.backfill import BackfillRefused, plan
+
+    app, _ = await _app(session, app_id, _principal(x_actor), "manage")
+    version = await _current_version(session, app)
+    try:
+        return (await plan(session, app, version, view_id)).out()
+    except BackfillRefused as e:
+        raise _view_refused(e) from e
+
+
+@router.post("/{app_id}/views/{view_id}/backfill")
+async def backfill(app_id: str, view_id: str, session: AsyncSession = Depends(get_session),
+                   x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """按新口径补算：这个视图的钉住项最近一次升版选了 recompute 时，取旧版本在同一来源上最近几期的输入，用新版本逐个
+    发起正式运行（来源 app_backfill）；新版本已经算过同一个输入的跳过。返回发起了几次、跳过几次。"""
+    from app.apps.backfill import BackfillRefused, run_backfill
+    from app.apps.resolve import clear_cache
+    from app.engine.launch import LaunchRefused
+
+    principal = _principal(x_actor)
+    app, _ = await _app(session, app_id, principal, "manage")
+    version = await _current_version(session, app)
+    try:
+        out = await run_backfill(session, app, version, view_id, principal=principal, actor=actor_of(x_actor))
+    except BackfillRefused as e:
+        raise _view_refused(e) from e
+    except LaunchRefused as e:
+        raise _view_refused(e) from e
+    clear_cache()
+    return out

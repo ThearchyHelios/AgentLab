@@ -74,7 +74,7 @@ def _scope_note(rows: list[Any], scoped: bool) -> str:
             "db_schema__ 工具；前几轮用过别的库，这一轮也不要沿用")
 
 
-def _tool_catalog(rows: list[Any]) -> str:
+def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None) -> str:
     """给助手看的工具清单。
 
     all_specs() 只有静态注册的内置工具，数据源工具是运行时按库动态生成的
@@ -82,10 +82,13 @@ def _tool_catalog(rows: list[Any]) -> str:
     自己写 SQL 的代码节点——接了数据库等于白接。
 
     不列表名（look 文档 D3）：以前每个库列前 12 个表名，和这一轮要做什么无关，闲聊也带着；表数写一句，字段要用时 look。
+
+    builtins 给了的话内置工具只列这几个：使用者的问数据（_CHAT_USER_PROMPT）只能用只读的那几个，列出来用不了的工具，
+    模型照样会绑。
     """
     lines = [
         f"- {name}（{spec.category}）：{spec.description}"
-        for name, spec in sorted(all_specs().items())
+        for name, spec in sorted(all_specs().items()) if builtins is None or name in builtins
     ]
 
     from app.data import introspect as _introspect
@@ -429,6 +432,14 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
     return f"请设计一个工作流：{payload.instruction}"
 
 
+async def _ensure_conversation_access(session: AsyncSession, conversation_id: str | None) -> Any | None:
+    """请求带的 conversation_id 这个人能不能用（对话按人隔离，D-d）：规则只有 api/deps.ensure_conversation_access 一处。
+    能用交回对话；没给、不存在交回 None（当没有历史）；不能用 403——别人的问答不能经「历史」拼进这一轮的提示。"""
+    from app.api.deps import ensure_conversation_access
+
+    return await ensure_conversation_access(session, conversation_id)
+
+
 async def _previous_graph(
     session: AsyncSession, conversation_id: str | None
 ) -> dict[str, Any] | None:
@@ -741,22 +752,65 @@ GRAPH_SCHEMA: dict[str, Any] = {
 }
 
 
-def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, looks: Any) -> str:
+def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, looks: Any, *,
+                  chat_user: bool = False) -> str:
     """画布、问数据（流式和非流式）共用的 system：节点手册、工具清单、数据源概览、结构要求、输出协议、查看的用法。
-    这一份一直用到自查修正结束（接着写、修正轮都不换），模型前后看到的是同一套说法。"""
+    这一份一直用到自查修正结束（接着写、修正轮都不换），模型前后看到的是同一套说法。
+
+    chat_user：开登录后 user 角色的问数据（D-c）。内置工具只列只读的那几个，结构要求后面再加一段使用者的约束。"""
+    from app.auth.chat_policy import CHAT_BUILTIN_TOOLS
+
     return (
         "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources)}"
+        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, builtins=CHAT_BUILTIN_TOOLS if chat_user else None)}"
         f"{datasources}{_scope_note(sources, scope is not None)}\n\n"
         "结构要求：\n"
         "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
         "2. 节点 id 用简短英文小写下划线；label 用中文，一眼看懂\n"
         "3. 用 assign_to 传结果，下游 {{ vars.变量名 }} 引用\n"
         "4. 只能用上面列出的工具名\n"
-        "5. 能用 3 个节点解决就别堆 8 个\n\n"
+        "5. 能用 3 个节点解决就别堆 8 个"
+        f"{_CHAT_USER_PROMPT if chat_user else ''}\n\n"
         f"{_STREAM_PROTOCOL}"
         + (f"\n\n{looks.guide()}\n{copilot_context.LOOK_WHEN_PROMPT}" if looks.kinds else "")
     )
+
+
+def _chat_user_kinds() -> str:
+    from app.auth.chat_policy import CHAT_NODE_TYPES
+
+    return "、".join(sorted(CHAT_NODE_TYPES - {"merge"}))
+
+
+#: 开登录后 user 角色在问数据里生成的图（D-c）要守的约束，接在结构要求后面（_graph_system 的 chat_user）。发起时按
+#: app/auth/chat_policy.py 收窄，节点手册里取数的标准写法（tool 节点查库、merge 按键合并）搭出来的图发起时一律被拒，所以先
+#: 说给模型听。规则本身只在 chat_policy 一处：节点类型从那里取，自查也按它判（_chat_user_issues），这里只是把它讲成模型
+#: 照着搭得出来的写法
+_CHAT_USER_PROMPT = (
+    "\n\n这位用户是「使用者」：这张图以他的身份运行，只能读数据、整理、撰写。下面几条优先于上面节点手册和搭图规则里的"
+    "写法：\n"
+    f"1. 节点只用 {_chat_user_kinds()}。不要用 tool、code、merge、supervisor、subgraph、loop、human、memory、validate 等"
+    "其他节点（merge 的输入只能是 tool 节点，所以同样用不了）\n"
+    "2. 取数只用 agent：tools 里绑定 db_query__<数据源> 和 db_schema__<数据源>。数字要进口径卡、报告时，给这个 agent 配 "
+    "output_schema 和 cite_fields: true，口径卡取 vars.<agent 的 assign_to>.字段。数据在两个库时，让一个 agent 绑两个库的"
+    "查询工具，各自聚合后在 output_schema 里一起交回\n"
+    "3. 查询一律只读，不要写改数据的 SQL\n"
+    "4. 任何节点、图级 defaults 里都不要写 memory_scope、collection：记忆范围和知识库由平台定"
+)
+
+
+def _chat_user_issues(nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """这张图使用者在问数据里能不能发起（app/auth/chat_policy.py，和 POST /api/runs 同一个判断）：不能的话是一条挡运行的
+    问题，交回模型按 _CHAT_USER_PROMPT 改；改不好照实列在交付的问题里，不自动运行。"""
+    from app.auth.chat_policy import chat_graph_problem
+
+    problem = chat_graph_problem({"nodes": list(nodes.values()), "edges": edges})
+    if not problem:
+        return []
+    return [{"level": "error", "node_id": None, "edge_id": None, "field": None, "code": "chat.not_allowed",
+             "message": problem,
+             "for_model": f"{problem}。按 system 里「使用者」那一段的约束改：取数改成 agent 绑定数据源查询工具，"
+                          "去掉不允许的节点、工具和记忆范围 / 知识库配置"}]
 
 
 def _graph_request(payload: GenerateIn) -> str:
@@ -791,6 +845,7 @@ async def generate(
     """
     from app.data.sqlcheck import load_checkers
 
+    await _ensure_conversation_access(session, payload.conversation_id)
     sources = await _sources(session, payload.datasource_ids)
     scope = {r.name for r in sources} if payload.datasource_ids else None
     # 先拿模型：没配好就直接 400，不白读一遍目录
@@ -1020,9 +1075,11 @@ def _blocking_issues(
     nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], scope: set[str] | None = None,
     *, sources: list[Any] | None = None, baseline: list[dict[str, Any]] | None = None,
     level: str | None = None, defaults: dict[str, Any] | None = None,
-    checkers: dict[str, Any] | None = None,
+    checkers: dict[str, Any] | None = None, chat_user: bool = False,
 ) -> list[dict[str, Any]] | None:
     """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
+
+    chat_user：图要以开登录后 user 角色的身份在问数据里发起（D-c），使用者不能用的节点、工具、配置也挡（_chat_user_issues）。
 
     限定了数据源时，用了范围外的库也算：用户点了「只查这个库」，拿别的库的数
     回答他，比跑不起来更糟——答案看起来是对的。
@@ -1051,7 +1108,8 @@ def _blocking_issues(
     authored = authored_issues(spec, sources or [], baseline, checkers=None if level else checkers)
     out = ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope")
-           + [i for i in authored if i["level"] == "error"])
+           + [i for i in authored if i["level"] == "error"]
+           + (_chat_user_issues(nodes, edges) if chat_user else []))
     if level:
         from app.engine.governance import lint_for_publish
 
@@ -1630,6 +1688,12 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
 
     from app.data.sqlcheck import load_checkers
 
+    from app.api.deps import restricted
+
+    # 带了对话的，先核对这个人能不能用它（D-d）：历史、上一轮的图都从它来
+    await _ensure_conversation_access(session, payload.conversation_id)
+    # 开登录后的 user 角色（D-c）：图只能用 chat_policy 放行的节点和工具，提示词先说、自查按同一个判断挡
+    chat_user = restricted()
     sources = await _sources(session, payload.datasource_ids)
     scope = {r.name for r in sources} if payload.datasource_ids else None
     # 基于数据目录的 SQL 检查器：在开流之前读好目录（流里不再碰这个会话），自查和收尾共用
@@ -1653,11 +1717,12 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
     looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
         payload.base_graph or {}).get("nodes") else prev_graph)
     # 这一份 system 一直用到最后：接着写、自查修正都沿用，不换
-    system = _graph_system(sources, scope, await copilot_context.section(looks), looks)
+    system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user)
     applier = GraphApplier(nodes, edges)
     started = time.monotonic()
     gen = Generation(model, system=system, applier=applier, looks=looks, started=started,
-                     checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers))
+                     checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers,
+                                          chat_user=chat_user))
 
     async def event_stream():
         yield _sse({"op": "model", "model": model_id})
@@ -1712,7 +1777,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
         async for op in _with_heartbeat(gen.repair(), phase="repairing"):
             yield _sse(op)
-        remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers)
+        remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers,
+                                     chat_user=chat_user)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
@@ -1743,6 +1809,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             authored = authored_issues(spec, sources, baseline, checkers=checkers)
             issues += [{**i, "level": "warning"} for i in authored if i["code"] == "sql_unknown_column"]
             issues += [i for i in authored if i["code"] in CHECK_CODES]
+            # 使用者发起不了的图（D-c）：自查没改好的照实列出，界面据此不运行、说清原因
+            issues += _chat_user_issues(nodes, edges) if chat_user else []
             # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
             # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [
@@ -2201,7 +2269,8 @@ APP_SYSTEM_PROMPT = """\
   文字组件里不要写数字，也不要拼算式——数字只来自绑定，界面层不做任何计算
 - 可见性表达式（visible）只能用 run、input、metric、instance、task、user、view 这几个根名字，只能比较、取值、in 和
   and / or / not，不能写算术
-- 不改钉住的版本（pins），不改入口表单的数据约束（类型、必填、枚举、取值范围），只改外观
+- 只改呈现：不改钉住的版本（pins）、入口（entries）、视图（views）、岗位（slots），不改表单的数据约束（字段、类型、
+  必填、枚举、取值范围）；表单只改已有表单的 title、description、x-order、x-widget、x-enum-labels。越界的操作不会被采纳
 - 岗位（slots）绑定到哪些人或组只能由人来做：岗位留着，不要替人绑定；done 的说明里提醒还有哪些岗位等着绑定
 - 能按常理定的直接改，必须由用户拿主意的才 ask"""
 
@@ -2215,7 +2284,7 @@ APP_PROTOCOL_PROMPT = """\
   {"op":"app_remove","id":"组件 id"}
   {"op":"app_move","id":"组件 id","parent":"组件 id 或页面 id","index":0}
   {"op":"app_page","page":{"id":"…","title":"…"}}          ← 新增页面，或改已有页面的标题
-  {"op":"app_set","path":"entries|views|forms|slots|task_ui","key":"…","value":{}}
+  {"op":"app_set","path":"forms|task_ui","key":"…","value":{}}   ← forms：已有表单的整份新写法，只改外观键；task_ui：按人工节点改待办外观
   {"op":"done","explanation":"两三句话说明改了什么，还有哪些岗位等着绑定"}    ← 最后一行
 - 组件 id 用简短英文小写下划线，同一个应用里不重复；已有的组件用 app_update 改，不要删了重建
 - 这句话不需要改应用（只是问个问题）时，第一行也是最后一行输出 {"op":"reply","text":"直接回答的内容"}
@@ -2278,6 +2347,18 @@ async def _derived_drafts(session: AsyncSession, pins: list[dict[str, Any]]) -> 
     return APP_DERIVED_PROMPT.format(drafts="\n".join(drafts)) if drafts else ""
 
 
+async def _require_app_manage(session: AsyncSession, app: Any) -> None:
+    """应用润色要这个应用的「管理」权限（同编辑草稿，§3.12）：搭建者不是创建者、也没有管理授权的，只能看不能改。"""
+    from app.api.deps import current_principal
+    from app.apps.access import app_role, at_least
+
+    role = await app_role(session, current_principal(), app)
+    if role is None:
+        raise HTTPException(404, "应用不存在，可能已被删除")
+    if not at_least(role, "manage"):
+        raise HTTPException(403, "需要这个应用的「管理」权限")
+
+
 @router.post("/app-stream")
 async def app_stream(payload: AppStreamIn, session: AsyncSession = Depends(get_session)):
     """应用润色：SSE 推送，形状同 /generate-stream。
@@ -2299,6 +2380,12 @@ async def app_stream(payload: AppStreamIn, session: AsyncSession = Depends(get_s
     row = await session.get(App, payload.app_id) if payload.app_id else None
     if payload.app_id and row is None:
         raise HTTPException(404, "应用不存在，可能已被删除")
+    if row is not None:
+        await _require_app_manage(session, row)
+    conversation = await _ensure_conversation_access(session, payload.conversation_id)
+    if conversation is not None and (conversation.kind != "app" or row is None or conversation.app_id != row.id):
+        # 应用助手的历史只取这个应用自己的那段对话：拿问数据、画布、别的应用的对话来拼，模型看到的「上一轮」是别处的事
+        raise HTTPException(409, "这段对话不是这个应用的助手对话，请从应用编辑器里重新打开助手")
     spec = copy.deepcopy(payload.spec if payload.spec is not None else (row.draft if row is not None else None))
     if not spec:
         raise HTTPException(400, "没有可润色的应用草稿。请先从工作流版本生成草稿，再请助手润色")
@@ -2352,7 +2439,8 @@ async def app_stream(payload: AppStreamIn, session: AsyncSession = Depends(get_s
             remaining = await checker.issues()
             yield _sse({"op": "check", "status": "failed" if remaining else "passed", "repaired": gen.repaired,
                         **({"issues": remaining} if remaining else {})})
-            yield _sse({"op": "final", "spec": applier.spec, "issues": await checker.lint(),
+            # 越界被拒的操作照实列给人看（警告级），排在应用检查的问题前面
+            yield _sse({"op": "final", "spec": applier.spec, "issues": [*applier.refusals(), *await checker.lint()],
                         "explanation": applier.explanation})
         except CopilotIncomplete as e:
             yield _sse({"op": "error", "message": f"助手本轮未完成：{e}", "hint": e.hint, "detail": e.detail})
@@ -2394,6 +2482,8 @@ async def extract_template(
     from app.db.models import Run, RunEvent, Workflow, WorkflowVersion
     from app.core.artifact_store import graph_hash
 
+    # 对话只是记进来源：不能用的不让记（D-d），不存在的照旧记下 id
+    await _ensure_conversation_access(session, payload.conversation_id)
     run = await session.get(Run, payload.run_id)
     if not run:
         raise HTTPException(404, "运行记录不存在，可能已被删除")

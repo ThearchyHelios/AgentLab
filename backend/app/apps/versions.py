@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import and_, or_, select
@@ -73,6 +74,63 @@ async def latest_published(session: AsyncSession, workflow_id: str) -> Any | Non
 async def version_row(session: AsyncSession, workflow_id: str, version: int) -> Any | None:
     return (await session.execute(select(WorkflowVersion).where(
         WorkflowVersion.workflow_id == workflow_id, WorkflowVersion.version == version))).scalar_one_or_none()
+
+
+# --------------------------------------------------------------------------
+# 子工作流固定的版本（D-q）
+# --------------------------------------------------------------------------
+
+#: 子工作流节点固定的版本不能用的机器码。发起正式运行（engine/launch.py）、发布工作流与发布前检查（engine/lint_process.py
+#: 的 lint_subgraph_pins）、应用检查（apps/lint.py）都按 subgraph_pin_problems 判，机器码相同
+SUBGRAPH_UNPUBLISHED = "subgraph_version_unpublished"
+SUBGRAPH_RETIRED = "subgraph_version_retired"
+
+
+@dataclass(frozen=True)
+class SubgraphPinProblem:
+    node_id: str
+    #: 子工作流节点的标题
+    title: str
+    code: str
+    #: 节点固定的是哪个工作流的哪一版：门禁拿读好的结果去查另一张图（自动修复后的预览）时，按它核对节点没改过
+    workflow_id: str
+    version: int
+    #: 说到「「月报」v3 没有发布过」为止；前后半句（不能发起正式运行 / 正式运行发起时会被拒绝）由调用方接
+    reason: str
+    #: 怎么改
+    advice: str
+
+
+async def subgraph_pin_problems(session: AsyncSession, spec: Any) -> list[SubgraphPinProblem]:
+    """图里每个固定了版本的子工作流节点，固定的那一版必须「已发布且未退役」（is_published）；不是的逐个交回。
+
+    子工作流固定版本就是方法卡的机制：外层发布时认可的是「用它的 vN」。vN 只是一张保存出来的草稿快照、或者已经退役，
+    正式运行照样执行它，就等于绕过了发布门禁、绕过了退役。发起时拦（launch.py），发布时也按同一条拦——不然钉在草稿上的
+    工作流照样发得出去，之后每一次正式运行（定时任务、应用入口、按需视图、补算）都在发起时才被拒。
+    没固定版本的子工作流跟随最新，那是受管级门禁管的事（governed.subgraph_unpinned），这里不管。"""
+    from app.engine.schema import NodeType
+
+    out: list[SubgraphPinProblem] = []
+    for node in spec.nodes:
+        if node.type != NodeType.SUBGRAPH:
+            continue
+        wid, pinned = node.config.get("workflow_id"), node.config.get("workflow_version")
+        if not wid or not str(pinned or "").isdigit():
+            continue
+        version = int(pinned)
+        workflow = await session.get(Workflow, str(wid))
+        row = await version_row(session, str(wid), version) if workflow is not None else None
+        if workflow is None or row is None:
+            out.append(SubgraphPinProblem(node.id, node.title, SUBGRAPH_UNPUBLISHED, str(wid), version,
+                                          f"工作流版本 v{version} 不存在", "请在节点中重新选择版本"))
+        elif row.retired_at is not None:
+            out.append(SubgraphPinProblem(node.id, node.title, SUBGRAPH_RETIRED, str(wid), version,
+                                          f"「{workflow.name}」v{version} 已退役", "请把节点改为固定一个在用的发布版本"))
+        elif not is_published(row, current=workflow.published_version):
+            out.append(SubgraphPinProblem(node.id, node.title, SUBGRAPH_UNPUBLISHED, str(wid), version,
+                                          f"「{workflow.name}」v{version} 没有发布过",
+                                          "请先发布那个工作流，或把节点改为固定一个已发布的版本"))
+    return out
 
 
 # --------------------------------------------------------------------------

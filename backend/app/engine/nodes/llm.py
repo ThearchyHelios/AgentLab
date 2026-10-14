@@ -48,7 +48,7 @@ from app.providers.factory import (
     get_chat_model,
 )
 from app.engine.sql_problems import event_checks
-from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_versions
+from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_reads_only, run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolBuildError,
@@ -337,6 +337,7 @@ async def _resolve_tools(ctx: NodeContext, state: GraphState) -> list[BaseTool]:
         collection=ctx.cfg("collection") or ctx.run.collection,
         data_versions=run_versions(ctx.run),
         mask_results=run_masks_results(ctx.run),
+        force_readonly=run_reads_only(ctx.run),
         # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
         emit=ctx.emit,
     )

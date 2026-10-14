@@ -27,6 +27,12 @@ from app.apps.tree import components
 OPS = ("app_add", "app_update", "app_remove", "app_move", "app_page", "app_set")
 _SET_PATHS = ("entries", "views", "forms", "slots", "task_ui")
 
+#: 助手润色能用的操作（D-h）：只改呈现。app_set 另外只放行 task_ui，和 forms 里只动外观键的改动（polish_problem）
+POLISH_OPS = ("app_add", "app_update", "app_remove", "app_move", "app_page")
+#: 表单里的外观键：顶层和每个字段上都只能改这几个，别的（type、required、enum、取值范围、format……）是数据约束
+FORM_LOOK_KEYS = frozenset({"title", "description", "x-order", "x-widget", "x-enum-labels"})
+_SET_LABEL = {"entries": "入口", "views": "视图", "slots": "岗位", "pins": "固定的版本"}
+
 
 def _refuse(problem: str) -> Applied:
     return Applied(False, False, problem)
@@ -248,3 +254,52 @@ def _first(e: ValidationError) -> str:
     err = e.errors()[0] if e.errors() else {}
     where = ".".join(str(x) for x in err.get("loc") or ())
     return f"{where} {err.get('msg', '')}".strip()
+
+
+# --------------------------------------------------------------------------
+# 助手润色的边界（D-h）
+# --------------------------------------------------------------------------
+
+
+def polish_problem(spec: dict[str, Any], op: dict[str, Any]) -> str | None:
+    """助手润色时这个操作有没有越界：越界返回交回模型的一句话，没越界返回 None。
+
+    润色只改呈现（布局、文案、控件，A8 第 2 条）。钉住的版本、入口、视图、岗位决定的是这个应用发起什么、读哪次运行、
+    派给谁，表单的数据约束决定收什么值——这些要人在编辑器里改、发布时过检查，助手改了会悄悄换掉应用的承诺。
+    编辑器自己调 apply_app_op 不受这一层限制。"""
+    kind = op.get("op") if isinstance(op, dict) else None
+    if kind != "app_set":
+        return None
+    path, key = op.get("path"), op.get("key")
+    if path == "task_ui":
+        return None
+    if path == "forms":
+        return _form_look_problem(spec, key, op.get("value"))
+    what = _SET_LABEL.get(str(path), str(path))
+    return (f"润色只改呈现，不能改{what}：{what}决定应用发起什么、读哪次运行、派给谁，要由人在编辑器里改。"
+            "请只用组件操作、待办外观（task_ui）和表单的外观键")
+
+
+def _looks_stripped(form: Any) -> Any:
+    """去掉外观键之后的表单：两份表单去掉外观键后一样，就只差在外观上。"""
+    if not isinstance(form, dict):
+        return form
+    out = {k: v for k, v in form.items() if k not in FORM_LOOK_KEYS}
+    props = form.get("properties")
+    if isinstance(props, dict):
+        out["properties"] = {name: ({k: v for k, v in field.items() if k not in FORM_LOOK_KEYS}
+                                    if isinstance(field, dict) else field) for name, field in props.items()}
+    return out
+
+
+def _form_look_problem(spec: dict[str, Any], key: Any, value: Any) -> str | None:
+    forms = spec.get("forms") if isinstance(spec.get("forms"), dict) else {}
+    if not isinstance(key, str) or key not in forms:
+        return f"润色不能新增表单「{key}」：表单决定入口收什么值，要由人在编辑器里加"
+    if value is None:
+        return f"润色不能删掉表单「{key}」"
+    if _looks_stripped(forms[key]) != _looks_stripped(value):
+        return (f"表单「{key}」只能改外观（{'、'.join(sorted(FORM_LOOK_KEYS))}），不能改字段、类型、必填、可选值、"
+                "取值范围这些数据约束")
+    return None
+

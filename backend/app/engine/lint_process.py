@@ -9,6 +9,10 @@
 
 子工作流里有没有人工节点要读库才知道，门禁本身不查库：调用方先用 load_subgraphs 读好、with_subgraphs 放进来，
 和 SQL 检查器、模型接入表同一个做法。没放进来时这一条不查。
+
+子工作流固定的版本是不是「已发布且未退役」（D-q）也要读库，随 load_subgraphs 一起读好（Subgraphs.pin_problems），由
+lint_subgraph_pins 报：这一条各级都是错误——正式运行发起时按同一条规则拒（engine/launch.py），发布时放过去只会让之后的
+每一次正式运行都在发起时才失败。
 """
 from __future__ import annotations
 
@@ -134,13 +138,25 @@ def human_issues(node: GraphNode) -> list[tuple[str, str, str]]:
 _SUBGRAPHS: ContextVar[Mapping[tuple[str, int | None], GraphSpec] | None] = ContextVar("process_subgraphs", default=None)
 
 
-async def load_subgraphs(session: Any, spec: GraphSpec) -> dict[tuple[str, int | None], GraphSpec]:
-    """读出图里子工作流节点引用的图（固定了版本的读那一版，没固定的读工作流现在的图）。读不到、不成形的跳过。"""
+class Subgraphs(dict):
+    """load_subgraphs 读好的东西：(工作流 id, 固定的版本，没固定为 None) → GraphSpec；pin_problems 另记固定的版本不是
+    「已发布且未退役」的子工作流节点（apps/versions.subgraph_pin_problems）。with_subgraphs 两样一起放进门禁。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pin_problems: list[Any] = []
+
+
+async def load_subgraphs(session: Any, spec: GraphSpec) -> Subgraphs:
+    """读出图里子工作流节点引用的图（固定了版本的读那一版，没固定的读工作流现在的图）。读不到、不成形的跳过。
+    固定的版本能不能用也一并读好（Subgraphs.pin_problems）。"""
     from sqlalchemy import select
 
+    from app.apps.versions import subgraph_pin_problems
     from app.db.models import Workflow, WorkflowVersion
 
-    out: dict[tuple[str, int | None], GraphSpec] = {}
+    out = Subgraphs()
+    out.pin_problems = await subgraph_pin_problems(session, spec)
     for node in spec.nodes:
         if node.type != NodeType.SUBGRAPH:
             continue
@@ -245,11 +261,27 @@ def lint_process(spec: GraphSpec, flag: Callable[..., None], *, level: str, stri
                  code="process.code_network", node_id=node.id, field="network")
 
 
+def lint_subgraph_pins(spec: GraphSpec, flag: Callable[..., None], *, level: str, strict: bool) -> None:
+    """子工作流固定的版本不是「已发布且未退役」的（D-q）：各级都报错（always），机器码和发起时拒绝的一样。
+    load_subgraphs 没读好、没放进来时不查（门禁本身不查库）。"""
+    graphs = _SUBGRAPHS.get()
+    nodes = spec.node_map()
+    for problem in getattr(graphs, "pin_problems", None) or []:
+        node = nodes.get(problem.node_id)
+        # 读好的结果对的是读的那张图；拿去查改过的图（自动修复的预览）时，节点改了固定的版本就不再算它
+        if node is None or str(node.config.get("workflow_id") or "") != problem.workflow_id \
+                or str(node.config.get("workflow_version") or "") != str(problem.version):
+            continue
+        flag(f"子工作流「{problem.title}」固定的{problem.reason}：正式运行发起时会被拒绝。{problem.advice}",
+             code=problem.code, node_id=problem.node_id, field="workflow_version", always=True)
+
+
 def _register() -> None:
     from app.engine.governance import EXTRA_LINTS
 
-    if lint_process not in EXTRA_LINTS:
-        EXTRA_LINTS.append(lint_process)
+    for check in (lint_process, lint_subgraph_pins):
+        if check not in EXTRA_LINTS:
+            EXTRA_LINTS.append(check)
 
 
 _register()

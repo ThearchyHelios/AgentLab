@@ -280,12 +280,13 @@ async def test_sent_then_restart_becomes_unknown(capabilities, monkeypatch):
     [rec] = await _records(run_id)
     assert rec.state == "sent"
     await run_manager.setup()
-    assert await actions.startup() == 1
+    # 启动整理按全库数：同一个测试进程里别的测试留下的结果未知（还没核实）也在里面，这里只看这一次运行的那条
+    assert await actions.startup() >= 1
     [rec] = await _records(run_id)
     assert rec.state == "unknown"
     await _task(run_id, "reconcile")
     assert len(await _events(run_id, "action.unknown")) == 1
-    assert await actions.startup() == 1 and len(await _events(run_id, "action.unknown")) == 1   # 不重复安排
+    assert await actions.startup() >= 1 and len(await _events(run_id, "action.unknown")) == 1   # 不重复安排
 
 
 async def test_continue_api_refuses_while_unresolved(erp, capabilities):

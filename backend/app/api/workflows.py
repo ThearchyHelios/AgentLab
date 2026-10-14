@@ -15,6 +15,7 @@ from app.data.catalog_impact import catalog_drift, catalog_versions_for, recorde
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import publish_issues
+from app.engine.lint_process import load_subgraphs, with_subgraphs
 from app.engine.provider_refs import CODES as PROVIDER_CODES, load_issues, load_providers, quiet_unset_model
 from app.engine.schema import GraphSpec, NodeType, validate_graph
 
@@ -192,13 +193,24 @@ async def delete_workflow(
 
 
 async def _delete_blockers(session: AsyncSession, workflow_id: str) -> list[str]:
-    from app.apps.versions import effect_count, pinning_apps, published_versions
+    """拒绝删除的原因：应用固定着；某个版本有生效记录（演练不算）。
+
+    生效记录按全部版本数，不只看在用的发布版：退役只是不再接受新的运行，退役之前写进外部系统的那些事照样发生过，
+    版本删掉了，生效记录就对不上它当时的承诺（D-n）。"""
+    from app.apps.versions import pinning_apps
+    from app.db.models import ActionRecord
 
     reasons = [f"应用「{a['name']}」v{a['app_version']} 固定了 v{a['version']}"
                for a in await pinning_apps(session, workflow_id)]
-    for row in await published_versions(session, workflow_id):
-        if count := await effect_count(session, workflow_id, row.version):
-            reasons.append(f"v{row.version} 有 {count} 条生效记录")
+    rows = (await session.execute(
+        select(ActionRecord.workflow_version, func.count(ActionRecord.id))
+        .where(ActionRecord.workflow_id == workflow_id, ActionRecord.state != "simulated")
+        .group_by(ActionRecord.workflow_version).order_by(ActionRecord.workflow_version))).all()
+    retired = set((await session.execute(select(WorkflowVersion.version).where(
+        WorkflowVersion.workflow_id == workflow_id, WorkflowVersion.retired_at.is_not(None)))).scalars())
+    for version, count in rows:
+        which = f"v{version}" if version is not None else "未记版本的运行"
+        reasons.append(f"{which}{'（已退役）' if version in retired else ''} 有 {count} 条生效记录")
     return reasons
 
 
@@ -424,8 +436,10 @@ async def publish_workflow(
         return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
 
     checkers = await _sql_checkers(session, spec)
-    issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers,
-                                                     providers=await _providers(session, spec))]
+    providers = await _providers(session, spec)
+    with with_subgraphs(await load_subgraphs(session, spec)):
+        issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers,
+                                                         providers=providers)]
     if any(i["level"] == "error" for i in issues):
         return {"ok": False, "level": payload.level, "version": version, "issues": issues}
 
@@ -553,8 +567,11 @@ async def publish_check(
     except Exception as e:  # noqa: BLE001
         return _unreadable(payload.level, e)
     versions, cards = await _gate_context(session, spec)
-    return check(spec, level=payload.level, versions=versions, cards=cards, checkers=await _sql_checkers(session, spec),
-                 providers=await _providers(session, spec))
+    checkers = await _sql_checkers(session, spec)
+    providers = await _providers(session, spec)
+    with with_subgraphs(await load_subgraphs(session, spec)):
+        return check(spec, level=payload.level, versions=versions, cards=cards, checkers=checkers,
+                     providers=providers)
 
 
 @router.post("/{workflow_id}/autofix")
@@ -580,8 +597,11 @@ async def autofix(
     versions, cards = await _gate_context(session, spec)
     checkers = await _sql_checkers(session, spec)
     providers = await _providers(session, spec)
-    out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards,
-                      checkers=checkers, providers=providers)
+    # 和发布、发布前检查同一套口径：子工作流先读好，process.human_in_subgraph 才查得到
+    subgraphs = await load_subgraphs(session, spec)
+    with with_subgraphs(subgraphs):
+        out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards,
+                          checkers=checkers, providers=providers)
     out["assist"] = None
     # 人在选项里选了「交给 Copilot」（handoff），和点「交给 Copilot」是一回事
     if payload.assist or out["handoff"]:
@@ -607,9 +627,11 @@ async def autofix(
             out["ops"] += helped["ops"]
             out["applied"].append("assist")
             fixed_spec = GraphSpec.model_validate(fixed)
-            after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards,
-                                checkers=await _sql_checkers(session, fixed_spec),
-                                providers=await _providers(session, fixed_spec))
+            fixed_checkers = await _sql_checkers(session, fixed_spec)
+            fixed_providers = await _providers(session, fixed_spec)
+            with with_subgraphs(await load_subgraphs(session, fixed_spec)):
+                after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards,
+                                    checkers=fixed_checkers, providers=fixed_providers)
             out.update(graph=fixed, remaining=after["remaining"], fixes=after["fixes"], ok=after["ok"])
         elif helped["reason"]:
             out["rejected"].append({"fix_id": "assist", "reason": helped["reason"]})

@@ -94,6 +94,7 @@ async def lint_app(session: AsyncSession, spec: dict[str, Any], bindings: dict[s
     level = _level(pins)
     _lint_unique(spec, out)
     _lint_pins(spec, pins, out)
+    await _lint_subgraph_pins(session, spec, pins, out)
     _lint_upgrade(spec, previous, dispositions or {}, out)
     views = spec.get("views") or {}
     await _lint_views(session, spec, pins, out)
@@ -145,6 +146,27 @@ def _lint_pins(spec: dict[str, Any], pins: dict[str, Any], out: _Issues) -> None
             out.error("app.pin_unpublished", f"引用的「{state.label}」没有发布过，应用只能引用已发布的版本", at)
         elif state.hash != pin.get("graph_hash"):
             out.error("app.pin_hash", f"引用的「{state.label}」的内容指纹和应用里记的不一致，请重新选择这一版", at)
+
+
+async def _lint_subgraph_pins(session: AsyncSession, spec: dict[str, Any], pins: dict[str, Any], out: _Issues) -> None:
+    """钉住的版本里，子工作流固定的版本不是「已发布且未退役」的（D-q，apps/versions.subgraph_pin_problems）：各种用法都会
+    发起这一版的正式运行（入口、流程、按需视图、给最新封存视图供数的定时任务、补算），每一次都会在发起时被拒，所以报错。
+    钉住项本身不能用的（上面 _lint_pins 报过）不再往里看。"""
+    from app.apps.versions import subgraph_pin_problems
+    from app.engine.schema import GraphSpec
+
+    for i, pin in enumerate(spec.get("pins") or []):
+        state = pins.get(pin.get("alias"))
+        if state is None or state.row is None or not state.published:
+            continue
+        try:
+            graph = GraphSpec.model_validate(state.graph)
+        except ValueError:
+            continue
+        for problem in await subgraph_pin_problems(session, graph):
+            out.error(problem.code, f"「{state.label}」里的子工作流「{problem.title}」固定的{problem.reason}：这一版的正式运行"
+                      "发起时会被拒绝。请在那个工作流里改好并发布新版本，再把这里的引用换成新版本", f"pins[{i}]",
+                      node_id=problem.node_id)
 
 
 def _lint_upgrade(spec: dict[str, Any], previous: Any | None, dispositions: dict[str, str], out: _Issues) -> None:
@@ -419,6 +441,7 @@ async def _lint_process(session: AsyncSession, spec: dict[str, Any], pins: dict[
     """流程钉住项：岗位都绑了人、写入动作有人核实、图本身经得起升级（process.* 升成 app.process_unsafe）。"""
     from app.capabilities.registry import effective_effect, get_capability
     from app.engine.governance import publish_issues
+    from app.engine.lint_process import load_subgraphs, with_subgraphs
     from app.engine.schema import GraphSpec
 
     process = [s for s in pins.values() if s.pin.get("use") == "process" and s.row is not None]
@@ -453,7 +476,10 @@ async def _lint_process(session: AsyncSession, spec: dict[str, Any], pins: dict[
             graph = GraphSpec.model_validate(state.graph)
         except ValueError:
             continue
-        for issue in publish_issues(graph, level=state.level or "published"):
+        # 子工作流里有没有人工节点要读库才知道（门禁本身不查库）：先读好放进来，process.human_in_subgraph 才真正生效
+        with with_subgraphs(await load_subgraphs(session, graph)):
+            issues = publish_issues(graph, level=state.level or "published")
+        for issue in issues:
             if (issue.code or "").startswith("process."):
                 out.error("app.process_unsafe", f"「{state.label}」作为流程不安全：{issue.message}",
                           f"pins[{_pin_index(spec, state.alias)}]", node_id=issue.node_id)

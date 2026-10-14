@@ -41,20 +41,25 @@ def node(nid, ntype, **config):
     return {"id": nid, "type": ntype, "position": {"x": 0, "y": 0}, "data": {"label": nid, "config": config}}
 
 
-async def _app() -> str:
+#: 发布版里声明的钩子（D-g：收请求时按当前发布版的声明认 kind 和入口）
+DECLARED = [{"name": "paid", "kind": "signal"}, {"name": "new", "kind": "start", "entry": "apply"}]
+
+
+async def _app(declared: list | None = None) -> str:
     async with SessionLocal() as session:
         app = App(name=f"付款-{uuid.uuid4().hex[:6]}", published_version=1)
         session.add(app)
         await session.flush()
-        session.add(AppVersion(app_id=app.id, version=1, spec={}, spec_hash="h" * 64, bindings={}))
+        session.add(AppVersion(app_id=app.id, version=1, spec={"hooks": DECLARED if declared is None else declared},
+                               spec_hash="h" * 64, bindings={}))
         await session.commit()
         return app.id
 
 
 async def _hook(app_id: str, kind: str, entry_id: str | None = None) -> tuple[str, str]:
     async with SessionLocal() as session:
-        row, secret = await hooks.create_hook(session, app_id, name="paid" if kind == "signal" else "new", kind=kind,
-                                              entry_id=entry_id)
+        row, secret, _ = await hooks.rotate_hook(session, app_id, "paid" if kind == "signal" else "new", kind=kind,
+                                                 entry=entry_id)
         await session.commit()
         return row.id, secret
 
@@ -228,20 +233,109 @@ async def test_a_receipt_stuck_in_processing_can_be_reclaimed_without_starting_t
 
 
 async def test_hook_management_functions():
+    """按名字一行（D-g）：生成、轮换都落在同一行上，地址（行 id）不变、密钥换掉；删掉按名字删。"""
     app_id = await _app()
     async with SessionLocal() as session:
         with pytest.raises(ValueError):
-            await hooks.create_hook(session, app_id, name="x", kind="start")      # 发起实例要指定入口
-        row, secret = await hooks.create_hook(session, app_id, name="paid", kind="signal")
+            await hooks.rotate_hook(session, app_id, "x", kind="nope")
+        row, secret, created = await hooks.rotate_hook(session, app_id, "paid", kind="signal")
         await session.commit()
-        listed = await hooks.list_hooks(session, app_id)
-        assert [h["id"] for h in listed] == [row.id] and "secret" not in listed[0]
-        assert listed[0]["url_path"] == f"/api/hooks/{row.id}"
-        assert row.secret != secret and len(secret) >= 32       # 库里是密文
-        assert await hooks.delete_hook(session, "other-app", row.id) is False
-        assert await hooks.delete_hook(session, app_id, row.id) is True
+        assert created and row.secret != secret and len(secret) >= 32       # 库里是密文
+        again, second, created = await hooks.rotate_hook(session, app_id, "paid", kind="signal")
         await session.commit()
-        assert await hooks.list_hooks(session, app_id) == []
+        assert not created and again.id == row.id and second != secret
+        assert (await hooks.hook_row(session, app_id, "paid")).id == row.id
+        assert await hooks.delete_hook(session, "other-app", "paid") is False
+        assert await hooks.delete_hook(session, app_id, "paid") is True
+        await session.commit()
+        assert await hooks.hook_row(session, app_id, "paid") is None
+
+
+async def test_one_name_one_row_even_under_races(client, monkeypatch):
+    """库里还没有 (app_id, name) 的唯一约束：并发生成只留一行；插入后发现别人抢先插了，删掉自己、改去轮换那一行；万一
+    多出一行，收请求只认最早那一行，停用按名字改全部行。"""
+    from app.db.base import utcnow
+    from app.db.models import AppHook
+
+    app_id = await _app()
+    async with SessionLocal() as session:
+        (await session.get(App, app_id)).draft = {"hooks": DECLARED}
+        await session.commit()
+    first, second = await asyncio.gather(client.post(f"/api/apps/{app_id}/hooks/paid/rotate"),
+                                         client.post(f"/api/apps/{app_id}/hooks/paid/rotate"))
+    assert first.status_code == second.status_code == 200, (first.text, second.text)
+    assert first.json()["id"] == second.json()["id"] and first.json()["secret"] != second.json()["secret"]
+    async with SessionLocal() as session:
+        rows = list((await session.execute(select(AppHook).where(AppHook.app_id == app_id))).scalars())
+    assert len(rows) == 1
+
+    # 另一个进程在「读不到行」和「插入」之间抢先插好了：这一次插入后再查，删掉自己、轮换最早那一行
+    real = hooks.hook_row
+    calls = {"n": 0}
+
+    async def stale_first_read(session, app, name):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else await real(session, app, name)
+
+    monkeypatch.setattr(hooks, "hook_row", stale_first_read)
+    async with SessionLocal() as session:
+        row, secret, created = await hooks.rotate_hook(session, app_id, "paid", kind="signal")
+        await session.commit()
+    monkeypatch.setattr(hooks, "hook_row", real)
+    assert not created and row.id == rows[0].id
+    async with SessionLocal() as session:
+        assert len(list((await session.execute(select(AppHook).where(AppHook.app_id == app_id))).scalars())) == 1
+
+    # 真的多出一行（多进程各自插入）：它的密钥收不到请求；停用两行一起停
+    from app.core.crypto import encrypt
+
+    async with SessionLocal() as session:
+        stray = AppHook(app_id=app_id, name="paid", kind="signal", enabled=True, secret=encrypt("stray-secret") or "",
+                        created_at=utcnow())
+        session.add(stray)
+        await session.commit()
+        stray_id = stray.id
+    headers, body = signed("stray-secret", {"correlation": "x"}, key="k-stray")
+    assert (await client.post(f"/api/hooks/{stray_id}", content=body, headers=headers)).status_code == 404
+    assert (await client.patch(f"/api/apps/{app_id}/hooks/paid", json={"enabled": False})).status_code == 200
+    async with SessionLocal() as session:
+        states = [r.enabled for r in (await session.execute(select(AppHook).where(AppHook.app_id == app_id))).scalars()]
+    assert states == [False, False]
+
+
+async def test_a_hook_works_by_what_the_published_version_declares(client, monkeypatch):
+    """D-g：钩子做什么按应用当前发布版的声明认，不按行上记的。发布版里没声明的、停用的拒收；行上记的入口和发布版不一样时，
+    以发布版为准。"""
+    calls: list[str] = []
+
+    async def start_entry(app_id, entry_id, values, principal, **kw):
+        calls.append(entry_id)
+        return SimpleNamespace(id=f"run-{entry_id}")
+
+    monkeypatch.setattr("app.apps.entries.start_entry", start_entry)
+    app_id = await _app(declared=[{"name": "new", "kind": "start", "entry": "apply_v2"}])
+    hook_id, secret = await _hook(app_id, "start", entry_id="apply")       # 行上记的是旧入口
+    headers, body = signed(secret, {"amount": 1}, key="k-1")
+    resp = await client.post(f"/api/hooks/{hook_id}", content=body, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert calls == ["apply_v2"] and resp.json()["kind"] == "start"
+
+    undeclared = await _app(declared=[])                                    # 只在草稿里、还没发布
+    hook_id, secret = await _hook(undeclared, "signal")
+    headers, body = signed(secret, {"correlation": "x"}, key="k-2")
+    resp = await client.post(f"/api/hooks/{hook_id}", content=body, headers=headers)
+    assert resp.status_code == 404 and "发布版本里没有声明" in resp.json()["detail"]
+    headers, body = signed("wrong", {"correlation": "x"}, key="k-3")
+    assert (await client.post(f"/api/hooks/{hook_id}", content=body, headers=headers)).status_code == 401, \
+        "没验过签名的请求不该探出声明"
+
+    async with SessionLocal() as session:
+        row = await hooks.hook_row(session, app_id, "new")
+        row.enabled = False
+        await session.commit()
+        hook_id = row.id
+    headers, body = signed(secret, {"amount": 1}, key="k-4")
+    assert (await client.post(f"/api/hooks/{hook_id}", content=body, headers=headers)).status_code == 404
 
 
 def test_outbound_generic_signature_verifies_inbound():

@@ -278,13 +278,22 @@ async def test_login_off_allows_everything(client):
     assert grants.json()["items"] == [{"principal_kind": "group", "principal": "财务", "role": "observe"},
                                       {"principal_kind": "everyone", "principal": "", "role": "use"}]
     assert (await client.get(f"/api/apps/{app_id}/grants")).json() == grants.json()
-    hook = (await client.post(f"/api/apps/{app_id}/hooks", json={"name": "erp", "kind": "start", "entry_id": "apply"})).json()
-    assert hook["secret"] and hook["kind"] == "start"
+    # 钩子按名字（D-g）：草稿里声明了才能生成密钥
+    assert (await client.post(f"/api/apps/{app_id}/hooks/erp/rotate")).status_code == 404
+    draft = (await client.get(f"/api/apps/{app_id}")).json()["draft"]
+    draft["hooks"] = [{"name": "erp", "kind": "start", "entry": "apply"}]
+    assert (await client.patch(f"/api/apps/{app_id}", json={"draft": draft})).status_code == 200
+    hook = (await client.post(f"/api/apps/{app_id}/hooks/erp/rotate")).json()
+    assert hook["secret"] and hook["kind"] == "start" and hook["entry_id"] == "apply" and hook["has_secret"]
+    assert (hook["in_draft"], hook["in_published"]) == (True, False)
     listed = (await client.get(f"/api/apps/{app_id}/hooks")).json()["items"]
     assert [h["name"] for h in listed] == ["erp"] and "secret" not in listed[0]
-    rotated = (await client.post(f"/api/apps/{app_id}/hooks/{hook['id']}/rotate")).json()
-    assert rotated["secret"] != hook["secret"]
-    assert (await client.delete(f"/api/apps/{app_id}/hooks/{hook['id']}")).status_code == 204
+    rotated = (await client.post(f"/api/apps/{app_id}/hooks/erp/rotate")).json()
+    assert rotated["secret"] != hook["secret"] and rotated["id"] == hook["id"]
+    assert (await client.patch(f"/api/apps/{app_id}/hooks/erp", json={"enabled": False})).json()["enabled"] is False
+    assert (await client.delete(f"/api/apps/{app_id}/hooks/erp")).status_code == 204
+    listed = (await client.get(f"/api/apps/{app_id}/hooks")).json()["items"]
+    assert [(h["name"], h["id"], h["has_secret"]) for h in listed] == [("erp", None, False)], "声明还在草稿里"
 
 
 async def test_users_see_only_granted_apps(client, monkeypatch):

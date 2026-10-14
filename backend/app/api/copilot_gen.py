@@ -365,8 +365,10 @@ class GraphChecker:
     def __init__(self, applier: GraphApplier, *, scope: set[str] | None = None, sources: list[Any] | None = None,
                  baseline: list[dict[str, Any]] | None = None, level: str | None = None,
                  defaults: dict[str, Any] | None = None, checkers: dict[str, Any] | None = None,
-                 known: set[Any] | None = None) -> None:
+                 known: set[Any] | None = None, chat_user: bool = False) -> None:
         self.applier = applier
+        #: 图要以开登录后 user 角色的身份在问数据里发起（D-c）：使用者不能用的节点、工具也算挡路
+        self.chat_user = chat_user
         self.scope = scope
         self.sources = sources
         self.baseline = baseline
@@ -380,7 +382,7 @@ class GraphChecker:
 
         return _blocking_issues(self.applier.nodes, self.applier.edges, self.scope, sources=self.sources,
                                 baseline=self.baseline, level=self.level, defaults=self.defaults,
-                                checkers=self.checkers)
+                                checkers=self.checkers, chat_user=self.chat_user)
 
     async def issues(self) -> list[dict[str, Any]]:
         errors = self.blocking()
@@ -414,7 +416,7 @@ REPAIR_LOOKS_PROMPT = "\n\n这一轮查看过的内容（和起草时看到的�
 APP_HUMAN_ONLY = frozenset({
     "app.pin_unpublished", "app.pin_retired", "app.pin_hash", "app.upgrade_policy", "app.slot_unbound",
     "app.reconciler_unbound", "app.acl_empty", "app.notify_channel_missing", "app.process_unsafe",
-    "app.view_source_empty",
+    "app.view_source_empty", "subgraph_version_unpublished", "subgraph_version_retired",
 })
 
 
@@ -440,6 +442,10 @@ class AppApplier:
     """应用的落地：app/apps/ops.apply_app_op 改 spec（原地改），外加接着写时的去重。
 
     plan、done 记下说明；reply 记下（这句话不需要改应用）；图操作、目录修改提案在这里一概不收。
+
+    润色只改呈现（D-h，app/apps/ops.polish_problem）：组件操作、页面、待办外观（task_ui）、表单的外观键照收；改钉住的
+    版本、入口、视图、岗位、表单的数据约束一律拒（Applied(False, False, problem)）。拒掉的原因记在 refused 里：自查时
+    交回模型（AppChecker.issues），交付时列给人看（refusals），不悄悄吞掉。
     """
 
     def __init__(self, spec: dict[str, Any]) -> None:
@@ -448,6 +454,9 @@ class AppApplier:
         self.plan: dict[str, Any] | None = None
         self.replied: dict[str, Any] | None = None
         self.explanation = ""
+        #: 越界被拒的操作：[{op, path, message}]，按到来的顺序
+        self.refused: list[dict[str, Any]] = []
+        self._reported = 0
         self._landed: list[str] = []
         self._continuing = False
         self._repairing = False
@@ -472,6 +481,10 @@ class AppApplier:
             return Applied(False, False)
         if self._continuing and self._repeats(op):
             return Applied(False, False)
+        if problem := app_ops.polish_problem(self.spec, op):
+            path = f"{op.get('path')}.{op.get('key')}" if op.get("key") else str(op.get("path") or "")
+            self.refused.append({"op": kind, "path": path, "message": problem})
+            return Applied(False, False, problem)
         applied = app_ops.apply_app_op(self.spec, op)
         if applied.changed:
             self.effective.append(op)
@@ -500,6 +513,21 @@ class AppApplier:
     def repairing(self) -> None:
         self._repairing = True
 
+    def unreported(self) -> list[dict[str, Any]]:
+        """还没交回过模型的越界操作，取走即算交回过：同一条不在后面几轮自查里反复交回。"""
+        out = self.refused[self._reported:]
+        self._reported = len(self.refused)
+        return out
+
+    def refusals(self) -> list[dict[str, Any]]:
+        """交付时列给人看的：形状同应用检查的问题（警告级），说明助手想改什么、为什么没改。"""
+        return [{"message": f"助手想改的这一处没有采纳：{r['message']}", "level": "warning", "code": POLISH_REFUSED,
+                 "path": r["path"] or None} for r in self.refused]
+
+
+#: 助手润色越界被拒（D-h）。不是应用检查的编号：不进发布检查，只在润色交付时列出来
+POLISH_REFUSED = "app.polish_refused"
+
 
 class AppChecker:
     """应用的自查：app/apps/lint.lint_app 的 error，去掉只有人能处理的（APP_HUMAN_ONLY），交回模型改。"""
@@ -517,7 +545,11 @@ class AppChecker:
             return list(await app_lint.lint_app(session, self.applier.spec, self.bindings))
 
     async def issues(self) -> list[dict[str, Any]]:
-        return [i for i in await self.lint() if i.get("level") == "error" and i.get("code") not in APP_HUMAN_ONLY]
+        """交回模型改的：应用检查的 error（去掉只有人能处理的），加上这之前越界被拒、还没交回过的操作。"""
+        refused = [{"message": r["message"], "level": "error", "code": POLISH_REFUSED, "path": r["path"] or None}
+                   for r in self.applier.unreported()]
+        return [*refused,
+                *(i for i in await self.lint() if i.get("level") == "error" and i.get("code") not in APP_HUMAN_ONLY)]
 
     def repair_request(self, issues: list[dict[str, Any]], looks_text: str) -> str:
         lines = "\n".join(f"- {i.get('path') or ''} {i.get('message') or ''}".strip() for i in issues)

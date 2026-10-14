@@ -98,10 +98,26 @@ def source_of_tool(name: str) -> str | None:
 MASK_RESULTS_OPTION = "mask_results"
 
 
+#: Run.options 里的键：这次运行的数据源查询一律只读，可写源上的写语句也由守卫拒掉（_make_query_tool 的 force_readonly）。
+#: 和 MASK_RESULTS_OPTION 一起由 api/runs.py 给开登录后 user 角色的问数据运行打上：只读不能交给审批——Agent 的
+#: approval 写成 never、或者管理员给这个工具设过「始终允许」，写语句就不问人直接执行了。另记一个键而不是拿遮罩开关
+#: 顺带：遮不遮和能不能写是两件事，各自说清
+READ_ONLY_OPTION = "read_only_data"
+
+
+def _run_option(run_ctx: Any, key: str) -> bool:
+    options = (getattr(run_ctx, "extra", None) or {}).get("run_options") or {}
+    return bool(options.get(key))
+
+
 def run_masks_results(run_ctx: Any) -> bool:
     """这次运行的查询结果要不要在工具边界就遮（见 MASK_RESULTS_OPTION）。构造 ToolContext 时传进去。"""
-    options = (getattr(run_ctx, "extra", None) or {}).get("run_options") or {}
-    return bool(options.get(MASK_RESULTS_OPTION))
+    return _run_option(run_ctx, MASK_RESULTS_OPTION)
+
+
+def run_reads_only(run_ctx: Any) -> bool:
+    """这次运行的数据源查询是不是一律只读（见 READ_ONLY_OPTION）。构造 ToolContext 时传进去。"""
+    return _run_option(run_ctx, READ_ONLY_OPTION)
 
 
 def run_versions(run_ctx: Any) -> dict[str, Any] | Versions | None:

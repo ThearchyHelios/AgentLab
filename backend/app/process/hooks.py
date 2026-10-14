@@ -15,11 +15,21 @@ Idempotency-Key 去重。start 按入口发起实例；signal 按 correlation �
 signal 的请求体：{"correlation": 关联键, "decision"?: "approve" | "reject", "note"?: …, 其余字段原样交给节点}。关联键
 也可以放在 X-AgentLab-Correlation 头里。
 
-钩子的增删放在 /api/apps/{id}/hooks（应用包的接口），这里给 create_hook / list_hooks / delete_hook 三个函数；
-密钥只在新建时交回一次，库里存密文。
+钩子按名字认（D-g）：应用 spec 的 hooks 里声明 {name, kind, entry}，app_hooks 按 (应用, 名字) 一行，只存密钥和启用
+与否。请求到来时按应用**当前发布版**的 spec 认这个名字的 kind 和 entry——不另存一份入口：钩子做什么跟着发布走，
+改草稿不改正在用的钩子，发布版里没声明（或者行被停用）的一律拒收。
+
+钩子的管理放在 /api/apps/{id}/hooks（应用包的接口），这里给 hook_row / rotate_hook / set_enabled / delete_hook 几个
+函数；密钥只在生成、轮换时交回一次，库里存密文。
+
+一个名字只认一行（最早的那一行，hook_row）。库里还没有 (app_id, name) 的唯一约束，靠三道守：同一进程里生成、轮换按名字
+串行（hook_lock）；插入后再查一遍，前面已经有行的删掉自己、改去轮换那一行（rotate_hook）；万一还是多出一行（多进程各自
+插入），收请求时只认最早那一行（receive），停用按名字改全部行（set_enabled）——不然停用管不到另一行，用另一把密钥签名
+的请求照样被接受。
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -99,12 +109,17 @@ async def receive(hook_id: str, headers: Any, body: bytes) -> dict[str, Any]:
 
     async with SessionLocal() as session:
         hook = await session.get(AppHook, hook_id)
-        if hook is None or not hook.enabled:
+        # 同名多出来的行（见模块说明）不认：界面、停用、轮换都只管最早那一行
+        if hook is None or not hook.enabled or (await hook_row(session, hook.app_id, hook.name)).id != hook.id:
             raise HookRejected("钩子不存在或已停用", status_code=404)
         secret = decrypt(hook.secret) or ""
+        declared = await published_declaration(session, hook.app_id, hook.name)
     if not secret:
         raise HookRejected("钩子的密钥无法解密（加密密钥可能已更换），请在应用里重新生成钩子", status_code=409)
     verify(secret, headers, body)
+    # 验过签名才说「发布版里没有它」：没验签的请求不该探出应用里声明了哪些钩子
+    if declared is None:
+        raise HookRejected("应用当前的发布版本里没有声明这个钩子，不接收请求", status_code=404)
     idem_key = _header(headers, IDEMPOTENCY_HEADER)[:200]
     if not idem_key:
         raise HookRejected(f"请求缺少 {IDEMPOTENCY_HEADER} 请求头：同一件事重发时要带同一个键", status_code=400)
@@ -122,17 +137,44 @@ async def receive(hook_id: str, headers: Any, body: bytes) -> dict[str, Any]:
     previous, reclaimed = await _claim(hook.id, idem_key)
     if previous is not None:
         return previous
-    request = HookRequest(hook_id=hook.id, kind=hook.kind, idem_key=idem_key, payload=payload)
+    kind = str(declared.get("kind"))
+    request = HookRequest(hook_id=hook.id, kind=kind, idem_key=idem_key, payload=payload)
     try:
-        if hook.kind == "start":
-            out = await _start(hook, request, reclaimed=reclaimed)
+        if kind == "start":
+            out = await _start(hook, request, declared.get("entry"), reclaimed=reclaimed)
         else:
             out = await _signal(hook, request, _header(headers, CORRELATION_HEADER), reclaimed=reclaimed)
     except Exception as e:
         await _finish(hook.id, idem_key, status="rejected", detail=str(e)[:500])
         raise
     await _finish(hook.id, idem_key, status="accepted", run_id=out.get("run_id"), task_id=out.get("task_id"))
-    return {"status": "accepted", "kind": hook.kind, **out}
+    return {"status": "accepted", "kind": kind, **out}
+
+
+def declarations(spec: Any) -> dict[str, dict[str, Any]]:
+    """spec.hooks 里的声明：{名字: {name, kind, entry}}。形状不对的跳过（应用检查另外报）；同名的取第一个。"""
+    out: dict[str, dict[str, Any]] = {}
+    hooks = spec.get("hooks") if isinstance(spec, dict) else None
+    for item in hooks if isinstance(hooks, list) else []:
+        if not isinstance(item, dict) or item.get("kind") not in KINDS:
+            continue
+        name = str(item.get("name") or "").strip()
+        if name and name not in out:
+            out[name] = {"name": name, "kind": item["kind"],
+                         "entry": item.get("entry") if item["kind"] == "start" else None}
+    return out
+
+
+async def published_declaration(session: AsyncSession, app_id: str, name: str) -> dict[str, Any] | None:
+    """应用当前发布版里这个名字的钩子声明；应用没发布、归档了、发布版里没有这个名字的返回 None。"""
+    from app.db.models import App, AppVersion
+
+    app = await session.get(App, app_id)
+    if app is None or app.status == "archived" or not app.published_version:
+        return None
+    spec = await session.scalar(select(AppVersion.spec).where(AppVersion.app_id == app_id,
+                                                              AppVersion.version == app.published_version))
+    return declarations(spec).get(name)
 
 
 async def _bind_signature(hook_id: str, ts: str, signature: str, idem_key: str) -> None:
@@ -205,15 +247,15 @@ def _caller(hook: AppHook) -> Any:
                      mode=auth_mode())
 
 
-async def _start(hook: AppHook, request: HookRequest, *, reclaimed: bool = False) -> dict[str, Any]:
+async def _start(hook: AppHook, request: HookRequest, entry: Any, *, reclaimed: bool = False) -> dict[str, Any]:
     from app.apps.entries import start_entry
 
-    if not hook.entry_id:
-        raise HookRejected("这个钩子没有指定入口，无法发起", status_code=409)
+    if not entry:
+        raise HookRejected("这个钩子在发布版里没有指定入口，无法发起", status_code=409)
     if reclaimed and (run_id := await _started_before(hook, request.idem_key)):
         # 上一次处理到一半服务停了：实例其实已经发起，交回它，不再发起一个
         return {"run_id": run_id}
-    run = await start_entry(hook.app_id, hook.entry_id, request.payload, _caller(hook), origin_kind="hook",
+    run = await start_entry(hook.app_id, str(entry), request.payload, _caller(hook), origin_kind="hook",
                             hook=hook.name, hook_key=request.idem_key)
     return {"run_id": run.id}
 
@@ -259,43 +301,78 @@ async def _signal(hook: AppHook, request: HookRequest, header_key: str, *, recla
 
 
 # --------------------------------------------------------------------------
-# 钩子的增删（给 /api/apps/{id}/hooks 用）
+# 钩子的管理（给 /api/apps/{id}/hooks 用）：按名字，一个名字一行
 # --------------------------------------------------------------------------
 
 
-def hook_out(row: AppHook) -> dict[str, Any]:
-    return {"id": row.id, "app_id": row.app_id, "name": row.name, "kind": row.kind, "entry_id": row.entry_id,
-            "enabled": row.enabled, "url_path": f"/api/hooks/{row.id}",
-            "created_at": row.created_at.isoformat() if row.created_at else None}
+def hook_out(row: AppHook | None, *, name: str, declared: dict[str, Any] | None, in_draft: bool,
+             in_published: bool, secret: str | None = None) -> dict[str, Any]:
+    """接口里的一行：声明（草稿优先，没有再看发布版）加上库里的那一行（密钥生成过没有、启用与否、收请求的地址）。"""
+    decl = declared or {}
+    return {"id": row.id if row is not None else None, "name": name,
+            "kind": decl.get("kind") or (row.kind if row is not None else None),
+            "entry_id": decl.get("entry") if decl else (row.entry_id if row is not None else None),
+            "enabled": bool(row.enabled) if row is not None else False,
+            "has_secret": row is not None and bool(row.secret),
+            "in_draft": in_draft, "in_published": in_published,
+            "url_path": f"/api/hooks/{row.id}" if row is not None else None,
+            "created_at": row.created_at.isoformat() if row is not None and row.created_at else None,
+            **({"secret": secret} if secret else {})}
 
 
-async def create_hook(session: AsyncSession, app_id: str, *, name: str, kind: str,
-                      entry_id: str | None = None) -> tuple[AppHook, str]:
-    """新建一个钩子，返回 (钩子, 密钥明文)。密钥只在这一次交回，库里存密文。调用方提交。"""
+async def hook_row(session: AsyncSession, app_id: str, name: str) -> AppHook | None:
+    """(应用, 名字) 的那一行。库里没有唯一约束，万一多出一行，认最早的那一行（之后的轮换、停用、删除、收请求都按它）。"""
+    return await session.scalar(select(AppHook).where(AppHook.app_id == app_id, AppHook.name == name)
+                                .order_by(AppHook.created_at, AppHook.id).limit(1))
+
+
+#: (应用 id, 名字) → 生成、轮换的锁（见模块说明）。只增不减：一个应用的钩子就那么几个
+_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def hook_lock(app_id: str, name: str) -> asyncio.Lock:
+    """同一个名字的生成、轮换在进程里串行：调用方从读行一直锁到提交（api/apps.py 的 rotate_hook）。"""
+    return _LOCKS.setdefault((app_id, name), asyncio.Lock())
+
+
+async def rotate_hook(session: AsyncSession, app_id: str, name: str, *, kind: str,
+                      entry: str | None = None) -> tuple[AppHook, str, bool]:
+    """生成或轮换这个名字的密钥，返回 (行, 密钥明文, 是不是新生成的)。密钥只在这一次交回，库里存密文。
+
+    kind / entry 只是照声明记在行上给人看；收请求时以当前发布版的声明为准（published_declaration）。调用方提交。
+    新插入一行之后再查一遍：别人抢先插了（并发生成，hook_lock 管不到的另一个进程），删掉自己这行、改去轮换最早那一行，
+    交回的仍是这一次的密钥——和两个人先后点「轮换」一样，后点的那把生效。"""
     from app.core.crypto import encrypt
 
     if kind not in KINDS:
         raise ValueError("钩子只能是发起实例或回调待办两种")
-    if kind == "start" and not entry_id:
-        raise ValueError("发起实例的钩子需要指定入口")
     secret = secrets.token_urlsafe(32)
-    row = AppHook(app_id=app_id, name=name.strip()[:100] or kind, kind=kind,
-                  entry_id=entry_id if kind == "start" else None, secret=encrypt(secret), enabled=True)
-    session.add(row)
+    row = await hook_row(session, app_id, name)
+    created = row is None
+    if row is None:
+        row = AppHook(app_id=app_id, name=name[:100], kind=kind, enabled=True, secret="")
+        session.add(row)
+        await session.flush()
+        first = await hook_row(session, app_id, name)
+        if first is not None and first.id != row.id:
+            await session.delete(row)
+            row, created = first, False
+    row.kind, row.entry_id = kind, (entry if kind == "start" else None)
+    row.secret = encrypt(secret) or ""
     await session.flush()
-    return row, secret
+    return row, secret, created
 
 
-async def list_hooks(session: AsyncSession, app_id: str) -> list[dict[str, Any]]:
-    rows = (await session.execute(select(AppHook).where(AppHook.app_id == app_id)
-                                  .order_by(AppHook.created_at))).scalars()
-    return [hook_out(r) for r in rows]
+async def set_enabled(session: AsyncSession, app_id: str, name: str, enabled: bool) -> None:
+    """启用、停用这个名字的钩子：同名的行一起改（见模块说明），停用管得到每一把密钥。调用方提交。"""
+    await session.execute(update(AppHook).where(AppHook.app_id == app_id, AppHook.name == name)
+                          .values(enabled=enabled).execution_options(synchronize_session="fetch"))
 
 
-async def delete_hook(session: AsyncSession, app_id: str, hook_id: str) -> bool:
-    """删掉一个钩子（去重记录随外键一起删）。不是这个应用的、不存在的返回 False。调用方提交。"""
-    row = await session.get(AppHook, hook_id)
-    if row is None or row.app_id != app_id:
-        return False
-    await session.delete(row)
-    return True
+async def delete_hook(session: AsyncSession, app_id: str, name: str) -> bool:
+    """删掉这个名字的钩子行（密钥、去重记录随外键一起删）；没有返回 False。声明留在 spec 里，由人在编辑器里删。调用方提交。"""
+    rows = list((await session.execute(select(AppHook).where(AppHook.app_id == app_id, AppHook.name == name)))
+                .scalars())
+    for row in rows:
+        await session.delete(row)
+    return bool(rows)

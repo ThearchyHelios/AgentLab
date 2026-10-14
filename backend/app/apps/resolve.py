@@ -32,18 +32,18 @@ from app.apps.spec import APP_ROOTS, VIEW_FORMAT
 from app.apps.tree import bind_kind, page_of, resolve_form
 from app.core.artifact_store import canonical_json
 from app.db.base import utcnow
-from app.db.models import Run, RunEvent, Schedule, ScheduleFire, Setting
+from app.db.models import Run, RunEvent, Schedule, ScheduleFire
 from app.db.models_apps import AppViewCache, AppVersion
 
-#: 设置里应用这一组（api/settings.py 的 get_settings 原样合并没登记过的组）：每个应用每天最多发起几次按需运行
-APPS_SETTING_KEY = "apps"
-DAILY_LIMIT_DEFAULT = 50
 #: 趋势最多取几次封存运行
 SERIES_MAX = 24
 #: 表格最多下发几行（页面上只排序、不汇总；完整快照走证据接口）
 TABLE_ROWS_MAX = 200
 #: 进程内的页面缓存
 PAGE_CACHE_SIZE = 256
+
+#: 按新口径补算的运行来源（engine/origin.py）
+BACKFILL_ORIGIN = "app_backfill"
 
 VIEW_EMPTY = "view.source_empty"
 VIEW_REFUSED = "app_view_refused"
@@ -83,13 +83,18 @@ async def sealed_runs(session: AsyncSession, workflow_id: Any, version: Any, gra
                       n: int) -> list[Run]:
     """钉住版本（同一 graph_hash）最近 n 次成功且已封存的正式运行，新的在前。
 
-    sealed_now 认的是「这一次结束时封的」：失败后接着跑完、新封存还没补上的那一刻，带着的是旧封存，不算。"""
+    sealed_now 认的是「这一次结束时封的」：失败后接着跑完、新封存还没补上的那一刻，带着的是旧封存，不算。
+    按新口径补算的运行（app_backfill）不算：它们是现在才算的历史期，「最近一次」不能取到它们；趋势另经 trend_runs
+    按它们对应的输入期排进去。"""
+    from sqlalchemy import or_
+
     from app.scheduler.auto_compare import sealed_now
 
     if not workflow_id or not isinstance(version, int) or not graph_hash:
         return []
     query = select(Run).where(Run.workflow_id == workflow_id, Run.version == version, Run.run_class == "formal",
-                              Run.status == "succeeded", Run.version_hash == graph_hash)
+                              Run.status == "succeeded", Run.version_hash == graph_hash,
+                              or_(Run.origin_kind.is_(None), Run.origin_kind != BACKFILL_ORIGIN))
     if isinstance(origin, str) and origin.startswith("schedule:"):
         query = query.where(Run.schedule_id == origin[len("schedule:"):])
     rows = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.created_at.desc())
@@ -101,6 +106,59 @@ async def sealed_runs(session: AsyncSession, workflow_id: Any, version: Any, gra
             if len(out) >= n:
                 break
     return out
+
+
+def input_key(inputs: Any) -> str:
+    """一次运行的输入的指纹：补算时认「同一个输入算过没有」，趋势里认补算和正常运行是不是同一期。"""
+    return hashlib.sha256(canonical_json(inputs if isinstance(inputs, dict) else {}).encode()).hexdigest()
+
+
+def _aware(moment: datetime | None) -> datetime | None:
+    if moment is None:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def period_of(run: Run) -> datetime | None:
+    """这次运行对应的输入期，趋势按它排：正常运行就是它结束的时间；补算的运行是现在才算的，按它补的那一次原来的时间
+    （origin.period_at，补算发起时记下）。"""
+    if run.origin_kind == BACKFILL_ORIGIN:
+        raw = (run.origin or {}).get("period_at")
+        if isinstance(raw, str):
+            try:
+                return _aware(datetime.fromisoformat(raw))
+            except ValueError:
+                pass
+    return _aware(run.finished_at or run.created_at)
+
+
+async def trend_runs(session: AsyncSession, app_id: str | None, workflow_id: Any, version: Any, graph_hash: Any,
+                     origin: str | None, n: int) -> list[Run]:
+    """趋势要画的那几次：同一来源最近 n 期，按输入期从早到晚。
+
+    来源本身的封存运行（sealed_runs），加上这个应用为同一来源按新口径补算的运行（app_backfill，origin.source 记着补的
+    是哪个来源）——补算的是新版本的点，按它补的那一期排进去（period_of）。同一个输入既有正常运行又有补算的，取正常
+    运行：补算只是替缺的那几期补上。"""
+    from app.scheduler.auto_compare import sealed_now
+
+    own = await sealed_runs(session, workflow_id, version, graph_hash, origin, n)
+    backfilled: list[Run] = []
+    if app_id and workflow_id and isinstance(version, int) and graph_hash:
+        rows = (await session.execute(select(Run).where(
+            Run.app_id == app_id, Run.origin_kind == BACKFILL_ORIGIN, Run.workflow_id == workflow_id,
+            Run.version == version, Run.version_hash == graph_hash, Run.run_class == "formal",
+            Run.status == "succeeded").order_by(Run.created_at.desc()).limit(max(n, 1) * 3 + 5))).scalars()
+        seen = {input_key(r.input) for r in own}
+        for run in rows:
+            key = input_key(run.input)
+            if (run.origin or {}).get("source") != (origin or "formal") or key in seen:
+                continue
+            if await sealed_now(session, run):
+                seen.add(key)
+                backfilled.append(run)
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    merged = sorted([*own, *backfilled], key=lambda r: (period_of(r) or floor, _aware(r.created_at) or floor))
+    return merged[-n:] if n > 0 else []
 
 
 @dataclass
@@ -254,9 +312,11 @@ async def cache_key(session: AsyncSession, state: PinState, inputs: dict[str, An
 
 
 async def daily_limit(session: AsyncSession) -> int:
-    row = await session.get(Setting, APPS_SETTING_KEY)
-    value = ((row.value if row else None) or {}).get("on_demand_daily_limit")
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else DAILY_LIMIT_DEFAULT
+    """每个应用每天最多发起几次按需运行：设置里的 apps.on_demand_daily_limit（D-j，默认值和取值范围只在 api/settings.py
+    一处定，设置页改的就是它）。"""
+    from app.api.settings import apps_settings
+
+    return int((await apps_settings(session))["on_demand_daily_limit"])
 
 
 async def _cached(session: AsyncSession, key: str) -> Run | None:
@@ -373,6 +433,12 @@ async def _mask_fingerprint(session: AsyncSession) -> str:
     return hashlib.sha256(canonical_json({"sources": sources, "capabilities": caps}).encode()).hexdigest()
 
 
+async def _backfilled(session: AsyncSession, app_id: str) -> int:
+    """这个应用补算完成了几次：进页面缓存的键。补算的运行不是「最近一次」，来源取的运行不变，趋势却多了点，键得跟着变。"""
+    return int(await session.scalar(select(func.count(Run.id)).where(
+        Run.app_id == app_id, Run.origin_kind == BACKFILL_ORIGIN, Run.status == "succeeded")) or 0)
+
+
 async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, principal: Principal, role: str | None,
                        instance: Run | None = None, params: dict[str, Any] | None = None, draft: bool = False,
                        version: AppVersion | None = None, actor: str | None = None) -> dict[str, Any]:
@@ -400,7 +466,8 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
            tuple((v, s.run.id if s.run else None, s.state) for v, s in sorted(ctx.sources.items())),
            tuple((a, p.workflow.published_version if p.workflow else None, p.retired)
                  for a, p in sorted(ctx.pins.items())),
-           role, principal.username, principal.role, await _mask_fingerprint(session))
+           role, principal.username, principal.role, await _mask_fingerprint(session),
+           await _backfilled(session, app.id))
     cacheable = (not draft and instance is None and all(s.state in ("ok", "empty") for s in ctx.sources.values())
                  and not _dynamic(page))
     if cacheable and key in _PAGE_CACHE:
@@ -719,16 +786,18 @@ async def _series(session: AsyncSession, ctx: _Page, source: Source, cid: str, r
     segments: list[tuple[int, str, list[Run]]] = []
     mode = "single"
     previous, disposition = await _upgrade_of(session, ctx, pin.alias)
+    app_id = ctx.app.id if ctx.app is not None else None
     if previous is not None and disposition in ("dual", "incomparable"):
         mode = disposition
-        old_runs = await sealed_runs(session, previous.get("workflow_id"), previous.get("version"),
-                                     previous.get("graph_hash"), origin, n)
-        segments.append((int(previous.get("version")), str(previous.get("graph_hash")), list(reversed(old_runs))))
+        old_runs = await trend_runs(session, app_id, previous.get("workflow_id"), previous.get("version"),
+                                    previous.get("graph_hash"), origin, n)
+        segments.append((int(previous.get("version")), str(previous.get("graph_hash")), old_runs))
     elif disposition == "recompute":
         mode = "recompute"
-    runs = await sealed_runs(session, pin.pin.get("workflow_id"), pin.pin.get("version"), pin.pin.get("graph_hash"),
-                             origin, n)
-    segments.append((int(pin.pin.get("version")), str(pin.pin.get("graph_hash")), list(reversed(runs))))
+    # 新版本这一段带上按新口径补算的那几期（trend_runs）：recompute 升版之后补算过，趋势就按新口径从头画
+    runs = await trend_runs(session, app_id, pin.pin.get("workflow_id"), pin.pin.get("version"),
+                            pin.pin.get("graph_hash"), origin, n)
+    segments.append((int(pin.pin.get("version")), str(pin.pin.get("graph_hash")), runs))
     series: list[dict[str, Any]] = []
     unit = ""
     for version, _, rows in segments:
@@ -739,8 +808,10 @@ async def _series(session: AsyncSession, ctx: _Page, source: Source, cid: str, r
             metric, text, eid, held = await _metric_value(point_source, node_id, metric_id, None)
             if metric is not None:
                 unit = unit or str(metric.get("unit") or "")
-            points.append({"run_id": run.id, "as_of": run.finished_at.isoformat() if run.finished_at else None,
+            period = period_of(run)
+            points.append({"run_id": run.id, "as_of": period.isoformat() if period else None,
                            "value": None if held or metric is None else metric.get("value"), "text": text,
+                           **({"backfill": True} if run.origin_kind == BACKFILL_ORIGIN else {}),
                            "evidence": _evidence(point_source, "metric", node=node_id, metric=metric_id, eid=eid)
                            if metric is not None else None})
         series.append({"version": version, "label": f"v{version}", "points": points})
@@ -758,14 +829,23 @@ async def _series(session: AsyncSession, ctx: _Page, source: Source, cid: str, r
 
 
 async def _upgrade_of(session: AsyncSession, ctx: _Page, alias: str) -> tuple[dict[str, Any] | None, str | None]:
-    """这个钉住项最近一次升版：(升版前的钉住项, 当时选的处置)。从当前应用版本往回找第一次换了工作流版本的地方——之后
-    又发过几版（改布局、改文案）不影响趋势按那次处置来画。没升过版的是 (None, None)。"""
-    if ctx.version is None or ctx.version.version <= 1:
+    if ctx.version is None:
+        return None, None
+    return await pin_upgrade(session, ctx.app.id, ctx.version, alias)
+
+
+async def pin_upgrade(session: AsyncSession, app_id: str, version: AppVersion,
+                      alias: str) -> tuple[dict[str, Any] | None, str | None]:
+    """这个钉住项最近一次升版：(升版前的钉住项, 当时选的处置)。从这个应用版本往回找第一次换了工作流版本的地方——之后
+    又发过几版（改布局、改文案）不影响趋势按那次处置来画、也不影响按新口径补算。没升过版的是 (None, None)。"""
+    if version.version <= 1:
         return None, None
     rows = list((await session.execute(select(AppVersion).where(
-        AppVersion.app_id == ctx.app.id, AppVersion.version <= ctx.version.version)
+        AppVersion.app_id == app_id, AppVersion.version <= version.version)
         .order_by(AppVersion.version.desc()))).scalars())
-    rows[0] = ctx.version
+    if not rows:
+        return None, None
+    rows[0] = version
     for newer, older in zip(rows, rows[1:]):
         new = next((p for p in newer.pins or [] if p.get("alias") == alias), None)
         old = next((p for p in older.pins or [] if p.get("alias") == alias), None)
@@ -787,14 +867,36 @@ def _query_artifact(source: Source, node_id: str, exec_no: Any = None) -> str | 
 
 
 async def _snapshot(source: Source, artifact: str) -> tuple[dict[str, Any] | None, set[str]]:
-    """查询快照和要遮的列（小写）：查询当时记下的加数据源现在设的，按 SQL 认出改了名字的也遮（同证据面板）。"""
-    from app.api.evidence import _fetch
+    """查询快照和要遮的列（小写）：查询当时记下的加数据源现在设的，按 SQL 认出改了名字的也遮（同证据面板）。端点快照
+    按列名遮（见下）。"""
+    from app.api.evidence import _fetch, _recorded_masks
 
     snap, ok = _fetch(artifact)
     if ok is not True or not isinstance(snap, dict) or not isinstance(snap.get("rows"), list):
         return None, set()
+    if snap.get("capability"):
+        # 端点快照：列是能力登记的表格映射排出来的，没有 SQL 改名这回事，按列名遮就是准的——落快照时记下的，加上能力
+        # 现在的遮罩字段。查询快照那一套（按 SQL 认改了名字的遮罩列）在这里认不出出处，会把整张表都遮掉
+        return snap, _recorded_masks(snap) | await _capability_masks(str(snap["capability"]))
     sets = await source.masks.sets(artifact, snap.get("source"), snap)
     return snap, set(sets.hidden)
+
+
+async def _capability_masks(name: str) -> set[str]:
+    """端点快照（capabilities/endpoints.py 落的 endpoint_snapshot）按能力现在的遮罩字段要遮的列（小写）。
+
+    快照里的 mask_columns 是落快照那一刻的遮罩（调用方另外并进来）；管理员事后给能力加了遮罩字段，来源运行没换，
+    视图也得跟着遮（P4，同数据源事后加遮罩列）。遮罩字段是 JSON 指针，按能力登记的表格映射认它落在哪几列
+    （masked_columns_of，落快照时记 mask_columns 用的同一个函数）。能力删掉了的只能按快照记下的遮。"""
+    from app.capabilities.endpoints import masked_columns_of
+    from app.capabilities.registry import get_capability, masked_paths
+    from app.db.base import SessionLocal
+
+    async with SessionLocal() as session:
+        cap = await get_capability(session, name)
+    if cap is None:
+        return set()
+    return {c.lower() for c in masked_columns_of(cap.tabular or {}, masked_paths(cap))}
 
 
 async def _cell(ctx: _Page, source: Source, cid: str, ref: Any, conv: Any) -> dict[str, Any]:

@@ -237,11 +237,23 @@ async def preview_request(session: AsyncSession, capability: Any, args: dict[str
     return {**req, "endpoint": endpoint.name, "environment": environment}
 
 
+def on_behalf_parts(on_behalf: Any) -> tuple[str | None, str | None]:
+    """on_behalf 的两种写法 → (发起人, 确认人)。
+
+    - 字符串（老写法，工具库试用、agent 里的读取）：就是发起人，没有确认人；
+    - {"sub": 发起人, "act": 确认人}：调用工具节点的写入。sub 一律是运行的发起人，确认动作的人放在 act（D-b）。"""
+    if isinstance(on_behalf, dict):
+        sub, act = on_behalf.get("sub"), on_behalf.get("act")
+        return (str(sub) if sub else None), (str(act) if act else None)
+    return (str(on_behalf) if on_behalf else None), None
+
+
 async def endpoint_request(session: AsyncSession, capability: Any, args: dict[str, Any], *, environment: str,
-                           idem_key: str | None = None, on_behalf: str | None = None,
+                           idem_key: str | None = None, on_behalf: str | dict[str, Any] | None = None,
                            run_id: str | None = None, node_id: str | None = None) -> EndpointResult:
     """平台执行器（registry.endpoint_request 的实现，签名同附录 C）。environment 由调用方按运行类别定（pick_environment）；
-    传 test 而端点没有测试环境时演练。超时、连接中断交 unknown=True：对方可能已经处理了，写入要转核实，不能重发。"""
+    传 test 而端点没有测试环境时演练。超时、连接中断交 unknown=True：对方可能已经处理了，写入要转核实，不能重发。
+    on_behalf 是发起人（字符串），或者 {"sub": 发起人, "act": 确认人}（on_behalf_parts）。"""
     try:
         cap, tool, endpoint = await _resolve(session, capability)
         envs = endpoint.environments or {}
@@ -271,9 +283,10 @@ async def endpoint_request(session: AsyncSession, capability: Any, args: dict[st
 
         from app.auth import current_mode
 
+        subject, actor = on_behalf_parts(on_behalf)
         # 开了登录，发起人就是认证过的用户名；关登录时是自报的署名，断言里照实写 verified=false
-        headers[ASSERTION_HEADER] = assertion(endpoint.name, on_behalf,
-                                              verified=bool(on_behalf) and current_mode() != "off")
+        headers[ASSERTION_HEADER] = assertion(endpoint.name, subject, actor=actor,
+                                              verified=bool(subject) and current_mode() != "off")
     try:
         async with _client(timeout=endpoint.timeout_s or settings.http_tool_timeout, follow_redirects=False,
                            trust_env=False, verify=env.get("verify_tls", True) is not False) as client:
