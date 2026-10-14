@@ -57,7 +57,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data import catalog, catalog_jobs, catalog_profile
-from app.data.catalog_review import SOURCE_LABEL, slot_path
+from app.data.catalog_review import SOURCE_LABEL, item_label, slot_path, table_usage_counts
 from app.data.draft_model import DRAFT_MODEL_PLACE
 from app.data.engine import SnapshotTampered, masked_columns
 
@@ -153,7 +153,8 @@ ASSISTANT_PROMPT_LABELS = {
     "view": "（视图）",
     "comment": "数据库注释：{text}",
     "system": "系统说明：{text}",
-    "usage": "这张表被运行用过 {n} 次。",
+    "usage": "这张表被 {runs} 次运行用到（查询 {n} 次）。",
+    "usage_none": "这张表还没有被运行用到过。",
     "description": "数据源说明：{text}",
     "guidance": "数据源的起草要求（使用者补充的背景和要求）：{text}",
     "structure": "表结构：",
@@ -469,7 +470,8 @@ async def prepare(session: AsyncSession, row: Any, source: Any, table: str,
     entries = await catalog.read_catalog(session, source.id)
     entry = entries.get(table)
     notes = entry.notes if entry else {}
-    usage = (await catalog.table_usage(session, source)).get(table, 0)
+    usage = await table_usage_counts(session, source)
+    used, runs = usage.queries.get(table, 0), usage.runs.get(table, 0)
     blank_n, blank_cols = await _last_blank(session, source.id, table)
 
     lines = [labels["head"], labels["table"].format(source=row.name, kind=row.kind, table=table,
@@ -477,7 +479,7 @@ async def prepare(session: AsyncSession, row: Any, source: Any, table: str,
     comment = str(meta.get("comment") or "").strip()
     if comment:
         lines.append((labels["system"] if system_notes else labels["comment"]).format(text=comment))
-    lines.append(labels["usage"].format(n=usage))
+    lines.append(labels["usage"].format(runs=runs, n=used) if used else labels["usage_none"])
     description = str(getattr(row, "description", "") or "").strip()
     if description:
         lines.append(labels["description"].format(text=description))
@@ -693,11 +695,9 @@ class _Tools:
 
 
 def _where(key: catalog.Slot, change: catalog.PatchChange) -> str:
-    """提案里一项的中文说法：「列 status 的码值」「表的有效记录条件」「指向 members 的关联关系」。"""
+    """提案里一项的中文说法：「列 status 的码值」「表的有效记录条件」「指向 members 的关联关系」（同审阅队列的 field_label）。"""
     value = change.after if isinstance(change.after, Mapping) else change.before
-    if key[0] == "r" and isinstance(value, Mapping) and value.get("to_table"):
-        return f"指向 {value['to_table']} 的关联关系"
-    return catalog.describe_slot(key)
+    return item_label(key, value if isinstance(value, Mapping) else None)
 
 
 # ==========================================================================

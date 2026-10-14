@@ -2,11 +2,13 @@
 
 - GET  /catalog/review-queue：只列推断（proposed）的项，按「使用次数权重 × 风险权重 × 来源权重」从高到低，同分按表名、
   路径；facts（有效记录条件、去重规则、业务日期、关联关系、业务主键、度量类型）/ names（中文名、说明、含义、单位、码值、
-  粒度、表类型）两组；按表筛选；分页；reasons 写为什么排在这里；表结构里已经没有的表、列不列
+  粒度、表类型）两组；按表筛选；分页；field_label 是给人看的位置（「列 status 的码值」）；reasons 写为什么排在这里
+  （被几次运行用到，和 /usage 的 total 一致）；table_usage 是使用次数（同目录清单）；表结构里已经没有的表、列不列
 - POST /catalog/review/batch：逐表按 if_version 乐观锁，一张表冲突不影响别的表；同一张表的几条一次写入；路径不对、表不存在
   逐条报
 - GET  /catalog/{table}/usage：用过这张表的运行，新的在前，取法同 catalog.table_usage
-- GET  /catalog/review-progress：常用 20 张表、全部、影响数字的项各自的确认情况
+- GET  /catalog/review-progress：常用 20 张表（使用次数前 20 张，同起草的默认范围：用到的不够 20 张时按表结构的顺序
+  补齐）、全部、影响数字的项各自的确认情况
 
 表名、列名、业务数字都是虚构的。
 """
@@ -188,11 +190,11 @@ async def test_queue_lists_only_proposed_items_by_priority(client):
     rel_id = _member_rel()["id"]
     assert (first["table_name"], first["path"]) in {("orders", "valid_filter"), ("orders", f"relations.{rel_id}")}
     vf = next(i for i in items if i["path"] == "valid_filter")
-    assert vf["field"] == "valid_filter" and vf["field_label"] == "有效记录条件"
+    assert vf["field"] == "valid_filter" and vf["field_label"] == "表的有效记录条件"
     assert vf["value"] == "status <> 9" and vf["display"] == "status <> 9"
     assert vf["source"] == "llm" and vf["note"] == "剖析核对：排除 3.2% 的行（共 12,345 行）"
     assert vf["table_usage"] == 37 and vf["version"] == 1
-    assert vf["reasons"] == ["常用表（使用 37 次）", "影响数字的项（有效记录条件）", "模型起草，未确认"]
+    assert vf["reasons"] == ["常用表（被 37 次运行用到）", "影响数字的项（有效记录条件）", "模型起草，未确认"]
     # 常用表上的中文名排在没人用的表上的中文名前面；同一张表上影响数字的项排在中文名前面
     order = [(i["table_name"], i["path"]) for i in items]
     assert order.index(("orders", "label")) < order.index(("coupons", "label"))
@@ -203,7 +205,7 @@ async def test_queue_values_are_displayed_in_ui_words(client):
     sid = await _source()
     items = {(i["table_name"], i["path"]): i for i in (await client.get(f"{_base(sid)}/review-queue")).json()["items"]}
     rel = items[("orders", f"relations.{_member_rel()['id']}")]
-    assert rel["field"] == "relation" and rel["field_label"] == "关联关系"
+    assert rel["field"] == "relation" and rel["field_label"] == "指向 members 的关联关系"
     assert rel["value"] == {"columns": ["member_id"], "to_table": "members", "to_columns": ["id"],
                             "cardinality": "many_to_one", "coverage": 0.98}
     assert rel["display"] == "member_id → members.id（多对一，覆盖率 98%）"
@@ -211,13 +213,37 @@ async def test_queue_values_are_displayed_in_ui_words(client):
     kind = items[("orders", "kind")]
     assert kind["display"] == "明细表" and kind["value"] == "fact"
     codes = items[("orders", "columns.status.codes")]
-    assert codes["field"] == "codes" and codes["field_label"] == "码值" and codes["column"] == "status"
+    assert codes["field"] == "codes" and codes["field_label"] == "列 status 的码值" and codes["column"] == "status"
     assert codes["display"] == "1=已支付、9=含义待填写"
     assert "1 个码值的含义待填写" in codes["reasons"] and "数据剖析，未确认" in codes["reasons"]
     assert items[("orders", "columns.amount.measure")]["display"] == "可累加"
-    assert items[("members", "keys")]["display"] == "id"
+    assert items[("members", "keys")]["display"] == "id" and items[("members", "keys")]["field_label"] == "表的业务主键"
+    assert items[("orders", "columns.amount.measure")]["field_label"] == "列 amount 的度量类型"
     assert items[("members", "label")]["reasons"] == ["名称和说明（中文名）", "模型起草，未确认"]
     assert items[("coupons", "label")]["reasons"] == ["名称和说明（中文名）", "数据库注释，未确认"]
+
+
+async def test_queue_reasons_count_runs_like_the_usage_list(client):
+    """同一次运行里查了几次这张表：原因写「被几次运行用到」（和 /usage 的 total 一样），table_usage 是使用次数（和目录清单的
+    「使用 N 次」一样），两个数不一样时原因里两个都写；优先级按使用次数（同清单的排序）。"""
+    sid = await _source()
+    async with SessionLocal() as session:
+        name = (await session.get(DataSource, sid)).name
+    runs = await _use(sid, name, {"orders": 2, "members": 1})
+    async with SessionLocal() as session:
+        for _ in range(3):
+            session.add(Artifact(id=uuid.uuid4().hex, run_id=runs[0], kind=catalog.QUERY_SNAPSHOT_KIND,
+                                 meta={"source_id": sid, "source": name, "tables": ["orders"]}))
+        await session.commit()
+        usage = await catalog.table_usage(session, await session.get(DataSource, sid))
+    assert usage["orders"] == 5
+    items = {(i["table_name"], i["path"]): i for i in (await client.get(f"{_base(sid)}/review-queue")).json()["items"]}
+    vf = items[("orders", "valid_filter")]
+    assert vf["table_usage"] == 5
+    assert vf["reasons"][0] == "常用表（被 2 次运行用到，使用 5 次）"
+    assert items[("members", "label")]["reasons"][0] == "常用表（被 1 次运行用到）"
+    assert vf["priority"] == round(catalog_review.priority(5, ("t", "valid_filter"), "llm"), 4)
+    assert (await client.get(f"{_base(sid)}/orders/usage")).json()["total"] == 2
 
 
 async def test_queue_filters_by_kind_and_table_and_pages(client):
@@ -338,20 +364,34 @@ async def test_table_usage_lists_runs_newest_first(client):
 # --------------------------------------------------------------------------
 
 
-async def test_review_progress_counts_top_tables_all_and_facts(client):
+async def test_review_progress_counts_top_tables_all_and_facts(client, monkeypatch):
     sid = await _source(usage={"orders": 5})
     r = await client.get(f"{_base(sid)}/review-progress")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["top_n"] == 20
-    # 常用表只算被运行用到过的表：这里只有 orders（9 项：表结构里没有的列不算）
-    assert body["top"] == {"tables": 1, "items_total": 9, "items_confirmed": 1, "items_proposed": 7,
-                           "items_verified": 0}
-    assert body["all"] == {"items_total": 13, "items_confirmed": 1, "items_proposed": 11, "items_rejected": 1,
-                           "items_verified": 0}
+    # 表结构里只有 3 张表：都算常用表（使用次数前 20 张）；表结构里没有的表、列不算
+    assert body["top"] == {"tables": 3, "items_total": 13, "items_confirmed": 1}
+    assert body["all"] == {"items_total": 13, "items_confirmed": 1, "items_proposed": 11, "items_rejected": 1}
     # 影响数字的项：有效记录条件、关联关系、度量类型、业务主键
     assert body["facts"] == {"proposed": 4, "confirmed": 0}
     await client.post(f"{_base(sid)}/review/batch", json={"items": [
         {"table_name": "orders", "path": "valid_filter", "action": "confirm", "if_version": 1}]})
     after = (await client.get(f"{_base(sid)}/review-progress")).json()
     assert after["top"]["items_confirmed"] == 2 and after["facts"] == {"proposed": 3, "confirmed": 1}
+    # 只取前 2 张：用得多的在前，没人用的按表结构的顺序补（同起草的默认范围）
+    monkeypatch.setattr(catalog_review, "TOP_N", 2)
+    used = await _source(usage={"coupons": 1})
+    top = (await client.get(f"{_base(used)}/review-progress")).json()["top"]
+    assert top == {"tables": 2, "items_total": 1 + 9, "items_confirmed": 1}
+
+
+def test_top_tables_are_the_draft_default_scope():
+    """常用表和起草对话框「使用次数最多的 20 张表」是同一批：使用次数从多到少，一样多（包括都没用过）的按表结构里的顺序。"""
+    tables = {f"t{i:02d}": {} for i in range(30)}
+    usage = {"t29": 4, "t05": 4, "t17": 9}
+    top = catalog_review.top_tables(tables, usage)
+    assert catalog_review.TOP_N == catalog.DRAFT_DEFAULT_TABLES == 20
+    assert top[:3] == ["t17", "t05", "t29"] and len(top) == 20
+    assert top[3:] == [n for n in tables if n not in usage][:17]
+    assert catalog_review.top_tables({"a": {}, "b": {}}, {}) == ["a", "b"]

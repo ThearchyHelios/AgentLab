@@ -39,7 +39,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data import catalog, catalog_jobs
-from app.data.catalog_review import field_label, slot_path
+from app.data.catalog_review import item_label, slot_path
 from app.data.engine import masked_columns
 from app.data.names import name_key
 
@@ -358,7 +358,7 @@ def plan_table(table_name: str, target: str, file_notes: Mapping[str, Any], targ
                 plan.keep += 1
             else:
                 plan.conflicts.append({
-                    "path": slot_path(mapped), "label": _label(mapped, item),
+                    "path": slot_path(mapped), "label": item_label(mapped, item),
                     "file_value": _shown_value(mapped, item), "target_value": _shown_value(mapped, have),
                     "file_status": status, "target_status": have.get("status"),
                     "why": _conflict_why(str(status), str(have.get("status"))),
@@ -369,14 +369,6 @@ def plan_table(table_name: str, target: str, file_notes: Mapping[str, Any], targ
             plan.update += 1
             plan.writes[mapped] = item
     return plan
-
-
-def _label(key: catalog.Slot, item: Mapping[str, Any]) -> str:
-    if key[0] == "t":
-        return f"表的{field_label(key)}"
-    if key[0] == "c":
-        return f"列 {key[1]} 的{field_label(key)}"
-    return f"指向 {item.get('to_table')} 的关联关系"
 
 
 def _shown_value(key: catalog.Slot, item: Mapping[str, Any]) -> Any:

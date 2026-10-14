@@ -335,7 +335,7 @@ async def test_background_has_structure_catalog_and_hides_masked_values(client, 
         assert rule in system
     # 表结构、目录（来源和状态）、使用次数、起草要求、数据源说明
     for fact in ("order_no", "status", "amount", "member_id → members.id", "主键", "每笔订单一行", "人工填写", "已确认",
-                 "模型起草", "已驳回", "被运行用过 0 次", "金额一律按元", "虚构的网店库", "数据剖析：全表 30 行"):
+                 "模型起草", "已驳回", "还没有被运行用到过", "金额一律按元", "虚构的网店库", "数据剖析：全表 30 行"):
         assert fact in system, fact
     # 别的表指过来的关联关系
     assert "members.id → orders.member_id" in system
@@ -349,6 +349,26 @@ async def test_background_has_structure_catalog_and_hides_masked_values(client, 
     # 没开剖析的源才写不能查数据；这里开了，给了查询工具
     assert model.tool_names() == ["run_query", "propose_changes"]
     assert "没开剖析" not in system
+
+
+async def test_background_says_how_many_runs_used_the_table(client, tmp_path, monkeypatch):
+    """使用次数的口径同审阅队列：被几次运行用到（同「用过这张表的运行」的 total），查询几次（同目录清单的「使用 N 次」）。"""
+    from app.db.models import Artifact, Run
+
+    sid = await _source(client, tmp_path)
+    async with SessionLocal() as session:
+        name = (await session.get(DataSource, sid)).name
+        for i, n in enumerate((2, 1)):
+            rid = uuid.uuid4().hex
+            session.add(Run(id=rid, graph={}, workflow_name=f"周报{i}", status="succeeded"))
+            for _ in range(n):
+                session.add(Artifact(id=uuid.uuid4().hex, run_id=rid, kind=catalog.QUERY_SNAPSHOT_KIND,
+                                     meta={"source_id": sid, "source": name, "tables": ["orders"]}))
+        await session.commit()
+    model = Scripted([Turn(text=["好。"])])
+    use(monkeypatch, model)
+    await _talk(client, sid, _ask("看看"))
+    assert "这张表被 2 次运行用到（查询 3 次）。" in model.seen[0][0].content
 
 
 async def test_long_catalogs_are_cut_with_a_note(client, tmp_path, monkeypatch):
