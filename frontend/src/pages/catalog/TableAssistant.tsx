@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { ArrowUp, BookMarked, Database, Info, MessagesSquare, Minus, Plus, Square, Trash2, X } from 'lucide-react'
 import clsx from 'clsx'
@@ -149,11 +149,12 @@ export function TableAssistant({ sourceId, table, tableLabel, detail, profileEna
     if (!streaming) send(text)
   }
 
-  const drop = (path: string) => setPending((cur) => dropPending(cur, path))
-  const restore = (part: Extract<TurnPart, { kind: 'proposal' }>, path: string) => {
+  // 两个回调保持不变：流式的正文每来一段只重画正在回答的那一轮
+  const drop = useCallback((path: string) => setPending((cur) => dropPending(cur, path)), [])
+  const restore = useCallback((part: Extract<TurnPart, { kind: 'proposal' }>, path: string) => {
     const change = part.changes.find((c) => c.path === path)
     if (change) setPending((cur) => mergeProposal(cur, [change], part.id, part.version))
-  }
+  }, [])
   const clearAll = async () => {
     if (!pendingRef.current.length) return
     if (!(await confirmDialog({ title: T.clearTitle(pendingRef.current.length), confirmLabel: T.clearConfirm, danger: true }))) return
@@ -259,7 +260,7 @@ export function TableAssistant({ sourceId, table, tableLabel, detail, profileEna
               <div className="flex flex-wrap gap-1.5">
                 {lastBlank > 0 && blankCols.length > 0 && (
                   <SuggestButton kind="blank" label={T.suggestBlank(lastBlank)}
-                                 onClick={() => send(T.suggestBlankText(blankCols.slice(0, 20)))} />
+                                 onClick={() => send(T.suggestBlankText(blankCols.slice(0, 20), blankCols.length))} />
                 )}
                 <SuggestButton kind="facts" label={T.suggestFacts} onClick={() => send(T.suggestFactsText)} />
                 {hasProposed && <SuggestButton kind="pending" label={T.suggestPending} onClick={() => send(T.suggestPendingText)} />}
@@ -333,7 +334,7 @@ function SuggestButton({ kind, label, onClick }: { kind: string; label: string; 
 // 一轮回答：正文、只读查询、修改提案按到来的先后排；末尾写这一轮的结局（出错、停止、用量）
 // ---------------------------------------------------------------------------
 
-function AssistantTurnView({ turn, pending, saved, onDrop, onRestore }: {
+const AssistantTurnView = memo(function AssistantTurnView({ turn, pending, saved, onDrop, onRestore }: {
   turn: AssistantTurn
   pending: PendingChange[]
   saved: ReadonlySet<string>
@@ -366,14 +367,14 @@ function AssistantTurnView({ turn, pending, saved, onDrop, onRestore }: {
       {turn.state === 'stopped' && (
         <p className="text-2xs text-faint" data-assistant-turn-status="stopped">{T.stopped}</p>
       )}
-      {turn.state === 'done' && (usage || turn.queries) && (
+      {turn.state === 'done' && (!!usage || (turn.queries ?? 0) > 0) && (
         <p className="tnum text-2xs text-faint" data-assistant-turn-status="done">
           {[usage ? T.usage(usage.input_tokens, usage.output_tokens) : '', turn.queries ? T.queries(turn.queries) : ''].filter(Boolean).join(' · ')}
         </p>
       )}
     </div>
   )
-}
+})
 
 /** 助手跑过的一条只读查询：摘要写行数（失败写原因），展开看 SQL 和前几行 */
 function QueryBlock({ part }: { part: Extract<TurnPart, { kind: 'query' }> }) {

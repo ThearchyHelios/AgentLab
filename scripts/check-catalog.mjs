@@ -1604,8 +1604,9 @@ await section('数据目录 · 起草：逐段写进目录、块进度与停止�
   check('……可以只重试这 2 张', (await page.locator('[data-draft-retry]').innerText().catch(() => '')).includes('（2 张）'))
   await page.locator('[data-draft-close]').click()
 
-  // 老服务端停下来时原因里没写：界面自己补一句
-  const legacy = newJob(state, S1, { tables: ['store_sales'], use_model: true })
+  // 老服务端停下来时原因里没写：界面自己补一句。部分完成的表段进度是「都结束了」，看不出写进了几段：也写一句
+  const legacy = newJob(state, S1, { tables: ['store_sales', 'members'], use_model: true })
+  settle(state, legacy, 'members', { status: 'partial', parts_total: 2, parts_done: 2, parts_written: 1, model_error: CALL_ERR })
   settle(state, legacy, 'store_sales', { status: 'running', parts_done: 1, parts_written: 1 })
   stopJob(legacy)
   legacy.tasks[0].model_error = null
@@ -1615,6 +1616,8 @@ await section('数据目录 · 起草：逐段写进目录、块进度与停止�
   await draftBox(page).locator('[data-draft-last-open]').click()
   check('服务端的原因里没写已写进几段：界面补「已写进目录 1 段，剩下 2 段没起草」', await until(async () => (await text('store_sales', '[data-draft-task-written]')) === '已写进目录 1 段，剩下 2 段没起草'),
     await text('store_sales', '[data-draft-task-written]'))
+  check('……部分完成的表写「已写进目录 1 段」，原因照旧', (await text('members', '[data-draft-task-written]')) === '已写进目录 1 段'
+        && (await text('members', '[data-draft-task-reason]')).includes(CALL_ERR), await text('members', '[data-draft-task-written]'))
   await page.locator('[data-draft-close]').click()
   state.jobs.pop()
 

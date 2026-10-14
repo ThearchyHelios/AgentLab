@@ -3005,7 +3005,8 @@ export const CATALOG_ASSISTANT_TEXT = {
     `上次起草有 ${formatNumber(n)} 列模型拿不准、留空了${cols.length ? `，例如 ${cols.join('、')}` : ''}。可以先从这几列开始。`,
   suggestLabel: '可以这样开始',
   suggestBlank: (n: number) => `补上留空的 ${formatNumber(n)} 列`,
-  suggestBlankText: (cols: string[]) => `请帮我补上这几列的中文名和含义：${cols.join('、')}。拿不准的地方先问我。`,
+  suggestBlankText: (cols: string[], total: number) =>
+    `请帮我补上这几列的中文名和含义：${cols.join('、')}${total > cols.length ? ` 等 ${formatNumber(total)} 列` : ''}。拿不准的地方先问我。`,
   suggestFacts: '核对有效记录条件和去重规则',
   suggestFactsText: '这张表的有效记录条件和去重规则应该怎么写？拿不准的地方先问我。',
   suggestPending: '看看哪些推断可以确认',

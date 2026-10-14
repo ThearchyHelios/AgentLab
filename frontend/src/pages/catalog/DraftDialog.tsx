@@ -533,13 +533,13 @@ function TaskRow({ task: t, jobError }: { task: CatalogDraftTask; jobError: stri
   const reason = jobError && t.error === jobError ? (t.model_error ?? '') : taskReason(t)
   const started = t.status !== 'pending' && t.status !== 'skipped'
   const parts = t.parts_total != null && t.parts_total > 1 && started
-  // 段被缩小、拆半后实际的块（比段多时才写）；已经写进目录的段：起草中写着（停止也不丢），停下来时服务端的原因里
-  // 没说的才补一句（没写全的段为什么没写出来，服务端的原因里有），写完了的不写
+  // 段被缩小、拆半后实际的块（比段多时才写）；已经写进目录的段：起草中、部分完成时写着（停止也不丢，部分完成的
+  // 段进度是「都结束了」，看不出写进了几段），停下来时补一句剩下几段没起草。服务端的原因里已经写了的不重复，写完了的不写
   const chunks = started ? chunksOf(t) : null
   const written = writtenOf(t)
-  const writtenText = written > 0 && t.status === 'running' ? DT.partsWritten(written)
-    : written > 0 && t.status === 'cancelled' && !reason.includes(DT.partsWritten(written))
-      ? DT.partsWrittenStopped(written, Math.max(0, (t.parts_total ?? written) - written)) : ''
+  const writtenText = written <= 0 || reason.includes(DT.partsWritten(written)) ? ''
+    : t.status === 'running' || t.status === 'partial' ? DT.partsWritten(written)
+      : t.status === 'cancelled' ? DT.partsWrittenStopped(written, Math.max(0, (t.parts_total ?? written) - written)) : ''
   const changes = DT.taskAdded(t.added, t.updated)
   const blank = blankOf(t)
   const sample = t.blank_sample?.filter(Boolean) ?? []
