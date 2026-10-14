@@ -8,7 +8,8 @@
 - POST   /catalog/{table}/patch  保存目录修改提案（乐观锁），记为人工确认
 - GET    /catalog/{table}/impact 影响面：引用这张表的已发布、受管模板（data/catalog_impact.py）
 - POST   /catalog/draft          同步起草（注释、外键、命名推断，可选模型）。界面改用下面的后台起草任务，这个留着；
-                                 同一个源有排队或进行中的后台任务时 409 catalog_draft_busy
+                                 和后台任务双向互斥：同一个源有排队或进行中的后台任务（或正在同步起草）时 409
+                                 catalog_draft_busy，同步起草期间建任务、重试、导入也是 409
 - PUT    /catalog/guidance       数据源级的起草要求（使用者补充的背景和要求，起草时交给模型）
 - POST   /catalog/draft-jobs     建后台起草任务（202）；GET /draft-jobs/active、/latest、/{job_id} 读任务；
                                  POST /draft-jobs/{job_id}/cancel 停止，/retry 只重试没写好的表（data/catalog_jobs.py）
@@ -419,20 +420,21 @@ async def draft_catalog(source_id: str, payload: CatalogDraftIn,
     model_items：模型给了这张表几项可用内容（没用模型、模型这部分失败时为 null）。界面据此区分「模型给了内容、
     只是和现有目录一致」（model_items > 0、三个数都是 0）和「模型没给内容」（model_error 有值）。
 
-    同一个源有排队或进行中的后台起草任务时 409 catalog_draft_busy（和建任务同一句话）：两边同时写同一个源的目录、
-    抢模型名额。
+    双向互斥（catalog_jobs.sync_draft，进程内登记）：同一个源有排队或进行中的后台起草任务、或者正在同步起草时 409
+    catalog_draft_busy（和建任务同一句话）；反过来，同步起草进行期间同一个源建任务、重试、导入目录也是 409。两边同时写
+    同一个源的目录、抢模型名额。
     """
     row, source = await _resolved(session, source_id)
+    cache = source.schema_cache or {}
     try:
-        await catalog_jobs.ensure_idle(session, row)
+        async with catalog_jobs.sync_draft(session, row):
+            if not cache.get("tables"):
+                raise _no_schema(cache)
+            report = await catalog.draft_catalog(session, source, tables=payload.tables or None,
+                                                 use_model=payload.use_model, actor=actor_of(x_actor),
+                                                 guidance=catalog_jobs.guidance_of(row))
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
-    cache = source.schema_cache or {}
-    if not cache.get("tables"):
-        raise _no_schema(cache)
-    report = await catalog.draft_catalog(session, source, tables=payload.tables or None,
-                                         use_model=payload.use_model, actor=actor_of(x_actor),
-                                         guidance=catalog_jobs.guidance_of(row))
     rows = [{"table_name": r.table, "added": r.added, "updated": r.updated, "removed": r.removed,
              "version": r.version, "error": r.error, "model_error": r.model_error, "model_items": r.model_items}
             for r in report.tables]

@@ -1488,9 +1488,13 @@ MODEL_FALLBACK_MAX_TOKENS = 8192
 #: 一段没写出来（额度用完、只给空壳）时拆成两半再问：最多拆几层、拆到最少几列为止
 MODEL_SPLIT_DEPTH = 3
 MODEL_SPLIT_MIN_COLUMNS = 5
-#: 止损：连续这么多段拆到底仍一项没写出来，这次起草后面的段不再拆小重试（模型明显用不了时不该一段一段拆到底烧额度；
-#: 每段另有 MODEL_PART_MAX_CALLS 次封顶）
-MODEL_GIVE_UP_AFTER = 2
+#: 止损（按比例）：这次起草最近 MODEL_HALT_WINDOW 次调用里有 MODEL_HALT_ON 次以上没写出来（额度用完、超时、空壳、出错），
+#: 之后的段不再拆小、每块只问一次，直到比例降下去。模型明显用不了时不该一段一段拆到底烧额度；以前按「连续几段」算，
+#: 偶尔一次写出来就清零，会思考的模型在宽表上 90 分钟停不下来。每段另有 MODEL_PART_MAX_CALLS 次封顶
+MODEL_HALT_WINDOW = 10
+MODEL_HALT_ON = 7
+#: 同一张表连续这么多个原始段都一项没写出来，这张表剩下的段跳过不问（可以换一个起草模型后只重试这张表）
+MODEL_TABLE_GIVE_UP_AFTER = 3
 #: 网络错误、429、5xx 最多重试几次，每次重试前等多久（秒，依次取用）。超时不原样重试，当作这一段太大、拆小再问
 MODEL_RETRIES = 2
 MODEL_RETRY_DELAYS_S = (10.0, 30.0)
@@ -1512,6 +1516,10 @@ CATALOG_DRAFT_SYSTEM = """你在为一个业务数据库编写数据目录：说
 log（日志表）、config（配置表）之一。
 - keys：业务主键，即在业务上唯一确定一行的列（可以和数据库主键不同），写列名。
 - business_date：业务日期按哪一列算，rule 写一句规则，timezone 写时区（不确定就留空）。
+- valid_filter：有效行过滤。condition 写一段 SQL 条件，筛出业务上算数的行（例如 STATUS NOT IN ('C', 'X')，去掉作废、\
+测试的行）：只用这张表自己的列、不带表名，只写比较、IN、BETWEEN、LIKE、IS NULL，用 AND、OR、NOT 连接，函数只用 UPPER、\
+LOWER、TRIM、COALESCE，不写子查询、聚合、窗口函数和分号；reason 写一句依据（例如哪条注释、哪些码值说明了这一点）。
+- dedup：去重规则，rule 写一句话（例如「同一订单号有多行时只取最后修改的那一行」），reason 写一句依据。
 - columns：每一列的 label（中文名）、meaning（含义，一句话）、unit（单位，例如「元」「人」，没有单位就留空）、\
 measure（度量类型：flow 流量，可跨期加总；stock 存量，时点值，不能跨期加总；ratio 比率；identifier 标识；\
 status 状态；attribute 属性）。
@@ -1519,6 +1527,8 @@ status 状态；attribute 属性）。
 规矩：
 - 只写数据事实，不写计算公式，不写指标怎么算。
 - 拿不准的字段留空，不要猜。列名、表名照原样写，不要翻译或改写。
+- 有效行过滤、去重规则只在表结构、注释、码值能看出来时才写（例如状态列的注释写明了哪些取值是作废、测试），拿不准就不写，\
+没有就不写：写错了会把算数的行筛掉、把不该合并的行合并。
 - 请你写的每一列都在 columns 里写一项，拿不准的字段可以留空，但不要漏掉列：漏掉的列会被再问一次。
 - 标着「系统说明」的内容是导入时按核对结果生成的，以它为准：不要重复，也不要与之矛盾。
 - 标着「已确认」的目录项由人工确认过，以它为准。
@@ -1537,6 +1547,7 @@ CATALOG_DRAFT_BACKGROUND_PROMPT = "使用者补充的背景和要求：\n{lines}
 CATALOG_DRAFT_TEXT_PROMPT = """只输出一个 JSON 对象，不要输出别的文字，格式如下（拿不准的字段不写）：
 {"tables": [{"table": "表名", "label": "中文名", "grain": "一行代表什么", "kind": "表类型", "keys": ["列名"], \
 "business_date": {"column": "列名", "rule": "一句规则", "timezone": "时区"}, \
+"valid_filter": {"condition": "SQL 条件", "reason": "一句依据"}, "dedup": {"rule": "一句话", "reason": "一句依据"}, \
 "columns": [{"name": "列名", "label": "中文名", "meaning": "含义", "unit": "单位", "measure": "度量类型"}]}]}
 表类型写 fact、dimension、snapshot、log、config 之一；度量类型写 flow、stock、ratio、identifier、status、attribute 之一。"""
 
@@ -1556,11 +1567,14 @@ CATALOG_DRAFT_PROMPT_LABELS = {
     "unique": "唯一约束：{cols}",
     "confirmed": "已确认的目录项：",
     # 分段起草：表名下一行说这次只写哪部分（宽表的表级一段、列分段，拆小重问时的半段）
-    "only_table": "这次只写表级的项（中文名、粒度、表类型、业务主键、业务日期），不写列",
+    "only_table": "这次只写表级的项（中文名、粒度、表类型、业务主键、业务日期、有效行过滤、去重规则），不写列",
     "only_columns": "这次只写下面列出的 {n} 列（这张表共 {total} 列），不写表级的项",
     "table_and_columns": "这次只写表级的项和这 {n} 列：{cols}",
     "brief_columns": "列（共 {n} 列，这里只列名字和类型）：",
     "drafted": "已起草的表级内容：",
+    # 开了数据剖析的源：目录里记下的码值（剖析看到的取值和已知含义）交给模型，判断有效行过滤用；遮罩的列不给
+    "codes": "目录里记下的码值（数据剖析看到的取值和已知含义，可据此判断有效行过滤）：",
+    "code": "- {name}：{codes}",
     # 使用者补充的背景和要求
     "description": "数据源说明：{text}",
     "guidance": "起草要求：{text}",
@@ -1587,6 +1601,20 @@ CATALOG_DRAFT_PROMPT_SCHEMA: dict[str, Any] = {
                         "properties": {"column": {"type": "string"}, "rule": {"type": "string"},
                                        "timezone": {"type": "string"}},
                         "required": ["column"],
+                    },
+                    "valid_filter": {
+                        "type": "object",
+                        "description": "有效行过滤：只在表结构、注释、码值能看出来时才写",
+                        "properties": {"condition": {"type": "string", "description": "SQL 条件，只用这张表的列"},
+                                       "reason": {"type": "string", "description": "一句依据"}},
+                        "required": ["condition"],
+                    },
+                    "dedup": {
+                        "type": "object",
+                        "description": "去重规则：只在表结构、注释能看出来时才写",
+                        "properties": {"rule": {"type": "string", "description": "一句话"},
+                                       "reason": {"type": "string", "description": "一句依据"}},
+                        "required": ["rule"],
                     },
                     "columns": {
                         "type": "array",
@@ -1708,11 +1736,77 @@ def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
     return text if text and len(text) <= limit else None
 
 
-def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool) -> dict[str, Any]:
+#: 模型给的依据（有效行过滤、去重规则的 reason）写进这一项的 note
+FACT_REASON_NOTE = "依据：{reason}"
+#: 有效行过滤按数据源的写法整理（列名加了引号）以后超过目录里这一项的长度上限
+FACT_FILTER_TOO_LONG = "{label}按数据源的写法整理后超过 {limit} 字"
+
+
+def _model_fact(raw: Any, key: str) -> tuple[str, str | None] | None:
+    """模型给的有效行过滤、去重规则 → (取值, 依据)。约定是对象（{condition 或 rule, reason}），只写了一段文字的也认；
+    取值不是非空文字的不要。"""
+    if isinstance(raw, str):
+        text, reason = raw, None
+    elif isinstance(raw, Mapping):
+        text, reason = raw.get(key), raw.get("reason")
+        if text is None:
+            text = raw.get("value")
+    else:
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return text.strip(), _clean_text(reason)
+
+
+def _fact_item(value: str, reason: str | None) -> dict[str, Any]:
+    return make_item(value, "llm", note=FACT_REASON_NOTE.format(reason=reason) if reason else None)
+
+
+def _model_facts(entry: Mapping[str, Any], meta: Mapping[str, Any], *, kind: str | None, table: str | None,
+                 dropped: list[tuple[str, str]] | None = None) -> dict[str, Any]:
+    """模型提议的有效行过滤、去重规则（llm / proposed，依据写进 note）。
+
+    有效行过滤按数据源的方言解析成一个条件、只能用这张表的列（sqlcheck.parse_valid_filter），不过就丢掉、不算这张表
+    失败：服务端日志记一条，dropped 给了就记下 (原因, 模型写的条件)，起草引擎把它写进这张表的日志（起草任务逐表的
+    log）。存的是 sqlcheck.stored_valid_filter 整理过的写法：原文照旧，只把列换成表结构里的真名、不带表名，按数据源的
+    需要加引号——剖析核对的、SQL 检查让模型照着加的都是这一条。去重规则是一句话，同文字项的规矩。"""
+    from app.data import sqlcheck
+
+    out: dict[str, Any] = {}
+    found = _model_fact(entry.get("valid_filter"), "condition")
+    if found is not None:
+        text, reason = found
+        parsed = sqlcheck.parse_valid_filter(text, meta, kind=kind, table=table)
+        problem = parsed.problem
+        if problem is None:
+            stored = sqlcheck.stored_valid_filter(parsed, kind)
+            if _text_ok(stored):
+                out["valid_filter"] = _fact_item(stored, reason)
+            else:
+                # 加了引号以后超过上限：写进去会让整张表写入失败（validate_notes），不收
+                problem = FACT_FILTER_TOO_LONG.format(label=TABLE_FIELD_LABEL["valid_filter"], limit=_TEXT_MAX)
+        if problem is not None:
+            import logging
+
+            logging.getLogger(__name__).info("起草数据目录：表 %s 的有效行过滤没有通过校验，已丢掉：%s（%s）",
+                                             table or meta.get("qualified") or entry.get("table"), problem, text[:200])
+            if dropped is not None:
+                dropped.append((problem, text))
+    found = _model_fact(entry.get("dedup"), "rule")
+    if found is not None and (text := _clean_text(found[0])) is not None:
+        out["dedup"] = _fact_item(text, found[1])
+    return out
+
+
+def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool, source_kind: str | None = None,
+                table: str | None = None, dropped: list[tuple[str, str]] | None = None) -> dict[str, Any]:
     """模型给的一张表 → 目录项（llm / proposed）。不合规的值整项丢掉，不硬塞：列名对不上表结构的、
     表类型和度量类型不在取值里的、业务主键里有不存在的列的、看起来是计算公式的（_formula_like，公式进口径卡）。
     该是文字的地方写成了数组、对象（列名、表类型、业务日期的列、度量类型……）同样丢掉，不抛异常：实测见过把列名
-    写成数组的，以前在这里抛 TypeError，整张表记出错。导入表格的源，说明已经覆盖的字段也丢掉。"""
+    写成数组的，以前在这里抛 TypeError，整张表记出错。导入表格的源，说明已经覆盖的字段也丢掉。
+
+    有效行过滤、去重规则见 _model_facts：source_kind 是数据源类型（按它的方言解析条件，不认识的类型不收有效行过滤），
+    table 是表名（条件里的列可以带这张表的表名），dropped 收没通过校验的有效行过滤 (原因, 模型写的条件)。"""
     columns = {c["name"]: c for c in meta.get("columns") or []}
     notes: dict[str, Any] = {}
     table_has_system_note = system and bool((meta.get("comment") or "").strip())
@@ -1734,6 +1828,7 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
             if (text := _clean_text(date.get(k))) is not None:
                 value[k] = text
         notes["business_date"] = make_item(value, "llm")
+    notes.update(_model_facts(entry, meta, kind=source_kind, table=table, dropped=dropped))
     out_cols: dict[str, dict[str, Any]] = {}
     listed = entry.get("columns")
     for col in listed if isinstance(listed, list) else []:
@@ -1842,8 +1937,10 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
     没用模型时为 None）有可用内容的再并上。同步起草和后台起草任务（每张表一结束就调）共用这一处。
 
     - 并入已有目录按 merge_notes 的规则：人工确认、驳回过的项不动。内容没变不写、不升版本。
-    - 模型这次没给的项（留空、没通过校验）不删以前起草的；列已经不在表结构里的，模型各段都写出来时（covered 含 llm）
-      照旧删掉。模型只写出一部分的不算完整起草过（covered 不含 llm）。
+    - 模型这次没给的项（留空、没通过校验）不删以前起草的；列已经不在表结构里的（业务主键、业务日期指着的列也算），
+      整张表起草完（各段都写出来的 ok、只写出一部分的 partial 都一样）就按完整覆盖的规则删掉：删的只是说已经不存在的
+      列的模型起草项，和这次写没写全无关。后台任务里宽表每写出一段就先并入一次（catalog_jobs.write_part，那一次不删
+      任何东西），这里是整张表的收尾。
     - 模型留空的列（blank）按并入之后的目录再筛一遍：已经有中文名或含义的（以前起草的、库注释、起草进行中有人填的）
       不算留空。
     - 写入撞上别人刚改过（乐观锁）就重读重并，最多三次。
@@ -1859,8 +1956,8 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
         if modeled.items:
             result.model_items = modeled.items
             result.blank = list(getattr(modeled, "blank", None) or [])
-            model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"}) if modeled.status == "ok"
-                                     else frozenset())
+            model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"})
+                                     if modeled.status in ("ok", "partial") else frozenset())
     for _attempt in range(3):
         entry = await read_entry(session, source.id, table)
         version = entry.version if entry else 0
@@ -2324,9 +2421,10 @@ __all__ = [
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftModel", "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL",
     "MEASURE_LABEL", "MODEL_BATCH_COLUMNS", "MODEL_BATCH_TABLES", "MODEL_CONCURRENCY", "MODEL_EMPTY_REASON",
-    "MODEL_FALLBACK_MAX_TOKENS", "MODEL_MAX_TOKENS", "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON",
-    "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS", "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER",
-    "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
+    "FACT_REASON_NOTE", "MODEL_FALLBACK_MAX_TOKENS", "MODEL_HALT_ON", "MODEL_HALT_WINDOW", "MODEL_MAX_TOKENS",
+    "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON", "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS",
+    "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER", "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS",
+    "MODEL_TABLE_GIVE_UP_AFTER", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
     "PATCH_MAX_CHANGES",
     "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE", "WRITE_CONFLICT_ERROR", "default_tables",
     "missing_table_error", "pick_tables", "write_draft",

@@ -410,9 +410,14 @@ class CatalogDraftTask(Base):
     table_name: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(20), default="pending")
     column_count: Mapped[int] = mapped_column(Integer, default=0)
-    # 模型分几段起草（不用模型时为 NULL）、已经结束了几段
+    # 模型分几段起草（不用模型时为 NULL）、已经结束了几段、其中写出了内容并进了目录的段数（宽表每写出一段就并入目录，
+    # 停止、服务重启时已经写进去的留着）
     parts_total: Mapped[int | None] = mapped_column(Integer, default=None)
     parts_done: Mapped[int] = mapped_column(Integer, default=0)
+    parts_written: Mapped[int] = mapped_column(Integer, default=0)
+    # 块进度：这张表实际分成几块来问、已经结束了几块（段被缩小、拆成两半后会变多）；不用模型时为 NULL
+    chunks_total: Mapped[int | None] = mapped_column(Integer, default=None)
+    chunks_done: Mapped[int | None] = mapped_column(Integer, default=None)
     added: Mapped[int] = mapped_column(Integer, default=0)
     updated: Mapped[int] = mapped_column(Integer, default=0)
     removed: Mapped[int] = mapped_column(Integer, default=0)
@@ -421,6 +426,8 @@ class CatalogDraftTask(Base):
     # 模型拿不准、留空了的列（中文名和含义都没给）：几列，最多记 5 个列名。表的状态不因此变
     blank_columns: Mapped[int] = mapped_column(Integer, default=0)
     blank_sample: Mapped[list[Any] | None] = mapped_column(default=None)
+    # 起草时记下的几句话，不算失败（模型提议的有效记录条件没有收下的原因），最多 10 句
+    log: Mapped[list[Any] | None] = mapped_column(default=None)
     # error：整张表没起草（表结构里没有、写入一直冲突、服务重启中断）；model_error：模型那部分没写出来的原因和办法
     error: Mapped[str | None] = mapped_column(Text, default=None)
     model_error: Mapped[str | None] = mapped_column(Text, default=None)

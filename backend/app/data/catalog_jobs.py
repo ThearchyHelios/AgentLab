@@ -6,11 +6,15 @@
 - **建任务**（create_job）：同一个数据源同时只有一个排队或进行中的任务（DraftBusy；部分唯一索引兜底）。不指定表时
   按使用次数取前 20 张；表结构里没有的表照样建进任务、状态 skipped。起草要求（数据源级）和本次说明随任务记下快照。
 - **在后台起草**（manager.start）：进程内的 asyncio 任务，引擎是 data/catalog_draft.py（分段、按失败原因处理）。
-  每张表一结束就并入目录（catalog.write_draft，规则和同步起草一样：人工确认、驳回过的不动，模型这次没给的项不删
-  以前起草的，乐观锁冲突重读重并）；逐表的状态、到第几段、计数、模型留空的列，任务的用量（含超时、没写出来的调用
-  次数）、当前的列数上限、提醒随时落库，接口读的是库里的状态。
+  宽表每写出一段就并入目录（write_part：这一次合并不删任何东西），整张表结束（不管写全没写全）再按完整覆盖的规则
+  收尾一次（catalog.write_draft，规则和同步起草一样：人工确认、驳回过的不动，模型这次没给的项不删以前起草的，只删
+  已经不在表结构里的列的模型项，乐观锁冲突重读重并）；新增、更新、删除的计数是各次写入的合计。逐表的状态、到第几段、
+  写进目录的段数、块进度、计数、模型留空的列，任务的用量（含超时、没写出来的调用次数）、当前的列数上限、提醒随时落库，
+  接口读的是库里的状态。
 - **停止**（cancel）：排队的直接 cancelled；进行中的停掉正在进行的模型调用，没开始和没写完的表记 cancelled，已经写进
-  目录的不回滚，任务最后是 cancelled。
+  目录的（含宽表已经写出来的段）不回滚，任务最后是 cancelled。写过段的表 model_error 说清写进了几段、剩几段没起草。
+- **和同步起草互斥**（sync_draft）：同步起草（POST /catalog/draft）进行期间，同一个源建任务、重试、导入（ensure_idle）
+  都是 DraftBusy；有排队或进行中的任务时同步起草也是。进程内登记（单进程部署）。
 - **重试**（retry_tables + create_job）：新任务，只含原任务里 failed、partial、cancelled 的表；用不用模型、本次说明沿用，
   起草要求取数据源当前的。
 - **服务重启**：启动时（startup）把排队、进行中的任务标成 interrupted，没结束的表记 cancelled、写明「服务重启，起草
@@ -26,11 +30,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -62,6 +67,10 @@ BLANK_SAMPLE = 5
 STOP_GRACE_S = 10.0
 
 INTERRUPTED_ERROR = "服务重启，起草中断"
+#: 停止、中断时写过段的表（宽表每写出一段就并入目录）：写进了几段、剩几段没起草
+STOPPED_WRITTEN = "已停止：已写进目录 {n} 段，剩下 {m} 段没起草"
+INTERRUPTED_WRITTEN = "已中断：已写进目录 {n} 段，剩下 {m} 段没起草"
+_WRITTEN = {"cancelled": STOPPED_WRITTEN, "interrupted": INTERRUPTED_WRITTEN}
 UNFINISHED_ERROR = "起草结束时这张表还没有写完，请重试这张表"
 WRITE_ERROR = "写入数据目录时出错：{line}"
 JOB_ERROR = "起草任务出错：{line}"
@@ -162,6 +171,11 @@ def task_dict(task: CatalogDraftTask) -> dict[str, Any]:
         "columns": task.column_count,
         "parts_total": task.parts_total,
         "parts_done": task.parts_done,
+        # 宽表每写出一段就并入目录：已经写进目录的段数（停止、服务重启时这些段留着）
+        "parts_written": task.parts_written or 0,
+        # 块进度：这张表实际分成的块数和已结束的块数（段被缩小、拆成两半后会变多）；不用模型时为 null
+        "chunks_total": task.chunks_total,
+        "chunks_done": task.chunks_done,
         "added": task.added,
         "updated": task.updated,
         "removed": task.removed,
@@ -170,6 +184,8 @@ def task_dict(task: CatalogDraftTask) -> dict[str, Any]:
         # 模型拿不准、留空了的列（中文名和含义都没给）：几列、最多 5 个列名（按表结构的顺序）。表的状态不因此变
         "blank_columns": task.blank_columns or 0,
         "blank_sample": list(task.blank_sample or []),
+        # 起草时记下的几句话，不算失败（模型提议的有效记录条件没有收下的原因：没通过校验、剖析核对排除 0% 或 100%）
+        "log": list(task.log or []),
         "error": task.error,
         "model_error": task.model_error,
         "started_at": _iso(task.started_at),
@@ -237,21 +253,39 @@ async def job_brief(session: AsyncSession, job: CatalogDraftJob | None) -> dict[
 
 
 async def last_drafts(session: AsyncSession, source_id: str) -> dict[str, dict[str, Any]]:
-    """每张表最近一次起草任务里的那一项：{表名: {status, job_id, finished_at, error, model_error, blank_columns}}。
-    任务还在进行，就是进行中的状态。只看最近 LAST_DRAFT_JOBS 个任务；每张表取哪一项在库里挑好（清单页起草时会反复取）。"""
+    """每张表最近一次起草任务里的那一项：{表名: {status, job_id, finished_at, error, model_error, blank_columns,
+    parts_written, blank_columns_from}}。任务还在进行，就是进行中的状态。只看最近 LAST_DRAFT_JOBS 个任务；每张表取哪一项
+    在库里挑好（清单页起草时会反复取）。
+
+    blank_columns_from：最近一次结束于 ok / partial 的用模型起草记下的留空列数（数字），没有是 null。之后的起草停止了、
+    中断了、而且没有写进新内容（parts_written 为 0）时照样带着，界面据此继续提示留空的列；之后有起草写进了新内容（停止
+    前已经写了几段、或者正在写）就是 null：以前的留空列数可能已经不对了。不用模型的起草不改模型留空的列，不算。"""
     recent = (select(CatalogDraftJob.id).where(CatalogDraftJob.source_id == source_id)
               .order_by(CatalogDraftJob.created_at.desc()).limit(LAST_DRAFT_JOBS)).scalar_subquery()
-    rank = func.row_number().over(partition_by=CatalogDraftTask.table_name,
-                                  order_by=(CatalogDraftJob.created_at.desc(), CatalogDraftTask.seq)).label("rank")
+
+    def ranked() -> Any:
+        return func.row_number().over(partition_by=CatalogDraftTask.table_name,
+                                      order_by=(CatalogDraftJob.created_at.desc(), CatalogDraftTask.seq)).label("rank")
+
     inner = (select(CatalogDraftTask.table_name, CatalogDraftTask.status, CatalogDraftTask.job_id,
                     CatalogDraftTask.finished_at, CatalogDraftTask.error, CatalogDraftTask.model_error,
-                    CatalogDraftTask.blank_columns, rank)
+                    CatalogDraftTask.blank_columns, CatalogDraftTask.parts_written, ranked())
              .join(CatalogDraftJob, CatalogDraftJob.id == CatalogDraftTask.job_id)
              .where(CatalogDraftJob.id.in_(recent))).subquery()
     rows = (await session.execute(select(inner).where(inner.c.rank == 1))).mappings()
+    # 每张表最近一次「写进了模型起草的内容」的用模型起草：结束于 ok / partial 的，或者写过段的（停止、中断、进行中）
+    wrote = (select(CatalogDraftTask.table_name, CatalogDraftTask.status, CatalogDraftTask.blank_columns, ranked())
+             .join(CatalogDraftJob, CatalogDraftJob.id == CatalogDraftTask.job_id)
+             .where(CatalogDraftJob.id.in_(recent), CatalogDraftTask.parts_total.is_not(None),
+                    or_(CatalogDraftTask.status.in_(("ok", "partial")),
+                        func.coalesce(CatalogDraftTask.parts_written, 0) > 0))).subquery()
+    blank_from = {row["table_name"]: (row["blank_columns"] or 0) if row["status"] in ("ok", "partial") else None
+                  for row in (await session.execute(select(wrote).where(wrote.c.rank == 1))).mappings()}
     return {row["table_name"]: {"status": row["status"], "job_id": row["job_id"],
                                 "finished_at": _iso(row["finished_at"]), "error": row["error"],
-                                "model_error": row["model_error"], "blank_columns": row["blank_columns"] or 0}
+                                "model_error": row["model_error"], "blank_columns": row["blank_columns"] or 0,
+                                "parts_written": row["parts_written"] or 0,
+                                "blank_columns_from": blank_from.get(row["table_name"])}
             for row in rows}
 
 
@@ -264,10 +298,41 @@ def busy_message(row: Any) -> str:
     return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录，请等这次起草结束（或先停止它）再开始新的起草"
 
 
+def sync_busy_message(row: Any) -> str:
+    return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录（同步起草），请等这次起草结束再开始新的起草"
+
+
+#: 正在同步起草（POST /catalog/draft）的数据源。进程内登记：服务端是单进程部署，多进程部署时要换成库里的锁
+_SYNC: set[str] = set()
+
+
+def sync_drafting(source_id: str) -> bool:
+    """这个源正在同步起草。"""
+    return source_id in _SYNC
+
+
 async def ensure_idle(session: AsyncSession, row: Any) -> None:
-    """这个源没有排队或进行中的任务；有就抛 DraftBusy。"""
+    """这个源没有在起草：没有排队或进行中的任务，也没有在同步起草。有就抛 DraftBusy。建任务、重试、导入目录之前都调它。"""
+    if row.id in _SYNC:
+        raise DraftBusy(sync_busy_message(row))
     if await active_job(session, row.id) is not None:
         raise DraftBusy(busy_message(row))
+
+
+@contextlib.asynccontextmanager
+async def sync_draft(session: AsyncSession, row: Any) -> AsyncIterator[None]:
+    """同步起草期间登记这个源：同一个源建任务、重试、导入、再开一次同步起草都抛 DraftBusy；有排队或进行中的任务时
+    这里就抛 DraftBusy。先登记、再查库：查库要让出事件循环，先登记才不会和同时建的任务互相看不见（建任务那边写库之后
+    也再看一次，见 create_job）。"""
+    if row.id in _SYNC:
+        raise DraftBusy(sync_busy_message(row))
+    _SYNC.add(row.id)
+    try:
+        if await active_job(session, row.id) is not None:
+            raise DraftBusy(busy_message(row))
+        yield
+    finally:
+        _SYNC.discard(row.id)
 
 
 async def check_model(session: AsyncSession) -> None:
@@ -299,9 +364,10 @@ async def create_job(session: AsyncSession, row: Any, source: Any, *, tables: li
             continue
         seen.add(key)
         columns = len((all_tables.get(key) or {}).get("columns") or [])
+        parts = catalog_draft.parts_for(columns) if use_model else None
         tasks.append(CatalogDraftTask(job_id=job.id, seq=len(tasks), table_name=key, status="pending",
-                                      column_count=columns,
-                                      parts_total=catalog_draft.parts_for(columns) if use_model else None))
+                                      column_count=columns, parts_total=parts, parts_written=0,
+                                      chunks_total=parts, chunks_done=0 if use_model else None))
     session.add(job)
     try:
         await session.flush()
@@ -311,6 +377,12 @@ async def create_job(session: AsyncSession, row: Any, source: Any, *, tables: li
         # 部分唯一索引：另一个请求同时给这个源建了任务
         await session.rollback()
         raise DraftBusy(busy_message(row)) from e
+    if row.id in _SYNC:
+        # 写库的时候同一个源开始了同步起草（它查库时还没看到这个任务）：这个任务不要了
+        await session.execute(delete(CatalogDraftTask).where(CatalogDraftTask.job_id == job.id))
+        await session.execute(delete(CatalogDraftJob).where(CatalogDraftJob.id == job.id))
+        await session.commit()
+        raise DraftBusy(sync_busy_message(row))
     return job, tasks
 
 
@@ -347,8 +419,21 @@ async def cancel(session: AsyncSession, job: CatalogDraftJob) -> None:
 
 async def _close(session: AsyncSession, job_id: str, job_status: str, job_error: str | None, task_status: str,
                  task_error: str | None) -> None:
-    """收尾：还没结束的表记 task_status，任务（还没结束的话）记 job_status。"""
+    """收尾：还没结束的表记 task_status，任务（还没结束的话）记 job_status。停止、中断时写过段的表 model_error 说清写进了
+    几段、剩几段没起草（已经写进去的段留在目录里）。"""
     now = utcnow()
+    written = _WRITTEN.get(job_status)
+    if written is not None:
+        rows = (await session.execute(
+            select(CatalogDraftTask.id, CatalogDraftTask.parts_written, CatalogDraftTask.parts_total)
+            .where(CatalogDraftTask.job_id == job_id, CatalogDraftTask.status.in_(_OPEN),
+                   func.coalesce(CatalogDraftTask.parts_written, 0) > 0))).all()
+        for task_id, n, total in rows:
+            await session.execute(
+                update(CatalogDraftTask).where(CatalogDraftTask.id == task_id, CatalogDraftTask.status.in_(_OPEN))
+                .values(status=task_status, error=task_error, finished_at=now,
+                        model_error=written.format(n=n, m=max(0, int(total or n) - int(n))))
+                .execution_options(synchronize_session=False))
     await session.execute(
         update(CatalogDraftTask).where(CatalogDraftTask.job_id == job_id, CatalogDraftTask.status.in_(_OPEN))
         .values(status=task_status, error=task_error, finished_at=now).execution_options(synchronize_session=False))
@@ -478,7 +563,8 @@ class _JobRun:
         if use_model and names:
             await self._write(self._set_model, model_id)
             hooks = catalog_draft.Hooks(call_started=self._call_started, call_done=self._call_done,
-                                        part_done=self._part_done, table_done=self._table_done)
+                                        part_done=self._part_done, table_done=self._table_done,
+                                        part_written=self._part_written, chunks_changed=self._chunks_changed)
             await catalog_draft.run_model_draft(model, source, names, existing=existing, background=background,
                                                 hooks=hooks)
         else:
@@ -504,6 +590,12 @@ class _JobRun:
 
     async def _table_done(self, table: str, outcome: catalog_draft.ModelOutcome | None) -> None:
         await self._write(self._write_table, table, outcome)
+
+    async def _part_written(self, table: str, written: catalog_draft.PartWrite) -> None:
+        await self._write(self._write_part, table, written)
+
+    async def _chunks_changed(self, table: str, total: int, done: int) -> None:
+        await self._write(self._set_chunks, table, total, done)
 
     # ---------------------------------------------------------------- 库操作
 
@@ -554,9 +646,35 @@ class _JobRun:
                               .values(parts_done=CatalogDraftTask.parts_done + 1))
         await session.commit()
 
+    async def _set_chunks(self, session: AsyncSession, table: str, total: int, done: int) -> None:
+        await session.execute(self._task(CatalogDraftTask.table_name == table, CatalogDraftTask.status.in_(_OPEN))
+                              .values(chunks_total=int(total), chunks_done=int(done)))
+        await session.commit()
+
+    async def _write_part(self, session: AsyncSession, table: str, written: catalog_draft.PartWrite) -> None:
+        """宽表写出了一段：马上并入目录（这一次不删任何东西），记下写进去的段数、累加计数。写不进去只记日志：整张表结束
+        时收尾那次还会把它带上。"""
+        try:
+            found = await write_part(session, self.source, table, written.notes, at=self.at, actor=self.actor)
+        except Exception:  # noqa: BLE001 - 这一段写不进去不影响起草
+            logger.exception("起草任务 %s 把表 %s 写出来的一段并入数据目录时出错", self.job_id, table)
+            await session.rollback()
+            return
+        if found is None:
+            logger.warning("起草任务 %s：表 %s 的数据目录正被修改，这一段等整张表写完时再并入", self.job_id, table)
+            return
+        stats, version = found
+        await session.execute(
+            self._task(CatalogDraftTask.table_name == table, CatalogDraftTask.status.in_(_OPEN))
+            .values(parts_written=int(written.parts_written), version=version,
+                    added=CatalogDraftTask.added + stats.added, updated=CatalogDraftTask.updated + stats.updated,
+                    removed=CatalogDraftTask.removed + stats.removed))
+        await session.commit()
+
     async def _write_table(self, session: AsyncSession, table: str,
                            outcome: catalog_draft.ModelOutcome | None) -> None:
-        """一张表结束：并入目录、写入，记下这张表的结果。"""
+        """一张表结束：并入目录、写入（宽表写过的段已经并入过，这里是整张表的收尾），记下这张表的结果。计数加在逐段写入
+        的计数上。"""
         try:
             result = await catalog.write_draft(session, self.source, table, outcome, at=self.at, actor=self.actor)
         except Exception as e:  # noqa: BLE001 - 这一张写不进去不影响别的表
@@ -568,13 +686,20 @@ class _JobRun:
                                               error=WRITE_ERROR.format(line=first_line(e) or describe_exception(e)),
                                               model_error=outcome.error if outcome is not None else None)
         values: dict[str, Any] = {
-            "status": result.status, "added": result.added, "updated": result.updated, "removed": result.removed,
-            "version": result.version, "model_items": result.model_items, "error": result.error,
+            "status": result.status, "added": CatalogDraftTask.added + result.added,
+            "updated": CatalogDraftTask.updated + result.updated, "removed": CatalogDraftTask.removed + result.removed,
+            "model_items": result.model_items, "error": result.error,
             "model_error": result.model_error, "finished_at": utcnow(),
             "blank_columns": len(result.blank), "blank_sample": result.blank[:BLANK_SAMPLE] or None,
         }
+        if result.version:
+            values["version"] = result.version
         if outcome is not None:
-            values["parts_done"] = outcome.parts_done
+            values.update(parts_done=outcome.parts_done, chunks_total=outcome.chunks_total,
+                          chunks_done=outcome.chunks_done, log=list(outcome.log) or None)
+            if not result.error:
+                # 收尾写进去了：写出内容的段都在目录里了。没写进去（一直撞上别人刚改过）的照库里逐段写进去的段数
+                values["parts_written"] = outcome.parts_written
         await session.execute(self._task(CatalogDraftTask.table_name == table, CatalogDraftTask.status.in_(_OPEN))
                               .values(**values))
         await session.commit()
@@ -592,6 +717,30 @@ class _JobRun:
             update(CatalogDraftJob).where(CatalogDraftJob.id == self.job_id, CatalogDraftJob.status == "running")
             .values(status=status, finished_at=now).execution_options(synchronize_session=False))
         await session.commit()
+
+
+async def write_part(session: AsyncSession, source: Any, table: str, notes: dict[str, Any], *, at: str,
+                     actor: str | None) -> tuple[catalog.MergeStats, int] | None:
+    """宽表写出来的一段并入目录：(计数, 写入后的版本)；撞上别人刚改过、重读重并三次仍冲突返回 None。
+
+    数据库注释、外键、命名推断和这张表到这时拿到的模型起草，按 merge_notes 的规则并入（人工确认、驳回过的不动），
+    **这一次不删任何东西**（covered 为空）：删掉表结构里已经没有的、这一轮没再得出的，是整张表写完时 catalog.write_draft
+    收尾那一次的事。内容没变不写、不升版本。"""
+    structure = catalog.draft_structure(source, table)
+    for _attempt in range(3):
+        entry = await catalog.read_entry(session, source.id, table)
+        version = entry.version if entry else 0
+        merged, stats = catalog.merge_notes(entry.notes if entry else {}, structure.notes, at=at)
+        merged, more = catalog.merge_notes(merged, notes, at=at)
+        stats += more
+        if entry is None and not merged:
+            return stats, 0
+        try:
+            written = await catalog.write_entry(session, source.id, table, merged, if_version=version, actor=actor)
+        except catalog.CatalogConflict:
+            continue
+        return stats, written.version
+    return None
 
 
 class DraftJobs:
@@ -660,8 +809,8 @@ manager = DraftJobs()
 
 
 __all__ = ["ACTIVE", "BLANK_SAMPLE", "DraftBusy", "DraftFinished", "DraftJobs", "FINISHED", "GUIDANCE_MAX",
-           "INTERRUPTED_ERROR", "MAX_TABLES", "NOTE_MAX", "NothingToRetry", "RETRYABLE", "TASK_DONE", "TASK_STATUSES",
-           "TextTooLong",
+           "INTERRUPTED_ERROR", "INTERRUPTED_WRITTEN", "MAX_TABLES", "NOTE_MAX", "NothingToRetry", "RETRYABLE",
+           "STOPPED_WRITTEN", "TASK_DONE", "TASK_STATUSES", "TextTooLong",
            "active_job", "cancel", "check_model", "clean_text", "create_job", "ensure_idle", "guidance_of", "job_brief",
            "job_dict", "job_out", "last_drafts", "latest_job", "load", "manager", "retry_tables", "save_guidance",
-           "startup", "tasks_of"]
+           "startup", "sync_busy_message", "sync_draft", "sync_drafting", "tasks_of", "write_part"]
