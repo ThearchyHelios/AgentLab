@@ -123,13 +123,16 @@ async def test_a_partial_group_keeps_the_other_defaults_down_to_each_item():
 ])
 async def test_bad_values_are_refused_with_the_settings_page_wording(key, value, label):
     async with client() as c:
-        r = await c.put("/api/settings", json={"values": {"verify": {key: value}, "ui": {"theme": "dark"}}})
+        # 比的是这次请求前后：同一个测试进程里别的测试可能已经把主题存成了别的值，不能假定它不是 dark
+        before = (await c.get("/api/settings")).json()["ui"]["theme"]
+        wanted = "light" if before == "dark" else "dark"
+        r = await c.put("/api/settings", json={"values": {"verify": {key: value}, "ui": {"theme": wanted}}})
         assert r.status_code == 422, r.text
         detail = r.json()["detail"]
         # 报错写设置页上的叫法（「双盲复算 · 允许的相对误差」），不写键名；认不出的键原样点名
         assert VERIFY_SETTING_LABEL.get(label, label.rpartition(".")[2]) in detail, detail
         got = (await c.get("/api/settings")).json()
-    assert got["verify"] == VERIFY_DEFAULTS and got["ui"]["theme"] != "dark", "整个请求都没写进去"
+    assert got["verify"] == VERIFY_DEFAULTS and got["ui"]["theme"] == before, "整个请求都没写进去"
 
 
 @pytest.mark.parametrize("raw", ["NaN", "Infinity"])
