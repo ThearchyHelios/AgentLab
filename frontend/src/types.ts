@@ -2712,7 +2712,13 @@ export interface CatalogItem<T = unknown> {
   value: T
   source: CatalogSource
   status: CatalogStatus
+  /** 备注：机器写的说明（模型起草的依据、数据剖析的测量、双盲复算的出处……） */
   note?: string
+  /**
+   * 确认时的依据：保存修改提案（表助手、助手流里「建议更新数据目录」）时使用者确认的依据，和备注分开存。值改了换成那一次的，
+   * 撤销审阅回到推断时去掉；只由服务端写，整份提交时带上也不作数
+   */
+  reason?: string
   updated_at?: string
 }
 
@@ -2745,6 +2751,8 @@ export interface CatalogRelation {
   source: CatalogSource
   status: CatalogStatus
   note?: string
+  /** 确认时的依据（同 CatalogItem.reason） */
+  reason?: string
   updated_at?: string
   /**
    * 基数是数据剖析用数据核实的（子表一侧数过是否唯一），只由剖析写。外键、命名推断的基数没有这个键。
@@ -2859,7 +2867,8 @@ export type CatalogReviewAction = 'confirm' | 'reject' | 'reset'
 
 // ---------------------------------------------------------------------------
 // 起草任务（/api/datasources/{id}/catalog/draft-jobs）：起草在服务端后台进行，逐表起草、每张表一结束就并入目录。
-// 关掉对话框不停任务；服务重启时还没结束的任务记 interrupted，不自动续跑，由人点「重试」接着起草。
+// 关掉对话框不停任务；服务重启时还没结束的任务记 interrupted，不自动续跑，由人点「重试」把没写全的表重新起草一遍
+// （重试不跳过已写进目录的段，整张表重新分段起草；已写进目录的内容不会丢）。
 // ---------------------------------------------------------------------------
 
 /**
@@ -2884,6 +2893,16 @@ export interface CatalogDraftTask {
   /** 模型分几段起草（超过 40 列的宽表拆成表级一段加列分段）；不用模型时为 null */
   parts_total: number | null
   parts_done: number
+  /**
+   * 已经写进目录的段数：每写完一段就并入目录，停止、服务重启时已写进的段保留。老服务端没有这个键
+   */
+  parts_written?: number
+  /**
+   * 这张表实际分成的块数和已结束的块数：额度用完、超时后段被缩小、拆半，块会比段多。不用模型时为 null；
+   * 老服务端没有这两个键
+   */
+  chunks_total?: number | null
+  chunks_done?: number | null
   added: number
   updated: number
   removed: number
@@ -2900,6 +2919,11 @@ export interface CatalogDraftTask {
   blank_columns?: number
   /** 留空的列里的前几个（最多 5 个，列名照表结构原样）。老服务端没有这个键 */
   blank_sample?: string[]
+  /**
+   * 这张表起草时记下的几句话（服务端整句中文，不算失败），比如模型提议的有效记录条件没有收下的原因。最多 10 句；
+   * 老服务端没有这个键
+   */
+  log?: string[]
   /** 整张表没起草的原因：表结构里没有、写入一直冲突、服务重启中断 */
   error: string | null
   /** 模型那部分没写出来的原因和办法（第几段、哪些列、为什么） */
@@ -2984,6 +3008,13 @@ export interface CatalogLastDraft {
   model_error: string | null
   /** 那次起草模型拿不准、留空的列数（同 CatalogDraftTask.blank_columns）。老服务端没有这个键 */
   blank_columns?: number
+  /**
+   * 最近一次这张表结束于完成、部分完成的起草记下的留空列数（没有这样的起草为 null）。最近一次是停止、服务重启中断、
+   * 又没有新写入时，界面用它接着提示留空的列。老服务端没有这个键
+   */
+  blank_columns_from?: number | null
+  /** 那次起草已写进目录的段数（同 CatalogDraftTask.parts_written）。接口约定里没有这一项，服务端给了才用 */
+  parts_written?: number
 }
 
 /**
@@ -3044,6 +3075,185 @@ export interface CatalogImpactTemplate {
   level: 'published' | 'governed'
   impact: 'direct' | 'possible'
   nodes: CatalogImpactNode[]
+}
+
+// ---------------------------------------------------------------------------
+// 审阅队列（/api/datasources/{id}/catalog/review-queue、review/batch、review-progress、{table}/usage，后端
+// data/catalog_review.py）：跨表列出推断项，按表的使用次数、这一项对数字的影响和来源排好，可以成批确认、驳回。
+// ---------------------------------------------------------------------------
+
+/** 队列的筛选：全部、影响数字的项（有效记录条件、去重、业务日期、关联关系、业务主键、度量类型）、名称和含义 */
+export type CatalogReviewKind = 'all' | 'facts' | 'names'
+
+/** 队列里的一项（只列推断状态的项） */
+export interface CatalogReviewItem {
+  table_name: string
+  /** 审阅接口的路径写法 */
+  path: string
+  /** 字段名（valid_filter、label……；关联关系是 relation） */
+  field: string
+  /**
+   * 字段的界面叫法（服务端写好的「中文名」「码值」「有效记录条件」「关联关系」），不含是哪一列：界面上的位置按 path
+   * 说（「列 status 的码值」，review.ts 的 reviewWhere）
+   */
+  field_label: string
+  /** 列级的项是哪一列；表级的项、关联关系为 null。接口约定里没有写明，服务端给了才用 */
+  column?: string | null
+  value: unknown
+  /** 值写成一行字（服务端写好的） */
+  display: string
+  source: CatalogSource
+  status: CatalogStatus
+  note: string | null
+  /** 越大越靠前：表的使用次数权重 × 风险权重 × 来源权重 */
+  priority: number
+  /** 为什么排在这里（中文，服务端写好的） */
+  reasons: string[]
+  /** 所在表被运行用过的次数 */
+  table_usage: number
+  /** 所在表的目录版本：成批审阅时逐表带上 */
+  version: number
+}
+
+/** GET /catalog/review-queue */
+export interface CatalogReviewQueue {
+  total: number
+  items: CatalogReviewItem[]
+}
+
+/** POST /catalog/review/batch 的一项 */
+export interface CatalogReviewBatchItem {
+  table_name: string
+  path: string
+  action: CatalogReviewAction
+  if_version: number
+}
+
+/** 成批审阅逐条的结果：一张表冲突不影响别的表；成功的写明这张表写入后的版本 */
+export interface CatalogReviewBatchResult {
+  table_name: string
+  path: string
+  ok: boolean
+  version: number | null
+  error: string | null
+  code: string | null
+}
+
+/** 用过这张表的一次运行（新的在前） */
+export interface CatalogUsageRun {
+  run_id: string
+  workflow_id: string | null
+  workflow_name: string | null
+  run_class: 'formal' | 'exploratory' | null
+  status: string
+  started_at: string | null
+}
+
+/** GET /catalog/{table}/usage */
+export interface CatalogTableUsage {
+  total: number
+  runs: CatalogUsageRun[]
+}
+
+/**
+ * GET /catalog/review-progress：常用的前 top_n 张表、全部表、影响数字的项各审阅到哪儿。
+ * 「常用表」只算被运行用过的：tables 可能比 top_n 少，没有运行时是 0。三行的进度都按「已确认 ÷（已确认 + 待确认）」算
+ * （review.ts 的 confirmProgress）：已驳回的、有确证的（外键约束）不用再确认，不计入
+ */
+export interface CatalogReviewProgress {
+  top_n: number
+  /** items_proposed、items_verified：接口约定里没有写明，服务端给了才用（没有待确认数时只写已确认几项） */
+  top: { tables: number; items_total: number; items_confirmed: number; items_proposed?: number; items_verified?: number }
+  all: { items_total: number; items_confirmed: number; items_proposed: number; items_rejected: number; items_verified?: number }
+  facts: { proposed: number; confirmed: number }
+}
+
+// ---------------------------------------------------------------------------
+// 导出导入（/api/datasources/{id}/catalog/export、import/preview、import，后端 data/catalog_transfer.py）：
+// 本机整理好的目录带到另一个实例。先预览（只读），确认后逐表写入。
+// ---------------------------------------------------------------------------
+
+/** 导出的文件：含全部状态的项 */
+export interface CatalogExportFile {
+  format: 'agentlab-catalog'
+  version: 1
+  exported_at: string
+  source: { name: string; kind: string }
+  guidance: string | null
+  tables: Record<string, { notes: CatalogNotes; version: number }>
+}
+
+/** 一处冲突：这里已确认、已驳回的项和文件中的不一样，以这里为准 */
+export interface CatalogImportConflict {
+  path: string
+  label: string
+  file_value: unknown
+  target_value: unknown
+  why: string
+}
+
+/** 预览、导入报告里的一张表 */
+export interface CatalogImportTable {
+  /** 文件中的表名 */
+  table_name: string
+  /** 对上的这个数据源里的表名（名字不一样时才有意思）；对不上为 null */
+  matched_as: string | null
+  add: number
+  update: number
+  keep: number
+  conflicts: CatalogImportConflict[]
+  skipped: { path: string; why: string }[]
+  /** 导入后这张表的目录版本（只有导入的报告有） */
+  version?: number | null
+  /** 这张表没导入的原因（逐表写入，一张表失败不影响别的）。接口约定里没有写明，服务端给了才显示 */
+  error?: string | null
+}
+
+export interface CatalogImportTotals {
+  tables: number
+  add: number
+  update: number
+  keep: number
+  conflicts: number
+  skipped: number
+}
+
+/** POST /catalog/import/preview、/catalog/import */
+export interface CatalogImportReport {
+  tables: CatalogImportTable[]
+  /** 文件中有、这个数据源里对不上的表 */
+  unmatched_tables: string[]
+  totals: CatalogImportTotals
+  /** 起草要求：写入文件中的（这里还没有）、保留这里的、不导入 */
+  guidance: { file: string | null; target: string | null; action: 'keep' | 'replace' | 'none' }
+}
+
+// ---------------------------------------------------------------------------
+// 表助手（POST /api/datasources/{id}/catalog/{table}/assistant，后端 data/catalog_assistant.py）：对话完善一张表的
+// 目录。回答是事件流，每个事件一行 data: <JSON>。对话不存服务端，每一轮都把前面的对话和还没保存的修改带上。
+// ---------------------------------------------------------------------------
+
+/** 提案里的一项：和助手流里的 catalog_patch 一样，多一个给人看的位置 */
+export interface CatalogAssistantChange extends CatalogPatchChange {
+  label?: string
+}
+
+/**
+ * 事件流里的一个事件。服务端等模型时另发 SSE 注释行（「: keep-alive」，不是事件），读流时跳过。
+ * query 的 row_count 是取回的行数；truncated（接口约定里没有写明，服务端给了才用）为真时后面还有行，取回的只是前一截
+ */
+export type CatalogAssistantEvent =
+  | { type: 'text'; delta: string }
+  | { type: 'query'; sql: string; columns: string[]; rows: unknown[][]; row_count: number; truncated?: boolean; error: string | null }
+  | { type: 'proposal'; source_id: string; table: string; version: number; changes: CatalogAssistantChange[] }
+  | { type: 'done'; usage: { input_tokens: number; output_tokens: number }; queries: number }
+  | { type: 'error'; message: string; code?: string | null }
+
+/** 交给表助手的一轮请求 */
+export interface CatalogAssistantRequest {
+  messages: { role: 'user' | 'assistant'; content: string }[]
+  /** 界面上还没保存的修改：最多 200 项（服务端同一个上限，多了整个请求 422），多出来的只交最近的 200 项 */
+  pending: CatalogPatchSubmit[]
 }
 
 /** GET /datasources/{id}/catalog/{table}/impact */

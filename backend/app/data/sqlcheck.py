@@ -1131,5 +1131,274 @@ async def load_checkers_by_name(session: Any, names: Iterable[str]) -> dict[str,
     return await load_checkers(session, rows)
 
 
-__all__ = ["CHECK_CODES", "LEVELS", "MAX_CHECKS", "MAX_SQL_CHARS", "SqlCheck", "SqlChecker", "check_sql",
-           "dialect_of", "graph_checks", "graph_sources", "load_checkers", "load_checkers_by_name", "tool_query"]
+# ==========================================================================
+# 有效行过滤（valid_filter）的校验：模型起草的条件要能进目录、能拼进剖析的核对查询
+# ==========================================================================
+
+#: 有效行过滤最多几个字（同目录里文本项的上限）
+VALID_FILTER_MAX = 500
+#: 有效行过滤里能用的函数（其余函数、聚合、窗口一律不收）
+VALID_FILTER_FUNCTIONS = ("UPPER", "LOWER", "TRIM", "COALESCE")
+#: 模板占位：条件里不该有，有了也说不清最终拼出来的是什么（注释在解析之后按语法树认，字符串里的 -- 不算）
+_FILTER_TEMPLATE = re.compile(r"\{\{|\{%")
+
+#: 不合规的说法以这一项在界面上的叫法开头（catalog.TABLE_FIELD_LABEL：「有效记录条件」）：没收下的原因会记进起草任务
+#: 逐表的日志，界面上看得到
+_FILTER_PREFIX = catalog.TABLE_FIELD_LABEL["valid_filter"]
+
+
+@dataclass(frozen=True)
+class ValidFilter:
+    """一段有效行过滤解析的结果。
+
+    expression：sqlglot 的条件（不合规时为 None）；columns：条件里用到的列（表结构里的真名，按出现的先后去重）；
+    names：条件里写的列名 → 表结构里的真名；problem：不合规时给人看的一句话，合规是 None；dialect：解析用的 sqlglot
+    方言。text：解析的原文（去掉首尾空白）；spans：每处列引用（连同表名前缀）在原文里的位置 (起, 止（含）, 真名)，按
+    书写的先后，有一处拿不到位置时为 None（canonical_valid_filter 退回按语法树重写）。
+    """
+
+    expression: Any = None
+    columns: tuple[str, ...] = ()
+    names: Mapping[str, str] = field(default_factory=dict)
+    problem: str | None = None
+    dialect: str | None = None
+    text: str = ""
+    spans: tuple[tuple[int, int, str], ...] | None = None
+
+
+def _bad_filter(problem: str, dialect: str | None = None) -> ValidFilter:
+    return ValidFilter(problem=f"{_FILTER_PREFIX}{problem}", dialect=dialect)
+
+
+def _filter_node_problem(node: Any, *, predicate: bool) -> str | None:
+    """一个不在允许范围里的节点为什么不收（没有问题返回 None 的调用方不会走到这里）。"""
+    from sqlglot import exp
+
+    if isinstance(node, exp.Query):
+        return "应为一个条件，不能是一条查询"
+    if any(isinstance(n, (exp.Query, exp.Subquery)) for n in node.walk()):
+        return "里不能有子查询"
+    if any(isinstance(n, exp.Window) for n in node.walk()):
+        return "里不能有窗口函数"
+    if any(isinstance(n, exp.AggFunc) for n in node.walk()):
+        return "里不能有聚合函数"
+    if isinstance(node, exp.Func):
+        name = str(node.this) if isinstance(node, exp.Anonymous) else node.sql_name()
+        return f"里只能用 {'、'.join(VALID_FILTER_FUNCTIONS)} 这几个函数，不能用 {name.upper()}"
+    if predicate:
+        return "应为一个条件（比较、IN、BETWEEN、LIKE、IS NULL，用 AND、OR、NOT 连接）"
+    text = node.sql()
+    return f"里有不支持的写法（{text[:40]}{'…' if len(text) > 40 else ''}）"
+
+
+def _filter_value_problem(node: Any) -> str | None:
+    """比较两边的一个值：列、字面量、负数、允许的几个函数（参数同样是值）。"""
+    from sqlglot import exp
+
+    node = _unparen(node)
+    if isinstance(node, (exp.Column, exp.Literal, exp.Null, exp.Boolean)):
+        return None
+    if isinstance(node, exp.Neg) and isinstance(_unparen(node.this), exp.Literal) and not _unparen(node.this).is_string:
+        return None
+    if isinstance(node, (exp.Upper, exp.Lower, exp.Trim, exp.Coalesce)):
+        for arg in node.iter_expressions():
+            if problem := _filter_value_problem(arg):
+                return problem
+        return None
+    return _filter_node_problem(node, predicate=False)
+
+
+def _filter_predicate_problem(node: Any) -> str | None:
+    """一个条件：比较、IN（只能是值的列表）、BETWEEN、LIKE、IS NULL，或者用 AND / OR / NOT 连起来的条件。"""
+    from sqlglot import exp
+
+    node = _unparen(node)
+    if isinstance(node, (exp.And, exp.Or)):
+        return _filter_predicate_problem(node.left) or _filter_predicate_problem(node.right)
+    if isinstance(node, exp.Not):
+        return _filter_predicate_problem(node.this)
+    if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        return _filter_value_problem(node.left) or _filter_value_problem(node.right)
+    if isinstance(node, exp.In):
+        if any(node.args.get(k) for k in ("query", "unnest", "field")):
+            return "里不能有子查询"
+        if not node.expressions:
+            return _filter_node_problem(node, predicate=True)
+        return _filter_value_problem(node.this) or next(
+            (p for p in (_filter_value_problem(e) for e in node.expressions) if p), None)
+    if isinstance(node, exp.Between):
+        return next((p for p in (_filter_value_problem(node.args.get(k)) for k in ("this", "low", "high")) if p), None)
+    if isinstance(node, exp.Like):
+        return _filter_value_problem(node.this) or _filter_value_problem(node.expression)
+    if isinstance(node, exp.Is):
+        if not isinstance(_unparen(node.expression), exp.Null):
+            return "里的 IS 只能写 IS NULL 或 IS NOT NULL"
+        return _filter_value_problem(node.this)
+    return _filter_node_problem(node, predicate=True)
+
+
+def parse_valid_filter(condition: Any, meta: Mapping[str, Any] | None, *, kind: str | None,
+                       table: str | None = None) -> ValidFilter:
+    """按数据源的方言把有效行过滤解析成一个条件，并核对它只用了这张表的列。从不抛异常，不合规写在 problem 里。
+
+    规矩：一段文字、不超过 VALID_FILTER_MAX 字；不能有分号、模板占位、注释；解析出来恰好是一个条件，只由比较、IN（值的
+    列表）、BETWEEN、LIKE、IS NULL、AND / OR / NOT 和 UPPER / LOWER / TRIM / COALESCE 组成（不能有子查询、聚合、窗口、
+    别的函数、算术、参数占位）；列不带表名或带这张表的表名（table），都在表结构里，至少用到一列。
+
+    列名先照原样对表结构，对不上再不分大小写对；表结构里有只差大小写的几列（PostgreSQL 上 "Status" 和 status 可以
+    并存）、写法又和哪一列都不一样时说不清是哪一列，不收。
+    """
+    from app.data.names import name_key as _key
+
+    dialect = dialect_of(kind)
+    if not isinstance(condition, str) or not condition.strip():
+        return _bad_filter("应为一段 SQL 条件", dialect)
+    text = condition.strip()
+    if len(text) > VALID_FILTER_MAX:
+        return _bad_filter(f"超过 {VALID_FILTER_MAX} 字", dialect)
+    if ";" in text:
+        return _bad_filter("里不能有分号", dialect)
+    if _FILTER_TEMPLATE.search(text):
+        return _bad_filter("里不能有模板占位", dialect)
+    if dialect is None:
+        return _bad_filter(f"没法校验：数据源类型「{kind}」不支持", dialect)
+    try:
+        import sqlglot
+
+        statements = [s for s in sqlglot.parse(text, read=dialect) if s is not None]
+    except Exception:  # noqa: BLE001 - 语法错、方言不支持的写法：一律不收
+        return _bad_filter("不是一段能解析的 SQL 条件", dialect)
+    if len(statements) != 1:
+        return _bad_filter("不是一段能解析的 SQL 条件", dialect)
+    expression = statements[0]
+    if any(node.comments for node in expression.walk()):
+        return _bad_filter("里不能有注释", dialect)
+    if problem := _filter_predicate_problem(expression):
+        return _bad_filter(problem, dialect)
+    from sqlglot import exp
+
+    real_names = [str(c.get("name")) for c in (meta or {}).get("columns") or []
+                  if isinstance(c, Mapping) and c.get("name") is not None]
+    exact = set(real_names)
+    by_lower: dict[str, list[str]] = {}
+    for name in real_names:
+        by_lower.setdefault(name.lower(), []).append(name)
+    own = {_key(str(n).rsplit(".", 1)[-1]) for n in (table, (meta or {}).get("qualified")) if n}
+    used: dict[str, str] = {}
+    spans: list[tuple[int, int, str]] | None = []
+    for column in expression.find_all(exp.Column, bfs=False):          # 按书写的先后
+        if column.is_star:
+            return _bad_filter("里不能写 *", dialect)
+        qualifier = column.table
+        if column.args.get("db") or column.args.get("catalog") or (qualifier and _key(qualifier) not in own):
+            return _bad_filter(f"只能引用这张表的列，不能引用 {column.sql(dialect=dialect)}", dialect)
+        written = column.name
+        if written in exact:
+            real = written
+        else:
+            found = by_lower.get(written.lower()) or []
+            if not found:
+                return _bad_filter(f"里的列「{written}」不在表结构里", dialect)
+            if len(found) > 1:
+                return _bad_filter(f"里的列「{written}」在表结构里有只差大小写的几列（{'、'.join(found)}），"
+                                   "要照表结构的写法写清是哪一列", dialect)
+            real = found[0]
+        used.setdefault(written, real)
+        span = _column_span(column, text)
+        spans = None if spans is None or span is None else [*spans, (*span, real)]
+    if not used:
+        return _bad_filter("没有用到这张表的任何列", dialect)
+    return ValidFilter(expression=expression, columns=tuple(dict.fromkeys(used.values())), names=used,
+                       dialect=dialect, text=text, spans=tuple(spans) if spans is not None else None)
+
+
+def _column_span(column: Any, text: str) -> tuple[int, int] | None:
+    """一处列引用（连同表名前缀）在原文里的位置 (起, 止（含）)：sqlglot 在标识符的 meta 里记下了它在原文里的起止。
+    拿不到、或者那一截原文里认不出这个列名时为 None。"""
+    ident = column.this
+    meta = getattr(ident, "meta", None) or {}
+    start, end = meta.get("start"), meta.get("end")
+    prefix = column.args.get("table")
+    if prefix is not None:
+        start = (getattr(prefix, "meta", None) or {}).get("start")
+    if not (isinstance(start, int) and isinstance(end, int) and 0 <= start <= end < len(text)):
+        return None
+    if not text[start:end + 1].rstrip("\"`]").lower().endswith(str(column.name).lower()):
+        return None
+    return start, end
+
+
+def valid_filter_problem(condition: Any, meta: Mapping[str, Any] | None, *, kind: str | None,
+                         table: str | None = None) -> str | None:
+    """有效行过滤哪里不合规（给人看的一句话）；合规返回 None。规矩见 parse_valid_filter。"""
+    return parse_valid_filter(condition, meta, kind=kind, table=table).problem
+
+
+def render_valid_filter(parsed: ValidFilter, *, quoted: Any) -> str:
+    """把解析好的条件按数据源的方言重新写出来，列换成表结构里的真名、不带表名；quoted(真名) 为真的加引号（和剖析查询
+    其余部分的写法一致：SqlDialect.quote 要加引号的才加）。按语法树重写，NOT IN、IS NOT NULL 会写成 NOT x IN、
+    NOT x IS NULL：canonical_valid_filter 拿不到原文里的位置时才退回用它。"""
+    from sqlglot import exp
+
+    if parsed.expression is None:
+        raise ValueError(parsed.problem or "有效行过滤不合规")
+
+    def swap(node: Any) -> Any:
+        if isinstance(node, exp.Column):
+            real = parsed.names.get(node.name, node.name)
+            return exp.Column(this=exp.Identifier(this=real, quoted=bool(quoted(real))))
+        return node
+
+    return parsed.expression.copy().transform(swap).sql(dialect=parsed.dialect)
+
+
+def canonical_valid_filter(parsed: ValidFilter, *, quote: Any) -> str:
+    """有效行过滤存进目录、拼进剖析核对查询的写法（两处用的是同一条）：原文照旧，只把每处列引用换成 quote(真名)——表结构
+    里的真名、不带表名，按数据源的需要加引号（quote 是 catalog_profile.SqlDialect.quote，和剖析查询其余部分的写法一致）。
+
+    以前目录里存的是模型的原文，核对时却按真名加了引号：PostgreSQL 上混合大小写的列（"OrderStatus"）不加引号会被折成
+    小写，存下的 orderstatus <> 'X' 一跑就报列不存在，核对过的却能跑通，SQL 检查还会让模型照抄存下的那一句。
+
+    拿不到原文里的位置、换完以后认不出原来那几列时，退回按语法树重写（render_valid_filter）。"""
+    if parsed.expression is None:
+        raise ValueError(parsed.problem or "有效行过滤不合规")
+    if parsed.spans:
+        text = parsed.text
+        for start, end, real in sorted(parsed.spans, reverse=True):
+            text = text[:start] + quote(real) + text[end + 1:]
+        if _same_columns(text, parsed):
+            return text
+    return render_valid_filter(parsed, quoted=lambda name: quote(name) != name)
+
+
+def _same_columns(text: str, parsed: ValidFilter) -> bool:
+    """换过列名的原文还是一个条件，列依次是表结构里的那几列、都不带表名。"""
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        tree = sqlglot.parse_one(text, read=parsed.dialect)
+    except Exception:  # noqa: BLE001 - 换坏了就退回按语法树重写
+        return False
+    columns = list(tree.find_all(exp.Column, bfs=False))
+    return ([c.name for c in columns] == [real for _, _, real in parsed.spans or ()]
+            and not any(c.table for c in columns))
+
+
+def stored_valid_filter(parsed: ValidFilter, kind: str | None) -> str:
+    """模型提议的有效行过滤存进目录的写法：canonical_valid_filter，按这个数据源的方言加引号（catalog_profile.SqlDialect：
+    SQLAlchemy 的写法，要加才加——PostgreSQL、SQLite 的 "OrderStatus"，MySQL 的 `OrderStatus`，Oracle 探查出来的小写名
+    不加）。"""
+    from app.data.catalog_profile import SqlDialect
+
+    try:
+        dialect = SqlDialect(kind)
+    except ValueError:
+        return parsed.text
+    return canonical_valid_filter(parsed, quote=dialect.quote)
+
+
+__all__ = ["CHECK_CODES", "LEVELS", "MAX_CHECKS", "MAX_SQL_CHARS", "SqlCheck", "SqlChecker", "VALID_FILTER_FUNCTIONS",
+           "VALID_FILTER_MAX", "ValidFilter", "canonical_valid_filter", "check_sql", "dialect_of", "graph_checks",
+           "graph_sources", "load_checkers", "load_checkers_by_name", "parse_valid_filter", "render_valid_filter",
+           "stored_valid_filter", "tool_query", "valid_filter_problem"]

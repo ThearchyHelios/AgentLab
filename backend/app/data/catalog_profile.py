@@ -999,7 +999,8 @@ def _codes_finding(c: _CodesOutcome, value: dict[str, str]) -> dict[str, Any]:
 
 def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
     """人工确认过的关系只补覆盖率和基数：覆盖率是测量值，照新的写；基数只在原来没有时补，不改人定的；
-    备注只在原来为空、或者是剖析自己写的时候换成新的（只是日期变了不换）。状态、来源不动。返回改没改。"""
+    备注只在原来为空、或者是剖析自己写的时候换成新的（只是日期变了不换）。状态、来源、确认时的依据（reason，保存提案时
+    另存，不在备注里）不动。返回改没改。"""
     changed = False
     if rel.get("coverage") != o.coverage:
         rel["coverage"] = o.coverage
@@ -1020,9 +1021,12 @@ def _patch_confirmed(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
 
 def _patch_fk(rel: dict[str, Any], o: _RelationOutcome, at: str) -> bool:
     """外键关系只补基数和「用数据核实过」：外键结构推的多对一可能其实是一对一，数据说了算。来源、状态、
-    覆盖率都不动；备注同 _patch_confirmed（只是旧备注的日期不同不换）。返回改没改。"""
+    覆盖率都不动；备注同 _patch_confirmed（只是旧备注的日期不同不换）。人工确认过的（值不变、保存即确认的外键关系，
+    来源仍是 fk）同 _patch_confirmed：不改人定的基数，数据核实出的不一样时也不标「用数据核实过」，测量的说法照常写进
+    备注。返回改没改。"""
     changed = False
-    if o.cardinality_checked:
+    overruled = rel.get("status") == "confirmed" and rel.get("cardinality") not in (None, o.cardinality)
+    if o.cardinality_checked and not overruled:
         if rel.get("cardinality") != o.cardinality:
             rel["cardinality"] = o.cardinality
             changed = True
@@ -1341,8 +1345,129 @@ async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[st
     return report
 
 
-__all__ = ["CODES_MAX", "IN_CHUNK", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES",
+# ==========================================================================
+# 核对模型提议的有效行过滤：排除了多少行
+# ==========================================================================
+
+#: 有效行过滤核对的说法（写进这一项的 note；前面是模型给的依据）
+FILTER_CHECKED = "剖析核对：排除 {share} 的行（共 {rows} 行）"
+FILTER_SAMPLED = "剖析核对：按前 {rows} 行统计，排除 {share} 的行"
+FILTER_SAMPLED_EDGE = "剖析核对：按前 {rows} 行统计，{what}，请人工核对"
+FILTER_UNCHECKED = "没有核对排除比例（{why}）"
+FILTER_NOT_ENABLED = "数据源没有开数据剖析"
+
+
+@dataclass(frozen=True)
+class FilterCheck:
+    """核对一条有效行过滤的结果。
+
+    keep：收不收（排除 0% 或 100% 的不收：前者什么都没筛掉，后者把所有行都筛掉了，多半写错了）；note：写进这一项 note
+    的那句（剖析核对的排除比例，或者没有核对的原因）；rows / excluded：数到的行数和其中被排除的行数（没核对是 None）；
+    sampled：表太大或不知道多大，只数了前若干行；dropped：不收的原因（记日志用）。"""
+
+    keep: bool
+    note: str
+    rows: int | None = None
+    excluded: int | None = None
+    sampled: bool = False
+    dropped: str | None = None
+
+
+def excluded_share(excluded: int, rows: int) -> str:
+    """排除比例写成百分数：留一位小数（整数不带小数）；不到 0.1% 的写「不足 0.1%」，不是全部的不四舍五入成 100%。"""
+    if rows <= 0:
+        return "0%"
+    pct = excluded * 100 / rows
+    if 0 < pct < 0.1:
+        return "不足 0.1%"
+    if 99.9 < pct < 100:
+        return "超过 99.9%"
+    return f"{pct:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def _unchecked(why: str) -> FilterCheck:
+    return FilterCheck(True, FILTER_UNCHECKED.format(why=why))
+
+
+def _unsafe_literal(value: str) -> bool:
+    """拼不进核对查询的字符串取值：查询层用 SQLAlchemy 的 text() 执行，它会把字符串里的「:名字」当成绑定参数；
+    反斜杠在 MySQL 上读法不定、守卫会整条拒掉；控制字符不该出现（同 sql_literal 的规矩）。"""
+    return "\\" in value or bool(_CONTROL.search(value)) or bool(_BIND_LIKE.search(value))
+
+
+async def check_valid_filter(source: Any, table: str, meta: dict[str, Any] | None, condition: str, *,
+                             settings: ProfileSettings | None = None) -> FilterCheck:
+    """开了数据剖析的源：数一数这条有效行过滤排除了多少行（模型起草时提议的那条，data/catalog_draft.py 调）。从不抛异常。
+
+    经剖析的只读守卫（_Runner：guard.check(readonly=True)、单条时限、查询次数上限）发一条查询：只取条件里用到的列，
+    先取前 max(sample_size, max_scan_rows) 行（大表不做整表扫描），再数总行数和不满足条件的行数（条件为 NULL 也算排除，
+    和 WHERE 一样）。数到的不满前那么多行，就是整张表。
+
+    - 排除 0% 或 100% 的不收（keep 为假）；只数了前若干行的照收，写明「请人工核对」；
+    - 没开剖析、数据源停用、条件里有遮罩的列、视图、取值拼不进查询、查询失败或超时：照收，note 写没有核对的原因。
+    """
+    from app.data import sqlcheck
+
+    options = getattr(source, "options", None)
+    settings = settings or profile_settings(options)
+    if not settings.enabled:
+        return _unchecked(FILTER_NOT_ENABLED)
+    if getattr(source, "enabled", True) is False:
+        return _unchecked("数据源已停用")
+    kind = getattr(source, "kind", None)
+    parsed = sqlcheck.parse_valid_filter(condition, meta, kind=kind, table=table)
+    if parsed.problem:
+        return FilterCheck(False, parsed.problem, dropped=parsed.problem)
+    masked = {c.lower() for c in data_engine.masked_columns(options)}
+    if hit := [c for c in parsed.columns if c.lower() in masked]:
+        return _unchecked(f"条件里的 {'、'.join(hit)} 在数据源设置中被遮罩，不取数")
+    if (meta or {}).get("is_view"):
+        return _unchecked("这张表是视图，剖析可能触发整个视图的计算")
+    from sqlglot import exp
+
+    if any(n.is_string and _unsafe_literal(str(n.this)) for n in parsed.expression.find_all(exp.Literal)):
+        return _unchecked("条件里的取值含有冒号或反斜杠，拼不进核对查询")
+    try:
+        dialect = SqlDialect(kind)
+    except ValueError as e:
+        return _unchecked(str(e))
+    cap = max(int(settings.sample_size), int(settings.max_scan_rows))
+    # 和存进目录的是同一条（catalog._model_facts 存的就是这个写法）：列换成真名、按方言加引号，别的照原文
+    cond = sqlcheck.canonical_valid_filter(parsed, quote=dialect.quote)
+    cols = ", ".join(dialect.quote(c) for c in parsed.columns)
+    inner = dialect.limit(f"SELECT {cols} FROM {dialect.table(meta, table)}", cap)
+    sql = f"SELECT COUNT(*) AS n, SUM(CASE WHEN {cond} THEN 0 ELSE 1 END) AS x FROM ({inner}) s"
+    run = _Runner(source, settings, dialect)
+    try:
+        res = await run(sql)
+    except _Skip as e:
+        return _unchecked(e.detail.removesuffix("，已跳过"))
+    except _Stop as e:
+        return _unchecked(_STOP_DETAIL[e.reason].format(max_queries=settings.max_queries,
+                                                        max_total_s=_fmt(settings.max_total_s)).removesuffix("，未检查"))
+    except SnapshotTampered as e:
+        return _unchecked(str(e))
+    row = res.rows[0] if res.rows else [None, None]
+    rows, excluded = _as_int(row[0]), _as_int(row[1]) if len(row) > 1 else None
+    if not rows:
+        return _unchecked("表里还没有数据")
+    excluded = excluded or 0
+    sampled = rows >= cap
+    counted = f"{rows:,}"
+    if excluded in (0, rows):
+        what = "没有排除任何一行" if excluded == 0 else "所有行都被排除了"
+        if sampled:
+            return FilterCheck(True, FILTER_SAMPLED_EDGE.format(rows=counted, what=what), rows, excluded, True)
+        return FilterCheck(False, FILTER_CHECKED.format(share=excluded_share(excluded, rows), rows=counted), rows,
+                           excluded, False, dropped=what)
+    share = excluded_share(excluded, rows)
+    note = (FILTER_SAMPLED if sampled else FILTER_CHECKED).format(share=share, rows=counted)
+    return FilterCheck(True, note, rows, excluded, sampled)
+
+
+__all__ = ["CODES_MAX", "FILTER_CHECKED", "FILTER_NOT_ENABLED", "FILTER_SAMPLED", "FILTER_UNCHECKED", "FilterCheck",
+           "IN_CHUNK", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES",
            "PROFILE_OPTION", "PROFILE_PROBE_TABLES", "ProfileBusy", "ProfileDisabled", "ProfileReport",
-           "ProfileSettings", "ProfileSkip", "SqlDialect", "TableProfile", "TableSize", "ensure_enabled",
-           "estimate_size", "profile_catalog", "profile_settings", "profile_settings_problem", "profile_settings_rejection",
-           "sql_literal"]
+           "ProfileSettings", "ProfileSkip", "SqlDialect", "TableProfile", "TableSize", "check_valid_filter",
+           "ensure_enabled", "estimate_size", "excluded_share", "profile_catalog", "profile_settings",
+           "profile_settings_problem", "profile_settings_rejection", "sql_literal"]

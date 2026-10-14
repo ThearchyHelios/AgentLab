@@ -8,11 +8,19 @@
 - POST   /catalog/{table}/patch  保存目录修改提案（乐观锁），记为人工确认
 - GET    /catalog/{table}/impact 影响面：引用这张表的已发布、受管模板（data/catalog_impact.py）
 - POST   /catalog/draft          同步起草（注释、外键、命名推断，可选模型）。界面改用下面的后台起草任务，这个留着；
-                                 同一个源有排队或进行中的后台任务时 409 catalog_draft_busy
+                                 和后台任务双向互斥：同一个源有排队或进行中的后台任务（或正在同步起草）时 409
+                                 catalog_draft_busy，同步起草期间建任务、重试、导入也是 409
 - PUT    /catalog/guidance       数据源级的起草要求（使用者补充的背景和要求，起草时交给模型）
 - POST   /catalog/draft-jobs     建后台起草任务（202）；GET /draft-jobs/active、/latest、/{job_id} 读任务；
                                  POST /draft-jobs/{job_id}/cancel 停止，/retry 只重试没写好的表（data/catalog_jobs.py）
 - POST   /catalog/profile        同步剖析：对业务库发少量只读查询，核对关系、取码值候选（data/catalog_profile.py）
+- GET    /catalog/review-queue   审阅队列：推断的项按使用次数、风险、来源排好；POST /catalog/review/batch 批量审阅，
+                                 GET /catalog/review-progress 审阅进度，GET /catalog/{table}/usage 用过这张表的运行
+                                 （data/catalog_review.py）
+- GET    /catalog/export         导出数据目录（JSON 附件）；POST /catalog/import/preview 导入预览（只读），
+                                 POST /catalog/import 导入（data/catalog_transfer.py）
+- POST   /catalog/{table}/assistant  表助手：对话完善这张表的目录（text/event-stream），提案不写目录
+                                 （data/catalog_assistant.py）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
 不对 422，源或表不存在 404。所有写操作记录请求头 X-Actor 的署名（自报、未认证）。剖析没开启、正在剖析 409。
@@ -24,7 +32,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +43,7 @@ from app.api.coded import (
 )
 from app.api.runs import actor_of
 from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, introspect, table_versions
+from app.data import catalog_assistant, catalog_review, catalog_transfer
 from app.data.engine import SnapshotTampered
 from app.db.base import get_session
 from app.db.models import DataSource
@@ -234,6 +243,92 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
     }
 
 
+# ---- 审阅队列、审阅进度（要登记在 GET /catalog/{table} 前面：不然 review-queue、review-progress 会被当成表名）
+
+
+@router.get("/{source_id}/catalog/review-queue")
+async def catalog_review_queue(source_id: str,
+                               limit: int = Query(50, ge=1, le=catalog_review.QUEUE_LIMIT_MAX),
+                               offset: int = Query(0, ge=0),
+                               kind: Literal["all", "facts", "names"] = Query("all"),
+                               table: str | None = Query(None, max_length=255),
+                               session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """审阅队列：只列推断的项，按使用次数、风险、来源排好（data/catalog_review.py）。kind 筛影响数字的项（facts）或名称
+    和说明（names），table 只看一张表。"""
+    _, source = await _resolved(session, source_id)
+    return await catalog_review.review_queue(session, source, kind=kind, table=table or None, limit=limit,
+                                             offset=offset)
+
+
+@router.get("/{source_id}/catalog/review-progress")
+async def catalog_review_progress(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """审阅进度：常用 20 张表、全部、影响数字的项各自确认了多少。"""
+    _, source = await _resolved(session, source_id)
+    return await catalog_review.review_progress(session, source)
+
+
+# ---- 导出导入（导出同样要登记在 GET /catalog/{table} 前面）
+
+
+@router.get("/{source_id}/catalog/export")
+async def export_catalog(source_id: str, session: AsyncSession = Depends(get_session)) -> Any:
+    """导出这个数据源的数据目录：JSON 附件「<数据源名>-数据目录.json」，含全部状态的项（data/catalog_transfer.py）。"""
+    from fastapi.responses import JSONResponse
+
+    row = await _source_row(session, source_id)
+    body = await catalog_transfer.export_catalog(session, row)
+    name = catalog_transfer.attachment_name(row.name)
+    return JSONResponse(body, headers={"Content-Disposition": catalog_transfer.content_disposition(name, row.id)})
+
+
+class CatalogImportIn(BaseModel):
+    #: 导出的那个对象（格式在 data/catalog_transfer.read_file 里核对，不对 422，说明是中文）
+    content: Any = None
+    #: 目标还没有起草要求时，是否写入文件里的起草要求
+    include_guidance: bool = False
+
+
+async def _import_source(session: AsyncSession, source_id: str) -> tuple[DataSource, Any]:
+    row, source = await _resolved(session, source_id)
+    cache = source.schema_cache or {}
+    if not cache.get("tables"):
+        raise CodedHTTPException(409, f"{introspect.why_empty(cache)}，无法导入数据目录。请先在数据源卡片上点「探查结构」",
+                                 SCHEMA_MISSING)
+    return row, source
+
+
+@router.post("/{source_id}/catalog/import/preview")
+async def preview_catalog_import(source_id: str, payload: CatalogImportIn,
+                                 session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """导入预览（只读）：每张对上的表新增、更新、保留几项，冲突和跳过的逐条列出。文件格式不对 422；没有表结构 409。"""
+    row, source = await _import_source(session, source_id)
+    try:
+        report = await catalog_transfer.plan_import(session, row, source, payload.content,
+                                                    include_guidance=payload.include_guidance)
+    except catalog_transfer.TransferInvalid as e:
+        raise HTTPException(422, str(e)) from e
+    return report.as_dict()
+
+
+@router.post("/{source_id}/catalog/import")
+async def import_catalog(source_id: str, payload: CatalogImportIn, x_actor: str | None = Header(default=None),
+                         session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """导入：规则同预览，逐表写入（乐观锁），返回同样形状的报告和每张表写入后的版本。有排队或进行中的起草任务
+    409 catalog_draft_busy；文件格式不对 422；没有表结构 409。"""
+    row, source = await _import_source(session, source_id)
+    try:
+        await catalog_jobs.ensure_idle(session, row)
+    except catalog_jobs.DraftBusy as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
+    try:
+        report = await catalog_transfer.run_import(session, row, source, payload.content,
+                                                   include_guidance=payload.include_guidance,
+                                                   actor=actor_of(x_actor))
+    except catalog_transfer.TransferInvalid as e:
+        raise HTTPException(422, str(e)) from e
+    return report.as_dict()
+
+
 @router.get("/{source_id}/catalog/{table}")
 async def get_catalog_table(source_id: str, table: str,
                             session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
@@ -419,20 +514,21 @@ async def draft_catalog(source_id: str, payload: CatalogDraftIn,
     model_items：模型给了这张表几项可用内容（没用模型、模型这部分失败时为 null）。界面据此区分「模型给了内容、
     只是和现有目录一致」（model_items > 0、三个数都是 0）和「模型没给内容」（model_error 有值）。
 
-    同一个源有排队或进行中的后台起草任务时 409 catalog_draft_busy（和建任务同一句话）：两边同时写同一个源的目录、
-    抢模型名额。
+    双向互斥（catalog_jobs.sync_draft，进程内登记）：同一个源有排队或进行中的后台起草任务、或者正在同步起草时 409
+    catalog_draft_busy（和建任务同一句话）；反过来，同步起草进行期间同一个源建任务、重试、导入目录也是 409。两边同时写
+    同一个源的目录、抢模型名额。
     """
     row, source = await _resolved(session, source_id)
+    cache = source.schema_cache or {}
     try:
-        await catalog_jobs.ensure_idle(session, row)
+        async with catalog_jobs.sync_draft(session, row):
+            if not cache.get("tables"):
+                raise _no_schema(cache)
+            report = await catalog.draft_catalog(session, source, tables=payload.tables or None,
+                                                 use_model=payload.use_model, actor=actor_of(x_actor),
+                                                 guidance=catalog_jobs.guidance_of(row))
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
-    cache = source.schema_cache or {}
-    if not cache.get("tables"):
-        raise _no_schema(cache)
-    report = await catalog.draft_catalog(session, source, tables=payload.tables or None,
-                                         use_model=payload.use_model, actor=actor_of(x_actor),
-                                         guidance=catalog_jobs.guidance_of(row))
     rows = [{"table_name": r.table, "added": r.added, "updated": r.updated, "removed": r.removed,
              "version": r.version, "error": r.error, "model_error": r.model_error, "model_items": r.model_items}
             for r in report.tables]
@@ -527,6 +623,38 @@ async def review_catalog_item(source_id: str, table: str, payload: CatalogReview
     return await _detail(session, source, key, entry)
 
 
+class CatalogBatchReviewItem(BaseModel):
+    table_name: str = Field(min_length=1, max_length=255)
+    path: str = Field(min_length=1, max_length=600)
+    action: Literal["confirm", "reject", "reset"]
+    if_version: int = Field(ge=0)
+
+
+class CatalogBatchReviewIn(BaseModel):
+    items: list[CatalogBatchReviewItem] = Field(min_length=1, max_length=catalog_review.BATCH_MAX)
+
+
+@router.post("/{source_id}/catalog/review/batch")
+async def review_catalog_batch(source_id: str, payload: CatalogBatchReviewIn,
+                               x_actor: str | None = Header(default=None),
+                               session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """批量审阅：逐条结果和请求一一对应。逐表按 if_version 乐观锁，同一张表的几条一次写入；一张表冲突、路径不对、表不存在
+    只记在那几条上（ok 为假，code 是 catalog_conflict / catalog_path_invalid / table_missing），不影响别的。"""
+    _, source = await _resolved(session, source_id)
+    items = [catalog_review.BatchItem(i.table_name, i.path, i.action, i.if_version) for i in payload.items]
+    return {"results": await catalog_review.review_batch(session, source, items, actor=actor_of(x_actor))}
+
+
+@router.get("/{source_id}/catalog/{table}/usage")
+async def catalog_table_runs(source_id: str, table: str,
+                             limit: int = Query(20, ge=1, le=catalog_review.RUNS_LIMIT_MAX),
+                             session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """用过这张表的运行（total 是几次运行），新的在前；取法同使用次数（catalog.table_usage）。"""
+    _, source = await _resolved(session, source_id)
+    key, _ = await _table_key(session, source, table)
+    return await catalog_review.table_runs(session, source, key, limit=limit)
+
+
 def _tables_of(source: Any) -> dict[str, Any] | None:
     """核对提案用的表结构；没有表结构（尚未探查）时不核对列名。"""
     return ((source.schema_cache or {}).get("tables") or None) if source is not None else None
@@ -552,7 +680,8 @@ async def preview_catalog_patch(source_id: str, table: str, payload: CatalogPatc
 async def save_catalog_patch(source_id: str, table: str, payload: CatalogPatchIn,
                              x_actor: str | None = Header(default=None),
                              session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """保存一条目录修改提案：改动过的项记为人工填写、已确认。版本不符 409；有一项不合法 422，整条不写。"""
+    """保存一条目录修改提案：改动过的项记为人工填写、已确认，写了依据的项依据另存成这一项确认时的依据（reason，和备注
+    分开，规则见 catalog.apply_patch）。版本不符 409；有一项不合法 422，整条不写。"""
     _, source = await _resolved(session, source_id)
     key, _ = await _table_key(session, source, table)
     try:
@@ -564,6 +693,45 @@ async def save_catalog_patch(source_id: str, table: str, payload: CatalogPatchIn
     except catalog.CatalogInvalid as e:
         raise _invalid(e) from e
     return await _detail(session, source, key, entry)
+
+
+class AssistantMessageIn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=catalog_assistant.MESSAGE_MAX)
+
+
+class AssistantIn(BaseModel):
+    #: 整段对话（服务端不存）；没有使用者的话时助手先开口
+    messages: list[AssistantMessageIn] = Field(default_factory=list, max_length=catalog_assistant.MAX_MESSAGES)
+    #: 界面上还没保存的修改，让模型知道。不设上限：宽表上几轮攒下来常常超过一次保存的 200 项，不能因此不让问（背景里只列
+    #: 最近的 catalog_assistant.PENDING_SHOWN 项，码值照全部合并）
+    pending: list[CatalogPatchChange] = Field(default_factory=list)
+
+
+@router.post("/{source_id}/catalog/{table}/assistant")
+async def catalog_table_assistant(source_id: str, table: str, payload: AssistantIn,
+                                  session: AsyncSession = Depends(get_session)) -> Any:
+    """表助手：和使用者对话完善这张表的目录，返回 text/event-stream（事件见 data/catalog_assistant.py）。提案只交给界面，
+    不写目录；保存走 /catalog/{table}/patch。开始前：表不在 404；对话不合规 422；起草模型用不了 409
+    catalog_draft_model_unavailable（说法同起草任务）。"""
+    from fastapi.responses import StreamingResponse
+
+    row, source = await _resolved(session, source_id)
+    key = catalog.resolve_table_name(source.schema_cache, table)
+    if key is None:
+        raise HTTPException(404, f"数据源中没有表 {table}，可能已被删除或尚未探查结构")
+    messages = [m.model_dump() for m in payload.messages]
+    if problem := catalog_assistant.conversation_problem(messages):
+        raise HTTPException(422, problem)
+    try:
+        model, model_id = await catalog_assistant.resolve_model(session)
+    except catalog.CatalogModelUnavailable as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_MODEL_UNAVAILABLE) from e
+    context = await catalog_assistant.prepare(session, row, source, key,
+                                              pending=[c.model_dump() for c in payload.pending])
+    return StreamingResponse(catalog_assistant.stream(model, model_id, context, messages),
+                             media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @router.get("/{source_id}/catalog/{table}/impact")

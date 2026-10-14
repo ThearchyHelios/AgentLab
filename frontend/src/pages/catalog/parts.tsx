@@ -1,14 +1,14 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { Check, CircleCheck, CircleDashed, CircleX, RotateCcw, ShieldCheck, Trash2, X } from 'lucide-react'
+import { Check, CircleCheck, CircleDashed, CircleX, Info, MessageSquareQuote, RotateCcw, ShieldCheck, Trash2, X } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import clsx from 'clsx'
 import type { CatalogCounts, CatalogReviewAction, CatalogSource, CatalogStatus } from '../../types'
 import { Notice } from '../../components/ui'
 import { formatDateTime, formatNumber, formatTime } from '../../lib/format'
 import {
-  CATALOG_SOURCE_LABEL, CATALOG_STATUS_HINT, CATALOG_STATUS_LABEL, CATALOG_TEXT as CT,
+  CATALOG_SOURCE_LABEL, CATALOG_STATUS_HINT, CATALOG_STATUS_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT,
 } from '../../lib/terms'
 import { STATUSES, initialStatus } from './model'
 
@@ -99,12 +99,14 @@ export interface ReviewTarget {
   source: CatalogSource
   status: CatalogStatus
   note?: string
+  /** 确认时的依据（保存修改提案时记下的，和备注分开写） */
+  reason?: string
   updated_at?: string
 }
 
 /**
  * 单项的来源和状态。触发按钮就是状态标识（compact 时只有图标，列表格里每格一个）；点开是一个小弹层：
- * 位置、来源、状态说明、更新时间，以及确认 / 驳回 / 恢复。弹层挂在 body 上、按触发按钮的位置固定定位，
+ * 位置、来源、状态说明、更新时间、备注和确认时的依据（各一块），以及确认 / 驳回 / 恢复。弹层挂在 body 上、按触发按钮的位置固定定位，
  * 不会被表格的横向滚动裁掉；滚动时跟着触发按钮走，滚出视野或改窗口大小时收起。键盘：Enter 打开，焦点落到第一个可点的操作，
  * ←→↑↓ 在操作之间移动，Tab 在弹层里循环，Esc 收起并把焦点还给触发按钮
  */
@@ -260,6 +262,12 @@ export function ItemMark({ target, compact = false, disabled = false, disabledHi
               <p className="tnum text-faint" title={formatDateTime(target.updated_at)} data-item-updated="">{CT.itemUpdated(formatTime(target.updated_at))}</p>
             )}
             {target.note && <p className="whitespace-pre-wrap break-words rounded border bg-bg px-2 py-1 text-dim">{target.note}</p>}
+            {/* 确认时的依据：使用者确认时说的话，和上面机器写的备注分开（驳回的项只在这里看得到当初确认时的依据） */}
+            {target.reason?.trim() && (
+              <p className="whitespace-pre-wrap break-words rounded border bg-bg px-2 py-1 text-dim" data-item-reason="">
+                <span className="text-faint">{UT.fieldReason}：</span>{target.reason.trim()}
+              </p>
+            )}
           </div>
           <div className="mt-3 flex flex-wrap gap-1.5">
             <ActionButton icon={<Check size={11} />} disabled={disabled || status === 'confirmed'} onClick={() => act('confirm')} action="confirm">
@@ -293,6 +301,53 @@ function ActionButton({ icon, children, disabled, onClick, action, title }: {
     </button>
   )
 }
+
+/**
+ * 人工确认的项带的备注：确认时留着的数据剖析说明、模型起草时附的依据、双盲复算写明的出处。确认过的项是 SQL 检查和助手的
+ * 依据，为什么这么定要看得到，不能只藏在状态弹层里：表级的项写在值下面（TableFieldRow，同有效记录条件的说明），列的一格、
+ * 关联关系悬停看（NoteHint）。没有备注、不是已确认的为空串
+ */
+export const confirmedNote = (item: { status: CatalogStatus; note?: string } | null | undefined): string =>
+  (item && item.status === 'confirmed' ? item.note?.trim() ?? '' : '')
+
+/**
+ * 确认时的依据（目录项的 reason）：保存修改提案时使用者确认的依据，服务端和备注分开存，这里也分开写——表级的项在值下面
+ * 另起一行，列的一格、关联关系另一个悬停的图标（NoteHint，读屏念「确认时的依据：……」）。只在已确认的项上就近写；驳回的项
+ * 值已划掉，当初确认时的依据只在状态弹层里看。没有为空串
+ */
+export const confirmedReason = (item: { status: CatalogStatus; reason?: string } | null | undefined): string =>
+  (item && item.status === 'confirmed' ? item.reason?.trim() ?? '' : '')
+
+/** 确认时的依据用的图标：引号气泡（使用者的话），和备注的「i」分得开 */
+export const REASON_ICON: LucideIcon = MessageSquareQuote
+
+/**
+ * 列的一格、关联关系上的备注或确认时的依据：只占一个小图标，悬停看全文；读屏念「说明：……」（label 换成「确认时的依据」
+ * 时念「确认时的依据：……」）。attr 是给检查脚本定位的 data- 属性名
+ */
+export function NoteHint({ note, attr, label = UT.fieldNote, icon: Icon = Info }: {
+  note: string
+  attr: string
+  label?: string
+  icon?: LucideIcon
+}) {
+  return (
+    <span className="inline-flex shrink-0 cursor-help items-center pt-[3px] text-faint hover:text-dim" title={`${label}：${note}`}
+          {...{ [attr]: '' }}>
+      <Icon size={11} aria-hidden />
+      <span className="sr-only">{label}：{note}</span>
+    </span>
+  )
+}
+
+/** 列的一格、关联关系上确认时的依据（没有为 null） */
+export function ReasonHint({ reason, attr }: { reason: string; attr: string }) {
+  return reason ? <NoteHint note={reason} attr={attr} label={UT.fieldReason} icon={REASON_ICON} /> : null
+}
+
+/** 从审阅队列打开的那一项（表级项、列的一格、一条关系）：一圈强调色的框，淡淡的底 */
+export const FOCUS_RING = 'rounded-md ring-2 ring-inset ring-[var(--accent)]'
+export const FOCUS_STYLE = { background: 'color-mix(in srgb, var(--accent) 7%, transparent)' }
 
 /** 导入表格的源：说明是系统生成的，只读 */
 export function SystemNotesNotice() {

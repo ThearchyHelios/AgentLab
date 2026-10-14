@@ -8,7 +8,8 @@ import { CatalogImpactList } from '../components/CatalogImpact'
 import { CATALOG_PATCH_TEXT as T, CATALOG_STATUS_LABEL, CATALOG_UI_TEXT as UT } from '../lib/terms'
 import type { CatalogPatchChange } from '../types'
 import {
-  catalogTableHref, codeMeaning, patchSubmit, patchTarget, patchValueText, patchWhere, type CatalogPatch,
+  beforeStatusShown, catalogTableHref, codeMeaning, patchBeforeText, patchSubmit, patchTarget, patchValueText, patchWhere,
+  type CatalogPatch,
 } from './catalogPatch'
 
 // ===========================================================================
@@ -183,13 +184,15 @@ function ChangeRow({ change: c, dense }: { change: CatalogPatchChange; dense: bo
       </div>
       <dl className="mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-2xs leading-relaxed">
         <dt className="text-faint">{T.before}</dt>
-        <dd className={clsx('break-words', c.before == null ? 'text-faint' : 'text-dim')} data-patch-before="">
-          {patchValueText(c.path, c.before)}
-          {c.before != null && c.before_status && <span className="text-faint">（{CATALOG_STATUS_LABEL[c.before_status]}）</span>}
+        <dd className={clsx('break-words', c.before == null || c.before_status === 'rejected' ? 'text-faint' : 'text-dim')} data-patch-before=""
+            data-patch-before-status={c.before_status ?? undefined}>
+          {patchBeforeText(c)}
+          {beforeStatusShown(c) && <span className="text-faint">（{CATALOG_STATUS_LABEL[c.before_status!]}）</span>}
         </dd>
         <dt className="text-faint">{T.after}</dt>
         <dd className="break-words text-fg" data-patch-after="">
-          {isCodes ? <CodesAfter before={c.before} after={c.after} /> : patchValueText(c.path, c.after)}
+          {/* 被驳回的码值不算：保存时整项换成新的，改后的码值都是新加的 */}
+          {isCodes ? <CodesAfter before={c.before_status === 'rejected' ? null : c.before} after={c.after} /> : patchValueText(c.path, c.after)}
         </dd>
         {c.reason && (
           <>

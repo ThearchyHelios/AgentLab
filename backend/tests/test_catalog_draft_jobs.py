@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import uuid
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -441,6 +443,11 @@ def test_old_job_tables_get_the_new_columns():
         assert conn.execute(text("SELECT timeouts, failed_calls, part_columns, notice FROM catalog_draft_jobs")) \
             .one() == (0, 0, None, None)
         assert conn.execute(text("SELECT blank_columns, blank_sample FROM catalog_draft_tasks")).one() == (0, None)
+        # 闭环第一步：逐段落盘的段数、块进度。存量行是 0 和 NULL：升级前没记这些
+        assert conn.execute(text("SELECT parts_written, chunks_total, chunks_done FROM catalog_draft_tasks")) \
+            .one() == (0, None, None)
+        # 复核后：逐表的日志（没收下的有效记录条件）。存量行是 NULL，接口给空列表
+        assert conn.execute(text("SELECT log FROM catalog_draft_tasks")).one() == (None,)
 
 
 async def test_a_job_that_cannot_start_is_failed_with_the_reason(client, monkeypatch):
@@ -779,3 +786,295 @@ async def test_jobs_go_away_with_their_source(client):
         assert (await session.execute(select(CatalogDraftJob).where(CatalogDraftJob.id == job["id"]))).first() is None
         assert (await session.execute(select(CatalogDraftTask).where(CatalogDraftTask.job_id == job["id"]))).first() \
             is None
+
+
+# --------------------------------------------------------------------------
+# 闭环第一步：宽表逐段落盘、停止后的说法、块进度、停止后的留空提示、同步起草与任务互斥
+# --------------------------------------------------------------------------
+
+
+def _wide(n: int = 95) -> dict:
+    return {"wide": {"qualified": "wide", "columns": [_col(f"c{i:03d}") for i in range(1, n + 1)],
+                     "primary_key": ["c001"], "comment": None, "is_view": False, "foreign_keys": []}}
+
+
+def _wide_reply(blank: set[str] = frozenset()) -> dict:
+    """95 列的宽表每列都写中文名；blank 里的列只列出、不写（模型拿不准）。"""
+    return {"wide": {"label": "宽表", "kind": "fact",
+                     "columns": [{"name": f"c{i:03d}", "label": f"第{i}列"} for i in range(1, 96)
+                                 if f"c{i:03d}" not in blank]}}
+
+
+class Hold:
+    """假模型：请写的表在 tables 里、或请写的列里有 columns 里的列时，等 release 才回（停止时这次调用被取消）；别的照
+    FakeModel 回。waiting：有调用在等了。"""
+
+    def __init__(self, replies: dict, *, tables: set[str] = frozenset(), columns: set[str] = frozenset()) -> None:
+        self.inner = FakeModel(replies)
+        self.tables, self.columns = set(tables), set(columns)
+        self.release, self.waiting = asyncio.Event(), asyncio.Event()
+        self.cancelled = 0
+        self.model_name = "hold-model"
+
+    def with_structured_output(self, schema, **_):
+        outer = self
+
+        class _S:
+            async def ainvoke(self, messages):
+                asked = requested("\n".join(str(m.content) for m in messages))
+                cols = {c for _, listed in asked.values() for c in listed or []}
+                if outer.tables & set(asked) or outer.columns & cols:
+                    outer.waiting.set()
+                    try:
+                        await outer.release.wait()
+                    except asyncio.CancelledError:
+                        outer.cancelled += 1
+                        raise
+                return outer.inner._reply(messages, "structured")
+
+        return _S()
+
+    async def ainvoke(self, messages):
+        return await self.inner.ainvoke(messages)
+
+
+async def _task(client, sid: str, job_id: str, table: str) -> dict:
+    return next(t for t in (await get_job(client, sid, job_id))["tasks"] if t["table_name"] == table)
+
+
+async def _start_held_wide(client, sid: str, monkeypatch) -> tuple[str, Hold]:
+    """95 列的宽表分 4 段：表级那段和第 2 段照常写，第 3、4 段一直等着。等到前两段都写进目录才返回。"""
+    model = Hold(_wide_reply(), columns={"c033", "c065"})
+    use(monkeypatch, model)
+    job = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["wide"], "use_model": True})).json()["job"]
+
+    async def two_written() -> bool:
+        return (await _task(client, sid, job["id"], "wide"))["parts_written"] == 2
+
+    await until(two_written)
+    return job["id"], model
+
+
+async def test_a_stopped_wide_table_keeps_the_parts_already_written(client, monkeypatch):
+    """宽表每写出一段就并入目录：停止时已经写进去的段留着，这张表照旧记停止，model_error 说清写进了几段、剩几段没起草。"""
+    sid = await _source(_wide())
+    job_id, model = await _start_held_wide(client, sid, monkeypatch)
+    task = await _task(client, sid, job_id, "wide")
+    assert task["status"] == "running" and task["parts_total"] == 4 and task["parts_done"] == 2
+    assert (task["chunks_total"], task["chunks_done"]) == (4, 2)
+    assert task["added"] == 2 + 32 and task["version"] >= 1, "表级两项 + 第 2 段 32 列"
+
+    r = await client.post(f"{_base(sid)}/draft-jobs/{job_id}/cancel")
+    assert r.status_code == 200, r.text
+    task = next(t for t in r.json()["job"]["tasks"] if t["table_name"] == "wide")
+    assert task["status"] == "cancelled" and task["error"] is None and task["parts_written"] == 2
+    assert task["model_error"] == "已停止：已写进目录 2 段，剩下 2 段没起草"
+    assert model.cancelled == 2, "第 3、4 段正在进行的调用被停掉"
+    notes = (await client.get(f"{_base(sid)}/wide")).json()["notes"]
+    assert notes["label"]["value"] == "宽表" and notes["kind"]["value"] == "fact"
+    assert set(notes["columns"]) == {f"c{i:03d}" for i in range(1, 33)}, "第 2 段写进去的留着"
+    row = next(r for r in (await client.get(_base(sid))).json()["tables"] if r["table_name"] == "wide")
+    assert row["last_draft"]["status"] == "cancelled" and row["last_draft"]["parts_written"] == 2
+    assert row["last_draft"]["blank_columns_from"] is None, "停止前写进了新内容：以前的留空列数不再沿用"
+
+
+async def test_an_interrupted_wide_table_keeps_its_written_parts_too(client, monkeypatch):
+    sid = await _source(_wide())
+    job_id, _ = await _start_held_wide(client, sid, monkeypatch)
+    await catalog_jobs.manager.shutdown(grace=5)
+    task = await _task(client, sid, job_id, "wide")
+    assert task["status"] == "cancelled" and task["error"] == "服务重启，起草中断"
+    assert task["model_error"] == "已中断：已写进目录 2 段，剩下 2 段没起草"
+    assert len((await client.get(f"{_base(sid)}/wide")).json()["notes"]["columns"]) == 32
+
+    # 进程没来得及收尾（直接退出）：下次启动时同样写清
+    async with SessionLocal() as session:
+        job = CatalogDraftJob(source_id=sid, status="running", use_model=True)
+        session.add(job)
+        await session.flush()
+        session.add(CatalogDraftTask(job_id=job.id, seq=0, table_name="wide", status="running", parts_total=3,
+                                     parts_written=1))
+        session.add(CatalogDraftTask(job_id=job.id, seq=1, table_name="gates", status="pending", parts_total=1))
+        await session.commit()
+        crashed = job.id
+    await catalog_jobs.startup()
+    by = {t["table_name"]: t for t in (await get_job(client, sid, crashed))["tasks"]}
+    assert by["wide"]["model_error"] == "已中断：已写进目录 1 段，剩下 2 段没起草"
+    assert by["gates"]["model_error"] is None and by["gates"]["error"] == "服务重启，起草中断"
+
+
+async def test_a_finished_wide_table_counts_every_write_once(client, monkeypatch):
+    """逐段落盘之后整张表收尾一次：新增、更新的计数是各次写入的合计（每一项只数一次），块进度和写进去的段数都记下。"""
+    sid = await _source(_wide())
+    job = await _draft(client, sid, monkeypatch, FakeModel(_wide_reply({"c010", "c040", "c070"})), ["wide"])
+    task = job["tasks"][0]
+    assert task["status"] == "ok" and task["parts_written"] == 4 and task["parts_done"] == 4
+    assert (task["chunks_total"], task["chunks_done"]) == (4, 4)
+    assert (task["added"], task["updated"], task["removed"]) == (2 + 92, 0, 0)
+    assert task["blank_columns"] == 3 and task["blank_sample"] == ["c010", "c040", "c070"]
+    notes = (await client.get(f"{_base(sid)}/wide")).json()["notes"]
+    assert len(notes["columns"]) == 92
+
+    plain = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["wide"]})).json()["job"]
+    await finished(plain["id"])
+    task = (await get_job(client, sid, plain["id"]))["tasks"][0]
+    assert (task["parts_written"], task["chunks_total"], task["chunks_done"]) == (0, None, None), "不用模型时为 null"
+
+
+async def test_chunk_progress_shows_a_part_that_was_split(client, monkeypatch):
+    """块进度：这张表实际分成的块数和已结束的块数，一段超时拆成两半后变多。"""
+    monkeypatch.setattr(catalog, "MODEL_TIMEOUT_S", 0.05)
+    sid = await _source(_tickets(24))
+    replies = {"tickets": {"label": "门票", "columns": [{"name": f"c{i:02d}", "label": f"第{i}列"}
+                                                       for i in range(1, 25)]}}
+    job = await _draft(client, sid, monkeypatch, FakeModel(replies, hang=1), ["tickets"])
+    task = job["tasks"][0]
+    assert task["status"] == "ok" and (task["chunks_total"], task["chunks_done"]) == (2, 2)
+    assert task["parts_written"] == 1 and task["parts_total"] == 1
+
+
+async def test_a_partial_table_also_drops_model_items_of_columns_gone_from_the_schema(client, monkeypatch):
+    """整张表写完时按完整覆盖的规则收尾，只写出一部分的也一样：只删已经不在表结构里的列的模型起草项。"""
+    sid = await _source(_tickets(6))
+    full = {"label": "门票", "columns": [{"name": f"c{i:02d}", "label": f"第{i}列"} for i in range(1, 7)]}
+    await _draft(client, sid, monkeypatch, FakeModel({"tickets": full}), ["tickets"])
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, sid)
+        row.schema_cache = {"tables": _tickets(5)}                  # 重新探查过：c06 已经没有了
+        await session.commit()
+    some = {"label": "门票", "columns": [{"name": f"c{i:02d}", "label": f"第{i}列"} for i in range(1, 5)]}
+    job = await _draft(client, sid, monkeypatch, FakeModel({"tickets": some}, list_all=False), ["tickets"])
+    task = job["tasks"][0]
+    assert task["status"] == "partial" and task["removed"] == 1
+    after = (await client.get(f"{_base(sid)}/tickets")).json()["notes"]["columns"]
+    assert set(after) == {"c01", "c02", "c03", "c04", "c05"}, "c05 是以前起草的，这次没写出来也留着"
+
+
+async def test_blank_columns_from_carries_the_last_finished_draft_over_a_stop(client, monkeypatch):
+    """目录清单的 last_draft.blank_columns_from：最近一次结束于完成、部分完成的起草记下的留空列数。之后的起草停止了、
+    没写进新内容时照样带着，界面据此继续提示；不用模型的起草不算。"""
+    sid = await _source(_tickets(4))
+    replies = {"tickets": {"label": "门票", "columns": [{"name": "c01", "label": "编号"}]}}
+    await _draft(client, sid, monkeypatch, FakeModel(replies), ["tickets"])
+
+    async def last() -> dict:
+        rows = (await client.get(_base(sid))).json()["tables"]
+        return next(r for r in rows if r["table_name"] == "tickets")["last_draft"]
+
+    first = await last()
+    assert first["status"] == "ok" and first["blank_columns"] == 3 and first["blank_columns_from"] == 3
+    assert first["parts_written"] == 1
+
+    plain = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["tickets"]})).json()["job"]
+    await finished(plain["id"])
+    assert (await last())["blank_columns_from"] == 3, "不用模型的起草不改模型留空的列"
+
+    monkeypatch.setattr(catalog_jobs.manager, "start", lambda job_id: None)
+    queued = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["tickets"], "use_model": True})).json()
+    await client.post(f"{_base(sid)}/draft-jobs/{queued['job']['id']}/cancel")
+    stopped = await last()
+    assert stopped["status"] == "cancelled" and stopped["blank_columns"] == 0 and stopped["parts_written"] == 0
+    assert stopped["blank_columns_from"] == 3
+
+    other = await _source(_tickets(4))
+    rows = (await client.get(_base(other))).json()["tables"]
+    assert rows[0]["last_draft"] is None
+
+
+async def test_a_sync_draft_and_draft_jobs_exclude_each_other(client, monkeypatch):
+    """同步起草进行期间，同一个源建任务、重试、再开一次同步起草都 409 catalog_draft_busy（导入照 ensure_idle 认）；
+    同步起草结束后照常。"""
+    sid = await _source()
+    use(monkeypatch, FakeModel(REPLIES))
+    old = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["gates"], "use_model": True})).json()["job"]
+    await finished(old["id"])
+    async with SessionLocal() as session:
+        await session.execute(
+            CatalogDraftTask.__table__.update().where(CatalogDraftTask.job_id == old["id"]).values(status="failed"))
+        await session.commit()
+
+    model = Hold(REPLIES, tables={"visits"})
+    use(monkeypatch, model)
+    sync = asyncio.create_task(client.post(f"{_base(sid)}/draft", json={"tables": ["visits"], "use_model": True}))
+    await asyncio.wait_for(model.waiting.wait(), 5)
+
+    busy = await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["gates"]})
+    assert busy.status_code == 409 and busy.json()["code"] == "catalog_draft_busy", busy.text
+    assert "正在起草" in busy.json()["detail"]
+    retry = await client.post(f"{_base(sid)}/draft-jobs/{old['id']}/retry")
+    assert retry.status_code == 409 and retry.json()["code"] == "catalog_draft_busy", retry.text
+    again = await client.post(f"{_base(sid)}/draft", json={"tables": ["gates"]})
+    assert again.status_code == 409 and again.json()["code"] == "catalog_draft_busy", again.text
+    async with SessionLocal() as session:
+        with pytest.raises(catalog_jobs.DraftBusy):
+            await catalog_jobs.ensure_idle(session, await session.get(DataSource, sid))
+    assert (await client.get(f"{_base(sid)}/draft-jobs/latest")).json()["job"]["id"] == old["id"], "没建新任务"
+
+    model.release.set()
+    done = await sync
+    assert done.status_code == 200, done.text
+    after = await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["gates"]})
+    assert after.status_code == 202, after.text
+    await finished(after.json()["job"]["id"])
+
+
+async def test_a_wide_table_whose_closing_write_fails_keeps_the_count_of_parts_on_disk(client, monkeypatch):
+    """整张表收尾那一次写不进去（一直撞上别人刚改过）：已经逐段写进去的段留着，写进目录的段数照库里的记，不按引擎写出来
+    的段数虚报。"""
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)          # 一段一段来：最后一段只在收尾那次写
+    sid = await _source(_wide())
+    use(monkeypatch, FakeModel(_wide_reply()))
+    real = catalog.write_draft
+
+    async def conflicted(session, source, table, modeled=None, *, at, actor):
+        result = await real(session, source, table, None, at=at, actor=actor)
+        result.error, result.status = catalog.WRITE_CONFLICT_ERROR, "failed"
+        result.added = result.updated = result.removed = 0
+        return result
+
+    monkeypatch.setattr(catalog, "write_draft", conflicted)
+    job = (await client.post(f"{_base(sid)}/draft-jobs", json={"tables": ["wide"], "use_model": True})).json()["job"]
+    await finished(job["id"])
+    task = await _task(client, sid, job["id"], "wide")
+    assert task["status"] == "failed" and task["error"] == catalog.WRITE_CONFLICT_ERROR
+    assert task["parts_written"] == 3, "最后一段没写进去"
+    assert len((await client.get(f"{_base(sid)}/wide")).json()["notes"]["columns"]) == 64
+
+
+async def test_a_dropped_filter_is_logged_on_the_task_not_failed(client, monkeypatch):
+    """模型提议的有效记录条件没通过校验：丢掉、不算失败（表照样完成），逐表的 log 里记一条，接口看得到；没有就是
+    空列表。"""
+    sid = await _source()
+    replies = {**REPLIES, "gates": {"label": "闸口",
+                                    "valid_filter": {"condition": "gate_code IN (SELECT 1)", "reason": "猜的"}}}
+    job = await _draft(client, sid, monkeypatch, FakeModel(replies), ["gates", "channels"])
+    by = {t["table_name"]: t for t in job["tasks"]}
+    assert by["gates"]["status"] == "ok" and by["gates"]["model_error"] is None
+    assert by["gates"]["log"] == ["有效记录条件里不能有子查询，模型提议的这一条没有收下：gate_code IN (SELECT 1)"]
+    assert by["channels"]["log"] == []
+    notes = (await client.get(f"{_base(sid)}/gates")).json()["notes"]
+    assert "valid_filter" not in notes and notes["label"]["value"] == "闸口"
+
+
+async def test_each_write_of_a_job_stamps_its_own_time(client, monkeypatch):
+    """起草任务写进目录的项，修改时间是那一次写入的时间：宽表逐段落盘的每一段、整张表收尾各取一次当时的时间。以前只在任务
+    开始时取一次（截到秒），整个任务写进去的项都是开始那一刻，比任务的开始时间还早，也看不出哪一段是什么时候写的。
+
+    时钟换成每取一次走一分钟的假时钟；同时只起草一段，各段的先后是定的：表级那段、第 2、3 段逐段落盘，第 4 段由收尾写进去。"""
+    ticks = itertools.count()
+    start = datetime(2026, 10, 14, 3, tzinfo=timezone.utc)
+    monkeypatch.setattr(catalog, "now_iso",
+                        lambda: (start + timedelta(minutes=next(ticks))).isoformat(timespec="seconds"))
+    monkeypatch.setattr(catalog, "MODEL_CONCURRENCY", 1)
+    sid = await _source(_wide())
+    job = await _draft(client, sid, monkeypatch, FakeModel(_wide_reply()), ["wide"])
+    task = job["tasks"][0]
+    assert task["status"] == "ok" and task["parts_written"] == 4
+    notes = (await client.get(f"{_base(sid)}/wide")).json()["notes"]
+    cols = notes["columns"]
+    parts = [{cols[f"c{i:03d}"]["label"]["updated_at"] for i in range(lo, hi + 1)}
+             for lo, hi in ((1, 32), (33, 64), (65, 95))]
+    assert all(len(p) == 1 for p in parts), "同一段的项是同一次写进去的"
+    assert notes["kind"]["updated_at"] == notes["label"]["updated_at"], "表级那段的两项是同一次写进去的"
+    stamps = [notes["label"]["updated_at"], *(p.pop() for p in parts)]
+    assert len(set(stamps)) == 4 and stamps == sorted(stamps), stamps

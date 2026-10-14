@@ -65,10 +65,15 @@ function changeOf(x: unknown): CatalogPatchChange | null {
   }
 }
 
+/** 提案里的各项（catalog_patch、表助手的 proposal 事件同一个形状）：认不出的项跳过 */
+export function patchChangesOf(raw: unknown): CatalogPatchChange[] {
+  return (Array.isArray(raw) ? raw : []).map(changeOf).filter((c): c is CatalogPatchChange => !!c)
+}
+
 /** catalog_patch 操作 → 提案。认不出的形状返回 null */
 export function catalogPatchOf(op: Record<string, any>, key = ''): CatalogPatch | null {
   if (typeof op.source !== 'string' || typeof op.source_id !== 'string' || typeof op.table !== 'string') return null
-  const changes = (Array.isArray(op.changes) ? op.changes : []).map(changeOf).filter((c): c is CatalogPatchChange => !!c)
+  const changes = patchChangesOf(op.changes)
   if (!changes.length) return null
   const version = typeof op.version === 'number' && Number.isFinite(op.version) ? op.version : 0
   return {
@@ -135,6 +140,20 @@ export function patchValueText(path: string, v: unknown): string {
   }
   return typeof v === 'string' ? v : JSON.stringify(v)
 }
+
+/**
+ * 改前那一格（卡片、表助手的提案和待保存的修改都用它）：被驳回的项写「已驳回：原值」——服务端把驳回的原值也交回来
+ * （before_status 为 rejected），保存时照旧换成人工确认的新值；只写「未填写」就看不出原来有一个被驳回的值，和导入预览
+ * 「目标里这一项已经驳回」对不上。别的照 patchValueText 写，没有值写「未填写」
+ */
+export function patchBeforeText(change: Pick<CatalogPatchChange, 'path' | 'before' | 'before_status'>): string {
+  const text = patchValueText(change.path, change.before)
+  return change.before_status === 'rejected' && change.before != null ? CATALOG_PATCH_TEXT.beforeRejected(text) : text
+}
+
+/** 改前要不要跟一个状态（「（推断）」）：有值、不是被驳回的（被驳回的状态已经写在 patchBeforeText 里） */
+export const beforeStatusShown = (change: Pick<CatalogPatchChange, 'before' | 'before_status'>) =>
+  change.before != null && !!change.before_status && change.before_status !== 'rejected'
 
 /** 交回保存、预览的那一份：路径、原样取值、理由 */
 export function patchSubmit(changes: CatalogPatchChange[]) {

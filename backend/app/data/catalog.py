@@ -7,7 +7,7 @@
 **只记数据事实，不放计算公式。** 公式（指标怎么算）在口径卡里；这里只描述数据本身。所以 notes 的
 字段是固定的一组，不认识的字段一律拒收（validate_notes）。
 
-notes 结构（每个「项」都是 {value, source, status}，可选 note、updated_at）::
+notes 结构（每个「项」都是 {value, source, status}，可选 note、reason、updated_at）::
 
     {"label": 项(str), "description": 项(str), "grain": 项(str), "keys": 项(list[str]),
      "kind": 项("fact"|"dimension"|"snapshot"|"log"|"config"),
@@ -18,7 +18,10 @@ notes 结构（每个「项」都是 {value, source, status}，可选 note、upd
                        "codes": 项(dict[码值, 含义]；含义可为空串，表示待填写；项上可带 complete: true，
                                   表示已列出全部取值)}},
      "relations": [{"id", "columns", "to_table", "to_columns", "cardinality", "coverage",
-                    "source", "status", "note"?, "cardinality_checked"?}]}
+                    "source", "status", "note"?, "reason"?, "cardinality_checked"?}]}
+
+note 是机器写的说明（模型起草的依据、数据剖析的测量、双盲复算的出处……）；reason 是保存修改提案时使用者确认的依据
+（界面上叫「确认时的依据」，最多 500 字），只由 apply_patch 写，两者分开存，规矩见 apply_patch。
 
 关系上的 cardinality_checked: true 只由数据剖析写：基数是用数据核实的（子表一侧数过 COUNT 和 COUNT(DISTINCT)，
 或者有主键、唯一约束）。外键约束、命名推断给的基数是按表结构推的，子表一侧可能每个键恰好一行；SQL 检查只在
@@ -87,16 +90,18 @@ COLUMN_FIELD_LABEL = {"label": "中文名", "meaning": "含义", "unit": "单位
 #: 各来源起草出来的项的初始状态：外键约束是数据库强制的，算有确证；人工填写即确认；其余都是推断
 _INITIAL_STATUS = {"fk": "verified", "human": "confirmed"}
 
-_ITEM_KEYS = frozenset({"value", "source", "status", "note", "updated_at"})
+_ITEM_KEYS = frozenset({"value", "source", "status", "note", "reason", "updated_at"})
 #: 码值项另有一个「已列全」标记（complete: true）：码值表列出了这一列的全部取值。只有人工明确确认、或者数据剖析
 #: 没截断地看完了全表取值时才有；没有它的码值表只是「已知的一部分」，SQL 检查不能拿它判断某个值「不在码值表里」
 _CODES_ITEM_KEYS = _ITEM_KEYS | {"complete"}
 _RELATION_KEYS = frozenset({"id", "columns", "to_table", "to_columns", "cardinality", "coverage", "source",
-                            "status", "note", "updated_at", "cardinality_checked"})
+                            "status", "note", "reason", "updated_at", "cardinality_checked"})
 _BUSINESS_DATE_KEYS = frozenset({"column", "rule", "timezone"})
 #: 文本项的长度上限。目录是给模型和人读的短说明，长篇大论放口径卡或知识库
 _TEXT_MAX = 500
 _LONG_TEXT_MAX = 2000
+#: 确认时的依据（项上的 reason）的长度上限：同文本项
+REASON_MAX = _TEXT_MAX
 
 
 def now_iso() -> str:
@@ -137,17 +142,29 @@ def unreviewed_status(item: Mapping[str, Any]) -> str:
 
 
 def make_item(value: Any, source: str, status: str | None = None, *, note: str | None = None,
-              at: str | None = None, complete: bool = False) -> dict[str, Any]:
+              at: str | None = None, complete: bool = False, reason: str | None = None) -> dict[str, Any]:
     """构造一个项。status 不给时按来源取初始状态（initial_status）。complete 只用于码值项（已列出全部取值），
-    为假时不写这个键：没有标记和标记为否是一回事，写法统一，冻结进快照的哈希才稳定。"""
+    为假时不写这个键：没有标记和标记为否是一回事，写法统一，冻结进快照的哈希才稳定。reason 是确认时的依据
+    （apply_patch 写），没有时不写这个键。"""
     out: dict[str, Any] = {"value": value, "source": source, "status": status or initial_status(source)}
     if note:
         out["note"] = note
+    if reason:
+        out["reason"] = reason
     if at:
         out["updated_at"] = at
     if complete:
         out["complete"] = True
     return out
+
+
+def clip_reason(reason: Any) -> str | None:
+    """提案里的依据 → 存进项里的 reason：去掉首尾空白，超过 REASON_MAX 字截成 REASON_MAX - 1 字加「…」。没有（空的、
+    不是文字）为 None。预览（plan_patch）和保存（apply_patch）用的是同一句。"""
+    text = reason.strip() if isinstance(reason, str) else ""
+    if not text:
+        return None
+    return text if len(text) <= REASON_MAX else text[:REASON_MAX - 1] + "…"
 
 
 def codes_complete(item: Any) -> bool:
@@ -256,9 +273,18 @@ def _item_problems(where: str, item: Any, rule: tuple[Any, str], *,
         problems.append(f"{where}{hint}")
     if "note" in item and not isinstance(item["note"], str):
         problems.append(f"{where}的备注应为文字")
+    if "reason" in item and not _reason_ok(item["reason"]):
+        problems.append(f"{where}{_REASON_HINT}")
     if "updated_at" in item and not isinstance(item["updated_at"], str):
         problems.append(f"{where}的修改时间应为文字")
     return problems
+
+
+def _reason_ok(value: Any) -> bool:
+    return isinstance(value, str) and len(value) <= REASON_MAX
+
+
+_REASON_HINT = f"确认时的依据应为不超过 {REASON_MAX} 字的文字"
 
 
 def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
@@ -297,6 +323,8 @@ def _relation_problems(rel: Any, seen: set[str]) -> list[str]:
         problems.append(f"{where}的状态「{rel.get('status')}」不在可选值内")
     if "note" in rel and not isinstance(rel["note"], str):
         problems.append(f"{where}的备注应为文字")
+    if "reason" in rel and not _reason_ok(rel["reason"]):
+        problems.append(f"{where}{_REASON_HINT}")
     if "cardinality_checked" in rel and not isinstance(rel["cardinality_checked"], bool):
         problems.append(f"{where}的「基数已用数据核实」应为是或否")
     if "updated_at" in rel and not isinstance(rel["updated_at"], str):
@@ -609,7 +637,7 @@ def merge_notes(existing: Mapping[str, Any] | None, draft: Mapping[str, Any] | N
     """把起草结果并入已有目录，返回 (新目录, 计数)。不改入参。
 
     规则（逐个槽位）：
-    - 已有项是 confirmed 或 rejected：不动。驳回的留着，同一项下次起草就不会再冒出来。
+    - 已有项是 confirmed 或 rejected：不动（确认时的依据 reason 跟着留着）。驳回的留着，同一项下次起草就不会再冒出来。
     - 起草结果里没有这一项：
       - 模型起草的项（llm）留着。模型这次留空、给的值没通过校验（_from_model 里就丢掉了），都不能把以前起草好的
         删掉——实测整库重跑一次，模型这次没给的几百项全被删掉，有的表覆盖率从八成多掉到五成。只有这一轮完整起草过
@@ -698,7 +726,10 @@ def describe_slot(key: Slot) -> str:
 
 
 def review_item(notes: Mapping[str, Any] | None, path: str, action: str, *, at: str | None = None) -> dict[str, Any]:
-    """对一项做审阅，返回新目录（不改入参）。路径不对、项不存在、操作不认识都抛 CatalogPathError。"""
+    """对一项做审阅，返回新目录（不改入参）。路径不对、项不存在、操作不认识都抛 CatalogPathError。
+
+    确认时的依据（reason）：确认、驳回不带依据，原有的留着；撤销审阅回到推断，去掉——推断项上挂着「使用者说：……」，
+    看起来像使用者确认过它。"""
     if action not in REVIEW_ACTIONS:
         raise CatalogPathError("不支持这种审阅操作，只能确认、驳回或撤销审阅")
     key = parse_path(path)
@@ -711,6 +742,8 @@ def review_item(notes: Mapping[str, Any] | None, path: str, action: str, *, at: 
         del slots[key]
         return _assemble(slots)
     item["status"] = {"confirm": "confirmed", "reject": "rejected"}.get(action) or unreviewed_status(item)
+    if action == "reset":
+        item.pop("reason", None)
     item["updated_at"] = at or now_iso()
     return _assemble(slots)
 
@@ -755,6 +788,8 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
       或数据剖析。码值的「已列全」标记跟着值走：只勾上或取消它也算改过（_edit_value）。
     - 值没动的项：保持原来的来源和状态；提交里把状态改成确认、驳回或来源的初始状态的，照改（等同单项审阅）；
       改成别的状态的不认（不能把推断改成「有确证」）。
+    - 确认时的依据（reason）只由保存修改提案写（apply_patch），提交里带的不作数：值改过、新填的项去掉（原来的依据说的
+      是旧值，界面原样带回来的也不认）；值没动的留着库里的；状态改回来源的初始状态（等同撤销审阅）的去掉。
     - 已有、但提交里没有的表级项、列级项：删掉。
     - 已有、但提交里没有的关联关系：外键约束、命名推断、数据剖析、模型起草来的，转为驳回、保留编号；只有人工
       新建的才真正删掉。删掉的推断关系下次起草会再提出来，关系图（助手挑表、SQL 检查）也会按表结构现推回来，
@@ -785,8 +820,9 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
     for key, item in new.items():
         prev = old.get(key)
         if prev is None or _edit_value(key, item) != _edit_value(key, prev):
-            # 「基数已用数据核实」只由数据剖析写：人工改过的关系记成人工确认，提交里带的这个标记不作数
-            fresh = {k: v for k, v in item.items() if k not in ("updated_at", "cardinality_checked")}
+            # 「基数已用数据核实」只由数据剖析写：人工改过的关系记成人工确认，提交里带的这个标记不作数；确认时的依据只由
+            # 保存修改提案写，说的是旧值，不留
+            fresh = {k: v for k, v in item.items() if k not in ("updated_at", "cardinality_checked", "reason")}
             fresh.update(source="human", status="confirmed", updated_at=at)
             out[key] = fresh
             continue
@@ -795,6 +831,8 @@ def apply_human_edit(existing: Mapping[str, Any] | None, submitted: Mapping[str,
         if status != prev.get("status") and status in ("confirmed", "rejected", unreviewed_status(prev)):
             kept["status"] = status
             kept["updated_at"] = at
+            if status not in ("confirmed", "rejected"):
+                kept.pop("reason", None)                     # 等同撤销审阅：回到推断，确认时的依据不留
         if item.get("note") != prev.get("note"):
             if item.get("note"):
                 kept["note"] = item["note"]
@@ -860,9 +898,9 @@ async def save_human_edit(session: AsyncSession, source_id: str, table: str, sub
 
 #: 新增关联关系的路径：relations.new，值写两端；编号按两端算（relation_id），同一条关系不论谁提都是同一个编号
 NEW_RELATION_PATH = "relations.new"
-#: 一条提案最多几项：用户说的是一两条事实，几十项的「提案」多半是模型在重写整张表
-PATCH_MAX_CHANGES = 20
-_REASON_MAX = 500
+#: 一条提案最多几项（预览、保存都按它）。对话里的纠正通常是一两条事实；表助手（data/catalog_assistant.py）会逐列补中文名、
+#: 含义，界面上跨几轮攒下的待保存修改一次保存，宽表上常常几十上百项，所以放到 200
+PATCH_MAX_CHANGES = 200
 #: 看起来像计算公式的文字：「转化率=下单数/访问数」「= SUM(amount)」。公式进口径卡，目录只记数据事实。
 #: 不认减号：「上线日期=2024-01-01」不是公式。有效记录条件本来就是 SQL 条件，不查它。
 #: 对话提案（plan_patch）、人工整份提交（apply_human_edit，只查改动过的项）、模型起草（_from_model，丢掉这一项）
@@ -877,9 +915,11 @@ class PatchChange:
     """提案里的一项，核对过的。
 
     - path：规范化后的路径（新增关系写成 relations.<编号>）；
-    - before / before_status：当前目录里这一项的值和状态（被驳回的和没有的都算没有，为 None）；
+    - before / before_status：当前目录里这一项的值和状态，没有这一项为 None。被驳回的照样给出原值、状态写 rejected
+      （同导入预览「目标里这一项已经驳回」）：只是给人看的，算改后、算 state 都按没有这一项，保存时换成人工确认的新值；
     - after：保存后的值（码值是补充后的完整对照）；value：要交回保存的原样取值（码值只有补充的那几个，
       409 之后在最新的目录上重新补）；
+    - reason：提案的依据，按保存时的样子截过（clip_reason），没有为空串；
     - state：change 值有变化；confirm 值相同、但还不是已确认（保存即确认）；same 已经是这个值且已确认。
     - note：服务端对这一项的说明，给人看；没有时为 None，as_dict 里也不出现。目前只有一种：新增的关联关系没写
       基数、又推算不出来（_relation_after）。
@@ -1013,6 +1053,8 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
       没有这个码时加进去，不会把已有的含义抹掉（_merge_codes）。
     - 关联关系不抹掉测量结果：覆盖率沿用目录里的，基数没写时沿用或推算（_relation_after）。两端、基数、覆盖率都和
       目录里一样时只是确认，来源不变。
+    - 被驳回的项算没有：码值不在驳回的码值上补，和驳回的值一样也是 change（保存时换成人工确认的新值）。改前照样写出
+      驳回的原值、before_status 为 rejected，不然界面上只看到「未填写」，看不出原来有一个被驳回的值。
     - 看起来像计算公式的文字不收（_FORMULA）：公式进口径卡。
     - 同一个路径出现两次只认第一次。
     """
@@ -1033,8 +1075,7 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
             continue
         path = raw["path"].strip()
         value = copy.deepcopy(raw["value"])
-        reason = raw.get("reason")
-        reason = reason.strip()[:_REASON_MAX] if isinstance(reason, str) else ""
+        reason = clip_reason(raw.get("reason")) or ""
         if path == NEW_RELATION_PATH:
             rel, problem = _patch_relation(table, value, None, tables, columns)
             if problem:
@@ -1093,8 +1134,10 @@ def plan_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
             state = "same" if live.get("status") == "confirmed" else "confirm"
         else:
             state = "change"
-        out.append(PatchChange(path=norm, before=copy.deepcopy(before),
-                               before_status=live.get("status") if live is not None else None,
+        # 改前给人看：被驳回的也写出原值（上面算改后、算 state 照旧按没有这一项）
+        shown = live if live is not None else prev
+        out.append(PatchChange(path=norm, before=copy.deepcopy(_value_of(key, shown)) if shown is not None else None,
+                               before_status=shown.get("status") if shown is not None else None,
                                after=after, value=value, reason=reason, state=state, note=note))
     return PatchPlan(out, problems)
 
@@ -1105,6 +1148,11 @@ def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
 
     值有变化的项记为人工填写、已确认（和人工编辑同一条规矩：改动出自人的确认，不是模型起草）；值没变的只把
     状态改成已确认、来源不变（等同单项确认）；已经确认过的原样不动。
+
+    提案里的依据（reason，clip_reason 截过）记进这一项的 reason（确认时的依据），和备注 note 分开：note 是起草的依据、
+    剖析的测量这类机器写的说明，照旧不拼依据——以前拼进 note，再剖析时测量的说法换不了新（catalog_profile._patch_confirmed
+    只换剖析自己写的备注）、旧依据叠在新依据后面、撤销审阅后还挂在推断项上。依据每次保存整句换掉、不叠加：值改了的项
+    （关联关系改了值也一样）是这一次的依据，没写就没有（原来的说的是旧值）；值不变、保存即确认的也换成这一次的。
     """
     plan = plan_patch(notes, changes, table=table, tables=tables)
     if plan.problems:
@@ -1116,20 +1164,25 @@ def apply_patch(notes: Mapping[str, Any] | None, changes: Any, *, table: str,
         if change.state == "same":
             continue
         prev = slots.get(key)
+        reason = change.reason or None
         if change.state == "confirm" and prev is not None:
-            slots[key] = {**prev, "status": "confirmed", "updated_at": at}
+            item = {k: v for k, v in prev.items() if k != "reason"}
+            item.update(status="confirmed", updated_at=at, **({"reason": reason} if reason else {}))
+            slots[key] = item
             continue
         if key[0] == "r":
             rel = {"id": key[1], **change.after, "source": "human", "status": "confirmed", "updated_at": at}
             if prev is not None and prev.get("note"):
                 rel["note"] = prev["note"]       # 覆盖率沿用了，说明它怎么测的那段备注也留着
+            if reason:
+                rel["reason"] = reason
             slots[key] = rel
         else:
             # 码值是补充、不删已有的码：原来标了「已列全」的，补充之后仍然列全。提案自己不能标「已列全」——
             # 用户在对话里说一个码值的意思，不等于确认这一列只有这些取值
             done = key[0] == "c" and key[2] == "codes" and prev is not None and prev.get("status") != "rejected" \
                 and codes_complete(prev)
-            slots[key] = make_item(change.after, "human", "confirmed", at=at, complete=done)
+            slots[key] = make_item(change.after, "human", "confirmed", at=at, complete=done, reason=reason)
     out = _assemble(slots)
     if problems := validate_notes(out):
         raise CatalogInvalid(problems)
@@ -1488,9 +1541,13 @@ MODEL_FALLBACK_MAX_TOKENS = 8192
 #: 一段没写出来（额度用完、只给空壳）时拆成两半再问：最多拆几层、拆到最少几列为止
 MODEL_SPLIT_DEPTH = 3
 MODEL_SPLIT_MIN_COLUMNS = 5
-#: 止损：连续这么多段拆到底仍一项没写出来，这次起草后面的段不再拆小重试（模型明显用不了时不该一段一段拆到底烧额度；
-#: 每段另有 MODEL_PART_MAX_CALLS 次封顶）
-MODEL_GIVE_UP_AFTER = 2
+#: 止损（按比例）：这次起草最近 MODEL_HALT_WINDOW 次调用里有 MODEL_HALT_ON 次以上没写出来（额度用完、超时、空壳、出错），
+#: 之后的段不再拆小、每块只问一次，直到比例降下去。模型明显用不了时不该一段一段拆到底烧额度；以前按「连续几段」算，
+#: 偶尔一次写出来就清零，会思考的模型在宽表上 90 分钟停不下来。每段另有 MODEL_PART_MAX_CALLS 次封顶
+MODEL_HALT_WINDOW = 10
+MODEL_HALT_ON = 7
+#: 同一张表连续这么多个原始段都一项没写出来，这张表剩下的段跳过不问（可以换一个起草模型后只重试这张表）
+MODEL_TABLE_GIVE_UP_AFTER = 3
 #: 网络错误、429、5xx 最多重试几次，每次重试前等多久（秒，依次取用）。超时不原样重试，当作这一段太大、拆小再问
 MODEL_RETRIES = 2
 MODEL_RETRY_DELAYS_S = (10.0, 30.0)
@@ -1512,6 +1569,10 @@ CATALOG_DRAFT_SYSTEM = """你在为一个业务数据库编写数据目录：说
 log（日志表）、config（配置表）之一。
 - keys：业务主键，即在业务上唯一确定一行的列（可以和数据库主键不同），写列名。
 - business_date：业务日期按哪一列算，rule 写一句规则，timezone 写时区（不确定就留空）。
+- valid_filter：有效行过滤。condition 写一段 SQL 条件，筛出业务上算数的行（例如 STATUS NOT IN ('C', 'X')，去掉作废、\
+测试的行）：只用这张表自己的列、不带表名，只写比较、IN、BETWEEN、LIKE、IS NULL，用 AND、OR、NOT 连接，函数只用 UPPER、\
+LOWER、TRIM、COALESCE，不写子查询、聚合、窗口函数和分号；reason 写一句依据（例如哪条注释、哪些码值说明了这一点）。
+- dedup：去重规则，rule 写一句话（例如「同一订单号有多行时只取最后修改的那一行」），reason 写一句依据。
 - columns：每一列的 label（中文名）、meaning（含义，一句话）、unit（单位，例如「元」「人」，没有单位就留空）、\
 measure（度量类型：flow 流量，可跨期加总；stock 存量，时点值，不能跨期加总；ratio 比率；identifier 标识；\
 status 状态；attribute 属性）。
@@ -1519,6 +1580,8 @@ status 状态；attribute 属性）。
 规矩：
 - 只写数据事实，不写计算公式，不写指标怎么算。
 - 拿不准的字段留空，不要猜。列名、表名照原样写，不要翻译或改写。
+- 有效行过滤、去重规则只在表结构、注释、码值能看出来时才写（例如状态列的注释写明了哪些取值是作废、测试），拿不准就不写，\
+没有就不写：写错了会把算数的行筛掉、把不该合并的行合并。
 - 请你写的每一列都在 columns 里写一项，拿不准的字段可以留空，但不要漏掉列：漏掉的列会被再问一次。
 - 标着「系统说明」的内容是导入时按核对结果生成的，以它为准：不要重复，也不要与之矛盾。
 - 标着「已确认」的目录项由人工确认过，以它为准。
@@ -1537,6 +1600,7 @@ CATALOG_DRAFT_BACKGROUND_PROMPT = "使用者补充的背景和要求：\n{lines}
 CATALOG_DRAFT_TEXT_PROMPT = """只输出一个 JSON 对象，不要输出别的文字，格式如下（拿不准的字段不写）：
 {"tables": [{"table": "表名", "label": "中文名", "grain": "一行代表什么", "kind": "表类型", "keys": ["列名"], \
 "business_date": {"column": "列名", "rule": "一句规则", "timezone": "时区"}, \
+"valid_filter": {"condition": "SQL 条件", "reason": "一句依据"}, "dedup": {"rule": "一句话", "reason": "一句依据"}, \
 "columns": [{"name": "列名", "label": "中文名", "meaning": "含义", "unit": "单位", "measure": "度量类型"}]}]}
 表类型写 fact、dimension、snapshot、log、config 之一；度量类型写 flow、stock、ratio、identifier、status、attribute 之一。"""
 
@@ -1556,11 +1620,14 @@ CATALOG_DRAFT_PROMPT_LABELS = {
     "unique": "唯一约束：{cols}",
     "confirmed": "已确认的目录项：",
     # 分段起草：表名下一行说这次只写哪部分（宽表的表级一段、列分段，拆小重问时的半段）
-    "only_table": "这次只写表级的项（中文名、粒度、表类型、业务主键、业务日期），不写列",
+    "only_table": "这次只写表级的项（中文名、粒度、表类型、业务主键、业务日期、有效行过滤、去重规则），不写列",
     "only_columns": "这次只写下面列出的 {n} 列（这张表共 {total} 列），不写表级的项",
     "table_and_columns": "这次只写表级的项和这 {n} 列：{cols}",
     "brief_columns": "列（共 {n} 列，这里只列名字和类型）：",
     "drafted": "已起草的表级内容：",
+    # 开了数据剖析的源：目录里记下的码值（剖析看到的取值和已知含义）交给模型，判断有效行过滤用；遮罩的列不给
+    "codes": "目录里记下的码值（数据剖析看到的取值和已知含义，可据此判断有效行过滤）：",
+    "code": "- {name}：{codes}",
     # 使用者补充的背景和要求
     "description": "数据源说明：{text}",
     "guidance": "起草要求：{text}",
@@ -1587,6 +1654,20 @@ CATALOG_DRAFT_PROMPT_SCHEMA: dict[str, Any] = {
                         "properties": {"column": {"type": "string"}, "rule": {"type": "string"},
                                        "timezone": {"type": "string"}},
                         "required": ["column"],
+                    },
+                    "valid_filter": {
+                        "type": "object",
+                        "description": "有效行过滤：只在表结构、注释、码值能看出来时才写",
+                        "properties": {"condition": {"type": "string", "description": "SQL 条件，只用这张表的列"},
+                                       "reason": {"type": "string", "description": "一句依据"}},
+                        "required": ["condition"],
+                    },
+                    "dedup": {
+                        "type": "object",
+                        "description": "去重规则：只在表结构、注释能看出来时才写",
+                        "properties": {"rule": {"type": "string", "description": "一句话"},
+                                       "reason": {"type": "string", "description": "一句依据"}},
+                        "required": ["rule"],
                     },
                     "columns": {
                         "type": "array",
@@ -1708,11 +1789,77 @@ def _clean_text(value: Any, limit: int = _TEXT_MAX) -> str | None:
     return text if text and len(text) <= limit else None
 
 
-def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool) -> dict[str, Any]:
+#: 模型给的依据（有效行过滤、去重规则的 reason）写进这一项的 note
+FACT_REASON_NOTE = "依据：{reason}"
+#: 有效行过滤按数据源的写法整理（列名加了引号）以后超过目录里这一项的长度上限
+FACT_FILTER_TOO_LONG = "{label}按数据源的写法整理后超过 {limit} 字"
+
+
+def _model_fact(raw: Any, key: str) -> tuple[str, str | None] | None:
+    """模型给的有效行过滤、去重规则 → (取值, 依据)。约定是对象（{condition 或 rule, reason}），只写了一段文字的也认；
+    取值不是非空文字的不要。"""
+    if isinstance(raw, str):
+        text, reason = raw, None
+    elif isinstance(raw, Mapping):
+        text, reason = raw.get(key), raw.get("reason")
+        if text is None:
+            text = raw.get("value")
+    else:
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return text.strip(), _clean_text(reason)
+
+
+def _fact_item(value: str, reason: str | None) -> dict[str, Any]:
+    return make_item(value, "llm", note=FACT_REASON_NOTE.format(reason=reason) if reason else None)
+
+
+def _model_facts(entry: Mapping[str, Any], meta: Mapping[str, Any], *, kind: str | None, table: str | None,
+                 dropped: list[tuple[str, str]] | None = None) -> dict[str, Any]:
+    """模型提议的有效行过滤、去重规则（llm / proposed，依据写进 note）。
+
+    有效行过滤按数据源的方言解析成一个条件、只能用这张表的列（sqlcheck.parse_valid_filter），不过就丢掉、不算这张表
+    失败：服务端日志记一条，dropped 给了就记下 (原因, 模型写的条件)，起草引擎把它写进这张表的日志（起草任务逐表的
+    log）。存的是 sqlcheck.stored_valid_filter 整理过的写法：原文照旧，只把列换成表结构里的真名、不带表名，按数据源的
+    需要加引号——剖析核对的、SQL 检查让模型照着加的都是这一条。去重规则是一句话，同文字项的规矩。"""
+    from app.data import sqlcheck
+
+    out: dict[str, Any] = {}
+    found = _model_fact(entry.get("valid_filter"), "condition")
+    if found is not None:
+        text, reason = found
+        parsed = sqlcheck.parse_valid_filter(text, meta, kind=kind, table=table)
+        problem = parsed.problem
+        if problem is None:
+            stored = sqlcheck.stored_valid_filter(parsed, kind)
+            if _text_ok(stored):
+                out["valid_filter"] = _fact_item(stored, reason)
+            else:
+                # 加了引号以后超过上限：写进去会让整张表写入失败（validate_notes），不收
+                problem = FACT_FILTER_TOO_LONG.format(label=TABLE_FIELD_LABEL["valid_filter"], limit=_TEXT_MAX)
+        if problem is not None:
+            import logging
+
+            logging.getLogger(__name__).info("起草数据目录：表 %s 的有效行过滤没有通过校验，已丢掉：%s（%s）",
+                                             table or meta.get("qualified") or entry.get("table"), problem, text[:200])
+            if dropped is not None:
+                dropped.append((problem, text))
+    found = _model_fact(entry.get("dedup"), "rule")
+    if found is not None and (text := _clean_text(found[0])) is not None:
+        out["dedup"] = _fact_item(text, found[1])
+    return out
+
+
+def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bool, source_kind: str | None = None,
+                table: str | None = None, dropped: list[tuple[str, str]] | None = None) -> dict[str, Any]:
     """模型给的一张表 → 目录项（llm / proposed）。不合规的值整项丢掉，不硬塞：列名对不上表结构的、
     表类型和度量类型不在取值里的、业务主键里有不存在的列的、看起来是计算公式的（_formula_like，公式进口径卡）。
     该是文字的地方写成了数组、对象（列名、表类型、业务日期的列、度量类型……）同样丢掉，不抛异常：实测见过把列名
-    写成数组的，以前在这里抛 TypeError，整张表记出错。导入表格的源，说明已经覆盖的字段也丢掉。"""
+    写成数组的，以前在这里抛 TypeError，整张表记出错。导入表格的源，说明已经覆盖的字段也丢掉。
+
+    有效行过滤、去重规则见 _model_facts：source_kind 是数据源类型（按它的方言解析条件，不认识的类型不收有效行过滤），
+    table 是表名（条件里的列可以带这张表的表名），dropped 收没通过校验的有效行过滤 (原因, 模型写的条件)。"""
     columns = {c["name"]: c for c in meta.get("columns") or []}
     notes: dict[str, Any] = {}
     table_has_system_note = system and bool((meta.get("comment") or "").strip())
@@ -1734,6 +1881,7 @@ def _from_model(entry: Mapping[str, Any], meta: Mapping[str, Any], *, system: bo
             if (text := _clean_text(date.get(k))) is not None:
                 value[k] = text
         notes["business_date"] = make_item(value, "llm")
+    notes.update(_model_facts(entry, meta, kind=source_kind, table=table, dropped=dropped))
     out_cols: dict[str, dict[str, Any]] = {}
     listed = entry.get("columns")
     for col in listed if isinstance(listed, list) else []:
@@ -1842,8 +1990,10 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
     没用模型时为 None）有可用内容的再并上。同步起草和后台起草任务（每张表一结束就调）共用这一处。
 
     - 并入已有目录按 merge_notes 的规则：人工确认、驳回过的项不动。内容没变不写、不升版本。
-    - 模型这次没给的项（留空、没通过校验）不删以前起草的；列已经不在表结构里的，模型各段都写出来时（covered 含 llm）
-      照旧删掉。模型只写出一部分的不算完整起草过（covered 不含 llm）。
+    - 模型这次没给的项（留空、没通过校验）不删以前起草的；列已经不在表结构里的（业务主键、业务日期指着的列也算），
+      整张表起草完（各段都写出来的 ok、只写出一部分的 partial 都一样）就按完整覆盖的规则删掉：删的只是说已经不存在的
+      列的模型起草项，和这次写没写全无关。后台任务里宽表每写出一段就先并入一次（catalog_jobs.write_part，那一次不删
+      任何东西），这里是整张表的收尾。
     - 模型留空的列（blank）按并入之后的目录再筛一遍：已经有中文名或含义的（以前起草的、库注释、起草进行中有人填的）
       不算留空。
     - 写入撞上别人刚改过（乐观锁）就重读重并，最多三次。
@@ -1859,8 +2009,8 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
         if modeled.items:
             result.model_items = modeled.items
             result.blank = list(getattr(modeled, "blank", None) or [])
-            model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"}) if modeled.status == "ok"
-                                     else frozenset())
+            model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"})
+                                     if modeled.status in ("ok", "partial") else frozenset())
     for _attempt in range(3):
         entry = await read_entry(session, source.id, table)
         version = entry.version if entry else 0
@@ -2249,27 +2399,27 @@ def query_snapshot_meta(source: Any, sql: str) -> dict[str, Any]:
     return {"source_id": getattr(source, "id", None), "source": getattr(source, "name", None), "tables": tables}
 
 
-async def table_usage(session: AsyncSession, source: Any) -> dict[str, int]:
-    """每张表被运行查询过的次数：{schema_cache 的表名: 次数}，没被查过的表不出现。
+async def query_snapshot_tables(session: AsyncSession, source: Any) -> list[tuple[str, frozenset[str]]]:
+    """这个源上属于运行的每一行查询快照引用：(运行 id, 这条查询用到的表——schema_cache 的表名)，没对上任何表的不收。
 
-    取法：数据源查询工具每次成功查询都存一份查询快照工件（tools/datasource.py），工件引用表 artifacts 里
-    按 (内容哈希, 运行) 各记一行。数「属于某次运行（runs 里有这次运行）、属于这个源、SQL 里用到了这张表」的
-    行：同一次运行里结果一模一样的重复查询只算一次，工具库里的试用（不属于任何运行）不算。
+    使用次数（table_usage）和「这张表被哪些运行用过」（data/catalog_review.py）共用这一份取法：数据源查询工具每次成功
+    查询都存一份查询快照工件（tools/datasource.py），工件引用表 artifacts 里按 (内容哈希, 运行) 各记一行；只收属于某次运行
+    （runs 里有这次运行）、属于这个源的行，工具库里的试用（不属于任何运行）不算。
 
-    表名在查询当时就记进了引用的 meta（query_snapshot_meta），这里只读 artifacts 一张表；升级前的老引用
-    没有 meta，退回读工件内容里的源名和 SQL，读过的按工件 id 缓存（内容永不改变）。SQL 里写的表名去掉
-    schema 前缀后按 name_key（只把 ASCII 字母转小写，和 SQLite 比较标识符的口径一致）对到表结构上，对不上的不计。
+    表名在查询当时就记进了引用的 meta（query_snapshot_meta），这里只读 artifacts 一张表；升级前的老引用没有 meta，退回读
+    工件内容里的源名和 SQL，读过的按工件 id 缓存（内容永不改变）。SQL 里写的表名去掉 schema 前缀后按 name_key（只把
+    ASCII 字母转小写，和 SQLite 比较标识符的口径一致）对到表结构上，对不上的不计。
     """
     rows = (await session.execute(
-        select(Artifact.id, Artifact.meta).join(Run, Run.id == Artifact.run_id)
+        select(Artifact.id, Artifact.meta, Artifact.run_id).join(Run, Run.id == Artifact.run_id)
         .where(Artifact.kind == QUERY_SNAPSHOT_KIND)
     )).all()
     tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
     lookup: dict[str, str] = {}
     for name in tables:
         lookup.setdefault(name_key(name), name)
-    counts: Counter[str] = Counter()
-    for artifact_id, meta in rows:
+    out: list[tuple[str, frozenset[str]]] = []
+    for artifact_id, meta, run_id in rows:
         meta = meta if isinstance(meta, dict) else {}
         if isinstance(meta.get("tables"), list):
             source_id, source_name, names = meta.get("source_id"), meta.get("source"), meta["tables"]
@@ -2281,8 +2431,21 @@ async def table_usage(session: AsyncSession, source: Any) -> dict[str, int]:
                 continue
         elif source_name != source.name:
             continue
-        hit = {lookup.get(name_key(str(n).rsplit(".", 1)[-1])) for n in names}
-        counts.update(t for t in hit if t is not None)
+        hit = frozenset(t for t in (lookup.get(name_key(str(n).rsplit(".", 1)[-1])) for n in names) if t is not None)
+        if hit:
+            out.append((str(run_id), hit))
+    return out
+
+
+async def table_usage(session: AsyncSession, source: Any) -> dict[str, int]:
+    """每张表被运行查询过的次数：{schema_cache 的表名: 次数}，没被查过的表不出现。
+
+    按查询快照引用的行数（query_snapshot_tables）：同一次运行里结果一模一样的重复查询只算一次，同一次运行里不同的查询
+    各算一次，工具库里的试用不算。
+    """
+    counts: Counter[str] = Counter()
+    for _run, hit in await query_snapshot_tables(session, source):
+        counts.update(hit)
     return dict(counts)
 
 
@@ -2324,10 +2487,11 @@ __all__ = [
     "CatalogEntry", "CatalogInvalid", "CatalogModelUnavailable", "CatalogPathError", "DRAFT_DEFAULT_TABLES",
     "DraftModel", "DraftReport", "INFERRED_MARK", "ITEM_SOURCES", "ITEM_STATUSES", "JoinEdge", "KIND_LABEL",
     "MEASURE_LABEL", "MODEL_BATCH_COLUMNS", "MODEL_BATCH_TABLES", "MODEL_CONCURRENCY", "MODEL_EMPTY_REASON",
-    "MODEL_FALLBACK_MAX_TOKENS", "MODEL_MAX_TOKENS", "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON",
-    "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS", "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER",
-    "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
-    "PATCH_MAX_CHANGES",
+    "FACT_REASON_NOTE", "MODEL_FALLBACK_MAX_TOKENS", "MODEL_HALT_ON", "MODEL_HALT_WINDOW", "MODEL_MAX_TOKENS",
+    "MODEL_MIN_PART_COLUMNS", "MODEL_NOTICE_OFF", "MODEL_NOTICE_ON", "MODEL_NOTICE_WINDOW", "MODEL_PART_MAX_CALLS",
+    "MODEL_RETRIES", "MODEL_RETRY_DELAYS_S", "MODEL_SHRINK_AFTER", "MODEL_SPLIT_DEPTH", "MODEL_SPLIT_MIN_COLUMNS",
+    "MODEL_TABLE_GIVE_UP_AFTER", "MODEL_TIMEOUT_S", "MergeStats", "NEW_RELATION_PATH",
+    "PATCH_MAX_CHANGES", "REASON_MAX", "clip_reason",
     "PROFILE_NOTE_PREFIX", "PROFILE_VERIFY_COVERAGE", "WRITE_CONFLICT_ERROR", "default_tables",
     "missing_table_error", "pick_tables", "write_draft",
     "PatchChange", "PatchPlan", "QUERY_SNAPSHOT_KIND", "REVIEW_ACTIONS", "TABLE_FIELDS", "TABLE_FIELD_LABEL",
