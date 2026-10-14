@@ -351,6 +351,18 @@ async def test_background_has_structure_catalog_and_hides_masked_values(client, 
     assert "没开剖析" not in system
 
 
+async def test_long_catalogs_are_cut_with_a_note(client, tmp_path, monkeypatch):
+    sid = await _source(client, tmp_path)
+    monkeypatch.setattr(catalog_assistant, "CATALOG_ITEMS_SHOWN", 2)
+    model = Scripted([Turn(text=["好。"])])
+    use(monkeypatch, model)
+    await _talk(client, sid, _ask("看看"))
+    system = model.seen[0][0].content
+    # 表级的项在前；遮罩列的码值本来就不算；剩下的说明还有几项
+    assert "- label（中文名）：订单" in system and "- grain（粒度）" in system and "- kind（表类型）" not in system
+    assert "还有 3 项没有列出" in system
+
+
 async def test_without_profiling_there_is_no_query_tool(client, tmp_path, monkeypatch):
     sid = await _source(client, tmp_path, profile=False)
     model = Scripted([Turn(text=["只能根据表结构推断。"])])

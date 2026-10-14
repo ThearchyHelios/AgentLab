@@ -79,9 +79,11 @@ TOOL_CHARS = 12_000
 RETRY_DELAYS_S = (3.0, 10.0)
 #: 等模型的时候每隔几秒发一行 SSE 注释
 HEARTBEAT_S = 10.0
-#: 背景里「目录里还没有中文名和含义的列」最多列几个；别的表指过来的关联关系最多列几条
+#: 背景里「目录里还没有中文名和含义的列」最多列几个；别的表指过来的关联关系最多列几条；这张表的目录最多列几项
+#: （几百列的宽表全部起草过有上千项，全列出来提示词就太长了：表级的项、关联关系在前，列的项在后）
 UNNAMED_SHOWN = 30
 INCOMING_SHOWN = 30
+CATALOG_ITEMS_SHOWN = 600
 
 QUERY_TOOL = "run_query"
 PROPOSE_TOOL = "propose_changes"
@@ -166,6 +168,7 @@ ASSISTANT_PROMPT_LABELS = {
     "catalog_empty": "这张表还没有数据目录。",
     "item": "- {path}（{label}）：{value}〔{source}，{status}〕",
     "item_note": "  备注：{text}",
+    "catalog_more": "（还有 {n} 项没有列出：这张表的目录太长。要改的项照上面的路径写法提，核对时按当前目录算）",
     "relation": "{columns} → {to_table}.{to_columns}{extra}",
     "relation_extra": "（{text}）",
     "cardinality": "基数 {value}",
@@ -357,10 +360,14 @@ def _catalog_lines(notes: Mapping[str, Any] | None, masked: set[str]) -> list[st
     （剖析的备注里有取值范围）。"""
     labels = ASSISTANT_PROMPT_LABELS
     lines: list[str] = []
-    for key, item in catalog._slots(notes).items():
+    # 表级的项、关联关系在前，列的项在后（稳定排序，各自照目录里的顺序）；遮罩列上的码值不算
+    slots = [(key, item) for key, item in sorted(catalog._slots(notes).items(), key=lambda kv: kv[0][0] == "c")
+             if not (key[0] == "c" and key[2] == "codes" and key[1].lower() in masked)]
+    for shown, (key, item) in enumerate(slots):
+        if shown >= CATALOG_ITEMS_SHOWN:
+            lines.append(labels["catalog_more"].format(n=len(slots) - shown))
+            break
         hidden = _touches_masked(key, item, masked)
-        if hidden and key[0] == "c" and key[2] == "codes":
-            continue
         if key[0] == "r":
             label, value = labels["field_relation"], _relation_line(item)
         else:

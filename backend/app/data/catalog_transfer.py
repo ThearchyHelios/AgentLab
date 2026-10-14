@@ -30,6 +30,7 @@ tables: {表名: {notes, version}}}，含全部状态的项，表结构里已经
 from __future__ import annotations
 
 import copy
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -51,7 +52,8 @@ _UNNAMED = "数据源"
 
 #: 状态：照带的、只填空缺的
 _LOCKED = ("confirmed", "rejected")
-_STATUS_LABEL = {"proposed": "推断", "verified": "有确证", "confirmed": "已确认", "rejected": "已驳回"}
+#: 状态的界面叫法（同 frontend/src/lib/terms.ts 的 CATALOG_STATUS_LABEL）
+_STATUS_LABEL = {"proposed": "推断", "verified": "已验证", "confirmed": "已确认", "rejected": "已驳回"}
 
 #: 写入一直撞上别人刚改过（重读重算三次仍冲突）
 WRITE_CONFLICT_ERROR = "这张表的数据目录正被其他人修改，没有导入，请稍后重新导入"
@@ -106,7 +108,12 @@ class ImportFile:
 
 
 def read_file(content: Any, *, include_guidance: bool) -> ImportFile:
-    """导出的那个对象 → ImportFile。格式不对抛 TransferInvalid（说法给人看）。"""
+    """导出的那个对象 → ImportFile。界面直接交来文件的原文（一段 JSON 文字）也认。格式不对抛 TransferInvalid（说法给人看）。"""
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError as e:
+            raise TransferInvalid("文件内容不是合法的 JSON，请选择从 AgentLab 导出的数据目录文件") from e
     if not isinstance(content, Mapping):
         raise TransferInvalid("文件内容不是数据目录导出的格式，请选择从 AgentLab 导出的数据目录文件")
     if content.get("format") != FORMAT:

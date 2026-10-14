@@ -334,6 +334,11 @@ async def test_import_waits_for_draft_jobs_and_rejects_bad_files(client):
         r = await client.post(f"{_base(local)}/import/preview", json={"content": body})
         assert r.status_code == 422, body
         assert any("一" <= ch <= "鿿" for ch in r.json()["detail"])
+    # 界面直接交来文件原文也认；不是 JSON 的 422
+    as_text = await client.post(f"{_base(local)}/import/preview", json={"content": json.dumps(content)})
+    assert as_text.status_code == 200 and as_text.json()["totals"]["tables"] == 2
+    not_json = await client.post(f"{_base(local)}/import/preview", json={"content": "{不是 JSON"})
+    assert not_json.status_code == 422 and "JSON" in not_json.json()["detail"]
     too_long = {**content, "guidance": "长" * (catalog_jobs.GUIDANCE_MAX + 1)}
     r = await client.post(f"{_base(local)}/import/preview", json={"content": too_long, "include_guidance": True})
     assert r.status_code == 422 and "起草要求" in r.json()["detail"]
