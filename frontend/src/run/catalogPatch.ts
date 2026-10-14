@@ -65,10 +65,15 @@ function changeOf(x: unknown): CatalogPatchChange | null {
   }
 }
 
+/** 提案里的各项（catalog_patch、表助手的 proposal 事件同一个形状）：认不出的项跳过 */
+export function patchChangesOf(raw: unknown): CatalogPatchChange[] {
+  return (Array.isArray(raw) ? raw : []).map(changeOf).filter((c): c is CatalogPatchChange => !!c)
+}
+
 /** catalog_patch 操作 → 提案。认不出的形状返回 null */
 export function catalogPatchOf(op: Record<string, any>, key = ''): CatalogPatch | null {
   if (typeof op.source !== 'string' || typeof op.source_id !== 'string' || typeof op.table !== 'string') return null
-  const changes = (Array.isArray(op.changes) ? op.changes : []).map(changeOf).filter((c): c is CatalogPatchChange => !!c)
+  const changes = patchChangesOf(op.changes)
   if (!changes.length) return null
   const version = typeof op.version === 'number' && Number.isFinite(op.version) ? op.version : 0
   return {

@@ -436,9 +436,12 @@ function newJob(state, src, { tables, use_model, note = null, retry_of = null })
   const tasks = tables.map((name) => {
     const t = state.tables[src].find((x) => x.name === name && !x.missing)
     const cols = t?.columns?.length ?? 0
+    const partsTotal = t && use_model ? (cols > PART_COLUMNS ? 1 + Math.ceil(cols / PART_COLUMNS) : 1) : null
     return {
       table_name: name, status: t ? 'pending' : 'skipped', columns: cols,
-      parts_total: t && use_model ? (cols > PART_COLUMNS ? 1 + Math.ceil(cols / PART_COLUMNS) : 1) : null, parts_done: 0,
+      parts_total: partsTotal, parts_done: 0,
+      // 逐段写进目录：已写进的段数；段被缩小、拆半后实际的块数和已结束的块数（不用模型时为 null）
+      parts_written: 0, chunks_total: partsTotal, chunks_done: partsTotal == null ? null : 0,
       added: 0, updated: 0, removed: 0, version: t?.version ?? 0, model_items: null, blank_columns: 0, blank_sample: [],
       error: t ? null : `表结构里没有 ${name}，请先重新探查结构`, model_error: null,
       started_at: null, finished_at: t ? null : isoNow(),
@@ -507,7 +510,13 @@ function finishJob(job, status) {
  */
 function stopJob(job, status = 'cancelled', error = null) {
   for (const t of job.tasks) {
-    if (t.status === 'pending' || t.status === 'running') Object.assign(t, { status: 'cancelled', error, finished_at: isoNow() })
+    if (t.status !== 'pending' && t.status !== 'running') continue
+    // 写过段的表照旧记已停止，原因写一句已写进目录几段、剩下几段没起草（服务端停止、中断时的说法：catalog_jobs 的
+    // STOPPED_WRITTEN、INTERRUPTED_WRITTEN）
+    const written = t.parts_written ?? 0
+    const modelError = written > 0 && t.parts_total
+      ? `${status === 'interrupted' ? '已中断' : '已停止'}：已写进目录 ${written} 段，剩下 ${t.parts_total - written} 段没起草` : t.model_error
+    Object.assign(t, { status: 'cancelled', error, model_error: modelError, finished_at: isoNow() })
   }
   if (error) job.error = error
   delete job.stopAsked
@@ -524,15 +533,19 @@ function failJob(job, error) {
 }
 
 function lastDraftOf(state, src, name) {
-  for (const job of [...state.jobs].reverse()) {
-    if (job.source_id !== src) continue
+  const jobs = [...state.jobs].reverse().filter((j) => j.source_id === src)
+  const fixture = state.tables[src]?.find((x) => x.name === name)?.lastDraft ?? null
+  // 最近一次这张表结束于完成、部分完成的起草记下的留空列数（服务端 last_drafts 的 blank_columns_from）
+  const ended = jobs.map((j) => j.tasks.find((x) => x.table_name === name)).find((t) => t && (t.status === 'ok' || t.status === 'partial'))
+  const from = ended ? ended.blank_columns : fixture?.blank_columns_from ?? null
+  for (const job of jobs) {
     const t = job.tasks.find((x) => x.table_name === name)
     if (t) {
       return { status: t.status, job_id: job.id, finished_at: t.finished_at, error: t.error, model_error: t.model_error,
-        blank_columns: t.blank_columns }
+        blank_columns: t.blank_columns, blank_columns_from: from, parts_written: t.parts_written ?? 0 }
     }
   }
-  return state.tables[src]?.find((x) => x.name === name)?.lastDraft ?? null
+  return fixture
 }
 
 const jobOf = (state, key) => {
@@ -1202,8 +1215,10 @@ await section('数据目录 · 起草：已有任务（409）、服务重启中�
   check('上一次起草因服务重启中断：设置阶段写明，给「查看」', await until(async () => (await draftText(page, '[data-draft-last]')).includes('服务重启')),
     await draftText(page, '[data-draft-last]'))
   await draftBox(page).locator('[data-draft-last-open]').click()
-  check('……点开：结果写明服务重启中断，可以接着重试', await until(async () => (await draftPhase(page)) === 'done')
-        && (await draftText(page, '[data-draft-title]')) === '服务重启，起草中断' && (await draftText(page, '[data-draft-interrupted]')).includes('重试'),
+  // 重试不是续跑：服务端把这些表整张重新分段起草（不跳过已写进目录的段），不能说成「接着起草」剩下的部分
+  check('……点开：结果写明服务重启中断，可以只重试这些表、会重新起草整张表（不说接着起草）', await until(async () => (await draftPhase(page)) === 'done')
+        && (await draftText(page, '[data-draft-title]')) === '服务重启，起草中断' && (await draftText(page, '[data-draft-interrupted]')).includes('会重新起草整张表')
+        && (await draftText(page, '[data-draft-interrupted]')).includes('已写进目录的内容不会丢') && !(await draftText(page, '[data-draft-interrupted]')).includes('接着起草'),
     `${await draftText(page, '[data-draft-title]')} · ${await draftText(page, '[data-draft-interrupted]')}`)
   // 服务端把任务和没写完的表都记「服务重启，起草中断」：标题、提示已经写了，逐表只写「已停止」，不再各写一遍
   check('……没写的 2 张记「已停止」，原因不再逐张重复', (await draftText(page, '[data-draft-task="orders"] [data-draft-task-status]')) === '已停止'
@@ -1537,6 +1552,113 @@ await section('数据目录 · 起草：模型拿不准、留空的列', async (
         && (await tip.getAttribute('data-notice')) === 'warn' && await tip.locator('[data-catalog-redraft]').count() === 1,
     await tip.innerText({ timeout: 500 }).catch(() => ''))
   await cleanCopy(page, '留空列的提示')
+  check('只发过起草任务相关的写请求', writes(sent, /./).every((s) => /catalog\/(draft-jobs|guidance)/.test(s.key)),
+    JSON.stringify(writes(sent, /./).map((s) => s.key)))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据目录 · 起草：逐段写进目录、块进度与停止后的留空提示', async () => {
+  const state = freshState()
+  // 上一次起草写完了这两张表，各留了几列空（之后停止、又没有新写入时，界面接着用这次记下的留空列数提示）
+  const old = newJob(state, S1, { tables: ['store_sales', 'members'], use_model: true })
+  settle(state, old, 'store_sales', { added: 10, model_items: 40, blank_columns: 6, blank_sample: BLANK_SAMPLE })
+  settle(state, old, 'members', { added: 2, model_items: 3, blank_columns: 3, blank_sample: ['member_no', 'joined_on'] })
+  finishJob(old)
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  check('开始起草（门店销售、会员 2 张，用模型）', await startDraft(page, { select: ['store_sales', 'members'], model: true }))
+  const job = state.jobs.at(-1)
+  const task = (n) => draftBox(page).locator(`[data-draft-task="${n}"]`)
+  const text = (n, sel) => task(n).locator(sel).first().innerText({ timeout: 500 }).then((t) => t.replace(/\s+/g, ' ').trim()).catch(() => '')
+
+  // 宽表第 1 段写完就写进目录：逐表写「已写进目录 1 段」；没拆过的段不写块进度（段进度已经说清了）
+  settle(state, job, 'store_sales', { status: 'running', parts_done: 1, parts_written: 1, chunks_total: 3, chunks_done: 1 })
+  check('宽表写完一段：逐表写「已写进目录 1 段」，段进度「1 / 3 段」，没拆过不写块进度',
+    await until(async () => (await text('store_sales', '[data-draft-task-written]')) === '已写进目录 1 段')
+        && (await text('store_sales', '[data-draft-task-parts]')) === '1 / 3 段' && await task('store_sales').locator('[data-draft-task-chunks]').count() === 0,
+    `${await text('store_sales', '[data-draft-task-written]')} · ${await text('store_sales', '[data-draft-task-parts]')}`)
+  check('……「已写进目录」悬停写明停止、服务重启时保留', ((await task('store_sales').locator('[data-draft-task-written]').getAttribute('title')) ?? '').includes('停止或服务重启时已写进的段保留'))
+  // 额度用完、超时后段被拆半：块比段多，写「已结束几块 / 共几块」，悬停说明为什么变多
+  settle(state, job, 'store_sales', { status: 'running', parts_done: 1, parts_written: 1, chunks_total: 5, chunks_done: 2 })
+  const chunks = task('store_sales').locator('[data-draft-task-chunks]')
+  check('段被拆小：写块进度「2 / 5 块」，悬停说明实际分成 5 块', await until(async () => (await text('store_sales', '[data-draft-task-chunks]')) === '2 / 5 块')
+        && ((await chunks.getAttribute('title')) ?? '').includes('实际分成 5 块'), await text('store_sales', '[data-draft-task-chunks]'))
+  settle(state, job, 'store_sales', { status: 'running', parts_done: 2, parts_written: 2, chunks_total: 5, chunks_done: 4 })
+  check('……接着写：「已写进目录 2 段」「2 / 3 段」「4 / 5 块」', await until(async () => (await text('store_sales', '[data-draft-task-written]')) === '已写进目录 2 段')
+        && (await text('store_sales', '[data-draft-task-parts]')) === '2 / 3 段' && (await text('store_sales', '[data-draft-task-chunks]')) === '4 / 5 块')
+  check('……还没开始的表不写段进度、块进度、已写进目录', await task('members').locator('[data-draft-task-parts], [data-draft-task-chunks], [data-draft-task-written]').count() === 0)
+  await shot(page, 'catalog-draft-chunks')
+
+  // 停止：已写进的段保留。说法照服务端：写过段的表记已停止，原因写已写进几段、剩下几段没起草
+  await page.locator('[data-draft-stop]').click()
+  check('点「停止」：写明正在停止、已写进目录的段保留', await until(async () => (await draftText(page, '[data-draft-title]')).includes('已写进目录的段保留')),
+    await draftText(page, '[data-draft-title]'))
+  stopJob(job)
+  check('停下来：宽表记已停止，原因写「已写进目录 2 段，剩下 1 段没起草」', await until(async () => (await draftPhase(page)) === 'done')
+        && (await text('store_sales', '[data-draft-task-status]')) === '已停止'
+        && (await text('store_sales', '[data-draft-task-reason]')).includes('已写进目录 2 段，剩下 1 段没起草'),
+    `${await text('store_sales', '[data-draft-task-status]')} · ${await text('store_sales', '[data-draft-task-reason]')}`)
+  check('……服务端的原因已经写了，界面不再重复一行「已写进目录」', await task('store_sales').locator('[data-draft-task-written]').count() === 0)
+  const cancelled = await draftText(page, '[data-draft-cancelled]')
+  // 重试会把这张宽表整张重新起草（服务端不跳过已写进目录的段），不能说成「接着起草剩下的段」
+  check('……汇总写明已写进的段保留：其中 1 张表已写进目录 2 段，只重试这些表时会重新起草整张表', cancelled.includes('每写完一段就写进目录')
+        && cancelled.includes('其中 1 张表已写进目录 2 段') && cancelled.includes('只重试这些表时会重新起草整张表，已写进的不会丢')
+        && !cancelled.includes('接着起草'), cancelled)
+  check('……可以只重试这 2 张', (await page.locator('[data-draft-retry]').innerText().catch(() => '')).includes('（2 张）'))
+  await page.locator('[data-draft-close]').click()
+
+  // 老服务端停下来时原因里没写：界面自己补一句。部分完成的表段进度是「都结束了」，看不出写进了几段：也写一句
+  const legacy = newJob(state, S1, { tables: ['store_sales', 'members'], use_model: true })
+  settle(state, legacy, 'members', { status: 'partial', parts_total: 2, parts_done: 2, parts_written: 1, model_error: CALL_ERR })
+  settle(state, legacy, 'store_sales', { status: 'running', parts_done: 1, parts_written: 1 })
+  stopJob(legacy)
+  legacy.tasks[0].model_error = null
+  await page.locator('[data-catalog-draft]').first().click()
+  await draftBox(page).waitFor()
+  await until(async () => (await draftBox(page).locator('[data-draft-last-open]').count()) === 1)
+  await draftBox(page).locator('[data-draft-last-open]').click()
+  check('服务端的原因里没写已写进几段：界面补「已写进目录 1 段，剩下 2 段没起草」', await until(async () => (await text('store_sales', '[data-draft-task-written]')) === '已写进目录 1 段，剩下 2 段没起草'),
+    await text('store_sales', '[data-draft-task-written]'))
+  check('……部分完成的表写「已写进目录 1 段」，原因照旧', (await text('members', '[data-draft-task-written]')) === '已写进目录 1 段'
+        && (await text('members', '[data-draft-task-reason]')).includes(CALL_ERR), await text('members', '[data-draft-task-written]'))
+  await page.locator('[data-draft-close]').click()
+  state.jobs.pop()
+
+  // 服务重启中断：写过段的宽表原因写「已中断：已写进目录 1 段，剩下 2 段没起草」（服务端中断时的说法），界面不再补一行；
+  // 提示写明重试会重新起草整张表，不说接着起草
+  const crashed = newJob(state, S1, { tables: ['store_sales'], use_model: true })
+  settle(state, crashed, 'store_sales', { status: 'running', parts_done: 1, parts_written: 1 })
+  stopJob(crashed, 'interrupted', '服务重启，起草中断')
+  await page.locator('[data-catalog-draft]').first().click()
+  await draftBox(page).waitFor()
+  await until(async () => (await draftBox(page).locator('[data-draft-last-open]').count()) === 1)
+  await draftBox(page).locator('[data-draft-last-open]').click()
+  check('服务重启中断：宽表的原因写「已中断：已写进目录 1 段，剩下 2 段没起草」，不再补一行「已写进目录」',
+    await until(async () => (await text('store_sales', '[data-draft-task-reason]')) === '已中断：已写进目录 1 段，剩下 2 段没起草')
+        && await task('store_sales').locator('[data-draft-task-written]').count() === 0, await text('store_sales', '[data-draft-task-reason]'))
+  check('……提示写明只重试这些表会重新起草整张表，已写进目录的内容不会丢', (await draftText(page, '[data-draft-interrupted]')).includes('会重新起草整张表，已写进目录的内容不会丢'),
+    await draftText(page, '[data-draft-interrupted]'))
+  await page.locator('[data-draft-close]').click()
+  state.jobs.pop()
+
+  // 清单：会员表这次还没开始就停了（没有新写入）：接着用上一次写完时记下的留空列数提示；门店销售这次写进了 2 段，不再拿旧数提示
+  const rowBlank = (n) => page.locator(`[data-catalog-row="${n}"] [data-row-blank]`)
+  await goto(page, `/data/catalog/${S1}`)
+  check('清单：停止、没有新写入的表接着提示「上次起草有 3 列模型拿不准、留空了」', await until(async () => (await rowBlank('members').innerText({ timeout: 500 }).catch(() => '')).includes('上次起草有 3 列模型拿不准、留空了')),
+    await rowBlank('members').innerText({ timeout: 500 }).catch(() => ''))
+  check('……这次写进了段的宽表不拿旧的留空列数提示', await rowBlank('store_sales').count() === 0)
+  await page.locator('[data-catalog-row="members"] [data-catalog-open-row]').click()
+  const tip = page.locator('[data-catalog-last-draft]')
+  check('表详情：顶部照旧提示 3 列留空，写明是再之前那次起草记下的（最近一次已停止）',
+    await until(async () => (await tip.innerText({ timeout: 500 }).catch(() => '')).includes('上次起草有 3 列模型拿不准、留空了'))
+        && (await tip.getAttribute('data-catalog-last-draft')) === 'cancelled'
+        && (await tip.locator('[data-catalog-last-draft-earlier]').innerText().catch(() => '')).includes('最近一次起草已停止'),
+    await tip.innerText({ timeout: 500 }).catch(() => ''))
+  check('……给「重新起草这张表」「补充起草要求」，旁边是「和助手一起完善」', await tip.locator('[data-catalog-redraft]').count() === 1
+        && await tip.locator('[data-catalog-draft-guidance]').count() === 1 && await tip.locator('[data-catalog-assistant-open="notice"]').count() === 1)
+  await cleanCopy(page, '逐段写进目录的提示')
   check('只发过起草任务相关的写请求', writes(sent, /./).every((s) => /catalog\/(draft-jobs|guidance)/.test(s.key)),
     JSON.stringify(writes(sent, /./).map((s) => s.key)))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))

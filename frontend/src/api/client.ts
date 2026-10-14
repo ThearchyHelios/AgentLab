@@ -1,6 +1,8 @@
 import type {
-  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogDetail, CatalogDraftJob, CatalogImpact, CatalogList, CatalogNotes,
-  CatalogPatchPreview, CatalogPatchSubmit, CatalogProfileOut, CatalogReviewAction, CommitOut, CurrentRecipe, EditPreview,
+  ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogAssistantEvent, CatalogAssistantRequest, CatalogDetail, CatalogDraftJob,
+  CatalogImpact, CatalogImportReport, CatalogList, CatalogNotes, CatalogPatchPreview, CatalogPatchSubmit, CatalogProfileOut,
+  CatalogReviewAction, CatalogReviewBatchItem, CatalogReviewBatchResult, CatalogReviewKind, CatalogReviewProgress, CatalogReviewQueue,
+  CatalogTableUsage, CommitOut, CurrentRecipe, EditPreview,
   EditRequest, ImportRecord,
   ManifestOut, PurgeRawBody, PurgeRawOut, QuestionAnswer, Recipe, RedraftRulesOut, RemovePeriodBody, RemovePeriodOut,
   RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
@@ -15,7 +17,7 @@ import {
   ApiError, BASE, NETWORK_MESSAGE, actorHeader, codeOf, del, describeDetail, failure, get, isGatewayFailure, parseBody,
   patch, post, put, qs, report, request, upload, type RequestOptions, type UploadOptions,
 } from './http'
-import { bundle } from './bundle'
+import { bundle, dispositionName } from './bundle'
 import { compare } from './compare'
 import { inquiry } from './inquiry'
 import { schedules } from './schedules'
@@ -451,6 +453,51 @@ export const api = {
     profile: (sourceId: string, body: { tables?: string[] }, opts?: RequestOptions) =>
       request<CatalogProfileOut>(`/datasources/${encodeURIComponent(sourceId)}/catalog/profile`,
         { method: 'POST', body: JSON.stringify(body), ...opts }),
+    // ---- 审阅队列（只列推断项，按表的使用次数、这一项对数字的影响和来源排好）
+    /** 一页待确认项。kind：全部 / 影响数字的项 / 名称和含义；table 只看这一张表 */
+    reviewQueue: (sourceId: string, params: { limit?: number; offset?: number; kind?: CatalogReviewKind; table?: string | null },
+      opts?: RequestOptions) =>
+      get<CatalogReviewQueue>(`${catalogBase(sourceId)}/review-queue${qs({ limit: 50, offset: 0, kind: 'all', ...params })}`, opts),
+    /**
+     * 成批确认、驳回、撤销审阅（最多 200 条）：逐表按 if_version 乐观锁，一张表冲突不影响别的表，同一张表的几条一次写入。
+     * 逐条回结果：成功的带这张表写入后的版本，冲突、不合法的带原因和机读码
+     */
+    reviewBatch: (sourceId: string, items: CatalogReviewBatchItem[]) =>
+      post<{ results: CatalogReviewBatchResult[] }>(`${catalogBase(sourceId)}/review/batch`, { items }),
+    /** 审阅进度：使用次数前 top_n 张表、全部表、影响数字的项 */
+    reviewProgress: (sourceId: string, opts?: RequestOptions) =>
+      get<CatalogReviewProgress>(`${catalogBase(sourceId)}/review-progress`, opts),
+    /** 用过这张表的运行，新的在前 */
+    usage: (sourceId: string, table: string, limit = 20, opts?: RequestOptions) =>
+      get<CatalogTableUsage>(`${catalogBase(sourceId)}/${encodeURIComponent(table)}/usage${qs({ limit })}`, opts),
+    // ---- 导出导入
+    /**
+     * 导出这个数据源的数据目录（GET /catalog/export，附件）：回来的是文件本身和服务端给的文件名，没给就是 null，由调用方
+     * 按数据源名补。原样存下，不解析：导入时交回的就是这份
+     */
+    exportFile: async (sourceId: string): Promise<{ blob: Blob; name: string | null }> => {
+      const path = `${catalogBase(sourceId)}/export`
+      let res: Response
+      try {
+        res = await fetch(BASE + path, { headers: actorHeader() })
+      } catch (e: any) {
+        const err = new ApiError(0, NETWORK_MESSAGE, { kind: 'network', raw: `${e?.name ?? 'Error'}: ${e?.message ?? e}` })
+        report(false, err)
+        throw err
+      }
+      if (!res.ok) throw failure(res.status, res.statusText, await res.text().catch(() => ''), path)
+      report(true)
+      return { blob: await res.blob(), name: dispositionName(res.headers.get('Content-Disposition')) }
+    },
+    /** 导入的预览（只读）：哪些表对上了，各有几项新增、更新、保留、冲突、跳过，冲突逐条列出 */
+    importPreview: (sourceId: string, body: { content: unknown; include_guidance: boolean }) =>
+      post<CatalogImportReport>(`${catalogBase(sourceId)}/import/preview`, body),
+    /**
+     * 导入：规则同预览，逐表乐观锁，一张表失败不影响别的。有排队、进行中的起草任务时 409（catalog_draft_busy）；
+     * 文件格式不对 422（detail 是一句中文）
+     */
+    importCatalog: (sourceId: string, body: { content: unknown; include_guidance: boolean }) =>
+      post<CatalogImportReport>(`${catalogBase(sourceId)}/import`, body),
   },
 
   runs: {
@@ -862,6 +909,83 @@ export function streamCopilot(
         return
       }
       onEnd(e?.message ?? '连接中断，请重试')
+    }
+  })()
+  return () => controller.abort()
+}
+
+/** 表助手一轮结束时的情况：error 是给人看的那句话（开流前被拒时带状态码和机读码）；aborted 是点了停止 */
+export interface CatalogAssistantEnd {
+  error?: string
+  status?: number
+  code?: string
+  aborted?: boolean
+}
+
+/**
+ * 表助手的一轮（POST /datasources/{id}/catalog/{table}/assistant）：回答是事件流，每个事件一行 data: <JSON>，到一个回调
+ * 一个（text 增量、query 只读查询、proposal 修改提案、done、error）。返回取消函数，就是「停止回答」。
+ *
+ * 开流之前就被拒（表不在 404、起草模型用不了 409 catalog_draft_model_unavailable、请求太长 422）时 onEnd 带服务端那句话、
+ * 状态码和机读码；流到一半断了和一开始就连不上一样，说无法连接服务。认不出的行（心跳、半截）跳过
+ */
+export function streamCatalogAssistant(
+  sourceId: string,
+  table: string,
+  body: CatalogAssistantRequest,
+  onEvent: (event: CatalogAssistantEvent) => void,
+  onEnd: (end: CatalogAssistantEnd) => void,
+): () => void {
+  const controller = new AbortController()
+  const path = `${catalogBase(sourceId)}/${encodeURIComponent(table)}/assistant`
+  const emit = (line: string) => {
+    const text = line.replace(/\r$/, '')
+    if (!text.startsWith('data:')) return
+    const payload = text.slice(5).trim()
+    if (!payload) return
+    try {
+      const event = parseBody(payload)
+      if (event && typeof event === 'object' && typeof event.type === 'string') onEvent(event as CatalogAssistantEvent)
+    } catch { /* 认不出的一行，跳过 */ }
+  }
+  void (async () => {
+    try {
+      const res = await fetch(BASE + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...actorHeader() },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      })
+      if (!res.ok || !res.body) {
+        const err = failure(res.status, res.statusText, await res.text().catch(() => ''), path)
+        onEnd(err.kind === 'network' ? { error: NETWORK_MESSAGE } : { error: err.message, status: res.status, code: err.code })
+        return
+      }
+      report(true)
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let idx: number
+        while ((idx = buffer.indexOf('\n')) >= 0) {
+          emit(buffer.slice(0, idx))
+          buffer = buffer.slice(idx + 1)
+        }
+      }
+      buffer += decoder.decode()
+      if (buffer) emit(buffer)
+      onEnd({})
+    } catch (e: any) {
+      if (e?.name === 'AbortError') { onEnd({ aborted: true }); return }
+      if (e instanceof TypeError) {
+        report(false, new ApiError(0, NETWORK_MESSAGE, { kind: 'network', raw: String(e) }))
+        onEnd({ error: NETWORK_MESSAGE })
+        return
+      }
+      onEnd({ error: e?.message ?? NETWORK_MESSAGE })
     }
   })()
   return () => controller.abort()

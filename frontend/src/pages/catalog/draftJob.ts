@@ -42,12 +42,41 @@ export const DRAFT_PART_COLUMNS = 40
 /** 模型拿不准、留空的列数（任务里的一张表、清单上的上次起草）；老服务端没有这个键时为 0 */
 export const blankOf = (t: { blank_columns?: number } | null | undefined): number => Math.max(0, t?.blank_columns ?? 0)
 
+type LastDraftLike = {
+  status: CatalogDraftTaskStatus
+  blank_columns?: number
+  blank_columns_from?: number | null
+  parts_written?: number
+}
+
 /**
- * 清单、表详情上「上次起草有 N 列模型拿不准、留空了」的 N：这张表的那次起草结束了才算（还在起草的那一次写到一半，
- * 不说「上次」）
+ * 清单、表详情上「上次起草有 N 列模型拿不准、留空了」的 N 和它的出处：这张表的那次起草结束了才算（还在起草的那一次
+ * 写到一半，不说「上次」）。最近一次是停止、服务重启中断（表记已停止），又没有新写入（自己没记下留空的列、也没写进
+ * 任何一段）时，留空的列照旧是再之前那次写完的起草记下的（blank_columns_from），earlier 为真
  */
-export const lastBlankOf = (d: { status: CatalogDraftTaskStatus; blank_columns?: number } | null | undefined): number =>
-  (d && TASK_ENDED.has(d.status) ? blankOf(d) : 0)
+export function lastBlankInfo(d: LastDraftLike | null | undefined): { n: number; earlier: boolean } {
+  if (!d || !TASK_ENDED.has(d.status)) return { n: 0, earlier: false }
+  const own = blankOf(d)
+  if (d.status === 'cancelled' && own === 0 && (d.parts_written ?? 0) === 0) {
+    const from = Math.max(0, d.blank_columns_from ?? 0)
+    return { n: from, earlier: from > 0 }
+  }
+  return { n: own, earlier: false }
+}
+
+/**
+ * 宽表的块进度：段被缩小、拆半后实际分成的块比段多，这时才写「已结束几块 / 共几块」（没拆过的段进度已经说清了）。
+ * 不用模型、老服务端没有这两个键时为 null
+ */
+export function chunksOf(t: { parts_total: number | null; chunks_total?: number | null; chunks_done?: number | null }):
+  { done: number; total: number } | null {
+  const total = t.chunks_total
+  if (total == null || total <= Math.max(1, t.parts_total ?? 1)) return null
+  return { done: Math.max(0, Math.min(total, t.chunks_done ?? 0)), total }
+}
+
+/** 已经写进目录的段数（老服务端没有这个键时为 0） */
+export const writtenOf = (t: { parts_written?: number }): number => Math.max(0, t.parts_written ?? 0)
 
 /** 一次起草里留空的列合计：服务端给了合计就用它，老服务端没有就按逐表加 */
 export const jobBlank = (j: CatalogDraftJob): number => (j.blank_columns != null ? blankOf(j) : j.tasks.reduce((n, t) => n + blankOf(t), 0))

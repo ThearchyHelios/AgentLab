@@ -9,8 +9,8 @@ import { errorMessage } from '../../lib/errors'
 import { formatTime } from '../../lib/format'
 import { CATALOG_DRAFT_TEXT as DT, CATALOG_TEXT as CT, DRAFT_GUIDANCE_MAX, DRAFT_NOTE_MAX } from '../../lib/terms'
 import {
-  DRAFT_MAX_TABLES, DRAFT_MODEL_UNAVAILABLE, DRAFT_PART_COLUMNS, DRAFT_TOP_N, RETRYABLE, blankOf, isJobActive, jobBlank, needsLook,
-  nothingWritten, retryableCount, taskReason,
+  DRAFT_MAX_TABLES, DRAFT_MODEL_UNAVAILABLE, DRAFT_PART_COLUMNS, DRAFT_TOP_N, RETRYABLE, blankOf, chunksOf, isJobActive, jobBlank, needsLook,
+  nothingWritten, retryableCount, taskReason, writtenOf,
 } from './draftJob'
 import type { DraftPreset, DraftStartBody } from './draftJob'
 
@@ -435,6 +435,9 @@ function JobView({ job, running, stopping, busy, blankTables, onRedraftBlank }: 
   // 额度用完、超时多了，之后的段缩小了：进行中写一句，段数为什么变多看得明白
   const partColumns = running && job.use_model && job.part_columns != null && job.part_columns < DRAFT_PART_COLUMNS ? job.part_columns : null
   const blankTotal = jobBlank(job)
+  // 停下来时已经写进了一部分段的表（宽表每写完一段就写进目录）：几张、合计几段
+  const stopped = job.tasks.filter((t) => t.status === 'cancelled' && writtenOf(t) > 0)
+  const stoppedParts = { tables: stopped.length, parts: stopped.reduce((n, t) => n + writtenOf(t), 0) }
   return (
     <div className="min-w-0 space-y-3">
       {busy && <Notice tone="info" attr={{ 'data-draft-busy': '' }}>{DT.busy}</Notice>}
@@ -468,7 +471,12 @@ function JobView({ job, running, stopping, busy, blankTables, onRedraftBlank }: 
       {running && <p className="text-2xs leading-relaxed text-faint">{DT.hideHint}</p>}
       {job.status === 'failed' && job.error && <Notice tone="err" attr={{ 'data-draft-job-error': '' }}>{job.error}</Notice>}
       {job.status === 'interrupted' && <Notice tone="warn" attr={{ 'data-draft-interrupted': '' }}>{DT.interrupted}</Notice>}
-      {job.status === 'cancelled' && <p className="text-2xs text-dim" data-draft-cancelled="">{DT.cancelled}</p>}
+      {job.status === 'cancelled' && (
+        <p className="text-2xs leading-relaxed text-dim" data-draft-cancelled="">
+          {DT.cancelled}
+          {stoppedParts.tables > 0 && <span className="block">{DT.cancelledParts(stoppedParts.tables, stoppedParts.parts)}</span>}
+        </p>
+      )}
       {problemText && (
         <p className="text-xs leading-relaxed" data-draft-problems="">{problemText}</p>
       )}
@@ -523,7 +531,15 @@ const TASK_ICON: Record<CatalogDraftTaskStatus, { Icon: LucideIcon | null; color
 function TaskRow({ task: t, jobError }: { task: CatalogDraftTask; jobError: string | null }) {
   const { Icon, color } = TASK_ICON[t.status]
   const reason = jobError && t.error === jobError ? (t.model_error ?? '') : taskReason(t)
-  const parts = t.parts_total != null && t.parts_total > 1 && t.status !== 'pending' && t.status !== 'skipped'
+  const started = t.status !== 'pending' && t.status !== 'skipped'
+  const parts = t.parts_total != null && t.parts_total > 1 && started
+  // 段被缩小、拆半后实际的块（比段多时才写）；已经写进目录的段：起草中、部分完成时写着（停止也不丢，部分完成的
+  // 段进度是「都结束了」，看不出写进了几段），停下来时补一句剩下几段没起草。服务端的原因里已经写了的不重复，写完了的不写
+  const chunks = started ? chunksOf(t) : null
+  const written = writtenOf(t)
+  const writtenText = written <= 0 || reason.includes(DT.partsWritten(written)) ? ''
+    : t.status === 'running' || t.status === 'partial' ? DT.partsWritten(written)
+      : t.status === 'cancelled' ? DT.partsWrittenStopped(written, Math.max(0, (t.parts_total ?? written) - written)) : ''
   const changes = DT.taskAdded(t.added, t.updated)
   const blank = blankOf(t)
   const sample = t.blank_sample?.filter(Boolean) ?? []
@@ -537,6 +553,11 @@ function TaskRow({ task: t, jobError }: { task: CatalogDraftTask; jobError: stri
             {DT.parts(t.parts_done, t.parts_total!)}
           </span>
         )}
+        {chunks && (
+          <span className="tnum shrink-0 text-2xs text-faint" title={DT.chunksHint(chunks.total)} data-draft-task-chunks="">
+            {DT.chunks(chunks.done, chunks.total)}
+          </span>
+        )}
         {changes && (
           <span className="tnum shrink-0 text-2xs text-faint" title={DT.taskAddedHint(t.added, t.updated, t.removed)}>{changes}</span>
         )}
@@ -545,6 +566,11 @@ function TaskRow({ task: t, jobError }: { task: CatalogDraftTask; jobError: stri
           {DT.taskStatus[t.status]}
         </span>
       </div>
+      {writtenText && (
+        <p className="mt-0.5 break-words pl-5 text-2xs leading-relaxed text-faint" title={DT.partsWrittenHint} data-draft-task-written="">
+          {writtenText}
+        </p>
+      )}
       {reason && (
         <p className="mt-0.5 break-words pl-5 text-2xs leading-relaxed text-dim" data-draft-task-reason="">{reason}</p>
       )}

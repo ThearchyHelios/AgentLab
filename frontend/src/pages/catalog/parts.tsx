@@ -294,6 +294,10 @@ function ActionButton({ icon, children, disabled, onClick, action, title }: {
   )
 }
 
+/** 从审阅队列打开的那一项（表级项、列的一格、一条关系）：一圈强调色的框，淡淡的底 */
+export const FOCUS_RING = 'rounded-md ring-2 ring-inset ring-[var(--accent)]'
+export const FOCUS_STYLE = { background: 'color-mix(in srgb, var(--accent) 7%, transparent)' }
+
 /** 导入表格的源：说明是系统生成的，只读 */
 export function SystemNotesNotice() {
   return (
