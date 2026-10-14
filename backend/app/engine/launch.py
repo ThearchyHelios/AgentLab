@@ -55,9 +55,22 @@ async def launch_run(
     actor: str | None,
     schedule_id: str | None = None,
     options: dict[str, Any] | None = None,
+    origin_kind: str | None = None,
+    origin: dict[str, Any] | None = None,
+    app_id: str | None = None,
+    app_version: int | None = None,
+    expect_hash: str | None = None,
 ) -> Run:
     """发起一次运行，返回刚建好的运行记录（执行已经交给 run_manager）。不发起就抛 LaunchRefused；抛别的异常时
     运行也没有开始执行。
+
+    应用平台（docs/design/app-platform-and-look.md §2.1、§2.10 X3）：
+    - origin_kind / origin：运行来源（engine/origin.py 的 ORIGIN_KINDS）。记在运行上，同时把 run.origin 事件放进
+      notes（在封存范围内）。调用方：POST /api/runs（客户端只能声明 CLIENT_ORIGINS）、定时任务（schedule）、
+      应用入口和视图（app_*）、入站钩子（hook）。
+    - app_id / app_version：应用发起的运行属于哪个应用版本。
+    - expect_hash：应用发起正式运行时必须带上钉住版本的 graph_hash，和快照对不上就拒绝（run_version_hash_mismatch）。
+      「已发布且未退役」的判定见 app/apps/versions.py（BE-3 实现，替换下面「只认当前发布版」的规则，F1）。
 
     参数和 POST /api/runs 的请求体一一对应（input 叫 input_payload）；actor 是记在运行上的发起人。
     schedule_id 是发起它的定时任务，options 是整次运行沿用的选项快照，都原样交给 run_manager.start；图里有双盲复算、
@@ -159,6 +172,12 @@ async def launch_run(
         payload_ev = dict(ev)
         node = payload_ev.pop("node_id", None)
         notes.append(("caliber.upgrade", node, payload_ev))
+    if origin_kind:
+        from app.engine.origin import origin_note
+
+        data = {**(origin or {}), "actor": actor, "app_id": app_id, "app_version": app_version}
+        data.pop("kind", None)
+        notes.insert(0, (EventType.RUN_ORIGIN, None, origin_note(origin_kind, **data)))
     try:
         run = await run_manager.start(
             graph=graph,
@@ -174,6 +193,10 @@ async def launch_run(
             options=options,
             schedule_id=schedule_id,
             notes=notes,
+            origin_kind=origin_kind,
+            origin=origin,
+            app_id=app_id,
+            app_version=app_version,
         )
     except ValueError as e:
         raise LaunchRefused(400, str(e)) from e

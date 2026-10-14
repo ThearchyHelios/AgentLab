@@ -195,8 +195,14 @@ class RunManager:
         options: dict[str, Any] | None = None,
         schedule_id: str | None = None,
         notes: Sequence[tuple[EventType | str, str | None, dict[str, Any]]] = (),
+        origin_kind: str | None = None,
+        origin: dict[str, Any] | None = None,
+        app_id: str | None = None,
+        app_version: int | None = None,
     ) -> Run:
         """建运行记录、交给执行任务。options 是这次运行的选项快照，schedule_id 是发起它的定时任务（可空）。
+        origin_kind / origin / app_id / app_version 是运行来源（engine/origin.py），由 launch_run 定下，原样记在运行上；
+        对应的 run.origin 事件由 launch_run 放进 notes。
 
         notes 是发起时就定下的事件 (类型, node_id, 数据)，比如正式运行按什么级别出具、口径升版怎么处置。它们和
         运行记录同一个事务提交，排在 run.started 前面：写不进去就不建运行，不会出现运行已经在执行、调用方却
@@ -242,6 +248,10 @@ class RunManager:
                     data_versions=data_versions,
                     options=options,
                     schedule_id=schedule_id,
+                    origin_kind=origin_kind,
+                    origin=origin,
+                    app_id=app_id,
+                    app_version=app_version,
                 )
                 run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
                 session.add(run)
