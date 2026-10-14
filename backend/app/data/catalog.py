@@ -860,8 +860,9 @@ async def save_human_edit(session: AsyncSession, source_id: str, table: str, sub
 
 #: 新增关联关系的路径：relations.new，值写两端；编号按两端算（relation_id），同一条关系不论谁提都是同一个编号
 NEW_RELATION_PATH = "relations.new"
-#: 一条提案最多几项：用户说的是一两条事实，几十项的「提案」多半是模型在重写整张表
-PATCH_MAX_CHANGES = 20
+#: 一条提案最多几项（预览、保存都按它）。对话里的纠正通常是一两条事实；表助手（data/catalog_assistant.py）会逐列补中文名、
+#: 含义，界面上跨几轮攒下的待保存修改一次保存，宽表上常常几十上百项，所以放到 200
+PATCH_MAX_CHANGES = 200
 _REASON_MAX = 500
 #: 看起来像计算公式的文字：「转化率=下单数/访问数」「= SUM(amount)」。公式进口径卡，目录只记数据事实。
 #: 不认减号：「上线日期=2024-01-01」不是公式。有效记录条件本来就是 SQL 条件，不查它。

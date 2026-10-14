@@ -18,6 +18,8 @@
                                  （data/catalog_review.py）
 - GET    /catalog/export         导出数据目录（JSON 附件）；POST /catalog/import/preview 导入预览（只读），
                                  POST /catalog/import 导入（data/catalog_transfer.py）
+- POST   /catalog/{table}/assistant  表助手：对话完善这张表的目录（text/event-stream），提案不写目录
+                                 （data/catalog_assistant.py）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
 不对 422，源或表不存在 404。所有写操作记录请求头 X-Actor 的署名（自报、未认证）。剖析没开启、正在剖析 409。
@@ -40,7 +42,7 @@ from app.api.coded import (
 )
 from app.api.runs import actor_of
 from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, introspect, table_versions
-from app.data import catalog_review, catalog_transfer
+from app.data import catalog_assistant, catalog_review, catalog_transfer
 from app.data.engine import SnapshotTampered
 from app.db.base import get_session
 from app.db.models import DataSource
@@ -688,6 +690,44 @@ async def save_catalog_patch(source_id: str, table: str, payload: CatalogPatchIn
     except catalog.CatalogInvalid as e:
         raise _invalid(e) from e
     return await _detail(session, source, key, entry)
+
+
+class AssistantMessageIn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=catalog_assistant.MESSAGE_MAX)
+
+
+class AssistantIn(BaseModel):
+    #: 整段对话（服务端不存）；没有使用者的话时助手先开口
+    messages: list[AssistantMessageIn] = Field(default_factory=list, max_length=catalog_assistant.MAX_MESSAGES)
+    #: 界面上还没保存的修改，让模型知道
+    pending: list[CatalogPatchChange] = Field(default_factory=list, max_length=catalog_assistant.MAX_PENDING)
+
+
+@router.post("/{source_id}/catalog/{table}/assistant")
+async def catalog_table_assistant(source_id: str, table: str, payload: AssistantIn,
+                                  session: AsyncSession = Depends(get_session)) -> Any:
+    """表助手：和使用者对话完善这张表的目录，返回 text/event-stream（事件见 data/catalog_assistant.py）。提案只交给界面，
+    不写目录；保存走 /catalog/{table}/patch。开始前：表不在 404；对话不合规 422；起草模型用不了 409
+    catalog_draft_model_unavailable（说法同起草任务）。"""
+    from fastapi.responses import StreamingResponse
+
+    row, source = await _resolved(session, source_id)
+    key = catalog.resolve_table_name(source.schema_cache, table)
+    if key is None:
+        raise HTTPException(404, f"数据源中没有表 {table}，可能已被删除或尚未探查结构")
+    messages = [m.model_dump() for m in payload.messages]
+    if problem := catalog_assistant.conversation_problem(messages):
+        raise HTTPException(422, problem)
+    try:
+        model, model_id = await catalog_assistant.resolve_model(session)
+    except catalog.CatalogModelUnavailable as e:
+        raise CodedHTTPException(409, str(e), CATALOG_DRAFT_MODEL_UNAVAILABLE) from e
+    context = await catalog_assistant.prepare(session, row, source, key,
+                                              pending=[c.model_dump() for c in payload.pending])
+    return StreamingResponse(catalog_assistant.stream(model, model_id, context, messages),
+                             media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @router.get("/{source_id}/catalog/{table}/impact")
