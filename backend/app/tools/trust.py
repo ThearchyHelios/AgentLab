@@ -11,6 +11,14 @@
   对错号，批了 A 的那一下落到 B 头上。
 - 快照为 None 是升级前发起的运行：MCP 和自定义工具照旧不问。它们可能正停在某个
   审批上，这时候多插一次「问人」同样会对错号。
+
+能力登记的审批（应用平台 A6 第 4 条，修 F7）也在发起时进这份快照，不另起一份：
+- 正式运行：三档一律不看；管理员声明为只读、审批为 none 的能力直接放行（快照里记 exempt），其余照旧问人。以前带 MCP、
+  自定义工具的 Agent 在正式运行里一律停在半路等审批，流程跨系统升级时会撞上断点重放的限制；
+- 审批为 confirm 的能力总要人确认，正式运行、探索运行都一样（快照里记 confirm）；
+- 探索运行沿用三档。
+同一次运行的能力治理快照另由发起方写进 Run.options["capabilities"]（capabilities/registry.capability_snapshot），两份
+在同一时刻读同一张登记表。
 """
 from __future__ import annotations
 
@@ -33,8 +41,12 @@ SETTING_KEY = "tool_trust"
 GATE_TIMEOUT_S = 30
 
 Policy = Literal["safe", "gate", "ask"]
-#: 正式运行的快照里放这个标记：三档一律不看，MCP 和自定义工具全部按 ask
+#: 正式运行的快照里放这个标记：三档一律不看，MCP 和自定义工具全部按 ask（能力登记免审批的除外）
 FORMAL_MARK = "__formal__"
+#: 快照里能力登记带来的档位：exempt（正式运行里只读、免审批）、confirm（总要确认）。和三档的取值分开：
+#: 正式运行的快照里出现 always 不代表什么（三档在正式运行里一律不看），出现 exempt 才是登记里声明过的
+EXEMPT = "exempt"
+CONFIRM = "confirm"
 
 
 def trust_key_of(tool: BaseTool | None) -> str | None:
@@ -50,10 +62,22 @@ def call_policy(
 ) -> Policy:
     """节点 approval=dangerous 时，这一次调用怎么放：直接跑 / 先问门控 / 问人。"""
     key = trust_key_of(tool)
+    if trust is not None:
+        governed = trust.get(key or name)
+        if governed == CONFIRM:
+            return "ask"
+        if trust.get(FORMAL_MARK) and governed == EXEMPT and not _judged_dangerous(tool, args):
+            return "safe"
     if key is not None and trust is not None:
         level = "ask" if trust.get(FORMAL_MARK) else trust.get(key, "ask")
         return "safe" if level == "always" else "gate" if level == "gated" else "ask"
     return "ask" if call_is_dangerous(tool, name, args) else "safe"
+
+
+def _judged_dangerous(tool: BaseTool | None, args: dict[str, Any]) -> bool:
+    """按这一次参数判定的工具（可写数据源的查询）说这次危险：登记里写了只读也照旧问人，DML 不因为一句声明就免审批。"""
+    judge = ((tool.metadata or {}) if tool is not None else {}).get("dangerous_if")
+    return bool(judge and judge(args))
 
 
 def asks_trustable(tool: BaseTool | None, trust: dict[str, str] | None) -> str | None:
@@ -63,7 +87,7 @@ def asks_trustable(tool: BaseTool | None, trust: dict[str, str] | None) -> str |
     不给这个按钮——点了也不会生效。
     """
     key = trust_key_of(tool)
-    if key is None or trust is None or trust.get(FORMAL_MARK):
+    if key is None or trust is None or trust.get(FORMAL_MARK) or trust.get(key) == CONFIRM:
         return None
     return key
 
@@ -82,10 +106,29 @@ async def load_trust(session: AsyncSession) -> dict[str, str]:
 
 
 async def run_snapshot(session: AsyncSession, *, run_class: str) -> dict[str, str]:
-    """发起一次运行时定下的三档。正式运行不看用户的偏好，理由同 runner._approval_default。"""
+    """发起一次运行时定下的三档。正式运行不看用户的偏好，理由同 runner._approval_default；能力登记的审批叠在上面。"""
+    governed = await _governed(session, formal=run_class == "formal")
     if run_class == "formal":
-        return {FORMAL_MARK: "1"}
-    return await load_trust(session)
+        return {FORMAL_MARK: "1", **governed}
+    return {**await load_trust(session), **governed}
+
+
+async def _governed(session: AsyncSession, *, formal: bool) -> dict[str, str]:
+    """能力登记里改过审批的那些：confirm 的记 confirm；正式运行里只读且 none 的记 exempt。登记表是空的（没同步过）就没有。"""
+    from sqlalchemy import select
+
+    from app.capabilities.registry import effective_effect
+    from app.db.models import Capability
+
+    rows = (await session.execute(select(Capability).where(Capability.approval.in_((CONFIRM, "none")),
+                                                           Capability.missing.is_(False)))).scalars()
+    out: dict[str, str] = {}
+    for row in rows:
+        if row.approval == CONFIRM:
+            out[row.name] = CONFIRM
+        elif formal and effective_effect(row) == "read":
+            out[row.name] = EXEMPT
+    return out
 
 
 async def set_trust(session: AsyncSession, key: str, level: str) -> None:

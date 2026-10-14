@@ -19,6 +19,8 @@ from app.api import (
     identity as identity_api, ledger as ledger_api, notify as notify_api, tasks as tasks_api,
 )
 from app.api.coded import CodedHTTPException, coded_handler
+from app.api.deps import chat_scope, evidence_scope, require_role, role_by_method, run_scope
+from app.auth.middleware import AuthMiddleware
 from app.core.config import settings
 from app.db.base import init_db
 from app.engine.runner import run_manager
@@ -40,6 +42,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings.ensure_dirs()
     await init_db()
     await seed_defaults()
+    await _platform_startup()
 
     # 把存的 embedding 配置读进来。不读的话重启后会悄悄退回本地哈希向量，
     # 而库里的向量是上次那个模型建的——检索会整体退回关键词，
@@ -86,6 +89,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         logger.exception("数据目录起草任务的启动整理失败，服务照常启动")
 
     await run_manager.setup()
+    # 流程：存量的待审批补建待办（派给任何人，幂等）；上次进程没了时已发出、没拿到结果的写入收成结果未知、安排核实
+    from app.process import actions as _actions, tasks as _tasks
+
+    await _tasks.startup()
+    await _actions.startup()
     from app.sandbox.manager import sandbox_manager as _sbm
 
     await _sbm.start_reaper()
@@ -109,6 +117,37 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         logger.info("已停止")
 
 
+async def _platform_startup() -> None:
+    """应用平台的启动整理（BE-1）：登录设置读进缓存；自定义工具请求头、MCP env 和请求头里的存量明文加密一遍（幂等）；
+    存量的内网 MCP 服务改为绑定登记端点（只在升级后第一次启动时做）；能力登记同步一次。后三样出错只记日志：最坏是登记
+    暂时不全，不该让服务起不来。"""
+    from app.auth import current_mode, load_settings
+    from app.capabilities import registry as capability_registry
+    from app.capabilities.secrets import seal_existing
+    from app.db.base import SessionLocal
+
+    await load_settings(force=True)
+    logger.info("登录方式：%s", current_mode())
+    try:
+        if sealed := await seal_existing():
+            logger.info("已加密 %d 处存量的明文密钥（自定义工具请求头、MCP 环境变量和请求头）", sealed)
+    except Exception:  # noqa: BLE001
+        logger.exception("存量密钥加密失败，服务照常启动")
+    try:
+        from app.tools.mcp_manager import adopt_intranet_servers
+
+        if adopted := await adopt_intranet_servers():
+            logger.info("已为 %d 个指向内网的存量 MCP 服务登记端点并绑定：%s", len(adopted),
+                        "、".join(a["server"] for a in adopted))
+    except Exception:  # noqa: BLE001
+        logger.exception("存量 MCP 服务的端点登记失败，服务照常启动")
+    try:
+        async with SessionLocal() as session:
+            await capability_registry.sync_all(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("能力登记同步失败，服务照常启动")
+
+
 app = FastAPI(
     title="AgentLab",
     description="可视化 Agent 编排实验台",
@@ -116,6 +155,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# 身份（app/auth/middleware.py）：按请求认出是谁、核对 CSRF。加在 CORS 之前，CORS 就在它外面一层：
+# 跨域预检由 CORS 先答，不经过登录检查
+app.add_middleware(AuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -124,47 +166,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for router in (
-    workflows.router,
+# 路由级权限（§3.12）。关登录时这些依赖全部放行；开了登录，中间件先挡掉没登录的，这里再按角色和运行挡
+_BUILDER = [require_role("builder")]
+_ADMIN = [require_role("admin")]
+_USER = [require_role("user")]
+for router, guard in (
+    (workflows.router, _BUILDER),
     # 这几个也挂在 /api/runs 下面，要在 runs.router 之前登记：以后加的固定路径（/api/runs/compare 之类）
-    # 才不会被 runs 的 /{run_id} 当成运行 id 吃掉。/{run_id}/… 的子路径放在哪边都不冲突
-    compare.router,
-    bundle.router,
-    inquiry.router,
-    whatif.router,
-    runs.router,
-    runs.approvals_router,
-    evidence.router,
-    settings_api.router,
-    tools.router,
-    tools.custom_router,
-    tools.mcp_router,
-    knowledge.memory_router,
-    knowledge.kb_router,
-    knowledge.skills_router,
-    sandbox.router,
-    copilot.router,
-    conversations.router,
-    artifacts.router,
-    governance.router,
-    schedules.router,
+    # 才不会被 runs 的 /{run_id} 当成运行 id 吃掉。/{run_id}/… 的子路径放在哪边都不冲突。
+    # 运行对比、可验证报告、质询、假设分析交的是查询原文，只给 builder 及以上
+    (compare.router, _BUILDER),
+    (bundle.router, _BUILDER),
+    (inquiry.router, _BUILDER),
+    (whatif.router, _BUILDER),
+    (runs.router, [run_scope]),
+    (runs.approvals_router, _BUILDER),
+    (evidence.router, [evidence_scope]),
+    # 模型接入、运行默认值：搭建者只读，改动只给管理员
+    (settings_api.router, [role_by_method(read="builder", write="admin")]),
+    (tools.router, _BUILDER),
+    (tools.custom_router, _BUILDER),
+    # MCP 的 stdio 只有管理员能建、能改（api/tools.py 里按传输方式判断）
+    (tools.mcp_router, _BUILDER),
+    (knowledge.memory_router, _BUILDER),
+    (knowledge.kb_router, _BUILDER),
+    (knowledge.skills_router, _BUILDER),
+    (sandbox.router, _BUILDER),
+    (copilot.router, [chat_scope]),
+    (conversations.router, [chat_scope]),
+    # 工件：user 角色只能取能读的运行引用的、遮罩后的（api/artifacts.py）
+    (artifacts.router, _USER),
+    (governance.router, _BUILDER),
+    (schedules.router, _BUILDER),
     # 按配方导入的 /api/datasources/imports/… 要在 datasources 的通配 /{source_id} 之前登记
-    table_imports.router,
-    source_versions.router,
-    catalog.router,
-    datasources.router,
-    # 应用平台
-    auth_api.router,
-    identity_api.router,
-    capabilities_api.router,
-    apps_api.router,
-    tasks_api.router,
-    actions_api.router,
-    hooks_api.router,
-    notify_api.router,
-    ledger_api.router,
+    (table_imports.router, _BUILDER),
+    (source_versions.router, _BUILDER),
+    (catalog.router, _BUILDER),
+    (datasources.router, _BUILDER),
+    # 应用平台。登录、登出、OIDC、JWKS 匿名可用，设置在接口里要管理员；入站钩子只认签名
+    (auth_api.router, []),
+    (identity_api.router, _ADMIN),
+    # 能力登记、端点：搭建者只读，改动在接口里要管理员
+    (capabilities_api.router, _BUILDER),
+    # 应用、待办、生效记录、通知：各自按应用授权、派给谁再判断
+    (apps_api.router, _USER),
+    (tasks_api.router, _USER),
+    (actions_api.router, _USER),
+    (hooks_api.router, []),
+    (notify_api.router, _USER),
+    (ledger_api.router, _BUILDER),
 ):
-    app.include_router(router)
+    app.include_router(router, dependencies=guard)
 
 
 app.add_exception_handler(CodedHTTPException, coded_handler)

@@ -39,6 +39,9 @@ class ToolContext:
     #: None 是升级前发起的运行，用当前版本；Versions.CURRENT 是不在运行里的调用，用当前版本；
     #: 缺省 Versions.UNSET 是谁都没给——上传源遇到它报错，见 Versions
     data_versions: dict[str, Any] | Versions | None = Versions.UNSET
+    #: 数据源查询结果交给模型、落进快照之前先遮（tools/datasource.py 的 run_masks_results）：开登录后 user 角色发起的
+    #: 问数据运行，对它来说遮罩就是边界，事件、回答里只能有遮过的值
+    mask_results: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -145,7 +148,10 @@ async def build_tools(
     """按名字列表组装工具。
 
     allow_write（应用平台 A5）：写入能力只能放在调用工具节点里——只有调用工具节点传 True；agent、协作节点用默认值，
-    能力登记里治理后效果为 write 的工具在这里就被拒绝（BE-1 实现判定；契约骨架阶段不拦，行为同以前）。
+    能力登记里治理后效果为 write 的工具在这里就被拒绝（ToolBuildError，绑了它的节点失败并说清去哪里改）。发布检查
+    另有一道 action.write_in_agent（engine/lint_capabilities.py），这里是运行时的那一道：草稿、探索运行不过发布检查。
+    视参数而定（dynamic）的照旧放行，每次调用按参数问审批（可写数据源的 DML、有副作用的内置工具）；绑定端点、由平台
+    执行的除外，见 capabilities.registry.writes_externally。
 
     四种来源：内置（静态注册）、MCP（mcp:<server>/<tool>）、数据源
     （db_query__<源名> / db_schema__<源名>）、自定义（数据库里的 CustomTool）。
@@ -172,7 +178,7 @@ async def build_tools(
     if datasource_names and session is not None:
         from app.tools.datasource import build_datasource_tools
 
-        tools.extend(await build_datasource_tools(datasource_names, ctx, session))
+        tools.extend(await build_datasource_tools(datasource_names, ctx, session, mask_results=ctx.mask_results))
 
     if mcp_names:
         from app.tools.mcp_manager import mcp_manager
@@ -184,7 +190,35 @@ async def build_tools(
 
         tools.extend(await build_custom_tools(custom_names, ctx, session))
 
+    if not allow_write and tools:
+        await _refuse_writes(tools, session)
     return tools
+
+
+async def _refuse_writes(tools: list[BaseTool], session: Any) -> None:
+    """写外部系统的工具（capabilities.registry.writes_externally：治理后效果为 write，或绑定端点、视参数而定）不交给
+    agent。按能力登记的名字认（MCP 是 mcp:<服务>/<工具>，和 trust_key 一致）。"""
+    from sqlalchemy import select
+
+    from app.capabilities.registry import effective_effect, writes_externally
+    from app.db.models import Capability
+
+    keys = {(t.metadata or {}).get("trust_key") or t.name for t in tools}
+
+    async def lookup(s: Any) -> list[Any]:
+        return list((await s.execute(select(Capability).where(Capability.name.in_(list(keys))))).scalars())
+
+    if session is not None:
+        rows = await lookup(session)
+    else:
+        from app.db.base import SessionLocal
+
+        async with SessionLocal() as own:
+            rows = await lookup(own)
+    if writes := [row.name for row in rows if writes_externally(row.name, effective_effect(row), row.endpoint_id)]:
+        raise ToolBuildError(
+            f"{'、'.join(f'「{w}」' for w in writes)}是写入能力，只能放在「调用工具」节点里，由动作确认后发送；"
+            "请从 Agent 的工具清单中移除，改用「调用工具」节点")
 
 
 class ToolBuildError(ValueError):
@@ -350,7 +384,8 @@ async def call_tool(
             return await spec.func(ctx, **payload)
         return await spec.func(**payload)
 
-    tools = await build_tools([name], ctx, session=session)
+    # 直接调用（调用工具节点、工具库试用）：参数是人配的，不是模型挑的，写入能力也能调——写入在运行里另有动作流程把关
+    tools = await build_tools([name], ctx, session=session, allow_write=True)
     if not tools:
         raise KeyError(f"找不到工具 {name}")
     tool = tools[0]

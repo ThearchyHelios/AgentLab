@@ -8,9 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
+from app.api.deps import ensure_role
+from app.capabilities import registry as capability_registry
+from app.capabilities import secrets as vault
+from app.capabilities.endpoints import bound_endpoint_ref, find_endpoint
 from app.core.errors import explain, raw
 from app.db.base import get_session
-from app.db.models import CustomTool, McpServer
+from app.db.models import CustomTool, Endpoint, McpServer
 from app.tools.custom import ToolFailure, schema_problem, trial
 from app.tools.mcp_manager import mcp_manager
 from app.tools.registry import (
@@ -131,6 +135,10 @@ async def _side_effect(name: str, args: dict[str, Any], session: AsyncSession) -
     )).scalar_one_or_none()
     if row is not None:
         cfg = row.config or {}
+        if ref := bound_endpoint_ref(row):
+            endpoint = await find_endpoint(session, ref)
+            return (f"将经登记的端点「{endpoint.name if endpoint else ref}」发送 {cfg.get('method') or 'GET'} 请求"
+                    "（试用按探索运行处理：有测试环境时发往测试环境，写入在没有测试环境时只演练、不发送）")
         if row.kind == "http":
             return (f"将调用自定义接口「{name}」"
                     f"（{cfg.get('method') or 'GET'} {cfg.get('url') or '（未填写地址）'}）")
@@ -227,6 +235,9 @@ class CustomToolOut(CustomToolIn):
 def _custom_out(row: CustomTool) -> CustomToolOut:
     out = CustomToolOut.model_validate(row)
     out.problem = schema_problem(row.parameters or {})
+    if "headers" in (row.config or {}):
+        # 请求头的值存的是密文，接口只回掩码；原样提交回来表示保持原值（_seal_config）
+        out.config = {**(row.config or {}), "headers": vault.masked((row.config or {}).get("headers"))}
     return out
 
 
@@ -235,6 +246,28 @@ def _refuse_bad_schema(parameters: Any) -> None:
     problem = schema_problem(parameters)
     if problem:
         raise HTTPException(422, problem)
+
+
+def _seal_config(config: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
+    """请求头的值加密；提交的是原值的掩码时保持原值。"""
+    if "headers" not in config:
+        return config
+    return {**config, "headers": vault.seal(config.get("headers"), (previous or {}).get("headers"))}
+
+
+async def _refuse_bad_binding(session: AsyncSession, kind: str, config: dict[str, Any]) -> None:
+    """绑定登记端点的 http 工具：端点要存在，路径只写路径（主机和协议由端点决定），模型拿不到任意地址。"""
+    ref = config.get("endpoint")
+    if kind != "http" or not ref:
+        return
+    if await find_endpoint(session, str(ref)) is None:
+        raise HTTPException(422, "绑定的端点不存在，请先到「工具 → 端点」登记")
+    path = str(config.get("path") or "")
+    if path and not path.startswith("/"):
+        raise HTTPException(422, "绑定端点时，路径需要以 / 开头，例如 /orders/{{ order_id }}")
+    method = str(config.get("method") or "GET").upper()
+    if method not in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"):
+        raise HTTPException(422, f"不支持的请求方法「{method}」")
 
 
 @custom_router.get("", response_model=list[CustomToolOut])
@@ -251,10 +284,12 @@ async def create_custom(
     if payload.name in all_specs():
         raise HTTPException(409, f"「{payload.name}」与内置工具重名，请换一个名称")
     _refuse_bad_schema(payload.parameters)
-    row = CustomTool(**payload.model_dump())
+    await _refuse_bad_binding(session, payload.kind, payload.config)
+    row = CustomTool(**{**payload.model_dump(), "config": _seal_config(payload.config, None)})
     session.add(row)
     await session.commit()
     await session.refresh(row)
+    await capability_registry.sync_all(session)
     return _custom_out(row)
 
 
@@ -266,10 +301,14 @@ async def update_custom(
     if not row:
         raise HTTPException(404, "工具不存在，可能已被删除")
     _refuse_bad_schema(payload.parameters)
+    await _refuse_bad_binding(session, payload.kind, payload.config)
+    sealed = _seal_config(payload.config, row.config)
     for key, value in payload.model_dump().items():
         setattr(row, key, value)
+    row.config = sealed
     await session.commit()
     await session.refresh(row)
+    await capability_registry.sync_all(session)
     return _custom_out(row)
 
 
@@ -280,6 +319,7 @@ async def delete_custom(tool_id: str, session: AsyncSession = Depends(get_sessio
         raise HTTPException(404, "工具不存在，可能已被删除")
     await session.delete(row)
     await session.commit()
+    await capability_registry.sync_all(session)
 
 
 async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
@@ -339,7 +379,7 @@ class CustomToolDraftIn(BaseModel):
 def _draft_problem(kind: str, config: dict[str, Any]) -> str | None:
     if kind not in ("http", "python"):
         return f"不支持「{kind}」工具类型：仅支持 http 和 python"
-    if kind == "http" and not str(config.get("url") or "").strip():
+    if kind == "http" and not str(config.get("url") or "").strip() and not config.get("endpoint"):
         return "尚未填写接口地址"
     if kind == "python" and not str(config.get("code") or "").strip():
         return "尚未填写代码"
@@ -347,17 +387,21 @@ def _draft_problem(kind: str, config: dict[str, Any]) -> str | None:
 
 
 @custom_router.post("/test")
-async def test_custom_draft(payload: CustomToolDraftIn) -> dict[str, Any]:
+async def test_custom_draft(payload: CustomToolDraftIn, session: AsyncSession = Depends(get_session)
+                            ) -> dict[str, Any]:
     """试跑一份没保存的配置，不落库。
 
     以前只能试已保存的：新建要先保存才能试，改了代码也得先存——保存等于让节点
     立刻用上一个还没试过的版本。
+
+    编辑已保存的工具时，界面上的请求头是掩码：按同名工具存着的值认回来，不然试跑带着掩码去请求。
     """
     problem = _draft_problem(payload.kind, payload.config)
     if problem:
         return {"ok": False, "error": problem, "hint": "", "detail": "", "duration_ms": 0}
-    draft = CustomTool(name=payload.name or "draft_tool", kind=payload.kind,
-                       parameters=payload.parameters, config=payload.config)
+    saved = (await session.execute(select(CustomTool).where(CustomTool.name == payload.name))).scalar_one_or_none()
+    draft = CustomTool(name=payload.name or "draft_tool", kind=payload.kind, parameters=payload.parameters,
+                       config=_seal_config(payload.config, saved.config if saved else None))
     return await _trial(draft, payload.args)
 
 
@@ -383,9 +427,14 @@ class McpIn(BaseModel):
     transport: str = "stdio"  # stdio | http
     command: str | None = None
     args: list[str] = Field(default_factory=list)
+    #: env、headers 的值存密文、接口只回掩码，提交掩码值表示保持原值
     env: dict[str, str] = Field(default_factory=dict)
     url: str | None = None
     enabled: bool = True
+    #: http 传输的认证头
+    headers: dict[str, str] = Field(default_factory=dict)
+    #: 绑定登记的端点：url 只填路径，主机、协议、内网访问、认证头跟端点走
+    endpoint_id: str | None = None
 
 
 class McpOut(McpIn):
@@ -403,6 +452,7 @@ class McpOut(McpIn):
 
 def _mcp_out(row: McpServer) -> McpOut:
     out = McpOut.model_validate(row)
+    out.env, out.headers = vault.masked(row.env), vault.masked(row.headers)
     checked = health.fields(row.last_check)
     out.last_checked_at = checked["last_checked_at"]
     out.last_check_ok = checked["last_check_ok"]
@@ -411,7 +461,35 @@ def _mcp_out(row: McpServer) -> McpOut:
 
 
 def _mcp_connection(row: McpServer) -> tuple[Any, ...]:
-    return (row.transport, row.command, list(row.args or []), dict(row.env or {}), row.url)
+    return (row.transport, row.command, list(row.args or []), dict(row.env or {}), row.url,
+            dict(row.headers or {}), row.endpoint_id)
+
+
+async def _guard_mcp(payload: McpIn, row: McpServer, session: AsyncSession) -> None:
+    """stdio 是在服务器上执行命令，只有管理员能建、能改（关登录时所有人等同管理员）；http 的地址要么绑定登记的端点，
+    要么过 SSRF 检查（mcp_manager.check_url，连接前还会再查一次）。"""
+    if payload.transport != "http":
+        ensure_role("admin")
+        return
+    from app.tools import mcp_manager as mcp_module
+    from app.tools.net import UnsafeUrlError
+
+    if payload.endpoint_id and await session.get(Endpoint, payload.endpoint_id) is None:
+        raise HTTPException(422, "绑定的端点不存在，请先到「工具 → 端点」登记")
+    if not payload.endpoint_id and not (payload.url or "").strip():
+        raise HTTPException(422, "尚未填写 MCP 服务的地址")
+    try:
+        await mcp_module.check_url(row)
+    except UnsafeUrlError as e:
+        raise HTTPException(422, f"MCP 服务的地址未通过安全检查：{e}") from e
+
+
+def _apply_mcp(row: McpServer, payload: McpIn) -> None:
+    previous_env, previous_headers = dict(row.env or {}), dict(row.headers or {})
+    for key, value in payload.model_dump().items():
+        setattr(row, key, value)
+    row.env = vault.seal(payload.env, previous_env)
+    row.headers = vault.seal(payload.headers, previous_headers)
 
 
 @mcp_router.get("/servers", response_model=list[McpOut])
@@ -425,7 +503,9 @@ async def create_server(
 ) -> McpOut:
     if (await session.execute(select(McpServer).where(McpServer.name == payload.name))).scalar_one_or_none():
         raise HTTPException(409, f"已存在名为「{payload.name}」的 MCP 服务，请换一个名称")
-    row = McpServer(**payload.model_dump())
+    row = McpServer()
+    _apply_mcp(row, payload)
+    await _guard_mcp(payload, row, session)
     session.add(row)
     await session.commit()
     await session.refresh(row)
@@ -439,9 +519,12 @@ async def update_server(
     row = await session.get(McpServer, server_id)
     if not row:
         raise HTTPException(404, "MCP 服务不存在，可能已被删除")
+    if row.transport != "http":
+        ensure_role("admin")
     before, old_name, was_enabled = _mcp_connection(row), row.name, row.enabled
-    for key, value in payload.model_dump().items():
-        setattr(row, key, value)
+    _apply_mcp(row, payload)
+    if _mcp_connection(row) != before:
+        await _guard_mcp(payload, row, session)
     if _mcp_connection(row) != before:
         # 启动命令、地址换了，上次的「连得上」说的是另一个进程
         row.status, row.last_error, row.last_check = "unknown", None, None
@@ -458,9 +541,12 @@ async def delete_server(server_id: str, session: AsyncSession = Depends(get_sess
     row = await session.get(McpServer, server_id)
     if not row:
         raise HTTPException(404, "MCP 服务不存在，可能已被删除")
+    if row.transport != "http":
+        ensure_role("admin")
     await session.delete(row)
     await session.commit()
     mcp_manager.invalidate(row.name)
+    await capability_registry.sync_all(session)
 
 
 @mcp_router.post("/servers/{server_id}/probe")
@@ -480,9 +566,12 @@ async def probe_server(
     row.tools_cache = [t["name"] for t in result.get("tools", [])]
     row.last_check = health.record(result.get("ok"), result["elapsed_ms"], result.get("error"))
     await session.commit()
+    await capability_registry.sync_all(session)
     return result
 
 
 @mcp_router.post("/refresh")
-async def refresh_mcp() -> dict[str, Any]:
-    return {"servers": await mcp_manager.refresh()}
+async def refresh_mcp(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    servers = await mcp_manager.refresh()
+    await capability_registry.sync_all(session)
+    return {"servers": servers}

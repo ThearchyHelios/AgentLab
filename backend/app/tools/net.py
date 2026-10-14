@@ -16,6 +16,10 @@ class UnsafeUrlError(ValueError):
 
 _BLOCKED_PORTS = {22, 23, 25, 135, 139, 445, 3389}
 
+# 云厂商的元数据服务：登记的端点开了内网访问也不放行（拿到它等于拿到这台机器的云凭据）。链路本地整段都算
+# （169.254.169.254、ECS 任务元数据 169.254.170.2、IPv6 的 fe80::/10），另加不在链路本地段里的几个
+_METADATA_HOSTS = frozenset({"100.100.100.200", "fd00:ec2::254", "metadata.google.internal"})
+
 
 def _is_private(ip: str) -> bool:
     try:
@@ -95,7 +99,15 @@ async def _real_ips(host: str) -> tuple[str, ...]:
     raise UnsafeUrlError(f"{host} 解析到代理分配的虚拟地址，且未能向公共 DNS 核实真实地址，已拦截")
 
 
-async def assert_safe_url(url: str) -> str:
+def _is_metadata(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return addr.is_link_local or str(addr) in _METADATA_HOSTS
+
+
+async def assert_safe_url(url: str, *, allow_intranet: bool = False) -> str:
     """挡住 SSRF。
 
     agent 手里的 HTTP 工具就是一把面向内网的扫描枪，所以这里做三件事：
@@ -105,6 +117,9 @@ async def assert_safe_url(url: str) -> str:
     本机代理开了 fake-ip 时，查什么都先拿到 198.18 段的假地址。配了
     http_tool_fake_ip_ranges 的话，落在段里的解析结果改向公共 DNS 核实真实地址
     再判断；直接放行不行——内网域名在 fake-ip 下也是这个段。
+
+    allow_intranet 只给管理员登记、开了内网访问的端点用（app/capabilities/endpoints.py）：内网、回环地址放行，
+    元数据地址和高危端口照样拦；域名白名单管的是模型能去哪儿，登记的端点不受它限制。模型给出的地址永远不带这个参数。
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -114,6 +129,19 @@ async def assert_safe_url(url: str) -> str:
         raise UnsafeUrlError("URL 中没有主机名")
     if parsed.port in _BLOCKED_PORTS:
         raise UnsafeUrlError(f"端口 {parsed.port} 不允许访问")
+    if host.lower() in _METADATA_HOSTS:
+        raise UnsafeUrlError(f"{host} 是云服务器的元数据地址，已拦截")
+
+    if allow_intranet:
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(
+                host, parsed.port or (443 if parsed.scheme == "https" else 80))
+        except OSError as e:
+            raise UnsafeUrlError(f"域名解析失败：{host}") from e
+        for info in infos:
+            if _is_metadata(info[4][0]):
+                raise UnsafeUrlError(f"{host} 解析到元数据地址 {info[4][0]}，已拦截")
+        return url
 
     allowlist = settings.http_tool_allowlist
     if allowlist:

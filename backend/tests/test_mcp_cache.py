@@ -48,6 +48,12 @@ def manager(monkeypatch):
 
     _FakeClient.connects = []
     monkeypatch.setattr(mcp_client, "MultiServerMCPClient", _FakeClient)
+
+    # http 服务的地址检查（SSRF）另有测试（test_capabilities_secrets.py）；这里的地址是虚构的，解析不了
+    async def _unchecked(row):
+        return mcp_module._server_config(row)
+
+    monkeypatch.setattr(mcp_module, "check_url", _unchecked)
     fresh = mcp_module.McpManager()
     monkeypatch.setattr(mcp_module, "mcp_manager", fresh)
     monkeypatch.setattr(tools_api, "mcp_manager", fresh)
@@ -228,3 +234,46 @@ async def test_a_missing_command_is_named_in_the_error(client, manager, monkeypa
         assert probe["ok"] is False and "ghost-mcp-server" in probe["error"], probe
     finally:
         await client.delete(f"/api/mcp/servers/{row['id']}")
+
+
+async def test_legacy_intranet_servers_are_bound_to_an_endpoint_once():
+    """升级前建的 http MCP 服务指向本机、内网：升级后没绑定端点的地址要过 SSRF 检查，这些服务就连不上了。升级后第一次
+    启动时各自登记一个开内网访问的端点、绑定上去，地址改成路径，连接和以前一样；写审计，只做一次。公网地址的不动。"""
+    from sqlalchemy import delete, select
+
+    from app.db.base import SessionLocal
+    from app.db.models import AuditEvent, Endpoint, McpServer
+    from app.tools import mcp_manager as mcp_module
+
+    async with SessionLocal() as s:
+        await s.execute(delete(AuditEvent).where(AuditEvent.action == mcp_module.ADOPT_ACTION))
+        s.add_all([McpServer(name="local kb", transport="http", url="http://127.0.0.1:8931/mcp?team=fin"),
+                   McpServer(name="meta", transport="http", url="http://169.254.169.254/mcp")])
+        await s.commit()
+    try:
+        adopted = await mcp_module.adopt_intranet_servers()
+        assert [a["server"] for a in adopted] == ["local kb"], "元数据地址开了内网访问也照样拦，不收编"
+        async with SessionLocal() as s:
+            server = (await s.execute(select(McpServer).where(McpServer.name == "local kb"))).scalar_one()
+            endpoint = await s.get(Endpoint, server.endpoint_id)
+            assert server.url == "/mcp?team=fin"
+            assert endpoint.environments["prod"]["base_url"] == "http://127.0.0.1:8931"
+            assert endpoint.environments["prod"]["allow_intranet"] is True
+            config = await mcp_module.check_url(server)
+        assert config["url"] == "http://127.0.0.1:8931/mcp?team=fin"
+
+        async with SessionLocal() as s:
+            s.add(McpServer(name="late", transport="http", url="http://127.0.0.1:9000/mcp"))
+            await s.commit()
+        assert await mcp_module.adopt_intranet_servers() == [], "只做一次：之后新建的照规则走"
+        async with SessionLocal() as s:
+            late = (await s.execute(select(McpServer).where(McpServer.name == "late"))).scalar_one()
+        with pytest.raises(Exception, match="绑定登记的端点"):
+            await mcp_module.check_url(late)
+    finally:
+        async with SessionLocal() as s:
+            await s.execute(delete(McpServer).where(McpServer.name.in_(["local kb", "meta", "late"])))
+            await s.execute(delete(Endpoint).where(Endpoint.name.like("mcp-%")))
+            await s.execute(delete(AuditEvent).where(AuditEvent.action.in_([mcp_module.ADOPT_ACTION,
+                                                                            "endpoint.adopt_mcp"])))
+            await s.commit()

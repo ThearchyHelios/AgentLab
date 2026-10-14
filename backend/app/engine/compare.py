@@ -51,6 +51,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -121,12 +122,13 @@ _CFG_KEYS: dict[str, frozenset[str]] = {
     "supervisor": frozenset({"agents", "max_rounds", "on_exhausted", "goal", "provider", "model", "max_tokens",
                              "max_parallel", "approval", "emit_message", "assign_to"}),
     "subgraph": frozenset({"workflow_id", "workflow_version", "input", "assign_to"}),
-    "tool": frozenset({"tool", "args", "fail_fast", "memory_scope", "collection", "approval", "assign_to"}),
+    "tool": frozenset({"tool", "args", "fail_fast", "memory_scope", "collection", "approval", "assign_to", "assignee"}),
     "code": frozenset({"code", "evidence_role", "language", "timeout", "memory_mb", "network", "isolation", "files",
                        "fail_fast", "approval", "assign_to"}),
     "branch": frozenset({"cases", "mode"}),
     "loop": frozenset({"mode", "max_iterations", "item_var", "items", "condition"}),
-    "human": frozenset({"mode", "title", "message", "schema", "context", "draft", "stop_on_reject", "assign_to"}),
+    "human": frozenset({"mode", "title", "message", "schema", "context", "draft", "stop_on_reject", "assign_to",
+                        "assignee", "policy", "due", "on_timeout", "form", "form_from"}),
     "validate": frozenset({"schema", "source", "max_retries", "repair_with_llm", "fail_fast", "assign_to"}),
     "memory": frozenset({"action", "scope", "query", "limit", "kind", "content", "importance", "assign_to"}),
     "retrieve": frozenset({"query", "collection", "limit", "alpha", "rerank", "min_score", "assign_to"}),
@@ -672,6 +674,30 @@ def _graph_sql(node: dict[str, Any] | None) -> tuple[str, str | None] | None:
     return None
 
 
+def _request(snap: dict[str, Any]) -> dict[str, Any] | None:
+    """端点读取的快照（capabilities/endpoints.py 的 endpoint_snapshot）记的是请求，不是 SQL。"""
+    request = snap.get("request")
+    return request if isinstance(request, dict) and not isinstance(snap.get("sql"), str) else None
+
+
+def _compare_request(b: "_Query", t: "_Query") -> "_Shape":
+    """两次端点读取的取数方式变没变：比端点、方法、路径；只有查询参数、请求体里的值不同的算参数变化。"""
+    was, now = _request(b.snap or {}), _request(t.snap or {})
+    if was is None or now is None:
+        return _Shape("changed", differences=["一次是数据库查询、一次是端点读取，取数方式不同"])
+    differences = []
+    if b.source != t.source:
+        differences.append(f"端点由「{b.source}」改为「{t.source}」")
+    if (was.get("method"), was.get("path")) != (now.get("method"), now.get("path")):
+        differences.append(f"请求由 {was.get('method')} {was.get('path')} 改为 {now.get('method')} {now.get('path')}")
+    if differences:
+        return _Shape("changed", differences=differences[:MAX_DIFFERENCES])
+    literals = [{"base": json.dumps(was.get(k), ensure_ascii=False, sort_keys=True, default=str),
+                 "target": json.dumps(now.get(k), ensure_ascii=False, sort_keys=True, default=str)}
+                for k in ("query", "body") if was.get(k) != now.get(k)]
+    return _Shape("params_only", literals) if literals else _Shape("same")
+
+
 def _definition(graph: dict[str, Any], card_id: str, metric_id: str) -> dict[str, Any] | None:
     """图里口径卡节点上写的指标定义；指标定义来自别的工作流（口径卡来源）的不算，那里写的才是当时用的。"""
     card = _nodes(graph).get(card_id)
@@ -816,6 +842,8 @@ class _Compare:
         return self._shapes[key]
 
     def _compare_sql(self, b: _Query, t: _Query) -> _Shape:
+        if b.snap is not None and t.snap is not None and (_request(b.snap) or _request(t.snap)):
+            return _compare_request(b, t)
         if b.sql is None or t.sql is None:
             which = "基准运行" if b.sql is None else "这次运行"
             return _Shape("changed", known=False, differences=[f"{which}的查询快照无法读取，无法比较 SQL"])
@@ -874,12 +902,14 @@ class _Compare:
         shape = self.shape(b, t)
         if not shape.known:
             return _Change("unknown", f"{name}的快照无法读取，无法判断 SQL 是否有变化")
+        # 端点读取比的是请求（_compare_request），说法跟着换
+        what = "请求" if (b.snap and _request(b.snap)) or (t.snap and _request(t.snap)) else " SQL "
         if shape.structure == "changed":
-            return _Change("sql", f"{name}的 SQL 结构有变化" + (f"：{shape.differences[0]}" if shape.differences else ""))
+            return _Change("sql", f"{name}的{what}结构有变化" + (f"：{shape.differences[0]}" if shape.differences else ""))
         if shape.structure == "params_only":
             shown = "，".join(f"{x['base']} → {x['target']}" for x in shape.literals[:2])
             more = f" 等 {len(shape.literals)} 处" if len(shape.literals) > 2 else ""
-            return _Change("params", f"{name}的 SQL 只有参数不同（{shown}{more}）")
+            return _Change("params", f"{name}的{what}只有参数不同（{shown}{more}）")
         return _Change("same")
 
     def _snapshot_change(self, b: _Query | None, t: _Query | None, seen: frozenset[str] = frozenset()) -> _Change:

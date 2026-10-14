@@ -48,7 +48,7 @@ from app.providers.factory import (
     get_chat_model,
 )
 from app.engine.sql_problems import event_checks
-from app.tools.datasource import QUERY_PREFIX, run_versions
+from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolBuildError,
@@ -59,6 +59,7 @@ from app.tools.registry import (
     prepare_args,
 )
 from app.tools.trust import asks_trustable, ask_gate, call_policy, node_task, trust_key_of
+from app.capabilities.registry import is_platform_query, snapshot_owned
 
 # --------------------------------------------------------------------------
 # 公共部分
@@ -335,6 +336,7 @@ async def _resolve_tools(ctx: NodeContext, state: GraphState) -> list[BaseTool]:
         memory_scope=ctx.cfg("memory_scope") or ctx.run.memory_scope,
         collection=ctx.cfg("collection") or ctx.run.collection,
         data_versions=run_versions(ctx.run),
+        mask_results=run_masks_results(ctx.run),
         # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
         emit=ctx.emit,
     )
@@ -506,9 +508,13 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 snapshot_id = None
         # 查库成功时工具交回的 JSON 里带着查询快照的工件 id：记进返回值（进 checkpoint，重放拿到的
-        # 是同一份）和 tool.end（在封存范围内，证据接口从这里出发找快照）。只认数据源工具：那个 id 是
-        # 我们自己落的；MCP、自定义工具的文字来自外面，拼一个同样形状的 JSON 就能把任意快照塞进封存范围
-        query = query_entry_fields(content) if evidence_on and ok and name.startswith(QUERY_PREFIX) else None
+        # 是同一份）和 tool.end（在封存范围内，证据接口从这里出发找快照）。只认平台执行的查询（数据源工具、
+        # 能力登记里声明了表格的端点读取，is_platform_query 按名字认身份、不看结果长什么样）：那个 id 是
+        # 我们自己落的；MCP、自定义工具的文字来自外面，拼一个同样形状的 JSON 就能把任意快照塞进封存范围。
+        # 端点读取另核一道：工件得是这次运行落下的端点快照
+        query = query_entry_fields(content) if evidence_on and ok and is_platform_query(name) else None
+        if query and not await snapshot_owned(query["artifact"], ctx.run.run_id, name):
+            query = None
         ctx.emit(
             EventType.TOOL_END if ok else EventType.TOOL_ERROR,
             tool=name,
@@ -871,7 +877,7 @@ def _record_call(node_id: str, exec_no: int, call_id: str, name: str, args: dict
         record["via"] = snapshot
         entries.append({"kind": "tool", "node_id": node_id, "exec": exec_no, "artifact": snapshot,
                         "call_id": call_id, "tool": name})
-    if not artifact or not name.startswith(QUERY_PREFIX):
+    if not artifact or not is_platform_query(name):
         return content
     try:
         data = json.loads(content)

@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field, create_model
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.capabilities import secrets as vault
+from app.capabilities.endpoints import bound_endpoint_ref, find_endpoint
 from app.db.models import CustomTool
 from app.engine.expressions import render_deep, render_template
 from app.sandbox.base import SandboxLimits
@@ -125,11 +127,11 @@ class ToolFailure(dict):
 
 
 async def _run_http(row: CustomTool, args: dict[str, Any]) -> Any:
-    """HTTP 模板工具：url / headers / body 里可以用 {{ 参数名 }} 插值。"""
+    """HTTP 模板工具：url / headers / body 里可以用 {{ 参数名 }} 插值。headers 的值存的是密文，这里解开再插值。"""
     config = row.config or {}
     ctx = dict(args)
     url = render_template(config.get("url", ""), ctx)
-    headers = render_deep(config.get("headers") or {}, ctx)
+    headers = render_deep(vault.reveal(config.get("headers")), ctx)
     body = config.get("body")
     json_body = None
     if body:
@@ -155,6 +157,45 @@ async def _run_http(row: CustomTool, args: dict[str, Any]) -> Any:
         except json.JSONDecodeError:
             return {"status": result["status"], "body": text}
     return {"status": result["status"], "body": text}
+
+
+async def _run_info(session: AsyncSession, run_id: str) -> tuple[bool, str | None, bool]:
+    """(正式运行？, 发起人, 是不是在一次真实的运行里)。工具库试用、试跑不在运行里：按探索运行算，发起人是当前请求的人。"""
+    from app.db.models import Run
+
+    run = await session.get(Run, run_id) if run_id else None
+    if run is None:
+        from app.api.deps import current_principal
+
+        return False, current_principal().username, False
+    return run.run_class == "formal", run.started_by, True
+
+
+async def _run_endpoint(row: CustomTool, args: dict[str, Any], ctx: ToolContext) -> Any:
+    """绑定登记端点的 HTTP 工具：由平台执行器发请求（capabilities/endpoints.py），模型只给参数、拿不到任意地址。
+
+    写入（capabilities.registry.writes_externally：治理后效果为 write，或者视参数而定——执行器分不出读写）在运行里不从这里发：它要先留生效记录、按幂等键发送、结果未知时转核实，那是调用工具节点
+    的动作流程（app/process/actions.py）。这里只给工具库试用、试跑发写入，按探索运行走测试环境或演练。"""
+    from app.capabilities import endpoints as ep
+    from app.capabilities.registry import effective_effect, endpoint_request, get_capability, writes_externally
+    from app.db.base import SessionLocal
+
+    async with SessionLocal() as session:
+        endpoint = await ep.find_endpoint(session, ep.bound_endpoint_ref(row))
+        if endpoint is None:
+            return ToolFailure(error=f"自定义工具「{row.name}」绑定的端点不存在，可能已被删除。请到「工具」页重新选择端点")
+        cap = await get_capability(session, row.name)
+        method = str((row.config or {}).get("method") or "GET").upper()
+        effect = effective_effect(cap) if cap is not None else ("read" if method in ("GET", "HEAD") else "write")
+        formal, starter, in_run = await _run_info(session, ctx.run_id)
+        if writes_externally(row.name, effect, endpoint.id) and in_run:
+            return ToolFailure(error=f"「{row.name}」是写入能力，只能经「调用工具」节点的动作确认后发送")
+        environment = ep.pick_environment(endpoint, formal=formal, effect=effect)
+        result = await endpoint_request(session, cap if cap is not None else row.name, args,
+                                        environment=environment, on_behalf=starter,
+                                        run_id=ctx.run_id if in_run else None, node_id=ctx.node_id)
+    out = ep.tool_result(result)
+    return ToolFailure(out) if "error" in out else out
 
 
 async def _run_python(row: CustomTool, args: dict[str, Any], ctx: ToolContext) -> Any:
@@ -206,16 +247,19 @@ async def build_custom_tools(
 
         def _make(bound_row: CustomTool):
             async def _run(**kwargs: Any) -> str:
-                if bound_row.kind == "python":
-                    value = await _run_python(bound_row, kwargs, ctx)
-                else:
-                    value = await _run_http(bound_row, kwargs)
+                value = await _execute(bound_row, kwargs, ctx)
                 if isinstance(value, str):
                     return value
                 return json.dumps(value, ensure_ascii=False, default=str, indent=2)
 
             return _run
 
+        meta: dict[str, Any] = {"trust_key": row.name}
+        if ref := bound_endpoint_ref(row):
+            endpoint = await find_endpoint(session, ref)
+            if endpoint is not None:
+                # 时限按端点登记的走：界面上写「已超出 N 秒上限」，引擎到点收回控制权（engine/toolcalls.limit_of）
+                meta["timeout_s"] = endpoint.timeout_s
         tools.append(
             StructuredTool(
                 name=row.name,
@@ -224,10 +268,18 @@ async def build_custom_tools(
                 coroutine=_make(row),
                 func=None,
                 # 信任三档按它认工具（trust.py）；和工具列表里的 id 一致
-                metadata={"trust_key": row.name},
+                metadata=meta,
             )
         )
     return tools
+
+
+async def _execute(row: CustomTool, args: dict[str, Any], ctx: ToolContext) -> Any:
+    if row.kind == "python":
+        return await _run_python(row, args, ctx)
+    if bound_endpoint_ref(row):
+        return await _run_endpoint(row, args, ctx)
+    return await _run_http(row, args)
 
 
 async def trial(row: CustomTool, args: dict[str, Any], ctx: ToolContext) -> tuple[Any, str | None]:
@@ -240,6 +292,4 @@ async def trial(row: CustomTool, args: dict[str, Any], ctx: ToolContext) -> tupl
     试跑也得报，否则用户照着一份「跑通了」的错参数去配工作流。
     """
     payload, note = prepare_args(schema_to_model(row.name or "draft", row.parameters or {}), args)
-    if row.kind == "python":
-        return await _run_python(row, payload, ctx), note
-    return await _run_http(row, payload), note
+    return await _execute(row, payload, ctx), note
