@@ -105,7 +105,13 @@ async function open(path, { handlers = [], viewport = { width: 1440, height: 900
   await page.goto(`${WEB}${path}`, { waitUntil: 'networkidle' })
   await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), THEME)
   await page.waitForTimeout(400)
-  return { page, sent, errors, natives, close: () => { opened.delete(ctx); return ctx.close() } }
+  // 关之前先撤掉拦截、忽略还在路上的那几条：满负荷并行时，取真实返回的拦截可能在页面关掉之后才回来，
+  // 没人接住的报错会把整个检查进程带崩（「Request context disposed」）
+  return { page, sent, errors, natives, close: async () => {
+    opened.delete(ctx)
+    await page.unrouteAll({ behavior: 'ignoreErrors' }).catch(() => {})
+    return ctx.close()
+  } }
 }
 const goto = async (page, path) => {
   await page.goto(`${WEB}${path}`, { waitUntil: 'networkidle' })
@@ -609,9 +615,11 @@ function jobHandlers(state, reply) {
     }],
     // 起草对话框写明用哪个起草模型：设置里的 catalog_draft（其余设置照真服务端的）、助手当前用的模型
     [/^GET \/settings$/, async (route) => {
-      const real = await route.fetch()
+      // 页面已经关了（上一节收尾时还在路上）：这一条不用再答
+      const real = await route.fetch().catch(() => null)
+      if (!real) return route.abort().catch(() => {})
       const body = await real.json().catch(() => ({}))
-      return route.fulfill({ response: real, json: { ...body, catalog_draft: state.draftModel } })
+      return route.fulfill({ response: real, json: { ...body, catalog_draft: state.draftModel } }).catch(() => {})
     }],
     [/^GET \/copilot\/model$/, (route) => json(state.assistantModel)(route)],
   ]

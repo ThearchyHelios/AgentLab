@@ -96,7 +96,13 @@ async function open(path, { handlers = [], viewport = { width: 1440, height: 900
   await page.goto(`${WEB}${path}`, { waitUntil: 'networkidle' })
   await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), THEME)
   await page.waitForTimeout(400)
-  return { page, sent, errors, natives, close: () => { opened.delete(ctx); return ctx.close() } }
+  // 关之前先撤掉拦截、忽略还在路上的那几条：满负荷并行时，取真实返回的拦截可能在页面关掉之后才回来，
+  // 没人接住的报错会把整个检查进程带崩（「Request context disposed」）
+  return { page, sent, errors, natives, close: async () => {
+    opened.delete(ctx)
+    await page.unrouteAll({ behavior: 'ignoreErrors' }).catch(() => {})
+    return ctx.close()
+  } }
 }
 const goto = async (page, path) => {
   await page.goto(`${WEB}${path}`, { waitUntil: 'networkidle' })
