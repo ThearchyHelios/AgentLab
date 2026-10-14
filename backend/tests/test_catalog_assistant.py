@@ -353,6 +353,23 @@ async def test_background_has_structure_catalog_and_hides_masked_values(client, 
     assert "没开剖析" not in system
 
 
+async def test_the_draft_guidance_is_not_what_the_user_said(client, tmp_path, monkeypatch):
+    """数据源的起草要求是以前写在数据源上的背景，不是这次对话里使用者说的话：背景里标明白；系统提示词写清 reason 里引用的
+    原话只能是这次对话里使用者的消息，依据来自起草要求时写「起草要求写着：……」。验收时模型把起草要求写成了
+    「使用者说：……」，保存之后看起来像是使用者亲口确认过。"""
+    sid = await _source(client, tmp_path, guidance="pay_type：1=现金，2=刷卡")
+    model = Scripted([Turn(text=["好。"])])
+    use(monkeypatch, model)
+    await _talk(client, sid, _ask("看看还缺什么"))
+    system = model.seen[0][0].content
+    assert "数据源的起草要求（不是这次对话里使用者说的话）：pay_type：1=现金，2=刷卡" in system
+    assert "使用者补充的背景和要求" not in system
+    assert "只能引用这次对话里使用者的消息" in system and "起草要求写着：" in system
+    reason = (catalog_assistant.PROPOSE_TOOL_PROMPT["function"]["parameters"]["properties"]["changes"]["items"]
+              ["properties"]["reason"]["description"])
+    assert "这次对话里使用者" in reason and "起草要求写着" in reason
+
+
 async def test_background_says_how_many_runs_used_the_table(client, tmp_path, monkeypatch):
     """使用次数的口径同审阅队列：被几次运行用到（同「用过这张表的运行」的 total），查询几次（同目录清单的「使用 N 次」）。"""
     from app.db.models import Artifact, Run
