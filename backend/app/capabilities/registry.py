@@ -28,25 +28,29 @@ async def sync_all(session: AsyncSession) -> int:
     raise NotImplementedError("BE-1")
 
 
+# 运行路径上会被别的包调到的几个函数，契约骨架里给的是「和今天行为一致」的默认实现（不查登记、不改变任何判定），
+# 并行开发时一个包没写完不会弄挂别的包的测试。BE-1 换成真实现，签名不变。
+
+
 async def get_capability(session: AsyncSession, name: str) -> Any | None:
     """一行能力登记（db.models_capabilities.Capability），没有就是 None。"""
-    raise NotImplementedError("BE-1")
+    return None
 
 
 def effective_effect(capability: Any) -> str:
     """治理后的效果：effect 为空时按 effect_system。"""
-    raise NotImplementedError("BE-1")
+    return getattr(capability, "effect", None) or getattr(capability, "effect_system", None) or "dynamic"
 
 
 async def capability_snapshot(session: AsyncSession, tool_names: list[str]) -> dict[str, Any]:
     """运行发起时用到的能力的治理快照：{名字: {effect, approval, unattended_write, version, endpoint_id, masked}}。
     写进 Run.options["capabilities"]，恢复和重放用同一份。"""
-    raise NotImplementedError("BE-1")
+    return {}
 
 
 async def capability_versions_for(session: AsyncSession, tool_names: list[str]) -> dict[str, int]:
     """发布时记下的能力版本：{名字: version}。"""
-    raise NotImplementedError("BE-1")
+    return {}
 
 
 def is_platform_query(name: str) -> bool:
@@ -66,4 +70,4 @@ async def endpoint_request(session: AsyncSession, capability: Any, args: dict[st
 
 def masked_paths(capability: Any) -> list[str]:
     """能力的遮罩字段（JSON 指针）。"""
-    raise NotImplementedError("BE-1")
+    return list(getattr(capability, "masked", None) or [])

@@ -32,9 +32,12 @@ export const apps = {
   grants: (id: string) => get<{ items: AppGrant[] }>(`${at(id)}/grants`),
   setGrants: (id: string, items: AppGrant[]) => put<{ items: AppGrant[] }>(`${at(id)}/grants`, { items }),
   /** 页面解析：服务端解析好的视图模型（不可见的组件不下发，遮罩值不出服务端） */
-  page: (id: string, page: string, params?: { instance?: string; params?: Record<string, unknown> }, opts?: RequestOptions) =>
+  page: (id: string, page: string,
+    params?: { instance?: string; params?: Record<string, unknown>; draft?: boolean }, opts?: RequestOptions) =>
     get<ViewModel>(`${at(id)}/pages/${encodeURIComponent(page)}${qs({
       instance: params?.instance, params: params?.params ? JSON.stringify(params.params) : undefined,
+      // 编辑器预览：按草稿解析（不发起运行，视图取钉住版本已有的封存运行）
+      draft: params?.draft ? 1 : undefined,
     })}`, opts),
   /** 发起一个实例 */
   start: (id: string, entry: string, values: Record<string, unknown>) =>

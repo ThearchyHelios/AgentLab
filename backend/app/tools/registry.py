@@ -140,9 +140,12 @@ def build_tool(spec: ToolSpec, ctx: ToolContext) -> BaseTool:
 
 
 async def build_tools(
-    names: list[str], ctx: ToolContext, *, session: Any = None
+    names: list[str], ctx: ToolContext, *, session: Any = None, allow_write: bool = False
 ) -> list[BaseTool]:
     """按名字列表组装工具。
+
+    allow_write（应用平台 A5）：写入能力只能放在调用工具节点里——只有调用工具节点传 True；agent、协作节点用默认值，
+    能力登记里治理后效果为 write 的工具在这里就被拒绝（BE-1 实现判定；契约骨架阶段不拦，行为同以前）。
 
     四种来源：内置（静态注册）、MCP（mcp:<server>/<tool>）、数据源
     （db_query__<源名> / db_schema__<源名>）、自定义（数据库里的 CustomTool）。
