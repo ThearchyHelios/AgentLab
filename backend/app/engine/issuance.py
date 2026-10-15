@@ -409,6 +409,17 @@ def trace_numbers(
     return report
 
 
+def metrics_only(contract: Any) -> bool:
+    """指标出具：契约写了「指标来自」，没写「报告来自」也没写「叙述」——出具的就是指标本身（纯指标看板，用户 2026-10-15
+    拍板）。三档的语义不变，核对的对象从叙述换成指标：必需指标缺了不予出具；成果字段里给人看的数要回指到指标集；
+    每个指标的输入要追到原始数据（engine/lineage），追不到的照实写进缺口、不盖完整出具。"""
+    if not isinstance(contract, dict):
+        return False
+    sources = contract.get("metrics_from") or []
+    return bool(sources) and contract.get("report_from") in (None, "") \
+        and not str(contract.get("narrative") or "").strip()
+
+
 def decide_tier(
     *,
     missing_required: list[str],

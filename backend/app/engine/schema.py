@@ -899,6 +899,18 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         elif node.type == NodeType.TOOL:
             if not cfg.get("tool"):
                 result.add("「调用工具」节点还没有选择工具", node_id=node.id, field="tool")
+            # 写入动作的确认派给谁（应用平台 §3.8）：写法同人工节点
+            from app.engine.lint_process import assignee_problem
+
+            if problem := assignee_problem(cfg.get("assignee")):
+                result.add(problem, node_id=node.id, field="assignee", code="human.assignee_invalid")
+        elif node.type == NodeType.HUMAN:
+            # 人工节点的流程配置（派给谁、会签、时限、超时、表单，§3.7）。运行时没法照着写错的配置执行，按错误报，
+            # 各级发布和发起运行都挡。实现在 engine/lint_process.py
+            from app.engine.lint_process import human_issues
+
+            for code, message, field in human_issues(node):
+                result.add(message, node_id=node.id, field=field, code=code)
         elif node.type == NodeType.SUBGRAPH:
             if not cfg.get("workflow_id"):
                 result.add("「子工作流」节点还没有选择要嵌套的工作流", node_id=node.id,

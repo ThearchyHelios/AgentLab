@@ -16,7 +16,7 @@ import { explainRunError } from '../lib/explain'
 import { formatClock, formatDuration, formatNumber, NONE, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
 import {
-  COPILOT_CONTEXT_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, evidenceTally, issuanceLabel,
+  COPILOT_CONTEXT_TEXT, DUAL_CHECK_TEXT, EVIDENCE_TEXT, ISSUANCE_MODE_TEXT, JUDGE_TEXT, MERGE_TEXT, RUN_SQL_CHECK_TEXT, evidenceTally, issuanceLabel,
   nodeTypeLabel,
 } from '../lib/terms'
 import { SqlCheckList } from './SqlChecks'
@@ -2443,6 +2443,9 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
         </span>
       </div>
       {meta.hint && <div className="mt-1 text-2xs leading-relaxed text-dim">{meta.hint}</div>}
+      {issuance?.mode === 'metrics' && (
+        <div className="mt-1 text-2xs leading-relaxed text-dim" data-issuance-mode="metrics">{ISSUANCE_MODE_TEXT.metrics}</div>
+      )}
       {counts && (counts.total > 0 || counts.other > 0 || suspect > 0 || uncitedClaims > 0 || !!claims) && (
         // 逐段证据的计数：和报告核对那一行、证据条同一种说法。可疑名字、没挂依据的结论句不是数字，
         // 各自另起一句。有无证据的数字、可疑名字、证据有问题（相矛盾、部分有依据、证据不足）的结论句时才给「定位下一处」——

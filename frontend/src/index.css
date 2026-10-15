@@ -91,6 +91,14 @@
      在 panel 底上作为图形 ≥ 3:1 */
   --via-semantic: #2b95c0;
   --via-keyword: #d55181;
+
+  /* 应用页图表（趋势、图表）的系列色，按固定顺序取，不轮换。dataviz 的参考色板按面板底色（#141926 / #ffffff）
+     跑过校验：深色下四色对底色都 ≥ 3:1、相邻两色色觉异常下也分得开；浅色下第 3、4 色对底色不足 3:1，
+     图表一律带「查看数据」的表格视图和图例，不靠颜色单独认 */
+  --viz-1: #3987e5;
+  --viz-2: #d95926;
+  --viz-3: #199e70;
+  --viz-4: #c98500;
 }
 
 :root[data-theme='light'] {
@@ -148,6 +156,10 @@
   --nt-challenge: #7d4c8f;
   --via-semantic: #0a7ea4;
   --via-keyword: #c2447a;
+  --viz-1: #2a78d6;
+  --viz-2: #eb6834;
+  --viz-3: #1baf7a;
+  --viz-4: #eda100;
 }
 
 /* 「跟随系统」且系统是浅色：和上面那块逐字相同 */
@@ -207,6 +219,10 @@
     --nt-challenge: #7d4c8f;
     --via-semantic: #0a7ea4;
     --via-keyword: #c2447a;
+    --viz-1: #2a78d6;
+    --viz-2: #eb6834;
+    --viz-3: #1baf7a;
+    --viz-4: #eda100;
   }
 }
 

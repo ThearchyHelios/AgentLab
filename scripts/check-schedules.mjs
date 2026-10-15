@@ -364,10 +364,15 @@ const VERSION3 = {
   id: 'v3', version: 3, note: '发布', workflow_id: 'wf-weekly', published: true, graph: WORKFLOWS[0].graph,
   input_fields: [{ name: 'date', required: true, description: '统计日期' }, { name: 'region', default: '华东' }],
 }
+/** ISO 周的补充说明照服务端（scheduler/service.ISO_WEEK_NOTE）：几个周变量同一句 */
+const ISO_NOTE = 'ISO 周从周一开始，含当年 1 月 4 日的那一周是第 1 周；跨年那几天按所在的周算，例如 2027-01-01（周五）属于 2026-W53'
 const VARIABLES = [
-  { name: 'schedule.yesterday', label: '昨天（YYYY-MM-DD）', example: '2026-10-04' },
-  { name: 'schedule.today', label: '今天（YYYY-MM-DD）', example: '2026-10-05' },
-  { name: 'schedule.last_week_start', label: '上周一（YYYY-MM-DD）', example: '2026-09-28' },
+  { name: 'schedule.yesterday', label: '昨天（YYYY-MM-DD）', example: '2026-10-04', note: '' },
+  { name: 'schedule.today', label: '今天（YYYY-MM-DD）', example: '2026-10-05', note: '' },
+  { name: 'schedule.this_week', label: '本周（ISO 周，YYYY-Www）', example: '2026-W41', note: ISO_NOTE },
+  { name: 'schedule.last_week', label: '上周（ISO 周，YYYY-Www）', example: '2026-W40', note: ISO_NOTE },
+  { name: 'schedule.last_week_start', label: '上周一（YYYY-MM-DD）', example: '2026-09-28', note: '' },
+  { name: 'schedule.last_month', label: '上月（YYYY-MM）', example: '2026-09', note: '' },
 ]
 const FEISHU_URL = 'https://open.feishu.cn/open-apis/bot/v2/hook/0f3c9a7e-demo-ab12'
 const urlHint = (url) => {
@@ -954,6 +959,15 @@ await section('新建：每周一 09:00 的请求体', async () => {
     await page.locator('[data-input-field="date"] [data-required][aria-label="必填"]').count() === 1
       && await page.locator('[data-input-field="region"] [data-required]').count() === 0)
   await page.locator('[data-input-vars="date"]').click()
+  const varLabels = await page.locator('[data-input-field="date"] [data-var]').allInnerTexts()
+  check('变量清单有 ISO 周、月份（按周、按月统计的报告跟着触发日走）',
+    varLabels.includes('本周（ISO 周，YYYY-Www）') && varLabels.includes('上周（ISO 周，YYYY-Www）') && varLabels.includes('上月（YYYY-MM）'),
+    oneLine(varLabels))
+  check('ISO 周的悬停写变量名和示例', (await page.locator('[data-input-field="date"] [data-var="schedule.last_week"]').getAttribute('title'))
+    === 'schedule.last_week，例如 2026-W40')
+  const notes = await page.locator('[data-input-field="date"] [data-var-note]').allInnerTexts()
+  check('ISO 周的跨年规则写在变量下面，几个周变量同一句只写一遍（触屏没有悬停也看得到）',
+    notes.length === 1 && notes[0] === ISO_NOTE, oneLine(notes))
   await page.locator('[data-input-field="date"] [data-var="schedule.yesterday"]').click()
   check('点变量插入模板', await page.locator('[data-input-field="date"] input').inputValue() === '{{ schedule.yesterday }}',
     await page.locator('[data-input-field="date"] input').inputValue())
@@ -1380,6 +1394,82 @@ await section('详情：晚到的刷新与先开触发历史', async () => {
   check('保存带的是表单所基于的那一版（9），不撞假的 409', JSON.stringify(hp) === JSON.stringify({ misfire_grace_s: 86400, version: 9 }), JSON.stringify(hp))
   check('……没有冲突提示', await h.page.locator('[data-schedule-conflict]').count() === 0)
   check('没有页面报错', !h.errors.length, h.errors.join(' ｜ '))
+})
+
+await section('详情：重新载入碰上原地刷新，照样换成服务端的设置', async () => {
+  const state = freshState()
+  const { page, sent, errors } = await open('/schedules/s-weekly', { state })
+  await page.locator('[data-schedule-form]').waitFor()
+  state.schedules = state.schedules.map((s) => (s.id === 's-weekly' ? { ...s, version: 9, name: '别处改过的名字' } : s))
+  await page.locator('[data-field="name"]').fill('又改一次')
+  await page.locator('[data-schedule-save]').click()
+  await page.locator('[data-schedule-reload]').waitFor()
+  // 读晚 1.5 秒才回：「重新载入」的读还在路上，立即运行之后的原地刷新又发出去一次
+  state.override = slowGet(state, '/schedules/s-weekly', (st) => st.schedules.find((s) => s.id === 's-weekly'))
+  const gets = () => sent.filter((s) => s.key === 'GET /schedules/s-weekly').length
+  const before = gets()
+  await page.locator('[data-schedule-reload]').click()
+  await page.locator('[role="dialog"]').getByRole('button', { name: '放弃修改并重新载入' }).click()
+  await until(() => gets() > before)
+  await page.locator('header [data-schedule-run]').click()
+  check('重新载入的读在路上时又原地刷新了一次', await until(() => gets() >= before + 2), `${gets() - before} 次`)
+  check('……重新载入不被刷新作废：表单换成服务端的设置、冲突提示收起', await until(async () =>
+    (await page.locator('[data-field="name"]').inputValue()) === '别处改过的名字'
+      && await page.locator('[data-schedule-conflict]').count() === 0, 5000),
+  await page.locator('[data-field="name"]').inputValue())
+  state.override = null
+  await page.locator('[data-misfire]').selectOption('86400')
+  await page.locator('[data-schedule-save]').click()
+  await until(() => writes(sent, /^PATCH /).length === 2)
+  await saveDone(page)
+  const p = writes(sent, /^PATCH /)[1]?.body
+  check('……再保存带重新载入的那一版（9），不再撞 409', JSON.stringify(p) === JSON.stringify({ misfire_grace_s: 86400, version: 9 }),
+    JSON.stringify(p))
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
+await section('详情：运行结束后页头的「上次触发」跟着变', async () => {
+  // 上次触发发起的运行还在跑：页头和触发历史第一条是同一次触发（服务端同一个口径）
+  const running = (st) => {
+    const f = { ...st.fires[0], run_status: 'running', compare: null }
+    st.fires = [f, ...st.fires.slice(1)]
+    st.schedules = st.schedules.map((x) => (x.id === 's-weekly' ? { ...x, last_fire: structuredClone(f) } : x))
+  }
+  const finish = (st) => {
+    st.fires = [{ ...st.fires[0], run_status: 'succeeded' }, ...st.fires.slice(1)]
+    st.schedules = st.schedules.map((x) => (x.id === 's-weekly' ? { ...x, last_fire: structuredClone(st.fires[0]) } : x))
+  }
+  const head = (page) => page.locator('[data-schedule-summary] [data-status]').first().getAttribute('data-status').catch(() => null)
+  const row = (page) => page.locator('[data-fire-id="f00"] [data-status]').first().getAttribute('data-status').catch(() => null)
+
+  // 点触发历史的「刷新」：页头一起变，不等下一次原地刷新
+  const st = freshState()
+  running(st)
+  const a = await open('/schedules/s-weekly?tab=history', { state: st })
+  await a.page.locator('[data-fire-id="f00"]').waitFor()
+  check('开始时页头和触发历史都是「运行中」', await until(async () => await head(a.page) === 'running' && await row(a.page) === 'running'),
+    `${await head(a.page)} ｜ ${await row(a.page)}`)
+  finish(st)
+  await a.page.locator('[data-fire-refresh]').click()
+  check('点触发历史的刷新：页头的上次触发跟着变成已完成', await until(async () => await head(a.page) === 'succeeded', 3000),
+    `${await head(a.page)}`)
+  check('……触发历史那一行也是已完成', await row(a.page) === 'succeeded', `${await row(a.page)}`)
+  check('没有页面报错', !a.errors.length, a.errors.join(' ｜ '))
+
+  // 什么都不点：运行还在跑时页头原地刷新得勤，运行一结束页头和触发历史都跟着变
+  const st2 = freshState()
+  running(st2)
+  const b = await open('/schedules/s-weekly?tab=history', { state: st2 })
+  await b.page.locator('[data-fire-id="f00"]').waitFor()
+  await until(async () => await head(b.page) === 'running')
+  const fires = () => b.sent.filter((x) => x.key === 'GET /schedules/s-weekly/fires').length
+  const firesBefore = fires()
+  finish(st2)
+  check('运行结束：不点刷新，几秒内页头的上次触发变成已完成', await until(async () => await head(b.page) === 'succeeded', 8000, 250),
+    `${await head(b.page)}`)
+  check('……触发历史那一行原地换成已完成，不从头重取（翻过的页不丢）', await until(async () => await row(b.page) === 'succeeded', 2000)
+    && fires() === firesBefore, `${await row(b.page)} ｜ 多取了 ${fires() - firesBefore} 次`)
+  check('没有页面报错', !b.errors.length, b.errors.join(' ｜ '))
 })
 
 await section('详情：触发历史分页', async () => {

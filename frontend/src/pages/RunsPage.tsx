@@ -7,17 +7,18 @@ import { formatSpan } from '../lib/format'
 import { STATUS, type StatusCode } from '../lib/status'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import type { Approval, Run } from '../types'
+import type { Task } from '../typesApp'
 import {
-  ApprovalRows, FilterBar, RunRows, StatusSegments,
+  FilterBar, RunRows, StatusSegments, TaskRows,
 } from './runs/RunList'
 import { RunDetailView } from './runs/RunDetailView'
 import {
   RUNS_TABS, TAB_CODES, TAB_LABEL, ageMs, asTab, duplicateNames, isLiveRun, matchesCodes,
   parseQuery, runCode, stripStatusWords, type RunsTab,
 } from './runs/model'
-import { UNSAVED_NAME } from '../lib/terms'
+import { ORIGIN_TEXT, TASK_LOG_TEXT, UNSAVED_NAME, originLabel } from '../lib/terms'
 import { RunTabs, type TabItem } from './runs/parts'
-import { useApprovalQueue, useRunList, useStatusCounts } from './runs/useRunsData'
+import { useApprovalQueue, useRunList, useStatusCounts, useTaskQueue } from './runs/useRunsData'
 import './runs/runs.css'
 
 /**
@@ -39,6 +40,7 @@ export function RunsPage() {
   const runClass = (['formal', 'exploratory'].includes(params.get('class') ?? '') ? params.get('class') : '') as
     '' | 'formal' | 'exploratory'
   const workflowId = params.get('wf') ?? ''
+  const origin = params.get('origin') ?? ''
   const segment = (params.get('status') ?? '').split(',').filter((c): c is StatusCode => c in STATUS)
 
   const patchParams = useCallback((patch: Record<string, string | null>) => {
@@ -78,6 +80,8 @@ export function RunsPage() {
   const [epoch, setEpoch] = useState(0)
   const [tick, setTick] = useState(0)
   const queue = useApprovalQueue(epoch)
+  // 「待办」页签列的是待办（审批、补充输入、动作确认、核实）；判「等待审批 / 已挂起」仍按待审批（queue）
+  const tasks = useTaskQueue(epoch)
   // 判「等待审批 / 已挂起」用哪份待审批：页面自己那份上限高（500 条），没拿到
   // 之前用 catalog 的；两份都没有时是 null，按等待审批算，不闪成「已挂起」
   const known: Approval[] | null = queue.state === 'ok' ? queue.items : catalogLoaded ? approvals : null
@@ -89,14 +93,14 @@ export function RunsPage() {
     : (parsed.codes.length ? parsed.codes : segment)
   const impossible = !!tabCodes && parsed.codes.length > 0 && codes.length === 0
 
-  const filters = { codes, runClass, workflowId, q: parsed.q }
+  const filters = { codes, runClass, workflowId, q: parsed.q, origin }
   const list = useRunList(filters, tab !== 'approvals' && !impossible)
   // 计数两份：页签和分段上的跟着当前的类别、工作流、名称条件走；右侧总览说的
   // 是全局——筛掉了不代表事情没了
-  const narrowed = !!(runClass || workflowId || parsed.q)
+  const narrowed = !!(runClass || workflowId || parsed.q || origin)
   const countKey = epoch * 100_000 + tick
   const globalCounts = useStatusCounts({ runClass: '', workflowId: '', q: '' }, known, countKey)
-  const narrowCounts = useStatusCounts({ runClass, workflowId, q: parsed.q }, known, countKey, narrowed)
+  const narrowCounts = useStatusCounts({ runClass, workflowId, q: parsed.q, origin }, known, countKey, narrowed)
   const counts = narrowed ? narrowCounts : globalCounts
 
   const { reload: reloadList, patchRow, removeRow } = list
@@ -133,13 +137,9 @@ export function RunsPage() {
     ...list.rows.map((r) => ({ id: r.workflow_id, name: r.workflow_name })),
   ]), [workflows, list.rows])
 
-  // 待审批页签也吃同样的类别、工作流、名称条件
-  const approvalFilter = useCallback((a: Approval) => {
-    if (runClass && a.run_class !== runClass) return false
-    if (workflowId === UNSAVED_WORKFLOW_ID ? !!a.workflow_id : workflowId && a.workflow_id !== workflowId) return false
-    if (parsed.q && !(a.workflow_name ?? '').toLowerCase().includes(parsed.q.toLowerCase())) return false
-    return true
-  }, [runClass, workflowId, parsed.q])
+  // 待办页签吃同样的名称条件。待办上只有工作流名，没有运行类别、工作流 id 和来源，那几项不筛它
+  const taskFilter = useCallback((t: Task) =>
+    !parsed.q || `${t.workflow_name ?? ''} ${t.title}`.toLowerCase().includes(parsed.q.toLowerCase()), [parsed.q])
 
   const pendingOf = useCallback(
     (id: string) => known?.find((a) => a.run_id === id && a.status === 'pending'),
@@ -165,7 +165,7 @@ export function RunsPage() {
   }, [removeRow, navigate, location.search])
 
   const now = useTicker(60_000)
-  const queueItems = queue.items.filter(approvalFilter)
+  const queueItems = tasks.items.filter(taskFilter)
   const oldest = oldestAge(queueItems, now)
   const running = (counts.counts.running ?? 0) + (counts.counts.queued ?? 0)
   const failed = counts.counts.failed ?? 0
@@ -173,15 +173,15 @@ export function RunsPage() {
   const allRunning = (globalCounts.counts.running ?? 0) + (globalCounts.counts.queued ?? 0)
   const allFailed = globalCounts.counts.failed ?? 0
   const allPlus = globalCounts.saturated ? '+' : ''
-  const allPending = queue.items.length
-  const allOldest = oldestAge(queue.items, now)
+  const allPending = tasks.items.length
+  const allOldest = oldestAge(tasks.items, now)
   const tabs: TabItem<RunsTab>[] = RUNS_TABS.map((key) => {
     if (key === 'approvals') {
       return {
         key, label: TAB_LABEL[key], count: queueItems.length, tone: 'alert',
         title: queueItems.length
-          ? `${queueItems.length} 条待审批${oldest != null ? `，最久已等待 ${formatSpan(oldest, { coarse: true })}` : ''}`
-          : '没有待审批',
+          ? `${queueItems.length} 条待办${oldest != null ? `，最久已等待 ${formatSpan(oldest, { coarse: true })}` : ''}`
+          : TASK_LOG_TEXT.emptyTitle,
       }
     }
     if (key === 'running') return { key, label: TAB_LABEL[key], count: running, countLabel: `${running}${plus}`, tone: 'live' }
@@ -201,10 +201,10 @@ export function RunsPage() {
   const clearFilters = () => {
     typing.current = false
     setDraft('')
-    patchParams({ q: null, status: null, class: null, wf: null })
+    patchParams({ q: null, status: null, class: null, wf: null, origin: null })
   }
 
-  const filterNote = describeFilters({ tab, parsed, segment, runClass, workflowId, workflows })
+  const filterNote = describeFilters({ tab, parsed, segment, runClass, workflowId, workflows, origin })
 
   return (
     <div className="flex h-full flex-col" data-runs-page="">
@@ -212,7 +212,7 @@ export function RunsPage() {
       <PageHeader
         icon={<History size={13} />}
         title="记录"
-        subtitle="每次运行的完整轨迹、待处理的审批和封存凭证"
+        subtitle="每次运行的完整轨迹、待处理的待办和封存凭证"
         actions={<IconButton label="刷新" icon={<RefreshCw size={12} aria-hidden />} onClick={refreshAll} data-runs-refresh="" />}
       />
 
@@ -224,6 +224,7 @@ export function RunsPage() {
             runClass={runClass} onRunClass={(v) => patchParams({ class: v || null })}
             workflowId={workflowId} onWorkflow={(id) => patchParams({ wf: id || null })}
             workflows={workflows} dupNames={dupNames}
+            origin={origin} onOrigin={(v) => patchParams({ origin: v || null })}
           />
           {tab === 'all'
             ? <StatusSegments active={codes} onPick={pickSegment} counts={counts} />
@@ -237,7 +238,7 @@ export function RunsPage() {
             onKeyDown={moveInList}
           >
             {tab === 'approvals' ? (
-              <ApprovalRows queue={queue} filter={approvalFilter} onOpen={open} selectedId={runId} dupNames={dupNames} />
+              <TaskRows queue={tasks} filter={taskFilter} onOpen={open} selectedId={runId} dupNames={dupNames} />
             ) : (
               <RunRows
                 list={shownList}
@@ -267,8 +268,8 @@ export function RunsPage() {
   )
 }
 
-/** 一批待审批里等得最久的那条等了多久；空的是 null */
-function oldestAge(items: Approval[], now: number): number | null {
+/** 一批待办里等得最久的那条等了多久；空的是 null */
+function oldestAge(items: { created_at?: string | null }[], now: number): number | null {
   return items.reduce<number | null>((m, a) => {
     const age = ageMs(a.created_at, now)
     return age != null && (m == null || age > m) ? age : m
@@ -278,7 +279,7 @@ function oldestAge(items: Approval[], now: number): number | null {
 /** 列表里 ↑↓ 在行之间移动焦点，回车打开（行本身是按钮）。不在移动时就打开：每按一下就拉一次详情太吵 */
 function moveInList(e: KeyboardEvent<HTMLDivElement>) {
   if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
-  const rows = [...e.currentTarget.querySelectorAll<HTMLElement>('[data-run-id][type=button], [data-approval-id]')]
+  const rows = [...e.currentTarget.querySelectorAll<HTMLElement>('[data-run-id][type=button], [data-task-id]')]
   const i = rows.indexOf(document.activeElement as HTMLElement)
   if (i < 0) return
   const next = rows[e.key === 'ArrowDown' ? Math.min(rows.length - 1, i + 1) : Math.max(0, i - 1)]
@@ -289,15 +290,16 @@ function moveInList(e: KeyboardEvent<HTMLDivElement>) {
 }
 
 /** 空的「没有匹配」要说清是被哪些条件筛空的；没有任何条件时返回 null */
-function describeFilters({ tab, parsed, segment, runClass, workflowId, workflows }: {
+function describeFilters({ tab, parsed, segment, runClass, workflowId, workflows, origin }: {
   tab: RunsTab; parsed: ReturnType<typeof parseQuery>; segment: StatusCode[]
-  runClass: string; workflowId: string; workflows: { id: string; name: string }[]
+  runClass: string; workflowId: string; workflows: { id: string; name: string }[]; origin: string
 }): string | null {
   const parts: string[] = []
   if (parsed.words.length) parts.push(`状态「${parsed.words.join('、')}」`)
   else if (tab === 'all' && segment.length) parts.push(`状态「${segment.map((c) => STATUS[c].short).join('、')}」`)
   if (parsed.q) parts.push(`名称含「${parsed.q}」`)
   if (runClass) parts.push(runClass === 'formal' ? '正式运行' : '探索运行')
+  if (origin) parts.push(`来源「${origin === 'none' ? ORIGIN_TEXT.unknown : originLabel(origin)}」`)
   if (workflowId === UNSAVED_WORKFLOW_ID) parts.push(UNSAVED_NAME)
   else if (workflowId) parts.push(`工作流「${workflows.find((w) => w.id === workflowId)?.name ?? '已删除的工作流'}」`)
   if (!parts.length) return null
@@ -314,7 +316,7 @@ function Overview({ pending, oldest, running, failed, plus, onTab }: {
 }) {
   const tiles: { key: RunsTab; code: StatusCode; label: string; value: string; sub: string; alert: boolean }[] = [
     {
-      key: 'approvals', code: 'waiting', label: '待审批', value: String(pending),
+      key: 'approvals', code: 'waiting', label: TASK_LOG_TEXT.tab, value: String(pending),
       sub: pending ? `最久已等待 ${formatSpan(oldest, { coarse: true })}` : '暂无待处理',
       alert: pending > 0,
     },

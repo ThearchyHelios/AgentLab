@@ -5,8 +5,9 @@
 提示词里也不提。这组守的是：
 
 - 目录清单接口返回 schema_truncated、schema_total（数据库里一共几张），界面据此说明「只探查了前 200 张」
-- 助手上下文的 total 是表结构缓存里的真实总数；context 操作里带上 explored（探查到几张）
-- 提示词里写明还有几张没探查到，遇到不认识的表名先查结构
+- 助手的概览写「共 205 张表，只探查了 200 张」；查看记录（look 事件）的 total 是表结构缓存里的真实总数，另带
+  explored（探查到几张）
+- 查看结果里写明还有几张没探查到，遇到不认识的表名先查结构；交回的表目录也写明只列了探查到的
 - 没截断的库照旧，不多说一句
 
 合成库：205 张空表，测试里临时建，用完连同数据源一起删掉。
@@ -89,31 +90,37 @@ async def test_catalog_list_of_a_complete_schema(client, narrow):
 
 
 async def test_assistant_context_counts_the_real_total(wide):
-    from app.api import copilot_context
+    from app.look.service import LookService
+    from app.look.tables import TableKind
 
     sid, name = wide
-    plan = await copilot_context.plan_context([await _row(sid)])
-    ctx = plan.fallback("测试")
-    (row,) = ctx.op()["sources"]
+    kind = await TableKind.load([await _row(sid)])
+    looks = LookService([kind])
+    overview = await looks.overview()
+    assert f"共 {WIDE} 张表，只探查了 200 张" in overview
+    # 点名查看一张探查到的表：记录里 total 是真实总数，另带 explored；文字里说清还有多少张没探查到
+    result = await looks.look({"op": "look", "need": "看一下 t000", "targets": [
+        {"kind": "table", "source": name, "name": "t000"}]})
+    (row,) = result.record["objects"]
     assert row["total"] == WIDE and row["explored"] == 200
-    text = ctx.section()
-    assert f"共 {WIDE} 张表" in text and "只探查了 200 张" in text and f"还有 {WIDE - 200} 张没有探查到" in text
+    assert f"共 {WIDE} 张表，只探查了 200 张" in result.text
     # 遇到不认识的表名先查结构，别猜
-    assert f"db_schema__{name}" in text and "information_schema" in text
-    # 挑表的请求里也写明只列了探查到的
-    pick = plan._pick_messages("各表的金额")[1][1]
-    assert f"共 {WIDE} 张表，只探查了 200 张" in pick
+    assert f"db_schema__{name}" in result.text and "information_schema" in result.text
+    # 交回的表目录也写明只列了探查到的
+    assert f"共 {WIDE} 张表，只探查了 200 张，下面只列探查到的" in await kind.index(None)
 
 
 async def test_assistant_context_of_a_complete_schema_says_nothing_extra(narrow):
-    from app.api import copilot_context
+    from app.look.service import LookService
+    from app.look.tables import TableKind
 
-    sid, _ = narrow
-    plan = await copilot_context.plan_context([await _row(sid)])
-    ctx = await plan.resolve(None, need="x")
-    (row,) = ctx.op()["sources"]
+    sid, name = narrow
+    looks = LookService([await TableKind.load([await _row(sid)])])
+    assert "只探查了" not in await looks.overview()
+    result = await looks.look({"op": "look", "need": "全部"})
+    (row,) = result.record["objects"]
     assert row["total"] == 3 and "explored" not in row
-    assert "没有探查到" not in ctx.section()
+    assert "没有探查到" not in result.text and "只探查了" not in result.text
 
 
 async def test_schema_tool_does_not_deny_a_table_that_was_not_introspected(wide, narrow):

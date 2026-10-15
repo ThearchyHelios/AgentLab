@@ -876,6 +876,11 @@ await section('auto：修完没有错了，发布按钮才可用；发布只在�
   await submit(page).click()
   await waitFor(page, async () => state.publishes.length === 1)
   check('人点了「发布为受管」才发出一次发布', state.publishes.length === 1 && state.publishes[0].level === 'governed', JSON.stringify(state.publishes))
+  // 受管级发布成功：弹窗标题写明受管（和工具栏「受管 vN」、发布提示同一种说法），不只写「已发布 vN」
+  const done = dialog(page).locator('[data-publish-done-level="governed"]')
+  check('受管发布成功：弹窗换成成功的说明', await waitFor(page, async () => await done.count() === 1))
+  const head = await dialog(page).innerText().catch(() => '')
+  check('……标题写明受管', head.includes(`已发布 v${state.version} · 受管`), head.split('\n')[0])
 })
 
 await section('choice：没选之前不能应用；选了之后载荷里是选的值', async () => {
@@ -1930,6 +1935,193 @@ await section('点名的模型接入：390px 下修复选项不伸出弹窗', as
   })
   check('390px：几组接入选项和长标题都在弹窗里，没有横向滚动条', !m.wide.length && m.scrollers === 0 && m.own <= 0, JSON.stringify(m))
   await shoot(page, 'publish-provider-390', page)
+})
+
+await section('应用平台：发布成功做成应用；已发布版本的使用情况与退役', async () => {
+  // A8：发布成功的弹窗里点「做成应用」→ 应用编辑，按这一版派生。L4：发布弹窗、版本历史写这一版被哪些应用固定、
+  // 生效记录和正式运行各有多少。A1：退役只给管理员（关登录时所有人），当前发布版不能退
+  const usage = { apps: [{ app_id: 'app-wk', name: '周报看板', app_version: 2 }], effects: 3, formal_runs: 14 }
+  {
+    const { page } = await open({ id: 'pf-hard' })
+    const ledger = []
+    await page.route(/\/api\/ledger\/workflow-versions\/.+$/, (route) => {
+      ledger.push(new URL(route.request().url()).pathname)
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(usage) })
+    })
+    await openDialog(page)
+    const line = dialog(page).locator('[data-publish-usage]')
+    check('发布弹窗：当前已发布版本的使用情况', await waitFor(page, async () => await line.count() === 1)
+      && (await line.innerText()).includes('被 1 个应用固定') && (await line.innerText()).includes('生效记录 3 条'),
+      await line.innerText().catch(() => ''))
+    check('……按当前已发布的版本问账本', ledger.some((p) => p.endsWith('/pf-hard/2')), ledger.join(','))
+  }
+  {
+    const { page, state } = await open({ id: 'pf-easy' })
+    const derived = []
+    await page.route(/\/api\/apps\/derive$/, (route) => {
+      derived.push(route.request().postDataJSON())
+      return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ detail: '检查脚本不建应用' }) })
+    })
+    await openDialog(page)
+    await dialog(page).locator('[data-fix-all]').waitFor()
+    await dialog(page).locator('[data-fix-all]').click()
+    await dialog(page).locator('[data-fix-preview="ready"]').waitFor()
+    await dialog(page).locator('[data-fix-apply]').click()
+    await waitFor(page, async () => await submit(page).isEnabled().catch(() => false))
+    await submit(page).click()
+    await waitFor(page, async () => state.publishes.length === 1)
+    const done = dialog(page).locator('[data-publish-done]')
+    check('发布成功：弹窗不关，换成成功的说明', await waitFor(page, async () => await done.count() === 1))
+    const head = await dialog(page).innerText().catch(() => '')
+    check('……已发布级的标题不写受管', head.includes(`已发布 v${state.version}`) && !head.includes('受管')
+      && await done.getAttribute('data-publish-done-level') === 'published', head.split('\n')[0])
+    const make = dialog(page).locator('[data-publish-make-app]')
+    check('……给「做成应用」的入口', await make.count() === 1 && (await make.innerText()).includes('做成应用'))
+    await make.click()
+    await page.waitForURL('**/apps/new/edit**')
+    const u = new URL(page.url())
+    check('「做成应用」跳到应用编辑，带着工作流和刚发布的版本', u.searchParams.get('workflow') === 'pf-easy'
+      && Number(u.searchParams.get('version')) === state.version, u.pathname + u.search)
+    check('……进来就按这一版派生', await waitFor(page, async () => derived.length === 1)
+      && derived[0]?.workflow_id === 'pf-easy', JSON.stringify(derived))
+  }
+  {
+    const { page } = await open({ id: 'pf-lib' })
+    const retires = []
+    const versions = [4, 3, 2].map((n) => ({ id: `v${n}`, version: n, note: '', created_at: '2026-09-26T02:00:00Z',
+      published: n === 4, level: 'published', retired_at: n === 2 ? '2026-10-01T02:00:00Z' : null, retired_by: n === 2 ? '张工' : null,
+      retire_note: n === 2 ? '改按支付日统计' : null }))
+    await page.route(/\/api\/workflows\/pf-lib\/versions(\/\d+)?(\/retire)?$/, (route) => {
+      const path = new URL(route.request().url()).pathname
+      const v = Number(path.split('/')[5])
+      if (path.endsWith('/retire')) {
+        retires.push({ v, body: route.request().postDataJSON() })
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ retired: true, affected_apps: usage.apps }) })
+      }
+      const body = v ? { ...versions.find((x) => x.version === v), workflow_id: 'pf-lib', graph: FAKES['pf-lib'].graph, graph_hash: 'x' } : versions
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
+    })
+    await page.route(/\/api\/ledger\/workflow-versions\/.+$/, (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(usage) }))
+    // 编排页一进来焦点在助手输入框里，那时的 ⌥H 是打字：先把焦点放回页面（同 check-studio）
+    await page.evaluate(() => document.activeElement?.blur?.())
+    await page.keyboard.press('Alt+KeyH')
+    const sheet = page.locator('[role="dialog"][aria-label="版本历史"]')
+    await sheet.waitFor()
+    check('版本列表标出已退役的版本', await sheet.locator('[data-version-retired-chip]').count() === 1)
+    const retiredRow = sheet.locator('ol button', { hasText: 'v2' }).first()
+    check('……不用点开，列表那一行就写谁退的和退役说明', await retiredRow.locator('[data-version-retired]').count() === 1
+      && (await retiredRow.innerText()).includes('张工') && (await retiredRow.innerText()).includes('改按支付日统计'),
+      (await retiredRow.innerText()).replace(/\s+/g, ' '))
+    await retiredRow.click()
+    const gone = sheet.locator('[data-version-lifecycle="2"]')
+    await gone.waitFor()
+    check('退役的版本：展开后不给「做成应用」和退役按钮，也不重复写退役说明', await gone.locator('[data-version-make-app]').count() === 0
+      && await gone.locator('[data-version-retire]').count() === 0 && await gone.locator('[data-version-retired]').count() === 0)
+    await sheet.locator('ol button', { hasText: 'v4' }).first().click()
+    const cur = sheet.locator('[data-version-lifecycle="4"]')
+    // 使用情况是展开之后另取的（账本接口）：等它回来再读，别读到占位的「…」
+    check('展开当前发布版：写使用情况', await waitFor(page, async () => await cur.count() === 1
+      && (await cur.innerText().catch(() => '')).includes('被 1 个应用固定')), await cur.innerText().catch(() => ''))
+    check('……当前发布版的退役按钮不可点，写明原因', await cur.locator('[data-version-retire]').isDisabled()
+      && (await cur.innerText()).includes('当前发布版不能退役'))
+    await sheet.locator('ol button', { hasText: 'v3' }).first().click()
+    const old = sheet.locator('[data-version-lifecycle="3"]')
+    await old.waitFor()
+    await old.locator('[data-version-retire]').click()
+    const ask = page.locator('[role="alertdialog"], [role="dialog"]').filter({ hasText: '退役 v3' }).first()
+    check('退役前确认，列出受影响的应用', await waitFor(page, async () => (await ask.innerText().catch(() => '')).includes('周报看板')))
+    await ask.getByRole('button', { name: '退役这一版' }).click()
+    const note = page.locator('[role="alertdialog"], [role="dialog"]').filter({ hasText: '退役说明' }).first()
+    await note.getByRole('button', { name: '退役这一版' }).click().catch(() => {})
+    check('确认之后才发出退役请求', await waitFor(page, async () => retires.length === 1) && retires[0].v === 3, JSON.stringify(retires))
+  }
+  {
+    // 版本历史里每个已发布、未退役的版本都能做成应用：关掉发布弹窗之后不用为此重发一次
+    const { page } = await open({ id: 'pf-lib' })
+    const versions = [4, 3, 2].map((n) => ({ id: `v${n}`, version: n, note: '', created_at: '2026-09-26T02:00:00Z',
+      published: n === 4, level: n === 2 ? null : 'published', retired_at: null, retired_by: null }))
+    const derived = []
+    await page.route(/\/api\/workflows\/pf-lib\/versions(\/\d+)?$/, (route) => {
+      const v = Number(new URL(route.request().url()).pathname.split('/')[5])
+      const body = v ? { ...versions.find((x) => x.version === v), workflow_id: 'pf-lib', graph: FAKES['pf-lib'].graph, graph_hash: 'x' } : versions
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
+    })
+    await page.route(/\/api\/ledger\/workflow-versions\/.+$/, (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(usage) }))
+    await page.route(/\/api\/apps\/derive$/, (route) => {
+      derived.push(route.request().postDataJSON())
+      return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ detail: '检查脚本不建应用' }) })
+    })
+    await page.evaluate(() => document.activeElement?.blur?.())
+    await page.keyboard.press('Alt+KeyH')
+    const sheet = page.locator('[role="dialog"][aria-label="版本历史"]')
+    await sheet.waitFor()
+    await sheet.locator('ol button', { hasText: 'v2' }).first().click()
+    await sheet.locator('ol li').filter({ hasText: 'v2' }).locator('.fade-up').first().waitFor()
+    check('没发布过的版本不给「做成应用」', await sheet.locator('[data-version-make-app]').count() === 0)
+    await sheet.locator('ol button', { hasText: 'v3' }).first().click()
+    const make = sheet.locator('[data-version-make-app="3"]')
+    check('展开一个已发布、不是当前发布版的版本：给「做成应用」', await waitFor(page, async () => await make.count() === 1)
+      && (await make.innerText()).includes('做成应用'))
+    await make.click()
+    await page.waitForURL('**/apps/new/edit**')
+    const u = new URL(page.url())
+    check('……跳到新建应用，带着工作流和这一版', u.searchParams.get('workflow') === 'pf-lib' && u.searchParams.get('version') === '3',
+      u.pathname + u.search)
+    check('……进来就按这一版派生', await waitFor(page, async () => derived.length === 1)
+      && derived[0]?.workflow_id === 'pf-lib' && derived[0]?.version === 3, JSON.stringify(derived))
+  }
+})
+
+// 开了登录：发布记的是登录的人（服务端写 published_by，不看署名），不给署名框、不说「未署名」；受管级只给管理员，
+// 搭建者那一档当场置灰、写明原因，不等点了发布才被拒（V1-21、V1-22）。受管工作流的新版本不论哪一档都只有管理员能发：
+// 降成「已发布」会让此后的正式运行不再过治理门禁，和以受管级发布同一级（Q8，服务端同样拦）——搭建者两档都锁住
+await section('开了登录的搭建者：受管级置灰写原因、受管工作流两档都锁住、以登录身份发布、没有署名框', async () => {
+  const { page, state } = await open({ id: 'pf-hard' })
+  await page.route(/\/api\/auth\/me$/, (route) => route.fulfill({ status: 200, contentType: 'application/json',
+    body: JSON.stringify({ mode: 'local', username: 'lisi', display_name: '李四', role: 'builder', groups: [], verified: true }) }))
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.waitForFunction(() => window.__studio?.getState().workflow?.id === 'pf-hard', null, { timeout: 15000 })
+  await openDialog(page)
+  const governed = dialog(page).locator('[data-publish-level="governed"]')
+  const published = dialog(page).locator('[data-publish-level="published"]')
+  check('受管级置灰', await governed.isDisabled())
+  check('……卡上写明要管理员', (await governed.innerText()).includes('需要管理员'), (await governed.innerText()).replace(/\s+/g, ' '))
+  check('受管工作流：「已发布」也置灰，卡上写明降级要管理员', await published.isDisabled()
+    && (await published.innerText()).includes('降为「已发布」'), (await published.innerText()).replace(/\s+/g, ' '))
+  check('……两档都没选中', await dialog(page).locator('[role="radio"][aria-checked="true"]').count() === 0)
+  check('……发布按钮不可用，悬停写只有管理员能发布', await submit(page).isDisabled()
+    && await submit(page).getAttribute('title') === '这是受管工作流，新版本只有管理员能发布', `${await submit(page).getAttribute('title')}`)
+  check('……不出降级提示（降级不是他能选的）', await dialog(page).locator('[data-publish-downgrade]').count() === 0)
+  check('……按「已发布」先查一遍问题', state.checks[0]?.level === 'published', JSON.stringify(state.checks.map((c) => c.level)))
+  const signer = dialog(page).locator('[data-publish-signer]')
+  check('以登录身份发布：写显示名，不用本机署名', await signer.getAttribute('data-publish-signer') === 'verified'
+    && (await signer.innerText()).includes('以登录身份发布：李四（lisi）') && !(await signer.innerText()).includes('检查脚本'),
+    await signer.innerText())
+  check('没有署名框，也不说「未署名」', await dialog(page).getByRole('textbox', { name: '署名' }).count() === 0
+    && !(await dialog(page).innerText()).includes('未署名'))
+  check('没有点发布，不发请求', state.publishes.length === 0)
+})
+
+// 管理员手动把受管工作流降成「已发布」：提示将降级，点发布先确认一次，确认后才发
+await section('管理员降级受管工作流：提示、确认之后才发', async () => {
+  const { page, state } = await open({ id: 'pf-hard' })
+  await openDialog(page)
+  await dialog(page).locator('[data-publish-level="published"]').click()
+  check('点了「已发布」：提示将降级，发布按钮可用', await dialog(page).locator('[data-publish-downgrade]').count() === 1
+    && (await dialog(page).locator('[data-publish-downgrade]').innerText()).includes('将降级') && await submit(page).isEnabled())
+  const confirm = page.locator('[role="dialog"]').filter({ hasText: '降级并发布' })
+  await submit(page).click()
+  check('点发布先确认降级，确认之前不发请求', await waitFor(page, async () => await confirm.count() === 1)
+    && (await confirm.innerText()).includes('不再受治理门禁约束') && state.publishes.length === 0)
+  await confirm.getByRole('button', { name: '取消' }).click()
+  check('……取消：不发请求，发布弹窗还在', await waitFor(page, async () => await confirm.count() === 0)
+    && state.publishes.length === 0 && await submit(page).count() === 1)
+  await submit(page).click()
+  await confirm.getByRole('button', { name: '降级并发布' }).click()
+  check('……确认之后才发出一次发布，等级是「已发布」', await waitFor(page, async () => state.publishes.length === 1)
+    && state.publishes[0]?.level === 'published', JSON.stringify(state.publishes))
 })
 
 await section('360px 下不横向滚动', async () => {

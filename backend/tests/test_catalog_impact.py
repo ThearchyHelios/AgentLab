@@ -186,11 +186,12 @@ def test_graph_sql_tables_uses_the_evidence_rules():
 
 
 def test_assistant_seeds_read_tool_nodes_the_same_way():
-    """助手给全字段的「现有工作流用到的表」和发布记录、SQL 检查认的是同一种节点（sqlcheck.tool_query）。
+    """助手概览里的「现有工作流用到的表」、发布前修复和升级证据由系统代为查看的表（look 文档 D5），和发布记录、SQL
+    检查认的是同一种节点（sqlcheck.tool_query）。
 
     画布上把调用工具节点换成别的类型，配置里的 tool、args 还留着：那已经不是一条会执行的查询，不能当成用到的表。
     """
-    from app.api.copilot_context import graph_tables
+    from app.look.tables import graph_tables
 
     shop = SimpleNamespace(name="shop", schema_cache={"tables": {
         "orders": {"qualified": "orders"}, "customers": {"qualified": "customers"}, "stores": {"qualified": "stores"}}})

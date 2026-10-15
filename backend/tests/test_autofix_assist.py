@@ -168,7 +168,8 @@ async def test_questions_are_passed_on_without_changes(client, monkeypatch):
     out = await assist(client, wf)
     # 一句一条的文字，前面标上是哪个节点的事（句子里已经点了名的不重复标）
     assert out["assist"] == {"ok": False, "summary": "等你决定出具的是哪个出口", "questions": [
-        "两个出口里，哪个是要出具的？「出具」还是「原始数」？", "「周报口径卡」：required 要包括哪些指标？候选：gmv"]}
+        "两个出口里，哪个是要出具的？「出具」还是「原始数」？", "「周报口径卡」：required 要包括哪些指标？候选：gmv"],
+        "looks": []}
     assert out["rejected"] == [] and out["graph"] == two_exits()
 
 

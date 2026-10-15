@@ -67,7 +67,9 @@ async def publish(graph, *, name="口径库", versions=1, status="published", la
         session.add(wf)
         await session.flush()
         for v in range(1, versions + 1):
-            session.add(WorkflowVersion(workflow_id=wf.id, version=v, graph=later if later and v > 1 else graph))
+            # 每一版都发布过（level 记着）：口径卡固定的版本须「已发布且未退役」（D-q）
+            session.add(WorkflowVersion(workflow_id=wf.id, version=v, graph=later if later and v > 1 else graph,
+                                        level="published"))
         await session.commit()
         return wf.id
 

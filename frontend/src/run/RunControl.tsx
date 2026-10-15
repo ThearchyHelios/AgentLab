@@ -5,14 +5,16 @@ import clsx from 'clsx'
 import { api } from '../api/client'
 import { NODE_DEFS } from '../canvas/nodeDefs'
 import { hintOf } from '../canvas/shortcuts'
-import { isComposing, Kbd, Skeleton, Spinner, toast } from '../components/ui'
-import { useLocalActor } from '../lib/actor'
+import { Kbd, Skeleton, Spinner, toast } from '../components/ui'
+import { SchemaForm } from '../components/SchemaForm'
 import { errorMessage } from '../lib/errors'
 import { explainStartError } from '../lib/explain'
-import { matchShortcut } from '../lib/keys'
-import { runClassLabel } from '../lib/terms'
+import { SIGNER_TEXT, runClassLabel } from '../lib/terms'
+import { useSigner } from '../store/auth'
 import { useStudio, type FlowNode } from '../store/studio'
 import type { ValidationIssue, WorkflowVersion } from '../types'
+import type { FormSchema } from '../typesApp'
+import { inputPayload, inputSchemaOf, type InputField } from './inputSchema'
 import { ClassDot, escapeRun, RunCapsule } from './RunHud'
 import { isActivePhase } from './trace'
 
@@ -51,72 +53,30 @@ function startFailed(e: unknown, navigate: (to: string) => void) {
  *   错误、未保存改动都无关（改了只提示「不含画布改动」），表单字段取那一版的。
  */
 
-type Field = { name: string; required?: boolean; description?: string; default?: unknown; example?: unknown }
-
-/** 已发布版本的入口字段，按 (工作流, 版本) 缓存：发布之后那一版就不会再变 */
-const versionFields = new Map<string, Field[]>()
-
-function fieldsOfGraph(graph: WorkflowVersion['graph']): Field[] {
+function fieldsOfGraph(graph: WorkflowVersion['graph']): InputField[] {
   const entry = graph?.nodes?.find((n) => n.type === 'input')
-  return ((entry?.data?.config?.fields ?? []) as Field[]).filter((f) => f?.name)
+  return ((entry?.data?.config?.fields ?? []) as InputField[]).filter((f) => f?.name)
 }
 
-const shown = (v: unknown): string => (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v))
+/** 已发布版本的发起表单，按 (工作流, 版本) 缓存：发布之后那一版就不会再变 */
+const versionForms = new Map<string, FormSchema>()
 
-function payloadOf(fields: Field[], values: Record<string, string>): Record<string, any> {
-  const payload: Record<string, any> = {}
-  for (const field of fields) {
-    // 留空就用默认值。占位符里写着「默认：…」，照它说的办
-    const typed = values[field.name]
-    const raw = typed != null && typed.trim() !== '' ? typed : field.default ?? ''
-    // 看起来像 JSON 就按 JSON 传，让数组/对象类型的输入能用
-    if (typeof raw === 'string' && /^\s*[[{]/.test(raw)) {
-      try { payload[field.name] = JSON.parse(raw) } catch { payload[field.name] = raw }
-    } else {
-      payload[field.name] = raw
-    }
-  }
-  return payload
-}
-
-function FieldsForm({ fields, values, onChange, onSubmit }: {
-  fields: Field[]
-  values: Record<string, string>
-  onChange: (v: Record<string, string>) => void
+/**
+ * 发起表单。X2：发起表单、人工节点、待办、应用入口共用一个表单渲染器（SchemaForm）——以前这里每个字段都是一个
+ * 文本框，入口字段声明了类型、可选值也看不出来。Mod+Enter 直接发起
+ */
+function LaunchForm({ schema, values, onChange, onSubmit, idPrefix }: {
+  schema: FormSchema
+  values: Record<string, unknown>
+  onChange: (v: Record<string, unknown>) => void
   onSubmit: () => void
+  idPrefix: string
 }) {
+  if (!Object.keys(schema.properties).length) return null
   return (
-    <>
-      {fields.map((field, i) => (
-        <div key={field.name} className="mb-2.5">
-          <label className="label" htmlFor={`run-field-${field.name}`}>
-            {field.name}
-            {field.required && <span className="ml-1 text-[var(--err)]" aria-label="必填">*</span>}
-            {field.description && (
-              <span className="ml-1.5 font-normal text-faint">{field.description}</span>
-            )}
-          </label>
-          <textarea
-            id={`run-field-${field.name}`}
-            className="field"
-            rows={2}
-            autoFocus={i === 0}
-            value={values[field.name] ?? ''}
-            // 占位符不复用 description（标签旁已经写着）：有默认值说默认值，有示例给示例，都没有就空着
-            placeholder={field.default != null && shown(field.default) !== ''
-              ? `默认：${shown(field.default)}`
-              : field.example != null ? `例如：${shown(field.example)}` : ''}
-            onChange={(e) => onChange({ ...values, [field.name]: e.target.value })}
-            onKeyDown={(e) => {
-              if (!isComposing(e) && matchShortcut(e.nativeEvent, 'Mod+Enter')) {
-                e.preventDefault()
-                onSubmit()
-              }
-            }}
-          />
-        </div>
-      ))}
-    </>
+    <div className="mb-1" data-launch-form="">
+      <SchemaForm schema={schema} value={values} onChange={onChange} onSubmit={onSubmit} idPrefix={idPrefix} />
+    </div>
   )
 }
 
@@ -160,15 +120,18 @@ function ExploreLauncher({ tight }: { tight: boolean }) {
   const issues = useStudio((s) => s.issues)
   const startRun = useStudio((s) => s.startRun)
   const [open, setOpen] = useState(false)
-  const [values, setValues] = useState<Record<string, string>>({})
+  const [values, setValues] = useState<Record<string, unknown>>({})
   const [busy, setBusy] = useState(false)
   const wrap = useRef<HTMLDivElement>(null)
   useDismiss(open, () => setOpen(false), wrap)
 
-  const fields = useMemo(() => {
+  // 画布上的入口字段按和服务端同一套规则转成表单（run/inputSchema）：试运行的是画布，不是已发布版本
+  const entryFields = useMemo(() => {
     const entry = nodes.find((n) => n.data.nodeType === 'input')
-    return ((entry?.data.config?.fields ?? []) as Field[]).filter((f) => f?.name)
+    return ((entry?.data.config?.fields ?? []) as InputField[]).filter((f) => f?.name)
   }, [nodes])
+  const schema = useMemo(() => inputSchemaOf(entryFields), [entryFields])
+  const fields = entryFields
   const errors = issues.filter((i) => i.level === 'error')
   const blocked = !!errors.length || !nodes.length
 
@@ -176,7 +139,7 @@ function ExploreLauncher({ tight }: { tight: boolean }) {
   const launch = async () => {
     setBusy(true)
     try {
-      await startRun(payloadOf(fields, values))
+      await startRun(inputPayload(schema, values))
       setOpen(false)
     } catch (e) {
       startFailed(e, navigate)
@@ -217,7 +180,7 @@ function ExploreLauncher({ tight }: { tight: boolean }) {
             <span>{runClassLabel('exploratory')}</span>
             <span className="sf-dim">· 使用画布当前内容，结果不归档</span>
           </div>
-          <FieldsForm fields={fields} values={values} onChange={setValues} onSubmit={() => void launch()} />
+          <LaunchForm schema={schema} values={values} onChange={setValues} onSubmit={() => void launch()} idPrefix="run-explore" />
           <button type="button" className="btn btn-primary w-full justify-center" disabled={busy}
                   onClick={() => void launch()}>
             {busy ? <Spinner size={11} /> : <Play size={11} fill="currentColor" />} {runClassLabel('exploratory')}
@@ -243,35 +206,37 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
   const dirty = useStudio((s) => s.dirty)
   const canvasVersion = useStudio((s) => s.workflow?.version)
   const startFormalRun = useStudio((s) => s.startFormalRun)
-  // 正式运行记在署名下（请求头 X-Actor）：和发布、审批一样写明以谁的名义
-  const actor = useLocalActor()
+  // 正式运行记在谁的名下：开了登录是登录的人（服务端不看署名），关登录是本机署名（请求头 X-Actor）。和发布、审批一样写明
+  const signer = useSigner()
   const key = `${workflowId}@${version}`
   const [open, setOpen] = useState(false)
-  const [fields, setFields] = useState<Field[] | null>(versionFields.get(key) ?? null)
+  const [schema, setSchema] = useState<FormSchema | null>(versionForms.get(key) ?? null)
   const [loadError, setLoadError] = useState<unknown>(null)
-  const [values, setValues] = useState<Record<string, string>>({})
+  const [values, setValues] = useState<Record<string, unknown>>({})
   const [busy, setBusy] = useState(false)
   const wrap = useRef<HTMLDivElement>(null)
   useDismiss(open, () => setOpen(false), wrap)
 
   useEffect(() => {
-    setFields(versionFields.get(key) ?? null)
+    setSchema(versionForms.get(key) ?? null)
     setValues({})
   }, [key])
 
   useEffect(() => {
-    if (!open || versionFields.has(key)) return
+    if (!open || versionForms.has(key)) return
     let alive = true
     setLoadError(null)
     api.workflows.version(workflowId, version)
       .then((v) => {
-        const list = (v.input_fields?.length ? v.input_fields : fieldsOfGraph(v.graph)) as Field[]
-        versionFields.set(key, list)
-        if (alive) setFields(list)
+        // 服务端按版本快照转好的表单（input_schema）为准；老服务端没有，按这一版的入口字段同规则转
+        const form = v.input_schema ?? inputSchemaOf((v.input_fields?.length ? v.input_fields : fieldsOfGraph(v.graph)) as InputField[])
+        versionForms.set(key, form)
+        if (alive) setSchema(form)
       })
       .catch((e) => { if (alive) setLoadError(e) })
     return () => { alive = false }
   }, [open, key, workflowId, version])
+  const fields = schema ? Object.keys(schema.properties) : null
 
   // 画布和已发布版本不是同一份：有未保存的改动，或者保存过但没重新发布
   const ahead = dirty || (canvasVersion != null && canvasVersion !== version)
@@ -281,7 +246,7 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
   const launch = async () => {
     setBusy(true)
     try {
-      await startFormalRun(payloadOf(fields ?? [], values))
+      await startFormalRun(schema ? inputPayload(schema, values) : {})
       setOpen(false)
     } catch (e) {
       startFailed(e, navigate)
@@ -333,12 +298,14 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
           {fields && !fields.length && (
             <div className="mb-2.5 text-2xs text-faint">v{version} 没有输入字段，将直接运行</div>
           )}
-          {fields && (
-            <FieldsForm fields={fields} values={values} onChange={setValues} onSubmit={() => void launch()} />
+          {schema && (
+            <LaunchForm schema={schema} values={values} onChange={setValues} onSubmit={() => void launch()} idPrefix="run-formal" />
           )}
-          {actor ? (
+          {signer.verified ? (
+            <div className="sf-pop-sign" data-signer="verified">{SIGNER_TEXT.launchAs(signer.name)}</div>
+          ) : signer.name ? (
             <div className="sf-pop-sign" data-signer="signed">
-              将以「<b>{actor}</b>」的名义发起，并记入运行记录
+              将以「<b>{signer.name}</b>」的名义发起，并记入运行记录
             </div>
           ) : (
             <div className="sf-pop-sign is-unsigned" data-signer="unsigned">
@@ -346,7 +313,7 @@ function FormalLauncher({ workflowId, version }: { workflowId: string; version: 
             </div>
           )}
           <button type="button" className="btn w-full justify-center sf-formal-go"
-                  disabled={busy || fields == null} onClick={() => void launch()}>
+                  disabled={busy || schema == null} onClick={() => void launch()}>
             {busy ? <Spinner size={11} /> : <ClassDot formal />} {label}
           </button>
           {!!fields?.length && (

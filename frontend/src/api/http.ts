@@ -39,11 +39,17 @@ export class ApiError extends Error {
    * 交叉表）。原样保留，按接口各自校验后再用（上传表格见 uploadDecision）
    */
   decision?: unknown
+  /**
+   * 错误响应的原样 JSON：detail、code 之外服务端另带的键在这里——表单校验没过（应用入口、待办回复的 422）的
+   * errors: [{path, code, message}]（lib/schemaForm 的 formErrorsOf 按 path 挂到字段下面），没登录（401）的 mode
+   */
+  body?: unknown
 
   constructor(
     public status: number,
     message: string,
-    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string; field?: string; decision?: unknown },
+    opts?: { kind?: ApiErrorKind; detail?: unknown; raw?: string; timeoutMs?: number; code?: string; field?: string; decision?: unknown
+      body?: unknown },
   ) {
     super(message)
     this.name = 'ApiError'
@@ -54,6 +60,7 @@ export class ApiError extends Error {
     this.code = opts?.code
     this.field = opts?.field
     this.decision = opts?.decision
+    this.body = opts?.body
   }
 }
 
@@ -75,11 +82,31 @@ export function report(reachable: boolean, error?: ApiError) {
   }
 }
 
+/**
+ * 开了登录时，服务端要求非 GET 请求带这个头（再加 Origin 校验）防跨站请求：别的站点的表单和简单请求带不上自定义头。
+ * 每个请求都带上，比按方法挑更不容易漏——流式接口、上传、延迟删除都从 actorHeader 取头
+ */
+export const REQUEST_HEADER = { 'X-AgentLab-Request': '1' }
+
 export function actorHeader(): Record<string, string> {
   const actor = localActor()
   // 请求头只能是 Latin-1：中文署名原样放进去，fetch 直接抛错、整个请求发不出去。
-  // 后端 runs.actor_of 解码，纯 ASCII 的老署名编码前后一样
-  return actor ? { 'X-Actor': encodeURIComponent(actor) } : {}
+  // 后端 runs.actor_of 解码，纯 ASCII 的老署名编码前后一样。开了登录时服务端不看 X-Actor，带着无妨
+  return actor ? { ...REQUEST_HEADER, 'X-Actor': encodeURIComponent(actor) } : { ...REQUEST_HEADER }
+}
+
+/**
+ * 开了登录、会话没了（过期、被注销）：服务端回 401，整页跳到登录页，登录后回到原处。整页跳而不是路由跳：
+ * 外壳里各个 store 拿的都是上一个人的数据，重新加载一遍最干净。登录接口自己的 401（密码不对）和登录页上的请求不跳。
+ * 认人接口（/auth/me）的 401 也不跳：它是「还没登录」的回答，外壳拿到后自己去登录页（App 启动时）——在这里再整页跳一次，
+ * 登录页加载起来又认一遍人，同一次进门要请求好几次
+ */
+function toLogin(path?: string) {
+  if (typeof window === 'undefined' || path === '/auth/login' || path === '/auth/me') return
+  const { pathname, search } = window.location
+  if (pathname === '/login') return
+  const back = `${pathname}${search}`
+  window.location.assign(back && back !== '/' ? `/login?next=${encodeURIComponent(back)}` : '/login')
 }
 
 /**
@@ -203,11 +230,13 @@ export function failure(status: number, statusText: string, text: string, path?:
     return err
   }
   report(true)
+  if (status === 401) toLogin(path)
   if (isJson) {
     const detail = body?.detail ?? body
     return new ApiError(status, describeDetail(detail, path), {
       detail, raw: typeof body?.raw === 'string' ? body.raw : `${status} ${text.slice(0, 2000)}`,
       code: codeOf(body), field: fieldOf(body), decision: decisionOf(body),
+      body,
     })
   }
   const message = status >= 500

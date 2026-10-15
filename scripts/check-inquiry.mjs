@@ -79,7 +79,7 @@ async function open(syn, { width = 1100, height = 900, theme = 'dark', setup, ws
   const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: theme, timezoneId: 'Asia/Shanghai' })
   ctx.setDefaultTimeout(6000)
   const page = await ctx.newPage()
-  const hits = { lists: [], asks: [], snapshots: [], artifacts: [], segments: [], approvals: [], writes: [], other: [] }
+  const hits = { lists: [], asks: [], snapshots: [], artifacts: [], segments: [], approvals: [], writes: [], responds: [], tasks: [], other: [] }
   const state = {
     lists: { [RUNS.approve]: fx.items, [RUNS.formal]: fx.items, [RUNS.explore]: fx.explore_items },
     reply: (body) => ({ status: 200, json: answerFor(body) }),
@@ -108,10 +108,23 @@ async function open(syn, { width = 1100, height = 900, theme = 'dark', setup, ws
       const out = typeof state.reply === 'function' ? state.reply(body) : state.reply
       return route.fulfill({ status: out.status, json: out.json })
     }
+    // 审批卡的内容在待办卡里（应用平台 X4）：批准、驳回走 /api/tasks/{id}/respond。预览给合成审批带上了待办
+    // （task-<审批 id>，frontend/src/dev/taskOf.ts），这里只记下请求体、回一条凑齐了的待办，不算「写请求」
+    const respond = path.match(/^\/api\/tasks\/([^/]+)\/respond$/)
+    if (respond && method === 'POST') {
+      hits.responds.push({ task: decodeURIComponent(respond[1]), body: JSON.parse(req.postData() ?? '{}') })
+      return route.fulfill({ json: { task: { id: decodeURIComponent(respond[1]), status: 'resolved' }, resolved: true } })
+    }
     if (method !== 'GET') {
       hits.writes.push(`${method} ${path}`)
       return route.abort()
     }
+    // 审批带着待办，审批卡不该再按运行去取待办列表
+    if (path === '/api/tasks') {
+      hits.tasks.push(url.search)
+      return route.fulfill({ json: { items: [] } })
+    }
+    if (path === '/api/tasks/count') return route.fulfill({ json: { mine: 0, apps: 0, other: 0 } })
     if (inq) {
       const run = decodeURIComponent(inq[1])
       hits.lists.push({ run, report: url.searchParams.get('report'), unit: url.searchParams.get('unit') })
@@ -1541,6 +1554,22 @@ await section('窄屏与深浅色', async () => {
     check(`390px 工件页签（${theme}）：页面没有报错`, errors.length === 0, errors.join('；'))
     await ctx.close()
   }
+})
+
+await section('审批卡的批准走待办回复：/api/tasks/{id}/respond，不按运行取待办列表', async () => {
+  const { ctx, page, hits, errors } = await open('inquiry-approval', {
+    setup: (s) => { s.approvals[RUNS.approve] = [approvalRow(fx.approval_id, RUNS.approve, fx.reports.approve.doc_artifact)] },
+  })
+  await approve(page).waitFor()
+  check('审批带着待办：卡片画出来，没有按运行去取待办列表', hits.tasks.length === 0, hits.tasks.join('、'))
+  await approve(page).click()
+  await page.waitForTimeout(300)
+  const sent = hits.responds
+  check('批准：只发一次待办回复，按审批对应的待办', sent.length === 1 && sent[0].task === `task-${fx.approval_id}`, JSON.stringify(sent))
+  check('……决定是批准', sent[0]?.body?.decision === 'approve', JSON.stringify(sent[0]?.body))
+  check('……不再走老的审批回复接口', !hits.writes.some((w) => /\/api\/approvals\/[^/]+\/decide$|\/resume$/.test(w)), hits.writes.join('、'))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+  await ctx.close()
 })
 
 await browser.close()

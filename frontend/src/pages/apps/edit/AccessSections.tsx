@@ -1,0 +1,389 @@
+import { useCallback, useEffect, useState } from 'react'
+import { KeyRound, Plus } from 'lucide-react'
+import { api } from '../../../api/client'
+import type { AppHookRow } from '../../../typesApp'
+import {
+  CopyButton, DeleteButton, EmptyState, ErrorState, Field, SectionBar, Skeleton, Spinner, confirmDialog, toast,
+} from '../../../components/ui'
+import { PrincipalPicker, type Principal as Picked } from '../../../components/PrincipalPicker'
+import { APP_EDITOR_TEXT as T, GRANT_ROLE_HINT, GRANT_ROLE_LABEL, NOTIFY_TEXT } from '../../../lib/terms'
+import { useLoginOn } from '../../../store/auth'
+import type { AppGrant, GrantRole, NotifyChannelRow } from '../../../typesApp'
+import { applyAppOp } from './appOps'
+import { useEditor } from './context'
+
+/*
+ * 岗位与授权、钩子、通知订阅。
+ *
+ * 岗位：图里人工节点写的岗位名（assignee 的岗位）在这里绑定到人或组；绑定不进 spec，存在草稿的 bindings 里，发布时
+ * 进应用版本——spec 可以导出，绑定是这一个部署自己的。人员变动只改组成员，不发新版本。
+ * 授权：use / observe / manage，即时生效、写审计，不需要发新版本（A1）。关登录时所有人都是管理员，授权开登录后才生效
+ */
+
+const ROLES: GrantRole[] = ['use', 'observe', 'manage']
+
+export function AccessSection() {
+  const { draft, setDraft, bindings, setBindings } = useEditor()
+  const [adding, setAdding] = useState('')
+  const slots = Object.entries(draft.slots)
+
+  const addSlot = () => {
+    const name = adding.trim()
+    if (!name || name in draft.slots) return
+    setDraft((s) => applyAppOp(s, { op: 'app_set', path: 'slots', key: name, value: { label: name } }))
+    setAdding('')
+  }
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-8 p-4" data-app-access="">
+      <section data-app-slots={slots.length}>
+        <SectionBar title={T.slots} hint={T.slotsHint} />
+        {!slots.length && <p className="mb-2 text-2xs text-faint">—</p>}
+        <div className="space-y-2">
+          {slots.map(([name, slot]) => {
+            const bound = bindings.slots?.[name] ?? []
+            return (
+              <div key={name} className="space-y-1.5 rounded-lg border bg-panel px-3 py-2" data-app-slot={name}>
+                <div className="flex items-end gap-2">
+                  <div className="mono w-36 shrink-0 pb-1.5 text-xs">{name}</div>
+                  <Field label={T.slotLabel} className="min-w-0 flex-1">
+                    {(p) => <input {...p} className="field" value={slot.label}
+                                   onChange={(e) => setDraft((s) => applyAppOp(s, { op: 'app_set', path: 'slots', key: name, value: { label: e.target.value } }))} />}
+                  </Field>
+                  <DeleteButton label={T.slotRemove(name)} onClick={() => {
+                    setDraft((s) => applyAppOp(s, { op: 'app_set', path: 'slots', key: name, value: null }))
+                    setBindings((b) => { const next = { ...b.slots }; delete next[name]; return { ...b, slots: next } })
+                  }} />
+                </div>
+                <PrincipalPicker label={T.slots} value={bound as Picked[]}
+                                 onChange={(v) => setBindings((b) => ({
+                                   ...b, slots: { ...b.slots, [name]: v.filter((x) => x.kind !== 'everyone') as { kind: 'user' | 'group'; name: string }[] },
+                                 }))} />
+                {!bound.length && <p className="text-2xs" style={{ color: 'var(--st-waiting)' }}>{T.slotUnbound}</p>}
+              </div>
+            )
+          })}
+        </div>
+        <div className="mt-2 flex gap-2">
+          <input className="field mono w-48 text-xs" value={adding} placeholder={T.slotName} aria-label={T.slotName}
+                 onChange={(e) => setAdding(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addSlot() }} />
+          <button type="button" className="btn btn-sm" disabled={!adding.trim()} onClick={addSlot}><Plus size={11} aria-hidden /> {T.slotAdd}</button>
+        </div>
+      </section>
+      <Grants />
+    </div>
+  )
+}
+
+function Grants() {
+  const { appId } = useEditor()
+  const loginOn = useLoginOn()
+  const [items, setItems] = useState<AppGrant[] | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [dirty, setDirty] = useState(false)
+  const load = useCallback(() => {
+    api.apps.grants(appId).then(({ items: list }) => { setItems(list); setDirty(false) }).catch(() => setItems([]))
+  }, [appId])
+  useEffect(load, [load])
+  const save = async () => {
+    if (!items) return
+    setBusy(true)
+    try {
+      const { items: saved } = await api.apps.setGrants(appId, items)
+      setItems(saved)
+      setDirty(false)
+      toast.ok(T.grantsSaved)
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <section data-app-grants={items?.length ?? ''}>
+      <SectionBar title={T.grants} hint={loginOn ? T.grantsHint : T.grantsOff}>
+        <button type="button" className="btn btn-sm btn-primary" disabled={!dirty || busy} onClick={() => void save()}>
+          {busy ? <Spinner size={11} /> : null} {T.grantsSave}
+        </button>
+      </SectionBar>
+      {!items ? <Skeleton rows={3} /> : (
+        <div className="space-y-3">
+          {ROLES.map((role) => (
+            // 每一档写明叫什么、管什么：三行选择器长得一样，不写就分不出哪一行是哪一档
+            <div key={role} className="rounded-lg border bg-panel px-3 py-2" data-app-grant-role={role}>
+              <div className="mb-1.5">
+                <div className="text-xs font-medium" data-app-grant-title="">{GRANT_ROLE_LABEL[role]}</div>
+                <p className="mt-0.5 text-2xs leading-relaxed text-faint">{GRANT_ROLE_HINT[role]}</p>
+              </div>
+              <PrincipalPicker label={GRANT_ROLE_LABEL[role]} allowEveryone={role !== 'manage'}
+                               value={items.filter((g) => g.role === role).map((g) => ({ kind: g.principal_kind, name: g.principal }))}
+                               onChange={(v) => {
+                                 setItems((cur) => [...(cur ?? []).filter((g) => g.role !== role),
+                                   ...v.map((p) => ({ principal_kind: p.kind, principal: p.name, role }))])
+                                 setDirty(true)
+                               }} />
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
+/*
+ * 钩子（D-g）：按名字关联。spec.hooks 声明 {name, kind, entry}（进草稿、随应用版本发布）；密钥按 (应用, 名字) 存在服务端，
+ * 只在「生成 / 轮换」时交回一次，这里显示一次、附复制按钮，离开这一节就不再有。入站请求到来时服务端按当前发布版里这个
+ * 名字的种类和入口处理：发布版里没声明、停用了的一律拒收——所以每一行照实标出「发布版里有没有」「生成过密钥没有」。
+ * 改了名字就是另一个钩子：旧名字的密钥行留在下面「草稿里没有声明」那一组，可以删掉
+ */
+export function HooksSection() {
+  const { appId, draft, setDraft, dirty, save } = useEditor()
+  const [rows, setRows] = useState<AppHookRow[] | null>(null)
+  const [loadError, setLoadError] = useState<unknown>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [shown, setShown] = useState<{ name: string; secret: string; path: string | null } | null>(null)
+  const load = useCallback(() => {
+    api.apps.hooks(appId).then((list) => { setRows(list); setLoadError(null) }).catch(setLoadError)
+  }, [appId])
+  useEffect(load, [load])
+
+  const set = (hooks: typeof draft.hooks) => setDraft((s) => ({ ...s, hooks }))
+  const stateOf = (name: string) => rows?.find((r) => r.name === name)
+  const undeclared = (rows ?? []).filter((r) => r.has_secret && !draft.hooks.some((h) => h.name === r.name))
+  const names = draft.hooks.map((h) => h.name.trim())
+  const dup = (name: string) => names.filter((n) => n === name.trim()).length > 1
+
+  /** 生成或轮换：服务端按保存过的草稿认这个名字，有未保存的修改先存 */
+  const rotate = async (name: string) => {
+    const cur = stateOf(name)
+    if (cur?.has_secret && !(await confirmDialog({
+      title: T.hookRotateTitle(name), body: T.hookRotateBody, confirmLabel: T.hookRotateConfirm, danger: true,
+    }))) return
+    setBusy(name)
+    try {
+      if (dirty && !(await save())) return
+      const row = await api.apps.rotateHook(appId, name)
+      const id = row.id ?? cur?.id ?? null
+      if (row.secret) setShown({ name, secret: row.secret, path: row.url_path ?? (id ? `/api/hooks/${encodeURIComponent(id)}` : null) })
+      toast.ok(T.hookRotated(name))
+      load()
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setBusy(null)
+    }
+  }
+  const toggle = async (name: string, enabled: boolean) => {
+    setBusy(name)
+    try {
+      await api.apps.setHookEnabled(appId, name, enabled)
+      load()
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setBusy(null)
+    }
+  }
+  const removeKey = async (name: string) => {
+    if (!(await confirmDialog({ title: T.hookDeleteTitle(name), body: T.hookDeleteBody, confirmLabel: T.hookDeleteKey, danger: true }))) return
+    setBusy(name)
+    try {
+      await api.apps.deleteHook(appId, name)
+      if (shown?.name === name) setShown(null)
+      toast.ok(T.hookDeleted(name))
+      load()
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const status = (name: string, declared: boolean) => (
+    <HookStatus name={name} state={stateOf(name)} declared={declared} busy={busy === name} loaded={!!rows}
+                onRotate={() => void rotate(name)} onToggle={(v) => void toggle(name, v)} onRemove={() => void removeKey(name)} />
+  )
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-4 p-4" data-app-hooks={draft.hooks.length}>
+      <SectionBar title={T.sections.hooks} hint={T.hooksHint}>
+        <button type="button" className="btn btn-sm" data-app-hook-add=""
+                onClick={() => set([...draft.hooks, { name: `hook${draft.hooks.length + 1}`, kind: 'signal', entry: null }])}>
+          <Plus size={11} aria-hidden /> {T.hookAdd}
+        </button>
+      </SectionBar>
+      {shown && <SecretOnce shown={shown} onDismiss={() => setShown(null)} />}
+      {loadError ? <ErrorState compact error={loadError} onRetry={load} /> : null}
+      {!draft.hooks.length && !undeclared.length ? <EmptyState title={T.hooksEmpty} /> : (
+        <div className="space-y-2">
+          {draft.hooks.map((h, i) => (
+            <div key={i} className="space-y-1.5 rounded-lg border bg-panel px-3 py-2" data-app-hook={h.name}>
+              <div className="grid grid-cols-[1fr_140px_1fr_auto] items-end gap-2">
+                <Field label={T.hookName} error={h.name.trim() && dup(h.name) ? T.hookDuplicate(h.name.trim()) : undefined}>
+                  {(p) => <input {...p} className="field mono text-xs" value={h.name}
+                                 onChange={(e) => set(draft.hooks.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)))} />}
+                </Field>
+                <Field label={T.hookKind}>
+                  {(p) => (
+                    <select {...p} className="field" value={h.kind}
+                            onChange={(e) => set(draft.hooks.map((x, j) => (j === i ? { ...x, kind: e.target.value as 'start' | 'signal' } : x)))}>
+                      {Object.entries(T.hookKinds).map(([k, label]) => <option key={k} value={k}>{label}</option>)}
+                    </select>
+                  )}
+                </Field>
+                {h.kind === 'start' ? (
+                  <Field label={T.hookEntry}>
+                    {(p) => (
+                      <select {...p} className="field" value={h.entry ?? ''}
+                              onChange={(e) => set(draft.hooks.map((x, j) => (j === i ? { ...x, entry: e.target.value || null } : x)))}>
+                        <option value="">—</option>
+                        {draft.entries.map((en) => <option key={en.id} value={en.id}>{en.label || en.id}</option>)}
+                      </select>
+                    )}
+                  </Field>
+                ) : <div />}
+                <DeleteButton label={T.hookRemove(h.name)} onClick={() => set(draft.hooks.filter((_, j) => j !== i))} />
+              </div>
+              {h.name.trim() && !dup(h.name) && status(h.name.trim(), true)}
+            </div>
+          ))}
+          {undeclared.map((r) => (
+            <div key={r.name} className="space-y-1.5 rounded-lg border border-dashed px-3 py-2" data-app-hook={r.name}
+                 data-app-hook-undeclared="">
+              <div className="flex items-center gap-2 text-xs">
+                <span className="mono font-medium">{r.name}</span>
+                {r.kind && <span className="chip">{T.hookKinds[r.kind]}</span>}
+              </div>
+              {status(r.name, false)}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 一行钩子的服务端状态：发布版里有没有、生成过密钥没有、启用；生成 / 轮换、删除密钥 */
+function HookStatus({ name, state, declared, busy, loaded, onRotate, onToggle, onRemove }: {
+  name: string
+  state: AppHookRow | undefined
+  declared: boolean
+  busy: boolean
+  loaded: boolean
+  onRotate: () => void
+  onToggle: (enabled: boolean) => void
+  onRemove: () => void
+}) {
+  if (!loaded) return null
+  const has = !!state?.has_secret
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs" data-app-hook-state={has ? 'secret' : 'none'}
+         data-app-hook-published={state?.in_published ? '1' : '0'}>
+      <span className="chip" style={has ? { color: 'var(--ok)', borderColor: 'var(--ok)' } : undefined}>
+        {has ? T.hookSecretSet : T.hookSecretNone}
+      </span>
+      {!declared
+        ? <span style={{ color: 'var(--st-waiting)' }}>{T.hookNotDeclared}</span>
+        : state?.in_published ? <span className="text-faint">{T.hookPublished}</span>
+        : <span style={{ color: 'var(--st-waiting)' }}>{T.hookNotPublished}</span>}
+      <span className="flex-1" />
+      {has && (
+        <label className="flex items-center gap-1" title={T.hookEnabledHint}>
+          <input type="checkbox" className="accent-[var(--accent)]" checked={state!.enabled} disabled={busy}
+                 onChange={(e) => onToggle(e.target.checked)} data-app-hook-enabled="" />
+          {T.hookEnabled}
+        </label>
+      )}
+      {declared && (
+        <button type="button" className="btn btn-xs" disabled={busy} onClick={onRotate} data-app-hook-rotate={name}>
+          {busy ? <Spinner size={10} /> : <KeyRound size={10} aria-hidden />} {has ? T.hookRotate : T.hookGenerate}
+        </button>
+      )}
+      {has && (
+        <button type="button" className="btn btn-xs btn-ghost" disabled={busy} onClick={onRemove} data-app-hook-delete={name}>
+          {T.hookDeleteKey}
+        </button>
+      )}
+    </div>
+  )
+}
+
+/** 刚生成、轮换的密钥：只显示这一次，附复制按钮和入站地址；关掉、离开这一节就没有了 */
+function SecretOnce({ shown, onDismiss }: { shown: { name: string; secret: string; path: string | null }; onDismiss: () => void }) {
+  const url = shown.path ? `${window.location.origin}${shown.path}` : null
+  return (
+    <div className="space-y-2 rounded-lg border px-3 py-2.5" style={{ borderColor: 'var(--st-waiting)' }} role="status"
+         data-app-hook-secret={shown.name}>
+      <div className="flex items-center gap-1.5 text-xs font-semibold">
+        <KeyRound size={12} aria-hidden /> {T.hookSecretTitle(shown.name)}
+      </div>
+      <p className="text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }}>{T.hookSecretOnce}</p>
+      <div className="flex items-center gap-2">
+        <code className="mono min-w-0 flex-1 break-all rounded border bg-bg px-2 py-1 text-2xs" data-app-hook-secret-value="">
+          {shown.secret}
+        </code>
+        <CopyButton text={shown.secret} />
+      </div>
+      {url && (
+        <div className="flex items-center gap-2 text-2xs">
+          <span className="shrink-0 text-faint">{T.hookUrl}</span>
+          <code className="mono min-w-0 flex-1 break-all" data-app-hook-url="">{url}</code>
+          <CopyButton text={url} />
+        </div>
+      )}
+      <p className="text-2xs text-faint">{T.hookSigning}</p>
+      <div className="flex justify-end">
+        <button type="button" className="btn btn-sm" onClick={onDismiss} data-app-hook-secret-dismiss="">{T.hookSecretDismiss}</button>
+      </div>
+    </div>
+  )
+}
+
+export function NotifySection() {
+  const { draft, setDraft } = useEditor()
+  const [channels, setChannels] = useState<NotifyChannelRow[] | null>(null)
+  useEffect(() => { api.notify.channels().then(({ items }) => setChannels(items)).catch(() => setChannels([])) }, [])
+  const set = (notify: typeof draft.notify) => setDraft((s) => ({ ...s, notify }))
+  const events = Object.keys(NOTIFY_TEXT.eventLabel)
+  return (
+    <div className="mx-auto max-w-3xl p-4" data-app-notify={draft.notify.length}>
+      <SectionBar title={T.sections.notify} hint={T.notifyHint}>
+        <button type="button" className="btn btn-sm" disabled={!channels?.length}
+                onClick={() => set([...draft.notify, { channel: channels![0].id, events: ['task.opened', 'action.unknown'] }])}>
+          <Plus size={11} aria-hidden /> {T.notifyAdd}
+        </button>
+      </SectionBar>
+      {!channels ? <Skeleton rows={2} /> : !draft.notify.length ? <EmptyState title={T.notifyEmpty} body={NOTIFY_TEXT.emptyBody} /> : (
+        <div className="space-y-2">
+          {draft.notify.map((n, i) => (
+            <div key={i} className="space-y-1.5 rounded-lg border bg-panel px-3 py-2" data-app-notify-sub={n.channel}>
+              <div className="flex items-end gap-2">
+                <Field label={T.notifyChannel} className="min-w-0 flex-1"
+                       error={channels.some((c) => c.id === n.channel) ? undefined : T.notifyChannelMissing}>
+                  {(p) => (
+                    <select {...p} className="field" value={n.channel}
+                            onChange={(e) => set(draft.notify.map((x, j) => (j === i ? { ...x, channel: e.target.value } : x)))}>
+                      {channels.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                      {!channels.some((c) => c.id === n.channel) && <option value={n.channel} disabled>{n.channel}</option>}
+                    </select>
+                  )}
+                </Field>
+                <DeleteButton label={T.notifyRemove} onClick={() => set(draft.notify.filter((_, j) => j !== i))} />
+              </div>
+              <div className="grid grid-cols-3 gap-1">
+                {events.map((ev) => (
+                  <label key={ev} className="flex items-center gap-1.5 text-xs">
+                    <input type="checkbox" className="accent-[var(--accent)]" checked={n.events.includes(ev)}
+                           onChange={(e) => set(draft.notify.map((x, j) => (j === i
+                             ? { ...x, events: e.target.checked ? [...x.events, ev] : x.events.filter((y) => y !== ev) } : x)))} />
+                    {NOTIFY_TEXT.eventLabel[ev]}
+                  </label>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}

@@ -16,6 +16,7 @@ from app.engine.nodes import (
 )
 from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges, innermost_loops
 from app.engine.state import GraphState
+from app.process.actions import ActionPending
 
 NodeRunner = Callable[[GraphState, NodeContext], Awaitable[dict[str, Any]]]
 
@@ -133,6 +134,10 @@ def _wrap(
             except GraphBubbleUp:
                 # interrupt() / Command 靠异常向上传递控制流，不是执行失败：
                 # 必须原样放行，否则人工介入会被当成节点报错吞掉。
+                raise
+            except ActionPending:
+                # 写外部系统的结果未知（app/process/actions.py）也不是执行失败：不重试（重试也只会再挂起一次）、
+                # 不被 on_error=continue 当成失败往下走，原样交给 runner 收成挂起
                 raise
             except asyncio.CancelledError:
                 raise

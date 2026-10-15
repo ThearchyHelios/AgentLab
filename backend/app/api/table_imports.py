@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
 from app.api.datasources import _NAME_PATTERN, _out, read_upload
-from app.api.runs import actor_of
+from app.api.deps import current_principal, signer_of
 from app.data import recipe_imports, table_versions
 from app.data.recipe_imports import EditRequest, ImportRefused
 from app.data.recipe_types import Acceptance, AiAvailability, PeriodInput, Recipe, Selection
@@ -53,11 +53,13 @@ def _refused(e: Exception) -> CodedHTTPException:
 
 
 def _signed(body: dict[str, Any] | None, header: str | None) -> str | None:
-    """署名：请求体的 signed_by 优先，其次请求头 X-Actor。只原样记下（未认证）。"""
+    """署名：开了登录是登录的人；关登录时请求体的 signed_by 优先，其次请求头 X-Actor，只原样记下（未认证）。"""
     raw = (body or {}).get("signed_by") if isinstance(body, dict) else None
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()[:_SIGNED_MAX]
-    return actor_of(header)
+    return signer_of(raw, header, _SIGNED_MAX)
+
+
+def _login_on() -> bool:
+    return current_principal().mode != "off"
 
 
 #: JSON 请求体的字节上限和嵌套层数上限（SE-5）。最大的合法配方（200 个标签、几十个分段）也只有一两百 KB、
@@ -371,9 +373,10 @@ def _context_inputs(raw: Any, signed_by: str | None) -> dict[str, PeriodInput] |
         if start > end:
             raise bad
         who = value.get("signed_by")
+        # 开了登录时 signed_by 已经是登录的人，这里填的不看（signer_of 同一条）
         out[key] = PeriodInput(start=start, end=end,
-                               signed_by=(str(who).strip()[:_SIGNED_MAX] if isinstance(who, str) and who.strip()
-                                          else signed_by))
+                               signed_by=(str(who).strip()[:_SIGNED_MAX]
+                                          if isinstance(who, str) and who.strip() and not _login_on() else signed_by))
     return out
 
 

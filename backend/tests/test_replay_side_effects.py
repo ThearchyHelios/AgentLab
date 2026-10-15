@@ -315,3 +315,187 @@ async def test_continuing_an_old_failure_after_tools_ran_is_refused(monkeypatch)
     with pytest.raises(ValueError, match="重复执行"):
         await run_manager.continue_failed(run.id)
     assert len(CALLS) == 1
+
+
+# --------------------------------------------------------------------------
+# 跨重放协议的升级安全（应用平台 §7.5）：流程实例一等几天，中间系统升级是常态。
+#
+# 照「以后改了节点里 task 的调用顺序，PROTOCOL 加一」的规矩，把升级模拟成 PROTOCOL 从现在的 2 变成 3：
+# 断点是按 2 写的，恢复时代码按 3 认。
+# --------------------------------------------------------------------------
+
+
+def _to_protocol_3(monkeypatch) -> None:
+    from app.engine import replay, runner
+
+    assert replay.PROTOCOL == 2, "PROTOCOL 已经升过了：把这几条的「旧版」「新版」跟着改"
+    monkeypatch.setattr(runner, "PROTOCOL", 3)
+
+
+async def _paused(run_id: str) -> None:
+    await _wait(run_id, ("interrupted",))
+    await run_manager.wait_idle(run_id)
+
+
+async def test_upgrade_pause_at_human_node_resumes(monkeypatch):
+    graph = chain(
+        node("start", "input", fields=[{"name": "question"}]),
+        node("h", "human", mode="approve", title="批一下", assignee={"kind": "initiator"}, due="PT4H"),
+        node("out", "output", fields=[]),
+    )
+    run = await run_manager.start(graph=graph, input_payload={"question": "x"}, started_by="ann")
+    await _paused(run.id)
+    _to_protocol_3(monkeypatch)
+    from app.api.deps import Principal
+    from app.process import tasks
+
+    task = (await tasks.list_tasks(Principal(username="ann", mode="off"), run_id=run.id))[0]
+    out = await tasks.respond(task["id"], Principal(username="ann", mode="off"), decision="approve")
+    assert out["resolved"] is True
+    assert (await _wait(run.id, ("failed", "succeeded"))).status == "succeeded"
+
+
+async def test_upgrade_pause_mid_agent_is_refused_and_flagged_at_publish(monkeypatch):
+    from app.engine.governance import lint_for_publish
+    from app.engine.schema import GraphSpec
+
+    _script_two_calls(monkeypatch)
+    graph = chain(
+        node("start", "input", fields=[{"name": "question"}]),
+        node("bot", "agent", prompt="记两笔", tools=["tally_side_effect"], approval="always", max_steps=5),
+        node("out", "output", fields=[]),
+    )
+    flagged = {i.code for i in lint_for_publish(GraphSpec.model_validate(graph), level="published").issues}
+    assert "process.wait_mid_agent" in flagged            # 应用按流程钉住它时，这一条会升成错误
+    run = await run_manager.start(graph=graph, input_payload={"question": "x"})
+    await _paused(run.id)
+    await run_manager.resume(run.id, {"approved": True})
+    await asyncio.sleep(0.1)
+    await _paused(run.id)
+    assert len(CALLS) == 1
+    _to_protocol_3(monkeypatch)
+    with pytest.raises(ValueError, match="重复执行"):
+        await run_manager.resume(run.id, {"approved": True})
+    assert len(CALLS) == 1
+
+
+def _pay_graph():
+    from tests.fakes.fake_erp import PAY
+
+    return chain(
+        node("start", "input", fields=[{"name": "amount"}]),
+        node("pay", "tool", tool=PAY, args={"amount": "{{ input.amount }}", "card": "6222020200112233"}),
+        node("out", "output", fields=[{"name": "单号", "value": "{{ nodes.pay.receipt.id }}"}]),
+    )
+
+
+async def _confirm_card(run_id: str):
+    from app.api.deps import Principal
+    from app.process import tasks
+
+    who = Principal(username="ann", mode="off")
+    [task] = [t for t in await tasks.list_tasks(who, run_id=run_id) if t["kind"] == "action_confirm"]
+    return await tasks.respond(task["id"], who, decision="approve", payload_hash=task["payload"]["payload_hash"])
+
+
+async def test_upgrade_pause_at_write_confirmation_resumes_and_sends_once(monkeypatch):
+    from tests.fakes.fake_erp import FakeErp, endpoint_row, install
+
+    erp = FakeErp()
+    install(monkeypatch, erp, await endpoint_row(test=True), lookup=False)
+    run = await run_manager.start(graph=_pay_graph(), input_payload={"amount": 30}, run_class="formal")
+    await _paused(run.id)
+    _to_protocol_3(monkeypatch)
+    await _confirm_card(run.id)
+    final = await _wait(run.id, ("failed", "succeeded"))
+    assert final.status == "succeeded", final.error
+    assert len(erp.writes()) == 1
+
+
+async def test_upgrade_with_unknown_result_reconciles_and_continues_without_resending(monkeypatch):
+    """结果未知时停下的断点是按旧协议写的，节点里已经批过一次、发过一次（tool.start 带 action_key）。
+    升级后核实为已生效：_stale_replay 只对这种写入节点放行，节点重新执行时查到已生效，交回回执、不再发。"""
+    from app.api.deps import Principal
+    from app.db.models import ActionRecord
+    from app.process import tasks
+    from tests.fakes.fake_erp import FakeErp, endpoint_row, install
+
+    erp = FakeErp(mode="timeout_after_write")
+    install(monkeypatch, erp, await endpoint_row(test=True), lookup=False)
+    run = await run_manager.start(graph=_pay_graph(), input_payload={"amount": 30}, run_class="formal")
+    await _paused(run.id)
+    await _confirm_card(run.id)
+    await _paused(run.id)
+    assert len(erp.writes()) == 1
+
+    _to_protocol_3(monkeypatch)
+    who = Principal(username="ann", mode="off")
+    [task] = [t for t in await tasks.list_tasks(who, run_id=run.id) if t["kind"] == "reconcile"]
+    out = await tasks.respond(task["id"], who, decision="confirmed", values={"external_id": "PAY-1001"})
+    assert out["resolved"] is True
+    final = await _wait(run.id, ("failed", "succeeded"))
+    assert final.status == "succeeded", final.error
+    assert len(erp.writes()) == 1                        # 不重发
+    async with SessionLocal() as session:
+        [rec] = (await session.execute(select(ActionRecord).where(ActionRecord.run_id == run.id))).scalars().all()
+    assert rec.state == "confirmed" and rec.resolution["how"] == "manual"
+    resumed = [e for e in await _events(run.id) if e.type == "run.resumed"]
+    assert resumed[-1].data["from"] == ["pay"]          # 写入节点从头重新执行：查到已生效，交回回执
+
+
+async def test_upgrade_a_plain_tool_node_after_approval_is_still_refused(monkeypatch):
+    """豁免只给写入节点：普通的调用工具节点批过、执行过（tool.start 不带 action_key）之后失败，升级后照旧拒绝接着跑。"""
+    state = {"fail": True}
+
+    class _Args(BaseModel):
+        label: str
+
+    from app.tools.registry import register
+
+    name = "tally_then_maybe_fail"
+
+    @register(name, "测试用：记一笔，第一次之后失败", "test", _Args, dangerous=True, needs_context=False)
+    async def _tally_fail(label: str) -> str:
+        CALLS.append({"label": label})
+        if state["fail"]:
+            raise RuntimeError("下游断了")
+        return "ok"
+
+    graph = chain(
+        node("start", "input", fields=[{"name": "question"}]),
+        node("t", "tool", tool=name, args={"label": "一笔"}, approval="always"),
+        node("out", "output", fields=[]),
+    )
+    run = await run_manager.start(graph=graph, input_payload={"question": "x"})
+    await _paused(run.id)
+    await run_manager.resume(run.id, {"approved": True})
+    assert (await _wait(run.id, ("failed", "succeeded"))).status == "failed"
+    await run_manager.wait_idle(run.id)
+    assert len(CALLS) == 1
+    _to_protocol_3(monkeypatch)
+    state["fail"] = False
+    with pytest.raises(ValueError, match="重复执行"):
+        await run_manager.continue_failed(run.id)
+    assert len(CALLS) == 1
+
+
+async def test_upgrade_human_inside_subgraph_is_flagged_at_publish():
+    from app.db.models import Workflow, WorkflowVersion
+    from app.engine.governance import lint_for_publish
+    from app.engine.lint_process import load_subgraphs, with_subgraphs
+    from app.engine.schema import GraphSpec
+
+    inner = chain(node("start", "input"), node("h", "human", mode="approve"), node("out", "output"))
+    async with SessionLocal() as session:
+        wf = Workflow(name="子流程", graph=inner)
+        session.add(wf)
+        await session.flush()
+        session.add(WorkflowVersion(workflow_id=wf.id, version=1, graph=inner))
+        await session.commit()
+        outer = GraphSpec.model_validate(chain(
+            node("start", "input"), node("sub", "subgraph", workflow_id=wf.id, workflow_version=1),
+            node("out", "output")))
+        graphs = await load_subgraphs(session, outer)
+    with with_subgraphs(graphs):
+        codes = {i.code for i in lint_for_publish(outer, level="published").issues}
+    assert "process.human_in_subgraph" in codes

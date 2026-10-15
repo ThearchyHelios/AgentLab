@@ -363,24 +363,12 @@ async def test_the_one_shot_generate_reports_tool_changes_too(client, monkeypatc
     """非流式的 /generate 交回的是整张新图：照样比对、照样提醒。"""
     import app.api.copilot as copilot
 
-    rewritten = copy.deepcopy(ROUND_ONE)
-    del _config(rewritten, "query_data")["tools"]
-    raw = {
-        "explanation": "改了提示词",
-        "nodes": [{"id": n["id"], "type": n["type"], "label": n["data"]["label"],
-                   "config": n["data"]["config"]} for n in rewritten["nodes"]],
-        "edges": rewritten["edges"],
-    }
-
-    class _OneShot:
-        def with_structured_output(self, *_a, **_k):
-            return self
-
-        async def ainvoke(self, _messages):
-            return raw
+    # 非流式的 /generate 和流式走同一个生成过程（copilot_gen）：模型按操作流改图
+    ops = [{"op": "update_node", "id": "query_data", "config": {"prompt": "短一点", "tools": None}},
+           {"op": "done", "explanation": "改了提示词"}]
 
     async def _model(*_a, **_k):
-        return _OneShot(), "mock-fast"
+        return _Scripted(ops), "mock-fast"
 
     monkeypatch.setattr(copilot, "get_chat_model", _model)
     r = await client.post("/api/copilot/generate", json={

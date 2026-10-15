@@ -8,6 +8,7 @@ import {
 } from '../lib/terms'
 import type { NodeType } from '../types'
 import { dualCheckFields, dualCheckSummary } from './DualCheckFields'
+import { HUMAN_PROCESS_FIELDS, TOOL_WRITE_FIELDS } from './humanFields'
 import { nodePickField, triStateField, upstreamModel, verifyModelFields } from './verifyFields'
 
 export type FieldType =
@@ -327,6 +328,8 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'tool', label: '工具', type: 'tools', help: '只能选一个' },
       { key: 'args', label: '参数', type: 'json', syntax: 'template', help: '值中可用 {{ }} 引用上游数据' },
       { key: 'approval', label: '审批策略', type: 'select', options: APPROVAL_OPTIONS },
+      // 写外部系统只能放在调用工具节点里（A5）：确认卡在节点开头、发送之前
+      ...TOOL_WRITE_FIELDS,
       ...COMMON_TAIL,
     ],
     defaults: { args: {} },
@@ -560,6 +563,8 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       { key: 'message', label: '展示给审批人的内容', type: 'prompt' },
       { key: 'draft', label: '草稿内容', type: 'prompt', when: (c) => c.mode === 'edit' },
       { key: 'stop_on_reject', label: '驳回即终止运行', type: 'switch', when: (c) => c.mode === 'approve' },
+      // 流程语义（§3.7）：谁处理、几个人怎么算、多久、超时怎么办。没有应用绑定的运行派给任何人，和以前一样
+      ...HUMAN_PROCESS_FIELDS,
       ...COMMON_TAIL,
     ],
     defaults: { mode: 'approve', title: '待审批', message: '{{ last_message }}' },

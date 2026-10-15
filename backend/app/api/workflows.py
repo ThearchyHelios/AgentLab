@@ -6,20 +6,27 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.core.errors import graph_error
+from app.api.coded import CodedHTTPException
 from app.api.runs import actor_of
 from app.core.artifact_store import graph_hash
 from app.data.catalog_impact import catalog_drift, catalog_versions_for, recorded_versions
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import publish_issues
+from app.engine.lint_process import load_subgraphs, with_subgraphs
 from app.engine.provider_refs import CODES as PROVIDER_CODES, load_issues, load_providers, quiet_unset_model
 from app.engine.schema import GraphSpec, NodeType, validate_graph
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 
 _GONE = "工作流不存在，可能已被删除"
+#: 删除被拒：还有应用固定着、或者发布过的版本有生效记录（F4）
+WORKFLOW_IN_USE = "workflow_in_use"
+#: 受管级发布、版本退役只给管理员（Q8）
+ADMIN_ONLY = "admin_only"
 _LEVELS = ("published", "governed")
 _BAD_LEVEL = "发布级别只能是「已发布」或「受管」"
 #: 剩下的挡住发布的只有模型接入的问题、人又要交给助手时的说明：换成哪个接入要人拿主意，助手处理不了。发布弹窗里
@@ -58,11 +65,36 @@ class WorkflowOut(BaseModel):
     status: str = "draft"
     published_version: int | None = None
     published_by: str | None = None
+    #: 当前发布版本的级别（published / governed）。status 在画布上改过之后会回到 draft，「这是不是受管工作流」看这一项
+    published_level: str | None = None
+    #: 画布这一版的图和当前发布版的图内容相同（按 graph_hash 比）：撤回改动后保存出来的新版本号更大，内容却和发布版
+    #: 一样，页头照实写「与发布版内容相同」，不写「领先 N 版」。没发布过、老数据没记哈希的为 false
+    same_as_published: bool = False
     created_at: Any = None
     updated_at: Any = None
     run_count: int = 0
 
     model_config = {"from_attributes": True}
+
+
+async def _published_levels(session: AsyncSession, ids: list[str] | None = None) -> dict[str, str]:
+    """各工作流当前发布版本的级别 {工作流 id: level}。没发布过、或老数据没记级别的不在里面。"""
+    stmt = select(WorkflowVersion.workflow_id, WorkflowVersion.level).join(
+        Workflow, (Workflow.id == WorkflowVersion.workflow_id) & (Workflow.published_version == WorkflowVersion.version))
+    if ids is not None:
+        stmt = stmt.where(WorkflowVersion.workflow_id.in_(ids))
+    return {wid: level for wid, level in (await session.execute(stmt)).all() if level}
+
+
+async def _same_as_published(session: AsyncSession, ids: list[str] | None = None) -> set[str]:
+    """画布这一版（Workflow.version）的图哈希和当前发布版相同的工作流 id。两边哈希都记着才比，不在前端比图。"""
+    current, published = aliased(WorkflowVersion), aliased(WorkflowVersion)
+    stmt = select(Workflow.id, current.graph_hash, published.graph_hash).join(
+        current, (current.workflow_id == Workflow.id) & (current.version == Workflow.version)).join(
+        published, (published.workflow_id == Workflow.id) & (published.version == Workflow.published_version))
+    if ids is not None:
+        stmt = stmt.where(Workflow.id.in_(ids))
+    return {wid for wid, mine, theirs in (await session.execute(stmt)).all() if mine and mine == theirs}
 
 
 async def _run_counts(session: AsyncSession, ids: list[str] | None = None) -> dict[str, int]:
@@ -78,6 +110,8 @@ async def _workflow_out(session: AsyncSession, workflow: Workflow) -> WorkflowOu
     """返回单个工作流的接口都走这里，run_count 和列表一致。"""
     item = WorkflowOut.model_validate(workflow)
     item.run_count = (await _run_counts(session, [workflow.id])).get(workflow.id, 0)
+    item.published_level = (await _published_levels(session, [workflow.id])).get(workflow.id)
+    item.same_as_published = workflow.id in await _same_as_published(session, [workflow.id])
     return item
 
 
@@ -87,10 +121,14 @@ async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[W
         (await session.execute(select(Workflow).order_by(Workflow.updated_at.desc()))).scalars()
     )
     counts = await _run_counts(session)
+    levels = await _published_levels(session)
+    same = await _same_as_published(session)
     out: list[WorkflowOut] = []
     for row in rows:
         item = WorkflowOut.model_validate(row)
         item.run_count = counts.get(row.id, 0)
+        item.published_level = levels.get(row.id)
+        item.same_as_published = row.id in same
         out.append(item)
     return out
 
@@ -179,8 +217,33 @@ async def delete_workflow(
     )
     if live:
         raise HTTPException(409, f"该工作流还有 {live} 次运行正在进行，现在删除会使这些运行失去所属工作流。请先停止运行，再删除")
+    # 版本随工作流级联删除（F4）：应用固定着的版本、带生效记录的版本删掉，应用发起不了、生效记录对不上承诺。这两种拒绝
+    if reasons := await _delete_blockers(session, workflow_id):
+        raise CodedHTTPException(409, "该工作流还在使用中，不能删除：" + "；".join(reasons), WORKFLOW_IN_USE)
     await session.delete(workflow)
     await session.commit()
+
+
+async def _delete_blockers(session: AsyncSession, workflow_id: str) -> list[str]:
+    """拒绝删除的原因：应用固定着；某个版本有生效记录（演练不算）。
+
+    生效记录按全部版本数，不只看在用的发布版：退役只是不再接受新的运行，退役之前写进外部系统的那些事照样发生过，
+    版本删掉了，生效记录就对不上它当时的承诺（D-n）。"""
+    from app.apps.versions import pinning_apps
+    from app.db.models import ActionRecord
+
+    reasons = [f"应用「{a['name']}」v{a['app_version']} 固定了 v{a['version']}"
+               for a in await pinning_apps(session, workflow_id)]
+    rows = (await session.execute(
+        select(ActionRecord.workflow_version, func.count(ActionRecord.id))
+        .where(ActionRecord.workflow_id == workflow_id, ActionRecord.state != "simulated")
+        .group_by(ActionRecord.workflow_version).order_by(ActionRecord.workflow_version))).all()
+    retired = set((await session.execute(select(WorkflowVersion.version).where(
+        WorkflowVersion.workflow_id == workflow_id, WorkflowVersion.retired_at.is_not(None)))).scalars())
+    for version, count in rows:
+        which = f"v{version}" if version is not None else "未记版本的运行"
+        reasons.append(f"{which}{'（已退役）' if version in retired else ''} 有 {count} 条生效记录")
+    return reasons
 
 
 @router.post("/{workflow_id}/duplicate", response_model=WorkflowOut, status_code=201)
@@ -209,6 +272,12 @@ class VersionOut(BaseModel):
     created_at: Any = None
     #: 这一版按哪一档发布的（published / governed）。没发布过、或者是记级别之前发布的为 null
     level: str | None = None
+    #: 这一版是谁、什么时候发布的；退役了的是什么时候、谁退的、退役时写的说明（没写为 null）。存量为 null
+    published_at: Any = None
+    published_by: str | None = None
+    retired_at: Any = None
+    retired_by: str | None = None
+    retire_note: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -239,6 +308,10 @@ class VersionDetailOut(VersionOut):
     catalog_versions: dict[str, Any] | None = None
     #: 发布之后目录有变化的表：[{source, source_id, table, label, published, current, impact}]
     catalog_changes: list[dict[str, Any]] = Field(default_factory=list)
+    #: 入口字段换成表单（agentlab.form/1）：发起表单、应用入口用同一个渲染器（X2）
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    #: 账本（L4）：固定这一版的应用、生效记录数、正式运行数
+    usage: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("/{workflow_id}/versions/{version}", response_model=VersionDetailOut)
@@ -268,6 +341,9 @@ async def get_version(
                 f for f in ((node.get("data") or {}).get("config") or {}).get("fields") or []
                 if isinstance(f, dict)
             )
+    from app.apps.forms import input_schema
+    from app.apps.versions import usage
+
     return VersionDetailOut(
         id=snapshot.id, version=snapshot.version, note=snapshot.note,
         created_at=snapshot.created_at, workflow_id=workflow_id, graph=graph,
@@ -275,7 +351,40 @@ async def get_version(
         published=workflow.published_version == snapshot.version, level=snapshot.level,
         catalog_versions=recorded_versions(snapshot.catalog_versions),
         catalog_changes=await catalog_drift(session, snapshot.catalog_versions),
+        input_schema=input_schema(fields), published_at=snapshot.published_at, published_by=snapshot.published_by,
+        retired_at=snapshot.retired_at, retired_by=snapshot.retired_by, retire_note=snapshot.retire_note,
+        usage=await usage(session, workflow_id, snapshot.version),
     )
+
+
+class RetireIn(BaseModel):
+    note: str = Field(default="", max_length=2000)
+
+
+@router.post("/{workflow_id}/versions/{version}/retire")
+async def retire_version(
+    workflow_id: str, version: int, payload: RetireIn, session: AsyncSession = Depends(get_session),
+    x_actor: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """退役一个发布过的版本：不再接受新的正式运行，进行中的实例照常走完。当前发布版不能退役；返回受影响的应用
+    （它们标「需升级」）。只有管理员能做（Q8），关登录时放行。"""
+    from app.apps.versions import RetireRefused, retire_version as retire
+
+    _require_admin("退役版本")
+    try:
+        return await retire(session, workflow_id, version, actor=actor_of(x_actor), note=payload.note)
+    except RetireRefused as e:
+        if e.code:
+            raise CodedHTTPException(e.status_code, e.message, e.code) from e
+        raise HTTPException(e.status_code, e.message) from e
+
+
+def _require_admin(what: str) -> None:
+    """受管级发布、版本退役只给管理员（Q8）。关登录时所有人等同管理员。"""
+    from app.api.deps import current_principal
+
+    if not current_principal().at_least("admin"):
+        raise CodedHTTPException(403, f"{what}需要管理员权限", ADMIN_ONLY)
 
 
 @router.post("/{workflow_id}/versions/{version}/restore", response_model=WorkflowOut)
@@ -335,9 +444,15 @@ async def publish_workflow(
     """
     if payload.level not in _LEVELS:
         raise HTTPException(400, _BAD_LEVEL)
+    if payload.level == "governed":
+        _require_admin("以受管级别发布")
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
+    if payload.level != "governed" and workflow.published_version and \
+            (await _published_levels(session, [workflow_id])).get(workflow_id) == "governed":
+        # 把受管工作流降成已发布，之后的正式运行就不再过治理门禁：和以受管级别发布是同一级的决定（Q8）
+        _require_admin("把受管工作流降为已发布")
 
     version = payload.version or workflow.version
     snapshot = (
@@ -357,17 +472,31 @@ async def publish_workflow(
         return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
 
     checkers = await _sql_checkers(session, spec)
-    issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers,
-                                                     providers=await _providers(session, spec))]
+    providers = await _providers(session, spec)
+    with with_subgraphs(await load_subgraphs(session, spec)):
+        issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers,
+                                                         providers=providers)]
     if any(i["level"] == "error" for i in issues):
         return {"ok": False, "level": payload.level, "version": version, "issues": issues}
 
+    # 发布时用到的能力的治理版本（F5）。在改这一版之前取：能力登记缺了的要另开会话同步、提交，这个会话手里不能先有写
+    from app.capabilities.registry import capability_versions_for
+    from app.db.base import utcnow
+    from app.engine.launch import graph_tool_names
+
+    capabilities = await capability_versions_for(session, graph_tool_names(snapshot.graph))
     if not snapshot.graph_hash:
         snapshot.graph_hash = graph_hash(snapshot.graph)
     # 级别记在这一版上：之后改画布（status 退回 draft），从这一版发起的正式运行照样按发布时的级别出具
     snapshot.level = payload.level
     # 发布时的目录版本也记在这一版上：重新发布同一版等于按现在的目录重新认可它，跟着更新
     snapshot.catalog_versions = await catalog_versions_for(session, spec)
+    # 发布人、发布时间、用到的能力版本也记在这一版上（F5）：工作流上的 published_by 只记最近一次。退役过的版本重新
+    # 发布等于重新认可它，退役信息清掉
+    snapshot.published_at = utcnow()
+    snapshot.published_by = actor_of(x_actor)
+    snapshot.capability_versions = capabilities
+    snapshot.retired_at = snapshot.retired_by = snapshot.retire_note = None
     workflow.status = payload.level
     workflow.published_version = version
     workflow.published_by = actor_of(x_actor)
@@ -474,8 +603,11 @@ async def publish_check(
     except Exception as e:  # noqa: BLE001
         return _unreadable(payload.level, e)
     versions, cards = await _gate_context(session, spec)
-    return check(spec, level=payload.level, versions=versions, cards=cards, checkers=await _sql_checkers(session, spec),
-                 providers=await _providers(session, spec))
+    checkers = await _sql_checkers(session, spec)
+    providers = await _providers(session, spec)
+    with with_subgraphs(await load_subgraphs(session, spec)):
+        return check(spec, level=payload.level, versions=versions, cards=cards, checkers=checkers,
+                     providers=providers)
 
 
 @router.post("/{workflow_id}/autofix")
@@ -501,8 +633,11 @@ async def autofix(
     versions, cards = await _gate_context(session, spec)
     checkers = await _sql_checkers(session, spec)
     providers = await _providers(session, spec)
-    out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards,
-                      checkers=checkers, providers=providers)
+    # 和发布、发布前检查同一套口径：子工作流先读好，process.human_in_subgraph 才查得到
+    subgraphs = await load_subgraphs(session, spec)
+    with with_subgraphs(subgraphs):
+        out = apply_fixes(graph, payload.apply, payload.choices, level=payload.level, versions=versions, cards=cards,
+                          checkers=checkers, providers=providers)
     out["assist"] = None
     # 人在选项里选了「交给 Copilot」（handoff），和点「交给 Copilot」是一回事
     if payload.assist or out["handoff"]:
@@ -520,16 +655,19 @@ async def autofix(
 
         helped = await assist_publish_fix(session, out["graph"], level=payload.level,
                                           provider=payload.provider, model=payload.model)
-        out["assist"] = {"ok": helped["accepted"], "summary": helped["summary"], "questions": helped["questions"]}
+        out["assist"] = {"ok": helped["accepted"], "summary": helped["summary"], "questions": helped["questions"],
+                         "looks": helped["looks"]}
         if helped["accepted"]:
             fixed = helped["graph"]
             out["changes"] += diff_changes(out["graph"], fixed, fix_id="assist", label="助手的修改")
             out["ops"] += helped["ops"]
             out["applied"].append("assist")
             fixed_spec = GraphSpec.model_validate(fixed)
-            after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards,
-                                checkers=await _sql_checkers(session, fixed_spec),
-                                providers=await _providers(session, fixed_spec))
+            fixed_checkers = await _sql_checkers(session, fixed_spec)
+            fixed_providers = await _providers(session, fixed_spec)
+            with with_subgraphs(await load_subgraphs(session, fixed_spec)):
+                after = apply_fixes(fixed, [], level=payload.level, versions=versions, cards=cards,
+                                    checkers=fixed_checkers, providers=fixed_providers)
             out.update(graph=fixed, remaining=after["remaining"], fixes=after["fixes"], ok=after["ok"])
         elif helped["reason"]:
             out["rejected"].append({"fix_id": "assist", "reason": helped["reason"]})

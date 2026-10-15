@@ -12,7 +12,7 @@ import { datasourceTools, modelOptions, providerOfModel, useCatalog, useDatasour
 import { api } from '../api/client'
 import { IconButton, JsonInput, Modal, isComposing, useRadioGroup } from '../components/ui'
 import { formatShortcut } from '../lib/keys'
-import { JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, MERGE_TEXT, CATALOG_UI_TEXT, NODE_TYPE_LABEL, PROVIDER_REF_TEXT, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
+import { INPUT_FIELD_TEXT, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, MERGE_TEXT, CATALOG_UI_TEXT, NODE_TYPE_LABEL, PROVIDER_REF_TEXT, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
 import { TemplateText } from './TemplateText'
 import { MERGE_ALIAS, isQueryNode, mergeAlias } from './mergeInputs'
 import type { NodeType, Provider, ValidationIssue, WorkflowVersion } from '../types'
@@ -1360,6 +1360,7 @@ function IoFieldList({ nodeId, value, issues, onChange }: {
                            onChange={(e) => update(i, { default: e.target.value })} />
                   </Sub>
                 </div>
+                <InputFieldType uid={`${uid}-${i}`} field={field} onChange={(patch) => update(i, patch)} />
               </>
             )}
             {own.map((x, k) => <IssueLine key={k} issue={x} />)}
@@ -1371,6 +1372,82 @@ function IoFieldList({ nodeId, value, issues, onChange }: {
         <Plus size={11} /> 添加字段
       </button>
     </div>
+  )
+}
+
+/**
+ * 入口字段的类型、格式、可选值（X2）：服务端按它们把入口字段转成发起表单（agentlab.form/1），正式运行、画布试运行、
+ * 应用入口的表单都照它画。没写类型的按文本处理，老图照常运行；写回时空的键删掉，不在配置里留空值
+ */
+function InputFieldType({ uid, field, onChange }: {
+  uid: string; field: Record<string, any>; onChange: (patch: Record<string, any>) => void
+}) {
+  const type = typeof field.type === 'string' ? field.type : 'string'
+  const options: string[] = Array.isArray(field.enum) ? field.enum.map(String) : []
+  const [enumText, setEnumText] = useState(options.join('\n'))
+  useEffect(() => { setEnumText(options.join('\n')) }, [options.join('\n')]) // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <div className="mt-1.5 space-y-1.5" data-input-field-type={type}>
+      <div className="flex gap-2">
+        <Sub label={INPUT_FIELD_TEXT.type} htmlFor={`${uid}-type`} className="flex-1" sub="type">
+          <select id={`${uid}-type`} className="field" value={type}
+                  onChange={(e) => onChange({ type: e.target.value === 'string' ? undefined : e.target.value,
+                                              ...(e.target.value !== 'string' ? { format: undefined } : {}),
+                                              ...(e.target.value !== 'number' && e.target.value !== 'integer'
+                                                ? { minimum: undefined, maximum: undefined } : {}) })}>
+            {Object.entries(INPUT_FIELD_TEXT.types).map(([k, label]) => <option key={k} value={k}>{label}</option>)}
+          </select>
+        </Sub>
+        {type === 'string' && (
+          <Sub label={INPUT_FIELD_TEXT.format} htmlFor={`${uid}-format`} className="flex-1" sub="format">
+            <select id={`${uid}-format`} className="field" value={field.format ?? ''}
+                    onChange={(e) => onChange({ format: e.target.value || undefined })}>
+              {Object.entries(INPUT_FIELD_TEXT.formats).map(([k, label]) => <option key={k} value={k}>{label}</option>)}
+            </select>
+          </Sub>
+        )}
+      </div>
+      {(type === 'number' || type === 'integer') && (
+        <div className="flex gap-2" data-input-field-range="">
+          {(['minimum', 'maximum'] as const).map((key) => (
+            <Sub key={key} label={INPUT_FIELD_TEXT[key]} htmlFor={`${uid}-${key}`} className="flex-1" sub={key}>
+              <RangeInput id={`${uid}-${key}`} value={field[key]} onChange={(n) => onChange({ [key]: n })} />
+            </Sub>
+          ))}
+        </div>
+      )}
+      {type !== 'boolean' && (
+        <Sub label={INPUT_FIELD_TEXT.enum} htmlFor={`${uid}-enum`} sub="enum">
+          <textarea id={`${uid}-enum`} className="field text-xs" rows={2} value={enumText}
+                    placeholder={INPUT_FIELD_TEXT.enumHint}
+                    onChange={(e) => setEnumText(e.target.value)}
+                    onBlur={() => {
+                      const list = enumText.split('\n').map((x) => x.trim()).filter(Boolean)
+                      const typed = type === 'number' || type === 'integer' ? list.map(Number).filter((n) => Number.isFinite(n)) : list
+                      onChange({ enum: typed.length ? typed : undefined })
+                    }} />
+        </Sub>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 数字字段的上下限：框里的字自己留一份，离开时才写回（「0.」这类打到一半的写法不被回写成 0）；读不成数的、清空的写回时
+ * 删掉这个键，不在配置里留空值
+ */
+function RangeInput({ id, value, onChange }: { id: string; value: unknown; onChange: (n: number | undefined) => void }) {
+  const shown = typeof value === 'number' && Number.isFinite(value) ? String(value) : ''
+  const [text, setText] = useState(shown)
+  useEffect(() => { setText(shown) }, [shown])
+  return (
+    <input id={id} type="text" inputMode="decimal" className="field tnum" title={INPUT_FIELD_TEXT.rangeHint} value={text}
+           onChange={(e) => setText(e.target.value)}
+           onBlur={() => {
+             const n = text.trim() === '' ? undefined : Number(text.trim())
+             onChange(n != null && Number.isFinite(n) ? n : undefined)
+             if (n == null || !Number.isFinite(n)) setText('')
+           }} />
   )
 }
 

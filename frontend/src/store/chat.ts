@@ -1,7 +1,9 @@
 import { create } from 'zustand'
 import { ApiError, api, streamCopilot, streamRun } from '../api/client'
 import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
-import { decodeRun } from '../run/decode'
+import { copilotContext, copilotLook, decodeRun, looksOf } from '../run/decode'
+import { LOOK_TEXT } from '../lib/terms'
+import type { LookEvent } from '../typesApp'
 import { errorMessage, humanizeError, isNetworkError } from '../lib/errors'
 import { guardReview, hasEvidence } from '../lib/evidence'
 import { explainRunError, explainStartError } from '../lib/explain'
@@ -138,6 +140,8 @@ export interface TurnMeta {
   clipped?: 'partial' | 'lost'
   /** 这一问限定了只查哪些数据源 */
   scope?: ScopeSource[]
+  /** 这一轮助手查看过的表（look 事件原样，look §2.5.8）：下一轮服务端据此写「上一轮查看过」，追问时直接点名查看 */
+  looks?: LookEvent[]
   /**
    * 成果里有逐段证据（报告撰写节点的文档）。库里只存答案的文字，证据的标注和字段名在
    * 运行的成果里：有这个记号的轮次恢复时要回运行那里取一次
@@ -436,8 +440,15 @@ function buildMeta(t: ChatTurn): TurnMeta {
     clipped: t.clipped,
     scope: t.scope?.length ? t.scope : undefined,
     evidence: hasEvidence(t.output) || t.meta?.evidence || undefined,
+    looks: lookList(t),
     at: Date.now(),
   }
+}
+
+/** 这一轮的查看记录：操作流里有就取操作流的（重试会重新查看），恢复的历史轮次没有操作流，沿用 meta 里的 */
+function lookList(t: ChatTurn): LookEvent[] | undefined {
+  const looks = looksOf(t.ops)
+  return looks.length ? looks : t.meta?.looks?.length ? t.meta.looks : undefined
 }
 
 /**
@@ -1329,8 +1340,17 @@ function plan(flow: Flow, args: PlanArgs) {
           }))
           break
         case 'heartbeat':
-          patch(() => ({ status: PHASE_TEXT[(op.phase as Phase) ?? 'planning'] ?? '正在处理…' }))
+          // 查看进行中（looking）不是这一页的阶段：浮条直说「正在查看表结构…」
+          patch(() => ({ status: op.phase === 'looking' ? LOOK_TEXT.running
+            : PHASE_TEXT[(op.phase as Phase) ?? 'planning'] ?? '正在处理…' }))
           break
+        case 'look':
+        case 'context': {
+          // 查看结束：浮条换成查看了什么。记录随这一轮的 meta 落库（buildMeta 从操作流取）
+          const look = op.op === 'look' ? copilotLook(op) : copilotContext(op)
+          if (look) patch(() => ({ status: look.title }))
+          break
+        }
         case 'plan':
           patch(() => ({ phase: 'building', status: op.summary || '正在生成工作流…' }))
           break
@@ -1440,6 +1460,7 @@ async function launch(
   try {
     const run = await api.runs.start({
       graph, input: fillInput(graph, question, historyOf(flow.conversationId, flow.turnId)),
+      origin: 'chat',
     })
     // 启动请求在路上时用户点了停止或重试：运行已经起来了，得追一个取消过去
     if (!flow.alive()) {

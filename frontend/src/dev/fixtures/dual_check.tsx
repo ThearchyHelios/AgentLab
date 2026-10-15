@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { JSX } from 'react'
 import { ReactFlow, ReactFlowProvider } from '@xyflow/react'
 import { ApprovalCard } from '../../run/RunPanel'
+import { withTask } from '../taskOf'
 import { Inspector } from '../../canvas/Inspector'
 import { NodeCard } from '../../canvas/NodeCard'
 import { EvidencePane } from '../../pages/runs/EvidencePane'
@@ -73,7 +74,7 @@ function approvalOf(search: string): Approval {
 function Card({ value }: { value: Approval }) {
   return (
     <div className="overflow-hidden rounded-lg border" style={{ borderColor: 'var(--warn)' }}>
-      <ApprovalCard approval={value} onResolved={(id) => { (window as any).__dualResolved = id }} />
+      <ApprovalCard approval={withTask(value)} onResolved={(id) => { (window as any).__dualResolved = id }} />
     </div>
   )
 }

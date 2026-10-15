@@ -28,7 +28,7 @@ from app.engine.toolcalls import (
 from app.providers import catalog
 from app.providers.factory import ModelSpec, bind_tools_safely, get_chat_model
 from app.engine.sql_problems import event_checks
-from app.tools.datasource import QUERY_PREFIX, run_versions
+from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_reads_only, run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolContext,
@@ -314,6 +314,8 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 memory_scope=ctx.run.memory_scope,
                 collection=ctx.run.collection,
                 data_versions=run_versions(ctx.run),
+                mask_results=run_masks_results(ctx.run),
+                force_readonly=run_reads_only(ctx.run),
                 # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
                 emit=ctx.emit,
             )

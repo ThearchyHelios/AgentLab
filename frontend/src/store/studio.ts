@@ -11,9 +11,10 @@ import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import { toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import { formatShortcut } from '../lib/keys'
-import { CATALOG_PATCH_TEXT, UPGRADE_TEXT } from '../lib/terms'
+import { CATALOG_PATCH_TEXT, LOOK_TEXT, UPGRADE_TEXT, publishedLevelOf } from '../lib/terms'
 import type { CopilotOp } from '../run/decode'
-import { copilotContext, endingOf, reduceTeam, settleTeam } from '../run/decode'
+import type { LookEvent } from '../typesApp'
+import { copilotContext, copilotLook, endingOf, looksOf, reduceTeam, settleTeam } from '../run/decode'
 import { catalogPatchOf } from '../run/catalogPatch'
 import { activeEdgesOf, applyDerived } from '../run/derive'
 import {
@@ -487,7 +488,9 @@ const memoryOf = (past: ConversationTurn[]): StudioState['copilotMemory'] => ({
 function recordCanvasTurn(
   conversationId: string | null,
   instruction: string,
-  patch: { graph?: any; explanation?: string; answer?: string; status?: 'done' | 'error'; error?: string },
+  patch: { graph?: any; explanation?: string; answer?: string; status?: 'done' | 'error'; error?: string
+    /** 这一轮的查看记录（look §2.5.8）：服务端下一轮据此写「上一轮查看过」 */
+    meta?: { looks: LookEvent[] } },
   set?: (fn: (s: StudioState) => Partial<StudioState>) => void,
 ): void {
   if (!conversationId) return
@@ -594,7 +597,7 @@ interface StudioState {
     errorDetail: string
     model: string
     // 从提交到第一个操作之间有 5~30 秒，得让用户看见这段在发生什么
-    phase: 'connecting' | 'planning' | 'building' | 'wiring' | 'finalizing' | 'repairing' | ''
+    phase: 'connecting' | 'planning' | 'looking' | 'building' | 'wiring' | 'finalizing' | 'repairing' | ''
     thinking: string        // 模型的思考原文（只有支持 thinking 的模型有）
     elapsedMs: number
     lastInstruction: string // 失败后"用同一需求重试"要用
@@ -1287,8 +1290,9 @@ export const useStudio = create<StudioState>((set, get) => ({
     const seq = ++upgradeSeq
     const { nodes, edges, workflow } = get()
     const graph = toGraph(nodes, edges)
-    // 受管的图升级完还要按受管重新发布：新写出来的报告节点直接按受管门禁的要求配
-    const level = workflow?.status === 'governed' ? 'governed' : 'published'
+    // 受管的图升级完还要按受管重新发布：新写出来的报告节点直接按受管门禁的要求配。按当前发布版的级别认（画布上改过
+    // 之后 status 回到草稿，受管工作流仍是受管的）
+    const level = workflow ? publishedLevelOf(workflow) : 'published'
     set({ upgrade: { status: 'loading', assist, seq } })
     try {
       const raw = await api.copilot.upgradeEvidence({ graph, level, ...(assist ? { assist: true } : {}) }, { signal: ctl.signal })
@@ -1712,6 +1716,7 @@ export const useStudio = create<StudioState>((set, get) => ({
         workflow_id: workflow?.id,
         graph: toGraph(nodes, edges),
         input,
+        origin: 'canvas',
       })
       const trace = seedTrace(run)
       set({ run, streaming: true, trace, runPhase: trace.phase, runSnapshot: snapshotOf(nodes, edges) })
@@ -1794,6 +1799,11 @@ export const useStudio = create<StudioState>((set, get) => ({
           return { ...t, ops: [...t.ops, op] }
         }),
       }))
+    }
+    /** 这一轮查看过什么，随轮次存进 meta.looks（look §2.5.8）；没查看过就不写 meta */
+    const looksMeta = (): { meta?: { looks: LookEvent[] } } => {
+      const looks = looksOf(get().copilotTurns.find((t) => t.id === turnId)?.ops ?? [])
+      return looks.length ? { meta: { looks } } : {}
     }
     const settle = (patch: Partial<CopilotTurn>) => {
       set((s: StudioState) => ({
@@ -1884,19 +1894,23 @@ export const useStudio = create<StudioState>((set, get) => ({
             })
             break
           case 'heartbeat':
-            // 模型沉默期间的补拍，用来刷新阶段和已用时长
+            // 模型沉默期间的补拍，用来刷新阶段和已用时长。查看进行中（looking）浮条直说「正在查看表结构…」，
+            // 不留着上一条操作的说法——那会像是卡在了上一步
             set({
               copilot: {
                 ...s.copilot,
                 phase: (op.phase as any) ?? s.copilot.phase,
                 elapsedMs: op.elapsed_ms ?? s.copilot.elapsedMs,
+                ...(op.phase === 'looking' ? { lastOp: LOOK_TEXT.running } : {}),
               },
             })
             break
+          case 'look':
           case 'context': {
-            // 服务端按需求挑了表：浮条和轮次卡上先说参考了几张表，展开的过程里有表名（decodeCopilot）
-            const ctx = copilotContext(op)
-            if (ctx) set({ copilot: { ...s.copilot, lastOp: ctx.title } })
+            // 助手查看了表结构（老服务端是预先挑表的 context）：浮条上说查看了什么，展开的过程里有表名（decodeCopilot）。
+            // 查看记录随这一轮存进 meta.looks（recordCanvasTurn）
+            const look = op.op === 'look' ? copilotLook(op) : copilotContext(op)
+            if (look) set({ copilot: { ...s.copilot, lastOp: look.title } })
             break
           }
           case 'catalog_patch': {
@@ -1942,7 +1956,7 @@ export const useStudio = create<StudioState>((set, get) => ({
             const text = String(op.text ?? '')
             settle({ phase: 'done', outcome: 'answered', reply: text })
             finish({ explanation: '', error: '' })
-            recordCanvasTurn(get().copilotConversationId, instruction, { answer: text, status: 'done' }, set)
+            recordCanvasTurn(get().copilotConversationId, instruction, { answer: text, status: 'done', ...looksMeta() }, set)
             break
           }
           case 'add_node': {
@@ -2095,7 +2109,7 @@ export const useStudio = create<StudioState>((set, get) => ({
             settle({ phase: 'done', outcome, diff, issues, explanation, toolChanges, toolWarnings })
             finish({ explanation, error: '' })
             recordCanvasTurn(get().copilotConversationId, instruction, {
-              graph: op.graph, explanation: explanation ?? '', status: 'done',
+              graph: op.graph, explanation: explanation ?? '', status: 'done', ...looksMeta(),
             }, set)
             void get().validate()
             setTimeout(() => {
@@ -2127,7 +2141,7 @@ export const useStudio = create<StudioState>((set, get) => ({
             finish({ explanation: '', error: message,
                      errorHint: typeof op.hint === 'string' ? op.hint : '',
                      errorDetail: typeof op.detail === 'string' ? op.detail : '' })
-            recordCanvasTurn(get().copilotConversationId, instruction, { status: 'error', error: message }, set)
+            recordCanvasTurn(get().copilotConversationId, instruction, { status: 'error', error: message, ...looksMeta() }, set)
             break
           }
         }
@@ -2274,6 +2288,7 @@ export const useStudio = create<StudioState>((set, get) => ({
         workflow_id: workflow.id,
         run_class: 'formal',
         input,
+        origin: 'launcher',
       })
       const trace = seedTrace(run)
       // 正式运行跑的是已发布版本；画布有未保存改动时不让发起，所以此刻的画布就是它

@@ -83,11 +83,14 @@ async def test_the_group_round_trips(client, providers):
     ("起草模型甲", "起草模型"),
 ])
 async def test_bad_values_are_refused_with_the_settings_page_wording(client, providers, value, label):
-    r = await client.put("/api/settings", json={"values": {"catalog_draft": value, "ui": {"theme": "dark"}}})
+    # 比的是这次请求前后：同一个测试进程里别的测试可能已经把主题存成了别的值，不能假定它不是 dark
+    before = (await client.get("/api/settings")).json()["ui"]["theme"]
+    wanted = "light" if before == "dark" else "dark"
+    r = await client.put("/api/settings", json={"values": {"catalog_draft": value, "ui": {"theme": wanted}}})
     assert r.status_code == 422, r.text
     assert label in r.json()["detail"]
     got = (await client.get("/api/settings")).json()
-    assert got["catalog_draft"] == {"provider": None, "model": None} and got["ui"]["theme"] != "dark"
+    assert got["catalog_draft"] == {"provider": None, "model": None} and got["ui"]["theme"] == before
 
 
 @pytest.mark.parametrize("name,reason,fix", [

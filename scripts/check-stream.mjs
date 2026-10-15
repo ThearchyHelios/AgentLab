@@ -761,33 +761,39 @@ await section('并行查询各配各的；查询的 SQL 检查；指标的问题
   await page.close()
 })
 
-await section('参考了哪些表：画布右栏和问数据页（context 操作）', async () => {
-  const c = await open('syn=copilot-context&dense=1', { w: 380, h: 800, name: 'copilot-context' })
-  const row = c.page.locator('[data-step-code="copilot_context"]')
-  check('画布右栏：一行说参考了几张表', await row.count() === 1 && (await row.innerText()).includes('参考了 5 张表'),
+await section('助手查看了哪些表：画布右栏和问数据页（look 事件）', async () => {
+  // look §2.6：一次查看一行；标题说看了什么，副标题说在哪、怎么来的，表名收在展开区
+  const c = await open('syn=copilot-context&dense=1', { w: 380, h: 800, name: 'copilot-look' })
+  const row = c.page.locator('[data-step-code="copilot_look"]')
+  check('画布右栏：一行说查看了几张表', await row.count() === 1 && (await row.innerText()).includes('查看了 5 张表'),
     await row.count() ? await row.innerText() : '没有这一行')
+  check('副标题写库名和怎么来的', (await row.innerText()).includes('按需求挑选'))
   check('表名收在展开区，不铺满窄栏', !(await row.innerText()).includes('channel_visits'))
   await row.locator('button').first().click()
   await c.page.waitForTimeout(150)
   const expanded = await row.innerText()
-  check('展开看到按数据源分组的表名', expanded.includes('「scenic」按需求从 51 张表中挑出 3 张')
-    && expanded.includes('channel_visits') && expanded.includes('「shop」全部 2 张表'), expanded.slice(0, 160))
+  check('展开看到每个库一行和没找到的表', expanded.includes('「scenic」：按需求挑出 visits、channels')
+    && expanded.includes('为连接补上 channel_visits') && expanded.includes('没找到：「shop」的 refund_detail'), expanded.slice(0, 200))
   const overflow = await c.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   check('展开后不撑破 380px 窄栏', overflow <= 0, `${overflow}px`)
-  check('有数据目录的大库：不提示起草目录', await row.locator('[data-step-next]').count() === 0
-    && await row.locator('[data-fix="catalog"]').count() === 0)
+  const hint0 = row.locator('[data-step-next]')
+  check('没有数据目录的库：常显下一步，点名那个库', await hint0.count() === 1
+    && (await hint0.innerText()).includes('「shop」还没有数据目录'), await hint0.count() ? await hint0.innerText() : '没有这一句')
+  check('旧文案不再出现', !/参考了 \d+ 张表|只提供了表名|未能按需求挑选/.test(await c.page.locator('body').innerText()))
   check('没有运行时报错', c.errors.length === 0, c.errors.join(' | '))
   await c.page.close()
 
-  const f = await open('syn=copilot-fallback&dense=1', { w: 380, h: 800, name: 'copilot-fallback' })
-  const fb = f.page.locator('[data-step-code="copilot_context"]')
-  check('挑表失败：写明只给了表名', await fb.count() === 1 && (await fb.innerText()).includes('未能按需求挑选，已提供全部表名'))
-  // 真实运行里数据源一张目录都没有：这一行下面常显下一步，入口去那个源的目录页
-  const hint = fb.locator('[data-step-next]')
-  check('没有数据目录的大库：常显「还没有数据目录」，不收进展开区', await hint.count() === 1
+  const f = await open('syn=copilot-fallback&dense=1', { w: 380, h: 800, name: 'copilot-look-fallback' })
+  const rows = f.page.locator('[data-step-code="copilot_look"]')
+  check('挑表失败后点名再看：两次查看各一行', await rows.count() === 2, String(await rows.count()))
+  const fb = rows.first()
+  check('挑表失败：标题直说没挑出来、已交回表目录', (await fb.innerText()).includes('没挑出来，已把表目录交给助手'))
+  const second = rows.nth(1)
+  const hint = second.locator('[data-step-next]')
+  check('点名查看的那一行：没有数据目录时常显「还没有数据目录」', await hint.count() === 1
     && (await hint.innerText()).includes('这个数据源还没有数据目录，起草后挑表和 SQL 检查会更准'),
     await hint.count() ? await hint.innerText() : '没有这一句')
-  const go = fb.locator('a[data-fix="catalog"]')
+  const go = second.locator('a[data-fix="catalog"]')
   check('……附去数据目录页的入口', await go.count() === 1 && await go.getAttribute('href') === '/data/catalog/src-scenic'
     && (await go.innerText()).includes('去数据目录起草'), await go.count() ? await go.getAttribute('href') : '没有入口')
   const narrow = await f.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
@@ -797,12 +803,14 @@ await section('参考了哪些表：画布右栏和问数据页（context 操作
   check('挑表失败：展开看到原因', (await fb.innerText()).includes('原因：挑选数据表超过 20 秒未完成'))
   await f.page.close()
 
-  const q = await open('syn=chat', { w: 1100, h: 800, name: 'chat-context' })
-  check('问数据页：执行开始后这一行随「规划」收起', !(await q.page.locator('body').innerText()).includes('参考了 2 张表'))
+  // 问数据页的桩数据（dev/preview 的 syn=chat）是一条 look 事件（按需查看了两张表）：照 look 的说法显示，不再出老的 context 行
+  const q = await open('syn=chat', { w: 1100, h: 800, name: 'chat-look' })
+  check('问数据页：执行开始后这一行随「规划」收起', !(await q.page.locator('body').innerText()).includes('查看了 2 张表'))
   await q.page.locator('button', { hasText: '规划' }).first().click()
   await q.page.waitForTimeout(200)
-  const qrow = q.page.locator('[data-step-code="copilot_context"]')
-  check('问数据页：点开「规划」看到参考了几张表', await qrow.count() === 1 && (await qrow.innerText()).includes('参考了 2 张表'))
+  const qrow = q.page.locator('[data-step-code="copilot_look"]')
+  check('问数据页：点开「规划」看到查看了几张表（look 行）', await qrow.count() === 1 && (await qrow.innerText()).includes('查看了 2 张表'))
+  check('问数据页：没有老的 context 行', await q.page.locator('[data-step-code="copilot_context"]').count() === 0)
   await qrow.locator('button').first().click()
   await q.page.waitForTimeout(150)
   check('问数据页：展开看到表名', (await qrow.innerText()).includes('v_device_kpi、dim_device'))

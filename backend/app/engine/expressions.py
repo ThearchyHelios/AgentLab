@@ -476,6 +476,23 @@ _OP_SYMBOLS = {
 }
 
 
+#: arithmetic=False 时不能调用的函数：它们本身就是在算数（应用的可见性表达式只做比较、布尔运算、取值和 in，P7）
+_ARITH_FUNCS = frozenset({"abs", "min", "max", "sum", "round", "int", "float"})
+_ARITH_SYMBOLS = {
+    "Add": "+", "Sub": "-", "Mult": "*", "Div": "/", "FloorDiv": "//", "Mod": "%", "Pow": "**",
+    "USub": "-", "UAdd": "+",
+}
+
+
+class ExpressionArithmetic(ExpressionError):
+    """arithmetic=False 时写了算术。应用检查据此给 app.expr_arith，和别的不合法（app.expr_invalid）分开。"""
+
+
+def _no_arithmetic(what: str) -> ExpressionArithmetic:
+    return ExpressionArithmetic(f"这里的表达式只能做比较、布尔运算、取值和 in，不能做算术（{what}）。要用算出来的数，"
+                                "请在工作流的口径卡里算好，再按指标取值")
+
+
 def _unsupported(name: str) -> str:
     """「表达式中不支持列表推导式」「表达式中不支持 lambda」：英文写法前面空一格。"""
     label = _NODE_NAMES.get(name, name)
@@ -504,13 +521,26 @@ class _Unbrace(ast.NodeTransformer):
         return node
 
 
-def _check_static(tree: ast.Expression) -> list[str]:
+def _check_static(tree: ast.Expression, roots: frozenset[str] = EXPRESSION_ROOTS,
+                  arithmetic: bool = True) -> list[str]:
     """不求值，只看结构：违规直接抛 ExpressionError，返回不认识的名字（留给提示用）。
 
     运行时求值会短路（and/or、三元只走一边），没走到的那一半写错了也发现不了；
     画布校验和 Copilot 自查要的是"整条表达式都能跑"，所以得把整棵树走一遍。
+
+    roots：认得的根名字（应用的可见性表达式用 apps.spec.APP_ROOTS）。arithmetic 为假时算术一律抛
+    ExpressionArithmetic：负数字面量（-1）不算算术，-x 算。
     """
     unknown: list[str] = []
+    if not arithmetic:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
+                raise _no_arithmetic(_ARITH_SYMBOLS.get(type(node.op).__name__, ""))
+            if (isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd))
+                    and not isinstance(node.operand, ast.Constant)):
+                raise _no_arithmetic(_ARITH_SYMBOLS[type(node.op).__name__])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _ARITH_FUNCS:
+                raise _no_arithmetic(f"{node.func.id}()")
     for node in ast.walk(tree):
         if isinstance(node, ast.BinOp) and type(node.op) not in _BIN_OPS:
             if isinstance(node.op, ast.BitOr):
@@ -534,17 +564,21 @@ def _check_static(tree: ast.Expression) -> list[str]:
             raise ExpressionError(
                 f"字符串「{node.value}」中的 {{{{ }}}} 不会被渲染：表达式不经过模板渲染，请直接写路径，例如 vars.x"
             )
-        elif (isinstance(node, ast.Name) and node.id not in EXPRESSION_ROOTS
+        elif (isinstance(node, ast.Name) and node.id not in roots
               and node.id not in _SAFE_FUNCS and node.id not in _LITERAL_NAMES):
             unknown.append(node.id)
     return list(dict.fromkeys(unknown))
 
 
-def parse_expression(expr: str) -> tuple[ast.Expression, list[str], list[str]]:
+def parse_expression(expr: str, *, roots: frozenset[str] | None = None,
+                     arithmetic: bool = True) -> tuple[ast.Expression, list[str], list[str]]:
     """解析 + 静态检查：(语法树, 被剥掉的 {{ }}, 不认识的名字)。结构违规抛 ExpressionError。
 
     运行时求值、画布校验、Copilot 自查都走这一个入口——三处各写一套规则的话，
     迟早出现"校验说能跑、跑起来报错"。
+
+    应用的可见性表达式也走这里（应用平台 A2）：roots=APP_ROOTS、arithmetic=False，算术抛 ExpressionArithmetic。
+    不给这两个参数时和以前一模一样（图里的根名字，允许算术）。
     """
     text = (expr or "").strip()
     try:
@@ -556,7 +590,7 @@ def parse_expression(expr: str) -> tuple[ast.Expression, list[str], list[str]]:
     tree = ast.fix_missing_locations(unbrace.visit(tree))
     if sum(1 for _ in ast.walk(tree)) > _MAX_NODES:
         raise ExpressionError("表达式过于复杂")
-    unknown = _check_static(tree)
+    unknown = _check_static(tree, EXPRESSION_ROOTS if roots is None else roots, arithmetic)
     return tree, unbrace.found, unknown
 
 
@@ -689,7 +723,8 @@ def substitute(tree: ast.AST, values: dict[str, Any]) -> str:
     return ast.unparse(ast.fix_missing_locations(replaced))
 
 
-def eval_expression(expr: str, ctx: dict[str, Any], *, track: TruncatedUse | None = None) -> Any:
+def eval_expression(expr: str, ctx: dict[str, Any], *, track: TruncatedUse | None = None,
+                    roots: frozenset[str] | None = None, arithmetic: bool = True) -> Any:
     """求值一个受限的 Python 表达式。
 
     只放行字面量、比较、布尔/算术运算、下标、属性访问和一小撮白名单函数。
@@ -697,11 +732,14 @@ def eval_expression(expr: str, ctx: dict[str, Any], *, track: TruncatedUse | Non
 
     track：跟踪截断的结果有没有被当成整组用，记进 track.sources（口径卡用，见 TruncatedUse）。
     不给就不跟踪：分支条件、数据整形、复算的行为和以前完全一样。
+
+    roots / arithmetic 同 parse_expression。给了 roots 时只从 ctx 里取这些根名字：别的键哪怕在 ctx 里也取到 None，
+    调用方往上下文里多放了什么，表达式都够不着（应用的可见性表达式，P4）。
     """
     expr = (expr or "").strip()
     if not expr:
         return None
-    tree, _, _ = parse_expression(expr)
+    tree, _, _ = parse_expression(expr, roots=roots, arithmetic=arithmetic)
 
     def _tracked(base_src: Any, full_src: Any, base: Any, key: Any, value: Any) -> Any:
         """取到的值要不要包一层：截断结果的 rows 包成 TruncatedRows，row_count 直接记一笔
@@ -728,7 +766,7 @@ def eval_expression(expr: str, ctx: dict[str, Any], *, track: TruncatedUse | Non
         if isinstance(node, ast.Constant):
             return node.value
         if isinstance(node, ast.Name):
-            if node.id in ctx:
+            if node.id in ctx and (roots is None or node.id in roots):
                 return ctx[node.id]
             if node.id in _SAFE_FUNCS:
                 return _SAFE_FUNCS[node.id]

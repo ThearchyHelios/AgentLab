@@ -8,10 +8,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
+from app.api.deps import ensure_role
+from app.capabilities import registry as capability_registry
+from app.capabilities import secrets as vault
+from app.capabilities.endpoints import bound_endpoint_ref, find_endpoint
 from app.core.errors import explain, raw
 from app.db.base import get_session
-from app.db.models import CustomTool, McpServer
-from app.tools.custom import ToolFailure, schema_problem, trial
+from app.db.models import Capability, CustomTool, Endpoint, McpServer
+from app.tools.custom import ToolFailure, held_write, http_failure, schema_problem, trial
 from app.tools.mcp_manager import mcp_manager
 from app.tools.registry import (
     ToolArgsError, ToolBuildError, ToolContext, Versions, all_specs, build_tools, call_is_dangerous,
@@ -68,6 +72,15 @@ async def list_tools(session: AsyncSession = Depends(get_session)) -> list[dict[
                    for t in await mcp_manager.list_tools())
     except Exception:  # noqa: BLE001 - MCP 连不上不该让整个工具列表挂掉
         pass
+    # 在工具库里执行是不是只演练（写外部系统的能力，和执行接口 _held 同一个判断）：详情区的提示条照这个说「这里只演练，
+    # 不真的发送」，不说「请求会实际发出」
+    customs = {row.name: row for row in (await session.execute(select(CustomTool))).scalars()}
+    # 能力登记一次读进会话：_held 逐个 session.get，登记里有的直接从会话里取，不再一个工具查一次库（会话按弱引用记着
+    # 读过的行，列表留到循环结束）
+    _caps = (await session.execute(select(Capability))).scalars().all()
+    for item in out:
+        custom = customs.get(item["id"]) if item["source"] == "custom" else None
+        item["write_rehearsal"] = await _held(item["id"], custom, session)
     return out
 
 
@@ -131,6 +144,10 @@ async def _side_effect(name: str, args: dict[str, Any], session: AsyncSession) -
     )).scalar_one_or_none()
     if row is not None:
         cfg = row.config or {}
+        if ref := bound_endpoint_ref(row):
+            endpoint = await find_endpoint(session, ref)
+            return (f"将经登记的端点「{endpoint.name if endpoint else ref}」发送 {cfg.get('method') or 'GET'} 请求"
+                    "（试用按探索运行处理：有测试环境时发往测试环境，没有时发往生产环境）")
         if row.kind == "http":
             return (f"将调用自定义接口「{name}」"
                     f"（{cfg.get('method') or 'GET'} {cfg.get('url') or '（未填写地址）'}）")
@@ -142,6 +159,16 @@ async def _side_effect(name: str, args: dict[str, Any], session: AsyncSession) -
     if tools and call_is_dangerous(tools[0], name, args):
         return f"将在可写数据源上执行写操作：{str(args.get('sql') or '')[:120]}"
     return None
+
+
+async def _held(name: str, custom: CustomTool | None, session: AsyncSession) -> bool:
+    """在工具库里执行它是不是只演练：写外部系统的能力。自定义工具按它绑定的端点认（tools/custom.held_write），别的按
+    能力登记的治理认。"""
+    if custom is not None:
+        return await held_write(session, custom)
+    cap = await capability_registry.get_capability(session, name)
+    return cap is not None and capability_registry.writes_externally(
+        name, capability_registry.effective_effect(cap), cap.endpoint_id)
 
 
 @router.post("/{tool_name:path}/run")
@@ -156,8 +183,20 @@ async def run_tool(
     有副作用的工具先 409 说清它会做什么，带上 confirm 再来一次才执行。工作流里
     同一个「需确认」意味着要人工审批，在这里却点一下就真跑了——同一个标签两种
     含义，工具库里试 file_write、shell_exec 的人会以为还有一道关。
+
+    写入外部系统的能力（capabilities.registry.writes_externally，和运行时同一个判断）在这里一律演练、不发送，结果标
+    rehearsal：对外写入只经调用工具节点（要确认、带幂等键、留生效记录，A5）。没有副作用，也就不先 409。
     """
-    if not (confirm or payload.confirm):
+    import json
+    import time
+
+    custom = (await session.execute(select(CustomTool).where(CustomTool.name == tool_name))).scalar_one_or_none()
+    rehearsal = await _held(tool_name, custom, session)
+    if rehearsal and custom is None:
+        # 被治理为写入的 MCP、数据源、内置工具：拼不出将要发送的请求，不执行，交回这次的参数
+        return {"ok": True, "rehearsal": True, "duration_ms": 0,
+                "result": {"rehearsal": True, "message": "演练：写入能力不在这里真的执行", "args": payload.args}}
+    if not (rehearsal or confirm or payload.confirm):
         effect = await _side_effect(tool_name, payload.args, session)
         if effect:
             # 只说后果，不说怎么确认：弹窗还是再点一次是界面的事，写死在这里
@@ -167,8 +206,6 @@ async def run_tool(
     # 不在运行里：上传表格查当前版本（运行里查的是发起时固定的那一版）
     ctx = ToolContext(run_id="playground", node_id="playground",
                       sandbox_session=payload.sandbox_session, data_versions=Versions.CURRENT)
-    import time
-
     started = time.perf_counter()
     notes: list[str] = []
     try:
@@ -188,13 +225,23 @@ async def run_tool(
             "detail": raw(e),
             "duration_ms": int((time.perf_counter() - started) * 1000),
         }
-    return {
-        "ok": True,
-        "result": result,
-        "duration_ms": int((time.perf_counter() - started) * 1000),
-        # 参数名写错、被替换成唯一候选跑通了：运行时会报出来，这里也得说
-        **({"note": notes[0]} if notes else {}),
-    }
+    took = int((time.perf_counter() - started) * 1000)
+    # 参数名写错、被替换成唯一候选跑通了：运行时会报出来，这里也得说
+    extra = {"note": notes[0]} if notes else {}
+    if rehearsal:
+        # 演练回执是平台拼的 JSON：按对象交回，界面逐项画（方法、地址、请求头、请求体）。拼不出请求（路径参数不合法）的
+        # 交回的是 {error}：照实说失败
+        try:
+            value = json.loads(result) if isinstance(result, str) else result
+        except ValueError:
+            value = None
+        if not (isinstance(value, dict) and value.get("rehearsal")):
+            error = value.get("error") if isinstance(value, dict) else None
+            return {"ok": False, "error": str(error or result), "hint": "", "detail": "", "duration_ms": took, **extra}
+        return {"ok": True, "rehearsal": True, "result": value, "duration_ms": took, **extra}
+    if custom is not None and (failed := http_failure(custom, result)):
+        return {"ok": False, **failed, "duration_ms": took, **extra}
+    return {"ok": True, "result": result, "duration_ms": took, **extra}
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +274,9 @@ class CustomToolOut(CustomToolIn):
 def _custom_out(row: CustomTool) -> CustomToolOut:
     out = CustomToolOut.model_validate(row)
     out.problem = schema_problem(row.parameters or {})
+    if "headers" in (row.config or {}):
+        # 请求头的值存的是密文，接口只回掩码；原样提交回来表示保持原值（_seal_config）
+        out.config = {**(row.config or {}), "headers": vault.masked((row.config or {}).get("headers"))}
     return out
 
 
@@ -235,6 +285,34 @@ def _refuse_bad_schema(parameters: Any) -> None:
     problem = schema_problem(parameters)
     if problem:
         raise HTTPException(422, problem)
+
+
+def _seal_config(config: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
+    """请求头的值加密；提交的是原值的掩码时保持原值。名字不合法（空的、带空格、冒号、中文）的不让存：存进去之后每次
+    调用都在发出之前失败。值里可以写 {{ 参数 }} 模板，不查。"""
+    if "headers" not in config:
+        return config
+    headers = config.get("headers")
+    if headers is not None and not isinstance(headers, dict):
+        raise HTTPException(422, "请求头需要写成 JSON 对象，每个请求头名称对应一个值")
+    if problem := vault.header_problem(headers, check_values=False):
+        raise HTTPException(422, problem)
+    return {**config, "headers": vault.seal(headers, (previous or {}).get("headers"))}
+
+
+async def _refuse_bad_binding(session: AsyncSession, kind: str, config: dict[str, Any]) -> None:
+    """绑定登记端点的 http 工具：端点要存在，路径只写路径（主机和协议由端点决定），模型拿不到任意地址。"""
+    ref = config.get("endpoint")
+    if kind != "http" or not ref:
+        return
+    if await find_endpoint(session, str(ref)) is None:
+        raise HTTPException(422, "绑定的端点不存在，请先到「工具 → 端点」登记")
+    path = str(config.get("path") or "")
+    if path and not path.startswith("/"):
+        raise HTTPException(422, "绑定端点时，路径需要以 / 开头，例如 /orders/{{ order_id }}")
+    method = str(config.get("method") or "GET").upper()
+    if method not in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"):
+        raise HTTPException(422, f"不支持的请求方法「{method}」")
 
 
 @custom_router.get("", response_model=list[CustomToolOut])
@@ -251,10 +329,12 @@ async def create_custom(
     if payload.name in all_specs():
         raise HTTPException(409, f"「{payload.name}」与内置工具重名，请换一个名称")
     _refuse_bad_schema(payload.parameters)
-    row = CustomTool(**payload.model_dump())
+    await _refuse_bad_binding(session, payload.kind, payload.config)
+    row = CustomTool(**{**payload.model_dump(), "config": _seal_config(payload.config, None)})
     session.add(row)
     await session.commit()
     await session.refresh(row)
+    await capability_registry.sync_all(session)
     return _custom_out(row)
 
 
@@ -266,10 +346,14 @@ async def update_custom(
     if not row:
         raise HTTPException(404, "工具不存在，可能已被删除")
     _refuse_bad_schema(payload.parameters)
+    await _refuse_bad_binding(session, payload.kind, payload.config)
+    sealed = _seal_config(payload.config, row.config)
     for key, value in payload.model_dump().items():
         setattr(row, key, value)
+    row.config = sealed
     await session.commit()
     await session.refresh(row)
+    await capability_registry.sync_all(session)
     return _custom_out(row)
 
 
@@ -280,10 +364,12 @@ async def delete_custom(tool_id: str, session: AsyncSession = Depends(get_sessio
         raise HTTPException(404, "工具不存在，可能已被删除")
     await session.delete(row)
     await session.commit()
+    await capability_registry.sync_all(session)
 
 
-async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
-    """试跑一次，返回和工具库「执行」同一种形状：{ok, result | error/hint/detail, duration_ms, note?}。"""
+async def _trial(row: CustomTool, args: dict[str, Any], session: AsyncSession) -> dict[str, Any]:
+    """试跑一次，返回和工具库「执行」同一种形状：{ok, result | error/hint/detail, duration_ms, note?, rehearsal?}。
+    写入能力只演练（rehearsal: true，结果是将要发送的请求）；HTTP 工具的结果按状态码说成败，非 2xx 是失败。"""
     import json
     import time
 
@@ -301,6 +387,7 @@ async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
                 "hint": '参数定义是 JSON Schema，格式如 {"type": "object", "properties": '
                         '{"n": {"type": "integer", "description": "…"}}, "required": ["n"]}',
                 "detail": "", "duration_ms": 0}
+    rehearsal = await held_write(session, row)
     try:
         result, note = await trial(row, args, ctx)
     except ToolArgsError as e:
@@ -323,6 +410,10 @@ async def _trial(row: CustomTool, args: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": error, "hint": hint,
                 "detail": json.dumps(dict(result), ensure_ascii=False), "duration_ms": took(),
                 **extra}
+    if rehearsal:
+        return {"ok": True, "rehearsal": True, "result": result, "duration_ms": took(), **extra}
+    if failed := http_failure(row, result):
+        return {"ok": False, **failed, "duration_ms": took(), **extra}
     return {"ok": True, "result": result, "duration_ms": took(), **extra}
 
 
@@ -339,7 +430,7 @@ class CustomToolDraftIn(BaseModel):
 def _draft_problem(kind: str, config: dict[str, Any]) -> str | None:
     if kind not in ("http", "python"):
         return f"不支持「{kind}」工具类型：仅支持 http 和 python"
-    if kind == "http" and not str(config.get("url") or "").strip():
+    if kind == "http" and not str(config.get("url") or "").strip() and not config.get("endpoint"):
         return "尚未填写接口地址"
     if kind == "python" and not str(config.get("code") or "").strip():
         return "尚未填写代码"
@@ -347,18 +438,24 @@ def _draft_problem(kind: str, config: dict[str, Any]) -> str | None:
 
 
 @custom_router.post("/test")
-async def test_custom_draft(payload: CustomToolDraftIn) -> dict[str, Any]:
+async def test_custom_draft(payload: CustomToolDraftIn, session: AsyncSession = Depends(get_session)
+                            ) -> dict[str, Any]:
     """试跑一份没保存的配置，不落库。
 
     以前只能试已保存的：新建要先保存才能试，改了代码也得先存——保存等于让节点
     立刻用上一个还没试过的版本。
+
+    编辑已保存的工具时，界面上的请求头是掩码：按同名工具存着的值认回来，不然试跑带着掩码去请求。
+    绑定端点的草稿按草稿的方法、路径、请求体拼请求（不是同名的已保存那一版）；读写按已保存的治理和草稿的方法里更严的
+    一个认（tools/custom._effect_of）：把只读的改成 POST 去试，只演练、不发送。
     """
     problem = _draft_problem(payload.kind, payload.config)
     if problem:
         return {"ok": False, "error": problem, "hint": "", "detail": "", "duration_ms": 0}
-    draft = CustomTool(name=payload.name or "draft_tool", kind=payload.kind,
-                       parameters=payload.parameters, config=payload.config)
-    return await _trial(draft, payload.args)
+    saved = (await session.execute(select(CustomTool).where(CustomTool.name == payload.name))).scalar_one_or_none()
+    draft = CustomTool(name=payload.name or "draft_tool", kind=payload.kind, parameters=payload.parameters,
+                       config=_seal_config(payload.config, saved.config if saved else None))
+    return await _trial(draft, payload.args, session)
 
 
 @custom_router.post("/{tool_id}/test")
@@ -368,7 +465,7 @@ async def test_custom(
     row = await session.get(CustomTool, tool_id)
     if not row:
         raise HTTPException(404, "工具不存在，可能已被删除")
-    return await _trial(row, payload.args)
+    return await _trial(row, payload.args, session)
 
 
 # --------------------------------------------------------------------------
@@ -383,9 +480,14 @@ class McpIn(BaseModel):
     transport: str = "stdio"  # stdio | http
     command: str | None = None
     args: list[str] = Field(default_factory=list)
+    #: env、headers 的值存密文、接口只回掩码，提交掩码值表示保持原值
     env: dict[str, str] = Field(default_factory=dict)
     url: str | None = None
     enabled: bool = True
+    #: http 传输的认证头
+    headers: dict[str, str] = Field(default_factory=dict)
+    #: 绑定登记的端点：url 只填路径，主机、协议、内网访问、认证头跟端点走
+    endpoint_id: str | None = None
 
 
 class McpOut(McpIn):
@@ -403,6 +505,7 @@ class McpOut(McpIn):
 
 def _mcp_out(row: McpServer) -> McpOut:
     out = McpOut.model_validate(row)
+    out.env, out.headers = vault.masked(row.env), vault.masked(row.headers)
     checked = health.fields(row.last_check)
     out.last_checked_at = checked["last_checked_at"]
     out.last_check_ok = checked["last_check_ok"]
@@ -411,7 +514,35 @@ def _mcp_out(row: McpServer) -> McpOut:
 
 
 def _mcp_connection(row: McpServer) -> tuple[Any, ...]:
-    return (row.transport, row.command, list(row.args or []), dict(row.env or {}), row.url)
+    return (row.transport, row.command, list(row.args or []), dict(row.env or {}), row.url,
+            dict(row.headers or {}), row.endpoint_id)
+
+
+async def _guard_mcp(payload: McpIn, row: McpServer, session: AsyncSession) -> None:
+    """stdio 是在服务器上执行命令，只有管理员能建、能改（关登录时所有人等同管理员）；http 的地址要么绑定登记的端点，
+    要么过 SSRF 检查（mcp_manager.check_url，连接前还会再查一次）。"""
+    if payload.transport != "http":
+        ensure_role("admin")
+        return
+    from app.tools import mcp_manager as mcp_module
+    from app.tools.net import UnsafeUrlError
+
+    if payload.endpoint_id and await session.get(Endpoint, payload.endpoint_id) is None:
+        raise HTTPException(422, "绑定的端点不存在，请先到「工具 → 端点」登记")
+    if not payload.endpoint_id and not (payload.url or "").strip():
+        raise HTTPException(422, "尚未填写 MCP 服务的地址")
+    try:
+        await mcp_module.check_url(row)
+    except UnsafeUrlError as e:
+        raise HTTPException(422, f"MCP 服务的地址未通过安全检查：{e}") from e
+
+
+def _apply_mcp(row: McpServer, payload: McpIn) -> None:
+    previous_env, previous_headers = dict(row.env or {}), dict(row.headers or {})
+    for key, value in payload.model_dump().items():
+        setattr(row, key, value)
+    row.env = vault.seal(payload.env, previous_env)
+    row.headers = vault.seal(payload.headers, previous_headers)
 
 
 @mcp_router.get("/servers", response_model=list[McpOut])
@@ -425,7 +556,9 @@ async def create_server(
 ) -> McpOut:
     if (await session.execute(select(McpServer).where(McpServer.name == payload.name))).scalar_one_or_none():
         raise HTTPException(409, f"已存在名为「{payload.name}」的 MCP 服务，请换一个名称")
-    row = McpServer(**payload.model_dump())
+    row = McpServer()
+    _apply_mcp(row, payload)
+    await _guard_mcp(payload, row, session)
     session.add(row)
     await session.commit()
     await session.refresh(row)
@@ -439,9 +572,12 @@ async def update_server(
     row = await session.get(McpServer, server_id)
     if not row:
         raise HTTPException(404, "MCP 服务不存在，可能已被删除")
+    if row.transport != "http":
+        ensure_role("admin")
     before, old_name, was_enabled = _mcp_connection(row), row.name, row.enabled
-    for key, value in payload.model_dump().items():
-        setattr(row, key, value)
+    _apply_mcp(row, payload)
+    if _mcp_connection(row) != before:
+        await _guard_mcp(payload, row, session)
     if _mcp_connection(row) != before:
         # 启动命令、地址换了，上次的「连得上」说的是另一个进程
         row.status, row.last_error, row.last_check = "unknown", None, None
@@ -458,9 +594,12 @@ async def delete_server(server_id: str, session: AsyncSession = Depends(get_sess
     row = await session.get(McpServer, server_id)
     if not row:
         raise HTTPException(404, "MCP 服务不存在，可能已被删除")
+    if row.transport != "http":
+        ensure_role("admin")
     await session.delete(row)
     await session.commit()
     mcp_manager.invalidate(row.name)
+    await capability_registry.sync_all(session)
 
 
 @mcp_router.post("/servers/{server_id}/probe")
@@ -480,9 +619,12 @@ async def probe_server(
     row.tools_cache = [t["name"] for t in result.get("tools", [])]
     row.last_check = health.record(result.get("ok"), result["elapsed_ms"], result.get("error"))
     await session.commit()
+    await capability_registry.sync_all(session)
     return result
 
 
 @mcp_router.post("/refresh")
-async def refresh_mcp() -> dict[str, Any]:
-    return {"servers": await mcp_manager.refresh()}
+async def refresh_mcp(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    servers = await mcp_manager.refresh()
+    await capability_registry.sync_all(session)
+    return {"servers": servers}

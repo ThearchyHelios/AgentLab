@@ -15,9 +15,17 @@ const PAGE = 20
  * 触发历史：每次触发一行，新的在前，20 条一页、「加载更多」往后接。计划时间按定时任务的时区写；跳过、发起失败
  * 写原因；发起了的链到那次运行、写运行现在的状态；运行成功结束后服务端和同一任务上一次成功的运行比过的，另给
  * 「与上一次对比」（基准不是紧挨着的上一次时写「与上一次成功的运行对比」）；发出去的通知逐条写结果。refreshKey 变了
- * （立即运行之后）从头重取
+ * （立即运行之后）从头重取。
+ *
+ * 和页头的「上次触发」对齐：latest 是页头最新读到的那一次（页头原地刷新时跟着变），列表里有同一次就原地换上它的状态，
+ * 没有、而且比列表第一条新就从头重取；反过来，从头取回第一页时把最新的那一条交给 onNewest，页头据此跟着变
  */
-export function FireHistory({ schedule, refreshKey }: { schedule: Schedule; refreshKey: number }) {
+export function FireHistory({ schedule, refreshKey, latest, onNewest }: {
+  schedule: Schedule
+  refreshKey: number
+  latest?: ScheduleFire | null
+  onNewest?: (fire: ScheduleFire | null) => void
+}) {
   const [items, setItems] = useState<ScheduleFire[] | null>(null)
   const [next, setNext] = useState<string | null>(null)
   const [error, setError] = useState<unknown>(null)
@@ -26,6 +34,8 @@ export function FireHistory({ schedule, refreshKey }: { schedule: Schedule; refr
   // 从头重取时作废还在路上的「加载更多」：两份答复交错接上会重复、会漏
   const seq = useRef(0)
   const id = schedule.id
+  const newestRef = useRef(onNewest)
+  newestRef.current = onNewest
 
   const load = useCallback(async () => {
     const n = ++seq.current
@@ -35,11 +45,24 @@ export function FireHistory({ schedule, refreshKey }: { schedule: Schedule; refr
       setItems(page.items ?? [])
       setNext(page.next_before ?? null)
       setError(null)
+      newestRef.current?.(page.items?.[0] ?? null)
     } catch (e) {
       if (n === seq.current) setError(e)
     }
   }, [id])
   useEffect(() => { void load() }, [load, refreshKey])
+
+  // 页头读到的最新一次：同一次原地换上（运行跑完了），列表里没有的新触发从头重取。只看会变的几项，页头每次原地刷新
+  // 都是一个新对象，不能拿对象比
+  const latestKey = latest ? [latest.id, latest.status, latest.run_status ?? '', latest.created_at].join('|') : ''
+  useEffect(() => {
+    if (!latest || items === null) return
+    if (items.some((f) => f.id === latest.id)) {
+      setItems((cur) => cur && cur.map((f) => (f.id === latest.id ? { ...f, ...latest } : f)))
+    } else if (!items.length || (parseServerTime(latest.created_at)?.getTime() ?? 0) > (parseServerTime(items[0].created_at)?.getTime() ?? 0)) {
+      void load()
+    }
+  }, [latestKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const more = async () => {
     if (!next || loadingMore) return

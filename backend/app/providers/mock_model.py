@@ -46,6 +46,68 @@ def _fake_value(schema: dict[str, Any], key: str = "") -> Any:
     return f"[mock:{key or 'value'}]"
 
 
+#: 助手按操作流写图时 system 里一定有这一句（api/copilot.py 的 _STREAM_PROTOCOL / APP_PROTOCOL_PROMPT）
+_OPS_MARK = "输出格式（严格遵守）"
+#: 看起来是在问数据的请求：演示模型据此决定要不要先 look 一次。闲聊、改提示词不看
+_DATA_WORDS = re.compile(r"查|多少|几个|统计|数据|表|库|sql|金额|数量|排名|趋势|汇总|明细|报表|周报|月报|指标|销售|"
+                         r"订单|人数|人次|收入|占比|同比|环比|top", re.I)
+_QUERY_TOOL = re.compile(r"- db_query__(\S+?)（数据库）")
+
+
+def _question_of(human: str) -> str:
+    """助手请求里用户的原话：问数据是「问题：…」那一行，画布新建是「请设计一个工作流：…」，改图是最后一段。"""
+    for mark in ("问题：", "请设计一个工作流："):
+        if mark in human:
+            return human.rsplit(mark, 1)[1].split("\n", 1)[0].strip()
+    return human.strip().rsplit("\n", 1)[-1].strip()
+
+
+def _ops(*ops: dict[str, Any]) -> str:
+    return "\n".join(json.dumps(op, ensure_ascii=False) for op in ops) + "\n"
+
+
+def _copilot_script(messages: list[BaseMessage]) -> str | None:
+    """助手（画布、问数据、应用润色）的演示脚本：没配模型接入时也能看到「查看 → 接着写」的完整过程。
+
+    - 数据类请求、有数据源：先 plan，再 look 一次（只写 kind 和数据源，按需求挑表），停下；
+    - 收到查看结果（对话里已经有一条自己的输出）：接着写一张「输入 → 查库的 Agent → 成果」的图；
+    - 闲聊：一行 reply，不看；
+    - 自查修正、应用润色：只说明，不改。
+    """
+    system = next((_text_of(m) for m in messages if m.type == "system"), "")
+    if _OPS_MARK not in system:
+        return None
+    humans = [_text_of(m) for m in messages if m.type == "human"]
+    first, last = (humans[0], humans[-1]) if humans else ("", "")
+    if "app_add" in system:
+        return _ops({"op": "plan", "summary": "演示模型不改应用"},
+                    {"op": "done", "explanation": "（演示模型）没有修改应用。如需真实的润色，请在「设置 → 模型接入」中添加模型接入"})
+    if "上线前自查" in last:
+        return _ops({"op": "done", "explanation": "演示模型不做修正"})
+    question = _question_of(first)
+    sources = _QUERY_TOOL.findall(system)
+    if any(m.type == "ai" for m in messages):
+        tool = f"db_query__{sources[0]}" if sources else None
+        answering = "用户问了下面这个问题" in first
+        return _ops(
+            {"op": "add_node", "node": {"id": "start", "type": "input", "label": "输入",
+                                        "config": {} if answering else {"fields": [{"name": "question"}]}}},
+            {"op": "add_node", "node": {"id": "ask", "type": "agent", "label": "查库回答", "config": {
+                "prompt": "{{ input.question }}", "tools": [tool] if tool else [], "assign_to": "answer"}}},
+            {"op": "add_edge", "edge": {"source": "start", "target": "ask"}},
+            {"op": "add_node", "node": {"id": "out", "type": "output", "label": "成果", "config": {
+                "fields": [{"name": "answer", "value": "{{ vars.answer }}"}]}}},
+            {"op": "add_edge", "edge": {"source": "ask", "target": "out"}},
+            {"op": "done", "explanation": "（演示模型）按查看结果搭了一张查库回答的图", "run": True},
+        )
+    if sources and '"op":"look"' in system and _DATA_WORDS.search(question):
+        return _ops({"op": "plan", "summary": "先看一下相关的表，再搭查库回答的图"},
+                    {"op": "look", "need": question[:80] or "这个问题要用到的表",
+                     "targets": [{"kind": "table", "source": sources[0]}]})
+    topic = re.sub(r"\s+", " ", question).strip()[:60] or "这个问题"
+    return _ops({"op": "reply", "text": f"（演示模型的回复）收到「{topic}」。如需真实的回答，请在「设置 → 模型接入」中添加模型接入"})
+
+
 class MockChatModel(BaseChatModel):
     """不联网的假模型。
 
@@ -111,6 +173,10 @@ class MockChatModel(BaseChatModel):
         if self.response_format:
             payload = _fake_value(self.response_format)
             return AIMessage(content=json.dumps(payload, ensure_ascii=False, indent=2))
+
+        # 助手按操作流写图：照脚本走一遍（数据类请求先 look 一次）
+        if not self.tools and (script := _copilot_script(messages)) is not None:
+            return AIMessage(content=script)
 
         # 绑了工具、而且这一轮还没有工具返回过 —— 那就调一次工具，
         # 让 agent 循环和画布上的工具节点真的被走到

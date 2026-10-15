@@ -8,7 +8,7 @@ import type {
   RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
 } from '../types'
 import type {
-  Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, EvidenceGraph,
+  Approval, AutofixResult, Conversation, ConversationDetail, ConversationTurn, CustomTool, DataSource, DataSourceName, EvidenceGraph,
   EvidenceAudit, EvidenceJudgeResult, EvidenceProvenance, EvidenceSegmentDetail, GraphSpec, KbDocument, MemoryItem, Provider, PublishCheck, PublishLevel, ReviewResult, Run,
   RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, UploadDecision, UploadMixedColumn, UploadResult,
   UploadShapeReason, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
@@ -23,6 +23,11 @@ import { inquiry } from './inquiry'
 import { schedules } from './schedules'
 import { whatif } from './whatif'
 import { reportExport } from './reportExport'
+// 应用平台：各自的接口文件，这里只挂上去
+import { apps, ledger } from './apps'
+import { actions, tasks } from './tasks'
+import { auth, identity } from './auth'
+import { capabilities, endpoints, notify } from './capabilities'
 
 // 请求层搬到了 http.ts（见那边的说明）。原先从这里导出的照旧从这里导出，调用方不用改；
 // 请求函数也一并转出，给不在 api/ 下、又想直接发请求的地方用。api/ 下的命名空间文件请直接从 http.ts 导入
@@ -227,6 +232,10 @@ export const api = {
     /** 某个版本的完整快照（含 graph）。正式运行的输入字段要从已发布版本取，不能取画布 */
     version: (id: string, v: number) => get<WorkflowVersion>(`/workflows/${id}/versions/${v}`),
     restore: (id: string, v: number) => post<Workflow>(`/workflows/${id}/versions/${v}/restore`),
+    /** 退役一个已发布的版本（A1）：当前发布版 409；返回受影响的应用。只有管理员（关登录时所有人） */
+    retire: (id: string, v: number, note?: string) =>
+      post<{ retired: boolean; affected_apps: { app_id: string; name: string; app_version: number }[] }>(
+        `/workflows/${id}/versions/${v}/retire`, { note: note ?? null }),
     publish: (id: string, level: 'published' | 'governed', version?: number) =>
       post<{ ok: boolean; level?: string; version?: number; issues: any[] }>(
         `/workflows/${id}/publish`, { level, version }),
@@ -252,6 +261,14 @@ export const api = {
   // ---- 运行 ----
   datasources: {
     list: (opts?: RequestOptions) => get<DataSource[]>('/datasources', opts),
+    /**
+     * 只有名字和说明（D-c）：开了登录、管理员允许使用者问数据时，使用者的问数据页按它列数据源（完整列表只给搭建者）。
+     * 形状按 {items} 或数组两种都认
+     */
+    names: async (opts?: RequestOptions): Promise<DataSourceName[]> => {
+      const raw = await get<DataSourceName[] | { items: DataSourceName[] }>('/datasources/names', opts)
+      return Array.isArray(raw) ? raw : raw?.items ?? []
+    },
     kinds: () => get<any>('/datasources/kinds'),
     create: (body: any) => post<any>('/datasources', body),
     update: (id: string, body: any) => patch<any>(`/datasources/${id}`, body),
@@ -508,6 +525,8 @@ export const api = {
     list: (params?: {
       workflow_id?: string; status?: RunStatus | RunStatus[] | string; run_class?: 'formal' | 'exploratory'
       q?: string; limit?: number; before?: string
+      /** 按运行来源筛（X3）；none 是来源未记录的老运行 */
+      origin_kind?: string
     }) => get<Run[]>(`/runs${qs(params)}`),
     get: (id: string) => get<Run>(`/runs/${id}`),
     /** 这次运行实际跑的那张图（运行时的快照），不是工作流现在的样子 */
@@ -517,6 +536,8 @@ export const api = {
       workflow_id?: string; graph?: GraphSpec; input?: Record<string, any>
       memory_scope?: string; collection?: string
       run_class?: 'formal' | 'exploratory'; version?: number
+      /** 运行来源（X3）：客户端只能声明 chat、canvas、launcher、api（不传按 api 记），其余由服务端写 */
+      origin?: 'chat' | 'canvas' | 'launcher' | 'api'
     }) => post<Run>('/runs', body),
     artifacts: (id: string) => get<any[]>(`/runs/${id}/artifacts`),
     /** 从失败的节点接着跑。graph 只能带改过配置的同一张图，结构必须一致 */
@@ -808,8 +829,9 @@ export const api = {
       }>('/copilot/generate', body),
     explain: (graph: GraphSpec) => post<{ explanation: string }>('/copilot/explain', { graph }),
     layout: (graph: GraphSpec) => post<GraphSpec>('/copilot/layout', { graph }),
-    fromRun: (runId: string, name?: string) =>
-      post<any>('/copilot/from-run', { run_id: runId, name }),
+    /** from：问数据回答上点「做成应用」时带上这次运行出自哪段对话的哪一轮，记进新工作流的来源 */
+    fromRun: (runId: string, name?: string, from?: { conversation_id?: string | null; turn_id?: string | null }) =>
+      post<any>('/copilot/from-run', { run_id: runId, name, ...(from ?? {}) }),
     getModel: () => get<CopilotModel>('/copilot/model'),
     setModel: (body: { provider?: string | null; model?: string | null }) =>
       put<CopilotModel>('/copilot/model', body),
@@ -832,6 +854,17 @@ export const api = {
   inquiry,
   whatif,
   reportExport,
+
+  // ---- 应用平台（typesApp.ts 是接口约定） ----
+  apps,
+  ledger,
+  tasks,
+  actions,
+  auth,
+  identity,
+  capabilities,
+  endpoints,
+  notify,
 }
 
 /**
@@ -1000,7 +1033,16 @@ export function streamCatalogAssistant(
  * 审批恢复时会重新 attachRun，不传 after 就是 after=0，后端按 `seq > after`
  * 把整条历史再推一遍，而消费方多半是无条件追加——事件就这么重复累积了。
  * 已经有事件在手的场景（重新接上一条运行）应当传当前最大 seq。
+ *
+ * 连不上 WebSocket 时退回轮询（应用平台 D-c）：握手连续 WS_GIVE_UP 次都没打开（服务端按运行判权限，拒绝时握手
+ * 直接断开；代理不转发 WebSocket 也是这样），改为每 POLL_MS 取一次 /runs/{id}/events?after= 和运行状态，运行不在
+ * 进行中时照 stream.end 的样子收尾。第一批是补的历史，同 WebSocket 的回放一样标 replay
  */
+const WS_GIVE_UP = 2
+const POLL_MS = 1500
+/** 不在进行中的状态：同服务端 api/runs._SETTLED，另加服务重启挂起的 suspended（轮询时没有后续事件会来） */
+const SETTLED_STATUS = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'suspended'])
+
 export function streamRun(
   runId: string,
   onEvent: (event: RunEvent) => void,
@@ -1013,19 +1055,62 @@ export function streamRun(
   let closed = false
   let lastSeq = after
   let retry = 0
+  /** 握手连续失败（一次都没打开过就断了）几次 */
+  let refused = 0
+  let pollTimer: ReturnType<typeof setTimeout> | undefined
+
+  const finish = (status?: string) => {
+    if (closed) return
+    closed = true
+    onClose?.({ status })
+  }
+
+  const poll = async (first: boolean) => {
+    if (closed) return
+    let delay = POLL_MS
+    try {
+      const events = await api.runs.events(runId, lastSeq)
+      if (closed) return
+      for (const event of events) {
+        if (event.seq) lastSeq = Math.max(lastSeq, event.seq)
+        onEvent(first ? { ...event, replay: true } : event)
+      }
+      // 这一批没有新事件时才看状态：运行刚结束时最后几条事件和状态可能前后脚落库，先把事件收完
+      if (!events.length) {
+        const run = await api.runs.get(runId)
+        if (closed) return
+        if (SETTLED_STATUS.has(String(run.status))) {
+          // 状态落了、最后几条事件可能刚落库：再补一次再收尾
+          const rest = await api.runs.events(runId, lastSeq).catch(() => [] as RunEvent[])
+          for (const event of rest) {
+            if (event.seq) lastSeq = Math.max(lastSeq, event.seq)
+            onEvent(event)
+          }
+          finish(run.status)
+          return
+        }
+      }
+      retry = 0
+    } catch {
+      // 断线、服务重启：退避重试，最多等 10 秒
+      retry += 1
+      delay = Math.min(POLL_MS * 2 ** retry, 10_000)
+    }
+    if (!closed) pollTimer = setTimeout(() => void poll(false), delay)
+  }
 
   const connect = () => {
     if (closed) return
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    let opened = false
     socket = new WebSocket(`${proto}://${location.host}/api/runs/${runId}/stream?after=${lastSeq}`)
 
     socket.onmessage = (ev) => {
       const event = parseBody(ev.data) as RunEvent & { type: string; status?: string }
       if (event.type === 'stream.end') {
-        closed = true
         socket?.close()
         // 新后端放在 data.status，老后端放在顶层 status
-        onClose?.({ status: event.data?.status ?? event.status })
+        finish(event.data?.status ?? event.status)
         return
       }
       if (event.seq) lastSeq = Math.max(lastSeq, event.seq)
@@ -1033,11 +1118,19 @@ export function streamRun(
     }
     socket.onclose = () => {
       if (closed) return
+      if (!opened) refused += 1
+      if (refused >= WS_GIVE_UP) {
+        socket = null
+        void poll(true)
+        return
+      }
       // 指数退避重连，最多等 5 秒
       retry += 1
       setTimeout(connect, Math.min(300 * 2 ** retry, 5000))
     }
     socket.onopen = () => {
+      opened = true
+      refused = 0
       retry = 0
       report(true)
     }
@@ -1046,6 +1139,7 @@ export function streamRun(
 
   return () => {
     closed = true
+    clearTimeout(pollTimer)
     socket?.close()
   }
 }

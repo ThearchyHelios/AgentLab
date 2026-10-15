@@ -461,6 +461,9 @@ class McpServer(Base, TimestampMixin):
     tools_cache: Mapped[list[Any]] = mapped_column(default=list)
     # 最近一次连接的时刻和耗时（status / last_error 只有结论，没有「何时、多快」）
     last_check: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # http 传输的认证头（值经 core/crypto 加密，接口只回掩码）；或者绑定一个登记的端点（app/capabilities）
+    headers: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    endpoint_id: Mapped[str | None] = mapped_column(String(32), default=None)
 
 
 class CustomTool(Base, TimestampMixin):
@@ -497,6 +500,8 @@ class Workflow(Base, TimestampMixin):
     # 正式运行默认解析到这个版本；为空表示还没发布过
     published_version: Mapped[int | None] = mapped_column(Integer, default=None)
     published_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    # 从运行提取来的工作流记下来源：{"run_id", "conversation_id"?, "turn_id"?}（/copilot/from-run）。手建的为空
+    origin: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     versions: Mapped[list["WorkflowVersion"]] = relationship(
         back_populates="workflow", cascade="all, delete-orphan", lazy="selectin"
@@ -523,6 +528,15 @@ class WorkflowVersion(Base, TimestampMixin):
     # 从这一版发起正式运行时和当前的比，有变化只提醒、不拦。没发布过、或者是加这一列之前发布的为空——不知道
     # 当时是哪一版，不提醒
     catalog_versions: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # 这一版是谁、什么时候发布的（工作流上的 published_by 只记最近一次）。存量为空
+    published_at: Mapped[datetime | None] = mapped_column(default=None)
+    published_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    # 退役：不再接受新的正式运行，进行中的实例照常走完。当前发布版不能退役（app/apps/versions.py）
+    retired_at: Mapped[datetime | None] = mapped_column(default=None)
+    retired_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    retire_note: Mapped[str | None] = mapped_column(Text, default=None)
+    # 发布时这一版用到的能力的治理版本：{能力名: version}。正式运行发起时有漂移只提醒、不拦
+    capability_versions: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     workflow: Mapped[Workflow] = relationship(back_populates="versions")
 
@@ -534,6 +548,8 @@ class WorkflowVersion(Base, TimestampMixin):
 
 class Run(Base, TimestampMixin):
     __tablename__ = "runs"
+    # 找钉住版本最近一次封存的运行（应用的视图、口径对比）。存量库由 db/base.py 的 _INDEX_MIGRATIONS 补建
+    __table_args__ = (Index("ix_runs_wf_ver_status", "workflow_id", "version", "status"),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     workflow_id: Mapped[str | None] = mapped_column(
@@ -583,6 +599,12 @@ class Run(Base, TimestampMixin):
     options: Mapped[dict[str, Any]] = mapped_column(default=dict)
     # 发起它的定时任务，手动发起的为空。不设外键：定时任务删掉之后，运行记录照旧是追溯凭证，来源 id 留着
     schedule_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    # 运行来源（engine/origin.py 的 ORIGIN_KINDS）：chat / canvas / launcher / schedule / app_entry / app_view /
+    # app_backfill / hook / api。发起时由 launch_run 写，同时记一条 run.origin 事件进封存范围。存量为空：来源未记录
+    origin_kind: Mapped[str | None] = mapped_column(String(20), default=None, index=True)
+    origin: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    app_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    app_version: Mapped[int | None] = mapped_column(Integer, default=None)
 
     events: Mapped[list["RunEvent"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
@@ -781,6 +803,10 @@ class Conversation(Base, TimestampMixin):
     """
 
     __tablename__ = "conversations"
+    # 一个人在一个应用里只有一段（未归档的）助手对话（D-e）。存量库由 db/base.py 的 _UNIQUE_INDEX_MIGRATIONS 补建。
+    # created_by 为空（关登录又没填署名）的不受约束：SQLite 的唯一索引里 NULL 互不相等，那种情况靠接口里的进程内锁
+    __table_args__ = (Index("ux_conversations_app_owner", "app_id", "created_by", unique=True,
+                            sqlite_where=text("kind = 'app' AND archived = 0")),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     title: Mapped[str] = mapped_column(String(200), default="")
@@ -789,6 +815,11 @@ class Conversation(Base, TimestampMixin):
         ForeignKey("workflows.id", ondelete="CASCADE"), default=None, index=True
     )
     archived: Mapped[bool] = mapped_column(default=False)
+    # 应用编辑时助手对话归属的应用（kind=app）。其余为空
+    app_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    # 谁建的这段对话（api/deps.actor_of：开登录时是认证过的用户名）。开登录后 user 角色只看得到、只改得动自己的对话；
+    # 存量为空：关登录时建的，开登录后只有 builder 以上看得到
+    created_by: Mapped[str | None] = mapped_column(String(100), default=None, index=True)
     # 列表按活跃度排。不能用 updated_at —— 改个标题就会把这条顶到最前面，
     # 而用户对"最近聊过的"的预期是按说话时间排，不是按编辑时间
     last_active_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, index=True)
@@ -931,3 +962,18 @@ class WebhookDelivery(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+# --------------------------------------------------------------------------
+# 应用平台（docs/design/app-platform-and-look.md §3.1）：按领域分文件，这里统一导入，
+# 让 init_db 的 create_all 和其他模块 `from app.db.models import ...` 都认得到
+# --------------------------------------------------------------------------
+
+from app.db.models_apps import (  # noqa: E402,F401
+    App, AppGrant, AppHook, AppVersion, AppViewCache, HookReceipt,
+)
+from app.db.models_capabilities import Capability, Endpoint  # noqa: E402,F401
+from app.db.models_identity import AuditEvent, AuthSession, Group, GroupMember, User  # noqa: E402,F401
+from app.db.models_process import (  # noqa: E402,F401
+    ActionRecord, NotifyChannel, NotifyDelivery, Task, TaskAssignment,
+)

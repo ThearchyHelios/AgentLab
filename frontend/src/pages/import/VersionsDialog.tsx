@@ -10,9 +10,10 @@ import {
   EmptyState, ErrorState, Modal, Notice, Skeleton, TabPanel, Tabs, promptDialog, toast,
 } from '../../components/ui'
 import { localActor } from '../../lib/actor'
+import { signerNow } from '../../store/auth'
 import { humanizeError } from '../../lib/errors'
 import { formatBytes, formatDateTime, formatTime, parseServerTime } from '../../lib/format'
-import { RAW_STATE_LABEL, VERSIONS_TEXT as VT } from '../../lib/terms'
+import { RAW_STATE_LABEL, SIGNER_TEXT, VERSIONS_TEXT as VT } from '../../lib/terms'
 import { ManifestBody } from './ManifestBody'
 
 // ===========================================================================
@@ -72,7 +73,11 @@ const reasonOf = (s: SnapshotOut) => (s.reason_code ? VT.notActivatable[s.reason
 /** 历史版本按「最近一次成为当前版本」的时刻排；没启用过的按创建时间 */
 const timeOf = (s: SnapshotOut) => parseServerTime(s.activated_at ?? s.created_at)?.getTime() ?? 0
 
-const signerLine = () => VT.signedBy(localActor() ?? VT.unsigned)
+/** 确认框里「记在谁名下」那一行：开了登录写登录身份，关登录写本机署名（未认证） */
+const signerLine = () => {
+  const who = signerNow()
+  return who.verified ? SIGNER_TEXT.signedIn(who.name) : VT.signedBy(who.name || VT.unsigned)
+}
 
 const reasonValid = (v: string) => (v.length > 500 ? VT.reasonTooLong : null)
 

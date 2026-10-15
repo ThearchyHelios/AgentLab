@@ -91,6 +91,12 @@ const ORDER = [
   'bundle',          // 可验证报告
   'whatif',          // 数字推演
   'report-export',   // 报告导出：自包含 HTML、不执行脚本读得到正文、点开数字看出处
+  // 应用平台（docs/design/app-platform-and-look.md §4.5）。check-auth 不在这里：它要另起一套开着本地账号登录的服务，
+  // 由编排者单独跑（关登录时的这些检查照常在这里跑）
+  'apps',            // 应用页、印章、点数字看出处、入口校验、实例页
+  'inbox',           // 待办箱：会签进度、超时横幅、动作确认的哈希卡、核实待办
+  'app-editor',      // 应用编辑：固定版本、派生、页面树和属性面板、检查定位、发布时选处置、助手流
+  'capabilities',    // 能力登记、端点、密钥掩码；设置页的身份、通知、审计
   'ui',              // 各页面端到端，连真数据
 ]
 // 各项的耗时（秒）。只决定排队顺序：长的先开跑，短的填空，结果不受影响。新加的检查不在表里就按 60 秒算；
@@ -101,6 +107,8 @@ const ESTIMATE = {
   evidence: 91, versions: 60, catalog: 150, 'catalog-loop': 60, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
   // 占位，换成真检查时按实测改
   schedules: 60, compare: 45, verify: 71, inquiry: 60, bundle: 16, whatif: 33, 'report-export': 30,
+  // 应用平台：还没实测，按同类页面估（全是伪造接口、不连真数据）
+  apps: 60, inbox: 45, 'app-editor': 45, capabilities: 30,
 }
 // 最慢的两项按段拆成几份。用的是它们自己的段过滤：最后一份用 *_SKIP 兜住「其余全部」，以后新加的段
 // 不用改这里也跑得到（拆出去的那几份要是一段都没对上，那一份会报「一项都没跑」）。

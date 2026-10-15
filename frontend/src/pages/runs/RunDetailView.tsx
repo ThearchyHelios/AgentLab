@@ -11,21 +11,22 @@ import { resolveStatus, statusLabel, type StatusCode } from '../../lib/status'
 import { AssistantStream, type StreamTurn, type TurnFailure } from '../../run/AssistantStream'
 import { catalogDrift, decodePhase, decodeRun, exitLabels, summarizeRun, type RunFinal } from '../../run/decode'
 import { sourceHandles } from '../../canvas/nodeDefs'
-import { ApprovalCard } from '../../run/RunPanel'
+import { EffectsPane, RunTaskCards, useRunTasks } from './RunTasks'
+import { OriginChip } from './RunList'
 import { runStatusOf, type RunPhase } from '../../run/trace'
 import { useCatalog } from '../../store/catalog'
 import type { Approval, Run, RunEvent } from '../../types'
 import { CatalogDriftBanner, FailedBanner, FeedbackStrip, HeldBanner, WaitingBanner, type Feedback } from './Banners'
-import { localActor } from '../../lib/actor'
+import { signerNow } from '../../store/auth'
 import { explainRunError, explainStartError } from '../../lib/explain'
 import { canLeave, leavePass } from '../../lib/leave'
-import { UNSAVED_HINT, isUnsaved, runName } from '../../lib/terms'
+import { SIGNER_TEXT, UNSAVED_HINT, isUnsaved, runName } from '../../lib/terms'
 import {
   asView, duplicateNames, graphShape, idTail, isLiveRun, runScope, type DetailView,
 } from './model'
 import { ArtifactsPane, useRunArtifacts } from './ArtifactsPane'
 import { EvidencePane } from './EvidencePane'
-import { EVIDENCE_AUDIT_TEXT, RUN_ARTIFACTS_TEXT } from '../../lib/terms'
+import { ACTION_LOG_TEXT, EVIDENCE_AUDIT_TEXT, MAKE_APP_TEXT, RUN_ARTIFACTS_TEXT } from '../../lib/terms'
 import { ClassChip, MoreMenu, RunTabs, TierChip, copyText, type MenuItem, type TabItem } from './parts'
 import { ProvenanceBar, Telemetry, runClocks } from './Telemetry'
 import { TracePane } from './TracePane'
@@ -74,7 +75,12 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   }, [d.state, navigate, search])
 
   const run = d.run
-  const pendingFlag = d.pending == null ? undefined : d.pending.length > 0
+  // 待办卡：这次运行待处理的待办（含没有审批的核实动作结果、等外部系统）。待审批、运行状态、待办和动作的事件变了就重新取
+  const taskEvents = d.events.filter((e) => e.type.startsWith('task.') || e.type.startsWith('action.')).length
+  const pendingIds = (d.pending ?? []).map((a) => a.id)
+  const runTasks = useRunTasks(runId, `${pendingIds.join(',')}|${run?.status ?? ''}|${taskEvents}`, pendingIds)
+  // 停着等人的不只有审批：动作结果未知时运行挂起、开一条核实待办，那也是在等人，不是服务重启打断的「已挂起」
+  const pendingFlag = d.pending == null ? undefined : d.pending.length > 0 || !!runTasks.tasks?.length
   // 接着流时事件就是事实；不接流时把 GET 到的状态和有没有待审批交给解码器收尾：
   // 服务被强杀的运行（interrupted、没有审批）这样才会停下，而不是一直转圈
   const finalStatus = !run || d.streaming ? undefined : run.status
@@ -219,14 +225,16 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   // 等审批、挂起的运行不再往下跑：收成已取消，待审批一并关闭（后端记下署名）
   const abandon = async () => {
     const n = d.pending?.length ?? 0
-    const actor = localActor()
+    // 开了登录：留痕记登录的人（服务端不看署名）；关登录：本机署名
+    const who = signerNow()
     const ok = await confirmDialog({
       title: '放弃这次运行？',
       body: code === 'waiting'
         ? `「${runName(run)}」正在等待审批。放弃后运行将终止，且无法恢复。`
         : `「${runName(run)}」已在断点处挂起。放弃后将无法继续运行。`,
       consequences: [
-        ...(n ? [`${n} 条待审批一并关闭，${actor ? `留痕署名「${actor}」` : '留痕记为未署名（可在「设置 → 偏好设置」中填写署名）'}`] : []),
+        ...(n ? [`${n} 条待审批一并关闭，${who.verified ? `留痕记为${SIGNER_TEXT.signedIn(who.name)}`
+          : who.name ? `留痕署名「${who.name}」` : '留痕记为未署名（可在「设置 → 偏好设置」中填写署名）'}`] : []),
         '运行记为已取消；已完成的节点、产出和事件仍会保留',
       ],
       danger: true,
@@ -294,13 +302,17 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       const input = { ...(run.input ?? {}), [field]: value }
       const scope = runScope(run)
       let next: Run
+      // 来源沿用原运行的（客户端只能声明这几种）；原来是应用、定时任务、钩子发起的，重新发起算手动的那一种
+      const kept = run.origin_kind === 'chat' || run.origin_kind === 'canvas' || run.origin_kind === 'launcher'
+        || run.origin_kind === 'api' ? run.origin_kind : null
       if (formal) {
-        next = await api.runs.start({ workflow_id: run.workflow_id!, run_class: 'formal', input, ...scope })
+        next = await api.runs.start({ workflow_id: run.workflow_id!, run_class: 'formal', input, ...scope,
+                                      origin: kept ?? 'launcher' })
       } else {
         const graph = d.graph ?? (await api.runs.graph(run.id)).graph
         next = await api.runs.start({
           ...(run.workflow_id && !workflowGone ? { workflow_id: run.workflow_id } : {}),
-          graph, input, ...scope,
+          graph, input, ...scope, origin: kept ?? 'api',
         })
       }
       toast.ok(`已补上「${field}」并重新发起运行`)
@@ -402,8 +414,10 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
     try {
       const res = await api.copilot.fromRun(run.id)
       void refreshCatalog()
+      // 提取出来的草稿发布之后，发布成功的提示里可以「做成应用」（A8）：这里先说一句，不另开入口
       toast.ok(
         `已提取为草稿「${res.name}」：${res.nodes} 个节点${res.dropped_nodes ? `，已移除 ${res.dropped_nodes} 个未执行的节点` : ''}`,
+        { detail: MAKE_APP_TEXT.done },
       )
       // 提取出来的草稿接下来一定要去画布审改，直接带过去。上面已经问过，这一跳不再问
       navigate(`/studio/${res.workflow_id}`, leavePass())
@@ -434,8 +448,10 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
         await api.runs.remove(run.id)
       } catch (e) {
         // 封存过的正式运行：后端要 force，并在 detail 里写明后果。照它说的再确认一次，
-        // 而且要照抄 id 前几位——这是出具结果的追溯凭证，不该一路回车删掉
-        if (e instanceof ApiError && e.status === 409 && run.run_class === 'formal' && sealed) {
+        // 而且要照抄 id 前几位——这是出具结果的追溯凭证，不该一路回车删掉。
+        // 写过外部系统的（run_has_effects）强制也删不掉，不再问一遍，直接把原因报出来
+        if (e instanceof ApiError && e.status === 409 && e.code !== 'run_has_effects'
+          && run.run_class === 'formal' && sealed) {
           const forced = await confirmDialog({
             title: '强制删除已封存的正式运行？',
             body: e.message,
@@ -514,16 +530,24 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       : phase !== 'waiting' && clocks.wall != null ? { elapsedMs: paused ? clocks.active ?? clocks.wall : clocks.wall } : {}),
   }
 
-  const cards = d.pending?.length ? (
-    <div className="mt-3 space-y-2">
-      {d.pending.map((a) => (
-        <div key={a.id} data-approval-card={a.id} className="relative overflow-hidden rounded-lg border"
-             style={{ borderColor: 'color-mix(in srgb, var(--st-waiting) 45%, var(--border))' }}>
-          {/* 详情头已经写着是哪个工作流，卡头不再重复 */}
-          <ApprovalCard approval={a} onResolved={() => onResolved(a)} showWorkflow={false} />
-        </div>
-      ))}
-    </div>
+  // 待办卡（TaskCard）：一次中断一条待办；凑齐了运行恢复，接上实时流。没凑齐（会签里记下一票）只刷新这几张卡。
+  // 待审批里对不上待办的（开待办出过错还没补上、老服务端没有待办接口）按审批画审批卡。只认取待办那一刻就在的审批：
+  // 刚来的那条，待办还在路上，不先按审批画一张、取回来又换成待办卡
+  const covered = new Set((runTasks.tasks ?? []).map((t) => t.approval_id).filter(Boolean))
+  const orphans = (d.pending ?? []).filter((a) => runTasks.asked.has(a.id) && !covered.has(a.id))
+  const cards = runTasks.tasks?.length || orphans.length ? (
+    <RunTaskCards tasks={runTasks.tasks ?? []} approvals={orphans}
+                  onApprovalResolved={async (a) => { await onResolved(a); runTasks.reload() }}
+                  onResolved={async (task, resolved) => {
+      if (!resolved) { runTasks.reload(); return }
+      const approval = task.approval_id ? d.pending?.find((a) => a.id === task.approval_id) : undefined
+      if (approval) await onResolved(approval)
+      else {
+        void refreshApprovals()
+        d.follow(await api.runs.get(run.id).catch(() => null))
+      }
+      runTasks.reload()
+    }} />
   ) : null
 
   // 发布之后数据目录有变化：正式运行开始时记下的提醒，横幅一直挂着（不拦运行，但看结果的人得知道）。
@@ -540,6 +564,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       key: 'artifacts', label: '工件', count: artifactCount, unit: '件', tone: 'quiet',
       title: RUN_ARTIFACTS_TEXT.tabTitle(artifactCount),
     },
+    { key: 'effects', label: ACTION_LOG_TEXT.panel, title: ACTION_LOG_TEXT.panelHint },
   ]
 
   return (
@@ -555,6 +580,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
               {dup && <span className="mono shrink-0 text-2xs text-faint" title={`工作流 id：${run.workflow_id}`}>{idTail(run.workflow_id)}</span>}
               <ClassChip runClass={run.run_class} version={run.version} always />
               <TierChip tier={(run.output as any)?._issuance?.tier} />
+              <OriginChip kind={run.origin_kind} always />
             </div>
             {/* 窄时换行：不换行时这一行只有定时任务链接能缩，会被挤成 0 宽，其余各项被压成竖排 */}
             <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-2xs text-faint">
@@ -672,6 +698,11 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
         {view === 'evidence' && (
           <div className="absolute inset-0" data-view-pane="evidence">
             <EvidencePane run={run} output={turn.output ?? null} labelOf={labelOf} refreshKey={artifactKey} />
+          </div>
+        )}
+        {view === 'effects' && (
+          <div className="absolute inset-0" data-view-pane="effects">
+            <EffectsPane runId={run.id} refreshKey={artifactKey} />
           </div>
         )}
         {view === 'artifacts' && (

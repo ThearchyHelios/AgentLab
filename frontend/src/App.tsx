@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode, RefObject } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { Bell, BellOff, Moon, RotateCw, Sun, UserRound } from 'lucide-react'
+import { Bell, BellOff, LogOut, Moon, RotateCw, Sun, UserRound } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, NETWORK_MESSAGE, api } from './api/client'
 import { CATALOG_TIMEOUT_MS, catalogListState, useCatalog, useOnReconnect } from './store/catalog'
@@ -20,11 +20,20 @@ import { KnowledgePage } from './pages/KnowledgePage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SchedulesPage } from './pages/schedules/SchedulesPage'
 import { NotFound } from './pages/NotFound'
+// 应用平台：使用面（FE-5）、搭建面的应用编辑（FE-6）
+import { AppsHome } from './pages/apps/AppsHome'
+import { AppPage } from './pages/apps/AppPage'
+import { EntryPage } from './pages/apps/EntryPage'
+import { InstancePage } from './pages/apps/InstancePage'
+import { TaskPage } from './pages/apps/TaskPage'
+import { AppEditor } from './pages/apps/edit/AppEditor'
+import { LoginPage } from './pages/LoginPage'
 import { Logo } from './components/Logo'
 import {
   CommandPalette, PAGES, ShortcutHelp, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
-  toggleTheme, useTheme, waitedFor,
+  toggleTheme, usePages, useTheme, visiblePages, waitedFor,
 } from './components/CommandPalette'
+import { atLeast, authSettled, loginOn, loginUrl, needsLogin, prefsLocalOnly, principalName, useAuth } from './store/auth'
 import { ErrorBoundary, Kbd, OfflineBanner, Spinner, StatusBadge, isComposing, toast, useTicker } from './components/ui'
 import { applyTheme, normalizeTheme } from './lib/theme'
 import { ariaShortcut, isTypingTarget, matchShortcut } from './lib/keys'
@@ -35,9 +44,13 @@ import {
   composeTitle, flagAttention, notifyInBackground, notifySupported, paintFavicon, useSignals,
 } from './lib/notify'
 import type { Attention, FaviconDot } from './lib/notify'
+import type { Principal } from './typesApp'
 import { useLeaveBlocker } from './lib/leave'
 import { useLocalActor } from './lib/actor'
-import { RUN_COMPARE_TEXT, runName } from './lib/terms'
+import { APP_TEXT, AUTH_MODE_LABEL, AUTH_TEXT, ROLE_LABEL, RUN_COMPARE_TEXT, TASK_NOTIFY_TEXT, runName } from './lib/terms'
+
+/** 启动时认人（/auth/me）最多等多久再取目录 */
+const AUTH_WAIT_MS = 2500
 
 export default function App() {
   const loaded = useCatalog((s) => s.loaded)
@@ -47,21 +60,54 @@ export default function App() {
   const location = useLocation()
   const [offlineOk, setOfflineOk] = useState(false)
 
-  useEffect(() => { void useCatalog.getState().refresh() }, [])
-  // 连着时每 4 秒拉一次待审批，顺带当心跳；断开后的退避重试由 catalog 自己排
-  useEffect(() => useCatalog.getState().startHeartbeat(), [])
+  const navigate = useNavigate()
+  // 先认人（/auth/me）再取目录：使用者（开了登录的 user 角色）不取那几张表；开了登录还没登录的去登录页，什么都不取。
+  // 关登录时 /me 恒为 off，和以前一样直接取
+  useEffect(() => {
+    void (async () => {
+      // 认人最多等 AUTH_WAIT_MS：服务端卡着不回时不能把目录也一起拖住（启动页的「比平时慢」要点得出是哪几张表）。
+      // 晚到的「还没登录」照样送去登录页（认人接口的 401 不整页跳，见 api/http）。load 同一时刻只发一个请求：
+      // 开发模式下这个 effect 执行两次，也只认一次人
+      const loading = useAuth.getState().load()
+      const toLoginPage = (who: Principal | null) => {
+        if (!needsLogin(who)) return false
+        if (window.location.pathname !== '/login') navigate(loginUrl(), { replace: true })
+        return true
+      }
+      const me = await Promise.race([
+        loading,
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), AUTH_WAIT_MS)),
+      ])
+      if (me === undefined) void loading.then(toLoginPage)
+      else if (toLoginPage(me)) return
+      void useCatalog.getState().refresh()
+    })()
+    // 只在启动时认一次；登录、退出都整页重新加载
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  // 启动时没连上、没认出人：恢复后再认一次（catalog 自己会重拉它那几张表）
+  useOnReconnect(() => { if (!useAuth.getState().ready) void useAuth.getState().load() })
+  // 连着时每 4 秒拉一次待审批和待办数，顺带当心跳；断开后的退避重试由 catalog 自己排。没登录时不拉
+  const signedOut = useAuth((s) => needsLogin(s.me))
+  useEffect(() => (signedOut ? undefined : useCatalog.getState().startHeartbeat()), [signedOut])
+  const roleRedirect = useRoleRedirect()
 
   // 主题的真源在后端设置里。启动时没连上就等恢复再读一次，不然这次会话一直用缓存。
   // 读到过、或者人在这台设备上换过（导航、⌘K 都派发 agentlab:theme），就不再读，
   // 路上的那一次读回来也不应用：断线时换的主题不能在重连时被服务端的旧值翻回去
+  // 开了登录、又不是管理员（D-s）：主题只存本机，不读服务端那份全站共用的（使用者也读不到），先等认出人再决定
   const themeSettled = useRef(false)
   const loadTheme = () => {
     if (themeSettled.current) return
-    api.settings.get().then((s) => {
+    void authSettled().then((me) => {
       if (themeSettled.current) return
-      themeSettled.current = true
-      applyTheme(normalizeTheme(s?.ui?.theme))
-    }).catch(() => {})
+      if (prefsLocalOnly(me)) { themeSettled.current = true; return }
+      api.settings.get().then((s) => {
+        if (themeSettled.current) return
+        themeSettled.current = true
+        applyTheme(normalizeTheme(s?.ui?.theme))
+      }).catch(() => {})
+    })
   }
   useEffect(loadTheme, [])
   useEffect(() => {
@@ -80,11 +126,15 @@ export default function App() {
   const offlineAtBoot = !everOk && (backend === 'down' || (allFailed && backend === 'checking'))
   const booting = !offlineOk && (!loaded || offlineAtBoot)
   // 启动页的清单自己会说哪几项还在等、哪几项失败了；进了外壳才需要当面提醒
-  useCatalogWarning(stalled, !booting)
+  useCatalogWarning(stalled, !booting && location.pathname !== '/login')
+  // 登录页不在外壳里：没登录时导航、目录、心跳都还没有
+  if (location.pathname === '/login') return <LoginPage />
   if (booting) return <BootScreen onEnterOffline={() => setOfflineOk(true)} />
 
   return (
-    <div className="flex h-full">
+    // 横向裁掉：导航项的悬停提示（不可见时也占位）在窄屏上伸出视口，整页就能左右滚出一块空白。clip 不建滚动容器，
+    // 粘性定位和纵向都照旧
+    <div className="flex h-full overflow-x-clip">
       <Nav stalled={stalled} />
 
       <main className="flex min-w-0 flex-1 flex-col">
@@ -97,9 +147,11 @@ export default function App() {
               藏在一个问号里下次就没人记得它存在了。
               导航高亮不用动——NavLink 默认前缀匹配，/chat/abc 照样点亮「问数据」。*/}
           <ErrorBoundary resetKey={location.pathname}>
+            {/* 开了登录的使用者只到得了「应用」和「设置」：别的地址（旧书签、手输）送回应用首页 */}
+            {roleRedirect ? <Navigate to={roleRedirect} replace /> : (
             <Routes>
-              {/* 默认落到对话页：多数人要的是答案，画布留给要自己编排的人 */}
-              <Route path="/" element={<Navigate to="/chat" replace />} />
+              {/* 默认落到对话页：多数人要的是答案，画布留给要自己编排的人。使用者落到应用首页 */}
+              <Route path="/" element={<HomeRedirect />} />
               <Route path="/chat" element={<ChatPage />} />
               <Route path="/chat/:conversationId" element={<ChatPage />} />
               <Route path="/studio" element={<StudioPage />} />
@@ -121,12 +173,23 @@ export default function App() {
               <Route path="/knowledge/:tab/:id" element={<KnowledgePage />} />
               <Route path="/schedules" element={<SchedulesPage />} />
               <Route path="/schedules/:id" element={<SchedulesPage />} />
+              {/* 应用：固定路径（inbox）写在 /apps/:appId 前面，读的人一眼看出它不是应用 id */}
+              <Route path="/apps" element={<AppsHome />} />
+              <Route path="/apps/inbox/:taskId" element={<TaskPage />} />
+              <Route path="/apps/:appId" element={<AppPage />} />
+              <Route path="/apps/:appId/p/:pageId" element={<AppPage />} />
+              <Route path="/apps/:appId/new/:entryId" element={<EntryPage />} />
+              <Route path="/apps/:appId/i/:runId" element={<InstancePage />} />
+              <Route path="/apps/:appId/edit" element={<AppEditor />} />
+              <Route path="/apps/:appId/edit/:section" element={<AppEditor />} />
+              {/* /login 不在这里：它不在外壳里，App 开头就单独画了 */}
               {/* 数据源搬到了顶级「数据」页；旧书签和各处「去设置 → 数据源」的链接还在 */}
               <Route path="/settings/datasources" element={<Navigate to="/data" replace />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/settings/:tab" element={<SettingsPage />} />
               <Route path="*" element={<NotFound />} />
             </Routes>
+            )}
           </ErrorBoundary>
         </div>
       </main>
@@ -138,6 +201,21 @@ export default function App() {
       <LeaveBlocker />
     </div>
   )
+}
+
+/** 首页：使用者（开了登录的 user 角色）落到应用首页，其余落到问数据 */
+function HomeRedirect() {
+  const me = useAuth((s) => s.me)
+  return <Navigate to={loginOn(me) && !atLeast(me, 'builder') ? '/apps' : '/chat'} replace />
+}
+
+/** 使用者到了看不到的页面：送回应用首页。搭建者以上、关登录时不管 */
+function useRoleRedirect(): string | null {
+  const me = useAuth((s) => s.me)
+  const { pathname } = useLocation()
+  if (!loginOn(me) || atLeast(me, 'builder') || pathname === '/') return null
+  const ok = visiblePages(me).some((p) => pathname === p.to || pathname.startsWith(`${p.to}/`))
+  return ok ? null : '/apps'
 }
 
 // -------------------------------------------------------------------------
@@ -180,7 +258,7 @@ function ShellKeys() {
         openShortcutHelp()
         return
       }
-      const page = PAGES.find((p) => matchShortcut(e, p.shortcut))
+      const page = visiblePages(useAuth.getState().me).find((p) => matchShortcut(e, p.shortcut))
       if (page) {
         e.preventDefault()
         // 有没保存的改动时由 LeaveBlocker 先问，这里照常跳
@@ -247,16 +325,17 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
   const chat = useChatActivity()
   const live = studio.startsWith('run') || chat === 'run'
 
-  // 整条导航约 580px 高（八个导航项），窗口再矮，最底下的遥测点和署名就被切掉、够不着。
-  // 矮窗口（≤600px）按高度收紧到 455px 左右（导航项 36px），而不是让导航滚动：导航一旦
-  // overflow，挂在右侧的悬停提示和遥测浮层也会被一起裁掉。加导航项时在 480px 高的窗口里
-  // 量一遍（check-shell 的「窗口高 480px」）
+  const pages = usePages()
+  // 整条导航约 640px 高（九个导航项），窗口再矮，最底下的遥测点和署名就被切掉、够不着。
+  // 矮窗口（521–660px）按高度收紧到 500px 左右（导航项 36px），≤520px 再收一档到 460px 左右（导航项 32px、
+  // 图标和字之间只留 2px），而不是让导航滚动：导航一旦 overflow，挂在右侧的悬停提示和遥测浮层也会被
+  // 一起裁掉。加导航项时在 600px、520px、480px 高的窗口里量一遍（check-shell 的「窗口高 …px」）
   return (
     <nav aria-label="主导航" className="relative z-30 flex w-16 shrink-0 flex-col border-r bg-panel">
       <Link
         to="/"
         aria-label={live ? 'AgentLab 首页（有运行正在进行）' : 'AgentLab 首页'}
-        className="group relative mx-auto mb-2 mt-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-lg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)] [@media(max-height:600px)]:mb-1 [@media(max-height:600px)]:mt-2 [@media(max-height:600px)]:h-9"
+        className="group relative mx-auto mb-2 mt-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-lg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)] [@media(max-height:660px)]:mb-1 [@media(max-height:660px)]:mt-2 [@media(max-height:660px)]:h-9"
       >
         <Logo size={22} live={live} className="text-accent" title="" />
         <Tip>
@@ -264,17 +343,19 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
           <span className="text-faint">受限动态编排{live ? ' · 有运行正在进行' : ''}</span>
         </Tip>
       </Link>
-      <div aria-hidden className="mx-4 mb-2 h-px shrink-0 bg-hairline [@media(max-height:600px)]:mb-1" />
+      <div aria-hidden className="mx-4 mb-2 h-px shrink-0 bg-hairline [@media(max-height:660px)]:mb-1" />
 
       <ul className="flex flex-col gap-0.5">
-        {PAGES.map((p) => (
+        {pages.map((p) => (
           <li key={p.to} className="relative px-1">
             <NavLink
               to={p.to}
               aria-keyshortcuts={ariaShortcut(p.shortcut)}
               className={({ isActive }) => clsx(
                 'group relative flex h-12 w-full flex-col items-center justify-center gap-1 rounded-md text-2xs leading-none outline-none',
-                '[@media(max-height:600px)]:h-9',
+                // 两档的高度不能叠在同一个窗口高度上：同时命中时后出的那条赢，而 Tailwind 把 660 那条排在后面，
+                // ≤520px 的 32px 就一直没生效（九项在 480px 高的窗口里放不下）。所以 36px 那档只管 521–660px
+                '[@media(min-height:521px)_and_(max-height:660px)]:h-9 [@media(max-height:520px)]:h-8 [@media(max-height:520px)]:gap-0.5',
                 'transition-colors focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
                 isActive ? 'bg-hover font-medium text-fg' : 'text-dim hover:bg-hover hover:text-fg',
               )}
@@ -294,16 +375,18 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
               )}
             </NavLink>
             {p.to === '/runs' && <ApprovalBadge />}
+            {p.to === '/apps' && <AppsBadge />}
           </li>
         ))}
       </ul>
 
-      <div className="mt-auto flex flex-col items-center gap-1.5 pb-2 pt-3 [@media(max-height:600px)]:gap-1 [@media(max-height:600px)]:pb-1 [@media(max-height:600px)]:pt-2">
+      <div className="mt-auto flex flex-col items-center gap-1.5 pb-2 pt-3 [@media(max-height:660px)]:gap-1 [@media(max-height:660px)]:pb-1 [@media(max-height:660px)]:pt-2">
         <div className="flex items-center gap-0.5">
           <NotifyToggle />
           <ThemeToggle />
         </div>
-        <ActorButton />
+        {/* 开了登录：账户（显示名、角色、退出），没有署名框——签批记的是登录身份 */}
+        <AccountOrActor />
         <div aria-hidden className="h-px w-8 bg-hairline" />
         <Telemetry stalled={stalled} />
       </div>
@@ -311,37 +394,56 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
   )
 }
 
+/** 导航项右上角的徽标：图标右上角外侧，外圈一道面板底色的描边把它从图标上抠开 */
+const BADGE_CLASS = clsx(
+  'group/badge absolute left-[calc(50%+7px)] top-[3px] z-10 flex h-4 min-w-4 items-center justify-center rounded-full px-1',
+  '[@media(max-height:660px)]:top-0',
+  'bg-warn-solid text-[10px] font-semibold leading-none text-on-warn tnum ring-2 ring-[var(--bg-panel)]',
+  'outline-none focus-visible:ring-[var(--accent)]',
+)
+
 /**
- * 待审批徽标。
+ * 待审批徽标（「记录」上）。
  *
  * 它是一个单独的链接（直达记录页的待审批页签），不是「记录」的一部分：导航
  * 项本身永远进 /runs，否则同一个入口时而进列表、时而进某条详情，人就摸不准
- * 点下去会到哪。挂在图标右上角外侧，外圈一道面板底色的描边把它从图标上抠开；
- * 浅色下用 warn-solid 配 on-warn，不再是黑字压在深琥珀上糊成一团。
+ * 点下去会到哪。浅色下用 warn-solid 配 on-warn，不再是黑字压在深琥珀上糊成一团。
+ *
+ * 徽标按来源分开、不重复计数：这里只数不属于应用的运行的待办（画布、定时任务的审批），应用里的数在「应用」上。
+ * 老服务端没有待办数时按待审批数。「最久已等待」按待审批列表算，所以只在应用里没有待办时写
  */
 function ApprovalBadge() {
   const approvals = useCatalog((s) => s.approvals)
+  const counts = useCatalog((s) => s.taskCounts)
   const pending = approvals.filter((a) => a.status === 'pending')
-  if (!pending.length) return null
-  const oldest = pending.reduce((a, b) => ((a.created_at ?? '') <= (b.created_at ?? '') ? a : b))
-  const waited = waitedFor(oldest.created_at)
-  const text = `${pending.length} 项待审批${waited ? `，最久已等待 ${waited}` : ''}`
+  const count = counts ? counts.other : pending.length
+  if (!count) return null
+  const oldest = pending.length && (!counts || !counts.apps)
+    ? pending.reduce((a, b) => ((a.created_at ?? '') <= (b.created_at ?? '') ? a : b)) : null
+  const waited = oldest ? waitedFor(oldest.created_at) : null
+  const text = `${count} 项待审批${waited ? `，最久已等待 ${waited}` : ''}`
   return (
-    <Link
-      to="/runs?tab=approvals"
-      aria-label={`${text}。打开待审批`}
-      data-approval-badge=""
-      className={clsx(
-        'group/badge absolute left-[calc(50%+7px)] top-[3px] z-10 flex h-4 min-w-4 items-center justify-center rounded-full px-1',
-        '[@media(max-height:600px)]:top-0',
-        'bg-warn-solid text-[10px] font-semibold leading-none text-on-warn tnum ring-2 ring-[var(--bg-panel)]',
-        'outline-none focus-visible:ring-[var(--accent)]',
-      )}
-    >
-      {pending.length > 99 ? '99+' : pending.length}
+    <Link to="/runs?tab=approvals" aria-label={`${text}。打开待审批`} data-approval-badge="" className={BADGE_CLASS}>
+      {count > 99 ? '99+' : count}
       <Tip badge>
         <span className="font-medium">{text}</span>
         <span className="text-faint">点击处理</span>
+      </Tip>
+    </Link>
+  )
+}
+
+/** 应用里派给我的待办（「应用」上）：直达应用首页的待办页签 */
+function AppsBadge() {
+  const count = useCatalog((s) => s.taskCounts?.apps ?? 0)
+  if (!count) return null
+  const text = APP_TEXT.navBadge(count)
+  return (
+    <Link to="/apps?tab=inbox" aria-label={`${text}。${APP_TEXT.navBadgeOpen}`} data-apps-badge="" className={BADGE_CLASS}>
+      {count > 99 ? '99+' : count}
+      <Tip badge>
+        <span className="font-medium">{text}</span>
+        <span className="text-faint">{APP_TEXT.navBadgeOpen}</span>
       </Tip>
     </Link>
   )
@@ -353,7 +455,7 @@ function NotifyToggle() {
   if (!notifySupported()) return null
   const Icon = notify ? Bell : BellOff
   const tip = notify
-    ? '后台提醒：已开启 · 运行结束、失败或有新的待审批时发送系统通知'
+    ? '后台提醒：已开启 · 运行结束、失败或有新的待审批、待办时发送系统通知'
     : permission === 'denied'
       ? '后台提醒：浏览器已拒绝通知权限，请在站点设置中允许'
       : '后台提醒：已关闭 · 开启时浏览器将请求通知权限'
@@ -364,7 +466,7 @@ function NotifyToggle() {
       aria-pressed={notify}
       onClick={() => void toggleNotify()}
       className={clsx(
-        'group relative flex h-8 w-7 items-center justify-center rounded-md outline-none hover:bg-hover [@media(max-height:600px)]:h-7',
+        'group relative flex h-8 w-7 items-center justify-center rounded-md outline-none hover:bg-hover [@media(max-height:660px)]:h-7',
         'focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
         notify ? 'text-accent' : 'text-faint hover:text-fg',
       )}
@@ -385,7 +487,7 @@ function ThemeToggle() {
       type="button"
       aria-label={`切换到${next}主题`}
       onClick={toggleTheme}
-      className="group relative flex h-8 w-7 items-center justify-center rounded-md text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-[var(--accent)] [@media(max-height:600px)]:h-7"
+      className="group relative flex h-8 w-7 items-center justify-center rounded-md text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-[var(--accent)] [@media(max-height:660px)]:h-7"
     >
       <Icon size={15} aria-hidden />
       <Tip>
@@ -393,6 +495,78 @@ function ThemeToggle() {
         <span className="text-faint">当前{pref === 'system' ? `跟随系统（${now}）` : now}</span>
       </Tip>
     </button>
+  )
+}
+
+/** 关登录：本机署名；开登录：账户 */
+function AccountOrActor() {
+  const on = useAuth((s) => loginOn(s.me))
+  return on ? <AccountButton /> : <ActorButton />
+}
+
+/**
+ * 账户（开了登录时）：首字圆钮，点开是显示名、用户名、角色、登录方式和「退出登录」。没有署名框：发布、审批、发起都记
+ * 登录的用户名。退出后整页回到登录页，各个 store 里上一个人的数据一并丢掉
+ */
+function AccountButton() {
+  const me = useAuth((s) => s.me)
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    panelRef.current?.focus()
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (!panelRef.current?.contains(t) && !btnRef.current?.contains(t)) setOpen(false)
+    }
+    window.addEventListener('mousedown', onDown)
+    return () => window.removeEventListener('mousedown', onDown)
+  }, [open])
+  if (!me) return null
+  const name = principalName(me)
+  const initial = Array.from(me.display_name || me.username || '?')[0].toUpperCase()
+  const logout = async () => {
+    setBusy(true)
+    try {
+      await useAuth.getState().logout()
+      window.location.assign('/login')
+    } catch (e) {
+      toast.error(e)
+      setBusy(false)
+    }
+  }
+  return (
+    <div className="relative">
+      <button ref={btnRef} type="button" aria-label={`${AUTH_TEXT.signedInAs(name)}。${AUTH_TEXT.accountTip}`}
+              aria-expanded={open} aria-haspopup="dialog" data-account={me.role} onClick={() => setOpen((o) => !o)}
+              className="group relative flex h-7 w-7 items-center justify-center rounded-full border bg-elev text-xs font-semibold text-fg outline-none hover:border-[var(--border-strong)] hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)]">
+        {initial}
+        {!open && <Tip>{AUTH_TEXT.signedInAs(name)}<span className="text-faint">{ROLE_LABEL[me.role]}</span></Tip>}
+      </button>
+      {open && (
+        <div ref={panelRef} role="dialog" aria-label={AUTH_TEXT.account} tabIndex={-1} data-account-menu=""
+             onKeyDown={(e) => { if (e.key === 'Escape' && !isComposing(e)) { e.stopPropagation(); setOpen(false); btnRef.current?.focus() } }}
+             className="fade-up absolute bottom-0 left-full z-40 ml-2.5 w-60 rounded-lg border bg-panel text-xs shadow-elev-3 outline-none">
+          <div className="border-b px-3 py-2.5">
+            <div className="truncate font-semibold text-fg" title={name}>{me.display_name || me.username}</div>
+            {me.display_name && me.username && <div className="mono truncate text-2xs text-faint">{me.username}</div>}
+          </div>
+          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 px-3 py-2 text-2xs">
+            <dt className="text-faint">{AUTH_TEXT.roleLabel}</dt><dd className="text-dim" data-account-role={me.role}>{ROLE_LABEL[me.role]}</dd>
+            <dt className="text-faint">{AUTH_TEXT.modeLabel}</dt><dd className="text-dim">{AUTH_MODE_LABEL[me.mode]}</dd>
+            {me.groups.length > 0 && <><dt className="text-faint">{AUTH_TEXT.groupsLabel}</dt><dd className="text-dim">{me.groups.join('、')}</dd></>}
+          </dl>
+          <div className="flex border-t px-3 py-2">
+            <button type="button" className="btn btn-sm w-full justify-center" disabled={busy} data-logout=""
+                    onClick={() => void logout()}>
+              {busy ? <Spinner size={12} /> : <LogOut size={12} aria-hidden />} {AUTH_TEXT.logout}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -457,6 +631,10 @@ const NO_CHECKS: CatalogCheck[] = []
 
 /** 请求发出去这么久还没回来，就不算「还在加载」，算卡住了 */
 const STALL_MS = 3000
+/** 页面开始加载外壳的时刻（头一回取目录的卡住从这里算，见 useStalledChecks） */
+const BOOT_AT = performance.now()
+/** 头一回取目录还没有着落 */
+let bootLoad = true
 
 /**
  * 卡着没回来的 catalog 请求（后端没断时）。
@@ -472,10 +650,17 @@ function useStalledChecks(): CatalogCheck[] {
   const checks = useCatalog((s) => s.checks)
   const [stalled, setStalled] = useState(false)
   useEffect(() => {
-    if (!waiting) return
-    const t = setTimeout(() => setStalled(true), STALL_MS)
+    if (!waiting) {
+      // 头一回取目录有了着落（取回来了或出错了）：之后的刷新都从发出请求算
+      if (checks.length) bootLoad = false
+      return
+    }
+    // 启动时先认人（最多等 AUTH_WAIT_MS）再取目录：头一回加载从启动算起，认人等掉的那段也算——人已经在启动页上
+    // 等了那么久，进来以后不能还说「在线」
+    const wait = bootLoad ? Math.max(0, STALL_MS - (performance.now() - BOOT_AT)) : STALL_MS
+    const t = setTimeout(() => setStalled(true), wait)
     return () => { clearTimeout(t); setStalled(false) }
-  }, [waiting])
+  }, [waiting, checks.length])
   // 断开时归离线横幅说，这里不再叠一层
   return stalled && waiting && !down ? checks.filter((c) => c.state === 'pending') : NO_CHECKS
 }
@@ -989,10 +1174,60 @@ function watchApprovals(go: Go): () => void {
   })
 }
 
+/**
+ * 派给自己的新待办：规则同待审批——拿到过一次真列表才记底，之后新来的、标签页在后台时发系统通知。不每拍都取列表：
+ * 心跳取的「派给我的」待办数或最新一条的时间（taskCounts.mine / latest）变了才取一次派给我的待处理待办。搭建者以上已经按待审批发过通知的
+ * （待办带着那条审批）不再发第二条；核实、等外部系统这类没有审批的待办只在这里通知
+ */
+function watchTasks(go: Go): () => void {
+  let seen: Set<string> | null = null
+  let inflight = false
+  let again = false
+  const pull = async () => {
+    if (inflight) { again = true; return }
+    inflight = true
+    try {
+      const { items } = await api.tasks.list({ assigned: 'me', status: 'pending', limit: 100 })
+      const pending = items.filter((t) => t.status === 'pending')
+      if (!seen) { seen = new Set(pending.map((t) => t.id)); return }
+      const fresh = pending.filter((t) => !seen!.has(t.id))
+      fresh.forEach((t) => seen!.add(t.id))
+      const builder = atLeast(useAuth.getState().me, 'builder')
+      const approvals = useCatalog.getState().approvals
+      for (const t of fresh) {
+        if (builder && t.approval_id && approvals.some((a) => a.id === t.approval_id)) continue
+        const owner = t.app_name ?? (t.workflow_name || t.workflow_id ? runName(t) : null)
+        notifyInBackground({
+          title: `${TASK_NOTIFY_TEXT.title}${t.title || TASK_NOTIFY_TEXT.untitled}`,
+          body: [owner, t.node_label].filter(Boolean).join(' · ') || undefined,
+          tag: `task:${t.id}`,
+          onClick: () => go(t.app_id ? `/apps/inbox/${encodeURIComponent(t.id)}` : `/runs/${t.run_id}`),
+        })
+      }
+    } catch {
+      // 下次待办数变了再取；没记底之前不发通知
+    } finally {
+      inflight = false
+      if (again) { again = false; void pull() }
+    }
+  }
+  // 待办数随目录在启动时就取了，常常早于外壳挂上这个订阅：已经有数时当场记底，别等到它下一次变——那时新来的
+  // 已经在列表里，会被当成「已有的」记进底里，一条通知都不发
+  if (useCatalog.getState().taskCounts && !needsLogin(useAuth.getState().me)) void pull()
+  return useCatalog.subscribe((s, p) => {
+    if (s.taskCounts === p.taskCounts || !s.taskCounts) return
+    if (seen && s.taskCounts.mine === p.taskCounts?.mine && s.taskCounts.latest === p.taskCounts?.latest) return
+    if (needsLogin(useAuth.getState().me)) return
+    void pull()
+  })
+}
+
 function ShellSignals() {
   const { pathname, search } = useLocation()
   const navigate = useNavigate()
-  const pending = useCatalog((s) => s.approvals.filter((a) => a.status === 'pending').length)
+  // 标签页标题上的待处理数：搭建者以上照旧数待审批；使用者没有待审批列表，数派给自己的待办
+  const builder = useAuth((s) => atLeast(s.me, 'builder'))
+  const pending = useCatalog((s) => (builder ? s.approvals.filter((a) => a.status === 'pending').length : s.taskCounts?.mine ?? 0))
   const studio = useStudioActivity()
   const chat = useChatActivity()
   const attention = useSignals((s) => s.attention)
@@ -1024,7 +1259,7 @@ function ShellSignals() {
   navRef.current = navigate
   useEffect(() => {
     const go: Go = (to) => { if (to) navRef.current(to) }
-    const stops = [watchStudio(go), watchChat(go), watchApprovals(go)]
+    const stops = [watchStudio(go), watchChat(go), watchApprovals(go), watchTasks(go)]
     return () => stops.forEach((stop) => stop())
   }, [])
   return null

@@ -6,7 +6,7 @@ import { EmptyState, ErrorState, IconButton, PageHeader, Skeleton, Spinner, Tabs
 import { leavePass } from '../../lib/leave'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import { useOnReconnect } from '../../store/catalog'
-import type { Schedule } from '../../types'
+import type { Schedule, ScheduleFire } from '../../types'
 import { FireHistory } from './FireHistory'
 import { EnableSwitch, LastFire, NextRun, isUnsupported, rememberScheduleNames, removeSchedule, runNow, setEnabled } from './parts'
 import { ScheduleEditor } from './ScheduleEditor'
@@ -41,6 +41,14 @@ export function ScheduleCreatePage() {
 type TabKey = 'settings' | 'history'
 
 /**
+ * 页头的「上次触发」原地刷新（页面不可见时不刷）：平时同列表 30 秒一次；上次触发发起的运行还在排队、运行中时 5 秒一次，
+ * 运行一结束页头就跟着变——不然触发历史里已经「已完成」，页头还挂着「运行中」
+ */
+const IDLE_REFRESH_MS = 30_000
+const LIVE_REFRESH_MS = 5_000
+const liveFire = (f: ScheduleFire | null | undefined) => !!f?.run_id && (f.run_status === 'queued' || f.run_status === 'running')
+
+/**
  * 一个定时任务的详情（/schedules/:id）：页头是名字、频率和启用开关、立即运行、删除；下面两个标签，设置（表单）
  * 和触发历史（?tab=history）。切到触发历史时表单不卸载，改到一半的内容还在。
  *
@@ -64,18 +72,24 @@ export function ScheduleDetailPage({ id }: { id: string }) {
   const now = useTicker(30_000)
   const loaded = useRef(false)
   /**
-   * 读的序号：后发的读胜过先发的读；开关、保存成功时也加一，作废还在路上的读。那次读可能在写之前读到旧值、
-   * 在写的答复之后才回来，落地会把页头的开关、名字盖回旧的（详情页没有定时刷新，错的会一直挂着）
+   * 读的序号，两个：seq 记写（开关、保存成功）和 adopt 的读（首次打开、重新载入），tick 记原地刷新。
+   * - 写作废还在路上的一切读：那次读可能在写之前读到旧值、在写的答复之后才回来，落地会把页头的开关、名字盖回旧的；
+   * - adopt 的读作废在它之前发出的刷新（读得更早），后发的 adopt 胜过先发的；
+   * - 刷新只作废更早的刷新，不碰 adopt 的读：运行中页头每 5 秒原地刷新一次，和「重新载入」撞上时要是把它作废了，
+   *   表单不重置、版本不换，按钮像没反应
    */
   const seq = useRef(0)
+  const tick = useRef(0)
   const wrote = () => { seq.current++ }
 
-  /** 读最新的定时任务，读到了返回 true。adopt：表单保存时也改用它的版本（首次打开、重新载入） */
+  /** 读最新的定时任务，读到了返回 true。adopt：表单保存时也改用它的版本（首次打开、重新载入）；不 adopt 的是原地刷新 */
   const load = useCallback(async (adopt: boolean): Promise<boolean> => {
-    const n = ++seq.current
+    const n = adopt ? ++seq.current : seq.current
+    const m = ++tick.current
+    const current = () => n === seq.current && (adopt || m === tick.current)
     try {
       const s = await api.schedules.get(id)
-      if (n !== seq.current) return false
+      if (!current()) return false
       rememberScheduleNames([s])
       setSchedule(s)
       setError(null)
@@ -83,7 +97,7 @@ export function ScheduleDetailPage({ id }: { id: string }) {
       loaded.current = true
       return true
     } catch (e) {
-      if (n !== seq.current) return false
+      if (!current()) return false
       // 读到过之后刷新失败：页头照旧显示手上的，只在首次打开时整页报错
       if (!loaded.current || (e instanceof ApiError && e.status === 404)) setError(e)
       else if (adopt) toast.error(e)
@@ -96,6 +110,25 @@ export function ScheduleDetailPage({ id }: { id: string }) {
     if (await load(true)) setResetKey((k) => k + 1)
   }
   useOnReconnect(() => { void load(false) })
+  const live = liveFire(schedule?.last_fire)
+  useEffect(() => {
+    const t = setInterval(() => { if (!document.hidden) void load(false) }, live ? LIVE_REFRESH_MS : IDLE_REFRESH_MS)
+    return () => clearInterval(t)
+  }, [load, live])
+  /**
+   * 触发历史取回了第一页：最新的那一条就是页头的「上次触发」（服务端同一个口径：记录时间最新的那一次）。同一次触发
+   * 照它的状态换上（点了触发历史的「刷新」，页头一起变）；不是同一次（这期间又触发过）就重读页头
+   */
+  const lastFireId = useRef<string | undefined>(undefined)
+  lastFireId.current = schedule?.last_fire?.id
+  const onNewest = useCallback((f: ScheduleFire | null) => {
+    if (!f) return
+    if (lastFireId.current !== f.id) {
+      void load(false)
+      return
+    }
+    setSchedule((cur) => (cur && cur.last_fire?.id === f.id ? { ...cur, last_fire: f } : cur))
+  }, [load])
   useEffect(() => {
     if (tab === 'history') setHistorySeen(true)
     else setSettingsSeen(true)
@@ -219,7 +252,7 @@ export function ScheduleDetailPage({ id }: { id: string }) {
             )}
             {historySeen && (
               <div role="tabpanel" id="schedule-panel-history" aria-labelledby="schedule-tab-history" hidden={tab !== 'history'}>
-                <FireHistory schedule={schedule} refreshKey={historyKey} />
+                <FireHistory schedule={schedule} refreshKey={historyKey} latest={schedule.last_fire} onNewest={onNewest} />
               </div>
             )}
           </div>

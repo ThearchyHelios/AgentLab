@@ -53,6 +53,17 @@ class Settings(BaseSettings):
     # 用于加密落库的 provider api key。留空则自动生成并存到 data_dir/.secret_key。
     secret_key: str = ""
 
+    # --- 身份（app/auth/）---
+    # 登录方式 AGENTLAB_AUTH_MODE（off / local / oidc）由 app/auth 每次直接读环境变量：测试和部署脚本临时改它
+    # 要立刻生效，不能被这个单例在导入时定死。这里只放会话和对外地址
+    auth_session_idle_hours: int = 12
+    auth_session_max_days: int = 7
+    # 会话 cookie 带不带 Secure。不设时按请求本身是不是 https 定：本机 http 开发照常能登录
+    auth_cookie_secure: bool | None = None
+    # 对外的访问地址（反向代理后面时填，如 https://agentlab.example.com）。OIDC 的回调地址按它拼；
+    # 不设时按请求的 Host 拼
+    public_url: str = ""
+
     # --- 沙箱 ---
     sandbox_backend: str = "auto"  # auto | microvm | seatbelt | bubblewrap | local | off
     sandbox_timeout: int = 30
@@ -121,6 +132,14 @@ class Settings(BaseSettings):
 
                 return json.loads(text)
             return [part.strip() for part in text.split(",") if part.strip()]
+        return value
+
+    @field_validator("auth_cookie_secure", mode="before")
+    @classmethod
+    def _blank_is_auto(cls, value: object) -> object:
+        # AGENTLAB_AUTH_COOKIE_SECURE= 写成空值等于没设（按请求定）
+        if isinstance(value, str) and not value.strip():
+            return None
         return value
 
     @field_validator("scheduler", mode="before")

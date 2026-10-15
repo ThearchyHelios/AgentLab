@@ -23,14 +23,18 @@ import { normalizeTheme } from '../lib/theme'
 import { useLeaveGuard } from '../lib/leave'
 import { localActor, setLocalActor } from '../lib/actor'
 import {
-  AGENT_GUARD_TEXT, DRAFT_MODEL_SETTING_TEXT, JUDGE_SETTING_TEXT, PROVIDER_REF_TEXT, TOOL_GATE_TEXT, VERIFY_SETTING_TEXT, judgeByModelText,
-  judgeUnlimitedText,
+  AGENT_GUARD_TEXT, APP_SETTING_TEXT, DRAFT_MODEL_SETTING_TEXT, IDENTITY_TEXT, JUDGE_SETTING_TEXT, NOTIFY_TEXT, PROVIDER_REF_TEXT,
+  SETTINGS_ROLE_TEXT, TOOL_GATE_TEXT, VERIFY_SETTING_TEXT, judgeByModelText, judgeUnlimitedText,
 } from '../lib/terms'
+import { atLeast, loginOn, prefsLocalOnly, usePrincipal } from '../store/auth'
 import type { ThemePref } from '../lib/theme'
 import {
   ProviderOptions, VerifySection, verifyChanged, verifyDraftOf, verifyErrors, verifyLabels, verifyPayload, type VerifyDraft,
 } from './VerifySettings'
 import { DraftModelSection } from './DraftModelSettings'
+import { IdentityTab } from './settings/IdentityTab'
+import { NotifyTab } from './settings/NotifyTab'
+import { AuditTab } from './settings/AuditTab'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
 // 数据源搬去了顶级的「数据」页（/data），/settings/datasources 跳过去
@@ -38,12 +42,26 @@ const TABS = [
   { key: 'providers', label: '模型接入' },
   { key: 'prefs', label: '偏好设置' },
   { key: 'system', label: '运行环境' },
+  // 应用平台（A7）：登录方式和人、通知渠道、管理类操作的留痕
+  { key: 'identity', label: IDENTITY_TEXT.tab },
+  { key: 'notify', label: NOTIFY_TEXT.tab },
+  { key: 'audit', label: IDENTITY_TEXT.audit },
 ]
+
+/** 只给管理员的页签（§3.12）：登录方式和人、审计 */
+const ADMIN_TABS = new Set(['identity', 'audit'])
+/** 开了登录的使用者只剩个人的：主题、通知渠道（个人） */
+const USER_TABS = new Set(['prefs', 'notify'])
 
 export function SettingsPage() {
   const { tab: raw } = useParams()
+  const me = usePrincipal()
+  const builder = atLeast(me, 'builder')
+  const admin = atLeast(me, 'admin')
+  // 按角色收起：关登录时所有人等同管理员，全部页签照旧
+  const tabs = TABS.filter((t) => (builder ? admin || !ADMIN_TABS.has(t.key) : USER_TABS.has(t.key)))
   // datasources 也算认得：否则 useTabRoute 会先把地址纠正回 providers，和下面的跳转打架
-  const [tab, setTab] = useTabRoute([...TABS.map((t) => t.key), 'datasources'], 'providers')
+  const [tab, setTab] = useTabRoute([...tabs.map((t) => t.key), ...(builder ? ['datasources'] : [])], builder ? 'providers' : 'prefs')
 
   if (raw === 'datasources') return <Navigate to="/data" replace />
 
@@ -55,13 +73,17 @@ export function SettingsPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <PageHeader icon={<SettingsIcon size={13} />} title="设置" subtitle="模型接入、偏好和运行环境" />
-      <Tabs tabs={TABS} active={tab} onChange={change} label="设置" idPrefix="settings" />
+      <PageHeader icon={<SettingsIcon size={13} />} title="设置"
+                  subtitle={builder ? '模型接入、偏好、运行环境、身份和通知' : SETTINGS_ROLE_TEXT.subtitleUser} />
+      <Tabs tabs={tabs} active={tab} onChange={change} label="设置" idPrefix="settings" />
       <TabPanel idPrefix="settings" tabKey={tab} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-4xl p-4">
           {tab === 'providers' && <ProvidersTab />}
-          {tab === 'prefs' && <PrefsTab />}
+          {tab === 'prefs' && (builder ? <PrefsTab /> : <PersonalPrefs />)}
           {tab === 'system' && <SystemTab />}
+          {tab === 'identity' && <IdentityTab />}
+          {tab === 'notify' && <NotifyTab />}
+          {tab === 'audit' && <AuditTab />}
         </div>
       </TabPanel>
     </div>
@@ -85,6 +107,8 @@ function ProvidersTab() {
   const loaded = useCatalog((s) => s.loaded)
   const [catalog, setCatalog] = useState<any>(null)
   const [editing, setEditing] = useState<Provider | 'new' | null>(null)
+  // 模型接入只有管理员能改（服务端 role_by_method(write=admin)）；开登录的搭建者只看，不出改动的按钮，免得点了才 403
+  const canWrite = atLeast(usePrincipal(), 'admin')
 
   const loadCatalog = () => api.providers.catalog().then(setCatalog, () => {})
   useEffect(() => { void loadCatalog() }, [])
@@ -122,10 +146,13 @@ function ProvidersTab() {
 
   return (
     <div>
-      <SectionBar title="模型接入" hint="API Key 加密保存在本地，不会返回给浏览器。状态圆点表示上次连接测试的结果，与是否启用无关。">
-        <button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}>
-          <Plus size={12} aria-hidden /> 添加接入
-        </button>
+      <SectionBar title="模型接入" hint={`API Key 加密保存在本地，不会返回给浏览器。状态圆点表示上次连接测试的结果，与是否启用无关。${
+        canWrite ? '' : '只有管理员能添加、修改和测试模型接入。'}`}>
+        {canWrite && (
+          <button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}>
+            <Plus size={12} aria-hidden /> 添加接入
+          </button>
+        )}
       </SectionBar>
 
       {!loaded ? (
@@ -136,12 +163,14 @@ function ProvidersTab() {
           title="还没有配置模型"
           source="providers"
           body="接入 Anthropic、OpenAI 或任何 OpenAI 兼容的服务（DeepSeek、通义、本机 Ollama…）后，Agent 才能运行。"
-          action={<button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}><Plus size={12} aria-hidden /> 添加接入</button>}
+          action={canWrite
+            ? <button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}><Plus size={12} aria-hidden /> 添加接入</button>
+            : undefined}
         />
       ) : (
         <div className="space-y-2.5">
           {providers.map((p) => (
-            <ProviderCard key={p.id} provider={p} kindLabel={kindLabel(p.kind)}
+            <ProviderCard key={p.id} provider={p} kindLabel={kindLabel(p.kind)} canWrite={canWrite}
                           onEdit={() => setEditing(p)} onRemove={() => void remove(p)} />
           ))}
         </div>
@@ -167,8 +196,8 @@ function ProvidersTab() {
   )
 }
 
-function ProviderCard({ provider: p, kindLabel, onEdit, onRemove }: {
-  provider: Provider; kindLabel: string; onEdit: () => void; onRemove: () => void
+function ProviderCard({ provider: p, kindLabel, canWrite, onEdit, onRemove }: {
+  provider: Provider; kindLabel: string; canWrite: boolean; onEdit: () => void; onRemove: () => void
 }) {
   const key = `provider:${p.id}`
   // 后端记着上次测的结果：换了浏览器、清了缓存也还在。本机刚测过的更新就用本机的
@@ -191,14 +220,16 @@ function ProviderCard({ provider: p, kindLabel, onEdit, onRemove }: {
         {!p.enabled && <span className="chip" title={PROVIDER_REF_TEXT.disabledChip}>已停用</span>}
         <span className="flex-1" />
         <HealthPill record={record} checkingSince={checkingSince} />
-        <div className="flex items-center gap-1">
-          <button className="btn btn-sm" disabled={!!checkingSince} onClick={() => void test()}
-                  title={`向 ${p.default_model || '默认模型'} 发送一条测试消息`}>
-            <Plug size={11} aria-hidden /> 测试连接
-          </button>
-          <button className="btn btn-sm btn-ghost" onClick={onEdit}>编辑</button>
-          <DeleteButton label={`删除模型接入 ${p.name}`} onClick={onRemove} />
-        </div>
+        {canWrite && (
+          <div className="flex items-center gap-1">
+            <button className="btn btn-sm" disabled={!!checkingSince} onClick={() => void test()}
+                    title={`向 ${p.default_model || '默认模型'} 发送一条测试消息`}>
+              <Plug size={11} aria-hidden /> 测试连接
+            </button>
+            <button className="btn btn-sm btn-ghost" onClick={onEdit}>编辑</button>
+            <DeleteButton label={`删除模型接入 ${p.name}`} onClick={onRemove} />
+          </div>
+        )}
       </div>
       <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-2xs text-faint">
         {p.base_url && <span className="mono break-all">{p.base_url}</span>}
@@ -615,6 +646,10 @@ function ProviderEditor({ provider, catalog, onClose, onSaved }: {
  *   所以不做自动保存。署名以前每敲一个字就写 localStorage，现在跟着一起保存。
  */
 function PrefsTab() {
+  const me = usePrincipal()
+  // 开了登录：署名就是登录的人，不再有自报署名；运行默认值这些全站共用的设置只有管理员能改（搭建者只读）
+  const signedIn = loginOn(me)
+  const admin = atLeast(me, 'admin')
   const collections = useCatalog((s) => s.collections)
   const providers = useCatalog((s) => s.providers)
   const [values, setValues] = useState<Record<string, any> | null>(null)
@@ -630,6 +665,8 @@ function PrefsTab() {
     jClaims: string | null; jCost: string | null; jTimeout: string | null; jClick: string | null; jDaily: string | null
     // 起草模型（数据目录的用模型起草、按配方导入的 AI 起草）：空串 = 跟随助手的模型（存 null）
     draftProvider: string; draftModel: string
+    // 应用一组（D-j）：按需视图每个应用每天最多发起几次
+    appsDaily: string
   } | null>(null)
   const [spend, setSpend] = useState<{ usd?: number; calls?: number; unpriced_calls?: number } | null>(null)
   // 核查一组（双盲复算、反方审稿、审批质询）的草稿另放一份，和上面的共用保存条；verifySaves 是存过几次，今日核查花费跟着再取
@@ -680,6 +717,8 @@ function PrefsTab() {
     // 起草模型（服务端 catalog_draft 一组；老服务端没有这一组时两项都是空，这一节也不显示）
     draftProvider: typeof values?.catalog_draft?.provider === 'string' ? values.catalog_draft.provider : '',
     draftModel: typeof values?.catalog_draft?.model === 'string' ? values.catalog_draft.model : '',
+    // 服务端没给这一项时按默认的 200 显示（同服务端的缺省值）
+    appsDaily: String(values?.apps?.on_demand_daily_limit ?? APPS_DAILY_DEFAULT),
   }
   const cur = draft ?? saved
   const stepCap = Number(values?.limits?.max_agent_steps) || 100
@@ -697,6 +736,10 @@ function PrefsTab() {
       ? undefined : '请填写大于 0 的金额，或留空表示不限',
   }
   const guardInvalid = Object.values(guardErrors).some(Boolean)
+  // 0 到 100,000（同服务端 settings.APPS_DAILY_LIMIT_MAX）：0 是不再发起按需运行
+  const appsError = cur.appsDaily === saved.appsDaily
+    || (/^\d+$/.test(cur.appsDaily.trim()) && Number(cur.appsDaily) <= APPS_DAILY_MAX)
+    ? undefined : APP_SETTING_TEXT.onDemandLimitInvalid
   // 裁判的上限同样只校验改过的；null（不限）总是对的
   const judgeError = (key: 'jClaims' | 'jCost' | 'jTimeout' | 'jClick' | 'jDaily') => {
     const v = cur[key]
@@ -716,7 +759,7 @@ function PrefsTab() {
   const verifyKeys = verifyChanged(verifyCur, verifySaved)
   const verifyErrs = verifyErrors(verifyCur, verifySaved)
   const verifyInvalid = Object.values(verifyErrs).some(Boolean)
-  const invalid = guardInvalid || judgeInvalid || verifyInvalid
+  const invalid = guardInvalid || judgeInvalid || verifyInvalid || !!appsError
   const changed = (Object.keys(saved) as (keyof typeof saved)[]).filter((k) => cur[k] !== saved[k])
   const dirty = values ? changed.length + verifyKeys.length : 0
   // 外壳唯一的 blocker 在地址（pathname）变化时问：切标签、导航、⌘K、⌥ 数字、后退都算
@@ -756,7 +799,8 @@ function PrefsTab() {
     }
     const judgeChanged = changed.some((k) => JUDGE_DRAFT.has(k))
     const draftChanged = changed.some((k) => DRAFT_MODEL_DRAFT.has(k))
-    const runChanged = changed.some((k) => k !== 'actor' && !JUDGE_DRAFT.has(k) && !DRAFT_MODEL_DRAFT.has(k))
+    const appsChanged = changed.includes('appsDaily')
+    const runChanged = changed.some((k) => k !== 'actor' && k !== 'appsDaily' && !JUDGE_DRAFT.has(k) && !DRAFT_MODEL_DRAFT.has(k))
     try {
       // 裁判一组整组写：后端对没给的键回落到默认值，只发改过的那一项会把别的项冲回默认
       const judge = judgeChanged ? {
@@ -772,7 +816,9 @@ function PrefsTab() {
       const verify = verifyKeys.length ? verifyPayload(verifyCur) : null
       // 起草模型一组：两项一起写，空着的存 null（跟随助手的模型）
       const catalogDraft = draftChanged ? { provider: cur.draftProvider || null, model: cur.draftModel.trim() || null } : null
-      if (runChanged || judge || verify || catalogDraft) {
+      // 应用一组同样整组写：别的键（以后加的）照原样带回去
+      const apps = appsChanged ? { ...(values.apps ?? {}), on_demand_daily_limit: Number(cur.appsDaily.trim()) } : null
+      if (runChanged || judge || verify || catalogDraft || apps) {
         const run = {
           ...(values.run ?? {}),
           default_memory_scope: cur.scope,
@@ -786,7 +832,7 @@ function PrefsTab() {
         }
         const out = await api.settings.put({
           ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}), ...(verify ? { verify } : {}),
-          ...(catalogDraft ? { catalog_draft: catalogDraft } : {}),
+          ...(catalogDraft ? { catalog_draft: catalogDraft } : {}), ...(apps ? { apps } : {}),
         })
         setValues((v) => ({
           ...(v ?? {}),
@@ -794,6 +840,7 @@ function PrefsTab() {
           ...(judge ? { judge: out?.judge ?? judge } : {}),
           ...(verify ? { verify: out?.verify ?? verify } : {}),
           ...(catalogDraft ? { catalog_draft: out?.catalog_draft ?? catalogDraft } : {}),
+          ...(apps ? { apps: out?.apps ?? apps } : {}),
         }))
         // 每日上限改了：旁边那句「今天已花」的分母跟着变，顺手再取一次
         if (judge) void loadSpend()
@@ -892,6 +939,10 @@ function PrefsTab() {
           : <Skeleton rows={6} height={14} />
       ) : (
         <>
+          {!admin && (
+            <p className="text-2xs leading-relaxed text-faint" data-prefs-readonly="">{SETTINGS_ROLE_TEXT.prefsReadOnly}</p>
+          )}
+          {!signedIn && (
           <section>
             <SectionBar title="操作者署名" hint="仅保存在当前浏览器中，更换设备后需重新填写。" />
             <Field label="名字" htmlFor="pref-actor"
@@ -901,7 +952,9 @@ function PrefsTab() {
                      onChange={(e) => edit({ actor: e.target.value })} />
             </Field>
           </section>
+          )}
 
+          <fieldset disabled={!admin} className="m-0 min-w-0 space-y-6 border-0 p-0" data-prefs-shared="">
           <section>
             <SectionBar title="运行默认值" hint="保存在服务端，所有用户共用。发起运行时未单独指定的项使用此处的设置。" />
             <div className="grid grid-cols-2 gap-3">
@@ -1109,6 +1162,18 @@ function PrefsTab() {
             <DraftModelSection provider={cur.draftProvider} model={cur.draftModel} onEdit={edit}
                                error={fieldError?.field === 'catalog_draft.provider' ? fieldError.message : undefined} />
           )}
+
+          <section data-apps-settings="">
+            <SectionBar title={APP_SETTING_TEXT.title} hint={APP_SETTING_TEXT.hint} />
+            <Field label={APP_SETTING_TEXT.onDemandLimit} htmlFor="pref-apps-daily" error={appsError}
+                   hint={APP_SETTING_TEXT.onDemandLimitHint}>
+              {(p) => (
+                <input {...p} className="field tnum max-w-40" inputMode="numeric" value={cur.appsDaily}
+                       onChange={(e) => edit({ appsDaily: e.target.value })} data-apps-daily="" />
+              )}
+            </Field>
+          </section>
+          </fieldset>
         </>
       )}
 
@@ -1133,6 +1198,7 @@ function PrefsTab() {
                     jClaims: '每份报告最多裁判句数', jCost: '每份报告的金额上限', jTimeout: '每份报告的时长上限',
                     jClick: '每次点击的金额上限', jDaily: '每日金额上限',
                     draftProvider: DRAFT_MODEL_SETTING_TEXT.provider, draftModel: DRAFT_MODEL_SETTING_TEXT.model,
+                    appsDaily: APP_SETTING_TEXT.onDemandLimit,
                   })[k]).concat(verifyLabels(verifyKeys)).join('、')}
                 </span>
               </span>
@@ -1148,6 +1214,7 @@ function PrefsTab() {
               <button className="btn btn-sm btn-primary" disabled={saving || invalid}
                       title={guardInvalid ? '护栏设置中有无效值，请修正后再保存'
                         : judgeInvalid ? '证据裁判的上限有无效值，请修正后再保存'
+                        : appsError ? APP_SETTING_TEXT.onDemandLimitInvalid
                         : verifyInvalid ? VERIFY_SETTING_TEXT.section.saveInvalid : undefined}
                       onClick={() => void save()}>
                 {saving ? <Spinner size={11} /> : <Check size={12} aria-hidden />} 保存设置
@@ -1160,6 +1227,22 @@ function PrefsTab() {
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/** 按需视图每日上限的缺省值和最大值（同服务端 settings.APPS_DEFAULTS、APPS_DAILY_LIMIT_MAX） */
+const APPS_DAILY_DEFAULT = 200
+const APPS_DAILY_MAX = 100_000
+
+/**
+ * 开了登录的使用者的偏好：只有主题（只存本机，D-s）。署名就是登录的人；运行默认值、模型这些全站共用的设置不给使用者看，
+ * 接口也不给（GET /api/settings 只给搭建者以上）
+ */
+function PersonalPrefs() {
+  return (
+    <div className="max-w-2xl space-y-6 pb-20" data-prefs-personal="">
+      <ThemeSection />
     </div>
   )
 }
@@ -1239,6 +1322,8 @@ function ThemeSection() {
   const { pref } = useTheme()
   const [receipt, setReceipt] = useState<'saving' | 'saved' | null>(null)
   const latest = useRef<ThemePref>(pref)
+  // 开了登录、不是管理员（D-s）：只存本机，不写服务端，也就不去读回核对
+  const local = prefsLocalOnly(usePrincipal())
 
   useEffect(() => {
     if (receipt !== 'saved') return
@@ -1252,6 +1337,7 @@ function ThemeSection() {
     setReceipt('saving')
     await setThemePref(next)
     if (latest.current !== next) return
+    if (local) { setReceipt('saved'); return }
     const stored = await api.settings.get().then((s) => normalizeTheme(s?.ui?.theme), () => null)
     if (latest.current !== next) return
     setReceipt(stored === next ? 'saved' : null)
@@ -1259,7 +1345,7 @@ function ThemeSection() {
 
   return (
     <section>
-      <SectionBar title="界面" hint="选择后立即生效并保存，所有设备共用。" />
+      <SectionBar title="界面" hint={local ? SETTINGS_ROLE_TEXT.themeLocal : '选择后立即生效并保存，所有设备共用。'} />
       <div className="flex flex-wrap items-center gap-3">
         <ThemeChoice value={pref} onChange={(v) => void pick(v)} />
         <span className="text-2xs" aria-live="polite" data-theme-save={receipt ?? undefined}>

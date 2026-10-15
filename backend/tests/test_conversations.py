@@ -162,12 +162,12 @@ async def test_no_conversation_means_no_history_header(client, monkeypatch) -> N
     captured: list = []
 
     class _Recorder:
-        def with_structured_output(self, *_a, **_k):
-            return self
+        # 非流式的 /generate 和流式走同一个生成过程（copilot_gen）：模型按操作流回答
+        async def astream(self, messages):
+            from langchain_core.messages import AIMessageChunk
 
-        async def ainvoke(self, messages):
             captured.append(messages)
-            return {"nodes": [], "edges": []}
+            yield AIMessageChunk(content='{"op":"reply","text":"好"}\n')
 
     async def _model(*_a, **_k):
         return _Recorder(), "mock-fast"

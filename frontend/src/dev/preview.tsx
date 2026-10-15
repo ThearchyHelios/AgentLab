@@ -6,6 +6,7 @@ import { Database, MessageSquare, RotateCw } from 'lucide-react'
 import { AssistantStream, StreamEmpty, type StreamTurn } from '../run/AssistantStream'
 import { Markdown } from '../run/Markdown'
 import { ApprovalCard } from '../run/RunPanel'
+import { withTask } from './taskOf'
 import { decodeCopilot, decodeRun } from '../run/decode'
 import { catalogPatchesOf } from '../run/catalogPatch'
 import { ToastHost } from '../components/ui'
@@ -341,11 +342,13 @@ function synthetic(name: string): StreamTurn[] {
       return [{ id: 'cancelled', question: '把大表全量拉一遍', phase: 'done', statusCode: 'cancelled',
                 steps: decodeRun(cancelledRun()), runId: 'syn-cancel' }]
     case 'chat': {
-      // 问数据的一轮：先建图、再执行。执行开始后「规划」收成一行
+      // 问数据的一轮：先建图（按需查看了两张表：look 事件）、再执行。执行开始后「规划」收成一行
       const plan = decodeCopilot([
+        { op: 'heartbeat', phase: 'looking', elapsed_ms: 1800 },
+        { op: 'look', id: 'L1', by: 'model', need: '设备 KPI 和设备维度', status: 'ok', elapsed_ms: 2100, objects: [
+          { kind: 'table', source: 'warehouse', source_id: 'src-warehouse', named: [], picked: ['v_device_kpi', 'dim_device'],
+            joined: [], missing: [], total: 53 }] },
         { op: 'heartbeat', phase: 'planning', elapsed_ms: 6400 },
-        { op: 'context', elapsed_ms: 2100, sources: [
-          { source: 'warehouse', tables: ['v_device_kpi', 'dim_device'], selected_by: 'model', total: 53 }] },
         { op: 'thinking', delta: '要先查表结构，再按设备汇总 KPI。' },
         { op: 'plan', summary: '取数 → 汇总 → 出结论' },
         { op: 'add_node', node: { id: 'q', type: 'tool', label: '查询设备 KPI' } },
@@ -570,7 +573,7 @@ function Preview() {
     return (
       <div className={dense ? 'w-[360px] border-r' : 'mx-auto max-w-3xl p-4'}>
         <div className="overflow-hidden rounded-lg border" style={{ borderColor: 'var(--warn)' }}>
-          <ApprovalCard approval={approval} onResolved={() => undefined} />
+          <ApprovalCard approval={withTask(approval)} onResolved={() => undefined} />
         </div>
       </div>
     )

@@ -209,6 +209,12 @@ await section('断网打开', async () => {
         check('指标步骤带口径、计算方式（原式、代入式）、输入和复算',
           /口径卡「/.test(text) && /原式（计算方式）/.test(text) && /代入式/.test(text)
             && (/输入/.test(text) || /缺少输入/.test(text)) && /复算/.test(text), text.slice(0, 300))
+        // 有出处（确定性复算一致）和追到原始数据分开说：链里带了 untraced 的，面板写明追没追到、追到哪个节点为止
+        const untraced = chain.find((s) => s.step === 'metric')?.untraced
+        if (Array.isArray(untraced)) {
+          check('指标步骤写明输入追没追到原始数据', /原始数据/.test(text)
+            && untraced.every((u) => text.includes(String(u.path))), text.slice(0, 300))
+        }
       }
       if (kinds.includes('query')) {
         check('查询步骤带 SQL 和被引用的行', /SQL/.test(text) && /被引用的行/.test(text), text.slice(0, 300))

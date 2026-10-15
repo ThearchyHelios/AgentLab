@@ -10,6 +10,7 @@ import { EVIDENCE_STATE, segmentLabel, segmentState, sourceOf, unitText, type Ev
 import { humanizeError } from '../lib/errors'
 import { formatCost, formatDateTime, formatTime, parseServerTime } from '../lib/format'
 import { COST_TEXT, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT, runCostText } from '../lib/terms'
+import { useAtLeast } from '../store/auth'
 import { useEvidence } from '../store/evidence'
 import { useStudio } from '../store/studio'
 import type {
@@ -481,14 +482,17 @@ export const useInquiryBusy = (runId: string | null | undefined): boolean =>
 
 /**
  * 页面给报告文档和问答串的「能不能问」。open 是按运行状态能不能问（审批卡：审批待处理；运行详情：封存了的探索运行），
- * 设置里关了审批质询时 access 为 null、disabled 为真。host 每一处各一个：同一张审批卡同时挂在两处时靠它分开
+ * 设置里关了审批质询时 access 为 null、disabled 为真。host 每一处各一个：同一张审批卡同时挂在两处时靠它分开。
+ * 质询只给搭建者及以上（main.py 的 inquiry 路由）：开了登录的使用者处理待办时报告照常看，不挂「质询」，不让人点了再被拒
  */
 export function useInquiryAccess(open: boolean, approvalId: string | null): { access: InquiryAccess | null; disabled: boolean } {
   const host = useId()
-  const enabled = useInquiryEnabled(open)
-  const access = useMemo<InquiryAccess | null>(() => (open && enabled !== false ? { approvalId, host } : null),
-    [open, enabled, approvalId, host])
-  return { access, disabled: open && enabled === false }
+  const builder = useAtLeast('builder')
+  const askable = open && builder
+  const enabled = useInquiryEnabled(askable)
+  const access = useMemo<InquiryAccess | null>(() => (askable && enabled !== false ? { approvalId, host } : null),
+    [askable, enabled, approvalId, host])
+  return { access, disabled: askable && enabled === false }
 }
 
 /** 问答串：服务端列出来的，加上这一页里问过、列表里还没有的（没写进运行记录的一直只在这里），按提问时间排 */

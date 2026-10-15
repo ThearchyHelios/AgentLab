@@ -39,6 +39,12 @@ class ToolContext:
     #: None 是升级前发起的运行，用当前版本；Versions.CURRENT 是不在运行里的调用，用当前版本；
     #: 缺省 Versions.UNSET 是谁都没给——上传源遇到它报错，见 Versions
     data_versions: dict[str, Any] | Versions | None = Versions.UNSET
+    #: 数据源查询结果交给模型、落进快照之前先遮（tools/datasource.py 的 run_masks_results）：开登录后 user 角色发起的
+    #: 问数据运行，对它来说遮罩就是边界，事件、回答里只能有遮过的值
+    mask_results: bool = False
+    #: 数据源查询一律只读，可写源上的写语句也拒（tools/datasource.py 的 run_reads_only）：同样是 user 角色的问数据运行。
+    #: 不能交给审批去拦——Agent 的 approval 是发起人自己写在图里的
+    force_readonly: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -53,6 +59,9 @@ class ToolSpec:
     dangerous: bool = False
     # 函数第一个参数是否接收 ToolContext
     needs_context: bool = True
+    # 改平台自身的状态（写记忆）：不危险到默认要人确认，但也不是只读——能力登记里不能记成只读（只读的才能正式运行免审批、
+    # 才能当写入的查询能力），见 capabilities.registry._discover
+    writes_state: bool = False
 
     def json_schema(self) -> dict[str, Any]:
         return self.args_schema.model_json_schema()
@@ -69,6 +78,7 @@ def register(
     *,
     dangerous: bool = False,
     needs_context: bool = True,
+    writes_state: bool = False,
 ) -> Callable[[ToolFunc], ToolFunc]:
     def deco(func: ToolFunc) -> ToolFunc:
         _REGISTRY[name] = ToolSpec(
@@ -79,6 +89,7 @@ def register(
             func=func,
             dangerous=dangerous,
             needs_context=needs_context,
+            writes_state=writes_state,
         )
         return func
 
@@ -140,9 +151,15 @@ def build_tool(spec: ToolSpec, ctx: ToolContext) -> BaseTool:
 
 
 async def build_tools(
-    names: list[str], ctx: ToolContext, *, session: Any = None
+    names: list[str], ctx: ToolContext, *, session: Any = None, allow_write: bool = False
 ) -> list[BaseTool]:
     """按名字列表组装工具。
+
+    allow_write（应用平台 A5）：写入能力只能放在调用工具节点里——只有调用工具节点传 True；agent、协作节点用默认值，
+    能力登记里治理后效果为 write 的工具在这里就被拒绝（ToolBuildError，绑了它的节点失败并说清去哪里改）。发布检查
+    另有一道 action.write_in_agent（engine/lint_capabilities.py），这里是运行时的那一道：草稿、探索运行不过发布检查。
+    视参数而定（dynamic）的照旧放行，每次调用按参数问审批（可写数据源的 DML、有副作用的内置工具）；绑定端点、由平台
+    执行的除外，见 capabilities.registry.writes_externally。
 
     四种来源：内置（静态注册）、MCP（mcp:<server>/<tool>）、数据源
     （db_query__<源名> / db_schema__<源名>）、自定义（数据库里的 CustomTool）。
@@ -169,7 +186,8 @@ async def build_tools(
     if datasource_names and session is not None:
         from app.tools.datasource import build_datasource_tools
 
-        tools.extend(await build_datasource_tools(datasource_names, ctx, session))
+        tools.extend(await build_datasource_tools(datasource_names, ctx, session, force_readonly=ctx.force_readonly,
+                                                  mask_results=ctx.mask_results))
 
     if mcp_names:
         from app.tools.mcp_manager import mcp_manager
@@ -181,7 +199,35 @@ async def build_tools(
 
         tools.extend(await build_custom_tools(custom_names, ctx, session))
 
+    if not allow_write and tools:
+        await _refuse_writes(tools, session)
     return tools
+
+
+async def _refuse_writes(tools: list[BaseTool], session: Any) -> None:
+    """写外部系统的工具（capabilities.registry.writes_externally：治理后效果为 write，或绑定端点、视参数而定）不交给
+    agent。按能力登记的名字认（MCP 是 mcp:<服务>/<工具>，和 trust_key 一致）。"""
+    from sqlalchemy import select
+
+    from app.capabilities.registry import effective_effect, writes_externally
+    from app.db.models import Capability
+
+    keys = {(t.metadata or {}).get("trust_key") or t.name for t in tools}
+
+    async def lookup(s: Any) -> list[Any]:
+        return list((await s.execute(select(Capability).where(Capability.name.in_(list(keys))))).scalars())
+
+    if session is not None:
+        rows = await lookup(session)
+    else:
+        from app.db.base import SessionLocal
+
+        async with SessionLocal() as own:
+            rows = await lookup(own)
+    if writes := [row.name for row in rows if writes_externally(row.name, effective_effect(row), row.endpoint_id)]:
+        raise ToolBuildError(
+            f"{'、'.join(f'「{w}」' for w in writes)}是写入能力，只能放在「调用工具」节点里，由动作确认后发送；"
+            "请从 Agent 的工具清单中移除，改用「调用工具」节点")
 
 
 class ToolBuildError(ValueError):
@@ -347,7 +393,8 @@ async def call_tool(
             return await spec.func(ctx, **payload)
         return await spec.func(**payload)
 
-    tools = await build_tools([name], ctx, session=session)
+    # 直接调用（调用工具节点、工具库试用）：参数是人配的，不是模型挑的，写入能力也能调——写入在运行里另有动作流程把关
+    tools = await build_tools([name], ctx, session=session, allow_write=True)
     if not tools:
         raise KeyError(f"找不到工具 {name}")
     tool = tools[0]

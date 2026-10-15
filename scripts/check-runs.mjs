@@ -1,4 +1,4 @@
-// 记录页（/runs）的检查：页签、状态筛选、分页、时间、待审批、删除保护、运行中接流、
+// 记录页（/runs）的检查：页签、状态筛选、分页、时间、待办、运行来源、生效记录、删除保护、运行中接流、
 // 失败的排错路径、封存凭证、提取模板。
 //
 // 守的是审查里抓到的几条死路：待审批的运行排在第 145 位、列表只取 100 条，点了
@@ -122,10 +122,36 @@ const recordedCodes = () => page.evaluate(() => window.__runCodes ?? [])
 // 各节共用的真数据，只读，在所有节之前取好。放在某一节里取的话，那一节的界面一出错，
 // 后面十几节都拿着 undefined 报「中途出错」，各自真正的状态就看不见了
 const pending = await getJson('/approvals?status=pending&limit=500')
+// 「待办」页签列的是不属于应用的运行里待处理的待办（应用平台：一次中断对应一条审批和一条待办，存量的待审批服务端
+// 启动时补建了待办）。应用里的待办在「应用 → 待办」里，不在这里
+const pendingTasks = ((await getJson('/tasks?assigned=all&status=pending&limit=500').catch(() => ({ items: [] }))).items ?? [])
+  .filter((t) => !t.app_id)
 const allRuns = await getJson('/runs?limit=200')
 const listTop = await getJson('/runs?limit=50')
 const wfHost = (await getJson('/workflows'))[0]
 const base = allRuns.find((r) => r.status === 'succeeded' && !r.workflow_id)
+
+/**
+ * 合成的两条待处理待办（沙箱里一条都没有时用）：挂在沙箱里真实的运行上——最近的一条，和排在第 100 名之后的一条
+ * （原来只取 100 条时找不到的那种）。一条等了 8 天，一条刚来
+ */
+function syntheticTasks() {
+  const picks = [allRuns[0], allRuns[Math.min(allRuns.length - 1, 120)]].filter((r, i, a) => r && a.indexOf(r) === i)
+  return picks.map((r, i) => {
+    const at = new Date(Date.now() - (i ? 8 * 86400_000 : 3 * 60_000)).toISOString()
+    return { id: `fake0task0list${i}`, approval_id: `fake0appr0list${i}`, run_id: r.id, node_id: 'gate', node_label: '人工审批',
+      run_class: r.run_class ?? 'exploratory', workflow_id: r.workflow_id ?? null, workflow_name: r.workflow_name || '订单日报',
+      app_id: null, app_version: null, kind: i ? 'input' : 'approve', title: i ? '补一下预算上限' : '这份报表可以发出吗？', form: null,
+      policy: { kind: 'any' }, status: 'pending', due_at: null, escalation_level: 0, payload: {}, can_respond: true,
+      assignments: [{ id: `fake0as${i}`, principal_kind: 'anyone', principal: '', source: 'anyone', status: 'pending',
+        responded_by: null, responded_at: null, verified: false }],
+      outcome: null, resolved_by: null, resolved_at: null, created_at: at }
+  })
+}
+const syntheticApprovals = (tasks) => tasks.map((t) => ({ id: t.approval_id, run_id: t.run_id, node_id: t.node_id,
+  mode: t.kind === 'input' ? 'input' : 'approve', title: t.title, payload: { kind: 'human_node' }, status: 'pending', response: {},
+  created_at: t.created_at, workflow_id: t.workflow_id, workflow_name: t.workflow_name, node_label: t.node_label,
+  run_status: 'interrupted', run_class: t.run_class, task_id: t.id }))
 
 // ------------------------------------------------------------------ 页签
 
@@ -163,9 +189,9 @@ await section('页签与地址', async () => {
   check('认不出的页签落回「全部」并纠正地址', !new URL(page.url()).searchParams.has('tab'))
 })
 
-// ------------------------------------------------------------------ 待审批
+// ------------------------------------------------------------------ 待办（以前叫待审批）
 
-await section('待审批页签', async () => {
+await section('待办页签', async () => {
   // 「别处批掉了」要用的实时流：routeWebSocket 只管注册之后加载的页面，先挂上
   let resumeSocket = false
   if (pending.length) {
@@ -178,35 +204,60 @@ await section('待审批页签', async () => {
       ws.send(JSON.stringify({ seq: lastSeq + 2, type: 'node.started', node_id: target.node_id, ts: t + 0.05, data: { resumed: true } }))
     })
   }
+  // 沙箱是开发库的拷贝：手上的待办刚好都处理完时一条都没有，列表这几项就只剩空态可看。那时拿两条合成的待办来验列表
+  // （挂在沙箱里真实的运行上，一条排在最近 100 条之外）；点进详情、别处批掉这几段要真待审批，照旧只在有的时候跑
+  const synthetic = !pendingTasks.length && allRuns.length > 0
+  const listTasks = synthetic ? syntheticTasks() : pendingTasks
+  if (synthetic) {
+    console.log('  · 沙箱里没有待处理的待办：列表这几项用合成的 2 条')
+    fakes.set('GET /api/tasks', (url) => ({ status: 200, json: { items: url.searchParams.get('run_id') ? [] : listTasks } }))
+    fakes.set('GET /api/approvals', (url) => ({ status: 200, json: url.searchParams.get('run_id') ? [] : syntheticApprovals(listTasks) }))
+  }
   await page.goto(`${WEB}/runs?tab=approvals`, { waitUntil: 'networkidle' })
   await page.waitForTimeout(400)
-  const approvalRows = page.locator('[data-approvals-list] [data-approval-id]')
-  const shownApprovals = await approvalRows.evaluateAll((els) => els.map((e) => e.getAttribute('data-approval-id')))
-  check('沙箱里的待审批都在页签里', pending.length > 0 && pending.every((a) => shownApprovals.includes(a.id)),
-    `API ${pending.length} 条 / 页面 ${shownApprovals.length} 条`)
-  const deep = pending.filter((a) => allRuns.findIndex((r) => r.id === a.run_id) >= 100)
-  check('排在最近 100 条之外的待审批也看得到（原来的死路）', deep.every((a) => shownApprovals.includes(a.id)),
+  check('页签叫「待办」', (await page.locator('[role=tab][data-tab=approvals]').innerText()).includes('待办'))
+  const taskRows = page.locator('[data-tasks-list] [data-task-id]')
+  const shownTasks = await taskRows.evaluateAll((els) => els.map((e) => e.getAttribute('data-task-id')))
+  check(synthetic ? '不属于应用的待办都在页签里（合成的 2 条）' : '沙箱里不属于应用的待办都在页签里',
+    listTasks.length > 0 && listTasks.every((t) => shownTasks.includes(t.id)),
+    `API ${listTasks.length} 条 / 页面 ${shownTasks.length} 条`)
+  check('存量的待审批都补建了待办', pending.every((a) => pendingTasks.some((t) => t.approval_id === a.id)),
+    `${pending.filter((a) => !pendingTasks.some((t) => t.approval_id === a.id)).length} 条没有对应的待办`)
+  const deep = listTasks.filter((t) => allRuns.findIndex((r) => r.id === t.run_id) >= 100)
+  check('排在最近 100 条之外的待办也看得到（原来的死路）', deep.every((t) => shownTasks.includes(t.id)),
     `${deep.length} 条在第 100 名之后`)
-  check('每条都写着等了多久', await page.locator('[data-approvals-list] [data-approval-age]').count() === shownApprovals.length)
-  if (pending.length) {
-    const rowText = await page.locator(`[data-approval-id="${pending[0].id}"]`).innerText()
-    const hasWf = rowText.includes(pending[0].workflow_name ?? '')
-    const hasNode = rowText.includes(pending[0].node_label ?? pending[0].node_id)
+  check('每条都写着等了多久', await page.locator('[data-tasks-list] [data-task-age]').count() === shownTasks.length)
+  check('每条标着待办的种类', await page.locator('[data-tasks-list] [data-task-kind-chip]').count() === shownTasks.length)
+  if (listTasks.length) {
+    const first = listTasks[0]
+    const rowText = await page.locator(`[data-task-id="${first.id}"]`).innerText()
+    // 应用里的写应用名；没保存就跑的写「未保存的工作流」、不露「临时图」（同审批行的 runName）
+    const unsaved = !first.workflow_id && (!first.workflow_name || ['临时图', '未保存的工作流'].includes(first.workflow_name))
+    const wfName = first.app_name || (unsaved ? '未保存的工作流' : first.workflow_name ?? '')
+    const hasWf = rowText.includes(wfName) && !rowText.includes('临时图')
+    const hasNode = rowText.includes(`「${first.node_label ?? first.node_id}」`)
     // 名字来自沙箱库，只报在不在
-    check('每条写着工作流名和节点', hasWf && hasNode, `工作流名 ${hasWf ? '在' : '缺'} · 节点 ${hasNode ? '在' : '缺'}`)
+    check('每条写着工作流名和节点（节点写名字，不写 id）', hasWf && hasNode,
+      `工作流名 ${hasWf ? '在' : '缺'} · 节点 ${hasNode ? '在' : '缺'}`)
     check('每条有处理入口', rowText.includes('去处理'))
   }
+  check('列表下面写明应用里的待办在哪里处理', (await page.locator('[data-tasks-list]').innerText().catch(() => '')).includes('应用 → 待办'))
   const badge = await page.locator('[role=tab][data-tab=approvals]').innerText()
-  check('页签上的数和待审批条数一致', badge.includes(String(pending.length)), badge.replace(/\s+/g, ' '))
+  check('页签上的数和待办条数一致', badge.includes(String(listTasks.length)), badge.replace(/\s+/g, ' '))
+  if (synthetic) {
+    fakes.delete('GET /api/tasks')
+    fakes.delete('GET /api/approvals')
+  }
   if (pending.length) {
     const target = pending[0]
-    await page.locator(`[data-approval-id="${target.id}"]`).click()
+    const task = pendingTasks.find((t) => t.approval_id === target.id)
+    await page.locator(`[data-task-id="${task?.id}"]`).click()
     await page.waitForURL(`**/runs/${target.run_id}**`)
     await page.locator('[data-run-detail]').waitFor()
     await page.waitForTimeout(500)
     check('点进去是那次运行，地址保留 ?tab=approvals', new URL(page.url()).searchParams.get('tab') === 'approvals')
     check('详情显示等审批的横幅', await page.locator('[data-run-banner=waiting]').count() === 1)
-    check('审批卡在时间线里', await page.locator(`[data-approval-card="${target.id}"]`).count() === 1)
+    check('待办卡（TaskCard）在时间线里，按审批 id 定位得到', await page.locator(`[data-approval-card="${target.id}"][data-task-card]`).count() === 1)
     check('详情头的状态是「等待审批」', await page.locator('[data-run-detail]').getAttribute('data-run-code') === 'waiting')
     const docScroll = await page.evaluate(() => document.scrollingElement.scrollHeight - innerHeight)
     check('整页不滚动：滚的是时间线自己', docScroll <= 0, `溢出 ${docScroll}px`)
@@ -1554,8 +1605,21 @@ await section('工作流筛选：未保存的工作流', async () => {
   if (wfOptions.includes('__none__')) {
     await listAfter(() => page.locator('[data-runs-workflow]').selectOption('__none__'), (p) => p.get('workflow_id') === '__none__')
     check('地址记下 ?wf=__none__', new URL(page.url()).searchParams.get('wf') === '__none__')
-    const names = await page.locator('[data-runs-list] [data-run-id] > div:first-of-type').evaluateAll((els) => els.map((e) => e.textContent ?? ''))
-    check('筛出来的都是未保存的工作流', names.length > 0 && names.every((n) => n.includes('未保存的工作流')), `${names.length} 行`)
+    const rows = await page.locator('[data-runs-list] [data-run-id]').evaluateAll((els) => els.map((e) => ({
+      id: e.getAttribute('data-run-id'), name: e.querySelector(':scope > div:first-of-type')?.textContent ?? '' })))
+    // 没有工作流的运行有两种：没保存就跑的（记的名字是「临时图」、空，或已经是「未保存的工作流」），和工作流后来删掉了的
+    // （记着当时的名字）。前一种一律写「未保存的工作流」、不露「临时图」；后一种照记下的名字写。名字来自沙箱库，只报条数
+    const byId = new Map((await getJson('/runs?workflow_id=__none__&limit=200')).map((r) => [r.id, r]))
+    const unsavedName = (r) => !r.workflow_name || ['临时图', '未保存的工作流'].includes(r.workflow_name)
+    const wrong = rows.filter(({ id, name }) => {
+      const r = byId.get(id)
+      if (!r || r.workflow_id) return true
+      return unsavedName(r) ? !name.includes('未保存的工作流') : !name.includes(r.workflow_name)
+    })
+    check('筛出来的都是没有工作流的运行：没保存就跑的写「未保存的工作流」，不露「临时图」',
+      rows.length > 0 && !wrong.length && rows.every((r) => !r.name.includes('临时图'))
+      && rows.some((r) => r.name.includes('未保存的工作流')),
+      `${rows.length} 行 · ${rows.filter((r) => unsavedName(byId.get(r.id) ?? {})).length} 行是没保存就跑的 · ${wrong.length} 行不对`)
     await page.locator('[data-runs-workflow]').selectOption('')
     await settle()
   }
@@ -1877,8 +1941,10 @@ await section('证据页签：左边报告、右边常驻面板、下方审计�
   })
   await page.goto(`${WEB}/runs/${EV}`, { waitUntil: 'networkidle' })
   await page.locator('[data-run-detail]').waitFor()
+  // 应用平台在工件后面加了「生效记录」（§3.8）
+  const tabOrder = (await page.locator('[data-run-detail] [role=tab]').evaluateAll((els) => els.map((e) => e.getAttribute('data-tab')))).join(',')
   check('详情多了「证据」页签（在航迹和工件之间）', await viewTab('evidence').count() === 1
-    && (await page.locator('[data-run-detail] [role=tab]').evaluateAll((els) => els.map((e) => e.getAttribute('data-tab')))).join(',') === 'stream,trace,evidence,artifacts')
+    && tabOrder === 'stream,trace,evidence,artifacts,effects', tabOrder)
   check('没打开证据页签之前不取证据图和审计表', !evRequests.some((u) => u.includes(EV)), evRequests.join(' '))
   await viewTab('evidence').click()
   await page.locator('[data-view-pane=evidence] [data-evidence-pane=cited]').waitFor({ timeout: 8000 }).catch(() => {})
@@ -2272,6 +2338,107 @@ await section('证据页签：没有逐段证据的运行给升级横幅，跳�
   }
   for (const k of ['GET /api/workflows', 'GET /api/conversations', 'POST /api/workflows/validate', 'POST /api/workflows/variables',
     'POST /api/copilot/upgrade-evidence']) fakes.delete(k)
+})
+
+// ------------------------------------------------------------------ 应用平台：运行来源、生效记录
+
+await section('待办页签：审批带着 task_id，新来的审批按 id 补取待办，不整表重取', async () => {
+  // D-r：/api/approvals 每项带 task_id。待审批变了时，记录页的「待办」页签按 task_id 只取新来的那几条
+  check('审批列表的每一项都带着对应待办的 task_id', pending.every((a) => typeof a.task_id === 'string'
+    && pendingTasks.some((t) => t.id === a.task_id && t.approval_id === a.id)),
+  `${pending.filter((a) => !a.task_id).length} 条没带`)
+  const lists = []
+  const byId = []
+  const onRequest = (req) => {
+    const u = new URL(req.url())
+    // 只数这个页签的整表重取（assigned=all）。外壳的新待办通知按「派给我的」（assigned=me）取，那是另一回事：
+    // 它在派给我的待办数变了、或刚打开页面记底时取一次
+    if (u.pathname === '/api/tasks' && u.searchParams.get('assigned') !== 'me') lists.push(u.search)
+    const m = u.pathname.match(/^\/api\/tasks\/([^/]+)$/)
+    if (m && m[1] !== 'count') byId.push(m[1])
+  }
+  fakes.set('GET /api/approvals', () => ({ status: 200, json: pending }))
+  await page.goto(`${WEB}/runs?tab=approvals`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(600)
+  page.on('request', onRequest)
+  const at = new Date().toISOString()
+  const extra = { id: 'fake0appr0byid', run_id: 'fake0run0byid', node_id: 'gate', mode: 'approve', title: '按 id 补取的待审批',
+    payload: { kind: 'human_node' }, status: 'pending', response: {}, created_at: at, workflow_id: null, workflow_name: '订单日报',
+    node_label: '人工审批', run_status: 'interrupted', run_class: 'exploratory', task_id: 'fake0task0byid' }
+  const task = { id: 'fake0task0byid', approval_id: extra.id, run_id: extra.run_id, node_id: 'gate', node_label: '人工审批',
+    run_class: 'exploratory', workflow_id: null, workflow_name: '订单日报', app_id: null, app_version: null, kind: 'approve',
+    title: extra.title, form: null, policy: { kind: 'any' }, status: 'pending', due_at: null, escalation_level: 0, payload: {},
+    assignments: [], can_respond: true, outcome: null, resolved_by: null, resolved_at: null, created_at: at }
+  fakes.set('GET /api/approvals', () => ({ status: 200, json: [...pending, extra] }))
+  fakes.set('GET /api/tasks/fake0task0byid', () => ({ status: 200, json: task }))
+  const shown = await page.locator('[data-tasks-list] [data-task-id="fake0task0byid"]').waitFor({ timeout: 9000 }).then(() => true, () => false)
+  check('新来的审批：待办按 task_id 补进列表', shown)
+  check('……按 id 取了那一条', byId.includes('fake0task0byid'), byId.join(','))
+  check('……没有整表重取待办', lists.length === 0, lists.join(' | '))
+  page.off('request', onRequest)
+  fakes.delete('GET /api/approvals')
+  fakes.delete('GET /api/tasks/fake0task0byid')
+})
+
+await section('运行来源：标签与筛选', async () => {
+  // X3：运行记着从哪里发起；老运行没有来源，详情写「来源未记录」，列表里不标。筛选按 origin_kind 查服务端
+  const seen = []
+  const fake = (id, kind, hours) => ({ ...base, id, origin_kind: kind, origin: kind ? { kind } : null,
+    created_at: new Date(Date.now() - hours * 3_600_000).toISOString() })
+  const rows = [fake('fake0origin0chat', 'chat', 1), fake('fake0origin0canvas', 'canvas', 2), fake('fake0origin0none', null, 3)]
+  fakes.set('GET /api/runs', (url) => {
+    seen.push(url.searchParams.get('origin_kind'))
+    const kind = url.searchParams.get('origin_kind')
+    const json = kind === 'none' ? rows.filter((r) => !r.origin_kind) : kind ? rows.filter((r) => r.origin_kind === kind) : rows
+    return { status: 200, json }
+  })
+  await page.goto(`${WEB}/runs`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(300)
+  check('列表行标出来源', await page.locator('[data-run-id="fake0origin0chat"] [data-run-origin="chat"]').count() === 1
+    && (await page.locator('[data-run-id="fake0origin0chat"] [data-run-origin]').innerText()).includes('问数据'))
+  check('来源未记录的老运行在列表里不标', await page.locator('[data-run-id="fake0origin0none"] [data-run-origin]').count() === 0)
+  const sel = page.locator('[data-runs-origin]')
+  check('筛选条里有来源下拉，含「来源未记录」', await sel.count() === 1
+    && (await sel.locator('option').allInnerTexts()).includes('来源未记录'))
+  await sel.selectOption('canvas')
+  await settle()
+  check('选了来源按 origin_kind 查服务端', seen.includes('canvas'), seen.join(','))
+  check('地址里记着来源', new URL(page.url()).searchParams.get('origin') === 'canvas')
+  check('只剩那一种来源', (await ids()).join(',') === 'fake0origin0canvas', (await ids()).join(','))
+  await sel.selectOption('')
+  await settle()
+  fakes.delete('GET /api/runs')
+  if (base) {
+    await page.goto(`${WEB}/runs/${base.id}`, { waitUntil: 'networkidle' })
+    await page.locator('[data-run-detail]').waitFor()
+    const chip = page.locator('[data-run-detail] header [data-run-origin]')
+    check('详情头写来源；老运行写「来源未记录」', await chip.count() === 1
+      && (base.origin_kind ? true : (await chip.innerText()).includes('来源未记录')), await chip.innerText().catch(() => ''))
+  }
+})
+
+await section('生效记录面板', async () => {
+  // §3.8：调用工具节点对外部系统的每次写入。权威记录在服务端，详情里单独一个视图
+  if (!base) { check('沙箱里有一条成功的运行', false); return }
+  const t = new Date().toISOString()
+  const rec = (id, state, attempt = 1) => ({ id, run_id: base.id, node_id: 'pay', app_id: null, capability: 'erp_pay',
+    environment: state === 'simulated' ? 'simulated' : 'prod', state, attempt, payload_hash: `${id}abcdef0123456789`,
+    preview: { amount: '***' }, receipt: state === 'confirmed' ? { order: 'ERP-1' } : null, error: null, resolution: null,
+    created_at: t, updated_at: t })
+  fakes.set('GET /api/actions', () => ({ status: 200, json: { items: [rec('a1', 'confirmed'), rec('a2', 'unknown', 2), rec('a3', 'simulated')] } }))
+  await page.goto(`${WEB}/runs/${base.id}?view=effects`, { waitUntil: 'networkidle' })
+  const pane = page.locator('[data-effects-pane]')
+  check('「生效记录」视图列出每次写入', await pane.waitFor({ timeout: 5000 }).then(() => true, () => false)
+    && await pane.locator('[data-effect]').count() === 3)
+  check('状态照实写：已生效、结果未知、演练', (await pane.innerText()).includes('已生效') && (await pane.innerText()).includes('结果未知')
+    && (await pane.innerText()).includes('演练'))
+  check('哈希只露前 8 位', (await pane.locator('[data-effect="a1"]').innerText()).includes('a1abcdef'))
+  await pane.locator('[data-effect="a1"] summary').click()
+  check('展开看到遮罩后的发送内容和回执', (await pane.locator('[data-effect="a1"]').innerText()).includes('ERP-1'))
+  fakes.set('GET /api/actions', () => ({ status: 200, json: { items: [] } }))
+  await page.goto(`${WEB}/runs/${base.id}?view=effects`, { waitUntil: 'networkidle' })
+  check('没有写入时说清楚', (await page.locator('[data-view-pane="effects"]').innerText()).includes('这次运行没有写入外部系统'))
+  fakes.delete('GET /api/actions')
 })
 
 await section('收尾', async () => {

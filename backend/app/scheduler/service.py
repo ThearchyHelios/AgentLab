@@ -31,20 +31,30 @@ RUN_CLASSES = ("formal", "exploratory")
 #: 挂起的另外按失败推一次通知（webhook._state_of），不然任务就此静默停摆
 ACTIVE_RUN = ("queued", "running", "interrupted")
 
-#: 模板里能用的变量：(变量名, 说明)。说明写在变量清单接口里，和示例一起给界面
-VARIABLES: tuple[tuple[str, str], ...] = (
-    ("today", "今天（YYYY-MM-DD）"),
-    ("yesterday", "昨天（YYYY-MM-DD）"),
-    ("this_week_start", "本周一（YYYY-MM-DD）"),
-    ("last_week_start", "上周一（YYYY-MM-DD）"),
-    ("last_week_end", "上周日（YYYY-MM-DD）"),
-    ("this_month_start", "本月 1 日（YYYY-MM-DD）"),
-    ("last_month_start", "上月 1 日（YYYY-MM-DD）"),
-    ("last_month_end", "上月最后一天（YYYY-MM-DD）"),
-    ("fire_time", "本次计划触发时间（带时区偏移的 ISO 时间）"),
-    ("last_fire_time", "上一次计划触发时间（带时区偏移的 ISO 时间）"),
+#: ISO 周不直观的那一处：跨年那几天按所在的周算，年份跟着周走。写在变量清单接口里（note），界面放在变量下面
+ISO_WEEK_NOTE = ("ISO 周从周一开始，含当年 1 月 4 日的那一周是第 1 周；跨年那几天按所在的周算，"
+                 "例如 2027-01-01（周五）属于 2026-W53")
+
+#: 模板里能用的变量：(变量名, 说明, 补充说明)。说明、补充说明写在变量清单接口里，和示例一起给界面
+VARIABLES: tuple[tuple[str, str, str], ...] = (
+    ("today", "今天（YYYY-MM-DD）", ""),
+    ("yesterday", "昨天（YYYY-MM-DD）", ""),
+    ("this_week", "本周（ISO 周，YYYY-Www）", ISO_WEEK_NOTE),
+    ("last_week", "上周（ISO 周，YYYY-Www）", ISO_WEEK_NOTE),
+    ("week_before_last", "上上周（ISO 周，YYYY-Www）", ISO_WEEK_NOTE),
+    ("this_week_start", "本周一（YYYY-MM-DD）", ""),
+    ("last_week_start", "上周一（YYYY-MM-DD）", ""),
+    ("last_week_end", "上周日（YYYY-MM-DD）", ""),
+    ("this_month", "本月（YYYY-MM）", ""),
+    ("last_month", "上月（YYYY-MM）", ""),
+    ("month_before_last", "上上月（YYYY-MM）", ""),
+    ("this_month_start", "本月 1 日（YYYY-MM-DD）", ""),
+    ("last_month_start", "上月 1 日（YYYY-MM-DD）", ""),
+    ("last_month_end", "上月最后一天（YYYY-MM-DD）", ""),
+    ("fire_time", "本次计划触发时间（带时区偏移的 ISO 时间）", ""),
+    ("last_fire_time", "上一次计划触发时间（带时区偏移的 ISO 时间）", ""),
 )
-_NAMES = tuple(f"schedule.{key}" for key, _ in VARIABLES)
+_NAMES = tuple(f"schedule.{key}" for key, _, _ in VARIABLES)
 _TEMPLATE_RE = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
 
 #: 触发记下来、运行还没发起时先写成这样：发起成功再改成 started。进程在这中间被强杀，留下的记录照实说没有发起。
@@ -76,9 +86,11 @@ def current_value(value: Any) -> str:
 
 
 def template_values(fire_at: datetime, tz: str, cron_expr: str | cron.CronSpec) -> dict[str, str]:
-    """按计划触发时间在任务时区算出的变量（键不带 schedule. 前缀）。日期写 YYYY-MM-DD，时间写带偏移的 ISO、只到秒。
+    """按计划触发时间在任务时区算出的变量（键不带 schedule. 前缀）。日期写 YYYY-MM-DD，ISO 周写 YYYY-Www（2026-W42），
+    月份写 YYYY-MM，时间写带偏移的 ISO、只到秒。
 
     按 fire_at 算而不是按「现在」：补发晚了一小时、立即运行在零点前后点下去，「昨天」都是那次触发的昨天。
+    ISO 周的年份是周所在的年（isocalendar），不是日历年：2027-01-01 是 2026-W53，2025-12-29 是 2026-W01。
     last_fire_time 是按 cron 往前找的上一次计划触发，不看历史记录：同一个 (cron, 时区, fire_at) 永远渲染出同一份输入。
     """
     zone = cron.zone(tz)
@@ -87,15 +99,22 @@ def template_values(fire_at: datetime, tz: str, cron_expr: str | cron.CronSpec) 
     week_start = today - timedelta(days=today.weekday())
     month_start = today.replace(day=1)
     last_month_end = month_start - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
     previous = cron.prev_fire(cron_expr, zone, fire_at)
     return {
         "today": _day(today),
         "yesterday": _day(today - timedelta(days=1)),
+        "this_week": _week(today),
+        "last_week": _week(today - timedelta(days=7)),
+        "week_before_last": _week(today - timedelta(days=14)),
         "this_week_start": _day(week_start),
         "last_week_start": _day(week_start - timedelta(days=7)),
         "last_week_end": _day(week_start - timedelta(days=1)),
+        "this_month": _month(month_start),
+        "last_month": _month(last_month_start),
+        "month_before_last": _month(last_month_start - timedelta(days=1)),
         "this_month_start": _day(month_start),
-        "last_month_start": _day(last_month_end.replace(day=1)),
+        "last_month_start": _day(last_month_start),
         "last_month_end": _day(last_month_end),
         "fire_time": local.isoformat(timespec="seconds"),
         "last_fire_time": previous.astimezone(zone).isoformat(timespec="seconds") if previous else "",
@@ -104,6 +123,16 @@ def template_values(fire_at: datetime, tz: str, cron_expr: str | cron.CronSpec) 
 
 def _day(value: date) -> str:
     return value.isoformat()
+
+
+def _week(value: date) -> str:
+    """这一天所在的 ISO 周：2026-W42。周号补足两位，和 ISO 8601 的写法一致（2026-W05，不写 2026-W5）。"""
+    year, week, _ = value.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _month(value: date) -> str:
+    return f"{value.year:04d}-{value.month:02d}"
 
 
 def render_inputs(template: dict[str, str], values: dict[str, str]) -> dict[str, str]:
@@ -155,13 +184,14 @@ def _check_text(name: str, text: str) -> None:
 
 
 def variables(now: datetime | None = None, tz: str = DEFAULT_TIMEZONE) -> list[dict[str, str]]:
-    """变量清单：[{name, label, example}]。示例按 now（默认现在）这一刻触发算；上一次计划触发时间没有 cron
-    可依，示例按每天同一时刻触发算。"""
+    """变量清单：[{name, label, example, note}]。示例按 now（默认现在）这一刻触发算；上一次计划触发时间没有 cron
+    可依，示例按每天同一时刻触发算。note 是补充说明（ISO 周的跨年规则），没有的是空串。"""
     moment = (now or utcnow()).replace(second=0, microsecond=0)
     local = moment.astimezone(cron.zone(tz))
     daily = f"{local.minute} {local.hour} * * *"
     values = template_values(moment, tz, daily)
-    return [{"name": f"schedule.{key}", "label": label, "example": values[key]} for key, label in VARIABLES]
+    return [{"name": f"schedule.{key}", "label": label, "example": values[key], "note": note}
+            for key, label, note in VARIABLES]
 
 
 # --------------------------------------------------------------------------
@@ -281,7 +311,9 @@ async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: st
                 async with SessionLocal() as session:
                     run = await launch_run(session, workflow_id=workflow_id, run_class=run_class,
                                            input_payload=inputs, actor=actor or actor_label(name),
-                                           schedule_id=schedule_id)
+                                           schedule_id=schedule_id, origin_kind="schedule",
+                                           origin={"schedule_id": schedule_id, "schedule": name,
+                                                   "fire_id": fire.id, "fire_kind": kind})
             except LaunchRefused as e:
                 return await _finish(fire.id, status="failed_to_start", reason=e.message)
             except Exception:  # noqa: BLE001 - 发起失败不能让调度循环停下；详细信息进日志，记录上写通用说明
@@ -297,10 +329,11 @@ async def record_skip(schedule_id: str, fire_at: datetime, reason: str) -> Sched
     return await _record(schedule_id, fire_at, "misfire", "skipped_misfire", reason, {})
 
 
-async def _active_run(schedule_id: str) -> tuple[str, str, bool] | None:
-    """这个任务发起的、还没结束的运行（最近的那一个）：(运行 id, 状态, 是否停在审批)，没有返回 None。
+async def _active_run(schedule_id: str) -> tuple[str, str, bool, bool] | None:
+    """这个任务发起的、还没结束的运行（最近的那一个）：(运行 id, 状态, 是否停在审批, 是否等写入核实)，没有返回 None。
 
-    停在审批：有 pending 的审批，或者刚批完（answered）、还没接着执行。interrupted 而两样都没有的是挂起的。"""
+    停在审批：有 pending 的审批，或者刚批完（answered）、还没接着执行。interrupted 而两样都没有的是挂起的；挂起的里面
+    有写外部系统结果未知、等核实的（app/process/actions.py），处理办法不一样，单独说。"""
     async with SessionLocal() as session:
         row = (await session.execute(
             select(Run.id, Run.status).where(Run.schedule_id == schedule_id, Run.status.in_(ACTIVE_RUN))
@@ -311,16 +344,22 @@ async def _active_run(schedule_id: str) -> tuple[str, str, bool] | None:
         waiting = status == "interrupted" and bool(await session.scalar(
             select(func.count()).select_from(Approval).where(
                 Approval.run_id == run_id, Approval.status.in_(("pending", "answered")))))
-        return run_id, status, waiting
+        from app.process.actions import unresolved_action
+
+        held = status == "interrupted" and not waiting and await unresolved_action(session, run_id)
+        return run_id, status, waiting, held
 
 
-def overlap_reason(run_id: str, status: str, waiting: bool) -> str:
+def overlap_reason(run_id: str, status: str, waiting: bool, action_pending: bool = False) -> str:
     """跳过的原因按挡路的那次运行说清楚该等还是该处理。运行编号和界面上的短编号一样写（#前 6 位）。"""
     tag = f"#{run_id[:6]}"
     if status != "interrupted":
         return f"上一次运行 {tag} 仍在进行中，本次触发已跳过"
     if waiting:
         return f"上一次运行 {tag} 正在等待审批，处理审批、运行结束后才会按时发起新的运行；本次触发已跳过"
+    if action_pending:
+        return (f"上一次运行 {tag} 有一次写入外部系统的结果未知，正在等待核实，核实后会自动继续；它结束后才会按时发起"
+                "新的运行，本次触发已跳过")
     return (f"上一次运行 {tag} 已挂起（通常是服务重启所致），请在「记录」中继续运行或放弃这次运行，"
             "它结束后才会按时发起新的运行；本次触发已跳过")
 

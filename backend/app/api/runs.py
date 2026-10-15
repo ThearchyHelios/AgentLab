@@ -4,14 +4,15 @@ import asyncio
 import contextlib
 from datetime import datetime
 from typing import Any
-from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
+# 「人」的唯一入口搬到了 api/deps.py（开登录时返回认证过的用户名）。别处照旧从这里导入 actor_of
+from app.api.deps import actor_of  # noqa: F401
 from app.core.bus import bus
 from app.db.base import SessionLocal, get_session
 from app.db.models import Approval, Artifact, Run, RunEvent
@@ -24,16 +25,12 @@ from app.engine.runner import run_manager
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
+#: POST /api/runs 声明了客户端不能声明的来源（422）
+ORIGIN_NOT_ALLOWED = "origin_not_allowed"
+#: 删除被拒：这次运行写过外部系统（有演练以外的生效记录，409）
+RUN_HAS_EFFECTS = "run_has_effects"
 
-def actor_of(header: str | None) -> str | None:
-    """请求头 X-Actor 里的署名（设置页填的那个），没填就是 None。
 
-    浏览器的请求头只能是 Latin-1：中文署名原样放进去，fetch 直接抛错、整个请求
-    发不出去。所以前端按 encodeURIComponent 编码后发，这里解回来；老客户端发的
-    纯 ASCII 署名解码前后一样。
-    """
-    value = unquote((header or "").strip()).strip()
-    return value[:100] or None
 
 
 class StartRunIn(BaseModel):
@@ -46,6 +43,9 @@ class StartRunIn(BaseModel):
     # formal：从已发布的不可变版本发起，可复现可出具；exploratory：随便玩
     run_class: str = "exploratory"
     version: int | None = None  # formal 时可指定版本，默认用已发布版本
+    #: 运行来源（engine/origin.py）：客户端只能声明 chat / canvas / launcher / api，不传按 api 记。
+    #: 应用、钩子、定时任务发起的来源只能由服务端写
+    origin: str | None = None
 
 
 class RunOut(BaseModel):
@@ -71,6 +71,13 @@ class RunOut(BaseModel):
     collection: str | None = None
     #: 发起它的定时任务。为空 = 手动发起
     schedule_id: str | None = None
+    #: 运行来源（engine/origin.py 的 ORIGIN_KINDS）。为空是加这一列之前的运行：来源未记录
+    origin_kind: str | None = None
+    #: run.origin 事件的数据（kind、app_id、entry / view、hook、actor、actor_verified……），和封存范围里那一条是同一份
+    origin: dict[str, Any] | None = None
+    #: 应用发起的运行属于哪个应用版本
+    app_id: str | None = None
+    app_version: int | None = None
     # 时间一律带时区（db.base.UTCDateTime 读出来就是 UTC aware）
     created_at: Any = None
     started_at: Any = None
@@ -86,17 +93,47 @@ async def start_run(
     x_actor: str | None = Header(default=None),
 ) -> Run:
     """发起规则全在 engine/launch.py（定时任务到点发起也用它），这里只把拒绝换回 HTTP 响应。"""
+    from app.api.deps import restricted
+    from app.engine.origin import CLIENT_ORIGINS
+    from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
+
+    origin = payload.origin or "api"
+    if origin not in CLIENT_ORIGINS:
+        # 应用入口、钩子、定时任务的来源由服务端写：客户端能声明的话，谁都能把一次画布试跑说成应用发起的
+        raise CodedHTTPException(422, "运行来源只能是问数据、画布上的试运行、正式运行（手动）或接口，应用、外部系统和定时任务"
+                                      "发起的运行由服务端记录来源", ORIGIN_NOT_ALLOWED, field="origin")
+    options = None
+    actor = actor_of(x_actor)
+    memory_scope = payload.memory_scope
+    if restricted():
+        # user 角色（管理员开了问数据）只能发起问数据当场搭的探索运行：已发布工作流的正式运行只经应用入口发起，别的来源
+        # 都是搭建者的事。图里只许读数据、整理、撰写这一类节点和只读工具（app/auth/chat_policy.py）。
+        # 查询结果在工具边界就遮，事件、回答里只有遮过的值——它读得到自己这次运行的事件（api/deps.py 的 _run_scope）；
+        # 数据源查询一律只读，写语句不交给审批（Agent 的 approval 是它自己写在图里的）
+        if origin != "chat" or payload.run_class != "exploratory" or payload.workflow_id or payload.version is not None:
+            raise HTTPException(403, "没有权限：使用者只能发起问数据的运行，工作流的运行需要搭建者及以上的角色")
+        from app.auth.chat_policy import SCOPE_REFUSED, chat_graph_problem, chat_memory_scope
+
+        if problem := chat_graph_problem(payload.graph):
+            raise HTTPException(403, problem)
+        if payload.memory_scope or payload.collection:
+            raise HTTPException(403, SCOPE_REFUSED)
+        # 记忆固定为这位使用者自己的范围、知识库取设置里的默认值：记忆、知识库的内容不经遮罩（见 chat_policy 开头）
+        memory_scope = chat_memory_scope(actor)
+        options = {MASK_RESULTS_OPTION: True, READ_ONLY_OPTION: True}
     try:
         return await launch_run(
             session,
             workflow_id=payload.workflow_id,
             graph=payload.graph,
             input_payload=payload.input,
-            memory_scope=payload.memory_scope,
+            memory_scope=memory_scope,
             collection=payload.collection,
             run_class=payload.run_class,
             version=payload.version,
-            actor=actor_of(x_actor),
+            actor=actor,
+            origin_kind=origin,
+            options=options,
         )
     except LaunchRefused as e:
         raise _refused(e) from e
@@ -113,6 +150,8 @@ def _refused(e: LaunchRefused) -> HTTPException:
 #: workflow_id 取这个值时只要没挂在任何工作流上的运行：画布上没保存就跑的临时图，
 #: 以及工作流被删掉之后留下来的运行（外键是 SET NULL）
 UNSAVED = "__none__"
+#: origin_kind 取这个值时只要来源未记录的运行（加来源这一列之前的老运行）
+NO_ORIGIN = "none"
 
 
 @router.get("", response_model=list[RunOut])
@@ -122,6 +161,7 @@ async def list_runs(
     run_class: str | None = None,
     q: str | None = Query(default=None, description="按工作流名模糊匹配"),
     schedule_id: str | None = Query(default=None, description="只要这个定时任务发起的运行"),
+    origin_kind: str | None = Query(default=None, description=f"逗号分隔的运行来源；{NO_ORIGIN} 表示来源未记录的老运行"),
     limit: int = Query(default=50, ge=1, le=200),
     before: datetime | None = Query(default=None, description="翻页游标：只要 created_at 早于它的"),
     session: AsyncSession = Depends(get_session),
@@ -144,6 +184,9 @@ async def list_runs(
         stmt = stmt.where(Run.workflow_name.ilike(f"%{_like(q.strip())}%", escape="\\"))
     if schedule_id:
         stmt = stmt.where(Run.schedule_id == schedule_id)
+    if origins := _csv(origin_kind):
+        kinds = [o for o in origins if o != NO_ORIGIN]
+        stmt = stmt.where(or_(Run.origin_kind.in_(kinds), *([Run.origin_kind.is_(None)] if NO_ORIGIN in origins else [])))
     if before is not None:
         stmt = stmt.where(Run.created_at < before)
     return list((await session.execute(stmt)).scalars())
@@ -272,8 +315,22 @@ def _not_while_inquiring(run_id: str, detail: str) -> None:
 @router.post("/{run_id}/resume", response_model=RunOut)
 async def resume_run(
     run_id: str, payload: ResumeIn, x_actor: str | None = Header(default=None)
-) -> Run:
+) -> Any:
+    """兼容垫片：回复审批改走待办服务（app/process/tasks.py 的 respond，按派给谁、会签汇总）。「始终允许」、改过的代码、
+    双盲裁决的选择原样交给节点。没有待审批的（服务重启挂起的运行从断点接着跑）照旧直接恢复。"""
     _not_while_inquiring(run_id, BUSY_DECIDE)
+    target = payload.approval_id
+    if target is None:
+        async with SessionLocal() as session:
+            pending = list((await session.execute(select(Approval.id).where(
+                Approval.run_id == run_id, Approval.status == "pending"))).scalars())
+        # 只有一条时才敢认；多条时交给引擎说清楚「无法确定回复的是哪一条」
+        target = pending[0] if len(pending) == 1 else None
+    if target is not None:
+        async with SessionLocal() as session:
+            approval = await session.get(Approval, target)
+        if approval is not None and approval.run_id == run_id and approval.status == "pending":
+            return await _respond_to(target, payload.response, x_actor)
     try:
         # approval_id 以前定义了却从没传下去——一次运行里有多条待审批时，
         # 引擎无从知道这次回复的是哪一条
@@ -286,6 +343,24 @@ async def resume_run(
         raise _missing(e) from e
     except ValueError as e:
         raise HTTPException(409, str(e)) from e
+
+
+async def _respond_to(approval_id: str, response: Any, x_actor: str | None) -> Any:
+    """老接口的回复交给待办服务：只当一票、原样交给节点。待办还没有的（开待办时出过错）现在补一条。"""
+    from app.api.tasks import principal_of, refused
+    from app.process.tasks import RawResponse, TaskRefused, respond, task_for_approval
+
+    task_id = await task_for_approval(approval_id)
+    if task_id is None:
+        raise HTTPException(404, "审批记录不存在，所属的运行可能已被删除")
+    try:
+        out = await respond(task_id, principal_of(x_actor), decision=RawResponse(response))
+    except TaskRefused as e:
+        error = refused(e)
+        if isinstance(error, HTTPException):
+            raise error from e
+        return error
+    return out["run"]
 
 
 class ContinueIn(BaseModel):
@@ -306,12 +381,17 @@ async def continue_run(
     重跑一遍，纯属白等。
     """
     _not_while_inquiring(run_id, BUSY_CONTINUE)
+    from app.engine.runner import ContinueRefused
+
     try:
         return await run_manager.continue_failed(
             run_id, graph=payload.graph, actor=actor_of(x_actor),
         )
     except KeyError as e:
         raise _missing(e) from e
+    except ContinueRefused as e:
+        # 正式运行带图（formal_graph_locked）、写入结果未知还没核实（action_unresolved）：带机器码
+        raise CodedHTTPException(409, str(e), e.code) from e
     except ValueError as e:
         raise HTTPException(409, str(e)) from e
 
@@ -394,16 +474,28 @@ async def get_history(run_id: str, limit: int = 50) -> list[dict[str, Any]]:
 async def delete_run(
     run_id: str, force: bool = False, session: AsyncSession = Depends(get_session)
 ) -> None:
-    """删除运行记录。运行记录是出具的追溯依据，两种情况要拦：
+    """删除运行记录。运行记录是出具的追溯依据，三种情况要拦：
 
     - 还在跑的：删了会留下没人管的执行任务，它还会往一条不存在的记录里写事件；
+    - 写过外部系统的（有演练以外的生效记录）：生效记录随运行级联删除，删了就对不上外部系统里已经发生的事（P8），
+      停在「结果未知、等核实」上的连核实待办一起没了。force 也不放行；工作流的删除检查（F4）也就绕不过去；
     - 封存过的正式运行：删掉之后清单再也无法核对。确实要删，带 force=true。
     """
+    from sqlalchemy import func
+
+    from app.db.models import ActionRecord
+
     run = await session.get(Run, run_id)
     if not run:
         raise HTTPException(404, "运行记录不存在")
     if run.status in ("queued", "running") or run_manager.is_active(run_id):
         raise HTTPException(409, "这次运行仍在进行，现在删除会留下无人管理的后台任务。请先停止运行，再删除")
+    effects = await session.scalar(select(func.count(ActionRecord.id)).where(
+        ActionRecord.run_id == run_id, ActionRecord.state != "simulated"))
+    if effects:
+        raise CodedHTTPException(
+            409, f"这次运行有 {effects} 条写入外部系统的生效记录，是和外部系统对账的依据，不能删除（强制删除也不行）",
+            RUN_HAS_EFFECTS)
     if run.run_class == "formal" and run.manifest_hash and not force:
         raise HTTPException(
             409,
@@ -545,6 +637,9 @@ class ApprovalOut(BaseModel):
     node_label: str | None = None
     run_status: str | None = None
     run_class: str | None = None
+    #: 这条审批对应的待办（app/process/tasks.py）。回复走 POST /api/tasks/{task_id}/respond；开待办时出过错、还没补上的
+    #: 为空，老接口 /decide 照旧能用（它会现补一条）
+    task_id: str | None = None
 
 
 @approvals_router.get("", response_model=list[ApprovalOut])
@@ -554,9 +649,12 @@ async def list_approvals(
     limit: int = Query(default=100, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> list[ApprovalOut]:
+    from app.db.models import Task
+
     stmt = (
-        select(Approval, Run)
+        select(Approval, Run, Task.id)
         .join(Run, Run.id == Approval.run_id, isouter=True)
+        .join(Task, Task.approval_id == Approval.id, isouter=True)
         .order_by(Approval.created_at.desc())
         .limit(limit)
     )
@@ -565,8 +663,9 @@ async def list_approvals(
     if run_id:
         stmt = stmt.where(Approval.run_id == run_id)
     out: list[ApprovalOut] = []
-    for approval, run in (await session.execute(stmt)).all():
+    for approval, run, task_id in (await session.execute(stmt)).all():
         item = ApprovalOut.model_validate(approval, from_attributes=True)
+        item.task_id = task_id
         if run is not None:
             item.workflow_id = run.workflow_id
             item.workflow_name = run.workflow_name
@@ -597,7 +696,8 @@ async def decide(
     payload: DecideIn,
     session: AsyncSession = Depends(get_session),
     x_actor: str | None = Header(default=None),
-) -> Run:
+) -> Any:
+    """兼容垫片：改走待办服务（app/process/tasks.py 的 respond）。请求体照旧，只当一票、原样交给节点。"""
     approval = await session.get(Approval, approval_id)
     if not approval:
         raise HTTPException(404, "审批记录不存在，所属的运行可能已被删除")
@@ -615,15 +715,7 @@ async def decide(
         response["value"] = payload.value
     if payload.args is not None:
         response["args"] = payload.args
-
-    try:
-        return await run_manager.resume(
-            approval.run_id, response,
-            approval_id=approval.id,
-            actor=approval.resolved_by,
-        )
-    except ValueError as e:
-        raise HTTPException(409, str(e)) from e
+    return await _respond_to(approval.id, response, x_actor)
 
 
 def _jsonable(value: Any) -> Any:

@@ -10,6 +10,7 @@ import clsx from 'clsx'
 import { CATALOG_LABELS, catalogListState, useCatalog } from '../store/catalog'
 import type { CatalogKey } from '../store/catalog'
 import { humanizeError } from '../lib/errors'
+import { actorHeader } from '../api/http'
 import { ariaShortcut, formatShortcut } from '../lib/keys'
 import { STATUS, statusMeta } from '../lib/status'
 import type { StatusShape } from '../lib/status'
@@ -44,7 +45,7 @@ export function isComposing(e: ReactKeyboardEvent | KeyboardEvent): boolean {
  * 读屏会把「重试 刷新页面 技术细节…」连同堆栈摘要一起当成警报念出来。
  */
 export class ErrorBoundary extends Component<
-  { resetKey?: string; scope?: 'page' | 'shell'; title?: string; children: ReactNode }, { error: Error | null }
+  { resetKey?: string; scope?: 'page' | 'shell' | 'block'; title?: string; children: ReactNode }, { error: Error | null }
 > {
   state: { error: Error | null } = { error: null }
 
@@ -68,6 +69,22 @@ export class ErrorBoundary extends Component<
       ? error.stack
       : `${error.name}: ${error.message}${error.stack ? `\n\n${error.stack}` : ''}`
     const shell = this.props.scope === 'shell'
+    // 页面里的一块（应用页的一个组件）：只坏它自己，就地一行说明，不占整页
+    if (this.props.scope === 'block') {
+      return (
+        <div data-error-scope="block" className="rounded-lg border border-dashed px-3 py-2 text-xs"
+             style={{ borderColor: 'color-mix(in srgb, var(--err) 35%, var(--border))' }}>
+          <div role="alert" className="flex items-center gap-1.5 text-fg">
+            <AlertCircle size={13} className="shrink-0 text-[var(--err)]" aria-hidden />
+            {this.props.title ?? '这一块无法显示'}
+          </div>
+          <div className="mt-1 flex items-center gap-2">
+            <button className="btn btn-xs" onClick={() => this.setState({ error: null })}>重试</button>
+            <TechDetails raw={raw} summary={error.message} />
+          </div>
+        </div>
+      )
+    }
     return (
       <div data-error-scope={shell ? 'shell' : 'page'}
            className={clsx('flex flex-col items-center justify-center gap-3 p-8 text-center', shell ? 'h-screen bg-[var(--bg)]' : 'h-full')}>
@@ -1381,11 +1398,13 @@ function BadgeShape({ shape, maskId, animate }: { shape: StatusShape; maskId: st
  * 徽标加中文。正常态安静（只有字色），异常态（失败、等人、挂起、阻断）才铺淡底。
  * 文字从 lib/status 取，全站只有这一份说法。
  */
-export function StatusPill({ status, pendingApproval, short = false, plain = false, title, className }: {
+export function StatusPill({ status, pendingApproval, short = false, plain = false, label, title, className }: {
   status: string
   pendingApproval?: boolean
   /** 用短叫法：「待审批」「完成」 */
   short?: boolean
+  /** 服务端给的说法（流程实例的结论，如「已退回」「等待核实写入结果」）：剪影和颜色仍按 status，文字用它 */
+  label?: string
   /** 不要底色和内边距，行内用 */
   plain?: boolean
   title?: string
@@ -1405,7 +1424,7 @@ export function StatusPill({ status, pendingApproval, short = false, plain = fal
       data-status={meta.code}
     >
       <StatusBadge status={status} pendingApproval={pendingApproval} size={12} decorative />
-      {short ? meta.short : meta.label}
+      {label || (short ? meta.short : meta.label)}
     </span>
   )
 }
@@ -1751,7 +1770,8 @@ export function withoutDeferred<T extends { id: string }>(rows: T[], base: strin
 if (typeof window !== 'undefined') {
   window.addEventListener('pagehide', () => {
     for (const url of pendingDeletes.values()) {
-      void fetch(url, { method: 'DELETE', keepalive: true }).catch(() => {})
+      // 开了登录时非 GET 请求要带防跨站的请求头（api/http 的 actorHeader），补发的这一下也一样
+      void fetch(url, { method: 'DELETE', keepalive: true, headers: actorHeader() }).catch(() => {})
     }
     pendingDeletes.clear()
   })

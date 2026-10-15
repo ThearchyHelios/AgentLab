@@ -9,6 +9,11 @@
 让 copilot 或 runner 自己去写会更"自动"，但建图失败、运行失败、用户中途
 取消这三种半途而废的情况它们各自只知道一半，最后还是要在三个地方各接一次。
 前端本来就完整地知道这一轮走到哪了。
+
+对话按人隔离（D-d）：新建时记下建立人（created_by = actor_of）。开登录后 user 角色只列得出、读得到、改得动、删得掉
+自己建的对话；created_by 为空的老对话（关登录时建的）只有 builder 以上看得到。应用编辑器的助手对话（kind=app）另要
+这个应用的 manage。接受 conversation_id 的别的接口（助手的生成流、应用润色、从运行提取）按同一套规则核对：
+ensure_conversation_access。关登录时一切照旧。
 """
 
 from __future__ import annotations
@@ -16,11 +21,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import actor_of, current_principal
 from app.db.base import get_session, utcnow
 from app.db.models import Approval, Conversation, ConversationTurn, Run
 
@@ -102,6 +108,10 @@ class ConversationOut(BaseModel):
     title: str
     kind: str
     workflow_id: str | None = None
+    #: 应用编辑器的助手对话（kind=app）归属的应用
+    app_id: str | None = None
+    #: 谁建的。关登录时是自报的署名；老对话为空
+    created_by: str | None = None
     archived: bool
     created_at: Any = None
     last_active_at: Any = None
@@ -251,10 +261,60 @@ async def _statuses(
 # --------------------------------------------------------------------------
 
 
+#: 对话按人隔离时拒绝的说法
+NOT_YOURS = "没有权限查看这段对话：开启登录后，使用者只能查看自己建立的对话"
+APP_MANAGE_ONLY = "没有权限查看这段对话：应用编辑器的助手对话只对能管理这个应用的人开放"
+
+
+def _isolated() -> str | None:
+    """开登录后的 user 角色：只看得到自己建的对话，交回它的用户名；关登录、builder 以上为 None（不按人收窄）。"""
+    from app.api.deps import restricted
+
+    return (current_principal().username or "") if restricted() else None
+
+
+async def _manages_app(session: AsyncSession, app_id: str) -> bool:
+    """这个人能不能管理这个应用（app/apps/access.py：关登录、admin 都能；builder 要是建立人或有 manage 授权）。应用已经
+    删掉的，只有 admin 看得到它留下的对话。"""
+    from app.apps.access import app_role, at_least
+    from app.db.models import App
+
+    principal = current_principal()
+    if principal.mode == "off" or principal.role == "admin":
+        return True
+    app = await session.get(App, app_id)
+    return app is not None and at_least(await app_role(session, principal, app), "manage")
+
+
+async def _check_access(session: AsyncSession, row: Conversation) -> None:
+    """这段对话这个人能不能用，不能用抛 403。"""
+    mine = _isolated()
+    if mine is not None and (not row.created_by or row.created_by != mine):
+        raise HTTPException(403, NOT_YOURS)
+    if row.kind == "app" and row.app_id and not await _manages_app(session, row.app_id):
+        raise HTTPException(403, APP_MANAGE_ONLY)
+
+
+async def ensure_conversation_access(session: AsyncSession, conversation_id: str | None) -> Conversation | None:
+    """接受 conversation_id 的接口（助手的 generate-stream、generate、app-stream、from-run……）在读历史、记来源之前调。
+
+    能用交回对话；没给 id、对话不存在交回 None——和加这道核对之前一样当没有历史，前端带着一个刚删掉的对话 id 也不至于
+    整轮失败；存在但这个人不能用（开登录后 user 角色碰别人的或老对话，没有 manage 的人碰应用的助手对话）回 403，免得
+    别人的问答经「历史」拼进这一轮的提示、再从回答里带出来。关登录时只要存在就能用。"""
+    if not conversation_id:
+        return None
+    row = await session.get(Conversation, conversation_id)
+    if row is None:
+        return None
+    await _check_access(session, row)
+    return row
+
+
 async def _get(session: AsyncSession, conversation_id: str) -> Conversation:
     row = await session.get(Conversation, conversation_id)
     if not row:
         raise HTTPException(404, "对话不存在，可能已被删除")
+    await _check_access(session, row)
     return row
 
 
@@ -262,17 +322,34 @@ async def _get(session: AsyncSession, conversation_id: str) -> Conversation:
 async def list_conversations(
     kind: str = "chat",
     workflow_id: str | None = None,
+    app_id: str | None = None,
     include_archived: bool = False,
     session: AsyncSession = Depends(get_session),
 ) -> list[ConversationOut]:
     query = select(Conversation).where(Conversation.kind == kind)
     if workflow_id:
         query = query.where(Conversation.workflow_id == workflow_id)
+    if app_id:
+        query = query.where(Conversation.app_id == app_id)
     if not include_archived:
         query = query.where(Conversation.archived.is_(False))
+    if (mine := _isolated()) is not None:
+        # 开登录后的 user 角色：只列自己建的；建立人为空的老对话不列
+        query = query.where(Conversation.created_by == mine)
     rows = list((await session.execute(
         query.order_by(Conversation.last_active_at.desc())
     )).scalars())
+    # 应用的助手对话只列能管理的应用的（一个应用一次判断）
+    managed: dict[str, bool] = {}
+    kept = []
+    for row in rows:
+        if row.kind == "app" and row.app_id:
+            if row.app_id not in managed:
+                managed[row.app_id] = await _manages_app(session, row.app_id)
+            if not managed[row.app_id]:
+                continue
+        kept.append(row)
+    rows = kept
     if not rows:
         return []
 
@@ -300,12 +377,16 @@ async def list_conversations(
 
 @router.post("", response_model=ConversationDetail, status_code=201)
 async def create_conversation(
-    payload: ConversationIn, session: AsyncSession = Depends(get_session)
+    payload: ConversationIn,
+    session: AsyncSession = Depends(get_session),
+    x_actor: str | None = Header(default=None),
 ) -> ConversationDetail:
+    # 应用编辑器的助手对话不从这里建：GET /api/apps/{id}/assistant-conversation 先核对 manage，再取或建
     row = Conversation(
         kind=payload.kind,
         workflow_id=payload.workflow_id,
         title=payload.title or "新对话",
+        created_by=actor_of(x_actor),
     )
     session.add(row)
     await session.commit()
@@ -401,6 +482,7 @@ async def patch_turn(
     payload: TurnPatch,
     session: AsyncSession = Depends(get_session),
 ) -> TurnOut:
+    await _get(session, conversation_id)
     turn = await session.get(ConversationTurn, turn_id)
     if not turn or turn.conversation_id != conversation_id:
         raise HTTPException(404, "该轮对话不存在，可能已被删除")

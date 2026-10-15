@@ -1232,12 +1232,19 @@ MIX = {"id": "mix", "name": "销售额加首组名称字数", "unit": "元", "de
        "expression": "cell(nodes.fetch, 0, 'gmv') + len(vars.res.rows[0][0])"}
 
 
-def with_regions(spec: dict, source: str) -> dict:
+#: 数据整形解析第二份查询结果的两种写法。原样解析（模板整串就是 {{ nodes.regions }}）的，vars.res.rows[0][0] 确定地对到
+#: 那份快照的第 0 行第 0 列，卡上记成 cell() 一样的单元格取数（engine/lineage.py）；模板带了过滤器的不算原样解析，按位置
+#: 取的格卡上只记路径和值，遮罩顺着取值链认（_positional_masks）——下面几个测试守的是后一条路
+PARSED = "{{ nodes.regions }}"
+FILTERED = "{{ nodes.regions | trim }}"
+
+
+def with_regions(spec: dict, source: str, template: str = FILTERED) -> dict:
     """取数之后另查一次按地区分组的结果（第二份快照），数据整形把它解析进 vars.res：口径卡按位置取它的格。"""
     nodes = list(spec["nodes"])
     at = next(i for i, n in enumerate(nodes) if n["id"] == "fetch") + 1
     nodes[at:at] = [node("regions", "tool", tool=f"db_query__{source}", args={"sql": BY_REGION}),
-                    node("parse", "transform", mode="json", template="{{ nodes.regions }}", assign_to="res")]
+                    node("parse", "transform", mode="json", template=template, assign_to="res")]
     return {"nodes": nodes, "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}
 
 
@@ -1275,6 +1282,28 @@ async def test_an_unmasked_cell_read_by_position_from_another_snapshot_is_blind_
     assert out["status"] == "agreed" and out["metrics"][0]["status"] == "agreed", out
     [task] = blind.tasks
     assert "len('华东')" in task
+
+
+async def test_a_cell_read_through_a_plain_parse_is_judged_like_cell(monkeypatch, masked_shop, shop):
+    """数据整形只是原样解析第二次查询的结果：vars.res.rows[0][0] 卡上记成单元格取数（落在第二份快照的第 0 行 region 列），
+    和 cell(nodes.regions, 0, 'region') 一个说法——遮罩列上的照实说是遮罩、不盲算、取值不进任何产出；没遮罩时它是查询来
+    的文本，和 cell() 取的文本格一样不能单独复算，照实说不是数值。"""
+    for (name, _), reason in ((masked_shop, "输入 vars.res.rows[0][0] 取自设置了遮罩的列，不能用于复算"),
+                              (shop, "输入 vars.res.rows[0][0] 不是数值")):
+        blind = Blind(monkeypatch, name, {"销售额加首组名称字数": (RIGHT, "gmv")})
+        run = await start(with_regions(graph(name, RIGHT, metrics=[MIX], dual={"definitions": {}}), name, PARSED))
+        assert run.status == "succeeded", run.error
+        evs = await events(run.id)
+        [card] = [e.data for e in evs if e.type == "node.finished" and e.node_id == "card"]
+        item = next(i for i in artifact_store.load(card["artifact"])["metrics"][0]["inputs"]
+                    if i["path"] == "vars.res.rows[0][0]")
+        assert (item["via"], item["through"], item["node_id"], item["locator"]) == (
+            "tool_cell", "parse", "regions", {"row": 0, "column": "region"}), item
+        out = dual_output(run, evs)
+        [row] = out["metrics"]
+        assert row["status"] == "unchecked" and row["reason"] == reason, row
+        assert blind.tasks == [] and blind.runs == 0, blind.tasks
+        assert "华东" not in json.dumps(out, ensure_ascii=False)
 
 
 #: 按位置取的那一格：数据整形解析好的第二份查询结果（首组地区名），快照 id 是编的

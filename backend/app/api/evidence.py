@@ -128,6 +128,7 @@ from app.engine.evidence import (
     withhold_metrics,
 )
 from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candidates, outdated
+from app.engine.lineage import untraced
 from app.engine.merge_query import MERGE_SOURCE, trace_cell
 from app.engine.schema import CLAIMS_JUDGE, GraphSpec, challenge_report, dual_check_card
 from app.engine.toolcalls import QUERY_PREFIX
@@ -813,6 +814,40 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
     }
 
 
+METRIC_NOT_FOUND = "evidence_metric_not_found"
+
+
+@router.get("/{run_id}/evidence/metrics/{node}/{metric}")
+async def evidence_metric(run_id: str, node: str, metric: str) -> dict[str, Any]:
+    """点开应用页上的一个指标（应用平台 §3.6）：指标 → 输入 → 查询快照的出处链，和报告片段的指标链同一套（_metric_chain）。
+
+    没有报告也能点：指标从口径卡节点最后一次封存的指标集里取。值取自遮罩列的（_metric_masks），指标步骤和展示的字都写
+    「已遮罩」，同报告撰写时认出来的那样。"""
+    sealed = await _sealed(run_id)
+    cards = [(art, card) for node_id, art, card in _sealed_cards(sealed) if node_id == node]
+    found = _metric_in(cards[-1][1], metric) if cards else None
+    if found is None:
+        raise CodedHTTPException(404, "这次运行封存的口径卡里没有这个指标", METRIC_NOT_FOUND)
+    artifact, card = cards[-1]
+    masks = _Masks(sealed)
+    _, word = await _metric_masks(found, node, artifact, sealed, masks, card=card)
+    try:
+        shown = word or render_metric(found)
+    except RenderError:
+        shown = MISSING
+    eid = make_eid("metric", artifact, {"metric": metric})
+    entry = {"kind": "metric", "artifact": artifact, "node_id": node, "eid": eid,
+             **({"masked": True, "rendered": word} if word else {})}
+    chain = await _metric_chain({"text": shown}, {"kind": "metric", "locator": {"metric": metric}, "eid": eid},
+                                entry, {"catalog": {}}, sealed, masks)
+    covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
+    masked = list(dict.fromkeys(c for step in chain if step.get("step") in ("query", "input")
+                                for c in step.get("masked") or []))
+    return {"run_id": run_id, "node": node, "metric": metric, "rendered": shown, "eid": eid, "chain": chain,
+            "seal": {"sealed": sealed.sealed, "ok": sealed.seal["ok"], "covered": covered},
+            "redacted": {"columns": masked, "note": MASK_NOTE} if masked else {"columns": []}}
+
+
 def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
                   ) -> tuple[_Report, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
     """选报告、确认文档完好、找到片段：(报告, (块, 句子, 片段))。片段接口和推断来源接口共用同一套错误码。"""
@@ -928,6 +963,10 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     # 期 4：这个指标做没做过双盲复算、结果如何。没有双盲复算复核过这份指标集时没有这个键，老运行一字不差
     if checked := _dual_check_of(sealed, str(entry.get("node_id") or ""), artifact, metric_id, metric):
         step["dual_check"] = checked
+    if metric is not None and metric.get("inputs"):
+        # 输入追没追到原始数据（engine/lineage.py）：和「有出处」（确定性复算一致）是两件事，面板分开说。追不到的照实说
+        # 出处追到哪个节点为止；卡上没有输入（常量）的没有可追的，不给这个键
+        step["untraced"] = _untraced_steps(metric, sealed)
     catalog = doc.get("catalog") or {}
     inputs: list[dict[str, Any]] = []
     #: 输入指到的查询快照 → 被引用的格；同一份快照只给一个查询步骤，格合在一起高亮
@@ -935,6 +974,9 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     held, word = await _metric_masks(metric or {}, str(entry.get("node_id") or ""), artifact, sealed, masks, card=card)
     for item in (metric or {}).get("inputs") or []:
         one = {"step": "input", **item}
+        if item.get("through"):
+            # 穿过原样解析查询结果的整形节点按位置取的格：面板写明经过的是哪个节点（图里的名字）
+            one["through_label"] = _node_label(sealed, item["through"])
         artifact_of = item.get("artifact")
         if artifact_of and item.get("via") in ("tool_cell", "agent_field"):
             one["query"] = _query_alias(catalog, artifact_of)
@@ -955,6 +997,26 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         step["value"] = word or MASKED
     queries = [s for a, cells in wanted.items() for s in await _query_steps(a, cells, doc, sealed, masks)]
     return [step, *inputs, *queries]
+
+
+def _node_label(sealed: _Sealed, node_id: Any) -> str:
+    """封存的图里这个节点的名字，没有名字的写 id。"""
+    node = next((n for n in (sealed.graph or {}).get("nodes") or [] if isinstance(n, dict) and n.get("id") == node_id), {})
+    return str((node.get("data") or {}).get("label") or node_id or "")
+
+
+def _untraced_steps(metric: dict[str, Any], sealed: _Sealed) -> list[dict[str, Any]]:
+    """指标的输入里追不到原始数据的：[{path, node_id, label, type}]，label 是封存的图里那个节点的名字、type 是节点类型
+    （面板按它写「数据整形」「沙箱代码」）。认不出是哪个节点的，node_id、label 为 None。"""
+    nodes = {n.get("id"): n for n in (sealed.graph or {}).get("nodes") or [] if isinstance(n, dict)}
+    out = []
+    for item in untraced(metric.get("inputs") or []):
+        node_id = item.get("node_id")
+        node = nodes.get(node_id) or {}
+        out.append({"path": item.get("path"), "node_id": node_id,
+                    "label": _node_label(sealed, node_id) if node_id else None,
+                    "type": node.get("type") or None})
+    return out
 
 
 @dataclass(frozen=True)
@@ -2105,6 +2167,13 @@ async def _mask_sets(snap: dict[str, Any] | None, source: Any, masks: _Masks, *,
     artifact 是 snap 的工件 id：给了的，分析结果按快照记在进程里（_MEMO，键见 _Masks.memo_key），之后的请求不再分析。"""
     if snap is not None and snap.get("source") == MERGE_SOURCE:
         return await _merge_mask_sets(snap, masks, depth=depth)
+    if snap is not None and snap.get("capability"):
+        # 端点快照：列是能力登记的表格映射排出来的，没有 SQL 可认、也不该按数据源认（端点不是数据源，按数据源找不到会把
+        # 整张表都当成「数据源不在了」遮掉）。按列名遮：落快照时记下的加能力现在的遮罩字段，确定就是这几列
+        from app.capabilities.registry import snapshot_masked_columns
+
+        base = await snapshot_masked_columns(snap)
+        return _MaskSets(set(base), set(base), base)
     name = source or (snap or {}).get("source")
     current, found = await masks.of(name)
     base = set(current) | (_recorded_masks(snap) if snap is not None else set())

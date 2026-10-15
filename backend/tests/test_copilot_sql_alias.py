@@ -7,7 +7,8 @@ cell() 都直接用中文名。
 中文别名要按方言加标识符引号：MySQL / MariaDB 用反引号，PostgreSQL、Oracle、SQLite 用双引号；单引号是字符串。
 
 这组守的是：
-- 节点手册里 Agent 查库的说明、写 SQL 的硬性要求（搭查库节点时的规则）都有这一条，按方言给出示例
+- 节点手册里 Agent 查库的说明、写 SQL 的硬性要求（搭查库节点时的规则）都有这一条，按方言给出示例；写 SQL 的
+  硬性要求说的是「照查看结果写、没看过先 look」，不再让助手先放一个 db_schema 节点去猜（look 文档 D3）
 - 加了引号的中文别名不让自查放弃列名核对：以前 SQL 里只要有带引号的标识符就整条不判，照这条规矩写的 SQL
   会把猜错的英文列名一起放过去
 """
@@ -32,6 +33,11 @@ def test_guidance_asks_for_chinese_aliases_with_dialect_quotes(text):
     assert "AS `月份`" in text and "MySQL" in text           # MySQL / MariaDB：反引号
     assert 'AS "月份"' in text and "PostgreSQL" in text and "Oracle" in text and "SQLite" in text
     assert "单引号" in text                                    # 单引号是字符串，不是别名
+
+
+def test_sql_rules_point_at_look_not_at_guessing():
+    assert "look" in SQL_RULES_PROMPT and "查看结果" in SQL_RULES_PROMPT
+    assert "图里先放一个 db_schema 工具节点" not in SQL_RULES_PROMPT
 
 
 def _source(**tables):

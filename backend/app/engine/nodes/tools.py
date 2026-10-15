@@ -19,7 +19,8 @@ from app.engine.toolcalls import ToolTimeout, limit_fields, limit_of, run_bounde
 from app.sandbox.base import SandboxLimits
 from app.sandbox.manager import sandbox_manager
 from app.engine.sql_problems import event_checks
-from app.tools.datasource import DATA_UNAVAILABLE, QUERY_PREFIX, SCHEMA_PREFIX, run_versions
+from app.capabilities.registry import is_platform_query, snapshot_owned
+from app.tools.datasource import DATA_UNAVAILABLE, SCHEMA_PREFIX, run_masks_results, run_reads_only, run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolBuildError,
@@ -47,6 +48,8 @@ def _tool_ctx(ctx: NodeContext) -> ToolContext:
         memory_scope=ctx.cfg("memory_scope") or ctx.run.memory_scope,
         collection=ctx.cfg("collection") or ctx.run.collection,
         data_versions=run_versions(ctx.run),
+        mask_results=run_masks_results(ctx.run),
+        force_readonly=run_reads_only(ctx.run),
         # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
         emit=ctx.emit,
     )
@@ -61,7 +64,8 @@ async def _dynamic_tool(name: str, ctx: NodeContext) -> Any:
         return None
     async with SessionLocal() as session:
         try:
-            tools = await build_tools([name], _tool_ctx(ctx), session=session)
+            # 写入能力只能放在调用工具节点里（应用平台 A5）：只有这里传 allow_write=True
+            tools = await build_tools([name], _tool_ctx(ctx), session=session, allow_write=True)
         except ToolBuildError as e:
             # 工具自己的配置写坏了：说清是哪个、去哪里改，不再往下走到 call_tool 里炸
             raise NodeError(ctx.node.id, str(e)) from e
@@ -77,6 +81,11 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     args = ctx.render(ctx.cfg("args", {}) or {}, state)
     if not isinstance(args, dict):
         raise NodeError(ctx.node.id, "工具参数必须是 JSON 对象")
+
+    # 能力治理后效果为写入的：走动作的路径（先留生效记录再发送，app/process/actions.py）。登记里没有、或不是写入的，
+    # 照以前的路径执行
+    if (capability := await _write_capability(name, ctx)) is not None:
+        return await _run_write(state, ctx, name, args, capability)
 
     # 审批通过后节点会整个重放、再算一遍要不要问人，所以这里只能取决于 name 和 args。
     # 节点没配时取全局设置（「危险工具默认需要人工确认」），见 NodeContext.approval_mode
@@ -163,7 +172,7 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     evidence_on = ledger_enabled(ctx.run)
     # 查表结构的工具只在数据本身用不了时算失败：它别的回话（「结构信息不可用」之类）是正常的结果
     failed = isinstance(result, str) and (
-        (name.startswith(QUERY_PREFIX) and result.startswith(QUERY_FAILED))
+        (is_platform_query(name) and result.startswith(QUERY_FAILED))
         or (name.startswith(SCHEMA_PREFIX) and result.startswith(DATA_UNAVAILABLE)))
     if evidence_on and failed:
         # 没查成：原话就是报错（「查询失败：no such table: x」），照写，别再套一层
@@ -182,11 +191,16 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         )
     except Exception:  # noqa: BLE001
         snapshot_id = None
-    # 只认数据源工具交回的查询：别的工具（MCP、自定义）拼出同样形状的 JSON，里面的工件 id 不是我们落的
-    query = query_entry_fields(result) if evidence_on and name.startswith(QUERY_PREFIX) else None
+    # 只认平台执行的查询（数据源查询、登记里声明了 tabular 的端点读取，capabilities.registry.is_platform_query）：
+    # 别的工具（MCP、自定义）拼出同样形状的 JSON，里面的工件 id 不是我们落的。按身份认，不看结果长得像不像（F11）
+    query = query_entry_fields(result) if evidence_on and is_platform_query(name) else None
+    # 端点读取另核一道（同 nodes/llm.py）：名字对了，交回的工件还得是这次运行落下的端点快照。数据源查询的快照由数据层
+    # 自己落，snapshot_owned 对它们直接放行
+    if query and not await snapshot_owned(query["artifact"], ctx.run.run_id, name):
+        query = None
     schema = query.get("schema_artifact") if query else None
     # 这次查询的 SQL 检查结果单独带上：preview 只有前 2000 个字符，checks 排在 rows 后面，通常被截掉
-    checks = event_checks(result) if name.startswith(QUERY_PREFIX) else []
+    checks = event_checks(result) if is_platform_query(name) else []
     ctx.emit(EventType.TOOL_END, tool=name, duration_ms=elapsed,
              preview=json.dumps(result, ensure_ascii=False, default=str)[:2000],
              artifact=snapshot_id, **({"query_artifact": query["artifact"]} if query else {}),
@@ -213,6 +227,105 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             updates["evidence"] = entries
     var_name = ctx.cfg("assign_to", "")
     if var_name:
+        updates["vars"] = {var_name: result}
+    return updates
+
+
+def _governance(name: str, ctx: NodeContext) -> dict[str, Any]:
+    """这次运行发起时固定的能力治理快照（Run.options["capabilities"]，见 capabilities.registry.capability_snapshot）。
+    恢复、重放用同一份：停在确认上期间有人改了治理，这次运行仍按发起时的。"""
+    options = ctx.run.extra.get("run_options") or {}
+    return ((options.get("capabilities") or {}).get(name)) or {}
+
+
+async def _write_capability(name: str, ctx: NodeContext) -> Any | None:
+    """写外部系统的能力登记（capabilities.registry.writes_externally：治理后效果为 write，或绑定端点、视参数而定）；
+    不是写入（或登记里没有）返回 None。效果和绑定的端点按发起时的治理快照认。"""
+    from app.capabilities.registry import effective_effect, get_capability, writes_externally
+
+    async with SessionLocal() as session:
+        capability = await get_capability(session, name)
+    if capability is None:
+        return None
+    governance = _governance(name, ctx)
+    effect = governance.get("effect") or effective_effect(capability)
+    endpoint_id = governance["endpoint_id"] if "endpoint_id" in governance else capability.endpoint_id
+    return capability if writes_externally(name, effect, endpoint_id) else None
+
+
+async def _run_write(state: GraphState, ctx: NodeContext, name: str, args: dict[str, Any],
+                     capability: Any) -> dict[str, Any]:
+    """写外部系统（§3.8）。顺序是升级安全的关键：查生效记录 → 需要确认时在 tool.start 之前停下（节点边界上，
+    只有 ask 的记录 task）→ 恢复后重算哈希 → 先写记录再发送。发送前一定先查记录，节点重新执行（恢复、接着跑、
+    跨重放协议）时已生效的交回回执、已发出的转核实，不会重发。"""
+    from app.engine.nodes.human import resolve_assignee
+    from app.process import actions
+
+    exec_no = next_exec(state, ctx.node.id)
+    try:
+        prep = await actions.prepare(run_id=ctx.run.run_id, node_id=ctx.node.id, exec_no=exec_no,
+                                     capability=capability, args=args)
+    except actions.ActionFailed as e:
+        raise NodeError(ctx.node.id, str(e)) from e
+    if prep.receipt is not None:
+        ctx.emit(EventType.LOG, level="info", code="action_already_applied",
+                 message=f"「{name}」这次写入已经生效，交回存下的回执，不再发送")
+        return _write_updates(ctx, prep.receipt)
+
+    governance = _governance(name, ctx)
+    unattended = governance.get("unattended_write", getattr(capability, "unattended_write", False))
+    confirm = (governance.get("approval") or getattr(capability, "approval", "inherit")) == "confirm" \
+        or not (ctx.approval_mode() == "never" and unattended)
+    confirmer: str | None = None
+    if confirm:
+        title = f"确认发送：{getattr(capability, 'title', '') or name}"
+        card = {"kind": "action_confirm", "node_id": ctx.node.id, "mode": "approve", "title": title, "tool": name,
+                "capability": name, "preview": prep.preview, "payload_hash": prep.payload_hash,
+                "environment": prep.environment, "endpoint": prep.endpoint, "attempt": prep.attempt}
+        if assignee := await resolve_assignee(state, ctx):
+            card["assignee"] = assignee
+        answer = await ask(ctx, card, **card)
+        decision = read_decision(answer)
+        confirmed = answer.get("payload_hash") if isinstance(answer, dict) else None
+        await once(ctx, EventType.HUMAN_RESOLVED, tool=name, approved=decision.approved, note=decision.note,
+                   actor=ctx.actor(), payload_hash=confirmed)
+        if not decision.approved:
+            # 驳回是人的决定，不是故障：运行到这里结束（状态记失败，没有可走的出口），说法写成「未确认（被驳回）」，
+            # 实例页按待办的结论另说（apps/resolve.instance_states）
+            raise NodeError(ctx.node.id, f"「{ctx.node.title}」未确认（被驳回），没有发送"
+                            + (f"：{decision.note}" if decision.note else ""))
+        if confirmed != prep.payload_hash:
+            # 动作确认不接受改参数：要改在上游的表单里改。确认之后上游的数据变了，看过的就不是要发的，拒发
+            raise NodeError(ctx.node.id, f"「{name}」确认时看到的内容和现在要发送的不一致（内容指纹对不上），"
+                                         "已拒绝发送。请重新发起运行，确认新的内容")
+        confirmer = ctx.actor() or await _confirmed_by(ctx.run.run_id, ctx.node.id)
+    # 身份断言（D-b）：sub 一律是运行的发起人——这件事是替他办的；确认的人放在 act。以前恢复时写的是确认人，
+    # 外部系统会把审批人当成申请人；无人值守的写入没有人确认，不写 act
+    on_behalf = {"sub": prep.run.get("started_by"), "act": confirmer}
+    try:
+        result = await actions.send(prep, capability, run_id=ctx.run.run_id, node_id=ctx.node.id,
+                                    exec_no=exec_no, emit=ctx.emit, on_behalf=on_behalf)
+    except actions.ActionFailed as e:
+        raise NodeError(ctx.node.id, str(e)) from e
+    return _write_updates(ctx, result)
+
+
+async def _confirmed_by(run_id: str, node_id: str) -> str | None:
+    """确认这次发送的人：节点重新执行（结果未知核实后接着跑、重启后恢复）时 ctx.actor() 已经不是确认的那次恢复，
+    按待办上记的处理人认（会签时是凑齐的那一票）。"""
+    from sqlalchemy import select
+
+    from app.db.models import Task
+
+    async with SessionLocal() as session:
+        return await session.scalar(select(Task.resolved_by).where(
+            Task.run_id == run_id, Task.node_id == node_id, Task.kind == "action_confirm",
+            Task.status == "resolved").order_by(Task.created_at.desc()).limit(1))
+
+
+def _write_updates(ctx: NodeContext, result: dict[str, Any]) -> dict[str, Any]:
+    updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
+    if var_name := ctx.cfg("assign_to", ""):
         updates["vars"] = {var_name: result}
     return updates
 

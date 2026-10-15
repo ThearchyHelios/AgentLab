@@ -84,6 +84,27 @@ class EventType(StrEnum):
     # 封存核对只覆盖 manifest_seq 之前的事件，追加它不影响 verify；封存的报告文档一个字都不改
     EVIDENCE_JUDGED = "evidence.judged"
 
+    # 应用平台（docs/design/app-platform-and-look.md §3.11）
+    # 运行来源：发起时写进 launch_run 的 notes，在封存范围内（engine/origin.py）
+    RUN_ORIGIN = "run.origin"
+    # 待办：一次中断面向人的那一面（app/process/tasks.py）
+    TASK_OPENED = "task.opened"
+    TASK_RESPONDED = "task.responded"  # 谁、怎么决定的、第几人 / 共几人
+    TASK_REASSIGNED = "task.reassigned"
+    TASK_REMINDED = "task.reminded"
+    TASK_ESCALATED = "task.escalated"
+    TASK_EXPIRED = "task.expired"
+    TASK_RESOLVED = "task.resolved"
+    TASK_CANCELLED = "task.cancelled"
+    # 动作：写外部系统（app/process/actions.py）。prepared 带 payload_hash、环境、遮罩后的预览
+    ACTION_PREPARED = "action.prepared"
+    ACTION_SENT = "action.sent"
+    ACTION_CONFIRMED = "action.confirmed"
+    ACTION_FAILED = "action.failed"
+    ACTION_UNKNOWN = "action.unknown"
+    ACTION_RECONCILED = "action.reconciled"
+    ACTION_SIMULATED = "action.simulated"
+
     # 其他
     LOG = "log"
     USAGE = "usage"  # token / 成本累计

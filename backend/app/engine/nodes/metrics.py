@@ -33,6 +33,7 @@ from app.engine.expressions import (
     substitute,
 )
 from app.engine.labels import field_label
+from app.engine.lineage import parsed_tool, row_cell
 from app.engine.sql_problems import CHECK_FIELDS, QueryProblem, merge_problems, node_of, query_problems, reason_text
 from app.engine.state import GraphState, template_context
 
@@ -528,12 +529,16 @@ def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,
     vars.X 要反查是谁写的：assign_to 为 X 的节点里，按执行顺序最后跑的那一个——
     和状态里 vars 的覆盖顺序一致。入口节点把输入字段也写进 vars。
 
-    两种来历能追到查询快照里的那一格：
+    三种来历能追到查询快照里的那一格（engine/lineage.py 说「追到了原始数据」的就是这几种，加上运行输入）：
     - cell(nodes.fetch, 0, 'gmv')：via tool_cell，带 locator、artifact、eid，按快照核对
+    - vars.q.rows[0][0]，q 由「只是把调用工具节点的结果原样按 JSON 解析」的整形节点写：同 cell()，via tool_cell，
+      另记 through（穿过的整形节点）
     - agent 开了 cite_fields 的字段：via agent_field，接上它的 data_evidence（eid、核对状态）
     """
     if (parts := cell_parts(path)) is not None:
         return _cell_input(path, value, parts, state, ctx, tctx or template_context(state))
+    if (parsed := _parsed_cell(path, value, state, ctx, tctx or template_context(state))) is not None:
+        return parsed
     spec = ctx.run.spec
     nodes = spec.node_map()
     node_id: str | None = None
@@ -642,16 +647,42 @@ def _agent_element(evidence: dict[str, Any], key: str) -> dict[str, Any] | None:
     return out
 
 
+def _parsed_cell(path: str, value: Any, state: GraphState, ctx: NodeContext,
+                 tctx: dict[str, Any]) -> dict[str, Any] | None:
+    """穿过「只是把调用工具节点的结果原样按 JSON 解析」的整形节点按位置取的一格（vars.q.rows[0][0]、
+    nodes.parse.rows[0]['gmv']）：整形节点不改动任何一格，第 i 行第 j 列就是那份查询快照的第 i 行第 j 列，和 cell() 一样
+    按快照核对（_cell_input），through 记下穿过的整形节点。
+
+    不是这种取法（不是 .rows[行][列] 的样子、写它的不是这种整形节点）返回 None，按一般的来历记：表达式、模板拼出来的
+    结构即使带着 rows 和快照 id，行也可能被筛过、换过顺序，对不到快照的同一行（见 engine/lineage.parsed_tool）。"""
+    at = row_cell(path)
+    if at is None:
+        return None
+    nodes = ctx.run.spec.node_map()
+    transform = at.name if at.root == "nodes" else _writer_of(at.name, state, ctx)
+    node = nodes.get(transform) if transform else None
+    tool = parsed_tool(node.type, node.config, lambda i: nodes[i].type if i in nodes else None) if node else None
+    if node is None or tool is None:
+        return None
+    return _cell_input(path, value, (at.table, repr(at.row), repr(at.column)), state, ctx, tctx,
+                       through=(node.id, tool))
+
+
 def _cell_input(path: str, value: Any, parts: tuple[str, str, str], state: GraphState, ctx: NodeContext,
-                tctx: dict[str, Any]) -> dict[str, Any]:
+                tctx: dict[str, Any], *, through: tuple[str, str] | None = None) -> dict[str, Any]:
     """cell() 取的那一格：它来自哪次查询（台账里的 query 条目）、第几行哪一列、快照里是不是这个值。
 
     查询结果经 transform 解析过也认得出来：数据源工具交回的 JSON 里带着快照的工件 id。
     取不到快照、或者快照里那一格和算的时候用的值不一样，status 如实写，不替它圆。
+
+    through 是 (整形节点, 调用工具节点)：穿过原样按 JSON 解析的整形节点按位置取的格（_parsed_cell）。台账按工件认不出时
+    按那个调用工具节点找它最后一次查询，卡上记下穿过的整形节点。
     """
     source, row_src, column_src = parts
     entry: dict[str, Any] = {"path": path, "value": value if value is None or isinstance(value, (int, float, str, bool))
                              else _brief(value), "node_id": None, "via": "tool_cell"}
+    if through is not None:
+        entry["through"] = through[0]
     table = _value_of(source, tctx)
     row, column = _value_of(row_src, tctx), _value_of(column_src, tctx)
     data = table
@@ -664,19 +695,21 @@ def _cell_input(path: str, value: Any, parts: tuple[str, str, str], state: Graph
     queries = [e for e in state.get("evidence") or [] if isinstance(e, dict) and e.get("kind") == "query"]
     ledger = next((e for e in reversed(queries) if artifact and e.get("artifact") == artifact), None)
     head = _REF_HEAD.match(source)
-    if ledger is None and head and head.group(1) == "nodes":
+    producer = through[1] if through is not None else head.group(2) if head and head.group(1) == "nodes" else None
+    if ledger is None and producer:
         # 台账是按工件认的；工具交回的不是带工件 id 的 JSON 时，按取值链上的节点找它最后一次查询
-        ledger = next((e for e in reversed(queries) if e.get("node_id") == head.group(2)), None)
+        ledger = next((e for e in reversed(queries) if e.get("node_id") == producer), None)
     if ledger is None:
-        entry.update(node_id=head.group(2) if head and head.group(1) == "nodes" else None,
-                     status="unresolved", reason="找不到这份数据对应的查询快照：cell() 需要读取查询工具返回的结果")
+        entry.update(node_id=producer, status="unresolved",
+                     reason="找不到这份数据对应的查询快照：cell() 需要读取查询工具返回的结果" if through is None
+                     else "找不到这份数据对应的查询快照：调用工具节点交回的不是数据源查询的结果")
         return entry
     entry["node_id"] = ledger.get("node_id")
     artifact = ledger.get("artifact")
     try:
         raw, name = locate_cell(data if isinstance(data, dict) else table, row, column)
     except CellError as e:
-        entry.update(status="unresolved", reason=f"cell() {e}", artifact=artifact)
+        entry.update(status="unresolved", reason=f"cell() {e}" if through is None else f"{path}：{e}", artifact=artifact)
         return entry
     locator = {"row": row, "column": name}
     entry.update(locator=locator, artifact=artifact, eid=cell_eid(artifact, row, name))

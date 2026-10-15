@@ -36,6 +36,10 @@ export interface Workflow {
   is_template: boolean
   status?: 'draft' | 'published' | 'governed'
   published_version?: number | null
+  /** 当前发布版本的级别。画布上改过之后 status 回到 draft，「这是不是受管工作流」看这一项（老服务端不给） */
+  published_level?: 'published' | 'governed' | null
+  /** 画布这一版的图和当前发布版内容相同（服务端按图哈希比）：撤回改动后保存出来的新版本不算「领先」（老服务端不给） */
+  same_as_published?: boolean
   /** 最近一次发布的署名。发布时没有署名为 null */
   published_by?: string | null
   run_count?: number
@@ -173,6 +177,11 @@ export interface Approval {
   /** 谁处理的。null 表示处理时没有署名，显示「未署名」 */
   resolved_by?: string | null
   resolved_at?: string | null
+  /**
+   * 这条审批对应的待办（一次中断对应一条 Approval 和一条 Task，应用平台 D-r）。有它审批卡直接按 id 取待办，
+   * 不必再按运行取一遍待办列表去对；老服务端不给
+   */
+  task_id?: string | null
 }
 
 /**
@@ -245,6 +254,11 @@ export interface ToolInfo {
    * 一定失败，列表上要醒目地标出来。null / 缺省表示没问题
    */
   problem?: string | null
+  /**
+   * 在工具库里执行只演练、不发送：写外部系统的能力（被治理为写入，或绑定端点、视参数而定），和执行接口同一个判断。
+   * 详情区的提示条照它说「这里只演练」，不说「请求会实际发出」（老服务端不给）
+   */
+  write_rehearsal?: boolean
 }
 
 /**
@@ -2090,6 +2104,12 @@ export interface EvidenceInput {
   model_value?: unknown
   /** tool_cell mismatch：快照里的值（value 是算的时候用的） */
   snapshot_value?: unknown
+  /**
+   * tool_cell：按位置取的格（vars.q.rows[0][0]）穿过了「只是把调用工具节点的结果原样按 JSON 解析」的整形节点，这是那个
+   * 节点的 id；through_label 是它在图里的名字（证据接口补的）。cell() 取的格没有这两个键
+   */
+  through?: string | null
+  through_label?: string
   /** unresolved 的原因（人话） */
   reason?: string
   /** 输入对到的查询在报告目录里的编号（Q3）：接口按工件补的全局编号 */
@@ -2244,6 +2264,16 @@ export interface EvidenceMerge {
   traced: EvidenceMergeTrace[]
 }
 
+/** 指标的一个输入追不到原始数据：出处追到哪个节点为止。认不出是哪个节点时 node_id、label 为 null */
+export interface EvidenceUntraced {
+  path: string
+  node_id: string | null
+  /** 封存的图里那个节点的名字 */
+  label: string | null
+  /** 节点类型（transform、code、llm……） */
+  type: string | null
+}
+
 export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   step: string
   metric?: string
@@ -2282,6 +2312,11 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   sql_check_reason?: string
   /** metric（期 4）：这个指标的双盲复算状态。没有双盲复算复核过这份指标集时没有这个键 */
   dual_check?: EvidenceDualCheck
+  /**
+   * metric：输入里追不到原始数据（查询快照里的格、运行输入）的，空数组是都追到了；卡上没有输入、老服务端没有这个键。
+   * 和「有出处」（口径卡确定性复算一致）是两件事，面板分开说（服务端 engine/lineage.py）
+   */
+  untraced?: EvidenceUntraced[]
   /** query：这次查询对照数据目录查出的问题。没查出问题时没有这个键 */
   checks?: SqlCheckItem[]
   /** query：查询当时冻结的表结构快照（工件 id）。合并查询、老快照没有 */
@@ -3712,6 +3747,8 @@ export interface ScheduleVariable {
   /** 如「昨天（YYYY-MM-DD）」 */
   label: string
   example: string
+  /** 补充说明（ISO 周的跨年规则），没有的是空串；老服务端没有这个键 */
+  note?: string
 }
 
 /** POST /api/schedules/{id}/run：这次手动触发和它发起的运行（没发起时为 null） */
@@ -4216,4 +4253,49 @@ export interface InquirySnapshot {
   /** 遮掉的列 */
   masked: string[]
   source: string | null
+}
+
+// ---------------------------------------------------------------------------
+// 应用平台（docs/design/app-platform-and-look.md）：运行来源、版本的发布 / 退役与使用情况、从运行提取的来源。
+// 接口约定的主体在 typesApp.ts（冻结）；这里只往已有的类型上补字段，同名接口会合并
+// ---------------------------------------------------------------------------
+
+/** 运行来源（X3）。老运行四项都为空，界面写「来源未记录」 */
+export interface Run {
+  origin_kind?: import('./typesApp').OriginKind | null
+  /** run.origin 事件的数据：kind、app_id、entry / view、hook、actor、actor_verified…… */
+  origin?: Record<string, any> | null
+  app_id?: string | null
+  app_version?: number | null
+}
+
+/** 每个版本各自记发布、退役（A1、F5）；VersionDetailOut 另带入口表单和使用情况 */
+export interface WorkflowVersion {
+  level?: 'published' | 'governed' | null
+  published_at?: string | null
+  published_by?: string | null
+  retired_at?: string | null
+  retired_by?: string | null
+  retire_note?: string | null
+  /** 入口字段按 agentlab.form/1 转好的表单（服务端 input_schema(fields)），发起表单照它画 */
+  input_schema?: import('./typesApp').FormSchema | null
+  /** 被哪些应用固定、生效记录数、正式运行数（同 GET /api/ledger/workflow-versions/{wf}/{v}） */
+  usage?: { apps: { app_id: string; name: string; app_version: number }[]; effects: number; formal_runs: number } | null
+}
+
+/** 从运行提取时的来源：run_id、对话、轮次（/copilot/from-run 写） */
+export interface Workflow {
+  origin?: Record<string, any> | null
+}
+
+/**
+ * GET /api/datasources/names（应用平台 D-c）：开了登录、允许使用者问数据时，问数据页按它列可选的数据源。
+ * 只有名字和说明，没有连接信息、表结构
+ */
+export interface DataSourceName {
+  id: string
+  name: string
+  description?: string
+  kind?: string
+  enabled?: boolean
 }

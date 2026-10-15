@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import artifact_store
 from app.core.events import EventType
 from app.data.catalog_impact import catalog_drift
+from app.apps.versions import is_published, subgraph_pin_problems
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import governance_note, unresolved_caliber_upgrades
 from app.engine.runner import run_manager
@@ -29,6 +30,14 @@ logger = logging.getLogger(__name__)
 
 #: 发起时发现绑定的工具在本机不存在（见 missing_tools）
 TOOL_MISSING = "run_tool_missing"
+#: 正式运行引用的版本没有发布过（草稿快照）、已经退役、和调用方带来的 graph_hash 对不上（应用平台 A1）
+VERSION_UNPUBLISHED = "run_version_unpublished"
+VERSION_RETIRED = "run_version_retired"
+VERSION_HASH_MISMATCH = "run_version_hash_mismatch"
+#: 发布之后这一版用到的能力的治理版本变了：只提醒、不拦（同数据目录漂移）
+CAPABILITY_DRIFT = "capability_drift"
+#: 正式运行里子工作流节点固定的版本没有发布过、已经退役（D-q）的机器码，和发布门禁、应用检查同一套：见 apps/versions.py
+#: 的 SUBGRAPH_UNPUBLISHED / SUBGRAPH_RETIRED 和 subgraph_pin_problems
 
 
 class LaunchRefused(Exception):
@@ -55,9 +64,24 @@ async def launch_run(
     actor: str | None,
     schedule_id: str | None = None,
     options: dict[str, Any] | None = None,
+    origin_kind: str | None = None,
+    origin: dict[str, Any] | None = None,
+    app_id: str | None = None,
+    app_version: int | None = None,
+    expect_hash: str | None = None,
 ) -> Run:
     """发起一次运行，返回刚建好的运行记录（执行已经交给 run_manager）。不发起就抛 LaunchRefused；抛别的异常时
     运行也没有开始执行。
+
+    应用平台（docs/design/app-platform-and-look.md §2.1、§2.10 X3）：
+    - origin_kind / origin：运行来源（engine/origin.py 的 ORIGIN_KINDS）。记在运行上，同时把 run.origin 事件放进
+      notes（在封存范围内）。调用方：POST /api/runs（客户端只能声明 CLIENT_ORIGINS）、定时任务（schedule）、
+      应用入口和视图（app_*）、入站钩子（hook）。
+    - app_id / app_version：应用发起的运行属于哪个应用版本。
+    - expect_hash：应用发起正式运行时必须带上钉住版本的 graph_hash，和快照对不上就拒绝（run_version_hash_mismatch）。
+      正式运行接受「已发布且未退役」的版本（app/apps/versions.py 的 is_published，F1）：没发布过的拒绝
+      （run_version_unpublished），退役的拒绝（run_version_retired）。
+    - 用到的能力的治理快照写进 options["capabilities"]；能力版本相对发布时有变化只记一条提醒（capability_drift）。
 
     参数和 POST /api/runs 的请求体一一对应（input 叫 input_payload）；actor 是记在运行上的发起人。
     schedule_id 是发起它的定时任务，options 是整次运行沿用的选项快照，都原样交给 run_manager.start；图里有双盲复算、
@@ -69,6 +93,8 @@ async def launch_run(
     version_hash: str | None = None
     governed = False
     formal = run_class == "formal"
+    # 发布时记下的能力版本（正式运行才比，见 _with_capability_snapshot）
+    published_capabilities: dict[str, Any] | None = None
 
     if formal:
         # 正式运行的全部语义就这一条规则：必须引用一个不可变的已发布版本。
@@ -85,16 +111,6 @@ async def launch_run(
         if not workflow.published_version:
             raise LaunchRefused(409, f"「{workflow.name}」还没有发布版本，请先在编排页发布")
         run_version = version or workflow.published_version
-        # "不可变"和"过过闸"是两件事。快照确实不可变，但 PATCH 保存出来的
-        # 草稿版本同样有快照——只认 version 存不存在的话，工作流只要发布过
-        # 任意一个版本，之后所有草稿都能以 formal 身份启动，发布期的
-        # validate_graph + lint_for_publish 全部绕过。
-        if run_version != workflow.published_version:
-            raise LaunchRefused(
-                409,
-                f"v{run_version} 不是当前发布版本（v{workflow.published_version}）。"
-                "正式运行只能使用当前发布版本；如需运行这一版，请先发布它。",
-            )
         snapshot = (
             await session.execute(
                 select(WorkflowVersion).where(
@@ -105,8 +121,29 @@ async def launch_run(
         ).scalar_one_or_none()
         if not snapshot:
             raise LaunchRefused(404, f"版本 v{run_version} 不存在")
+        # "不可变"和"过过闸"是两件事。快照确实不可变，但 PATCH 保存出来的
+        # 草稿版本同样有快照——只认 version 存不存在的话，工作流只要发布过
+        # 任意一个版本，之后所有草稿都能以 formal 身份启动，发布期的
+        # validate_graph + lint_for_publish 全部绕过。
+        # 以前只认当前发布版（F1），应用就固定不住旧的发布版；现在认「已发布且未退役」，说法只有 versions.is_published 一处
+        if snapshot.retired_at is not None:
+            raise LaunchRefused(
+                409, f"v{run_version} 已退役，不再接受新的正式运行。请改用当前发布版本（v{workflow.published_version}）",
+                VERSION_RETIRED)
+        if not is_published(snapshot, current=workflow.published_version):
+            raise LaunchRefused(
+                409,
+                f"v{run_version} 没有发布过（当前发布版本为 v{workflow.published_version}）。"
+                "正式运行只能使用已发布的版本；如需运行这一版，请先发布它。",
+                VERSION_UNPUBLISHED,
+            )
         graph = snapshot.graph
         version_hash = snapshot.graph_hash or artifact_store.graph_hash(graph)
+        published_capabilities = snapshot.capability_versions
+        # 应用发起时带着固定版本的指纹：快照和应用发布时看到的不是同一张图就不发起（按 graph_hash 钉死）
+        if expect_hash and expect_hash != version_hash:
+            raise LaunchRefused(
+                409, f"v{run_version} 的内容指纹和发起方记录的不一致，不发起这次正式运行", VERSION_HASH_MISMATCH)
         name = workflow.name
         # 按这一版发布时记下的级别；记级别之前发布的老版本没有，照旧看工作流现在的 status
         governed = (snapshot.level == "governed") if snapshot.level else workflow.status == "governed"
@@ -121,6 +158,8 @@ async def launch_run(
         errors, upgrade_events = await unresolved_caliber_upgrades(session, spec)
         if errors:
             raise LaunchRefused(409, "；".join(errors))
+        # 处置声明了，固定的那一版本身还得在用（D-q）：两条都拦，先说升版是沿用以前的提示顺序
+        await _refuse_unpublished_subgraphs(session, spec)
         # 数据目录和口径卡不同：目录是给人和助手看的说明，不是运行的输入。发布之后变了只提醒、不拦——
         # 拦下来等于让一次文字修订卡住正式出具
         catalog_changes = await catalog_drift(session, snapshot.catalog_versions)
@@ -137,6 +176,8 @@ async def launch_run(
         raise LaunchRefused(400, "没有要运行的内容：请求中既没有工作流 ID，也没有工作流内容")
     await _refuse_missing_tools(session, graph)
     options = await _with_verify_snapshot(session, graph, options)
+    options, capability_changes = await _with_capability_snapshot(
+        session, graph, options, published=published_capabilities)
 
     from app.api.settings import resolve_run_scope
 
@@ -154,11 +195,24 @@ async def launch_run(
         # SQL 用到的，possible Agent 可能查询的（界面分开说）
         notes.append((EventType.CATALOG_DRIFT, None,
                       {"version": run_version, "count": len(catalog_changes), "tables": catalog_changes}))
+    if capability_changes:
+        # 能力的治理（读写效果、审批、遮罩……）发布之后改过：同目录漂移，只提醒、不拦，之后回看这次运行知道差在哪
+        notes.append(("log", None, {
+            "level": "warning", "code": CAPABILITY_DRIFT, "version": run_version, "capabilities": capability_changes,
+            "message": f"v{run_version} 发布之后，用到的 {len(capability_changes)} 项能力的治理设置有变化："
+                       + "、".join(f"「{c['name']}」" for c in capability_changes[:8])
+                       + ("等" if len(capability_changes) > 8 else "")}))
     # 已声明策略的升版记入事件流，出具物上能看到"这期换口径了、怎么处置的"
     for ev in upgrade_events:
         payload_ev = dict(ev)
         node = payload_ev.pop("node_id", None)
         notes.append(("caliber.upgrade", node, payload_ev))
+    if origin_kind:
+        from app.engine.origin import origin_note
+
+        data = {**(origin or {}), "actor": actor, "app_id": app_id, "app_version": app_version}
+        data.pop("kind", None)
+        notes.insert(0, (EventType.RUN_ORIGIN, None, origin_note(origin_kind, **data)))
     try:
         run = await run_manager.start(
             graph=graph,
@@ -174,10 +228,49 @@ async def launch_run(
             options=options,
             schedule_id=schedule_id,
             notes=notes,
+            origin_kind=origin_kind,
+            origin=origin,
+            app_id=app_id,
+            app_version=app_version,
         )
     except ValueError as e:
         raise LaunchRefused(400, str(e)) from e
     return run
+
+
+def graph_tool_names(graph: dict[str, Any]) -> list[str]:
+    """图里绑定的工具名（去重，按出现顺序），能力快照和发布时记能力版本都按它取。模板拼出来的名字发起时还不知道是谁，
+    不算。图不成形时为空。"""
+    try:
+        spec = GraphSpec.model_validate(graph)
+    except Exception:  # noqa: BLE001 - 图本身不成形交给 run_manager.start 报
+        return []
+    return list(dict.fromkeys(name for _, name in _bindings(spec)))
+
+
+async def _with_capability_snapshot(session: AsyncSession, graph: dict[str, Any], options: dict[str, Any] | None, *,
+                                    published: dict[str, Any] | None
+                                    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """用到的能力的治理快照放进 options["capabilities"]（A6.4：写进 run.started，恢复和重放用同一份），以及相对发布时
+    （WorkflowVersion.capability_versions）有变化的能力 [{name, published, current}]。
+
+    没有登记的能力时快照为空，options 原样不动，run.started 和以前逐字相同。published 为空（探索运行、记能力版本之前
+    发布的老版本）不比。"""
+    from app.capabilities.registry import capability_snapshot, capability_versions_for
+
+    names = graph_tool_names(graph)
+    if not names:
+        return options, []
+    snapshot = await capability_snapshot(session, names)
+    if snapshot and not (isinstance(options, dict) and "capabilities" in options):
+        options = {**(options or {}), "capabilities": snapshot}
+    changes: list[dict[str, Any]] = []
+    if published:
+        current = await capability_versions_for(session, names)
+        for name, was in published.items():
+            if current.get(name) != was:
+                changes.append({"name": name, "published": was, "current": current.get(name)})
+    return options, changes
 
 
 #: 运行中途要读核查设置的节点：双盲复算、反方审稿
@@ -322,6 +415,14 @@ async def missing_tools(session: AsyncSession, spec: GraphSpec) -> list[tuple[st
         elif name not in custom:
             missing.append((who, name, "tools"))
     return missing
+
+
+async def _refuse_unpublished_subgraphs(session: AsyncSession, spec: GraphSpec) -> None:
+    """正式运行里，每个固定了版本的子工作流节点，固定的那一版必须「已发布且未退役」（D-q）。规则在
+    apps/versions.subgraph_pin_problems，发布门禁按同一条拦；这里是发起这一刻的那一道（发布之后那一版才退役的）。"""
+    for problem in await subgraph_pin_problems(session, spec):
+        raise LaunchRefused(409, f"{problem.who}固定的{problem.reason}，不能发起正式运行。"
+                                 f"{problem.advice}，再发布这个工作流", problem.code)
 
 
 async def _refuse_missing_tools(session: AsyncSession, graph: dict[str, Any]) -> None:

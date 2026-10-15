@@ -37,6 +37,10 @@
     dSource: '来源', dPinned: '口径来源', dUpgrade: '升版处置', dDual: '双盲复算', dArtifact: '工件',
     dNode: '来源节点', dStatus: '状态', dDecimals: '小数位',
     recomputeOk: '复算一致', recomputeBad: '复算不一致：代入式的计算结果与记录值不符', recomputeNone: '无法复算',
+    // 输入追没追到原始数据（查询快照里的格、运行输入）：和「有出处」（确定性复算一致）是两件事，同证据面板的说法
+    dOrigin: '原始数据', originTraced: '输入都追到了原始数据（查询快照里的格或运行输入）',
+    originStop: (path, label) => `${path} 的出处追到「${label}」为止，没追到原始数据`,
+    originUnknown: (path) => `${path} 无法确定来自哪个节点，没追到原始数据`,
     incomplete: '结果不完整', incompleteWhy: (t) => `基于被截断的查询结果计算，结果不完整${t ? `：${t}` : ''}`,
     sqlCheckFailed: 'SQL 检查未通过', sqlCheckWhy: (t) => `所依据的查询未通过 SQL 检查，结果不可靠${t ? `：${t}` : ''}`,
     missingValue: '缺少输入：口径卡本次未计算出该指标的值',
@@ -190,9 +194,15 @@
     // 计算方式：原式 + 代入式
     body.push(h('p', { class: 'sub' }, T.dExpression), h('pre', { class: 'sql' }, String(step.expression || NONE)))
     body.push(h('p', { class: 'sub' }, T.dSubstituted), h('pre', { class: 'sql' }, String(step.substituted || NONE)))
+    const untraced = Array.isArray(step.untraced) ? step.untraced.filter(isObj) : null
     body.push(h('div', {}, kv([
       [T.dRecompute, step.recompute_ok == null ? T.recomputeNone
         : step.recompute_ok ? T.recomputeOk : T.recomputeBad],
+      // 卡上没有输入、导出之前的服务端没给时不写
+      untraced ? [T.dOrigin, untraced.length
+        ? untraced.map((u) => (u.node_id ? T.originStop(String(u.path || NONE), u.label || nodeLabel(u.node_id))
+          : T.originUnknown(String(u.path || NONE)))).join('；')
+        : T.originTraced] : null,
     ])))
     // 双盲复算（期 4）：复核过这个指标才有
     if (isObj(step.dual_check)) {

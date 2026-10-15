@@ -18,6 +18,7 @@ import * as status from '../lib/status'
 import * as keys from '../lib/keys'
 import * as terms from '../lib/terms'
 import * as errors from '../lib/errors'
+import { useAuth } from '../store/auth'
 import * as explain from '../lib/explain'
 import * as health from '../lib/health'
 import * as actor from '../lib/actor'
@@ -741,7 +742,7 @@ function Harness() {
 }
 
 ;(window as any).__ui = {
-  toast, confirmDialog, promptDialog, useCatalog, ApiError, api, streamCopilot,
+  toast, confirmDialog, promptDialog, useCatalog, useAuth, ApiError, api, streamCopilot,
   mountDatasources: (n: number) => setDatasourceConsumers(n),
   // 检查脚本直接拿应用同一份模块实例测 lib：instanceof ApiError 才靠得住
   lib: { format, status, keys, terms, errors, explain, health, actor, validation, evidence },

@@ -9,7 +9,7 @@ import { EmptyState, IconButton, Modal, confirmDialog, promptDialog, toast } fro
 import { formatDateTime, formatTime, parseServerTime } from '../lib/format'
 import { formatShortcut } from '../lib/keys'
 import { leavePass, registerLeaveGuard } from '../lib/leave'
-import { WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import { WORKFLOW_STATUS_LABEL, publishedLevelOf } from '../lib/terms'
 import type { GraphSpec, Workflow } from '../types'
 
 /** 标签的中文。后端写的是机器标记，和中文界面混排很突兀 */
@@ -155,7 +155,8 @@ export async function createWorkflow(
 
 function StatusChip({ w }: { w: Workflow }) {
   const p = w.published_version
-  const pub = WORKFLOW_STATUS_LABEL[w.status === 'governed' ? 'governed' : 'published']
+  // 当前发布版的级别看 published_level（同工具栏的版本标签）：画布上改过之后 status 回到草稿，受管发布版照实写「受管」
+  const pub = WORKFLOW_STATUS_LABEL[publishedLevelOf(w)]
   // 和工具栏的版本标签同一个口径：最新一版就是发布的那版才算「已发布」。发布后又保存过，
   // 状态退回草稿，但已发布的 vN 还在、正式运行照样跑它——只写「草稿」就把这件事藏起来了
   if ((w.status === 'governed' || w.status === 'published') && p === w.version) {

@@ -204,18 +204,12 @@ async def test_a_text_reply_is_passed_through_on_the_canvas_too(client, monkeypa
 async def test_the_non_streaming_generate_keeps_positions_too(client, monkeypatch):
     import app.api.copilot as copilot
 
-    class _Structured:
-        def with_structured_output(self, _schema):
-            return self
-
-        async def ainvoke(self, _messages):
-            return {"explanation": "改了提示词", "nodes": [
-                {"id": n["id"], "type": n["type"], "label": n["id"], "config": n["data"]["config"]}
-                for n in BASE["nodes"]
-            ], "edges": BASE["edges"]}
+    # 非流式的 /generate 和流式走同一个生成过程（copilot_gen）：模型按操作流改图
+    ops = [{"op": "update_node", "id": "answer", "config": {"prompt": "简短回答：{{ input.question }}"}},
+           {"op": "done", "explanation": "改了提示词"}]
 
     async def _model(*_a, **_k):
-        return _Structured(), "mock-fast"
+        return _Scripted(ops), "mock-fast"
 
     monkeypatch.setattr(copilot, "get_chat_model", _model)
     r = await client.post("/api/copilot/generate", json={"instruction": "改", "base_graph": BASE})

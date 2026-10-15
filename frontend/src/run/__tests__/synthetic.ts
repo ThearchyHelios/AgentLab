@@ -496,18 +496,21 @@ export const COPILOT_TOOLS_DROPPED = [
 ]
 
 /**
- * 助手按需求挑表（context 操作，copilot_context.DatasourceContext.op）：大库挑了 3 张（含补进来的关联表），
- * 小库全部表都带字段。挑表用了 3 秒多，先到一拍心跳，再是 context，然后照常思考、起草、自查
+ * 助手按需查看（look 事件，look §2.5.7、应用平台 L2）：模型先输出一行 look，服务端停下、查看、把结果交回，
+ * 再接着写。大库按需求挑了 3 张、为连接补上 1 张；小库点名查看了 2 张（没有数据目录：过程里提示先去起草）。
+ * 查看用了 3 秒多，先到一拍「正在查看」的心跳，再是 look 事件，然后照常思考、起草、自查
  */
 export const COPILOT_CONTEXT = [
   { op: 'model', model: 'claude-sonnet-4' },
-  { op: 'heartbeat', phase: 'planning', elapsed_ms: 3000 },
-  { op: 'context', elapsed_ms: 3420, sources: [
-    { source: 'scenic', source_id: 'src-scenic', tables: ['visits', 'channels', 'channel_visits'], selected_by: 'model', total: 51,
-      catalog_tables: 12 },
-    // 小库全部表都带字段：没有数据目录也不提示
-    { source: 'shop', source_id: 'src-shop', tables: ['orders', 'customers'], selected_by: 'all', total: 2, catalog_tables: 0 },
-  ] },
+  { op: 'heartbeat', phase: 'planning', elapsed_ms: 1500 },
+  { op: 'heartbeat', phase: 'looking', elapsed_ms: 3000 },
+  { op: 'look', id: 'L1', by: 'model', need: '按渠道统计上月的入园人次，要入园记录和渠道维度', status: 'ok', elapsed_ms: 3420,
+    objects: [
+      { kind: 'table', source: 'scenic', source_id: 'src-scenic', named: [], picked: ['visits', 'channels'],
+        joined: ['channel_visits'], missing: [], total: 51, catalog_tables: 12 },
+      { kind: 'table', source: 'shop', source_id: 'src-shop', named: ['orders', 'customers'], picked: [], joined: [],
+        missing: ['refund_detail'], total: 2, catalog_tables: 0 },
+    ] },
   { op: 'heartbeat', phase: 'planning', elapsed_ms: 6000 },
   { op: 'thinking', delta: '入园记录不带渠道，要经 channel_visits 连到渠道表，再按渠道汇总上月的入园人次。' },
   { op: 'plan', summary: '取数 → 出结论' },
@@ -516,6 +519,22 @@ export const COPILOT_CONTEXT = [
   { op: 'done', explanation: '两步' },
   { op: 'check', status: 'passed', repaired: 0 },
   { op: 'final', graph: { nodes: [{ id: 'q' }, { id: 'o' }] } },
+]
+
+/**
+ * 老服务端的 context 操作（按需求挑表、预先塞进 system）：新前端连老服务端时照常显示一行，说法和 look 同一套
+ */
+export const COPILOT_CONTEXT_LEGACY = [
+  { op: 'model', model: 'claude-sonnet-4' },
+  { op: 'context', elapsed_ms: 3420, sources: [
+    { source: 'scenic', source_id: 'src-scenic', tables: ['visits', 'channels', 'channel_visits'], selected_by: 'model', total: 51,
+      catalog_tables: 12 },
+    { source: 'shop', source_id: 'src-shop', tables: ['orders', 'customers'], selected_by: 'all', total: 2, catalog_tables: 0 },
+  ] },
+  { op: 'plan', summary: '取数 → 出结论' },
+  { op: 'add_node', node: { id: 'q', type: 'tool', label: '查询各渠道入园人次' } },
+  { op: 'done', explanation: '一步' },
+  { op: 'final', graph: { nodes: [{ id: 'q' }] } },
 ]
 
 /**
@@ -536,20 +555,49 @@ export const COPILOT_CATALOG_PATCH = [
   { op: 'reply', text: '好的，已整理成数据目录的修改建议，确认后保存即可。' },
 ]
 
-/** 挑表失败（超时）：只给了表名，原因随 context 带来；生成照常进行 */
+/**
+ * 挑表失败（超时）：交回了表目录（status=index），原因随 look 带来；模型照目录点名再看一次（第二行），生成照常进行。
+ * 大库一张目录都没有：过程里提示先去起草目录
+ */
 export const COPILOT_CONTEXT_FALLBACK = [
   { op: 'model', model: 'claude-sonnet-4' },
-  { op: 'heartbeat', phase: 'planning', elapsed_ms: 18000 },
-  { op: 'context', elapsed_ms: 20004, sources: [
-    // 大库一张目录都没有：过程里提示先去起草目录
-    { source: 'scenic', source_id: 'src-scenic', tables: [], selected_by: 'fallback', total: 51, catalog_tables: 0,
-      reason: '挑选数据表超过 20 秒未完成' },
+  { op: 'heartbeat', phase: 'looking', elapsed_ms: 18000 },
+  { op: 'look', id: 'L1', by: 'model', need: '各渠道上月的入园人次', status: 'index', reason: '挑选数据表超过 20 秒未完成',
+    elapsed_ms: 20004, objects: [
+      { kind: 'table', source: 'scenic', source_id: 'src-scenic', named: [], picked: [], joined: [], missing: [], total: 51,
+        catalog_tables: 0 },
+    ] },
+  { op: 'look', id: 'L2', by: 'model', need: '各渠道上月的入园人次', status: 'ok', elapsed_ms: 420, objects: [
+    { kind: 'table', source: 'scenic', source_id: 'src-scenic', named: ['visits', 'channels'], picked: [], joined: [], missing: [],
+      total: 51, catalog_tables: 0 },
   ] },
   { op: 'plan', summary: '先查表结构，再取数' },
   { op: 'add_node', node: { id: 's', type: 'tool', label: '查看表结构' } },
   { op: 'add_node', node: { id: 'o', type: 'output', label: '成果' } },
   { op: 'done', explanation: '两步' },
   { op: 'final', graph: { nodes: [{ id: 's' }, { id: 'o' }] } },
+]
+
+/** 发布前修复：系统按要修的 SQL 代为查看（by=system），模型没有再看 */
+export const COPILOT_LOOK_SYSTEM = [
+  { op: 'look', id: 'L1', by: 'system', need: '修复「取数」的 SQL', status: 'ok', elapsed_ms: 120, objects: [
+    { kind: 'table', source: 'scenic', source_id: 'src-scenic', named: ['visits', 'channels', 'channel_visits'], picked: [],
+      joined: [], missing: [], total: 51, catalog_tables: 12 },
+  ] },
+  { op: 'update_node', id: 'q', config: { args: { sql: 'SELECT 1' } } },
+  { op: 'done', explanation: '改了一处' },
+]
+
+/** 应用润色：系统先查看固定的版本、模型再查看一个能力，随后问回来一句（ask）结束这一轮 */
+export const COPILOT_APP_ASK = [
+  { op: 'look', id: 'L1', by: 'system', need: '固定的工作流版本', status: 'ok', elapsed_ms: 80, objects: [
+    { kind: 'workflow_version', named: ['周销售 v7'], missing: [] },
+  ] },
+  { op: 'look', id: 'L2', by: 'model', need: '写回 ERP 的能力', status: 'ok', elapsed_ms: 60, objects: [
+    { kind: 'capability', named: ['erp_pay'], missing: ['erp_refund'] },
+  ] },
+  { op: 'app_add', parent: 'home', index: 0, component: { id: 'gmv', type: 'metric', props: { label: '销售额' } } },
+  { op: 'ask', question: '报告放在指标下面还是单独一页？' },
 ]
 
 /** Copilot 操作流：思考被心跳打断、自查修一轮没修好、模型写了不存在的节点类型 */

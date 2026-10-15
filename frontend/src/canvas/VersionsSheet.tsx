@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronLeft, History, RotateCcw, ShieldCheck } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { Archive, ChevronLeft, History, LayoutGrid, RotateCcw, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import {
@@ -8,8 +9,11 @@ import {
 import { ErrorState, Skeleton, toast } from '../components/ui'
 import { useDatasources } from '../store/catalog'
 import { formatDateTime, formatTime } from '../lib/format'
-import { CATALOG_DRIFT_TEXT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import { CATALOG_DRIFT_TEXT, VERSION_USAGE_TEXT, WORKFLOW_STATUS_LABEL, publishedLevelOf } from '../lib/terms'
+import { useAtLeast } from '../store/auth'
+import { RetiredNote, VersionUsageLine, retireBlocked, retireVersion, useVersionUsage } from './versionUsage'
 import { hintOf } from './shortcuts'
+import { newAppPath } from '../pages/apps/shared'
 import type { Edge } from '@xyflow/react'
 import type { CatalogDriftTable, CatalogVersions as CatalogVersionsRecord, GraphSpec, Workflow, WorkflowVersion } from '../types'
 
@@ -128,12 +132,29 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
                           <span title={formatDateTime(v.created_at)}>{formatTime(v.created_at)}</span>
                           {current && <span className="chip">{dirty ? '画布基于此版本' : '当前画布版本'}</span>}
                           {published && (
-                            <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}>
+                            // 按这一版自己的级别写：画布上改过之后 status 回到草稿，受管发布版照实写「受管」。老数据没记级别的
+                            // 退回看工作流当前发布版的级别
+                            <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}
+                                  data-version-published={v.level ?? publishedLevelOf(workflow)}>
                               <ShieldCheck size={9} />
-                              {WORKFLOW_STATUS_LABEL[workflow.status === 'governed' ? 'governed' : 'published']}
+                              {WORKFLOW_STATUS_LABEL[v.level ?? publishedLevelOf(workflow)]}
+                            </span>
+                          )}
+                          {!published && v.level && !v.retired_at && (
+                            <span className="chip" data-version-level={v.level}>{WORKFLOW_STATUS_LABEL[v.level]}</span>
+                          )}
+                          {v.retired_at && (
+                            <span className="chip" style={{ color: 'var(--st-waiting)' }} data-version-retired-chip="">
+                              {VERSION_USAGE_TEXT.retired}
                             </span>
                           )}
                         </span>
+                        {/* 谁、什么时候退的，退役时写的说明：列表上直接看得到，不用逐个点开 */}
+                        {v.retired_at && (
+                          <span className="mt-0.5 block">
+                            <RetiredNote by={v.retired_by} at={v.retired_at} note={v.retire_note} />
+                          </span>
+                        )}
                       </span>
                     </button>
                     {open && (
@@ -148,6 +169,9 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
                                 <CatalogVersions versions={detail.version.catalog_versions}
                                                  changes={detail.version.catalog_changes ?? []} />
                               )}
+                              <VersionLifecycle workflowId={workflow.id} version={detail.version}
+                                                current={v.version === workflow.published_version}
+                                                onRetired={() => { load(); setPicked(null) }} />
                             </>
                           )}
                       </div>
@@ -214,6 +238,49 @@ function VersionPreview({ version, target, diff, lock, onRestore }: {
 }
 
 const DIFF_COLOR = { add: 'var(--ok)', del: 'var(--err)', mod: 'var(--warn)' } as const
+
+/**
+ * 发布过的版本：被哪些应用固定、生效记录和正式运行各有多少（L4），做成应用，以及退役（A1）。草稿版本都没有，不画。
+ * 退役之后这一版不能再发起正式运行，也不能再做成应用（应用只能固定已发布且未退役的版本）；固定它的应用标「需升级」，
+ * 进行中的实例照常走完。退役的人、时间和说明写在列表那一行上，这里不再重复
+ */
+function VersionLifecycle({ workflowId, version, current, onRetired }: {
+  workflowId: string; version: WorkflowVersion; current: boolean; onRetired: () => void
+}) {
+  const navigate = useNavigate()
+  const publishedLevel = !!version.level || current
+  const usage = useVersionUsage(workflowId, publishedLevel ? version.version : null)
+  // 退役只给管理员（Q8）；关登录时所有人等同管理员。做成应用给搭建者及以上（同应用首页的「新建应用」）
+  const admin = useAtLeast('admin')
+  const builder = useAtLeast('builder')
+  if (!publishedLevel) return null
+  const blocked = retireBlocked({ current, publishedLevel, retired: !!version.retired_at, admin })
+  return (
+    <div className="mt-3 border-t pt-2 text-2xs" data-version-lifecycle={version.version}>
+      <div className="font-medium text-dim">{VERSION_USAGE_TEXT.usage}</div>
+      <div className="mt-1">
+        {usage ? <VersionUsageLine usage={usage} /> : <span className="text-faint">…</span>}
+      </div>
+      {!version.retired_at && (
+        <>
+          {builder && (
+            <button type="button" className="btn btn-sm mt-2 w-full justify-center" title={VERSION_USAGE_TEXT.makeAppHint}
+                    data-version-make-app={version.version}
+                    onClick={() => navigate(newAppPath({ workflow: workflowId, version: version.version }))}>
+              <LayoutGrid size={11} aria-hidden /> {VERSION_USAGE_TEXT.makeApp}
+            </button>
+          )}
+          <button type="button" className="btn btn-sm mt-2 w-full justify-center" disabled={!!blocked}
+                  title={blocked ?? undefined} data-version-retire={version.version}
+                  onClick={async () => { if (await retireVersion(workflowId, version.version, usage)) onRetired() }}>
+            <Archive size={11} aria-hidden /> {VERSION_USAGE_TEXT.retire}
+          </button>
+          {blocked && <div className="mt-1 text-faint">{blocked}</div>}
+        </>
+      )}
+    </div>
+  )
+}
 
 /**
  * 发布时的目录版本：这一版用到的表在发布时是数据目录的第几版，之后改过的标出来——下次从这一版发起正式运行时会

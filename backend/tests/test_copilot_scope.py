@@ -188,23 +188,16 @@ async def test_the_one_shot_generate_refuses_an_empty_scope_with_the_same_code(c
 async def test_the_one_shot_generate_honours_the_scope(client, monkeypatch, sources):
     import app.api.copilot as copilot
 
-    seen: list = []
-
-    class _OneShot:
-        def with_structured_output(self, *_a, **_k):
-            return self
-
-        async def ainvoke(self, messages):
-            seen.append(messages)
-            return {"nodes": [], "edges": []}
+    # 非流式的 /generate 和流式走同一个生成过程（copilot_gen）：模型按操作流回答
+    model = _Scripted([{"op": "reply", "text": "好"}])
 
     async def _model(*_a, **_k):
-        return _OneShot(), "mock-fast"
+        return model, "mock-fast"
 
     monkeypatch.setattr(copilot, "get_chat_model", _model)
     r = await client.post("/api/copilot/generate", json={
         "instruction": "订单多少", "datasource_ids": [sources["scope_shop"]],
     })
     assert r.status_code == 200, r.text
-    system = next(t for role, t in seen[0] if role == "system")
+    system = model.systems[0]
     assert "db_query__scope_shop" in system and "db_query__scope_sales" not in system

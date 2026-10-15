@@ -613,12 +613,13 @@ async def _query_input(item: dict[str, Any], sources: _Sources, aliases: dict[st
         return {}, f"输入 {item['path']} 取的是一整段查询结果，盲算只能复核单个格子"
     if item["path"] not in tops:
         return {}, f"输入 {item['path']} 决定取哪一格，不能单独复算"
-    value = cell_value(item.get("value"))
-    if not _number(value):
-        return {}, f"输入 {item['path']} 不是数值"
+    # 先认遮罩、再认是不是数：遮罩列上的号码、名称多半是文本，说「不是数值」会让审核人以为改成数就能复算
     hidden = await sources.hidden(artifact)
     if column.lower() in hidden:
         return {}, f"输入 {item['path']} 取自设置了遮罩的列，不能用于复算"
+    value = cell_value(item.get("value"))
+    if not _number(value):
+        return {}, f"输入 {item['path']} 不是数值"
     found = await sources.source(source)
     derived = derived_columns(snap, set(hidden), found.kind if found is not None else None) if hidden else None
     if derived and column.lower() in derived:

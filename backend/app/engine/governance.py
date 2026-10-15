@@ -5,9 +5,10 @@ from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any, Callable
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.engine.issuance import metrics_only
 from app.engine.labels import contract_label, field_label, judge_label, option_label, q
 from app.engine.schema import (
     CLAIMS_JUDGE,
@@ -15,6 +16,7 @@ from app.engine.schema import (
     GraphSpec,
     NodeType,
     ValidationResult,
+    _ancestors,
     _caliber_inputs,
     claims_problem,
     contract_needs_metrics,
@@ -28,6 +30,23 @@ from app.engine.schema import (
 UPGRADE_POLICIES = {"recompute", "dual", "incomparable"}
 
 UPGRADE_POLICY_LABELS = {k: option_label("upgrade_policy", k) for k in ("recompute", "dual", "incomparable")}
+
+#: 发布门禁的扩展检查（应用平台 §3.13）：各包把自己的检查登记在这里，不改下面的主循环。
+#: 每个检查的签名：check(spec, flag, *, level, strict) -> None，flag 同 lint_for_publish 里的那个
+#: （message, code=, node_id=, hard=, field=）。登记见 engine/lint_process.py、engine/lint_capabilities.py
+EXTRA_LINTS: list[Callable[..., None]] = []
+
+
+def _load_extra_lints() -> None:
+    """导入各包的检查模块（它们导入时把自己登记进 EXTRA_LINTS）。还没建的模块跳过。"""
+    import importlib
+
+    for name in ("app.engine.lint_process", "app.engine.lint_capabilities"):
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError as e:
+            if e.name != name:
+                raise
 
 
 def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any] | None = None,
@@ -52,8 +71,9 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
     strict = level == "governed"
 
     def flag(message: str, *, code: str, node_id: str | None = None, hard: bool = False,
-             field: str | None = None, sql_level: str | None = None) -> None:
-        result.add(message, level="error" if (hard and strict) else "warning", node_id=node_id,
+             field: str | None = None, sql_level: str | None = None, always: bool = False) -> None:
+        # always：各级都报错（§3.13 的 action.write_in_agent、action.prod_missing），不只受管级
+        result.add(message, level="error" if (always or (hard and strict)) else "warning", node_id=node_id,
                    field=field, code=code, sql_level=sql_level)
 
     has_contract_output = False
@@ -110,6 +130,9 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
 
     _lint_evidence(spec, flag, strict=strict)
     _lint_sql(spec, flag, checkers)
+    _load_extra_lints()
+    for check in EXTRA_LINTS:
+        check(spec, flag, level=level, strict=strict)
     if providers is not None:
         from app.engine.provider_refs import issues as provider_issues
 
@@ -214,10 +237,16 @@ def _lint_contract(
     # 引用模式（report_from）核对的是报告撰写节点产出的文档，数字回指靠文档里的引用标记，
     # 用不上 narrative。report_from 指错了（不是报告撰写节点、不在出口上游）由 validate_graph
     # 报 error（contract.report_from_invalid），发布时两者一起过，照样挡住
-    if contract.get("report_from") in (None, "") and not str(contract.get("narrative") or "").strip():
+    # 只写了「指标来自」、上游没有报告撰写节点的是指标出具（纯指标看板，board_only）：出具的就是指标本身，核对成果字段
+    # 里的数和指标的出处，不缺核对。上游有报告的照旧要指明核哪一份——不然报告的正文没人核
+    by_metrics = board_only(contract, spec, node_id)
+    if contract.get("report_from") in (None, "") and not str(contract.get("narrative") or "").strip() \
+            and not by_metrics:
         flag("出具契约既没有设置「报告来自」（核对哪个「报告撰写」节点的文档），也没有填写「叙述」，"
-             "不会执行数字核对", code="contract.report_from_missing", node_id=node_id, hard=True,
-             field="contract.report_from")
+             "不会执行数字核对" + ("" if sources else "；纯指标看板请设置「指标来自」，按指标出具"),
+             code="contract.report_from_missing", node_id=node_id, hard=True, field="contract.report_from")
+    if strict and by_metrics:
+        _lint_metric_lineage(spec, sources, flag, node_id=node_id)
 
     # 引用模式下整张图没有口径卡（只引查询单元格的问数据图）：没有指标可列，strict + cells 已经保证
     # 每个数点得开出处、对不上就不予出具（用户 2026-09-29 拍板）。有口径卡的照旧要列必需指标——
@@ -519,6 +548,43 @@ def _card_feeders(graph: _Graph, card: GraphNode) -> list[GraphNode]:
     return list(out.values())
 
 
+def board_only(contract: Any, spec: GraphSpec, exit_id: str) -> bool:
+    """按指标出具（纯指标看板）：契约只写了「指标来自」（issuance.metrics_only），成果上游没有报告撰写节点，成果字段里也
+    没有模型写的话。有报告的，报告正文要按引用核对；有模型写的话的，那就是叙述——两种都不能因为契约少写了一样就改成
+    只核指标。门禁和成果节点（nodes/io）用这一处。"""
+    if not metrics_only(contract):
+        return False
+    nodes = spec.node_map()
+    exit_node = nodes.get(exit_id)
+    if exit_node is None or any(nodes[a].type == NodeType.REPORT for a in _ancestors(spec, exit_id) if a in nodes):
+        return False
+    return not exit_text_fields(spec, exit_node)
+
+
+def _lint_metric_lineage(spec: GraphSpec, sources: list[str], flag: Callable[..., None], *, node_id: str) -> None:
+    """受管级别按指标出具：每个指标的输入都要追到原始数据（查询快照的格、运行输入），静态地按 engine/lineage 认。
+    没有叙述可核，指标的出处就是出具的全部依据；追不到的那一个，「完整出具」这一档就没有根据。"""
+    from app.engine.lineage import static_stops
+
+    nodes = {n.id: {"type": str(n.type), "title": n.title, "config": n.config} for n in spec.nodes}
+    for card_id in sources:
+        card = nodes.get(card_id)
+        if card is None or card["type"] != str(NodeType.METRICS):
+            continue
+        for metric in card["config"].get("metrics") or []:
+            if not isinstance(metric, dict) or not metric.get("expression"):
+                continue
+            stops = static_stops(nodes, str(metric["expression"]))
+            if not stops:
+                continue
+            where = "、".join(dict.fromkeys(
+                f"{s.path}（停在「{nodes[s.node_id]['title']}」）" if s.node_id in nodes else s.path for s in stops[:3]))
+            flag(f"受管级别按指标出具时，每个指标都要追到原始数据：口径卡「{card['title']}」的指标"
+                 f"「{metric.get('name') or metric.get('id')}」的输入 {where} 没追到。"
+                 "请在口径卡里用 cell() 按格取数，或让数据整形只原样解析调用工具节点的结果",
+                 code="governed.metric_untraced", node_id=card_id, hard=True, field="metrics")
+
+
 def _lint_evidence(spec: GraphSpec, flag: Callable[..., None], *, strict: bool) -> None:
     graph = _Graph(spec)
     outputs = [n for n in spec.nodes if n.type == NodeType.OUTPUT]
@@ -619,7 +685,7 @@ async def unresolved_caliber_upgrades(
     返回 (阻断性错误, 需记录的升版事件)。有新版本但没声明 upgrade_policy
     的直接阻断 formal 启动 —— 这是"被迫处置"，不是提醒。
     """
-    from app.db.models import WorkflowVersion
+    from app.apps.versions import latest_published
 
     errors: list[str] = []
     events: list[dict[str, Any]] = []
@@ -638,13 +704,9 @@ async def unresolved_caliber_upgrades(
             continue
         if not pinned or not wf_id or not str(pinned).isdigit():
             continue
-        latest = (
-            await session.execute(
-                select(func.max(WorkflowVersion.version)).where(
-                    WorkflowVersion.workflow_id == wf_id
-                )
-            )
-        ).scalar()
+        # 只看已发布且未退役的版本（F3）：工作流每保存一次就留一个快照，上游改一下画布不算升版，不该逼下游处置
+        newest = await latest_published(session, str(wf_id))
+        latest = newest.version if newest is not None else None
         if latest is None or latest <= int(pinned):
             continue
         policy = node.config.get("upgrade_policy")

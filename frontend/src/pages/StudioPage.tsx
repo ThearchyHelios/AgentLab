@@ -29,7 +29,7 @@ import {
 import { isNetworkError } from '../lib/errors'
 import { formatClock } from '../lib/format'
 import { formatShortcut, isTypingTarget, matchShortcut } from '../lib/keys'
-import { WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import { VERSION_LABEL_TEXT, WORKFLOW_STATUS_LABEL, publishedLevelOf } from '../lib/terms'
 import type { Workflow } from '../types'
 
 // 三栏的收起状态存在这台浏览器里。读写都可能抛（隐私模式、存储被禁），抛了就用默认值
@@ -306,6 +306,22 @@ export function StudioPage() {
     setDock('problems')
     void useStudio.getState().previewUpgrade()
   }, [upgradeParam, workflow, workflowId, setParams, location.key])
+
+  // ?publish=1：问数据回答上点「做成应用」，提取出工作流后跳过来（A8）。图打开之后直接打开发布弹窗，发布成功的提示里
+  // 再点「做成应用」进应用编辑。读完就摘掉，理由同上。有未保存的修改时不打开（发布按钮本来也要求先保存）
+  const publishParam = params.get('publish')
+  const publishAsked = useRef<string | null>(null)
+  useEffect(() => {
+    if (publishParam !== '1' || !workflow || workflow.id !== workflowId) return
+    if (publishAsked.current === location.key) return
+    publishAsked.current = location.key
+    setParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.delete('publish')
+      return next
+    }, { replace: true })
+    if (!useStudio.getState().dirty) setPublishing(true)
+  }, [publishParam, workflow, workflowId, setParams, location.key])
 
   // 开始跑图或生成时，属性面板让开——不然进展发生在一块被盖住的地方。
   // （选中节点即滑出属性面板，取消选中即收起，不再需要手动切 tab）
@@ -777,22 +793,32 @@ function VersionLabel({ workflow: w }: { workflow: Workflow }) {
   // 画布就是已发布的那一版才算「在线」。老数据里有状态还挂着受管、版本却已经往前走了的
   // （旧的 restore 接口不退回草稿），那也得说清画布是草稿
   const live = (w.status === 'governed' || w.status === 'published') && p === w.version
-  const ahead = p != null ? w.version - p : 0
-  const pubWord = WORKFLOW_STATUS_LABEL[w.status === 'governed' ? 'governed' : 'published']
+  // 撤回改动后保存出来的新版本：版本号大了，内容和发布版一样（服务端按图哈希比），不算「领先」
+  const same = !live && p != null && !!w.same_as_published
+  const ahead = p != null && !same ? w.version - p : 0
+  // 当前发布版的级别看 published_level：画布上改过之后 status 回到草稿，受管发布版照实写「受管」
+  const governed = publishedLevelOf(w) === 'governed'
+  const pubWord = WORKFLOW_STATUS_LABEL[publishedLevelOf(w)]
   const pubText = p != null ? `${pubWord} v${p}` : ''
   const title = [
-    live ? `画布与${pubText}一致` : `画布是草稿 v${w.version}`,
-    p != null && !live ? `正式运行使用已发布的 v${p}${ahead > 0 ? `，画布领先 ${ahead} 版` : ''}` : '',
+    live ? `画布与${pubText}一致` : `画布是草稿 v${w.version}${same ? `，${VERSION_LABEL_TEXT.sameAsPublished(p)}` : ''}`,
+    p != null && !live ? `正式运行使用${pubWord}的 v${p}${ahead > 0 ? `，画布领先 ${ahead} 版` : ''}` : '',
     p == null ? '尚未发布，只能发起探索运行' : '',
     w.published_by ? `发布人：${w.published_by}` : '',
   ].filter(Boolean).join('\n')
   return (
-    <span className="flex shrink-0 items-center overflow-hidden rounded-full border text-2xs leading-5" title={title}>
-      {!live && <span className="tnum px-2 text-dim">草稿 v{w.version}</span>}
+    <span className="flex shrink-0 items-center overflow-hidden rounded-full border text-2xs leading-5" title={title}
+          data-version-label="" data-same-as-published={same || undefined}>
+      {!live && (
+        <span className="tnum px-2 text-dim">
+          草稿 v{w.version}
+          {same && <span className="text-faint @max-[1120px]:hidden">（{VERSION_LABEL_TEXT.sameAsPublished(p)}）</span>}
+        </span>
+      )}
       {/* 最窄的工具栏里画布不是已发布那一版时只留「草稿 vN」：已发布的版本号在正式运行按钮上 */}
       {p != null && (
         <span className={clsx('tnum flex items-center gap-1 px-2', !live && 'border-l @max-[760px]:hidden')}
-              style={{ color: 'var(--ok)', ...(w.status === 'governed' ? { background: 'var(--st-done-soft)' } : {}) }}>
+              style={{ color: 'var(--ok)', ...(governed ? { background: 'var(--st-done-soft)' } : {}) }}>
           {/* 工具栏窄了只留盾牌和版本号，字留给读屏（全文在 title 里） */}
           <ShieldCheck size={10} /> <span><span className="@max-[880px]:sr-only">{pubWord} </span>v{p}</span>
           {!live && ahead > 0 && <span className="text-faint @max-[1120px]:hidden">（领先 {ahead} 版）</span>}

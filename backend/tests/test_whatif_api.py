@@ -597,32 +597,40 @@ async def test_excluding_rows_of_an_old_run_never_says_unchanged(client, monkeyp
 
 async def test_only_inputs_computed_after_the_snapshot_came_back_are_doubted(client, monkeypatch):
     """写在查询之前的容器（early）排除行影响不到它；查询之后才算出来、又对不上任何快照的（late）说不准。
-    按位置取自整份结果的一格（vars.res.rows[0][2]）同样说不准：排除第 0 行后它取到的是另一行。"""
+
+    按位置取自整份结果的一格分两种：数据整形只是原样解析查询结果的（vars.res，模板整串就是 {{ nodes.fetch }}），那一格
+    卡上记成快照的第 0 行，和 cell() 一样——排除第 0 行，这个指标就照实说那一行已排除、算不出；模板带了过滤器的
+    （vars.raw）不算原样解析，认不出是快照的哪一行，说不准：排除第 0 行后它取到的是另一行。"""
     metrics = [
         {"id": "m_early", "name": "加早", "decimals": 1, "expression": f"round({AMOUNT5} + sum(vars.early.items), 1)"},
         {"id": "m_late", "name": "加晚", "decimals": 1, "expression": f"round({AMOUNT5} + sum(vars.late.items), 1)"},
         {"id": "first", "name": "首单占比", "decimals": 2,
          "expression": "round(vars.res.rows[0][2] / len(vars.res.rows), 2)"},
+        {"id": "first_raw", "name": "首单占比（过滤器）", "decimals": 2,
+         "expression": "round(vars.raw.rows[0][2] / len(vars.raw.rows), 2)"},
     ]
     row = await run_graph(monkeypatch, chain(
         node("start", "input"),
         node("early_n", "transform", mode="expression", expression="{'items': [1.5, 2.5]}", assign_to="early"),
         node("fetch", "tool", tool="db_query__shop", args={"sql": SQL}),
         node("parse", "transform", mode="json", template="{{ nodes.fetch }}", assign_to="res"),
+        node("parse_raw", "transform", mode="json", template="{{ nodes.fetch | trim }}", assign_to="raw"),
         node("late_n", "transform", mode="expression", expression="{'items': [1.5, 2.5]}", assign_to="late"),
         node("card", "metrics", caliber="推演口径", metrics=metrics),
         node("write", "report", instructions="写周报", on_violation="flag"),
         node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}])),
-        text="加早 [[m:m_early]]，加晚 [[m:m_late]]，首单占比 [[m:first]]。")
+        text="加早 [[m:m_early]]，加晚 [[m:m_late]]，首单占比 [[m:first]]，[[m:first_raw]]。")
     snapshot = await snapshot_of(row.id)
     assert [(m, s, new == old) for _, m, s, new, old in await faithful(row.id)] == [
-        ("m_early", "ok", True), ("m_late", "ok", True), ("first", "ok", True)]
+        ("m_early", "ok", True), ("m_late", "ok", True), ("first", "ok", True), ("first_raw", "ok", True)]
     metrics = by_id(await whatif(client, row.id, {"card": "card", "overrides": {"exclude_rows": {snapshot: [0]}}}))
     assert metrics["m_early"]["status"] == "unchanged" and metrics["m_early"]["changed"] is False
     assert metrics["m_late"]["status"] == "unsupported" and "vars.late.items" in metrics["m_late"]["reason"]
     assert "对不上任何查询快照" in metrics["m_late"]["reason"]
-    assert metrics["first"]["status"] == "unsupported" and metrics["first"]["new"] is None
-    assert "vars.res.rows[0][2]" in metrics["first"]["reason"]
+    assert metrics["first"]["status"] == "excluded" and metrics["first"]["new"] is None
+    assert "vars.res.rows[0][2] 所在的第 1 行已排除" in metrics["first"]["reason"], metrics["first"]["reason"]
+    assert metrics["first_raw"]["status"] == "unsupported" and metrics["first_raw"]["new"] is None
+    assert "vars.raw.rows[0][2]" in metrics["first_raw"]["reason"]
 
 
 # --------------------------------------------------------------------------

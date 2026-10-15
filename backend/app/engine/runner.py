@@ -27,6 +27,7 @@ from app.engine.context import NodeError, RunContext
 from app.engine.deadline import segment
 from app.engine.replay import PROTOCOL, PROTOCOL_KEY, protocol_of
 from app.engine.schema import GraphSpec, NodeType, loop_steps, topology_of, validate_graph
+from app.process.actions import ActionPending
 from app.tools.datasource import RUN_VERSIONS_KEY
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,19 @@ _EPHEMERAL = {EventType.LLM_TOKEN, EventType.LLM_THINKING_DELTA}
 #: RunContext.extra 里放这次运行的选项（Run.options）的键。节点从这里读发起时定下的快照、不读设置的
 #: 当前值：审批停下期间改了设置，恢复后的那一段也按发起时的，重放和正式运行才可复现
 RUN_OPTIONS_KEY = "run_options"
+
+
+#: 接着跑被拒的机器码：正式运行带图（F2），有结果未知、还没核实的写入
+FORMAL_GRAPH_LOCKED = "formal_graph_locked"
+ACTION_UNRESOLVED = "action_unresolved"
+
+
+class ContinueRefused(ValueError):
+    """接着跑被拒、带机器码的那几种。是 ValueError：老调用方按 ValueError 接（409）照旧成立。"""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class RunManager:
@@ -195,8 +209,14 @@ class RunManager:
         options: dict[str, Any] | None = None,
         schedule_id: str | None = None,
         notes: Sequence[tuple[EventType | str, str | None, dict[str, Any]]] = (),
+        origin_kind: str | None = None,
+        origin: dict[str, Any] | None = None,
+        app_id: str | None = None,
+        app_version: int | None = None,
     ) -> Run:
         """建运行记录、交给执行任务。options 是这次运行的选项快照，schedule_id 是发起它的定时任务（可空）。
+        origin_kind / origin / app_id / app_version 是运行来源（engine/origin.py），由 launch_run 定下，原样记在运行上；
+        对应的 run.origin 事件由 launch_run 放进 notes。
 
         notes 是发起时就定下的事件 (类型, node_id, 数据)，比如正式运行按什么级别出具、口径升版怎么处置。它们和
         运行记录同一个事务提交，排在 run.started 前面：写不进去就不建运行，不会出现运行已经在执行、调用方却
@@ -242,6 +262,10 @@ class RunManager:
                     data_versions=data_versions,
                     options=options,
                     schedule_id=schedule_id,
+                    origin_kind=origin_kind,
+                    origin=origin,
+                    app_id=app_id,
+                    app_version=app_version,
                 )
                 run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
                 session.add(run)
@@ -462,7 +486,13 @@ class RunManager:
 
         服务重启挂起的运行（interrupted 且没有待审批）也走这里：它没有在等谁，
         断点完好，从断点驱动和失败后接着跑是同一件事。界面上两者都叫「接着跑」。
+
+        正式运行不能带图接着跑（F2）：它钉的是发布的不可变版本、按 graph_hash 核对，换一张图接着跑，运行就不再等于它
+        钉住的那一版，而 version_hash 照旧写着那一版。接着跑也不改发起人：接着跑的人记在 run.resumed 里。
+        写外部系统结果未知、还没核实的（app/process/actions.py）也不能接着跑：核实之后系统会自动接着跑。
         """
+        from app.process.actions import unresolved_action
+
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
             if not run:
@@ -474,6 +504,14 @@ class RunManager:
             )).first() is not None
             if not (run.status == "failed" or (run.status == "interrupted" and not has_pending)):
                 raise ValueError(_cannot_continue(run.status, has_pending))
+            if graph is not None and run.run_class == "formal":
+                raise ContinueRefused(
+                    "正式运行固定在发布的版本上，不能修改配置后继续运行。如需修改，请在画布上修改并发布新版本后重新发起",
+                    code=FORMAL_GRAPH_LOCKED)
+            if run.status == "interrupted" and await unresolved_action(session, run_id):
+                raise ContinueRefused(
+                    "这次运行有一次写入外部系统的结果未知，正在等待核实；核实之后运行会自动继续，无需手动继续运行",
+                    code=ACTION_UNRESOLVED)
             observed = run.status
             spec = GraphSpec.model_validate(run.graph)
             workflow_id = run.workflow_id
@@ -500,6 +538,10 @@ class RunManager:
         snapshot = await app.aget_state(config)
         pending = [str(n) for n in (getattr(snapshot, "next", None) or [])]
         if not pending:
+            # 停在审批上、批了之后才失败的节点（动作确认之后结果未知、工具批准之后执行出错）：LangGraph 的 next 里
+            # 没有它（答复的写入挂在它身上），可断点完好，从断点驱动会重新执行它、审批的答复取自断点
+            pending = [str(t.name) for t in getattr(snapshot, "tasks", None) or () if getattr(t, "error", None)]
+        if not pending:
             raise ValueError(
                 "这次运行没有可继续的断点，可能在执行第一个节点前就已中断。请重新发起运行。"
             )
@@ -515,8 +557,7 @@ class RunManager:
             # 可能已经先动了它
             await _claim(session, run_id, (observed,),
                               lambda status: _cannot_continue(status, False),
-                              **({"graph": spec.model_dump(mode="json")} if graph is not None else {}),
-                              **({"started_by": actor} if actor else {}))
+                              **({"graph": spec.model_dump(mode="json")} if graph is not None else {}))
             run = await session.get(Run, run_id)
             bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             await session.commit()
@@ -640,6 +681,8 @@ class RunManager:
         #: 终态事件（run.failed / run.cancelled）等 _finalize 算完耗时再发，timing 才带得上
         terminal: tuple[EventType, dict[str, Any]] | None = None
         error_node: str | None = None
+        #: 结果未知、挂起等核实的动作（ActionPending），收尾之后发 action.unknown、安排核实
+        pending_action: str | None = None
 
         deadline: asyncio.Timeout | None = None
         # 停在审批上的那一刻：这一段的执行算到这里为止。后面写审批记录、发 run.interrupted 是收尾，
@@ -752,6 +795,12 @@ class RunManager:
                     error = "用户取消"
                     terminal = (EventType.RUN_CANCELLED, {"actor": self._stopped_by.pop(run_id, None)})
                 raise
+            except ActionPending as e:
+                # 写外部系统的结果未知（app/process/actions.py）：不在节点里等，运行收成挂起、不封存，等核实之后
+                # 由系统接着跑。节点重新执行时先查生效记录，已生效的交回回执、未知的照旧挂起，不会重发
+                status = "interrupted"
+                error = str(e)
+                pending_action = e.action_id
             except TimeoutError as e:
                 status = "failed"
                 if deadline is not None and deadline.expired():
@@ -796,6 +845,13 @@ class RunManager:
                     self._finalizing.discard(run_id)
                     self._tasks.pop(run_id, None)
                     self._stopped_by.pop(run_id, None)
+                if pending_action is not None:
+                    from app.process.actions import on_unknown
+
+                    try:
+                        await on_unknown(pending_action)
+                    except Exception:  # noqa: BLE001 - 运行已经收成挂起；没安排上的核实，下次启动时 actions.startup 补上
+                        logger.exception("run %s 的动作 %s 结果未知，安排核实时出错", run_id, pending_action)
                 # 运行到终态就把沙箱会话收掉。thread_id 每个 run 都是新的，
                 # 不收的话每跑一次带代码节点的图就多一台常驻 microVM（几百 MB），
                 # 而且没有任何自动回收路径会碰它——闲置回收只在"下次有人执行
@@ -830,6 +886,7 @@ class RunManager:
             value = getattr(item, "value", item)
             interrupt_id = getattr(item, "id", None)
             payload = value if isinstance(value, dict) else {"value": value}
+            opened: str | None = None
             async with SessionLocal() as session:
                 existing = (
                     await session.execute(
@@ -841,17 +898,26 @@ class RunManager:
                     )
                 ).scalar_one_or_none()
                 if existing is None:
-                    session.add(
-                        Approval(
-                            run_id=run_id,
-                            node_id=str(payload.get("node_id") or ""),
-                            interrupt_id=interrupt_id,
-                            mode=str(payload.get("mode") or "approve"),
-                            title=str(payload.get("title") or "待审批"),
-                            payload=payload,
-                            schema_=payload.get("schema") or {},
-                        )
+                    approval = Approval(
+                        run_id=run_id,
+                        node_id=str(payload.get("node_id") or ""),
+                        interrupt_id=interrupt_id,
+                        mode=str(payload.get("mode") or "approve"),
+                        title=str(payload.get("title") or "待审批"),
+                        payload=payload,
+                        schema_=payload.get("schema") or {},
                     )
+                    session.add(approval)
+                    await session.flush()
+                    # 同一次中断给人的那一面（app/process/tasks.py）：和 Approval 同一个事务，有审批就有待办。
+                    # 开待办出了错不能连审批一起丢——运行确实停在这里等人；下次启动时按「派给任何人」补建
+                    try:
+                        async with session.begin_nested():
+                            from app.process.tasks import open_task
+
+                            opened = (await open_task(session, approval)).id
+                    except Exception:  # noqa: BLE001
+                        logger.exception("run %s 的审批 %s 没能开出待办，启动时会补建", run_id, approval.id)
                     await session.commit()
             await self._emit(
                 run_id,
@@ -859,6 +925,10 @@ class RunManager:
                 node_id=payload.get("node_id"),
                 data={"interrupt_id": interrupt_id, "payload": _safe(payload)},
             )
+            if opened:
+                from app.process.tasks import announce
+
+                await announce(opened)
         return True
 
     async def _finalize(
@@ -884,9 +954,11 @@ class RunManager:
         # 会读到半截——以前先提交状态，前一种偶尔翻不到；反过来先落事件，后一种
         # 每次都读到 running 和空的 output
         event: RunEventModel | None = None
+        app_id: str | None = None
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
             if run:
+                app_id = run.app_id
                 timing = await _timing(session, run, elapsed_ms, now)
                 events_usage = await _usage_of_events(session, run_id)
                 inquiry = events_usage.pop("inquiry", None)
@@ -949,6 +1021,11 @@ class RunManager:
             # 关停时挂起的也要让在线的客户端收尾：进程马上就没了，不说一声，
             # 界面会一直以为它还在跑
             await bus.close(run_id)
+        if app_id and status in ("succeeded", "failed"):
+            # 应用实例结束、失败：按应用订阅推送（app/notify/service.py）。放到后台，接收端慢不拖着收尾
+            from app.notify.service import notify_run, spawn
+
+            spawn(notify_run(run_id, "run.finished" if status == "succeeded" else "run.failed"))
 
     async def _seal(self, run_id: str) -> None:
         """对到此为止的全部事件算清单哈希，记下封到了哪一条。"""
@@ -1233,6 +1310,10 @@ async def _stale_replay(run_id: str, spec: GraphSpec, snapshot: Any) -> str | No
     「断点之后」按 checkpoint 的写入时刻算：同一个 superstep 里恢复不会写新的 checkpoint，
     所以升级后恢复过一次的运行，断点仍是旧版写的，而那之后的工作是新版做的——
     哪一段是哪一版，看那一段 run.started 里记的 replay_protocol。
+
+    只多豁免一种（应用平台 A4 第 9 条）：调用工具节点在断点之后的每一条 tool.start 都带 action_key——这是写入动作，
+    发送前一定先按 action_key 查生效记录（app/process/actions.py），已生效的交回回执、已发出的转核实，重复执行由数据库
+    挡住，task 的位置错开也不会重发。一条 tool.start 都没有的不算（说不清它是不是写入节点），照旧拒绝。
     """
     if protocol_of(getattr(snapshot, "metadata", None)) >= PROTOCOL:
         return None
@@ -1253,6 +1334,7 @@ async def _stale_replay(run_id: str, spec: GraphSpec, snapshot: Any) -> str | No
             .order_by(RunEvent.seq)
         )).all()
     protocol = 1
+    done: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for kind, owner, ts, data in rows:
         if kind == EventType.RUN_STARTED:
             protocol = protocol_of({PROTOCOL_KEY: (data or {}).get("replay_protocol")})
@@ -1261,7 +1343,12 @@ async def _stale_replay(run_id: str, spec: GraphSpec, snapshot: Any) -> str | No
             continue
         for node_id in suspects:
             if owner == node_id or (owner or "").startswith(f"{node_id}/"):
-                return nodes[node_id].title or node_id
+                done.setdefault(node_id, []).append((kind, data or {}))
+    for node_id, events in done.items():
+        starts = [data for kind, data in events if kind == EventType.TOOL_START]
+        if nodes[node_id].type == NodeType.TOOL and starts and all(d.get("action_key") for d in starts):
+            continue
+        return nodes[node_id].title or node_id
     return None
 
 
@@ -1312,7 +1399,9 @@ async def _seq_floor(session: Any, run_id: str, last_seq: int | None) -> int:
 
 
 async def _close_approvals(session: Any, run_id: str, actor: str | None, now: datetime) -> int:
-    """运行已经结束，它还没处理完的审批一并关掉。返回关掉了几条。"""
+    """运行已经结束，它还没处理完的审批一并关掉，对应的待办（连同核实待办）跟着关闭。返回关掉了几条审批。"""
+    from app.process.tasks import close_for_run
+
     rows = list((await session.execute(
         select(Approval).where(Approval.run_id == run_id,
                                Approval.status.in_(["pending", "answered"]))
@@ -1321,6 +1410,7 @@ async def _close_approvals(session: Any, run_id: str, actor: str | None, now: da
         approval.status = "cancelled"
         approval.resolved_at = now
         approval.resolved_by = actor
+    await close_for_run(session, run_id, now)
     return len(rows)
 
 

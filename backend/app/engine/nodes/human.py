@@ -35,6 +35,9 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         payload["draft"] = ctx.render(ctx.cfg("draft", ""), state)
     if reports := _reviewed_reports(state, ctx):
         payload["reports"] = reports
+    # 流程配置（应用平台 §3.7）：派给谁、会签、时限、超时、表单。待办服务（app/process/tasks.py）按中断内容开待办，
+    # 不回头读图——表达式、关联键、表单来源都要按这一刻的状态算，只有节点算得出。没写这些配置的老图，中断内容和以前一字不差
+    payload.update(await _process(state, ctx))
 
     response = await ask(ctx, payload, **payload)
     # 谁批的跟着事件走：时间线要写得出"张工驳回了"，没署名就是 None，不再默认写"你"
@@ -71,6 +74,86 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if var_name:
         updates["vars"] = {var_name: result.get("value", result.get("approved"))}
     return updates
+
+
+async def _process(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
+    """人工节点的流程配置，按这一刻的状态算好，放进中断内容。
+
+    form_from 取上游 agent 拟的表单：运行时按目录校验，不合规退回节点上的静态 form，并记一条警告（P3：不挡运行）。
+    警告经 once 发：退不退回只取决于状态，重放时结果一样，task 的位置不会错开。"""
+    from app.engine.expressions import resolve_path
+    from app.engine.lint_process import normalize_policy
+
+    out: dict[str, Any] = {}
+    if assignee := await resolve_assignee(state, ctx):
+        out["assignee"] = assignee
+        if assignee["kind"] == "hook":
+            out["correlation_key"] = assignee["correlation_key"]
+    policy = normalize_policy(ctx.cfg("policy"))
+    if policy and policy["kind"] != "any":
+        out["policy"] = policy
+    if ctx.cfg("due"):
+        out["due"] = str(ctx.cfg("due"))
+    if isinstance(ctx.cfg("on_timeout"), dict) and ctx.cfg("on_timeout"):
+        out["on_timeout"] = dict(ctx.cfg("on_timeout"))
+
+    form = ctx.cfg("form") if isinstance(ctx.cfg("form"), dict) and ctx.cfg("form") else None
+    source = str(ctx.cfg("form_from") or "").strip()
+    if source:
+        candidate = resolve_path(template_context(state), source)
+        if isinstance(candidate, str):
+            try:
+                candidate = json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+        from app.apps.forms import validate_form_schema
+
+        problems = validate_form_schema(candidate) if isinstance(candidate, dict) else ["不是一个 JSON 对象"]
+        if not problems:
+            form = candidate
+        else:
+            fallback = "已改用节点上的静态表单" if form else "节点上没有静态表单，按原来的方式填写"
+            await once(ctx, EventType.LOG, level="warn", code="form_from_invalid",
+                       message=f"「{ctx.node.title}」从「{source}」取到的表单不符合组件目录（{problems[0]}），{fallback}")
+    if form:
+        out["form"] = form
+    return out
+
+
+async def resolve_assignee(state: GraphState, ctx: NodeContext) -> dict[str, Any] | None:
+    """派给谁：岗位、发起人原样交给待办服务；表达式在这里求值（只能取输入和变量），关联键在这里渲染。
+
+    表达式的结果要是用户名或组名（一个字符串，或几个字符串的列表）。算不出来时记一条警告、派给任何人：
+    不挡运行，也不猜。"""
+    value = ctx.cfg("assignee")
+    if not isinstance(value, dict) or not value.get("kind"):
+        return None
+    kind = value["kind"]
+    if kind == "slot":
+        return {"kind": "slot", "slot": str(value.get("slot") or "").strip()}
+    if kind == "initiator":
+        return {"kind": "initiator"}
+    if kind == "hook":
+        return {"kind": "hook", "correlation_key": ctx.render_str(str(value.get("correlation") or ""), state).strip()}
+    if kind == "expression":
+        from app.engine.expressions import ExpressionError, eval_expression
+
+        expr = str(value.get("expr") or "")
+        scope = {"input": state.get("input") or {}, "vars": state.get("vars") or {}}
+        try:
+            result = eval_expression(expr, scope)
+        except ExpressionError as e:
+            result, reason = None, str(e)
+        else:
+            reason = "结果不是用户名或组名"
+        names = [result] if isinstance(result, str) else result if isinstance(result, list) else []
+        names = [n.strip() for n in names if isinstance(n, str) and n.strip()]
+        if not names:
+            await once(ctx, EventType.LOG, level="warn", code="assignee_unresolved",
+                       message=f"「{ctx.node.title}」的「派给谁」表达式没有算出用户名或组名（{reason}），已派给任何人")
+            return None
+        return {"kind": "expression", "expr": expr, "names": names[:20]}
+    return None
 
 
 #: 模板里对某个节点产出的引用：{{ nodes.write.text }}、{{ vars.weekly }}
