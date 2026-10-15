@@ -93,14 +93,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         except Exception:  # noqa: BLE001
             logger.exception("上传表格的版本整理失败，服务照常启动")
 
-    # 上次没做完的数据目录起草任务：标成中断（没结束的表记停止），不自动续跑——拷来的数据目录（检查脚本、验收副本）
-    # 启动时不能替人去调模型。界面上点「重试」接着起草没写好的表
-    from app.data import catalog_jobs
+    # 上次没做完的数据目录起草、剖析任务：标成中断（没结束的表记停止），不自动续跑——拷来的数据目录（检查脚本、验收副本）
+    # 启动时不能替人去调模型、查业务库。界面上点「重试」接着做没做完的表。剖析设置里按整次剖析算的旧预算顺带迁移掉
+    from app.data import catalog_jobs, catalog_profile_jobs
 
     try:
         await catalog_jobs.startup()
     except Exception:  # noqa: BLE001
         logger.exception("数据目录起草任务的启动整理失败，服务照常启动")
+    try:
+        await catalog_profile_jobs.startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("数据剖析任务的启动整理失败，服务照常启动")
 
     await run_manager.setup()
     # 流程：存量的待审批补建待办（派给任何人，幂等）；上次进程没了时已发出、没拿到结果的写入收成结果未知、安排核实
@@ -129,9 +133,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # 先停调度，再停运行：停运行的途中不该再有新运行被发起。起草任务停下来标成中断，下次启动不会再续
+        # 先停调度，再停运行：停运行的途中不该再有新运行被发起。起草、剖析任务停下来标成中断，下次启动不会再续
         await scheduler.stop()
         await catalog_jobs.manager.shutdown()
+        await catalog_profile_jobs.manager.shutdown()
         await run_manager.shutdown()
         from app.sandbox.manager import sandbox_manager
 

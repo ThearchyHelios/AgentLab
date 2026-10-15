@@ -24,7 +24,7 @@ from app.db.models import DataSource
 from tests.fixtures.catalog import scenic, scenic_notes
 from tests.fixtures.catalog.fake_model import FakeModel
 from tests.test_catalog_patch import _schema
-from tests.test_catalog_profile import _notes, _on, _relation, _table, _url, client, make_source  # noqa: F401
+from tests.test_catalog_profile import _notes, _on, _profile, _relation, _table, client, make_source  # noqa: F401
 
 AT = "2026-10-04T08:00:00+00:00"
 DAY1, DAY2, DAY3 = "2026-10-01T08:00:00+00:00", "2026-10-02T08:00:00+00:00", "2026-10-03T08:00:00+00:00"
@@ -131,8 +131,7 @@ async def test_confirming_a_profiled_relation_by_patch_keeps_the_fanout_check(cl
     """审查探针 A1：剖析得出多对一、覆盖率 1.0，经对话提案确认这条关系之后，扇出检查照样报 error。"""
     sql = "SELECT COUNT(g.id) AS n FROM gates g JOIN visits v ON v.gate_id = g.id"
     sid = await make_source(scenic_db, options=_on(), draft=["visits", "gates"])
-    r = await client.post(_url(sid), json={"tables": ["visits"]})
-    assert r.status_code == 200, r.text
+    await _profile(client, sid, ["visits"])
     detail = await _notes(client, sid, "visits")
     rel = _relation(detail["notes"], "gate_id")
     assert (rel["source"], rel["status"], rel["cardinality"], rel["coverage"]) == (
@@ -156,8 +155,7 @@ async def test_profiled_relation_without_child_check_only_warns(client, make_sou
     核实过：扇出检查只给 warning（「可能重复计算」），不给 error、不让出具降档。"""
     sql = "SELECT COUNT(g.id) AS n FROM gates g JOIN visits v ON v.gate_id = g.id"
     sid = await make_source(scenic_db, options=_on(max_scan_rows=100), draft=["visits", "gates"])
-    r = await client.post(_url(sid), json={"tables": ["visits"]})
-    assert r.status_code == 200, r.text
+    await _profile(client, sid, ["visits"])
     rel = _relation((await _notes(client, sid, "visits"))["notes"], "gate_id")
     assert (rel["source"], rel["status"], rel["cardinality"]) == ("profile", "verified", "many_to_one")
     assert not rel.get("cardinality_checked")
@@ -359,15 +357,13 @@ def test_codes_complete_flag_is_validated_and_counts_as_an_edit():
 
 async def test_profile_marks_codes_complete_only_when_the_whole_table_was_read(client, make_source, scenic_db):
     whole = await make_source(scenic_db, options=_on(), draft=["visits"])
-    r = await client.post(_url(whole), json={"tables": ["visits"]})
-    assert r.status_code == 200, r.text
+    await _profile(client, whole, ["visits"])
     codes = (await _notes(client, whole, "visits"))["notes"]["columns"]["status"]["codes"]
     assert "统计全表" in codes["note"] and codes.get("complete") is True
 
     # 不做整表统计（只看前若干行）：取值可能没看全，不标
     capped = await make_source(scenic_db, options=_on(max_scan_rows=0, sample_size=10), draft=["visits"])
-    r = await client.post(_url(capped), json={"tables": ["visits"]})
-    assert r.status_code == 200, r.text
+    await _profile(client, capped, ["visits"])
     codes = (await _notes(client, capped, "visits"))["notes"]["columns"]["status"]["codes"]
     assert "按前 10 行统计" in codes["note"] and "complete" not in codes
 
@@ -388,10 +384,10 @@ async def test_rerun_on_another_day_with_same_data_keeps_the_version(client, mak
     assert r.status_code == 200, r.text
 
     monkeypatch.setattr(catalog, "now_iso", lambda: DAY1)
-    first = _table((await client.post(_url(sid), json={"tables": ["visits"]})).json(), "visits")
+    first = _table(await _profile(client, sid, ["visits"]), "visits")
     notes_day1 = (await _notes(client, sid, "visits"))["notes"]
     monkeypatch.setattr(catalog, "now_iso", lambda: DAY2)
-    second = _table((await client.post(_url(sid), json={"tables": ["visits"]})).json(), "visits")
+    second = _table(await _profile(client, sid, ["visits"]), "visits")
     assert (second["added"], second["updated"], second["removed"]) == (0, 0, 0)
     assert second["version"] == first["version"]
     assert (await _notes(client, sid, "visits"))["notes"] == notes_day1        # 备注里还是第一天的日期
@@ -404,7 +400,7 @@ async def test_rerun_on_another_day_with_same_data_keeps_the_version(client, mak
     finally:
         db.close()
     monkeypatch.setattr(catalog, "now_iso", lambda: DAY3)
-    third = _table((await client.post(_url(sid), json={"tables": ["visits"]})).json(), "visits")
+    third = _table(await _profile(client, sid, ["visits"]), "visits")
     assert third["version"] == second["version"] + 1 and third["updated"] >= 1
     codes = (await _notes(client, sid, "visits"))["notes"]["columns"]["status"]["codes"]
     assert set(codes["value"]) == {"0", "1", "2"} and codes["updated_at"] == DAY3
