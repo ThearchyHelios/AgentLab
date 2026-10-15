@@ -167,6 +167,25 @@ async def test_preflight_blocks_and_nothing_is_written(client, tmp_path):
     assert (await s.blueprint(bp["id"])).workflow_id is None
 
 
+async def test_a_failed_trial_blocks_the_plan(client, tmp_path):
+    """最近一次试运行失败了：挡住发布（用真数跑出了错，发布出去每次出数都是同一个错），写明出错的那一句；不再只是
+    「还没有成功的试运行」的提醒。"""
+    from sqlalchemy import update
+
+    bp = await _board_from_run(client, tmp_path)
+    async with SessionLocal() as session:
+        await session.execute(update(Run).where(Run.id == bp["last_trial_run_id"]).values(
+            status="failed", error="工具 db_query__shop 查询失败：(1049, \"Unknown database 'shop'\")\n第二行不要"))
+        await session.commit()
+    plan = (await client.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).json()
+    assert plan["ok"] is False
+    codes = {p["code"]: p for p in plan["problems"]}
+    failed = codes["plan.trial_failed"]
+    assert failed["level"] == "error" and failed["who"] == "you" and failed["plain"]["title"] == "最近一次试运行失败了"
+    assert failed["message"] == "最近一次试运行失败了：工具 db_query__shop 查询失败：(1049, \"Unknown database 'shop'\")"
+    assert "plan.untrialed" not in codes
+
+
 async def test_a_process_with_an_unbound_step_stops_at_preflight(client):
     wf_id = await s.published_workflow(s.expense_graph(), f"报销-{uuid.uuid4().hex[:4]}", description="报销审批")
     bp = (await client.post("/api/blueprints", json={"source": {"kind": "workflow_version", "id": wf_id},

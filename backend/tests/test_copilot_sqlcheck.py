@@ -292,3 +292,20 @@ async def test_upgrade_assist_checks_sql_like_the_publish_gate(scenic_source, mo
     # 改不好：整个作废，原因写的是这条 SQL 检查
     assert out["accepted"] is False and out["ok"] is False
     assert "一对多" in (out["reason"] or ""), out["reason"]
+
+
+def test_a_source_name_written_as_a_database_is_sent_back():
+    """表名前面写了数据源名（scenic.orders）：数据库把它当成库名，跑起来报库不存在；认列的检查找表时会去掉前缀，拦不住它，
+    这里单独交回模型改。数据源名恰好也是库名的不报。"""
+    from app.api.copilot import authored_issues
+
+    cache = {"schema": "main", "tables": {"orders": {"columns": [{"name": "id"}, {"name": "total_amount"}]}}}
+    source = SimpleNamespace(name="scenic", database="/data/scenic.db", schema_cache=cache)
+    sql = "SELECT SUM(o.total_amount) AS gmv FROM `scenic`.orders o WHERE o.id > '{{ input.since }}' -- from scenic.x"
+    spec = _spec(_node("start", "input"), _fetch(sql), _node("out", "output", fields=[]))
+    (issue,) = authored_issues(spec, [source])
+    assert (issue["code"], issue["level"], issue["node_id"]) == ("sql_source_prefix", "error", "fetch")
+    assert "scenic.orders" in issue["message"] and "去掉「scenic.」" in issue["for_model"]
+    # 数据源名就是库名：照写，不报
+    same = SimpleNamespace(name="scenic", database="scenic", schema_cache=cache)
+    assert all(i["code"] != "sql_source_prefix" for i in authored_issues(spec, [same]))

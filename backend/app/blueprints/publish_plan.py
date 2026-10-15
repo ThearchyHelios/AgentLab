@@ -69,6 +69,7 @@ GRANT_ROLES = ("use", "observe", "manage")
 NOT_INSTANTIATED = "plan.not_instantiated"
 GRAPH_CHANGED = "plan.graph_changed"
 UNTRIALED = "plan.untrialed"
+TRIAL_FAILED = "plan.trial_failed"
 TRIAL_DIFFERS = "plan.trial_differs"
 ADMIN_REQUIRED = "plan.admin_required"
 DOWNGRADE_ADMIN = "plan.downgrade_admin"
@@ -347,9 +348,13 @@ async def _preflight(session: AsyncSession, bp: Blueprint, target: _Target, *, l
     _, problem = await grants_problem(session, grant_items(bp))
     if problem:
         out.append(_problem(GRANT_REFUSED, problem, source="grants"))
-    # 试运行：没用真数试过、试过之后又改了，照实说（不拦）
+    # 试运行：最近一次失败了的挡住——用真数跑过、出了错，照样发布出去每次出数都是同一个错（取数 SQL 把数据源名写成了
+    # 库名这一类，2026-10 撞过）；没用真数试过、试过之后又改了，照实说（不拦）
     trial = await session.get(Run, bp.last_trial_run_id) if bp.last_trial_run_id else None
-    if not is_trial_of(trial, bp) or trial.status != "succeeded":
+    if is_trial_of(trial, bp) and trial.status == "failed":
+        why = (trial.error or "").strip().splitlines()[0][:200] if (trial.error or "").strip() else ""
+        out.append(_problem(TRIAL_FAILED, f"最近一次试运行失败了{f'：{why}' if why else ''}", source="plan"))
+    elif not is_trial_of(trial, bp) or trial.status != "succeeded":
         out.append(_problem(UNTRIALED, "还没有成功的试运行：发布之前没用真数看过结果", "warning", source="plan"))
     elif graph_hash(trial.graph or {}) != target.digest:
         out.append(_problem(TRIAL_DIFFERS, "发布的内容和最近一次试运行不同：试运行之后又改过", "warning", source="plan"))

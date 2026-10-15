@@ -1248,6 +1248,8 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
 
     - sql_unknown_column：调用工具节点的 SQL 里有数据源结构（schema_cache）里查不到的列——凭空
       猜的列名跑起来只会「no such column」，还白跑前面的步骤
+    - sql_source_prefix：表名前面写了数据源名（sql_source_prefix）——数据源名被数据库当成库名，跑起来报库不存在；
+      认列的检查按表名找表时会去掉前缀，拦不住它
     - parse_model_text：整形节点按 JSON 解析 agent / llm 写的文字（validate 里只是 warning：旧图照跑）
     - report_no_source：报告撰写节点的上游没有任何证据来源（运行时只给一条警告，报告里的数全没有出处）。
       metrics_from 指向不是口径卡的节点，validate 本来就报 error，自查照样交回去
@@ -1277,6 +1279,16 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
         sql = args.get("sql") if isinstance(args, dict) else None
         if source is None or not str(node.config.get("tool") or "").startswith("db_query__") \
                 or not isinstance(sql, str):
+            continue
+        if prefixed := sql_source_prefix(sql, source):
+            name, bare = source.name, prefixed[0].split(".", 1)[1]
+            out.append({"level": "error", "node_id": node.id, "edge_id": None, "field": "args.sql",
+                        "code": "sql_source_prefix",
+                        "message": f"SQL 里的表 {'、'.join(prefixed[:5])} 前面写了数据源名「{name}」：数据库会把它当成库名，"
+                                   f"运行时报库不存在。去掉「{name}.」，表名照表结构写（如 {bare}）",
+                        "for_model": f"SQL 里的表 {'、'.join(prefixed[:5])} 前面写了数据源名「{name}」。工具 db_query__{name} "
+                                     f"已经连到这个数据源，数据库里没有叫「{name}」的库或 schema，这样写跑起来会报库不存在。"
+                                     f"去掉「{name}.」，表名照表结构里的写（如 {bare}）"})
             continue
         found = sql_unknown_columns(sql, source)
         if not found:
@@ -1405,6 +1417,29 @@ def _blank_unicode_identifiers(sql: str) -> str:
         else:
             out.append(token.text)
     return "".join(out)
+
+
+def sql_source_prefix(sql: str, source: Any) -> list[str]:
+    """SQL 里 FROM / JOIN 后面写成「数据源名.表名」的表（去重、按出现顺序）。
+
+    数据源名是在 AgentLab 里给连接起的名字，不是库名、schema：取数工具 db_query__<数据源名> 已经连到这个数据源，再写
+    前缀，数据库会把它当成库名（MySQL 的 Unknown database、SQLite 的 unknown database、PostgreSQL 的 schema 不存在）。
+    认列的检查（introspect.find_table）找表时会去掉前缀，拦不住它。数据源名恰好也是库名、schema 的不算：连接里填的库、
+    探查的 schema、候选 schema、表结构里本来就带这个前缀的表。"""
+    from app.data.guard import _blank_quoted, strip_comments
+
+    name = str(getattr(source, "name", "") or "")
+    if not name:
+        return []
+    cache = getattr(source, "schema_cache", None) or {}
+    real = {str(x).lower() for x in (getattr(source, "database", None), cache.get("schema"),
+                                     *(cache.get("available_schemas") or [])) if x}
+    if name.lower() in real or any(str(t).lower().startswith(f"{name.lower()}.") for t in cache.get("tables") or {}):
+        return []
+    # 抹掉注释、模板写法和字符串，带引号的标识符留着（`shop`.`orders` 一样要认）
+    text = _blank_quoted(re.sub(r"\{\{.*?\}\}", " 0 ", strip_comments(sql), flags=re.S), identifiers=False)
+    pattern = re.compile(rf"\b(?:from|join)\s+[`\"\[]?{re.escape(name)}[`\"\]]?\s*\.\s*[`\"\[]?([^\s`\"\[\].,()]+)", re.I)
+    return list(dict.fromkeys(f"{name}.{m.group(1)}" for m in pattern.finditer(text)))
 
 
 def sql_unknown_columns(sql: str, source: Any) -> tuple[list[str], list[str]] | None:

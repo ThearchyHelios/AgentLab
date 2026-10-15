@@ -36,7 +36,8 @@ START = "start"
 # ==========================================================================
 
 SQL_BRIEF_HEAD_PROMPT = ("取数节点 {node}（工具 db_query__{source}）：写一条只读 SQL（只能 SELECT，一条语句），结果{shape}。"
-                         "{period}")
+                         "这个工具已经连到数据源「{source}」：表名照下面写的（就是这个数据源里的表名），前面不要加「{source}.」，"
+                         "数据库里没有叫这个名字的库。{period}")
 SQL_PERIOD_PROMPT = ("统计期用入口字段：从 '{{ input.period_start }}' 到 '{{ input.period_end }}'（日期，含两端，"
                      "写在 SQL 里要带单引号）。")
 SQL_ONE_ROW_PROMPT = "只出一行，每个要算的数一列（或者算它要用的基础量各一列），列名用英文小写和下划线"
@@ -598,7 +599,9 @@ def item_brief(item: dict[str, Any]) -> str:
 
     return SQL_ITEM_PROMPT.format(
         label=value(item.get("label")) or item["id"], id=item["id"], unit=f"，单位 {unit}" if unit else "",
-        measure=text("measure"), table=f"{table.get('source')}.{table.get('table')}" if table else UNKNOWN_PROMPT,
+        # 只写数据源里的表名（多 schema 的库，目录里的名字本身带 schema 前缀）：以前写成「数据源名.表名」，模型照抄进 SQL，
+        # 数据源名被数据库当成库名，跑起来报库不存在
+        measure=text("measure"), table=str(table.get("table") or UNKNOWN_PROMPT) if table else UNKNOWN_PROMPT,
         date=(f"{date.get('column')}" + (f"（{date['rule']}）" if date.get("rule") else "")) if date else UNKNOWN_PROMPT,
         filter=text("filter"), grain=text("grain"))
 
