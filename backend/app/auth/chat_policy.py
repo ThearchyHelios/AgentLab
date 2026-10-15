@@ -4,16 +4,23 @@
 start_run 先查来源和运行类别）。图本身再按这里收窄，理由是同一条：对 user 角色来说遮罩就是边界（A7 第 6 条），它能
 碰的只有「读数据、整理、撰写」这一类，不能执行代码、不能调外部系统、不能写任何东西：
 
-- 节点只许：输入、模型、Agent、报告、输出、知识库检索、数据整形、条件分支、口径卡、合并查询。调用工具（会写外部系统）、
-  代码、协作、子工作流、循环、人工审批、记忆写入、校验、双盲复算、反方审稿一律不许——后几种不是危险，而是问数据用不到，
-  多放一种就多一处要单独核对遮罩的地方；
-- Agent 的工具只许数据源工具（db_query__ / db_schema__，查询结果按 MASK_RESULTS_OPTION 在工具边界遮）和只读的内置工具
-  （计算、当前时间、JSON 取值、知识库检索、记忆读取）。自定义工具、MCP、文件、网页、HTTP、代码执行一律不许；模板拼出来的
-  工具名（{{ vars.tool }}）发起时不知道是谁，也不许。数据源查询一律只读：可写源上的写语句由守卫拒掉，不交给审批（api/runs.py
-  给运行打上 READ_ONLY_OPTION）——Agent 的 approval 是发起人自己写在图里的，写成 never 就不问人了；
+- 节点只许：输入、模型、Agent、报告、输出、知识库检索、数据整形、条件分支、口径卡、合并查询、调用工具。代码、协作、
+  子工作流、循环、人工审批、记忆写入、校验、双盲复算、反方审稿一律不许——后几种不是危险，而是问数据用不到，多放一种
+  就多一处要单独核对遮罩的地方；
+- 工具（Agent 绑的、调用工具节点调的同一份白名单，engine/launch.tool_bindings 一并列出）只许数据源工具（db_query__ /
+  db_schema__，查询结果按 MASK_RESULTS_OPTION 在工具边界遮）和只读的内置工具（计算、当前时间、JSON 取值、知识库检索、
+  记忆读取）。自定义工具、MCP、文件、网页、HTTP、代码执行、平台的写入能力（records_append 这类）一律不许；模板拼出来的
+  工具名（{{ vars.tool }}）发起时不知道是谁，也不许。调用工具节点放行的理由：它和 Agent 调同一个查询工具等价——同一个
+  ToolContext 带着遮罩、只读两个开关（engine/nodes/tools.py 的 _tool_ctx），参数由人写死反而比模型挑的更好核对；
+  周期看板、异常处置这些模板的取数节点就是它（个人应用和问数据同一份白名单，blueprints/personal.policy_problem）；
+- 数据源查询一律只读：可写源上的写语句由守卫拒掉，不交给审批（api/runs.py、个人应用刷新、个人蓝图试运行给运行打上
+  READ_ONLY_OPTION）——Agent、调用工具节点的 approval 是发起人自己写在图里的，写成 never 就不问人了。能力治理里改成
+  「写入」的工具在只读运行里同样不执行（调用工具节点在走动作流程之前拒，Agent 建工具时拒）；
 - 记忆范围、知识库不由发起人挑：记忆和知识库里的内容不经遮罩，搭建者的 Agent 存进去的查询原文，换个范围就读到了。
   记忆固定为这位使用者自己的范围（chat_memory_scope；问数据里写不了记忆，它读到的只会是空的），知识库固定为设置里的
-  运行默认值。节点上、图级 defaults 里写了 memory_scope / collection 的图不许发起，请求体里带的同样拒（api/runs.py）。
+  运行默认值。节点上、图级 defaults 里、调用工具节点的参数里写了 memory_scope / collection 的图不许发起，请求体里带的
+  同样拒（api/runs.py）。这只是发起前的一道：根子在运行时——遮罩、只读的运行里范围由运行定，节点配置改不了，kb_search
+  的 collection 参数（参数名纠错改出来的、模型挑的）一律拒（tools/registry.ToolContext.fixed_scope）。
 
 没在这里列出的节点类型、工具，以后加了也默认不许（白名单），要放开得先想清楚遮罩怎么守。
 """
@@ -23,7 +30,7 @@ from typing import Any
 
 #: 问数据运行里 user 角色能用的节点类型（engine/schema.py 的 NodeType 取值）
 CHAT_NODE_TYPES = frozenset({"input", "llm", "agent", "report", "output", "retrieve", "transform", "branch",
-                             "metrics", "merge"})
+                             "metrics", "merge", "tool"})
 #: Agent 能绑的只读内置工具（tools/builtin/）
 CHAT_BUILTIN_TOOLS = frozenset({"calculator", "current_time", "json_query", "kb_search", "memory_recall"})
 #: 运行时改记忆范围、知识库的配置键（engine/nodes 的 ctx.cfg("memory_scope") / ctx.cfg("collection")，图级 defaults 同样生效）
@@ -54,7 +61,7 @@ def chat_graph_problem(graph: Any, *, where: str = "问数据") -> str | None:
     校验的图本来就发起不了。
 
     where 是说法里的「在哪」：个人应用（blueprints/personal.py）用的是同一份白名单，只把「问数据」换成「个人应用」。"""
-    from app.engine.launch import tool_bindings
+    from app.engine.launch import node_setting, tool_bindings
     from app.engine.schema import GraphSpec, type_label
 
     if not isinstance(graph, dict):
@@ -71,6 +78,12 @@ def chat_graph_problem(graph: Any, *, where: str = "问数据") -> str | None:
             return (f"没有权限：使用者在{where}中不能使用「{type_label(node.type)}」节点（「{node.title}」）。"
                     "如需这类处理，请联系搭建者做成应用")
         if any(_set(node.config.get(key)) for key in SCOPE_KEYS):
+            return f"{scope_refused}（「{node.title}」）"
+        # 调用工具节点的参数直接交给工具：kb_search 的 collection 这类参数写了，同样是自己挑了范围。取值和运行时同一个规则
+        # （node_setting：节点上没写就取图级 defaults 里的 args）。参数名写错、运行时被纠成 collection 的，这里认不出——
+        # 运行时那一道由工具自己拒（tools/registry.ToolContext.fixed_scope，kb_search 只能检索运行定下的知识库）
+        args = node_setting(spec, node, "args") if str(node.type) == "tool" else None
+        if isinstance(args, dict) and any(_set(args.get(key)) for key in SCOPE_KEYS):
             return f"{scope_refused}（「{node.title}」）"
     for who, name in tool_bindings(spec):
         if "{{" in name:

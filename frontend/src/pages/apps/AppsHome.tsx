@@ -21,6 +21,7 @@ import type { AppSummary, InstanceRow, Task } from '../../typesApp'
 import { LoadError, appPath, useLoad } from './shared'
 import { NEW_APP_TEXT } from '../../lib/termsBlueprint'
 import { CREATE_APP_PATH, useCreateScope } from '../blueprints/shared'
+import { PersonalStubCard, isPersonalStub } from './personal'
 
 const TABS = ['inbox', 'apps', 'mine'] as const
 type Tab = (typeof TABS)[number]
@@ -160,24 +161,37 @@ function AppsTab() {
   const { data, error, reload } = useLoad((signal) => api.apps.list({ signal }), [])
   if (error && !data) return <LoadError error={error} onRetry={reload} />
   if (!data) return <Skeleton rows={4} />
-  // 个人应用（N7）单独一组「我的应用」放在前面：只有拥有者看得见，服务端只把自己的交来
-  const mine = data.items.filter((a) => a.scope === 'personal')
+  // 个人应用（N7）单独一组「我的应用」放在前面：只有拥有者看得见，服务端只把自己的交来。开了登录的管理员另看得到别人的
+  // 个人应用在不在（服务端只给元数据，my_role 为空）：单列一组「使用者的个人应用」放在最后，不链到页面，只给归档
+  const others = data.items.filter(isPersonalStub)
+  const mine = data.items.filter((a) => a.scope === 'personal' && !isPersonalStub(a))
   const shared = data.items.filter((a) => a.scope !== 'personal')
-  if (mine.length) {
+  if (mine.length || others.length) {
     return (
       <div className="space-y-4">
-        <section aria-labelledby="apps-home-personal" data-app-group="personal">
-          <h2 id="apps-home-personal" className="text-xs font-semibold">{PERSONAL_TEXT.group}</h2>
-          <p className="mb-2 text-2xs text-faint">{PERSONAL_TEXT.groupHint}</p>
-          <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" data-app-list-personal="">
-            {mine.map((a) => <AppCard key={a.id} app={a} canEdit={false} />)}
-          </ul>
-        </section>
+        {mine.length > 0 && (
+          <section aria-labelledby="apps-home-personal" data-app-group="personal">
+            <h2 id="apps-home-personal" className="text-xs font-semibold">{PERSONAL_TEXT.group}</h2>
+            <p className="mb-2 text-2xs text-faint">{PERSONAL_TEXT.groupHint}</p>
+            <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" data-app-list-personal="">
+              {mine.map((a) => <AppCard key={a.id} app={a} canEdit={false} />)}
+            </ul>
+          </section>
+        )}
         {shared.length > 0 && (
           <section aria-labelledby="apps-home-shared" data-app-group="shared">
             <h2 id="apps-home-shared" className="mb-2 text-xs font-semibold">{PERSONAL_TEXT.sharedGroup}</h2>
             <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" data-app-list="">
               {shared.map((a) => <AppCard key={a.id} app={a} canEdit={builder && a.my_role === 'manage'} />)}
+            </ul>
+          </section>
+        )}
+        {others.length > 0 && (
+          <section aria-labelledby="apps-home-others" data-app-group="others">
+            <h2 id="apps-home-others" className="text-xs font-semibold">{PERSONAL_TEXT.othersGroup}</h2>
+            <p className="mb-2 text-2xs text-faint">{PERSONAL_TEXT.othersGroupHint}</p>
+            <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" data-app-list-others="">
+              {others.map((a) => <PersonalStubCard key={a.id} app={a} onArchived={reload} />)}
             </ul>
           </section>
         )}

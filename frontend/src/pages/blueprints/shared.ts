@@ -19,10 +19,10 @@ export const blueprintPath = (id: string, section?: 'trial', query?: Record<stri
 
 /**
  * 管理员开没开「使用者建个人应用」（设置 apps.user_personal_apps，默认关）。使用者读不到设置，开关随认人接口
- * （GET /api/auth/me）一起给，同问数据的 user_can_chat。老服务端不给时按关。
+ * （GET /api/auth/me 的 Principal.user_personal_apps）一起给，同问数据的 user_can_chat。老服务端不给时按关。
  */
 export function personalAppsOn(me: Principal | null | undefined): boolean {
-  return (me as (Principal & { user_personal_apps?: boolean }) | null | undefined)?.user_personal_apps === true
+  return me?.user_personal_apps === true
 }
 
 /** 这个人新建应用时建哪种蓝图；null = 没有入口 */

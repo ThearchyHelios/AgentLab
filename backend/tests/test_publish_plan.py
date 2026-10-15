@@ -313,7 +313,8 @@ async def test_governed_plans_need_an_admin(login, tmp_path):
     # 使用者看不到发布单
     await auth_env.make_user(f"lee{u}", "user")
     user = await auth_env.login(f"lee{u}")
-    assert (await user.get(f"/api/publish-plans/{plan['id']}")).status_code == 403
+    # 使用者碰共享蓝图的发布单回 404，和看不到的一样（D5）
+    assert (await user.get(f"/api/publish-plans/{plan['id']}")).status_code == 404
 
 
 async def test_runs_launched_by_a_plan_are_formal_and_from_the_published_version(client, tmp_path):
@@ -432,11 +433,11 @@ async def test_problems_are_split_into_three_kinds(client):
 
 async def _approval_blueprint(client) -> str:
     """审批流程模板的蓝图：只有一步主管审批（处理人写了具体的人，岗位按卡片绑上），没有写回。"""
-    from app.blueprints.templates._common import EXTRAS
+    from app.blueprints.templates import get_template
 
     bp = (await client.post("/api/blueprints", json={"source": {"kind": "template", "id": "approval"}, "scope": "shared",
                                                      "name": f"报销-{uuid.uuid4().hex[:4]}"})).json()
-    spec = EXTRAS["approval"].example()
+    spec = get_template("approval").example()
     spec["people"] = spec["people"][:1]
     spec["access"] = {"use": [{"kind": "user", "name": "zhang"}], "observe": [], "manage": []}
     await s.edit_spec(bp["id"], **spec)
@@ -489,8 +490,14 @@ async def test_cards_changed_after_the_trial_are_what_gets_published(client):
 
 async def test_a_plan_cannot_take_over_an_app_the_builder_cannot_manage(login, tmp_path):
     """蓝图已经发布成应用：只有对那个应用有管理权限的人能出单、执行（发布单会改它的草稿、发布它、整份替换授权）。
-    只能查看的搭建者出单时预检报 plan.app_forbidden（要找管理员），执行 403；应用的授权没被改。"""
-    await auth_env.turn_on_local()
+
+    - 别的搭建者连这张共享蓝图都看不到（D5）：读、改、出单、看单子一律 404，列表里没有；给了那个应用的管理授权之后才
+      看得到；
+    - 蓝图的拥有者对应用没有管理权限（应用是管理员替他发布的、只授给他使用）时，把自己写进「谁能看」的管理想借发布单
+      拿到管理权：出单时预检报 plan.app_forbidden（要找管理员），执行 403；应用的授权没被改。"""
+    import json
+
+    root = await auth_env.turn_on_local()
     u = uuid.uuid4().hex[:6]
     await auth_env.make_user(f"zhao{u}", "builder")
     await auth_env.make_user(f"qian{u}", "builder")
@@ -502,25 +509,50 @@ async def test_a_plan_cannot_take_over_an_app_the_builder_cannot_manage(login, t
                                                     "scope": "shared"})).json()
     await s.edit_spec(bp["id"], purpose=s.item("每周看上周销售额"),
                       access={"use": [{"kind": "user", "name": f"zhao{u}"}], "observe": [], "manage": []})
-    plan = (await owner.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published",
-                                                                              "first_run": False})).json()
+    # 管理员能读写、出单（D5）：应用由管理员发布，创建人是管理员
+    plan = (await root.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published",
+                                                                             "first_run": False})).json()
     assert not [p for p in plan["problems"] if p["code"] == "plan.app_forbidden"]
-    done = (await owner.post(f"/api/publish-plans/{plan['id']}/run")).json()
+    done = (await root.post(f"/api/publish-plans/{plan['id']}/run")).json()
     assert done["status"] == "done", done["steps"]
     app_id = (await s.blueprint(bp["id"])).app_id
 
-    # 另一个搭建者把自己写进「谁能看」的管理，想借发布单拿到管理权
-    await s.edit_spec(bp["id"], access={"use": [], "observe": [], "manage": [{"kind": "user", "name": f"qian{u}"}]})
-    plan = (await other.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published",
+    # 别的搭建者：当这张蓝图不存在
+    assert (await other.get(f"/api/blueprints/{bp['id']}")).status_code == 404
+    assert (await other.patch(f"/api/blueprints/{bp['id']}", json={"name": "改个名"})).status_code == 404
+    assert (await other.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).status_code \
+        == 404
+    assert (await other.get(f"/api/publish-plans/{plan['id']}")).status_code == 404
+    assert (await other.post(f"/api/publish-plans/{plan['id']}/run")).status_code == 404
+    assert bp["id"] not in [b["id"] for b in (await other.get("/api/blueprints")).json()["items"]]
+    assert bp["id"] in [b["id"] for b in (await owner.get("/api/blueprints")).json()["items"]]
+    up = await other.post("/api/files", files={"file": ("说明.txt", "x".encode(), "text/plain")},
+                          data={"context": json.dumps({"blueprint_id": bp["id"]})})
+    assert up.status_code == 404 and up.json()["code"] == "files.context_invalid", "往别人的蓝图上传附件同样不收"
+    ghost = await other.post("/api/files", files={"file": ("说明.txt", "x".encode(), "text/plain")},
+                             data={"context": json.dumps({"blueprint_id": uuid.uuid4().hex})})
+    assert (ghost.status_code, ghost.json()) == (up.status_code, up.json()), "看不到的和不存在的一个说法，试不出它在不在"
+    assert bp["id"] in [b["id"] for b in (await root.get("/api/blueprints")).json()["items"]]
+
+    # 拥有者把自己写进「谁能看」的管理，想借发布单拿到管理权
+    await s.edit_spec(bp["id"], access={"use": [], "observe": [], "manage": [{"kind": "user", "name": f"zhao{u}"}]})
+    plan = (await owner.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published",
                                                                               "first_run": False})).json()
     forbidden = [p for p in plan["problems"] if p["code"] == "plan.app_forbidden"]
     assert plan["ok"] is False and forbidden and forbidden[0]["who"] == "admin" and forbidden[0]["plain"]["title"]
-    r = await other.post(f"/api/publish-plans/{plan['id']}/run")
+    r = await owner.post(f"/api/publish-plans/{plan['id']}/run")
     assert r.status_code == 403 and r.json()["code"] == "plan.app_forbidden", r.text
     async with SessionLocal() as session:
         grants = {(g.principal, g.role) for g in (await session.execute(
             select(AppGrant).where(AppGrant.app_id == app_id))).scalars()}
     assert grants == {(f"zhao{u}", "use")}, "授权没被改"
+
+    # 应用的管理者看得到它出自的蓝图（D5）
+    async with SessionLocal() as session:
+        session.add(AppGrant(app_id=app_id, principal_kind="user", principal=f"qian{u}", role="manage"))
+        await session.commit()
+    assert (await other.get(f"/api/blueprints/{bp['id']}")).status_code == 200
+    assert bp["id"] in [b["id"] for b in (await other.get("/api/blueprints")).json()["items"]]
 
 
 async def test_plans_left_running_by_a_dead_process_are_stopped_at_startup(client, tmp_path):

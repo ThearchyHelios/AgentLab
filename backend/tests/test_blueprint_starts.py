@@ -204,7 +204,8 @@ async def test_who_can_start_what(login):
     listed = {b["id"] for b in (await builder.get("/api/blueprints")).json()["items"]}
     assert r.json()["id"] in listed and mine["id"] not in listed
     # 使用者看不到共享蓝图
-    assert (await user.get(f"/api/blueprints/{r.json()['id']}")).status_code == 403
+    # 使用者碰共享蓝图回 404，和看不到的一样，试不出它在不在（D5）
+    assert (await user.get(f"/api/blueprints/{r.json()['id']}")).status_code == 404
 
 
 async def test_patch_applies_card_ops_as_the_user(client):

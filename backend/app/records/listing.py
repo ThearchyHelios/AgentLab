@@ -7,8 +7,9 @@
 遮罩：别人提交的行里，数据源设了遮罩的列（「填什么」里标了敏感的，加上管理员在数据页手工加的）换成「已遮罩」——和看板证据
 同一套遮罩列、同一个说法（P4、P5）；自己提交的行照原样给（是自己填的）。附件列遮掉之后连文件的引用也不给。
 
-返回的形状同 frontend/src/typesBlueprint.ts 的 RecordsPage：{table, version, columns, items, mine_only}，另带 next_cursor
-（下一页的游标，「版本:序号」，没有下一页为空）和 state（empty：这个应用还没有记录表）。
+返回的形状同 frontend/src/typesBlueprint.ts 的 RecordsPage，每个键都在：{table, version, columns, items, mine_only,
+next_cursor, state}。next_cursor 是下一页的游标（「版本:序号」），没有下一页为 null；state 是 ok（有这张表，items 可能
+为空）、empty（这个应用还没有记录表），草稿预览（apps/resolve._records_list）是 preview（不列真实的记录）。
 """
 from __future__ import annotations
 
@@ -104,4 +105,4 @@ async def page(session: AsyncSession, app: Any, *, principal: Any, role: str | N
     last = items[-1] if items else None
     return {"table": current.table_key, "version": versions[0].version if versions else current.version,
             "columns": columns, "items": items, "mine_only": scope == "mine",
-            "next_cursor": f"{last['_version']}:{last['_seq']}" if more and last else None}
+            "next_cursor": f"{last['_version']}:{last['_seq']}" if more and last else None, "state": "ok"}

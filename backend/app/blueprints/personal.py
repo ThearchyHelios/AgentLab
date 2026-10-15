@@ -99,8 +99,9 @@ def owns(principal: Any, owner: str | None) -> bool:
 
 def policy_problem(graph: Any) -> str | None:
     """个人应用的图能不能用：和使用者问数据同一份白名单（auth/chat_policy.chat_graph_problem），说法只换「在哪」。
-    能用返回 None。没有人工节点、不写入都在白名单里：人工、调用工具、代码、记忆写入这几类节点不在名单上，写入能力和
-    自定义工具不是只读工具；数据源查询在运行时另按 READ_ONLY 只读。"""
+    能用返回 None。没有人工节点、不写入都在白名单里：人工、代码、记忆写入这几类节点不在名单上；调用工具节点可以用，
+    但和 Agent 一样只能绑数据源查询和只读的内置工具（模板的取数节点就是它），写入能力和自定义工具不是只读工具；数据源
+    查询在运行时另按 READ_ONLY 只读、按 MASK_RESULTS 在工具边界遮，调用工具节点和 Agent 走同一道。"""
     from app.auth.chat_policy import chat_graph_problem
 
     return chat_graph_problem(graph, where="个人应用")
@@ -656,7 +657,9 @@ async def review_payload(session: AsyncSession, task: Any) -> dict[str, Any]:
     blueprint_id = (task.correlation_key or "").removeprefix(REVIEW_KEY)
     blueprint = await session.get(Blueprint, blueprint_id) if blueprint_id else None
     if blueprint is None:
-        return {"kind": REVIEW}
+        # 蓝图已经不在了（被删）：键照样都给，界面按同一个形状读，不另判缺键
+        return {"kind": REVIEW, "blueprint_id": blueprint_id or None, "app_id": task.app_id, "name": None,
+                "purpose": "", "template_id": None, "submitted_by": None, "note": "", "copies": []}
     await settle_review(session, blueprint)
     submitted = (await session.execute(select(BlueprintEvent).where(
         BlueprintEvent.blueprint_id == blueprint.id, BlueprintEvent.op == "submit_review")
@@ -677,14 +680,16 @@ async def review_payload(session: AsyncSession, task: Any) -> dict[str, Any]:
 
 
 async def personal_state(session: AsyncSession, app: Any, principal: Any) -> dict[str, Any]:
-    """个人应用详情里给拥有者的那一块：今天还能刷新几次、蓝图的状态（是不是改过还没重新存）、审核到哪了（在等谁、退回了、
-    已发布成哪个正式应用）。"""
+    """个人应用详情里给拥有者的那一块：能不能刷新、提交审核（allowed，同 ensure_allowed 那一条规则：管理员关了开关之后
+    使用者的个人应用还看得到，只是不能再刷新、提交审核；界面照它置灰，不自己再推一遍）、今天还能刷新几次、蓝图的状态
+    （是不是改过还没重新存）、审核到哪了（在等谁、退回了、已发布成哪个正式应用）。"""
     from app.db.models_blueprints import Blueprint
 
     remaining, limit = await remaining_today(session, principal.username)
     blueprint = await session.get(Blueprint, app.blueprint_id) if app.blueprint_id else None
     pin = _pin(app.draft)
-    out: dict[str, Any] = {"remaining_today": remaining, "daily_limit": limit,
+    out: dict[str, Any] = {"allowed": await allowed(session, principal), "remaining_today": remaining,
+                           "daily_limit": limit,
                            "blueprint_status": blueprint.status if blueprint is not None else None,
                            "graph_changed": blueprint is not None and pin is not None
                            and pin.get("graph_hash") != graph_hash_of(blueprint),

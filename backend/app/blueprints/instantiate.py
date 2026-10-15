@@ -208,26 +208,28 @@ def instantiate(blueprint: dict[str, Any], *, filled: dict[str, Any] | None = No
         "name": name, "workflow_id": workflow_id, "blueprint_id": blueprint_id, "schedule_id": schedule_id,
         "records": records, "graph": graph}}
     raw, joint_defs = template.skeleton(bp)
-    extras = c.EXTRAS.get(template.id)
     # 自由形导入的图原样用、不重新排版：它的哈希要和导入的那一版对得上，发布单才按哈希复用那一版
-    skeleton = copy.deepcopy(raw) if extras is not None and extras.imports_graph else normalize(raw)
+    skeleton = copy.deepcopy(raw) if template.imports_graph else normalize(raw)
     out = copy.deepcopy(skeleton)
-    briefs = extras.briefs(bp) if extras is not None and extras.briefs is not None else {}
+    briefs = template.briefs(bp) if template.briefs is not None else {}
     basis = {g: c.basis_of(text, template.id, template.version) for g, text in briefs.items()}
     joints: dict[str, Any] = {}
     filled = filled or {}
     for j in joint_defs:
+        # 模板声明的说法、类型、分组随状态一起存（界面写「第几组、填的是什么」，不只写关节 id）
+        said = {"label": j.label or j.id, "kind": j.kind, "group": j.group}
         if j.kind not in GENERATED_JOINT_KINDS:
-            joints[j.id] = {"status": "filled", "by": "template"}
+            joints[j.id] = {"status": "filled", "by": "template", **said}
             continue
         value = filled.get(j.id)
         config = node_config(out, j.node_id)
         if isinstance(value, str) and value.strip() and config is not None:
             write_at(config, j.field, value.strip())
-            joints[j.id] = {"status": "filled", "by": "assistant", "value": value.strip(),
+            joints[j.id] = {"status": "filled", "by": "assistant", "value": value.strip(), **said,
                             **({"basis": basis[j.group]} if j.group in basis else {})}
         else:
-            joints[j.id] = {"status": "pending", "by": "template", "note": "这一项助手还没填上：可以请助手填，或者换个说法再试"}
+            joints[j.id] = {"status": "pending", "by": "template", **said,
+                            "note": "这一项助手还没填上：可以请助手填，或者换个说法再试"}
             problems.append({"code": JOINT_UNFILLED, "level": "error", "node_id": j.node_id, "field": j.field,
                              "joint": j.id, "message": f"「{j.label or j.id}」还没填"})
     problems += skeleton_changes(skeleton, out, joint_defs)
@@ -301,24 +303,23 @@ def trial_inputs(blueprint: dict[str, Any], *, at: datetime | None = None) -> di
 
 
 def registry_problems() -> list[str]:
-    """模板登记齐不齐：首批都登记了（check_registry）、关节类型都认得、每个模板都给了示例蓝图，示例实例化出来过得了
-    画布校验、骨架比对没有差异（模板定义、实例化、测试三样都要给，缺一样启动即报错，N3）。"""
-    from app.blueprints.templates import JOINT_KINDS, check_registry, list_templates
-    from app.blueprints.templates import _common as c
+    """模板登记齐不齐（templates.check_registry 调这里）：首批都登记了、关节类型都认得、每个模板都给了示例蓝图
+    （TemplateDef.example / example_fill），示例实例化出来过得了画布校验、骨架比对没有差异（模板定义、实例化、测试
+    三样都要给，缺一样启动即报错，N3）。"""
+    from app.blueprints.templates import JOINT_KINDS, TEMPLATE_IDS, get_template, list_templates
 
-    problems = list(check_registry())
+    problems = [f"模板「{t}」没有登记" for t in TEMPLATE_IDS if get_template(t) is None]
     for template in list_templates():
-        extras = c.EXTRAS.get(template.id)
-        if extras is None:
+        if template.example is None or template.example_fill is None:
             problems.append(f"模板「{template.id}」没有示例蓝图")
             continue
         try:
             graph = None
-            if extras.imports_graph:
+            if template.imports_graph:
                 from app.blueprints.templates.freeform import example_graph
 
                 graph = example_graph()
-            inst = instantiate(extras.example(), filled=extras.example_fill(), graph=graph)
+            inst = instantiate(template.example(), filled=template.example_fill(), graph=graph)
         except Exception as e:  # noqa: BLE001 - 核对本身出错也照实报，不让启动卡在异常上
             problems.append(f"模板「{template.id}」的示例实例化出错：{e}")
             continue

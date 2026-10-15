@@ -8,26 +8,28 @@
  * 只有一层：顶层 object，字段是 string / number / integer / boolean，数组只装枚举字符串（多选）。
  *
  * 文件（normal-user-apps N9、§3.8）：字段 type 为 object、x-widget 为 file，只有这个控件能用 object。值是上传后拿回的
- * 引用 {file_id, name, size, sha256, type}，规则和服务端 apps/forms.py 同一份：必填，形状是文件引用。允许的类型和大小
- * 写在 x-file（accept、max_mb），只在上传时用，提交时不再查（上传那一步服务端已经核对过）。
+ * 引用 {file_id, name, size, sha256, type}，规则和服务端 apps/forms.py 同一份：必填，形状是文件引用，不合时错误的 code 是
+ * file（同服务端 files/store.FILE_ERROR_CODE）。允许的类型和大小写在 x-file（accept、max_mb），只在上传时用，提交时不再查
+ * （上传那一步服务端已经核对过）。
  */
-import type { FormError, FormField, FormSchema, FormWidget } from '../typesApp'
+import type { FileLimits, FormError, FormField, FormSchema, FormWidget } from '../typesApp'
 import type { FileRef } from '../typesBlueprint'
 import { FILE_TEXT, FORM_TEXT } from './termsApp'
 
-/** 文件控件的限制：允许的类型（MIME 或扩展名）、大小上限（MB）。x-file 由服务端随表单给 */
-export interface FileLimits { accept?: string[]; max_mb?: number | null }
-
-/** 表单字段上的 x-file（typesApp.FormField 还没有这一项，见报告的接口约定请求） */
+/**
+ * 表单字段上的 x-file（FormField['x-file']）整理成控件用的样子：可选类型去掉空的，大小上限不是正数的当没写。
+ * 服务端保存表单时已经按同一套规则查过（apps/forms._file_field_problems），这里只防手写的老表单
+ */
 export function fileLimitsOf(field: FormField): FileLimits {
-  const raw = (field as FormField & { 'x-file'?: unknown })['x-file']
-  if (!raw || typeof raw !== 'object') return {}
-  const x = raw as { accept?: unknown; max_mb?: unknown }
-  const accept = Array.isArray(x.accept) ? x.accept.filter((a): a is string => typeof a === 'string' && !!a.trim())
-    : typeof x.accept === 'string' ? x.accept.split(',').map((a) => a.trim()).filter(Boolean) : undefined
+  const x = field['x-file']
+  if (!x || typeof x !== 'object') return {}
+  // 画布上手写的老图可能把可选类型写成一串逗号分隔的字
+  const raw: unknown = x.accept
+  const accept = Array.isArray(raw) ? raw.filter((a): a is string => typeof a === 'string' && !!a.trim())
+    : typeof raw === 'string' ? raw.split(',').map((a) => a.trim()).filter(Boolean) : undefined
   return {
     accept: accept?.length ? accept : undefined,
-    max_mb: typeof x.max_mb === 'number' && Number.isFinite(x.max_mb) && x.max_mb > 0 ? x.max_mb : null,
+    max_mb: typeof x.max_mb === 'number' && Number.isFinite(x.max_mb) && x.max_mb > 0 ? x.max_mb : undefined,
   }
 }
 
@@ -44,6 +46,17 @@ export function toFileRef(raw: FileRef): FileRef {
   return { file_id: raw.file_id, name: raw.name, size: raw.size, sha256: raw.sha256, type: raw.type }
 }
 
+/** 表单引用的写法（同服务端 apps/tree.FORM_REF_PREFIX）：{"$ref": "#/forms/<名字>"} */
+const FORM_REF_PREFIX = '#/forms/'
+
+/** 内联的表单原样交回；引用换成 forms 里的那一份；引用不到的是 null（同服务端 apps/tree.resolve_form） */
+export function resolveForm(forms: Record<string, FormSchema> | null | undefined,
+  form: FormSchema | { $ref: string } | null | undefined): FormSchema | null {
+  if (!form) return null
+  if (!('$ref' in form)) return form
+  return form.$ref.startsWith(FORM_REF_PREFIX) ? forms?.[form.$ref.slice(FORM_REF_PREFIX.length)] ?? null : null
+}
+
 /** 字段顺序：x-order 里写到的在前（按写的顺序），没写到的按 properties 的原顺序跟在后面；不存在的名字跳过 */
 export function fieldOrder(schema: FormSchema): string[] {
   const props = schema.properties ?? {}
@@ -54,8 +67,8 @@ export function fieldOrder(schema: FormSchema): string[] {
 /** 这个字段画成哪种控件：写了 x-widget 照它，没写按类型推 */
 export function widgetOf(field: FormField): FormWidget {
   if (field['x-widget']) return field['x-widget']
-  // 只有文件控件用 object（typesApp.FormField 的 type 还没列 object）
-  if ((field.type as string) === 'object') return 'file'
+  // 只有文件控件用 object
+  if (field.type === 'object') return 'file'
   switch (field.type) {
     case 'boolean': return 'checkbox'
     case 'array': return 'multiselect'
@@ -139,7 +152,7 @@ export function validateForm(schema: FormSchema, values: Record<string, unknown>
 
 function fieldError(field: FormField, v: unknown, required: boolean): Omit<FormError, 'path'> | null {
   if (isEmpty(v)) return required ? { code: 'required', message: FORM_TEXT.required } : null
-  if (widgetOf(field) === 'file') return isFileRef(v) ? null : { code: 'type', message: FILE_TEXT.invalid }
+  if (widgetOf(field) === 'file') return isFileRef(v) ? null : { code: 'file', message: FILE_TEXT.invalid }
   switch (field.type) {
     case 'string': {
       if (typeof v !== 'string') return { code: 'type', message: FORM_TEXT.type.string }

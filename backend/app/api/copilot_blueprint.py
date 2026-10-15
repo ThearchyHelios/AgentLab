@@ -4,8 +4,8 @@
 - POST /api/copilot/fill-joints-stream：按模板填生成关节（sql、metric_expr）。TemplateApplier 只收 fill_joint、只收模板声明过的
   关节；不同 group 的关节并行填。
 
-都复用 api/copilot_gen.Generation。权限按蓝图判（blueprints/store.ensure_access）：共享蓝图要搭建者；个人蓝图只给拥有者，且
-管理员开了个人应用。
+都复用 api/copilot_gen.Generation。权限按蓝图判（blueprints/store.ensure_access）：共享蓝图要搭建者，且是拥有者、它发布出来
+的应用的管理者或管理员；个人蓝图只给拥有者，且管理员开了个人应用。
 
 **调用次数的预算**（N11）：起草蓝图 1 次主调用加最多 2 次查看；填关节每组 1 次调用、各自最多 1 次查看（系统先代为查看
 这一组要用的表，不占次数），不同的组并行。并行调用出错（多半是模型服务限流）的组，等别的组做完再按顺序试一次。

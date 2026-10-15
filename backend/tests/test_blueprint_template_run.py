@@ -10,7 +10,7 @@ import uuid
 import pytest
 
 from app.blueprints.instantiate import instantiate
-from app.blueprints.templates import _common as c
+from app.blueprints.templates import get_template
 from app.data.engine import engines
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run
@@ -48,7 +48,7 @@ async def shop(tmp_path):
 async def test_the_board_template_runs_and_issues_by_metrics(shop):
     from app.blueprints.templates._common import safe_id
 
-    extras = c.EXTRAS["periodic_board"]
+    extras = get_template("periodic_board")
     spec = extras.example()
     for item in spec["data"]:
         item["table"]["value"]["source"] = shop

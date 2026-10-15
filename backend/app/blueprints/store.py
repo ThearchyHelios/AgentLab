@@ -1,8 +1,9 @@
 """蓝图的读写与留痕（N2、§3.1、§3.10）。蓝图接口（api/blueprints.py 的 PATCH）、蓝图助手和填关节的流式接口
 （api/copilot_blueprint.py）都经这里落地，规则只有一处：
 
-- 权限：共享蓝图要搭建者；个人蓝图只给拥有者，而且管理员开了个人应用（blueprints/personal.allowed）。别人的个人蓝图
-  当没有（404），不说它在不在；
+- 权限：共享蓝图要搭建者，而且只给拥有者、它发布出来的应用的管理者（app_role=manage）和管理员（can_access）——别的
+  搭建者列表里看不到、直接访问回 404；审核副本的拥有者是处理审核的那位搭建者（personal.copy_for_review）。个人蓝图只给
+  拥有者，而且管理员开了个人应用（blueprints/personal.allowed）。看不到的蓝图一律当没有（404），不说它在不在；
 - 落地：bp_* 操作按 blueprints/ops.apply_bp_op 逐个落到存着的那一份上，每个操作写一条 blueprint_events（谁、核实过没有、
   来源、位置、改之前、改之后，P2）。复用口径卡的操作先按库里那一版核对（look/calibers.verify_reuse）并补上它读的列；
 - 关节：卡片改了，生成关节的依据跟着变的那几组标回「待填」（instantiate.filled_from），蓝图上的关节状态随之更新。
@@ -50,8 +51,9 @@ async def load(session: AsyncSession, blueprint_id: str) -> Any:
 
 
 async def ensure_access(session: AsyncSession, blueprint: Any) -> None:
-    """这个人能不能读写这张蓝图：共享的要搭建者及以上；个人的要拥有者，且个人应用开着（关登录时只看开关）。"""
-    from app.api.deps import current_principal, ensure_role
+    """这个人能不能读写这张蓝图（读、改卡片、试运行、出发布单都按它）：共享的要搭建者及以上，而且是 can_access 认的
+    那几种人；个人的要拥有者，且个人应用开着（关登录时只看开关）。看不到的一律 404。"""
+    from app.api.deps import current_principal
     from app.blueprints import personal
 
     principal = current_principal()
@@ -61,7 +63,51 @@ async def ensure_access(session: AsyncSession, blueprint: Any) -> None:
         if not await personal.allowed(session, principal):
             raise HTTPException(403, PERSONAL_OFF)
         return
-    ensure_role("builder")
+    # 使用者碰共享蓝图也回 404：先回 403 再回 404，两者一比就试得出这张蓝图在不在（D5「看不到的一律当不存在」）
+    if not principal.at_least("builder") or not await can_access(session, principal, blueprint):
+        raise HTTPException(404, BLUEPRINT_GONE)
+
+
+async def can_access(session: AsyncSession, principal: Any, blueprint: Any) -> bool:
+    """这个人能不能读写这张蓝图，不看角色门槛和个人应用开关（那两样由 ensure_access 另判，文件上传按它核对上下文）：
+
+    - 关登录：都能（没有可信的身份）；
+    - 个人蓝图：只有拥有者；
+    - 共享蓝图：拥有者、管理员、它发布出来的应用（blueprint.app_id）的管理者（apps/access.app_role 是 manage）。
+      别的搭建者不行：卡片上写的是谁来审批、谁能看、往哪写，改一张别人的蓝图再出单，等于替别人改了应用。"""
+    from app.blueprints import personal
+
+    if principal.mode == "off":
+        return True
+    if getattr(blueprint, "scope", "shared") == "personal":
+        return personal.owns(principal, blueprint.owner)
+    if principal.role == "admin" or (principal.username and blueprint.owner == principal.username):
+        return True
+    return await _manages_app(session, principal, blueprint.app_id)
+
+
+async def _manages_app(session: AsyncSession, principal: Any, app_id: str | None) -> bool:
+    from app.apps.access import app_role
+    from app.db.models_apps import App
+
+    app = await session.get(App, app_id) if app_id else None
+    return app is not None and await app_role(session, principal, app) == "manage"
+
+
+async def shared_listed(session: AsyncSession, principal: Any, rows: list[Any]) -> list[Any]:
+    """列表里这个人看得到的共享蓝图（同 can_access）：同一个应用只查一次授权。"""
+    managed: dict[str, bool] = {}
+    out = []
+    for bp in rows:
+        if principal.mode == "off" or principal.role == "admin" or (
+                principal.username and bp.owner == principal.username):
+            out.append(bp)
+            continue
+        if bp.app_id and bp.app_id not in managed:
+            managed[bp.app_id] = await _manages_app(session, principal, bp.app_id)
+        if bp.app_id and managed[bp.app_id]:
+            out.append(bp)
+    return out
 
 
 # ==========================================================================
@@ -274,8 +320,9 @@ def blueprint_issues_of(blueprint: Any) -> list[dict[str, Any]]:
 
 
 def blueprint_out(blueprint: Any, *, issues: bool = True) -> dict[str, Any]:
-    """一张蓝图交给前端的样子（frontend/src/typesBlueprint.ts 的 Blueprint）。关节只给状态，不给填的值（值在图上看）。"""
-    joints = {jid: {k: v for k, v in state.items() if k in ("status", "by", "note")}
+    """一张蓝图交给前端的样子（frontend/src/typesBlueprint.ts 的 Blueprint）。关节只给状态和模板声明的说法、类型、分组
+    （JointState：status、by、note、label、kind、group），不给填的值（值在图上看）。"""
+    joints = {jid: {k: v for k, v in state.items() if k in ("status", "by", "note", "label", "kind", "group")}
               for jid, state in (blueprint.joints or {}).items() if isinstance(state, dict)}
     out = {
         "id": blueprint.id, "name": blueprint.name, "owner": blueprint.owner, "scope": blueprint.scope,

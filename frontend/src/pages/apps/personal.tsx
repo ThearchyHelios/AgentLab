@@ -3,47 +3,30 @@
  * 结果遮罩、探索运行未经发布审核），「刷新」写明今天还剩几次，「提交审核」交给一位搭建者或一个组。
  *
  * 印章上的「探索 · 未经发布审核」由服务端写，这里不另编（P1）。剩余次数以服务端为准：详情里给了（AppDetail.personal，
- * 服务端 blueprints/personal.personal_state 的形状，typesApp 还没有它、契约待补）就写，刷新的回包里也带；不知道的不猜，
- * 只说有上限。超了上限服务端回 429，照实说用完了。蓝图改过、还没重新存的（graph_changed），照实说刷新要先重新存。
+ * 服务端 blueprints/personal.personal_state）就写，刷新的回包里也带；不知道的不猜，只说有上限。超了上限服务端回 429，
+ * 照实说用完了。蓝图改过、还没重新存的（graph_changed），照实说刷新要先重新存。
  *
  * 审核状态同样以服务端为准：最近一条审核待办还在等（pending）写「审核中」；搭建者发布了（decision=published）写
  * 「已有正式版本：去看看」，链到发布的那个应用；退回了写退回和原因，可以再提交。详情没给时看蓝图的状态（in_review）。
+ *
+ * 别人的个人应用（开了登录的管理员看到的，my_role 为空）：服务端只给名称、拥有者、状态、创建和更新时间（api/apps._personal_stub），
+ * 这里照它写，给「归档」；页面、运行、蓝图的内容都看不到，也不去取（PersonalStubCard、PersonalStubPage）。
  */
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { FileCheck2, Hourglass, RotateCw, Send, UserRound } from 'lucide-react'
+import { Archive, FileCheck2, Hourglass, LayoutGrid, RotateCw, Send, UserRound } from 'lucide-react'
 import { ApiError, api } from '../../api/client'
 import { PrincipalPicker, type Principal } from '../../components/PrincipalPicker'
-import { Modal, Notice, Spinner, toast } from '../../components/ui'
-import { PERSONAL_TEXT as T } from '../../lib/termsApp'
-import type { AppDetail } from '../../typesApp'
+import { Modal, Notice, PageHeader, Spinner, confirmDialog, toast } from '../../components/ui'
+import { formatDateTime } from '../../lib/format'
+import { APP_TEXT, PERSONAL_TEXT as T } from '../../lib/termsApp'
+import type { AppDetail, AppSummary, PersonalReview } from '../../typesApp'
 import { blueprintPath } from '../blueprints/shared'
-import { appPath } from './shared'
-
-/** 最近一条审核待办（服务端 personal_state.review）：status 是待办的状态，decision 是结论（published / reject） */
-export interface PersonalReview {
-  task_id: string
-  status: 'pending' | 'resolving' | 'resolved' | 'cancelled' | 'expired'
-  decision?: 'published' | 'reject' | null
-  note?: string
-  /** 发布出来的正式应用（decision=published 时） */
-  app_id?: string | null
-  to?: { kind: 'user' | 'group'; name: string }[]
-  resolved_at?: string | null
-}
-
-/** 个人应用在详情里多给的（服务端 blueprints/personal.personal_state）：今天还能刷新几次、蓝图改过没有、审核到哪了 */
-export interface PersonalInfo {
-  remaining_today?: number | null
-  daily_limit?: number | null
-  blueprint_status?: string | null
-  graph_changed?: boolean
-  review?: PersonalReview | null
-}
+import { BackLink, appPath } from './shared'
 
 /** 界面上的审核状态：在等、发布了、退回了；还没提交过（或审核取消、过期）为 null */
 type ReviewView =
-  | { state: 'in_review'; to?: { kind: 'user' | 'group'; name: string }[] }
+  | { state: 'in_review'; to?: PersonalReview['to'] }
   | { state: 'published'; appId?: string | null }
   | { state: 'rejected'; note?: string }
 
@@ -55,11 +38,11 @@ function reviewView(r: PersonalReview | null | undefined): ReviewView | null {
   return null
 }
 
-export const personalOf = (d: AppDetail | undefined): PersonalInfo | null =>
-  ((d as (AppDetail & { personal?: PersonalInfo }) | undefined)?.personal) ?? null
-
 export function PersonalBar({ detail, onRefreshed }: { detail: AppDetail; onRefreshed: () => void }) {
-  const info = personalOf(detail)
+  const info = detail.personal ?? null
+  // 管理员关了开关：刷新、提交审核服务端都会拒，详情里照同一条规则给了 allowed（blueprints/personal.allowed），这里照它写明、
+  // 按钮置灰。详情没给（老服务端）的不猜，按钮照常，由服务端拒并说清
+  const allowed = info?.allowed !== false
   const [remaining, setRemaining] = useState<number | null>(info?.remaining_today ?? null)
   const [busy, setBusy] = useState(false)
   const [review, setReview] = useState<ReviewView | null>(reviewView(info?.review))
@@ -102,6 +85,7 @@ export function PersonalBar({ detail, onRefreshed }: { detail: AppDetail; onRefr
   return (
     <div className="space-y-2" data-personal-bar={detail.id}>
       <Notice tone="info" attr={{ 'data-personal-banner': '' }}>{T.banner}</Notice>
+      {!allowed && <Notice tone="warn" attr={{ 'data-personal-off': '' }}>{T.switchedOff}</Notice>}
       {info?.graph_changed && detail.blueprint_id && (
         <Notice tone="warn" attr={{ 'data-personal-graph-changed': '' }}>
           {T.graphChanged}{' '}
@@ -109,8 +93,8 @@ export function PersonalBar({ detail, onRefreshed }: { detail: AppDetail; onRefr
         </Notice>
       )}
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <button type="button" className="btn btn-sm" disabled={busy || usedUp} onClick={() => void refresh()}
-                title={usedUp ? T.refreshUsedUp : T.refreshLimitHint} data-personal-refresh="">
+        <button type="button" className="btn btn-sm" disabled={busy || usedUp || !allowed} onClick={() => void refresh()}
+                title={!allowed ? T.switchedOff : usedUp ? T.refreshUsedUp : T.refreshLimitHint} data-personal-refresh="">
           {busy ? <Spinner size={11} /> : <RotateCw size={11} aria-hidden />} {busy ? T.refreshing : T.refresh}
         </button>
         <span className="text-2xs text-dim" data-personal-remaining={remaining ?? ''}>
@@ -137,7 +121,8 @@ export function PersonalBar({ detail, onRefreshed }: { detail: AppDetail; onRefr
                 {review.note ? T.rejectedNote(review.note) : T.rejected}
               </span>
             )}
-            <button type="button" className="btn btn-sm" title={T.submitReviewHint} onClick={() => setAsking(true)}
+            <button type="button" className="btn btn-sm" title={allowed ? T.submitReviewHint : T.switchedOff} disabled={!allowed}
+                    onClick={() => setAsking(true)}
                     data-personal-submit-review="">
               <Send size={11} aria-hidden /> {T.submitReview}
             </button>
@@ -196,5 +181,97 @@ function ReviewDialog({ appId, onClose, onSent }: {
         </div>
       </div>
     </Modal>
+  )
+}
+
+// ---------------------------------------------------------------- 别人的个人应用（管理员）
+
+/** 别人的个人应用：开了登录的管理员看到的只有元数据（服务端 api/apps._personal_stub，my_role 为空） */
+export const isPersonalStub = (a: AppSummary): boolean => a.scope === 'personal' && a.my_role == null
+
+/** 归档别人的个人应用：确认框写明后果；成功交回服务端的那一份（同样只有元数据），取消或失败为 null */
+async function archiveStub(app: AppSummary): Promise<AppSummary | null> {
+  if (!(await confirmDialog({
+    title: T.archiveTitle(app.name), consequences: T.archiveConsequences, confirmLabel: T.archiveConfirm, danger: true,
+  }))) return null
+  try {
+    const next = await api.apps.archive(app.id)
+    toast.ok(T.archiveDone(next.name))
+    return next
+  } catch (e) {
+    toast.error(e)
+    return null
+  }
+}
+
+/** 拥有者、创建和更新时间：服务端只给这几样 */
+function StubMeta({ app }: { app: AppSummary }) {
+  return (
+    <div className="space-y-0.5 text-2xs leading-relaxed text-dim" data-app-stub-meta="">
+      <p data-app-stub-owner={app.owner ?? ''}>{app.owner ? T.owner(app.owner) : T.ownerUnknown}</p>
+      {app.created_at && <p data-app-stub-created="">{T.createdAt(formatDateTime(app.created_at))}</p>}
+      <p data-app-stub-updated="">{T.updatedAt(formatDateTime(app.updated_at))}</p>
+    </div>
+  )
+}
+
+function ArchiveButton({ app, onArchived }: { app: AppSummary; onArchived: (next: AppSummary) => void }) {
+  const [busy, setBusy] = useState(false)
+  if (app.status === 'archived') return <span className="chip">{APP_TEXT.archived}</span>
+  return (
+    <button type="button" className="btn btn-xs" disabled={busy} data-app-stub-archive=""
+            onClick={async () => {
+              setBusy(true)
+              const next = await archiveStub(app)
+              setBusy(false)
+              if (next) onArchived(next)
+            }}>
+      {busy ? <Spinner size={10} /> : <Archive size={11} aria-hidden />} {T.archive}
+    </button>
+  )
+}
+
+/** 应用首页「使用者的个人应用」一组里的一张卡：不链到应用页（看不到内容），只写元数据，给「归档」 */
+export function PersonalStubCard({ app, onArchived }: { app: AppSummary; onArchived: () => void }) {
+  return (
+    <li className="flex flex-col rounded-lg border bg-panel p-3" data-app-stub={app.id}>
+      <div className="flex items-start gap-2">
+        <span aria-hidden className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border bg-elev text-dim">
+          <LayoutGrid size={14} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-semibold text-fg">{app.name}</div>
+          <StubMeta app={app} />
+        </div>
+      </div>
+      <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-2xs">
+        <span className="chip" style={{ color: 'var(--accent)' }}>{T.badge}</span>
+        <span className="flex-1" />
+        <ArchiveButton app={app} onArchived={onArchived} />
+      </div>
+    </li>
+  )
+}
+
+/** 管理员打开别人的个人应用：写明看不到内容，只给元数据和「归档」，不去取页面 */
+export function PersonalStubPage({ app, onArchived }: { app: AppSummary; onArchived: () => void }) {
+  const who = app.owner ?? T.ownerUnknown
+  return (
+    <div className="flex h-full flex-col" data-app-stub-page={app.id}>
+      <PageHeader icon={<LayoutGrid size={14} />} title={app.name}
+                  actions={<span className="chip" title={T.badgeHint} data-app-personal="">{T.badge}</span>} />
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-5xl space-y-3 p-4">
+          <div className="text-2xs"><BackLink to="/apps?tab=apps" label={APP_TEXT.backToApps} /></div>
+          <Notice tone="info" attr={{ 'data-app-stub-notice': '' }}>
+            <span className="font-medium">{T.stubTitle(who)}</span>：{T.stubBody}
+          </Notice>
+          <div className="flex flex-wrap items-start gap-3 rounded-lg border bg-panel p-3">
+            <div className="min-w-0 flex-1"><StubMeta app={app} /></div>
+            <ArchiveButton app={app} onArchived={onArchived} />
+          </div>
+        </div>
+      </div>
+    </div>
   )
 }

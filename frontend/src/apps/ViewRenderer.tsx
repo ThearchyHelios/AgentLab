@@ -44,9 +44,8 @@ export interface ViewEditMarks {
 
 const EditMarksCtx = createContext<ViewEditMarks | null>(null)
 
-/** 服务端按草稿解析时给隐藏的组件带的标记（发布版里没有这样的组件） */
-const isHidden = (node: ViewNode, marks: ViewEditMarks | null) =>
-  (node as ViewNode & { hidden?: boolean }).hidden === true || !!marks?.hidden.has(node.id)
+/** 服务端按草稿解析时给隐藏的组件带的标记（ViewNode.hidden，发布版里没有这样的组件），加上这一次刚隐藏的 */
+const isHidden = (node: ViewNode, marks: ViewEditMarks | null) => node.hidden === true || !!marks?.hidden.has(node.id)
 
 export function ViewRenderer({ model, appId, runId, preview = false, onNavigate, onReload, editing }: ViewRendererProps) {
   const [evidence, setEvidence] = useState<EvidenceTarget | null>(null)

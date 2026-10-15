@@ -20,12 +20,13 @@ import pytest
 from app.blueprints.generation import BlueprintApplier, BlueprintChecker, TemplateApplier, TemplateChecker
 from app.blueprints.instantiate import generated_groups, instantiate
 from app.blueprints.templates import _common as c
+from app.blueprints.templates import get_template
 from app.db.base import SessionLocal
 import app.db.models  # noqa: F401 - 建表前要先登记全部模型（conftest 按 Base.metadata 建）
 
 
 def _board():
-    extras = c.EXTRAS["periodic_board"]
+    extras = get_template("periodic_board")
     inst = instantiate(extras.example())
     group = generated_groups(inst)["fetch_shop"]
     return extras, inst, group
@@ -143,7 +144,7 @@ async def test_apply_ops_and_save_writes_events_and_marks_stale_joints():
     from app.blueprints.ops import BpRefused
     from app.db.models_blueprints import Blueprint, BlueprintEvent
 
-    extras = c.EXTRAS["periodic_board"]
+    extras = get_template("periodic_board")
     spec = extras.example()
     inst = instantiate(spec, filled=extras.example_fill())
     bp_id = await _blueprint(spec, template_id="periodic_board", template_version=1, joints=inst.joints)

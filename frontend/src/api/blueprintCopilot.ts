@@ -14,6 +14,7 @@
  * 开流之前就被拒（4xx/5xx）时 onEnd 带服务端那句话、状态码和机读码；流到一半断了和一开始就连不上一样，说无法连接服务。
  * 请求函数从 ./http 导入，不要从 ./client 导入（循环导入，见 http.ts 开头）。
  */
+import type { BlueprintStreamEvent, FillJointsEvent } from '../typesBlueprint'
 import { ApiError, BASE, NETWORK_MESSAGE, actorHeader, codeOf, describeDetail, isGatewayFailure, parseBody, report } from './http'
 
 export interface BlueprintStreamRequest {
@@ -31,8 +32,8 @@ export interface FillJointsRequest {
 
 export type StreamEnd = (error?: string, info?: { status?: number; code?: string; aborted?: boolean }) => void
 
-/** 一条 SSE：返回取消函数 */
-function sse(path: string, body: unknown, onOp: (op: any) => void, onEnd: StreamEnd): () => void {
+/** 一条 SSE：返回取消函数。帧的形状以服务端为准（typesBlueprint 的 BlueprintStreamEvent、FillJointsEvent），这里不逐帧核对 */
+function sse<E>(path: string, body: unknown, onOp: (op: E) => void, onEnd: StreamEnd): () => void {
   const controller = new AbortController()
   void (async () => {
     try {
@@ -94,8 +95,8 @@ function sse(path: string, body: unknown, onOp: (op: any) => void, onEnd: Stream
   return () => controller.abort()
 }
 
-export const streamBlueprint = (body: BlueprintStreamRequest, onOp: (op: any) => void, onEnd: StreamEnd) =>
+export const streamBlueprint = (body: BlueprintStreamRequest, onOp: (op: BlueprintStreamEvent) => void, onEnd: StreamEnd) =>
   sse('/copilot/blueprint-stream', body, onOp, onEnd)
 
-export const streamFillJoints = (body: FillJointsRequest, onOp: (op: any) => void, onEnd: StreamEnd) =>
+export const streamFillJoints = (body: FillJointsRequest, onOp: (op: FillJointsEvent) => void, onEnd: StreamEnd) =>
   sse('/copilot/fill-joints-stream', body, onOp, onEnd)

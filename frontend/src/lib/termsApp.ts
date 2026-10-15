@@ -65,11 +65,8 @@ export const APP_HOME_TEXT = {
   taskNotFound: '待办不存在，所属的运行可能已被删除',
 }
 
-/**
- * 待办的种类：看中断内容里的 kind，不看 mode（§3.7）。review 是个人应用提交审核（docs/design/normal-user-apps.md N7）：
- * typesApp 的 TaskKind 还没有它（契约待补），这里先按多一种写
- */
-export const TASK_KIND_LABEL: Record<TaskKind | 'review', string> = {
+/** 待办的种类：看中断内容里的 kind，不看 mode（§3.7）。review 是个人应用提交审核（docs/design/normal-user-apps.md N7） */
+export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   approve: '人工审批',
   input: '补充输入',
   edit: '改稿',
@@ -547,6 +544,14 @@ export const FILE_TEXT = {
   /** 值不是上传后拿回的引用（前后端同一条：必填，形状是文件引用） */
   invalid: '请上传文件',
   empty: '未上传',
+  // ---- 运行详情里读入附件的一行（file.extracted，服务端 files/text.py 的模板函数 file_text）。数由调用方按千分位写好 ----
+  extracted: (name: string, chars: string | null) => {
+    const what = name ? `读入附件「${name}」` : '读入附件'
+    return chars == null ? what : `${what}${name ? '' : ' '}${chars} 字`
+  },
+  extractedAll: (total: string) => `全文 ${total} 字，已全部读入`,
+  extractedCut: (chars: string, total: string) => `全文 ${total} 字，只读入了前 ${chars} 字，其余没有读入`,
+  extractFailed: (name: string) => (name ? `附件「${name}」抽不出文字` : '附件抽不出文字'),
   typeLabels: {
     'application/pdf': 'PDF', 'application/msword': 'Word', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'Word',
     'application/vnd.ms-excel': 'Excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'Excel',
@@ -586,6 +591,7 @@ export const RECORDS_TEXT = {
   more: '加载更多',
   reload: '重新读取',
   tableMissing: '这个应用还没有记录表：发布之后、有人提交过才会有记录',
+  preview: '按草稿预览：这里不列真实的记录，发布之后按看的人列出',
   yes: '是',
   no: '否',
 }
@@ -625,6 +631,25 @@ export const PERSONAL_TEXT = {
   rejectedNote: (note: string) => `上次的审核已退回：${note}`,
   graphChanged: '蓝图在存成个人应用之后又改过：刷新按存下的那一版运行，要用改过的，请回到蓝图重新存成你的应用。',
   graphChangedGo: '回到蓝图',
+  switchedOff: '管理员关闭了「使用者可以建个人应用」：已有的结果还能看，暂时不能刷新、提交审核',
+  // ---- 管理员看别人的个人应用：只有名称、拥有者、时间，可以归档，看不到内容
+  othersGroup: '使用者的个人应用',
+  othersGroupHint: '使用者自己建的个人应用。管理员只看得到名称、拥有者和时间，可以归档，看不到页面、运行和蓝图的内容',
+  owner: (who: string) => `拥有者：${who}`,
+  ownerUnknown: '拥有者未记录',
+  createdAt: (t: string) => `创建于 ${t}`,
+  updatedAt: (t: string) => `更新于 ${t}`,
+  stubTitle: (who: string) => `这是 ${who} 的个人应用`,
+  stubBody: '个人应用只有拥有者看得见。管理员看得到名称、拥有者和时间，可以归档，但看不到页面、运行和蓝图的内容。',
+  archive: '归档',
+  archiveTitle: (name: string) => `归档「${name}」？`,
+  archiveConsequences: [
+    '拥有者的应用列表里不再列出它，不能再刷新或提交审核',
+    '它的蓝图和以前的刷新记录照常保留，你看不到它们的内容',
+    '目前没有恢复的操作',
+  ],
+  archiveConfirm: '归档个人应用',
+  archiveDone: (name: string) => `已归档「${name}」`,
 }
 
 /** 审核待办（个人应用提交审核，N7）：处理人在待办里取一份共享副本，在副本上试运行、走发布单；不发布就退回 */

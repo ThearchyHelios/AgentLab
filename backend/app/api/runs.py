@@ -170,8 +170,14 @@ async def list_runs(
 
     以前只有 limit：待审批的运行排在第 145 位，列表只取 100 条，点了徽标也找不到它。
     筛选都走服务端，翻页用 created_at 做游标（before 传上一页最后一条的 created_at）。
+    别人的个人应用刷新、个人蓝图试运行不列（只给拥有者，auth/access.hidden_runs），管理员也一样。
     """
-    stmt = select(Run).order_by(Run.created_at.desc()).limit(limit)
+    from sqlalchemy import not_
+
+    from app.api.deps import current_principal
+    from app.auth.access import hidden_runs
+
+    stmt = select(Run).where(not_(hidden_runs(current_principal()))).order_by(Run.created_at.desc()).limit(limit)
     if workflow_id == UNSAVED:
         stmt = stmt.where(Run.workflow_id.is_(None))
     elif workflow_id:
@@ -649,12 +655,18 @@ async def list_approvals(
     limit: int = Query(default=100, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> list[ApprovalOut]:
+    from sqlalchemy import not_
+
+    from app.api.deps import current_principal
+    from app.auth.access import hidden_runs
     from app.db.models import Task
 
     stmt = (
         select(Approval, Run, Task.id)
         .join(Run, Run.id == Approval.run_id, isouter=True)
         .join(Task, Task.approval_id == Approval.id, isouter=True)
+        # 别人的个人应用刷新、个人蓝图试运行上的审批不列（只给拥有者，同运行列表）
+        .where(or_(Run.id.is_(None), not_(hidden_runs(current_principal()))))
         .order_by(Approval.created_at.desc())
         .limit(limit)
     )
@@ -698,9 +710,13 @@ async def decide(
     x_actor: str | None = Header(default=None),
 ) -> Any:
     """兼容垫片：改走待办服务（app/process/tasks.py 的 respond）。请求体照旧，只当一票、原样交给节点。"""
+    from app.api.deps import PRIVATE_RUN, can_read_run, current_principal
+
     approval = await session.get(Approval, approval_id)
     if not approval:
         raise HTTPException(404, "审批记录不存在，所属的运行可能已被删除")
+    if not await can_read_run(current_principal(), approval.run_id):
+        raise HTTPException(403, PRIVATE_RUN)
     if approval.status != "pending":
         raise HTTPException(409, "这条审批已处理过，请刷新页面查看最新状态")
     # 在落签批人之前拦：拒掉的批准不该留下「谁试图批的」

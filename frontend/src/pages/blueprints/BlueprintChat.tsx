@@ -16,10 +16,14 @@ import { decodeCopilot, type CopilotOp } from '../../run/decode'
 import { BLUEPRINT_TEXT } from '../../lib/terms'
 import { chatBusy, openAsk, useBlueprint, type BpTurn } from '../../store/blueprint'
 import type { ConversationTurn } from '../../types'
+import type { BlueprintTurnMeta } from '../../typesBlueprint'
 
-/** 落过库的一轮 → 显示用的一轮。meta.asked 是服务端记的反问 {question, options}；answer 是回答或这一轮的说明 */
+/**
+ * 落过库的一轮 → 显示用的一轮。meta 的形状见 BlueprintTurnMeta（ConversationTurn.meta 是各种对话共用的宽类型，这里按蓝图
+ * 对话的约定读，缺字段、类型不对的照样不崩）；answer 是回答或这一轮的说明
+ */
 function pastTurn(t: ConversationTurn): StreamTurn {
-  const meta = (t.meta ?? {}) as { looks?: CopilotOp[]; asked?: { question?: string; options?: string[] } | null }
+  const meta: BlueprintTurnMeta = t.meta ?? {}
   const asked = meta.asked && typeof meta.asked === 'object' ? meta.asked : null
   const ops: CopilotOp[] = [...(Array.isArray(meta.looks) ? meta.looks.map((l) => ({ ...l, op: 'look' })) : [])]
   if (t.status !== 'error') ops.push({ op: 'done', explanation: t.explanation || '' })

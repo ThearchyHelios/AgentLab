@@ -4,7 +4,7 @@
 关节分两种：确定性关节由蓝图直接填，不经模型；生成关节只有 sql 和 metric_expr 两类，模型在 TemplateApplier 下
 只能用 fill_joint 填模板声明过的关节。实例化后的图和骨架逐节点比对，只许关节位置不同（tpl.skeleton_changed）。
 
-开发者扩展时，模板定义、实例化、测试三样都要给；check_registry 在启动时核对。
+开发者扩展时，模板定义（连同示例蓝图 example / example_fill）、实例化、测试三样都要给；check_registry 在启动时核对。
 """
 from __future__ import annotations
 
@@ -55,6 +55,18 @@ class TemplateDef:
     #: schedule(bp) -> 定时任务参数 | None
     schedule: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
     tags: list[str] = field(default_factory=list)
+    #: 一张完整的示例蓝图（测试和启动核对用）：实例化、生成关节都填上后要能通过画布校验和发布前检查。必须给
+    example: Callable[[], dict[str, Any]] | None = None
+    #: 示例蓝图的生成关节怎么填（测试和启动核对用）：{关节 id: 值}。必须给（没有生成关节的给 dict）
+    example_fill: Callable[[], dict[str, Any]] | None = None
+    #: prefill(spec)：选模板时预置还没填的卡片（原地改，已经写了的不动）
+    prefill: Callable[[dict[str, Any]], None] | None = None
+    #: briefs(bp) -> {group: 说明}：每组生成关节给模型看的说明（填关节时交给助手，依据指纹按它算）
+    briefs: Callable[[dict[str, Any]], dict[str, str]] | None = None
+    #: problems(spec) -> [{code, level, path, message}]：卡片内容超出模板能力的地方（bp.template_mismatch 等）
+    problems: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None
+    #: 自由形：图是导入的（实例化时从上下文拿），模板不出骨架、不重新排版
+    imports_graph: bool = False
 
 
 _REGISTRY: dict[str, TemplateDef] = {}
@@ -77,8 +89,10 @@ def list_templates() -> list[TemplateDef]:
 
 
 def check_registry() -> list[str]:
-    """启动时核对：首批模板都登记了、关节类型都认得。交回问题清单（空 = 没问题）。"""
-    problems = [f"模板「{t}」没有登记" for t in TEMPLATE_IDS if t not in _REGISTRY]
-    return problems
+    """启动时核对（api/templates.py 导入时调）：首批模板都登记了、关节类型都认得、每个模板都给了示例蓝图，示例实例化出来
+    过得了画布校验、骨架比对没有差异（blueprints/instantiate.registry_problems）。交回问题清单（空 = 没问题）。"""
+    from app.blueprints.instantiate import registry_problems
+
+    return registry_problems()
 
 from app.blueprints.templates import approval, exception_handling, freeform, periodic_board, reconcile_writeback, records  # noqa: E402,F401

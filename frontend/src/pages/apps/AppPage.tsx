@@ -5,8 +5,8 @@
  * 每 5 秒重取一次，生成完自动换上；引用的版本退役了照实提示，入口暂停发起。
  *
  * 另取一次应用详情：有 manage 的人点「编辑」在页面上直接改（地址上记 edit=1，见 PageEdit.tsx，normal-user-apps N6）；
- * 个人应用（scope 为 personal）顶上写明是个人应用，给「刷新」和「提交审核」（personal.tsx，N7）。详情取不到不挡页面：
- * 照只能用的人画。
+ * 个人应用（scope 为 personal）顶上写明是个人应用，给「刷新」和「提交审核」（personal.tsx，N7）；开了登录的管理员打开别人的
+ * 个人应用只拿到元数据，换成只写名称、拥有者、时间和「归档」的一页。详情取不到不挡页面：照只能用的人画。
  */
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { LayoutGrid, PencilLine, RotateCw, Settings2 } from 'lucide-react'
@@ -14,14 +14,14 @@ import { api } from '../../api/client'
 import { ViewRenderer } from '../../apps/ViewRenderer'
 import { parseViewParams } from '../../apps/components/input'
 import { Notice, PageHeader, Skeleton, Spinner, Tabs } from '../../components/ui'
-import { useAtLeast } from '../../store/auth'
+import { loginOn, useAtLeast, useAuth } from '../../store/auth'
 import { usePageTitle } from '../../lib/notify'
 import { APP_TEXT, PAGE_EDIT_TEXT, PERSONAL_TEXT } from '../../lib/termsApp'
 import type { AppDetail } from '../../typesApp'
 import { AppMeta, BackLink, LoadError, appPath, loadHome, useLoad, usePoll } from './shared'
 import { BackfillPanel } from './backfill'
 import { PageEditor } from './PageEdit'
-import { PersonalBar } from './personal'
+import { PersonalBar, PersonalStubPage, isPersonalStub } from './personal'
 
 const POLL_MS = 5000
 
@@ -34,7 +34,9 @@ export function AppPage() {
   const [search, setSearch] = useSearchParams()
   const raw = search.get('params')
   const navigate = useNavigate()
-  const { data: detail, reload: reloadDetail } = useLoad((signal) => api.apps.get(appId, { signal }), [appId])
+  const { data: detail, error: detailError, reload: reloadDetail } = useLoad((signal) => api.apps.get(appId, { signal }), [appId])
+  // 开了登录的管理员打开的可能是别人的个人应用（只有元数据）：等详情回来再决定画哪一种，免得先去取一次看不到的页面
+  const mayBeStub = useAuth((s) => loginOn(s.me) && s.me?.role === 'admin')
   const editing = editableOf(detail) && search.get('edit') === '1'
   const setEditing = (on: boolean) => setSearch((prev) => {
     const next = new URLSearchParams(prev)
@@ -51,6 +53,9 @@ export function AppPage() {
     navigate(`${appPath(appId)}/p/${encodeURIComponent(id)}${tail ? `?${tail}` : ''}`)
   }
 
+  // 别人的个人应用（开了登录的管理员）：服务端只给元数据，页面、运行都看不到，不去取
+  if (detail && isPersonalStub(detail)) return <PersonalStubPage app={detail} onArchived={reloadDetail} />
+  if (mayBeStub && !detail && !detailError) return <div className="p-4"><Skeleton rows={6} /></div>
   if (editing && detail) {
     return (
       <PageEditor key={appId} appId={appId} detail={detail} pageId={pageId} rawParams={raw} onNavigate={go}

@@ -106,5 +106,5 @@ TEMPLATE = register(TemplateDef(
            "access": "可选：谁能用、谁能看全部、谁能管理"},
     personal="导入的图满足问数据的规则（只读、没有人工节点和写入）时可以",
     skeleton=skeleton, app_skeleton=app_skeleton, schedule=schedule, tags=["导入"],
+    example=example, example_fill=dict, imports_graph=True,
 ))
-c.extend(ID, c.Extras(example=example, example_fill=dict, imports_graph=True))

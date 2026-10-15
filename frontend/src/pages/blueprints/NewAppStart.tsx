@@ -29,8 +29,6 @@ import { blueprintPath, useCreateScope } from './shared'
 /** 起点：建蓝图的请求体里 source 那一段 */
 type Source = { kind: BlueprintSourceKind; id?: string; version?: number }
 
-/** 模板说明：服务端给了会产出什么、要准备什么时用它的，没给时按模板 id 说（termsBlueprint.TEMPLATE_PRODUCES） */
-type TemplateCardInfo = TemplateInfo & { produces?: string | null; prepare?: string[] | null }
 
 export function NewAppStart() {
   const scope = useCreateScope()
@@ -155,7 +153,7 @@ function TemplateStart({ scope, busy, onPick }: {
 }) {
   const { data, error, reload } = useLoad(() => api.templates.list(), [])
   // 「自由形」是从已有的运行或工作流导入用的，不作为从零开始的场景
-  const items = (data?.items ?? []).filter((t) => t.id !== 'freeform') as TemplateCardInfo[]
+  const items = (data?.items ?? []).filter((t) => t.id !== 'freeform')
   return (
     <section className="space-y-2" data-new-app-start="template" aria-labelledby="new-app-template">
       <div>
@@ -177,14 +175,15 @@ function TemplateStart({ scope, busy, onPick }: {
 }
 
 function TemplateCard({ t, scope, busy, onPick }: {
-  t: TemplateCardInfo; scope: BlueprintScope; busy: string | null; onPick: (t: TemplateInfo) => void
+  t: TemplateInfo; scope: BlueprintScope; busy: string | null; onPick: (t: TemplateInfo) => void
 }) {
   // 个人应用只能用模板里只读的那部分；整个模板都用不了的（要派人审批、写外部系统）照实说，不给选
   const blocked = scope === 'personal' && !t.personal
-  const produces = t.produces || TEMPLATE_PRODUCES[t.id]
-  const prepare = t.prepare?.length ? t.prepare
-    : t.cards.filter((c) => c.card !== 'purpose' && c.card !== 'template')
-      .map((c) => (c.note ? `${CARD_LABEL[c.card] ?? c.card}：${c.note}` : CARD_LABEL[c.card] ?? c.card))
+  // 会产出什么：按模板 id 说（termsBlueprint.TEMPLATE_PRODUCES，模板说明里没有这一项）；要准备什么：用模板说明里各张卡片的
+  // 说明拼（服务端 TemplateInfo.cards）
+  const produces = TEMPLATE_PRODUCES[t.id]
+  const prepare = t.cards.filter((c) => c.card !== 'purpose' && c.card !== 'template')
+    .map((c) => (c.note ? `${CARD_LABEL[c.card] ?? c.card}：${c.note}` : CARD_LABEL[c.card] ?? c.card))
   const key = `template:${t.id}`
   return (
     <li className="flex flex-col rounded-lg border bg-panel p-3" data-template={t.id} aria-disabled={blocked || undefined}>

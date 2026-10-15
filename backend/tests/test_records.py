@@ -670,3 +670,251 @@ async def test_a_correction_only_reaches_rows_the_submitter_can_see(monkeypatch)
     assert (await fix("amy", amy_row.row_id, "a2")).status == 200
     assert (await fix("cat", bob_row.row_id, "c1")).status == 200
     assert "不在这张记录表里" in (await fix("dan", amy_row.row_id, "d1")).error
+
+
+def correct_graph(table_ref: str) -> dict:
+    """写记录表的那一步带上要更正的行（supersedes）。"""
+    return chain(node("start", "input", fields=[{"name": "store"}, {"name": "qty"}, {"name": "fix"}]),
+                 node("w", "tool", tool=RECORDS_APPEND, approval="never",
+                      args={"table": table_ref, "values": {"门店": "{{ input.store }}", "数量": "{{ input.qty }}"},
+                            "supersedes": "{{ input.fix }}"}),
+                 node("out", "output", fields=[{"name": "id", "value": "{{ nodes.w.receipt._id }}"}]))
+
+
+async def test_a_correction_keeps_the_submitter_and_records_who_corrected(engine_up):
+    """别人代为更正（D6）：更正行的提交人沿用原行的——原提交人按「只看自己的」照样看得见改过的那一行；动手更正的人记进
+    动作记录的回执和审计（records.correct），不记进行里。重放同一个动作不再写行、也不再记审计。"""
+    from sqlalchemy import func
+
+    from app.capabilities.platform import execute
+    from app.capabilities.registry import get_capability
+    from app.core.artifact_store import load
+    from app.db.models import AuditEvent
+
+    app = await make_app(grants={"amy": "use", "cat": "observe"})
+    table = await make_table(app)
+    source = await source_of(table)
+    original = add(table, {"门店": "一店", "数量": 3}, by="amy")
+    workflow_id = await writer_of(app, correct_graph(source.name))
+    await _sync()
+
+    run = await run_manager.start(graph=correct_graph(source.name),
+                                  input_payload={"store": "一店", "qty": "9", "fix": original.row_id},
+                                  run_class="formal", started_by="cat", workflow_id=workflow_id)
+    done = await wait(run.id, ("succeeded", "failed", "interrupted"))
+    assert done.status == "succeeded", done.error
+    async with SessionLocal() as session:
+        [rec] = list((await session.execute(select(ActionRecord).where(ActionRecord.run_id == run.id))).scalars())
+        audits = list((await session.execute(select(AuditEvent).where(AuditEvent.action == "records.correct",
+                                                                      AuditEvent.subject_id == table.id))).scalars())
+    body = load(rec.receipt["artifact"])["body"]
+    assert (body["_submitted_by"], body["corrected_by"]) == ("amy", "cat"), "回执里记着谁交的、谁改的"
+    assert [(a.actor, a.data["submitted_by"], a.data["supersedes"], a.data["row_id"], a.data["run_id"])
+            for a in audits] == [("cat", "amy", original.row_id, body["_id"], run.id)]
+
+    mine, _ = store.rows(path_of(table), columns_of(table), scope="mine", viewer="amy")
+    assert [(r["_id"], r["_submitted_by"], r["values"]["数量"]) for r in mine] == [(body["_id"], "amy", 9)], \
+        "原提交人看得见改过的那一行"
+    assert store.rows(path_of(table), columns_of(table), scope="mine", viewer="cat")[0] == [], "更正的人不算提交人"
+    history, _ = store.rows(path_of(table), columns_of(table), scope="all", viewer=None, history=True)
+    assert {r["_id"]: r["_run_id"] for r in history}[body["_id"]] == run.id, "这一行出自哪次运行照样查得到"
+
+    async with SessionLocal() as session:
+        cap = await get_capability(session, RECORDS_APPEND)
+    again = await execute(None, cap, {"table": source.name, "values": {"门店": "一店", "数量": 9},
+                                      "supersedes": original.row_id},
+                          environment="prod", idem_key=rec.idem_key, on_behalf={"sub": "cat"}, run_id=run.id)
+    assert again.status == 200 and again.body["duplicate"] is True and again.body["_submitted_by"] == "amy"
+    async with SessionLocal() as session:
+        assert int(await session.scalar(select(func.count(AuditEvent.id)).where(
+            AuditEvent.action == "records.correct", AuditEvent.subject_id == table.id)) or 0) == 1
+
+    # 自己交的新一行：提交人就是自己，回执里没有 corrected_by
+    fresh = store.append(path_of(table), columns_of(table), {"门店": "二店", "数量": 1}, version=table.version,
+                         run_id=None, actor="amy", action_key=uuid.uuid4().hex)
+    assert fresh.submitted_by == "amy" and "corrected_by" not in fresh.receipt()
+
+
+# --------------------------------------------------------------------------
+# 跨版本汇总（停用的版本只读挂在连接上，UNION ALL 接上）；停用之前发起的运行照常写完
+# --------------------------------------------------------------------------
+
+#: 不兼容的改动：数量从整数放宽成数（都是数，旧记录照样并进来）、原因从文字改成是或否（意思变了，旧记录这一列为空）、
+#: 加必填的店长（旧记录没有，为空）
+CHANGED = [COLUMNS[0], {**COLUMNS[1], "type": "number"}, {**COLUMNS[2], "type": "boolean"},
+           {"name": "店长", "label": "店长", "type": "string", "required": True}]
+SUMMARY = 'SELECT count(*) AS n, sum("数量") AS s FROM records'
+
+
+async def _publish_changed(app: App, columns=CHANGED) -> tuple[RecordsTable, RecordsTable]:
+    """草稿出第 2 版（draft_table），发布单切换（publish_table）：第 1 版这时才停用。交回（第 1 版，第 2 版）。"""
+    from app.records.tables import draft_table, publish_table
+
+    async with SessionLocal() as session:
+        owner = await session.get(App, app.id)
+        drafted = await draft_table(session, owner, columns)
+        await publish_table(session, owner, f"{drafted.table_key}.v{drafted.version}", columns)
+        await session.commit()
+        key = drafted.table_key
+    async with SessionLocal() as session:
+        v1, v2 = list((await session.execute(select(RecordsTable).where(RecordsTable.table_key == key)
+                                             .order_by(RecordsTable.version))).scalars())
+    return v1, v2
+
+
+async def test_the_summary_reads_every_version_after_an_incompatible_change(engine_up):
+    """表单不兼容地改过并发布之后，看板查新一版的数据源，旧版本的记录照样在汇总里：列照新一版的来，旧版本没有的、类型改得
+    对不上的为空，整数放宽成数的照样并进来；各版本各按自己的高水位固定，同一次运行审批前后查到的数一样；挂上去的旧版本和
+    main 一样不能直接写库名查；用户 SQL 写 ATTACH 照旧被拒。"""
+    from app.apps.resolve import _version_text
+    from app.records.views import cache_token
+
+    app = await make_app()
+    v1 = await make_table(app)
+    first = add(v1, {"门店": "一店", "数量": 2, "原因": "破损"})
+    add(v1, {"门店": "一店", "数量": 5, "原因": "破损"}, supersedes=first.row_id)
+    add(v1, {"门店": "二店", "数量": 1}, by="bob")
+    v1, v2 = await _publish_changed(app)
+    assert v1.retired_at is not None and v2.retired_at is None and v2.version == 2
+    add(v2, {"门店": "三店", "数量": 7.5, "原因": True, "店长": "钱七"})
+    source = await source_of(v2)
+
+    async with SessionLocal() as session:
+        now = await resolve(session, source)
+    got = await run_query(now, 'SELECT _schema_version AS v, "门店", "数量", "原因", "店长" FROM records '
+                               'ORDER BY v, "门店"')
+    assert got.rows == [[1, "一店", 5, None, None], [1, "二店", 1, None, None], [2, "三店", 7.5, 1, "钱七"]], \
+        "旧版本的记录并进来（更正过的只留最新的一行），对不上的列为空"
+    assert (await run_query(now, SUMMARY)).rows == [[3, 13.5]]
+    for sql in ("SELECT count(*) FROM records_v1.records", 'SELECT count(*) FROM "records_v1"."records"',
+                "SELECT count(*) FROM [RECORDS_V1].records", "SELECT count(*) FROM main.records"):
+        with pytest.raises(SqlRejected):
+            await run_query(now, sql)
+    for sql in (f"ATTACH DATABASE '{path_of(v1)}' AS sneak", "DETACH DATABASE records_v1"):
+        with pytest.raises(SqlRejected):
+            await run_query(now, sql)
+    # 同一个数据源不经解析查（数据剖析这类入口）：连接上挂过的旧版本摘掉了，库名写了也查不到
+    with pytest.raises(Exception) as gone:
+        await run_query(source, "SELECT count(*) FROM records_v1.records")
+    assert "records_v1" in str(gone.value)
+    assert [r[1] for r in (await run_query(source, "PRAGMA database_list")).rows] == ["main", "temp"]
+    assert (await run_query(now, "PRAGMA database_list")).rows[-1][1] == "records_v1", "再按汇总查又挂上"
+    # 行级过滤对每一版都生效
+    async with SessionLocal() as session:
+        bobs = await resolve(session, source, {"seq": 1, "rows": "mine", "viewer": "bob",
+                                               "older": [{"version": 1, "seq": 3}]})
+    assert (await run_query(bobs, SUMMARY)).rows == [[1, 1]]
+
+    # 高水位：旧版本同样按发起时固定（停用之前发起的运行还能往旧版本写完）
+    tool = f"db_query__{source.name}"
+    graph = chain(node("start", "input"), node("t1", "tool", tool=tool, args={"sql": SUMMARY}),
+                  node("gate", "human", mode="approve", title="看一眼"),
+                  node("t2", "tool", tool=tool, args={"sql": SUMMARY}),
+                  node("out", "output", fields=[{"name": "t1", "value": "{{ nodes.t1 }}"},
+                                                {"name": "t2", "value": "{{ nodes.t2 }}"}]))
+    run = await run_manager.start(graph=graph, input_payload={}, run_class="formal")
+    assert (await wait(run.id)).status == "interrupted"
+    add(v1, {"门店": "四店", "数量": 4})
+    add(v2, {"门店": "五店", "数量": 6, "店长": "孙八"})
+    await run_manager.resume(run.id, {"approved": True})
+    done = await wait(run.id, ("succeeded", "failed"))
+    assert done.status == "succeeded", done.error
+    assert json.loads(done.output["t1"])["rows"] == [[3, 13.5]]
+    assert json.loads(done.output["t2"])["rows"] == [[3, 13.5]], "审批期间两个版本新来的都没混进这次运行"
+    entry = done.data_versions[source.id]
+    assert entry["seq"] == 1 and entry["older"] == [{"version": 1, "seq": 3}]
+    assert _version_text(entry) == f"{source.name} 截至第 1 条（连同第 1 版截至第 3 条）"
+    assert cache_token(entry) != cache_token({**entry, "older": [{"version": 1, "seq": 4}]}), \
+        "旧版本多了一行，按需视图的缓存就不再算数"
+    again = await run_manager.start(graph=chain(node("start", "input"),
+                                                node("t", "tool", tool=tool, args={"sql": SUMMARY}),
+                                                node("out", "output", fields=[{"name": "t", "value": "{{ nodes.t }}"}])),
+                                    input_payload={}, run_class="formal")
+    assert json.loads((await wait(again.id, ("succeeded", "failed"))).output["t"])["rows"] == [[5, 23.5]]
+
+
+async def test_a_lost_old_version_is_named_not_silently_dropped(engine_up):
+    """旧版本的数据文件不在了（管理员手工删了）：汇总照常查得出来、只是少了那一版，但不是悄悄少——发起时记进 data_versions 的
+    older（missing），印章写明缺了哪一版、数不全；查询快照里同样记着；不在运行里的查询也一样。"""
+    from app.apps.resolve import _records_gap, _version_text
+    from app.core.artifact_store import load
+    from app.db.models import Artifact
+    from app.records.views import pin_entry
+
+    app = await make_app()
+    v1 = await make_table(app)
+    add(v1, {"门店": "一店", "数量": 2})
+    v1, v2 = await _publish_changed(app)
+    add(v2, {"门店": "三店", "数量": 7.5, "店长": "钱七"})
+    source = await source_of(v2)
+    path_of(v1).unlink()
+
+    async with SessionLocal() as session:
+        entry = await pin_entry(session, source)
+        now = await resolve(session, source)
+    assert entry["seq"] == 1 and entry["older"] == [{"version": 1, "seq": None, "missing": True}]
+    assert now.older == ({"version": 1, "seq": None, "missing": True},) and not now.attach
+    assert (await run_query(now, SUMMARY)).rows == [[1, 7.5]], "查得出来，只是没有第 1 版"
+    assert _version_text({**entry, "name": source.name}) == f"{source.name} 截至第 1 条"
+    assert _records_gap({**entry, "name": source.name}) == \
+        f"记录表「{source.name}」第 1 版的数据文件不在了，汇总里没有这一版的记录，数不全"
+
+    tool = f"db_query__{source.name}"
+    run = await run_manager.start(graph=chain(node("start", "input"), node("t", "tool", tool=tool, args={"sql": SUMMARY}),
+                                              node("out", "output", fields=[{"name": "t", "value": "{{ nodes.t }}"}])),
+                                  input_payload={}, run_class="formal")
+    done = await wait(run.id, ("succeeded", "failed"))
+    assert done.status == "succeeded", done.error
+    assert json.loads(done.output["t"])["rows"] == [[1, 7.5]]
+    pinned = done.data_versions[source.id]
+    assert pinned["older"] == [{"version": 1, "seq": None, "missing": True}] and _records_gap(pinned)
+    async with SessionLocal() as session:
+        snaps = list((await session.execute(select(Artifact).where(Artifact.run_id == run.id,
+                                                                   Artifact.kind == "query_snapshot"))).scalars())
+    assert snaps and load(snaps[0].id)["records_view"]["older"] == [{"version": 1, "seq": None, "missing": True}]
+
+
+def test_union_keeps_numbers_widened_and_drops_meanings_that_changed():
+    from app.records.store import Column, union_compatible
+
+    assert union_compatible(Column("数量", type="number"), Column("数量", type="integer"))
+    assert union_compatible(Column("门店"), Column("门店"))
+    assert not union_compatible(Column("原因", type="boolean"), Column("原因"))
+    assert not union_compatible(Column("数量"), Column("数量", type="number")), "数改成文字：旧记录这一列为空"
+
+
+async def test_runs_launched_before_a_version_is_retired_still_write_to_it(engine_up):
+    """停用之前发起、审批停在半路的实例，批完照常写进它发起时的那一版（同「进行中的实例照常走完」）；停用之后发起的
+    运行不能往停用的版本写，一行都不落。"""
+    app = await make_app()
+    v1 = await make_table(app)
+    source = await source_of(v1)
+    graph = chain(node("start", "input", fields=[{"name": "store"}, {"name": "qty"}]),
+                  node("gate", "human", mode="approve", title="批一下"),
+                  node("w", "tool", tool=RECORDS_APPEND, approval="never",
+                       args={"table": source.name, "values": {"门店": "{{ input.store }}", "数量": "{{ input.qty }}"}}),
+                  node("out", "output", fields=[{"name": "id", "value": "{{ nodes.w.receipt._id }}"}]))
+    workflow_id = await writer_of(app, graph)
+    await _sync()
+    before = await run_manager.start(graph=graph, input_payload={"store": "一店", "qty": "3"}, run_class="formal",
+                                     started_by="amy", workflow_id=workflow_id)
+    assert (await wait(before.id)).status == "interrupted"
+    v1, v2 = await _publish_changed(app)
+    after = await run_manager.start(graph=graph, input_payload={"store": "二店", "qty": "4"}, run_class="formal",
+                                    started_by="amy", workflow_id=workflow_id)
+    assert (await wait(after.id)).status == "interrupted"
+    for run in (before, after):
+        await run_manager.resume(run.id, {"approved": True})
+
+    done = await wait(before.id, ("succeeded", "failed"))
+    assert done.status == "succeeded", done.error
+    [row], _ = store.rows(path_of(v1), columns_of(v1), scope="all", viewer=None)
+    assert row["_run_id"] == before.id and row["_schema_version"] == 1 and row["values"]["门店"] == "一店"
+    assert done.output["id"] == row["_id"]
+
+    late = await wait(after.id, ("succeeded", "failed", "interrupted"))
+    assert late.status != "succeeded"
+    async with SessionLocal() as session:
+        [rec] = list((await session.execute(select(ActionRecord).where(ActionRecord.run_id == after.id))).scalars())
+    assert rec.state == "failed" and "停用" in (rec.error or ""), (rec.state, rec.error)
+    assert store.high_water(path_of(v1)) == 1 and store.high_water(path_of(v2)) == 0, "停用之后发起的一行都没写"

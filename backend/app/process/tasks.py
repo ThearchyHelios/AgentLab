@@ -146,9 +146,10 @@ async def open_review(session: AsyncSession, *, run: Run, app_id: str, blueprint
                       to: list[tuple[str, str]]) -> Task:
     """个人应用提交审核：开一条 review 待办，派给选定的搭建者或组（组在这一刻展开成成员，同改派），来源记 review。
 
-    待办的 run_id 不能为空（带外键，开待办的事件、通知都按运行走）：挂在个人应用最近一次成功的刷新上——审核的人要看的
-    也正是这次用真数出的结果。这次运行已经结束，不会被恢复：回复走 _respond_review，不调 run_manager.resume。调用方提交，
-    提交后 announce。"""
+    待办的 run_id 不能为空（带外键，开待办的事件、通知都按运行走）：挂在个人应用最近一次成功的刷新上，只是外键挂靠——
+    个人应用的刷新只有拥有者读得到（auth/access.private_owner），处理人（搭建者、管理员也一样）读不到这次运行、打不开这个
+    个人应用；他要看结果，取共享副本（blueprints/personal.copy_for_review）在副本上试运行。这次运行已经结束，不会被恢复：
+    回复走 _respond_review，不调 run_manager.resume。调用方提交，提交后 announce。"""
     task = Task(run_id=run.id, node_id=None, app_id=app_id, app_version=None, kind=REVIEW_KIND, title=title[:300],
                 policy={"kind": "any"}, correlation_key=f"blueprint:{blueprint_id}")
     session.add(task)

@@ -9,7 +9,8 @@
 （INTEGER PRIMARY KEY），只增不减：从不删行，也就不会复用。
 
 **读。** 高水位（high_water）是现在最大的 _seq。一次运行在开始时记下它（engine/runner._data_versions），之后这次
-运行查到的都是 _seq ≤ 高水位、在那一刻没被更正过的行：行只追加、不改，所以同一次运行查几遍都是同一份。
+运行查到的都是 _seq ≤ 高水位、在那一刻没被更正过的行：行只追加、不改，所以同一次运行查几遍都是同一份。表单不兼容地改过
+之后，临时视图把比这一版老的各版本（只读挂在连接上）按 UNION ALL 接上，各按自己的高水位（view_prelude 的 older）。
 
 这里的函数都是同步的（sqlite3 直连、关 DQS），调用方放进线程。表结构的登记、数据源在 records/tables.py。
 """
@@ -282,10 +283,15 @@ class Appended:
     #: 同一个动作键已经写过：交回的是第一次写下的那一行，这次没有再写
     duplicate: bool
     values: dict[str, Any]
+    #: 这一行记的提交人（更正行沿用原行的，见 append）
+    submitted_by: str | None = None
+    #: 更正行：动手更正的人（不记进行里，记进回执、动作记录和审计）；不是更正为 None
+    corrected_by: str | None = None
 
     def receipt(self) -> dict[str, Any]:
         return {"_seq": self.seq, "_id": self.row_id, "_submitted_at": self.submitted_at,
-                "duplicate": self.duplicate}
+                "_submitted_by": self.submitted_by, "duplicate": self.duplicate,
+                **({"corrected_by": self.corrected_by} if self.corrected_by is not None else {})}
 
 
 def append(path: Path, columns: list[Column], values: Any, *, version: int, run_id: str | None, actor: str | None,
@@ -293,7 +299,11 @@ def append(path: Path, columns: list[Column], values: Any, *, version: int, run_
     """写一行。同一个 action_key 第二次来交回第一次的那一行（duplicate=True），不再写。
 
     values 只认表里的业务列：多出来的字段、必填没填、类型收不成都拒（RecordsRefused），一行都不写。
-    supersedes 是被更正的那一行的 _id：它得在这张表里、而且还没被更正过（更正要改最新的那一行）。"""
+    supersedes 是被更正的那一行的 _id：它得在这张表里、而且还没被更正过（更正要改最新的那一行）。
+
+    提交人（_submitted_by）：新提交记 actor；更正行沿用原行的提交人——这一条还是他交的那一条，按「只看自己的」看的人
+    照样看得见改过的那一行，别人代为更正也不会让它从原提交人眼前消失。动手更正的是 actor，交回在 corrected_by 里，
+    由调用方记进动作记录和审计（records/actions.py）。"""
     if not action_key:
         raise RecordsRefused("records.action_key_missing", "写记录表需要动作键，只能经调用工具节点写入")
     if not isinstance(values, dict):
@@ -311,24 +321,28 @@ def append(path: Path, columns: list[Column], values: Any, *, version: int, run_
         conn = _rw(path)
         try:
             conn.execute("BEGIN IMMEDIATE")
-            done = conn.execute(f"SELECT _seq, _id, _submitted_at FROM {_q(TABLE)} WHERE {ACTION_KEY_COLUMN} = ?",
-                                (action_key,)).fetchone()
+            done = conn.execute(f"SELECT _seq, _id, _submitted_at, _submitted_by, _supersedes FROM {_q(TABLE)} "
+                                f"WHERE {ACTION_KEY_COLUMN} = ?", (action_key,)).fetchone()
             if done is not None:
                 conn.rollback()
                 return Appended(seq=int(done[0]), row_id=str(done[1]), submitted_at=str(done[2]), duplicate=True,
-                                values=_row_values(path, columns, int(done[0])))
+                                values=_row_values(path, columns, int(done[0])), submitted_by=done[3],
+                                corrected_by=actor if done[4] else None)
+            submitted_by = actor
             if supersedes:
-                target = conn.execute(f"SELECT _seq FROM {_q(TABLE)} WHERE _id = ?", (supersedes,)).fetchone()
+                target = conn.execute(f"SELECT _seq, _submitted_by FROM {_q(TABLE)} WHERE _id = ?",
+                                      (supersedes,)).fetchone()
                 if target is None:
                     raise RecordsRefused("records.supersede_missing", "要更正的那一行不在这张记录表里")
                 later = conn.execute(f"SELECT 1 FROM {_q(TABLE)} WHERE _supersedes = ? LIMIT 1",
                                      (supersedes,)).fetchone()
                 if later is not None:
                     raise RecordsRefused("records.supersede_twice", "这一行已经被更正过了，请在最新的那一行上更正")
+                submitted_by = target[1]
             row_id, at = new_id(), _now()
             names = ["_id", "_submitted_by", "_submitted_at", "_run_id", "_supersedes", "_schema_version",
                      ACTION_KEY_COLUMN, *row]
-            params = [row_id, actor, at, run_id, supersedes or None, version, action_key, *row.values()]
+            params = [row_id, submitted_by, at, run_id, supersedes or None, version, action_key, *row.values()]
             cur = conn.execute(f"INSERT INTO {_q(TABLE)} ({', '.join(_q(n) for n in names)}) "
                                f"VALUES ({', '.join('?' for _ in names)})", params)
             seq = int(cur.lastrowid or 0)
@@ -338,7 +352,8 @@ def append(path: Path, columns: list[Column], values: Any, *, version: int, run_
             raise
         finally:
             conn.close()
-    return Appended(seq=seq, row_id=row_id, submitted_at=at, duplicate=False, values=row)
+    return Appended(seq=seq, row_id=row_id, submitted_at=at, duplicate=False, values=row, submitted_by=submitted_by,
+                    corrected_by=actor if supersedes else None)
 
 
 def _row_values(path: Path, columns: list[Column], seq: int) -> dict[str, Any]:
@@ -380,16 +395,32 @@ def lookup(path: Path, columns: list[Column], action_key: str) -> dict[str, Any]
     return {"_seq": int(got[0]), "_id": str(got[1]), "_submitted_at": str(got[2]), "duplicate": True}
 
 
+def union_compatible(new: Column, old: Column) -> bool:
+    """跨版本汇总时，旧版本的这一列能不能并进新版本的同名列：类型一样，或者整数和数之间（都是数）。别的类型改动（数改成
+    文字、文字改成是或否……）意思变了，旧版本那一列补空，不把两种东西混在一列里算。"""
+    return new.type == old.type or {new.type, old.type} <= {"number", "integer"}
+
+
 def view_select(columns: list[Column], *, high_water: int | None, scope: str, viewer: str | None,
-                schema: str = "main") -> str:
+                schema: str = "main", present: list[Column] | None = None) -> str:
     """临时视图（和看板、记录列表）看到的那一份：
 
     - _seq ≤ 高水位（None 为不限，现在有的都算）；
     - 没被更正过：在高水位之内没有一行指向它（_supersedes）。按高水位判，不靠可改的标记——原行永远不改；
     - 行级过滤：scope=all 全部，mine 只看 _submitted_by = viewer 的，none 一行都不给。
 
-    不露 _action_key。列名照 SYSTEM_COLUMNS + 业务列的顺序。"""
-    cols = ", ".join(f"r.{_q(n)}" for n in (*SYSTEM_COLUMNS, *(c.name for c in columns)))
+    不露 _action_key。列名照 SYSTEM_COLUMNS + 业务列的顺序。present 是 schema 那个文件里实际有的业务列（跨版本汇总时
+    旧版本的列）：columns 里它没有的、类型对不上的（union_compatible）补 NULL；None 为 columns 都在。"""
+    have = None if present is None else {c.name.lower(): c for c in present}
+
+    def pick(c: Column) -> str:
+        if have is None:
+            return f"r.{_q(c.name)}"
+        old = have.get(c.name.lower())
+        return f"r.{_q(old.name)} AS {_q(c.name)}" if old is not None and union_compatible(c, old) \
+            else f"NULL AS {_q(c.name)}"
+
+    cols = ", ".join([*(f"r.{_q(n)}" for n in SYSTEM_COLUMNS), *(pick(c) for c in columns)])
     src = f"{_q(schema)}.{_q(TABLE)}"
     where = []
     if high_water is not None:
@@ -406,12 +437,28 @@ def view_select(columns: list[Column], *, high_water: int | None, scope: str, vi
     return f"SELECT {cols} FROM {src} AS r WHERE {' AND '.join(where)}"
 
 
-def view_prelude(columns: list[Column], *, high_water: int | None, scope: str, viewer: str | None) -> tuple[str, ...]:
+@dataclass(frozen=True)
+class OlderVersion:
+    """跨版本汇总时并进来的一个旧表版本：挂在查询连接上的库名（ATTACH … AS schema）、那一版的业务列、这次查询的高水位
+    （None 为不限）。"""
+
+    schema: str
+    columns: list[Column]
+    high_water: int | None
+
+
+def view_prelude(columns: list[Column], *, high_water: int | None, scope: str, viewer: str | None,
+                 older: tuple[OlderVersion, ...] | list[OlderVersion] = ()) -> tuple[str, ...]:
     """查询连接上建同名临时视图的两条语句。SQLite 解析不带库名的表名时先找 temp 库，于是 FROM records 查到的就是
-    这份视图；直接写 main.records 的 SQL 由只读守卫拒掉（data/engine.run_query 的 forbid_schemas）。"""
+    这份视图；直接写 main.records 的 SQL 由只读守卫拒掉（data/engine.run_query 的 forbid_schemas）。
+
+    older 是这张表比这一版老的各版本（只读挂在连接上，records/views.py）：视图按 UNION ALL 把它们接在这一版后面，
+    列照这一版的来，旧版本没有的列补 NULL；每一版各按自己的高水位、自己文件里的更正判，行级过滤同一个。"""
+    parts = [view_select(columns, high_water=high_water, scope=scope, viewer=viewer)]
+    parts += [view_select(columns, high_water=o.high_water, scope=scope, viewer=viewer, schema=o.schema,
+                          present=o.columns) for o in older]
     return (f"DROP VIEW IF EXISTS temp.{_q(TABLE)}",
-            f"CREATE TEMP VIEW {_q(TABLE)} AS "
-            + view_select(columns, high_water=high_water, scope=scope, viewer=viewer))
+            f"CREATE TEMP VIEW {_q(TABLE)} AS " + " UNION ALL ".join(parts))
 
 
 def rows(path: Path, columns: list[Column], *, scope: str, viewer: str | None, history: bool = False,

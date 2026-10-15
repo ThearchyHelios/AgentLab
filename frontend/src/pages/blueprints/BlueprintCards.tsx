@@ -342,16 +342,18 @@ function AddButton({ ctx, label, prompt, path, make }: {
   )
 }
 
-/** 「看哪些数」的一项：先写对到的数据（表、中文名、粒度、业务日期、为什么），再逐项列 */
+/**
+ * 「看哪些数」的一项：先写对到的数据（表、粒度、业务日期、为什么），再逐项列。表只写「源.表」（服务端 BpDataItem.table 是
+ * {source, table}）：表的中文名不在蓝图里，要看去数据目录，这里不另取
+ */
 function DataBlock({ ctx, item, index }: { ctx: CardCtx; item: BpDataItem; index: number }) {
-  const table = (item.table?.value ?? null) as { source?: string; table?: string; label?: string } | null
-  const date = item.date?.value as { column?: string; rule?: string } | null
+  const table = item.table?.value ?? null
+  const date = item.date?.value ?? null
   const head = table?.table ? (
     <div className="mb-1.5 rounded border bg-bg px-2 py-1.5 text-2xs leading-relaxed" data-bp-match={`${table.source}.${table.table}`}>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
         <span className="inline-flex items-center gap-1 text-fg"><Database size={11} aria-hidden className="text-faint" />
           {BLUEPRINT_TEXT.dataTable}：<span className="mono">{table.source}.{table.table}</span></span>
-        {table.label && <span>{BLUEPRINT_TEXT.dataTableLabel}：<span className="text-fg">{table.label}</span></span>}
         {item.grain?.value != null && <span>{BLUEPRINT_TEXT.dataGrain}：<span className="text-fg">{String(item.grain.value)}</span></span>}
         {date?.column && <span>{BLUEPRINT_TEXT.dataDate}：<span className="text-fg">{valueText('date', date)}</span></span>}
       </div>
@@ -448,9 +450,6 @@ function AccessCard({ ctx, note, issues }: { ctx: CardCtx; note?: string; issues
 
 // ---------------------------------------------------------------- 关节
 
-/** 关节的说明：服务端在关节状态上给了名字和种类时用它，没给写关节 id */
-type JointView = JointState & { label?: string | null; kind?: string | null }
-
 /** 按卡片直接填好的确定性关节（表单、处理人、定时这些）：不经模型，不逐个列 */
 const deterministic = (j: JointState) => j.status === 'filled' && j.by === 'template'
 
@@ -460,7 +459,7 @@ function Joints({ blueprintId }: { blueprintId: string }) {
   const bp = entry?.blueprint
   if (!bp) return null
   const fill = entry?.fill
-  const all = Object.entries(bp.joints ?? {}) as [string, JointView][]
+  const all = Object.entries(bp.joints ?? {})
   // 只列生成关节（取数的 SQL、指标的算法）：确定性关节按卡片填，汇总成一句
   const joints = all.filter(([, j]) => !deterministic(j))
   const fixed = all.length - joints.length
@@ -479,8 +478,9 @@ function Joints({ blueprintId }: { blueprintId: string }) {
       setBusy(false)
     }
   }
+  // 关节的说法：模板声明的名字，没有就写种类和 id（实例化之前存下的关节没有这两项）
   const nameOf = (id: string) => {
-    const j = (bp.joints?.[id] ?? {}) as JointView
+    const j: Partial<JointState> = bp.joints?.[id] ?? {}
     return j.label || (j.kind ? `${JOINT_KIND_LABEL[j.kind] ?? j.kind}（${id}）` : id)
   }
   return (

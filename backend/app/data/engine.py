@@ -942,6 +942,10 @@ async def run_query(
             raise SqlRejected(f"「{source.name}」只能按表名查询（如 FROM records），不能在表名前加库名「{hit}.」："
                               "这张表只给看这次运行能看的那些行")
     prelude: tuple[str, ...] = tuple(getattr(source, "prelude", None) or ())
+    attach: tuple[tuple[str, str], ...] = tuple(getattr(source, "attach", None) or ())
+    if attach and (kind != "sqlite" or not source.readonly):
+        # 挂旧版本靠 URI 写法的 mode=ro：只有以 URI 只读打开的 SQLite 连接认它（_sqlite_url）
+        raise ValueError("只有只读的 SQLite 数据源能挂其他库")
 
     engine = await engines.get(source)
     started = time.perf_counter()
@@ -950,6 +954,9 @@ async def run_query(
         return await _run_write(engine, kind, statement, limits, started)
 
     async def _read(conn: AsyncConnection) -> tuple[list[str], list[list[Any]], bool, dict[str, str]]:
+        # 记录表跨版本汇总：旧版本先只读挂到这条连接上（prelude 里的临时视图要引用它们）
+        if prelude or attach:
+            await _attach_readonly(conn, attach)
         # 连接上先执行的语句（记录表的同名临时视图）。按驱动原样执行，不经 text()：视图里拼着看的人的名字，
         # 名字里的冒号不能被当成绑定参数
         for stmt in prelude:
@@ -979,6 +986,41 @@ async def run_query(
         sql=statement,
         column_types=types,
     )
+
+
+#: 平台挂到查询连接上的库名只许这个样子（records/views.py 的 records_v<版本>）：拼进 ATTACH / DETACH 语句
+_ATTACH_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _same_file(a: str, b: str) -> bool:
+    return bool(a) and bool(b) and os.path.realpath(a) == os.path.realpath(b)
+
+
+async def _attach_readonly(conn: AsyncConnection, wanted: tuple[tuple[str, str], ...]) -> None:
+    """让这条连接上挂着的库正好是 wanted（库名 → 文件），一律以 URI 的 mode=ro 只读挂上。
+
+    连接在池子里复用，挂过的库留在连接上：已经挂好、文件对得上的不重挂；不在 wanted 里的（或文件对不上的）先摘掉——
+    不然 SQL 写个库名就能读到这次没并进来的那一版。用户 SQL 里的 ATTACH / DETACH 由只读守卫拒（data/guard.py），
+    挂库只有这里做；DETACH 失败（连接上还有没读完的语句）照实抛出，不带着不该挂的库查。"""
+    from urllib.parse import quote
+
+    want = dict(wanted)
+    for name in want:
+        if not _ATTACH_NAME.match(name) or name in ("main", "temp"):
+            raise ValueError(f"挂库的库名不合规：{name}")
+    have = {str(r[1]): str(r[2] or "") for r in (await conn.exec_driver_sql("PRAGMA database_list")).fetchall()}
+    for name, file in have.items():
+        if name in ("main", "temp"):
+            continue
+        if name not in want or not _same_file(file, want[name]):
+            await conn.exec_driver_sql(f'DETACH DATABASE "{name}"')
+    for name, path in want.items():
+        if name in have and _same_file(have[name], path):
+            continue
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"要并进来的数据文件不在了：{os.path.basename(path)}")
+        uri = f"file:{quote(os.path.realpath(path))}?mode=ro"
+        await conn.exec_driver_sql(f"ATTACH DATABASE '{uri}' AS \"{name}\"")
 
 
 class _TypeTally:

@@ -2682,5 +2682,47 @@ await section('单次运行时限将至（cause: run_deadline）：核查没做�
   check('……不出 undefined、NaN、[object Object]', !odd.some((s) => /undefined|NaN|object Object/.test(`${s.title}${s.sub ?? ''}${s.next ?? ''}`)))
 })
 
+await section('读入附件 file.extracted：读入多少字、全文多少字、截断和抽不出都看得见，工件可点开', async () => {
+  // 服务端 files/text.py：模板函数 file_text 每读一个附件记一条，node_id 是读它的节点。以前这类事件落进「未识别的事件」
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const ART = 'f1e0'.repeat(16)
+  const base = { file_id: 'f1', sha256: 'ab'.repeat(32), artifact: ART }
+  const steps = mod.decodeRun([
+    E(1, 'run.started', null, { nodes: 2 }),
+    E(2, 'node.started', 'llm', { node_type: 'llm', label: '读说明' }),
+    E(3, 'file.extracted', 'llm', { ...base, name: '报损说明.txt', chars: 1200, total_chars: 1200, truncated: false, ok: true }),
+    E(4, 'file.extracted', 'llm', { ...base, name: '合同.pdf', chars: 20000, total_chars: 53120, truncated: true, ok: true }),
+    E(5, 'file.extracted', 'llm', { ...base, name: '扫描件.png', chars: 0, total_chars: 0, truncated: false, ok: false,
+      reason: '图片里的文字目前读不出来' }),
+    E(6, 'node.finished', 'llm', {}),
+  ])
+  const all = flatten(steps)
+  const rows = all.filter((s) => s.code === 'file_extracted')
+  check('每读一个附件一行，挂在读它的节点下，不再是「未识别的事件」', rows.length === 3 && !all.some((s) => s.title === '未识别的事件')
+    && all.find((s) => s.kind === 'node' && s.nodeId === 'llm')?.children?.filter((c) => c.code === 'file_extracted').length === 3,
+  all.map((s) => s.title).join(' | '))
+  const [whole, cut, failedRead] = rows
+  check('读全了：标题写文件名和读入字数，副标题写全文已全部读入，不用提醒色', whole?.title === '读入附件「报损说明.txt」1,200 字'
+    && whole.sub === '全文 1,200 字，已全部读入' && whole.level === undefined, `${whole?.title} / ${whole?.sub} / ${whole?.level}`)
+  check('截断了：副标题写全文多少字、只读入了前多少字，提醒色', cut?.title === '读入附件「合同.pdf」20,000 字'
+    && cut.sub === '全文 53,120 字，只读入了前 20,000 字，其余没有读入' && cut.level === 'warn', `${cut?.title} / ${cut?.sub}`)
+  check('抽不出：标题说抽不出文字，副标题写原因，提醒色', failedRead?.title === '附件「扫描件.png」抽不出文字'
+    && failedRead.sub === '图片里的文字目前读不出来' && failedRead.level === 'warn', `${failedRead?.title} / ${failedRead?.sub}`)
+  check('读入的那一段可以点开（工件）', rows.every((s) => s.artifact === ART))
+  check('标题、副标题里没有内部代码', !rows.some((s) => /file\.extracted|file_extracted|total_chars|truncated/.test(`${s.title}${s.sub ?? ''}`)))
+  // 缺字段、类型不对：不崩，不出 undefined、NaN、[object Object]
+  let broken = null
+  let odd = []
+  try {
+    odd = flatten(mod.decodeRun([{}, { name: 7, chars: 'x', ok: 'yes' }, { ok: false }].map((d, i) => E(i + 1, 'file.extracted', null, d))))
+      .filter((s) => s.code === 'file_extracted')
+  } catch (e) {
+    broken = String(e?.message ?? e)
+  }
+  check('缺字段的事件：不抛异常，每条照样一行', broken === null && odd.length === 3, broken ?? `${odd.length} 行`)
+  check('……不出 undefined、NaN、[object Object]，没有文件名就不写名字，不知道字数就不写数', !odd.some((s) => /undefined|NaN|object Object|「」|\d/.test(`${s.title}${s.sub ?? ''}`))
+    && odd[0]?.title === '读入附件' && odd[2]?.title === '附件抽不出文字', odd.map((s) => `${s.title}|${s.sub ?? ''}`).join(' ; '))
+})
+
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')
 process.exit(failed ? 1 : 0)

@@ -13,7 +13,10 @@
 //   - 搭建者：导航九项都在，账户菜单写搭建者；
 //   - 关登录：/login 直接回首页；导航底部是署名入口，没有账户菜单；应用首页挂「未开启登录」的说明；
 //   - 管理员允许使用者问数据时（D-c）：问数据页只取数据源的名字（/api/datasources/names），不取完整列表和表结构；
-//   - 使用者的设置页只剩偏好设置（主题）和通知，换主题只存本机、不写服务端（D-s）。
+//   - 使用者的设置页只剩偏好设置（主题）和通知，换主题只存本机、不写服务端（D-s）；
+//   - 管理员的「使用者可以建个人应用」开关（认人接口的 user_personal_apps，docs/design/normal-user-apps.md N7）：关着时使用者
+//     没有「新建应用」、新建页写明管理员还没开放、进不了蓝图页；开着时有「新建应用」（建的是个人应用），自己的个人应用单列
+//     一组「我的应用」，能进自己的蓝图页。
 //
 // 身份接口在浏览器层答掉（/api/auth/**），按 state 切登录方式和角色；其余 GET 放行（外壳要它），写请求拦下记在探针里。
 // 编排者的完整关口另起一套开着 local 登录的服务跑真接口，见 docs/design §6.3。
@@ -60,6 +63,28 @@ const TASK = {
   can_respond: true, outcome: null, resolved_by: null, resolved_at: null, created_at: new Date().toISOString(),
 }
 
+// 使用者自己建的个人应用和它的蓝图（形状同服务端 api/apps._summary、blueprints/store.blueprint_out）
+const ago = (ms) => new Date(Date.now() - ms).toISOString()
+const MY_APP = {
+  id: 'app_mine', name: '我的退款周报', description: '每周看自己门店的退款', icon: 'app', status: 'active', published_version: null,
+  level: null, needs_upgrade: false, pending_tasks: 0, my_role: 'manage', created_at: ago(86_400_000), updated_at: ago(600_000),
+  scope: 'personal', owner: 'zhangsan', blueprint_id: 'bp_mine',
+}
+const SHARED_APP = {
+  id: 'app_weekly', name: '门店周报', description: '每周一看各门店的销售概况', icon: 'app', status: 'active', published_version: 3,
+  level: 'published', needs_upgrade: false, pending_tasks: 0, my_role: 'use', created_at: ago(7 * 86_400_000),
+  updated_at: ago(3600_000), scope: 'shared', owner: null, blueprint_id: null,
+}
+const item = (value, status = 'confirmed') => ({ value, source: 'user', status, why: null })
+const MY_BLUEPRINT = {
+  id: 'bp_mine', name: '我的退款周报', owner: 'zhangsan', scope: 'personal', status: 'personal',
+  spec: { format: 'agentlab.blueprint/1', purpose: item('每周看自己门店的退款'), template: null, data: [],
+    cadence: item(null, 'missing'), people: [], fields: [], writeback: null, access: { use: [], observe: [], manage: [] }, asks: [] },
+  template_id: null, template_version: null, source: { kind: 'conversation' }, conversation_id: null, workflow_id: null,
+  app_id: 'app_mine', last_trial_run_id: null, graph_hash: null, joints: {}, copied_from: null, issues: [],
+  created_at: ago(86_400_000), updated_at: ago(600_000),
+}
+
 const browser = await chromium.launch({ executablePath: CHROME })
 
 /**
@@ -103,13 +128,21 @@ async function open(state) {
         return route.fulfill({ status: 401, json: { detail: '请先登录', code: 'auth_required', mode: state.mode,
           can_bootstrap: !!state.bootstrap } })
       }
-      return route.fulfill({ json: { mode: state.mode, ...PEOPLE[state.who], verified: true, user_can_chat: !!state.chat } })
+      return route.fulfill({ json: { mode: state.mode, ...PEOPLE[state.who], verified: true, user_can_chat: !!state.chat,
+        user_personal_apps: !!state.personal } })
     }
     state.reads?.push(p)
     if (state.mode !== 'off' && (!state.who || state.expire)) {
       return route.fulfill({ status: 401, json: { detail: '请先登录', code: 'auth_required', mode: state.mode } })
     }
-    if (p === '/api/apps') return route.fulfill({ json: { items: [] } })
+    if (p === '/api/apps') {
+      return route.fulfill({ json: { items: state.apps ?? [], can_create: { shared: state.who !== 'user', personal: !!state.personal } } })
+    }
+    // 蓝图：使用者自己的个人蓝图（开关开着时能进）；没有准备的一律当没有
+    if (p === '/api/blueprints') return route.fulfill({ json: { items: state.personal ? [MY_BLUEPRINT] : [] } })
+    if (p === '/api/blueprints/bp_mine') return route.fulfill({ json: MY_BLUEPRINT })
+    if (p.startsWith('/api/blueprints')) return route.fulfill({ status: 404, json: { detail: '蓝图不存在或已被删除' } })
+    if (p === '/api/templates') return route.fulfill({ json: { items: [] } })
     if (p === '/api/tasks/count') return route.fulfill({ json: { mine: 1, apps: 1, other: 0 } })
     if (p === '/api/tasks') return route.fulfill({ json: { items: [TASK] } })
     if (p === '/api/tasks/task_x') return route.fulfill({ json: TASK })
@@ -294,6 +327,43 @@ await section('使用者的设置页：只剩偏好设置和通知，换主题�
   check('换主题不往服务端写', !state.writes.some((w) => w.path === '/api/settings'), state.writes.map((w) => w.path).join(','))
   check('不提示「未能保存到设置」', !(await page.locator('body').innerText()).includes('未能保存到设置'))
   check('启动时也不去读服务端的设置', !state.reads.includes('/api/settings'))
+})
+
+await section('使用者：个人应用开关关着时没有新建入口，开着时有「新建应用」和「我的应用」', async () => {
+  // 关着：首页没有「新建应用」，也没有「我的应用」一组；直接打开新建页写明管理员还没开放；进不了蓝图页
+  const off = { mode: 'local', who: 'user', personal: false, apps: [SHARED_APP], writes: [] }
+  const page = await open(off)
+  await page.goto(`${WEB}/apps?tab=apps`)
+  await page.locator('[data-app="app_weekly"]').waitFor({ timeout: 15000 })
+  check('关着：页头没有「新建应用」', await page.locator('[data-app-create]').count() === 0)
+  check('……没有「我的应用」一组', await page.locator('[data-app-group="personal"]').count() === 0)
+  await page.goto(`${WEB}/apps/create`)
+  await page.locator('[data-new-app]').waitFor({ timeout: 8000 })
+  check('……打开新建页：写明管理员还没有开放个人应用，不给起点', (await page.locator('[data-new-app]').getAttribute('data-new-app')) === 'none'
+    && (await page.locator('main').innerText()).includes('管理员还没有开放个人应用'))
+  await page.goto(`${WEB}/blueprints/bp_mine`)
+  check('……进不了蓝图页（送回应用首页）', await page.waitForURL(/\/apps(\?|$)/, { timeout: 8000 }).then(() => true, () => false), page.url())
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+
+  // 开着：页头有「新建应用」（建的是个人应用），自己的个人应用单列「我的应用」；能进自己的蓝图页
+  const on = { mode: 'local', who: 'user', personal: true, apps: [MY_APP, SHARED_APP], writes: [] }
+  const p2 = await open(on)
+  await p2.goto(`${WEB}/apps?tab=apps`)
+  const mine = p2.locator('[data-app-group="personal"]')
+  check('开着：自己的个人应用单列「我的应用」', await mine.waitFor({ timeout: 15000 }).then(() => true, () => false)
+    && await mine.locator('[data-app="app_mine"]').count() === 1)
+  check('……共享的应用另列一组', await p2.locator('[data-app-group="shared"] [data-app="app_weekly"]').count() === 1)
+  const create = p2.locator('[data-app-create]')
+  check('……页头有「新建应用」，建的是个人应用', await create.count() === 1 && (await create.getAttribute('data-app-create')) === 'personal'
+    && (await create.getAttribute('href')) === '/apps/create', String(await create.getAttribute('data-app-create').catch(() => '')))
+  await p2.goto(`${WEB}/apps/create`)
+  await p2.locator('[data-new-app]').waitFor({ timeout: 8000 })
+  check('……新建页按个人应用给起点', (await p2.locator('[data-new-app]').getAttribute('data-new-app')) === 'personal'
+    && await p2.locator('[data-new-app-personal]').count() === 1)
+  await p2.goto(`${WEB}/blueprints/bp_mine`)
+  await p2.waitForTimeout(800)
+  check('……能进自己的蓝图页', /\/blueprints\/bp_mine/.test(p2.url()), p2.url())
+  check('没有未捕获的运行时错误', p2.errors.length === 0, p2.errors[0] ?? '')
 })
 
 await browser.close()

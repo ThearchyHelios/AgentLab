@@ -208,6 +208,5 @@ TEMPLATE = register(TemplateDef(
            "access": "可选：谁能填（只看得到自己的记录）、谁能看全部、谁能管理"},
     personal=None,
     skeleton=skeleton, app_skeleton=app_skeleton, schedule=schedule, tags=["流程", "记录", "看板"],
+    example=example, example_fill=example_fill, prefill=_prefill, briefs=briefs, problems=problems,
 ))
-c.extend(ID, c.Extras(example=example, example_fill=example_fill, prefill=_prefill, briefs=briefs,
-                      problems=problems))

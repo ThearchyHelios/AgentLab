@@ -1569,7 +1569,11 @@ export interface VarIssue {
 export interface Conversation {
   id: string
   title: string
-  kind: 'chat' | 'canvas'
+  /**
+   * 前端建的只有 chat、canvas；服务端另建两种：app 是应用编辑器的助手对话，blueprint 是蓝图对话（docs/design/normal-user-apps.md
+   * §2.2，权限跟着蓝图走，经 GET /api/blueprints/{id}/conversation 读）
+   */
+  kind: 'chat' | 'canvas' | 'app' | 'blueprint'
   workflow_id?: string | null
   archived: boolean
   created_at?: string

@@ -21,7 +21,7 @@ import { cleanValues, validateForm, withDefaults } from '../../lib/schemaForm'
 import { TRIAL_TEXT } from '../../lib/terms'
 import { TaskCard } from '../../run/TaskCard'
 import { useBlueprint } from '../../store/blueprint'
-import type { AppSpec, FormError, FormSchema, ViewModel } from '../../typesApp'
+import type { FormError, FormSchema, ViewModel } from '../../typesApp'
 import { useLoad, usePoll } from '../apps/shared'
 import { blueprintPath } from './shared'
 
@@ -29,12 +29,11 @@ const POLL_MS = 4000
 /** 流程类模板：试运行里有人工步骤，右侧要列待办 */
 const PROCESS_TEMPLATES = new Set(['approval', 'exception_handling', 'reconcile_writeback'])
 
-/** 应用骨架里第一个入口的表单（试运行的输入） */
-function entryForm(spec: AppSpec | null | undefined): FormSchema | null {
-  const form = spec?.entries?.[0]?.form
-  if (!form) return null
-  return '$ref' in form ? spec?.forms?.[String((form as { $ref: string }).$ref)] ?? null : form as FormSchema
-}
+/**
+ * 「换一期再试」填的表单：服务端随预览给（ViewModel.trial.form，blueprints/trial.retry_form，和试运行时认表单是同一条规则），
+ * 这里照着画，不自己从骨架里挑。没有的只能原样再试一次
+ */
+const trialForm = (model: ViewModel | null | undefined): FormSchema | null => model?.trial?.form ?? null
 
 /** 视图里报错的那一块：服务端在来源上写了为什么 */
 function failureOf(model: ViewModel | null | undefined): string | null {
@@ -136,8 +135,7 @@ function TrialBanner({ blueprintId, runId, model, onRetried }: {
 }) {
   const entry = useBlueprint((s) => s.byId[blueprintId])
   const last = entry?.lastTrial?.run_id === runId ? entry.lastTrial : null
-  // 输入表单：服务端随试运行给的，没给就用按卡片生成的应用骨架里的入口表单
-  const form = last?.form ?? entryForm(entry?.instantiated?.app_spec)
+  const form = trialForm(model)
   const [open, setOpen] = useState(false)
   const [values, setValues] = useState<Record<string, unknown>>({})
   const [errors, setErrors] = useState<FormError[]>([])

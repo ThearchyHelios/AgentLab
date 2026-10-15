@@ -162,13 +162,7 @@ def _record(node: Any, meta: dict[str, Any], *, included: str, total: int, trunc
     data = {"file_id": meta["file_id"], "name": meta["name"], "sha256": meta["sha256"], "chars": len(included),
             "total_chars": total, "truncated": truncated, "ok": problem is None, "artifact": artifact,
             **({"reason": problem} if problem else {})}
-    event = getattr(EventType, "FILE_EXTRACTED", None)
     try:
-        if event is not None:
-            node.emit(event, **data)
-        else:
-            # 事件类型还没登记（contract_requests）：先记成日志事件，code 写明是哪一种
-            node.emit(EventType.LOG, level="info", code="file.extracted",
-                      message=f"读入附件「{meta['name']}」{len(included)} 字" + ("（截断）" if truncated else ""), **data)
+        node.emit(EventType.FILE_EXTRACTED, **data)
     except Exception:  # noqa: BLE001 - 事件只是留痕，读入的文字照样交回
         logger.warning("file.extracted 事件没发出去", exc_info=True)

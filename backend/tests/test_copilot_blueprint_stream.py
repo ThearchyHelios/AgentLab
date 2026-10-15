@@ -227,8 +227,9 @@ async def test_personal_blueprints_need_the_switch(client, monkeypatch):
 
 def _board_spec(shop: str, crm: str) -> dict:
     from app.blueprints.templates import _common as c
+    from app.blueprints.templates import get_template
 
-    spec = c.EXTRAS["periodic_board"].example()
+    spec = get_template("periodic_board").example()
     for item in spec["data"]:
         item["table"]["value"] = {"source": shop, "table": "orders"}
     spec["data"] = spec["data"][:2]
@@ -381,7 +382,7 @@ async def test_records_fill_uses_the_records_table(client, monkeypatch):
     这一个表版本上（「键.v版本」）。"""
     import re
 
-    from app.blueprints.templates import _common as c
+    from app.blueprints.templates import get_template
     from app.db.models_blueprints import RecordsTable
 
     def route(messages, n):
@@ -396,7 +397,7 @@ async def test_records_fill_uses_the_records_table(client, monkeypatch):
                 {"op": "fill_joint", "joint": "metric_loss_count", "value": f"cell(nodes.{node}, 0, 'loss_count')"},
                 {"op": "done"}]
 
-    bp_id = await _blueprint(spec=c.EXTRAS["records"].example(), template_id="records", template_version=1)
+    bp_id = await _blueprint(spec=get_template("records").example(), template_id="records", template_version=1)
     try:
         events = await _events(client, monkeypatch, Scripted(route), "/api/copilot/fill-joints-stream",
                                {"blueprint_id": bp_id})

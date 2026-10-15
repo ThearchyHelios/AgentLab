@@ -212,6 +212,22 @@ def trial_inputs(blueprint: Blueprint, inputs: dict[str, Any] | None) -> dict[st
     return {**base, **{k: v for k, v in (inputs or {}).items() if v not in (None, "")}}
 
 
+def retry_form(app_spec: dict[str, Any]) -> dict[str, Any] | None:
+    """「换一期再试」填的表单（预览的 trial.form，界面照它画，不自己挑）：流程类、填报登记是第一个带表单的入口的示例表单
+    （entry_of_draft，填了就走 entry_inputs，和应用入口提交同一条路）；看板类没有入口，是按条件查看的条件表单（视图来源的
+    params，就是图的输入，trial_inputs 拿用户给的覆盖按「多久更新」算出的那一期）。都没有为 None（只能原样再试一次）。"""
+    from app.apps.tree import resolve_form
+
+    if (found := entry_of_draft(app_spec)) is not None:
+        return found[1]
+    for view in (app_spec.get("views") or {}).values():
+        source = view.get("source") if isinstance(view, dict) else None
+        form = resolve_form(app_spec, source.get("params")) if isinstance(source, dict) else None
+        if isinstance(form, dict) and (form.get("properties") or {}):
+            return form
+    return None
+
+
 def entry_of_draft(app_spec: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """应用草稿里第一个带表单的入口和它的表单（流程类：「填什么」就是它）；看板类没有入口，为 None。"""
     from app.apps.tree import resolve_form
@@ -263,8 +279,10 @@ async def start_trial(session: AsyncSession, blueprint: Blueprint, *, inputs: di
         raise TrialRefused(409, NOT_READY_TEXT, NOT_READY, [p for p in result.problems if p.get("level") == "error"])
     options = None
     memory_scope = None
-    if restricted():
-        # 开登录后的使用者（个人蓝图）：和问数据、个人应用同一份约束（auth/chat_policy.py，blueprints/personal.policy_problem）
+    if restricted() or blueprint.scope == "personal":
+        # 开登录后的使用者，和任何人的个人蓝图：和问数据、个人应用的刷新同一份约束（auth/chat_policy.py，
+        # blueprints/personal.policy_problem）。个人蓝图的试运行就是刷新的预演，搭建者自己的个人蓝图也照样遮罩、只读，
+        # 试出来的才是存成个人应用以后刷新出来的样子
         from app.auth.chat_policy import chat_memory_scope
         from app.blueprints.personal import policy_problem
         from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
@@ -334,7 +352,8 @@ class PreviewApp:
 async def preview_page(session: AsyncSession, blueprint: Blueprint, *, page_id: str | None, run_id: str | None,
                        principal: Principal) -> dict[str, Any]:
     """按这次试运行解析应用草稿的一页（agentlab.view/1），印章 from=试运行、trial=true。run_id 不给就是最近一次。
-    草稿用这次试运行时记下的那一份（之后改了卡片，预览的仍是这次运行对应的样子）。"""
+    草稿用这次试运行时记下的那一份（之后改了卡片，预览的仍是这次运行对应的样子）。trial 里另给「换一期再试」的表单
+    （retry_form）。"""
     from app.apps.resolve import resolve_page
     from app.apps.tree import page_of
 
@@ -354,5 +373,7 @@ async def preview_page(session: AsyncSession, blueprint: Blueprint, *, page_id: 
 
         raise ViewRefused(404, f"应用里没有页面「{wanted}」", "app_page_not_found")
     app = PreviewApp(id=blueprint.app_id or blueprint.id, name=blueprint.name, draft=spec)
-    return await resolve_page(session, app, page_id=wanted, principal=principal, role="manage", draft=True,
+    page = await resolve_page(session, app, page_id=wanted, principal=principal, role="manage", draft=True,
                               trial=run, actor=principal.username)
+    # 「换一期再试」的表单按这次试运行对应的那份草稿给（retry_form）：界面照它画，不自己从骨架里挑
+    return {**page, "trial": {**(page.get("trial") or {}), "form": retry_form(spec)}}

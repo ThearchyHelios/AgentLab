@@ -131,7 +131,6 @@ export const BLUEPRINT_TEXT = {
   templateOf: (label: string, version: number) => `${label}（模板 v${version}）`,
   // 对到数据的项
   dataTable: '表',
-  dataTableLabel: '中文名',
   dataGrain: '粒度',
   dataDate: '业务日期',
   dataReuseText: (metric: string, version: number) => `复用口径卡里的「${metric}」（v${version}），不重写指标式`,

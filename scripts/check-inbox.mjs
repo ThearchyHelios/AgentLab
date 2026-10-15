@@ -12,7 +12,10 @@
 //   - 升级之后：升级加派的那一份不算进会签人数，另写升级后的规则（升级给谁、其中一人说了算），名单里标「升级」；
 //     待办箱一行写所属实例，同标题的分得开；
 //   - 补充输入带表单的：本地校验，服务端 422 的错误挂回字段；
-//   - 关登录时签批人一行写本机署名；会签只记下一票（resolved 为假）时提示「等待其他人处理」。
+//   - 关登录时签批人一行写本机署名；会签只记下一票（resolved 为假）时提示「等待其他人处理」；
+//   - 审核个人应用（kind=review，payload 同服务端 blueprints/personal.review_payload）：写提交人（显示名）、目的、说明；没有
+//     「同意」——「取副本，去发布」调 POST /api/blueprints/{id}/copy 后进副本蓝图；取过的给「打开我的副本」（只认自己取的那
+//     一份，别人取的不算）；「退回」可以写原因，走待办接口 decision=reject。
 //
 // 接口全部在浏览器层答掉（/api/tasks/**），数据是这里虚构的；写请求记在探针里。
 //
@@ -110,6 +113,26 @@ const TASKS = {
       escalation: { slot: 'director', assignees: [{ kind: 'user', name: 'zhaoliu' }], decided: null, by: null } },
     payload: { kind: 'human_node', message: '钱七报销 300 元' },
   },
+  // 审核个人应用：不挂在中断上（node_id 为空），派给处理审核的人；payload 同服务端 blueprints/personal.review_payload
+  review: {
+    ...base, id: 'review', kind: 'review', title: '审核个人应用「我的退款周报」', node_id: null, app_id: 'app_mine',
+    app_name: '我的退款周报', app_version: null, workflow_name: null, run_id: 'run_p1',
+    assignments: [assignment('r1', '审批人甲', 'pending', null, { source: 'review' })],
+    payload: { kind: 'review', blueprint_id: 'bp_mine', app_id: 'app_mine', name: '我的退款周报', purpose: '每周看自己门店的退款',
+      template_id: 'periodic_board', submitted_by: 'zhangsan', note: '想给门店组的人都用', copies: [] },
+    people: { zhangsan: '张三', 审批人甲: '审批人甲' },
+  },
+  // 已经取过副本：自己取的那一份给「打开我的副本」；别的处理人取的不算
+  reviewed: {
+    ...base, id: 'reviewed', kind: 'review', title: '审核个人应用「门店日报」', node_id: null, app_id: 'app_daily',
+    app_name: '门店日报', app_version: null, workflow_name: null, run_id: 'run_p2',
+    assignments: [assignment('r2', '审批人甲', 'pending', null, { source: 'review' })],
+    payload: { kind: 'review', blueprint_id: 'bp_daily', app_id: 'app_daily', name: '门店日报', purpose: '每天看门店的销售',
+      template_id: 'periodic_board', submitted_by: 'zhangsan', note: '', copies: [
+        { id: 'bp_daily_other', owner: 'lisi', status: 'drafting', app_id: null },
+        { id: 'bp_daily_mine', owner: '审批人甲', status: 'trialed', app_id: null }] },
+    people: { zhangsan: '张三' },
+  },
   input: {
     ...base, id: 'input', approval_id: 'ap5', kind: 'input', title: '补填发票信息',
     form: { format: 'agentlab.form/1', type: 'object', required: ['invoice'], properties: {
@@ -144,9 +167,13 @@ async function open(state) {
         const resolved = m[1] !== 'signoff'
         return route.fulfill({ json: { task: { ...t, status: resolved ? 'resolved' : 'pending' }, resolved } })
       }
+      // 审核待办「取副本，去发布」：服务端建一份归处理人的共享副本，交回副本蓝图
+      if (p === '/api/blueprints/bp_mine/copy') return route.fulfill({ json: { id: 'bp_mine_copy', scope: 'shared', owner: '审批人甲' } })
       return route.fulfill({ status: 503, json: { detail: '检查脚本拦下了写请求' } })
     }
     if (p === '/api/auth/me') return route.fulfill({ json: { mode: 'off', username: null, display_name: null, role: 'admin', groups: [], verified: false } })
+    // 进了副本蓝图之后的页面不在这里查：蓝图一律答「不存在」，不打到真实服务端
+    if (p.startsWith('/api/blueprints/')) return route.fulfill({ status: 404, json: { detail: '蓝图不存在或已被删除' } })
     if (p === '/api/tasks/count') return route.fulfill({ json: { mine: Object.keys(TASKS).length, apps: Object.keys(TASKS).length, other: 0 } })
     if (p === '/api/tasks') return route.fulfill({ json: { items: Object.values(TASKS) } })
     const m = p.match(/^\/api\/tasks\/([^/]+)$/)
@@ -279,11 +306,63 @@ await section('补充输入：表单校验、422 挂回字段', async () => {
   check('提交的是表单的值，decision 是 submit', sent?.body?.decision === 'submit' && sent?.body?.values?.invoice === 'FP-001', JSON.stringify(sent?.body))
 })
 
+await section('审核个人应用：取副本去发布、打开我的副本、退回', async () => {
+  const state = { writes: [] }
+  const page = await open(state)
+  await page.goto(`${WEB}/apps/inbox/review`)
+  const box = page.locator('[data-task-review]')
+  await box.waitFor({ timeout: 15000 })
+  const text = await box.innerText()
+  check('写提交人（显示名）、目的、提交说明', text.includes('提交人：张三') && text.includes('每周看自己门店的退款')
+    && text.includes('想给门店组的人都用'), text.replace(/\s+/g, ' '))
+  check('同意不在这里点：没有「同意」「驳回」按钮，也不写「没有派给你」',
+    await page.locator('[data-task-approve], [data-task-reject]').count() === 0 && !(await card(page).innerText()).includes('没有派给你'))
+  check('没取过副本：给「取副本，去发布」，没有「打开我的副本」', await box.locator('[data-task-review-copy]').count() === 1
+    && await box.locator('[data-task-review-open]').count() === 0)
+  // 待办挂在提交人那次个人应用的刷新上，只有拥有者读得到：不给「打开实例」「打开运行记录」（链出去只会 404 / 403）
+  const links = await card(page).locator('a[href]').evaluateAll((as) => as.map((a) => a.getAttribute('href')))
+  check('不给打不开的链接：没有指向提交人个人应用的实例页、也没有运行记录页', !links.some((h) => /\/apps\/app_mine\/i\/|^\/runs\//.test(h ?? ''))
+    && !/查看实例|查看运行/.test(await card(page).innerText()), links.join(' , '))
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+  await box.locator('[data-task-review-copy]').click()
+  check('取副本：POST /api/blueprints/{原蓝图}/copy', await page.waitForURL(/\/blueprints\/bp_mine_copy$/, { timeout: 5000 }).then(() => true, () => false)
+    && state.writes.some((w) => w.method === 'POST' && w.path === '/api/blueprints/bp_mine/copy'), page.url())
+  check('……然后进副本蓝图（在副本上试运行、走发布单）', /\/blueprints\/bp_mine_copy$/.test(page.url()), page.url())
+  check('取副本不回复待办（待办等发布单做完自动记为已发布）', !state.writes.some((w) => w.path === '/api/tasks/review/respond'))
+
+  // 已经取过副本：只认自己取的那一份
+  const p2 = await open({ writes: [] })
+  await p2.goto(`${WEB}/apps/inbox/reviewed`)
+  const box2 = p2.locator('[data-task-review]')
+  await box2.waitFor({ timeout: 15000 })
+  const openCopy = box2.locator('[data-task-review-open]')
+  check('取过副本：给「打开我的副本」，链到自己取的那一份', await openCopy.count() === 1
+    && (await openCopy.getAttribute('href')) === '/blueprints/bp_daily_mine', String(await openCopy.getAttribute('href').catch(() => '')))
+  check('……别的处理人取的副本不算，也不再给「取副本」', await box2.locator('[data-task-review-copy]').count() === 0
+    && !(await box2.innerHTML()).includes('bp_daily_other'))
+
+  // 退回：可以写原因，走待办接口
+  const s3 = { writes: [] }
+  const p3 = await open(s3)
+  await p3.goto(`${WEB}/apps/inbox/review`)
+  const box3 = p3.locator('[data-task-review]')
+  await box3.waitFor({ timeout: 15000 })
+  await box3.getByRole('textbox', { name: '退回的原因（选填）' }).fill('口径和财务的对不上')
+  await box3.locator('[data-task-review-reject]').click()
+  await p3.waitForTimeout(300)
+  const sent = s3.writes.find((w) => w.path === '/api/tasks/review/respond')
+  check('退回：decision 是 reject，带上原因', sent?.body?.decision === 'reject' && sent?.body?.note === '口径和财务的对不上', JSON.stringify(sent?.body))
+  check('退回后提示「已退回」', await p3.getByText('已退回').first().waitFor({ timeout: 3000 }).then(() => true, () => false))
+  check('退回不取副本', !s3.writes.some((w) => w.path.endsWith('/copy')))
+})
+
 await section('待办箱：列表和徽标', async () => {
   const page = await open({ writes: [] })
   await page.goto(`${WEB}/apps?tab=inbox`)
   await page.locator('[data-inbox-task]').first().waitFor({ timeout: 15000 })
   check('每条待办一行，链到详情', (await page.locator('[data-inbox-task]').count()) === Object.keys(TASKS).length)
+  check('审核个人应用的一行写种类「审核个人应用」', (await page.locator('[data-inbox-task="review"]').innerText()).includes('审核个人应用')
+    && (await page.locator('[data-inbox-task="review"]').getAttribute('data-task-kind')) === 'review')
   check('「应用」导航上的徽标数应用里的待办', (await page.locator('[data-apps-badge]').innerText()).trim() === String(Object.keys(TASKS).length))
   check('页签上带数', /\d/.test(await page.getByRole('tab', { name: /待办/ }).innerText()))
 })

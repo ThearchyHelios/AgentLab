@@ -8,7 +8,7 @@
  * 文件字段（normal-user-apps N9）：输入节点的字段写 type: file，转成 type 为 object、x-widget 为 file 的字段，允许的类型
  * 和大小（accept、max_mb）进 x-file。值是上传后拿回的引用，没上传的不传。
  */
-import type { FormField, FormSchema } from '../typesApp'
+import type { FileLimits, FormField, FormSchema } from '../typesApp'
 
 /** 输入节点的一个字段（canvas/nodeDefs 的 ioFields；type / enum / format / 上下限是应用平台新加的，老图没有） */
 export interface InputField {
@@ -17,8 +17,8 @@ export interface InputField {
   description?: string
   default?: unknown
   example?: unknown
-  /** file：文件（上传后拿回的引用） */
-  type?: FormField['type'] | 'file'
+  /** file：文件（上传后拿回的引用）；表单里的 object 只给文件控件，输入节点上写 file */
+  type?: Exclude<FormField['type'], 'object'> | 'file'
   enum?: (string | number)[]
   format?: FormField['format']
   /** 数字类型的上下限（闭区间，表单子集没有 exclusiveMinimum：「大于 0」的金额写 0.01） */
@@ -29,15 +29,15 @@ export interface InputField {
   max_mb?: number
 }
 
-/** 文件字段：type 为 object（typesApp.FormField 还没列 object 和 x-file，见报告的接口约定请求） */
+/** 文件字段：type 为 object、x-widget 为 file，限制进 x-file（同服务端 apps/forms.input_schema） */
 function fileField(f: InputField): FormField {
-  const limits: { accept?: string[]; max_mb?: number } = {}
+  const limits: FileLimits = {}
   if (Array.isArray(f.accept) && f.accept.length) limits.accept = f.accept.filter((a) => typeof a === 'string' && a)
   if (typeof f.max_mb === 'number' && Number.isFinite(f.max_mb) && f.max_mb > 0) limits.max_mb = f.max_mb
-  const field: Record<string, unknown> = { type: 'object', title: f.name, 'x-widget': 'file' }
+  const field: FormField = { type: 'object', title: f.name, 'x-widget': 'file' }
   if (f.description) field.description = f.description
   if (Object.keys(limits).length) field['x-file'] = limits
-  return field as unknown as FormField
+  return field
 }
 
 const TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array'])
@@ -53,7 +53,7 @@ export function inputSchemaOf(fields: InputField[]): FormSchema {
       if (f.required) required.push(f.name)
       continue
     }
-    const type = f.type && TYPES.has(f.type) ? f.type as FormField['type'] : 'string'
+    const type = f.type && TYPES.has(f.type) ? f.type as Exclude<FormField['type'], 'object'> : 'string'
     const options = Array.isArray(f.enum) && f.enum.length ? f.enum : null
     const field: FormField = { type, title: f.name }
     if (f.description) field.description = f.description

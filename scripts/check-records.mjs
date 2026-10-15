@@ -65,9 +65,12 @@ const HOME = {
     { id: 'my_records', type: 'records_list', props: { table: 'loss', title: '报损登记' } },
     { id: 'no_table', type: 'records_list', props: {} },
     { id: 'server_page', type: 'records_list', props: { who: 'mine' },
-      data: { table: 'loss', version: 1, columns: COLUMNS_FIRST, mine_only: true, items: [] } },
+      data: { table: 'loss', version: 1, columns: COLUMNS_FIRST, mine_only: true, items: [], next_cursor: null, state: 'ok' } },
     { id: 'empty_page', type: 'records_list', props: {},
       data: { table: null, version: 0, columns: [], items: [], mine_only: true, state: 'empty', next_cursor: null } },
+    // 按草稿预览（服务端 apps/resolve._records_list）：不列真实的记录
+    { id: 'preview_page', type: 'records_list', props: {},
+      data: { table: null, version: 0, columns: [], items: [], mine_only: false, state: 'preview', next_cursor: null } },
   ],
   forms: {},
   problems: [],
@@ -79,8 +82,10 @@ const COLUMNS = [
   { name: 'photo', label: '照片', type: 'file' },
 ]
 const PHOTO = { file_id: 'f_photo', name: '破损.png', size: 20480, sha256: 'ab'.repeat(32), type: 'image/png' }
+// 一行的形状同服务端 records/listing.py：系统列（records.SYSTEM_COLUMNS）加上这一行在第几版表里（_version）
 const row = (id, seq, by, values, extra = {}) => ({
-  _id: id, _seq: seq, _submitted_by: by, _submitted_at: at(seq), _supersedes: null, values, ...extra,
+  _id: id, _seq: seq, _submitted_by: by, _submitted_at: at(seq), _run_id: `run_${id}`, _supersedes: null, _schema_version: 1,
+  _version: 1, superseded: false, values, ...extra,
 })
 /** zhangsan 的三条：r3 是对 r1 的更正（r1 被更正过，只在历史里） */
 const MINE_ROWS = [
@@ -120,7 +125,7 @@ async function open({ state, width = 1280, height = 900 }) {
       const items = mine ? MINE_ROWS : ALL_ROWS
       const history = url.searchParams.get('history') === 'true' || url.searchParams.get('history') === '1'
       return route.fulfill({ json: { table: 'loss', version: 1, columns: COLUMNS, mine_only: mine,
-        items: history ? [R1, ...items] : items } })
+        items: history ? [R1, ...items] : items, next_cursor: null, state: 'ok' } })
     }
     return route.continue()
   })
@@ -167,6 +172,10 @@ await section('我的记录：使用者只看到自己的、标题写「我的�
   check('服务端给了第一页的照它画（这里是空的，写「你还没有提交过记录」）',
     (await page.locator('[data-node="server_page"]').innerText()).includes('你还没有提交过记录'))
   check('服务端说还没有记录表的照实说', (await page.locator('[data-node="empty_page"]').innerText()).includes('还没有记录表'))
+  const preview = page.locator('[data-node="preview_page"]')
+  check('按草稿预览（state=preview）：照实说不列真实的记录，不说成「还没有记录表」，也不给重新读取',
+    await preview.locator('[data-records-preview]').count() === 1 && !(await preview.innerText()).includes('还没有记录表')
+    && await preview.getByRole('button', { name: '重新读取' }).count() === 0, (await preview.innerText()).replace(/\s+/g, ' '))
   check('只读：没有发出写请求', state.writes.length === 0, state.writes.map((w) => w.path).join(','))
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
 })

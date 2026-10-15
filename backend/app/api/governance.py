@@ -98,12 +98,17 @@ async def exploratory_clusters(
     这就是模板生长的触发器。用本地 embedding 做贪心聚类，
     出现 ≥3 次的簇标记为晋升候选。
     """
+    from sqlalchemy import not_
+
+    from app.api.deps import current_principal
+    from app.auth.access import hidden_runs
     from app.memory.embeddings import cosine, embed_texts
 
     rows = list(
         await session.execute(
             select(Run.id, Run.input, Run.workflow_name, Run.created_at)
-            .where(Run.run_class != "formal")
+            # 别人的个人应用刷新、个人蓝图试运行只给拥有者（同运行列表），不进聚类
+            .where(Run.run_class != "formal", not_(hidden_runs(current_principal())))
             .order_by(Run.created_at.desc())
             .limit(limit)
         )

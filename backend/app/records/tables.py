@@ -4,7 +4,8 @@
 **表版本。** 「填什么」卡片变了时按列的变化分档（column_changes）：
 - 只加可选字段、改中文名、改敏感标记：兼容，在同一个版本上 ADD COLUMN、更新登记；
 - 改类型、删字段、加必填字段、可选改必填：不兼容，出新版本（新文件、新数据源、records_tables 再登记一行），
-  旧版本标 retired_at、只读保留——旧记录照原样留着，照样查得到，只是不再往里写。
+  旧版本标 retired_at、只读保留——旧记录照原样留着，照样查得到（新一版的查询按 UNION ALL 并进来，records/views.py），
+  只是不再往里写：停用之前发起、还在半路的运行照常写完（records/actions.py），之后发起的拒。
 不兼容的判定沿用按期累积的 INCOMPATIBLE_KINDS（data/recipe_accumulate.py，列类型变了同样是不兼容），再加上记录表
 特有的三种：删字段、加必填字段、可选改必填（旧行在那一列上是空的）。
 
@@ -38,13 +39,14 @@ RECORDS_INCOMPATIBLE = (*INCOMPATIBLE_KINDS, "column_removed", "required_added",
 SOURCE_PREFIX = "rec_"
 #: 系统列在表结构里的说明（工具描述、db_schema、数据目录起草看得到）
 SYSTEM_NOTES = {
-    "_seq": "序号：只增不减，一次运行只看得到开始时已有的序号以内的记录",
+    "_seq": "序号：同一版内只增不减，一次运行只看得到开始时已有的序号以内的记录。表单改过、出了新版本时，旧版本的记录"
+            "一并列在这张表里，各版本各自编号，按 _schema_version 分开",
     "_id": "这一行的编号",
     "_submitted_by": "提交人",
     "_submitted_at": "提交时间（UTC）",
     "_run_id": "写入这一行的运行",
     "_supersedes": "更正的是哪一行（那一行的编号）；更正过的行不再出现在查询里",
-    "_schema_version": "写入时的表版本",
+    "_schema_version": "写入时的表版本（并进来的旧版本的记录是旧的版本号）",
 }
 _SQL_TYPE_LABEL = {"string": "TEXT", "number": "REAL", "integer": "INTEGER", "boolean": "INTEGER", "array": "TEXT",
                    "file": "TEXT"}
@@ -171,7 +173,8 @@ def schema_cache_of(columns: list[Column], label: str) -> dict[str, Any]:
 
 def _description(label: str, version: int) -> str:
     return (f"记录表「{label}」{'' if version == 1 else f'（第 {version} 版）'}：平台托管、只许追加的填报记录，表名 records。"
-            "一次运行只看得到开始时已有的记录；更正过的行只留最新的一行")
+            "一次运行只看得到开始时已有的记录；更正过的行只留最新的一行"
+            + ("" if version == 1 else "；前几版的记录一并列在里面，旧版本没有的字段为空"))
 
 
 async def _free_name(session: AsyncSession, base: str) -> str:
@@ -402,8 +405,10 @@ def path_of(row: RecordsTable) -> Any:
     return store.table_path(row.table_key, row.version)
 
 
-def refuse_retired(row: RecordsTable) -> None:
-    if row.retired_at is not None:
+def refuse_retired(row: RecordsTable, *, launched_at: datetime | None = None) -> None:
+    """往停用的版本写：拒。launched_at 是要写的那次运行发起的时刻——停用之前发起的照常写完（同进行中的实例照常走完，
+    写进它发起时图里写的那一版）；停用之后发起的、不在运行里的一律拒。"""
+    if row.retired_at is not None and (launched_at is None or launched_at >= row.retired_at):
         raise RecordsRefused("records.table_retired",
                              f"记录表「{row.name}」的第 {row.version} 版已经停用（表单改过，出了新版本），旧记录只读保留。"
                              "请重新发布应用，让它写到新版本")

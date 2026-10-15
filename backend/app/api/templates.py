@@ -1,7 +1,8 @@
 """场景模板列表（docs/design/normal-user-apps.md §3.3）：GET /api/templates。登录即可看（新建应用的「从场景模板开始」）。
 
-模板登记在导入这个模块时核对一遍（blueprints/instantiate.registry_problems）：首批都登记了、关节类型认得、每个模板的
-示例蓝图实例化出来过得了画布校验、骨架比对没有差异。缺一样启动即报错（N3：模板定义、实例化、测试三样都要给）。
+模板登记在导入这个模块时核对一遍（blueprints/templates.check_registry → instantiate.registry_problems）：首批都登记了、
+关节类型认得、每个模板的示例蓝图实例化出来过得了画布校验、骨架比对没有差异。缺一样启动即报错（N3：模板定义、实例化、
+测试三样都要给）。
 """
 from __future__ import annotations
 
@@ -9,12 +10,11 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from app.blueprints.instantiate import registry_problems
-from app.blueprints.templates import list_templates
+from app.blueprints.templates import check_registry, list_templates
 
 router = APIRouter(prefix="/api/templates", tags=["templates"])
 
-_PROBLEMS = registry_problems()
+_PROBLEMS = check_registry()
 if _PROBLEMS:
     raise RuntimeError("场景模板登记不完整：" + "；".join(_PROBLEMS))
 

@@ -176,6 +176,5 @@ TEMPLATE = register(TemplateDef(
            "access": "可选：谁能用、谁能看全部、谁能管理"},
     personal="只看清单的那一部分（没有处置和复核）",
     skeleton=skeleton, app_skeleton=app_skeleton, schedule=schedule, tags=["流程", "定时", "异常"],
+    example=example, example_fill=example_fill, prefill=_prefill, briefs=briefs, problems=problems,
 ))
-c.extend(ID, c.Extras(example=example, example_fill=example_fill, prefill=_prefill, briefs=briefs,
-                      problems=problems))

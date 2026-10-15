@@ -23,10 +23,10 @@ import { appPath, usePoll } from '../apps/shared'
 const WHO: ProblemWho[] = ['you', 'assistant', 'admin']
 
 /**
- * 这条问题归谁：服务端在问题顶层给的 who（发布单按自动修复的种类、要管理员的编号算好的）为准，没有再看白话里登记的
- * 那一档。PlainIssue 还没有顶层的 who（契约待补），先按多一项读
+ * 这条问题归谁：服务端在问题顶层给的 who（发布单按自动修复的种类、要管理员的编号算好的，没登记白话的也有）为准；
+ * 没给的（老服务端）再看白话里登记的那一档
  */
-const whoOf = (p: PlainIssue): ProblemWho => (p as PlainIssue & { who?: ProblemWho }).who ?? p.plain?.who ?? 'you'
+const whoOf = (p: PlainIssue): ProblemWho => p.who ?? p.plain?.who ?? 'you'
 const DISPOSITIONS: Disposition[] = ['recompute', 'dual', 'incomparable']
 const POLL_MS = 1000
 
@@ -97,7 +97,8 @@ export function PublishSummary({ blueprintId, open, onClose, onFix }: {
   }
 
   const problems = plan?.problems ?? []
-  const blocked = problems.some((p) => p.level === 'error')
+  // 能不能确认以服务端为准（ok：没有 error 级问题、也没停下），界面不另算
+  const blocked = !!plan && !plan.ok
   const started = !!plan && plan.status !== 'planned'
   const scheduled = !!plan?.steps.some((s) => s.kind === 'create_schedule' && s.status !== 'skipped')
   const when = scheduled ? cadenceWhen(bp?.spec.cadence?.value) : ''
@@ -264,16 +265,7 @@ function ProblemColumn({ who, items, onFix, onDispose, busy }: {
               <div style={{ color: p.level === 'error' ? 'var(--st-failed)' : 'var(--st-waiting)' }}>{p.plain?.title ?? p.message}</div>
               {p.plain?.why && <div className="text-dim">{p.plain.why}</div>}
               {p.plain?.action && <div className="text-faint">{p.plain.action}</div>}
-              {p.code === 'app.upgrade_policy' && typeof (p as { alias?: unknown }).alias === 'string' && (
-                <div className="mt-1 flex flex-wrap gap-1" role="group" data-plan-disposition={(p as { alias?: string }).alias}>
-                  {DISPOSITIONS.map((d) => (
-                    <button key={d} type="button" className="btn btn-xs" disabled={busy} title={APP_EDITOR_TEXT.dispositionHint[d]}
-                            onClick={() => onDispose((p as { alias?: string }).alias!, d)}>
-                      {APP_EDITOR_TEXT.dispositions[d]}
-                    </button>
-                  ))}
-                </div>
-              )}
+              {p.code === 'app.upgrade_policy' && p.alias && <DispositionChoice alias={p.alias} busy={busy} onDispose={onDispose} />}
             </li>
           ))}
         </ul>
@@ -283,6 +275,22 @@ function ProblemColumn({ who, items, onFix, onDispose, busy }: {
           <MessageSquare size={11} aria-hidden /> {PLAN_TEXT.fixWithAssistant}
         </button>
       )}
+    </div>
+  )
+}
+
+/** 钉住项升了版、要选处置的（app.upgrade_policy 带 alias）：就地给三种处置，选了带着处置重出发布单 */
+function DispositionChoice({ alias, busy, onDispose }: {
+  alias: string; busy: boolean; onDispose: (alias: string, d: Disposition) => void
+}) {
+  return (
+    <div className="mt-1 flex flex-wrap gap-1" role="group" data-plan-disposition={alias}>
+      {DISPOSITIONS.map((d) => (
+        <button key={d} type="button" className="btn btn-xs" disabled={busy} title={APP_EDITOR_TEXT.dispositionHint[d]}
+                onClick={() => onDispose(alias, d)}>
+          {APP_EDITOR_TEXT.dispositions[d]}
+        </button>
+      ))}
     </div>
   )
 }

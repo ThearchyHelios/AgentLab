@@ -7,8 +7,8 @@
   口径卡的项落成 caliber_from；
 - 应用骨架：apps/derive.py 的派生规则（_results、_entries、岗位、待办外观）加模板自己的排布。
 
-模板登记（TemplateDef）之外每个模板另给几样（EXTRAS）：一张完整的示例蓝图（测试和启动核对用）、选模板时的预置、
-给模型看的每组关节说明。
+每个模板的登记（TemplateDef）连同示例蓝图（测试和启动核对用）、选模板时的预置、给模型看的每组关节说明、模板自己认的问题
+一起写，不另开旁路登记；这里的 prefill / template_problems 按模板 id 取登记来用。
 """
 from __future__ import annotations
 
@@ -16,11 +16,10 @@ import copy
 import hashlib
 import json
 import re
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.blueprints.templates import Joint
+from app.blueprints.templates import Joint, get_template
 
 #: 实例化时交给模板的上下文（蓝图 id、工作流 id、定时任务 id、记录表、导入的图）：放在 bp 的这个键下，模板读、不写回
 CONTEXT_KEY = "_context"
@@ -741,33 +740,8 @@ def finish_app(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 # ==========================================================================
-# 模板登记之外的几样（示例蓝图、预置、每组关节的说明）
+# 示例蓝图的写法、预置、模板自己认的问题（各模板写进自己的 TemplateDef）
 # ==========================================================================
-
-
-@dataclass
-class Extras:
-    #: 一张完整的示例蓝图（测试和启动核对用）：实例化、生成关节都填上后要能通过画布校验和发布前检查
-    example: Callable[[], dict[str, Any]]
-    #: 示例蓝图的生成关节怎么填（测试用）：{关节 id: 值}
-    example_fill: Callable[[], dict[str, Any]]
-    #: 选模板时预置还没填的卡片
-    prefill: Callable[[dict[str, Any]], None] | None = None
-    #: 每组生成关节给模型看的说明：{group: 说明}
-    briefs: Callable[[dict[str, Any]], dict[str, str]] | None = None
-    #: 自由形：图是导入的（实例化时从上下文拿），模板不出骨架
-    imports_graph: bool = False
-    #: 卡片内容超出模板能力的地方（bp.template_mismatch 等）：[{code, level, path, message}]
-    problems: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None
-
-
-EXTRAS: dict[str, Extras] = {}
-
-
-def extend(template_id: str, extras: Extras) -> None:
-    if template_id in EXTRAS:
-        raise ValueError(f"模板「{template_id}」的示例和预置重复登记")
-    EXTRAS[template_id] = extras
 
 
 def user_item(v: Any) -> dict[str, Any]:
@@ -781,11 +755,11 @@ def template_item(v: Any) -> dict[str, Any]:
 
 
 def template_problems(template_id: str, spec: dict[str, Any]) -> list[dict[str, Any]]:
-    """模板自己认的问题：卡片内容超出模板能力（只能从一个库查、复用的口径卡接不上……）。"""
-    extras = EXTRAS.get(template_id)
-    if extras is None or extras.problems is None:
+    """模板自己认的问题（TemplateDef.problems）：卡片内容超出模板能力（只能从一个库查、复用的口径卡接不上……）。"""
+    template = get_template(template_id)
+    if template is None or template.problems is None:
         return []
-    return extras.problems(spec)
+    return template.problems(spec)
 
 
 def mismatch(path: str, message: str) -> dict[str, Any]:
@@ -793,10 +767,10 @@ def mismatch(path: str, message: str) -> dict[str, Any]:
 
 
 def prefill(template_id: str, spec: dict[str, Any]) -> None:
-    """选模板时按模板预置还没填的卡片（原地改）。已经写了的不动。"""
-    extras = EXTRAS.get(template_id)
-    if extras is not None and extras.prefill is not None:
-        extras.prefill(spec)
+    """选模板时按模板预置还没填的卡片（TemplateDef.prefill，原地改）。已经写了的不动。"""
+    template = get_template(template_id)
+    if template is not None and template.prefill is not None:
+        template.prefill(spec)
 
 
 def default_cadence(preset: str = "weekly") -> dict[str, Any]:

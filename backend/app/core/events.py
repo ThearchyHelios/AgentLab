@@ -105,6 +105,11 @@ class EventType(StrEnum):
     ACTION_RECONCILED = "action.reconciled"
     ACTION_SIMULATED = "action.simulated"
 
+    # 普通用户建应用（docs/design/normal-user-apps.md N9、§3.8）
+    # 读入一个附件的文字（模板函数 file_text，app/files/text.py）：哪个文件、读入多少字、全文多少字、是否截断，
+    # 读入的那一段存成工件（artifact）。抽不出时 ok=false、reason 写原因
+    FILE_EXTRACTED = "file.extracted"
+
     # 其他
     LOG = "log"
     USAGE = "usage"  # token / 成本累计

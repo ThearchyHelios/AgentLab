@@ -129,7 +129,8 @@ function pointLabel(asOf: string, sameDay: boolean): string {
 
 /**
  * 趋势：服务端按处置给好线和断点——dual 两条线（旧版本、新版本），incomparable 两段之间断开并写明前后不可比，
- * recompute 只给新版本、写一句说明。点一个点打开那一次运行里这个指标的出处
+ * recompute 只给新版本、写一句说明；试运行预览里只有一个点，服务端写在 note 里的说明照写。点一个点打开那一次运行里
+ * 这个指标的出处
  */
 export function SeriesBlock({ node }: NodeProps) {
   const { openEvidence } = useView()
@@ -161,6 +162,8 @@ export function SeriesBlock({ node }: NodeProps) {
       if (index > 0 && index < keys.length) brk.push({ index, label: VIEW_TEXT.incomparable })
       if (str(b?.text)) extra.push(str(b.text))
     }
+    // 服务端照实写的说明：试运行预览里只有这一次试运行一个点，写明没有趋势
+    if (str(data.note)) extra.push(str(data.note))
     return { categories: keys.map((k) => pointLabel(k, sameDay)), series: lines, breaks: brk, notes: extra }
   }, [data, label])
   const unit = str(data.unit)

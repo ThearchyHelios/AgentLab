@@ -1,7 +1,9 @@
 """蓝图、试运行、发布单的接口（docs/design/normal-user-apps.md §3.5、§3.6、§3.10）。
 
-权限在接口里判：共享蓝图要 builder（受管级发布单再要 admin），个人蓝图要拥有者且能用个人应用（blueprints/personal.allowed：
-开了登录的搭建者及以上随时能，使用者和关登录时看管理员开没开 apps.user_personal_apps）。别人的个人蓝图一律当不存在（404）。
+权限在接口里判：共享蓝图要 builder（受管级发布单再要 admin），而且只给拥有者、它发布出来的应用的管理者和管理员
+（blueprints/store.can_access），别的搭建者列表里看不到、直接访问 404；个人蓝图要拥有者且能用个人应用
+（blueprints/personal.allowed：开了登录的搭建者及以上随时能，使用者和关登录时看管理员开没开 apps.user_personal_apps）。
+看不到的蓝图一律当不存在（404）。
 
 - 起点四个，都落到同一个蓝图（N1）：conversation（空蓝图，另建一段蓝图对话）、template（按模板预置卡片）、run（问数据
   的一轮回答：按 /copilot/from-run 同一个提取规则取出执行路径，模板记「自由形」）、workflow_version（已发布的版本：
@@ -36,6 +38,8 @@ FREEFORM = "freeform"
 #: 蓝图对话（Conversation.kind）
 CONVERSATION_KIND = "blueprint"
 DEFAULT_NAME = "新应用"
+#: 蓝图列表最多列几张
+_LIST_MAX = 200
 
 
 # --------------------------------------------------------------------------
@@ -66,8 +70,8 @@ async def _personal_allowed(session: AsyncSession, principal: Principal) -> None
 
 
 async def _blueprint(session: AsyncSession, blueprint_id: str) -> Blueprint:
-    """取蓝图并判权限（blueprints/store.load，蓝图接口和蓝图助手同一条规则）：共享的要搭建者；个人的要拥有者（别人的
-    个人蓝图当不存在）且能用个人应用。"""
+    """取蓝图并判权限（blueprints/store.load，蓝图接口和蓝图助手同一条规则）：共享的要搭建者，且是拥有者、它发布出来的
+    应用的管理者或管理员；个人的要拥有者且能用个人应用。看不到的当不存在（404）。"""
     from app.blueprints.store import load
 
     return await load(session, blueprint_id)
@@ -247,23 +251,29 @@ async def _from_version(session: AsyncSession, spec: dict[str, Any], workflow_id
 async def list_blueprints(scope: Literal["shared", "personal"] | None = None,
                           session: AsyncSession = Depends(get_session),
                           x_actor: str | None = Header(default=None)) -> dict[str, Any]:
-    """共享蓝图（搭建者看得到）和我的个人蓝图（能用个人应用时），按最近改动排。"""
+    """我能读写的共享蓝图（搭建者及以上：自己的、自己管理的应用出自的；管理员全部，blueprints/store.can_access）和我的
+    个人蓝图（能用个人应用时），按最近改动排。别的搭建者的共享蓝图不列。"""
     from app.blueprints.personal import allowed
+    from app.blueprints.store import shared_listed
 
     principal = _principal(x_actor)
-    wanted = []
+    rows: list[Blueprint] = []
     if scope in (None, "shared") and principal.at_least("builder"):
-        wanted.append(Blueprint.scope == "shared")
+        query = select(Blueprint).where(Blueprint.scope == "shared")
+        if principal.mode != "off" and principal.role != "admin":
+            # 候选只有自己的、发布成了应用的（要不要列看应用的管理权，shared_listed 逐个应用核对）
+            query = query.where(or_(Blueprint.owner == (principal.username or ""), Blueprint.app_id.is_not(None)))
+        else:
+            query = query.order_by(Blueprint.updated_at.desc()).limit(_LIST_MAX)
+        rows += await shared_listed(session, principal, list((await session.execute(query)).scalars()))
     if scope in (None, "personal") and await allowed(session, principal):
         mine = Blueprint.scope == "personal"
         if principal.mode != "off":
             mine = mine & (Blueprint.owner == (principal.username or ""))
-        wanted.append(mine)
-    if not wanted:
-        return {"items": []}
-    rows = (await session.execute(select(Blueprint).where(or_(*wanted)).order_by(Blueprint.updated_at.desc())
-                                  .limit(200))).scalars()
-    return {"items": [blueprint_out(bp) for bp in rows]}
+        rows += list((await session.execute(select(Blueprint).where(mine).order_by(Blueprint.updated_at.desc())
+                                            .limit(_LIST_MAX))).scalars())
+    rows.sort(key=lambda bp: bp.updated_at or bp.created_at, reverse=True)
+    return {"items": [blueprint_out(bp) for bp in rows[:_LIST_MAX]]}
 
 
 @router.get("/blueprints/{blueprint_id}")
@@ -351,7 +361,8 @@ class TrialIn(BaseModel):
 @router.post("/blueprints/{blueprint_id}/trial")
 async def trial(blueprint_id: str, payload: TrialIn, session: AsyncSession = Depends(get_session),
                 x_actor: str | None = Header(default=None)) -> Any:
-    """用真数试运行：实例化 → 保存图 → 发起探索运行，交回 {run_id, blueprint}。缺项、待填的关节挡住时回 409 和问题。"""
+    """用真数试运行：实例化 → 保存图 → 发起探索运行，交回 {run_id, blueprint, inputs}（inputs 是这次实际用的输入：
+    看板类补齐了统计期，流程类是示例表单按入口映射换成的图输入）。缺项、待填的关节挡住时回 409 和问题。"""
     from app.blueprints.trial import TrialRefused, start_trial
     from app.engine.launch import LaunchRefused
 
@@ -365,7 +376,7 @@ async def trial(blueprint_id: str, payload: TrialIn, session: AsyncSession = Dep
         raise _refused(e) from e
     except LaunchRefused as e:
         raise _refused(e) from e
-    return {"run_id": run.id, "blueprint": blueprint_out(bp)}
+    return {"run_id": run.id, "blueprint": blueprint_out(bp), "inputs": dict(run.input or {})}
 
 
 @router.get("/blueprints/{blueprint_id}/preview")

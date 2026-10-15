@@ -68,7 +68,7 @@ const USER_OFF = { ...USER_ON, user_personal_apps: false }
 
 const TEMPLATES = [
   { id: 'periodic_board', version: 1, label: '周期看板', description: '每天、每周或每月看一组固定的数', applies_when: '', tags: [],
-    personal: '全部可用', produces: '一页看板：印章、指标、趋势、明细',
+    personal: '全部可用',
     cards: [{ card: 'purpose', note: '必填' }, { card: 'data', note: '必填：要看的数' }, { card: 'cadence', note: '必填：多久出一次数' },
       { card: 'access', note: '谁能用' }] },
   { id: 'approval', version: 1, label: '审批流程', description: '有人发起、有人审批，可以按金额分级', applies_when: '', tags: [],
@@ -120,8 +120,11 @@ const READY = (extra = {}) => ({ ...clone(BP), issues: [], joints: { ...BP.joint
 const ASK = { id: 'q1', question: '销售额按下单日还是支付日算？', options: ['按下单日', '按支付日'], path: '/data/0/date', answer: null }
 
 const STAMP = { as_of: ago(3600_000), as_of_text: '截至 2026-10-13 09:00；统计期 上一 ISO 周 2026-W41', pin: '门店周报（试运行）',
-  graph_hash: 'ab12cd34', calibers: [], tier: 'formal', tier_text: '完整出具', from: '试运行', sealed: true,
-  notes: ['数据是真的；这不是正式结果，发布后才会按定时任务出数'] }
+  graph_hash: 'ab12cd34', calibers: [], tier: 'formal', tier_text: '完整出具', from: '试运行', sealed: true, trial: true,
+  notes: ['数据是真的，但这不是正式结果：发布之后才会按设定出数'] }
+// 形状同服务端试运行预览（blueprints/trial.preview_page）：印章 trial=true；趋势只有这一次试运行一个点，version 为 null，
+// note 照实说没有趋势（apps/resolve._trial_series）；视图模型带 trial（对着哪次试运行）
+const TRIAL_SERIES_NOTE = '试运行只有一次，没有趋势：发布之后每出一期数，这里多一个点'
 const PREVIEW = {
   format: 'agentlab.view/1',
   app: { id: '', name: '门店周报', version: 0, level: null, needs_upgrade: false },
@@ -130,13 +133,28 @@ const PREVIEW = {
   tree: [
     { id: 'stamp', type: 'stamp', props: {}, data: { view: 'wk', state: 'ok', stamp: STAMP } },
     { id: 'gmv', type: 'metric', props: { label: '销售额' }, data: { state: 'ok', text: '45.68 万元', name: '销售额' } },
+    { id: 'gmv_trend', type: 'series', props: { label: '销售额的趋势' }, data: { state: 'ok', mode: 'single', unit: '万元',
+      trial: true, breaks: [], note: TRIAL_SERIES_NOTE,
+      series: [{ version: null, label: '试运行', points: [{ run_id: 'run_trial', as_of: '2026-10-12', value: 45.68, text: '45.68 万元',
+        evidence: null }] }] } },
   ],
   forms: {}, problems: [],
+  trial: { run_id: 'run_trial', status: 'succeeded', status_text: '已完成' },
 }
 const PREVIEW_FAILED = {
   ...PREVIEW, sources: { wk: { kind: 'trial', state: 'error', run_id: 'run_trial', stamp: null,
     message: '「取数」这一步查询失败：表 refunds 里没有列 refund_amt' } },
   tree: [{ id: 'gmv', type: 'metric', props: { label: '销售额' }, data: { view: 'wk', state: 'error' } }],
+}
+// 看板类的应用骨架（同服务端 periodic_board.app_skeleton）：没有入口；「按条件查看」那一页的条件表单是图的输入（统计期），
+// 按引用写在 forms 里（{"$ref": "#/forms/start"}）——「换一期再试」填的就是它
+const BOARD_SPEC = {
+  format: 'agentlab.app/1', name: '门店周报', pins: [{ alias: 'main', workflow_id: null, version: null, graph_hash: 'ab12cd34', use: 'view' }],
+  slots: {}, entries: [], task_ui: {}, hooks: [], notify: [], pages: [],
+  forms: { start: { format: 'agentlab.form/1', type: 'object', required: [], 'x-order': ['period'],
+    properties: { period: { type: 'string', title: '统计期' } } } },
+  views: { wk: { source: { kind: 'latest_sealed', pin: 'main' } },
+    custom: { source: { kind: 'on_demand', pin: 'main', params: { $ref: '#/forms/start' }, ttl_s: 3600 } } },
 }
 const TRIAL_TASK = {
   id: 'task_trial', approval_id: null, run_id: 'run_trial', node_id: 'review', app_id: null, app_name: null, workflow_name: null,
@@ -157,21 +175,26 @@ const SUMMARY = [
   { step: 'publish_workflow', text: '发布「门店周报」：此后每周一 09:00 按这一版自动出数' },
   { step: 'grant', text: '门店组的人可以使用' },
 ]
+// 形状同服务端 blueprints/publish_plan.plan_out：ok（没有 error 级问题、也没停下）由服务端算，界面照它决定能不能确认；
+// 每条问题顶层带 who（归谁处理）和 source（出自哪一项预检）
 const PLAN_BLOCKED = {
   id: 'plan_1', blueprint_id: 'bp_week', level: 'published', graph_hash: 'ab12cd34', status: 'planned', steps: steps(0),
-  summary: SUMMARY, options: { first_run: true },
+  summary: SUMMARY, options: { first_run: true, dispositions: {}, spec_hash: 'f00d' }, ok: false, actor: 'lisi',
+  created_at: '2026-10-14T09:00:00+00:00', updated_at: '2026-10-14T09:00:00+00:00',
   problems: [
-    { code: 'bp.unconfirmed', level: 'error', path: '/data/0/table', message: '「看哪些数·第 1 项·对到的表」还没确认',
+    { code: 'bp.unconfirmed', level: 'error', path: '/data/0/table', message: '「看哪些数·第 1 项·对到的表」还没确认', who: 'you',
+      source: 'blueprint',
       plain: { title: '「销售额」对到的表还没确认', why: '这是助手按数据目录对的', who: 'you', action: '在卡片上点「确认」' } },
-    { code: 'app.upgrade_policy', level: 'error', path: 'pins[0]', alias: 'weekly', message: '口径升版必须处置',
-      plain: { title: '口径变了，以前的数怎么处理还没选', why: '', who: 'you', action: '选一种处置' } },
-    { code: 'app.view_unbound', level: 'warning', path: 'views.wk', message: '视图没有绑定定时任务',
-      plain: { title: '有一块看板没有对应的数', why: '', who: 'assistant', action: '交给助手按卡片改' } },
-    { code: 'governed.metric_untraced', level: 'warning', path: null, message: '指标没有静态追到原始数据',
+    { code: 'app.upgrade_policy', level: 'error', path: 'pins[0]', alias: 'weekly', message: '口径升版必须处置', who: 'you',
+      source: 'app', plain: { title: '口径变了，以前的数怎么处理还没选', why: '', who: 'you', action: '选一种处置' } },
+    { code: 'app.view_unbound', level: 'warning', path: 'views.wk', message: '视图没有绑定定时任务', who: 'assistant',
+      source: 'app', plain: { title: '有一块看板没有对应的数', why: '', who: 'assistant', action: '交给助手按卡片改' } },
+    { code: 'governed.metric_untraced', level: 'warning', path: null, message: '指标没有静态追到原始数据', who: 'admin',
+      source: 'workflow', fix_kind: null,
       plain: { title: '有的指标追不到原始数据', why: '受管级要求', who: 'admin', action: '请管理员处理，或改选已发布级' } },
   ],
 }
-const PLAN_OK = { ...PLAN_BLOCKED, id: 'plan_2', problems: [] }
+const PLAN_OK = { ...PLAN_BLOCKED, id: 'plan_2', problems: [], ok: true }
 
 // ---------------------------------------------------------------- 浏览器
 
@@ -277,8 +300,8 @@ async function open({ width = 1280, height = 900, state }) {
       }
       if (what === 'preview') return json(state.preview ?? PREVIEW)
       if (what === 'instantiate') {
-        return json({ blueprint: state.bp ?? BP, app_spec: { format: 'agentlab.app/1', name: '门店周报', pins: [], slots: {}, entries: [],
-          forms: {}, task_ui: {}, views: {}, pages: [], hooks: [], notify: [] }, problems: [] })
+        return json({ blueprint: state.bp ?? BP, app_spec: state.appSpec ?? { format: 'agentlab.app/1', name: '门店周报', pins: [], slots: {},
+          entries: [], forms: {}, task_ui: {}, views: {}, pages: [], hooks: [], notify: [] }, problems: [] })
       }
       if (what === 'publish-plan') {
         state.planBodies = [...(state.planBodies ?? []), body()]
@@ -545,6 +568,9 @@ await section('试运行：横幅、输入、换一期再试、待办、出错',
   check('横幅写这次的输入', (await banner.locator('[data-trial-inputs]').innerText()).includes('2026-W41'))
   check('应用的样子用 ViewRenderer 渲染（预览）', await page.locator('[data-view-renderer="preview"]').count() === 1
     && (await page.locator('[data-stamp]').first().innerText()).includes('试运行'))
+  const trend = page.locator('[data-component="series"]')
+  check('趋势只有试运行一个点：照写服务端的说明（没有趋势），不当成出错', (await trend.locator('[data-series-note]').allInnerTexts())
+    .includes(TRIAL_SERIES_NOTE), (await trend.innerText().catch(() => '')).replace(/\s+/g, ' '))
   const tasks = page.locator('[data-trial-tasks]')
   check('有待办：右侧列试运行里的待办', await tasks.waitFor({ timeout: 5000 }).then(() => true, () => false))
   check('按钮写「以试运行身份…」', (await tasks.locator('[data-task-approve]').innerText()).includes('以试运行身份同意')
@@ -553,8 +579,31 @@ await section('试运行：横幅、输入、换一期再试、待办、出错',
   await tasks.locator('[data-task-approve]').click()
   check('以试运行身份同意：回复待办', await until(() => (state.responds ?? []).length === 1) && state.responds[0].decision === 'approve')
   await banner.locator('[data-trial-retry]').click()
+  check('预览没给表单：不自己从骨架里挑，只能原样再试', await banner.locator('[data-trial-retry-form] [data-field]').count() === 0)
   await banner.locator('[data-trial-retry-go]').click()
   check('换一期再试：再发起一次试运行', await until(() => (state.trials ?? []).length === 2))
+
+  // 看板类：「换一期再试」的表单由服务端随预览给（ViewModel.trial.form，blueprints/trial.retry_form：看板类是按条件查看的
+  // 条件表单），界面照它画、不自己从骨架里挑；填的期带进试运行
+  const board = { bp: READY(), appSpec: BOARD_SPEC, preview: { ...PREVIEW, trial: { ...PREVIEW.trial, form: BOARD_SPEC.forms.start } } }
+  const b = await open({ state: board })
+  await b.page.goto(`${WEB}/blueprints/bp_week`)
+  await b.page.locator('[data-bp-instantiate]').click()
+  await b.page.waitForTimeout(300)
+  await b.page.locator('[data-blueprint-trial]').click()
+  await b.page.waitForURL(/\/trial\?run=run_trial/, { timeout: 5000 })
+  const bBanner = b.page.locator('[data-trial-banner]')
+  await bBanner.waitFor({ timeout: 5000 })
+  check('横幅写服务端交回的这次输入（字段按表单写中文名）', (await bBanner.locator('[data-trial-inputs]').innerText()).includes('统计期：2026-W41'),
+    await bBanner.locator('[data-trial-inputs]').innerText())
+  await bBanner.locator('[data-trial-retry]').click()
+  const retryForm = bBanner.locator('[data-trial-retry-form] [data-field="period"] input')
+  check('看板类：「换一期再试」照服务端随预览给的条件表单画，带上这次的期', await retryForm.count() === 1
+    && await retryForm.inputValue() === '2026-W41', String(await retryForm.inputValue().catch(() => '（没有表单）')))
+  await retryForm.fill('2026-W40')
+  await bBanner.locator('[data-trial-retry-go]').click()
+  check('……换的期带进试运行', await until(() => (board.trials ?? []).length === 2) && board.trials[1]?.inputs?.period === '2026-W40',
+    JSON.stringify(board.trials))
 
   // 出错：白话说为什么，给「交给助手修」「回到卡片改」
   const bad = { bp: READY({ status: 'trialed', last_trial_run_id: 'run_trial' }), preview: PREVIEW_FAILED,
@@ -604,7 +653,7 @@ await section('发布摘要：三栏、处置、交给助手修', async () => {
 
 await section('发布摘要：确认、逐步打勾、停下、接着做', async () => {
   const running = { ...clone(PLAN_OK), status: 'running', steps: steps(2) }
-  const stopped = { ...clone(PLAN_OK), status: 'stopped', steps: steps(7, 'grant', '名录里没有组「门店」：先在设置里建这个组，或者在卡片上改授权') }
+  const stopped = { ...clone(PLAN_OK), status: 'stopped', ok: false, steps: steps(7, 'grant', '名录里没有组「门店」：先在设置里建这个组，或者在卡片上改授权') }
   const done = { ...clone(PLAN_OK), status: 'done', steps: steps(9) }
   const state = {
     bp: READY({ status: 'trialed', last_trial_run_id: 'run_trial' }), plans: [clone(PLAN_OK)],

@@ -78,6 +78,7 @@ async def test_trial_runs_the_unpublished_graph_and_previews_with_a_trial_stamp(
     # 自由形导入的图原样跑（哈希和导入的那一版一样），名字记蓝图名
     assert graph_hash(run.graph) == bp["graph_hash"] and run.workflow_name == bp["name"]
     assert run.input["period_start"] == s.PERIOD["period_start"]
+    assert r.json()["inputs"] == run.input, "回包里是这次实际用的输入"
 
     r = await client.get(f"/api/blueprints/{bp['id']}/preview")
     assert r.status_code == 200, r.text
@@ -171,6 +172,8 @@ async def test_process_trial_assigns_every_step_to_the_trial_runner_and_never_es
     assert form["trial"] is True and form["handler"] is True and form["task"]["id"] == task.id
     timeline = find(vm, "instance_timeline")[0]["data"]
     assert timeline["state"] == "ok" and timeline["status_text"] == "等待审批"
+    # 「换一期再试」的表单随预览给（blueprints/trial.retry_form）：流程类是入口的示例表单
+    assert set(vm["trial"]["form"]["properties"]) >= {"amount"}, vm["trial"]["form"]
     # 首页的「我发起的」列的就是这次试运行
     home = (await client.get(f"/api/blueprints/{bp['id']}/preview", params={"page": "home"})).json()
     assert [i["run_id"] for i in find(home, "instance_list")[0]["data"]["items"]] == [run_id]
@@ -253,7 +256,8 @@ async def login():
 
 
 async def test_a_users_trial_follows_the_chat_rules(login, tmp_path):
-    """使用者试运行自己的个人蓝图：和问数据同一份约束——结果遮罩、只读、记忆是他自己的；图里有使用者不能用的节点不试。"""
+    """使用者试运行自己的个人蓝图：和问数据同一份约束——结果遮罩、只读、记忆是他自己的；取数的调用工具节点（查数据源）
+    能试（D1），绑了使用者不能用的工具（写入能力）的不试。"""
     from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
 
     await login.turn_on_local()
@@ -282,7 +286,22 @@ async def test_a_users_trial_follows_the_chat_rules(login, tmp_path):
     source = await s.register_source(s.make_source(tmp_path))
     bp = await personal(s.board_graph(source))
     r = await user.post(f"/api/blueprints/{bp['id']}/trial", json={})
+    assert r.status_code == 200, r.text
+    run = await s.wait(r.json()["run_id"])
+    assert run.status == "succeeded" and run.options[READ_ONLY_OPTION] is True, run.error
+
+    # 同一张图里取数节点换成写记录表：使用者不能用的工具，不试
+    from app.db.models_blueprints import Blueprint
+
+    writes = s.board_graph(source)
+    writes["nodes"][1]["data"]["config"] = {"tool": "records_append", "args": {"table": "x", "values": {}}}
+    async with SessionLocal() as session:
+        row = await session.get(Blueprint, bp["id"])
+        row.graph, row.graph_hash = writes, graph_hash(writes)
+        await session.commit()
+    r = await user.post(f"/api/blueprints/{bp['id']}/trial", json={})
     assert r.status_code == 403 and r.json()["code"] == "trial_policy" and "个人应用" in r.json()["detail"], r.text
+    assert "records_append" in r.json()["detail"]
 
 
 async def test_a_template_blueprint_trials_with_the_latest_period_and_keeps_its_filled_joints(client, tmp_path):
@@ -327,6 +346,8 @@ async def test_a_template_blueprint_trials_with_the_latest_period_and_keeps_its_
     vm = (await client.get(f"/api/blueprints/{bp['id']}/preview")).json()
     stamp = find(vm, "stamp")[0]["data"]["stamp"]
     assert stamp["from"] == TRIAL_FROM and stamp["trial"] is True
+    # 「换一期再试」的表单随预览给：看板类没有入口，是按条件查看的条件表单（图的输入，统计期在里面），界面照它画
+    assert {"period_start", "period_end"} <= set(vm["trial"]["form"]["properties"]), vm["trial"]["form"]
     # 周期看板有趋势：试运行只有一个点，照实说没有趋势
     trends = [n["data"] for n in walk(vm["tree"]) if (n.get("data") or {}).get("note") == TRIAL_SERIES]
     assert trends and len(trends[0]["series"][0]["points"]) == 1

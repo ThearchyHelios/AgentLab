@@ -821,23 +821,22 @@ def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, 
 def _chat_user_kinds() -> str:
     from app.auth.chat_policy import CHAT_NODE_TYPES
 
-    return "、".join(sorted(CHAT_NODE_TYPES - {"merge"}))
+    return "、".join(sorted(CHAT_NODE_TYPES))
 
 
 #: 开登录后 user 角色在问数据里生成的图（D-c）要守的约束，接在结构要求后面（_graph_system 的 chat_user）。发起时按
-#: app/auth/chat_policy.py 收窄，节点手册里取数的标准写法（tool 节点查库、merge 按键合并）搭出来的图发起时一律被拒，所以先
-#: 说给模型听。规则本身只在 chat_policy 一处：节点类型从那里取，自查也按它判（_chat_user_issues），这里只是把它讲成模型
-#: 照着搭得出来的写法
+#: app/auth/chat_policy.py 收窄：节点只许读数据、整理、撰写这一类，tool 节点和 agent 只能用数据源查询和只读的内置工具，
+#: 所以先说给模型听。规则本身只在 chat_policy 一处：节点类型从那里取，自查也按它判（_chat_user_issues），这里只是把它讲成
+#: 模型照着搭得出来的写法
 _CHAT_USER_PROMPT = (
     "\n\n这位用户是「使用者」：这张图以他的身份运行，只能读数据、整理、撰写。下面几条优先于上面节点手册和搭图规则里的"
     "写法：\n"
-    f"1. 节点只用 {_chat_user_kinds()}。不要用 tool、code、merge、supervisor、subgraph、loop、human、memory、validate 等"
-    "其他节点（merge 的输入只能是 tool 节点，所以同样用不了）\n"
-    "2. 取数只用 agent：tools 里绑定 db_query__<数据源> 和 db_schema__<数据源>。数字要进口径卡、报告时，给这个 agent 配 "
-    "output_schema 和 cite_fields: true，口径卡取 vars.<agent 的 assign_to>.字段。数据在两个库时，让一个 agent 绑两个库的"
-    "查询工具，各自聚合后在 output_schema 里一起交回\n"
+    f"1. 节点只用 {_chat_user_kinds()}。不要用 code、supervisor、subgraph、loop、human、memory、validate 等其他节点\n"
+    "2. tool 节点和 agent 都只能用 db_query__<数据源>、db_schema__<数据源> 和上面列出的内置工具：取数用 tool 节点"
+    "（tool 写 db_query__<数据源>，args.sql 写好 SQL）或 agent（tools 里绑定这两种数据源工具）。不要用 http_request、"
+    "records_append 这类写入或连外部的工具，工具名不要用 {{ }} 拼\n"
     "3. 查询一律只读，不要写改数据的 SQL\n"
-    "4. 任何节点、图级 defaults 里都不要写 memory_scope、collection：记忆范围和知识库由平台定"
+    "4. 任何节点、图级 defaults、tool 节点的 args 里都不要写 memory_scope、collection：记忆范围和知识库由平台定"
 )
 
 
@@ -851,7 +850,7 @@ def _chat_user_issues(nodes: dict[str, dict[str, Any]], edges: list[dict[str, An
         return []
     return [{"level": "error", "node_id": None, "edge_id": None, "field": None, "code": "chat.not_allowed",
              "message": problem,
-             "for_model": f"{problem}。按 system 里「使用者」那一段的约束改：取数改成 agent 绑定数据源查询工具，"
+             "for_model": f"{problem}。按 system 里「使用者」那一段的约束改：取数用 tool 节点或 agent 调数据源查询工具，"
                           "去掉不允许的节点、工具和记忆范围 / 知识库配置"}]
 
 
@@ -2593,10 +2592,13 @@ async def extract_run_path(session: AsyncSession, run_id: str) -> RunPath:
     参数化成入口字段的默认值。不落库。「提取成工作流」（/from-run）和蓝图的「从问数据的回答开始」共用。"""
     from sqlalchemy import select as _sel
 
+    from app.api.deps import can_read_run, current_principal
     from app.db.models import Run, RunEvent
 
     run = await session.get(Run, run_id)
-    if not run:
+    # 读不到的运行当它不存在：别人的个人应用刷新、个人蓝图试运行只给拥有者（auth/access.private_owner），提取出的图就是
+    # 那张蓝图的内容，管理员、搭建者也不给
+    if not run or not await can_read_run(current_principal(), run):
         raise PathRefused(404, "运行记录不存在，可能已被删除")
     # 没跑通的路径提出来是半截骨架：失败节点之后的步骤一步都不在里面，
     # 人拿去审改时却看不出它缺了什么
@@ -2752,12 +2754,15 @@ async def review_run(
     规则层先扫一遍（engine/review.py:scan），没扫出东西就到此为止、直接返回，
     不花一次模型调用；扫出来了才叫模型重组答案并把异常说破。
     """
+    from app.api.deps import PRIVATE_RUN, can_read_run, current_principal
     from app.db.models import Run, RunEvent
     from app.engine import review as rv
 
     run = await session.get(Run, payload.run_id)
     if not run:
         raise HTTPException(404, "运行记录不存在，可能已被删除")
+    if not await can_read_run(current_principal(), run):
+        raise HTTPException(403, PRIVATE_RUN)
 
     rows = list((await session.execute(
         select(RunEvent).where(RunEvent.run_id == payload.run_id).order_by(RunEvent.seq)

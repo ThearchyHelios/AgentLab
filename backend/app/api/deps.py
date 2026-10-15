@@ -11,7 +11,9 @@
 - run_events_readable(principal, run)：运行的原始记录、事件、实时流能不能读（user 只读查询结果在工具边界遮过的）；
 - ensure_conversation_access(session, conversation_id)：接受 conversation_id 的接口核对对话归属（对话按人隔离）；
 - run_scope / evidence_scope / chat_scope：main.py 挂在运行、证据、问数据几组路由上的依赖，按 run_id 判断能不能读。
-  run_scope 同样管运行的 WebSocket，握手时按运行判。
+  run_scope 同样管运行的 WebSocket，握手时按运行判；
+- private_run_scope：挂在只给搭建者的运行子路由（对比、可验证报告、质询、假设分析）上，别人的个人应用刷新、个人蓝图
+  试运行只有拥有者能碰（auth/access.py 的 private_owner），管理员、搭建者也不例外。
 
 关登录时：所有人等同 admin、全部放行，行为和加这一层之前一模一样（界面上挂横幅说明）。
 
@@ -189,12 +191,15 @@ def masked_at_boundary(run: Any) -> bool:
 async def run_events_readable(principal: Principal, run: Any) -> bool:
     """能不能读这次运行的原始记录、事件和实时流（GET /api/runs/{id}、/events、/graph，WebSocket /stream）。
 
-    关登录、builder 及以上：能。user：这次运行它能读（can_read_run），而且查询结果在工具边界就遮过（masked_at_boundary）。
-    两个条件缺一不可：没在边界遮过的运行，事件里 tool.end 的预览、运行状态里是查询结果的原文，遮罩管不到——自己发起的
-    应用实例、有授权的应用视图运行经应用页和证据接口读（那两处按派生遮罩给）。实际上满足两条的就是它自己开登录后发起的
+    关登录：能。builder 及以上：这次运行它能读就能（can_read_run：别人的个人应用刷新、个人蓝图试运行读不了）。
+    user：这次运行它能读（can_read_run），而且查询结果在工具边界就遮过（masked_at_boundary）。两个条件缺一不可：
+    没在边界遮过的运行，事件里 tool.end 的预览、运行状态里是查询结果的原文，遮罩管不到——自己发起的应用实例、
+    有授权的应用视图运行经应用页和证据接口读（那两处按派生遮罩给）。实际上满足两条的就是它自己开登录后发起的
     问数据运行；关登录时自报同名留下的老运行没在边界遮过，开了登录也读不到。"""
-    if principal.mode == "off" or principal.at_least("builder"):
+    if principal.mode == "off":
         return True
+    if principal.at_least("builder"):
+        return await can_read_run(principal, run)
     if run is None or not principal.username or not masked_at_boundary(run):
         return False
     return await can_read_run(principal, run)
@@ -206,7 +211,8 @@ def _own_chat_run(principal: Principal, run: Any) -> bool:
 
 
 async def _run_scope(conn: HTTPConnection) -> None:
-    """/api/runs 下的接口和运行的实时流。builder 及以上全部放行；user 角色只在管理员开了问数据（Q2）时能碰这组接口：
+    """/api/runs 下的接口和运行的实时流。builder 及以上放行，只有别人的个人应用刷新、个人蓝图试运行例外（只给拥有者，
+    _refuse_private）；user 角色只在管理员开了问数据（Q2）时能碰这组接口：
     - 列表、别人的运行一律不给（记录页是给搭建者看的）；
     - 能发起（只能是问数据的探索运行，start_run 里按请求体再查）；能停止自己的问数据运行；
     - 能读运行记录、事件、运行时的图，能连 WebSocket：按运行判（run_events_readable），握手时就判，不再一刀切只给
@@ -214,7 +220,10 @@ async def _run_scope(conn: HTTPConnection) -> None:
     - 自己发起的应用实例、有授权的应用视图运行、参与的实例，经应用页（/api/apps/{id}/instances）和证据接口
       （evidence_scope）读，这里不给原始事件和状态：tool.end 的预览、运行状态里是查询结果的原文，遮罩管不到。"""
     principal = current_principal()
-    if principal.mode == "off" or principal.at_least("builder"):
+    if principal.mode == "off":
+        return
+    if principal.at_least("builder"):
+        await _refuse_private(conn, principal)
         return
     if conn.scope["type"] == "websocket":
         # 握手前拒：服务端回 1008，不建立连接。没登录的中间件已经挡掉了，这里只剩按运行判
@@ -256,6 +265,34 @@ async def _load_run(run_id: str | None) -> Any:
         return await session.get(Run, run_id)
 
 
+#: 搭建者、管理员碰别人的个人应用刷新、个人蓝图试运行时的说法
+PRIVATE_RUN = "没有权限查看这次运行：个人应用的刷新和个人蓝图的试运行只有拥有者能看"
+#: 运行子路由里另带的运行 id（对比的基准 ?base=）
+_RUN_QUERY_KEYS = ("base",)
+
+
+async def _refuse_private(conn: HTTPConnection, principal: Principal) -> None:
+    """builder 及以上：路径里的运行（和对比的基准）是别人的个人应用刷新、个人蓝图试运行时拒（403，WebSocket 握手前
+    1008）。不存在的运行放过去，由接口照旧回 404。"""
+    ids = [conn.path_params.get("run_id"), *(conn.query_params.get(k) for k in _RUN_QUERY_KEYS)]
+    for run_id in (i for i in ids if i):
+        if await can_read_run(principal, run_id):
+            continue
+        if conn.scope["type"] == "websocket":
+            from fastapi import WebSocketException, status
+
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+        raise HTTPException(403, PRIVATE_RUN)
+
+
+async def _private_run_scope(conn: HTTPConnection) -> None:
+    """只给搭建者的运行子路由（main.py 里对比、可验证报告、质询、假设分析）：角色由 require_role 判，这里只管别人的
+    个人应用刷新、个人蓝图试运行。"""
+    principal = current_principal()
+    if principal.mode != "off":
+        await _refuse_private(conn, principal)
+
+
 def restricted() -> bool:
     """这次请求的人是不是开登录后的 user 角色：对它来说遮罩就是边界，只能做问数据、用应用这几件事。"""
     principal = current_principal()
@@ -263,10 +300,13 @@ def restricted() -> bool:
 
 
 async def _evidence_scope(conn: HTTPConnection) -> None:
-    """/api/runs/{run_id}/evidence… 这组证据接口：builder 及以上全部放行；user 角色只读（GET），而且这次运行要能读
-    （can_read_run）。证据接口交出的查询行本身按派生遮罩处理过。"""
+    """/api/runs/{run_id}/evidence… 这组证据接口：builder 及以上放行，别人的个人应用刷新、个人蓝图试运行除外（只给
+    拥有者）；user 角色只读（GET），而且这次运行要能读（can_read_run）。证据接口交出的查询行本身按派生遮罩处理过。"""
     principal = current_principal()
-    if principal.mode == "off" or principal.at_least("builder") or conn.scope["type"] != "http":
+    if principal.mode == "off" or conn.scope["type"] != "http":
+        return
+    if principal.at_least("builder"):
+        await _refuse_private(conn, principal)
         return
     ensure_role("user")
     if conn.scope.get("method", "GET") != "GET":
@@ -298,6 +338,7 @@ _CHAT_ROUTES = frozenset({("POST", "/api/copilot/generate-stream"), ("GET", "/ap
 run_scope = Depends(_run_scope)
 evidence_scope = Depends(_evidence_scope)
 chat_scope = Depends(_chat_scope)
+private_run_scope = Depends(_private_run_scope)
 
 
 def role_by_method(*, read: str, write: str) -> Any:

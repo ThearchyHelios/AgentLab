@@ -178,15 +178,23 @@ async def test_entry_binds_the_file_once_and_file_text_reads_it(client):
     assert text.startswith(TEXT[:12]) and f"共 {len(TEXT)} 字" in text and "只读入了前 12 字" in text
     async with SessionLocal() as session:
         events = list((await session.execute(select(RunEvent).where(RunEvent.run_id == run_id))).scalars())
-    extracted = [e.data for e in events if e.type == "file.extracted" or e.data.get("code") == "file.extracted"]
+    extracted = [e.data for e in events if e.type == "file.extracted"]
     assert len(extracted) == 1
     assert extracted[0]["truncated"] is True and extracted[0]["chars"] == 12
     assert extracted[0]["total_chars"] == len(TEXT) and extracted[0]["artifact"]
+    # 可验证报告的事件名表认得它（运行时间线的说法在前端 run/decode.ts，check-decode 有一节）
+    from pathlib import Path
+
+    from app import bundle as bundle_pkg
+
+    verifier = (Path(bundle_pkg.__file__).parent / "verifier.js").read_text(encoding="utf-8")
+    assert "'file.extracted': '读入附件'" in verifier
 
     again = await client.post(f"/api/apps/{app_id}/entries/report", json={"values": {"doc": ref}},
                               headers=actor("amy"))
     assert again.status_code == 422
     assert again.json()["errors"][0]["path"] == "doc" and "已经提交过" in again.json()["errors"][0]["message"]
+    assert again.json()["errors"][0]["code"] == "file"
 
     bobs = (await upload(client, app_id, "别人的.txt", "二店报损".encode(), who="bob")).json()
     stolen = await client.post(f"/api/apps/{app_id}/entries/report", json={"values": {"doc": bobs}},
@@ -355,6 +363,7 @@ async def test_import_period_uses_the_recipe_and_leaves_decisions_to_people(clie
 
 def test_form_file_widget_rules():
     from app.apps.forms import input_schema, validate_form, validate_form_schema
+    from app.apps.spec import FORM_ERROR_CODES
 
     form = {"type": "object", "required": ["doc"], "properties": {"doc": FILE_FIELD}}
     assert validate_form_schema(form) == []
@@ -367,9 +376,10 @@ def test_form_file_widget_rules():
     ref = {"file_id": "f", "name": "a.txt", "size": 3, "sha256": "0" * 64, "type": "text/plain"}
     assert validate_form(form, {"doc": ref}) == []
     assert validate_form(form, {})[0]["code"] == "required"
-    assert validate_form(form, {"doc": "a.txt"})[0]["message"] == "「附件」需要先上传文件"
+    assert validate_form(form, {"doc": "a.txt"})[0] == {"path": "doc", "code": "file", "message": "「附件」需要先上传文件"}
     wrong = validate_form(form, {"doc": {**ref, "name": "a.pdf", "type": "application/pdf"}})
-    assert wrong and "只收这些类型" in wrong[0]["message"]
+    assert wrong and wrong[0]["code"] == "file" and "只收这些类型" in wrong[0]["message"]
+    assert "file" in FORM_ERROR_CODES, "文件控件的错误有自己的 code（前端 FormError.code 同一份）"
     schema = input_schema([{"name": "doc", "type": "file", "required": True, "accept": [".pdf"], "max_mb": 5}])
     assert schema["properties"]["doc"] == {"type": "object", "x-widget": "file", "title": "doc",
                                            "x-file": {"accept": [".pdf"], "max_mb": 5}}

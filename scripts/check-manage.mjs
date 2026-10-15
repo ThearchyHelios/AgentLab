@@ -679,6 +679,58 @@ await section('设置 · 起草模型', async () => {
   await old.close()
 })
 
+await section('设置 · 应用：使用者可以建个人应用（只有管理员能改）', async () => {
+  // 管理员开关 apps.user_personal_apps（docs/design/normal-user-apps.md N7）：在「应用」一组，和按需视图每日上限一起整组写；
+  // 只有管理员能改，搭建者看得到、改不了。使用者那边的入口随认人接口的 user_personal_apps 变（check-auth 查）
+  let stored = await get('/settings')
+  stored = { ...stored, apps: { ...(stored.apps ?? {}), on_demand_daily_limit: 200, user_personal_apps: false } }
+  const { page, sent, errors, close } = await open('/settings/prefs', {
+    handlers: [
+      [/^GET \/settings$/, (route) => json(stored)(route)],
+      [/^PUT \/settings$/, (route, { body }) => { stored = { ...stored, ...body.values }; return json(stored)(route) }],
+    ],
+  })
+  const box = page.locator('[data-apps-settings]')
+  await box.waitFor()
+  const toggle = box.locator('[data-apps-personal]')
+  check('「应用」一组里有「使用者可以建个人应用」，存着的是关', await toggle.count() === 1 && !(await toggle.isChecked())
+    && (await box.innerText()).includes('使用者可以建个人应用'))
+  const hint = await page.locator('#pref-apps-personal-hint').innerText().catch(() => '')
+  check('……写明开了之后使用者能做什么：只有自己看得见、只读遮罩、给别人用要审核', hint.includes('只有自己看得见')
+    && hint.includes('遮罩') && hint.includes('审核'), hint)
+  check('管理员（关登录）可以改', await toggle.isEnabled())
+  await toggle.check()
+  const bar = (await page.locator('[data-prefs-bar]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('……保存条写「使用者可以建个人应用」', bar.includes('有 1 项未保存') && bar.includes('使用者可以建个人应用'), bar)
+  await page.getByRole('button', { name: /保存设置/ }).click()
+  await page.waitForTimeout(500)
+  const put = sent.filter((s) => s.key === 'PUT /settings').at(-1)?.body?.values
+  check('保存只 PUT apps 一组：开关写成 true，每日上限原样带回', Object.keys(put ?? {}).join() === 'apps'
+    && put.apps.user_personal_apps === true && put.apps.on_demand_daily_limit === 200, JSON.stringify(put))
+  check('……读回来还是开着', await toggle.isChecked())
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+
+  // 搭建者（开了登录）：开关照服务端显示，改不了，写明只有管理员可以修改
+  const builder = await open('/settings/prefs', {
+    handlers: [
+      [/^GET \/auth\/me$/, json({ mode: 'local', username: 'lisi', display_name: '李四', role: 'builder', groups: [], verified: true,
+        user_personal_apps: true })],
+      [/^GET \/settings$/, (route) => json({ ...stored, apps: { ...stored.apps, user_personal_apps: true } })(route)],
+    ],
+  })
+  const t2 = builder.page.locator('[data-apps-personal]')
+  await t2.waitFor()
+  check('搭建者：开关照服务端显示（开着），但改不了', await t2.isChecked() && await t2.isDisabled())
+  check('……写明只有管理员可以修改', (await builder.page.locator('[data-prefs-readonly]').innerText().catch(() => '')).includes('只有管理员'))
+  await t2.click({ force: true, timeout: 2000 }).catch(() => {})
+  await builder.page.waitForTimeout(300)
+  check('……点了也不变、不出保存条、不发 PUT', await t2.isChecked() && await builder.page.locator('[data-prefs-bar]').count() === 0
+    && !builder.sent.some((s) => s.key === 'PUT /settings'))
+  check('没有运行时报错', builder.errors.length === 0, builder.errors[0] ?? '')
+  await builder.close()
+})
+
 await section('设置 · 点名的接入已停用或不存在', async () => {
   // 点名停用的接入以前照常调用，现在运行时照实报错（K1）：存着的值后来被停用了，那一格下面要说；别的停用接入列着但选不了；
   // 服务端按项拒收（422 带 field）时整句落到那一格下面、焦点移过去，保存条上原因不截断。接入表、设置读写都是假的

@@ -109,5 +109,5 @@ TEMPLATE = register(TemplateDef(
            "access": "可选：谁能发起、谁能看全部、谁能管理"},
     personal=None,
     skeleton=skeleton, app_skeleton=app_skeleton, schedule=None, tags=["流程", "审批"],
+    example=example, example_fill=dict, prefill=_prefill, problems=problems,
 ))
-c.extend(ID, c.Extras(example=example, example_fill=dict, prefill=_prefill, problems=problems))

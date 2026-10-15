@@ -14,14 +14,14 @@ import copy
 import pytest
 
 from app.blueprints.instantiate import filled_from, generated_groups, instantiate, registry_problems, skeleton_changes
-from app.blueprints.templates import GENERATED_JOINT_KINDS, TEMPLATE_IDS, get_template
+from app.blueprints.templates import GENERATED_JOINT_KINDS, TEMPLATE_IDS, check_registry, get_template
 from app.blueprints.templates import _common as c
 from app.engine.governance import publish_issues
 from app.engine.schema import GraphSpec, validate_graph
 
 
 def _graph_for(template_id: str):
-    if c.EXTRAS[template_id].imports_graph:
+    if get_template(template_id).imports_graph:
         from app.blueprints.templates.freeform import example_graph
 
         return example_graph()
@@ -30,16 +30,31 @@ def _graph_for(template_id: str):
 
 def test_registry_is_complete():
     assert registry_problems() == []
+    assert check_registry() == [], "启动核对（check_registry）走的就是 registry_problems 这一份"
     assert all(get_template(t) is not None for t in TEMPLATE_IDS)
     for t in TEMPLATE_IDS:
         template = get_template(t)
         assert template.applies_when and template.cards and template.skeleton
         assert all(note.startswith(("必填", "可选")) for note in template.cards.values()), t
+        # 示例蓝图、预置、每组关节的说明、模板自己认的问题都登记在 TemplateDef 上，没有旁路登记
+        assert callable(template.example) and callable(template.example_fill), t
+        assert template.imports_graph == (t == "freeform")
+    assert not hasattr(c, "EXTRAS")
+
+
+def test_a_template_without_an_example_is_reported(monkeypatch):
+    """模板定义、实例化、测试三样缺一样启动即报错：少了示例蓝图的模板，check_registry 照实报出来。"""
+    import dataclasses
+
+    from app.blueprints.templates import _REGISTRY
+
+    monkeypatch.setitem(_REGISTRY, "approval", dataclasses.replace(get_template("approval"), example=None))
+    assert check_registry() == ["模板「approval」没有示例蓝图"]
 
 
 @pytest.mark.parametrize("template_id", TEMPLATE_IDS)
 def test_every_template_instantiates_validates_and_publishes(template_id):
-    extras = c.EXTRAS[template_id]
+    extras = get_template(template_id)
     example = extras.example()
     graph = _graph_for(template_id)
 
@@ -71,7 +86,7 @@ def test_every_template_instantiates_validates_and_publishes(template_id):
 
 
 def test_board_details():
-    extras = c.EXTRAS["periodic_board"]
+    extras = get_template("periodic_board")
     inst = instantiate(extras.example(), filled=extras.example_fill(), schedule_id="sch_1", blueprint_id="bp_1")
     nodes = {n["id"]: n for n in inst.graph["nodes"]}
     assert nodes["fetch_shop"]["data"]["config"]["tool"] == "db_query__shop"
@@ -95,7 +110,7 @@ def test_board_details():
 
 
 def test_board_with_reused_caliber_and_two_sources():
-    spec = c.EXTRAS["periodic_board"].example()
+    spec = get_template("periodic_board").example()
     spec["data"].append({"id": "visits", "label": {"value": "访客数", "source": "user", "status": "confirmed", "why": None},
                          "unit": {"value": "人", "source": "user", "status": "confirmed", "why": None},
                          "table": {"value": {"source": "crm", "table": "visits"}, "source": "user",
@@ -125,7 +140,7 @@ def test_board_with_reused_caliber_and_two_sources():
 
 
 def test_approval_details():
-    inst = instantiate(c.EXTRAS["approval"].example())
+    inst = instantiate(get_template("approval").example())
     nodes = {n["id"]: n for n in inst.graph["nodes"]}
     finance = nodes["review_finance"]["data"]["config"]
     assert finance["assignee"] == {"kind": "slot", "slot": "finance"} and finance["policy"] == "all"
@@ -143,7 +158,7 @@ def test_approval_details():
     assert inst.app_spec["entries"][0]["map"] == {"amount": "form.amount", "reason": "form.reason"}
     assert inst.schedule is None
     # 确定性关节按卡片换：改了金额线，分支跟着变；骨架比对只许关节位置不同
-    other = c.EXTRAS["approval"].example()
+    other = get_template("approval").example()
     other["people"][1]["threshold"]["value"]["value"] = 8000
     changed = instantiate(other)
     assert {n["id"]: n for n in changed.graph["nodes"]}["gate_finance"]["data"]["config"]["cases"][0]["condition"] \
@@ -151,7 +166,7 @@ def test_approval_details():
 
 
 def test_approval_writeback_confirms_with_last_step(monkeypatch):
-    spec = c.EXTRAS["approval"].example()
+    spec = get_template("approval").example()
     item = c.template_item
     spec["writeback"] = {"capability": item("erp_reimburse"), "mapping": item({"amount": "form.amount", "kind": "'报销'"}),
                          "confirm": item(True)}
@@ -170,7 +185,7 @@ def test_approval_writeback_confirms_with_last_step(monkeypatch):
 def test_records_routes_submit_and_summary():
     from app.records import RECORDS_APPEND
 
-    extras = c.EXTRAS["records"]
+    extras = get_template("records")
     inst = instantiate(extras.example(), records={"table": "loss", "source": "records_loss"}, blueprint_id="bp_9")
     nodes = {n["id"]: n for n in inst.graph["nodes"]}
     append = nodes["append"]["data"]["config"]
@@ -190,18 +205,18 @@ def test_records_routes_submit_and_summary():
 
 
 def test_exception_and_reconcile_details():
-    inst = instantiate(c.EXTRAS["exception_handling"].example())
+    inst = instantiate(get_template("exception_handling").example())
     nodes = {n["id"]: n for n in inst.graph["nodes"]}
     assert nodes["handle"]["data"]["config"]["mode"] == "input"
     assert nodes["handle"]["data"]["config"]["assignee"] == {"kind": "slot", "slot": "owner"}
     assert nodes["review"]["data"]["config"]["assignee"] == {"kind": "slot", "slot": "区域经理"}
     assert nodes["gate"]["data"]["config"]["cases"][0]["condition"] == "nodes.parse.row_count > 0"
     # 只看清单（个人应用能用的那一部分）：没有人工节点
-    spec = c.EXTRAS["exception_handling"].example()
+    spec = get_template("exception_handling").example()
     spec["people"] = []
     assert not [n for n in instantiate(spec).graph["nodes"] if n["type"] == "human"]
 
-    inst = instantiate(c.EXTRAS["reconcile_writeback"].example())
+    inst = instantiate(get_template("reconcile_writeback").example())
     write = {n["id"]: n for n in inst.graph["nodes"]}["writeback"]["data"]["config"]
     assert write["args"] == {"items": "{{ nodes.parse.rows | compact }}", "total": "{{ nodes.caliber.metrics[1].value }}"}
     assert write["assignee"] == {"kind": "slot", "slot": "check"}
@@ -210,7 +225,7 @@ def test_exception_and_reconcile_details():
 
 
 def test_skeleton_changes_catch_anything_but_joints():
-    extras = c.EXTRAS["periodic_board"]
+    extras = get_template("periodic_board")
     inst = instantiate(extras.example(), filled=extras.example_fill())
     joints = inst.joint_defs
     graph = copy.deepcopy(inst.graph)
@@ -228,7 +243,7 @@ def test_skeleton_changes_catch_anything_but_joints():
 
 
 def test_filled_values_go_stale_when_the_cards_change():
-    extras = c.EXTRAS["periodic_board"]
+    extras = get_template("periodic_board")
     spec = extras.example()
     inst = instantiate(spec, filled=extras.example_fill())
     joints = inst.joints
@@ -247,6 +262,6 @@ def test_trial_inputs_follow_the_cadence():
 
     from app.blueprints.instantiate import trial_inputs
 
-    inputs = trial_inputs(c.EXTRAS["periodic_board"].example(), at=datetime(2026, 10, 15, 3, tzinfo=timezone.utc))
+    inputs = trial_inputs(get_template("periodic_board").example(), at=datetime(2026, 10, 15, 3, tzinfo=timezone.utc))
     assert inputs == {"period": "2026-W41", "period_start": "2026-10-05", "period_end": "2026-10-11"}
-    assert trial_inputs(c.EXTRAS["approval"].example()) == {}
+    assert trial_inputs(get_template("approval").example()) == {}

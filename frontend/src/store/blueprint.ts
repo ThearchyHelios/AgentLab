@@ -4,8 +4,8 @@ import { streamBlueprint, streamFillJoints } from '../api/blueprintCopilot'
 import { COPILOT_PHASE_TEXT, copilotLook, type CopilotOp } from '../run/decode'
 import { BLUEPRINT_TEXT, LOOK_TEXT } from '../lib/terms'
 import type { ConversationTurn } from '../types'
-import type { AppSpec, FormSchema } from '../typesApp'
-import type { Blueprint, BpAsk, BpOp, JointState, PlainIssue, TrialStart } from '../typesBlueprint'
+import type { AppSpec } from '../typesApp'
+import type { Blueprint, BpAsk, BpOp, JointState, PlainIssue } from '../typesBlueprint'
 
 /**
  * 蓝图页的状态（docs/design/normal-user-apps.md §2.2、§2.11、§4.2）：每个蓝图一桶——蓝图本身、对话的轮次、填关节的进度。
@@ -71,12 +71,9 @@ export interface BpEntry {
   answered: string[]
   /** 最近一次按卡片生成的结果：应用骨架（试运行的输入表单从它的入口取）和检查出的问题 */
   instantiated?: { app_spec: AppSpec; problems: PlainIssue[] } | null
-  /** 这一页里发起的最近一次试运行：用了什么输入、输入表单（服务端给了的话） */
-  lastTrial?: { run_id: string; inputs?: Record<string, unknown> | null; form?: FormSchema | null } | null
+  /** 这一页里发起的最近一次试运行：实际用了什么输入（服务端交回的，看板类补齐了统计期） */
+  lastTrial?: { run_id: string; inputs?: Record<string, unknown> | null } | null
 }
-
-/** 试运行的回包：服务端可以多给这次用的输入（按「多久更新」算出的最近一期）和输入表单 */
-export type TrialStartOut = TrialStart & { inputs?: Record<string, unknown> | null; form?: FormSchema | null }
 
 interface BlueprintState {
   byId: Record<string, BpEntry>
@@ -193,15 +190,15 @@ export const useBlueprint = create<BlueprintState>((set, get) => {
       const key = `${id}:chat`
       const stop = streamBlueprint(
         { blueprint_id: id, instruction },
-        (op: CopilotOp) => {
+        (op) => {
           got.push(op)
           patchTurn(id, turnId, (t) => ({ ops: pushOp(t.ops, op) }))
           switch (op.op) {
-            case 'heartbeat':
-              patchTurn(id, turnId, () => ({
-                status: op.phase === 'looking' ? LOOK_TEXT.running : COPILOT_PHASE_TEXT[String(op.phase)] ?? COPILOT_PHASE_TEXT.planning,
-              }))
+            case 'heartbeat': {
+              const status = op.phase === 'looking' ? LOOK_TEXT.running : COPILOT_PHASE_TEXT[op.phase] ?? COPILOT_PHASE_TEXT.planning
+              patchTurn(id, turnId, () => ({ status }))
               break
+            }
             case 'look': {
               const look = copilotLook(op)
               if (look) patchTurn(id, turnId, () => ({ status: look.title }))
@@ -212,13 +209,17 @@ export const useBlueprint = create<BlueprintState>((set, get) => {
               // 模型写成通用的 ask 也认（服务端存进蓝图时换成 bp_ask）
               patchTurn(id, turnId, () => ({ status: BLUEPRINT_TEXT.turnAsked }))
               break
-            case 'final':
+            case 'final': {
               // 服务端落地后的整份蓝图为准
-              if (isBlueprint(op.blueprint)) { finalSeen = true; patch(id, () => ({ blueprint: op.blueprint as Blueprint })) }
+              const bp = op.blueprint
+              if (isBlueprint(bp)) { finalSeen = true; patch(id, () => ({ blueprint: bp })) }
               break
-            case 'error':
-              patchTurn(id, turnId, () => ({ phase: 'error', error: String(op.message ?? BLUEPRINT_TEXT.turnFailed) }))
+            }
+            case 'error': {
+              const error = op.message || BLUEPRINT_TEXT.turnFailed
+              patchTurn(id, turnId, () => ({ phase: 'error', error }))
               break
+            }
             default:
               if (BP_EDIT_OPS.has(op.op)) patchTurn(id, turnId, () => ({ status: BLUEPRINT_TEXT.turnRunning }))
           }
@@ -257,10 +258,10 @@ export const useBlueprint = create<BlueprintState>((set, get) => {
     },
 
     trial: async (id, inputs) => {
-      const res = await api.blueprints.trial(id, inputs ? { inputs } : {}) as TrialStartOut
+      const res = await api.blueprints.trial(id, inputs ? { inputs } : {})
       patch(id, () => ({
         blueprint: res.blueprint, loadState: 'ready',
-        lastTrial: { run_id: res.run_id, inputs: res.inputs ?? inputs ?? null, form: res.form ?? null },
+        lastTrial: { run_id: res.run_id, inputs: res.inputs ?? inputs ?? null },
       }))
       return res.run_id
     },
@@ -281,52 +282,64 @@ export const useBlueprint = create<BlueprintState>((set, get) => {
       })
       const stop = streamFillJoints(
         { blueprint_id: id, ...(groups?.length ? { groups } : {}) },
-        (op: CopilotOp) => {
-          const gid = typeof op.group === 'string' && op.group ? op.group : null
-          const joint = typeof op.joint === 'string' ? op.joint : null
+        (op) => {
+          const gid = op.group || null
           switch (op.op) {
-            case 'group':
+            case 'group': {
               // 组的结局：started / retrying（并行出错退回串行再试）是在填，filled 填好，failed 没填上（带原因或没过的检查）
-              if (gid) {
-                const issue = Array.isArray(op.issues) ? op.issues.find((i: any) => i?.message) : null
-                group(gid, (g) => ({
-                  joints: Array.isArray(op.joints) ? op.joints.map(String) : g.joints,
-                  status: op.status === 'filled' ? 'done' : op.status === 'failed' ? 'failed' : 'running',
-                  line: op.status === 'retrying' ? BLUEPRINT_TEXT.groupRetrying : g.line,
-                  ...(op.message || issue ? { message: String(op.message ?? issue.message) } : {}),
-                }))
-              }
+              const message = op.message || op.issues?.find((i) => i.message)?.message
+              const status = op.status === 'filled' ? 'done' : op.status === 'failed' ? 'failed' : 'running'
+              const joints = op.joints?.map(String)
+              const retrying = op.status === 'retrying'
+              group(op.group, (g) => ({
+                joints: joints ?? g.joints, status, line: retrying ? BLUEPRINT_TEXT.groupRetrying : g.line,
+                ...(message ? { message } : {}),
+              }))
               break
-            case 'plan':
-              if (gid && op.summary) group(gid, () => ({ line: String(op.summary) }))
+            }
+            case 'plan': {
+              const line = op.summary
+              if (gid && line) group(gid, () => ({ line }))
               break
-            case 'check':
-              if (gid) group(gid, () => ({ line: op.status === 'repairing' ? COPILOT_PHASE_TEXT.repairing : BLUEPRINT_TEXT.groupChecked }))
+            }
+            case 'check': {
+              const line = op.status === 'repairing' ? COPILOT_PHASE_TEXT.repairing : BLUEPRINT_TEXT.groupChecked
+              if (gid) group(gid, () => ({ line }))
               break
-            case 'fill_joint':
-              if (joint) patchFill(id, (f) => ({ joints: { ...f.joints, [joint]: { status: 'filled' } } }))
-              if (gid && joint) group(gid, (g) => ({ joints: g.joints.includes(joint) ? g.joints : [...g.joints, joint] }))
+            }
+            case 'fill_joint': {
+              const joint = op.joint
+              patchFill(id, (f) => ({ joints: { ...f.joints, [joint]: { status: 'filled' } } }))
+              if (gid) group(gid, (g) => ({ joints: g.joints.includes(joint) ? g.joints : [...g.joints, joint] }))
               break
-            case 'heartbeat':
-              if (gid) group(gid, () => ({ line: op.phase === 'looking' ? LOOK_TEXT.running : COPILOT_PHASE_TEXT[String(op.phase)] }))
+            }
+            case 'heartbeat': {
+              const line = op.phase === 'looking' ? LOOK_TEXT.running : COPILOT_PHASE_TEXT[op.phase]
+              if (gid) group(gid, () => ({ line }))
               break
+            }
             case 'look': {
               const look = copilotLook(op)
               if (gid && look) group(gid, () => ({ line: look.title }))
               break
             }
-            case 'final':
-              if (isBlueprint(op.blueprint)) { finalSeen = true; patch(id, () => ({ blueprint: op.blueprint as Blueprint })) }
-              if (Array.isArray(op.problems)) patchFill(id, () => ({ problems: op.problems as PlainIssue[] }))
+            case 'final': {
+              const bp = op.blueprint
+              const problems = op.problems
+              if (isBlueprint(bp)) { finalSeen = true; patch(id, () => ({ blueprint: bp })) }
+              if (Array.isArray(problems)) patchFill(id, () => ({ problems }))
               // 各组的结局以 final 为准（卡片在填的时候又改过的组，服务端判它不算数）
-              for (const [g, r] of Object.entries((op.groups ?? {}) as Record<string, { status?: string }>)) {
+              for (const [g, r] of Object.entries(op.groups ?? {})) {
                 group(g, () => ({ status: r?.status === 'filled' ? 'done' : 'failed' }))
               }
               break
-            case 'error':
-              if (gid) group(gid, () => ({ status: 'failed', message: String(op.message ?? BLUEPRINT_TEXT.groupFailed) }))
-              else patchFill(id, () => ({ error: String(op.message ?? BLUEPRINT_TEXT.fillFailed) }))
+            }
+            case 'error': {
+              const message = op.message
+              if (gid) group(gid, () => ({ status: 'failed', message: message || BLUEPRINT_TEXT.groupFailed }))
+              else patchFill(id, () => ({ error: message || BLUEPRINT_TEXT.fillFailed }))
               break
+            }
           }
         },
         (error, info) => {

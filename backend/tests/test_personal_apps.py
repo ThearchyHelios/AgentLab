@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import uuid
 from datetime import timedelta
 
@@ -28,7 +29,7 @@ from app.api.deps import Principal
 from app.api.settings import APPS_GROUP
 from app.core.artifact_store import graph_hash
 from app.db.base import SessionLocal, utcnow
-from app.db.models import Run, Setting, Workflow, WorkflowVersion
+from app.db.models import Run, RunEvent, Setting, Workflow, WorkflowVersion
 from app.db.models_apps import App
 from app.db.models_blueprints import Blueprint, BlueprintEvent
 from app.db.models_process import Task, TaskAssignment
@@ -165,13 +166,17 @@ async def test_the_switch_gates_users_but_not_builders():
 
     # 搭建者不受开关管（§3.12）
     assert (await c["bob"].get("/api/apps")).json()["can_create"] == {"shared": True, "personal": True}
-    await saved(c["bob"], await blueprint("bob"))
+    bob_app = await saved(c["bob"], await blueprint("bob"))
 
     await switch(True)
     assert (await c["uma"].get("/api/apps")).json()["can_create"] == {"shared": False, "personal": True}
     app_id = await saved(c["uma"], uma_bp)
+    assert (await c["uma"].get(f"/api/apps/{app_id}")).json()["personal"]["allowed"] is True
 
     await switch(False)
+    # 关了开关：个人应用照样看得到，详情照同一条规则说现在不能刷新、提交审核（界面照它置灰，不自己再推一遍）
+    assert (await c["uma"].get(f"/api/apps/{app_id}")).json()["personal"]["allowed"] is False
+    assert (await c["bob"].get(f"/api/apps/{bob_app}")).json()["personal"]["allowed"] is True, "搭建者不受开关管"
     assert (await c["uma"].post(f"/api/apps/{app_id}/refresh")).json()["code"] == "personal.off"
     r = await c["uma"].post(f"/api/apps/{app_id}/submit-review", json={"to": [{"kind": "user", "name": "bob"}]})
     assert r.status_code == 403 and r.json()["code"] == "personal.off"
@@ -398,19 +403,31 @@ async def test_only_the_owner_sees_a_personal_app():
 
 
 async def test_an_admin_sees_that_it_exists_and_can_archive_it_but_not_its_content():
+    """管理员看别人的个人应用（D7）：列表和详情里只有名称、拥有者、状态、创建和更新时间，能归档；页面、草稿、候选、
+    版本、刷新的运行、蓝图一概看不到。"""
     root, c = await people()
     await switch(True)
-    app_id = await saved(c["uma"], await blueprint("uma"))
-    await refreshed(c["uma"], app_id)
-    for path in (f"/api/apps/{app_id}", f"/api/apps/{app_id}/pages/home", f"/api/apps/{app_id}/pages/home?draft=1",
-                 f"/api/apps/{app_id}/candidates", f"/api/apps/{app_id}/versions"):
+    bp = await blueprint("uma")
+    app_id = await saved(c["uma"], bp)
+    run = await refreshed(c["uma"], app_id)
+    for path in (f"/api/apps/{app_id}/pages/home", f"/api/apps/{app_id}/pages/home?draft=1",
+                 f"/api/apps/{app_id}/candidates", f"/api/apps/{app_id}/versions", f"/api/blueprints/{bp}"):
         assert (await root.get(path)).status_code == 404, path
+    for path in (f"/api/runs/{run.id}", f"/api/runs/{run.id}/evidence"):
+        assert (await root.get(path)).status_code == 403, path
     listed = next(a for a in (await root.get("/api/apps")).json()["items"] if a["id"] == app_id)
     assert (listed["owner"], listed["scope"], listed["my_role"], listed["description"], listed["name"]) == (
         "uma", "personal", None, "", "我的周报")
+    assert listed["created_at"] and listed["updated_at"] and listed["blueprint_id"] is None
+    detail = await root.get(f"/api/apps/{app_id}")
+    assert detail.status_code == 200, detail.text
+    assert {k: detail.json()[k] for k in listed} == listed, "详情和列表里那一条一样，只有元数据"
+    assert not {"draft", "draft_bindings", "personal"} & set(detail.json()) and detail.json()["published"] is None
     r = await root.post(f"/api/apps/{app_id}/archive")
     assert r.status_code == 200 and r.json()["status"] == "archived", r.text
     assert "draft" not in r.json() and "personal" not in r.json()
+    # 别的搭建者连元数据也没有：当这个应用不存在
+    assert (await c["bob"].get(f"/api/apps/{app_id}")).status_code == 404
     r = await c["uma"].post(f"/api/apps/{app_id}/refresh")
     assert r.status_code == 409 and "已归档" in r.json()["detail"]
 
@@ -471,6 +488,11 @@ async def test_review_gives_the_builder_a_shared_copy_and_leaves_the_original(mo
     assert (dup["copied_from"], dup["scope"], dup["owner"], dup["status"]) == (bp, "shared", "bob", "drafting")
     assert dup["graph_hash"] == graph_hash(KPI) and dup["spec"]["purpose"]["value"] == "每周看销售额"
     assert (await c["bob"].post(f"/api/blueprints/{bp}/copy")).json()["id"] == dup["id"], "再取是同一份"
+    # 副本归处理审核的人（D5）：别的搭建者看不到；审核的人也读不到拥有者那次刷新（D2，只给拥有者）
+    assert (await c["bob"].get(f"/api/blueprints/{dup['id']}")).status_code == 200
+    assert (await c["bea"].get(f"/api/blueprints/{dup['id']}")).status_code == 404
+    assert dup["id"] not in [b["id"] for b in (await c["bea"].get("/api/blueprints")).json()["items"]]
+    assert (await c["bob"].get(f"/api/runs/{run.id}")).status_code == 403
     async with SessionLocal() as session:
         original = await session.get(Blueprint, bp)
         assert original.status == "in_review" and original.scope == "personal" and original.graph == KPI
@@ -812,11 +834,11 @@ async def test_a_personal_blueprint_never_creates_a_records_table():
     个人蓝图建记录表、登记全局数据源。"""
     from app.blueprints.ops import blueprint_issues
     from app.blueprints.store import instantiate_context
-    from app.blueprints.templates._common import EXTRAS
+    from app.blueprints.templates import get_template
     from app.db.models import DataSource
     from app.db.models_blueprints import RecordsTable
 
-    spec = EXTRAS["records"].example()
+    spec = get_template("records").example()
     assert any(i["code"] == "bp.template_mismatch" and i["path"] == "/template"
                for i in blueprint_issues(spec, for_="personal"))
     async with SessionLocal() as session:
@@ -830,3 +852,284 @@ async def test_a_personal_blueprint_never_creates_a_records_table():
         assert "records" not in ctx
         assert not (await session.execute(select(RecordsTable).where(RecordsTable.table_key == row.id))).first()
         assert int(await session.scalar(select(func.count(DataSource.id))) or 0) == sources
+
+
+# --------------------------------------------------------------------------
+# 只有拥有者读得到的运行（D2）
+# --------------------------------------------------------------------------
+
+
+async def test_personal_runs_are_read_by_their_owner_only():
+    """个人应用的刷新、个人蓝图的试运行只有拥有者读得到：管理员、搭建者也不行——运行记录、事件、运行时的图、证据、工件、
+    对比、可验证报告、文件下载、运行列表、审批列表、实时流一个口径（auth/access.private_owner / hidden_runs）。
+    共享蓝图的试运行、别的运行照旧给搭建者读。"""
+    from app.api.deps import run_events_readable
+    from app.auth import artifact_readable, run_readable
+    from app.db.models import Artifact
+    from app.db.models_blueprints import StoredFile
+    from tests.test_user_chat_access import _cookie, _refused, _ws
+
+    root, c = await people()
+    await switch(True)
+    bp = await blueprint("uma", trialed=False)
+    r = await c["uma"].post(f"/api/blueprints/{bp}/trial", json={})
+    assert r.status_code == 200, r.text
+    trial = await wait(r.json()["run_id"])
+    assert trial.status == "succeeded" and trial.origin_kind == "trial", trial.error
+    app_id = await saved(c["uma"], bp)
+    refresh = await refreshed(c["uma"], app_id)
+    async with SessionLocal() as session:
+        shared_bp = Blueprint(name="共享周报", owner="bob", scope="shared", status="drafting", spec={},
+                              source={"kind": "template"})
+        session.add(shared_bp)
+        await session.flush()
+        shared_trial = Run(workflow_name="共享周报", graph=KPI, status="succeeded", origin_kind="trial",
+                           origin={"blueprint_id": shared_bp.id}, started_by="bob")
+        old = Run(workflow_name="老运行", graph=KPI, status="succeeded", origin_kind=None, started_by="bob")
+        session.add_all([shared_trial, old])
+        await session.commit()
+        assert await session.scalar(select(Artifact.id).where(Artifact.run_id == refresh.id).limit(1)), "刷新落了工件"
+    # 工件按内容寻址，同样内容的工件可能也挂在别的（读得到的）运行上：另落一件只挂在这次刷新上的
+    from app.core.artifact_store import put_json
+
+    artifact = await put_json({"note": uuid.uuid4().hex}, kind="node_output", run_id=refresh.id, node_id="card")
+    up = await c["uma"].post("/api/files", files={"file": ("说明.txt", "本周说明".encode(), "text/plain")},
+                             data={"context": json.dumps({"blueprint_id": bp})})
+    assert up.status_code == 201, up.text
+    file_id = up.json()["file_id"]
+    async with SessionLocal() as session:
+        (await session.get(StoredFile, file_id)).bound_run_id = trial.id
+        await session.commit()
+
+    def principal(name: str, role: str) -> Principal:
+        return Principal(username=name, role=role, verified=True, mode="local")
+
+    for who, role in (("root", "admin"), ("bob", "builder")):
+        client = root if who == "root" else c[who]
+        for run in (trial, refresh):
+            for path in ("", "/events", "/graph", "/evidence", "/compare/base", "/bundle.html", "/artifacts"):
+                r = await client.get(f"/api/runs/{run.id}{path}")
+                assert r.status_code == 403, (who, run.origin_kind, path, r.status_code)
+            assert not await run_readable(principal(who, role), run.id)
+            assert not await run_events_readable(principal(who, role), run)
+        assert (await client.get(f"/api/artifacts/{artifact}")).status_code == 403, who
+        assert not await artifact_readable(principal(who, role), artifact)
+        assert (await client.get(f"/api/files/{file_id}")).status_code == 403, who
+        listed = {r["id"] for r in (await client.get("/api/runs?limit=200")).json()}
+        assert not {trial.id, refresh.id} & listed, who
+        assert {shared_trial.id, old.id} <= listed, "共享蓝图的试运行、来源没记的老运行照旧列出"
+        assert (await client.get(f"/api/runs/{shared_trial.id}")).status_code == 200
+        assert _refused(await _ws(f"/api/runs/{refresh.id}/stream", _cookie(client))), "实时流握手前就拒"
+
+    for run in (trial, refresh):
+        assert await run_readable(principal("uma", "user"), run.id)
+        assert (await c["uma"].get(f"/api/runs/{run.id}/evidence")).status_code == 200
+    assert (await c["uma"].get(f"/api/files/{file_id}")).status_code == 200
+    assert await artifact_readable(principal("uma", "user"), artifact)
+    # 拥有者是搭建者时：他自己的个人应用刷新、个人蓝图试运行照样读得到、列得出，别的搭建者读不到；试运行和刷新一样
+    # 遮罩、只读（试运行是刷新的预演）
+    from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
+
+    bob_bp = await blueprint("bob", trialed=False)
+    r = await c["bob"].post(f"/api/blueprints/{bob_bp}/trial", json={})
+    assert r.status_code == 200, r.text
+    bob_trial = await wait(r.json()["run_id"])
+    assert bob_trial.options[READ_ONLY_OPTION] is True and bob_trial.options[MASK_RESULTS_OPTION] is True
+    assert bob_trial.memory_scope == "chat:bob"
+    bob_run = await refreshed(c["bob"], await saved(c["bob"], bob_bp))
+    for run_id in (bob_trial.id, bob_run.id):
+        assert (await c["bob"].get(f"/api/runs/{run_id}")).status_code == 200
+        assert run_id in {r["id"] for r in (await c["bob"].get("/api/runs?limit=200")).json()}
+        assert (await c["bea"].get(f"/api/runs/{run_id}")).status_code == 403
+
+
+async def test_the_other_doors_to_a_private_run_are_shut_too(monkeypatch):
+    """D2 的其余入口：别人的个人应用刷新、个人蓝图试运行，管理员、搭建者从这些地方同样碰不到——「提取成工作流」、运行复核、
+    从问数据的回答开始建蓝图（当它不存在）；质询、假设分析（403）；审批列表、探索问题聚类里不出现。拥有者自己的照旧能用、
+    列得出；别的运行照旧。"""
+    from app.api.deps import PRIVATE_RUN
+    from app.db.models import Approval
+    from app.memory import embeddings
+
+    root, c = await people()
+    await switch(True)
+    bp = await blueprint("uma", trialed=False)
+    r = await c["uma"].post(f"/api/blueprints/{bp}/trial", json={})
+    assert r.status_code == 200, r.text
+    trial = await wait(r.json()["run_id"])
+    refresh = await refreshed(c["uma"], await saved(c["uma"], bp))
+    bob_bp = await blueprint("bob", trialed=False)
+    r = await c["bob"].post(f"/api/blueprints/{bob_bp}/trial", json={})
+    assert r.status_code == 200, r.text
+    bob_trial = await wait(r.json()["run_id"])
+    question = {"question": "上周各门店的销售额"}
+    async with SessionLocal() as session:
+        # 聚类只列两条以上的簇：别的探索运行放两条
+        shared, also = (Run(workflow_name="共享的运行", graph=KPI, status="succeeded", run_class="exploratory",
+                            origin_kind="chat", started_by="bob", input=question) for _ in range(2))
+        session.add_all([shared, also])
+        await session.flush()
+        for run_id in (trial.id, refresh.id, bob_trial.id):
+            (await session.get(Run, run_id)).input = question
+        approvals = {run_id: Approval(run_id=run_id, node_id="card", title="看一眼") for run_id in
+                     (refresh.id, bob_trial.id, shared.id)}
+        session.add_all(approvals.values())
+        await session.commit()
+        approval_ids = {run_id: a.id for run_id, a in approvals.items()}
+
+    async def _same(texts):
+        return [[1.0, 0.0] for _ in texts]
+
+    # 聚类只看谁进了候选：每条输入的向量一样，候选就都在一簇里
+    monkeypatch.setattr(embeddings, "embed_texts", _same)
+
+    async def clustered(client) -> set[str]:
+        body = (await client.get("/api/governance/exploratory-clusters", params={"limit": 500})).json()
+        return {rid for cluster in body["clusters"] for rid in cluster["run_ids"]}
+
+    async def approvals_of(client) -> set[str]:
+        return {a["id"] for a in (await client.get("/api/approvals", params={"status": "all", "limit": 500})).json()}
+
+    for who, client in (("root", root), ("bob", c["bob"])):
+        for run in (trial, refresh):
+            r = await client.post("/api/copilot/from-run", json={"run_id": run.id})
+            assert r.status_code == 404, (who, run.origin_kind, r.status_code)
+            r = await client.post("/api/copilot/review", json={"run_id": run.id})
+            assert r.status_code == 403 and r.json()["detail"] == PRIVATE_RUN, (who, r.status_code)
+            r = await client.post("/api/blueprints", json={"source": {"kind": "run", "id": run.id}, "scope": "shared"})
+            assert r.status_code == 404, (who, r.status_code)
+            assert (await client.get(f"/api/runs/{run.id}/inquiries")).status_code == 403, who
+            assert (await client.post(f"/api/runs/{run.id}/inquiries", json={"question": "x"})).status_code == 403
+            assert (await client.post(f"/api/runs/{run.id}/evidence/whatif", json={})).status_code == 403, who
+        assert approval_ids[refresh.id] not in await approvals_of(client), who
+        assert approval_ids[shared.id] in await approvals_of(client), "别的运行上的审批照旧列出"
+        seen = await clustered(client)
+        assert not {trial.id, refresh.id} & seen, who
+        assert shared.id in seen, "别的探索运行照旧进聚类"
+
+    # 拥有者是搭建者时：自己的个人蓝图试运行照样能用、列得出；别的搭建者不行
+    assert approval_ids[bob_trial.id] in await approvals_of(c["bob"])
+    assert approval_ids[bob_trial.id] not in await approvals_of(c["bea"])
+    assert bob_trial.id in await clustered(c["bob"]) and bob_trial.id not in await clustered(c["bea"])
+    assert (await c["bob"].get(f"/api/runs/{bob_trial.id}/inquiries")).status_code == 200
+    assert (await c["bea"].get(f"/api/runs/{bob_trial.id}/inquiries")).status_code == 403
+    assert (await c["bob"].post("/api/copilot/review", json={"run_id": bob_trial.id})).status_code == 200
+    r = await c["bob"].post("/api/blueprints", json={"source": {"kind": "run", "id": bob_trial.id}, "scope": "shared"})
+    assert r.status_code == 201, r.text
+    assert (await c["bea"].post("/api/blueprints", json={"source": {"kind": "run", "id": bob_trial.id},
+                                                         "scope": "shared"})).status_code == 404
+
+
+# --------------------------------------------------------------------------
+# 按模板做个人应用（D1：取数的调用工具节点过同一份白名单）
+# --------------------------------------------------------------------------
+
+
+def _example(template_id: str, **cards) -> tuple[dict, dict, dict | None]:
+    """模板登记的示例蓝图（卡片可以改几张）、生成关节的填法、自由形导入的示例图。"""
+    from app.blueprints.templates import get_template
+    from app.blueprints.templates.freeform import example_graph
+
+    template = get_template(template_id)
+    spec = {**template.example(), **cards}
+    return spec, template.example_fill(), example_graph() if template.imports_graph else None
+
+
+@pytest.mark.parametrize("template_id, cards", [
+    ("periodic_board", {}),
+    # 异常处置只看清单的那一部分：不写「谁来做」，没有处置和复核
+    ("exception_handling", {"people": []}),
+    ("freeform", {}),
+])
+def test_the_template_examples_that_can_be_personal_pass_the_personal_rules(template_id, cards):
+    """模板说能做成个人应用的那一部分，示例实例化出来的图过个人应用的约束（取数节点是调用工具节点查数据源）。"""
+    from app.blueprints.instantiate import instantiate
+    from app.blueprints.personal import policy_problem
+    from app.blueprints.templates import get_template
+
+    assert get_template(template_id).personal
+    spec, fill, graph = _example(template_id, **cards)
+    inst = instantiate(spec, filled=fill, graph=graph)
+    assert not [p for p in inst.problems if p["level"] == "error"], inst.problems
+    nodes = (graph or inst.graph)["nodes"]
+    assert any(n["type"] == "tool" and n["data"]["config"]["tool"].startswith("db_query__") for n in nodes)
+    assert policy_problem(graph or inst.graph) is None
+
+
+def test_the_parts_that_cannot_be_personal_are_still_refused():
+    """异常处置写了「谁来做」就有人工处置；审批、对账回写、填报登记不能做成个人应用（personal 为 None）。"""
+    from app.blueprints.instantiate import instantiate
+    from app.blueprints.personal import policy_problem
+    from app.blueprints.templates import get_template
+
+    spec, fill, _ = _example("exception_handling")
+    problem = policy_problem(instantiate(spec, filled=fill).graph)
+    assert problem and "人工" in problem
+    for template_id in ("approval", "reconcile_writeback", "records"):
+        assert get_template(template_id).personal is None, template_id
+
+
+async def test_a_personal_board_from_the_template_trials_saves_and_refreshes(tmp_path):
+    """使用者按周期看板模板（示例卡片，库换成现造的）做个人应用：试运行、存成我的应用、刷新都跑通。取数的调用工具节点
+    在刷新里照样遮罩、只读：遮罩列只有「已遮罩」，页面上的数是这次刷新算的。"""
+    import sqlite3
+    from datetime import date, timedelta as days
+
+    from app.blueprints.instantiate import instantiate
+    from app.data import introspect
+    from app.db.models import DataSource
+    from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
+
+    _, c = await people()
+    await switch(True)
+    name = f"shop_{uuid.uuid4().hex[:6]}"
+    path = tmp_path / f"{name}.db"
+    today = date.today()
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, amount REAL, refunded INTEGER, paid_at TEXT, "
+                   "phone TEXT)")
+        db.executemany("INSERT INTO orders (amount, refunded, paid_at, phone) VALUES (?, ?, ?, ?)",
+                       [(100.0, i % 5 == 0, (today - days(days=i)).isoformat(), "13900000001") for i in range(40)])
+    async with SessionLocal() as session:
+        row = DataSource(name=name, kind="sqlite", database=str(path), readonly=False, enabled=True,
+                         options={"mask_columns": "phone"})
+        session.add(row)
+        await session.flush()
+        row.schema_cache = await introspect.introspect(row)
+        await session.commit()
+
+    r = await c["uma"].post("/api/blueprints", json={"source": {"kind": "template", "id": "periodic_board"},
+                                                     "scope": "personal", "name": "我的门店周报"})
+    assert r.status_code == 201, r.text
+    bp = r.json()["id"]
+    spec, fill, _ = _example("periodic_board")
+    spec = json.loads(json.dumps(spec, ensure_ascii=False).replace('"source": "shop"', f'"source": "{name}"'))
+    fill = json.loads(json.dumps(fill, ensure_ascii=False).replace("fetch_shop", f"fetch_{name}"))
+    # 取数时顺带查了遮罩列：刷新里它只会是「已遮罩」
+    fill[f"sql_fetch_{name}"] = fill[f"sql_fetch_{name}"].replace(" FROM orders", ", MAX(phone) AS phone FROM orders")
+    filled = instantiate(spec, filled=fill, name="我的门店周报", blueprint_id=bp)
+    assert not [p for p in filled.problems if p["level"] == "error"], filled.problems
+    async with SessionLocal() as session:
+        row = await session.get(Blueprint, bp)
+        row.spec, row.joints = spec, filled.joints
+        await session.commit()
+
+    r = await c["uma"].post(f"/api/blueprints/{bp}/trial", json={})
+    assert r.status_code == 200, r.text
+    trial = await wait(r.json()["run_id"])
+    assert trial.status == "succeeded", trial.error
+    assert trial.options[READ_ONLY_OPTION] is True and trial.options[MASK_RESULTS_OPTION] is True
+    app_id = await saved(c["uma"], bp)
+    run = await refreshed(c["uma"], app_id)
+    assert run.options[READ_ONLY_OPTION] is True and run.options[MASK_RESULTS_OPTION] is True
+    async with SessionLocal() as session:
+        events = list((await session.execute(select(RunEvent).where(RunEvent.run_id == run.id))).scalars())
+    dumped = json.dumps([e.data for e in events], ensure_ascii=False)
+    assert "13900000001" not in dumped and "已遮罩" in dumped
+    page = (await c["uma"].get(f"/api/apps/{app_id}/pages/home")).json()
+    metrics = [n for n in walk(page["tree"]) if n["type"] == "metric"]
+    assert metrics and all(m["data"]["state"] == "ok" for m in metrics), metrics
+    assert {m["data"]["evidence"]["run_id"] for m in metrics} == {run.id}
+    async with SessionLocal() as session:
+        await session.execute(delete(DataSource).where(DataSource.name == name))
+        await session.commit()

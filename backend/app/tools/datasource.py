@@ -120,6 +120,13 @@ def run_reads_only(run_ctx: Any) -> bool:
     return _run_option(run_ctx, READ_ONLY_OPTION)
 
 
+def run_scope_fixed(run_ctx: Any) -> bool:
+    """这次运行的记忆范围、知识库是不是由运行定、节点配置和工具参数都改不了（ToolContext.fixed_scope）：查询结果要遮、
+    或者一律只读的运行（使用者的问数据、个人应用的刷新、个人蓝图的试运行，auth/chat_policy.py）。记忆、知识库的内容不经
+    遮罩，对这类运行来说换个范围就绕过了遮罩。"""
+    return run_masks_results(run_ctx) or run_reads_only(run_ctx)
+
+
 def run_versions(run_ctx: Any) -> dict[str, Any] | Versions | None:
     """一次运行固定的数据版本（runner 放在 RunContext.extra 里）。构造 ToolContext 时传进去。
 
@@ -677,7 +684,9 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
             # id，出处链按它找快照文件
             if getattr(source, "origin", None) == "records" and getattr(source, "prelude", None):
                 extra["records_view"] = {"high_water": getattr(source, "high_water", None),
-                                         "rows": getattr(source, "rows", None)}
+                                         "rows": getattr(source, "rows", None),
+                                         # 跨版本汇总并进来的旧版本和各自的高水位（records/views.py）
+                                         **({"older": list(source.older)} if getattr(source, "older", None) else {})}
             # 工件引用的 meta 记下源和 SQL 里用到的表：数据目录按它数每张表被运行查询过几次
             # （catalog.table_usage），不用再逐个读工件内容。meta 不进内容哈希，快照本身一字不变
             payload["artifact"] = await put_json(

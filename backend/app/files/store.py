@@ -70,9 +70,8 @@ _TEXT_TYPES = ("text/csv", "text/plain")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 #: 文件名最长存几个字
 NAME_MAX = 300
-#: 文件控件（x-widget: file）的值要是引用这个形状；校验不过时表单错误的 code。
-#: 前端的表单错误 code 联合类型里还没有专门的一项（contract_requests），先用 type
-FILE_ERROR_CODE = "type"
+#: 文件控件（x-widget: file）的值要是引用这个形状；校验不过时表单错误的 code（apps/spec.FORM_ERROR_CODES 的 file）
+FILE_ERROR_CODE = "file"
 
 
 class FileRefused(Exception):
@@ -255,12 +254,14 @@ async def _task_context(session: AsyncSession, principal: Any, ctx: dict[str, st
 async def _blueprint_context(session: AsyncSession, principal: Any, ctx: dict[str, str]) -> dict[str, Any] | None:
     from app.db.models_blueprints import Blueprint
 
+    from app.blueprints.store import BLUEPRINT_GONE, can_access
+
     bp = await session.get(Blueprint, ctx["blueprint_id"])
-    if bp is None:
-        raise FileRefused(404, "files.context_invalid", "蓝图不存在")
-    if principal.mode != "off" and not (
-            (bp.owner and bp.owner == principal.username) or (bp.scope == "shared" and principal.at_least("builder"))):
-        raise FileRefused(403, "files.forbidden", _NO_ACCESS)
+    # 同读写蓝图（blueprints/store.can_access）：拥有者；共享蓝图另有管理员、它发布出来的应用的管理者。看不到的和不存在的
+    # 一个说法（同 store.ensure_access「看不到的一律 404」）：回 403 就等于告诉人这张蓝图在
+    if bp is None or (principal.mode != "off" and not (
+            (bp.scope != "shared" or principal.at_least("builder")) and await can_access(session, principal, bp))):
+        raise FileRefused(404, "files.context_invalid", BLUEPRINT_GONE)
     return None
 
 

@@ -4934,6 +4934,8 @@ export const ORIGIN_LABEL: Record<OriginKind, string> = {
   app_backfill: '按新口径补算',
   hook: '外部系统触发',
   api: '接口',
+  trial: '蓝图试运行',
+  personal_app: '个人应用刷新',
 }
 
 export const ORIGIN_TEXT = {
@@ -5188,6 +5190,8 @@ export const NOTIFY_TEXT = {
     'task.opened': '待办打开', 'task.escalated': '待办升级', 'task.expired': '待办超时', 'task.resolved': '待办处理完',
     'action.unknown': '动作结果未知', 'action.failed': '动作失败', 'action.confirmed': '动作已生效',
     'run.failed': '运行失败', 'run.finished': '运行结束',
+    // 个人应用提交审核有了结果（发布了或退回了），通知提交人：只对个人渠道、全局渠道有意义（服务端 notify/service.notify_review）
+    'review.done': '我提交审核的应用有结果',
   } as Record<string, string>,
   enabled: '启用',
   signed: '已签名',
@@ -5624,7 +5628,7 @@ export const TASK_NOTIFY_TEXT = {
 export const SETTINGS_ROLE_TEXT = {
   subtitleUser: '个人的主题和通知',
   themeLocal: '主题只保存在当前浏览器中，更换设备后需重新选择',
-  prefsReadOnly: '运行默认值、证据裁判和核查的设置全站共用，只有管理员可以修改',
+  prefsReadOnly: '运行默认值、证据裁判、核查和应用的设置全站共用，只有管理员可以修改',
   notifyPersonal: '个人渠道只推送派给你的待办和你发起的实例的事件',
 }
 

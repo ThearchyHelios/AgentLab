@@ -41,7 +41,7 @@ import { REVIEW_TASK_TEXT } from '../lib/termsApp'
 import { blueprintPath } from '../pages/blueprints/shared'
 import type { Approval, ApprovalReport } from '../types'
 import type {
-  FormError, Task, TaskAssignment, TaskKind, TaskMyResponse, TaskProgress, TaskRespond,
+  FormError, ReviewTaskPayload, Task, TaskAssignment, TaskKind, TaskMyResponse, TaskProgress, TaskRespond,
 } from '../typesApp'
 import { Markdown } from './Markdown'
 import { ApprovalReports, ApprovalRunClass } from './ApprovalReport'
@@ -71,10 +71,7 @@ export interface TaskCardProps {
   trial?: boolean
 }
 
-/** 待办的种类，多一种 review（个人应用提交审核）：typesApp 的 TaskKind 还没有它（契约待补），先在这里按多一种认 */
-type CardKind = TaskKind | 'review'
-
-const KIND_ICON: Record<CardKind, typeof Hand> = {
+const KIND_ICON: Record<TaskKind, typeof Hand> = {
   approve: Hand, input: Keyboard, edit: PenLine, tool: Wrench, code: Code, dual_check: Hand,
   action_confirm: Send, reconcile: SearchCheck, signal: Webhook, review: UserCheck,
 }
@@ -85,7 +82,7 @@ const STALE_MS = 24 * 3_600_000
 export function TaskCard({ task, onResolved, compact = false, send, showOwner = true, showSignoffs = true, trial = false }: TaskCardProps) {
   const toast = useToast()
   const payload: Record<string, any> = task.payload ?? {}
-  const kind = task.kind as CardKind
+  const kind = task.kind
   const pending = task.status === 'pending'
   const canAct = pending && task.can_respond
   const inquiring = useInquiryBusy(task.run_id)
@@ -301,9 +298,10 @@ function Review({ task, canAct, busy, note, setNote, onReject }: {
   const me = usePrincipal()
   const actor = useLocalActor()
   const [copying, setCopying] = useState(false)
-  const payload: Record<string, any> = task.payload ?? {}
+  const payload: Partial<ReviewTaskPayload> = task.payload ?? {}
   const blueprintId = typeof payload.blueprint_id === 'string' ? payload.blueprint_id : null
-  const copies: { id: string; owner: string | null; status: string }[] = Array.isArray(payload.copies) ? payload.copies : []
+  const copies = Array.isArray(payload.copies) ? payload.copies : []
+  // 审核副本归取它的那位搭建者：取过的打开自己那一份（别的处理人取的副本不算）
   const myName = me?.username ?? actor ?? null
   const mine = copies.find((c) => c.owner === myName)
   const submitter = typeof payload.submitted_by === 'string' ? payload.submitted_by : null
@@ -382,7 +380,7 @@ function TaskMeta({ task, showOwner }: { task: Task; showOwner: boolean }) {
   const owner = !showOwner ? null : task.app_name ? task.app_name : task.workflow_name ? runName(task) : null
   return (
     <div className="tnum mb-2 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-2xs text-dim">
-      <span>{TASK_KIND_LABEL[task.kind as CardKind] ?? task.kind}</span>
+      <span>{TASK_KIND_LABEL[task.kind] ?? task.kind}</span>
       {owner && <><span aria-hidden>·</span><span>{owner}</span></>}
       {where && <><span aria-hidden>·</span><span>{TASK_TEXT.node(where)}</span></>}
       {created && <><span aria-hidden>·</span><span title={formatDateTime(created)}>{TASK_TEXT.createdAt(formatTime(created))}</span></>}
@@ -774,15 +772,22 @@ function Signer() {
   )
 }
 
-/** 去实例页（应用里的）或记录页（别处的，搭建者以上才看得到记录页） */
+/**
+ * 去实例页（应用里的）或记录页（别处的，搭建者以上才看得到记录页）。
+ *
+ * 审核个人应用的待办不给这两个：run_id 是提交人那次个人应用的刷新、app_id 是他的个人应用，只有拥有者读得到（服务端
+ * auth/access.private_owner，处理人是管理员、搭建者也不例外），链出去只会是打不开的页面。处理人要看的是取副本之后在副本
+ * 蓝图上试运行出来的（Review 里的「取副本，去发布」「打开我的副本」）
+ */
 function TaskLinks({ task }: { task: Task }) {
   const builder = useAtLeast('builder')
   const links = useMemo(() => {
     const out: { to: string; label: string }[] = []
+    if (task.kind === 'review') return out
     if (task.app_id) out.push({ to: `/apps/${encodeURIComponent(task.app_id)}/i/${encodeURIComponent(task.run_id)}`, label: TASK_TEXT.openInstance })
     if (builder) out.push({ to: `/runs/${encodeURIComponent(task.run_id)}`, label: TASK_TEXT.openRun })
     return out
-  }, [task.app_id, task.run_id, builder])
+  }, [task.kind, task.app_id, task.run_id, builder])
   if (!links.length) return null
   return (
     <div className="mt-1.5 flex flex-wrap gap-x-3 text-2xs">

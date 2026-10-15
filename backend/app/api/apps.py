@@ -133,17 +133,27 @@ async def _summary(session: AsyncSession, app: App, principal: Principal, role: 
             "published_version": app.published_version, "level": version.level if version else None,
             "needs_upgrade": await _needs_upgrade(session, version),
             "pending_tasks": await _pending(session, app.id, principal), "my_role": role,
+            "created_at": app.created_at.isoformat() if app.created_at else None,
             "updated_at": app.updated_at.isoformat() if app.updated_at else None,
             # 个人应用（N7）：scope=personal、拥有者；出自哪个蓝图（共享应用经发布单生成的也有）
             "scope": app.scope or "shared", "owner": app.owner, "blueprint_id": app.blueprint_id}
 
 
 def _personal_stub(app: App) -> dict[str, Any]:
-    """管理员在应用列表里看到的别人的个人应用：在不在、谁的、叫什么、状态，能归档；说明、页面、数一概不给（P4）。"""
+    """管理员看到的别人的个人应用（列表、详情、归档的回包同一份）：名称、拥有者、状态、创建和更新时间，能归档；说明、
+    页面、数、运行、蓝图一概不给（P4，N7「管理员看得到谁有几个个人应用，可以归档，但不看内容」）。"""
     return {"id": app.id, "name": app.name, "description": "", "icon": "app", "status": app.status,
             "published_version": None, "level": None, "needs_upgrade": False, "pending_tasks": 0, "my_role": None,
+            "created_at": app.created_at.isoformat() if app.created_at else None,
             "updated_at": app.updated_at.isoformat() if app.updated_at else None,
             "scope": "personal", "owner": app.owner, "blueprint_id": None}
+
+
+def _sees_stub(principal: Principal, app: App) -> bool:
+    """这个人对这个应用只看得到元数据（_personal_stub）：开了登录的管理员看别人的个人应用。"""
+    from app.apps.access import is_personal
+
+    return is_personal(app) and principal.mode != "off" and principal.role == "admin"
 
 
 def _published_outline(version: AppVersion | None) -> dict[str, Any] | None:
@@ -158,6 +168,36 @@ def _published_outline(version: AppVersion | None) -> dict[str, Any] | None:
                         if isinstance(e, dict) and e.get("id")]}
 
 
+def _draft_changed(app: App, previous: AppVersion | None) -> bool | None:
+    """草稿和当前发布版是否一致（N6，页面上直接改时说「有未发布的改动」还是「和发布版相同」）。按发布时的规整方式比
+    （publish_draft：parse_spec 规整成同一个形状），两边都过一遍，老版本发布时还没有的字段按缺省补齐、不算改动；钉住项的
+    级别发布时按库里的那一版补、不出自草稿，不比。岗位绑定一并比。没发布过、发布版规整不了的为 None（不知道，界面不猜）；
+    草稿规整不了的算改过（发布前得先改好）。"""
+    from pydantic import ValidationError
+
+    from app.apps.lint import pins_with_state
+    from app.apps.spec import parse_spec
+    from app.core.artifact_store import canonical_json
+
+    def normal(spec: Any) -> str:
+        out = parse_spec(spec or {}).model_dump(mode="json", by_alias=True)
+        out["pins"] = pins_with_state(out, {})
+        return canonical_json(out)
+
+    if previous is None:
+        return None
+    try:
+        published = normal(previous.spec)
+    except ValidationError:
+        return None
+    try:
+        draft = normal(app.draft)
+    except ValidationError:
+        return True
+    bindings = {"slots": {}, **(app.draft_bindings or {})}
+    return draft != published or canonical_json(bindings) != canonical_json(previous.bindings or {"slots": {}})
+
+
 async def _detail(session: AsyncSession, app: App, principal: Principal, role: str | None, *,
                   with_backfill: bool = False) -> dict[str, Any]:
     """应用详情。草稿和草稿里的岗位绑定只给 manage（D-m）：草稿是还没发布、没过检查的东西，岗位绑定是这个部署里具体
@@ -167,8 +207,8 @@ async def _detail(session: AsyncSession, app: App, principal: Principal, role: s
     归档这些改动的回包里不算（编辑器存一次草稿就算一遍太浪费，补算只看发布版，草稿改了也不变）。"""
     from app.apps.spec import empty_spec
 
-    out = {**await _summary(session, app, principal, role),
-           "published": _published_outline(await _previous(session, app))}
+    previous = await _previous(session, app)
+    out = {**await _summary(session, app, principal, role), "published": _published_outline(previous)}
     if not at_least(role, "manage"):
         return out
     out.update(draft=app.draft or empty_spec(app.name), draft_bindings={"slots": {}, **(app.draft_bindings or {})},
@@ -179,6 +219,8 @@ async def _detail(session: AsyncSession, app: App, principal: Principal, role: s
 
         out["personal"] = await personal_state(session, app, principal)
         return out
+    if (changed := _draft_changed(app, previous)) is not None:
+        out["draft_changed"] = changed
     if with_backfill:
         from app.apps.backfill import backfillable
 
@@ -200,7 +242,6 @@ async def list_apps(include_archived: bool = False, scope: str | None = None,
     个人看管理员的开关，blueprints/personal.allowed）。"""
     from sqlalchemy import or_
 
-    from app.apps.access import is_personal
     from app.blueprints.personal import allowed
 
     principal = _principal(x_actor)
@@ -215,7 +256,7 @@ async def list_apps(include_archived: bool = False, scope: str | None = None,
     for app in (await session.execute(query)).scalars():
         role = await app_role(session, principal, app)
         if role is None:
-            if is_personal(app) and principal.mode != "off" and principal.role == "admin":
+            if _sees_stub(principal, app):
                 items.append(_personal_stub(app))
             continue
         items.append(await _summary(session, app, principal, role))
@@ -279,7 +320,12 @@ async def derive(payload: DeriveIn, session: AsyncSession = Depends(get_session)
 @router.get("/{app_id}")
 async def get_app(app_id: str, session: AsyncSession = Depends(get_session),
                   x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """应用详情（_detail）。管理员打开别人的个人应用只拿到元数据（_personal_stub，同列表里那一条），页面、草稿、刷新、
+    蓝图的接口照旧当它不存在。"""
     principal = _principal(x_actor)
+    stub = await session.get(App, app_id)
+    if stub is not None and _sees_stub(principal, stub) and await app_role(session, principal, stub) is None:
+        return {**_personal_stub(stub), "published": None}
     app, role = await _app(session, app_id, principal, "use")
     return await _detail(session, app, principal, role, with_backfill=True)
 
@@ -354,7 +400,7 @@ async def archive_app(app_id: str, session: AsyncSession = Depends(get_session),
     await session.commit()
     await session.refresh(app)
     if role is None:
-        return _personal_stub(app)
+        return {**_personal_stub(app), "published": None}
     return await _detail(session, app, principal, role)
 
 

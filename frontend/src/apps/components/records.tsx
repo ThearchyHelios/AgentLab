@@ -22,14 +22,16 @@ import { RECORDS_TEXT as T } from '../../lib/termsApp'
 import type { RecordRow, RecordsPage } from '../../typesBlueprint'
 import { str, useView, type NodeProps } from '../context'
 
-/** 服务端可能给的下一页游标、状态（typesBlueprint.RecordsPage 还没有这两项，契约待补）：empty 是这个应用还没有记录表 */
-type Page = RecordsPage & { next_cursor?: string | null; state?: string }
-
-/** 服务端解析页面时给的第一页（node.data）：形状对得上才用 */
-function pageOf(data: unknown): Page | null {
-  return data && typeof data === 'object' && Array.isArray((data as Page).items) && Array.isArray((data as Page).columns)
-    ? data as Page : null
+/**
+ * 服务端解析页面时给的第一页（node.data，形状同 RecordsPage）：形状对得上才用。state=empty 是这个应用还没有记录表，
+ * preview 是按草稿预览（不列真实的记录）
+ */
+function isPage(data: unknown): data is RecordsPage {
+  if (!data || typeof data !== 'object') return false
+  const d: { items?: unknown; columns?: unknown } = data
+  return Array.isArray(d.items) && Array.isArray(d.columns)
 }
+const pageOf = (data: unknown): RecordsPage | null => (isPage(data) ? data : null)
 
 /** 一格的值写给人看：文件是可下载的链接，数组用顿号连，布尔写是或否，其余原样 */
 function Value({ v }: { v: unknown }) {
@@ -56,7 +58,7 @@ export function RecordsList({ node }: NodeProps) {
   const table = str(node.props.table) || undefined
   const who = node.props.who === 'mine' || node.props.who === 'all' ? node.props.who : undefined
   const initial = pageOf(node.data)
-  const [page, setPage] = useState<Page | null>(initial)
+  const [page, setPage] = useState<RecordsPage | null>(initial)
   const [error, setError] = useState<unknown>(null)
   const [more, setMore] = useState(false)
   const [query, setQuery] = useState('')
@@ -82,7 +84,7 @@ export function RecordsList({ node }: NodeProps) {
     if (!page?.next_cursor) return
     setMore(true)
     try {
-      const next: Page = await api.personal.records(appId, { table, who, cursor: page.next_cursor })
+      const next = await api.personal.records(appId, { table, who, cursor: page.next_cursor })
       setPage({ ...next, items: [...page.items, ...next.items] })
     } catch (e) {
       setError(e)
@@ -124,12 +126,15 @@ export function RecordsList({ node }: NodeProps) {
         {page && page.items.length > 0 && (
           <span className="tnum shrink-0 text-2xs text-faint" data-records-count="">{T.count(rows.length, page.items.length)}</span>
         )}
-        <button type="button" className="btn btn-xs btn-ghost shrink-0" onClick={() => { setHistory(null); setHistoryError(null); load() }}
-                aria-label={T.reload} title={T.reload}>
-          <RotateCw size={11} aria-hidden />
-        </button>
+        {page?.state !== 'preview' && (
+          <button type="button" className="btn btn-xs btn-ghost shrink-0" onClick={() => { setHistory(null); setHistoryError(null); load() }}
+                  aria-label={T.reload} title={T.reload}>
+            <RotateCw size={11} aria-hidden />
+          </button>
+        )}
       </div>
-      {page?.state === 'empty' && !page.items.length ? <div className="px-3 py-3 text-2xs text-faint">{T.tableMissing}</div>
+      {page?.state === 'preview' ? <div className="px-3 py-3 text-2xs text-faint" data-records-preview="">{T.preview}</div>
+        : page?.state === 'empty' && !page.items.length ? <div className="px-3 py-3 text-2xs text-faint">{T.tableMissing}</div>
         : error && !page ? <ErrorState compact error={error} onRetry={load} className="m-2" />
         : !page ? <div className="flex items-center gap-2 px-3 py-3 text-2xs text-faint"><Spinner size={11} /></div>
         : (

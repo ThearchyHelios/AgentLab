@@ -4,23 +4,32 @@
 交回回执。幂等键就是动作键：发送用的是「动作键:第几次」，这里只取动作键，同一个动作不论第几次发都只落一行
 （记录表 store.append 按它去重）。写下的行里有文件字段的，把那几个文件绑到这一行（下载按行级可见核对）。
 
+表版本停用了（表单不兼容地改过、新一版已经发布）：停用之前发起的运行照常写进它（同「进行中的实例照常走完」：审批停在半路的
+实例，批完写进它发起时的那一版）；停用之后发起的拒（records.table_retired）。没有运行的直接调用一律拒。
+
 写之前核对三样（写进去的东西谁都看得到，不能凭图里写的一个名字就写）：
 - 正式运行只写自己的记录表：表出自哪个蓝图，就只收那个蓝图发布出来的工作流的运行（没有蓝图的表，收钉着它的应用里的
   工作流）——不然一张手改过的图就能往别的应用的表里写（records.table_foreign）；
 - 更正（supersedes）只能更正提交的人看得到的那一行：按行级可见（records/access），使用者只能更正自己提交的；
 - 文件只绑这次运行提交时绑上的（StoredFile.bound_run_id 是这次运行）：值里随便写一个文件编号，不会把别人的文件挂到
   这一行上、让看得到这一行的人都能下载。
+
+更正行的提交人沿用原行的（records/store.append）：原提交人照样看得见改过的那一行。动手更正的人记进回执（corrected_by，
+随动作记录的回执落工件）和审计（records.correct），不记进行里。
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 from sqlalchemy import select
 
 from app.db.base import SessionLocal
 from app.records import store
+
+logger = logging.getLogger(__name__)
 
 
 def _result(status: int | None, body: Any = None, *, error: str | None = None, environment: str = "prod") -> Any:
@@ -37,6 +46,7 @@ def action_key_of(idem_key: str | None) -> str:
 async def append_action(args: dict[str, Any], *, idem_key: str | None, run_id: str | None, on_behalf: Any,
                         environment: str) -> Any:
     from app.capabilities.platform import actor_of
+    from app.db.models import Run
     from app.records.tables import columns_of, find_table, path_of, refuse_retired
 
     values = args.get("values")
@@ -56,7 +66,9 @@ async def append_action(args: dict[str, Any], *, idem_key: str | None, run_id: s
             source = await session.get(DataSource, table.source_id)
         try:
             if table is not None:
-                refuse_retired(table)
+                # 停用的版本：停用之前发起的运行照常写完（同进行中的实例照常走完），之后发起的拒
+                run = await session.get(Run, run_id) if run_id else None
+                refuse_retired(table, launched_at=run.created_at if run is not None else None)
                 await _check_writer(session, table, run_id)
                 if supersedes:
                     await _check_supersedes(session, table, supersedes, actor)
@@ -74,6 +86,8 @@ async def append_action(args: dict[str, Any], *, idem_key: str | None, run_id: s
         return _result(None, error=e.message, environment=environment)
     if not done.duplicate:
         await _bind_files(table, columns, done, run_id)
+        if done.corrected_by is not None:
+            await _audit_correction(table, done, supersedes, run_id)
     return _result(200, {"table": table.table_key, "version": table.version, "source": source.name if source else None,
                          **done.receipt()}, environment=environment)
 
@@ -114,6 +128,23 @@ async def _check_supersedes(session: Any, table: Any, row_id: str, actor: str | 
     row = await asyncio.to_thread(store.row_by_id, path_of(table), columns_of(table), row_id)
     if scope.get("rows") != "mine" or row is None or row.get("_submitted_by") != actor:
         raise store.RecordsRefused("records.supersede_missing", "要更正的那一行不在这张记录表里")
+
+
+async def _audit_correction(table: Any, done: Any, supersedes: str | None, run_id: str | None) -> None:
+    """更正留一条审计：谁改的（操作人）、改的是谁交的哪一行、换成了哪一行、哪次运行。审计没写成不改变已经写下的那一行
+    （行已经落了，动作记录照常确认），只记日志。"""
+    from app.apps.audit import record
+
+    try:
+        async with SessionLocal() as session:
+            await record(session, action="records.correct", subject_kind="records_table", subject_id=table.id,
+                         actor=done.corrected_by,
+                         data={"table": table.table_key, "version": table.version, "name": table.name,
+                               "row_id": done.row_id, "supersedes": supersedes, "submitted_by": done.submitted_by,
+                               "run_id": run_id})
+            await session.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("记录表的更正没能写进审计（表 %s，行 %s）", table.id, done.row_id)
 
 
 async def _bind_files(table: Any, columns: list[Any], done: Any, run_id: str | None) -> None:

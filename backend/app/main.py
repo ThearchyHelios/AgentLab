@@ -24,7 +24,7 @@ from app.api import (
     templates as templates_api,
 )
 from app.api.coded import CodedHTTPException, coded_handler
-from app.api.deps import chat_scope, evidence_scope, require_role, role_by_method, run_scope
+from app.api.deps import chat_scope, evidence_scope, private_run_scope, require_role, role_by_method, run_scope
 from app.auth.middleware import AuthMiddleware
 from app.core.config import settings
 from app.db.base import init_db
@@ -196,11 +196,12 @@ for router, guard in (
     (workflows.router, _BUILDER),
     # 这几个也挂在 /api/runs 下面，要在 runs.router 之前登记：以后加的固定路径（/api/runs/compare 之类）
     # 才不会被 runs 的 /{run_id} 当成运行 id 吃掉。/{run_id}/… 的子路径放在哪边都不冲突。
-    # 运行对比、可验证报告、质询、假设分析交的是查询原文，只给 builder 及以上
-    (compare.router, _BUILDER),
-    (bundle.router, _BUILDER),
-    (inquiry.router, _BUILDER),
-    (whatif.router, _BUILDER),
+    # 运行对比、可验证报告、质询、假设分析交的是查询原文，只给 builder 及以上；别人的个人应用刷新、个人蓝图试运行只给
+    # 拥有者（private_run_scope），管理员也不例外
+    (compare.router, [*_BUILDER, private_run_scope]),
+    (bundle.router, [*_BUILDER, private_run_scope]),
+    (inquiry.router, [*_BUILDER, private_run_scope]),
+    (whatif.router, [*_BUILDER, private_run_scope]),
     (runs.router, [run_scope]),
     (runs.approvals_router, _BUILDER),
     (evidence.router, [evidence_scope]),

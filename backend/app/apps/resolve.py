@@ -282,6 +282,7 @@ async def stamp_of(session: AsyncSession, source: Source) -> dict[str, Any]:
     if source.kind == "exploratory" and source.state == "ok" and source.message:
         # 个人应用最近一次刷新没成功、这里给的是上一次的（_exploratory_source）
         notes.append(source.message)
+    notes += [gap for entry in (run.data_versions or {}).values() if (gap := _records_gap(entry))]
     if not sealed.trusted:
         notes.append("这次运行还没有封存（或封存核对不一致），数字仅供参考")
     return {
@@ -304,8 +305,23 @@ async def stamp_of(session: AsyncSession, source: Source) -> dict[str, Any]:
 def _version_text(entry: dict[str, Any]) -> str:
     """印章上一个数据源固定的版本：上传表格写快照 id 前 8 位；记录表写「截至第 N 条」（records/views.pin_entry）。"""
     if entry.get("origin") == "records":
-        return f"{entry.get('name')} 截至第 {entry.get('seq') or 0} 条"
+        # 跨版本汇总并进来的旧版本（records/views.py）各有高水位，一并写上；数据文件不在了的没并进来，不写（缺了哪版见
+        # _records_gap）
+        older = "、".join(f"第 {o.get('version')} 版截至第 {o.get('seq') or 0} 条" for o in entry.get("older") or []
+                         if isinstance(o, dict) and not o.get("missing"))
+        return f"{entry.get('name')} 截至第 {entry.get('seq') or 0} 条" + (f"（连同{older}）" if older else "")
     return f"{entry.get('name')} {str(entry.get('snapshot') or '')[:8]}"
+
+
+def _records_gap(entry: Any) -> str | None:
+    """记录表的跨版本汇总缺了哪几版（旧版本的数据文件不在了，records/views.pin_entry 记成 missing）：印章上照实说数不全。"""
+    if not isinstance(entry, dict) or entry.get("origin") != "records":
+        return None
+    lost = [str(o.get("version")) for o in entry.get("older") or [] if isinstance(o, dict) and o.get("missing")]
+    if not lost:
+        return None
+    return (f"记录表「{entry.get('name')}」第 {'、'.join(lost)} 版的数据文件不在了，汇总里没有"
+            f"{'这一版' if len(lost) == 1 else '这几版'}的记录，数不全")
 
 
 # --------------------------------------------------------------------------
@@ -335,6 +351,7 @@ async def cache_key(session: AsyncSession, state: PinState, inputs: dict[str, An
     from app.engine.launch import graph_tool_names
     from app.engine.runner import _data_versions
     from app.engine.schema import GraphSpec
+    from app.records.views import cache_token as records_cache_token
 
     try:
         versions = await _data_versions(session, GraphSpec.model_validate(state.graph))
@@ -343,7 +360,7 @@ async def cache_key(session: AsyncSession, state: PinState, inputs: dict[str, An
     capabilities = await capability_versions_for(session, graph_tool_names(state.graph))
     text = canonical_json({"graph_hash": state.hash, "input": inputs,
                            # 记录表按高水位（seq）：有新的提交，缓存就不再算数
-                           "data_versions": {k: (v or {}).get("snapshot") or (v or {}).get("seq")
+                           "data_versions": {k: (v or {}).get("snapshot") or records_cache_token(v)
                                              for k, v in sorted(versions.items())},
                            "capabilities": capabilities})
     return hashlib.sha256(text.encode()).hexdigest()
@@ -1415,14 +1432,14 @@ async def _instance_list(session: AsyncSession, ctx: _Page, props: dict[str, Any
 
 async def _records_list(session: AsyncSession, ctx: _Page, props: dict[str, Any]) -> dict[str, Any]:
     """记录列表（docs/design/normal-user-apps.md N8）：每次打开按看的人实时过滤（records/listing.py），不走封存，同实例列表。
-    草稿预览不列真实的记录。"""
+    草稿预览不列真实的记录：state=preview（不说成「还没有记录表」，形状同 RecordsPage）。"""
     from app.records.listing import page
 
     who = props.get("who") if props.get("who") in ("mine", "all") else None
     limit = props.get("limit") if isinstance(props.get("limit"), int) else 50
     if ctx.draft:
         return {"table": props.get("table"), "version": 0, "columns": [], "items": [], "mine_only": who == "mine",
-                "state": "empty", "next_cursor": None}
+                "state": "preview", "next_cursor": None}
     return await page(session, ctx.app, principal=ctx.principal, role=ctx.role, table=props.get("table"), who=who,
                       limit=limit)
 

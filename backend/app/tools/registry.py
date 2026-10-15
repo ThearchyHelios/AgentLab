@@ -45,6 +45,10 @@ class ToolContext:
     #: 数据源查询一律只读，可写源上的写语句也拒（tools/datasource.py 的 run_reads_only）：同样是 user 角色的问数据运行。
     #: 不能交给审批去拦——Agent 的 approval 是发起人自己写在图里的
     force_readonly: bool = False
+    #: 记忆范围、知识库由运行定，工具参数改不了（tools/datasource.py 的 run_scope_fixed：遮罩、只读的运行——使用者的问数据、
+    #: 个人应用的刷新、个人蓝图的试运行）。记忆、知识库的内容不经遮罩：kb_search 的 collection 参数（调用工具节点写的、
+    #: 参数名纠错改出来的、图级 defaults 补上的、模型挑的）一律拒，只能检索 collection 这一个
+    fixed_scope: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
 

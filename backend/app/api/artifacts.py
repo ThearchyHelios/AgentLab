@@ -17,11 +17,12 @@ _MAX_INLINE = 2 * 1024 * 1024
 async def get_artifact(artifact_id: str) -> dict[str, Any]:
     """按内容哈希取回一个工件。取回时会复验哈希——内容不可变是这层的全部承诺。
 
-    开了登录：builder 及以上照旧拿原文。user 角色只能取它能读的运行引用的工件（can_read_artifact），而且对它来说遮罩
+    开了登录：builder 及以上照旧拿原文，只被别人的个人应用刷新、个人蓝图试运行引用的除外（只给拥有者，管理员也一样，
+    auth/access.artifact_readable）。user 角色只能取它能读的运行引用的工件（can_read_artifact），而且对它来说遮罩
     就是边界：只给白名单里的几种，按派生遮罩处理后再给（_masked_for_user），别的种类一律不给。"""
     principal = current_principal()
     restricted = principal.mode != "off" and not principal.at_least("builder")
-    if restricted and not await can_read_artifact(principal, artifact_id):
+    if principal.mode != "off" and not await can_read_artifact(principal, artifact_id):
         raise HTTPException(403, "没有权限查看这件工件")
     try:
         content = artifact_store.load(artifact_id)

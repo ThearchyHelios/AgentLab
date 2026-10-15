@@ -6,7 +6,7 @@ import {
   ABSENCE_CLAIM_TEXT, ACTION_CONFIRM_TEXT, ACTION_ENV_LABEL, ACTION_LOG_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, LOOK_TEXT, MERGE_TEXT,
   ORIGIN_TEXT, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, TASK_KIND_LABEL, TASK_LOG_TEXT, TASK_STATUS_LABEL, TASK_TEXT, TYPE_LABEL, originLabel,
   CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, MASKED_CELL_TEXT, NODE_TYPE_LABEL,
-  VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText,
+  VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText, FILE_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -2798,6 +2798,28 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         break
       }
 
+      case 'file.extracted': {
+        // 模板函数 file_text 读入一个附件的文字（服务端 files/text.py）：读入多少字、全文多少字、是否截断，读入的那一段存成
+        // 工件可以点开；抽不出时 ok=false、reason 写原因。截断、抽不出都要看得见：下游拿到的不是全文
+        const name = typeof d.name === 'string' ? d.name.trim() : ''
+        const chars = num(d.chars)
+        const total = num(d.total_chars)
+        const failedRead = d.ok === false
+        const cut = !failedRead && d.truncated === true
+        const reason = typeof d.reason === 'string' && d.reason.trim() ? d.reason.trim() : undefined
+        push({
+          id: `fx-${seq}`, seq, kind: 'tool', nodeId, status: 'done', code: 'file_extracted',
+          ...(failedRead || cut ? { level: 'warn' as const } : {}),
+          title: failedRead ? FILE_TEXT.extractFailed(name) : FILE_TEXT.extracted(name, chars != null ? formatNumber(chars) : null),
+          ...(failedRead ? (reason ? { sub: reason } : {})
+            : total == null ? {}
+            : !cut ? { sub: FILE_TEXT.extractedAll(formatNumber(total)) }
+            : chars != null ? { sub: FILE_TEXT.extractedCut(formatNumber(chars), formatNumber(total)) } : {}),
+          ...(typeof d.artifact === 'string' && d.artifact ? { artifact: d.artifact } : {}),
+        }, nodeId)
+        break
+      }
+
       default:
         // 新增事件类型时不要静默吞掉——宁可显示一条，也比让人觉得"什么都没
         // 发生"好。但内部类型名（agent.route.end 这种）对使用者是一串代码，
@@ -3172,13 +3194,6 @@ export function catalogDrift(d: Record<string, any>): {
 }
 
 /**
- * 查看对象的类型。口径卡（caliber，docs/design/normal-user-apps.md N2：蓝图对到已发布的口径卡）typesApp 的 LookObject 还没有，
- * 契约待补，先在这里按多一种认
- */
-type LookKind = LookObject['kind'] | 'caliber'
-const kindOf = (o: LookObject): LookKind => o.kind as LookKind
-
-/**
  * look 事件（L2，服务端 app/look/base.py 的形状）读进来：objects 按类型标记；字段缺了的补空，认不出的形状返回 null
  * （不出这一行，也不报错）。旧写法 sources[] 当作表类型读
  */
@@ -3190,7 +3205,7 @@ export function lookEventOf(op: CopilotOp): LookEvent | null {
   const objects: LookObject[] = list
     .filter((x): x is Record<string, any> => !!x && typeof x === 'object')
     .map((x) => {
-      const kind = (x.kind === 'capability' || x.kind === 'workflow_version' || x.kind === 'caliber' ? x.kind : 'table') as LookObject['kind']
+      const kind: LookObject['kind'] = x.kind === 'capability' || x.kind === 'workflow_version' || x.kind === 'caliber' ? x.kind : 'table'
       const total = num(x.total)
       const explored = num(x.explored)
       return {
@@ -3213,10 +3228,10 @@ export function lookEventOf(op: CopilotOp): LookEvent | null {
 }
 
 /** 这一类对象一共给了几个（表：点名的 + 挑出的 + 补上的，去重） */
-function lookCount(objects: LookObject[], kind: LookKind): number {
+function lookCount(objects: LookObject[], kind: LookObject['kind']): number {
   const seen = new Set<string>()
   for (const o of objects) {
-    if (kindOf(o) !== kind) continue
+    if (o.kind !== kind) continue
     for (const n of [...o.named, ...(o.picked ?? []), ...(o.joined ?? [])]) seen.add(`${o.source ?? ''}\u0000${n}`)
   }
   return seen.size
@@ -3236,7 +3251,8 @@ function lookLine(o: LookObject): string {
     o.picked?.length ? LOOK_TEXT.picked(o.picked) : '',
     o.joined?.length ? LOOK_TEXT.joined(o.joined) : '',
   ].filter(Boolean)
-  const kind = kindOf(o)
+  // 口径卡（caliber）是蓝图对到的已发布口径卡上的指标（docs/design/normal-user-apps.md N2）
+  const kind = o.kind
   const head = kind === 'table' ? `「${o.source ?? ''}」` : kind === 'capability' ? '能力' : kind === 'caliber' ? '口径卡' : '工作流版本'
   const partial = o.total != null && o.explored != null ? `（${LOOK_TEXT.partial(o.total, o.explored)}）` : ''
   return parts.length ? `${head}${partial}：${parts.join('；')}` : ''

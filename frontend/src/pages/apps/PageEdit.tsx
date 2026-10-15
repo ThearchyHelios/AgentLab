@@ -45,13 +45,10 @@ import { AppMeta, BackLink, LoadError, appPath } from './shared'
 interface Box { top: number; left: number; width: number; height: number }
 
 /**
- * 服务端给的「草稿和当前发布版是否一致」（AppDetail.draft_changed，见报告的接口约定请求）。没给的当不知道：
- * 只在这一次改过之后说「有未发布的改动」，不在浏览器里拿草稿和发布版逐项比（发布时服务端会规整 spec，比不准）
+ * 服务端给的「草稿和当前发布版是否一致」（AppDetail.draft_changed）。没给的当不知道：只在这一次改过之后说「有未发布的
+ * 改动」，不在浏览器里拿草稿和发布版逐项比（发布时服务端会规整 spec，比不准）
  */
-const draftChangedOf = (d: AppDetail): boolean | null => {
-  const v = (d as AppDetail & { draft_changed?: unknown }).draft_changed
-  return typeof v === 'boolean' ? v : null
-}
+const draftChangedOf = (d: AppDetail): boolean | null => d.draft_changed ?? null
 
 /** 组件在界面上叫什么：属性里写的名字、标题，再退到目录里的中文名 */
 function labelOf(comp: AppComponent | undefined, entry: CatalogComponent | undefined): string {
