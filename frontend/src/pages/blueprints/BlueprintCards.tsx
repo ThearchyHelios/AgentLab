@@ -6,8 +6,9 @@
  * 条件这些选填的空着也是缺，只看项的状态会把它们都标成缺；「待确认」是助手、模板、目录提的、你还没看过的项。界面不自己判
  * 哪些项必填（P7）。
  *
- * 每一项可以点开改：改完发一个 bp_set（值是纯值，服务端记成来源「你」、已确认）；待确认的可以直接点「确认」（只改状态，
- * 来源不变）。加一项是 bp_add（卡片字段写纯值），删一项是 bp_remove。对到数据的项写表、中文名、粒度、业务日期和
+ * 每一项可以点「修改」：改完发一个 bp_set（值是纯值，服务端记成来源「你」、已确认）；待确认的可以直接点「确认」（只改状态，
+ * 来源不变），一张卡片上待确认的不止一项时卡头另有「确认全部」，一次修改带上这几项的状态（服务端整批落或整批不落）。
+ * 加一项是 bp_add（卡片字段写纯值），删一项是 bp_remove。对到数据的项写表、中文名、粒度、业务日期和
  * 「为什么对到这张表」（来自查看和数据目录）。
  *
  * 关节：按卡片生成之后列出生成关节的状态；「让助手填」走 fill-joints-stream，各组并行，逐组写进度。
@@ -87,6 +88,11 @@ function cardStatus(ctx: CardCtx, card: CardKey, items: [string, BpItem | null |
   return shown.includes('confirmed') ? 'confirmed' : null
 }
 
+/** 这张卡片上待确认、有值的项（各自有「确认」按钮的那几项） */
+function pendingOf(items: [string, BpItem | null | undefined][]): string[] {
+  return items.filter(([, i]) => isItem(i) && i.status === 'proposed' && i.value != null && i.value !== '').map(([p]) => p)
+}
+
 /** 新加一项的 id（数据项、步骤）：小写字母开头，和已有的不重 */
 function freshId(prefix: string, taken: string[]): string {
   for (let n = taken.length + 1; ; n += 1) if (!taken.includes(`${prefix}${n}`)) return `${prefix}${n}`
@@ -143,28 +149,35 @@ function CardFor({ card, ctx, template }: { card: CardKey; ctx: CardCtx; templat
       )
     case 'template':
       return <TemplateCard ctx={ctx} template={template} issues={issues} />
-    case 'data':
+    case 'data': {
+      const items = spec.data.flatMap((d, i) => DATA_KEYS.map((k) => [`/data/${i}/${k}`, d[k] as BpItem] as [string, BpItem]))
       return (
-        <Card card={card} note={note} issues={issues}
-              status={cardStatus(ctx, card, spec.data.flatMap((d, i) => DATA_KEYS.map((k) => [`/data/${i}/${k}`, d[k] as BpItem] as [string, BpItem])))}
-              actions={<AddButton ctx={ctx} label={BP_EDIT_TEXT.addData} prompt={BP_EDIT_TEXT.addDataPrompt} path="/data"
-                                  make={(name) => ({ id: freshId('d', spec.data.map((d) => d.id)), label: name })} />}>
+        <Card card={card} note={note} issues={issues} status={cardStatus(ctx, card, items)}
+              actions={<>
+                <ConfirmAll ctx={ctx} card={card} paths={pendingOf(items)} />
+                <AddButton ctx={ctx} label={BP_EDIT_TEXT.addData} prompt={BP_EDIT_TEXT.addDataPrompt} path="/data"
+                           make={(name) => ({ id: freshId('d', spec.data.map((d) => d.id)), label: name })} />
+              </>}>
           {spec.data.length === 0 && <Empty />}
           {spec.data.map((d, i) => <DataBlock key={d.id} ctx={ctx} item={d} index={i} />)}
         </Card>
       )
+    }
     case 'cadence':
       return (
         <Card card={card} status={cardStatus(ctx, card, [['/cadence', spec.cadence]])} note={note} issues={issues}>
           <ItemRow ctx={ctx} path="/cadence" item={spec.cadence} label={ITEM_LABEL.cadence} kind="cadence" />
         </Card>
       )
-    case 'people':
+    case 'people': {
+      const items = spec.people.flatMap((s, i) => STEP_KEYS.map((k) => [`/people/${i}/${k}`, s[k] as BpItem] as [string, BpItem]))
       return (
-        <Card card={card} note={note} issues={issues}
-              status={cardStatus(ctx, card, spec.people.flatMap((s, i) => STEP_KEYS.map((k) => [`/people/${i}/${k}`, s[k] as BpItem] as [string, BpItem])))}
-              actions={<AddButton ctx={ctx} label={BP_EDIT_TEXT.addStep} prompt={BP_EDIT_TEXT.addStepPrompt} path="/people"
-                                  make={(name) => ({ id: freshId('s', spec.people.map((s) => s.id)), label: name })} />}>
+        <Card card={card} note={note} issues={issues} status={cardStatus(ctx, card, items)}
+              actions={<>
+                <ConfirmAll ctx={ctx} card={card} paths={pendingOf(items)} />
+                <AddButton ctx={ctx} label={BP_EDIT_TEXT.addStep} prompt={BP_EDIT_TEXT.addStepPrompt} path="/people"
+                           make={(name) => ({ id: freshId('s', spec.people.map((s) => s.id)), label: name })} />
+              </>}>
           {spec.people.length === 0 && <Empty />}
           {spec.people.map((s, i) => (
             <SubBlock key={s.id} ctx={ctx} title={String(s.label?.value ?? '') || BLUEPRINT_TEXT.item(i + 1)} path={`/people/${i}`}
@@ -176,29 +189,34 @@ function CardFor({ card, ctx, template }: { card: CardKey; ctx: CardCtx; templat
           ))}
         </Card>
       )
-    case 'fields':
+    }
+    case 'fields': {
+      const items = spec.fields.map((f, i) => [`/fields/${i}/spec`, f.spec] as [string, BpItem])
       return (
-        <Card card={card} note={note} issues={issues}
-              status={cardStatus(ctx, card, spec.fields.map((f, i) => [`/fields/${i}/spec`, f.spec] as [string, BpItem]))}
-              actions={<AddButton ctx={ctx} label={BP_EDIT_TEXT.addField} prompt={BP_EDIT_TEXT.addFieldPrompt} path="/fields"
-                                  make={(name) => ({ name: freshFieldName(name, spec.fields.map((f) => f.name)), sensitive: false,
-                                    spec: { type: 'string', title: name } })} />}>
+        <Card card={card} note={note} issues={issues} status={cardStatus(ctx, card, items)}
+              actions={<>
+                <ConfirmAll ctx={ctx} card={card} paths={pendingOf(items)} />
+                <AddButton ctx={ctx} label={BP_EDIT_TEXT.addField} prompt={BP_EDIT_TEXT.addFieldPrompt} path="/fields"
+                           make={(name) => ({ name: freshFieldName(name, spec.fields.map((f) => f.name)), sensitive: false,
+                             spec: { type: 'string', title: name } })} />
+              </>}>
           {spec.fields.length === 0 && <Empty />}
           {spec.fields.map((f, i) => <FieldBlock key={f.name} ctx={ctx} field={f} index={i} />)}
         </Card>
       )
+    }
     case 'writeback': {
       const wb = spec.writeback
+      const items: [string, BpItem][] = wb ? [['/writeback/capability', wb.capability], ['/writeback/mapping', wb.mapping],
+        ['/writeback/confirm', wb.confirm]] : []
       return (
-        <Card card={card} note={note} issues={issues}
-              status={cardStatus(ctx, card, wb ? [['/writeback/capability', wb.capability], ['/writeback/mapping', wb.mapping],
-                ['/writeback/confirm', wb.confirm]] : [])}
+        <Card card={card} note={note} issues={issues} status={cardStatus(ctx, card, items)}
               actions={!wb ? (
                 <button type="button" className="btn btn-xs btn-ghost" disabled={ctx.locked || !!ctx.edit.busy} data-bp-add="/writeback"
                         onClick={() => void ctx.edit.run('wb', [{ op: 'bp_set', path: '/writeback', value: {} }])}>
                   <Plus size={11} aria-hidden /> {BP_EDIT_TEXT.addWriteback}
                 </button>
-              ) : undefined}>
+              ) : <ConfirmAll ctx={ctx} card={card} paths={pendingOf(items)} />}>
           {!wb ? <Empty /> : (
             <SubBlock ctx={ctx} title={CARD_LABEL.writeback} path="/writeback">
               <ItemRow ctx={ctx} path="/writeback/capability" item={wb.capability} label={ITEM_LABEL.capability} kind="text" />
@@ -281,7 +299,23 @@ function SubBlock({ ctx, title, path, attr, head, children }: {
   )
 }
 
-/** 卡片上的一项：名字、值、状态、来源、为什么；「改」打开编辑框，待确认的可以直接确认 */
+/**
+ * 「确认全部」：这张卡片上待确认的项一次标成已确认（一次修改带上这几项的 /status，服务端整批落或整批不落，来源不变）。
+ * 只有一项时不摆，用那一项自己的「确认」
+ */
+function ConfirmAll({ ctx, card, paths }: { ctx: CardCtx; card: CardKey; paths: string[] }) {
+  if (paths.length < 2) return null
+  const ops = paths.map((p): BpOp => ({ op: 'bp_set', path: `${p}/status`, value: 'confirmed' }))
+  return (
+    <button type="button" className="btn btn-xs" disabled={ctx.locked || !!ctx.edit.busy}
+            title={BLUEPRINT_TEXT.confirmAllHint(paths.length)} data-bp-confirm-all={paths.length}
+            onClick={() => void ctx.edit.run(`confirm-all:${card}`, ops, BLUEPRINT_TEXT.confirmedAll(paths.length))}>
+      {BLUEPRINT_TEXT.confirmAll(paths.length)}
+    </button>
+  )
+}
+
+/** 卡片上的一项：名字、值、状态、来源、为什么；「修改」打开编辑框，待确认的可以直接确认 */
 function ItemRow({ ctx, path, item, label, kind }: {
   ctx: CardCtx; path: string; item: BpItem | null | undefined; label: string; kind: EditorKind
 }) {

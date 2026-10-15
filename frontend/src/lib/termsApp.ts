@@ -491,8 +491,8 @@ export const PAGE_EDIT_TEXT = {
   personalNoPublish: '个人应用没有发布这一步：改动保存后直接生效',
   // ---- 小工具条
   toolbar: (label: string) => `「${label}」的操作`,
-  editText: '改文字',
-  editTextTitle: (label: string) => `改「${label}」的文字`,
+  editText: '修改文字',
+  editTextTitle: (label: string) => `修改「${label}」的文字`,
   editTextHint: '只改组件上显示的文字，不改它的数据来源',
   noText: '这个组件没有可改的文字',
   saveText: '保存文字',

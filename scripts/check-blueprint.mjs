@@ -6,8 +6,8 @@
 //     （模板卡写适用场景、会产出什么、要准备什么）、从已有的开始（最近的问数据回答；已发布的工作流只给搭建者）。身份决定范围：
 //     搭建者建共享蓝图；使用者在管理员开了个人应用时建个人蓝图，个人应用用不了的模板不给选；开关没开照实说没开放；
 //     应用首页的「新建应用」链到 /apps/create；
-//   - 卡片：卡头标状态（缺按服务端检查、待确认、已确认），对到数据的项写表、中文名、粒度、业务日期、为什么；点开改发 bp_set
-//     （纯值），确认只改状态，加一项发 bp_add（纯值）；缺项时「用真数试一次」置灰并写清缺什么；
+//   - 卡片：卡头标状态（缺按服务端检查、待确认、已确认），对到数据的项写表、中文名、粒度、业务日期、为什么；「修改」发 bp_set
+//     （纯值），确认只改状态，「确认全部」一次带上整张卡片待确认的几项，加一项发 bp_add（纯值）；缺项时「用真数试一次」置灰并写清缺什么；
 //   - 反问：助手的 bp_ask 画成可点的选项，「这一轮在等你回答」常显，输入框提示回答；点选项就是把它作为下一轮发出去（回答记在
 //     问题上、这一轮落进蓝图对话都是服务端做的，前端不另记）；
 //   - 关节：只列生成关节，按卡片填的汇总一句；「让助手填」走 fill-joints-stream，逐组写进度，组之间并行；
@@ -472,6 +472,15 @@ await section('蓝图页：卡片的状态、对到的数据、改一项、缺�
   check('加一项：bp_add，卡片字段写纯值、id 不和已有的重', await until(() => (state.patches ?? []).length === 3)
     && JSON.stringify(state.patches[2].ops) === JSON.stringify([{ op: 'bp_add', path: '/data', value: { id: 'd3', label: '订单数' } }]),
     JSON.stringify(state.patches?.[2]))
+  // 确认全部：这张卡片上待确认、有值的几项一次标成已确认（单位、对到的表、算法）；只有一项的卡片（多久更新）不摆
+  const confirmAll = page.locator('[data-card="data"] [data-bp-confirm-all]')
+  check('卡头有「确认全部」，写明几项', (await confirmAll.innerText()).includes('确认全部（3）')
+    && await page.locator('[data-card="cadence"] [data-bp-confirm-all]').count() === 0, await confirmAll.innerText())
+  check('改值的按钮写「修改」', (await page.locator('[data-bp-item="/data/0/unit"] [data-bp-edit]').innerText()).trim() === '修改')
+  await confirmAll.click()
+  check('确认全部：一次修改带上这几项的状态，只改状态', await until(() => (state.patches ?? []).length === 4)
+    && JSON.stringify(state.patches[3].ops) === JSON.stringify(['/data/0/unit', '/data/0/table', '/data/0/measure']
+      .map((p) => ({ op: 'bp_set', path: `${p}/status`, value: 'confirmed' }))), JSON.stringify(state.patches?.[3]))
   // 被拒：照实说服务端的原因
   state.patchReject = '「单位」最多 20 个字'
   await page.locator('[data-bp-item="/data/0/unit"] [data-bp-edit]').click()
