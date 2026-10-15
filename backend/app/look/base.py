@@ -24,7 +24,9 @@ REPAIR_LOOK_LIMIT = 1       # 自查修正阶段另给几次
 LOOK_RESULT_CHARS = 12_000  # 一次查看结果的字数上限
 PICK_LIMIT = 12             # 挑选最多挑几个；候选不超过这个数时不挑、全给（沿用）
 CONTEXT_TABLE_LIMIT = 16    # 一次查看最多给几张表的详情（含中间表，沿用）
-PICK_TIMEOUT_S = 20         # 挑选时限（沿用）
+#: 挑选时限。经 OpenAI 兼容接入的推理模型关不掉思考（look/pick.PICK_MAX_TOKENS），先想再写：原来的 20 秒常常想到一半就
+#: 掐了，交回目录让主模型自己再看一遍反而更慢
+PICK_TIMEOUT_S = 45
 
 
 class LookTarget(TypedDict, total=False):
