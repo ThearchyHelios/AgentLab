@@ -15,7 +15,7 @@
   是这个值又确认过的不提；有效记录条件是模型写的 SQL，另按起草的规矩核对（_Tools.filter_problem：一个条件、只用这张表的
   列、不能有子查询……）。核对过的作为 proposal 事件交给界面，**不写目录**。没收下的项和原因交回模型（不带任何取值）。
   界面上还没保存的修改（pending）里同一列的码值并进新提的码值：界面上同一路径以后一次为准，不能把先提的码值丢了。
-- run_query：只读查询，只有数据源开了数据剖析才给。经剖析的只读守卫和单条时限（catalog_profile._Runner：
+- run_query：只读查询，只有数据源开了数据剖析才给。经剖析的单条查询入口（catalog_profile.run_single_query：
   guard.check(readonly=True)，单条时限取剖析设置和数据源查询时限中较小的一个），每次请求最多 MAX_QUERIES 条（守卫拒掉的
   也算），最多 QUERY_ROWS 行交给模型、SHOWN_ROWS 行交给界面。结果交给模型、界面之前先遮（engine/masking.mask_query_result：
   取自遮罩列的结果列整列换成「已遮罩」，改了名字的也认；这一次请求里前面遮掉的值按值换），报错原话里的值也换。没开剖析时
@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses
 import json
 import logging
 from collections.abc import AsyncIterator, Iterable, Mapping
@@ -621,15 +620,11 @@ class _Tools:
         known = known if known.strong else None
         error: str | None = None
         result: Any = None
-        settings = dataclasses.replace(self.ctx.settings, max_queries=1)
         try:
-            runner = catalog_profile._Runner(self.ctx.query_source, settings,
-                                            catalog_profile.SqlDialect(self.ctx.kind))
-            result = await runner(sql, max_rows=QUERY_ROWS)
-        except catalog_profile._Skip as e:
+            result = await catalog_profile.run_single_query(self.ctx.query_source, sql, settings=self.ctx.settings,
+                                                            max_rows=QUERY_ROWS, kind=self.ctx.kind)
+        except catalog_profile.QueryFailed as e:
             error = e.detail
-        except catalog_profile._Stop as e:
-            error = str(e)
         except SnapshotTampered as e:
             error = QUERY_TAMPERED.format(name=self.ctx.source_name, error=e)
         except ValueError as e:                  # 不支持的数据库类型

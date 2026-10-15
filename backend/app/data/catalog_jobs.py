@@ -13,15 +13,20 @@
   接口读的是库里的状态。
 - **停止**（cancel）：排队的直接 cancelled；进行中的停掉正在进行的模型调用，没开始和没写完的表记 cancelled，已经写进
   目录的（含宽表已经写出来的段）不回滚，任务最后是 cancelled。写过段的表 model_error 说清写进了几段、剩几段没起草。
-- **和同步起草互斥**（sync_draft）：同步起草（POST /catalog/draft）进行期间，同一个源建任务、重试、导入（ensure_idle）
-  都是 DraftBusy；有排队或进行中的任务时同步起草也是。进程内登记（单进程部署）。
+- **同种任务互斥**（ensure_draft_free）：同一个源同时只有一个排队或进行中的起草任务，同步起草（POST /catalog/draft）
+  进行期间也算在起草，建任务、重试都是 DraftBusy。剖析任务不挡起草：同源有剖析任务时起草任务照建，排在它后面
+  （waiting_for = "profile"），剖析结束后自动开始（每个源一条队，见 data/catalog_job_runtime.py）。
+- **同步写操作要求源空闲**（ensure_idle；sync_draft、import_write 占队）：同步起草、导入目录要的是这个源上没有别的事——有排队或进行中的
+  起草任务（DraftBusy）、剖析任务（catalog_profile_jobs.ProfileBusy）都不开始；开始了就占着这个源的队，执行期间
+  新建的任务排在它后面。进程内登记（单进程部署）。
 - **重试**（retry_tables + create_job）：新任务，只含原任务里 failed、partial、cancelled 的表；用不用模型、本次说明沿用，
   起草要求取数据源当前的。
 - **服务重启**：启动时（startup）把排队、进行中的任务标成 interrupted，没结束的表记 cancelled、写明「服务重启，起草
   中断」。不自动续跑：复制出来的数据目录（检查、验收）启动时不能自己去调模型；界面让人点「重试」续上。关停时
   （manager.shutdown）停掉进行中的任务，同样标成 interrupted。
 
-任务的库写入一律经 _JobRun._write：一条一条来，shield 起来——停止任务时不会打断写到一半的库操作，收尾前等它们写完。
+任务的生命周期（进程内执行、停止、同源排队、库写入一条一条来并 shield、启动时标中断、状态词）在
+data/catalog_job_runtime.py，剖析任务用的是同一套；这里只写起草自己的步骤。
 
 **起草要求**存在数据源 options 的 catalog_draft_guidance 里（上传表格的源存在它自己的 DataSource 行上），一段文字，
 去首尾空白、最多 GUIDANCE_MAX 字，空串等于没有。只经 PUT /catalog/guidance 改：数据源接口不显示它、整份回写 options
@@ -40,20 +45,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data import catalog, catalog_draft
+from app.data import catalog_job_runtime as runtime
+from app.data.catalog_job_runtime import ACTIVE, FINISHED, RETRYABLE, STOP_GRACE_S, TASK_DONE, TASK_STATUSES
 from app.data.engine import CATALOG_DRAFT_GUIDANCE_OPTION
 from app.db.base import SessionLocal, new_id, utcnow
-from app.db.models import CatalogDraftJob, CatalogDraftTask, DataSource
+from app.db.models import CatalogDraftJob, CatalogDraftTask, CatalogProfileJob, DataSource
 
 logger = logging.getLogger(__name__)
 
-#: 任务还没结束的状态（同一个源只能有一个）、结束了的状态
-ACTIVE = ("queued", "running")
-FINISHED = ("succeeded", "partial", "failed", "cancelled", "interrupted")
-#: 逐表的状态，以及其中算「已结束」的、重试时要带上的
-TASK_STATUSES = ("pending", "running", "ok", "partial", "failed", "skipped", "cancelled")
-TASK_DONE = ("ok", "partial", "failed", "skipped", "cancelled")
-RETRYABLE = ("failed", "partial", "cancelled")
-_OPEN = ("pending", "running")
+_OPEN = runtime.OPEN
 
 #: 一个任务最多几张表；起草要求、本次说明最多几个字
 MAX_TABLES = 500
@@ -63,9 +63,6 @@ NOTE_MAX = 1000
 LAST_DRAFT_JOBS = 100
 #: 逐表最多记几个模型留空的列名
 BLANK_SAMPLE = 5
-#: 停止进行中的任务时最多等它收尾多久（秒）；关停服务时另给（shutdown 的 grace）
-STOP_GRACE_S = 10.0
-
 INTERRUPTED_ERROR = "服务重启，起草中断"
 #: 停止、中断时写过段的表（宽表每写出一段就并入目录）：写进了几段、剩几段没起草
 STOPPED_WRITTEN = "已停止：已写进目录 {n} 段，剩下 {m} 段没起草"
@@ -93,7 +90,7 @@ class TextTooLong(ValueError):
     """起草要求、本次说明超长。message 给人看。"""
 
 
-class _JobFailed(Exception):
+class _JobFailed(runtime.JobFailed):
     """任务整体出错（数据源没了、快照没了、模型用不了）：message 就是任务的 error。"""
 
 
@@ -200,13 +197,15 @@ def _counts(statuses: list[str]) -> dict[str, int]:
     return counts
 
 
-def job_dict(job: CatalogDraftJob, tasks: list[CatalogDraftTask]) -> dict[str, Any]:
-    """接口返回的任务（CatalogDraftJob）：逐表的状态按起草顺序；计数、合计都按逐表的算。"""
+def job_dict(job: CatalogDraftJob, tasks: list[CatalogDraftTask], *, waiting_for: str | None = None) -> dict[str, Any]:
+    """接口返回的任务（CatalogDraftJob）：逐表的状态按起草顺序；计数、合计都按逐表的算。waiting_for：排队中、排在同源的
+    剖析任务后面时是 "profile"（见 waiting_for），否则 null。"""
     counts = _counts([t.status for t in tasks])
     return {
         "id": job.id,
         "source_id": job.source_id,
         "status": job.status,
+        "waiting_for": waiting_for,
         "use_model": bool(job.use_model),
         "model": job.model,
         "guidance": job.guidance,
@@ -235,12 +234,32 @@ def job_dict(job: CatalogDraftJob, tasks: list[CatalogDraftTask]) -> dict[str, A
     }
 
 
+async def waiting_for(session: AsyncSession, job: CatalogDraftJob) -> str | None:
+    """排队中的起草任务在等什么：排在同源的剖析任务后面时是 "profile"，否则 None（进行中、结束了的都是 None）。
+
+    先看这个源的队（进程内，排在它前面的是谁）；任务刚建、后台还没排进队时看库：同源有比它先建的、排队或进行中的剖析
+    任务。"""
+    if job.status != "queued":
+        return None
+    ahead = runtime.lanes.ahead(job.source_id, job.id)
+    if ahead is not None:
+        return "profile" if "profile" in ahead else None
+    earlier = (await session.execute(
+        select(CatalogProfileJob.id).where(CatalogProfileJob.source_id == job.source_id,
+                                           CatalogProfileJob.status.in_(ACTIVE),
+                                           CatalogProfileJob.created_at <= job.created_at).limit(1)
+    )).first()
+    return "profile" if earlier is not None else None
+
+
 async def job_out(session: AsyncSession, job: CatalogDraftJob | None) -> dict[str, Any] | None:
-    return None if job is None else job_dict(job, await tasks_of(session, job.id))
+    if job is None:
+        return None
+    return job_dict(job, await tasks_of(session, job.id), waiting_for=await waiting_for(session, job))
 
 
 async def job_brief(session: AsyncSession, job: CatalogDraftJob | None) -> dict[str, Any] | None:
-    """目录清单顶上的进度：{id, status, total, done}。"""
+    """目录清单顶上的进度：{id, status, total, done, waiting_for}。"""
     if job is None:
         return None
     rows = (await session.execute(
@@ -249,7 +268,7 @@ async def job_brief(session: AsyncSession, job: CatalogDraftJob | None) -> dict[
     )).all()
     counts = {status: n for status, n in rows}
     return {"id": job.id, "status": job.status, "total": sum(counts.values()),
-            "done": sum(counts.get(s, 0) for s in TASK_DONE)}
+            "done": sum(counts.get(s, 0) for s in TASK_DONE), "waiting_for": await waiting_for(session, job)}
 
 
 async def last_drafts(session: AsyncSession, source_id: str) -> dict[str, dict[str, Any]]:
@@ -294,12 +313,30 @@ async def last_drafts(session: AsyncSession, source_id: str) -> dict[str, dict[s
 # ==========================================================================
 
 
-def busy_message(row: Any) -> str:
-    return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录，请等这次起草结束（或先停止它）再开始新的起草"
+#: 撞上起草时说法的最后一句（「请等这次起草结束{then}」）缺省是建起草任务的；导入目录、同步起草撞上起草、剖析时按这次要做
+#: 的事说（_then）
+THEN_DRAFT = "再开始新的起草"
 
 
-def sync_busy_message(row: Any) -> str:
-    return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录（同步起草），请等这次起草结束再开始新的起草"
+def _then(kind: str, busy: str) -> str:
+    """同步写操作（kind：import / sync_draft）撞上 busy（draft 起草、profile 剖析）时说法的最后一句：导入撞上什么都是
+    「再导入」；同步起草撞上起草是「再开始新的起草」（和建起草任务同一句话），撞上剖析是「再起草」——那时要做的是起草，
+    不是「开始新的剖析」。"""
+    if kind == "import":
+        return "再导入"
+    return THEN_DRAFT if busy == "draft" else "再起草"
+
+
+def busy_message(row: Any, then: str = THEN_DRAFT) -> str:
+    return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录，请等这次起草结束（或先停止它）{then}"
+
+
+def sync_busy_message(row: Any, then: str = THEN_DRAFT) -> str:
+    return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录（同步起草），请等这次起草结束{then}"
+
+
+def import_busy_message(row: Any) -> str:
+    return f"数据源「{getattr(row, 'name', '')}」正在导入数据目录，请等导入完成后再试"
 
 
 #: 正在同步起草（POST /catalog/draft）的数据源。进程内登记：服务端是单进程部署，多进程部署时要换成库里的锁
@@ -311,28 +348,84 @@ def sync_drafting(source_id: str) -> bool:
     return source_id in _SYNC
 
 
-async def ensure_idle(session: AsyncSession, row: Any) -> None:
-    """这个源没有在起草：没有排队或进行中的任务，也没有在同步起草。有就抛 DraftBusy。建任务、重试、导入目录之前都调它。"""
+async def ensure_draft_free(session: AsyncSession, row: Any, *, then: str = THEN_DRAFT) -> None:
+    """同种任务互斥：这个源没有在起草——没有排队或进行中的起草任务，也没有在同步起草。有就抛 DraftBusy。建起草任务、
+    重试之前调它。剖析任务不算：同源有剖析任务时起草任务照建，排在它后面。then 是说法最后一句要做的事。"""
     if row.id in _SYNC:
-        raise DraftBusy(sync_busy_message(row))
+        raise DraftBusy(sync_busy_message(row, then))
+    if await active_job(session, row.id) is not None:
+        raise DraftBusy(busy_message(row, then))
+
+
+async def ensure_idle(session: AsyncSession, row: Any, kind: str = "import") -> None:
+    """同步写操作（kind：import 导入目录、sync_draft 同步起草）要求源空闲：没有在起草（DraftBusy，同 ensure_draft_free），
+    也没有排队或进行中的剖析任务（catalog_profile_jobs.ProfileBusy，说法里写明进行到第几张）。说法最后一句按 kind 说
+    这次要做的事（_then）。"""
+    from app.data import catalog_profile_jobs
+
+    await ensure_draft_free(session, row, then=_then(kind, "draft"))
+    await catalog_profile_jobs.ensure_free(session, row, then=_then(kind, "profile"))
+
+
+def _lane_busy(row: Any, holder: runtime.LaneTicket, kind: str) -> Exception:
+    """库里查过没有任务、这个源的队却被占着（同步起草、导入目录正在做，或者一个任务刚好在收尾）：按占着的是谁说，最后
+    一句按这次要做的事（kind）说。"""
+    if holder.kind == "profile":
+        from app.data import catalog_profile_jobs
+
+        return catalog_profile_jobs.ProfileBusy(catalog_profile_jobs.busy_message(row, None,
+                                                                                  then=_then(kind, "profile")))
+    if holder.kind == "import":
+        return DraftBusy(import_busy_message(row))
+    then = _then(kind, "draft")
+    return DraftBusy(sync_busy_message(row, then) if holder.kind == "sync_draft" else busy_message(row, then))
+
+
+@contextlib.asynccontextmanager
+async def _sync_write(row: Any, kind: str, check: Callable[[], Awaitable[None]]) -> AsyncIterator[None]:
+    """同步写操作期间占着这个源的队（不阻塞地试占）：先查库（check：源上有排队或进行中的任务抛 DraftBusy / ProfileBusy），
+    再占队——别的同步写操作正在做时占不到，同样抛忙，什么都不做。占到了，执行期间新建的任务排在它后面，做完才开始。"""
+    await check()
+    try:
+        ticket = runtime.lanes.try_enter(row.id, kind)
+    except runtime.LaneBusy as e:
+        raise _lane_busy(row, e.holder, kind) from e
+    try:
+        yield
+    finally:
+        ticket.release()
+
+
+async def _ensure_idle_but_sync(session: AsyncSession, row: Any) -> None:
+    """同 ensure_idle(…, "sync_draft")，只是不看 _SYNC：同步起草自己刚登记在里面。"""
+    from app.data import catalog_profile_jobs
+
     if await active_job(session, row.id) is not None:
         raise DraftBusy(busy_message(row))
+    await catalog_profile_jobs.ensure_free(session, row, then=_then("sync_draft", "profile"))
 
 
 @contextlib.asynccontextmanager
 async def sync_draft(session: AsyncSession, row: Any) -> AsyncIterator[None]:
-    """同步起草期间登记这个源：同一个源建任务、重试、导入、再开一次同步起草都抛 DraftBusy；有排队或进行中的任务时
-    这里就抛 DraftBusy。先登记、再查库：查库要让出事件循环，先登记才不会和同时建的任务互相看不见（建任务那边写库之后
-    也再看一次，见 create_job）。"""
+    """同步起草期间登记这个源、占着它的队：同一个源建起草任务、重试、导入、再开一次同步起草都抛 DraftBusy，期间新建的
+    剖析任务排在它后面；有排队或进行中的起草任务时这里抛 DraftBusy，有剖析任务时抛 ProfileBusy。先登记、再查库：查库要
+    让出事件循环，先登记才不会和同时建的任务互相看不见（建任务那边写库之后也再看一次，见 create_job）。"""
     if row.id in _SYNC:
         raise DraftBusy(sync_busy_message(row))
     _SYNC.add(row.id)
     try:
-        if await active_job(session, row.id) is not None:
-            raise DraftBusy(busy_message(row))
-        yield
+        async with _sync_write(row, "sync_draft", lambda: _ensure_idle_but_sync(session, row)):
+            yield
     finally:
         _SYNC.discard(row.id)
+
+
+@contextlib.asynccontextmanager
+async def import_write(session: AsyncSession, row: Any) -> AsyncIterator[None]:
+    """导入目录期间占着这个源的队：源上有排队或进行中的起草、剖析任务（或者正在同步起草、导入）时抛 DraftBusy /
+    ProfileBusy；导入期间新建的任务排在它后面。"""
+    async with _sync_write(row, "import", lambda: ensure_idle(session, row, "import")):
+        yield
 
 
 async def check_model(session: AsyncSession) -> None:
@@ -344,8 +437,9 @@ async def create_job(session: AsyncSession, row: Any, source: Any, *, tables: li
                      note: str | None, actor: str | None,
                      retry_of: str | None = None) -> tuple[CatalogDraftJob, list[CatalogDraftTask]]:
     """建一个排队的任务（还没开始，调用方接着 manager.start）。row 是数据源记录（起草要求取它的），source 是读表结构
-    用的源（上传源是绑定当前快照的视图）。有排队或进行中的任务抛 DraftBusy。"""
-    await ensure_idle(session, row)
+    用的源（上传源是绑定当前快照的视图）。有排队或进行中的起草任务（或正在同步起草）抛 DraftBusy；同源有剖析任务时照建，
+    排在它后面。"""
+    await ensure_draft_free(session, row)
     cache = getattr(source, "schema_cache", None) or {}
     all_tables = cache.get("tables") or {}
     wanted = list(tables) if tables else await catalog.default_tables(session, source)
@@ -395,26 +489,22 @@ async def retry_tables(session: AsyncSession, job: CatalogDraftJob) -> list[str]
 
 
 async def cancel(session: AsyncSession, job: CatalogDraftJob) -> None:
-    """停止一个任务。排队的直接 cancelled；进行中的交给 manager 停（停掉模型调用、没写完的表记 cancelled）。
-    已经结束的抛 DraftFinished。"""
-    if job.status in FINISHED:
+    """停止一个任务。排队的直接 cancelled（在队里等着的后台执行跟着停掉、出队）；进行中的交给 manager 停（停掉模型调用、
+    没写完的表记 cancelled）。已经结束的抛 DraftFinished。"""
+    # 先取出来：排队的没停成（刚被后台认领）时 cancel_queued 会回滚，回滚让 job 的属性全部过期，再读 job.id 就要在
+    # 异步会话里同步地重新加载（MissingGreenlet）
+    job_id, status = job.id, job.status
+    if status in FINISHED:
         raise DraftFinished("这次起草已经结束了，不需要停止")
-    if job.status == "queued":
-        now = utcnow()
-        claimed = await session.execute(
-            update(CatalogDraftJob).where(CatalogDraftJob.id == job.id, CatalogDraftJob.status == "queued")
-            .values(status="cancelled", finished_at=now).execution_options(synchronize_session=False))
-        if claimed.rowcount == 1:
-            await session.execute(
-                update(CatalogDraftTask).where(CatalogDraftTask.job_id == job.id, CatalogDraftTask.status.in_(_OPEN))
-                .values(status="cancelled", finished_at=now).execution_options(synchronize_session=False))
-            await session.commit()
+    if status == "queued":
+        if await runtime.cancel_queued(session, CatalogDraftJob, CatalogDraftTask, job_id):
+            await manager.stop(job_id, "user", grace=STOP_GRACE_S)
             return
-        await session.rollback()         # 刚被后台认领、开始了：按进行中的停
-    if await manager.stop(job.id, "user", grace=STOP_GRACE_S):
+        # 刚被后台认领、开始了：按进行中的停
+    if await manager.stop(job_id, "user", grace=STOP_GRACE_S):
         return
     # 库里说在进行，这个进程里却没有在跑它（记录对不上）：直接记停止
-    await _close(session, job.id, "cancelled", None, "cancelled", None)
+    await _close(session, job_id, "cancelled", None, "cancelled", None)
 
 
 async def _close(session: AsyncSession, job_id: str, job_status: str, job_error: str | None, task_status: str,
@@ -434,26 +524,19 @@ async def _close(session: AsyncSession, job_id: str, job_status: str, job_error:
                 .values(status=task_status, error=task_error, finished_at=now,
                         model_error=written.format(n=n, m=max(0, int(total or n) - int(n))))
                 .execution_options(synchronize_session=False))
-    await session.execute(
-        update(CatalogDraftTask).where(CatalogDraftTask.job_id == job_id, CatalogDraftTask.status.in_(_OPEN))
-        .values(status=task_status, error=task_error, finished_at=now).execution_options(synchronize_session=False))
-    await session.execute(
-        update(CatalogDraftJob).where(CatalogDraftJob.id == job_id, CatalogDraftJob.status.in_(ACTIVE))
-        .values(status=job_status, error=job_error, finished_at=now).execution_options(synchronize_session=False))
-    await session.commit()
+    await runtime.close_job(session, CatalogDraftJob, CatalogDraftTask, job_id, job_status, job_error, task_status,
+                            task_error)
 
 
 async def startup() -> int:
     """服务启动时：排队、进行中的任务标成 interrupted，没结束的表记 cancelled、写明服务重启。不自动续跑。返回标了几个。"""
-    async with SessionLocal() as session:
-        ids = [job_id for job_id in (await session.execute(
-            select(CatalogDraftJob.id).where(CatalogDraftJob.status.in_(ACTIVE)))).scalars()
-            if not manager.running(job_id)]
-        for job_id in ids:
-            await _close(session, job_id, "interrupted", INTERRUPTED_ERROR, "cancelled", INTERRUPTED_ERROR)
-    if ids:
-        logger.warning("服务重启：%d 个数据目录起草任务没有做完，已标为中断，可在数据目录页重试", len(ids))
-    return len(ids)
+    async def interrupt(session: AsyncSession, job_id: str) -> None:
+        await _close(session, job_id, "interrupted", INTERRUPTED_ERROR, "cancelled", INTERRUPTED_ERROR)
+
+    n = await runtime.interrupt_on_startup(CatalogDraftJob, interrupt, running=manager.running)
+    if n:
+        logger.warning("服务重启：%d 个数据目录起草任务没有做完，已标为中断，可在数据目录页重试", n)
+    return n
 
 
 # ==========================================================================
@@ -461,60 +544,35 @@ async def startup() -> int:
 # ==========================================================================
 
 
-class _JobRun:
-    """一个任务在后台的一次执行。"""
+class _JobRun(runtime.JobRun):
+    """一个起草任务在后台的一次执行（进队、停止、收尾的框架在 runtime.JobRun）。"""
+
+    kind = "draft"
+    model = CatalogDraftJob
 
     def __init__(self, job_id: str) -> None:
-        self.job_id = job_id
-        self.task: asyncio.Task[None] | None = None
-        #: 为什么停：user 使用者点了停止，shutdown 服务关停（标中断）
-        self.stop_reason: str | None = None
-        self._writes: set[asyncio.Task[Any]] = set()
-        self._lock = asyncio.Lock()
+        super().__init__(job_id)
         self._started: set[str] = set()
         self.source: Any = None
         self.actor: str | None = None
 
-    # ---------------------------------------------------------------- 库写入
+    # ---------------------------------------------------------------- 停止、出错时收尾
 
-    async def _write(self, fn: Callable[..., Awaitable[Any]], *args: Any) -> Any:
-        """一条库写入：同一个任务的写入一条一条来；shield 起来，停止任务时不会打断写到一半的库操作。"""
-        async def go() -> Any:
-            async with self._lock:
-                async with SessionLocal() as session:
-                    return await fn(session, *args)
+    async def _stopped(self) -> None:
+        if self.stop_reason == "user":
+            await self._end("cancelled", None, "cancelled", None)
+        else:
+            await self._end("interrupted", INTERRUPTED_ERROR, "cancelled", INTERRUPTED_ERROR)
 
-        task = asyncio.ensure_future(go())
-        self._writes.add(task)
-        task.add_done_callback(self._writes.discard)
-        return await asyncio.shield(task)
+    async def _failed(self, reason: str) -> None:
+        await self._end("failed", reason, "failed", reason)
 
-    async def _settle(self) -> None:
-        """等手上的库写入都写完（停止、出错收尾之前）。"""
-        while self._writes:
-            await asyncio.gather(*list(self._writes), return_exceptions=True)
+    async def _crashed(self, e: Exception) -> None:
+        from app.core.errors import describe_exception, first_line
 
-    # ---------------------------------------------------------------- 主流程
-
-    async def run(self) -> None:
-        try:
-            await self._run()
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if current is not None:
-                current.uncancel()
-            if self.stop_reason == "user":
-                await self._end("cancelled", None, "cancelled", None)
-            else:
-                await self._end("interrupted", INTERRUPTED_ERROR, "cancelled", INTERRUPTED_ERROR)
-        except _JobFailed as e:
-            await self._end("failed", str(e), "failed", str(e))
-        except Exception as e:  # noqa: BLE001 - 任务整体出错：照实记下，不留在「起草中」
-            from app.core.errors import describe_exception, first_line
-
-            logger.exception("数据目录起草任务 %s 出错", self.job_id)
-            reason = JOB_ERROR.format(line=first_line(e) or describe_exception(e))
-            await self._end("failed", reason, "failed", reason)
+        logger.exception("数据目录起草任务 %s 出错", self.job_id)
+        reason = JOB_ERROR.format(line=first_line(e) or describe_exception(e))
+        await self._end("failed", reason, "failed", reason)
 
     async def _end(self, job_status: str, job_error: str | None, task_status: str, task_error: str | None) -> None:
         """停止、出错时收尾：等手上的库写入写完，再把没结束的表和任务记下来。收尾本身写不进去只记日志（下次启动时
@@ -603,11 +661,7 @@ class _JobRun:
             .execution_options(synchronize_session=False)
 
     async def _claim(self, session: AsyncSession) -> bool:
-        result = await session.execute(
-            update(CatalogDraftJob).where(CatalogDraftJob.id == self.job_id, CatalogDraftJob.status == "queued")
-            .values(status="running", started_at=utcnow()).execution_options(synchronize_session=False))
-        await session.commit()
-        return result.rowcount == 1
+        return await runtime.claim(session, CatalogDraftJob, self.job_id)
 
     async def _set_model(self, session: AsyncSession, model_id: str) -> None:
         await session.execute(update(CatalogDraftJob).where(CatalogDraftJob.id == self.job_id)
@@ -746,66 +800,11 @@ async def write_part(session: AsyncSession, source: Any, table: str, notes: dict
     return None
 
 
-class DraftJobs:
-    """进程内的起草任务（照 app/scheduler 的写法：一个 asyncio 任务一件事，停的时候给宽限）。"""
+class DraftJobs(runtime.JobManager):
+    """进程内的起草任务（start / stop / wait / running / shutdown 见 runtime.JobManager）。"""
 
     def __init__(self) -> None:
-        self._runs: dict[str, _JobRun] = {}
-
-    def _alive(self, job_id: str) -> _JobRun | None:
-        run = self._runs.get(job_id)
-        if run is None or run.task is None or run.task.done():
-            return None
-        try:
-            if run.task.get_loop() is not asyncio.get_running_loop():
-                self._runs.pop(job_id, None)   # 别的事件循环留下的（测试每个用例一个循环）
-                return None
-        except RuntimeError:
-            return None
-        return run
-
-    def start(self, job_id: str) -> None:
-        """开始在后台起草这个（排队中的）任务。"""
-        run = _JobRun(job_id)
-        run.task = asyncio.get_running_loop().create_task(run.run(), name=f"catalog-draft-{job_id}")
-        self._runs[job_id] = run
-
-        def forget(_: asyncio.Task[None]) -> None:
-            if self._runs.get(job_id) is run:
-                self._runs.pop(job_id, None)
-
-        run.task.add_done_callback(forget)
-
-    def running(self, job_id: str) -> bool:
-        return self._alive(job_id) is not None
-
-    async def stop(self, job_id: str, reason: str, *, grace: float = STOP_GRACE_S) -> bool:
-        """停掉这个进程里在跑的任务，等它收尾（最多 grace 秒）。不在这个进程里跑返回 False。"""
-        run = self._alive(job_id)
-        if run is None:
-            return False
-        if run.stop_reason is None:
-            run.stop_reason = reason
-            run.task.cancel()  # type: ignore[union-attr]
-        await asyncio.wait([run.task], timeout=grace)  # type: ignore[list-item]
-        return True
-
-    async def wait(self, job_id: str, timeout: float | None = None) -> None:
-        """等这个任务做完（测试、调试用）。不在跑直接返回。"""
-        run = self._alive(job_id)
-        if run is not None:
-            await asyncio.wait([run.task], timeout=timeout)  # type: ignore[list-item]
-
-    async def shutdown(self, *, grace: float = 3.0) -> None:
-        """关停：停掉进行中的任务（标中断），最多等 grace 秒收尾。"""
-        runs = [run for job_id in list(self._runs) if (run := self._alive(job_id)) is not None]
-        for run in runs:
-            if run.stop_reason is None:
-                run.stop_reason = "shutdown"
-                run.task.cancel()  # type: ignore[union-attr]
-        if runs:
-            await asyncio.wait([run.task for run in runs], timeout=grace)  # type: ignore[misc]
-            logger.info("已停止 %d 个数据目录起草任务", len(runs))
+        super().__init__(_JobRun, label="数据目录起草任务", name="catalog-draft")
 
 
 manager = DraftJobs()
@@ -813,7 +812,8 @@ manager = DraftJobs()
 
 __all__ = ["ACTIVE", "BLANK_SAMPLE", "DraftBusy", "DraftFinished", "DraftJobs", "FINISHED", "GUIDANCE_MAX",
            "INTERRUPTED_ERROR", "INTERRUPTED_WRITTEN", "MAX_TABLES", "NOTE_MAX", "NothingToRetry", "RETRYABLE",
-           "STOPPED_WRITTEN", "TASK_DONE", "TASK_STATUSES", "TextTooLong",
-           "active_job", "cancel", "check_model", "clean_text", "create_job", "ensure_idle", "guidance_of", "job_brief",
-           "job_dict", "job_out", "last_drafts", "latest_job", "load", "manager", "retry_tables", "save_guidance",
-           "startup", "sync_busy_message", "sync_draft", "sync_drafting", "tasks_of", "write_part"]
+           "STOPPED_WRITTEN", "TASK_DONE", "TASK_STATUSES", "THEN_DRAFT", "TextTooLong",
+           "active_job", "cancel", "check_model", "clean_text", "create_job", "ensure_draft_free", "ensure_idle",
+           "guidance_of", "import_busy_message", "import_write", "job_brief", "job_dict", "job_out", "last_drafts",
+           "latest_job", "load", "manager", "retry_tables", "save_guidance", "startup", "sync_busy_message", "sync_draft",
+           "sync_drafting", "tasks_of", "waiting_for", "write_part"]

@@ -536,7 +536,7 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
           </button>
         )}
         {profile.enabled && (
-          <span className="chip" data-profile-on="" title={PROFILE_TEXT.chipHint(profile.max_queries, profile.query_timeout_s)}>
+          <span className="chip" data-profile-on="" title={PROFILE_TEXT.chipHint(profile.table_max_queries, profile.table_max_s, profile.query_timeout_s)}>
             <ScanSearch size={10} aria-hidden /> {PROFILE_TEXT.chip}
           </span>
         )}

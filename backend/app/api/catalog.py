@@ -8,12 +8,17 @@
 - POST   /catalog/{table}/patch  保存目录修改提案（乐观锁），记为人工确认
 - GET    /catalog/{table}/impact 影响面：引用这张表的已发布、受管模板（data/catalog_impact.py）
 - POST   /catalog/draft          同步起草（注释、外键、命名推断，可选模型）。界面改用下面的后台起草任务，这个留着；
-                                 和后台任务双向互斥：同一个源有排队或进行中的后台任务（或正在同步起草）时 409
-                                 catalog_draft_busy，同步起草期间建任务、重试、导入也是 409
+                                 同一个源有排队或进行中的起草任务（或正在同步起草）时 409 catalog_draft_busy，有剖析任务时
+                                 409 profile_busy；同步起草期间建起草任务、重试、导入也是 409，新建的剖析任务排在它后面
 - PUT    /catalog/guidance       数据源级的起草要求（使用者补充的背景和要求，起草时交给模型）
 - POST   /catalog/draft-jobs     建后台起草任务（202）；GET /draft-jobs/active、/latest、/{job_id} 读任务；
-                                 POST /draft-jobs/{job_id}/cancel 停止，/retry 只重试没写好的表（data/catalog_jobs.py）
-- POST   /catalog/profile        同步剖析：对业务库发少量只读查询，核对关系、取码值候选（data/catalog_profile.py）
+                                 POST /draft-jobs/{job_id}/cancel 停止，/retry 只重试没写好的表（data/catalog_jobs.py）。
+                                 同源有剖析任务时照建，排在它后面（waiting_for）
+- POST   /catalog/profile-jobs   建后台剖析任务（202）：对业务库逐表发少量只读查询，核对关系、取码值候选、提议业务日期
+                                 （data/catalog_profile_jobs.py，引擎在 data/catalog_profile.py）；GET /profile-jobs/active、
+                                 /latest、/{job_id} 读任务，/{job_id}/tasks/{seq} 读一张表的明细（检查项、发现、发过的查询）；
+                                 POST /profile-jobs/{job_id}/cancel 停止，/retry 只重试没做完的表。同源有起草任务时照建，
+                                 排在它后面（waiting_for）
 - GET    /catalog/review-queue   审阅队列：推断的项按使用次数、风险、来源排好；POST /catalog/review/batch 批量审阅，
                                  GET /catalog/review-progress 审阅进度，GET /catalog/{table}/usage 用过这张表的运行
                                  （data/catalog_review.py）
@@ -23,8 +28,9 @@
                                  （data/catalog_assistant.py）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
-不对 422，源或表不存在 404。所有写操作记录请求头 X-Actor 的署名（自报、未认证）。剖析没开启、正在剖析 409。
-起草任务的 409 带机读码（api/coded.py）：同一个源已有排队或进行中的任务、起草模型用不了、要停止的任务已经结束。
+不对 422，源或表不存在 404。所有写操作记下署名（api/deps.actor_of：开了登录是认证过的用户名，否则请求头 X-Actor 的自报）。
+起草、剖析任务的 409 带机读码（api/coded.py）：同一个源已有排队或进行中的同种任务、起草模型用不了、剖析没开启、按范围
+挑不出表、要停止的任务已经结束。
 
 上传表格的源按当前快照的表结构回答（table_versions.resolve_source），和查询实际用的库是同一个版本。
 """
@@ -38,11 +44,12 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import (
-    CATALOG_DRAFT_BUSY, CATALOG_DRAFT_FINISHED, CATALOG_DRAFT_MODEL_UNAVAILABLE, PROFILE_BUSY, SCHEMA_MISSING,
-    SNAPSHOT_TAMPERED, CodedHTTPException,
+    CATALOG_DRAFT_BUSY, CATALOG_DRAFT_FINISHED, CATALOG_DRAFT_MODEL_UNAVAILABLE, CATALOG_PROFILE_FINISHED, PROFILE_BUSY,
+    PROFILE_NOTHING, SCHEMA_MISSING, SNAPSHOT_TAMPERED, CodedHTTPException,
 )
-from app.api.runs import actor_of
-from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, introspect, table_versions
+from app.api.deps import actor_of
+from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, catalog_profile_jobs, introspect
+from app.data import table_versions
 from app.data import catalog_assistant, catalog_review, catalog_transfer
 from app.data.engine import SnapshotTampered
 from app.db.base import get_session
@@ -102,9 +109,11 @@ GUIDANCE_MISSING = "请求里要写起草要求（guidance 一项，一段文字
 GUIDANCE_NOT_TEXT = "起草要求要是一段文字（要清除起草要求请传空串）"
 
 
-class CatalogProfileIn(BaseModel):
-    #: 要剖析的表；不给或为空时按使用次数取前 10 张目录里有待核实关系的表
-    tables: list[str] | None = Field(default=None, max_length=200)
+class ProfileJobIn(BaseModel):
+    #: 要剖析的表（范围 selected，按给的顺序去重）；最多 500 张（超了 422，说明是中文）
+    tables: list[str] | None = None
+    #: 不指定表时的范围：needed 需要剖析的表（缺省）、all 全部表（都不含视图、没有可剖析的项的表）
+    scope: Literal["needed", "all"] | None = None
 
 
 async def _resolved(session: AsyncSession, source_id: str) -> tuple[DataSource, Any]:
@@ -134,7 +143,8 @@ def _item_value(notes: dict[str, Any], name: str) -> tuple[Any, str | None]:
 
 
 def _summary_row(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogEntry | None,
-                 usage: int, last_draft: dict[str, Any] | None = None) -> dict[str, Any]:
+                 usage: int, last_draft: dict[str, Any] | None = None,
+                 profiling: dict[str, Any] | None = None) -> dict[str, Any]:
     notes = entry.notes if entry else {}
     label, label_status = _item_value(notes, "label")
     kind, _ = _item_value(notes, "kind")
@@ -157,7 +167,19 @@ def _summary_row(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogE
         # 这张表最近一次起草任务里的那一项：{status, job_id, finished_at, error, model_error, blank_columns}，没起草过
         # 是 null
         "last_draft": last_draft,
+        # 剖析：最近一次剖析（CatalogLastProfile，没剖析过是 null）、要不要剖析和为什么、按当前目录和表结构要做几项检查
+        **(profiling or {"last_profile": None, "profile_due": False, "profile_due_reason": None, "profile_checks": 0}),
     }
+
+
+def _profiling(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogEntry | None, *,
+               tables: dict[str, Any], masked: set[str], last: dict[str, Any] | None) -> dict[str, Any]:
+    notes = entry.notes if entry else {}
+    planned = catalog_profile.plan_checks(name, meta, notes, tables=tables, masked=masked)
+    checks = sum(1 for c in planned if c.skip is None)
+    reason = catalog_profile_jobs.due_reason(meta, notes, last, planned)
+    return {"last_profile": catalog_profile_jobs.public_last(last), "profile_due": reason is not None,
+            "profile_due_reason": reason, "profile_checks": checks}
 
 
 def _structure(meta: dict[str, Any]) -> dict[str, Any]:
@@ -188,6 +210,9 @@ async def _detail(session: AsyncSession, source: Any, table: str, entry: catalog
         "structure": _structure(meta) if meta is not None else None,
         "system_notes": catalog.system_notes_source(source),
         "usage": usage,
+        # 这张表最近一次剖析（CatalogProfileTaskDetail：检查项、发现、跳过的项、日期范围、发过的查询）；任务还在进行就是
+        # 进行中的状态；没剖析过是 null
+        "last_profile": await catalog_profile_jobs.last_detail(session, source.id, table),
     }
 
 
@@ -223,11 +248,17 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
     entries = await catalog.read_catalog(session, source.id)
     usage = await catalog.table_usage(session, source)
     drafts = await catalog_jobs.last_drafts(session, source.id)
+    lasts = await catalog_profile_jobs.last_profiles(session, source.id)
+    masked = catalog_profile.masked_of(row.options)
+
+    def profiling(name: str, meta: dict[str, Any] | None) -> dict[str, Any]:
+        return _profiling(name, meta, entries.get(name), tables=tables, masked=masked, last=lasts.get(name))
+
     order = {name: i for i, name in enumerate(tables)}
-    rows = [_summary_row(name, meta, entries.get(name), usage.get(name, 0), drafts.get(name))
+    rows = [_summary_row(name, meta, entries.get(name), usage.get(name, 0), drafts.get(name), profiling(name, meta))
             for name, meta in tables.items()]
     rows.sort(key=lambda r: (-r["usage"], order[r["table_name"]]))
-    rows += [_summary_row(name, None, entry, 0, drafts.get(name))
+    rows += [_summary_row(name, None, entry, 0, drafts.get(name), profiling(name, None))
              for name, entry in sorted(entries.items()) if name not in tables]
     return {
         "tables": rows,
@@ -238,8 +269,11 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
         "schema_total": max(_int(cache.get("total")), len(tables)),
         # 数据源级的起草要求（没有是 null）
         "guidance": catalog_jobs.guidance_of(row),
-        # 排队或进行中的起草任务 {id, status, total, done}，界面据此显示进度；没有是 null
+        # 排队或进行中的起草任务 {id, status, total, done, waiting_for}，界面据此显示进度；没有是 null
         "active_job": await catalog_jobs.job_brief(session, await catalog_jobs.active_job(session, source.id)),
+        # 排队或进行中的剖析任务 {id, status, total, done, waiting_for}；没有是 null
+        "active_profile_job": await catalog_profile_jobs.job_brief(
+            session, await catalog_profile_jobs.active_job(session, source.id)),
     }
 
 
@@ -313,20 +347,152 @@ async def preview_catalog_import(source_id: str, payload: CatalogImportIn,
 @router.post("/{source_id}/catalog/import")
 async def import_catalog(source_id: str, payload: CatalogImportIn, x_actor: str | None = Header(default=None),
                          session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """导入：规则同预览，逐表写入（乐观锁），返回同样形状的报告和每张表写入后的版本。有排队或进行中的起草任务
-    409 catalog_draft_busy；文件格式不对 422；没有表结构 409。"""
+    """导入：规则同预览，逐表写入（乐观锁），返回同样形状的报告和每张表写入后的版本。有排队或进行中的起草任务（或正在
+    同步起草、导入）409 catalog_draft_busy，有剖析任务 409 profile_busy（说法的最后一句说「再导入」）；文件格式不对 422；
+    没有表结构 409。"""
     row, source = await _import_source(session, source_id)
     try:
-        await catalog_jobs.ensure_idle(session, row)
+        async with catalog_jobs.import_write(session, row):
+            report = await catalog_transfer.run_import(session, row, source, payload.content,
+                                                       include_guidance=payload.include_guidance,
+                                                       actor=actor_of(x_actor))
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
-    try:
-        report = await catalog_transfer.run_import(session, row, source, payload.content,
-                                                   include_guidance=payload.include_guidance,
-                                                   actor=actor_of(x_actor))
+    except catalog_profile_jobs.ProfileBusy as e:
+        raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
     except catalog_transfer.TransferInvalid as e:
         raise HTTPException(422, str(e)) from e
     return report.as_dict()
+
+
+# ---- 后台剖析任务（同样登记在 GET /catalog/{table} 前面：active、latest 要先于 /profile-jobs/{job_id}）
+
+
+async def _profile_source(session: AsyncSession, source_id: str) -> tuple[DataSource, Any]:
+    """建剖析任务、重试之前的几道门，409 都带机读码（界面按它分情况给下一步，不从原话里认）：未开启 profile_disabled、
+    数据源停用 datasource_inactive、快照登记被改动 snapshot_tampered、没有表结构 schema_missing。返回 (数据源记录,
+    读表结构用的源)。"""
+    row = await _source_row(session, source_id)
+    try:
+        catalog_profile.ensure_enabled(row)
+    except catalog_profile.ProfileDisabled as e:
+        raise CodedHTTPException(409, str(e), e.code) from e
+    try:
+        source = await table_versions.resolve_source(session, row)
+    except SnapshotTampered as e:          # 快照清单对不上（SnapshotManifestMismatch 同时是 SnapshotMissing）
+        raise CodedHTTPException(409, str(e), SNAPSHOT_TAMPERED) from e
+    except table_versions.SnapshotMissing as e:
+        raise HTTPException(409, str(e)) from e
+    cache = source.schema_cache or {}
+    if not cache.get("tables"):
+        raise CodedHTTPException(409, f"{introspect.why_empty(cache)}，无法进行数据剖析。请先在数据源卡片上点「探查结构」",
+                                 SCHEMA_MISSING)
+    return row, source
+
+
+async def _start_profile(session: AsyncSession, row: DataSource, source: Any, *, tables: list[str] | None,
+                         scope: str, actor: str | None, retry_of: str | None = None) -> dict[str, Any]:
+    try:
+        job, tasks = await catalog_profile_jobs.create_job(
+            session, row, source, tables=tables, scope=scope, settings=catalog_profile.ensure_enabled(row),
+            actor=actor, retry_of=retry_of)
+    except catalog_profile_jobs.ProfileBusy as e:
+        raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
+    except catalog_profile_jobs.ProfileNothing as e:
+        raise CodedHTTPException(409, str(e), PROFILE_NOTHING) from e
+    catalog_profile_jobs.manager.start(job.id)
+    return {"job": catalog_profile_jobs.job_dict(job, tasks,
+                                                 waiting_for=await catalog_profile_jobs.waiting_for(session, job))}
+
+
+@router.post("/{source_id}/catalog/profile-jobs", status_code=202)
+async def create_profile_job(source_id: str, payload: ProfileJobIn, x_actor: str | None = Header(default=None),
+                             session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """建后台剖析任务，马上返回（202，任务是排队中）。tables 非空时范围是 selected（表结构里没有、视图、没有可剖析的项照样
+    建进任务、状态 skipped），否则按 scope（缺省 needed）挑。同源有排队或进行中的剖析任务 409 profile_busy（说清进行到第几张；
+    界面改去 GET /profile-jobs/active 显示那一个），按范围挑出 0 张表 409 profile_nothing；同源有起草任务时照建，排在它后面
+    （waiting_for = "draft"），起草结束后自动开始。"""
+    if payload.tables and len(payload.tables) > catalog_profile_jobs.MAX_TABLES:
+        raise HTTPException(422, f"一次最多剖析 {catalog_profile_jobs.MAX_TABLES} 张表，当前 {len(payload.tables)} 张，"
+                                 "请分几次剖析")
+    row, source = await _profile_source(session, source_id)
+    tables = [str(t) for t in payload.tables] if payload.tables else None
+    scope = "selected" if tables else (payload.scope or "needed")
+    return await _start_profile(session, row, source, tables=tables, scope=scope, actor=actor_of(x_actor))
+
+
+@router.get("/{source_id}/catalog/profile-jobs/active")
+async def active_profile_job(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """排队或进行中的那个剖析任务，没有是 null。"""
+    row = await _source_row(session, source_id)
+    return {"job": await catalog_profile_jobs.job_out(session, await catalog_profile_jobs.active_job(session, row.id))}
+
+
+@router.get("/{source_id}/catalog/profile-jobs/latest")
+async def latest_profile_job(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """最近建的一个剖析任务（任何状态），没有是 null。"""
+    row = await _source_row(session, source_id)
+    return {"job": await catalog_profile_jobs.job_out(session, await catalog_profile_jobs.latest_job(session, row.id))}
+
+
+async def _profile_job_or_404(session: AsyncSession, source_id: str, job_id: str) -> tuple[DataSource, Any]:
+    row = await _source_row(session, source_id)
+    job = await catalog_profile_jobs.load(session, row.id, job_id)
+    if job is None:
+        raise HTTPException(404, "剖析任务不存在，可能属于别的数据源，已随数据源删除，或者超过保留数被清理了")
+    return row, job
+
+
+@router.get("/{source_id}/catalog/profile-jobs/{job_id}")
+async def get_profile_job(source_id: str, job_id: str,
+                          session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    _, job = await _profile_job_or_404(session, source_id, job_id)
+    return {"job": await catalog_profile_jobs.job_out(session, job)}
+
+
+@router.get("/{source_id}/catalog/profile-jobs/{job_id}/tasks/{seq}")
+async def get_profile_task(source_id: str, job_id: str, seq: int,
+                           session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """剖析任务里的一张表（按剖析顺序的序号）：检查项、发现、跳过的项、日期范围、发过的查询（字面量已换成「?」）。"""
+    _, job = await _profile_job_or_404(session, source_id, job_id)
+    task = await catalog_profile_jobs.load_task(session, job, seq)
+    if task is None:
+        raise HTTPException(404, "这次剖析里没有这一张表")
+    return {"task": catalog_profile_jobs.task_detail(job, task)}
+
+
+@router.post("/{source_id}/catalog/profile-jobs/{job_id}/cancel")
+async def cancel_profile_job(source_id: str, job_id: str,
+                             session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """停止：排队的直接停止；进行中的不再等正在跑的那条查询（数据库按单条时限截止它），这张表做完的项照常写进目录、没做的
+    保留旧结论，后面的表记停止。已经结束的 409 catalog_profile_finished。返回停止之后的任务。"""
+    row, job = await _profile_job_or_404(session, source_id, job_id)
+    owner = row.id
+    try:
+        await catalog_profile_jobs.cancel(session, job)
+    except catalog_profile_jobs.ProfileFinished as e:
+        raise CodedHTTPException(409, str(e), CATALOG_PROFILE_FINISHED) from e
+    session.expire_all()                  # 后台在别的会话里收的尾：重新读
+    return {"job": await catalog_profile_jobs.job_out(session, await catalog_profile_jobs.load(session, owner, job_id))}
+
+
+@router.post("/{source_id}/catalog/profile-jobs/{job_id}/retry", status_code=202)
+async def retry_profile_job(source_id: str, job_id: str, x_actor: str | None = Header(default=None),
+                            session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """重试：新任务，只含原任务里 failed、partial、cancelled 的表（按原来的顺序），范围 selected，设置取数据源当前的。
+    同源有排队或进行中的剖析任务 409 profile_busy；没有可重试的表 422；开始不了的几种情况同建任务。"""
+    _, old = await _profile_job_or_404(session, source_id, job_id)
+    row, source = await _profile_source(session, source_id)
+    try:
+        await catalog_profile_jobs.ensure_free(session, row)
+    except catalog_profile_jobs.ProfileBusy as e:
+        raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
+    try:
+        tables = await catalog_profile_jobs.retry_tables(session, old)
+    except catalog_profile_jobs.NothingToRetry as e:
+        raise HTTPException(422, str(e)) from e
+    return await _start_profile(session, row, source, tables=tables, scope="selected", actor=actor_of(x_actor),
+                                retry_of=old.id)
 
 
 @router.get("/{source_id}/catalog/{table}")
@@ -398,7 +564,7 @@ async def create_draft_job(source_id: str, payload: DraftJobIn, x_actor: str | N
         raise HTTPException(422, str(e)) from e
     row, source = await _resolved(session, source_id)
     try:
-        await catalog_jobs.ensure_idle(session, row)
+        await catalog_jobs.ensure_draft_free(session, row)
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     cache = source.schema_cache or {}
@@ -412,7 +578,7 @@ async def create_draft_job(source_id: str, payload: DraftJobIn, x_actor: str | N
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     catalog_jobs.manager.start(job.id)
-    return {"job": catalog_jobs.job_dict(job, tasks)}
+    return {"job": catalog_jobs.job_dict(job, tasks, waiting_for=await catalog_jobs.waiting_for(session, job))}
 
 
 @router.get("/{source_id}/catalog/draft-jobs/active")
@@ -466,7 +632,7 @@ async def retry_draft_job(source_id: str, job_id: str, x_actor: str | None = Hea
     _, old = await _job_or_404(session, source_id, job_id)
     row, source = await _resolved(session, source_id)
     try:
-        await catalog_jobs.ensure_idle(session, row)
+        await catalog_jobs.ensure_draft_free(session, row)
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     try:
@@ -484,7 +650,7 @@ async def retry_draft_job(source_id: str, job_id: str, x_actor: str | None = Hea
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     catalog_jobs.manager.start(job.id)
-    return {"job": catalog_jobs.job_dict(job, tasks)}
+    return {"job": catalog_jobs.job_dict(job, tasks, waiting_for=await catalog_jobs.waiting_for(session, job))}
 
 
 @router.put("/{source_id}/catalog/{table}")
@@ -529,6 +695,8 @@ async def draft_catalog(source_id: str, payload: CatalogDraftIn,
                                                  guidance=catalog_jobs.guidance_of(row))
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
+    except catalog_profile_jobs.ProfileBusy as e:
+        raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
     rows = [{"table_name": r.table, "added": r.added, "updated": r.updated, "removed": r.removed,
              "version": r.version, "error": r.error, "model_error": r.model_error, "model_items": r.model_items}
             for r in report.tables]
@@ -538,71 +706,6 @@ async def draft_catalog(source_id: str, payload: CatalogDraftIn,
         "model_used": report.model_used,
         "model": report.model or None,
         "model_error": report.model_error,
-    }
-
-
-def _profile_table_out(t: catalog_profile.TableProfile) -> dict[str, Any]:
-    return {
-        "table_name": t.table,
-        "queries": t.queries,
-        "row_estimate": t.row_estimate.to_dict() if t.row_estimate else None,
-        "findings": t.findings,
-        "skipped": [s.to_dict() for s in t.skipped],
-        "date_ranges": t.date_ranges,
-        "added": t.added,
-        "updated": t.updated,
-        "removed": t.removed,
-        "version": t.version,
-        "error": t.error,
-    }
-
-
-@router.post("/{source_id}/catalog/profile")
-async def profile_catalog_tables(source_id: str, payload: CatalogProfileIn,
-                                 x_actor: str | None = Header(default=None),
-                                 session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """同步剖析。返回每张表用了几条查询、写进目录的发现、跳过了什么及原因。
-
-    默认关闭：数据源设置里没开启数据剖析、数据源停用，409；同一个数据源已经在剖析，409。
-    """
-    row, source = await _resolved(session, source_id)
-    # 409 都带机读码（api/coded.py），界面按它分五种情况给下一步，不从原话里认
-    try:
-        catalog_profile.ensure_enabled(row)
-    except catalog_profile.ProfileDisabled as e:
-        raise CodedHTTPException(409, str(e), e.code) from e
-    cache = source.schema_cache or {}
-    if not cache.get("tables"):
-        raise CodedHTTPException(409, f"{introspect.why_empty(cache)}，无法进行数据剖析。请先在数据源卡片上点「探查结构」",
-                                 SCHEMA_MISSING)
-    actor = actor_of(x_actor)
-    try:
-        report = await catalog_profile.profile_catalog(session, row, source, tables=payload.tables or None,
-                                                       actor=actor)
-    except catalog_profile.ProfileDisabled as e:
-        raise CodedHTTPException(409, str(e), e.code) from e
-    except catalog_profile.ProfileBusy as e:
-        raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
-    except SnapshotTampered as e:
-        raise CodedHTTPException(409, str(e), SNAPSHOT_TAMPERED) from e
-    rows = [_profile_table_out(t) for t in report.tables]
-    note = None
-    if not rows and report.empty_tables:
-        note = (f"有待核对关联关系的 {len(report.empty_tables)} 张表都是空表，没有可以核实的数据。"
-                "请在数据有了之后再剖析，或指定要剖析的表")
-    elif not rows:
-        note = "目录里还没有待核实的关联关系，请先起草数据目录，或指定要剖析的表"
-    return {
-        "profiled_at": report.profiled_at,
-        "actor": actor,
-        "settings": report.settings.to_dict(),
-        "queries_used": report.queries_used,
-        "stopped": report.stopped,
-        "tables": rows,
-        "total": {k: sum(r[k] for r in rows) for k in ("added", "updated", "removed")},
-        # 不指定表时挑表途中确知是空表、跳过了的表（指定了表时总是空列表）
-        "empty_tables": report.empty_tables,
-        "note": note,
     }
 
 

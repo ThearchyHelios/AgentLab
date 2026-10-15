@@ -23,7 +23,7 @@ from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
 from app.data import catalog as data_catalog
-from app.data.catalog_profile import profile_settings_rejection
+from app.data.catalog_profile import profile_settings_rejection, without_legacy
 from app.data import introspect as introspect_mod
 from app.data import table_versions
 from app.data.engine import (
@@ -465,12 +465,13 @@ async def create_source(
     )).scalar_one_or_none()
     if exists:
         raise HTTPException(409, f"已存在名为「{payload.name}」的数据源，请换一个标识")
-    _refuse_bad_options(payload.options)
+    options = without_legacy(payload.options) or {}
+    _refuse_bad_options(options)
     _refuse_reserved(payload.kind, payload.database)
 
     row = DataSource(
         **payload.model_dump(exclude={"password", "options"}),
-        options=_with_managed(payload.options, None),
+        options=_with_managed(options, None),
         password=encrypt(payload.password),
     )
     _settle_oracle(row, None, None)
@@ -519,6 +520,8 @@ async def update_source(
         # 升级前就指向上传目录的手工源：启动时已强制只读（table_versions.startup），不许再改回可写
         raise HTTPException(422, _UPLOAD_DIR_READONLY)
     if "options" in data:
+        # 剖析设置里还带着以前按整次剖析算的预算（老页面提交的）：只摘掉，不报错（catalog_profile.LEGACY_KEYS）
+        data["options"] = without_legacy(data["options"])
         _refuse_bad_options(data["options"])
         data["options"] = _with_managed(data["options"] or {}, row.options)
     if "password" in data:

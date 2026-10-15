@@ -14,6 +14,8 @@ import type { ProfileForm } from './profile'
 // 数据剖析的设置：开关、五项预算、风险说明。数据源编辑框里是其中一段；导入表格的源没有编辑框，数据目录页在
 // 剖析被拒（未开启）时也要就地打开它，所以另有一个只改这一项的弹窗（options 的其余键原样带上）。
 // 剖析会对业务库发查询，开关默认关着；开启后五项预算才展开，风险说明写的是此刻填的数。
+// 预算按表算：每张表最多查询数、每张表时长上限（用完只停这张表），另有单条查询时限、抽样键值数、整表统计行数上限；
+// 没有整次剖析的总量上限（任务自己在连续失败、多数超时时停下）。
 // ===========================================================================
 
 /** 保存被拒时的落点：某一项，或者整段（认不出是哪一项） */
@@ -57,7 +59,7 @@ export function ProfileSettingsSection({ idPrefix, form, onChange, serverError }
             <p className="flex items-start gap-1.5 rounded-md px-2 py-1.5 text-2xs leading-relaxed text-dim" data-profile-risk=""
                style={{ background: 'var(--st-waiting-soft)' }}>
               <ShieldAlert size={12} className="mt-px shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden />
-              <span>{PT.risk(s.max_queries, s.query_timeout_s, s.max_total_s)}</span>
+              <span>{PT.risk(s.table_max_queries, s.table_max_s, s.query_timeout_s)}</span>
             </p>
           )}
           <div className="grid gap-3 sm:grid-cols-2">

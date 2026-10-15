@@ -2839,6 +2839,18 @@ export interface CatalogTableRow {
   updated_by: string | null
   /** 这张表最近一次起草任务里的那一项（任务还在进行就是进行中的状态）；没起草过为 null。老服务端没有这个键 */
   last_draft?: CatalogLastDraft | null
+  /** 这张表最近一次剖析（任务还在进行就是进行中的状态）；没剖析过为 null。老服务端没有这个键 */
+  last_profile?: CatalogLastProfile | null
+  /** 按「需要剖析」的口径这张表要不要剖析（表结构里、不是视图、有可剖析的项，且满足 profile_due_reason 之一） */
+  profile_due?: boolean
+  /**
+   * 为什么需要剖析：never 从没剖析过；unfinished 最近一次剖析没做完（部分完成、失败、已停止）；new_relations 目录里有待核实的
+   * 关系不在最近一次剖析的检查项里；new_checks 最近一次剖析之后多出了码值、日期检查（某一列被记成了状态类、日期列变了）。
+   * 不需要时为 null
+   */
+  profile_due_reason?: CatalogProfileDueReason | null
+  /** 按当前目录和表结构这张表要做几项检查；0 表示没有可剖析的项（视图为 0） */
+  profile_checks?: number
 }
 
 /** GET /datasources/{id}/catalog */
@@ -2857,6 +2869,8 @@ export interface CatalogList {
   guidance?: string | null
   /** 排队或进行中的起草任务（页面据此显示进度）；没有为 null。老服务端没有这一项 */
   active_job?: CatalogActiveDraftJob | null
+  /** 排队或进行中的剖析任务（页面据此显示进度）；没有为 null。老服务端没有这一项 */
+  active_profile_job?: CatalogActiveProfileJob | null
 }
 
 /** 表结构里的一列 */
@@ -2899,6 +2913,8 @@ export interface CatalogDetail {
   structure: CatalogStructure | null
   system_notes: boolean
   usage: number
+  /** 这张表最近一次剖析的完整结果（含检查清单、发现、发过的查询；任务还在进行就是进行中的状态）；没剖析过为 null */
+  last_profile?: CatalogProfileTaskDetail | null
 }
 
 /** 单项审阅：确认、驳回、撤销审阅（回到来源的初始状态；人工填写的项直接删掉） */
@@ -3027,6 +3043,11 @@ export interface CatalogDraftJob {
   notice?: string | null
   /** 任务整体出错的原因 */
   error: string | null
+  /**
+   * 排在同一个数据源的剖析任务后面（起草和剖析同源串行，按建立顺序）：剖析结束后自动开始。不在等时为 null；
+   * 老服务端没有这个键
+   */
+  waiting_for?: 'profile' | null
   tasks: CatalogDraftTask[]
 }
 
@@ -3036,6 +3057,8 @@ export interface CatalogActiveDraftJob {
   status: CatalogDraftJobStatus
   total: number
   done: number
+  /** 排在剖析任务后面（同 CatalogDraftJob.waiting_for） */
+  waiting_for?: 'profile' | null
 }
 
 /** 清单一行上这张表最近一次起草的结果 */
@@ -3303,26 +3326,68 @@ export interface CatalogImpact {
 }
 
 // ===========================================================================
-// 数据剖析（后端 app/data/catalog_profile.py）：对业务库发少量只读查询，核实推断的关联关系、取码值候选、
-// 提议业务日期。默认关闭，按数据源在 options.catalog_profile 里开启。
+// 数据剖析（后端 app/data/catalog_profile.py、catalog_profile_jobs.py）：对业务库发少量只读查询，核实推断的关联关系、
+// 取码值候选、提议业务日期。默认关闭，按数据源在 options.catalog_profile 里开启。
+// 剖析是服务端的后台任务（/api/datasources/{id}/catalog/profile-jobs）：逐表剖析，每张表有自己的查询次数和时长预算，
+// 每张表一结束就写进目录；查询一条一条发，可以随时停止。和同一个数据源的起草任务按建立顺序排队，一个结束了另一个才开始。
+// 服务重启时还没结束的任务记 interrupted，不自动续跑（由人点「重试没做完的表」）。
 // ===========================================================================
 
 /** 剖析设置里的数值项 */
-export type CatalogProfileNumberKey = 'max_queries' | 'query_timeout_s' | 'sample_size' | 'max_scan_rows' | 'max_total_s'
+export type CatalogProfileNumberKey = 'table_max_queries' | 'table_max_s' | 'query_timeout_s' | 'sample_size' | 'max_scan_rows'
 
-/** 一个数据源的剖析设置（服务端 ProfileSettings.to_dict） */
+/** 一个数据源的剖析设置（服务端 ProfileSettings.to_dict）；任务里的 settings 是建任务时的快照 */
 export interface CatalogProfileSettings {
   enabled: boolean
-  max_queries: number
+  /** 每张表最多发几条查询，用完只停这张表 */
+  table_max_queries: number
+  /** 每张表最多剖析几秒，到时只停这张表 */
+  table_max_s: number
+  /** 单条查询时限（不超过数据源自身的查询时限，也不超过这张表剩下的时长） */
   query_timeout_s: number
   sample_size: number
   /** 0 表示一律不做整表统计 */
   max_scan_rows: number
-  max_total_s: number
 }
 
-/** 整次剖析中途停下的原因：查询次数用完、总时长用完、连续多条查询失败 */
-export type CatalogProfileStop = 'budget' | 'deadline' | 'failed'
+/** 为什么需要剖析（GET /catalog 每行的 profile_due_reason） */
+export type CatalogProfileDueReason = 'never' | 'unfinished' | 'new_relations' | 'new_checks'
+
+/** 剖析的范围：selected 指定的表；needed 需要剖析的表；all 全部可剖析的表（不含视图） */
+export type CatalogProfileScope = 'selected' | 'needed' | 'all'
+
+/**
+ * 剖析任务的状态：排队、进行中、完成、部分完成（有失败、部分完成、已停止的表）、失败（任务整体出错）、已停止（使用者停止）、
+ * 服务重启中断。和起草任务同一套
+ */
+export type CatalogProfileJobStatus = CatalogDraftJobStatus
+
+/**
+ * 任务里一张表的状态。ok：每项检查都有结论；partial：有项因为运行原因没查成（unfinished）；failed：写入一直冲突或整张表出错；
+ * skipped：视图、表结构里没有、空表、没有可剖析的项；cancelled：停止、止损、服务重启时还没开始、没做完
+ */
+export type CatalogProfileTaskStatus = CatalogDraftTaskStatus
+
+/** 跳过一项的原因（CatalogProfileSkip.reason、检查项的 reason） */
+export type CatalogProfileSkipReason = 'budget' | 'deadline' | 'failed' | 'timeout' | 'error' | 'rejected' | 'slow' | 'cancelled'
+  | 'masked' | 'too_large' | 'view' | 'unsupported' | 'no_data' | 'missing' | 'high_cardinality' | 'nothing'
+
+/** 一类检查：关联关系、码值、日期列 */
+export type CatalogProfileCheckKind = 'relation' | 'codes' | 'date'
+
+/** 发现的合计（任务里是逐表合计） */
+export interface CatalogProfileSummary {
+  /** 有结论的关系条数 */
+  relations_checked: number
+  /** 其中状态为已验证的 */
+  relations_verified: number
+  /** 取到码值候选的列数 */
+  codes: number
+  /** 这些码值里含义还空着的个数之和 */
+  codes_pending: number
+  /** 提议了业务日期的表数（逐表时 0 或 1） */
+  business_dates: number
+}
 
 /** 一张表的行数：stats 数据库的统计信息（估算）；count 数到上限为止；unknown 没能得到 */
 export interface CatalogProfileSize {
@@ -3386,43 +3451,146 @@ export interface CatalogProfileSkip {
   kind: string
   target: string
   path: string | null
-  /** budget / deadline / failed / timeout / error / rejected / masked / too_large / view / unsupported / no_data / missing / high_cardinality */
-  reason: string
+  /**
+   * 运行原因没查成（计入 unfinished、使表成为部分完成）：budget 这张表的查询次数用完、deadline 这张表的时长用完、failed 连续失败
+   * 止损、timeout、error、rejected 未通过只读守卫、slow 超时比例止损、cancelled 停止或服务重启。
+   * 按规则不查（不算没做完）：masked、too_large、view、unsupported、no_data、missing、high_cardinality、nothing 没有可剖析的项
+   */
+  reason: CatalogProfileSkipReason | (string & {})
   detail: string
 }
 
-export interface CatalogProfileTable {
+/** 任务里的一张表（按 seq） */
+export interface CatalogProfileTaskRow {
+  seq: number
   table_name: string
+  status: CatalogProfileTaskStatus
+  checks_total: number
+  /** 结束了的项（含跳过的） */
+  checks_done: number
+  /** 每类检查 [结束了的, 一共]；这类没有检查时是 [0, 0] */
+  checks_by_kind: Record<CatalogProfileCheckKind, [number, number]>
+  /** 进行中时正在做哪一项的整句（如「正在核对 orders.customer_id → customers.id」）；其余时候 null */
+  current: string | null
   queries: number
+  elapsed_ms: number
   row_estimate: CatalogProfileSize | null
-  findings: CatalogProfileFinding[]
-  skipped: CatalogProfileSkip[]
-  /** 日期类列的取值范围 */
-  date_ranges: { column: string; min: string; max: string }[]
+  summary: CatalogProfileSummary
+  /** 跳过的项数 */
+  skipped_count: number
+  /** 其中因为运行原因没查成的项数 */
+  unfinished: number
   added: number
   updated: number
   removed: number
   version: number
-  /** 这张表没剖析（表结构里没有）或结果没写进去（写入一直冲突） */
+  /** 整张表的原因：表结构里没有、视图、空表、没有可剖析的项、写入一直冲突、停止 / 中断 / 止损 */
   error: string | null
+  started_at: string | null
+  finished_at: string | null
 }
 
-/** POST /datasources/{id}/catalog/profile */
-export interface CatalogProfileOut {
-  profiled_at: string
-  actor: string | null
+/** 检查清单里的一项 */
+export interface CatalogProfileCheck {
+  kind: CatalogProfileCheckKind
+  /** 哪一项：关系写「customer_id → customers.id」，码值、日期写列名 */
+  target: string
+  /** 审阅路径；没有为 null */
+  path: string | null
+  state: 'pending' | 'running' | 'done' | 'skipped'
+  /** 跳过的原因（同 CatalogProfileSkip.reason）；没跳过为 null */
+  reason: CatalogProfileSkipReason | (string & {}) | null
+  /** 可以直接显示的整句（结论或跳过的原因）；没有为 null */
+  detail: string | null
+  queries: number
+}
+
+/** 发过的一条查询。sql 的字面量都换成了 ?（IN 列表里抽到的键值不留在 AgentLab 的库里） */
+export interface CatalogProfileQuery {
+  at: string
+  kind: 'row_estimate' | CatalogProfileCheckKind
+  target: string
+  sql: string
+  ms: number
+  /** 返回的行数；没返回（超时、出错、守卫拒）时为 null */
+  rows: number | null
+  outcome: 'ok' | 'timeout' | 'error' | 'rejected'
+  /** 超时、出错、守卫拒时的原因 */
+  detail: string | null
+}
+
+/** GET /profile-jobs/{id}/tasks/{seq}：一张表的完整结果；GET /catalog/{table} 的 last_profile 也是这个形状 */
+export interface CatalogProfileTaskDetail extends CatalogProfileTaskRow {
+  job_id: string
+  job_status: CatalogProfileJobStatus
+  created_by: string | null
+  checks: CatalogProfileCheck[]
+  findings: CatalogProfileFinding[]
+  skipped: CatalogProfileSkip[]
+  /** 日期类列的取值范围 */
+  date_ranges: { column: string; min: string; max: string }[]
+  query_log: CatalogProfileQuery[]
+}
+
+/** 一次剖析任务 */
+export interface CatalogProfileJob {
+  id: string
+  source_id: string
+  status: CatalogProfileJobStatus
+  scope: CatalogProfileScope
+  /** 建任务时的剖析设置快照 */
   settings: CatalogProfileSettings
-  queries_used: number
-  stopped: CatalogProfileStop | null
-  tables: CatalogProfileTable[]
-  total: { added: number; updated: number; removed: number }
-  /**
-   * 不指定表时，挑表途中估过行数、确知是空表而跳过的表（老后端没有这个键；指定了表时是空列表）。
-   * 估行数的查询算在 queries_used 里，不算在各表的 queries 里
-   */
-  empty_tables?: string[]
-  /** 一张表都没有剖析时的说明 */
-  note: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  /** 谁建的（X-Actor） */
+  created_by: string | null
+  /** 重试建的任务记着原任务的 id */
+  retry_of: string | null
+  /** 排在同一个数据源的起草任务后面：起草结束后自动开始。不在等时为 null */
+  waiting_for: 'draft' | null
+  total: number
+  /** 已结束的表数 */
+  done: number
+  counts: Record<CatalogProfileTaskStatus, number>
+  /** 整个任务发出的查询数、其中超时的、失败的 */
+  queries: number
+  timeouts: number
+  errors: number
+  /** 任务级止损停下的原因：failed 连续 3 条查询失败；slow 最近 10 条里 7 条超时。没停为 null */
+  stop_reason: 'failed' | 'slow' | null
+  /** 最近查询多数超时时的提醒（一句中文）；好转后服务端清掉 */
+  notice: string | null
+  /** 任务整体出错或止损的整句原因 */
+  error: string | null
+  added: number
+  updated: number
+  removed: number
+  summary: CatalogProfileSummary
+  tasks: CatalogProfileTaskRow[]
+}
+
+/** 清单一行上这张表最近一次剖析 */
+export interface CatalogLastProfile {
+  job_id: string
+  seq: number
+  status: CatalogProfileTaskStatus
+  started_at: string | null
+  finished_at: string | null
+  summary: CatalogProfileSummary
+  skipped_count: number
+  unfinished: number
+  error: string | null
+  row_estimate: CatalogProfileSize | null
+}
+
+/** 目录清单顶上的进行中剖析任务（GET /catalog 的 active_profile_job） */
+export interface CatalogActiveProfileJob {
+  id: string
+  status: CatalogProfileJobStatus
+  total: number
+  done: number
+  waiting_for: 'draft' | null
 }
 
 // ===========================================================================

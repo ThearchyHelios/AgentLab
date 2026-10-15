@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
-  AlertTriangle, ArrowLeft, ChevronLeft, ChevronRight, GitBranch, Info, ListChecks, Lock, MessagesSquare, Pencil, Plus, RotateCw, Search, Sparkles, X,
+  AlertTriangle, ArrowLeft, ChevronLeft, ChevronRight, GitBranch, Info, ListChecks, Lock, MessagesSquare, Pencil, Plus, RotateCw, ScanSearch, Search,
+  Sparkles, X,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
 import type {
-  CatalogBusinessDate, CatalogCardinality, CatalogDetail, CatalogItem, CatalogRelation, CatalogReviewAction, CatalogTableKind,
+  CatalogBusinessDate, CatalogCardinality, CatalogDetail, CatalogItem, CatalogProfileJob, CatalogRelation, CatalogReviewAction, CatalogTableKind,
   CatalogTableRow,
 } from '../../types'
 import { DeleteButton, EmptyState, ErrorState, Notice, Skeleton, Spinner, confirmDialog, toast } from '../../components/ui'
@@ -15,7 +16,7 @@ import { formatDateTime, formatNumber, formatTime } from '../../lib/format'
 import {
   CATALOG_ASSISTANT_TEXT as AT, CATALOG_CARDINALITY_LABEL, CATALOG_DRAFT_TEXT as DT, CATALOG_IMPACT_TEXT, CATALOG_KIND_HINT, CATALOG_KIND_LABEL,
   CATALOG_REVIEW_TEXT as RT, CATALOG_TABLE_FIELD_HINT, CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT,
-  CATALOG_USAGE_TEXT, CODES_TEXT as KT,
+  CATALOG_USAGE_TEXT, CODES_TEXT as KT, PROFILE_TEXT as PT,
 } from '../../lib/terms'
 import { CatalogImpactList } from '../../components/CatalogImpact'
 import {
@@ -26,8 +27,10 @@ import type { ReviewTarget } from './parts'
 import { ColumnTable, NARROW, Value, pendingCodes } from './ColumnTable'
 import type { ColumnModel } from './ColumnTable'
 import { CodesDialog } from './CodesDialog'
-import { coverageText } from './profile'
-import { lastBlankInfo, taskReason } from './draftJob'
+import { coverageText, isProfilable, profileBlockOf } from './profile'
+import { isJobActive, lastBlankInfo, taskReason } from './draftJob'
+import { isProfileBusy } from './profileJob'
+import { PROFILE_TASK_ICON, ProfileTaskBody } from './ProfileDialog'
 import { TableAssistant } from './TableAssistant'
 import { TableUsageList } from './TableUsage'
 import {
@@ -42,6 +45,9 @@ import type { CodesItem, ColumnField, EditForm, RelationDraft, TableField, Table
 //
 // 写操作都带读到的版本。409 说明别人刚改过：不静默覆盖，横幅写明并给「重新载入」；编辑中的修改留着，重新载入前
 // 先问一句。编辑中换表、离开页面走全站的离开前确认。
+//
+// 「数据剖析」一节：这张表上次剖析的时间、发起人、所属任务、行数估算和来源、日期范围、发现、跳过的项、发过的查询；
+// 「剖析这张表」建只含这张表的剖析任务（没开剖析时引到剖析设置；已有剖析任务时写明它到哪了、这张表在不在里面）。
 // ===========================================================================
 
 const KINDS = Object.keys(CATALOG_KIND_LABEL) as CatalogTableKind[]
@@ -62,7 +68,7 @@ type Conflict = 'edit' | 'review'
 
 export function TableDetail({
   sourceId, table, rows, drafted, fillCodes, onFillDone, prev, next, onOpen, onBack, onDetail, draftBusy = false, onRedraft, onDraftGuidance,
-  profileEnabled = false, focusPath = null, usageOpen = false,
+  profileEnabled = false, focusPath = null, usageOpen = false, profile,
 }: {
   sourceId: string
   table: string
@@ -99,6 +105,8 @@ export function TableDetail({
   focusPath?: string | null
   /** 「用过这张表的运行」直接取（从审阅队列打开时） */
   usageOpen?: boolean
+  /** 数据剖析：页面跟着的剖析任务、建只含这张表的任务、打开剖析设置和剖析对话框 */
+  profile?: TableProfileProps
 }) {
   const [detail, setDetail] = useState<CatalogDetail | null>(null)
   const [loadError, setLoadError] = useState<unknown>(null)
@@ -620,6 +628,11 @@ export function TableDetail({
                               focusPath={focusPath} />}
           </section>
 
+          {profile && (
+            <ProfileSection table={detail.table_name} detail={detail} row={rows.find((r) => r.table_name === table) ?? null}
+                            enabled={profileEnabled} profile={profile} onFillCodes={detail.in_schema ? fillCodesOf : undefined} />
+          )}
+
           <section aria-labelledby="catalog-sec-impact" data-catalog-section="impact">
             <div className="mb-2 flex flex-wrap items-baseline gap-2">
               <h3 id="catalog-sec-impact" className="text-xs font-semibold outline-none" tabIndex={-1}>{CATALOG_IMPACT_TEXT.title}</h3>
@@ -1035,5 +1048,154 @@ function RelationEditor({ drafts, initial, problems, rows, onChange }: {
         <Plus size={11} aria-hidden /> {CT.addRelation}
       </button>
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 数据剖析
+// ---------------------------------------------------------------------------
+
+export interface TableProfileProps {
+  /** 页面跟着的剖析任务（进行中的、刚结束的） */
+  job: CatalogProfileJob | null
+  /** 建只含这张表的剖析任务；409、422 照原样抛 */
+  onStart: (table: string) => Promise<CatalogProfileJob>
+  /** 正忙（409）时取进行中的那一个，页面改跟着它 */
+  onShowActive: () => Promise<CatalogProfileJob | null>
+  /** 打开这个数据源的剖析设置 */
+  onSettings: () => void
+  /** 打开剖析对话框，显示这个任务（页面跟着的那一个，或者按编号取来） */
+  onOpenJob: (jobId: string | null) => void
+}
+
+/**
+ * 表详情里的「数据剖析」一节。上次剖析的结论在服务端的 last_profile（GET /catalog/{table}，任务还在进行就是进行中的状态），
+ * 页面跟着的任务里这张表在排队、剖析中时以任务为准（比载入详情时新）；这张表剖析完，页面会重新载入详情
+ */
+function ProfileSection({ table, detail, row, enabled, profile, onFillCodes }: {
+  table: string
+  detail: CatalogDetail
+  row: CatalogTableRow | null
+  enabled: boolean
+  profile: TableProfileProps
+  onFillCodes?: (column: string) => void
+}) {
+  const [starting, setStarting] = useState(false)
+  /** 开始不了（409）：服务端的原话、正在进行的那个任务里有没有这张表 */
+  const [blocked, setBlocked] = useState<{ kind: string; message: string; where: string } | null>(null)
+  useEffect(() => { setBlocked(null) }, [table])
+  const last = detail.last_profile ?? null
+  const job = profile.job
+  const live = job && isJobActive(job) ? job.tasks.find((t) => t.table_name === table) ?? null : null
+  const liveActive = live && (live.status === 'pending' || live.status === 'running') ? live : null
+  const isView = !!detail.structure?.is_view || !!row?.is_view
+  const profilable = detail.in_schema && !isView && (row ? isProfilable(row) : true)
+  const canStart = enabled && profilable && !liveActive && !starting
+  // 上次剖析所在的任务：正有别的剖析任务在进行时不去换（页面只跟着一个任务，换了就看不到进行中的那个了）
+  const canOpenJob = !!last && (!job || !isJobActive(job) || job.id === last.job_id)
+
+  const start = async () => {
+    setStarting(true)
+    setBlocked(null)
+    try {
+      const next = await profile.onStart(table)
+      const text = next.status === 'queued' && next.waiting_for === 'draft' ? PT.profileThisQueued(table) : PT.profileThisStarted(table)
+      toast.ok(text, { action: { label: PT.viewProgress, onClick: () => profile.onOpenJob(next.id) } })
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        const kind = profileBlockOf(e)
+        let where = ''
+        if (isProfileBusy(e)) {
+          // 正忙：写清进行中的那个任务到哪了、这张表在不在里面、排第几
+          const active = await profile.onShowActive().catch(() => null)
+          if (active) {
+            const at = active.tasks.findIndex((t) => t.table_name === table)
+            where = [PT.busyAt(active.created_by, active.done, active.total), at >= 0 ? PT.busyThisIn(at + 1, active.total) : PT.busyThisNotIn].join('；')
+          }
+        }
+        setBlocked({ kind, message: e.message, where })
+      } else {
+        toast.error(e)
+      }
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  let status: ReactNode = null
+  if (liveActive) {
+    status = (
+      <Notice tone="info" attr={{ 'data-catalog-profile-live': liveActive.status }}>
+        <p className="font-medium">{liveActive.status === 'running' ? PT.detailRunning : PT.detailPending}</p>
+        {liveActive.status === 'running' && liveActive.current && <p className="mt-0.5 break-words text-dim">{liveActive.current}</p>}
+        <button type="button" className="btn btn-sm mt-2" onClick={() => profile.onOpenJob(job!.id)} data-catalog-profile-progress="">{PT.viewProgress}</button>
+      </Notice>
+    )
+  }
+  const lastAt = last?.finished_at ?? last?.started_at ?? null
+  const ended = last && last.status !== 'pending' && last.status !== 'running'
+  const LastIcon = last ? PROFILE_TASK_ICON[last.status].Icon : null
+  return (
+    <section aria-labelledby="catalog-sec-profile" data-catalog-section="profile">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <h3 id="catalog-sec-profile" className="text-xs font-semibold">{PT.title}</h3>
+        <span className="text-2xs text-faint">{PT.detailHint}</span>
+        <span className="flex-1" />
+        {profilable && (
+          <button type="button" className="btn btn-sm" disabled={!canStart} onClick={() => void start()}
+                  title={!enabled ? PT.profileThisDisabled : PT.profileThisHint} data-catalog-profile-table="">
+            {starting ? <Spinner size={11} /> : <ScanSearch size={11} aria-hidden />} {PT.profileThis}
+          </button>
+        )}
+      </div>
+      <div className="space-y-2.5 rounded-lg border bg-panel px-3 py-2.5" data-catalog-profile-section={last ? last.status : 'never'}>
+        {!enabled && profilable && (
+          <p className="flex flex-wrap items-center gap-2 text-2xs text-dim" data-catalog-profile-disabled="">
+            <span>{PT.profileThisDisabled}</span>
+            <button type="button" className="btn btn-xs" onClick={profile.onSettings} data-catalog-profile-enable="">{PT.enable}</button>
+          </p>
+        )}
+        {blocked && (
+          <Notice tone={blocked.kind === 'busy' ? 'info' : 'warn'} attr={{ 'data-catalog-profile-blocked': blocked.kind }}>
+            <p className="font-medium">{PT.blocked[blocked.kind] ?? PT.blocked.other}</p>
+            <p className="mt-0.5 break-words text-dim">{blocked.message}</p>
+            {blocked.where && <p className="mt-0.5 text-dim" data-catalog-profile-busy-where="">{blocked.where}</p>}
+            {blocked.kind === 'busy' && (
+              <button type="button" className="btn btn-sm mt-2" onClick={() => profile.onOpenJob(null)} data-catalog-profile-progress="">{PT.viewProgress}</button>
+            )}
+            {blocked.kind === 'disabled' && (
+              <button type="button" className="btn btn-sm mt-2" onClick={profile.onSettings} data-catalog-profile-enable="">{PT.enable}</button>
+            )}
+          </Notice>
+        )}
+        {status}
+        {!last && !liveActive && (
+          <p className="text-xs text-dim" data-catalog-profile-never="">
+            {!detail.in_schema ? PT.detailMissing : isView ? PT.detailView : !profilable ? PT.detailNoChecks : PT.detailNever}
+          </p>
+        )}
+        {last && ended && (
+          <>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-2xs text-dim" data-catalog-profile-last="">
+              {LastIcon && <LastIcon size={11} className="shrink-0" style={{ color: PROFILE_TASK_ICON[last.status].color }} aria-hidden />}
+              <span className="font-medium text-fg">{PT.taskStatus[last.status]}</span>
+              {lastAt && <span className="tnum" title={formatDateTime(lastAt)}>{PT.detailLast(formatTime(lastAt))}</span>}
+              {last.created_by && <span>· {PT.detailBy(last.created_by)}</span>}
+              {last.queries > 0 && <span className="tnum">· {PT.tableQueries(last.queries)}</span>}
+              <span className="flex-1" />
+              {canOpenJob && (
+                <button type="button" className="rounded px-1 text-2xs text-[var(--accent)] underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+                        onClick={() => profile.onOpenJob(last.job_id)} data-catalog-profile-job={last.job_id}>{PT.detailJob}</button>
+              )}
+            </div>
+            {PT.findings(last.summary, true) && (
+              <p className="text-xs" data-catalog-profile-findings="">{PT.findings(last.summary, true)}</p>
+            )}
+            {/* 码值候选还在目录里（没被改掉、删掉）才给「填写含义」：码值弹窗改的是目录里的那一项 */}
+            <ProfileTaskBody detail={last} mode="detail" onFill={onFillCodes} canFill={(col) => !!detail.notes.columns?.[col]?.codes} />
+          </>
+        )}
+      </div>
+    </section>
   )
 }
