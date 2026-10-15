@@ -2891,6 +2891,8 @@ export const PROFILE_TEXT = {
   // 停止时正在执行的那条查询由数据库按单条时限截止，不是立刻停
   stopping: '正在停止：等正在执行的那条查询结束（不超过单条查询时限），已做完的项照常写进目录…',
   progress: (done: number, total: number) => `${formatNumber(done)} / ${formatNumber(total)} 张表`,
+  /** 结束以后：做完了几张（停止、失败、跳过的不算） */
+  progressDone: (ok: number, total: number) => `完成 ${formatNumber(ok)} / ${formatNumber(total)} 张表`,
   queriesSent: (n: number) => `已发 ${formatNumber(n)} 条查询`,
   queriesBad: (timeouts: number, errors: number) => [
     timeouts ? `超时 ${formatNumber(timeouts)} 条` : '', errors ? `失败 ${formatNumber(errors)} 条` : '',

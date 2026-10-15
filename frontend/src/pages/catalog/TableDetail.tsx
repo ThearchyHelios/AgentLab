@@ -1191,7 +1191,8 @@ function ProfileSection({ table, detail, row, enabled, profile, onFillCodes }: {
             {PT.findings(last.summary, true) && (
               <p className="text-xs" data-catalog-profile-findings="">{PT.findings(last.summary, true)}</p>
             )}
-            <ProfileTaskBody detail={last} mode="detail" onFill={onFillCodes} />
+            {/* 码值候选还在目录里（没被改掉、删掉）才给「填写含义」：码值弹窗改的是目录里的那一项 */}
+            <ProfileTaskBody detail={last} mode="detail" onFill={onFillCodes} canFill={(col) => !!detail.notes.columns?.[col]?.codes} />
           </>
         )}
       </div>

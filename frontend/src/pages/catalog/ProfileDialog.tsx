@@ -125,7 +125,10 @@ export function ProfileDialog({
   const tooMany = !!picked.body.tables && picked.tables.length > PROFILE_MAX_TABLES
 
   const [mode, setMode] = useState<'setup' | 'job' | 'blocked'>(initial === 'job' && job ? 'job' : 'setup')
-  const [blocked, setBlocked] = useState<{ kind: ProfileBlock; message: string; active: CatalogProfileJob | null; body: ProfileStartBody } | null>(null)
+  /** 开始不了（409）：哪种情况、服务端原话、正忙时进行中的那一个、当时的范围和剖析设置（就地开启后据此回到选范围） */
+  const [blocked, setBlocked] = useState<{
+    kind: ProfileBlock; message: string; active: CatalogProfileJob | null; body: ProfileStartBody; settings: CatalogProfileSettings
+  } | null>(null)
   const [starting, setStarting] = useState(false)
   const [startError, setStartError] = useState<string | null>(null)
   /** 是 409（正忙）转过来显示的那一个 */
@@ -160,7 +163,7 @@ export function ProfileDialog({
     if (e instanceof ApiError && e.status === 409) {
       const kind = profileBlockOf(e)
       const active = isProfileBusy(e) ? await api.dataCatalog.profileJobs.active(sourceId).then((r) => r.job, () => null) : null
-      setBlocked({ kind, message: e.message, active, body })
+      setBlocked({ kind, message: e.message, active, body, settings })
       setMode('blocked')
     } else {
       setStartError(PT.startFailed(errorMessage(e)))
@@ -227,13 +230,13 @@ export function ProfileDialog({
     setMode('job')
   }
 
-  // 因为没开启被拒的：就地开了（设置存好、这里拿到的设置变成开启）就回到选范围，可以直接开始
+  // 因为没开启被拒的：就地开了（被拒之后设置存过、这里拿到的是新的一份，并且开着）就回到选范围，可以直接开始
   useEffect(() => {
-    if (mode === 'blocked' && blocked?.kind === 'disabled' && settings.enabled) {
+    if (mode === 'blocked' && blocked?.kind === 'disabled' && settings !== blocked.settings && settings.enabled) {
       setBlocked(null)
       setMode('setup')
     }
-  }, [mode, blocked, settings.enabled])
+  }, [mode, blocked, settings])
 
   const phase: 'setup' | 'blocked' | 'running' | 'done' = inSetup ? 'setup' : mode === 'blocked' ? 'blocked' : isJobActive(job) ? 'running' : 'done'
   const canStart = settings.enabled && picked.tables.length > 0 && !tooMany && !starting
@@ -441,10 +444,13 @@ function JobView({ sourceId, job, running, stopping, busy, filled, returnTo, onS
   const started = job.started_at ? Date.parse(job.started_at) : NaN
   const ended = job.finished_at ? Date.parse(job.finished_at) : NaN
   const elapsedMs = Number.isFinite(started) ? (running ? Math.max(now, Date.now()) : Number.isFinite(ended) ? ended : started) - started : null
-  const pct = job.total ? (job.done / job.total) * 100 : 0
+  // 进行中按已结束的表数走（真进度）；结束以后写做完了几张（停止、失败、跳过的不算「完成」），同起草
+  const ok = job.counts.ok ?? job.tasks.filter((t) => t.status === 'ok').length
+  const value = running ? job.done : ok
+  const pct = job.total ? (value / job.total) * 100 : 0
   const bad = job.tasks.some((t) => PROFILE_RETRYABLE.has(t.status))
   const tone = job.status === 'failed' ? 'var(--err)' : running ? 'var(--accent)' : bad ? 'var(--warn)' : 'var(--st-done)'
-  const progress = PT.progress(job.done, job.total)
+  const progress = running ? PT.progress(job.done, job.total) : PT.progressDone(ok, job.total)
   const badQueries = PT.queriesBad(job.timeouts, job.errors)
   const notice = running ? job.notice?.trim() ?? '' : ''
   const changed = job.added + job.updated + job.removed
@@ -480,7 +486,7 @@ function JobView({ sourceId, job, running, stopping, busy, filled, returnTo, onS
         </span>
       </div>
       <div className="h-1.5 overflow-hidden rounded-full bg-hover" role="progressbar" aria-label={progress}
-           aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={job.done}>
+           aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={value}>
         <div className="h-full rounded-full transition-[width] duration-300" style={{ width: `${pct}%`, background: tone }} />
       </div>
       {queued && job.waiting_for === 'draft' && (
@@ -595,7 +601,8 @@ function TaskItem({ sourceId, job, task: t, open, onToggle, filled, focusAfter, 
   const size = t.status !== 'skipped' ? sizeText(t.row_estimate) : null
   const usedUp = t.queries > 0 && t.queries >= job.settings.table_max_queries
   const note = taskNote(t, job.error)
-  const started = t.status !== 'pending'
+  // 没开始就停下的表（停止、止损、服务重启时还在排队）不写各类检查的 0/N：它一项都没做
+  const started = !!t.started_at || t.queries > 0
   const panelId = `catalog-profile-task-${t.seq}`
   return (
     <li className="min-w-0" data-profile-task={t.table_name} data-status={t.status} data-seq={t.seq}>
@@ -688,13 +695,15 @@ function TaskDetailLoader({ sourceId, jobId, task: t, filled, focusAfter, onOpen
  * mode detail：表详情里，写行数和来源、日期范围、发现、跳过的项、发过的查询（检查清单在任务里看）。
  * onFill 不给时码值不带「填写含义」
  */
-export function ProfileTaskBody({ detail: d, mode, filled = {}, focusAfter = null, onOpenTable, onFill }: {
+export function ProfileTaskBody({ detail: d, mode, filled = {}, focusAfter = null, onOpenTable, onFill, canFill }: {
   detail: CatalogProfileTaskDetail
   mode: 'job' | 'detail'
   filled?: Record<string, number>
   focusAfter?: string | null
   onOpenTable?: (table: string) => void
   onFill?: (column: string) => void
+  /** 这一列能不能填含义（码值候选还在目录里）；不给就是都能填 */
+  canFill?: (column: string) => boolean
 }) {
   const relations = d.findings.filter((f): f is CatalogProfileRelationFinding => f.kind === 'relation')
   const codes = d.findings.filter((f): f is CatalogProfileCodesFinding => f.kind === 'codes')
@@ -746,7 +755,7 @@ export function ProfileTaskBody({ detail: d, mode, filled = {}, focusAfter = nul
         <Group title={PT.findingCodes}>
           {codes.map((f) => (
             <CodesLine key={f.path} f={f} fillKey={fillKey(d.table_name, f.column)} filled={filled[fillKey(d.table_name, f.column)]}
-                       onFill={onFill ? () => onFill(f.column) : undefined} />
+                       onFill={onFill && (!canFill || canFill(f.column)) ? () => onFill(f.column) : undefined} />
           ))}
         </Group>
       )}
