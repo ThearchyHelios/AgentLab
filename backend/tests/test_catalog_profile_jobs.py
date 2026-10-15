@@ -304,11 +304,61 @@ async def test_startup_marks_unfinished_jobs_interrupted_and_does_not_resume(cli
     assert got["status"] == "interrupted" and got["error"] == "服务重启，剖析中断" and got["finished_at"]
     assert by["channels"]["status"] == "ok" and by["channels"]["error"] is None
     assert by["visits"]["status"] == by["gates"]["status"] == "cancelled"
-    assert by["visits"]["error"] == by["gates"]["error"] == "服务重启，剖析中断"
+    assert by["gates"]["error"] == "服务重启，剖析中断"
+    # 进程没了，visits 没走到写目录那一步：查完的码值也没写进目录，不能还标「完成」
+    assert by["visits"]["error"] == "服务重启，剖析中断：已查完的 1 项没有写进数据目录，剩下 1 项没查"
     visits = await _detail(client, sid, job_id, 1)
-    assert [c["state"] for c in visits["checks"]] == ["done", "skipped"]
-    assert visits["checks"][1]["reason"] == "cancelled" and visits["unfinished"] == 1
+    assert [(c["state"], c["reason"]) for c in visits["checks"]] == [("skipped", "cancelled"), ("skipped", "cancelled")]
+    assert visits["checks"][0]["detail"] == "服务重启，剖析中断，查完了但结论没有写进数据目录"
+    assert visits["checks"][1]["detail"] == "服务重启，剖析中断，未检查"
+    assert visits["unfinished"] == visits["skipped_count"] == 2 and visits["findings"] == []
     assert not catalog_profile_jobs.manager.running(job_id), "不自动续跑"
+
+
+async def test_a_job_failing_mid_table_does_not_claim_the_finished_checks(client, make_source, scenic_db,
+                                                                          monkeypatch):
+    """visits 的 4 条关系核对完、取码值时快照被改动：任务整体失败，visits 没走到写目录那一步。核对完的关系不能还标「完成」：
+    记为跳过（error）、写明没写进目录，算没做完；目录里那几条关系原样不动；重试带上 visits。"""
+    from app.data.engine import SnapshotTampered
+
+    sid = await make_source(scenic_db, options=_on(), draft=["visits"])
+
+    async def tampered(*_args, **_kwargs):
+        raise SnapshotTampered("数据文件与登记的版本不一致，可能被修改过，已拒绝查询")
+
+    monkeypatch.setattr(catalog_profile, "_check_codes", tampered)
+    body = await _profile(client, sid, ["visits"])
+    visits = body["tables"][0]
+    assert body["status"] == "failed" and visits["status"] == "failed"
+    relations = [c for c in visits["checks"] if c["kind"] == "relation"]
+    assert len(relations) == 4 and all(c["queries"] > 0 for c in relations), "关系确实查过了"
+    assert all((c["state"], c["reason"]) == ("skipped", "error") for c in visits["checks"])
+    assert relations[0]["detail"] == "数据文件与登记的版本不一致，可能被修改过，已拒绝查询，查完了但结论没有写进数据目录"
+    assert visits["error"] == "数据文件与登记的版本不一致，可能被修改过，已拒绝查询：已查完的 4 项没有写进数据目录，剩下 2 项没查"
+    assert visits["unfinished"] == 6 and visits["findings"] == [] and visits["query_log"], "发过的查询照样留痕"
+    notes = (await _notes(client, sid, "visits"))["notes"]
+    assert _relation(notes, "gate_id")["status"] == "proposed" and _relation(notes, "gate_id")["source"] == "name"
+    async with SessionLocal() as session:
+        failed = await session.get(CatalogProfileJob, body["id"])
+        assert await catalog_profile_jobs.retry_tables(session, failed) == ["visits"]
+
+
+async def test_the_catalog_and_the_table_result_commit_together(client, make_source, scenic_db, monkeypatch):
+    """目录和这张表的剖析结果在同一个事务里：记结果那一步出错，目录也没写进去，收尾时照实说「没写进目录」。"""
+    sid = await make_source(scenic_db, options=_on(), draft=["visits"])
+    real = catalog_profile_jobs._ProfileRun._save_table
+
+    async def broken(self, session, seq, result):
+        await real(self, session, seq, result)
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(catalog_profile_jobs._ProfileRun, "_save_table", broken)
+    body = await _profile(client, sid, ["visits"])
+    visits = body["tables"][0]
+    assert body["status"] == "failed" and visits["status"] == "failed"
+    assert visits["error"].endswith("已查完的 6 项没有写进数据目录")
+    notes = (await _notes(client, sid, "visits"))["notes"]
+    assert _relation(notes, "gate_id")["status"] == "proposed", "目录跟着结果一起回滚，没写进去"
 
 
 async def test_retry_takes_only_unfinished_tables(client, make_source, scenic_db, monkeypatch):

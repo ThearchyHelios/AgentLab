@@ -12,7 +12,7 @@ data/catalog_job_runtime.py），逐表剖析（引擎在 data/catalog_profile.p
   起草在前时 waiting_for 是 "draft"。建任务时顺手清掉超出保留数的旧任务（prune）。
 - **在后台剖析**（manager.start）：轮到了才开始。每张表开始前重读数据源——停用了、关掉了剖析就停下，剩下的表 cancelled、
   error 写明；遮罩按最新的设置——再逐表调 catalog_profile.profile_table（它读的是那时目录里的最新内容：起草刚提的关系也
-  核对）。检查项、正在做哪一项、查询数、发过的查询随时落库；整张表的结果和写目录在同一次库操作里，停止时也不会被打断。
+  核对）。检查项、正在做哪一项、查询数、发过的查询随时落库；整张表的结果和写目录在同一个事务里，停止时也不会被打断。
 - **任务级止损**（替代以前的整次总量上限）：连续 3 条查询失败、最近 10 条里 7 条超时，整个任务停下（stop_reason、error），
   正在做的那张表写入已做完的项，后面的表 cancelled、error 带同一句原因；最近 6 条里 4 条超时时 notice 有一句提醒，好转后
   清掉。任务最后的状态按逐表算：有 failed、partial、cancelled 的表是 partial，否则 succeeded；任务整体出错（数据源没了、
@@ -21,7 +21,8 @@ data/catalog_job_runtime.py），逐表剖析（引擎在 data/catalog_profile.p
   目录、没做的保留旧结论，后面的表 cancelled，任务 cancelled。
 - **重试**（retry_tables + create_job）：新任务，只含原任务里 failed、partial、cancelled 的表（按原来的顺序），范围 selected，
   retry_of 记原任务；设置取数据源当前的。
-- **服务重启**（startup）：排队、进行中的标 interrupted，没结束的表 cancelled、error「服务重启，剖析中断」。不自动续跑：
+- **服务重启**（startup）：排队、进行中的标 interrupted，没结束的表 cancelled、error「服务重启，剖析中断」（进程没了时正在
+  剖析的那张表，查完的项也没写进目录，照实写明，见文末）。不自动续跑：
   复制出来的数据目录启动时不能自己去查业务库，界面让人点「重试」。关停时（manager.shutdown）停掉进行中的，同样标中断。
   启动时还一次性迁移剖析设置的旧键（catalog_profile.migrate_settings）。
 - **保留**（prune）：每个源保留最近 KEEP_JOBS 个结束了的剖析任务，更早的删掉；某张表最近一次剖析所在的任务不删，表详情的
@@ -30,7 +31,9 @@ data/catalog_job_runtime.py），逐表剖析（引擎在 data/catalog_profile.p
   的「上次剖析」）、due_reason（这张表要不要剖析、为什么）。
 
 没结束的表收尾时（停止、中断、整体出错）检查项里还排着的、正在做的记为跳过（原因 cancelled 或 error），不留「排队中」的
-检查项在一张已经结束的表上。
+检查项在一张已经结束的表上。目录只在一张表结束时和它的结果一起写（同一个事务）：收尾时还没结束的表，查完的项结论也没
+写进目录（进程被杀、快照被改动），同样记为跳过、写明「查完了但结论没有写进数据目录」，算没做完，重试时带上这张表。
+停止、关停这类能收尾的停下不走这条路：正在剖析的那张表做完的项照常写进目录（catalog_profile.profile_table）。
 """
 from __future__ import annotations
 
@@ -68,7 +71,15 @@ SOURCE_DISABLED = "数据源「{name}」已停用，剖析已停止"
 PROFILE_TURNED_OFF = "数据源「{name}」已关闭数据剖析，剖析已停止"
 #: 没结束的检查项在收尾时的说明（{why} 是停止、中断、出错的原因）
 _UNCHECKED = "{why}，未检查"
+#: 查完了、结论却没写进目录的检查项：这张表没走到整张表结束、写目录那一步（进程没了、任务整体出错）
+_UNSAVED = "{why}，查完了但结论没有写进数据目录"
 _CHECK_OPEN = ("pending", "running")
+
+
+def unsaved_error(why: str, done: int, rest: int) -> str:
+    """没走到写目录那一步的表的整句原因：查完的几项没写进目录，剩下几项没查。"""
+    text = f"{why}：已查完的 {done} 项没有写进数据目录"
+    return text + f"，剩下 {rest} 项没查" if rest else text
 
 
 class ProfileBusy(Exception):
@@ -525,22 +536,42 @@ async def prune(session: AsyncSession, source_id: str, *, keep: int | None = Non
 async def _close_tasks(session: AsyncSession, job_id: str, task_status: str, task_error: str | None,
                        *, why: str) -> None:
     """还没结束的表记 task_status（原因 task_error）；它们的检查项里还排着的、正在做的记为跳过（停止、中断是 cancelled，
-    出错是 error，说明是「{why}，未检查」），计进跳过的项和没做完的项。"""
+    出错是 error，说明是「{why}，未检查」），计进跳过的项和没做完的项。
+
+    还没结束的表没走到整张表结束那一步：目录只在那一步和这张表的结果一起写（catalog_profile._record，同一个事务），
+    所以这里已经查完（done）的项结论也没写进目录——进程没了、任务整体出错（快照被改动……）都是这样。它们同样记为跳过、
+    原因同上，说明是「{why}，查完了但结论没有写进数据目录」，算没做完；这张表的原因写明查完的几项没写进目录。不能留着
+    「完成」：检查清单上标着完成、目录里却没有，看的人会以为结论已经在目录里了。"""
     now = utcnow()
     reason = "cancelled" if task_status == "cancelled" else "error"
-    detail = _UNCHECKED.format(why=why)
+    detail, unsaved = _UNCHECKED.format(why=why), _UNSAVED.format(why=why)
     tasks = (await session.execute(
         select(CatalogProfileTask).where(CatalogProfileTask.job_id == job_id, CatalogProfileTask.status.in_(OPEN))
     )).scalars()
     for task in tasks:
         checks = [dict(c) for c in task.checks or [] if isinstance(c, dict)]
         skipped = list(task.skipped or [])
+        listed = {(s.get("kind"), s.get("target"), s.get("path")) for s in skipped if isinstance(s, dict)}
+        done = rest = 0
         for check in checks:
-            if check.get("state") in _CHECK_OPEN:
+            state = check.get("state")
+            if state == "done":
+                done += 1
+                check.update(state="skipped", reason=reason, detail=unsaved)
+            elif state in _CHECK_OPEN:
+                rest += 1
                 check.update(state="skipped", reason=reason, detail=detail)
-                skipped.append(ProfileSkip(check.get("kind") or "", check.get("target") or "", reason, detail,
+            elif state != "skipped":
+                continue
+            # 跳过的项按检查项列全：进行中的表只随时落了检查项，按规则不查的（遮罩……）也要进跳过的项
+            key = (check.get("kind"), check.get("target"), check.get("path"))
+            if key not in listed:
+                listed.add(key)
+                skipped.append(ProfileSkip(check.get("kind") or "", check.get("target") or "",
+                                           check.get("reason") or "", check.get("detail") or "",
                                            check.get("path")).to_dict())
-        task.status, task.error, task.finished_at, task.current = task_status, task_error, now, None
+        error = unsaved_error(task_error or why, done, rest) if done else task_error
+        task.status, task.error, task.finished_at, task.current = task_status, error, now, None
         task.checks, task.skipped = checks or None, skipped or None
         task.skipped_count = len(skipped)
         task.unfinished = sum(1 for s in skipped if s.get("reason") in UNFINISHED_REASONS)
@@ -776,7 +807,7 @@ class _ProfileRun(runtime.JobRun):
         await session.commit()
 
     async def _save_table(self, session: AsyncSession, seq: int, result: TableResult) -> None:
-        """一张表结束（和写目录在同一次库操作里）：整张表的结果。"""
+        """一张表结束：整张表的结果。和写目录在同一个事务里，由 catalog_profile._record 一起提交，这里不提交。"""
         await session.execute(
             self._task(CatalogProfileTask.seq == seq, CatalogProfileTask.status.in_(OPEN))
             .values(status=result.status, checks=[dict(c) for c in result.checks] or None, current=None,
@@ -790,7 +821,6 @@ class _ProfileRun(runtime.JobRun):
         if values := self._counters():
             await session.execute(update(CatalogProfileJob).where(CatalogProfileJob.id == self.job_id).values(**values)
                                   .execution_options(synchronize_session=False))
-        await session.commit()
 
     async def _finish(self, session: AsyncSession) -> None:
         """剖析完：万一还有没收尾的表（进度回调写库失败之类）记失败；有 failed、partial、cancelled 的表是 partial，否则
@@ -820,4 +850,4 @@ __all__ = ["INTERRUPTED_ERROR", "KEEP_JOBS", "MAX_TABLES", "NOTHING_AT_ALL", "NO
            "ProfileBusy", "ProfileFinished", "ProfileJobs", "ProfileNothing", "active_job", "busy_message", "cancel",
            "create_job", "due_reason", "ensure_free", "job_brief", "job_dict", "job_out", "last_detail",
            "last_profiles", "latest_job", "load", "load_task", "manager", "prune", "public_last", "retry_tables",
-           "startup", "task_detail", "task_row", "task_rows", "waiting_for"]
+           "startup", "task_detail", "task_row", "task_rows", "unsaved_error", "waiting_for"]

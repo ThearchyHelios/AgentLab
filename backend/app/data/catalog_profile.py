@@ -811,7 +811,8 @@ class TableHooks:
 
     - progress：一项检查（含开头的估行数）开始、结束时；result 里的 checks、current、queries、query_log 是这时的样子；
     - query：每发出（或被守卫拒掉）一条查询之后；
-    - recorded：整张表结束，和写目录在同一次库操作里（session 是那一次的，shield 起来，停止时也不会被打断）；
+    - recorded：整张表结束，和写目录在同一个事务里（session 是那一次的，shield 起来，停止时也不会被打断；不用自己提交，
+      写完由 _record 和目录一起提交）；
     - stop_text：停止时的说法（「剖析已停止」「服务重启，剖析中断」），停止之后才调。
     """
 
@@ -1617,7 +1618,8 @@ async def profile_table(cx: ProfileContext, table: str, *,
       停下时剩下的项记 failed / slow，error 是止损的那一句。
     - 停止（任务被 cancel）：正在跑的那条查询由数据库按单条时限截止；已做完的项照常写进目录，没做的记 cancelled、保留旧
       结论；写完再把停止传下去（CancelledError）。
-    - 整张表结束把结论并进目录（乐观锁，撞上别人刚改过重读重并，三次仍冲突记 failed），和 hooks.recorded 在同一次库操作里。
+    - 整张表结束把结论并进目录（乐观锁，撞上别人刚改过重读重并，三次仍冲突记 failed），和 hooks.recorded 在同一个事务里
+      提交。
 
     db 是执行库操作的：db(fn, *args) 开一个会话调 fn(session, *args)。后台任务给它的 SerialWriter（一条一条、shield），
     不给就各开一个会话。快照被改动（SnapshotTampered）原样抛出，不写目录：整个任务都该停。
@@ -1685,7 +1687,10 @@ def _settle_status(result: TableResult) -> None:
 async def _record(session: AsyncSession, source_id: str, table: str, out: _TableOutcome | None, result: TableResult,
                   actor: str | None, recorded: Callable[[AsyncSession, TableResult], Awaitable[None]] | None) -> None:
     """整张表结束：把结论并进目录（out 为 None 的不写：表结构里没有、视图），定下表的状态，再交给 recorded（同一个会话）。
-    修改时间取这一次写入的时间。"""
+    修改时间取这一次写入的时间。
+
+    目录和 recorded 写的这张表的结果在同一个事务里提交：进程在中间没了，两样都没写进去，下次启动收尾时这张表做完的项
+    照实记「没写进目录」（catalog_profile_jobs._close_tasks），不会出现目录写了、剖析记录却说没写的情形。"""
     if out is not None:
         try:
             await _write(session, source_id, table, out, result, at=catalog.now_iso(), actor=actor)
@@ -1699,11 +1704,12 @@ async def _record(session: AsyncSession, source_id: str, table: str, out: _Table
     _settle_status(result)
     if recorded is not None:
         await recorded(session, result)
+    await session.commit()
 
 
 async def _write(session: AsyncSession, source_id: str, table: str, out: _TableOutcome, result: TableResult, *,
                  at: str, actor: str | None) -> None:
-    """并入并写入（乐观锁）。撞上别人刚改过就重读重并，最多三次；三次仍冲突这张表记 failed。"""
+    """并入并写入（乐观锁）。撞上别人刚改过就重读重并，最多三次；三次仍冲突这张表记 failed。写进事务、不提交（见 _record）。"""
     for _attempt in range(3):
         entry = await catalog.read_entry(session, source_id, table)
         version = entry.version if entry else 0
@@ -1714,7 +1720,8 @@ async def _write(session: AsyncSession, source_id: str, table: str, out: _TableO
         if entry is None and not notes:
             return                       # 什么也没得出，不建空目录
         try:
-            written = await catalog.write_entry(session, source_id, table, notes, if_version=version, actor=actor)
+            written = await catalog.write_entry(session, source_id, table, notes, if_version=version, actor=actor,
+                                                commit=False)
         except catalog.CatalogConflict:
             continue
         result.version = written.version

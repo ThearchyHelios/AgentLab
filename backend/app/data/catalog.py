@@ -421,8 +421,11 @@ async def read_catalog(session: AsyncSession, source_id: str) -> dict[str, Catal
 
 
 async def write_entry(session: AsyncSession, source_id: str, table: str, notes: dict[str, Any], *,
-                      if_version: int, actor: str | None) -> CatalogEntry:
+                      if_version: int, actor: str | None, commit: bool = True) -> CatalogEntry:
     """整份写入一张表的目录（乐观锁），提交事务，返回写入后的目录。
+
+    commit=False 只写进当前事务、不提交，由调用方和它自己的写入一起提交：剖析一张表结束时，目录和这张表的剖析结果要么
+    都写进去、要么都没写（进程在两次提交之间没了，剖析结果会说「没写进目录」，目录里其实已经写了）。冲突时照样回滚。
 
     - if_version 是写入方读到的版本，还没有目录时传 0；和库里的不一致抛 CatalogConflict，什么都不写。
       比对和写入在同一条 UPDATE … WHERE version = ? 里完成：两个请求同时读到第 3 版，只有一个写得进去。
@@ -446,7 +449,7 @@ async def write_entry(session: AsyncSession, source_id: str, table: str, notes: 
         row = CatalogNote(source_id=source_id, table_name=table, notes=stored, version=1, updated_by=actor)
         session.add(row)
         try:
-            await session.commit()
+            await (session.commit() if commit else session.flush())
         except IntegrityError as e:
             # 唯一约束 (source_id, table_name)：另一个请求抢先建了这张表的目录
             await session.rollback()
@@ -461,7 +464,8 @@ async def write_entry(session: AsyncSession, source_id: str, table: str, notes: 
     if result.rowcount != 1:
         await session.rollback()
         raise CatalogConflict(table, current + 1)
-    await session.commit()
+    if commit:
+        await session.commit()
     await session.refresh(row)
     return _entry(row)
 
