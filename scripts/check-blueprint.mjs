@@ -187,6 +187,8 @@ const PLAN_BLOCKED = {
       plain: { title: '「销售额」对到的表还没确认', why: '这是助手按数据目录对的', who: 'you', action: '在卡片上点「确认」' } },
     { code: 'app.upgrade_policy', level: 'error', path: 'pins[0]', alias: 'weekly', message: '口径升版必须处置', who: 'you',
       source: 'app', plain: { title: '口径变了，以前的数怎么处理还没选', why: '', who: 'you', action: '选一种处置' } },
+    { code: 'app.binding_target_missing', level: 'error', path: 'pages.home.c1', message: '绑定的视图不存在', who: 'assistant',
+      source: 'app', plain: { title: '页面上有一块绑的东西不存在', why: '', who: 'assistant', action: '交给助手按卡片改' } },
     { code: 'app.view_unbound', level: 'warning', path: 'views.wk', message: '视图没有绑定定时任务', who: 'assistant',
       source: 'app', plain: { title: '有一块看板没有对应的数', why: '', who: 'assistant', action: '交给助手按卡片改' } },
     { code: 'governed.metric_untraced', level: 'warning', path: null, message: '指标没有静态追到原始数据', who: 'admin',
@@ -629,9 +631,12 @@ await section('发布摘要：三栏、处置、交给助手修', async () => {
   const dlg = page.locator('[data-plan="planned"]')
   await dlg.waitFor({ timeout: 15000 })
   check('每一步一句白话', (await dlg.locator('[data-plan-step="publish_workflow"]').innerText()).includes('此后每周一 09:00 按这一版自动出数'))
-  check('问题分三栏：你来定、助手可以修、要找管理员', await dlg.locator('[data-plan-who="you"]').getAttribute('data-plan-who-count') === '2'
+  check('挡路的问题分三栏：你来定、助手可以修、要找管理员', await dlg.locator('[data-plan-who="you"]').getAttribute('data-plan-who-count') === '2'
     && await dlg.locator('[data-plan-who="assistant"]').getAttribute('data-plan-who-count') === '1'
-    && await dlg.locator('[data-plan-who="admin"]').getAttribute('data-plan-who-count') === '1')
+    && await dlg.locator('[data-plan-who="admin"]').getAttribute('data-plan-who-count') === '0')
+  check('只是提醒的（warning）另列，不进三栏', await dlg.locator('[data-plan-reminders]').getAttribute('data-plan-reminders') === '2'
+    && await dlg.locator('[data-plan-reminder="app.view_unbound"]').count() === 1
+    && await dlg.locator('[data-plan-reminder="governed.metric_untraced"]').count() === 1)
   check('有 error 不能确认，写明为什么', await page.locator('[data-plan-confirm]').isDisabled() && await dlg.locator('[data-plan-blocked]').count() === 1)
   check('关登录（管理员）：可以选受管级', await dlg.locator('[data-plan-level]').count() === 1)
   await dlg.locator('[data-plan-disposition="weekly"] button').first().click()
@@ -639,7 +644,8 @@ await section('发布摘要：三栏、处置、交给助手修', async () => {
     && state.planBodies[1].dispositions?.weekly === 'recompute', JSON.stringify(state.planBodies?.[1]))
   await page.locator('[data-plan-fix]').click()
   check('交给助手修：关掉摘要，把问题作为一轮发给助手', await until(() => state.chats.length === 1)
-    && state.chats[0].instruction.includes('有一块看板没有对应的数'), JSON.stringify(state.chats[0]))
+    && state.chats[0].instruction.includes('页面上有一块绑的东西不存在')
+    && !state.chats[0].instruction.includes('有一块看板没有对应的数'), JSON.stringify(state.chats[0]))
 
   // 搭建者（开了登录）：没有受管级可选
   const b = { me: BUILDER, bp: READY({ status: 'trialed', last_trial_run_id: 'run_trial' }), plans: [clone(PLAN_OK)] }

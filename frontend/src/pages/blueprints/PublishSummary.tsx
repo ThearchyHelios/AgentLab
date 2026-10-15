@@ -97,6 +97,9 @@ export function PublishSummary({ blueprintId, open, onClose, onFix }: {
   }
 
   const problems = plan?.problems ?? []
+  // 挡发布的（error）按谁来改分三栏；只是提醒的（warning，比如视图要等第一次正式运行才有数）另列一处，不混在「你来定」里
+  const blocking = problems.filter((p) => p.level === 'error')
+  const reminders = problems.filter((p) => p.level !== 'error')
   // 能不能确认以服务端为准（ok：没有 error 级问题、也没停下），界面不另算
   const blocked = !!plan && !plan.ok
   const started = !!plan && plan.status !== 'planned'
@@ -202,12 +205,12 @@ export function PublishSummary({ blueprintId, open, onClose, onFix }: {
             {!started && (
               <section aria-labelledby="plan-problems">
                 <h3 id="plan-problems" className="mb-1.5 text-2xs font-semibold text-dim">{PLAN_TEXT.problems}</h3>
-                {!problems.length ? <p className="text-2xs text-faint" data-plan-no-problems="">{PLAN_TEXT.noProblems}</p> : (
+                {!blocking.length ? <p className="text-2xs text-faint" data-plan-no-problems="">{PLAN_TEXT.noProblems}</p> : (
                   <>
                     {blocked && <p className="mb-1.5 text-2xs" style={{ color: 'var(--st-failed)' }} data-plan-blocked="">{PLAN_TEXT.blocked}</p>}
-                    <div className="grid grid-cols-1 gap-2 md:grid-cols-3" data-plan-problems={problems.length}>
+                    <div className="grid grid-cols-1 gap-2 md:grid-cols-3" data-plan-problems={blocking.length}>
                       {WHO.map((who) => (
-                        <ProblemColumn key={who} who={who} items={problems.filter((p) => whoOf(p) === who)}
+                        <ProblemColumn key={who} who={who} items={blocking.filter((p) => whoOf(p) === who)}
                                        onFix={(lines) => { onClose(); onFix(lines) }} busy={!!busy}
                                        onDispose={(alias, d) => {
                                          const next = { ...dispositions, [alias]: d }
@@ -217,6 +220,20 @@ export function PublishSummary({ blueprintId, open, onClose, onFix }: {
                       ))}
                     </div>
                   </>
+                )}
+                {reminders.length > 0 && (
+                  <div className="mt-2 rounded-lg border bg-bg p-2" data-plan-reminders={reminders.length}>
+                    <div className="text-2xs font-semibold text-fg">{PLAN_TEXT.reminders}</div>
+                    <div className="mb-1.5 text-2xs leading-relaxed text-faint">{PLAN_TEXT.remindersHint}</div>
+                    <ul className="space-y-1.5">
+                      {reminders.map((p, i) => (
+                        <li key={`${p.code}-${i}`} className="text-2xs leading-relaxed" data-plan-reminder={p.code ?? ''}>
+                          <div style={{ color: 'var(--st-waiting)' }}>{p.plain?.title ?? p.message}</div>
+                          {p.plain?.action && <div className="text-dim">{p.plain.action}</div>}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
                 )}
               </section>
             )}

@@ -142,11 +142,20 @@ async def sync_all(session: AsyncSession) -> int:
         digest = _hash({**synced, "endpoint_id": item.get("endpoint_id")})
         row = existing.get(name)
         if row is None:
-            # 平台能力第一次进登记时带上治理默认（records_append 允许无人值守、查询能力是 records_lookup），之后照管理员改的
+            # 平台能力进登记时带上治理默认（records_append 允许无人值守、查询能力是 records_lookup）
             fresh.append({"name": name, **synced, "source_hash": digest, "synced_at": now,
                           "endpoint_id": item.get("endpoint_id"), **_FRESH_DEFAULTS,
                           **GOVERNANCE_DEFAULTS.get(name, {})})
-        elif row.source_hash != digest or row.missing:
+            continue
+        if _platform_defaults_apply(row, name):
+            # 管理员没改过的平台能力一直跟着平台默认走：默认后来调整了（或者这一行是在默认写好之前登记的），不能永远停在
+            # 老样子——那样填报登记的每次提交都要等人确认、结果不明时找不到人核实。管理员改过就听管理员的
+            defaults = GOVERNANCE_DEFAULTS[name]
+            if any(getattr(row, k) != v for k, v in defaults.items()):
+                for key, value in defaults.items():
+                    setattr(row, key, value)
+                changed += 1
+        if row.source_hash != digest or row.missing:
             for key, value in synced.items():
                 setattr(row, key, value)
             # 绑定端点由工具自己的配置定（自定义工具的 config.endpoint、MCP 服务的端点），登记里跟着它走
@@ -167,6 +176,11 @@ async def sync_all(session: AsyncSession) -> int:
         await session.commit()
     await refresh_cache(session)
     return changed
+
+
+def _platform_defaults_apply(row: Any, name: str) -> bool:
+    """这一行平台能力是不是还没人治理过：治理一次版本加一、记下改动人（govern），没动过的才按平台默认。"""
+    return name in GOVERNANCE_DEFAULTS and row.version == 1 and row.updated_by is None
 
 
 async def refresh_cache(session: AsyncSession) -> None:
