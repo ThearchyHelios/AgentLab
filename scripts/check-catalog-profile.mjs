@@ -780,7 +780,7 @@ await section('剖析 · 开始前：范围、个数与预算', async () => {
   // 没有可剖析项的配置表、只剩目录的旧表
   check('没选表、没筛选：范围是「需要剖析的 5 张表」（默认）和「全部 6 张表」', scopes.join(',') === 'needed:5,all:6'
         && await box(page).locator('[data-profile-scope="needed"] input').isChecked(), scopes.join(','))
-  check('……写明需要剖析的口径、全部不含视图', (await inBox(page, '[data-profile-scope="needed"]')).includes('从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系的表')
+  check('……写明需要剖析的口径（含上次是空表的不算）、全部不含视图', (await inBox(page, '[data-profile-scope="needed"]')).includes('从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系、要取码值或日期范围的列的表。上次是空表的不算')
         && (await inBox(page, '[data-profile-scope="all"]')).includes('不含视图'))
   const budget = await inBox(page, '[data-profile-budget]')
   check('预算按表写：每张表最多 40 条、60 秒，单条 10 秒，抽样、整表统计门槛，按哪个源的设置',
