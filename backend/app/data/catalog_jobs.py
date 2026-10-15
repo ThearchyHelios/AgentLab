@@ -491,17 +491,20 @@ async def retry_tables(session: AsyncSession, job: CatalogDraftJob) -> list[str]
 async def cancel(session: AsyncSession, job: CatalogDraftJob) -> None:
     """停止一个任务。排队的直接 cancelled（在队里等着的后台执行跟着停掉、出队）；进行中的交给 manager 停（停掉模型调用、
     没写完的表记 cancelled）。已经结束的抛 DraftFinished。"""
-    if job.status in FINISHED:
+    # 先取出来：排队的没停成（刚被后台认领）时 cancel_queued 会回滚，回滚让 job 的属性全部过期，再读 job.id 就要在
+    # 异步会话里同步地重新加载（MissingGreenlet）
+    job_id, status = job.id, job.status
+    if status in FINISHED:
         raise DraftFinished("这次起草已经结束了，不需要停止")
-    if job.status == "queued":
-        if await runtime.cancel_queued(session, CatalogDraftJob, CatalogDraftTask, job.id):
-            await manager.stop(job.id, "user", grace=STOP_GRACE_S)
+    if status == "queued":
+        if await runtime.cancel_queued(session, CatalogDraftJob, CatalogDraftTask, job_id):
+            await manager.stop(job_id, "user", grace=STOP_GRACE_S)
             return
         # 刚被后台认领、开始了：按进行中的停
-    if await manager.stop(job.id, "user", grace=STOP_GRACE_S):
+    if await manager.stop(job_id, "user", grace=STOP_GRACE_S):
         return
     # 库里说在进行，这个进程里却没有在跑它（记录对不上）：直接记停止
-    await _close(session, job.id, "cancelled", None, "cancelled", None)
+    await _close(session, job_id, "cancelled", None, "cancelled", None)
 
 
 async def _close(session: AsyncSession, job_id: str, job_status: str, job_error: str | None, task_status: str,

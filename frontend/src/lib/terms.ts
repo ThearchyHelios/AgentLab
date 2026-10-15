@@ -2850,8 +2850,8 @@ export const PROFILE_TEXT = {
   scopeSelected: (n: number) => `已选的 ${formatNumber(n)} 张表`,
   scopeFiltered: (n: number) => `当前筛选结果中的 ${formatNumber(n)} 张表`,
   scopeNeeded: (n: number) => `需要剖析的 ${formatNumber(n)} 张表`,
-  scopeNeededHint: '从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系的表',
-  scopeNeededNone: '没有需要剖析的表：都剖析过、上次都做完了，也没有新的待核实关联关系',
+  scopeNeededHint: '从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系、要取码值或日期范围的列的表。上次是空表的不算，有了数据请选全部表或单独剖析它',
+  scopeNeededNone: '没有需要剖析的表：都剖析过、上次都做完了，也没有新的待核实关联关系和新的码值、日期列',
   scopeAll: (n: number) => `全部 ${formatNumber(n)} 张表`,
   scopeAllHint: '有可剖析项的表，不含视图',
   /** 已选、筛选结果里有剖析不了的表：不交给服务端，写明有几张 */
@@ -3073,9 +3073,10 @@ export const PROFILE_TEXT = {
     never: '从没剖析过',
     unfinished: '上次剖析没做完',
     new_relations: '剖析之后目录里出现了新的待核实关联关系',
+    new_checks: '剖析之后多出了要取码值或日期范围的列',
   } as Record<string, string>,
   dueFilter: '需要剖析',
-  dueFilterHint: '从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系的表',
+  dueFilterHint: '从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系、要取码值或日期范围的列的表',
 
   // ---- 表详情的「数据剖析」一节
   detailHint: '对业务库发只读查询得到的观测：行数、日期范围、核实了什么、跳过了什么',

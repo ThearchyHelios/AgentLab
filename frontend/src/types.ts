@@ -2845,7 +2845,8 @@ export interface CatalogTableRow {
   profile_due?: boolean
   /**
    * 为什么需要剖析：never 从没剖析过；unfinished 最近一次剖析没做完（部分完成、失败、已停止）；new_relations 目录里有待核实的
-   * 关系不在最近一次剖析的检查项里。不需要时为 null
+   * 关系不在最近一次剖析的检查项里；new_checks 最近一次剖析之后多出了码值、日期检查（某一列被记成了状态类、日期列变了）。
+   * 不需要时为 null
    */
   profile_due_reason?: CatalogProfileDueReason | null
   /** 按当前目录和表结构这张表要做几项检查；0 表示没有可剖析的项（视图为 0） */
@@ -3350,7 +3351,7 @@ export interface CatalogProfileSettings {
 }
 
 /** 为什么需要剖析（GET /catalog 每行的 profile_due_reason） */
-export type CatalogProfileDueReason = 'never' | 'unfinished' | 'new_relations'
+export type CatalogProfileDueReason = 'never' | 'unfinished' | 'new_relations' | 'new_checks'
 
 /** 剖析的范围：selected 指定的表；needed 需要剖析的表；all 全部可剖析的表（不含视图） */
 export type CatalogProfileScope = 'selected' | 'needed' | 'all'

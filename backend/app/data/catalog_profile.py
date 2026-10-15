@@ -1476,12 +1476,6 @@ def plan_checks(table: str, meta: dict[str, Any] | None, notes: dict[str, Any] |
     return checks
 
 
-def profile_checks(table: str, meta: dict[str, Any] | None, notes: dict[str, Any] | None, *, tables: dict[str, Any],
-                   masked: set[str]) -> int:
-    """这张表要做几项检查（按规则不查的不算）：0 表示没有可剖析的项；视图、表结构里没有的表是 0。"""
-    return sum(1 for c in plan_checks(table, meta, notes, tables=tables, masked=masked) if c.skip is None)
-
-
 def has_pending_relations(notes: dict[str, Any] | None) -> bool:
     """这张表还有没有待核实的关系：要核对的关系里有还是推断（proposed）的。挑表时这样的表排在前面。"""
     return any(r.get("status") == "proposed" for r in _relation_candidates(notes))
@@ -1867,5 +1861,5 @@ __all__ = ["CODES_MAX", "EMPTY_ERROR", "FILTER_CHECKED", "FILTER_NOT_ENABLED", "
            "QueryFailed", "SourceRunner", "SqlDialect", "TableBudget", "TableHooks", "TableResult", "TableSize",
            "UNFINISHED_REASONS", "VIEW_ERROR", "check_valid_filter", "ensure_enabled", "estimate_size", "excluded_share",
            "has_pending_relations", "make_context", "masked_of", "migrate_settings", "pending_relation_paths",
-           "plan_checks", "profile_checks", "profile_settings", "profile_settings_problem", "profile_settings_rejection",
+           "plan_checks", "profile_settings", "profile_settings_problem", "profile_settings_rejection",
            "profile_table", "run_single_query", "sql_literal", "summarize", "without_legacy"]

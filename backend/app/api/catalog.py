@@ -175,8 +175,9 @@ def _summary_row(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogE
 def _profiling(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogEntry | None, *,
                tables: dict[str, Any], masked: set[str], last: dict[str, Any] | None) -> dict[str, Any]:
     notes = entry.notes if entry else {}
-    checks = catalog_profile.profile_checks(name, meta, notes, tables=tables, masked=masked)
-    reason = catalog_profile_jobs.due_reason(meta, notes, last, checks)
+    planned = catalog_profile.plan_checks(name, meta, notes, tables=tables, masked=masked)
+    checks = sum(1 for c in planned if c.skip is None)
+    reason = catalog_profile_jobs.due_reason(meta, notes, last, planned)
     return {"last_profile": catalog_profile_jobs.public_last(last), "profile_due": reason is not None,
             "profile_due_reason": reason, "profile_checks": checks}
 

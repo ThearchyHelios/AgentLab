@@ -319,7 +319,8 @@ def _ranked(source_id: str, *columns: Any) -> Any:
 
 async def last_profiles(session: AsyncSession, source_id: str) -> dict[str, dict[str, Any]]:
     """每张表的「上次剖析」（见 _ranked 的 shown）：{表名: CatalogLastProfile 加上内部用的 paths（那一项检查项的路径，判断
-    有没有新的待核实关系用）、queued（最近一项还排着或在做：这张表已经在进行中的任务里了）}。在做的就是进行中的状态。
+    有没有新的待核实关系用）、keys（那一项检查项的 (kind, target)，判断有没有新的码值、日期检查用）、queued（最近一项还排着
+    或在做：这张表已经在进行中的任务里了）}。在做的就是进行中的状态。
     每张表取哪一项在库里挑好。"""
     inner = _ranked(source_id, CatalogProfileTask.table_name, CatalogProfileTask.job_id,
                     CatalogProfileTask.seq, CatalogProfileTask.status, CatalogProfileTask.started_at,
@@ -339,17 +340,18 @@ async def last_profiles(session: AsyncSession, source_id: str) -> dict[str, dict
             "summary": {**_empty_summary(), **(row["summary"] or {})}, "skipped_count": row["skipped_count"] or 0,
             "unfinished": row["unfinished"] or 0, "error": row["error"], "row_estimate": row["row_estimate"],
             "paths": {c.get("path") for c in row["checks"] or [] if isinstance(c, dict) and c.get("path")},
+            "keys": {(c.get("kind"), c.get("target")) for c in row["checks"] or [] if isinstance(c, dict)},
             "queued": row["table_name"] in queued,
         }
     return out
 
 
 #: last_profiles 里只给内部用的键
-_INTERNAL = ("paths", "queued")
+_INTERNAL = ("paths", "keys", "queued")
 
 
 def public_last(last: dict[str, Any] | None) -> dict[str, Any] | None:
-    """接口里的 CatalogLastProfile：去掉内部用的 paths、queued。"""
+    """接口里的 CatalogLastProfile：去掉内部用的 paths、keys、queued。"""
     return None if last is None else {k: v for k, v in last.items() if k not in _INTERNAL}
 
 
@@ -365,14 +367,18 @@ async def last_detail(session: AsyncSession, source_id: str, table: str) -> dict
 
 
 def due_reason(meta: dict[str, Any] | None, notes: dict[str, Any] | None, last: dict[str, Any] | None,
-               checks: int) -> str | None:
+               planned: list[catalog_profile.PlannedCheck]) -> str | None:
     """这张表要不要剖析、为什么：never 从没剖析过；unfinished 上次剖析是 partial / failed / cancelled；new_relations
-    目录里有待核实的关系不在上次剖析的检查项里。表结构里没有、视图、没有可剖析的项（checks 为 0）、已经在进行中的任务里
-    （排着或在做）的不要。
+    目录里有待核实的关系不在上次剖析的检查项里；new_checks 上次剖析之后多出了要做的码值、日期检查（上次剖析时没有可剖析的
+    项、后来起草或人工把某一列记成了状态类，或者日期列变了）。表结构里没有、视图、没有可剖析的项、已经在进行中的任务里
+    （排着或在做）的不要。planned 是按当前目录和表结构列出的检查（catalog_profile.plan_checks）。
 
     「上次剖析」和表清单显示的是同一项（last_profiles，真正开始过的最近一项）：上次真正剖析完整了，后来某个任务没轮到它
-    就停了，不算没做完——不然表清单一边显示「上次剖析：完成」，一边说「上次剖析没做完」。一次都没开始过的，按最近一项算。"""
-    if not isinstance(meta, dict) or meta.get("is_view") or checks <= 0:
+    就停了，不算没做完——不然表清单一边显示「上次剖析：完成」，一边说「上次剖析没做完」。一次都没开始过的，按最近一项算。
+
+    上次是空表而跳过的不算要剖析：表里有没有数据，不发查询就不知道；空表等有了数据，选「全部表」或单独剖析它。"""
+    runnable = [c for c in planned if c.skip is None]
+    if not isinstance(meta, dict) or meta.get("is_view") or not runnable:
         return None
     if last is None:
         return "never"
@@ -382,6 +388,9 @@ def due_reason(meta: dict[str, Any] | None, notes: dict[str, Any] | None, last: 
         return "unfinished"
     if catalog_profile.pending_relation_paths(notes) - set(last.get("paths") or ()):
         return "new_relations"
+    seen = last.get("keys") or set()
+    if any(c.kind != "relation" and (c.kind, c.target) not in seen for c in runnable):
+        return "new_checks"
     return None
 
 
@@ -429,8 +438,8 @@ async def ensure_free(session: AsyncSession, row: Any, tables: list[str] | None 
 
 
 #: 挑出 0 张表时的说法
-NOTHING_NEEDED = ("没有需要剖析的表：能剖析的表都剖析过了，上次剖析也都做完了，之后没有新的待核实关系。"
-                  "要重新剖析，请选「全部表」或指定要剖析的表")
+NOTHING_NEEDED = ("没有需要剖析的表：能剖析的表都剖析过了，上次剖析也都做完了，之后没有新的待核实关系，也没有新的码值、"
+                  "日期列（上次是空表的不算）。要重新剖析，请选「全部表」或指定要剖析的表")
 NOTHING_AT_ALL = ("没有可以剖析的表：表结构里的表都是视图，或者没有可剖析的项（要核对的关联关系、像码值的列、日期列都没有，"
                   "或者都被遮罩了）。请先起草数据目录，或指定要剖析的表")
 
@@ -487,10 +496,9 @@ async def _pick(session: AsyncSession, row: Any, source: Any, *, tables: list[st
         if not isinstance(meta, dict) or meta.get("is_view"):
             continue
         checks = plan(name)
-        runnable = sum(1 for c in checks if c.skip is None)
-        if runnable == 0:
+        if not any(c.skip is None for c in checks):
             continue
-        if scope == "needed" and due_reason(meta, notes(name), last.get(name), runnable) is None:
+        if scope == "needed" and due_reason(meta, notes(name), last.get(name), checks) is None:
             continue
         candidates.append((name, checks))
     if not candidates:
@@ -627,22 +635,25 @@ async def _close(session: AsyncSession, job_id: str, job_status: str, job_error:
 async def cancel(session: AsyncSession, job: CatalogProfileJob) -> None:
     """停止一个剖析任务。排队的直接 cancelled（在队里等着的后台执行跟着停掉、出队）；进行中的交给 manager 停：正在等的那条
     查询不再等（库那边按单条时限截止），那张表做完的项照常写进目录，后面的表 cancelled。已经结束的抛 ProfileFinished。"""
-    if job.status in FINISHED:
+    # 先取出来：排队的没停成（刚被后台认领）时要回滚，回滚让 job 的属性全部过期，再读 job.id 就要在异步会话里同步地
+    # 重新加载（MissingGreenlet）
+    job_id, status = job.id, job.status
+    if status in FINISHED:
         raise ProfileFinished("这次剖析已经结束了，不需要停止")
-    if job.status == "queued":
+    if status == "queued":
         claimed = await session.execute(
-            update(CatalogProfileJob).where(CatalogProfileJob.id == job.id, CatalogProfileJob.status == "queued")
+            update(CatalogProfileJob).where(CatalogProfileJob.id == job_id, CatalogProfileJob.status == "queued")
             .values(status="cancelled", finished_at=utcnow()).execution_options(synchronize_session=False))
         if claimed.rowcount == 1:
-            await _close_tasks(session, job.id, "cancelled", None, why=STOPPED_ERROR)
+            await _close_tasks(session, job_id, "cancelled", None, why=STOPPED_ERROR)
             await session.commit()
-            await manager.stop(job.id, "user", grace=STOP_GRACE_S)
+            await manager.stop(job_id, "user", grace=STOP_GRACE_S)
             return
         await session.rollback()         # 刚被后台认领、开始了：按进行中的停
-    if await manager.stop(job.id, "user", grace=STOP_GRACE_S):
+    if await manager.stop(job_id, "user", grace=STOP_GRACE_S):
         return
     # 库里说在进行，这个进程里却没有在跑它（记录对不上）：直接记停止
-    await _close(session, job.id, "cancelled", None, "cancelled", None)
+    await _close(session, job_id, "cancelled", None, "cancelled", None)
 
 
 async def startup() -> int:

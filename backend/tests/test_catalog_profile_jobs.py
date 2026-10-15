@@ -597,6 +597,41 @@ async def test_profile_due_never_unfinished_and_new_relations(client, make_sourc
     await catalog_profile_jobs.manager.wait(job["id"], timeout=30)
 
 
+async def test_profile_due_new_checks_after_a_column_becomes_a_status(client, make_source, scenic_db):
+    """上次剖析时没有可剖析的项（指定了表，记为跳过），后来有人把一列记成状态类：多出了码值检查，又要剖析了，原因是
+    new_checks；剖析过（这一次估过行数发现是空表）之后不再要。"""
+    sid = await make_source(scenic_db, options=_on(), draft=["suppliers"])
+    await _profile(client, sid, ["suppliers"])
+    rows = await _rows(client, sid)
+    assert rows["suppliers"]["last_profile"]["status"] == "skipped"
+    assert (rows["suppliers"]["profile_checks"], rows["suppliers"]["profile_due"]) == (0, False)
+
+    async with SessionLocal() as session:
+        entry = await catalog.read_entry(session, sid, "suppliers")       # 起草没推断出什么时还没有目录
+        notes = dict(entry.notes) if entry else {}
+        columns = dict(notes.get("columns") or {})
+        columns["name"] = {**(columns.get("name") or {}),
+                           "measure": {"value": "status", "source": "human", "status": "confirmed"}}
+        notes["columns"] = columns
+        await catalog.write_entry(session, sid, "suppliers", notes, if_version=entry.version if entry else 0,
+                                  actor=None)
+    rows = await _rows(client, sid)
+    assert rows["suppliers"]["profile_checks"] == 1
+    assert (rows["suppliers"]["profile_due"], rows["suppliers"]["profile_due_reason"]) == (True, "new_checks")
+    assert "keys" not in rows["suppliers"]["last_profile"]
+    job = (await _start(client, sid)).json()["job"]
+    assert "suppliers" in [t["table_name"] for t in job["tasks"]], "「需要剖析的表」里有它"
+    await client.post(f"{_url(sid)}/{job['id']}/cancel")
+    await catalog_profile_jobs.manager.wait(job["id"], timeout=30)
+    # 景区库的 suppliers 是空表：这次剖析估过行数就跳过了。空表不算要剖析（不发查询不知道有没有数据），等有了数据选
+    # 「全部表」或单独剖析它
+    await _profile(client, sid, ["suppliers"])
+    rows = await _rows(client, sid)
+    last = rows["suppliers"]["last_profile"]
+    assert (last["status"], last["error"]) == ("skipped", "空表，没有可剖析的数据")
+    assert (rows["suppliers"]["profile_due"], rows["suppliers"]["profile_due_reason"]) == (False, None)
+
+
 async def test_nothing_to_profile_is_409(client, make_source, tmp_path):
     path = _db(tmp_path / "plain.db", "CREATE TABLE suppliers (id INTEGER PRIMARY KEY, name TEXT);",
                {"suppliers": [(1, "甲供应商")]})
@@ -763,3 +798,43 @@ async def test_retention_keeps_recent_jobs_and_each_tables_last_profile(client, 
         left = set((await session.execute(select(CatalogProfileJob.id)
                                           .where(CatalogProfileJob.source_id == sid))).scalars())
     assert ids[0] in left and job["id"] in left and ids[3] not in left
+
+
+async def test_cancel_a_job_claimed_between_load_and_cancel(client, make_source, scenic_db, monkeypatch):
+    """停止时读到的是排队中，可在停之前后台刚认领了它：排队的那一步没停成、回滚，接着按进行中的停。回滚让读到的 job
+    属性全部过期，以前再读 job.id 会在异步会话里同步加载（MissingGreenlet），接口 500。起草任务同一个写法，一起钉住。"""
+    sid = await make_source(scenic_db, options=_on(), draft=["visits"])
+    stopped: list[str] = []
+
+    async def fake_stop(job_id, reason, *, grace=0):
+        stopped.append(job_id)
+        return True
+
+    for module, model in ((catalog_profile_jobs, CatalogProfileJob), (catalog_jobs, None)):
+        monkeypatch.setattr(module.manager, "start", lambda job_id: None)       # 不在后台跑：认领由下面手工做
+        monkeypatch.setattr(module.manager, "stop", fake_stop)
+    job_id = (await _start(client, sid, ["visits"])).json()["job"]["id"]
+    async with SessionLocal() as session:
+        job = await session.get(CatalogProfileJob, job_id)
+        assert job.status == "queued"
+        async with SessionLocal() as other:                                    # 后台刚认领
+            await other.execute(catalog_profile_jobs.update(CatalogProfileJob).where(CatalogProfileJob.id == job_id)
+                                .values(status="running"))
+            await other.commit()
+        await catalog_profile_jobs.cancel(session, job)
+    assert stopped == [job_id]
+
+    from app.db.models import CatalogDraftJob
+
+    r = await client.post(f"/api/datasources/{sid}/catalog/draft-jobs", json={"tables": ["visits"], "use_model": False})
+    assert r.status_code == 202, r.text
+    draft_id = r.json()["job"]["id"]
+    async with SessionLocal() as session:
+        job = await session.get(CatalogDraftJob, draft_id)
+        assert job.status == "queued"
+        async with SessionLocal() as other:
+            await other.execute(catalog_profile_jobs.update(CatalogDraftJob).where(CatalogDraftJob.id == draft_id)
+                                .values(status="running"))
+            await other.commit()
+        await catalog_jobs.cancel(session, job)
+    assert stopped == [job_id, draft_id]

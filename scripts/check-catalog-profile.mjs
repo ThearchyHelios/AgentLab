@@ -658,7 +658,7 @@ async function openDialog(page) {
   await box(page).waitFor()
 }
 // 界面不该露的机读码：状态、跳过原因、检查类别、查询结果的英文值
-const CODE_RE = /\b(?:queued|running|succeeded|partial|failed|cancelled|interrupted|pending|skipped|budget|deadline|timeout|rejected|masked|too_large|slow|nothing|row_estimate|relation|codes|verified|proposed|unfinished|new_relations|never)\b/
+const CODE_RE = /\b(?:queued|running|succeeded|partial|failed|cancelled|interrupted|pending|skipped|budget|deadline|timeout|rejected|masked|too_large|slow|nothing|row_estimate|relation|codes|verified|proposed|unfinished|new_relations|new_checks|never)\b/
 async function cleanCopy(page, where) {
   let t = await box(page).innerText().catch(() => '')
   // 表名、列名、SQL 是库里的标识，照原样显示，先去掉再查
