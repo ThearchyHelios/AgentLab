@@ -28,8 +28,8 @@ tables: {表名: {notes, version}}}，含全部状态的项，表结构里已经
   没有是 none。
 - 文件格式不对（不是对象、格式标记或版本不对、表的目录不是对象、起草要求不是文字或超长）抛 TransferInvalid，接口回 422。
 
-有排队或进行中的起草任务时不导入（接口先调 catalog_jobs.ensure_idle，409 catalog_draft_busy）；目标数据源没有表结构时
-接口回 409（什么也对不上）。
+有排队或进行中的起草、剖析任务时不导入（接口经 catalog_jobs.import_write，409 catalog_draft_busy / profile_busy，导入期间
+占着这个源的队）；目标数据源没有表结构时接口回 409（什么也对不上）。
 """
 from __future__ import annotations
 

@@ -20,26 +20,30 @@ AT = "2026-10-03T08:00:00+00:00"
 def test_settings_default_off_and_parse_leniently():
     s = profile_settings({})
     assert s == ProfileSettings()
-    assert s.enabled is False and s.max_queries == 60 and s.query_timeout_s == 10 and s.sample_size == 2000
-    assert s.max_scan_rows == 100_000 and s.max_total_s == 120
-    on = profile_settings({PROFILE_OPTION: {"enabled": True, "max_queries": "30", "sample_size": 500}})
-    assert on.enabled is True and on.max_queries == 30 and on.sample_size == 500
-    # 库里存着的值不对（老数据、手改过）：那一项用缺省，不因此开启，也不报错
-    odd = profile_settings({PROFILE_OPTION: {"enabled": "yes", "max_queries": 0, "query_timeout_s": "x"}})
-    assert odd.enabled is False and odd.max_queries == 60 and odd.query_timeout_s == 10
+    assert s.enabled is False and s.table_max_queries == 40 and s.table_max_s == 60 and s.query_timeout_s == 10
+    assert s.sample_size == 2000 and s.max_scan_rows == 100_000
+    on = profile_settings({PROFILE_OPTION: {"enabled": True, "table_max_queries": "30", "sample_size": 500}})
+    assert on.enabled is True and on.table_max_queries == 30 and on.sample_size == 500
+    # 库里存着的值不对（老数据、手改过）：那一项用缺省，不因此开启，也不报错；迁移前的旧键不看
+    odd = profile_settings({PROFILE_OPTION: {"enabled": "yes", "table_max_queries": 0, "query_timeout_s": "x",
+                                             "max_queries": 5}})
+    assert odd.enabled is False and odd.table_max_queries == 40 and odd.query_timeout_s == 10
     assert profile_settings({PROFILE_OPTION: "on"}) == ProfileSettings()
+    # 任务里存着的快照读回来是同一份设置
+    assert ProfileSettings.from_dict(on.to_dict()) == on and ProfileSettings.from_dict(None) == ProfileSettings()
 
 
 @pytest.mark.parametrize("value, label", [
-    ({"max_queries": 0}, "查询次数上限"),
-    ({"max_queries": 501}, "查询次数上限"),
-    ({"max_queries": 2.5}, "查询次数上限"),
+    ({"table_max_queries": 0}, "每张表最多查询数"),
+    ({"table_max_queries": 201}, "每张表最多查询数"),
+    ({"table_max_queries": 2.5}, "每张表最多查询数"),
+    ({"table_max_s": 9}, "每张表时长上限"),
+    ({"table_max_s": 601}, "每张表时长上限"),
     ({"query_timeout_s": 61}, "单条查询时限"),
     ({"sample_size": 5}, "抽样键值数"),
     ({"max_scan_rows": -1}, "整表统计行数上限"),
-    ({"max_total_s": 5}, "总时长上限"),
     ({"enabled": "true"}, "开启数据剖析"),
-    ({"max_queries": True}, "查询次数上限"),
+    ({"table_max_queries": True}, "每张表最多查询数"),
 ])
 def test_settings_problem_names_the_field_in_chinese(value, label):
     problem = profile_settings_problem({PROFILE_OPTION: value})
@@ -51,9 +55,21 @@ def test_settings_problem_rejects_unknown_keys_and_wrong_shape():
     assert profile_settings_problem({PROFILE_OPTION: ["enabled"]})
     assert profile_settings_problem({}) is None
     assert profile_settings_problem({PROFILE_OPTION: None}) is None
-    assert profile_settings_problem({PROFILE_OPTION: {"enabled": True, "max_queries": 500, "query_timeout_s": 1.5,
-                                                      "sample_size": 10, "max_scan_rows": 0,
-                                                      "max_total_s": 600}}) is None
+    assert profile_settings_problem({PROFILE_OPTION: {"enabled": True, "table_max_queries": 200, "table_max_s": 10.5,
+                                                      "query_timeout_s": 1.5, "sample_size": 10,
+                                                      "max_scan_rows": 0}}) is None
+
+
+def test_legacy_whole_run_budgets_are_stripped_not_rejected():
+    """以前按整次剖析算的两项（查询次数上限、总时长上限）：保存时只摘掉，不报错；不折算成每张表的预算。"""
+    old = {"charset": "utf8mb4", PROFILE_OPTION: {"enabled": True, "max_queries": 60, "max_total_s": 120,
+                                                  "sample_size": 500}}
+    cleaned = catalog_profile.without_legacy(old)
+    assert cleaned == {"charset": "utf8mb4", PROFILE_OPTION: {"enabled": True, "sample_size": 500}}
+    assert old[PROFILE_OPTION]["max_queries"] == 60, "不改调用方的对象"
+    assert profile_settings_problem(cleaned) is None
+    plain = {PROFILE_OPTION: {"enabled": True}}
+    assert catalog_profile.without_legacy(plain) is plain and catalog_profile.without_legacy(None) is None
 
 
 def test_profile_option_never_reaches_the_connection_url():

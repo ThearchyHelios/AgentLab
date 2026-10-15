@@ -11,14 +11,18 @@ from fastapi.responses import JSONResponse
 #: 限定的数据源一个都不在了（删了或停用了），见 copilot._sources
 DATASOURCE_SCOPE_EMPTY = "datasource_scope_empty"
 
-#: 保存数据源时剖析设置不合规（422）：field 是出错的那一项（max_queries……），说不清是哪一项时没有 field
+#: 保存数据源时剖析设置不合规（422）：field 是出错的那一项（table_max_queries……），说不清是哪一项时没有 field
 PROFILE_SETTINGS_INVALID = "profile_settings_invalid"
-#: 剖析开始不了（409）的五种情况，见 api/catalog.profile_catalog_tables
+#: 剖析任务开始不了（409，api/catalog.create_profile_job）：未开启、数据源停用、没有表结构、快照被改动、这个源已有排队或
+#: 进行中的剖析任务（导入目录、同步起草遇到剖析任务也是它）、按范围挑出 0 张表
 PROFILE_DISABLED = "profile_disabled"
 DATASOURCE_INACTIVE = "datasource_inactive"
 SCHEMA_MISSING = "schema_missing"
 PROFILE_BUSY = "profile_busy"
 SNAPSHOT_TAMPERED = "snapshot_tampered"
+PROFILE_NOTHING = "profile_nothing"
+#: 要停止的剖析任务已经结束了（409）
+CATALOG_PROFILE_FINISHED = "catalog_profile_finished"
 #: 数据目录的后台起草任务（api/catalog.py 的 /catalog/draft-jobs）：同一个源已有排队或进行中的任务（409，界面改去
 #: GET /draft-jobs/active 显示那一个）、起草模型用不了（409，不建任务）、要停止的任务已经结束了（409）
 CATALOG_DRAFT_BUSY = "catalog_draft_busy"

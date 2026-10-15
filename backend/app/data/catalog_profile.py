@@ -5,28 +5,47 @@
 （来源记为 profile，和外键约束的 fk 分开），对不上的保持 proposed 并在备注里写明覆盖率。顺带给状态类的列
 取一次取值分布（码值候选，含义留给人填），给只有一个日期列的表提议业务日期。
 
+**一次剖析一张表。** 入口是 profile_table：先列全这张表要做的检查（plan_checks，纯函数——范围里的 profile_checks、
+建任务时列出的检查项、执行时用的是同一份），第一条查询估行数（确知是空表就整张表跳过），再逐项执行，每项开始、结束经
+hooks 回调（后台任务据此把进度落库），整张表结束把结论并进目录（_apply，乐观锁）。没查成的项，目录里剖析以前对它的
+结论原样留着：这次没查成不等于结论错了。以前是一次同步请求剖析一批表、预算按整次算，选 50 张表只做得完前两三张，
+其余整张记「查询次数用完」；现在每张表各有自己的预算，任务、排队、停止、留痕的落库在 data/catalog_profile_jobs.py，
+这里不碰任务表。
+
 **这是数据目录里唯一会对业务库发查询的地方**，约束都是硬的：
 
 - 默认关闭，按数据源在 options.catalog_profile 里开启（profile_settings）；
 - 每条查询先过守卫的只读判定（不论数据源本身可写与否），再交给查询层 run_query：同一套连接、守卫和
-  时限，不另开连接；
-- 每条查询有时限（不超过数据源自己的查询时限），每次剖析有查询次数上限和总时长上限；
+  时限，不另开连接；查询一条一条发，不并发；
+- 单条查询的时限取设置和数据源查询时限中小的，且不超过这张表剩下的时长；
+- 每张表有自己的预算（TableBudget：查询次数、时长），用完只停这张表，剩下的项记「这张表的查询次数（时长）用完」，下一张
+  表拿满额。整个任务一个查询器（SourceRunner）管任务级止损：连续 3 条查询失败（多半是连接断了、没有权限）、最近 10 条里
+  7 条超时（库响应慢，再发只是给业务库加压）就停下整个任务；最近 6 条里 4 条超时先提醒；
+- 每条发出的查询（含超时、失败、守卫拒掉的）都留痕，SQL 里的字面量换成「?」（sql_semantics.normalize_sql）：抽样到的
+  键值不进 AgentLab 自己的库；
 - 表有多大先看数据库的统计信息，没有统计信息就数到上限为止，不做全表 COUNT；超过上限的表不做
   COUNT(DISTINCT)、MIN/MAX 这类整表统计，抽样和取值分布也只看前若干行；
 - 数据源设置里遮罩的列不取样，也不出现在任何一条剖析查询里；
 - 只取低基数列的取值分布（最多 21 个取值），不取明细行。
+
+表助手的只读查询、起草时核对有效记录条件走单条查询的入口（run_single_query）：同一个只读守卫、同一个单条时限，一次一条，
+不设预算、不留痕。
 """
 from __future__ import annotations
 
+import asyncio
+import collections
 import copy
 import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import select, update
 from sqlalchemy.dialects import mysql, oracle, postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +53,8 @@ from app.data import catalog, guard
 from app.data import engine as data_engine
 from app.data.engine import CATALOG_PROFILE_OPTION, QueryResult, SnapshotTampered
 from app.data.guard import QueryLimits, SqlRejected
+from app.data.sql_semantics import normalize_sql
+from app.db.base import SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -51,33 +72,42 @@ class ProfileSettings:
     """一个数据源的剖析设置。缺省即「关闭」：剖析会对业务库发查询，必须有人按源明确打开。"""
 
     enabled: bool = False
-    #: 一次剖析最多发几条查询（读统计信息、抽样、核对都算）。用完就停，剩下的记为「查询次数用完」
-    max_queries: int = 60
-    #: 单条查询的时限（秒）。实际取它和数据源自己的查询时限中较小的一个
+    #: 每张表最多发几条查询（估行数、抽样、核对都算）。用完只停这张表，剩下的项记为「这张表的查询次数用完」
+    table_max_queries: int = 40
+    #: 每张表的时长上限（秒）。用完同样只停这张表
+    table_max_s: float = 60
+    #: 单条查询的时限（秒）。实际取它和数据源自己的查询时限中较小的一个，且不超过这张表剩下的时长
     query_timeout_s: float = 10
     #: 每条关系从子表抽多少个不同的键值去父表里对
     sample_size: int = 2000
     #: 行数不超过它的表才做 COUNT(DISTINCT)、MIN/MAX 这类整表统计；更大的、或者不知道多大的表只看前若干行。
     #: 填 0 表示一律不做整表统计
     max_scan_rows: int = 100_000
-    #: 一次剖析的总时长上限（秒）。接口是同步的，不能让一个请求无限地挂着
-    max_total_s: float = 120
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> ProfileSettings:
+        """任务里存着的设置快照 → 设置（读法同 profile_settings：哪一项不对就用缺省；开关按快照里的）。"""
+        return profile_settings({PROFILE_OPTION: raw}) if isinstance(raw, dict) else cls()
 
 
 #: 数值项：(中文叫法, 下限, 上限, 是否必须是整数)。叫法和数据源设置里剖析预算的标签一致（frontend/src/lib/terms.ts），
 #: 报错里只写它
 _NUMBER_FIELDS: dict[str, tuple[str, float, float, bool]] = {
-    "max_queries": ("查询次数上限", 1, 500, True),
+    "table_max_queries": ("每张表最多查询数", 1, 200, True),
+    "table_max_s": ("每张表时长上限（秒）", 10, 600, False),
     "query_timeout_s": ("单条查询时限（秒）", 1, 60, False),
     "sample_size": ("抽样键值数", 10, 10_000, True),
     "max_scan_rows": ("整表统计行数上限", 0, 10_000_000, True),
-    "max_total_s": ("总时长上限（秒）", 10, 600, False),
 }
 _ENABLED_LABEL = "开启数据剖析"
 _KNOWN_KEYS = frozenset({"enabled", *_NUMBER_FIELDS})
+#: 以前的整次预算（一次剖析最多几条查询、总时长）。现在预算按表算，这两项不再有意义：启动时从库里删掉
+#: （migrate_settings），保存时请求里还带着的（老页面）只摘掉、不报错（without_legacy）。不折算成新键：旧值按整次剖析
+#: 算，和「每张表」含义不同，硬折算才是不照实
+LEGACY_KEYS = ("max_queries", "max_total_s")
 
 
 def _fmt(value: float) -> str:
@@ -101,7 +131,7 @@ def _number(value: Any, low: float, high: float, integer: bool) -> int | float |
 
 def profile_settings(options: dict[str, Any] | None) -> ProfileSettings:
     """options → 剖析设置。读的时候宽松：库里存着的某一项不对（老数据、手改过），那一项用缺省，不报错；
-    开关只认 true，写成别的一律当作没开。"""
+    开关只认 true，写成别的一律当作没开。认不出的项（含迁移前的旧键）不看。"""
     raw = (options or {}).get(PROFILE_OPTION)
     if not isinstance(raw, dict):
         return ProfileSettings()
@@ -121,7 +151,8 @@ def profile_settings_problem(options: dict[str, Any] | None) -> str | None:
 
 def profile_settings_rejection(options: dict[str, Any] | None) -> tuple[str, str | None] | None:
     """同 profile_settings_problem，另给出错的是哪一项：(给人看的一句, 字段名)。字段名是 enabled 或 _NUMBER_FIELDS
-    的键（max_queries……），格式不对、有认不出的项时为 None。接口带着它回 422，表单不必从原话里认是哪一格。"""
+    的键（table_max_queries……），格式不对、有认不出的项时为 None。接口带着它回 422，表单不必从原话里认是哪一格。
+    旧键（LEGACY_KEYS）在这之前已经由 without_legacy 摘掉。"""
     raw = (options or {}).get(PROFILE_OPTION)
     if raw is None:
         return None
@@ -137,6 +168,36 @@ def profile_settings_rejection(options: dict[str, Any] | None) -> tuple[str, str
             return f"数据剖析的「{label}」需要填写 {_fmt(low)} 到 {_fmt(high)} 之间的{kind}；当前为「{raw[key]}」", key
     return None
 
+
+def without_legacy(options: dict[str, Any] | None) -> dict[str, Any] | None:
+    """保存数据源时：剖析设置里还带着旧的整次预算（老页面提交的），只摘掉，不报错。没有旧键原样返回。"""
+    raw = (options or {}).get(PROFILE_OPTION)
+    if not isinstance(raw, dict) or not any(key in raw for key in LEGACY_KEYS):
+        return options
+    return {**(options or {}), PROFILE_OPTION: {k: v for k, v in raw.items() if k not in LEGACY_KEYS}}
+
+
+async def migrate_settings(session: AsyncSession) -> int:
+    """服务启动时一次性迁移：库里所有数据源 options.catalog_profile 中的旧键（max_queries、max_total_s）删掉，记日志。
+    不折算成新键（见 LEGACY_KEYS）。返回改了几个数据源。只读写设置，不连业务库。"""
+    from app.db.models import DataSource
+
+    rows = (await session.execute(select(DataSource.id, DataSource.name, DataSource.options))).all()
+    changed = 0
+    for source_id, name, options in rows:
+        cleaned = without_legacy(options if isinstance(options, dict) else None)
+        if cleaned is options or cleaned is None:
+            continue
+        dropped = {k: (options or {}).get(PROFILE_OPTION, {}).get(k) for k in LEGACY_KEYS
+                   if k in ((options or {}).get(PROFILE_OPTION) or {})}
+        await session.execute(update(DataSource).where(DataSource.id == source_id).values(options=cleaned)
+                              .execution_options(synchronize_session=False))
+        logger.info("数据剖析设置迁移：数据源 %s（%s）去掉了按整次剖析算的旧预算 %s，改按每张表的预算", source_id, name,
+                    dropped)
+        changed += 1
+    if changed:
+        await session.commit()
+    return changed
 
 # ==========================================================================
 # SQL：字面量与方言
@@ -279,17 +340,33 @@ class SqlDialect:
 
 
 # ==========================================================================
-# 发查询：守卫、查询次数、时限
+# 发查询：守卫、单条时限、每张表的预算、任务级止损、留痕
 # ==========================================================================
 
-#: 总时长只剩这么一点时不再发新查询：发出去的时限也只剩零点几秒，白占一次查询次数
+#: 这张表的时长只剩这么一点时不再发新查询：发出去的时限也只剩零点几秒，白占一次查询次数
 _MIN_WINDOW_S = 0.5
-#: 连续失败这么多条就停：多半是连接断了、账号没有权限，再发只是一条条重复同一个错误
-_MAX_CONSECUTIVE_ERRORS = 3
+#: 连续失败这么多条就停下整个任务：多半是连接断了、账号没有权限，再发只是一条条重复同一个错误
+MAX_CONSECUTIVE_ERRORS = 3
+#: 最近 SLOW_WINDOW 条查询里 SLOW_STOP 条超时就停下整个任务：库响应慢，再发只是给业务库加压
+SLOW_WINDOW = 10
+SLOW_STOP = 7
+#: 最近 NOTICE_WINDOW 条里 NOTICE_ON 条超时先提醒（任务的 notice），好转后清掉
+NOTICE_WINDOW = 6
+NOTICE_ON = 4
+#: 「运行原因没查成」的跳过原因：计入 unfinished，使这张表成为 partial。其余（遮罩、视图、表太大、取值太多……）是
+#: 按规则不查，不算没做完
+UNFINISHED_REASONS = frozenset({"budget", "deadline", "failed", "timeout", "error", "rejected", "slow", "cancelled"})
+
+FAILED_STOP = "连续 {n} 条查询失败，已停止剖析：{line}"
+SLOW_STOP_TEXT = f"数据库响应慢：最近 {SLOW_WINDOW} 条查询 {SLOW_STOP} 条超时，已停止，避免给业务库加压"
+SLOW_NOTICE = "数据库响应慢：最近 {n} 条查询有 {k} 条超时。超时再多会自动停止，也可以先停止、换个时间再剖析"
+#: 停止落在一条查询上：asyncio 这边不再等它的结果，库那边由单条时限截止（run_query 的 _server_deadline）
+CANCELLED_QUERY = "剖析已停止，没有等这条查询的结果；数据库按单条时限截止它"
 
 
 class _Stop(Exception):
-    """整次剖析停下：budget 查询次数用完、deadline 总时长用完、failed 连续失败。剩下的检查都不再发查询。"""
+    """停下：budget 这张表的查询次数用完、deadline 这张表的时长用完（只停这张表）；failed 连续失败、slow 超时比例
+    （整个任务停下）。剩下的检查都不再发查询。"""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -310,6 +387,16 @@ class _Skip(Exception):
         self.carry = carry
 
 
+class QueryFailed(Exception):
+    """单条只读查询（run_single_query）没成：reason 是 rejected 未通过守卫 / timeout 超时 / error 查询失败，detail
+    是给人看的整句（同剖析里这一项的说明）。"""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
 def _brief(e: BaseException) -> str:
     """驱动报错的第一行，去掉 SQLAlchemy 加的「(模块.类名)」前缀和后面附的 SQL、文档链接。"""
     lines = str(getattr(e, "orig", None) or e).strip().splitlines()
@@ -317,13 +404,39 @@ def _brief(e: BaseException) -> str:
     return first[:160] or type(e).__name__
 
 
-class _Runner:
-    """剖析发的每一条查询都从这里走：先按只读过守卫，再交给查询层 run_query；记次数、管时限。
+class TableBudget:
+    """一张表的预算：最多 table_max_queries 条查询、table_max_s 秒（从这张表开始算）。用完抛 _Stop（budget /
+    deadline），只停这张表，下一张表另起一份满额的。"""
+
+    def __init__(self, settings: ProfileSettings) -> None:
+        self.max_queries = int(settings.table_max_queries)
+        self.seconds = float(settings.table_max_s)
+        self.ends = time.monotonic() + self.seconds
+        self.used = 0
+        #: 一条查询的时限被这张表剩下的时长截短后超时了：时长已经用完
+        self.out_of_time = False
+
+    def remaining(self) -> float:
+        """要发一条查询之前：次数、时长都还有，返回这张表剩下的秒数；用完抛 _Stop。不记次数（守卫拒掉的不算）。"""
+        if self.used >= self.max_queries:
+            raise _Stop("budget")
+        left = self.ends - time.monotonic()
+        if self.out_of_time or left <= _MIN_WINDOW_S:
+            raise _Stop("deadline")
+        return left
+
+
+class SourceRunner:
+    """剖析发的每一条查询都从这里走（整个任务一个）：先按只读过守卫，再交给查询层 run_query；管单条时限、任务级止损，
+    每条查询交给 record 留痕。
 
     - 只读：不论数据源本身可写与否，先用 guard.check(readonly=True) 判一遍，再进 run_query——那里还会按
       数据源自己的设置判一遍。两遍是同一个守卫，不为剖析放宽，也不另开连接。
-    - 查询次数：每发一条记一次（超时、失败的也算），到上限就停。没发出去的（守卫拒了）不算。
-    - 时限：单条取设置和数据源查询时限中较小的一个，并且不超过总时长剩下的部分。
+    - 单条时限：取设置和数据源查询时限中较小的一个，并且不超过这张表剩下的时长（budget）。
+    - 预算：每发一条记一次这张表的次数（超时、失败的也算），守卫拒掉的没发出去，不算。
+    - 止损：连续 MAX_CONSECUTIVE_ERRORS 条失败 → stopped = failed；最近 SLOW_WINDOW 条里 SLOW_STOP 条超时 →
+      stopped = slow。停下之后再发直接抛 _Stop，error 是整句原因。最近 NOTICE_WINDOW 条里 NOTICE_ON 条超时时 notice
+      有一句提醒，好转后清掉。
     """
 
     def __init__(self, source: Any, settings: ProfileSettings, dialect: SqlDialect) -> None:
@@ -331,47 +444,99 @@ class _Runner:
         self.settings = settings
         self.kind = dialect.kind
         self.timeout = min(float(settings.query_timeout_s), float(data_engine.query_timeout(source)))
-        self.ends = time.monotonic() + float(settings.max_total_s)
-        self.used = 0
+        #: 整个任务发出的查询数、其中超时的、失败的
+        self.queries = 0
+        self.timeouts = 0
+        self.errors = 0
         self.stopped: str | None = None
-        self._errors = 0
+        self.error: str | None = None
+        self.notice: str | None = None
+        self._consecutive = 0
+        self._recent: collections.deque[bool] = collections.deque(maxlen=SLOW_WINDOW)
 
-    def _stop(self, reason: str) -> None:
-        self.stopped = reason
-        raise _Stop(reason)
+    def _timed(self, timed_out: bool) -> None:
+        """记下这条查询超时没有，按比例判提醒和止损。"""
+        self._recent.append(timed_out)
+        recent = list(self._recent)
+        window = recent[-NOTICE_WINDOW:]
+        hits = sum(window)
+        self.notice = SLOW_NOTICE.format(n=len(window), k=hits) if hits >= NOTICE_ON else None
+        if sum(recent) >= SLOW_STOP and self.stopped is None:
+            self.stopped = "slow"
+            self.error = SLOW_STOP_TEXT
 
-    async def __call__(self, sql: str, *, max_rows: int = 1) -> QueryResult:
+    async def run(self, sql: str, *, max_rows: int = 1, budget: TableBudget | None = None,
+                  record: Callable[[dict[str, Any]], None] | None = None) -> QueryResult:
         if self.stopped:
             raise _Stop(self.stopped)
-        if self.used >= self.settings.max_queries:
-            self._stop("budget")
-        remaining = self.ends - time.monotonic()
-        if remaining <= _MIN_WINDOW_S:
-            self._stop("deadline")
+        left = budget.remaining() if budget is not None else None
+        at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+        def log(outcome: str, ms: int, rows: int | None, detail: str | None) -> None:
+            if record is not None:
+                record({"at": at, "sql": normalize_sql(sql, self.kind).text, "ms": ms, "rows": rows,
+                        "outcome": outcome, "detail": detail})
+
         try:
             guard.check(sql, readonly=True, source_name=getattr(self.source, "name", ""), dialect=self.kind)
         except SqlRejected as e:
-            raise _Skip("rejected", f"剖析查询未通过安全守卫：{e}") from e
-        self.used += 1
-        cut = remaining < self.timeout
-        seconds = round(min(self.timeout, remaining), 3)
+            detail = f"剖析查询未通过安全守卫：{e}"
+            log("rejected", 0, None, detail)
+            raise _Skip("rejected", detail) from e
+        if budget is not None:
+            budget.used += 1
+        self.queries += 1
+        cut = left is not None and left < self.timeout
+        seconds = round(min(self.timeout, left) if left is not None else self.timeout, 3)
         limits = QueryLimits(max_rows=max(1, int(max_rows)), timeout_seconds=seconds)
+        started = time.perf_counter()
+
+        def ms() -> int:
+            return int((time.perf_counter() - started) * 1000)
+
         try:
             result = await data_engine.run_query(self.source, sql, limits=limits)
         except SqlRejected as e:
             # 上面已经按只读过了同一个守卫，查询层再拒只可能是时限到了
-            if cut:
-                self.stopped = "deadline"
-            raise _Skip("timeout", f"查询超时：超过 {_fmt(seconds)} 秒被中断，已跳过") from e
+            self.timeouts += 1
+            if cut and budget is not None:
+                budget.out_of_time = True
+            detail = f"查询超时：超过 {_fmt(seconds)} 秒被中断，已跳过"
+            log("timeout", ms(), None, detail)
+            self._timed(True)
+            raise _Skip("timeout", detail) from e
         except SnapshotTampered:
             raise
-        except Exception as e:  # noqa: BLE001 - 一条查询失败不该拖垮整次剖析，原因照实记下
-            self._errors += 1
-            if self._errors >= _MAX_CONSECUTIVE_ERRORS:
+        except asyncio.CancelledError:
+            log("error", ms(), None, CANCELLED_QUERY)
+            raise
+        except Exception as e:  # noqa: BLE001 - 一条查询失败不该拖垮整张表，原因照实记下
+            self.errors += 1
+            self._consecutive += 1
+            detail = f"查询失败：{_brief(e)}"
+            log("error", ms(), None, detail)
+            self._timed(False)
+            if self._consecutive >= MAX_CONSECUTIVE_ERRORS and self.stopped is None:
                 self.stopped = "failed"
-            raise _Skip("error", f"查询失败：{_brief(e)}") from e
-        self._errors = 0
+                self.error = FAILED_STOP.format(n=MAX_CONSECUTIVE_ERRORS, line=_brief(e))
+            raise _Skip("error", detail) from e
+        self._consecutive = 0
+        log("ok", ms(), result.row_count, None)
+        self._timed(False)
         return result
+
+
+async def run_single_query(source: Any, sql: str, *, settings: ProfileSettings, max_rows: int = 1,
+                           kind: str | None = None) -> QueryResult:
+    """单条只读查询（表助手的 run_query、起草时核对有效记录条件）：同剖析一样过只读守卫、交给 run_query，单条时限取剖析
+    设置和数据源查询时限中较小的一个。只有一条：不设预算、不止损、不留痕。
+
+    没成抛 QueryFailed（reason、detail）；快照被改动抛 SnapshotTampered；不支持的数据库类型抛 ValueError。"""
+    dialect = SqlDialect(kind if kind is not None else getattr(source, "kind", None))
+    try:
+        return await SourceRunner(source, settings, dialect).run(sql, max_rows=max_rows)
+    except _Skip as e:
+        raise QueryFailed(e.reason, e.detail) from e
 
 
 # ==========================================================================
@@ -411,12 +576,13 @@ def _as_int(value: Any) -> int | None:
     return int(number) if number == number and abs(number) != float("inf") else None
 
 
-async def estimate_size(run: _Runner, dialect: SqlDialect, meta: dict[str, Any], name: str, *,
-                        max_scan_rows: int) -> tuple[TableSize, list[_Skip]]:
+async def estimate_size(run: Callable[..., Awaitable[QueryResult]], dialect: SqlDialect, meta: dict[str, Any],
+                        name: str, *, max_scan_rows: int) -> tuple[TableSize, list[_Skip]]:
     """先读统计信息；读不到（SQLite、没分析过的表）再数到 max_scan_rows + 1 行为止。
 
     统计信息为 0 或负数（PostgreSQL 没分析过的表是 -1，MySQL 的估算值可能是 0）当作不知道：一张其实很大的表
-    要是被当成空表，后面就会对它做整表统计。返回 (行数, 途中没查成的几条)。查询次数、总时长用完时抛 _Stop。
+    要是被当成空表，后面就会对它做整表统计。返回 (行数, 途中没查成的几条)。这张表的查询次数、时长用完（或者任务止损）
+时抛 _Stop。
     """
     skips: list[_Skip] = []
     sql = dialect.stats_sql(meta, name)
@@ -444,24 +610,33 @@ async def estimate_size(run: _Runner, dialect: SqlDialect, meta: dict[str, Any],
 
 
 # ==========================================================================
-# 一次剖析：上下文、结果
+# 一张表的剖析：上下文、结果
 # ==========================================================================
 
-#: 不指定表时剖析几张：目录里有要核对的关系的表，还有待核实（推断）关系的在前，再按使用次数；确知是空表的跳过
-PROFILE_DEFAULT_TABLES = 10
-#: 不指定表时，为跳过空表最多先估几张候选表的行数；估行数的查询最多用掉查询次数上限的一半，免得都花在挑表上
-PROFILE_PROBE_TABLES = 30
 #: IN 列表每批最多几个值：Oracle 的 IN 列表不能超过 1000 项（ORA-01795），各家统一按它分批
 IN_CHUNK = 1000
 #: 剖析写的备注都以它开头（「数据剖析：」）：人工确认过的关系，只覆盖剖析自己写的备注，不碰人写的（认的时候连
 #: 升级前带日期的「数据剖析（日期）：」一起认，catalog.is_profile_note）。不写日期，时间看这一项的 updated_at
 NOTE_PREFIX = catalog.PROFILE_NOTE_PREFIX
-#: 整次剖析停下的原因 → 剩下没查的项的说明
+#: 停下的原因 → 剩下没查的项的说明。failed、slow 是任务级止损，停的是整个任务；cancelled 的说法由调用方给（停止、
+#: 服务重启各有各的说法，见 TableHooks.stop_text）
 _STOP_DETAIL = {
-    "budget": "本次剖析的查询次数已用完（上限 {max_queries} 条），未检查",
-    "deadline": "本次剖析的总时长已用完（上限 {max_total_s} 秒），未检查",
+    "budget": "这张表的查询次数已用完（上限 {max_queries} 条），未检查",
+    "deadline": "这张表的时长已用完（上限 {max_s} 秒），未检查",
     "failed": "连续多条查询失败，已停止剖析，未检查",
+    "slow": "数据库响应慢，已停止剖析，未检查",
 }
+#: 整张表的原因（TableResult.error）
+VIEW_ERROR = "视图没有统计信息，剖析可能触发整个视图的计算，已跳过"
+EMPTY_ERROR = "空表，没有可剖析的数据"
+NOTHING_ERROR = "没有可剖析的项：没有要核对的关联关系、像码值的列和日期列，或者都被遮罩了"
+CONFLICT_ERROR = "这张表的数据目录正被其他人修改，剖析结果未能写入，请稍后重新剖析"
+WRITE_ERROR = "写入数据目录时出错：{line}"
+TABLE_ERROR = "剖析这张表时出错：{line}"
+#: 停止、服务重启时正在剖析的那张表：做完的项照常写进了目录，剩下的没查
+STOPPED_TABLE = "{why}：已做完的 {done} 项照常写进了数据目录，剩下 {rest} 项没查"
+#: 停止的说法（TableHooks.stop_text 没给时）
+STOPPED = "剖析已停止"
 
 
 class ProfileDisabled(Exception):
@@ -473,18 +648,15 @@ class ProfileDisabled(Exception):
         self.code = code
 
 
-class ProfileBusy(Exception):
-    """这个数据源正在剖析。message 给人看。"""
-
-
 @dataclass
 class ProfileSkip:
     """没做的一项和原因。
 
     kind：relation 关系、codes 码值、date 日期列、row_estimate 行数估算、table 整张表。
-    reason：budget 查询次数用完、deadline 总时长用完、failed 连续失败、timeout 超时、error 查询失败、
-    rejected 未通过守卫、masked 字段被遮罩、too_large 表太大、view 视图、unsupported 暂不支持、
-    no_data 没有数据、missing 表结构里没有、high_cardinality 取值太多（不像码值）。detail 是给人看的整句。
+    reason：budget 这张表的查询次数用完、deadline 这张表的时长用完、failed 连续失败止损、slow 超时比例止损、
+    cancelled 停止或服务重启、timeout 超时、error 查询失败、rejected 未通过守卫（以上算「运行原因没查成」，见
+    UNFINISHED_REASONS）；masked 字段被遮罩、too_large 表太大、view 视图、unsupported 暂不支持、no_data 没有数据、
+    missing 表结构里没有、high_cardinality 取值太多（不像码值）、nothing 没有可剖析的项（按规则不查）。detail 是给人看的整句。
     """
 
     kind: str
@@ -499,35 +671,57 @@ class ProfileSkip:
 
 
 @dataclass
-class TableProfile:
-    """一张表这次剖析的结果。findings 是写进目录的发现（给界面看，形状见 _finding_*）。"""
+class TableResult:
+    """一张表这次剖析的结果。
+
+    status：ok 每项都有结论、partial 有项因为运行原因没查成、failed 写入一直冲突或整张表出错、skipped 表结构里没有 /
+    视图 / 空表 / 没有可剖析的项。checks 是检查项（[{kind, target, path, state, reason, detail, queries}]，按执行顺序，
+    含按规则不查的）；findings 是写进目录的发现（给界面看，形状见 _relation_finding 等）；query_log 是发过的查询
+    （字面量已换成「?」）。"""
 
     table: str
+    status: str = "running"
+    checks: list[dict[str, Any]] = field(default_factory=list)
+    #: 进行中时正在做哪一项的整句
+    current: str | None = None
     queries: int = 0
+    elapsed_ms: int = 0
     row_estimate: TableSize | None = None
     findings: list[dict[str, Any]] = field(default_factory=list)
     skipped: list[ProfileSkip] = field(default_factory=list)
     #: 日期类列的取值范围（MIN、MAX）。只有一个日期列时它还写进了业务日期的备注；多个时只在这里
     date_ranges: list[dict[str, Any]] = field(default_factory=list)
+    query_log: list[dict[str, Any]] = field(default_factory=list)
     added: int = 0
     updated: int = 0
     removed: int = 0
     version: int = 0
-    #: 这张表没剖析（表结构里没有）或结果没写进去（写入一直冲突）
+    #: 整张表的原因：表结构里没有、视图、空表、没有可剖析的项、写入一直冲突、停止 / 中断 / 止损
     error: str | None = None
 
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped)
 
-@dataclass
-class ProfileReport:
-    """一次剖析的结果。stopped：整次剖析中途停下的原因（budget / deadline / failed），做完了为 None。"""
+    @property
+    def unfinished(self) -> int:
+        """跳过的项里因为运行原因没查成的（次数、时长、超时、出错、守卫拒、止损、停止）。"""
+        return sum(1 for s in self.skipped if s.reason in UNFINISHED_REASONS)
 
-    profiled_at: str
-    settings: ProfileSettings
-    tables: list[TableProfile] = field(default_factory=list)
-    queries_used: int = 0
-    stopped: str | None = None
-    #: 不指定表时，挑表途中估过行数、确知是空表而跳过的表（表结构顺序）。估行数的查询算在 queries_used 里
-    empty_tables: list[str] = field(default_factory=list)
+    def summary(self) -> dict[str, int]:
+        return summarize(self.findings)
+
+
+def summarize(findings: list[dict[str, Any]] | None) -> dict[str, int]:
+    """发现的合计：有结论的关系条数、其中有确证（verified）的、取到码值候选的列数、这些码值里含义还空着的个数、提议了
+    业务日期的表数（一张表时是 0 或 1）。"""
+    found = [f for f in findings or [] if isinstance(f, dict)]
+    relations = [f for f in found if f.get("kind") == "relation"]
+    codes = [f for f in found if f.get("kind") == "codes"]
+    return {"relations_checked": len(relations),
+            "relations_verified": sum(1 for f in relations if f.get("status") == "verified"),
+            "codes": len(codes), "codes_pending": sum(int(f.get("pending") or 0) for f in codes),
+            "business_dates": sum(1 for f in found if f.get("kind") == "business_date")}
 
 
 @dataclass
@@ -584,34 +778,67 @@ class _TableOutcome:
 
 
 @dataclass
-class _Context:
+class ProfileContext:
+    """一个剖析任务共用的：源（上传源是绑定当前快照的视图）、设置、方言、查询器（任务级止损在它身上）、表结构、遮罩的
+    列（小写，任务每张表开始前按数据源最新的设置换掉）、已经估过的行数（父表的行数核对关系时会用到，不重复估）。"""
+
     source: Any
     settings: ProfileSettings
     dialect: SqlDialect
-    run: _Runner
+    runner: SourceRunner
     tables: dict[str, Any]
     #: 遮罩的列（小写）。遮罩按列名生效、不分大小写、不分表，和证据面板的比法一致
     masked: set[str]
     sizes: dict[str, TableSize] = field(default_factory=dict)
 
-    async def size(self, table: str, result: TableProfile) -> TableSize:
-        """表有多大，一次剖析里每张表只估一次。途中没查成的记进 result（行数估算这一项）。"""
-        if table not in self.sizes:
-            size, skips = await estimate_size(self.run, self.dialect, self.tables[table], table,
-                                              max_scan_rows=self.settings.max_scan_rows)
-            self.sizes[table] = size
-            result.skipped += [ProfileSkip("row_estimate", table, s.reason, s.detail) for s in skips]
-        return self.sizes[table]
 
-    async def size_with_data(self, table: str, result: TableProfile) -> TableSize:
-        """同 size，但确知是空表时直接跳过这一项（抛 _Skip），不再为它发查询。"""
-        size = await self.size(table, result)
-        if size.rows == 0:
-            raise _Skip("no_data", f"{table} 是空表，无法剖析")
-        return size
+def make_context(source: Any, settings: ProfileSettings, *, options: dict[str, Any] | None) -> ProfileContext:
+    """剖析任务的上下文。options 是数据源记录的 options（遮罩按它）；不支持的数据库类型抛 ValueError。"""
+    dialect = SqlDialect(getattr(source, "kind", None))
+    return ProfileContext(source=source, settings=settings, dialect=dialect,
+                          runner=SourceRunner(source, settings, dialect),
+                          tables=(getattr(source, "schema_cache", None) or {}).get("tables") or {},
+                          masked=masked_of(options))
+
+
+def masked_of(options: dict[str, Any] | None) -> set[str]:
+    return {c.lower() for c in data_engine.masked_columns(options)}
+
+
+@dataclass
+class TableHooks:
+    """profile_table 的回调（后台任务据此落库）。都可以不给。
+
+    - progress：一项检查（含开头的估行数）开始、结束时；result 里的 checks、current、queries、query_log 是这时的样子；
+    - query：每发出（或被守卫拒掉）一条查询之后；
+    - recorded：整张表结束，和写目录在同一个事务里（session 是那一次的，shield 起来，停止时也不会被打断；不用自己提交，
+      写完由 _record 和目录一起提交）；
+    - stop_text：停止时的说法（「剖析已停止」「服务重启，剖析中断」），停止之后才调。
+    """
+
+    progress: Callable[[TableResult], Awaitable[None]] | None = None
+    query: Callable[[TableResult], Awaitable[None]] | None = None
+    recorded: Callable[[AsyncSession, TableResult], Awaitable[None]] | None = None
+    stop_text: Callable[[], str] | None = None
+
+
+class _TableCx:
+    """一张表这次剖析的执行状态：预算、正在做的检查项、发过的查询。检查函数经它发查询、估行数。"""
+
+    def __init__(self, job: ProfileContext, table: str, result: TableResult, hooks: TableHooks) -> None:
+        self.job = job
+        self.settings = job.settings
+        self.dialect = job.dialect
+        self.tables = job.tables
+        self.table = table
+        self.result = result
+        self.hooks = hooks
+        self.budget = TableBudget(job.settings)
+        #: 正在做的检查项（result.checks 里的那一个）；None 是这张表开头的估行数
+        self.check: dict[str, Any] | None = None
 
     def is_masked(self, column: str) -> bool:
-        return column.lower() in self.masked
+        return column.lower() in self.job.masked
 
     def scan_cap(self, size: TableSize) -> int | None:
         """大表（或不知道多大）抽样、取值分布只看前多少行；小表整表看，返回 None。"""
@@ -619,6 +846,53 @@ class _Context:
             return None
         return max(self.settings.sample_size, self.settings.max_scan_rows)
 
+    async def run(self, sql: str, *, max_rows: int = 1, kind: str | None = None,
+                  target: str | None = None) -> QueryResult:
+        """发一条查询：记进这张表的留痕（kind、target 是它属于哪一项）、计数，再回调 hooks.query。"""
+        check = self.check
+        label = (kind or (check["kind"] if check else "row_estimate"),
+                 target or (check["target"] if check else self.table))
+        result = self.result
+
+        def record(entry: dict[str, Any]) -> None:
+            result.query_log.append({"at": entry["at"], "kind": label[0], "target": label[1], "sql": entry["sql"],
+                                     "ms": entry["ms"], "rows": entry["rows"], "outcome": entry["outcome"],
+                                     "detail": entry["detail"]})
+            if entry["outcome"] != "rejected":
+                result.queries += 1
+                if check is not None:
+                    check["queries"] = int(check.get("queries") or 0) + 1
+
+        try:
+            found = await self.job.runner.run(sql, max_rows=max_rows, budget=self.budget, record=record)
+        except _Skip:
+            await self._queried()
+            raise
+        await self._queried()
+        return found
+
+    async def _queried(self) -> None:
+        if self.hooks.query is not None:
+            await self.hooks.query(self.result)
+
+    async def size(self, table: str, result: TableResult) -> TableSize:
+        """表有多大，一个任务里每张表只估一次。途中没查成的记进 result（行数估算这一项）。"""
+        if table not in self.job.sizes:
+            async def run(sql: str, **kw: Any) -> QueryResult:
+                return await self.run(sql, kind="row_estimate", target=table, **kw)
+
+            size, skips = await estimate_size(run, self.dialect, self.tables[table], table,
+                                              max_scan_rows=self.settings.max_scan_rows)
+            self.job.sizes[table] = size
+            result.skipped += [ProfileSkip("row_estimate", table, s.reason, s.detail) for s in skips]
+        return self.job.sizes[table]
+
+    async def size_with_data(self, table: str, result: TableResult) -> TableSize:
+        """同 size，但确知是空表时直接跳过这一项（抛 _Skip），不再为它发查询。"""
+        size = await self.size(table, result)
+        if size.rows == 0:
+            raise _Skip("no_data", f"{table} 是空表，无法剖析")
+        return size
 
 def _column(meta: dict[str, Any], name: str) -> str | None:
     """表结构里这一列的写法（目录里的列名大小写可能和表结构不同）；没有返回 None。"""
@@ -665,8 +939,8 @@ def _relation_candidates(notes: dict[str, Any] | None) -> list[dict[str, Any]]:
             if isinstance(r, dict) and r.get("id") and r.get("status") != "rejected"]
 
 
-async def _unique(cx: _Context, table: str, meta: dict[str, Any], column: str,
-                  result: TableProfile) -> tuple[bool | None, str]:
+async def _unique(cx: _TableCx, table: str, meta: dict[str, Any], column: str,
+                  result: TableResult) -> tuple[bool | None, str]:
     """这一列（非空部分）唯一吗：(True / False / None 不知道, 依据)。有主键或唯一约束直接认；否则只对行数不超过
     整表统计上限的表数一次 COUNT 和 COUNT(DISTINCT)，大表不扫。"""
     how = _constraint(meta, column)
@@ -734,27 +1008,13 @@ def _relation_note(*, sample: int, matched: int, coverage: float, scan_cap: int 
     return NOTE_PREFIX + "；".join(parts) + "。"
 
 
-async def _check_relation(cx: _Context, table: str, rel: dict[str, Any], out: _TableOutcome,
-                          result: TableProfile) -> None:
+async def _check_relation(cx: _TableCx, table: str, rel: dict[str, Any], out: _TableOutcome,
+                          result: TableResult) -> None:
     """从子表取至多 sample_size 个不同的非空键值，去父表里数对上几个，得到覆盖率；再看父键、子键唯不唯一。"""
-    cols, to_cols = list(rel.get("columns") or []), list(rel.get("to_columns") or [])
-    to_table = str(rel.get("to_table") or "")
-    if len(cols) != 1 or len(to_cols) != 1:
-        raise _Skip("unsupported", "多列组成的关联关系暂不剖析")
-    meta = cx.tables[table]
-    parent = to_table if to_table in cx.tables else catalog.resolve_table_name({"tables": cx.tables}, to_table)
-    if parent is None:
-        raise _Skip("missing", f"表结构里没有被指向的表 {to_table}，请先重新探查结构")
-    pmeta = cx.tables[parent]
-    col, pcol = _column(meta, cols[0]), _column(pmeta, to_cols[0])
-    if col is None or pcol is None:
-        missing = f"{table}.{cols[0]}" if col is None else f"{parent}.{to_cols[0]}"
-        raise _Skip("missing", f"表结构里没有列 {missing}，请先重新探查结构")
-    if pmeta.get("is_view"):
-        raise _Skip("view", f"被指向的 {parent} 是视图，不剖析")
-    for name, owner in ((col, table), (pcol, parent)):
-        if cx.is_masked(name):
-            raise _Skip("masked", f"{owner}.{name} 在数据源设置中被遮罩，不取样", carry=True)
+    # 两端在表结构里的写法；按规则不查的（多列、不在表结构里、指向视图、碰到遮罩列）plan_checks 已经列成跳过，这里再判
+    # 一遍只是兜底
+    parent, col, pcol = _relation_ends(table, rel, cx.tables, cx.job.masked)
+    meta, pmeta = cx.tables[table], cx.tables[parent]
 
     if rel.get("source") == "fk":
         await cx.size_with_data(table, result)
@@ -886,7 +1146,7 @@ def _share(count: int, total: int) -> str:
     return "不足 1%" if 0 < ratio < 0.01 else f"{round(ratio * 100)}%"
 
 
-async def _check_codes(cx: _Context, table: str, column: str, out: _TableOutcome, result: TableProfile) -> None:
+async def _check_codes(cx: _TableCx, table: str, column: str, out: _TableOutcome, result: TableResult) -> None:
     """GROUP BY 取出现最多的 CODES_MAX + 1 个取值：不超过 CODES_MAX 个就是码值候选（值有了，含义等人填）。"""
     if cx.is_masked(column):
         raise _Skip("masked", f"{table}.{column} 在数据源设置中被遮罩，不取值", carry=False)
@@ -921,8 +1181,8 @@ def _is_date_column(col: dict[str, Any]) -> bool:
     return catalog.is_date_column(str(col.get("name") or ""), col.get("type"))
 
 
-async def _check_dates(cx: _Context, table: str, columns: list[str], total: int, out: _TableOutcome,
-                       result: TableProfile) -> None:
+async def _check_dates(cx: _TableCx, table: str, columns: list[str], total: int, out: _TableOutcome,
+                       result: TableResult) -> None:
     """日期类列的 MIN、MAX，作为业务日期的参考。整表统计，只对行数不超过上限的表做。表里只有一个日期类列
     （total 是表结构里日期类列的个数，含被遮罩的）时提议它作为业务日期。"""
     d, meta = cx.dialect, cx.tables[table]
@@ -1131,79 +1391,325 @@ def _apply(existing: dict[str, Any] | None, out: _TableOutcome, *,
 
 
 # ==========================================================================
-# 入口
+# 一张表要做哪些检查（纯函数）
 # ==========================================================================
 
-#: 正在剖析的数据源。检查和登记之间没有 await，在一个事件循环里是原子的；服务端是单进程部署，
-#: 多进程部署时要换成库里的锁
-_RUNNING: set[str] = set()
 
+@dataclass(frozen=True)
+class PlannedCheck:
+    """一项检查。skip 给了的是按规则不查的（遮罩、多列关系、表结构里没有、被指向的是视图）：(原因, 说明, 要不要原样
+    留着旧结论)，不发查询；relation / column / columns 是执行时要的参数。"""
 
-@dataclass
-class _Check:
     kind: str
     target: str
     path: str | None
-    run: Callable[[], Awaitable[None]]
-    #: 没查成时调用：把目录里剖析以前对这一项写的结论标记为原样保留
-    keep: Callable[[], None]
+    skip: tuple[str, str, bool] | None = None
+    relation: dict[str, Any] | None = None
+    column: str | None = None
+    columns: tuple[str, ...] = ()
+    #: 日期检查：表结构里日期类列的个数（含被遮罩的）。只有一个时才提议业务日期
+    date_total: int = 0
+
+    def as_check(self) -> dict[str, Any]:
+        """检查项（TableResult.checks 的一项）：还没开始，或者按规则跳过。"""
+        state, reason, detail = ("skipped", self.skip[0], self.skip[1]) if self.skip else ("pending", None, None)
+        return {"kind": self.kind, "target": self.target, "path": self.path, "state": state, "reason": reason,
+                "detail": detail, "queries": 0}
 
 
-def _plan(cx: _Context, table: str, notes: dict[str, Any], out: _TableOutcome,
-          result: TableProfile) -> list[_Check]:
-    """这张表要做的检查，按价值排：关系、码值、日期。先列全再执行：中途停下时，没做的每一项都要记下原因。"""
-    meta = cx.tables[table]
-    checks: list[_Check] = []
+def _relation_ends(table: str, rel: dict[str, Any], tables: dict[str, Any], masked: set[str]) -> tuple[str, str, str]:
+    """一条关系两端在表结构里的写法：(被指向的表, 子表的列, 被指向的列)。按规则不查的抛 _Skip：多列组成的、表结构里
+    没有的表或列、被指向的是视图、两端有被遮罩的列（遮罩的列不出现在任何一条剖析查询里）。"""
+    cols, to_cols = list(rel.get("columns") or []), list(rel.get("to_columns") or [])
+    to_table = str(rel.get("to_table") or "")
+    if len(cols) != 1 or len(to_cols) != 1:
+        raise _Skip("unsupported", "多列组成的关联关系暂不剖析")
+    meta = tables[table]
+    parent = to_table if to_table in tables else catalog.resolve_table_name({"tables": tables}, to_table)
+    if parent is None:
+        raise _Skip("missing", f"表结构里没有被指向的表 {to_table}，请先重新探查结构")
+    pmeta = tables[parent]
+    col, pcol = _column(meta, cols[0]), _column(pmeta, to_cols[0])
+    if col is None or pcol is None:
+        missing = f"{table}.{cols[0]}" if col is None else f"{parent}.{to_cols[0]}"
+        raise _Skip("missing", f"表结构里没有列 {missing}，请先重新探查结构")
+    if pmeta.get("is_view"):
+        raise _Skip("view", f"被指向的 {parent} 是视图，不剖析")
+    for name, owner in ((col, table), (pcol, parent)):
+        if name.lower() in masked:
+            raise _Skip("masked", f"{owner}.{name} 在数据源设置中被遮罩，不取样", carry=True)
+    return parent, col, pcol
+
+
+def plan_checks(table: str, meta: dict[str, Any] | None, notes: dict[str, Any] | None, *, tables: dict[str, Any],
+                masked: set[str]) -> list[PlannedCheck]:
+    """这张表要做的检查，按价值排：关系、码值、日期。范围（profile_checks）、建任务时列出的检查项、执行时用的都是这一份：
+    先列全再执行，中途停下时没做的每一项都要记下原因。视图、表结构里没有的表返回空列表。
+
+    按规则不查的也列出来（带 skip）：被遮罩的码值列、日期列，多列的、两端不在表结构里的、指向视图的、碰到遮罩列的关系——
+    要让人看得见为什么它没有结论。masked 是遮罩的列（小写）。"""
+    if not isinstance(meta, dict) or meta.get("is_view"):
+        return []
+    notes = notes or {}
+    checks: list[PlannedCheck] = []
     for rel in _relation_candidates(notes):
-        rid = str(rel["id"])
-        checks.append(_Check("relation", _relation_target(rel), f"relations.{rid}",
-                             lambda rel=rel: _check_relation(cx, table, rel, out, result),
-                             lambda rid=rid: out.keep_relations.add(rid)))
+        skip: tuple[str, str, bool] | None = None
+        try:
+            _relation_ends(table, rel, tables, masked)
+        except _Skip as e:
+            skip = (e.reason, e.detail, e.carry)
+        checks.append(PlannedCheck("relation", _relation_target(rel), f"relations.{rel['id']}", skip, relation=rel))
     for column in _code_columns(meta, notes):
-        checks.append(_Check("codes", column, f"columns.{column}.codes",
-                             lambda column=column: _check_codes(cx, table, column, out, result),
-                             lambda column=column: out.keep_codes.add(column)))
+        skip = (("masked", f"{table}.{column} 在数据源设置中被遮罩，不取值", False)
+                if column.lower() in masked else None)
+        checks.append(PlannedCheck("codes", column, f"columns.{column}.codes", skip, column=column))
     dates = [str(c["name"]) for c in meta.get("columns") or [] if isinstance(c, dict) and _is_date_column(c)]
     for column in dates:
-        if cx.is_masked(column):
-            result.skipped.append(ProfileSkip("date", column, "masked",
-                                              f"{table}.{column} 在数据源设置中被遮罩，不取最小值和最大值"))
-    usable = [c for c in dates if not cx.is_masked(c)]
+        if column.lower() in masked:
+            checks.append(PlannedCheck("date", column, None,
+                                       ("masked", f"{table}.{column} 在数据源设置中被遮罩，不取最小值和最大值", False),
+                                       column=column))
+    usable = [c for c in dates if c.lower() not in masked]
     if usable:
-        checks.append(_Check("date", "、".join(usable), "business_date" if len(dates) == 1 else None,
-                             lambda: _check_dates(cx, table, usable, len(dates), out, result),
-                             lambda: setattr(out, "keep_business_date", True)))
+        checks.append(PlannedCheck("date", "、".join(usable), "business_date" if len(dates) == 1 else None,
+                                   columns=tuple(usable), date_total=len(dates)))
     return checks
 
 
-async def _profile_table(cx: _Context, table: str, notes: dict[str, Any], result: TableProfile) -> _TableOutcome:
-    out = _TableOutcome()
-    if cx.tables[table].get("is_view"):
-        result.skipped.append(ProfileSkip("table", table, "view", "视图没有统计信息，剖析可能触发整个视图的计算，已跳过"))
-        return out
-    checks = _plan(cx, table, notes, out, result)
-    for i, check in enumerate(checks):
+def profile_checks(table: str, meta: dict[str, Any] | None, notes: dict[str, Any] | None, *, tables: dict[str, Any],
+                   masked: set[str]) -> int:
+    """这张表要做几项检查（按规则不查的不算）：0 表示没有可剖析的项；视图、表结构里没有的表是 0。"""
+    return sum(1 for c in plan_checks(table, meta, notes, tables=tables, masked=masked) if c.skip is None)
+
+
+def has_pending_relations(notes: dict[str, Any] | None) -> bool:
+    """这张表还有没有待核实的关系：要核对的关系里有还是推断（proposed）的。挑表时这样的表排在前面。"""
+    return any(r.get("status") == "proposed" for r in _relation_candidates(notes))
+
+
+def pending_relation_paths(notes: dict[str, Any] | None) -> set[str]:
+    """待核实（proposed）关系的路径（relations.<编号>）。上次剖析的检查项里没有它们，就是剖析之后冒出了新的待核实关系。"""
+    return {f"relations.{r['id']}" for r in _relation_candidates(notes) if r.get("status") == "proposed"}
+
+
+# ==========================================================================
+# 入口：剖析一张表
+# ==========================================================================
+
+ESTIMATING = "正在估算 {table} 的行数"
+
+
+def _current_text(table: str, check: PlannedCheck) -> str:
+    """进行中时正在做哪一项的整句（逐表一行的最后一栏）。"""
+    if check.kind == "relation":
+        return f"正在核对 {table}.{check.target}"
+    if check.kind == "codes":
+        return f"正在取 {table}.{check.column} 的取值分布"
+    if len(check.columns) == 1:
+        return f"正在取 {table}.{check.columns[0]} 的最小值和最大值"
+    return f"正在取 {table} 中 {check.target} 的最小值和最大值"
+
+
+def _keep(out: _TableOutcome, check: PlannedCheck) -> None:
+    """这一项没查成：目录里剖析以前对它写的结论标记为原样保留。"""
+    if check.kind == "relation" and check.relation is not None:
+        out.keep_relations.add(str(check.relation["id"]))
+    elif check.kind == "codes" and check.column:
+        out.keep_codes.add(check.column)
+    elif check.kind == "date" and check.columns:
+        out.keep_business_date = True
+
+
+def _close_open(result: TableResult, plan: list[PlannedCheck], out: _TableOutcome, reason: str, detail: str) -> int:
+    """还没结束的项（排着的、正在做的）都记为跳过、原因 reason，旧结论原样保留。返回记了几项。"""
+    n = 0
+    for check, planned in zip(result.checks, plan):
+        if check["state"] in ("pending", "running"):
+            check.update(state="skipped", reason=reason, detail=detail)
+            result.skipped.append(ProfileSkip(check["kind"], check["target"], reason, detail, check["path"]))
+            _keep(out, planned)
+            n += 1
+    return n
+
+
+def _stop_detail(cx: _TableCx, reason: str) -> str:
+    return _STOP_DETAIL[reason].format(max_queries=cx.settings.table_max_queries, max_s=_fmt(cx.settings.table_max_s))
+
+
+async def _execute(cx: _TableCx, table: str, check: PlannedCheck, out: _TableOutcome) -> None:
+    if check.kind == "relation":
+        await _check_relation(cx, table, check.relation or {}, out, cx.result)
+    elif check.kind == "codes":
+        await _check_codes(cx, table, str(check.column), out, cx.result)
+    else:
+        await _check_dates(cx, table, list(check.columns), check.date_total, out, cx.result)
+
+
+async def _progress(cx: _TableCx) -> None:
+    if cx.hooks.progress is not None:
+        await cx.hooks.progress(cx.result)
+
+
+async def _run_checks(cx: _TableCx, table: str, plan: list[PlannedCheck], runnable: list[int],
+                      out: _TableOutcome) -> None:
+    """第一条查询估行数（确知是空表就整张表跳过），再逐项执行。预算用完、任务止损时剩下的项记原因、保留旧结论。"""
+    result = cx.result
+    result.current = ESTIMATING.format(table=table)
+    await _progress(cx)
+    try:
+        size = await cx.size(table, result)
+    except _Stop as e:
+        _close_open(result, plan, out, e.reason, _stop_detail(cx, e.reason))
+        if e.reason in ("failed", "slow"):
+            result.error = cx.job.runner.error
+        return
+    finally:
+        result.current = None
+    if size.rows == 0:
+        _close_open(result, plan, out, "no_data", f"{table} 是空表，无法剖析")
+        result.status, result.error = "skipped", EMPTY_ERROR
+        return
+    for i in runnable:
+        planned, check = plan[i], result.checks[i]
+        check["state"] = "running"
+        result.current = _current_text(table, planned)
+        cx.check = check
+        await _progress(cx)
         try:
-            await check.run()
+            await _execute(cx, table, planned, out)
+            check["state"] = "done"
         except _Skip as e:
-            result.skipped.append(ProfileSkip(check.kind, check.target, e.reason, e.detail, check.path))
+            check.update(state="skipped", reason=e.reason, detail=e.detail)
+            result.skipped.append(ProfileSkip(planned.kind, planned.target, e.reason, e.detail, planned.path))
             if e.carry:
-                check.keep()
+                _keep(out, planned)
         except _Stop as e:
-            detail = _STOP_DETAIL[e.reason].format(max_queries=cx.settings.max_queries,
-                                                   max_total_s=_fmt(cx.settings.max_total_s))
-            for rest in checks[i:]:
-                result.skipped.append(ProfileSkip(rest.kind, rest.target, e.reason, detail, rest.path))
-                rest.keep()
+            cx.check = None
+            _close_open(result, plan, out, e.reason, _stop_detail(cx, e.reason))
+            if e.reason in ("failed", "slow"):
+                result.error = cx.job.runner.error
             break
-    if table in cx.sizes:
-        result.row_estimate = cx.sizes[table]
-    return out
+        finally:
+            cx.check = None
+            result.current = None
+        await _progress(cx)
 
 
-async def _write(session: AsyncSession, source_id: str, table: str, out: _TableOutcome, result: TableProfile, *,
+async def _own_session(fn: Callable[..., Awaitable[Any]], *args: Any) -> Any:
+    async with SessionLocal() as session:
+        return await fn(session, *args)
+
+
+async def _read_notes(session: AsyncSession, source_id: str, table: str) -> dict[str, Any]:
+    entry = await catalog.read_entry(session, source_id, table)
+    return entry.notes if entry else {}
+
+
+async def profile_table(cx: ProfileContext, table: str, *,
+                        db: Callable[..., Awaitable[Any]] | None = None, hooks: TableHooks | None = None,
+                        actor: str | None = None) -> TableResult:
+    """剖析一张表并把结论写进目录，返回这张表的结果（TableResult）。
+
+    - 表结构里没有、视图：skipped，不发查询。
+    - 先列全检查项（plan_checks，读的是这时目录里的最新内容），按规则不查的直接记跳过；一项可查的都没有：skipped
+      「没有可剖析的项」，不发查询。
+    - 第一条查询估行数，确知是空表：skipped「空表」。
+    - 逐项执行：这张表的查询次数、时长用完（TableBudget）只停这张表，剩下的项记 budget / deadline；任务止损（cx.runner）
+      停下时剩下的项记 failed / slow，error 是止损的那一句。
+    - 停止（任务被 cancel）：正在跑的那条查询由数据库按单条时限截止；已做完的项照常写进目录，没做的记 cancelled、保留旧
+      结论；写完再把停止传下去（CancelledError）。
+    - 整张表结束把结论并进目录（乐观锁，撞上别人刚改过重读重并，三次仍冲突记 failed），和 hooks.recorded 在同一个事务里
+      提交。
+
+    db 是执行库操作的：db(fn, *args) 开一个会话调 fn(session, *args)。后台任务给它的 SerialWriter（一条一条、shield），
+    不给就各开一个会话。快照被改动（SnapshotTampered）原样抛出，不写目录：整个任务都该停。
+    """
+    hooks = hooks or TableHooks()
+    db = db or _own_session
+    started = time.monotonic()
+    result = TableResult(table=table)
+    meta = cx.tables.get(table)
+    if not isinstance(meta, dict) or meta.get("is_view"):
+        reason = "view" if isinstance(meta, dict) else "missing"
+        why = VIEW_ERROR if reason == "view" else catalog.missing_table_error(table)
+        result.status, result.error = "skipped", why
+        result.skipped.append(ProfileSkip("table", table, reason, why))
+        await db(_record, cx.source.id, table, None, result, actor, hooks.recorded)
+        return result
+    notes = await db(_read_notes, cx.source.id, table)
+    plan = plan_checks(table, meta, notes, tables=cx.tables, masked=cx.masked)
+    out = _TableOutcome()
+    tcx = _TableCx(cx, table, result, hooks)
+    result.checks = [p.as_check() for p in plan]
+    for planned in plan:
+        if planned.skip is not None:
+            result.skipped.append(ProfileSkip(planned.kind, planned.target, planned.skip[0], planned.skip[1],
+                                              planned.path))
+            if planned.skip[2]:
+                _keep(out, planned)
+    runnable = [i for i, p in enumerate(plan) if p.skip is None]
+    stopped: asyncio.CancelledError | None = None
+    try:
+        if not runnable:
+            result.status, result.error = "skipped", NOTHING_ERROR
+            result.skipped.append(ProfileSkip("table", table, "nothing", NOTHING_ERROR))
+        else:
+            await _run_checks(tcx, table, plan, runnable, out)
+    except asyncio.CancelledError as e:
+        stopped = e
+        why = hooks.stop_text() if hooks.stop_text is not None else STOPPED
+        done = sum(1 for c in result.checks if c["state"] == "done")
+        rest = _close_open(result, plan, out, "cancelled", f"{why}，未检查")
+        result.error = STOPPED_TABLE.format(why=why, done=done, rest=rest)
+    except SnapshotTampered:
+        raise
+    except Exception as e:  # noqa: BLE001 - 一张表出了意外不拖垮别的表：照实记下，做完的项照常写
+        logger.exception("剖析表 %s 时出错", table)
+        line = _brief(e)
+        _close_open(result, plan, out, "error", TABLE_ERROR.format(line=line))
+        result.status, result.error = "failed", TABLE_ERROR.format(line=line)
+    result.current = None
+    result.row_estimate = cx.sizes.get(table)
+    result.elapsed_ms = int((time.monotonic() - started) * 1000)
+    await db(_record, cx.source.id, table, out, result, actor, hooks.recorded)
+    if stopped is not None:
+        raise stopped
+    return result
+
+
+def _settle_status(result: TableResult) -> None:
+    """表的状态：skipped、failed 的不变；有运行原因没查成的项是 partial，否则 ok。"""
+    if result.status in ("skipped", "failed"):
+        return
+    result.status = "partial" if result.unfinished else "ok"
+
+
+async def _record(session: AsyncSession, source_id: str, table: str, out: _TableOutcome | None, result: TableResult,
+                  actor: str | None, recorded: Callable[[AsyncSession, TableResult], Awaitable[None]] | None) -> None:
+    """整张表结束：把结论并进目录（out 为 None 的不写：表结构里没有、视图），定下表的状态，再交给 recorded（同一个会话）。
+    修改时间取这一次写入的时间。
+
+    目录和 recorded 写的这张表的结果在同一个事务里提交：进程在中间没了，两样都没写进去，下次启动收尾时这张表做完的项
+    照实记「没写进目录」（catalog_profile_jobs._close_tasks），不会出现目录写了、剖析记录却说没写的情形。"""
+    if out is not None:
+        try:
+            await _write(session, source_id, table, out, result, at=catalog.now_iso(), actor=actor)
+        except Exception as e:  # noqa: BLE001 - 这一张写不进去不影响别的表
+            logger.exception("剖析结果写入表 %s 的数据目录时出错", table)
+            await session.rollback()
+            result.error = WRITE_ERROR.format(line=_brief(e))
+            result.status = "failed"
+            result.findings = []
+            result.added = result.updated = result.removed = 0
+    _settle_status(result)
+    if recorded is not None:
+        await recorded(session, result)
+    await session.commit()
+
+
+async def _write(session: AsyncSession, source_id: str, table: str, out: _TableOutcome, result: TableResult, *,
                  at: str, actor: str | None) -> None:
-    """并入并写入（乐观锁）。撞上别人刚改过就重读重并，最多三次。"""
+    """并入并写入（乐观锁）。撞上别人刚改过就重读重并，最多三次；三次仍冲突这张表记 failed。写进事务、不提交（见 _record）。"""
     for _attempt in range(3):
         entry = await catalog.read_entry(session, source_id, table)
         version = entry.version if entry else 0
@@ -1214,96 +1720,21 @@ async def _write(session: AsyncSession, source_id: str, table: str, out: _TableO
         if entry is None and not notes:
             return                       # 什么也没得出，不建空目录
         try:
-            written = await catalog.write_entry(session, source_id, table, notes, if_version=version, actor=actor)
+            written = await catalog.write_entry(session, source_id, table, notes, if_version=version, actor=actor,
+                                                commit=False)
         except catalog.CatalogConflict:
             continue
         result.version = written.version
         return
-    result.error = "这张表的数据目录正被其他人修改，剖析结果未能写入，请稍后重新剖析"
+    result.error = CONFLICT_ERROR
+    result.status = "failed"
     result.findings = []
     result.added = result.updated = result.removed = 0
 
 
-async def _pick_tables(session: AsyncSession, source: Any, tables: list[str] | None,
-                       entries: dict[str, catalog.CatalogEntry], report: ProfileReport) -> list[str]:
-    cache = getattr(source, "schema_cache", None) or {}
-    all_tables = cache.get("tables") or {}
-    if tables:
-        picked: list[str] = []
-        for name in dict.fromkeys(str(t) for t in tables):
-            key = catalog.resolve_table_name(cache, name)
-            if key is None:
-                report.tables.append(TableProfile(table=name, error=f"表结构里没有 {name}，请先重新探查结构"))
-            elif key not in picked:
-                picked.append(key)
-        return picked
-    usage = await catalog.table_usage(session, source)
-    order = {name: i for i, name in enumerate(all_tables)}
-    candidates = [name for name, meta in all_tables.items()
-                  if not (meta or {}).get("is_view") and name in entries
-                  and _relation_candidates(entries[name].notes)]
-    # 还有待核实（推断）关系的表排在前面：剖析就是来核实它们的；关系都核实过、人工确认过的再剖析只是补覆盖率。
-    # 同样待核实的按使用次数，再按表结构顺序。返回全部候选，空表由 _skip_empty 估过行数再跳过
-    return sorted(candidates, key=lambda n: (not _pending(entries[n].notes), -usage.get(n, 0), order[n]))
-
-
-def _pending(notes: dict[str, Any] | None) -> bool:
-    """这张表还有没有待核实的关系：要核对的关系里有还是推断（proposed）的。"""
-    return any(r.get("status") == "proposed" for r in _relation_candidates(notes))
-
-
-async def _skip_empty(cx: _Context, candidates: list[str], report: ProfileReport) -> list[TableProfile]:
-    """不指定表时：按顺序估候选表的行数，确知是空表的跳过（记进 report.empty_tables），凑够 PROFILE_DEFAULT_TABLES
-    张为止。以前不估，所有表使用次数都是 0 时按表结构顺序取前 10 张，结果大半是空表、一条关系都核实不了。
-
-    估行数的查询算进这张表的查询数，行数留在 cx.sizes 里，剖析时不再查。最多估 PROFILE_PROBE_TABLES 张、最多用掉
-    查询次数上限的一半；超过了、或者整次剖析已经停下，剩下的候选不估、照顺序排上（真是空表的，剖析时各项检查会
-    记下「空表，无法剖析」）。
-    """
-    picked: list[TableProfile] = []
-    probed = 0
-    for name in candidates:
-        if len(picked) >= PROFILE_DEFAULT_TABLES:
-            break
-        result = TableProfile(table=name)
-        if (cx.run.stopped is None and probed < PROFILE_PROBE_TABLES
-                and cx.run.used < cx.settings.max_queries // 2):
-            probed += 1
-            before = cx.run.used
-            try:
-                size = await cx.size(name, result)
-            except _Stop:
-                size = None
-            result.queries = cx.run.used - before
-            if size is not None and size.rows == 0:
-                report.empty_tables.append(name)
-                continue
-        picked.append(result)
-    return picked
-
-
-async def profile_catalog(session: AsyncSession, row: Any, source: Any, *, tables: list[str] | None = None,
-                          actor: str | None = None, settings: ProfileSettings | None = None) -> ProfileReport:
-    """剖析这些表并把结论写进数据目录，同步完成。
-
-    - row：数据源记录（开关、遮罩按它的 options）；source：用来查询和读表结构的源（上传源是绑定当前快照的视图）。
-    - settings 不给就按 row.options 读；没开启抛 ProfileDisabled，这个源正在剖析抛 ProfileBusy。
-    - tables 为空时按使用次数取前 PROFILE_DEFAULT_TABLES 张目录里有待核实关系的表。
-    - 每张表做完就写入，后面的表停下（预算、总时长）不影响前面已经写进去的。
-    """
-    settings = ensure_enabled(row, settings)
-    if source.id in _RUNNING:
-        raise ProfileBusy(f"数据源「{getattr(row, 'name', '')}」正在进行数据剖析，请等待完成后再试")
-    _RUNNING.add(source.id)
-    try:
-        return await _profile(session, row, source, tables, actor, settings)
-    finally:
-        _RUNNING.discard(source.id)
-
-
 def ensure_enabled(row: Any, settings: ProfileSettings | None = None) -> ProfileSettings:
     """这个数据源能不能剖析：数据源停用了、或者没开启数据剖析，抛 ProfileDisabled（message 给人看）。
-    返回要用的设置（不给就按 row.options 读）。接口在做别的检查之前先调它：开关是第一道门。"""
+    返回要用的设置（不给就按 row.options 读）。建任务之前先调它：开关是第一道门；任务每张表开始前也按它重新看一遍。"""
     settings = settings or profile_settings(getattr(row, "options", None))
     name = getattr(row, "name", "") or ""
     if getattr(row, "enabled", True) is False:
@@ -1311,38 +1742,6 @@ def ensure_enabled(row: Any, settings: ProfileSettings | None = None) -> Profile
     if not settings.enabled:
         raise ProfileDisabled(f"数据源「{name}」未开启数据剖析。剖析会对业务库发查询，请先在数据源设置中开启数据剖析")
     return settings
-
-
-async def _profile(session: AsyncSession, row: Any, source: Any, tables: list[str] | None, actor: str | None,
-                   settings: ProfileSettings) -> ProfileReport:
-    at = catalog.now_iso()
-    report = ProfileReport(profiled_at=at, settings=settings)
-    dialect = SqlDialect(source.kind)
-    run = _Runner(source, settings, dialect)
-    cx = _Context(source=source, settings=settings, dialect=dialect, run=run,
-                  tables=(getattr(source, "schema_cache", None) or {}).get("tables") or {},
-                  masked={c.lower() for c in data_engine.masked_columns(getattr(row, "options", None))})
-    entries = await catalog.read_catalog(session, source.id)
-    picked = await _pick_tables(session, source, tables, entries, report)
-    results = [TableProfile(table=t) for t in picked] if tables else await _skip_empty(cx, picked, report)
-    for result in results:
-        table = result.table
-        report.tables.append(result)
-        if run.stopped:
-            detail = _STOP_DETAIL[run.stopped].format(max_queries=settings.max_queries,
-                                                      max_total_s=_fmt(settings.max_total_s))
-            result.skipped.append(ProfileSkip("table", table, run.stopped, detail))
-            continue
-        before = run.used
-        entry = entries.get(table)
-        out = await _profile_table(cx, table, entry.notes if entry else {}, result)
-        result.queries += run.used - before
-        await _write(session, source.id, table, out, result, at=at, actor=actor)
-    report.queries_used = run.used
-    report.stopped = run.stopped
-    logger.info("数据剖析 源=%s 表=%s 查询=%d 停止=%s 署名=%s", source.id,
-                ",".join(t.table for t in report.tables), run.used, run.stopped, actor)
-    return report
 
 
 # ==========================================================================
@@ -1399,7 +1798,7 @@ async def check_valid_filter(source: Any, table: str, meta: dict[str, Any] | Non
                              settings: ProfileSettings | None = None) -> FilterCheck:
     """开了数据剖析的源：数一数这条有效行过滤排除了多少行（模型起草时提议的那条，data/catalog_draft.py 调）。从不抛异常。
 
-    经剖析的只读守卫（_Runner：guard.check(readonly=True)、单条时限、查询次数上限）发一条查询：只取条件里用到的列，
+    经单条查询的入口（run_single_query：guard.check(readonly=True)、单条时限）发一条查询：只取条件里用到的列，
     先取前 max(sample_size, max_scan_rows) 行（大表不做整表扫描），再数总行数和不满足条件的行数（条件为 NULL 也算排除，
     和 WHERE 一样）。数到的不满前那么多行，就是整张表。
 
@@ -1437,14 +1836,10 @@ async def check_valid_filter(source: Any, table: str, meta: dict[str, Any] | Non
     cols = ", ".join(dialect.quote(c) for c in parsed.columns)
     inner = dialect.limit(f"SELECT {cols} FROM {dialect.table(meta, table)}", cap)
     sql = f"SELECT COUNT(*) AS n, SUM(CASE WHEN {cond} THEN 0 ELSE 1 END) AS x FROM ({inner}) s"
-    run = _Runner(source, settings, dialect)
     try:
-        res = await run(sql)
-    except _Skip as e:
+        res = await run_single_query(source, sql, settings=settings, kind=kind)
+    except QueryFailed as e:
         return _unchecked(e.detail.removesuffix("，已跳过"))
-    except _Stop as e:
-        return _unchecked(_STOP_DETAIL[e.reason].format(max_queries=settings.max_queries,
-                                                        max_total_s=_fmt(settings.max_total_s)).removesuffix("，未检查"))
     except SnapshotTampered as e:
         return _unchecked(str(e))
     row = res.rows[0] if res.rows else [None, None]
@@ -1465,9 +1860,12 @@ async def check_valid_filter(source: Any, table: str, meta: dict[str, Any] | Non
     return FilterCheck(True, note, rows, excluded, sampled)
 
 
-__all__ = ["CODES_MAX", "FILTER_CHECKED", "FILTER_NOT_ENABLED", "FILTER_SAMPLED", "FILTER_UNCHECKED", "FilterCheck",
-           "IN_CHUNK", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "PROFILE_DEFAULT_TABLES",
-           "PROFILE_OPTION", "PROFILE_PROBE_TABLES", "ProfileBusy", "ProfileDisabled", "ProfileReport",
-           "ProfileSettings", "ProfileSkip", "SqlDialect", "TableProfile", "TableSize", "check_valid_filter",
-           "ensure_enabled", "estimate_size", "excluded_share", "profile_catalog", "profile_settings",
-           "profile_settings_problem", "profile_settings_rejection", "sql_literal"]
+
+__all__ = ["CODES_MAX", "EMPTY_ERROR", "FILTER_CHECKED", "FILTER_NOT_ENABLED", "FILTER_SAMPLED", "FILTER_UNCHECKED",
+           "FilterCheck", "IN_CHUNK", "LEGACY_KEYS", "MAX_CODE_LEN", "MAX_LITERAL_LEN", "NOTE_PREFIX", "NOTHING_ERROR",
+           "PROFILE_OPTION", "PlannedCheck", "ProfileContext", "ProfileDisabled", "ProfileSettings", "ProfileSkip",
+           "QueryFailed", "SourceRunner", "SqlDialect", "TableBudget", "TableHooks", "TableResult", "TableSize",
+           "UNFINISHED_REASONS", "VIEW_ERROR", "check_valid_filter", "ensure_enabled", "estimate_size", "excluded_share",
+           "has_pending_relations", "make_context", "masked_of", "migrate_settings", "pending_relation_paths",
+           "plan_checks", "profile_checks", "profile_settings", "profile_settings_problem", "profile_settings_rejection",
+           "profile_table", "run_single_query", "sql_literal", "summarize", "without_legacy"]

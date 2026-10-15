@@ -62,7 +62,7 @@ MAX_QUERY_TIMEOUT_S = 600
 #:   运行事件里有查询结果的预览
 MASK_COLUMNS_OPTION = "mask_columns"
 
-#: 数据源 options 里的数据剖析设置（一个对象：开关、查询次数上限、单条时限……）。取值和校验见
+#: 数据源 options 里的数据剖析设置（一个对象：开关、每张表的查询数和时长、单条时限……）。取值和校验见
 #: data/catalog_profile.py；放在这里只为让拼连接串时摘掉它
 CATALOG_PROFILE_OPTION = "catalog_profile"
 
