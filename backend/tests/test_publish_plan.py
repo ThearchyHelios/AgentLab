@@ -202,6 +202,65 @@ async def test_a_process_with_an_unbound_step_stops_at_preflight(client):
     assert "沿用" in summary["save_version"] and "流程类" in summary["first_run"]
 
 
+@pytest.fixture
+async def erp_write():
+    """一项写入能力：绑定登记端点的 POST，没登记查询（结果未知时平台查不了，要人核实）。"""
+    from sqlalchemy import delete
+
+    from app.capabilities import registry
+    from app.db.models import Capability, CustomTool, Endpoint
+
+    tag = uuid.uuid4().hex[:6]
+    name = f"erp_claim_{tag}"
+    async with SessionLocal() as session:
+        erp = Endpoint(name=f"erp_{tag}", environments={"prod": {"base_url": "https://erp.example.com", "headers": {}}})
+        session.add(erp)
+        await session.flush()
+        session.add(CustomTool(name=name, kind="http", parameters={"type": "object", "properties": {}},
+                               config={"endpoint": erp.id, "method": "POST", "path": "/claims"}))
+        await session.commit()
+        await registry.sync_all(session)
+    try:
+        yield name
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(delete(CustomTool).where(CustomTool.name == name))
+            await session.execute(delete(Endpoint).where(Endpoint.name == f"erp_{tag}"))
+            await session.execute(delete(Capability).where(Capability.name == name))
+            await session.commit()
+            await registry.refresh_cache(session)
+
+
+async def test_the_reconciler_comes_from_the_writeback_card(client, erp_write):
+    """审批通过后写回一项没登记查询的能力：结果不明时要人核实。发布单只列一条、指到「写回哪里」卡片上那一项（应用检查说的
+    核实岗位没绑、写入没人核实是同一件事，不再重复列）；在卡片上选了人，绑到应用的核实岗位，这几条都不再有。"""
+    from app.blueprints.templates import get_template
+
+    bp = (await client.post("/api/blueprints", json={"source": {"kind": "template", "id": "approval"},
+                                                     "scope": "shared"})).json()
+    example = get_template("approval").example()
+    await s.edit_spec(bp["id"], **{k: example[k] for k in ("purpose", "people", "fields", "access")},
+                      writeback={"capability": s.item(erp_write), "mapping": s.item({"amount": "form.amount"}),
+                                 "confirm": s.item(True), "reconciler": s.item(None, status="missing")})
+    assert (await client.get(f"/api/blueprints/{bp['id']}")).json()["reconciler_needed"] is True
+
+    def about_reconciler(plan: dict) -> list[str]:
+        return sorted(p["code"] for p in plan["problems"] if p["code"] in ("bp.reconciler_unbound", "app.reconciler_unbound")
+                      or (p["code"] == "app.slot_unbound" and p.get("path") == "slots.reconciler"))
+
+    plan = (await client.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).json()
+    assert plan["ok"] is False and about_reconciler(plan) == ["bp.reconciler_unbound"]
+    (problem,) = [p for p in plan["problems"] if p["code"] == "bp.reconciler_unbound"]
+    assert problem["who"] == "you" and problem["path"] == "/writeback/reconciler"
+    assert "结果不明时谁去核实" in problem["plain"]["action"]
+
+    r = await client.patch(f"/api/blueprints/{bp['id']}", json={"ops": [
+        {"op": "bp_set", "path": "/writeback/reconciler", "value": [{"kind": "group", "name": "财务组"}]}]})
+    assert r.status_code == 200, r.text
+    plan = (await client.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).json()
+    assert about_reconciler(plan) == [], [p["code"] for p in plan["problems"]]
+
+
 async def test_a_failed_step_stops_and_resume_does_not_redo_what_is_done(client, tmp_path, monkeypatch):
     from app.blueprints import publish_plan as plans
 

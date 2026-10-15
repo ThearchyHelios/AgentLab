@@ -59,7 +59,7 @@ BLUEPRINT_SYSTEM_PROMPT = """\
   "sensitive":false}；type 只能是 string、number、integer、boolean、array，x-widget 可写 textarea、select、date 这类控件
 - /writeback 写回哪里：{"capability":"能力登记里的写入能力","mapping":{"参数":"form.字段 | metric.指标 id | rows | '常量'"},
   "confirm":true}
-- 谁能看（/access）由用户自己在卡片上定，你不填
+- 谁能看（/access）、写回的结果不明时谁去核实（/writeback/reconciler）由用户自己在卡片上定，你不填
 
 规则：
 - 只提议：你写的每一项都是「待确认」，用户确认了才算数；用户已经确认过的项不要改，除非他这一轮明确要改

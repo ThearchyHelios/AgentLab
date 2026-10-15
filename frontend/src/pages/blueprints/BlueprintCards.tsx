@@ -6,6 +6,8 @@
  * 条件这些选填的空着也是缺，只看项的状态会把它们都标成缺；「待确认」是助手、模板、目录提的、你还没看过的项。界面不自己判
  * 哪些项必填（P7）。
  *
+ * 写回卡片上「结果不明时谁去核实」只在目标能力没登记查询时摆（服务端 Blueprint.reconciler_needed），只能由人选（同「谁能看」）。
+ *
  * 每一项可以点「修改」：改完发一个 bp_set（值是纯值，服务端记成来源「你」、已确认）；待确认的可以直接点「确认」（只改状态，
  * 来源不变），一张卡片上待确认的不止一项时卡头另有「确认全部」，一次修改带上这几项的状态（服务端整批落或整批不落）。
  * 加一项是 bp_add（卡片字段写纯值），删一项是 bp_remove。对到数据的项写表、中文名、粒度、业务日期和
@@ -28,6 +30,9 @@ import type {
 } from '../../typesBlueprint'
 import { SELF_RECORDS, ValueEditor, valueText, type EditorKind, type EditorScope } from './editors'
 import { isItem, missingPaths, visibleCards, type CardKey } from './shared'
+
+/** 卡片上还没有的一项（旧蓝图的写回卡片没有「结果不明时谁去核实」）：按缺摆出来，改了服务端才建 */
+const UNSET: BpItem = { value: null, source: 'template', status: 'missing' }
 
 const STATUS_COLOR: Record<ItemStatus, string> = {
   confirmed: 'var(--st-done)', proposed: 'var(--st-waiting)', missing: 'var(--st-failed)',
@@ -207,8 +212,12 @@ function CardFor({ card, ctx, template }: { card: CardKey; ctx: CardCtx; templat
     }
     case 'writeback': {
       const wb = spec.writeback
+      // 结果不明时谁去核实：目标能力没登记查询时才摆（服务端说要不要）；以前选过、后来能力补登了查询的照样摆出来，写明用不上
+      const reconciler: BpItem = wb?.reconciler ?? UNSET
+      const chosen = Array.isArray(reconciler.value) && reconciler.value.length > 0
+      const askReconciler = !!wb && (!!ctx.bp.reconciler_needed || chosen)
       const items: [string, BpItem][] = wb ? [['/writeback/capability', wb.capability], ['/writeback/mapping', wb.mapping],
-        ['/writeback/confirm', wb.confirm]] : []
+        ['/writeback/confirm', wb.confirm], ...(askReconciler ? [['/writeback/reconciler', reconciler] as [string, BpItem]] : [])] : []
       return (
         <Card card={card} note={note} issues={issues} status={cardStatus(ctx, card, items)}
               actions={!wb ? (
@@ -222,6 +231,15 @@ function CardFor({ card, ctx, template }: { card: CardKey; ctx: CardCtx; templat
               <ItemRow ctx={ctx} path="/writeback/capability" item={wb.capability} label={ITEM_LABEL.capability} kind="text" />
               <ItemRow ctx={ctx} path="/writeback/mapping" item={wb.mapping} label={ITEM_LABEL.mapping} kind="mapping" />
               <ItemRow ctx={ctx} path="/writeback/confirm" item={wb.confirm} label={ITEM_LABEL.confirm} kind="bool" />
+              {askReconciler && (
+                <>
+                  <ItemRow ctx={ctx} path="/writeback/reconciler" item={reconciler} label={ITEM_LABEL.reconciler} kind="grantees" />
+                  <p className="pl-[7.5rem] text-2xs leading-relaxed text-dim"
+                     data-bp-reconciler-hint={ctx.bp.reconciler_needed ? 'needed' : 'unused'}>
+                    {ctx.bp.reconciler_needed ? BP_EDIT_TEXT.reconcilerHint : BP_EDIT_TEXT.reconcilerUnused}
+                  </p>
+                </>
+              )}
             </SubBlock>
           )}
         </Card>

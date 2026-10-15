@@ -168,7 +168,7 @@ def example() -> dict[str, Any]:
         "fields": [],
         "writeback": {"capability": item("fake_ledger_adjust"),
                       "mapping": item({"items": "rows", "total": "metric.diff_amount"}),
-                      "confirm": item(True)},
+                      "confirm": item(True), "reconciler": item([{"kind": "group", "name": "财务组"}])},
         "access": {"use": [{"kind": "group", "name": "财务组"}], "observe": [], "manage": []}, "asks": [],
     }
 
@@ -193,7 +193,8 @@ TEMPLATE = register(TemplateDef(
            "data": "必填：差异的指标（差异笔数、差异金额），对到同一个库里的表",
            "cadence": "必填：多久核对一次，统计哪一期",
            "people": "必填：谁复核（只有一步）",
-           "writeback": "必填：写回哪个系统（能力登记里的写入能力）、字段对应（差异明细写 rows）、要不要人确认",
+           "writeback": "必填：写回哪个系统（能力登记里的写入能力）、字段对应（差异明细写 rows）、要不要人确认；"
+                        "能力没登记查询的，还要定结果不明时谁去核实",
            "access": "可选：谁能用、谁能看全部、谁能管理"},
     personal=None,
     skeleton=skeleton, app_skeleton=app_skeleton, schedule=schedule, tags=["流程", "定时", "写回"],

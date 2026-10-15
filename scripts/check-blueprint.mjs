@@ -8,6 +8,7 @@
 //     应用首页的「新建应用」链到 /apps/create；
 //   - 卡片：卡头标状态（缺按服务端检查、待确认、已确认），对到数据的项写表、中文名、粒度、业务日期、为什么；「修改」发 bp_set
 //     （纯值），确认只改状态，「确认全部」一次带上整张卡片待确认的几项，加一项发 bp_add（纯值）；缺项时「用真数试一次」置灰并写清缺什么；
+//   - 写回卡片：目标能力没登记查询时摆「结果不明时谁去核实」（服务端 reconciler_needed），缺时只挡发布，选人发 bp_set；
 //   - 反问：助手的 bp_ask 画成可点的选项，「这一轮在等你回答」常显，输入框提示回答；点选项就是把它作为下一轮发出去（回答记在
 //     问题上、这一轮落进蓝图对话都是服务端做的，前端不另记）；
 //   - 关节：只列生成关节，按卡片填的汇总一句；「让助手填」走 fill-joints-stream，逐组写进度，组之间并行；
@@ -74,7 +75,7 @@ const TEMPLATES = [
   { id: 'approval', version: 1, label: '审批流程', description: '有人发起、有人审批，可以按金额分级', applies_when: '', tags: [],
     personal: null,
     cards: [{ card: 'purpose', note: '必填' }, { card: 'fields', note: '必填：发起时填什么' }, { card: 'people', note: '必填：谁审批' },
-      { card: 'access', note: '' }] },
+      { card: 'writeback', note: '可选：通过后写回哪个系统' }, { card: 'access', note: '' }] },
   { id: 'freeform', version: 1, label: '自由形', description: '从已有的运行或工作流导入', applies_when: '', tags: [], personal: '只读部分',
     cards: [{ card: 'purpose', note: '' }, { card: 'cadence', note: '' }, { card: 'access', note: '' }] },
 ]
@@ -489,6 +490,64 @@ await section('蓝图页：卡片的状态、对到的数据、改一项、缺�
   check('被拒：编辑框留着，提示服务端的原因', await page.getByText('「单位」最多 20 个字').first().waitFor({ timeout: 3000 }).then(() => true, () => false)
     && await page.locator('[data-bp-item="/data/0/unit"] [data-bp-editor]').count() === 1)
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+})
+
+// ---------------------------------------------------------------- 写回：结果不明时谁去核实
+
+/** 审批流程的蓝图：通过后写回一项没登记查询的写入能力（服务端说要定核实人：reconciler_needed） */
+const CLAIM_SPEC = {
+  ...clone(SPEC), template: { id: 'approval', version: 1 }, data: [], cadence: item(null),
+  people: [{ id: 's1', label: item('主管审批', 'user'), who: item([{ kind: 'user', name: 'zhang' }], 'user'),
+    policy: item({ kind: 'any' }, 'user'), due: item(null), on_timeout: item(null), threshold: item(null) }],
+  fields: [{ name: 'amount', spec: item({ type: 'number', title: '金额' }, 'user'), sensitive: false }],
+  writeback: { capability: item('erp_claim', 'user'), mapping: item({ amount: 'form.amount' }, 'user'),
+    confirm: item(true, 'user'), reconciler: item(null) },
+}
+const RECONCILER_UNBOUND = { code: 'bp.reconciler_unbound', level: 'error', path: '/writeback/reconciler',
+  message: '「erp_claim」没登记查询：写回的结果不明时要有人去目标系统里核实，还没定是谁',
+  plain: { title: '写回的结果不明时没人核实', why: '平台查不了，也不会自动重发', who: 'you',
+    action: '在「写回哪里」卡片的「结果不明时谁去核实」里选人或组。' } }
+const CLAIM = (extra = {}) => ({ ...clone(BP), template_id: 'approval', spec: clone(CLAIM_SPEC), joints: {},
+  issues: [RECONCILER_UNBOUND], reconciler_needed: true, ...extra })
+
+await section('写回：结果不明时谁去核实（能力没登记查询才摆，只能由人选，只挡发布）', async () => {
+  const state = { bp: CLAIM() }
+  const { page } = await open({ state })
+  await page.goto(`${WEB}/blueprints/bp_week`)
+  await page.locator('[data-card="writeback"]').waitFor({ timeout: 15000 })
+  const row = page.locator('[data-bp-item="/writeback/reconciler"]')
+  check('能力没登记查询：摆出「结果不明时谁去核实」，标「缺」，写明为什么要人核实',
+    await row.count() === 1 && await row.getAttribute('data-item-status') === 'missing'
+    && await page.locator('[data-bp-reconciler-hint="needed"]').count() === 1
+    && await page.locator('[data-card="writeback"]').getAttribute('data-card-status') === 'missing')
+  check('卡片上照白话写缺什么、怎么改', (await page.locator('[data-card="writeback"] [data-card-issues]').innerText())
+    .includes('写回的结果不明时没人核实'))
+  check('只挡发布：「用真数试一次」照样能点', !(await page.locator('[data-blueprint-trial]').isDisabled()))
+  await row.locator('[data-bp-edit]').click()
+  const editor = row.locator('[data-bp-editor]')
+  await editor.locator('select').first().selectOption('group')
+  await editor.locator('[data-principal-picker] input').fill('财务组')
+  await editor.locator('[data-principal-picker] input').press('Enter')
+  await row.locator('[data-bp-save]').click()
+  check('选人：bp_set /writeback/reconciler，值是一组人或组', await until(() => (state.patches ?? []).length === 1)
+    && JSON.stringify(state.patches[0].ops) === JSON.stringify([
+      { op: 'bp_set', path: '/writeback/reconciler', value: [{ kind: 'group', name: '财务组' }] }]),
+    JSON.stringify(state.patches?.[0]))
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+
+  // 能力登记了查询：平台自己查，不摆这一项；以前选过的照样摆出来，写明用不上
+  const looked = { bp: CLAIM({ issues: [], reconciler_needed: false }) }
+  const second = await open({ state: looked })
+  await second.page.goto(`${WEB}/blueprints/bp_week`)
+  await second.page.locator('[data-card="writeback"]').waitFor({ timeout: 15000 })
+  check('登记了查询、没选过人：不摆这一项', await second.page.locator('[data-bp-item="/writeback/reconciler"]').count() === 0)
+  const chosen = CLAIM({ issues: [], reconciler_needed: false })
+  chosen.spec.writeback.reconciler = item([{ kind: 'group', name: '财务组' }], 'user')
+  const third = await open({ state: { bp: chosen } })
+  await third.page.goto(`${WEB}/blueprints/bp_week`)
+  await third.page.locator('[data-card="writeback"]').waitFor({ timeout: 15000 })
+  check('登记了查询、以前选过人：照样摆出来，写明用不上', await third.page.locator('[data-bp-item="/writeback/reconciler"]').count() === 1
+    && await third.page.locator('[data-bp-reconciler-hint="unused"]').count() === 1)
 })
 
 // ---------------------------------------------------------------- 反问

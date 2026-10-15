@@ -105,7 +105,7 @@ TEMPLATE = register(TemplateDef(
     cards={"purpose": "必填：一句话说清审批什么",
            "fields": "必填：申请人要填的字段（名称、类型、必填、上下限、选项）",
            "people": "必填：每一步谁处理、几个人同意算通过、时限、超时给谁；某一步只在金额超过某个数时才走，写条件",
-           "writeback": "可选：通过后写回哪个系统、哪些字段、要不要人确认",
+           "writeback": "可选：通过后写回哪个系统、哪些字段、要不要人确认；能力没登记查询的，还要定结果不明时谁去核实",
            "access": "可选：谁能发起、谁能看全部、谁能管理"},
     personal=None,
     skeleton=skeleton, app_skeleton=app_skeleton, schedule=None, tags=["流程", "审批"],

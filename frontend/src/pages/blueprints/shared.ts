@@ -65,10 +65,12 @@ export function visibleCards(spec: BlueprintSpec | null | undefined, templateCar
 }
 
 /**
- * 服务端蓝图检查（Blueprint.issues）里说「缺」的那几种：缺必填项、没对到表、岗位没人。卡片上的「缺」以它为准——项的状态
- * 默认就是缺（单位、筛选条件这些可以不填），只看项的状态会把选填的都标成缺
+ * 服务端蓝图检查（Blueprint.issues）里说「缺」的那几种：缺必填项、没对到表、岗位没人、写回结果不明时没人核实。卡片上的
+ * 「缺」以它为准——项的状态默认就是缺（单位、筛选条件这些可以不填），只看项的状态会把选填的都标成缺
  */
-export const MISSING_CODES = new Set(['bp.missing', 'bp.data_unmapped', 'bp.people_unbound', 'tpl.joint_unfilled'])
+export const MISSING_CODES = new Set([
+  'bp.missing', 'bp.data_unmapped', 'bp.people_unbound', 'bp.reconciler_unbound', 'tpl.joint_unfilled',
+])
 
 /** 卡片上标「缺」的位置：服务端给了检查结果时按它；老服务端没给时退回项本身的状态（null） */
 export function missingPaths(bp: Blueprint | null | undefined): Set<string> | null {

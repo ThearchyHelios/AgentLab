@@ -187,6 +187,47 @@ def test_writeback_only_takes_write_capabilities(monkeypatch):
     assert apply_bp_op(spec, {"op": "bp_remove", "path": "/writeback"}, source="user")["writeback"] is None
 
 
+def test_the_reconciler_is_chosen_by_people_and_only_when_the_write_cannot_be_looked_up(monkeypatch):
+    """写回的「结果不明时谁去核实」：目标能力没登记查询时才要（试运行只提醒，发布挡住）；只收用户的、只能是人或组；
+    助手换写回卡片时留着用户选好的人；岗位绑定按它绑到应用的核实岗位，能力补登了查询就不再要、也不再绑。"""
+    from app.blueprints.templates._common import bindings_of, needs_reconciler
+    from app.capabilities import registry
+
+    monkeypatch.setitem(registry._view, "bp_test_erp_post", {"effect": "write", "endpoint_id": "e1", "missing": False})
+    spec = apply_bp_op(empty_blueprint(), {"op": "bp_template", "template": {"id": "approval", "version": 1}},
+                       source="user")
+    spec = apply_bp_op(spec, {"op": "bp_set", "path": "/writeback", "value": {
+        "capability": "bp_test_erp_post", "mapping": {"amount": "form.reason"}, "confirm": True}}, source="assistant")
+    assert needs_reconciler(spec)
+    found = {i["code"]: i for i in blueprint_issues(spec, for_="publish")}
+    assert (found["bp.reconciler_unbound"]["level"], found["bp.reconciler_unbound"]["path"]) == (
+        "error", "/writeback/reconciler")
+    trial = {i["code"]: i for i in blueprint_issues(spec, for_="trial")}
+    assert trial["bp.reconciler_unbound"]["level"] == "warning", "试运行的待办派给试运行的人自己，不挡试运行"
+
+    finance = [{"kind": "group", "name": "财务组"}]
+    assert "要由你来定" in refused(spec, {"op": "bp_set", "path": "/writeback/reconciler", "value": finance}).message
+    assert "要由你来定" in refused(spec, {"op": "bp_set", "path": "/writeback", "value": {
+        "capability": "bp_test_erp_post", "reconciler": finance}}).message
+    assert "人或组" in refused(spec, {"op": "bp_set", "path": "/writeback/reconciler",
+                                      "value": [{"kind": "slot", "name": "财务"}]}, source="user").message
+    chosen = apply_bp_op(spec, {"op": "bp_set", "path": "/writeback/reconciler", "value": [*finance, *finance]},
+                         source="user")
+    assert chosen["writeback"]["reconciler"] == {"value": finance, "source": "user", "status": "confirmed", "why": None}
+    assert not [i for i in blueprint_issues(chosen, for_="publish") if i["code"] == "bp.reconciler_unbound"]
+    assert bindings_of(chosen)["slots"]["reconciler"] == finance
+    # 助手换目标能力、字段对应：用户选好的人留着
+    kept = apply_bp_op(chosen, {"op": "bp_set", "path": "/writeback", "value": {
+        "capability": "bp_test_erp_post", "mapping": {"amount": "form.reason"}, "confirm": False}}, source="assistant")
+    assert kept["writeback"]["reconciler"]["value"] == finance and kept["writeback"]["confirm"]["value"] is False
+    # 补登了查询：平台自己查，不再要人核实，卡片上留着的人也不绑
+    monkeypatch.setitem(registry._view, "bp_test_erp_post", {"effect": "write", "endpoint_id": "e1", "missing": False,
+                                                              "lookup": "bp_test_erp_get"})
+    assert not needs_reconciler(spec)
+    assert not [i for i in blueprint_issues(spec, for_="publish") if i["code"] == "bp.reconciler_unbound"]
+    assert "reconciler" not in bindings_of(chosen)["slots"]
+
+
 def test_access_is_for_people_and_asks_go_one_way():
     spec = empty_blueprint()
     e = refused(spec, {"op": "bp_add", "path": "/access/use", "value": {"kind": "group", "name": "门店"}})

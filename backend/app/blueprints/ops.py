@@ -9,7 +9,8 @@
 - /asks：bp_ask 追加一个反问（只有助手问），/asks/<i>/answer 记用户的回答；
 - 选模板只走 bp_template：记下模板和版本，按模板预置还没填的卡片（来源记「模板默认」、状态「待确认」）。
 
-「谁能看」（access）只收用户的操作：授权是人的决定，助手提的没有「待确认」可挂（P2）。
+「谁能看」（access）和写回的「结果不明时谁去核实」（/writeback/reconciler）只收用户的操作：授权、派活给谁是人的决定，
+助手提的没有「待确认」可挂（P2）。
 落地前后都按 agentlab.blueprint/1 的形状核一遍（spec.parse_blueprint），不合形状的一律拒。
 """
 from __future__ import annotations
@@ -45,9 +46,17 @@ POLICY_KINDS = ("any", "all", "quorum")
 TIMEOUT_ACTIONS = ("remind", "escalate", "reject")
 #: 金额线只许「字段 比较 常量」
 THRESHOLD_OPS = (">", ">=", "<", "<=", "==", "!=")
-#: 「谁能看」的三档和能授权的对象
+#: 「谁能看」的三档和能授权的对象（写回的核实人也只能是人或组：绑到应用的核实岗位）
 ACCESS_KINDS = ("use", "observe", "manage")
 GRANTEE_KINDS = ("user", "group")
+#: 写回卡片上的项
+WRITEBACK_KEYS = ("capability", "mapping", "confirm", "reconciler")
+#: 只收用户操作的位置（JSON 指针的前几段）和助手动它时交回的话（按位置的最后一段认）
+USER_ONLY = (("access",), ("writeback", "reconciler"))
+_USER_ONLY_TEXT = {
+    "access": "「谁能看」要由你来定：授权是人的决定，助手不替你填",
+    "reconciler": "「结果不明时谁去核实」要由你来定：派活给谁是人的决定，助手不替你选",
+}
 #: 入口字段里模板自己要用的名字（统计期），「填什么」不能占
 RESERVED_FIELDS = frozenset({"period", "period_start", "period_end", "mode"})
 #: 列表的上限：再多就不是普通人在卡片上能判断对错的颗粒度了
@@ -363,6 +372,18 @@ def _grantees(value: Any, _spec: dict[str, Any]) -> Any:
     return [_principal(v, GRANTEE_KINDS, "授权的对象") for v in value]
 
 
+def _reconciler(value: Any, _spec: dict[str, Any]) -> Any:
+    """结果不明时谁去核实：一组人或组（绑到应用的核实岗位，核实待办派给他们）。"""
+    if not isinstance(value, list) or len(value) > 20:
+        raise BpRefused("核实的人要写成一组人或组（最多 20 个）")
+    out: list[dict[str, str]] = []
+    for v in value:
+        p = _principal(v, GRANTEE_KINDS, "核实的人")
+        if p not in out:
+            out.append(p)
+    return out or None
+
+
 #: 各项的检查。键是 (卡片, 项)；卡片本身就是一项的写 (卡片, None)
 _CHECKS: dict[tuple[str, str | None], Callable[[Any, dict[str, Any]], Any]] = {
     ("purpose", None): _text(500, "目的"),
@@ -383,6 +404,7 @@ _CHECKS: dict[tuple[str, str | None], Callable[[Any, dict[str, Any]], Any]] = {
     ("writeback", "capability"): _capability,
     ("writeback", "mapping"): _mapping,
     ("writeback", "confirm"): _confirm,
+    ("writeback", "reconciler"): _reconciler,
 }
 
 
@@ -441,12 +463,22 @@ def _new_entry(card: str, raw: Any, source: str, spec: dict[str, Any]) -> dict[s
 
 
 def _writeback(raw: Any, source: str, spec: dict[str, Any]) -> dict[str, Any] | None:
+    """整张写回卡片换掉。核实人只由用户定：助手写了要拒；没写的沿用卡片上原来的（助手改目标能力、字段对应时，不能把
+    用户选好的人冲掉）。"""
     if raw is None:
         return None
-    if not isinstance(raw, dict) or set(raw) - {"capability", "mapping", "confirm"}:
-        raise BpRefused("「写回哪里」只能写目标能力、字段对应和要不要人确认")
-    return {key: _item(_checked("writeback", key, raw.get(key), spec), source)
-            for key in ("capability", "mapping", "confirm")}
+    if not isinstance(raw, dict) or set(raw) - set(WRITEBACK_KEYS):
+        raise BpRefused("「写回哪里」只能写目标能力、字段对应、要不要人确认和结果不明时谁去核实")
+    if "reconciler" in raw and source != "user":
+        raise BpRefused(_USER_ONLY_TEXT["reconciler"])
+    out = {key: _item(_checked("writeback", key, raw.get(key), spec), source)
+           for key in ("capability", "mapping", "confirm")}
+    if "reconciler" in raw:
+        out["reconciler"] = _item(_checked("writeback", "reconciler", raw["reconciler"], spec), source)
+    else:
+        before = (spec.get("writeback") or {}).get("reconciler")
+        out["reconciler"] = copy.deepcopy(before) if isinstance(before, dict) else _item(None, "template")
+    return out
 
 
 def _set_item_part(item: dict[str, Any], part: str, value: Any, source: str) -> None:
@@ -481,9 +513,9 @@ def _container(spec: dict[str, Any], tokens: list[str]) -> tuple[dict[str, Any],
     if card == "fields" and len(tokens) == 3 and tokens[2] == "spec":
         entries = spec.get("fields") or []
         return entries[_index(tokens[1], len(entries))], "spec"
-    if card == "writeback" and len(tokens) == 2 and tokens[1] in ("capability", "mapping", "confirm"):
+    if card == "writeback" and len(tokens) == 2 and tokens[1] in WRITEBACK_KEYS:
         if spec.get("writeback") is None:
-            spec["writeback"] = {k: _item(None, "template") for k in ("capability", "mapping", "confirm")}
+            spec["writeback"] = {k: _item(None, "template") for k in WRITEBACK_KEYS}
         return spec["writeback"], tokens[1]
     raise BpRefused(f"不能改这个位置：/{'/'.join(tokens)}")
 
@@ -642,8 +674,8 @@ def apply_bp_op(spec: dict[str, Any], op: dict[str, Any], *, source: str) -> dic
         tokens = parse_pointer(parsed.path)
         if tokens[0] not in _LABEL or tokens[0] == "template":
             raise BpRefused(f"没有这张卡片：/{tokens[0]}（选模板用 bp_template）")
-        if tokens[0] == "access" and source != "user":
-            raise BpRefused("「谁能看」要由你来定：授权是人的决定，助手不替你填")
+        if source != "user" and (only := next((k for k in USER_ONLY if tuple(tokens[:len(k)]) == k), None)):
+            raise BpRefused(_USER_ONLY_TEXT[only[-1]])
         if parsed.op == "bp_set":
             _set(out, tokens, parsed.value, source)
         elif parsed.op == "bp_add":
@@ -720,6 +752,15 @@ def blueprint_issues(spec: dict[str, Any], *, for_: str) -> list[dict[str, Any]]
         add("bp.missing", "/writeback", "「写回哪里」还没定：要写回哪个系统、哪些字段")
     elif isinstance(wb, dict) and _value(wb.get("capability")) is not None and _value(wb.get("mapping")) is None:
         add("bp.missing", "/writeback/mapping", "写回的字段对应还没写：目标系统的每个参数取哪个字段或指标")
+    if "writeback" in used and for_ != "personal" and isinstance(wb, dict) and _value(wb.get("reconciler")) is None:
+        from app.blueprints.templates._common import needs_reconciler
+
+        if needs_reconciler(spec):
+            # 目标能力没登记查询：写回的结果不明时平台查不了、也不自动重发，要有人去目标系统里核实。试运行时写入走测试
+            # 环境或演练、待办派给试运行的人自己，不挡试运行，只挡发布（同 bp.people_unbound）
+            add("bp.reconciler_unbound", "/writeback/reconciler",
+                f"「{_value(wb.get('capability'))}」没登记查询：写回的结果不明时（请求发出去了、没拿到答复）要有人去目标系统里"
+                "核实，还没定是谁", level="error" if publish else "warning")
 
     for card in ("data", "people", "fields"):
         if spec.get(card) and card not in used:
@@ -818,14 +859,14 @@ def _items(spec: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
             out.append((f"/fields/{i}/spec", f["spec"]))
     wb = spec.get("writeback")
     if isinstance(wb, dict):
-        out += [(f"/writeback/{k}", wb[k]) for k in ("capability", "mapping", "confirm") if isinstance(wb.get(k), dict)]
+        out += [(f"/writeback/{k}", wb[k]) for k in WRITEBACK_KEYS if isinstance(wb.get(k), dict)]
     return out
 
 
 _PART_LABEL = {"label": "名称", "unit": "单位", "table": "对到的表", "measure": "怎么算", "date": "业务日期",
                "filter": "筛选条件", "grain": "粒度", "who": "处理人", "policy": "几个人同意", "due": "时限",
                "on_timeout": "超时怎么办", "threshold": "条件", "spec": "字段", "capability": "目标能力",
-               "mapping": "字段对应", "confirm": "要不要人确认"}
+               "mapping": "字段对应", "confirm": "要不要人确认", "reconciler": "结果不明时谁去核实"}
 
 
 def _where(path: str) -> str:

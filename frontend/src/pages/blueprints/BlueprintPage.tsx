@@ -25,8 +25,11 @@ import { TrialSection } from './TrialSection'
 import { blueprintPath, trialed } from './shared'
 
 const SECTIONS = ['cards', 'trial'] as const
-/** 只挡发布、不挡试运行的问题：待确认的项、岗位没人（试运行时人工步骤派给试运行的人自己，服务端 blueprints/ops） */
-const PUBLISH_ONLY = new Set(['bp.unconfirmed', 'bp.people_unbound'])
+/**
+ * 只挡发布、不挡试运行的问题：待确认的项、岗位没人、写回结果不明时没人核实（试运行时人工步骤派给试运行的人自己，写入走
+ * 测试环境或演练，服务端 blueprints/ops）
+ */
+const PUBLISH_ONLY = new Set(['bp.unconfirmed', 'bp.people_unbound', 'bp.reconciler_unbound'])
 type Section = (typeof SECTIONS)[number]
 
 /** 模板说明整站一份，进一次蓝图页取一次就够 */

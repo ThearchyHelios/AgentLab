@@ -204,6 +204,7 @@ export const ITEM_LABEL: Record<string, string> = {
   capability: '写到哪个系统',
   mapping: '字段对应',
   confirm: '要不要人确认',
+  reconciler: '结果不明时谁去核实',
   cadence: '多久更新、统计哪一期',
   use: '可以使用',
   observe: '可以查看全部',
@@ -351,6 +352,10 @@ export const BP_EDIT_TEXT = {
   addField: '加一个字段',
   addFieldPrompt: '字段叫什么（例如「金额」）',
   addWriteback: '要写回系统',
+  /** 写回卡片上「结果不明时谁去核实」的说明：目标能力没登记查询时才摆（服务端 Blueprint.reconciler_needed） */
+  reconcilerHint: '这项写入能力没登记查询：写回的结果不明时（请求发出去了、没拿到答复），平台查不了，也不会自动重发，'
+    + '要有人去目标系统里看写进去没有。只能由你来选。',
+  reconcilerUnused: '这项写入能力已经登记了查询，结果不明时平台自己去查：这一项用不上了，发布时不会派给他们。',
   removeTitle: (where: string) => `删掉${where}？`,
   removeConfirm: '删掉',
   template: '换一个场景',

@@ -78,6 +78,9 @@ class Writeback(_Strict):
     capability: Item = Field(default_factory=Item)
     mapping: Item = Field(default_factory=Item)  # {参数: "form.x" | "metric.y" | 常量}
     confirm: Item = Field(default_factory=Item)  # 要不要人确认（布尔）
+    # 结果不明时谁去核实（[{kind: user|group, name}]）：目标能力没登记查询时才要，绑到应用的核实岗位（apps/derive.RECONCILER）。
+    # 只由用户定（同「谁能看」）。旧蓝图没有这一项，读进来是空的
+    reconciler: Item = Field(default_factory=Item)
 
 
 class Access(_Strict):

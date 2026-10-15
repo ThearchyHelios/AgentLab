@@ -49,6 +49,11 @@ export interface BpWriteback {
   capability: BpItem<string>
   mapping: BpItem<Record<string, string>>
   confirm: BpItem<boolean>
+  /**
+   * 结果不明时谁去核实（一组人或组）：目标能力没登记查询时才要（Blueprint.reconciler_needed），发布时绑到应用的核实岗位。
+   * 只由用户定，助手的改动服务端不收。旧蓝图没有这一项
+   */
+  reconciler?: BpItem<{ kind: 'user' | 'group'; name: string }[]>
 }
 
 export interface BpAccess {
@@ -122,6 +127,11 @@ export interface Blueprint {
   graph_hash: string | null
   joints: Record<string, JointState>
   copied_from: string | null
+  /**
+   * 写回卡片上要不要摆「结果不明时谁去核实」：模板用到写回、选了目标能力、这项能力没登记查询（服务端
+   * templates/_common.needs_reconciler，界面不自己判）。老服务端不给时按不要
+   */
+  reconciler_needed?: boolean
   /** 蓝图检查（bp.* / tpl.*），带白话 */
   issues?: PlainIssue[]
   created_at: string

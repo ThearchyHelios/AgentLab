@@ -352,6 +352,12 @@ def bindings_of(bp: dict[str, Any]) -> dict[str, Any]:
         timeout = value(step.get("on_timeout"))
         if isinstance(timeout, dict):
             bind(escalate_slot(step), timeout.get("to") or [])
+    if needs_reconciler(bp):
+        # 写回的结果不明时谁去核实：只在目标能力没登记查询时绑（应用骨架这时才声明核实岗位，app_base）。补登了查询的，
+        # 卡片上留着的人不再绑：平台自己查，用不上
+        from app.apps.derive import RECONCILER
+
+        bind(RECONCILER, value((bp.get("writeback") or {}).get("reconciler")) or [])
     return {"slots": slots}
 
 
@@ -420,6 +426,18 @@ def write_lookup(capability: str) -> bool:
 
     view = cached_view(capability) or {}
     return bool(view.get("lookup"))
+
+
+def needs_reconciler(bp: dict[str, Any]) -> bool:
+    """「写回哪里」要不要定「结果不明时谁去核实」：模板用到写回卡片、选了目标能力、这项能力没登记查询（和应用骨架加核实
+    岗位同一个判断，app_base）。结果不明时平台不自动重发，查不了就只能派人去目标系统里看。蓝图检查、岗位绑定、交给前端的
+    蓝图（reconciler_needed）共用这一份。"""
+    ref = bp.get("template")
+    template = get_template(str(ref.get("id") or "")) if isinstance(ref, dict) else None
+    if template is None or "writeback" not in template.cards:
+        return False
+    capability = value((bp.get("writeback") or {}).get("capability"))
+    return bool(capability) and not write_lookup(str(capability))
 
 
 # ==========================================================================

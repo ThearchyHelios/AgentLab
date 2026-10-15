@@ -377,7 +377,10 @@ async def blueprint_view(session: AsyncSession, blueprint: Any) -> dict[str, Any
 
 def blueprint_out(blueprint: Any, *, issues: bool = True, extra: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """一张蓝图交给前端的样子（frontend/src/typesBlueprint.ts 的 Blueprint）。关节只给状态和模板声明的说法、类型、分组
-    （JointState：status、by、note、label、kind、group），不给填的值（值在图上看）。"""
+    （JointState：status、by、note、label、kind、group），不给填的值（值在图上看）。reconciler_needed：写回卡片上要不要
+    摆「结果不明时谁去核实」（目标能力没登记查询，templates/_common.needs_reconciler），界面不自己判。"""
+    from app.blueprints.templates._common import needs_reconciler
+
     joints = {jid: {k: v for k, v in state.items() if k in ("status", "by", "note", "label", "kind", "group")}
               for jid, state in (blueprint.joints or {}).items() if isinstance(state, dict)}
     out = {
@@ -386,7 +389,7 @@ def blueprint_out(blueprint: Any, *, issues: bool = True, extra: list[dict[str, 
         "template_version": blueprint.template_version, "source": blueprint.source or {},
         "conversation_id": blueprint.conversation_id, "workflow_id": blueprint.workflow_id, "app_id": blueprint.app_id,
         "last_trial_run_id": blueprint.last_trial_run_id, "graph_hash": blueprint.graph_hash, "joints": joints,
-        "copied_from": blueprint.copied_from,
+        "copied_from": blueprint.copied_from, "reconciler_needed": needs_reconciler(blueprint.spec or {}),
         "created_at": blueprint.created_at.isoformat() if blueprint.created_at else None,
         "updated_at": blueprint.updated_at.isoformat() if blueprint.updated_at else None,
     }

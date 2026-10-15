@@ -71,6 +71,8 @@ GRAPH_CHANGED = "plan.graph_changed"
 UNTRIALED = "plan.untrialed"
 TRIAL_FAILED = "plan.trial_failed"
 TRIAL_DIFFERS = "plan.trial_differs"
+#: 蓝图检查：写回的结果不明时没人核实（blueprints/ops.blueprint_issues）
+RECONCILER_UNBOUND = "bp.reconciler_unbound"
 ADMIN_REQUIRED = "plan.admin_required"
 DOWNGRADE_ADMIN = "plan.downgrade_admin"
 PREFLIGHT = "plan.preflight"
@@ -343,6 +345,13 @@ async def _preflight(session: AsyncSession, bp: Blueprint, target: _Target, *, l
     issues = await lint_app(session, spec, _draft_bindings(bp, target), previous=target.previous,
                             dispositions=options.get("dispositions") or {},
                             pins=await _simulated_pins(session, spec, target, workflow_id=workflow_id, level=level))
+    if any(i.get("code") == RECONCILER_UNBOUND for i in out):
+        # 写回的结果不明时没人核实：蓝图检查已经指到卡片上那一项，应用检查说的是同一件事（核实岗位没绑、写入没人核实），
+        # 不再多列两条——那两条说的岗位在卡片上找不到
+        from app.apps.derive import RECONCILER
+
+        issues = [i for i in issues if i.get("code") != "app.reconciler_unbound"
+                  and not (i.get("code") == "app.slot_unbound" and i.get("path") == f"slots.{RECONCILER}")]
     out += [{**i, "source": "app"} for i in issues]
     # 授权：给的人和组要在名录里（同授权接口）
     _, problem = await grants_problem(session, grant_items(bp))
