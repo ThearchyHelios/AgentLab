@@ -313,12 +313,26 @@ async def last_drafts(session: AsyncSession, source_id: str) -> dict[str, dict[s
 # ==========================================================================
 
 
-def busy_message(row: Any) -> str:
-    return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录，请等这次起草结束（或先停止它）再开始新的起草"
+#: 撞上起草时说法的最后一句（「请等这次起草结束{then}」）缺省是建起草任务的；导入目录、同步起草撞上起草、剖析时按这次要做
+#: 的事说（_then）
+THEN_DRAFT = "再开始新的起草"
 
 
-def sync_busy_message(row: Any) -> str:
-    return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录（同步起草），请等这次起草结束再开始新的起草"
+def _then(kind: str, busy: str) -> str:
+    """同步写操作（kind：import / sync_draft）撞上 busy（draft 起草、profile 剖析）时说法的最后一句：导入撞上什么都是
+    「再导入」；同步起草撞上起草是「再开始新的起草」（和建起草任务同一句话），撞上剖析是「再起草」——那时要做的是起草，
+    不是「开始新的剖析」。"""
+    if kind == "import":
+        return "再导入"
+    return THEN_DRAFT if busy == "draft" else "再起草"
+
+
+def busy_message(row: Any, then: str = THEN_DRAFT) -> str:
+    return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录，请等这次起草结束（或先停止它）{then}"
+
+
+def sync_busy_message(row: Any, then: str = THEN_DRAFT) -> str:
+    return f"数据源「{getattr(row, 'name', '')}」正在起草数据目录（同步起草），请等这次起草结束{then}"
 
 
 def import_busy_message(row: Any) -> str:
@@ -334,33 +348,37 @@ def sync_drafting(source_id: str) -> bool:
     return source_id in _SYNC
 
 
-async def ensure_draft_free(session: AsyncSession, row: Any) -> None:
+async def ensure_draft_free(session: AsyncSession, row: Any, *, then: str = THEN_DRAFT) -> None:
     """同种任务互斥：这个源没有在起草——没有排队或进行中的起草任务，也没有在同步起草。有就抛 DraftBusy。建起草任务、
-    重试之前调它。剖析任务不算：同源有剖析任务时起草任务照建，排在它后面。"""
+    重试之前调它。剖析任务不算：同源有剖析任务时起草任务照建，排在它后面。then 是说法最后一句要做的事。"""
     if row.id in _SYNC:
-        raise DraftBusy(sync_busy_message(row))
+        raise DraftBusy(sync_busy_message(row, then))
     if await active_job(session, row.id) is not None:
-        raise DraftBusy(busy_message(row))
+        raise DraftBusy(busy_message(row, then))
 
 
-async def ensure_idle(session: AsyncSession, row: Any) -> None:
-    """同步写操作（导入目录、同步起草）要求源空闲：没有在起草（DraftBusy，同 ensure_draft_free），也没有排队或进行中的
-    剖析任务（catalog_profile_jobs.ProfileBusy，说法里写明进行到第几张）。"""
+async def ensure_idle(session: AsyncSession, row: Any, kind: str = "import") -> None:
+    """同步写操作（kind：import 导入目录、sync_draft 同步起草）要求源空闲：没有在起草（DraftBusy，同 ensure_draft_free），
+    也没有排队或进行中的剖析任务（catalog_profile_jobs.ProfileBusy，说法里写明进行到第几张）。说法最后一句按 kind 说
+    这次要做的事（_then）。"""
     from app.data import catalog_profile_jobs
 
-    await ensure_draft_free(session, row)
-    await catalog_profile_jobs.ensure_free(session, row)
+    await ensure_draft_free(session, row, then=_then(kind, "draft"))
+    await catalog_profile_jobs.ensure_free(session, row, then=_then(kind, "profile"))
 
 
-def _lane_busy(row: Any, holder: runtime.LaneTicket) -> Exception:
-    """库里查过没有任务、这个源的队却被占着（同步起草、导入目录正在做，或者一个任务刚好在收尾）：按占着的是谁说。"""
+def _lane_busy(row: Any, holder: runtime.LaneTicket, kind: str) -> Exception:
+    """库里查过没有任务、这个源的队却被占着（同步起草、导入目录正在做，或者一个任务刚好在收尾）：按占着的是谁说，最后
+    一句按这次要做的事（kind）说。"""
     if holder.kind == "profile":
         from app.data import catalog_profile_jobs
 
-        return catalog_profile_jobs.ProfileBusy(catalog_profile_jobs.busy_message(row, None))
+        return catalog_profile_jobs.ProfileBusy(catalog_profile_jobs.busy_message(row, None,
+                                                                                  then=_then(kind, "profile")))
     if holder.kind == "import":
         return DraftBusy(import_busy_message(row))
-    return DraftBusy(sync_busy_message(row) if holder.kind == "sync_draft" else busy_message(row))
+    then = _then(kind, "draft")
+    return DraftBusy(sync_busy_message(row, then) if holder.kind == "sync_draft" else busy_message(row, then))
 
 
 @contextlib.asynccontextmanager
@@ -371,7 +389,7 @@ async def _sync_write(row: Any, kind: str, check: Callable[[], Awaitable[None]])
     try:
         ticket = runtime.lanes.try_enter(row.id, kind)
     except runtime.LaneBusy as e:
-        raise _lane_busy(row, e.holder) from e
+        raise _lane_busy(row, e.holder, kind) from e
     try:
         yield
     finally:
@@ -379,12 +397,12 @@ async def _sync_write(row: Any, kind: str, check: Callable[[], Awaitable[None]])
 
 
 async def _ensure_idle_but_sync(session: AsyncSession, row: Any) -> None:
-    """同 ensure_idle，只是不看 _SYNC：同步起草自己刚登记在里面。"""
+    """同 ensure_idle(…, "sync_draft")，只是不看 _SYNC：同步起草自己刚登记在里面。"""
     from app.data import catalog_profile_jobs
 
     if await active_job(session, row.id) is not None:
         raise DraftBusy(busy_message(row))
-    await catalog_profile_jobs.ensure_free(session, row)
+    await catalog_profile_jobs.ensure_free(session, row, then=_then("sync_draft", "profile"))
 
 
 @contextlib.asynccontextmanager
@@ -406,7 +424,7 @@ async def sync_draft(session: AsyncSession, row: Any) -> AsyncIterator[None]:
 async def import_write(session: AsyncSession, row: Any) -> AsyncIterator[None]:
     """导入目录期间占着这个源的队：源上有排队或进行中的起草、剖析任务（或者正在同步起草、导入）时抛 DraftBusy /
     ProfileBusy；导入期间新建的任务排在它后面。"""
-    async with _sync_write(row, "import", lambda: ensure_idle(session, row)):
+    async with _sync_write(row, "import", lambda: ensure_idle(session, row, "import")):
         yield
 
 
@@ -791,7 +809,7 @@ manager = DraftJobs()
 
 __all__ = ["ACTIVE", "BLANK_SAMPLE", "DraftBusy", "DraftFinished", "DraftJobs", "FINISHED", "GUIDANCE_MAX",
            "INTERRUPTED_ERROR", "INTERRUPTED_WRITTEN", "MAX_TABLES", "NOTE_MAX", "NothingToRetry", "RETRYABLE",
-           "STOPPED_WRITTEN", "TASK_DONE", "TASK_STATUSES", "TextTooLong",
+           "STOPPED_WRITTEN", "TASK_DONE", "TASK_STATUSES", "THEN_DRAFT", "TextTooLong",
            "active_job", "cancel", "check_model", "clean_text", "create_job", "ensure_draft_free", "ensure_idle",
            "guidance_of", "import_busy_message", "import_write", "job_brief", "job_dict", "job_out", "last_drafts",
            "latest_job", "load", "manager", "retry_tables", "save_guidance", "startup", "sync_busy_message", "sync_draft",

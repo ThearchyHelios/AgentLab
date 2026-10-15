@@ -186,11 +186,20 @@ async def test_import_and_sync_draft_are_409_while_profiling(client, make_source
     job = (await _start(client, sid, ["channels"])).json()["job"]
     await asyncio.wait_for(gate.entered.wait(), 10)
 
+    # 说法按这次要做的事说下一步：是在导入、起草，不是要开始新的剖析
     r = await client.post(f"{_base(sid)}/import", json={"content": exported})
     assert r.status_code == 409 and r.json()["code"] == "profile_busy", r.text
-    assert "正在剖析" in r.json()["detail"]
+    assert "正在剖析" in r.json()["detail"] and r.json()["detail"].endswith("请等这次剖析结束（或先停止它）再导入")
     r = await client.post(f"{_base(sid)}/draft", json={"tables": ["gates"]})
     assert r.status_code == 409 and r.json()["code"] == "profile_busy", r.text
+    assert r.json()["detail"].endswith("请等这次剖析结束（或先停止它）再起草")
+    again = await _start(client, sid, ["gates"])
+    assert again.json()["detail"].endswith("请等这次剖析结束（或先停止它）再开始新的剖析")
+    # 库里查过没有任务、队却被剖析占着（任务刚好在收尾）时同样按这次要做的事说
+    row, holder = SimpleNamespace(name="x"), SimpleNamespace(kind="profile")
+    assert str(catalog_jobs._lane_busy(row, holder, "import")).endswith("（或先停止它）再导入")
+    assert str(catalog_jobs._lane_busy(row, holder, "sync_draft")).endswith("（或先停止它）再起草")
+    assert str(catalog_jobs._lane_busy(row, SimpleNamespace(kind="draft"), "import")).endswith("（或先停止它）再导入")
 
     gate.release.set()
     await catalog_profile_jobs.manager.wait(job["id"], timeout=10)

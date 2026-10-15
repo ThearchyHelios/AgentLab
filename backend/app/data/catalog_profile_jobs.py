@@ -390,9 +390,15 @@ def due_reason(meta: dict[str, Any] | None, notes: dict[str, Any] | None, last: 
 # ==========================================================================
 
 
+#: 撞上剖析任务时说法的最后一句（「请等这次剖析结束（或先停止它）{then}」）缺省是建剖析任务的；导入目录、同步起草撞上
+#: 时各说各的（catalog_jobs）：那时要做的是导入、起草，不是开始新的剖析
+THEN_PROFILE = "再开始新的剖析"
+
+
 def busy_message(row: Any, brief: dict[str, Any] | None, *, table: str | None = None,
-                 position: int | None = None) -> str:
-    """同源已有剖析任务时的说法：写明进行到第几张；从表详情点「剖析这张表」时再说这张表在不在那个任务里、排第几。"""
+                 position: int | None = None, then: str = THEN_PROFILE) -> str:
+    """同源已有剖析任务时的说法：写明进行到第几张；从表详情点「剖析这张表」时再说这张表在不在那个任务里、排第几；最后
+    一句按调用方要做的事说（then）。"""
     name = getattr(row, "name", "") or ""
     if brief is None:
         text = f"数据源「{name}」正在剖析"
@@ -402,11 +408,13 @@ def busy_message(row: Any, brief: dict[str, Any] | None, *, table: str | None = 
         text = f"数据源「{name}」正在剖析：第 {min(brief['done'] + 1, brief['total'])} / {brief['total']} 张表"
     if table is not None:
         text += f"，{table} 在这次剖析里，排第 {position} 张" if position else f"，{table} 不在这次剖析里"
-    return text + "。请等这次剖析结束（或先停止它）再开始新的剖析"
+    return text + f"。请等这次剖析结束（或先停止它）{then}"
 
 
-async def ensure_free(session: AsyncSession, row: Any, tables: list[str] | None = None) -> None:
-    """这个源没有排队或进行中的剖析任务；有就抛 ProfileBusy。只指定了一张表时，说法里带上这张表在不在那个任务里。"""
+async def ensure_free(session: AsyncSession, row: Any, tables: list[str] | None = None, *,
+                      then: str = THEN_PROFILE) -> None:
+    """这个源没有排队或进行中的剖析任务；有就抛 ProfileBusy。只指定了一张表时，说法里带上这张表在不在那个任务里；then 是
+    说法的最后一句要做的事（见 busy_message）。"""
     job = await active_job(session, row.id)
     if job is None:
         return
@@ -417,7 +425,7 @@ async def ensure_free(session: AsyncSession, row: Any, tables: list[str] | None 
         table = key
         names = [r.table_name for r in await task_rows(session, job.id)]
         position = names.index(key) + 1 if key in names else None
-    raise ProfileBusy(busy_message(row, brief, table=table, position=position))
+    raise ProfileBusy(busy_message(row, brief, table=table, position=position, then=then))
 
 
 #: 挑出 0 张表时的说法
@@ -876,7 +884,7 @@ manager = ProfileJobs()
 
 
 __all__ = ["INTERRUPTED_ERROR", "KEEP_JOBS", "MAX_TABLES", "NOTHING_AT_ALL", "NOTHING_NEEDED", "NothingToRetry",
-           "ProfileBusy", "ProfileFinished", "ProfileJobs", "ProfileNothing", "active_job", "busy_message", "cancel",
-           "create_job", "due_reason", "ensure_free", "job_brief", "job_dict", "job_out", "last_detail",
-           "last_profiles", "latest_job", "load", "load_task", "manager", "prune", "public_last", "retry_tables",
-           "startup", "task_detail", "task_row", "task_rows", "unsaved_error", "waiting_for"]
+           "ProfileBusy", "ProfileFinished", "ProfileJobs", "ProfileNothing", "THEN_PROFILE", "active_job",
+           "busy_message", "cancel", "create_job", "due_reason", "ensure_free", "job_brief", "job_dict", "job_out",
+           "last_detail", "last_profiles", "latest_job", "load", "load_task", "manager", "prune", "public_last",
+           "retry_tables", "startup", "task_detail", "task_row", "task_rows", "unsaved_error", "waiting_for"]

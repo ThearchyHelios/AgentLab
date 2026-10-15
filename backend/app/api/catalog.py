@@ -346,8 +346,9 @@ async def preview_catalog_import(source_id: str, payload: CatalogImportIn,
 @router.post("/{source_id}/catalog/import")
 async def import_catalog(source_id: str, payload: CatalogImportIn, x_actor: str | None = Header(default=None),
                          session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """导入：规则同预览，逐表写入（乐观锁），返回同样形状的报告和每张表写入后的版本。有排队或进行中的起草任务
-    409 catalog_draft_busy；文件格式不对 422；没有表结构 409。"""
+    """导入：规则同预览，逐表写入（乐观锁），返回同样形状的报告和每张表写入后的版本。有排队或进行中的起草任务（或正在
+    同步起草、导入）409 catalog_draft_busy，有剖析任务 409 profile_busy（说法的最后一句说「再导入」）；文件格式不对 422；
+    没有表结构 409。"""
     row, source = await _import_source(session, source_id)
     try:
         async with catalog_jobs.import_write(session, row):
