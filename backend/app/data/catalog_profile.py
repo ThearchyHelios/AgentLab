@@ -634,7 +634,7 @@ CONFLICT_ERROR = "这张表的数据目录正被其他人修改，剖析结果�
 WRITE_ERROR = "写入数据目录时出错：{line}"
 TABLE_ERROR = "剖析这张表时出错：{line}"
 #: 停止、服务重启时正在剖析的那张表：做完的项照常写进了目录，剩下的没查
-STOPPED_TABLE = "{why}：已做完的 {done} 项已写进数据目录，剩下 {rest} 项没查"
+STOPPED_TABLE = "{why}：已做完的 {done} 项照常写进了数据目录，剩下 {rest} 项没查"
 #: 停止的说法（TableHooks.stop_text 没给时）
 STOPPED = "剖析已停止"
 

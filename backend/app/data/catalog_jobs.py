@@ -16,7 +16,7 @@
 - **同种任务互斥**（ensure_draft_free）：同一个源同时只有一个排队或进行中的起草任务，同步起草（POST /catalog/draft）
   进行期间也算在起草，建任务、重试都是 DraftBusy。剖析任务不挡起草：同源有剖析任务时起草任务照建，排在它后面
   （waiting_for = "profile"），剖析结束后自动开始（每个源一条队，见 data/catalog_job_runtime.py）。
-- **同步写操作要求源空闲**（ensure_idle、sync_write）：同步起草、导入目录要的是这个源上没有别的事——有排队或进行中的
+- **同步写操作要求源空闲**（ensure_idle；sync_draft、import_write 占队）：同步起草、导入目录要的是这个源上没有别的事——有排队或进行中的
   起草任务（DraftBusy）、剖析任务（catalog_profile_jobs.ProfileBusy）都不开始；开始了就占着这个源的队，执行期间
   新建的任务排在它后面。进程内登记（单进程部署）。
 - **重试**（retry_tables + create_job）：新任务，只含原任务里 failed、partial、cancelled 的表；用不用模型、本次说明沿用，
