@@ -509,26 +509,46 @@ async def _pick(session: AsyncSession, row: Any, source: Any, *, tables: list[st
     return [(name, None, None, checks) for name, checks in candidates]
 
 
-async def create_job(session: AsyncSession, row: Any, source: Any, *, tables: list[str] | None, scope: str,
-                     settings: ProfileSettings, actor: str | None,
-                     retry_of: str | None = None) -> tuple[CatalogProfileJob, list[CatalogProfileTask]]:
-    """建一个排队的剖析任务（还没开始，调用方接着 manager.start）。row 是数据源记录（遮罩按它的设置），source 是读表结构
-    用的源（上传源是绑定当前快照的视图）。同源已有排队或进行中的剖析任务抛 ProfileBusy；挑出 0 张表抛 ProfileNothing。
-    同源有起草任务时照建，排在它后面。建完顺手清掉超出保留数的旧任务。"""
-    await ensure_free(session, row, tables)
-    picked = await _pick(session, row, source, tables=tables, scope=scope)
-    job = CatalogProfileJob(id=new_id(), source_id=row.id, status="queued", scope=scope,
-                            settings=settings.to_dict(), created_by=actor, retry_of=retry_of)
-    now = utcnow()
+def _tasks_for(job_id: str, picked: list[tuple[str, str | None, str | None, list[Any]]],
+               now: Any) -> list[CatalogProfileTask]:
+    """_pick 挑出的表 → 逐表的行：按规则不剖析的（表结构里没有、视图、没有可剖析的项）直接记跳过，其余排队。"""
     tasks: list[CatalogProfileTask] = []
     for seq, (name, reason, why, checks) in enumerate(picked):
         shown = [c.as_check() for c in checks]
         if reason is not None:
             rule = [ProfileSkip(c.kind, c.target, c.skip[0], c.skip[1], c.path) for c in checks if c.skip]
-            tasks.append(_skipped_task(job.id, seq, name, reason, str(why), shown, rule, now))
+            tasks.append(_skipped_task(job_id, seq, name, reason, str(why), shown, rule, now))
             continue
-        tasks.append(CatalogProfileTask(job_id=job.id, seq=seq, table_name=name, status="pending", checks=shown,
+        tasks.append(CatalogProfileTask(job_id=job_id, seq=seq, table_name=name, status="pending", checks=shown,
                                         summary=_empty_summary()))
+    return tasks
+
+
+async def _behind_draft(session: AsyncSession, source_id: str) -> bool:
+    """这个源有排队、进行中的起草任务，或者正在同步起草：新建的剖析任务要排在它后面。"""
+    from app.data import catalog_jobs
+
+    return catalog_jobs.sync_drafting(source_id) or await catalog_jobs.active_job(session, source_id) is not None
+
+
+async def create_job(session: AsyncSession, row: Any, source: Any, *, tables: list[str] | None, scope: str,
+                     settings: ProfileSettings, actor: str | None,
+                     retry_of: str | None = None) -> tuple[CatalogProfileJob, list[CatalogProfileTask]]:
+    """建一个排队的剖析任务（还没开始，调用方接着 manager.start）。row 是数据源记录（遮罩按它的设置），source 是读表结构
+    用的源（上传源是绑定当前快照的视图）。同源已有排队或进行中的剖析任务抛 ProfileBusy；挑出 0 张表抛 ProfileNothing。
+    同源有起草任务时照建，排在它后面——这时挑出 0 张表也照建。不管排没排队，这里挑出的表单都是暂定的：开始剖析时按那时的
+    目录再定一遍（_ProfileRun._rescope）。建完顺手清掉超出保留数的旧任务。"""
+    await ensure_free(session, row, tables)
+    try:
+        picked = await _pick(session, row, source, tables=tables, scope=scope)
+    except ProfileNothing:
+        # 排在起草后面：起草多半会提出新的关系，开始时（_ProfileRun._rescope）按那时的目录再挑；现在挑不出也照建
+        if not await _behind_draft(session, row.id):
+            raise
+        picked = []
+    job = CatalogProfileJob(id=new_id(), source_id=row.id, status="queued", scope=scope,
+                            settings=settings.to_dict(), created_by=actor, retry_of=retry_of)
+    tasks = _tasks_for(job.id, picked, utcnow())
     session.add(job)
     try:
         await session.flush()
@@ -690,6 +710,8 @@ class _ProfileRun(runtime.JobRun):
         #: 正在剖析的那张表：seq 和开始的时刻（进度回调据此落库）
         self._seq = -1
         self._table_started = 0.0
+        #: 开始时按此刻的目录一张表都挑不出来（_rescope）：为什么，记在任务的提醒里
+        self._scope_note: str | None = None
 
     # ---------------------------------------------------------------- 停止、出错时收尾
 
@@ -738,10 +760,14 @@ class _ProfileRun(runtime.JobRun):
                 source = await table_versions.resolve_source(session, row)
             except table_versions.SnapshotMissing as e:
                 raise runtime.JobFailed(str(e)) from e
-            pending = [(t.seq, t.table_name) for t in await task_rows(session, job.id) if t.status == "pending"]
             settings = ProfileSettings.from_dict(job.settings)
-            self.actor = job.created_by
             options = dict(row.options or {})
+        # 要剖析哪些表按开始这一刻的目录定：排在起草后面时，建任务那会儿起草还没提出关系
+        await self._write(self._rescope, row, source)
+        async with SessionLocal() as session:
+            job = await session.get(CatalogProfileJob, self.job_id)
+            pending = [(t.seq, t.table_name) for t in await task_rows(session, job.id) if t.status == "pending"]
+            self.actor = job.created_by
         try:
             self.cx = catalog_profile.make_context(source, settings, options=options)
         except ValueError as e:              # 不支持的数据库类型
@@ -791,7 +817,7 @@ class _ProfileRun(runtime.JobRun):
         if runner is None:
             return {}
         return {"queries": runner.queries, "timeouts": runner.timeouts, "errors": runner.errors,
-                "notice": runner.notice}
+                "notice": runner.notice or self._scope_note}
 
     async def _save_counters(self, session: AsyncSession) -> None:
         if values := self._counters():
@@ -801,6 +827,40 @@ class _ProfileRun(runtime.JobRun):
 
     async def _claim(self, session: AsyncSession) -> bool:
         return await runtime.claim(session, CatalogProfileJob, self.job_id)
+
+    async def _rescope(self, session: AsyncSession, row: Any, source: Any) -> None:
+        """开始剖析时按此刻的目录重定范围（建任务时挑的表单是暂定的：排在起草后面时，起草还没提出关系）。
+
+        - 需要剖析的表、全部表：整份重挑（这个任务的表都还没开始）。挑不出来就照实记在提醒里，任务以 0 张表结束；
+        - 指定的表：建任务时判为「没有可剖析的项」的再看一次，现在有了就排上；表结构里没有、视图照旧跳过。
+        要做的检查项在每张表开始时还会按那时的目录再列一遍（profile_table）。"""
+        job = await session.get(CatalogProfileJob, self.job_id)
+        if job is None:
+            return
+        if job.scope == "selected":
+            stale = [t for t in await task_rows(session, job.id) if t.status == "skipped" and t.error == NOTHING_ERROR]
+            if stale:
+                fresh = {name: (reason, checks) for name, reason, _why, checks in await _pick(
+                    session, row, source, tables=[t.table_name for t in stale], scope="selected")}
+                for task in stale:
+                    reason, checks = fresh.get(task.table_name, ("nothing", []))
+                    if reason is None:
+                        await session.execute(self._task(CatalogProfileTask.seq == task.seq).values(
+                            status="pending", checks=[c.as_check() for c in checks], skipped=None, skipped_count=0,
+                            unfinished=0, error=None, finished_at=None))
+                await session.commit()
+            return
+        await session.execute(delete(CatalogProfileTask).where(CatalogProfileTask.job_id == self.job_id)
+                              .execution_options(synchronize_session=False))
+        try:
+            picked = await _pick(session, row, source, tables=None, scope=job.scope)
+        except ProfileNothing as e:
+            picked = []
+            self._scope_note = str(e)
+            await session.execute(update(CatalogProfileJob).where(CatalogProfileJob.id == self.job_id)
+                                  .values(notice=self._scope_note).execution_options(synchronize_session=False))
+        session.add_all(_tasks_for(self.job_id, picked, utcnow()))
+        await session.commit()
 
     async def _recheck(self, session: AsyncSession) -> str | None:
         """重读数据源：停用了、关掉了剖析返回停下的整句；遮罩换成最新的设置。数据源没了抛 JobFailed。"""

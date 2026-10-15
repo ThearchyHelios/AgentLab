@@ -838,3 +838,51 @@ async def test_cancel_a_job_claimed_between_load_and_cancel(client, make_source,
             await other.commit()
         await catalog_jobs.cancel(session, job)
     assert stopped == [job_id, draft_id]
+
+
+async def test_scope_is_settled_when_the_job_starts_behind_a_draft(client, make_source, scenic_db, monkeypatch):
+    """起草完接着剖析：剖析任务建的时候排在起草后面，起草还没提出关系，只靠关系才有检查项的表（areas.park_id 只能靠命名
+    推断）这时挑不进来。范围在开始剖析时按那时的目录定：起草写完关系，剖析开始时 areas 排上了。"""
+    sid = await make_source(scenic_db, options=_on())
+    assert (await _rows(client, sid))["areas"]["profile_checks"] == 0, "还没起草：areas 没有可剖析的项"
+    draft_start, profile_start = catalog_jobs.manager.start, catalog_profile_jobs.manager.start
+    monkeypatch.setattr(catalog_jobs.manager, "start", lambda job_id: None)
+    monkeypatch.setattr(catalog_profile_jobs.manager, "start", lambda job_id: None)
+    r = await client.post(f"/api/datasources/{sid}/catalog/draft-jobs", json={"tables": ["areas"], "use_model": False})
+    assert r.status_code == 202, r.text
+    draft_id = r.json()["job"]["id"]
+    queued = await _start(client, sid, scope="all")
+    assert queued.status_code == 202, queued.text
+    job = queued.json()["job"]
+    assert job["waiting_for"] == "draft" and "areas" not in [t["table_name"] for t in job["tasks"]]
+
+    draft_start(draft_id)                                   # 起草跑完：areas 有了推断的关系
+    await catalog_jobs.manager.wait(draft_id, timeout=30)
+    assert (await _rows(client, sid))["areas"]["profile_checks"] == 1
+    profile_start(job["id"])
+    await catalog_profile_jobs.manager.wait(job["id"], timeout=60)
+    tasks = {t["table_name"]: t for t in (await client.get(f"{_url(sid)}/{job['id']}")).json()["job"]["tasks"]}
+    assert "areas" in tasks and tasks["areas"]["status"] in ("ok", "partial"), tasks.get("areas")
+    assert tasks["areas"]["checks_by_kind"]["relation"][1] == 1
+
+
+async def test_nothing_needed_behind_a_draft_is_created_and_settled_at_start(client, make_source, tmp_path,
+                                                                             monkeypatch):
+    """排在起草后面时挑不出表也照建（起草多半会提出关系）；开始时还是挑不出来，就以 0 张表结束、提醒里写明为什么。"""
+    path = _db(tmp_path / "bare.db", "CREATE TABLE notes_kv (k TEXT PRIMARY KEY, v TEXT);", {"notes_kv": [("a", "b")]})
+    sid = await make_source(path, options=_on())
+    assert (await _start(client, sid)).status_code == 409, "没有起草任务时照旧 409"
+    draft_start = catalog_jobs.manager.start
+    monkeypatch.setattr(catalog_jobs.manager, "start", lambda job_id: None)
+    r = await client.post(f"/api/datasources/{sid}/catalog/draft-jobs", json={"tables": ["notes_kv"], "use_model": False})
+    draft_id = r.json()["job"]["id"]
+    made = await _start(client, sid)
+    assert made.status_code == 202, made.text
+    job = made.json()["job"]
+    assert job["status"] == "queued" and job["total"] == 0 and job["waiting_for"] == "draft"
+    draft_start(draft_id)
+    await catalog_jobs.manager.wait(draft_id, timeout=30)
+    await catalog_profile_jobs.manager.wait(job["id"], timeout=30)
+    done = (await client.get(f"{_url(sid)}/{job['id']}")).json()["job"]
+    assert done["status"] == "succeeded" and done["total"] == 0
+    assert done["notice"] and done["notice"].startswith("没有需要剖析的表")
