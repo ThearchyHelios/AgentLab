@@ -25,10 +25,11 @@ data/catalog_job_runtime.py），逐表剖析（引擎在 data/catalog_profile.p
   剖析的那张表，查完的项也没写进目录，照实写明，见文末）。不自动续跑：
   复制出来的数据目录启动时不能自己去查业务库，界面让人点「重试」。关停时（manager.shutdown）停掉进行中的，同样标中断。
   启动时还一次性迁移剖析设置的旧键（catalog_profile.migrate_settings）。
-- **保留**（prune）：每个源保留最近 KEEP_JOBS 个结束了的剖析任务，更早的删掉；某张表最近一次剖析所在的任务不删，表详情的
+- **保留**（prune）：每个源保留最近 KEEP_JOBS 个结束了的剖析任务，更早的删掉；某张表「上次剖析」所在的任务不删，表详情的
   「上次剖析」一直在。
-- **读**：job_dict（任务和逐表一行）、task_detail（一张表的检查项、发现、跳过的项、发过的查询）、last_profiles（表清单每行
-  的「上次剖析」）、due_reason（这张表要不要剖析、为什么）。
+- **读**：job_dict（任务和逐表一行）、task_detail（一张表的检查项、发现、跳过的项、发过的查询）、last_profiles / last_detail
+  （表清单每行、表详情的「上次剖析」）、due_reason（这张表要不要剖析、为什么）。「上次剖析」是真正开始过的最近一次（见
+  _ranked）：没开始就停了的、还排着的那一项不挡掉上一次真正剖析的行数、发过的查询。
 
 没结束的表收尾时（停止、中断、整体出错）检查项里还排着的、正在做的记为跳过（原因 cancelled 或 error），不留「排队中」的
 检查项在一张已经结束的表上。目录只在一张表结束时和它的结果一起写（同一个事务）：收尾时还没结束的表，查完的项结论也没
@@ -41,7 +42,7 @@ import logging
 import time
 from typing import Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -295,60 +296,87 @@ async def load_task(session: AsyncSession, job: CatalogProfileJob, seq: int) -> 
     )).scalar_one_or_none()
 
 
-def _latest_per_table(source_id: str, *columns: Any) -> Any:
-    """每张表最近一次剖析的那一项（最近建的任务里的；同一个任务里同名的取 seq 小的）：子查询，带 rank 列。"""
-    rank = func.row_number().over(partition_by=CatalogProfileTask.table_name,
-                                  order_by=(CatalogProfileJob.created_at.desc(), CatalogProfileTask.seq)).label("rank")
-    return (select(*columns, rank).join(CatalogProfileJob, CatalogProfileJob.id == CatalogProfileTask.job_id)
+#: 同一张表的各项谁算「最近」：任务建得晚的在前；同一个任务里同名的取 seq 小的
+_NEWEST = (CatalogProfileJob.created_at.desc(), CatalogProfileJob.id.desc(), CatalogProfileTask.seq)
+#: 表清单、表详情显示的「上次剖析」：真正开始过（started_at 有值）的排在没开始过的前面，各自再按 _NEWEST
+_SHOWN = (case((CatalogProfileTask.started_at.is_(None), 1), else_=0), *_NEWEST)
+
+
+def _ranked(source_id: str, *columns: Any) -> Any:
+    """每张表剖析过的各项：子查询，带两个排名。
+
+    - shown：这张表的「上次剖析」（表清单每行、表详情、要不要剖析都按它；保留也保护它所在的任务）——真正开始过的最近一项，
+      一次都没开始过才退回最近一项。没开始就结束了的那一项（停在前面的表上、任务止损或整体出错后没轮到、建任务时就判为
+      跳过）、排队中还没轮到的那一项都不算：它没有行数估算、发过的查询，要是挡掉上一次真正剖析的那一项，表详情就只剩
+      一句「已停止」，那次剖析所在的任务还会被当成不是谁的最近一次给清掉——行数、日期范围、发过的查询只存在剖析任务里。
+    - latest：最近一项，不管开始没有。它还排着、在做（pending / running）说明这张表已经在进行中的任务里了。
+    """
+    shown = func.row_number().over(partition_by=CatalogProfileTask.table_name, order_by=_SHOWN).label("shown")
+    latest = func.row_number().over(partition_by=CatalogProfileTask.table_name, order_by=_NEWEST).label("latest")
+    return (select(*columns, shown, latest).join(CatalogProfileJob, CatalogProfileJob.id == CatalogProfileTask.job_id)
             .where(CatalogProfileJob.source_id == source_id)).subquery()
 
 
 async def last_profiles(session: AsyncSession, source_id: str) -> dict[str, dict[str, Any]]:
-    """每张表最近一次剖析里的那一项：{表名: CatalogLastProfile 加上 paths（检查项的路径，判断有没有新的待核实关系用）}。
-    任务还在进行，就是进行中的状态。每张表取哪一项在库里挑好。"""
-    inner = _latest_per_table(source_id, CatalogProfileTask.table_name, CatalogProfileTask.job_id,
-                              CatalogProfileTask.seq, CatalogProfileTask.status, CatalogProfileTask.started_at,
-                              CatalogProfileTask.finished_at, CatalogProfileTask.summary,
-                              CatalogProfileTask.skipped_count, CatalogProfileTask.unfinished,
-                              CatalogProfileTask.error, CatalogProfileTask.row_estimate, CatalogProfileTask.checks)
-    rows = (await session.execute(select(inner).where(inner.c.rank == 1))).mappings()
+    """每张表的「上次剖析」（见 _ranked 的 shown）：{表名: CatalogLastProfile 加上内部用的 paths（那一项检查项的路径，判断
+    有没有新的待核实关系用）、queued（最近一项还排着或在做：这张表已经在进行中的任务里了）}。在做的就是进行中的状态。
+    每张表取哪一项在库里挑好。"""
+    inner = _ranked(source_id, CatalogProfileTask.table_name, CatalogProfileTask.job_id,
+                    CatalogProfileTask.seq, CatalogProfileTask.status, CatalogProfileTask.started_at,
+                    CatalogProfileTask.finished_at, CatalogProfileTask.summary,
+                    CatalogProfileTask.skipped_count, CatalogProfileTask.unfinished,
+                    CatalogProfileTask.error, CatalogProfileTask.row_estimate, CatalogProfileTask.checks)
+    rows = list((await session.execute(
+        select(inner).where(or_(inner.c.shown == 1, inner.c.latest == 1)))).mappings())
+    queued = {row["table_name"] for row in rows if row["latest"] == 1 and row["status"] in OPEN}
     out: dict[str, dict[str, Any]] = {}
     for row in rows:
+        if row["shown"] != 1:
+            continue
         out[row["table_name"]] = {
             "job_id": row["job_id"], "seq": row["seq"], "status": row["status"],
             "started_at": _iso(row["started_at"]), "finished_at": _iso(row["finished_at"]),
             "summary": {**_empty_summary(), **(row["summary"] or {})}, "skipped_count": row["skipped_count"] or 0,
             "unfinished": row["unfinished"] or 0, "error": row["error"], "row_estimate": row["row_estimate"],
             "paths": {c.get("path") for c in row["checks"] or [] if isinstance(c, dict) and c.get("path")},
+            "queued": row["table_name"] in queued,
         }
     return out
 
 
+#: last_profiles 里只给内部用的键
+_INTERNAL = ("paths", "queued")
+
+
 def public_last(last: dict[str, Any] | None) -> dict[str, Any] | None:
-    """接口里的 CatalogLastProfile：去掉内部用的 paths。"""
-    return None if last is None else {k: v for k, v in last.items() if k != "paths"}
+    """接口里的 CatalogLastProfile：去掉内部用的 paths、queued。"""
+    return None if last is None else {k: v for k, v in last.items() if k not in _INTERNAL}
 
 
 async def last_detail(session: AsyncSession, source_id: str, table: str) -> dict[str, Any] | None:
-    """这张表最近一次剖析的明细（表详情的「数据剖析」一节）；没剖析过是 None。"""
+    """这张表「上次剖析」（见 _ranked 的 shown）的明细（表详情的「数据剖析」一节）；没剖析过是 None。"""
     found = (await session.execute(
         select(CatalogProfileTask, CatalogProfileJob)
         .join(CatalogProfileJob, CatalogProfileJob.id == CatalogProfileTask.job_id)
         .where(CatalogProfileJob.source_id == source_id, CatalogProfileTask.table_name == table)
-        .order_by(CatalogProfileJob.created_at.desc(), CatalogProfileTask.seq).limit(1)
+        .order_by(*_SHOWN).limit(1)
     )).first()
     return None if found is None else task_detail(found[1], found[0])
 
 
 def due_reason(meta: dict[str, Any] | None, notes: dict[str, Any] | None, last: dict[str, Any] | None,
                checks: int) -> str | None:
-    """这张表要不要剖析、为什么：never 从没剖析过；unfinished 最近一次剖析是 partial / failed / cancelled；new_relations
-    目录里有待核实的关系不在最近一次剖析的检查项里。表结构里没有、视图、没有可剖析的项（checks 为 0）、正在剖析的不要。"""
+    """这张表要不要剖析、为什么：never 从没剖析过；unfinished 上次剖析是 partial / failed / cancelled；new_relations
+    目录里有待核实的关系不在上次剖析的检查项里。表结构里没有、视图、没有可剖析的项（checks 为 0）、已经在进行中的任务里
+    （排着或在做）的不要。
+
+    「上次剖析」和表清单显示的是同一项（last_profiles，真正开始过的最近一项）：上次真正剖析完整了，后来某个任务没轮到它
+    就停了，不算没做完——不然表清单一边显示「上次剖析：完成」，一边说「上次剖析没做完」。一次都没开始过的，按最近一项算。"""
     if not isinstance(meta, dict) or meta.get("is_view") or checks <= 0:
         return None
     if last is None:
         return "never"
-    if last["status"] in OPEN:
+    if last.get("queued") or last["status"] in OPEN:
         return None
     if last["status"] in RETRYABLE:
         return "unfinished"
@@ -511,8 +539,9 @@ async def retry_tables(session: AsyncSession, job: CatalogProfileJob) -> list[st
 
 
 async def prune(session: AsyncSession, source_id: str, *, keep: int | None = None) -> int:
-    """保留：这个源最近 keep（缺省 KEEP_JOBS）个结束了的剖析任务留着，更早的删掉；某张表最近一次剖析所在的任务不删。
-    返回删了几个。"""
+    """保留：这个源最近 keep（缺省 KEEP_JOBS）个结束了的剖析任务留着，更早的删掉；某张表「上次剖析」（真正开始过的最近
+    一次，见 _ranked）所在的任务不删——排队中还没轮到、没开始就结束了的那一项不算，不然新建一个任务就能把上一次真正剖析
+    清掉。返回删了几个。"""
     keep = KEEP_JOBS if keep is None else keep
     finished = list((await session.execute(
         select(CatalogProfileJob.id).where(CatalogProfileJob.source_id == source_id,
@@ -522,8 +551,8 @@ async def prune(session: AsyncSession, source_id: str, *, keep: int | None = Non
     old = finished[keep:]
     if not old:
         return 0
-    inner = _latest_per_table(source_id, CatalogProfileTask.job_id)
-    protected = set((await session.execute(select(inner.c.job_id).where(inner.c.rank == 1))).scalars())
+    inner = _ranked(source_id, CatalogProfileTask.job_id)
+    protected = set((await session.execute(select(inner.c.job_id).where(inner.c.shown == 1))).scalars())
     victims = [job_id for job_id in old if job_id not in protected]
     if not victims:
         return 0

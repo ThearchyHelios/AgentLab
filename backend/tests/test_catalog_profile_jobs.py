@@ -670,6 +670,41 @@ async def test_the_table_detail_and_list_carry_the_last_profile(client, make_sou
     assert (await _notes(client, sid, "gates"))["last_profile"] is None
 
 
+async def test_the_last_profile_is_the_last_one_that_actually_ran(client, make_source, scenic_db, monkeypatch):
+    """channels 剖析完（ok）；再建 [visits, channels]、停在 visits 上：channels 没开始就停了。表详情、表清单的「上次剖析」
+    仍是上一次真正剖析的那一项（行数、发过的查询都在），不算没做完；保留不删它所在的任务，之后再建一个排队的任务也不删。"""
+    sid = await make_source(scenic_db, options=_on(), draft=["visits", "channels"])
+    first = await _profile(client, sid, ["channels"])
+    gate = _hold_queries(monkeypatch, _at_visits_codes)
+    second = (await _start(client, sid, ["visits", "channels"])).json()["job"]
+    await asyncio.wait_for(gate.entered.wait(), 10)
+    stopped = (await client.post(f"{_url(sid)}/{second['id']}/cancel")).json()["job"]
+    assert [(t["table_name"], t["status"]) for t in stopped["tasks"]] == [("visits", "partial"),
+                                                                          ("channels", "cancelled")]
+
+    last = (await _notes(client, sid, "channels"))["last_profile"]
+    assert (last["job_id"], last["status"]) == (first["id"], "ok")
+    assert last["started_at"] and last["queries"] and last["row_estimate"] and last["query_log"]
+    rows = await _rows(client, sid)
+    assert rows["channels"]["last_profile"]["job_id"] == first["id"] and not rows["channels"]["profile_due"]
+    assert rows["visits"]["last_profile"]["job_id"] == second["id"], "visits 真正剖析过：上次剖析是停下的这一次"
+    async with SessionLocal() as session:
+        assert await catalog_profile_jobs.prune(session, sid, keep=1) == 0, "first 是 channels 上次剖析所在的任务"
+
+    # 结束了的任务超出保留数时再建一个排队的任务（建任务时顺手清）：排着的那一项不算 channels 的上次剖析
+    monkeypatch.setattr(catalog_profile_jobs, "KEEP_JOBS", 0)
+    monkeypatch.setattr(catalog_profile_jobs.manager, "start", lambda job_id: None)
+    queued = (await _start(client, sid, ["channels"])).json()["job"]
+    async with SessionLocal() as session:
+        left = set((await session.execute(select(CatalogProfileJob.id)
+                                          .where(CatalogProfileJob.source_id == sid))).scalars())
+    assert {first["id"], second["id"], queued["id"]} == left
+    assert (await _notes(client, sid, "channels"))["last_profile"]["job_id"] == first["id"]
+    row = (await _rows(client, sid))["channels"]
+    assert row["last_profile"]["job_id"] == first["id"] and not row["profile_due"], "已经排进任务里了"
+    await client.post(f"{_url(sid)}/{queued['id']}/cancel")
+
+
 # --------------------------------------------------------------------------
 # 设置迁移、保留
 # --------------------------------------------------------------------------
