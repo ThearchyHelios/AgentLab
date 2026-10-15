@@ -16,7 +16,7 @@ from app.apps.access import role_of
 from app.apps.derive import derive_app
 from app.apps.describe import describe_version
 from app.apps.lint import lint_app
-from app.apps.ops import apply_app_op
+from app.apps.ops import apply_app_op, polish_problem
 from app.apps.spec import empty_spec, parse_spec
 from app.core.artifact_store import graph_hash
 from app.db.base import SessionLocal, utcnow
@@ -131,6 +131,26 @@ def test_the_six_operations():
     assert apply_app_op(spec, {"op": "app_set", "path": "pins", "key": "x", "value": {}}).problem
     assert apply_app_op(spec, {"op": "nope"}).problem
     parse_spec(spec)
+
+
+def test_update_hides_and_unhides_a_component():
+    """隐藏（normal-user-apps N6）走 app_update：为真才写进组件，取消隐藏去掉这一项；写别的值拒收、组件不动。
+    应用页上直接改和编辑器的「隐藏」开关、助手润色用的都是这一个操作（前端 edit/appOps 同一套）。"""
+    spec = empty_spec("看板")
+    apply_app_op(spec, {"op": "app_page", "page": {"id": "home", "title": "首页"}})
+    apply_app_op(spec, {"op": "app_add", "parent": "home", "component": {"id": "tip", "type": "notice", "props": {"text": "说明"}}})
+    comp = spec["pages"][0]["body"][0]
+    assert apply_app_op(spec, {"op": "app_update", "id": "tip", "hidden": True}).changed
+    assert comp["hidden"] is True
+    parse_spec(spec)
+    again = apply_app_op(spec, {"op": "app_update", "id": "tip", "hidden": True})
+    assert (again.changed, again.problem) == (False, None)
+    bad = apply_app_op(spec, {"op": "app_update", "id": "tip", "hidden": "yes"})
+    assert bad.problem and comp["hidden"] is True
+    assert apply_app_op(spec, {"op": "app_update", "id": "tip", "hidden": False}).changed
+    assert "hidden" not in comp
+    # 润色可以隐藏：只改呈现
+    assert polish_problem(spec, {"op": "app_update", "id": "tip", "hidden": True}) is None
 
 
 # --------------------------------------------------------------------------

@@ -121,11 +121,14 @@ async def tick(now: datetime | None = None) -> None:
 
 
 async def process_due(now: datetime | None = None) -> None:
-    """流程的一拍（app/process）：待办的提醒、升级、超时驳回（永不自动批准）；结果未知的写入按退避去查。
+    """流程的一拍（app/process）：待办的提醒、升级、超时驳回（永不自动批准）；结果未知的写入按退避去查；
+    上传了却一直没提交的文件过了时限清掉（app/files，每小时一次）。
     各自出错只记日志：这一拍出错不该让调度循环停下，下一拍照常再查。"""
+    from app.files import store as files_store
     from app.process import actions, tasks
 
-    for name, step in (("待办的时限处理", tasks.tick), ("写入结果的查询", actions.tick)):
+    for name, step in (("待办的时限处理", tasks.tick), ("写入结果的查询", actions.tick),
+                       ("没有提交的上传文件清理", files_store.cleanup_tick)):
         try:
             await step(now)
         except Exception:  # noqa: BLE001

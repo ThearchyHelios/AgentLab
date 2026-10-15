@@ -4934,6 +4934,8 @@ export const ORIGIN_LABEL: Record<OriginKind, string> = {
   app_backfill: '按新口径补算',
   hook: '外部系统触发',
   api: '接口',
+  trial: '蓝图试运行',
+  personal_app: '个人应用刷新',
 }
 
 export const ORIGIN_TEXT = {
@@ -5188,6 +5190,8 @@ export const NOTIFY_TEXT = {
     'task.opened': '待办打开', 'task.escalated': '待办升级', 'task.expired': '待办超时', 'task.resolved': '待办处理完',
     'action.unknown': '动作结果未知', 'action.failed': '动作失败', 'action.confirmed': '动作已生效',
     'run.failed': '运行失败', 'run.finished': '运行结束',
+    // 个人应用提交审核有了结果（发布了或退回了），通知提交人：只对个人渠道、全局渠道有意义（服务端 notify/service.notify_review）
+    'review.done': '我提交审核的应用有结果',
   } as Record<string, string>,
   enabled: '启用',
   signed: '已签名',
@@ -5213,6 +5217,7 @@ export const LOOK_TEXT = {
   tables: (n: number) => `${formatNumber(n)} 张表`,
   capabilities: (n: number) => `${formatNumber(n)} 个能力`,
   versions: (n: number) => `${formatNumber(n)} 个工作流版本`,
+  calibers: (n: number) => `${formatNumber(n)} 张口径卡`,
   title: (what: string) => `查看了 ${what}`,
   /** 系统代为查看：发布前修复、升级证据按要修的 SQL 点名；应用润色先查看固定的版本 */
   systemTables: (what: string) => `按要修的 SQL 查看了 ${what}`,
@@ -5623,7 +5628,7 @@ export const TASK_NOTIFY_TEXT = {
 export const SETTINGS_ROLE_TEXT = {
   subtitleUser: '个人的主题和通知',
   themeLocal: '主题只保存在当前浏览器中，更换设备后需重新选择',
-  prefsReadOnly: '运行默认值、证据裁判和核查的设置全站共用，只有管理员可以修改',
+  prefsReadOnly: '运行默认值、证据裁判、核查和应用的设置全站共用，只有管理员可以修改',
   notifyPersonal: '个人渠道只推送派给你的待办和你发起的实例的事件',
 }
 
@@ -5634,6 +5639,8 @@ export const APP_SETTING_TEXT = {
   onDemandLimit: '按需视图每日上限',
   onDemandLimitHint: '每个应用每天最多按需发起几次运行，命中缓存的不计；填 0 表示不再发起按需运行。到上限后，视图提示次日再试',
   onDemandLimitInvalid: '请填写 0 到 100,000 之间的整数',
+  personalApps: '使用者可以建个人应用',
+  personalAppsHint: '开启后，使用者可以从说需求、场景模板或问数据的回答建一个只有自己看得见的应用：只读、结果遮罩，每人每天的刷新次数按上面的每日上限算；想给别人用要提交给搭建者审核发布。搭建者及以上不受这一项限制',
 }
 
 /** 自定义工具绑定登记的端点（§3.9）：只填路径，地址和认证头由端点提供 */
@@ -5736,3 +5743,4 @@ export const CAPABILITY_REVIEW_TEXT: typeof CATALOG_REVIEW_TEXT = {
 
 // 应用平台使用面的文案（FE-5 维护）。调用方照旧从 lib/terms 导入
 export * from './termsApp'
+export * from './termsBlueprint'

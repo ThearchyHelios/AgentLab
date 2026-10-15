@@ -7,7 +7,9 @@
  * - 时限与升级：剩多久、超了多久、升级过几次；超时只会提醒、升级或驳回，不会自动批准；
  * - 动作确认的哈希卡：遮罩后的预览、内容哈希前 8 位、环境；确认时原样带回哈希，服务端发送前重算，对不上不发（P8）；
  * - 核实待办：已生效（填外部单号）/ 未生效重新发送 / 未生效放弃，结果未知永远不会自动重发；
- * - 等外部系统（signal）：说明由入站钩子完成，不在这里处理。
+ * - 等外部系统（signal）：说明由入站钩子完成，不在这里处理；
+ * - 审核个人应用（review，docs/design/normal-user-apps.md N7）：同意不在这里点，处理人取一份共享副本、在副本上试运行和
+ *   走发布单（发布单做完这条待办自动记为已发布）；不发布就退回。
  *
  * 不碰画布的 store：恢复之后谁去重新接事件流、刷新哪张列表，由调用方在 onResolved 里决定。会签时一个人的回复记下了、
  * 还没凑齐（resolved 为假），照样回调——调用方据此刷新卡片。
@@ -17,10 +19,10 @@
  */
 import { useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import {
-  Ban, Check, CheckCheck, Clock, Code, ExternalLink, Hand, Keyboard, PenLine, Send, SearchCheck, TriangleAlert,
-  Webhook, Wrench,
+  Ban, Check, CheckCheck, Clock, Code, Copy, ExternalLink, Hand, Keyboard, PenLine, Send, SearchCheck, TriangleAlert,
+  UserCheck, Webhook, Wrench,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../api/client'
@@ -33,11 +35,13 @@ import { formatDateTime, formatSpan, formatTime, parseServerTime } from '../lib/
 import { cleanValues, formErrorsOf, validateForm, withDefaults } from '../lib/schemaForm'
 import {
   ACTION_CONFIRM_TEXT, ACTION_ENV_LABEL, INQUIRY_TEXT, RECONCILE_TEXT, SIGNAL_TEXT, TASK_KIND_LABEL, TASK_STATUS_LABEL,
-  TASK_TEXT, TOOL_TRUST_TEXT, runName,
+  TASK_TEXT, TOOL_TRUST_TEXT, TRIAL_TEXT, runName,
 } from '../lib/terms'
+import { REVIEW_TASK_TEXT } from '../lib/termsApp'
+import { blueprintPath } from '../pages/blueprints/shared'
 import type { Approval, ApprovalReport } from '../types'
 import type {
-  FormError, Task, TaskAssignment, TaskKind, TaskMyResponse, TaskProgress, TaskRespond,
+  FormError, ReviewTaskPayload, Task, TaskAssignment, TaskKind, TaskMyResponse, TaskProgress, TaskRespond,
 } from '../typesApp'
 import { Markdown } from './Markdown'
 import { ApprovalReports, ApprovalRunClass } from './ApprovalReport'
@@ -60,17 +64,22 @@ export interface TaskCardProps {
   showOwner?: boolean
   /** 画不画会签进度。应用页上同一页另有会签组件时服务端说不画（signoffs_on_page），同一页上不写两遍 */
   showSignoffs?: boolean
+  /**
+   * 试运行里的待办（docs/design/normal-user-apps.md N4）：派给了试运行的人自己，按钮写「以试运行身份同意 / 驳回 / 提交」，
+   * 别让人以为这是在批一张真单子
+   */
+  trial?: boolean
 }
 
 const KIND_ICON: Record<TaskKind, typeof Hand> = {
   approve: Hand, input: Keyboard, edit: PenLine, tool: Wrench, code: Code, dual_check: Hand,
-  action_confirm: Send, reconcile: SearchCheck, signal: Webhook,
+  action_confirm: Send, reconcile: SearchCheck, signal: Webhook, review: UserCheck,
 }
 
 /** 一天没人处理就用琥珀色写等了多久，同审批卡 */
 const STALE_MS = 24 * 3_600_000
 
-export function TaskCard({ task, onResolved, compact = false, send, showOwner = true, showSignoffs = true }: TaskCardProps) {
+export function TaskCard({ task, onResolved, compact = false, send, showOwner = true, showSignoffs = true, trial = false }: TaskCardProps) {
   const toast = useToast()
   const payload: Record<string, any> = task.payload ?? {}
   const kind = task.kind
@@ -203,11 +212,15 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
                    onSubmit={(body) => void respond(body, RECONCILE_TEXT.done)} />
       )}
       {kind === 'signal' && <SignalNote payload={payload} />}
+      {kind === 'review' && (
+        <Review task={task} canAct={canAct} busy={busy} note={note} setNote={setNote}
+                onReject={() => void respond({ decision: 'reject' }, REVIEW_TASK_TEXT.rejected)} />
+      )}
 
       {showForm && (
         <div className="mb-2 rounded border bg-bg p-2.5">
           <SchemaForm schema={task.form!} value={values} errors={errors} readOnly={!canAct}
-                      idPrefix={`task-${task.id}`} onSubmit={canAct ? approve : undefined}
+                      idPrefix={`task-${task.id}`} onSubmit={canAct ? approve : undefined} fileContext={{ task_id: task.id }}
                       onChange={(v) => { setValues(v); if (errors.length) setErrors([]) }} />
         </div>
       )}
@@ -225,7 +238,8 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
           <div className="flex gap-2">
             <button type="button" className="btn btn-primary flex-1 justify-center" disabled={busy || inquiring}
                     data-task-approve="" onClick={approve}>
-              {busy ? <Spinner size={12} /> : <Check size={12} aria-hidden />} {binary ? TASK_TEXT.approve : TASK_TEXT.submit}
+              {busy ? <Spinner size={12} /> : <Check size={12} aria-hidden />}{' '}
+              {binary ? (trial ? TRIAL_TEXT.approve : TASK_TEXT.approve) : (trial ? TRIAL_TEXT.submit : TASK_TEXT.submit)}
             </button>
             {trustKey && (
               <button type="button" className="btn flex-1 justify-center" disabled={busy || inquiring} data-approval-always=""
@@ -236,7 +250,8 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
             )}
             <button type="button" className="btn btn-danger flex-1 justify-center" disabled={busy || inquiring}
                     data-task-reject="" onClick={reject}>
-              <Ban size={12} aria-hidden /> {binary ? TASK_TEXT.reject : TASK_TEXT.rejectStop}
+              <Ban size={12} aria-hidden />{' '}
+              {binary ? (trial ? TRIAL_TEXT.reject : TASK_TEXT.reject) : (trial ? TRIAL_TEXT.rejectStop : TASK_TEXT.rejectStop)}
             </button>
           </div>
           {inquiring && (
@@ -259,7 +274,7 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
           )}
         </>
       )}
-      {pending && !task.can_respond && kind !== 'signal' && (
+      {pending && !task.can_respond && kind !== 'signal' && kind !== 'review' && (
         task.my_response
           ? <div className="mt-1 text-2xs leading-relaxed text-dim" data-task-readonly="responded">{respondedText(task.my_response)}</div>
           : <div className="mt-1 text-2xs leading-relaxed text-dim" data-task-readonly="">{TASK_TEXT.cannotRespond}</div>
@@ -267,6 +282,76 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
 
       {canAct && kind !== 'signal' && !compact && <Signer />}
       {!compact && <TaskLinks task={task} />}
+    </div>
+  )
+}
+
+/**
+ * 审核个人应用：提交人、目的、说明；处理人取一份共享副本去发布（取过的打开自己那一份），不发布就退回。
+ * 副本只有这条审核派给的人取得到（服务端 blueprints/personal.copy_for_review），取副本不改原来的个人应用
+ */
+function Review({ task, canAct, busy, note, setNote, onReject }: {
+  task: Task; canAct: boolean; busy: boolean; note: string; setNote: (v: string) => void; onReject: () => void
+}) {
+  const toast = useToast()
+  const navigate = useNavigate()
+  const me = usePrincipal()
+  const actor = useLocalActor()
+  const [copying, setCopying] = useState(false)
+  const payload: Partial<ReviewTaskPayload> = task.payload ?? {}
+  const blueprintId = typeof payload.blueprint_id === 'string' ? payload.blueprint_id : null
+  const copies = Array.isArray(payload.copies) ? payload.copies : []
+  // 审核副本归取它的那位搭建者：取过的打开自己那一份（别的处理人取的副本不算）
+  const myName = me?.username ?? actor ?? null
+  const mine = copies.find((c) => c.owner === myName)
+  const submitter = typeof payload.submitted_by === 'string' ? payload.submitted_by : null
+
+  const copy = async () => {
+    if (!blueprintId || copying) return
+    setCopying(true)
+    try {
+      const row = await api.blueprints.copyForReview(blueprintId)
+      navigate(blueprintPath(row.id))
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setCopying(false)
+    }
+  }
+
+  return (
+    <div className="mb-2 space-y-2" data-task-review="">
+      <p className="text-2xs leading-relaxed text-dim">{REVIEW_TASK_TEXT.intro}</p>
+      <dl className="space-y-1 rounded border bg-bg p-2 text-2xs leading-relaxed">
+        {submitter && <div className="text-dim">{REVIEW_TASK_TEXT.submittedBy(personName(submitter, task.people))}</div>}
+        {typeof payload.purpose === 'string' && payload.purpose && (
+          <div><dt className="inline text-faint">{REVIEW_TASK_TEXT.purpose}：</dt><dd className="inline">{payload.purpose}</dd></div>
+        )}
+        {typeof payload.note === 'string' && payload.note && (
+          <div><dt className="inline text-faint">{REVIEW_TASK_TEXT.note}：</dt><dd className="inline whitespace-pre-wrap">{payload.note}</dd></div>
+        )}
+      </dl>
+      {canAct && (
+        <>
+          <div className="flex gap-2">
+            {mine
+              ? <Link className="btn btn-primary flex-1 justify-center" to={blueprintPath(mine.id)} data-task-review-open="">
+                  <ExternalLink size={12} aria-hidden /> {REVIEW_TASK_TEXT.openCopy}
+                </Link>
+              : <button type="button" className="btn btn-primary flex-1 justify-center" disabled={busy || copying || !blueprintId}
+                        onClick={() => void copy()} data-task-review-copy="">
+                  {copying ? <Spinner size={12} /> : <Copy size={12} aria-hidden />} {copying ? REVIEW_TASK_TEXT.copying : REVIEW_TASK_TEXT.copy}
+                </button>}
+            <button type="button" className="btn btn-danger flex-1 justify-center" disabled={busy || copying}
+                    onClick={onReject} data-task-review-reject="">
+              <Ban size={12} aria-hidden /> {REVIEW_TASK_TEXT.reject}
+            </button>
+          </div>
+          <input className="field" aria-label={REVIEW_TASK_TEXT.rejectNote} placeholder={REVIEW_TASK_TEXT.rejectNote}
+                 value={note} onChange={(e) => setNote(e.target.value)} />
+          <div className="text-2xs leading-relaxed text-dim">{REVIEW_TASK_TEXT.rejectHint}</div>
+        </>
+      )}
     </div>
   )
 }
@@ -687,15 +772,22 @@ function Signer() {
   )
 }
 
-/** 去实例页（应用里的）或记录页（别处的，搭建者以上才看得到记录页） */
+/**
+ * 去实例页（应用里的）或记录页（别处的，搭建者以上才看得到记录页）。
+ *
+ * 审核个人应用的待办不给这两个：run_id 是提交人那次个人应用的刷新、app_id 是他的个人应用，只有拥有者读得到（服务端
+ * auth/access.private_owner，处理人是管理员、搭建者也不例外），链出去只会是打不开的页面。处理人要看的是取副本之后在副本
+ * 蓝图上试运行出来的（Review 里的「取副本，去发布」「打开我的副本」）
+ */
 function TaskLinks({ task }: { task: Task }) {
   const builder = useAtLeast('builder')
   const links = useMemo(() => {
     const out: { to: string; label: string }[] = []
+    if (task.kind === 'review') return out
     if (task.app_id) out.push({ to: `/apps/${encodeURIComponent(task.app_id)}/i/${encodeURIComponent(task.run_id)}`, label: TASK_TEXT.openInstance })
     if (builder) out.push({ to: `/runs/${encodeURIComponent(task.run_id)}`, label: TASK_TEXT.openRun })
     return out
-  }, [task.app_id, task.run_id, builder])
+  }, [task.kind, task.app_id, task.run_id, builder])
   if (!links.length) return null
   return (
     <div className="mt-1.5 flex flex-wrap gap-x-3 text-2xs">

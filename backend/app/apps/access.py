@@ -5,6 +5,9 @@
 - builder：所有应用至少 observe（能用、能看全部实例）；自己建的、或者有 manage 授权的才 manage；
 - user：按授权（给本人、给所在的组、给所有人）取最高的那一档，最高到 observe：搭建、发布、绑定岗位、授权、钩子、按草稿
   预览、改派催办都不给 user 角色（§3.12），授给它的 manage 按 observe 算。没有授权就看不到这个应用。
+- 个人应用（scope=personal，docs/design/normal-user-apps.md N7）：只有拥有者能用，按 manage 算（改页面、刷新、提交审核）；
+  别人一律没有权限、看不到，管理员也一样——管理员只在应用列表里看得到它存在、能归档（can_archive），不看内容（P4）。
+  个人应用没有授权（不能分享），授权表里不会有它。
 """
 from __future__ import annotations
 
@@ -38,7 +41,25 @@ def granted_role(principal: Principal, grants: list[Any]) -> str | None:
     return best
 
 
+def personal_role(principal: Principal, app: Any) -> str | None:
+    """个人应用上这个人的权限：拥有者 manage，别人 None。关登录时全部放行（没有可信的身份，同共享应用）。"""
+    if principal.mode == "off":
+        return "manage"
+    return "manage" if app.owner and principal.username == app.owner else None
+
+
+def is_personal(app: Any) -> bool:
+    return getattr(app, "scope", "shared") == "personal"
+
+
+def can_archive(principal: Principal, app: Any, role: str | None) -> bool:
+    """能不能归档：管理权限；个人应用另外管理员也能（看不到内容，但能把它收起来）。"""
+    return at_least(role, "manage") or (is_personal(app) and principal.role == "admin")
+
+
 def role_of(principal: Principal, app: Any, grants: list[Any]) -> str | None:
+    if is_personal(app):
+        return personal_role(principal, app)
     if principal.mode == "off" or principal.role == "admin":
         return "manage"
     granted = granted_role(principal, grants)
@@ -55,6 +76,8 @@ async def grants_of(session: AsyncSession, app_id: str) -> list[AppGrant]:
 
 
 async def app_role(session: AsyncSession, principal: Principal, app: Any) -> str | None:
+    if is_personal(app):
+        return personal_role(principal, app)
     if principal.mode == "off" or principal.role == "admin":
         return "manage"
     return role_of(principal, app, await grants_of(session, app.id))

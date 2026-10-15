@@ -7,12 +7,16 @@
  *
  * 应用编辑器的预览（FE-6）也用它：传按草稿解析出的视图模型、preview 为真——不发起运行、不提交表单，点数字照样能看出处。
  * 一个组件画坏了只坏它自己（每个组件各包一层错误边界），不连累整页。
+ *
+ * 隐藏（normal-user-apps N6）：作者隐藏的组件，发布版解析时服务端就跳过；按草稿解析时照样下发、带 hidden。这里只看这个
+ * 标记：应用页上直接改的编辑状态（editing）画成半透明、标「已隐藏」，别处（编辑器的预览）照使用者看到的样子不画。
+ * 编辑状态另给草稿里隐藏了的组件 id（editing.hidden）：服务端没带标记的也认得出来。
  */
-import { useCallback, useMemo, useState } from 'react'
+import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { AlertTriangle, PackageX } from 'lucide-react'
+import { AlertTriangle, EyeOff, PackageX } from 'lucide-react'
 import { ErrorBoundary } from '../components/ui'
-import { APP_TEXT, VIEW_TEXT } from '../lib/termsApp'
+import { APP_TEXT, PAGE_EDIT_TEXT, VIEW_TEXT } from '../lib/termsApp'
 import type { ViewEvidence, ViewModel, ViewNode } from '../typesApp'
 import { ViewCtx, type ViewCtxValue } from './context'
 import { RENDERERS } from './components'
@@ -29,9 +33,21 @@ export interface ViewRendererProps {
   onNavigate?: (pageId: string) => void
   /** 视图刷新、实例发起之后要重新取视图模型 */
   onReload?: () => void
+  /** 应用页上直接改的编辑状态：隐藏的组件画成半透明（不传时隐藏的组件不画） */
+  editing?: ViewEditMarks
 }
 
-export function ViewRenderer({ model, appId, runId, preview = false, onNavigate, onReload }: ViewRendererProps) {
+/** 编辑状态的标记：草稿里隐藏了的组件 id */
+export interface ViewEditMarks {
+  hidden: ReadonlySet<string>
+}
+
+const EditMarksCtx = createContext<ViewEditMarks | null>(null)
+
+/** 服务端按草稿解析时给隐藏的组件带的标记（ViewNode.hidden，发布版里没有这样的组件），加上这一次刚隐藏的 */
+const isHidden = (node: ViewNode, marks: ViewEditMarks | null) => node.hidden === true || !!marks?.hidden.has(node.id)
+
+export function ViewRenderer({ model, appId, runId, preview = false, onNavigate, onReload, editing }: ViewRendererProps) {
   const [evidence, setEvidence] = useState<EvidenceTarget | null>(null)
   const openEvidence = useCallback((ev: ViewEvidence, label: string, text?: string) => {
     setEvidence({ evidence: ev, label, text })
@@ -46,7 +62,7 @@ export function ViewRenderer({ model, appId, runId, preview = false, onNavigate,
 
   return (
     <ViewCtx.Provider value={ctx}>
-      <div className="space-y-3" data-view-renderer={preview ? 'preview' : 'live'}>
+      <div className="space-y-3" data-view-renderer={preview ? 'preview' : 'live'} data-view-editing={editing ? '' : undefined}>
         {problems.length > 0 && (
           <div role="alert" className="rounded-lg border px-3 py-2 text-xs leading-relaxed" data-view-problems={problems.length}
                style={{ borderColor: 'color-mix(in srgb, var(--warn) 40%, var(--border))', background: 'color-mix(in srgb, var(--warn) 7%, transparent)' }}>
@@ -63,7 +79,7 @@ export function ViewRenderer({ model, appId, runId, preview = false, onNavigate,
             </ul>
           </div>
         )}
-        {render(model.tree)}
+        <EditMarksCtx.Provider value={editing ?? null}>{render(model.tree)}</EditMarksCtx.Provider>
       </div>
       <EvidenceDrawer target={evidence} onClose={() => setEvidence(null)} />
     </ViewCtx.Provider>
@@ -73,14 +89,29 @@ export function ViewRenderer({ model, appId, runId, preview = false, onNavigate,
 let generation = 0
 
 function Node({ node, gen }: { node: ViewNode; gen: string }) {
+  const marks = useContext(EditMarksCtx)
+  const hidden = isHidden(node, marks)
+  // 隐藏的组件只在编辑状态下画（半透明）；别处照使用者看到的样子跳过
+  if (hidden && !marks) return null
   const Renderer = RENDERERS[node.type]
   if (!Renderer) return <Unknown node={node} />
-  return (
+  const body = (
     <ErrorBoundary scope="block" resetKey={gen}>
-      <div data-node={node.id} className="min-w-0">
+      {/* 编辑状态下组件可以聚焦：键盘也能选中（编辑层按回车选中） */}
+      <div data-node={node.id} data-node-hidden={hidden ? '' : undefined} tabIndex={marks ? 0 : undefined}
+           className={hidden ? 'min-w-0 opacity-45' : 'min-w-0'}>
         <Renderer node={{ ...node, props: node.props ?? {} }} />
       </div>
     </ErrorBoundary>
+  )
+  if (!hidden) return body
+  return (
+    <div className="relative min-w-0" title={PAGE_EDIT_TEXT.hiddenHint}>
+      <span className="chip absolute right-1 top-1 z-[1] bg-panel text-2xs" data-hidden-tag="">
+        <EyeOff size={10} aria-hidden /> {PAGE_EDIT_TEXT.hiddenTag}
+      </span>
+      {body}
+    </div>
   )
 }
 

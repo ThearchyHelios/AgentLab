@@ -41,6 +41,14 @@ def principal_out(p: Principal) -> dict[str, Any]:
             "user_can_chat": user_can_chat()}
 
 
+async def principal_full(session: AsyncSession, p: Principal) -> dict[str, Any]:
+    """认人接口、登录交回的那一份：principal_out 再加上管理员开没开「使用者可以建个人应用」（同 user_can_chat，使用者
+    读不到设置，新建应用的入口、个人蓝图页按它给）。"""
+    from app.blueprints.personal import enabled
+
+    return {**principal_out(p), "user_personal_apps": await enabled(session)}
+
+
 @router.get("/me")
 async def me(x_actor: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> Any:
     """当前是谁。关登录：mode=off、role=admin、username 是自报的署名。开登录没登录：401，带 mode（登录页据此显示
@@ -49,12 +57,12 @@ async def me(x_actor: str | None = Header(default=None), session: AsyncSession =
     principal = current_principal()
     if principal.mode == "off":
         actor = decode_actor(x_actor)
-        return principal_out(Principal(username=actor, display_name=actor, role="admin", mode="off"))
+        return await principal_full(session, Principal(username=actor, display_name=actor, role="admin", mode="off"))
     if not principal.username:
         can_bootstrap = principal.mode == "local" and not await _local_admin_exists(session)
         return JSONResponse(status_code=401, content={"detail": "请先登录", "code": "auth_required",
                                                       "mode": principal.mode, "can_bootstrap": can_bootstrap})
-    return principal_out(principal)
+    return await principal_full(session, principal)
 
 
 def _client_ip(request: Request) -> str:
@@ -89,7 +97,7 @@ async def login(payload: LoginIn, request: Request, response: Response,
                                           user_agent=request.headers.get("user-agent"))
     await session.commit()
     _login_response(request, response, token)
-    return principal_out(await sessions.principal_of(session, user, mode))
+    return await principal_full(session, await sessions.principal_of(session, user, mode))
 
 
 @router.post("/logout", status_code=204)
@@ -301,7 +309,7 @@ async def put_settings(payload: SettingsIn, request: Request, response: Response
     out = _settings_out(value)
     if token is not None and created is not None:
         _login_response(request, response, token)
-        out["principal"] = principal_out(await sessions.principal_of(session, created, current_mode()))
+        out["principal"] = await principal_full(session, await sessions.principal_of(session, created, current_mode()))
     return out
 
 
@@ -318,4 +326,4 @@ async def bootstrap(payload: BootstrapIn, request: Request, response: Response,
                                           user_agent=request.headers.get("user-agent"))
     await session.commit()
     _login_response(request, response, token)
-    return principal_out(await sessions.principal_of(session, user, "local"))
+    return await principal_full(session, await sessions.principal_of(session, user, "local"))

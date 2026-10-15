@@ -6,7 +6,8 @@
  * 按 path 挂到字段下面。对不上任何字段的错误（服务端说的是整张表，或者字段名对不上）照实列在表单顶上，不吞掉。
  *
  * 值的类型和表单声明的一致：数字字段存数（输入途中的「1.」这类半截写法留在框里，不回写成别的数），日期时间存带本地
- * 时区的 RFC 3339，多选存字符串数组。没填的不进值（undefined），必填由校验拦。
+ * 时区的 RFC 3339，多选存字符串数组，文件存上传后拿回的引用（FileInput）。没填的不进值（undefined），必填由校验拦。
+ * 文件要先上传：上传的上下文（应用的入口、待办、蓝图）由用表单的地方给（fileContext），不给的地方不能上传。
  */
 import { useEffect, useId, useState } from 'react'
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
@@ -14,12 +15,13 @@ import clsx from 'clsx'
 import type { FormError, FormField, FormSchema } from '../typesApp'
 import { FORM_TEXT } from '../lib/termsApp'
 import {
-  fieldOfPath, fieldOrder, localToRfc3339, optionsOf, rfc3339ToLocal, widgetOf,
+  fieldOfPath, fieldOrder, fileLimitsOf, localToRfc3339, optionsOf, rfc3339ToLocal, widgetOf,
 } from '../lib/schemaForm'
 import { matchShortcut } from '../lib/keys'
 import { useAtLeast } from '../store/auth'
 import { JsonInput, isComposing } from './ui'
 import { PrincipalPicker } from './PrincipalPicker'
+import { FileInput } from './FileInput'
 
 export interface SchemaFormProps {
   schema: FormSchema
@@ -32,9 +34,11 @@ export interface SchemaFormProps {
   onSubmit?: () => void
   /** 控件 id 的前缀，同一页有多份表单时避免撞 id */
   idPrefix?: string
+  /** 文件控件上传的上下文：{app_id, entry}（入口）、{task_id}（待办）、{blueprint_id}（试运行）。不给就不能上传 */
+  fileContext?: Record<string, string>
 }
 
-export function SchemaForm({ schema, value, onChange, errors, readOnly, onSubmit, idPrefix }: SchemaFormProps) {
+export function SchemaForm({ schema, value, onChange, errors, readOnly, onSubmit, idPrefix, fileContext }: SchemaFormProps) {
   const auto = useId().replace(/[^a-zA-Z0-9_-]/g, '')
   const prefix = idPrefix ?? `sf${auto}`
   const order = fieldOrder(schema)
@@ -77,15 +81,16 @@ export function SchemaForm({ schema, value, onChange, errors, readOnly, onSubmit
       {order.map((key) => (
         <FieldRow key={key} id={`${prefix}-${key}`} name={key} field={schema.properties[key]}
                   required={required.has(key)} value={value[key]} error={byField.get(key)}
-                  readOnly={readOnly || !!schema.properties[key].readOnly} onChange={(v) => set(key, v)} />
+                  readOnly={readOnly || !!schema.properties[key].readOnly} onChange={(v) => set(key, v)}
+                  fileContext={fileContext} />
       ))}
     </div>
   )
 }
 
-function FieldRow({ id, name, field, required, value, error, readOnly, onChange }: {
+function FieldRow({ id, name, field, required, value, error, readOnly, onChange, fileContext }: {
   id: string; name: string; field: FormField; required: boolean; value: unknown; error?: FormError
-  readOnly: boolean; onChange: (v: unknown) => void
+  readOnly: boolean; onChange: (v: unknown) => void; fileContext?: Record<string, string>
 }) {
   const widget = widgetOf(field)
   const title = field.title || name
@@ -141,6 +146,17 @@ function FieldRow({ id, name, field, required, value, error, readOnly, onChange 
           : <PrincipalPicker single label={title}
                              value={typeof value === 'string' && value ? [{ kind: 'user', name: value }] : []}
                              onChange={(list) => onChange(list[0]?.name || undefined)} />}
+        {foot}
+      </div>
+    )
+  }
+  if (widget === 'file') {
+    // 文件控件自己有按钮和链接：标题指着它的主按钮（id），限制和「谁能下载」写在控件下面
+    return (
+      <div className="min-w-0" data-field={name} data-widget="file">
+        <label className="label" htmlFor={id}>{label}</label>
+        <FileInput id={id} label={title} value={value} readOnly={readOnly} context={fileContext} limits={fileLimitsOf(field)}
+                   invalid={!!error} describedBy={describedBy} onChange={onChange} />
         {foot}
       </div>
     )

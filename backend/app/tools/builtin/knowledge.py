@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 from app.db.base import SessionLocal
 from app.memory import kb, store
-from app.tools.registry import ToolContext, register
+from app.tools.registry import ToolArgsError, ToolContext, register
 
 
 class KbSearchArgs(BaseModel):
@@ -23,6 +23,11 @@ class KbSearchArgs(BaseModel):
 )
 async def kb_search(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
     args = KbSearchArgs(**kwargs)
+    if ctx.fixed_scope and args.collection and args.collection != ctx.collection:
+        # 遮罩、只读的运行（使用者的问数据、个人应用、个人蓝图的试运行）：知识库的内容不经遮罩，只能检索运行定下的那一个。
+        # 拒而不是悄悄改用默认的：检索的不是参数里写的那个库，结果却照常交回，看的人会当成查过了那一个
+        raise ToolArgsError(f"这次运行只能检索管理员设好的知识库，不能另指定知识库「{args.collection}」："
+                            "去掉 collection 参数即可")
     async with SessionLocal() as session:
         hits = await kb.search(
             session,

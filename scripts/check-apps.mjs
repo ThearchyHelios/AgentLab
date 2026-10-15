@@ -13,7 +13,11 @@
 //   - 实例页：状态（服务端给的说法：结果未知写「等待核实写入结果」）、印章、进度（结果未知的那一步不写「完成」）、
 //     本实例的待办卡（就地处理）；不是处理人的待办表单只画这一步的状态、不去取待办；动作状态（哈希前 8 位、环境；
 //     结果未知的经过记一笔，不当失败原因）；
-//   - 窄屏（390px）不出横向滚动。
+//   - 窄屏（390px）不出横向滚动；
+//   - 页面上直接改（normal-user-apps N6）：有 manage 的人点「编辑」进编辑状态（地址记 edit=1），按草稿解析；点组件是选中、
+//     不打开出处；小工具条改文字只给目录标了 x-text 的属性；隐藏、上移、删除都自动存草稿（PATCH 带整份草稿）后按草稿
+//     重新解析；草稿里隐藏的组件画成半透明，服务端没画出来的列在页底能取消隐藏；「加一张数据卡片」按类别分组、候选 id
+//     撞了换新的；顶部写「有未发布的改动」，「发布」走应用发布；应用出自蓝图时给「改取数」，链到蓝图页。
 //
 // 页面是真页面（走真的应用外壳），/api/apps/**、/api/tasks/**、指标链接口在浏览器层答掉，数据是这里虚构的
 // （「门店周报」「报销审批」）；其余 GET 放行到服务端（外壳要它），写请求一律拦下、记在探针里，不碰真实写接口。
@@ -232,6 +236,67 @@ const METRIC_CHAIN_TRACED = {
   chain: [{ ...METRIC_CHAIN.chain[0], inputs: [TRACED_INPUT], untraced: [] }, { step: 'input', ...TRACED_INPUT }],
 }
 
+// ---------------------------------------------------------------- 页面上直接改（N6）的假数据
+
+/** 门店周报的草稿：和 HOME 的组件一一对应；stores 被隐藏（服务端按草稿解析照样下发、带 hidden），old_note 也被隐藏
+ *  但服务端没画出来（编辑层列在页底） */
+const DRAFT = {
+  format: 'agentlab.app/1', name: '门店周报', description: '每周一看各门店的销售概况',
+  pins: [{ alias: 'wk', workflow_id: 'wf_week', version: 7, graph_hash: '3fa2c1d0', level: 'governed', use: 'view' }],
+  entries: [], views: { wk: { source: { kind: 'latest_sealed', pin: 'wk', from: 'formal' } } }, forms: {}, slots: {}, task_ui: {},
+  pages: [{ id: 'home', title: '本周概览', body: [
+    { id: 'stamp', type: 'stamp', props: {}, bind: { view: 'wk', run: 'status' } },
+    { id: 'kpis', type: 'columns', props: { count: 2 }, children: [
+      { id: 'gmv', type: 'metric', props: { label: '销售额', unit: '万元', conv: '万' }, bind: { view: 'wk', metric: 'kpi.gmv' } },
+      { id: 'orders', type: 'metric', props: { label: '订单数' }, bind: { view: 'wk', metric: 'kpi.orders' } },
+      { id: 'shops', type: 'metric', props: { label: '门店数', unit: '家' }, bind: { view: 'wk', cell: { node: 'q1', row: 0, col: 'n' } } },
+      { id: 'aov', type: 'metric', props: { label: '客单价', unit: '元' }, bind: { view: 'wk', metric: 'kpi.aov' } },
+    ] },
+    { id: 'trend', type: 'series', props: { label: '销售额趋势' }, bind: { view: 'wk', series: 'kpi.gmv', last: 12 } },
+    { id: 'stores', type: 'table', props: { title: '门店排行' }, hidden: true, bind: { view: 'wk', query: { node: 'q1' } } },
+    { id: 'old_note', type: 'notice', props: { text: '旧的说明' }, hidden: true },
+    { id: 'future', type: 'gauge3d', props: {} },
+    { id: 'broken', type: 'metric', props: { label: '毛利率' }, bind: { view: 'wk', metric: 'kpi.margin' } },
+  ] }, { id: 'detail', title: '门店明细', body: [] }],
+}
+const DETAIL = { ...APPS[0], blueprint_id: 'bp_week', draft: DRAFT, draft_bindings: { slots: {} },
+  published: { version: 3, pages: [{ id: 'home', title: '本周概览' }, { id: 'detail', title: '门店明细' }], entries: [] } }
+/** 按草稿解析：stores 带 hidden 下发，old_note 不下发 */
+const DRAFT_HOME = { ...HOME, tree: HOME.tree.map((n) => (n.id === 'stores' ? { ...n, hidden: true } : n)) }
+const CATALOG = { version: 1, categories: { layout: '布局', display: '展示' }, components: [
+  { name: 'columns', label: '分栏', category: 'layout', version: 1, children: true, bindings: [],
+    props: { type: 'object', properties: { count: { type: 'integer', title: '列数' } } } },
+  { name: 'stamp', label: '印章', category: 'display', version: 1, children: false, bindings: ['run'],
+    props: { type: 'object', properties: { compact: { type: 'boolean', title: '紧凑显示' } } } },
+  { name: 'metric', label: '指标块', category: 'display', version: 1, children: false, bindings: ['metric', 'cell'],
+    props: { type: 'object', properties: {
+      label: { type: 'string', maxLength: 200, title: '名称', 'x-text': true },
+      unit: { type: 'string', maxLength: 200, title: '单位', 'x-text': true },
+      conv: { type: 'string', maxLength: 200, title: '换算' } } } },
+  { name: 'series', label: '趋势', category: 'display', version: 1, children: false, bindings: ['series'],
+    props: { type: 'object', properties: { label: { type: 'string', maxLength: 200, title: '名称', 'x-text': true } } } },
+  { name: 'table', label: '表格', category: 'display', version: 1, children: false, bindings: ['query'],
+    props: { type: 'object', properties: { title: { type: 'string', maxLength: 200, title: '标题', 'x-text': true } } } },
+  { name: 'notice', label: '提示', category: 'display', version: 1, children: false, bindings: [],
+    props: { type: 'object', properties: { text: { type: 'string', maxLength: 4000, title: '提示文字', 'x-text': true } } } },
+] }
+/** 「加一张数据卡片」的候选：口径卡指标两个（其中一个 id 和页面上的 gmv 撞了）、趋势一个 */
+const CANDIDATES = { items: [
+  { kind: 'metric', label: '退款率', group: '口径卡「周销售」', component: { id: 'refund', type: 'metric', props: { label: '退款率' },
+    bind: { view: 'wk', metric: 'kpi.refund' } } },
+  { kind: 'metric', label: '销售额', group: '口径卡「周销售」', component: { id: 'gmv', type: 'metric', props: { label: '销售额' },
+    bind: { view: 'wk', metric: 'kpi.gmv' } } },
+  { kind: 'series', label: '订单数趋势', group: '口径卡「周销售」', component: { id: 'orders_trend', type: 'series',
+    props: { label: '订单数趋势' }, bind: { view: 'wk', series: 'kpi.orders', last: 12 } } },
+] }
+
+/** 草稿里按 id 找组件 */
+const findIn = (spec, id) => {
+  const walk = (list) => { for (const c of list ?? []) { if (c.id === id) return c; const hit = walk(c.children); if (hit) return hit } return null }
+  for (const pg of spec?.pages ?? []) { const hit = walk(pg.body); if (hit) return hit }
+  return null
+}
+
 // ---------------------------------------------------------------- 浏览器
 
 const browser = await chromium.launch({ executablePath: CHROME })
@@ -262,10 +327,32 @@ async function open({ width = 1280, height = 900, state }) {
       if (p.startsWith('/api/tasks/') && p.endsWith('/respond')) {
         return route.fulfill({ json: { task: { ...TASK, status: 'resolved', can_respond: false }, resolved: true } })
       }
+      // 页面上直接改：存草稿回详情（带上存进去的草稿），发布回新版本
+      if (state.detail && r.method() === 'PATCH' && p === '/api/apps/app_weekly') {
+        const body = JSON.parse(r.postData() || '{}')
+        state.patches = [...(state.patches ?? []), body]
+        state.detail = { ...state.detail, ...(body.draft ? { draft: body.draft } : {}) }
+        return route.fulfill({ json: state.detail })
+      }
+      if (state.detail && p === '/api/apps/app_weekly/publish') {
+        return route.fulfill({ json: { ok: true, version: 4, level: 'governed', spec_hash: 'h4', issues: [] } })
+      }
       return route.fulfill({ status: 503, json: { detail: '检查脚本拦下了写请求' } })
     }
     if (p === '/api/auth/me') return route.fulfill({ json: state.me ?? { mode: 'off', username: null, display_name: null, role: 'admin', groups: [], verified: false } })
     if (p === '/api/apps') return route.fulfill({ json: { items: APPS } })
+    // 应用详情：默认不给草稿（不进编辑状态）；页面上直接改的段落给 manage 的详情
+    if (p === '/api/apps/app_weekly') return route.fulfill({ json: state.detail ?? { ...APPS[0], published: DETAIL.published } })
+    if (p === '/api/apps/app_claim') return route.fulfill({ json: { ...APPS[1], published: { version: 2, pages: [{ id: 'home', title: '报销' }], entries: [] } } })
+    if (p === '/api/apps/catalog') return route.fulfill({ json: CATALOG })
+    if (p === '/api/apps/app_weekly/candidates') {
+      state.candidateHits = (state.candidateHits ?? 0) + 1
+      return route.fulfill({ json: CANDIDATES })
+    }
+    if (p === '/api/apps/app_weekly/pages/home' && url.searchParams.get('draft') === '1') {
+      state.draftHits = (state.draftHits ?? 0) + 1
+      return route.fulfill({ json: state.draftHome ?? DRAFT_HOME })
+    }
     if (p === '/api/apps/app_weekly/pages/home') {
       state.pageHits = (state.pageHits ?? 0) + 1
       return route.fulfill({ json: state.home ?? HOME })
@@ -312,10 +399,12 @@ await section('首页：三个页签、关登录说明、需升级', async () =>
   check('能管理的应用有「编辑」，只能用的没有',
     (await page.locator('[data-app="app_weekly"] a[href$="/edit"]').count()) === 1
     && (await page.locator('[data-app="app_claim"] a[href$="/edit"]').count()) === 0)
-  // 新建应用是新建向导的起点：搭建者及以上在页头看得到（关登录时所有人等同管理员），点进去先选工作流和版本
+  // 新建应用（normal-user-apps §4.1）：搭建者及以上在页头看得到（关登录时所有人等同管理员），点进去是三个起点的新建页，
+  // 建的是共享蓝图。起点和蓝图页本身在 check-blueprint 里查
   const create = page.locator('header [data-app-create]')
-  check('页头有「新建应用」，链到新建页（不带工作流、版本：先选）', await create.count() === 1
-    && (await create.innerText()).includes('新建应用') && await create.getAttribute('href') === '/apps/new/edit',
+  check('页头有「新建应用」，链到新建页（三个起点）', await create.count() === 1
+    && (await create.innerText()).includes('新建应用') && await create.getAttribute('href') === '/apps/create'
+    && await create.getAttribute('data-app-create') === 'shared',
     `${await create.count()} ｜ ${await create.getAttribute('href').catch(() => '')}`)
   await page.getByRole('tab', { name: '我发起的' }).click()
   await page.locator('[data-mine] [data-instance]').first().waitFor({ timeout: 5000 })
@@ -323,7 +412,7 @@ await section('首页：三个页签、关登录说明、需升级', async () =>
     (await page.locator('[data-mine] a[href="/apps/app_claim/i/run_claim_1"]').count()) === 1)
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
 
-  // 开了登录的使用者：没有「新建应用」（搭建是搭建者及以上的事）
+  // 开了登录的使用者、管理员没开个人应用：没有「新建应用」（开了的情形在 check-blueprint 里查）
   const user = { writes: [], me: { mode: 'local', username: 'zhangsan', display_name: '张三', role: 'user', groups: [], verified: true } }
   const u = await open({ state: user })
   await u.page.goto(`${WEB}/apps?tab=apps`)
@@ -511,6 +600,126 @@ await section('实例页：状态、进度、待办卡、动作状态', async ()
     && /不会自动重发/.test(await page.locator('[data-action="unknown"] [data-action-note]').innerText()))
   check('关登录（等同管理员）时接运行流', (await page.locator('[data-instance-follow]').getAttribute('data-instance-follow')) === 'stream')
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+})
+
+// ---------------------------------------------------------------- 页面上直接改（N6）
+
+await section('应用页：编辑状态、改文字、隐藏、上下挪、删除、加一张数据卡片、发布', async () => {
+  const state = { writes: [], detail: structuredClone(DETAIL) }
+  const { page } = await open({ state })
+  await page.goto(`${WEB}/apps/app_weekly`)
+  await page.locator('[data-view-renderer]').waitFor({ timeout: 15000 })
+  const start = page.locator('[data-page-edit-start]')
+  check('有 manage 的人有「编辑」', await start.waitFor({ timeout: 5000 }).then(() => true, () => false)
+    && (await start.innerText()).includes('编辑'))
+  await start.click()
+  await page.locator('[data-page-edit-layer]').waitFor({ timeout: 8000 })
+  check('编辑状态记在地址上（edit=1）', /[?&]edit=1/.test(page.url()), page.url())
+  check('按草稿解析（draft=1）', (state.draftHits ?? 0) >= 1, `${state.draftHits ?? 0} 次`)
+  check('顶部的编辑条：写「编辑中」，给「发布」', /编辑中/.test(await page.locator('[data-page-edit-bar]').innerText())
+    && await page.locator('[data-page-edit-publish]').count() === 1)
+  const changeData = page.locator('[data-page-edit-change-data]')
+  check('应用出自蓝图：给「改取数」，链到蓝图页', await changeData.count() === 1
+    && await changeData.getAttribute('href') === '/blueprints/bp_week', await changeData.getAttribute('href').catch(() => ''))
+
+  // 隐藏：服务端带 hidden 下发的画成半透明、标「已隐藏」；没下发的列在页底
+  const stores = page.locator('[data-node="stores"]')
+  check('隐藏的组件画成半透明', await stores.getAttribute('data-node-hidden') === ''
+    && /opacity-45/.test(await stores.getAttribute('class') ?? ''), await stores.getAttribute('class').catch(() => ''))
+  check('……旁边标「已隐藏」', await page.locator('[data-hidden-tag]').count() >= 1)
+  const hiddenList = page.locator('[data-page-edit-hidden-list]')
+  check('服务端没画出来的隐藏组件列在页底，能取消隐藏', await hiddenList.getAttribute('data-page-edit-hidden-list') === '1'
+    && await hiddenList.locator('[data-page-edit-unhide="old_note"]').count() === 1)
+
+  // 点组件是选中，不打开出处
+  await page.locator('[data-node="gmv"] button[data-evidence="metric"]').click()
+  const toolbar = page.locator('[data-page-edit-toolbar="gmv"]')
+  check('点组件出小工具条（选中）', await toolbar.waitFor({ timeout: 3000 }).then(() => true, () => false))
+  check('编辑状态下点数字不打开出处', await page.locator('[data-evidence-panel]').count() === 0 && !state.chainHits)
+  const ops = await toolbar.locator('[data-page-edit-op]').evaluateAll((els) => els.map((e) => e.getAttribute('data-page-edit-op')))
+  check('小工具条五样：改文字、隐藏、上移、下移、删除', ops.join(',') === 'text,hide,up,down,remove', ops.join(','))
+
+  // 改文字：只给标了 x-text 的属性（名称、单位），不给换算
+  await toolbar.locator('[data-page-edit-op="text"]').click()
+  const dlg = page.getByRole('dialog')
+  await dlg.locator('[data-page-edit-text]').waitFor({ timeout: 3000 })
+  const fields = await dlg.locator('[data-page-edit-text-field]').evaluateAll((els) => els.map((e) => e.getAttribute('data-page-edit-text-field')))
+  check('改文字只列给人看的文字（名称、单位），不列换算', fields.join(',') === 'label,unit', fields.join(','))
+  await dlg.locator('[data-page-edit-text-field="label"] input').fill('本周销售额')
+  const before = state.draftHits ?? 0
+  await dlg.locator('[data-page-edit-text-save]').click()
+  await page.waitForFunction(() => document.querySelector('[data-page-edit-save]')?.getAttribute('data-page-edit-save') === 'saved', null, { timeout: 5000 }).catch(() => {})
+  check('改文字自动存草稿（PATCH 带整份草稿）', findIn(state.patches?.at(-1)?.draft, 'gmv')?.props?.label === '本周销售额',
+    JSON.stringify(findIn(state.patches?.at(-1)?.draft, 'gmv')?.props ?? {}))
+  check('……存完按草稿重新解析', (state.draftHits ?? 0) > before, `${before} → ${state.draftHits ?? 0}`)
+  check('……顶部写「有未发布的改动」', (await page.locator('[data-page-edit-status]').innerText()).includes('有未发布的改动'))
+
+  // 隐藏
+  await page.locator('[data-node="gmv"]').click()
+  await page.locator('[data-page-edit-toolbar="gmv"] [data-page-edit-op="hide"]').click()
+  await page.waitForTimeout(400)
+  check('隐藏：草稿里这个组件 hidden 为真', findIn(state.patches?.at(-1)?.draft, 'gmv')?.hidden === true)
+
+  // 同一层里下移一格
+  await page.locator('[data-node="orders"]').click()
+  await page.locator('[data-page-edit-toolbar="orders"] [data-page-edit-op="down"]').click()
+  await page.waitForTimeout(400)
+  const order = findIn(state.patches?.at(-1)?.draft, 'kpis')?.children?.map((c) => c.id).join(',')
+  check('下移：同一层里和下一个换位置', order === 'gmv,shops,orders,aov', order)
+  check('第一个组件不能上移', await page.locator('[data-node="stamp"]').click().then(async () =>
+    page.locator('[data-page-edit-toolbar="stamp"] [data-page-edit-op="up"]').isDisabled()))
+
+  // 删除要确认
+  await page.locator('[data-node="broken"]').click()
+  await page.locator('[data-page-edit-toolbar="broken"] [data-page-edit-op="remove"]').click()
+  const confirm = page.locator('[role="dialog"], [role="alertdialog"]').filter({ hasText: '删除「毛利率」？' }).first()
+  check('删除先确认、写明后果', await confirm.waitFor({ timeout: 3000 }).then(() => true, () => false))
+  await confirm.getByRole('button', { name: '删除组件' }).click()
+  await page.waitForTimeout(400)
+  check('删除：草稿里没有这个组件了', !!state.patches?.at(-1)?.draft && findIn(state.patches.at(-1).draft, 'broken') === null)
+
+  // 取消隐藏页底列出的
+  await page.locator('[data-page-edit-unhide="old_note"]').click()
+  await page.waitForTimeout(400)
+  check('页底的「取消隐藏」：草稿里去掉 hidden', findIn(state.patches?.at(-1)?.draft, 'old_note') && !('hidden' in findIn(state.patches.at(-1).draft, 'old_note')))
+
+  // 加一张数据卡片：候选按类别分组，id 撞了换新的
+  await page.locator('[data-page-edit-add-card]').click()
+  const cand = page.getByRole('dialog')
+  await cand.locator('[data-page-edit-candidates]').waitFor({ timeout: 3000 })
+  const groups = await cand.locator('[data-candidate-group]').evaluateAll((els) => els.map((e) => e.getAttribute('data-candidate-group')))
+  check('候选按类别分组（口径卡指标、趋势）', groups.join(',') === 'metric,series', groups.join(','))
+  check('……组名写中文', (await cand.locator('[data-candidate-group="metric"] h3').innerText()) === '口径卡指标')
+  await cand.locator('[data-candidate="gmv"] [data-candidate-add]').click()
+  await page.waitForTimeout(400)
+  const home = state.patches?.at(-1)?.draft?.pages?.[0]?.body ?? []
+  check('加上的卡片落在页尾，id 和已有的撞了换成新的', home.at(-1)?.id === 'gmv_2' && home.at(-1)?.bind?.metric === 'kpi.gmv',
+    JSON.stringify(home.at(-1) ?? {}))
+
+  // 发布
+  const writesBefore = state.writes.length
+  await page.locator('[data-page-edit-publish]').click()
+  const pub = page.locator('[role="dialog"], [role="alertdialog"]').filter({ hasText: '发布这些改动？' }).first()
+  await pub.waitFor({ timeout: 3000 })
+  await pub.getByRole('button', { name: '发布', exact: true }).click()
+  await page.waitForTimeout(500)
+  check('「发布」走应用发布', state.writes.slice(writesBefore).some((w) => w.method === 'POST' && w.path === '/api/apps/app_weekly/publish'))
+  check('……发布后不再写「有未发布的改动」', !(await page.locator('[data-page-edit-status]').innerText().catch(() => '')).includes('有未发布的改动'))
+
+  await page.locator('[data-page-edit-done]').click()
+  await page.locator('[data-page-edit-start]').waitFor({ timeout: 5000 })
+  check('完成编辑：回到使用者看到的样子（地址上去掉 edit）', !/[?&]edit=1/.test(page.url()), page.url())
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+})
+
+await section('应用页：只能用的人没有「编辑」，编辑地址也不进编辑状态', async () => {
+  const state = { writes: [] }
+  const { page } = await open({ state })
+  await page.goto(`${WEB}/apps/app_claim?edit=1`)
+  await page.locator('[data-view-renderer]').waitFor({ timeout: 15000 })
+  await page.waitForTimeout(500)
+  check('使用者没有「编辑」', await page.locator('[data-page-edit-start]').count() === 0)
+  check('带着 edit=1 也不进编辑状态', await page.locator('[data-page-edit-layer]').count() === 0)
 })
 
 await section('窄屏：390px 不出横向滚动', async () => {

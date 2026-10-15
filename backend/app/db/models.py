@@ -977,3 +977,6 @@ from app.db.models_identity import AuditEvent, AuthSession, Group, GroupMember, 
 from app.db.models_process import (  # noqa: E402,F401
     ActionRecord, NotifyChannel, NotifyDelivery, Task, TaskAssignment,
 )
+from app.db.models_blueprints import (  # noqa: E402,F401
+    Blueprint, BlueprintEvent, PublishPlan, RecordsTable, StoredFile,
+)

@@ -76,9 +76,12 @@ export function PinsSection() {
     setDraft((s) => ({ ...s, pins: s.pins.map((p, j) => (j === i ? { ...p, ...patch } : p)) }))
 
   const rederive = async (pin: AppPin) => {
+    // 还没发布的（试运行派生的草稿）、个人应用的钉住项没有工作流版本可派生
+    if (!pin.workflow_id || pin.version == null) return
+    const { workflow_id: wid, version } = pin
     if (!(await confirmDialog({ title: T.rederiveTitle, body: T.rederiveBody, confirmLabel: T.rederive, danger: true }))) return
     try {
-      const { spec } = await api.apps.derive({ workflow_id: pin.workflow_id, version: pin.version, name: draft.name })
+      const { spec } = await api.apps.derive({ workflow_id: wid, version, name: draft.name })
       setDraft(() => ({ ...spec, name: draft.name, description: draft.description || spec.description }))
       toast.ok(T.rederiveDone)
     } catch (e) {
@@ -107,12 +110,12 @@ export function PinsSection() {
               {(p) => <input {...p} className="field mono text-xs" value={pin.alias} onChange={(e) => update(i, { alias: e.target.value })} />}
             </Field>
             <div className="min-w-0 pb-1.5 text-xs">
-              <div className="truncate font-medium">{nameOf(pin.workflow_id)}</div>
+              <div className="truncate font-medium">{pin.workflow_id ? nameOf(pin.workflow_id) : '—'}</div>
               <div className="mono text-2xs text-faint">{T.pinHash(pin.graph_hash || '')}</div>
             </div>
             <Field label={T.pickVersion}>
               {() => (
-                <PublishedVersionPicker compact workflowId={pin.workflow_id} value={pin.version}
+                <PublishedVersionPicker compact workflowId={pin.workflow_id ?? ''} value={pin.version}
                                         onChange={(v) => v && update(i, { version: v.version, graph_hash: v.graph_hash ?? '',
                                                                            level: v.level ?? null })} />
               )}

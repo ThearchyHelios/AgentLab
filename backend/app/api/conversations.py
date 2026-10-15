@@ -287,12 +287,21 @@ async def _manages_app(session: AsyncSession, app_id: str) -> bool:
 
 
 async def _check_access(session: AsyncSession, row: Conversation) -> None:
-    """这段对话这个人能不能用，不能用抛 403。"""
+    """这段对话这个人能不能用，不能用抛 403。蓝图对话跟着蓝图走（blueprints/store.ensure_access）：别人的个人蓝图的对话，
+    搭建者、管理员也看不到（§3.12：别人的个人应用内容谁都不看），当它不存在（404，同蓝图）。"""
     mine = _isolated()
     if mine is not None and (not row.created_by or row.created_by != mine):
         raise HTTPException(403, NOT_YOURS)
     if row.kind == "app" and row.app_id and not await _manages_app(session, row.app_id):
         raise HTTPException(403, APP_MANAGE_ONLY)
+    if row.kind == "blueprint":
+        from app.blueprints.store import BLUEPRINT_GONE, ensure_access
+        from app.db.models_blueprints import Blueprint
+
+        bp = (await session.execute(select(Blueprint).where(Blueprint.conversation_id == row.id))).scalars().first()
+        if bp is None:
+            raise HTTPException(404, BLUEPRINT_GONE)
+        await ensure_access(session, bp)
 
 
 async def ensure_conversation_access(session: AsyncSession, conversation_id: str | None) -> Conversation | None:
@@ -348,6 +357,12 @@ async def list_conversations(
                 managed[row.app_id] = await _manages_app(session, row.app_id)
             if not managed[row.app_id]:
                 continue
+        if row.kind == "blueprint":
+            # 蓝图对话跟着蓝图走：别人的个人蓝图的对话不列
+            try:
+                await _check_access(session, row)
+            except HTTPException:
+                continue
         kept.append(row)
     rows = kept
     if not rows:
@@ -398,7 +413,13 @@ async def create_conversation(
 async def get_conversation(
     conversation_id: str, session: AsyncSession = Depends(get_session)
 ) -> ConversationDetail:
-    row = await _get(session, conversation_id)
+    return await conversation_detail(session, await _get(session, conversation_id))
+
+
+async def conversation_detail(session: AsyncSession, row: Conversation) -> ConversationDetail:
+    """一段对话连同各轮（权限由调用方先判过）。蓝图对话另经 GET /api/blueprints/{id}/conversation 取：那条路按蓝图判，
+    没开问数据的使用者也读得到自己蓝图的对话。"""
+    conversation_id = row.id
     turns = list((await session.execute(
         select(ConversationTurn)
         .where(ConversationTurn.conversation_id == conversation_id)

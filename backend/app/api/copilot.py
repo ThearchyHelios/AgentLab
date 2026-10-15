@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -449,7 +450,29 @@ async def _previous_graph(
     if not conversation_id:
         return None
     turns = await recent_turns(session, conversation_id)
-    return next((t.graph for t in reversed(turns) if t.graph), None)
+    return next((t.graph for t in reversed(turns) if _has_nodes(t.graph)), None)
+
+
+def _has_nodes(graph: Any) -> bool:
+    """一轮记下的图里有没有节点：只问了一句、没搭图的那一轮记的是空图，不算「上一轮的图」。"""
+    return isinstance(graph, dict) and bool(graph.get("nodes"))
+
+
+def _asked_of(asked: dict[str, Any]) -> dict[str, Any]:
+    """模型的反问（ask 操作）→ 交给前端、记进这一轮 meta.asked 的形状 {question, options}。"""
+    options = asked.get("options")
+    listed = options if isinstance(options, list) else []
+    return {"question": str(asked.get("question") or ""),
+            "options": [str(o) for o in listed if isinstance(o, (str, int, float))]}
+
+
+def _asked_final(asked: dict[str, Any], base_graph: dict[str, Any] | None,
+                 prev_graph: dict[str, Any] | None) -> dict[str, Any]:
+    """只问不改的一轮的收尾：图原样交回（画布上原来的图、问数据上一轮的图，都没有就是空图），不运行、不重排。"""
+    graph = base_graph if _has_nodes(base_graph) else prev_graph if _has_nodes(prev_graph) else None
+    graph = graph or {"nodes": [], "edges": []}
+    return {"op": "final", "graph": graph, "issues": [], "explanation": "", "autorun": False,
+            "layout": {"mode": "keep", "placed": []}, "tool_changes": [], "asked": _asked_of(asked)}
 
 
 async def _history_section(session: AsyncSession, conversation_id: str | None) -> str:
@@ -472,7 +495,7 @@ async def _history_section(session: AsyncSession, conversation_id: str | None) -
         return ""
 
     lines = [
-        f"第 {i} 轮\n  问：{t.question}\n  答：{_answer_of(t) or '（没有结果）'}"
+        f"第 {i} 轮\n  问：{t.question}\n  答：{_asked_line(t) or _answer_of(t) or '（没有结果）'}"
         for i, t in enumerate(turns, 1)
         if t.question
     ]
@@ -481,7 +504,7 @@ async def _history_section(session: AsyncSession, conversation_id: str | None) -
 
     block = "# 这次对话之前聊过的\n" + "\n".join(lines)
 
-    last_graph = next((t.graph for t in reversed(turns) if t.graph), None)
+    last_graph = next((t.graph for t in reversed(turns) if _has_nodes(t.graph)), None)
     if last_graph:  # 和 _previous_graph 取的是同一张，兜底重放靠的就是它
         block += (
             "\n\n上一轮用的工作流（数据源和表都已经对好了）：\n"
@@ -490,6 +513,25 @@ async def _history_section(session: AsyncSession, conversation_id: str | None) -
     if looked := _looked_line(turns[-1]):
         block += "\n\n" + looked
     return block
+
+
+#: 只问不改的那一轮在历史里的写法：下一轮用户的话就是在回答它
+ASKED_PROMPT = "（助手反问，等用户回答：{question}{options}）"
+
+
+def _asked_line(turn: Any) -> str:
+    """这一轮是助手反问（前端记进 meta.asked：final 带的 {question, options}，或者只记 true、问题写在答案里）：写成「助手
+    反问了什么」——不然下一轮模型把它当成自己给出的答案，不知道用户的话是在回答它的问题。不是反问的轮次是空串。"""
+    from app.api.conversations import turn_meta
+
+    asked = (turn_meta(turn) or {}).get("asked")
+    if asked is True:
+        asked = {"question": turn.answer or ""}
+    if not isinstance(asked, dict) or not str(asked.get("question") or "").strip():
+        return ""
+    options = [str(o) for o in asked.get("options") or [] if isinstance(o, (str, int, float))]
+    return ASKED_PROMPT.format(question=str(asked["question"]).strip(),
+                               options=f"；候选：{'、'.join(options)}" if options else "")
 
 
 LOOKED_PROMPT = "上一轮查看过：{items}（要再看时直接点名）"
@@ -779,23 +821,22 @@ def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, 
 def _chat_user_kinds() -> str:
     from app.auth.chat_policy import CHAT_NODE_TYPES
 
-    return "、".join(sorted(CHAT_NODE_TYPES - {"merge"}))
+    return "、".join(sorted(CHAT_NODE_TYPES))
 
 
 #: 开登录后 user 角色在问数据里生成的图（D-c）要守的约束，接在结构要求后面（_graph_system 的 chat_user）。发起时按
-#: app/auth/chat_policy.py 收窄，节点手册里取数的标准写法（tool 节点查库、merge 按键合并）搭出来的图发起时一律被拒，所以先
-#: 说给模型听。规则本身只在 chat_policy 一处：节点类型从那里取，自查也按它判（_chat_user_issues），这里只是把它讲成模型
-#: 照着搭得出来的写法
+#: app/auth/chat_policy.py 收窄：节点只许读数据、整理、撰写这一类，tool 节点和 agent 只能用数据源查询和只读的内置工具，
+#: 所以先说给模型听。规则本身只在 chat_policy 一处：节点类型从那里取，自查也按它判（_chat_user_issues），这里只是把它讲成
+#: 模型照着搭得出来的写法
 _CHAT_USER_PROMPT = (
     "\n\n这位用户是「使用者」：这张图以他的身份运行，只能读数据、整理、撰写。下面几条优先于上面节点手册和搭图规则里的"
     "写法：\n"
-    f"1. 节点只用 {_chat_user_kinds()}。不要用 tool、code、merge、supervisor、subgraph、loop、human、memory、validate 等"
-    "其他节点（merge 的输入只能是 tool 节点，所以同样用不了）\n"
-    "2. 取数只用 agent：tools 里绑定 db_query__<数据源> 和 db_schema__<数据源>。数字要进口径卡、报告时，给这个 agent 配 "
-    "output_schema 和 cite_fields: true，口径卡取 vars.<agent 的 assign_to>.字段。数据在两个库时，让一个 agent 绑两个库的"
-    "查询工具，各自聚合后在 output_schema 里一起交回\n"
+    f"1. 节点只用 {_chat_user_kinds()}。不要用 code、supervisor、subgraph、loop、human、memory、validate 等其他节点\n"
+    "2. tool 节点和 agent 都只能用 db_query__<数据源>、db_schema__<数据源> 和上面列出的内置工具：取数用 tool 节点"
+    "（tool 写 db_query__<数据源>，args.sql 写好 SQL）或 agent（tools 里绑定这两种数据源工具）。不要用 http_request、"
+    "records_append 这类写入或连外部的工具，工具名不要用 {{ }} 拼\n"
     "3. 查询一律只读，不要写改数据的 SQL\n"
-    "4. 任何节点、图级 defaults 里都不要写 memory_scope、collection：记忆范围和知识库由平台定"
+    "4. 任何节点、图级 defaults、tool 节点的 args 里都不要写 memory_scope、collection：记忆范围和知识库由平台定"
 )
 
 
@@ -809,7 +850,7 @@ def _chat_user_issues(nodes: dict[str, dict[str, Any]], edges: list[dict[str, An
         return []
     return [{"level": "error", "node_id": None, "edge_id": None, "field": None, "code": "chat.not_allowed",
              "message": problem,
-             "for_model": f"{problem}。按 system 里「使用者」那一段的约束改：取数改成 agent 绑定数据源查询工具，"
+             "for_model": f"{problem}。按 system 里「使用者」那一段的约束改：取数用 tool 节点或 agent 调数据源查询工具，"
                           "去掉不允许的节点、工具和记忆范围 / 知识库配置"}]
 
 
@@ -1024,6 +1065,8 @@ async def _op_model(session: AsyncSession, payload: GenerateIn) -> tuple[Any, st
 
 # 多久没动静就补一拍心跳。3 秒是"用户开始怀疑是不是卡了"的量级。
 _HEARTBEAT_SECONDS = 3.0
+#: 蓝图助手和填关节里算「正在搭」的操作（bp_ask 是反问，不算）
+_BLUEPRINT_BUILD_OPS = ("bp_set", "bp_add", "bp_remove", "bp_template", "fill_joint")
 
 
 async def _with_heartbeat(source: Any, phase: str = "planning", *, started: float | None = None):
@@ -1048,7 +1091,8 @@ async def _with_heartbeat(source: Any, phase: str = "planning", *, started: floa
                     return
                 kind = op.get("op")
                 # 阶段跟着实际操作走，前端据此换文案。查看时生成过程自己发一拍 looking，查看完回到 planning
-                if kind == "add_node" or kind in APP_OPS:
+                # 蓝图助手的 bp_* 操作、填关节的 fill_joint 也是在动手（api/copilot_blueprint.py）
+                if kind == "add_node" or kind in APP_OPS or kind in _BLUEPRINT_BUILD_OPS:
                     phase = "building"
                 elif kind in ("add_edge", "connect"):
                     phase = "wiring"
@@ -1204,6 +1248,8 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
 
     - sql_unknown_column：调用工具节点的 SQL 里有数据源结构（schema_cache）里查不到的列——凭空
       猜的列名跑起来只会「no such column」，还白跑前面的步骤
+    - sql_source_prefix：表名前面写了数据源名（sql_source_prefix）——数据源名被数据库当成库名，跑起来报库不存在；
+      认列的检查按表名找表时会去掉前缀，拦不住它
     - parse_model_text：整形节点按 JSON 解析 agent / llm 写的文字（validate 里只是 warning：旧图照跑）
     - report_no_source：报告撰写节点的上游没有任何证据来源（运行时只给一条警告，报告里的数全没有出处）。
       metrics_from 指向不是口径卡的节点，validate 本来就报 error，自查照样交回去
@@ -1233,6 +1279,16 @@ def authored_issues(spec: GraphSpec, sources: list[Any], baseline: list[dict[str
         sql = args.get("sql") if isinstance(args, dict) else None
         if source is None or not str(node.config.get("tool") or "").startswith("db_query__") \
                 or not isinstance(sql, str):
+            continue
+        if prefixed := sql_source_prefix(sql, source):
+            name, bare = source.name, prefixed[0].split(".", 1)[1]
+            out.append({"level": "error", "node_id": node.id, "edge_id": None, "field": "args.sql",
+                        "code": "sql_source_prefix",
+                        "message": f"SQL 里的表 {'、'.join(prefixed[:5])} 前面写了数据源名「{name}」：数据库会把它当成库名，"
+                                   f"运行时报库不存在。去掉「{name}.」，表名照表结构写（如 {bare}）",
+                        "for_model": f"SQL 里的表 {'、'.join(prefixed[:5])} 前面写了数据源名「{name}」。工具 db_query__{name} "
+                                     f"已经连到这个数据源，数据库里没有叫「{name}」的库或 schema，这样写跑起来会报库不存在。"
+                                     f"去掉「{name}.」，表名照表结构里的写（如 {bare}）"})
             continue
         found = sql_unknown_columns(sql, source)
         if not found:
@@ -1361,6 +1417,29 @@ def _blank_unicode_identifiers(sql: str) -> str:
         else:
             out.append(token.text)
     return "".join(out)
+
+
+def sql_source_prefix(sql: str, source: Any) -> list[str]:
+    """SQL 里 FROM / JOIN 后面写成「数据源名.表名」的表（去重、按出现顺序）。
+
+    数据源名是在 AgentLab 里给连接起的名字，不是库名、schema：取数工具 db_query__<数据源名> 已经连到这个数据源，再写
+    前缀，数据库会把它当成库名（MySQL 的 Unknown database、SQLite 的 unknown database、PostgreSQL 的 schema 不存在）。
+    认列的检查（introspect.find_table）找表时会去掉前缀，拦不住它。数据源名恰好也是库名、schema 的不算：连接里填的库、
+    探查的 schema、候选 schema、表结构里本来就带这个前缀的表。"""
+    from app.data.guard import _blank_quoted, strip_comments
+
+    name = str(getattr(source, "name", "") or "")
+    if not name:
+        return []
+    cache = getattr(source, "schema_cache", None) or {}
+    real = {str(x).lower() for x in (getattr(source, "database", None), cache.get("schema"),
+                                     *(cache.get("available_schemas") or [])) if x}
+    if name.lower() in real or any(str(t).lower().startswith(f"{name.lower()}.") for t in cache.get("tables") or {}):
+        return []
+    # 抹掉注释、模板写法和字符串，带引号的标识符留着（`shop`.`orders` 一样要认）
+    text = _blank_quoted(re.sub(r"\{\{.*?\}\}", " 0 ", strip_comments(sql), flags=re.S), identifiers=False)
+    pattern = re.compile(rf"\b(?:from|join)\s+[`\"\[]?{re.escape(name)}[`\"\]]?\s*\.\s*[`\"\[]?([^\s`\"\[\].,()]+)", re.I)
+    return list(dict.fromkeys(f"{name}.{m.group(1)}" for m in pattern.finditer(text)))
 
 
 def sql_unknown_columns(sql: str, source: Any) -> tuple[list[str], list[str]] | None:
@@ -1742,7 +1821,10 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 yield _sse(applier.replied)
                 return
             if gen.asked is not None and not applier.effective:
-                # 先问清楚才能动手，什么都还没改：问题已经转出去了，这一轮到此为止
+                # 先问清楚才能动手，什么都还没改：这一轮到此为止。照样发一条 final 收尾，带上问题（asked）和没动过的图：
+                # 前端据此把这一轮记成「助手反问」、问题进历史（以前流就这么断了，问数据页一直停在「进行中」），
+                # 不运行、不重排。图给一份对象（画布上原来的图、问数据上一轮的图，都没有就是空图），老前端照样认得
+                yield _sse(_asked_final(gen.asked, payload.base_graph, prev_graph))
                 return
             # 只发了目录修改提案，既没回答也没改图（用户只是在说一条数据事实）：补一句回答收尾，
             # 不能按下面的「模型没有给出任何修改」报错——提案已经摆在用户面前了
@@ -1828,6 +1910,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 "layout": layout,
                 # 改图回执：哪些节点、成员的工具变了。画布上看不出来，得明说
                 "tool_changes": changes,
+                # 改了图又问了用户（这一轮照样结束、不自动运行）：问题跟着 final 交付，前端记进这一轮
+                **({"asked": _asked_of(gen.asked)} if gen.asked is not None else {}),
             }
         except Exception as e:  # noqa: BLE001
             final = {"op": "error", "message": f"模型返回的工作流结构有误：{graph_error(e)}",
@@ -2409,7 +2493,7 @@ async def app_stream(payload: AppStreamIn, session: AsyncSession = Depends(get_s
         APP_REQUEST_PROMPT.format(spec=json.dumps(spec, ensure_ascii=False, indent=2), instruction=payload.instruction),
         await _history_section(session, payload.conversation_id))
     applier = AppApplier(spec)
-    checker = AppChecker(applier, bindings=bindings)
+    checker = AppChecker(applier, bindings=bindings, scope=(row.scope if row is not None else None) or "shared")
     started = time.monotonic()
     gen = Generation(model, system=system, applier=applier, checker=checker, looks=looks, started=started)
 
@@ -2479,25 +2563,87 @@ async def extract_template(
     新工作流记下来源（workflows.origin = {run_id, conversation_id?, turn_id?}）：从这里发布、再做成应用的那条路
     （总方案 A8）事后查得到它出自哪次运行、哪段对话。
     """
-    from sqlalchemy import select as _sel
-
-    from app.db.models import Run, RunEvent, Workflow, WorkflowVersion
+    from app.db.models import WorkflowVersion
     from app.core.artifact_store import graph_hash
 
     # 对话只是记进来源：不能用的不让记（D-d），不存在的照旧记下 id
     await _ensure_conversation_access(session, payload.conversation_id)
-    run = await session.get(Run, payload.run_id)
-    if not run:
-        raise HTTPException(404, "运行记录不存在，可能已被删除")
+    try:
+        path = await extract_run_path(session, payload.run_id)
+    except PathRefused as e:
+        raise HTTPException(e.status_code, e.message) from e
+    run, graph = path.run, path.graph
+    workflow = Workflow(
+        name=payload.name or f"{run.workflow_name or '探索'}（提取的模板）",
+        description=f"从运行 {run.id[:8]} 的实际执行路径提取（{path.nodes} 个节点），经人工审核后发布",
+        graph=graph,
+        tags=["extracted"],
+        status="draft",
+        origin={"run_id": run.id,
+                **({"conversation_id": payload.conversation_id} if payload.conversation_id else {}),
+                **({"turn_id": payload.turn_id} if payload.turn_id else {})},
+    )
+    session.add(workflow)
+    await session.flush()
+    session.add(
+        WorkflowVersion(
+            workflow_id=workflow.id, version=1, graph=graph,
+            graph_hash=graph_hash(graph), note=f"从运行 {run.id} 提取",
+        )
+    )
+    await session.commit()
+    return {
+        "workflow_id": workflow.id,
+        "name": workflow.name,
+        "nodes": path.nodes,
+        "edges": path.edges,
+        "dropped_nodes": path.dropped,
+        "source_run": run.id,
+    }
+
+
+class PathRefused(Exception):
+    """提取不了：status_code / message 就是 HTTP 回的状态码和 detail。"""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+@dataclass
+class RunPath:
+    """从一次运行提取出的执行路径：草稿图（已排版）和节点、连线、剪掉的节点数。"""
+
+    run: Any
+    graph: dict[str, Any]
+    nodes: int
+    edges: int
+    dropped: int
+
+
+async def extract_run_path(session: AsyncSession, run_id: str) -> RunPath:
+    """一次成功运行实际走过的路径 → 草稿图（确定性）：只留执行过的节点和它们之间的边，分支上没走的岔路剪掉，输入值
+    参数化成入口字段的默认值。不落库。「提取成工作流」（/from-run）和蓝图的「从问数据的回答开始」共用。"""
+    from sqlalchemy import select as _sel
+
+    from app.api.deps import can_read_run, current_principal
+    from app.db.models import Run, RunEvent
+
+    run = await session.get(Run, run_id)
+    # 读不到的运行当它不存在：别人的个人应用刷新、个人蓝图试运行只给拥有者（auth/access.private_owner），提取出的图就是
+    # 那张蓝图的内容，管理员、搭建者也不给
+    if not run or not await can_read_run(current_principal(), run):
+        raise PathRefused(404, "运行记录不存在，可能已被删除")
     # 没跑通的路径提出来是半截骨架：失败节点之后的步骤一步都不在里面，
     # 人拿去审改时却看不出它缺了什么
     if run.status != "succeeded":
-        raise HTTPException(
+        raise PathRefused(
             409, "这次运行未成功结束，提取出的执行路径不完整。"
                  "请先让它成功运行一次，再从该次运行提取",
         )
-    if not run.graph.get("nodes"):
-        raise HTTPException(400, "这次运行没有保存工作流快照，无法提取")
+    if not (run.graph or {}).get("nodes"):
+        raise PathRefused(400, "这次运行没有保存工作流快照，无法提取")
 
     events = list(
         (
@@ -2513,7 +2659,7 @@ async def extract_template(
         if e.type == "edge.taken" and e.node_id
     }
     if not executed:
-        raise HTTPException(400, "这次运行没有节点执行记录")
+        raise PathRefused(400, "这次运行没有节点执行记录")
 
     spec = GraphSpec.model_validate(run.graph)
     kept_nodes = [n for n in spec.nodes if n.id in executed]
@@ -2540,34 +2686,8 @@ async def extract_template(
     draft_spec = auto_layout(
         GraphSpec(nodes=kept_nodes, edges=kept_edges, defaults=spec.defaults)
     )
-    graph = draft_spec.model_dump(mode="json")
-    workflow = Workflow(
-        name=payload.name or f"{run.workflow_name or '探索'}（提取的模板）",
-        description=f"从运行 {run.id[:8]} 的实际执行路径提取（{len(kept_nodes)} 个节点），经人工审核后发布",
-        graph=graph,
-        tags=["extracted"],
-        status="draft",
-        origin={"run_id": run.id,
-                **({"conversation_id": payload.conversation_id} if payload.conversation_id else {}),
-                **({"turn_id": payload.turn_id} if payload.turn_id else {})},
-    )
-    session.add(workflow)
-    await session.flush()
-    session.add(
-        WorkflowVersion(
-            workflow_id=workflow.id, version=1, graph=graph,
-            graph_hash=graph_hash(graph), note=f"从运行 {run.id} 提取",
-        )
-    )
-    await session.commit()
-    return {
-        "workflow_id": workflow.id,
-        "name": workflow.name,
-        "nodes": len(kept_nodes),
-        "edges": len(kept_edges),
-        "dropped_nodes": len(spec.nodes) - len(kept_nodes),
-        "source_run": run.id,
-    }
+    return RunPath(run=run, graph=draft_spec.model_dump(mode="json"), nodes=len(kept_nodes), edges=len(kept_edges),
+                   dropped=len(spec.nodes) - len(kept_nodes))
 
 
 class ExplainIn(BaseModel):
@@ -2669,12 +2789,15 @@ async def review_run(
     规则层先扫一遍（engine/review.py:scan），没扫出东西就到此为止、直接返回，
     不花一次模型调用；扫出来了才叫模型重组答案并把异常说破。
     """
+    from app.api.deps import PRIVATE_RUN, can_read_run, current_principal
     from app.db.models import Run, RunEvent
     from app.engine import review as rv
 
     run = await session.get(Run, payload.run_id)
     if not run:
         raise HTTPException(404, "运行记录不存在，可能已被删除")
+    if not await can_read_run(current_principal(), run):
+        raise HTTPException(403, PRIVATE_RUN)
 
     rows = list((await session.execute(
         select(RunEvent).where(RunEvent.run_id == payload.run_id).order_by(RunEvent.seq)

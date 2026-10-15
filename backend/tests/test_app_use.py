@@ -271,6 +271,28 @@ async def test_on_demand_views(client):
             await session.commit()
 
 
+async def test_the_detail_says_whether_the_draft_differs_from_the_published_version(client):
+    """AppDetail.draft_changed（N6）：按发布时的规整方式比草稿和当前发布版——刚发布完一致；改了页面的字、改了岗位绑定都算
+    改过；再发布又一致。只读草稿规整的那一份不算改过（钉住项的级别是发布时按库里补的）；没发布过的不给。"""
+    wf, hash_ = await workflow(KPI)
+    spec = kpi_spec(wf, hash_)
+    app_id = await published_app(client, spec, name="按需看板")
+    detail = (await client.get(f"/api/apps/{app_id}")).json()
+    assert detail["draft_changed"] is False, "刚发布完：草稿就是发布版"
+
+    renamed = {**spec, "pages": [{**spec["pages"][0], "title": "周报首页"}]}
+    detail = (await client.patch(f"/api/apps/{app_id}", json={"draft": renamed})).json()
+    assert detail["draft_changed"] is True
+    assert (await client.post(f"/api/apps/{app_id}/publish", json={})).json()["ok"]
+    assert (await client.get(f"/api/apps/{app_id}")).json()["draft_changed"] is False
+
+    bound = {"slots": {"finance": [{"kind": "user", "name": "钱七"}]}}
+    assert (await client.patch(f"/api/apps/{app_id}", json={"draft_bindings": bound})).json()["draft_changed"] is True
+
+    fresh = (await client.post("/api/apps", json={"name": "没发布过", "spec": spec})).json()
+    assert "draft_changed" not in (await client.get(f"/api/apps/{fresh['id']}")).json(), "没发布过的不比"
+
+
 async def test_auto_views_launch_when_the_page_opens(client):
     wf, hash_ = await workflow(KPI)
     app_id = await published_app(client, kpi_spec(wf, hash_, auto=True), name="自动看板")

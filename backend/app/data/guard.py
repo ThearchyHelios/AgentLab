@@ -471,3 +471,39 @@ def is_write(sql: str, *, dialect: str | None = None) -> bool:
     if not statements:
         return True
     return any(_write_reason(s, r) is not None for s in statements for r in readings)
+
+
+#: 代码段里的一个词或一个符号（schema_reference 用）
+_ATOM = re.compile(r"\w+|\S")
+
+
+def _ident_name(token: _Token) -> str:
+    """带引号的标识符 → 名字本身（"ma""in" → ma"in，[main] → main）。"""
+    end = len(token.text) - token.close if token.close else len(token.text)
+    inner = token.text[token.open:end]
+    quote = token.text[:token.open]
+    return inner.replace(quote * 2, quote) if quote in ('"', "`") else inner
+
+
+def schema_reference(sql: str, schemas: tuple[str, ...] | list[str], *, dialect: str | None = None) -> str | None:
+    """SQL 里有没有直接写这些库名加点（main.records、"main"."records"、[main].records……）：有就交回写的那个库名。
+
+    记录表靠连接上的同名临时视图做钉版本和行级可见（records/store.view_prelude）：不带库名的表名先找 temp 库，查到的
+    是视图；写了 main. 就绕过视图看到了底表。所以这一类源（data/engine.run_query 的 forbid_schemas）一律拒。按扫描出的
+    词判断：字符串、注释里的 main. 不算；带引号的写法算。每种读法都扫一遍，任何一种读出来有就算有。"""
+    wanted = {s.lower() for s in schemas if s}
+    if not wanted:
+        return None
+    for reading in _readings(dialect):
+        atoms: list[str] = []
+        for token in _tokens(sql, reading):
+            if token.kind == "code":
+                atoms += [a.lower() for a in _ATOM.findall(token.text)]
+            elif token.kind == "ident":
+                atoms.append(_ident_name(token).lower())
+            elif token.kind in ("string", "sep"):
+                atoms.append(token.kind)
+        for name, nxt in zip(atoms, atoms[1:]):
+            if name in wanted and nxt == ".":
+                return name
+    return None

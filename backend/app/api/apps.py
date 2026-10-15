@@ -75,12 +75,27 @@ def _refuse_archived(app: App, what: str) -> None:
         raise CodedHTTPException(409, f"「{app.name}」已归档，不能再{what}", APP_ARCHIVED)
 
 
+#: 个人应用（docs/design/normal-user-apps.md N7）没有的那几样：发布、授权
+PERSONAL_ONLY_MINE = "personal.not_shareable"
+
+
+def _refuse_personal(app: App, what: str) -> None:
+    """个人应用没有应用版本（草稿就是在用的那一份）、不能分享：发布、授权一律不收，说清想给别人用怎么办。"""
+    if getattr(app, "scope", "shared") == "personal":
+        raise CodedHTTPException(409, f"「{app.name}」是个人应用，只给你自己用，不能{what}。想给别人用，请提交审核，由搭建者"
+                                      "发布成正式应用", PERSONAL_ONLY_MINE)
+
+
 def _require_builder(principal: Principal) -> None:
     if not principal.at_least("builder"):
         raise CodedHTTPException(403, "搭建应用需要搭建者权限", NO_ACCESS)
 
 
 async def _current_version(session: AsyncSession, app: App) -> AppVersion:
+    if getattr(app, "scope", "shared") == "personal":
+        # 个人应用没有发布版本：不发起实例、没有按需视图，页面直接按存的样子显示，要新数点「刷新」
+        raise CodedHTTPException(409, f"「{app.name}」是个人应用，不发起实例、没有按需视图：要看最新的数请点「刷新」",
+                                 NOT_PUBLISHED)
     if not app.published_version:
         raise CodedHTTPException(409, f"「{app.name}」还没有发布", NOT_PUBLISHED)
     return (await session.execute(select(AppVersion).where(
@@ -118,7 +133,27 @@ async def _summary(session: AsyncSession, app: App, principal: Principal, role: 
             "published_version": app.published_version, "level": version.level if version else None,
             "needs_upgrade": await _needs_upgrade(session, version),
             "pending_tasks": await _pending(session, app.id, principal), "my_role": role,
-            "updated_at": app.updated_at.isoformat() if app.updated_at else None}
+            "created_at": app.created_at.isoformat() if app.created_at else None,
+            "updated_at": app.updated_at.isoformat() if app.updated_at else None,
+            # 个人应用（N7）：scope=personal、拥有者；出自哪个蓝图（共享应用经发布单生成的也有）
+            "scope": app.scope or "shared", "owner": app.owner, "blueprint_id": app.blueprint_id}
+
+
+def _personal_stub(app: App) -> dict[str, Any]:
+    """管理员看到的别人的个人应用（列表、详情、归档的回包同一份）：名称、拥有者、状态、创建和更新时间，能归档；说明、
+    页面、数、运行、蓝图一概不给（P4，N7「管理员看得到谁有几个个人应用，可以归档，但不看内容」）。"""
+    return {"id": app.id, "name": app.name, "description": "", "icon": "app", "status": app.status,
+            "published_version": None, "level": None, "needs_upgrade": False, "pending_tasks": 0, "my_role": None,
+            "created_at": app.created_at.isoformat() if app.created_at else None,
+            "updated_at": app.updated_at.isoformat() if app.updated_at else None,
+            "scope": "personal", "owner": app.owner, "blueprint_id": None}
+
+
+def _sees_stub(principal: Principal, app: App) -> bool:
+    """这个人对这个应用只看得到元数据（_personal_stub）：开了登录的管理员看别人的个人应用。"""
+    from app.apps.access import is_personal
+
+    return is_personal(app) and principal.mode != "off" and principal.role == "admin"
 
 
 def _published_outline(version: AppVersion | None) -> dict[str, Any] | None:
@@ -133,6 +168,36 @@ def _published_outline(version: AppVersion | None) -> dict[str, Any] | None:
                         if isinstance(e, dict) and e.get("id")]}
 
 
+def _draft_changed(app: App, previous: AppVersion | None) -> bool | None:
+    """草稿和当前发布版是否一致（N6，页面上直接改时说「有未发布的改动」还是「和发布版相同」）。按发布时的规整方式比
+    （publish_draft：parse_spec 规整成同一个形状），两边都过一遍，老版本发布时还没有的字段按缺省补齐、不算改动；钉住项的
+    级别发布时按库里的那一版补、不出自草稿，不比。岗位绑定一并比。没发布过、发布版规整不了的为 None（不知道，界面不猜）；
+    草稿规整不了的算改过（发布前得先改好）。"""
+    from pydantic import ValidationError
+
+    from app.apps.lint import pins_with_state
+    from app.apps.spec import parse_spec
+    from app.core.artifact_store import canonical_json
+
+    def normal(spec: Any) -> str:
+        out = parse_spec(spec or {}).model_dump(mode="json", by_alias=True)
+        out["pins"] = pins_with_state(out, {})
+        return canonical_json(out)
+
+    if previous is None:
+        return None
+    try:
+        published = normal(previous.spec)
+    except ValidationError:
+        return None
+    try:
+        draft = normal(app.draft)
+    except ValidationError:
+        return True
+    bindings = {"slots": {}, **(app.draft_bindings or {})}
+    return draft != published or canonical_json(bindings) != canonical_json(previous.bindings or {"slots": {}})
+
+
 async def _detail(session: AsyncSession, app: App, principal: Principal, role: str | None, *,
                   with_backfill: bool = False) -> dict[str, Any]:
     """应用详情。草稿和草稿里的岗位绑定只给 manage（D-m）：草稿是还没发布、没过检查的东西，岗位绑定是这个部署里具体
@@ -142,12 +207,20 @@ async def _detail(session: AsyncSession, app: App, principal: Principal, role: s
     归档这些改动的回包里不算（编辑器存一次草稿就算一遍太浪费，补算只看发布版，草稿改了也不变）。"""
     from app.apps.spec import empty_spec
 
-    out = {**await _summary(session, app, principal, role),
-           "published": _published_outline(await _previous(session, app))}
+    previous = await _previous(session, app)
+    out = {**await _summary(session, app, principal, role), "published": _published_outline(previous)}
     if not at_least(role, "manage"):
         return out
     out.update(draft=app.draft or empty_spec(app.name), draft_bindings={"slots": {}, **(app.draft_bindings or {})},
                created_by=app.created_by)
+    if app.scope == "personal":
+        # 个人应用给拥有者的那一块：今天还能刷新几次、蓝图改过没有、审核到哪了（blueprints/personal.personal_state）
+        from app.blueprints.personal import personal_state
+
+        out["personal"] = await personal_state(session, app, principal)
+        return out
+    if (changed := _draft_changed(app, previous)) is not None:
+        out["draft_changed"] = changed
     if with_backfill:
         from app.apps.backfill import backfillable
 
@@ -161,19 +234,34 @@ async def _detail(session: AsyncSession, app: App, principal: Principal, role: s
 
 
 @router.get("")
-async def list_apps(include_archived: bool = False, session: AsyncSession = Depends(get_session),
+async def list_apps(include_archived: bool = False, scope: str | None = None,
+                    session: AsyncSession = Depends(get_session),
                     x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """应用列表。个人应用只列给拥有者；管理员另外看得到别人的个人应用在不在（_personal_stub，不含内容），能归档。
+    scope 给了只列那一种（shared / personal）。can_create 是这个人能建哪种应用：新建应用的入口按它给（共享要搭建者及以上，
+    个人看管理员的开关，blueprints/personal.allowed）。"""
+    from sqlalchemy import or_
+
+    from app.blueprints.personal import allowed
+
     principal = _principal(x_actor)
     query = select(App).order_by(App.updated_at.desc())
     if not include_archived:
         query = query.where(App.status != "archived")
+    if scope == "personal":
+        query = query.where(App.scope == "personal")
+    elif scope == "shared":
+        query = query.where(or_(App.scope == "shared", App.scope.is_(None)))
     items = []
     for app in (await session.execute(query)).scalars():
         role = await app_role(session, principal, app)
         if role is None:
+            if _sees_stub(principal, app):
+                items.append(_personal_stub(app))
             continue
         items.append(await _summary(session, app, principal, role))
-    return {"items": items}
+    return {"items": items, "can_create": {"shared": principal.mode == "off" or principal.at_least("builder"),
+                                           "personal": await allowed(session, principal)}}
 
 
 class AppIn(BaseModel):
@@ -186,18 +274,28 @@ class AppIn(BaseModel):
 @router.post("", status_code=201)
 async def create_app(payload: AppIn, session: AsyncSession = Depends(get_session),
                      x_actor: str | None = Header(default=None)) -> dict[str, Any]:
-    from app.apps.spec import empty_spec
-
     principal = _principal(x_actor)
     _require_builder(principal)
-    draft = dict(payload.spec) if payload.spec else empty_spec(payload.name)
-    draft["name"] = payload.name
-    app = App(name=payload.name, description=payload.description, icon=payload.icon, draft=draft,
-              draft_bindings={"slots": {}}, created_by=actor_of(x_actor), updated_by=actor_of(x_actor))
+    app = await new_app(session, name=payload.name, description=payload.description, icon=payload.icon,
+                        spec=payload.spec, actor=actor_of(x_actor))
+    return await _detail(session, app, principal, "manage")
+
+
+async def new_app(session: AsyncSession, *, name: str, description: str = "", icon: str = "app",
+                  spec: dict[str, Any] | None = None, bindings: dict[str, Any] | None = None,
+                  actor: str | None, blueprint_id: str | None = None) -> App:
+    """建一个应用（只有草稿，提交）。建应用的接口和发布单共用；发布单另带上岗位绑定和出自哪个蓝图。"""
+    from app.apps.spec import empty_spec
+
+    draft = dict(spec) if spec else empty_spec(name)
+    draft["name"] = name
+    app = App(name=name, description=description, icon=icon, draft=draft,
+              draft_bindings={"slots": {}, **(bindings or {})}, created_by=actor, updated_by=actor,
+              blueprint_id=blueprint_id)
     session.add(app)
     await session.commit()
     await session.refresh(app)
-    return await _detail(session, app, principal, "manage")
+    return app
 
 
 class DeriveIn(BaseModel):
@@ -222,7 +320,12 @@ async def derive(payload: DeriveIn, session: AsyncSession = Depends(get_session)
 @router.get("/{app_id}")
 async def get_app(app_id: str, session: AsyncSession = Depends(get_session),
                   x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """应用详情（_detail）。管理员打开别人的个人应用只拿到元数据（_personal_stub，同列表里那一条），页面、草稿、刷新、
+    蓝图的接口照旧当它不存在。"""
     principal = _principal(x_actor)
+    stub = await session.get(App, app_id)
+    if stub is not None and _sees_stub(principal, stub) and await app_role(session, principal, stub) is None:
+        return {**_personal_stub(stub), "published": None}
     app, role = await _app(session, app_id, principal, "use")
     return await _detail(session, app, principal, role, with_backfill=True)
 
@@ -257,6 +360,12 @@ async def update_app(app_id: str, payload: AppPatch, session: AsyncSession = Dep
     _refuse_archived(app, "修改")
     if payload.draft_bindings is not None and (problem := _bindings_problem(payload.draft_bindings)):
         raise HTTPException(422, problem)
+    if app.scope == "personal" and payload.draft is not None:
+        # 个人应用的草稿就是在用的那一份：只许改呈现，固定的蓝图、视图来源只由「存成我的应用」改
+        from app.blueprints.personal import draft_problem
+
+        if problem := draft_problem(app.draft or {}, payload.draft):
+            raise HTTPException(422, problem)
     for key in ("name", "description", "icon"):
         if (value := getattr(payload, key)) is not None:
             setattr(app, key, value)
@@ -275,16 +384,23 @@ async def archive_app(app_id: str, session: AsyncSession = Depends(get_session),
                       x_actor: str | None = Header(default=None)) -> dict[str, Any]:
     """归档：不再出现在应用列表里，入口拒绝发起、入站钩子一律拒收（apps/entries.py、process/hooks.py），不再改草稿、
     不再发布；进行中的实例照常走完，版本、实例、生效记录都留着。没有恢复的接口。"""
+    from app.apps.access import can_archive
     from app.apps.audit import record
 
     principal = _principal(x_actor)
-    app, role = await _app(session, app_id, principal, "manage")
+    app = await session.get(App, app_id)
+    role = await app_role(session, principal, app) if app is not None else None
+    if app is None or not can_archive(principal, app, role):
+        # 管理员能归档别人的个人应用（看不到内容，能收起来）；其余照旧要管理权限
+        app, role = await _app(session, app_id, principal, "manage")
     app.status = "archived"
     app.updated_by = actor_of(x_actor)
     await record(session, action="app.archive", subject_kind="app", subject_id=app.id, actor=actor_of(x_actor),
-                 data={"name": app.name})
+                 data={"name": app.name, **({"owner": app.owner} if app.scope == "personal" else {})})
     await session.commit()
     await session.refresh(app)
+    if role is None:
+        return {**_personal_stub(app), "published": None}
     return await _detail(session, app, principal, role)
 
 
@@ -356,8 +472,12 @@ async def lint(app_id: str, session: AsyncSession = Depends(get_session),
 
     principal = _principal(x_actor)
     app, _ = await _app(session, app_id, principal, "manage")
-    issues = await lint_app(session, app.draft or {}, app.draft_bindings or {}, previous=await _previous(session, app))
-    issues += await acl_issues(session, app.id)
+    scope = app.scope or "shared"
+    issues = await lint_app(session, app.draft or {}, app.draft_bindings or {}, previous=await _previous(session, app),
+                            scope=scope)
+    if scope != "personal":
+        # 个人应用不能授权给别人，「还没有授权」不是问题
+        issues += await acl_issues(session, app.id)
     pins = await load_pins(session, app.draft or {})
     return {"issues": issues, "level": app_level([{"level": p.level} for p in pins.values()]) if pins else None}
 
@@ -373,6 +493,18 @@ async def publish(app_id: str, payload: PublishIn, session: AsyncSession = Depen
     """把草稿冻结成一个不可变的应用版本。钉住项相对上一版升了版而没选处置的不发布（ok=false，needs_disposition 列出）。
 
     返回 200 + ok/issues 而不是抛错，前端把问题列表渲染出来（同工作流发布）。"""
+    principal = _principal(x_actor)
+    app, _ = await _app(session, app_id, principal, "manage")
+    _refuse_archived(app, "发布")
+    _refuse_personal(app, "发布")
+    return await publish_draft(session, app, note=payload.note, dispositions=payload.dispositions,
+                               actor=actor_of(x_actor))
+
+
+async def publish_draft(session: AsyncSession, app: App, *, note: str, dispositions: dict[str, str],
+                        actor: str | None) -> dict[str, Any]:
+    """检查草稿，过了就冻结成新的应用版本并提交；没过交回 ok=false 和问题（不写库）。发布接口和发布单共用。
+    两个人同时发布时后到的那个抛 409（app_publish_conflict）。"""
     from app.apps.audit import record
     from app.apps.lint import acl_issues, lint_app, needs_disposition, pins_with_state
     from app.apps.pins import load_pins
@@ -381,18 +513,14 @@ async def publish(app_id: str, payload: PublishIn, session: AsyncSession = Depen
     from app.apps.tree import app_level, spec_hash
     from app.db.base import utcnow
 
-    principal = _principal(x_actor)
-    app, _ = await _app(session, app_id, principal, "manage")
-    _refuse_archived(app, "发布")
     previous = await _previous(session, app)
     draft = app.draft or {}
-    issues = await lint_app(session, draft, app.draft_bindings or {}, previous=previous,
-                            dispositions=payload.dispositions)
+    issues = await lint_app(session, draft, app.draft_bindings or {}, previous=previous, dispositions=dispositions)
     issues += await acl_issues(session, app.id)
     upgraded = needs_disposition(previous, draft.get("pins") or []) if isinstance(draft.get("pins"), list) else []
     if any(i["level"] == "error" for i in issues):
         return {"ok": False, "issues": issues,
-                "needs_disposition": [u for u in upgraded if payload.dispositions.get(u["alias"]) is None]}
+                "needs_disposition": [u for u in upgraded if dispositions.get(u["alias"]) is None]}
     pins = await load_pins(session, draft)
     spec = parse_spec(draft).model_dump(mode="json", by_alias=True)
     spec["pins"] = pins_with_state(spec, pins)
@@ -400,14 +528,14 @@ async def publish(app_id: str, payload: PublishIn, session: AsyncSession = Depen
     level = app_level(spec["pins"])
     row = AppVersion(app_id=app.id, version=number, spec=spec, spec_hash=spec_hash(spec), pins=spec["pins"],
                      bindings={"slots": {}, **(app.draft_bindings or {})}, level=level,
-                     dispositions={u["alias"]: payload.dispositions[u["alias"]] for u in upgraded},
-                     note=payload.note, published_by=actor_of(x_actor), published_at=utcnow())
+                     dispositions={u["alias"]: dispositions[u["alias"]] for u in upgraded},
+                     note=note, published_by=actor, published_at=utcnow())
     session.add(row)
     app.published_version = number
-    app.updated_by = actor_of(x_actor)
-    await record(session, action="app.publish", subject_kind="app", subject_id=app.id, actor=actor_of(x_actor),
+    app.updated_by = actor
+    await record(session, action="app.publish", subject_kind="app", subject_id=app.id, actor=actor,
                  data={"version": number, "spec_hash": row.spec_hash, "level": level, "pins": spec["pins"],
-                       "dispositions": row.dispositions, "note": payload.note})
+                       "dispositions": row.dispositions, "note": note})
     try:
         await session.commit()
     except IntegrityError as e:
@@ -479,20 +607,30 @@ async def put_grants(app_id: str, payload: GrantsIn, session: AsyncSession = Dep
     给的人和组按名录核对（auth/directory.py，同选人控件、同应用检查）：账号密码登录时名录里没有的、任何登录方式下停用了
     的拒收，说清是哪一档、哪个名字——界面上选人时已经拦着，这里拦旧客户端和直接调接口的。单点登录的人第一次登录后才进
     名录，名录里还没有的照收（检查里提醒）；关登录不核对。"""
+    app, _ = await _app(session, app_id, _principal(x_actor), "manage")
+    _refuse_personal(app, "授权给别人")
+    wanted, problem = await grants_problem(session, [(i.principal_kind, i.principal, i.role) for i in payload.items])
+    if problem:
+        raise HTTPException(422, problem)
+    return {"items": await replace_grants(session, app, wanted, actor=actor_of(x_actor))}
+
+
+async def grants_problem(session: AsyncSession, items: list[tuple[str, str, str]]
+                         ) -> tuple[list[tuple[str, str, str]], str | None]:
+    """要给的授权 [(principal_kind, principal, role)] → (去重规范化之后的, 收不下的说明)，只读。形状不对、名录核对不过
+    （同上面的规则）时说明不为空。授权接口和发布单（预检只检查、最后一步照它授权）共用。"""
     from app.api.deps import auth_mode
-    from app.apps.audit import record
     from app.auth.directory import load_directory, mismatch
     from app.db.models_apps import GRANT_ROLES
 
-    app, _ = await _app(session, app_id, _principal(x_actor), "manage")
     wanted: list[tuple[str, str, str]] = []
-    for item in payload.items:
-        if item.principal_kind not in ("user", "group", "everyone") or item.role not in GRANT_ROLES:
-            raise HTTPException(422, "授权只能给人、组或所有人，权限只能是使用、查看全部实例或管理")
-        principal = "" if item.principal_kind == "everyone" else item.principal.strip()
-        if item.principal_kind != "everyone" and not principal:
-            raise HTTPException(422, "授权给人或组时需要写明是谁")
-        key = (item.principal_kind, principal, item.role)
+    for kind, name, role in items:
+        if kind not in ("user", "group", "everyone") or role not in GRANT_ROLES:
+            return wanted, "授权只能给人、组或所有人，权限只能是使用、查看全部实例或管理"
+        principal = "" if kind == "everyone" else (name or "").strip()
+        if kind != "everyone" and not principal:
+            return wanted, "授权给人或组时需要写明是谁"
+        key = (kind, principal, role)
         if key not in wanted:
             wanted.append(key)
     if (mode := auth_mode()) != "off":
@@ -500,18 +638,26 @@ async def put_grants(app_id: str, payload: GrantsIn, session: AsyncSession = Dep
         refused = [f"「{ROLE_TEXT[role]}」里的{m.text}" for kind, who, role in wanted
                    if (m := mismatch(known, mode, kind, who)) is not None and m.blocking]
         if refused:
-            raise HTTPException(422, f"{'；'.join(refused)}：授权只能给名录里在用的人和组，请移除或从候选中重新选择")
+            return wanted, f"{'；'.join(refused)}：授权只能给名录里在用的人和组，请移除或从候选中重新选择"
+    return wanted, None
+
+
+async def replace_grants(session: AsyncSession, app: App, wanted: list[tuple[str, str, str]], *,
+                         actor: str | None) -> list[dict[str, str]]:
+    """整份替换授权（调用方先过了 grants_problem），写审计并提交。"""
+    from app.apps.audit import record
+
     before = [_grant_out(g) for g in await grants_of(session, app.id)]
     for g in await grants_of(session, app.id):
         await session.delete(g)
     await session.flush()
     for kind, who, role in wanted:
-        session.add(AppGrant(app_id=app.id, principal_kind=kind, principal=who, role=role, granted_by=actor_of(x_actor)))
+        session.add(AppGrant(app_id=app.id, principal_kind=kind, principal=who, role=role, granted_by=actor))
     after = [{"principal_kind": k, "principal": p, "role": r} for k, p, r in wanted]
-    await record(session, action="app.grants", subject_kind="app", subject_id=app.id, actor=actor_of(x_actor),
+    await record(session, action="app.grants", subject_kind="app", subject_id=app.id, actor=actor,
                  data={"before": before, "after": after})
     await session.commit()
-    return {"items": after}
+    return after
 
 
 # --------------------------------------------------------------------------
@@ -661,7 +807,8 @@ async def get_page(app_id: str, page_id: str, instance: str | None = None, param
 
     principal = _principal(x_actor)
     app, role = await _app(session, app_id, principal, "manage" if draft else "use")
-    version = None if draft else await _current_version(session, app)
+    # 个人应用没有应用版本：草稿就是在用的那一份（resolve_page 按 scope 认）
+    version = None if draft or app.scope == "personal" else await _current_version(session, app)
     run = await _instance(session, app, instance, principal, role) if instance else None
     try:
         return await resolve_page(session, app, page_id=page_id, principal=principal, role=role, instance=run,

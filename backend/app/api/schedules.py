@@ -461,25 +461,43 @@ async def list_schedules(session: AsyncSession = Depends(get_session)) -> dict[s
 @router.post("", status_code=201)
 async def create_schedule(request: Request, session: AsyncSession = Depends(get_session),
                           x_actor: str | None = Header(default=None)) -> dict[str, Any]:
-    body = await _body(request)
-    name = _name(body.get("name"))
-    workflow_id = _workflow_id(body.get("workflow_id"))
-    cron_expr, tz = _cron(body.get("cron")), _timezone(body.get("timezone"))
-    run_class = _run_class(body.get("run_class", "formal"))
-    template = _template(body.get("input_template"))
-    enabled = _enabled(body.get("enabled", True))
-    overlap = _overlap(body.get("overlap", "skip"))
-    grace = _grace(body.get("misfire_grace_s", DEFAULT_GRACE_S))
-    hook = _new_webhook(body.get("webhook"))
-    workflow = await _check_workflow(session, workflow_id, run_class, template)
-    row = Schedule(name=name, workflow_id=workflow_id, workflow_name=workflow.name, cron=cron_expr, timezone=tz,
-                   run_class=run_class, input_template=template, enabled=enabled, overlap=overlap,
-                   misfire_grace_s=grace, next_run_at=service.next_run(cron_expr, tz, enabled),
-                   created_by=actor_of(x_actor), **_webhook_columns(hook))
+    row = await create_schedule_row(session, await _body(request), actor=actor_of(x_actor))
+    return await _schedule_out(session, row)
+
+
+def schedule_values(body: dict[str, Any]) -> dict[str, Any]:
+    """建定时任务的请求体 → 规范化之后的列（不含工作流名、下一次触发），逐项校验，不对抛 422（带 field）。只读，
+    不碰库：发布单的预检用它「只检查」，建任务的接口和发布单建任务都先过它。"""
+    values = {"name": _name(body.get("name")), "workflow_id": _workflow_id(body.get("workflow_id")),
+              "cron": _cron(body.get("cron")), "timezone": _timezone(body.get("timezone")),
+              "run_class": _run_class(body.get("run_class", "formal")),
+              "input_template": _template(body.get("input_template")),
+              "enabled": _enabled(body.get("enabled", True)), "overlap": _overlap(body.get("overlap", "skip")),
+              "misfire_grace_s": _grace(body.get("misfire_grace_s", DEFAULT_GRACE_S))}
+    return {**values, "webhook": _new_webhook(body.get("webhook"))}
+
+
+def template_problem(template: dict[str, str], graph: Any, workflow_name: str) -> str | None:
+    """输入模板对不上这张图的入口字段（字段名、必填项）：说明；对得上为 None。发布单的预检按将要发布的图查。"""
+    try:
+        service.check_fields(template, service.input_fields(graph), workflow_name)
+    except service.TemplateError as e:
+        return str(e)
+    return None
+
+
+async def create_schedule_row(session: AsyncSession, body: dict[str, Any], *, actor: str | None) -> Schedule:
+    """校验并建一个定时任务（提交）。建任务的接口和发布单（停用着建，应用发布后再启用）共用。"""
+    values = schedule_values(body)
+    hook = values.pop("webhook")
+    workflow = await _check_workflow(session, values["workflow_id"], values["run_class"], values["input_template"])
+    row = Schedule(**values, workflow_name=workflow.name,
+                   next_run_at=service.next_run(values["cron"], values["timezone"], values["enabled"]),
+                   created_by=actor, **_webhook_columns(hook))
     session.add(row)
     await session.commit()
     await session.refresh(row)
-    return await _schedule_out(session, row)
+    return row
 
 
 @router.get("/{schedule_id}")
@@ -553,6 +571,38 @@ async def update_schedule(schedule_id: str, request: Request,
     await session.commit()
     session.expire_all()
     return await _schedule_out(session, await _get(session, schedule_id))
+
+
+async def retime(session: AsyncSession, row: Schedule, body: dict[str, Any]) -> Schedule:
+    """按新的设置改一个已有的定时任务（提交）：名称、cron、时区、输入模板，校验同建任务；启用状态不动。cron、时区真改了才
+    按 PATCH 同一个规则重算下一次触发。发布单给已经发布过的蓝图再发一版时用它沿用原来的任务，不另建一个（两个任务会
+    在同一时刻各发起一次）。"""
+    values = schedule_values({**body, "workflow_id": row.workflow_id, "enabled": row.enabled})
+    workflow = await _check_workflow(session, row.workflow_id, row.run_class, values["input_template"])
+    changed = {"name": values["name"], "cron": values["cron"], "timezone": values["timezone"],
+               "input_template": values["input_template"], "workflow_name": workflow.name}
+    if values["cron"] != row.cron or values["timezone"] != row.timezone:
+        changed["next_run_at"] = _next_after_edit(row, values["cron"], values["timezone"], row.enabled)
+    await session.execute(update(Schedule).where(Schedule.id == row.id)
+                          .values(**changed, version=row.version + 1).execution_options(synchronize_session=False))
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def set_enabled(session: AsyncSession, row: Schedule, enabled: bool) -> Schedule:
+    """启用、停用一个定时任务（提交），下一次触发按 PATCH 同一个规则算，版本号加一。发布单在应用发布之后用它启用
+    先停用着建的任务；已经是这个状态的不动。"""
+    if row.enabled == enabled:
+        return row
+    await session.execute(
+        update(Schedule).where(Schedule.id == row.id)
+        .values(enabled=enabled, next_run_at=_next_after_edit(row, row.cron, row.timezone, enabled),
+                version=row.version + 1).execution_options(synchronize_session=False))
+    await session.commit()
+    # 只重读这一行：调用方（发布单）同一个会话里还拿着别的对象，不能整个会话过期
+    await session.refresh(row)
+    return row
 
 
 def _next_after_edit(row: Schedule, cron_expr: str, tz: str, enabled: bool) -> datetime | None:

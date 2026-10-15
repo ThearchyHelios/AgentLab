@@ -1,5 +1,5 @@
 // 编排页编辑体验的检查：撤销重做、问题面板定位、快捷键、三栏收起、调色板落点、
-// 分支 default 拦截、?run=&focus= 参数、助手改图（应用 / 只回话 / 失败 / 停止）。
+// 分支 default 拦截、?run=&focus= 参数、助手改图（应用 / 只回话 / 失败 / 停止 / 反问）。
 //
 // 不写库：要编辑的工作流、它的版本、画布会话、助手的流式输出都用 page.route 在
 // 浏览器里伪造；后端只被读（目录、校验、变量分析这些纯计算）。保存走伪造的 PATCH，
@@ -1288,6 +1288,51 @@ await section('助手改图：一步撤销、回执、只回话、失败退回�
   check('开始新对话：换一条会话，模型上下文清零', m2.id === 'conv-new' && m2.turns === 0, JSON.stringify(m2))
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
   await ctx.close()
+})
+
+// ================================================================ 6b
+// 助手问回来一句、流就此结束（normal-user-apps N11）：这一轮照样记进画布会话，问题作为这一轮的回话进历史，下一轮模型知道
+// 自己问过什么；卡头写「助手反问」，不是「未修改画布」那种没下文。画布不动、不占撤销栈
+await section('助手反问：这一轮照样记下，问题进历史', async () => {
+  const { page, state, errors } = await open()
+  const turns = []
+  /** 等页面这一侧或脚本这一侧的条件成立 */
+  const until = async (cond, ms = 3000) => {
+    const end = Date.now() + ms
+    while (!(await cond()) && Date.now() < end) await new Promise((r) => setTimeout(r, 50))
+    return cond()
+  }
+  await page.route(/\/api\/conversations\/[^/]+\/turns(\/[^/?]+)?$/, (route) => {
+    const req = route.request()
+    const body = req.postDataJSON() ?? {}
+    turns.push({ method: req.method(), body })
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+      id: 't-ask', seq: 3, question: body.question ?? '', answer: body.answer ?? '', explanation: '', status: 'done', error: '' }) })
+  })
+  const before = await st(page)
+  const mem0 = await S(page, () => window.__studio.getState().copilotMemory.past.length)
+  state.stream = [
+    { op: 'model', model: 'fake-model' },
+    { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+    { op: 'ask', question: '分支按客户等级分，还是按订单金额分？' },
+  ]
+  await S(page, () => window.__studio.getState().runCopilot('加一个分支', true))
+  await page.waitForFunction(() => window.__studio.getState().copilotTurns.at(-1)?.phase !== 'running')
+  const t = await S(page, () => window.__studio.getState().copilotTurns.at(-1))
+  check('反问：这一轮收尾为「已回答」，问题作为回话', t.phase === 'done' && t.outcome === 'answered'
+    && t.reply === '分支按客户等级分，还是按订单金额分？', JSON.stringify({ phase: t.phase, outcome: t.outcome, reply: t.reply }))
+  check('反问：画布没动、不占撤销栈', (await st(page)).nodes.length === before.nodes.length && (await st(page)).past === before.past)
+  const patched = await until(() => turns.some((x) => x.method === 'PATCH'))
+  const body = turns.find((x) => x.method === 'PATCH')?.body
+  check('反问：这一轮记进画布会话，问题进历史（answer）', patched && body?.answer === '分支按客户等级分，还是按订单金额分？'
+    && body?.status === 'done', JSON.stringify(body))
+  check('反问：模型记忆跟着多一轮', await until(async () =>
+    (await S(page, () => window.__studio.getState().copilotMemory.past.length)) > mem0))
+  const card = page.locator('[data-assistant-panel] [data-turn]').last()
+  check('反问：卡头写「助手反问」，不写「未修改画布」', await card.waitFor({ timeout: 3000 }).then(() => true, () => false)
+    && (await card.innerText()).includes('助手反问') && !(await card.innerText()).includes('未修改画布'),
+    (await card.innerText().catch(() => '')).split('\n').slice(0, 4).join(' / '))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
 })
 
 // ================================================================ 7

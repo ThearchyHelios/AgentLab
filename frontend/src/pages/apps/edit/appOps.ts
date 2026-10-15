@@ -3,7 +3,7 @@
  *
  * 应用操作的形状同服务端 app/apps/ops.py（apply_app_op）：
  *   {"op":"app_add","parent":"<组件 id>|<页面 id>","index":0,"component":{...}}
- *   {"op":"app_update","id":"<组件 id>","props":{...},"bind":{...},"visible":"..."}
+ *   {"op":"app_update","id":"<组件 id>","props":{...},"bind":{...},"visible":"...","hidden":true}
  *   {"op":"app_remove","id":"<组件 id>"}
  *   {"op":"app_move","id":"<组件 id>","parent":"...","index":0}
  *   {"op":"app_page","page":{"id","title"}}
@@ -82,6 +82,29 @@ export function freshId(spec: AppSpec, base: string): string {
   return `${base}_${n}`
 }
 
+/**
+ * 要加进草稿的组件（「加一张数据卡片」的候选）：自己和子组件的 id 都换成草稿里没有的，候选的 id 和页面上已有的撞了
+ * 也不会把已有的那个覆盖掉（app_add 同 id 是整体覆盖）
+ */
+export function freshComponent(spec: AppSpec, comp: AppComponent): AppComponent {
+  const taken = componentIds(spec)
+  const walk = (c: AppComponent): AppComponent => {
+    const base = c.id || c.type
+    let id = base
+    for (let n = 2; taken.has(id); n++) id = `${base}_${n}`
+    taken.add(id)
+    return { ...c, id, ...(c.children ? { children: c.children.map(walk) } : {}) }
+  }
+  return walk(clone(comp))
+}
+
+/** 页面上的「改文字」能改哪几项：组件目录里标了给人看的文字（x-text）的字符串属性 */
+export function textPropsOf(props: Record<string, any> | undefined): { key: string; title: string; long: boolean }[] {
+  return Object.entries((props?.properties ?? {}) as Record<string, any>)
+    .filter(([, p]) => !!p && p.type === 'string' && p['x-text'] === true && !Array.isArray(p.enum))
+    .map(([key, p]) => ({ key, title: typeof p.title === 'string' && p.title ? p.title : key, long: (p.maxLength ?? 0) > 200 }))
+}
+
 const clampIndex = (i: unknown, len: number) =>
   typeof i === 'number' && Number.isFinite(i) ? Math.max(0, Math.min(len, Math.floor(i))) : len
 
@@ -104,10 +127,23 @@ export function applyAppOp(spec: AppSpec, op: Record<string, any>): AppSpec {
     case 'app_update': {
       const at = typeof op.id === 'string' ? findComponent(next, op.id) : null
       if (!at) return spec
-      if (op.props && typeof op.props === 'object') at.node.props = { ...(at.node.props ?? {}), ...op.props }
+      if (op.props && typeof op.props === 'object') {
+        // 按键合并；写 null 表示去掉这一项（同服务端 apps/ops._update）。留着 null 进草稿，发布检查按属性的类型报不对
+        const props: Record<string, unknown> = { ...(at.node.props ?? {}) }
+        for (const [k, v] of Object.entries(op.props as Record<string, unknown>)) {
+          if (v === null || v === undefined) delete props[k]
+          else props[k] = v
+        }
+        at.node.props = props
+      }
       if ('bind' in op) at.node.bind = op.bind ?? null
       if ('visible' in op) at.node.visible = op.visible || null
       if ('scope' in op) at.node.scope = op.scope || null
+      // 隐藏（N6）：只在为真时写，取消隐藏去掉这一项（同服务端组件模型的默认值 false）
+      if ('hidden' in op) {
+        if (op.hidden === true) at.node.hidden = true
+        else delete at.node.hidden
+      }
       return next
     }
     case 'app_remove': {

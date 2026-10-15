@@ -18,24 +18,32 @@ class PinState:
     pin: dict[str, Any]
     workflow: Any | None
     row: Any | None
+    #: 个人应用（docs/design/normal-user-apps.md N7）的固定版本写的是蓝图：图在蓝图上，没有工作流、没有版本
+    blueprint: Any | None = None
 
     @property
     def name(self) -> str:
+        if self.blueprint is not None:
+            return self.blueprint.name or ""
         return self.workflow.name if self.workflow is not None else str(self.pin.get("workflow_id") or "")
 
     @property
     def label(self) -> str:
-        """「周销售 v7」。"""
+        """「周销售 v7」。个人应用的蓝图没有版本，只写名字。"""
+        if self.blueprint is not None:
+            return f"「{self.name}」"
         return f"{self.name} v{self.pin.get('version')}"
 
     @property
     def graph(self) -> dict[str, Any]:
+        if self.row is None and self.blueprint is not None:
+            return self.blueprint.graph or {}
         return (self.row.graph if self.row is not None else None) or {}
 
     @property
     def hash(self) -> str | None:
         if self.row is None:
-            return None
+            return graph_hash(self.blueprint.graph or {}) if self.blueprint is not None else None
         return self.row.graph_hash or graph_hash(self.row.graph or {})
 
     @property
@@ -65,9 +73,17 @@ class PinState:
 
 
 async def load_pins(session: AsyncSession, spec: dict[str, Any]) -> dict[str, PinState]:
+    from app.db.models_blueprints import Blueprint
+
     out: dict[str, PinState] = {}
     for pin in spec.get("pins") or []:
         if not isinstance(pin, dict) or not pin.get("alias"):
+            continue
+        if isinstance(pin.get("blueprint"), str):
+            # 个人应用：图在蓝图上。蓝图删了 blueprint 为空，检查和解析照实报
+            blueprint = await session.get(Blueprint, pin["blueprint"])
+            out[str(pin["alias"])] = PinState(alias=str(pin["alias"]), pin=pin, workflow=None, row=None,
+                                              blueprint=blueprint)
             continue
         wf_id, version = pin.get("workflow_id"), pin.get("version")
         workflow = await session.get(Workflow, wf_id) if isinstance(wf_id, str) else None
@@ -80,8 +96,9 @@ async def load_pins(session: AsyncSession, spec: dict[str, Any]) -> dict[str, Pi
 
 
 def needs_upgrade(pins: dict[str, PinState]) -> bool:
-    """钉住的版本有退役的（或者已经不能用了）：入口拒绝发起新实例，视图照实写明（A1）。"""
-    return any(not p.usable for p in pins.values())
+    """钉住的版本有退役的（或者已经不能用了）：入口拒绝发起新实例，视图照实写明（A1）。个人应用的蓝图没有版本可退役、
+    可升级，不算（它的图改过没重新存，刷新时照实拒绝，见 blueprints/personal.refresh）。"""
+    return any(not p.usable for p in pins.values() if not p.pin.get("blueprint"))
 
 
 #: 结果只由参数决定的内置工具：同样的输入算出同样的东西。别的（联网、读文件、知识库、记忆、当前时间、执行代码）都算活的
@@ -113,7 +130,8 @@ async def reads_live(session: AsyncSession, graph: dict[str, Any]) -> bool:
         return False
     origins = dict((await session.execute(select(DataSource.name, DataSource.origin)
                                           .where(DataSource.name.in_(sorted(sources))))).all())
-    return any(origins.get(s) != "upload" for s in sources)
+    # 记录表按高水位固定（records/views.pin_entry），缓存键里带着它，同上传表格
+    return any(origins.get(s) not in ("upload", "records") for s in sources)
 
 
 async def write_nodes(session: AsyncSession, graph: dict[str, Any]) -> dict[str, Any]:

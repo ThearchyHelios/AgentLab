@@ -19,6 +19,7 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from langchain_core.messages import AIMessage
 
 from app.data import catalog, schema_view
 from app.data.catalog import INFERRED_MARK, make_item
@@ -26,7 +27,8 @@ from app.data.introspect import introspect
 from app.db.base import SessionLocal
 from app.db.models import DataSource
 from app.look.base import CONTEXT_TABLE_LIMIT, LookBudget
-from app.look.pick import Picker
+from app.look import pick as pick_module
+from app.look.pick import REASON_EMPTY, REASON_FORMAT, Picker
 from app.look.service import LookService, parse_targets
 from app.look.tables import TableKind
 from app.main import app
@@ -195,7 +197,7 @@ async def test_named_look_brings_in_the_bridge_without_the_picker(monkeypatch, s
     assert block["total"] == scenic.TABLE_COUNT + len(scenic.VIEWS) and block["catalog_tables"] == 0
 
 
-async def test_need_only_look_picks_with_a_small_fast_model(monkeypatch, scenic_source):
+async def test_need_only_look_picks_with_thinking_off_and_room_to_think(monkeypatch, scenic_source):
     fake = FakePicker(PICKED)
     specs = _use_picker(monkeypatch, fake)
     looks = await _service([scenic_source])
@@ -205,7 +207,8 @@ async def test_need_only_look_picks_with_a_small_fast_model(monkeypatch, scenic_
     # 挑选的输入是需求加紧凑的表目录（每张表一行），不是全部字段
     assert NEED in fake.calls[0] and "channel_visits" in fake.calls[0] and "attributed_share" not in fake.calls[0]
     (spec,) = specs
-    assert spec.thinking == "off" and spec.max_tokens <= 2048
+    # 经 OpenAI 兼容接入的推理模型收不到 thinking=off：额度要留出思考的余地，不然想完就没额度写结果
+    assert spec.thinking == "off" and spec.max_tokens == pick_module.PICK_MAX_TOKENS >= 16384
     (block,) = result.record["objects"]
     assert (block["named"], block["picked"], block["joined"]) == ([], ["visits", "channels"], ["channel_visits"])
     assert f"按需求从 {scenic.TABLE_COUNT + len(scenic.VIEWS)} 张表中挑出 2 张，另为连接补上 1 张" in result.text
@@ -243,6 +246,108 @@ async def test_pick_failures_hand_back_the_index(monkeypatch, scenic_source, fak
     assert "没能按需求挑出表" in result.text and record["reason"] in result.text
     assert "channel_visits" in result.text and "attributed_share" not in result.text
     assert "点名" in result.text
+
+
+class ScriptedPicker:
+    """结构化输出和纯文本各回各的：structured 是 include_raw 的回包（或要抛的异常），plain 是纯文本调用的回复（或异常）。
+    calls 按顺序记下调了哪一种。"""
+
+    def __init__(self, *, structured, plain=None) -> None:
+        self.structured, self.plain = structured, plain
+        self.calls: list[str] = []
+
+    def with_structured_output(self, schema, **kwargs):
+        assert schema["title"] and kwargs.get("include_raw")
+        outer = self
+
+        class _Structured:
+            async def ainvoke(self, _messages):
+                outer.calls.append("structured")
+                if isinstance(outer.structured, Exception):
+                    raise outer.structured
+                return outer.structured
+
+        return _Structured()
+
+    async def ainvoke(self, _messages):
+        self.calls.append("plain")
+        if isinstance(self.plain, Exception):
+            raise self.plain
+        return self.plain
+
+
+def _raw(content: str = "", **meta) -> dict:
+    return {"raw": AIMessage(content=content, response_metadata=meta), "parsed": None, "parsing_error": None}
+
+
+async def _look(monkeypatch, source, fake) -> dict:
+    _use_picker(monkeypatch, fake)
+    looks = await _service([source])
+    return (await looks.look({"op": "look", "need": NEED}, LookBudget())).record
+
+
+async def test_a_pick_cut_off_at_the_budget_says_so(monkeypatch, scenic_source):
+    """思考占满额度、结构化调用停在上限：照实说被截断（带额度），不当成「格式不对」，也不再白调一次纯文本。"""
+    fake = ScriptedPicker(structured=_raw('{"items": [{"name": "vis', finish_reason="length"),
+                          plain=AssertionError("截断后不该再调纯文本"))
+    record = await _look(monkeypatch, scenic_source, fake)
+    assert fake.calls == ["structured"]
+    assert record["status"] == "index"
+    assert record["reason"] == f"按需求挑选的模型的输出达到上限（{pick_module.PICK_MAX_TOKENS} token）被截断，没写完挑选结果"
+
+
+async def test_a_plain_reply_with_thinking_and_prose_is_still_read(monkeypatch, scenic_source):
+    """网关不支持结构化输出、正文里先是 <think> 包着的思考（里面打了个草稿），再是一句说明和围栏里的 JSON：认围栏里的。"""
+    text = ('<think>先打个草稿 {"items": [{"name": "stores"}]}</think>\n好的，挑出这些：\n```json\n'
+            '{"items": [{"name": "visits"}, {"name": "channels"}]}\n```')
+    fake = ScriptedPicker(structured=NotImplementedError("不支持工具调用"), plain=AIMessage(content=text))
+    record = await _look(monkeypatch, scenic_source, fake)
+    assert fake.calls == ["structured", "plain"]
+    assert record["status"] == "ok" and record["objects"][0]["picked"] == ["visits", "channels"]
+
+
+async def test_structured_reply_written_in_the_text_is_read_without_a_second_call(monkeypatch, scenic_source):
+    """网关收了结构化输出的参数却把 JSON 写在正文里：从原始回复里认出来，不再调纯文本。"""
+    fake = ScriptedPicker(structured=_raw('结果：{"items": [{"name": "visits"}]}', finish_reason="stop"),
+                          plain=AssertionError("原始回复里已经有了"))
+    record = await _look(monkeypatch, scenic_source, fake)
+    assert fake.calls == ["structured"] and record["objects"][0]["picked"] == ["visits"]
+
+
+@pytest.mark.parametrize(("plain", "reason"), [
+    (AIMessage(content=""), REASON_EMPTY),
+    (AIMessage(content="这几张都要看，见第[1]条"), REASON_FORMAT),
+], ids=["empty", "prose"])
+async def test_empty_and_prose_replies_are_told_apart(monkeypatch, scenic_source, plain, reason):
+    """空回复和写了字却不是约定格式的分开说；正文里顺手写的 [1] 不算一个空的挑选结果。"""
+    fake = ScriptedPicker(structured=_raw("", finish_reason="stop"), plain=plain)
+    record = await _look(monkeypatch, scenic_source, fake)
+    assert record["status"] == "index" and record["reason"] == reason
+
+
+async def test_a_budget_the_service_rejects_falls_back_to_a_smaller_one(monkeypatch, scenic_source):
+    """服务方一开口就嫌额度太大：按 PICK_FALLBACK_MAX_TOKENS 重建再问，挑选照常成。"""
+    import app.look.pick as pick
+    from app.providers import budget
+
+    monkeypatch.setattr(budget, "_REJECTED", set())
+
+    class TooBig(Exception):
+        status_code = 400
+
+    big = FakePicker(error=TooBig("max_tokens: 16384 > 8192, which is the maximum allowed"))
+    small = FakePicker(PICKED)
+    specs: list = []
+
+    async def _model(_session, spec):
+        specs.append(spec)
+        return (big if spec.max_tokens == pick.PICK_MAX_TOKENS else small), "fake-pick-small-gateway"
+
+    monkeypatch.setattr(pick, "get_chat_model", _model)
+    looks = await _service([scenic_source])
+    record = (await looks.look({"op": "look", "need": NEED}, LookBudget())).record
+    assert [s.max_tokens for s in specs] == [pick.PICK_MAX_TOKENS, pick.PICK_FALLBACK_MAX_TOKENS]
+    assert record["status"] == "ok" and record["objects"][0]["picked"] == ["visits", "channels"]
 
 
 async def test_an_empty_pick_is_reported_as_such(monkeypatch, scenic_source):

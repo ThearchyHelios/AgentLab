@@ -87,6 +87,7 @@ export function EntryPage() {
                     <h2 className="mb-3 text-sm font-semibold">{label}</h2>
                     {blocked && <Notice tone="warn" className="mb-3" attr={{ 'data-app-needs-upgrade': '' }}>{ENTRY_TEXT.upgrade}</Notice>}
                     <SchemaForm schema={schema} value={values} errors={errors} idPrefix={`entry-${entryId}`}
+                                fileContext={{ app_id: appId, entry: entryId }}
                                 onChange={(v) => { setValues(v); if (errors.length) setErrors([]) }}
                                 onSubmit={() => void submit()} />
                     <div className="mt-4 flex flex-wrap items-center gap-3">

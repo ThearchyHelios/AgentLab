@@ -53,6 +53,20 @@ STATUS_TEXT = {"queued": "排队中", "running": "运行中", "interrupted": "�
                "failed": "失败", "cancelled": "已取消"}
 TIER_TEXT = {"formal": "完整出具", "degraded": "降档出具", "withheld": "不予出具"}
 NO_TIER = "未声明出具契约"
+#: 蓝图试运行（docs/design/normal-user-apps.md N4）：印章的来源、说明，趋势只有一个点时的说明，预览里入口按钮为什么点不了
+TRIAL_FROM = "试运行"
+TRIAL_NOTE = "数据是真的，但这不是正式结果：发布之后才会按设定出数"
+TRIAL_SERIES = "试运行只有一次，没有趋势：发布之后每出一期数，这里多一个点"
+TRIAL_ENTRY = "试运行预览里不能发起；要换一份示例再试，请回到蓝图重新试运行"
+#: 钉住项还没有版本号（蓝图试运行派生的草稿）：没有正式运行可看，趋势也画不出来
+UNPUBLISHED_EMPTY = "还没有发布：发布之后有一次正式运行成功并封存，这里才有数"
+UNPUBLISHED_SERIES = "还没有发布，没有趋势：发布之后每出一期数，这里多一个点"
+#: 个人应用的视图（exploratory，N7）：印章的来源，还没刷新过、最近一次没成功、写在共享应用里时写什么
+EXPLORATORY_FROM = "探索 · 未经发布审核"
+EXPLORATORY_EMPTY = "还没有数据：点「刷新」后按当前的图运行一次"
+EXPLORATORY_FAILED = "最近一次刷新没有成功，这里是上一次成功刷新的结果"
+EXPLORATORY_SHARED = "这个视图取的是探索运行，只有个人应用能这样取数：请管理应用的人改成取正式运行"
+EXPLORATORY_SERIES = "每次刷新"
 TIER_BY_METRICS = "（按指标）"
 EMPTY_TEXT = "还没有数据"
 _ACTIVE = ("queued", "running", "interrupted")
@@ -172,11 +186,14 @@ class Source:
     stamp: dict[str, Any] | None = None
     message: str | None = None
     origin: str | None = None
+    #: 蓝图试运行的预览（resolve_page 的 trial 旁路）：不管视图声明的是哪种来源，都取这次试运行
+    trial: bool = False
     _masks: Any = None
 
     def out(self) -> dict[str, Any]:
-        # kind（latest_sealed / on_demand / instance）：界面据此在按需视图的印章旁给「刷新」
-        return {"state": self.state, "kind": self.kind, "run_id": self.run.id if self.run else None,
+        # kind（latest_sealed / on_demand / instance）：界面据此在按需视图的印章旁给「刷新」；试运行预览里一律是 trial
+        return {"state": self.state, "kind": "trial" if self.trial else self.kind,
+                "run_id": self.run.id if self.run else None,
                 "stamp": self.stamp, **({"message": self.message} if self.message else {})}
 
     @property
@@ -202,6 +219,10 @@ def _when(value: datetime | None) -> str:
 
 async def _from_text(session: AsyncSession, source: Source) -> str:
     run = source.run
+    if source.trial:
+        return TRIAL_FROM
+    if source.kind == "exploratory":
+        return EXPLORATORY_FROM
     if source.kind == "instance":
         return "本实例"
     if source.kind == "on_demand":
@@ -236,8 +257,7 @@ async def stamp_of(session: AsyncSession, source: Source) -> dict[str, Any]:
     if period:
         parts.append("统计期 " + "、".join(period))
     if run.data_versions:
-        parts.append("数据版本 " + "、".join(f"{v.get('name')} {str(v.get('snapshot') or '')[:8]}"
-                                         for v in run.data_versions.values() if isinstance(v, dict)))
+        parts.append("数据版本 " + "、".join(_version_text(v) for v in run.data_versions.values() if isinstance(v, dict)))
     calibers: list[dict[str, str]] = []
     for _, _, card in _sealed_cards(sealed):
         item = {"name": str(card.get("caliber") or ""), "version": str(card.get("caliber_version") or "")}
@@ -246,8 +266,11 @@ async def stamp_of(session: AsyncSession, source: Source) -> dict[str, Any]:
     issuance = _issuance_of(sealed)
     tier = issuance.get("tier") if isinstance(issuance, dict) else None
     notes: list[str] = []
-    workflow_name = pin.name if pin is not None else run.workflow_name
-    if pin is not None and pin.workflow is not None:
+    # 试运行跑的是还没发布的图：钉住项没有版本号，名字取运行上记的（蓝图名），版本错位一类的说明不适用
+    workflow_name = pin.name if pin is not None and not source.trial else run.workflow_name
+    if source.trial:
+        notes.append(TRIAL_NOTE)
+    elif pin is not None and pin.workflow is not None:
         current = pin.workflow.published_version
         if pin.retired:
             notes.append(f"固定的 v{pin.pin.get('version')} 已退役，这里保留最后一次的数据；应用需要升级")
@@ -256,6 +279,10 @@ async def stamp_of(session: AsyncSession, source: Source) -> dict[str, Any]:
                 notes.append(f"定时任务已改为运行 v{current}，本应用固定在 v{pin.pin.get('version')}")
             else:
                 notes.append(f"工作流的当前发布版本是 v{current}，本应用固定在 v{pin.pin.get('version')}")
+    if source.kind == "exploratory" and source.state == "ok" and source.message:
+        # 个人应用最近一次刷新没成功、这里给的是上一次的（_exploratory_source）
+        notes.append(source.message)
+    notes += [gap for entry in (run.data_versions or {}).values() if (gap := _records_gap(entry))]
     if not sealed.trusted:
         notes.append("这次运行还没有封存（或封存核对不一致），数字仅供参考")
     return {
@@ -270,8 +297,31 @@ async def stamp_of(session: AsyncSession, source: Source) -> dict[str, Any]:
             issuance, dict) and issuance.get("mode") == "metrics" else ""),
         "from": await _from_text(session, source),
         "sealed": bool(sealed.trusted),
+        **({"trial": True} if source.trial else {}),
         **({"notes": notes} if notes else {}),
     }
+
+
+def _version_text(entry: dict[str, Any]) -> str:
+    """印章上一个数据源固定的版本：上传表格写快照 id 前 8 位；记录表写「截至第 N 条」（records/views.pin_entry）。"""
+    if entry.get("origin") == "records":
+        # 跨版本汇总并进来的旧版本（records/views.py）各有高水位，一并写上；数据文件不在了的没并进来，不写（缺了哪版见
+        # _records_gap）
+        older = "、".join(f"第 {o.get('version')} 版截至第 {o.get('seq') or 0} 条" for o in entry.get("older") or []
+                         if isinstance(o, dict) and not o.get("missing"))
+        return f"{entry.get('name')} 截至第 {entry.get('seq') or 0} 条" + (f"（连同{older}）" if older else "")
+    return f"{entry.get('name')} {str(entry.get('snapshot') or '')[:8]}"
+
+
+def _records_gap(entry: Any) -> str | None:
+    """记录表的跨版本汇总缺了哪几版（旧版本的数据文件不在了，records/views.pin_entry 记成 missing）：印章上照实说数不全。"""
+    if not isinstance(entry, dict) or entry.get("origin") != "records":
+        return None
+    lost = [str(o.get("version")) for o in entry.get("older") or [] if isinstance(o, dict) and o.get("missing")]
+    if not lost:
+        return None
+    return (f"记录表「{entry.get('name')}」第 {'、'.join(lost)} 版的数据文件不在了，汇总里没有"
+            f"{'这一版' if len(lost) == 1 else '这几版'}的记录，数不全")
 
 
 # --------------------------------------------------------------------------
@@ -301,6 +351,7 @@ async def cache_key(session: AsyncSession, state: PinState, inputs: dict[str, An
     from app.engine.launch import graph_tool_names
     from app.engine.runner import _data_versions
     from app.engine.schema import GraphSpec
+    from app.records.views import cache_token as records_cache_token
 
     try:
         versions = await _data_versions(session, GraphSpec.model_validate(state.graph))
@@ -308,7 +359,9 @@ async def cache_key(session: AsyncSession, state: PinState, inputs: dict[str, An
         versions = {}
     capabilities = await capability_versions_for(session, graph_tool_names(state.graph))
     text = canonical_json({"graph_hash": state.hash, "input": inputs,
-                           "data_versions": {k: (v or {}).get("snapshot") for k, v in sorted(versions.items())},
+                           # 记录表按高水位（seq）：有新的提交，缓存就不再算数
+                           "data_versions": {k: (v or {}).get("snapshot") or records_cache_token(v)
+                                             for k, v in sorted(versions.items())},
                            "capabilities": capabilities})
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -407,6 +460,8 @@ class _Page:
     actor: str | None
     #: 正在解析的这一页（组件之间要互相知道的：同一页上有没有绑同一条待办的会签组件）
     page: dict[str, Any] = field(default_factory=dict)
+    #: 蓝图的试运行（trial 旁路）：草稿里所有视图来源都解析到这次运行，流程组件也对着它
+    trial: Run | None = None
     pins: dict[str, PinState] = field(default_factory=dict)
     sources: dict[str, Source] = field(default_factory=dict)
     problems: list[dict[str, Any]] = field(default_factory=list)
@@ -445,28 +500,41 @@ async def _backfilled(session: AsyncSession, app_id: str) -> int:
 
 async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, principal: Principal, role: str | None,
                        instance: Run | None = None, params: dict[str, Any] | None = None, draft: bool = False,
-                       version: AppVersion | None = None, actor: str | None = None) -> dict[str, Any]:
-    """解析一页，返回 agentlab.view/1。draft 为真时按草稿解析：不发起任何运行，视图取钉住版本已有的封存运行。"""
+                       version: AppVersion | None = None, actor: str | None = None,
+                       trial: Run | None = None) -> dict[str, Any]:
+    """解析一页，返回 agentlab.view/1。draft 为真时按草稿解析：不发起任何运行，视图取钉住版本已有的封存运行。
+
+    trial 是蓝图的一次试运行（docs/design/normal-user-apps.md N4，只和 draft 一起用）：草稿里所有视图来源（最近封存、
+    按需、本实例）都解析到这次运行，流程组件（实例进度、待办）也对着它；印章的来源写「试运行」、trial 为真、说明里写
+    「这不是正式结果」；趋势只有这一个点。不改 agentlab.app/1 的视图来源，只是解析时的旁路。
+
+    个人应用（N7）没有应用版本：草稿就是在用的那一份，不按草稿预览时也解析它（version 为空）。作者隐藏了的组件（hidden）
+    不下发；按草稿解析（编辑状态）时照常解析、带上 hidden，界面画成半透明。"""
     import copy
 
-    from app.apps.tree import app_level
+    from app.apps.tree import app_level, spec_hash
 
-    spec = copy.deepcopy(app.draft if draft else (version.spec if version is not None else {})) or {}
+    personal = getattr(app, "scope", "shared") == "personal"
+    spec = copy.deepcopy(app.draft if draft or personal else (version.spec if version is not None else {})) or {}
     page = page_of(spec, page_id)
     if page is None:
         raise ViewRefused(404, f"应用里没有页面「{page_id}」", "app_page_not_found")
+    trial = trial if draft else None
     ctx = _Page(app=app, spec=spec, version=None if draft else version, principal=principal, role=role,
-                instance=instance, params=params or {}, draft=draft, actor=actor, page=page)
+                instance=instance or trial, params=params or {}, draft=draft, actor=actor, page=page, trial=trial)
     ctx.pins = await load_pins(session, spec)
-    upgrade = needs_upgrade(ctx.pins)
+    # 试运行的钉住项本来就没有版本（还没发布），不是「需要升级」
+    upgrade = needs_upgrade(ctx.pins) if trial is None else False
     level = version.level if (version is not None and not draft) else app_level(
         [{"level": p.level} for p in ctx.pins.values()])
-    wanted = _views_of(page)
+    wanted = _views_of(page, hidden=draft)
     for vid in wanted:
         ctx.sources[vid] = await _source(session, ctx, vid)
     # 键：应用版本、页面、各来源取的那次运行、角色。另加各钉住项所在工作流的当前发布版和退役与否：印章上「定时任务已改为
     # 运行 vN」「已退役」随它们变，运行没换也得重新算；遮罩设置的指纹同理（_mask_fingerprint）
-    key = (app.id, "draft" if draft else (version.version if version else None), page_id,
+    # 个人应用没有版本号，草稿改了就生效：按草稿的指纹认
+    key = (app.id, "draft" if draft else (version.version if version else (spec_hash(spec) if personal else None)),
+           page_id,
            tuple((v, s.run.id if s.run else None, s.state, s.message) for v, s in sorted(ctx.sources.items())),
            tuple((a, p.workflow.published_version if p.workflow else None, p.retired)
                  for a, p in sorted(ctx.pins.items())),
@@ -498,6 +566,8 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
         "tree": tree,
         "forms": ctx.forms,
         "problems": ctx.problems,
+        **({"trial": {"run_id": trial.id, "status": trial.status,
+                      "status_text": STATUS_TEXT.get(trial.status, trial.status)}} if trial is not None else {}),
     }
     if cacheable:
         _PAGE_CACHE[key] = copy.deepcopy(out)
@@ -507,7 +577,7 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
 
 
 _DYNAMIC = frozenset({"instance_list", "task_list", "instance_header", "instance_timeline", "task_form", "signoffs",
-                      "action_status", "entry_button"})
+                      "action_status", "entry_button", "records_list"})
 
 
 def _dynamic(page: dict[str, Any]) -> bool:
@@ -517,15 +587,26 @@ def _dynamic(page: dict[str, Any]) -> bool:
     return any(c.get("type") in _DYNAMIC for c, _, _ in components({"pages": [page]}))
 
 
-def _views_of(page: dict[str, Any]) -> list[str]:
-    from app.apps.tree import components
-
+def _views_of(page: dict[str, Any], *, hidden: bool = False) -> list[str]:
+    """这一页要解析哪些视图。hidden 为假时跳过作者隐藏了的组件（连同它里面的）：只被它们绑定的视图不取运行，按需视图也
+    不会因为一块看不见的组件自动发起。"""
     out: list[str] = []
-    for comp, _, _ in components({"pages": [page]}):
+    for comp in _shown(page.get("body") or [], hidden=hidden):
         for vid in ((comp.get("bind") or {}).get("view") if isinstance(comp.get("bind"), dict) else None,
                     comp.get("scope")):
             if isinstance(vid, str) and vid not in out:
                 out.append(vid)
+    return out
+
+
+def _shown(items: list[Any], *, hidden: bool) -> list[dict[str, Any]]:
+    """深度优先列出组件；hidden 为假时隐藏了的组件和它里面的都不列。"""
+    out: list[dict[str, Any]] = []
+    for comp in items:
+        if not isinstance(comp, dict) or (comp.get("hidden") and not hidden):
+            continue
+        out.append(comp)
+        out += _shown(comp.get("children") or [], hidden=hidden)
     return out
 
 
@@ -536,6 +617,8 @@ async def _source(session: AsyncSession, ctx: _Page, vid: str) -> Source:
     kind = src.get("kind")
     if kind is None:
         return Source(id=vid, kind="", state="error", message=f"视图「{vid}」不存在")
+    if ctx.trial is not None:
+        return await _trial_source(session, ctx, vid, kind, src)
     state = ctx.pins.get(src.get("pin")) if kind != "instance" else None
     run: Run | None = None
     if kind == "instance":
@@ -546,6 +629,8 @@ async def _source(session: AsyncSession, ctx: _Page, vid: str) -> Source:
                       and p.pin.get("version") == run.version), None)
     elif state is None:
         return Source(id=vid, kind=kind, state="error", message=f"视图「{vid}」引用的工作流版本不在应用里")
+    elif kind == "exploratory":
+        return await _exploratory_source(session, ctx, vid, state)
     elif kind == "latest_sealed":
         run = await latest_sealed_run(session, state, src.get("from"))
         if run is None:
@@ -565,6 +650,47 @@ async def _source(session: AsyncSession, ctx: _Page, vid: str) -> Source:
     return source
 
 
+async def _exploratory_source(session: AsyncSession, ctx: _Page, vid: str, state: PinState) -> Source:
+    """个人应用的视图（docs/design/normal-user-apps.md N7）：这个应用、这个拥有者、这张图下最近一次成功封存的刷新
+    （blueprints/personal.exploratory_runs）。只在个人应用里合法（应用检查报 app.view_source_personal）：共享应用里写了的
+    照实报错、不取数。正在刷新的照实写；最近一次刷新没成功的，给上一次成功的结果并写明（印章的说明里也有）。"""
+    from app.blueprints.personal import exploratory_runs, latest_refresh
+
+    if getattr(ctx.app, "scope", "shared") != "personal":
+        return Source(id=vid, kind="exploratory", state="error", message=EXPLORATORY_SHARED)
+    hash_ = state.pin.get("graph_hash")
+    latest = await latest_refresh(session, ctx.app.id, hash_)
+    if latest is not None and latest.status in _ACTIVE:
+        return Source(id=vid, kind="exploratory", state="running", run=latest, pin=state, message=RUNNING_TEXT)
+    # 开了登录时刷新只能由拥有者发起，按人筛是多一道保险；关登录没有可信的身份，不按人筛
+    owner = ctx.app.owner if ctx.principal.mode != "off" else None
+    runs = await exploratory_runs(session, ctx.app.id, hash_, 1, owner)
+    if not runs:
+        if latest is not None:
+            return Source(id=vid, kind="exploratory", state="error", run=latest, pin=state,
+                          message=f"最近一次刷新{STATUS_TEXT.get(latest.status, latest.status)}")
+        return Source(id=vid, kind="exploratory", state="empty", pin=state, message=EXPLORATORY_EMPTY)
+    source = Source(id=vid, kind="exploratory", state="ok", run=runs[0], pin=state)
+    if latest is not None and latest.id != runs[0].id and latest.status in ("failed", "cancelled"):
+        source.message = EXPLORATORY_FAILED
+    return source
+
+
+async def _trial_source(session: AsyncSession, ctx: _Page, vid: str, kind: str, src: dict[str, Any]) -> Source:
+    """试运行预览：这个视图声明的是哪种来源都取这次试运行。钉住项按视图引用的那个认（实例视图不引用，取第一个）。"""
+    run = ctx.trial
+    assert run is not None
+    state = ctx.pins.get(src.get("pin")) or next(iter(ctx.pins.values()), None)
+    if run.status in _ACTIVE:
+        return Source(id=vid, kind=kind, state="running", run=run, pin=state, trial=True,
+                      message=await _active_text(session, run))
+    source = Source(id=vid, kind=kind, state="ok" if run.status == "succeeded" else "error", run=run, pin=state,
+                    trial=True)
+    if run.status != "succeeded":
+        source.message = f"这次试运行{STATUS_TEXT.get(run.status, run.status)}"
+    return source
+
+
 #: 来源的运行还没结束时各块写什么。页面在跟着（应用页轮询、实例页轮询或接事件流），不用人去刷新
 RUNNING_TEXT = "正在运行，完成后自动刷新"
 
@@ -580,6 +706,8 @@ async def _active_text(session: AsyncSession, run: Run) -> str:
 
 async def _empty_text(session: AsyncSession, state: PinState, origin: Any) -> str:
     """最近封存运行的视图还没有数据时说什么：还没有、什么时候会有（定时任务的下次运行时间，或者要等一次正式运行）。"""
+    if not isinstance(state.pin.get("version"), int):
+        return UNPUBLISHED_EMPTY
     if isinstance(origin, str) and origin.startswith("schedule:"):
         schedule = await session.get(Schedule, origin[len("schedule:"):])
         if schedule is None:
@@ -629,9 +757,13 @@ async def _node(session: AsyncSession, ctx: _Page, comp: dict[str, Any]) -> dict
     if not isinstance(comp, dict):
         return None
     cid = str(comp.get("id"))
+    # 作者隐藏了的（N6）不下发，里面的也不下发；按草稿解析（编辑状态）时照常解析，带上 hidden 由界面画成半透明
+    if comp.get("hidden") and not ctx.draft:
+        return None
     if comp.get("visible") and not await _visible(session, ctx, comp):
         return None
-    node: dict[str, Any] = {"id": cid, "type": comp.get("type"), "props": dict(comp.get("props") or {})}
+    node: dict[str, Any] = {"id": cid, "type": comp.get("type"), "props": dict(comp.get("props") or {}),
+                            **({"hidden": True} if comp.get("hidden") else {})}
     entry = BY_NAME.get(str(comp.get("type")))
     if entry is not None and entry["children"]:
         node["children"] = [n for c in comp.get("children") or [] if (n := await _node(session, ctx, c)) is not None]
@@ -703,6 +835,10 @@ async def _data(session: AsyncSession, ctx: _Page, comp: dict[str, Any]) -> dict
     cid = str(comp.get("id"))
     if ctype == "entry_button":
         entry = next((e for e in ctx.spec.get("entries") or [] if e.get("id") == props.get("entry")), None)
+        if ctx.trial is not None:
+            # 试运行预览：入口照常画出来（发布后长这样），发起不了——试运行的输入在蓝图上填
+            return {"entry": props.get("entry"), "label": props.get("label") or (entry or {}).get("label") or "",
+                    "disabled": True, "reason": TRIAL_ENTRY}
         blocked = needs_upgrade({a: p for a, p in ctx.pins.items() if entry and a == entry.get("pin")})
         return {"entry": props.get("entry"), "label": props.get("label") or (entry or {}).get("label") or "",
                 "disabled": blocked or entry is None,
@@ -714,6 +850,8 @@ async def _data(session: AsyncSession, ctx: _Page, comp: dict[str, Any]) -> dict
         return {"form": props.get("form")}
     if ctype == "instance_list":
         return await _instance_list(session, ctx, props)
+    if ctype == "records_list":
+        return await _records_list(session, ctx, props)
     if ctype == "instance_header":
         return await _instance_header(session, ctx)
     if ctype == "instance_timeline":
@@ -810,9 +948,17 @@ async def _series(session: AsyncSession, ctx: _Page, source: Source, cid: str, r
 
     n = min(last, SERIES_MAX) if isinstance(last, int) and not isinstance(last, bool) and last > 0 else 12
     node_id, _, metric_id = ref.partition(".")
+    if source.trial:
+        return await _trial_series(source, node_id, metric_id)
+    if source.kind == "exploratory":
+        return await _exploratory_series(session, ctx, source, node_id, metric_id, n)
     pin = source.pin
     if pin is None:
         return {"state": "error"}
+    if not isinstance(pin.pin.get("version"), int):
+        # 钉住项还没有版本号（蓝图试运行派生的草稿按草稿预览）：没有一期一期的封存运行可画，照实说，不算解析出错
+        return {"state": "empty", "mode": "single", "unit": "", "series": [], "breaks": [],
+                "message": UNPUBLISHED_SERIES}
     origin = source.origin
     segments: list[tuple[int, str, list[Run]]] = []
     mode = "single"
@@ -856,6 +1002,47 @@ async def _series(session: AsyncSession, ctx: _Page, source: Source, cid: str, r
                        "text": f"升版到 v{series[-1]['version']} 时选择了按新口径重算：只画新版本的数"})
     # 一个点都没有是空态（界面写「还没有数据点」），不是解析出错，不进 problems
     return {"state": "ok", "mode": mode, "unit": unit, "series": series, "breaks": breaks}
+
+
+async def _exploratory_series(session: AsyncSession, ctx: _Page, source: Source, node_id: str, metric_id: str,
+                              n: int) -> dict[str, Any]:
+    """个人应用的趋势：同一个应用、同一张图最近 n 次成功封存的刷新，按时间从早到晚排成一列（同 exploratory 视图取数的
+    规则）。图改过、重新存成个人应用之后从新图的第一次刷新画起，旧图的点不混进来。"""
+    from app.api.evidence import _sealed
+    from app.blueprints.personal import exploratory_runs
+
+    assert source.pin is not None
+    owner = ctx.app.owner if ctx.principal.mode != "off" else None
+    runs = list(reversed(await exploratory_runs(session, ctx.app.id, source.pin.pin.get("graph_hash"), n, owner)))
+    points = []
+    unit = ""
+    for run in runs:
+        sealed = source.sealed if source.run is not None and run.id == source.run.id else await _sealed(run.id)
+        point_source = Source(id=source.id, kind=source.kind, state="ok", run=run, pin=source.pin, sealed=sealed)
+        metric, text, eid, held = await _metric_value(point_source, node_id, metric_id, None)
+        if metric is not None:
+            unit = unit or str(metric.get("unit") or "")
+        period = period_of(run)
+        points.append({"run_id": run.id, "as_of": period.isoformat() if period else None,
+                       "value": None if held or metric is None else metric.get("value"), "text": text,
+                       "evidence": _evidence(point_source, "metric", node=node_id, metric=metric_id, eid=eid)
+                       if metric is not None else None})
+    return {"state": "ok", "mode": "single", "unit": unit,
+            "series": [{"version": None, "label": EXPLORATORY_SERIES, "points": points}], "breaks": []}
+
+
+async def _trial_series(source: Source, node_id: str, metric_id: str) -> dict[str, Any]:
+    """试运行预览里的趋势：只有这一次试运行一个点，照实写「没有趋势」（note），不报错。"""
+    metric, text, eid, held = await _metric_value(source, node_id, metric_id, None)
+    run = source.run
+    assert run is not None
+    period = period_of(run)
+    point = {"run_id": run.id, "as_of": period.isoformat() if period else None,
+             "value": None if held or metric is None else metric.get("value"), "text": text,
+             "evidence": _evidence(source, "metric", node=node_id, metric=metric_id, eid=eid)
+             if metric is not None else None}
+    return {"state": "ok", "mode": "single", "unit": str((metric or {}).get("unit") or ""), "trial": True,
+            "series": [{"version": None, "label": TRIAL_FROM, "points": [point]}], "breaks": [], "note": TRIAL_SERIES}
 
 
 async def _upgrade_of(session: AsyncSession, ctx: _Page, alias: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -1234,9 +1421,27 @@ async def _instance_list(session: AsyncSession, ctx: _Page, props: dict[str, Any
     # 关登录、又没填署名时分不出谁是谁，「我发起的」就是全部（同待办箱，A4.6）
     mine = (ctx.principal.username or ctx.actor) if who == "mine" else None
     limit = props.get("limit") if isinstance(props.get("limit"), int) else 50
+    if ctx.trial is not None:
+        # 试运行预览：「我发起的」里就是这一次试运行
+        return {"who": who, "entry": props.get("entry"), "trial": True,
+                "items": await instance_rows(session, [ctx.trial])}
     return {"who": who, "entry": props.get("entry"),
             "items": [] if ctx.draft else await list_instances(session, ctx.app.id, mine=mine, entry=props.get("entry"),
                                                                 limit=limit)}
+
+
+async def _records_list(session: AsyncSession, ctx: _Page, props: dict[str, Any]) -> dict[str, Any]:
+    """记录列表（docs/design/normal-user-apps.md N8）：每次打开按看的人实时过滤（records/listing.py），不走封存，同实例列表。
+    草稿预览不列真实的记录：state=preview（不说成「还没有记录表」，形状同 RecordsPage）。"""
+    from app.records.listing import page
+
+    who = props.get("who") if props.get("who") in ("mine", "all") else None
+    limit = props.get("limit") if isinstance(props.get("limit"), int) else 50
+    if ctx.draft:
+        return {"table": props.get("table"), "version": 0, "columns": [], "items": [], "mine_only": who == "mine",
+                "state": "preview", "next_cursor": None}
+    return await page(session, ctx.app, principal=ctx.principal, role=ctx.role, table=props.get("table"), who=who,
+                      limit=limit)
 
 
 async def _instance_header(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
@@ -1315,7 +1520,10 @@ async def _task_list(session: AsyncSession, ctx: _Page, props: dict[str, Any]) -
 
     scope = props.get("scope") if props.get("scope") in ("mine", "instance") else "mine"
     query = select(Task).where(Task.app_id == ctx.app.id)
-    if scope == "instance":
+    if ctx.trial is not None:
+        # 试运行的待办不属于任何应用，都派给了发起试运行的人自己（process/tasks.py）：列这次试运行的
+        query = select(Task).where(Task.run_id == ctx.trial.id)
+    elif scope == "instance":
         if ctx.instance is None:
             return {"scope": scope, "items": []}
         query = query.where(Task.run_id == ctx.instance.id)
@@ -1404,7 +1612,9 @@ async def _process_data(session: AsyncSession, ctx: _Page, ctype: Any, kind: str
                 "handler": handles(rows, reader), "assignments": [_assignment_row(a) for a in rows],
                 "progress": progress(task, rows), "my_response": my_response(rows, reader),
                 "people": await display_names(session, people_of(task, rows)),
-                **({"signoffs_on_page": True} if signoffs else {})}
+                **({"signoffs_on_page": True} if signoffs else {}),
+                # 试运行的待办派给了发起试运行的人自己：界面上按钮写「以试运行身份同意 / 驳回」
+                **({"trial": True} if ctx.trial is not None else {})}
     records = (await session.execute(select(ActionRecord).where(ActionRecord.run_id == run.id,
                                                                 ActionRecord.node_id == node_id)
                                      .order_by(ActionRecord.created_at, ActionRecord.attempt))).scalars()

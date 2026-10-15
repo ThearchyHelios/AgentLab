@@ -242,8 +242,8 @@ export function PublishSection({ onPublished }: { onPublished: () => void }) {
   )
 }
 
-/** 为每个升版的固定版本选处置，写清后果。不给默认值：必须由人选 */
-function DispositionDialog({ items, busy, onClose, onConfirm }: {
+/** 为每个升版的固定版本选处置，写清后果。不给默认值：必须由人选（应用页上直接改的「发布」也用它） */
+export function DispositionDialog({ items, busy, onClose, onConfirm }: {
   items: NonNullable<PublishResult['needs_disposition']>
   busy: boolean
   onClose: () => void

@@ -344,7 +344,8 @@ export function NotifySection() {
   const [channels, setChannels] = useState<NotifyChannelRow[] | null>(null)
   useEffect(() => { api.notify.channels().then(({ items }) => setChannels(items)).catch(() => setChannels([])) }, [])
   const set = (notify: typeof draft.notify) => setDraft((s) => ({ ...s, notify }))
-  const events = Object.keys(NOTIFY_TEXT.eventLabel)
+  // 「我提交审核的应用有结果」是发给提交人的，不归哪个应用：应用的通知里不列
+  const events = Object.keys(NOTIFY_TEXT.eventLabel).filter((e) => e !== 'review.done')
   return (
     <div className="mx-auto max-w-3xl p-4" data-app-notify={draft.notify.length}>
       <SectionBar title={T.sections.notify} hint={T.notifyHint}>

@@ -665,8 +665,9 @@ function PrefsTab() {
     jClaims: string | null; jCost: string | null; jTimeout: string | null; jClick: string | null; jDaily: string | null
     // 起草模型（数据目录的用模型起草、按配方导入的 AI 起草）：空串 = 跟随助手的模型（存 null）
     draftProvider: string; draftModel: string
-    // 应用一组（D-j）：按需视图每个应用每天最多发起几次
+    // 应用一组（D-j）：按需视图每个应用每天最多发起几次；使用者能不能建个人应用（N7，默认关）
     appsDaily: string
+    appsPersonal: boolean
   } | null>(null)
   const [spend, setSpend] = useState<{ usd?: number; calls?: number; unpriced_calls?: number } | null>(null)
   // 核查一组（双盲复算、反方审稿、审批质询）的草稿另放一份，和上面的共用保存条；verifySaves 是存过几次，今日核查花费跟着再取
@@ -719,6 +720,7 @@ function PrefsTab() {
     draftModel: typeof values?.catalog_draft?.model === 'string' ? values.catalog_draft.model : '',
     // 服务端没给这一项时按默认的 200 显示（同服务端的缺省值）
     appsDaily: String(values?.apps?.on_demand_daily_limit ?? APPS_DAILY_DEFAULT),
+    appsPersonal: values?.apps?.user_personal_apps === true,
   }
   const cur = draft ?? saved
   const stepCap = Number(values?.limits?.max_agent_steps) || 100
@@ -799,8 +801,8 @@ function PrefsTab() {
     }
     const judgeChanged = changed.some((k) => JUDGE_DRAFT.has(k))
     const draftChanged = changed.some((k) => DRAFT_MODEL_DRAFT.has(k))
-    const appsChanged = changed.includes('appsDaily')
-    const runChanged = changed.some((k) => k !== 'actor' && k !== 'appsDaily' && !JUDGE_DRAFT.has(k) && !DRAFT_MODEL_DRAFT.has(k))
+    const appsChanged = changed.some((k) => APPS_DRAFT.has(k))
+    const runChanged = changed.some((k) => k !== 'actor' && !APPS_DRAFT.has(k) && !JUDGE_DRAFT.has(k) && !DRAFT_MODEL_DRAFT.has(k))
     try {
       // 裁判一组整组写：后端对没给的键回落到默认值，只发改过的那一项会把别的项冲回默认
       const judge = judgeChanged ? {
@@ -817,7 +819,9 @@ function PrefsTab() {
       // 起草模型一组：两项一起写，空着的存 null（跟随助手的模型）
       const catalogDraft = draftChanged ? { provider: cur.draftProvider || null, model: cur.draftModel.trim() || null } : null
       // 应用一组同样整组写：别的键（以后加的）照原样带回去
-      const apps = appsChanged ? { ...(values.apps ?? {}), on_demand_daily_limit: Number(cur.appsDaily.trim()) } : null
+      const apps = appsChanged
+        ? { ...(values.apps ?? {}), on_demand_daily_limit: Number(cur.appsDaily.trim()), user_personal_apps: cur.appsPersonal }
+        : null
       if (runChanged || judge || verify || catalogDraft || apps) {
         const run = {
           ...(values.run ?? {}),
@@ -1172,6 +1176,17 @@ function PrefsTab() {
                        onChange={(e) => edit({ appsDaily: e.target.value })} data-apps-daily="" />
               )}
             </Field>
+            <label className="mt-3 flex items-start gap-2 text-xs">
+              <input type="checkbox" className="mt-0.5" checked={cur.appsPersonal} data-apps-personal=""
+                     aria-describedby="pref-apps-personal-hint"
+                     onChange={(e) => edit({ appsPersonal: e.target.checked })} />
+              <span>
+                {APP_SETTING_TEXT.personalApps}
+                <span id="pref-apps-personal-hint" className="mt-0.5 block text-2xs leading-relaxed text-faint">
+                  {APP_SETTING_TEXT.personalAppsHint}
+                </span>
+              </span>
+            </label>
           </section>
           </fieldset>
         </>
@@ -1198,7 +1213,7 @@ function PrefsTab() {
                     jClaims: '每份报告最多裁判句数', jCost: '每份报告的金额上限', jTimeout: '每份报告的时长上限',
                     jClick: '每次点击的金额上限', jDaily: '每日金额上限',
                     draftProvider: DRAFT_MODEL_SETTING_TEXT.provider, draftModel: DRAFT_MODEL_SETTING_TEXT.model,
-                    appsDaily: APP_SETTING_TEXT.onDemandLimit,
+                    appsDaily: APP_SETTING_TEXT.onDemandLimit, appsPersonal: APP_SETTING_TEXT.personalApps,
                   })[k]).concat(verifyLabels(verifyKeys)).join('、')}
                 </span>
               </span>
@@ -1230,6 +1245,9 @@ function PrefsTab() {
     </div>
   )
 }
+
+/** 应用一组在草稿里的几项：保存时整组写 apps */
+const APPS_DRAFT = new Set(['appsDaily', 'appsPersonal'])
 
 /** 按需视图每日上限的缺省值和最大值（同服务端 settings.APPS_DEFAULTS、APPS_DAILY_LIMIT_MAX） */
 const APPS_DAILY_DEFAULT = 200

@@ -1,7 +1,10 @@
 """开登录后使用者的问数据（D-c）：能发起什么样的运行、查询结果在工具边界遮、运行的 WebSocket 按运行判、数据源名单。
 
-- 图：只许输入、模型、Agent、报告、成果、知识检索、数据整形、条件分支、口径卡、合并查询；Agent 只许数据源工具和只读的
-  内置工具（app/auth/chat_policy.py）。调用工具、沙箱代码、自定义工具、MCP、网页、HTTP、文件一律 403；
+- 图：只许输入、模型、Agent、报告、成果、知识检索、数据整形、条件分支、口径卡、合并查询、调用工具；Agent 和调用工具
+  节点只许数据源工具和只读的内置工具（app/auth/chat_policy.py）。沙箱代码、自定义工具、MCP、网页、HTTP、文件、平台的
+  写入能力一律 403；
+- 调用工具节点查数据源：和 Agent 同一条路，结果在工具边界遮、可写源上的写语句被守卫拒掉；能力治理里改成写入的工具
+  在只读运行里不执行；
 - 使用者发起的问数据运行一定带 MASK_RESULTS_OPTION：真的执行一次（演示模型调数据源查询），事件、快照、实时流里都没有
   遮罩列的原值；
 - WebSocket：没登录的握手前关掉；使用者只能连自己能读、查询结果在工具边界遮过的运行（握手时判，1008 拒）；
@@ -54,6 +57,10 @@ def chat_graph(*tools: str, middle: dict | None = None) -> dict:
                "memory_recall"),
     chain(node("start", "input"), node("kb", "retrieve", query="x"), node("t", "transform", expression="1"),
           node("out", "output")),
+    # 调用工具节点：绑定的工具过同一份白名单就行（D1）
+    chat_graph(middle=node("ask", "tool", tool="db_query__crm", args={"sql": "SELECT city FROM customers"})),
+    chat_graph(middle=node("ask", "tool", tool="calculator", args={"expression": "1 + 1"})),
+    chat_graph(middle=node("ask", "tool", tool="kb_search", args={"query": "退款规则"})),
     {"nodes": "坏的"},          # 不成形的图交给 launch_run 照常报校验问题
 ])
 def test_graphs_a_user_may_run_in_chat(graph):
@@ -62,7 +69,11 @@ def test_graphs_a_user_may_run_in_chat(graph):
 
 @pytest.mark.parametrize("graph, said", [
     (chat_graph(middle=node("ask", "code", code="print(1)")), "沙箱代码"),
-    (chat_graph(middle=node("ask", "tool", tool="calculator")), "调用工具"),
+    (chat_graph(middle=node("ask", "tool", tool="http_request")), "http_request"),
+    (chat_graph(middle=node("ask", "tool", tool="records_append")), "records_append"),
+    (chat_graph(middle=node("ask", "tool", tool="memory_write")), "memory_write"),
+    (chat_graph(middle=node("ask", "tool", tool="mcp:fs/read_file")), "mcp:fs/read_file"),
+    (chat_graph(middle=node("ask", "tool", tool="{{ vars.tool }}")), "模板"),
     (chat_graph(middle=node("ask", "supervisor", agents=[])), "多 Agent 协作"),
     (chat_graph(middle=node("ask", "subgraph", workflow_id="w")), "子工作流"),
     (chat_graph(middle=node("ask", "human", mode="approve")), "人工审批"),
@@ -85,7 +96,11 @@ def test_graphs_a_user_may_not_run_in_chat(graph, said):
     chat_graph(middle=node("ask", "agent", prompt="x", tools=["memory_recall"], memory_scope="builders")),
     chat_graph(middle=node("kb", "retrieve", query="x", collection="hr")),
     {**chat_graph("kb_search"), "defaults": {"collection": "hr"}},
+    # 调用工具节点的参数直接交给工具：在参数里挑知识库同样不许
+    chat_graph(middle=node("kb", "tool", tool="kb_search", args={"query": "x", "collection": "hr"})),
     {**chat_graph("memory_recall"), "defaults": {"memory_scope": "  "}},
+    # 节点上没写参数、运行时取图级 defaults 里的 args（和运行时同一个取值规则，engine/launch.node_setting）
+    {**chat_graph(middle=node("kb", "tool", tool="kb_search")), "defaults": {"args": {"query": "x", "collection": "hr"}}},
 ])
 def test_users_may_not_pick_memory_or_knowledge_scope(graph):
     """记忆、知识库的内容不经遮罩：节点上、图级 defaults 里都不许指定范围，用管理员设好的默认值。"""
@@ -268,6 +283,181 @@ async def test_a_users_chat_run_cannot_write_a_writable_source(world, monkeypatc
     assert sqlite3.connect(path).execute("SELECT COUNT(*) FROM ledger").fetchone()[0] == 0, "搭建者照旧能写"
 
 
+async def _writable_masked_source(tmp_path) -> tuple[str, object]:
+    """可写的客户库（手机号是遮罩列）：调用工具节点查它、想删它。"""
+    path = tmp_path / f"crm_rw_{uuid.uuid4().hex[:6]}.db"
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, city TEXT);"
+                     f"INSERT INTO customers VALUES (1, '张三', '{PHONE}', '杭州'), (2, '李四', '13900000002', '宁波');")
+    db.commit()
+    db.close()
+    name = f"crm_rw_{uuid.uuid4().hex[:6]}"
+    async with SessionLocal() as session:
+        row = DataSource(name=name, kind="sqlite", database=str(path), readonly=False, enabled=True,
+                         description="客户（可写）", options={"mask_columns": "phone"})
+        session.add(row)
+        await session.flush()
+        row.schema_cache = await introspect.introspect(row)
+        await session.commit()
+    return name, path
+
+
+def _tool_chat(tool: str, sql: str) -> dict:
+    """问数据当场搭的图：取数用调用工具节点（D1），不经 Agent、不调模型。approval=never 是发起人自己写的：只读不交给
+    审批，写成 never 也照样拒写。"""
+    return chain(node("start", "input", fields=[{"name": "question"}]),
+                 node("q", "tool", tool=tool, args={"sql": sql}, fail_fast=False, approval="never"),
+                 node("out", "output", fields=[{"name": "结果", "value": "{{ nodes.q }}"}]))
+
+
+async def test_a_users_tool_node_is_masked_and_read_only(world, tmp_path):
+    """调用工具节点这条路和 Agent 一样（D1）：使用者问数据的运行里，结果在工具边界就遮（事件、查询快照、运行产出里都没有
+    原值），可写源上的写语句被守卫拒掉、一行没少（节点上写了免审批也一样）；搭建者发起的同一张写图照旧能写。"""
+    from app.core.artifact_store import load
+    from app.tools.datasource import FORCED_READONLY, READ_ONLY_OPTION
+
+    await _allow_chat(world)
+    name, path = await _writable_masked_source(tmp_path)
+    tool = f"db_query__{name}"
+
+    r = await world["uma"].post("/api/runs", json={"origin": "chat", "input": {"question": "客户"},
+                                                   "graph": _tool_chat(tool, "SELECT name, phone, city FROM customers")})
+    assert r.status_code == 201, r.text
+    run = await _finish(r.json()["id"])
+    assert run.status == "succeeded", run.error
+    assert run.options[MASK_RESULTS_OPTION] is True and run.options[READ_ONLY_OPTION] is True
+    async with SessionLocal() as s:
+        events = list((await s.execute(select(RunEvent).where(RunEvent.run_id == run.id))).scalars())
+        snaps = list((await s.execute(select(Artifact).where(Artifact.run_id == run.id,
+                                                             Artifact.kind == "query_snapshot"))).scalars())
+    dumped = json.dumps([e.data for e in events], ensure_ascii=False) + json.dumps(run.output, ensure_ascii=False)
+    assert "tool.end" in {e.type for e in events}
+    assert PHONE not in dumped and MASKED in dumped and "张三" in dumped, "遮罩列换掉，别的列照旧"
+    assert snaps and all(PHONE not in json.dumps(load(snap.id), ensure_ascii=False) for snap in snaps)
+
+    delete_all = _tool_chat(tool, "DELETE FROM customers")
+    r = await world["uma"].post("/api/runs", json={"origin": "chat", "input": {"question": "清空"}, "graph": delete_all})
+    assert r.status_code == 201, r.text
+    run = await _finish(r.json()["id"])
+    async with SessionLocal() as s:
+        events = list((await s.execute(select(RunEvent).where(RunEvent.run_id == run.id))).scalars())
+    assert FORCED_READONLY[:12] in json.dumps([e.data for e in events], ensure_ascii=False), "写语句被守卫拒掉"
+    assert sqlite3.connect(path).execute("SELECT COUNT(*) FROM customers").fetchone()[0] == 2
+
+    r = await world["bob"].post("/api/runs", json={"origin": "chat", "input": {"question": "清空"}, "graph": delete_all})
+    assert r.status_code == 201, r.text
+    await _finish(r.json()["id"])
+    assert sqlite3.connect(path).execute("SELECT COUNT(*) FROM customers").fetchone()[0] == 0, "搭建者照旧能写"
+
+
+async def test_a_tool_governed_as_write_is_not_run_in_a_read_only_run(world, tmp_path):
+    """能力治理把数据源查询改成「写入」：使用者问数据里的调用工具节点不进动作流程（探索运行在那里会演练、交回假回执），
+    直接拒、说清是只读运行；表里的行一条没动。"""
+    from app.db.models import ActionRecord, Capability
+
+    await _allow_chat(world)
+    name, path = await _writable_masked_source(tmp_path)
+    tool = f"db_query__{name}"
+    async with SessionLocal() as s:
+        s.add(Capability(name=tool, system=name, title="客户库", effect_system="dynamic", effect="write"))
+        await s.commit()
+    try:
+        r = await world["uma"].post("/api/runs", json={"origin": "chat", "input": {"question": "清空"},
+                                                       "graph": _tool_chat(tool, "DELETE FROM customers")})
+        assert r.status_code == 201, r.text
+        run = await _finish(r.json()["id"])
+        assert run.status == "failed" and "只能读数据" in (run.error or "") and tool in run.error, run.error
+        async with SessionLocal() as s:
+            assert not list((await s.execute(select(ActionRecord).where(ActionRecord.run_id == run.id))).scalars())
+        assert sqlite3.connect(path).execute("SELECT COUNT(*) FROM customers").fetchone()[0] == 2
+    finally:
+        async with SessionLocal() as s:
+            await s.execute(delete(Capability).where(Capability.name == tool))
+            await s.commit()
+
+
+async def test_kb_search_keeps_to_the_runs_knowledge_base_when_the_scope_is_fixed(monkeypatch):
+    """工具层的那一道（D1）：范围固定的运行里 kb_search 不认 collection 参数——直接写的、参数名写错被纠成 collection 的都拒，
+    不悄悄改查默认库；没写的照常查运行定下的那一个。范围不固定（搭建者的运行）照旧按参数查。"""
+    from app.memory import kb
+    from app.tools.registry import ToolArgsError, ToolContext, Versions, call_tool
+
+    searched: list[str] = []
+
+    async def _search(session, *, collection, query, limit, **_):
+        searched.append(collection)
+        return []
+
+    monkeypatch.setattr(kb, "search", _search)
+    fixed = ToolContext(collection="default", fixed_scope=True, data_versions=Versions.CURRENT)
+    for args in ({"query": "x", "collection": "hr"}, {"query": "x", "limit": 5, "coll": "hr"}):
+        with pytest.raises(ToolArgsError) as refused:
+            await call_tool("kb_search", args, fixed)
+        assert "只能检索管理员设好的知识库" in str(refused.value) and "hr" in str(refused.value)
+    assert searched == []
+    await call_tool("kb_search", {"query": "x"}, fixed)
+    await call_tool("kb_search", {"query": "x", "collection": "default"}, fixed)
+    await call_tool("kb_search", {"query": "x", "collection": "hr"},
+                    ToolContext(collection="default", data_versions=Versions.CURRENT))
+    assert searched == ["default", "default", "hr"]
+
+
+def _kb_search_spy(monkeypatch) -> list[str]:
+    from app.memory import kb
+
+    searched: list[str] = []
+
+    async def _search(session, *, collection, query, limit, **_):
+        searched.append(collection)
+        return [{"content": f"{collection} 库里的一段", "score": 1.0}]
+
+    monkeypatch.setattr(kb, "search", _search)
+    return searched
+
+
+async def test_a_users_run_cannot_reach_another_knowledge_base_through_the_tool_layer(world, monkeypatch):
+    """白名单认不出的两种写法，运行时在工具层拒（D1）：调用工具节点的参数名写错（coll 被纠成 collection）、Agent 在参数里
+    挑知识库。使用者的问数据只查得到运行定下的知识库；搭建者发起的同一张图照旧按参数查。"""
+    from app.providers import mock_model
+
+    await _allow_chat(world)
+    searched = _kb_search_spy(monkeypatch)
+    typo = chain(node("start", "input", fields=[{"name": "question"}]),
+                 node("kb", "tool", tool="kb_search", args={"query": "x", "limit": 5, "coll": "hr"}),
+                 node("out", "output", fields=[{"name": "结果", "value": "{{ nodes.kb }}"}]))
+    assert chat_graph_problem(typo) is None, "白名单只看字面写的参数名，这一道在工具层"
+    r = await world["uma"].post("/api/runs", json={"origin": "chat", "graph": typo, "input": {"question": "x"}})
+    assert r.status_code == 201, r.text
+    run = await _finish(r.json()["id"])
+    assert run.status == "failed" and "只能检索管理员设好的知识库" in (run.error or ""), run.error
+    assert "hr" not in searched
+
+    replies: list[str] = []
+
+    def _decide(self, messages):
+        if seen := [m for m in messages if isinstance(m, ToolMessage)]:
+            replies.append(str(seen[-1].content))
+            return AIMessage(content="好了。")
+        return AIMessage(content="", tool_calls=[{"name": "kb_search", "args": {"query": "薪酬", "collection": "hr"},
+                                                  "id": "call_1"}])
+
+    monkeypatch.setattr(mock_model.MockChatModel, "_decide", _decide)
+    r = await world["uma"].post("/api/runs", json={"origin": "chat", "graph": chat_graph("kb_search"),
+                                                   "input": {"question": "薪酬"}})
+    assert r.status_code == 201, r.text
+    run = await _finish(r.json()["id"])
+    assert run.status == "succeeded", run.error
+    assert replies and "只能检索管理员设好的知识库" in replies[-1], replies
+    assert "hr" not in searched
+
+    replies.clear()
+    r = await world["bob"].post("/api/runs", json={"origin": "chat", "graph": chat_graph("kb_search"),
+                                                   "input": {"question": "薪酬"}})
+    assert r.status_code == 201, r.text
+    assert (await _finish(r.json()["id"])).status == "succeeded"
+    assert searched == ["hr"] and "hr 库里的一段" in replies[-1], "搭建者的运行照旧按参数查"
+
+
 async def test_a_users_chat_run_keeps_to_its_own_memory_scope(world):
     """请求体里带记忆范围、知识库的拒；不带的，记忆是这位使用者自己的范围，知识库是设置里的默认值。"""
     await _allow_chat(world)
@@ -287,10 +477,12 @@ async def test_a_users_chat_run_keeps_to_its_own_memory_scope(world):
 
 
 class _Scripted:
-    """第一轮按节点手册的标准写法搭（tool 节点查库），收到自查请求时改成 Agent 查库。记下 system 和每一轮的请求。"""
+    """第一轮按节点手册的标准写法搭（tool 节点调 fetch_tool，缺省是查库），收到自查请求时改成 Agent 查库。记下 system 和
+    每一轮的请求。"""
 
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, fetch_tool: str | None = None) -> None:
         self.source = source
+        self.fetch_tool = fetch_tool or f"db_query__{source}"
         self.systems: list[str] = []
         self.humans: list[str] = []
 
@@ -308,7 +500,7 @@ class _Scripted:
                    {"op": "add_node", "node": {"id": "start", "type": "input", "label": "输入",
                                                "config": {"fields": [{"name": "question"}]}}},
                    {"op": "add_node", "node": {"id": "fetch", "type": "tool", "label": "查库",
-                                               "config": {"tool": f"db_query__{self.source}",
+                                               "config": {"tool": self.fetch_tool,
                                                           "args": {"sql": "SELECT city FROM customers"}}}},
                    {"op": "add_node", "node": {"id": "out", "type": "output", "label": "成果",
                                                "config": {"fields": [{"name": "回答", "value": "{{ last_message }}"}]}}},
@@ -344,13 +536,21 @@ async def _generate(client, monkeypatch, model: _Scripted) -> list[dict]:
 
 
 async def test_generation_for_a_user_keeps_to_the_chat_policy(world, monkeypatch):
-    """使用者问数据时，提示词先说清只能 Agent 查库；照标准写法搭出的 tool 节点图按 chat_policy 交回去改，改好才交付、
-    自动运行。搭建者照旧按节点手册来，tool 节点不算问题。"""
+    """使用者问数据时，提示词先说清只能用数据源查询和只读的内置工具；tool 节点查库照标准写法搭，一次就过、自动运行（D1）。
+    tool 节点绑了不许的工具（http_request）按 chat_policy 交回去改，改好才交付。搭建者照旧按节点手册来。"""
     await _allow_chat(world)
     model = _Scripted(world["source"])
     events = await _generate(world["uma"], monkeypatch, model)
     assert "这位用户是「使用者」" in model.systems[0] and "- http_request" not in model.systems[0]
-    assert len(model.humans) == 2 and "调用工具" in model.humans[1], "tool 节点按 chat_policy 交回去改"
+    assert "tool 节点和 agent 都只能用" in model.systems[0]
+    assert len(model.humans) == 1, "tool 节点查库不算问题"
+    final = next(e for e in events if e.get("op") == "final")
+    assert final["autorun"] is True and "tool" in {n["type"] for n in final["graph"]["nodes"]}
+    assert chat_graph_problem(final["graph"]) is None
+
+    model = _Scripted(world["source"], fetch_tool="http_request")
+    events = await _generate(world["uma"], monkeypatch, model)
+    assert len(model.humans) == 2 and "http_request" in model.humans[1], "绑了不许的工具按 chat_policy 交回去改"
     check = [e for e in events if e.get("op") == "check"][-1]
     final = next(e for e in events if e.get("op") == "final")
     assert check["status"] == "passed" and final["autorun"] is True
@@ -367,9 +567,9 @@ async def test_generation_for_a_user_keeps_to_the_chat_policy(world, monkeypatch
 async def test_generation_for_a_user_reports_what_it_could_not_fix(world, monkeypatch):
     """改不好的照实交付：自查失败、final 里列出 chat.not_allowed，不自动运行。"""
     await _allow_chat(world)
-    model = _Scripted(world["source"])
-    model._lines = lambda repair: _Scripted(world["source"])._lines(False) if not repair else [
-        json.dumps({"op": "done", "explanation": "没改"}, ensure_ascii=False)]
+    model = _Scripted(world["source"], fetch_tool="http_request")
+    model._lines = lambda repair: _Scripted(world["source"], fetch_tool="http_request")._lines(False) if not repair \
+        else [json.dumps({"op": "done", "explanation": "没改"}, ensure_ascii=False)]
     events = await _generate(world["uma"], monkeypatch, model)
     check = [e for e in events if e.get("op") == "check"][-1]
     final = next(e for e in events if e.get("op") == "final")
@@ -448,9 +648,12 @@ async def test_source_names_for_the_chat_page(world):
     assert (await uma.get("/api/datasources")).status_code == 403
     await _allow_chat(world)
     body = (await uma.get("/api/datasources/names")).json()
-    assert [i["name"] for i in body["items"]] == [world["source"]], "只列启用着的"
-    assert set(body["items"][0]) == {"id", "name", "description", "kind"}, "连接信息不在名单里"
-    assert body["items"][0]["description"] == "客户" and body["items"][0]["kind"] == "sqlite"
+    # 同一个测试进程里别的测试留下的数据源也会在名单里：只核对这里建的两个（一个启用、一个停用）
+    names = [i["name"] for i in body["items"]]
+    assert world["source"] in names and not [n for n in names if n.startswith("off_")], "只列启用着的"
+    item = next(i for i in body["items"] if i["name"] == world["source"])
+    assert set(item) == {"id", "name", "description", "kind"}, "连接信息不在名单里"
+    assert item["description"] == "客户" and item["kind"] == "sqlite"
     assert (await uma.get("/api/datasources")).status_code == 403, "完整的数据源列表照旧只给搭建者"
     assert (await bob.get("/api/datasources/names")).status_code == 200
 

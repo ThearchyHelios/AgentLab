@@ -68,7 +68,7 @@ async def look_service(sources: list[Any], *, spec: ModelSpec | None, graph: Map
                        kinds: tuple[str, ...] = ("table", "capability"), answer: bool = False) -> LookService:
     """按入口组装这一轮的查看服务。读目录、读能力登记都用各自的短会话，开流前后都能调。
 
-    spec 是助手的模型规格：挑选模型第一次要用时才按它拿（关思考、额度小）。graph 是现有工作流，概览里列出它查过的表。
+    spec 是助手的模型规格：挑选模型第一次要用时才按它拿（关思考、额度按 look/pick.PICK_MAX_TOKENS）。graph 是现有工作流，概览里列出它查过的表。
     answer：问数据（意图为回答），能力只列只读的。
     """
     picker = Picker(spec)

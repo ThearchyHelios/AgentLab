@@ -16,9 +16,12 @@ import { useCatalog } from '../../store/catalog'
 import { useAtLeast, useLoginOn } from '../../store/auth'
 import { formatDateTime, formatRelative, formatSpan, formatTime, parseServerTime } from '../../lib/format'
 import { runName } from '../../lib/terms'
-import { APP_HOME_TEXT, APP_TEXT, TASK_KIND_LABEL, TASK_STATUS_LABEL, TASK_TEXT } from '../../lib/termsApp'
+import { APP_HOME_TEXT, APP_TEXT, PERSONAL_TEXT, TASK_KIND_LABEL, TASK_STATUS_LABEL, TASK_TEXT } from '../../lib/termsApp'
 import type { AppSummary, InstanceRow, Task } from '../../typesApp'
-import { LoadError, appPath, newAppPath, useLoad } from './shared'
+import { LoadError, appPath, useLoad } from './shared'
+import { NEW_APP_TEXT } from '../../lib/termsBlueprint'
+import { CREATE_APP_PATH, useCreateScope } from '../blueprints/shared'
+import { PersonalStubCard, isPersonalStub } from './personal'
 
 const TABS = ['inbox', 'apps', 'mine'] as const
 type Tab = (typeof TABS)[number]
@@ -28,11 +31,13 @@ export function AppsHome() {
   const [search, setSearch] = useSearchParams()
   const tab: Tab = (TABS as readonly string[]).includes(search.get('tab') ?? '') ? search.get('tab') as Tab : 'inbox'
   const loginOn = useLoginOn()
-  const builder = useAtLeast('builder')
   const inboxCount = useCatalog((s) => s.taskCounts?.mine ?? 0)
-  // 新建应用给搭建者及以上：是新建向导的起点，现在从已有的工作流开始（选一个已发布且未退役的版本 → 派生 → 进编辑器）
-  const create = builder && (
-    <Link to={newAppPath()} className="btn btn-primary btn-sm" title={APP_TEXT.createHint} data-app-create="">
+  // 新建应用（docs/design/normal-user-apps.md §4.1）：搭建者建共享应用；使用者在管理员开了个人应用时也有，只能建个人应用。
+  // 三个起点（说需求、场景模板、已有的回答或已发布的工作流）都在新建页上
+  const scope = useCreateScope()
+  const create = scope && (
+    <Link to={CREATE_APP_PATH} className="btn btn-primary btn-sm" data-app-create={scope}
+          title={scope === 'personal' ? NEW_APP_TEXT.homeHintPersonal : NEW_APP_TEXT.homeHint}>
       <Plus size={12} aria-hidden /> {APP_TEXT.create}
     </Link>
   )
@@ -152,14 +157,52 @@ function InboxRow({ task }: { task: Task }) {
 
 function AppsTab() {
   const builder = useAtLeast('builder')
+  const scope = useCreateScope()
   const { data, error, reload } = useLoad((signal) => api.apps.list({ signal }), [])
   if (error && !data) return <LoadError error={error} onRetry={reload} />
   if (!data) return <Skeleton rows={4} />
+  // 个人应用（N7）单独一组「我的应用」放在前面：只有拥有者看得见，服务端只把自己的交来。开了登录的管理员另看得到别人的
+  // 个人应用在不在（服务端只给元数据，my_role 为空）：单列一组「使用者的个人应用」放在最后，不链到页面，只给归档
+  const others = data.items.filter(isPersonalStub)
+  const mine = data.items.filter((a) => a.scope === 'personal' && !isPersonalStub(a))
+  const shared = data.items.filter((a) => a.scope !== 'personal')
+  if (mine.length || others.length) {
+    return (
+      <div className="space-y-4">
+        {mine.length > 0 && (
+          <section aria-labelledby="apps-home-personal" data-app-group="personal">
+            <h2 id="apps-home-personal" className="text-xs font-semibold">{PERSONAL_TEXT.group}</h2>
+            <p className="mb-2 text-2xs text-faint">{PERSONAL_TEXT.groupHint}</p>
+            <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" data-app-list-personal="">
+              {mine.map((a) => <AppCard key={a.id} app={a} canEdit={false} />)}
+            </ul>
+          </section>
+        )}
+        {shared.length > 0 && (
+          <section aria-labelledby="apps-home-shared" data-app-group="shared">
+            <h2 id="apps-home-shared" className="mb-2 text-xs font-semibold">{PERSONAL_TEXT.sharedGroup}</h2>
+            <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" data-app-list="">
+              {shared.map((a) => <AppCard key={a.id} app={a} canEdit={builder && a.my_role === 'manage'} />)}
+            </ul>
+          </section>
+        )}
+        {others.length > 0 && (
+          <section aria-labelledby="apps-home-others" data-app-group="others">
+            <h2 id="apps-home-others" className="text-xs font-semibold">{PERSONAL_TEXT.othersGroup}</h2>
+            <p className="mb-2 text-2xs text-faint">{PERSONAL_TEXT.othersGroupHint}</p>
+            <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3" data-app-list-others="">
+              {others.map((a) => <PersonalStubCard key={a.id} app={a} onArchived={reload} />)}
+            </ul>
+          </section>
+        )}
+      </div>
+    )
+  }
   if (!data.items.length) {
     return (
-      <EmptyState icon={<LayoutGrid size={28} />} title={APP_TEXT.noApps} body={builder ? APP_TEXT.noAppsBody : APP_TEXT.noAppsUser}
-                  action={builder ? (
-                    <Link to={newAppPath()} className="btn btn-sm" data-app-create-empty="">
+      <EmptyState icon={<LayoutGrid size={28} />} title={APP_TEXT.noApps} body={scope ? NEW_APP_TEXT.homeEmptyBody : APP_TEXT.noAppsUser}
+                  action={scope ? (
+                    <Link to={CREATE_APP_PATH} className="btn btn-sm" data-app-create-empty="">
                       <Plus size={12} aria-hidden /> {APP_TEXT.create}
                     </Link>
                   ) : undefined} />
@@ -189,7 +232,10 @@ function AppCard({ app, canEdit }: { app: AppSummary; canEdit: boolean }) {
         </div>
       </div>
       <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-2xs">
-        <span className="chip">{app.published_version ? APP_TEXT.publishedAt(app.published_version) : APP_TEXT.unpublished}</span>
+        {/* 个人应用没有应用版本，不写「未发布」：角标写「个人」 */}
+        {app.scope === 'personal'
+          ? <span className="chip" style={{ color: 'var(--accent)' }} title={PERSONAL_TEXT.badgeHint} data-app-personal="">{PERSONAL_TEXT.badge}</span>
+          : <span className="chip">{app.published_version ? APP_TEXT.publishedAt(app.published_version) : APP_TEXT.unpublished}</span>}
         {app.level && <span className="chip">{app.level === 'governed' ? APP_TEXT.levelGoverned : APP_TEXT.levelPublished}</span>}
         {app.status === 'archived' && <span className="chip">{APP_TEXT.archived}</span>}
         {app.needs_upgrade && (

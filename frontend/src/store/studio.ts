@@ -1805,6 +1805,12 @@ export const useStudio = create<StudioState>((set, get) => ({
       const looks = looksOf(get().copilotTurns.find((t) => t.id === turnId)?.ops ?? [])
       return looks.length ? { meta: { looks } } : {}
     }
+    /** 助手这一轮问回来的那句话（ask）：落库时作为这一轮的回答进历史，下一轮模型知道自己问过什么（N11） */
+    const askedText = (): string => {
+      const ops = get().copilotTurns.find((t) => t.id === turnId)?.ops ?? []
+      const ask = [...ops].reverse().find((o) => o.op === 'ask')
+      return ask ? String(ask.question ?? '').trim() : ''
+    }
     const settle = (patch: Partial<CopilotTurn>) => {
       set((s: StudioState) => ({
         copilotTurns: s.copilotTurns.map((t) => (t.id === turnId ? { ...t, ...patch } : t)),
@@ -2110,6 +2116,7 @@ export const useStudio = create<StudioState>((set, get) => ({
             finish({ explanation, error: '' })
             recordCanvasTurn(get().copilotConversationId, instruction, {
               graph: op.graph, explanation: explanation ?? '', status: 'done', ...looksMeta(),
+              ...(askedText() ? { answer: askedText() } : {}),
             }, set)
             void get().validate()
             setTimeout(() => {
@@ -2152,9 +2159,19 @@ export const useStudio = create<StudioState>((set, get) => ({
           if (get().cancelCopilot === stop) set({ cancelCopilot: null })
           return
         }
+        finished = true
+        // 只问不改的一轮（ask 之后流就结束了，N11）：画布没动，问题当成这一轮的回话摆出来，照样记进会话、进历史——
+        // 以前这一轮被当成「没修改画布」收掉，也不落库，下一轮模型不知道自己问过什么
+        const asked = error ? '' : askedText()
+        if (asked) {
+          revert()
+          settle({ phase: 'done', outcome: 'answered', reply: asked })
+          finish({ explanation: '', error: '' })
+          recordCanvasTurn(get().copilotConversationId, instruction, { answer: asked, status: 'done', ...looksMeta() }, set)
+          return
+        }
         // 流断了但没收到 final / error / reply：这一轮不能一直挂在"进行中"，
         // 否则侧栏会永远转圈，而后台其实什么都不会再来了。改了一半的画布退回去
-        finished = true
         const outcome = revert()
         const message = error ?? (outcome === 'reverted' ? '本轮连接中断，画布已恢复到本轮之前的状态' : '')
         settle(message ? { phase: 'error', error: message, outcome } : { phase: 'done', outcome })

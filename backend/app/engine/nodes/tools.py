@@ -20,7 +20,8 @@ from app.sandbox.base import SandboxLimits
 from app.sandbox.manager import sandbox_manager
 from app.engine.sql_problems import event_checks
 from app.capabilities.registry import is_platform_query, snapshot_owned
-from app.tools.datasource import DATA_UNAVAILABLE, SCHEMA_PREFIX, run_masks_results, run_reads_only, run_versions
+from app.tools.datasource import (DATA_UNAVAILABLE, SCHEMA_PREFIX, run_masks_results, run_reads_only,
+                                  run_scope_fixed, run_versions)
 from app.tools.registry import (
     ToolArgsError,
     ToolBuildError,
@@ -41,15 +42,18 @@ EVIDENCE_ROLES = ("source", "compute")
 
 
 def _tool_ctx(ctx: NodeContext) -> ToolContext:
+    # 遮罩、只读的运行：记忆范围、知识库只认运行定下的，节点配置、图级 defaults 里写的都不算（tools/registry.ToolContext.fixed_scope）
+    fixed = run_scope_fixed(ctx.run)
     return ToolContext(
         run_id=ctx.run.run_id,
         node_id=ctx.node.id,
         sandbox_session=ctx.run.thread_id,
-        memory_scope=ctx.cfg("memory_scope") or ctx.run.memory_scope,
-        collection=ctx.cfg("collection") or ctx.run.collection,
+        memory_scope=ctx.run.memory_scope if fixed else ctx.cfg("memory_scope") or ctx.run.memory_scope,
+        collection=ctx.run.collection if fixed else ctx.cfg("collection") or ctx.run.collection,
         data_versions=run_versions(ctx.run),
         mask_results=run_masks_results(ctx.run),
         force_readonly=run_reads_only(ctx.run),
+        fixed_scope=fixed,
         # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
         emit=ctx.emit,
     )
@@ -85,6 +89,11 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # 能力治理后效果为写入的：走动作的路径（先留生效记录再发送，app/process/actions.py）。登记里没有、或不是写入的，
     # 照以前的路径执行
     if (capability := await _write_capability(name, ctx)) is not None:
+        if run_reads_only(ctx.run):
+            # 只读的运行（使用者的问数据、个人应用的刷新、个人蓝图的试运行，auth/chat_policy.py）什么都不写：能力治理里
+            # 改成「写入」的工具也不进动作流程（探索运行在那里会演练、交回一张假回执），同 Agent 建工具时拒写入能力
+            raise NodeError(ctx.node.id, f"这次运行只能读数据：「{name}」是写入能力，不能调用。需要写入的，"
+                                         "请联系搭建者做成应用")
         return await _run_write(state, ctx, name, args, capability)
 
     # 审批通过后节点会整个重放、再算一遍要不要问人，所以这里只能取决于 name 和 args。

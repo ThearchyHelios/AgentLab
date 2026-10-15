@@ -9,6 +9,7 @@ from app.engine.context import NodeContext, NodeError
 from app.engine.evidence import ledger_enabled, next_exec
 from app.engine.state import GraphState, template_context
 from app.memory import kb, store
+from app.tools.datasource import run_scope_fixed
 
 
 async def run_memory(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
@@ -77,7 +78,9 @@ async def run_retrieve(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if not query.strip():
         raise NodeError(ctx.node.id, "「知识检索」节点没有填写检索问题")
 
-    collection = ctx.render_str(ctx.cfg("collection", "") or ctx.run.collection, state)
+    # 遮罩、只读的运行：知识库只认运行定下的（tools/registry.ToolContext.fixed_scope，同调用工具节点、Agent）
+    collection = ctx.run.collection if run_scope_fixed(ctx.run) \
+        else ctx.render_str(ctx.cfg("collection", "") or ctx.run.collection, state)
     limit = int(ctx.cfg("limit", 5) or 5)
     # 不写死 0.5：没配置就跟着 embedder 的能力走（见 embeddings.default_alpha）
     raw_alpha = ctx.cfg("alpha")

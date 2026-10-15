@@ -28,6 +28,8 @@ import { apps, ledger } from './apps'
 import { actions, tasks } from './tasks'
 import { auth, identity } from './auth'
 import { capabilities, endpoints, notify } from './capabilities'
+// 普通用户建应用（typesBlueprint.ts 是接口约定）
+import { blueprints, files, personal, templates } from './blueprints'
 
 // 请求层搬到了 http.ts（见那边的说明）。原先从这里导出的照旧从这里导出，调用方不用改；
 // 请求函数也一并转出，给不在 api/ 下、又想直接发请求的地方用。api/ 下的命名空间文件请直接从 http.ts 导入
@@ -865,6 +867,12 @@ export const api = {
   capabilities,
   endpoints,
   notify,
+
+  // ---- 普通用户建应用（typesBlueprint.ts 是接口约定） ----
+  blueprints,
+  templates,
+  files,
+  personal,
 }
 
 /**

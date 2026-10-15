@@ -27,16 +27,18 @@ from app.notify.core import Message, Outcome, host_of
 logger = logging.getLogger(__name__)
 
 #: 可以订阅的事件
-EVENTS = ("task.opened", "run.finished", "run.failed", "action.unknown")
+EVENTS = ("task.opened", "run.finished", "run.failed", "action.unknown", "review.done")
 EVENT_LABEL = {"task.opened": "有待办派给我", "run.finished": "实例完成", "run.failed": "实例失败",
-               "action.unknown": "写入结果未知"}
+               "action.unknown": "写入结果未知",
+               # 个人应用提交审核之后，搭建者发布了或退回了（docs/design/normal-user-apps.md N7）
+               "review.done": "我提交审核的应用有结果"}
 #: 这几种也是「有一条待办要你处理」，按 task.opened 的订阅推
 _AS = {"task.reassigned": "task.opened", "task.escalated": "task.opened", "task.reminded": "task.opened"}
 _TASK_HEAD = {"task.opened": "新的待办", "task.reassigned": "待办已改派给你", "task.escalated": "待办已超时，升级处理",
               "task.reminded": "待办催办"}
 _KIND_TEXT = {"approve": "审批", "input": "补充输入", "edit": "编辑稿件", "tool": "工具调用审批", "code": "代码执行审批",
               "dual_check": "双盲复算裁决", "action_confirm": "确认写入外部系统", "reconcile": "核实写入结果",
-              "signal": "等外部系统回调"}
+              "signal": "等外部系统回调", "review": "审核个人应用"}
 _ENV_TEXT = {"prod": "生产环境", "test": "测试环境", "simulated": "演练"}
 
 _background: set[asyncio.Task[Any]] = set()
@@ -182,7 +184,8 @@ async def notify_task(task_id: str, event: str, *, users: list[str]) -> int:
         where = await _where(session, run)
         pending = list((await session.execute(select(TaskAssignment).where(
             TaskAssignment.task_id == task_id, TaskAssignment.status == "pending"))).scalars())
-        node = _label(run.graph if run else None, task.node_id)
+        # 不挂在节点上的待办（个人应用的审核）用待办的标题：它按应用名起，不是按运行数据渲染的
+        node = _label(run.graph if run else None, task.node_id) if task.node_id else task.title[:80]
     names = "、".join(dict.fromkeys(a.principal or "任何人" for a in pending)) or "任何人"
     lines = [("状态", "待处理"), ("种类", _KIND_TEXT.get(task.kind, task.kind)), ("派给", names[:200])]
     if where:
@@ -218,6 +221,25 @@ async def notify_run(run_id: str, event: str) -> int:
                "subject": {"run_id": run_id, "app_id": run.app_id}}
     return await _push(channels, message, subject_kind="run", subject_id=run_id, event=event, run_id=run_id,
                        task_id=None)
+
+
+async def notify_review(task_id: str, decision: str, *, owner: str, name: str, app_id: str | None) -> int:
+    """个人应用提交审核有了结果（review.done，N7）：通知提交人——他自己订阅了这件事的个人渠道，加上订阅了它的全局渠道。
+    消息里只有应用名和结论，不放应用里的数（P4）。app_id 是链接过去的应用：发布了的是正式应用，退回的是他的个人应用。"""
+    event = "review.done"
+    async with SessionLocal() as session:
+        channels = await _channels(session, event, None, [owner])
+        if not channels:
+            return 0
+        base = await _base_url(session)
+    published = decision == "published"
+    message = {"event": event, "status": decision, "ok": published,
+               "title": f"提交审核的「{name[:80]}」{'已发布成正式应用' if published else '被退回'}",
+               "lines": [("结论", "已发布" if published else "已退回"), ("待办", f"#{task_id[:6]}")],
+               "links": [("去看看" if published else "查看我的应用", f"{base}/apps/{app_id}")] if base and app_id else [],
+               "subject": {"task_id": task_id, "app_id": app_id}}
+    return await _push(channels, message, subject_kind="task", subject_id=task_id, event=event, run_id=None,
+                       task_id=task_id)
 
 
 async def notify_action(action_id: str, event: str) -> int:

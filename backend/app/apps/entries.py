@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from app.apps.tree import entry_of, pins_by_alias, resolve_form
+from app.files import store as files_store
 
 #: 入口发起被拒时的机器码
 APP_GONE = "app_not_found"
@@ -112,12 +113,31 @@ async def start_entry(app_id: str, entry_id: str, values: dict[str, Any], princi
         form = resolve_form(spec, entry.get("form")) or {"type": "object", "properties": {}}
         if errors := validate_form(form, values if isinstance(values, dict) else None):
             raise FormRejected(errors)
+        # 表单里的文件（docs/design/normal-user-apps.md N9）：核对是提交人在这个入口传的、还没用过，先占住；表单值换成
+        # 登记的那一份引用（连同 sha256 进运行输入、随封存固定）。发起成功绑到这次运行，发起不成放回去
+        values, claimed = await _claim_files(form, values, principal, app.id, entry_id)
         inputs = map_inputs(entry, values, principal)
         title = render_title(entry, inputs)
-        return await launch_run(
-            session, workflow_id=pin["workflow_id"], run_class="formal", version=pin["version"],
-            expect_hash=pin["graph_hash"], input_payload=inputs, actor=getattr(principal, "username", None),
-            origin_kind=origin_kind, app_id=app.id, app_version=version.version,
-            origin={"entry": entry_id, "spec_hash": version.spec_hash, "title": title, "hook": hook, "hook_key": hook_key,
-                    "actor_verified": bool(getattr(principal, "verified", False)),
-                    "auth_mode": getattr(principal, "mode", "off")})
+        try:
+            run = await launch_run(
+                session, workflow_id=pin["workflow_id"], run_class="formal", version=pin["version"],
+                expect_hash=pin["graph_hash"], input_payload=inputs, actor=getattr(principal, "username", None),
+                origin_kind=origin_kind, app_id=app.id, app_version=version.version,
+                origin={"entry": entry_id, "spec_hash": version.spec_hash, "title": title, "hook": hook,
+                        "hook_key": hook_key, "actor_verified": bool(getattr(principal, "verified", False)),
+                        "auth_mode": getattr(principal, "mode", "off")})
+        except BaseException:
+            await files_store.release(claimed)
+            raise
+        await files_store.finish(claimed, run.id)
+        return run
+
+
+async def _claim_files(form: dict[str, Any], values: dict[str, Any], principal: Any, app_id: str,
+                       entry_id: str) -> tuple[dict[str, Any], Any]:
+    """占住表单里的文件；引用不对（不是自己传的、在别处传的、已经用过）按表单错误交回，落到那个字段上。"""
+    try:
+        return await files_store.claim(form, values, principal=principal,
+                                       context={"app_id": app_id, "entry": entry_id})
+    except files_store.FileRefused as e:
+        raise FormRejected([{"path": e.field or "", "code": files_store.FILE_ERROR_CODE, "message": e.message}]) from e

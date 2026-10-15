@@ -33,6 +33,11 @@ class App(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="active")  # active | archived
     created_by: Mapped[str | None] = mapped_column(String(100), default=None)
     updated_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    # 普通用户建应用（N7）：personal 是使用者自己的个人应用，只有拥有者看得见、永远跑探索运行、没有应用版本
+    scope: Mapped[str] = mapped_column(String(20), default="shared")  # shared | personal
+    owner: Mapped[str | None] = mapped_column(String(100), default=None)
+    # 出自哪个蓝图（共享应用经发布单生成、个人应用存蓝图时生成）
+    blueprint_id: Mapped[str | None] = mapped_column(String(32), default=None)
 
 
 class AppVersion(Base):

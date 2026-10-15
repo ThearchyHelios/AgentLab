@@ -2,6 +2,7 @@
 
 - 同步：主键是图里的工具名；同步得出的效果只说系统知道的（可写数据源为视参数而定，绑定端点的非 GET 为写入）；
   source_hash 没变不动；来源没了记 missing、不删行；
+- 平台能力的治理默认：没人治理过的一直跟着默认走，管理员改过的同步不动；
 - 治理：version 乐观锁、写审计；只读能力才能免审批；查询能力只能是同一端点上、绑定端点的只读能力；
 - 写记忆这类改平台自身状态的内置工具不记成只读（不能免审批、不能当查询能力），照旧能给 Agent 用；
 - is_platform_query：数据源查询，和绑定端点、声明了表格、治理后只读的 http 工具；Python 工具写了表格也不算；
@@ -19,6 +20,7 @@ from sqlalchemy import delete, select, update
 from app.capabilities import registry
 from app.db.base import SessionLocal
 from app.db.models import AuditEvent, Capability, CustomTool, DataSource, Endpoint, McpServer
+from app.records import RECORDS_APPEND, RECORDS_LOOKUP
 from app.tools.registry import ToolBuildError, ToolContext, Versions, build_tools
 from app.tools.trust import CONFIRM, EXEMPT, FORMAL_MARK, call_policy, run_snapshot
 from tests.fakes import auth_env
@@ -83,6 +85,26 @@ async def test_sync_derives_effects_and_only_touches_what_changed(world):
         await s.commit()
         assert await registry.sync_all(s) == 1
     assert (await _row("calc_py")).missing, "来源没了记 missing、不删行"
+
+
+async def test_platform_defaults_follow_until_governed(world):
+    """在平台默认写好之前就登记了的 records_append（不许无人值守、没有查询能力）：没人治理过的，同步时改回平台默认，
+    不然填报登记的每次提交都要等人确认、结果不明时没人核实；管理员治理过的，同步不再动它。"""
+    async with SessionLocal() as s:
+        await s.execute(update(Capability).where(Capability.name == RECORDS_APPEND)
+                        .values(unattended_write=False, lookup=None))
+        await s.commit()
+        assert await registry.sync_all(s) == 1
+    row = await _row(RECORDS_APPEND)
+    assert (row.unattended_write, row.lookup, row.version) == (True, RECORDS_LOOKUP, 1)
+
+    c = auth_env.client()
+    r = await c.put(f"/api/capabilities/{RECORDS_APPEND}/governance", json={"version": 1, "unattended_write": False})
+    assert r.status_code == 200, r.text
+    async with SessionLocal() as s:
+        assert await registry.sync_all(s) == 0, "管理员改过就听管理员的"
+    row = await _row(RECORDS_APPEND)
+    assert (row.unattended_write, row.lookup, row.version) == (False, RECORDS_LOOKUP, 2)
 
 
 async def test_governance_lock_audit_and_rules(world):

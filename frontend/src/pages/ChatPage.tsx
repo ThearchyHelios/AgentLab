@@ -17,9 +17,12 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { canLeave, leavePass } from '../lib/leave'
 import { formatNumber, formatTime } from '../lib/format'
-import { MAKE_APP_TEXT } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT } from '../lib/terms'
 import { useCatalog, useCatalogListState, useDatasources, useOnReconnect, type CatalogListState } from '../store/catalog'
 import { useAtLeast } from '../store/auth'
+import { useBlueprint } from '../store/blueprint'
+import type { BlueprintScope } from '../typesBlueprint'
+import { blueprintPath, useCreateScope } from './blueprints/shared'
 import {
   agentSteps, busyTurn, isBusy, stepsVisible, useChat, type Attempt, type ChatTurn, type Failure, type ScopeSource,
 } from '../store/chat'
@@ -198,6 +201,9 @@ export function ChatPage() {
 
   const streamTurns = useMemo(() => (turns ?? []).map(toStreamTurn), [turns])
   const lastId = turns?.[turns.length - 1]?.id
+  // 上一轮以助手反问收尾：输入框提示回答它（N11）
+  const lastTurn = turns?.[turns.length - 1]
+  const answering = !!lastTurn?.asked && (lastTurn.phase === 'done' || lastTurn.phase === 'ready')
   useLazyHydrate(currentId, turns)
 
   // 三种「没有轮次」要分开画：还在取、取失败、真的是空的。以前三者都是「问点什么」，
@@ -242,7 +248,7 @@ export function ChatPage() {
           stopLabel="停止这一轮"
           blocked={blocked}
           label="向数据提问"
-          placeholder="输入你的问题…"
+          placeholder={answering ? CHAT_BLUEPRINT_TEXT.answerPlaceholder : '输入你的问题…'}
           leading={picker}
         />
       </div>
@@ -379,11 +385,14 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     // 没核对上的不知道结局，用「未运行」那个空心点，不画成完成也不画成失败
     statusCode: turn.phase === 'cancelled' ? 'cancelled'
       : turn.phase === 'suspended' ? 'suspended'
+      // 助手反问：这一轮结束了，在等用户回答
+      : turn.asked && turn.phase === 'done' ? 'waiting'
       : turn.phase === 'ready' || turn.phase === 'unknown' ? 'idle'
       : undefined,
     tone: turn.phase === 'suspended' || turn.phase === 'unknown' ? 'warn' : undefined,
     // 进行中的写此刻在做什么；结束了的用全站统一的状态词
     status: live ? liveLine(turn)
+      : turn.asked && (turn.phase === 'done' || turn.phase === 'ready') ? CHAT_BLUEPRINT_TEXT.asked
       : turn.phase === 'checking' || turn.phase === 'suspended' || turn.phase === 'ready' || turn.phase === 'unknown'
         ? turn.status
         : undefined,
@@ -472,32 +481,29 @@ function lastSentence(text: string): string {
  * 是几十个请求换一堆没人看的步骤。所以默认只显示问题和答案，想看过程再取。
  */
 /**
- * 回答上的「做成应用」（A8）：从这次运行提取工作流（/copilot/from-run，只保留实际执行的步骤，新工作流记下来源），
- * 跳到画布去发布——应用只能固定已发布的版本；发布成功的提示里再点「做成应用」进入应用编辑。
- * 「在画布里打开」照旧在回答的流程图上
+ * 回答上的「做成应用」（docs/design/normal-user-apps.md §4.1）：带着这次运行建一个运行起点的蓝图（服务端按 from-run 提取，
+ * 只保留实际执行的步骤），直接进蓝图页——整理成卡片、用真数试一次、确认发布，不再跳画布的发布弹窗。搭建者建共享蓝图；
+ * 使用者在管理员开了个人应用时建个人蓝图。「在画布里打开」照旧在回答的流程图上
  */
-function MakeAppButton({ runId, conversationId, turnId }: { runId: string; conversationId: string; turnId: string | null }) {
+function MakeAppButton({ runId, scope }: { runId: string; scope: BlueprintScope }) {
   const navigate = useNavigate()
-  const refreshCatalog = useCatalog((s) => s.refresh)
   const [busy, setBusy] = useState(false)
   return (
-    <button className="btn btn-xs btn-ghost" disabled={busy} title={MAKE_APP_TEXT.hint} data-make-app=""
+    <button className="btn btn-xs btn-ghost" disabled={busy} data-make-app={scope}
+            title={scope === 'personal' ? CHAT_BLUEPRINT_TEXT.makeAppHintPersonal : CHAT_BLUEPRINT_TEXT.makeAppHint}
             onClick={async () => {
-              if (!(await canLeave('/studio/'))) return
               setBusy(true)
               try {
-                const res = await api.copilot.fromRun(runId, undefined, { conversation_id: conversationId, turn_id: turnId })
-                void refreshCatalog()
-                // 带 publish=1：画布载入这张图后直接打开发布弹窗，发布成功的提示里点「做成应用」
-                navigate(`/studio/${res.workflow_id}?publish=1`, leavePass())
-                toast.ok(MAKE_APP_TEXT.done)
+                const bp = await api.blueprints.create({ source: { kind: 'run', id: runId }, scope })
+                useBlueprint.getState().adopt(bp)
+                navigate(blueprintPath(bp.id))
               } catch (e) {
                 toast.error(e)
-              } finally {
                 setBusy(false)
               }
             }}>
-      {busy ? <Spinner size={11} /> : <LayoutGrid size={11} aria-hidden />} {busy ? MAKE_APP_TEXT.busy : MAKE_APP_TEXT.button}
+      {busy ? <Spinner size={11} /> : <LayoutGrid size={11} aria-hidden />}{' '}
+      {busy ? CHAT_BLUEPRINT_TEXT.makeAppBusy : CHAT_BLUEPRINT_TEXT.makeApp}
     </button>
   )
 }
@@ -512,15 +518,15 @@ function TurnExtras({ turnId, readOnly }: {
   const approvals = useCatalog((s) => s.approvals)
   const { reattach, runNow, toggleSteps } = useChat.getState()
   const busy = useChat((s) => (conversationId ? isBusy(s.byConversation[conversationId]) : false))
-  // 做成应用要去画布发布：只给搭建者以上（开了登录的使用者问数据时没有画布）
-  const builder = useAtLeast('builder')
+  // 做成应用进蓝图：搭建者建共享的；使用者在管理员开了个人应用时建个人的，都不是就没有这个按钮
+  const makeScope = useCreateScope()
   if (!turn || !conversationId) return null
   const runId = turn.run?.id
   const pending = runId ? approvals.filter((a) => a.run_id === runId && a.status === 'pending') : []
   const canSteps = !!turn.restored && !!runId && !BUSY.has(turn.phase)
   const scoped = !!turn.scope?.length
-  // 回答成功、有运行的轮次可以做成应用（A8）：先从这次运行提取工作流，在画布上发布后再做成应用
-  const canApp = !!runId && turn.phase === 'done' && !readOnly && builder
+  // 回答成功、有运行的轮次可以做成应用：带着这次运行进蓝图
+  const canApp = !!runId && turn.phase === 'done' && !readOnly && !!makeScope
 
   if (!pending.length && !turn.pendingRun && !canSteps && !scoped && !canApp) return null
   return (
@@ -549,7 +555,7 @@ function TurnExtras({ turnId, readOnly }: {
               {turn.steps === 'loading' ? '正在加载执行过程…' : stepsVisible(turn) ? '收起执行过程' : '查看执行过程'}
             </button>
           )}
-          {canApp && <MakeAppButton runId={runId!} conversationId={conversationId} turnId={turn.serverId} />}
+          {canApp && <MakeAppButton runId={runId!} scope={makeScope!} />}
         </div>
       )}
       {/* 通过了运行就接着跑：回收站里的会话左栏找不到，跑起来没人看着 */}

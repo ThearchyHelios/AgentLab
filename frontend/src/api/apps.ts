@@ -5,7 +5,7 @@
  * 入口提交校验失败回 422，ApiError 的 body 里带 {errors: FormError[]}。
  */
 import type {
-  AppBindings, AppDetail, AppGrant, AppHookRow, AppSpec, AppSummary, AppVersionRow, BackfillPlan, BackfillResult,
+  AppBindings, AppDetail, AppGrant, AppHookRow, AppList, AppSpec, AppSummary, AppVersionRow, BackfillPlan, BackfillResult,
   ComponentCatalog, Disposition, InstanceRow, LintIssue, PublishResult, ViewModel,
 } from '../typesApp'
 import type { ConversationDetail, EvidenceSegmentDetail } from '../types'
@@ -16,7 +16,7 @@ const hookAt = (id: string, name: string) => `${at(id)}/hooks/${encodeURICompone
 
 export const apps = {
   catalog: (opts?: RequestOptions) => get<ComponentCatalog>('/apps/catalog', opts),
-  list: (opts?: RequestOptions) => get<{ items: AppSummary[] }>('/apps', opts),
+  list: (opts?: RequestOptions) => get<AppList>('/apps', opts),
   get: (id: string, opts?: RequestOptions) => get<AppDetail>(at(id), opts),
   create: (body: { name: string; description?: string; spec?: AppSpec }) => post<AppDetail>('/apps', body),
   /** 从工作流版本确定性派生一份应用草稿（不落库），编辑器拿去预览 / 新建 */

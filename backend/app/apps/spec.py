@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 APP_FORMAT = "agentlab.app/1"
 FORM_FORMAT = "agentlab.form/1"
@@ -35,13 +35,21 @@ DISPOSITIONS = ("recompute", "dual", "incomparable")
 FORM_WIDGETS = (
     "text", "textarea", "number", "integer", "date", "datetime", "select", "radio", "multiselect", "checkbox",
     "principal", "note", "json",
+    # 文件（docs/design/normal-user-apps.md N9）：值是上传后拿回的引用 {file_id, name, size, sha256, type}，
+    # 字段 type 为 object，只有这个控件能用 object
+    "file",
 )
 #: 表单字段能用的 type
 FORM_TYPES = ("string", "number", "integer", "boolean", "array")
+#: 文件控件（x-widget: file）的字段类型：只有这个控件能用 object（apps/forms.py 按控件放行）
+FILE_FIELD_TYPE = "object"
+#: 文件引用的形状：上传后拿回、提交时原样带回
+FILE_REF_KEYS = ("file_id", "name", "size", "sha256", "type")
 #: 表单字段能用的 format。不支持 pattern：JS 和 Python 的正则语义不同，会出现前端放行、后端拒收
 FORM_FORMATS = ("date", "date-time", "email", "uri")
-#: 表单校验错误的 code
-FORM_ERROR_CODES = ("required", "type", "enum", "minimum", "maximum", "min_length", "max_length", "max_items", "format")
+#: 表单校验错误的 code。file：文件控件的值不对（没上传、不是本人传的、已经用过、类型或大小不符，app/files/store.py）
+FORM_ERROR_CODES = ("required", "type", "enum", "minimum", "maximum", "min_length", "max_length", "max_items", "format",
+                    "file")
 
 
 class _Strict(BaseModel):
@@ -49,12 +57,23 @@ class _Strict(BaseModel):
 
 
 class Pin(_Strict):
+    """一个钉住项。共享应用钉工作流版本；还没发布的（蓝图试运行时派生的草稿）version 为空，应用检查按
+    app.pin_unpublished 拦发布。个人应用（N7）没有工作流：写 blueprint（蓝图 id），version 为空，图在蓝图上。
+    workflow_id 和 blueprint 恰好写一个。"""
+
     alias: str
-    workflow_id: str
-    version: int
+    workflow_id: str | None = None
+    version: int | None = None
     graph_hash: str
     level: str | None = None
     use: Literal["view", "entry", "process"] = "view"
+    blueprint: str | None = None
+
+    @model_validator(mode="after")
+    def _one_target(self) -> Pin:
+        if (self.workflow_id is None) == (self.blueprint is None):
+            raise ValueError("固定版本要写 workflow_id 或 blueprint 其中一个")
+        return self
 
 
 class Slot(_Strict):
@@ -80,7 +99,8 @@ class Entry(_Strict):
 
 
 class ViewSource(_Strict):
-    kind: Literal["latest_sealed", "on_demand", "instance"]
+    # exploratory 只在个人应用里合法（N7）：取这个应用、这个拥有者、这张图下最近一次成功封存的探索运行
+    kind: Literal["latest_sealed", "on_demand", "instance", "exploratory"]
     pin: str | None = None
     # latest_sealed：schedule:<id> | formal
     from_: str | None = Field(default=None, alias="from")
@@ -104,6 +124,8 @@ class Component(_Strict):
     visible: str | None = None
     # 可见性表达式里 run / metric / input 指的是哪个视图
     scope: str | None = None
+    # 作者隐藏了它（N6）：解析时跳过，编辑状态下照常画成半透明。和可见性表达式不是一回事
+    hidden: bool = False
     children: list[Component] = Field(default_factory=list)
 
 

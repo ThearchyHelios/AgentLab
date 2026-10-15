@@ -18,8 +18,13 @@ from app.api import (
     actions as actions_api, apps as apps_api, auth as auth_api, capabilities as capabilities_api, hooks as hooks_api,
     identity as identity_api, ledger as ledger_api, notify as notify_api, tasks as tasks_api,
 )
+# 普通用户建应用（docs/design/normal-user-apps.md §3.10）：蓝图、模板、文件、个人应用。权限在接口里按蓝图的范围和拥有者判
+from app.api import (
+    blueprints as blueprints_api, copilot_blueprint, files as files_api, personal as personal_api,
+    templates as templates_api,
+)
 from app.api.coded import CodedHTTPException, coded_handler
-from app.api.deps import chat_scope, evidence_scope, require_role, role_by_method, run_scope
+from app.api.deps import chat_scope, evidence_scope, private_run_scope, require_role, role_by_method, run_scope
 from app.auth.middleware import AuthMiddleware
 from app.core.config import settings
 from app.db.base import init_db
@@ -103,6 +108,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     await _tasks.startup()
     await _actions.startup()
+    # 发布单：上次进程没了时还在执行的单改成停下（停在没做完的那一步、写明执行中断），这样能接着做
+    from app.blueprints import publish_plan as _plans
+
+    try:
+        if stopped := await _plans.startup():
+            logger.info("%d 份发布单执行中断，已改成停下，可以接着做", stopped)
+    except Exception:  # noqa: BLE001
+        logger.exception("发布单的启动整理失败，服务照常启动")
     from app.sandbox.manager import sandbox_manager as _sbm
 
     await _sbm.start_reaper()
@@ -183,11 +196,12 @@ for router, guard in (
     (workflows.router, _BUILDER),
     # 这几个也挂在 /api/runs 下面，要在 runs.router 之前登记：以后加的固定路径（/api/runs/compare 之类）
     # 才不会被 runs 的 /{run_id} 当成运行 id 吃掉。/{run_id}/… 的子路径放在哪边都不冲突。
-    # 运行对比、可验证报告、质询、假设分析交的是查询原文，只给 builder 及以上
-    (compare.router, _BUILDER),
-    (bundle.router, _BUILDER),
-    (inquiry.router, _BUILDER),
-    (whatif.router, _BUILDER),
+    # 运行对比、可验证报告、质询、假设分析交的是查询原文，只给 builder 及以上；别人的个人应用刷新、个人蓝图试运行只给
+    # 拥有者（private_run_scope），管理员也不例外
+    (compare.router, [*_BUILDER, private_run_scope]),
+    (bundle.router, [*_BUILDER, private_run_scope]),
+    (inquiry.router, [*_BUILDER, private_run_scope]),
+    (whatif.router, [*_BUILDER, private_run_scope]),
     (runs.router, [run_scope]),
     (runs.approvals_router, _BUILDER),
     (evidence.router, [evidence_scope]),
@@ -221,6 +235,13 @@ for router, guard in (
     (identity_api.directory_router, _BUILDER),
     # 能力登记、端点：搭建者只读，改动在接口里要管理员
     (capabilities_api.router, _BUILDER),
+    # 普通用户建应用：个人应用的接口共用 /api/apps 前缀，要在 apps_api 之前登记；蓝图助手共用 /api/copilot 前缀，
+    # 在接口里按蓝图的范围判（共享要 builder，个人要拥有者且开了 apps.user_personal_apps）
+    (personal_api.router, _USER),
+    (blueprints_api.router, _USER),
+    (templates_api.router, _USER),
+    (files_api.router, _USER),
+    (copilot_blueprint.router, _USER),
     # 应用、待办、生效记录、通知：各自按应用授权、派给谁再判断
     (apps_api.router, _USER),
     (tasks_api.router, _USER),

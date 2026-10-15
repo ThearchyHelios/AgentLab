@@ -449,8 +449,7 @@ async def publish_workflow(
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
-    if payload.level != "governed" and workflow.published_version and \
-            (await _published_levels(session, [workflow_id])).get(workflow_id) == "governed":
+    if await downgrades_governed(session, workflow, payload.level):
         # 把受管工作流降成已发布，之后的正式运行就不再过治理门禁：和以受管级别发布是同一级的决定（Q8）
         _require_admin("把受管工作流降为已发布")
 
@@ -466,49 +465,75 @@ async def publish_workflow(
     if not snapshot:
         raise HTTPException(404, f"不存在 v{version} 版本：画布上的修改还没有保存，请先保存再发布")
 
-    try:
-        spec = GraphSpec.model_validate(snapshot.graph)
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "issues": [{"level": "error", "message": f"无法解析工作流结构：{graph_error(e)}"}]}
+    issues = await gate_issues(session, snapshot.graph, payload.level)
+    if issues is None:
+        return {"ok": False, "issues": [{"level": "error", "message": _unparsed(snapshot.graph)}]}
+    if any(i["level"] == "error" for i in issues):
+        return {"ok": False, "level": payload.level, "version": version, "issues": issues}
+    return {**await commit_publish(session, workflow, snapshot, payload.level, actor_of(x_actor)),
+            "issues": issues}  # 剩下的都是警告
 
+
+async def downgrades_governed(session: AsyncSession, workflow: Workflow, level: str) -> bool:
+    """这次发布会不会把受管工作流降成已发布（Q8：只给管理员）。发布接口和发布单的预检共用。"""
+    return level != "governed" and bool(workflow.published_version) and \
+        (await _published_levels(session, [workflow.id])).get(workflow.id) == "governed"
+
+
+def _unparsed(graph: Any) -> str:
+    try:
+        GraphSpec.model_validate(graph)
+    except Exception as e:  # noqa: BLE001
+        return f"无法解析工作流结构：{graph_error(e)}"
+    return "无法解析工作流结构"
+
+
+async def gate_issues(session: AsyncSession, graph: Any, level: str) -> list[dict[str, Any]] | None:
+    """发布这张图会遇到的问题（validate + 门禁），只读：不改库、不发布。图不成形时为 None。
+    发布接口和发布单的预检（blueprints/publish_plan.py）共用，口径只有这一份。"""
+    try:
+        spec = GraphSpec.model_validate(graph)
+    except Exception:  # noqa: BLE001
+        return None
     checkers = await _sql_checkers(session, spec)
     providers = await _providers(session, spec)
     with with_subgraphs(await load_subgraphs(session, spec)):
-        issues = [i.model_dump() for i in publish_issues(spec, level=payload.level, checkers=checkers,
-                                                         providers=providers)]
-    if any(i["level"] == "error" for i in issues):
-        return {"ok": False, "level": payload.level, "version": version, "issues": issues}
+        return [i.model_dump() for i in publish_issues(spec, level=level, checkers=checkers, providers=providers)]
 
+
+async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: WorkflowVersion, level: str,
+                         actor: str | None) -> dict[str, Any]:
+    """把这一版立为正式版本并提交（调用方先过了 gate_issues、权限）。发布接口和发布单共用。"""
     # 发布时用到的能力的治理版本（F5）。在改这一版之前取：能力登记缺了的要另开会话同步、提交，这个会话手里不能先有写
     from app.capabilities.registry import capability_versions_for
     from app.db.base import utcnow
     from app.engine.launch import graph_tool_names
 
+    spec = GraphSpec.model_validate(snapshot.graph)
     capabilities = await capability_versions_for(session, graph_tool_names(snapshot.graph))
     if not snapshot.graph_hash:
         snapshot.graph_hash = graph_hash(snapshot.graph)
     # 级别记在这一版上：之后改画布（status 退回 draft），从这一版发起的正式运行照样按发布时的级别出具
-    snapshot.level = payload.level
+    snapshot.level = level
     # 发布时的目录版本也记在这一版上：重新发布同一版等于按现在的目录重新认可它，跟着更新
     snapshot.catalog_versions = await catalog_versions_for(session, spec)
     # 发布人、发布时间、用到的能力版本也记在这一版上（F5）：工作流上的 published_by 只记最近一次。退役过的版本重新
     # 发布等于重新认可它，退役信息清掉
     snapshot.published_at = utcnow()
-    snapshot.published_by = actor_of(x_actor)
+    snapshot.published_by = actor
     snapshot.capability_versions = capabilities
     snapshot.retired_at = snapshot.retired_by = snapshot.retire_note = None
-    workflow.status = payload.level
-    workflow.published_version = version
-    workflow.published_by = actor_of(x_actor)
+    workflow.status = level
+    workflow.published_version = snapshot.version
+    workflow.published_by = actor
     await session.commit()
     return {
         "ok": True,
-        "level": payload.level,
-        "version": version,
+        "level": level,
+        "version": snapshot.version,
         "graph_hash": snapshot.graph_hash,
         "published_by": workflow.published_by,
         "catalog_versions": recorded_versions(snapshot.catalog_versions),
-        "issues": issues,  # 剩下的都是警告
     }
 
 
@@ -595,19 +620,23 @@ async def publish_check(
 
     只读：不改库、不发布。发布弹窗一打开就调它，不用等点了发布才知道被拦。
     """
+    return await check_graph(session, await _draft(session, workflow_id, payload), payload.level)
+
+
+async def check_graph(session: AsyncSession, graph: Any, level: str) -> dict[str, Any]:
+    """发布前检查的本体：问题加上能怎么修（每条问题带 fix 的种类 auto / choice / assist）。只读。
+    发布前检查接口和发布单的预检共用（发布单按修复的种类把问题分给「你来定」「助手可以修」）。"""
     from app.engine.autofix import check
 
-    graph = await _draft(session, workflow_id, payload)
     try:
         spec = GraphSpec.model_validate(graph)
     except Exception as e:  # noqa: BLE001
-        return _unreadable(payload.level, e)
+        return _unreadable(level, e)
     versions, cards = await _gate_context(session, spec)
     checkers = await _sql_checkers(session, spec)
     providers = await _providers(session, spec)
     with with_subgraphs(await load_subgraphs(session, spec)):
-        return check(spec, level=payload.level, versions=versions, cards=cards, checkers=checkers,
-                     providers=providers)
+        return check(spec, level=level, versions=versions, cards=cards, checkers=checkers, providers=providers)
 
 
 @router.post("/{workflow_id}/autofix")

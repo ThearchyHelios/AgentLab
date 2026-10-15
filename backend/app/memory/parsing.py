@@ -185,8 +185,11 @@ def _from_html(raw: bytes) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def extract(raw: bytes, filename: str, mime: str = "") -> str:
-    """文件字节 → 文本。认不出就按 UTF-8 文本试。"""
+def extract(raw: bytes, filename: str, mime: str = "", *, tables: bool = False) -> str:
+    """文件字节 → 文本。认不出就按 UTF-8 文本试。
+
+    tables：表格也转成文字（CSV、TSV 原样，xlsx 逐个工作表按行列出）。知识库不收表格（见 _TABULAR），不传它；
+    运行时把上传的附件交给 agent 读（files/text.py 的 file_text，docs/design/normal-user-apps.md N9）传 True。"""
     ext = _ext(filename)
     if ext in _PDF or mime == "application/pdf":
         return _from_pdf(raw)
@@ -196,6 +199,10 @@ def extract(raw: bytes, filename: str, mime: str = "") -> str:
         return _from_pptx(raw)
     if ext in _HTML or mime == "text/html":
         return _from_html(raw)
+    if tables and ext in (".csv", ".tsv"):
+        return _from_text_table(raw, filename)
+    if tables and ext == ".xlsx":
+        return _from_xlsx(raw, filename)
     if ext in _TABULAR:
         raise UnsupportedDocument(
             f"「{filename}」是表格，知识库不接收表格。请到「数据」页的「表格」中点击「上传表格」导入："
@@ -216,3 +223,40 @@ def extract(raw: bytes, filename: str, mime: str = "") -> str:
             f"无法读取 {filename or '该文件'}：它不是 UTF-8 文本，"
             f"也不是可识别的 PDF / Word / PowerPoint / HTML。"
         ) from e
+
+
+def _from_text_table(raw: bytes, filename: str) -> str:
+    """CSV / TSV 原样当文字。国内导出的 CSV 常是 GBK，UTF-8 解不开就按 GB18030 试。"""
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise UnsupportedDocument(f"无法读取 {filename}：既不是 UTF-8 也不是 GBK 编码的文字")
+
+
+def _from_xlsx(raw: bytes, filename: str) -> str:
+    """xlsx 逐个工作表按行列出，单元格之间用制表符。只读取值（公式取上次计算的结果），隐藏的工作表也列出、标明隐藏。"""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as e:  # pragma: no cover - openpyxl 在核心依赖里
+        raise UnsupportedDocument("读取 Excel 需要 openpyxl") from e
+    try:
+        book = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception as e:  # noqa: BLE001 - 解析库的各种异常一律照实说读不开
+        raise UnsupportedDocument(f"无法读取 {filename}：{_why(e)}") from e
+    parts: list[str] = []
+    try:
+        for sheet in book.worksheets:
+            hidden = "（隐藏）" if getattr(sheet, "sheet_state", "visible") != "visible" else ""
+            lines = []
+            for row in sheet.iter_rows(values_only=True):
+                cells = ["" if v is None else str(v) for v in row]
+                while cells and not cells[-1]:
+                    cells.pop()
+                if cells:
+                    lines.append("\t".join(cells))
+            parts.append(f"## 工作表 {sheet.title}{hidden}\n" + "\n".join(lines))
+    finally:
+        book.close()
+    return "\n\n".join(parts)

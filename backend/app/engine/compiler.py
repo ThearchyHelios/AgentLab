@@ -11,6 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError, RunContext
+from app.engine.expressions import open_template_scope, template_scope
 from app.engine.nodes import (
     challenge, control, dual_check, human, io, knowledge, llm, merge, metrics, multi, report, tools,
 )
@@ -83,7 +84,9 @@ def _wrap(
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                updates = await runner(state, ctx)
+                # 模板函数（file_text）要知道在哪次运行、哪个节点：执行期间设好（engine/expressions.template_scope）
+                with template_scope(await open_template_scope(ctx)):
+                    updates = await runner(state, ctx)
                 elapsed = int((time.perf_counter() - started) * 1000)
 
                 # 完整输出落工件库。事件里只放截断预览是给画布看的；

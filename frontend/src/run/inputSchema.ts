@@ -4,8 +4,11 @@
  * 正式运行的表单由服务端转好放在版本详情里（VersionDetailOut.input_schema，服务端 app/apps/forms.input_schema）；
  * 画布试运行用的是画布上还没保存的入口字段，只能在这里按同一套规则转：没写类型的按文本，可选值变成下拉，
  * 说明、默认值照搬。两处规则对不上时以服务端为准——发起时服务端照版本快照校验，这里只决定怎么画。
+ *
+ * 文件字段（normal-user-apps N9）：输入节点的字段写 type: file，转成 type 为 object、x-widget 为 file 的字段，允许的类型
+ * 和大小（accept、max_mb）进 x-file。值是上传后拿回的引用，没上传的不传。
  */
-import type { FormField, FormSchema } from '../typesApp'
+import type { FileLimits, FormField, FormSchema } from '../typesApp'
 
 /** 输入节点的一个字段（canvas/nodeDefs 的 ioFields；type / enum / format / 上下限是应用平台新加的，老图没有） */
 export interface InputField {
@@ -14,12 +17,27 @@ export interface InputField {
   description?: string
   default?: unknown
   example?: unknown
-  type?: FormField['type']
+  /** file：文件（上传后拿回的引用）；表单里的 object 只给文件控件，输入节点上写 file */
+  type?: Exclude<FormField['type'], 'object'> | 'file'
   enum?: (string | number)[]
   format?: FormField['format']
   /** 数字类型的上下限（闭区间，表单子集没有 exclusiveMinimum：「大于 0」的金额写 0.01） */
   minimum?: number
   maximum?: number
+  /** 文件字段：允许的类型（MIME 或扩展名）、大小上限（MB） */
+  accept?: string[]
+  max_mb?: number
+}
+
+/** 文件字段：type 为 object、x-widget 为 file，限制进 x-file（同服务端 apps/forms.input_schema） */
+function fileField(f: InputField): FormField {
+  const limits: FileLimits = {}
+  if (Array.isArray(f.accept) && f.accept.length) limits.accept = f.accept.filter((a) => typeof a === 'string' && a)
+  if (typeof f.max_mb === 'number' && Number.isFinite(f.max_mb) && f.max_mb > 0) limits.max_mb = f.max_mb
+  const field: FormField = { type: 'object', title: f.name, 'x-widget': 'file' }
+  if (f.description) field.description = f.description
+  if (Object.keys(limits).length) field['x-file'] = limits
+  return field
 }
 
 const TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array'])
@@ -30,7 +48,12 @@ export function inputSchemaOf(fields: InputField[]): FormSchema {
   const required: string[] = []
   for (const f of fields) {
     if (!f?.name) continue
-    const type = f.type && TYPES.has(f.type) ? f.type : 'string'
+    if (f.type === 'file') {
+      properties[f.name] = fileField(f)
+      if (f.required) required.push(f.name)
+      continue
+    }
+    const type = f.type && TYPES.has(f.type) ? f.type as Exclude<FormField['type'], 'object'> : 'string'
     const options = Array.isArray(f.enum) && f.enum.length ? f.enum : null
     const field: FormField = { type, title: f.name }
     if (f.description) field.description = f.description
@@ -65,6 +88,10 @@ export function inputPayload(schema: FormSchema, values: Record<string, unknown>
     const typed = values[name]
     const blank = typed == null || (typeof typed === 'string' && typed.trim() === '')
     if (blank && field.default == null && (field.type === 'number' || field.type === 'integer')) continue // 没填的数字不传，不传空串
+    if (field['x-widget'] === 'file') { // 文件：上传后拿回的引用原样传，没上传的不传
+      if (!blank) payload[name] = typed
+      continue
+    }
     const raw = blank ? field.default ?? (field.type === 'array' ? [] : field.type === 'boolean' ? false : '') : typed
     if (field.type === 'string' && !field.enum && typeof raw === 'string' && /^\s*[[{]/.test(raw)) {
       try { payload[name] = JSON.parse(raw) } catch { payload[name] = raw }

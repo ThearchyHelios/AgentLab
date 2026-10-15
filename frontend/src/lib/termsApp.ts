@@ -65,7 +65,7 @@ export const APP_HOME_TEXT = {
   taskNotFound: '待办不存在，所属的运行可能已被删除',
 }
 
-/** 待办的种类：看中断内容里的 kind，不看 mode（§3.7） */
+/** 待办的种类：看中断内容里的 kind，不看 mode（§3.7）。review 是个人应用提交审核（docs/design/normal-user-apps.md N7） */
 export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   approve: '人工审批',
   input: '补充输入',
@@ -76,6 +76,7 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   action_confirm: '动作确认',
   reconcile: '核实结果',
   signal: '等待外部系统',
+  review: '审核个人应用',
 }
 
 export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
@@ -455,4 +456,213 @@ export const PUBLISH_ROLE_TEXT = {
   downgradeTitle: (name: string) => `以「已发布」等级发布「${name}」？`,
   downgradeConsequences: ['当前为受管工作流，发布后降为已发布', '此后从这一版发起的正式运行不再受治理门禁约束'],
   downgradeConfirm: '降级并发布',
+}
+
+// ---------------------------------------------------------------------------
+// 普通用户建应用（docs/design/normal-user-apps.md §4.5–§4.7）：页面上直接改、文件控件、记录列表、个人应用。
+// 蓝图、模板、试运行、发布摘要的说法在 termsBlueprint.ts
+// ---------------------------------------------------------------------------
+
+/** 应用页上直接改（N6）：编辑层、小工具条、加一张数据卡片、发布 */
+export const PAGE_EDIT_TEXT = {
+  edit: '编辑',
+  editHint: '在页面上直接改文字、隐藏组件、调整顺序；改动自动存为草稿，发布后使用者才看得到',
+  done: '完成编辑',
+  editing: '编辑中',
+  pickHint: '点选页面上的组件进行修改。改动自动存为草稿，按草稿重新显示；发布之前，使用者看到的还是当前发布版。',
+  saving: '正在保存…',
+  saved: '已存为草稿',
+  saveFailed: '草稿保存失败，页面已恢复为上一次保存的样子',
+  unpublished: '有未发布的改动',
+  neverPublished: '这个应用还没有发布',
+  draftSameAsPublished: '草稿和当前发布版一致',
+  publish: '发布',
+  publishing: '正在发布…',
+  publishTitle: '发布这些改动？',
+  publishConsequences: ['按现在的草稿生成新的应用版本，使用者打开时看到改过的样子', '只改页面呈现，不改工作流，也不发起运行'],
+  publishConfirm: '发布',
+  published: (v: number) => `已发布应用版本 v${v}`,
+  publishBlocked: '发布前检查没有通过，需要先处理这些问题：',
+  openCheck: '到应用编辑器处理',
+  openEditor: '应用编辑器',
+  openEditorHint: '入口、表单、岗位和授权在应用编辑器里改',
+  changeData: '改取数',
+  changeDataHint: '取数逻辑在蓝图里改：改完要用真数再试一次，口径变了还要说清以前的数怎么处理',
+  personalNoPublish: '个人应用没有发布这一步：改动保存后直接生效',
+  // ---- 小工具条
+  toolbar: (label: string) => `「${label}」的操作`,
+  editText: '修改文字',
+  editTextTitle: (label: string) => `修改「${label}」的文字`,
+  editTextHint: '只改组件上显示的文字，不改它的数据来源',
+  noText: '这个组件没有可改的文字',
+  saveText: '保存文字',
+  hide: '隐藏',
+  unhide: '取消隐藏',
+  hiddenTag: '已隐藏',
+  hiddenHint: '作者隐藏了它：使用者看不到。可见性条件是按运行情况决定显示与否，隐藏是不要它',
+  moveUp: '上移',
+  moveDown: '下移',
+  remove: '删除',
+  removeTitle: (label: string) => `删除「${label}」？`,
+  removeConsequences: ['从草稿里删掉这个组件，发布后使用者不再看到它', '数据来源不受影响，以后可以用「加一张数据卡片」再加回来'],
+  removeConfirm: '删除组件',
+  /** 草稿里隐藏了、页面上没有画出来的组件：列在页底，可以取消隐藏 */
+  hiddenElsewhere: (n: number) => `这一页还有 ${n} 个隐藏的组件没有显示出来：`,
+  // ---- 加一张数据卡片
+  addCard: '加一张数据卡片',
+  addCardHint: '从这个应用固定版本的结果里挑：口径卡的指标、报告、明细或趋势',
+  candidatesLoading: '正在列出可加的数据卡片…',
+  candidatesEmpty: '没有可加的数据卡片：固定版本里没有口径卡、报告、取数结果或趋势',
+  candidateKinds: { metric: '口径卡指标', report: '报告', table: '明细', series: '趋势' } as Record<string, string>,
+  addThis: '加上',
+  added: (label: string) => `已加上「${label}」`,
+  close: '关闭',
+  /** 应用编辑器属性面板里的「隐藏」开关 */
+  hiddenSwitch: '隐藏这个组件',
+}
+
+/** 文件控件（N9）：拖放或点选，先上传拿引用，再随表单提交 */
+export const FILE_TEXT = {
+  drop: '把文件拖到这里，或点击选择',
+  dropNow: '松开即上传',
+  choose: '选择文件',
+  sending: '正在上传',
+  sent: '上传完成，正在等服务端核对',
+  cancel: '取消上传',
+  cancelled: '已取消上传',
+  remove: '移除',
+  replace: '换一个文件',
+  download: '下载',
+  types: (list: string) => `允许的类型：${list}`,
+  maxSize: (mb: number) => `单个文件不超过 ${mb} MB`,
+  serverChecks: '类型和大小由服务端核对',
+  tooLarge: (name: string, mb: number) => `「${name}」超过 ${mb} MB，不能上传`,
+  badType: (name: string, list: string) => `「${name}」的类型不在允许范围内，允许：${list}`,
+  failed: (name: string, reason: string) => `「${name}」上传失败：${reason}`,
+  noContext: '这里不能上传文件：只有应用的入口、待办和蓝图的试运行能带文件',
+  whoCanDownload: '能看到这次提交的人都能下载附件',
+  /** 值不是上传后拿回的引用（前后端同一条：必填，形状是文件引用） */
+  invalid: '请上传文件',
+  empty: '未上传',
+  // ---- 运行详情里读入附件的一行（file.extracted，服务端 files/text.py 的模板函数 file_text）。数由调用方按千分位写好 ----
+  extracted: (name: string, chars: string | null) => {
+    const what = name ? `读入附件「${name}」` : '读入附件'
+    return chars == null ? what : `${what}${name ? '' : ' '}${chars} 字`
+  },
+  extractedAll: (total: string) => `全文 ${total} 字，已全部读入`,
+  extractedCut: (chars: string, total: string) => `全文 ${total} 字，只读入了前 ${chars} 字，其余没有读入`,
+  extractFailed: (name: string) => (name ? `附件「${name}」抽不出文字` : '附件抽不出文字'),
+  typeLabels: {
+    'application/pdf': 'PDF', 'application/msword': 'Word', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'Word',
+    'application/vnd.ms-excel': 'Excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'Excel',
+    'text/csv': 'CSV', 'text/plain': '纯文本', 'image/png': 'PNG 图片', 'image/jpeg': 'JPG 图片',
+  } as Record<string, string>,
+}
+
+/** 记录列表 records_list（N8）：使用者只看自己的，观察者、管理者看全部 */
+export const RECORDS_TEXT = {
+  mine: '我的记录',
+  all: '全部记录',
+  mineHint: '只显示你自己提交的记录',
+  allHint: '你能查看这个应用的全部记录，包括别人提交的',
+  filter: '筛选',
+  filterPlaceholder: '按内容或提交人筛选',
+  sort: '排序',
+  newest: '最新的在前',
+  oldest: '最早的在前',
+  empty: '还没有记录',
+  emptyMine: '你还没有提交过记录',
+  emptyFiltered: '没有符合筛选条件的记录',
+  count: (shown: number, total: number) => (shown === total ? `${total} 条` : `${shown} / ${total} 条`),
+  seq: (n: number) => `第 ${n} 条`,
+  by: (who: string) => `由「${who}」提交`,
+  expand: '展开全部字段',
+  collapse: '收起',
+  corrected: '已更正',
+  correctedHint: '这条是对之前一次提交的更正，原来的那条保留在更正历史里',
+  superseded: '已被更正',
+  history: '更正历史',
+  hideHistory: '收起更正历史',
+  historyLoading: '正在读取更正历史…',
+  historyEmpty: '没有找到更正前的记录',
+  historyItem: (n: number, at: string) => `第 ${n} 条 · ${at}`,
+  attachment: '附件',
+  version: (v: number) => `表版本 v${v}`,
+  more: '加载更多',
+  reload: '重新读取',
+  tableMissing: '这个应用还没有记录表：发布之后、有人提交过才会有记录',
+  preview: '按草稿预览：这里不列真实的记录，发布之后按看的人列出',
+  yes: '是',
+  no: '否',
+}
+
+/** 个人应用（N7）：使用者自己建、只有自己看得见、永远是探索 */
+export const PERSONAL_TEXT = {
+  group: '我的应用',
+  groupHint: '你自己建的个人应用，只有你看得见',
+  sharedGroup: '共享的应用',
+  badge: '个人',
+  badgeHint: '个人应用：只有你看得见，数据来自你自己发起的探索运行，未经发布审核',
+  banner: '这是你的个人应用：只有你看得见，结果按你的权限遮罩。数据来自你自己发起的探索运行，未经发布审核，不是正式结果。',
+  refresh: '刷新',
+  refreshLeft: (n: number) => `今天还剩 ${n} 次`,
+  refreshLimitHint: '每天能刷新的次数有上限，由管理员设置',
+  refreshUsedUp: '今天的刷新次数已用完，明天再来',
+  refreshing: '正在刷新…',
+  refreshed: (n: number) => `已发起刷新，完成后自动更新。今天还剩 ${n} 次`,
+  submitReview: '提交审核',
+  submitReviewHint: '想给别人用：交给一位搭建者或一个组审核，审核通过后由搭建者发布成正式应用',
+  reviewTitle: '提交审核',
+  reviewIntro: '搭建者会在一份副本上用真数试运行、再发布成正式应用，你的个人应用不会被改动。发布后会通知你，个人应用留不留由你决定。',
+  reviewTo: '交给谁审核',
+  reviewToHint: '选一位搭建者，或者一个组（组里任一人都能处理）',
+  reviewNote: '说明（选填）',
+  reviewNotePlaceholder: '这个应用解决什么问题、给谁用',
+  reviewSubmit: '提交审核',
+  reviewPick: '请先选择交给谁审核',
+  reviewSent: '已提交审核',
+  cancel: '取消',
+  inReview: '审核中',
+  inReviewTo: (names: string) => `已提交给 ${names} 审核，等待处理`,
+  inReviewPlain: '已提交审核，等待搭建者处理',
+  formal: '已有正式版本',
+  formalGo: '去看看',
+  rejected: '上次的审核已退回，可以改好后再提交',
+  rejectedNote: (note: string) => `上次的审核已退回：${note}`,
+  graphChanged: '蓝图在存成个人应用之后又改过：刷新按存下的那一版运行，要用改过的，请回到蓝图重新存成你的应用。',
+  graphChangedGo: '回到蓝图',
+  switchedOff: '管理员关闭了「使用者可以建个人应用」：已有的结果还能看，暂时不能刷新、提交审核',
+  // ---- 管理员看别人的个人应用：只有名称、拥有者、时间，可以归档，看不到内容
+  othersGroup: '使用者的个人应用',
+  othersGroupHint: '使用者自己建的个人应用。管理员只看得到名称、拥有者和时间，可以归档，看不到页面、运行和蓝图的内容',
+  owner: (who: string) => `拥有者：${who}`,
+  ownerUnknown: '拥有者未记录',
+  createdAt: (t: string) => `创建于 ${t}`,
+  updatedAt: (t: string) => `更新于 ${t}`,
+  stubTitle: (who: string) => `这是 ${who} 的个人应用`,
+  stubBody: '个人应用只有拥有者看得见。管理员看得到名称、拥有者和时间，可以归档，但看不到页面、运行和蓝图的内容。',
+  archive: '归档',
+  archiveTitle: (name: string) => `归档「${name}」？`,
+  archiveConsequences: [
+    '拥有者的应用列表里不再列出它，不能再刷新或提交审核',
+    '它的蓝图和以前的刷新记录照常保留，你看不到它们的内容',
+    '目前没有恢复的操作',
+  ],
+  archiveConfirm: '归档个人应用',
+  archiveDone: (name: string) => `已归档「${name}」`,
+}
+
+/** 审核待办（个人应用提交审核，N7）：处理人在待办里取一份共享副本，在副本上试运行、走发布单；不发布就退回 */
+export const REVIEW_TASK_TEXT = {
+  intro: '使用者把自己的个人应用交给你审核。同意不在这里点：取一份共享副本，在副本上用真数试一次、走发布单，发布之后这条待办自动记为已发布；原来的个人应用不会被改动。',
+  submittedBy: (who: string) => `提交人：${who}`,
+  purpose: '目的',
+  note: '提交说明',
+  copy: '取副本，去发布',
+  copying: '正在取副本…',
+  openCopy: '打开我的副本',
+  reject: '退回',
+  rejectHint: '不发布就退回：提交人会收到通知，他的个人应用照常可用',
+  rejectNote: '退回的原因（选填）',
+  rejected: '已退回',
 }

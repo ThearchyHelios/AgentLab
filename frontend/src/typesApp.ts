@@ -21,6 +21,11 @@ export interface Principal {
   verified: boolean
   /** 开登录后 user 角色能不能问数据（Q2，管理员开关） */
   user_can_chat?: boolean
+  /**
+   * 管理员开没开「使用者可以建个人应用」（设置 apps.user_personal_apps，docs/design/normal-user-apps.md N7）。使用者读不到
+   * 设置，开关随认人、登录接口一起给（服务端 api/auth.principal_full）；老服务端不给时按关
+   */
+  user_personal_apps?: boolean
 }
 
 export interface UserRow {
@@ -67,9 +72,18 @@ export interface AuditRow {
 export type FormWidget =
   | 'text' | 'textarea' | 'number' | 'integer' | 'date' | 'datetime' | 'select' | 'radio' | 'multiselect'
   | 'checkbox' | 'principal' | 'note' | 'json'
+  /** 文件（N9）：字段 type 为 object，值是上传后拿回的引用 FileRef（typesBlueprint.ts） */
+  | 'file'
+
+/** 文件控件的限制（x-file，服务端 apps/forms._file_field_problems）：可选的类型（扩展名或 MIME）、大小上限（MB） */
+export interface FileLimits {
+  accept?: string[]
+  max_mb?: number
+}
 
 export interface FormField {
-  type: 'string' | 'number' | 'integer' | 'boolean' | 'array'
+  /** object 只有文件控件能用（x-widget 为 file，服务端 apps/spec.FILE_FIELD_TYPE），值是 FileRef */
+  type: 'string' | 'number' | 'integer' | 'boolean' | 'array' | 'object'
   title?: string
   description?: string
   default?: unknown
@@ -84,6 +98,8 @@ export interface FormField {
   format?: 'date' | 'date-time' | 'email' | 'uri'
   items?: { type: 'string'; enum?: string[] }
   'x-widget'?: FormWidget
+  /** 文件控件的限制，只配 x-widget: file */
+  'x-file'?: FileLimits
 }
 
 export interface FormSchema {
@@ -95,10 +111,13 @@ export interface FormSchema {
   'x-order'?: string[]
 }
 
-/** 前后端同一种错误格式 */
+/**
+ * 前后端同一种错误格式（服务端 apps/spec.FORM_ERROR_CODES）。file：文件控件的值不是上传后拿回的引用、类型或大小不合
+ * x-file 的限制，或提交时核对引用没过（不是这个人传的、已经用过）
+ */
 export interface FormError {
   path: string
-  code: 'required' | 'type' | 'enum' | 'minimum' | 'maximum' | 'min_length' | 'max_length' | 'max_items' | 'format'
+  code: 'required' | 'type' | 'enum' | 'minimum' | 'maximum' | 'min_length' | 'max_length' | 'max_items' | 'format' | 'file'
   message: string
 }
 
@@ -111,11 +130,14 @@ export type Disposition = 'recompute' | 'dual' | 'incomparable'
 
 export interface AppPin {
   alias: string
-  workflow_id: string
-  version: number
+  /** 共享应用钉工作流版本；个人应用（docs/design/normal-user-apps.md N7）写 blueprint，workflow_id 为空 */
+  workflow_id: string | null
+  /** 还没发布（蓝图试运行时派生的草稿）、或个人应用时为空 */
+  version: number | null
   graph_hash: string
   level?: string | null
   use: PinUse
+  blueprint?: string | null
 }
 
 export interface AppEntry {
@@ -128,7 +150,8 @@ export interface AppEntry {
 }
 
 export interface AppViewSource {
-  kind: 'latest_sealed' | 'on_demand' | 'instance'
+  /** exploratory 只在个人应用里合法：最近一次成功封存的探索运行（N7） */
+  kind: 'latest_sealed' | 'on_demand' | 'instance' | 'exploratory'
   pin?: string | null
   from?: string | null
   params?: FormSchema | { $ref: string } | null
@@ -146,6 +169,8 @@ export interface AppComponent {
   bind?: AppBinding | null
   visible?: string | null
   scope?: string | null
+  /** 作者隐藏了它（N6）：解析时跳过，编辑状态下画成半透明 */
+  hidden?: boolean
   children?: AppComponent[]
 }
 
@@ -185,6 +210,10 @@ export interface CatalogComponent {
   version: number
   children: boolean
   bindings: string[]
+  /**
+   * 属性的 JSON Schema（服务端 apps/catalog.py）。给人看的文字标了 `x-text: true`（页面编辑「改文字」只列这几项，N6）；
+   * 写给解析器的字符串（列名、换算）不标。注解不参与校验
+   */
   props: Record<string, any>
 }
 
@@ -213,9 +242,26 @@ export interface AppSummary {
   needs_upgrade: boolean
   /** 当前用户在这个应用里的待办数 */
   pending_tasks: number
-  /** 当前用户的授权（关登录时为 manage） */
+  /**
+   * 当前用户的授权（关登录时为 manage）。为 null 的只有一种：开了登录的管理员看别人的个人应用（服务端 api/apps._personal_stub，
+   * 列表、详情、归档的回包同一份）——只有名称、拥有者、状态、创建和更新时间，能归档；说明、页面、运行、蓝图一概不给（N7）
+   */
   my_role: GrantRole | null
+  created_at: string | null
   updated_at: string
+  /** 个人应用（N7）：只有拥有者看得见、跑探索运行；老服务端不给时按 shared */
+  scope?: 'shared' | 'personal'
+  owner?: string | null
+  blueprint_id?: string | null
+}
+
+/**
+ * GET /api/apps（scope=shared|personal 只列那一种）：items 是这个人看得到的应用；can_create 是他能建哪种应用（共享要搭建者及
+ * 以上，个人看管理员的开关），和认人接口的 user_personal_apps 出自同一条规则（服务端 blueprints/personal.allowed）
+ */
+export interface AppList {
+  items: AppSummary[]
+  can_create: { shared: boolean; personal: boolean }
 }
 
 export interface AppDetail extends AppSummary {
@@ -227,6 +273,47 @@ export interface AppDetail extends AppSummary {
   published?: { version: number; pages: { id: string; title: string }[]; entries: { id: string; label: string }[] } | null
   /** 能按新口径补算的视图（只在 manage 取详情时算，D-f） */
   backfill?: BackfillPlan[]
+  /** 个人应用给拥有者的那一块（服务端 blueprints/personal.personal_state）：只在拥有者取个人应用的详情时给 */
+  personal?: PersonalState
+  /**
+   * 草稿（连同岗位绑定）和当前发布版是否一致（服务端 api/apps._draft_changed，按发布时的规整方式比，normal-user-apps N6）。
+   * 只给 manage，而且只在有发布版、发布版规整得了时给；没给的是不知道：界面只在这一次改过之后说「有未发布的改动」，
+   * 不在浏览器里逐项比
+   */
+  draft_changed?: boolean
+}
+
+/**
+ * 个人应用的状态（N7、§4.6）：能不能刷新、提交审核，今天还能刷新几次（和按需视图共用每日上限，按人计）、蓝图改过没有、
+ * 审核到哪了。blueprint_status 同 typesBlueprint.BlueprintStatus；蓝图被删了为 null
+ */
+export interface PersonalState {
+  /**
+   * 这个人现在能不能刷新、提交审核（服务端 blueprints/personal.allowed：开了登录的搭建者及以上随时能，使用者和关登录时看
+   * 管理员的开关）。为假时个人应用照样看得到，按钮置灰
+   */
+  allowed: boolean
+  remaining_today: number
+  daily_limit: number
+  blueprint_status: import('./typesBlueprint').BlueprintStatus | null
+  /** 蓝图在存成个人应用之后又改过（图的哈希对不上）：刷新按存下的那一版跑，要用改过的得回蓝图重新存 */
+  graph_changed: boolean
+  /** 最近一条审核待办；没提交过审核为 null */
+  review: PersonalReview | null
+}
+
+/** 个人应用最近一条审核待办：status 是待办的状态，decision 是结论（published 搭建者发布了副本，reject 退回） */
+export interface PersonalReview {
+  task_id: string
+  status: TaskStatus
+  decision: 'published' | 'reject' | null
+  /** 退回的原因（没写为空串） */
+  note: string
+  /** 发布出来的正式应用（decision=published 时）；别的时候为 null */
+  app_id: string | null
+  /** 派给了谁（没撤回的那几份） */
+  to: { kind: TaskAssignment['principal_kind']; name: string }[]
+  resolved_at: string | null
 }
 
 /** 按新口径补算会发起几次（GET /api/apps/{id}/views/{view}/backfill，不发起运行） */
@@ -301,13 +388,15 @@ export interface Stamp {
   tier_text: string
   from: string
   sealed: boolean
+  /** 蓝图的试运行（N4）：来源写「试运行」、说明里写这不是正式结果。不是试运行时不给 */
+  trial?: boolean
   /** 照实标出的错位：定时任务已改跑新版本、应用还钉在旧版本，等 */
   notes?: string[]
 }
 
 export interface ViewSourceState {
-  /** 来源的种类：按需视图（on_demand）才有「刷新」 */
-  kind?: 'latest_sealed' | 'on_demand' | 'instance'
+  /** 来源的种类：按需视图（on_demand）才有「刷新」；试运行解析时为 trial，个人应用为 exploratory */
+  kind?: 'latest_sealed' | 'on_demand' | 'instance' | 'exploratory' | 'trial'
   state: 'ok' | 'empty' | 'running' | 'stale' | 'error'
   run_id: string | null
   stamp: Stamp | null
@@ -330,16 +419,25 @@ export interface ViewNode {
   type: string
   props: Record<string, any>
   /**
+   * 作者隐藏了它（N6）：只在按草稿解析（编辑状态，draft=1）时下发并带上这个标记，界面画成半透明；发布版、个人应用的
+   * 使用面不下发隐藏的组件
+   */
+  hidden?: boolean
+  /**
    * 服务端解析好的数据（backend/app/apps/resolve.py 的 _data），形状随组件而定；绑定了视图的都带 state 和可选的 message：
    * - stamp：{view, state, stamp}；metric：{state, text, name, unit, evidence}
    * - series：{state, mode: single|dual|incomparable|recompute, unit, series: [{version, label, points: [{run_id, as_of,
-   *   value, text, evidence}]}], breaks: [{after_run?, from, to, text}]}
+   *   value, text, evidence, backfill?}]}], breaks: [{after_run?, from, to, text}], note?, trial?}——version 是固定的工作流
+   *   版本号；试运行预览里只有这一次试运行一个点，version 为 null、trial 为真、note 照实写没有趋势；钉住项还没有版本号
+   *   （试运行派生的草稿）时 state=empty、message 说明
    * - table、chart：{state, columns, rows（遮罩的格子已换成「已遮罩」）, column_types, masked, total_rows, truncated, evidence}
    * - report：{state, node, doc_artifact, evidence}；field：{state, text, value?, evidence?}；status：{state, value, text}
-   * - form：{form}；entry_button：{entry, label, disabled, reason?}；instance_list：{who, entry, items}
+   * - form：{form}；entry_button：{entry, label, disabled, reason?}；instance_list：{who, entry, items, trial?}
    * - instance_header：InstanceRow + {state, stamp}；instance_timeline：{state, status, status_code, status_text, steps}
-   * - task_list：{scope, items}；task_form、signoffs：{state, task, task_ui, handler, assignments, progress, my_response}
+   * - task_list：{scope, items}；task_form、signoffs：{state, task, task_ui, handler, assignments, progress, my_response,
+   *   people, signoffs_on_page?, trial?}——trial：试运行里的待办派给了试运行的人自己
    * - action_status：{state, node, records: [{id, state, environment, attempt, payload_hash, error?, note?, receipt?}]}
+   * - records_list：RecordsPage（typesBlueprint.ts）：服务端取好的第一页，界面翻页再取
    */
   data?: Record<string, any> | null
   children?: ViewNode[]
@@ -354,6 +452,12 @@ export interface ViewModel {
   tree: ViewNode[]
   forms: Record<string, FormSchema>
   problems: { component: string; code: string; message: string }[]
+  /**
+   * 蓝图的试运行预览（GET /api/blueprints/{id}/preview，N4）：对着的是哪次试运行、跑到哪了。应用页上不给。
+   * 试运行没有应用版本，app.version 为 0。form 是「换一期再试」填的表单（服务端 blueprints/trial.retry_form，按这次试运行
+   * 对应的草稿：流程类、填报登记是入口的示例表单，看板类是按条件查看的条件表单）；没有为 null，只能原样再试一次
+   */
+  trial?: { run_id: string; status: string; status_text: string; form?: FormSchema | null }
 }
 
 export interface InstanceRow {
@@ -376,8 +480,12 @@ export interface InstanceRow {
 // 待办（§3.7）
 // ---------------------------------------------------------------------------
 
+/**
+ * 待办的种类。review 是个人应用提交审核（docs/design/normal-user-apps.md N7）：不挂在运行的中断上，同意不在待办上点——
+ * 处理人取一份共享副本、走发布单（发布单做完这条自动记为已发布），不发布就退回（decision=reject）；payload 见 ReviewTaskPayload
+ */
 export type TaskKind =
-  | 'approve' | 'input' | 'edit' | 'tool' | 'code' | 'dual_check' | 'action_confirm' | 'reconcile' | 'signal'
+  | 'approve' | 'input' | 'edit' | 'tool' | 'code' | 'dual_check' | 'action_confirm' | 'reconcile' | 'signal' | 'review'
 export type TaskStatus = 'pending' | 'resolving' | 'resolved' | 'cancelled' | 'expired'
 export type TaskPolicy = { kind: 'any' } | { kind: 'all' } | { kind: 'quorum'; m: number }
 
@@ -440,7 +548,10 @@ export interface Task {
   status: TaskStatus
   due_at: string | null
   escalation_level: number
-  /** 给人看的上下文：人工节点的 message / context / draft / reports，工具审批的参数，动作确认的预览等（原样来自中断内容） */
+  /**
+   * 给人看的上下文：人工节点的 message / context / draft / reports，工具审批的参数，动作确认的预览等（原样来自中断内容）；
+   * 审核个人应用（kind=review）是 ReviewTaskPayload
+   */
   payload: Record<string, any>
   assignments: TaskAssignment[]
   /** 当前用户能不能回复这一条 */
@@ -457,6 +568,24 @@ export interface Task {
   created_at: string
   /** 待办上出现的人的显示名（用户名 → 显示名：派给谁、谁回复、谁处理）。界面写显示名、悬停给用户名；老服务端不给 */
   people?: Record<string, string>
+}
+
+/**
+ * 审核个人应用的待办给处理人看的（服务端 blueprints/personal.review_payload）：提交的是哪个蓝图、哪个个人应用、谁提交的、
+ * 留了什么话，取过的共享副本（审核副本归取它的那位搭建者，owner 是他）。不含个人应用页面上的数：要看数，取副本后在
+ * 副本上用真数试一次。键总是都在；蓝图被删了时 name、submitted_by 为 null、copies 为空
+ */
+export interface ReviewTaskPayload {
+  kind: 'review'
+  blueprint_id: string | null
+  /** 提交审核的那个个人应用 */
+  app_id: string | null
+  name: string | null
+  purpose: string
+  template_id: string | null
+  submitted_by: string | null
+  note: string
+  copies: { id: string; owner: string | null; status: import('./typesBlueprint').BlueprintStatus; app_id: string | null }[]
 }
 
 export interface TaskRespond {
@@ -570,11 +699,14 @@ export interface NotifyChannelRow {
 // 运行来源（§2.10 X3）与助手查看（§2.9 L2）
 // ---------------------------------------------------------------------------
 
+/** 运行来源（服务端 engine/origin.ORIGIN_KINDS，顺序相同）。trial：蓝图的试运行；personal_app：个人应用的刷新（都是探索运行） */
 export type OriginKind =
   | 'chat' | 'canvas' | 'launcher' | 'schedule' | 'app_entry' | 'app_view' | 'app_backfill' | 'hook' | 'api'
+  | 'trial' | 'personal_app'
 
+/** 查看的对象。caliber 是已发布口径卡上的指标（蓝图助手复用口径时看，服务端 look/calibers.py） */
 export interface LookObject {
-  kind: 'table' | 'capability' | 'workflow_version'
+  kind: 'table' | 'capability' | 'workflow_version' | 'caliber'
   source?: string
   /** 点名了不在这一轮范围里的数据源时为 null，missing 里是点名的表 */
   source_id?: string | null

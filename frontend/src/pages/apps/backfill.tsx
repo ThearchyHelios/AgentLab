@@ -60,7 +60,8 @@ export function backfillTargets(spec: AppSpec, current: AppVersionRow, previous:
     if (!alias || v.source.kind === 'instance' || current.dispositions?.[alias] !== 'recompute') continue
     const now = current.pins.find((p) => p.alias === alias)
     const before = previous.pins.find((p) => p.alias === alias)
-    if (!now || !before || before.version === now.version) continue
+    // 已发布的应用版本里钉住项都有版本号；没有的（个人应用）谈不上升版
+    if (!now || !before || now.version == null || before.version == null || before.version === now.version) continue
     const max = seriesDepth(spec, view)
     if (max > 0) out.push({ view, alias, from: before.version, to: now.version, max })
   }

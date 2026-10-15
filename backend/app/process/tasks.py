@@ -11,6 +11,10 @@
 - 关登录时谁都能回复（「都算」），回复人记自报的署名。开了登录：派给人的认用户名，派给组的认组，派给「任何人」的要
   builder 以上（这类待办来自画布、定时任务，是给搭建者看的），等外部系统的只有管理员能代为处理。
 - tick：提醒、升级（加派一份，escalation_level+1，只升一次）、超时驳回。永不自动批准。
+- 蓝图的试运行（origin_kind=trial，docs/design/normal-user-apps.md N4）：每一步都派给发起试运行的人自己，按真实设置显示
+  时限，但调度不对它们做提醒、升级、超时驳回——试运行不该把待办推到真实的处理人、上级那里。
+- 个人应用提交审核（kind=review，N7）：没有 Approval、不恢复运行，挂在个人应用最近一次成功的刷新上；派给选定的搭建者
+  或组。在待办里只能退回，同意要在共享副本上走发布单，发布完自动记为已发布（blueprints/personal.py）。
 """
 from __future__ import annotations
 
@@ -133,6 +137,68 @@ async def open_reconcile(session: AsyncSession, action: Any, *, title: str) -> T
     return task
 
 
+#: 个人应用提交审核的待办（docs/design/normal-user-apps.md N7）。没有 Approval，按 correlation_key = blueprint:<蓝图 id>
+#: 找回提交审核的蓝图
+REVIEW_KIND = "review"
+
+
+async def open_review(session: AsyncSession, *, run: Run, app_id: str, blueprint_id: str, title: str,
+                      to: list[tuple[str, str]]) -> Task:
+    """个人应用提交审核：开一条 review 待办，派给选定的搭建者或组（组在这一刻展开成成员，同改派），来源记 review。
+
+    待办的 run_id 不能为空（带外键，开待办的事件、通知都按运行走）：挂在个人应用最近一次成功的刷新上，只是外键挂靠——
+    个人应用的刷新只有拥有者读得到（auth/access.private_owner），处理人（搭建者、管理员也一样）读不到这次运行、打不开这个
+    个人应用；他要看结果，取共享副本（blueprints/personal.copy_for_review）在副本上试运行。这次运行已经结束，不会被恢复：
+    回复走 _respond_review，不调 run_manager.resume。调用方提交，提交后 announce。"""
+    task = Task(run_id=run.id, node_id=None, app_id=app_id, app_version=None, kind=REVIEW_KIND, title=title[:300],
+                policy={"kind": "any"}, correlation_key=f"blueprint:{blueprint_id}")
+    session.add(task)
+    await session.flush()
+    targets: list[tuple[str, str, str]] = []
+    for kind, name in dict.fromkeys(to):
+        targets += await _expand(session, task, kind, name, REVIEW_KIND)
+    for kind, name, source in dict.fromkeys(targets):
+        session.add(TaskAssignment(task_id=task.id, principal_kind=kind, principal=name, source=source))
+    await session.flush()
+    return task
+
+
+async def review_handler(session: AsyncSession, task: Task, principal: Any) -> bool:
+    """这个人是不是这条审核待办的处理人（派给他或他的组、没撤回，同 handles）：只有他们能取个人蓝图的共享副本。"""
+    return handles((await _assignments(session, [task.id])).get(task.id, []), principal)
+
+
+async def close_review(session: AsyncSession, blueprint_id: str, principal: Any, outcome: dict[str, Any], *,
+                       require_handler: bool = False) -> str | None:
+    """审核有了结果（副本发布了、或者退回了）：把这个蓝图还在等的审核待办收掉（条件 UPDATE，和别人的回复抢同一行），
+    结论写进 outcome。require_handler 为真时只有处理人能收（退回），不是派给他的抛 403。返回待办 id，没有在等的返回
+    None。调用方提交。"""
+    task = await session.scalar(select(Task).where(Task.correlation_key == f"blueprint:{blueprint_id}",
+                                                   Task.kind == REVIEW_KIND, Task.status == "pending"))
+    if task is None:
+        return None
+    rows = (await _assignments(session, [task.id])).get(task.id, [])
+    mine = next((a for a in rows if principal is not None and _matches(a, principal)), None)
+    if require_handler and mine is None:
+        raise TaskRefused("这条待办没有派给你", status_code=403, code="task_not_assigned")
+    now = utcnow()
+    username = getattr(principal, "username", None)
+    claimed = await session.execute(
+        update(Task).where(Task.id == task.id, Task.status == "pending")
+        .values(status="resolved", resolved_by=username, resolved_at=now, outcome=outcome))
+    if claimed.rowcount != 1:
+        return None
+    if mine is not None:
+        await session.execute(update(TaskAssignment).where(TaskAssignment.id == mine.id).values(
+            status="responded", responded_by=username, responded_at=now,
+            verified=bool(getattr(principal, "verified", False)),
+            response={"decision": outcome.get("decision"), "note": outcome.get("note") or ""}))
+    await session.execute(update(TaskAssignment).where(TaskAssignment.task_id == task.id,
+                                                       TaskAssignment.status == "pending")
+                          .values(status="withdrawn"))
+    return task.id
+
+
 async def _assign(session: AsyncSession, task: Task, run: Run | None, assignee: Any, *,
                   source: str | None = None) -> list[TaskAssignment]:
     rows = []
@@ -144,11 +210,18 @@ async def _assign(session: AsyncSession, task: Task, run: Run | None, assignee: 
     return rows
 
 
+#: 蓝图试运行的运行来源（engine/origin.py）：待办派给发起人自己、调度不处理时限
+TRIAL_ORIGIN = "trial"
+
+
 async def _targets(session: AsyncSession, task: Task, run: Run | None, assignee: Any) -> list[tuple[str, str, str]]:
     """(principal_kind, principal, source) 列表，去重。"""
     spec = assignee if isinstance(assignee, dict) else {}
     kind = spec.get("kind")
     out: list[tuple[str, str, str]] = []
+    if run is not None and run.origin_kind == TRIAL_ORIGIN and kind != "hook":
+        # 试运行：不管图里派给谁（岗位、组、表达式），都派给发起试运行的人自己，来源记 trial。等外部系统的照旧等外部系统
+        return [("user", run.started_by, TRIAL_ORIGIN) if run.started_by else ("anyone", "", TRIAL_ORIGIN)]
     if kind == "slot":
         slot = str(spec.get("slot") or "")
         bound = await _slot_binding(session, run, slot)
@@ -408,6 +481,8 @@ async def respond(task_id: str, principal: Any, *, decision: Any, values: dict[s
             raise TaskRefused("待办不存在，所属的运行可能已被删除", status_code=404)
         if task.kind == "reconcile":
             return await _respond_reconcile(session, task, principal, decision, values, note)
+        if task.kind == REVIEW_KIND:
+            return await _respond_review(session, task, principal, decision, note)
         if task.status != "pending":
             raise TaskRefused(_closed(task.status))
         if inquiry_busy(task.run_id):
@@ -416,6 +491,7 @@ async def respond(task_id: str, principal: Any, *, decision: Any, values: dict[s
         rows = (await _assignments(session, [task.id])).get(task.id, [])
         mine = _pick(task, rows, principal)
         response, verdict = _engine_response(task, approval, decision, values, note, payload_hash)
+        response = await _bind_files(session, task, principal, response)
         now = utcnow()
         marked = await session.execute(
             update(TaskAssignment).where(TaskAssignment.id == mine.id, TaskAssignment.status == "pending")
@@ -495,6 +571,40 @@ async def _respond_reconcile(session: AsyncSession, task: Task, principal: Any, 
     out = await reconcile(action_id, principal, outcome=decision,
                           external_id=str((values or {}).get("external_id") or "") or None, note=note)
     return {"task": await detail(task_id, principal), "resolved": True, "run": out.get("run")}
+
+
+async def _bind_files(session: AsyncSession, task: Task, principal: Any, response: Any) -> Any:
+    """回复里表单的文件（docs/design/normal-user-apps.md N9）：核对是这个人在这条待办上传的、还没用过，绑到这次运行，
+    和回复一起提交；交给节点的值换成登记的那一份引用。引用不对按表单错误交回，落到那个字段上。"""
+    from app.files import store as files_store
+
+    value = response.get("value") if isinstance(response, dict) else None
+    if not isinstance(value, dict) or not files_store.file_fields(task.form):
+        return response
+    try:
+        bound = await files_store.bind_in(session, task.form, value, principal=principal, run_id=task.run_id,
+                                          context={"task_id": task.id})
+    except files_store.FileRefused as e:
+        await session.rollback()
+        raise FormInvalid([{"path": e.field or "", "code": files_store.FILE_ERROR_CODE, "message": e.message}]) from e
+    return {**response, "value": bound}
+
+
+async def _respond_review(session: AsyncSession, task: Task, principal: Any, decision: Any,
+                          note: str | None) -> dict[str, Any]:
+    """审核待办（个人应用提交审核）在待办里只能退回：同意要取共享副本、在副本上走发布单，发布单做完自动记为已发布
+    （blueprints/personal.review_published）。退回的结论、蓝图状态和通知由 blueprints/personal.reject_review 做。"""
+    if task.status != "pending":
+        raise TaskRefused(_closed(task.status))
+    if decision != "reject":
+        raise TaskRefused("审核个人应用不在这里同意：请取一份共享副本，在副本上用真数试一次、走发布单，发布之后这条待办"
+                          "自动记为已发布；不发布请退回", status_code=422, code="task_decision_invalid")
+    task_id, run_id = task.id, task.run_id
+    await session.rollback()
+    from app.blueprints.personal import reject_review
+
+    await reject_review(task_id, principal, note=note)
+    return {"task": await detail(task_id, principal), "resolved": True, "run": await _run(run_id)}
 
 
 async def close_reconcile(session: AsyncSession, action_id: str, principal: Any, outcome: str,
@@ -652,15 +762,17 @@ async def _notify(task_id: str, event: str, users: list[str]) -> int:
 
 
 async def tick(now: datetime | None = None) -> int:
-    """调度循环每一拍：提醒、升级、超时驳回（永不自动批准）。返回处理的条数。"""
+    """调度循环每一拍：提醒、升级、超时驳回（永不自动批准）。返回处理的条数。试运行的待办不处理（只显示时限）。"""
     now = now or utcnow()
     action = func.json_extract(Task.on_timeout, "$.action")
+    trial = select(Run.id).where(Run.origin_kind == TRIAL_ORIGIN)
     async with SessionLocal() as session:
-        due = list((await session.execute(select(Task.id).where(Task.status == "pending", or_(
-            and_(Task.remind_at.is_not(None), Task.remind_at <= now),
-            and_(Task.due_at.is_not(None), Task.due_at <= now, action == "reject"),
-            and_(Task.due_at.is_not(None), Task.due_at <= now, action == "escalate", Task.escalation_level == 0),
-        )).order_by(Task.due_at))).scalars())
+        due = list((await session.execute(select(Task.id).where(
+            Task.status == "pending", Task.run_id.not_in(trial), or_(
+                and_(Task.remind_at.is_not(None), Task.remind_at <= now),
+                and_(Task.due_at.is_not(None), Task.due_at <= now, action == "reject"),
+                and_(Task.due_at.is_not(None), Task.due_at <= now, action == "escalate", Task.escalation_level == 0),
+            )).order_by(Task.due_at))).scalars())
     done = 0
     for task_id in due:
         try:
@@ -906,7 +1018,7 @@ async def _describe(session: AsyncSession, tasks: list[Task], principal: Any) ->
     approvals = {a.id: a for a in (await session.execute(
         select(Approval).where(Approval.id.in_([t.approval_id for t in tasks if t.approval_id])))).scalars()}
     runs = {r.id: r for r in (await session.execute(
-        select(Run.id, Run.workflow_name, Run.graph, Run.origin)
+        select(Run.id, Run.workflow_name, Run.graph, Run.origin, Run.origin_kind)
         .where(Run.id.in_({t.run_id for t in tasks})))).all()}
     apps = dict((await session.execute(select(App.id, App.name).where(
         App.id.in_({t.app_id for t in tasks if t.app_id})))).all())
@@ -917,6 +1029,10 @@ async def _describe(session: AsyncSession, tasks: list[Task], principal: Any) ->
         payload = dict(approvals[task.approval_id].payload or {}) if task.approval_id in approvals else {}
         if task.kind == "reconcile":
             payload = await _reconcile_payload(session, task)
+        elif task.kind == REVIEW_KIND:
+            from app.blueprints.personal import review_payload
+
+            payload = await review_payload(session, task)
         run = runs.get(task.run_id)
         out.append({
             "id": task.id, "approval_id": task.approval_id, "run_id": task.run_id, "node_id": task.node_id,
@@ -940,6 +1056,8 @@ async def _describe(session: AsyncSession, tasks: list[Task], principal: Any) ->
             "created_at": _iso(task.created_at),
             # 这条待办上出现的人的显示名（派给谁、谁回复、谁处理、升级给谁）：界面写显示名，悬停给用户名
             "people": {u: names[u] for u in people_of(task, rows) if u in names},
+            # 蓝图试运行的待办：派给了发起试运行的人自己，界面上写「以试运行身份同意 / 驳回」
+            **({"trial": True} if run is not None and run.origin_kind == TRIAL_ORIGIN else {}),
         })
     return out
 

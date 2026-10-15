@@ -83,8 +83,15 @@ def needs_disposition(previous: Any | None, pins: list[dict[str, Any]]) -> list[
 
 
 async def lint_app(session: AsyncSession, spec: dict[str, Any], bindings: dict[str, Any], *,
-                   previous: Any | None = None, dispositions: dict[str, str] | None = None) -> list[dict[str, Any]]:
-    """检查一份待发布的应用。previous 是上一个应用版本（判断钉住项升版要不要处置）。"""
+                   previous: Any | None = None, dispositions: dict[str, str] | None = None,
+                   pins: dict[str, Any] | None = None, scope: str = "shared") -> list[dict[str, Any]]:
+    """检查一份待发布的应用。previous 是上一个应用版本（判断钉住项升版要不要处置）。
+
+    pins 给了就按它认钉住项（别名 → PinState），不读库：发布单的预检按「将要发布的那一版」检查（版本已经存下、还没发布，
+    blueprints/publish_plan.py 把它当作已发布的样子交进来），其余调用方不给。
+
+    scope 是应用的范围（App.scope）。个人应用（personal，docs/design/normal-user-apps.md N7）固定的是它自己的蓝图、视图只取
+    探索运行、图要满足使用者的约束（_lint_personal）；共享应用里出现蓝图、探索运行的照实报错。"""
     from app.apps.pins import load_pins
 
     out = _Issues()
@@ -95,15 +102,19 @@ async def lint_app(session: AsyncSession, spec: dict[str, Any], bindings: dict[s
             loc = ".".join(str(x) for x in err.get("loc") or ())
             out.error("app.format", f"应用描述的格式不对：{loc}（{err.get('msg')}）", loc or None)
         return out.items
-    pins = await load_pins(session, spec)
+    pins = pins if pins is not None else await load_pins(session, spec)
     level = _level(pins)
     _lint_unique(spec, out)
-    _lint_pins(spec, pins, out)
+    _lint_pins(spec, pins, out, scope)
     await _lint_subgraph_pins(session, spec, pins, out)
     _lint_upgrade(spec, previous, dispositions or {}, out)
     views = spec.get("views") or {}
-    await _lint_views(session, spec, pins, out)
+    await _lint_views(session, spec, pins, out, scope)
     _lint_components(spec, pins, views, level, out)
+    await _lint_records_rows(session, spec, pins, out)
+    _lint_hidden(spec, out)
+    if scope == "personal":
+        _lint_personal(spec, pins, out)
     _lint_entries(spec, pins, out)
     await _lint_process(session, spec, pins, bindings or {}, out)
     _lint_hooks(spec, out)
@@ -139,10 +150,18 @@ def _lint_unique(spec: dict[str, Any], out: _Issues) -> None:
         entries.add(entry.get("id"))
 
 
-def _lint_pins(spec: dict[str, Any], pins: dict[str, Any], out: _Issues) -> None:
+def _lint_pins(spec: dict[str, Any], pins: dict[str, Any], out: _Issues, scope: str = "shared") -> None:
     for i, pin in enumerate(spec.get("pins") or []):
         state = pins.get(pin.get("alias"))
         at = f"pins[{i}]"
+        if pin.get("blueprint") or scope == "personal":
+            # 个人应用的蓝图在 _lint_personal 里查；两种范围和两种固定版本对不上的在这里报
+            if pin.get("blueprint") and scope != "personal":
+                out.error("app.pin_unpublished", f"引用的「{pin.get('alias')}」是蓝图里还没发布的图：共享应用只能引用已发布的"
+                          "工作流版本", at)
+            elif not pin.get("blueprint"):
+                out.error("personal.policy", "个人应用只能引用它自己的蓝图，不能引用工作流版本", at)
+            continue
         if state is None or state.row is None:
             out.error("app.pin_unpublished", f"引用的工作流版本「{pin.get('alias')}」不存在（工作流或 v{pin.get('version')} 已删除）", at)
         elif state.retired:
@@ -186,7 +205,8 @@ def _lint_upgrade(spec: dict[str, Any], previous: Any | None, dispositions: dict
                       f"请选择 {choices} 中的一种", f"pins[{index}]", alias=item["alias"])
 
 
-async def _lint_views(session: AsyncSession, spec: dict[str, Any], pins: dict[str, Any], out: _Issues) -> None:
+async def _lint_views(session: AsyncSession, spec: dict[str, Any], pins: dict[str, Any], out: _Issues,
+                      scope: str = "shared") -> None:
     from app.apps.pins import reads_live
     from app.apps.resolve import latest_sealed_run
     from app.db.models import Schedule
@@ -195,11 +215,21 @@ async def _lint_views(session: AsyncSession, spec: dict[str, Any], pins: dict[st
         source = (view or {}).get("source") or {}
         at = f"views.{vid}.source"
         kind = source.get("kind")
+        if (kind == "exploratory") != (scope == "personal"):
+            # 探索运行只在个人应用里合法（N7）：共享应用的视图取了它，等于把没发布的图的结果当正式结果给人看；个人应用
+            # 只有蓝图上的图、没有正式运行，取别的来源永远是空的
+            out.error("app.view_source_personal",
+                      f"视图「{vid}」取的是探索运行：只有个人应用能这样取数，共享应用的视图要取正式运行（最近一次出数、"
+                      "按条件查看或本实例）" if kind == "exploratory" else
+                      f"视图「{vid}」：个人应用的视图只能取它自己的探索运行（每次刷新的结果）", f"{at}.kind")
+            continue
         if kind == "instance":
             continue
         state = pins.get(source.get("pin"))
         if state is None:
             out.error("app.binding_target_missing", f"视图「{vid}」引用的工作流版本「{source.get('pin')}」不在应用里", at)
+            continue
+        if kind == "exploratory":
             continue
         if kind == "latest_sealed":
             origin = source.get("from")
@@ -241,7 +271,8 @@ def _view_graphs(spec: dict[str, Any], pins: dict[str, Any], view_id: str | None
         aliases = {e.get("pin") for e in spec.get("entries") or []} or set(pins)
         return [pins[a].graph for a in aliases if a in pins and pins[a].row is not None]
     state = pins.get(source.get("pin"))
-    return [state.graph] if state is not None and state.row is not None else []
+    # 个人应用的固定版本是蓝图：图在蓝图上（row 为空）
+    return [state.graph] if state is not None and (state.row is not None or state.blueprint is not None) else []
 
 
 def _lint_components(spec: dict[str, Any], pins: dict[str, Any], views: dict[str, Any], level: str,
@@ -474,6 +505,94 @@ def _lint_refs(spec: dict[str, Any], comp: dict[str, Any], at: str, out: _Issues
         out.error("app.binding_target_missing", f"组件「{comp.get('id')}」引用的入口「{props['entry']}」不存在", f"{at}.props.entry")
     if comp.get("type") == "form" and props.get("form") not in (spec.get("forms") or {}):
         out.error("app.binding_target_missing", f"组件「{comp.get('id')}」引用的表单「{props.get('form')}」不存在", f"{at}.props.form")
+
+
+#: SQL 里出现这些就算汇总过了：分组，或者聚合函数
+_AGGREGATED = re.compile(r"\bgroup\s+by\b|\b(?:count|sum|avg|min|max|total|group_concat)\s*\(", re.I)
+
+
+async def _lint_records_rows(session: AsyncSession, spec: dict[str, Any], pins: dict[str, Any], out: _Issues) -> None:
+    """表格组件绑定的查询直接列出记录表的逐行、没有汇总（app.records_rows_exposed，docs/design/normal-user-apps.md N8）：
+    看板读的是正式运行的结果，正式运行看得到全部行，这样等于所有使用者都能看到别人的记录，绕过了行级可见。只提醒：
+    作者可能就是要公开（排行榜）；逐行查看请用记录列表组件，它按看的人过滤。只看调用工具节点写在图里的 SQL。"""
+    from app.data.guard import _blank_quoted
+    from app.db.models import DataSource
+    from app.records import RECORDS_ORIGIN
+    from app.tools.datasource import QUERY_PREFIX
+
+    records: set[str] | None = None
+    for comp, _, at in components(spec):
+        bind = comp.get("bind") if isinstance(comp.get("bind"), dict) else None
+        if comp.get("type") != "table" or bind is None or bind_kind(bind) != "query":
+            continue
+        target = bind.get("query") if isinstance(bind.get("query"), dict) else {}
+        for graph in _view_graphs(spec, pins, bind.get("view")):
+            node = node_map(graph).get(str(target.get("node") or ""))
+            tool = str(((node or {}).get("config") or {}).get("tool") or "")
+            sql = (((node or {}).get("config") or {}).get("args") or {}).get("sql")
+            if node is None or node["type"] != "tool" or not tool.startswith(QUERY_PREFIX) or not isinstance(sql, str):
+                continue
+            if records is None:
+                records = set((await session.execute(select(DataSource.name).where(
+                    DataSource.origin == RECORDS_ORIGIN))).scalars())
+            if tool[len(QUERY_PREFIX):] not in records or _AGGREGATED.search(_blank_quoted(sql, dialect="sqlite")):
+                continue
+            out.warning("app.records_rows_exposed",
+                        f"组件「{comp.get('id')}」（表格）直接列出了记录表的逐行：看板的数据是正式运行查的，看得到全部行，"
+                        "所有能用这个应用的人都会看到别人提交的记录。要逐行查看请改用「记录列表」组件（按看的人过滤）；"
+                        "看板上的表格请改成汇总", f"{at}.bind", node_id=str(target.get("node")))
+            break
+
+
+def _lint_hidden(spec: dict[str, Any], out: _Issues) -> None:
+    """隐藏了的组件是唯一绑定某个视图的组件（N6，app.hidden_bound）：隐藏之后这个视图的数在页面上一处都看不到了——可能
+    隐藏错了，或者这个视图连同组件可以删掉。只提醒：作者也许就是暂时不想让人看。放在隐藏了的布局组件里的算隐藏。"""
+    binders: dict[str, list[tuple[bool, str, str]]] = {}
+
+    def walk(items: list[Any], hidden: bool, at: str) -> None:
+        for i, comp in enumerate(items):
+            if not isinstance(comp, dict):
+                continue
+            here = f"{at}[{i}]"
+            off = hidden or bool(comp.get("hidden"))
+            bind = comp.get("bind") if isinstance(comp.get("bind"), dict) else {}
+            if isinstance(bind.get("view"), str):
+                binders.setdefault(bind["view"], []).append((off, str(comp.get("id")), here))
+            walk(comp.get("children") or [], off, f"{here}.children")
+
+    for pi, page in enumerate(spec.get("pages") or []):
+        if isinstance(page, dict):
+            walk(page.get("body") or [], False, f"pages[{pi}].body")
+    for vid, items in binders.items():
+        if not all(off for off, _, _ in items):
+            continue
+        _, cid, at = items[0]
+        what = f"组件「{cid}」是唯一绑定视图「{vid}」的组件" if len(items) == 1 else f"绑定视图「{vid}」的组件都"
+        out.warning("app.hidden_bound", f"{what}，隐藏之后页面上一处都看不到这个视图的数了。确实不要了可以删掉它",
+                    f"{at}.hidden")
+
+
+def _lint_personal(spec: dict[str, Any], pins: dict[str, Any], out: _Issues) -> None:
+    """个人应用（N7）：固定版本是它自己的蓝图（还在、图的指纹和应用记的一样），图满足使用者的约束（同问数据的白名单，
+    blueprints/personal.policy_problem，personal.policy），不能有入口、钩子、通知订阅、岗位。"""
+    from app.blueprints.personal import NOT_IN_PERSONAL, policy_problem
+
+    for i, pin in enumerate(spec.get("pins") or []):
+        if not pin.get("blueprint"):
+            continue
+        state = pins.get(pin.get("alias"))
+        at = f"pins[{i}]"
+        if state is None or state.blueprint is None:
+            out.error("personal.policy", "个人应用出自的蓝图已经不在了：没法再刷新，可以归档这个应用", at)
+            continue
+        if state.hash != pin.get("graph_hash"):
+            out.error("app.pin_hash", "蓝图在存成个人应用之后又改过：请回到蓝图重新「存成我的应用」", at)
+        if problem := policy_problem(state.graph):
+            out.error("personal.policy", problem, at)
+    declared = [(key, label) for key, label in NOT_IN_PERSONAL if spec.get(key)]
+    if declared:
+        out.error("personal.policy", f"个人应用不发起实例、不派待办，不能有{'、'.join(label for _, label in declared)}：请删掉",
+                  declared[0][0])
 
 
 def _lint_entries(spec: dict[str, Any], pins: dict[str, Any], out: _Issues) -> None:

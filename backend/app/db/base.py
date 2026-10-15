@@ -235,6 +235,10 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("mcp_servers", "endpoint_id", "VARCHAR(32)"),
     ("conversations", "app_id", "VARCHAR(32)"),
     ("conversations", "created_by", "VARCHAR(100)"),
+    # 普通用户建应用（docs/design/normal-user-apps.md §3.1）：个人应用（scope=personal、owner）和出自哪个蓝图
+    ("apps", "scope", "VARCHAR(20) DEFAULT 'shared'"),
+    ("apps", "owner", "VARCHAR(100)"),
+    ("apps", "blueprint_id", "VARCHAR(32)"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。

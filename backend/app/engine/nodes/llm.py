@@ -48,7 +48,7 @@ from app.providers.factory import (
     get_chat_model,
 )
 from app.engine.sql_problems import event_checks
-from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_reads_only, run_versions
+from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_reads_only, run_scope_fixed, run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolBuildError,
@@ -329,15 +329,18 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
 async def _resolve_tools(ctx: NodeContext, state: GraphState) -> list[BaseTool]:
     names = ctx.cfg("tools", []) or []
+    # 遮罩、只读的运行：记忆范围、知识库只认运行定下的，模型在参数里挑的也不算（tools/registry.ToolContext.fixed_scope）
+    fixed = run_scope_fixed(ctx.run)
     tool_ctx = ToolContext(
         run_id=ctx.run.run_id,
         node_id=ctx.node.id,
         sandbox_session=ctx.run.thread_id,
-        memory_scope=ctx.cfg("memory_scope") or ctx.run.memory_scope,
-        collection=ctx.cfg("collection") or ctx.run.collection,
+        memory_scope=ctx.run.memory_scope if fixed else ctx.cfg("memory_scope") or ctx.run.memory_scope,
+        collection=ctx.run.collection if fixed else ctx.cfg("collection") or ctx.run.collection,
         data_versions=run_versions(ctx.run),
         mask_results=run_masks_results(ctx.run),
         force_readonly=run_reads_only(ctx.run),
+        fixed_scope=fixed,
         # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
         emit=ctx.emit,
     )

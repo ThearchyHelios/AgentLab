@@ -3,7 +3,7 @@ import { ArrowDown, ArrowUp, Plus, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../../api/client'
 import { DeleteButton, EmptyState, Field, SectionBar, confirmDialog, isComposing, toast } from '../../../components/ui'
-import { APP_EDITOR_TEXT as T, APP_TERM_TEXT } from '../../../lib/terms'
+import { APP_EDITOR_TEXT as T, APP_TERM_TEXT, PAGE_EDIT_TEXT } from '../../../lib/terms'
 import type { AppBinding, AppComponent, AppSpec, AppViewSource, CatalogComponent } from '../../../typesApp'
 import { BackfillButton, useBackfillTargets } from '../backfill'
 import { applyAppOp, componentsOfView, findComponent, freshId } from './appOps'
@@ -129,7 +129,8 @@ function Tree({ nodes, depth, byName }: { nodes: AppComponent[]; depth: number; 
                       selected === n.id && 'bg-hover ring-1 ring-inset ring-[var(--accent)]')}
                     style={{ paddingLeft: 6 + depth * 14 }}>
               <span className={clsx('shrink-0', entry ? 'text-dim' : 'text-[var(--err)]')}>{entry?.label ?? n.type}</span>
-              <span className="min-w-0 flex-1 truncate text-faint">{label || n.id}</span>
+              <span className={clsx('min-w-0 flex-1 truncate text-faint', n.hidden && 'line-through')}>{label || n.id}</span>
+              {n.hidden && <span className="shrink-0 text-2xs text-faint" title={PAGE_EDIT_TEXT.hiddenHint} data-app-component-hidden="">{PAGE_EDIT_TEXT.hiddenTag}</span>}
               {n.visible && <span className="shrink-0 text-2xs text-faint" title={n.visible}>{T.visible}</span>}
             </button>
             {!!n.children?.length && <Tree nodes={n.children} depth={depth + 1} byName={byName} />}
@@ -200,6 +201,17 @@ function ComponentInspector({ node, entry }: { node: AppComponent; entry?: Catal
           <BindEditor kinds={entry.bindings} value={node.bind ?? null} views={views} onChange={(bind) => update({ bind })} />
         </section>
       )}
+      {/* 隐藏（N6）：作者不要它，解析时跳过；和下面按运行情况决定的可见性不是一回事 */}
+      <section>
+        <label className="flex items-start gap-2 text-xs" data-app-hidden-switch="">
+          <input type="checkbox" className="mt-0.5 accent-[var(--accent)]" checked={!!node.hidden}
+                 onChange={(e) => update({ hidden: e.target.checked })} />
+          <span>
+            <span className="font-medium">{PAGE_EDIT_TEXT.hiddenSwitch}</span>
+            <span className="mt-0.5 block text-2xs leading-relaxed text-faint">{PAGE_EDIT_TEXT.hiddenHint}</span>
+          </span>
+        </label>
+      </section>
       <section>
         <SectionBar title={T.visible} hint={T.visibleHint} />
         <div className="grid grid-cols-[1fr_180px] gap-2">
@@ -361,11 +373,13 @@ function useViewNodes(view: string): { id: string; label: string }[] {
   const pin = draft.pins.find((p) => p.alias === source?.pin) ?? (draft.pins.length === 1 ? draft.pins[0] : undefined)
   const [nodes, setNodes] = useState<{ id: string; label: string }[]>([])
   useEffect(() => {
-    if (!pin) { setNodes([]); return }
-    const key = `${pin.workflow_id}@${pin.version}`
+    // 还没发布的（试运行派生的草稿）、个人应用的钉住项没有工作流版本可取
+    if (!pin || !pin.workflow_id || pin.version == null) { setNodes([]); return }
+    const { workflow_id: wid, version } = pin
+    const key = `${wid}@${version}`
     let p = graphCache.get(key)
     if (!p) {
-      p = api.workflows.version(pin.workflow_id, pin.version)
+      p = api.workflows.version(wid, version)
         .then((v) => (v.graph?.nodes ?? []).map((n) => ({ id: n.id, label: String(n.data?.label ?? n.id) })))
       p.catch(() => graphCache.delete(key))
       graphCache.set(key, p)
@@ -450,7 +464,7 @@ function ViewsPanel() {
               <select className="field h-7 py-0 text-xs" value={v.source.pin ?? ''} aria-label={T.viewPin} title={APP_TERM_TEXT.pin}
                       onChange={(e) => set(key, { source: { ...v.source, pin: e.target.value || null } })}>
                 <option value="">{T.viewPin}</option>
-                {draft.pins.map((p) => <option key={p.alias} value={p.alias}>{p.alias} · v{p.version}</option>)}
+                {draft.pins.map((p) => <option key={p.alias} value={p.alias}>{p.alias}{p.version != null ? ` · v${p.version}` : ''}</option>)}
               </select>
             )}
             {v.source.kind === 'latest_sealed' && (
