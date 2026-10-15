@@ -62,6 +62,9 @@ class ToolSpec:
     # 改平台自身的状态（写记忆）：不危险到默认要人确认，但也不是只读——能力登记里不能记成只读（只读的才能正式运行免审批、
     # 才能当写入的查询能力），见 capabilities.registry._discover
     writes_state: bool = False
+    # 能力登记里的效果，写了就照它登记（平台内置的写入能力记 write：只能放在调用工具节点里，经动作流程执行，
+    # capabilities/platform.py）。不写的按 dangerous / writes_state 推
+    effect: str | None = None
 
     def json_schema(self) -> dict[str, Any]:
         return self.args_schema.model_json_schema()
@@ -79,6 +82,7 @@ def register(
     dangerous: bool = False,
     needs_context: bool = True,
     writes_state: bool = False,
+    effect: str | None = None,
 ) -> Callable[[ToolFunc], ToolFunc]:
     def deco(func: ToolFunc) -> ToolFunc:
         _REGISTRY[name] = ToolSpec(
@@ -90,6 +94,7 @@ def register(
             dangerous=dangerous,
             needs_context=needs_context,
             writes_state=writes_state,
+            effect=effect,
         )
         return func
 

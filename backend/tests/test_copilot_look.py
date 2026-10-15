@@ -268,10 +268,16 @@ async def test_ask_ends_the_round(client, monkeypatch, shop):
     final = events[-1]
     assert final["op"] == "final" and final["autorun"] is False
     assert {n["id"] for n in final["graph"]["nodes"]} == {"start", "q"}
+    # 改了图又问了：问题跟着 final 交付，前端记进这一轮
+    assert final["asked"] == {"question": ask["question"], "options": []}
 
-    # 什么都还没改就问：问题转出去，这一轮就结束
+    # 什么都还没改就问：问题转出去，这一轮就结束。照样发一条 final 收尾（带问题、图原样、不运行），前端据此把这一轮
+    # 记成「助手反问」，不会一直停在「进行中」
     events = await _events(client, monkeypatch, Turns([ask]), {"instruction": "订单金额"})
-    assert _ops(events) == ["ask"]
+    assert _ops(events) == ["ask", "final"]
+    final = events[-1]
+    assert final["asked"]["question"] == ask["question"] and final["autorun"] is False
+    assert final["graph"] == {"nodes": [], "edges": []} and final["issues"] == []
     # 非流式的 /generate：问题放在说明里，原图照旧
     r = await client.post("/api/copilot/generate", json={"instruction": "订单金额"})
     assert r.status_code == 200, r.text

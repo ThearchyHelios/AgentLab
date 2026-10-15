@@ -195,6 +195,15 @@ def _is_upload(row: DataSource) -> bool:
     return (row.origin or "manual") == "upload"
 
 
+def _is_records(row: DataSource) -> bool:
+    """记录表（docs/design/normal-user-apps.md N8）登记的只读源：连接、结构由平台维护，随应用的表单变，不在这里改、删。"""
+    return (row.origin or "manual") == "records"
+
+
+_RECORDS_LOCKED = "记录表由应用的表单维护，不能在这里修改「{}」。要改字段，请到应用的「填什么」里改"
+_RECORDS_KEEP = "记录表由应用维护，不能在这里删除：旧记录要一直留着备查"
+
+
 async def _snapshot_infos(session: AsyncSession, rows: list[DataSource]) -> dict[str, dict[str, Any]]:
     """各上传源当前版本的摘要：{源 id: {id, created_at, file_name, raw_state, mode, periods, period_start,
     period_end, activated_at}}。两次查询取齐，不逐个查。
@@ -479,7 +488,14 @@ async def update_source(
 ) -> DataSourceOut:
     row = await _get_or_404(session, source_id)
     data = payload.model_dump(exclude_unset=True)
-    if _is_upload(row):
+    if _is_records(row):
+        # 连接、只读、结构都由记录表维护（records/tables.py）；说明、遮罩列这类照常能改
+        changed = _locked_changes(row, data)
+        if changed:
+            raise HTTPException(422, _RECORDS_LOCKED.format("」「".join(changed)))
+        for key in _UPLOAD_LOCKED:
+            data.pop(key, None)
+    elif _is_upload(row):
         # 上传源的连接由版本底座维护（见 _locked_changes）
         changed = _locked_changes(row, data)
         if changed:
@@ -527,6 +543,8 @@ async def update_source(
 @router.delete("/{source_id}", status_code=204)
 async def delete_source(source_id: str, session: AsyncSession = Depends(get_session)) -> None:
     row = await _get_or_404(session, source_id)
+    if _is_records(row):
+        raise HTTPException(409, _RECORDS_KEEP)
     # 上传源的导入记录置 retired 留作审计；库文件和原件交给回收，被运行引用的版本会保留。只读进程（没拿到
     # 版本存储的守卫）不删上传源：retire_source 要删隔离文件、放弃暂存区（第 8 节遗留项 5）。
     # 手工登记的源没有导入记录、配方、暂存区和隔离文件，根本不碰版本存储：不调 retire_source，只读进程里也照常
@@ -718,6 +736,12 @@ async def test_draft(
         return {"ok": False, "error": f"不支持「{payload.kind}」类型的数据库",
                 "hint": f"目前支持：{'、'.join(SUPPORTED_KINDS)}", "detail": "", "elapsed_ms": 0, "url": ""}
     saved = await session.get(DataSource, payload.id) if payload.id else None
+    if saved is not None and _is_records(saved):
+        # 记录表：连接字段由应用维护（同上传源），测的就是登记的那个文件
+        changed = _locked_changes(saved, payload.model_dump(exclude_unset=True, include=set(_UPLOAD_LOCKED)))
+        if changed:
+            return _refused(_RECORDS_LOCKED.format("」「".join(changed)))
+        return await _test_saved(session, saved)
     if saved is not None and _is_upload(saved):
         # 上传源：连接字段由系统维护。改了就和保存一样拒；没改，测的就是它当前版本的快照，
         # 不拿表单里的路径去连——否则带上一个上传源的 id，就能把上传目录里任何文件拿来试
@@ -765,6 +789,9 @@ async def _test_saved(session: AsyncSession, row: DataSource) -> dict[str, Any]:
             result = _refused(str(e))
         else:
             result = await _probe(view, cached=True)
+    elif _is_records(row):
+        # 记录表的文件在应用自己的数据目录里，是平台登记的只读源，照常测
+        result = await _probe(row, cached=True)
     elif _in_app_files(row.kind, row.database):
         result = _refused(_APP_FILES_REFUSED)
     else:
@@ -806,6 +833,8 @@ async def introspect_source(
     row = await _get_or_404(session, source_id)
     if _is_upload(row):
         raise HTTPException(409, "上传的表格无需重新探查，重新上传即可更新")
+    if _is_records(row):
+        raise HTTPException(409, "记录表的结构由应用的表单维护，无需重新探查")
     try:
         cache = await introspect_mod.introspect(row, schema=schema)
     except Exception as e:  # noqa: BLE001

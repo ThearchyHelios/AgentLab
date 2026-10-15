@@ -928,8 +928,20 @@ async def run_query(
     """
     limits = limits or QueryLimits(timeout_seconds=query_timeout(source))
     kind = (source.kind or "").lower()
+    if (getattr(source, "origin", None) or "manual") == "records" and not getattr(source, "prelude", None):
+        # 记录表（docs/design/normal-user-apps.md N8）没经解析就拿来查（数据剖析这类入口）：照样走临时视图，
+        # 底表里的幂等键、被更正的行不露出来
+        from app.records.views import default_view
+
+        source = default_view(source)
     # 按数据源的方言扫：MySQL 的反斜杠转义、PG 的 $$ 字符串，守卫要和数据库读得一样
     statement = check(sql, readonly=bool(source.readonly), source_name=source.name, dialect=kind)
+    if forbidden := tuple(getattr(source, "forbid_schemas", None) or ()):
+        # 记录表靠连接上的同名临时视图钉版本、分行可见：写了 main.<表> 就绕过了视图（records/views.py）
+        if hit := guard.schema_reference(statement, forbidden, dialect=kind):
+            raise SqlRejected(f"「{source.name}」只能按表名查询（如 FROM records），不能在表名前加库名「{hit}.」："
+                              "这张表只给看这次运行能看的那些行")
+    prelude: tuple[str, ...] = tuple(getattr(source, "prelude", None) or ())
 
     engine = await engines.get(source)
     started = time.perf_counter()
@@ -938,6 +950,10 @@ async def run_query(
         return await _run_write(engine, kind, statement, limits, started)
 
     async def _read(conn: AsyncConnection) -> tuple[list[str], list[list[Any]], bool, dict[str, str]]:
+        # 连接上先执行的语句（记录表的同名临时视图）。按驱动原样执行，不经 text()：视图里拼着看的人的名字，
+        # 名字里的冒号不能被当成绑定参数
+        for stmt in prelude:
+            await conn.exec_driver_sql(stmt)
         cursor = await conn.stream(text(statement))
         columns = list(cursor.keys())
         collected = RowCollector(limits)

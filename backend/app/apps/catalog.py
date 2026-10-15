@@ -5,7 +5,8 @@
 
 每个组件登记：名字、中文名、类别、版本、props 的 JSON Schema、允许的绑定种类、能不能有子组件。
 props 里每一项都写 title（属性面板上的中文名），取值不直观的另写 description；枚举写 x-enum-labels（和 enum 按位置
-对应，同表单 agentlab.form/1 的写法）。这几样是注解，不参与校验。
+对应，同表单 agentlab.form/1 的写法）；给人看的文字（标题、名称、说明）标 x-text，应用页上直接改的「改文字」只改这几项，
+列名、换算这类写给解析器的字符串不标。这几样是注解，不参与校验。
 服务端校验器和解析器由 app/apps/ 的实现按名字注册（BE-3）；开发者扩展组件时，目录项、校验器、解析器、前端渲染器
 四样都要给，缺一样启动即报错（check_registry）。
 """
@@ -22,11 +23,17 @@ def _props(**properties: Any) -> dict[str, Any]:
 
 
 def _text(title: str, **more: Any) -> dict[str, Any]:
-    return {"type": "string", "maxLength": 200, "title": title, **more}
+    """给人看的一行字（标题、名称、单位）：x-text 标出来，页面上直接改的「改文字」改它（normal-user-apps N6）。"""
+    return {"type": "string", "maxLength": 200, "title": title, "x-text": True, **more}
 
 
 def _long(title: str) -> dict[str, Any]:
-    return {"type": "string", "maxLength": 4000, "title": title}
+    return {"type": "string", "maxLength": 4000, "title": title, "x-text": True}
+
+
+def _code(title: str, **more: Any) -> dict[str, Any]:
+    """写给解析器的短字符串（列名、换算）：不是给人看的文字，「改文字」不碰。"""
+    return {"type": "string", "maxLength": 200, "title": title, **more}
 
 
 def _enum(title: str, **labels: str) -> dict[str, Any]:
@@ -56,7 +63,7 @@ COMPONENTS: list[dict[str, Any]] = [
      "bindings": ["metric", "cell"],
      "props": _props(label=_text("名称"),
                      unit=_text("单位", description="绑定单元格时写在数下面；绑定指标时数里已经带着口径卡的单位"),
-                     conv=_text("换算", description="万、亿、pct（百分比）、int（取整）或 .N（保留 N 位小数）"))},
+                     conv=_code("换算", description="万、亿、pct（百分比）、int（取整）或 .N（保留 N 位小数）"))},
     {"name": "series", "label": "趋势", "category": "display", "version": 1, "children": False,
      "bindings": ["series"], "props": _props(label=_text("名称"), chart=_CHART)},
     {"name": "table", "label": "表格", "category": "display", "version": 1, "children": False,
@@ -68,7 +75,7 @@ COMPONENTS: list[dict[str, Any]] = [
                      limit={"type": "integer", "minimum": 1, "title": "最多显示行数"})},
     {"name": "chart", "label": "图表", "category": "display", "version": 1, "children": False,
      "bindings": ["query"],
-     "props": _props(title=_text("标题"), chart=_CHART, x=_text("横轴列"),
+     "props": _props(title=_text("标题"), chart=_CHART, x=_code("横轴列"),
                      y={"type": "array", "items": {"type": "string", "maxLength": 200}, "maxItems": 4,
                         "title": "纵轴列", "description": "最多 4 列"})},
     {"name": "report", "label": "报告", "category": "display", "version": 1, "children": False,
@@ -103,6 +110,12 @@ COMPONENTS: list[dict[str, Any]] = [
      "bindings": ["task"], "props": _props()},
     {"name": "action_status", "label": "动作状态", "category": "process", "version": 1, "children": False,
      "bindings": ["action"], "props": _props(label=_text("名称"))},
+    # 记录表的逐行（docs/design/normal-user-apps.md N8）：每次打开按看的人实时过滤（use 只看自己提交的），不走封存
+    {"name": "records_list", "label": "记录列表", "category": "process", "version": 1, "children": False,
+     "bindings": [], "props": _props(title=_text("标题"),
+                                     table=_code("记录表", description="不填就是这个应用的第一张记录表"),
+                                     who=_enum("显示谁的", mine="我提交的", all="全部（要有查看全部的权限）"),
+                                     limit={"type": "integer", "minimum": 1, "maximum": 200, "title": "最多显示几条"})},
 ]
 
 BY_NAME: dict[str, dict[str, Any]] = {c["name"]: c for c in COMPONENTS}

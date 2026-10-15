@@ -664,14 +664,17 @@ async def notify_settings(session: AsyncSession) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# 应用：按需视图的每日上限（D-j）
+# 应用：按需视图的每日上限（D-j）、使用者能不能建个人应用（docs/design/normal-user-apps.md N7）
 # --------------------------------------------------------------------------
 
 #: 设置里 apps 这一组。on_demand_daily_limit：每个应用每天最多发起几次按需视图的正式运行（app/apps/resolve.py 的
-#: daily_limit 读它），点「刷新」才运行、同一个键只运行一份之外，再兜一道花费的底。0 表示不再发起按需运行
+#: daily_limit 读它），点「刷新」才运行、同一个键只运行一份之外，再兜一道花费的底。0 表示不再发起按需运行；个人应用的刷新
+#: 共用这一项，按人计（blueprints/personal.py）。
+#: user_personal_apps：开了登录时使用者能不能建个人应用、刷新、提交审核（默认关，同问数据的开关；搭建者及以上不受它管）。
+#: 关登录时它照样生效：关着就没有个人应用的入口。只有管理员能改（整个设置接口的改动都要管理员）
 APPS_GROUP = "apps"
-APPS_DEFAULTS: dict[str, Any] = {"on_demand_daily_limit": 200}
-APPS_SETTING_LABEL = {"on_demand_daily_limit": "按需视图每日上限"}
+APPS_DEFAULTS: dict[str, Any] = {"on_demand_daily_limit": 200, "user_personal_apps": False}
+APPS_SETTING_LABEL = {"on_demand_daily_limit": "按需视图每日上限", "user_personal_apps": "使用者可以建个人应用"}
 #: 上限的上限：再大就等于不限，要不限的不该靠这一项
 APPS_DAILY_LIMIT_MAX = 100_000
 
@@ -688,17 +691,22 @@ def apps_problem(value: Any) -> str | None:
         if key not in APPS_DEFAULTS:
             return (f"「应用」设置中不支持「{key}」，可设置的项："
                     + "、".join(f"「{APPS_SETTING_LABEL[k]}」" for k in APPS_DEFAULTS))
-        if not _daily_limit_ok(item):
+        if key == "user_personal_apps":
+            if not isinstance(item, bool):
+                return f"「{APPS_SETTING_LABEL[key]}」只能是开或关，当前为「{item}」"
+        elif not _daily_limit_ok(item):
             return (f"「{APPS_SETTING_LABEL[key]}」需要是 0 到 {APPS_DAILY_LIMIT_MAX:,} 之间的整数（0 表示不再发起按需运行），"
                     f"当前为「{item}」")
     return None
 
 
 def apps_values(stored: Any) -> dict[str, Any]:
-    """库里存的（或刚写进来的）apps 一组 → 补齐默认；存坏了的项按默认。"""
+    """库里存的（或刚写进来的）apps 一组 → 补齐默认；存坏了的项按默认（个人应用的开关存坏了按关）。"""
     stored = stored if isinstance(stored, dict) else {}
     limit = stored.get("on_demand_daily_limit")
-    return {"on_demand_daily_limit": limit if _daily_limit_ok(limit) else APPS_DEFAULTS["on_demand_daily_limit"]}
+    personal = stored.get("user_personal_apps")
+    return {"on_demand_daily_limit": limit if _daily_limit_ok(limit) else APPS_DEFAULTS["on_demand_daily_limit"],
+            "user_personal_apps": personal if isinstance(personal, bool) else APPS_DEFAULTS["user_personal_apps"]}
 
 
 async def apps_settings(session: AsyncSession) -> dict[str, Any]:
@@ -750,7 +758,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     NOTIFY_GROUP: notify_values(None),
     # 起草模型：数据目录起草、按配方导入的 AI 起草用的模型，留空沿用助手的模型
     CATALOG_DRAFT_GROUP: catalog_draft_values(None),
-    # 应用：按需视图的每日上限（管理员在设置页改）
+    # 应用：按需视图的每日上限、使用者能不能建个人应用（管理员在设置页改）
     APPS_GROUP: apps_values(None),
 }
 

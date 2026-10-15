@@ -42,3 +42,18 @@ def test_annotations_do_not_change_validation():
     assert not list(Draft202012Validator(table).iter_errors({"title": "门店", "sort": "-gmv", "limit": 20}))
     assert list(Draft202012Validator(table).iter_errors({"limit": 0}))
     assert list(Draft202012Validator(table).iter_errors({"unknown": 1}))
+
+
+def test_text_props_are_marked_for_page_editing():
+    """应用页上直接改的「改文字」（normal-user-apps N6）只改标了 x-text 的属性：给人看的标题、名称、说明。
+    列名、换算这类写给解析器的字符串不标，普通人改了会让组件取不到数。x-text 同样只是注解，不参与校验。"""
+    marked = {(c["name"], key) for c in COMPONENTS for key, prop in c["props"]["properties"].items()
+              if prop.get("x-text") is True}
+    assert {("metric", "label"), ("metric", "unit"), ("text", "markdown"), ("notice", "text"),
+            ("section", "description"), ("entry_button", "label"), ("form", "submit_label")} <= marked
+    assert ("metric", "conv") not in marked and ("chart", "x") not in marked
+    # 只有字符串、不是枚举的才标
+    for name, key in marked:
+        prop = BY_NAME[name]["props"]["properties"][key]
+        assert prop["type"] == "string" and "enum" not in prop, (name, key)
+    assert not list(Draft202012Validator(BY_NAME["metric"]["props"]).iter_errors({"label": "销售额", "conv": "万"}))

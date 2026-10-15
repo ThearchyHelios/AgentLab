@@ -560,8 +560,11 @@ def reaches_app_files(path: str | None) -> bool:
     可写的沙箱根目录，登记模型生成的库是正当用法。
     """
     data = settings.data_dir
+    # records、files：记录表和上传文件（docs/design/normal-user-apps.md N8、N9）。记录表由平台登记成只读源、按行级可见查，
+    # 手工登记过去就绕开了钉版本和行级可见；上传的文件按绑定的运行核对读权限
     return _reaches(path, _zone(
-        [data / "artifacts", data / "sandbox-policies"], [*_app_db_files(), data / ".secret_key"]))
+        [data / "artifacts", data / "sandbox-policies", data / "records", data / "files"],
+        [*_app_db_files(), data / ".secret_key"]))
 
 
 def report_to_json(report: Any) -> dict[str, Any]:
@@ -2625,7 +2628,8 @@ async def _disable_manual_app_files(session: AsyncSession) -> int:
         select(DataSource).where(
             DataSource.kind == "sqlite",
             or_(DataSource.enabled.is_(True), DataSource.readonly.is_(False)),
-            or_(DataSource.origin.is_(None), DataSource.origin != "upload"),
+            # 记录表（origin=records）的文件就在应用的数据目录里，是平台自己登记的只读源，不在此列
+            or_(DataSource.origin.is_(None), DataSource.origin.not_in(("upload", "records"))),
         )
     )).scalars())
     hit = [row for row in rows if reaches_app_files(row.database)]

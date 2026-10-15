@@ -341,6 +341,8 @@ async def _resolve(session: AsyncSession, row: DataSource, ctx: ToolContext) -> 
     pins = ctx.data_versions
     if isinstance(pins, dict) and row.id not in pins and _pinned_under_name(pins, row.name):
         raise table_versions.SnapshotMissing(_rebuilt(row.name))
+    if (getattr(row, "origin", None) or "manual") == "records":
+        return await _resolve_records(session, row, ctx), True
     if (getattr(row, "origin", None) or "manual") != "upload":
         return row, False
     if pins is None or pins is Versions.CURRENT:
@@ -426,6 +428,66 @@ async def _pin_late(row: DataSource, ctx: ToolContext) -> str:
                         source_id=row.id, source=row.name, snapshot=sid, late=True)
     # 一定是非空的快照 id：交给 resolve_source 的空值会被当成「没固定」，退回当前指针
     return sid
+
+
+async def _resolve_records(session: AsyncSession, row: DataSource, ctx: ToolContext) -> Any:
+    """记录表（docs/design/normal-user-apps.md N8）：按这次运行 data_versions 里记下的高水位和行级过滤，换成连接上建
+    同名临时视图的 RecordsView（records/views.py）。和上传表格同一套规矩：
+
+    - 不在运行里（工具库试用，Versions.CURRENT）、升级前发起的运行（None）：现在的数据、看全部（只有搭建者进得来）；
+    - 在运行里却没拿到固定的版本（Versions.UNSET）：报错，不退回现在的数据；
+    - 运行里还没固定（发起时没算到）：第一次用到时固定当时的高水位和行级过滤，记进运行（_pin_late_records）。"""
+    from app.records import views as records_views
+
+    pins = ctx.data_versions
+    if pins is None or pins is Versions.CURRENT:
+        return await records_views.resolve(session, row)
+    if not isinstance(pins, dict):
+        logger.error("记录表 %s 的工具没拿到用哪一版（运行 %s 节点 %s 的 ToolContext.data_versions=%r）",
+                     row.name, ctx.run_id, ctx.node_id, pins)
+        raise table_versions.SnapshotMissing(_versions_lost(row.name))
+    entry = pins.get(row.id)
+    if not isinstance(entry, dict) or not isinstance(entry.get("seq"), int):
+        entry = await _pin_late_records(row, ctx)
+    return await records_views.resolve(session, row, entry)
+
+
+async def _pin_late_records(row: DataSource, ctx: ToolContext) -> dict[str, Any]:
+    """发起时没固定到的记录表：第一次用到时固定当时的高水位和这次运行看哪些行，记进 runs.data_versions。
+    做法同 _pin_late：锁内认运行记录里已有的，没有才现算；补固定这件事发一条日志事件。"""
+    from app.db.base import SessionLocal
+    from app.db.models import Run
+    from app.records.views import pin_entry
+
+    pins = ctx.data_versions
+    assert isinstance(pins, dict)
+    created = False
+    async with _late_lock():
+        entry = pins.get(row.id)
+        if isinstance(entry, dict) and isinstance(entry.get("seq"), int):
+            return entry
+        async with SessionLocal() as session:
+            run = await session.get(Run, ctx.run_id) if ctx.run_id else None
+            stored = dict((run.data_versions if run is not None else None) or {})
+            entry = stored.get(row.id)
+            if not (isinstance(entry, dict) and isinstance(entry.get("seq"), int)):
+                entry = await pin_entry(session, row, run_class=run.run_class if run is not None else "exploratory",
+                                        started_by=run.started_by if run is not None else None)
+                if entry is None:
+                    raise table_versions.SnapshotMissing(f"记录表「{row.name}」的登记或数据文件不在了，请联系管理员")
+                entry["late"] = True
+                created = True
+                if run is not None:
+                    stored[row.id] = entry
+                    run.data_versions = stored
+                    await session.commit()
+        pins[row.id] = entry
+    if created:
+        await _announce(ctx, EventType.LOG, level="info", code=LATE_PIN_CODE,
+                        message=f"记录表「{row.name}」发起时没有固定，本次运行第一次用到它时固定为当时已有的记录，"
+                                "之后继续运行、审批恢复都沿用这一份",
+                        source_id=row.id, source=row.name, seq=entry.get("seq"), late=True)
+    return entry
 
 
 async def _announce(ctx: ToolContext, event_type: EventType, **data: Any) -> None:
@@ -611,6 +673,11 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
                 extra["masked_whole"] = True
             if version := getattr(source, "snapshot_id", None):
                 extra["data_version"] = version
+            # 记录表（records/views.py）：查的是第几条以内、看的是谁的行。不写进 data_version：那一项是上传表格的快照
+            # id，出处链按它找快照文件
+            if getattr(source, "origin", None) == "records" and getattr(source, "prelude", None):
+                extra["records_view"] = {"high_water": getattr(source, "high_water", None),
+                                         "rows": getattr(source, "rows", None)}
             # 工件引用的 meta 记下源和 SQL 里用到的表：数据目录按它数每张表被运行查询过几次
             # （catalog.table_usage），不用再逐个读工件内容。meta 不进内容哈希，快照本身一字不变
             payload["artifact"] = await put_json(

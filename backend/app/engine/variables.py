@@ -182,8 +182,13 @@ def _iter_strings(value: Any, prefix: str = "") -> list[tuple[str, str]]:
 
 
 def _root_of(expr: str) -> tuple[str, str]:
-    """把 `vars.sales | json` 拆成 ('vars.sales', 'vars')。"""
+    """把 `vars.sales | json` 拆成 ('vars.sales', 'vars')。模板函数（`file_text(input.附件, 8000)`）按它的第一个
+    参数认：引用的是 input.附件。"""
+    from app.engine.expressions import template_call
+
     path = expr.split("|")[0].strip()
+    if "(" in path and (call := template_call(path)) is not None:
+        path = call[1][0] if call[1] else ""
     # 去掉下标，vars.rows[0].name → vars.rows.name
     clean = re.sub(r"\[[^\]]*\]", "", path)
     root = clean.split(".")[0].strip()

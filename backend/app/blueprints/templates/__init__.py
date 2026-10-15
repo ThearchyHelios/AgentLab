@@ -80,3 +80,5 @@ def check_registry() -> list[str]:
     """启动时核对：首批模板都登记了、关节类型都认得。交回问题清单（空 = 没问题）。"""
     problems = [f"模板「{t}」没有登记" for t in TEMPLATE_IDS if t not in _REGISTRY]
     return problems
+
+from app.blueprints.templates import approval, exception_handling, freeform, periodic_board, reconcile_writeback, records  # noqa: E402,F401

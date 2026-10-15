@@ -65,8 +65,14 @@ def put_raw(raw: bytes) -> tuple[str, Path]:
     已有文件的哈希对不上（磁盘损坏、被人改过）时，用这次的字节原子替换掉它：路径本身就是
     内容的哈希，这次手里的字节才是这个名字应有的内容。
     """
+    return put_addressed(raw, raw_root())
+
+
+def put_addressed(raw: bytes, root: Path) -> tuple[str, Path]:
+    """按内容哈希存进 root/<前两位>/<sha>，只读（0444），返回 (sha256, 路径)。原件存档和上传的文件
+    （files/store.py，docs/design/normal-user-apps.md N9）共用这一种写法，见 put_raw。"""
     sha = hashlib.sha256(raw).hexdigest()
-    path = raw_path(sha)
+    path = root / sha[:2] / sha
     if path.is_file() and sha256_file(path) == sha:
         return sha, path
     path.parent.mkdir(parents=True, exist_ok=True)

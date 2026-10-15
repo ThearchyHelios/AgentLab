@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import math
 import operator
 import re
-from typing import Any
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 # --------------------------------------------------------------------------
 # 变量插值： {{ input.query }} / {{ nodes.n1.text }} / {{ vars.items | json }}
@@ -70,8 +75,102 @@ def _stringify(value: Any) -> str:
     return str(value)
 
 
+# --------------------------------------------------------------------------
+# 模板函数：{{ file_text(input.附件) }} / {{ file_text(input.附件, 8000) }}
+# --------------------------------------------------------------------------
+
+#: 模板里能调的函数：名字 → 「模块:函数」，用到时才导入（模板引擎不依赖文件存储）。参数是路径（input.附件）、数或
+#: 带引号的文字；函数要知道自己在哪次运行、哪个节点（发事件、核对绑定的文件），从 TEMPLATE_SCOPE 取
+TEMPLATE_FUNCTIONS: dict[str, str] = {"file_text": "app.files.text:file_text"}
+#: 模板函数的准备：节点配置里用到这个函数时，执行前先异步做的事（模板渲染是同步的，读库只能放在这里）。
+#: 名字 → 「模块:函数」，函数收 TemplateScope
+TEMPLATE_PREPARERS: dict[str, str] = {"file_text": "app.files.text:prepare"}
+_CALL = re.compile(r"^([A-Za-z_]\w*)\s*\((.*)\)$", re.S)
+_ARG_NUMBER = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+
+
+@dataclass
+class TemplateScope:
+    """一次节点执行里渲染模板的运行上下文：node 是 NodeContext（运行、节点、发事件），memo 给模板函数记这一次执行里
+    已经做过的事（同一个附件同一个上限只抽一次、只发一条事件）。"""
+
+    node: Any
+    memo: dict[str, Any] = field(default_factory=dict)
+
+
+TEMPLATE_SCOPE: ContextVar[TemplateScope | None] = ContextVar("agentlab_template_scope", default=None)
+
+
+async def open_template_scope(node: Any) -> TemplateScope:
+    """一次节点执行的模板上下文：节点配置（连同图级默认）里用到哪个模板函数，就先做它的准备（TEMPLATE_PREPARERS，
+    例如读这次运行绑定的文件）。每次执行现做：回复待办时新绑上的文件，恢复之后的这一次执行就看得到。"""
+    scope = TemplateScope(node)
+    text = json.dumps([getattr(node, "config", None), getattr(getattr(getattr(node, "run", None), "spec", None),
+                                                              "defaults", None)], ensure_ascii=False, default=str)
+    for name, target in TEMPLATE_PREPARERS.items():
+        if f"{name}(" in text:
+            module, _, attr = target.partition(":")
+            await getattr(importlib.import_module(module), attr)(scope)
+    return scope
+
+
+@contextmanager
+def template_scope(scope: TemplateScope) -> Iterator[TemplateScope]:
+    """节点执行期间设好模板的运行上下文（engine/compiler.py 包在每次执行外面）。不在节点里渲染时没有它，模板函数
+    照实说「运行时才读取」。"""
+    token = TEMPLATE_SCOPE.set(scope)
+    try:
+        yield scope
+    finally:
+        TEMPLATE_SCOPE.reset(token)
+
+
+def template_call(expr: str) -> tuple[str, list[str]] | None:
+    """`file_text(input.附件, 8000)` → ("file_text", ["input.附件", "8000"])；不是登记过的模板函数为 None。
+    变量检查（engine/variables.py）按它认出函数里引用的路径。"""
+    m = _CALL.match(expr.strip())
+    if not m or m.group(1) not in TEMPLATE_FUNCTIONS:
+        return None
+    args = [a.strip() for a in _split_args(m.group(2))]
+    return m.group(1), [a for a in args if a]
+
+
+def _split_args(text: str) -> list[str]:
+    """按顶层逗号切参数：引号、括号、方括号里的逗号不算。"""
+    out: list[str] = []
+    depth, quote, start = 0, "", 0
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            out.append(text[start:i])
+            start = i + 1
+    out.append(text[start:])
+    return out
+
+
+def _arg_value(arg: str, ctx: dict[str, Any]) -> Any:
+    if _ARG_NUMBER.match(arg):
+        return float(arg) if "." in arg else int(arg)
+    if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "'\"":
+        return arg[1:-1]
+    return resolve_path(ctx, arg)
+
+
+def _function(name: str) -> Callable[..., Any]:
+    module, _, attr = TEMPLATE_FUNCTIONS[name].partition(":")
+    return getattr(importlib.import_module(module), attr)
+
+
 def render_template(text: str, ctx: dict[str, Any]) -> str:
-    """把字符串里的 {{ ... }} 全部替换掉。支持 `路径 | 过滤器` 语法。"""
+    """把字符串里的 {{ ... }} 全部替换掉。支持 `路径 | 过滤器` 语法，以及登记过的模板函数（TEMPLATE_FUNCTIONS）。"""
     if not text or "{{" not in text:
         return text or ""
 
@@ -79,8 +178,13 @@ def render_template(text: str, ctx: dict[str, Any]) -> str:
         expr = match.group(1).strip()
         if not expr:
             return ""
+        call = template_call(expr.split("|")[0]) if "(" in expr else None
         parts = [p.strip() for p in expr.split("|")]
-        value = resolve_path(ctx, parts[0])
+        if call is not None:
+            name, args = call
+            value = _function(name)(*(_arg_value(a, ctx) for a in args))
+        else:
+            value = resolve_path(ctx, parts[0])
         for filt in parts[1:]:
             fn = _FILTERS.get(filt)
             if fn:

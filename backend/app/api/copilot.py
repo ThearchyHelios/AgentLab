@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -449,7 +450,29 @@ async def _previous_graph(
     if not conversation_id:
         return None
     turns = await recent_turns(session, conversation_id)
-    return next((t.graph for t in reversed(turns) if t.graph), None)
+    return next((t.graph for t in reversed(turns) if _has_nodes(t.graph)), None)
+
+
+def _has_nodes(graph: Any) -> bool:
+    """一轮记下的图里有没有节点：只问了一句、没搭图的那一轮记的是空图，不算「上一轮的图」。"""
+    return isinstance(graph, dict) and bool(graph.get("nodes"))
+
+
+def _asked_of(asked: dict[str, Any]) -> dict[str, Any]:
+    """模型的反问（ask 操作）→ 交给前端、记进这一轮 meta.asked 的形状 {question, options}。"""
+    options = asked.get("options")
+    listed = options if isinstance(options, list) else []
+    return {"question": str(asked.get("question") or ""),
+            "options": [str(o) for o in listed if isinstance(o, (str, int, float))]}
+
+
+def _asked_final(asked: dict[str, Any], base_graph: dict[str, Any] | None,
+                 prev_graph: dict[str, Any] | None) -> dict[str, Any]:
+    """只问不改的一轮的收尾：图原样交回（画布上原来的图、问数据上一轮的图，都没有就是空图），不运行、不重排。"""
+    graph = base_graph if _has_nodes(base_graph) else prev_graph if _has_nodes(prev_graph) else None
+    graph = graph or {"nodes": [], "edges": []}
+    return {"op": "final", "graph": graph, "issues": [], "explanation": "", "autorun": False,
+            "layout": {"mode": "keep", "placed": []}, "tool_changes": [], "asked": _asked_of(asked)}
 
 
 async def _history_section(session: AsyncSession, conversation_id: str | None) -> str:
@@ -472,7 +495,7 @@ async def _history_section(session: AsyncSession, conversation_id: str | None) -
         return ""
 
     lines = [
-        f"第 {i} 轮\n  问：{t.question}\n  答：{_answer_of(t) or '（没有结果）'}"
+        f"第 {i} 轮\n  问：{t.question}\n  答：{_asked_line(t) or _answer_of(t) or '（没有结果）'}"
         for i, t in enumerate(turns, 1)
         if t.question
     ]
@@ -481,7 +504,7 @@ async def _history_section(session: AsyncSession, conversation_id: str | None) -
 
     block = "# 这次对话之前聊过的\n" + "\n".join(lines)
 
-    last_graph = next((t.graph for t in reversed(turns) if t.graph), None)
+    last_graph = next((t.graph for t in reversed(turns) if _has_nodes(t.graph)), None)
     if last_graph:  # 和 _previous_graph 取的是同一张，兜底重放靠的就是它
         block += (
             "\n\n上一轮用的工作流（数据源和表都已经对好了）：\n"
@@ -490,6 +513,25 @@ async def _history_section(session: AsyncSession, conversation_id: str | None) -
     if looked := _looked_line(turns[-1]):
         block += "\n\n" + looked
     return block
+
+
+#: 只问不改的那一轮在历史里的写法：下一轮用户的话就是在回答它
+ASKED_PROMPT = "（助手反问，等用户回答：{question}{options}）"
+
+
+def _asked_line(turn: Any) -> str:
+    """这一轮是助手反问（前端记进 meta.asked：final 带的 {question, options}，或者只记 true、问题写在答案里）：写成「助手
+    反问了什么」——不然下一轮模型把它当成自己给出的答案，不知道用户的话是在回答它的问题。不是反问的轮次是空串。"""
+    from app.api.conversations import turn_meta
+
+    asked = (turn_meta(turn) or {}).get("asked")
+    if asked is True:
+        asked = {"question": turn.answer or ""}
+    if not isinstance(asked, dict) or not str(asked.get("question") or "").strip():
+        return ""
+    options = [str(o) for o in asked.get("options") or [] if isinstance(o, (str, int, float))]
+    return ASKED_PROMPT.format(question=str(asked["question"]).strip(),
+                               options=f"；候选：{'、'.join(options)}" if options else "")
 
 
 LOOKED_PROMPT = "上一轮查看过：{items}（要再看时直接点名）"
@@ -1024,6 +1066,8 @@ async def _op_model(session: AsyncSession, payload: GenerateIn) -> tuple[Any, st
 
 # 多久没动静就补一拍心跳。3 秒是"用户开始怀疑是不是卡了"的量级。
 _HEARTBEAT_SECONDS = 3.0
+#: 蓝图助手和填关节里算「正在搭」的操作（bp_ask 是反问，不算）
+_BLUEPRINT_BUILD_OPS = ("bp_set", "bp_add", "bp_remove", "bp_template", "fill_joint")
 
 
 async def _with_heartbeat(source: Any, phase: str = "planning", *, started: float | None = None):
@@ -1048,7 +1092,8 @@ async def _with_heartbeat(source: Any, phase: str = "planning", *, started: floa
                     return
                 kind = op.get("op")
                 # 阶段跟着实际操作走，前端据此换文案。查看时生成过程自己发一拍 looking，查看完回到 planning
-                if kind == "add_node" or kind in APP_OPS:
+                # 蓝图助手的 bp_* 操作、填关节的 fill_joint 也是在动手（api/copilot_blueprint.py）
+                if kind == "add_node" or kind in APP_OPS or kind in _BLUEPRINT_BUILD_OPS:
                     phase = "building"
                 elif kind in ("add_edge", "connect"):
                     phase = "wiring"
@@ -1742,7 +1787,10 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 yield _sse(applier.replied)
                 return
             if gen.asked is not None and not applier.effective:
-                # 先问清楚才能动手，什么都还没改：问题已经转出去了，这一轮到此为止
+                # 先问清楚才能动手，什么都还没改：这一轮到此为止。照样发一条 final 收尾，带上问题（asked）和没动过的图：
+                # 前端据此把这一轮记成「助手反问」、问题进历史（以前流就这么断了，问数据页一直停在「进行中」），
+                # 不运行、不重排。图给一份对象（画布上原来的图、问数据上一轮的图，都没有就是空图），老前端照样认得
+                yield _sse(_asked_final(gen.asked, payload.base_graph, prev_graph))
                 return
             # 只发了目录修改提案，既没回答也没改图（用户只是在说一条数据事实）：补一句回答收尾，
             # 不能按下面的「模型没有给出任何修改」报错——提案已经摆在用户面前了
@@ -1828,6 +1876,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 "layout": layout,
                 # 改图回执：哪些节点、成员的工具变了。画布上看不出来，得明说
                 "tool_changes": changes,
+                # 改了图又问了用户（这一轮照样结束、不自动运行）：问题跟着 final 交付，前端记进这一轮
+                **({"asked": _asked_of(gen.asked)} if gen.asked is not None else {}),
             }
         except Exception as e:  # noqa: BLE001
             final = {"op": "error", "message": f"模型返回的工作流结构有误：{graph_error(e)}",
@@ -2409,7 +2459,7 @@ async def app_stream(payload: AppStreamIn, session: AsyncSession = Depends(get_s
         APP_REQUEST_PROMPT.format(spec=json.dumps(spec, ensure_ascii=False, indent=2), instruction=payload.instruction),
         await _history_section(session, payload.conversation_id))
     applier = AppApplier(spec)
-    checker = AppChecker(applier, bindings=bindings)
+    checker = AppChecker(applier, bindings=bindings, scope=(row.scope if row is not None else None) or "shared")
     started = time.monotonic()
     gen = Generation(model, system=system, applier=applier, checker=checker, looks=looks, started=started)
 
@@ -2479,25 +2529,84 @@ async def extract_template(
     新工作流记下来源（workflows.origin = {run_id, conversation_id?, turn_id?}）：从这里发布、再做成应用的那条路
     （总方案 A8）事后查得到它出自哪次运行、哪段对话。
     """
-    from sqlalchemy import select as _sel
-
-    from app.db.models import Run, RunEvent, Workflow, WorkflowVersion
+    from app.db.models import WorkflowVersion
     from app.core.artifact_store import graph_hash
 
     # 对话只是记进来源：不能用的不让记（D-d），不存在的照旧记下 id
     await _ensure_conversation_access(session, payload.conversation_id)
-    run = await session.get(Run, payload.run_id)
+    try:
+        path = await extract_run_path(session, payload.run_id)
+    except PathRefused as e:
+        raise HTTPException(e.status_code, e.message) from e
+    run, graph = path.run, path.graph
+    workflow = Workflow(
+        name=payload.name or f"{run.workflow_name or '探索'}（提取的模板）",
+        description=f"从运行 {run.id[:8]} 的实际执行路径提取（{path.nodes} 个节点），经人工审核后发布",
+        graph=graph,
+        tags=["extracted"],
+        status="draft",
+        origin={"run_id": run.id,
+                **({"conversation_id": payload.conversation_id} if payload.conversation_id else {}),
+                **({"turn_id": payload.turn_id} if payload.turn_id else {})},
+    )
+    session.add(workflow)
+    await session.flush()
+    session.add(
+        WorkflowVersion(
+            workflow_id=workflow.id, version=1, graph=graph,
+            graph_hash=graph_hash(graph), note=f"从运行 {run.id} 提取",
+        )
+    )
+    await session.commit()
+    return {
+        "workflow_id": workflow.id,
+        "name": workflow.name,
+        "nodes": path.nodes,
+        "edges": path.edges,
+        "dropped_nodes": path.dropped,
+        "source_run": run.id,
+    }
+
+
+class PathRefused(Exception):
+    """提取不了：status_code / message 就是 HTTP 回的状态码和 detail。"""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+@dataclass
+class RunPath:
+    """从一次运行提取出的执行路径：草稿图（已排版）和节点、连线、剪掉的节点数。"""
+
+    run: Any
+    graph: dict[str, Any]
+    nodes: int
+    edges: int
+    dropped: int
+
+
+async def extract_run_path(session: AsyncSession, run_id: str) -> RunPath:
+    """一次成功运行实际走过的路径 → 草稿图（确定性）：只留执行过的节点和它们之间的边，分支上没走的岔路剪掉，输入值
+    参数化成入口字段的默认值。不落库。「提取成工作流」（/from-run）和蓝图的「从问数据的回答开始」共用。"""
+    from sqlalchemy import select as _sel
+
+    from app.db.models import Run, RunEvent
+
+    run = await session.get(Run, run_id)
     if not run:
-        raise HTTPException(404, "运行记录不存在，可能已被删除")
+        raise PathRefused(404, "运行记录不存在，可能已被删除")
     # 没跑通的路径提出来是半截骨架：失败节点之后的步骤一步都不在里面，
     # 人拿去审改时却看不出它缺了什么
     if run.status != "succeeded":
-        raise HTTPException(
+        raise PathRefused(
             409, "这次运行未成功结束，提取出的执行路径不完整。"
                  "请先让它成功运行一次，再从该次运行提取",
         )
-    if not run.graph.get("nodes"):
-        raise HTTPException(400, "这次运行没有保存工作流快照，无法提取")
+    if not (run.graph or {}).get("nodes"):
+        raise PathRefused(400, "这次运行没有保存工作流快照，无法提取")
 
     events = list(
         (
@@ -2513,7 +2622,7 @@ async def extract_template(
         if e.type == "edge.taken" and e.node_id
     }
     if not executed:
-        raise HTTPException(400, "这次运行没有节点执行记录")
+        raise PathRefused(400, "这次运行没有节点执行记录")
 
     spec = GraphSpec.model_validate(run.graph)
     kept_nodes = [n for n in spec.nodes if n.id in executed]
@@ -2540,34 +2649,8 @@ async def extract_template(
     draft_spec = auto_layout(
         GraphSpec(nodes=kept_nodes, edges=kept_edges, defaults=spec.defaults)
     )
-    graph = draft_spec.model_dump(mode="json")
-    workflow = Workflow(
-        name=payload.name or f"{run.workflow_name or '探索'}（提取的模板）",
-        description=f"从运行 {run.id[:8]} 的实际执行路径提取（{len(kept_nodes)} 个节点），经人工审核后发布",
-        graph=graph,
-        tags=["extracted"],
-        status="draft",
-        origin={"run_id": run.id,
-                **({"conversation_id": payload.conversation_id} if payload.conversation_id else {}),
-                **({"turn_id": payload.turn_id} if payload.turn_id else {})},
-    )
-    session.add(workflow)
-    await session.flush()
-    session.add(
-        WorkflowVersion(
-            workflow_id=workflow.id, version=1, graph=graph,
-            graph_hash=graph_hash(graph), note=f"从运行 {run.id} 提取",
-        )
-    )
-    await session.commit()
-    return {
-        "workflow_id": workflow.id,
-        "name": workflow.name,
-        "nodes": len(kept_nodes),
-        "edges": len(kept_edges),
-        "dropped_nodes": len(spec.nodes) - len(kept_nodes),
-        "source_run": run.id,
-    }
+    return RunPath(run=run, graph=draft_spec.model_dump(mode="json"), nodes=len(kept_nodes), edges=len(kept_edges),
+                   dropped=len(spec.nodes) - len(kept_nodes))
 
 
 class ExplainIn(BaseModel):

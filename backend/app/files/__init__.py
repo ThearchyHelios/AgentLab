@@ -3,7 +3,8 @@
 读文件：模板函数 file_text(ref)；导入：平台内置能力 table_import_period（按上传源已有的配方导入一期，效果写入）。
 下载按绑定的运行或记录核对读权限。没绑定的上传 24 小时后清理。
 
-包 B3 实现。
+模块：store（存放、上传上下文、绑定、读权限、删除、清理）、text（模板函数 file_text）、imports（平台能力
+table_import_period 的执行）；接口在 api/files.py。
 """
 from __future__ import annotations
 

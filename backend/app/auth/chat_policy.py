@@ -47,11 +47,13 @@ def _set(value: Any) -> bool:
     return value not in (None, "")
 
 
-def chat_graph_problem(graph: Any) -> str | None:
+def chat_graph_problem(graph: Any, *, where: str = "问数据") -> str | None:
     """这张图 user 角色能不能在问数据里运行：能用返回 None，不能用交回一句给人看的原因（403 的 detail）。
 
     图不成形（GraphSpec 校验不过）时也返回 None：交给 launch_run 照常报校验问题——两边用的是同一个 GraphSpec，过不了
-    校验的图本来就发起不了。"""
+    校验的图本来就发起不了。
+
+    where 是说法里的「在哪」：个人应用（blueprints/personal.py）用的是同一份白名单，只把「问数据」换成「个人应用」。"""
     from app.engine.launch import tool_bindings
     from app.engine.schema import GraphSpec, type_label
 
@@ -61,19 +63,20 @@ def chat_graph_problem(graph: Any) -> str | None:
         spec = GraphSpec.model_validate(graph)
     except ValueError:
         return None
+    scope_refused = SCOPE_REFUSED.replace("问数据", where)
     if any(_set(spec.defaults.get(key)) for key in SCOPE_KEYS):
-        return SCOPE_REFUSED
+        return scope_refused
     for node in spec.nodes:
         if str(node.type) not in CHAT_NODE_TYPES:
-            return (f"没有权限：使用者在问数据中不能使用「{type_label(node.type)}」节点（「{node.title}」）。"
+            return (f"没有权限：使用者在{where}中不能使用「{type_label(node.type)}」节点（「{node.title}」）。"
                     "如需这类处理，请联系搭建者做成应用")
         if any(_set(node.config.get(key)) for key in SCOPE_KEYS):
-            return f"{SCOPE_REFUSED}（「{node.title}」）"
+            return f"{scope_refused}（「{node.title}」）"
     for who, name in tool_bindings(spec):
         if "{{" in name:
-            return f"没有权限：{who}的工具名由模板拼成，发起前无法确定是哪个工具，使用者在问数据中不能这样绑定工具"
+            return f"没有权限：{who}的工具名由模板拼成，发起前无法确定是哪个工具，使用者在{where}中不能这样绑定工具"
         if not _tool_allowed(name):
-            return (f"没有权限：{who}绑定了工具「{name}」。使用者在问数据中只能使用数据源查询和只读的内置工具"
+            return (f"没有权限：{who}绑定了工具「{name}」。使用者在{where}中只能使用数据源查询和只读的内置工具"
                     "（计算、当前时间、JSON 取值、知识库检索、记忆读取）")
     return None
 

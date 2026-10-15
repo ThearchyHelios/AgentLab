@@ -25,6 +25,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.capabilities.platform import GOVERNANCE_DEFAULTS
+
 
 @dataclass(frozen=True)
 class EndpointResult:
@@ -44,6 +46,9 @@ GOVERNED_FIELDS = ("effect", "approval", "unattended_write", "returns_schema", "
                    "credential_mode", "lookup", "endpoint_id")
 #: 同步时写的字段（source_hash 只按它们算）
 _SYNCED_FIELDS = ("system", "title", "description", "params_schema", "effect_system")
+#: 新插入的行一律带上这几项（平台能力的治理默认会改其中几项）：一条 INSERT 插多行时各行的键要一样，
+#: 不然后面几行多出来的键会被丢掉
+_FRESH_DEFAULTS = {"unattended_write": False, "lookup": None}
 
 #: 登记的进程内快照：同步、治理、端点改动时重算（refresh_cache）。is_platform_query 跑在节点的热路径上、发布检查
 #: （engine/lint_capabilities.py）是同步函数，都不能每次查库
@@ -79,9 +84,10 @@ async def _discover(session: AsyncSession) -> dict[str, dict[str, Any]]:
 
     found: dict[str, dict[str, Any]] = {}
     for name, spec in all_specs().items():
+        # 平台内置的写入能力（records_append、table_import_period）自己声明效果为 write（capabilities/platform.py）
         found[name] = {"system": "builtin", "title": name, "description": spec.description,
                        "params_schema": _json_schema(spec.args_schema),
-                       "effect_system": "dynamic" if spec.dangerous or spec.writes_state else "read"}
+                       "effect_system": spec.effect or ("dynamic" if spec.dangerous or spec.writes_state else "read")}
 
     for src in (await session.execute(select(DataSource))).scalars():
         found[f"{QUERY_PREFIX}{src.name}"] = {
@@ -136,8 +142,10 @@ async def sync_all(session: AsyncSession) -> int:
         digest = _hash({**synced, "endpoint_id": item.get("endpoint_id")})
         row = existing.get(name)
         if row is None:
+            # 平台能力第一次进登记时带上治理默认（records_append 允许无人值守、查询能力是 records_lookup），之后照管理员改的
             fresh.append({"name": name, **synced, "source_hash": digest, "synced_at": now,
-                          "endpoint_id": item.get("endpoint_id")})
+                          "endpoint_id": item.get("endpoint_id"), **_FRESH_DEFAULTS,
+                          **GOVERNANCE_DEFAULTS.get(name, {})})
         elif row.source_hash != digest or row.missing:
             for key, value in synced.items():
                 setattr(row, key, value)
@@ -239,10 +247,12 @@ def governance_of(capability: Any) -> dict[str, Any]:
             "lookup": capability.lookup, "credential_mode": capability.credential_mode or "service"}
 
 
-def _default_governance(item: dict[str, Any]) -> dict[str, Any]:
-    """还没进登记表的能力（刚建的数据源，登记还没同步到）按同步得出的样子算：没人治理过，版本是新行的 1。"""
+def _default_governance(item: dict[str, Any], name: str = "") -> dict[str, Any]:
+    """还没进登记表的能力（刚建的数据源，登记还没同步到）按同步得出的样子算：没人治理过，版本是新行的 1。
+    平台能力带上它的治理默认（同 sync_all 插入新行时）。"""
     return {"effect": item["effect_system"], "approval": "inherit", "unattended_write": False, "version": 1,
-            "endpoint_id": item.get("endpoint_id"), "masked": [], "lookup": None, "credential_mode": "service"}
+            "endpoint_id": item.get("endpoint_id"), "masked": [], "lookup": None, "credential_mode": "service",
+            **GOVERNANCE_DEFAULTS.get(name, {})}
 
 
 async def _governed_rows(session: AsyncSession, tool_names: list[str]) -> dict[str, dict[str, Any]]:
@@ -257,7 +267,7 @@ async def _governed_rows(session: AsyncSession, tool_names: list[str]) -> dict[s
            (await session.execute(select(Capability).where(Capability.name.in_(names)))).scalars()}
     if missing := [n for n in names if n not in out]:
         found = await _discover(session)
-        out.update({n: _default_governance(found[n]) for n in missing if n in found})
+        out.update({n: _default_governance(found[n], n) for n in missing if n in found})
     return out
 
 
@@ -303,7 +313,12 @@ async def endpoint_request(session: AsyncSession, capability: Any, args: dict[st
     """平台执行器：按登记的端点发请求（只认登记的 base_url，参数按路径段编码代入），声明了 tabular 的读取落快照。
     实现在 capabilities/endpoints.py。tool：按这一行自定义工具拼请求（工具页试运行的草稿），不给按能力名找已保存的。"""
     from app.capabilities.endpoints import endpoint_request as run
+    from app.capabilities.platform import execute, is_platform
 
+    if tool is None and is_platform(getattr(capability, "name", None)):
+        # 平台内置能力（记录表、导入一期）：平台自己执行，不发请求；生效记录、幂等、确认照旧在动作流程里
+        return await execute(session, capability, args, environment=environment, idem_key=idem_key,
+                             on_behalf=on_behalf, run_id=run_id, node_id=node_id)
     return await run(session, capability, args, environment=environment, idem_key=idem_key, on_behalf=on_behalf,
                      run_id=run_id, node_id=node_id, tool=tool)
 
@@ -380,9 +395,15 @@ async def _check_lookup(session: AsyncSession, name: str, endpoint_id: str | Non
     （endpoint_request），所以只能是同一个端点上、绑定端点的只读能力：写记忆这类平台自身的写、别的系统上的读取、
     MCP 和 Python 工具都查不了这一笔写入。能力页的候选按同一条规矩列。"""
     from app.capabilities.endpoints import bound_endpoint_ref
+    from app.capabilities.platform import is_platform, lookup_allowed
     from app.db.models import Capability, CustomTool
 
     ref = str(lookup)
+    if is_platform(name):
+        # 平台能力的查询能力也由平台执行，只认登记好的那一对（records_append → records_lookup）
+        if not lookup_allowed(name, ref):
+            raise GovernanceError("平台能力的查询能力只能是平台为它准备的那一项")
+        return
     finder = await session.get(Capability, ref)
     tool = (await session.execute(select(CustomTool).where(CustomTool.name == ref))).scalar_one_or_none()
     if (ref == name or finder is None or finder.missing or effective_effect(finder) != "read" or tool is None

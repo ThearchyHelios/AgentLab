@@ -320,10 +320,13 @@ async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, ex
          environment=prep.environment, preview=prep.preview, attempt=prep.attempt)
 
     if prep.environment == "simulated":
+        from app.capabilities.platform import is_platform
+
         receipt = {"simulated": True, "environment": "simulated", "endpoint": prep.endpoint}
         await _set(action_id, ("pending",), state="simulated", receipt=receipt)
         emit(EventType.ACTION_SIMULATED, action_id=action_id, capability=name,
-             message="演练：探索运行里端点没有测试环境，没有发送请求")
+             message="演练：探索运行里不写平台的记录表和数据源，没有写入" if is_platform(name)
+             else "演练：探索运行里端点没有测试环境，没有发送请求")
         return _output(action_id, prep, "simulated", None, receipt)
 
     # 先记 sent 再发：发到一半进程没了，重启后看到的是 sent，只能核实，不会当成没发过再发一次
@@ -360,10 +363,15 @@ async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, ex
         emit(EventType.TOOL_END, tool=name, preview=receipt["summary"], artifact=artifact, action_id=action_id)
         return _output(action_id, prep, "confirmed", status, result.body)
     if status is None and not result.unknown:
-        # 连接都没建立、端点配置不对：请求确定没有发出去
+        # 连接都没建立、端点配置不对：请求确定没有发出去。平台内置能力（capabilities/platform.py）是平台自己拒收的
+        # （记录表的字段对不上、导入要人在数据页确认……），说「没有写入」
+        from app.capabilities.platform import is_platform
+
         await _set(action_id, ("sent",), state="failed", error=result.error or "请求没有发出")
         emit(EventType.ACTION_FAILED, action_id=action_id, capability=name, error=result.error)
         emit(EventType.TOOL_ERROR, tool=name, error=result.error or "请求没有发出", action_id=action_id)
+        if is_platform(name):
+            raise ActionFailed(f"「{name}」没有写入：{result.error or '平台没有执行'}")
         raise ActionFailed(f"「{name}」没有发送成功：{result.error or '请求没有发出'}")
     if status is not None and 400 <= status < 500 and status != 429:
         await _set(action_id, ("sent",), state="failed", response_status=status,

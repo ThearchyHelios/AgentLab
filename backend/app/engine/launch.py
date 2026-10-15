@@ -69,6 +69,7 @@ async def launch_run(
     app_id: str | None = None,
     app_version: int | None = None,
     expect_hash: str | None = None,
+    workflow_name: str | None = None,
 ) -> Run:
     """发起一次运行，返回刚建好的运行记录（执行已经交给 run_manager）。不发起就抛 LaunchRefused；抛别的异常时
     运行也没有开始执行。
@@ -83,12 +84,13 @@ async def launch_run(
       （run_version_unpublished），退役的拒绝（run_version_retired）。
     - 用到的能力的治理快照写进 options["capabilities"]；能力版本相对发布时有变化只记一条提醒（capability_drift）。
 
-    参数和 POST /api/runs 的请求体一一对应（input 叫 input_payload）；actor 是记在运行上的发起人。
+    参数和 POST /api/runs 的请求体一一对应（input 叫 input_payload）；actor 是记在运行上的发起人。workflow_name 是没挂在
+    工作流上的探索运行记在运行上的名字（蓝图的试运行写蓝图名），不给就是「未保存的工作流」；挂在工作流上的用工作流的名字。
     schedule_id 是发起它的定时任务，options 是整次运行沿用的选项快照，都原样交给 run_manager.start；图里有双盲复算、
     反方审稿节点时 options 另加核查设置的快照（_with_verify_snapshot）。
     """
     # 没挂在工作流上（画布没保存就发起、问数据当场搭的）。老数据里是「临时图」，前端两种都认
-    name = "未保存的工作流"
+    name = workflow_name or "未保存的工作流"
     run_version: int | None = None
     version_hash: str | None = None
     governed = False

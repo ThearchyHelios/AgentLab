@@ -28,6 +28,7 @@ from app.engine.deadline import segment
 from app.engine.replay import PROTOCOL, PROTOCOL_KEY, protocol_of
 from app.engine.schema import GraphSpec, NodeType, loop_steps, topology_of, validate_graph
 from app.process.actions import ActionPending
+from app.records.views import scope_entries
 from app.tools.datasource import RUN_VERSIONS_KEY
 
 logger = logging.getLogger(__name__)
@@ -244,6 +245,8 @@ class RunManager:
             # 看不到这条还没提交的运行，会把刚固定的快照删掉（table_versions.pin_lock）
             async with pin_lock():
                 data_versions = await _data_versions(session, spec)
+                # 记录表这次运行看哪些行：正式运行看全部，别的按发起人的授权（records/views.scope_entries）
+                await scope_entries(session, data_versions, run_class=run_class, started_by=started_by)
                 run = Run(
                     workflow_id=workflow_id,
                     workflow_name=workflow_name,
@@ -1177,8 +1180,13 @@ async def _data_versions(session: Any, spec: GraphSpec) -> dict[str, Any]:
     发起时算不到的（继续运行时改了节点配置、没固定版本的子工作流中途被改过、运行中途新建的源）
     由数据源工具第一次用到时补上（tools/datasource.py 的 _pin_late，记进运行记录并发一条日志事件）。
     没用到任何上传源时返回空 dict 而不是 None：None 留给升级前发起的运行（照旧用当前版本，不补固定）。
+
+    记录表（origin=records，docs/design/normal-user-apps.md N8）同样在这里固定高水位：{"seq": 高水位, …}
+    （records/views.pin_entry）。这次运行看哪些行由发起处另外记上（records/views.scope_entries）：按需视图的缓存键
+    只要高水位。
     """
     from app.db.models import DataSource
+    from app.records.views import pin_entry
 
     names, anything = await _bound_sources(session, spec)
     if not names and not anything:
@@ -1190,7 +1198,15 @@ async def _data_versions(session: Any, spec: GraphSpec) -> dict[str, Any]:
     if not anything:
         query = query.where(DataSource.name.in_(sorted(names)))
     rows = (await session.execute(query)).all()
-    return {sid: {"snapshot": snap, "name": name} for sid, name, snap in rows}
+    out: dict[str, Any] = {sid: {"snapshot": snap, "name": name} for sid, name, snap in rows}
+    records = select(DataSource).where(DataSource.enabled.is_(True), DataSource.origin == "records") \
+        .order_by(DataSource.name)
+    if not anything:
+        records = records.where(DataSource.name.in_(sorted(names)))
+    for source in (await session.execute(records)).scalars():
+        if (entry := await pin_entry(session, source)) is not None:
+            out[source.id] = entry
+    return out
 
 
 async def _bound_sources(session: Any, spec: GraphSpec) -> tuple[set[str], bool]:

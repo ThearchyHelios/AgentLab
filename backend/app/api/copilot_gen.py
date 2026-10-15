@@ -36,8 +36,9 @@ from app.providers.budget import cut_off as _cut_off
 
 #: 自查最多交回去改几轮。一轮只花一次"只输出改动"的调用；两轮还改不好，多半是需求本身有歧义，该让人看了
 SELF_CHECK_ROUNDS = 2
-#: 读到这几种操作就停下：done 说完了，look 要查看，ask 要等用户回答
-_STOP_OPS = ("done", "look", "ask")
+#: 读到这几种操作就停下：done 说完了，look 要查看，ask 要等用户回答（蓝图助手的反问是 bp_ask，normal-user-apps N2）
+_ASK_OPS = ("ask", "bp_ask")
+_STOP_OPS = ("done", "look", *_ASK_OPS)
 #: 不占次数的查看回话（need 没写、次数用完）连着来几次就不再接着写：模型在原地打转，再要下去只是花钱
 _IDLE_LOOKS = 2
 
@@ -418,6 +419,11 @@ APP_HUMAN_ONLY = frozenset({
     "app.slot_principal_unknown", "app.reconciler_unbound", "app.acl_empty", "app.acl_principal_unknown",
     "app.notify_channel_missing", "app.process_unsafe",
     "app.view_source_empty", "subgraph_version_unpublished", "subgraph_version_retired",
+    # 个人应用（docs/design/normal-user-apps.md N7、N6）：视图来源和应用范围对不上、图违反使用者的约束要回到蓝图改，
+    # 隐藏哪块是作者的决定——润色只改呈现，改不了视图来源，也不该替人取消隐藏
+    "app.view_source_personal", "app.hidden_bound", "personal.policy",
+    # 看板表格逐行列出记录表（N8）：公开不公开是作者的决定，助手不替人把表格换掉
+    "app.records_rows_exposed",
 })
 
 
@@ -533,9 +539,11 @@ POLISH_REFUSED = "app.polish_refused"
 class AppChecker:
     """应用的自查：app/apps/lint.lint_app 的 error，去掉只有人能处理的（APP_HUMAN_ONLY），交回模型改。"""
 
-    def __init__(self, applier: AppApplier, *, bindings: dict[str, Any] | None = None) -> None:
+    def __init__(self, applier: AppApplier, *, bindings: dict[str, Any] | None = None, scope: str = "shared") -> None:
         self.applier = applier
         self.bindings = bindings or {}
+        #: 应用的范围（App.scope）：个人应用按个人应用的规则查（apps/lint.lint_app 的 scope）
+        self.scope = scope
 
     async def lint(self) -> list[dict[str, Any]]:
         """全部问题（各级都在），交付时列出来。另开短会话：流里请求的会话已经不能用了。"""
@@ -543,7 +551,7 @@ class AppChecker:
         from app.db.base import SessionLocal
 
         async with SessionLocal() as session:
-            return list(await app_lint.lint_app(session, self.applier.spec, self.bindings))
+            return list(await app_lint.lint_app(session, self.applier.spec, self.bindings, scope=self.scope))
 
     async def issues(self) -> list[dict[str, Any]]:
         """交回模型改的：应用检查的 error（去掉只有人能处理的），加上这之前越界被拒、还没交回过的操作。"""
@@ -572,8 +580,10 @@ class Generation:
     """
 
     def __init__(self, model: Any, *, system: str, applier: Applier, checker: Checker | None = None,
-                 looks: LookService | None = None, started: float | None = None) -> None:
+                 looks: LookService | None = None, started: float | None = None, look_limit: int = LOOK_LIMIT) -> None:
         self.model = model
+        #: 起草阶段最多查看几次。蓝图、填关节按调用次数的预算收得更紧（normal-user-apps N11）
+        self.look_limit = look_limit
         self.system = system
         self.applier = applier
         self.checker = checker
@@ -587,7 +597,7 @@ class Generation:
         self.calls = 0
 
     async def draft(self, request: str) -> AsyncIterator[dict[str, Any]]:
-        async for op in self._converse(request, LookBudget(LOOK_LIMIT), repair=False):
+        async for op in self._converse(request, LookBudget(self.look_limit), repair=False):
             yield op
 
     async def repair(self, rounds: int = SELF_CHECK_ROUNDS) -> AsyncIterator[dict[str, Any]]:
@@ -635,7 +645,7 @@ class Generation:
                         yield op
                     elif kind == "look":
                         look = op
-                    elif kind == "ask":
+                    elif kind in _ASK_OPS:
                         self.asked = op
                         yield op
                     elif repair and kind in ("plan", "done"):

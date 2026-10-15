@@ -16,8 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict
 
-#: 这一版实现的对象类型（口径以后再加：账本先做实验，look §3.8）
-LOOK_KINDS = ("table", "capability", "workflow_version")
+#: 实现的对象类型。口径（caliber）是已发布口径卡上的指标，蓝图助手复用口径时看（look/calibers.py，normal-user-apps N2）
+LOOK_KINDS = ("table", "capability", "workflow_version", "caliber")
 
 LOOK_LIMIT = 3              # 起草阶段每轮最多查看几次
 REPAIR_LOOK_LIMIT = 1       # 自查修正阶段另给几次

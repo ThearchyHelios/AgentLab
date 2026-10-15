@@ -108,6 +108,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     await _tasks.startup()
     await _actions.startup()
+    # 发布单：上次进程没了时还在执行的单改成停下（停在没做完的那一步、写明执行中断），这样能接着做
+    from app.blueprints import publish_plan as _plans
+
+    try:
+        if stopped := await _plans.startup():
+            logger.info("%d 份发布单执行中断，已改成停下，可以接着做", stopped)
+    except Exception:  # noqa: BLE001
+        logger.exception("发布单的启动整理失败，服务照常启动")
     from app.sandbox.manager import sandbox_manager as _sbm
 
     await _sbm.start_reaper()

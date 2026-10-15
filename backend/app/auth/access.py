@@ -4,6 +4,7 @@
 - 自己发起的运行；
 - 自己参与的实例：派给过自己（或自己所在的组）的待办，或者自己回复过的待办所在的运行。派给「任何人」的不算：那是没有
   应用绑定的运行（画布、定时任务），user 角色不该因此读到；
+- 自己的个人应用（docs/design/normal-user-apps.md N7）的刷新：只有拥有者，别人的个人应用即使有人自报同名也不算；
 - 有授权（use / observe / manage，含 everyone 和自己所在的组）的应用里：
   - 视图运行（来源是应用视图、按新口径补算）；
   - observe、manage 授权另能读全部实例；
@@ -87,6 +88,8 @@ async def run_readable(principal: Any, run: Any) -> bool:
             return False
         if run.started_by == principal.username:
             return True
+        if run.origin_kind == "personal_app" and run.app_id:
+            return await _owns_personal_app(session, principal, run.app_id)
         if await _participated(session, principal, run.id):
             return True
         apps = await app_roles(session, principal)
@@ -94,6 +97,15 @@ async def run_readable(principal: Any, run: Any) -> bool:
             if run.origin_kind in _VIEW_ORIGINS or apps[run.app_id] & {"observe", "manage"}:
                 return True
         return await _viewed_by_granted_app(session, run, set(apps))
+
+
+async def _owns_personal_app(session: AsyncSession, principal: Any, app_id: str) -> bool:
+    """个人应用的刷新只有这个应用的拥有者能读：别人参与不了（不派待办）、也没有授权可言（个人应用不能分享）。按应用上记的
+    拥有者认，不按发起人——刷新只能由拥有者发起，这里不靠它。"""
+    from app.db.models import App
+
+    owner = await session.scalar(select(App.owner).where(App.id == app_id, App.scope == "personal"))
+    return bool(owner) and owner == principal.username
 
 
 async def artifact_readable(principal: Any, artifact_id: str) -> bool:

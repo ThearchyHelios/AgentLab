@@ -2,7 +2,7 @@
 
 操作（一行一个 JSON）：
   {"op":"app_add","parent":"<组件 id>|<页面 id>","index":0,"component":{...}}
-  {"op":"app_update","id":"<组件 id>","props":{...},"bind":{...},"visible":"..."}
+  {"op":"app_update","id":"<组件 id>","props":{...},"bind":{...},"visible":"...","hidden":true}
   {"op":"app_remove","id":"<组件 id>"}
   {"op":"app_move","id":"<组件 id>","parent":"...","index":0}
   {"op":"app_page","page":{"id","title"}}                    新增或改页面标题
@@ -125,6 +125,8 @@ def _update(spec: dict[str, Any], op: dict[str, Any]) -> Applied:
     if found is None:
         return _refuse(f"找不到组件「{op.get('id')}」")
     items, i = found
+    if "hidden" in op and op["hidden"] not in (True, False, None):
+        return _refuse("隐藏只能写是或否")
     before = copy.deepcopy(items[i])
     comp = items[i]
     if isinstance(op.get("props"), dict):
@@ -142,6 +144,12 @@ def _update(spec: dict[str, Any], op: dict[str, Any]) -> Applied:
                 comp.pop(key, None)
             else:
                 comp[key] = op[key]
+    # 隐藏（normal-user-apps N6）：作者不要它，只是呈现；为真才写，取消隐藏去掉这一项（组件模型的默认值是 false）
+    if "hidden" in op:
+        if op["hidden"] is True:
+            comp["hidden"] = True
+        else:
+            comp.pop("hidden", None)
     try:
         Component.model_validate(comp)
     except ValidationError as e:

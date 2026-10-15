@@ -703,7 +703,8 @@ async def _usable_sources(run_id: str, names: Iterable[str], versions: Any) -> d
         known = used.get(str(name))
         if known and str(source_id) not in known:
             continue
-        if (origin or "manual") == "upload" and pins is not None and source_id not in pins:
+        # 记录表（origin=records）同理：没固定过高水位的，建工具时会补固定进运行记录
+        if (origin or "manual") in ("upload", "records") and pins is not None and source_id not in pins:
             continue
         out[str(name)] = masked_columns(options)
     return out

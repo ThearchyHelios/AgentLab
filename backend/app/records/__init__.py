@@ -6,7 +6,9 @@
 - 钉版本：运行开始时 data_versions 记下高水位 _seq；查询连接上建同名 TEMP VIEW，只露出 _seq ≤ 高水位、没被更正过的行；
 - 行级可见：同一套临时视图按人过滤（use 只看自己的，observe / manage 看全部）；正式运行以服务身份跑、不过滤。
 
-包 B3 实现。
+模块：store（文件层：建表、加列、追加、高水位、视图语句）、tables（records_tables 与数据源的登记、表版本，
+ensure_table）、access（看哪些行）、views（查询时的 RecordsView、data_versions 里的那一项）、actions（平台能力
+records_append / records_lookup 的执行）、listing（记录列表）。
 """
 from __future__ import annotations
 
