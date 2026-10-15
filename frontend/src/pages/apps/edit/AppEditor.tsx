@@ -34,9 +34,9 @@ import { FormsSection } from './FormsSection'
 const SECTIONS = ['pins', 'pages', 'forms', 'preview', 'check', 'publish', 'access', 'hooks', 'notify'] as const
 type Section = typeof SECTIONS[number]
 
-/** 组件目录整站一份，进一次编辑器取一次就够 */
+/** 组件目录整站一份，进一次编辑器取一次就够（应用页上直接改的编辑层也用这一份） */
 let catalogCache: Promise<ComponentCatalog> | null = null
-const loadCatalog = () => {
+export const loadCatalog = () => {
   catalogCache ??= api.apps.catalog().catch((e) => { catalogCache = null; throw e })
   return catalogCache
 }

@@ -25,7 +25,11 @@
 //      彻底删除（清空也跳过它）；
 //  12. 限定数据源：点一下只查这个库，请求里带上 datasource_ids，库不在了说人话、补救是放开范围；
 //      库列表没取回来时，从上一问接过来的范围照样看得见；
-//  13. 画布助手的「在现有工作流上改 | 从头生成」分段控件；助手出错时同一句报错只说一遍。
+//  13. 画布助手的「在现有工作流上改 | 从头生成」分段控件；助手出错时同一句报错只说一遍；
+//  14. 助手反问（normal-user-apps N11）：只问不改的一轮记成「助手反问」，问题作为这一轮的内容、落库进历史，不再一直停在
+//      「正在理解需求」；输入框提示回答助手的问题；刷新后照样标「助手反问」，不当成没查库的回答；
+//  15. 回答上的「做成应用」带着这次运行进蓝图（建运行起点的蓝图），不再提取工作流、跳画布的发布弹窗；
+//  16. 服务端这一轮已经自查修正过（收到 check 的结论）还没过的：不再整轮重新生成一遍，直接说没过、给补救。
 //
 // 所有写请求都被拦在浏览器里，不碰任何库。
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
@@ -194,11 +198,16 @@ const GUARD_CONVS = {
 const FIX_CONVS = {
   fixZ: conv('c0fixz', '会话 Z：参数定义有误（后端现在的说法）', 1, 60 * 24 * 27),
 }
+/** 只在「助手反问」那段出现：库里存着一轮以反问收尾的（answer 列里是助手问的那句话，meta.asked 标着） */
+const ASKBACK_CONVS = {
+  askBack: conv('c0askbk', '助手反问过的会话', 1, 60 * 24 * 34),
+}
 /** 只在「问数据的证据」那段出现：库里存着一轮带证据的答案，刷新后回运行取 _evidence */
 const ASK_CONVS = {
   askZ: conv('c0askz', '问数据：各区域销售额和最大的一单', 1, 60 * 24 * 33),
 }
 const DETAIL = {
+  c0askbk: [turn('tab1', '上周销售额是多少', { answer: '销售额按下单日还是支付日算？', meta: { v: 1, asked: true } })],
   c0askz: [turn('tz9', '上周各区域的销售额，最大的一单是多少', {
     answer: EVQ.output.answer, graph: GRAPH, run_id: 'run-evq',
     meta: { v: 1, runId: 'run-evq', runClass: 'exploratory', runStatus: 'succeeded', evidence: true },
@@ -385,6 +394,8 @@ const ctl = {
   guardConvs: false,
   /** 列表里多摆「问数据的证据」那段的会话（ASK_CONVS） */
   askConvs: false,
+  /** 列表里多摆「助手反问」那段的会话（ASKBACK_CONVS） */
+  askBack: false,
   /** 列表里多摆「先去改参数定义」那段的会话（FIX_CONVS） */
   fixConvs: false,
   /** 数据源列表取不回来 */
@@ -401,6 +412,7 @@ const resetDb = () => {
 resetDb()
 const allConvs = () => [...Object.values(CONVS), ...Object.values(TRASHED), ...(ctl.trashMore ? Object.values(TRASH_MORE) : []),
   ...(ctl.guardConvs ? Object.values(GUARD_CONVS) : []), ...(ctl.askConvs ? Object.values(ASK_CONVS) : []),
+  ...(ctl.askBack ? Object.values(ASKBACK_CONVS) : []),
   ...(ctl.fixConvs ? Object.values(FIX_CONVS) : [])]
   .filter((c) => !db.purged.has(c.id))
   .map((c) => ({ ...c, archived: db.archived.has(c.id) }))
@@ -468,6 +480,26 @@ async function fakeApi(route) {
         { op: 'error', message: '模型返回的工作流结构有误：第 2 个节点的类型「sql」不存在',
           hint: '请重试，或把需求描述得更具体',
           detail: "2 validation errors for GraphSpec\nnodes.1.type\n  Input should be 'input', 'output', 'llm' [type=literal_error]" },
+      ]
+      return route.fulfill({ status: 200, contentType: 'text/event-stream',
+        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
+    }
+    if (String(b.instruction ?? '').includes('自查没修好')) {
+      // 服务端自查交回模型改过、还是没过（check failed），final 带着同一批问题：前端不该再整轮重来
+      const ops = [
+        { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+        ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
+        { op: 'check', status: 'failed', issues: ['「查数」节点还没有选择工具'] },
+        { op: 'final', graph: GRAPH, explanation: '', issues: [{ level: 'error', node_id: 'ag', message: '「查数」节点还没有选择工具' }] },
+      ]
+      return route.fulfill({ status: 200, contentType: 'text/event-stream',
+        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
+    }
+    if (String(b.instruction ?? '').includes('先问清楚')) {
+      // 助手要先问清楚才能动手（服务端 copilot_gen 的 ask）：问题转出去，这一轮到此为止——没有 final，也没有 reply
+      const ops = [
+        { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+        { op: 'ask', question: '销售额按下单日还是支付日算？' },
       ]
       return route.fulfill({ status: 200, contentType: 'text/event-stream',
         body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
@@ -1458,6 +1490,94 @@ for (const theme of THEMES) {
       JSON.stringify(sent))
     check('保存成功写明第几版、给到数据目录的入口', (await card.locator('[data-patch-done]').innerText()).includes('第 4 版')
       && (await card.locator('[data-patch-open]').getAttribute('href')) === '/data/catalog/src-shop/orders')
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('askback', '助手反问：这一轮记成「助手反问」，问题进历史，输入框提示回答', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0emptg')
+    const patches = log.patches.length
+    await send(page, '先问清楚再查上周销售额')
+    const t = await page.waitForFunction(() => window.__chat.getState().byConversation.c0emptg?.at(-1)?.phase !== 'planning', null,
+      { timeout: 6000 }).then(() => true, () => false)
+    const turn = (await chatState(page)).byConversation.c0emptg.at(-1)
+    check('只问不改的一轮收尾，不再一直停在「正在理解需求」', t && turn.phase === 'done', turn.phase)
+    check('这一轮记成「助手反问」，问题作为这一轮的内容', turn.asked === '销售额按下单日还是支付日算？'
+      && turn.output?.answer === turn.asked, JSON.stringify({ asked: turn.asked, output: turn.output }))
+    const card = page.locator('[data-turn]').last()
+    check('轮次头写「助手反问」，问题摆出来', (await card.innerText()).includes('助手反问')
+      && (await card.innerText()).includes('销售额按下单日还是支付日算？'), (await card.innerText()).split('\n').slice(0, 6).join(' / '))
+    check('不标「本条未查询数据库」（这不是回答）', !(await card.innerText()).includes('本条未查询数据库'))
+    const box = page.getByRole('textbox', { name: '向数据提问' })
+    check('输入框提示回答助手的问题', (await box.getAttribute('placeholder')).includes('回答助手的问题'))
+    const saved = await until(() => log.patches.slice(patches).some((x) => x.body.answer === '销售额按下单日还是支付日算？'))
+    const body = log.patches.slice(patches).find((x) => x.body.answer)?.body
+    check('问题落库进历史（answer 列），meta 标着反问', saved && body.status === 'done' && body.meta?.asked === true, JSON.stringify(body))
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+
+    // 刷新之后：库里的这一轮照样是「助手反问」，不当成没查库的回答
+    ctl.askBack = true
+    const again = await open(theme)
+    await goto(again.page, 'c0askbk')
+    const restored = again.page.locator('[data-turn]').last()
+    await restored.waitFor({ timeout: 6000 })
+    check('刷新后照样标「助手反问」', (await restored.innerText()).includes('助手反问'), (await restored.innerText()).split('\n').slice(0, 4).join(' / '))
+    check('……不标「本条未查询数据库」', !(await restored.innerText()).includes('本条未查询数据库'))
+    check('……输入框提示回答助手的问题', (await again.page.getByRole('textbox', { name: '向数据提问' }).getAttribute('placeholder'))
+      .includes('回答助手的问题'))
+    ctl.askBack = false
+    await again.ctx.close()
+  })
+
+  await section('selfcheck', '服务端已经自查修正过还没过：不再整轮重新生成', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0emptg')
+    const gens = log.gens.length
+    await send(page, '自查没修好的问题')
+    const done = await page.waitForFunction(() => window.__chat.getState().byConversation.c0emptg?.at(-1)?.phase === 'error', null,
+      { timeout: 6000 }).then(() => true, () => false)
+    await page.waitForTimeout(500)
+    const turn = (await chatState(page)).byConversation.c0emptg.at(-1)
+    check('只生成了一次（同一轮的自查修正已经做过，不再整轮重来）', log.gens.length - gens === 1, `${log.gens.length - gens} 次`)
+    check('这一轮照实说没过、说明已经修正过', done && turn.failure?.reason?.includes('已按检查结果修正过'), JSON.stringify(turn.failure))
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('makeapp', '做成应用：带着这次运行进蓝图，不再跳画布发布', async () => {
+    const { page, ctx, errors } = await open(theme)
+    const made = []
+    const extracted = []
+    await page.route('**/api/copilot/from-run**', (route) => { extracted.push(route.request().url()); return route.abort() })
+    await page.route(/\/api\/(blueprints|templates)(\/|\?|$)/, (route) => {
+      const r = route.request()
+      const path = new URL(r.url()).pathname
+      if (path === '/api/templates') return route.fulfill({ json: { items: [] } })
+      if (path === '/api/blueprints' && r.method() === 'POST') {
+        made.push(r.postDataJSON())
+        return route.fulfill({ status: 201, json: {
+          id: 'bp_from_run', name: 'B 的问题', owner: null, scope: 'shared', status: 'drafting', template_id: 'freeform',
+          template_version: 1, source: { kind: 'run', id: 'run-b1' }, conversation_id: null, workflow_id: null, app_id: null,
+          last_trial_run_id: null, graph_hash: 'x', joints: {}, copied_from: null, issues: [], created_at: iso(1), updated_at: iso(1),
+          spec: { format: 'agentlab.blueprint/1', purpose: { value: 'B 的问题', source: 'assistant', status: 'proposed' },
+            template: { id: 'freeform', version: 1 }, data: [], cadence: { value: null, source: 'assistant', status: 'missing' },
+            people: [], fields: [], writeback: null, access: { use: [], observe: [], manage: [] }, asks: [] },
+        } })
+      }
+      return route.fulfill({ status: 404, json: { detail: '检查脚本没有这个蓝图' } })
+    })
+    await goto(page, 'c0idleb')
+    const button = page.locator('[data-make-app]').last()
+    check('回答完成、有运行的轮次有「做成应用」', await button.waitFor({ timeout: 6000 }).then(() => true, () => false))
+    check('关登录（等同管理员）：建共享蓝图', await button.getAttribute('data-make-app') === 'shared')
+    await button.click()
+    check('建运行起点的蓝图', await until(() => made.length === 1) && made[0].source?.kind === 'run' && made[0].source?.id === 'run-b1'
+      && made[0].scope === 'shared', JSON.stringify(made[0]))
+    check('进蓝图页，不去画布', await page.waitForURL(/\/blueprints\/bp_from_run$/, { timeout: 5000 }).then(() => true, () => false)
+      && !page.url().includes('/studio/'), page.url())
+    check('不再提取工作流（from-run）', extracted.length === 0, extracted.join(' | '))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })

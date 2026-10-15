@@ -30,6 +30,7 @@ import { AppEditor } from './pages/apps/edit/AppEditor'
 // 普通用户建应用：新建应用的起点、蓝图页（F5）
 import { NewAppStart } from './pages/blueprints/NewAppStart'
 import { BlueprintPage } from './pages/blueprints/BlueprintPage'
+import { personalAppsOn } from './pages/blueprints/shared'
 import { LoginPage } from './pages/LoginPage'
 import { Logo } from './components/Logo'
 import {
@@ -221,6 +222,8 @@ function useRoleRedirect(): string | null {
   const me = useAuth((s) => s.me)
   const { pathname } = useLocation()
   if (!loginOn(me) || atLeast(me, 'builder') || pathname === '/') return null
+  // 个人蓝图（docs/design/normal-user-apps.md N7）：管理员开了个人应用时，使用者能进自己的蓝图页。它不是导航页，不在页面目录里
+  if (personalAppsOn(me) && pathname.startsWith('/blueprints/')) return null
   const ok = visiblePages(me).some((p) => pathname === p.to || pathname.startsWith(`${p.to}/`))
   return ok ? null : '/apps'
 }

@@ -15,7 +15,8 @@
  * - table、chart：{state, columns, rows（二维数组，遮罩的格子服务端已换成「已遮罩」）, masked, total_rows, truncated,
  *   evidence（kind 为 query，带查询快照的工件）}
  * - report：{state, node, doc_artifact, evidence}
- * - field（输入、成果、运行信息）：{state, text, value?, evidence?}；status：{state, value（运行状态）, text}
+ * - field（输入、成果、运行信息）：{state, text, value?, evidence?}（value 是提交的文件引用时画成下载链接）；
+ *   status：{state, value（运行状态）, text}
  * - form：{form}（表单名，表单在 ViewModel.forms 里）。提交即按这些值重新解析本页（按需视图的参数），见 input.tsx
  * - entry_button：{entry, label, disabled, reason?}
  * - instance_list：{who, entry, items: InstanceRow[]}

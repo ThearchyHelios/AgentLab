@@ -8,7 +8,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { ArrowDown, ArrowUp, RefreshCw, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../api/client'
+import { FileLink } from '../../components/FileInput'
 import { Notice, Spinner, StatusPill, useToast } from '../../components/ui'
+import { isFileRef } from '../../lib/schemaForm'
 import { Markdown } from '../../run/Markdown'
 import { EvidenceDoc } from '../../run/EvidenceDoc'
 import { useEvidence } from '../../store/evidence'
@@ -353,6 +355,8 @@ export function FieldBlock({ node }: NodeProps) {
       <span className="text-faint">{label}</span>
       {state ? <BlockState {...state} />
         : data.state === 'masked' ? <span className="italic text-faint">{text || VIEW_TEXT.masked}</span>
+        // 绑定的输入是提交的文件（normal-user-apps N9）：写成可下载的链接
+        : isFileRef(data.value) ? <FileLink file={data.value} />
         : !text ? <span className="text-faint">—</span>
         : evidence && evidence.kind !== 'report' ? <Num text={text} evidence={evidence} label={label} />
         : evidence ? <ReportText text={text} evidence={evidence} label={label} />

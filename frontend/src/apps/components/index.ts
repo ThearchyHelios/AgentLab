@@ -12,6 +12,7 @@ import { FormBlock } from './input'
 import {
   ActionStatus, EntryButton, InstanceHeader, InstanceList, InstanceTimeline, SignoffsBlock, TaskForm, TaskList,
 } from './process'
+import { RecordsList } from './records'
 
 export const RENDERERS: Record<string, ComponentType<NodeProps>> = {
   // 布局
@@ -42,4 +43,6 @@ export const RENDERERS: Record<string, ComponentType<NodeProps>> = {
   task_form: TaskForm,
   signoffs: SignoffsBlock,
   action_status: ActionStatus,
+  // 填报登记的逐行查看（normal-user-apps N8）：按看的人实时取，使用者只看自己的
+  records_list: RecordsList,
 }

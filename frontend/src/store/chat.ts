@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { ApiError, api, streamCopilot, streamRun } from '../api/client'
 import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
 import { copilotContext, copilotLook, decodeRun, looksOf } from '../run/decode'
-import { LOOK_TEXT } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT, LOOK_TEXT } from '../lib/terms'
 import type { LookEvent } from '../typesApp'
 import { errorMessage, humanizeError, isNetworkError } from '../lib/errors'
 import { guardReview, hasEvidence } from '../lib/evidence'
@@ -140,6 +140,8 @@ export interface TurnMeta {
   clipped?: 'partial' | 'lost'
   /** 这一问限定了只查哪些数据源 */
   scope?: ScopeSource[]
+  /** 这一轮以助手反问收尾（answer 列里是助手问的那句话，不是答案）：刷新之后照样标「助手反问」，不当成没查库的回答 */
+  asked?: true
   /** 这一轮助手查看过的表（look 事件原样，look §2.5.8）：下一轮服务端据此写「上一轮查看过」，追问时直接点名查看 */
   looks?: LookEvent[]
   /**
@@ -225,6 +227,11 @@ export interface ChatTurn {
   writing?: { chars: number; thought: string } | null
   /** 这一问只查这几个数据源。重试、重新问都沿用它 */
   scope?: ScopeSource[]
+  /**
+   * 助手问回来的那句话（N11）：这一轮到此结束，问题作为这一轮的内容显示、进历史，输入框提示回答它；用户的回答就是下一轮。
+   * 以前这里没有分支：只问不改的一轮流结束时既没有 final 也没有 reply，这一轮一直停在「正在理解需求」
+   */
+  asked?: string
 }
 
 export type LoadState = 'loading' | 'ready' | 'error'
@@ -439,6 +446,7 @@ function buildMeta(t: ChatTurn): TurnMeta {
     queries: t.events.length ? countQueries(t.events) : t.meta?.queries,
     clipped: t.clipped,
     scope: t.scope?.length ? t.scope : undefined,
+    asked: t.asked ? true : undefined,
     evidence: hasEvidence(t.output) || t.meta?.evidence || undefined,
     looks: lookList(t),
     at: Date.now(),
@@ -636,7 +644,7 @@ function restoreTurn(t: ConversationTurn): ChatTurn {
   } else if (t.status === 'error') {
     phase = outcome ?? 'error'
     status = PHASE_TEXT[phase]
-  } else if (t.graph && !runId && !answer) {
+  } else if (t.graph && !runId && (!answer || meta?.asked)) {
     phase = 'ready'   // 建好了没跑：刷新之后「跑一下」还得在
     status = PHASE_TEXT.ready
   } else {
@@ -678,7 +686,7 @@ function restoreTurn(t: ConversationTurn): ChatTurn {
     final: meta?.runStatus ? { status: meta.runStatus } : undefined,
     // 没有运行、没有图、却有答案：这一条是 reply，根据前几轮说的，没查库。
     // 这是这条路径上最硬的一条约定，老数据也要标出来
-    noQuery: meta?.noQuery ?? (t.status === 'done' && !t.run_id && !t.graph && !!answer),
+    noQuery: meta?.noQuery ?? (!meta?.asked && t.status === 'done' && !t.run_id && !t.graph && !!answer),
     pendingRun: phase === 'ready',
     restored: true,
     steps: 'idle',
@@ -695,6 +703,7 @@ function restoreTurn(t: ConversationTurn): ChatTurn {
       : !runId && graphful && atClip(answer) && !review?.answer ? 'lost' : undefined,
     meta,
     scope: meta?.scope,
+    asked: meta?.asked && answer ? answer : undefined,
   }
 }
 
@@ -1265,6 +1274,15 @@ function plan(flow: Flow, args: PlanArgs) {
 
   /** 这一轮建出来的图。retry 要把它交回去，所以得在闭包里留一份 */
   let built: GraphSpec | null = baseGraph ?? null
+  /** 助手问回来的那句话：流结束时没有别的结局（final / reply / error）就按反问收尾 */
+  let asked = ''
+  /** 这一轮已经有了结局（final、reply、error）：流结束时不再按反问收尾 */
+  let settled = false
+  /**
+   * 服务端这一轮已经按运行时同一套规则自查过（收到了 check 的结论）：没过的问题已经交回模型在同一轮里改过了（N11、G12）。
+   * 这时前端不再整轮重来——那是再烧一次完整生成，改的还是同一批问题；只有老服务端（不自查）才由前端重来一次
+   */
+  let selfChecked = false
 
   /**
    * 带着原因自动重来一次。超过上限就把原因如实留在这一轮上，不再烧钱。
@@ -1363,10 +1381,21 @@ function plan(flow: Flow, args: PlanArgs) {
         case 'done':
           patch(() => ({ explanation: op.explanation ?? '' }))
           break
+        case 'check':
+          // 自查的结论（通过、没修好）：同一轮里已经交回模型改过了
+          if (op.status === 'passed' || op.status === 'failed') selfChecked = true
+          break
+        case 'ask':
+          // 助手要先问清楚才能动手（N11）：记下问题，这一轮到此为止。后面要是还有 final（问之前已经改了图），按 final 收尾、
+          // 问题一并带上；流就此结束的话，结束时按反问收尾
+          asked = String(op.question ?? '').trim()
+          if (asked) patch(() => ({ status: CHAT_BLUEPRINT_TEXT.asked, asked }))
+          break
         case 'reply': {
           // 这句话不需要工作流——问的是前几轮已经查出来的东西，或者是
           // 对过程说的话（「重试」「换个说法」）。以前这些也各自重建一整张
           // 图、跑一遍 153 张表的库，纯属白花钱
+          settled = true
           const text = String(op.text ?? '')
           patch(() => ({
             phase: 'done', status: PHASE_TEXT.done, cancel: null, endedAt: Date.now(),
@@ -1376,6 +1405,7 @@ function plan(flow: Flow, args: PlanArgs) {
           break
         }
         case 'final': {
+          settled = true
           const graph = op.graph as GraphSpec
           built = graph          // 要重试的话，交回去的就是它
           // 连 meta 一起写：它的 at 是「建图还有动静」的凭据，后端这时也会刷新 updated_at
@@ -1387,14 +1417,14 @@ function plan(flow: Flow, args: PlanArgs) {
           const blockers = ((op.issues ?? []) as ValidationIssue[])
             .filter((i) => i.level === 'error')
             .map((i) => i.message)
-          if (blockers.length && retry(`生成的工作流没有通过校验：${blockers.join('；')}`)) break
+          if (blockers.length && !selfChecked && retry(`生成的工作流没有通过校验：${blockers.join('；')}`)) break
           if (blockers.length) {
-            // 重来一次还是没过。校验消息是写给画布用户的（"先拖一个节点进来"），
+            // 自查修正过（或重来一次）还是没过。校验消息是写给画布用户的（"先拖一个节点进来"），
             // 直接甩给一个在问数据页打字的人毫无意义——先给一句他能照做的，
             // 原文留在技术细节里作线索
             fail({
               title: '未能生成可运行的工作流',
-              reason: '已自动调整一次，生成的工作流仍未通过检查。',
+              reason: selfChecked ? '助手已按检查结果修正过，生成的工作流仍未通过检查。' : '已自动调整一次，生成的工作流仍未通过检查。',
               hint: '请补充描述后重新提问，写明要查询的数据库、时间范围和指标。',
               detail: blockers.join('\n'),
             }, graph)
@@ -1404,11 +1434,13 @@ function plan(flow: Flow, args: PlanArgs) {
           // 用户要的是流程本身时（「设计一个每天跑的工作流」），建完就跑
           // 等于替他多花一次钱，而他要的是那张图
           if (op.autorun === false) {
+            // 问了用户的不自动运行（服务端 autorun 为假）：图摆着等「运行」，问题照样作为这一轮的内容、进历史
             patch(() => ({
-              graph, phase: 'ready', status: PHASE_TEXT.ready, cancel: null,
+              graph, phase: 'ready', status: asked ? CHAT_BLUEPRINT_TEXT.asked : PHASE_TEXT.ready, cancel: null,
               explanation: op.explanation ?? '', pendingRun: true, endedAt: Date.now(),
+              ...(asked ? { output: { answer: asked } } : {}),
             }))
-            void flow.persist({ status: 'done' })
+            void flow.persist({ status: 'done', ...(asked ? { answer: asked } : {}) })
             break
           }
           patch(() => ({
@@ -1421,6 +1453,7 @@ function plan(flow: Flow, args: PlanArgs) {
         case 'error':
           // 后端给的是三段：message 人话、hint 怎么办、detail 原始异常。
           // 原文不再截成一行甩给用户，收进可展开、可复制的技术细节
+          settled = true
           fail({
             ...failureOf(op.message ?? '生成失败'),
             ...(op.hint ? { hint: String(op.hint) } : {}),
@@ -1430,7 +1463,18 @@ function plan(flow: Flow, args: PlanArgs) {
       }
     },
     (error, info?: { code?: string }) => {
-      if (!error || !flow.alive()) return
+      if (!error) {
+        // 流正常结束、只问了一句（ask 之后没有 final / reply）：这一轮记成「助手反问」，问题作为内容显示、落库进历史
+        if (asked && !settled && flow.alive()) {
+          patch(() => ({
+            phase: 'done', status: CHAT_BLUEPRINT_TEXT.asked, cancel: null, endedAt: Date.now(),
+            output: { answer: asked }, asked,
+          }))
+          void flow.persist({ status: 'done', answer: asked })
+        }
+        return
+      }
+      if (!flow.alive()) return
       const turn = findTurn(flow.conversationId, flow.turnId)
       if (!turn || !BUSY_PHASES.has(turn.phase) || turn.run) return
       // 限定的库一个都不在了：后端在开流之前就 400，带机读码 datasource_scope_empty。

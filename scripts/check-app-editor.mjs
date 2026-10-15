@@ -296,6 +296,11 @@ await section('页面树和属性面板：目录驱动、绑定、可见性', as
   const kinds = await insp.locator('[data-app-bind-kind] option').allInnerTexts()
   check('绑定种类只给目录登记的（指标、单元格）', kinds.includes('指标') && kinds.includes('单元格') && !kinds.includes('报告'), kinds.join(' | '))
   await insp.locator('[data-app-prop="unit"] input').fill('元')
+  // 隐藏（normal-user-apps N6）：和可见性条件分开的一个开关，树上标「已隐藏」
+  const hide = insp.locator('[data-app-hidden-switch] input[type="checkbox"]')
+  check('属性面板有「隐藏这个组件」的开关', await hide.count() === 1 && (await insp.locator('[data-app-hidden-switch]').innerText()).includes('隐藏这个组件'))
+  await hide.check()
+  check('……打开后树上标「已隐藏」', await page.locator('[data-app-component="gmv"] [data-app-component-hidden]').count() === 1)
   await page.locator('[data-app-component="warn"]').click()
   const vis = page.locator('[data-app-inspector="warn"] [data-app-visible]')
   check('可见性表达式照原样显示，可编辑', await vis.inputValue() === "run.tier != 'formal'")
@@ -309,6 +314,8 @@ await section('页面树和属性面板：目录驱动、绑定、可见性', as
   const body = state.patches[0]?.draft?.pages?.[0]?.body ?? []
   check('保存的草稿里有改过的属性和新组件', JSON.stringify(body).includes('"unit":"元"') && JSON.stringify(body).includes('"type":"report"'),
     JSON.stringify(body).slice(0, 200))
+  const gmv = body.flatMap((c) => [c, ...(c.children ?? [])]).find((c) => c.id === 'gmv')
+  check('……隐藏的组件 hidden 为真', gmv?.hidden === true, JSON.stringify(gmv ?? {}).slice(0, 120))
 })
 
 await section('视图来源：每种来源写一句解释；新增时起名，删除先确认、写明用到它的组件、可以撤销', async () => {

@@ -14,7 +14,7 @@ import { splitShrunk } from '../canvas/copilotMerge'
 import { confirmDialog, IconButton, StatusBadge, toast } from '../components/ui'
 import { formatCost, formatLapse, formatOffset, formatSpan, formatTokens, shortId, NONE } from '../lib/format'
 import { statusLabel } from '../lib/status'
-import { runClassLabel, SQL_CHECK_TEXT } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT, runClassLabel, SQL_CHECK_TEXT } from '../lib/terms'
 import { sortSqlChecks } from '../lib/sqlcheck'
 import type { RunUsage, ToolChange } from '../types'
 import { AssistantStream, type StreamTurn } from './AssistantStream'
@@ -164,6 +164,10 @@ function copilotTurn(
     statusCode = 'cancelled'
   } else if (t.phase === 'error' || errorOp) {
     status = '本轮未能完成'
+  } else if (out.kind !== 'built' && t.ops.some((o) => o.op === 'ask')) {
+    // 助手问回来一句、画布没动（N11）：这一轮在等你回答，不是「未修改画布」那种没下文
+    status = CHAT_BLUEPRINT_TEXT.asked
+    statusCode = 'waiting'
   } else if (reply && out.kind !== 'built') {
     status = '已回答（未修改画布）'
   } else if (out.kind === 'built') {

@@ -5213,6 +5213,7 @@ export const LOOK_TEXT = {
   tables: (n: number) => `${formatNumber(n)} 张表`,
   capabilities: (n: number) => `${formatNumber(n)} 个能力`,
   versions: (n: number) => `${formatNumber(n)} 个工作流版本`,
+  calibers: (n: number) => `${formatNumber(n)} 张口径卡`,
   title: (what: string) => `查看了 ${what}`,
   /** 系统代为查看：发布前修复、升级证据按要修的 SQL 点名；应用润色先查看固定的版本 */
   systemTables: (what: string) => `按要修的 SQL 查看了 ${what}`,
@@ -5634,6 +5635,8 @@ export const APP_SETTING_TEXT = {
   onDemandLimit: '按需视图每日上限',
   onDemandLimitHint: '每个应用每天最多按需发起几次运行，命中缓存的不计；填 0 表示不再发起按需运行。到上限后，视图提示次日再试',
   onDemandLimitInvalid: '请填写 0 到 100,000 之间的整数',
+  personalApps: '使用者可以建个人应用',
+  personalAppsHint: '开启后，使用者可以从说需求、场景模板或问数据的回答建一个只有自己看得见的应用：只读、结果遮罩，每人每天的刷新次数按上面的每日上限算；想给别人用要提交给搭建者审核发布。搭建者及以上不受这一项限制',
 }
 
 /** 自定义工具绑定登记的端点（§3.9）：只填路径，地址和认证头由端点提供 */

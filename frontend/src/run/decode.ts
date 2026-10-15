@@ -6,7 +6,7 @@ import {
   ABSENCE_CLAIM_TEXT, ACTION_CONFIRM_TEXT, ACTION_ENV_LABEL, ACTION_LOG_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, LOOK_TEXT, MERGE_TEXT,
   ORIGIN_TEXT, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, TASK_KIND_LABEL, TASK_LOG_TEXT, TASK_STATUS_LABEL, TASK_TEXT, TYPE_LABEL, originLabel,
   CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, MASKED_CELL_TEXT, NODE_TYPE_LABEL,
-  VERIFY_TRUNCATED_TEXT,
+  VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -3172,6 +3172,13 @@ export function catalogDrift(d: Record<string, any>): {
 }
 
 /**
+ * 查看对象的类型。口径卡（caliber，docs/design/normal-user-apps.md N2：蓝图对到已发布的口径卡）typesApp 的 LookObject 还没有，
+ * 契约待补，先在这里按多一种认
+ */
+type LookKind = LookObject['kind'] | 'caliber'
+const kindOf = (o: LookObject): LookKind => o.kind as LookKind
+
+/**
  * look 事件（L2，服务端 app/look/base.py 的形状）读进来：objects 按类型标记；字段缺了的补空，认不出的形状返回 null
  * （不出这一行，也不报错）。旧写法 sources[] 当作表类型读
  */
@@ -3183,7 +3190,7 @@ export function lookEventOf(op: CopilotOp): LookEvent | null {
   const objects: LookObject[] = list
     .filter((x): x is Record<string, any> => !!x && typeof x === 'object')
     .map((x) => {
-      const kind: LookObject['kind'] = x.kind === 'capability' || x.kind === 'workflow_version' ? x.kind : 'table'
+      const kind = (x.kind === 'capability' || x.kind === 'workflow_version' || x.kind === 'caliber' ? x.kind : 'table') as LookObject['kind']
       const total = num(x.total)
       const explored = num(x.explored)
       return {
@@ -3206,10 +3213,10 @@ export function lookEventOf(op: CopilotOp): LookEvent | null {
 }
 
 /** 这一类对象一共给了几个（表：点名的 + 挑出的 + 补上的，去重） */
-function lookCount(objects: LookObject[], kind: LookObject['kind']): number {
+function lookCount(objects: LookObject[], kind: LookKind): number {
   const seen = new Set<string>()
   for (const o of objects) {
-    if (o.kind !== kind) continue
+    if (kindOf(o) !== kind) continue
     for (const n of [...o.named, ...(o.picked ?? []), ...(o.joined ?? [])]) seen.add(`${o.source ?? ''}\u0000${n}`)
   }
   return seen.size
@@ -3229,7 +3236,8 @@ function lookLine(o: LookObject): string {
     o.picked?.length ? LOOK_TEXT.picked(o.picked) : '',
     o.joined?.length ? LOOK_TEXT.joined(o.joined) : '',
   ].filter(Boolean)
-  const head = o.kind === 'table' ? `「${o.source ?? ''}」` : o.kind === 'capability' ? '能力' : '工作流版本'
+  const kind = kindOf(o)
+  const head = kind === 'table' ? `「${o.source ?? ''}」` : kind === 'capability' ? '能力' : kind === 'caliber' ? '口径卡' : '工作流版本'
   const partial = o.total != null && o.explored != null ? `（${LOOK_TEXT.partial(o.total, o.explored)}）` : ''
   return parts.length ? `${head}${partial}：${parts.join('；')}` : ''
 }
@@ -3248,8 +3256,9 @@ export function copilotLook(op: CopilotOp):
   const tables = lookCount(look.objects, 'table')
   const caps = lookCount(look.objects, 'capability')
   const versions = lookCount(look.objects, 'workflow_version')
+  const calibers = lookCount(look.objects, 'caliber')
   const what = [tables ? LOOK_TEXT.tables(tables) : '', caps ? LOOK_TEXT.capabilities(caps) : '',
-    versions ? LOOK_TEXT.versions(versions) : ''].filter(Boolean).join('、')
+    versions ? LOOK_TEXT.versions(versions) : '', calibers ? LOOK_TEXT.calibers(calibers) : ''].filter(Boolean).join('、')
   const tableObjs = look.objects.filter((o) => o.kind === 'table' && o.source)
   const missing = look.objects.filter((o) => o.missing.length)
     .map((o) => LOOK_TEXT.missing(o.kind === 'table' ? `「${o.source ?? ''}」` : '', o.missing))
@@ -3267,8 +3276,8 @@ export function copilotLook(op: CopilotOp):
   }
   const title = !what ? LOOK_TEXT.nothing
     : look.by === 'system'
-      ? tables && !caps && !versions ? LOOK_TEXT.systemTables(what)
-        : versions && !tables && !caps ? LOOK_TEXT.systemVersions(what) : LOOK_TEXT.system(what)
+      ? tables && !caps && !versions && !calibers ? LOOK_TEXT.systemTables(what)
+        : versions && !tables && !caps && !calibers ? LOOK_TEXT.systemVersions(what) : LOOK_TEXT.system(what)
       : LOOK_TEXT.title(what)
   const where = [...new Set(tableObjs.map((o) => o.source))].join('、')
   const how = [...new Set(tableObjs.map(lookHow))].join('、')
@@ -3368,14 +3377,15 @@ const APP_SET_LABEL: Record<string, string> = {
 }
 
 export function decodeCopilot(ops: CopilotOp[], opts?: {
-  /** app：应用编辑器里的助手（应用润色），操作是应用操作，结局说的是应用草稿 */
-  context?: 'canvas' | 'chat' | 'app'
+  /** app：应用编辑器里的助手（应用润色），操作是应用操作，结局说的是应用草稿；blueprint：蓝图助手，操作是 bp_* */
+  context?: 'canvas' | 'chat' | 'app' | 'blueprint'
   unchanged?: boolean
   /** 画布上的节点名。自查问题、「去掉了」这类只带 id 的行据此写成名字 */
   labelOf?: (id: string) => string | undefined
 }): Step[] {
   const canvas = opts?.context === 'canvas'
   const app = opts?.context === 'app'
+  const blueprint = opts?.context === 'blueprint'
   const labels = labelsOf(ops, opts?.labelOf)
   const out: Step[] = []
   let i = 0
@@ -3477,6 +3487,34 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         add({ id: `ca-${i}`, seq: i, kind: 'note', status: 'done', code: 'copilot_ask',
               title: LOOK_TEXT.ask, detail: String(op.question ?? '') || undefined, next: LOOK_TEXT.askNext })
         break
+      case 'bp_ask':
+        // 蓝图助手的反问（N2）：带候选，选项画在对话下面（蓝图页），这里记一行
+        settleAll('done')
+        add({ id: `ba-${i}`, seq: i, kind: 'note', status: 'done', code: 'blueprint_ask', title: BP_OP_TEXT.ask,
+              detail: [String(op.question ?? ''), ...(Array.isArray(op.options) ? op.options.map((o: unknown) => `· ${String(o)}`) : [])]
+                .filter(Boolean).join('\n') || undefined,
+              next: BP_OP_TEXT.askNext })
+        break
+      case 'bp_set':
+      case 'bp_add':
+      case 'bp_remove':
+      case 'bp_template': {
+        // 蓝图的改动（服务端 BlueprintApplier 落地后转出）：一行一个，说改了哪张卡片的哪一项
+        const where = bpPathText(op.path)
+        const tid = String(op.template?.id ?? '')
+        const title = op.op === 'bp_template' ? BP_OP_TEXT.template(TEMPLATE_LABEL[tid] ?? tid)
+          : op.op === 'bp_add' ? BP_OP_TEXT.add(where)
+          : op.op === 'bp_remove' ? BP_OP_TEXT.remove(where)
+          : /\/status$/.test(String(op.path ?? '')) && op.value === 'confirmed' ? BP_OP_TEXT.confirm(where)
+          : BP_OP_TEXT.set(where)
+        add({ id: `bo-${i}`, seq: i, kind: 'note', status: 'done', code: 'blueprint_op', title: clip(title) })
+        break
+      }
+      case 'fill_joint':
+        // 填关节（N3）：模型只填模板声明过的位置，一行一个
+        add({ id: `bj-${i}`, seq: i, kind: 'note', status: 'done', code: 'blueprint_joint',
+              title: clip(BP_OP_TEXT.fill(String(op.label ?? op.joint ?? ''))) })
+        break
       case 'app_add':
       case 'app_update':
       case 'app_remove':
@@ -3530,7 +3568,7 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         // 心跳那条"正在理解需求…"要收尾，否则生成完了它还在转圈
         settleAll('done')
         add({ id: `cd-${i}`, seq: i, kind: 'lifecycle', status: 'done',
-              title: app ? '应用草稿已调整完成' : `工作流已搭建完成，新增 ${nodeCount} 个步骤`,
+              title: app ? '应用草稿已调整完成' : blueprint ? BP_OP_TEXT.done : `工作流已搭建完成，新增 ${nodeCount} 个步骤`,
               detail: String(op.explanation ?? '') || undefined })
         break
       case 'check': {
@@ -3561,6 +3599,7 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
                 title: op.status === 'failed'
                   ? canvas
                     ? `自查后仍有 ${issues.length} 处问题未能自动修正`
+                    : blueprint ? BP_OP_TEXT.checkLeft(issues.length)
                     : `自查后仍有 ${issues.length} 处问题，未自动运行`
                   : String(op.message ?? '自查未能完成'),
                 detail: [...lines, ...droppedOf(op).map((x) => x.message)].join('\n') || undefined,
@@ -3585,6 +3624,12 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
               : `工作流已搭建完成，共 ${total} 个步骤`
         }
         settleAll('done')
+        // 蓝图助手提的改动有的没采纳（越界、和你确认过的卡片冲突）：服务端在 final.issues 里照实交回，这里一行说清
+        if (blueprint && Array.isArray(op.issues) && op.issues.length) {
+          const lines = op.issues.map((x: any) => String(x?.message ?? '')).filter(Boolean)
+          add({ id: `bn-${i}`, seq: i, kind: 'note', status: 'done', level: 'warn', code: 'blueprint_refused',
+                title: BP_OP_TEXT.refused(lines.length), detail: lines.join('\n') || undefined })
+        }
         // 模型写了不存在的节点类型：那一步被跳过了。不说出来的话"共 N 步"是
         // 一句不完整的真话，用户要到运行结果不对才发现少了一步
         for (const t of skippedTypes(op)) {
