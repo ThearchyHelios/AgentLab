@@ -176,6 +176,8 @@ export function CatalogPage() {
   const visible = useMemo(() => visibleRows(rows, query, filter, sort, usedOnly, dueOnly), [rows, query, filter, sort, usedOnly, dueOnly])
   const counts = useMemo(() => filterCounts(rows, query, usedOnly, dueOnly), [rows, query, usedOnly, dueOnly])
   const dueTotal = useMemo(() => dueCount(rows, query, usedOnly), [rows, query, usedOnly])
+  /** 服务端给不给「需要剖析」的口径（老服务端每行没有 profile_due）：不给就不出「需要剖析」开关 */
+  const dueKnown = useMemo(() => rows.some((r) => r.profile_due !== undefined), [rows])
   const base = `/data/catalog/${encodeURIComponent(sourceId)}`
   const openTable = useCallback((t: string) => navigate(`${base}/${encodeURIComponent(t)}${searchRef.current}`), [navigate, base])
   const backToList = useCallback(() => navigate(`${base}${searchRef.current}`), [navigate, base])
@@ -528,7 +530,7 @@ export function CatalogPage() {
                     profileOn={profileSettings.enabled}
                     profileLive={profileLive}
                     dueOnly={dueOnly}
-                    onDueOnly={setDueOnly}
+                    onDueOnly={dueKnown || dueOnly ? setDueOnly : undefined}
                     dueTotal={dueTotal}
                   />
                 </>
