@@ -435,6 +435,96 @@ class CatalogDraftTask(Base):
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
 
 
+class CatalogProfileJob(Base, TimestampMixin):
+    """数据目录的一次后台剖析任务（data/catalog_profile_jobs.py）。逐表的结果在 catalog_profile_tasks。
+
+    以前剖析是一次同步长请求：预算按整次剖析算（选 50 张表只做得完两三张）、不能停、关掉页面报告就没了，对业务库查了什么
+    也无从查。现在建任务后在后台逐表剖析，每张表各有自己的查询次数和时长，进度、发过的查询（字面量去掉）随时落库。生命周期
+    和起草任务是同一套（data/catalog_job_runtime.py），表各建各的：进度字段完全不同。
+
+    同一个数据源同时只有一个排队或进行中的剖析任务：接口先查一遍，部分唯一索引兜底。和同源的起草任务按建立的先后排队。
+    服务重启时还没结束的标成 interrupted，不自动续跑。挂外键、级联删除：任务是数据源的附属记录。
+    """
+
+    __tablename__ = "catalog_profile_jobs"
+    __table_args__ = (
+        Index("ix_catalog_profile_jobs_source_created", "source_id", "created_at"),
+        Index("ux_catalog_profile_jobs_active", "source_id", unique=True,
+              sqlite_where=text("status IN ('queued', 'running')")),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    source_id: Mapped[str] = mapped_column(ForeignKey("data_sources.id", ondelete="CASCADE"))
+    # queued | running | succeeded | partial | failed | cancelled | interrupted
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    # selected 指定的表 | needed 需要剖析的表 | all 全部表
+    scope: Mapped[str] = mapped_column(String(20), default="selected")
+    # 建任务时的剖析设置快照（catalog_profile.ProfileSettings.to_dict）
+    settings: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # 署名（开了登录是认证过的用户名，否则请求头 X-Actor 的自报）
+    created_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    # 整个任务发出的查询数、其中超时的、失败的（守卫拒掉的没发出去，不算）
+    queries: Mapped[int] = mapped_column(Integer, default=0)
+    timeouts: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[int] = mapped_column(Integer, default=0)
+    # 任务级止损停下的原因：failed 连续失败、slow 超时比例；没有为 NULL
+    stop_reason: Mapped[str | None] = mapped_column(String(20), default=None)
+    # 提醒：最近的查询多数超时时的一句话，好转后清掉
+    notice: Mapped[str | None] = mapped_column(Text, default=None)
+    # 任务整体出错、止损、数据源中途停用或关掉剖析时的整句原因
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    # 重试建的任务记下是重试哪一个
+    retry_of: Mapped[str | None] = mapped_column(String(32), default=None)
+
+
+class CatalogProfileTask(Base):
+    """剖析任务里的一张表。按 seq（剖析顺序）排。状态：pending 排队、running 剖析中、ok 每项都有结论、partial 有项因为
+    运行原因没查成、failed 写入一直冲突或整张表出错、skipped 视图 / 表结构里没有 / 空表 / 没有可剖析的项、cancelled
+    （停止、止损或服务重启）。
+
+    检查项、发现、跳过的项、日期范围、发过的查询都是 JSON：条数受每张表的查询上限约束，大小有界。发过的查询里的 SQL
+    字面量都换成了「?」（sql_semantics.normalize_sql）：抽样到的键值不进 AgentLab 自己的库。"""
+
+    __tablename__ = "catalog_profile_tasks"
+    __table_args__ = (UniqueConstraint("job_id", "seq"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    job_id: Mapped[str] = mapped_column(ForeignKey("catalog_profile_jobs.id", ondelete="CASCADE"), index=True)
+    seq: Mapped[int] = mapped_column(Integer)
+    # 表结构里的键；表结构里没有的（skipped）是请求里的原样名字
+    table_name: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    # 检查项：[{kind, target, path, state, reason, detail, queries}]。建任务时按当时的目录列一遍，开始剖析这张表时按最新的
+    # 目录重列
+    checks: Mapped[list[Any] | None] = mapped_column(default=None)
+    queries: Mapped[int] = mapped_column(Integer, default=0)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
+    # 进行中时正在做哪一项的整句（「正在核对 orders.customer_id → customers.id」）
+    current: Mapped[str | None] = mapped_column(Text, default=None)
+    # 行数估算 {rows, method, at_least}
+    row_estimate: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    findings: Mapped[list[Any] | None] = mapped_column(default=None)
+    skipped: Mapped[list[Any] | None] = mapped_column(default=None)
+    date_ranges: Mapped[list[Any] | None] = mapped_column(default=None)
+    # 发过的查询：[{at, kind, target, sql, ms, rows, outcome, detail}]
+    query_log: Mapped[list[Any] | None] = mapped_column(default=None)
+    # 发现的合计 {relations_checked, relations_verified, codes, codes_pending, business_dates}；跳过的项数、其中因为运行
+    # 原因没查成的（表清单的「上次剖析」读这几列，不必读整份发现）
+    summary: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    unfinished: Mapped[int] = mapped_column(Integer, default=0)
+    added: Mapped[int] = mapped_column(Integer, default=0)
+    updated: Mapped[int] = mapped_column(Integer, default=0)
+    removed: Mapped[int] = mapped_column(Integer, default=0)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    # 整张表的原因：表结构里没有、视图、空表、没有可剖析的项、写入一直冲突、停止 / 中断 / 止损
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+
+
 class Setting(Base, TimestampMixin):
     """键值形式的用户设置，前端 Settings 页直接读写。"""
 

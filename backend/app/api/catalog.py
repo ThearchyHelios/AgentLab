@@ -42,7 +42,8 @@ from app.api.coded import (
     SNAPSHOT_TAMPERED, CodedHTTPException,
 )
 from app.api.runs import actor_of
-from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, introspect, table_versions
+from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, catalog_profile_jobs, introspect
+from app.data import table_versions
 from app.data import catalog_assistant, catalog_review, catalog_transfer
 from app.data.engine import SnapshotTampered
 from app.db.base import get_session
@@ -317,13 +318,14 @@ async def import_catalog(source_id: str, payload: CatalogImportIn, x_actor: str 
     409 catalog_draft_busy；文件格式不对 422；没有表结构 409。"""
     row, source = await _import_source(session, source_id)
     try:
-        await catalog_jobs.ensure_idle(session, row)
+        async with catalog_jobs.import_write(session, row):
+            report = await catalog_transfer.run_import(session, row, source, payload.content,
+                                                       include_guidance=payload.include_guidance,
+                                                       actor=actor_of(x_actor))
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
-    try:
-        report = await catalog_transfer.run_import(session, row, source, payload.content,
-                                                   include_guidance=payload.include_guidance,
-                                                   actor=actor_of(x_actor))
+    except catalog_profile_jobs.ProfileBusy as e:
+        raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
     except catalog_transfer.TransferInvalid as e:
         raise HTTPException(422, str(e)) from e
     return report.as_dict()
@@ -398,7 +400,7 @@ async def create_draft_job(source_id: str, payload: DraftJobIn, x_actor: str | N
         raise HTTPException(422, str(e)) from e
     row, source = await _resolved(session, source_id)
     try:
-        await catalog_jobs.ensure_idle(session, row)
+        await catalog_jobs.ensure_draft_free(session, row)
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     cache = source.schema_cache or {}
@@ -412,7 +414,7 @@ async def create_draft_job(source_id: str, payload: DraftJobIn, x_actor: str | N
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     catalog_jobs.manager.start(job.id)
-    return {"job": catalog_jobs.job_dict(job, tasks)}
+    return {"job": catalog_jobs.job_dict(job, tasks, waiting_for=await catalog_jobs.waiting_for(session, job))}
 
 
 @router.get("/{source_id}/catalog/draft-jobs/active")
@@ -466,7 +468,7 @@ async def retry_draft_job(source_id: str, job_id: str, x_actor: str | None = Hea
     _, old = await _job_or_404(session, source_id, job_id)
     row, source = await _resolved(session, source_id)
     try:
-        await catalog_jobs.ensure_idle(session, row)
+        await catalog_jobs.ensure_draft_free(session, row)
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     try:
@@ -484,7 +486,7 @@ async def retry_draft_job(source_id: str, job_id: str, x_actor: str | None = Hea
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     catalog_jobs.manager.start(job.id)
-    return {"job": catalog_jobs.job_dict(job, tasks)}
+    return {"job": catalog_jobs.job_dict(job, tasks, waiting_for=await catalog_jobs.waiting_for(session, job))}
 
 
 @router.put("/{source_id}/catalog/{table}")
@@ -529,6 +531,8 @@ async def draft_catalog(source_id: str, payload: CatalogDraftIn,
                                                  guidance=catalog_jobs.guidance_of(row))
     except catalog_jobs.DraftBusy as e:
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
+    except catalog_profile_jobs.ProfileBusy as e:
+        raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
     rows = [{"table_name": r.table, "added": r.added, "updated": r.updated, "removed": r.removed,
              "version": r.version, "error": r.error, "model_error": r.model_error, "model_items": r.model_items}
             for r in report.tables]
