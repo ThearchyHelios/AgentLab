@@ -2,6 +2,7 @@ import type {
   CatalogBusinessDate, CatalogColumnNotes, CatalogCounts, CatalogDetail, CatalogItem, CatalogNotes, CatalogRelation, CatalogSource, CatalogStatus,
   CatalogStructureColumn, CatalogTableRow,
 } from '../../types'
+import { isProfileDue } from './profile'
 
 // ===========================================================================
 // 数据目录界面的纯函数：清单的筛选和排序、单表目录摊平成「项」、编辑表单和目录之间的来回转换、表单校验。
@@ -114,11 +115,13 @@ export const isUsed = (r: CatalogTableRow): boolean => r.in_schema && r.usage > 
 
 /**
  * 筛选并排序。默认保持服务端的顺序（使用次数多的在前，次数相同按表结构里的顺序）；表结构里已经没有的表
- * 不论怎么排都在最后。used：只看运行中查询过的表（从顶部摘要点进来时带上，和摘要的数字对得上）
+ * 不论怎么排都在最后。used：只看运行中查询过的表（从顶部摘要点进来时带上，和摘要的数字对得上）；
+ * due：只看需要剖析的表（和剖析范围「需要剖析的表」同一个口径）。这两项和审阅进度的筛选叠加
  */
-export function visibleRows(rows: CatalogTableRow[], q: string, filter: ListFilter, sort: ListSort, used = false): CatalogTableRow[] {
+export function visibleRows(rows: CatalogTableRow[], q: string, filter: ListFilter, sort: ListSort, used = false, due = false): CatalogTableRow[] {
   const order = new Map(rows.map((r, i) => [r.table_name, i]))
-  const picked = rows.filter((r) => matchesQuery(r, q) && (!used || isUsed(r)) && (filter === 'all' || progressOf(r.counts) === filter))
+  const picked = rows.filter((r) => matchesQuery(r, q) && (!used || isUsed(r)) && (!due || isProfileDue(r))
+    && (filter === 'all' || progressOf(r.counts) === filter))
   const idx = (r: CatalogTableRow) => order.get(r.table_name) ?? 0
   return picked.sort((a, b) => {
     if (a.in_schema !== b.in_schema) return a.in_schema ? -1 : 1
@@ -144,22 +147,27 @@ export function usageSummary(rows: CatalogTableRow[]): { used: number; pending: 
   return out
 }
 
-/** 各筛选项下有几张表（筛选按钮上的数字，按搜索词和「只看运行中查询过的表」算） */
-export function filterCounts(rows: CatalogTableRow[], q: string, used = false): Record<ListFilter, number> {
+/** 各筛选项下有几张表（筛选按钮上的数字，按搜索词、「只看运行中查询过的表」「只看需要剖析的表」算） */
+export function filterCounts(rows: CatalogTableRow[], q: string, used = false, due = false): Record<ListFilter, number> {
   const out: Record<ListFilter, number> = { all: 0, pending: 0, done: 0, none: 0 }
   for (const r of rows) {
-    if (!matchesQuery(r, q) || (used && !isUsed(r))) continue
+    if (!matchesQuery(r, q) || (used && !isUsed(r)) || (due && !isProfileDue(r))) continue
     out.all++
     out[progressOf(r.counts)]++
   }
   return out
 }
 
+/** 「需要剖析」那个开关上的数字：按搜索词和「只看运行中查询过的表」算，不管审阅进度筛到哪一项 */
+export function dueCount(rows: CatalogTableRow[], q: string, used = false): number {
+  return rows.filter((r) => matchesQuery(r, q) && (!used || isUsed(r)) && isProfileDue(r)).length
+}
+
 /**
  * 清单的筛选、搜索、排序记在地址栏里（刷新、前进后退、把链接发给同事都不丢）：q 搜索词，filter 筛选，sort 排序，
- * used=1 只看运行中查询过的表。默认值不写进地址；认不出的值按默认
+ * used=1 只看运行中查询过的表，profile=due 只看需要剖析的表。默认值不写进地址；认不出的值按默认
  */
-export interface ListParams { query: string; filter: ListFilter; sort: ListSort; used: boolean }
+export interface ListParams { query: string; filter: ListFilter; sort: ListSort; used: boolean; due?: boolean }
 
 export function listParamsOf(p: URLSearchParams): ListParams {
   const filter = p.get('filter') as ListFilter | null
@@ -169,6 +177,7 @@ export function listParamsOf(p: URLSearchParams): ListParams {
     filter: filter && LIST_FILTERS.includes(filter) ? filter : 'all',
     sort: sort && LIST_SORTS.includes(sort) ? sort : 'usage',
     used: p.get('used') === '1',
+    due: p.get('profile') === 'due',
   }
 }
 
@@ -180,6 +189,7 @@ export function writeListParams(p: URLSearchParams, s: ListParams): URLSearchPar
   put('filter', s.filter === 'all' ? null : s.filter)
   put('sort', s.sort === 'usage' ? null : s.sort)
   put('used', s.used ? '1' : null)
+  put('profile', s.due ? 'due' : null)
   return next
 }
 

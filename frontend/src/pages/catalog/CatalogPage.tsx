@@ -6,30 +6,34 @@ import {
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
-import type { CatalogDetail, CatalogList, CatalogReviewItem, CatalogReviewKind, CatalogTableRow } from '../../types'
-import { EmptyState, ErrorState, PageHeader, Skeleton, Spinner, rovingTarget, toast, useTicker } from '../../components/ui'
+import type {
+  CatalogDetail, CatalogList, CatalogProfileTaskStatus, CatalogReviewItem, CatalogReviewKind, CatalogTableRow,
+} from '../../types'
+import { EmptyState, ErrorState, PageHeader, Skeleton, Spinner, rovingTarget, toast } from '../../components/ui'
 import { useCatalog, useDatasources, useOnReconnect } from '../../store/catalog'
 import { errorMessage } from '../../lib/errors'
 import { formatNumber } from '../../lib/format'
 import {
-  CATALOG_DRAFT_TEXT as DT, CATALOG_REVIEW_TEXT as RT, CATALOG_TEXT as CT, CATALOG_TRANSFER_TEXT as XT, PROFILE_STOP_LABEL,
-  PROFILE_TEXT as PT, SCHEMA_PARTIAL_TEXT as SPT,
+  CATALOG_DRAFT_TEXT as DT, CATALOG_REVIEW_TEXT as RT, CATALOG_TEXT as CT, CATALOG_TRANSFER_TEXT as XT, PROFILE_TEXT as PT,
+  SCHEMA_PARTIAL_TEXT as SPT,
 } from '../../lib/terms'
 import { StatusLegend, SystemNotesNotice } from './parts'
 import { DraftDialog } from './DraftDialog'
-import { isJobActive, jobBlank, retryableCount, useDraftJob } from './draftJob'
+import { isJobActive, jobBlank, retryableCount, useDraftJob, waitsForProfile } from './draftJob'
 import type { DraftPreset, DraftStartBody } from './draftJob'
 import { ProfileDialog } from './ProfileDialog'
-import type { ProfileJob } from './ProfileDialog'
 import { ProfileSettingsDialog } from './ProfileSettings'
-import { fillKey, profileBlockOf, profileSettingsOf, secondsText } from './profile'
+import { fillKey, profileSettingsOf } from './profile'
+import { retryableTasks, useProfileJob } from './profileJob'
+import type { ProfileStartBody } from './profileJob'
 import { TableDetail } from './TableDetail'
+import type { TableProfileProps } from './TableDetail'
 import { TableIndex } from './TableIndex'
 import { ReviewOverview, ReviewQueue } from './ReviewQueue'
 import { ImportDialog } from './TransferDialog'
 import { itemKey, reviewParamsOf, writeReviewParams } from './review'
 import type { CatalogView } from './review'
-import { filterCounts, listParamsOf, progressOf, rowFromDetail, usageSummary, visibleRows, writeListParams } from './model'
+import { dueCount, filterCounts, listParamsOf, progressOf, rowFromDetail, usageSummary, visibleRows, writeListParams } from './model'
 import type { ListFilter, ListParams, ListSort } from './model'
 
 // ===========================================================================
@@ -47,6 +51,10 @@ import type { ListFilter, ListParams, ListSort } from './model'
 // 左栏有两个视图：表清单（逐表看）和审阅队列（view=review：跨表按优先级列出推断项，成批确认、驳回，筛选记在 kind /
 // rtable 里）。从队列点开一项，右栏是所在表的详情，地址带着那一项（item），详情滚到那一项、列出用过这张表的运行。
 // 页头的「导出目录」「导入目录」把整理好的目录带到另一个实例（导入先预览，确认后才写）。
+//
+// 起草、剖析都是服务端的后台任务（draftJob.ts、profileJob.ts），状态在这一页上：关掉对话框照常进行，页头的「起草」「数据
+// 剖析」换成进度入口（「起草 3/20」「剖析 12/40」「剖析 排队中」），点开对应的对话框；结束时右下角提示，可以回到结果。
+// 同一个数据源的起草和剖析按建立顺序排队：一个在排队、进行中时，另一个建出来是排队，前一个结束后自动开始。
 // ===========================================================================
 
 export function CatalogPage() {
@@ -107,10 +115,13 @@ export function CatalogPage() {
   const { query, filter, sort } = list
   /** 只看运行中查询过的表：从顶部摘要点进来时打开，筛选结果和摘要的数字一致 */
   const usedOnly = list.used
+  /** 只看需要剖析的表（和剖析范围「需要剖析的表」同一个口径） */
+  const dueOnly = !!list.due
   const setQuery = useCallback((q: string) => { typedAt.current = Date.now(); setList((c) => ({ ...c, query: q })) }, [])
   const setFilter = useCallback((f: ListFilter) => setList((c) => ({ ...c, filter: f })), [])
   const setSort = useCallback((v: ListSort) => setList((c) => ({ ...c, sort: v })), [])
   const setUsedOnly = useCallback((v: boolean) => setList((c) => ({ ...c, used: v })), [])
+  const setDueOnly = useCallback((v: boolean) => setList((c) => ({ ...c, due: v })), [])
   /**
    * 跳到别的表、回到清单时带上清单的查询参数（按页面上的算：搜索词可能还没写进地址）。审阅视图的参数（view、kind、rtable）
    * 照旧带着，从审阅队列打开的那一项（item）不带：换了表就不是那一项了
@@ -133,21 +144,25 @@ export function CatalogPage() {
   const [draftOpen, setDraftOpen] = useState<{ view: 'setup' | 'job'; busy?: boolean; preset?: DraftPreset } | null>(null)
   /** 起草写进了这些表：详情据此重新载入（编辑中的不动，保存时服务端会用版本号拦下） */
   const [drafted, setDrafted] = useState<{ seq: number; tables: Set<string> }>({ seq: 0, tables: new Set() })
-  const [profiling, setProfiling] = useState(false)
+  /**
+   * 剖析对话框开着没有、打开时显示什么：setup 选范围开始；job 显示页面跟着的任务（进行中的进度、刚结束的结果）。
+   * scope：从表清单的「剖析所选」打开，范围默认是已选的表
+   */
+  const [profileOpen, setProfileOpen] = useState<{ view: 'setup' | 'job'; scope?: 'selected' } | null>(null)
   const [profileSettingsOpen, setProfileSettingsOpen] = useState(false)
-  /** 一次剖析的状态。关掉弹窗剖析照常进行：状态留在页面上，页头有入口，完成后提示并可再打开报告 */
-  const [job, setJob] = useState<(ProfileJob & { sourceId: string }) | null>(null)
   /** 剖析设置刚存过：数据源列表重取回来之前按存下的这份算（预算、开没开） */
   const [savedOptions, setSavedOptions] = useState<{ sourceId: string; options: Record<string, unknown> } | null>(null)
   /**
-   * 从剖析报告点「填写含义」：报告先收起，打开那张表并弹出那一列的码值；码值弹窗关上（保存或取消）后回到报告，
-   * 焦点落在下一列的「填写含义」上，一列接一列地填
+   * 从剖析结果点「填写含义」：对话框先收起，打开那张表并弹出那一列的码值；码值弹窗关上（保存或取消）后回到结果，
+   * 那张表照旧展开，焦点落在下一列的「填写含义」上，一列接一列地填
    */
   const [fillCodes, setFillCodes] = useState<{ table: string; column: string; seq: number } | null>(null)
-  /** 回到报告时从哪一列接着往下 */
+  /** 回到结果时从哪一列接着往下 */
   const [returnTo, setReturnTo] = useState<{ table: string; column: string } | null>(null)
-  const profilingRef = useRef(profiling)
-  profilingRef.current = profiling
+  /** 从结果去填了含义的码值列：保存后还剩几个待填写（按任务记，换了任务就不算） */
+  const [filled, setFilled] = useState<{ jobId: string; map: Record<string, number> } | null>(null)
+  const profileOpenRef = useRef(profileOpen)
+  profileOpenRef.current = profileOpen
   const alive = useRef(true)
   // 开发模式的严格模式会先卸载再挂载一次：挂载时要重新置为真
   useEffect(() => {
@@ -158,8 +173,9 @@ export function CatalogPage() {
   sourceRef.current = sourceId
 
   const rows = useMemo(() => data?.tables ?? [], [data])
-  const visible = useMemo(() => visibleRows(rows, query, filter, sort, usedOnly), [rows, query, filter, sort, usedOnly])
-  const counts = useMemo(() => filterCounts(rows, query, usedOnly), [rows, query, usedOnly])
+  const visible = useMemo(() => visibleRows(rows, query, filter, sort, usedOnly, dueOnly), [rows, query, filter, sort, usedOnly, dueOnly])
+  const counts = useMemo(() => filterCounts(rows, query, usedOnly, dueOnly), [rows, query, usedOnly, dueOnly])
+  const dueTotal = useMemo(() => dueCount(rows, query, usedOnly), [rows, query, usedOnly])
   const base = `/data/catalog/${encodeURIComponent(sourceId)}`
   const openTable = useCallback((t: string) => navigate(`${base}/${encodeURIComponent(t)}${searchRef.current}`), [navigate, base])
   const backToList = useCallback(() => navigate(`${base}${searchRef.current}`), [navigate, base])
@@ -232,7 +248,7 @@ export function CatalogPage() {
   }, [])
   // 上方的进度：跟着的任务在进行就按它；跟着的就是清单说的那一个、已经结束了，就不信清单（清单还没重取回来）
   const listActive = isJobActive(data?.active_job) ? data?.active_job ?? null : null
-  const stripJob: { done: number; total: number; status: string } | null = draftJob && (draftActive || draftJob.id === listActive?.id)
+  const stripJob: { done: number; total: number; status: string; waiting_for?: string | null } | null = draftJob && (draftActive || draftJob.id === listActive?.id)
     ? (draftActive ? draftJob : null)
     : listActive
   // 调用接连没写出来的提醒：关着对话框时也要看得到（上方的进度带着它）
@@ -240,87 +256,105 @@ export function CatalogPage() {
 
   const options = savedOptions?.sourceId === sourceId ? savedOptions.options : source?.options
   const profileSettings = useMemo(() => profileSettingsOf(options), [options])
-  const myJob = job?.sourceId === sourceId ? job : null
-  const jobRunning = myJob?.phase === 'running'
-  useTicker(1000, jobRunning)
 
   /**
-   * 剖析：同步请求，做完才返回。期间关掉弹窗不影响；回来时页面已经换了数据源或卸载了，只提示、不再改这一页。
-   * 写进去的表重新载入清单和正在看的详情（编辑中的不动，同起草）
+   * 剖析任务（后台进行，状态在页面上）：每张表一结束就重取清单、正在看的表在里面就重新载入（编辑中的不动，保存时服务端
+   * 会用版本号拦下）；结束时重取一次清单。对话框关着时结束的，右下角提示并给「查看报告」
    */
-  const startProfile = useCallback(async (tables: string[] | null) => {
+  const profile = useProfileJob(sourceId, data?.active_profile_job, {
+    onTablesEnded: (tables) => {
+      setDrafted((cur) => ({ seq: cur.seq + 1, tables: new Set(tables) }))
+      void load()
+    },
+    onFinished: (job) => {
+      void load()
+      if (profileOpenRef.current) return
+      const src = job.source_id
+      const opts = {
+        key: `catalog-profile:${src}`, duration: 10000,
+        action: { label: PT.viewReport, onClick: () => { if (sourceRef.current === src) setProfileOpen({ view: 'job' }) } },
+      }
+      if (job.stop_reason) toast.warn(PT.toast.stopped(PT.stopShort[job.stop_reason] ?? ''), opts)
+      else if (job.status === 'succeeded') toast.ok(PT.toast.succeeded(PT.findings(job.summary)), opts)
+      else if (job.status === 'partial') toast.warn(PT.toast.partial(retryableTasks(job).length), opts)
+      else if (job.status === 'failed') toast.error(PT.toast.failed(job.error ?? ''), opts)
+      else if (job.status === 'interrupted') toast.warn(PT.toast.interrupted, opts)
+      else toast.warn(PT.toast.cancelled, opts)
+    },
+  })
+  const profileJob = profile.job
+  const profileActive = isJobActive(profileJob)
+  // 页头的剖析进度：同起草，跟着的任务在进行就按它；跟着的就是清单说的那一个、已经结束了，就不信清单
+  const listProfile = isJobActive(data?.active_profile_job) ? data?.active_profile_job ?? null : null
+  const profileStrip: { done: number; total: number; status: string; waiting_for?: string | null } | null =
+    profileJob && (profileActive || profileJob.id === listProfile?.id) ? (profileActive ? profileJob : null) : listProfile
+  /** 跟着的剖析任务里各表的状态（表清单的「剖析」一格据此写排队、剖析中） */
+  const profileLive = useMemo(() => new Map<string, CatalogProfileTaskStatus>(
+    profileActive && profileJob ? profileJob.tasks.map((t) => [t.table_name, t.status]) : []), [profileActive, profileJob])
+  /** 打开剖析对话框：有进行中的任务就直接显示它；上一次的结果看过了，再点就是重新开始 */
+  const openProfile = useCallback(() => setProfileOpen({ view: profileActive ? 'job' : 'setup' }), [profileActive])
+  const openProfileSelected = useCallback(() => setProfileOpen({ view: profileActive ? 'job' : 'setup', scope: 'selected' }), [profileActive])
+  const startProfile = useCallback(async (body: ProfileStartBody) => {
+    const next = await profile.start(body)
+    // 选中的表已经交给剖析任务了：清空，免得接着点「剖析所选」又剖析一遍
+    if (body.tables) setSelected(new Set())
+    return next
+  }, [profile.start])
+  /** 表详情里「剖析这张表」：只含这张表 */
+  const profileTable = useCallback((t: string) => profile.start({ tables: [t] }), [profile.start])
+  /** 打开剖析对话框显示某个任务：页面跟着的那一个直接打开；别的（表详情里「查看这次剖析」）先取来 */
+  const openProfileJob = useCallback(async (jobId: string | null) => {
+    if (!jobId || profile.job?.id === jobId) {
+      setProfileOpen({ view: 'job' })
+      return
+    }
     const src = sourceId
-    const startedAt = Date.now()
-    setJob({ sourceId: src, phase: 'running', startedAt, tables, settings: profileSettings })
-    let next: ProfileJob
     try {
-      const report = await api.dataCatalog.profile(src, tables ? { tables } : {})
-      next = { phase: 'done', report, ms: Date.now() - startedAt }
+      const { job } = await api.dataCatalog.profileJobs.get(src, jobId)
+      if (sourceRef.current !== src) return
+      profile.track(job)
+      setProfileOpen({ view: 'job' })
     } catch (e) {
-      next = e instanceof ApiError && e.status === 409
-        ? { phase: 'blocked', kind: profileBlockOf(e), message: e.message, tables }
-        : { phase: 'failed', error: e, tables }
+      toast.error(e)
     }
-    const here = alive.current && sourceRef.current === src
-    if (here) setJob({ ...next, sourceId: src })
-    if (next.phase === 'done') {
-      const r = next.report
-      const touched = r.tables.filter((t) => !t.error && t.added + t.updated + t.removed > 0).map((t) => t.table_name)
-      if (here) {
-        if (touched.length) setDrafted((cur) => ({ seq: cur.seq + 1, tables: new Set(touched) }))
-        void load()
-      }
-      // 弹窗开着就看报告；关了（在后台继续）才提示，并给「查看报告」
-      if (!here || !profilingRef.current) {
-        const summary = PT.summary(r.queries_used, r.settings.max_queries, r.tables.length)
-        const text = r.stopped ? PT.toastStopped(PROFILE_STOP_LABEL[r.stopped] ?? r.stopped) : PT.toastDone(summary)
-        const show = r.stopped ? toast.warn : toast.ok
-        show(text, here ? { key: `profile:${src}`, duration: 10000, action: { label: PT.viewReport, onClick: () => setProfiling(true) } }
-          : { key: `profile:${src}` })
-      }
-    } else if (!here || !profilingRef.current) {
-      toast.error(next.phase === 'blocked' ? next.message : next.error, here
-        ? { key: `profile:${src}`, action: { label: PT.viewReport, onClick: () => setProfiling(true) } } : { key: `profile:${src}` })
-    }
-  }, [sourceId, profileSettings, load])
-
-  const openProfile = useCallback(() => {
-    // 上一次的结果（报告、被拒）看过了，再点就是重新开始；正在剖析时打开的是进度
-    setJob((cur) => (cur && cur.phase === 'running' && cur.sourceId === sourceId ? cur : null))
-    setProfiling(true)
-  }, [sourceId])
+  }, [sourceId, profile.job?.id, profile.track])
+  const tableProfile: TableProfileProps = useMemo(() => ({
+    job: profileJob, onStart: profileTable, onShowActive: profile.showActive, onSettings: () => setProfileSettingsOpen(true),
+    onOpenJob: (id: string | null) => void openProfileJob(id),
+  }), [profileJob, profileTable, profile.showActive, openProfileJob])
 
   const onProfileSettingsSaved = useCallback((row: any) => {
     setProfileSettingsOpen(false)
     setSavedOptions({ sourceId, options: row?.options ?? {} })
     void useCatalog.getState().reload('datasources')
-    // 因为没开启被拒的：开了就回到选范围，可以直接开始
-    setJob((cur) => (cur && cur.phase === 'blocked' && cur.kind === 'disabled' ? null : cur))
   }, [sourceId])
 
   const openFromReport = useCallback((t: string) => {
-    setProfiling(false)
+    setProfileOpen(null)
     openTable(t)
   }, [openTable])
 
   const fillFromReport = useCallback((t: string, column: string) => {
-    setProfiling(false)
+    setProfileOpen(null)
     setFillCodes((cur) => ({ table: t, column, seq: (cur?.seq ?? 0) + 1 }))
     openTable(t)
   }, [openTable])
 
-  const jobRef = useRef(job)
-  jobRef.current = job
-  /** 从报告打开的码值弹窗关上了：记下这一列还剩几个含义待填写（报告里跟着改），回到报告 */
+  const profileJobRef = useRef(profileJob)
+  profileJobRef.current = profileJob
+  /**
+   * 码值弹窗关上了：是从剖析结果打开的，就记下这一列还剩几个含义待填写（结果里跟着改），回到结果。表详情的「数据剖析」
+   * 一节里点的「填写含义」不回对话框
+   */
   const onFillDone = useCallback((seq: number, pending: number | null) => {
     const fill = fillCodes?.seq === seq ? fillCodes : null
-    const cur = jobRef.current
-    if (!fill || !alive.current || cur?.phase !== 'done' || cur.sourceId !== sourceRef.current) return
+    const cur = profileJobRef.current
+    if (!fill || !alive.current || !cur || cur.source_id !== sourceRef.current) return
     if (pending != null) {
-      setJob((j) => (j && j.phase === 'done' ? { ...j, filled: { ...j.filled, [fillKey(fill.table, fill.column)]: pending } } : j))
+      setFilled((f) => ({ jobId: cur.id, map: { ...(f?.jobId === cur.id ? f.map : {}), [fillKey(fill.table, fill.column)]: pending } }))
     }
     setReturnTo({ table: fill.table, column: fill.column })
-    setProfiling(true)
+    setProfileOpen({ view: 'job' })
   }, [fillCodes])
 
   // 上一张 / 下一张按清单当前的筛选和排序走；正在看的表不在筛选结果里（刚确认完、从关联关系跳过来）时按全部表走
@@ -394,7 +428,7 @@ export function CatalogPage() {
     }
   }, [table, navigate, base, params])
 
-  const filtered = !!query.trim() || filter !== 'all' || usedOnly
+  const filtered = !!query.trim() || filter !== 'all' || usedOnly || dueOnly
   const empty = rows.length > 0 && rows.every((r) => progressOf(r.counts) === 'none')
   const hasTables = rows.length > 0
   const draftButton = (primary = false) => (
@@ -402,23 +436,32 @@ export function CatalogPage() {
       <Sparkles size={11} aria-hidden /> {CT.draft}
     </button>
   )
-  // 页头的「数据剖析」：剖析进行中换成计时，点开看进度（关掉弹窗剖析照常进行）
-  const headerProfile = jobRunning && myJob?.phase === 'running'
-    ? (
-      <button type="button" className="btn btn-sm" onClick={() => setProfiling(true)} title={PT.headerRunningHint}
-              aria-label={PT.headerRunning(secondsText(Date.now() - myJob.startedAt))} data-catalog-profile="running">
-        <Spinner size={11} /> <span className="tnum hidden sm:inline">{PT.headerRunning(secondsText(Date.now() - myJob.startedAt))}</span>
-      </button>
-    )
-    : (
-      <button type="button" className="btn btn-sm" onClick={openProfile} aria-label={PT.action} title={PT.actionHint} data-catalog-profile="">
-        <ScanSearch size={11} aria-hidden /> <span className="hidden sm:inline">{PT.action}</span>
-      </button>
-    )
-  // 页头的「起草」窄屏只留图标，标题才放得下
+  // 页头的「数据剖析」「起草」：任务在排队、进行中时换成进度入口（「剖析 12/40」「剖析 排队中」），点开对应的对话框
+  // （关掉对话框任务照常进行）；排在另一种任务后面时悬停写明。窄屏只留图标，标题才放得下（进度在读屏的名称里）
+  const profileQueued = profileStrip?.status === 'queued'
+  const profileLabel = profileStrip ? (profileQueued ? PT.headerQueued : PT.headerRunning(profileStrip.done, profileStrip.total)) : PT.action
+  const profileTitle = profileStrip
+    ? (profileQueued ? (profileStrip.waiting_for === 'draft' ? PT.headerQueuedDraft : PT.headerQueuedHint) : PT.headerRunningHint(profileStrip.done, profileStrip.total))
+    : PT.actionHint
+  // 最近查询多数超时的提醒：对话框关着时也要看得到（页头的入口换成提醒色，悬停写全文）
+  const profileNotice = profileActive ? profileJob?.notice?.trim() || null : null
+  const headerProfile = (
+    <button type="button" className="btn btn-sm" onClick={openProfile} aria-label={profileLabel} title={profileNotice ? `${profileTitle}。${profileNotice}` : profileTitle}
+            data-catalog-profile={profileStrip?.status ?? ''} data-progress={profileStrip ? `${profileStrip.done}/${profileStrip.total}` : undefined}>
+      {profileStrip && !profileQueued ? <Spinner size={11} /> : <ScanSearch size={11} aria-hidden />}
+      <span className="tnum hidden sm:inline">{profileLabel}</span>
+      {profileNotice && <TriangleAlert size={11} className="shrink-0 text-[var(--warn)]" aria-hidden data-catalog-profile-notice="" />}
+    </button>
+  )
+  const draftQueued = stripJob?.status === 'queued'
+  const draftLabel = stripJob ? (draftQueued ? DT.headerQueued : DT.headerRunning(stripJob.done, stripJob.total)) : CT.draft
+  const draftTitle = stripJob
+    ? (draftQueued ? (waitsForProfile(stripJob) ? DT.headerQueuedProfile : DT.headerQueuedHint) : DT.headerRunningHint(stripJob.done, stripJob.total))
+    : CT.draft
   const headerDraft = (
-    <button type="button" className="btn btn-sm" onClick={openDraft} aria-label={CT.draft} title={CT.draft} data-catalog-draft="">
-      <Sparkles size={11} aria-hidden /> <span className="hidden sm:inline">{CT.draft}</span>
+    <button type="button" className="btn btn-sm" onClick={openDraft} aria-label={draftLabel} title={draftTitle} data-catalog-draft=""
+            data-catalog-draft-head={stripJob?.status ?? ''}>
+      {stripJob && !draftQueued ? <Spinner size={11} /> : <Sparkles size={11} aria-hidden />} <span className="tnum hidden sm:inline">{draftLabel}</span>
     </button>
   )
 
@@ -481,7 +524,12 @@ export function CatalogPage() {
                     active={table}
                     onOpen={openTable}
                     onDraft={openDraft}
-                    onProfile={openProfile}
+                    onProfile={openProfileSelected}
+                    profileOn={profileSettings.enabled}
+                    profileLive={profileLive}
+                    dueOnly={dueOnly}
+                    onDueOnly={setDueOnly}
+                    dueTotal={dueTotal}
                   />
                 </>
               )}
@@ -493,7 +541,8 @@ export function CatalogPage() {
               <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} fillCodes={fillCodes} prev={prev} next={next}
                            onFillDone={onFillDone} onOpen={openTable} onBack={backToList} onDetail={onDetail}
                            draftBusy={!!stripJob} onRedraft={redraftTable} onDraftGuidance={draftWithGuidance}
-                           profileEnabled={profileSettings.enabled} focusPath={inReview ? review.item || null : null} usageOpen={inReview} />
+                           profileEnabled={profileSettings.enabled} focusPath={inReview ? review.item || null : null} usageOpen={inReview}
+                           profile={tableProfile} />
             )
             : inReview
               ? <ReviewOverview />
@@ -554,6 +603,7 @@ export function CatalogPage() {
           initialBusy={!!draftOpen.busy}
           preset={draftOpen.preset ?? null}
           stopping={draft.stopping}
+          profileActive={!!profileStrip}
           onStart={startDraft}
           onCancel={draft.cancel}
           onRetry={draft.retry}
@@ -562,23 +612,32 @@ export function CatalogPage() {
           onClose={() => setDraftOpen(null)}
         />
       )}
-      {profiling && data && (
+      {profileOpen && data && (
         <ProfileDialog
+          sourceId={sourceId}
           sourceName={source?.name ?? sourceId}
           settings={profileSettings}
           rows={rows}
           visible={visible}
           selected={[...selected]}
           filtered={filtered}
-          job={myJob}
-          onStart={(tables) => void startProfile(tables)}
-          onClose={() => { setProfiling(false); setReturnTo(null) }}
+          job={profileJob}
+          initial={profileOpen.view}
+          initialScope={profileOpen.scope ?? null}
+          draftActive={!!stripJob}
+          stopping={profile.stopping}
+          filled={filled && filled.jobId === profileJob?.id ? filled.map : {}}
           returnTo={returnTo}
+          onStart={startProfile}
+          onCancel={profile.cancel}
+          onRetry={profile.retry}
+          onShowActive={profile.showActive}
+          onTrack={profile.track}
+          onClose={() => { setProfileOpen(null); setReturnTo(null) }}
           onSettings={() => setProfileSettingsOpen(true)}
           onGoSource={() => navigate(back)}
           onOpenTable={openFromReport}
           onFillCodes={fillFromReport}
-          onReset={() => setJob(null)}
         />
       )}
       {importing && (
@@ -597,11 +656,12 @@ export function CatalogPage() {
  * notice：调用接连没写出来时服务端给的提醒，跟着写一行（全文在悬停里，对话框里也有）
  */
 function DraftStrip({ job, notice, onOpen }: {
-  job: { done: number; total: number; status: string }
+  job: { done: number; total: number; status: string; waiting_for?: string | null }
   notice: string | null
   onOpen: () => void
 }) {
-  const text = job.status === 'queued' ? DT.stripQueued(job.total) : DT.strip(job.done, job.total)
+  // 排在剖析任务后面（同一个数据源的起草和剖析按建立顺序排队）：写明剖析结束后自动开始
+  const text = job.status === 'queued' ? (waitsForProfile(job) ? DT.stripQueuedProfile(job.total) : DT.stripQueued(job.total)) : DT.strip(job.done, job.total)
   return (
     <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2 text-xs"
          style={{ background: 'color-mix(in srgb, var(--accent) 6%, var(--bg-panel))' }}
