@@ -67,6 +67,8 @@ export interface AuditRow {
 export type FormWidget =
   | 'text' | 'textarea' | 'number' | 'integer' | 'date' | 'datetime' | 'select' | 'radio' | 'multiselect'
   | 'checkbox' | 'principal' | 'note' | 'json'
+  /** 文件（N9）：字段 type 为 object，值是上传后拿回的引用 FileRef（typesBlueprint.ts） */
+  | 'file'
 
 export interface FormField {
   type: 'string' | 'number' | 'integer' | 'boolean' | 'array'
@@ -111,11 +113,14 @@ export type Disposition = 'recompute' | 'dual' | 'incomparable'
 
 export interface AppPin {
   alias: string
-  workflow_id: string
-  version: number
+  /** 共享应用钉工作流版本；个人应用（docs/design/normal-user-apps.md N7）写 blueprint，workflow_id 为空 */
+  workflow_id: string | null
+  /** 还没发布（蓝图试运行时派生的草稿）、或个人应用时为空 */
+  version: number | null
   graph_hash: string
   level?: string | null
   use: PinUse
+  blueprint?: string | null
 }
 
 export interface AppEntry {
@@ -128,7 +133,8 @@ export interface AppEntry {
 }
 
 export interface AppViewSource {
-  kind: 'latest_sealed' | 'on_demand' | 'instance'
+  /** exploratory 只在个人应用里合法：最近一次成功封存的探索运行（N7） */
+  kind: 'latest_sealed' | 'on_demand' | 'instance' | 'exploratory'
   pin?: string | null
   from?: string | null
   params?: FormSchema | { $ref: string } | null
@@ -146,6 +152,8 @@ export interface AppComponent {
   bind?: AppBinding | null
   visible?: string | null
   scope?: string | null
+  /** 作者隐藏了它（N6）：解析时跳过，编辑状态下画成半透明 */
+  hidden?: boolean
   children?: AppComponent[]
 }
 
@@ -216,6 +224,10 @@ export interface AppSummary {
   /** 当前用户的授权（关登录时为 manage） */
   my_role: GrantRole | null
   updated_at: string
+  /** 个人应用（N7）：只有拥有者看得见、跑探索运行；老服务端不给时按 shared */
+  scope?: 'shared' | 'personal'
+  owner?: string | null
+  blueprint_id?: string | null
 }
 
 export interface AppDetail extends AppSummary {
@@ -306,8 +318,8 @@ export interface Stamp {
 }
 
 export interface ViewSourceState {
-  /** 来源的种类：按需视图（on_demand）才有「刷新」 */
-  kind?: 'latest_sealed' | 'on_demand' | 'instance'
+  /** 来源的种类：按需视图（on_demand）才有「刷新」；试运行解析时为 trial，个人应用为 exploratory */
+  kind?: 'latest_sealed' | 'on_demand' | 'instance' | 'exploratory' | 'trial'
   state: 'ok' | 'empty' | 'running' | 'stale' | 'error'
   run_id: string | null
   stamp: Stamp | null

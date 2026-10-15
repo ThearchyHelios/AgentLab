@@ -361,11 +361,13 @@ function useViewNodes(view: string): { id: string; label: string }[] {
   const pin = draft.pins.find((p) => p.alias === source?.pin) ?? (draft.pins.length === 1 ? draft.pins[0] : undefined)
   const [nodes, setNodes] = useState<{ id: string; label: string }[]>([])
   useEffect(() => {
-    if (!pin) { setNodes([]); return }
-    const key = `${pin.workflow_id}@${pin.version}`
+    // 还没发布的（试运行派生的草稿）、个人应用的钉住项没有工作流版本可取
+    if (!pin || !pin.workflow_id || pin.version == null) { setNodes([]); return }
+    const { workflow_id: wid, version } = pin
+    const key = `${wid}@${version}`
     let p = graphCache.get(key)
     if (!p) {
-      p = api.workflows.version(pin.workflow_id, pin.version)
+      p = api.workflows.version(wid, version)
         .then((v) => (v.graph?.nodes ?? []).map((n) => ({ id: n.id, label: String(n.data?.label ?? n.id) })))
       p.catch(() => graphCache.delete(key))
       graphCache.set(key, p)
@@ -450,7 +452,7 @@ function ViewsPanel() {
               <select className="field h-7 py-0 text-xs" value={v.source.pin ?? ''} aria-label={T.viewPin} title={APP_TERM_TEXT.pin}
                       onChange={(e) => set(key, { source: { ...v.source, pin: e.target.value || null } })}>
                 <option value="">{T.viewPin}</option>
-                {draft.pins.map((p) => <option key={p.alias} value={p.alias}>{p.alias} · v{p.version}</option>)}
+                {draft.pins.map((p) => <option key={p.alias} value={p.alias}>{p.alias}{p.version != null ? ` · v${p.version}` : ''}</option>)}
               </select>
             )}
             {v.source.kind === 'latest_sealed' && (

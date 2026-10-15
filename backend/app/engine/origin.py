@@ -22,6 +22,8 @@ ORIGIN_KINDS = (
     "app_backfill",  # 钉住项按 recompute 升版后，按历次触发的输入补算
     "hook",          # 外部系统经入站钩子触发
     "api",           # 直接调接口，没说是哪
+    "trial",         # 蓝图的试运行（探索运行，docs/design/normal-user-apps.md N4）
+    "personal_app",  # 个人应用的刷新（探索运行，N7）
 )
 
 #: 客户端在 POST /api/runs 里能声明的来源

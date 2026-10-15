@@ -27,6 +27,9 @@ import { EntryPage } from './pages/apps/EntryPage'
 import { InstancePage } from './pages/apps/InstancePage'
 import { TaskPage } from './pages/apps/TaskPage'
 import { AppEditor } from './pages/apps/edit/AppEditor'
+// 普通用户建应用：新建应用的起点、蓝图页（F5）
+import { NewAppStart } from './pages/blueprints/NewAppStart'
+import { BlueprintPage } from './pages/blueprints/BlueprintPage'
 import { LoginPage } from './pages/LoginPage'
 import { Logo } from './components/Logo'
 import {
@@ -175,6 +178,10 @@ export default function App() {
               <Route path="/schedules/:id" element={<SchedulesPage />} />
               {/* 应用：固定路径（inbox）写在 /apps/:appId 前面，读的人一眼看出它不是应用 id */}
               <Route path="/apps" element={<AppsHome />} />
+              {/* 要在 /apps/:appId 之前：create 不是应用 id */}
+              <Route path="/apps/create" element={<NewAppStart />} />
+              <Route path="/blueprints/:blueprintId" element={<BlueprintPage />} />
+              <Route path="/blueprints/:blueprintId/:section" element={<BlueprintPage />} />
               <Route path="/apps/inbox/:taskId" element={<TaskPage />} />
               <Route path="/apps/:appId" element={<AppPage />} />
               <Route path="/apps/:appId/p/:pageId" element={<AppPage />} />
