@@ -48,7 +48,8 @@ BLUEPRINT_SYSTEM_PROMPT = """\
 - 场景：用 bp_template 选模板（见下面的模板清单），选了之后模板会预置几项默认值
 - /data 看哪些数，每一项：{"id":"gmv","label":"销售额","unit":"元","table":{"source":"库名","table":"表名"},
   "measure":"怎么算（白话或简单聚合）","date":{"column":"业务日期的列","rule":"按支付日"},"filter":"筛选条件","grain":"粒度"}
-  对到已发布的口径卡时写 "reuse"（照抄 look 给的复用写法），不写 table
+  对到已发布的口径卡时写 "reuse"（照抄 look 给的复用写法），不写 table。table 的 source 只能是上面概览里列出的数据源名，
+  不要自己起名；填报登记汇总这个应用自己收上来的记录时，写 {"source":"@records","table":"records"}（记录表建好后系统换成真名）
 - /cadence 多久更新：{"preset":"daily|weekly|monthly","weekday":1,"day":1,"time":"09:00","tz":"Asia/Shanghai",
   "period":"yesterday|last_iso_week|last_month|today|this_iso_week|this_month"}（weekly 写 weekday，1 是周一；monthly 写 day）
 - /people 谁来做，每一步：{"id":"finance","label":"财务会签","who":[{"kind":"user|group|slot|initiator","name":"…"}],
@@ -298,7 +299,7 @@ async def blueprint_stream(payload: BlueprintStreamIn, session: AsyncSession = D
         issues=BLUEPRINT_ISSUES_PROMPT.format(lines="\n".join(f"- {i['path']} {i['message']}" for i in missing))
         if missing else ""), history)
     applier = BlueprintApplier(spec, calibers=calibers)
-    checker = BlueprintChecker(applier)
+    checker = BlueprintChecker(applier, template_id=row.template_id)
     started = time.monotonic()
     gen = copilot.Generation(op_model, system=system, applier=applier, checker=checker, looks=looks, started=started,
                              look_limit=BLUEPRINT_LOOK_LIMIT)
@@ -329,7 +330,7 @@ async def blueprint_stream(payload: BlueprintStreamIn, session: AsyncSession = D
                 target = await own.get(Blueprint, blueprint_id)
                 saved = await store.apply_ops_and_save(own, target, [*applier.effective, *([asked] if asked else [])],
                                                        actor, verified, "assistant", partial=True)
-                out = store.blueprint_out(target)
+                out = await store.blueprint_view(own, target)
             conflicts = [{"code": r["code"], "level": "warning", "path": r["op"].get("path"),
                           "message": f"助手提的这一处没有采纳：{r['message']}"} for r in saved.refused]
             answer = applier.explanation or (asked["question"] if asked else "")
@@ -533,7 +534,7 @@ async def fill_joints_stream(payload: FillJointsIn, session: AsyncSession = Depe
                 target.joints = joints
                 target.updated_by = actor
                 await own.commit()
-                out = store.blueprint_out(target)
+                out = await store.blueprint_view(own, target)
             yield _sse({"op": "final", "blueprint": out,
                         "groups": {g: {"status": "filled" if not (results.get(g) or {}).get("error")
                                        and not (results.get(g) or {}).get("issues") else "failed",

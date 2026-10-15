@@ -22,6 +22,9 @@ from app.blueprints.ops import BpRefused, apply_bp_op, parse_pointer
 
 #: 蓝图不存在（或者是别人的个人蓝图）
 BLUEPRINT_GONE = "蓝图不存在，可能已被删除"
+#: 「看哪些数」里指填报登记这个应用自己的记录表（templates/records.RECORDS_SELF）：建表之前还没有数据源名，实例化时
+#: 换成记录表登记成的数据源
+SELF_RECORDS = "@records"
 PERSONAL_OFF = "管理员还没有开放个人应用：想给自己做一个看板，可以请管理员打开，或请搭建者做成应用"
 
 
@@ -319,7 +322,60 @@ def blueprint_issues_of(blueprint: Any) -> list[dict[str, Any]]:
     return [with_plain(i) for i in issues]
 
 
-def blueprint_out(blueprint: Any, *, issues: bool = True) -> dict[str, Any]:
+async def data_source_problems(session: AsyncSession, spec: dict[str, Any], *,
+                               template_id: str | None) -> list[dict[str, Any]]:
+    """「看哪些数」对到的数据源和表在不在。卡片的白名单（ops._table）只核形状、不查库：对到一个不存在的源，要到试运行
+    发起时才报「绑定的工具不存在」，用户还找不到在哪改——这里提前在卡片上照实说，挡住试运行和发布（P1）。
+
+    本应用的记录表写 @records，只有填报登记认；源存在、表结构探查过、表却不在里面的，同样照实说。没探查过的不猜。"""
+    from app.data import catalog
+    from app.db.models import DataSource
+
+    items = [(i, item, (item.get("table") or {}).get("value")) for i, item in enumerate(spec.get("data") or [])
+             if isinstance(item, dict)]
+    names = {t["source"] for _, _, t in items if isinstance(t, dict) and t.get("source") and t["source"] != SELF_RECORDS}
+    rows = {r.name: r for r in (await session.execute(select(DataSource).where(DataSource.name.in_(names)))).scalars()} \
+        if names else {}
+    records = template_id == "records"
+    hint = "；汇总本应用填报的记录，请选「本应用的记录表」" if records else ""
+    out: list[dict[str, Any]] = []
+    for i, item, table in items:
+        if not isinstance(table, dict) or not table.get("source"):
+            continue
+        label = (item.get("label") or {}).get("value") or item.get("id")
+        path = f"/data/{i}/table"
+        source = table["source"]
+        if source == SELF_RECORDS:
+            if not records:
+                out.append({"code": "bp.data_source_unknown", "level": "error", "path": path,
+                            "message": f"「{label}」对到了「本应用的记录表」，只有填报登记才有记录表：请重新选数据源"})
+            continue
+        row = rows.get(source)
+        if row is None or not row.enabled:
+            out.append({"code": "bp.data_source_unknown", "level": "error", "path": path,
+                        "message": f"「{label}」对到的数据源「{source}」{'已停用' if row is not None else '不存在'}：请在"
+                                   f"「看哪些数」里重新选数据源{hint}"})
+        elif (row.schema_cache or {}).get("tables") and not catalog.resolve_table_name(row.schema_cache, table.get("table") or ""):
+            out.append({"code": "bp.data_table_unknown", "level": "error", "path": path,
+                        "message": f"数据源「{source}」里没有表「{table.get('table')}」：请在「看哪些数」里重新选表"})
+    return out
+
+
+async def data_source_issues(session: AsyncSession, blueprint: Any) -> list[dict[str, Any]]:
+    """data_source_problems 加白话，按这张蓝图的模板判。"""
+    from app.plain import with_plain
+
+    spec = blueprint.spec or {}
+    template_id = (spec.get("template") or {}).get("id") or blueprint.template_id
+    return [with_plain(i) for i in await data_source_problems(session, spec, template_id=template_id)]
+
+
+async def blueprint_view(session: AsyncSession, blueprint: Any) -> dict[str, Any]:
+    """接口交回的蓝图：blueprint_out 再加上要查库的检查（对到的数据源和表在不在）。"""
+    return blueprint_out(blueprint, extra=await data_source_issues(session, blueprint))
+
+
+def blueprint_out(blueprint: Any, *, issues: bool = True, extra: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """一张蓝图交给前端的样子（frontend/src/typesBlueprint.ts 的 Blueprint）。关节只给状态和模板声明的说法、类型、分组
     （JointState：status、by、note、label、kind、group），不给填的值（值在图上看）。"""
     joints = {jid: {k: v for k, v in state.items() if k in ("status", "by", "note", "label", "kind", "group")}
@@ -335,5 +391,5 @@ def blueprint_out(blueprint: Any, *, issues: bool = True) -> dict[str, Any]:
         "updated_at": blueprint.updated_at.isoformat() if blueprint.updated_at else None,
     }
     if issues:
-        out["issues"] = blueprint_issues_of(blueprint)
+        out["issues"] = [*blueprint_issues_of(blueprint), *(extra or [])]
     return out

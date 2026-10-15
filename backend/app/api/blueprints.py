@@ -77,12 +77,12 @@ async def _blueprint(session: AsyncSession, blueprint_id: str) -> Blueprint:
     return await load(session, blueprint_id)
 
 
-def blueprint_out(bp: Blueprint) -> dict[str, Any]:
-    """接口形状（frontend/src/typesBlueprint.ts 的 Blueprint，blueprints/store.blueprint_out）：图本身不下发（只给哈希），
-    关节只给状态，问题带白话。"""
-    from app.blueprints.store import blueprint_out as shaped
+async def blueprint_out(session: AsyncSession, bp: Blueprint) -> dict[str, Any]:
+    """接口形状（frontend/src/typesBlueprint.ts 的 Blueprint，blueprints/store.blueprint_view）：图本身不下发（只给哈希），
+    关节只给状态，问题带白话，含要查库的检查（对到的数据源和表在不在）。"""
+    from app.blueprints.store import blueprint_view
 
-    return shaped(bp)
+    return await blueprint_view(session, bp)
 
 
 def _refused(e: Any) -> HTTPException:
@@ -180,7 +180,7 @@ async def create_blueprint(payload: BlueprintIn, session: AsyncSession = Depends
     await record_event(session, bp, "create", {"source": bp.source, "scope": bp.scope}, principal=principal)
     await session.commit()
     await session.refresh(bp)
-    return blueprint_out(bp)
+    return await blueprint_out(session, bp)
 
 
 def _template_spec(spec: dict[str, Any], template_id: str | None) -> dict[str, Any]:
@@ -273,7 +273,7 @@ async def list_blueprints(scope: Literal["shared", "personal"] | None = None,
         rows += list((await session.execute(select(Blueprint).where(mine).order_by(Blueprint.updated_at.desc())
                                             .limit(_LIST_MAX))).scalars())
     rows.sort(key=lambda bp: bp.updated_at or bp.created_at, reverse=True)
-    return {"items": [blueprint_out(bp) for bp in rows[:_LIST_MAX]]}
+    return {"items": [await blueprint_out(session, bp) for bp in rows[:_LIST_MAX]]}
 
 
 @router.get("/blueprints/{blueprint_id}")
@@ -282,7 +282,7 @@ async def get_blueprint(blueprint_id: str, session: AsyncSession = Depends(get_s
     from app.blueprints.trial import settle
 
     bp = await _blueprint(session, blueprint_id)
-    return blueprint_out(await settle(session, bp))
+    return await blueprint_out(session, await settle(session, bp))
 
 
 @router.get("/blueprints/{blueprint_id}/conversation")
@@ -331,7 +331,7 @@ async def patch_blueprint(blueprint_id: str, payload: BlueprintPatch, session: A
             raise CodedHTTPException(422, e.message, e.code) from e
     await session.commit()
     await session.refresh(bp)
-    return blueprint_out(bp)
+    return await blueprint_out(session, bp)
 
 
 # --------------------------------------------------------------------------
@@ -351,7 +351,7 @@ async def instantiate_blueprint(blueprint_id: str, session: AsyncSession = Depen
         result = await materialize(session, bp, principal=principal)
     except TrialRefused as e:
         raise _refused(e) from e
-    return {"blueprint": blueprint_out(bp), "app_spec": result.app_spec, "problems": result.problems}
+    return {"blueprint": await blueprint_out(session, bp), "app_spec": result.app_spec, "problems": result.problems}
 
 
 class TrialIn(BaseModel):
@@ -376,7 +376,7 @@ async def trial(blueprint_id: str, payload: TrialIn, session: AsyncSession = Dep
         raise _refused(e) from e
     except LaunchRefused as e:
         raise _refused(e) from e
-    return {"run_id": run.id, "blueprint": blueprint_out(bp), "inputs": dict(run.input or {})}
+    return {"run_id": run.id, "blueprint": await blueprint_out(session, bp), "inputs": dict(run.input or {})}
 
 
 @router.get("/blueprints/{blueprint_id}/preview")

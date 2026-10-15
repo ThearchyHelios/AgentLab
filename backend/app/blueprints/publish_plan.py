@@ -304,7 +304,10 @@ async def _preflight(session: AsyncSession, bp: Blueprint, target: _Target, *, l
     from app.core.artifact_store import graph_hash
 
     # 蓝图：缺的项、待确认的项（发布前要人看过，bp.unconfirmed）、还没填的生成关节（同蓝图卡片上显示的那一份）
-    out: list[dict[str, Any]] = [{**i, "source": "blueprint"} for i in blueprint_issues_of(bp)]
+    from app.blueprints.store import data_source_issues
+
+    out: list[dict[str, Any]] = [{**i, "source": "blueprint"}
+                                 for i in [*blueprint_issues_of(bp), *await data_source_issues(session, bp)]]
     # 发布的级别：受管级、把受管降为已发布都只给管理员（Q8，同发布接口）
     if level == "governed" and not principal.at_least("admin"):
         out.append(_problem(ADMIN_REQUIRED, "以受管级别发布需要管理员", source="plan"))

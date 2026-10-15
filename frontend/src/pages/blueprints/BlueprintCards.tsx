@@ -25,7 +25,7 @@ import { chatBusy, useBlueprint } from '../../store/blueprint'
 import type {
   Blueprint, BpDataItem, BpField, BpItem, BpOp, BpStep, ItemStatus, JointState, PlainIssue, TemplateInfo,
 } from '../../typesBlueprint'
-import { ValueEditor, valueText, type EditorKind, type EditorScope } from './editors'
+import { SELF_RECORDS, ValueEditor, valueText, type EditorKind, type EditorScope } from './editors'
 import { isItem, missingPaths, visibleCards, type CardKey } from './shared'
 
 const STATUS_COLOR: Record<ItemStatus, string> = {
@@ -115,6 +115,7 @@ export function BlueprintCards({ blueprintId, templates }: { blueprintId: string
     scope: {
       fields: spec.fields.map((f) => ({ name: f.name, title: String((f.spec?.value as Record<string, unknown> | null)?.title ?? f.name) })),
       metrics: spec.data.map((d) => ({ id: d.id, title: String(d.label?.value ?? d.id) })),
+      recordsSelf: (spec.template?.id ?? bp.template_id) === 'records',
     },
   }
   return (
@@ -353,7 +354,7 @@ function DataBlock({ ctx, item, index }: { ctx: CardCtx; item: BpDataItem; index
     <div className="mb-1.5 rounded border bg-bg px-2 py-1.5 text-2xs leading-relaxed" data-bp-match={`${table.source}.${table.table}`}>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
         <span className="inline-flex items-center gap-1 text-fg"><Database size={11} aria-hidden className="text-faint" />
-          {BLUEPRINT_TEXT.dataTable}：<span className="mono">{table.source}.{table.table}</span></span>
+          {BLUEPRINT_TEXT.dataTable}：<span className={table.source === SELF_RECORDS ? '' : 'mono'}>{valueText('table', table)}</span></span>
         {item.grain?.value != null && <span>{BLUEPRINT_TEXT.dataGrain}：<span className="text-fg">{String(item.grain.value)}</span></span>}
         {date?.column && <span>{BLUEPRINT_TEXT.dataDate}：<span className="text-fg">{valueText('date', date)}</span></span>}
       </div>

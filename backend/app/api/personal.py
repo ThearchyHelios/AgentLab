@@ -45,11 +45,11 @@ def _refused(e: Any) -> HTTPException:
     return HTTPException(e.status_code, e.message)
 
 
-def blueprint_out(row: Any) -> dict[str, Any]:
+async def blueprint_out(session: AsyncSession, row: Any) -> dict[str, Any]:
     """蓝图的接口形状只有一份（api/blueprints.blueprint_out，带蓝图检查的白话）：存成个人应用、取副本交回的也是它。"""
     from app.api.blueprints import blueprint_out as out
 
-    return out(row)
+    return await out(session, row)
 
 
 async def _blueprint(session: AsyncSession, blueprint_id: str) -> Any:
@@ -89,7 +89,7 @@ async def save_personal(blueprint_id: str, session: AsyncSession = Depends(get_s
             return JSONResponse(status_code=e.status_code,
                                 content={"detail": e.message, "code": e.code, "issues": e.issues})
         raise _refused(e) from e
-    return {"app_id": app.id, "blueprint": blueprint_out(await _blueprint(session, blueprint_id))}
+    return {"app_id": app.id, "blueprint": await blueprint_out(session, await _blueprint(session, blueprint_id))}
 
 
 @router.post("/blueprints/{blueprint_id}/copy", status_code=201)
@@ -101,7 +101,7 @@ async def copy_for_review(blueprint_id: str, session: AsyncSession = Depends(get
         row = await copy(session, await _blueprint(session, blueprint_id), principal=_principal(x_actor))
     except PersonalRefused as e:
         raise _refused(e) from e
-    return blueprint_out(row)
+    return await blueprint_out(session, row)
 
 
 # --------------------------------------------------------------------------

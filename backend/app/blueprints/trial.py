@@ -274,6 +274,12 @@ async def start_trial(session: AsyncSession, blueprint: Blueprint, *, inputs: di
     from app.api.deps import restricted
     from app.engine.launch import launch_run
 
+    from app.blueprints.store import data_source_issues
+
+    # 对到的数据源和表不在：发起时只会报「绑定的工具不存在」，这里先按卡片照实说是哪一项、怎么改
+    unknown = [i for i in await data_source_issues(session, blueprint) if i.get("level") == "error"]
+    if unknown:
+        raise TrialRefused(409, NOT_READY_TEXT, NOT_READY, unknown)
     result = await materialize(session, blueprint, principal=principal)
     if result.blocked:
         raise TrialRefused(409, NOT_READY_TEXT, NOT_READY, [p for p in result.problems if p.get("level") == "error"])

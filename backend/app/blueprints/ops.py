@@ -119,6 +119,9 @@ def _table(value: Any, _spec: dict[str, Any]) -> Any:
     if not isinstance(value, dict) or set(value) - {"source", "table"}:
         raise BpRefused("对到的表要写明数据源和表名两项")
     out = {k: str(value.get(k) or "").strip() for k in ("source", "table")}
+    if out["source"] == "@records":
+        # 本应用的记录表（填报登记，blueprints/store.SELF_RECORDS）只有一张，表名固定，用户和模型都不用写
+        out["table"] = "records"
     if not all(out.values()) or any(len(v) > 200 for v in out.values()):
         raise BpRefused("对到的表要写明数据源和表名")
     return out

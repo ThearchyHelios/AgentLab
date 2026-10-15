@@ -295,6 +295,15 @@ export const BP_OP_TEXT = {
 export const BP_EDIT_TEXT = {
   source: '数据源',
   table: '表名',
+  /** 填报登记里「看哪些数」对到这个应用自己收上来的记录（服务端写 @records） */
+  selfRecords: '本应用的记录表',
+  selfRecordsHint: '这个应用每次提交存下的那张表；发布后系统建好表、换成真名',
+  pickSource: '选一个数据源',
+  pickTable: '选一张表',
+  tablesLoading: '正在读取表…',
+  /** 读不到表的列表（没读取过表结构、或没有权限）时直接填表名 */
+  tableManual: '读不到这个数据源的表，请直接填表名',
+  sourcesFailed: '读不到数据源列表，请直接填数据源名和表名',
   column: '日期列',
   rule: '按什么算（例如按支付日）',
   preset: '频率',

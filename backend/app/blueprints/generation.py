@@ -143,18 +143,31 @@ class BlueprintChecker:
     交回它改。缺的项（bp.missing、bp.data_unmapped……）不交回：缺的往往是只有用户知道的事，逼它补只会让它编，由它在
     这一轮里 bp_ask 问，或者留给用户在卡片上填。"""
 
-    def __init__(self, applier: BlueprintApplier) -> None:
+    def __init__(self, applier: BlueprintApplier, *, template_id: str | None = None) -> None:
         self.applier = applier
+        self.template_id = template_id
 
     def lint(self) -> list[dict[str, Any]]:
         from app.blueprints.ops import blueprint_issues
 
         return blueprint_issues(self.applier.spec, for_="trial")
 
+    async def sources(self) -> list[dict[str, Any]]:
+        """对到的数据源和表在不在（要查库，用自己的会话：流式回答时接口的会话可能已经关了）。对到一个不存在的源是助手
+        提错了，交回它改，不留给用户到试运行时才碰上。"""
+        from app.blueprints.store import data_source_problems
+        from app.db.base import SessionLocal
+
+        spec = self.applier.spec
+        template_id = (spec.get("template") or {}).get("id") or self.template_id
+        async with SessionLocal() as session:
+            return await data_source_problems(session, spec, template_id=template_id)
+
     async def issues(self) -> list[dict[str, Any]]:
         refused = [{"code": r["code"], "level": "error", "path": r["path"], "message": r["message"]}
                    for r in self.applier.unreported()]
-        return [*refused, *(i for i in self.lint() if i["code"] == "bp.template_mismatch" and i["level"] == "error")]
+        return [*refused, *(i for i in self.lint() if i["code"] == "bp.template_mismatch" and i["level"] == "error"),
+                *await self.sources()]
 
     def repair_request(self, issues: list[dict[str, Any]], looks_text: str) -> str:
         return BLUEPRINT_REPAIR_PROMPT.format(spec=json.dumps(self.applier.spec, ensure_ascii=False),

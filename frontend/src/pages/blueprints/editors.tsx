@@ -7,7 +7,7 @@
  * agentlab.form/1 的一个属性另加是否必填；字段对应的取值是表单字段（form.x）、指标（metric.y）、核对出来的行（rows）或
  * 常量（文字加单引号）。说法都是白话：时限写「2 天 3 小时」，存的是 ISO 8601 时长；处理人写名字，不写 kind。
  */
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Plus, X } from 'lucide-react'
 import { PrincipalPicker, type Principal as PickerPrincipal } from '../../components/PrincipalPicker'
@@ -17,16 +17,22 @@ import {
   TIMEOUT_LABEL, WEEKDAY_LABEL, cadenceText, durationIso, durationText, policyText, principalText,
 } from '../../lib/terms'
 import type { BpPrincipal } from '../../typesBlueprint'
+import type { DataSourceName } from '../../types'
+import { api } from '../../api/client'
 
 export type EditorKind =
   | 'text' | 'textarea' | 'table' | 'date' | 'cadence' | 'principals' | 'grantees' | 'policy' | 'duration' | 'timeout'
   | 'threshold' | 'field' | 'bool' | 'mapping'
 
-/** 编辑框要的选项：「填什么」里的字段、「看哪些数」里的指标（金额线、字段对应从里面选） */
+/** 编辑框要的选项：「填什么」里的字段、「看哪些数」里的指标（金额线、字段对应从里面选）；填报登记能对到本应用的记录表 */
 export interface EditorScope {
   fields: { name: string; title: string }[]
   metrics: { id: string; title: string }[]
+  recordsSelf?: boolean
 }
+
+/** 「看哪些数」里指这个应用自己的记录表（服务端 blueprints/store.SELF_RECORDS），表名固定 */
+export const SELF_RECORDS = '@records'
 
 type Obj = Record<string, any>
 const obj = (v: unknown): Obj => (v && typeof v === 'object' && !Array.isArray(v) ? v as Obj : {})
@@ -79,7 +85,9 @@ export function valueText(kind: EditorKind, value: unknown, scope?: EditorScope)
   if (value == null || value === '') return BLUEPRINT_TEXT.empty
   const o = obj(value)
   switch (kind) {
-    case 'table': return o.source || o.table ? `${o.source ?? ''}.${o.table ?? ''}` : BLUEPRINT_TEXT.empty
+    case 'table':
+      if (o.source === SELF_RECORDS) return BP_EDIT_TEXT.selfRecords
+      return o.source || o.table ? `${o.source ?? ''}.${o.table ?? ''}` : BLUEPRINT_TEXT.empty
     case 'date': return o.column ? `${o.column}${o.rule ? `（${o.rule}）` : ''}` : BLUEPRINT_TEXT.empty
     case 'cadence': return cadenceText(o) || BLUEPRINT_TEXT.empty
     case 'principals':
@@ -160,17 +168,85 @@ function TextEditor({ kind, value, busy, onSave, onCancel }: ValueEditorProps) {
   )
 }
 
-function TableEditor({ value, busy, onSave, onCancel }: ValueEditorProps) {
+/**
+ * 对到哪张表：先选数据源（已接入的，填报登记另有「本应用的记录表」），再选表（读这个数据源读取过的表结构）。读不到列表时
+ * 退回直接填写——合不合规照旧由服务端判，对到不存在的源、表由蓝图检查在卡片上照实说
+ */
+function TableEditor({ value, busy, onSave, onCancel, scope }: ValueEditorProps) {
   const o = obj(value)
   const [source, setSource] = useState(String(o.source ?? ''))
-  const [table, setTable] = useState(String(o.table ?? ''))
+  const [table, setTable] = useState(String(o.source === SELF_RECORDS ? 'records' : o.table ?? ''))
+  const [sources, setSources] = useState<DataSourceName[] | null>(null)
+  const [tables, setTables] = useState<string[] | null>(null)
+  const [loadingTables, setLoadingTables] = useState(false)
+  const [manual, setManual] = useState(false)
+  useEffect(() => {
+    let alive = true
+    api.datasources.names()
+      .then((list) => { if (alive) setSources(list.filter((x) => x.enabled !== false)) })
+      .catch(() => { if (alive) { setSources([]); setManual(true) } })
+    return () => { alive = false }
+  }, [])
+  const picked = sources?.find((x) => x.name === source)
+  useEffect(() => {
+    setTables(null)
+    if (!picked) return
+    let alive = true
+    setLoadingTables(true)
+    api.datasources.schema(picked.id)
+      .then((r) => { if (alive) setTables(Array.isArray(r?.tables) ? r.tables.map(String) : []) })
+      .catch(() => { if (alive) setTables([]) })
+      .finally(() => { if (alive) setLoadingTables(false) })
+    return () => { alive = false }
+  }, [picked?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+  const self = source === SELF_RECORDS
+  const ok = self || (!!source.trim() && !!table.trim())
+  const save = () => onSave(self ? { source: SELF_RECORDS, table: 'records' } : { source: source.trim(), table: table.trim() })
+  if (manual) {
+    return (
+      <Shell busy={busy} onCancel={onCancel} ok={ok} onSave={save}>
+        <p className="text-2xs text-dim" data-bp-table-manual="">{BP_EDIT_TEXT.sourcesFailed}</p>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label={BP_EDIT_TEXT.source}>{(p) => <input {...p} className="field" value={source} onChange={(e) => setSource(e.target.value)} />}</Field>
+          <Field label={BP_EDIT_TEXT.table}>{(p) => <input {...p} className="field" value={table} onChange={(e) => setTable(e.target.value)} />}</Field>
+        </div>
+      </Shell>
+    )
+  }
   return (
-    <Shell busy={busy} onCancel={onCancel} ok={!!source.trim() && !!table.trim()}
-           onSave={() => onSave({ source: source.trim(), table: table.trim() })}>
+    <Shell busy={busy} onCancel={onCancel} ok={ok} onSave={save}>
       <div className="grid grid-cols-2 gap-2">
-        <Field label={BP_EDIT_TEXT.source}>{(p) => <input {...p} className="field" value={source} onChange={(e) => setSource(e.target.value)} />}</Field>
-        <Field label={BP_EDIT_TEXT.table}>{(p) => <input {...p} className="field" value={table} onChange={(e) => setTable(e.target.value)} />}</Field>
+        <Field label={BP_EDIT_TEXT.source}>
+          {(p) => (
+            <select {...p} className="field" value={source} data-bp-table-source="" disabled={sources == null}
+                    onChange={(e) => { setSource(e.target.value); setTable(e.target.value === SELF_RECORDS ? 'records' : '') }}>
+              <option value="">{sources == null ? BP_EDIT_TEXT.tablesLoading : BP_EDIT_TEXT.pickSource}</option>
+              {scope?.recordsSelf && <option value={SELF_RECORDS}>{BP_EDIT_TEXT.selfRecords}</option>}
+              {/* 原来填的源不在列表里（不存在、已停用）也列出来，看得出要换 */}
+              {source && source !== SELF_RECORDS && sources && !picked && <option value={source}>{source}</option>}
+              {(sources ?? []).map((x) => (
+                <option key={x.id} value={x.name}>{x.description ? `${x.name}（${x.description}）` : x.name}</option>
+              ))}
+            </select>
+          )}
+        </Field>
+        <Field label={BP_EDIT_TEXT.table}>
+          {(p) => self ? (
+            <input {...p} className="field" value={BP_EDIT_TEXT.selfRecords} disabled title={BP_EDIT_TEXT.selfRecordsHint} />
+          ) : tables && tables.length ? (
+            <select {...p} className="field" value={table} data-bp-table-name="" onChange={(e) => setTable(e.target.value)}>
+              <option value="">{BP_EDIT_TEXT.pickTable}</option>
+              {table && !tables.includes(table) && <option value={table}>{table}</option>}
+              {tables.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+          ) : (
+            <input {...p} className="field" value={table} disabled={!source || loadingTables} data-bp-table-name=""
+                   placeholder={loadingTables ? BP_EDIT_TEXT.tablesLoading : picked ? BP_EDIT_TEXT.tableManual : ''}
+                   onChange={(e) => setTable(e.target.value)} />
+          )}
+        </Field>
       </div>
+      {self && <p className="text-2xs text-dim">{BP_EDIT_TEXT.selfRecordsHint}</p>}
     </Shell>
   )
 }
