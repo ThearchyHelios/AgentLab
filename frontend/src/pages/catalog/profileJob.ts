@@ -133,7 +133,8 @@ export function useProfileJob(sourceId: string, active: CatalogActiveProfileJob 
   }, [accept])
 
   /**
-   * 停止。服务端停下正在执行的那条查询（由数据库按单条时限截止）之前任务还是进行中：这期间 stopping 为这个任务。
+   * 停止。停止接口等服务端收尾写完才答（不等正在执行的那条查询，它由数据库按单条时限截止），这期间任务还是进行中：
+   * stopping 为这个任务。
    * 已经结束了（409）就取一次最新的
    */
   const cancel = useCallback(async () => {

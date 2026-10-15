@@ -492,8 +492,8 @@ export const api = {
         get<{ task: CatalogProfileTaskDetail }>(
           `${catalogBase(sourceId)}/profile-jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(String(seq))}`, opts),
       /**
-       * 停止：排队的直接停；进行中的那条查询由数据库按单条时限截止，这张表已做完的项照常写进目录、没做的保留旧结论，
-       * 后面的表记已停止。回停止之后的状态；已经结束的回 409（catalog_profile_finished）
+       * 停止：排队的直接停；进行中的不再等正在执行的那条查询（数据库按单条时限截止它），这张表已做完的项照常写进目录、
+       * 没做的保留旧结论，后面的表记已停止。收尾写完才回停止之后的状态；已经结束的回 409（catalog_profile_finished）
        */
       cancel: (sourceId: string, jobId: string) =>
         post<{ job: CatalogProfileJob }>(`${catalogBase(sourceId)}/profile-jobs/${encodeURIComponent(jobId)}/cancel`),

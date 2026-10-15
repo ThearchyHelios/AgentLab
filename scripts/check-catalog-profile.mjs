@@ -4,8 +4,9 @@
 // 「开始前的范围和个数是不是按清单算的」「预算是不是按表写的、估了这次最多几条查询」「明说只读、一条一条发、可以停」
 // 「同源有起草任务时是不是写排队」「进行中每张表到哪了（各类检查几项、发了几条查询、正在做哪一项）」「停得下来、停下来
 // 写清做完的保留了什么」「展开一张表看得到检查清单和发过的查询（字面量换成了 ?）」「结束后能按有发现 / 有跳过 / 失败筛、
-// 只重试没做完的表」「止损、服务重启的原因照实写」「各种 409 各有下一步」「表清单的剖析一列和需要剖析的筛选」「表详情的一节
-// 和剖析这张表」「设置的两项新字段、被拒时报错落到那一项」「起草排在剖析后面时怎么说」。
+// 只重试没做完的表」「止损、服务重启的原因照实写（进程被杀时没来得及收尾的那张表点名，不说做完的已写进目录）」
+// 「各种 409 各有下一步」「表清单的剖析一列和需要剖析的筛选」「表详情的一节和剖析这张表」「设置的两项新字段、被拒时报错
+// 落到那一项」「起草排在剖析后面时怎么说」「展开进行中的表时只在一项检查开始、结束时重取，不跟着查询数每次轮询都取」。
 //
 // 写法同 check-catalog：数据源列表、目录清单、单表目录、剖析任务、起草任务都用 page.route 伪造（虚构的网店业务库，表名
 // orders、customers、visits……都是通用的假名字），任务怎么往前走由检查自己推（settle、finish、stopJob），页面每 1.5 秒
@@ -360,8 +361,16 @@ function finish(job, status) {
   job.started_at ??= job.finished_at
   delete job.stopAsked
 }
-/** 停下（使用者停止、止损、服务重启）：正在做的表写入已做完的项、其余项记原因；没开始的表记已停止，原因同一句 */
-function stopJob(job, { status = 'cancelled', reason = 'cancelled', current = null, rest = null, error = null } = {}) {
+/**
+ * 停下（使用者停止、止损、服务重启）。正在做的那张表照服务端分两种：
+ * - 来得及收尾（saved，缺省：停止、止损、关停服务）：写入已做完的项，其余项记原因，状态按逐表算（有项没查是部分完成），
+ *   error 是 rest（服务端的「已做完的 N 项照常写进了数据目录，剩下 M 项没查」）；
+ * - 没来得及收尾（saved: false：进程被杀，下次启动时才标中断）：结论一项都没写进目录，表记已停止，查完的项也改记跳过，
+ *   说法照服务端（catalog_profile_jobs._close_tasks）：查完的项「{原因}，查完了但结论没有写进数据目录」，表的原因
+ *   「{原因}：已查完的 N 项没有写进数据目录，剩下 M 项没查」；一项都还没查完时表的原因就是 error。
+ * 没开始的表记已停止，原因同一句
+ */
+function stopJob(job, { status = 'cancelled', reason = 'cancelled', current = null, rest = null, error = null, saved = true } = {}) {
   for (const t of job.tasks) {
     if (t.status === 'running') {
       const left = t.checks.filter((c) => c.state === 'pending' || c.state === 'running')
@@ -369,7 +378,17 @@ function stopJob(job, { status = 'cancelled', reason = 'cancelled', current = nu
         Object.assign(c, { state: 'skipped', reason, detail: current ?? '已停止，这一项没有查' })
         t.skipped.push({ kind: c.kind, target: c.target, path: c.path, reason, detail: c.detail })
       }
-      Object.assign(t, { status: 'cancelled', current: null, finished_at: isoNow(), error: rest ?? error })
+      if (saved) {
+        Object.assign(t, { status: left.length ? 'partial' : 'ok', current: null, finished_at: isoNow(), error: rest ?? error })
+        continue
+      }
+      const done = t.checks.filter((x) => x.state === 'done')
+      for (const c of done) {
+        Object.assign(c, { state: 'skipped', reason, detail: `${error}，查完了但结论没有写进数据目录` })
+        t.skipped.push({ kind: c.kind, target: c.target, path: c.path, reason, detail: c.detail })
+      }
+      const own = done.length ? `${error}：已查完的 ${done.length} 项没有写进数据目录${left.length ? `，剩下 ${left.length} 项没查` : ''}` : error
+      Object.assign(t, { status: 'cancelled', current: null, finished_at: isoNow(), error: own })
     } else if (t.status === 'pending') {
       Object.assign(t, { status: 'cancelled', finished_at: isoNow(), error: error ?? '已停止，这张表没有剖析' })
     }
@@ -830,6 +849,30 @@ await section('剖析 · 进行中：逐表进度、后台继续与停止', asyn
         && (await inBox(page, '[data-profile-queries]')).includes('已发 23 条查询') && (await inBox(page, '[data-profile-elapsed]')).startsWith('· 用时'),
   await textOf(box(page).locator('[role="status"]')))
   check('……标题写「正在剖析…」', (await inBox(page, '[data-profile-title]')) === '正在剖析…')
+  // 展开进行中的那一行：服务端只在一项检查开始、结束时写检查清单和发过的查询，其间每发一条查询只加查询数。所以只多了
+  // 查询数时不重取这张表的完整结果，一项结束了、换了一项在做才重取（开发模式下 StrictMode 挂载时会多取一次，按展开后的
+  // 次数为准）
+  const detailGets = () => count(sent, new RegExp(`^GET .*profile-jobs/${job.id}/tasks/1$`))
+  const jobPolls = () => count(sent, new RegExp(`^GET .*profile-jobs/${job.id}$`))
+  const ordersTask = job.tasks.find((t) => t.table_name === 'orders')
+  await taskLine(page, 'orders').locator('[data-profile-task-toggle]').click()
+  const live = box(page).locator('[data-profile-task-detail="orders"]')
+  check('进行中展开一行：取这张表的完整结果，正在做的那一项写「进行中」', await until(async () => (await live.locator('[data-profile-checks]').count()) === 1)
+        && detailGets() >= 1 && (await live.locator('[data-profile-check][data-state="running"]').count()) === 1, `${detailGets()} 次`)
+  await sleep(300)
+  const gets0 = detailGets()
+  for (const n of [25, 27]) {
+    const p0 = jobPolls()
+    Object.assign(ordersTask, { queries: n, elapsed_ms: ordersTask.elapsed_ms + 1500 })
+    await until(async () => jobPolls() >= p0 + 2, 5000)
+  }
+  check('……这一项没结束、只多发了几条查询：逐表一行跟着走，不重取这张表的完整结果', (await inBox(page, '[data-profile-task="orders"] [data-profile-task-queries]')) === '27 条查询'
+        && detailGets() === gets0, `展开后 ${gets0} 次 → ${detailGets()} 次`)
+  settle(state, job, 'orders', { status: 'running', done: { relation: 4, codes: 5, date: 1 }, queries: 29, current: '正在取 orders.source 的码值候选' })
+  check('……这一项结束、换了下一项：重取一次，检查清单跟上', await until(async () => detailGets() === gets0 + 1
+        && (await live.locator('[data-profile-check="relation"][data-state="done"]').count()) === 4), `展开后 ${gets0} 次 → ${detailGets()} 次`)
+  await taskLine(page, 'orders').locator('[data-profile-task-toggle]').click()
+  await until(async () => (await live.count()) === 0)
   settle(state, job, 'orders', {
     queries: 31, elapsed_ms: 26000, added: 3, updated: 2, row_estimate: { rows: 250000, method: 'stats', at_least: null },
     findings: [
@@ -883,21 +926,25 @@ await section('剖析 · 进行中：逐表进度、后台继续与停止', asyn
   check('点页头：回到对话框，直接是进行中的任务，提醒写在进度条下面', await until(async () => (await phase(page)) === 'running')
         && (await inBox(page, '[data-profile-notice]')) === NOTICE && await box(page).locator('[data-profile-scope]').count() === 0)
 
-  // 停止：调停止接口；正在执行的那条查询由数据库按单条时限截止，这期间写「正在停止」
+  // 停止：调停止接口。服务端不再等正在执行的那条查询（数据库按单条时限截止它），收尾写完就答，这期间写「正在停止」
   await page.locator('[data-profile-stop]').click()
-  check('点「停止」：调停止接口，写「正在停止：等正在执行的那条查询结束…」，停止按钮不能再点', await until(async () =>
-    (await inBox(page, '[data-profile-title]')).startsWith('正在停止：等正在执行的那条查询结束'))
+  check('点「停止」：调停止接口，写「正在停止：正在执行的那条查询不再等待，由数据库按单条时限截止…」，停止按钮不能再点', await until(async () =>
+    (await inBox(page, '[data-profile-title]')).startsWith('正在停止：正在执行的那条查询不再等待，由数据库按单条时限截止'))
+    && !(await inBox(page, '[data-profile-title]')).includes('等正在执行的那条查询结束')
     && count(sent, new RegExp(`^POST .*profile-jobs/${job.id}/cancel$`)) === 1 && await page.locator('[data-profile-stop]').isDisabled(),
   await inBox(page, '[data-profile-title]'))
-  stopJob(job, { rest: '已停止：做完的 1 项已写进目录，其余 3 项保留原来的结论' })
+  // 服务端：正在剖析的访问记录来得及收尾，做完的 1 项写进目录、剩下 3 项没查（部分完成），后面的表已停止
+  stopJob(job, { rest: '剖析已停止：已做完的 1 项照常写进了数据目录，剩下 3 项没查' })
   check('……停下来：标题写「已停止」，写明做完的已写进目录、没做的保留原来的结论', await until(async () => (await phase(page)) === 'done')
-        && (await inBox(page, '[data-profile-title]')) === '已停止' && (await inBox(page, '[data-profile-cancelled]')).includes('没做的项保留原来的结论'),
+        && (await inBox(page, '[data-profile-title]')) === '已停止' && (await inBox(page, '[data-profile-cancelled]')).includes('没做的项保留原来的结论')
+        && !(await inBox(page, '[data-profile-cancelled]')).includes('没来得及'),
   `${await inBox(page, '[data-profile-title]')} · ${await inBox(page, '[data-profile-cancelled]')}`)
-  check('……正在剖析的那张写已停止和服务端的原因；后面的表都记已停止', (await inBox(page, '[data-profile-task="visits"] [data-profile-task-status]')) === '已停止'
-        && (await inBox(page, '[data-profile-task="visits"] [data-profile-task-note]')).includes('其余 3 项保留原来的结论')
+  check('……正在剖析的那张写部分完成和服务端的原因；后面的表都记已停止', (await inBox(page, '[data-profile-task="visits"] [data-profile-task-status]')) === '部分完成'
+        && (await inBox(page, '[data-profile-task="visits"] [data-profile-task-note]')).includes('已做完的 1 项照常写进了数据目录')
         && (await inBox(page, '[data-profile-task="tmp_log"] [data-profile-task-status]')) === '已停止'
-        && await taskLine(page, 'tmp_log').locator('[data-profile-task-checks]').count() === 0)
-  check('……汇总照实写：5 张表，完成 1，已停止 4', (await inBox(page, '[data-profile-counts]')) === '5 张表：完成 1，已停止 4', await inBox(page, '[data-profile-counts]'))
+        && await taskLine(page, 'tmp_log').locator('[data-profile-task-checks]').count() === 0, await inBox(page, '[data-profile-task="visits"]'))
+  check('……汇总照实写：5 张表，完成 1，部分完成 1，已停止 3', (await inBox(page, '[data-profile-counts]')) === '5 张表：完成 1，部分完成 1，已停止 3',
+    await inBox(page, '[data-profile-counts]'))
   check('……可以重试没做完的 4 张', (await textOf(page.locator('[data-profile-retry]'))).includes('重试没做完的表（4 张）'))
   check('……页头回到「数据剖析」', await until(async () => (await head(page).getAttribute('data-catalog-profile')) === ''))
   const polls = () => count(sent, new RegExp(`^GET .*profile-jobs/${job.id}$`))
@@ -1109,16 +1156,67 @@ await section('剖析 · 止损与服务重启', async () => {
         && (await inBox(page, '[data-profile-stop-error]')) === FAIL && (await inBox(page, '[data-profile-stopped="failed"]')).includes('测试连接'))
   await page.locator('[data-profile-close]').click()
 
-  // 服务重启：任务标中断，不自动续跑
+  // 服务重启：任务标中断，不自动续跑。关停服务时正在剖析的那张表来得及收尾（做完的项写进目录），后面的表已停止
+  const RESTART = '服务重启，剖析中断'
   await openDialog(page)
   await page.locator('[data-profile-start]').click()
   await until(async () => (await phase(page)) === 'running')
   const job3 = state.pjobs.at(-1)
-  settle(state, job3, job3.tasks[0].table_name, { queries: 5 })
-  stopJob(job3, { status: 'interrupted', error: '服务重启，剖析中断' })
-  check('服务重启：标题写「服务重启，剖析中断」，写明不会自动续上、可以重试没做完的表', await until(async () => (await phase(page)) === 'done')
-        && (await inBox(page, '[data-profile-title]')) === '服务重启，剖析中断' && (await inBox(page, '[data-profile-interrupted]')).includes('不会自动续上'))
-  check('……和任务相同的原因不逐表重复', await box(page).locator('[data-profile-task-note]').filter({ hasText: '服务重启' }).count() === 0)
+  const [first3, second3] = job3.tasks.map((t) => t.table_name)
+  settle(state, job3, first3, { queries: 5 })
+  settle(state, job3, second3, { status: 'running', done: { relation: 1 }, queries: 4 })
+  const left3 = job3.tasks[1].checks.filter((c) => c.state !== 'done').length
+  stopJob(job3, { status: 'interrupted', error: RESTART, rest: `${RESTART}：已做完的 1 项照常写进了数据目录，剩下 ${left3} 项没查` })
+  check('服务重启（关停时收了尾）：标题写「服务重启，剖析中断」，写明做完的项已写进目录、不会自动续上、可以重试', await until(async () => (await phase(page)) === 'done')
+        && (await inBox(page, '[data-profile-title]')) === RESTART && (await inBox(page, '[data-profile-interrupted]')).includes('不会自动续上')
+        && (await inBox(page, '[data-profile-interrupted]')).includes('做完的项已写进数据目录')
+        && !(await inBox(page, '[data-profile-interrupted]')).includes('没来得及'), await inBox(page, '[data-profile-interrupted]'))
+  check('……正在剖析的那张：部分完成，写服务端的原因（做完的写进了目录）', (await inBox(page, `[data-profile-task="${second3}"] [data-profile-task-status]`)) === '部分完成'
+        && (await inBox(page, `[data-profile-task="${second3}"] [data-profile-task-note]`)).includes('已做完的 1 项照常写进了数据目录'),
+  await inBox(page, `[data-profile-task="${second3}"]`))
+  check('……和任务相同的原因不逐表重复（只有收了尾的那张写它自己的一句）', await box(page).locator('[data-profile-task-note]').filter({ hasText: RESTART }).count() === 1)
+  await page.locator('[data-profile-close]').click()
+
+  // 进程被杀：下次启动时才标中断，正在剖析的那张表没来得及收尾，这次的结论一项都没写进目录（服务端把查完的项改记跳过）。
+  // 不能说「做完的项已写进数据目录」：点名这张表，写明它这次的结论没写进去
+  await openDialog(page)
+  await page.locator('[data-profile-start]').click()
+  await until(async () => (await phase(page)) === 'running')
+  const job4 = state.pjobs.at(-1)
+  const [first4, lost4] = job4.tasks.map((t) => t.table_name)
+  settle(state, job4, first4, { queries: 5 })
+  settle(state, job4, lost4, { status: 'running', done: { relation: 1 }, queries: 4 })
+  stopJob(job4, { status: 'interrupted', error: RESTART, current: `${RESTART}，未检查`, saved: false })
+  const note = () => inBox(page, '[data-profile-interrupted]')
+  check('服务重启（进程被杀、没来得及收尾）：点名剖析到一半的那张表，写明它这次的结论没写进目录、保留原来的结论', await until(async () => (await phase(page)) === 'done')
+        && (await note()).includes(`「${lost4}」剖析到一半服务就停了`) && (await note()).includes('这次的结论没有写进目录') && (await note()).includes('保留原来的结论')
+        && (await note()).includes('其余做完的项已写进数据目录') && (await note()).includes('不会自动续上'), await note())
+  check('……不再一律说「做完的项已写进数据目录」', !(await note()).startsWith('服务重启时这次剖析还没有完成：做完的项已写进数据目录'), await note())
+  check('……那张表记已停止，这一行照服务端写明查完的项没写进目录；前面剖析完的表照常', (await inBox(page, `[data-profile-task="${lost4}"] [data-profile-task-status]`)) === '已停止'
+        && (await inBox(page, `[data-profile-task="${lost4}"] [data-profile-task-note]`)) === `${RESTART}：已查完的 1 项没有写进数据目录，剩下 1 项没查`
+        && (await inBox(page, `[data-profile-task="${first4}"] [data-profile-task-status]`)) === '完成', await inBox(page, `[data-profile-task="${lost4}"]`))
+  await taskLine(page, lost4).locator('[data-profile-task-toggle]').click()
+  const lostBox = box(page).locator(`[data-profile-task-detail="${lost4}"]`)
+  check('……展开：检查清单没有标「完成」的项，查完的那项写明结论没写进目录', await until(async () => (await lostBox.locator('[data-profile-checks]').count()) === 1)
+        && await lostBox.locator('[data-profile-check][data-state="done"]').count() === 0
+        && (await textOf(lostBox.locator('[data-profile-check="relation"]'))).includes('查完了但结论没有写进数据目录'), await textOf(lostBox.locator('[data-profile-checks]')))
+  check('……没开始的表不写这一句', await box(page).locator('[data-profile-task-note]').filter({ hasText: '写进' }).count() === 1)
+  await shot(page, 'profile-interrupted')
+  await page.locator('[data-profile-close]').click()
+
+  // 进程被杀时那张表一项都还没查完（还在估行数）：服务端给它的原因就是任务的那一句，这一行改写「没来得及收尾」；
+  // 也没有别的表收了尾，不说「其余做完的项已写进」
+  await openDialog(page)
+  await page.locator('[data-profile-start]').click()
+  await until(async () => (await phase(page)) === 'running')
+  const job5 = state.pjobs.at(-1)
+  const lost5 = job5.tasks[0].table_name
+  settle(state, job5, lost5, { status: 'running', queries: 1, current: `正在估算 ${lost5} 的行数` })
+  stopJob(job5, { status: 'interrupted', error: RESTART, current: `${RESTART}，未检查`, saved: false })
+  check('……一项都还没查完就被杀：这一行写「没来得及收尾，这次的结论没有写进目录」，说明里不提「其余做完的项」', await until(async () => (await phase(page)) === 'done')
+        && (await inBox(page, `[data-profile-task="${lost5}"] [data-profile-task-note]`)) === '剖析到一半中断，没来得及收尾，这次的结论没有写进目录，保留原来的结论'
+        && (await note()).includes(`「${lost5}」剖析到一半服务就停了`) && !(await note()).includes('其余做完的项'),
+  `${await inBox(page, `[data-profile-task="${lost5}"]`)} · ${await note()}`)
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })
@@ -1378,6 +1476,18 @@ await section('剖析 · 表详情的「数据剖析」一节', async () => {
   await page.locator('[data-catalog-row="customers"] [data-catalog-open-row]').click()
   check('剖析完：这一节换成这次的结果（行数更新），发起人是本机', await until(async () => (await textOf(sec.locator('[data-profile-rows]'))).includes('约 12,500 行'))
         && (await textOf(sec.locator('[data-catalog-profile-last]'))).includes(`${ACTOR} 发起`))
+  // 再剖析一次，剖析到一半进程被杀（下次启动时才标中断）：这张表没来得及收尾，这一节照服务端写明查完的项没写进目录，
+  // 跳过的项里那一项写明结论没写进去
+  await sec.locator('[data-catalog-profile-table]').click()
+  await until(async () => state.pjobs.at(-1) !== job)
+  const killed = state.pjobs.at(-1)
+  settle(state, killed, 'customers', { status: 'running', done: { codes: 1 }, queries: 2 })
+  await until(async () => (await sec.locator('[data-catalog-profile-live="running"]').count()) === 1)
+  stopJob(killed, { status: 'interrupted', error: '服务重启，剖析中断', current: '服务重启，剖析中断，未检查', saved: false })
+  check('剖析到一半进程被杀：这一节写已停止和服务端的原因（查完的项没写进目录），跳过的项写明结论没写进去', await until(async () =>
+    (await textOf(sec.locator('[data-profile-table-error]'))) === '服务重启，剖析中断：已查完的 1 项没有写进数据目录，剩下 1 项没查')
+        && (await textOf(sec.locator('[data-catalog-profile-last]'))).includes('已停止')
+        && (await textOf(sec)).includes('查完了但结论没有写进数据目录') && !(await textOf(sec)).includes('照常写进'), await textOf(sec))
   // 没剖析过、视图、没有可剖析项
   await page.locator('[data-catalog-row="orders"] [data-catalog-open-row]').click()
   check('从没剖析过的表：写「还没有剖析过」，给「剖析这张表」', await until(async () => (await textOf(sec.locator('[data-catalog-profile-never]'))) === '这张表还没有剖析过。')

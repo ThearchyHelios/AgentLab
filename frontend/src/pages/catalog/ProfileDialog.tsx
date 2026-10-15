@@ -455,6 +455,9 @@ function JobView({ sourceId, job, running, stopping, busy, filled, returnTo, onS
   const notice = running ? job.notice?.trim() ?? '' : ''
   const changed = job.added + job.updated + job.removed
   const findings = PT.findings(job.summary)
+  // 停下以后写进了什么按逐表照实说：没来得及收尾的表点名；收了尾的表（完成、部分完成）做完的项写进了目录
+  const unsaved = job.tasks.filter(isUnsaved).map((t) => t.table_name)
+  const written = job.tasks.some((t) => t.status === 'ok' || t.status === 'partial')
   const [filter, setFilter] = useState<Filter>('all')
   const radio = useRadioGroup(FILTERS, filter, setFilter)
   const tasks = running ? job.tasks : job.tasks.filter(FILTER_TEST[filter])
@@ -519,8 +522,8 @@ function JobView({ sourceId, job, running, stopping, busy, filled, returnTo, onS
       {!job.stop_reason && job.status === 'failed' && job.error && (
         <Notice tone="err" className="break-words" attr={{ 'data-profile-job-error': '' }}>{job.error}</Notice>
       )}
-      {!running && job.status === 'cancelled' && <p className="text-2xs leading-relaxed text-dim" data-profile-cancelled="">{PT.cancelledNote}</p>}
-      {job.status === 'interrupted' && <Notice tone="warn" attr={{ 'data-profile-interrupted': '' }}>{PT.interruptedNote}</Notice>}
+      {!running && job.status === 'cancelled' && <p className="text-2xs leading-relaxed text-dim" data-profile-cancelled="">{PT.cancelledNote(unsaved, written)}</p>}
+      {job.status === 'interrupted' && <Notice tone="warn" attr={{ 'data-profile-interrupted': '' }}>{PT.interruptedNote(unsaved, written)}</Notice>}
       <div>
         <div className="mb-1 flex flex-wrap items-center gap-2">
           <span className="text-2xs font-medium text-dim" id="catalog-profile-tasks-label">{PT.tasks}</span>
@@ -572,13 +575,23 @@ export function checksText(t: Pick<CatalogProfileTaskRow, 'checks_by_kind'>): st
 }
 
 /**
+ * 没来得及收尾的表：开始剖析了（有开始时刻），却以「已停止」结束。正常收尾的表状态按逐表算（完成、部分完成、失败、跳过），
+ * 不会是已停止；没开始就停下的表没有开始时刻。只有进程被杀（下次启动时才标中断）或停止时服务端没在跑它，正在做的那张才以
+ * 已停止结束——目录只在整张表结束时和它的结果一起写，它这次一项结论都没写进去（服务端把查完的项改记跳过，这张表的原因
+ * 写明查完的几项没写进目录；一项都还没查完时原因就是任务的那一句）
+ */
+export const isUnsaved = (t: Pick<CatalogProfileTaskRow, 'status' | 'started_at'>): boolean => t.status === 'cancelled' && !!t.started_at
+
+/**
  * 一张表的结论：进行中写正在做哪一项；结束了写发现（核实了几条关系、取到几列码值……），没查成的写几项，整张表的原因照服务端
- * 的原话。jobError：任务整体的原因（止损、服务重启时服务端把后面的表也记上同一句），和它一样的不再逐表重复
+ * 的原话。jobError：任务整体的原因（止损、服务重启时服务端把后面的表也记上同一句），和它一样的不再逐表重复。
+ * 没来得及收尾的表写明这次的结论没写进目录（服务端给了自己的原因时用原话）
  */
 export function taskNote(t: CatalogProfileTaskRow, jobError: string | null): string {
   if (t.status === 'pending') return ''
   if (t.status === 'running') return t.current ?? ''
   const own = t.error && t.error !== jobError ? t.error : ''
+  if (isUnsaved(t)) return own || PT.notSaved
   if (t.status === 'skipped' || t.status === 'failed') return own
   const parts = [PT.findings(t.summary, true), t.unfinished ? PT.unfinished(t.unfinished) : '', own]
   if (t.status === 'ok' && !parts.some(Boolean)) return PT.noFindings
@@ -648,7 +661,9 @@ function TaskItem({ sourceId, job, task: t, open, onToggle, filled, focusAfter, 
 }
 
 /**
- * 展开的一张表：按 seq 取完整结果（检查清单、发现、发过的查询）。还在剖析的表，每多结束一项、多发一条查询就重取一次
+ * 展开的一张表：按 seq 取完整结果（检查清单、发现、发过的查询）。还在剖析的表只在一项检查开始、结束时重取：服务端这时才
+ * 写检查清单、正在做哪一项和发过的查询（开始时 current 换成这一项，结束时结束的项数加一、current 清空）；其间每发一条
+ * 查询只加查询数和用时，这两样逐表一行上就有，跟着它重取只会每次轮询都多取一份没变的结果
  */
 function TaskDetailLoader({ sourceId, jobId, task: t, filled, focusAfter, onOpenTable, onFillCodes }: {
   sourceId: string
@@ -662,7 +677,7 @@ function TaskDetailLoader({ sourceId, jobId, task: t, filled, focusAfter, onOpen
   const [detail, setDetail] = useState<CatalogProfileTaskDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [again, setAgain] = useState(0)
-  const sig = `${t.status}:${t.checks_done}:${t.queries}`
+  const sig = `${t.status}:${t.checks_done}:${t.current ?? ''}`
   useEffect(() => {
     let alive = true
     api.dataCatalog.profileJobs.task(sourceId, jobId, t.seq).then(({ task }) => {
