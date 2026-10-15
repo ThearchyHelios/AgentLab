@@ -2988,8 +2988,9 @@ export const PROFILE_TEXT = {
   rowsCount: (n: number) => `${formatNumber(n)} 行`,
   rowsAtLeast: (n: number) => `超过 ${formatNumber(n - 1)} 行`,
   rowsUnknown: '没能得到行数',
-  rowsHint: { stats: '数据库统计信息中的估算值', count: '计数到整表统计行数上限为止' } as Record<string, string>,
-  rowsSource: { stats: '来自数据库统计信息', count: '数到整表统计行数上限为止' } as Record<string, string>,
+  // count 是逐行数完了（没超过整表统计行数上限，是准数）；capped 是数到上限还没数完，只知道至少多少行
+  rowsHint: { stats: '数据库统计信息中的估算值', count: '逐行数出来的准数，没超过整表统计行数上限', capped: '计数到整表统计行数上限为止' } as Record<string, string>,
+  rowsSource: { stats: '来自数据库统计信息', count: '逐行数出来的', capped: '数到整表统计行数上限为止' } as Record<string, string>,
   openTable: '打开',
   openTableLabel: (name: string) => `打开「${name}」`,
   findingRelations: '关联关系',

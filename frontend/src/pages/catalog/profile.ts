@@ -219,7 +219,7 @@ export function agoText(v: string | null | undefined, now = Date.now()): string 
   return days <= 30 ? `${days} 天前` : formatTime(d)
 }
 
-/** 行数估算写成人话，带来源（统计信息 / 数到上限）；没有估算为 null */
+/** 行数估算写成人话，带来源（统计信息 / 逐行数出来的 / 数到上限）；没有估算为 null */
 export function sizeText(size: CatalogProfileSize | null | undefined): { text: string; hint?: string; source?: string } | null {
   if (!size) return null
   if (size.rows != null) {
@@ -227,7 +227,7 @@ export function sizeText(size: CatalogProfileSize | null | undefined): { text: s
       hint: PROFILE_TEXT.rowsHint[size.method], source: PROFILE_TEXT.rowsSource[size.method] }
   }
   if (size.at_least != null) {
-    return { text: PROFILE_TEXT.rowsAtLeast(size.at_least), hint: PROFILE_TEXT.rowsHint.count, source: PROFILE_TEXT.rowsSource.count }
+    return { text: PROFILE_TEXT.rowsAtLeast(size.at_least), hint: PROFILE_TEXT.rowsHint.capped, source: PROFILE_TEXT.rowsSource.capped }
   }
   return { text: PROFILE_TEXT.rowsUnknown }
 }
