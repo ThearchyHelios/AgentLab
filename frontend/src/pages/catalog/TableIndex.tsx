@@ -2,8 +2,8 @@ import { memo, useCallback, useEffect, useRef } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { AlertTriangle, History, Info, ScanSearch, Search, Sparkles, X } from 'lucide-react'
 import clsx from 'clsx'
-import type { CatalogTableRow } from '../../types'
-import { useRadioGroup } from '../../components/ui'
+import type { CatalogProfileTaskStatus, CatalogTableRow } from '../../types'
+import { useRadioGroup, useTicker } from '../../components/ui'
 import { formatNumber } from '../../lib/format'
 import {
   CATALOG_DRAFT_TEXT as DT, CATALOG_KIND_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT, PROFILE_TEXT as PT,
@@ -11,6 +11,7 @@ import {
 import { CountBadges } from './parts'
 import { LIST_FILTERS, LIST_SORTS, progressOf } from './model'
 import { lastBlankInfo, taskReason } from './draftJob'
+import { profileCell } from './profile'
 import type { ListFilter, ListSort } from './model'
 
 // ===========================================================================
@@ -19,11 +20,15 @@ import type { ListFilter, ListSort } from './model'
 // 下面淡淡地写「未填写中文名」——一屏几十行「未填写中文名」认不出是哪张表。上次起草失败、部分完成的表再多一行，
 // 写明原因（全文在悬停里，点开表还有「重新起草这张表」）；上次起草有留空列（模型拿不准）的表另有一行淡色的轻提示，
 // 不是失败标记。键盘：↑↓ 在行之间移动，Home / End 到两头，Enter 打开；复选框按住 Shift 点选可以连选一段。
+//
+// 开了数据剖析的源（或者剖析过的表）第二行多一格「剖析」：未剖析 / 3 天前剖析 / 剖析部分完成 / 剖析失败 / 剖析中 / 排队剖析，
+// 需要剖析的（从没剖析过、上次没做完、之后出现了新的待核实关系）用提醒色，悬停写上次剖析的时间和原因。筛选组下面另有
+// 「需要剖析」开关，和审阅进度的筛选叠加（审阅进度的四项数字照旧按审阅算），口径同剖析范围里的「需要剖析的表」。
 // ===========================================================================
 
 export function TableIndex({
   rows, total, counts, query, onQuery, filter, onFilter, usedOnly = false, onUsedOnly, sort, onSort, selected, onSelected, active, onOpen,
-  onDraft, onProfile,
+  onDraft, onProfile, profileOn = false, profileLive, dueOnly = false, onDueOnly, dueTotal = 0,
 }: {
   /** 筛选、排序后的行 */
   rows: CatalogTableRow[]
@@ -46,6 +51,15 @@ export function TableIndex({
   onDraft: () => void
   /** 剖析所选（数据剖析弹窗，范围默认是已选的表） */
   onProfile?: () => void
+  /** 这个数据源开了数据剖析：每行写「剖析」一格，给「需要剖析」开关 */
+  profileOn?: boolean
+  /** 页面正跟着的剖析任务里各表的状态（排队、剖析中），比清单新 */
+  profileLive?: Map<string, CatalogProfileTaskStatus>
+  /** 只看需要剖析的表 */
+  dueOnly?: boolean
+  onDueOnly?: (v: boolean) => void
+  /** 需要剖析的表有几张（按搜索词算） */
+  dueTotal?: number
 }) {
   const radio = useRadioGroup(LIST_FILTERS, filter, onFilter)
   const listRef = useRef<HTMLUListElement>(null)
@@ -53,6 +67,8 @@ export function TableIndex({
   const lastClicked = useRef<number | null>(null)
   const picked = rows.filter((r) => selected.has(r.table_name)).length
   const all = rows.length > 0 && picked === rows.length
+  // 「3 天前剖析」「12 分钟前剖析」隔一分钟重算一次
+  const now = useTicker(60_000, profileOn)
 
   useEffect(() => {
     if (allRef.current) allRef.current.indeterminate = picked > 0 && !all
@@ -140,6 +156,17 @@ export function TableIndex({
             </button>
           ))}
         </div>
+        {onDueOnly && (profileOn || dueOnly) && (
+          <div className="flex">
+            <button type="button" aria-pressed={dueOnly} onClick={() => onDueOnly(!dueOnly)} title={PT.dueFilterHint} data-catalog-profile-due={dueOnly ? 'on' : 'off'}
+                    className={clsx('inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-2xs outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
+                      dueOnly ? 'border-[var(--accent)] bg-accent-soft text-fg' : 'border-dashed text-dim hover:bg-hover hover:text-fg')}>
+              <ScanSearch size={10} className={dueOnly ? 'text-[var(--accent)]' : 'text-faint'} aria-hidden />
+              {PT.dueFilter}
+              <span className="tnum text-faint">{formatNumber(dueTotal)}</span>
+            </button>
+          </div>
+        )}
         {usedOnly && (
           <div className="flex" data-catalog-used-only="">
             <span className="inline-flex min-w-0 items-center gap-1 rounded-md border border-[var(--accent)] bg-accent-soft py-0.5 pl-2 pr-0.5 text-2xs text-fg"
@@ -179,7 +206,7 @@ export function TableIndex({
       <ul ref={listRef} className="relative min-h-0 flex-1 overflow-y-auto" aria-label={CT.tableCount(rows.length, total)}>
         {rows.map((r, i) => (
           <Row key={r.table_name} row={r} index={i} active={r.table_name === active} checked={selected.has(r.table_name)}
-               onToggle={toggle} onOpen={onOpen} onKey={onRowKey} />
+               onToggle={toggle} onOpen={onOpen} onKey={onRowKey} profileOn={profileOn} live={profileLive?.get(r.table_name) ?? null} now={now} />
         ))}
       </ul>
 
@@ -199,7 +226,9 @@ export function TableIndex({
   )
 }
 
-const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen, onKey }: {
+const PROFILE_TONE = { due: 'var(--st-waiting)', bad: 'var(--err)', active: 'var(--accent)', quiet: undefined } as const
+
+const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen, onKey, profileOn, live, now }: {
   row: CatalogTableRow
   index: number
   active: boolean
@@ -207,7 +236,12 @@ const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen
   onToggle: (i: number, e: ReactMouseEvent<HTMLInputElement>) => void
   onOpen: (table: string) => void
   onKey: (i: number, e: ReactKeyboardEvent<HTMLButtonElement>) => void
+  profileOn: boolean
+  live: CatalogProfileTaskStatus | null
+  now: number
 }) {
+  // 「剖析」一格：开了剖析的源每行都写；没开的源只写剖析过的表（以前开过，结论还在目录里）
+  const cell = profileOn || r.last_profile || live ? profileCell(r, live, now) : null
   const progress = progressOf(r.counts)
   // 上次起草没写全：失败、部分完成各一种说法，后面接原因
   const last = r.last_draft && (r.last_draft.status === 'failed' || r.last_draft.status === 'partial') ? r.last_draft : null
@@ -254,6 +288,11 @@ const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen
           {r.is_view && <span className="shrink-0">· {CT.view}</span>}
           {r.relations > 0 && <span className="shrink-0 tnum">· {CT.relationCount(r.relations)}</span>}
           <span className="flex-1" />
+          {cell && (
+            <span className="min-w-0 shrink truncate" title={cell.title} style={{ color: PROFILE_TONE[cell.tone] }} data-row-profile={cell.tone}>
+              <span className="sr-only">{PT.title}：</span>{cell.text}
+            </span>
+          )}
           <span className="tnum shrink-0" title={CT.usageHint} data-row-usage={r.usage}>{CT.usage(r.usage)}</span>
         </span>
         {!r.in_schema && (

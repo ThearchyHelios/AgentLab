@@ -2485,6 +2485,10 @@ export const CATALOG_DRAFT_TEXT = {
     : total === 1 ? '表结构中已没有这张表，不能起草' : `表结构中已没有这 ${formatNumber(total)} 张表，不能起草`),
   // ---- 进行中
   queued: '排队中，等待开始…',
+  /** 同一个数据源的起草和剖析按建立顺序排队：排在剖析任务后面 */
+  waitingProfile: '排在剖析任务后面，剖析结束后自动开始',
+  /** 设置阶段：这个数据源有剖析任务在排队、进行中，起草会排在它后面 */
+  queueHint: '这个数据源有剖析任务在进行：起草会排在它后面，剖析结束后自动开始',
   running: '正在起草…',
   // 服务端点了停止就取消进行中的模型调用（不等它答完，一次调用可能要几分钟），只等手上正在写入目录的那张表写完
   // 宽表每写完一段就写进目录：停下来时已写进的段保留，只停掉进行中的调用
@@ -2578,6 +2582,13 @@ export const CATALOG_DRAFT_TEXT = {
   // ---- 目录页上方的进度、结束提示
   strip: (done: number, total: number) => `正在起草：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
   stripQueued: (total: number) => `起草任务排队中，共 ${formatNumber(total)} 张表`,
+  stripQueuedProfile: (total: number) => `起草任务排在剖析任务后面，剖析结束后自动开始（共 ${formatNumber(total)} 张表）`,
+  /** 页头的进度入口：进行中写「起草 3/20」，排队写「起草 排队中」 */
+  headerRunning: (done: number, total: number) => `起草 ${formatNumber(done)}/${formatNumber(total)}`,
+  headerQueued: '起草 排队中',
+  headerRunningHint: (done: number, total: number) => `起草进行中：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，点击查看进度`,
+  headerQueuedHint: '起草任务排队中，点击查看',
+  headerQueuedProfile: '起草任务排在剖析任务后面，剖析结束后自动开始，点击查看',
   stripOpen: '查看进度',
   toast: {
     succeeded: (summary: string) => `数据目录起草完成：${summary}`,
@@ -2752,47 +2763,56 @@ export const SCHEMA_PARTIAL_TEXT = {
 }
 
 // ===========================================================================
-// 数据剖析（数据源设置里的开关和预算；数据目录页的「数据剖析」）
+// 数据剖析（数据源设置里的开关和预算；数据目录页的「数据剖析」：后台任务，逐表进行）
 //
 // 术语：
-// - 「数据剖析」：对业务库发少量只读查询，核实推断的关联关系（覆盖率、基数），取状态类列的码值候选，提议业务日期。
+// - 「数据剖析」：对业务库发只读查询，核实推断的关联关系（覆盖率、基数），取状态类列的码值候选，提议业务日期。
 //   动作写「剖析」，不写扫描、探测。默认关闭，按数据源开启。
-// - 预算五项：查询次数上限、单条查询时限、抽样键值数、整表统计行数上限、总时长上限。标签和服务端校验报错里的叫法
-//   一致（catalog_profile._NUMBER_FIELDS），保存被拒时按它认出是哪一项。
+// - 剖析是后台任务：逐张表进行，每张表剖析完就写进目录；查询一条一条地发，可以随时停止。关掉对话框照常进行。
+//   目录只在整张表结束时写一次：停止、关停服务时正在做的那张来得及收尾，做完的项照常写进去；进程被杀时那张表没来得及收尾，
+//   这次做完的项一项都没写进去。说停下以后写进了什么，按逐表的状态照实说（cancelledNote / interruptedNote），不一律说「已写进」。
+// - 预算按表算：「每张表最多查询数」「每张表时长上限」用完只停这张表，下一张表重新计数；另有单条查询时限、抽样键值数、
+//   整表统计行数上限。标签和服务端校验报错里的叫法一致（catalog_profile._NUMBER_FIELDS），保存被拒时按机读码认出是哪一项。
+// - 没有整次总量上限：任务自己在连续失败、多数超时时停下（止损），写明原因。
+// - 「没查成」≠ 结论错了：因为次数、时长、超时、出错没查成的项保留剖析以前的结论，可以「重试没做完的表」。
+// - 和起草同一套状态词：排队、进行中、完成、部分完成、失败、已停止、服务重启中断。同一个数据源的起草和剖析排队进行。
 // ===========================================================================
 
 export const PROFILE_FIELD_LABEL: Record<'enabled' | CatalogProfileNumberKey, string> = {
   enabled: '开启数据剖析',
-  max_queries: '查询次数上限',
+  table_max_queries: '每张表最多查询数',
+  table_max_s: '每张表时长上限',
   query_timeout_s: '单条查询时限',
   sample_size: '抽样键值数',
   max_scan_rows: '整表统计行数上限',
-  max_total_s: '总时长上限',
 }
 
 export const PROFILE_FIELD_UNIT: Record<CatalogProfileNumberKey, string> = {
-  max_queries: '条',
+  table_max_queries: '条',
+  table_max_s: '秒',
   query_timeout_s: '秒',
   sample_size: '个',
   max_scan_rows: '行',
-  max_total_s: '秒',
 }
 
 export const PROFILE_FIELD_HINT: Record<CatalogProfileNumberKey, string> = {
-  max_queries: '一次剖析最多发出的查询条数，用完即停止',
-  query_timeout_s: '超过即中断这条查询；不超过数据源自身的查询时限',
+  table_max_queries: '剖析一张表最多发出的查询条数，用完只停这张表，下一张表重新计数',
+  table_max_s: '剖析一张表最多用的时长，到时只停这张表，下一张表重新计时',
+  query_timeout_s: '超过即中断这条查询；不超过数据源自身的查询时限，也不超过这张表剩下的时长',
   sample_size: '核对一条关联关系时，从本表抽取的不同键值个数',
   max_scan_rows: '不超过此行数的表才做去重计数、最小值和最大值等整表统计',
-  max_total_s: '一次剖析的总时长，到时即停止',
 }
+
+/** 表名点名：「visits」、「refunds」 */
+const quoteNames = (names: string[]) => names.map((n) => `「${n}」`).join('、')
 
 export const PROFILE_TEXT = {
   // ---- 设置
   section: '数据剖析',
   enableHint: '默认关闭。开启后可在数据目录中核实推断的关联关系、取状态类列的码值候选',
-  risk: (queries: number, timeout: number, total: number) =>
-    `开启后，每次剖析会对这个数据源发出只读查询：最多 ${formatNumber(queries)} 条，单条不超过 ${formatNumber(timeout)} 秒，`
-    + `总时长不超过 ${formatNumber(total)} 秒。不读取明细行，遮罩的列不取样。`,
+  risk: (queries: number, perTable: number, timeout: number) =>
+    `开启后，剖析会对这个数据源发出只读查询，一条一条地发，可随时停止：每张表最多 ${formatNumber(queries)} 条、`
+    + `${formatNumber(perTable)} 秒，单条不超过 ${formatNumber(timeout)} 秒。不读取明细行，遮罩的列不取样。`,
   range: (min: number, max: number, unit: string, def: number) =>
     `范围 ${formatNumber(min)}–${formatNumber(max)} ${unit}，默认 ${formatNumber(def)}`,
   scanZero: '填 0 表示一律不做整表统计',
@@ -2802,70 +2822,176 @@ export const PROFILE_TEXT = {
   invalid: (n: number) => `数据剖析有 ${formatNumber(n)} 项设置不正确`,
   // ---- 数据源卡片
   chip: '数据剖析已开启',
-  chipHint: (queries: number, timeout: number) =>
-    `数据剖析已开启：每次最多 ${formatNumber(queries)} 条只读查询，单条不超过 ${formatNumber(timeout)} 秒`,
+  chipHint: (queries: number, perTable: number, timeout: number) =>
+    `数据剖析已开启：每张表最多 ${formatNumber(queries)} 条只读查询、${formatNumber(perTable)} 秒，单条不超过 ${formatNumber(timeout)} 秒`,
   open: '设置数据剖析',
   dialogTitle: (name: string) => `「${name}」的数据剖析设置`,
-  dialogBody: '设置保存在数据源上，对数据目录中的每次剖析生效。',
+  dialogBody: '设置保存在数据源上，对之后新建的剖析生效；进行中的剖析按开始时的设置。',
   savedOn: (name: string) => `「${name}」已开启数据剖析`,
   savedOff: (name: string) => `「${name}」已关闭数据剖析`,
   saved: (name: string) => `已保存「${name}」的数据剖析设置`,
-  // ---- 数据目录页：范围与确认
+
+  // ---- 数据目录页：入口
   action: '数据剖析',
-  actionHint: '对业务库发少量只读查询：核实推断的关联关系、取码值候选、提议业务日期',
+  actionHint: '对业务库发只读查询：核实推断的关联关系、取码值候选、提议业务日期',
   profileSelected: (n: number) => `剖析所选（${formatNumber(n)}）`,
+  /** 页头的进度入口：进行中写「剖析 12/40」，排队写「剖析 排队中」 */
+  headerRunning: (done: number, total: number) => `剖析 ${formatNumber(done)}/${formatNumber(total)}`,
+  headerQueued: '剖析 排队中',
+  headerRunningHint: (done: number, total: number) => `数据剖析进行中：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，点击查看进度`,
+  headerQueuedHint: '剖析任务排队中，点击查看',
+  headerQueuedDraft: '剖析任务排在起草任务后面，起草结束后自动开始，点击查看',
+
+  // ---- 开始前：范围、预算
   title: '数据剖析',
-  intro: '对业务库发少量只读查询，核实推断的关联关系（覆盖率、基数），取状态类列的码值候选，提议业务日期。'
-    + '结论写入数据目录；已确认、已驳回的项不会被改动。',
+  intro: '逐张表对业务库发只读查询，核实推断的关联关系（覆盖率、基数），取状态类列的码值候选，提议业务日期。'
+    + '每张表剖析完就写进数据目录；已确认、已驳回的项不会被改动。',
   scope: '剖析范围',
   scopeSelected: (n: number) => `已选的 ${formatNumber(n)} 张表`,
   scopeFiltered: (n: number) => `当前筛选结果中的 ${formatNumber(n)} 张表`,
-  scopeDefault: '使用次数最多、有待核实关联关系的表',
-  scopeDefaultHint: (n: number) => `由服务端挑选，至多 ${formatNumber(n)} 张`,
-  scopeTooMany: (max: number) => `超过 ${formatNumber(max)} 张，请缩小范围`,
-  budget: '本次预算',
-  budgetQueries: (queries: number, timeout: number) =>
-    `最多 ${formatNumber(queries)} 条只读查询，单条不超过 ${formatNumber(timeout)} 秒`,
-  budgetTotal: (total: number) => `总时长不超过 ${formatNumber(total)} 秒，到时即停止`,
+  scopeNeeded: (n: number) => `需要剖析的 ${formatNumber(n)} 张表`,
+  scopeNeededHint: '从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系的表',
+  scopeNeededNone: '没有需要剖析的表：都剖析过、上次都做完了，也没有新的待核实关联关系',
+  scopeAll: (n: number) => `全部 ${formatNumber(n)} 张表`,
+  scopeAllHint: '有可剖析项的表，不含视图',
+  /** 已选、筛选结果里有剖析不了的表：不交给服务端，写明有几张 */
+  scopeLeftOut: (n: number) => `另有 ${formatNumber(n)} 张不剖析（视图、表结构中已没有，或没有可剖析的项）`,
+  scopeEmpty: '这个范围里没有可剖析的表',
+  scopeTooMany: (max: number) => `一次最多剖析 ${formatNumber(max)} 张表，请缩小范围`,
+  budget: '预算',
+  budgetFrom: (name: string) => `按「${name}」的数据剖析设置`,
+  budgetPerTable: (queries: number, secs: number) =>
+    `每张表最多 ${formatNumber(queries)} 条查询、${formatNumber(secs)} 秒，用完只停这张表，下一张表重新计数`,
+  budgetQuery: (secs: number) => `单条查询不超过 ${formatNumber(secs)} 秒`,
   budgetSample: (n: number) => `每条关联关系抽样 ${formatNumber(n)} 个键值`,
   budgetScan: (n: number) => (n > 0 ? `行数超过 ${formatNumber(n)} 的表不做整表统计` : '不做整表统计'),
-  budgetFrom: (name: string) => `按「${name}」的数据剖析设置`,
+  /** 上限的估算：表数 × 每张表的上限 */
+  budgetTotal: (tables: number, queries: number, span: string) =>
+    `这次 ${formatNumber(tables)} 张表，最多约 ${formatNumber(queries)} 条查询、${span}`,
   editSettings: '修改设置',
-  noCancel: '剖析在服务端一次完成，开始后无法中途停止。',
+  readOnly: '剖析会对业务库发只读查询，一条一条地发，可随时停止；停止时已做完的项照常写进目录，没做的保留原来的结论。',
   start: '开始剖析',
-  again: '重新剖析',
+  /** 同一个数据源有起草任务在排队、进行中：剖析排在它后面 */
+  queue: '排队剖析',
+  queueHint: '这个数据源有起草任务在进行：剖析会排在它后面，起草任务结束后自动开始',
   disabledTitle: '这个数据源未开启数据剖析',
   disabledBody: '剖析会对业务库发出只读查询，需要先在数据源设置中开启。',
   enable: '开启数据剖析',
-  // ---- 进行中
-  running: '正在剖析…',
-  elapsed: (used: string, total: string) => `已用时 ${used}（总时长上限 ${total}）`,
-  runningHint: '剖析在服务端一次完成，无法中途停止。关闭此窗口不影响剖析，完成后会提示结果。',
-  background: '在后台继续',
-  headerRunning: (used: string) => `正在剖析 ${used}`,
-  headerRunningHint: '数据剖析进行中，点击查看',
-  leavePage: '离开本页不会中止剖析，结论仍会写入数据目录，但不再显示本次的报告。',
-  // ---- 报告
-  done: '剖析完成',
-  stoppedTitle: (reason: string) => `剖析已停止：${reason}`,
-  summary: (used: number, max: number, tables: number) =>
-    `用了 ${formatNumber(used)} / ${formatNumber(max)} 条查询，剖析 ${formatNumber(tables)} 张表`,
+  /** 上一次剖析（没做完的才提），可以点开 */
+  last: (state: string, at: string) => `上一次剖析（${at}）：${state}`,
+  lastOpen: '查看',
+  startFailed: (reason: string) => `未能开始剖析：${reason}`,
+
+  // ---- 进行中、结束：任务
+  jobTitle: {
+    queued: '排队中，等待开始…',
+    running: '正在剖析…',
+    succeeded: '剖析完成',
+    partial: '剖析完成，部分表没做完',
+    failed: '剖析失败',
+    cancelled: '已停止',
+    interrupted: '服务重启，剖析中断',
+  } as Record<CatalogDraftJobStatus, string>,
+  waitingDraft: '排在起草任务后面，起草结束后自动开始',
+  // 停止时服务端不等正在执行的那条查询（它的结果记「失败」），库那边按单条时限截止它；收尾写完（至多十来秒）停止就答。
+  // 别写成「等这条查询结束」：单条时限设得长时，界面会让人以为要等满时限
+  stopping: '正在停止：正在执行的那条查询不再等待，由数据库按单条时限截止；已做完的项照常写进目录…',
+  progress: (done: number, total: number) => `${formatNumber(done)} / ${formatNumber(total)} 张表`,
+  /** 结束以后：做完了几张（停止、失败、跳过的不算） */
+  progressDone: (ok: number, total: number) => `完成 ${formatNumber(ok)} / ${formatNumber(total)} 张表`,
+  queriesSent: (n: number) => `已发 ${formatNumber(n)} 条查询`,
+  queriesBad: (timeouts: number, errors: number) => [
+    timeouts ? `超时 ${formatNumber(timeouts)} 条` : '', errors ? `失败 ${formatNumber(errors)} 条` : '',
+  ].filter(Boolean).join('、'),
+  elapsed: (span: string) => `用时 ${span}`,
+  hide: '在后台继续',
+  hideHint: '关闭对话框不会停止剖析，页头显示进度；每张表剖析完就写进目录',
+  stop: '停止',
+  busyShown: '这个数据源已有剖析任务在进行，下面显示的是它的进度',
+  createdBy: (who: string) => `由「${who}」发起`,
+  /** 任务级止损 */
+  stopTitle: { failed: '连续多条查询失败，剖析已停止', slow: '数据库响应慢，剖析已停止' } as Record<string, string>,
+  stopShort: { failed: '连续多条查询失败', slow: '数据库响应慢' } as Record<string, string>,
+  stopNext: {
+    failed: '后面的表没有剖析。请先在数据源卡片上测试连接、确认账号有只读权限，再重试没做完的表。',
+    slow: '后面的表没有剖析。可以在业务库不忙的时候重试没做完的表，或在剖析设置中调低单条查询时限、每张表最多查询数。',
+  } as Record<string, string>,
+  /**
+   * 停止、服务重启以后的说明。停下时正在剖析的那张表通常来得及收尾，做完的项照常写进目录（服务端记部分完成）；lost 是没来得
+   * 及收尾的表（进程被杀、下次启动时才标中断，或停止时服务端没在跑它）：目录只在整张表结束时和它的结果一起写，所以它这次
+   * 一项结论都没写进去，服务端把它记成已停止、查完的项也改记跳过。有这样的表时点名说，不能一律说「做完的项已写进数据目录」。
+   * 它这次可能一项都还没查完，所以说「这次的结论没有写进目录」，不说「做完的项没写进去」。
+   * written：有别的表收了尾（完成、部分完成），才说「其余做完的项已写进」
+   */
+  cancelledNote: (lost: string[], written: boolean) => (lost.length
+    ? `${quoteNames(lost)}剖析到一半停下，没来得及收尾，这次的结论没有写进目录，保留原来的结论${written ? '；其余做完的项已写进数据目录' : ''}。可以重试没做完的表。`
+    : '做完的项已写进数据目录，没做的项保留原来的结论；后面的表没有剖析，可以重试没做完的表。'),
+  interruptedNote: (lost: string[], written: boolean) => (lost.length
+    ? `服务重启时这次剖析还没有完成：${quoteNames(lost)}剖析到一半服务就停了，没来得及收尾，这次的结论没有写进目录，保留原来的结论${written ? '；其余做完的项已写进数据目录' : ''}。不会自动续上，可以重试没做完的表。`
+    : '服务重启时这次剖析还没有完成：做完的项已写进数据目录，没做的项保留原来的结论。不会自动续上，可以重试没做完的表。'),
+  /** 逐表一行：没来得及收尾的表（见 cancelledNote）。服务端给了这张表自己的原因（查完的几项没写进目录）时用原话 */
+  notSaved: '剖析到一半中断，没来得及收尾，这次的结论没有写进目录，保留原来的结论',
+  /** 结束后的汇总：「40 张表：完成 33，部分完成 4，跳过 2，失败 1」 */
+  counts: (total: number, c: { ok: number; partial: number; skipped: number; failed: number; cancelled: number }) =>
+    `${formatNumber(total)} 张表：${[
+      `完成 ${formatNumber(c.ok)}`,
+      c.partial ? `部分完成 ${formatNumber(c.partial)}` : '',
+      c.skipped ? `跳过 ${formatNumber(c.skipped)}` : '',
+      c.failed ? `失败 ${formatNumber(c.failed)}` : '',
+      c.cancelled ? `已停止 ${formatNumber(c.cancelled)}` : '',
+    ].filter(Boolean).join('，')}`,
   changes: (added: number, updated: number, removed: number) =>
-    `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
+    `目录新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
   noChange: '目录没有变化',
-  toastDone: (summary: string) => `数据剖析完成：${summary}`,
-  toastStopped: (reason: string) => `数据剖析已停止：${reason}`,
-  toastFailed: '数据剖析未能完成',
-  viewReport: '查看报告',
+  /**
+   * 发现的合计（任务、逐表共用）：核实了几条关系、几条仍为推断，取到几列码值（几个含义待填写），提议了业务日期。
+   * 一项都没有为空串
+   */
+  findings: (s: { relations_checked: number; relations_verified: number; codes: number; codes_pending: number; business_dates: number },
+    perTable = false) => [
+    s.relations_verified ? `核实 ${formatNumber(s.relations_verified)} 条关系` : '',
+    s.relations_checked > s.relations_verified ? `${formatNumber(s.relations_checked - s.relations_verified)} 条关系仍为推断` : '',
+    s.codes ? `取到 ${formatNumber(s.codes)} 列码值候选${s.codes_pending ? `（${formatNumber(s.codes_pending)} 个含义待填写）` : ''}` : '',
+    s.business_dates ? (perTable ? '提议业务日期' : `提议 ${formatNumber(s.business_dates)} 张表的业务日期`) : '',
+  ].filter(Boolean).join('，'),
+  noFindings: '没有新的发现',
+  filterLabel: '筛选逐表结果',
+  filter: { all: '全部', findings: '有发现', skipped: '有跳过', failed: '失败' } as Record<string, string>,
+  filterNone: '没有符合的表',
+  retry: (n: number) => `重试没做完的表（${formatNumber(n)} 张）`,
+  retryHint: '新建一次剖析，只含失败、部分完成和已停止的表；已写进目录的结论不受影响',
+  again: '重新选择范围',
   close: '完成',
+  tasks: '逐表进度',
+
+  // ---- 逐表一行
+  taskStatus: {
+    pending: '排队', running: '剖析中', ok: '完成', partial: '部分完成', failed: '失败', skipped: '跳过', cancelled: '已停止',
+  } as Record<CatalogDraftTaskStatus, string>,
+  checkKind: { relation: '关系', codes: '码值', date: '日期' } as Record<string, string>,
+  kindProgress: (label: string, done: number, total: number) => `${label} ${formatNumber(done)}/${formatNumber(total)}`,
   tableQueries: (n: number) => `${formatNumber(n)} 条查询`,
+  /** 这张表的查询次数用完了（等于每张表最多查询数） */
+  tableQueriesUsedUp: (n: number) => `${formatNumber(n)} 条查询（已用完）`,
+  unfinished: (n: number) => `${formatNumber(n)} 项没查成`,
+  skippedN: (n: number) => `跳过 ${formatNumber(n)} 项`,
+  expandLabel: (table: string) => `查看 ${table} 的检查清单和发过的查询`,
+
+  // ---- 逐表展开、表详情：检查清单、发现、发过的查询
+  loading: '正在载入…',
+  loadFailed: (reason: string) => `未能载入这张表的剖析结果：${reason}`,
+  checksTitle: (done: number, total: number) => `检查清单（${formatNumber(done)} / ${formatNumber(total)} 项）`,
+  checkState: { pending: '等待', running: '进行中', done: '完成', skipped: '跳过' } as Record<string, string>,
+  checkQueries: (n: number) => `${formatNumber(n)} 条查询`,
+  rowsTitle: '行数',
   rowsStats: (n: number) => `约 ${formatNumber(n)} 行`,
   rowsCount: (n: number) => `${formatNumber(n)} 行`,
   rowsAtLeast: (n: number) => `超过 ${formatNumber(n - 1)} 行`,
+  rowsUnknown: '没能得到行数',
   rowsHint: { stats: '数据库统计信息中的估算值', count: '计数到整表统计行数上限为止' } as Record<string, string>,
+  rowsSource: { stats: '来自数据库统计信息', count: '数到整表统计行数上限为止' } as Record<string, string>,
   openTable: '打开',
   openTableLabel: (name: string) => `打开「${name}」`,
-  noFindings: '没有新的发现',
   findingRelations: '关联关系',
   findingCodes: '码值候选',
   findingDate: '业务日期',
@@ -2887,52 +3013,101 @@ export const PROFILE_TEXT = {
   dateRanges: '日期列的取值范围',
   skippedTitle: (n: number) => `跳过 ${formatNumber(n)} 项`,
   moreSkipped: (n: number) => `…另有 ${formatNumber(n)} 项`,
-  tableError: '这张表未能剖析',
-  // ---- 无法开始（409）
+  queriesTitle: (n: number) => `看发过的查询（${formatNumber(n)} 条）`,
+  queriesHint: 'SQL 里的取值都换成了「?」：抽样到的键值不保存在 AgentLab 中；遮罩的列不出现在任何查询里',
+  queryKind: { row_estimate: '行数估算', relation: '关系', codes: '码值', date: '日期' } as Record<string, string>,
+  queryOutcome: { ok: '成功', timeout: '超时', error: '失败', rejected: '未通过只读守卫' } as Record<string, string>,
+  queryRows: (n: number) => `${formatNumber(n)} 行`,
+  queryMs: (ms: number) => `${formatNumber(ms)} 毫秒`,
+
+  // ---- 结束时的提示（页面右下角，对话框关着时）
+  toast: {
+    succeeded: (text: string) => (text ? `数据剖析完成：${text}` : '数据剖析完成'),
+    partial: (n: number) => `数据剖析完成，${formatNumber(n)} 张表没做完`,
+    failed: (reason: string) => (reason ? `数据剖析失败：${reason}` : '数据剖析失败'),
+    stopped: (title: string) => `数据剖析已停止：${title}`,
+    cancelled: '数据剖析已停止',
+    interrupted: '服务重启，数据剖析中断',
+  },
+  viewReport: '查看报告',
+
+  // ---- 开始不了（409）
   blocked: {
     disabled: '未开启数据剖析',
     inactive: '数据源已停用',
     noSchema: '还没有表结构',
-    busy: '这个数据源正在剖析',
+    busy: '这个数据源已有剖析任务',
     tampered: '数据文件核对未通过',
+    nothing: '没有可剖析的表',
     other: '无法开始剖析',
   } as Record<string, string>,
   blockedNext: {
     disabled: '开启后即可在这里剖析。',
     inactive: '启用后回到这里重试。',
     noSchema: '探查完成后回到这里重试。',
-    busy: '同一个数据源同一时间只能进行一次剖析。',
+    busy: '同一个数据源同一时间只有一个剖析任务：可以查看它的进度，等它结束后再开始新的剖析。',
     tampered: '请重新上传表格，或联系管理员核对数据文件。',
+    nothing: '可以改选「全部表」，或在表清单中选定要剖析的表。',
     other: '请稍后重试。',
   } as Record<string, string>,
+  busyAt: (who: string | null, done: number, total: number) =>
+    `${who ? `由「${who}」发起，` : ''}已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
+  viewActive: '查看它的进度',
+  chooseAll: '改选全部表',
   goSource: '前往数据源',
-  retry: '重试',
-  failedTitle: '剖析未能完成',
+  retryStart: '重试',
+  failedTitle: '剖析未能开始',
   backToSetup: '返回',
+
+  // ---- 表清单的「剖析」一列和筛选
+  listNever: '未剖析',
+  listNoChecks: '无可剖析项',
+  listNoChecksHint: '按当前的目录和表结构，这张表没有可剖析的项（关联关系候选、像码值的列、日期列）',
+  listAgo: (ago: string) => `${ago}剖析`,
+  listNewRelations: '有新关系待剖析',
+  listStatus: {
+    pending: '排队剖析', running: '剖析中', partial: '剖析部分完成', failed: '剖析失败', skipped: '剖析已跳过', cancelled: '剖析已停止',
+  } as Record<string, string>,
+  listHint: (status: string, at: string) => `上次剖析（${at}）：${status}`,
+  dueReason: {
+    never: '从没剖析过',
+    unfinished: '上次剖析没做完',
+    new_relations: '剖析之后目录里出现了新的待核实关联关系',
+  } as Record<string, string>,
+  dueFilter: '需要剖析',
+  dueFilterHint: '从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系的表',
+
+  // ---- 表详情的「数据剖析」一节
+  detailHint: '对业务库发只读查询得到的观测：行数、日期范围、核实了什么、跳过了什么',
+  detailNever: '这张表还没有剖析过。',
+  detailNoChecks: '按当前的目录和表结构，这张表没有可剖析的项（关联关系候选、像码值的列、日期列）。',
+  detailView: '视图不剖析。',
+  detailMissing: '表结构中已没有这张表，不能剖析。',
+  detailLast: (at: string) => `上次剖析：${at}`,
+  detailBy: (who: string) => `${who} 发起`,
+  detailJob: '查看这次剖析',
+  detailPending: '在剖析任务里排队，等待开始',
+  detailRunning: '正在剖析这张表',
+  profileThis: '剖析这张表',
+  profileThisHint: '新建一次剖析，只含这张表',
+  profileThisDisabled: '这个数据源未开启数据剖析，开启后才能剖析',
+  profileThisStarted: (table: string) => `已开始剖析 ${table}`,
+  profileThisQueued: (table: string) => `已排队剖析 ${table}：起草任务结束后自动开始`,
+  busyThisIn: (pos: number, total: number) => `这张表在其中，排第 ${formatNumber(pos)} / ${formatNumber(total)} 张`,
+  busyThisNotIn: '这张表不在其中，等它结束后再剖析这张表',
+  viewProgress: '查看进度',
 }
 
-/** 整次剖析中途停下的原因 */
-export const PROFILE_STOP_LABEL: Record<string, string> = {
-  budget: '查询次数已用完',
-  deadline: '总时长已用完',
-  failed: '连续多条查询失败',
-}
-
-/** 停下之后怎么办 */
-export const PROFILE_STOP_NEXT: Record<string, string> = {
-  budget: '其余检查未执行。可在数据剖析设置中调高查询次数上限，或缩小剖析范围后重新剖析。',
-  deadline: '其余检查未执行。可在数据剖析设置中调高总时长上限，或缩小剖析范围后重新剖析。',
-  failed: '其余检查未执行。请先在数据源卡片上测试连接，确认可用后重新剖析。',
-}
-
-/** 跳过一项的原因（skipped.reason）。整句说明在 skipped.detail 里 */
+/** 跳过一项的原因（skipped.reason、检查项的 reason）。整句说明在 detail 里 */
 export const PROFILE_SKIP_REASON_LABEL: Record<string, string> = {
-  budget: '查询次数用完',
-  deadline: '总时长用完',
+  budget: '本表查询次数用完',
+  deadline: '本表时长用完',
   failed: '连续失败',
   timeout: '查询超时',
   error: '查询失败',
-  rejected: '未通过安全守卫',
+  rejected: '未通过只读守卫',
+  slow: '数据库响应慢',
+  cancelled: '已停止',
   masked: '列已遮罩',
   too_large: '表太大',
   view: '视图',
@@ -2940,6 +3115,7 @@ export const PROFILE_SKIP_REASON_LABEL: Record<string, string> = {
   no_data: '没有数据',
   missing: '表结构中没有',
   high_cardinality: '取值太多',
+  nothing: '没有可剖析的项',
 }
 
 /** 跳过的是哪一类检查（skipped.kind） */

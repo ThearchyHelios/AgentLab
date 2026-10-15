@@ -9,6 +9,9 @@ import type { CatalogActiveDraftJob, CatalogDraftJob, CatalogDraftTask, CatalogD
 //
 // 取回来的状态只往前走：已经结束的任务不会被一个晚到的「进行中」翻回去，已结束的表数不减少（停止接口的回答和
 // 正在路上的那次取进度谁先到都一样）。
+//
+// 同一个数据源的起草任务和剖析任务按建立顺序排队（服务端每个源一条队）：起草建在剖析之后时是排队、waiting_for 为
+// profile，剖析结束后自动开始，界面照这样说（waitsForProfile）。
 // ===========================================================================
 
 /** 进行中多久取一次进度 */
@@ -25,6 +28,10 @@ const DRAFT_FINISHED = 'catalog_draft_finished'
 
 export const isJobActive = (j: { status: string } | null | undefined): boolean =>
   !!j && (j.status === 'queued' || j.status === 'running')
+
+/** 起草任务排在同一个数据源的剖析任务后面（剖析结束后自动开始）。老服务端没有 waiting_for */
+export const waitsForProfile = (j: { status: string; waiting_for?: string | null } | null | undefined): boolean =>
+  !!j && j.status === 'queued' && j.waiting_for === 'profile'
 
 const TASK_ENDED = new Set<CatalogDraftTaskStatus>(['ok', 'partial', 'failed', 'skipped', 'cancelled'])
 /** 「只重试失败的表」带上的：失败、部分完成、已停止 */

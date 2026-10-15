@@ -1,6 +1,6 @@
 import type {
   ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogAssistantEvent, CatalogAssistantRequest, CatalogDetail, CatalogDraftJob,
-  CatalogImpact, CatalogImportReport, CatalogList, CatalogNotes, CatalogPatchPreview, CatalogPatchSubmit, CatalogProfileOut,
+  CatalogImpact, CatalogImportReport, CatalogList, CatalogNotes, CatalogPatchPreview, CatalogPatchSubmit, CatalogProfileJob, CatalogProfileTaskDetail,
   CatalogReviewAction, CatalogReviewBatchItem, CatalogReviewBatchResult, CatalogReviewKind, CatalogReviewProgress, CatalogReviewQueue,
   CatalogTableUsage, CommitOut, CurrentRecipe, EditPreview,
   EditRequest, ImportRecord,
@@ -466,12 +466,44 @@ export const api = {
     putGuidance: (sourceId: string, guidance: string) =>
       put<{ guidance: string | null }>(`${catalogBase(sourceId)}/guidance`, { guidance }),
     /**
-     * 同步剖析：对业务库发少量只读查询，核对关系、取码值候选，结论写进目录。不给 tables 时按使用次数取前 10 张
-     * 有待核实关系的表。没开启、数据源停用、没有表结构、同一个数据源正在剖析、快照被改动时回 409（detail 是一句中文）
+     * 剖析任务（后台进行：逐表对业务库发只读查询，一条一条发，每张表一结束就写进目录）。剖析会对业务库发查询，默认关闭，
+     * 按数据源开启。和同一个数据源的起草任务按建立顺序排队（起草在排队、进行中时剖析建成 queued、waiting_for 为 draft）
      */
-    profile: (sourceId: string, body: { tables?: string[] }, opts?: RequestOptions) =>
-      request<CatalogProfileOut>(`/datasources/${encodeURIComponent(sourceId)}/catalog/profile`,
-        { method: 'POST', body: JSON.stringify(body), ...opts }),
+    profileJobs: {
+      /**
+       * 建任务：tables 非空时只剖析这些表（最多 500 张，按给的顺序，表结构里没有、视图、没有可剖析的项照样建进任务、记跳过），
+       * 否则按 scope（缺省 needed：需要剖析的表；all：全部可剖析的表）由服务端挑。202。
+       * 409 带机读码：profile_disabled、datasource_inactive、schema_missing、snapshot_tampered、profile_busy（这个源已有排队、
+       * 进行中的剖析任务，detail 写明进行到第几张）、profile_nothing（按范围挑出 0 张表，detail 写明原因和建议）
+       */
+      create: (sourceId: string, body: { tables?: string[]; scope?: 'needed' | 'all' }) =>
+        post<{ job: CatalogProfileJob }>(`${catalogBase(sourceId)}/profile-jobs`, body),
+      /** 排队或进行中的那个剖析任务；没有为 null */
+      active: (sourceId: string, opts?: RequestOptions) =>
+        get<{ job: CatalogProfileJob | null }>(`${catalogBase(sourceId)}/profile-jobs/active`, opts),
+      /** 最近建的一个剖析任务（任何状态）；没有为 null */
+      latest: (sourceId: string, opts?: RequestOptions) =>
+        get<{ job: CatalogProfileJob | null }>(`${catalogBase(sourceId)}/profile-jobs/latest`, opts),
+      /** 一个剖析任务的当前状态；不属于这个数据源回 404 */
+      get: (sourceId: string, jobId: string, opts?: RequestOptions) =>
+        get<{ job: CatalogProfileJob }>(`${catalogBase(sourceId)}/profile-jobs/${encodeURIComponent(jobId)}`, opts),
+      /** 任务里一张表的完整结果：检查清单、发现、跳过的项、日期范围、发过的查询。找不到 404 */
+      task: (sourceId: string, jobId: string, seq: number, opts?: RequestOptions) =>
+        get<{ task: CatalogProfileTaskDetail }>(
+          `${catalogBase(sourceId)}/profile-jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(String(seq))}`, opts),
+      /**
+       * 停止：排队的直接停；进行中的不再等正在执行的那条查询（数据库按单条时限截止它），这张表已做完的项照常写进目录、
+       * 没做的保留旧结论，后面的表记已停止。收尾写完才回停止之后的状态；已经结束的回 409（catalog_profile_finished）
+       */
+      cancel: (sourceId: string, jobId: string) =>
+        post<{ job: CatalogProfileJob }>(`${catalogBase(sourceId)}/profile-jobs/${encodeURIComponent(jobId)}/cancel`),
+      /**
+       * 重试没做完的表：新任务只含原任务里失败、部分完成、已停止的表（按原顺序）。202；没有可重试的表 422；
+       * 这个源已有排队、进行中的剖析任务 409（profile_busy）
+       */
+      retry: (sourceId: string, jobId: string) =>
+        post<{ job: CatalogProfileJob }>(`${catalogBase(sourceId)}/profile-jobs/${encodeURIComponent(jobId)}/retry`),
+    },
     // ---- 审阅队列（只列推断项，按表的使用次数、这一项对数字的影响和来源排好）
     /** 一页待确认项。kind：全部 / 影响数字的项 / 名称和含义；table 只看这一张表 */
     reviewQueue: (sourceId: string, params: { limit?: number; offset?: number; kind?: CatalogReviewKind; table?: string | null },
@@ -512,7 +544,8 @@ export const api = {
     importPreview: (sourceId: string, body: { content: unknown; include_guidance: boolean }) =>
       post<CatalogImportReport>(`${catalogBase(sourceId)}/import/preview`, body),
     /**
-     * 导入：规则同预览，逐表乐观锁，一张表失败不影响别的。有排队、进行中的起草任务时 409（catalog_draft_busy）；
+     * 导入：规则同预览，逐表乐观锁，一张表失败不影响别的。有排队、进行中的起草任务时 409（catalog_draft_busy），剖析任务时
+     * 409（profile_busy）；
      * 文件格式不对 422（detail 是一句中文）
      */
     importCatalog: (sourceId: string, body: { content: unknown; include_guidance: boolean }) =>

@@ -82,6 +82,7 @@ const ORDER = [
   'versions',        // 上传表格的版本：回滚、清单、移除一期、清除原件
   'catalog',         // 数据目录：表清单、起草、单项审阅、批量确认、编辑即确认、409
   'catalog-loop',    // 数据目录闭环：表助手、审阅队列、导出导入、防错事实的说明
+  'catalog-profile', // 数据剖析：逐表的后台任务、表清单的剖析一列、表详情的一节、剖析设置
   // 复核套件与导出
   'schedules',       // 定时任务
   'compare',         // 运行对比
@@ -109,7 +110,7 @@ const ORDER = [
 const ESTIMATE = {
   challenge: 30,
   stream: 173, chat: 160, studio: 149, manage: 145, runs: 112, publish: 92, shell: 87,
-  evidence: 91, versions: 60, catalog: 150, 'catalog-loop': 60, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
+  evidence: 91, versions: 60, catalog: 150, 'catalog-loop': 60, 'catalog-profile': 90, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
   // 占位，换成真检查时按实测改
   schedules: 60, compare: 45, verify: 71, inquiry: 60, bundle: 16, whatif: 33, 'report-export': 30,
   // 应用平台：还没实测，按同类页面估（全是伪造接口、不连真数据）

@@ -10,7 +10,7 @@ import { formatTime } from '../../lib/format'
 import { CATALOG_DRAFT_TEXT as DT, CATALOG_TEXT as CT, DRAFT_GUIDANCE_MAX, DRAFT_NOTE_MAX } from '../../lib/terms'
 import {
   DRAFT_MAX_TABLES, DRAFT_MODEL_UNAVAILABLE, DRAFT_PART_COLUMNS, DRAFT_TOP_N, RETRYABLE, blankOf, chunksOf, isJobActive, jobBlank, needsLook,
-  nothingWritten, retryableCount, taskReason, writtenOf,
+  nothingWritten, retryableCount, taskReason, waitsForProfile, writtenOf,
 } from './draftJob'
 import type { DraftPreset, DraftStartBody } from './draftJob'
 
@@ -27,6 +27,9 @@ import type { DraftPreset, DraftStartBody } from './draftJob'
 // 术语的含义，再重新起草这几张表。「重新起草这几张表」回到设置：范围就是那几张、勾着用模型、焦点在起草要求，
 // 补完再开始。表详情里的「补充起草要求」也是这样打开（范围是那一张，见 preset）。预先选好的范围里的表已经不在表结构
 // 里时不退回别的范围：那一项照旧选着、写明原因，不能开始。
+//
+// 同一个数据源的起草和剖析按建立顺序排队：有剖析任务在进行时，设置里写明起草会排在它后面；任务排在剖析后面
+// （waiting_for 为 profile）时写「排在剖析任务后面，剖析结束后自动开始」。
 // ===========================================================================
 
 type Scope = 'preset' | 'selected' | 'filtered' | 'top' | 'all'
@@ -46,7 +49,7 @@ const startErrorText = (e: unknown) =>
 
 export function DraftDialog({
   sourceId, sourceDescription, guidance, rows, visible, selected, filtered, job, initial, initialBusy = false, preset: initialPreset = null,
-  stopping, onStart, onCancel, onRetry, onTrack, onGuidanceSaved, onClose,
+  stopping, profileActive = false, onStart, onCancel, onRetry, onTrack, onGuidanceSaved, onClose,
 }: {
   sourceId: string
   /** 数据源说明：用模型起草时连同起草要求一起交给模型 */
@@ -74,6 +77,8 @@ export function DraftDialog({
   preset?: DraftPreset | null
   /** 点了停止、服务端还没停下来 */
   stopping: boolean
+  /** 同一个数据源有剖析任务在排队、进行中：起草会排在它后面 */
+  profileActive?: boolean
   /** 建任务；409 已有任务时页面改取进行中的那一个（busy 为真） */
   onStart: (body: DraftStartBody) => Promise<{ job: CatalogDraftJob; busy: boolean }>
   onCancel: () => Promise<void>
@@ -367,6 +372,11 @@ export function DraftDialog({
                 <button type="button" className="btn btn-sm" onClick={() => openLast(last)} data-draft-last-open="">{DT.lastOpen}</button>
               </div>
             )}
+            {profileActive && (
+              <p className="flex items-start gap-1.5 text-2xs leading-relaxed text-dim" data-draft-queue="">
+                <Info size={11} className="mt-px shrink-0" style={{ color: 'var(--accent)' }} aria-hidden /> <span>{DT.queueHint}</span>
+              </p>
+            )}
             {startError && <Notice tone="err" attr={{ 'data-draft-start-error': '' }}>{startError}</Notice>}
           </>
         )}
@@ -451,6 +461,11 @@ function JobView({ job, running, stopping, busy, blankTables, onRedraftBlank }: 
            aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={value}>
         <div className="h-full rounded-full transition-[width] duration-300" style={{ width: `${pct}%`, background: tone }} />
       </div>
+      {waitsForProfile(job) && (
+        <p className="flex items-start gap-1.5 text-2xs leading-relaxed text-dim" data-draft-waiting="profile">
+          <Info size={11} className="mt-px shrink-0" style={{ color: 'var(--accent)' }} aria-hidden /> <span>{DT.waitingProfile}</span>
+        </p>
+      )}
       {notice && <Notice tone="warn" className="break-words" attr={{ 'data-draft-notice': '' }}>{notice}</Notice>}
       <p className="tnum text-sm" data-draft-summary="">{summary}</p>
       {(job.model || usage.calls > 0 || failures) && (
