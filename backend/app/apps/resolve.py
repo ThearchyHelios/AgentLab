@@ -405,6 +405,8 @@ class _Page:
     params: dict[str, Any]
     draft: bool
     actor: str | None
+    #: 正在解析的这一页（组件之间要互相知道的：同一页上有没有绑同一条待办的会签组件）
+    page: dict[str, Any] = field(default_factory=dict)
     pins: dict[str, PinState] = field(default_factory=dict)
     sources: dict[str, Source] = field(default_factory=dict)
     problems: list[dict[str, Any]] = field(default_factory=list)
@@ -454,7 +456,7 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
     if page is None:
         raise ViewRefused(404, f"应用里没有页面「{page_id}」", "app_page_not_found")
     ctx = _Page(app=app, spec=spec, version=None if draft else version, principal=principal, role=role,
-                instance=instance, params=params or {}, draft=draft, actor=actor)
+                instance=instance, params=params or {}, draft=draft, actor=actor, page=page)
     ctx.pins = await load_pins(session, spec)
     upgrade = needs_upgrade(ctx.pins)
     level = version.level if (version is not None and not draft) else app_level(
@@ -555,12 +557,25 @@ async def _source(session: AsyncSession, ctx: _Page, vid: str) -> Source:
             return Source(id=vid, kind=kind, state="empty", pin=state,
                           message="按需运行的视图：点「刷新」后按当前参数运行一次")
     if run.status in _ACTIVE:
-        return Source(id=vid, kind=kind, state="running", run=run, pin=state, message="正在运行，完成后刷新页面")
+        return Source(id=vid, kind=kind, state="running", run=run, pin=state, message=await _active_text(session, run))
     source = Source(id=vid, kind=kind, state="ok" if run.status == "succeeded" else "error", run=run, pin=state,
                     origin=src.get("from"))
     if run.status != "succeeded":
         source.message = f"这次运行{STATUS_TEXT.get(run.status, run.status)}"
     return source
+
+
+#: 来源的运行还没结束时各块写什么。页面在跟着（应用页轮询、实例页轮询或接事件流），不用人去刷新
+RUNNING_TEXT = "正在运行，完成后自动刷新"
+
+
+async def _active_text(session: AsyncSession, run: Run) -> str:
+    """来源的运行还没结束：在跑写「正在运行」；停着等人（interrupted）按在等的那一步说等什么（等待审批、等待确认发送、
+    等待核实写入结果……，同实例的状态 instance_state），不说「正在运行」——页头写着「等待审批」，这里不能对不上。"""
+    if run.status != "interrupted":
+        return RUNNING_TEXT
+    text = instance_state(run, (await _trails(session, [run]))[run.id])["text"]
+    return f"{text}，流程走完后自动显示"
 
 
 async def _empty_text(session: AsyncSession, state: PinState, origin: Any) -> str:
@@ -1095,12 +1110,42 @@ def _decision(trail: _Trail, node_id: str) -> tuple[str | None, str | None]:
     return done[-1].kind, (done[-1].outcome or {}).get("decision")
 
 
+#: 人工节点的「驳回」出口（engine/layout.py 的 approved / rejected）
+REJECTED_HANDLE = "rejected"
+_REJECTIONS = ("reject", "expired_reject")
+
+
+def rejected_outputs(graph: Any) -> dict[str, set[str]]:
+    """成果节点 → 从哪几个人工节点的「驳回」出口一路走到它（中间不经过别的人工节点：再遇到人工节点，结局由那一个人
+    的决定说了算）。按图认，不按成果节点的标题猜。"""
+    from app.apps.tree import node_map
+
+    nodes = node_map(graph)
+    edges = [e for e in (graph or {}).get("edges") or [] if isinstance(e, dict)]
+    out: dict[str, set[str]] = {}
+    for gate in (e for e in edges if e.get("sourceHandle") == REJECTED_HANDLE
+                 and (nodes.get(str(e.get("source"))) or {}).get("type") == "human"):
+        seen: set[str] = set()
+        todo = [str(gate.get("target"))]
+        while todo:
+            nid = todo.pop()
+            if nid in seen or nid not in nodes or nodes[nid]["type"] == "human":
+                continue
+            seen.add(nid)
+            if nodes[nid]["type"] == "output":
+                out.setdefault(nid, set()).add(str(gate["source"]))
+            todo += [str(e.get("target")) for e in edges if str(e.get("source")) == nid]
+    return out
+
+
 def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
     """实例给人看的状态 {code, text}：code 是界面画状态标记用的状态（运行的那几种，加 held），text 说这件事办到哪了、
     结论是什么，不只是运行状态（P1）。
 
     - 走完了：图里有几个成果节点（分支的几种结局，如「已通过」「已退回」）、恰好走到了其中一个的，写走到的那一个；只有
-      一个成果节点的、几个成果节点并行都走到了的（「周报」「明细」一起出）写「已完成」——那不是哪一种结局；
+      一个成果节点的、几个成果节点并行都走到了的（「周报」「明细」一起出）写「已完成」——那不是哪一种结局。走到的是
+      否定的那种结局——这次运行里人工节点驳回了、从它的「驳回」出口一路走到的成果节点（rejected_outputs）——code 记
+      cancelled（同「未确认（被驳回）」，是人的决定，不画成成功），文字照旧写成果节点的标题；
     - 停着：有已发出、结果未知的动作，写「等待核实写入结果」；否则按在等的待办说（等待审批、等待确认发送……）；
     - 失败：停在一个被人驳回的待办上的——动作确认被驳回（「付款」未确认（被驳回））、审批设了驳回即终止、补充输入被
       驳回——是人的决定，不是故障，code 记 cancelled；核实为未生效、选了放弃的同理。外部系统拒绝之类照写失败。
@@ -1124,7 +1169,9 @@ def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
         outputs = {nid for nid, n in nodes.items() if n["type"] == "output"}
         reached = [nid for etype, nid in trail.events if etype == "node.finished" and nid in outputs]
         if len(outputs) > 1 and len(set(reached)) == 1:
-            return {"code": "succeeded", "text": title(reached[0])}
+            gates = rejected_outputs(run.graph).get(reached[0], set())
+            negative = any(_decision(trail, gate)[1] in _REJECTIONS for gate in gates)
+            return {"code": "cancelled" if negative else "succeeded", "text": title(reached[0])}
         return {"code": "succeeded", "text": STATUS_TEXT["succeeded"]}
     if run.status == "failed":
         failed = [nid for etype, nid in trail.events if etype == "node.failed"]
@@ -1133,7 +1180,7 @@ def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
             kind, decision = _decision(trail, node_id)
             if kind == "action_confirm" and decision == "reject":
                 return {"code": "cancelled", "text": f"「{title(node_id)}」未确认（被驳回）"}
-            if decision in ("reject", "expired_reject"):
+            if decision in _REJECTIONS:
                 return {"code": "cancelled", "text": f"「{title(node_id)}」被驳回"}
             record = next((a for a in reversed(trail.actions) if a.node_id == node_id), None)
             if record is not None and record.state == "failed":
@@ -1241,7 +1288,8 @@ async def _timeline(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
             text = WAITING_TEXT.get(pending[-1].kind)
         elif step["state"] == "failed" and kind == "action_confirm" and decision == "reject":
             step["state"], text = "rejected", "未确认（被驳回）"
-        elif step["state"] == "failed" and decision in ("reject", "expired_reject"):
+        elif step["state"] in ("failed", "done") and decision in _REJECTIONS:
+            # 驳回了：驳回即终止的（节点失败）和从「驳回」出口接着走的（节点完成）都是人的决定，不画成成功
             step["state"], text = "rejected", _DECISION_TEXT[decision]
         elif step["state"] == "failed" and record is not None and (record.resolution or {}).get("outcome") == "abandon":
             step["state"], text = "rejected", "核实为未生效，已放弃发送"
@@ -1324,9 +1372,14 @@ async def _process_data(session: AsyncSession, ctx: _Page, ctype: Any, kind: str
     """待办（task_form、signoffs）、动作（action_status）。
 
     待办这里就判定读者是不是这条待办的处理人（process.tasks.handles）：是的，界面按 id 取完整的待办画待办卡（能处理的
-    给表单）；不是的（发起人、旁观的人）只看这一步的状态——派给了谁、会签进度、时限——不去取待办（取了也是 404）。"""
+    给表单）；不是的（发起人、旁观的人）只看这一步的状态——派给了谁、会签进度、时限——不去取待办（取了也是 404）。
+
+    同一页上另有绑同一条待办的会签组件（signoffs）时，待办表单不再画会签进度（signoffs_on_page）：同一页上「会签进度
+    0/2」不写两遍。人名给显示名（people：用户名 → 显示名），界面写显示名、悬停给用户名。"""
+    from app.apps.tree import components
+    from app.auth.directory import display_names
     from app.db.models_process import ActionRecord, Task, TaskAssignment
-    from app.process.tasks import handles, my_response, principal_with_actor, progress
+    from app.process.tasks import handles, my_response, people_of, principal_with_actor, progress
 
     run = ctx.instance
     if run is None:
@@ -1340,13 +1393,18 @@ async def _process_data(session: AsyncSession, ctx: _Page, ctype: Any, kind: str
                                            .order_by(TaskAssignment.created_at))).scalars())
         reader = principal_with_actor(ctx.principal, ctx.actor)
         resolved_at = _aware(task.resolved_at).isoformat() if task.resolved_at else None
+        signoffs = ctype == "task_form" and any(
+            c.get("type") == "signoffs" and isinstance(c.get("bind"), dict) and c["bind"].get("task") == node_id
+            for c, _, _ in components({"pages": [ctx.page]}))
         return {"state": "ok", "task": {**_task_row(task, instance_title(run)), "form": task.form,
                                         "resolved_by": task.resolved_by, "resolved_at": resolved_at,
                                         "outcome": {"decision": (task.outcome or {}).get("decision")}
                                         if task.outcome else None},
                 "task_ui": (ctx.spec.get("task_ui") or {}).get(node_id) or {},
                 "handler": handles(rows, reader), "assignments": [_assignment_row(a) for a in rows],
-                "progress": progress(task, rows), "my_response": my_response(rows, reader)}
+                "progress": progress(task, rows), "my_response": my_response(rows, reader),
+                "people": await display_names(session, people_of(task, rows)),
+                **({"signoffs_on_page": True} if signoffs else {})}
     records = (await session.execute(select(ActionRecord).where(ActionRecord.run_id == run.id,
                                                                 ActionRecord.node_id == node_id)
                                      .order_by(ActionRecord.created_at, ActionRecord.attempt))).scalars()

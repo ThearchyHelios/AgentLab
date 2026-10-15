@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.core.errors import graph_error
 from app.api.coded import CodedHTTPException
@@ -66,6 +67,9 @@ class WorkflowOut(BaseModel):
     published_by: str | None = None
     #: 当前发布版本的级别（published / governed）。status 在画布上改过之后会回到 draft，「这是不是受管工作流」看这一项
     published_level: str | None = None
+    #: 画布这一版的图和当前发布版的图内容相同（按 graph_hash 比）：撤回改动后保存出来的新版本号更大，内容却和发布版
+    #: 一样，页头照实写「与发布版内容相同」，不写「领先 N 版」。没发布过、老数据没记哈希的为 false
+    same_as_published: bool = False
     created_at: Any = None
     updated_at: Any = None
     run_count: int = 0
@@ -82,6 +86,17 @@ async def _published_levels(session: AsyncSession, ids: list[str] | None = None)
     return {wid: level for wid, level in (await session.execute(stmt)).all() if level}
 
 
+async def _same_as_published(session: AsyncSession, ids: list[str] | None = None) -> set[str]:
+    """画布这一版（Workflow.version）的图哈希和当前发布版相同的工作流 id。两边哈希都记着才比，不在前端比图。"""
+    current, published = aliased(WorkflowVersion), aliased(WorkflowVersion)
+    stmt = select(Workflow.id, current.graph_hash, published.graph_hash).join(
+        current, (current.workflow_id == Workflow.id) & (current.version == Workflow.version)).join(
+        published, (published.workflow_id == Workflow.id) & (published.version == Workflow.published_version))
+    if ids is not None:
+        stmt = stmt.where(Workflow.id.in_(ids))
+    return {wid for wid, mine, theirs in (await session.execute(stmt)).all() if mine and mine == theirs}
+
+
 async def _run_counts(session: AsyncSession, ids: list[str] | None = None) -> dict[str, int]:
     """各工作流的运行次数 {工作流 id: 次数}，ids 为 None 时算全部。列表和单个工作流的接口都按它算：以前只有列表
     计数，详情、保存、恢复的返回落在 WorkflowOut 的默认值 0 上，同一个工作流两处说的次数不一样。"""
@@ -96,6 +111,7 @@ async def _workflow_out(session: AsyncSession, workflow: Workflow) -> WorkflowOu
     item = WorkflowOut.model_validate(workflow)
     item.run_count = (await _run_counts(session, [workflow.id])).get(workflow.id, 0)
     item.published_level = (await _published_levels(session, [workflow.id])).get(workflow.id)
+    item.same_as_published = workflow.id in await _same_as_published(session, [workflow.id])
     return item
 
 
@@ -106,11 +122,13 @@ async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[W
     )
     counts = await _run_counts(session)
     levels = await _published_levels(session)
+    same = await _same_as_published(session)
     out: list[WorkflowOut] = []
     for row in rows:
         item = WorkflowOut.model_validate(row)
         item.run_count = counts.get(row.id, 0)
         item.published_level = levels.get(row.id)
+        item.same_as_published = row.id in same
         out.append(item)
     return out
 

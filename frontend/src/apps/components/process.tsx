@@ -12,7 +12,7 @@ import clsx from 'clsx'
 import { api } from '../../api/client'
 import { ErrorState, Spinner, StatusPill, useTicker } from '../../components/ui'
 import {
-  Due, Resolved, SignoffHead, Signoffs, TaskCard, assigneeName, respondedText,
+  Due, Resolved, SignoffHead, Signoffs, TaskCard, assigneeHint, assigneeName, respondedText,
 } from '../../run/TaskCard'
 import { formatDateTime, formatRelative, formatTime } from '../../lib/format'
 import {
@@ -223,7 +223,7 @@ function taskOf(data: Record<string, any>): Task {
   return {
     ...summary, policy: summary.policy ?? { kind: 'any' }, payload: {}, can_respond: false,
     outcome: summary.outcome ?? null, resolved_by: summary.resolved_by ?? null, resolved_at: summary.resolved_at ?? null,
-    progress: data.progress ?? null, my_response: data.my_response ?? null,
+    progress: data.progress ?? null, my_response: data.my_response ?? null, people: data.people ?? {},
     assignments: raw.map((a, i) => ({
       id: a.id ?? String(i), principal_kind: a.principal_kind ?? 'anyone', principal: str(a.principal),
       source: str(a.source), status: a.status ?? 'pending', responded_by: a.responded_by ?? null,
@@ -242,31 +242,36 @@ function useFullTask(summary: TaskSummary | undefined, enabled: boolean) {
 
 /**
  * 待办表单：服务端解析时就判定了读者是不是这条待办的处理人（data.handler）。是的按 id 取完整的待办画待办卡（能处理的给
- * 表单）；不是的（发起人、旁观的人）只画这一步的状态——派给了谁、会签进度、时限——不去取待办（取了也是「待办不存在」）
+ * 表单）；不是的（发起人、旁观的人）只画这一步的状态——派给了谁、会签进度、时限——不去取待办（取了也是「待办不存在」）。
+ * 同一页上另有绑同一条待办的会签组件时服务端说一声（data.signoffs_on_page），这里不再画会签进度：同一页上不写两遍
  */
 export function TaskForm({ node }: NodeProps) {
   const { preview, onReload } = useView()
   const summary = node.data?.task as TaskSummary | undefined
   const handler = node.data?.handler !== false
+  const signoffs = node.data?.signoffs_on_page !== true
   const { task, error, retry } = useFullTask(summary, !preview && handler)
   if (!summary) return <div className="text-2xs text-faint" data-component="task_form">{VIEW_TEXT.tasks.empty}</div>
   return (
     <div className="overflow-hidden rounded-lg border" data-component="task_form" data-task-handler={handler ? 'yes' : 'no'}>
       {preview ? <TaskRow task={summary} />
-        : !handler ? <TaskState task={taskOf(node.data!)} />
+        : !handler ? <TaskState task={taskOf(node.data!)} signoffs={signoffs} />
         : error ? <ErrorState compact error={error} onRetry={retry} className="m-2" />
         : !task ? <div className="px-3 py-3"><Spinner size={11} /></div>
-        : <TaskCard task={task} onResolved={() => { retry(); onReload?.() }} />}
+        : <TaskCard task={task} showSignoffs={signoffs} onResolved={() => { retry(); onReload?.() }} />}
     </div>
   )
 }
 
-/** 这一步的状态（不是处理人看的）：种类、标题、状态、时限、升级；在等谁、会签进度；处理完了写谁、什么时候、结果 */
-function TaskState({ task }: { task: Task }) {
+/**
+ * 这一步的状态（不是处理人看的）：种类、标题、状态、时限、升级；在等谁、会签进度；处理完了写谁、什么时候、结果。
+ * 人名写显示名，悬停给用户名（服务端给的 people）
+ */
+function TaskState({ task, signoffs }: { task: Task; signoffs: boolean }) {
   const now = useTicker(60_000)
   const pending = task.status === 'pending'
-  const waiting = task.assignments.filter((a) => a.status === 'pending').map(assigneeName)
-  const voting = task.progress && (task.assignments.length > 1 || task.policy.kind !== 'any')
+  const waiting = task.assignments.filter((a) => a.status === 'pending')
+  const voting = signoffs && task.progress && (task.assignments.length > 1 || task.policy.kind !== 'any')
   return (
     <div className="space-y-1.5 p-3" data-task-state={task.status} data-task={task.id}>
       <div className="tnum flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
@@ -282,7 +287,11 @@ function TaskState({ task }: { task: Task }) {
       </div>
       {!pending && <Resolved task={task} />}
       {pending && waiting.length > 0 && (
-        <div className="text-2xs text-dim" data-task-waiting-on="">{TASK_TEXT.waitingOn(waiting.join('、'))}</div>
+        // 悬停给用户名（写的是显示名的那几个）
+        <div className="text-2xs text-dim" data-task-waiting-on=""
+             title={waiting.map((a) => assigneeHint(a, task.people)).filter(Boolean).join('、') || undefined}>
+          {TASK_TEXT.waitingOn(waiting.map((a) => assigneeName(a, task.people)).join('、'))}
+        </div>
       )}
       {voting && <div className="rounded border bg-bg p-2"><SignoffHead task={task} /></div>}
       {pending && task.my_response && (

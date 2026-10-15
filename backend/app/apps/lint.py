@@ -553,6 +553,7 @@ async def _lint_process(session: AsyncSession, spec: dict[str, Any], pins: dict[
             label = (info or {}).get("label") or slot
             why = f"（{'；'.join(used[slot][:3])}）：没有人，流程走到这一步就派给了任何人" if used.get(slot) else ""
             out.error("app.slot_unbound", f"岗位「{label}」还没有绑定到人或组{why}", f"slots.{slot}")
+    await _lint_slot_principals(session, slots, bound, out)
     for state in process:
         nodes = node_map(state.graph)
         for node_id, cap in writes[state.alias].items():
@@ -570,6 +571,33 @@ async def _lint_process(session: AsyncSession, spec: dict[str, Any], pins: dict[
             if (issue.code or "").startswith("process."):
                 out.error("app.process_unsafe", f"「{state.label}」作为流程不安全：{issue.message}",
                           f"pins[{_pin_index(spec, state.alias)}]", node_id=issue.node_id)
+
+
+async def _lint_slot_principals(session: AsyncSession, slots: dict[str, Any], bound: dict[str, Any],
+                                out: _Issues) -> None:
+    """岗位绑定的人和组要在名录里（auth/directory.py，同选人控件的名录）：绑了名录里没有的、已停用的，流程走到这一步就
+    派给了没人能处理的名字——界面上选人时拦着，旧客户端、直接调接口、绑好之后人被停用或删除的照样会漏过来，所以发布时
+    再核一次。账号密码登录报错；单点登录的人第一次登录后才进名录，名录里还没有的只提醒；关登录不核对。"""
+    from app.api.deps import auth_mode
+    from app.auth.directory import load_directory, mismatch
+
+    mode = auth_mode()
+    if mode == "off" or not any(bound.get(s) for s in slots):
+        return
+    known = await load_directory(session)
+    for slot, info in slots.items():
+        label = (info or {}).get("label") or slot
+        for item in bound.get(slot) or []:
+            m = mismatch(known, mode, item.get("kind"), str(item.get("name"))) if isinstance(item, dict) else None
+            if m is None:
+                continue
+            if m.blocking:
+                out.error("app.slot_principal_unknown", f"岗位「{label}」绑定的{m.text}：派给这个名字的待办没有人能处理"
+                          "（全体会签时整条待办办不完）。请从候选中重新选择，或从岗位里移除", f"slots.{slot}",
+                          problem=m.problem)
+            else:
+                out.warning("app.slot_principal_unknown", f"岗位「{label}」绑定的{m.text}", f"slots.{slot}",
+                            problem=m.problem)
 
 
 def _pin_index(spec: dict[str, Any], alias: str) -> int:
@@ -597,17 +625,37 @@ async def _lint_notify(session: AsyncSession, spec: dict[str, Any], out: _Issues
 
 
 async def acl_issues(session: AsyncSession, app_id: str) -> list[dict[str, Any]]:
-    """开了登录却没有任何 use 以上的授权：除了管理员和搭建者，谁都用不了这个应用。关登录时不报。"""
-    from app.api.deps import auth_mode
-    from app.db.models_apps import AppGrant
+    """开了登录却没有任何 use 以上的授权：除了管理员和搭建者，谁都用不了这个应用。关登录时不报。
 
-    if auth_mode() == "off":
+    授权给的人和组要在名录里（同岗位绑定，见 _lint_slot_principals）：授给名录里没有的名字，以后建了同名的人就直接拿到
+    这一档权限；授给停用的人，重新启用就又能用——都说清是哪一档、哪个名字。账号密码登录报错，单点登录名录里还没有的只提醒。"""
+    from app.api.deps import auth_mode
+    from app.apps.access import ROLE_TEXT, grants_of
+    from app.auth.directory import load_directory, mismatch
+
+    mode = auth_mode()
+    if mode == "off":
         return []
-    count = len((await session.execute(select(AppGrant.id).where(AppGrant.app_id == app_id))).all())
-    if count:
-        return []
-    return [{"message": "还没有授权给任何人或组使用这个应用：只有管理员和搭建者能打开它", "level": "warning",
-             "code": "app.acl_empty", "path": None}]
+    grants = await grants_of(session, app_id)
+    if not grants:
+        return [{"message": "还没有授权给任何人或组使用这个应用：只有管理员和搭建者能打开它", "level": "warning",
+                 "code": "app.acl_empty", "path": None}]
+    out = _Issues()
+    known = await load_directory(session)
+    for g in grants:
+        if (m := mismatch(known, mode, g.principal_kind, g.principal)) is None:
+            continue
+        what = f"「{ROLE_TEXT.get(g.role, g.role)}」授权给的{m.text}"
+        if m.blocking:
+            out.error("app.acl_principal_unknown", f"{what}：{_GRANT_RISK[m.problem]}", "grants", problem=m.problem)
+        else:
+            out.warning("app.acl_principal_unknown", what, "grants", problem=m.problem)
+    return out.items
+
+
+#: 授权给了名录里对不上的名字，会出什么事
+_GRANT_RISK = {"missing": "以后建了同名的人会直接拿到这一档权限。请从授权里移除，或从候选中重新选择",
+               "disabled": "重新启用后他又能用这个应用。请从授权里移除"}
 
 
 def pins_with_state(spec: dict[str, Any], pins: dict[str, Any]) -> list[dict[str, Any]]:

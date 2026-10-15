@@ -214,12 +214,14 @@ async def delete_group(group_id: str, session: AsyncSession = Depends(get_sessio
 
 @directory_router.get("/directory")
 async def directory(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """选人用的名录。停用的人也列出来（标 disabled）：已经绑着他的岗位、授权要能认出「这个人停用了」，不是「没有这个人」。"""
-    users = (await session.execute(select(User).order_by(User.username))).scalars()
-    groups = (await session.execute(select(Group).order_by(Group.name))).scalars()
-    return {"users": [{"username": u.username, "display_name": u.display_name or u.username, "disabled": u.disabled}
-                      for u in users],
-            "groups": [{"name": g.name, "label": g.label or g.name} for g in groups]}
+    """选人用的名录。停用的人也列出来（标 disabled）：已经绑着他的岗位、授权要能认出「这个人停用了」，不是「没有这个人」。
+    和应用检查、改授权时的核对同一处取（auth/directory.py）。"""
+    from app.auth.directory import load_directory
+
+    known = await load_directory(session)
+    return {"users": [{"username": u.username, "display_name": u.display_name, "disabled": u.disabled}
+                      for u in known.users.values()],
+            "groups": [{"name": g.name, "label": g.label} for g in known.groups.values()]}
 
 
 # ---------------------------------------------------------------- 审计

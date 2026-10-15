@@ -455,6 +455,8 @@ export interface Task {
   resolved_by: string | null
   resolved_at: string | null
   created_at: string
+  /** 待办上出现的人的显示名（用户名 → 显示名：派给谁、谁回复、谁处理）。界面写显示名、悬停给用户名；老服务端不给 */
+  people?: Record<string, string>
 }
 
 export interface TaskRespond {

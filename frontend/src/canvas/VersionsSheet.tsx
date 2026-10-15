@@ -9,7 +9,7 @@ import {
 import { ErrorState, Skeleton, toast } from '../components/ui'
 import { useDatasources } from '../store/catalog'
 import { formatDateTime, formatTime } from '../lib/format'
-import { CATALOG_DRIFT_TEXT, VERSION_USAGE_TEXT, WORKFLOW_STATUS_LABEL } from '../lib/terms'
+import { CATALOG_DRIFT_TEXT, VERSION_USAGE_TEXT, WORKFLOW_STATUS_LABEL, publishedLevelOf } from '../lib/terms'
 import { useAtLeast } from '../store/auth'
 import { RetiredNote, VersionUsageLine, retireBlocked, retireVersion, useVersionUsage } from './versionUsage'
 import { hintOf } from './shortcuts'
@@ -132,9 +132,12 @@ export function VersionsSheet({ workflow, onClose }: { workflow: Workflow; onClo
                           <span title={formatDateTime(v.created_at)}>{formatTime(v.created_at)}</span>
                           {current && <span className="chip">{dirty ? '画布基于此版本' : '当前画布版本'}</span>}
                           {published && (
-                            <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}>
+                            // 按这一版自己的级别写：画布上改过之后 status 回到草稿，受管发布版照实写「受管」。老数据没记级别的
+                            // 退回看工作流当前发布版的级别
+                            <span className="chip" style={{ color: 'var(--ok)', borderColor: 'var(--ok)' }}
+                                  data-version-published={v.level ?? publishedLevelOf(workflow)}>
                               <ShieldCheck size={9} />
-                              {WORKFLOW_STATUS_LABEL[workflow.status === 'governed' ? 'governed' : 'published']}
+                              {WORKFLOW_STATUS_LABEL[v.level ?? publishedLevelOf(workflow)]}
                             </span>
                           )}
                           {!published && v.level && !v.retired_at && (

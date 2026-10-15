@@ -17,6 +17,8 @@ from app.api.deps import Principal
 from app.db.models_apps import AppGrant
 
 RANK = {"use": 1, "observe": 2, "manage": 3}
+#: 三档授权的叫法（同前端 GRANT_ROLE_LABEL）：权限不够的报错、授权核对的说明里写这个
+ROLE_TEXT = {"use": "使用", "observe": "查看全部实例", "manage": "管理"}
 
 
 def at_least(role: str | None, need: str) -> bool:

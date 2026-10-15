@@ -101,7 +101,7 @@ const LINT = [
 
 async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition', stream = [], spec = SPEC, lint = LINT,
   versions = [], versionSpec = null, hooks = [], conversation = { id: 'conv-ae', kind: 'app', title: '', turns: [] },
-  backfill = undefined, plan = null } = {}) {
+  backfill = undefined, plan = null, status = 'active' } = {}) {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } })
   opened.add(ctx)
   await ctx.addInitScript(() => { try { localStorage.setItem('agentlab_actor', '检查脚本') } catch { /* noop */ } })
@@ -110,11 +110,12 @@ async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition',
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
-  const app = { id: 'app-ae', name: SPEC.name, description: '', icon: 'app', status: 'active', published_version: 2, level: 'published',
+  const app = { id: 'app-ae', name: SPEC.name, description: '', icon: 'app', status, published_version: 2, level: 'published',
     needs_upgrade: false, pending_tasks: 0, my_role: 'manage', updated_at: '2026-10-10T02:00:00Z', draft: clone(spec),
     draft_bindings: { slots: {} }, created_by: '检查脚本', ...(backfill ? { backfill } : {}) }
   const state = { app, patches: [], lints: 0, publishes: [], derives: [], creates: [], streams: [], pages: [],
-    hooks: clone(hooks), rotates: [], hookPatches: [], hookDeletes: [], backfills: [], turns: [], turnPatches: [], conversations: 0 }
+    hooks: clone(hooks), rotates: [], hookPatches: [], hookDeletes: [], backfills: [], turns: [], turnPatches: [], conversations: 0,
+    archives: 0 }
 
   await page.route(/\/api\//, (route) => {
     const req = route.request()
@@ -149,6 +150,11 @@ async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition',
       const body = req.postDataJSON()
       state.patches.push(body)
       state.app = { ...state.app, ...(body.draft ? { draft: body.draft } : {}), ...(body.draft_bindings ? { draft_bindings: body.draft_bindings } : {}) }
+      return json(route, state.app)
+    }
+    if (sub === 'archive') {
+      state.archives += 1
+      state.app = { ...state.app, status: 'archived' }
       return json(route, state.app)
     }
     if (sub === 'lint') {
@@ -601,6 +607,37 @@ await section('岗位与授权：三档各写标题和说明；搭建者从名�
   await input.press('Enter')
   check('名录里有的照常加上', await chips() === 2 && await use.locator('[data-principal-refused]').count() === 0)
   check('名录只取一次，几个选择器共用', asked.length === 1, String(asked.length))
+})
+
+// 归档（api/apps.py 的 archive_app）：后果照服务端的实际行为写；没有恢复的接口，界面上也不给「恢复」
+await section('归档：确认框写明后果；归档后顶部写明已归档，保存和发布置灰', async () => {
+  const { page, state, errors } = await open({ path: '/apps/app-ae/edit/publish' })
+  const archive = page.locator('[data-app-archive]')
+  check('编辑器给「归档」', await archive.count() === 1)
+  await archive.click()
+  const dlg = page.getByRole('dialog')
+  await dlg.waitFor({ timeout: 3000 }).catch(() => {})
+  const text = (await dlg.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('确认框写明后果：列表不再列出、入口不再接受新实例、钩子拒收、进行中的照常走完、不能再改和发布、没有恢复',
+    ['应用列表里不再列出', '入口不再接受新实例', '入站钩子一律拒收', '进行中的实例照常走完', '不能再修改草稿、发布新版本', '没有恢复']
+      .every((k) => text.includes(k)), text)
+  await dlg.getByRole('button', { name: '取消' }).click()
+  await page.waitForTimeout(200)
+  check('……取消就不归档', state.archives === 0 && await page.locator('[data-app-archived]').count() === 0)
+  await archive.click()
+  await page.getByRole('dialog').getByRole('button', { name: '归档应用' }).click()
+  check('确认后发归档请求', await waitFor(page, async () => state.archives === 1))
+  const banner = page.locator('[data-app-archived]')
+  check('归档后顶部写明已归档', await waitFor(page, async () => await banner.count() === 1)
+    && (await banner.innerText()).includes('已归档'))
+  check('……不再给「归档」', await page.locator('[data-app-archive]').count() === 0)
+  check('……保存和发布置灰', await page.locator('[data-app-save]').isDisabled() && await page.locator('[data-app-publish-submit]').isDisabled()
+    && ((await page.locator('[data-app-publish-submit]').getAttribute('title')) ?? '').includes('已归档'))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+
+  const again = await open({ path: '/apps/app-ae/edit/pages', status: 'archived' })
+  check('打开已归档的应用：一进来就写明已归档，没有「归档」，保存置灰', await again.page.locator('[data-app-archived]').count() === 1
+    && await again.page.locator('[data-app-archive]').count() === 0 && await again.page.locator('[data-app-save]').isDisabled())
 })
 
 check('检查没有写库（兜底拦下的写请求）', writes.length === 0, writes.slice(0, 4).join('、'))

@@ -38,6 +38,8 @@ export interface Workflow {
   published_version?: number | null
   /** 当前发布版本的级别。画布上改过之后 status 回到 draft，「这是不是受管工作流」看这一项（老服务端不给） */
   published_level?: 'published' | 'governed' | null
+  /** 画布这一版的图和当前发布版内容相同（服务端按图哈希比）：撤回改动后保存出来的新版本不算「领先」（老服务端不给） */
+  same_as_published?: boolean
   /** 最近一次发布的署名。发布时没有署名为 null */
   published_by?: string | null
   run_count?: number
@@ -252,6 +254,11 @@ export interface ToolInfo {
    * 一定失败，列表上要醒目地标出来。null / 缺省表示没问题
    */
   problem?: string | null
+  /**
+   * 在工具库里执行只演练、不发送：写外部系统的能力（被治理为写入，或绑定端点、视参数而定），和执行接口同一个判断。
+   * 详情区的提示条照它说「这里只演练」，不说「请求会实际发出」（老服务端不给）
+   */
+  write_rehearsal?: boolean
 }
 
 /**

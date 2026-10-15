@@ -876,6 +876,11 @@ await section('auto：修完没有错了，发布按钮才可用；发布只在�
   await submit(page).click()
   await waitFor(page, async () => state.publishes.length === 1)
   check('人点了「发布为受管」才发出一次发布', state.publishes.length === 1 && state.publishes[0].level === 'governed', JSON.stringify(state.publishes))
+  // 受管级发布成功：弹窗标题写明受管（和工具栏「受管 vN」、发布提示同一种说法），不只写「已发布 vN」
+  const done = dialog(page).locator('[data-publish-done-level="governed"]')
+  check('受管发布成功：弹窗换成成功的说明', await waitFor(page, async () => await done.count() === 1))
+  const head = await dialog(page).innerText().catch(() => '')
+  check('……标题写明受管', head.includes(`已发布 v${state.version} · 受管`), head.split('\n')[0])
 })
 
 await section('choice：没选之前不能应用；选了之后载荷里是选的值', async () => {
@@ -1967,6 +1972,9 @@ await section('应用平台：发布成功做成应用；已发布版本的使�
     await waitFor(page, async () => state.publishes.length === 1)
     const done = dialog(page).locator('[data-publish-done]')
     check('发布成功：弹窗不关，换成成功的说明', await waitFor(page, async () => await done.count() === 1))
+    const head = await dialog(page).innerText().catch(() => '')
+    check('……已发布级的标题不写受管', head.includes(`已发布 v${state.version}`) && !head.includes('受管')
+      && await done.getAttribute('data-publish-done-level') === 'published', head.split('\n')[0])
     const make = dialog(page).locator('[data-publish-make-app]')
     check('……给「做成应用」的入口', await make.count() === 1 && (await make.innerText()).includes('做成应用'))
     await make.click()

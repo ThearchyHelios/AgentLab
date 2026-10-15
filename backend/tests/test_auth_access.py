@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 
 from app.api.deps import Principal, can_read_artifact, can_read_run
 from app.core.artifact_store import put_json
@@ -72,10 +72,12 @@ async def world():
         s.add(DataSource(name="crm", kind="sqlite", options={"mask_columns": ["phone"]}))
         await s.commit()
         ids = {k: r.id for k, r in runs.items()}
+        # 按 id 交回：同一个测试进程里别的测试留下的应用也可能叫「报销」，按名字找会撞上
+        apps = {"报销": app_a.id, "周报": app_b.id}
     uma = await auth_env.login("uma")
     bob = await auth_env.login("bob")
     try:
-        yield {"admin": admin, "uma": uma, "bob": bob, "runs": ids}
+        yield {"admin": admin, "uma": uma, "bob": bob, "runs": ids, "apps": apps}
     finally:
         async with SessionLocal() as s:
             for model in (TaskAssignment, Task, AppGrant, AppVersion, App):
@@ -191,8 +193,8 @@ async def test_action_receipt_body_is_masked_for_a_user(world):
 async def test_a_manage_grant_does_not_make_a_user_an_app_builder(world):
     """§3.12：搭建、发布、绑定岗位、授权、钩子 user 一律不给。授给使用者的 manage 按 observe 算。"""
     uma = world["uma"]
+    app_id = world["apps"]["报销"]
     async with SessionLocal() as s:
-        app_id = (await s.execute(select(App.id).where(App.name == "报销"))).scalar_one()
         s.add(AppGrant(app_id=app_id, principal_kind="user", principal="uma", role="manage"))
         await s.commit()
     assert (await uma.post(f"/api/apps/{app_id}/publish", json={})).status_code == 403

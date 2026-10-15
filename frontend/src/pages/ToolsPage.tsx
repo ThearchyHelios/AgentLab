@@ -92,8 +92,12 @@ function sampleOf(spec: any): any {
   }
 }
 
-/** 在工具库里直接执行时，它的副作用落在哪里。说实话：内置工具有围栏，外接的没有 */
+/**
+ * 在工具库里直接执行时，它的副作用落在哪里。说实话：内置工具有围栏，外接的没有；写外部系统的能力在这里只演练
+ * （服务端给的 write_rehearsal，和执行接口同一个判断），不说「请求会实际发出」
+ */
 function sideEffectNote(tool: ToolInfo): string {
+  if (tool.write_rehearsal) return TOOL_REHEARSAL_TEXT.library
   if (tool.source !== 'builtin') return '自定义工具和 MCP 工具的副作用由工具自身决定，此处无法拦截：请求会实际发出，并可能修改外部系统。'
   if (tool.category === '文件') return '文件读写限定在工作目录内，无法访问其他位置。'
   if (tool.category === '网络') return '内网、回环和云元数据地址会被拦截，公网请求会实际发出。'
@@ -240,15 +244,22 @@ function ToolLibrary() {
               </div>
             )}
 
-            {picked.dangerous && (
-              <div className="mb-3 flex gap-2 rounded-lg border px-2.5 py-2 text-xs leading-relaxed"
+            {picked.dangerous && (picked.write_rehearsal ? (
+              // 写入能力：执行不先确认（演练没有副作用）、也不真的发出，提示条和结果的「演练」同一个颜色
+              <div className="mb-3 flex gap-2 rounded-lg border px-2.5 py-2 text-xs leading-relaxed" data-tool-side-effect="rehearsal"
+                   style={{ borderColor: 'color-mix(in srgb, var(--st-waiting) 40%, var(--border))', background: 'var(--st-waiting-soft)' }}>
+                <StatusBadge status="waiting" size={13} decorative className="mt-0.5 shrink-0" />
+                <span>{sideEffectNote(picked)}</span>
+              </div>
+            ) : (
+              <div className="mb-3 flex gap-2 rounded-lg border px-2.5 py-2 text-xs leading-relaxed" data-tool-side-effect="send"
                    style={{ borderColor: 'color-mix(in srgb, var(--warn) 40%, var(--border))', background: 'color-mix(in srgb, var(--warn) 7%, transparent)' }}>
                 <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--warn)]" aria-hidden />
                 <span>
                   此处直接执行，不经审批：执行前会先说明具体操作，确认后才会执行。{sideEffectNote(picked)}
                 </span>
               </div>
-            )}
+            ))}
 
             <div className="mb-1 flex items-center gap-2">
               <label className="label !mb-0" htmlFor="tool-args">参数</label>

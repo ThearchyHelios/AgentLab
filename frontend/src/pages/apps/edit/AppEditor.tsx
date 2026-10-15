@@ -11,10 +11,12 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { Bot, ExternalLink, LayoutGrid, Save } from 'lucide-react'
+import { Archive, Bot, ExternalLink, LayoutGrid, Save } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../../api/client'
-import { EmptyState, ErrorState, Field, PageHeader, Skeleton, Spinner, confirmDialog, isComposing, toast } from '../../../components/ui'
+import {
+  EmptyState, ErrorState, Field, Notice, PageHeader, Skeleton, Spinner, confirmDialog, isComposing, toast,
+} from '../../../components/ui'
 import { formatTime } from '../../../lib/format'
 import { matchShortcut } from '../../../lib/keys'
 import { useLeaveGuard } from '../../../lib/leave'
@@ -180,6 +182,27 @@ function EditApp({ appId }: { appId: string }) {
     }
   }, [appId])
 
+  /** 归档：确认框照服务端的实际行为写后果（入口不再发起、钩子拒收、进行中的照常走完、不能再改和发布，没有恢复） */
+  const [archiving, setArchiving] = useState(false)
+  const archive = async () => {
+    if (!detail || !(await confirmDialog({
+      title: T.archiveTitle(detail.name), consequences: dirty ? [...T.archiveConsequences, T.archiveUnsaved] : T.archiveConsequences,
+      confirmLabel: T.archiveConfirm, danger: true,
+    }))) return
+    setArchiving(true)
+    try {
+      const next = await api.apps.archive(appId)
+      setDetail((cur) => ({ ...next, backfill: next.backfill ?? cur?.backfill }))
+      // 归档之后改不了草稿：没保存的修改也存不上，不再拦着离开
+      setDirty(false)
+      toast.ok(T.archiveDone(next.name))
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setArchiving(false)
+    }
+  }
+
   // 只在离开编辑器时问：切换分节是同一个草稿
   useLeaveGuard(dirty, () => confirmDialog({
     title: T.unsaved, body: T.leaveBody, confirmLabel: '放弃修改', cancelLabel: '返回保存', danger: true,
@@ -187,18 +210,20 @@ function EditApp({ appId }: { appId: string }) {
     blocks: (next) => !next?.pathname.startsWith(`/apps/${encodeURIComponent(appId)}/edit`),
   })
 
+  // 归档了的应用不能再改草稿（服务端同样拒绝）：快捷键和置灰的「保存草稿」一致，不发请求
+  const archived = detail?.status === 'archived'
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (isComposing(e) || !matchShortcut(e, 'Mod+S')) return
       e.preventDefault()
-      void save()
+      if (!archived) void save()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [save])
+  }, [save, archived])
 
   const ctx = useMemo<EditorState | null>(() => (detail && draft ? {
-    appId, detail, draft, catalog, dirty, selected,
+    appId, detail, draft, catalog, dirty, selected, archived,
     setDraft: (fn) => { setDraftState((cur) => (cur ? fn(cur) : cur)); setDirty(true) },
     setBindings: (fn) => { setBindingsState((cur) => fn(cur)); setDirty(true) },
     bindings, save,
@@ -210,7 +235,7 @@ function EditApp({ appId }: { appId: string }) {
     },
     focusPath,
     clearFocus: () => setFocusPath(null),
-  } : null), [appId, detail, draft, catalog, dirty, selected, bindings, save, navigate, focusPath])
+  } : null), [appId, detail, draft, catalog, dirty, selected, archived, bindings, save, navigate, focusPath])
 
   if (error) return <ErrorState error={error} onRetry={() => void load()} className="m-6" />
   // 没有 manage 的人取不到草稿（D-m）：手动打开编辑地址时说清楚，别一直停在骨架屏
@@ -237,12 +262,18 @@ function EditApp({ appId }: { appId: string }) {
                     title={T.assistantToggle} onClick={() => setAssistant((v) => !v)}>
               <Bot size={11} aria-hidden /> {T.assistant}
             </button>
-            <button type="button" className="btn btn-sm btn-primary" disabled={!dirty || saving} onClick={() => void save()}
-                    data-app-save="">
+            {!ctx.archived && (
+              <button type="button" className="btn btn-sm" disabled={archiving} onClick={() => void archive()} data-app-archive="">
+                {archiving ? <Spinner size={11} /> : <Archive size={11} aria-hidden />} {T.archive}
+              </button>
+            )}
+            <button type="button" className="btn btn-sm btn-primary" disabled={!dirty || saving || ctx.archived}
+                    title={ctx.archived ? T.archivedLocked : undefined} onClick={() => void save()} data-app-save="">
               {saving ? <Spinner size={11} /> : <Save size={11} aria-hidden />} {saving ? T.saving : T.save}
             </button>
           </>}
         />
+        {ctx.archived && <Notice tone="warn" className="mx-4 mt-3" attr={{ 'data-app-archived': '' }}>{T.archivedBanner}</Notice>}
         <div className="flex min-h-0 flex-1">
           <nav className="w-36 shrink-0 border-r p-2" aria-label={T.title}>
             {SECTIONS.map((s) => (

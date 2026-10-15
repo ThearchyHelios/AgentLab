@@ -400,3 +400,20 @@ async def test_only_an_admin_downgrades_a_governed_workflow(client, monkeypatch)
     plain = await workflow({1: "published", 2: None}, current=1, status="draft")
     ok = await client.post(f"/api/workflows/{plain}/publish", json={"level": "published", "version": 2})
     assert ok.status_code == 200, ok.text
+
+
+async def test_a_draft_equal_to_the_published_graph_says_so(client):
+    """撤回改动后保存出来的新版本号更大、内容却和发布版一样：服务端按 graph_hash 比好给标记（same_as_published），
+    页头照实写「与发布版内容相同」，不写「领先 N 版」。详情、列表、保存的回包同一个口径。"""
+    created = (await client.post("/api/workflows", json={"name": f"撤回-{uuid.uuid4().hex[:6]}", "graph": simple()})).json()
+    wf = created["id"]
+    assert created["same_as_published"] is False, "没发布过不算相同"
+    assert (await client.post(f"/api/workflows/{wf}/publish", json={"level": "published"})).status_code == 200
+    assert (await client.get(f"/api/workflows/{wf}")).json()["same_as_published"] is True
+    changed = (await client.patch(f"/api/workflows/{wf}", json={"graph": simple("改过")})).json()
+    assert changed["version"] == 2 and changed["same_as_published"] is False
+    # 视口不算内容（graph_hash 剔除 viewport）
+    back = (await client.patch(f"/api/workflows/{wf}", json={"graph": {**simple(), "viewport": {"x": 3, "y": 4, "zoom": 1}}})).json()
+    assert back["version"] == 3 and back["published_version"] == 1 and back["same_as_published"] is True
+    listed = next(w for w in (await client.get("/api/workflows")).json() if w["id"] == wf)
+    assert listed["same_as_published"] is True

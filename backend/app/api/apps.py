@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
 from app.api.deps import Principal, actor_of, current_principal
-from app.apps.access import app_role, at_least, grants_of
+from app.apps.access import ROLE_TEXT, app_role, at_least, grants_of
 from app.db.base import get_session
 from app.db.models import Run
 from app.db.models_apps import App, AppGrant, AppHook, AppVersion
@@ -32,7 +32,8 @@ APP_GONE = "应用不存在，可能已被删除"
 NO_ACCESS = "app_forbidden"
 NOT_PUBLISHED = "app_unpublished"
 PUBLISH_CONFLICT = "app_publish_conflict"
-_ROLE_TEXT = {"use": "使用", "observe": "查看全部实例", "manage": "管理"}
+#: 归档了的应用不再改草稿、不再发布（没有恢复的接口：归档后这个应用只留着给进行中的实例走完、给人查）
+APP_ARCHIVED = "app_archived"
 
 
 @router.get("/catalog")
@@ -65,8 +66,13 @@ async def _app(session: AsyncSession, app_id: str, principal: Principal, need: s
         # 没有任何授权的人不该知道这个应用在不在
         raise HTTPException(404, APP_GONE)
     if not at_least(role, need):
-        raise CodedHTTPException(403, f"需要这个应用的「{_ROLE_TEXT[need]}」权限", NO_ACCESS)
+        raise CodedHTTPException(403, f"需要这个应用的「{ROLE_TEXT[need]}」权限", NO_ACCESS)
     return app, role
+
+
+def _refuse_archived(app: App, what: str) -> None:
+    if app.status == "archived":
+        raise CodedHTTPException(409, f"「{app.name}」已归档，不能再{what}", APP_ARCHIVED)
 
 
 def _require_builder(principal: Principal) -> None:
@@ -248,6 +254,7 @@ async def update_app(app_id: str, payload: AppPatch, session: AsyncSession = Dep
     """改草稿：spec、岗位绑定、名称等。草稿随便改，发布时才过检查（形状不对的检查里报 app.format）。"""
     principal = _principal(x_actor)
     app, role = await _app(session, app_id, principal, "manage")
+    _refuse_archived(app, "修改")
     if payload.draft_bindings is not None and (problem := _bindings_problem(payload.draft_bindings)):
         raise HTTPException(422, problem)
     for key in ("name", "description", "icon"):
@@ -266,7 +273,8 @@ async def update_app(app_id: str, payload: AppPatch, session: AsyncSession = Dep
 @router.post("/{app_id}/archive")
 async def archive_app(app_id: str, session: AsyncSession = Depends(get_session),
                       x_actor: str | None = Header(default=None)) -> dict[str, Any]:
-    """归档：不再出现在应用列表里，入口拒绝发起；版本、实例、生效记录都留着。"""
+    """归档：不再出现在应用列表里，入口拒绝发起、入站钩子一律拒收（apps/entries.py、process/hooks.py），不再改草稿、
+    不再发布；进行中的实例照常走完，版本、实例、生效记录都留着。没有恢复的接口。"""
     from app.apps.audit import record
 
     principal = _principal(x_actor)
@@ -375,6 +383,7 @@ async def publish(app_id: str, payload: PublishIn, session: AsyncSession = Depen
 
     principal = _principal(x_actor)
     app, _ = await _app(session, app_id, principal, "manage")
+    _refuse_archived(app, "发布")
     previous = await _previous(session, app)
     draft = app.draft or {}
     issues = await lint_app(session, draft, app.draft_bindings or {}, previous=previous,
@@ -465,8 +474,14 @@ async def get_grants(app_id: str, session: AsyncSession = Depends(get_session),
 @router.put("/{app_id}/grants")
 async def put_grants(app_id: str, payload: GrantsIn, session: AsyncSession = Depends(get_session),
                      x_actor: str | None = Header(default=None)) -> dict[str, Any]:
-    """整份替换授权。授权不进应用版本（改了不用重新发布），写审计。"""
+    """整份替换授权。授权不进应用版本（改了不用重新发布），写审计。
+
+    给的人和组按名录核对（auth/directory.py，同选人控件、同应用检查）：账号密码登录时名录里没有的、任何登录方式下停用了
+    的拒收，说清是哪一档、哪个名字——界面上选人时已经拦着，这里拦旧客户端和直接调接口的。单点登录的人第一次登录后才进
+    名录，名录里还没有的照收（检查里提醒）；关登录不核对。"""
+    from app.api.deps import auth_mode
     from app.apps.audit import record
+    from app.auth.directory import load_directory, mismatch
     from app.db.models_apps import GRANT_ROLES
 
     app, _ = await _app(session, app_id, _principal(x_actor), "manage")
@@ -480,6 +495,12 @@ async def put_grants(app_id: str, payload: GrantsIn, session: AsyncSession = Dep
         key = (item.principal_kind, principal, item.role)
         if key not in wanted:
             wanted.append(key)
+    if (mode := auth_mode()) != "off":
+        known = await load_directory(session)
+        refused = [f"「{ROLE_TEXT[role]}」里的{m.text}" for kind, who, role in wanted
+                   if (m := mismatch(known, mode, kind, who)) is not None and m.blocking]
+        if refused:
+            raise HTTPException(422, f"{'；'.join(refused)}：授权只能给名录里在用的人和组，请移除或从候选中重新选择")
     before = [_grant_out(g) for g in await grants_of(session, app.id)]
     for g in await grants_of(session, app.id):
         await session.delete(g)

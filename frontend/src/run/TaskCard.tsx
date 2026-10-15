@@ -58,6 +58,8 @@ export interface TaskCardProps {
   send?: (body: TaskRespond) => Promise<{ task: Task; resolved: boolean }>
   /** 卡头写不写应用或工作流名。画布上工作流就是眼前这张，不用再说一遍 */
   showOwner?: boolean
+  /** 画不画会签进度。应用页上同一页另有会签组件时服务端说不画（signoffs_on_page），同一页上不写两遍 */
+  showSignoffs?: boolean
 }
 
 const KIND_ICON: Record<TaskKind, typeof Hand> = {
@@ -68,7 +70,7 @@ const KIND_ICON: Record<TaskKind, typeof Hand> = {
 /** 一天没人处理就用琥珀色写等了多久，同审批卡 */
 const STALE_MS = 24 * 3_600_000
 
-export function TaskCard({ task, onResolved, compact = false, send, showOwner = true }: TaskCardProps) {
+export function TaskCard({ task, onResolved, compact = false, send, showOwner = true, showSignoffs = true }: TaskCardProps) {
   const toast = useToast()
   const payload: Record<string, any> = task.payload ?? {}
   const kind = task.kind
@@ -148,7 +150,7 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
       <TaskMeta task={task} showOwner={showOwner} />
 
       {!pending && <Resolved task={task} />}
-      {(task.assignments.length > 1 || task.policy.kind !== 'any') && <Signoffs task={task} />}
+      {showSignoffs && (task.assignments.length > 1 || task.policy.kind !== 'any') && <Signoffs task={task} />}
 
       {(kind === 'approve' || kind === 'input' || kind === 'edit') && payload.kind === 'human_node' && runClass && (
         <ApprovalRunClass runClass={runClass} approve={kind === 'approve'} />
@@ -333,7 +335,7 @@ export function Due({ dueAt, now }: { dueAt: string | null; now: number }) {
 }
 
 /** 处理过的：谁、什么时候、结果（实例页上不是处理人的人看这一步的状态也用它） */
-export function Resolved({ task }: { task: Pick<Task, 'status' | 'outcome' | 'resolved_by' | 'resolved_at'> }) {
+export function Resolved({ task }: { task: Pick<Task, 'status' | 'outcome' | 'resolved_by' | 'resolved_at' | 'people'> }) {
   const decision = typeof task.outcome?.decision === 'string' ? TASK_TEXT.decision[task.outcome.decision] ?? task.outcome.decision : null
   const at = task.resolved_at ? formatDateTime(task.resolved_at) : ''
   return (
@@ -341,7 +343,9 @@ export function Resolved({ task }: { task: Pick<Task, 'status' | 'outcome' | 're
       <span className="chip">{TASK_STATUS_LABEL[task.status] ?? task.status}</span>
       {decision && <span>{TASK_TEXT.outcome}：{decision}</span>}
       {(task.resolved_by || at) && (
-        <span>{task.resolved_by ? TASK_TEXT.resolvedBy(task.resolved_by, at) : TASK_TEXT.resolvedAt(at)}</span>
+        <span title={usernameHint(task.resolved_by, task.people)}>
+          {task.resolved_by ? TASK_TEXT.resolvedBy(personName(task.resolved_by, task.people), at) : TASK_TEXT.resolvedAt(at)}
+        </span>
       )}
     </div>
   )
@@ -369,27 +373,51 @@ function progressOf(task: Pick<Task, 'progress' | 'policy' | 'assignments'>): Ta
 }
 
 /** 升级之后的规则：升级给谁、其中一人说了算；有人定了就写谁定了什么 */
-function escalationText(p: TaskProgress): string | null {
+function escalationText(p: TaskProgress, people?: Record<string, string> | null): string | null {
   const e = p.escalation
   if (!e) return null
-  if (e.decided && e.by) return TASK_TEXT.escalationDecided(e.by, TASK_TEXT.decision[e.decided] ?? e.decided)
-  const who = e.slot ? TASK_TEXT.slot(e.slot) : e.assignees.map((a) => a.name || TASK_TEXT.assignee.anyone).join('、')
+  if (e.decided && e.by) return TASK_TEXT.escalationDecided(personName(e.by, people), TASK_TEXT.decision[e.decided] ?? e.decided)
+  const who = e.slot ? TASK_TEXT.slot(e.slot)
+    : e.assignees.map((a) => (a.kind === 'user' ? personName(a.name, people) : a.name) || TASK_TEXT.assignee.anyone).join('、')
   return TASK_TEXT.escalationRule(who)
 }
 
-export function assigneeName(a: Pick<TaskAssignment, 'principal_kind' | 'principal' | 'responded_by'>): string {
+/**
+ * 人名：有显示名写显示名（服务端在待办上给 people：用户名 → 显示名），名录里没有的（关登录时自报的署名）照写原名。
+ * usernameHint 是悬停给的用户名：显示名和用户名一样时不给
+ */
+export function personName(username: string, people?: Record<string, string> | null): string {
+  return people?.[username] || username
+}
+
+export function usernameHint(username: string | null | undefined, people?: Record<string, string> | null): string | undefined {
+  return username && personName(username, people) !== username ? username : undefined
+}
+
+export function assigneeName(a: Pick<TaskAssignment, 'principal_kind' | 'principal' | 'responded_by'>,
+  people?: Record<string, string> | null): string {
   if (a.principal_kind === 'anyone') return TASK_TEXT.assignee.anyone
   if (a.principal_kind === 'hook') return TASK_TEXT.assignee.hook
-  if (a.principal_kind === 'group') return a.responded_by ? `${a.responded_by}（${TASK_TEXT.assignee.group(a.principal)}）` : TASK_TEXT.assignee.group(a.principal)
-  return a.principal
+  if (a.principal_kind === 'group') {
+    return a.responded_by ? `${personName(a.responded_by, people)}（${TASK_TEXT.assignee.group(a.principal)}）` : TASK_TEXT.assignee.group(a.principal)
+  }
+  return personName(a.principal, people)
+}
+
+/** 派给谁的悬停：写的是显示名时给用户名（组里回复的人同理） */
+export function assigneeHint(a: Pick<TaskAssignment, 'principal_kind' | 'principal' | 'responded_by'>,
+  people?: Record<string, string> | null): string | undefined {
+  if (a.principal_kind === 'user') return usernameHint(a.principal, people)
+  if (a.principal_kind === 'group') return usernameHint(a.responded_by, people)
+  return undefined
 }
 
 /** 会签进度的那一行（几人同意了、几人驳回、规则），升级了另写一行升级后的规则。不列名单：实例页上只看状态的人用它 */
-export function SignoffHead({ task }: { task: Pick<Task, 'progress' | 'policy' | 'assignments'> }) {
+export function SignoffHead({ task }: { task: Pick<Task, 'progress' | 'policy' | 'assignments' | 'people'> }) {
   const p = progressOf(task)
   const policy = task.policy.kind === 'all' ? TASK_TEXT.policy.all
     : task.policy.kind === 'quorum' ? TASK_TEXT.policy.quorum(task.policy.m) : TASK_TEXT.policy.any
-  const up = escalationText(p)
+  const up = escalationText(p, task.people)
   return (
     <>
       <div className="mb-1 flex flex-wrap items-center gap-x-2 text-2xs" data-signoff-head="">
@@ -435,7 +463,7 @@ export function Signoffs({ task }: { task: Task }) {
             <span aria-hidden style={{ color: agreed(a) ? 'var(--st-done)' : rejected(a) ? 'var(--err)' : 'var(--text-faint)' }}>
               {agreed(a) ? '✓' : rejected(a) ? '✕' : '○'}
             </span>
-            <span className="text-fg">{assigneeName(a)}</span>
+            <span className="text-fg" title={assigneeHint(a, task.people)} data-assignee="">{assigneeName(a, task.people)}</span>
             {escalated(a) && <span className="chip" style={{ color: 'var(--st-waiting)' }}>{TASK_TEXT.escalationTag}</span>}
             <span className="text-dim">
               {a.status === 'responded'

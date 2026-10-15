@@ -148,7 +148,16 @@ const TASK = {
   can_respond: true, outcome: null, resolved_by: null, resolved_at: null, created_at: ago(1800_000),
 }
 
-const INSTANCE = {
+/** 会签组件和待办表单绑同一条待办：页面解析给的数据一样，只有待办表单带 signoffs_on_page */
+function withSignoffsData(instance) {
+  const tree = instance.view.tree
+  const form = tree.find((n) => n.id === 'review')
+  const { signoffs_on_page: _, ...data } = form.data
+  tree.find((n) => n.id === 'signs').data = data
+  return instance
+}
+
+const INSTANCE = withSignoffsData({
   run_id: 'run_claim_1', title: '张三 的报销', entry_id: 'apply', status: 'interrupted', started_by: '张三',
   created_at: ago(1800_000), finished_at: null, pending_tasks: 1, tier: null,
   // 给人看的状态服务端说（apps/resolve.instance_state）：结果未知时是在等核实，不是「等待审批」
@@ -157,7 +166,7 @@ const INSTANCE = {
     format: 'agentlab.view/1',
     app: { id: 'app_claim', name: '报销审批', version: 2, level: 'published', needs_upgrade: false },
     page: { id: 'instance', title: '实例' }, pages: [{ id: 'home', title: '报销' }, { id: 'instance', title: '实例' }],
-    sources: { inst: { state: 'running', run_id: 'run_claim_1', stamp: null, message: '正在运行，完成后刷新页面' } },
+    sources: { inst: { state: 'running', run_id: 'run_claim_1', stamp: null, message: '等待核实写入结果，流程走完后自动显示' } },
     tree: [
       { id: 'inst_header', type: 'instance_header', props: {}, data: {
         state: 'ok', run_id: 'run_claim_1', title: '张三 的报销', status: 'interrupted', status_code: 'waiting',
@@ -169,9 +178,11 @@ const INSTANCE = {
           { node: 'finance', title: '财务审批', state: 'waiting', text: '等待审批', at: ago(1700_000) },
           { node: 'pay', title: '付款', state: 'unknown', text: '结果未知，等待核实', at: ago(600_000) },
         ] } },
-      // 发起人不是这条待办的处理人：服务端解析时判定（handler 为假），只给这一步的状态，界面不去取待办
+      // 发起人不是这条待办的处理人：服务端解析时判定（handler 为假），只给这一步的状态，界面不去取待办。同一页上另有绑
+      // 同一条待办的会签组件（signs）：服务端说一声（signoffs_on_page），待办表单不再画会签进度。人名服务端给显示名（people）
       { id: 'review', type: 'task_form', props: {}, bind: { task: 'review' }, data: {
-        state: 'ok', handler: false, task_ui: {},
+        state: 'ok', handler: false, task_ui: {}, signoffs_on_page: true,
+        people: { lisi: '李四', wangwu: '王五', zhaoliu: '赵六' },
         task: { id: 'task_other', run_id: 'run_claim_1', node_id: 'review', kind: 'approve', title: '复核', status: 'pending',
           due_at: new Date(Date.now() + 3600_000).toISOString(), policy: { kind: 'all' }, escalation_level: 1,
           created_at: ago(1700_000), instance_title: '张三 的报销', form: null },
@@ -186,6 +197,7 @@ const INSTANCE = {
         progress: { policy: 'all', voters: 2, need: 2, agreed: 1, rejected: 0,
           escalation: { slot: 'director', assignees: [{ kind: 'user', name: 'zhaoliu' }], decided: null, by: null } },
         my_response: null } },
+      { id: 'signs', type: 'signoffs', props: {}, bind: { task: 'review' }, data: null },
       { id: 'inst_tasks', type: 'task_list', props: { scope: 'instance' }, data: { scope: 'instance', items: [] } },
       { id: 'pay', type: 'action_status', props: { label: '付款' }, data: { state: 'ok', node: 'pay', records: [
         { id: 'act1', state: 'unknown', environment: 'prod', attempt: 1, payload_hash: '9c1e44ab',
@@ -194,7 +206,7 @@ const INSTANCE = {
     ],
     forms: {}, problems: [],
   },
-}
+})
 
 /**
  * 指标链照服务端的形状（api/evidence 的 _metric_chain）。销售额按位置取数据整形的结果（vars.q.rows[0][0]），整形节点不是
@@ -330,6 +342,10 @@ await section('应用页：印章、指标、出处、趋势、表格、未知�
   const stamp = page.locator('[data-stamp]').first()
   const stampText = await stamp.innerText()
   check('印章四项：截至、口径、出具档位、来源', ['截至', '口径', '出具档位', '来源'].every((k) => stampText.includes(k)), stampText.replace(/\n/g, ' '))
+  // 截至是服务端给的整句（自己带着「截至」）：完整、紧凑两种印章都只写一次，不写成「截至 截至 …」
+  const stampTexts = await page.locator('[data-stamp]').allInnerTexts()
+  check('印章里「截至」只出现一次（完整和紧凑两种）', stampTexts.length > 0 && stampTexts.every((t) => t.split('截至').length === 2),
+    stampTexts.map((t) => t.replace(/\s+/g, ' ').slice(0, 40)).join(' | '))
   check('印章写口径名和哈希前 8 位', stampText.includes('周销售 v7 · 3fa2c1d0') && stampText.includes('周销售口径 v3'))
   check('服务端标出的错位照写', (await stamp.locator('[data-stamp-note]').innerText()).includes('固定在 v7'))
   check('页面有两页：页签', (await page.getByRole('tab').count()) >= 2)
@@ -397,8 +413,8 @@ await section('应用页：印章、指标、出处、趋势、表格、未知�
 
 await section('应用页：视图生成中自动重取、需升级提示', async () => {
   const running = { ...HOME, app: { ...HOME.app, needs_upgrade: true },
-    sources: { wk: { state: 'running', run_id: RUN, stamp: null, message: '正在运行，完成后刷新页面' } },
-    tree: [{ id: 'stamp', type: 'stamp', props: {}, data: { view: 'wk', state: 'running', stamp: null, message: '正在运行，完成后刷新页面' } }] }
+    sources: { wk: { state: 'running', run_id: RUN, stamp: null, message: '正在运行，完成后自动刷新' } },
+    tree: [{ id: 'stamp', type: 'stamp', props: {}, data: { view: 'wk', state: 'running', stamp: null, message: '正在运行，完成后自动刷新' } }] }
   const state = { writes: [], home: running }
   const { page } = await open({ state })
   await page.goto(`${WEB}/apps/app_weekly`)
@@ -474,10 +490,17 @@ await section('实例页：状态、进度、待办卡、动作状态', async ()
   check('结果未知的那一步写「结果未知」，不写「完成」',
     (await page.locator('[data-timeline-step="unknown"]').innerText()).includes('结果未知'))
   const other = page.locator('[data-component="task_form"][data-task-handler="no"]')
-  check('不是处理人：只画这一步的状态（在等谁、会签进度、升级后的规则），不出红框',
+  check('不是处理人：只画这一步的状态（在等谁），不出红框',
     (await other.locator('[data-task-state="pending"]').count()) === 1 && (await other.locator('[role="alert"]').count()) === 0
-    && (await other.innerText()).includes('等待 wangwu、zhaoliu 处理') && (await other.innerText()).includes('1/2 已同意')
-    && (await other.innerText()).includes('已升级给岗位「director」'), (await other.innerText()).replace(/\n/g, ' '))
+    && (await other.innerText()).includes('等待 王五、赵六 处理'), (await other.innerText()).replace(/\n/g, ' '))
+  check('……等待名单写显示名，悬停给用户名', (await other.locator('[data-task-waiting-on]').getAttribute('title')) === 'wangwu、zhaoliu')
+  const signs = page.locator('[data-component="signoffs"]')
+  check('同一页上有会签组件：待办表单不再画会签进度，会签进度只画一遍', (await other.locator('[data-signoff-head]').count()) === 0
+    && (await signs.locator('[data-signoff-head]').count()) === 1 && (await signs.innerText()).includes('1/2 已同意')
+    && (await signs.innerText()).includes('已升级给岗位「director」'), (await signs.innerText()).replace(/\n/g, ' '))
+  const lisi = signs.locator('[data-assignee]').first()
+  check('……会签名单写显示名，悬停给用户名', (await lisi.innerText()) === '李四' && (await lisi.getAttribute('title')) === 'lisi'
+    && (await signs.innerText()).includes('赵六'), (await signs.innerText()).replace(/\n/g, ' '))
   check('……也不去取那条待办', !(state.taskReads ?? []).includes('/api/tasks/task_other'), JSON.stringify(state.taskReads))
   await page.locator('[data-component="task_list"] [data-task]').waitFor({ timeout: 5000 })
   check('本实例的待办就地处理（完整的待办卡）', (await page.locator('[data-component="task_list"] [data-task-approve]').count()) === 1)

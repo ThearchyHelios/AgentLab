@@ -3976,11 +3976,14 @@ await section('工具', async () => {
   const brokenProblem = '参数定义格式有误：参数 store 应写成 {"type": "string"} 这样的对象，不能直接写 "string"'
   const brokenTool = { id: 'broken_demo', name: 'broken_demo', description: '检查脚本的坏工具', category: '自定义 · http',
     source: 'custom', dangerous: true, runtime_approval: false, schema: { properties: { store: 'string' } }, problem: brokenProblem }
+  // 写外部系统的能力：服务端在工具项上给 write_rehearsal（和执行接口同一个判断），在工具库里执行只演练
+  const payTool = { id: 'pay_demo', name: 'pay_demo', description: '检查脚本的写入能力', category: '自定义 · http',
+    source: 'custom', dangerous: true, runtime_approval: true, write_rehearsal: true, schema: { properties: { amount: { type: 'number' } } } }
   const brokenRow = { id: 'check-manage-broken', name: 'broken_demo', kind: 'http', description: '检查脚本的坏工具',
     parameters: { properties: { store: 'string' } }, config: { method: 'GET', url: 'https://example.com/x' }, enabled: true, problem: brokenProblem }
   const { page, sent, natives, errors, close } = await open(danger ? `/tools/library/${danger.id}` : '/tools', {
     handlers: [
-      [/^GET \/tools$/, async (route) => json([...await (await route.fetch()).json(), brokenTool])(route)],
+      [/^GET \/tools$/, async (route) => json([...await (await route.fetch()).json(), brokenTool, payTool])(route)],
       [/^GET \/custom-tools$/, async (route) => json([...await (await route.fetch()).json(), brokenRow])(route)],
       [/^POST \/tools\/[^/]+\/run$/, (route, { body }) => {
         calls++
@@ -4030,6 +4033,20 @@ await section('工具', async () => {
     const note = await page.locator('[data-tool-note]').innerText().catch(() => '')
     check('参数名被纠正过：成功结果下面用 warn 写出来，提醒先改对再抄进工作流', note.includes('cuont') && note.includes('修正参数名称'), note)
     check('……结果和提醒落在看得见的地方（不用自己滚）', await inView(page.locator('[data-tool-note]')))
+  }
+  {
+    // 写入能力在这里只演练（执行不先确认、也不真的发出）：提示条不说「请求会实际发出」；别的外接工具照旧
+    await page.locator('nav[aria-label="工具列表"] button', { hasText: 'pay_demo' }).first().click()
+    await page.waitForTimeout(300)
+    const bar = page.locator('[data-tool-side-effect]')
+    const barText = await bar.innerText().catch(() => '')
+    check('写入能力：提示条写这里只演练、不真的发送，不说请求会实际发出', await bar.getAttribute('data-tool-side-effect') === 'rehearsal'
+      && barText.includes('这里只演练，不真的发送') && !barText.includes('实际发出') && !barText.includes('确认后才会执行'), barText)
+    await page.locator('nav[aria-label="工具列表"] button', { hasText: 'broken_demo' }).first().click()
+    await page.waitForTimeout(300)
+    const other = await bar.innerText().catch(() => '')
+    check('……不是写入能力的自定义工具照旧警示请求会实际发出', await bar.getAttribute('data-tool-side-effect') === 'send'
+      && other.includes('请求会实际发出'), other)
   }
   {
     const item = page.locator('nav[aria-label="工具列表"] button', { hasText: 'broken_demo' }).first()

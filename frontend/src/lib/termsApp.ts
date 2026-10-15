@@ -227,7 +227,7 @@ export const ACTION_TEXT = {
 
 /** 印章：截至 / 口径 / 出具档位 / 来源（§2.3） */
 export const STAMP_TEXT = {
-  asOf: '截至',
+  // 截至一项不另写标签：服务端给的整句（as_of_text）自己带着「截至」
   caliber: '口径',
   tier: '出具档位',
   from: '来源',
@@ -255,7 +255,8 @@ export const APP_TERM_TEXT = {
 /** 视图来源的状态 */
 export const VIEW_TEXT = {
   empty: '还没有可读的运行',
-  running: '正在生成，完成后自动刷新',
+  /** 服务端没给原话时的兜底，和服务端 apps/resolve.RUNNING_TEXT 同一句 */
+  running: '正在运行，完成后自动刷新',
   stale: '数据已过期，可点击刷新',
   error: '这部分数据无法读取',
   refresh: '刷新',

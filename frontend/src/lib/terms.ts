@@ -70,6 +70,19 @@ export const WORKFLOW_STATUS_LABEL: Record<'draft' | 'published' | 'governed', s
   governed: '受管',
 }
 
+/**
+ * 当前发布版的级别，叫法取 WORKFLOW_STATUS_LABEL[…]（「已发布」「受管」）：按服务端给的当前发布版级别（published_level）。
+ * 画布上改过之后 status 回到草稿，看 status 会把受管发布版写成「已发布」；老服务端不给级别时退回看 status
+ */
+export function publishedLevelOf(w: { status?: string | null; published_level?: string | null }): 'published' | 'governed' {
+  return (w.published_level ?? w.status) === 'governed' ? 'governed' : 'published'
+}
+
+/** 工具栏的版本标签：画布这一版和发布版内容相同（撤回改动后保存出来的）时不写「领先 N 版」 */
+export const VERSION_LABEL_TEXT = {
+  sameAsPublished: (v: number) => `与发布版 v${v} 内容相同`,
+}
+
 /** 发布弹窗里的选项说明：和工具栏 chip「已发布 v4」说法对得上 */
 export const WORKFLOW_STATUS_HINT: Record<'draft' | 'published' | 'governed', string> = {
   draft: '草稿 — 只能发起探索运行',
@@ -5299,7 +5312,8 @@ export const VERSION_USAGE_TEXT = {
   retired_ok: (v: number) => `已退役 v${v}`,
   makeApp: '做成应用',
   makeAppHint: '从这一版确定性地派生一个应用草稿，之后在应用编辑中调整',
-  published: (v: number) => `已发布 v${v}`,
+  /** 发布成功（弹窗标题、提示）：受管级发布写明受管，和工具栏「受管 v6」对得上 */
+  published: (v: number, level?: 'published' | 'governed' | null) => `已发布 v${v}${level === 'governed' ? ' · 受管' : ''}`,
   publishedNext: '可以从这一版做成应用：入口表单、待办、指标和报告按图确定性派生，之后再调整布局和文案',
 }
 
@@ -5339,6 +5353,21 @@ export const APP_EDITOR_TEXT = {
   open: '打开应用',
   assistant: '助手',
   assistantToggle: '显示或隐藏助手',
+  // ---- 归档（照服务端的实际行为写：api/apps.py 的 archive_app、apps/entries.py、process/hooks.py）。没有恢复的接口
+  archive: '归档',
+  archiveTitle: (name: string) => `归档「${name}」？`,
+  archiveConsequences: [
+    '应用列表里不再列出它，已打开的链接仍能查看',
+    '入口不再接受新实例；入站钩子一律拒收，在等外部系统回调的实例收不到回调',
+    '进行中的实例照常走完，待办照常处理；版本、实例、生效记录都保留',
+    '归档后不能再修改草稿、发布新版本，目前没有恢复的操作',
+  ],
+  /** 有未保存的修改时多写一条：归档之后存不上 */
+  archiveUnsaved: '草稿里还没保存的修改不会保存',
+  archiveConfirm: '归档应用',
+  archiveDone: (name: string) => `已归档「${name}」`,
+  archivedBanner: '这个应用已归档：应用列表里不再列出，入口和入站钩子不再接受新实例，进行中的实例照常走完。不能再修改草稿、发布新版本',
+  archivedLocked: '应用已归档，不能再修改草稿、发布新版本',
   // ---- 新建（向导的起点：现在只有「从已有的工作流开始」一种）
   startFromWorkflow: '从已有的工作流开始',
   newIntro: '从一个已发布的工作流版本确定性地派生应用：入口表单、待办、指标、报告和表格按图生成，之后再调整布局和文案。',
@@ -5636,6 +5665,8 @@ export const MASK_BOUNDARY_TEXT = {
  */
 export const TOOL_REHEARSAL_TEXT = {
   badge: '演练：写入能力不在这里真的发送',
+  /** 工具库详情区的提示条（写入能力）：执行不经确认、也不真的发出，不说「请求会实际发出」 */
+  library: '这里只演练，不真的发送：执行后交回将要发送的请求。对外写入只经「调用工具」节点发送：要确认、带幂等键、记入生效记录。',
   hint: '对外写入只经「调用工具」节点发送：要确认、带幂等键、记入生效记录。下面是将要发送的请求',
   hintArgs: '对外写入只经「调用工具」节点发送，这里没有执行。下面是这次的参数',
   request: '请求',

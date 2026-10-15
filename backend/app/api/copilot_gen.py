@@ -411,11 +411,12 @@ APP_REPAIR_PROMPT = (
 )
 REPAIR_LOOKS_PROMPT = "\n\n这一轮查看过的内容（和起草时看到的是同一份）：\n{text}"
 
-#: 应用检查里只有人能处理的问题：钉住哪个版本、升版怎么处置、岗位和核实人绑给谁、授权、通知渠道。不交回模型改，
-#: 照常列在交付的问题里
+#: 应用检查里只有人能处理的问题：钉住哪个版本、升版怎么处置、岗位和核实人绑给谁（绑的人在不在名录里）、授权、通知
+#: 渠道。不交回模型改，照常列在交付的问题里
 APP_HUMAN_ONLY = frozenset({
     "app.pin_unpublished", "app.pin_retired", "app.pin_hash", "app.upgrade_policy", "app.slot_unbound",
-    "app.reconciler_unbound", "app.acl_empty", "app.notify_channel_missing", "app.process_unsafe",
+    "app.slot_principal_unknown", "app.reconciler_unbound", "app.acl_empty", "app.acl_principal_unknown",
+    "app.notify_channel_missing", "app.process_unsafe",
     "app.view_source_empty", "subgraph_version_unpublished", "subgraph_version_retired",
 })
 

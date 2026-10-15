@@ -11,7 +11,7 @@ import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import { toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
 import { formatShortcut } from '../lib/keys'
-import { CATALOG_PATCH_TEXT, LOOK_TEXT, UPGRADE_TEXT } from '../lib/terms'
+import { CATALOG_PATCH_TEXT, LOOK_TEXT, UPGRADE_TEXT, publishedLevelOf } from '../lib/terms'
 import type { CopilotOp } from '../run/decode'
 import type { LookEvent } from '../typesApp'
 import { copilotContext, copilotLook, endingOf, looksOf, reduceTeam, settleTeam } from '../run/decode'
@@ -1290,8 +1290,9 @@ export const useStudio = create<StudioState>((set, get) => ({
     const seq = ++upgradeSeq
     const { nodes, edges, workflow } = get()
     const graph = toGraph(nodes, edges)
-    // 受管的图升级完还要按受管重新发布：新写出来的报告节点直接按受管门禁的要求配
-    const level = workflow?.status === 'governed' ? 'governed' : 'published'
+    // 受管的图升级完还要按受管重新发布：新写出来的报告节点直接按受管门禁的要求配。按当前发布版的级别认（画布上改过
+    // 之后 status 回到草稿，受管工作流仍是受管的）
+    const level = workflow ? publishedLevelOf(workflow) : 'published'
     set({ upgrade: { status: 'loading', assist, seq } })
     try {
       const raw = await api.copilot.upgradeEvidence({ graph, level, ...(assist ? { assist: true } : {}) }, { signal: ctl.signal })

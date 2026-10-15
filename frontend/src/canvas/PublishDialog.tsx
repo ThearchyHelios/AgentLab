@@ -14,6 +14,7 @@ import { Modal, Spinner, confirmDialog, toast, useRadioGroup } from '../componen
 import { humanizeError } from '../lib/errors'
 import {
   CATALOG_UI_TEXT as UT, PROVIDER_REF_TEXT, PUBLISH_FIX_TEXT as T, VERSION_USAGE_TEXT, WORKFLOW_STATUS_HINT, WORKFLOW_STATUS_LABEL,
+  publishedLevelOf,
 } from '../lib/terms'
 import { VersionUsageLine, useVersionUsage } from './versionUsage'
 import { newAppPath } from '../pages/apps/shared'
@@ -78,8 +79,8 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
   const downgrade = governedWf && level === 'published'
   // 还没选档时按「已发布」查：能选的只有这一档，问题先列出来
   const pf = usePreflight(workflow.id, level ?? 'published', { onRechecked: () => setGate(null) })
-  /** 发布成功：弹窗不立刻关，给「做成应用」的入口（A8）。关掉时才算完成（onDone） */
-  const [done, setDone] = useState<number | null>(null)
+  /** 发布成功：弹窗不立刻关，给「做成应用」的入口（A8）。关掉时才算完成（onDone）。记着发的是哪一档：受管级标题写明受管 */
+  const [done, setDone] = useState<{ version: number; level: PublishLevel } | null>(null)
   const navigate = useNavigate()
   // 当前已发布的那一版被哪些应用固定、有几条生效记录（L4）：发布新版之后它们仍然固定在旧版上，发布前先知道
   const usage = useVersionUsage(workflow.id, published ?? null)
@@ -117,14 +118,14 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
     try {
       const res = await api.workflows.publish(workflow.id, level)
       if (res.ok) {
-        toast.ok(`已发布 v${res.version}${level === 'governed' ? ' · 受管' : ''}${actor ? ` · ${actor}` : ''}`)
+        toast.ok(`${VERSION_USAGE_TEXT.published(res.version ?? workflow.version, level)}${actor ? ` · ${actor}` : ''}`)
         const fresh = await api.workflows.get(workflow.id)
         // 发布不动图、不升版本，只换状态和发布人：换掉工作流的元信息就够了。走 load 的话
         // 撤销栈、助手的轮次、运行态全被清空，镜头还要重新取景——发布一下什么都没了。
         // 版本对不上（这期间别处又存过）才整张重载，画布这时没有未保存的改动（有就发不了）
         if (fresh.version === useStudio.getState().workflow?.version) useStudio.setState({ workflow: fresh })
         else load(fresh)
-        setDone(res.version ?? fresh.published_version ?? workflow.version)
+        setDone({ version: res.version ?? fresh.published_version ?? workflow.version, level })
       } else {
         setGate(normalizeCheck({ issues: res.issues }, level).issues)
         toast.warn('发布未通过门禁检查。请查看下方问题清单，点击条目可定位到对应节点')
@@ -145,18 +146,18 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
 
   if (done != null) {
     return (
-      <Modal open onClose={onDone} title={VERSION_USAGE_TEXT.published(done)} width={480}
+      <Modal open onClose={onDone} title={VERSION_USAGE_TEXT.published(done.version, done.level)} width={480}
              footer={<>
                <button className="btn" onClick={onDone} data-autofocus="">完成</button>
                <button className="btn btn-primary" data-publish-make-app=""
                        onClick={() => {
                          onDone()
-                         navigate(newAppPath({ workflow: workflow.id, version: done }))
+                         navigate(newAppPath({ workflow: workflow.id, version: done.version }))
                        }}>
                  <LayoutGrid size={12} aria-hidden /> {VERSION_USAGE_TEXT.makeApp}
                </button>
              </>}>
-        <div className="flex items-start gap-2 text-xs leading-relaxed" data-publish-done={done}>
+        <div className="flex items-start gap-2 text-xs leading-relaxed" data-publish-done={done.version} data-publish-done-level={done.level}>
           <CheckCircle2 size={14} className="mt-0.5 shrink-0" style={{ color: 'var(--ok)' }} aria-hidden />
           <span>{VERSION_USAGE_TEXT.publishedNext}</span>
         </div>
@@ -911,7 +912,8 @@ const LEVELS = ['published', 'governed'] as const
  */
 export function PublishPreflightPane({ onLocate }: { onLocate: (issue: ValidationIssue) => void }) {
   const workflow = useStudio((s) => s.workflow)
-  const [level, setLevel] = useState<PublishLevel>(workflow?.status === 'governed' ? 'governed' : 'published')
+  // 默认按当前发布版的级别查：画布上改过之后 status 回到草稿，受管工作流仍按受管查
+  const [level, setLevel] = useState<PublishLevel>(workflow ? publishedLevelOf(workflow) : 'published')
   // 修复正在出预览、存草稿、重查时不换档（和发布弹窗同一条）：方向键也换不了
   const busy = useRef(false)
   const pick = useCallback((l: PublishLevel) => { if (!busy.current) setLevel(l) }, [])

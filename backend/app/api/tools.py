@@ -14,7 +14,7 @@ from app.capabilities import secrets as vault
 from app.capabilities.endpoints import bound_endpoint_ref, find_endpoint
 from app.core.errors import explain, raw
 from app.db.base import get_session
-from app.db.models import CustomTool, Endpoint, McpServer
+from app.db.models import Capability, CustomTool, Endpoint, McpServer
 from app.tools.custom import ToolFailure, held_write, http_failure, schema_problem, trial
 from app.tools.mcp_manager import mcp_manager
 from app.tools.registry import (
@@ -72,6 +72,15 @@ async def list_tools(session: AsyncSession = Depends(get_session)) -> list[dict[
                    for t in await mcp_manager.list_tools())
     except Exception:  # noqa: BLE001 - MCP 连不上不该让整个工具列表挂掉
         pass
+    # 在工具库里执行是不是只演练（写外部系统的能力，和执行接口 _held 同一个判断）：详情区的提示条照这个说「这里只演练，
+    # 不真的发送」，不说「请求会实际发出」
+    customs = {row.name: row for row in (await session.execute(select(CustomTool))).scalars()}
+    # 能力登记一次读进会话：_held 逐个 session.get，登记里有的直接从会话里取，不再一个工具查一次库（会话按弱引用记着
+    # 读过的行，列表留到循环结束）
+    _caps = (await session.execute(select(Capability))).scalars().all()
+    for item in out:
+        custom = customs.get(item["id"]) if item["source"] == "custom" else None
+        item["write_rehearsal"] = await _held(item["id"], custom, session)
     return out
 
 

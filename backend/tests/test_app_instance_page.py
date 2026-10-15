@@ -5,9 +5,13 @@
   不是的只给这一步的状态（派给了谁、会签进度、时限），不让界面去取；
 - 会签进度把登录核实过的审批人写成「自报署名」、没有处理时间：页面解析给的派给谁要带上这两项；
 - 同意过的人再打开写「没有派给你」：待办上带这个人的回复，写「你已处理」；
-- 走了「已退回」分支的实例写「已完成」：实例的状态说流程走到了哪个成果节点；
+- 走了「已退回」分支的实例写「已完成」：实例的状态说流程走到了哪个成果节点；走到的是从人工节点「驳回」出口一路走到的
+  成果节点（否定的结局）时不画成成功的绿勾，时间线上「已驳回」那一步同样；
 - 升级之后写「0/3 已同意」，其实总监一人同意就通过：会签人数不算升级加派的那一份，升级后的规则单列；
-- 同一个人两笔报销，待办列表里标题一样分不开：待办带上实例标题和开出的时间。
+- 同一个人两笔报销，待办列表里标题一样分不开：待办带上实例标题和开出的时间；
+- 停着等审批时印章那一块写「正在运行，完成后刷新页面」，和页头的「等待审批」「自动刷新」对不上：按在等的那一步说；
+- 「会签进度 0/2」画了两遍（待办表单一遍、会签组件一遍）：同一页上有绑同一条待办的会签组件时，服务端告诉待办表单不画；
+- 等待名单、会签名单写的是用户名：服务端给显示名（people），界面写显示名、悬停给用户名。
 """
 from __future__ import annotations
 
@@ -49,11 +53,13 @@ def expense() -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-SPEC = {"format": "agentlab.app/1", "name": "报销", "pages": [{"id": "instance", "title": "实例", "body": [
-    {"id": "hdr", "type": "instance_header"}, {"id": "tl", "type": "instance_timeline"},
-    {"id": "form", "type": "task_form", "bind": {"task": "review"}},
-    {"id": "signs", "type": "signoffs", "bind": {"task": "review"}},
-    {"id": "mine", "type": "task_list", "props": {"scope": "mine"}}]}]}
+SPEC = {"format": "agentlab.app/1", "name": "报销", "views": {"inst": {"source": {"kind": "instance"}}},
+        "pages": [{"id": "instance", "title": "实例", "body": [
+            {"id": "hdr", "type": "instance_header"}, {"id": "tl", "type": "instance_timeline"},
+            {"id": "form", "type": "task_form", "bind": {"task": "review"}},
+            {"id": "signs", "type": "signoffs", "bind": {"task": "review"}},
+            {"id": "mine", "type": "task_list", "props": {"scope": "mine"}},
+            {"id": "st", "type": "stamp", "bind": {"view": "inst"}}]}]}
 
 
 def user(name: str) -> Principal:
@@ -76,7 +82,7 @@ async def _setup() -> tuple[str, str, str, str]:
     u = uuid.uuid4().hex[:6]
     a, b, boss, group = f"zhang{u}", f"wang{u}", f"zhao{u}", f"finance{u}"
     async with SessionLocal() as session:
-        people = [User(username=n, role="user") for n in (a, b)]
+        people = [User(username=n, role="user", display_name=f"财务{n[:1]}") for n in (a, b)]
         session.add_all(people)
         g = Group(name=group)
         session.add(g)
@@ -137,6 +143,14 @@ async def test_the_initiator_sees_the_step_not_a_missing_task():
     hdr = view["hdr"]
     assert (hdr["status_code"], hdr["status_text"]) == ("waiting", "等待审批")
     assert next(s for s in view["tl"]["steps"] if s["node"] == "review")["text"] == "等待审批"
+    # 停着等审批：印章那一块按在等的那一步说，不写「正在运行，完成后刷新页面」（页头写着等待审批、自动刷新）
+    assert view["st"]["state"] == "running" and view["st"]["message"] == "等待审批，流程走完后自动显示"
+    # 同一页上有绑同一条待办的会签组件：待办表单不再画会签进度，会签组件照画
+    assert form["signoffs_on_page"] is True and "signoffs_on_page" not in view["signs"]
+    # 等待名单写显示名：服务端给用户名 → 显示名，界面悬停给用户名
+    assert form["people"] == {a: "财务z", b: "财务w"} and view["signs"]["people"] == form["people"]
+    detail = await tasks.detail(task.id, user(a))
+    assert detail["people"] == {a: "财务z", b: "财务w"}, "待办卡（待办服务）同一个口径"
 
 
 async def test_signoffs_say_who_verified_and_when_and_the_voter_sees_their_own_answer():
@@ -176,9 +190,12 @@ async def test_the_instance_says_which_outcome_it_reached():
     await tasks.respond((await _task(back)).id, user(b), decision="reject", note="票据不全")
     await _wait(back, ("succeeded",))
     view = await _page(app_id, back, user("qianqi"))
-    # 走了退回分支：运行是「已完成」，流程的结论是「已退回」
-    assert (view["hdr"]["status_code"], view["hdr"]["status_text"]) == ("succeeded", "已退回")
-    assert next(s for s in view["tl"]["steps"] if s["node"] == "review")["text"] == "已驳回"
+    # 走了退回分支：运行是「已完成」，流程的结论是「已退回」。这是否定的结局（从「驳回」出口走到的成果节点），状态
+    # 标记同「未确认（被驳回）」，不画成成功；时间线上驳回的那一步同样
+    assert (view["hdr"]["status_code"], view["hdr"]["status_text"]) == ("cancelled", "已退回")
+    assert view["tl"]["status_code"] == "cancelled"
+    review = next(s for s in view["tl"]["steps"] if s["node"] == "review")
+    assert (review["state"], review["text"]) == ("rejected", "已驳回")
     # 判定之后没回复的都撤回了：会签人数按判定那一刻的算，不缩成 1
     assert view["signs"]["progress"] == {"policy": "all", "voters": 2, "need": 2, "agreed": 0, "rejected": 1}
     from app.apps.resolve import list_instances
@@ -186,6 +203,38 @@ async def test_the_instance_says_which_outcome_it_reached():
     async with SessionLocal() as session:
         rows = {r["run_id"]: r for r in await list_instances(session, app_id, mine="qianqi")}
     assert (rows[back]["status_text"], rows[passed]["status_text"]) == ("已退回", "已通过")
+    assert (rows[back]["status_code"], rows[passed]["status_code"]) == ("cancelled", "succeeded")
+
+
+def test_a_negative_outcome_is_read_from_the_graph_and_this_runs_decision():
+    """否定的结局按图认（人工节点「驳回」出口一路走到的成果节点，中间不经过别的人工节点），再看这次运行里那个人工节点
+    是不是真的驳回了：两条路汇到同一个成果节点时，批准走过来的不算否定。不按成果节点的标题猜。"""
+    from types import SimpleNamespace
+
+    from app.apps.resolve import _Trail, instance_state, rejected_outputs
+
+    graph = {"nodes": [node("start", "input", "发起"), node("review", "human", "财务会签", mode="approve"),
+                       node("pay", "tool", "付款"), node("note", "tool", "记一笔"),
+                       node("done", "output", "办结"), node("back", "output", "打回重填"),
+                       node("again", "human", "复核", mode="approve"), node("ok", "output", "复核通过")],
+             "edges": [{"source": "start", "target": "review"},
+                       {"source": "review", "target": "pay", "sourceHandle": "approved"},
+                       {"source": "review", "target": "note", "sourceHandle": "rejected"},
+                       {"source": "pay", "target": "done"}, {"source": "note", "target": "done"},
+                       {"source": "note", "target": "back"},
+                       {"source": "review", "target": "again", "sourceHandle": "rejected"},
+                       {"source": "again", "target": "ok", "sourceHandle": "approved"}]}
+    # 「复核通过」在另一个人工节点之后：结局由复核的人说了算，不算 review 驳回的结局
+    assert rejected_outputs(graph) == {"done": {"review"}, "back": {"review"}}
+
+    def state(decision, reached):
+        task = SimpleNamespace(node_id="review", kind="approve", status="resolved", outcome={"decision": decision})
+        trail = _Trail(tasks=[task], events=[("node.finished", reached)])
+        return instance_state(SimpleNamespace(status="succeeded", graph=graph), trail)
+
+    assert state("reject", "back") == {"code": "cancelled", "text": "打回重填"}
+    assert state("expired_reject", "done") == {"code": "cancelled", "text": "办结"}
+    assert state("approve", "done") == {"code": "succeeded", "text": "办结"}, "批准走过来的同一个成果节点不算否定"
 
 
 async def test_outputs_reached_in_parallel_are_not_one_outcome():

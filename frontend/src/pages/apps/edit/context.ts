@@ -7,6 +7,8 @@ export interface EditorState {
   appId: string
   /** 应用详情（manage）：带着草稿、岗位绑定和能按新口径补算的视图 */
   detail: AppDetail
+  /** 应用已归档（服务端的 status）：不能再改草稿、发布（服务端同样拒绝），保存和发布置灰 */
+  archived: boolean
   draft: AppSpec
   /** 改草稿：传函数拿到最新的那一份（助手的操作和人的编辑可能挨着到） */
   setDraft: (fn: (spec: AppSpec) => AppSpec) => void

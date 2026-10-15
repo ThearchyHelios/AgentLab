@@ -22,6 +22,7 @@ from typing import Any
 from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.directory import display_names
 from app.core.events import EventType
 from app.db.base import SessionLocal, utcnow
 from app.db.models import (
@@ -909,6 +910,7 @@ async def _describe(session: AsyncSession, tasks: list[Task], principal: Any) ->
         .where(Run.id.in_({t.run_id for t in tasks})))).all()}
     apps = dict((await session.execute(select(App.id, App.name).where(
         App.id.in_({t.app_id for t in tasks if t.app_id})))).all())
+    names = await display_names(session, [u for t in tasks for u in people_of(t, assignments.get(t.id, []))])
     out = []
     for task in tasks:
         rows = assignments.get(task.id, [])
@@ -936,8 +938,16 @@ async def _describe(session: AsyncSession, tasks: list[Task], principal: Any) ->
             "my_response": my_response(rows, principal),
             "outcome": task.outcome, "resolved_by": task.resolved_by, "resolved_at": _iso(task.resolved_at),
             "created_at": _iso(task.created_at),
+            # 这条待办上出现的人的显示名（派给谁、谁回复、谁处理、升级给谁）：界面写显示名，悬停给用户名
+            "people": {u: names[u] for u in people_of(task, rows) if u in names},
         })
     return out
+
+
+def people_of(task: Task, rows: list[TaskAssignment]) -> set[str]:
+    """待办上按用户名出现的人：派给的人、回复的人、处理的人。"""
+    return ({a.principal for a in rows if a.principal_kind == "user"} | {a.responded_by for a in rows if a.responded_by}
+            | ({task.resolved_by} if task.resolved_by else set()))
 
 
 def visible(item: dict[str, Any], principal: Any) -> bool:

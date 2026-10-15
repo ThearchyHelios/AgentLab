@@ -140,6 +140,22 @@ async def test_tool_library_rehearses_anything_governed_as_a_write(world):
     assert out.json()["rehearsal"] is True and out.json()["result"]["args"] == {"q": "x"}
 
 
+async def test_tool_list_says_which_tools_only_rehearse(world):
+    """工具列表上每个工具带 write_rehearsal（和执行接口同一个判断）：详情区的提示条照它说「这里只演练，不真的发送」，
+    不说「请求会实际发出」。绑定端点的 POST 是写入；GET、Python 工具、没治理成写入的内置工具不是。"""
+    c = auth_env.client()
+    tools = {t["id"]: t for t in (await c.get("/api/tools")).json()}
+    assert tools["erp_pay"]["write_rehearsal"] is True
+    assert tools["erp_orders"]["write_rehearsal"] is False and tools["calc_py"]["write_rehearsal"] is False
+    assert tools["file_write"]["write_rehearsal"] is False, "写工作目录不是对外写入，照旧确认后真的执行"
+    r = await c.put("/api/capabilities/http_request/governance", json={"version": 1, "effect": "write"})
+    assert r.status_code == 200, r.text
+    tools = {t["id"]: t for t in (await c.get("/api/tools")).json()}
+    assert tools["http_request"]["write_rehearsal"] is True, "治理成写入的内置工具同样只演练"
+    run = await c.post("/api/tools/http_request/run", json={"args": {"url": "https://example.com"}})
+    assert run.status_code == 200 and run.json()["rehearsal"] is True, "列表上的标记和执行接口同一个判断"
+
+
 async def test_platform_query_is_by_identity_not_by_shape(world):
     c = auth_env.client()
     tabular = {"rows": "/items", "columns": {"单号": "/id"}}

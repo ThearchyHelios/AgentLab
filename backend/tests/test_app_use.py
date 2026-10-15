@@ -181,6 +181,27 @@ async def test_entries_validate_map_and_title(client):
     assert home["forms"]["apply"]["properties"]["amount"]["title"] == "金额（元）"
 
 
+async def test_an_archived_app_keeps_its_instances_but_takes_no_new_ones(client):
+    """归档（编辑器里的「归档」照这里写后果）：应用列表不再列出，入口不再发起新实例；进行中、已有的实例照常能看；
+    不再改草稿、不再发布（409 app_archived）；没有恢复的接口。"""
+    wf, hash_ = await workflow(EXPENSE)
+    app_id = await published_app(client, expense_spec(wf, hash_), name=f"归档-{uuid.uuid4().hex[:6]}")
+    res = await client.post(f"/api/apps/{app_id}/entries/apply", json={"values": {"amount": 1}}, headers=actor("张三"))
+    run_id = res.json()["run_id"]
+    archived = (await client.post(f"/api/apps/{app_id}/archive")).json()
+    assert archived["status"] == "archived"
+    assert app_id not in [a["id"] for a in (await client.get("/api/apps")).json()["items"]]
+    assert app_id in [a["id"] for a in (await client.get("/api/apps", params={"include_archived": True})).json()["items"]]
+    refused = await client.post(f"/api/apps/{app_id}/entries/apply", json={"values": {"amount": 1}})
+    assert refused.status_code == 404 and "已归档" in refused.json()["detail"]
+    assert (await client.get(f"/api/apps/{app_id}/instances/{run_id}")).status_code == 200, "已有的实例照常能看"
+    for res in (await client.patch(f"/api/apps/{app_id}", json={"name": "改名"}),
+                await client.post(f"/api/apps/{app_id}/publish", json={})):
+        assert res.status_code == 409 and res.json()["code"] == "app_archived", res.text
+    assert "不能再发布" in (await client.post(f"/api/apps/{app_id}/publish", json={})).json()["detail"]
+    assert (await client.get(f"/api/apps/{app_id}")).json()["status"] == "archived"
+
+
 async def test_an_app_on_a_retired_version_refuses_new_instances(client):
     wf, hash_ = await workflow(EXPENSE, versions=(1, 2), current=2)
     app_id = await published_app(client, expense_spec(wf, hash_))

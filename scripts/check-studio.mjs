@@ -135,6 +135,7 @@ const wf = (id, extra) => ({
   id, name: extra.name, description: extra.description ?? '检查脚本伪造的工作流', graph: extra.graph ?? GRAPH,
   tags: extra.tags ?? [], version: extra.version ?? 3, is_template: !!extra.is_template,
   status: extra.status ?? 'draft', published_version: extra.published_version ?? null,
+  published_level: extra.published_level ?? null, same_as_published: !!extra.same_as_published,
   published_by: extra.published_by ?? null, run_count: 0,
   created_at: '2026-09-20T02:00:00Z', updated_at: '2026-09-26T02:00:00Z',
 })
@@ -2976,6 +2977,52 @@ await section('应用平台：人工节点的流程配置、入口字段的类�
     await ctx.close()
   } finally {
     delete FAKES['st-proc']
+  }
+})
+
+await section('受管工作流在画布上改过之后：页头、版本历史、选择器照当前发布版的级别写「受管」；和发布版内容相同时不写领先', async () => {
+  // 画布上改过之后 status 回到草稿，当前发布版仍是受管级（published_level）。st-govs：撤回改动后保存出来的 v8，
+  // 服务端按图哈希比出和 v6 相同（same_as_published）；st-gova：真的改过、领先 2 版
+  FAKES['st-govs'] = wf('st-govs', { name: '__studio_check_gov_same__', version: 8, published_version: 6, published_level: 'governed', same_as_published: true })
+  FAKES['st-gova'] = wf('st-gova', { name: '__studio_check_gov_ahead__', version: 8, published_version: 6, published_level: 'governed' })
+  const versions = [8, 7, 6, 5].map((n) => ({ id: `gv${n}`, version: n, note: '', created_at: '2026-10-15T02:00:00Z',
+    published: n === 6, level: n === 6 ? 'governed' : n === 5 ? 'published' : null }))
+  const before = (page) => page.route(/\/api\/workflows\/st-gov[sa]\/versions$/, (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(versions) }))
+  try {
+    const same = await open({ path: '/studio/st-govs', before })
+    const label = (p) => p.locator('[data-version-label]').innerText().then((t) => t.replace(/\s+/g, ' '), () => '')
+    const sameText = await label(same.page)
+    check('内容和发布版相同：写「与发布版 v6 内容相同」，不写领先', sameText.includes('草稿 v8') && sameText.includes('与发布版 v6 内容相同')
+      && !sameText.includes('领先'), sameText)
+    check('……发布版写「受管 v6」，不写「已发布」', sameText.includes('受管 v6') && !sameText.includes('已发布'), sameText)
+    await blur(same.page)
+    await same.page.keyboard.press('Alt+KeyH')
+    const v6 = same.page.locator('ol[aria-label="版本"] > li').nth(2)
+    await v6.waitFor({ timeout: 3000 }).catch(() => {})
+    const v6Text = await v6.innerText().catch(() => '')
+    check('版本历史：当前发布版按这一版自己的级别写「受管」', await v6.locator('[data-version-published="governed"]').count() === 1
+      && v6Text.includes('受管') && !v6Text.includes('已发布'), v6Text.replace(/\s+/g, ' '))
+    check('没有运行时报错', same.errors.length === 0, same.errors.slice(0, 2).join(' | '))
+    await same.ctx.close()
+
+    const ahead = await open({ path: '/studio/st-gova', before })
+    const aheadText = await label(ahead.page)
+    check('真的改过：照旧写领先 2 版，发布版写「受管 v6」', aheadText.includes('领先 2 版') && aheadText.includes('受管 v6')
+      && !aheadText.includes('内容相同') && !aheadText.includes('已发布'), aheadText)
+    await ahead.page.locator('button[title^="切换、新建"]').click()
+    await ahead.page.waitForTimeout(300)
+    await ahead.page.keyboard.type('__studio_check_gov_ahead__')
+    await ahead.page.waitForTimeout(200)
+    const row = ahead.page.locator('li[role="option"]', { has: ahead.page.locator('span.truncate', { hasText: /^__studio_check_gov_ahead__$/ }) })
+    const chips = await row.locator('.chip').allInnerTexts()
+    check('选择器：草稿之外写「受管 v6」', chips.includes('草稿') && chips.some((t) => t.includes('受管 v6')) && !chips.some((t) => t.includes('已发布')),
+      chips.join(' | '))
+    await ahead.page.keyboard.press('Escape')
+    await ahead.ctx.close()
+  } finally {
+    delete FAKES['st-govs']
+    delete FAKES['st-gova']
   }
 })
 

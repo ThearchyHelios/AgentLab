@@ -147,7 +147,7 @@ export function CheckSection() {
 }
 
 export function PublishSection({ onPublished }: { onPublished: () => void }) {
-  const { appId, dirty, save, goto, draft } = useEditor()
+  const { appId, dirty, save, goto, draft, archived } = useEditor()
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const [blocked, setBlocked] = useState<LintIssue[] | null>(null)
@@ -194,8 +194,9 @@ export function PublishSection({ onPublished }: { onPublished: () => void }) {
           <Field label={T.publishNote} className="min-w-0 flex-1">
             {(p) => <input {...p} className="field" value={note} onChange={(e) => setNote(e.target.value)} />}
           </Field>
-          <button type="button" className="btn btn-primary" disabled={busy || !draft.pins.length} onClick={() => void publish()}
-                  data-app-publish-submit="">
+          {/* 归档了的应用不再发布（服务端同样拒绝，app_archived） */}
+          <button type="button" className="btn btn-primary" disabled={busy || !draft.pins.length || archived}
+                  title={archived ? T.archivedLocked : undefined} onClick={() => void publish()} data-app-publish-submit="">
             {busy ? <Spinner size={11} /> : <ShieldCheck size={11} aria-hidden />} {busy ? T.publishing : T.publish}
           </button>
         </div>
