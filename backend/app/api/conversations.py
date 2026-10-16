@@ -118,7 +118,7 @@ class ConversationOut(BaseModel):
     turn_count: int = 0
     #: 列表里给个副标题，让人一眼认出是哪次聊天
     last_question: str = ""
-    #: 最后一轮停在哪：running | waiting | error | cancelled | suspended | done，
+    #: 最后一轮停在哪：running | waiting | error | cancelled | rejected | suspended | done，
     #: 没有轮次时为 None。见 last_status()
     last_status: str | None = None
     #: 最后一轮的运行。建图阶段就断了的没有
@@ -173,18 +173,24 @@ BUILD_STALE = timedelta(minutes=15)
 
 
 def last_status(
-    turn: Any, run_status: str | None, pending: bool, now: datetime | None = None,
+    turn: Any, run_status: str | None, pending: bool, now: datetime | None = None, end_reason: str | None = None,
 ) -> str:
     """一轮停在哪。轮次状态只有 running / done / error 三种，细分要看运行和元数据。
 
     轮次状态是前端写的：页面关掉、服务重启时它停在 running，这时要以运行的状态为准；
     运行也没有的，是断在了建图阶段。已经收尾的轮次以轮次自己为准——它写下的就是
     用户看到的结局（取消、服务重启挂起在 error 里分开记）。
+
+    被审批人驳回结束的（运行 cancelled + end_reason=rejected，05-已知遗留 (a)）单独记 rejected，不和手动停止混成
+    cancelled：前端落库时 meta 里记着 rejected（outcome 照旧是 cancelled），页面关掉没落库的看运行的 end_reason。
     """
-    outcome = (turn_meta(turn) or {}).get("outcome")
+    meta = turn_meta(turn) or {}
+    outcome = meta.get("outcome")
     if turn.status == "done":
         return "done"
     if turn.status == "error":
+        if outcome == "cancelled" and meta.get("rejected"):
+            return "rejected"
         if outcome == "cancelled" or (turn.error or "").strip() == "已取消":
             return "cancelled"
         if outcome == "suspended":
@@ -192,7 +198,7 @@ def last_status(
             live = _from_run(run_status, pending)
             return live if live in ("running", "waiting") else "suspended"
         return "error"
-    live = _from_run(run_status, pending)
+    live = _from_run(run_status, pending, end_reason)
     if live:
         return live
     updated = turn.updated_at
@@ -202,7 +208,9 @@ def last_status(
     return "error" if stale else "running"
 
 
-def _from_run(run_status: str | None, pending: bool) -> str | None:
+def _from_run(run_status: str | None, pending: bool, end_reason: str | None = None) -> str | None:
+    if run_status == "cancelled" and end_reason == "rejected":
+        return "rejected"
     return {
         "queued": "running", "running": "running",
         "interrupted": "waiting" if pending else "suspended",
@@ -236,11 +244,14 @@ async def _statuses(
     run_of = {cid: turn_run_id(t) for cid, t in turns.items()}
     run_ids = {r for r in run_of.values() if r}
     runs: dict[str, str] = {}
+    ended: dict[str, str | None] = {}
     waiting: set[str] = set()
     if run_ids:
-        runs = dict((await session.execute(
-            select(Run.id, Run.status).where(Run.id.in_(run_ids))
-        )).all())
+        rows = (await session.execute(
+            select(Run.id, Run.status, Run.end_reason).where(Run.id.in_(run_ids))
+        )).all()
+        runs = {r: st for r, st, _ in rows}
+        ended = {r: reason for r, _, reason in rows}
         stopped = [r for r, st in runs.items() if st == "interrupted"]
         if stopped:
             waiting = set((await session.execute(
@@ -251,7 +262,8 @@ async def _statuses(
     out: dict[str, tuple[str, str | None]] = {}
     for cid, turn in turns.items():
         run_id = run_of[cid] if run_of[cid] in runs else None
-        out[cid] = (last_status(turn, runs.get(run_id or ""), run_id in waiting, now),
+        out[cid] = (last_status(turn, runs.get(run_id or ""), run_id in waiting, now,
+                                end_reason=ended.get(run_id or "")),
                     run_id)
     return out
 

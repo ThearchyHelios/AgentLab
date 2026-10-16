@@ -1584,10 +1584,10 @@ export interface Conversation {
   /** 列表里的副标题，让人一眼认出是哪次聊天 */
   last_question: string
   /**
-   * 最后一轮停在哪。左栏对这次没打开过的会话也能标出运行中、待审批、失败。
-   * 没有轮次时为 null；老后端不给
+   * 最后一轮停在哪。左栏对这次没打开过的会话也能标出运行中、待审批、失败、被驳回（rejected：运行被审批人驳回结束，
+   * 服务端 cancelled + end_reason=rejected）。没有轮次时为 null；老后端不给
    */
-  last_status?: 'running' | 'waiting' | 'error' | 'cancelled' | 'suspended' | 'done' | null
+  last_status?: 'running' | 'waiting' | 'error' | 'cancelled' | 'rejected' | 'suspended' | 'done' | null
   /** 最后一轮的运行。建图阶段就断了的没有 */
   last_run_id?: string | null
 }

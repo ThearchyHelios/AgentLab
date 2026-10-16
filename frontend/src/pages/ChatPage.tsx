@@ -802,7 +802,7 @@ function remedyOf(t: ChatTurn): Remedy | null {
 }
 
 const OUTCOME: Record<Attempt['outcome'], string> = {
-  failed: 'failed', cancelled: 'cancelled', suspended: 'suspended',
+  failed: 'failed', cancelled: 'cancelled', rejected: 'rejected', suspended: 'suspended',
   unusable: 'failed', partial: 'waiting', done: 'succeeded',
 }
 

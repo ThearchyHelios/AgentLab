@@ -106,7 +106,8 @@ export interface ScopeSource {
  */
 export interface Attempt {
   n: number
-  outcome: 'failed' | 'cancelled' | 'suspended' | 'unusable' | 'partial' | 'done'
+  /** rejected：那一次的运行被人驳回结束（不是手动停止，也不是故障）。老的留档里被驳回的那次记的是 cancelled，不改写 */
+  outcome: 'failed' | 'cancelled' | 'rejected' | 'suspended' | 'unusable' | 'partial' | 'done'
   summary: string
   detail?: string
   runId?: string | null
@@ -1181,6 +1182,11 @@ function attemptOf(t: ChatTurn): Attempt {
     answer: answer && answer.length > ATTEMPT_ANSWER_CAP ? answer.slice(0, ATTEMPT_ANSWER_CAP) + '…' : answer,
   }
   const signals = (t.review?.signals ?? []).map((s) => s.detail).join('\n') || undefined
+  // 被驳回的那次照实写谁在哪一步驳回（以前写「已手动停止」，用户其实没有停过它）
+  if (t.phase === 'cancelled' && t.rejected) {
+    const sub = t.rejected.sub && t.rejected.sub !== REJECTED_TEXT.title ? `：${t.rejected.sub}` : ''
+    return { ...base, outcome: 'rejected', summary: `${REJECTED_TEXT.title}${sub}` }
+  }
   if (t.phase === 'cancelled') return { ...base, outcome: 'cancelled', summary: '已手动停止' }
   if (t.phase === 'suspended') return { ...base, outcome: 'suspended', summary: '服务重启，运行中断' }
   if (t.phase === 'error' || t.failure) {
