@@ -416,3 +416,36 @@ def test_index_sql_golden_parses_and_passes_the_guard(kind, schema):
     check(sql, readonly=True, source_name="x", dialect=kind)
     assert so.index_sql("mariadb", "shop") == GOLDEN[("mysql", "shop")]
     assert so.index_sql("db2", None) is None
+
+
+async def test_draft_and_profile_jobs_say_they_wait_for_introspect(small):
+    """起草、剖析排在同源的探查任务后面时，waiting_for 照实说是探查（界面写「探查结束后自动开始」）。"""
+    from datetime import datetime, timezone
+
+    from app.data import catalog_jobs, catalog_profile_jobs
+    from app.db.base import new_id
+    from app.db.models import CatalogDraftJob, CatalogProfileJob
+
+    sid, _ = small
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        profile = CatalogProfileJob(id=new_id(), source_id=sid, status="queued", scope="needed", created_at=now)
+        draft = CatalogDraftJob(id=new_id(), source_id=sid, status="queued")
+        session.add_all([profile, draft])
+        await session.commit()
+    try:
+        for kind, job, waiting in (("profile", profile, catalog_profile_jobs.waiting_for),
+                                   ("draft", draft, catalog_jobs.waiting_for)):
+            held = runtime.lanes.enter(sid, "introspect", "an-introspect-job")
+            mine = runtime.lanes.enter(sid, kind, job.id)
+            try:
+                async with SessionLocal() as session:
+                    assert await waiting(session, job) == "introspect", kind
+            finally:
+                held.release()
+                mine.release()
+    finally:
+        async with SessionLocal() as session:
+            for model, job_id in ((CatalogProfileJob, profile.id), (CatalogDraftJob, draft.id)):
+                await session.delete(await session.get(model, job_id))
+            await session.commit()

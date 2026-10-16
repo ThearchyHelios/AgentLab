@@ -939,8 +939,11 @@ async def add_to_scope(source_id: str, names: list[str], *, trail: Trail, reason
             for o in todo:
                 was_in = bool(o.in_scope)
                 o.in_scope = True
-                if not was_in or reason == "explicit":
-                    o.scope_reason = reason if not was_in or o.scope_reason in (None, "on_demand") else o.scope_reason
+                if not was_in or (reason == "explicit" and o.scope_reason in (None, "on_demand")):
+                    o.scope_reason = reason
+                elif was_in:
+                    # 本来就在范围里、只是上次没读到结构（pinned、规则命中的）：这次重读一遍，不算「加入」，不记留痕
+                    continue
                 o.added_via, o.added_by, o.added_at = trail.via, (trail.actor or None), now
                 o.added_run_id, o.added_conversation_id = trail.run_id, trail.conversation_id
                 o.added_ref = (trail.ref or None) and str(trail.ref)[:64]

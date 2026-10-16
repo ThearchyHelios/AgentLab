@@ -581,7 +581,7 @@ def _unavailable_tool(row: DataSource, prefix: str, reason: str) -> StructuredTo
             metadata={"dangerous_if": lambda args: False, "timeout_s": query_timeout(row)},
         )
 
-    async def _schema(table: str | list[str] | None = None) -> str:
+    async def _schema(table: str | list[str] | None = None, keyword: str | None = None) -> str:
         return f"{DATA_UNAVAILABLE}{reason}"
 
     return StructuredTool(
