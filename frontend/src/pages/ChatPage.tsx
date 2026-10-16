@@ -304,7 +304,7 @@ export function ChatPage() {
           if (busy || blocked) pick(text)
           else void send(text)
         }}
-        onOpenGraph={async (graph, question) => {
+        onOpenGraph={async (graph, question, turnId) => {
           // 建成一张新工作流，走它自己的地址。以前是 setGraph(graph)：只换掉了画布
           // 上的节点，store 里的 workflow 还是上一次打开的那张图——于是 ⌘S 把那张图
           // 整张覆盖了（旧版本还在版本表里，界面上却没有入口找回）；没打开过图时
@@ -313,7 +313,19 @@ export function ChatPage() {
           if (!(await canLeave('/studio/'))) return
           try {
             const name = `问数据：${(question ?? '').trim().slice(0, 24) || '未命名'}`
-            const created = await api.workflows.create({ name, graph })
+            // 新工作流记下出自哪次运行、哪段对话、哪一轮（服务端核对，同「提取成工作流」的来源）：沉淀和召回要找得到它。
+            // 这一轮还没运行过（只建了图）的没有来源可记
+            const turn = turns?.find((t) => t.id === turnId)
+            const origin = turn?.run?.id
+              ? { run_id: turn.run.id, ...(currentId ? { conversation_id: currentId } : {}),
+                  ...(currentId && turn.serverId ? { turn_id: turn.serverId } : {}) }
+              : undefined
+            // 来源核对不过（运行刚被删）：来源只是留痕，不挡「在画布里打开」，不带来源照常新建
+            const created = await (origin
+              ? api.workflows.create({ name, graph, origin }).catch((e) => (
+                e instanceof ApiError && e.code === 'workflow_origin_invalid'
+                  ? api.workflows.create({ name, graph }) : Promise.reject(e)))
+              : api.workflows.create({ name, graph }))
             void refreshCatalog()
             navigate(`/studio/${created.id}`, leavePass())
             toast.ok('已在画布中新建工作流，原有工作流不受影响')

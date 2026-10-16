@@ -1823,6 +1823,31 @@ await section('结论句裁判（可点击证据第四期）：裁判调用单�
     odd.find((s) => s.code === 'report_checked')?.title)
 })
 
+await section('口径账本：封存后比对已发布口径（ledger.matched）', async () => {
+  // next-round 02 做法 2：探索运行封存之后，服务端在后台比对已发布口径，追加一条 ledger.matched（只有各种状态几条）
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const run = (data) => flatten(mod.decodeRun([
+    E(1, 'run.started', null, {}), E(2, 'node.started', 'q', { node_type: 'tool' }), E(3, 'node.finished', 'q', {}),
+    E(4, 'run.finished', null, { status: 'succeeded' }),
+    E(5, 'ledger.matched', null, { artifact: 'cm-1', manifest_hash: 'h', algo: '1', post_seal: true, ...data }),
+  ]))
+  const all = run({ counts: { proven: 1, composed: 0, related: 2, none: 0, skipped: 0 }, trigger: 'sealed' })
+  check('认得它：不是「未识别的事件」', !all.some((s) => s.title === '未识别的事件'))
+  const lm = all.find((s) => s.code === 'ledger_matched')
+  check('一行：几条等价已证明、几条有相关口径，写明封存后比对、不在封存范围内',
+    lm?.title === '比对已发布口径：1 条查询等价已证明，2 条有相关口径' && lm?.sub === '封存后比对，不在封存范围内'
+    && lm?.level === 'info' && lm?.kind === 'note', `${lm?.title} / ${lm?.sub} / ${lm?.level}`)
+  const late = run({ counts: { proven: 0, related: 0, none: 1, skipped: 1 }, trigger: 'backfill' }).find((s) => s.code === 'ledger_matched')
+  check('事后补比的写明按现在的口径回看；没比完的是提醒', late?.title === '比对已发布口径：1 条没有相关的已发布口径，1 条没有比完'
+    && late?.sub === '封存后比对，不在封存范围内 · 按现在的口径回看' && late?.level === 'warn', `${late?.title} / ${late?.sub} / ${late?.level}`)
+  const odd = run({ counts: 'x' }).find((s) => s.code === 'ledger_matched')
+  check('缺字段：只说比对过，不出 undefined、不瞎填数', odd?.title === '比对已发布口径' && !/undefined|NaN/.test(`${odd?.title}${odd?.sub}`),
+    odd?.title)
+  const phase = [E(4, 'run.finished', null, {}), E(5, 'ledger.matched', null, {})]
+    .reduce((s, ev) => mod.nextPhase(s, ev), { phase: 'running', awaiting: false })
+  check('不改相位：运行照旧是结束了', phase.phase === 'succeeded', phase.phase)
+})
+
 await section('术语', async () => {
   // 没起名的节点退到类型名，类型名跟全站同一张表
   const h = mod.decodeRun([{ seq: 1, type: 'node.started', node_id: 'h', ts: 1, data: { node_type: 'human', label: 'h' } }])

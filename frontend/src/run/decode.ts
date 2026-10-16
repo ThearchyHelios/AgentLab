@@ -6,7 +6,7 @@ import {
   ABSENCE_CLAIM_TEXT, ACTION_CONFIRM_TEXT, ACTION_ENV_LABEL, ACTION_LOG_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, LOOK_TEXT, MERGE_TEXT,
   ORIGIN_TEXT, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, TASK_KIND_LABEL, TASK_LOG_TEXT, TASK_STATUS_LABEL, TASK_TEXT, TYPE_LABEL, originLabel,
   CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, MASKED_CELL_TEXT, NODE_TYPE_LABEL,
-  VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText, FILE_TEXT, REJECTED_TEXT,
+  VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText, FILE_TEXT, REJECTED_TEXT, LEDGER_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -2399,6 +2399,20 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
             ...(d.priced === false ? [JUDGE_TEXT.noPrice] : []),
             ...(Array.isArray(d.gaps) ? d.gaps.map(String) : [])].join('\n') } : {}),
         }, nodeId)
+        break
+      }
+
+      case 'ledger.matched': {
+        // 口径账本：探索运行封存之后，服务端在后台拿这次执行的 SQL 和已发布口径比对过了。追加在封存之后、不在封存范围内；
+        // 事件里只有几条查询各是什么情况，逐个数的标签走 GET /runs/{id}/ledger
+        const counts = d.counts && typeof d.counts === 'object' ? d.counts : {}
+        const retro = typeof d.trigger === 'string' && d.trigger !== 'sealed'
+        out.push({
+          id: `lm-${seq}`, seq, kind: 'note', status: 'done', code: 'ledger_matched',
+          level: typeof counts.skipped === 'number' && counts.skipped > 0 ? 'warn' : 'info',
+          title: LEDGER_TEXT.timeline(counts),
+          sub: [LEDGER_TEXT.sub, retro ? LEDGER_TEXT.retro : ''].filter(Boolean).join(' · '),
+        })
         break
       }
 

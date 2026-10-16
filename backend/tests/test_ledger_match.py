@@ -288,3 +288,13 @@ async def test_only_sealed_query_snapshots_are_compared(monkeypatch):
     await ledger_match.match_run(row.id, trigger="on_demand")
     recorded, _ = await matched(row.id)
     assert [q["status"] for q in recorded.content["queries"]] == ["proven"]
+
+
+async def test_cells_inside_a_table_are_labelled_the_same_way(monkeypatch):
+    wf = await S.publish()
+    row = await S.explore(monkeypatch, S.EQUIVALENT,
+                          text="本周销售额 [[v:Q1.r0.销售额]]。\n\n[[table:Q1 cols=销售额 rows=0-0]]")
+    recorded, _ = await matched(row.id)
+    [labels] = [r["labels"] for r in recorded.content["reports"].values()]
+    assert len(labels) >= 2 and all(label["kind"] == "caliber" and label["caliber"] == f"{wf}@1"
+                                    for label in labels.values())
