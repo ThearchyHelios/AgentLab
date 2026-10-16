@@ -628,7 +628,7 @@ async function fakeApi(route) {
       : conversation.includes('步数用满') ? `run-steps-${++runSeq}`
       : conversation.includes('照服务端的决定') ? `run-decide-${++runSeq}`
       : `run-busy-${++runSeq}`
-    log.runStarts.push({ id, graph: b.graph })
+    log.runStarts.push({ id, graph: b.graph, origin_ref: b.origin_ref })
     return json({ id, status: 'queued', run_class: 'exploratory', output: {}, usage: {} })
   }
   m = path.match(/^\/runs\/([^/]+)\/(cancel|continue)$/)
@@ -1455,6 +1455,10 @@ for (const theme of THEMES) {
     const started = log.runStarts.slice(startsBefore).at(-1)
     check('发起的图里 agent 步数是 24', started?.graph?.nodes?.find((n) => n.type === 'agent')?.data?.config?.max_steps === 24,
       JSON.stringify(started?.graph?.nodes?.map((n) => n.data?.config)))
+    // 口径账本的来源链（next-round 02 做法 9）：运行记下属于哪段对话、哪一轮（服务端核对后封存进运行来源）
+    const server = await page.evaluate(() => window.__chat.getState().byConversation.c0histf.at(-1).serverId)
+    check('发起时带上这一轮属于哪段对话、哪一轮', started?.origin_ref?.conversation_id === 'c0histf'
+      && !!server && started?.origin_ref?.turn_id === server, JSON.stringify(started?.origin_ref))
     check('上一次留档：第 1 次尝试 · 结论不可用', await shows(page, '第 1 次尝试'))
     await page.screenshot({ path: `${SHOTS}/retried-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
@@ -2442,6 +2446,8 @@ for (const theme of THEMES) {
     const asks = await page.evaluate(() => window.__asks)
     check('说了放弃：建一个、跳过去，整条路只问这一遍', creates.length === 1 && asks === 2
       && new URL(page.url()).pathname === '/studio/wf-chat-open', `建了 ${creates.length} 个 · 一共问了 ${asks} 遍（取消那次算一遍）`)
+    check('建的工作流带上来源：哪次运行、哪段对话、哪一轮（服务端核对）', JSON.stringify(creates[0]?.origin)
+      === JSON.stringify({ run_id: 'run-b1', conversation_id: 'c0idleb', turn_id: 'tb1' }), JSON.stringify(creates[0]?.origin))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })

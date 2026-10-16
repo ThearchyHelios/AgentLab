@@ -240,8 +240,14 @@ export const api = {
   workflows: {
     list: (opts?: RequestOptions) => get<Workflow[]>('/workflows', opts),
     get: (id: string) => get<Workflow>(`/workflows/${id}`),
-    create: (body: { name: string; description?: string; graph?: GraphSpec; tags?: string[] }) =>
-      post<Workflow>('/workflows', body),
+    /**
+     * origin：新工作流出自哪次运行、哪段对话、哪一轮（问数据的「在画布里打开」带上，next-round 02 做法 9）。服务端核对运行
+     * 读得到、对话用得了、这一轮属于这段对话，对不上回 422（workflow_origin_invalid）
+     */
+    create: (body: {
+      name: string; description?: string; graph?: GraphSpec; tags?: string[]
+      origin?: { run_id: string; conversation_id?: string; turn_id?: string }
+    }) => post<Workflow>('/workflows', body),
     update: (id: string, body: Partial<Workflow> & { note?: string }) =>
       patch<Workflow>(`/workflows/${id}`, body),
     remove: (id: string) => del(`/workflows/${id}`),
@@ -622,6 +628,11 @@ export const api = {
       run_class?: 'formal' | 'exploratory'; version?: number
       /** 运行来源（X3）：客户端只能声明 chat、canvas、launcher、api（不传按 api 记），其余由服务端写 */
       origin?: 'chat' | 'canvas' | 'launcher' | 'api'
+      /**
+       * 问数据的运行属于哪段对话、哪一轮（只在 origin 是 chat 时收，next-round 02 做法 9）：服务端核对后写进运行来源、在封存
+       * 范围内。对话、轮次对不上回 422（origin_ref_invalid）
+       */
+      origin_ref?: { conversation_id: string; turn_id: string }
     }) => post<Run>('/runs', body),
     artifacts: (id: string) => get<any[]>(`/runs/${id}/artifacts`),
     /** 从失败的节点接着跑。graph 只能带改过配置的同一张图，结构必须一致 */

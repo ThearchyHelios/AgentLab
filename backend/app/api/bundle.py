@@ -8,8 +8,8 @@
 另外要求运行已经结束（成功、失败、取消）：失败后接着跑的运行留着上一次的封存，跑完会重新封存、换掉清单哈希，
 早年的运行停在审批时也封存过——这时导出去的文件，封存哈希和系统里之后记的对不上，页面上「去系统里对照」
 那一步就作废了。
-只读：不追加任何事件，不改运行记录。路径挂在 /api/runs/{run_id}/… 下面，runs.py 里已经有 /{run_id}/verify，
-这里叫 bundle.html，不撞名。
+不追加运行事件、不改运行记录，只记一条导出审计（report.exported，format=bundle：召回要找得到谁下载过可验证报告，
+next-round 02 做法 9）。路径挂在 /api/runs/{run_id}/… 下面，runs.py 里已经有 /{run_id}/verify，这里叫 bundle.html，不撞名。
 """
 from __future__ import annotations
 
@@ -71,6 +71,10 @@ async def export_bundle(run_id: str) -> Response:
         legacy=bool(sealed.seal.get("legacy")), graph=sealed.graph, source_masks=masks,
         sure_columns=sure, sure_secrets=secrets,
         read=lambda artifact: read_bytes(artifact, verify=False), exported_at=exported_at)))
+    from app.api.evidence import _reports, record_export
+
+    await record_export(run_id, "bundle", reports=[{"report_node": r.node_id, "doc_artifact": r.doc_artifact}
+                                                   for r in _reports(sealed)])
     return Response(page, media_type="text/html; charset=utf-8", headers={
         "Content-Disposition": content_disposition(attachment_name(info), run_id=run_id),
         # 导出的是这一刻的封存件，不该被哪一层缓存下来、换给下一个请求

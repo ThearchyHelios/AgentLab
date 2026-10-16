@@ -4501,6 +4501,34 @@ export const BUNDLE_TEXT = {
 }
 
 /**
+ * 口径账本（docs/design/next-round/02-口径账本.md）。探索运行封存之后，服务端在后台拿这次执行的 SQL 和已发布口径的取数比对，
+ * 追加一条 ledger.matched（封存之后，不在封存范围内）。这一波只有时间线上那一行；逐个数的标签、证据面板的「口径」一步、对账在
+ * 第 4 波接上界面（接口 GET /api/runs/{id}/ledger 已就绪）。叫法同总方案 X10：来自口径（受管 / 已发布）· 等价已证明 / 助手选用、
+ * 相关口径、这次的推理
+ */
+export const LEDGER_TEXT = {
+  /** 时间线那一行：只说几条查询各是什么情况（服务端的 counts），不带绑定和差异 */
+  timeline: (counts: { proven?: unknown; composed?: unknown; related?: unknown; none?: unknown; skipped?: unknown }) => {
+    const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0)
+    const parts = [
+      n(counts.proven) ? `${formatNumber(n(counts.proven))} 条查询等价已证明` : '',
+      n(counts.composed) ? `${formatNumber(n(counts.composed))} 条来自助手选用的口径` : '',
+      n(counts.related) ? `${formatNumber(n(counts.related))} 条有相关口径` : '',
+      n(counts.none) ? `${formatNumber(n(counts.none))} 条没有相关的已发布口径` : '',
+      n(counts.skipped) ? `${formatNumber(n(counts.skipped))} 条没有比完` : '',
+    ].filter(Boolean)
+    return parts.length ? `比对已发布口径：${parts.join('，')}` : '比对已发布口径'
+  },
+  /** 副标题：比对在封存之后；事后补比、打开时按需比的另写一句 */
+  sub: '封存后比对，不在封存范围内',
+  retro: '按现在的口径回看',
+  /** 标签的四种、认法的两种（第 4 波的证据面板、轮次摘要用同一套） */
+  kind: { caliber: '来自口径', related: '相关口径', reasoning: '这次的推理', unknown: '没有比对' },
+  how: { independent: '等价已证明', composed: '助手选用' },
+  level: { governed: '受管', published: '已发布' },
+}
+
+/**
  * 审批质询：审批人在批准前就待审的报告提问（选一句、划一段原文，或就整份报告），核查模型只读查库作答。问答写进运行
  * 记录、随运行一并封存，不改动报告；封存之后只有探索运行还能问，追加在封存之后
  */

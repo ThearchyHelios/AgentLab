@@ -189,13 +189,15 @@ WHERE / GROUP BY 里用列别名的），而且只说四类：
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
+import json
 import logging
 import math
 import re
 from collections import deque
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any
 
@@ -8032,6 +8034,591 @@ def diff_facets(a: Facets, b: Facets, labels: tuple[str, str] = ("A", "B"), *,
                             labels=labels).items
 
 
-__all__ = ["MAX_SQL_CHARS", "PLACEHOLDER", "Aggregate", "ColumnRef", "Computed", "FacetDiff", "Facets", "JoinFacet",
-           "LimitFacet", "NormalizedSql", "Part", "SqlDiff", "TimePredicate", "catalog_labels", "diff_facets",
-           "explain_sql_diff", "facets", "normalize_sql"]
+# ==========================================================================
+# 口径模板的参数绑定与等价证明（docs/design/next-round/02-口径账本.md 做法 1）
+# ==========================================================================
+#
+# 口径账本要回答「这次执行的 SQL 是不是某一版口径的取数」。口径的取数节点里写的是模板（WHERE paid_at >= '{{ input.start }}'），
+# 这次执行的是字面 SQL。只比 normalize_sql 的文本会错给信任（status = 'paid' 和 'refunded' 文本相同），只拿模板原文和执行的
+# SQL 去比 explain_sql_diff 又永远不等价（参数不同），所以分两步：
+#
+# 1. 绑定（启发）：模板里每个 {{ input.<字段> }} 按位置换成哨兵（引号里是 '__agl_p<i>__' 这样的字，裸写的是一个不会出现的
+#    整数），依次在三级规范形式（optimizer / light / parsed，见 _canonical_forms）上抹掉字面量的值比结构；结构一样就按位置
+#    把两边的字面量配起来：含哨兵的口径字面量转成正则取出参数（'{{ input.m }}-01' 这种半截的也行），不含哨兵的必须相等，
+#    同一个槽位出现几处要取到同一个值。三级都对不上时退回「同一列、同一运算符的常量」配对（启发式，只用于说明和预填）。
+# 2. 证明：一律按绑定用 engine/expressions.render_template（运行时同一个渲染器）渲染口径模板，再交给 explain_sql_diff。等价
+#    与否只由这一步判——绑定配错了，渲染出来的 SQL 和执行的不等价，结论只会是「不等价」，不会错给信任。
+#
+# 规范化里按交换律排序的地方（AND 的各项、IN 列表）排的先后和字面量的值有关，哨兵和真实的值排出来的先后可能不同：那一级就
+# 配不上（常量对不上），换下一级；parsed 一级不排序，写法和模板同序时总配得上。
+#
+# 不可比的（照实给原因，不判等价）：模板里引用了 vars.、nodes.、file_text 这类运行时才有的东西；参数写在名字里（双引号、
+# 反引号括起来的标识符）；用了 trim / compact 以外的过滤器。
+
+#: 槽位的写法：input.<字段>。字段名可以是中文
+_SLOT_PATH = re.compile(r"^input\.([^\s.\[\]|{}()'\"]+)$")
+#: 槽位能带的过滤器：trim（去掉首尾空白）、compact（紧凑 JSON）。别的过滤器（upper、json……）倒推不回参数，不可比
+_SLOT_FILTERS = frozenset({"trim", "compact"})
+#: 模板里的 {{ … }}：和 engine/expressions 的 _TEMPLATE_RE 同一个写法（非贪婪、跨行）
+_SLOT_RE = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
+#: 引号里的哨兵
+_STRING_SENTINEL = "__agl_p{}__"
+_STRING_SENTINEL_RE = re.compile(r"__agl_p(\d+)__")
+#: 裸写的哨兵：这个整数加上槽位的序号。13 位、不以 0 开头，真实的 SQL 里几乎不会写这么一个数；写了也只是这一处配不上
+_NUMBER_SENTINEL = 7_340_193_582_000
+#: 配对用的三级规范形式（同 explain_sql_diff 比等价的先后），之后是启发式
+BINDING_LEVELS = ("optimizer", "light", "parsed", "heuristic")
+
+
+@dataclass(frozen=True)
+class TemplateSlot:
+    """模板里的一处 {{ input.<字段> }}：第几处（index）、字段、过滤器、在哪（quoted 引号里的字、bare 裸写、comment 注释里）。"""
+
+    index: int
+    field: str
+    filters: tuple[str, ...]
+    context: str
+
+
+@dataclass(frozen=True)
+class TemplateBinding:
+    """bind_template 的结果。
+
+    comparable 为假时 reason 写不可比的原因（模板引用了运行时的变量、参数写在名字里……），binding 为空。
+    binding 是 {字段: 值}：引号里取出的是字，裸写的数按原样（能原样写回的转成 int / float）。unbound 是模板里引用了、却没
+    取到值的字段（只出现在注释里、哪一级都配不上）。level 是在哪一级配上的（optimizer / light / parsed / heuristic），都没
+    配上为 None；heuristic 只是启发，只给说明和预填用，等价仍由 match_template 渲染之后的 explain_sql_diff 判。"""
+
+    comparable: bool
+    binding: dict[str, Any] = field(default_factory=dict)
+    unbound: tuple[str, ...] = ()
+    level: str | None = None
+    reason: str | None = None
+    slots: tuple[TemplateSlot, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"comparable": self.comparable, "binding": dict(self.binding), "unbound": list(self.unbound),
+                "level": self.level, "reason": self.reason}
+
+
+@dataclass(frozen=True)
+class TemplateMatch:
+    """match_template 的结果：执行的 SQL 是不是这份口径模板按某组参数渲染出来的。
+
+    equivalent 只由 explain_sql_diff(执行的 SQL, 按 binding 渲染的口径 SQL) 判。binding / unbound / level 同 TemplateBinding
+    （level 是绑定配上的那一级，heuristic 表示参数是按「同一列、同一运算符」猜的）；diff 是那一次 explain_sql_diff 的结果
+    （不可比时为 None）；rendered 是按绑定渲染出来的口径 SQL；columns 只在等价时给：按位置的列映射
+    [{index, ours, caliber}]（外层别名不计、列的先后计；SELECT * 按表结构展开），两边列数对不上、认不出列名时为 None。"""
+
+    equivalent: bool
+    comparable: bool = True
+    binding: dict[str, Any] = field(default_factory=dict)
+    unbound: tuple[str, ...] = ()
+    level: str | None = None
+    diff: SqlDiff | None = None
+    columns: tuple[dict[str, Any], ...] | None = None
+    rendered: str | None = None
+    reason: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"equivalent": self.equivalent, "comparable": self.comparable, "binding": dict(self.binding),
+                "unbound": list(self.unbound), "level": self.level,
+                "diff": self.diff.as_dict() if self.diff is not None else None,
+                "columns": [dict(c) for c in self.columns] if self.columns is not None else None,
+                "reason": self.reason}
+
+
+class _NotComparable(Exception):
+    """模板不可比：args[0] 是给人看的原因。"""
+
+
+def _slot_of(expr: str, index: int, context: str) -> TemplateSlot:
+    """一处 {{ … }} 的内容 → 槽位；不是 input.<字段>（可带 trim / compact）的抛 _NotComparable。"""
+    from app.engine.expressions import template_call
+
+    parts = [p.strip() for p in expr.split("|")]
+    head = parts[0]
+    if "(" in head and template_call(head) is not None:
+        raise _NotComparable("口径的取数 SQL 读了附件的内容，不能按参数比对")
+    if re.match(r"^(vars|nodes|output|loops|usage|messages|last_message)\b", head):
+        raise _NotComparable("口径的取数 SQL 引用了运行时才有的变量或节点产出，不能按参数比对")
+    found = _SLOT_PATH.match(head)
+    if found is None:
+        raise _NotComparable("口径的取数 SQL 里有认不出的模板写法，不能按参数比对")
+    filters = tuple(p for p in parts[1:] if p)
+    if bad := [f for f in filters if f not in _SLOT_FILTERS]:
+        raise _NotComparable(f"口径的取数 SQL 里的参数用了过滤器「{bad[0]}」，倒推不出参数，不能按参数比对")
+    if context == "name":
+        raise _NotComparable("口径的取数 SQL 把参数写在了表名或列名里，不能按参数比对")
+    return TemplateSlot(index=index, field=found.group(1), filters=filters, context=context)
+
+
+def _template_slots(template: str) -> tuple[list[tuple[int, int, TemplateSlot]], str]:
+    """模板里每一处 {{ … }}：[(起, 止, 槽位)]，以及按哨兵渲染的 SQL。逐字看引号和注释，定下每一处在哪：单引号里是字，
+    双引号、反引号里是名字，-- 和 /* */ 里是注释，别处是裸写。{{ … }} 里面的字不参与判断。"""
+    spans: list[tuple[int, int, TemplateSlot]] = []
+    out: list[str] = []
+    state = "code"
+    i, n = 0, len(template)
+    while i < n:
+        if template.startswith("{{", i):
+            m = _SLOT_RE.match(template, i)
+            if m is not None:
+                context = {"code": "bare", "string": "quoted", "name": "name", "line": "comment",
+                           "block": "comment"}[state]
+                slot = _slot_of(m.group(1).strip(), len(spans), context)
+                spans.append((m.start(), m.end(), slot))
+                out.append(_STRING_SENTINEL.format(slot.index) if context == "quoted"
+                           else str(_NUMBER_SENTINEL + slot.index) if context == "bare" else "")
+                i = m.end()
+                continue
+        ch = template[i]
+        if state == "code":
+            if ch == "'":
+                state = "string"
+            elif ch in "\"`":
+                state = "name"
+                quote = ch
+            elif template.startswith("--", i):
+                state = "line"
+            elif template.startswith("/*", i):
+                state = "block"
+        elif state == "string" and ch == "'":
+            state = "code"          # 成对的 '' 是转义：关上又马上打开，结果一样
+        elif state == "name" and ch == quote:
+            state = "code"
+        elif state == "line" and ch == "\n":
+            state = "code"
+        elif state == "block" and template.startswith("*/", i):
+            out.append("*/")
+            i += 2
+            state = "code"
+            continue
+        out.append(ch)
+        i += 1
+    return spans, "".join(out)
+
+
+def _erased(node: Any, literals: list[Any]) -> str:
+    """语法树的确定写法（同 _fingerprint），只是字面量一律写成 Literal()、不写值，按写出的先后把字面量节点收进 literals。
+    两棵树的这个写法一样，就是只差字面量；literals 的先后一一对应。"""
+    from sqlglot import exp
+
+    if isinstance(node, exp.Paren):
+        return _erased(node.this, literals)
+    if isinstance(node, exp.Literal):
+        literals.append(node)
+        return "Literal()"
+    if isinstance(node, exp.Expr):
+        parts = [f"{k}={_erased(v, literals)}" for k, v in sorted(node.args.items())
+                 if v is not None and v is not False and v != []]
+        mark = node.meta.get("sql_semantics_join") if isinstance(node, exp.Join) else None
+        if mark:
+            parts.append(f"@join={mark}")
+        surface = node.meta.get(_SURFACE)
+        if surface:
+            parts.append(f"@surface={surface}")
+        return f"{type(node).__name__}({','.join(parts)})"
+    if isinstance(node, list):
+        return "[" + ",".join(_erased(v, literals) for v in node) + "]"
+    return repr(node)
+
+
+def _sql_quoted(value: str) -> str:
+    """字面量的值写回单引号里的样子：单引号写两遍。"""
+    return value.replace("'", "''")
+
+
+def _bare_value(text: str) -> Any:
+    """裸写的数：能原样写回的转成 int / float（预填参数时是数），写不回原样的（100.50、1e3）留成字。"""
+    with contextlib.suppress(ValueError):
+        number = int(text)
+        if str(number) == text:
+            return number
+    with contextlib.suppress(ValueError):
+        real = float(text)
+        if repr(real) == text:
+            return real
+    return text
+
+
+def _unfilter(text: str, slot: TemplateSlot) -> tuple[bool, Any]:
+    """渲染出来的那一截 → 参数的值：compact 按 JSON 倒推，trim 要求首尾没有空白（否则渲染不回原样）。"""
+    value: Any = text
+    if "compact" in slot.filters:
+        try:
+            value = json.loads(text)
+        except ValueError:
+            return False, None
+    if "trim" in slot.filters and isinstance(value, str) and value != value.strip():
+        return False, None
+    return True, value
+
+
+class _Pairing:
+    """按位置配字面量：模板里每一处槽位取到的值；常量对不上、同一个槽位取到不同的值时 ok 为假。"""
+
+    def __init__(self, slots: dict[int, TemplateSlot]) -> None:
+        self.slots = slots
+        self.values: dict[str, Any] = {}
+        self.ok = True
+
+    def give(self, slot: TemplateSlot, value: Any) -> None:
+        if slot.field in self.values and self.values[slot.field] != value:
+            self.ok = False
+            return
+        self.values[slot.field] = value
+
+    def pair(self, ours: Any, theirs: Any) -> None:
+        """ours 是执行的 SQL 里的字面量，theirs 是哨兵渲染的口径 SQL 里同一位置的字面量。"""
+        from sqlglot import exp
+
+        if not self.ok:
+            return
+        text = str(theirs.this)
+        quoted = [self.slots[int(m.group(1))] for m in _STRING_SENTINEL_RE.finditer(text)
+                  if int(m.group(1)) in self.slots] if theirs.is_string else []
+        bare = None if theirs.is_string else self._bare_slot(text)
+        if bare is not None:
+            if not isinstance(ours, exp.Literal):
+                self.ok = False
+                return
+            raw = f"'{_sql_quoted(str(ours.this))}'" if ours.is_string else str(ours.this)
+            ok, value = _unfilter(raw, bare)
+            if ok:
+                self.give(bare, value if ours.is_string or "compact" in bare.filters else _bare_value(raw))
+            else:
+                self.ok = False
+            return
+        if not quoted:
+            # 口径里写死的常量：两边必须一模一样（字还是数、值）
+            if not isinstance(ours, exp.Literal) or ours.is_string != theirs.is_string or str(ours.this) != text:
+                self.ok = False
+            return
+        if not ours.is_string:
+            self.ok = False
+            return
+        pattern = "".join("(.*)" if m else re.escape(piece)
+                          for piece, m in _split_sentinels(text))
+        found = re.fullmatch(pattern, str(ours.this), re.DOTALL)
+        if found is None:
+            self.ok = False
+            return
+        for slot, got in zip(quoted, found.groups()):
+            ok, value = _unfilter(_sql_quoted(got), slot)
+            if not ok:
+                self.ok = False
+                return
+            self.give(slot, value)
+
+    def _bare_slot(self, text: str) -> TemplateSlot | None:
+        with contextlib.suppress(ValueError):
+            index = int(text) - _NUMBER_SENTINEL
+            slot = self.slots.get(index)
+            if slot is not None and slot.context == "bare":
+                return slot
+        return None
+
+
+def _split_sentinels(text: str) -> list[tuple[str, bool]]:
+    """口径字面量切成 (片段, 是不是哨兵)。"""
+    out: list[tuple[str, bool]] = []
+    pos = 0
+    for m in _STRING_SENTINEL_RE.finditer(text):
+        if m.start() > pos:
+            out.append((text[pos:m.start()], False))
+        out.append((m.group(0), True))
+        pos = m.end()
+    if pos < len(text):
+        out.append((text[pos:], False))
+    return out
+
+
+def _parsed_forms(sql: str, read: str | None, info: _Schema) -> tuple[Any, dict[str, _Form]]:
+    """(语法树, 三级规范形式)，做法同 explain_sql_diff：原文里有 sqlglot 会读错、会丢掉的写法时不出规范形式。解析不了的
+    语法树为 None。"""
+    if read == "mysql":
+        sql = _mysql_dashes(sql)
+    root, _ = _parse(sql, read)
+    if root is None:
+        return None, {}
+    text = sql.strip()
+    try:
+        marked = _mark_surfaces(root, text, read)
+        if read == "sqlite":
+            _mark_comma_joins(root, text, read)
+        if not marked or _lost_in_parsing(text, read, root):
+            return root, {}
+        return root, _canonical_forms(root, read, info)
+    except Exception:  # noqa: BLE001 - 规范化本身的缺陷：当作这一条没有规范形式（只会少配上）
+        logger.warning("口径模板绑定时规范化失败", exc_info=True)
+        return root, {}
+
+
+def _heuristic_pairs(root: Any) -> dict[tuple[str, str, int], list[Any]]:
+    """「列 运算符 常量」的几处：{(列名, 运算, 第几个常量): [常量节点…]}，按出现的先后。BETWEEN 的上下界、IN 列表的每一项
+    各算一处。只认一边是光一列（不管表名）、另一边是字面量的。"""
+    from sqlglot import exp
+
+    out: dict[tuple[str, str, int], list[Any]] = {}
+
+    def column(node: Any) -> str | None:
+        node = _unparen(node)
+        return name_key(node.name) if isinstance(node, exp.Column) and node.name else None
+
+    def add(col: str | None, op: str, pos: int, lit: Any) -> None:
+        lit = _unparen(lit)
+        if col is not None and isinstance(lit, exp.Literal):
+            out.setdefault((col, op, pos), []).append(lit)
+
+    for node in root.walk():
+        if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Like, exp.ILike)):
+            left, right = node.this, node.expression
+            op = type(node).__name__
+            add(column(left), op, 0, right)
+            flipped = {"GT": "LT", "LT": "GT", "GTE": "LTE", "LTE": "GTE"}.get(op, op)
+            add(column(right), flipped, 0, left)
+        elif isinstance(node, exp.Between):
+            add(column(node.this), "Between", 0, node.args.get("low"))
+            add(column(node.this), "Between", 1, node.args.get("high"))
+        elif isinstance(node, exp.In) and node.args.get("expressions"):
+            for item in node.args["expressions"]:
+                add(column(node.this), "In", 0, item)
+    return out
+
+
+def _bindings(template_sql: str, sql: str, read: str | None, info: _Schema
+              ) -> Iterator[tuple[str, dict[str, Any], tuple[str, ...], tuple[TemplateSlot, ...]]]:
+    """按 BINDING_LEVELS 的先后给出配得上的绑定：(哪一级, {字段: 值}, 没取到值的字段, 槽位)，同样的绑定只给一次。
+    模板没有槽位时只给一个空绑定（level 为 parsed：用不着配）。不可比抛 _NotComparable。"""
+    spans, sentinel_sql = _template_slots(template_sql)
+    slots = tuple(slot for _, _, slot in spans)
+    fields = tuple(dict.fromkeys(s.field for s in slots))
+    if not slots:
+        yield _PARSED, {}, (), slots
+        return
+    root_t, forms_t = _parsed_forms(sentinel_sql, read, info)
+    if root_t is None:
+        raise _NotComparable("口径的取数 SQL 代入参数后无法解析，不能按参数比对")
+    root_e, forms_e = _parsed_forms(sql, read, info)
+    if root_e is None:
+        return
+    by_index = {s.index: s for s in slots}
+    seen: list[dict[str, Any]] = []
+
+    def done(values: dict[str, Any]) -> tuple[str, ...]:
+        return tuple(f for f in fields if f not in values)
+
+    for level in (_OPTIMIZER, _LIGHT, _PARSED):
+        fe, ft = forms_e.get(level), forms_t.get(level)
+        if fe is None or ft is None:
+            continue
+        lits_e: list[Any] = []
+        lits_t: list[Any] = []
+        if _erased(fe.tree, lits_e) != _erased(ft.tree, lits_t) or len(lits_e) != len(lits_t):
+            continue
+        pairing = _Pairing(by_index)
+        for ours, theirs in zip(lits_e, lits_t):
+            pairing.pair(ours, theirs)
+        if pairing.ok and pairing.values not in seen:
+            seen.append(dict(pairing.values))
+            yield level, dict(pairing.values), done(pairing.values), slots
+    # 启发式：同一列、同一运算符的常量按出现的先后配（两边那一处的个数一样才配）；还没配上的槽位再按「同一运算符、两边
+    # 都只有这一处」配（按 created_at 筛对按 paid_at 筛：对账时照样要预填日期）。只用于说明和预填
+    ours_at, theirs_at = _heuristic_pairs(root_e), _heuristic_pairs(root_t)
+    pairing = _Pairing(by_index)
+    matched = False
+
+    def slotted(b: Any) -> bool:
+        return bool(b.is_string and _STRING_SENTINEL_RE.search(str(b.this))) or \
+            (not b.is_string and pairing._bare_slot(str(b.this)) is not None)
+
+    for key, theirs in theirs_at.items():
+        ours = ours_at.get(key) or []
+        if len(ours) != len(theirs):
+            continue
+        for a, b in zip(ours, theirs):
+            if slotted(b):
+                pairing.pair(a, b)
+                matched = True
+    loose_e: dict[tuple[str, int], list[Any]] = {}
+    loose_t: dict[tuple[str, int], list[Any]] = {}
+    for at, into in ((ours_at, loose_e), (theirs_at, loose_t)):
+        for (_, op, pos), lits in at.items():
+            into.setdefault((op, pos), []).extend(lits)
+    for key, theirs in loose_t.items():
+        ours = loose_e.get(key) or []
+        if len(ours) == 1 and len(theirs) == 1 and slotted(theirs[0]):
+            free = [s for s in pairing.slots.values() if s.field not in pairing.values]
+            before = dict(pairing.values)
+            probe = _Pairing(by_index)
+            probe.pair(ours[0], theirs[0])
+            if probe.ok and probe.values and all(f in {s.field for s in free} for f in probe.values):
+                pairing.values.update({k: v for k, v in probe.values.items() if k not in before})
+                matched = True
+    if matched and pairing.ok and pairing.values and pairing.values not in seen:
+        yield "heuristic", dict(pairing.values), done(pairing.values), slots
+
+
+def _slot_defaults(slots: Any) -> dict[str, Any]:
+    """入口字段的缺省值 {字段: 缺省值}：slots 可以是入口节点的 fields（[{name, default, …}]）、{字段: {default…}} 或字段名的
+    列表（没有缺省值）。"""
+    out: dict[str, Any] = {}
+    if isinstance(slots, Mapping):
+        items = [{"name": k, **(v if isinstance(v, Mapping) else {})} for k, v in slots.items()]
+    else:
+        items = [s if isinstance(s, Mapping) else {"name": s} for s in (slots or [])]
+    for item in items:
+        name = item.get("name")
+        if isinstance(name, str) and name and item.get("default") not in (None, ""):
+            out[name] = item["default"]
+    return out
+
+
+def render_bound(template_sql: str, binding: Mapping[str, Any], slots: Any = None) -> str:
+    """按绑定渲染口径模板（engine/expressions.render_template，运行时同一个渲染器）。没绑到的字段取入口字段的缺省值，同
+    入口节点的做法（engine/nodes/io.run_input：值为空时取缺省值）。"""
+    from app.engine.expressions import render_template
+
+    values = {**_slot_defaults(slots), **{k: v for k, v in binding.items() if v not in (None, "")}}
+    return render_template(template_sql, {"input": values})
+
+
+def bind_template(template_sql: str, slots: Any, sql: str, dialect: str | None = None, *,
+                  schema: Mapping[str, Any] | None = None) -> TemplateBinding:
+    """从执行的 SQL 反推口径模板的参数（启发，见本节开头）：第一组配得上的绑定。从不抛异常。
+
+    template_sql 是口径取数节点的 args.sql（只认 {{ input.<字段> }}，可带 trim / compact）；slots 是口径入口节点的字段
+    （[{name, default, …}]、{字段: {…}} 或字段名的列表，只用来取缺省值，可以不给）；sql 是这次执行的 SQL；dialect、schema
+    同 explain_sql_diff。绑定只是启发：配上了不说明等价，要 match_template 渲染之后交 explain_sql_diff 证明。"""
+    read = _read(dialect)
+    info = _schema_info(schema)
+    try:
+        for level, values, unbound, found in _bindings(template_sql or "", sql or "", read, info):
+            return TemplateBinding(True, values, unbound, level, None, found)
+        spans, _ = _template_slots(template_sql or "")
+    except _NotComparable as e:
+        return TemplateBinding(False, reason=str(e))
+    except Exception:  # noqa: BLE001 - 绑定本身的缺陷不能连累调用方：当作没配上
+        logger.warning("口径模板绑定失败", exc_info=True)
+        spans = []
+    fields = tuple(dict.fromkeys(slot.field for _, _, slot in spans))
+    return TemplateBinding(True, {}, fields, None, "参数绑不上：这次的 SQL 和口径的写法对不上", tuple(s for _, _, s in spans))
+
+
+def _result_columns(sql: str, read: str | None, info: _Schema) -> list[str] | None:
+    """一条查询选出来的列名（最外层第一支 SELECT，按位置）：SELECT * 按表结构展开（没给表结构认不出时为 None）；没起
+    别名的表达式写成它的 SQL。解析不了为 None。"""
+    from sqlglot import exp
+
+    root, _ = _parse(_mysql_dashes(sql) if read == "mysql" else sql, read)
+    if root is None:
+        return None
+    branches = _branches(root)
+    if not branches:
+        return None
+    if any(_is_star(item) for item in branches[0].selects):
+        if not info.mapping:
+            return None
+        try:
+            from sqlglot.optimizer.qualify import qualify
+
+            root = qualify(root.copy(), dialect=read, schema=info.mapping, expand_stars=True,
+                           validate_qualify_columns=False, quote_identifiers=False, identify=False)
+        except Exception:  # noqa: BLE001 - 展开不了 *：认不出列名
+            return None
+        branches = _branches(root)
+        if not branches or any(_is_star(item) for item in branches[0].selects):
+            return None
+    out = []
+    for item in branches[0].selects:
+        name = item.alias_or_name if isinstance(item, (exp.Alias, exp.Column)) else ""
+        out.append(name or item.sql(dialect=read))
+    return out
+
+
+def match_template(template_sql: str, slots: Any, sql: str, dialect: str | None = None, *,
+                   schema: Mapping[str, Any] | None = None, names: Mapping[str, str] | None = None,
+                   labels: tuple[str, str] = ("这次", "口径"), columns: Sequence[str] | None = None,
+                   deadline: float | None = None) -> TemplateMatch:
+    """执行的 SQL 是不是这份口径模板按某组参数渲染出来的（见本节开头）。从不抛异常。
+
+    按 bind_template 同样的先后逐个试配得上的绑定，每一组都按绑定渲染口径模板，交给 explain_sql_diff(sql, 渲染结果,
+    schema=…, names=…, labels=…)：等价与否只由它判，第一组等价的就是结论。一组都不等价时给第一组绑定（都没配上时按入口
+    字段的缺省值渲染）的那次比较：diff 说差在哪（labels 缺省「这次」「口径」）。schema 是查询当时冻结的表结构，names 是
+    列的中文名（catalog_labels）。columns 是这次查询结果的列名（查询快照里记的）：等价时据此按位置给列映射，不给就从 SQL
+    里认。deadline 是 time.monotonic() 的时刻：过了就不再试下一组绑定（已经试过的照常给结论）。"""
+    import time
+
+    read = _read(dialect)
+    info = _schema_info(schema)
+    sql = sql or ""
+    template_sql = template_sql or ""
+    tried: list[tuple[str | None, dict[str, Any], tuple[str, ...], SqlDiff, str]] = []
+    try:
+        candidates = list(_bindings(template_sql, sql, read, info))
+    except _NotComparable as e:
+        return TemplateMatch(False, comparable=False, reason=str(e))
+    except Exception:  # noqa: BLE001 - 绑定本身的缺陷：当作没配上，照样按缺省值比一次
+        logger.warning("口径模板绑定失败", exc_info=True)
+        candidates = []
+    defaults = _slot_defaults(slots)
+    for level, values, unbound, found in candidates:
+        if deadline is not None and tried and time.monotonic() > deadline:
+            break
+        rendered = render_bound(template_sql, values, slots)
+        diff = explain_sql_diff(sql, rendered, dialect, schema=schema, names=names, labels=labels)
+        if diff.equivalent and _unfilled(found, values, defaults):
+            # 有槽位既没取到值、也没有缺省值：渲染出来的是口径实际不会执行的 SQL（裸写的槽位成了空白，sqlglot 照样解析得了
+            # EXISTS (SELECT  FROM …)），不能拿它证明等价
+            diff = SqlDiff(False, [FacetDiff("other", None, None, _UNFILLED)], True, (f"- {sql.strip()}",
+                                                                                     f"+ {rendered.strip()}"))
+        if diff.equivalent:
+            return TemplateMatch(True, binding=values, unbound=unbound, level=level, diff=diff, rendered=rendered,
+                                 columns=_column_map(sql, rendered, read, info, columns))
+        tried.append((level, values, unbound, diff, rendered))
+    if tried:
+        level, values, unbound, diff, rendered = tried[0]
+        return TemplateMatch(False, binding=values, unbound=unbound, level=level, diff=diff, rendered=rendered)
+    try:
+        spans, _ = _template_slots(template_sql)
+    except _NotComparable as e:
+        return TemplateMatch(False, comparable=False, reason=str(e))
+    fields = tuple(dict.fromkeys(slot.field for _, _, slot in spans))
+    rendered = render_bound(template_sql, {}, slots)
+    diff = explain_sql_diff(sql, rendered, dialect, schema=schema, names=names, labels=labels)
+    if diff.equivalent and _unfilled(tuple(slot for _, _, slot in spans), {}, defaults):
+        diff = SqlDiff(False, [FacetDiff("other", None, None, _UNFILLED)], True,
+                       (f"- {sql.strip()}", f"+ {rendered.strip()}"))
+    if diff.equivalent:
+        # 口径的参数只出现在注释里、或者缺省值正好就是这次的：渲染出来就是等价的
+        return TemplateMatch(True, unbound=fields, diff=diff, rendered=rendered,
+                             columns=_column_map(sql, rendered, read, info, columns))
+    return TemplateMatch(False, unbound=fields, diff=diff, rendered=rendered,
+                         reason="参数绑不上：这次的 SQL 和口径的写法对不上" if fields else None)
+
+
+#: 有槽位没取到值、又没有缺省值时的说法
+_UNFILLED = "口径的参数有的没能从这次的 SQL 里取到，又没有缺省值，无法按口径渲染出可比的 SQL"
+
+
+def _unfilled(slots: Sequence[TemplateSlot], values: Mapping[str, Any], defaults: Mapping[str, Any]) -> bool:
+    """有不在注释里的槽位既没取到值、也没有缺省值。引号里取到空字（''）的算取到了：口径按空字渲染就是这一句。"""
+    return any(slot.context != "comment" and values.get(slot.field) is None and slot.field not in defaults
+               for slot in slots)
+
+
+def _column_map(sql: str, rendered: str, read: str | None, info: _Schema,
+                columns: Sequence[str] | None) -> tuple[dict[str, Any], ...] | None:
+    """等价时的列映射：按位置（已实测：外层别名不计、列的先后计）。两边列数对不上、认不出列名时为 None。"""
+    ours = [str(c) for c in columns] if columns is not None else _result_columns(sql, read, info)
+    theirs = _result_columns(rendered, read, info)
+    if ours is None or theirs is None or len(ours) != len(theirs):
+        return None
+    return tuple({"index": i, "ours": a, "caliber": b} for i, (a, b) in enumerate(zip(ours, theirs)))
+
+
+__all__ = ["BINDING_LEVELS", "MAX_SQL_CHARS", "PLACEHOLDER", "Aggregate", "ColumnRef", "Computed", "FacetDiff", "Facets",
+           "JoinFacet", "LimitFacet", "NormalizedSql", "Part", "SqlDiff", "TemplateBinding", "TemplateMatch",
+           "TemplateSlot", "TimePredicate", "bind_template", "catalog_labels", "diff_facets", "explain_sql_diff",
+           "facets", "match_template", "normalize_sql", "render_bound"]

@@ -39,11 +39,22 @@ PROVIDER_LEFT = ("剩余的问题是所用的模型接入不存在或已停用�
 PROVIDER_LEFT_FIX = "；也可在各条问题下方选择改用的模型接入"
 
 
+class WorkflowOrigin(BaseModel):
+    """新工作流出自哪次运行、哪段对话、哪一轮（next-round 02 做法 9）：问数据的「在画布里打开」带上它，和从运行提取（/copilot/
+    from-run）记成同一个形状 {run_id, conversation_id?, turn_id?}。「口径 → 来源问题」、认证队列的「在画布里打开过」都读它。"""
+
+    run_id: str = Field(min_length=1, max_length=32)
+    conversation_id: str | None = Field(default=None, max_length=32)
+    turn_id: str | None = Field(default=None, max_length=32)
+
+
 class WorkflowIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = ""
     graph: dict[str, Any] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
+    #: 来源（WorkflowOrigin）：服务端核对运行读得到、对话用得了、这一轮属于这段对话，才记进 workflows.origin
+    origin: WorkflowOrigin | None = None
 
 
 class WorkflowPatch(BaseModel):
@@ -137,11 +148,13 @@ async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[W
 async def create_workflow(
     payload: WorkflowIn, session: AsyncSession = Depends(get_session)
 ) -> WorkflowOut:
+    origin = await _checked_origin(session, payload.origin) if payload.origin is not None else None
     workflow = Workflow(
         name=payload.name,
         description=payload.description,
         graph=payload.graph,
         tags=payload.tags,
+        origin=origin,
     )
     session.add(workflow)
     await session.flush()
@@ -152,6 +165,30 @@ async def create_workflow(
     await session.commit()
     await session.refresh(workflow)
     return await _workflow_out(session, workflow)
+
+
+#: 新工作流的来源核对不过（422）：运行读不到、这一轮不属于这段对话
+WORKFLOW_ORIGIN_INVALID = "workflow_origin_invalid"
+
+
+async def _checked_origin(session: AsyncSession, origin: WorkflowOrigin) -> dict[str, str]:
+    """核对新工作流的来源，规则同从运行提取（/copilot/from-run）：运行这个人读得到（读不到的当它不存在）；对话这个人用得了
+    （不能用的 403）；给了轮次的，这一轮要是这段对话的。对话不存在的照 from-run 记下 id（对话删了，来源仍是那次运行）。"""
+    from app.api.deps import can_read_run, current_principal, ensure_conversation_access
+    from app.db.models import ConversationTurn
+
+    run = await session.get(Run, origin.run_id)
+    if run is None or not await can_read_run(current_principal(), run):
+        raise CodedHTTPException(422, "来源的运行不存在，可能已被删除", WORKFLOW_ORIGIN_INVALID, field="origin")
+    conversation = await ensure_conversation_access(session, origin.conversation_id)
+    if origin.turn_id:
+        turn = await session.get(ConversationTurn, origin.turn_id)
+        if turn is None or not origin.conversation_id or turn.conversation_id != origin.conversation_id:
+            raise CodedHTTPException(422, "来源的这一轮不属于这段对话", WORKFLOW_ORIGIN_INVALID, field="origin")
+    return {"run_id": run.id,
+            **({"conversation_id": conversation.id if conversation else origin.conversation_id}
+               if origin.conversation_id else {}),
+            **({"turn_id": origin.turn_id} if origin.turn_id else {})}
 
 
 @router.get("/{workflow_id}", response_model=WorkflowOut)

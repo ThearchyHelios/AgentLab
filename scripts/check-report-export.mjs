@@ -238,6 +238,74 @@ await section('断网打开', async () => {
   }
 })
 
+// ---------------------------------------------------------------- 口径一步（口径账本，next-round 02 做法 3）
+
+await section('口径一步', async () => {
+  if (skipped()) return
+  const data = dataOf(html)
+  // 没比对过的运行：数据块里没有 ledger，面板里也没有「口径」一步
+  if (!data.ledger) {
+    const plain = await openFile(writePage('report-plain.html', html))
+    try {
+      const cited = plain.page.locator('#report button[data-seg][data-state="deterministic"]').first()
+      if (await cited.count()) {
+        await cited.click()
+        await plain.page.locator('#detail').waitFor({ state: 'visible', timeout: 5000 })
+        check('没比对过的运行：面板里没有「口径」一步', await plain.page.locator('#detail [data-step="ledger"]').count() === 0)
+      }
+    } finally {
+      await plain.ctx.close()
+    }
+  }
+  // 服务端比对过的运行面板里是什么样：数据块里放一份口径账本给的标签（来自口径、相关口径各一个），断网打开点开看。
+  // 只改数据块（脚本的哈希不变，内容安全策略照样放行）
+  const keys = Object.keys(data.refs ?? {})
+  if (!keys.length) return note('报告里没有可点的片段，口径一步不查')
+  const labels = {
+    [keys[0]]: { kind: 'caliber', how: 'independent', caliber: 'wf-x@3', workflow_id: 'wf-x', version: 3, level: 'governed',
+      workflow_name: '周销售', level_text: '受管', column: 'gmv',
+      binding: [{ field: 'start', value: '2026-09-01' }, { field: 'phone', masked: true, value: '已遮罩' }] },
+    ...(keys[1] ? { [keys[1]]: { kind: 'related', related: [{ caliber: 'wf-x@3', workflow_id: 'wf-x', version: 3,
+      workflow_name: '周销售', level_text: '受管', diff: { items: [{ aspect: 'filter', text: '口径只保留已支付的行，这次没有这个条件' }] } }] } } : {}),
+  }
+  const ledger = { labels, note: '封存后比对，不在封存范围内', retro: true, retro_note: '按现在的口径回看' }
+  const patched = html.replace(DATA_RE, (_, a, body, c) => a + JSON.stringify({ ...JSON.parse(body), ledger })
+    .replace(/</g, '\\u003c') + c)
+  const { ctx, page, errors } = await openFile(writePage('report-ledger.html', patched))
+  try {
+    const first = page.locator(`#report button[data-seg="${keys[0]}"]`).first()
+    if (!(await first.count())) return note('数据块里的片段在正文里找不到按钮，口径一步不查')
+    // 只打印「口径」这一节（数据块里放的是编的标签）：面板别处是真数据，不打印
+    const ledgerText = async (seg) => {
+      await seg.click()
+      await page.locator('#detail').waitFor({ state: 'visible', timeout: 5000 })
+      const part = page.locator('#detail [data-step="ledger"]')
+      const text = (await part.count()) ? await part.innerText() : ''
+      const order = await page.evaluate(() => [...document.querySelectorAll('#detail-body > section')].map((s) => s.dataset.step ?? ''))
+      await page.keyboard.press('Escape')
+      return { text, order }
+    }
+    const { text, order } = await ledgerText(first)
+    check('面板最上面多「口径」一步：来自口径「周销售」v3（受管）、等价已证明', /口径/.test(text)
+      && text.includes('来自口径「周销售」v3（受管）') && text.includes('等价已证明'), text.replace(/\n/g, ' '))
+    check('参数照给，遮罩的写「已遮罩」', text.includes('start = 「2026-09-01」') && text.includes('phone = 已遮罩'))
+    check('写明封存后比对、不在封存范围内，事后补比的写按现在的口径回看',
+      text.includes('封存后比对，不在封存范围内') && text.includes('按现在的口径回看'))
+    check('「口径」一步排在出处链前面', order[1] === 'ledger', order.slice(0, 2).join(','))
+    if (keys[1]) {
+      const second = page.locator(`#report button[data-seg="${keys[1]}"]`).first()
+      if (await second.count()) {
+        const other = (await ledgerText(second)).text
+        check('相关口径：写明是哪一份、差在哪', other.includes('相关口径') && other.includes('口径只保留已支付的行'),
+          other.replace(/\n/g, ' '))
+      }
+    }
+    check('页面没有报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  } finally {
+    await ctx.close()
+  }
+})
+
 // ---------------------------------------------------------------- 不执行脚本
 
 await section('不执行脚本', async () => {
