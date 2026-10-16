@@ -365,7 +365,7 @@ async def test_profile_marks_codes_complete_only_when_the_whole_table_was_read(c
     capped = await make_source(scenic_db, options=_on(max_scan_rows=0, sample_size=10), draft=["visits"])
     await _profile(client, capped, ["visits"])
     codes = (await _notes(client, capped, "visits"))["notes"]["columns"]["status"]["codes"]
-    assert "按前 10 行统计" in codes["note"] and "complete" not in codes
+    assert "按存储顺序取前 10 行统计" in codes["note"] and "complete" not in codes
 
 
 # ==========================================================================

@@ -3528,7 +3528,8 @@ export interface CatalogProfileTaskDetail extends CatalogProfileTaskRow {
   findings: CatalogProfileFinding[]
   skipped: CatalogProfileSkip[]
   /** 日期类列的取值范围 */
-  date_ranges: { column: string; min: string; max: string }[]
+  /** invalid：零日期、占位日期这类不计入最小值和最大值的个数（没有时不给） */
+  date_ranges: { column: string; min: string; max: string; invalid?: number }[]
   query_log: CatalogProfileQuery[]
 }
 

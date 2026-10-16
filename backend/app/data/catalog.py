@@ -1365,7 +1365,9 @@ def is_date_column(name: str, type_name: str | None) -> bool:
     数据剖析（表里只有一个日期类列时提议它作业务日期）和 SQL 检查（按业务日期以外的时间列统计）共用这一个判断。
     以前两边各写一套：剖析认的「唯一日期列」，SQL 检查可能认为还有别的时间列，反过来也一样，两边对不上。
     """
-    t = (type_name or "").upper()
+    t = _type_words(type_name)
+    if t.startswith(("ENUM", "SET")) or "INTERVAL" in t:
+        return False
     if "DATE" in t or "TIMESTAMP" in t:
         return True
     if t and not any(k in t for k in _TEXT_TYPES):
@@ -1400,10 +1402,28 @@ def _name_index(tables: Mapping[str, Any]) -> dict[tuple[str, str], set[str]]:
     return index
 
 
+#: 类型写法里带引号的部分（ENUM('int','date') 的取值）：认类型时去掉，取值里的词不能让一列变成数字或时间
+_QUOTED_IN_TYPE = re.compile(r"'(?:[^']|'')*'")
+
+
+def _type_words(type_name: str | None) -> str:
+    """认类型用的写法：大写、去掉引号里的取值。探查存的是按方言编译的完整写法（ENUM('paid','refund')、
+    VARCHAR2(20 CHAR)、TIMESTAMP WITH TIME ZONE），不再是 SQLAlchemy 的通用写法。"""
+    return _QUOTED_IN_TYPE.sub("''", (type_name or "").upper()).strip()
+
+
 def _type_family(type_name: str | None) -> str | None:
-    """列类型的大类：数字、文字、时间；认不出来返回 None（不据此排除）。"""
-    t = (type_name or "").upper()
+    """列类型的大类：数字、文字、时间；认不出来返回 None（不据此排除）。
+
+    认的是按方言编译的完整写法：MySQL 的 ENUM / SET 是文字（取值列表里的词不算），Oracle 的 INTERVAL DAY TO SECOND
+    是时长、不算数字（以前按子串「INT」认成了数字）。PostgreSQL 的枚举编译出来是类型名本身，只看类型认不出来，
+    要看列上的取值列表（column_family）。"""
+    t = _type_words(type_name)
     if not t:
+        return None
+    if t.startswith(("ENUM", "SET")):
+        return "text"
+    if "INTERVAL" in t:
         return None
     if any(k in t for k in ("CHAR", "TEXT", "CLOB", "STRING", "UUID")):
         return "text"
@@ -1412,6 +1432,16 @@ def _type_family(type_name: str | None) -> str | None:
     if any(k in t for k in ("DATE", "TIME")):
         return "time"
     return None
+
+
+def column_family(col: Mapping[str, Any] | None) -> str | None:
+    """表结构里一列的类型大类：有取值列表（探查记下的 enum_values：MySQL 的 ENUM / SET、PostgreSQL 的枚举）的是
+    文字，其余按类型写法认（_type_family）。"""
+    if not isinstance(col, Mapping):
+        return None
+    if col.get("enum_values"):
+        return "text"
+    return _type_family(col.get("type"))
 
 
 def _id_stem(column: str) -> str | None:
@@ -1469,8 +1499,8 @@ def infer_name_relations(schema_cache: Mapping[str, Any] | None, table: str, *,
         pk = list(target_meta.get("primary_key") or [])
         if len(pk) != 1:
             continue
-        pk_type = next((c.get("type") for c in target_meta.get("columns") or [] if c.get("name") == pk[0]), None)
-        mine, theirs = _type_family(col.get("type")), _type_family(pk_type)
+        pk_col = next((c for c in target_meta.get("columns") or [] if c.get("name") == pk[0]), None)
+        mine, theirs = column_family(col), column_family(pk_col)
         if mine and theirs and mine != theirs:
             continue
         out.append(_relation(table, [name], target, pk, "name", cardinality=_cardinality(meta, [name])))

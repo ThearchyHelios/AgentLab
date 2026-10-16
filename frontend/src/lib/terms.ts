@@ -2771,7 +2771,7 @@ export const SCHEMA_PARTIAL_TEXT = {
 // - 剖析是后台任务：逐张表进行，每张表剖析完就写进目录；查询一条一条地发，可以随时停止。关掉对话框照常进行。
 //   目录只在整张表结束时写一次：停止、关停服务时正在做的那张来得及收尾，做完的项照常写进去；进程被杀时那张表没来得及收尾，
 //   这次做完的项一项都没写进去。说停下以后写进了什么，按逐表的状态照实说（cancelledNote / interruptedNote），不一律说「已写进」。
-// - 预算按表算：「每张表最多查询数」「每张表时长上限」用完只停这张表，下一张表重新计数；另有单条查询时限、抽样键值数、
+// - 预算按表算：「每张表最多查询数」「每张表时长上限」用完只停这张表，下一张表重新计数；另有单条查询时限、核对键值数、
 //   整表统计行数上限。标签和服务端校验报错里的叫法一致（catalog_profile._NUMBER_FIELDS），保存被拒时按机读码认出是哪一项。
 // - 没有整次总量上限：任务自己在连续失败、多数超时时停下（止损），写明原因。
 // - 「没查成」≠ 结论错了：因为次数、时长、超时、出错没查成的项保留剖析以前的结论，可以「重试没做完的表」。
@@ -2783,7 +2783,7 @@ export const PROFILE_FIELD_LABEL: Record<'enabled' | CatalogProfileNumberKey, st
   table_max_queries: '每张表最多查询数',
   table_max_s: '每张表时长上限',
   query_timeout_s: '单条查询时限',
-  sample_size: '抽样键值数',
+  sample_size: '核对键值数',
   max_scan_rows: '整表统计行数上限',
 }
 
@@ -2799,7 +2799,7 @@ export const PROFILE_FIELD_HINT: Record<CatalogProfileNumberKey, string> = {
   table_max_queries: '剖析一张表最多发出的查询条数，用完只停这张表，下一张表重新计数',
   table_max_s: '剖析一张表最多用的时长，到时只停这张表，下一张表重新计时',
   query_timeout_s: '超过即中断这条查询；不超过数据源自身的查询时限，也不超过这张表剩下的时长',
-  sample_size: '核对一条关联关系时，从本表抽取的不同键值个数',
+  sample_size: '核对一条关联关系时，从本表取的不同键值个数：取的是数据库先给出的那些，不是随机抽样',
   max_scan_rows: '不超过此行数的表才做去重计数、最小值和最大值等整表统计',
 }
 
@@ -2863,7 +2863,7 @@ export const PROFILE_TEXT = {
   budgetPerTable: (queries: number, secs: number) =>
     `每张表最多 ${formatNumber(queries)} 条查询、${formatNumber(secs)} 秒，用完只停这张表，下一张表重新计数`,
   budgetQuery: (secs: number) => `单条查询不超过 ${formatNumber(secs)} 秒`,
-  budgetSample: (n: number) => `每条关联关系抽样 ${formatNumber(n)} 个键值`,
+  budgetSample: (n: number) => `每条关联关系取 ${formatNumber(n)} 个不同键值核对`,
   budgetScan: (n: number) => (n > 0 ? `行数超过 ${formatNumber(n)} 的表不做整表统计` : '不做整表统计'),
   /** 上限的估算：表数 × 每张表的上限 */
   budgetTotal: (tables: number, queries: number, span: string) =>
@@ -3002,7 +3002,7 @@ export const PROFILE_TEXT = {
   relationLowCoverage: '覆盖率不足，可能不是这条关系',
   relationNotUnique: '被指向列未核实唯一',
   coverage: (pct: string) => `覆盖率 ${pct}`,
-  sampled: (sample: number, matched: number) => `抽样 ${formatNumber(sample)} 个键值，对上 ${formatNumber(matched)} 个`,
+  sampled: (sample: number, matched: number) => `取了 ${formatNumber(sample)} 个不同键值，对上 ${formatNumber(matched)} 个`,
   cardinalityUnknown: '基数未核实',
   codeRows: (n: number) => `${formatNumber(n)} 行`,
   codesSummary: (values: number, rows: number) => `${formatNumber(values)} 个取值，共 ${formatNumber(rows)} 行`,
@@ -3012,10 +3012,12 @@ export const PROFILE_TEXT = {
   dateProposal: (col: string) => `提议按 ${col} 作为业务日期`,
   dateSpan: (min: string, max: string) => `取值从 ${min} 到 ${max}`,
   dateRanges: '日期列的取值范围',
+  /** 日期列的最小值、最大值不计入的值（catalog_profile.VALID_DATE_FROM）：零日期、0001-01-01、9999-12-31、无穷大 */
+  dateInvalid: (n: number) => `另有 ${formatNumber(n)} 个无效日期未计入（零日期或占位日期）`,
   skippedTitle: (n: number) => `跳过 ${formatNumber(n)} 项`,
   moreSkipped: (n: number) => `…另有 ${formatNumber(n)} 项`,
   queriesTitle: (n: number) => `看发过的查询（${formatNumber(n)} 条）`,
-  queriesHint: 'SQL 里的取值都换成了「?」：抽样到的键值不保存在 AgentLab 中；遮罩的列不出现在任何查询里',
+  queriesHint: 'SQL 里的取值都换成了「?」：取到的键值不保存在 AgentLab 中；遮罩的列不出现在任何查询里',
   queryKind: { row_estimate: '行数估算', relation: '关系', codes: '码值', date: '日期' } as Record<string, string>,
   queryOutcome: { ok: '成功', timeout: '超时', error: '失败', rejected: '未通过只读守卫' } as Record<string, string>,
   queryRows: (n: number) => `${formatNumber(n)} 行`,

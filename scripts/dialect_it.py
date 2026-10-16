@@ -1,0 +1,388 @@
+"""方言容器集成测试的执行端（由 scripts/dialect-it.sh 起好容器后调用，不进 CI）。
+
+对每种库：
+1. 用管理账号建虚构夹具（见 _ddl / _rows）；
+2. 用 AgentLab 自己的探查（app.data.introspect）读结构，核对类型写法、ENUM 取值、Oracle 小写带引号的名字、索引首列；
+3. 用 AgentLab 自己的剖析（catalog_profile.profile_table，目录读写换成内存里的）逐表剖析，经只读连接、守卫、单条时限，
+   和线上走的是同一条路；
+4. 直接跑取值观察要用的新查询（按日行数、时间窗口里的取值分布、块采样）；
+5. 断言：所有查询零报错（留痕里没有超时、失败、守卫拒），每个结论和下面按夹具定义手算的一致。
+
+夹具的数（手算的依据）：orders 40 行，id 1–40。
+- store_code = id % 5 + 1（整数子列，指向文字主键 stores.code，'1'–'5' 都在）；
+- status CHAR(2)：id 是 3 的倍数为 'A'，否则 'B'（13 / 27）；type：奇数 'web'、偶数 'shop'（20 / 20）；
+  level = id % 3 + 1（1: 13、2: 14、3: 13）；pay_way（只 MySQL / MariaDB，ENUM('cash','card','coupon')）：奇数 cash、偶数 card；
+- paid_at = 2026-09-01 10:00 加 (id % 10) 天，id 39、40 是无效日期（MySQL 零日期、PG ±infinity、Oracle 0001-01-01 和
+  9999-12-31 23:59:59）；date（日期列）同 paid_at 的日子，id 39、40 为空；
+- events 先插 10 行、收集统计信息，再插 1500 行（统计信息做旧：说 10 行，其实 1510 行，超过整表统计上限 1000）；
+- Oracle 另有小写带引号的表 "visits"（"id"、"level"），3 行，level 1、1、2。
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime as _dt
+import os
+import sys
+import tempfile
+import time
+from collections import Counter
+from types import SimpleNamespace
+from typing import Any
+
+# AgentLab 自己的库放到临时目录：不碰开发数据目录（必须在导入 app 之前设）
+os.environ["AGENTLAB_DATA_DIR"] = tempfile.mkdtemp(prefix="agentlab-dialect-it-")
+
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
+
+from app.core.crypto import encrypt  # noqa: E402
+from app.data import catalog, catalog_profile, introspect  # noqa: E402
+from app.data import engine as data_engine  # noqa: E402
+from app.data.catalog_profile import ProfileSettings, SqlDialect  # noqa: E402
+
+PASSWORD = os.environ.get("DIALECT_IT_PASSWORD", "itpass")
+SETTINGS = ProfileSettings(enabled=True, table_max_queries=40, table_max_s=60, query_timeout_s=10, sample_size=100,
+                           max_scan_rows=1000)
+N_ORDERS, N_EVENTS_OLD, N_EVENTS_NEW = 40, 10, 1500
+BASE = _dt.datetime(2026, 9, 1, 10, 0, 0)
+WINDOW_FROM = "2026-09-05"
+
+failures: list[str] = []
+
+
+def check(ok: bool, what: str) -> None:
+    print(("  ✓ " if ok else "  ✗ ") + what)
+    if not ok:
+        failures.append(what)
+
+
+# ---------------------------------------------------------------- 手算
+
+
+def _order(i: int) -> dict[str, Any]:
+    return {"id": i, "store_code": i % 5 + 1, "status": "A" if i % 3 == 0 else "B",
+            "type": "web" if i % 2 else "shop", "level": i % 3 + 1, "pay_way": "cash" if i % 2 else "card",
+            "paid_at": None if i >= 39 else BASE + _dt.timedelta(days=i % 10),
+            "date": None if i >= 39 else (BASE + _dt.timedelta(days=i % 10)).date()}
+
+
+ORDERS = [_order(i) for i in range(1, N_ORDERS + 1)]
+VALID = [o for o in ORDERS if o["paid_at"] is not None]
+IN_WINDOW = [o for o in VALID if o["paid_at"].date().isoformat() >= WINDOW_FROM]
+EXPECT = {
+    "status": Counter(o["status"] for o in ORDERS),
+    "type": Counter(o["type"] for o in ORDERS),
+    "level": Counter(str(o["level"]) for o in ORDERS),
+    "pay_way": Counter(o["pay_way"] for o in ORDERS),
+    "paid_at": (min(o["paid_at"] for o in VALID), max(o["paid_at"] for o in VALID)),
+    "day_volume": Counter(o["paid_at"].date().isoformat() for o in IN_WINDOW),
+    "window_status": Counter(o["status"] for o in IN_WINDOW),
+}
+
+
+# ---------------------------------------------------------------- 各库的夹具
+
+
+class Target:
+    def __init__(self, key: str, kind: str, port: int) -> None:
+        self.key, self.kind, self.port = key, kind, port
+        self.oracle = kind == "oracle"
+        self.mysql = kind in ("mysql", "mariadb")
+        self.pg = kind == "postgresql"
+
+    def admin_url(self) -> str:
+        if self.pg:
+            return f"postgresql+asyncpg://postgres:{PASSWORD}@127.0.0.1:{self.port}/it"
+        if self.mysql:
+            return f"mysql+aiomysql://root:{PASSWORD}@127.0.0.1:{self.port}/it"
+        return f"oracle+oracledb://it:{PASSWORD}@127.0.0.1:{self.port}/?service_name=FREEPDB1"
+
+    def source(self) -> SimpleNamespace:
+        user = {"postgresql": "postgres", "mysql": "root", "mariadb": "root", "oracle": "it"}[self.kind]
+        return SimpleNamespace(id=f"it-{self.key}", name=f"it_{self.key}", kind=self.kind, host="127.0.0.1",
+                               port=self.port, database="FREEPDB1" if self.oracle else "it", username=user,
+                               password=encrypt(PASSWORD), options={}, readonly=True, description="",
+                               schema_cache={}, origin="manual", enabled=True)
+
+
+def _q(t: Target, name: str) -> str:
+    """建表时的列名：Oracle 上 TYPE、LEVEL、DATE 是保留字，按大写加引号建（库里就是大写的普通名字）。"""
+    if t.oracle and name in ("type", "level", "date"):
+        return f'"{name.upper()}"'
+    if t.mysql:
+        return f"`{name}`"
+    return f'"{name}"' if name in ("type", "level", "date") else name
+
+
+def _ddl(t: Target) -> list[str]:
+    ts = "TIMESTAMP" if not t.mysql else "DATETIME"
+    intg = "NUMBER(10)" if t.oracle else "INTEGER"
+    vc = "VARCHAR2" if t.oracle else "VARCHAR"
+    cols = [f"id {intg} PRIMARY KEY", f"store_code {intg}", "status CHAR(2)", f"{_q(t, 'type')} {vc}(10)",
+            f"{_q(t, 'level')} {intg}", f"paid_at {ts}", f"{_q(t, 'date')} DATE"]
+    if t.mysql:
+        cols.append("pay_way ENUM('cash','card','coupon')")
+    out = [f"CREATE TABLE stores (code {vc}(10) PRIMARY KEY, name {vc}(20))",
+           f"CREATE TABLE orders ({', '.join(cols)})",
+           "CREATE INDEX ix_orders_paid_at ON orders (paid_at)"]
+    events = f"CREATE TABLE events (id {intg} PRIMARY KEY, kind {vc}(10))"
+    if t.pg:
+        events += " WITH (autovacuum_enabled = false)"
+    if t.mysql:
+        events += " STATS_PERSISTENT=1 STATS_AUTO_RECALC=0"
+    out.append(events)
+    if t.oracle:
+        out.append('CREATE TABLE "visits" ("id" NUMBER(10) PRIMARY KEY, "level" NUMBER(10))')
+    return out
+
+
+def _paid(t: Target, o: dict[str, Any]) -> str:
+    if o["paid_at"] is not None:
+        stamp = o["paid_at"].strftime("%Y-%m-%d %H:%M:%S")
+        return f"TIMESTAMP '{stamp}'" if t.oracle else f"'{stamp}'"
+    # 无效日期：各家能存进去的那种
+    if t.mysql:
+        return "'0000-00-00 00:00:00'"
+    if t.pg:
+        return "'infinity'" if o["id"] == 39 else "'-infinity'"
+    return "TIMESTAMP '9999-12-31 23:59:59'" if o["id"] == 39 else "TIMESTAMP '0001-01-01 00:00:00'"
+
+
+def _rows(t: Target) -> list[str]:
+    out = [f"INSERT INTO stores (code, name) VALUES ('{c}', 'store {c}')" for c in ("1", "2", "3", "4", "5", "A1")]
+    for o in ORDERS:
+        day = f"DATE '{o['date'].isoformat()}'" if o["date"] is not None else "NULL"
+        cols = ["id", "store_code", "status", _q(t, "type"), _q(t, "level"), "paid_at", _q(t, "date")]
+        vals = [str(o["id"]), str(o["store_code"]), f"'{o['status']}'", f"'{o['type']}'", str(o["level"]),
+                _paid(t, o), day]
+        if t.mysql:
+            cols.append("pay_way")
+            vals.append(f"'{o['pay_way']}'")
+        out.append(f"INSERT INTO orders ({', '.join(cols)}) VALUES ({', '.join(vals)})")
+    if t.oracle:
+        out += ['INSERT INTO "visits" ("id", "level") VALUES (1, 1)', 'INSERT INTO "visits" ("id", "level") VALUES (2, 1)',
+                'INSERT INTO "visits" ("id", "level") VALUES (3, 2)']
+    return out
+
+
+def _events(start: int, n: int) -> list[str]:
+    return [f"INSERT INTO events (id, kind) VALUES ({i}, '{'open' if i % 4 else 'close'}')"
+            for i in range(start, start + n)]
+
+
+def _analyze(t: Target, table: str) -> list[str]:
+    if t.pg:
+        return [f"ANALYZE {table}"]
+    if t.mysql:
+        return [f"ANALYZE TABLE {table}"]
+    return [f"BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, '{table.upper()}'); END;"]
+
+
+async def _wait(t: Target, deadline_s: float = 360) -> Any:
+    engine = create_async_engine(t.admin_url())
+    started = time.monotonic()
+    while True:
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1 FROM DUAL" if t.oracle else "SELECT 1"))
+            return engine
+        except Exception as e:  # noqa: BLE001 - 容器还没起来：等
+            if time.monotonic() - started > deadline_s:
+                raise RuntimeError(f"{t.key} 在 {deadline_s:.0f} 秒内没起来：{e}") from e
+            await asyncio.sleep(3)
+
+
+async def _setup(t: Target) -> None:
+    engine = await _wait(t)
+    try:
+        async with engine.begin() as conn:
+            if t.mysql:
+                # 关掉严格模式才写得进零日期（老库里常见的情形）
+                await conn.execute(text("SET SESSION sql_mode = ''"))
+            for sql in _ddl(t) + _rows(t) + _events(1, N_EVENTS_OLD):
+                await conn.exec_driver_sql(sql)
+        async with engine.begin() as conn:
+            for sql in _analyze(t, "events") + _analyze(t, "orders") + _analyze(t, "stores"):
+                await conn.exec_driver_sql(sql)
+            if t.oracle:
+                await conn.exec_driver_sql("""BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, '"visits"'); END;""")
+        async with engine.begin() as conn:
+            if t.mysql:
+                await conn.execute(text("SET SESSION sql_mode = ''"))
+            for sql in _events(N_EVENTS_OLD + 1, N_EVENTS_NEW):
+                await conn.exec_driver_sql(sql)
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------- 剖析：目录换成内存里的
+
+
+async def _profile(source: Any, tables: list[str], notes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    cx = catalog_profile.make_context(source, SETTINGS, options={})
+    captured: dict[str, Any] = {}
+
+    async def db(fn: Any, *args: Any) -> Any:
+        if fn is catalog_profile._read_notes:
+            return notes.get(args[1], {})
+        if fn is catalog_profile._record:
+            _sid, table, out, result, _actor, _rec = args
+            catalog_profile._settle_status(result)
+            captured[table] = (out, result)
+            return None
+        raise AssertionError(f"剖析要了没预料的库操作：{fn}")
+
+    for table in tables:
+        await catalog_profile.profile_table(cx, table, db=db)
+    return captured
+
+
+def _key(meta: dict[str, Any], name: str) -> str:
+    """表结构里这个名字的写法（Oracle 上普通名字是小写，TYPE 这类保留字是大写）。"""
+    return next(str(c["name"]) for c in meta["columns"] if str(c["name"]).lower() == name)
+
+
+def _day(v: Any) -> str:
+    return str(v)[:10]
+
+
+async def run_target(t: Target) -> None:
+    print(f"\n== {t.key}（{t.kind}，端口 {t.port}）")
+    await _setup(t)
+    source = t.source()
+    try:
+        cache = await introspect.introspect(source)
+        source.schema_cache = cache
+        tables = cache["tables"]
+        orders, events, stores = tables["orders"], tables["events"], tables["stores"]
+        types = {c["name"].lower(): c for c in orders["columns"]}
+        check(not cache.get("failed") and {"orders", "events", "stores"} <= set(tables), "探查读到三张夹具表")
+        check("paid_at" in [c.lower() for c in orders.get("index_first_columns") or []],
+              f"索引首列记进了表结构：{orders.get('index_first_columns')}")
+        if t.oracle:
+            check(stores["columns"][0]["type"] == "VARCHAR2(10 CHAR)", f"Oracle 文字类型写全了长度和单位："
+                                                                         f"{stores['columns'][0]['type']}")
+            check(types["id"]["type"] == "NUMBER(10, 0)", f"Oracle 数字类型写全了精度：{types['id']['type']}")
+            check("visits" in tables and tables["visits"].get("quote_name") is True,
+                  "Oracle 小写带引号的表记了 quote_name")
+            check(all(c.get("quote_name") is True for c in tables["visits"]["columns"]),
+                  "Oracle 小写带引号的列记了 quote_name")
+            check(_key(orders, "level") == "LEVEL" and "quote_name" not in types["level"],
+                  "Oracle 的保留字列 LEVEL 是大写的普通名字，不记 quote_name")
+        if t.mysql:
+            check(types["pay_way"]["type"].startswith("ENUM(") and
+                  types["pay_way"].get("enum_values") == ["cash", "card", "coupon"],
+                  f"MySQL ENUM 记下了取值列表：{types['pay_way']}")
+        if t.pg:
+            check(types["paid_at"]["type"] == "TIMESTAMP WITHOUT TIME ZONE",
+                  f"PostgreSQL 时间类型写全了时区：{types['paid_at']['type']}")
+
+        store_col, code_col = _key(orders, "store_code"), _key(stores, "code")
+        rel = catalog.relation_id("orders", [store_col], "stores", [code_col])
+        notes = {"orders": {"relations": [{"id": rel, "columns": [store_col], "to_table": "stores",
+                                           "to_columns": [code_col], "cardinality": "many_to_one", "source": "name",
+                                           "status": "proposed"}]}}
+        names = ["orders", "events", "stores"] + (["visits"] if t.oracle else [])
+        got = await _profile(source, names, notes)
+
+        logs = [q for _, r in got.values() for q in r.query_log]
+        bad = [f"{q['kind']} {q['target']}：{q['outcome']} {q['detail']}" for q in logs if q["outcome"] != "ok"]
+        check(not bad, f"剖析的 {len(logs)} 条查询零报错" + (f"：{bad[:3]}" if bad else ""))
+
+        out, result = got["orders"]
+        check(result.status == "ok", f"orders 剖析完成：{result.status} {result.error or ''}")
+        [r] = out.relations or [None]
+        check(r is not None and r.coverage == 1.0 and r.sample == 5 and r.matched == 5 and r.holds,
+              f"整数子列对文字主键：取 5 个键值全对上、升为有确证（{r and r.note}）")
+        codes = {c.column.lower(): c for c in out.codes}
+        for col in ("status", "type", "level") + (("pay_way",) if t.mysql else ()):
+            c = codes.get(col)
+            check(c is not None and Counter(dict(c.values)) == EXPECT[col],
+                  f"{col} 的取值分布和手算一致：{c and c.values}")
+        if t.oracle or t.pg:
+            check(codes["status"].values and all(not k.endswith(" ") for k, _ in codes["status"].values),
+                  "CHAR(2) 码值去掉了补齐的空格")
+        if t.mysql:
+            check(codes["pay_way"].declared == ["coupon"] and "coupon" in codes["pay_way"].note,
+                  "ENUM 列定义里没出现的取值也进了码值")
+            check(catalog_profile.MYSQL_CODES_COLLATION_NOTE in codes["status"].note, "MySQL 码值说明写了排序规则")
+            check(catalog_profile.MYSQL_COLLATION_NOTE in r.note, "MySQL 关系说明写了排序规则")
+        ranges = {d["column"].lower(): d for d in result.date_ranges}
+        paid = ranges.get("paid_at")
+        lo, hi = EXPECT["paid_at"]
+        check(paid is not None and paid["min"][:19].replace("T", " ") == str(lo) and
+              paid["max"][:19].replace("T", " ") == str(hi) and paid.get("invalid") == 2,
+              f"paid_at 的范围排除了 2 个无效日期：{paid}")
+        day = ranges.get("date")
+        check(day is not None and _day(day["min"]) == lo.date().isoformat() and _day(day["max"]) ==
+              hi.date().isoformat() and not day.get("invalid"), f"date 列（保留字）的范围：{day}")
+
+        out_e, result_e = got["events"]
+        size = result_e.row_estimate
+        d = SqlDialect(t.kind)
+        stats = await data_engine.run_query(source, d.stats_sql(events, "events"))
+        estimated = int(float(stats.rows[0][0] or 0)) if stats.rows else 0
+        if estimated <= SETTINGS.max_scan_rows:
+            check(size is not None and size.rows is None and size.at_least == SETTINGS.max_scan_rows + 1,
+                  f"统计信息做旧（说 {estimated} 行，其实 {N_EVENTS_OLD + N_EVENTS_NEW} 行）也认出了大表：{size}")
+        else:
+            # 有的库插入时自己就更新了行数估算，夹具做不旧：照实说，只核对按统计信息认出了大表
+            print(f"  · 统计信息没能做旧（库自己更新成了 {estimated} 行），只核对按统计信息认出大表")
+            check(size is not None and size.method == "stats" and (size.rows or 0) > SETTINGS.max_scan_rows,
+                  f"按统计信息认出了大表：{size}")
+        kind_codes = next((c for c in out_e.codes if c.column.lower() == "kind"), None)
+        check(kind_codes is not None and not kind_codes.complete and "按存储顺序取前" in kind_codes.note,
+              f"大表的码值按存储顺序的前若干行，不标已列全：{kind_codes and kind_codes.note}")
+
+        if t.oracle:
+            out_v, result_v = got["visits"]
+            lv = next((c for c in out_v.codes if c.column == "level"), None)
+            check(result_v.status == "ok" and lv is not None and Counter(dict(lv.values)) == Counter({"1": 2, "2": 1}),
+                  f"小写带引号的表和列照样剖析：{result_v.status} {lv and lv.values}")
+            vstats = await data_engine.run_query(source, d.stats_sql(tables["visits"], "visits"))
+            check(bool(vstats.rows) and vstats.rows[0][0] is not None, f"小写表的统计信息按原名查得到：{vstats.rows}")
+
+        # ---- 取值观察的新方法
+        tbl = d.table(orders, "orders")
+        paid_col = d.column(orders, _key(orders, "paid_at"))
+        res = await data_engine.run_query(source, d.day_volume_sql(tbl, paid_col, WINDOW_FROM))
+        got_days = Counter({_day(row[0]): int(row[1]) for row in res.rows})
+        check(got_days == EXPECT["day_volume"], f"按日行数和手算一致（无效日期不算进窗口）：{dict(got_days)}")
+        status_col = d.column(orders, _key(orders, "status"))
+        res = await data_engine.run_query(source, d.window_value_counts_sql(tbl, status_col, paid_col, WINDOW_FROM, 21))
+        got_window = Counter({str(row[0]).rstrip(" "): int(row[1]) for row in res.rows})
+        check(got_window == EXPECT["window_status"], f"时间窗口里的取值分布和手算一致：{dict(got_window)}")
+        sampled = d.sample_value_counts_sql(d.table(events, "events"), d.column(events, _key(events, "kind")), 50, 21)
+        if t.pg or t.oracle:
+            res = await data_engine.run_query(source, sampled)
+            total = sum(int(row[1]) for row in res.rows)
+            check(total <= N_EVENTS_OLD + N_EVENTS_NEW, f"块采样跑得通（取到 {total} 行）")
+        else:
+            check(sampled is None, "MySQL / MariaDB 没有块采样，照实返回 None")
+    finally:
+        await data_engine.engines.invalidate(source.id)
+
+
+async def main() -> int:
+    only = set((os.environ.get("DIALECT_IT_ONLY") or "pg,mysql,mariadb,oracle").split(","))
+    plan = [("pg", "postgresql", "DIALECT_IT_PG_PORT"), ("mysql", "mysql", "DIALECT_IT_MYSQL_PORT"),
+            ("mariadb", "mariadb", "DIALECT_IT_MARIADB_PORT"), ("oracle", "oracle", "DIALECT_IT_ORACLE_PORT")]
+    for key, kind, env in plan:
+        if key not in only:
+            continue
+        port = os.environ.get(env)
+        if not port:
+            failures.append(f"{key}：没有拿到容器端口（{env}）")
+            continue
+        try:
+            await run_target(Target(key, kind, int(port)))
+        except Exception as e:  # noqa: BLE001 - 一种库出错不挡别的库，照实记下
+            print(f"  ✗ {key} 中途出错：{type(e).__name__}: {e}")
+            failures.append(f"{key}：{type(e).__name__}: {e}")
+    await data_engine.engines.close()
+    print("\n" + ("全部通过" if not failures else f"{len(failures)} 项不通过：\n- " + "\n- ".join(failures)))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

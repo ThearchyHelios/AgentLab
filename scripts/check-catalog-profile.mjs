@@ -695,7 +695,7 @@ await section('剖析 · 设置：每张表的两项预算、被拒时报错落�
   await sec.locator('[data-profile-enabled]').check()
   const labels = await sec.locator('label.label').allInnerTexts()
   check('开启后五项预算展开：每张表最多查询数、每张表时长上限在前，没有整次的查询次数上限、总时长上限',
-    labels.join('、') === '每张表最多查询数、每张表时长上限、单条查询时限、抽样键值数、整表统计行数上限', labels.join('、'))
+    labels.join('、') === '每张表最多查询数、每张表时长上限、单条查询时限、核对键值数、整表统计行数上限', labels.join('、'))
   const units = await sec.locator('[data-profile-field] span').allInnerTexts()
   check('……每项带单位', units.join(',') === '条,秒,秒,个,行', units.join(','))
   const hints = await sec.locator('[id$="-hint"]').allInnerTexts()
@@ -783,8 +783,8 @@ await section('剖析 · 开始前：范围、个数与预算', async () => {
   check('……写明需要剖析的口径（含上次是空表的不算）、全部不含视图', (await inBox(page, '[data-profile-scope="needed"]')).includes('从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系、要取码值或日期范围的列的表。上次是空表的不算')
         && (await inBox(page, '[data-profile-scope="all"]')).includes('不含视图'))
   const budget = await inBox(page, '[data-profile-budget]')
-  check('预算按表写：每张表最多 40 条、60 秒，单条 10 秒，抽样、整表统计门槛，按哪个源的设置',
-    ['每张表最多 40 条查询、60 秒，用完只停这张表', '单条查询不超过 10 秒', '抽样 2,000 个键值', '行数超过 100,000 的表不做整表统计', `按「${NAME1}」的数据剖析设置`]
+  check('预算按表写：每张表最多 40 条、60 秒，单条 10 秒，核对键值数、整表统计门槛，按哪个源的设置',
+    ['每张表最多 40 条查询、60 秒，用完只停这张表', '单条查询不超过 10 秒', '取 2,000 个不同键值核对', '行数超过 100,000 的表不做整表统计', `按「${NAME1}」的数据剖析设置`]
       .every((x) => budget.includes(x)), budget)
   check('……按这次的表数估上限：「这次 5 张表，最多约 200 条查询、5 分钟」', (await inBox(page, '[data-profile-budget-total]')) === '这次 5 张表，最多约 200 条查询、5 分钟',
     await inBox(page, '[data-profile-budget-total]'))

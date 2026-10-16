@@ -240,7 +240,7 @@ async def test_profile_verifies_name_relations_and_proposes_codes_and_business_d
         assert rel["to_table"] == parent
         assert (rel["source"], rel["status"]) == ("profile", "verified")
         assert rel["coverage"] == 1.0 and rel["cardinality"] == "many_to_one"
-        assert "数据剖析" in rel["note"] and "抽样" in rel["note"]
+        assert "数据剖析" in rel["note"] and "子表取了" in rel["note"] and "抽样" not in rel["note"]
         # 子表一侧数过 COUNT 和 COUNT(DISTINCT)、确有重复：基数是用数据核实的（A6，一对多关联的检查据此给 error）
         assert rel["cardinality_checked"] is True
         # A7：说明里不写日期，时间看这一项的 updated_at（界面按本地时间显示）
@@ -318,7 +318,7 @@ async def test_wrong_name_relation_stays_proposed_with_coverage_in_note(client, 
     rel = _relation((await _notes(client, sid, "parking_records"))["notes"], "lot_id")
     assert rel["status"] == "proposed" and rel["source"] == "profile"
     assert rel["coverage"] == 0.15
-    assert "抽样覆盖率 15%" in rel["note"] and "可能不是这条关系" in rel["note"] and "20 个" in rel["note"]
+    assert "覆盖率 15%" in rel["note"] and "可能不是这条关系" in rel["note"] and "20 个" in rel["note"]
     finding = _table(body, "parking_records")["findings"][0]
     assert finding["status"] == "proposed" and finding["coverage"] == 0.15
     # 两个日期类列：不提议业务日期，取值范围只在剖析结果里
