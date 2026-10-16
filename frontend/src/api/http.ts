@@ -104,7 +104,8 @@ export function actorHeader(): Record<string, string> {
 function toLogin(path?: string) {
   if (typeof window === 'undefined' || path === '/auth/login' || path === '/auth/me') return
   const { pathname, search } = window.location
-  if (pathname === '/login') return
+  // 分享页（/s）上没有登录这回事：不送去登录页
+  if (pathname === '/login' || pathname === '/s') return
   const back = `${pathname}${search}`
   window.location.assign(back && back !== '/' ? `/login?next=${encodeURIComponent(back)}` : '/login')
 }

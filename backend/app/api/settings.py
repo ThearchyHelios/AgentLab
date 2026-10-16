@@ -646,7 +646,7 @@ def notify_problem(value: Any) -> str | None:
             from app.notify.digest import time_ok
 
             if not time_ok(item):
-                return f"「{NOTIFY_SETTING_LABEL[key]}」需要写成 时:分（00:00 到 23:59，例如 09:00），当前为「{item}」"
+                return f"「{NOTIFY_SETTING_LABEL[key]}」需要是 24 小时制的时间，例如 09:00（从 00:00 到 23:59），当前为「{item}」"
         elif problem := _base_url_problem(item):
             return problem
     return None

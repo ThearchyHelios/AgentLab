@@ -11,6 +11,9 @@
  * 隐藏（normal-user-apps N6）：作者隐藏的组件，发布版解析时服务端就跳过；按草稿解析时照样下发、带 hidden。这里只看这个
  * 标记：应用页上直接改的编辑状态（editing）画成半透明、标「已隐藏」，别处（编辑器的预览）照使用者看到的样子不画。
  * 编辑状态另给草稿里隐藏了的组件 id（editing.hidden）：服务端没带标记的也认得出来。
+ *
+ * 分享页（pages/apps/SharePage，04 细案 C2）也用它：传 preview（不发起、不刷新）和 onEvidence——点数字不打开在线出处（那要
+ * 按运行读证据的身份，分享页上没有），交给分享页说明「出处在下载的报告里」。
  */
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
@@ -35,6 +38,8 @@ export interface ViewRendererProps {
   onReload?: () => void
   /** 应用页上直接改的编辑状态：隐藏的组件画成半透明（不传时隐藏的组件不画） */
   editing?: ViewEditMarks
+  /** 点数字看出处时不开证据面板、交给调用方（分享页：出处在下载的报告里） */
+  onEvidence?: (evidence: ViewEvidence, label: string, text?: string) => void
 }
 
 /** 编辑状态的标记：草稿里隐藏了的组件 id */
@@ -47,11 +52,12 @@ const EditMarksCtx = createContext<ViewEditMarks | null>(null)
 /** 服务端按草稿解析时给隐藏的组件带的标记（ViewNode.hidden，发布版里没有这样的组件），加上这一次刚隐藏的 */
 const isHidden = (node: ViewNode, marks: ViewEditMarks | null) => node.hidden === true || !!marks?.hidden.has(node.id)
 
-export function ViewRenderer({ model, appId, runId, preview = false, onNavigate, onReload, editing }: ViewRendererProps) {
+export function ViewRenderer({ model, appId, runId, preview = false, onNavigate, onReload, editing, onEvidence }: ViewRendererProps) {
   const [evidence, setEvidence] = useState<EvidenceTarget | null>(null)
   const openEvidence = useCallback((ev: ViewEvidence, label: string, text?: string) => {
-    setEvidence({ evidence: ev, label, text })
-  }, [])
+    if (onEvidence) onEvidence(ev, label, text)
+    else setEvidence({ evidence: ev, label, text })
+  }, [onEvidence])
   // 视图模型换了（刷新、重新取）就是新的一代：画坏了的组件跟着重试一次
   const gen = useMemo(() => String(++generation), [model])
   const render = useCallback((nodes: ViewNode[] | undefined): ReactNode =>
@@ -81,7 +87,7 @@ export function ViewRenderer({ model, appId, runId, preview = false, onNavigate,
         )}
         <EditMarksCtx.Provider value={editing ?? null}>{render(model.tree)}</EditMarksCtx.Provider>
       </div>
-      <EvidenceDrawer target={evidence} onClose={() => setEvidence(null)} />
+      {!onEvidence && <EvidenceDrawer target={evidence} onClose={() => setEvidence(null)} />}
     </ViewCtx.Provider>
   )
 }

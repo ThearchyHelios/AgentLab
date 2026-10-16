@@ -682,6 +682,8 @@ function PrefsTab() {
     // 应用一组（D-j）：按需视图每个应用每天最多发起几次；使用者能不能建个人应用（N7，默认关）
     appsDaily: string
     appsPersonal: boolean
+    // 允许建分享链接（服务端 apps.share_links，04 细案 C2，默认关）
+    appsShare: boolean
   } | null>(null)
   const [spend, setSpend] = useState<{ usd?: number; calls?: number; unpriced_calls?: number } | null>(null)
   // 核查一组（双盲复算、反方审稿、审批质询）的草稿另放一份，和上面的共用保存条；verifySaves 是存过几次，今日核查花费跟着再取
@@ -735,6 +737,7 @@ function PrefsTab() {
     // 服务端没给这一项时按默认的 200 显示（同服务端的缺省值）
     appsDaily: String(values?.apps?.on_demand_daily_limit ?? APPS_DAILY_DEFAULT),
     appsPersonal: values?.apps?.user_personal_apps === true,
+    appsShare: values?.apps?.share_links === true,
   }
   const cur = draft ?? saved
   const stepCap = Number(values?.limits?.max_agent_steps) || 100
@@ -834,7 +837,8 @@ function PrefsTab() {
       const catalogDraft = draftChanged ? { provider: cur.draftProvider || null, model: cur.draftModel.trim() || null } : null
       // 应用一组同样整组写：别的键（以后加的）照原样带回去
       const apps = appsChanged
-        ? { ...(values.apps ?? {}), on_demand_daily_limit: Number(cur.appsDaily.trim()), user_personal_apps: cur.appsPersonal }
+        ? { ...(values.apps ?? {}), on_demand_daily_limit: Number(cur.appsDaily.trim()), user_personal_apps: cur.appsPersonal,
+            share_links: cur.appsShare }
         : null
       if (runChanged || judge || verify || catalogDraft || apps) {
         const run = {
@@ -1201,6 +1205,17 @@ function PrefsTab() {
                 </span>
               </span>
             </label>
+            <label className="mt-3 flex items-start gap-2 text-xs">
+              <input type="checkbox" className="mt-0.5" checked={cur.appsShare} data-apps-share-links=""
+                     aria-describedby="pref-apps-share-hint"
+                     onChange={(e) => edit({ appsShare: e.target.checked })} />
+              <span>
+                {APP_SETTING_TEXT.shareLinks}
+                <span id="pref-apps-share-hint" className="mt-0.5 block text-2xs leading-relaxed text-faint">
+                  {APP_SETTING_TEXT.shareLinksHint}
+                </span>
+              </span>
+            </label>
           </section>
           </fieldset>
         </>
@@ -1228,6 +1243,7 @@ function PrefsTab() {
                     jClick: '每次点击的金额上限', jDaily: '每日金额上限',
                     draftProvider: DRAFT_MODEL_SETTING_TEXT.provider, draftModel: DRAFT_MODEL_SETTING_TEXT.model,
                     appsDaily: APP_SETTING_TEXT.onDemandLimit, appsPersonal: APP_SETTING_TEXT.personalApps,
+                    appsShare: APP_SETTING_TEXT.shareLinks,
                   })[k]).concat(verifyLabels(verifyKeys)).join('、')}
                 </span>
               </span>
@@ -1261,7 +1277,7 @@ function PrefsTab() {
 }
 
 /** 应用一组在草稿里的几项：保存时整组写 apps */
-const APPS_DRAFT = new Set(['appsDaily', 'appsPersonal'])
+const APPS_DRAFT = new Set(['appsDaily', 'appsPersonal', 'appsShare'])
 
 /** 按需视图每日上限的缺省值和最大值（同服务端 settings.APPS_DEFAULTS、APPS_DAILY_LIMIT_MAX） */
 const APPS_DAILY_DEFAULT = 200

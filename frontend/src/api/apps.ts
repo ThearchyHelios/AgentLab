@@ -6,10 +6,11 @@
  */
 import type {
   AppBindings, AppDetail, AppGrant, AppHookRow, AppList, HookReceipts, AppSpec, AppSummary, AppVersionRow, BackfillPlan, BackfillResult,
-  ComponentCatalog, Disposition, InstanceRow, LintIssue, PublishResult, ViewModel,
+  ComponentCatalog, Disposition, InstanceRow, LintIssue, PublishResult, ViewModel, ViewShareCreated, ViewShareList,
+  ViewShareRow,
 } from '../typesApp'
 import type { ConversationDetail, EvidenceSegmentDetail } from '../types'
-import { del, get, patch, post, put, qs, type RequestOptions } from './http'
+import { del, get, patch, post, put, qs, request, type RequestOptions } from './http'
 
 const at = (id: string) => `/apps/${encodeURIComponent(id)}`
 const hookAt = (id: string, name: string) => `${at(id)}/hooks/${encodeURIComponent(name)}`
@@ -74,6 +75,15 @@ export const apps = {
   deleteHook: (id: string, name: string) => del(hookAt(id, name)),
   /** 钩子最近收到的请求（manage）：状态、原因、发起的实例或解决的待办，加近 1 小时验签失败几次（04 细案 A6） */
   hookReceipts: (id: string, name: string) => get<HookReceipts>(`${hookAt(id, name)}/receipts`),
+  /**
+   * 分享链接（manage，服务端 api/shares.py）：列、建、撤销。建要管理员开了「允许建分享链接」，到期必填（最长 max_days 天）；
+   * key 只在建的这一次交回
+   */
+  shares: (id: string) => get<ViewShareList>(`${at(id)}/shares`),
+  createShare: (id: string, body: { page_id: string; mode: 'latest' | 'fixed'; expires_at: string; embed_allowed: boolean }) =>
+    post<ViewShareCreated>(`${at(id)}/shares`, body),
+  revokeShare: (id: string, shareId: string) =>
+    request<ViewShareRow>(`${at(id)}/shares/${encodeURIComponent(shareId)}`, { method: 'DELETE' }),
   /**
    * 应用编辑器里助手的对话（D-e，manage）：取这个应用的那段对话，没有就建（kind=app、归属这个应用）。带着历史轮次；
    * 老服务端只回对话本身时由调用方再按 id 取一次

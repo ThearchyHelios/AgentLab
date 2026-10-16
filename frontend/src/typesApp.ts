@@ -457,6 +457,11 @@ export interface ViewNode {
    */
   hidden?: boolean
   /**
+   * 分享链接里（resolve_page 的 share 旁路）被换成说明块的组件原来是什么（entry_button、task_list、report……）：type 已经是
+   * notice，props.text 写着为什么不显示。别处没有这一项
+   */
+  share_placeholder?: string
+  /**
    * 服务端解析好的数据（backend/app/apps/resolve.py 的 _data），形状随组件而定；绑定了视图的都带 state 和可选的 message：
    * - stamp：{view, state, stamp}；metric：{state, text, name, unit, evidence}
    * - series：{state, mode: single|dual|incomparable|recompute, unit, series: [{version, label, points: [{run_id, as_of,
@@ -720,12 +725,77 @@ export interface NotifyChannelRow {
   name: string
   scope: 'global' | 'app' | 'user'
   owner_id: string | null
-  format: 'generic' | 'feishu' | 'wecom' | 'dingtalk'
-  /** 只回主机名 */
+  /** email：邮件（第五种格式，服务端 notify/mail.py，04 细案 B2） */
+  format: 'generic' | 'feishu' | 'wecom' | 'dingtalk' | 'email'
+  /** 只回主机名；邮件渠道是空串 */
   url_host: string
   signed: boolean
   events: string[]
   enabled: boolean
+  /**
+   * 邮件渠道发给谁：个人渠道是拥有者的账号邮箱（没有邮箱是空的，发不出去），全局、应用的是填的那几个收件地址。
+   * Webhook 渠道没有这一项
+   */
+  mail_to?: string[]
+}
+
+/**
+ * GET /api/notify/channels 另给的 mail：邮件服务（设置的 mail 一组）启没启用、本人的账号邮箱（关登录时为 null）。
+ * 设置页据此列不列「邮件」这一格式、个人邮件渠道写「发到账号邮箱 …」。老服务端不给时按没启用
+ */
+export interface NotifyMailState {
+  enabled: boolean
+  account_email: string | null
+}
+
+/**
+ * 分享链接（服务端 api/shares.py，04 细案 C2）：管理应用的人在应用编辑里建、撤销。key 只在建的时候交回一次
+ * （ViewShareCreated），之后只给开头一截（prefix）认是哪一条
+ */
+export interface ViewShareRow {
+  id: string
+  prefix: string
+  app_id: string
+  page_id: string
+  page_title: string
+  /** latest：始终是最近一次封存；fixed：固定在建分享那一刻每个视图取的运行 */
+  mode: 'latest' | 'fixed'
+  app_version: number | null
+  embed_allowed: boolean
+  created_by: string | null
+  created_by_name: string | null
+  created_at: string | null
+  expires_at: string | null
+  revoked_at: string | null
+  revoked_by: string | null
+  open_count: number
+  last_opened_at: string | null
+  state: 'active' | 'revoked' | 'expired'
+}
+
+export interface ViewShareCreated extends ViewShareRow {
+  key: string
+  /** /s#<key> */
+  path: string
+  /** 拼上对外访问地址的完整链接；没设对外访问地址时为 null，界面按当前页面的地址拼 */
+  url: string | null
+}
+
+export interface ViewShareList {
+  /** 管理员开没开「允许建分享链接」：关着时不给新建，已有的照列、能撤销 */
+  enabled: boolean
+  /** 部署配没配允许嵌入分享页的站点（AGENTLAB_EMBED_ORIGINS） */
+  embed_origins: boolean
+  max_days: number
+  items: ViewShareRow[]
+}
+
+/** 分享页（GET /api/shares/page，agentlab.share/1）：页脚要的、按分享解析的视图模型、能下载报告的那几次运行 */
+export interface SharePayload {
+  format: 'agentlab.share/1'
+  share: { mode: 'latest' | 'fixed'; created_by: string | null; created_at: string; expires_at: string; embed_allowed: boolean }
+  view: ViewModel
+  downloads: { view: string; run_id: string; reports: string[]; as_of_text?: string | null }[]
 }
 
 /**
