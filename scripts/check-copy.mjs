@@ -6,7 +6,7 @@
 // 守的是 2026-09 文案整改定下的写法（术语表和语体规范见 frontend/src/lib/terms.ts 开头）：
 //   - 「跑」作动词（工作流写「运行」，节点、工具写「执行」）、后端（写「服务端」）、多半、照样、眼下、压根、
 //     取不到、没取回来、读不懂、连不上、写坏了（写「无法 / 未能 / 失败」）、
-//     令牌 / tok / tokens（写「token」）、钉住（写「固定版本」「引用版本」）、智能体（写「Agent」）、
+//     令牌 / tok / tokens（写「token」）、快照链接（写「分享链接」）、钉住（写「固定版本」「引用版本」）、智能体（写「Agent」）、
 //     供应商（写「模型接入」）、界面上的 Copilot（写「助手」）；
 //   - 句尾语气词（吧、呢、哦……）；
 //   - 句子里裸写的配置键名和枚举值（report_from、require_citation、cells: true……），要写界面上的中文标签；
@@ -67,6 +67,8 @@ const RULES = [
     test: (t) => t.match(/.{0,6}(?:多半|照样|眼下|压根|取不到|没取回来|读不懂|连不上|写坏了).{0,6}/)?.[0],
   },
   { id: '令牌', what: '「令牌」：写「token」', test: (t) => t.match(/.{0,6}令牌.{0,6}/)?.[0] },
+  // 总方案 X10：不记名的只读链接叫「分享链接」，「快照」专指查询快照
+  { id: '快照链接', what: '「快照链接」：写「分享链接」（「快照」专指查询快照）', test: (t) => t.match(/.{0,6}快照链接.{0,6}/)?.[0] },
   {
     id: 'tok', what: '「tok」「tokens」：写「token」（如「2.8k token」）',
     test: (t, prose) => (prose
@@ -462,6 +464,8 @@ console.log('\n=== 扫描器自检（拿构造的源码喂一遍）===')
       && !strings.some((s) => s.text === '跑') && !seen('./跑.ts') && !strings.some((s) => s.text === '后端'))
   check('合规的文案不误报', !lint('保存并继续运行', true).length && !lint('56.0k token', false).length
     && !lint('已达上限（3 句），这句未裁判', true).length)
+  check('「快照链接」报出来，「分享链接」「查询快照」不误报', lint('复制快照链接', true).some((h) => h.rule === '快照链接')
+    && !lint('复制分享链接', true).length && !lint('打开查询快照', true).length)
 
   const py = [
     'from fastapi import HTTPException',

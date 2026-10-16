@@ -6,6 +6,9 @@
 //     管理员能开；测试连接按环境发，照服务端的话写（2xx 才是成功，能连上但 404 是提醒）；
 //   - 关登录（默认）时所有人等同管理员：治理、退役、身份设置都能改；
 //   - 设置页的身份、通知、审计三个页签在，通知渠道的地址只显示主机名；
+//   - 邮件（04 细案 B2）：「邮件服务」一节管理员改、搭建者只看，口令只说设没设、留空不改，有没保存的改动时不能发测试邮件；
+//     每天的待办汇总的发送时间；邮件服务没启用时不列「邮件」格式；个人邮件渠道不填地址、写「发到账号邮箱 …」，没有邮箱照实
+//     写发不出去；投递记录里邮件成功写「已交给邮件服务器」，不写已送达；
 //   - 能力字段的待审阅（D-i）复用数据目录的审阅队列：成批确认逐项带能力的治理版本；
 //   - 自定义工具可以绑定登记的端点（只填路径）；MCP 的认证头按掩码编辑；本地子进程只有管理员能建、能改（A6）；
 //   - 单点登录映射管理员：用户或组至少一项；开了登录的使用者在设置页只剩个人的主题和通知，换主题不写服务端（D-s）。
@@ -86,7 +89,11 @@ const MCP_ROWS = [
     headers: { Authorization: 'Bearer ****9a2c' }, endpoint_id: null, status: 'ok', last_error: null, tools_cache: [] },
 ]
 
-async function open(path, { conflict = false, me = OFF } = {}) {
+const NOTIFY_ITEMS = [
+  { id: 'ch1', name: '财务群', scope: 'global', owner_id: null, format: 'feishu', url_host: 'open.feishu.cn', signed: true,
+    events: ['task.opened'], enabled: true }]
+
+async function open(path, { conflict = false, me = OFF, settings = null, notify = null, deliveries = [] } = {}) {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } })
   opened.add(ctx)
   const page = await ctx.newPage()
@@ -95,7 +102,8 @@ async function open(path, { conflict = false, me = OFF } = {}) {
   page.on('pageerror', (e) => errors.push(e.message))
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
   const state = { caps: JSON.parse(JSON.stringify(CAPS)), endpoints: JSON.parse(JSON.stringify(ENDPOINTS)), governs: [], endpointWrites: [],
-    tests: [], syncs: 0, settings: [], reviews: [], batches: [], tools: [], mcp: [], prefs: [] }
+    tests: [], syncs: 0, settings: [], reviews: [], batches: [], tools: [], mcp: [], prefs: [], channelWrites: [], mailTests: 0,
+    values: settings ? JSON.parse(JSON.stringify(settings)) : { ui: { theme: 'dark' } } }
 
   await page.route(/\/api\//, (route) => {
     const req = route.request()
@@ -133,8 +141,25 @@ async function open(path, { conflict = false, me = OFF } = {}) {
     return json(route, { id: 'm9', ...req.postDataJSON() })
   })
   await page.route(/\/api\/settings$/, (route) => {
-    if (route.request().method() !== 'GET') { state.prefs.push(route.request().postDataJSON()); return json(route, {}) }
-    return me.mode !== 'off' && me.role === 'user' ? json(route, { detail: '没有权限' }, 403) : json(route, { ui: { theme: 'dark' } })
+    if (route.request().method() !== 'GET') {
+      const body = route.request().postDataJSON()
+      state.prefs.push(body)
+      // 同服务端：给了的组并进去（mail 的口令不回、只说设没设），交回整份
+      for (const [k, v] of Object.entries(body?.values ?? {})) {
+        state.values[k] = { ...(state.values[k] ?? {}), ...v }
+        if (k === 'mail') {
+          const pw = v.password
+          state.values.mail = { ...state.values.mail, password: null,
+            password_set: typeof pw === 'string' ? pw !== '' : !!state.values.mail.password_set }
+        }
+      }
+      return json(route, state.values)
+    }
+    return me.mode !== 'off' && me.role === 'user' ? json(route, { detail: '没有权限' }, 403) : json(route, state.values)
+  })
+  await page.route(/\/api\/settings\/mail\/test$/, (route) => {
+    state.mailTests += 1
+    return json(route, { ok: true, message: '已交给邮件服务器（发到 root@example.com），是否送达以邮件服务器为准，请到收件箱确认' })
   })
   await page.route(/\/api\/capabilities\/sync$/, (route) => { state.syncs += 1; return json(route, { changed: 2 }) })
   await page.route(/\/api\/capabilities\/[^/]+\/governance$/, (route) => {
@@ -177,10 +202,16 @@ async function open(path, { conflict = false, me = OFF } = {}) {
   await page.route(/\/api\/audit(\?.*)?$/, (route) => json(route, { items: [
     { id: 'a1', at: '2026-10-10T02:00:00Z', actor: '张工', verified: false, action: 'capability.govern', subject_kind: 'capability',
       subject_id: 'erp_pay', data: { version: 2 } }] }))
-  await page.route(/\/api\/notify\/channels$/, (route) => json(route, { items: [
-    { id: 'ch1', name: '财务群', scope: 'global', owner_id: null, format: 'feishu', url_host: 'open.feishu.cn', signed: true,
-      events: ['task.opened'], enabled: true }] }))
-  await page.route(/\/api\/notify\/deliveries(\?.*)?$/, (route) => json(route, { items: [] }))
+  await page.route(/\/api\/notify\/channels$/, (route) => {
+    const req = route.request()
+    if (req.method() === 'POST') {
+      const body = req.postDataJSON()
+      state.channelWrites.push(body)
+      return json(route, { id: 'ch-new', owner_id: null, url_host: '', signed: false, enabled: true, ...body }, 201)
+    }
+    return json(route, { items: notify?.items ?? NOTIFY_ITEMS, ...(notify?.mail ? { mail: notify.mail } : {}) })
+  })
+  await page.route(/\/api\/notify\/deliveries(\?.*)?$/, (route) => json(route, { items: deliveries }))
 
   await page.goto(`${WEB}${path}`, { waitUntil: 'networkidle' })
   await page.waitForTimeout(300)
@@ -301,7 +332,7 @@ await section('设置：身份、通知、审计', async () => {
 
 await section('设置 → 通知：可订阅的事件照服务端登记列（总方案 X6）', async () => {
   // 列表从真后端的 GET /api/notify/events 来（GET 放行）：这种范围的渠道收得到的才列；从来推不到的（以前列着、一勾就 422
-  // 的「待办升级」「动作已生效」……）和登记了还没推送的（评测、召回、待办汇总……）都不列
+  // 的「待办升级」「动作已生效」……）和登记了还没推送的（召回、待办汇总……）都不列
   const { page, errors } = await open('/settings/notify')
   await page.getByRole('button', { name: '添加渠道' }).first().click()
   const dlg = page.locator('[role="dialog"]')
@@ -311,17 +342,105 @@ await section('设置 → 通知：可订阅的事件照服务端登记列（总
     return waitFor(page, async () => await dlg.locator(`[data-notify-events="${value}"]`).count() === 1)
   }
   const every = ['task.opened', 'run.finished', 'run.failed', 'action.unknown']
-  check('全局渠道：推给全局渠道的五项', await waitFor(page, async () => await dlg.locator('[data-notify-events="global"]').count() === 1)
-    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done']), JSON.stringify(await listed()))
+  // 第 3 波起：定时评测的两个事件只推全局渠道（评测是搭建者们共用的一把尺，不归哪个人；服务端 notify/service.notify_eval）；
+  // 访问密钥快到期推给全局渠道（服务账号的密钥）和个人渠道（个人密钥），每天的待办汇总只推个人渠道
+  check('全局渠道：推给全局渠道的几项', await waitFor(page, async () => await dlg.locator('[data-notify-events="global"]').count() === 1)
+    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done', 'eval.regressed', 'eval.failed', 'key.expiring']),
+    JSON.stringify(await listed()))
   const text = await dlg.innerText()
+  // 只推定时发起的评测：叫法照实带「定时」，勾上的人不会以为手动发起的那次也推
+  check('评测的两个事件照实说是定时的', ['定时评测有退步', '定时评测没有评完'].every((t) => text.includes(t)), text)
   check('从来推不到的不列', !['待办升级', '待办超时', '待办处理完', '动作失败', '动作已生效'].some((t) => text.includes(t)), text)
-  check('登记了还没推送的不列', !['评测有退步', '评测失败', '每天的待办汇总', '访问密钥快到期', '数据源有变化要处理', '口径升版，答案的数变了']
+  check('登记了还没推送的不列', !['数据源有变化要处理', '口径升版，答案的数变了']
     .some((t) => text.includes(t)), text)
+  check('只推个人渠道的「每天的待办汇总」全局渠道不列', !text.includes('每天的待办汇总'), text)
   check('应用的渠道：不列只发给提交人的「我提交审核的应用有结果」', await scope('app')
     && JSON.stringify(await listed()) === JSON.stringify(every), JSON.stringify(await listed()))
-  check('个人渠道：五项都列', await scope('user') && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done']),
+  check('个人渠道：连同待办汇总、密钥快到期都列', await scope('user')
+    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done', 'task.digest', 'key.expiring']),
     JSON.stringify(await listed()))
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+})
+
+const MAIL = { enabled: true, host: 'smtp.example.com', port: 587, security: 'starttls', username: 'agentlab', password: null,
+  password_set: true, from_addr: 'agentlab@example.com', from_name: 'AgentLab', default_for_assignees: false }
+
+await section('设置 → 通知：邮件服务一节、每天的待办汇总', async () => {
+  const { page, state, errors } = await open('/settings/notify', { settings: { mail: MAIL, notify: { public_base_url: null, digest_at: '09:00' } },
+    notify: { items: NOTIFY_ITEMS, mail: { enabled: true, account_email: null } } })
+  const box = page.locator('[data-mail-section="edit"]')
+  check('管理员看得到、改得了邮件服务', await waitFor(page, async () => await box.count() === 1)
+    && await box.locator('[data-mail-field="host"]').inputValue() === 'smtp.example.com')
+  check('口令只说设没设，输入框是空的', await box.locator('[data-mail-field="password"]').inputValue() === ''
+    && (await box.innerText()).includes('已设置；留空表示不修改'))
+  check('没改动时能发测试邮件', !(await box.locator('[data-mail-test]').isDisabled()))
+  await box.locator('[data-mail-field="host"]').fill('mail.example.org')
+  check('有没保存的改动时先保存再发', await box.locator('[data-mail-test]').isDisabled() && (await box.innerText()).includes('先保存再发测试邮件'))
+  await box.locator('[data-mail-save]').click()
+  check('保存交的是 mail 一组，口令没填就不带', await waitFor(page, async () => state.prefs.length === 1)
+    && state.prefs[0].values.mail.host === 'mail.example.org' && !('password' in state.prefs[0].values.mail),
+    JSON.stringify(state.prefs[0]))
+  await box.locator('[data-mail-test]').click()
+  check('测试邮件照服务端的话写「已交给邮件服务器」', await waitFor(page, async () => state.mailTests === 1)
+    && await waitFor(page, async () => (await page.locator('body').innerText()).includes('已交给邮件服务器（发到')))
+  check('写明退信不追踪', (await box.locator('[data-mail-handoff]').innerText()).includes('退信不追踪'))
+  const digest = page.locator('[data-digest-section="edit"]')
+  check('待办汇总的发送时间', await digest.locator('[data-digest-at]').inputValue() === '09:00')
+  await digest.locator('[data-digest-at]').fill('17:30')
+  await digest.locator('[data-digest-save]').click()
+  check('只交汇总时间这一项', await waitFor(page, async () => state.prefs.length === 2)
+    && JSON.stringify(state.prefs[1]) === JSON.stringify({ values: { notify: { digest_at: '17:30' } } }), JSON.stringify(state.prefs[1]))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+
+  const builder = { mode: 'local', username: 'bea', display_name: '搭建者', role: 'builder', groups: [], verified: true }
+  const ro = await open('/settings/notify', { me: builder, settings: { mail: MAIL, notify: { public_base_url: null, digest_at: '09:00' } } })
+  const roBox = ro.page.locator('[data-mail-section="readonly"]')
+  check('搭建者只看：输入框都不能改、没有保存和测试', await waitFor(ro.page, async () => await roBox.count() === 1)
+    && await roBox.locator('[data-mail-field="host"]').isDisabled() && await roBox.locator('[data-mail-save]').count() === 0
+    && await roBox.locator('[data-mail-test]').count() === 0 && (await roBox.innerText()).includes('只有管理员能修改邮件服务'))
+})
+
+await section('设置 → 通知：邮件格式、个人邮件渠道发到账号邮箱、投递记录', async () => {
+  const off = await open('/settings/notify', { notify: { items: NOTIFY_ITEMS, mail: { enabled: false, account_email: null } } })
+  await off.page.getByRole('button', { name: '添加渠道' }).first().click()
+  const offDlg = off.page.locator('[role="dialog"]')
+  const options = await offDlg.locator('[data-notify-format-select] option').allInnerTexts()
+  check('邮件服务没启用：不列「邮件」，写明为什么', !options.includes('邮件')
+    && (await offDlg.locator('[data-notify-mail-off]').innerText()).includes('邮件服务没有启用'), options.join('、'))
+
+  const me = { mode: 'local', username: 'uma', display_name: '小乌', role: 'user', groups: [], verified: true, user_id: 'u-uma' }
+  const items = [
+    { id: 'm1', name: '我的邮件', scope: 'user', owner_id: 'u-uma', format: 'email', url_host: '', signed: false,
+      events: ['task.opened'], enabled: true, mail_to: ['uma@example.com'] },
+    { id: 'm2', name: '旧邮件', scope: 'user', owner_id: 'u-uma', format: 'email', url_host: '', signed: false,
+      events: ['task.opened'], enabled: true, mail_to: [] },
+  ]
+  const deliveries = [
+    { id: 'd1', channel_id: 'm1', event: 'task.opened', status: 'ok', http_status: null, error: null, format: 'email', created_at: '2026-10-15T02:00:00Z' },
+  ]
+  const { page, state, errors } = await open('/settings/notify', { me, deliveries,
+    notify: { items, mail: { enabled: true, account_email: 'uma@example.com' } } })
+  const row = page.locator('[data-notify-channel="我的邮件"]')
+  check('个人邮件渠道写「发到账号邮箱 …」', await waitFor(page, async () => await row.count() === 1)
+    && (await row.locator('[data-notify-target]').innerText()).includes('发到账号邮箱 uma@example.com'))
+  check('账号没有邮箱的照实写发不出去', (await page.locator('[data-notify-channel="旧邮件"] [data-notify-target]').innerText())
+    .includes('没有邮箱地址'))
+  await page.getByRole('button', { name: '添加渠道' }).first().click()
+  const dlg = page.locator('[role="dialog"]')
+  await dlg.locator('[data-notify-format-select]').selectOption('email')
+  check('个人邮件渠道不填地址，写发到账号邮箱', await dlg.locator('[data-notify-mail-to="account"]').count() === 1
+    && (await dlg.locator('[data-notify-mail-to="account"]').innerText()).includes('发到账号邮箱 uma@example.com')
+    && await dlg.locator('input[placeholder="https://"]').count() === 0)
+  await dlg.getByLabel('名称').fill('待办邮件')
+  await dlg.locator('[data-notify-save]').click()
+  check('建的时候不带地址', await waitFor(page, async () => state.channelWrites.length === 1)
+    && state.channelWrites[0].format === 'email' && state.channelWrites[0].scope === 'user' && !('url' in state.channelWrites[0]),
+    JSON.stringify(state.channelWrites[0]))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+  const admin = await open('/settings/notify', { deliveries, notify: { items: NOTIFY_ITEMS, mail: { enabled: true, account_email: null } } })
+  const d = admin.page.locator('[data-delivery-format="email"]')
+  check('投递记录里邮件成功写「已交给邮件服务器」，不写已送达', await waitFor(admin.page, async () => await d.count() === 1)
+    && (await d.innerText()).includes('已交给邮件服务器') && !(await d.innerText()).includes('已送达'))
 })
 
 await section('能力：待审阅复用数据目录的审阅队列，成批确认逐项带能力的治理版本', async () => {

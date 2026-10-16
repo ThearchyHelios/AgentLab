@@ -1466,7 +1466,9 @@ def _located(locator: dict[str, Any]) -> list[tuple[Any, Any]]:
 
 
 async def _caliber_source(source: Any) -> dict[str, Any] | None:
-    """钉住别处口径卡（caliber_from）时，定义取自哪个工作流的哪一版；带上工作流现在的名字方便认。"""
+    """钉住别处口径卡（caliber_from）时，定义取自哪个工作流的哪一版；带上工作流现在的名字方便认。取数节点拷进这张图时
+    改了名的（caliber_from.nodes，next-round 02 做法 4），来源里照带 nodes 映射：指标的输入写的是改名后的节点，面板据此
+    说清它们对应那一版里的哪个取数节点。"""
     if not isinstance(source, dict) or not source.get("workflow_id"):
         return None
     async with SessionLocal() as session:
@@ -1478,7 +1480,11 @@ def _caliber_upgrade(event: dict[str, Any] | None) -> dict[str, Any] | None:
     """这张口径卡在正式运行发起时的升版处置：钉在哪一版、上游最新是哪一版、怎么处置的。"""
     if not isinstance(event, dict):
         return None
-    return {k: event.get(k) for k in ("workflow_id", "caliber_node", "pinned", "latest", "policy", "policy_label")}
+    out = {k: event.get(k) for k in ("workflow_id", "caliber_node", "pinned", "latest", "policy", "policy_label")}
+    if isinstance(event.get("caliber_nodes"), dict):
+        # 取数节点拷进这张图时改了名（caliber_from.nodes）：照给映射；没改名的卡没有这个键，老运行一字不差
+        out["caliber_nodes"] = dict(event["caliber_nodes"])
+    return out
 
 
 #: 双盲复算节点产出里一个指标的结果（engine/nodes/dual_check.py 的 SAME / DIFFERENT / UNCHECKED），原样交给界面

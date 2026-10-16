@@ -10,7 +10,10 @@
 模型，数据类请求一次查看到位。
 
 **各入口看什么**（总方案 §5.3）：画布、问数据看表和能力（问数据只列只读能力）；发布前修复、升级证据看表，由系统按要修
-的 SQL 代为查看（look 文档 D5）；应用润色看工作流版本和能力（在 copilot.py 里组装）。
+的 SQL 代为查看（look 文档 D5）；应用润色看工作流版本和能力（在 copilot.py 里组装）。问数据另看已发布口径（next-round 02
+做法 4：搭建者及以上；使用者发起的图里看得到拷进来的取数 SQL，这一波不给）：助手可以 use_caliber 选用一份口径做骨架，
+「什么时候该看」换成 LOOK_WHEN_ANSWER_PROMPT，输出协议多 USE_CALIBER_PROMPT 一段。运行时写 SQL 的 Agent 不看口径（拍板
+L2：保持独立解读，「等价已证明」才有意义）。
 
 这里提供：look_service（按入口组装查看服务，开流之前调：读目录、读能力登记要用会话）、section（system 里数据源那一节）、
 system_look（系统代为查看）、写 SQL 的硬性要求和「什么时候该看」的判断标准。
@@ -59,6 +62,23 @@ LOOK_WHEN_PROMPT = """\
   · 用户说了一条数据事实：先看那张表的现有目录，再提目录修改
   · 要看就先看，看完再规划，不要先搭节点再回头看；这次对话里已经看过的表直接点名看，不要只给需求"""
 
+#: 问数据里（能看已发布口径时）的「什么时候该看」：问数据那一条按口径账本改写（next-round 02 做法 4 ④），别的照旧
+LOOK_WHEN_ANSWER_PROMPT = LOOK_WHEN_PROMPT.replace(
+    """  · 问数据：查库交给 agent 节点，它运行时会自己查表结构。只有从概览看不出该用哪个库、用户点了表名、用户说了口径时
+    才看一次，把看到的表名写进 agent 的提示词，运行时少走弯路""",
+    """  · 问数据：先看已发布口径（kind 写 caliber）。问法和口径的定义完全对得上时用 use_caliber 选用它；口径只覆盖问题的
+    一部分时 use_caliber 选用那一部分，其余交给 agent 补；问法多了口径没有的条件（比如「含退款」「只看新客」）时不要套
+    口径，交给 agent 去查，系统会自动拿它的 SQL 和口径对账。查库交给 agent 时它运行时会自己查表结构：只有从概览看不出
+    该用哪个库、用户点了表名时才看表，把看到的表名写进 agent 的提示词""")
+
+#: 问数据里输出协议多的一段：选用口径（ledger/compose.py）。只在这一轮能看已发布口径时接在协议后面
+USE_CALIBER_PROMPT = """- 选用已发布口径（只在问数据里、look 过 caliber 之后）：
+  {"op":"use_caliber","id":"c1","workflow_id":"…","version":3,"card":"口径卡节点 id","metrics":["指标id"],"inputs":{"字段":"值"}}
+  照抄查看结果里给的写法，只改 id、metrics、inputs。系统按那一版生成取数节点（c1_<原 id>）和口径卡（节点 id 就是 c1），
+  并把入口连到取数、取数连到口径卡；你**不要**自己写这几个节点，也不要改它们。接下来只需把口径卡连到报告
+  （add_edge c1 → report），报告里用 [[m:指标id]] 引用。inputs 按口径的入口字段填（日期、门店这类问题里给出的条件），
+  填不对会被拒收、原因会交回给你改；口径对不上问法时不要选用"""
+
 #: 系统代为查看时写进记录的需求（界面上显示）
 SYSTEM_LOOK_FIX_NEED = "要修的工作流里，查库节点的 SQL 用到的表"
 SYSTEM_LOOK_UPGRADE_NEED = "要升级的工作流里，查库节点的 SQL 用到的表"
@@ -66,20 +86,46 @@ SYSTEM_LOOK_UPGRADE_NEED = "要升级的工作流里，查库节点的 SQL 用�
 
 async def look_service(sources: list[Any], *, spec: ModelSpec | None, graph: Mapping[str, Any] | None = None,
                        kinds: tuple[str, ...] = ("table", "capability"), answer: bool = False,
-                       catalog_view: Any = None, trail: Mapping[str, Any] | None = None) -> LookService:
+                       catalog_view: Any = None, trail: Mapping[str, Any] | None = None,
+                       session: Any = None) -> LookService:
     """按入口组装这一轮的查看服务。读目录、读能力登记都用各自的短会话，开流前后都能调。
 
     spec 是助手的模型规格：挑选模型第一次要用时才按它拿（关思考、额度按 look/pick.PICK_MAX_TOKENS）。graph 是现有工作流，概览里列出它查过的表。
     answer：问数据（意图为回答），能力只列只读的。catalog_view：表详情里给哪一份数据目录（data/catalog_view.py），不给是当前目录。
     trail：按需加入探查范围时的留痕（哪一轮对话：{conversation_id}；谁取这次请求的身份）。
+    kinds 里有 caliber 时用 session（调用方开流之前的会话）读已发布口径，问数据里另判能不能组合（look/calibers 的 compose）。
     """
+    from app.look.calibers import CaliberKind
+
     picker = Picker(spec)
     made: list[Any] = []
     if "table" in kinds:
         made.append(await TableKind.load(sources, graph=graph, picker=picker, catalog_view=catalog_view, trail=trail))
     if "capability" in kinds:
         made.append(await CapabilityKind.load(picker=picker, read_only=answer))
+    if "caliber" in kinds and session is not None:
+        made.append(await CaliberKind.load(session, picker=picker, compose=answer))
     return LookService(made)
+
+
+def composing(looks: LookService) -> bool:
+    """这一轮能不能选用已发布口径（问数据里读好了能组合的口径卡）。"""
+    kind = looks.kinds.get("caliber")
+    return kind is not None and getattr(kind, "options", None) is not None
+
+
+def look_when(looks: LookService) -> str:
+    """「什么时候该看」：能选用已发布口径的问数据用改写过的那一份。"""
+    return LOOK_WHEN_ANSWER_PROMPT if composing(looks) else LOOK_WHEN_PROMPT
+
+
+def composer(looks: LookService) -> Any | None:
+    """GraphApplier 用的组合器（ledger/compose.Composer）；这一轮不能选用口径时为 None。"""
+    if not composing(looks):
+        return None
+    from app.ledger.compose import Composer
+
+    return Composer(list(looks.kinds["caliber"].options))
 
 
 async def section(looks: LookService) -> str:
@@ -105,6 +151,6 @@ async def system_look(looks: LookService, graph: Mapping[str, Any] | None, sourc
 
 
 __all__ = [
-    "LOOK_WHEN_PROMPT", "SQL_RULES_PROMPT", "SYSTEM_LOOK_FIX_NEED", "SYSTEM_LOOK_UPGRADE_NEED", "graph_tables",
-    "look_service", "section", "system_look",
+    "LOOK_WHEN_ANSWER_PROMPT", "LOOK_WHEN_PROMPT", "SQL_RULES_PROMPT", "SYSTEM_LOOK_FIX_NEED", "SYSTEM_LOOK_UPGRADE_NEED",
+    "USE_CALIBER_PROMPT", "composer", "composing", "graph_tables", "look_service", "look_when", "section", "system_look",
 ]

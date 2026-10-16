@@ -613,8 +613,9 @@ def catalog_draft_values(stored: Any) -> dict[str, Any]:
 #: 全站只认一个对外地址（core/public_url.py）：环境变量 AGENTLAB_PUBLIC_URL 设了的话这一项不生效、不能改（PUT 回 409）。
 #: 键名沿用 notify 一组，界面上在「设置 → 通用」
 NOTIFY_GROUP = public_url.SETTING_GROUP
-NOTIFY_DEFAULTS: dict[str, Any] = {public_url.SETTING_KEY: None}
-NOTIFY_SETTING_LABEL = {public_url.SETTING_KEY: "对外访问地址"}
+#: digest_at：每天几点给订阅了「每天的待办汇总」的个人渠道发汇总（HH:MM，按服务端所在时区；notify/digest.py，04 细案 B3）
+NOTIFY_DEFAULTS: dict[str, Any] = {public_url.SETTING_KEY: None, "digest_at": "09:00"}
+NOTIFY_SETTING_LABEL = {public_url.SETTING_KEY: "对外访问地址", "digest_at": "待办汇总的发送时间"}
 #: GET /api/settings 另给的只读一组：{value: 生效的对外访问地址, env_locked: 是不是环境变量指定的}。设置页据此显示
 #: 「由环境变量指定」；PUT 带上它也不落库（同 limits）
 PUBLIC_URL_GROUP = "public_url"
@@ -641,15 +642,25 @@ def notify_problem(value: Any) -> str | None:
         if key not in NOTIFY_DEFAULTS:
             return (f"「通知」设置中不支持「{key}」，可设置的项："
                     + "、".join(f"「{NOTIFY_SETTING_LABEL[k]}」" for k in NOTIFY_DEFAULTS))
-        if problem := _base_url_problem(item):
+        if key == "digest_at":
+            from app.notify.digest import time_ok
+
+            if not time_ok(item):
+                return f"「{NOTIFY_SETTING_LABEL[key]}」需要是 24 小时制的时间，例如 09:00（从 00:00 到 23:59），当前为「{item}」"
+        elif problem := _base_url_problem(item):
             return problem
     return None
 
 
 def notify_values(stored: Any) -> dict[str, Any]:
-    """库里存的（或刚写进来的）notify 一组 → 补齐默认、规范化：去掉首尾空白和末尾的 /，空串当没填；存坏了的按没填。"""
+    """库里存的（或刚写进来的）notify 一组 → 补齐默认、规范化：去掉首尾空白和末尾的 /，空串当没填；存坏了的按没填。
+    汇总时间存坏了按缺省。"""
+    from app.notify.digest import time_ok
+
     stored = stored if isinstance(stored, dict) else {}
-    return {public_url.SETTING_KEY: public_url.normalize(stored.get(public_url.SETTING_KEY))}
+    at = stored.get("digest_at")
+    return {public_url.SETTING_KEY: public_url.normalize(stored.get(public_url.SETTING_KEY)),
+            "digest_at": at.strip() if time_ok(at) else NOTIFY_DEFAULTS["digest_at"]}
 
 
 async def notify_settings(session: AsyncSession) -> dict[str, Any]:
@@ -676,8 +687,11 @@ def public_url_values(stored_notify: Any) -> dict[str, Any]:
 #: user_personal_apps：开了登录时使用者能不能建个人应用、刷新、提交审核（默认关，同问数据的开关；搭建者及以上不受它管）。
 #: 关登录时它照样生效：关着就没有个人应用的入口。只有管理员能改（整个设置接口的改动都要管理员）
 APPS_GROUP = "apps"
-APPS_DEFAULTS: dict[str, Any] = {"on_demand_daily_limit": 200, "user_personal_apps": False}
-APPS_SETTING_LABEL = {"on_demand_daily_limit": "按需视图每日上限", "user_personal_apps": "使用者可以建个人应用"}
+#: share_links：能不能建分享链接（只读、不用登录就能看的视图页，api/shares.py，04 细案 C2、集成-I6）。缺省关；关掉时已有的
+#: 分享链接一并打不开（管理员随时收得回来），撤销照常能做
+APPS_DEFAULTS: dict[str, Any] = {"on_demand_daily_limit": 200, "user_personal_apps": False, "share_links": False}
+APPS_SETTING_LABEL = {"on_demand_daily_limit": "按需视图每日上限", "user_personal_apps": "使用者可以建个人应用",
+                      "share_links": "允许建分享链接"}
 #: 上限的上限：再大就等于不限，要不限的不该靠这一项
 APPS_DAILY_LIMIT_MAX = 100_000
 
@@ -694,7 +708,7 @@ def apps_problem(value: Any) -> str | None:
         if key not in APPS_DEFAULTS:
             return (f"「应用」设置中不支持「{key}」，可设置的项："
                     + "、".join(f"「{APPS_SETTING_LABEL[k]}」" for k in APPS_DEFAULTS))
-        if key == "user_personal_apps":
+        if key in ("user_personal_apps", "share_links"):
             if not isinstance(item, bool):
                 return f"「{APPS_SETTING_LABEL[key]}」只能是开或关，当前为「{item}」"
         elif not _daily_limit_ok(item):
@@ -708,14 +722,150 @@ def apps_values(stored: Any) -> dict[str, Any]:
     stored = stored if isinstance(stored, dict) else {}
     limit = stored.get("on_demand_daily_limit")
     personal = stored.get("user_personal_apps")
+    shares = stored.get("share_links")
     return {"on_demand_daily_limit": limit if _daily_limit_ok(limit) else APPS_DEFAULTS["on_demand_daily_limit"],
-            "user_personal_apps": personal if isinstance(personal, bool) else APPS_DEFAULTS["user_personal_apps"]}
+            "user_personal_apps": personal if isinstance(personal, bool) else APPS_DEFAULTS["user_personal_apps"],
+            "share_links": shares if isinstance(shares, bool) else APPS_DEFAULTS["share_links"]}
 
 
 async def apps_settings(session: AsyncSession) -> dict[str, Any]:
     """设置里的 apps 一组，没存过的补默认。按需视图发起前从这里读每日上限。"""
     row = await session.get(Setting, APPS_GROUP)
     return apps_values(row.value if row else None)
+
+
+# --------------------------------------------------------------------------
+# 口径账本：按口径自动正式出具的开关、每日上限，口径比对的时限（docs/design/next-round/02-口径账本.md 做法 5、2）
+# --------------------------------------------------------------------------
+
+#: 设置里 ledger 这一组。auto_issue：问数据的答案整题等价于受管口径（Agent 独立写的 SQL 被证明等价、版本受管、图里没有人工
+#: 节点和写入）时自动按口径发起一次正式运行（拍板 L1；不满足的只给一键）。issue_daily_limit：每天最多按口径正式出具几次
+#: （自动的、一键的合计，0 表示不再出具）：正式运行含报告撰写的模型费用。match_timeout_s：一次运行的口径比对最多算几秒，
+#: 超时的照实记没比完（ledger/match.py）。召回的上限在第 4 波加。只有管理员能改（整个设置接口的改动都要管理员）
+LEDGER_GROUP = "ledger"
+LEDGER_DEFAULTS: dict[str, Any] = {"auto_issue": True, "issue_daily_limit": 20, "match_timeout_s": 8}
+LEDGER_SETTING_LABEL = {"auto_issue": "自动按口径正式出具", "issue_daily_limit": "按口径正式出具每日上限",
+                        "match_timeout_s": "口径比对时限（秒）"}
+#: 时限的范围：太短比不完一份口径，太长占着比对的线程
+LEDGER_TIMEOUT_RANGE = (1, 60)
+
+
+def _timeout_ok(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) \
+        and LEDGER_TIMEOUT_RANGE[0] <= value <= LEDGER_TIMEOUT_RANGE[1]
+
+
+def ledger_problem(value: Any) -> str | None:
+    """设置页写进来的 ledger 这一组有什么问题，没问题返回 None。"""
+    if not isinstance(value, dict):
+        return f"「口径账本」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key, item in value.items():
+        if key not in LEDGER_DEFAULTS:
+            return (f"「口径账本」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{LEDGER_SETTING_LABEL[k]}」" for k in LEDGER_DEFAULTS))
+        if key == "auto_issue" and not isinstance(item, bool):
+            return f"「{LEDGER_SETTING_LABEL[key]}」只能是开或关，当前为「{item}」"
+        if key == "issue_daily_limit" and not _daily_limit_ok(item):
+            return (f"「{LEDGER_SETTING_LABEL[key]}」需要是 0 到 {APPS_DAILY_LIMIT_MAX:,} 之间的整数（0 表示不再按口径出具），"
+                    f"当前为「{item}」")
+        if key == "match_timeout_s" and not _timeout_ok(item):
+            return (f"「{LEDGER_SETTING_LABEL[key]}」需要是 {LEDGER_TIMEOUT_RANGE[0]} 到 {LEDGER_TIMEOUT_RANGE[1]} 之间的数，"
+                    f"当前为「{item}」")
+    return None
+
+
+def ledger_values(stored: Any) -> dict[str, Any]:
+    """库里存的（或刚写进来的）ledger 一组 → 补齐默认；存坏了的项按默认（自动出具的开关存坏了按关，宁可少出具）。"""
+    stored = stored if isinstance(stored, dict) else {}
+    auto, limit, timeout = stored.get("auto_issue"), stored.get("issue_daily_limit"), stored.get("match_timeout_s")
+    return {"auto_issue": auto if isinstance(auto, bool) else (LEDGER_DEFAULTS["auto_issue"] if auto is None else False),
+            "issue_daily_limit": limit if _daily_limit_ok(limit) else LEDGER_DEFAULTS["issue_daily_limit"],
+            "match_timeout_s": timeout if _timeout_ok(timeout) else LEDGER_DEFAULTS["match_timeout_s"]}
+
+
+async def ledger_settings(session: AsyncSession) -> dict[str, Any]:
+    """设置里的 ledger 一组，没存过的补默认。按口径出具、比对从这里读。"""
+    row = await session.get(Setting, LEDGER_GROUP)
+    return ledger_values(row.value if row else None)
+
+
+# --------------------------------------------------------------------------
+# 评测：并发、每题时限、单次和每日金额上限、保留几次、结论裁判的缺省（docs/design/next-round/01-效果度量与回归评测.md 做法 17）
+# --------------------------------------------------------------------------
+
+#: 设置里 eval 这一组（评测-D9 拍板的缺省：同时 2 题、每题 900 秒、单次评测 2 美元、评测每日 5 美元）。前四项是全站的预算
+#: 缺省，题集上改过的项盖过它（app/eval/suites.effective_budget）；评测每日的金额上限是评测那本账（engine/spend.eval_spend，
+#: 单独记账，不挤占裁判、核查的额度）的上限，题集只能往下收。keep_runs：每个题集保留最近几次评测的明细（钉住的基线、A/B
+#: 引用的那一对另外留着，总表永久保留，app/eval/cleanup.py）。judge：发起评测时变体里没写的话，结论裁判开不开（缺省关：
+#: 裁判按句数花钱）。搭建者只读，管理员写（整个设置接口的规矩）
+EVAL_GROUP = "eval"
+EVAL_SPEND = "eval_spend"
+EVAL_DEFAULTS: dict[str, Any] = {"max_parallel": 2, "per_case_timeout_s": 900, "per_run_max_usd": 2.0,
+                                 "daily_max_usd": 5.0, "keep_runs": 20, "judge": False}
+EVAL_SETTING_LABEL = {"max_parallel": "评测 · 同时评几道题", "per_case_timeout_s": "评测 · 每题时限（秒）",
+                      "per_run_max_usd": "评测 · 单次评测的金额上限（美元）", "daily_max_usd": "评测 · 每日金额上限（美元）",
+                      "keep_runs": "评测 · 每个题集保留最近几次的明细", "judge": "评测 · 缺省打开结论裁判"}
+#: 保留的次数：至少 1（最近一次总要能和下一次比），最多 1000
+EVAL_KEEP_MAX = 1000
+
+
+def _eval_item_problem(key: str, item: Any) -> str | None:
+    from app.eval.suites import BUDGET_RULES
+
+    label = EVAL_SETTING_LABEL[key]
+    if key == "judge":
+        return None if isinstance(item, bool) else f"「{label}」只能是开或关，当前为「{item}」"
+    if key == "keep_runs":
+        ok = isinstance(item, int) and not isinstance(item, bool) and 1 <= item <= EVAL_KEEP_MAX
+        return None if ok else f"「{label}」需要是 1 到 {EVAL_KEEP_MAX} 之间的整数，当前为「{item}」"
+    _, kind, low, high = BUDGET_RULES[key]
+    ok = not isinstance(item, bool) and isinstance(item, (int, float)) and math.isfinite(item) \
+        and (kind is float or isinstance(item, int)) and low <= item <= high
+    unit = "整数" if kind is int else "数"
+    return None if ok else f"「{label}」需要是 {low:g} 到 {high:g} 之间的{unit}，当前为「{item}」"
+
+
+def eval_problem(value: Any) -> str | None:
+    """设置页写进来的 eval 这一组有什么问题，没问题返回 None。"""
+    if not isinstance(value, dict):
+        return f"「评测」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key, item in value.items():
+        if key not in EVAL_DEFAULTS:
+            return (f"「评测」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{EVAL_SETTING_LABEL[k]}」" for k in EVAL_DEFAULTS))
+        if problem := _eval_item_problem(key, item):
+            return problem
+    merged = eval_values(value)
+    if merged["per_run_max_usd"] > merged["daily_max_usd"]:
+        return (f"「{EVAL_SETTING_LABEL['per_run_max_usd']}」不能高于「{EVAL_SETTING_LABEL['daily_max_usd']}」，"
+                f"当前为 {merged['per_run_max_usd']:g} 和 {merged['daily_max_usd']:g}")
+    return None
+
+
+def eval_values(stored: Any) -> dict[str, Any]:
+    """库里存的（或刚写进来的）eval 一组 → 补齐默认；存坏了的项按默认。"""
+    stored = stored if isinstance(stored, dict) else {}
+    out = dict(EVAL_DEFAULTS)
+    for key in EVAL_DEFAULTS:
+        if key in stored and _eval_item_problem(key, stored[key]) is None:
+            value = stored[key]
+            out[key] = float(value) if key in ("per_run_max_usd", "daily_max_usd") else value
+    return out
+
+
+async def eval_settings(session: AsyncSession) -> dict[str, Any]:
+    """设置里的 eval 一组，没存过的补默认。发起评测、清理评测从这里读。"""
+    row = await session.get(Setting, EVAL_GROUP)
+    return eval_values(row.value if row else None)
+
+
+# --------------------------------------------------------------------------
+# 邮件服务（notify/mail.py，04 细案 B2）：只有管理员能改（整个设置接口的改动都要管理员），口令加密存、读的时候只说配没配
+# --------------------------------------------------------------------------
+
+MAIL_GROUP = "mail"
+#: 发测试邮件没有可发的账号（关登录）、账号没有邮箱时 POST /api/settings/mail/test 回 422 的机读码
+MAIL_TEST_NO_ADDRESS = "mail_test_no_address"
 
 
 # --------------------------------------------------------------------------
@@ -729,6 +879,19 @@ def _hidden_groups() -> tuple[str, ...]:
     from app.auth import SETTING_KEY as AUTH_KEY
 
     return (AUTH_KEY,)
+
+
+def _mail_public(stored: Any) -> dict[str, Any]:
+    from app.notify import mail
+
+    return mail.public_value(stored)
+
+
+def _internal(key: str) -> bool:
+    """通知自己记的账（每天汇总的认领行、自动建过邮件渠道的人，notify/digest.STATE_PREFIX）：不是用户设置，不列、不收。"""
+    from app.notify.digest import STATE_PREFIX
+
+    return key.startswith(STATE_PREFIX)
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -761,8 +924,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     NOTIFY_GROUP: notify_values(None),
     # 起草模型：数据目录起草、按配方导入的 AI 起草用的模型，留空沿用助手的模型
     CATALOG_DRAFT_GROUP: catalog_draft_values(None),
-    # 应用：按需视图的每日上限、使用者能不能建个人应用（管理员在设置页改）
+    # 应用：按需视图的每日上限、使用者能不能建个人应用、能不能建分享链接（管理员在设置页改）
     APPS_GROUP: apps_values(None),
+    # 口径账本：自动按口径正式出具的开关、每日上限，口径比对的时限
+    LEDGER_GROUP: ledger_values(None),
+    # 评测：预算的全站缺省（题集上可以改）、保留几次明细、结论裁判的缺省开关
+    EVAL_GROUP: eval_values(None),
+    # 邮件服务（SMTP）：通知渠道的邮件格式用它发信。缺省关
+    MAIL_GROUP: _mail_public(None),
 }
 
 
@@ -815,8 +984,10 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     # 裁判、核查的每日计数是引擎记的账，不是用户设置：设置页整组回写时带着一份旧的，会把今天的花费清零
     stored.pop(JUDGE_SPEND, None)
     stored.pop(VERIFY_SPEND, None)
+    stored.pop(EVAL_SPEND, None)
     for key in _hidden_groups():
         stored.pop(key, None)
+    stored = {k: v for k, v in stored.items() if not _internal(k)}
     merged = {k: {**v, **(stored.get(k) or {})} for k, v in DEFAULT_SETTINGS.items()}
     # 裁判、核查设置按引擎实际生效的样子给：存坏了的项显示默认，存了 null 的上限显示不限
     merged[JUDGE_GROUP] = judge_values(stored.get(JUDGE_GROUP))
@@ -825,6 +996,10 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     merged[PUBLIC_URL_GROUP] = public_url_values(stored.get(NOTIFY_GROUP))
     merged[CATALOG_DRAFT_GROUP] = catalog_draft_values(stored.get(CATALOG_DRAFT_GROUP))
     merged[APPS_GROUP] = apps_values(stored.get(APPS_GROUP))
+    merged[LEDGER_GROUP] = ledger_values(stored.get(LEDGER_GROUP))
+    merged[EVAL_GROUP] = eval_values(stored.get(EVAL_GROUP))
+    # 口令不回（password 恒为 null），只说配没配（password_set）
+    merged[MAIL_GROUP] = _mail_public(stored.get(MAIL_GROUP))
     for key, value in stored.items():
         merged.setdefault(key, value)
     return merged
@@ -914,8 +1089,10 @@ async def put_settings(
         if problem := notify_problem(payload.values[NOTIFY_GROUP]):
             raise HTTPException(422, problem)
         # 存规范化之后的：末尾带 / 的地址拼链接会多出一个斜杠
-        payload.values[NOTIFY_GROUP] = notify_values(payload.values[NOTIFY_GROUP])
-        if public_url.env_locked() and payload.values[NOTIFY_GROUP] != await notify_settings(session):
+        # 只给了一部分的（只改汇总时间）补上存着的另几项，不把对外访问地址冲成没填
+        payload.values[NOTIFY_GROUP] = notify_values({**await notify_settings(session), **payload.values[NOTIFY_GROUP]})
+        current_url = (await notify_settings(session))[public_url.SETTING_KEY]
+        if public_url.env_locked() and payload.values[NOTIFY_GROUP][public_url.SETTING_KEY] != current_url:
             # 环境变量指定了对外访问地址：改这一项不会生效，照实拒绝，不悄悄存一个用不上的值。原样写回（整组回写）不算改
             raise CodedHTTPException(
                 409, f"对外访问地址由环境变量 {public_url.ENV_NAME} 指定（{public_url.env_url()}），不能在设置里修改。"
@@ -924,10 +1101,26 @@ async def put_settings(
         if problem := apps_problem(payload.values[APPS_GROUP]):
             raise HTTPException(422, problem)
         payload.values[APPS_GROUP] = apps_values(payload.values[APPS_GROUP])
+    if LEDGER_GROUP in payload.values:
+        if problem := ledger_problem(payload.values[LEDGER_GROUP]):
+            raise HTTPException(422, problem)
+        payload.values[LEDGER_GROUP] = ledger_values(payload.values[LEDGER_GROUP])
+    if EVAL_GROUP in payload.values:
+        if problem := eval_problem(payload.values[EVAL_GROUP]):
+            raise HTTPException(422, problem)
+        payload.values[EVAL_GROUP] = eval_values(payload.values[EVAL_GROUP])
+    if MAIL_GROUP in payload.values:
+        from app.notify import mail
+
+        saved_mail = await session.get(Setting, MAIL_GROUP)
+        saved_value = saved_mail.value if saved_mail is not None else None
+        if problem := mail.settings_problem(payload.values[MAIL_GROUP], saved_value):
+            raise HTTPException(422, problem)
+        payload.values[MAIL_GROUP] = mail.stored_value(payload.values[MAIL_GROUP], saved_value)
     if found := await _provider_problem(session, payload.values):
         raise CodedHTTPException(422, found[1], PROVIDER_INVALID, field=found[0])
     for key, value in payload.values.items():
-        if key in (TRUST_KEY, "limits", PUBLIC_URL_GROUP, JUDGE_SPEND, VERIFY_SPEND, *_hidden_groups()):
+        if key in (TRUST_KEY, "limits", PUBLIC_URL_GROUP, JUDGE_SPEND, VERIFY_SPEND, EVAL_SPEND, *_hidden_groups()) or _internal(key):
             # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，
             # 会把刚在工具页改的档位冲掉。limits 是环境变量定的、public_url 是算出来的，写进库也不生效。
             # 裁判、核查的每日计数是引擎记的账，只有引擎自己写。登录设置只经 /api/auth/settings 改（_hidden_groups）
@@ -942,6 +1135,35 @@ async def put_settings(
         # 中间件、单点登录的回调按进程缓存取对外访问地址：写完库就刷新，不用重启
         public_url.remember(payload.values[NOTIFY_GROUP][public_url.SETTING_KEY])
     return await get_settings(session)
+
+
+@router.post("/settings/mail/test")
+async def test_mail(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """按存着的邮件服务设置发一封测试邮件，发到管理员自己的账号邮箱（只发到认证过的账号，不收任意地址：不让这个接口成了
+    邮件中继）。没启用也能测（配好了先试一封再启用）；不重试。{ok, message}：成功说「已交给邮件服务器」，是否送达以邮件服务器
+    为准（退信不追踪）。关登录时没有账号、账号没有邮箱：422（mail_test_no_address），说清怎么办。"""
+    from app.api.deps import current_principal
+    from app.db.models import User
+    from app.notify import mail
+    from app.notify.core import Message
+
+    principal = current_principal()
+    if principal.mode == "off" or not principal.user_id:
+        raise CodedHTTPException(422, "关闭登录时没有账号邮箱，测试邮件发不到人：请建一个全局的邮件渠道、填上收件地址，"
+                                      "用渠道的「发送测试消息」试", MAIL_TEST_NO_ADDRESS)
+    user = await session.get(User, principal.user_id)
+    to = (user.email or "").strip() if user is not None else ""
+    if not mail.address_ok(to):
+        raise CodedHTTPException(422, f"{mail.NO_EMAIL}，再发测试邮件", MAIL_TEST_NO_ADDRESS)
+    row = await session.get(Setting, MAIL_GROUP)
+    cfg = mail.config_of(row.value if row is not None else None)
+    if not cfg.ready:
+        return {"ok": False, "message": f"请先填写并保存「{mail.LABEL['host']}」和「{mail.LABEL['from_addr']}」，再发测试邮件"}
+    msg = Message(title="邮件服务测试", ok=True, lines=[("说明", "这是一封测试邮件。收到即表示邮件服务配置正确")])
+    outcome = await mail.send(cfg, [to], msg, label="测试邮件", retry=False)
+    if outcome.ok:
+        return {"ok": True, "message": f"{mail.HANDED_OFF}（发到 {to}），是否送达以邮件服务器为准，请到收件箱确认"}
+    return {"ok": False, "message": outcome.error or "发送失败"}
 
 
 @router.get("/settings/judge/spend")
@@ -961,6 +1183,16 @@ async def get_verify_spend(session: AsyncSession = Depends(get_session)) -> dict
     形状同 /settings/judge/spend：{date, usd, calls, unpriced_calls, daily_max_usd}，daily_max_usd 为 null 表示不限。
     """
     return {**await verify_daily_spend(), "daily_max_usd": (await verify_settings(session))["daily_max_usd"]}
+
+
+@router.get("/settings/eval/spend")
+async def get_eval_spend(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """今天（本地日期）评测花了多少（评测那本账，engine/spend.eval_spend），放在评测的每日上限旁边。只读：计数只有评测
+    自己记。形状同 /settings/judge/spend：{date, usd, calls, unpriced_calls, daily_max_usd}。calls 是今天开评的题数（每题
+    开评前预留一次）。"""
+    from app.engine.spend import eval_spend
+
+    return {**await eval_spend.daily(), "daily_max_usd": (await eval_settings(session))["daily_max_usd"]}
 
 
 @router.get("/system")

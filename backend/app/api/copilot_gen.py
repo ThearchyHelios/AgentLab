@@ -255,14 +255,30 @@ class GraphApplier:
     - skipped_types：模型编出来的节点类型，收尾时说出来
 
     patches：目录修改提案转不转（只有用户亲口说了数据事实的画布、问数据才转）。
+
+    composer：问数据里能选用已发布口径时（ledger/compose.Composer，next-round 02 做法 4）。use_caliber 由它按那一版确定性
+    实例化成取数节点和口径卡，这里落地：节点、连线照 add_node / add_edge 记进 seen（兜底重放照样重放得出来），入口连到
+    第一个取数节点（入口还没加的话，等入口加了再接）；转给界面的只是那一条 use_caliber，带上 result（选用了哪一版、生成了
+    哪几个节点）。不合规的拒收：result 写原因、照样转给界面（过程里照实写一行），原因记进 refused，自查时交回模型改
+    （GraphChecker.issues）。没有 composer 的入口（画布、发布前修复、升级）use_caliber 不认，照旧当认不出的操作丢掉。
     """
 
     def __init__(self, nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], *, patches: bool = True,
-                 questions: bool = False) -> None:
+                 questions: bool = False, composer: Any = None) -> None:
         self.nodes = nodes
         self.edges = edges
         self.patches = patches
         self.questions_mode = questions
+        self.composer = composer
+        #: 选用口径实例化出来的段：[(第一个取数节点, 全部节点 id)]，接入口用
+        self.composed: list[tuple[str, list[str]]] = []
+        #: 已经落地的 use_caliber（ledger/compose.signature），接着写时重发的同一个不再落地
+        self._composed_ops: set[str] = set()
+        #: 系统接上的连线（入口 → 取数）：模型再发一条一模一样的不重复加
+        self._wired: list[dict[str, Any]] = []
+        #: 拒收的 use_caliber：[{op, message}]，自查时交回模型
+        self.refused: list[dict[str, Any]] = []
+        self._reported = 0
         self.seen: list[dict[str, Any]] = []
         self.tried: list[dict[str, Any]] = []
         self.effective: list[dict[str, Any]] = []
@@ -305,11 +321,18 @@ class GraphApplier:
             self.autorun = op.get("run") is not False
             self.seen.append(op)
             return Applied(False, True)
+        if kind == "use_caliber" and self.composer is not None:
+            return self._use_caliber(op)
+        if kind == "add_edge" and self._was_wired(op.get("edge") or {}):
+            # 入口 → 取数这条系统已经接上了
+            return Applied(False, False)
         if self._continuing and self._repeats(op):
             return Applied(False, False)
         self.seen.append(op)
         self.tried.append(op)
         changed = _apply_op(self.nodes, self.edges, op)
+        if changed and kind == "add_node":
+            self._wire()
         if changed:
             self.effective.append(op)
             nid = (op.get("node") or {}).get("id") if kind == "add_node" else op.get("id")
@@ -320,6 +343,56 @@ class GraphApplier:
             if bad and bad not in _NODE_TYPES:
                 self.skipped_types.append(str(bad))
         return Applied(changed, changed)
+
+    def _use_caliber(self, op: dict[str, Any]) -> Applied:
+        """选用一份已发布口径（见类说明）。op 原地写上 result，原样转给界面。"""
+        from app.ledger.compose import ComposeRefused, signature
+
+        sig = signature(op)
+        if sig in self._composed_ops:
+            return Applied(False, False)
+        try:
+            composed = self.composer.compose(op, taken=set(self.nodes))
+        except ComposeRefused as e:
+            op["result"] = {"status": "refused", "reason": e.message}
+            self.refused.append({"op": {k: v for k, v in op.items() if k != "result"}, "message": e.message})
+            return Applied(False, True, e.message)
+        self._composed_ops.add(sig)
+        primitive = [{"op": "add_node", "node": {"id": n["id"], "type": n["type"], "label": n["data"].get("label") or "",
+                                                 "config": n["data"].get("config") or {}}} for n in composed.nodes]
+        primitive += [{"op": "add_edge", "edge": e} for e in composed.edges]
+        for item in primitive:
+            self.seen.append(item)
+            self.tried.append(item)
+            if _apply_op(self.nodes, self.edges, item):
+                self.effective.append(item)
+        ids = [str(n["id"]) for n in composed.nodes]
+        self.composed.append((ids[0], ids))
+        if composed.op_id not in self._landed:
+            self._landed.append(composed.op_id)
+        self._wire()
+        op["result"] = composed.result()
+        return Applied(True, True)
+
+    def _wire(self) -> None:
+        """选用口径生成的取数节点还没有上游、图里已经有入口的：系统把入口连到第一个取数节点。"""
+        entry = next((nid for nid, n in self.nodes.items() if n.get("type") == "input"), None)
+        if entry is None:
+            return
+        for first, _ in self.composed:
+            if first in self.nodes and not any(e["target"] == first for e in self.edges):
+                edge = {"source": entry, "target": first, "sourceHandle": None}
+                self.edges.append(edge)
+                self._wired.append(edge)
+
+    def _was_wired(self, edge: dict[str, Any]) -> bool:
+        return any(w["source"] == edge.get("source") and w["target"] == edge.get("target") for w in self._wired)
+
+    def unreported(self) -> list[dict[str, Any]]:
+        """还没交回过模型的拒收的选用，取走即算交回过（同 AppApplier.unreported）。"""
+        out = self.refused[self._reported:]
+        self._reported = len(self.refused)
+        return out
 
     def _repeats(self, op: dict[str, Any]) -> bool:
         """接着写时和已落地完全相同的操作（look §2.5.5）：已有的同一条连线、和已落地节点一模一样的节点、重发的同一个操作。"""
@@ -355,6 +428,7 @@ class GraphApplier:
                          for e in graph.get("edges") or []]
         for op in self.seen:
             _apply_op(self.nodes, self.edges, op)
+        self._wire()
 
 
 class GraphChecker:
@@ -387,8 +461,9 @@ class GraphChecker:
 
     async def issues(self) -> list[dict[str, Any]]:
         errors = self.blocking()
+        refused = _refused_issues(self.applier)
         if self.known is None:
-            return errors or []
+            return [*refused, *(errors or [])]
         from app.engine.autofix import _sig
 
         if not self.applier.effective:
@@ -404,6 +479,22 @@ class GraphChecker:
 # ==========================================================================
 # 应用的落地
 # ==========================================================================
+
+#: 选用口径被拒时交回模型的说法
+_REFUSED_FOR_MODEL = ("上一次的 use_caliber 被拒收：{message}。按原因改正后重新输出 use_caliber（id 可以沿用）；这份口径对不上"
+                      "问法的话就不要选用，交给 agent 查")
+
+
+def _refused_issues(applier: Any) -> list[dict[str, Any]]:
+    """拒收的 use_caliber 还没交回过模型的那几条，形状同自查的问题（error 级：不改就少了这一块）。"""
+    if not isinstance(applier, GraphApplier):
+        return []
+    from app.ledger.compose import REFUSED
+
+    return [{"level": "error", "node_id": None, "edge_id": None, "field": None, "code": REFUSED,
+             "message": f"没有选用口径：{r['message']}", "for_model": _REFUSED_FOR_MODEL.format(message=r["message"])}
+            for r in applier.unreported()]
+
 
 APP_REPAIR_PROMPT = (
     "这是你刚改好的应用草稿：\n{spec}\n\n"

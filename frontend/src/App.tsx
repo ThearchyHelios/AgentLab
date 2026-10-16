@@ -32,6 +32,7 @@ import { NewAppStart } from './pages/blueprints/NewAppStart'
 import { BlueprintPage } from './pages/blueprints/BlueprintPage'
 import { personalAppsOn } from './pages/blueprints/shared'
 import { LoginPage } from './pages/LoginPage'
+import { SharePage } from './pages/apps/SharePage'
 import { Logo } from './components/Logo'
 import {
   CommandPalette, PAGES, ShortcutHelp, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
@@ -56,7 +57,17 @@ import { APP_TEXT, AUTH_MODE_LABEL, AUTH_TEXT, ROLE_LABEL, RUN_COMPARE_TEXT, TAS
 /** 启动时认人（/auth/me）最多等多久再取目录 */
 const AUTH_WAIT_MS = 2500
 
+/**
+ * 分享页（/s#<分享 key>，04 细案 C2）不在外壳里，比登录页还早一步分开：拿到链接的人没有登录这回事，外壳的认人、取目录、
+ * 心跳、读主题一样都不做（开了登录时它们会 401，再被请求层送去登录页）。整页加载时定一次：分享页上没有通往外壳的链接
+ */
+const SHARE_PAGE = typeof window !== 'undefined' && window.location.pathname === '/s'
+
 export default function App() {
+  return SHARE_PAGE ? <SharePage /> : <Shell />
+}
+
+function Shell() {
   const loaded = useCatalog((s) => s.loaded)
   const backend = useCatalog((s) => s.backend)
   const everOk = useCatalog((s) => s.lastOkAt != null)

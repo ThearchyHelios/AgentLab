@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import math
 import re
@@ -282,8 +283,87 @@ async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, A
         raise NodeError(ctx.node.id, f"「{name}」v{version} 中的「{title}」本身也引用自其他工作流的口径卡（源头是 {where}）。"
                                      "请直接固定到源头的口径卡，否则升版时无法正确比对版本")
     source = {"workflow_id": wf_id, "workflow_version": version, "node_id": node_id}
+    metrics = cfg.get("metrics") or []
+    rename = ref.get("nodes") if isinstance(ref, dict) else None
+    if rename not in (None, {}):
+        # 节点改名映射（next-round 02 做法 4）：那一版的式子读 nodes.fetch，这张图里拷过来的取数节点叫 c1_fetch。式子按
+        # 语法树把 nodes.<原 id> 的根换成新 id 再算；来源里照记映射，证据、对比、升版处置据此认得是同一份口径
+        if problem := rename_problem(rename):
+            raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」的节点改名映射有误：{problem}")
+        metrics = [rename_definition(m, rename) for m in metrics]
+        source["nodes"] = dict(rename)
     return {"caliber": cfg.get("caliber") or title, "caliber_version": str(cfg.get("caliber_version") or "v1"),
-            "metrics": cfg.get("metrics") or []}, source
+            "metrics": metrics}, source
+
+
+#: 改名映射里的节点 id：要能写进式子的取值链（nodes.<id>），和画布上的节点 id 同一种写法
+_NODE_ID = re.compile(r"^[A-Za-z_][\w-]*$")
+
+
+def rename_problem(rename: Any) -> str | None:
+    """caliber_from.nodes 的形状对不对：{原 id: 新 id}，两边都是非空的节点 id，新 id 不重复。对的是 None。
+    画布校验（engine/schema._caliber_from_issues）和运行时同一个判断；新 id 在不在这张图里由校验另查。"""
+    if not isinstance(rename, dict) or not rename:
+        return "需要写成「原节点 id → 这张图里的节点 id」的对照"
+    seen: set[str] = set()
+    for old, new in rename.items():
+        if not isinstance(old, str) or not _NODE_ID.match(old) or not isinstance(new, str) or not _NODE_ID.match(new):
+            return f"「{old}」→「{new}」不是节点 id 的写法"
+        if new in seen:
+            return f"有两个节点都改名成了「{new}」"
+        seen.add(new)
+    return None
+
+
+class _RenameNodes(ast.NodeTransformer):
+    """nodes.<原 id>（含 cell(nodes.<原 id>, …) 的第一个参数、nodes['原 id']）的根换成新 id。别的根（vars、input）不动。"""
+
+    def __init__(self, rename: dict[str, str]) -> None:
+        self.rename = rename
+        self.hits = 0
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        if isinstance(node.value, ast.Name) and node.value.id == "nodes" and node.attr in self.rename:
+            self.hits += 1
+            return ast.copy_location(ast.Attribute(value=node.value, attr=self.rename[node.attr], ctx=node.ctx), node)
+        return self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        key = node.slice
+        if isinstance(node.value, ast.Name) and node.value.id == "nodes" and isinstance(key, ast.Constant) \
+                and isinstance(key.value, str) and key.value in self.rename:
+            self.hits += 1
+            return ast.copy_location(ast.Subscript(value=node.value, slice=ast.Constant(self.rename[key.value]),
+                                                   ctx=node.ctx), node)
+        return self.generic_visit(node)
+
+
+def rename_expression(expression: str, rename: dict[str, str]) -> str:
+    """把式子里 nodes.<原 id> 的根按映射换成新 id（语法树上换，字符串字面量里的字不动）。一处都没换到、解析不了的原样交回：
+    解析不了的式子后面求值时照常报「表达式有误」。"""
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return expression
+    renamer = _RenameNodes(rename)
+    tree = ast.fix_missing_locations(renamer.visit(tree))
+    return ast.unparse(tree) if renamer.hits else expression
+
+
+def rename_definition(definition: Any, rename: dict[str, str]) -> Any:
+    """一个指标定义按映射改写式子（别的项原样）。不是对象的原样交回，后面照常报「指标定义不完整」。"""
+    if not isinstance(definition, dict) or not isinstance(definition.get("expression"), str):
+        return definition
+    return {**definition, "expression": rename_expression(definition["expression"], rename)}
+
+
+def source_expression(expression: str, source: Any) -> str:
+    """卡上记的式子换回那一版里的写法（来源里有改名映射时按映射反着换）：对比两次运行的口径（engine/compare）按它比，
+    同一份口径拷进图里时取数节点改了名，不算口径变了。没有映射的原样交回。"""
+    rename = source.get("nodes") if isinstance(source, dict) else None
+    if not isinstance(rename, dict) or not rename or rename_problem(rename) is not None:
+        return expression
+    return rename_expression(expression, {new: old for old, new in rename.items()})
 
 
 #: 新写法的小数位范围。负数是取整到十位、百位（round(x, -2)）

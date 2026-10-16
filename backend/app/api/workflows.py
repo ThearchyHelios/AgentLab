@@ -12,7 +12,9 @@ from app.core.errors import graph_error
 from app.api.coded import CodedHTTPException
 from app.api.runs import actor_of
 from app.core.artifact_store import graph_hash
-from app.data.catalog_impact import catalog_drift, catalog_versions_for, recorded_versions
+from app.data.catalog_impact import (
+    catalog_drift, catalog_versions_for, open_structure_issues, recorded_versions, schema_drift, schema_versions_for,
+)
 from app.db.base import get_session
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import publish_issues
@@ -345,6 +347,10 @@ class VersionDetailOut(VersionOut):
     catalog_versions: dict[str, Any] | None = None
     #: 发布之后目录有变化的表：[{source, source_id, table, label, published, current, impact}]
     catalog_changes: list[dict[str, Any]] = Field(default_factory=list)
+    #: 发布时记下的表结构版本 {源名: {表名: 结构版本}}（只记写死的 SQL 直接引用的表，next-round 03 B1）；记录之前发布的为 null
+    schema_versions: dict[str, Any] | None = None
+    #: 发布之后结构版本变了的表：[{source, source_id, table, label, published, current, removed, changes, more}]
+    schema_changes: list[dict[str, Any]] = Field(default_factory=list)
     #: 入口字段换成表单（agentlab.form/1）：发起表单、应用入口用同一个渲染器（X2）
     input_schema: dict[str, Any] = Field(default_factory=dict)
     #: 账本（L4）：固定这一版的应用、生效记录数、正式运行数
@@ -388,6 +394,8 @@ async def get_version(
         published=workflow.published_version == snapshot.version, level=snapshot.level,
         catalog_versions=recorded_versions(snapshot.catalog_versions),
         catalog_changes=await catalog_drift(session, snapshot.catalog_versions),
+        schema_versions=snapshot.schema_versions,
+        schema_changes=await schema_drift(session, snapshot.schema_versions),
         input_schema=input_schema(fields), published_at=snapshot.published_at, published_by=snapshot.published_by,
         retired_at=snapshot.retired_at, retired_by=snapshot.retired_by, retire_note=snapshot.retire_note,
         usage=await usage(session, workflow_id, snapshot.version),
@@ -535,7 +543,9 @@ async def gate_issues(session: AsyncSession, graph: Any, level: str) -> list[dic
     checkers = await _sql_checkers(session, spec)
     providers = await _providers(session, spec)
     with with_subgraphs(await load_subgraphs(session, spec)):
-        return [i.model_dump() for i in publish_issues(spec, level=level, checkers=checkers, providers=providers)]
+        issues = [i.model_dump() for i in publish_issues(spec, level=level, checkers=checkers, providers=providers)]
+    # 这一版直接引用的表上还没处理的结构变化（next-round 03 B1）：只是警告，不拦发布
+    return issues + await open_structure_issues(session, spec)
 
 
 async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: WorkflowVersion, level: str,
@@ -554,6 +564,8 @@ async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: Wo
     snapshot.level = level
     # 发布时的目录版本也记在这一版上：重新发布同一版等于按现在的目录重新认可它，跟着更新
     snapshot.catalog_versions = await catalog_versions_for(session, spec)
+    # 表的结构版本同理（next-round 03 B1）：正式运行发起时和现在的比，变了写 schema.drift，只提醒、不拦
+    snapshot.schema_versions = await schema_versions_for(session, spec)
     # 发布人、发布时间、用到的能力版本也记在这一版上（F5）：工作流上的 published_by 只记最近一次。退役过的版本重新
     # 发布等于重新认可它，退役信息清掉
     snapshot.published_at = utcnow()
@@ -564,6 +576,10 @@ async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: Wo
     workflow.published_version = snapshot.version
     workflow.published_by = actor
     await session.commit()
+    # 口径账本（next-round 02 做法 8）：从问数据固化出的口径发布了，来源运行在后台按它补比一次（不挡发布）
+    from app.ledger.certify import after_publish
+
+    after_publish(workflow.id, workflow.origin)
     return {
         "ok": True,
         "level": level,
@@ -673,7 +689,10 @@ async def check_graph(session: AsyncSession, graph: Any, level: str) -> dict[str
     checkers = await _sql_checkers(session, spec)
     providers = await _providers(session, spec)
     with with_subgraphs(await load_subgraphs(session, spec)):
-        return check(spec, level=level, versions=versions, cards=cards, checkers=checkers, providers=providers)
+        out = check(spec, level=level, versions=versions, cards=cards, checkers=checkers, providers=providers)
+    # 这一版直接引用的表上还没处理的结构变化（next-round 03 B1）：发布弹窗照别的警告一样列出来，不拦发布
+    out["issues"] = [*out["issues"], *await open_structure_issues(session, spec)]
+    return out
 
 
 @router.post("/{workflow_id}/autofix")

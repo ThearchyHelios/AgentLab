@@ -3,7 +3,7 @@
 三层，各挡各的：
 
 1. **金样**：每种方言（mysql、mariadb、postgresql、oracle、sqlite）× 每类查询（统计信息、有上限的计数、取不同键值、
-   对键值、唯一性、取值分布、日期最小最大、时间窗口里的取值分布、按日行数、块采样），完整 SQL 钉在
+   对键值、唯一性、取值分布、日期最小最大、时间窗口里的取值分布、按日行数、块采样、最新业务日期），完整 SQL 钉在
    tests/fixtures/dialect/<方言>.sql，人审过一次；以后拼法有任何改动都会出 diff。要更新金样：
    ``UPDATE_DIALECT_GOLDEN=1 pytest tests/test_profile_dialect_golden.py``，再逐行看 git diff。
 2. **sqlglot 逐条解析**：按方言读一遍（mariadb 按 mysql 读），挡住语法写坏了（少括号、关键字拼错）。
@@ -71,6 +71,9 @@ def _queries(kind: str) -> list[tuple[str, str | None]]:
                                                   "2026-08-27", 21)),
         ("day_volume", d.day_volume_sql(orders, d.column(META["orders"], "paid_at"), "2026-08-27")),
         ("sample", d.sample_value_counts_sql(orders, status, 1, 21)),
+        # 第 3 波：取值观察的最新业务日期（文字存的日期按字符串比）
+        ("max_date", d.max_date_sql(orders, d.column(META["orders"], "paid_at"))),
+        ("max_date_text", d.max_date_sql(orders, d.column(META["orders"], "biz_day"), text=True)),
     ]
     return out
 

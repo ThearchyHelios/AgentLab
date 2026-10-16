@@ -20,6 +20,8 @@ from app.api import (
 )
 # 下一轮第 2 波（docs/design/next-round）：评测、访问密钥
 from app.api import access_keys as access_keys_api, evals as evals_api
+# 第 3 波：分享链接、数据源的变化记录
+from app.api import shares as shares_api, source_changes as source_changes_api
 # 普通用户建应用（docs/design/normal-user-apps.md §3.10）：蓝图、模板、文件、个人应用。权限在接口里按蓝图的范围和拥有者判
 from app.api import (
     blueprints as blueprints_api, copilot_blueprint, files as files_api, personal as personal_api,
@@ -116,6 +118,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await introspect_jobs.startup()
     except Exception:  # noqa: BLE001
         logger.exception("探查任务的启动整理失败，服务照常启动")
+    # 评测（next-round 01 做法 6、9）：上次没做完的评测、影子起草同一个规矩——标中断（没做完的题记停止），不自动续跑：
+    # 拷来的数据目录启动时不能替人去调模型、查业务库。界面上点「重试」只把没做完的题接着做
+    from app.eval import runner as eval_runner, snapshots as eval_snapshots
+
+    try:
+        await eval_snapshots.startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("影子起草的启动整理失败，服务照常启动")
+    try:
+        await eval_runner.startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("评测任务的启动整理失败，服务照常启动")
 
     await run_manager.setup()
     # 流程：存量的待审批补建待办（派给任何人，幂等）；上次进程没了时已发出、没拿到结果的写入收成结果未知、安排核实
@@ -149,6 +163,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await catalog_jobs.manager.shutdown()
         await catalog_profile_jobs.manager.shutdown()
         await introspect_jobs.manager.shutdown()
+        # 评测要在运行之前停：它停下时会取消自己发起的作答、算期望的运行，再标中断
+        await eval_runner.shutdown()
+        await eval_snapshots.manager.shutdown()
         await run_manager.shutdown()
         from app.sandbox.manager import sandbox_manager
 
@@ -255,6 +272,8 @@ for router, guard in (
     (table_imports.router, _BUILDER),
     (source_versions.router, _BUILDER),
     (catalog.router, _BUILDER),
+    # 数据源的变化记录（/api/datasources/{id}/changes…）：在通配 /{source_id} 之前登记
+    (source_changes_api.router, _BUILDER),
     (datasources.router, _BUILDER),
     # 应用平台。登录、登出、OIDC、JWKS 匿名可用，设置在接口里要管理员；入站钩子只认签名
     (auth_api.router, []),
@@ -276,10 +295,14 @@ for router, guard in (
     (tasks_api.router, _USER),
     (actions_api.router, _USER),
     (hooks_api.router, []),
+    # 分享链接的读接口只认分享 key（不用登录，中间件放行 /api/shares/）
+    (shares_api.router, []),
     (notify_api.router, _USER),
     (ledger_api.router, _BUILDER),
     # 下一轮第 2 波：评测只给搭建者；访问密钥登录即可，接口里再按本人 / 管理员判
     (evals_api.router, _BUILDER),
+    # 口径账本里按答案出具、对账的（第 3 波）：登录即可，接口里按运行和应用授权判
+    (ledger_api.answers_router, _USER),
     (access_keys_api.router, _USER),
 ):
     app.include_router(router, dependencies=guard)

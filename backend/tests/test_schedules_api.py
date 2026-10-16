@@ -39,8 +39,12 @@ HOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/7c6b5a49-dddd-eeee-ffff-123
 SECRET = "SECdemo-api-not-real-7"
 SCHEDULE_KEYS = {"id", "name", "workflow_id", "workflow_name", "cron", "timezone", "run_class", "input_template",
                  "enabled", "overlap", "misfire_grace_s", "webhook", "next_run_at", "last_fire", "description_text",
-                 "created_by", "created_at", "updated_at", "version"}
-FIRE_KEYS = {"id", "fire_at", "kind", "status", "run_id", "run_status", "reason", "notified", "compare", "created_at"}
+                 "created_by", "created_at", "updated_at", "version",
+                 # 定时的目标（next-round X4）：种类、id、叫法、现在的名字、还在不在
+                 "target_kind", "target_id", "target_label", "target_name", "target_exists"}
+FIRE_KEYS = {"id", "fire_at", "kind", "status", "run_id", "run_status", "reason", "notified", "compare", "created_at",
+             # 目标是评测题集时这一次触发建的那次评测
+             "eval_run_id"}
 
 
 @pytest.fixture(autouse=True)

@@ -25,6 +25,7 @@ from app.api.copilot_gen import (  # noqa: F401
 # 起别名：本文件底下有个叫 explain 的接口，generate 里又有个局部变量叫 raw，同名会互相盖掉
 from app.core.errors import explain as explain_error, graph_error, raw as raw_error
 from app.data.sqlcheck import CHECK_CODES
+from app.data.sqlcheck_columns import sql_unknown_columns
 from app.db.base import get_session
 from app.db.models import Workflow
 from app.engine.layout import CORRIDOR_MIN, MIN_ROW_GAP, NODE_W, _height, auto_layout
@@ -116,7 +117,8 @@ async def _look_service(session: AsyncSession, payload: GenerateIn, sources: lis
     spec = await copilot_model_spec(session, payload, max_tokens=copilot_context.PICK_MAX_TOKENS)
     return await copilot_context.look_service(sources, spec=spec, graph=graph, kinds=kinds,
                                               answer=payload.intent == "answer", catalog_view=catalog_view,
-                                              trail={"conversation_id": getattr(payload, "conversation_id", None)})
+                                              trail={"conversation_id": getattr(payload, "conversation_id", None)},
+                                              session=session)
 
 
 NODE_REFERENCE = """\
@@ -199,7 +201,8 @@ NODE_REFERENCE = """\
   {{ nodes.报告节点id.text }}），审批卡会附上这份报告的核对概况
 - validate：JSON Schema 校验，可自动让模型修复。config: {schema, source, max_retries}
 - transform：数据整形。config: {mode: expression|template|json, expression/template, assign_to}
-- subgraph：嵌套另一个工作流。config: {workflow_id, input}
+- subgraph：嵌套另一个工作流。config: {workflow_id, workflow_version, input}：workflow_version 写固定的版本号（1、2…），
+  不写就跟随那个工作流最新的发布版本。问数据里不要拿子工作流去拼已发布的口径（子工作流里的数报告引用不到）
 - metrics：口径卡。报告里要出现的数字、以及所有派生计算（比率、增幅、占比、差值）都登记在这里。
   config: {caliber, caliber_version, metrics:[{id, name, unit, decimals, format, expression}], on_missing, assign_to}
   expression 是受限表达式（不是模板）：vars.kpi.gmv、cell(nodes.fetch, 0, 'gmv')、
@@ -816,7 +819,9 @@ def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, 
         "5. 能用 3 个节点解决就别堆 8 个"
         f"{_CHAT_USER_PROMPT if chat_user else ''}\n\n"
         f"{_STREAM_PROTOCOL}"
-        + (f"\n\n{looks.guide()}\n{copilot_context.LOOK_WHEN_PROMPT}" if looks.kinds else "")
+        # 问数据里能选用已发布口径时（next-round 02 做法 4）：协议多一段 use_caliber，「什么时候该看」换成问数据那一份
+        + (f"\n{copilot_context.USE_CALIBER_PROMPT}" if copilot_context.composing(looks) else "")
+        + (f"\n\n{looks.guide()}\n{copilot_context.look_when(looks)}" if looks.kinds else "")
     )
 
 
@@ -1347,79 +1352,8 @@ def _catalog_issues(node_id: str, sql: str, checker: Any) -> list[dict[str, Any]
 
 
 # --------------------------------------------------------------------------
-# SQL 里的列名对照数据源结构
-#
-# 只做有把握的判断，宁可漏判不可误判：这条会把图打回去让模型改。CTE、FROM 里的子查询、
-# 引号括起来的标识符、结构里找不到的表、结构没探查过或者探查被截断的，一律不判。
+# SQL 里的列名对照数据源结构（sql_unknown_columns）在 data/sqlcheck_columns.py：表结构变化的影响面也用它
 # --------------------------------------------------------------------------
-
-#: @ 开头的是变量（@region、@@session），: 开头的是参数，. 后面的是限定名
-_SQL_IDENT = re.compile(r"(?<![\w$#.:@])([A-Za-z_][A-Za-z0-9_$#]*)(?![\w$#])")
-_FROM_ITEMS = re.compile(
-    r"\b(?:from|join)\s+(.+?)(?=\bwhere\b|\bgroup\b|\border\b|\bhaving\b|\blimit\b|\bfetch\b|\boffset\b"
-    r"|\bunion\b|\bintersect\b|\bexcept\b|\bon\b|\busing\b|\b(?:left|right|inner|outer|full|cross|natural)\b"
-    r"|\bjoin\b|\bwindow\b|\)|$)", re.I | re.S)
-_TABLE_ITEM = re.compile(r"^\s*([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)*)(?:\s+(?:as\s+)?([A-Za-z_][\w$#]*))?\s*$",
-                         re.I)
-_ALIAS_AS = re.compile(r"\bas\s+([A-Za-z_][\w$#]*)", re.I)
-#: 不写 AS 的列别名：「SUM(amount) total,」「amount total FROM」
-_ALIAS_BARE = re.compile(r"(\)|\b[A-Za-z_][\w$#]*|\d)\s+([A-Za-z_][\w$#]*)\s*(?=,|\bfrom\b)", re.I)
-_QUALIFIED = re.compile(r"(?<![\w$#.])([A-Za-z_][\w$#]*)\s*\.\s*([A-Za-z_][\w$#]*|\*)(?!\s*\()")
-_SQL_WORDS = frozenset("""
-select distinct all from where and or not in is null like ilike between exists case when then else end as on using
-join inner left right outer full cross natural group by order having limit offset fetch first next rows row only
-union intersect except asc desc nulls last with over partition range preceding following unbounded current true
-false interval year month day hour minute second week quarter dow doy epoch date time timestamp datetime zone
-cast integer int bigint smallint tinyint decimal numeric real float double precision varchar char character text
-boolean bool signed unsigned binary top percent escape collate any some values current_date current_time
-current_timestamp localtime localtimestamp sysdate systimestamp rownum level dual unknown filter within
-at nocase rtrim glob regexp rlike similar to div mod xor isnull notnull minus prior connect start nocycle siblings
-grouping sets rollup cube ignore respect lateral apply qualify window exclude include ties others no groups
-for update of share nowait skip locked lock mode array sounds overlaps language query expansion separator
-charset utf8 utf8mb4 latin1 ascii unicode years months weeks days hours minutes seconds microsecond microseconds
-millisecond milliseconds year_month day_hour day_minute day_second hour_minute hour_second minute_second
-isodow isoyear century decade millennium julian timezone timezone_hour timezone_minute
-sql_calc_found_rows sql_no_cache sql_cache sql_small_result sql_big_result sql_buffer_result high_priority
-straight_join distinctrow unique recursive tablesample bernoulli sample repeatable pivot unpivot keep ordinality
-symmetric asymmetric leading trailing both placing force use index into default without local
-user current_user session_user system_user current_schema current_catalog current_role
-""".split())
-
-#: 后面跟的一定是操作数、不会是别名的词：「SELECT created_at FROM」里 created_at 是列。
-#: END、NULL、TRUE、CURRENT_DATE 这类「一个值到此为止」的词不在里面——「… END flag,」的 flag 是别名
-_OPERAND_BEFORE = frozenset("""
-select distinct distinctrow all unique by as and or not xor is in like ilike glob regexp rlike similar to between
-when then else case on where having exists div mod escape interval collate using any some from join
-sql_calc_found_rows sql_no_cache sql_cache sql_small_result sql_big_result sql_buffer_result high_priority
-straight_join
-""".split())
-#: 不是列的名字：排序规则名（COLLATE x）、字符集名（USING x、CHARSET x、CHARACTER SET x）
-_NAME_AFTER = re.compile(
-    r"\b(?:collate|charset|character\s+set|using(?!\s*\())\s+([A-Za-z_][\w$#]*)", re.I)
-#: DATEADD(dd, …)、DATEDIFF(wk, …) 的第一个参数是日期部分的缩写，不是列。只在这个位置放过：
-#: 放进关键字表的话，别处打错成 wk、dd 的列名就查不出来了
-_DATEPART_ARG = re.compile(
-    r"\b(?:dateadd|datediff|datediff_big|datepart|datename|datetrunc|date_bucket|timestampadd|timestampdiff)"
-    r"\s*\(\s*([A-Za-z_][\w$#]*)", re.I)
-#: 命名窗口：WINDOW w AS (…)、…, w2 AS (…)
-_WINDOW_NAME = re.compile(r"(?:\bwindow|,)\s*([A-Za-z_][\w$#]*)\s+as\s*\(", re.I)
-
-
-def _blank_unicode_identifiers(sql: str) -> str:
-    """带引号、名字里有非 ASCII 字符的标识符（中文别名 AS "月份"、AS `曝光量`）连引号一起换成空格。
-
-    这项核对只认 ASCII 的列名，中文名本来就不判；不抹掉的话，SQL 里一出现带引号的标识符就整条放弃核对，照「结果列
-    起中文别名」写的 SQL 会把猜错的英文列名一起放过去。英文的带引号标识符（"StatDate"）大小写、空格都可能，照旧不判。"""
-    from app.data.guard import _GENERIC, _tokens
-
-    out = []
-    for token in _tokens(sql, _GENERIC):
-        if token.kind == "ident" and not token.text.isascii():
-            out.append(" " * len(token.text))
-        else:
-            out.append(token.text)
-    return "".join(out)
-
 
 def sql_source_prefix(sql: str, source: Any) -> list[str]:
     """SQL 里 FROM / JOIN 后面写成「数据源名.表名」的表（去重、按出现顺序）。
@@ -1442,66 +1376,6 @@ def sql_source_prefix(sql: str, source: Any) -> list[str]:
     text = _blank_quoted(re.sub(r"\{\{.*?\}\}", " 0 ", strip_comments(sql), flags=re.S), identifiers=False)
     pattern = re.compile(rf"\b(?:from|join)\s+[`\"\[]?{re.escape(name)}[`\"\]]?\s*\.\s*[`\"\[]?([^\s`\"\[\].,()]+)", re.I)
     return list(dict.fromkeys(f"{name}.{m.group(1)}" for m in pattern.finditer(text)))
-
-
-def sql_unknown_columns(sql: str, source: Any) -> tuple[list[str], list[str]] | None:
-    """SQL 里用到、数据源结构里查不到的列：(查不到的列, 这几张表的全部列)。判断不了、或者都查得到时返回 None。"""
-    from app.data import introspect as _introspect
-    from app.data.guard import _blank_quoted, first_verb, strip_comments
-
-    cache = getattr(source, "schema_cache", None) or {}
-    if not cache.get("tables") or cache.get("failed") or first_verb(sql) != "select":
-        return None
-    text = _blank_unicode_identifiers(re.sub(r"\{\{.*?\}\}", " 0 ", strip_comments(sql), flags=re.S))
-    if '"' in text.replace("''", "") and _blank_quoted(text) != _blank_quoted(text, identifiers=False):
-        return None                                   # 引号括起来的标识符：大小写、空格都可能，不猜
-    text = _blank_quoted(text)
-    if re.search(r"\bwith\b", text, re.I) or re.search(r"\b(?:from|join)\s*\(", text, re.I) or "`" in text \
-            or "[" in text:
-        return None                                   # [方括号] 标识符、数组下标：同样不猜
-    tables: dict[str, dict[str, Any]] = {}       # 表名、别名（小写）→ 表结构
-    spans: list[tuple[int, int]] = []
-    for m in _FROM_ITEMS.finditer(text):
-        spans.append(m.span(1))
-        for item in m.group(1).split(","):
-            parsed = _TABLE_ITEM.match(item)
-            if not parsed:
-                return None
-            name, alias = parsed.group(1), parsed.group(2)
-            meta = _introspect.find_table(source, name)
-            if meta is None:
-                return None                           # 结构里找不到的表（视图、同义词、截断了的结构）不判
-            tables[name.lower()] = tables[name.rsplit(".", 1)[-1].lower()] = meta
-            if alias and alias.lower() not in _SQL_WORDS:
-                tables[alias.lower()] = meta
-    if not tables:
-        return None
-    known = list(dict.fromkeys(c["name"] for meta in {id(m): m for m in tables.values()}.values()
-                               for c in meta.get("columns") or []))
-    columns = {c.lower() for c in known}
-    # 「SELECT created_at FROM」里 created_at 前面是关键字，它是列，不是别名
-    aliases = {a.lower() for a in _ALIAS_AS.findall(text)} | {
-        m.group(2).lower() for m in _ALIAS_BARE.finditer(text) if m.group(1).lower() not in _OPERAND_BEFORE} | {
-        a.lower() for a in _WINDOW_NAME.findall(text)}
-    names = {m.start(1) for pattern in (_NAME_AFTER, _DATEPART_ARG) for m in pattern.finditer(text)}
-    unknown: list[str] = []
-    for m in _QUALIFIED.finditer(text):
-        if any(a <= m.start() < b for a, b in spans):
-            continue
-        meta = tables.get(m.group(1).lower())
-        col = m.group(2)
-        if meta is not None and col != "*" and col.lower() not in {c["name"].lower() for c in meta.get("columns") or []}:
-            unknown.append(f"{m.group(1)}.{col}")
-    for m in _SQL_IDENT.finditer(text):
-        word = m.group(1)
-        low = word.lower()
-        if any(a <= m.start() < b for a, b in spans) or low in _SQL_WORDS or low in columns or low in aliases \
-                or low in tables or m.start() in names or re.match(r"\s*[.(]", text[m.end():]) \
-                or text[m.end():m.end() + 1] == "'":      # N'…'、X'…'、_utf8mb4'…'：字面量的前缀
-            continue
-        unknown.append(word)
-    unknown = list(dict.fromkeys(unknown))
-    return (unknown, known) if unknown else None
 
 
 def _source_of(tool: str) -> str | None:
@@ -1830,12 +1704,16 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
         baseline = copy.deepcopy(
             (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
-        # 查看服务：读目录、读能力登记在开流之前做完。现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表列在概览里
+        # 查看服务：读目录、读能力登记在开流之前做完。现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表列在概览里。
+        # 问数据另看已发布口径、可以 use_caliber 选用（next-round 02 做法 4）：只给搭建者及以上——使用者的图里看得到拷进来的
+        # 取数 SQL（口径的 SQL 可能写着遮罩值），这一波不给
+        kinds = ("table", "capability", "caliber") if payload.intent == "answer" and not chat_user \
+            else ("table", "capability")
         looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
-            payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view)
+            payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view, kinds=kinds)
     # 这一份 system 一直用到最后：接着写、自查修正都沿用，不换
     system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user)
-    applier = GraphApplier(nodes, edges)
+    applier = GraphApplier(nodes, edges, composer=copilot_context.composer(looks))
     started = time.monotonic()
     gen = Generation(model, system=system, applier=applier, looks=looks, started=started,
                      checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers,
@@ -2584,6 +2462,10 @@ class FromRunIn(BaseModel):
     #: 问数据回答上点「做成应用」时带上：这次运行出自哪段对话的哪一轮，记进新工作流的来源（workflows.origin）
     conversation_id: str | None = None
     turn_id: str | None = None
+    #: 固化成口径草稿（next-round 02 做法 8，app/ledger/certify.freeze）：报告引用的查询变成固定 SQL 的取数节点，跨轮变化
+    #: 的字面量成为参数（不保留 Agent）。peers 是同一组（同一个 SQL 形状）的别的运行，认哪些字面量位置变了
+    freeze: bool = False
+    peers: list[str] = Field(default_factory=list, max_length=50)
 
 
 @router.post("/from-run")
@@ -2605,6 +2487,15 @@ async def extract_template(
 
     # 对话只是记进来源：不能用的不让记（D-d），不存在的照旧记下 id
     await _ensure_conversation_access(session, payload.conversation_id)
+    if payload.freeze:
+        # 固化成口径草稿：取数是固定的 SQL（以后比对认得出等价），不是保留 Agent 的执行路径
+        from app.ledger.certify import CertifyRefused, freeze
+
+        try:
+            return await freeze(session, payload.run_id, peers=payload.peers, name=payload.name,
+                                conversation_id=payload.conversation_id, turn_id=payload.turn_id)
+        except CertifyRefused as e:
+            raise HTTPException(e.status_code, e.message) from e
     try:
         path = await extract_run_path(session, payload.run_id)
     except PathRefused as e:

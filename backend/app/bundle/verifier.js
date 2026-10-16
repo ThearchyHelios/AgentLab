@@ -64,7 +64,8 @@
     'agent.step.end': 'Agent 步骤结束', 'agent.route.start': '调度决策开始', 'agent.route.end': '调度决策结束',
     'human.requested': '请求人工审批', 'human.resolved': '人工审批结果', 'approval.inquiry': '审批质询',
     'issuance': '出具判定', 'caliber.upgrade': '口径卡升版处置', 'catalog.drift': '数据目录变化',
-    'report.checked': '报告自查', 'evidence.judged': '按需裁判', 'file.extracted': '读入附件', 'log': '日志', 'usage': '用量',
+    'schema.drift': '表结构变化', 'report.checked': '报告自查', 'evidence.judged': '按需裁判', 'file.extracted': '读入附件',
+    'log': '日志', 'usage': '用量',
   }
   const T = {
     allPass: '全部通过',

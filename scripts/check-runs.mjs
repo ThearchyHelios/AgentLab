@@ -796,6 +796,65 @@ await section('正式运行：发布之后数据目录有变化，提醒但不�
   for (const k of [`GET /api/runs/${id}`, `GET /api/runs/${id}/events`, `GET /api/runs/${id}/graph`]) fakes.delete(k)
 })
 
+// ------------------------------------------------------------------ 发布之后表结构有变化（schema.drift）
+
+await section('正式运行：发布之后表结构有变化，和目录变化同一块横幅，提醒但不拦', async () => {
+  const id = 'fake0schemadrift000000000000000'
+  const t = Date.now() / 1000 - 30
+  const run = {
+    ...base, id, status: 'succeeded', run_class: 'formal', version: 2, workflow_id: null,
+    created_at: new Date(t * 1000).toISOString(), started_at: new Date(t * 1000).toISOString(),
+    finished_at: new Date((t + 2) * 1000).toISOString(), output: { 结果: '共 12 单' },
+  }
+  const graph = { nodes: [
+    { id: 'a', type: 'input', position: { x: 0, y: 0 }, data: { label: '输入', config: {} } },
+    { id: 'q', type: 'tool', position: { x: 200, y: 0 }, data: { label: '查订单', config: {} } },
+  ], edges: [{ source: 'a', target: 'q' }] }
+  const schemaTables = [
+    { source: 'shop', source_id: 'src-shop', table: 'orders', label: '订单', published: 1, current: 2, removed: false,
+      changes: [{ id: 'c1', kind: 'column_removed', column: 'status', severity: 'action', summary: 'orders.status：删除了列' }],
+      more: 0 },
+  ]
+  const events = (withCatalog) => [
+    { seq: 1, type: 'run.started', node_id: null, ts: t, data: { nodes: 2 } },
+    ...(withCatalog ? [{ seq: 2, type: 'catalog.drift', node_id: null, ts: t + 0.01, data: { version: 2, count: 1, tables: [
+      { source: 'shop', source_id: 'src-shop', table: 'orders', label: '订单', published: 3, current: 4, impact: 'direct' },
+    ] } }] : []),
+    { seq: 3, type: 'schema.drift', node_id: null, ts: t + 0.02, data: { version: 2, count: 1, tables: schemaTables } },
+    { seq: 4, type: 'node.started', node_id: 'a', ts: t + 0.1, data: {} },
+    { seq: 5, type: 'node.finished', node_id: 'a', ts: t + 0.2, data: { duration_ms: 100 } },
+    { seq: 6, type: 'node.started', node_id: 'q', ts: t + 0.3, data: {} },
+    { seq: 7, type: 'node.finished', node_id: 'q', ts: t + 0.4, data: { duration_ms: 100 } },
+    { seq: 8, type: 'run.finished', node_id: null, ts: t + 2, data: { output: run.output } },
+  ]
+  let withCatalog = false
+  fakes.set(`GET /api/runs/${id}`, () => ({ status: 200, json: run }))
+  fakes.set(`GET /api/runs/${id}/events`, () => ({ status: 200, json: events(withCatalog) }))
+  fakes.set(`GET /api/runs/${id}/graph`, () => ({ status: 200, json: { graph, workflow_id: null, version: 2 } }))
+  await page.goto(`${WEB}/runs/${id}`, { waitUntil: 'networkidle' })
+  const banner = page.locator('[data-run-banner="catalog-drift"]')
+  check('只有结构变了：照样是那一块横幅', await banner.waitFor({ timeout: 5000 }).then(() => true, () => false))
+  let text = await banner.innerText().catch(() => '')
+  check('标题按结构说', text.includes('自发布以来，「订单」的结构有变化'), text.split('\n')[0])
+  check('写明运行未被拦截', text.includes('运行未被拦截'))
+  check('逐表写结构版本、列出还没处理的变化', text.includes('「shop」订单（orders）：结构第 1 版 → 第 2 版')
+    && text.includes('要处理 · orders.status：删除了列'), text.replace(/\s+/g, ' '))
+  check('给到数据目录的入口', (await banner.locator('[data-drift-schema-table="orders"] [data-drift-open="orders"]')
+    .getAttribute('href')) === '/data/catalog/src-shop/orders')
+  check('时间线里也有一行提醒', await page.locator('[data-step-code="schema_drift"]').count() === 1)
+
+  withCatalog = true
+  await page.goto(`${WEB}/runs/${id}`, { waitUntil: 'networkidle' })
+  await banner.waitFor({ timeout: 5000 }).catch(() => {})
+  text = await banner.innerText().catch(() => '')
+  check('目录、结构都变了：仍是一块横幅', await page.locator('[data-run-banner="catalog-drift"]').count() === 1)
+  check('……标题按目录说，结构另起一组带小标题', text.includes('自发布以来，数据目录中「订单」有变化')
+    && text.includes('结构变化：自发布以来，「订单」的结构有变化'), text.replace(/\s+/g, ' '))
+  check('……结构那一组逐表一行', await banner.locator('[data-drift-schema] [data-drift-schema-table="orders"]').count() === 1)
+  check('运行照常完成：没有失败横幅', await page.locator('[data-run-banner=failed]').count() === 0)
+  for (const k of [`GET /api/runs/${id}`, `GET /api/runs/${id}/events`, `GET /api/runs/${id}/graph`]) fakes.delete(k)
+})
+
 // ------------------------------------------------------------------ 运行中：接流、停止、不能删
 
 const FAKE = 'fake0running0000000000000000000'

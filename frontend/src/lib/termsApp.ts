@@ -802,3 +802,122 @@ export const HOOK_RECEIPT_TEXT = {
     ? `近 1 小时验签失败 ${n} 次：验签失败的请求不留记录，只计数`
     : '近 1 小时没有验签失败的请求'),
 }
+
+/**
+ * 邮件（通知渠道的第五种格式，服务端 notify/mail.py，04 细案 B2）：设置 → 通知里的「邮件服务」「每天的待办汇总」两节、
+ * 渠道里的邮件格式。照实说：成功只写「已交给邮件服务器」，退信不追踪，不说已送达
+ */
+export const MAIL_TEXT = {
+  section: '邮件服务',
+  hint: '通知渠道选「邮件」时用这台邮件服务器发信。口令加密保存，之后只显示「已设置」',
+  readOnly: '只有管理员能修改邮件服务',
+  enabled: '启用邮件',
+  enabledHint: '关着时通知渠道里没有「邮件」这一格式；已有的邮件渠道发不出去，投递记录里写明原因',
+  host: 'SMTP 服务器',
+  hostHint: '主机名或 IP 地址，例如 smtp.example.com，不带协议和端口',
+  port: '端口',
+  security: '加密方式',
+  securityLabel: { starttls: 'STARTTLS（常用端口 587）', ssl: 'SSL/TLS（常用端口 465）', none: '不加密（只在内网中继时用）' } as Record<string, string>,
+  username: '用户名',
+  usernameHint: '服务器不要求登录时留空',
+  password: '口令',
+  passwordSet: '已设置；留空表示不修改',
+  passwordUnset: '未设置',
+  passwordClear: '清除已保存的口令',
+  fromAddr: '发件地址',
+  fromName: '发件人名称',
+  defaultAssignees: '默认发邮件给待办处理人',
+  defaultAssigneesHint: '打开后，第一次有待办派给某人时，自动给他建一个个人邮件渠道（订阅待办打开、动作结果未知、审核有结果），发到他的账号邮箱；本人之后可以改订阅或关掉、删掉。缺省关：刚配好邮件服务时不会突然往外发邮件',
+  save: '保存邮件服务',
+  saved: '已保存邮件服务设置',
+  invalidPort: '请填写 1 到 65535 之间的整数',
+  leaveBody: '邮件服务有没保存的改动，离开将丢失这些改动。',
+  test: '发测试邮件',
+  testHint: '按已保存的设置发一封到你自己的账号邮箱',
+  testDirty: '先保存再发测试邮件',
+  handoff: '已交给邮件服务器',
+  handoffHint: '「已交给邮件服务器」不等于已经进了收件箱：退信不追踪，是否送达以邮件服务器为准',
+  // 每天的待办汇总（服务端 notify/digest.py）
+  digest: '每天的待办汇总',
+  digestHint: '每天这个时间（按服务端所在时区）给订阅了「每天的待办汇总」的个人渠道发一条：还有几条待办、最早的时限、最多 5 条和去待办箱的链接。没有待办的人那天不发',
+  digestAt: '发送时间',
+  digestSave: '保存发送时间',
+  digestSaved: (at: string) => `每天 ${at} 发待办汇总`,
+  digestReadOnly: '只有管理员能修改发送时间',
+  // 渠道里的邮件格式
+  personalTo: (email: string | null) => (email ? `发到账号邮箱 ${email}` : '你的账号没有邮箱地址，发不出去：请联系管理员在「设置 → 身份」里填写'),
+  personalToHint: '个人邮件渠道只发到你的账号邮箱，不能填别的地址',
+  recipients: '收件地址',
+  recipientsHint: '多个地址用逗号或换行分隔，最多 20 个；人多的请填邮件组的地址',
+  to: (list: string[]) => (list.length
+    ? `发到 ${list.slice(0, 2).join('、')}${list.length > 2 ? ` 等 ${list.length} 个地址` : ''}` : ''),
+  off: '邮件服务没有启用，暂时不能选邮件：请管理员在下面的「邮件服务」里配置并启用',
+}
+
+/**
+ * 分享链接（服务端 api/shares.py，04 细案 C2）：应用编辑 → 岗位与授权里的管理。叫「分享链接」，不叫快照的那种说法：
+ * 「快照」专指查询快照
+ */
+export const SHARE_TEXT = {
+  section: '分享链接',
+  hint: '拿到链接的人不用登录就能看这一页：只读，只显示定时出数的视图，看到的数据和使用者一样遮过；出处给「下载报告」。必须设到期，随时可以撤销',
+  off: '管理员还没有打开分享链接：在「设置 → 偏好设置」的「应用」一节里打开「允许建分享链接」后才能建',
+  offWithRows: '管理员已关闭分享链接：下面这些暂时打不开，仍然可以撤销',
+  personal: '个人应用只给你自己用，不能分享',
+  unpublished: '发布之后才能建分享链接',
+  create: '新建分享链接',
+  empty: '还没有分享链接',
+  page: '分享哪一页',
+  pageHint: '只显示这一页上定时出数的视图；入口、表单、实例、待办和报告正文在分享页上换成说明',
+  mode: '数据',
+  modeLatest: '始终最新：跟着最近一次封存走',
+  modeFixed: '固定在现在这一期：之后出的数不换上来',
+  modeShort: { latest: '始终最新', fixed: '固定这一期' } as Record<string, string>,
+  expires: '有效期',
+  expiresDays: (n: number) => `${n} 天`,
+  expiresHint: (max: number) => `必须设到期，最长 ${max} 天`,
+  embed: '允许嵌入到别的站点',
+  embedHint: '勾上之后这条链接能放进门户的 iframe（只限部署配置里允许嵌入分享页的站点）；不勾的在别的页面里不显示内容',
+  embedNoOrigins: '部署没有配置允许嵌入分享页的站点（AGENTLAB_EMBED_ORIGINS），勾了也只能在 AgentLab 自己的页面里嵌',
+  submit: '建分享链接',
+  created: '分享链接已建好',
+  once: '链接只显示这一次，请现在复制下来；之后只看得到开头几位',
+  dismiss: '我已复制',
+  state: { active: '有效', revoked: '已撤销', expired: '已到期' } as Record<string, string>,
+  embedded: '可嵌入',
+  opened: (n: number) => (n ? `打开过 ${n} 次` : '还没打开过'),
+  by: (who: string) => `由 ${who} 建`,
+  until: (at: string) => `${at} 到期`,
+  revoke: '撤销',
+  revokeTitle: (prefix: string) => `撤销分享链接 ${prefix}…？`,
+  revokeBody: '撤销之后，拿着这条链接的人打开会看到「链接已撤销」，不能恢复；要再分享请建一条新的。',
+  revoked: '已撤销分享链接',
+}
+
+/** 分享页（/s，不在外壳里）：拿到分享链接的人看到的页面 */
+export const SHARE_PAGE_TEXT = {
+  loading: '正在打开分享的页面…',
+  readOnly: '只读',
+  footer: (who: string, at: string, until: string) => `只读 · 由 ${who} 于 ${at} 分享 · ${until} 到期`,
+  someone: '管理应用的人',
+  fixed: '固定在分享时的那一期',
+  latest: '跟着最近一次封存更新',
+  stamps: '数据的来历',
+  stampsHint: '每个视图取的是哪一次运行、截至什么时候、按哪个口径、出具档位',
+  download: '下载报告',
+  downloadHint: '下载的报告里每个数都点得开出处（口径、来源、计算方式），离线也能看',
+  downloading: '正在下载…',
+  downloaded: '已下载报告',
+  noReports: '这一页的数据没有可下载的报告',
+  evidenceTitle: '出处在下载的报告里',
+  evidence: '分享页不打开在线出处：点下面的「下载报告」，下载的报告里每个数都点得开出处，离线也能看',
+  close: '知道了',
+  noKey: '链接不完整：缺少 # 后面的那一段，请向分享的人确认链接',
+  errorTitle: {
+    share_revoked: '链接已撤销', share_expired: '链接已到期', share_links_off: '分享链接已关闭',
+    share_gone: '分享的页面打不开了', share_not_found: '链接无效', share_key_missing: '链接不完整',
+  } as Record<string, string>,
+  failed: '分享的页面打不开',
+  framed: '这条分享链接没有允许嵌入到别的页面，请直接打开链接查看',
+  openDirect: '在新窗口打开',
+}

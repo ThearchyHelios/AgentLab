@@ -4,7 +4,9 @@ ledger 键、报告导出的片段面板，三处读同一份比对工件、按�
 遮罩按读的那一刻重滤（同证据面板，api/evidence._Masks）：绑定的值是这次运行查到过的遮罩值时不给值（也就不能拿它代填出具），
 差异条目里的 SQL 片段走 _Shown 同一套换法。工作流名按现在的取（工件里不存名字）。
 
-界面层不放逻辑：标签、整题判断、能做的动作（这一波还没有出具和对账，actions 是空的）都由这里给。
+界面层不放逻辑：标签、整题判断、能做的动作都由这里给。actions（第 3 波）：整题等价时按那份口径正式出具（能不能、能不能
+自动、不能的原因，ledger/issue.plan_issue，按看的这个人的权限判）；有相关口径的查询看差多少（口径对账，ledger/reconcile）。
+issued 是这次运行按口径出具过的正式运行，reconciled 是对过的账（各自的运行、状态）。
 """
 from __future__ import annotations
 
@@ -73,6 +75,8 @@ def _query_view(query: dict[str, Any], hider: _Hide, names: dict[str, str]) -> d
     for cand in query.get("candidates") or []:
         item = ledger_labels.related_view(cand, hide=hider.hide, shown=hider.shown, names=names)
         item["status"] = cand.get("status")
+        if cand.get("how"):
+            item["how"] = cand["how"]
         if cand.get("columns") is not None:
             item["columns"] = cand["columns"]
         cands.append(item)
@@ -94,7 +98,8 @@ def _stamp(recorded: store.Recorded) -> dict[str, Any]:
         if isinstance(recorded.ts, (int, float)) else None
     return {"artifact": recorded.artifact, "algo": recorded.algo, "trigger": recorded.trigger, "retro": recorded.retro,
             "matched_at": at, "post_seal": True, "note": ledger_labels.POST_SEAL_NOTE,
-            **({"retro_note": ledger_labels.RETRO_NOTE} if recorded.retro else {})}
+            **({"retro_note": ledger_labels.CERTIFIED_NOTE if recorded.trigger == "certified"
+                else ledger_labels.RETRO_NOTE} if recorded.retro else {})}
 
 
 async def run_view(run_id: str) -> dict[str, Any]:
@@ -120,10 +125,20 @@ async def run_view(run_id: str) -> dict[str, Any]:
         return {**base, "state": "pending"}
     if recorded.content is None:
         return {**base, "state": "unreadable", "reason": recorded.problem, **_stamp(recorded)}
+    from app.api.deps import current_principal
+    from app.ledger import issue as ledger_issue
+    from app.ledger import reconcile as ledger_reconcile
+
     content = recorded.content
     sealed = await _sealed(run_id)
     hider = await _hider(sealed)
     names = await _names(_workflow_ids(content))
+    principal = current_principal()
+    plans = await ledger_issue.plans_for(run_id, content, principal=principal, hide=hider.hide,
+                                         artifact=recorded.artifact, retro=recorded.retro)
+    async with SessionLocal() as session:
+        issued = [ledger_issue.issued_view(r) for r in await ledger_issue.issued_runs(session, run_id)]
+        reconciled = [ledger_reconcile.reconciled_view(r) for r in await ledger_reconcile.reconciled_runs(session, run_id)]
     return {
         **base, "state": "matched", **_stamp(recorded),
         "calibers": [{**{k: c.get(k) for k in ("caliber", "workflow_id", "version", "level", "graph_hash")},
@@ -134,8 +149,9 @@ async def run_view(run_id: str) -> dict[str, Any]:
         "reports": _labels_view(content, hider, names),
         "primary": content.get("primary"),
         "whole": _whole_view(content.get("whole") or {}, hider, names),
-        # 能做的动作（按口径正式出具、对账）在第 3 波；这一波照实给空的
-        "actions": [],
+        "actions": [*(p.action() for p in plans), *ledger_reconcile.actions_of(content, names, hider.hide)],
+        "issued": issued,
+        "reconciled": reconciled,
     }
 
 

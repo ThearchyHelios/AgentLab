@@ -1,4 +1,4 @@
-import type { CatalogDriftTable, RunEvent, SqlCheckItem, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
+import type { CatalogDriftTable, RunEvent, SchemaDriftTable, SqlCheckItem, TeamMember, TeamRound, TeamRun, ToolChange } from '../types'
 import type { NodeState, RunPhase } from './trace'
 import type { LookEvent, LookObject, TaskKind } from '../typesApp'
 import { formatDuration, formatNumber } from '../lib/format'
@@ -7,6 +7,7 @@ import {
   ORIGIN_TEXT, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, TASK_KIND_LABEL, TASK_LOG_TEXT, TASK_STATUS_LABEL, TASK_TEXT, TYPE_LABEL, originLabel,
   CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, MASKED_CELL_TEXT, NODE_TYPE_LABEL,
   VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText, FILE_TEXT, REJECTED_TEXT, LEDGER_TEXT,
+  SCHEMA_DRIFT_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -2411,7 +2412,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           id: `lm-${seq}`, seq, kind: 'note', status: 'done', code: 'ledger_matched',
           level: typeof counts.skipped === 'number' && counts.skipped > 0 ? 'warn' : 'info',
           title: LEDGER_TEXT.timeline(counts),
-          sub: [LEDGER_TEXT.sub, retro ? LEDGER_TEXT.retro : ''].filter(Boolean).join(' · '),
+          sub: [LEDGER_TEXT.sub, d.trigger === 'certified' ? LEDGER_TEXT.certified : retro ? LEDGER_TEXT.retro : '']
+            .filter(Boolean).join(' · '),
         })
         break
       }
@@ -2429,6 +2431,17 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         out.push({
           id: `cd-${seq}`, seq, kind: 'note', level: 'warn', status: 'done', code: 'catalog_drift',
           title: drift.title, sub: CATALOG_DRIFT_TEXT.sub, detail: drift.detail,
+        })
+        break
+      }
+
+      case 'schema.drift': {
+        // 从发布版本发起的正式运行：发布之后这一版直接引用的表的结构变了（next-round 03 B1）。只提醒、运行照常，同目录漂移
+        const drift = schemaDrift(d)
+        if (!drift) break
+        out.push({
+          id: `sd-${seq}`, seq, kind: 'note', level: 'warn', status: 'done', code: 'schema_drift',
+          title: drift.title, sub: SCHEMA_DRIFT_TEXT.sub, detail: drift.detail,
         })
         break
       }
@@ -3213,6 +3226,40 @@ export function catalogDrift(d: Record<string, any>): {
   }
 }
 
+/** 一张表的那一行：「shop」订单（orders）：结构第 1 版 → 第 2 版（删了的写「表已删除」） */
+export function schemaDriftLine(t: SchemaDriftTable): string {
+  return SCHEMA_DRIFT_TEXT.line(t.source, CATALOG_DRIFT_TEXT.table(t.label, t.table), t.published, t.current, t.removed)
+}
+
+/**
+ * schema.drift 事件 → 提醒的标题和逐表明细。每张表一行（发布时和现在的结构版本），下面缩进列出这张表上还没处理的结构
+ * 变化（服务端给的一句话，最多 5 条，多的写「另有 N 条」）。认不出的形状返回 null
+ */
+export function schemaDrift(d: Record<string, any>): { title: string; detail: string; tables: SchemaDriftTable[] } | null {
+  const tables: SchemaDriftTable[] = (Array.isArray(d?.tables) ? d.tables : [])
+    .filter((t: any) => t && typeof t === 'object' && typeof t.table === 'string' && typeof t.source === 'string')
+    .map((t: any) => ({
+      source: t.source, source_id: String(t.source_id ?? ''), table: t.table,
+      label: typeof t.label === 'string' && t.label ? t.label : null,
+      published: num(t.published) ?? 0, current: t.removed ? null : (num(t.current) ?? null), removed: !!t.removed,
+      changes: (Array.isArray(t.changes) ? t.changes : [])
+        .filter((c: any) => c && typeof c === 'object' && typeof c.summary === 'string')
+        .map((c: any) => ({ id: String(c.id ?? ''), kind: String(c.kind ?? ''), column: typeof c.column === 'string' ? c.column : null,
+          severity: c.severity === 'action' || c.severity === 'warning' ? c.severity : 'info', summary: c.summary })),
+      more: num(t.more) ?? 0,
+    }))
+  if (!tables.length) return null
+  return {
+    title: SCHEMA_DRIFT_TEXT.title(tables[0].label ?? tables[0].table, tables.length),
+    detail: tables.flatMap((t) => [
+      schemaDriftLine(t),
+      ...t.changes.map((c) => `  · ${c.summary}`),
+      ...(t.more ? [`  ${SCHEMA_DRIFT_TEXT.more(t.more)}`] : []),
+    ]).join('\n'),
+    tables,
+  }
+}
+
 /**
  * look 事件（L2，服务端 app/look/base.py 的形状）读进来：objects 按类型标记；字段缺了的补空，认不出的形状返回 null
  * （不出这一行，也不报错）。旧写法 sources[] 当作表类型读
@@ -3575,6 +3622,25 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
               sub: CATALOG_PATCH_TEXT.stepSub,
               detail: patch.changes.map((c) => `${patchWhere(c)}：${patchBeforeText(c)} → ${patchValueText(c.path, c.after)}`)
                 .join('\n') })
+        break
+      }
+      case 'use_caliber': {
+        // 问数据的助手选用已发布口径（服务端 ledger/compose.py）：取数节点和口径卡由服务端按那一版生成，不另转 add_node，
+        // 这里一行说清选用了哪一版、生成了几个节点；拒收的照实写原因（原因同样交回了模型去改）
+        const r = op.result && typeof op.result === 'object' ? op.result : null
+        if (r?.status === 'ok') {
+          nodeCount += num(r.nodes) ?? 0
+          const metrics = Array.isArray(r.metrics) ? r.metrics.map((m: any) => String(m?.name ?? m?.id ?? '')).filter(Boolean) : []
+          add({ id: `uc-${i}`, seq: i, kind: 'node', status: 'done', code: 'use_caliber',
+                title: clip(LEDGER_TEXT.use.title(String(r.workflow_name ?? r.workflow_id ?? ''), num(r.version) ?? null,
+                                                  String(r.level_text ?? ''))),
+                detail: LEDGER_TEXT.use.detail(Array.isArray(r.fetches) ? r.fetches.length : 0, String(r.card ?? r.card_id ?? ''),
+                                               metrics.join('、')),
+                ...(r.card_id ? { nodeId: String(r.card_id) } : {}) })
+        } else if (r?.status === 'refused') {
+          add({ id: `uc-${i}`, seq: i, kind: 'note', status: 'done', level: 'warn', code: 'use_caliber_refused',
+                title: LEDGER_TEXT.use.refused, detail: String(r.reason ?? '') || undefined })
+        }
         break
       }
       case 'plan':

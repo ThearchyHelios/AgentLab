@@ -61,7 +61,8 @@ async def test_a_matched_run_gives_labels_and_the_whole_judgement(client, monkey
     body = await ledger_of(client, row.id)
     assert body["state"] == "matched" and body["note"] == "封存后比对，不在封存范围内" and body["post_seal"] is True
     assert body["trigger"] == "sealed" and body["retro"] is False and "retro_note" not in body
-    assert body["actions"] == [] and body["primary"] == "write"
+    # 第 3 波起整题等价时有「按口径出具」这一项（详细的在 tests/test_ledger_issue.py）
+    assert [a["kind"] for a in body["actions"]] == ["issue"] and body["primary"] == "write"
     [caliber] = body["calibers"]
     assert caliber["workflow_name"] == "周销售" and caliber["level_text"] == "受管" and caliber["caliber"] == f"{wf}@1"
     [label] = body["reports"]["write"]["labels"].values()

@@ -2,7 +2,7 @@
 
 标签四种（KINDS）：
 - caliber：来自口径「X」vN。how 是怎么认的：independent「等价已证明」（这次 Agent 自己写的 SQL 被证明和口径的取数等价）、
-  composed「助手选用」（助手按口径组合出来的；组合在第 3 波，这一波只留这个值）。
+  composed「助手选用」（助手 use_caliber 按口径组合出来的取数，证明了和那一版一致：ledger/match 的 composed）。
 - related：相关口径——同一个数据源、查了同样的表的已发布口径，但不等价；附差在哪（explain_sql_diff 的条目）。
 - reasoning：这次的推理——没有相关的已发布口径。
 - unknown：没比对、比对没做完（超时、解析失败）、快照读不出来。
@@ -30,6 +30,8 @@ HOWS = ("independent", "composed")
 #: 界面上标签要写明的两句：比对在封存之后做，不在封存范围内；事后补比的是按现在的口径回看
 POST_SEAL_NOTE = "封存后比对，不在封存范围内"
 RETRO_NOTE = "按现在的口径回看"
+#: 固化出的口径发布之后对来源运行补比的（store 的 trigger=certified）
+CERTIFIED_NOTE = "按之后发布的口径回看"
 #: 发布级别的叫法（同 blueprints/publish_plan.LEVEL_TEXT、前端 lib/terms.ts）
 LEVEL_TEXT = {"published": "已发布", "governed": "受管"}
 MASKED = "已遮罩"
@@ -72,7 +74,8 @@ def _related(query: Mapping[str, Any], *, reason: str | None = None) -> dict[str
 
 
 def _caliber(cand: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
-    return {"kind": "caliber", "how": "independent", "caliber": cand.get("caliber"),
+    return {"kind": "caliber", "how": "composed" if cand.get("how") == "composed" else "independent",
+            "caliber": cand.get("caliber"),
             "workflow_id": cand.get("workflow_id"), "version": cand.get("version"), "level": cand.get("level"),
             "binding": dict(cand.get("binding") or {}), **extra}
 
@@ -183,13 +186,15 @@ def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mappin
     common = set.intersection(*proven_keys) if proven_keys else set()
     nearby = _brief([c for q in queries_found for c in q.get("candidates") or []
                      if c.get("status") in ("proven", "related")])
+    queried = {"queries": [str(i["artifact"]) for i in from_queries]}
     if len(from_queries) < len(inputs):
-        return {"kind": "related", "related": nearby, "reason": INPUTS_ELSEWHERE} if nearby else {"kind": "reasoning"}
+        return {"kind": "related", "related": nearby, "reason": INPUTS_ELSEWHERE, **queried} if nearby \
+            else {"kind": "reasoning", **queried}
     if not common:
         if all(proven_keys):
-            return {"kind": "related", "related": nearby, "reason": MIXED_CALIBERS}
+            return {"kind": "related", "related": nearby, "reason": MIXED_CALIBERS, **queried}
         related = next((q for q in queries_found if q.get("status") == "related"), None)
-        return _related(related) if related is not None else {"kind": "reasoning"}
+        return {**_related(related), **queried} if related is not None else {"kind": "reasoning", **queried}
     reason = FORMULA_DIFFERS
     for key in sorted(common):
         chosen = [next(c for c in _proven(q) if c.get("caliber") == key) for q in queries_found]
@@ -218,9 +223,14 @@ def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mappin
                     if theirs == mine), None)
         if hit is None:
             continue
-        return {**_caliber(chosen[0], card=hit[0], metric=hit[1]), "binding": binding}
+        label = {**_caliber(chosen[0], card=hit[0], metric=hit[1]), "binding": binding,
+                 "queries": [str(i["artifact"]) for i in from_queries]}
+        if any(c.get("how") == "composed" for c in chosen):
+            # 几个输入里有一个是助手选用的，整个指标就按助手选用说（不能说成都是独立写出来的）
+            label["how"] = "composed"
+        return label
     return {"kind": "related", "related": _brief([c for q in queries_found for c in _proven(q)
-                                                  if c.get("caliber") in common]), "reason": reason}
+                                                  if c.get("caliber") in common]), "reason": reason, **queried}
 
 
 def _brief(cands: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -348,6 +358,6 @@ def related_view(item: Mapping[str, Any], *, hide: Callable[[Any], bool], shown:
     return out
 
 
-__all__ = ["HOWS", "KINDS", "LEVEL_TEXT", "POST_SEAL_NOTE", "RETRO_NOTE", "binding_view", "caliber_key",
+__all__ = ["CERTIFIED_NOTE", "HOWS", "KINDS", "LEVEL_TEXT", "POST_SEAL_NOTE", "RETRO_NOTE", "binding_view", "caliber_key",
            "card_expressions", "cell_label", "diff_view", "label_doc", "metric_label", "related_view", "view_label",
            "whole_of"]

@@ -1,6 +1,7 @@
 """通知的发送核心（附录 C，BE-2 提供）。从 scheduler/webhook.py 抽出：四种格式、签名、发送、脱敏（core.py）；
 webhook.py 照原名再导出，定时任务的通知存储不迁移（F14）。新对象（待办、实例、动作）的订阅和投递记录在
-service.py：渠道（notify_channels）、投递记录（notify_deliveries）。"""
+service.py：渠道（notify_channels）、投递记录（notify_deliveries）。渠道的第五种格式「邮件」走 mail.py（SMTP），订阅、
+投递记录、消息结构都和 Webhook 同一套，只是在这里按格式分到另一条发送路上。"""
 from __future__ import annotations
 
 from typing import Any
@@ -22,6 +23,10 @@ async def send(channel: Any, message: dict[str, Any]) -> Any:
                   lines=[(str(k), str(v)) for k, v in message.get("lines") or []],
                   links=[(str(k), str(v)) for k, v in message.get("links") or []],
                   ok=bool(message.get("ok")))
+    if channel.format == "email":
+        from app.notify import mail
+
+        return await mail.deliver(channel, message, msg)
     if not url:
         return Outcome(False, None, 0, "渠道的地址无法解密（加密密钥可能已更换），请重新填写地址")
     if getattr(channel, "scope", None) == "user":

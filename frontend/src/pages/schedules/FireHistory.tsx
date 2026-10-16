@@ -143,6 +143,9 @@ function FireRow({ fire: f, tz, now }: { fire: ScheduleFire; tz: string; now: nu
             {T.openRun}
             <ChevronRight size={11} aria-hidden />
           </Link>
+        ) : f.eval_run_id ? (
+          // 目标是评测题集：这一次发起的是一次评测（评测页在后续版本），这里只写编号
+          <span className="shrink-0 text-2xs text-dim" data-fire-eval={f.eval_run_id}>{T.evalFire(f.eval_run_id.slice(0, 6))}</span>
         ) : <span className="shrink-0 text-2xs text-faint">{T.noRun}</span>}
       </div>
       {f.reason && (

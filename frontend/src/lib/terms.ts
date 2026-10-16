@@ -2782,6 +2782,26 @@ export const CATALOG_DRIFT_TEXT = {
 }
 
 /**
+ * 发布之后表结构有变化（schema.drift，next-round 03 B1）：和目录有变化合在同一块横幅里，分开一组说。叫「结构变化」，和已经
+ * 在用的「目录有变化」分开（X10）
+ */
+export const SCHEMA_DRIFT_TEXT = {
+  /** 运行里的提醒：「自发布以来，「订单」等 2 张表的结构有变化」 */
+  title: (first: string, n: number) => (n > 1
+    ? `自发布以来，「${first}」等 ${formatNumber(n)} 张表的结构有变化`
+    : `自发布以来，「${first}」的结构有变化`),
+  /** 横幅里目录、结构都变了：结构这一组的小标题 */
+  head: '结构变化',
+  sub: '运行未被拦截。只是加了列不影响这次结果；删了列、改了类型时，写死的 SQL 可能报错或算错，请核对',
+  /** 一张表的那一行：「shop」订单（orders）：结构第 1 版 → 第 2 版 */
+  line: (source: string, table: string, from: number, to: number | null, removed: boolean) =>
+    `「${source}」${table}：${removed ? '表已删除' : `结构第 ${formatNumber(from)} 版 → 第 ${formatNumber(to ?? 0)} 版`}`,
+  /** 还有几条没处理的变化没列出来 */
+  more: (n: number) => `…另有 ${formatNumber(n)} 条结构变化`,
+  severity: { info: '说明', warning: '提醒', action: '要处理' } as Record<string, string>,
+}
+
+/**
  * 表结构只探查了一部分：探查结构时每个数据源最多取 200 张表（服务端 introspect._MAX_TABLES），多出来的表不在
  * 表结构里，数据目录列不出，助手也看不到它们的字段。数据目录页顶部和助手「参考了哪些表」那一行都要说出来。
  */
@@ -3149,7 +3169,10 @@ export const PROFILE_TEXT = {
   taskStatus: {
     pending: '排队', running: '剖析中', ok: '完成', partial: '部分完成', failed: '失败', skipped: '跳过', cancelled: '已停止',
   } as Record<CatalogDraftTaskStatus, string>,
-  checkKind: { relation: '关系', codes: '码值', date: '日期' } as Record<string, string>,
+  checkKind: {
+    relation: '关系', codes: '码值', date: '日期', observe: '取值观察',
+    rows: '行数', codes_observe: '码值观察', freshness: '最新业务日期', daily_volume: '按日行数',
+  } as Record<string, string>,
   kindProgress: (label: string, done: number, total: number) => `${label} ${formatNumber(done)}/${formatNumber(total)}`,
   tableQueries: (n: number) => `${formatNumber(n)} 条查询`,
   /** 这张表的查询次数用完了（等于每张表最多查询数） */
@@ -3199,7 +3222,10 @@ export const PROFILE_TEXT = {
   moreSkipped: (n: number) => `…另有 ${formatNumber(n)} 项`,
   queriesTitle: (n: number) => `看发过的查询（${formatNumber(n)} 条）`,
   queriesHint: 'SQL 里的取值都换成了「?」：取到的键值不保存在 AgentLab 中；遮罩的列不出现在任何查询里',
-  queryKind: { row_estimate: '行数估算', relation: '关系', codes: '码值', date: '日期' } as Record<string, string>,
+  queryKind: {
+    row_estimate: '行数估算', relation: '关系', codes: '码值', date: '日期',
+    codes_observe: '码值观察', freshness: '最新业务日期', daily_volume: '按日行数',
+  } as Record<string, string>,
   queryOutcome: { ok: '成功', timeout: '超时', error: '失败', rejected: '未通过只读守卫' } as Record<string, string>,
   queryRows: (n: number) => `${formatNumber(n)} 行`,
   queryMs: (ms: number) => `${formatNumber(ms)} 毫秒`,
@@ -3311,6 +3337,10 @@ export const PROFILE_SKIP_KIND_LABEL: Record<string, string> = {
   date: '日期列',
   row_estimate: '行数估算',
   table: '整张表',
+  rows: '行数观察',
+  codes_observe: '码值观察',
+  freshness: '最新业务日期',
+  daily_volume: '按日行数',
 }
 
 /** 码值候选：剖析只知道出现过哪些取值，含义等人填 */
@@ -3884,7 +3914,24 @@ export const SCHEDULE_TEXT = {
   /** 启用开关遇到版本不符（409）：服务端那句是写给表单保存的，开关用这句，原话放进详情 */
   toggleConflict: (name: string) => `「${name}」已在别处被修改，已重新载入最新状态，请确认后再切换`,
 
+  // ---- 目标（定时只有一套：目标可以是工作流、评测题集或数据源维护）
+  targetKind: { workflow: '工作流', eval_suite: '评测题集', source_maintenance: '数据源维护' } as Record<
+    import('../types').ScheduleTargetKind, string>,
+  /** 目标已经不在了：名字是保存时记下的 */
+  targetGone: (name: string) => `${name}（已不存在）`,
+  view: '查看',
+  viewLabel: (name: string) => `查看定时任务「${name}」`,
+  /** 非工作流目标的设置是只读的：启用、暂停、立即运行、触发历史照常可用 */
+  targetSettingsTitle: '设置',
+  targetSettingsNote: (kind: string) => `这个定时任务的目标是${kind}：可以启用、暂停、立即运行和查看触发历史；名称、频率和目标在这里只能查看，不能修改`,
+  targetField: '目标',
+  graceField: '补发宽限',
+
   // ---- 立即运行的结果
+  /** 目标是评测题集：发起的是一次评测，没有运行可看 */
+  evalStarted: '已发起一次评测',
+  /** 触发历史里评测题集那一次：评测的编号 */
+  evalFire: (short: string) => `评测 #${short}`,
   runStarted: '已发起运行',
   runSkipped: '上一次运行尚未结束，本次已按重叠策略跳过',
   runFailed: (reason: string | null) => (reason ? `未能发起运行：${reason}` : '未能发起运行'),
@@ -4522,10 +4569,24 @@ export const LEDGER_TEXT = {
   /** 副标题：比对在封存之后；事后补比、打开时按需比的另写一句 */
   sub: '封存后比对，不在封存范围内',
   retro: '按现在的口径回看',
+  /** 从问数据固化出的口径发布之后，对来源运行补比的那一次（服务端 trigger=certified） */
+  certified: '按之后发布的口径回看',
   /** 标签的四种、认法的两种（第 4 波的证据面板、轮次摘要用同一套） */
   kind: { caliber: '来自口径', related: '相关口径', reasoning: '这次的推理', unknown: '没有比对' },
   how: { independent: '等价已证明', composed: '助手选用' },
   level: { governed: '受管', published: '已发布' },
+  /**
+   * 问数据的助手选用已发布口径（use_caliber，服务端 ledger/compose.py 按那一版生成取数节点和口径卡）：过程里照实写一行。
+   * 拒收的（参数不对、版本不对……）同样一行，写服务端给的原因
+   */
+  use: {
+    title: (name: string, version: number | null, level: string) =>
+      `选用口径「${name}」${version != null ? ` v${version}` : ''}${level ? `（${level}）` : ''}`,
+    detail: (fetches: number, card: string, metrics: string) =>
+      `按这一版生成取数节点 ${formatNumber(fetches)} 个和口径卡「${card}」${metrics ? `，用到的指标：${metrics}` : ''}`,
+    refused: '没有选用口径',
+    status: '正在选用口径…',
+  },
 }
 
 /**
@@ -5611,7 +5672,8 @@ export const NOTIFY_TEXT = {
   urlHint: '地址加密保存，之后只显示主机名',
   secret: '签名密钥（可选）',
   format: '格式',
-  formats: { generic: '通用 JSON', feishu: '飞书群机器人', wecom: '企业微信群机器人', dingtalk: '钉钉群机器人' } as Record<string, string>,
+  // email：邮件（第五种格式，服务端 notify/mail.py）：要先在「邮件服务」一节配好并启用
+  formats: { generic: '通用 JSON', feishu: '飞书群机器人', wecom: '企业微信群机器人', dingtalk: '钉钉群机器人', email: '邮件' } as Record<string, string>,
   scope: '范围',
   scopes: { global: '全局', app: '应用', user: '个人' } as Record<string, string>,
   events: '订阅的事件',
@@ -5625,7 +5687,7 @@ export const NOTIFY_TEXT = {
     // 个人应用提交审核有了结果（发布了或退回了），通知提交人：只对个人渠道、全局渠道有意义（服务端 notify/service.notify_review）
     'review.done': '我提交审核的应用有结果',
     'source.changed': '数据源有变化要处理', 'ledger.recall': '口径升版，答案的数变了',
-    'eval.regressed': '评测有退步', 'eval.failed': '评测失败',
+    'eval.regressed': '定时评测有退步', 'eval.failed': '定时评测没有评完',
     'task.digest': '每天的待办汇总', 'key.expiring': '访问密钥快到期',
   } as Record<string, string>,
   /** 投递记录里才有的事件：改派、升级、催办按「待办打开」的订阅推，记录里照实写是哪一种（服务端 notify/service._AS） */
@@ -6085,6 +6147,9 @@ export const APP_SETTING_TEXT = {
   onDemandLimitInvalid: '请填写 0 到 100,000 之间的整数',
   personalApps: '使用者可以建个人应用',
   personalAppsHint: '开启后，使用者可以从说需求、场景模板或问数据的回答建一个只有自己看得见的应用：只读、结果遮罩，每人每天的刷新次数按上面的每日上限算；想给别人用要提交给搭建者审核发布。搭建者及以上不受这一项限制',
+  // 分享链接（服务端 apps.share_links，04 细案 C2）：默认关
+  shareLinks: '允许建分享链接',
+  shareLinksHint: '开启后，管理应用的人可以在应用编辑的「岗位与授权」里给一页建分享链接：拿到链接的人不用登录就能看（只读、只显示定时出数的视图、数据和使用者看到的一样遮过），必须设到期、最长 90 天、随时可以撤销。关掉时已有的分享链接一并打不开',
 }
 
 /**

@@ -857,6 +857,33 @@ await section('正式运行：发布之后数据目录有变化（catalog.drift 
     .every((s) => s.code !== 'catalog_drift'))
 })
 
+await section('正式运行：发布之后表结构有变化（schema.drift 事件）', async () => {
+  const steps = mod.decodeRun([
+    { seq: 1, type: 'run.started', node_id: null, ts: 1, data: { nodes: 1 } },
+    { seq: 2, type: 'schema.drift', node_id: null, ts: 1.01, data: { version: 2, count: 2, tables: [
+      { source: 'shop', source_id: 'src-shop', table: 'orders', label: '订单', published: 1, current: 2, removed: false,
+        changes: [{ id: 'c1', kind: 'column_removed', column: 'status', severity: 'action', summary: 'orders.status：删除了列' },
+          { id: 'c2', kind: 'column_type_changed', column: 'amount', severity: 'warning', summary: 'orders.amount：列的类型变了' }],
+        more: 3 },
+      { source: 'shop', source_id: 'src-shop', table: 'refunds', label: null, published: 4, current: null, removed: true,
+        changes: [], more: 0 },
+    ] } },
+  ])
+  const row = steps.find((s) => s.code === 'schema_drift')
+  check('一行提醒：「订单」等 2 张表的结构有变化', row?.title === '自发布以来，「订单」等 2 张表的结构有变化', row?.title)
+  check('是警告、不是失败', row?.level === 'warn' && row?.status === 'done' && row?.kind === 'note')
+  check('副标题写明运行未被拦截', !!row?.sub?.includes('运行未被拦截'), row?.sub)
+  check('展开逐表写结构版本，表删了写「表已删除」', !!row?.detail?.includes('「shop」订单（orders）：结构第 1 版 → 第 2 版')
+    && row.detail.includes('「shop」refunds：表已删除'), row?.detail)
+  check('……下面列出还没处理的变化和另有几条', !!row?.detail?.includes('· orders.status：删除了列')
+    && row.detail.includes('另有 3 条结构变化'), row?.detail)
+  const one = mod.schemaDrift({ tables: [{ source: 's', table: 't', published: 1, current: 2 }] })
+  check('只有一张表：标题不写「等」', one?.title === '自发布以来，「t」的结构有变化', one?.title)
+  check('和目录漂移分开记：catalog.drift 的解析不认它', mod.catalogDrift({ tables: [] }) === null)
+  check('形状不对不出行', mod.decodeRun([{ seq: 1, type: 'schema.drift', node_id: null, ts: 1, data: { tables: 'x' } }])
+    .every((s) => s.code !== 'schema_drift'))
+})
+
 await section('Copilot：心跳穿插、回话、少了一步、报错', async () => {
   const steps = mod.decodeCopilot(synthetic.COPILOT_STUCK, { context: 'canvas' })
   check('心跳穿插的思考仍然并成一条', steps.filter((s) => s.kind === 'think').length === 1,
@@ -1850,12 +1877,41 @@ await section('口径账本：封存后比对已发布口径（ledger.matched）
   const late = run({ counts: { proven: 0, related: 0, none: 1, skipped: 1 }, trigger: 'backfill' }).find((s) => s.code === 'ledger_matched')
   check('事后补比的写明按现在的口径回看；没比完的是提醒', late?.title === '比对已发布口径：1 条没有相关的已发布口径，1 条没有比完'
     && late?.sub === '封存后比对，不在封存范围内 · 按现在的口径回看' && late?.level === 'warn', `${late?.title} / ${late?.sub} / ${late?.level}`)
+  const certified = run({ counts: { proven: 1 }, trigger: 'certified' }).find((s) => s.code === 'ledger_matched')
+  check('固化出的口径发布后补比的写明按之后发布的口径回看', certified?.sub === '封存后比对，不在封存范围内 · 按之后发布的口径回看',
+    certified?.sub)
   const odd = run({ counts: 'x' }).find((s) => s.code === 'ledger_matched')
   check('缺字段：只说比对过，不出 undefined、不瞎填数', odd?.title === '比对已发布口径' && !/undefined|NaN/.test(`${odd?.title}${odd?.sub}`),
     odd?.title)
   const phase = [E(4, 'run.finished', null, {}), E(5, 'ledger.matched', null, {})]
     .reduce((s, ev) => mod.nextPhase(s, ev), { phase: 'running', awaiting: false })
   check('不改相位：运行照旧是结束了', phase.phase === 'succeeded', phase.phase)
+})
+
+await section('口径账本：问数据的助手选用已发布口径（use_caliber 操作）', async () => {
+  // next-round 02 做法 4：取数节点和口径卡由服务端按那一版生成（ledger/compose.py），不另转 add_node。过程里一行说清选用了
+  // 哪一版、生成了几个节点；拒收的照实写原因（同样交回了模型去改）
+  const ok = { op: 'use_caliber', id: 'c1', workflow_id: 'wf-week', version: 3, metrics: ['gmv'], inputs: { start: '2026-09-01' },
+    result: { status: 'ok', workflow_id: 'wf-week', workflow_name: '周销售', version: 3, level: 'governed', level_text: '受管',
+              card: '周销售卡', card_id: 'c1', fetches: ['c1_fetch'], metrics: [{ id: 'gmv', name: '销售额' }], nodes: 2 } }
+  const steps = mod.decodeCopilot([
+    { op: 'plan', summary: '选用周销售口径' },
+    { op: 'add_node', node: { id: 'start', type: 'input', label: '入口', config: {} } },
+    ok,
+    { op: 'add_node', node: { id: 'write', type: 'report', label: '写答案', config: {} } },
+    { op: 'done', explanation: '按口径回答' },
+  ], { context: 'chat' })
+  const row = steps.find((s) => s.code === 'use_caliber')
+  check('一行：选用了哪一版、级别', row?.title === '选用口径「周销售」 v3（受管）' && row?.kind === 'node' && row?.status === 'done', row?.title)
+  check('展开：生成了几个取数节点、哪张口径卡、用到哪几个指标',
+    row?.detail === '按这一版生成取数节点 1 个和口径卡「周销售卡」，用到的指标：销售额', row?.detail)
+  check('节点数算进「新增几个步骤」（入口、报告各 1，选用的 2）',
+    steps.find((s) => s.id.startsWith('cd-'))?.title === '工作流已搭建完成，新增 4 个步骤', steps.find((s) => s.id.startsWith('cd-'))?.title)
+  const refused = mod.decodeCopilot([{ op: 'use_caliber', id: 'c2', result: { status: 'refused', reason: '请填写「end」' } }])
+    .find((s) => s.code === 'use_caliber_refused')
+  check('拒收的：提醒一行，写服务端给的原因', refused?.title === '没有选用口径' && refused?.detail === '请填写「end」'
+    && refused?.level === 'warn', `${refused?.title} / ${refused?.detail}`)
+  check('没带结果（老服务端、形状不对）：不出行、不报错', mod.decodeCopilot([{ op: 'use_caliber', id: 'c1' }, { op: 'use_caliber', result: 'x' }]).length === 0)
 })
 
 await section('术语', async () => {

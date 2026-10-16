@@ -77,6 +77,10 @@ class EventType(StrEnum):
     # 每张表带 impact：direct 写死的 SQL 用到的，possible Agent 可能查询的。
     # 只提醒、不拦运行；落在封存范围内，出具物上看得到「当时的目录和发布时不一样」
     CATALOG_DRIFT = "catalog.drift"
+    # 从发布版本发起的正式运行：发布之后这一版直接引用的表的结构版本变了（data/catalog_impact.schema_drift，next-round
+    # 03 B1）。每张表带发布时和现在的结构版本、是否已删除、还没处理的结构变化。和 catalog.drift 分开记（老的渲染只认整数的
+    # 目录版本），界面上合到同一块横幅里。只提醒、不拦运行；落在封存范围内
+    SCHEMA_DRIFT = "schema.drift"
     # 报告撰写节点的自查结果：报告文档工件 id、统计、违规清单。落在封存范围内，
     # 证据接口靠它找到文档——不去翻不受封存保护的 artifacts 表
     REPORT_CHECKED = "report.checked"
