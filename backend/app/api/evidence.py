@@ -2851,7 +2851,7 @@ async def export_report_html(run_id: str, report: str | None = None) -> Response
         if run is None:      # 两次读之间被删掉了
             raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND)
         info = {"id": run.id, "workflow_id": run.workflow_id, "workflow_name": run.workflow_name,
-                "run_class": run.run_class, "status": run.status,
+                "run_class": run.run_class, "status": run.status, "end_reason": run.end_reason,
                 "started_at": run.started_at, "finished_at": run.finished_at}
     data = build_report(info, report_node=chosen.node_id, doc_artifact=chosen.doc_artifact,
                         doc_hash_ok=chosen.hash_ok, doc=doc, seal=sealed.seal, chains=chains, refs=refs,

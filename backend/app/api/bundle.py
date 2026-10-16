@@ -53,7 +53,8 @@ async def export_bundle(run_id: str) -> Response:
             raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND)
         info = {"id": run.id, "workflow_id": run.workflow_id, "workflow_name": run.workflow_name,
                 "version": run.version, "version_hash": run.version_hash, "run_class": run.run_class,
-                "status": run.status, "started_at": run.started_at, "finished_at": run.finished_at}
+                "status": run.status, "end_reason": run.end_reason, "started_at": run.started_at,
+                "finished_at": run.finished_at}
         # 封存之后追加的事件（按需裁判、审批质询）：_sealed 只留了封存范围内的，这几条另取，单列在页面上
         later = [tuple(r) for r in await session.execute(
             select(RunEvent.seq, RunEvent.type, RunEvent.node_id, RunEvent.data)

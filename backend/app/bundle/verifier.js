@@ -49,7 +49,9 @@
   const KIND_LABEL = { report_doc: '报告文档', metric_set: '口径卡', query: '查询快照' }
   const TIER_LABEL = { formal: '完整出具', degraded: '降档出具', withheld: '不予出具' }
   const CLASS_LABEL = { formal: '正式运行', exploratory: '探索运行' }
-  const STATUS_LABEL = { succeeded: '已完成', failed: '已失败', cancelled: '已取消' }
+  // rejected：被审批人驳回结束（运行记录 cancelled + end_reason=rejected）。封存里它和手动停止是同一种结束事件（运行取消），
+  // 分开二者的原因在那条事件的内容里，内容不随文件附带：见 checkMeta
+  const STATUS_LABEL = { succeeded: '已完成', failed: '已失败', cancelled: '已取消', rejected: '被驳回' }
   /** 结束类事件 → 它说明的运行结果（runner：成功、失败、取消各发一条，落库之后才封存） */
   const TERMINAL = { 'run.finished': 'succeeded', 'run.failed': 'failed', 'run.cancelled': 'cancelled' }
   const EVENT_LABEL = {
@@ -84,6 +86,7 @@
     range: (seq, count) => `第 1–${seq} 条事件（范围内 ${count} 条）`,
     rangeLegacy: '（早期运行，范围按结束事件推算）',
     markPass: '已核对',
+    markPassRejected: '已核对运行取消，被驳回取自运行记录',
     markFail: (claim) => `文件里写的是「${claim}」，见核对明细 ⑥`,
     markNa: '无法核对',
     noReports: '这次运行没有报告文档，下方只核对运行记录。',
@@ -208,6 +211,8 @@
     inputFrom: (query, row, column) => (query ? `查询 ${query}` : '') + (Number.isInteger(row) ? ` · 第 ${row + 1} 行` : '') + (column ? ` · ${column}` : ''),
     inputNotAttached: '快照未随文件附带（见核对明细 ③），输入的值按口径卡的记录展示',
     statusOk: (seq, what) => `与第 ${seq} 条事件（${what}）一致`,
+    statusOkRejected: (seq, what) => `与第 ${seq} 条事件（${what}）一致。被驳回和手动停止在封存里是同一种结束事件，`
+      + '「被驳回」取自运行记录（这条事件的内容不随文件附带），需要在系统中对照',
     statusMismatch: (claim, seq, what) => `文件里写的是「${claim}」，与封存范围内最后一条结束类事件（第 ${seq} 条，${what}）不符`,
     statusLegacy: '早期运行在结束事件落库之前封存，结束事件不在封存范围内，运行结果无法核对',
     statusNoEvent: '封存范围内没有运行结束、失败或取消的事件，运行结果无法核对',
@@ -1509,7 +1514,8 @@
    */
   function checkMeta(meta, out) {
     const items = []
-    const add = (field, shown, claim, result, reason) => items.push({ field, shown, claim, result, reason })
+    // mark：显示值旁边那一句的特例（默认按结果写已核对 / 不通过 / 无法核对）
+    const add = (field, shown, claim, result, reason, mark) => items.push({ field, shown, claim, result, reason, mark })
     const order = out.order
     const sealOk = out.manifest[0].result === PASS
     const label = (map, value) => map[value] || (value ? String(value) : '—')
@@ -1519,7 +1525,10 @@
     // 它就是范围内的最后一条；早期运行在 run.finished 落库之前封存，成功结束的那条在范围外，失败、取消的那条在范围的最后。
     // 先失败、经继续运行接着跑的，范围里那条运行失败之后运行又继续了，它不是运行的结束：拿它去对，元信息改成「已失败」
     // 也会被标成已核对。真正截止的那条不在范围里时，只有早期运行成功结束说得通（无法核对），别的说法都没有事件印证
-    const statusClaim = label(STATUS_LABEL, meta.status)
+    // 被驳回（cancelled + end_reason=rejected）照运行记录写「被驳回」，不写成手动停止的「已取消」；能核对的只有结束事件
+    // 是运行取消这一半，另一半写明取自运行记录
+    const rejected = meta.status === 'cancelled' && meta.end_reason === 'rejected'
+    const statusClaim = rejected ? STATUS_LABEL.rejected : label(STATUS_LABEL, meta.status)
     const lastSeq = order.length ? order[order.length - 1].seq : null
     const final = [...order].reverse().find((ev) => TERMINAL[ev.type])
     // 同一序号的几条（老数据里有）都算最后：结束事件和别的事件撞了序号，不能因此说它之后运行又继续了
@@ -1527,8 +1536,12 @@
     if (!sealOk) add('status', statusClaim, statusClaim, NA, T.metaNeedsManifest)
     else if (end) {
       const ok = TERMINAL[end.type] === meta.status
-      add('status', label(STATUS_LABEL, TERMINAL[end.type]), statusClaim, ok ? PASS : FAIL,
-        ok ? T.statusOk(end.seq, what(end)) : T.statusMismatch(statusClaim, end.seq, what(end)))
+      if (ok && rejected) {
+        add('status', statusClaim, statusClaim, PASS, T.statusOkRejected(end.seq, what(end)), T.markPassRejected)
+      } else {
+        add('status', label(STATUS_LABEL, TERMINAL[end.type]), statusClaim, ok ? PASS : FAIL,
+          ok ? T.statusOk(end.seq, what(end)) : T.statusMismatch(statusClaim, end.seq, what(end)))
+      }
     } else if (meta.legacy && meta.status === 'succeeded') add('status', statusClaim, statusClaim, NA, T.statusLegacy)
     // 显示的值写「—」：范围里没有说明运行怎样结束的事件，不能把文件里写的当成核对出来的
     else if (final) add('status', '—', statusClaim, FAIL, T.statusContinued(statusClaim, final.seq, what(final)))
@@ -1899,7 +1912,7 @@
     const checked = (field, fallback) => {
       const item = out.meta.find((m) => m.field === field)
       if (!item) return fallback
-      const note = item.result === PASS ? T.markPass : item.result === FAIL ? T.markFail(item.claim) : T.markNa
+      const note = item.mark ?? (item.result === PASS ? T.markPass : item.result === FAIL ? T.markFail(item.claim) : T.markNa)
       return h('span', { 'data-meta': field, 'data-result': item.result }, item.shown,
         h('span', { class: item.result === FAIL ? 'bad' : 'muted' }, `（${note}）`))
     }

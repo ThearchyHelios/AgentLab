@@ -17,7 +17,7 @@
 //   口径卡、快照对出来（显示文字按显示规则重新渲染后逐字比对）不通过，原因点名正文显示的字和引用的值，报告标题旁的徽标
 //   跟着不通过；
 // - 深浅色、窄屏：390 宽不横向溢出，点开的数字面板在窄屏上从底部抽出，深色下底是深的、字是浅的；
-// - 样本页：tests/bundle_samples.py 用虚构数据真实生成的几份页面（遮罩快照、两份报告、早期运行、失败结束、先失败后
+// - 样本页：tests/bundle_samples.py 用虚构数据真实生成的几份页面（遮罩快照、两份报告、早期运行、失败结束、被驳回结束（写「被驳回」、写明取自运行记录）、先失败后
 //   经继续运行跑到成功的早期运行、两条出具
 //   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列（卡的节点完成事件只给哈希）、同一张卡配上证据
 //   目录里写着号码的老文档（文档只给哈希、页面写明原因）、设了遮罩的数据源上按地区汇总的查询、每种显示
@@ -611,7 +611,7 @@ await section('样本页：各种形状', async () => {
     check('生成样本页（tests/bundle_samples.py）', false, String(e?.message ?? e))
     return
   }
-  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 17, Object.keys(samples).join('、'))
+  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 18, Object.keys(samples).join('、'))
 
   await sample('base', async (s, page) => {
     check('base：有无法核对的项，总览是中性的「可核对的项全部通过，另有 N 项无法核对」，不是绿色的通过', neutral(s),
@@ -733,6 +733,15 @@ await section('样本页：各种形状', async () => {
   })
   await sample('base', async (_, page) => {
     check('成功结束的运行不提重新封存', await page.locator('#seal-failed').isHidden())
+  })
+  // 被审批人驳回结束（cancelled + end_reason=rejected）：写「被驳回」，不写成手动停止的「已取消」；封存里只核对得到
+  // 「运行取消」这一半，旁边写明被驳回取自运行记录。不是失败，不提重新封存
+  await sample('rejected', async (s, page) => {
+    check('rejected：运行结果写「被驳回」，与运行取消事件对上', s.meta.status?.result === 'pass'
+      && s.meta.status.text.includes('被驳回') && !s.meta.status.text.includes('已取消'), JSON.stringify(s.meta.status))
+    check('rejected：写明被驳回取自运行记录', s.meta.status?.text.includes('取自运行记录')
+      && hasItem(s, 'meta', 'pass', '取自运行记录'), JSON.stringify(s.meta.status))
+    check('rejected：不提重新封存', await page.locator('#seal-failed').isHidden())
   })
   // 早期运行先失败、经继续运行跑到成功：范围里那条运行失败之后运行又继续了，它不是运行的结束；成功结束的那条在范围外
   await sample('continued', async (s) => {

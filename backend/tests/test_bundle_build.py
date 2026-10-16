@@ -340,6 +340,11 @@ def test_meta_names_the_seal_and_the_run():
     assert meta["manifest_seq"] == 15 and meta["manifest_hash"] == "ab" * 32 and meta["legacy"] is False
     assert meta["started_at"] == RUN["started_at"] and meta["finished_at"] == RUN["finished_at"]
     assert meta["exported_at"] == "2026-10-05T08:00:00+00:00"
+    # 同是 cancelled 的被驳回和手动停止靠 end_reason 分开；没有的（成功、失败、老运行）是 None
+    assert meta["end_reason"] is None
+    rejected = build_bundle({**RUN, "status": "cancelled", "end_reason": "rejected"}, sample_events(), manifest_seq=15,
+                            manifest_hash="ab" * 32, graph=GRAPH, read=STORE.get, exported_at="x")
+    assert (rejected["meta"]["status"], rejected["meta"]["end_reason"]) == ("cancelled", "rejected")
     # 出具档位取封存范围内最后一条出具判定事件，带上序号，浏览器拿已核对的事件对照
     assert meta["tier"] == {"value": "formal", "seq": 13}
     assert bundle["nodes"]["write"] == {"label": "写周报", "type": "report"}
@@ -463,7 +468,7 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
 
     rendered = pages()
     got = {name: json.loads(data_block(page)) for name, page in rendered.items()}
-    assert set(got) == {"base", "two-reports", "metric-only", "legacy", "failed", "continued", "degraded",
+    assert set(got) == {"base", "two-reports", "metric-only", "legacy", "failed", "rejected", "continued", "degraded",
                         "missing-doc", "missing-card", "nan", "stray", "masked-card", "masked-old-doc", "masked-source",
                         "formats", "formats-unit", "prose"}
     for name, bundle in got.items():
@@ -504,6 +509,10 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     assert [s["text"] for s in segments(only)] and not [s for s in segments(only) if s.get("cite", {}).get("kind") == "cell"]
     failed = got["failed"]
     assert failed["meta"]["status"] == "failed" and failed["meta"]["tier"] is None
+    rejected = got["rejected"]
+    assert (rejected["meta"]["status"], rejected["meta"]["end_reason"]) == ("cancelled", "rejected")
+    assert max(rejected["events"], key=lambda e: e["seq"])["type"] == "run.cancelled"
+    assert re.search(r'id="seal-failed"[^>]*\shidden', rendered["rejected"]), "被驳回不是失败：不提重新封存"
     assert max(failed["events"], key=lambda e: e["seq"])["type"] == "run.failed"
     # 先失败、经继续运行跑到成功的早期运行：范围里有那条运行失败，之后运行又继续了，最后一条不是结束事件
     continued = got["continued"]
