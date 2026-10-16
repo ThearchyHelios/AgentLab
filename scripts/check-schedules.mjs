@@ -535,7 +535,9 @@ function applyPatch(s, body) {
 let realSettings = null
 async function settingsOf(state) {
   realSettings ??= await fetch(`${API}/settings`).then((r) => r.json()).catch(() => ({}))
-  return { ...realSettings, ui: { ...(realSettings.ui ?? {}), theme: state.theme ?? 'dark' }, notify: state.notify }
+  // 对外访问地址只读的那一组：state.publicUrl 设了就按它（环境变量指定的情形），否则照真服务端
+  return { ...realSettings, ui: { ...(realSettings.ui ?? {}), theme: state.theme ?? 'dark' }, notify: state.notify,
+    public_url: state.publicUrl ?? realSettings.public_url }
 }
 
 /** 一个请求怎么答。返回 {status, json}；返回 null 表示放行（GET）或拦下（写请求） */
@@ -1242,6 +1244,25 @@ await section('详情：Webhook 与运行链接地址', async () => {
   const p3 = writes(sent, /^PATCH \/schedules\/s-weekly$/)[2]?.body
   check('删除 Webhook：地址交空串', p3?.webhook?.url === '' && p3?.version === 5, JSON.stringify(p3))
   check('……之后 Webhook 是关着的', await until(async () => !(await page.locator('[data-webhook-on]').isChecked())))
+  check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
+})
+
+await section('详情：对外访问地址由环境变量指定', async () => {
+  // 全站只认一个对外访问地址（服务端 core/public_url.py）：环境变量设了就以它为准，这里只显示、写明来源，不给修改；
+  // notify 里存着的旧值不生效，也不显示
+  const env = 'https://agentlab.example.internal'
+  const { page, sent, errors } = await open('/schedules/s-weekly', {
+    state: freshState({ notify: { public_base_url: 'https://stale.example.com' }, publicUrl: { value: env, env_locked: true } }),
+  })
+  await page.locator('[data-link-base]').waitFor()
+  const shown = await until(async () => {
+    const t = await text(page, '[data-link-base]')
+    return t.includes(env) ? t : null
+  })
+  check('显示环境变量给的地址，不显示设置里存着的旧值', !!shown && !shown.includes('stale.example.com'), oneLine([shown ?? '']))
+  check('……写明由环境变量 AGENTLAB_PUBLIC_URL 指定', (await text(page, '[data-link-base-env]').catch(() => '')).includes('AGENTLAB_PUBLIC_URL'))
+  check('……没有修改按钮，也没发 PUT', await page.locator('[data-link-base-edit]').count() === 0
+    && writes(sent, /^PUT \/settings$/).length === 0)
   check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
 })
 

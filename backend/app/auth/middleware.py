@@ -9,6 +9,8 @@
 - 会话 cookie → Principal（认证过的用户名、角色、组）；没有会话是匿名（username=None），X-Actor 一律不看；
 - /api 下除了登录本身、健康检查、入站钩子，匿名一律 401。各路由的角色要求另由 main.py 的路由级依赖管，这里兜底：
   哪个路由忘了挂依赖，也不会对没登录的人敞开；
+- 接口说明（FastAPI 自带的 /docs、/redoc、/openapi.json）和 /api 一样拦：匿名 401，不到搭建者 403。它们是 FastAPI 自己
+  挂的路由，挂不上路由级依赖，所以角色也在这里判。以前只拦 /api/ 开头的，开了登录接口全貌也对匿名的人敞开；
 - 非 GET 的请求必须带 X-AgentLab-Request 头，带了 Origin 的必须是本站或登记的前端地址（CSRF）。自定义请求头跨站发不出来
   （要过 CORS 预检，只放行配置里的前端地址），SameSite=Lax 的 cookie 也不随跨站的表单提交带过去；
 - WebSocket：没登录的握手前就关掉；登录了的交给路由，按运行判（api/deps.py 的 run_scope：user 角色只能连自己能读、
@@ -19,8 +21,8 @@ from __future__ import annotations
 import json
 from http.cookies import SimpleCookie
 from typing import Any
-from urllib.parse import urlsplit
 
+from app.api.coded import AUTH_REQUIRED
 from app.core.config import settings
 
 #: 开登录时匿名也能访问的接口
@@ -28,6 +30,8 @@ _PUBLIC = frozenset({"/api/health", "/api/auth/me", "/api/auth/login", "/api/aut
                      "/api/auth/oidc/callback", "/api/auth/jwks", "/api/auth/bootstrap"})
 #: 只认签名、不走会话的入站钩子（也不查 CSRF：调用方是外部系统，没有浏览器的 Origin）
 _HOOKS = "/api/hooks/"
+#: FastAPI 自带的接口说明（main.py 里 FastAPI() 的缺省地址）：开登录时要搭建者
+_DOCS = ("/docs", "/redoc", "/openapi.json")
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 CSRF_HEADER = "x-agentlab-request"
 
@@ -49,11 +53,17 @@ def _cookie(headers: dict[str, str], name: str) -> str | None:
     return morsel.value if morsel else None
 
 
+def _is_docs(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in _DOCS)
+
+
 def _origin_ok(origin: str, headers: dict[str, str], scope: dict[str, Any]) -> bool:
+    from app.core.public_url import origin_of, public_base_url
+
     allowed = {o.rstrip("/") for o in settings.cors_origins}
-    if settings.public_url:
-        parts = urlsplit(settings.public_url)
-        allowed.add(f"{parts.scheme}://{parts.netloc}")
+    # 对外访问地址（环境变量或设置里的那一项，core/public_url.py）：反向代理后面请求的 Host 不一定是它
+    if address := public_base_url():
+        allowed.add(origin_of(address))
     host = headers.get("x-forwarded-host") or headers.get("host")
     if host:
         scheme = headers.get("x-forwarded-proto") or scope.get("scheme") or "http"
@@ -92,7 +102,7 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
         from app.api.deps import reset_principal, set_principal
-        from app.auth import current_mode
+        from app.auth import current_mode, refusal
 
         # 登录设置在启动时读进缓存（main.py 的 _platform_startup），改设置的接口改完就刷新；这里不查库
         mode = current_mode()
@@ -130,7 +140,11 @@ class AuthMiddleware:
             return
         if (scope["type"] == "http" and is_api and not principal.username and path not in _PUBLIC
                 and not path.startswith(_HOOKS)):
-            await _reply(send, 401, "请先登录", "auth_required")
+            await _reply(send, 401, "请先登录", AUTH_REQUIRED)
+            return
+        if scope["type"] == "http" and _is_docs(path) and (refused := refusal(principal, "builder")) is not None:
+            # 和路由级依赖（auth.require）同一个判断、同一句话：没登录 401，角色不够 403
+            await _reply(send, refused.status_code, refused.detail, refused.code)
             return
 
         token = set_principal(principal)

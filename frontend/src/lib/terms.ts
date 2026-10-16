@@ -3922,19 +3922,20 @@ export const SCHEDULE_TEXT = {
   testResult: (head: string, status: number | null, detail: string) =>
     `${head}${status != null ? `（HTTP ${status}）` : ''}${detail ? `：${detail}` : ''}`,
 
-  // ---- 通知里的链接：运行、对比页都按这个地址拼（设置 notify 组，所有定时任务共用）
+  // ---- 通知里的链接：运行、对比页都按全站的对外访问地址拼（GENERAL_SETTING_TEXT，这里是它的快捷入口）
   linkBase: '通知中的链接',
   linkBaseValue: (url: string) => `按 ${url} 拼接`,
-  linkBaseUnset: '未设置服务访问地址，通知中不附带运行和对比页链接',
+  linkBaseUnset: '未设置对外访问地址，通知中不附带运行和对比页链接',
   linkBaseEdit: '修改',
   linkBaseSet: '设置',
-  linkBaseLabel: '服务访问地址',
-  linkBaseHint: '收件人打开运行、对比页链接用的地址，例如 https://agentlab.example.com。所有定时任务共用',
+  linkBaseLabel: '对外访问地址',
+  linkBaseHint: '收件人打开运行、对比页链接用的地址，例如 https://agentlab.example.com。全站共用一个，也可以在「设置 → 通用」中修改',
   linkBasePlaceholder: 'https://agentlab.example.com',
-  linkBaseInvalid: '请输入以 http:// 或 https:// 开头的地址',
-  linkBaseSaved: '已保存服务访问地址',
-  linkBaseCleared: '已清除服务访问地址',
-  linkBaseFailed: '无法读取服务访问地址',
+  linkBaseInvalid: '请输入以 http:// 或 https:// 开头的完整地址，不带 ? 或 # 之后的部分',
+  linkBaseSaved: '已保存对外访问地址',
+  linkBaseCleared: '已清除对外访问地址',
+  linkBaseFailed: '无法读取对外访问地址',
+  linkBaseEnv: '由环境变量 AGENTLAB_PUBLIC_URL 指定，不能在这里修改',
 
   // ---- 表单：保存
   save: '保存',
@@ -5901,6 +5902,31 @@ export const APP_SETTING_TEXT = {
   onDemandLimitInvalid: '请填写 0 到 100,000 之间的整数',
   personalApps: '使用者可以建个人应用',
   personalAppsHint: '开启后，使用者可以从说需求、场景模板或问数据的回答建一个只有自己看得见的应用：只读、结果遮罩，每人每天的刷新次数按上面的每日上限算；想给别人用要提交给搭建者审核发布。搭建者及以上不受这一项限制',
+}
+
+/**
+ * 设置 → 通用：全站共用的部署设置。对外访问地址全站只有一个（服务端 core/public_url.py）：环境变量 AGENTLAB_PUBLIC_URL
+ * 优先，其次这里填的；定时任务 Webhook 一节里是它的快捷入口（SCHEDULE_TEXT.linkBase*）
+ */
+export const GENERAL_SETTING_TEXT = {
+  tab: '通用',
+  publicUrl: '对外访问地址',
+  publicUrlHint: '别人打开 AgentLab 用的地址。通知和定时任务 Webhook 里的链接、单点登录的回调地址都按它拼，提交操作时也按它核对请求来源。留空时通知里不附链接，回调和来源核对按浏览器访问的地址认',
+  address: '地址',
+  addressHint: '以 http:// 或 https:// 开头的完整地址，例如 https://agentlab.example.com；放在反向代理的子路径下时带上路径',
+  placeholder: 'https://agentlab.example.com',
+  invalid: '请输入以 http:// 或 https:// 开头的完整地址，不带 ? 或 # 之后的部分',
+  unset: '未设置',
+  envLocked: '由环境变量 AGENTLAB_PUBLIC_URL 指定',
+  envLockedHint: '部署时用环境变量定了这个地址，这里不能修改。要改请修改部署配置后重启服务',
+  readOnly: '全站共用，只有管理员可以修改',
+  save: '保存',
+  saved: '已保存对外访问地址',
+  cleared: '已清除对外访问地址',
+  leaveTitle: '对外访问地址还没保存',
+  leaveBody: '离开此页面将丢失这次修改。',
+  leaveConfirm: '放弃修改',
+  leaveCancel: '返回保存',
 }
 
 /** 自定义工具绑定登记的端点（§3.9）：只填路径，地址和认证头由端点提供 */

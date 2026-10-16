@@ -424,9 +424,10 @@ async def notify_due(now: datetime | None = None) -> int:
                 .order_by(ScheduleFire.created_at)
             )).all()
             if rows:
-                from app.api.settings import notify_settings
+                # 链接里的地址：全站同一个对外访问地址（环境变量优先，其次设置，core/public_url.py）
+                from app.core import public_url
 
-                base_url = (await notify_settings(session))["public_base_url"]
+                base_url = await public_url.refresh(session)
             for fire, run in rows:
                 seen = await _state_of(session, fire, run, now)
                 if seen.state is None or seen.state == fire.notified_status:

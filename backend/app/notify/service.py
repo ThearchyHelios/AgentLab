@@ -7,7 +7,7 @@
 同一个渠道只推一次。待办改派、升级、催办都是「有一条待办要你处理」，订阅了 task.opened 的渠道一并收到。
 
 消息里只放标题、状态、链接（P4，沿用定时任务 Webhook 的规矩）：不放报告里的数字，待办的标题用节点在图上的名字
-（搭图时起的），不用按运行数据渲染出来的那一句。链接要设了对外访问地址（设置里的 notify）才有。
+（搭图时起的），不用按运行数据渲染出来的那一句。链接要有对外访问地址（环境变量或设置，core/public_url.py）才有。
 
 推送放在后台（spawn）：接收端挂住时超时加重试要几十秒，不能拖着开待办、运行收尾。测试用 drain 等它们推完。
 
@@ -153,9 +153,10 @@ def generic_body(message: dict[str, Any], msg: Message) -> dict[str, Any]:
 
 
 async def _base_url(session: Any) -> str | None:
-    from app.api.settings import notify_settings
+    """拼链接用的对外访问地址：全站同一个（环境变量优先，其次设置），手里有会话就按库里的值对齐缓存。"""
+    from app.core import public_url
 
-    return (await notify_settings(session))["public_base_url"]
+    return await public_url.refresh(session)
 
 
 async def _channels(session: Any, event: str, run: Run | None, users: list[str]) -> list[NotifyChannel]:

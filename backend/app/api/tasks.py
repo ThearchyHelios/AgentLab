@@ -1,17 +1,20 @@
 """待办（BE-2）：列表、计数、详情、回复、改派、催办。设计文档 §3.7、§3.10。
 
 身份经 api/deps.current_principal 取；关登录时它没有名字，用自报的署名（X-Actor）补上，回复人一栏才写得出人。
-回复被拒回 403 / 404 / 409 / 422，{detail, code}；表单不通过时另带 errors（同应用入口的 422）。
+回复被拒回 403 / 404 / 409 / 422，{detail, code}，一律带 code（外部系统按它认）；表单不通过时另带 errors（同应用入口的
+422）。服务层没带码的拒绝按状态补上同一类的码（api/coded.py 的 TASK_*）。
 """
 from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app.api.coded import CodedHTTPException
+from app.api.coded import (
+    ROLE_REQUIRED, TASK_CLOSED, TASK_FORBIDDEN, TASK_INVALID, TASK_NOT_FOUND, CodedHTTPException,
+)
 from app.api.deps import current_principal, decode_actor
 from app.process import tasks as task_service
 from app.process.tasks import FormInvalid, TaskRefused
@@ -23,12 +26,14 @@ def principal_of(x_actor: str | None) -> Any:
     return task_service.principal_with_actor(current_principal(), decode_actor(x_actor))
 
 
-def refused(e: TaskRefused) -> HTTPException | JSONResponse:
+#: 服务层（process/tasks.py、process/actions.py、blueprints/personal.py）没带码的拒绝按状态归到哪一类
+_CODE_BY_STATUS = {404: TASK_NOT_FOUND, 403: TASK_FORBIDDEN, 409: TASK_CLOSED, 422: TASK_INVALID}
+
+
+def refused(e: TaskRefused) -> CodedHTTPException | JSONResponse:
     if isinstance(e, FormInvalid):
         return JSONResponse({"detail": str(e), "code": e.code, "errors": e.errors}, status_code=422)
-    if e.code:
-        return CodedHTTPException(e.status_code, str(e), e.code)
-    return HTTPException(e.status_code, str(e))
+    return CodedHTTPException(e.status_code, str(e), e.code or _CODE_BY_STATUS.get(e.status_code, TASK_CLOSED))
 
 
 def _raise(e: TaskRefused) -> Any:
@@ -53,7 +58,7 @@ async def list_tasks(
 ) -> dict[str, Any]:
     principal = principal_of(x_actor)
     if assigned == "all" and principal.mode != "off" and not principal.at_least("builder"):
-        raise HTTPException(403, "只能查看派给自己的待办")
+        raise CodedHTTPException(403, "只能查看派给自己的待办", ROLE_REQUIRED)
     statuses = None if status == "all" else _csv(status) or ["pending"]
     items = await task_service.list_tasks(principal, assigned=assigned, statuses=statuses, app_id=app_id,
                                           run_id=run_id, limit=limit)
@@ -71,7 +76,7 @@ async def get_task(task_id: str, x_actor: str | None = Header(default=None)) -> 
     principal = principal_of(x_actor)
     out = await task_service.detail(task_id, principal)
     if out is None or not task_service.visible(out, principal):
-        raise HTTPException(404, "待办不存在，所属的运行可能已被删除")
+        raise CodedHTTPException(404, "待办不存在，所属的运行可能已被删除", TASK_NOT_FOUND)
     return out
 
 
