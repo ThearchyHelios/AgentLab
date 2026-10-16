@@ -30,6 +30,7 @@ from app.core.config import settings
 from app.db.base import init_db
 from app.engine.runner import run_manager
 from app.seed import seed_defaults
+from app.web_security import SecurityHeaders
 
 logging.basicConfig(
     level=logging.INFO,
@@ -192,6 +193,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# 安全响应头（app/web_security.py）：最后加、在最外层，CORS 预检和登录检查自己回的 401 / 403 也带上
+app.add_middleware(SecurityHeaders)
 
 # 路由级权限（§3.12）。关登录时这些依赖全部放行；开了登录，中间件先挡掉没登录的，这里再按角色和运行挡
 _BUILDER = [require_role("builder")]
