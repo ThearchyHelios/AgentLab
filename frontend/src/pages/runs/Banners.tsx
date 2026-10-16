@@ -3,9 +3,9 @@ import { Link } from 'react-router-dom'
 import { ArrowDown, Ban, BookMarked, ChartGantt, Copy, Crosshair, Play, RotateCcw, Settings2, Wrench, X } from 'lucide-react'
 import { CopyButton, Spinner, StatusBadge } from '../../components/ui'
 import { formatDateTime, formatSpan, formatTime } from '../../lib/format'
-import type { Approval, CatalogDriftTable } from '../../types'
-import { CATALOG_DRIFT_TEXT, CATALOG_IMPACT_TEXT } from '../../lib/terms'
-import { catalogDriftLine } from '../../run/decode'
+import type { Approval, CatalogDriftTable, SchemaDriftTable } from '../../types'
+import { CATALOG_DRIFT_TEXT, CATALOG_IMPACT_TEXT, SCHEMA_DRIFT_TEXT } from '../../lib/terms'
+import { catalogDriftLine, schemaDriftLine } from '../../run/decode'
 import type { RunErrorExplain } from '../../lib/explain'
 import { LONG_WAIT_MS, ageMs } from './model'
 import { copyText } from './parts'
@@ -25,31 +25,47 @@ function Shell({ color, children, data }: { color: string; children: ReactNode; 
 }
 
 // -------------------------------------------------------------------------
-// 发布之后数据目录有变化（catalog.drift）
+// 发布之后数据目录有变化（catalog.drift）、表结构有变化（schema.drift）：同一块横幅
 // -------------------------------------------------------------------------
 
 /**
  * 从发布版本发起的正式运行，开始时发现这一版用到的表的数据目录在发布之后改过。运行照常（目录是说明，
  * 不是运行的输入），但看结果的人要知道：「在园人数」在发布之后被改成了存量，这一版的 SQL 可能还在跨天相加。
  * SQL 里写着的表在前；Agent 可能查询的表（Agent 运行时自己写 SQL）另起一组、带小标题，和直接引用分开。
- * 每张表给到数据目录的入口；每组表多时只列前几张
+ * 每张表给到数据目录的入口；每组表多时只列前几张。
+ *
+ * 表结构在发布之后变了（schema.drift：删了列、改了类型……）也在这一块里另起一组：每张表写发布时和现在的结构版本，
+ * 下面列出还没处理的结构变化。只有结构变了时标题按结构说。同样只提醒、不拦
  */
-export function CatalogDriftBanner({ drift }: {
-  drift: { title: string; direct: CatalogDriftTable[]; possible: CatalogDriftTable[] }
+export function CatalogDriftBanner({ drift, schema }: {
+  drift: { title: string; direct: CatalogDriftTable[]; possible: CatalogDriftTable[] } | null
+  schema?: { title: string; tables: SchemaDriftTable[] } | null
 }) {
+  if (!drift && !schema) return null
   return (
     <Shell color="var(--st-waiting)" data="catalog-drift">
       <div className="flex items-start gap-2.5">
         <BookMarked size={14} className="mt-0.5 shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden />
         <div className="min-w-0 flex-1 text-xs">
-          <p className="font-semibold" data-drift-title="">{drift.title}</p>
-          <p className="mt-0.5 text-2xs text-dim">{CATALOG_DRIFT_TEXT.sub}</p>
-          {drift.direct.length > 0 && <DriftTables tables={drift.direct} />}
-          {drift.possible.length > 0 && (
+          <p className="font-semibold" data-drift-title="">{drift ? drift.title : schema!.title}</p>
+          <p className="mt-0.5 text-2xs text-dim">{drift ? CATALOG_DRIFT_TEXT.sub : SCHEMA_DRIFT_TEXT.sub}</p>
+          {drift && drift.direct.length > 0 && <DriftTables tables={drift.direct} />}
+          {drift && drift.possible.length > 0 && (
             <div className="mt-1.5" data-drift-possible={drift.possible.length}>
               <p className="text-2xs font-medium text-dim">{CATALOG_DRIFT_TEXT.possibleHead}</p>
               <p className="text-2xs text-faint">{CATALOG_DRIFT_TEXT.possibleHint}</p>
               <DriftTables tables={drift.possible} />
+            </div>
+          )}
+          {schema && schema.tables.length > 0 && (
+            <div className={drift ? 'mt-1.5' : undefined} data-drift-schema={schema.tables.length}>
+              {drift && (
+                <>
+                  <p className="text-2xs font-medium text-dim">{SCHEMA_DRIFT_TEXT.head}：{schema.title}</p>
+                  <p className="text-2xs text-faint">{SCHEMA_DRIFT_TEXT.sub}</p>
+                </>
+              )}
+              <SchemaTables tables={schema.tables} />
             </div>
           )}
         </div>
@@ -71,6 +87,40 @@ function DriftTables({ tables }: { tables: CatalogDriftTable[] }) {
                   to={`/data/catalog/${encodeURIComponent(t.source_id)}/${encodeURIComponent(t.table)}`}>
               {CATALOG_DRIFT_TEXT.open}
             </Link>
+          )}
+        </li>
+      ))}
+      {tables.length > shown.length && <li className="text-faint">{CATALOG_IMPACT_TEXT.more(tables.length - shown.length)}</li>}
+    </ul>
+  )
+}
+
+/** 结构变了的表：一行版本，下面缩进列出还没处理的结构变化（服务端的一句话，带严重程度） */
+function SchemaTables({ tables }: { tables: SchemaDriftTable[] }) {
+  const shown = tables.slice(0, DRIFT_SHOWN)
+  return (
+    <ul className="mt-1 space-y-1 text-2xs text-dim">
+      {shown.map((t) => (
+        <li key={`${t.source}/${t.table}`} className="min-w-0" data-drift-schema-table={t.table} data-removed={t.removed || undefined}>
+          <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
+            <span className="min-w-0 break-words">{schemaDriftLine(t)}</span>
+            {t.source_id && !t.removed && (
+              <Link className="shrink-0 text-[var(--accent)] hover:underline" data-drift-open={t.table}
+                    to={`/data/catalog/${encodeURIComponent(t.source_id)}/${encodeURIComponent(t.table)}`}>
+                {CATALOG_DRIFT_TEXT.open}
+              </Link>
+            )}
+          </span>
+          {t.changes.length > 0 && (
+            <ul className="mt-0.5 space-y-0.5 pl-3 text-faint">
+              {t.changes.map((c) => (
+                <li key={c.id || c.summary} className="min-w-0 break-words" data-drift-change={c.kind} data-severity={c.severity}>
+                  <span className={c.severity === 'action' ? 'text-[var(--warn)]' : undefined}>{SCHEMA_DRIFT_TEXT.severity[c.severity]}</span>
+                  {' · '}{c.summary}
+                </li>
+              ))}
+              {t.more > 0 && <li>{SCHEMA_DRIFT_TEXT.more(t.more)}</li>}
+            </ul>
           )}
         </li>
       ))}

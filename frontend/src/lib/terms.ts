@@ -2782,6 +2782,26 @@ export const CATALOG_DRIFT_TEXT = {
 }
 
 /**
+ * 发布之后表结构有变化（schema.drift，next-round 03 B1）：和目录有变化合在同一块横幅里，分开一组说。叫「结构变化」，和已经
+ * 在用的「目录有变化」分开（X10）
+ */
+export const SCHEMA_DRIFT_TEXT = {
+  /** 运行里的提醒：「自发布以来，「订单」等 2 张表的结构有变化」 */
+  title: (first: string, n: number) => (n > 1
+    ? `自发布以来，「${first}」等 ${formatNumber(n)} 张表的结构有变化`
+    : `自发布以来，「${first}」的结构有变化`),
+  /** 横幅里目录、结构都变了：结构这一组的小标题 */
+  head: '结构变化',
+  sub: '运行未被拦截。只是加了列不影响这次结果；删了列、改了类型时，写死的 SQL 可能报错或算错，请核对',
+  /** 一张表的那一行：「shop」订单（orders）：结构第 1 版 → 第 2 版 */
+  line: (source: string, table: string, from: number, to: number | null, removed: boolean) =>
+    `「${source}」${table}：${removed ? '表已删除' : `结构第 ${formatNumber(from)} 版 → 第 ${formatNumber(to ?? 0)} 版`}`,
+  /** 还有几条没处理的变化没列出来 */
+  more: (n: number) => `…另有 ${formatNumber(n)} 条结构变化`,
+  severity: { info: '说明', warning: '提醒', action: '要处理' } as Record<string, string>,
+}
+
+/**
  * 表结构只探查了一部分：探查结构时每个数据源最多取 200 张表（服务端 introspect._MAX_TABLES），多出来的表不在
  * 表结构里，数据目录列不出，助手也看不到它们的字段。数据目录页顶部和助手「参考了哪些表」那一行都要说出来。
  */
@@ -3149,7 +3169,10 @@ export const PROFILE_TEXT = {
   taskStatus: {
     pending: '排队', running: '剖析中', ok: '完成', partial: '部分完成', failed: '失败', skipped: '跳过', cancelled: '已停止',
   } as Record<CatalogDraftTaskStatus, string>,
-  checkKind: { relation: '关系', codes: '码值', date: '日期' } as Record<string, string>,
+  checkKind: {
+    relation: '关系', codes: '码值', date: '日期', observe: '取值观察',
+    rows: '行数', codes_observe: '码值观察', freshness: '最新业务日期', daily_volume: '按日行数',
+  } as Record<string, string>,
   kindProgress: (label: string, done: number, total: number) => `${label} ${formatNumber(done)}/${formatNumber(total)}`,
   tableQueries: (n: number) => `${formatNumber(n)} 条查询`,
   /** 这张表的查询次数用完了（等于每张表最多查询数） */
@@ -3199,7 +3222,10 @@ export const PROFILE_TEXT = {
   moreSkipped: (n: number) => `…另有 ${formatNumber(n)} 项`,
   queriesTitle: (n: number) => `看发过的查询（${formatNumber(n)} 条）`,
   queriesHint: 'SQL 里的取值都换成了「?」：取到的键值不保存在 AgentLab 中；遮罩的列不出现在任何查询里',
-  queryKind: { row_estimate: '行数估算', relation: '关系', codes: '码值', date: '日期' } as Record<string, string>,
+  queryKind: {
+    row_estimate: '行数估算', relation: '关系', codes: '码值', date: '日期',
+    codes_observe: '码值观察', freshness: '最新业务日期', daily_volume: '按日行数',
+  } as Record<string, string>,
   queryOutcome: { ok: '成功', timeout: '超时', error: '失败', rejected: '未通过只读守卫' } as Record<string, string>,
   queryRows: (n: number) => `${formatNumber(n)} 行`,
   queryMs: (ms: number) => `${formatNumber(ms)} 毫秒`,
@@ -3311,6 +3337,10 @@ export const PROFILE_SKIP_KIND_LABEL: Record<string, string> = {
   date: '日期列',
   row_estimate: '行数估算',
   table: '整张表',
+  rows: '行数观察',
+  codes_observe: '码值观察',
+  freshness: '最新业务日期',
+  daily_volume: '按日行数',
 }
 
 /** 码值候选：剖析只知道出现过哪些取值，含义等人填 */

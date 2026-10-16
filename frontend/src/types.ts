@@ -64,6 +64,10 @@ export interface WorkflowVersion {
   catalog_versions?: CatalogVersions | null
   /** 发布之后目录有变化的表 */
   catalog_changes?: CatalogDriftTable[]
+  /** 发布时记下的表结构版本 {源名: {表名: 结构版本}}（只记写死的 SQL 直接引用的表）；记录之前发布的为 null */
+  schema_versions?: Record<string, Record<string, number>> | null
+  /** 发布之后结构版本变了的表 */
+  schema_changes?: SchemaDriftTable[]
 }
 
 /**
@@ -89,6 +93,26 @@ export interface CatalogDriftTable {
   current: number
   /** direct：SQL 里写着这张表；possible：Agent 可能查询的表。老事件没有这一项，按 direct */
   impact: 'direct' | 'possible'
+}
+
+/**
+ * 发布之后表结构变了的一张表（服务端 catalog_impact.schema_drift；运行里的 schema.drift 事件同形）。和目录有变化
+ * （CatalogDriftTable）分开记：这里的版本是表结构版本，不是目录版本
+ */
+export interface SchemaDriftTable {
+  source: string
+  source_id: string
+  table: string
+  /** 表现在的中文名 */
+  label: string | null
+  /** 发布时的结构版本 */
+  published: number
+  /** 现在的结构版本；表已删除时为 null */
+  current: number | null
+  removed: boolean
+  /** 发布之后测到、还没处理的结构变化（最多 5 条，more 是另外还有几条） */
+  changes: { id: string; kind: string; column: string | null; severity: 'info' | 'warning' | 'action'; summary: string }[]
+  more: number
 }
 
 /**
@@ -3367,8 +3391,11 @@ export interface CatalogProfileSettings {
 /** 为什么需要剖析（GET /catalog 每行的 profile_due_reason） */
 export type CatalogProfileDueReason = 'never' | 'unfinished' | 'new_relations' | 'new_checks'
 
-/** 剖析的范围：selected 指定的表；needed 需要剖析的表；all 全部可剖析的表（不含视图） */
-export type CatalogProfileScope = 'selected' | 'needed' | 'all'
+/**
+ * 剖析的范围：selected 指定的表；needed 需要剖析的表；all 全部可剖析的表（不含视图）；observe 观察到期的表（只做取值观察）；
+ * maintenance 定时维护（需要剖析的表 + 观察到期的表）。后两种由定时维护建，界面不发起
+ */
+export type CatalogProfileScope = 'selected' | 'needed' | 'all' | 'observe' | 'maintenance'
 
 /**
  * 剖析任务的状态：排队、进行中、完成、部分完成（有失败、部分完成、已停止的表）、失败（任务整体出错）、已停止（使用者停止）、
@@ -3386,8 +3413,8 @@ export type CatalogProfileTaskStatus = CatalogDraftTaskStatus
 export type CatalogProfileSkipReason = 'budget' | 'deadline' | 'failed' | 'timeout' | 'error' | 'rejected' | 'slow' | 'cancelled'
   | 'masked' | 'too_large' | 'view' | 'unsupported' | 'no_data' | 'missing' | 'high_cardinality' | 'nothing'
 
-/** 一类检查：关联关系、码值、日期列 */
-export type CatalogProfileCheckKind = 'relation' | 'codes' | 'date'
+/** 一类检查：关联关系、码值、日期列；取值观察的四类（行数、码值观察、最新业务日期、按日行数） */
+export type CatalogProfileCheckKind = 'relation' | 'codes' | 'date' | 'rows' | 'codes_observe' | 'freshness' | 'daily_volume'
 
 /** 发现的合计（任务里是逐表合计） */
 export interface CatalogProfileSummary {
@@ -3482,8 +3509,8 @@ export interface CatalogProfileTaskRow {
   checks_total: number
   /** 结束了的项（含跳过的） */
   checks_done: number
-  /** 每类检查 [结束了的, 一共]；这类没有检查时是 [0, 0] */
-  checks_by_kind: Record<CatalogProfileCheckKind, [number, number]>
+  /** 每类检查 [结束了的, 一共]；这类没有检查时是 [0, 0]。取值观察的四类合成 observe 一类（老服务端不给） */
+  checks_by_kind: Partial<Record<'relation' | 'codes' | 'date' | 'observe', [number, number]>>
   /** 进行中时正在做哪一项的整句（如「正在核对 orders.customer_id → customers.id」）；其余时候 null */
   current: string | null
   queries: number
@@ -3562,6 +3589,9 @@ export interface CatalogProfileJob {
   created_by: string | null
   /** 重试建的任务记着原任务的 id */
   retry_of: string | null
+  /** manual 人点的；schedule 定时维护建的（fire_at 是那一次触发的计划时刻）。老服务端不给 */
+  trigger?: 'manual' | 'schedule'
+  fire_at?: string | null
   /** 排在同一个数据源的起草任务后面：起草结束后自动开始。不在等时为 null */
   waiting_for: 'draft' | 'introspect' | null
   total: number

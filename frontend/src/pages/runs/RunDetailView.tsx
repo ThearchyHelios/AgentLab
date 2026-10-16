@@ -9,7 +9,7 @@ import {
 import { formatDateTime, formatNumber, formatTime, shortId } from '../../lib/format'
 import { resolveStatus, statusLabel, type StatusCode } from '../../lib/status'
 import { AssistantStream, type StreamTurn, type TurnFailure } from '../../run/AssistantStream'
-import { catalogDrift, decodePhase, decodeRun, exitLabels, summarizeRun, type RunFinal } from '../../run/decode'
+import { catalogDrift, decodePhase, decodeRun, exitLabels, schemaDrift, summarizeRun, type RunFinal } from '../../run/decode'
 import { sourceHandles } from '../../canvas/nodeDefs'
 import { EffectsPane, RunTaskCards, useRunTasks } from './RunTasks'
 import { OriginChip } from './RunList'
@@ -554,6 +554,9 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   // 上面有提前返回，这里不能再用 hook；只解一条事件，直接算
   const catalogEvent = lastOf(d.events, 'catalog.drift')
   const catalogChange = catalogEvent ? catalogDrift(catalogEvent.data ?? {}) : null
+  // 表结构在发布之后变了（schema.drift）：和目录变化合在同一块横幅里
+  const schemaEvent = lastOf(d.events, 'schema.drift')
+  const schemaChange = schemaEvent ? schemaDrift(schemaEvent.data ?? {}) : null
   const unsaved = isUnsaved(run)
   const artifactCount = artifacts.items?.length
   const viewTabs: TabItem<DetailView>[] = [
@@ -652,7 +655,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
           <WaitingBanner approvals={d.pending} labelOf={labelOf} onJump={jumpToApproval}
                          onAbandon={() => void abandon()} busy={busy === 'abandon'} now={now} />
         )}
-        {catalogChange && <CatalogDriftBanner drift={catalogChange} />}
+        {(catalogChange || schemaChange) && <CatalogDriftBanner drift={catalogChange} schema={schemaChange} />}
         {feedback && <FeedbackStrip feedback={feedback} onDismiss={() => setFeedback(null)} />}
         <div className="flex items-center border-t pr-2">
           <RunTabs tabs={viewTabs} active={view} onChange={setView} label="运行详情视图" idPrefix="run-view"

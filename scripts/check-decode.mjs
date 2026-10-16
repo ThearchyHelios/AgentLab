@@ -857,6 +857,33 @@ await section('正式运行：发布之后数据目录有变化（catalog.drift 
     .every((s) => s.code !== 'catalog_drift'))
 })
 
+await section('正式运行：发布之后表结构有变化（schema.drift 事件）', async () => {
+  const steps = mod.decodeRun([
+    { seq: 1, type: 'run.started', node_id: null, ts: 1, data: { nodes: 1 } },
+    { seq: 2, type: 'schema.drift', node_id: null, ts: 1.01, data: { version: 2, count: 2, tables: [
+      { source: 'shop', source_id: 'src-shop', table: 'orders', label: '订单', published: 1, current: 2, removed: false,
+        changes: [{ id: 'c1', kind: 'column_removed', column: 'status', severity: 'action', summary: 'orders.status：删除了列' },
+          { id: 'c2', kind: 'column_type_changed', column: 'amount', severity: 'warning', summary: 'orders.amount：列的类型变了' }],
+        more: 3 },
+      { source: 'shop', source_id: 'src-shop', table: 'refunds', label: null, published: 4, current: null, removed: true,
+        changes: [], more: 0 },
+    ] } },
+  ])
+  const row = steps.find((s) => s.code === 'schema_drift')
+  check('一行提醒：「订单」等 2 张表的结构有变化', row?.title === '自发布以来，「订单」等 2 张表的结构有变化', row?.title)
+  check('是警告、不是失败', row?.level === 'warn' && row?.status === 'done' && row?.kind === 'note')
+  check('副标题写明运行未被拦截', !!row?.sub?.includes('运行未被拦截'), row?.sub)
+  check('展开逐表写结构版本，表删了写「表已删除」', !!row?.detail?.includes('「shop」订单（orders）：结构第 1 版 → 第 2 版')
+    && row.detail.includes('「shop」refunds：表已删除'), row?.detail)
+  check('……下面列出还没处理的变化和另有几条', !!row?.detail?.includes('· orders.status：删除了列')
+    && row.detail.includes('另有 3 条结构变化'), row?.detail)
+  const one = mod.schemaDrift({ tables: [{ source: 's', table: 't', published: 1, current: 2 }] })
+  check('只有一张表：标题不写「等」', one?.title === '自发布以来，「t」的结构有变化', one?.title)
+  check('和目录漂移分开记：catalog.drift 的解析不认它', mod.catalogDrift({ tables: [] }) === null)
+  check('形状不对不出行', mod.decodeRun([{ seq: 1, type: 'schema.drift', node_id: null, ts: 1, data: { tables: 'x' } }])
+    .every((s) => s.code !== 'schema_drift'))
+})
+
 await section('Copilot：心跳穿插、回话、少了一步、报错', async () => {
   const steps = mod.decodeCopilot(synthetic.COPILOT_STUCK, { context: 'canvas' })
   check('心跳穿插的思考仍然并成一条', steps.filter((s) => s.kind === 'think').length === 1,

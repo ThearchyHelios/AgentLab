@@ -565,9 +565,9 @@ export const PROFILE_TASK_ICON: Record<CatalogProfileTaskStatus, { Icon: LucideI
   cancelled: { Icon: CircleSlash, color: 'var(--text-faint)' },
 }
 
-/** 各类检查的进度：「关系 3/4 · 码值 5/6 · 日期 1/1」，这类没有检查的不写 */
+/** 各类检查的进度：「关系 3/4 · 码值 5/6 · 日期 1/1 · 取值观察 4/4」，这类没有检查的不写 */
 export function checksText(t: Pick<CatalogProfileTaskRow, 'checks_by_kind'>): string {
-  return (['relation', 'codes', 'date'] as const)
+  return (['relation', 'codes', 'date', 'observe'] as const)
     .map((k) => {
       const [done, total] = t.checks_by_kind?.[k] ?? [0, 0]
       return total > 0 ? PT.kindProgress(PT.checkKind[k], done, total) : ''
