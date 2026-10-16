@@ -3,7 +3,8 @@
  * - 发布弹窗的召回预告（RecallPreviewRow）：把这一版发布成新版本之后，旧版本被多少问数回答、导出、定时任务、应用用过，
  *   预计自动重算几组，超出上限的写明（GET /api/workflows/{id}/recall-preview）。和发布之后真的召回走同一份计划，规模一致；
  * - 版本历史里口径升到这一版之后的召回批次（RecallBatches）：每组的结论（数变了 / 没变 / 无法重算：原因 / 重算失败 / 正在
- *   重算 / 未重算），「另有 M 组未重算」和「接着算」（GET / POST /api/ledger/recall/{wf}/{v}）。
+ *   重算 / 未重算），「另有 M 组未重算」和「接着算」（GET / POST /api/ledger/recall/{wf}/{v}）。之后又发布了更新的版本的，
+ *   旧的那一版不再给「接着算」，写服务端给的原因（continue_reason）。
  *
  * 界面层不放逻辑：几组、能不能重算、为什么不能、能不能接着算都由服务端给。老服务端没有这两个接口（404）时不画。
  */
@@ -137,6 +138,9 @@ export function RecallBatches({ workflowId, version }: { workflowId: string; ver
                     data-version-recall-continue="" onClick={() => void continueBatch()}>
               {busy ? <Spinner size={11} /> : <Play size={11} aria-hidden />} {busy ? B.continuing : B.continue(data.batch_size)}
             </button>
+          )}
+          {!data.can_continue && data.continue_reason && (
+            <div className="mt-0.5 text-dim" data-version-recall-continue-reason="">{B.cannotContinue(data.continue_reason)}</div>
           )}
         </div>
       )}

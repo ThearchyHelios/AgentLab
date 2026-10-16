@@ -12,7 +12,7 @@ import {
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
 import { catalogPatchOf, patchBeforeText, patchValueText, patchWhere } from './catalogPatch'
-import { RECALL_TEXT } from '../lib/termsRecall'
+import { LEDGER_FEEDBACK_TEXT, RECALL_TEXT } from '../lib/termsRecall'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
 import { isSqlCheckCode, sortSqlChecks, sqlCheckOf, sqlChecksOf, sqlCheckWhere, sqlRuleLabel } from '../lib/sqlcheck'
 
@@ -2437,6 +2437,19 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           title, sub: R.sub,
           ...(tasks ? { meta: R.tasks(tasks) } : {}),
           ...(failed && typeof d.error === 'string' && d.error ? { detail: d.error } : {}),
+        })
+        break
+      }
+
+      case 'ledger.feedback': {
+        // 对账结果上的「说明有用 / 看不懂」（next-round 02 做法 10，服务端 ledger/feedback）：记在对账运行上、封存之后追加。
+        // 同一个人改主意会再记一条（统计只算最后一次），时间线照实一条一行
+        const F = LEDGER_FEEDBACK_TEXT
+        const verdict = typeof d.verdict === 'string' ? d.verdict : undefined
+        out.push({
+          id: `lf-${seq}`, seq, kind: 'note', status: 'done', code: 'ledger_feedback', level: 'info',
+          title: verdict && F.verdict[verdict] ? F.title(verdict, typeof d.by === 'string' ? d.by : null) : F.generic,
+          sub: F.sub,
         })
         break
       }

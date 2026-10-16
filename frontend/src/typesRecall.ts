@@ -78,6 +78,8 @@ export interface RecallBatches {
   /** 还没重算的几组（「另有 M 组未重算」） */
   remaining: number
   can_continue: boolean
+  /** 还有没算的组却不能接着算时为什么（之后又发布了更新的版本……）；能接着算、都算过了为 null */
+  continue_reason?: string | null
   truncated: boolean
   launched?: string[]
 }

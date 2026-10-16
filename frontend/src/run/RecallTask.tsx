@@ -211,7 +211,12 @@ function AnswerLink({ answer }: { answer: RecallAnswer }) {
   )
 }
 
+/** 重新出具的那次正式运行：搭建者链到记录页；使用者进不了记录页（点了会被送回应用首页），只写已经出具 */
 function IssuedLink({ runId }: { runId: string }) {
+  const builder = useAtLeast('builder')
+  if (!builder) {
+    return <span className="text-2xs text-dim" data-recall-issued-note="">{T.issuedUserNote}</span>
+  }
   return (
     <Link to={`/runs/${encodeURIComponent(runId)}`} data-recall-issued={runId}
           className="inline-flex items-center gap-1 text-2xs text-dim underline-offset-2 hover:text-fg hover:underline">

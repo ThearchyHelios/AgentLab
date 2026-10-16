@@ -2170,6 +2170,11 @@ await section('口径召回：版本历史看召回批次、另有 M 组未重�
   await page.route(/\/api\/ledger\/recall\/pf-lib\/(\d+)(\/continue)?$/, (route) => {
     const req = route.request()
     const v = Number(new URL(req.url()).pathname.split('/')[5])
+    // v2：口径升到 v2 时自动算了一批、还剩一组，后来又发布了 v4——v2 那一版不再给「接着算」，服务端写明原因
+    if (v === 2) return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...BATCHES, version: 2,
+      groups: [{ ...BATCHES.groups[4], id: '1-e', from_version: 1, to_version: 2 }], remaining: 1, can_continue: false,
+      continue_reason: '已有更新的发布版 v4，召回在 v4 那一版接着看',
+      counts: { changed: 0, unchanged: 0, failed: 0, running: 0, pending: 1, not_recomputable: 0 } }) })
     if (v !== 4) return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...BATCHES, version: v,
       groups: [], remaining: 0, can_continue: false, counts: { changed: 0, unchanged: 0, failed: 0, running: 0, pending: 0,
         not_recomputable: 0 } }) })
@@ -2217,6 +2222,14 @@ await section('口径召回：版本历史看召回批次、另有 M 组未重�
   await sheet.locator('[data-version-lifecycle="3"]').waitFor()
   await page.waitForTimeout(300)
   check('没有召回过的版本不画召回那一块', await sheet.locator('[data-version-lifecycle="3"] [data-version-recall]').count() === 0)
+  await sheet.locator('ol button', { hasText: 'v2' }).first().click()
+  const old = sheet.locator('[data-version-lifecycle="2"] [data-version-recall]')
+  check('之后又发布了更新版本的旧版：照样列出另有几组未重算', await waitFor(page, async () => await old.count() === 1)
+    && (await old.locator('[data-version-recall-remaining="1"]').innerText().catch(() => '')).includes('另有 1 组未重算'))
+  check('……不给「接着算」，写服务端给的原因', await old.locator('[data-version-recall-continue]').count() === 0
+    && (await old.locator('[data-version-recall-continue-reason]').innerText().catch(() => ''))
+      === '不再接着算：已有更新的发布版 v4，召回在 v4 那一版接着看')
+  check('……没有多发接着算的请求', continued.length === 1, continued.join(','))
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 })
 

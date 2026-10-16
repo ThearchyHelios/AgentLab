@@ -70,6 +70,8 @@ export const RECALL_TEXT = {
     } as Record<string, string>,
     reason: (state: string, reason: string) => (state === 'not_recomputable' ? `无法重算：${reason}` : reason),
     remaining: (count: number) => `另有 ${n(count)} 组未重算`,
+    /** 还有没算的组却不能接着算（之后又发布了更新的版本……）：照服务端给的原因写 */
+    cannotContinue: (reason: string) => `不再接着算：${reason}`,
     continue: (size: number) => `接着算（每次 ${n(size)} 组）`,
     continuing: '正在发起…',
     continued: (count: number) => (count ? `已发起 ${n(count)} 组召回` : '没有发起新的召回'),
@@ -108,6 +110,8 @@ export const RECALL_TEXT = {
     reissueHint: '按新版口径、这一组的参数发起一次正式运行（和按口径正式出具同一套检查）',
     reissued: '已按新版重新出具',
     issuedRun: '查看出具的正式运行',
+    /** 使用者进不了记录页：只写已经出具，不给点了回不来的链接（同问数据轮次下的出具结果） */
+    issuedUserNote: '正式运行的记录由搭建者在记录页查看',
     ack: '知道了',
     acked: '已记为知道了',
     doneReissue: '已按新版发起正式出具',
@@ -151,4 +155,16 @@ export const RECALL_TEXT = {
     newErrors: (count: number) => `按新目录检查新出现 ${n(count)} 条错误级问题`,
     sub: '封存后追加，不在封存范围内',
   },
+}
+
+/**
+ * 对账结果上的「说明有用 / 看不懂」在时间线上的说法（run/decode.ts 认 ledger.feedback，记在对账运行上，服务端
+ * app/ledger/feedback.py）。按钮在对账结果卡片上（问数据轮次、证据面板），这里只管时间线那一行。
+ */
+export const LEDGER_FEEDBACK_TEXT = {
+  verdict: { useful: '说明有用', unclear: '看不懂' } as Record<string, string>,
+  title: (verdict: string | undefined, by: string | null | undefined) =>
+    `${by ? `${by} ` : ''}反馈：${(verdict && LEDGER_FEEDBACK_TEXT.verdict[verdict]) || '对账说明'}`,
+  generic: '对账说明的反馈',
+  sub: '封存后追加，不在封存范围内',
 }

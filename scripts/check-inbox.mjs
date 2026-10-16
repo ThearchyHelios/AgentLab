@@ -174,6 +174,18 @@ const TASKS = {
       actions: [{ decision: 'reissue', available: false,
         reason: '这份口径没有被你能使用的应用固定，不能由你按口径出具，请搭建者出具' }, { decision: 'ack', available: true }] },
   },
+  // 已经按新版重新出具过的（处理完的）：出具的那次正式运行搭建者点得开，使用者只写一句（进不了记录页）
+  recallIssued: {
+    ...base, id: 'recallIssued', kind: 'recall', title: '口径「客户分层」升到 v3，答案的数变了', node_id: null, app_id: null,
+    app_name: null, app_version: null, workflow_name: '口径召回：客户分层 v2 → v3', run_id: 'rc_3', status: 'resolved',
+    resolved_by: 'zhangsan', resolved_at: ago(60_000), can_respond: false,
+    outcome: { decision: 'reissue', note: '', issued_run: 'run_issued_9' },
+    assignments: [assignment('rc4', 'zhangsan', 'responded', 'reissue', { source: 'recall' })],
+    payload: { kind: 'recall', reason: 'caliber', recall_run: 'rc_3', workflow_id: 'wf_tier', workflow_name: '客户分层',
+      from_version: 2, to_version: 3, binding: [], metrics: [], answers: [],
+      outcome: { decision: 'reissue', note: '', issued_run: 'run_issued_9' },
+      actions: [{ decision: 'reissue', available: false, issued_run: 'run_issued_9' }, { decision: 'ack', available: false }] },
+  },
   // 答案依据的目录有变、按新目录检查出了新的错误级问题：只有「知道了」
   recallCatalog: {
     ...base, id: 'recallCatalog', kind: 'recall', title: '答案依据的数据目录有变：按新目录检查出了新的问题', node_id: null,
@@ -209,6 +221,21 @@ async function open(state) {
   page.errors = []
   page.on('pageerror', (e) => page.errors.push(e.message))
   await page.addInitScript(() => localStorage.setItem('agentlab_actor', '审批人甲'))
+  if (state.notify) {
+    // 系统通知换成记录器：开了后台提醒、已授权；记下每一条通知（点它就是调它的 onclick），页面一直在后台
+    await page.addInitScript(() => {
+      localStorage.setItem('agentlab.notify', '1')
+      window.__notes = []
+      class FakeNotification {
+        static permission = 'granted'
+        static async requestPermission() { return 'granted' }
+        constructor(title, opts) { this.title = title; this.tag = opts?.tag; window.__notes.push(this) }
+        close() {}
+      }
+      window.Notification = FakeNotification
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true })
+    })
+  }
   await page.route((url) => url.pathname.startsWith('/api/'), (route) => {
     const r = route.request()
     const p = new URL(r.url()).pathname
@@ -247,6 +274,13 @@ async function open(state) {
     }
     // 进了副本蓝图之后的页面不在这里查：蓝图一律答「不存在」，不打到真实服务端
     if (p.startsWith('/api/blueprints/')) return route.fulfill({ status: 404, json: { detail: '蓝图不存在或已被删除' } })
+    // state.live：派给我的待处理待办由这一段自己换（外壳的待办通知看数和最新一条的时间变没变）
+    if (p === '/api/tasks/count' && state.live) {
+      return route.fulfill({ json: { mine: state.live.length, apps: 0, other: state.live.length,
+        latest: state.live.map((t) => t.created_at).sort().at(-1) ?? null } })
+    }
+    if (p === '/api/tasks' && state.live) return route.fulfill({ json: { items: state.live } })
+    if (p === '/api/approvals' && state.live) return route.fulfill({ json: [] })
     if (p === '/api/tasks/count') return route.fulfill({ json: { mine: Object.keys(TASKS).length, apps: Object.keys(TASKS).length, other: 0 } })
     if (p === '/api/tasks') return route.fulfill({ json: { items: Object.values(TASKS) } })
     const m = p.match(/^\/api\/tasks\/([^/]+)$/)
@@ -526,6 +560,19 @@ await section('口径召回：使用者看到的遮罩值、不能重新出具�
     && (await page.locator('[data-recall-reissue-reason]').innerText()).includes('请搭建者出具'))
   check('使用者不给记录页的链接', await box.locator('[data-recall-answer-link="run"]').count() === 0)
 
+  const p3 = await open({ writes: [], me: state.me })
+  await p3.goto(`${WEB}/apps/inbox/recallIssued`)
+  const done = p3.locator('[data-recall-outcome="reissue"]')
+  await done.waitFor({ timeout: 15000 })
+  check('使用者重新出具过：只写已出具、正式运行由搭建者在记录页查看，不给点了回不来的记录页链接',
+    (await done.innerText()).includes('正式运行的记录由搭建者在记录页查看')
+    && await p3.locator('[data-recall-issued]').count() === 0, (await done.innerText()).replace(/\s+/g, ' '))
+  const p4 = await open({ writes: [] })
+  await p4.goto(`${WEB}/apps/inbox/recallIssued`)
+  await p4.locator('[data-recall-outcome="reissue"]').waitFor({ timeout: 15000 })
+  check('……搭建者照样链到那次正式运行', (await p4.locator('[data-recall-outcome] [data-recall-issued]').getAttribute('href'))
+    === '/runs/run_issued_9' && await p4.locator('[data-recall-issued-note]').count() === 0)
+
   const p2 = await open({ writes: [] })
   await p2.goto(`${WEB}/apps/inbox/recallCatalog`)
   const basis = p2.locator('[data-recall-basis="catalog"]')
@@ -534,7 +581,35 @@ await section('口径召回：使用者看到的遮罩值、不能重新出具�
   check('目录有变：写变了的目录项和新出现的问题', text.includes('列 amount 的度量类型（改了）') && text.includes('新出现的错误级问题 1 条')
     && text.includes('分组里没有业务日期'), text.replace(/\s+/g, ' '))
   check('……只有「知道了」', await p2.locator('[data-recall-ack]').count() === 1 && await p2.locator('[data-recall-reissue]').count() === 0)
-  check('没有未捕获的运行时错误', page.errors.length === 0 && p2.errors.length === 0, page.errors[0] ?? p2.errors[0] ?? '')
+  check('没有未捕获的运行时错误', [page, p2, p3, p4].every((x) => x.errors.length === 0),
+    [page, p2, p3, p4].flatMap((x) => x.errors)[0] ?? '')
+})
+
+await section('口径召回：后台的系统通知点开去待办页（不去记录页）', async () => {
+  // recall 待办不属于应用（app_id 为空），挂在召回运行上：记录页里没有这张卡，使用者也进不了记录页。点通知一律去待办页
+  const users = {
+    builder: null,
+    user: { mode: 'local', username: 'zhangsan', display_name: '张三', role: 'user', groups: [], verified: true },
+  }
+  for (const [who, me] of Object.entries(users)) {
+    const state = { writes: [], notify: true, live: [], me: me ?? undefined }
+    const page = await open(state)
+    await page.goto(`${WEB}/apps`)
+    await page.locator('nav[aria-label="主导航"]').waitFor({ timeout: 15000 })
+    await page.waitForTimeout(1200)
+    state.live = [{ ...TASKS.recall, created_at: new Date().toISOString() }]
+    const noted = await page.waitForFunction(() => window.__notes.some((n) => n.tag === 'task:recall'), null, { timeout: 15000 })
+      .then(() => true, () => false)
+    check(`${who === 'user' ? '使用者' : '搭建者'}：来了 recall 待办，发系统通知`, noted,
+      (await page.evaluate(() => window.__notes.map((n) => n.tag))).join(','))
+    if (!noted) continue
+    await page.evaluate(() => window.__notes.find((n) => n.tag === 'task:recall').onclick())
+    const there = await page.waitForURL((u) => u.pathname === '/apps/inbox/recall', { timeout: 8000 }).then(() => true, () => false)
+    check('……点通知去这条待办的待办页', there, new URL(page.url()).pathname)
+    check('……待办页画出召回卡', await page.locator('[data-task-recall="caliber"]').waitFor({ timeout: 8000 })
+      .then(() => true, () => false))
+    check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+  }
 })
 
 await section('待办箱：列表和徽标', async () => {
