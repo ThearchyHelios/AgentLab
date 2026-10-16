@@ -2611,19 +2611,7 @@ export const CATALOG_DRAFT_TEXT = {
     ? `+${formatNumber(added)}${updated ? ` · 改 ${formatNumber(updated)}` : ''}` : ''),
   taskAddedHint: (added: number, updated: number, removed: number) =>
     `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
-  // ---- 目录页上方的进度、结束提示
-  strip: (done: number, total: number) => `正在起草：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
-  stripQueued: (total: number) => `起草任务排队中，共 ${formatNumber(total)} 张表`,
-  stripQueuedProfile: (total: number) => `起草任务排在剖析任务后面，剖析结束后自动开始（共 ${formatNumber(total)} 张表）`,
-  stripQueuedIntrospect: (total: number) => `起草任务排在探查任务后面，探查结束后自动开始（共 ${formatNumber(total)} 张表）`,
-  /** 页头的进度入口：进行中写「起草 3/20」，排队写「起草 排队中」 */
-  headerRunning: (done: number, total: number) => `起草 ${formatNumber(done)}/${formatNumber(total)}`,
-  headerQueued: '起草 排队中',
-  headerRunningHint: (done: number, total: number) => `起草进行中：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，点击查看进度`,
-  headerQueuedHint: '起草任务排队中，点击查看',
-  headerQueuedProfile: '起草任务排在剖析任务后面，剖析结束后自动开始，点击查看',
-  headerQueuedIntrospect: '起草任务排在探查任务后面，探查结束后自动开始，点击查看',
-  stripOpen: '查看进度',
+  // ---- 结束提示（进行中、排队中的进度在目录页的后台任务条，见 termsSource.ts）
   toast: {
     succeeded: (summary: string) => `数据目录起草完成：${summary}`,
     partial: (n: number) => `数据目录起草完成，${formatNumber(n)} 张表未写全`,
@@ -3034,13 +3022,6 @@ export const PROFILE_TEXT = {
   action: '数据剖析',
   actionHint: '对业务库发只读查询：核实推断的关联关系、取码值候选、提议业务日期',
   profileSelected: (n: number) => `剖析所选（${formatNumber(n)}）`,
-  /** 页头的进度入口：进行中写「剖析 12/40」，排队写「剖析 排队中」 */
-  headerRunning: (done: number, total: number) => `剖析 ${formatNumber(done)}/${formatNumber(total)}`,
-  headerQueued: '剖析 排队中',
-  headerRunningHint: (done: number, total: number) => `数据剖析进行中：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，点击查看进度`,
-  headerQueuedHint: '剖析任务排队中，点击查看',
-  headerQueuedDraft: '剖析任务排在起草任务后面，起草结束后自动开始，点击查看',
-  headerQueuedIntrospect: '剖析任务排在探查任务后面，探查结束后自动开始，点击查看',
 
   // ---- 开始前：范围、预算
   title: '数据剖析',
