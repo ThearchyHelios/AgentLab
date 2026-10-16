@@ -480,11 +480,13 @@ async def refresh_index(session: AsyncSession, source_id: str, schema: str, resu
     for chunk in _chunks(new_rows):
         await session.execute(insert(_SO), chunk)
     if changed:
-        stmt = (update(_SO).where(_SO.id == bindparam("_id"))
-                .values(kind=bindparam("kind"), comment=bindparam("comment"), est_rows=bindparam("est_rows"))
-                .execution_options(synchronize_session=False))
+        # 按表（不按 ORM 实体）的 executemany：ORM 的按主键批量更新要求参数里写主键列的名字
+        table = SourceObject.__table__
+        stmt = (update(table).where(table.c.id == bindparam("_id"))
+                .values(kind=bindparam("kind"), comment=bindparam("comment"), est_rows=bindparam("est_rows")))
+        conn = await session.connection()
         for chunk in _chunks(changed):
-            await session.execute(stmt, chunk)
+            await conn.execute(stmt, chunk)
     still = [r.id for name, r in existing.items() if name in seen]
     for chunk in _chunks(still):
         await session.execute(update(_SO).where(_SO.id.in_(chunk)).values(last_seen_at=now)

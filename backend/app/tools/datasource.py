@@ -854,7 +854,8 @@ def _schema_tables(table: str | list[str] | None) -> list[str]:
 #: db_schema 不传 table 时最多列几张（几千张表的库整份列出来没法看，也塞不进上下文）、按 keyword 检索给几个
 SCHEMA_LIST_LIMIT = 50
 SCHEMA_KEYWORD_LIMIT = 30
-SCHEMA_MORE_PROMPT = "…另有 {n} 张没有列出：用 keyword 按要查的内容检索，或者 table 直接点名"
+SCHEMA_MORE_PROMPT = "…另有 {n} 张没有列出{outside}：用 keyword 按要查的内容检索，或者 table 直接点名"
+SCHEMA_MORE_OUTSIDE = "（其中 {n} 张在探查范围外，点名时按需加入）"
 SCHEMA_KEYWORD_HEAD = "数据源「{source}」里和「{keyword}」相关的表（按相关程度排）："
 SCHEMA_KEYWORD_NONE = "数据源「{source}」里没有检索到和「{keyword}」相关的表：换个说法，或者 table 直接点名"
 SCHEMA_OUTSIDE_MARK = "（探查范围外：table 点名它会按需加入）"
@@ -908,7 +909,9 @@ def _make_schema_tool(source: Any, *, fixed: bool = False,
         lines = [f"  {n}" + ("（按原样导入、未经规整，不能直接对列求和）" if n in raw else "")
                  + (REPORTED_TOTAL_MARK if n in totals else "") for n in shown]
         if total > len(shown):
-            lines.append("  " + SCHEMA_MORE_PROMPT.format(n=total - len(shown)))
+            beyond = total - len(tables)
+            lines.append("  " + SCHEMA_MORE_PROMPT.format(
+                n=total - len(shown), outside=SCHEMA_MORE_OUTSIDE.format(n=beyond) if beyond > 0 else ""))
         return head + "：\n" + "\n".join(lines)
 
     return StructuredTool(
