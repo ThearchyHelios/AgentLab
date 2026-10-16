@@ -304,7 +304,9 @@ async def test_version_detail_has_form_and_usage(client):
     assert detail["usage"]["effects"] == 1 and detail["usage"]["formal_runs"] == 1
     assert [a["name"] for a in detail["usage"]["apps"]] == ["周报看板"]
     ledger = (await client.get(f"/api/ledger/workflow-versions/{wf}/1")).json()
-    assert ledger == detail["usage"]
+    # 账本接口在同一份之上另加口径账本的用量（问数回答、导出、定时任务、召回，next-round 02 做法 8）
+    assert {k: ledger[k] for k in detail["usage"]} == detail["usage"]
+    assert ledger["answers"] == 0 and ledger["recall"] == {"groups": 0, "changed": 0, "recalled_from": 0}
     effects = (await client.get("/api/ledger/effects", params={"workflow_id": wf})).json()["items"]
     assert [(e["capability"], e["state"], e["workflow_version"]) for e in effects] == [("erp_pay", "confirmed", 1)]
 

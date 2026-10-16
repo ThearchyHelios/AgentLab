@@ -11,7 +11,9 @@
   起草（建起草任务）、重新剖析（建剖析任务）、知道了、误报（必须写理由）。每个动作写 resolution，动了目录的记下目录版本，
   建了任务的记下任务编号。
 - **拉取**（list_changes / affecting）：给召回按 seq 游标拉；seq 自增、不复用。触发召回的只有结构类、处理时改了目录的、
-  以及 rules_touched 的新码值（triggers_recall）；纯取值漂移只算数据质量提醒。
+  以及 rules_touched 的新码值（triggers_recall）；纯取值漂移只算数据质量提醒。探查、剖析任务结束时（notify_after_job）
+  口径账本在后台按游标接着拉（ledger/recall.consume_source_changes）；处理变化时改了目录的那一条当场交过去
+  （ledger/recall.process_change：它记下来的时候游标早已经过去了）。
 - **说法**（summary）：一条变化给人看的一句（接口、日志用）；通知里不放它（不放表名、列名、取值，D9），见
   notify/service.notify_source_changed。
 
@@ -340,10 +342,17 @@ async def notify_after_job(source_id: str, job_id: str) -> int:
             from app.notify import service
 
             service.spawn(service.notify_source_changed(source_id))
-        return n
     except Exception:  # noqa: BLE001
         logger.exception("任务 %s 结束后推送数据源变化的通知时出错", job_id)
-        return 0
+        n = 0
+    try:
+        # 口径账本的召回（next-round 02 做法 7 三）：这次记下的变化里表或列被删、类型变了的，标用过它的答案「依据的表结构已变」
+        from app.ledger import recall
+
+        recall.spawn(recall.consume_source_changes())
+    except Exception:  # noqa: BLE001 - 辅助步骤
+        logger.exception("任务 %s 结束后排队召回时出错", job_id)
+    return n
 
 
 # ==========================================================================
@@ -469,6 +478,11 @@ async def handle(session: AsyncSession, source: Any, row: SourceChange, action: 
     if version is not None:
         out["catalog_version"] = version
     out["change"] = change_out(row)
+    if version is not None and triggers_recall(out["change"]):
+        # 处理时改了目录：用过这张表的答案「依据有变」（口径账本，后台；游标早已过了这一条，当场交过去）
+        from app.ledger import recall
+
+        recall.spawn(recall.process_change(out["change"]))
     return out
 
 

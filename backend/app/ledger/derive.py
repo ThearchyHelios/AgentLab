@@ -17,16 +17,16 @@ cell(nodes.X, 0, '列')、X 是查库的调用工具节点（look/calibers.card_
 拒收、给原因（NotDerivable）。工作流、版本、节点不在了也照实说。
 
 **已实现的**：caliber_probe —— 一份口径的取数 + 口径卡（评测口径题的期望）；reconcile —— 口径对账（第 3 波，
-reconcile_graph）；组合式问数用的 caliber_block(card_id, inputs)（第 3 波）。
+reconcile_graph）；组合式问数用的 caliber_block(card_id, inputs)（第 3 波）；recall —— 口径召回（第 4 波，recall_graph）。
 
 **扩展点**（第 3 波的账本按这里扩，不另写生成器）：
 - 口径对账（02 做法 6）：assemble("reconcile", [ours, caliber_block(pinned)], tail=[对账卡])。ours 是「这次的取数」
   （执行过的 SQL 原文，节点 id ours_q1…，build 一个 Block 即可，不经 caliber_block），对账卡是本地 metrics 节点（差值、
   相对差，式子引用 cell(nodes.ours_q1, 0, '列') 和口径卡的指标，on_missing=null），出口的契约写 metrics_from。
-- 口径召回（02 做法 7）：assemble("recall", [caliber_block(old, prefix="old_"), caliber_block(new, prefix="new_")],
-  tail=[召回卡])。同一张图里放两份口径，取数节点 id 会撞：caliber_block 带 prefix 时把拷出来的节点改名，口径卡的
-  caliber_from 带上改名映射 nodes={原 id: 新 id}，运行时 metrics._pinned_caliber 按语法树改写式子里的 cell(nodes.X…)
-  和 nodes.X（第 3 波起）。
+- 口径召回（02 做法 7，recall_graph）：assemble("recall", [caliber_block(old, prefix="old_"), caliber_block(new,
+  prefix="new_")], tail=[召回卡])。同一张图里放两份口径，取数节点 id 会撞：caliber_block 带 prefix 时把拷出来的节点改名，
+  口径卡的 caliber_from 带上改名映射 nodes={原 id: 新 id}，运行时 metrics._pinned_caliber 按语法树改写式子里的
+  cell(nodes.X…) 和 nodes.X（第 3 波起）。
 - 组合式问数（02 做法 4，ledger/compose.py）：不经 assemble（拷进的是问数据那张图），只用 caliber_block(prefix=…,
   card_id=…, inputs=…)：取数节点改名、模板按助手给的参数渲染成字面 SQL，口径卡带改名映射。
 - 新的派生种类登记进 KINDS，入口字段、出口、首尾相接都走 assemble，不在调用方拼节点。
@@ -44,7 +44,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-#: 派生图的种类。caliber_probe、reconcile 已实现；recall 归第 4 波（见模块说明的扩展点）
+#: 派生图的种类（见模块说明）
 KINDS = ("caliber_probe", "reconcile", "recall")
 
 #: 不能派生的原因的机器码
@@ -380,6 +380,53 @@ def reconcile_graph(pinned: Pinned, ours: Block, tail: Sequence[dict[str, Any]],
                     contract={"metrics_from": RECONCILE_CARD} if card is not None else None)
 
 
+#: 召回图里的召回卡（细案 02 做法 7）
+RECALL_CARD = "recall"
+
+
+def recall_prefixes(i: int) -> tuple[str, str]:
+    """召回图里第 i 对口径卡（旧版、新版）各自的前缀：第一对 old_ / new_，之后 old2_ / new2_……（同一版里两张卡读同一个
+    取数节点时，各拷一份也不撞）。"""
+    n = "" if i == 0 else str(i + 1)
+    return f"old{n}_", f"new{n}_"
+
+
+def recall_fields(old: Pinned, new: Pinned, inputs: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """召回图的入口：新版的入口字段在前（类型、必填照新版），旧版有、新版没有的接在后面；缺省值都换成这一组的参数。"""
+    fields: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for f in [*new.entry_fields, *old.entry_fields]:
+        name = str(f.get("name") or "")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        item = copy.deepcopy(dict(f))
+        if name in inputs:
+            item["default"] = inputs[name]
+        fields.append(item)
+    return fields
+
+
+def recall_graph(pairs: Sequence[tuple[Pinned, Pinned]], tail: Sequence[dict[str, Any]], *,
+                 inputs: Mapping[str, Any]) -> DerivedGraph:
+    """口径召回（细案 02 做法 7）：入口（这一组的参数）→ 每一对口径卡：旧版的取数 + 旧版口径卡（caliber_from 固定旧版）、
+    新版的取数 + 新版口径卡（固定新版），两版的取数节点各带前缀、口径卡的 caliber_from 带改名映射（不撞 id）→ tail（召回卡：
+    两版之差在这里算，ledger/recall.recall_card）→ 出口（契约 metrics_from 指向召回卡；不加报告、不调模型）。
+
+    两版在同一次运行里先后查同一份数据：差值只反映口径的变化（数据随时间的变化另拿原答案当时的值对照着说）。入口字段按
+    第一对的新版、旧版合起来（recall_fields）。同样的输入永远得到同一张图。"""
+    if not pairs:
+        raise ValueError("召回图至少要一对口径卡")
+    blocks: list[Block] = []
+    for i, (old, new) in enumerate(pairs):
+        old_prefix, new_prefix = recall_prefixes(i)
+        blocks += [caliber_block(old, prefix=old_prefix), caliber_block(new, prefix=new_prefix)]
+    old, new = pairs[0]
+    card = next((n for n in tail if n.get("type") == "metrics" and n.get("id") == RECALL_CARD), None)
+    return assemble("recall", blocks, fields=recall_fields(old, new, inputs), defaults=new.defaults or old.defaults,
+                    tail=tail, contract={"metrics_from": RECALL_CARD} if card is not None else None)
+
+
 def caliber_probe(pinned: Pinned, *, upgrade_policy: str | None = None) -> DerivedGraph:
     """口径探针：一份口径的取数 + 口径卡（评测口径题的期望，细案 01 做法 8）。节点 id 和原图一样，入口字段照抄。
     同样的 pinned 永远得到同一张图（确定性）。"""
@@ -388,6 +435,6 @@ def caliber_probe(pinned: Pinned, *, upgrade_policy: str | None = None) -> Deriv
 
 
 __all__ = ["ALIGN_ID", "Block", "DerivedGraph", "ENTRY_ID", "EXIT_ID", "GONE", "KINDS", "NOT_CARD", "NOT_REUSABLE",
-           "NotDerivable", "OURS_ID", "Pinned", "RECONCILE_CARD", "TEMPLATE", "assemble", "caliber_block",
-           "caliber_probe", "entry_fields", "load_pinned", "ours_block", "reconcile_graph", "reconcile_prefix", "render_inputs",
-           "template_problem"]
+           "NotDerivable", "OURS_ID", "Pinned", "RECALL_CARD", "RECONCILE_CARD", "TEMPLATE", "assemble", "caliber_block",
+           "caliber_probe", "entry_fields", "load_pinned", "ours_block", "recall_fields", "recall_graph",
+           "recall_prefixes", "reconcile_graph", "reconcile_prefix", "render_inputs", "template_problem"]

@@ -208,12 +208,7 @@ async def plan_issue(session: Any, run: Run | None, content: dict[str, Any] | No
     hide 判一个绑定值是不是这次运行查到过的遮罩值。只读，不发起。"""
     from app.api.deps import can_read_run
     from app.api.settings import ledger_settings
-    from app.apps import versions as app_versions
-    from app.apps.backfill import graph_side_effect
-    from app.apps.forms import input_schema, validate_form
-    from app.apps.resolve import input_key
     from app.ledger import match as ledger_match
-    from app.ledger.derive import entry_fields
     from app.ledger.labels import caliber_key
 
     plan = Plan(run_id=run.id if run else "", workflow_id=workflow_id, version=int(version),
@@ -237,43 +232,9 @@ async def plan_issue(session: Any, run: Run | None, content: dict[str, Any] | No
     plan.binding = dict(whole.get("binding") or {})
     if hide is not None and any(hide(v) for v in plan.binding.values()):
         return plan.refuse(MASKED_BINDING)
-    if workflow is None:
-        return plan.refuse(GONE, 404)
-    row = await app_versions.version_row(session, workflow_id, int(version))
-    if row is None:
-        return plan.refuse(VERSION_GONE.format(name=workflow.name, version=version), 404)
-    if row.retired_at is not None:
-        return plan.refuse(RETIRED.format(name=workflow.name, version=version))
-    if not app_versions.is_published(row, current=workflow.published_version):
-        return plan.refuse(UNPUBLISHED.format(name=workflow.name, version=version))
-    plan.level = row.level or plan.level
-    plan.expect_hash = row.graph_hash
-    if reason := await graph_side_effect(session, row.graph, level=row.level):
-        return plan.refuse(SIDE_EFFECT.format(name=workflow.name, version=version, reason=reason))
-    fields = list(entry_fields(row.graph or {}))
-    values = {str(f["name"]): f.get("default") for f in fields if f.get("default") not in (None, "")}
-    values.update({k: v for k, v in plan.binding.items() if v not in (None, "")})
-    plan.inputs = values
-    if errors := validate_form(input_schema(fields), values):
-        return plan.refuse(INPUTS.format(problems="；".join(e["message"] for e in errors)))
-    # 参数运行时要渲染进口径的 SQL 模板：写在引号里的不能带引号、裸写的只能是数（ledger/compose 同一个判断）
-    from app.ledger.compose import slot_contexts, value_problem
-
-    contexts = slot_contexts([n for n in (row.graph or {}).get("nodes") or [] if n.get("type") == "tool"],
-                             strict=False)
-    if problem := next((p for k, v in values.items() if (p := value_problem(k, v, contexts.get(k, set())))), None):
-        return plan.refuse(f"{problem}，不代填出具")
-    if principal.mode != "off" and not principal.at_least("builder"):
-        plan.granted_by_app = await _granting_app(session, principal, workflow_id, int(version))
-        if plan.granted_by_app is None:
-            return plan.refuse(ASK_BUILDER, 403, FORBIDDEN)
-    key = input_key(values)
-    plan.existing = next((r.id for r in await issued_runs(session, run.id)
-                          if (r.workflow_id, r.version) == (workflow_id, int(version)) and r.status in _LIVE
-                          and input_key(r.input) == key), None)
+    if await check_target(session, plan, workflow, principal=principal, source_run=run.id) is None:
+        return plan
     settings = await ledger_settings(session)
-    if plan.existing is None and await issued_today(session) >= int(settings["issue_daily_limit"]):
-        return plan.refuse(OVER_LIMIT.format(limit=settings["issue_daily_limit"]), 429, DAILY_LIMIT)
     if not settings["auto_issue"]:
         plan.auto_reason = AUTO_OFF
     elif run.origin_kind != "chat":
@@ -284,6 +245,68 @@ async def plan_issue(session: Any, run: Run | None, content: dict[str, Any] | No
         plan.auto_reason = AUTO_LEVEL
     elif retro:
         plan.auto_reason = AUTO_RETRO
+    return plan
+
+
+async def check_target(session: Any, plan: Plan, workflow: Any, *, principal: Any, source_run: str) -> Plan | None:
+    """按口径出具的那一版能不能发起（plan_issue 和召回待办的「按新版重新出具」共用，ledger/recall.reissue）：那一版已发布、
+    未退役；图里没有人工节点、不会写外部系统；入口字段的缺省值加上 plan.binding 过表单校验、能渲染进取数模板；使用者只能按
+    他有权使用的应用固定着的这一版（拍板 L5）；同一个来源（source_run）、同一版、同一组参数发起过的交回那一次；当天没超
+    上限。填好 plan 的 level、expect_hash、inputs、granted_by_app、existing；不能出具的写进 plan.refuse，交回 None。"""
+    from app.api.settings import ledger_settings
+    from app.apps import versions as app_versions
+    from app.apps.backfill import graph_side_effect
+    from app.apps.forms import input_schema, validate_form
+    from app.apps.resolve import input_key
+    from app.ledger.derive import entry_fields
+
+    workflow_id, version = plan.workflow_id, plan.version
+    if workflow is None:
+        plan.refuse(GONE, 404)
+        return None
+    row = await app_versions.version_row(session, workflow_id, int(version))
+    if row is None:
+        plan.refuse(VERSION_GONE.format(name=workflow.name, version=version), 404)
+        return None
+    if row.retired_at is not None:
+        plan.refuse(RETIRED.format(name=workflow.name, version=version))
+        return None
+    if not app_versions.is_published(row, current=workflow.published_version):
+        plan.refuse(UNPUBLISHED.format(name=workflow.name, version=version))
+        return None
+    plan.level = row.level or plan.level
+    plan.expect_hash = row.graph_hash
+    if reason := await graph_side_effect(session, row.graph, level=row.level):
+        plan.refuse(SIDE_EFFECT.format(name=workflow.name, version=version, reason=reason))
+        return None
+    fields = list(entry_fields(row.graph or {}))
+    values = {str(f["name"]): f.get("default") for f in fields if f.get("default") not in (None, "")}
+    values.update({k: v for k, v in plan.binding.items() if v not in (None, "")})
+    plan.inputs = values
+    if errors := validate_form(input_schema(fields), values):
+        plan.refuse(INPUTS.format(problems="；".join(e["message"] for e in errors)))
+        return None
+    # 参数运行时要渲染进口径的 SQL 模板：写在引号里的不能带引号、裸写的只能是数（ledger/compose 同一个判断）
+    from app.ledger.compose import slot_contexts, value_problem
+
+    contexts = slot_contexts([n for n in (row.graph or {}).get("nodes") or [] if n.get("type") == "tool"],
+                             strict=False)
+    if problem := next((p for k, v in values.items() if (p := value_problem(k, v, contexts.get(k, set())))), None):
+        plan.refuse(f"{problem}，不代填出具")
+        return None
+    if principal.mode != "off" and not principal.at_least("builder"):
+        plan.granted_by_app = await _granting_app(session, principal, workflow_id, int(version))
+        if plan.granted_by_app is None:
+            plan.refuse(ASK_BUILDER, 403, FORBIDDEN)
+            return None
+    key = input_key(values)
+    plan.existing = next((r.id for r in await issued_runs(session, source_run)
+                          if (r.workflow_id, r.version) == (workflow_id, int(version)) and r.status in _LIVE
+                          and input_key(r.input) == key), None)
+    settings = await ledger_settings(session)
+    if plan.existing is None and await issued_today(session) >= int(settings["issue_daily_limit"]):
+        plan.refuse(OVER_LIMIT.format(limit=settings["issue_daily_limit"]), 429, DAILY_LIMIT)
+        return None
     return plan
 
 
@@ -392,4 +415,4 @@ async def auto_issue(run_id: str) -> str | None:
 
 
 __all__ = ["AUTO_NOT_CHAT", "DAILY_LIMIT", "FORBIDDEN", "ORIGIN", "REFUSED", "IssueRefused", "Plan", "auto_issue",
-           "issue", "issued_runs", "issued_today", "issued_view", "plan_issue", "plans_for"]
+           "check_target", "issue", "issued_runs", "issued_today", "issued_view", "plan_issue", "plans_for"]

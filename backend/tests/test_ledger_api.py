@@ -233,11 +233,13 @@ async def test_stats_count_what_the_fixtures_did(client, monkeypatch):
     assert e1["with_candidates"] == 3 and e1["rates"]["proven"] == round(1 / 3, 4)
     assert e1["diff_aspects"]["filter"] == 1 and e1["labels"]["caliber"] == 1 and e1["labels"]["unknown"] == 1
     assert e1["whole_equivalent"] == 1
-    assert body["e2"]["launched"] == 0 and body["e2"]["feedback"]["available"] is False
+    assert body["e2"]["launched"] == 0 and body["e2"]["feedback"] == {"available": True, "useful": 0, "unclear": 0,
+                                                                    "runs": 0, "useful_rate": None}
     assert body["e3"]["chat_runs"] == 0 and body["e3"]["threshold"] == {"runs": 3, "conversations": 2}
     usage = {u["caliber"]: u for u in body["e4"]["usage"]}
     assert usage[f"{wf}@1"]["proven_runs"] == 1
-    assert body["e4"]["per_publish"]["available"] is False
+    # 召回（第 4 波）：这一段时间里没有发布新版本，没有召回
+    assert body["e4"]["per_publish"]["available"] is True and body["e4"]["per_publish"]["groups"] == 0
 
 
 async def test_stats_take_the_run_ids_the_caller_names(monkeypatch):

@@ -15,6 +15,9 @@
   时限，但调度不对它们做提醒、升级、超时驳回——试运行不该把待办推到真实的处理人、上级那里。
 - 个人应用提交审核（kind=review，N7）：没有 Approval、不恢复运行，挂在个人应用最近一次成功的刷新上；派给选定的搭建者
   或组。在待办里只能退回，同意要在共享副本上走发布单，发布完自动记为已发布（blueprints/personal.py）。
+- 口径召回（kind=recall，docs/design/next-round/02-口径账本.md 做法 7）：没有 Approval、不恢复运行。口径升版后数真变了的
+  挂在召回运行上，派给答案的主人（开登录时每人一条，关登录时任何人）；动作「按新版重新出具」（走按口径出具同一套判法）
+  和「知道了」。答案依据的目录、表结构变了的另两种只有「知道了」。开、收尾、内容都在 app/ledger/recall.py。
 """
 from __future__ import annotations
 
@@ -159,6 +162,29 @@ async def open_review(session: AsyncSession, *, run: Run, app_id: str, blueprint
         targets += await _expand(session, task, kind, name, REVIEW_KIND)
     for kind, name, source in dict.fromkeys(targets):
         session.add(TaskAssignment(task_id=task.id, principal_kind=kind, principal=name, source=source))
+    await session.flush()
+    return task
+
+
+#: 口径召回的待办（app/ledger/recall.py）。没有 Approval，按 correlation_key（来由:运行[:附加]:派给的种类:名字）认同一条
+RECALL_KIND = "recall"
+#: recall 待办的两种决定：按新版重新出具、知道了（目录、表结构那两种只有「知道了」）
+RECALL_DECISIONS = ("reissue", "ack")
+
+
+async def open_recall(session: AsyncSession, *, run: Run, title: str, owner: tuple[str, str],
+                      correlation_key: str) -> Task:
+    """开一条 recall 待办（挂在 run 上），派给 owner：人、组（在这一刻展开成成员，同改派）、任何人；来源记 recall。调用方
+    提交，提交后 announce。"""
+    task = Task(run_id=run.id, node_id=None, app_id=None, app_version=None, kind=RECALL_KIND, title=title[:300],
+                policy={"kind": "any"}, correlation_key=correlation_key[:200])
+    session.add(task)
+    await session.flush()
+    kind, name = owner
+    targets = await _expand(session, task, kind, name, RECALL_KIND) if kind in ("user", "group") and name \
+        else [("anyone", "", RECALL_KIND)]
+    for k, n, source in dict.fromkeys(targets):
+        session.add(TaskAssignment(task_id=task.id, principal_kind=k, principal=n, source=source))
     await session.flush()
     return task
 
@@ -327,8 +353,15 @@ async def announce(task_id: str, event: EventType = EventType.TASK_OPENED) -> No
         return
     from app.notify.service import spawn
 
+    users = [a.principal for a in rows.get(task_id, []) if a.principal_kind == "user"]
+    if task.kind == RECALL_KIND:
+        # 口径召回：口径升版、数变了的推 ledger.recall，订阅了 task.opened 的渠道另推一条（同一个渠道只推一次）
+        from app.notify.service import notify_recall
+
+        spawn(notify_recall(task_id, users))
+        return
     # 推送放到后台：接收端挂住时超时加重试要几十秒，不能让运行停在「执行中」等它
-    spawn(_notify(task_id, "task.opened", [a.principal for a in rows.get(task_id, []) if a.principal_kind == "user"]))
+    spawn(_notify(task_id, "task.opened", users))
 
 
 # --------------------------------------------------------------------------
@@ -542,6 +575,8 @@ async def respond(task_id: str, principal: Any, *, decision: Any, values: dict[s
             return await _respond_reconcile(session, task, principal, decision, values, note)
         if task.kind == REVIEW_KIND:
             return await _respond_review(session, task, principal, decision, note)
+        if task.kind == RECALL_KIND:
+            return await _respond_recall(session, task, principal, decision, note)
         if task.status != "pending":
             raise TaskRefused(_closed(task.status))
         if inquiry_busy(task.run_id):
@@ -666,6 +701,54 @@ async def _respond_review(session: AsyncSession, task: Task, principal: Any, dec
     from app.blueprints.personal import reject_review
 
     await reject_review(task_id, principal, note=note)
+    return {"task": await detail(task_id, principal), "resolved": True, "run": await _run(run_id)}
+
+
+async def _respond_recall(session: AsyncSession, task: Task, principal: Any, decision: Any,
+                          note: str | None) -> dict[str, Any]:
+    """recall 待办：「按新版重新出具」（app/ledger/recall.reissue，走按口径出具同一套判法；不能出具照实拒绝，待办留着）或
+    「知道了」。处理完记成已处理（条件 UPDATE，同 close_review），结论和出具的那次正式运行写进 outcome，另记一条审计：运行
+    已经封存，事件记不进去。"""
+    if task.status != "pending":
+        raise TaskRefused(_closed(task.status))
+    reason = (task.correlation_key or "").split(":", 1)[0]
+    allowed = RECALL_DECISIONS if reason == "caliber" else ("ack",)
+    if decision not in allowed:
+        raise TaskRefused("这条待办只能「按新版重新出具」或「知道了」" if reason == "caliber"
+                          else "这条待办只能「知道了」", status_code=422, code="task_decision_invalid")
+    rows = (await _assignments(session, [task.id])).get(task.id, [])
+    mine_id = _pick(task, rows, principal).id
+    task_id, run_id = task.id, task.run_id
+    await session.rollback()
+    outcome: dict[str, Any] = {"decision": decision, "note": (note or "").strip()[:2000]}
+    issued: Any = None
+    if decision == "reissue":
+        from app.ledger import recall
+
+        try:
+            issued = await recall.reissue(task_id, principal)
+        except recall.RecallRefused as e:
+            raise TaskRefused(e.message, status_code=e.status_code, code=e.code) from e
+        outcome["issued_run"] = issued.id
+    async with SessionLocal() as session:
+        now = utcnow()
+        claimed = await session.execute(
+            update(Task).where(Task.id == task_id, Task.status == "pending")
+            .values(status="resolved", resolved_by=principal.username, resolved_at=now, outcome=outcome))
+        if claimed.rowcount != 1:
+            await session.rollback()
+            raise TaskRefused(_closed("resolved"))
+        await session.execute(update(TaskAssignment).where(TaskAssignment.id == mine_id).values(
+            status="responded", responded_by=principal.username, responded_at=now, verified=bool(principal.verified),
+            response={"decision": decision, "note": outcome["note"]}))
+        await session.execute(update(TaskAssignment).where(TaskAssignment.task_id == task_id,
+                                                           TaskAssignment.status == "pending")
+                              .values(status="withdrawn"))
+        session.add(AuditEvent(actor=principal.username, verified=bool(principal.verified),
+                               action=f"ledger.recall.{decision}", subject_kind="task", subject_id=task_id,
+                               data={"run_id": run_id, **({"issued_run": issued.id} if issued is not None else {}),
+                                     **key_trace(principal)}))
+        await session.commit()
     return {"task": await detail(task_id, principal), "resolved": True, "run": await _run(run_id)}
 
 
@@ -1102,6 +1185,10 @@ async def _describe(session: AsyncSession, tasks: list[Task], principal: Any) ->
             from app.blueprints.personal import review_payload
 
             payload = await review_payload(session, task)
+        elif task.kind == RECALL_KIND:
+            from app.ledger.recall import task_payload
+
+            payload = await task_payload(session, task, principal)
         run = runs.get(task.run_id)
         out.append({
             "id": task.id, "approval_id": task.approval_id, "run_id": task.run_id, "node_id": task.node_id,

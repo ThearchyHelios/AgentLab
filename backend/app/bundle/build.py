@@ -1184,6 +1184,23 @@ def _summary(etype: str, data: Any) -> str:
                                                           ("none", "没有相关口径"), ("skipped", "没有比完"))
                  if isinstance(counts.get(k), int) and counts[k]]
         return "封存后比对已发布口径" + (f"：{'、'.join(parts)}" if parts else "")
+    if etype == EventType.LEDGER_RECALLED:
+        # 口径召回（next-round 02 做法 7）：只说按哪一版核对、数变没变，不带新旧值和差值
+        to = data.get("to_version")
+        head = f"已按 v{to} 核对" if isinstance(to, int) else "口径召回核对"
+        changed = data.get("changed")
+        return head + ("：数变了" if changed is True else "，不影响" if changed is False else "")
+    if etype == EventType.LEDGER_BASIS_CHANGED:
+        # 答案依据的目录事实、表结构变了：只说哪一类、几项，不带表名、列名、取值
+        kind = {"catalog": "目录事实", "structure": "表结构", "values": "取值", "catalog_edit": "目录"}.get(
+            str(data.get("kind") or ""), "")
+        items = data.get("items")
+        count = len(items) if isinstance(items, list) else 0
+        return f"依据的{kind or '东西'}有变" + (f"（{count} 项）" if count else "")
+    if etype == EventType.LEDGER_FEEDBACK:
+        # 对账结果上的反馈（next-round 02 做法 10）：只说是哪一种，不带谁给的
+        verdict = {"useful": "说明有用", "unclear": "看不懂"}.get(str(data.get("verdict") or ""))
+        return f"反馈：{verdict}" if verdict else "对账说明的反馈"
     if etype == EventType.LOG and isinstance(data.get("message"), str):
         return _clip(data["message"])
     return ""

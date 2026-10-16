@@ -17,6 +17,7 @@ import {
   publishedLevelOf,
 } from '../lib/terms'
 import { VersionUsageLine, useVersionUsage } from './versionUsage'
+import { RecallPreviewRow } from './RecallPanel'
 import { newAppPath } from '../pages/apps/shared'
 import { isSqlCheckCode, sqlRuleLabel } from '../lib/sqlcheck'
 import { SqlLevelBadge } from '../run/SqlChecks'
@@ -254,6 +255,10 @@ export function PublishDialog({ workflow, onClose, onDone, onLocate }: {
               <VersionUsageLine usage={usage} />
             </dd>
           </div>
+        )}
+        {/* 口径召回的预告（next-round 02 做法 7）：发布新版本之后用过旧版本的答案按参数分组重算，规模先摆出来 */}
+        {published != null && published !== workflow.version && (
+          <RecallPreviewRow workflowId={workflow.id} version={workflow.version} />
         )}
         <div className="flex items-start gap-2" data-publish-signer={signer.verified ? 'verified' : actor ? 'actor' : 'unsigned'}>
           <dt className="w-14 shrink-0 pt-px text-faint">{signer.verified ? '发布人' : '署名'}</dt>

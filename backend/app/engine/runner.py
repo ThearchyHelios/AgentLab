@@ -133,15 +133,20 @@ class RunManager:
         # 口径账本：最近几天封存了、一次都没比过的探索运行，在后台补比一次（ledger/match.py）。只读工件和版本表，不查业务库、
         # 不调模型；和调度循环同一个开关，拷来的数据目录、测试不补
         from app.ledger import match as ledger_match
+        from app.ledger import recall as ledger_recall
 
         ledger_match.start_backfill()
+        # 口径召回（ledger/recall.py）：最近发布、自动那一批没发完的接着发，结束了还没收尾的召回运行补上收尾。同一个开关
+        ledger_recall.start_resume()
 
     async def shutdown(self) -> None:
         self._closing = True
-        # 后台的口径比对先停：没做完的不记，下次启动补比会再比
+        # 后台的口径比对、召回先停：没做完的不记，下次启动补比、接着召回会再做
         from app.ledger import match as ledger_match
+        from app.ledger import recall as ledger_recall
 
         await ledger_match.shutdown()
+        await ledger_recall.shutdown()
         # 只等还没结束的：结束了的没什么可等，而且它可能属于另一个事件循环，
         # gather 会直接抛 "future belongs to a different loop"
         pending = [t for t in self._tasks.values() if not t.done()]
@@ -1084,6 +1089,11 @@ class RunManager:
 
             if ledger_match.wanted(run_class, origin_kind):
                 ledger_match.schedule(run_id)
+        if origin_kind == "recall" and status in ("succeeded", "failed", "cancelled"):
+            # 口径召回运行结束、封存完（ledger/recall.py）：在后台收尾——数变了开 recall 待办，没变的在原答案上记账
+            from app.ledger import recall as ledger_recall
+
+            ledger_recall.schedule_settle(run_id)
 
     async def _seal(self, run_id: str) -> None:
         """对到此为止的全部事件算清单哈希，记下封到了哪一条。"""

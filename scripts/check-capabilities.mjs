@@ -332,7 +332,7 @@ await section('设置：身份、通知、审计', async () => {
 
 await section('设置 → 通知：可订阅的事件照服务端登记列（总方案 X6）', async () => {
   // 列表从真后端的 GET /api/notify/events 来（GET 放行）：这种范围的渠道收得到的才列；从来推不到的（以前列着、一勾就 422
-  // 的「待办升级」「动作已生效」……）和登记了还没推送的（召回、待办汇总……）都不列
+  // 的「待办升级」「动作已生效」……）和登记了还没推送的（数据源变化……）都不列
   const { page, errors } = await open('/settings/notify')
   await page.getByRole('button', { name: '添加渠道' }).first().click()
   const dlg = page.locator('[role="dialog"]')
@@ -343,21 +343,23 @@ await section('设置 → 通知：可订阅的事件照服务端登记列（总
   }
   const every = ['task.opened', 'run.finished', 'run.failed', 'action.unknown']
   // 第 3 波起：定时评测的两个事件只推全局渠道（评测是搭建者们共用的一把尺，不归哪个人；服务端 notify/service.notify_eval）；
-  // 访问密钥快到期推给全局渠道（服务账号的密钥）和个人渠道（个人密钥），每天的待办汇总只推个人渠道
+  // 访问密钥快到期推给全局渠道（服务账号的密钥）和个人渠道（个人密钥），每天的待办汇总只推个人渠道。第 4 波：口径召回
+  // 数变了的推全局渠道和答案主人的个人渠道（notify_recall），不归哪个应用
   check('全局渠道：推给全局渠道的几项', await waitFor(page, async () => await dlg.locator('[data-notify-events="global"]').count() === 1)
-    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done', 'eval.regressed', 'eval.failed', 'key.expiring']),
+    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done', 'ledger.recall', 'eval.regressed', 'eval.failed',
+      'key.expiring']),
     JSON.stringify(await listed()))
   const text = await dlg.innerText()
   // 只推定时发起的评测：叫法照实带「定时」，勾上的人不会以为手动发起的那次也推
   check('评测的两个事件照实说是定时的', ['定时评测有退步', '定时评测没有评完'].every((t) => text.includes(t)), text)
   check('从来推不到的不列', !['待办升级', '待办超时', '待办处理完', '动作失败', '动作已生效'].some((t) => text.includes(t)), text)
-  check('登记了还没推送的不列', !['数据源有变化要处理', '口径升版，答案的数变了']
+  check('登记了还没推送的不列', !['数据源有变化要处理']
     .some((t) => text.includes(t)), text)
   check('只推个人渠道的「每天的待办汇总」全局渠道不列', !text.includes('每天的待办汇总'), text)
-  check('应用的渠道：不列只发给提交人的「我提交审核的应用有结果」', await scope('app')
+  check('应用的渠道：不列只发给提交人的「我提交审核的应用有结果」，也不列口径召回', await scope('app')
     && JSON.stringify(await listed()) === JSON.stringify(every), JSON.stringify(await listed()))
   check('个人渠道：连同待办汇总、密钥快到期都列', await scope('user')
-    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done', 'task.digest', 'key.expiring']),
+    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done', 'ledger.recall', 'task.digest', 'key.expiring']),
     JSON.stringify(await listed()))
   check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
 })

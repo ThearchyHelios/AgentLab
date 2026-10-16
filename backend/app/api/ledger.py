@@ -10,8 +10,13 @@
 - POST /api/ledger/answers/{run_id}/issue（answers_router，登录即可，第 3 波）：按口径正式出具（app/ledger/issue.py，拍板
   L1、L5：参数只从比对工件取，使用者只能按他有权使用的应用固定着的版本出具）；
 - POST /api/ledger/answers/{run_id}/reconcile（同上）：口径对账，点开才跑一次确定性派生的只读图（app/ledger/reconcile.py）；
+- POST /api/ledger/answers/{run_id}/reconcile/{reconcile_id}/feedback（同上，第 4 波）：对账结果上的「说明有用 / 看不懂」
+  （app/ledger/feedback.py，统计 E2）；
 - GET /api/ledger/certify-queue、POST /api/ledger/certify-queue/dismiss（router，搭建者，第 3 波）：可沉淀的问题、「不是口径」
-  （app/ledger/certify.py）。这几个新接口都不放给访问密钥（auth/keys.KEY_ROUTES 不登记）。
+  （app/ledger/certify.py）。
+- GET /api/ledger/recall/{workflow_id}/{version}、POST …/continue（router，搭建者，第 4 波）：口径升到这一版之后的召回批次——
+  每组的结论、「另有 M 组未重算」、手动接着算（app/ledger/recall.py）。版本用量（workflow-versions）另加问数回答、导出、召回。
+这几个新接口都不放给访问密钥（auth/keys.KEY_ROUTES 不登记）。
 """
 from __future__ import annotations
 
@@ -24,7 +29,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.base import get_session
+from app.db.base import SessionLocal, get_session
 from app.db.models import Workflow
 from app.db.models_process import ActionRecord
 
@@ -40,12 +45,18 @@ answers_router = APIRouter(prefix="/api/ledger/answers", tags=["ledger"])
 @router.get("/workflow-versions/{workflow_id}/{version}")
 async def workflow_version(workflow_id: str, version: int, session: AsyncSession = Depends(get_session)
                            ) -> dict[str, Any]:
-    """一个工作流版本被哪些应用固定、生效记录数、正式运行数。"""
+    """一个工作流版本被哪些应用固定、生效记录数、正式运行数；另加口径账本的用量（next-round 02 做法 8）：被几次问数回答用过
+    （answers：比对里等价已证明的探索运行）、导出过几次（exports：这些答案和这一版的正式运行上的报告导出审计）、定时任务几个、
+    召回（recall：以这一版为新版本召回过几组、其中数变了几组，作为旧版本被召回过几组）。"""
     from app.apps.versions import usage
+    from app.ledger.uses import version_usage
 
     if await session.get(Workflow, workflow_id) is None:
         raise HTTPException(404, "工作流不存在，可能已被删除")
-    return await usage(session, workflow_id, version)
+    base = await usage(session, workflow_id, version)
+    extra = await version_usage(session, workflow_id, version)
+    return {**base, "answers": extra["answers"], "exports": extra["exports"], "schedules": extra["schedules"],
+            "recall": extra["recall"]}
 
 
 def effect_row(r: ActionRecord, *, receipt: bool = True) -> dict[str, Any]:
@@ -161,6 +172,60 @@ async def reconcile_answer(run_id: str, payload: ReconcileIn) -> dict[str, Any]:
     except ledger_reconcile.ReconcileRefused as e:
         raise CodedHTTPException(e.status_code, e.message, e.code) from e
     return {"run_id": run.id, "reconciled": ledger_reconcile.reconciled_view(run)}
+
+
+class FeedbackIn(BaseModel):
+    """对账结果上的反馈：说明有用（useful）还是看不懂（unclear）。"""
+
+    verdict: str = Field(min_length=1, max_length=20)
+
+
+@answers_router.post("/{run_id}/reconcile/{reconcile_id}/feedback")
+async def reconcile_feedback(run_id: str, reconcile_id: str, payload: FeedbackIn) -> dict[str, Any]:
+    """对账结果上的「说明有用 / 看不懂」（app/ledger/feedback.py，统计 E2）：记成对账运行上的封存后事件，同一个人改主意只算
+    最后一次。交回这次对账现在的反馈 {mine, useful, unclear}。不认的反馈 422；不是这个答案的对账 404；读不了这个答案 403；
+    对账还没跑完 409。"""
+    from app.api.coded import CodedHTTPException
+    from app.api.deps import current_principal
+    from app.ledger import feedback
+
+    try:
+        out = await feedback.give(run_id, reconcile_id, payload.verdict, principal=current_principal())
+    except feedback.FeedbackRefused as e:
+        raise CodedHTTPException(e.status_code, e.message, e.code) from e
+    return {"run_id": reconcile_id, "feedback": out}
+
+
+@router.get("/recall/{workflow_id}/{version}")
+async def recall_batches(workflow_id: str, version: int, session: AsyncSession = Depends(get_session)
+                         ) -> dict[str, Any]:
+    """口径升到这一版之后的召回（app/ledger/recall.batches）：每组（旧版本、参数）的结论——数变了 / 没变 / 无法重算：原因 /
+    重算失败 / 还在算 / 未重算——和「另有 M 组未重算」、能不能接着算。计划从已有的召回运行现算，不另存。"""
+    from app.ledger import recall
+
+    if await session.get(Workflow, workflow_id) is None:
+        raise HTTPException(404, "工作流不存在，可能已被删除")
+    return await recall.batches(session, workflow_id, version)
+
+
+@router.post("/recall/{workflow_id}/{version}/continue")
+async def recall_continue(workflow_id: str, version: int, session: AsyncSession = Depends(get_session)
+                          ) -> dict[str, Any]:
+    """接着算：把还没重算的组再发起一批（每批 recall_limit 组，上限是 0 时按缺省的组数），交回发起了的召回运行和新的批次
+    情况。都算过了的、这一版已经不是当前发布版的（之后又发布了更新的版本）回 409，detail 写为什么。"""
+    from app.api.coded import CodedHTTPException
+    from app.api.deps import current_principal
+    from app.ledger import recall
+
+    if await session.get(Workflow, workflow_id) is None:
+        raise HTTPException(404, "工作流不存在，可能已被删除")
+    current = await recall.batches(session, workflow_id, version)
+    if not current["can_continue"]:
+        raise CodedHTTPException(409, current.get("continue_reason") or "没有还没重算的组", recall.REFUSED)
+    launched = await recall.launch(workflow_id, version, batch="manual", actor=current_principal().username)
+    async with SessionLocal() as fresh:
+        view = await recall.batches(fresh, workflow_id, version)
+    return {"launched": launched, **view}
 
 
 @router.get("/certify-queue")

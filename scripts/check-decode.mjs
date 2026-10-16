@@ -1888,6 +1888,74 @@ await section('口径账本：封存后比对已发布口径（ledger.matched）
   check('不改相位：运行照旧是结束了', phase.phase === 'succeeded', phase.phase)
 })
 
+await section('口径召回：封存后的核对结论与依据有变（ledger.recalled、ledger.basis_changed）', async () => {
+  // next-round 02 做法 7：口径发布新版本后召回运行在同一份数据上重算两版，数没变的在原答案上记「已按 vN 核对，不影响」，
+  // 召回运行自己记结论；目录事实被驳回或修改、表结构变了的在答案上记「依据有变」。都在封存之后，事件里不带数
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const base = [E(1, 'run.started', null, {}), E(2, 'node.started', 'q', { node_type: 'tool' }), E(3, 'node.finished', 'q', {}),
+    E(4, 'run.finished', null, { status: 'succeeded' })]
+  const run = (...more) => flatten(mod.decodeRun([...base, ...more]))
+  const answer = run(E(5, 'ledger.recalled', null, { role: 'answer', changed: false, recall_run: 'rc-1', workflow_id: 'wf-week',
+    from_version: 1, to_version: 2, post_seal: true }))
+  check('认得它们：不是「未识别的事件」', !answer.some((s) => s.title === '未识别的事件'))
+  const ok = answer.find((s) => s.code === 'ledger_recalled')
+  check('原答案上：已按 v2 核对，不影响；写明封存后追加', ok?.title === '已按 v2 核对，不影响'
+    && ok?.sub === '封存后追加，不在封存范围内' && ok?.level === 'info' && ok?.kind === 'note', `${ok?.title} / ${ok?.sub}`)
+  const changed = run(E(5, 'ledger.recalled', null, { role: 'recall', outcome: 'changed', changed: true, from_version: 1,
+    to_version: 2, answers: 2, tasks: ['t1', 't2'], metrics: [{ k: 0, name: '销售额', changed: true }] }))
+    .find((s) => s.code === 'ledger_recalled')
+  check('召回运行上：数变了是提醒，写开了几条待办，不带数', changed?.title === '召回核对（v1 → v2）：数变了'
+    && changed?.level === 'warn' && changed?.meta === '开了 2 条待办' && !/\d+\.\d/.test(`${changed?.title}${changed?.detail ?? ''}`),
+    `${changed?.title} / ${changed?.meta}`)
+  const same = run(E(5, 'ledger.recalled', null, { role: 'recall', outcome: 'unchanged', changed: false, from_version: 1, to_version: 2 }))
+    .find((s) => s.code === 'ledger_recalled')
+  check('……数没变的是一般说明', same?.title === '召回核对（v1 → v2）：数没变' && same?.level === 'info', same?.title)
+  const failedRun = run(E(5, 'ledger.recalled', null, { role: 'recall', outcome: 'failed', changed: null, error: '数据源已停用' }))
+    .find((s) => s.code === 'ledger_recalled')
+  check('……重算失败照实写原因', failedRun?.title === '召回重算失败' && failedRun?.detail === '数据源已停用' && failedRun?.level === 'warn',
+    `${failedRun?.title} / ${failedRun?.detail}`)
+  const probe = run(E(5, 'ledger.recalled', null, { role: 'recall', probe: true, outcome: 'failed', error: 'no such column' }))
+    .find((s) => s.code === 'ledger_recalled')
+  check('表结构变了之后的口径试算：没有算出来', probe?.title === '表结构变了之后试算口径：没有算出来', probe?.title)
+  const basis = run(E(5, 'ledger.basis_changed', null, { kind: 'catalog', source: 'shop', table: 'orders',
+    items: [{ path: 'columns.amount.measure', label: '列 amount 的度量类型', change: 'changed' }], new_errors: 1 }))
+    .find((s) => s.code === 'ledger_basis_changed')
+  check('目录事实被改：依据有变，列出哪几项、新出现几条错误级问题', basis?.title === '依据有变：数据目录里影响数字的项被驳回或修改'
+    && basis?.meta === 'shop · orders' && basis?.detail === '列 amount 的度量类型\n按新目录检查新出现 1 条错误级问题'
+    && basis?.level === 'warn', `${basis?.title} / ${basis?.detail}`)
+  const structure = run(E(5, 'ledger.basis_changed', null, { kind: 'structure', table: 'orders', column: 'amount', items: [] }))
+    .find((s) => s.code === 'ledger_basis_changed')
+  check('表结构变了：依据的表结构已变', structure?.title === '依据的表结构已变' && structure?.level === 'warn', structure?.title)
+  const odd = run(E(5, 'ledger.recalled', null, {}), E(6, 'ledger.basis_changed', null, { kind: 'x', items: 'y' }))
+  check('缺字段：不出 undefined、不瞎填数，认不出的结论和种类不猜', !odd.some((s) => /undefined|NaN/.test(`${s.title}${s.sub ?? ''}${s.detail ?? ''}${s.meta ?? ''}`))
+    && odd.some((s) => s.title === '口径召回核对') && odd.some((s) => s.title === '答案的依据有变'),
+    odd.map((s) => s.title).join(' | '))
+  const phase = [E(4, 'run.finished', null, {}), E(5, 'ledger.recalled', null, {}), E(6, 'ledger.basis_changed', null, {})]
+    .reduce((s, ev) => mod.nextPhase(s, ev), { phase: 'running', awaiting: false })
+  check('不改相位：运行照旧是结束了', phase.phase === 'succeeded', phase.phase)
+})
+
+await section('对账结果的反馈：说明有用 / 看不懂（ledger.feedback）', async () => {
+  // next-round 02 做法 10 的 E2：对账结果卡片上的反馈记成对账运行上的封存后事件（服务端 ledger/feedback），时间线一条一行
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: 1790000000 + seq, data })
+  const base = [E(1, 'run.started', null, {}), E(2, 'node.started', 'reconcile', { node_type: 'metrics' }),
+    E(3, 'node.finished', 'reconcile', {}), E(4, 'run.finished', null, { status: 'succeeded' })]
+  const steps = flatten(mod.decodeRun([...base,
+    E(5, 'ledger.feedback', null, { verdict: 'useful', by: '分析员甲', verified: true, source_run: 'run-a', post_seal: true }),
+    E(6, 'ledger.feedback', null, { verdict: 'unclear', by: null, post_seal: true }),
+    E(7, 'ledger.feedback', null, { verdict: 'great' })]))
+  const lines = steps.filter((s) => s.code === 'ledger_feedback')
+  check('认得它：不是「未识别的事件」，一条一行', !steps.some((s) => s.title === '未识别的事件') && lines.length === 3,
+    steps.map((s) => s.title).join(' | '))
+  check('写谁给了哪一种反馈、封存后追加', lines[0]?.title === '分析员甲 反馈：说明有用' && lines[0]?.sub === '封存后追加，不在封存范围内'
+    && lines[0]?.kind === 'note' && lines[0]?.level === 'info', `${lines[0]?.title} / ${lines[0]?.sub}`)
+  check('没署名的不写名字', lines[1]?.title === '反馈：看不懂', lines[1]?.title)
+  check('认不出的反馈不猜', lines[2]?.title === '对账说明的反馈', lines[2]?.title)
+  const phase = [E(4, 'run.finished', null, {}), E(5, 'ledger.feedback', null, { verdict: 'useful' })]
+    .reduce((s, ev) => mod.nextPhase(s, ev), { phase: 'running', awaiting: false })
+  check('不改相位：运行照旧是结束了', phase.phase === 'succeeded', phase.phase)
+})
+
 await section('口径账本：问数据的助手选用已发布口径（use_caliber 操作）', async () => {
   // next-round 02 做法 4：取数节点和口径卡由服务端按那一版生成（ledger/compose.py），不另转 add_node。过程里一行说清选用了
   // 哪一版、生成了几个节点；拒收的照实写原因（同样交回了模型去改）

@@ -6,7 +6,11 @@ ledger 键、报告导出的片段面板，三处读同一份比对工件、按�
 
 界面层不放逻辑：标签、整题判断、能做的动作都由这里给。actions（第 3 波）：整题等价时按那份口径正式出具（能不能、能不能
 自动、不能的原因，ledger/issue.plan_issue，按看的这个人的权限判）；有相关口径的查询看差多少（口径对账，ledger/reconcile）。
-issued 是这次运行按口径出具过的正式运行，reconciled 是对过的账（各自的运行、状态）。
+issued 是这次运行按口径出具过的正式运行，reconciled 是对过的账（各自的运行、状态，第 4 波起带上结果上的「说明有用 /
+看不懂」：看的这个人给过的、各几个，ledger/feedback）。
+
+recall（第 4 波，ledger/recall.answer_marks）：这个答案身上的召回标记——「已按 vN 核对，不影响」（checked）、依据有变
+（basis）、看的这个人手上说的是它的 recall 待办（tasks）。几种状态都带：没比对过、不比对的答案照样可能被标依据有变。
 """
 from __future__ import annotations
 
@@ -108,11 +112,16 @@ async def run_view(run_id: str) -> dict[str, Any]:
     from app.api.coded import CodedHTTPException
     from app.api.evidence import RUN_NOT_FOUND, _sealed
 
+    from app.api.deps import current_principal
+    from app.ledger.recall import answer_marks
+
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
-    if run is None:
-        raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND)
-    base: dict[str, Any] = {"run_id": run_id, "note": ledger_labels.POST_SEAL_NOTE}
+        if run is None:
+            raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND)
+        principal = current_principal()
+        marks = await answer_marks(session, run_id, principal)
+    base: dict[str, Any] = {"run_id": run_id, "note": ledger_labels.POST_SEAL_NOTE, "recall": marks}
     recorded = await store.latest(run_id)
     if recorded is None:
         why = ledger_match.ineligible(run)
@@ -125,7 +134,7 @@ async def run_view(run_id: str) -> dict[str, Any]:
         return {**base, "state": "pending"}
     if recorded.content is None:
         return {**base, "state": "unreadable", "reason": recorded.problem, **_stamp(recorded)}
-    from app.api.deps import current_principal
+    from app.ledger import feedback as ledger_feedback
     from app.ledger import issue as ledger_issue
     from app.ledger import reconcile as ledger_reconcile
 
@@ -133,12 +142,14 @@ async def run_view(run_id: str) -> dict[str, Any]:
     sealed = await _sealed(run_id)
     hider = await _hider(sealed)
     names = await _names(_workflow_ids(content))
-    principal = current_principal()
     plans = await ledger_issue.plans_for(run_id, content, principal=principal, hide=hider.hide,
                                          artifact=recorded.artifact, retro=recorded.retro)
     async with SessionLocal() as session:
         issued = [ledger_issue.issued_view(r) for r in await ledger_issue.issued_runs(session, run_id)]
         reconciled = [ledger_reconcile.reconciled_view(r) for r in await ledger_reconcile.reconciled_runs(session, run_id)]
+        # 对账结果上的「说明有用 / 看不懂」（ledger/feedback）：看的这个人给过哪一个、各几个
+        votes = await ledger_feedback.feedback_of(session, [r["run_id"] for r in reconciled], principal)
+        reconciled = [{**r, "feedback": votes[r["run_id"]]} for r in reconciled]
     return {
         **base, "state": "matched", **_stamp(recorded),
         "calibers": [{**{k: c.get(k) for k in ("caliber", "workflow_id", "version", "level", "graph_hash")},

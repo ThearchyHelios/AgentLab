@@ -1222,7 +1222,10 @@ function watchTasks(go: Go): () => void {
           title: `${TASK_NOTIFY_TEXT.title}${t.title || TASK_NOTIFY_TEXT.untitled}`,
           body: [owner, t.node_label].filter(Boolean).join(' · ') || undefined,
           tag: `task:${t.id}`,
-          onClick: () => go(t.app_id ? `/apps/inbox/${encodeURIComponent(t.id)}` : `/runs/${t.run_id}`),
+          // 应用里的待办、口径召回（挂在召回运行上，记录页里没有这张卡）、使用者（进不了记录页）都去待办页；
+          // 搭建者的别的待办去那次运行
+          onClick: () => go(t.app_id || t.kind === 'recall' || !builder
+            ? `/apps/inbox/${encodeURIComponent(t.id)}` : `/runs/${t.run_id}`),
         })
       }
     } catch {
