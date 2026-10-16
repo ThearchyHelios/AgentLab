@@ -4,7 +4,7 @@
 - 页面、/api 的响应（连同登录检查自己回的 401）都带 nosniff、Referrer-Policy 和 CSP frame-ancestors；
 - frame-ancestors 缺省 'self'，只有 'self' 时另加 X-Frame-Options: SAMEORIGIN；配了 AGENTLAB_FRAME_ANCESTORS 白名单时
   以 CSP 为准、不发 XFO（XFO 写不了白名单，两个都发的话老浏览器按 XFO 把白名单里的门户也拦了）；
-- 分享页 /s 用 AGENTLAB_EMBED_ORIGINS、Referrer-Policy: no-referrer（路由第 3 波才加，头的规则先守住）；
+- 分享页 /s 用 AGENTLAB_EMBED_ORIGINS、Referrer-Policy: no-referrer（真实页面托管下的头另见 test_shares.py）；
 - 严格的 script-src 只发 Content-Security-Policy-Report-Only，只在页面（index.html）上发，哈希就是构建产物里内联
   脚本的 sha256；接口返回的 HTML（导出的报告自带 meta CSP）不带它；
 - 接口自己设过的同名头不覆盖、不重复；WebSocket 不经过它；
