@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { ApiError, api, streamCopilot, streamRun } from '../api/client'
 import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
 import { copilotContext, copilotLook, decodeRun, looksOf } from '../run/decode'
-import { CHAT_BLUEPRINT_TEXT, LOOK_TEXT } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT, LOOK_TEXT, REJECTED_TEXT } from '../lib/terms'
 import type { LookEvent } from '../typesApp'
 import { errorMessage, humanizeError, isNetworkError } from '../lib/errors'
 import { guardReview, hasEvidence } from '../lib/evidence'
@@ -87,6 +87,11 @@ export interface Failure {
   fixFirst?: true
 }
 
+/** 被驳回的那一句：事件流里来的按 run.cancelled 的谁、哪一步、备注拼（REJECTED_TEXT.sub）；核对状态时只有报错原文 */
+export interface Rejected {
+  sub: string
+}
+
 /** 限定这一问只查哪些数据源。名字跟着存：库删了之后，这一轮查的是谁还得说得出来 */
 export interface ScopeSource {
   id: string
@@ -101,7 +106,8 @@ export interface ScopeSource {
  */
 export interface Attempt {
   n: number
-  outcome: 'failed' | 'cancelled' | 'suspended' | 'unusable' | 'partial' | 'done'
+  /** rejected：那一次的运行被人驳回结束（不是手动停止，也不是故障）。老的留档里被驳回的那次记的是 cancelled，不改写 */
+  outcome: 'failed' | 'cancelled' | 'rejected' | 'suspended' | 'unusable' | 'partial' | 'done'
   summary: string
   detail?: string
   runId?: string | null
@@ -127,6 +133,8 @@ export interface TurnMeta {
   issuance?: Record<string, any>
   noQuery?: boolean
   outcome?: 'cancelled' | 'suspended'
+  /** 运行被人驳回结束（outcome 是 cancelled）：副标题那一句，刷新之后照样写「被驳回」，不退回成「你已停止本轮」 */
+  rejected?: Rejected
   failure?: Failure
   attempts?: Attempt[]
   /** 这一轮从开问到交付的墙钟毫秒 */
@@ -206,6 +214,11 @@ export interface ChatTurn {
   /** 一行错误文案（兼容老数据和流式头部）。结构化的在 failure 里 */
   error: string
   failure?: Failure | null
+  /**
+   * 这一轮的运行被人驳回结束（服务端 cancelled + end_reason=rejected，05-已知遗留 (a)）。phase 照旧是 cancelled（不是故障、
+   * 不给继续运行），说法另写「被驳回」和谁、在哪一步、备注
+   */
+  rejected?: Rejected | null
   startedAt: number
   /** 交付、失败、取消或中断的时刻。计时器停在这里 */
   endedAt?: number
@@ -468,6 +481,7 @@ function buildMeta(t: ChatTurn): TurnMeta {
     issuance: slimIssuance(t.output?._issuance ?? t.rawOutput?._issuance) ?? t.meta?.issuance,
     noQuery: t.noQuery || undefined,
     outcome: t.phase === 'cancelled' ? 'cancelled' : t.phase === 'suspended' ? 'suspended' : undefined,
+    rejected: t.phase === 'cancelled' && t.rejected ? t.rejected : undefined,
     failure: t.failure ?? undefined,
     attempts: t.attempts?.length ? t.attempts : undefined,
     ms: t.endedAt ? t.endedAt - t.startedAt : t.meta?.ms,
@@ -754,6 +768,7 @@ function restoreTurn(t: ConversationTurn): ChatTurn {
     output,
     error: phase === 'error' ? (failure ? lineOf(failure) : t.status === 'running' ? buildInterrupted.title : '') : '',
     failure: phase === 'error' ? (t.status === 'running' ? buildInterrupted : failure) : phase === 'suspended' ? SUSPENDED : null,
+    rejected: phase === 'cancelled' ? meta?.rejected ?? null : null,
     startedAt: Date.parse(t.created_at ?? '') || Date.now(),
     endedAt: meta?.ms != null ? (Date.parse(t.created_at ?? '') || 0) + meta.ms : undefined,
     lastSeq: 0,
@@ -1121,7 +1136,10 @@ export const useChat = create<ChatState>((set, get) => ({
     }
     if (run.status === 'cancelled') {
       if (cur.phase !== 'done' && cur.phase !== 'cancelled') {
-        conclude({ phase: 'cancelled', status: PHASE_TEXT.cancelled, failure: null, error: '' }, '已取消')
+        // 被驳回只看服务端的 end_reason：核对时手上只有运行记录，副标题用报错原文（它就是给人看的那句）
+        const rejected = run.end_reason === 'rejected' ? { sub: run.error || REJECTED_TEXT.title } : null
+        conclude({ phase: 'cancelled', status: rejected ? REJECTED_TEXT.title : PHASE_TEXT.cancelled, failure: null,
+                   error: '', rejected }, '已取消')
       }
       return
     }
@@ -1242,6 +1260,11 @@ function attemptOf(t: ChatTurn): Attempt {
     answer: answer && answer.length > ATTEMPT_ANSWER_CAP ? answer.slice(0, ATTEMPT_ANSWER_CAP) + '…' : answer,
   }
   const signals = (t.review?.signals ?? []).map((s) => s.detail).join('\n') || undefined
+  // 被驳回的那次照实写谁在哪一步驳回（以前写「已手动停止」，用户其实没有停过它）
+  if (t.phase === 'cancelled' && t.rejected) {
+    const sub = t.rejected.sub && t.rejected.sub !== REJECTED_TEXT.title ? `：${t.rejected.sub}` : ''
+    return { ...base, outcome: 'rejected', summary: `${REJECTED_TEXT.title}${sub}` }
+  }
   if (t.phase === 'cancelled') return { ...base, outcome: 'cancelled', summary: '已手动停止' }
   if (t.phase === 'suspended') return { ...base, outcome: 'suspended', summary: '服务重启，运行中断' }
   if (t.phase === 'error' || t.failure) {
@@ -1776,15 +1799,18 @@ function watch(
         // 服务在关停：这一轮会停在断点上。停在审批上的仍然是在等人
         if (d.code === 'server_shutdown' && current()?.phase !== 'waiting') suspend()
         break
-      case 'run.cancelled':
+      case 'run.cancelled': {
         ended = true
         batch.now()
+        // 人的驳回（reason=rejected）也收成 cancelled：不是故障、不给继续运行，说法写「被驳回」和谁、哪一步、备注
+        const rejected = d.reason === 'rejected' ? { sub: REJECTED_TEXT.sub(d) } : null
         patch(() => ({
-          phase: 'cancelled', status: PHASE_TEXT.cancelled, cancel: null, endedAt: Date.now(),
-          runStatus: 'cancelled', final: { status: 'cancelled' },
+          phase: 'cancelled', status: rejected ? REJECTED_TEXT.title : PHASE_TEXT.cancelled, cancel: null,
+          endedAt: Date.now(), runStatus: 'cancelled', final: { status: 'cancelled' }, rejected,
         }))
         void flow.persist({ status: 'error', error: '已取消' })
         break
+      }
       case 'run.failed': {
         ended = true
         batch.now()

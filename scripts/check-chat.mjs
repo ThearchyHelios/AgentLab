@@ -198,6 +198,15 @@ const GUARD_CONVS = {
 const FIX_CONVS = {
   fixZ: conv('c0fixz', '会话 Z：参数定义有误（后端现在的说法）', 1, 60 * 24 * 27),
 }
+/**
+ * 只在「被驳回」那段出现（05-已知遗留 (a)）：一轮的运行被审批人驳回结束（服务端 cancelled + end_reason=rejected，
+ * 落库时 meta.outcome 是 cancelled、meta.rejected 记着那一句）。rejR 会打开、重新运行一次；rejS 不打开，状态只能从
+ * 列表接口的 last_status 来
+ */
+const REJECT_CONVS = {
+  rejR: conv('c0rejr', '会话：退款那一问', 1, 60 * 24 * 35, { last_status: 'rejected', last_run_id: 'run-rej2' }),
+  rejS: conv('c0rejs', '会话：没打开过的那一问', 1, 60 * 24 * 36, { last_status: 'rejected' }),
+}
 /** 只在「助手反问」那段出现：库里存着一轮以反问收尾的（answer 列里是助手问的那句话，meta.asked 标着） */
 const ASKBACK_CONVS = {
   askBack: conv('c0askbk', '助手反问过的会话', 1, 60 * 24 * 34),
@@ -340,6 +349,9 @@ const DETAIL = {
   // 要改的是工具库里的参数定义，不在这一轮的流程里：先去改，再接着跑（没记 fix 的老写法，按原话认）
   c0fixy: [turn('ty1', '查一下订单状态', { status: 'error', error: BROKEN_TOOL, graph: GRAPH, run_id: 'run-badtool' })],
   c0fixz: [turn('tfz1', '查一下订单状态', { status: 'error', error: BROKEN_TOOL_NOW, graph: GRAPH, run_id: 'run-badtool-now' })],
+  c0rejr: [turn('trj1', '这个月的退款有多少', { status: 'error', error: '已取消', graph: GRAPH, run_id: 'run-rej2',
+    meta: { v: 1, runId: 'run-rej2', runStatus: 'cancelled', outcome: 'cancelled', rejected: { sub: '张工 驳回了「查数」：数字对不上' } } })],
+  c0rejs: [],
 }
 /**
  * 成果带逐段证据的一轮（报告撰写节点 + _evidence）。夹具是后端 compose_doc 真跑出来的，只用
@@ -364,6 +376,7 @@ const RUNS = {
   'run-trash-live': { status: 'running', output: {}, error: null },
   'run-badtool': { status: 'failed', output: {}, error: BROKEN_TOOL },
   'run-badtool-now': { status: 'failed', output: {}, error: BROKEN_TOOL_NOW },
+  'run-rej2': { status: 'cancelled', end_reason: 'rejected', output: {}, error: '人工驳回：数字对不上' },
 }
 const SOURCES = [
   { id: 'ds-mig', name: 'shop', kind: 'mysql', description: '' },
@@ -404,6 +417,8 @@ const ctl = {
   sourcesFail: false,
   /** 数据源列表里多一个别处刚加的库 */
   extraSource: false,
+  /** 列表里多摆「被驳回」那段的两个会话（REJECT_CONVS） */
+  rejectConvs: false,
 }
 /** 会话的归档 / 删除状态。各段各自 resetDb，免得上一段删掉的会话影响下一段 */
 const db = { archived: new Set(), purged: new Set() }
@@ -415,7 +430,7 @@ resetDb()
 const allConvs = () => [...Object.values(CONVS), ...Object.values(TRASHED), ...(ctl.trashMore ? Object.values(TRASH_MORE) : []),
   ...(ctl.guardConvs ? Object.values(GUARD_CONVS) : []), ...(ctl.askConvs ? Object.values(ASK_CONVS) : []),
   ...(ctl.askBack ? Object.values(ASKBACK_CONVS) : []),
-  ...(ctl.fixConvs ? Object.values(FIX_CONVS) : [])]
+  ...(ctl.fixConvs ? Object.values(FIX_CONVS) : []), ...(ctl.rejectConvs ? Object.values(REJECT_CONVS) : [])]
   .filter((c) => !db.purged.has(c.id))
   .map((c) => ({ ...c, archived: db.archived.has(c.id) }))
 let runSeq = 0
@@ -1444,6 +1459,48 @@ for (const theme of THEMES) {
     await page.screenshot({ path: `${SHOTS}/retried-${theme}.png` })
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
+  })
+
+  await section('rejected', '被驳回：补救区和列表写「被驳回」，重新运行后「之前的尝试」不写「已手动停止」', async () => {
+    ctl.rejectConvs = true
+    try {
+      const { page, ctx, errors } = await open(theme)
+      await goto(page, 'c0rejr')
+      await shows(page, '这个月的退款有多少')
+      await page.waitForTimeout(500)
+      const turn0 = (await chatState(page)).byConversation.c0rejr?.[0]
+      check('刷新之后照样认成被驳回（相位 cancelled，带着驳回的那一句）', turn0?.phase === 'cancelled'
+        && turn0?.rejected?.sub === '张工 驳回了「查数」：数字对不上', JSON.stringify({ phase: turn0?.phase, rejected: turn0?.rejected }))
+      const card = page.locator('[data-remedy="cancelled"]')
+      const cardText = (await card.innerText().catch(() => '')).replace(/\n/g, ' / ')
+      check('补救区说是审批人驳回、谁在哪一步驳回，不说「你已停止本轮」', cardText.includes('被审批人驳回')
+        && cardText.includes('张工 驳回了「查数」：数字对不上') && !cardText.includes('你已停止本轮'), cardText)
+      check('被驳回的没有「继续运行」', !(await card.getByRole('button', { name: '继续运行' }).count()))
+      const aside = page.locator('aside[aria-label="对话列表"]')
+      const rowText = async (t) => (await aside.locator('div.group', { hasText: t }).innerText().catch(() => '')).replace(/\n/g, ' / ')
+      // 标题里不带「被驳回」：标出来的是状态，不是标题里的字
+      check('列表里打开过的：标「被驳回」', (await rowText('会话：退款那一问')).includes('被驳回'), await rowText('会话：退款那一问'))
+      check('列表里没打开过的：按 last_status 标「被驳回」，不标「失败」', (await rowText('没打开过的那一问')).includes('被驳回')
+        && !(await rowText('没打开过的那一问')).includes('失败'), await rowText('没打开过的那一问'))
+
+      const startsBefore = log.runStarts.length
+      await card.getByRole('button', { name: '重新运行本轮' }).click()
+      check('重新运行：留下一次尝试', await page.waitForFunction(
+        () => window.__chat.getState().byConversation.c0rejr.at(-1).attempts?.length === 1, null, { timeout: 8000 })
+        .then(() => true, () => false))
+      check('按原图重新发起了运行', log.runStarts.length > startsBefore, `${log.runStarts.length - startsBefore} 次`)
+      const [attempt] = (await chatState(page)).byConversation.c0rejr.at(-1).attempts ?? []
+      check('那一次记成被驳回、写谁在哪一步驳回', attempt?.outcome === 'rejected'
+        && attempt?.summary === '被驳回：张工 驳回了「查数」：数字对不上', JSON.stringify(attempt))
+      const history = page.locator('[aria-label="之前的尝试"]')
+      const historyText = (await history.innerText().catch(() => '')).replace(/\n/g, ' / ')
+      check('「之前的尝试」写「被驳回」，不写「已手动停止」', historyText.includes('第 1 次尝试')
+        && historyText.includes('被驳回：张工 驳回了「查数」') && !historyText.includes('已手动停止'), historyText)
+      check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+      await ctx.close()
+    } finally {
+      ctl.rejectConvs = false
+    }
   })
 
   await section('fixfirst', '要改的东西在工具库里：先去改参数定义，「接着跑」退成次要', async () => {

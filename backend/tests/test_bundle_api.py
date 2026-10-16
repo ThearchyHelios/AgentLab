@@ -353,6 +353,24 @@ async def test_a_failed_run_is_exportable(client, monkeypatch):
     assert data_of(resp.text)["meta"]["status"] == "failed"
 
 
+async def test_a_rejected_run_carries_its_end_reason(client, monkeypatch):
+    """被审批人驳回结束的运行（cancelled + end_reason=rejected，05-已知遗留 (a)）：可验证报告和报告导出的元信息都带上
+    end_reason，页面照它写「被驳回」，不写成手动停止的「已取消」。"""
+    row = await sealed_run(monkeypatch)
+    async with SessionLocal() as session:
+        run = await session.get(Run, row.id)
+        run.status, run.end_reason = "cancelled", "rejected"
+        await session.commit()
+    bundle = await client.get(f"/api/runs/{row.id}/bundle.html")
+    assert bundle.status_code == 200, bundle.text
+    meta = data_of(bundle.text)["meta"]
+    assert (meta["status"], meta["end_reason"]) == ("cancelled", "rejected")
+    report = await client.get(f"/api/runs/{row.id}/report.html")
+    assert report.status_code == 200, report.text
+    m = re.search(r'<script type="application/json" id="report-data">(.*?)</script>', report.text, re.S)
+    assert m and json.loads(m.group(1))["meta"]["end_reason"] == "rejected"
+
+
 async def test_a_broken_seal_is_refused(client, monkeypatch):
     row = await sealed_run(monkeypatch)
     async with SessionLocal() as session:

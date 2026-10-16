@@ -5163,6 +5163,25 @@ export const SYSTEM_RUNS_TEXT = {
   hint: '评测、口径对账、口径召回是系统代为发起的运行：证据仍可查看，但不计入使用统计，记录页默认不列',
 }
 
+/**
+ * 驳回 ≠ 失败（docs/design/next-round/05-已知遗留.md (a)）：人的驳回让运行结束在 cancelled + end_reason=rejected，
+ * run.cancelled 带着在哪一步（label）、谁（actor）、结论（decision）、备注（note）。时间线、问数据的终态、记录页都照这一份说，
+ * 不再按报错原文猜
+ */
+export const REJECTED_TEXT = {
+  title: '被驳回',
+  /** 副标题：谁在哪一步驳回、备注；超时驳回写按设置驳回（备注是系统写的那句，不重复） */
+  sub: (d: { actor?: unknown; label?: unknown; note?: unknown; decision?: unknown }): string => {
+    const who = typeof d.actor === 'string' ? d.actor.trim() : ''
+    const where = typeof d.label === 'string' && d.label.trim() ? `「${d.label.trim()}」` : '这一步'
+    const note = typeof d.note === 'string' ? d.note.trim() : ''
+    if (d.decision === 'expired_reject') return `${where}超过时限，按设置驳回`
+    return `${who ? `${who} 驳回了${where}` : `${where}被驳回`}${note ? `：${note}` : ''}`
+  },
+  /** 问数据：这一轮的运行被驳回结束时，补救区的那一句 */
+  chatReason: '这一轮的运行被审批人驳回，已经结束。这是人的决定，不是故障；改好内容后可以重新运行。',
+}
+
 /** 来源标签：老运行没有来源时写「来源未记录」 */
 export const originLabel = (kind: string | null | undefined): string =>
   kind && kind in ORIGIN_LABEL ? ORIGIN_LABEL[kind as OriginKind] : ORIGIN_TEXT.unknown

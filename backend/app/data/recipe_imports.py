@@ -2361,7 +2361,7 @@ def _manifest(*, staging_id: str, kind: str, source_id: str, info: table_version
               ex_dict: dict[str, Any], file: dict[str, Any], recipe_meta: dict[str, Any], checks: list[dict[str, Any]],
               overrides: list[dict[str, Any]], waivers: list[dict[str, Any]], confirmed: list[dict[str, Any]],
               notes: SchemaNotes, ai: dict[str, Any], signed_by: str | None,
-              edits: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+              edits: list[dict[str, Any]] | None = None, signer_verified: bool = False) -> dict[str, Any]:
     receipt = copy.deepcopy(ex_dict)
     receipt.pop("problems", None)
     return {
@@ -2383,7 +2383,8 @@ def _manifest(*, staging_id: str, kind: str, source_id: str, info: table_version
         "ai": ai,
         # 期 3：修复、框选的修改记录（含已被整份替换覆盖的，作为历史；不带撤销用的修改前起点）
         "edits": copy.deepcopy(list(edits or [])),
-        "signed_by": {"name": signed_by, "verified": False},
+        # 是否认证照实记（05-已知遗留 (c)）：开了登录、署名是登录的人时为真。以前写死 False，封存的证据记错了事实
+        "signed_by": {"name": signed_by, "verified": bool(signer_verified and signed_by)},
         "staging_id": staging_id, "kind": kind,
         "created_at": _now_iso(),
     }
@@ -2411,7 +2412,8 @@ def _file_sha(path: Path) -> str | None:
 
 
 async def commit_staging(session: AsyncSession, staging: ImportStaging, *, trial_id: str, confirmations: list[str],
-                         acceptances: list[Acceptance], signed_by: str | None) -> CommitResult:
+                         acceptances: list[Acceptance], signed_by: str | None,
+                         signer_verified: bool = False) -> CommitResult:
     """POST imports/{id}/commit（7.8）：预检 → （与现行导入相同时）不新建记录 → 发布构建、写配方、导入记录、
     快照、清单，切指针。失败时指针不动，暂存区退回 drafting（试运行库已被发布流程消耗）。
 
@@ -2532,6 +2534,8 @@ async def commit_staging(session: AsyncSession, staging: ImportStaging, *, trial
 
     ex = extraction_from_dict(ex_dict)
     who = signed_by or staging.signed_by
+    # 署名是这次请求的（signed_by）才谈得上认证；退回暂存区上记的那个，是否认证这里不知道，照实记未认证
+    who_verified = bool(signer_verified and signed_by)
     acc = [Acceptance(check_id=a.check_id, reason=a.reason.strip(), signed_by=who) for a in given.values()]
     # 这一期自己的说明（带实际的接受）进它的导入清单：版本页逐期显示「改写后的那一句」从这里取（第 5 节）。
     # 快照冻结的说明在多期时另按各期最弱的结论合并（2.8），只剩本期时就是它
@@ -2603,7 +2607,8 @@ async def commit_staging(session: AsyncSession, staging: ImportStaging, *, trial
             file={"name": file_name, "size": file_size, "raw_sha256": raw_sha},
             recipe_meta={"id": recipe_id, "sha256": recipe_sha, "origin": origin, "canonical": canonical},
             checks=checks_full, overrides=overrides, waivers=waivers, confirmed=confirmed,
-            notes=notes if union_info is None else period_notes, ai=ai, signed_by=who, edits=edits)
+            notes=notes if union_info is None else period_notes, ai=ai, signed_by=who, edits=edits,
+            signer_verified=who_verified)
 
     async def schema_cache_for(view: table_versions.SourceView, info: table_versions.PublishInfo) -> dict[str, Any]:
         from app.core import artifact_store
@@ -2663,7 +2668,7 @@ async def commit_staging(session: AsyncSession, staging: ImportStaging, *, trial
                    "table_hashes": dict(union_report.get("table_hashes") or {}), "union_ver": recipe_types.UNION_VER},
             parts=ordered, report=union_report, label_sets=list((plan or {}).get("label_sets") or []),
             gaps=list((plan or {}).get("gaps") or []), replaced=(plan or {}).get("replaces"), removed=None,
-            notes=notes, signed_by=who)
+            notes=notes, signed_by=who, signer_verified=who_verified)
         smid = await artifact_store.put_json(doc, kind="snapshot_manifest",
                                              meta={"source_id": source_id, "snapshot_id": info.snapshot_id})
         cache["import_manifests"] = [mid if iid is None else by_imp[iid].info.manifest_artifact

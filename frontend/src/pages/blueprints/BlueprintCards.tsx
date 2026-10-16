@@ -7,6 +7,7 @@
  * 哪些项必填（P7）。
  *
  * 写回卡片上「结果不明时谁去核实」只在目标能力没登记查询时摆（服务端 Blueprint.reconciler_needed），只能由人选（同「谁能看」）。
+ * 自由形的「谁来做」按服务端给的 derived_people 摆（FreeformPeople）：骨架是导入的图，卡片只定每一步由谁做。
  *
  * 每一项可以点「修改」：改完发一个 bp_set（值是纯值，服务端记成来源「你」、已确认）；待确认的可以直接点「确认」（只改状态，
  * 来源不变），一张卡片上待确认的不止一项时卡头另有「确认全部」，一次修改带上这几项的状态（服务端整批落或整批不落）。
@@ -26,7 +27,7 @@ import {
 } from '../../lib/terms'
 import { chatBusy, useBlueprint } from '../../store/blueprint'
 import type {
-  Blueprint, BpDataItem, BpField, BpItem, BpOp, BpStep, ItemStatus, JointState, PlainIssue, TemplateInfo,
+  Blueprint, BpDataItem, BpField, BpItem, BpOp, BpStep, DerivedPerson, ItemStatus, JointState, PlainIssue, TemplateInfo,
 } from '../../typesBlueprint'
 import { SELF_RECORDS, ValueEditor, valueText, type EditorKind, type EditorScope } from './editors'
 import { isItem, missingPaths, visibleCards, type CardKey } from './shared'
@@ -175,6 +176,7 @@ function CardFor({ card, ctx, template }: { card: CardKey; ctx: CardCtx; templat
         </Card>
       )
     case 'people': {
+      if (ctx.bp.derived_people) return <FreeformPeople ctx={ctx} rows={ctx.bp.derived_people} note={note} />
       const items = spec.people.flatMap((s, i) => STEP_KEYS.map((k) => [`/people/${i}/${k}`, s[k] as BpItem] as [string, BpItem]))
       return (
         <Card card={card} note={note} issues={issues} status={cardStatus(ctx, card, items)}
@@ -252,6 +254,45 @@ function CardFor({ card, ctx, template }: { card: CardKey; ctx: CardCtx; templat
 
 function Empty() {
   return <p className="text-2xs text-faint">{BLUEPRINT_TEXT.empty}</p>
+}
+
+/**
+ * 自由形的「谁来做」（05-已知遗留 (d)）：按服务端给的 derived_people 一行一行摆，不自己从图里推。岗位行、核实人那一行只定
+ * 由谁做（改了发 bp_set 到那一行的 path）；发起人、表达式、外部系统回调的步骤只读。不能加减步骤、不能改会签和时限：骨架是
+ * 导入的图，要改回画布
+ */
+function FreeformPeople({ ctx, rows, note }: { ctx: CardCtx; rows: DerivedPerson[]; note?: string }) {
+  const spec = ctx.bp.spec
+  const itemOf = (row: DerivedPerson): BpItem | null => {
+    if (row.kind === 'reconciler') return spec.writeback?.reconciler ?? UNSET
+    if (row.kind !== 'slot') return null
+    return spec.people.find((s) => s.id === row.slot)?.who ?? UNSET
+  }
+  const items = rows.flatMap((r): [string, BpItem][] => {
+    const item = itemOf(r)
+    return r.path && item ? [[r.path, item]] : []
+  })
+  const paths = new Set(items.map(([p]) => p))
+  const issues = (ctx.bp.issues ?? []).filter((i) => i.path === '/people' || (i.path != null && paths.has(i.path)))
+  return (
+    <Card card="people" note={note} issues={issues} status={cardStatus(ctx, 'people', items)}>
+      <p className="text-2xs leading-relaxed text-dim" data-bp-freeform-people={rows.length}>{BP_EDIT_TEXT.freeformPeopleHint}</p>
+      {rows.length === 0 && <p className="text-2xs text-faint">{BP_EDIT_TEXT.freeformPeopleEmpty}</p>}
+      {rows.map((row, i) => {
+        const item = itemOf(row)
+        return (
+          <div key={`${row.kind}-${row.slot ?? i}`} className="rounded-md border p-2" data-bp-derived={row.kind}
+               data-bp-slot={row.slot ?? undefined}>
+            <div className="mb-1 text-xs font-medium text-fg">{row.label}</div>
+            <p className="mb-1 text-2xs leading-relaxed text-dim">{row.detail}</p>
+            {row.path && item
+              ? <ItemRow ctx={ctx} path={row.path} item={item} label={BP_EDIT_TEXT.freeformWho} kind="grantees" />
+              : <p className="text-2xs text-faint">{BP_EDIT_TEXT.freeformReadOnly}</p>}
+          </div>
+        )
+      })}
+    </Card>
+  )
 }
 
 function Card({ card, status, note, actions, issues, children }: {

@@ -11,7 +11,7 @@ import { explainRunError } from '../../lib/explain'
 import {
   NONE, formatCost, formatDateTime, formatNumber, formatOffset, formatSpan, formatTokens, shortId,
 } from '../../lib/format'
-import { COST_TEXT, runClassLabel, nodeTypeLabel, runCostText } from '../../lib/terms'
+import { COST_TEXT, REJECTED_TEXT, runClassLabel, nodeTypeLabel, runCostText } from '../../lib/terms'
 import { topology, type GraphLike } from '../../run/derive'
 import {
   isActivePhase, isSettled, liveAt, project, type NodeState, type Projection, type RunPhase, type Trace,
@@ -449,6 +449,7 @@ function momentsOf(
     const failed = trace.phase === 'failed' ? trace.failedNodeId : undefined
     const why = trace.phase === 'failed'
       ? explainRunError((failed && trace.nodes[failed]?.error) || error).title
+      : code === 'rejected' ? error?.trim() || undefined
       : trace.phase === 'cancelled' ? cancelReason(error) ?? undefined
       : trace.phase === 'suspended' ? error?.trim() || undefined : undefined
     out.push({
@@ -458,6 +459,7 @@ function momentsOf(
       text: trace.phase === 'succeeded' ? '运行完成'
         : failed ? `失败于${name(failed)}`
         : trace.phase === 'failed' ? '运行失败'
+        : code === 'rejected' ? REJECTED_TEXT.title
         : trace.phase === 'cancelled' ? '运行取消' : '运行挂起',
       sub: why,
     })

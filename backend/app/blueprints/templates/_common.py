@@ -78,6 +78,19 @@ def context(bp: dict[str, Any]) -> dict[str, Any]:
     return ctx if isinstance(ctx, dict) else {}
 
 
+def with_graph(spec: dict[str, Any], graph: Any) -> dict[str, Any]:
+    """只有卡片（Blueprint.spec）、没有实例化上下文的地方，带上蓝图存的图再交给模板的函数：自由形的「谁来做」、要不要
+    核实人都按导入的图算（freeform.people_rows / needs_reconciler）。"""
+    return {**spec, CONTEXT_KEY: {**context(spec), "graph": graph}}
+
+
+def is_freeform(spec: dict[str, Any]) -> bool:
+    """卡片上选的是导入图的模板（自由形）。"""
+    ref = spec.get("template")
+    template = get_template(str(ref.get("id") or "")) if isinstance(ref, dict) else None
+    return template is not None and template.imports_graph
+
+
 def app_name(bp: dict[str, Any], fallback: str) -> str:
     """应用和工作流的名字：实例化时给的名字，没给就用目的的前一段。"""
     name = str(context(bp).get("name") or "").strip()
@@ -434,6 +447,12 @@ def needs_reconciler(bp: dict[str, Any]) -> bool:
     蓝图（reconciler_needed）共用这一份。"""
     ref = bp.get("template")
     template = get_template(str(ref.get("id") or "")) if isinstance(ref, dict) else None
+    if template is not None and template.imports_graph:
+        # 自由形没有「写回哪里」：按导入的图里的写入算（bp 要带着图，with_graph），核实人存在 /writeback/reconciler
+        # （05-已知遗留 (d)）
+        from app.blueprints.templates import freeform
+
+        return freeform.needs_reconciler(bp)
     if template is None or "writeback" not in template.cards:
         return False
     capability = value((bp.get("writeback") or {}).get("capability"))

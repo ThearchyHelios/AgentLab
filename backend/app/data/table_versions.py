@@ -2130,7 +2130,7 @@ class RawPurge:
 
 
 async def purge_import_raw(
-    session: AsyncSession, imp: TableImport, *, reason: str, signed_by: str | None
+    session: AsyncSession, imp: TableImport, *, reason: str, signed_by: str | None, signer_verified: bool = False
 ) -> RawPurge:
     """清除一次导入的原件（提交）。按两元组解包得到 (是否删了文件, 一并标成已清除的其他导入记录)，
     discarded_stagings 是一并放弃的暂存区。
@@ -2160,7 +2160,9 @@ async def purge_import_raw(
         now = utcnow()
         record = {
             "at": now.isoformat(), "reason": reason,
-            "signed_by": (signed_by or "").strip() or None, "signed_by_verified": False,
+            # 是否认证照实记（05-已知遗留 (c)）：开了登录、署名是登录的人时为真
+            "signed_by": (signed_by or "").strip() or None,
+            "signed_by_verified": bool(signer_verified and (signed_by or "").strip()),
         }
         imp.raw_state, imp.purged = "purged", record
         for other in others:

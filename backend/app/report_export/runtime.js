@@ -25,7 +25,7 @@
     metaRun: '运行 ID', metaClass: '运行类别', metaStatus: '运行状态', metaReport: '报告节点',
     metaStarted: '开始', metaFinished: '结束', metaExported: '导出时间',
     classLabel: { formal: '正式运行', exploratory: '探索运行' },
-    statusLabel: { succeeded: '已完成', failed: '已失败', cancelled: '已取消', running: '进行中', waiting: '等待审批' },
+    statusLabel: { succeeded: '已完成', failed: '已失败', cancelled: '已取消', rejected: '被驳回', running: '进行中', waiting: '等待审批' },
     docHashBad: '这份报告文档与哈希不一致（疑似被修改），正文仅供参考，其中的口径和出处未经核对。',
     sealNone: '这次运行导出时尚未封存：下列出处来自导出那一刻的系统记录，未经封存核对。',
     sealOk: (hash) => `运行已封存，清单哈希 ${hash}。要向系统外的人证明文件未被修改，请导出「可验证报告」（记录页 · 凭证详情），拿封存哈希去系统对照。`,
@@ -147,7 +147,8 @@
     $('meta').replaceChildren(...[...[
       [T.metaRun, h('code', {}, String(meta.run_id || ''))],
       [T.metaClass, label(T.classLabel, meta.run_class)],
-      [T.metaStatus, label(T.statusLabel, meta.status)],
+      // 被驳回（cancelled + end_reason=rejected）照运行记录写「被驳回」，不写成手动停止的「已取消」
+      [T.metaStatus, label(T.statusLabel, meta.status === 'cancelled' && meta.end_reason === 'rejected' ? 'rejected' : meta.status)],
       [T.metaReport, String(meta.report?.label || meta.report?.node_id || NONE)],
       [T.metaStarted, when(meta.started_at)],
       [T.metaFinished, when(meta.finished_at)],

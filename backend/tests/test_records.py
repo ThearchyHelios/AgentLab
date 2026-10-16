@@ -461,7 +461,7 @@ async def test_unknown_result_is_found_by_the_lookup_and_not_written_again(engin
             if (await session.get(ActionRecord, rec.id)).next_lookup_at is not None:
                 break
         await asyncio.sleep(0.05)
-    assert await actions.tick(utcnow() + timedelta(minutes=5)) == 1
+    assert rec.id in await actions.tick(utcnow() + timedelta(minutes=5))
     done = await wait(run.id, ("succeeded", "failed"))
     assert done.status == "succeeded", done.error
     async with SessionLocal() as session:

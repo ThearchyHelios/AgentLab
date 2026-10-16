@@ -10,7 +10,7 @@ import { type StatusCode } from '../../lib/status'
 import { isExecuting, liveAt, project, type Projection, type RunPhase, type Trace } from '../../run/trace'
 import { useRunClock } from '../../run/useRunClock'
 import type { Approval, Run } from '../../types'
-import { BUNDLE_TEXT, COST_TEXT, UNSAVED_HINT, isUnsaved, runCostText, runName } from '../../lib/terms'
+import { BUNDLE_TEXT, COST_TEXT, REJECTED_TEXT, UNSAVED_HINT, isUnsaved, runCostText, runName } from '../../lib/terms'
 import {
   LONG_WAIT_MS, ageMs, cancelReason, runScope, runTiming, type RunTiming,
 } from './model'
@@ -116,6 +116,10 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
     sub = '断点完好，可继续运行'
   } else if (code === 'cancelled') {
     sub = cancelNote(run.error, cancelled)
+  } else if (code === 'rejected') {
+    // 谁在哪一步驳回、备注：和时间线那一行同一句（REJECTED_TEXT.sub）。run.cancelled 还没取到时按驳回的那一步说
+    sub = cancelled?.reason === 'rejected' ? REJECTED_TEXT.sub(cancelled)
+      : REJECTED_TEXT.sub({ label: labelOf(run.error_node_id) })
   }
 
   const nodesTotal = proj?.nodesTotal ?? 0

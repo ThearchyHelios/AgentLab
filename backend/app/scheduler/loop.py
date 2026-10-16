@@ -130,7 +130,9 @@ async def process_due(now: datetime | None = None) -> None:
     for name, step in (("待办的时限处理", tasks.tick), ("写入结果的查询", actions.tick),
                        ("没有提交的上传文件清理", files_store.cleanup_tick)):
         try:
-            await step(now)
+            done = await step(now)
+            if isinstance(done, list) and done:
+                logger.info("%s：这一拍处理了 %d 条", name, len(done))
         except Exception:  # noqa: BLE001
             logger.exception("%s这一拍出错，下一拍照常进行", name)
 

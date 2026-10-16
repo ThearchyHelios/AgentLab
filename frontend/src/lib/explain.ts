@@ -295,11 +295,15 @@ export function explainRunError(error: string | null | undefined, detail?: strin
       raw,
     }
   }
-  // 后端有一条路径以前写「人工拒绝：」（现在统一为「人工驳回：」），历史运行里两种都有
-  if (/人工(?:驳回|拒绝)/.test(text)) {
+  // 只留给存量：加 end_reason 之前被驳回的运行记的是 failed，报错原文是这几种说法。新的驳回结束在 cancelled +
+  // end_reason=rejected，界面按那个字段说（lib/status、REJECTED_TEXT），不走这里（05-已知遗留 (a)）。后端有一条路径
+  // 以前写「人工拒绝：」（现在统一为「人工驳回：」）；动作确认、工具调用审批、代码执行审批的驳回各有一种原话。
+  // 接着跑只会读到同一个驳回答复、再停一次，所以都不给「继续运行」
+  if (/人工(?:驳回|拒绝)|未确认（被驳回）|的调用已被驳回|代码执行已被驳回/.test(text)) {
+    const human = /^人工(?:驳回|拒绝)/.test(plain)
     return {
       title: '人工审批驳回，运行终止',
-      reason: plain.replace(/^人工(?:驳回|拒绝)[：:]?\s*/, '') || undefined,
+      reason: (human ? plain.replace(/^人工(?:驳回|拒绝)[：:]?\s*/, '') : plain) || undefined,
       action: '这是审批人的决定，不是故障。如有需要，请修改内容后重新发起运行。',
       continuable: false,
       raw,

@@ -6,6 +6,7 @@ import {
 } from '../../components/ui'
 import { formatDateTime } from '../../lib/format'
 import { NOTIFY_TEXT as T, SETTINGS_ROLE_TEXT } from '../../lib/terms'
+import { NOTIFY_PERSONAL_EVENT_LABEL } from '../../lib/termsApp'
 import { useAtLeast } from '../../store/auth'
 import type { NotifyChannelRow, NotifyEventRow } from '../../typesApp'
 
@@ -18,6 +19,9 @@ import type { NotifyChannelRow, NotifyEventRow } from '../../typesApp'
 
 const FORMATS = ['generic', 'feishu', 'wecom', 'dingtalk'] as const
 const EVENTS = Object.keys(T.eventLabel)
+/** 事件在这个范围的渠道上怎么叫：个人渠道的实例结束只推自己发起的，叫「我发起的实例完成 / 失败」 */
+const eventLabel = (event: string, scope: string): string =>
+  (scope === 'user' ? NOTIFY_PERSONAL_EVENT_LABEL[event] : undefined) ?? T.eventLabel[event] ?? event
 
 export function NotifyTab() {
   const builder = useAtLeast('builder')
@@ -86,7 +90,7 @@ export function NotifyTab() {
                   </div>
                   <div className="truncate text-2xs text-faint">
                     <span className="mono">{row.url_host}</span>
-                    {row.events.length > 0 && ` · ${row.events.map((e) => T.eventLabel[e] ?? e).join('、')}`}
+                    {row.events.length > 0 && ` · ${row.events.map((e) => eventLabel(e, row.scope)).join('、')}`}
                   </div>
                 </div>
                 <label className="flex items-center gap-1 text-2xs">
@@ -218,7 +222,7 @@ function ChannelEditor({ row, onClose, onSaved }: {
               <label key={ev} className="flex items-center gap-1.5 text-xs" data-notify-event={ev}>
                 <input type="checkbox" className="accent-[var(--accent)]" checked={form.events.includes(ev)}
                        onChange={(e) => setForm({ ...form, events: e.target.checked ? [...form.events, ev] : form.events.filter((x) => x !== ev) })} />
-                {T.eventLabel[ev]}
+                {eventLabel(ev, form.scope)}
               </label>
             ))}
           </div>

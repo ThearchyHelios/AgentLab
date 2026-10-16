@@ -16,6 +16,8 @@
   引用链（④）按「已核对的口径卡的输入」认它；点开数字看得到指标、原式、代入式、输入和复算
 - legacy：早期运行，封存范围按结束事件推算（运行结束事件在范围外，运行结果无法核对）
 - failed：失败结束的运行（没有出具判定），封存说明多一句「继续运行会重新封存」
+- rejected：被审批人驳回结束的运行（运行记录 cancelled + end_reason=rejected，最后一条是运行取消）：运行结果写「被驳回」，
+  写明能核对的只是「运行取消」这一半、被驳回取自运行记录；不提重新封存
 - continued：早期运行先失败、经继续运行跑到成功：范围里有那条运行失败，之后运行又继续了，成功结束的那条在范围外
 - degraded：两条出具判定，先完整出具、后降档出具，认最后一条
 - missing-doc / missing-card：导出时服务端已没有报告文档 / 口径卡的文件
@@ -278,6 +280,11 @@ class Sample:
                 add("issuance", "out", {"tier": tier, "mode": "citations"})
             add("node.finished", "out", {"duration_ms": 2, "attempt": 1, "preview": {"周报": "（报告正文）"}})
             add("run.finished", None, {"output": {"周报": "（报告正文）"}})
+        elif ending == "rejected":
+            # 审批人在成果之前驳回（engine/runner：run.cancelled 带 reason=rejected、在哪一步、谁、备注；内容不随文件附带）
+            add("node.failed", "out", {"error": "人工驳回：数字对不上"})
+            add("run.cancelled", None, {"reason": "rejected", "node_id": "out", "label": "成果", "kind": "approve",
+                                        "decision": "reject", "actor": "值班分析员", "note": "数字对不上"})
         else:
             add("node.failed", "out", {"error": "出口复核没有通过"})
             add("run.failed", None, {"error": "出口复核没有通过"})
@@ -325,6 +332,9 @@ def bundles() -> dict[str, dict[str, Any]]:
 
     events, bound = s.events({"write": weekly}, ending="failed")
     out["failed"] = build(s, events, bound, run={**RUN, "status": "failed"})
+
+    events, bound = s.events({"write": weekly}, ending="rejected")
+    out["rejected"] = build(s, events, bound, run={**RUN, "status": "cancelled", "end_reason": "rejected"})
 
     # 早期运行先失败、经继续运行跑到成功：封存范围同样按结束事件推算，到成功结束的前一条为止
     events, _ = s.events({"write": weekly}, ending="continued")

@@ -1260,6 +1260,8 @@ export interface ImportRecord {
   period_start: string | null
   period_end: string | null
   signed_by: string | null
+  /** 署名是不是认证过的身份：按这一期导入清单里记下的（05-已知遗留 (c)），旧清单记的是 false。老后端不给 */
+  signed_by_verified?: boolean
   /** 接受的条数 */
   overrides: number
   waivers: number
@@ -1582,10 +1584,10 @@ export interface Conversation {
   /** 列表里的副标题，让人一眼认出是哪次聊天 */
   last_question: string
   /**
-   * 最后一轮停在哪。左栏对这次没打开过的会话也能标出运行中、待审批、失败。
-   * 没有轮次时为 null；老后端不给
+   * 最后一轮停在哪。左栏对这次没打开过的会话也能标出运行中、待审批、失败、被驳回（rejected：运行被审批人驳回结束，
+   * 服务端 cancelled + end_reason=rejected）。没有轮次时为 null；老后端不给
    */
-  last_status?: 'running' | 'waiting' | 'error' | 'cancelled' | 'suspended' | 'done' | null
+  last_status?: 'running' | 'waiting' | 'error' | 'cancelled' | 'rejected' | 'suspended' | 'done' | null
   /** 最后一轮的运行。建图阶段就断了的没有 */
   last_run_id?: string | null
 }
@@ -4481,4 +4483,14 @@ export interface DataSourceName {
   description?: string
   kind?: string
   enabled?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// 驳回 ≠ 失败（docs/design/next-round/05-已知遗留.md (a)，总方案 X9）
+
+/** 运行为什么结束在 cancelled（服务端 Run.end_reason）：rejected 人工驳回，stopped 手动停止。其余终态、老运行为空 */
+export type RunEndReason = 'rejected' | 'stopped'
+
+export interface Run {
+  end_reason?: RunEndReason | null
 }

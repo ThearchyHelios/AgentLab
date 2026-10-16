@@ -23,7 +23,7 @@ from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent, Workflow
 from app.engine.approval import read_decision
 from app.engine.compiler import compile_graph, initial_state
-from app.engine.context import NodeError, RunContext
+from app.engine.context import NodeError, NodeRejected, RunContext
 from app.engine.deadline import segment
 from app.engine.replay import PROTOCOL, PROTOCOL_KEY, protocol_of
 from app.engine.schema import GraphSpec, NodeType, loop_steps, topology_of, validate_graph
@@ -42,9 +42,18 @@ _EPHEMERAL = {EventType.LLM_TOKEN, EventType.LLM_THINKING_DELTA}
 RUN_OPTIONS_KEY = "run_options"
 
 
-#: 接着跑被拒的机器码：正式运行带图（F2），有结果未知、还没核实的写入
+#: 接着跑被拒的机器码：正式运行带图（F2），有结果未知、还没核实的写入，被人驳回了的
 FORMAL_GRAPH_LOCKED = "formal_graph_locked"
 ACTION_UNRESOLVED = "action_unresolved"
+RUN_REJECTED = "run_rejected"
+
+#: 运行为什么结束在 cancelled（Run.end_reason，docs/design/next-round/00-总方案.md X9）
+END_REJECTED = "rejected"
+END_STOPPED = "stopped"
+#: 被驳回的运行不能继续运行：从断点重跑会读到同一个驳回答复、再停在同一处
+REJECTED_CONTINUE = "被驳回的运行不能继续运行：改好内容后重新发起"
+#: 服务重启时还在排队的运行改成失败时写的话（run.error 和补发的 run.failed 是同一句）
+QUEUED_AT_RESTART = "服务重启时这次运行仍在排队，没有可恢复的进度，请重新发起运行"
 
 
 class ContinueRefused(ValueError):
@@ -94,6 +103,9 @@ class RunManager:
             stranded = list((await session.execute(
                 select(Run.id, Run.last_seq).where(Run.status == "running")
             )).all())
+            queued = list((await session.execute(
+                select(Run.id, Run.last_seq).where(Run.status == "queued")
+            )).all())
             await session.execute(
                 update(Run)
                 .where(Run.status == "running")
@@ -102,7 +114,7 @@ class RunManager:
             await session.execute(
                 update(Run)
                 .where(Run.status == "queued")
-                .values(status="failed", error="服务重启时这次运行仍在排队，没有可恢复的进度，请重新发起运行")
+                .values(status="failed", error=QUEUED_AT_RESTART)
             )
             await session.commit()
         # 进程被强杀时连 server_shutdown 日志都来不及发，事件流停在半路。补上这一条，
@@ -113,6 +125,11 @@ class RunManager:
                 "level": "warn", "code": "server_shutdown",
                 "message": "服务上次未正常关闭，这次运行已中断；可从断点继续运行",
             })
+        # 排队中的改成了失败，也补一条 run.failed：以前只改状态，时间线里没有失败原因这一行（05-已知遗留 (h)）。
+        # 不写结束时间、不封存：它从没开始执行，同以前（定时通知按「没有开始时间」认出它，scheduler/webhook.py）
+        for run_id, last_seq in queued:
+            bus.set_seq(run_id, last_seq or 0)
+            await self._emit(run_id, EventType.RUN_FAILED, data={"error": QUEUED_AT_RESTART})
 
     async def shutdown(self) -> None:
         self._closing = True
@@ -505,8 +522,13 @@ class RunManager:
                     Approval.run_id == run_id, Approval.status.in_(["pending", "answered"])
                 ).limit(1)
             )).first() is not None
+            if run.status == "cancelled" and run.end_reason == END_REJECTED:
+                raise ContinueRefused(REJECTED_CONTINUE, code=RUN_REJECTED)
             if not (run.status == "failed" or (run.status == "interrupted" and not has_pending)):
                 raise ValueError(_cannot_continue(run.status, has_pending))
+            if run.status == "failed" and await _rejected_before(session, run):
+                # 加 end_reason 之前被驳回的运行记的是 failed（封存不改写）：接着跑会读到同一个驳回答复、再停一次
+                raise ContinueRefused(REJECTED_CONTINUE, code=RUN_REJECTED)
             if graph is not None and run.run_class == "formal":
                 raise ContinueRefused(
                     "正式运行固定在发布的版本上，不能修改配置后继续运行。如需修改，请在画布上修改并发布新版本后重新发起",
@@ -613,7 +635,7 @@ class RunManager:
             # 或者另一个取消先到了，这里就什么都不做
             claimed = await session.execute(
                 update(Run).where(Run.id == run_id, Run.status == "interrupted")
-                .values(status="cancelled", finished_at=now)
+                .values(status="cancelled", end_reason=END_STOPPED, finished_at=now)
             )
             if claimed.rowcount != 1:
                 await session.rollback()
@@ -631,7 +653,7 @@ class RunManager:
             bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             # 和状态同一个事务提交，理由同 _finalize
             event = self._event(run_id, EventType.RUN_CANCELLED, data={
-                "timing": timing, "actor": actor,
+                "reason": END_STOPPED, "timing": timing, "actor": actor,
                 "message": f"放弃了这次运行，{closed} 条待审批一并关闭" if closed
                            else "放弃了这次挂起的运行",
             })
@@ -684,6 +706,8 @@ class RunManager:
         #: 终态事件（run.failed / run.cancelled）等 _finalize 算完耗时再发，timing 才带得上
         terminal: tuple[EventType, dict[str, Any]] | None = None
         error_node: str | None = None
+        #: 收成 cancelled 的原因（Run.end_reason）：rejected 人的驳回，stopped 手动停止
+        end_reason: str | None = None
         #: 结果未知、挂起等核实的动作（ActionPending），收尾之后发 action.unknown、安排核实
         pending_action: str | None = None
 
@@ -796,7 +820,9 @@ class RunManager:
                 else:
                     status = "cancelled"
                     error = "用户取消"
-                    terminal = (EventType.RUN_CANCELLED, {"actor": self._stopped_by.pop(run_id, None)})
+                    end_reason = END_STOPPED
+                    terminal = (EventType.RUN_CANCELLED, {"reason": END_STOPPED,
+                                                          "actor": self._stopped_by.pop(run_id, None)})
                 raise
             except ActionPending as e:
                 # 写外部系统的结果未知（app/process/actions.py）：不在节点里等，运行收成挂起、不封存，等核实之后
@@ -829,6 +855,12 @@ class RunManager:
                     "（AGENTLAB_MAX_GRAPH_STEPS）"
                 )
                 terminal = (EventType.RUN_FAILED, {"error": error})
+            except NodeRejected as e:
+                # 人的决定（驳回、超时驳回），不是故障：收成 cancelled，同手动停止走一样的收尾（关掉并行支路上的审批、
+                # 回收沙箱、关流、封存、不许继续运行）。原话照旧记在 error 上，在哪一步、谁、结论、备注进 run.cancelled
+                status, end_reason = "cancelled", END_REJECTED
+                error, error_node = str(e), e.node_id
+                terminal = (EventType.RUN_CANCELLED, rejected_data(e, spec))
             except Exception as e:  # noqa: BLE001
                 status = "failed"
                 error, terminal = _failure(e, spec)
@@ -840,7 +872,7 @@ class RunManager:
                 self._finalizing.add(run_id)
                 try:
                     await self._finalize(run_id, status, error, final_state, elapsed,
-                                         terminal=terminal, error_node=error_node)
+                                         terminal=terminal, error_node=error_node, end_reason=end_reason)
                 finally:
                     # 收尾被打断（关停时的取消、库连接出错）也得把自己摘掉。以前写在
                     # _finalize 后面，一被打断就漏掉，留下的任务让下一次 shutdown 的
@@ -944,6 +976,7 @@ class RunManager:
         *,
         terminal: tuple[EventType, dict[str, Any]] | None = None,
         error_node: str | None = None,
+        end_reason: str | None = None,
     ) -> None:
         usage = dict(state.get("usage") or {})
         output = dict(state.get("output") or {})
@@ -1000,6 +1033,7 @@ class RunManager:
                 run.output = output
                 run.usage = usage
                 run.error_node_id = error_node
+                run.end_reason = end_reason
                 if status != "interrupted":
                     run.finished_at = now
                 if status in ("failed", "cancelled"):
@@ -1024,11 +1058,12 @@ class RunManager:
             # 关停时挂起的也要让在线的客户端收尾：进程马上就没了，不说一声，
             # 界面会一直以为它还在跑
             await bus.close(run_id)
-        if app_id and status in ("succeeded", "failed"):
-            # 应用实例结束、失败：按应用订阅推送（app/notify/service.py）。放到后台，接收端慢不拖着收尾
+        if app_id and (status in ("succeeded", "failed") or end_reason == END_REJECTED):
+            # 应用实例结束、失败：按应用订阅推送（app/notify/service.py）。放到后台，接收端慢不拖着收尾。被驳回的走
+            # 「实例结束」（next-round X6）：发起人要知道结果，订阅「实例失败」的人盯的是故障；手动停止的不推，同以前
             from app.notify.service import notify_run, spawn
 
-            spawn(notify_run(run_id, "run.finished" if status == "succeeded" else "run.failed"))
+            spawn(notify_run(run_id, "run.failed" if status == "failed" else "run.finished"))
 
     async def _seal(self, run_id: str) -> None:
         """对到此为止的全部事件算清单哈希，记下封到了哪一条。"""
@@ -1267,6 +1302,22 @@ def _trust_event(tool_trust: dict[str, str] | None) -> Any:
     if tool_trust is None:
         return None
     return "formal" if tool_trust.get(FORMAL_MARK) else snapshot_levels(tool_trust)
+
+
+def rejected_data(exc: NodeRejected, spec: GraphSpec) -> dict[str, Any]:
+    """被驳回的 run.cancelled 带什么：原因（rejected）、在哪一步（节点 id 和图上的名字）、哪种关卡、结论（驳回 / 超时
+    驳回）、谁、备注。进封存：谁在哪一步驳回、为什么，事后查得到。"""
+    node = spec.node_map().get(exc.node_id)
+    return {"reason": END_REJECTED, "node_id": exc.node_id, "label": node.title if node else exc.node_id,
+            "kind": exc.kind, "decision": exc.decision, "actor": exc.actor, "note": exc.note}
+
+
+async def _rejected_before(session: Any, run: Run) -> bool:
+    """加 end_reason 之前被人驳回、记成 failed 的运行：失败的那一步上最近一条处理完的待办是驳回（和实例页认驳回的是
+    同一份判断，apps/resolve.legacy_rejected）。"""
+    from app.apps.resolve import legacy_rejected
+
+    return await legacy_rejected(session, run)
 
 
 def _failure(exc: BaseException, spec: GraphSpec) -> tuple[str, tuple[EventType, dict[str, Any]]]:

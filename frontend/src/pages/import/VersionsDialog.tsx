@@ -14,7 +14,7 @@ import { signerNow } from '../../store/auth'
 import { humanizeError } from '../../lib/errors'
 import { formatBytes, formatDateTime, formatTime, parseServerTime } from '../../lib/format'
 import { RAW_STATE_LABEL, SIGNER_TEXT, VERSIONS_TEXT as VT } from '../../lib/terms'
-import { ManifestBody } from './ManifestBody'
+import { ManifestBody, signerText } from './ManifestBody'
 
 // ===========================================================================
 // 版本页（数据源卡片上的「版本」，P3-SPEC 7.8）：当前版本的各期、历史版本、全部导入记录三个页签，
@@ -447,10 +447,10 @@ function CurrentTab({ cur, recOf, busy, onManifest, onRemove, onRevoke, onPurge 
               {acceptN > 0 && (
                 <details className="text-xs" data-part-acceptances={acceptN}>
                   <summary className="cursor-pointer select-none text-dim hover:text-fg">{VT.acceptCount(acceptN)}</summary>
-                  <AcceptanceList items={accepted} className="mt-1.5" />
+                  <AcceptanceList items={accepted} className="mt-1.5" signer={rec} />
                 </details>
               )}
-              {rec?.signed_by && <div className="text-2xs text-faint">{VT.signedBy(rec.signed_by)}</div>}
+              {rec?.signed_by && <div className="text-2xs text-faint">{signerText(rec.signed_by, !!rec.signed_by_verified)}</div>}
               <div className="flex flex-wrap items-center gap-1.5">
                 <button type="button" className="btn btn-xs" data-manifest-open={p.import_id} disabled={!rec}
                         onClick={() => rec && onManifest(rec)}>
@@ -522,8 +522,12 @@ function TableRows({ rows, label, attr }: { rows: Record<string, number> | null 
   )
 }
 
-/** 接受逐条：种类、核对、理由、署名（未认证）、时间 */
-function AcceptanceList({ items, className }: { items: ImportAcceptance[]; className?: string }) {
+/**
+ * 接受逐条：种类、核对、理由、署名、时间。理由由提交这一期的人写：署名和导入记录的一样时，是不是登录身份按记录（清单里记下的）说
+ */
+function AcceptanceList({ items, className, signer }: {
+  items: ImportAcceptance[]; className?: string; signer?: { signed_by: string | null; signed_by_verified?: boolean } | null
+}) {
   if (!items.length) return null
   return (
     <ul className={clsx('space-y-1', className)}>
@@ -534,7 +538,9 @@ function AcceptanceList({ items, className }: { items: ImportAcceptance[]; class
             <span className="min-w-0 flex-1 break-words">{VT.acceptRow(a.check_id, a.reason)}</span>
           </div>
           <div className="flex flex-wrap gap-x-2 text-2xs text-faint">
-            <span>{VT.signedBy(a.signed_by || VT.unsigned)}</span>
+            <span>{a.signed_by
+              ? signerText(a.signed_by, !!signer?.signed_by_verified && a.signed_by === signer.signed_by)
+              : VT.signedBy(VT.unsigned)}</span>
             {a.at && <span className="tnum">{formatDateTime(a.at)}</span>}
           </div>
         </li>
@@ -654,10 +660,12 @@ function ImportsTab({ imports, busy, onManifest, onPurge }: {
             <div className="flex flex-wrap gap-x-3 gap-y-1 text-2xs text-faint">
               <span>{r.recipe_seq != null ? VT.recipeSeq(r.recipe_seq) : r.recipe_id ? '' : VT.simpleImport}</span>
               {r.created_at && <span className="tnum">{formatDateTime(r.created_at)}</span>}
-              {r.signed_by && <span>{VT.signedBy(r.signed_by)}</span>}
+              {r.signed_by && <span data-record-signer={r.signed_by_verified ? 'verified' : 'self'}>
+                {signerText(r.signed_by, !!r.signed_by_verified)}
+              </span>}
             </div>
             <TableRows rows={r.rows} attr="data-record-rows" />
-            <AcceptanceList items={r.acceptances ?? []} />
+            <AcceptanceList items={r.acceptances ?? []} signer={r} />
             <div className="flex flex-wrap items-center gap-1.5">
               <button type="button" className="btn btn-xs" data-manifest-open={r.id} onClick={() => onManifest(r)}>
                 <FileText size={11} aria-hidden /> {VT.manifest}

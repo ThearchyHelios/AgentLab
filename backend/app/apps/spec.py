@@ -47,9 +47,10 @@ FILE_FIELD_TYPE = "object"
 FILE_REF_KEYS = ("file_id", "name", "size", "sha256", "type")
 #: 表单字段能用的 format。不支持 pattern：JS 和 Python 的正则语义不同，会出现前端放行、后端拒收
 FORM_FORMATS = ("date", "date-time", "email", "uri")
-#: 表单校验错误的 code。file：文件控件的值不对（没上传、不是本人传的、已经用过、类型或大小不符，app/files/store.py）
+#: 表单校验错误的 code。file：文件控件的值不对（没上传、不是本人传的、已经用过、类型或大小不符，app/files/store.py）；
+#: principal：开了登录时选人控件的值不在候选池里（auth/directory.principal_errors）
 FORM_ERROR_CODES = ("required", "type", "enum", "minimum", "maximum", "min_length", "max_length", "max_items", "format",
-                    "file")
+                    "file", "principal")
 
 
 class _Strict(BaseModel):

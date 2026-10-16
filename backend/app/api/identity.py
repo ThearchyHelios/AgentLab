@@ -27,6 +27,9 @@ router = APIRouter(prefix="/api", tags=["identity"])
 #: 人和组的名录（GET /api/directory）：只读、给搭建者及以上（main.py 挂 require_role("builder")），岗位绑定、应用授权的
 #: 选人控件据此给候选、核对填的名字在不在。只有用户名、显示名、是否停用和组名，不含邮箱、角色、登录时间
 directory_router = APIRouter(prefix="/api", tags=["identity"])
+#: 使用者选人的候选（GET /api/directory/candidates，05-已知遗留 (b)）：任何登录的人都能调（main.py 挂 require_role("user")），
+#: 按用途给候选池，只有用户名和显示名
+candidates_router = APIRouter(prefix="/api", tags=["identity"])
 
 
 def _iso(value: Any) -> str | None:
@@ -222,6 +225,56 @@ async def directory(session: AsyncSession = Depends(get_session)) -> dict[str, A
     return {"users": [{"username": u.username, "display_name": u.display_name, "disabled": u.disabled}
                       for u in known.users.values()],
             "groups": [{"name": g.name, "label": g.label} for g in known.groups.values()]}
+
+
+@candidates_router.get("/directory/candidates")
+async def candidates(purpose: str, app_id: str | None = None, entry: str | None = None, task_id: str | None = None,
+                     field: str | None = None, q: str | None = None, limit: int = 20,
+                     session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """使用者选人时的候选：{users: [{username, display_name}], groups: [{name, label}], truncated, needs_query?}。
+
+    不给是否停用（停用的直接不列）、角色、邮箱、组成员。purpose=form：表单里的选人控件，带 app_id 和 entry（入口表单）
+    或 task_id（待办表单）、field（哪个控件），池按字段的 x-principal 算、缺省是能用这个应用的人，要求调用的人能用这个
+    应用（否则 403）；应用授权给了所有人时不带前缀 q 不列（needs_query）。purpose=review：个人应用提交审核，启用的搭建者
+    和管理员。q 按用户名或显示名的开头筛，limit 最多 50。开了登录时提交的值按同一个池核对（auth/directory.principal_errors）。"""
+    from app.api.coded import CodedHTTPException
+    from app.api.deps import current_principal
+    from app.apps.access import app_role, at_least
+    from app.apps.tree import entry_of, resolve_form
+    from app.auth.directory import PURPOSES, field_pool, principal_fields, review_pool
+    from app.db.models_apps import App, AppVersion
+    from app.db.models_process import Task
+
+    if purpose not in PURPOSES:
+        raise CodedHTTPException(422, f"候选的用途只能是 {' / '.join(PURPOSES)}", "candidates_purpose")
+    if purpose == "review":
+        return (await review_pool(session)).pick(q, limit) | {"groups": []}
+    principal = current_principal()
+    bindings: dict[str, Any] | None = None
+    form: Any = None
+    task = await session.get(Task, task_id) if task_id else None
+    app = await session.get(App, task.app_id if task is not None else app_id) if (task or app_id) else None
+    if app is None or (task_id and task is None):
+        raise CodedHTTPException(404, "应用或待办不存在", "candidates_not_found")
+    if not at_least(await app_role(session, principal, app), "use"):
+        raise CodedHTTPException(403, "你没有这个应用的使用权限，看不到它的候选人", "candidates_forbidden")
+    if task is not None:
+        form = task.form
+        if task.app_version is not None:
+            bindings = await session.scalar(select(AppVersion.bindings).where(
+                AppVersion.app_id == app.id, AppVersion.version == task.app_version))
+    else:
+        version = (await session.execute(select(AppVersion).where(
+            AppVersion.app_id == app.id, AppVersion.version == app.published_version))).scalar_one_or_none() \
+            if app.published_version else None
+        spec = version.spec if version is not None else {}
+        found = entry_of(spec or {}, entry or "") if entry else None
+        form = resolve_form(spec or {}, found.get("form")) if found else None
+        bindings = version.bindings if version is not None else None
+    target = principal_fields(form).get(field or "")
+    if target is None:
+        raise CodedHTTPException(404, "表单里没有这个选人控件", "candidates_not_found")
+    return (await field_pool(session, app, bindings, target)).pick(q, limit)
 
 
 # ---------------------------------------------------------------- 审计

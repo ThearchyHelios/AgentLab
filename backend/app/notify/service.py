@@ -267,22 +267,36 @@ async def notify_task(task_id: str, event: str, *, users: list[str]) -> int:
 
 
 async def notify_run(run_id: str, event: str) -> int:
-    """应用实例结束、失败（run.finished / run.failed）。只推应用发起的运行。"""
+    """应用实例结束、失败（run.finished / run.failed）。只推应用发起的运行。
+
+    状态那一句取自实例页的说法（apps/resolve.instance_state），两边说同一句话：被驳回的（cancelled + end_reason=rejected）
+    走「实例结束」、写「「付款」未确认（被驳回）」；走到「已退回」成果的写「已退回」，不再一律写「已完成」。ok 只在真的
+    办成了（code 是 succeeded）时为真。
+
+    发起人是认证过的身份（run.origin.actor_verified）时，他自己订阅了这件事的个人渠道也收得到（「我发起的实例完成 / 失败」，
+    04-对外集成与触达 B1）。以前这里给 _channels 的 users 是空的，个人渠道勾了这两项永远收不到。自报的署名不算：关登录
+    时谁都能填别人的名字。"""
+    from app.apps.resolve import _trails, instance_state
+
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if run is None or not run.app_id:
             return 0
-        channels = await _channels(session, event, run, [])
+        verified = bool((run.origin or {}).get("actor_verified")) and bool(run.started_by)
+        channels = await _channels(session, event, run, [run.started_by] if verified else [])
         if not channels:
             return 0
         base = await _base_url(session)
         where = await _where(session, run)
+        state = instance_state(run, (await _trails(session, [run]))[run.id])
     finished = event == "run.finished"
-    lines = [("状态", "已完成" if finished else "失败"), ("实例", f"#{run_id[:6]}")]
-    if not finished and run.error_node_id:
+    ok = state["code"] == "succeeded"
+    lines = [("状态", state["text"]), ("实例", f"#{run_id[:6]}")]
+    if not finished and run.error_node_id and state["code"] == "failed":
         lines.append(("失败节点", f"「{_label(run.graph, run.error_node_id)}」"))
-    message = {"event": event, "status": run.status, "ok": finished,
-               "title": f"{where or '应用'}的实例{'已完成' if finished else '失败'}", "lines": lines,
+    head = ("已完成" if ok else "已结束") if finished else ("已结束" if state["code"] == "cancelled" else "失败")
+    message = {"event": event, "status": run.status, "ok": ok,
+               "title": f"{where or '应用'}的实例{head}", "lines": lines,
                "links": [("查看实例", f"{base}/apps/{run.app_id}/i/{run_id}")] if base else [],
                "subject": {"run_id": run_id, "app_id": run.app_id}}
     return await _push(channels, message, subject_kind="run", subject_id=run_id, event=event, run_id=run_id,

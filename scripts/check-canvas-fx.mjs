@@ -706,6 +706,21 @@ await settleCase('取消：清除、回放', [
   ev(9, 'run.cancelled', null, { timing: { wall_ms: 9000, active_ms: 9000, wait_ms: 0 } }, 9),
 ], { text: '已取消', actions: ['清除', '回放'] })
 
+// 人的驳回也是 run.cancelled（reason=rejected，05-已知遗留 (a)）：胶囊写「被驳回」、谁在哪一步驳回，不写「张工 取消了本次运行」
+await settleCase('被驳回：胶囊写被驳回和谁在哪一步驳回', [
+  ev(9, 'run.cancelled', null, { reason: 'rejected', node_id: 'review', label: '主管审批', kind: 'approve', decision: 'reject',
+    actor: '张工', note: '口径不对', timing: { wall_ms: 9000, active_ms: 9000, wait_ms: 0 } }, 9),
+], {
+  text: '被驳回', actions: ['清除', '回放'],
+  more: async (page) => {
+    const cap = await capText(page)
+    check('胶囊不写「已取消」', !cap.includes('已取消'), cap)
+    const title = await capsule(page).locator('.sf-cap-main').getAttribute('title') ?? ''
+    check('一句话写谁在哪一步驳回、备注，不写「取消了本次运行」', title.includes('张工 驳回了「主管审批」：口径不对')
+      && !title.includes('取消了本次运行'), title)
+  },
+})
+
 await settleCase('服务重启挂起：接着跑', [
   ev(9, 'log', null, { level: 'warn', code: 'server_shutdown', message: '服务关闭时这次运行仍在进行，已挂起；重启后可从断点继续运行' }, 9),
 ], {

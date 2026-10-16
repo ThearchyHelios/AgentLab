@@ -70,9 +70,13 @@ NOT_INSTANTIATED = "plan.not_instantiated"
 GRAPH_CHANGED = "plan.graph_changed"
 UNTRIALED = "plan.untrialed"
 TRIAL_FAILED = "plan.trial_failed"
+#: 最近一次试运行在某一步被人驳回、没有走完（cancelled + end_reason=rejected）：人的决定，不是故障，不挡发布、照实说
+TRIAL_REJECTED = "plan.trial_rejected"
 TRIAL_DIFFERS = "plan.trial_differs"
 #: 蓝图检查：写回的结果不明时没人核实（blueprints/ops.blueprint_issues）
 RECONCILER_UNBOUND = "bp.reconciler_unbound"
+#: 蓝图检查：「谁来做」有一步还没定由谁处理；自由形的带着 slot（哪个岗位，核实人是 apps/derive.RECONCILER）
+PEOPLE_UNBOUND = "bp.people_unbound"
 ADMIN_REQUIRED = "plan.admin_required"
 DOWNGRADE_ADMIN = "plan.downgrade_admin"
 PREFLIGHT = "plan.preflight"
@@ -237,8 +241,10 @@ async def _simulated_pins(session: AsyncSession, spec: dict[str, Any], target: _
 def bindings_of(bp: Blueprint) -> dict[str, Any]:
     """岗位绑定：「谁来做」卡片上写了具体的人或组的，按模板定的岗位名绑上（templates/_common.bindings_of）。"""
     from app.blueprints.templates._common import bindings_of as from_cards
+    from app.blueprints.templates._common import with_graph
 
-    return from_cards(bp.spec or {})
+    # 带上蓝图存的图：自由形的核实人要不要绑按导入的图算（05-已知遗留 (d)）
+    return from_cards(with_graph(bp.spec or {}, bp.graph))
 
 
 def grant_items(bp: Blueprint) -> list[tuple[str, str, str]]:
@@ -352,6 +358,14 @@ async def _preflight(session: AsyncSession, bp: Blueprint, target: _Target, *, l
 
         issues = [i for i in issues if i.get("code") != "app.reconciler_unbound"
                   and not (i.get("code") == "app.slot_unbound" and i.get("path") == f"slots.{RECONCILER}")]
+    if unbound := {str(i["slot"]) for i in out if i.get("code") == PEOPLE_UNBOUND and i.get("slot")}:
+        # 自由形的「谁来做」：岗位、核实人没绑，蓝图检查已经指到卡片上那一行（bp.people_unbound 带着 slot），应用检查说的是
+        # 同一件事，不再重复列（同上面核实岗位的办法）
+        from app.apps.derive import RECONCILER
+
+        issues = [i for i in issues if not (i.get("code") == "app.slot_unbound"
+                                            and str(i.get("path") or "").removeprefix("slots.") in unbound)
+                  and not (i.get("code") == "app.reconciler_unbound" and RECONCILER in unbound)]
     out += [{**i, "source": "app"} for i in issues]
     # 授权：给的人和组要在名录里（同授权接口）
     _, problem = await grants_problem(session, grant_items(bp))
@@ -363,11 +377,28 @@ async def _preflight(session: AsyncSession, bp: Blueprint, target: _Target, *, l
     if is_trial_of(trial, bp) and trial.status == "failed":
         why = (trial.error or "").strip().splitlines()[0][:200] if (trial.error or "").strip() else ""
         out.append(_problem(TRIAL_FAILED, f"最近一次试运行失败了{f'：{why}' if why else ''}", source="plan"))
+    elif is_trial_of(trial, bp) and trial.status == "cancelled" and trial.end_reason == "rejected":
+        # 搭建者在试运行里驳回了写入、审批：那是他的决定，不是图出了错，不说成「试运行失败了」、也不挡发布；只照实说
+        # 没走完——驳回之后的步骤没用真数看过
+        where = _node_title(trial.graph, trial.error_node_id)
+        out.append(_problem(TRIAL_REJECTED, f"最近一次试运行{f'在「{where}」' if where else ''}被驳回、没有走完",
+                            "warning", source="plan"))
     elif not is_trial_of(trial, bp) or trial.status != "succeeded":
         out.append(_problem(UNTRIALED, "还没有成功的试运行：发布之前没用真数看过结果", "warning", source="plan"))
     elif graph_hash(trial.graph or {}) != target.digest:
         out.append(_problem(TRIAL_DIFFERS, "发布的内容和最近一次试运行不同：试运行之后又改过", "warning", source="plan"))
     return [_with_who(p) for p in out]
+
+
+def _node_title(graph: Any, node_id: str | None) -> str | None:
+    """节点在图上的名字（没有名字的给 id）；没有节点时为 None。"""
+    if not node_id:
+        return None
+    for node in (graph or {}).get("nodes") or []:
+        if isinstance(node, dict) and node.get("id") == node_id:
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            return str(data.get("label") or node_id)
+    return node_id
 
 
 def _with_who(issue: dict[str, Any]) -> dict[str, Any]:
@@ -428,6 +459,7 @@ def _summary(bp: Blueprint, target: _Target, *, level: str, first_run: bool, opt
         if current and current > target.version else ""
     codes = {p.get("code") for p in problems}
     tried = "；发布的内容和最近一次试运行不同（试运行之后又改过），建议再试一次" if TRIAL_DIFFERS in codes else \
+        "；最近一次试运行被驳回、没有走完" if TRIAL_REJECTED in codes else \
         "；还没有用真数试运行过" if UNTRIALED in codes else ""
     if target.published_as == level:
         say("publish_workflow", f"「{name}」v{target.version} 已经按{LEVEL_TEXT[level]}级别发布过，不重复发布{tried}")

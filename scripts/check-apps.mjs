@@ -9,10 +9,11 @@
 //     不认识的组件写「此组件需要更新前端」，不报错、不空白；服务端解析出错的组件（problems）列在页面顶上；
 //     有视图在生成时自动重取；
 //   - 入口页：必填没填本地拦下、错误挂到字段下面；服务端 422 的 {errors:[{path, code, message}]} 按 path 挂回字段，
-//     对不上字段的列在表单顶上；⌘/Ctrl+Enter 发起；成功后进实例页；需升级时不让发起；
+//     对不上字段的列在表单顶上；⌘/Ctrl+Enter 发起；成功后进实例页；需升级时不让发起；使用者在选人控件里边输入边按
+//     候选池取候选（GET /api/directory/candidates，只有名字），不在池里的当场说清，不去取整份名录（05-已知遗留 (b)）；
 //   - 实例页：状态（服务端给的说法：结果未知写「等待核实写入结果」）、印章、进度（结果未知的那一步不写「完成」）、
 //     本实例的待办卡（就地处理）；不是处理人的待办表单只画这一步的状态、不去取待办；动作状态（哈希前 8 位、环境；
-//     结果未知的经过记一笔，不当失败原因）；
+//     结果未知的经过记一笔，不当失败原因）；被驳回的实例照服务端的说法写「「付款」未确认（被驳回）」，不写失败（05-已知遗留 (a)）；
 //   - 窄屏（390px）不出横向滚动；
 //   - 页面上直接改（normal-user-apps N6）：有 manage 的人点「编辑」进编辑状态（地址记 edit=1），按草稿解析；点组件是选中、
 //     不打开出处；小工具条改文字只给目录标了 x-text 的属性；隐藏、上移、删除都自动存草稿（PATCH 带整份草稿）后按草稿
@@ -340,6 +341,15 @@ async function open({ width = 1280, height = 900, state }) {
       return route.fulfill({ status: 503, json: { detail: '检查脚本拦下了写请求' } })
     }
     if (p === '/api/auth/me') return route.fulfill({ json: state.me ?? { mode: 'off', username: null, display_name: null, role: 'admin', groups: [], verified: false } })
+    // 使用者选人的候选池（05-已知遗留 (b)）：按段里给的 pool 答；整份名录只给搭建者，使用者取了就是 403
+    if (p === '/api/directory/candidates') {
+      (state.candidateCalls ??= []).push(Object.fromEntries(url.searchParams))
+      return route.fulfill({ json: state.pool ? state.pool(url.searchParams.get('q') ?? '') : { users: [], groups: [], truncated: false } })
+    }
+    if (p === '/api/directory') {
+      state.directoryHits = (state.directoryHits ?? 0) + 1
+      return route.fulfill({ status: 403, json: { detail: '需要搭建者权限' } })
+    }
     if (p === '/api/apps') return route.fulfill({ json: { items: APPS } })
     // 应用详情：默认不给草稿（不进编辑状态）；页面上直接改的段落给 manage 的详情
     if (p === '/api/apps/app_weekly') return route.fulfill({ json: state.detail ?? { ...APPS[0], published: DETAIL.published } })
@@ -360,7 +370,7 @@ async function open({ width = 1280, height = 900, state }) {
     if (p === '/api/apps/app_weekly/pages/detail') return route.fulfill({ json: { ...HOME, page: { id: 'detail', title: '门店明细' }, tree: [] } })
     if (p === '/api/apps/app_claim/pages/home') return route.fulfill({ json: state.claimHome ?? CLAIM_HOME })
     if (/^\/api\/apps\/[^/]+\/instances$/.test(p)) return route.fulfill({ json: { items: p.includes('app_claim') ? [INSTANCE] : [] } })
-    if (p === '/api/apps/app_claim/instances/run_claim_1') return route.fulfill({ json: INSTANCE })
+    if (p === '/api/apps/app_claim/instances/run_claim_1') return route.fulfill({ json: state.instance ?? INSTANCE })
     if (p === `/api/runs/${RUN}/evidence/metrics/kpi/gmv`) {
       state.chainHits = (state.chainHits ?? 0) + 1
       return route.fulfill({ json: state.traced ? METRIC_CHAIN_TRACED : METRIC_CHAIN })
@@ -555,6 +565,46 @@ await section('入口：本地校验、422 挂回字段、发起后进实例页'
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
 })
 
+await section('入口：使用者选人只出候选池里的人，不在池里当场说清（05-已知遗留 (b)）', async () => {
+  const people = [{ username: 'fay', display_name: '费伊' }, { username: 'fin', display_name: '樊宁' }]
+  const apply = CLAIM_HOME.forms.apply
+  const state = {
+    writes: [],
+    me: { mode: 'local', username: 'zhang', display_name: '张三', role: 'user', groups: [], verified: true },
+    claimHome: { ...CLAIM_HOME, forms: { apply: { ...apply, 'x-order': [...apply['x-order'], 'approver'],
+      properties: { ...apply.properties, approver: { type: 'string', title: '审批人', 'x-widget': 'principal' } } } } },
+    pool: (q) => ({ users: people.filter((u) => !q || u.username.startsWith(q) || u.display_name.startsWith(q)),
+      groups: [], truncated: false }),
+  }
+  const { page } = await open({ state })
+  await page.goto(`${WEB}/apps/app_claim/new/apply`)
+  const field = page.locator('[data-schema-form] [data-field="approver"]')
+  await field.waitFor({ timeout: 15000 })
+  const input = field.locator('input.field')
+  await input.fill('费')
+  await page.waitForFunction(() => !!document.querySelector('[data-field="approver"] datalist option'), null, { timeout: 5000 })
+    .catch(() => {})
+  const options = await field.locator('datalist option').evaluateAll((els) => els.map((e) => `${e.getAttribute('value')}|${e.textContent}`))
+  check('边输入边按开头取候选：列表里是候选池给的人，显示名作说明', options.join(',') === 'fay|费伊', options.join(','))
+  const asked = (state.candidateCalls ?? []).at(-1) ?? {}
+  check('……按这个入口、这个字段问（purpose=form）', asked.purpose === 'form' && asked.app_id === 'app_claim'
+    && asked.entry === 'apply' && asked.field === 'approver' && asked.q === '费', JSON.stringify(asked))
+  check('……不去取整份名录（使用者读不到）', !state.directoryHits, String(state.directoryHits ?? 0))
+  await input.fill('wangwu')
+  await input.press('Enter')
+  const refused = field.locator('[data-principal-refused="hard"]')
+  await refused.waitFor({ timeout: 5000 }).catch(() => {})
+  check('不在池里的名字当场说清，不收', (await refused.count()) === 1
+    && (await refused.innerText()).includes('「wangwu」不在可选的人里') && (await field.locator('[data-principal]').count()) === 0)
+  await input.fill('fay')
+  await input.press('Enter')
+  const chip = field.locator('[data-principal="user"] span[title]')
+  await chip.waitFor({ timeout: 5000 }).catch(() => {})
+  check('选中的人写显示名，悬停给用户名', (await chip.count()) === 1 && (await chip.innerText()) === '费伊'
+    && (await chip.getAttribute('title')) === 'fay')
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+})
+
 await section('入口：需升级时不让发起', async () => {
   const state = { writes: [], claimHome: { ...CLAIM_HOME, app: { ...CLAIM_HOME.app, needs_upgrade: true } } }
   const { page } = await open({ state })
@@ -565,6 +615,29 @@ await section('入口：需升级时不让发起', async () => {
 })
 
 // ---------------------------------------------------------------- 实例
+
+await section('实例页：被驳回写人的决定，不写失败（05-已知遗留 (a)）', async () => {
+  // 服务端：动作确认被驳回，运行收成 cancelled + end_reason=rejected；实例状态、进度的说法都是服务端给的（instance_state）
+  const said = { status: 'cancelled', status_code: 'cancelled', status_text: '「付款」未确认（被驳回）' }
+  const view = { ...INSTANCE.view, sources: {}, tree: [
+    { id: 'inst_header', type: 'instance_header', props: {}, data: { ...INSTANCE.view.tree[0].data, ...said, pending_tasks: 0,
+      finished_at: ago(60_000) } },
+    { id: 'inst_timeline', type: 'instance_timeline', props: {}, data: { state: 'ok', ...said, steps: [
+      { node: 'input', title: '报销单', state: 'done', text: '完成', at: ago(1790_000) },
+      { node: 'pay', title: '付款', state: 'rejected', text: '未确认（被驳回）', at: ago(60_000) },
+    ] } },
+  ] }
+  const state = { writes: [], instance: { ...INSTANCE, ...said, pending_tasks: 0, finished_at: ago(60_000), view } }
+  const { page } = await open({ state })
+  await page.goto(`${WEB}/apps/app_claim/i/run_claim_1`)
+  await page.locator('[data-view-renderer]').waitFor({ timeout: 15000 })
+  const header = page.locator('[data-component="instance_header"]')
+  check('实例状态写「「付款」未确认（被驳回）」', (await header.innerText()).includes('「付款」未确认（被驳回）'),
+    (await header.innerText()).replace(/\n/g, ' '))
+  check('……不写「失败」', !(await page.locator('[data-instance-page]').innerText()).includes('失败'))
+  check('被驳回的那一步写未确认（被驳回）', (await page.locator('[data-timeline-step="rejected"]').innerText()).includes('未确认（被驳回）'))
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+})
 
 await section('实例页：状态、进度、待办卡、动作状态', async () => {
   const state = { writes: [] }

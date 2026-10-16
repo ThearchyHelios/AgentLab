@@ -51,6 +51,8 @@ NEEDS_UPGRADE = "app_needs_upgrade"
 
 STATUS_TEXT = {"queued": "排队中", "running": "运行中", "interrupted": "等待处理", "succeeded": "已完成",
                "failed": "失败", "cancelled": "已取消"}
+#: 被驳回、又说不出是哪一步时（没有节点可指）的说法
+REJECTED_TEXT = "被驳回"
 TIER_TEXT = {"formal": "完整出具", "degraded": "降档出具", "withheld": "不予出具"}
 NO_TIER = "未声明出具契约"
 #: 蓝图试运行（docs/design/normal-user-apps.md N4）：印章的来源、说明，趋势只有一个点时的说明，预览里入口按钮为什么点不了
@@ -1277,8 +1279,9 @@ async def _trails(session: AsyncSession, runs: list[Run]) -> dict[str, _Trail]:
     for row in (await session.execute(select(ActionRecord).where(ActionRecord.run_id.in_(ids))
                                       .order_by(ActionRecord.created_at, ActionRecord.attempt))).scalars():
         out[row.run_id].actions.append(row)
-    # 节点事件只有结束了的运行要看（走到了哪个成果节点、停在哪个节点上）
-    wanted = [r.id for r in runs if r.status in ("succeeded", "failed")]
+    # 节点事件只有结束了的运行要看（走到了哪个成果节点、停在哪个节点上）。取消的只有被驳回的要看（停在哪一步）
+    wanted = [r.id for r in runs if r.status in ("succeeded", "failed")
+              or (r.status == "cancelled" and r.end_reason == "rejected")]
     if wanted:
         for run_id, etype, node_id in (await session.execute(
                 select(RunEvent.run_id, RunEvent.type, RunEvent.node_id).where(
@@ -1325,6 +1328,26 @@ def rejected_outputs(graph: Any) -> dict[str, set[str]]:
     return out
 
 
+def _rejection_text(trail: _Trail, node_id: str, title: str) -> str | None:
+    """停在被人驳回的待办上时怎么说：动作确认写「「付款」未确认（被驳回）」，别的写「「x」被驳回」；不是驳回的为 None。"""
+    kind, decision = _decision(trail, node_id)
+    if kind == "action_confirm" and decision == "reject":
+        return f"「{title}」未确认（被驳回）"
+    if decision in _REJECTIONS:
+        return f"「{title}」被驳回"
+    return None
+
+
+async def legacy_rejected(session: AsyncSession, run: Run) -> bool:
+    """加 end_reason 之前被人驳回的运行记的是 failed（封存不改写）：失败的那一步上最近一条处理完的待办是驳回。和实例页
+    认存量驳回（instance_state 的 failed 分支）是同一份判断；runner 据此不许它接着跑。"""
+    if run.status != "failed":
+        return False
+    trail = (await _trails(session, [run]))[run.id]
+    failed = [nid for etype, nid in trail.events if etype == "node.failed"]
+    return bool(failed) and _decision(trail, failed[-1])[1] in _REJECTIONS
+
+
 def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
     """实例给人看的状态 {code, text}：code 是界面画状态标记用的状态（运行的那几种，加 held），text 说这件事办到哪了、
     结论是什么，不只是运行状态（P1）。
@@ -1334,10 +1357,12 @@ def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
       否定的那种结局——这次运行里人工节点驳回了、从它的「驳回」出口一路走到的成果节点（rejected_outputs）——code 记
       cancelled（同「未确认（被驳回）」，是人的决定，不画成成功），文字照旧写成果节点的标题；
     - 停着：有已发出、结果未知的动作，写「等待核实写入结果」；否则按在等的待办说（等待审批、等待确认发送……）；
-    - 失败：停在一个被人驳回的待办上的——动作确认被驳回（「付款」未确认（被驳回））、审批设了驳回即终止、补充输入被
-      驳回——是人的决定，不是故障，code 记 cancelled；核实为未生效、选了放弃的同理。外部系统拒绝之类照写失败。
+    - 被驳回（cancelled + end_reason=rejected，engine/context.NodeRejected）：动作确认被驳回写「「付款」未确认（被驳回）」，
+      审批设了驳回即终止、补充输入被驳回等写「「x」被驳回」，code 记 cancelled；手动停止的写「已取消」；
+    - 失败：加 end_reason 之前被人驳回的运行记的是 failed（封存不改写），停在被驳回的待办上的照上一条说，和新形状说法
+      一样；核实为未生效、选了放弃的同理，code 记 cancelled。外部系统拒绝之类照写失败。
 
-    运行本身的状态不改（驳回动作确认在引擎里就是节点失败、运行结束）：这里只是把它说清楚。"""
+    通知（notify/service.notify_run）的文字也取自这里：实例页和推送说同一句话。"""
     from app.apps.tree import node_map
 
     nodes = node_map(run.graph)
@@ -1360,15 +1385,18 @@ def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
             negative = any(_decision(trail, gate)[1] in _REJECTIONS for gate in gates)
             return {"code": "cancelled" if negative else "succeeded", "text": title(reached[0])}
         return {"code": "succeeded", "text": STATUS_TEXT["succeeded"]}
+    if run.status == "cancelled" and run.end_reason == "rejected":
+        failed = [nid for etype, nid in trail.events if etype == "node.failed"]
+        node_id = run.error_node_id or (failed[-1] if failed else None)
+        said = _rejection_text(trail, node_id, title(node_id)) if node_id else None
+        # 待办没留下（老的审批、没开出待办）时按驳回的那一步说，不退回「已取消」：这是人的决定，不是有人停了它
+        return {"code": "cancelled", "text": said or (f"「{title(node_id)}」被驳回" if node_id else REJECTED_TEXT)}
     if run.status == "failed":
         failed = [nid for etype, nid in trail.events if etype == "node.failed"]
         if failed:
             node_id = failed[-1]
-            kind, decision = _decision(trail, node_id)
-            if kind == "action_confirm" and decision == "reject":
-                return {"code": "cancelled", "text": f"「{title(node_id)}」未确认（被驳回）"}
-            if decision in _REJECTIONS:
-                return {"code": "cancelled", "text": f"「{title(node_id)}」被驳回"}
+            if said := _rejection_text(trail, node_id, title(node_id)):
+                return {"code": "cancelled", "text": said}
             record = next((a for a in reversed(trail.actions) if a.node_id == node_id), None)
             if record is not None and record.state == "failed":
                 if (record.resolution or {}).get("outcome") == "abandon":

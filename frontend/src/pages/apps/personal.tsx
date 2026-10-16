@@ -171,7 +171,7 @@ function ReviewDialog({ appId, onClose, onSent }: {
         <p className="text-xs leading-relaxed text-dim">{T.reviewIntro}</p>
         <div>
           <div className="label"><UserRound size={11} aria-hidden className="mr-1 inline" />{T.reviewTo}</div>
-          <PrincipalPicker single value={to} onChange={setTo} label={T.reviewTo} />
+          <PrincipalPicker single value={to} onChange={setTo} label={T.reviewTo} source={{ purpose: 'review' }} />
           <p className="mt-1 text-2xs text-faint">{T.reviewToHint}</p>
         </div>
         <div>

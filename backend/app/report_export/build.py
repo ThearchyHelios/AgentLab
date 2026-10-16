@@ -320,7 +320,8 @@ def build_report(
 ) -> dict[str, Any]:
     """页面里的数据（report-data）。
 
-    - run：运行记录的几样（id、workflow_id、workflow_name、run_class、status、started_at、finished_at）
+    - run：运行记录的几样（id、workflow_id、workflow_name、run_class、status、end_reason、started_at、finished_at）；
+      end_reason 分开同是 cancelled 的被驳回和手动停止（05-已知遗留 (a)）
     - report_node / doc_artifact / doc_hash_ok：选中的报告节点、它的文档工件、取回时哈希核对的结果
     - doc：报告文档（正文的服务端渲染另走 render_body，这里不给：数据块只装点开数字要用的东西）
     - seal：{_sealed 的 seal 字段里的几样}（sealed、ok、manifest_hash、manifest_seq）
@@ -334,6 +335,7 @@ def build_report(
         "meta": {
             "run_id": run.get("id"), "workflow_id": run.get("workflow_id"),
             "workflow_name": display_name(run), "run_class": run.get("run_class"), "status": run.get("status"),
+            "end_reason": run.get("end_reason"),
             "started_at": _iso(run.get("started_at")), "finished_at": _iso(run.get("finished_at")),
             "report": {"node_id": report_node, "label": (nodes.get(report_node) or {}).get("label") or report_node},
             "doc_artifact": doc_artifact, "doc_hash_ok": doc_hash_ok,

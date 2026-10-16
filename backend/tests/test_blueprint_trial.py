@@ -157,7 +157,7 @@ async def test_process_trial_assigns_every_step_to_the_trial_runner_and_never_es
     assert task.due_at is not None and task.on_timeout["action"] == "escalate"
 
     # 时限到了：调度不升级试运行的待办（同一个库里别的测试的待办照常处理，只看这一条）
-    await tasks.tick(utcnow() + timedelta(hours=2))
+    assert task.id not in await tasks.tick(utcnow() + timedelta(hours=2))
     async with SessionLocal() as session:
         task = await session.get(Task, task.id)
         count = len(list((await session.execute(select(TaskAssignment).where(

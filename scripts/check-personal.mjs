@@ -7,7 +7,8 @@
 //   - 「刷新」写明今天还剩几次（服务端在详情和刷新回包里给）：点一次发 POST /refresh，剩余跟着回包变；用完了按钮置灰、
 //     写「今天的刷新次数已用完」；服务端回 429 时照实说服务端的原话，不当成网络错误；
 //   - 「提交审核」：没选人不让提交；选一位搭建者或一个组、附一句说明，POST /submit-review 带 {to, note}；提交后写
-//     「审核中」和交给了谁，不再给提交按钮；
+//     「审核中」和交给了谁，不再给提交按钮；选审核的人按候选池取（purpose=review：启用的搭建者和管理员，只有名字），
+//     不在池里的当场说清（05-已知遗留 (b)）；
 //   - 审核状态以服务端为准（详情的 personal，形状同服务端 blueprints/personal.personal_state）：审核待办还在等写「审核中」；
 //     结论是已发布写「已有正式版本：去看看」并链到那个应用；
 //     详情没给时看蓝图的状态（in_review 写「审核中」）；
@@ -134,6 +135,13 @@ async function open({ state, width = 1280, height = 900 }) {
       return route.fulfill({ status: 503, json: { detail: '检查脚本拦下了写请求' } })
     }
     if (p === '/api/auth/me') return route.fulfill({ json: state.me ?? USER })
+    // 提交审核选人的候选池（purpose=review）：启用的搭建者和管理员，只有名字
+    if (p === '/api/directory/candidates') {
+      (state.candidateCalls ??= []).push(Object.fromEntries(url.searchParams))
+      const builders = [{ username: 'lisi', display_name: '李四' }, { username: 'root', display_name: '管理员甲' }]
+      return route.fulfill({ json: { users: builders.filter((u) => u.username.startsWith(url.searchParams.get('q') ?? '')),
+        groups: [], truncated: false } })
+    }
     if (p === '/api/tasks/count') return route.fulfill({ json: { mine: 0, apps: 0, other: 0 } })
     if (p === '/api/tasks') return route.fulfill({ json: { items: [] } })
     if (p === '/api/apps') {
@@ -240,8 +248,15 @@ await section('提交审核：选人才能交、带说明；提交后写「审�
   await dlg.locator('[data-personal-review-dialog]').waitFor({ timeout: 5000 })
   check('写明搭建者在副本上发布、个人应用不会被改动', /副本/.test(await dlg.innerText()) && /不会被改动/.test(await dlg.innerText()))
   check('没选人不让提交', await dlg.locator('[data-personal-review-submit]').isDisabled())
+  await dlg.getByRole('textbox', { name: '交给谁审核' }).fill('wangwu')
+  await dlg.getByRole('button', { name: '添加' }).click()
+  await dlg.locator('[data-principal-refused="hard"]').waitFor({ timeout: 5000 }).catch(() => {})
+  check('不是搭建者的名字当场说清，不收', /「wangwu」不在可选的人里/.test(await dlg.locator('[data-principal-refused]').innerText().catch(() => '')))
+  check('……候选按提交审核的池问（purpose=review）', (state.candidateCalls ?? []).some((c) => c.purpose === 'review'),
+    JSON.stringify(state.candidateCalls ?? []))
   await dlg.getByRole('textbox', { name: '交给谁审核' }).fill('lisi')
   await dlg.getByRole('button', { name: '添加' }).click()
+  await dlg.locator('[data-principal="user"]').waitFor({ timeout: 5000 }).catch(() => {})
   await dlg.locator('#personal-review-note').fill('门店店长都想看')
   await dlg.locator('[data-personal-review-submit]').click()
   await page.locator('[data-personal-review="in_review"]').waitFor({ timeout: 5000 }).catch(() => {})

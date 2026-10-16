@@ -106,3 +106,33 @@ class NodeError(RuntimeError):
         super().__init__(message)
         self.node_id = node_id
         self.retryable = retryable
+
+
+#: 驳回发生在哪种关卡上（NodeRejected.kind）：人工节点的三种模式、写入前的动作确认、代码执行审批、工具调用审批、双盲裁决
+REJECTION_KINDS = ("approve", "input", "edit", "action_confirm", "code", "tool", "dual_check")
+
+
+class NodeRejected(NodeError):
+    """人的决定让运行到这里结束：驳回、超时驳回（docs/design/next-round/05-已知遗留.md (a)）。
+
+    这不是故障。以前六处驳回都抛普通的 NodeError，运行记成 failed：通知推「实例失败」，定时推「运行失败」，发布单把
+    驳回过的试运行说成「试运行失败了」，记录页还给「继续运行」——接着跑只会读到同一个驳回答复、再停一次。现在 runner
+    单独接住它，收成 cancelled + end_reason=rejected，run.cancelled 带上在哪一步、谁、结论和备注，消费方都读这一个字段。
+
+    是 NodeError 的子类：节点这一步照旧记 node.failed（时间线、实例进度按它收尾）；但不重试、不被 on_error=continue
+    接住（engine/compiler._execute：那两项是给故障准备的，驳回被吞掉运行就以 succeeded 结束了）。原话（str）照旧写给人看，
+    Run.error 和以前一字不差。kind 见 REJECTION_KINDS；decision 是 reject 或 expired_reject（同待办的结论）。"""
+
+    def __init__(self, node_id: str, message: str, *, kind: str, decision: str = "reject",
+                 actor: str | None = None, note: str = "") -> None:
+        super().__init__(node_id, message)
+        self.kind = kind
+        self.decision = decision
+        self.actor = actor
+        self.note = note
+
+    @classmethod
+    def of(cls, ctx: Any, message: str, *, kind: str, decision: Any) -> NodeRejected:
+        """按节点上下文和读出来的审批结论（engine/approval.Decision）造一个：谁驳回的取 ctx.actor()。"""
+        return cls(ctx.node.id, message, kind=kind, decision="expired_reject" if decision.expired else "reject",
+                   actor=ctx.actor(), note=decision.note or "")

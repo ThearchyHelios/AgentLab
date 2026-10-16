@@ -45,6 +45,21 @@ export interface BpStep {
 
 export interface BpField { name: string; spec: BpItem<Record<string, any>>; sensitive: boolean }
 
+/**
+ * 自由形「谁来做」的一行。slot：图里引用的一个岗位（path 是 /people/<i>/who，只定由谁做）；reconciler：写入能力没登记查询时
+ * 的核实人（path 是 /writeback/reconciler）；initiator / expression / hook：不按岗位派的步骤，只读（path 为空）。
+ * label 是节点在图上的名字，detail 写全每一处用途
+ */
+export interface DerivedPerson {
+  kind: 'slot' | 'reconciler' | 'initiator' | 'expression' | 'hook'
+  slot: string | null
+  label: string
+  detail: string
+  path: string | null
+  who: BpPrincipal[] | null
+  uses: { node_id: string; title: string; role: string }[]
+}
+
 export interface BpWriteback {
   capability: BpItem<string>
   mapping: BpItem<Record<string, string>>
@@ -132,6 +147,11 @@ export interface Blueprint {
    * templates/_common.needs_reconciler，界面不自己判）。老服务端不给时按不要
    */
   reconciler_needed?: boolean
+  /**
+   * 自由形按导入的图列出的「谁来做」（服务端 templates/freeform.people_rows，05-已知遗留 (d)）：界面照这一份画，不自己从图里推。
+   * 别的模板、老服务端为空
+   */
+  derived_people?: DerivedPerson[] | null
   /** 蓝图检查（bp.* / tpl.*），带白话 */
   issues?: PlainIssue[]
   created_at: string

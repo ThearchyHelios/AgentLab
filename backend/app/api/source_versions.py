@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
 from app.api.datasources import _out
-from app.api.deps import signer_of
+from app.api.deps import signer_of, signer_verified
 from app.data import source_versions, table_versions
 from app.data.recipe_imports import ImportRefused
 from app.db.base import get_session
@@ -170,7 +170,8 @@ async def remove_period(source_id: str, import_id: str, request: Request, x_acto
     source = await _source(session, source_id)
     try:
         out = await source_versions.remove_period(session, source, import_id, expected_current=expected,
-                                                  reason=reason or "", signed_by=_signed(body, x_actor))
+                                                  reason=reason or "", signed_by=_signed(body, x_actor),
+                                                  signer_verified=signer_verified())
     except _REFUSALS as e:
         raise _refused(e) from e
     return {"source": await _source_out(session, source_id), **out}
@@ -193,7 +194,7 @@ async def revoke_acceptance(source_id: str, import_id: str, request: Request,
     try:
         out = await source_versions.revoke_acceptance(
             session, source, import_id, expected_current=expected, expected_target=target, ack_mask_lost=ack,
-            reason=reason or "", signed_by=_signed(body, x_actor))
+            reason=reason or "", signed_by=_signed(body, x_actor), signer_verified=signer_verified())
     except _REFUSALS as e:
         raise _refused(e) from e
     return {"source": await _source_out(session, source_id), **out}

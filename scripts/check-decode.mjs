@@ -2724,5 +2724,32 @@ await section('读入附件 file.extracted：读入多少字、全文多少字�
     && odd[0]?.title === '读入附件' && odd[2]?.title === '附件抽不出文字', odd.map((s) => `${s.title}|${s.sub ?? ''}`).join(' ; '))
 })
 
+await section('人的驳回 run.cancelled reason=rejected（05-已知遗留 (a)）：终态是「被驳回」，副标题写谁、哪一步、备注；手动停止照旧「已取消」', async () => {
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: seq, data })
+  const head = [E(1, 'run.started', null, { nodes: 2 }), E(2, 'node.started', 'pay', { label: '付款' }),
+    E(3, 'human.requested', 'pay', { title: '确认发送：付款' }), E(4, 'human.resolved', 'pay', { approved: false, note: '金额不对', actor: '张工' }),
+    E(5, 'node.failed', 'pay', { error: '「付款」未确认（被驳回），没有发送：金额不对' })]
+  const ended = (data) => flatten(mod.decodeRun([...head, E(6, 'run.cancelled', null, data)]))
+    .find((s) => s.kind === 'lifecycle' && s.id === 'rc-6')
+  const rejected = ended({ reason: 'rejected', node_id: 'pay', label: '付款', kind: 'action_confirm', decision: 'reject',
+    actor: '张工', note: '金额不对' })
+  check('标题写「被驳回」，不写「已取消」「失败」', rejected?.title === '被驳回' && rejected?.status === 'cancelled',
+    `${rejected?.title} / ${rejected?.status}`)
+  check('副标题写谁在哪一步驳回、备注', rejected?.sub === '张工 驳回了「付款」：金额不对', rejected?.sub)
+  check('指向驳回的那一步（点了画布取景过去）', rejected?.nodeId === 'pay', rejected?.nodeId)
+  const anonymous = ended({ reason: 'rejected', node_id: 'pay', label: '付款', decision: 'reject', actor: null, note: '' })
+  check('没署名、没备注：「「付款」被驳回」，不出 null、undefined', anonymous?.sub === '「付款」被驳回', anonymous?.sub)
+  const expired = ended({ reason: 'rejected', node_id: 'pay', label: '付款', decision: 'expired_reject', actor: null,
+    note: '超过时限，按设置驳回' })
+  check('超时驳回：写按设置驳回，备注不重复', expired?.sub === '「付款」超过时限，按设置驳回', expired?.sub)
+  const phase = mod.decodePhase([...head, E(6, 'run.cancelled', null, { reason: 'rejected' })])
+  check('相位收成 cancelled（不是 failed、不给继续运行）', phase === 'cancelled', phase)
+  const stopped = ended({ reason: 'stopped', actor: '李工' })
+  check('手动停止照旧「已取消」，写谁停的', stopped?.title === '已取消' && stopped?.sub === '李工 取消了本次运行',
+    `${stopped?.title} / ${stopped?.sub}`)
+  const legacy = ended({})
+  check('老事件（没有 reason）照旧「已取消」', legacy?.title === '已取消', legacy?.title)
+})
+
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')
 process.exit(failed ? 1 : 0)

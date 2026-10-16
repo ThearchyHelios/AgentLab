@@ -3,7 +3,7 @@ import clsx from 'clsx'
 import type { CheckResult, ImportAcceptance, ManifestOut } from '../../types'
 import { CopyButton, Notice } from '../../components/ui'
 import { formatBytes, formatCost, formatDateTime, formatTokens } from '../../lib/format'
-import { RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, VERSIONS_TEXT as VT } from '../../lib/terms'
+import { RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, SIGNER_TEXT, VERSIONS_TEXT as VT } from '../../lib/terms'
 import { CheckStatusChip } from './ImportReceipt'
 import { ReceiptSummary } from './ReceiptBlocks'
 
@@ -79,7 +79,11 @@ export function ManifestBody({ m, fileName, rawState, recipeSeq }: {
               {short(c.file?.raw_sha256) && <span className="mono text-dim">{VT.sha(short(c.file?.raw_sha256))}</span>}
               {rawState != null && <span className="chip">{RAW_STATE_LABEL[rawState] ?? rawState}</span>}
             </div>
-            {c.signed_by?.name && <div className="text-2xs text-faint">{VT.signedBy(c.signed_by.name)}</div>}
+            {c.signed_by?.name && (
+              <div className="text-2xs text-faint" data-manifest-signer={c.signed_by.verified ? 'verified' : 'self'}>
+                {signerText(c.signed_by.name, !!c.signed_by.verified)}
+              </div>
+            )}
           </Block>
 
           <Block id="recipe" title={B.recipe}>
@@ -146,7 +150,9 @@ export function ManifestBody({ m, fileName, rawState, recipeSeq }: {
                       </span>
                     </div>
                     <div className="flex flex-wrap gap-x-2 text-2xs text-faint">
-                      <span>{VT.signedBy(a.signed_by || VT.unsigned)}</span>
+                      {/* 接受理由由提交这一期的人写，署名同清单的 signed_by：是不是登录身份按清单里记下的说 */}
+                      <span>{a.signed_by ? signerText(a.signed_by, !!c.signed_by?.verified && a.signed_by === c.signed_by.name)
+                        : VT.signedBy(VT.unsigned)}</span>
                       {a.at && <span className="tnum">{formatDateTime(a.at)}</span>}
                     </div>
                   </li>
@@ -234,4 +240,12 @@ function RawJson({ summary, value, attr }: { summary: string; value: unknown; at
       </div>
     </details>
   )
+}
+
+/**
+ * 留痕里的署名怎么说：按记下的「是否认证」写「登录身份：x」或「署名（未认证）：x」（05-已知遗留 (c)），和确认框里那一行
+ * （VersionsDialog 的 signerLine）同一套说法。旧清单记的是未认证，照记下的说
+ */
+export function signerText(name: string, verified: boolean): string {
+  return verified ? SIGNER_TEXT.signedIn(name) : VT.signedBy(name)
 }

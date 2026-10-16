@@ -12,7 +12,7 @@
 import { useEffect, useId, useState } from 'react'
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import clsx from 'clsx'
-import type { FormError, FormField, FormSchema } from '../typesApp'
+import type { CandidateSource, FormError, FormField, FormSchema } from '../typesApp'
 import { FORM_TEXT } from '../lib/termsApp'
 import {
   fieldOfPath, fieldOrder, fileLimitsOf, localToRfc3339, optionsOf, rfc3339ToLocal, widgetOf,
@@ -88,6 +88,16 @@ export function SchemaForm({ schema, value, onChange, errors, readOnly, onSubmit
   )
 }
 
+/**
+ * 选人控件的候选从哪个池取：表单用在入口（app_id + entry）、待办（task_id）上时，按这个字段问服务端（05-已知遗留 (b)）；
+ * 蓝图试运行之类没有应用的地方不给（搭建者用整份名录）
+ */
+function principalSource(context: Record<string, string> | undefined, field: string): CandidateSource | undefined {
+  if (context?.task_id) return { purpose: 'form', task_id: context.task_id, field }
+  if (context?.app_id && context.entry) return { purpose: 'form', app_id: context.app_id, entry: context.entry, field }
+  return undefined
+}
+
 function FieldRow({ id, name, field, required, value, error, readOnly, onChange, fileContext }: {
   id: string; name: string; field: FormField; required: boolean; value: unknown; error?: FormError
   readOnly: boolean; onChange: (v: unknown) => void; fileContext?: Record<string, string>
@@ -143,7 +153,7 @@ function FieldRow({ id, name, field, required, value, error, readOnly, onChange,
         <div className="label">{label}</div>
         {readOnly
           ? <div className="text-xs text-fg">{typeof value === 'string' && value ? value : '—'}</div>
-          : <PrincipalPicker single label={title}
+          : <PrincipalPicker single label={title} source={principalSource(fileContext, name)}
                              value={typeof value === 'string' && value ? [{ kind: 'user', name: value }] : []}
                              onChange={(list) => onChange(list[0]?.name || undefined)} />}
         {foot}

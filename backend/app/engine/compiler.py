@@ -10,7 +10,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
-from app.engine.context import NodeContext, NodeError, RunContext
+from app.engine.context import NodeContext, NodeError, NodeRejected, RunContext
 from app.engine.expressions import open_template_scope, template_scope
 from app.engine.nodes import (
     challenge, control, dual_check, human, io, knowledge, llm, merge, metrics, multi, report, tools,
@@ -144,6 +144,13 @@ def _wrap(
                 raise
             except asyncio.CancelledError:
                 raise
+            except NodeRejected as e:
+                # 人的决定（驳回、超时驳回），不是故障（总方案 X9）：「失败重试」「出错时继续」都是给故障准备的。重试只会把
+                # 同一件事再问一遍人；on_error=continue 会把驳回吞掉接着往下走，最后以 succeeded 结束，通知、定时推送、
+                # 发布单都看不到这次驳回。所以不重试、不被容错接住；节点这一步照旧记一条 node.failed（时间线、实例进度
+                # 按它收尾这一步），交给 runner 收成 cancelled + end_reason=rejected
+                last_error = e
+                break
             except Exception as e:  # noqa: BLE001
                 # NodeError 以前在这里直接 raise，于是节点自己抛的错既不重试、
                 # 也不发 node.failed、更不被 on_error=continue 接住。而 NodeError
@@ -168,8 +175,8 @@ def _wrap(
         ctx.emit(EventType.NODE_FAILED, error=message, duration_ms=elapsed, node_id=node.id,
                  detail=_detail(last_error))
 
-        # 容错模式：记下错误继续往下走，而不是让整张图挂掉
-        if node.config.get("on_error") == "continue":
+        # 容错模式：记下错误继续往下走，而不是让整张图挂掉。驳回不算错误，不走这里（见上）
+        if node.config.get("on_error") == "continue" and not isinstance(last_error, NodeRejected):
             return {
                 "nodes": {node.id: {"error": message, "failed": True}},
                 "trail": [{"node_id": node.id, "error": message, "ts": time.time()}],

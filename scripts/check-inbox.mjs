@@ -11,7 +11,8 @@
 //   - 不是派给我的（can_respond 为假）：只读，写明原因；同意过、还在等别人的写「你已处理：同意」，不写「没有派给你」；
 //   - 升级之后：升级加派的那一份不算进会签人数，另写升级后的规则（升级给谁、其中一人说了算），名单里标「升级」；
 //     待办箱一行写所属实例，同标题的分得开；
-//   - 补充输入带表单的：本地校验，服务端 422 的错误挂回字段；
+//   - 补充输入带表单的：本地校验，服务端 422 的错误挂回字段；表单里的选人控件按这条待办的候选池取候选（使用者读不到
+//     整份名录），不在池里的服务端 422（code=principal）挂回那个字段（05-已知遗留 (b)）；
 //   - 关登录时签批人一行写本机署名；会签只记下一票（resolved 为假）时提示「等待其他人处理」；
 //   - 审核个人应用（kind=review，payload 同服务端 blueprints/personal.review_payload）：写提交人（显示名）、目的、说明；没有
 //     「同意」——「取副本，去发布」调 POST /api/blueprints/{id}/copy 后进副本蓝图；取过的给「打开我的副本」（只认自己取的那
@@ -133,6 +134,13 @@ const TASKS = {
         { id: 'bp_daily_mine', owner: '审批人甲', status: 'trialed', app_id: null }] },
     people: { zhangsan: '张三' },
   },
+  // 补充输入里选复核人（选人控件）：使用者按这条待办的候选池选
+  pick: {
+    ...base, id: 'pick', approval_id: 'ap8', kind: 'input', title: '指定复核人',
+    form: { format: 'agentlab.form/1', type: 'object', required: ['reviewer'], properties: {
+      reviewer: { type: 'string', title: '复核人', 'x-widget': 'principal' } } },
+    payload: { kind: 'human_node', message: '请指定复核人' },
+  },
   input: {
     ...base, id: 'input', approval_id: 'ap5', kind: 'input', title: '补填发票信息',
     form: { format: 'agentlab.form/1', type: 'object', required: ['invoice'], properties: {
@@ -162,6 +170,10 @@ async function open(state) {
           return route.fulfill({ status: 422, json: { detail: '表单没有通过校验', code: 'form_invalid', errors: [
             { path: 'invoice', code: 'max_length', message: '最多 20 个字' }] } })
         }
+        if (m[1] === 'pick' && body?.values?.reviewer !== 'fin') {
+          return route.fulfill({ status: 422, json: { detail: '表单没有通过校验', code: 'form_invalid', errors: [
+            { path: 'reviewer', code: 'principal', message: `「${body?.values?.reviewer}」不在可选的人里，请从候选中选择` }] } })
+        }
         const t = TASKS[m[1]]
         // 会签：这一票记下了，还没凑齐
         const resolved = m[1] !== 'signoff'
@@ -171,7 +183,17 @@ async function open(state) {
       if (p === '/api/blueprints/bp_mine/copy') return route.fulfill({ json: { id: 'bp_mine_copy', scope: 'shared', owner: '审批人甲' } })
       return route.fulfill({ status: 503, json: { detail: '检查脚本拦下了写请求' } })
     }
-    if (p === '/api/auth/me') return route.fulfill({ json: { mode: 'off', username: null, display_name: null, role: 'admin', groups: [], verified: false } })
+    if (p === '/api/auth/me') return route.fulfill({ json: state.me ?? { mode: 'off', username: null, display_name: null, role: 'admin', groups: [], verified: false } })
+    if (p === '/api/directory/candidates') {
+      const q = new URL(r.url()).searchParams
+      ;(state.candidateCalls ??= []).push(Object.fromEntries(q))
+      const people = [{ username: 'fin', display_name: '樊宁' }, { username: 'fay', display_name: '费伊' }]
+      return route.fulfill({ json: { users: people.filter((u) => u.username.startsWith(q.get('q') ?? '')), groups: [], truncated: false } })
+    }
+    if (p === '/api/directory') {
+      state.directoryHits = (state.directoryHits ?? 0) + 1
+      return route.fulfill({ status: 403, json: { detail: '需要搭建者权限' } })
+    }
     // 进了副本蓝图之后的页面不在这里查：蓝图一律答「不存在」，不打到真实服务端
     if (p.startsWith('/api/blueprints/')) return route.fulfill({ status: 404, json: { detail: '蓝图不存在或已被删除' } })
     if (p === '/api/tasks/count') return route.fulfill({ json: { mine: Object.keys(TASKS).length, apps: Object.keys(TASKS).length, other: 0 } })
@@ -304,6 +326,31 @@ await section('补充输入：表单校验、422 挂回字段', async () => {
   check('服务端 422 挂回字段', (await form.locator('[data-field="invoice"] [data-field-error="max_length"]').count()) === 1)
   const sent = state.writes.find((w) => w.path === '/api/tasks/input/respond')
   check('提交的是表单的值，decision 是 submit', sent?.body?.decision === 'submit' && sent?.body?.values?.invoice === 'FP-001', JSON.stringify(sent?.body))
+})
+
+await section('补充输入里选人：按待办的候选池取候选，不在池里 422 挂回字段（05-已知遗留 (b)）', async () => {
+  const state = { writes: [], me: { mode: 'local', username: 'zhangsan', display_name: '张三', role: 'user', groups: [], verified: true } }
+  const page = await open(state)
+  await page.goto(`${WEB}/apps/inbox/pick`)
+  const field = page.locator('[data-schema-form] [data-field="reviewer"]')
+  await field.waitFor({ timeout: 15000 })
+  const input = field.locator('input.field')
+  await input.fill('f')
+  await page.waitForFunction(() => document.querySelectorAll('[data-field="reviewer"] datalist option').length > 1, null,
+    { timeout: 5000 }).catch(() => {})
+  const asked = (state.candidateCalls ?? []).at(-1) ?? {}
+  check('按这条待办、这个字段问候选（purpose=form、task_id）', asked.purpose === 'form' && asked.task_id === 'pick'
+    && asked.field === 'reviewer' && !asked.app_id, JSON.stringify(asked))
+  check('……列出池里的人（只有名字），不去取整份名录', (await field.locator('datalist option').count()) === 2 && !state.directoryHits)
+  // 候选接口一时取不到时先收下（提交时服务端判）：这里绕过前端的提前核对，直接看服务端 422 怎么挂回来
+  await page.route('**/api/directory/candidates**', (route) => route.abort())
+  await input.fill('wangwu')
+  await input.press('Enter')
+  await page.locator('[data-task-approve]').click()
+  await field.locator('[data-field-error="principal"]').waitFor({ timeout: 5000 }).catch(() => {})
+  check('服务端 422（code=principal）挂回选人字段', (await field.locator('[data-field-error="principal"]').count()) === 1
+    && (await field.locator('[data-field-error="principal"]').innerText()).includes('不在可选的人里'))
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
 })
 
 await section('审核个人应用：取副本去发布、打开我的副本、退回', async () => {

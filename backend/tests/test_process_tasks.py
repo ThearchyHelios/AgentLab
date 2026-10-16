@@ -271,7 +271,24 @@ async def test_login_on_only_assignees_can_respond():
 # --------------------------------------------------------------------------
 
 
-async def test_escalation_adds_the_director_whose_answer_decides():
+@pytest.fixture
+async def stray_due_task():
+    """别的测试留下的、早就到期、可升级的待办（-n 8 下同一个库里常有）。tick 扫全库，按条数断言的测试会被它带偏：
+    这里先放一条，测试只断言自己造的那条在不在 tick 交回的 id 里（05-已知遗留 (f)）。"""
+    async with SessionLocal() as session:
+        run = Run(workflow_name="别的测试留下的", status="interrupted", graph={}, input={})
+        session.add(run)
+        await session.flush()
+        task = Task(run_id=run.id, node_id="x", kind="approve", title="残留", due_at=utcnow() - timedelta(days=1),
+                    on_timeout={"action": "escalate", "to_slot": "nobody"})
+        session.add(task)
+        await session.commit()
+        yield task.id
+        await session.execute(delete(Run).where(Run.id == run.id))
+        await session.commit()
+
+
+async def test_escalation_adds_the_director_whose_answer_decides(stray_due_task):
     a, b, g, boss = f"a{_u()}", f"b{_u()}", f"finance{_u()}", f"boss{_u()}"
     await _people(a, b, group=g)
     run_id = await _app_run(
@@ -280,9 +297,9 @@ async def test_escalation_adds_the_director_whose_answer_decides():
         {"finance": [{"kind": "group", "name": g}], "director": [{"kind": "user", "name": boss}]})
     task = await _task(run_id)
     assert task.due_at is not None
-    assert await tasks.tick(utcnow()) == 0          # 还没到时限
-    assert await tasks.tick(utcnow() + timedelta(hours=2)) == 1
-    assert await tasks.tick(utcnow() + timedelta(hours=3)) == 0   # 只升一次
+    assert task.id not in await tasks.tick(utcnow())          # 还没到时限
+    assert task.id in await tasks.tick(utcnow() + timedelta(hours=2))
+    assert task.id not in await tasks.tick(utcnow() + timedelta(hours=3))   # 只升一次
     detail = await tasks.detail(task.id, off(None))
     assert detail["escalation_level"] == 1 and detail["status"] == "pending"
     assert ("user", boss, "escalation") in [(x["principal_kind"], x["principal"], x["source"])
@@ -293,13 +310,13 @@ async def test_escalation_adds_the_director_whose_answer_decides():
     assert (await _wait(run_id, ("succeeded", "failed"))).output.get("结论") == "通过"
 
 
-async def test_timeout_reject_never_approves():
+async def test_timeout_reject_never_approves(stray_due_task):
     run = await run_manager.start(
         graph=approval_flow(due="PT30M", on_timeout={"action": "reject"}), input_payload={"q": "x"})
     await _wait(run.id, ("interrupted",))
     await run_manager.wait_idle(run.id)
     task = await _task(run.id)
-    assert await tasks.tick(utcnow() + timedelta(hours=1)) == 1
+    assert task.id in await tasks.tick(utcnow() + timedelta(hours=1))
     final = await _wait(run.id, ("succeeded", "failed"))
     assert final.output.get("结论") == "退回"
     assert len(await _events(run.id, "task.expired")) == 1
@@ -308,16 +325,16 @@ async def test_timeout_reject_never_approves():
     assert row.status == "resolved" and row.outcome["decision"] == "expired_reject"
 
 
-async def test_remind_repeats_every_interval():
+async def test_remind_repeats_every_interval(stray_due_task):
     run = await run_manager.start(
         graph=approval_flow(due="PT1H", on_timeout={"action": "remind", "every": "PT1H"}), input_payload={"q": "x"})
     await _wait(run.id, ("interrupted",))
     await run_manager.wait_idle(run.id)
     task = await _task(run.id)
     later = utcnow() + timedelta(hours=1, minutes=1)
-    assert await tasks.tick(later) == 1
-    assert await tasks.tick(later) == 0
-    assert await tasks.tick(later + timedelta(hours=1)) == 1
+    assert task.id in await tasks.tick(later)
+    assert task.id not in await tasks.tick(later)
+    assert task.id in await tasks.tick(later + timedelta(hours=1))
     assert len(await _events(run.id, "task.reminded")) == 2
     async with SessionLocal() as session:
         assert (await session.get(Task, task.id)).status == "pending"
