@@ -30,7 +30,7 @@ from app.db.base import SessionLocal
 from app.db.models import DataSource
 from app.main import app as _fastapi_app
 from tests.fixtures.catalog import scenic
-from tests.fixtures.sources import drop_source
+from tests.fixtures.sources import drop_source, introspect_now
 
 ACTOR = {"X-Actor": quote("周宁")}
 
@@ -58,8 +58,7 @@ async def make_source(client):
             await session.commit()
             sid = row.id
         made.append(sid)
-        r = await client.post(f"/api/datasources/{sid}/introspect")
-        assert r.status_code == 200, r.text
+        await introspect_now(client, sid)
         if draft is not None:
             r = await client.post(f"/api/datasources/{sid}/catalog/draft", json={"tables": draft})
             assert r.status_code == 200, r.text
@@ -562,8 +561,7 @@ async def test_blocked_profile_says_which_case_by_code(client, make_source, scen
     r = await _start(client, sid, ["visits"])
     assert r.status_code == 409 and r.json()["code"] == "schema_missing" and "探查结构" in r.json()["detail"]
 
-    r = await client.post(f"/api/datasources/{sid}/introspect")
-    assert r.status_code == 200, r.text
+    await introspect_now(client, sid)
 
     async def tampered(*_args, **_kwargs):
         raise table_versions.SnapshotManifestMismatch("数据版本的哈希登记与快照清单不一致，已拒绝查询")

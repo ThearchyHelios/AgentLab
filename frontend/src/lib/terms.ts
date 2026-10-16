@@ -2355,6 +2355,7 @@ export const CATALOG_TEXT = {
   updatedAt: (at: string) => `${at} 修改`,
   notStarted: '尚未建立目录',
   missingBody: '表结构中已没有这张表（可能已删除或改名）。目录仍然保留，可以查看、驳回或删除其中的项。',
+  // 为什么不在（absent_reason）分开说的话见 CATALOG_ABSENT_TEXT；老服务端不给原因时用上面两句
   sectionTable: '表级信息',
   sectionColumns: '列',
   sectionRelations: '关联关系',
@@ -2614,12 +2615,14 @@ export const CATALOG_DRAFT_TEXT = {
   strip: (done: number, total: number) => `正在起草：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
   stripQueued: (total: number) => `起草任务排队中，共 ${formatNumber(total)} 张表`,
   stripQueuedProfile: (total: number) => `起草任务排在剖析任务后面，剖析结束后自动开始（共 ${formatNumber(total)} 张表）`,
+  stripQueuedIntrospect: (total: number) => `起草任务排在探查任务后面，探查结束后自动开始（共 ${formatNumber(total)} 张表）`,
   /** 页头的进度入口：进行中写「起草 3/20」，排队写「起草 排队中」 */
   headerRunning: (done: number, total: number) => `起草 ${formatNumber(done)}/${formatNumber(total)}`,
   headerQueued: '起草 排队中',
   headerRunningHint: (done: number, total: number) => `起草进行中：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，点击查看进度`,
   headerQueuedHint: '起草任务排队中，点击查看',
   headerQueuedProfile: '起草任务排在剖析任务后面，剖析结束后自动开始，点击查看',
+  headerQueuedIntrospect: '起草任务排在探查任务后面，探查结束后自动开始，点击查看',
   stripOpen: '查看进度',
   toast: {
     succeeded: (summary: string) => `数据目录起草完成：${summary}`,
@@ -2783,15 +2786,160 @@ export const CATALOG_DRIFT_TEXT = {
  * 表结构里，数据目录列不出，助手也看不到它们的字段。数据目录页顶部和助手「参考了哪些表」那一行都要说出来。
  */
 export const SCHEMA_PARTIAL_TEXT = {
-  /** 数据目录页顶部：「这个数据源共有 205 张表，只探查了前 200 张」 */
+  /** 数据目录页顶部：「这个数据源共有 3,000 张表，探查范围内 400 张」（有对象索引的源，next-round 03 A1） */
   title: (total: number, explored: number) =>
+    `这个数据源共有 ${formatNumber(total)} 张表，探查范围内 ${formatNumber(explored)} 张`,
+  body: (rest: number) => `其余 ${formatNumber(rest)} 张在探查范围外：对象索引里有它们的名字，但没有读取结构，`
+    + '不在清单中；助手点名范围外的表时会当场读取、加入范围。',
+  next: '要用的表不在清单中：在左上角的搜索框搜索它并「加入范围」，或回到数据源卡片调整「探查范围」后重新探查。',
+  /** 升级前只探查了一部分的老缓存（没有对象索引）：「共 205 张表，只探查了前 200 张」 */
+  legacyTitle: (total: number, explored: number) =>
     `这个数据源共有 ${formatNumber(total)} 张表，只探查了前 ${formatNumber(explored)} 张`,
-  body: (rest: number) => `探查结构时每个数据源最多取 200 张表（按数据库列出的顺序）：生产库动辄上千张，全部取回既慢也看不完。`
-    + `其余 ${formatNumber(rest)} 张不在数据目录中，助手也看不到它们的字段。`,
-  next: '所需的表不在清单中时，请回到数据源卡片换一个 schema，或改用只能看到所需表的数据库账号缩小范围，然后重新「探查结构」。',
+  legacyBody: (rest: number) => `其余 ${formatNumber(rest)} 张不在数据目录中，助手也看不到它们的字段。`,
+  legacyNext: '请回到数据源卡片重新「探查结构」：新的探查会列出全部对象，按探查范围读取结构。',
   /** 助手「参考了哪些表」那一行：「共 205 张，只探查了 200 张」 */
   context: (total: number, explored: number) => `共 ${formatNumber(total)} 张，只探查了 ${formatNumber(explored)} 张`,
 }
+
+// ===========================================================================
+// 后台探查、探查范围、对象索引（next-round 03 A1、A2）。探查结构改成了后台任务：卡片上看进度、能停止、看结果；
+// 几千张表的库只完整读取「探查范围」内的表，全库对象进对象索引
+// ===========================================================================
+
+/** 同源队里排在前面的事（waiting_for）的叫法 */
+export const LANE_KIND_LABEL: Record<string, string> = {
+  draft: '起草任务', profile: '剖析任务', import: '导入目录', sync_draft: '起草', introspect: '探查任务',
+}
+
+export const INTROSPECT_TEXT = {
+  button: '探查结构',
+  buttonHint: '读取探查范围内的表结构并缓存，助手据此编写 SQL。在后台进行，可以离开页面',
+  running: (done: number, total: number) => `探查中 ${formatNumber(done)}/${formatNumber(total)}`,
+  queued: '排队中',
+  queuedBehind: (kind: string) => `排在${LANE_KIND_LABEL[kind] ?? kind}后面，结束后自动开始`,
+  current: (table: string) => `正在读取 ${table}`,
+  stop: '停止',
+  stopHint: '停在当前这一批之后：已读完的表照常更新进表结构，没读的保留上一次的结构',
+  started: (name: string, total: number) => `「${name}」开始探查：探查范围内 ${formatNumber(total)} 张表，在后台进行`,
+  done: (name: string, n: number, outside: number) =>
+    `「${name}」探查完成：${formatNumber(n)} 张表` + (outside ? `，另有 ${formatNumber(outside)} 张在探查范围外` : ''),
+  partial: (name: string, ok: number, failed: number) =>
+    `「${name}」探查完成：${formatNumber(ok)} 张读到了结构，${formatNumber(failed)} 张读不到`,
+  cancelled: (name: string, ok: number, total: number) =>
+    `「${name}」已停止探查：读完的 ${formatNumber(ok)} / ${formatNumber(total)} 张已更新进表结构`,
+  failed: (name: string, error: string) => `「${name}」探查失败：${error}`,
+  interrupted: (name: string) => `「${name}」的探查因服务重启中断：读完的已更新进表结构，请重新探查`,
+  empty: '连接成功，但该 schema 下没有对象，请检查 schema 名称是否正确',
+  /** 卡片上最近一次探查没做完时常驻的一行 */
+  result: {
+    partial: (failed: number) => `上次探查有 ${formatNumber(failed)} 张表读不到结构，其余已更新`,
+    cancelled: (done: number, total: number) =>
+      `上次探查已停止：读完 ${formatNumber(done)} / ${formatNumber(total)} 张，其余保留上一次的结构`,
+    interrupted: '上次探查因服务重启中断：读完的已更新进表结构，其余保留上一次的结构',
+    failed: (error: string) => `上次探查失败：${error}`,
+  } as const,
+  failuresHead: '读不到结构的表',
+  tooLargeAction: '调整探查范围',
+  rerun: '重新探查',
+  /** 卡片上的范围标签：「探查范围 400 / 3,000」 */
+  scopeChip: (inScope: number, total: number) => `探查范围 ${formatNumber(inScope)} / ${formatNumber(total)}`,
+  scopeChipHint: '探查范围内的表读取完整结构；范围外的表在对象索引里有名字，助手点名时按需加入，数据目录页搜得到',
+  schemaChanged: (schema: string) => `已将 schema 改为 ${schema}，正在按新配置探查`,
+  schemaChangedFailed: (schema: string, why: string) =>
+    `schema 已改为 ${schema}，但没能开始探查（${why}）：助手读取的仍是原来的结构。请再次点击「探查结构」`,
+}
+
+export const INTROSPECT_SCOPE_TEXT = {
+  open: '探查范围',
+  openHint: '设定完整读取结构的表：按通配规则包含、排除，或逐张列出',
+  title: (name: string) => `「${name}」的探查范围`,
+  intro: (cap: number, max: number) => `探查结构时只完整读取探查范围内的表（缺省最多 ${formatNumber(cap)} 张，最多可调到 `
+    + `${formatNumber(max)} 张）。全库的对象都在对象索引里：数据目录页搜得到，助手点名范围外的表时当场读取、加入范围。`,
+  modeLabel: '范围',
+  mode: { all: '全部对象', rules: '按规则' } as Record<'all' | 'rules', string>,
+  modeHint: {
+    all: '对象索引里的全部表（排除的除外）；超过上限时探查会被拒绝',
+    rules: '只要命中「包含」的表（排除的除外），加上显式列出的',
+  } as Record<'all' | 'rules', string>,
+  include: '包含',
+  includeHint: '每行一条通配，按表名比较，不区分大小写，如 ord_* 或 *_daily',
+  exclude: '排除',
+  excludeHint: '每行一条通配；排除优先于包含，但排不掉一律在范围内的表',
+  tables: '显式列出的表',
+  tablesHint: '每行一张，一律进范围',
+  removed: '显式移出的表',
+  removedHint: '每行一张；一律在范围内的表也只有在这里移出才会离开范围',
+  views: '包含视图',
+  maxTables: '上限（张）',
+  maxTablesHint: (max: number) => `1 到 ${formatNumber(max)} 之间；规则命中超过上限时探查会被拒绝，不会悄悄截断`,
+  counting: '正在计算命中数…',
+  hits: (n: number, cap: number) => `命中 ${formatNumber(n)} 张，上限 ${formatNumber(cap)} 张`,
+  over: (n: number, cap: number) =>
+    `超过上限：命中 ${formatNumber(n)} 张，上限 ${formatNumber(cap)} 张。这样探查会被拒绝，请收窄规则或调高上限`,
+  breakdown: (rule: number, explicit: number, pinned: number) =>
+    `规则命中 ${formatNumber(rule)} · 显式列出 ${formatNumber(explicit)} · 一律在范围内 ${formatNumber(pinned)}`,
+  onDemandCount: (n: number) => `另有按需加入的 ${formatNumber(n)} 张（不计上限）`,
+  outside: (n: number, total: number) => `范围外 ${formatNumber(n)} 张，对象索引共 ${formatNumber(total)} 个对象`,
+  noIndex: '还没有对象索引：刷新对象索引后才数得出命中数',
+  refreshIndex: '刷新对象索引',
+  refreshing: '正在刷新…',
+  refreshHint: '发一条数据字典查询，列出全库的表名和注释；不读取表结构，不改表结构缓存',
+  refreshed: (n: number) => `对象索引已刷新：${formatNumber(n)} 个对象`,
+  indexAt: (when: string) => `对象索引刷新于 ${when}`,
+  indexCapped: '对象索引超过 5 万个对象，只收了按名字排序的前 5 万个；超出的部分不判为已删除',
+  inspector: '数据库的数据字典查询不可用，对象清单由驱动列出，没有表注释',
+  pinnedHead: '一律在范围内的表',
+  pinnedBody: '有数据目录的表、已发布模板写死的 SQL 用到的表一律在探查范围内，规则排不掉，只有「显式移出」才会离开范围。',
+  pinnedMore: (n: number) => `等 ${formatNumber(n)} 张`,
+  onDemandHead: '按需加入的表',
+  onDemandBody: '助手查看、运行时查表结构点名了范围外的表，或者在数据目录页手工加入：当场读取结构，以后每次探查都带上。',
+  onDemandVia: { look: '助手查看', db_schema: '运行时查表结构', catalog: '数据目录页' } as Record<string, string>,
+  onDemandBy: (by: string) => `由 ${by}`,
+  onDemandNeed: (need: string) => `需求：${need}`,
+  cancel: '取消',
+  save: '保存',
+  saveAndRun: '保存并探查',
+  saved: '已保存探查范围，下次探查时生效',
+  updated: (by: string | null, when: string) => (by ? `${by} 修改于 ${when}` : `修改于 ${when}`),
+  linesCount: (n: number, max: number) => `${formatNumber(n)} / ${formatNumber(max)} 条`,
+}
+
+/** 表结构里没有这张表时为什么（目录清单、表详情）。只有 removed 说「表已不在」 */
+export const CATALOG_ABSENT_TEXT = {
+  label: {
+    removed: '表已不在（已删除或改名）',
+    missing: '数据源里没有这张表',
+    out_of_scope: '在探查范围外',
+    reflect_failed: '在探查范围内，但读不到结构',
+    unknown: '不在已探查的表里',
+  } as Record<string, string>,
+  body: {
+    removed: '对象索引里已经没有这张表（已删除或改名）。目录仍然保留，可以查看、驳回或删除其中的项。',
+    missing: '数据源里没有这张表（全库的对象清单里也没有）。目录仍然保留，可以查看、驳回或删除其中的项。',
+    out_of_scope: '这张表在探查范围外：对象索引里有它，但没有读取结构。在数据源卡片的「探查范围」里加入它，'
+      + '或在清单的搜索框搜索它并「加入范围」。',
+    reflect_failed: '这张表在探查范围内，但上次探查读不到它的结构（权限不够或对象有问题）。目录仍然保留，修好后重新探查即可。',
+    unknown: '这张表不在已探查的表里：升级前的探查只取了一部分表，无法判断它是否还在。请回到数据源卡片重新「探查结构」。',
+  } as Record<string, string>,
+}
+
+/** 目录清单的分批渲染、在对象索引里找范围外的表并加入范围 */
+export const CATALOG_SCOPE_TEXT = {
+  more: (shown: number, total: number) => `显示更多（已显示 ${formatNumber(shown)} / ${formatNumber(total)} 张）`,
+  outsideHead: (n: number) => `探查范围外的表（${formatNumber(n)}）`,
+  outsideHint: '在对象索引里有名字，没有读取结构。加入范围会当场读取结构，并记进探查范围的「显式列出」',
+  outsideMore: (n: number) => `另有 ${formatNumber(n)} 张匹配，请换个更具体的关键词`,
+  searching: '正在搜索对象索引…',
+  searchFailed: '搜索对象索引失败',
+  add: '加入范围',
+  adding: '正在加入…',
+  added: (names: string[]) => `已加入探查范围：${names.join('、')}`,
+  addFailed: (name: string, why: string) => `${name} 没有加入：${why}`,
+  readFailed: (name: string, why: string) => `${name} 已加入范围，但读不到结构：${why}`,
+  view: '视图',
+  estRows: (n: number) => `约 ${formatNumber(n)} 行`,
+}
+
 
 // ===========================================================================
 // 数据剖析（数据源设置里的开关和预算；数据目录页的「数据剖析」：后台任务，逐表进行）
@@ -2872,6 +3020,7 @@ export const PROFILE_TEXT = {
   headerRunningHint: (done: number, total: number) => `数据剖析进行中：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，点击查看进度`,
   headerQueuedHint: '剖析任务排队中，点击查看',
   headerQueuedDraft: '剖析任务排在起草任务后面，起草结束后自动开始，点击查看',
+  headerQueuedIntrospect: '剖析任务排在探查任务后面，探查结束后自动开始，点击查看',
 
   // ---- 开始前：范围、预算
   title: '数据剖析',
@@ -2924,6 +3073,7 @@ export const PROFILE_TEXT = {
     interrupted: '服务重启，剖析中断',
   } as Record<CatalogDraftJobStatus, string>,
   waitingDraft: '排在起草任务后面，起草结束后自动开始。要剖析哪些表，开始时按起草后的目录再定',
+  waitingIntrospect: '排在探查任务后面，探查结束后自动开始。要剖析哪些表，开始时按探查后的表结构再定',
   // 停止时服务端不等正在执行的那条查询（它的结果记「失败」），库那边按单条时限截止它；收尾写完（至多十来秒）停止就答。
   // 别写成「等这条查询结束」：单条时限设得长时，界面会让人以为要等满时限
   stopping: '正在停止：正在执行的那条查询不再等待，由数据库按单条时限截止；已做完的项照常写进目录…',
@@ -3149,6 +3299,7 @@ export const PROFILE_SKIP_REASON_LABEL: Record<string, string> = {
   unsupported: '暂不支持',
   no_data: '没有数据',
   missing: '表结构中没有',
+  out_of_scope: '在探查范围外',
   high_cardinality: '取值太多',
   nothing: '没有可剖析的项',
 }
@@ -5497,6 +5648,8 @@ export const LOOK_TEXT = {
   joined: (names: string[]) => `为连接补上 ${names.join('、')}`,
   missing: (where: string, names: string[]) => `没找到：${where}${where ? '的 ' : ''}${names.join('、')}`,
   partial: (total: number, explored: number) => `共 ${formatNumber(total)} 张，只探查了 ${formatNumber(explored)} 张`,
+  /** 点名或挑中探查范围外的表，当场读了结构、加进了范围（next-round 03 A2） */
+  added: (names: string[]) => `按需加入探查范围：${names.join('、')}`,
   reason: (text: string) => `原因：${text}`,
   /** 应用润色时助手问回来的话：这一轮到此结束，回答就是下一轮 */
   ask: '助手需要你确认',

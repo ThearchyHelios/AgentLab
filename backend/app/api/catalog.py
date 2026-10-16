@@ -26,6 +26,8 @@
                                  POST /catalog/import 导入（data/catalog_transfer.py）
 - POST   /catalog/{table}/assistant  表助手：对话完善这张表的目录（text/event-stream），提案不写目录
                                  （data/catalog_assistant.py）
+- GET    /catalog/search         在对象索引里按名字、注释找表（含探查范围外的）；POST /catalog/scope/add 把范围外的表加进
+                                 探查范围（当场只读读结构、记进规则的显式列出，next-round 03 A2）
 
 规则都在 data/catalog.py，这里只做取源、转换形状和把异常翻成状态码：版本不符 409，结构不合规、审阅路径
 不对 422，源或表不存在 404。所有写操作记下署名（api/deps.actor_of：开了登录是认证过的用户名，否则请求头 X-Actor 的自报）。
@@ -44,12 +46,12 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import (
-    CATALOG_DRAFT_BUSY, CATALOG_DRAFT_FINISHED, CATALOG_DRAFT_MODEL_UNAVAILABLE, CATALOG_PROFILE_FINISHED, PROFILE_BUSY,
-    PROFILE_NOTHING, SCHEMA_MISSING, SNAPSHOT_TAMPERED, CodedHTTPException,
+    CATALOG_DRAFT_BUSY, CATALOG_DRAFT_FINISHED, CATALOG_DRAFT_MODEL_UNAVAILABLE, CATALOG_PROFILE_FINISHED,
+    INTROSPECT_BUSY, PROFILE_BUSY, PROFILE_NOTHING, SCHEMA_MISSING, SNAPSHOT_TAMPERED, CodedHTTPException,
 )
 from app.api.deps import actor_of
 from app.data import catalog, catalog_impact, catalog_jobs, catalog_profile, catalog_profile_jobs, introspect
-from app.data import table_versions
+from app.data import introspect_jobs, source_objects, table_versions
 from app.data import catalog_assistant, catalog_review, catalog_transfer
 from app.data.engine import SnapshotTampered
 from app.db.base import get_session
@@ -144,7 +146,7 @@ def _item_value(notes: dict[str, Any], name: str) -> tuple[Any, str | None]:
 
 def _summary_row(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogEntry | None,
                  usage: int, last_draft: dict[str, Any] | None = None,
-                 profiling: dict[str, Any] | None = None) -> dict[str, Any]:
+                 profiling: dict[str, Any] | None = None, absent: str | None = None) -> dict[str, Any]:
     notes = entry.notes if entry else {}
     label, label_status = _item_value(notes, "label")
     kind, _ = _item_value(notes, "kind")
@@ -153,8 +155,11 @@ def _summary_row(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogE
         "table_name": name,
         "qualified": (meta or {}).get("qualified", name),
         "is_view": bool((meta or {}).get("is_view")),
-        # 表结构里已经没有这张表（被删了、改名了），目录还留着：界面据此提示清理
+        # 表结构里没有这张表，目录还留着：界面据此提示。为什么不在（absent_reason）分开说：removed 表已不在（真删除）、
+        # missing 数据源里从来没有、out_of_scope 在探查范围外、reflect_failed 在范围里却读不到结构、unknown 说不清
+        # （升级前只探查了一部分的老缓存）。只有 removed 才说「表已不在」
         "in_schema": meta is not None,
+        "absent_reason": None if meta is not None else absent,
         "label": label,
         "label_status": label_status,
         "kind": kind,
@@ -173,9 +178,10 @@ def _summary_row(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogE
 
 
 def _profiling(name: str, meta: dict[str, Any] | None, entry: catalog.CatalogEntry | None, *,
-               tables: dict[str, Any], masked: set[str], last: dict[str, Any] | None) -> dict[str, Any]:
+               tables: dict[str, Any], masked: set[str], last: dict[str, Any] | None,
+               outside: frozenset[str] = frozenset()) -> dict[str, Any]:
     notes = entry.notes if entry else {}
-    planned = catalog_profile.plan_checks(name, meta, notes, tables=tables, masked=masked)
+    planned = catalog_profile.plan_checks(name, meta, notes, tables=tables, masked=masked, outside=outside)
     checks = sum(1 for c in planned if c.skip is None)
     reason = catalog_profile_jobs.due_reason(meta, notes, last, planned)
     return {"last_profile": catalog_profile_jobs.public_last(last), "profile_due": reason is not None,
@@ -200,9 +206,12 @@ async def _detail(session: AsyncSession, source: Any, table: str, entry: catalog
     meta = ((source.schema_cache or {}).get("tables") or {}).get(table)
     if usage is None:
         usage = (await catalog.table_usage(session, source)).get(table, 0)
+    absent = None if meta is not None else (await _absent(session, source, [table])).get(table)
     return {
         "table_name": table,
         "in_schema": meta is not None,
+        # 表结构里没有时为什么（同表清单的 absent_reason）
+        "absent_reason": absent,
         "notes": entry.notes if entry else {},
         "version": entry.version if entry else 0,
         "updated_at": _iso(entry.updated_at) if entry else None,
@@ -236,11 +245,12 @@ def _invalid(e: catalog.CatalogInvalid) -> HTTPException:
 
 @router.get("/{source_id}/catalog")
 async def list_catalog(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """表清单：表结构里的每张表各一行（没有目录的也列），使用次数多的在前；目录还在、表已不在的排最后。
+    """表清单：探查范围内、读到了结构的每张表各一行（没有目录的也列），使用次数多的在前；目录还在、表结构里没有的排最后，
+    各带 absent_reason（表已不在、数据源里没有、在探查范围外、读不到结构，见 _summary_row）。
 
-    探查结构每个源最多取 200 张表（introspect._MAX_TABLES），多出来的不在表结构里、这里也列不出：schema_truncated
-    说明有没有截断，schema_total 是数据库里一共几张表（含视图），界面据此说明「只探查了前 200 张」。老缓存没记
-    总数时按探查到的张数算。
+    几千张表的库只列探查范围内的（next-round 03 A1）：范围外的在对象索引里，用 GET /catalog/search 找、POST /catalog/scope/add
+    加进来。schema_truncated 是「有范围外的对象」，schema_total 是对象索引里一共几张（含视图）；scope 是范围的摘要
+    （schema_cache 的 scope：in_scope、reflected、failed、out_of_scope、cap、各原因几张），升级前探查的源为 null。
     """
     row, source = await _resolved(session, source_id)
     cache = source.schema_cache or {}
@@ -250,16 +260,20 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
     drafts = await catalog_jobs.last_drafts(session, source.id)
     lasts = await catalog_profile_jobs.last_profiles(session, source.id)
     masked = catalog_profile.masked_of(row.options)
+    outside = await catalog_profile_jobs.outside_of(session, row)
 
     def profiling(name: str, meta: dict[str, Any] | None) -> dict[str, Any]:
-        return _profiling(name, meta, entries.get(name), tables=tables, masked=masked, last=lasts.get(name))
+        return _profiling(name, meta, entries.get(name), tables=tables, masked=masked, last=lasts.get(name),
+                          outside=outside)
 
     order = {name: i for i, name in enumerate(tables)}
     rows = [_summary_row(name, meta, entries.get(name), usage.get(name, 0), drafts.get(name), profiling(name, meta))
             for name, meta in tables.items()]
     rows.sort(key=lambda r: (-r["usage"], order[r["table_name"]]))
-    rows += [_summary_row(name, None, entry, 0, drafts.get(name), profiling(name, None))
-             for name, entry in sorted(entries.items()) if name not in tables]
+    gone = [name for name in sorted(entries) if name not in tables]
+    absent = await _absent(session, row, gone)
+    rows += [_summary_row(name, None, entries[name], 0, drafts.get(name), profiling(name, None), absent.get(name))
+             for name in gone]
     return {
         "tables": rows,
         "system_notes": catalog.system_notes_source(source),
@@ -267,6 +281,7 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
         "schema_note": None if tables else introspect.why_empty(cache),
         "schema_truncated": bool(cache.get("truncated")),
         "schema_total": max(_int(cache.get("total")), len(tables)),
+        "scope": dict(cache["scope"]) if isinstance(cache.get("scope"), dict) else None,
         # 数据源级的起草要求（没有是 null）
         "guidance": catalog_jobs.guidance_of(row),
         # 排队或进行中的起草任务 {id, status, total, done, waiting_for}，界面据此显示进度；没有是 null
@@ -275,6 +290,71 @@ async def list_catalog(source_id: str, session: AsyncSession = Depends(get_sessi
         "active_profile_job": await catalog_profile_jobs.job_brief(
             session, await catalog_profile_jobs.active_job(session, source.id)),
     }
+
+
+async def _absent(session: AsyncSession, row: DataSource, names: list[str]) -> dict[str, str]:
+    """目录还在、表结构里没有的表为什么不在（source_objects.absent_reasons）。上传表格、记录表的结构随版本走：不在就是那一版
+    里没有这张表（removed）。"""
+    if not names:
+        return {}
+    if (row.origin or "manual") != "manual":
+        return dict.fromkeys(names, source_objects.ABSENT_REMOVED)
+    return await source_objects.absent_reasons(session, row, names)
+
+
+# ---- 对象索引里找表、加入探查范围（要登记在 GET /catalog/{table} 前面：不然 search 会被当成表名）
+
+
+@router.get("/{source_id}/catalog/search")
+async def search_catalog_tables(source_id: str, q: str = Query("", max_length=200),
+                                limit: int = Query(50, ge=1, le=200),
+                                session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """在对象索引里按名字、注释找表（不分大小写的包含）：{items: [{name, qualified, kind, comment, est_rows, in_scope,
+    scope_reason, absent_reason}], total, indexed}。清单只列探查范围内的表，范围外的靠这里找到、再「加入范围」。没有对象
+    索引的源（上传表格、升级前探查的）只在表结构里找（indexed=false）。"""
+    row, source = await _resolved(session, source_id)
+    cache = source.schema_cache or {}
+    schema = cache.get("schema")
+    text = q.strip()
+    if (row.origin or "manual") == "manual" and await source_objects.has_index(
+            session, row.id, source_objects.index_schema(row)):
+        items, total = await source_objects.search_index(session, row, text, limit=limit)
+        for item in items:
+            item["qualified"] = f"{schema}.{item['name']}" if schema else item["name"]
+        return {"items": items, "total": total, "indexed": True}
+    from app.data.names import name_key
+
+    key = name_key(text)
+    hits = [(n, m) for n, m in (cache.get("tables") or {}).items() if key and (
+        key in name_key(n) or text in str((m or {}).get("comment") or ""))]
+    return {"items": [{"name": n, "qualified": (m or {}).get("qualified", n),
+                       "kind": "view" if (m or {}).get("is_view") else "table", "comment": (m or {}).get("comment"),
+                       "est_rows": None, "in_scope": True, "scope_reason": None, "absent_reason": None}
+                      for n, m in hits[:limit]], "total": len(hits), "indexed": False}
+
+
+class ScopeAddIn(BaseModel):
+    #: 要加进探查范围的表（对象索引里的名字），一次最多 ADD_LIMIT 张
+    tables: list[str] = Field(min_length=1, max_length=source_objects.ADD_LIMIT)
+
+
+@router.post("/{source_id}/catalog/scope/add")
+async def add_catalog_scope(source_id: str, payload: ScopeAddIn, x_actor: str | None = Header(default=None),
+                            session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """把对象索引里探查范围外的表加进探查范围：当场只读读结构、写进表结构（schema_cache），并记进探查范围规则的「显式
+    列出」，以后每次探查都带上；留痕记谁、什么时候。返回 {added, already, failed: [{name, error}], refused: [{name, reason}],
+    scope}。上传表格、记录表 409（结构随版本走）。"""
+    row = await _source_row(session, source_id)
+    if (row.origin or "manual") != "manual":
+        raise HTTPException(409, "上传的表格、记录表没有探查范围：结构随版本走")
+    got = await source_objects.add_to_scope(row.id, [str(t) for t in payload.tables], reason="explicit",
+                                            trail=source_objects.Trail(via=source_objects.VIA_CATALOG,
+                                                                       actor=actor_of(x_actor)))
+    cache = got.cache if got.cache is not None else (row.schema_cache or {})
+    return {"added": got.added, "already": got.already,
+            "failed": [{"name": n, "error": e} for n, e in got.failed.items()],
+            "refused": [{"name": n, "reason": r} for n, r in got.refused.items()],
+            "scope": dict(cache["scope"]) if isinstance(cache.get("scope"), dict) else None}
 
 
 # ---- 审阅队列、审阅进度（要登记在 GET /catalog/{table} 前面：不然 review-queue、review-progress 会被当成表名）
@@ -360,6 +440,8 @@ async def import_catalog(source_id: str, payload: CatalogImportIn, x_actor: str 
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     except catalog_profile_jobs.ProfileBusy as e:
         raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
+    except introspect_jobs.IntrospectBusy as e:
+        raise CodedHTTPException(409, str(e), INTROSPECT_BUSY) from e
     except catalog_transfer.TransferInvalid as e:
         raise HTTPException(422, str(e)) from e
     return report.as_dict()
@@ -697,6 +779,8 @@ async def draft_catalog(source_id: str, payload: CatalogDraftIn,
         raise CodedHTTPException(409, str(e), CATALOG_DRAFT_BUSY) from e
     except catalog_profile_jobs.ProfileBusy as e:
         raise CodedHTTPException(409, str(e), PROFILE_BUSY) from e
+    except introspect_jobs.IntrospectBusy as e:
+        raise CodedHTTPException(409, str(e), INTROSPECT_BUSY) from e
     rows = [{"table_name": r.table, "added": r.added, "updated": r.updated, "removed": r.removed,
              "version": r.version, "error": r.error, "model_error": r.model_error, "model_items": r.model_items}
             for r in report.tables]

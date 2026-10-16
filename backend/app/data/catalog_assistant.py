@@ -508,6 +508,14 @@ async def prepare(session: AsyncSession, row: Any, source: Any, table: str,
     if guidance := catalog_jobs.guidance_of(row):
         lines.append(labels["guidance"].format(text=guidance))
     lines += ["", *_structure_lines(meta, masked, system=system_notes), ""]
+    # 剖析事实（行数估算、日期范围）：和助手 look、运行时 db_schema、/schema 同一段文字（schema_view.profile_lines，
+    # next-round 遗留 e），遮罩按此刻的设置重滤，上传表格换了版本的不给
+    from app.data import catalog_profile_jobs, schema_view
+
+    facts = (await catalog_profile_jobs.last_facts(session, source.id, [table])).get(table)
+    if profile := schema_view.profile_lines(facts, masked, schema_view.snapshot_of(source),
+                                            upload=schema_view.is_upload(source)):
+        lines += [*profile, ""]
     current = _catalog_lines(notes, masked)
     lines += [labels["catalog"], *current] if current else [labels["catalog_empty"]]
     incoming = []

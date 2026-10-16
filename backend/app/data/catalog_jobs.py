@@ -248,7 +248,10 @@ async def waiting_for(session: AsyncSession, job: CatalogDraftJob) -> str | None
         return None
     ahead = runtime.lanes.ahead(job.source_id, job.id)
     if ahead is not None:
-        return "profile" if "profile" in ahead else None
+        if "profile" in ahead:
+            return "profile"
+        # 排在同源的探查任务后面（next-round 03 A1：探查也进同一条队）
+        return "introspect" if "introspect" in ahead else None
     earlier = (await session.execute(
         select(CatalogProfileJob.id).where(CatalogProfileJob.source_id == job.source_id,
                                            CatalogProfileJob.status.in_(ACTIVE),
@@ -382,6 +385,11 @@ def _lane_busy(row: Any, holder: runtime.LaneTicket, kind: str) -> Exception:
                                                                                   then=_then(kind, "profile")))
     if holder.kind == "import":
         return DraftBusy(import_busy_message(row))
+    if holder.kind == "introspect":
+        # 正在探查结构（next-round 03 A1）：表结构做到一半，起草、导入要等它读完
+        from app.data import introspect_jobs
+
+        return introspect_jobs.IntrospectBusy(introspect_jobs.busy_message(row, None, then=_then(kind, "profile")))
     then = _then(kind, "draft")
     return DraftBusy(sync_busy_message(row, then) if holder.kind == "sync_draft" else busy_message(row, then))
 

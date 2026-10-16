@@ -443,7 +443,9 @@ export function CatalogPage() {
   const profileQueued = profileStrip?.status === 'queued'
   const profileLabel = profileStrip ? (profileQueued ? PT.headerQueued : PT.headerRunning(profileStrip.done, profileStrip.total)) : PT.action
   const profileTitle = profileStrip
-    ? (profileQueued ? (profileStrip.waiting_for === 'draft' ? PT.headerQueuedDraft : PT.headerQueuedHint) : PT.headerRunningHint(profileStrip.done, profileStrip.total))
+    ? (profileQueued ? (profileStrip.waiting_for === 'draft' ? PT.headerQueuedDraft
+      : profileStrip.waiting_for === 'introspect' ? PT.headerQueuedIntrospect : PT.headerQueuedHint)
+      : PT.headerRunningHint(profileStrip.done, profileStrip.total))
     : PT.actionHint
   // 最近查询多数超时的提醒：对话框关着时也要看得到（页头的入口换成提醒色，悬停写全文）
   const profileNotice = profileActive ? profileJob?.notice?.trim() || null : null
@@ -458,7 +460,9 @@ export function CatalogPage() {
   const draftQueued = stripJob?.status === 'queued'
   const draftLabel = stripJob ? (draftQueued ? DT.headerQueued : DT.headerRunning(stripJob.done, stripJob.total)) : CT.draft
   const draftTitle = stripJob
-    ? (draftQueued ? (waitsForProfile(stripJob) ? DT.headerQueuedProfile : DT.headerQueuedHint) : DT.headerRunningHint(stripJob.done, stripJob.total))
+    ? (draftQueued ? (waitsForProfile(stripJob) ? DT.headerQueuedProfile
+      : stripJob.waiting_for === 'introspect' ? DT.headerQueuedIntrospect : DT.headerQueuedHint)
+      : DT.headerRunningHint(stripJob.done, stripJob.total))
     : CT.draft
   const headerDraft = (
     <button type="button" className="btn btn-sm" onClick={openDraft} aria-label={draftLabel} title={draftTitle} data-catalog-draft=""
@@ -532,6 +536,9 @@ export function CatalogPage() {
                     dueOnly={dueOnly}
                     onDueOnly={dueKnown || dueOnly ? setDueOnly : undefined}
                     dueTotal={dueTotal}
+                    sourceId={sourceId}
+                    outside={data?.scope?.out_of_scope ?? 0}
+                    onAdded={() => { void load(); void useCatalog.getState().reload('datasources') }}
                   />
                 </>
               )}
@@ -586,7 +593,7 @@ export function CatalogPage() {
       />
       {hasTables && data?.schema_truncated && (
         <SchemaPartialNotice total={data.schema_total ?? 0} explored={rows.filter((r) => r.in_schema).length}
-                             onGoSource={() => navigate(back)} />
+                             scoped={!!data.scope} onGoSource={() => navigate(back)} />
       )}
       {hasTables && usage.used > 0 && !empty && <UsageSummary {...usage} active={usedOnly ? filter : null} onFocus={focusUsed} />}
       {hasTables && stripJob && !draftOpen && <DraftStrip job={stripJob} notice={stripNotice} onOpen={openDraft} />}
@@ -663,7 +670,10 @@ function DraftStrip({ job, notice, onOpen }: {
   onOpen: () => void
 }) {
   // 排在剖析任务后面（同一个数据源的起草和剖析按建立顺序排队）：写明剖析结束后自动开始
-  const text = job.status === 'queued' ? (waitsForProfile(job) ? DT.stripQueuedProfile(job.total) : DT.stripQueued(job.total)) : DT.strip(job.done, job.total)
+  const text = job.status === 'queued'
+    ? (waitsForProfile(job) ? DT.stripQueuedProfile(job.total)
+      : job.waiting_for === 'introspect' ? DT.stripQueuedIntrospect(job.total) : DT.stripQueued(job.total))
+    : DT.strip(job.done, job.total)
   return (
     <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2 text-xs"
          style={{ background: 'color-mix(in srgb, var(--accent) 6%, var(--bg-panel))' }}
@@ -749,10 +759,13 @@ function useMedia(query: string): boolean {
 }
 
 /**
- * 表结构只探查了一部分（每个数据源最多取 200 张表）：没探查到的表不在清单里，助手也看不到。顶部常驻一条说明，
- * 写清一共几张、探查了几张、为什么只取了这些，以及下一步——回到数据源卡片换 schema 或缩小范围后重新探查
+ * 有探查范围外的表（next-round 03 A1）：清单只列范围内的，顶部常驻一条说明，写清一共几张、范围内几张、范围外的去哪找
+ * （搜索框搜到后「加入范围」，或回数据源卡片调整探查范围）。升级前只探查了一部分的老缓存（没有对象索引，scoped 为假）
+ * 照旧说「只探查了前 N 张」、请重新探查
  */
-function SchemaPartialNotice({ total, explored, onGoSource }: { total: number; explored: number; onGoSource: () => void }) {
+function SchemaPartialNotice({ total, explored, scoped, onGoSource }: {
+  total: number; explored: number; scoped: boolean; onGoSource: () => void
+}) {
   const shownTotal = Math.max(total, explored)
   return (
     <div className="flex shrink-0 items-start gap-2 border-b px-4 py-2 text-xs"
@@ -760,9 +773,9 @@ function SchemaPartialNotice({ total, explored, onGoSource }: { total: number; e
          data-catalog-schema-partial={`${shownTotal},${explored}`}>
       <Database size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden />
       <div className="min-w-0 flex-1 leading-relaxed">
-        <p className="font-medium">{SPT.title(shownTotal, explored)}</p>
-        <p className="text-2xs text-dim">{SPT.body(Math.max(shownTotal - explored, 0))}</p>
-        <p className="text-2xs text-dim">{SPT.next}</p>
+        <p className="font-medium">{(scoped ? SPT.title : SPT.legacyTitle)(shownTotal, explored)}</p>
+        <p className="text-2xs text-dim">{(scoped ? SPT.body : SPT.legacyBody)(Math.max(shownTotal - explored, 0))}</p>
+        <p className="text-2xs text-dim">{scoped ? SPT.next : SPT.legacyNext}</p>
       </div>
       <button type="button" className="btn btn-sm shrink-0" onClick={onGoSource} data-catalog-schema-partial-go="">
         {CT.back}

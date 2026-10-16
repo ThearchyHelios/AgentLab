@@ -1,4 +1,4 @@
-"""数据源的只读表结构视图：库概览、表目录、表详情（字段、数据目录、连接条件、两跳的连接路径）。
+"""数据源的只读表结构视图：库概览、表目录、表详情（字段、数据目录、剖析事实、连接条件、两跳的连接路径）、大库的检索预筛。
 
 助手查看（app/look/tables.py）、运行时 agent 的 db_schema__（tools/datasource.py）、/api/datasources/{id}/schema?table=
 三处共用这一份（look 文档 D6：同一张表只有一种说法，同一套遮罩规矩）。以前三处各拼各的：助手的小库摘要每张表只列
@@ -8,12 +8,25 @@
 这一列的各项（含码值、带具体取值的说明）都不给。和表助手（data/catalog_assistant.py）是同一条规矩。代价是运行时
 agent 看到的目录少了遮罩列那部分（README 写明）。
 
-只读：只看表结构缓存（schema_cache）和调用方读好的数据目录，不碰业务库。这里的文字都是写给模型看的，不上界面。
+**剖析事实**（next-round 遗留 e）：剖析记下的行数估算和依据、各日期列的范围（catalog_profile_jobs.last_facts）在表详情里
+成一节（profile_lines），后面跟一句固定提示「只供写查询参考……不能作为回答里的数」——剖析数字是会过期的观测，叙述层无算术靠
+这句和裁判守住。遮罩按渲染这一刻的设置重滤（剖析之后才加遮罩的列，范围不出现）；上传表格只在剖析时的快照和这次读的快照
+一致时给，不一致写「剖析早于当前版本，不给」。look、运行时 db_schema、/schema、表助手四处都是这一段文字。
+
+**大库的检索预筛**（search_tables，next-round 03 A2）：几千张表的库，挑表时不能把整份表目录交给挑选模型。按需求做一次 BM25：
+文档是表名、注释、目录里的中文名 / 粒度 / 说明、列名、列的中文名（遮罩列只用列名）；探查范围外的对象只按名字和注释参与，
+权重低一档。切词用 memory/embeddings._tokens（英文按词、中文按字补二元组）加 catalog.name_words（下划线、驼峰拆词）。
+
+**三种「不在」**（absent_detail）：表已不在、在探查范围外、在范围里却读不到结构，说法分开；只有真删除才说「表已不在」。
+
+只读：只看表结构缓存（schema_cache）和调用方读好的数据目录、剖析事实、对象索引，不碰业务库。这里的文字都是写给模型看的，
+不上界面。
 """
 from __future__ import annotations
 
 import copy
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from app.data import catalog, introspect
@@ -31,6 +44,8 @@ PATH_LINES_LIMIT = 12
 OVERVIEW_LINE_PROMPT = "- {name}（{kind}，{access}）：{description}｜{state}"
 OVERVIEW_TABLES_PROMPT = "共 {total} 张表"
 OVERVIEW_PARTIAL_PROMPT = "共 {total} 张表，只探查了 {explored} 张"
+#: 有对象索引的源（next-round 03 A1）：范围外的表有名字，点名查看时按需加入
+OVERVIEW_SCOPED_PROMPT = "共 {total} 张表，探查范围内 {explored} 张（范围外的点名查看时按需加入）"
 OVERVIEW_CATALOG_ALL_PROMPT = "都有数据目录"
 OVERVIEW_CATALOG_SOME_PROMPT = "{n} 张有数据目录"
 OVERVIEW_CATALOG_NONE_PROMPT = "还没有数据目录"
@@ -42,6 +57,23 @@ JOIN_HEAD_PROMPT = "表之间的连接条件（写 JOIN … ON … 时照抄）�
 JOIN_MORE_PROMPT = "…另有 {n} 条，点名查看相关的表看各表的关联关系"
 PATH_HEAD_PROMPT = "连接路径："
 ROUTE_PROMPT = "{a} 与 {b} 没有直接关联，经 {mid} 连接：FROM {a} JOIN {mid} ON {first} JOIN {b} ON {second}"
+
+#: 剖析事实那一节（profile_lines）
+PROFILE_HEAD_PROMPT = "数据剖析（{day}）：{facts}"
+PROFILE_ROWS_PROMPT = {"stats": "约 {n} 行（数据库统计估算）", "count": "{n} 行（逐行数出）",
+                       "at_least": "至少 {n} 行（数到上限为止）"}
+PROFILE_RANGE_PROMPT = "{column} 从 {low} 到 {high}"
+PROFILE_HINT_PROMPT = "只供写查询参考（定时间范围、估表大小），不是查询结果，不能作为回答里的数"
+PROFILE_STALE_PROMPT = "数据剖析：剖析早于当前版本，不给"
+
+#: 三种「不在」（absent_detail）。{source} 数据源名，{table} 点名的表
+ABSENT_REMOVED_PROMPT = "数据源「{source}」里已经没有 {table}（表已删除或改名）。别拿名字相近的表顶替"
+ABSENT_MISSING_PROMPT = "数据源「{source}」里没有 {table}（全库的对象清单里也没有）。别拿名字相近的表顶替，不确定时用 keyword 检索"
+ABSENT_OUT_OF_SCOPE_PROMPT = ("{table} 在数据源「{source}」的探查范围外，这次没有它的结构{why}。要用它，请点名查看（会按需加入），"
+                              "或者请管理员把它加进探查范围")
+ABSENT_REFLECT_FAILED_PROMPT = "{table} 在数据源「{source}」的探查范围里，但读不到它的结构：{error}。别猜它的字段名"
+ABSENT_UNKNOWN_PROMPT = ("数据源「{source}」只探查了一部分表，{table} 不在已探查的表里，无法判断是否存在。请直接查询数据字典"
+                         "（information_schema.tables / columns，SQLite 用 sqlite_master）确认它的结构")
 
 
 # ==========================================================================
@@ -88,7 +120,8 @@ def overview_line(source: Any, *, catalog_tables: int) -> str:
     else:
         total = cache.get("total")
         total = max(total if isinstance(total, int) and not isinstance(total, bool) else 0, len(tables))
-        parts = [OVERVIEW_PARTIAL_PROMPT.format(total=total, explored=len(tables)) if cache.get("truncated")
+        partial = OVERVIEW_SCOPED_PROMPT if isinstance(cache.get("scope"), dict) else OVERVIEW_PARTIAL_PROMPT
+        parts = [partial.format(total=total, explored=len(tables)) if cache.get("truncated")
                  and total > len(tables) else OVERVIEW_TABLES_PROMPT.format(total=total)]
         if catalog_tables >= len(tables):
             parts.append(OVERVIEW_CATALOG_ALL_PROMPT)
@@ -115,11 +148,13 @@ def table_index(source: Any, notes_by_table: Mapping[str, Mapping[str, Any]], *,
 # ==========================================================================
 
 
-def table_detail(source: Any, table: str, *, catalog_notes: Mapping[str, Mapping[str, Any]] | None = None) -> str:
-    """单表的完整字段说明，有可给模型看的目录时附在后面；遮罩列只给列名和类型。
+def table_detail(source: Any, table: str, *, catalog_notes: Mapping[str, Mapping[str, Any]] | None = None,
+                 profile: Mapping[str, Mapping[str, Any]] | None = None) -> str:
+    """单表的完整字段说明，有可给模型看的目录时附在后面，有剖析事实时再附一节（profile_lines）；遮罩列只给列名和类型。
 
-    catalog_notes 是这个源的数据目录 {表名: notes}（原样，含驳回项：render_table_notes 自己去掉）。找不到这张表时
-    交回的几种说法（结构没探查、只探查了一部分、确实没有）和 introspect.describe_table 一样。
+    catalog_notes 是这个源的数据目录 {表名: notes}（原样，含驳回项：render_table_notes 自己去掉）。profile 是这个源的剖析
+    事实 {表名: facts}（catalog_profile_jobs.last_facts）；不给、这张表没有时输出和以前一字不差。找不到这张表时交回的几种
+    说法（结构没探查、只探查了一部分、确实没有）和 introspect.describe_table 一样。
     """
     meta = introspect.find_table(source, table)
     if not meta:
@@ -150,7 +185,230 @@ def table_detail(source: Any, table: str, *, catalog_notes: Mapping[str, Mapping
                                            meta=shown, system_notes=catalog.system_notes_source(source))
         if block:
             lines.append(block)
+    if profile:
+        key = catalog.resolve_table_name(getattr(source, "schema_cache", None), table)
+        lines += profile_lines(profile.get(key) if key else None, masked, snapshot_of(source),
+                               upload=is_upload(source))
     return "\n".join(lines)
+
+
+# ==========================================================================
+# 剖析事实
+# ==========================================================================
+
+
+def is_upload(source: Any) -> bool:
+    """上传表格的源（含绑定了快照的视图）：剖析事实要和快照对得上才给。"""
+    return (getattr(source, "origin", None) or "manual") == "upload"
+
+
+def snapshot_of(source: Any) -> str | None:
+    """这次读的是上传表格的哪个快照：绑定了快照的视图（table_versions.SourceView）是它绑定的那个，数据源记录是当前启用的
+    那个；数据库源为 None。"""
+    if not is_upload(source):
+        return None
+    return getattr(source, "snapshot_id", None) or getattr(source, "current_snapshot_id", None)
+
+
+def _day(value: Any) -> str:
+    return str(value or "")[:10]
+
+
+def _when(value: Any) -> str:
+    """日期范围的一端：日期只写到日，带时刻的写到秒（剖析记的是数据库原样的文字）。"""
+    text = str(value or "")
+    return text[:10] if len(text) <= 10 or text[10:].strip(" T0:.") == "" else text[:19]
+
+
+def profile_lines(facts: Mapping[str, Any] | None, masked: set[str], snapshot_id: str | None, *,
+                  upload: bool = False, indent: str = "  ") -> list[str]:
+    """剖析事实那一节：「数据剖析（YYYY-MM-DD）：约 N 行（数据库统计估算）；下单日从 … 到 …」，后面一句固定提示。
+
+    masked 是渲染这一刻的遮罩列（小写）：剖析之后才加遮罩的列，范围不出现。upload：上传表格源，剖析时的快照
+    （facts.snapshot_id）和这次读的快照对不上时只写「剖析早于当前版本，不给」——升级前的剖析记录没有快照，上传表格在重新剖析
+    之前一律不给。没有剖析事实（或者滤完什么都不剩）返回空列表：表详情和以前一字不差。"""
+    if not facts:
+        return []
+    if upload and (not snapshot_id or facts.get("snapshot_id") != snapshot_id):
+        return [indent + PROFILE_STALE_PROMPT]
+    parts: list[str] = []
+    estimate = facts.get("row_estimate") if isinstance(facts.get("row_estimate"), Mapping) else None
+    if estimate:
+        method, rows, least = estimate.get("method"), estimate.get("rows"), estimate.get("at_least")
+        if isinstance(rows, int) and method in ("stats", "count"):
+            parts.append(PROFILE_ROWS_PROMPT[method].format(n=f"{rows:,}"))
+        elif isinstance(least, int) and method == "count":
+            parts.append(PROFILE_ROWS_PROMPT["at_least"].format(n=f"{least:,}"))
+    for found in facts.get("date_ranges") or []:
+        if not isinstance(found, Mapping):
+            continue
+        column = str(found.get("column") or "")
+        if not column or column.lower() in masked or found.get("min") is None or found.get("max") is None:
+            continue
+        parts.append(PROFILE_RANGE_PROMPT.format(column=column, low=_when(found["min"]), high=_when(found["max"])))
+    if not parts:
+        return []
+    return [indent + PROFILE_HEAD_PROMPT.format(day=_day(facts.get("at")), facts="；".join(parts)),
+            indent + "  " + PROFILE_HINT_PROMPT]
+
+
+# ==========================================================================
+# 三种「不在」
+# ==========================================================================
+
+
+def absent_detail(source: Any, table: str, reason: str | None, *, error: str | None = None, why: str = "") -> str | None:
+    """点名的表不在表结构里时的说法（source_objects.absent_reasons 的原因）：表已不在、在探查范围外（why 是没能按需加入的
+    原因，比如上限用完了）、在范围里却读不到结构。原因不明（没有对象索引的老缓存）返回 None，由调用方照旧说。"""
+    from app.data import source_objects as so
+
+    name = getattr(source, "name", "")
+    if reason == so.ABSENT_REMOVED:
+        return ABSENT_REMOVED_PROMPT.format(source=name, table=table)
+    if reason == so.ABSENT_MISSING:
+        return ABSENT_MISSING_PROMPT.format(source=name, table=table)
+    if reason == so.ABSENT_OUT_OF_SCOPE:
+        return ABSENT_OUT_OF_SCOPE_PROMPT.format(source=name, table=table, why=f"（{why}）" if why else "")
+    if reason == so.ABSENT_REFLECT_FAILED:
+        return ABSENT_REFLECT_FAILED_PROMPT.format(source=name, table=table, error=error or "读不到列")
+    if reason == so.ABSENT_UNKNOWN:
+        return ABSENT_UNKNOWN_PROMPT.format(source=name, table=table)
+    return None
+
+
+# ==========================================================================
+# 大库的检索预筛
+# ==========================================================================
+
+#: 范围外的对象在检索里的权重（只有名字和注释，低一档）
+OUTSIDE_WEIGHT = 0.6
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    """检索的一个命中：表名（范围内是 schema_cache 的键，范围外是对象索引里的名字）、得分、在不在探查范围里。"""
+
+    name: str
+    score: float
+    in_scope: bool = True
+
+
+def _doc_text(name: str, meta: Mapping[str, Any] | None, notes: Mapping[str, Any] | None, masked: set[str]) -> str:
+    """一张范围内的表的检索文档：表名（再拆词）、注释、目录里的中文名 / 粒度 / 说明、列名（再拆词）、列的中文名。遮罩列只用
+    列名（注释、目录项不进：里面常写着取值）。"""
+    from app.data.catalog import name_words
+
+    parts = [name, " ".join(name_words(name))]
+    meta = meta or {}
+    if meta.get("comment"):
+        parts.append(str(meta["comment"]))
+    visible = catalog.visible_notes(notes or {})
+    for key in ("label", "grain", "description", "note"):
+        item = visible.get(key)
+        if isinstance(item, Mapping) and isinstance(item.get("value"), str):
+            parts.append(item["value"])
+    columns_notes = visible.get("columns") if isinstance(visible.get("columns"), Mapping) else {}
+    for col in meta.get("columns") or []:
+        if not isinstance(col, Mapping) or not col.get("name"):
+            continue
+        cname = str(col["name"])
+        parts += [cname, " ".join(name_words(cname))]
+        if cname.lower() in masked:
+            continue
+        if col.get("comment"):
+            parts.append(str(col["comment"]))
+        items = columns_notes.get(cname) if isinstance(columns_notes, Mapping) else None
+        label = items.get("label") if isinstance(items, Mapping) else None
+        if isinstance(label, Mapping) and isinstance(label.get("value"), str):
+            parts.append(label["value"])
+    return " ".join(parts)
+
+
+def _outside_text(name: str, comment: str | None) -> str:
+    from app.data.catalog import name_words
+
+    return " ".join([name, " ".join(name_words(name)), comment or ""])
+
+
+class _Index:
+    """BM25（k1=1.5、b=0.75，和 memory/embeddings.BM25 同一个公式）的倒排实现：几千上万篇文档时只看含这个词的文档，
+    不逐篇数。"""
+
+    def __init__(self, docs: list[str]) -> None:
+        import math
+
+        from app.memory.embeddings import _tokens
+
+        self._tokens = _tokens
+        self.k1, self.b = 1.5, 0.75
+        self.lengths: list[int] = []
+        self.postings: dict[str, list[tuple[int, int]]] = {}
+        for i, doc in enumerate(docs):
+            toks = _tokens(doc)
+            self.lengths.append(len(toks))
+            counts: dict[str, int] = {}
+            for t in toks:
+                counts[t] = counts.get(t, 0) + 1
+            for t, n in counts.items():
+                self.postings.setdefault(t, []).append((i, n))
+        self.n = len(docs)
+        self.avg = (sum(self.lengths) / self.n) if self.n else 0.0
+        self._log = math.log
+
+    def score(self, query: str) -> dict[int, float]:
+        out: dict[int, float] = {}
+        for tok in dict.fromkeys(self._tokens(query)):
+            posting = self.postings.get(tok)
+            if not posting:
+                continue
+            idf = self._log(1 + (self.n - len(posting) + 0.5) / (len(posting) + 0.5))
+            for i, tf in posting:
+                denom = tf + self.k1 * (1 - self.b + self.b * self.lengths[i] / (self.avg or 1))
+                out[i] = out.get(i, 0.0) + idf * (tf * (self.k1 + 1)) / denom
+        return out
+
+
+class TableSearch:
+    """一个源的检索：范围内的表（schema_cache）和范围外的对象（对象索引里的名字、注释）。建一次（一轮查看里第一次要挑时），
+    之后每个需求查一次。"""
+
+    def __init__(self, source: Any, notes_by_table: Mapping[str, Mapping[str, Any]],
+                 outside: Iterable[Any] = ()) -> None:
+        tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
+        masked = masked_set(source)
+        self.names: list[str] = []
+        self.inside: list[bool] = []
+        docs: list[str] = []
+        for name, meta in tables.items():
+            self.names.append(name)
+            self.inside.append(True)
+            docs.append(_doc_text(name, meta if isinstance(meta, Mapping) else None, notes_by_table.get(name), masked))
+        known = set(self.names)
+        for obj in outside:
+            name = str(getattr(obj, "name", obj))
+            if name in known:
+                continue
+            self.names.append(name)
+            self.inside.append(False)
+            docs.append(_outside_text(name, getattr(obj, "comment", None)))
+        self._index = _Index(docs)
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    def search(self, query: str, *, limit: int) -> list[SearchHit]:
+        """按得分从高到低的前 limit 个（得分为 0 的不算命中）。"""
+        scored = self._index.score(query)
+        hits = [SearchHit(self.names[i], s * (1.0 if self.inside[i] else OUTSIDE_WEIGHT), self.inside[i])
+                for i, s in scored.items() if s > 0]
+        hits.sort(key=lambda h: (-h.score, not h.in_scope, h.name))
+        return hits[:limit]
+
+
+def search_tables(source: Any, notes_by_table: Mapping[str, Mapping[str, Any]], query: str, *,
+                  outside: Iterable[Any] = (), limit: int = 120) -> list[SearchHit]:
+    """按需求检索这个源的表（一次性的写法；同一个源要查多次就建一个 TableSearch 复用）。"""
+    return TableSearch(source, notes_by_table, outside).search(query, limit=limit)
 
 
 def table_brief(source: Any, table: str) -> str:
@@ -253,6 +511,8 @@ def route_lines(source: Any, routes: list[tuple[str, str, tuple[JoinEdge, ...]]]
 
 
 __all__ = [
-    "JOIN_LINES_LIMIT", "PATH_LINES_LIMIT", "complete", "join_lines", "masked_notes", "masked_set", "overview_line",
-    "qualifier", "relation_graph", "route_lines", "table_brief", "table_detail", "table_index",
+    "JOIN_LINES_LIMIT", "OUTSIDE_WEIGHT", "PATH_LINES_LIMIT", "PROFILE_HINT_PROMPT", "PROFILE_STALE_PROMPT", "SearchHit",
+    "TableSearch", "absent_detail", "complete", "is_upload", "join_lines", "masked_notes", "masked_set",
+    "overview_line", "profile_lines", "qualifier", "relation_graph", "route_lines", "search_tables", "snapshot_of",
+    "table_brief", "table_detail", "table_index",
 ]

@@ -2,11 +2,17 @@
 
 - overview：每个库一行（data/schema_view.overview_line），外加「现有工作流用到的表」只列表名；
 - resolve：点名直取，认全名、只写表名、大小写不同、「库名.表名」（catalog.resolve_table_name）；只有一个候选库时可以不写库名；
-- pick：候选库的表加起来不超过 PICK_LIMIT 张就全给，否则用挑选模型按需求从表目录（表名｜中文名｜粒度）里挑；
+- pick：候选库的表加起来不超过 PICK_LIMIT 张就全给，否则用挑选模型按需求从表目录（表名｜中文名｜粒度）里挑；候选超过
+  PREFILTER_LIMIT 张（几千张表的库）时先按需求检索一遍（schema_view.search_tables，BM25），挑选模型只看前 PREFILTER_LIMIT
+  个命中、工作流已用到的表、命中表的一跳关联表（next-round 03 A2）；
+- 按需加入：点名或挑中探查范围外的表（对象索引里有、schema_cache 里没有），当场只读反射这一张、落盘、留痕
+  （source_objects.add_to_scope：谁、哪一轮、哪一次查看、需求原文），每次查看最多 ON_DEMAND_PER_LOOK 张，超了照实说；
+  look 记录里记 added_to_scope。读到的结构这一轮接着用（换成带新缓存的源），下一轮、运行时、SQL 检查、目录都看得到；
 - detail：沿关系图补上两跳以内的中间表（合计不超过 CONTEXT_TABLE_LIMIT），每张表给全部字段和数据目录（遮罩列只给
-  列名和类型），再给表之间的连接条件和连接路径；超过字数上限的表只给字段名。
+  列名和类型）、剖析事实（行数、日期范围，附「只供写查询参考」），再给表之间的连接条件和连接路径；超过字数上限的表只给
+  字段名。
 
-表结构和目录在开流之前读好（load）：目录用单独的会话读，读不到就当没有，不挡生成。
+表结构、目录、剖析事实、范围外的对象清单在开流之前读好（load）：用单独的会话读，读不到就当没有，不挡生成。
 """
 from __future__ import annotations
 
@@ -17,7 +23,10 @@ from typing import Any
 
 from app.data import catalog, introspect, schema_view
 from app.data.catalog import INFERRED_MARK, JoinEdge
-from app.look.base import CONTEXT_TABLE_LIMIT, PICK_LIMIT, LookTarget
+from app.data.names import name_key
+from app.look.base import (
+    CONTEXT_TABLE_LIMIT, NEIGHBOR_LIMIT, ON_DEMAND_PER_LOOK, PICK_LIMIT, PREFILTER_LIMIT, LookTarget,
+)
 from app.look.pick import Picker, PickFailed
 
 logger = logging.getLogger(__name__)
@@ -40,10 +49,21 @@ MISSING_PROMPT = "没找到：{items}（表结构里没有，可能没探查到�
 MISSING_SOURCE_PROMPT = "没找到数据源「{source}」：不在这一轮可用的数据源里"
 UNEXPLORED_PROMPT = ("（{source} 共 {total} 张表，只探查了 {explored} 张；用户说的表在这里找不到时，先用 db_schema__{source} "
                      "查，也查不到就查数据字典（information_schema.columns，SQLite 用 sqlite_master），别猜）")
+#: 有对象索引的源（探查范围以外的表有名字、可以按需加入）
+OUT_OF_SCOPE_PROMPT = ("（{source} 共 {total} 张表，探查范围内 {explored} 张；用户说的表在这里找不到时，点名 look 它，或者用 "
+                       "db_schema__{source} 按 keyword 查：范围外的表会按需加入，别猜）")
+ADDED_PROMPT = "按需加入探查范围：{tables}（在探查范围外，这次当场读了结构）"
+ADD_CAPPED_PROMPT = "一次查看最多按需加入 {limit} 张探查范围外的表，{tables} 这次没有加入：下一次 look 点名再看"
+ADD_FAILED_PROMPT = "{table} 在探查范围外，按需加入时没能读到结构：{why}"
+PREFILTERED_PROMPT = "数据源「{source}」（共 {total} 张表，按需求预筛出 {n} 张，探查范围外的标出来了）："
+OUTSIDE_MARK_PROMPT = "（探查范围外，选中后按需加入）"
+INDEX_MORE_PROMPT = "…另有 {n} 张没有列出：点名查看，或者换个说法写 need 再 look"
 INFERRED_PROMPT = ("标「推断，未确认」的说明和连接条件是按列名、数据库注释或模型推断出来的，没有人确认过：照抄前对照字段"
                    "核实")
 INDEX_HEAD_PROMPT = "数据源「{source}」（共 {total} 张表）："
 INDEX_PARTIAL_PROMPT = "数据源「{source}」（共 {total} 张表，只探查了 {explored} 张，下面只列探查到的）："
+INDEX_SCOPED_PROMPT = ("数据源「{source}」（共 {total} 张表，探查范围内 {explored} 张，下面只列范围内的；范围外的点名查看时"
+                       "按需加入）：")
 PICK_WHAT_PROMPT = "数据表"
 PICK_LINE_PROMPT = "每行一张表：表名｜中文名｜粒度"
 
@@ -56,7 +76,13 @@ class SourcePlan:
     entries: dict[str, catalog.CatalogEntry] = field(default_factory=dict)
     #: 现有工作流 SQL 里查过的表（schema_cache 的键）
     seeds: list[str] = field(default_factory=list)
+    #: 剖析事实 {表名: facts}（catalog_profile_jobs.last_facts）：表详情里附一节
+    facts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 对象索引里探查范围外的对象（source_objects.outside_objects）：检索、点名时用，点到了按需加入
+    outside: list[Any] = field(default_factory=list)
     _graph: dict[str, list[JoinEdge]] | None = None
+    _search: Any = None
+    _outside_keys: dict[str, Any] | None = None
 
     @property
     def name(self) -> str:
@@ -81,6 +107,35 @@ class SourcePlan:
         """探查截断了的话还有几张没探查到；没截断为 0（反射失败跳过的表是探查了、读不到，不算）。"""
         truncated = (getattr(self.source, "schema_cache", None) or {}).get("truncated")
         return max(self.total - self.explored, 0) if truncated else 0
+
+    @property
+    def scoped(self) -> bool:
+        """有对象索引（按探查范围物化的 schema_cache）：范围外的表有名字、可以按需加入。"""
+        return isinstance((getattr(self.source, "schema_cache", None) or {}).get("scope"), dict)
+
+    def outside_of(self, name: str) -> Any | None:
+        """对象索引里范围外的这个对象（按 name_key 比，写了 schema 前缀的只看表名）。"""
+        if self._outside_keys is None:
+            self._outside_keys = {name_key(o.name): o for o in self.outside}
+        return self._outside_keys.get(name_key(name.rsplit(".", 1)[-1]))
+
+    def search(self) -> Any:
+        """这个源的检索（第一次要预筛时才建）。"""
+        if self._search is None:
+            self._search = schema_view.TableSearch(self.source, self.notes, self.outside)
+        return self._search
+
+    def replace_cache(self, cache: dict[str, Any], added: list[str]) -> None:
+        """按需加入以后：换成带新 schema_cache 的源（不改调用方会话里的数据源对象），关系图、检索重建，加进来的不再算范围外。"""
+        base = self.source._base if isinstance(self.source, _WithCache) else self.source
+        self.source = _WithCache(base, cache)
+        keys = {name_key(n) for n in added}
+        self.outside = [o for o in self.outside if name_key(o.name) not in keys]
+        self._graph = self._search = self._outside_keys = None
+
+    def outside_qualified(self, name: str) -> str:
+        schema = (getattr(self.source, "schema_cache", None) or {}).get("schema")
+        return f"{schema}.{name}" if schema else name
 
     @property
     def raw_notes(self) -> dict[str, dict[str, Any]]:
@@ -108,6 +163,17 @@ class SourcePlan:
 
     def qualified(self, key: str) -> str:
         return schema_view.qualifier(self.source)(key)
+
+
+class _WithCache:
+    """数据源换上一份新的 schema_cache（按需加入以后）：别的属性照原来的。不是 ORM 对象，改它不会被调用方的会话写回库。"""
+
+    def __init__(self, base: Any, cache: dict[str, Any]) -> None:
+        self._base = base
+        self.schema_cache = cache
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
 
 
 @dataclass(frozen=True)
@@ -153,14 +219,27 @@ class TableKind:
     kind = "table"
     label = "表"
 
-    def __init__(self, plans: list[SourcePlan], *, picker: Picker | None = None) -> None:
+    def __init__(self, plans: list[SourcePlan], *, picker: Picker | None = None,
+                 trail: Mapping[str, Any] | None = None) -> None:
         self.plans = plans
         self.picker = picker
+        #: 按需加入的留痕：{actor, conversation_id}（开流前定下）；这一次查看的需求原文、编号由 begin 记
+        self.trail = dict(trail or {})
+        self._need = ""
+        self._ref = ""
+        #: 这一次查看里已经按需加入了几张、加了哪些（{第几个库: [表名]}）、没加成的（{(库, 点名): 说法}）
+        self._added_now = 0
+        self._added: dict[int, list[str]] = {}
+        self._notes: list[str] = []
+        self._prefiltered: dict[int, int] = {}
+        self._last_index: dict[tuple[int, ...], str] = {}
 
     @classmethod
     async def load(cls, sources: list[Any], *, graph: Mapping[str, Any] | None = None,
-                   picker: Picker | None = None, catalog_view: Any = None) -> TableKind:
-        """读各源的数据目录。graph 是现有工作流（改图时的原图、追问时上一轮的图），概览里列出它查过的表。
+                   picker: Picker | None = None, catalog_view: Any = None,
+                   trail: Mapping[str, Any] | None = None) -> TableKind:
+        """读各源的数据目录、剖析事实、探查范围外的对象清单。graph 是现有工作流（改图时的原图、追问时上一轮的图），概览里
+        列出它查过的表。trail 是按需加入的留痕（谁、哪一轮对话）：不给时谁取这次请求的身份。
 
         读哪一份目录由 catalog_view 定（data/catalog_view.py：当前目录、目录快照、关；只用已核实的项），不给是当前目录。
         查看结果里的目录和运行时 db_schema 给模型看的、自查用的是同一份——评测的「目录对照」量的才是整份贡献。"""
@@ -170,7 +249,23 @@ class TableKind:
         seeds = graph_tables(graph, sources)
         plans = [SourcePlan(source=s, entries=await read(view, s) if introspect.table_names(s) else {},
                             seeds=seeds.get(s.name, [])) for s in sources]
-        return cls(plans, picker=picker)
+        await _load_extras(plans)
+        trail = dict(trail or {})
+        if "actor" not in trail:
+            from app.api.deps import current_principal
+
+            trail["actor"] = current_principal().username
+        return cls(plans, picker=picker, trail=trail)
+
+    def begin(self, *, need: str, ref: str) -> None:
+        """一次查看开始（LookService 调）：按需加入的上限按这一次算，留痕记这次的需求和编号。"""
+        self._need, self._ref = need, ref
+        self._added_now = 0
+        self._added = {}
+        self._notes = []
+        self._prefiltered = {}
+        # 交回给模型点名的那份预筛目录只对这一次的需求有效
+        self._last_index = {}
 
     # ---------------------------------------------------------------- 概览、目录
 
@@ -193,12 +288,21 @@ class TableKind:
         return list(dict.fromkeys(found)), [s for s in sources if s not in by_name]
 
     async def index(self, sources: list[str] | None) -> str:
+        """交回给模型点名的表目录。这一次查看预筛过的，交回预筛的那一份（几千张表的整份目录塞不进来）；没预筛过、表又太多
+        的只列前 PREFILTER_LIMIT 张，写明另有几张。"""
+        candidates = self._candidates(sources)[0]
+        if (cached := self._last_index.get(tuple(candidates))) is not None:
+            return cached
         blocks = []
-        for i in self._candidates(sources)[0]:
+        for i in candidates:
             p = self.plans[i]
-            head = (INDEX_PARTIAL_PROMPT if p.unexplored else INDEX_HEAD_PROMPT).format(
-                source=p.name, total=p.total, explored=p.explored)
-            blocks.append(f"{head}\n{schema_view.table_index(p.source, p.notes)}")
+            head = (INDEX_HEAD_PROMPT if not p.unexplored else INDEX_SCOPED_PROMPT if p.scoped
+                    else INDEX_PARTIAL_PROMPT).format(source=p.name, total=p.total, explored=p.explored)
+            names = list(p.tables)
+            body = schema_view.table_index(p.source, p.notes, tables=names[:PREFILTER_LIMIT])
+            if len(names) > PREFILTER_LIMIT:
+                body += "\n" + INDEX_MORE_PROMPT.format(n=len(names) - PREFILTER_LIMIT)
+            blocks.append(f"{head}\n{body}")
         return "\n\n".join(blocks)
 
     # ---------------------------------------------------------------- 点名、挑选
@@ -222,20 +326,93 @@ class TableKind:
                 return TableRef(i, key)
         return None
 
+    def _find_outside(self, source: str | None, name: str) -> tuple[int, Any] | None:
+        """点名的表在哪个候选库的探查范围外（对象索引里有）：(第几个库, 对象)。规则同 _find。"""
+        if source is not None:
+            candidates = [i for i, p in enumerate(self.plans) if p.name == source]
+        elif (hit := self._prefixed(name)) is not None:
+            candidates, name = [hit[0]], hit[1]
+        else:
+            candidates = [i for i, p in enumerate(self.plans) if p.tables or p.outside]
+        for i in candidates:
+            obj = self.plans[i].outside_of(name)
+            if obj is not None:
+                return i, obj
+        return None
+
+    async def _add(self, wanted: dict[int, list[str]]) -> dict[tuple[int, str], TableRef]:
+        """按需加入（每次查看最多 ON_DEMAND_PER_LOOK 张，超了的照实说）：{(第几个库, 对象名): 加进来以后的 TableRef}。读不到
+        结构、加不进去的记进这一次的说明。"""
+        from app.data import source_objects as so
+
+        out: dict[tuple[int, str], TableRef] = {}
+        capped: list[str] = []
+        for i, names in wanted.items():
+            p = self.plans[i]
+            room = max(ON_DEMAND_PER_LOOK - self._added_now, 0)
+            take, rest = names[:room], names[room:]
+            capped += [f"{p.name} 的 {n}" for n in rest]
+            if not take:
+                continue
+            source_id = getattr(p.source, "id", None)
+            if not source_id:
+                continue
+            try:
+                got = await so.add_to_scope(source_id, take, trail=so.Trail(
+                    via=so.VIA_LOOK, actor=self.trail.get("actor"), conversation_id=self.trail.get("conversation_id"),
+                    ref=self._ref, need=self._need))
+            except Exception as e:  # noqa: BLE001 - 按需加入是辅助步骤，失败只是少一张表
+                from app.core.errors import explain
+
+                logger.exception("按需加入失败（数据源 %s）", p.name)
+                self._notes += [ADD_FAILED_PROMPT.format(table=n, why=explain(e)[0]) for n in take]
+                continue
+            self._added_now += len(got.added)
+            for name, why in {**got.failed, **got.refused}.items():
+                self._notes.append(ADD_FAILED_PROMPT.format(table=name, why=why))
+            if got.cache is not None and got.added:
+                p.replace_cache(got.cache, got.added)
+                self._added.setdefault(i, []).extend(got.added)
+            for name in got.added + got.already:
+                key = catalog.resolve_table_name(p.source.schema_cache, name)
+                if key:
+                    out[(i, name_key(name))] = TableRef(i, key)
+        if capped:
+            self._notes.append(ADD_CAPPED_PROMPT.format(limit=ON_DEMAND_PER_LOOK, tables="、".join(capped)))
+        return out
+
     async def resolve(self, targets: list[LookTarget]) -> tuple[list[TableRef], list[LookTarget]]:
         found: list[TableRef] = []
         missing: list[LookTarget] = []
-        single = len([p for p in self.plans if p.tables]) == 1
+        single = len([p for p in self.plans if p.tables or p.outside]) == 1
+        outside: list[tuple[LookTarget, int, Any]] = []
         for t in targets:
             source = t.get("source") or None
             if source is not None and source not in {p.name for p in self.plans}:
                 missing.append(t)
                 continue
-            ref = self._find(None if single and source is None else source, str(t.get("name") or ""))
+            where = None if single and source is None else source
+            ref = self._find(where, str(t.get("name") or ""))
             if ref is None:
-                missing.append(t)
+                hit = self._find_outside(where, str(t.get("name") or ""))
+                if hit is not None:
+                    outside.append((t, hit[0], hit[1]))
+                else:
+                    missing.append(t)
             elif ref not in found:
                 found.append(ref)
+        if outside:
+            wanted: dict[int, list[str]] = {}
+            for _t, i, obj in outside:
+                if obj.name not in wanted.setdefault(i, []):
+                    wanted[i].append(obj.name)
+            added = await self._add(wanted)
+            for t, i, obj in outside:
+                ref = added.get((i, name_key(obj.name)))
+                if ref is None:
+                    missing.append(t)
+                elif ref not in found:
+                    found.append(ref)
         return found, missing
 
     async def pick(self, need: str, sources: list[str] | None) -> tuple[list[TableRef], str | None]:
@@ -247,13 +424,16 @@ class TableKind:
                 return [], "；".join(f"数据源「{p.name}」{introspect.why_empty(p.source.schema_cache or {})}"
                                     for p in bare)
         pool = [TableRef(i, key, "picked") for i in candidates for key in self.plans[i].tables]
-        if len(pool) <= PICK_LIMIT:
+        outside = sum(len(self.plans[i].outside) for i in candidates)
+        if len(pool) + outside <= PICK_LIMIT and not outside:
             return pool, None
         if self.picker is None:
             return [], "没有可用的挑选模型"
-        index = "\n\n".join(
-            f"{(INDEX_PARTIAL_PROMPT if p.unexplored else INDEX_HEAD_PROMPT).format(source=p.name, total=p.total, explored=p.explored)}\n"
-            f"{schema_view.table_index(p.source, p.notes)}" for p in (self.plans[i] for i in candidates))
+        if len(pool) + outside > PREFILTER_LIMIT:
+            index = self._prefiltered_index(need, candidates)
+        else:
+            index = "\n\n".join(self._full_index(self.plans[i]) for i in candidates)
+        self._last_index[tuple(candidates)] = index
         used = "；".join(f"数据源「{p.name}」的 " + "、".join(p.qualified(t) for t in p.seeds)
                         for p in (self.plans[i] for i in candidates) if p.seeds)
         try:
@@ -263,21 +443,93 @@ class TableKind:
             return [], str(e)
         names = {self.plans[i].name for i in candidates}
         out: list[TableRef] = []
+        wanted: dict[int, list[str]] = {}
+        order: list[tuple[str, Any]] = []
         for source, name in picks:
             if len(candidates) == 1:
                 # 只有一个库要挑时不看模型写的库名（写错了也不要紧）
-                ref = self._find(self.plans[candidates[0]].name, name)
+                where: str | None = self.plans[candidates[0]].name
             elif source in names or source is None:
-                ref = self._find(source, name)
+                where = source
+            elif self._prefixed(name):
+                where = None
             else:
                 # 写了一个不在候选里的库名：表名前带着库名的照样认，否则丢掉
-                ref = self._find(None, name) if self._prefixed(name) else None
-            if ref is not None and ref.plan in candidates and not any(r.plan == ref.plan and r.key == ref.key
-                                                                      for r in out):
-                out.append(TableRef(ref.plan, ref.key, "picked"))
+                continue
+            ref = self._find(where, name)
+            if ref is not None and ref.plan in candidates:
+                if not any(r.plan == ref.plan and r.key == ref.key for r in out):
+                    out.append(TableRef(ref.plan, ref.key, "picked"))
+                    order.append(("in", out[-1]))
+                continue
+            hit = self._find_outside(where, name)
+            if hit is not None and hit[0] in candidates and hit[1].name not in wanted.setdefault(hit[0], []):
+                wanted[hit[0]].append(hit[1].name)
+                order.append(("out", (hit[0], name_key(hit[1].name))))
+        if any(wanted.values()):
+            added = await self._add({i: n for i, n in wanted.items() if n})
+            ranked: list[TableRef] = []
+            for kind, item in order:
+                ref = item if kind == "in" else added.get(item)
+                if ref is not None and not any(r.plan == ref.plan and r.key == ref.key for r in ranked):
+                    ranked.append(TableRef(ref.plan, ref.key, "picked"))
+            out = ranked
         if picks and not out:
             return [], "挑出的表在表结构中都不存在"
         return out[:PICK_LIMIT], None
+
+    def _full_index(self, p: SourcePlan) -> str:
+        """整份表目录（候选不多时交给挑选模型的那一份）：范围内的每张一行，范围外的另起一行、标出来。"""
+        head = (INDEX_PARTIAL_PROMPT if p.unexplored and not p.outside else INDEX_HEAD_PROMPT).format(
+            source=p.name, total=p.total, explored=p.explored)
+        lines = [schema_view.table_index(p.source, p.notes)]
+        lines += [self._outside_line(p, o) for o in p.outside]
+        return f"{head}\n" + "\n".join(x for x in lines if x)
+
+    def _outside_line(self, p: SourcePlan, obj: Any) -> str:
+        comment = f"｜{obj.comment}" if getattr(obj, "comment", None) else ""
+        return f"{p.outside_qualified(obj.name)}{comment}{OUTSIDE_MARK_PROMPT}"
+
+    def _prefiltered_index(self, need: str, candidates: list[int]) -> str:
+        """几千张表的库：按需求检索一遍，挑选模型只看前 PREFILTER_LIMIT 个命中（各库合起来按得分排）、工作流已用到的表、
+        命中表的一跳关联表（最多 NEIGHBOR_LIMIT 张）。检索什么都没命中时退回各库表结构里的前几张。"""
+        hits: list[tuple[float, int, Any]] = []
+        for i in candidates:
+            for hit in self.plans[i].search().search(need, limit=PREFILTER_LIMIT):
+                hits.append((hit.score, i, hit))
+        hits.sort(key=lambda h: (-h[0], h[1], h[2].name))
+        top = hits[:PREFILTER_LIMIT]
+        if not top:
+            per = max(PREFILTER_LIMIT // max(len(candidates), 1), 1)
+            top = [(0.0, i, schema_view.SearchHit(n, 0.0, True)) for i in candidates
+                   for n in list(self.plans[i].tables)[:per]]
+        blocks = []
+        for i in candidates:
+            p = self.plans[i]
+            mine = [h for _s, j, h in top if j == i]
+            inside = [h.name for h in mine if h.in_scope]
+            picked = list(dict.fromkeys([*p.seeds, *inside]))
+            neighbors: list[str] = []
+            graph = p.graph() if inside else {}
+            for name in inside:
+                for edge in graph.get(name, ()):
+                    if edge.to_table in p.tables and edge.to_table not in picked and edge.to_table not in neighbors:
+                        neighbors.append(edge.to_table)
+                if len(neighbors) >= NEIGHBOR_LIMIT:
+                    break
+            shown = picked + neighbors[:NEIGHBOR_LIMIT]
+            outside = [h.name for h in mine if not h.in_scope]
+            if not shown and not outside:
+                continue
+            self._prefiltered[i] = len(shown) + len(outside)
+            lines = [schema_view.table_index(p.source, p.notes, tables=shown)] if shown else []
+            for name in outside:
+                obj = p.outside_of(name)
+                if obj is not None:
+                    lines.append(self._outside_line(p, obj))
+            head = PREFILTERED_PROMPT.format(source=p.name, total=p.total, n=len(shown) + len(outside))
+            blocks.append(head + "\n" + "\n".join(x for x in lines if x))
+        return "\n\n".join(blocks)
 
     def key(self, obj: TableRef) -> str:
         return f"table:{self.plans[obj.plan].name}:{obj.key}"
@@ -319,7 +571,7 @@ class TableKind:
             lines.append(SOURCE_HEAD_PROMPT.format(source=p.name, kind=p.source.kind, lead="，".join(lead)))
             notes = p.raw_notes
             for key in tables:
-                full = schema_view.table_detail(p.source, key, catalog_notes=notes)
+                full = schema_view.table_detail(p.source, key, catalog_notes=notes, profile=p.facts)
                 block = full.split("\n")
                 if used + len(full) > budget:
                     block = [schema_view.table_brief(p.source, key)]
@@ -330,8 +582,11 @@ class TableKind:
                 lines += [f"    {x}" for x in block[1:]]
             lines += schema_view.join_lines(p.source, p.graph(), tables, indent="  ")
             lines += schema_view.route_lines(p.source, routes, indent="  ")
+            if self._added.get(i):
+                lines.append("  " + ADDED_PROMPT.format(tables="、".join(p.qualified(t) for t in self._added[i])))
             if p.unexplored:
-                lines.append("  " + UNEXPLORED_PROMPT.format(source=p.name, total=p.total, explored=p.explored))
+                prompt = OUT_OF_SCOPE_PROMPT if p.scoped else UNEXPLORED_PROMPT
+                lines.append("  " + prompt.format(source=p.name, total=p.total, explored=p.explored))
             blocks.append(self._record(p, named=named, picked=picked, joined=joined,
                                        missing=[str(t.get("name") or "") for t in missing
                                                 if self._missing_in(t) == i]))
@@ -339,6 +594,7 @@ class TableKind:
             lines.append(BRIEF_NOTE_PROMPT)
         if capped:
             lines.append(CAPPED_PROMPT.format(limit=CONTEXT_TABLE_LIMIT))
+        lines += self._notes
         lines += self._missing_lines(missing, blocks, set(by_plan))
         text = "\n".join(lines)
         if INFERRED_MARK in text:
@@ -391,4 +647,30 @@ class TableKind:
         }
         if p.unexplored:
             out["explored"] = p.explored
+        index = next(i for i, q in enumerate(self.plans) if q is p)
+        if self._added.get(index):
+            out["added_to_scope"] = [p.qualified(t) for t in self._added[index]]
+        if index in self._prefiltered:
+            out["prefiltered"] = self._prefiltered[index]
         return out
+
+
+async def _load_extras(plans: list[SourcePlan]) -> None:
+    """各源的剖析事实、探查范围外的对象清单：一个短会话读完。读不到就当没有（少一节剖析事实、少几个可按需加入的名字），
+    不挡生成。上传表格、记录表没有对象索引；探查范围以内就是全部的源（没有范围外的对象）不读清单。"""
+    from app.data import catalog_profile_jobs, source_objects
+    from app.db.base import SessionLocal
+
+    try:
+        async with SessionLocal() as session:
+            for p in plans:
+                source_id = getattr(p.source, "id", None)
+                if not source_id:
+                    continue
+                if p.tables:
+                    p.facts = await catalog_profile_jobs.last_facts(session, source_id)
+                scope = (getattr(p.source, "schema_cache", None) or {}).get("scope")
+                if isinstance(scope, dict) and scope.get("out_of_scope"):
+                    p.outside = await source_objects.outside_objects(session, p.source)
+    except Exception:  # noqa: BLE001
+        logger.exception("读剖析事实、探查范围外的对象清单失败，这一轮查看不给这两样")

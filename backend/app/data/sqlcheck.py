@@ -1385,16 +1385,19 @@ def _same_columns(text: str, parsed: ValidFilter) -> bool:
             and not any(c.table for c in columns))
 
 
-def stored_valid_filter(parsed: ValidFilter, kind: str | None) -> str:
+def stored_valid_filter(parsed: ValidFilter, kind: str | None, meta: Mapping[str, Any] | None = None) -> str:
     """模型提议的有效行过滤存进目录的写法：canonical_valid_filter，按这个数据源的方言加引号（catalog_profile.SqlDialect：
     SQLAlchemy 的写法，要加才加——PostgreSQL、SQLite 的 "OrderStatus"，MySQL 的 `OrderStatus`，Oracle 探查出来的小写名
-    不加）。"""
+    不加）。meta 是这张表的表结构：探查记了 quote_name 的列（Oracle 库里本来就是小写的列）强制加引号，和剖析核对查询
+    （catalog_profile.check_valid_filter）同一个写法——不加引号 Oracle 转成大写，找的是另一列。"""
     from app.data.catalog_profile import SqlDialect
 
     try:
         dialect = SqlDialect(kind)
     except ValueError:
         return parsed.text
+    if meta is not None:
+        return canonical_valid_filter(parsed, quote=lambda name: dialect.column(dict(meta), name))
     return canonical_valid_filter(parsed, quote=dialect.quote)
 
 

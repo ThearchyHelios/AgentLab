@@ -24,3 +24,21 @@ async def drop_source(source_id: str | None = None, *, name: str | None = None) 
         await session.execute(delete(DataSource).where(DataSource.id == source_id))
         await session.commit()
     await engines.invalidate(source_id)
+
+
+async def introspect_now(client, source_id: str, *, expect: int = 202) -> dict:
+    """探查结构并等它做完（探查是后台任务：POST /introspect 回 202 和任务，next-round 03 A1），返回数据源此刻的样子
+    （DataSourceOut）。expect 不是 202 时只发请求、断言状态码，返回响应体。"""
+    from app.data import introspect_jobs
+
+    r = await client.post(f"/api/datasources/{source_id}/introspect")
+    assert r.status_code == expect, r.text
+    if expect != 202:
+        return r.json()
+    job_id = r.json()["job"]["id"]
+    await introspect_jobs.manager.wait(job_id, timeout=120)
+    r = await client.get(f"/api/datasources/{source_id}/introspect-jobs/{job_id}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["job"]["status"] in ("succeeded", "partial"), body["job"]
+    return body["source"]

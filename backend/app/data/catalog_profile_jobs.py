@@ -238,7 +238,8 @@ def job_dict(job: CatalogProfileJob, tasks: list[Any], *, waiting_for: str | Non
 
 
 async def waiting_for(session: AsyncSession, job: CatalogProfileJob) -> str | None:
-    """排队中的剖析任务在等什么：排在同源的起草任务（或同步起草）后面时是 "draft"，否则 None。
+    """排队中的剖析任务在等什么：排在同源的起草任务（或同步起草）后面时是 "draft"，排在探查任务后面时是 "introspect"，
+    否则 None。
 
     先看这个源的队（进程内，排在它前面的是谁）；任务刚建、后台还没排进队时看库：同源有比它先建的、排队或进行中的起草
     任务，或者正在同步起草。"""
@@ -246,7 +247,10 @@ async def waiting_for(session: AsyncSession, job: CatalogProfileJob) -> str | No
         return None
     ahead = runtime.lanes.ahead(job.source_id, job.id)
     if ahead is not None:
-        return "draft" if any(kind in ("draft", "sync_draft") for kind in ahead) else None
+        if any(kind in ("draft", "sync_draft") for kind in ahead):
+            return "draft"
+        # 排在同源的探查任务后面（next-round 03 A1：探查也进同一条队）
+        return "introspect" if "introspect" in ahead else None
     from app.data import catalog_jobs
 
     if catalog_jobs.sync_drafting(job.source_id):
@@ -358,6 +362,33 @@ def public_last(last: dict[str, Any] | None) -> dict[str, Any] | None:
     return None if last is None else {k: v for k, v in last.items() if k not in _INTERNAL}
 
 
+async def last_facts(session: AsyncSession, source_id: str,
+                     tables: list[str] | None = None) -> dict[str, dict[str, Any]]:
+    """每张表「上次剖析」（见 _ranked 的 shown，和表清单、表详情同一项）里给助手看的剖析事实：{表名: {at, job_id,
+    row_estimate, date_ranges, snapshot_id}}，一条查询批量取。没有行数估算也没有日期范围的不给；tables 给了只取这几张。
+
+    look、运行时 db_schema、/schema、表助手四处都经 schema_view.profile_lines 渲染这一份（next-round 遗留 e）：剖析数字
+    是会过期的观测，不写进数据目录；遮罩、快照在渲染那一刻再核。"""
+    inner = _ranked(source_id, CatalogProfileTask.table_name, CatalogProfileTask.job_id,
+                    CatalogProfileTask.started_at, CatalogProfileTask.finished_at, CatalogProfileTask.row_estimate,
+                    CatalogProfileTask.date_ranges, CatalogProfileTask.snapshot_id)
+    query = select(inner).where(inner.c.shown == 1)
+    if tables is not None:
+        if not tables:
+            return {}
+        query = query.where(inner.c.table_name.in_(list(tables)))
+    out: dict[str, dict[str, Any]] = {}
+    for row in (await session.execute(query)).mappings():
+        estimate = row["row_estimate"] if isinstance(row["row_estimate"], dict) else None
+        ranges = [r for r in row["date_ranges"] or [] if isinstance(r, dict)]
+        if not estimate and not ranges:
+            continue
+        at = row["finished_at"] or row["started_at"]
+        out[row["table_name"]] = {"at": _iso(at), "job_id": row["job_id"], "row_estimate": estimate,
+                                  "date_ranges": ranges, "snapshot_id": row["snapshot_id"]}
+    return out
+
+
 async def last_detail(session: AsyncSession, source_id: str, table: str) -> dict[str, Any] | None:
     """这张表「上次剖析」（见 _ranked 的 shown）的明细（表详情的「数据剖析」一节）；没剖析过是 None。"""
     found = (await session.execute(
@@ -447,6 +478,18 @@ NOTHING_AT_ALL = ("没有可以剖析的表：表结构里的表都是视图，�
                   "或者都被遮罩了）。请先起草数据目录，或指定要剖析的表")
 
 
+async def outside_of(session: AsyncSession, row: Any) -> frozenset[str]:
+    """对象索引里探查范围外的对象（name_key）：剖析从范围内挑表，关系指向范围外的表时说「在探查范围外，可以加入」
+    （catalog_profile._relation_ends）。上传表格、记录表、升级前探查的源没有对象索引，是空集。"""
+    from app.data import source_objects
+
+    if (getattr(row, "origin", None) or "manual") != "manual":
+        return frozenset()
+    if not isinstance((getattr(row, "schema_cache", None) or {}).get("scope"), dict):
+        return frozenset()
+    return await source_objects.outside_names(session, row)
+
+
 def _skipped_task(job_id: str, seq: int, name: str, reason: str, why: str, checks: list[dict[str, Any]],
                   skipped: list[ProfileSkip], now: Any) -> CatalogProfileTask:
     entries = [s.to_dict() for s in skipped] + [ProfileSkip("table", name, reason, why).to_dict()]
@@ -463,13 +506,15 @@ async def _pick(session: AsyncSession, row: Any, source: Any, *, tables: list[st
     all_tables = cache.get("tables") or {}
     masked = catalog_profile.masked_of(getattr(row, "options", None))
     entries = await catalog.read_catalog(session, source.id)
+    outside = await outside_of(session, row)
 
     def notes(name: str) -> dict[str, Any]:
         entry = entries.get(name)
         return entry.notes if entry else {}
 
     def plan(name: str) -> list[Any]:
-        return catalog_profile.plan_checks(name, all_tables.get(name), notes(name), tables=all_tables, masked=masked)
+        return catalog_profile.plan_checks(name, all_tables.get(name), notes(name), tables=all_tables, masked=masked,
+                                           outside=outside)
 
     if scope == "selected":
         picked: list[tuple[str, str | None, str | None, list[Any]]] = []
@@ -765,6 +810,7 @@ class _ProfileRun(runtime.JobRun):
                 raise runtime.JobFailed(str(e)) from e
             settings = ProfileSettings.from_dict(job.settings)
             options = dict(row.options or {})
+            outside = await outside_of(session, row)
         # 要剖析哪些表按开始这一刻的目录定：排在起草后面时，建任务那会儿起草还没提出关系
         await self._write(self._rescope, row, source)
         async with SessionLocal() as session:
@@ -772,7 +818,7 @@ class _ProfileRun(runtime.JobRun):
             pending = [(t.seq, t.table_name) for t in await task_rows(session, job.id) if t.status == "pending"]
             self.actor = job.created_by
         try:
-            self.cx = catalog_profile.make_context(source, settings, options=options)
+            self.cx = catalog_profile.make_context(source, settings, options=options, outside=outside)
         except ValueError as e:              # 不支持的数据库类型
             raise runtime.JobFailed(str(e)) from e
         hooks = TableHooks(progress=self._progress, query=self._queried, stop_text=self.stop_text)
@@ -889,8 +935,10 @@ class _ProfileRun(runtime.JobRun):
         await session.commit()
 
     async def _start_table(self, session: AsyncSession, seq: int) -> None:
+        # 上传表格源记下这一刻剖析的是哪个快照：换了版本之后，旧版本的剖析事实不再交给助手（schema_view.profile_lines）
+        snapshot = getattr(self.cx.source, "snapshot_id", None) if self.cx is not None else None
         await session.execute(self._task(CatalogProfileTask.seq == seq, CatalogProfileTask.status == "pending")
-                              .values(status="running", started_at=utcnow()))
+                              .values(status="running", started_at=utcnow(), snapshot_id=snapshot))
         await session.commit()
 
     def _elapsed(self) -> int:
@@ -960,5 +1008,5 @@ manager = ProfileJobs()
 __all__ = ["INTERRUPTED_ERROR", "KEEP_JOBS", "MAX_TABLES", "NOTHING_AT_ALL", "NOTHING_NEEDED", "NothingToRetry",
            "ProfileBusy", "ProfileFinished", "ProfileJobs", "ProfileNothing", "THEN_PROFILE", "active_job",
            "busy_message", "cancel", "create_job", "due_reason", "ensure_free", "job_brief", "job_dict", "job_out",
-           "last_detail", "last_profiles", "latest_job", "load", "load_task", "manager", "prune", "public_last",
+           "last_detail", "last_facts", "last_profiles", "outside_of", "latest_job", "load", "load_task", "manager", "prune", "public_last",
            "retry_tables", "startup", "task_detail", "task_row", "task_rows", "unsaved_error", "waiting_for"]

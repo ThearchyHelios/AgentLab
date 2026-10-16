@@ -364,6 +364,8 @@ function rowOf(t) {
   const live = (it) => (it && it.status !== 'rejected' ? it : null)
   return {
     table_name: t.name, qualified: t.name, is_view: t.is_view, in_schema: !t.missing,
+    // 为什么不在（next-round 03 A1）：夹具给了 absent 才带，不给时同老服务端（界面照旧说表结构中已没有）
+    ...(t.absent ? { absent_reason: t.absent } : {}),
     label: live(n.label)?.value ?? null, label_status: live(n.label)?.status ?? null, kind: live(n.kind)?.value ?? null,
     counts: countsOf(n), relations: (n.relations ?? []).filter((r) => r.status !== 'rejected').length,
     usage: t.usage, version: t.version, updated_at: t.updated_at, updated_by: t.updated_by,
@@ -381,10 +383,12 @@ function listOf(state, src) {
   const active = state.jobs.find((j) => j.source_id === src && JOB_ACTIVE.has(j.status))
   return { tables: rows, system_notes: isUpload(src), schema_note: all.length ? null : '尚未探查结构',
     schema_truncated: total > explored, schema_total: total, guidance: state.guidance[src] ?? null,
+    // 有对象索引的源才有探查范围的摘要（state.scope 里给了）；没给是升级前探查的源
+    ...(state.scope?.[src] ? { scope: state.scope[src] } : {}),
     active_job: active ? (({ id, status, total: n, done }) => ({ id, status, total: n, done }))(jobOut(active)) : null }
 }
 const detailOf = (src, t) => ({
-  table_name: t.name, in_schema: !t.missing, notes: t.notes ?? {}, version: t.version, updated_at: t.updated_at, updated_by: t.updated_by,
+  table_name: t.name, in_schema: !t.missing, ...(t.absent ? { absent_reason: t.absent } : {}), notes: t.notes ?? {}, version: t.version, updated_at: t.updated_at, updated_by: t.updated_by,
   structure: t.missing ? null : {
     qualified: t.name, is_view: t.is_view, comment: t.comment, columns: t.columns,
     primary_key: t.columns.filter((c) => c.pk).map((c) => c.name), foreign_keys: [], unique: [],
@@ -654,6 +658,25 @@ function catalogHandlers(state, replies = {}) {
       state.sources = state.sources.map((s) => (s.id === id ? { ...s, ...body, password: undefined } : s))
       return json(state.sources.find((s) => s.id === id))(route)
     })],
+    // 在对象索引里找表（范围外的）、加入范围：要放在单表的 GET 前面（search 也对得上单表的写法）
+    [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/search$/, (route, { key, url }) => {
+      const q = (url.searchParams.get('q') ?? '').toLowerCase()
+      const items = (state.outside?.[parts(key)[2]] ?? []).filter((o) => o.name.includes(q) || (o.comment ?? '').includes(q))
+      return json({ items: items.map((o) => ({ qualified: o.name, kind: 'table', est_rows: null, in_scope: false,
+        scope_reason: null, absent_reason: 'out_of_scope', ...o })), total: items.length, indexed: true })(route)
+    }],
+    [/^POST \/datasources\/check-cat-[a-z]+\/catalog\/scope\/add$/, (route, { key, body }) => {
+      const src = parts(key)[2]
+      const added = []
+      for (const name of body?.tables ?? []) {
+        const i = (state.outside?.[src] ?? []).findIndex((o) => o.name === name)
+        if (i < 0) continue
+        state.outside[src].splice(i, 1)
+        state.tables[src].push(table(name, 0, [pk(), col('opened_at', 'TEXT')], null))
+        added.push(name)
+      }
+      return json({ added, already: [], failed: [], refused: [], scope: state.scope?.[src] ?? null })(route)
+    }],
     [/^GET \/datasources\/check-cat-[a-z]+\/catalog\/[^/]+$/, reply('get', (route, { key }) => {
       const { src, t } = findTable(state, key)
       return t ? json(detailOf(src, t))(route) : json({ detail: `数据源中没有表 ${parts(key)[4]}，可能已被删除或尚未探查结构` }, 404)(route)
@@ -2263,7 +2286,7 @@ await section('数据目录 · 空状态与导入表格', async () => {
 const profileBox = (page) => page.locator('[data-profile-dialog]')
 
 await section('数据目录 · 只探查了一部分表', async () => {
-  // 探查结构每个数据源最多取 200 张表：多出来的不在清单里，助手也看不到。顶部要说出来，并给出下一步
+  // 升级前探查的源（没有对象索引）：老缓存只探查了前 200 张，顶部照旧说出来，下一步是重新探查（新的探查列出全部对象）
   const state = freshState()
   const explored = state.tables[S1].filter((t) => !t.missing).length
   const total = explored + 57
@@ -2275,10 +2298,8 @@ await section('数据目录 · 只探查了一部分表', async () => {
     await bar.getAttribute('data-catalog-schema-partial'))
   const text = await bar.innerText().catch(() => '')
   check('……写成「共有 N 张表，只探查了前 M 张」', text.includes(`这个数据源共有 ${total} 张表，只探查了前 ${explored} 张`), text)
-  check('……说明为什么只取了这些、其余的助手也看不到', text.includes('最多取 200 张表') && text.includes('其余 57 张不在数据目录中')
-    && text.includes('助手也看不到'), text.replace(/\s+/g, ' '))
-  check('……给出下一步：换 schema 或缩小范围后重新探查', text.includes('换一个 schema') && text.includes('缩小范围')
-    && text.includes('探查结构'), text.replace(/\s+/g, ' '))
+  check('……其余的助手也看不到', text.includes('其余 57 张不在数据目录中') && text.includes('助手也看不到'), text.replace(/\s+/g, ' '))
+  check('……给出下一步：回到数据源卡片重新探查', text.includes('重新「探查结构」') && text.includes('全部对象'), text.replace(/\s+/g, ' '))
   await shot(page, 'catalog-schema-partial')
   await cleanCopy(page, '只探查了一部分表')
   await bar.locator('[data-catalog-schema-partial-go]').click()
@@ -2289,6 +2310,75 @@ await section('数据目录 · 只探查了一部分表', async () => {
   await page.locator('[data-catalog-overview]').waitFor()
   check('没截断的库不出这一条', await page.locator('[data-catalog-schema-partial]').count() === 0)
   check('只读、不发写请求', writes(sent, /./).length === 0)
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await close()
+})
+
+await section('数据目录 · 探查范围：三种不在、分批显示、加入范围', async () => {
+  // 几千张表的库（next-round 03 A1、A2）：清单只列探查范围内的；表结构里没有的按原因分开说，只有真删除说「表已不在」；
+  // 一次画 200 行，「显示更多」再画；搜索词同时在对象索引里找范围外的表，「加入范围」之后清单里就有了
+  const state = freshState()
+  for (let i = 1; i <= 120; i++) state.tables[S1].push(table(`arch_evt_${String(i).padStart(3, '0')}`, 0, [pk()], null))
+  state.tables[S1].push(table('gone_promos', 0, null, { label: item('已删除的促销', 'human') }, { missing: true, absent: 'removed' }))
+  state.tables[S1].push(table('cold_ledger', 0, null, { label: item('冷数据台账', 'human') }, { missing: true, absent: 'out_of_scope' }))
+  state.tables[S1].push(table('locked_audit', 0, null, { label: item('权限受限的审计表', 'human') }, { missing: true, absent: 'reflect_failed' }))
+  const explored = state.tables[S1].filter((t) => !t.missing).length
+  state.schemaTotal = { [S1]: explored + 2600 }
+  state.scope = { [S1]: { in_scope: explored + 1, reflected: explored, failed: 1, out_of_scope: 2600, cap: 500, index_total: explored + 2600,
+    pinned: 4, explicit: 0, rule: explored - 3, on_demand: 0 } }
+  state.outside = { [S1]: [{ name: 'complaint_ticket', comment: '客户投诉工单' }, { name: 'complaint_reason', comment: '投诉原因字典' }] }
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: catalogHandlers(state) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  const rendered = await page.locator('[data-catalog-row]').count()
+  check('一次只画 200 行', rendered === 200, String(rendered))
+  const more = page.locator('[data-catalog-more]')
+  const all = state.tables[S1].length
+  check('……「显示更多」写明已显示几张、一共几张', (await more.getAttribute('data-catalog-more')) === `200/${all}`
+    && (await more.innerText()).includes(`已显示 200 / ${all} 张`), await more.innerText().catch(() => ''))
+  await more.click()
+  await until(async () => (await page.locator('[data-catalog-row]').count()) === all)
+  check('……点了再画下一批，画完就不再给按钮', await page.locator('[data-catalog-row]').count() === all
+    && await page.locator('[data-catalog-more]').count() === 0, String(await page.locator('[data-catalog-row]').count()))
+  const reason = async (name) => page.locator(`[data-catalog-row="${name}"] [data-row-missing]`)
+    .evaluate((el) => [el.getAttribute('data-row-missing'), el.innerText]).catch(() => ['', ''])
+  const [r1, t1] = await reason('gone_promos')
+  check('真删除的写「表已不在」', r1 === 'removed' && t1.includes('表已不在'), t1)
+  const [r2, t2] = await reason('cold_ledger')
+  check('探查范围外的写「在探查范围外」，不说表已不在', r2 === 'out_of_scope' && t2.includes('在探查范围外') && !t2.includes('已不在'), t2)
+  const [r3, t3] = await reason('locked_audit')
+  check('读不到结构的写「读不到结构」', r3 === 'reflect_failed' && t3.includes('读不到结构'), t3)
+  const [r4, t4] = await reason('legacy_coupons')
+  check('老服务端不给原因的照旧写「表结构中已没有这张表」', r4 === '' && t4.includes('表结构中已没有这张表'), t4)
+  const bar = page.locator('[data-catalog-schema-partial]')
+  const barText = await bar.innerText().catch(() => '')
+  check('顶部说明写探查范围：共几张、范围内几张、范围外的怎么找', barText.includes('探查范围内') && barText.includes('其余 2,600 张在探查范围外')
+    && barText.includes('加入范围'), barText.replace(/\s+/g, ' '))
+
+  // 表详情：在范围外的那张说清怎么加进来
+  await page.locator('[data-catalog-row="cold_ledger"] [data-catalog-open-row]').click()
+  const notice = page.locator('[data-catalog-missing]')
+  await notice.waitFor({ timeout: 4000 }).catch(() => {})
+  check('表详情里按原因说：范围外的给加入范围的去处', (await notice.getAttribute('data-catalog-missing')) === 'out_of_scope'
+    && (await notice.innerText()).includes('探查范围'), await notice.innerText().catch(() => ''))
+
+  // 搜索范围外的表并加入范围
+  const search = page.locator('[data-catalog-search]')
+  await search.fill('complaint')
+  const outsideRow = page.locator('[data-catalog-outside-row="complaint_ticket"]')
+  check('搜索词同时在对象索引里找：范围外的命中列在清单下面', await outsideRow.waitFor({ timeout: 4000 }).then(() => true, () => false))
+  check('……写明在探查范围外、带注释', (await page.locator('[data-catalog-outside]').innerText()).includes('探查范围外的表')
+    && (await outsideRow.innerText()).includes('客户投诉工单'), await page.locator('[data-catalog-outside]').innerText().catch(() => ''))
+  await shot(page, 'catalog-outside-search')
+  await outsideRow.locator('[data-catalog-add-scope]').click()
+  await until(async () => (await page.locator('[data-catalog-row="complaint_ticket"]').count()) === 1)
+  const addReq = lastBody(sent, /^POST \/datasources\/check-cat-scenic\/catalog\/scope\/add$/)
+  check('……「加入范围」发的是这一张', JSON.stringify(addReq) === JSON.stringify({ tables: ['complaint_ticket'] }), JSON.stringify(addReq))
+  check('……加完清单重取，这张表在清单里了', await page.locator('[data-catalog-row="complaint_ticket"]').count() === 1)
+  check('……范围外的命中里不再有它', await page.locator('[data-catalog-outside-row="complaint_ticket"]').count() === 0)
+  await cleanCopy(page, '探查范围')
+  check('只有「加入范围」一种写请求', writes(sent, /./).every((s) => /scope\/add$/.test(s.key)),
+    writes(sent, /./).map((s) => s.key).join(' | '))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
   await close()

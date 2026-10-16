@@ -108,6 +108,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await catalog_profile_jobs.startup()
     except Exception:  # noqa: BLE001
         logger.exception("数据剖析任务的启动整理失败，服务照常启动")
+    # 后台探查任务（next-round 03 A1）同一个规矩：没做完的标中断，读完的表物化进表结构，不自动续跑
+    from app.data import introspect_jobs
+
+    try:
+        await introspect_jobs.startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("探查任务的启动整理失败，服务照常启动")
 
     await run_manager.setup()
     # 流程：存量的待审批补建待办（派给任何人，幂等）；上次进程没了时已发出、没拿到结果的写入收成结果未知、安排核实
@@ -140,6 +147,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await scheduler.stop()
         await catalog_jobs.manager.shutdown()
         await catalog_profile_jobs.manager.shutdown()
+        await introspect_jobs.manager.shutdown()
         await run_manager.shutdown()
         from app.sandbox.manager import sandbox_manager
 

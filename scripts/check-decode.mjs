@@ -703,6 +703,16 @@ await section('Copilot：助手按需查看（look 事件）', async () => {
     && mod.looksOf(synthetic.COPILOT_CONTEXT_FALLBACK)[0].objects[0].kind === 'table')
   check('旧写法 sources[] 当作表类型读', mod.lookEventOf({ op: 'look', sources: [{ source: 'a', named: ['x'], missing: [] }] })
     ?.objects[0]?.kind === 'table')
+  // 大库（next-round 03 A2）：点名或挑中探查范围外的表，当场读了结构、加进了范围；记录里的 added_to_scope 写进展开区
+  const added = mod.lookEventOf({ op: 'look', id: 'L1', need: '投诉工单处理时长', status: 'ok', objects: [
+    { kind: 'table', source: 'erp', named: [], picked: ['complaint_ticket', 'ord_hdr_east'], missing: [], total: 3000, explored: 400,
+      added_to_scope: ['complaint_ticket'], prefiltered: 140 }] })
+  check('look 记录读 added_to_scope、prefiltered', JSON.stringify(added?.objects[0]?.added_to_scope) === '["complaint_ticket"]'
+    && added?.objects[0]?.prefiltered === 140, JSON.stringify(added?.objects[0] ?? {}))
+  const addedRow = mod.copilotLook({ op: 'look', id: 'L1', need: '投诉工单处理时长', status: 'ok', objects: added.objects })
+  check('……展开区写「按需加入探查范围」', !!addedRow?.detail?.includes('按需加入探查范围：complaint_ticket'), addedRow?.detail)
+  check('……老服务端没有这一项：不出这一句', !mod.copilotLook({ op: 'look', id: 'L2', need: 'x', status: 'ok', objects: [
+    { kind: 'table', source: 'erp', named: ['a'], missing: [] }] })?.detail?.includes('按需加入'))
   check('形状不对不出行、不报错', mod.decodeCopilot([{ op: 'look' }, { op: 'look', objects: 'x' }]).length === 0)
   check('认不出的操作照旧忽略', mod.decodeCopilot([{ op: 'something_new', x: 1 }]).length === 0)
   // 三条旧说法删掉了（look §2.6），界面上哪里都不该再出现

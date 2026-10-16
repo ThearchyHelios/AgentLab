@@ -1929,7 +1929,7 @@ def _model_facts(entry: Mapping[str, Any], meta: Mapping[str, Any], *, kind: str
         parsed = sqlcheck.parse_valid_filter(text, meta, kind=kind, table=table)
         problem = parsed.problem
         if problem is None:
-            stored = sqlcheck.stored_valid_filter(parsed, kind)
+            stored = sqlcheck.stored_valid_filter(parsed, kind, meta)
             if _text_ok(stored):
                 out["valid_filter"] = _fact_item(stored, reason)
             else:
