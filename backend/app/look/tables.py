@@ -264,6 +264,8 @@ class TableKind:
         self._added = {}
         self._notes = []
         self._prefiltered = {}
+        # 交回给模型点名的那份预筛目录只对这一次的需求有效
+        self._last_index = {}
 
     # ---------------------------------------------------------------- 概览、目录
 
