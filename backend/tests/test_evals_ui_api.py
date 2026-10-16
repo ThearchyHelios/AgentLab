@@ -194,6 +194,39 @@ async def test_signals_give_criteria_trend_and_repeated_question_clusters(client
     assert (await client.get("/api/evals/signals", params={"days": 0})).status_code == 422
 
 
+async def test_one_visit_to_the_signals_tab_embeds_each_question_once(client, monkeypatch):
+    """「口径命中与重复度」页签一次打开：/signals 按窗口调 compute_stats（每个窗口都聚一次问题），页面另调 /ledger/stats——
+    同一句问题原文不管在几个窗口、几个接口里出现，都只取一次向量；再打开一遍一次都不取（配了远程向量模型时每取一次都花钱）。
+    两个接口同时到（页面是并行取的）也一样。"""
+    import asyncio
+    from collections import Counter
+
+    from app.memory import embeddings
+
+    real = embeddings.embed_texts
+    seen: Counter[str] = Counter()
+
+    async def counting(texts):
+        seen.update(texts)
+        return await real(texts)
+
+    monkeypatch.setattr(embeddings, "embed_texts", counting)
+    mark = uuid.uuid4().hex[:6]
+    asked = [f"虚构门店 {mark} 第 {i} 问的销售额是多少？" for i in range(3)]
+    for question in asked:
+        await _asked(question, 3)
+    a, b = await asyncio.gather(client.get("/api/evals/signals", params={"days": 30, "points": 6}),
+                                client.get("/api/ledger/stats"))
+    assert a.status_code == 200 and b.status_code == 200
+    mine = {t: n for t, n in seen.items() if mark in t}
+    assert set(mine) == set(asked) and set(mine.values()) == {1}, mine
+    assert sum(c["count"] for c in a.json()["clusters"] if mark in c["representative"]) >= 9, "聚类照旧：九次提问都在"
+    seen.clear()
+    await client.get("/api/evals/signals", params={"days": 30, "points": 6})
+    await client.get("/api/ledger/stats")
+    assert not [t for t in seen if mark in t], "再打开一遍：向量都在进程里，一次都不取"
+
+
 def test_bands_follow_the_reference_lines():
     from app.api import evals
 

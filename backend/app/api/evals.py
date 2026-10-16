@@ -34,7 +34,8 @@
   结果的列和前几行（界面上点选格或列）；用到遮罩列的照保存时那一道拒收、照实写原因（不回 422）；
 - GET /signals：「口径命中与重复度」页签的判据（细案 copilot-look-and-caliber-ledger §3.8 的参考线：E1 ≥30% / <10%，
   E3 ≥20%）、当前窗口和往前几个窗口各自落在哪一档、成员不少于 3 的问题类（可以加入题集或提取模板）。数都出自
-  ledger/stats.compute_stats 和 chat/questions（全站各一份），这里只按窗口调它们、按判据分档。
+  ledger/stats.compute_stats 和 chat/questions（全站各一份），这里只按窗口调它们、按判据分档。每个窗口都要聚一次问题，页面
+  另调 /api/ledger/stats：问题的向量由 chat/questions 在进程里留一份，同一句话只取一次（配了远程向量模型时不按窗口重发）。
 """
 from __future__ import annotations
 

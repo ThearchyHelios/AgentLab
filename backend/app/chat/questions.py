@@ -17,9 +17,19 @@
 
 聚类用 memory/embeddings 的向量贪心聚：按时间从新到旧，和某一类的种子足够像就并进去，否则自立一类。本地向量是词频
 哈希、语义能力弱，结果是下限——调用方据 embedder 照实写明用的是哪个向量模型。
+
+**向量只取一次。** 同一批问题会被聚很多遍：评测页「口径命中与重复度」一次打开，/api/evals/signals 按窗口调 compute_stats
+（缺省 6 个窗口，每个都聚一次），页面另调 /api/ledger/stats；认证队列、治理页的探索问题聚类也各聚一遍。配了远程向量模型时
+每聚一遍都把几百句问题重新发一次，页面慢、还花钱。所以问题原文 → 向量在进程里留一份（_vectors：最多 VECTOR_CACHE_MAX 句，
+最近用到的留着），同一句话只取一次；一次里重复的问法（聚类量的正是这个）也只发一句。缓存认的是「哪一个 embedder、哪一个取向量
+的函数」算的：设置页换了向量模型（memory/embeddings.configure 换了对象）就整份丢掉，不把两个向量空间的坐标混着比。取向量按事件
+循环串行：页面并行取的两个接口不会把同一批问题各发一遍。
 """
 from __future__ import annotations
 
+import asyncio
+import weakref
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -30,6 +40,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 #: 缺省的相似度阈值（同治理接口一直以来的 0.62）
 DEFAULT_THRESHOLD = 0.62
+#: 进程里最多留几句问题的向量：取问题的地方一次最多 500 句（ledger/stats、治理接口的上限），留两批的量，窗口来回切不用重取
+VECTOR_CACHE_MAX = 1000
 
 
 @dataclass(frozen=True)
@@ -86,14 +98,65 @@ async def recent_questions(session: AsyncSession, principal: Any, *, limit: int)
     return out[:limit]
 
 
+#: 问题原文 → 向量（最近用到的在后）和它们是谁算的（见模块说明「向量只取一次」）
+_VECTORS: "OrderedDict[str, Any]" = OrderedDict()
+_VECTORS_OF: tuple[Any, Any] | None = None
+_VECTOR_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
+
+
+def _vector_lock() -> asyncio.Lock:
+    """取向量的锁，按事件循环各一把（asyncio.Lock 不能跨循环用）。"""
+    loop = asyncio.get_running_loop()
+    lock = _VECTOR_LOCKS.get(loop)
+    if lock is None:
+        lock = _VECTOR_LOCKS[loop] = asyncio.Lock()
+    return lock
+
+
+def _owner() -> tuple[Any, Any]:
+    from app.memory import embeddings
+
+    return embeddings.get_embedder(), embeddings.embed_texts
+
+
+def _same_owner(a: tuple[Any, Any] | None, b: tuple[Any, Any]) -> bool:
+    return a is not None and a[0] is b[0] and a[1] is b[1]
+
+
+async def _vectors(texts: Sequence[str]) -> list[Any]:
+    """这些问题的向量（顺序同 texts）：进程里有的直接用，没有的去重后一次取齐、留下来。"""
+    global _VECTORS_OF
+
+    async with _vector_lock():
+        owner = _owner()
+        if not _same_owner(_VECTORS_OF, owner):
+            _VECTORS.clear()
+            _VECTORS_OF = owner
+        got = {t: _VECTORS[t] for t in texts if t in _VECTORS}
+        missing = [t for t in dict.fromkeys(texts) if t not in got]
+        if missing:
+            fresh = await owner[1](missing)
+            got.update(zip(missing, fresh))
+            # 取的这一会儿设置页换了向量模型：这一批照用（同一次聚类里坐标是一致的），不留给下一次
+            if not _same_owner(_VECTORS_OF, _owner()):
+                return [got[t] for t in texts]
+            for t in missing:
+                _VECTORS[t] = got[t]
+        for t in dict.fromkeys(texts):
+            _VECTORS.move_to_end(t)
+        while len(_VECTORS) > VECTOR_CACHE_MAX:
+            _VECTORS.popitem(last=False)
+        return [got[t] for t in texts]
+
+
 async def cluster_questions(questions: Sequence[Question], *, threshold: float = DEFAULT_THRESHOLD,
                             ) -> list[QuestionCluster]:
-    """向量贪心聚类（顺序同 questions：从新到旧）。"""
+    """向量贪心聚类（顺序同 questions：从新到旧）。向量取自 _vectors：同一句话在进程里只取一次。"""
     from app.memory import embeddings
 
     if not questions:
         return []
-    vectors = await embeddings.embed_texts([q.text for q in questions])
+    vectors = await _vectors([q.text for q in questions])
     clusters: list[tuple[int, QuestionCluster]] = []
     for i, question in enumerate(questions):
         for seed, cluster in clusters:
@@ -112,4 +175,5 @@ def embedder() -> str:
     return embeddings.embedder_id()
 
 
-__all__ = ["DEFAULT_THRESHOLD", "Question", "QuestionCluster", "cluster_questions", "embedder", "recent_questions"]
+__all__ = ["DEFAULT_THRESHOLD", "VECTOR_CACHE_MAX", "Question", "QuestionCluster", "cluster_questions", "embedder",
+           "recent_questions"]
