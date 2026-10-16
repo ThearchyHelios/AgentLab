@@ -327,6 +327,21 @@ async def test_caliber_cases_list_and_dispose_upgrades(client, source):
     assert res.status_code == 409 and res.json()["code"] == "eval_dispose_nothing_pending"
 
 
+async def test_caliber_cases_pin_only_published_versions(client, source):
+    async with SessionLocal() as session:
+        wf = Workflow(name=f"草稿口径_{uuid.uuid4().hex[:6]}", graph=_weekly(source["name"]), status="draft", version=1)
+        session.add(wf)
+        await session.flush()
+        session.add(WorkflowVersion(workflow_id=wf.id, version=1, graph=_weekly(source["name"])))
+        await session.commit()
+        wf_id = wf.id
+    suite = await new_suite(client)
+    res = await client.post(f"/api/evals/suites/{suite['id']}/cases", json={
+        "question": "q", "gold": {"kind": "caliber", "workflow_id": wf_id, "version": 1, "node_id": "card"},
+        "expectations": [{"kind": "scalar", "metric": "gmv"}]})
+    assert res.status_code == 422 and res.json()["field"] == "gold.version" and "没有发布过" in res.json()["detail"]
+
+
 # --------------------------------------------------------------------------
 # 导出导入
 # --------------------------------------------------------------------------

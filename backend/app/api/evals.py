@@ -156,9 +156,11 @@ def _context(suite: EvalSuite, actor: str | None, **extra: Any) -> gold_rules.Co
                               role="gold", extra={"trial": True, **extra})
 
 
-async def _trial(suite: EvalSuite, fields: dict[str, Any], actor: str | None, *, case_id: str | None = None,
-                 seq: int | None = None) -> gold_rules.GoldOutcome:
-    """按此刻试算一次期望。"""
+async def _trial(session: AsyncSession, suite: EvalSuite, fields: dict[str, Any], actor: str | None, *,
+                 case_id: str | None = None, seq: int | None = None) -> gold_rules.GoldOutcome:
+    """按此刻试算一次期望。试算要等一次运行跑完（最多 TRIAL_TIMEOUT_S 秒）：先结束这个请求的读事务，不一直开着它等
+    （会话的 expire_on_commit 是关的，读好的对象照用）。"""
+    await session.commit()
     return await gold_rules.compute_gold({**fields, "id": case_id, "seq": seq}, _context(suite, actor))
 
 
@@ -305,7 +307,7 @@ async def create_case(suite_id: str, request: Request, session: AsyncSession = D
     suite = await _suite(session, suite_id)
     actor = actor_of(x_actor)
     fields = await _validated(session, suite, await _body(request))
-    outcome = await _trial(suite, fields, actor)
+    outcome = await _trial(session, suite, fields, actor)
     _gate(outcome)
     row = await _insert_case(session, suite, fields, actor, _trial_record(outcome, actor))
     return {"case": _case_out(row, await _source_names(session, [row]), await _upgrade_of(session, row)),
@@ -318,7 +320,7 @@ async def trial_unsaved(suite_id: str, request: Request, session: AsyncSession =
     """只试算、不保存（界面上写 SQL、点选格或列时的「试算」）：交回试算结果，没过的照实写原因（不回 422）。"""
     suite = await _suite(session, suite_id)
     fields = await _validated(session, suite, await _body(request))
-    return {"trial": (await _trial(suite, fields, actor_of(x_actor))).to_dict()}
+    return {"trial": (await _trial(session, suite, fields, actor_of(x_actor))).to_dict()}
 
 
 @router.patch("/suites/{suite_id}/cases/{case_id}")
@@ -335,7 +337,7 @@ async def update_case(suite_id: str, case_id: str, request: Request, session: As
     outcome = None
     values: dict[str, Any] = {**fields, "case_hash": new_hash}
     if new_hash != row.case_hash:
-        outcome = await _trial(suite, fields, actor, case_id=row.id, seq=row.seq)
+        outcome = await _trial(session, suite, fields, actor, case_id=row.id, seq=row.seq)
         _gate(outcome)
         values["trial"] = _trial_record(outcome, actor)
     result = await session.execute(update(EvalCase).where(EvalCase.id == case_id, EvalCase.version == version)
@@ -366,7 +368,7 @@ async def trial_case(suite_id: str, case_id: str, session: AsyncSession = Depend
     suite = await _suite(session, suite_id)
     row = await _case(session, suite_id, case_id)
     actor = actor_of(x_actor)
-    outcome = await _trial(suite, case_fields(row), actor, case_id=row.id, seq=row.seq)
+    outcome = await _trial(session, suite, case_fields(row), actor, case_id=row.id, seq=row.seq)
     await session.execute(update(EvalCase).where(EvalCase.id == case_id).values(trial=_trial_record(outcome, actor))
                           .execution_options(synchronize_session=False))
     await session.commit()
@@ -448,7 +450,7 @@ async def create_from_run(suite_id: str, request: Request, session: AsyncSession
             "node_id": picked.get("node_id"), "confirmed_by": actor, "confirmed_at": utcnow().isoformat()}
     case_body = {k: body[k] for k in ("expectations", "tags", "datasource_ids", "enabled") if k in body}
     fields = await _validated(session, suite, {**case_body, "question": question, "gold": gold}, trusted_gold=True)
-    outcome = await _trial(suite, fields, actor)
+    outcome = await _trial(session, suite, fields, actor)
     _gate(outcome)
     row = await _insert_case(session, suite, fields, actor, _trial_record(outcome, actor))
     return {"case": _case_out(row, await _source_names(session, [row])), "trial": outcome.to_dict()}
@@ -503,7 +505,13 @@ async def dispose_upgrade(suite_id: str, case_id: str, request: Request, session
     fields = {**current, "gold": planned}
     for key in ("id", "suite_id", "seq"):
         fields.pop(key, None)
-    outcome = await _trial(suite, fields, actor, case_id=row.id if policy != "incomparable" else None,
+    if policy != "dual":
+        # 改钉到新版本：按新版本再核一遍（入口字段、指标），说得清是哪一项不行；dual 的新版由试算一起算
+        try:
+            await resolve_case(session, fields, tz=suite.timezone)
+        except CaseInvalid as e:
+            raise _invalid(e) from e
+    outcome = await _trial(session, suite, fields, actor, case_id=row.id if policy != "incomparable" else None,
                            seq=row.seq if policy != "incomparable" else None)
     _gate(outcome)
     if policy == "incomparable":
@@ -589,6 +597,7 @@ async def import_suite(request: Request, session: AsyncSession = Depends(get_ses
                                                  _context(suite, actor, imported=True))
 
     passed: list[tuple[transfer.PlannedCase, gold_rules.GoldOutcome]] = []
+    await session.commit()          # 试算要等运行跑完：不一直开着读事务等（同 _trial）
     for item, outcome in zip(ready, await asyncio.gather(*(trial(c) for c in ready))):
         if outcome.ok:
             passed.append((item, outcome))

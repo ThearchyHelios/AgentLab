@@ -159,12 +159,15 @@ async def suite_tables(session: AsyncSession, suite_id: str) -> dict[str, list[s
     """题集用得到的表：{源 id: [SQL 里写的表名]}。从期望 SQL（SQL 题、从运行认定）和口径题的取数 SQL 推；工作流题、
     只有反问的题推不出。名字还没对上表结构（plan_shadow 再对）。"""
     from app.db.models import DataSource
-    from app.db.models_eval import EvalCase
+    from app.db.models_eval import EvalCase, EvalSuite
     from app.eval.cases import render, variable_values
     from app.ledger import derive
     from app.tools.datasource import QUERY_PREFIX
 
-    values = variable_values(utcnow(), "Asia/Shanghai")
+    suite = await session.get(EvalSuite, suite_id)
+    if suite is None:
+        raise SnapshotInvalid("题集不存在，可能已被删除", field="suite_id")
+    values = variable_values(utcnow(), suite.timezone)
     out: dict[str, list[str]] = {}
     rows = (await session.execute(select(EvalCase).where(EvalCase.suite_id == suite_id, EvalCase.archived.is_(False))
                                   .order_by(EvalCase.seq))).scalars().all()
@@ -359,7 +362,9 @@ class ShadowDraft(runtime.JobRun):
         self.copy: dict[str, dict[str, dict[str, Any]]] = {}
         self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "timeouts": 0, "failed_calls": 0}
         self.done = 0
+        #: 没起草出来的表（一项都没写出来、表结构里没有）和只写出一部分的表：{「源名.表名」: 原因}
         self.failed: dict[str, str] = {}
+        self.partial: dict[str, str] = {}
         self.notice: str | None = None
 
     def lane_of(self, job: Any) -> str | None:
@@ -451,8 +456,8 @@ class ShadowDraft(runtime.JobRun):
             self.done += 1
             if outcome is not None and outcome.status == "failed":
                 self.failed[f"{source.name}.{table}"] = outcome.error or catalog.MODEL_EMPTY_REASON
-            elif outcome is not None and outcome.status == "partial" and outcome.error:
-                self.failed[f"{source.name}.{table}"] = outcome.error
+            elif outcome is not None and outcome.status == "partial":
+                self.partial[f"{source.name}.{table}"] = outcome.error or "只写出了一部分"
             await self._write(self._save_progress)
         return hook
 
@@ -468,7 +473,8 @@ class ShadowDraft(runtime.JobRun):
                 "unpriced": bool(self.usage["calls"]) and not priced}
 
     def _progress(self, current: dict[str, Any]) -> dict[str, Any]:
-        return {**current, "tables_done": self.done, "tables_failed": len(self.failed), "failures": dict(self.failed),
+        return {**current, "tables_done": self.done, "tables_failed": len(self.failed),
+                "tables_partial": len(self.partial), "failures": {**self.partial, **self.failed},
                 "notice": self.notice}
 
     async def _save_progress(self, session: AsyncSession) -> None:
@@ -495,8 +501,9 @@ class ShadowDraft(runtime.JobRun):
                      "draft": {**dict(snap.draft or {}), "model_id": self.model_id or None}, "tables": planned}
         content = _content({sid: self.copy.get(sid, {}) for sid in ids}, taken=taken)
         total = sum(len(v or []) for v in planned.values())
-        ok = total - len(self.failed)
-        status = "succeeded" if not self.failed else "partial" if ok > 0 else "failed"
+        # 一张都没起草出来才算失败（不出快照）；有没写出来、只写出一部分的表是 partial，快照照出、原因写在进度里
+        wrote = total - len(self.failed)
+        status = "failed" if wrote <= 0 else "partial" if self.failed or self.partial else "succeeded"
         artifact = await put_json(content, kind=SNAPSHOT_KIND, meta={"origin": "shadow", "sources": ids}) \
             if status != "failed" else None
 

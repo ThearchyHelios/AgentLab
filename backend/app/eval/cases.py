@@ -470,6 +470,10 @@ async def resolve_case(session: AsyncSession, fields: Mapping[str, Any], *, tz: 
             pinned = await derive.load_pinned(session, gold["workflow_id"], gold["version"], gold["node_id"])
         except derive.NotDerivable as e:
             raise CaseInvalid(f"这张口径卡不能当口径题：{e.message}", "gold", CALIBER_NOT_REUSABLE) from e
+        if pinned.retired or not pinned.published:
+            raise CaseInvalid(f"「{pinned.workflow_name}」v{pinned.version} "
+                              f"{'已退役' if pinned.retired else '没有发布过'}：口径题只能固定已发布且未退役的版本",
+                              "gold.version", CALIBER_NOT_REUSABLE)
         refs.pinned = pinned
         ids_ = {m["id"] for m in pinned.metrics}
         for i, exp in enumerate(fields.get("expectations") or []):

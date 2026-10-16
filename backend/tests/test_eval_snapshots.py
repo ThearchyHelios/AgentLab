@@ -19,7 +19,7 @@ from app.data import catalog, catalog_draft, catalog_profile, catalog_view
 from app.data.catalog import make_item
 from app.data.catalog_view import CatalogView
 from app.db.base import SessionLocal
-from app.db.models import CatalogNote
+from app.db.models import CatalogNote, DataSource
 from app.db.models_eval import EvalCatalogSnapshot, EvalSuite
 from app.eval import snapshots
 from tests.fixtures import dual_check_shop as shop
@@ -231,3 +231,37 @@ async def test_a_mock_provider_is_not_a_drafting_model():
             row = (await session.execute(select(Provider).where(Provider.name == "演示接入_快照"))).scalar_one()
             await session.delete(row)
             await session.commit()
+
+
+async def test_a_partly_failed_shadow_draft_still_snapshots_and_says_which_table(tmp_path, monkeypatch):
+    import sqlite3
+
+    from app.data import introspect
+
+    path = tmp_path / "two.db"
+    with sqlite3.connect(path) as db:
+        db.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, amount REAL);"
+                         "CREATE TABLE stores (id INTEGER PRIMARY KEY, name TEXT);")
+    async with SessionLocal() as session:
+        row = DataSource(name=f"two_{id(path) % 100000}", kind="sqlite", database=str(path))
+        session.add(row)
+        await session.flush()
+        row.schema_cache = await introspect.introspect(row)
+        await session.commit()
+        sid = row.id
+    try:
+        # stores 那一段一直出错：起草引擎拆小重试之后仍没写出来
+        monkeypatch.setattr(snapshots.ShadowDraft, "model_override",
+                            FakeModel({"orders": {"label": "订单"}, "stores": {"label": "门店"}}, fail={"stores"}))
+        monkeypatch.setattr(catalog, "MODEL_RETRIES", 0)
+        monkeypatch.setattr(catalog, "MODEL_BATCH_TABLES", 1)       # 每张表一段：一段出错只影响那一张
+        async with SessionLocal() as session:
+            plan = await snapshots.plan_shadow(session, {"sources": [{"id": sid, "tables": ["orders", "stores"]}]})
+            snap = await snapshots.start_shadow(session, plan, actor=None)
+        done = await wait_done(snap.id)
+        assert done.status == "partial" and done.artifact_id, (done.status, done.error)
+        assert list(done.progress["failures"]) == [f"{row.name}.stores"] and done.progress["tables_failed"] == 1
+        notes = await read_view(done.artifact_id, sid)
+        assert notes["orders"]["label"]["value"] == "订单" and "stores" not in notes
+    finally:
+        await drop_source(sid)

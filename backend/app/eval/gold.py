@@ -179,8 +179,8 @@ def _origin(case: Mapping[str, Any], ctx: Context, **more: Any) -> dict[str, Any
 # ==========================================================================
 
 
-#: 探针运行带的选项：查询一律只读、结果在工具边界就按遮罩遮好（同使用者的问数据运行）
 def _probe_options() -> dict[str, Any]:
+    """探针运行带的选项：查询一律只读、结果在工具边界就按遮罩遮好（同使用者的问数据运行）。"""
     from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
 
     return {MASK_RESULTS_OPTION: True, READ_ONLY_OPTION: True}
