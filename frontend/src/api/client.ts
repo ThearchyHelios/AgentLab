@@ -13,6 +13,7 @@ import type {
   RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, UploadDecision, UploadMixedColumn, UploadResult,
   UploadShapeReason, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
+import type { UnlistedRuns } from '../typesApp'
 import {
   ApiError, BASE, NETWORK_MESSAGE, actorHeader, codeOf, del, describeDetail, failure, get, isGatewayFailure, parseBody,
   patch, post, put, qs, report, request, upload, type RequestOptions, type UploadOptions,
@@ -563,6 +564,14 @@ export const api = {
       /** 按运行来源筛（X3）；none 是来源未记录的老运行 */
       origin_kind?: string
     }) => get<Run[]>(`/runs${qs(params)}`),
+    /**
+     * 同样的筛选下，列表因为「系统派生的运行默认不列」而没列出的次数（评测、口径对账、口径召回，next-round X1）。按来源
+     * 筛了的什么都不藏，total 为 0。老后端没有这个接口（404），调用方当作 0
+     */
+    unlisted: (params?: {
+      workflow_id?: string; status?: RunStatus | RunStatus[] | string; run_class?: 'formal' | 'exploratory'
+      q?: string; origin_kind?: string
+    }) => get<UnlistedRuns>(`/runs/unlisted${qs(params)}`),
     get: (id: string) => get<Run>(`/runs/${id}`),
     /** 这次运行实际跑的那张图（运行时的快照），不是工作流现在的样子 */
     graph: (id: string) => get<{ graph: GraphSpec; workflow_id: string | null; version: number | null }>(

@@ -705,6 +705,15 @@ export type OriginKind =
   | 'trial' | 'personal_app'
   | 'eval' | 'ledger_issue' | 'reconcile' | 'recall'
 
+/**
+ * GET /api/runs/unlisted：同样的筛选下，记录页因为「系统派生的运行默认不列」而没列出的次数。系统派生的是评测、口径对账、
+ * 口径召回（服务端 engine/origin.SYSTEM_ORIGINS）：不进使用统计，按来源点名才列
+ */
+export interface UnlistedRuns {
+  total: number
+  by_origin: Partial<Record<OriginKind, number>>
+}
+
 /** 查看的对象。caliber 是已发布口径卡上的指标（蓝图助手复用口径时看，服务端 look/calibers.py） */
 export interface LookObject {
   kind: 'table' | 'capability' | 'workflow_version' | 'caliber'

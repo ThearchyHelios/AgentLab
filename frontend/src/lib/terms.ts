@@ -5124,7 +5124,8 @@ export const ORIGIN_TEXT = {
   unknown: '来源未记录',
   unknownHint: '这次运行发起时还没有记录来源',
   hint: '这次运行从哪里发起。发起时写进运行记录，在封存范围内',
-  filterAll: '全部来源',
+  // 不点名来源时系统派生的运行（评测、口径对账、口径召回）不列，「全部」得照实说不含它们
+  filterAll: '全部来源（不含系统运行）',
   filterLabel: '按运行来源筛选',
   /** 时间线里 run.origin 那一行 */
   step: (label: string) => `来源：${label}`,
@@ -5133,6 +5134,18 @@ export const ORIGIN_TEXT = {
   view: (id: string) => `视图「${id}」`,
   hook: (name: string) => `钩子「${name}」`,
   actor: (who: string, verified: boolean) => `${verified ? '已登录用户' : '署名'}「${who}」`,
+}
+
+/**
+ * 记录页没列出的系统派生运行（评测、口径对账、口径召回：服务端 engine/origin.SYSTEM_ORIGINS，next-round X1）。它们是完整的
+ * 运行、不进使用统计，默认不列；照实写有几次没列出、在哪儿能看
+ */
+export const SYSTEM_RUNS_TEXT = {
+  /** parts 是「评测 2 次、口径对账 1 次」 */
+  unlisted: (total: number, parts: string) =>
+    `另有 ${total} 次系统运行未列出（${parts}），在来源筛选中选择对应来源即可查看`,
+  part: (label: string, n: number) => `${label} ${n} 次`,
+  hint: '评测、口径对账、口径召回是系统代为发起的运行：证据仍可查看，但不计入使用统计，记录页默认不列',
 }
 
 /** 来源标签：老运行没有来源时写「来源未记录」 */

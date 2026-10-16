@@ -34,6 +34,24 @@ ORIGIN_KINDS = (
 #: 客户端在 POST /api/runs 里能声明的来源
 CLIENT_ORIGINS = ("chat", "canvas", "launcher", "api")
 
+#: 系统派生的运行（docs/design/next-round/00-总方案.md X1）：评测、口径对账、口径召回都是服务端为了量、为了比替人跑的，
+#: 不是有人在用。它们是完整的运行（证据、封存都在、点得开），但不进使用统计——探索问题聚类、工具白名单衰减、数据目录的
+#: 使用次数和「被哪些运行用过」、审阅队列的使用权重、以后的账本统计——否则一跑评测，治理信号和目录的使用热度就失真了。
+#: 记录页默认也不列（筛选里能选，列表照实写有几次没列出）。ledger_issue 是替用户正式出具，照常计入
+SYSTEM_ORIGINS = ("eval", "reconcile", "recall")
+
+
+def counted_runs() -> Any:
+    """SQL 条件：计入使用统计的运行（排除 SYSTEM_ORIGINS）。所有使用统计都只算它圈进来的运行，别处不另写一份过滤。
+
+    来源按非空比较（coalesce，同 auth/access.hidden_runs）：加来源这一列之前的老运行 origin_kind 为空，NOT IN 碰上 NULL
+    会把它们一起筛掉；外连接没对上运行的行（问数据只回了一句、没有运行的那一轮）同理照常计入。"""
+    from sqlalchemy import func
+
+    from app.db.models import Run
+
+    return func.coalesce(Run.origin_kind, "").not_in(SYSTEM_ORIGINS)
+
 
 def origin_note(kind: str, **data: Any) -> dict[str, Any]:
     """run.origin 事件的数据：kind 加上调用方给的字段（app_id、app_version、spec_hash、entry / view、hook、

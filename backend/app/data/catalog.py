@@ -2408,15 +2408,18 @@ async def query_snapshot_tables(session: AsyncSession, source: Any) -> list[tupl
 
     使用次数（table_usage）和「这张表被哪些运行用过」（data/catalog_review.py）共用这一份取法：数据源查询工具每次成功
     查询都存一份查询快照工件（tools/datasource.py），工件引用表 artifacts 里按 (内容哈希, 运行) 各记一行；只收属于某次运行
-    （runs 里有这次运行）、属于这个源的行，工具库里的试用（不属于任何运行）不算。
+    （runs 里有这次运行）、属于这个源的行，工具库里的试用（不属于任何运行）不算；系统派生的运行（评测、口径对账、召回，
+    engine/origin.counted_runs）也不算——一跑评测，常用表的排序、起草的默认范围、审阅队列的权重就跟着被评测题刷高了。
 
     表名在查询当时就记进了引用的 meta（query_snapshot_meta），这里只读 artifacts 一张表；升级前的老引用没有 meta，退回读
     工件内容里的源名和 SQL，读过的按工件 id 缓存（内容永不改变）。SQL 里写的表名去掉 schema 前缀后按 name_key（只把
     ASCII 字母转小写，和 SQLite 比较标识符的口径一致）对到表结构上，对不上的不计。
     """
+    from app.engine.origin import counted_runs
+
     rows = (await session.execute(
         select(Artifact.id, Artifact.meta, Artifact.run_id).join(Run, Run.id == Artifact.run_id)
-        .where(Artifact.kind == QUERY_SNAPSHOT_KIND)
+        .where(Artifact.kind == QUERY_SNAPSHOT_KIND, counted_runs())
     )).all()
     tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
     lookup: dict[str, str] = {}
