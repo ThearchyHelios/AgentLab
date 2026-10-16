@@ -397,6 +397,19 @@ export function CatalogPage() {
   useOnReconnect(loadChangeCounts)
   const actionCount = changeCounts?.src === sourceId ? changeCounts.counts.by_severity.action : 0
   const onChangeCounts = useCallback((counts: SourceChangeCounts) => setChangeCounts({ src: sourceId, counts }), [sourceId])
+  // 队列里有任务走了（结束了）：探查读到了新的结构、剖析做了取值观察，都可能记下新的变化；探查改了表结构，清单也要重取
+  // （起草、剖析结束时页面跟着的任务自己会重取清单）
+  const queuedIds = useRef<{ src: string; ids: Map<string, string> }>({ src: '', ids: new Map() })
+  useEffect(() => {
+    const now = new Map(sourceJobs.items.map((i) => [i.id, i.kind]))
+    const prev = queuedIds.current.src === sourceId ? queuedIds.current.ids : new Map<string, string>()
+    queuedIds.current = { src: sourceId, ids: now }
+    const gone = [...prev].filter(([id]) => !now.has(id)).map(([, kind]) => kind)
+    if (!gone.length) return
+    loadChangeCounts()
+    setChangesSeq((n) => n + 1)
+    if (gone.includes('introspect')) void load()
+  }, [sourceJobs.items, sourceId, loadChangeCounts, load])
 
   const tableProfile: TableProfileProps = useMemo(() => ({
     job: profileJob, onStart: profileTable, onShowActive: profile.showActive, onSettings: () => setProfileSettingsOpen(true),

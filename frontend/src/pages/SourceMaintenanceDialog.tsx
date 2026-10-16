@@ -222,7 +222,7 @@ export function SourceMaintenanceDialog({ source, onClose, onSaved }: {
               {schedule && <LastRun schedule={schedule} onOpenProfileJob={(id) => {
                 onClose()
                 navigate(`/data/catalog/${encodeURIComponent(source.id)}?pjob=${encodeURIComponent(id)}`)
-              }} onClose={onClose} />}
+              }} />}
               {extra > 0 && <p className="text-2xs text-faint" data-maintenance-extra={extra}>{T.extra(extra)}</p>}
             </div>
           )}
@@ -231,8 +231,8 @@ export function SourceMaintenanceDialog({ source, onClose, onSaved }: {
 }
 
 /** 已经有维护定时：下一次什么时候、最近一次建了哪些任务、哪几步没执行和原因（触发记录的 inputs），到定时任务页看全部触发 */
-function LastRun({ schedule: s, onOpenProfileJob, onClose }: {
-  schedule: MaintenanceSchedule; onOpenProfileJob: (id: string) => void; onClose: () => void
+function LastRun({ schedule: s, onOpenProfileJob }: {
+  schedule: MaintenanceSchedule; onOpenProfileJob: (id: string) => void
 }) {
   const fire = s.last_fire
   const inputs = fire?.inputs ?? {}
@@ -260,10 +260,10 @@ function LastRun({ schedule: s, onOpenProfileJob, onClose }: {
                   <li key={j.id} className="flex flex-wrap items-center gap-2 text-2xs" data-maintenance-job={j.id} data-maintenance-job-kind={j.kind}>
                     <span className="mono">{T.lastJob(j.step.split('+').map((x) => T.step[x as MaintenanceStep] ?? x).join('、'),
                       T.lastJobKind[j.kind] ?? j.kind, j.id, j.tables ?? null)}</span>
-                    {j.kind === 'profile'
-                      ? <button type="button" className="btn btn-xs" onClick={() => onOpenProfileJob(j.id)} data-maintenance-job-open="">{T.viewJob}</button>
-                      // 探查任务的进度就在这张数据源卡片上：关上对话框就看得到
-                      : <button type="button" className="btn btn-xs" onClick={onClose} data-maintenance-job-open="">{T.viewJob}</button>}
+                    {/* 剖析任务点得进进度和结果（数据目录页的剖析对话框）；探查任务进行中时进度就在这张数据源卡片上，没有另外的页面 */}
+                    {j.kind === 'profile' && (
+                      <button type="button" className="btn btn-xs" onClick={() => onOpenProfileJob(j.id)} data-maintenance-job-open="">{T.viewJob}</button>
+                    )}
                   </li>
                 ))}
               </ul>

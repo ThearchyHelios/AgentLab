@@ -642,6 +642,7 @@ await section('定时维护：缺省关、建一条维护定时、改频率和�
   check('……哪几步没执行、原因照服务端', (await textOf(dlg.locator('[data-maintenance-skipped="profile_needed"]'))).startsWith('剖析需要的表没有执行：')
         && (await textOf(dlg.locator('[data-maintenance-skipped="observe"]'))).includes('未开启数据剖析'))
   check('……链到定时任务页的触发记录', (await dlg.locator('[data-maintenance-history]').getAttribute('href')) === '/schedules/check-sched-1')
+  check('……探查任务没有另外的进度页，不给点了没用的「查看进度」', await dlg.locator('[data-maintenance-job="check-ijob-7"] [data-maintenance-job-open]').count() === 0)
   // 改频率：PATCH 只带改了的和版本
   await page.locator('#maint-time').fill('02:30')
   await until(async () => (await textOf(page.locator('[data-maintenance-preview]'))).includes('每天 02:30'))
@@ -669,6 +670,17 @@ await section('定时维护：缺省关、建一条维护定时、改频率和�
   await page.getByRole('button', { name: '放弃修改', exact: true }).click()
   await until(async () => (await page.locator('[data-maintenance-dialog]').count()) === 0)
   check('卡片上的标签照实写已暂停', await until(async () => (await textOf(card.locator('[data-maintenance-chip]'))) === '定时维护 · 已暂停'))
+  // 最近一次建了剖析任务：「查看进度」到数据目录页打开那个剖析任务（地址里的 pjob 用过就去掉）
+  state.profileJobs['check-pjob-1'] = profileJob('running', 1)
+  state.maintenance.schedules[0].last_fire = { ...state.maintenance.schedules[0].last_fire, inputs: { steps: ['introspect', 'profile_needed'],
+    jobs: [{ step: 'introspect', kind: 'introspect', id: 'check-ijob-8', tables: 12 }, { step: 'profile_needed', kind: 'profile', id: 'check-pjob-1', tables: 8 }],
+    skipped: [] } }
+  await card.locator('[data-maintenance-open]').click()
+  await dlg.waitFor()
+  await dlg.locator('[data-maintenance-job="check-pjob-1"] [data-maintenance-job-open]').click()
+  check('剖析任务的「查看进度」：到数据目录页打开那个剖析任务', await until(async () => new URL(page.url()).pathname === `/data/catalog/${S1}`
+        && (await page.locator('[data-profile-dialog]').count()) === 1) && await until(async () => !new URL(page.url()).searchParams.has('pjob')),
+  page.url())
   check('没有拦下的写请求、没有原生对话框、没有运行时报错', blocked(sent).length === 0 && natives.length === 0 && errors.length === 0,
     [...blocked(sent).map((s) => s.key), ...natives, ...errors].join(' | '))
 })
