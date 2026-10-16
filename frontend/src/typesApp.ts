@@ -695,6 +695,16 @@ export interface NotifyChannelRow {
   enabled: boolean
 }
 
+/**
+ * 登记的通知事件（GET /api/notify/events，服务端 notify/service.EVENTS，总方案 X6）。scopes 是推给哪几条路：global
+ * 全局渠道自己订阅，user 相关的人自己的个人渠道，app 应用版本里的订阅；空的是登记了、还没有推送的，界面上不列
+ */
+export interface NotifyEventRow {
+  event: string
+  label: string
+  scopes: ('global' | 'user' | 'app')[]
+}
+
 // ---------------------------------------------------------------------------
 // 运行来源（§2.10 X3）与助手查看（§2.9 L2）
 // ---------------------------------------------------------------------------
