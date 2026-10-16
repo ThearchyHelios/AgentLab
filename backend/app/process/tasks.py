@@ -406,6 +406,22 @@ def _check_hash(card: dict[str, Any], given: Any, *, approving: bool) -> None:
                           status_code=422, code="payload_hash_mismatch")
 
 
+async def _check_principals(session: AsyncSession, task: Task, principal: Any, values: dict[str, Any]) -> None:
+    """待办表单里的选人控件：开了登录时按候选池核对（同入口表单，auth/directory.principal_errors）。不属于应用的待办
+    （试运行、画布）没有池，不核对。"""
+    from app.auth.directory import principal_errors
+
+    if not task.app_id or getattr(principal, "mode", "off") == "off":
+        return
+    app = await session.get(App, task.app_id)
+    if app is None:
+        return
+    bindings = await session.scalar(select(AppVersion.bindings).where(
+        AppVersion.app_id == task.app_id, AppVersion.version == task.app_version)) if task.app_version else None
+    if errors := await principal_errors(session, app, bindings, task.form, values, principal.mode):
+        raise FormInvalid(errors)
+
+
 def _validated(form: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
     from app.apps.forms import validate_form
 
@@ -491,6 +507,8 @@ async def respond(task_id: str, principal: Any, *, decision: Any, values: dict[s
         rows = (await _assignments(session, [task.id])).get(task.id, [])
         mine = _pick(task, rows, principal)
         response, verdict = _engine_response(task, approval, decision, values, note, payload_hash)
+        if task.form and verdict in ("approve", "submit") and values:
+            await _check_principals(session, task, principal, values)
         response = await _bind_files(session, task, principal, response)
         now = utcnow()
         marked = await session.execute(

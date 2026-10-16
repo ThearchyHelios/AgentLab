@@ -113,6 +113,13 @@ async def start_entry(app_id: str, entry_id: str, values: dict[str, Any], princi
         form = resolve_form(spec, entry.get("form")) or {"type": "object", "properties": {}}
         if errors := validate_form(form, values if isinstance(values, dict) else None):
             raise FormRejected(errors)
+        # 选人控件：开了登录时按候选池核对（auth/directory.py，05-已知遗留 (b)）。以前原样传下去，填错的名字会把待办
+        # 派给一个不存在的人——没人能处理，也不报错
+        from app.auth.directory import principal_errors
+
+        if errors := await principal_errors(session, app, version.bindings, form, values,
+                                            getattr(principal, "mode", "off")):
+            raise FormRejected(errors)
         # 表单里的文件（docs/design/normal-user-apps.md N9）：核对是提交人在这个入口传的、还没用过，先占住；表单值换成
         # 登记的那一份引用（连同 sha256 进运行输入、随封存固定）。发起成功绑到这次运行，发起不成放回去
         values, claimed = await _claim_files(form, values, principal, app.id, entry_id)

@@ -28,6 +28,8 @@ _FIELD_KEYS = frozenset({
     "minLength", "maxLength", "maxItems", "format", "items", "x-widget",
     # 文件控件的限制：accept（类型或扩展名的列表）、max_mb（docs/design/normal-user-apps.md §3.8）
     "x-file",
+    # 选人控件的候选池：{pool: app | group:<组> | slot:<岗位>}（auth/directory.py，05-已知遗留 (b)）
+    "x-principal",
 })
 #: 文件控件只认这几项写法
 _FILE_FIELD_KEYS = frozenset({"type", "title", "description", "readOnly", "x-widget", "x-file"})
@@ -88,6 +90,13 @@ def _field_problems(field: Any) -> list[str]:
         return out + _file_field_problems(field)
     if "x-file" in field:
         out.append("不是文件控件，不能写文件的限制")
+    if "x-principal" in field:
+        from app.auth.directory import pool_problem
+
+        if field.get("x-widget") != "principal":
+            out.append("不是选人控件，不能写候选范围")
+        elif problem := pool_problem(field["x-principal"]):
+            out.append(problem)
     if kind not in FORM_TYPES:
         out.append(f"的类型只能是 {' / '.join(FORM_TYPES)}")
     if "format" in field and field["format"] not in FORM_FORMATS:
@@ -153,7 +162,7 @@ def _clean_schema(form: dict[str, Any]) -> dict[str, Any]:
             continue
         props[name] = {k: v for k, v in field.items()
                        if k in _FIELD_KEYS and k not in ("format", "x-widget", "x-enum-labels", "title",
-                                                         "description", "readOnly", "default")}
+                                                         "description", "readOnly", "default", "x-principal")}
     return {"type": "object", "properties": props, "required": [r for r in form.get("required") or [] if r in props]}
 
 
