@@ -21,6 +21,10 @@ MySQL 字符串里的反斜杠转义、数字写法）一律不判等价、只�
 索引、MySQL 的隐式转换）在现造的小库上执行、一律不判等价；在 SQLite 上执行的那几对再拿 PostgreSQL / MySQL 的读法
 各判一遍，意思一样的只许给兜底。
 
+口径模板的绑定（bind_template / match_template，next-round 02 做法 1）也在这里守门（文件末尾「口径模板」一节）：语料里每一对
+把 B 的头两个字面量换成 {{ input.<字段> }} 当成口径模板，拿 A 去比；判了等价的，按绑定渲染的 SQL 在每组数据上和 A 的结果
+必须一样，而且 explain_sql_diff(A, 渲染结果) 也必须判等价（等价只能由它判）。
+
 第 5 轮的反例同样分两种：PostgreSQL 写成符号的 ~ / ~* / ~~ / ~~* / @@ 和 || 混用、前缀的 @、|/、COLLATE 后面跟 ::，
 不知道是哪种库时套着的块注释、紧跟着字的 --、双引号括起来的名字，一律不判等价、只给兜底；具体说法说错了的（条件写在聚合里被说成「另一边
 没有这个条件」、时间窗口被说成有效行过滤或者「没有按时间筛选」、反连接被说成有效行过滤、按主键定下来的列说 MAX 对
@@ -363,3 +367,64 @@ def test_round_five_traps_that_need_their_own_schema_get_only_the_fallback(name,
             diff = explain_sql_diff(x, y, dialect or None, schema=given)
             _check_shape(diff, x, y)
             assert not diff.equivalent and _only_fallback(diff), (name, dialect, bool(given), diff.items)
+
+
+# --------------------------------------------------------------------------
+# 口径模板：绑定渲染后的 SQL 进同一套执行守门（next-round 02 做法 1）
+# --------------------------------------------------------------------------
+
+
+def _as_template(sql: str, slots: int = 2) -> tuple[str, int]:
+    """把一条 SQL 的头几个字面量换成槽位，当成口径模板：字符串写成 '{{ input.pN }}'，数写成裸的 {{ input.pN }}。"""
+    from sqlglot.dialects.dialect import Dialect
+
+    out: list[str] = []
+    pos = n = 0
+    for token in Dialect.get_or_raise("sqlite").tokenize(sql):
+        kind = token.token_type.name
+        text = sql[token.start:token.end + 1]
+        if n >= slots or kind not in ("STRING", "NUMBER") or (kind == "STRING" and not text.startswith("'")):
+            continue
+        out += [sql[pos:token.start], f"'{{{{ input.p{n} }}}}'" if kind == "STRING" else f"{{{{ input.p{n} }}}}"]
+        pos, n = token.end + 1, n + 1
+    out.append(sql[pos:])
+    return "".join(out), n
+
+
+_TEMPLATED = [p for p in sql_pairs.PAIRS if _as_template(p.b)[1]]
+
+
+@pytest.mark.parametrize("pair", _TEMPLATED, ids=[p.id for p in _TEMPLATED])
+def test_bound_templates_are_guarded_by_execution(databases, pair):
+    """B 的头两个字面量换成槽位当口径模板，A 当这次执行的 SQL：判了等价的（proven），按绑定渲染的口径 SQL 在每组数据上和
+    A 的结果一样；match_template 判等价、explain_sql_diff(A, 渲染结果) 却判不等价的情况一个都不许有。A、B 本来就不等价的对
+    （expect == diff），绑定之后照样不许判等价。"""
+    from app.data.sql_semantics import match_template
+
+    template, _ = _as_template(pair.b)
+    expected = _results(databases, pair.a)
+    for schema in (None, SCHEMA):
+        m = match_template(template, None, pair.a, "sqlite", schema=schema)
+        if not m.equivalent:
+            continue
+        assert explain_sql_diff(pair.a, m.rendered, "sqlite", schema=schema).equivalent, \
+            f"{pair.id}：match_template 判了等价，explain_sql_diff 却不判（schema={bool(schema)}）"
+        assert _results(databases, m.rendered) == expected, \
+            f"{pair.id}：按绑定 {m.binding} 渲染的口径 SQL 在虚构库上结果不同，却判了等价（schema={bool(schema)}）"
+        if pair.expect == "diff":
+            assert explain_sql_diff(pair.a, pair.b, "sqlite", schema=schema).equivalent is False
+            # 绑定换掉的只是 B 的字面量：B 原样不等价、换了参数之后等价，说明不同就在那几个字面量上（渲染结果已经执行验过）
+
+
+def test_bound_templates_recognize_most_of_their_own_rewrites():
+    """口径模板拿它自己（B）去比一定等价；拿已知等价的改写（A，expect == same、不靠约束）去比，大多数认得出。只打印比例，
+    不强求：认不出的给的是不等价和差在哪，不是错的结论。"""
+    from app.data.sql_semantics import match_template
+
+    for pair in _TEMPLATED:
+        template, _ = _as_template(pair.b)
+        m = match_template(template, None, pair.b, "sqlite", schema=SCHEMA)
+        assert m.equivalent or not m.binding, (pair.id, m.reason, m.diff and m.diff.items)
+    same = [p for p in _TEMPLATED if p.expect == "same" and not p.needs_schema and not p.id.startswith("hard:")]
+    hits = [p.id for p in same if match_template(_as_template(p.b)[0], None, p.a, "sqlite", schema=SCHEMA).equivalent]
+    print(f"\n口径模板（B 换成槽位）拿已知等价的改写去比：{len(same)} 对里认出 {len(hits)} 对")
