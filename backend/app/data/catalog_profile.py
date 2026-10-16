@@ -28,6 +28,10 @@ hooks 回调（后台任务据此把进度落库），整张表结束把结论�
 - 数据源设置里遮罩的列不取样，也不出现在任何一条剖析查询里；
 - 只取低基数列的取值分布（最多 21 个取值），不取明细行。
 
+**取值观察**（next-round 03 B2，data/catalog_profile_observe）是这里的另外四类检查（行数、码值观察、最新业务日期、按日
+行数），同样计入每张表的预算、止损和留痕，遮罩列同样不出现在任何一条查询里；只在剖析任务的范围是 observe / maintenance
+时带上（profile_table 的 observe）。
+
 表助手的只读查询、起草时核对有效记录条件走单条查询的入口（run_single_query）：同一个只读守卫、同一个单条时限，一次一条，
 不设预算、不留痕。
 """
@@ -480,7 +484,14 @@ class SqlDialect:
                          f"SUM(CASE WHEN {c} < {lo} OR {c} >= {hi} THEN 1 ELSE 0 END)")
         return f"SELECT {', '.join(parts)} FROM {table}"
 
-    # ---- 取值观察（下一轮第 3 波用）：窗口、按日行数、块采样。这里先把各方言的写法定下来，金样和容器集成测试都覆盖
+    # ---- 取值观察（data/catalog_profile_observe）：最新业务日期、窗口、按日行数、块采样。金样和容器集成测试都覆盖
+
+    def max_date_sql(self, table: str, column: str, *, text: bool = False) -> str:
+        """业务日期列的最新日期：有效区间（VALID_DATE_FROM ≤ x < VALID_DATE_BEFORE）里的最大值，占位日期、无穷大不算。大表
+        只在这一列打头有索引时发（取最大值走索引）。"""
+        lo = self.date_literal(VALID_DATE_FROM, text=text)
+        hi = self.date_literal(VALID_DATE_BEFORE, text=text)
+        return f"SELECT MAX({column}) FROM {table} WHERE {column} >= {lo} AND {column} < {hi}"
 
     def _window(self, column: str, since: Any, text: bool) -> str:
         """时间窗口的条件：since 起（含），并且早于占位日期 9999-12-31——PostgreSQL 的 infinity、Oracle 的 9999-12-31
@@ -829,7 +840,8 @@ class ProfileDisabled(Exception):
 class ProfileSkip:
     """没做的一项和原因。
 
-    kind：relation 关系、codes 码值、date 日期列、row_estimate 行数估算、table 整张表。
+    kind：relation 关系、codes 码值、date 日期列、row_estimate 行数估算、table 整张表；取值观察的 rows 行数、codes_observe
+    码值观察、freshness 最新业务日期、daily_volume 按日行数（data/catalog_profile_observe）。
     reason：budget 这张表的查询次数用完、deadline 这张表的时长用完、failed 连续失败止损、slow 超时比例止损、
     cancelled 停止或服务重启、timeout 超时、error 查询失败、rejected 未通过守卫（以上算「运行原因没查成」，见
     UNFINISHED_REASONS）；masked 字段被遮罩、too_large 表太大、view 视图、unsupported 暂不支持、no_data 没有数据、
@@ -875,6 +887,8 @@ class TableResult:
     version: int = 0
     #: 整张表的原因：表结构里没有、视图、空表、没有可剖析的项、写入一直冲突、停止 / 中断 / 止损
     error: str | None = None
+    #: 取值观察（data/catalog_profile_observe）观察到的：[{kind, column, basis, basis_key, data}]，由剖析任务和结果一起落库
+    observations: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def skipped_count(self) -> int:
@@ -1018,6 +1032,8 @@ class _TableCx:
         self.budget = TableBudget(job.settings)
         #: 正在做的检查项（result.checks 里的那一个）；None 是这张表开头的估行数
         self.check: dict[str, Any] | None = None
+        #: 这张表此刻的目录（开始剖析这张表时读的）：取值观察按它找已确认的业务日期
+        self.table_notes: dict[str, Any] = {}
 
     def is_masked(self, column: str) -> bool:
         return column.lower() in self.job.masked
@@ -1767,8 +1783,16 @@ def pending_relation_paths(notes: dict[str, Any] | None) -> set[str]:
 ESTIMATING = "正在估算 {table} 的行数"
 
 
+#: 取值观察各项进行中的说法
+OBSERVE_CURRENT = {"rows": "正在记 {table} 的行数", "codes_observe": "正在观察 {table}.{column} 的取值分布",
+                   "freshness": "正在取 {table}.{column} 的最新业务日期",
+                   "daily_volume": "正在数 {table} 最近 35 天每天的行数"}
+
+
 def _current_text(table: str, check: PlannedCheck) -> str:
     """进行中时正在做哪一项的整句（逐表一行的最后一栏）。"""
+    if check.kind in OBSERVE_CURRENT:
+        return OBSERVE_CURRENT[check.kind].format(table=table, column=check.column or "")
     if check.kind == "relation":
         return f"正在核对 {table}.{check.target}"
     if check.kind == "codes":
@@ -1805,7 +1829,11 @@ def _stop_detail(cx: _TableCx, reason: str) -> str:
 
 
 async def _execute(cx: _TableCx, table: str, check: PlannedCheck, out: _TableOutcome) -> None:
-    if check.kind == "relation":
+    from app.data import catalog_profile_observe as observe
+
+    if check.kind in observe.OBSERVE_KINDS:
+        await observe.execute(cx, table, check, cx.result)
+    elif check.kind == "relation":
         await _check_relation(cx, table, check.relation or {}, out, cx.result)
     elif check.kind == "codes":
         await _check_codes(cx, table, str(check.column), out, cx.result)
@@ -1834,6 +1862,14 @@ async def _run_checks(cx: _TableCx, table: str, plan: list[PlannedCheck], runnab
     finally:
         result.current = None
     if size.rows == 0:
+        # 空表：行数观察照记 0 行（一张表变空是最大的「行数下跌」），别的项都不查
+        for check, planned in zip(result.checks, plan):
+            if planned.kind == "rows" and check["state"] == "pending":
+                result.observations.append({"kind": "rows", "column": "", "basis": {"method": size.method,
+                                                                                    "query_refs": []},
+                                            "basis_key": str(size.method), "data": {"rows": 0, "at_least": None,
+                                                                                   "method": size.method}})
+                check["state"] = "done"
         _close_open(result, plan, out, "no_data", f"{table} 是空表，无法剖析")
         result.status, result.error = "skipped", EMPTY_ERROR
         return
@@ -1875,8 +1911,12 @@ async def _read_notes(session: AsyncSession, source_id: str, table: str) -> dict
 
 async def profile_table(cx: ProfileContext, table: str, *,
                         db: Callable[..., Awaitable[Any]] | None = None, hooks: TableHooks | None = None,
-                        actor: str | None = None) -> TableResult:
+                        actor: str | None = None, regular: bool = True, observe: bool = False) -> TableResult:
     """剖析一张表并把结论写进目录，返回这张表的结果（TableResult）。
+
+    regular：做关系、码值、日期这几项剖析（缺省）；observe：接着做取值观察的四类检查（data/catalog_profile_observe，观察到的
+    记在 result.observations，由剖析任务和结果一起落库）。只观察（regular=False）时不往目录里并剖析结论——不然这次没做的剖析
+    项会被当成「这次完整检查过、却没再得出」删掉；目录里唯一可能变的是观察撤销「已列全」。
 
     - 表结构里没有、视图：skipped，不发查询。
     - 先列全检查项（plan_checks，读的是这时目录里的最新内容），按规则不查的直接记跳过；一项可查的都没有：skipped
@@ -1905,9 +1945,14 @@ async def profile_table(cx: ProfileContext, table: str, *,
         await db(_record, cx.source.id, table, None, result, actor, hooks.recorded)
         return result
     notes = await db(_read_notes, cx.source.id, table)
-    plan = plan_checks(table, meta, notes, tables=cx.tables, masked=cx.masked, outside=cx.outside)
+    plan = plan_checks(table, meta, notes, tables=cx.tables, masked=cx.masked, outside=cx.outside) if regular else []
+    if observe:
+        from app.data import catalog_profile_observe
+
+        plan += catalog_profile_observe.plan_observations(table, meta, notes, masked=cx.masked)
     out = _TableOutcome()
     tcx = _TableCx(cx, table, result, hooks)
+    tcx.table_notes = notes
     result.checks = [p.as_check() for p in plan]
     for planned in plan:
         if planned.skip is not None:
@@ -1939,7 +1984,7 @@ async def profile_table(cx: ProfileContext, table: str, *,
     result.current = None
     result.row_estimate = cx.sizes.get(table)
     result.elapsed_ms = int((time.monotonic() - started) * 1000)
-    await db(_record, cx.source.id, table, out, result, actor, hooks.recorded)
+    await db(_record, cx.source.id, table, out if regular else None, result, actor, hooks.recorded)
     if stopped is not None:
         raise stopped
     return result

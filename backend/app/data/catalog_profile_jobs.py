@@ -27,6 +27,12 @@ data/catalog_job_runtime.py），逐表剖析（引擎在 data/catalog_profile.p
   启动时还一次性迁移剖析设置的旧键（catalog_profile.migrate_settings）。
 - **保留**（prune）：每个源保留最近 KEEP_JOBS 个结束了的剖析任务，更早的删掉；某张表「上次剖析」所在的任务不删，表详情的
   「上次剖析」一直在。
+- **取值观察**（next-round 03 B2，data/catalog_profile_observe）：范围另有两种——observe（有数据目录、观察到期的表，只做
+  观察检查）和 maintenance（定时维护用：需要剖析的表做剖析，观察到期的表做观察，两样都要的两样都做）。每张表做哪几样按建
+  任务时列出的检查项定；观察到的随这张表的结果落库（同一个事务），和同口径的历史比出的取值变化写进 source_changes。人点的
+  「需要剖析 / 全部 / 指定的表」照旧不观察。
+- **触发**：任务的设置快照里另记 trigger（manual 人点的 / schedule 定时维护）、fire_at、schedule_id（剖析任务表没有这几列、
+  这一轮不加列，见 trigger_of），接口按 trigger、fire_at 给。
 - **读**：job_dict（任务和逐表一行）、task_detail（一张表的检查项、发现、跳过的项、发过的查询）、last_profiles / last_detail
   （表清单每行、表详情的「上次剖析」）、due_reason（这张表要不要剖析、为什么）。「上次剖析」是真正开始过的最近一次（见
   _ranked）：没开始就停了的、还排着的那一项不挡掉上一次真正剖析的行数、发过的查询。
@@ -200,6 +206,23 @@ def _counts(statuses: list[str]) -> dict[str, int]:
     return counts
 
 
+#: 剖析任务的范围：selected 指定的表、needed 需要剖析的表、all 全部表；observe 观察到期的表（只做取值观察）、maintenance
+#: 定时维护（需要剖析的表 + 观察到期的表）
+SCOPES = ("selected", "needed", "all", "observe", "maintenance")
+#: 带取值观察的范围
+OBSERVING_SCOPES = ("observe", "maintenance")
+#: 设置快照里记触发的几个键（不是剖析设置：ProfileSettings.from_dict 不认它们）
+_TRIGGER_KEYS = ("trigger", "fire_at", "schedule_id")
+
+
+def trigger_of(job: Any) -> dict[str, Any]:
+    """这个任务是怎么建的：{trigger: manual|schedule, fire_at, schedule_id}。剖析任务表没有这几列（只加不改的迁移这一轮
+    不加），记在设置快照里。"""
+    raw = getattr(job, "settings", None) or {}
+    return {"trigger": raw.get("trigger") or "manual", "fire_at": raw.get("fire_at"),
+            "schedule_id": raw.get("schedule_id")}
+
+
 def job_dict(job: CatalogProfileJob, tasks: list[Any], *, waiting_for: str | None = None) -> dict[str, Any]:
     """接口返回的任务（CatalogProfileJob）：逐表按剖析顺序；计数、合计都按逐表的算。"""
     rows = [task_row(t) for t in tasks]
@@ -219,6 +242,8 @@ def job_dict(job: CatalogProfileJob, tasks: list[Any], *, waiting_for: str | Non
         "finished_at": _iso(job.finished_at),
         "created_by": job.created_by,
         "retry_of": job.retry_of,
+        "trigger": trigger_of(job)["trigger"],
+        "fire_at": trigger_of(job)["fire_at"],
         "waiting_for": waiting_for,
         "total": len(rows),
         "done": sum(counts.get(s, 0) for s in TASK_DONE),
@@ -309,6 +334,26 @@ _NEWEST = (CatalogProfileJob.created_at.desc(), CatalogProfileJob.id.desc(), Cat
 _SHOWN = (case((CatalogProfileTask.started_at.is_(None), 1), else_=0), *_NEWEST)
 
 
+#: 只做了取值观察的那一项（observe 范围、maintenance 范围里只到期观察的表）在逐表一行的 summary 里带这个标记：它不是一次
+#: 剖析，不算「上次剖析」——不然表清单的「上次剖析」、给助手的剖析事实（行数、日期范围）会被一次只记了行数的观察顶掉
+OBSERVE_ONLY = "observe_only"
+_PROFILED = func.coalesce(func.json_extract(CatalogProfileTask.summary, f"$.{OBSERVE_ONLY}"), 0) == 0
+
+
+def _observe_only(checks: list[Any] | None) -> bool:
+    from app.data import catalog_profile_observe as observe
+
+    kinds = {c.get("kind") if isinstance(c, dict) else getattr(c, "kind", None) for c in checks or []}
+    return bool(kinds) and kinds <= set(observe.OBSERVE_KINDS)
+
+
+def _summary_of(result: TableResult) -> dict[str, Any]:
+    out: dict[str, Any] = dict(result.summary())
+    if _observe_only(result.checks):
+        out[OBSERVE_ONLY] = 1
+    return out
+
+
 def _ranked(source_id: str, *columns: Any) -> Any:
     """每张表剖析过的各项：子查询，带两个排名。
 
@@ -321,7 +366,7 @@ def _ranked(source_id: str, *columns: Any) -> Any:
     shown = func.row_number().over(partition_by=CatalogProfileTask.table_name, order_by=_SHOWN).label("shown")
     latest = func.row_number().over(partition_by=CatalogProfileTask.table_name, order_by=_NEWEST).label("latest")
     return (select(*columns, shown, latest).join(CatalogProfileJob, CatalogProfileJob.id == CatalogProfileTask.job_id)
-            .where(CatalogProfileJob.source_id == source_id)).subquery()
+            .where(CatalogProfileJob.source_id == source_id, _PROFILED)).subquery()
 
 
 async def last_profiles(session: AsyncSession, source_id: str) -> dict[str, dict[str, Any]]:
@@ -365,7 +410,8 @@ def public_last(last: dict[str, Any] | None) -> dict[str, Any] | None:
 async def last_facts(session: AsyncSession, source_id: str,
                      tables: list[str] | None = None) -> dict[str, dict[str, Any]]:
     """每张表「上次剖析」（见 _ranked 的 shown，和表清单、表详情同一项）里给助手看的剖析事实：{表名: {at, job_id,
-    row_estimate, date_ranges, snapshot_id}}，一条查询批量取。没有行数估算也没有日期范围的不给；tables 给了只取这几张。
+    row_estimate, date_ranges, snapshot_id, observed?}}，一条查询批量取。没有行数估算也没有日期范围的不给；tables 给了只取
+    这几张。observed 是取值观察最近一次的结论（catalog_profile_observe.observed_facts：最新业务日期、行数），有就给。
 
     look、运行时 db_schema、/schema、表助手四处都经 schema_view.profile_lines 渲染这一份（next-round 遗留 e）：剖析数字
     是会过期的观测，不写进数据目录；遮罩、快照在渲染那一刻再核。"""
@@ -386,6 +432,12 @@ async def last_facts(session: AsyncSession, source_id: str,
         at = row["finished_at"] or row["started_at"]
         out[row["table_name"]] = {"at": _iso(at), "job_id": row["job_id"], "row_estimate": estimate,
                                   "date_ranges": ranges, "snapshot_id": row["snapshot_id"]}
+    # 取值观察的结论（最新业务日期、行数，next-round 03 B2）和剖析事实同一节：只有观察、没剖析过的表也给
+    from app.data import catalog_profile_observe
+
+    for table, observed in (await catalog_profile_observe.observed_facts(session, source_id, tables)).items():
+        out.setdefault(table, {"at": None, "job_id": None, "row_estimate": None, "date_ranges": [],
+                               "snapshot_id": None})["observed"] = observed
     return out
 
 
@@ -394,7 +446,7 @@ async def last_detail(session: AsyncSession, source_id: str, table: str) -> dict
     found = (await session.execute(
         select(CatalogProfileTask, CatalogProfileJob)
         .join(CatalogProfileJob, CatalogProfileJob.id == CatalogProfileTask.job_id)
-        .where(CatalogProfileJob.source_id == source_id, CatalogProfileTask.table_name == table)
+        .where(CatalogProfileJob.source_id == source_id, CatalogProfileTask.table_name == table, _PROFILED)
         .order_by(*_SHOWN).limit(1)
     )).first()
     return None if found is None else task_detail(found[1], found[0])
@@ -476,6 +528,8 @@ NOTHING_NEEDED = ("没有需要剖析的表：能剖析的表都剖析过了，�
                   "日期列（上次是空表的不算）。要重新剖析，请选「全部表」或指定要剖析的表")
 NOTHING_AT_ALL = ("没有可以剖析的表：表结构里的表都是视图，或者没有可剖析的项（要核对的关联关系、像码值的列、日期列都没有，"
                   "或者都被遮罩了）。请先起草数据目录，或指定要剖析的表")
+NOTHING_TO_OBSERVE = ("没有要观察的表：取值观察只看有数据目录的表，这些表最近 {h} 小时内都观察过了（或者还没有数据目录）")
+NOTHING_TO_MAINTAIN = ("没有需要剖析或观察的表：能剖析的表都剖析过了，有数据目录的表最近 {h} 小时内也都观察过了")
 
 
 async def outside_of(session: AsyncSession, row: Any) -> frozenset[str]:
@@ -536,6 +590,8 @@ async def _pick(session: AsyncSession, row: Any, source: Any, *, tables: list[st
             else:
                 picked.append((key, None, None, checks))
         return picked
+    if scope in OBSERVING_SCOPES:
+        return await _pick_observing(session, source, scope, all_tables, entries, notes, plan, masked)
     usage = await catalog.table_usage(session, source)
     last = await last_profiles(session, source.id) if scope == "needed" else {}
     order = {name: i for i, name in enumerate(all_tables)}
@@ -557,6 +613,54 @@ async def _pick(session: AsyncSession, row: Any, source: Any, *, tables: list[st
     return [(name, None, None, checks) for name, checks in candidates]
 
 
+async def _pick_observing(session: AsyncSession, source: Any, scope: str, all_tables: dict[str, Any],
+                          entries: dict[str, Any], notes: Any, plan: Any,
+                          masked: set[str]) -> list[tuple[str, str | None, str | None, list[Any]]]:
+    """observe / maintenance 的表：观察到期的、有数据目录的表做观察检查（catalog_profile_observe.plan_observations）；
+    maintenance 另加需要剖析的表做剖析（同 needed）。两样都要的两样都做。剖析的在前（有待核实关系的再往前），再按使用次数、
+    表结构顺序。挑出 0 张抛 ProfileNothing。"""
+    from app.data import catalog_profile_observe as observe
+
+    observed = await observe.last_observed(session, source.id)
+    last = await last_profiles(session, source.id) if scope == "maintenance" else {}
+    usage = await catalog.table_usage(session, source)
+    order = {name: i for i, name in enumerate(all_tables)}
+    candidates: list[tuple[str, list[Any], bool]] = []
+    for name, meta in all_tables.items():
+        if not isinstance(meta, dict) or meta.get("is_view"):
+            continue
+        regular: list[Any] = []
+        if scope == "maintenance":
+            planned = plan(name)
+            if any(c.skip is None for c in planned) and due_reason(meta, notes(name), last.get(name), planned):
+                regular = planned
+        watched: list[Any] = []
+        if name in entries and observe.observe_reason(observed.get(name)) is not None:
+            watched = observe.plan_observations(name, meta, notes(name), masked=masked)
+        if regular or watched:
+            candidates.append((name, regular + watched, bool(regular)))
+    if not candidates:
+        text = NOTHING_TO_MAINTAIN if scope == "maintenance" else NOTHING_TO_OBSERVE
+        raise ProfileNothing(text.format(h=observe.OBSERVE_EVERY_H))
+    candidates.sort(key=lambda c: (not c[2], not catalog_profile.has_pending_relations(notes(c[0])),
+                                   -usage.get(c[0], 0), order[c[0]]))
+    return [(name, None, None, checks) for name, checks, _ in candidates]
+
+
+def task_modes(scope: str, checks: list[Any] | None) -> tuple[bool, bool]:
+    """一张表这次做哪几样：(剖析, 观察)。按建任务（或开始时重挑）列出的检查项：observe 范围只观察；maintenance 看检查项里
+    有没有剖析的、观察的；别的范围只剖析。"""
+    from app.data import catalog_profile_observe as observe
+
+    kinds = {c.get("kind") for c in checks or [] if isinstance(c, dict)}
+    watched = bool(kinds & set(observe.OBSERVE_KINDS))
+    if scope == "observe":
+        return False, True
+    if scope == "maintenance":
+        return bool(kinds - set(observe.OBSERVE_KINDS)), watched
+    return True, False
+
+
 def _tasks_for(job_id: str, picked: list[tuple[str, str | None, str | None, list[Any]]],
                now: Any) -> list[CatalogProfileTask]:
     """_pick 挑出的表 → 逐表的行：按规则不剖析的（表结构里没有、视图、没有可剖析的项）直接记跳过，其余排队。"""
@@ -567,8 +671,9 @@ def _tasks_for(job_id: str, picked: list[tuple[str, str | None, str | None, list
             rule = [ProfileSkip(c.kind, c.target, c.skip[0], c.skip[1], c.path) for c in checks if c.skip]
             tasks.append(_skipped_task(job_id, seq, name, reason, str(why), shown, rule, now))
             continue
+        summary = {**_empty_summary(), **({OBSERVE_ONLY: 1} if _observe_only(checks) else {})}
         tasks.append(CatalogProfileTask(job_id=job_id, seq=seq, table_name=name, status="pending", checks=shown,
-                                        summary=_empty_summary()))
+                                        summary=summary))
     return tasks
 
 
@@ -580,22 +685,31 @@ async def _behind_draft(session: AsyncSession, source_id: str) -> bool:
 
 
 async def create_job(session: AsyncSession, row: Any, source: Any, *, tables: list[str] | None, scope: str,
-                     settings: ProfileSettings, actor: str | None,
-                     retry_of: str | None = None) -> tuple[CatalogProfileJob, list[CatalogProfileTask]]:
+                     settings: ProfileSettings, actor: str | None, retry_of: str | None = None,
+                     trigger: str = "manual", fire_at: str | None = None, schedule_id: str | None = None,
+                     allow_empty: bool = False) -> tuple[CatalogProfileJob, list[CatalogProfileTask]]:
     """建一个排队的剖析任务（还没开始，调用方接着 manager.start）。row 是数据源记录（遮罩按它的设置），source 是读表结构
     用的源（上传源是绑定当前快照的视图）。同源已有排队或进行中的剖析任务抛 ProfileBusy；挑出 0 张表抛 ProfileNothing。
     同源有起草任务时照建，排在它后面——这时挑出 0 张表也照建。不管排没排队，这里挑出的表单都是暂定的：开始剖析时按那时的
-    目录再定一遍（_ProfileRun._rescope）。建完顺手清掉超出保留数的旧任务。"""
+    目录再定一遍（_ProfileRun._rescope）。建完顺手清掉超出保留数的旧任务。
+
+    trigger / fire_at / schedule_id 记进设置快照（见 trigger_of）。allow_empty：挑出 0 张也照建（定时维护排在同一次触发的
+    探查后面：探查完了表结构、目录可能就不一样了，开始时再挑）。"""
+    if scope not in SCOPES:
+        raise ValueError(f"不认识的剖析范围：{scope}")
     await ensure_free(session, row, tables)
     try:
         picked = await _pick(session, row, source, tables=tables, scope=scope)
     except ProfileNothing:
         # 排在起草后面：起草多半会提出新的关系，开始时（_ProfileRun._rescope）按那时的目录再挑；现在挑不出也照建
-        if not await _behind_draft(session, row.id):
+        if not allow_empty and not await _behind_draft(session, row.id):
             raise
         picked = []
+    snapshot = settings.to_dict()
+    if trigger != "manual":
+        snapshot.update(trigger=trigger, fire_at=fire_at, schedule_id=schedule_id)
     job = CatalogProfileJob(id=new_id(), source_id=row.id, status="queued", scope=scope,
-                            settings=settings.to_dict(), created_by=actor, retry_of=retry_of)
+                            settings=snapshot, created_by=actor, retry_of=retry_of)
     tasks = _tasks_for(job.id, picked, utcnow())
     session.add(job)
     try:
@@ -760,6 +874,8 @@ class _ProfileRun(runtime.JobRun):
         self._table_started = 0.0
         #: 开始时按此刻的目录一张表都挑不出来（_rescope）：为什么，记在任务的提醒里
         self._scope_note: str | None = None
+        #: 这个任务是怎么建的（trigger_of）：取值变化的 detected_by 按它记
+        self._trigger: dict[str, Any] = {"trigger": "manual", "fire_at": None, "schedule_id": None}
 
     # ---------------------------------------------------------------- 停止、出错时收尾
 
@@ -815,14 +931,17 @@ class _ProfileRun(runtime.JobRun):
         await self._write(self._rescope, row, source)
         async with SessionLocal() as session:
             job = await session.get(CatalogProfileJob, self.job_id)
-            pending = [(t.seq, t.table_name) for t in await task_rows(session, job.id) if t.status == "pending"]
+            scope = job.scope
+            pending = [(t.seq, t.table_name, *task_modes(scope, t.checks)) for t in await task_rows(session, job.id)
+                       if t.status == "pending"]
             self.actor = job.created_by
+            self._trigger = trigger_of(job)
         try:
             self.cx = catalog_profile.make_context(source, settings, options=options, outside=outside)
         except ValueError as e:              # 不支持的数据库类型
             raise runtime.JobFailed(str(e)) from e
         hooks = TableHooks(progress=self._progress, query=self._queried, stop_text=self.stop_text)
-        for seq, name in pending:
+        for seq, name, regular, watched in pending:
             # 每张表开始前重读数据源：停用了、关掉了剖析就停下；遮罩按最新的设置
             stop = await self._write(self._recheck)
             if stop is not None:
@@ -837,7 +956,8 @@ class _ProfileRun(runtime.JobRun):
             hooks.recorded = recorded
             self._seq = seq
             try:
-                await catalog_profile.profile_table(self.cx, name, db=self._write, hooks=hooks, actor=self.actor)
+                await catalog_profile.profile_table(self.cx, name, db=self._write, hooks=hooks, actor=self.actor,
+                                                    regular=regular, observe=watched)
             except SnapshotTampered as e:
                 raise runtime.JobFailed(str(e)) from e
             if self.cx.runner.stopped:
@@ -974,12 +1094,21 @@ class _ProfileRun(runtime.JobRun):
                     row_estimate=result.row_estimate.to_dict() if result.row_estimate else None,
                     findings=list(result.findings) or None, skipped=[s.to_dict() for s in result.skipped] or None,
                     date_ranges=list(result.date_ranges) or None, query_log=list(result.query_log) or None,
-                    summary=result.summary(), skipped_count=result.skipped_count, unfinished=result.unfinished,
+                    summary=_summary_of(result), skipped_count=result.skipped_count, unfinished=result.unfinished,
                     added=result.added, updated=result.updated, removed=result.removed, version=result.version,
                     error=result.error, finished_at=utcnow()))
         if values := self._counters():
             await session.execute(update(CatalogProfileJob).where(CatalogProfileJob.id == self.job_id).values(**values)
                                   .execution_options(synchronize_session=False))
+        if result.observations and self.cx is not None:
+            # 取值观察：观察记录、比出的取值变化、撤销「已列全」都和这张表的结果、目录在同一个事务里
+            from app.data import catalog_profile_observe
+            from app.data.source_changes import Detected
+
+            detected = Detected(job_kind="profile", job_id=self.job_id, task_seq=seq,
+                                trigger=self._trigger["trigger"], actor=self.actor, fire_at=self._trigger["fire_at"])
+            await catalog_profile_observe.save(session, self.cx.source, result.table, result, job_id=self.job_id,
+                                               seq=seq, detected=detected)
 
     async def _finish(self, session: AsyncSession) -> None:
         """剖析完：万一还有没收尾的表（进度回调写库失败之类）记失败；有 failed、partial、cancelled 的表是 partial，否则
@@ -1005,7 +1134,8 @@ class ProfileJobs(runtime.JobManager):
 manager = ProfileJobs()
 
 
-__all__ = ["INTERRUPTED_ERROR", "KEEP_JOBS", "MAX_TABLES", "NOTHING_AT_ALL", "NOTHING_NEEDED", "NothingToRetry",
+__all__ = ["INTERRUPTED_ERROR", "KEEP_JOBS", "MAX_TABLES", "NOTHING_AT_ALL", "NOTHING_NEEDED", "NOTHING_TO_MAINTAIN",
+           "NOTHING_TO_OBSERVE", "NothingToRetry", "OBSERVING_SCOPES", "SCOPES", "task_modes", "trigger_of",
            "ProfileBusy", "ProfileFinished", "ProfileJobs", "ProfileNothing", "THEN_PROFILE", "active_job",
            "busy_message", "cancel", "create_job", "due_reason", "ensure_free", "job_brief", "job_dict", "job_out",
            "last_detail", "last_facts", "last_profiles", "outside_of", "latest_job", "load", "load_task", "manager", "prune", "public_last",

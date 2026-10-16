@@ -65,6 +65,9 @@ PROFILE_ROWS_PROMPT = {"stats": "约 {n} 行（数据库统计估算）", "count
 PROFILE_RANGE_PROMPT = "{column} 从 {low} 到 {high}"
 PROFILE_HINT_PROMPT = "只供写查询参考（定时间范围、估表大小），不是查询结果，不能作为回答里的数"
 PROFILE_STALE_PROMPT = "数据剖析：剖析早于当前版本，不给"
+#: 取值观察的结论（next-round 03 B2）：最新业务日期；行数比剖析的新时用观察的
+PROFILE_LATEST_PROMPT = "最新业务日期 {column} 到 {value}（取值观察，{day}）"
+OBSERVE_HEAD_PROMPT = "取值观察（{day}）：{facts}"
 
 #: 三种「不在」（absent_detail）。{source} 数据源名，{table} 点名的表
 ABSENT_REMOVED_PROMPT = "数据源「{source}」里已经没有 {table}（表已删除或改名）。别拿名字相近的表顶替"
@@ -229,10 +232,15 @@ def profile_lines(facts: Mapping[str, Any] | None, masked: set[str], snapshot_id
     之前一律不给。没有剖析事实（或者滤完什么都不剩）返回空列表：表详情和以前一字不差。"""
     if not facts:
         return []
+    observed = facts.get("observed") if isinstance(facts.get("observed"), Mapping) and not upload else {}
     if upload and (not snapshot_id or facts.get("snapshot_id") != snapshot_id):
         return [indent + PROFILE_STALE_PROMPT]
     parts: list[str] = []
     estimate = facts.get("row_estimate") if isinstance(facts.get("row_estimate"), Mapping) else None
+    seen_rows = observed.get("rows") if isinstance(observed.get("rows"), Mapping) else None
+    if seen_rows and str(seen_rows.get("at") or "") > str(facts.get("at") or ""):
+        # 取值观察记的行数比上次剖析的新：用新的（同一种说法，口径照写）
+        estimate = seen_rows
     if estimate:
         method, rows, least = estimate.get("method"), estimate.get("rows"), estimate.get("at_least")
         if isinstance(rows, int) and method in ("stats", "count"):
@@ -246,10 +254,19 @@ def profile_lines(facts: Mapping[str, Any] | None, masked: set[str], snapshot_id
         if not column or column.lower() in masked or found.get("min") is None or found.get("max") is None:
             continue
         parts.append(PROFILE_RANGE_PROMPT.format(column=column, low=_when(found["min"]), high=_when(found["max"])))
+    for found in observed.get("freshness") or []:
+        column = str((found or {}).get("column") or "")
+        if column and column.lower() not in masked and found.get("max"):
+            parts.append(PROFILE_LATEST_PROMPT.format(column=column, value=_when(found["max"]), day=_day(found.get("at"))))
     if not parts:
         return []
-    return [indent + PROFILE_HEAD_PROMPT.format(day=_day(facts.get("at")), facts="；".join(parts)),
-            indent + "  " + PROFILE_HINT_PROMPT]
+    if facts.get("at"):
+        head = PROFILE_HEAD_PROMPT.format(day=_day(facts.get("at")), facts="；".join(parts))
+    else:
+        # 只有取值观察、没剖析过：照实说是观察
+        latest = max((str(f.get("at") or "") for f in [seen_rows or {}, *(observed.get("freshness") or [])]), default="")
+        head = OBSERVE_HEAD_PROMPT.format(day=_day(latest), facts="；".join(parts))
+    return [indent + head, indent + "  " + PROFILE_HINT_PROMPT]
 
 
 # ==========================================================================

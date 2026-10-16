@@ -25,3 +25,7 @@ SELECT status, COUNT(*) AS cnt FROM sales.orders WHERE paid_at >= DATE '2026-08-
 SELECT CAST(paid_at AS DATE) AS d, COUNT(*) AS n FROM sales.orders WHERE paid_at >= DATE '2026-08-27' AND paid_at < DATE '9999-12-31' GROUP BY CAST(paid_at AS DATE) ORDER BY d;
 -- sample
 SELECT status, COUNT(*) AS cnt FROM sales.orders TABLESAMPLE SYSTEM (1) WHERE status IS NOT NULL GROUP BY status ORDER BY cnt DESC, status LIMIT 21;
+-- max_date
+SELECT MAX(paid_at) FROM sales.orders WHERE paid_at >= DATE '0001-01-02' AND paid_at < DATE '9999-12-31';
+-- max_date_text
+SELECT MAX(biz_day) FROM sales.orders WHERE biz_day >= '0001-01-02' AND biz_day < '9999-12-31';
