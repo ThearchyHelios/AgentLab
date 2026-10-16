@@ -54,6 +54,8 @@ APP_DRAFT_INVALID = "app_draft_invalid"
 APP_GRANTS_INVALID = "app_grants_invalid"
 #: 页面参数不是 JSON 对象（422）
 APP_PARAMS_INVALID = "app_params_invalid"
+#: 入口表单、按需视图的参数没通过校验（422，另带 errors：[{path, code, message}]）。同待办回复、入站钩子的表单错误
+FORM_INVALID = "form_invalid"
 #: 发起实例、刷新视图、补算时引擎不发起运行，又没有更细的码（engine/launch.LaunchRefused 没带 code 的那几种）
 RUN_LAUNCH_REFUSED = "run_launch_refused"
 # 派生应用草稿时工作流、版本不存在（404）的码在 apps/derive.py（WORKFLOW_GONE、VERSION_GONE）；入口、视图、补算的码

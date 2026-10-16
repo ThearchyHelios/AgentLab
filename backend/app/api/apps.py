@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import (
     APP_BINDINGS_INVALID, APP_DRAFT_INVALID, APP_GRANTS_INVALID, APP_HOOK_NOT_DECLARED, APP_HOOK_NOT_FOUND,
-    APP_INSTANCE_NOT_FOUND, APP_NOT_FOUND, APP_PARAMS_INVALID, APP_VERSION_NOT_FOUND, RUN_LAUNCH_REFUSED,
+    APP_INSTANCE_NOT_FOUND, APP_NOT_FOUND, APP_PARAMS_INVALID, APP_VERSION_NOT_FOUND, FORM_INVALID, RUN_LAUNCH_REFUSED,
     CodedHTTPException,
 )
 from app.api.deps import Principal, actor_of, current_principal
@@ -841,7 +841,7 @@ async def start(app_id: str, entry_id: str, payload: StartIn, session: AsyncSess
     try:
         run = await start_entry(app.id, entry_id, payload.values, principal)
     except FormRejected as e:
-        return JSONResponse(status_code=422, content={"detail": "表单没有通过校验", "errors": e.errors})
+        return JSONResponse(status_code=422, content={"detail": "表单没有通过校验", "code": FORM_INVALID, "errors": e.errors})
     except (EntryRefused, LaunchRefused) as e:
         raise _view_refused(e) from e
     return {"run_id": run.id, "title": instance_title(run)}
@@ -912,7 +912,7 @@ async def refresh_view(app_id: str, view_id: str, payload: RefreshIn, session: A
         run, cached = await run_view(session, app=app, version=version, view_id=view_id, params=payload.params,
                                      principal=principal, actor=actor_of(x_actor))
     except FormRejected as e:
-        return JSONResponse(status_code=422, content={"detail": "参数没有通过校验", "errors": e.errors})
+        return JSONResponse(status_code=422, content={"detail": "参数没有通过校验", "code": FORM_INVALID, "errors": e.errors})
     except (ViewRefused, LaunchRefused) as e:
         raise _view_refused(e) from e
     return {"run_id": run.id, "cached": cached}

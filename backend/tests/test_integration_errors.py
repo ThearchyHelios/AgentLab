@@ -46,13 +46,23 @@ async def new_app() -> str:
         return row.id
 
 
-def test_no_bare_http_exception_left_in_the_integration_modules():
-    """这几个模块里不许再直接抛 HTTPException（没有 code）：一律 CodedHTTPException。"""
+def _called(node: ast.AST, name: str) -> bool:
+    return isinstance(node, ast.Call) and (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) == name
+
+
+def test_no_error_without_a_code_left_in_the_integration_modules():
+    """这几个模块里不许再直接抛 HTTPException（没有 code），一律 CodedHTTPException；直接回 JSONResponse 的错误（表单
+    没通过校验那几处）内容里也要有 code。"""
     for rel in ("api/apps.py", "api/tasks.py", "api/artifacts.py", "api/deps.py", "auth/__init__.py"):
         tree = ast.parse((APP_DIR / rel).read_text())
-        bare = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call)
-                and (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) == "HTTPException"]
+        bare = [node.lineno for node in ast.walk(tree) if _called(node, "HTTPException")]
         assert not bare, f"{rel} 第 {bare} 行抛的 HTTPException 没有 code"
+        for node in ast.walk(tree):
+            if not _called(node, "JSONResponse"):
+                continue
+            content = next((k.value for k in node.keywords if k.arg == "content"), node.args[0] if node.args else None)
+            keys = {k.value for k in getattr(content, "keys", []) if isinstance(k, ast.Constant)}
+            assert "code" in keys, f"{rel} 第 {node.lineno} 行回的 JSONResponse 没有 code"
 
 
 def test_codes_agree_with_the_ones_already_in_use():
