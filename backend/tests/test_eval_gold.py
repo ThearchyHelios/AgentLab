@@ -133,17 +133,16 @@ async def test_the_read_only_guard_refuses_writes_before_anything_runs(source):
         assert db.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == len(shop.ROWS)
 
 
-@pytest.mark.parametrize("sql, refused", [
-    ("SELECT status, COUNT(*) AS n FROM orders GROUP BY status", True),
-    ("SELECT status AS 状态 FROM orders", True),                       # 改了名字也认得出
-    ("SELECT * FROM orders", True),
-    ("SELECT COUNT(*) AS n FROM orders WHERE status = 'paid'", False),   # 结果里没有取自遮罩列的格
+@pytest.mark.parametrize("sql, expectation, refused", [
+    ("SELECT status, COUNT(*) AS n FROM orders GROUP BY status", {"kind": "set", "column": "status"}, True),
+    ("SELECT status AS 状态 FROM orders", {"kind": "set", "column": "状态"}, True),      # 改了名字也认得出
+    ("SELECT * FROM orders", {"kind": "table", "keys": ["id"]}, True),
+    # 结果里没有取自遮罩列的格：条件里用到遮罩列不算
+    ("SELECT COUNT(*) AS n FROM orders WHERE status = 'paid'", {"kind": "scalar", "column": "n"}, False),
 ])
-async def test_gold_that_uses_a_masked_column_is_refused(tmp_path, sql, refused):
+async def test_gold_that_uses_a_masked_column_is_refused(tmp_path, sql, expectation, refused):
     name, sid = await shop.add_source(shop.build(tmp_path / "masked.db"), options={"mask_columns": ["status"]})
     try:
-        expectation = {"kind": "scalar", "column": "n"} if not refused else {"kind": "table", "keys": ["id"]} \
-            if sql.startswith("SELECT *") else {"kind": "set", "column": "状态" if "状态" in sql else "status"}
         outcome = await gold.compute_gold(sql_case(sid, sql, expectation), ctx())
         if refused:
             assert outcome.status == "refused" and outcome.code == gold.GOLD_MASKED, outcome.reason
