@@ -20,9 +20,11 @@
 - 权限（拍板 L5）：搭建者及以上（关登录时同）都可以；使用者只能按他有权使用的应用固定着的这一版出具（复用应用授权，
   apps/access），别的写「请搭建者出具」；都要读得到这次运行；
 - 当天没超上限（设置 ledger.issue_daily_limit，自动的、一键的合计）。
-**自动出具**（auto_issue，拍板 L1）另要：设置里开着、认法是独立等价（how=independent：Agent 自己写的 SQL 被证明等价；
-「助手选用」的只给一键——选哪份口径是助手凭问法判断的，由人点一下代替证明）、版本是受管级别。只在运行一封存就比完的
-那一次触发（ledger/match）。不满足的写进 actions 的 auto_reason。
+**自动出具**（auto_issue，拍板 L1）另要：设置里开着、这次是问数据的答案（origin_kind=chat；画布试运行、蓝图试运行、
+个人应用刷新也比对，但只给一键——画布上反复试跑一份等价的草图，每次都是新的来源运行，自动的话每试一次就多一次正式运行，
+含报告撰写的模型费用）、认法是独立等价（how=independent：Agent 自己写的 SQL 被证明等价；「助手选用」的只给一键——选哪份
+口径是助手凭问法判断的，由人点一下代替证明）、版本是受管级别。只在运行一封存就比完的那一次触发（ledger/match）。不满足的
+写进 actions 的 auto_reason。
 
 **同一运行、同一口径、同一组参数只发起一次**：按 input_key（apps/resolve，补算用的同一个指纹）认，已经发起过、没失败的
 直接交回那一次。进程内按（运行、工作流、版本）串行，自动和一键同时到也只发一次（单进程部署，同 apps/backfill 的锁）。
@@ -70,6 +72,9 @@ ASK_BUILDER = "这份口径没有被你能使用的应用固定，不能由你�
 OVER_LIMIT = "今天的按口径出具已达到上限（{limit} 次），请明天再试，或请管理员调整上限"
 #: 不自动出具的原因（能一键出具时写进 actions 的 auto_reason）
 AUTO_OFF = "设置里关了自动按口径出具"
+AUTO_NOT_CHAT = "这次是{what}，不是问数据的答案：自动出具只给问数据的答案，这里只给一键出具"
+#: 参与比对、但不是问数据的那几种来源（ledger/match.EXPLORE_ORIGINS）怎么称呼
+_NOT_CHAT_TEXT = {"canvas": "画布试运行", "trial": "蓝图试运行", "personal_app": "个人应用的刷新"}
 AUTO_COMPOSED = "数来自助手选用的口径，只给一键出具：选用哪份口径是助手按问法判断的，要由人确认"
 AUTO_LEVEL = "这一版是已发布级别，自动出具只限受管级别的口径"
 AUTO_RETRO = "这次比对是事后按现在的口径回看的，不自动出具"
@@ -269,8 +274,16 @@ async def plan_issue(session: Any, run: Run | None, content: dict[str, Any] | No
     settings = await ledger_settings(session)
     if plan.existing is None and await issued_today(session) >= int(settings["issue_daily_limit"]):
         return plan.refuse(OVER_LIMIT.format(limit=settings["issue_daily_limit"]), 429, DAILY_LIMIT)
-    plan.auto_reason = (AUTO_OFF if not settings["auto_issue"] else AUTO_COMPOSED if plan.how != "independent"
-                        else AUTO_LEVEL if plan.level != "governed" else AUTO_RETRO if retro else None)
+    if not settings["auto_issue"]:
+        plan.auto_reason = AUTO_OFF
+    elif run.origin_kind != "chat":
+        plan.auto_reason = AUTO_NOT_CHAT.format(what=_NOT_CHAT_TEXT.get(run.origin_kind or "", "别处发起的运行"))
+    elif plan.how != "independent":
+        plan.auto_reason = AUTO_COMPOSED
+    elif plan.level != "governed":
+        plan.auto_reason = AUTO_LEVEL
+    elif retro:
+        plan.auto_reason = AUTO_RETRO
     return plan
 
 
@@ -378,5 +391,5 @@ async def auto_issue(run_id: str) -> str | None:
         return None
 
 
-__all__ = ["DAILY_LIMIT", "FORBIDDEN", "ORIGIN", "REFUSED", "IssueRefused", "Plan", "auto_issue", "issue",
-           "issued_runs", "issued_today", "issued_view", "plan_issue", "plans_for"]
+__all__ = ["AUTO_NOT_CHAT", "DAILY_LIMIT", "FORBIDDEN", "ORIGIN", "REFUSED", "IssueRefused", "Plan", "auto_issue",
+           "issue", "issued_runs", "issued_today", "issued_view", "plan_issue", "plans_for"]

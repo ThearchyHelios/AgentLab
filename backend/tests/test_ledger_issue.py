@@ -1,9 +1,10 @@
 """按口径正式出具（next-round 02 做法 5，拍板 L1、L5，app/ledger/issue.py）。
 
 真的跑探索运行（虚构店铺库、mock 模型写报告），等后台比对做完，看自动出具、一键出具、拒绝原因、去重：
-- 整题独立等价于受管口径：比对完自动发起一次正式运行（来源 ledger_issue），origin 记来源运行、口径、绑定哈希，参数是
-  绑定 + 缺省值，按 graph_hash 钉住；GET 账本的 actions 写能自动、issued 列出它；再点一次交回同一次；
-- 已发布级别、助手选用的：不自动，只给一键（写明为什么），一键照常发起；设置关了自动出具也不自动；
+- 问数据的答案整题独立等价于受管口径：比对完自动发起一次正式运行（来源 ledger_issue），origin 记来源运行、口径、绑定
+  哈希，参数是绑定 + 缺省值，按 graph_hash 钉住；GET 账本的 actions 写能自动、issued 列出它；再点一次交回同一次；
+- 已发布级别、助手选用的、不是问数据的（画布试运行等）：不自动，只给一键（写明为什么），一键照常发起；设置关了自动出具
+  也不自动；
 - 拒绝写明原因：整题不等价、点名别的口径、版本退役、图里有人工节点、缺入口字段、超过每日上限、使用者没有应用授权；
   使用者有授权（应用固定着这一版）就能出具，origin 记靠的是哪个应用；
 - 设置 ledger 一组：缺省值、写坏了拒收。
@@ -98,11 +99,12 @@ def two_writers(monkeypatch, answer: str = "本周销售额 [[v:Q1.r0.销售额]
     monkeypatch.setattr(mock_model.MockChatModel, "_decide", decide)
 
 
-async def equivalent_run(monkeypatch):
+async def equivalent_run(monkeypatch, origin: str = "chat"):
+    """一次整题独立等价于「周销售」v1 的探索运行（缺省是问数据的答案），等它封存、比对完。"""
     from app.engine.runner import run_manager as manager
 
     two_writers(monkeypatch)
-    run = await manager.start(graph=S.explore_graph(S.EQUIVALENT), input_payload={}, origin_kind="canvas")
+    run = await manager.start(graph=S.explore_graph(S.EQUIVALENT), input_payload={}, origin_kind=origin)
     row = await S.wait(run.id)
     assert row.status == "succeeded", row.error
     await ledger_match.drain()
@@ -140,6 +142,22 @@ async def test_an_independent_equivalent_answer_to_a_governed_caliber_is_issued_
     again = await client.post(f"/api/ledger/answers/{row.id}/issue", json={"workflow_id": wf, "version": 1})
     assert again.status_code == 200 and again.json()["created"] is False and again.json()["run_id"] == formal.id
     assert len(await issued(row.id)) == 1
+
+
+async def test_only_answers_in_chat_are_issued_automatically(client, monkeypatch):
+    """自动出具只给问数据的答案（拍板 L1、做法 5）：画布上反复试跑一份和受管口径等价的草图，每次都是新的来源运行，
+    自动的话每试一次就多一次正式运行（含报告撰写的模型费用）。画布试运行只给一键，写明为什么，一键照常发起。"""
+    wf = await S.publish()
+    row = await equivalent_run(monkeypatch, origin="canvas")
+    assert await settle(row.id) == []
+    [action] = [a for a in (await client.get(f"/api/runs/{row.id}/ledger")).json()["actions"] if a["kind"] == "issue"]
+    assert action["available"] is True and action["auto"] is False
+    assert action["auto_reason"] == ledger_issue.AUTO_NOT_CHAT.format(what="画布试运行")
+    assert await ledger_issue.auto_issue(row.id) is None and await issued(row.id) == []
+    res = await client.post(f"/api/ledger/answers/{row.id}/issue", json={"workflow_id": wf, "version": 1})
+    assert res.status_code == 200 and res.json()["created"] is True
+    [formal] = await settle(row.id)
+    assert formal.origin["auto"] is False and formal.status == "succeeded"
 
 
 async def test_published_level_calibers_only_get_one_click(client, monkeypatch):
