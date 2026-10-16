@@ -4471,3 +4471,13 @@ export interface DataSourceName {
   kind?: string
   enabled?: boolean
 }
+
+// ---------------------------------------------------------------------------
+// 驳回 ≠ 失败（docs/design/next-round/05-已知遗留.md (a)，总方案 X9）
+
+/** 运行为什么结束在 cancelled（服务端 Run.end_reason）：rejected 人工驳回，stopped 手动停止。其余终态、老运行为空 */
+export type RunEndReason = 'rejected' | 'stopped'
+
+export interface Run {
+  end_reason?: RunEndReason | null
+}

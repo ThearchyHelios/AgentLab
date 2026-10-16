@@ -50,8 +50,8 @@ RUN_REJECTED = "run_rejected"
 #: 运行为什么结束在 cancelled（Run.end_reason，docs/design/next-round/00-总方案.md X9）
 END_REJECTED = "rejected"
 END_STOPPED = "stopped"
-#: 被驳回的运行不能接着跑：从断点重跑会读到同一个驳回答复、再停在同一处
-REJECTED_CONTINUE = "被驳回的运行不能接着跑：改好内容后重新发起"
+#: 被驳回的运行不能继续运行：从断点重跑会读到同一个驳回答复、再停在同一处
+REJECTED_CONTINUE = "被驳回的运行不能继续运行：改好内容后重新发起"
 #: 服务重启时还在排队的运行改成失败时写的话（run.error 和补发的 run.failed 是同一句）
 QUEUED_AT_RESTART = "服务重启时这次运行仍在排队，没有可恢复的进度，请重新发起运行"
 

@@ -132,7 +132,7 @@ async def test_the_api_carries_end_reason_and_refuses_to_continue_a_rejected_run
     assert (body["status"], body["end_reason"]) == ("cancelled", "rejected")
     r = await client.post(f"/api/runs/{run_id}/continue", json={})
     assert r.status_code == 409 and r.json()["code"] == "run_rejected"
-    assert r.json()["detail"] == "被驳回的运行不能接着跑：改好内容后重新发起"
+    assert r.json()["detail"] == "被驳回的运行不能继续运行：改好内容后重新发起"
     stop = await client.post(f"/api/runs/{run_id}/cancel")
     assert stop.status_code == 409 and "被驳回" in stop.json()["detail"]
 

@@ -17,7 +17,7 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { canLeave, leavePass } from '../lib/leave'
 import { formatNumber, formatTime } from '../lib/format'
-import { CHAT_BLUEPRINT_TEXT } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT, REJECTED_TEXT } from '../lib/terms'
 import { useCatalog, useCatalogListState, useDatasources, useOnReconnect, type CatalogListState } from '../store/catalog'
 import { useAtLeast } from '../store/auth'
 import { useBlueprint } from '../store/blueprint'
@@ -383,7 +383,8 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
       : turn.phase === 'error' ? 'error'
       : live || turn.phase === 'checking' ? 'running' : 'done',
     // 没核对上的不知道结局，用「未运行」那个空心点，不画成完成也不画成失败
-    statusCode: turn.phase === 'cancelled' ? 'cancelled'
+    // 被人驳回的（turn.rejected，服务端 end_reason=rejected）照 lib/status 写「被驳回」，不写「已取消」
+    statusCode: turn.phase === 'cancelled' ? (turn.rejected ? 'rejected' : 'cancelled')
       : turn.phase === 'suspended' ? 'suspended'
       // 助手反问：这一轮结束了，在等用户回答
       : turn.asked && turn.phase === 'done' ? 'waiting'
@@ -729,6 +730,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
 
   // 中断、取消、没核对上在流里不出红框（它们不是故障），为什么停、停了意味着什么在这里说
   const note = kind === 'suspended' || kind === 'unknown' ? turn.failure
+    : kind === 'cancelled' && turn.rejected ? { title: '', reason: REJECTED_TEXT.chatReason, hint: turn.rejected.sub }
     : kind === 'cancelled' ? { title: '', reason: turn.run ? '你已停止本轮，对应的运行也已一并取消。' : '你在搭建工作流时停止了本轮。' }
     : null
 

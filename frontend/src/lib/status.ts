@@ -22,6 +22,7 @@ export type StatusCode =
   | 'succeeded'   // 运行跑完
   | 'failed'
   | 'cancelled'
+  | 'rejected'    // 运行：被人驳回结束（后端是 cancelled + end_reason=rejected，05-已知遗留 (a)）
   | 'suspended'   // 服务重启后挂起，可续跑
   | 'held'        // 后端的 interrupted 但没有待审批：已挂起 · 可续跑
   | 'skipped'     // 被 skip_if 跳过
@@ -104,6 +105,11 @@ export const STATUS: Record<StatusCode, StatusMeta> = {
     code: 'cancelled', label: '已取消', short: '已取消', shape: 'stop', alert: false, terminal: true,
     ...tok('cancelled', 'var(--text-faint)'),
   },
+  // 人的决定，不是故障：不画红、不给继续运行；和手动停止同一个剪影，叫法分开
+  rejected: {
+    code: 'rejected', label: '被驳回', short: '被驳回', shape: 'stop', alert: false, terminal: true,
+    hint: '审批人驳回了这次运行，运行到这里结束；改好内容后重新发起', ...tok('cancelled', 'var(--text-faint)'),
+  },
   suspended: {
     code: 'suspended', label: '已中断（服务重启）', short: '已中断', shape: 'pause', alert: true, terminal: true,
     hint: '服务重启时本次运行尚未结束，已在断点处挂起，可继续运行', ...tok('suspended', 'var(--warn)'),
@@ -141,15 +147,25 @@ const ALIAS: Record<string, StatusCode> = {
  * 才分得开——传 pendingApproval。不知道时（没传）按等待审批处理，这是
  * interrupted 最常见的来源，也是改造前的说法，不会比原来更错。
  */
-export function resolveStatus(status: string | null | undefined, opts?: { pendingApproval?: boolean }): StatusCode {
+export function resolveStatus(status: string | null | undefined, opts?: StatusOpts): StatusCode {
   if (!status) return 'idle'
   if (status === 'interrupted') return opts?.pendingApproval === false ? 'held' : 'waiting'
+  // 被驳回只看服务端给的 end_reason，不解析报错原文（界面层不放逻辑）
+  if (status === 'cancelled' && opts?.endReason === 'rejected') return 'rejected'
   if (status in STATUS) return status as StatusCode
   return ALIAS[status] ?? 'idle'
 }
 
+/**
+ * 落状态要的旁证：pendingApproval 分 interrupted 的两种；endReason 是运行的 end_reason（cancelled 时分被驳回和手动停止）
+ */
+export interface StatusOpts {
+  pendingApproval?: boolean
+  endReason?: string | null
+}
+
 /** 状态的完整外观。未知状态码回落到 idle 的外观，文字写原码，免得静默吞掉 */
-export function statusMeta(status: string | null | undefined, opts?: { pendingApproval?: boolean }): StatusMeta {
+export function statusMeta(status: string | null | undefined, opts?: StatusOpts): StatusMeta {
   const code = resolveStatus(status, opts)
   const meta = STATUS[code]
   if (status && code === 'idle' && status !== 'idle' && !(status in ALIAS)) {
@@ -159,7 +175,7 @@ export function statusMeta(status: string | null | undefined, opts?: { pendingAp
 }
 
 /** 只要文字 */
-export function statusLabel(status: string | null | undefined, opts?: { pendingApproval?: boolean; short?: boolean }): string {
+export function statusLabel(status: string | null | undefined, opts?: StatusOpts & { short?: boolean }): string {
   const meta = statusMeta(status, opts)
   return opts?.short ? meta.short : meta.label
 }
@@ -186,6 +202,7 @@ export function serverStatusOf(code: StatusCode): RunStatus | null {
     case 'waiting': case 'held': case 'suspended': return 'interrupted'
     case 'done': case 'succeeded': return 'succeeded'
     case 'queued': case 'running': case 'failed': case 'cancelled': return code
+    case 'rejected': return 'cancelled'
     default: return null
   }
 }

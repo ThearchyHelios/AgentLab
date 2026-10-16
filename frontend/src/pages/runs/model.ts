@@ -49,8 +49,8 @@ export const SEGMENT_CODES: StatusCode[] = RUN_STATUS_ORDER
  * 打断后没有审批——要看待审批列表才分得开。approvals 还没加载时传 null，按
  * 等待审批算（最常见的来源），不会在加载的那一瞬间闪成「已挂起」。
  */
-export function runCode(run: Pick<Run, 'id' | 'status'>, approvals: Approval[] | null): StatusCode {
-  if (run.status !== 'interrupted') return resolveStatus(run.status)
+export function runCode(run: Pick<Run, 'id' | 'status' | 'end_reason'>, approvals: Approval[] | null): StatusCode {
+  if (run.status !== 'interrupted') return resolveStatus(run.status, { endReason: run.end_reason })
   return resolveStatus(run.status, {
     pendingApproval: approvals == null ? undefined : hasPendingApproval(approvals, run.id),
   })

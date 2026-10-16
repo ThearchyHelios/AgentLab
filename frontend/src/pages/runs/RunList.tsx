@@ -7,7 +7,8 @@ import {
   formatCost, formatDateTime, formatDay, formatSpan, formatTime, formatTokens, parseServerTime, shortId,
 } from '../../lib/format'
 import {
-  ORIGIN_LABEL, ORIGIN_TEXT, RUN_CLASS_LABEL, TASK_KIND_LABEL, TASK_LOG_TEXT, UNSAVED_HINT, UNSAVED_NAME, isUnsaved, originLabel,
+  ORIGIN_LABEL, ORIGIN_TEXT, REJECTED_TEXT, RUN_CLASS_LABEL, TASK_KIND_LABEL, TASK_LOG_TEXT, UNSAVED_HINT, UNSAVED_NAME, isUnsaved,
+  originLabel,
   runName,
 } from '../../lib/terms'
 import { summarizeRun } from '../../run/decode'
@@ -466,6 +467,13 @@ function RowContext({ run, code, approval, now }: {
       const reason = cancelReason(run.error)
       return <div className={clsx(line, 'text-faint')} title={run.error ?? undefined}>已取消{reason ? ` · ${reason}` : ''}</div>
     }
+    case 'rejected':
+      // 人的驳回（end_reason=rejected）：报错原文就是给人看的那一句（「「付款」未确认（被驳回），没有发送：…」）
+      return (
+        <div className={clsx(line, 'text-faint')} title={run.error ?? undefined} data-run-reason="rejected">
+          {REJECTED_TEXT.title}{run.error ? ` · ${run.error}` : ''}
+        </div>
+      )
     default: {
       const summary = summarizeRun(run.input, run.output)
       return summary
