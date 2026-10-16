@@ -449,3 +449,218 @@ async def test_draft_and_profile_jobs_say_they_wait_for_introspect(small):
             for model, job_id in ((CatalogProfileJob, profile.id), (CatalogDraftJob, draft.id)):
                 await session.delete(await session.get(model, job_id))
             await session.commit()
+
+
+# --------------------------------------------------------------------------
+# 升级路径：升级前同步探查写的老缓存（没有 scope，也没有对象索引）
+# --------------------------------------------------------------------------
+
+LEGACY_TABLES = 60
+
+
+@pytest.fixture
+async def legacy(client, tmp_path):
+    """60 张表的源，schema_cache 是升级前同步探查写的那一份：没有 scope 摘要，对象索引一行都没有。"""
+    from app.data import introspect
+    from app.db.base import utcnow
+
+    path = tmp_path / "legacy.db"
+    db = sqlite3.connect(path)
+    for i in range(LEGACY_TABLES):
+        db.execute(f"CREATE TABLE t{i:02d} (id INTEGER PRIMARY KEY, amount INTEGER)")
+    db.commit()
+    db.close()
+    sid = await _make(client, str(path))
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, sid)
+        row.schema_cache = await introspect.introspect(row)
+        row.schema_synced_at = utcnow()
+        await session.commit()
+    cache = await _cache(sid)
+    assert len(cache["tables"]) == LEGACY_TABLES and "scope" not in cache
+    assert not await _rows(sid)
+    yield sid
+    await drop_source(sid)
+
+
+def _second_batch(monkeypatch, *, fail: bool = False) -> None:
+    """第一批照常读完；第二批起一直卡着（等着被停止），fail 时直接连接出错。"""
+    real = so.reflect
+    calls = 0
+
+    async def gated(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            if fail:
+                raise RuntimeError("connection reset by peer")
+            await asyncio.Event().wait()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(so, "reflect", gated)
+
+
+async def _until_first_batch(client, sid: str, job_id: str) -> None:
+    for _ in range(500):
+        await asyncio.sleep(0.02)
+        if (await client.get(f"/api/datasources/{sid}/introspect-jobs/{job_id}")).json()["job"]["done"] \
+                >= so.REFLECT_BATCH:
+            return
+    raise AssertionError("第一批一直没读完")
+
+
+@pytest.mark.parametrize("ending", ["cancel", "fail"])
+async def test_the_first_introspect_after_upgrade_never_shrinks_the_old_cache(client, legacy, monkeypatch, ending):
+    """升级后第一次后台探查中途停止、连接断开：还没重读的表照旧用老缓存里的那一份，表数不减少。"""
+    _second_batch(monkeypatch, fail=ending == "fail")
+    job = (await client.post(f"/api/datasources/{legacy}/introspect")).json()["job"]
+    assert job["total"] == LEGACY_TABLES
+    if ending == "cancel":
+        await _until_first_batch(client, legacy, job["id"])
+        r = await client.post(f"/api/datasources/{legacy}/introspect-jobs/{job['id']}/cancel")
+        assert r.status_code == 200 and r.json()["job"]["status"] == "cancelled", r.text
+    else:
+        await introspect_jobs.manager.wait(job["id"], timeout=60)
+        status = (await client.get(f"/api/datasources/{legacy}/introspect-jobs/{job['id']}")).json()["job"]
+        assert status["status"] == "failed" and status["counts"]["ok"] == so.REFLECT_BATCH
+    cache = await _cache(legacy)
+    assert len(cache["tables"]) == LEGACY_TABLES, f"老缓存里还没重读的表不见了：只剩 {len(cache['tables'])} 张"
+    assert not cache.get("skipped")
+    rows = await _rows(legacy)
+    fresh = [r for r in rows.values() if r.struct_version == 1]
+    assert len(fresh) == so.REFLECT_BATCH, "这次读到的才有结构版本"
+    assert all(r.meta and r.in_scope for r in rows.values()), "没重读的沿用老缓存的结构，仍在范围里"
+
+    monkeypatch.undo()
+    out = await introspect_now(client, legacy)
+    assert out["table_count"] == LEGACY_TABLES
+    assert {r.struct_version for r in (await _rows(legacy)).values()} == {1}, "老缓存接进来的不算一次结构变化"
+
+
+async def test_a_dry_run_then_a_failed_introspect_keeps_the_old_cache(client, legacy, monkeypatch):
+    """先在探查范围面板刷新了对象索引（dry_run），再点探查却连不上：失败照实记上，老缓存的表一张不少。"""
+    r = await client.post(f"/api/datasources/{legacy}/introspect", params={"dry_run": "true"})
+    assert r.status_code == 200 and r.json()["stored"] is True, r.text
+
+    async def down(*_a, **_k):
+        raise RuntimeError("could not connect to server")
+
+    monkeypatch.setattr(so, "list_objects", down)
+    r = await client.post(f"/api/datasources/{legacy}/introspect")
+    assert r.status_code == 400 and r.json()["code"] == "introspect_failed", r.text
+    cache = await _cache(legacy)
+    assert cache["failed"] is True and len(cache["tables"]) == LEGACY_TABLES
+
+
+async def test_a_restart_during_the_first_introspect_keeps_the_old_cache(client, legacy):
+    from app.db.base import utcnow
+
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, legacy)
+        queued, n = await introspect_jobs.prepare(session, row, actor="tester")
+    assert n == LEGACY_TABLES
+    async with SessionLocal() as session:
+        await session.execute(update(IntrospectJob).where(IntrospectJob.id == queued.id)
+                              .values(status="running", started_at=utcnow()))
+        await session.commit()
+    assert await introspect_jobs.startup() >= 1
+    assert len((await _cache(legacy))["tables"]) == LEGACY_TABLES
+
+
+async def test_an_old_cache_from_another_schema_is_not_carried_over(client, legacy):
+    """老缓存是别的 schema 探出来的（以前真探查能临时换 schema）：不接进这个 schema 的对象索引。"""
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, legacy)
+        row.schema_cache = {**row.schema_cache, "schema": "elsewhere"}
+        await session.commit()
+    r = await client.post(f"/api/datasources/{legacy}/introspect", params={"dry_run": "true"})
+    assert r.status_code == 200, r.text
+    assert not any(r.in_scope or r.meta for r in (await _rows(legacy)).values())
+
+
+# --------------------------------------------------------------------------
+# 一张表都没有：说出这台服务器上还有哪些 schema
+# --------------------------------------------------------------------------
+
+
+async def test_an_empty_schema_lists_the_other_schemas(client, tmp_path):
+    """schema 填错（或者是空的）：字典查询不报错、只是 0 行。照旧把候选 schema 记进表结构缓存，卡片和助手摘要都给得出提示，
+    不显示成「已同步、0 张表」了事。"""
+    from app.data import introspect
+
+    path = tmp_path / "empty.db"
+    sqlite3.connect(path).close()
+    sid = await _make(client, str(path))
+    try:
+        out = await introspect_now(client, sid)
+        assert out["table_count"] == 0 and out["schema_error"] == ""
+        assert "main" in out["available_schemas"], out
+        cache = await _cache(sid)
+        assert "main" in cache["available_schemas"] and not cache.get("failed")
+        async with SessionLocal() as session:
+            row = await session.get(DataSource, sid)
+            assert "数据可能在这些 schema：main" in introspect.summary(row)
+            listed = next(s for s in (await client.get("/api/datasources")).json() if s["id"] == sid)
+            assert "main" in listed["available_schemas"]
+
+        # 建了表再探查：有对象了，候选不再挂着
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE alpha (id INTEGER PRIMARY KEY)")
+        db.commit()
+        db.close()
+        out = await introspect_now(client, sid)
+        assert out["table_count"] == 1 and out["available_schemas"] == []
+    finally:
+        await drop_source(sid)
+
+
+async def test_an_empty_schema_on_a_server_with_other_schemas(client, small, monkeypatch):
+    """PostgreSQL、Oracle 的 schema 写错时字典查询只回 0 行：候选照 list_schemas 给（这里用替身模拟服务器上的几个 schema）。"""
+    sid, _ = small
+    from app.data import introspect
+
+    async def nothing(_source, _schema):
+        return so.IndexResult(objects=[], method="dictionary", total=0)
+
+    async def candidates(_source):
+        return ["sales_prod", "sales_dev"]
+
+    monkeypatch.setattr(so, "list_objects", nothing)
+    monkeypatch.setattr(introspect, "list_schemas", candidates)
+    out = await introspect_now(client, sid)
+    assert out["table_count"] == 0 and out["available_schemas"] == ["sales_prod", "sales_dev"]
+
+
+# --------------------------------------------------------------------------
+# 排队中的变化：任务开始时不把建任务之后加进来的表移出去
+# --------------------------------------------------------------------------
+
+
+async def test_tables_added_while_the_job_is_queued_stay_in_scope(client, small):
+    sid, _ = small
+    await _scope(client, sid, mode="rules", include=["alpha"])
+    await introspect_now(client, sid)
+    # 建任务之前按需加入、后来被显式移出的：这次探查要把它移出去
+    got = await so.add_to_scope(sid, ["eta"], trail=so.Trail(via=so.VIA_LOOK, actor="tester"))
+    assert got.added == ["eta"]
+    await _scope(client, sid, mode="rules", include=["alpha"], removed=["eta"])
+    held = runtime.lanes.enter(sid, "profile", "someone-else")
+    try:
+        job = (await client.post(f"/api/datasources/{sid}/introspect")).json()["job"]
+        assert job["status"] == "queued" and job["total"] == 1
+        r = await client.post(f"/api/datasources/{sid}/catalog/scope/add", json={"tables": ["beta"]})
+        assert r.status_code == 200 and r.json()["added"] == ["beta"], r.text
+        got = await so.add_to_scope(sid, ["gamma"], trail=so.Trail(via=so.VIA_LOOK, actor="tester"))
+        assert got.added == ["gamma"]
+        # 任务还没开始：范围还是上一次的（eta 还在），新加的两张已经进了表结构
+        assert set((await _cache(sid))["tables"]) == {"alpha", "beta", "gamma", "eta"}
+    finally:
+        held.release()
+    await introspect_jobs.manager.wait(job["id"], timeout=30)
+    assert (await client.get(f"/api/datasources/{sid}/introspect-jobs/{job['id']}")).json()["job"]["status"] \
+        == "succeeded"
+    assert set((await _cache(sid))["tables"]) == {"alpha", "beta", "gamma"}, "排队时加进来的表被任务移出去了"
+    rows = await _rows(sid)
+    assert rows["beta"].in_scope and rows["beta"].scope_reason == "explicit" and rows["beta"].meta
+    assert rows["gamma"].in_scope and rows["gamma"].scope_reason == "on_demand"
+    assert not rows["eta"].in_scope, "建任务之前按需加入、又被显式移出的，这次探查照规则移出"

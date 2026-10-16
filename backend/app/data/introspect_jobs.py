@@ -4,12 +4,14 @@
 进行时，目录和结构会对不上。现在：
 
 - **建任务**（prepare，在请求里做完）：先刷新对象索引（data/source_objects：一条字典查询，查不了退回 Inspector；连接本身
-  失败抛 IntrospectFailed，失败照实记进 schema_cache，表结构照旧留着），再按探查范围的规则圈表；规则命中超过上限抛
-  ScopeTooLarge（说出命中多少张），不建任务、不截断。圈好的范围写进对象索引，任务逐表一行（按名字排）。同一个源同时只有
-  一个排队或进行中的探查任务（IntrospectBusy；部分唯一索引兜底）。
+  失败抛 IntrospectFailed，失败照实记进 schema_cache，表结构照旧留着；升级前探查过的源第一次建索引时接上老缓存里的表结构，
+  见 source_objects.legacy_seed；一个对象都没有时记下这台服务器上能选的 schema），再按探查范围的规则圈表；规则命中超过
+  上限抛 ScopeTooLarge（说出命中多少张），不建任务、不截断。任务逐表一行（按名字排）。同一个源同时只有一个排队或进行中的
+  探查任务（IntrospectBusy；部分唯一索引兜底）。
 - **在后台反射**（manager.start）：照 core/job_runtime 的生命周期，和同源的起草、剖析排同一条队（introspect），轮到了才开始。
-  按批（source_objects.REFLECT_BATCH 张一批）只读反射，每批开始前重读数据源（停用了就停下），读完的表逐表记 ok / failed、
-  写进对象索引（指纹变了结构版本加 1）。全部读完由 rebuild_schema_cache 物化 schema_cache、盖上同步时间。
+  开始时才把圈好的范围写进对象索引（建任务之后才加进范围的表照旧留着）。按批（source_objects.REFLECT_BATCH 张一批）只读
+  反射，每批开始前重读数据源（停用了就停下），读完的表逐表记 ok / failed、写进对象索引（指纹变了结构版本加 1）。全部读完
+  由 rebuild_schema_cache 物化 schema_cache、盖上同步时间。
 - **停止**（cancel）：排队的直接 cancelled；进行中的停在当前这一批之后（库那边按单条时限截止），没读的表 cancelled；读完的
   照常物化进 schema_cache（范围内已反射的行），任务 cancelled。
 - **服务重启**（startup）：排队、进行中的标 interrupted，没读的表 cancelled、error「服务重启，探查中断」，同样把已读完的物化
@@ -216,15 +218,20 @@ def _refuse(row: Any) -> None:
         raise IntrospectRefused(RECORDS_REFUSED)
 
 
-async def _failure_marker(row: Any, cause: BaseException) -> dict[str, Any]:
-    """对象清单拿不到时记进 schema_cache 的失败标记：原因（驱动的原话第一行）和这台服务器上能选的 schema。"""
+async def _other_schemas(row: Any) -> list[str]:
+    """这台服务器上能选的 schema（introspect.list_schemas：真有对象的在前）；拿不到就不给。"""
     from app.data import introspect
 
     try:
-        candidates = await introspect.list_schemas(row)
+        return list(await introspect.list_schemas(row))
     except Exception:  # noqa: BLE001 - 候选也拿不到就不给
-        candidates = []
-    return {"failed": True, "error": first_line(cause) or describe_exception(cause), "available_schemas": candidates}
+        return []
+
+
+async def _failure_marker(row: Any, cause: BaseException) -> dict[str, Any]:
+    """对象清单拿不到时记进 schema_cache 的失败标记：原因（驱动的原话第一行）和这台服务器上能选的 schema。"""
+    return {"failed": True, "error": first_line(cause) or describe_exception(cause),
+            "available_schemas": await _other_schemas(row)}
 
 
 async def _record_failure(session: AsyncSession, row: Any, cause: BaseException) -> None:
@@ -263,7 +270,7 @@ async def preview(session: AsyncSession, row: Any, *, schema: str | None = None,
         out.update(stored=False, objects=[o.name for o in result.objects], scope=plan.summary())
         return out
     async with so.source_lock(row.id):
-        stats = await so.refresh_index(session, row.id, configured, result)
+        stats = await so.refresh_index(session, row.id, configured, result, legacy=row.schema_cache)
         await session.commit()
     plan = await so.plan_for(session, row, rules)
     out.update(stored=True, objects=[o.name for o in result.objects], scope=plan.summary(), added=stats.added,
@@ -289,8 +296,12 @@ async def prepare(session: AsyncSession, row: Any, *, actor: str | None,
     except Exception as e:  # noqa: BLE001
         await _record_failure(session, row, e)
         raise IntrospectFailed(e) from e
+    # 一个对象都没有：PostgreSQL、Oracle 的 schema 名写错（大小写、拼写）时字典查询不报错、只回 0 行，最常见的就是这种。
+    # 和以前同步探查一样把这台服务器上能选的 schema 记下来（物化时写进 schema_cache 的 available_schemas）：卡片上「该
+    # 服务器上还有……」、助手摘要里「数据可能在这些 schema」才给得出，不显示成「已同步、0 张表」了事
+    candidates = await _other_schemas(row) if not result.objects else []
     async with so.source_lock(source_id):
-        stats = await so.refresh_index(session, source_id, schema, result)
+        stats = await so.refresh_index(session, source_id, schema, result, legacy=row.schema_cache)
         await session.flush()
         rules = so.ScopeRules.from_options(row.options)
         plan = await so.plan_for(session, row, rules)
@@ -298,7 +309,10 @@ async def prepare(session: AsyncSession, row: Any, *, actor: str | None,
             await session.commit()
             raise ScopeTooLarge(plan)
         summary = {**plan.summary(rules), "index_method": stats.method, "index_capped": stats.capped,
-                   "index_note": stats.note, "added": stats.added, "removed": stats.removed}
+                   "index_note": stats.note, "added": stats.added, "removed": stats.removed,
+                   "adopted": stats.adopted}
+        if candidates:
+            summary["available_schemas"] = candidates
         job = IntrospectJob(id=new_id(), source_id=source_id, status="queued", trigger=trigger, schema_name=schema,
                             scope=summary, created_by=actor)
         session.add(job)
@@ -352,8 +366,10 @@ async def _materialize(session: AsyncSession, source_id: str, *, synced: bool,
     row = await session.get(DataSource, source_id)
     if row is None:
         return
+    scope = (job.scope or {}) if job is not None else {}
     async with so.source_lock(source_id):
-        await so.rebuild_schema_cache(session, row, synced=synced, index=_index_stats(job))
+        await so.rebuild_schema_cache(session, row, synced=synced, index=_index_stats(job),
+                                      candidates=list(scope.get("available_schemas") or []))
         if synced:
             row.schema_synced_at = utcnow()
         await session.commit()
@@ -470,17 +486,27 @@ class _IntrospectRun(runtime.JobRun):
         return await runtime.claim(session, IntrospectJob, self.job_id)
 
     async def _apply(self, session: AsyncSession, source_id: str, schema: str) -> None:
-        """开始执行时把建任务时圈好的范围写进对象索引：离开范围的清掉结构，范围内的按原因记。建任务之后按需加入的表
-        照旧留在范围里（它们刚读过，不在这次的表单里）。"""
+        """开始执行时把建任务时圈好的范围写进对象索引：离开范围的清掉结构，范围内的按原因记。
+
+        建任务之后才加进范围的表（added_at 不早于建任务的时刻：look、db_schema__ 按需加入的，目录页「加入范围」显式加的）
+        照旧留在范围里：它们是加的那一刻当场读过结构的，不在这次的表单里；任务排在剖析后面时，用户刚看到「已加入」，任务
+        一开始就把它移出去、清掉结构，要等再探查一次才回来。原因按圈范围的先后取高的那个（pinned > 显式 > 规则 > 按需）。
+        建任务之前就按需加入的不在此列：圈范围时已经算过（plan_scope），被显式移出的照规则移出。"""
+        rank = {r: i for i, r in enumerate(so.SCOPE_REASONS)}
         reasons = {r.table_name: r.reason or "rule" for r in (await session.execute(
             select(IntrospectTask.table_name, IntrospectTask.reason).where(IntrospectTask.job_id == self.job_id)
         )).all()}
+        job = await session.get(IntrospectJob, self.job_id)
         async with so.source_lock(source_id):
-            for name in (await session.execute(select(SourceObject.name).where(
-                    SourceObject.source_id == source_id, SourceObject.schema_name == schema,
-                    SourceObject.in_scope.is_(True), SourceObject.scope_reason == "on_demand",
-                    SourceObject.removed_at.is_(None)))).scalars():
-                reasons.setdefault(name, "on_demand")
+            if job is not None:
+                for name, reason in (await session.execute(select(SourceObject.name, SourceObject.scope_reason).where(
+                        SourceObject.source_id == source_id, SourceObject.schema_name == schema,
+                        SourceObject.in_scope.is_(True), SourceObject.removed_at.is_(None),
+                        SourceObject.added_at >= job.created_at))).all():
+                    late = reason or "on_demand"
+                    held = reasons.get(name)
+                    if held is None or rank.get(late, len(rank)) < rank.get(held, len(rank)):
+                        reasons[name] = late
             counts = {r: 0 for r in so.SCOPE_REASONS}
             for reason in reasons.values():
                 counts[reason] = counts.get(reason, 0) + 1

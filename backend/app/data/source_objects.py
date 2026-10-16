@@ -7,7 +7,8 @@
   sqlite_master，MySQL 查 information_schema.TABLES，PostgreSQL 查 pg_class 加 obj_description，Oracle 查 ALL_OBJECTS 加
   ALL_TAB_COMMENTS）。字典查询走数据库查询的同一个入口（engine.run_query：只读守卫、单条时限）；查不了退回 Inspector 的
   get_table_names / get_view_names，只是没有注释。最多收 INDEX_LIMIT 个对象（按名字排序取前面的），超了照实记 capped，
-  这时不判删除（没收进来的不等于不在了）。
+  这时不判删除（没收进来的不等于不在了）。升级前同步探查过的源，对象索引第一次建起来时把老缓存里的表结构接进来
+  （legacy_seed）：不然物化出来的会缩成这一次已经读完的那几张。
 - **探查范围**（ScopeRules / plan_scope）：数据源 options.introspect_scope 的规则——{mode: all|rules, include: [通配],
   exclude: [通配], tables: [显式], removed: [显式移出], views: bool, max_tables}。按 names.name_key 不分大小写匹配，排除优先。
   有数据目录的表、已发布模板写死的 SQL 用到的表一律在范围里（pinned），规则排不掉，只有显式移出才行。规则命中（含 pinned、
@@ -443,6 +444,8 @@ class RefreshStats:
     method: str
     capped: bool
     note: str | None = None
+    #: 第一次建对象索引时从升级前的老缓存接进来几张（legacy_seed）
+    adopted: int = 0
 
 
 def _chunks(items: list[Any], size: int = 500) -> Iterable[list[Any]]:
@@ -450,13 +453,63 @@ def _chunks(items: list[Any], size: int = 500) -> Iterable[list[Any]]:
         yield items[i:i + size]
 
 
-async def refresh_index(session: AsyncSession, source_id: str, schema: str, result: IndexResult) -> RefreshStats:
+def legacy_seed(cache: Mapping[str, Any] | None, schema: str,
+                names: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """升级前同步探查写的老缓存里、对象索引第一次建起来时要接进来的表：{对象索引里的名字: 这一行要带上的列}。
+
+    为什么要接：schema_cache 只从对象索引物化（rebuild_schema_cache），老缓存里的表结构却从来没进过对象索引。不接的话，
+    升级后第一次探查只要中途停止、连接断开、服务重启，或者排队时有人按需加入、探查失败要记一笔，物化出来的就只剩已经读完
+    的那几张：老缓存里还没重读的表静默消失，助手和问数据看到的表突然变少。接进来以后它们就是那时的探查范围（老缓存是按
+    「前 200 个对象」探的）：在范围里、算规则命中，带着老结构和它的指纹；结构版本记 0（还没按对象索引读过），第一次读到
+    记 1，不把反射格式的差异当成一次结构变化。老缓存里读不到结构的（skipped）照样记成范围里读不到结构。第一次探查任务
+    开始执行时照这一次的规则重圈（_IntrospectRun._apply），规则外的照常移出；没重读到的沿用老结构，和以后每一次探查中途
+    停下时一样。
+
+    只认老缓存：带 scope 摘要的是从对象索引物化的，不再接；缓存的 schema 和这一次的对不上（以前真探查能临时换 schema）
+    也不接，免得把别的 schema 的结构当成这一个的。按名字对，对不上的按 name_key 对（只认唯一的）；对象索引里没有的不接：
+    库里已经没有这张表了。"""
+    if not isinstance(cache, Mapping) or "scope" in cache:
+        return {}
+    if str(cache.get("schema") or "").strip() != schema:
+        return {}
+    tables = cache.get("tables") if isinstance(cache.get("tables"), Mapping) else {}
+    skipped = cache.get("skipped") if isinstance(cache.get("skipped"), Mapping) else {}
+    if not tables and not skipped:
+        return {}
+    old: dict[str, tuple[str, Any]] = {str(n): ("meta", m) for n, m in tables.items() if isinstance(m, dict) and m}
+    for n, why in skipped.items():
+        old.setdefault(str(n), ("error", why))
+    by_key: dict[str, list[str]] = {}
+    for n in old:
+        by_key.setdefault(name_key(n), []).append(n)
+    out: dict[str, dict[str, Any]] = {}
+    for name in names:
+        hit = name if name in old else None
+        if hit is None and len(by_key.get(name_key(name), [])) == 1:
+            hit = by_key[name_key(name)][0]
+        if hit is None:
+            continue
+        what, value = old[hit]
+        seed: dict[str, Any] = {"in_scope": True, "scope_reason": "rule"}
+        if what == "meta":
+            seed.update(meta=value, fingerprint=fingerprint(value))
+        else:
+            seed["reflect_error"] = str(value or "") or "读不到列"
+        out[name] = seed
+    return out
+
+
+async def refresh_index(session: AsyncSession, source_id: str, schema: str, result: IndexResult, *,
+                        legacy: Mapping[str, Any] | None = None) -> RefreshStats:
     """把字典查询的结果写进对象索引（不提交）：新出现的对象加一行；还在的更新类型、注释、行数估算、last_seen_at（删了又
-    出现的清掉 removed_at）；不在了的记 removed_at。索引被截断（capped）时不判删除：没收进来的不等于不在了。"""
+    出现的清掉 removed_at）；不在了的记 removed_at。索引被截断（capped）时不判删除：没收进来的不等于不在了。
+
+    legacy 是数据源此刻的 schema_cache：这个 schema 的对象索引第一次建起来时，老缓存里的表结构接进对应的行（legacy_seed）。"""
     now = utcnow()
     existing = {r.name: r for r in (await session.execute(
         select(SourceObject.id, SourceObject.name, SourceObject.removed_at, SourceObject.kind, SourceObject.comment,
                SourceObject.est_rows).where(*_scope_filter(source_id, schema)))).all()}
+    seeds = legacy_seed(legacy, schema, (o.name for o in result.objects)) if not existing else {}
     seen: set[str] = set()
     new_rows: list[dict[str, Any]] = []
     changed: list[dict[str, Any]] = []
@@ -470,7 +523,7 @@ async def refresh_index(session: AsyncSession, source_id: str, schema: str, resu
             new_rows.append({"source_id": source_id, "schema_name": schema, "name": obj.name,
                              "name_key": name_key(obj.name), "kind": obj.kind, "comment": obj.comment,
                              "est_rows": obj.est_rows, "quote_name": obj.quote, "first_seen_at": now,
-                             "last_seen_at": now})
+                             "last_seen_at": now, **seeds.get(obj.name, {})})
             continue
         if old.removed_at is not None:
             revived.append(old.id)
@@ -502,7 +555,7 @@ async def refresh_index(session: AsyncSession, source_id: str, schema: str, resu
             await session.execute(update(_SO).where(_SO.id.in_(chunk)).values(removed_at=now, in_scope=False)
                                   .execution_options(synchronize_session=False))
     return RefreshStats(total=len(seen), added=len(new_rows), removed=len(gone), method=result.method,
-                        capped=result.capped, note=result.note)
+                        capped=result.capped, note=result.note, adopted=len(seeds))
 
 
 async def live_objects(session: AsyncSession, source_id: str, schema: str) -> list[tuple[str, str]]:
@@ -656,14 +709,17 @@ _FAILURE_KEYS = ("failed", "error", "available_schemas")
 
 async def rebuild_schema_cache(session: AsyncSession, row: Any, *, failure: Mapping[str, Any] | None = None,
                                keep_failure: bool = False, synced: bool = False,
-                               index: RefreshStats | None = None) -> dict[str, Any]:
+                               index: RefreshStats | None = None,
+                               candidates: list[str] | None = None) -> dict[str, Any]:
     """从范围内已反射的行物化 schema_cache（唯一写它的地方），写进 row（不提交），返回新的缓存。
 
     形状和以前一样：tables（表在前、视图在后，各按名字）、truncated（有范围外的对象）、total（对象索引里的对象总数）、
     schema、synced_at；范围里却读不到结构的进 skipped（同以前的「跳过的对象」）；另加 scope 摘要。failure 给了的记上
     探查失败（failed、error、available_schemas，表结构照旧留着：助手还能按上一次读到的写 SQL）；keep_failure 时沿用缓存里
     原有的失败标记（按需加入不改它）。synced：这次是一次探查完成（synced_at 换成现在），否则沿用原来的。index：这次刷新
-    对象索引的结果（字典查询还是 Inspector、有没有被截断），不给沿用缓存里原来记的。"""
+    对象索引的结果（字典查询还是 Inspector、有没有被截断），不给沿用缓存里原来记的。candidates：对象索引一个对象都没有时
+    这台服务器上能选的 schema（建任务时拿的，这里不连库），写进 available_schemas——schema 填错多半是这样，不是失败，
+    failed 不置。"""
     from app.data.source_objects import ScopeRules as _Rules
 
     schema = index_schema(row)
@@ -709,6 +765,8 @@ async def rebuild_schema_cache(session: AsyncSession, row: Any, *, failure: Mapp
     }
     if skipped:
         cache["skipped"] = skipped
+    if candidates and not total:
+        cache["available_schemas"] = list(candidates)
     if failure:
         cache.update({k: failure[k] for k in _FAILURE_KEYS if k in failure})
     elif keep_failure:
@@ -976,7 +1034,8 @@ __all__ = [
     "INDEX_LIMIT", "IndexResult", "IndexedObject", "OutsideObject", "REFLECT_BATCH", "RULES_MAX", "Reflected",
     "RefreshStats", "SCOPE_DEFAULT", "SCOPE_MAX", "SCOPE_OPTION", "SCOPE_REASONS", "ScopePlan", "ScopeRules", "Trail",
     "VIA_CATALOG", "VIA_LOOK", "VIA_SCHEMA_TOOL", "absent_reasons", "add_to_scope", "apply_scope",
-    "count_added_in_run", "fingerprint", "has_index", "index_schema", "index_sql", "list_objects", "live_objects",
+    "count_added_in_run", "fingerprint", "has_index", "index_schema", "index_sql", "legacy_seed", "list_objects",
+    "live_objects",
     "on_demand_keys", "on_demand_list", "outside_names", "outside_objects", "pinned_keys", "plan_for", "plan_scope",
     "rebuild_schema_cache", "reflect", "refresh_index", "rules_problem", "save_reflected", "search_index",
     "source_lock", "target_schema", "too_large_message", "trail_dict",
