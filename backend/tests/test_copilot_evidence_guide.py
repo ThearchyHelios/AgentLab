@@ -213,7 +213,8 @@ async def test_guessed_columns_are_sent_back_and_fixed_before_running(sales, mon
         async with client.stream("POST", "/api/copilot/generate-stream",
                                  json={"instruction": "上周销售额多少", "intent": "answer"}) as r:
             async for line in r.aiter_lines():
-                if line.startswith("data: "):
+                # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+                if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                     events.append(json.loads(line[6:]))
     checks = [e for e in events if e["op"] == "check"]
     assert [c["status"] for c in checks] == ["repairing", "passed"], checks

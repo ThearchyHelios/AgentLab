@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections import defaultdict
 from typing import Any
 
@@ -45,11 +44,14 @@ async def tool_usage(
                 merged.extend(agent.get("tools") or [])
             granted[node.id] = sorted(set(merged))
 
+    from app.engine.origin import counted_runs
+
+    # 只算计入统计的运行（engine/origin.counted_runs）：评测、口径对账、召回替人跑的运行用到了哪些工具不说明白名单该不该收
     run_ids = [
         rid
         for (rid,) in await session.execute(
             select(Run.id)
-            .where(Run.workflow_id == workflow_id)
+            .where(Run.workflow_id == workflow_id, counted_runs())
             .order_by(Run.created_at.desc())
             .limit(limit_runs)
         )
@@ -95,62 +97,39 @@ async def exploratory_clusters(
 ) -> dict[str, Any]:
     """探索性问题聚类：同一个问题被反复问，就该长成模板里的固定一节。
 
-    这就是模板生长的触发器。用本地 embedding 做贪心聚类，
-    出现 ≥3 次的簇标记为晋升候选。
+    这就是模板生长的触发器。取问题、聚类全站只有一份（app/chat/questions.py）：只取问题原文（不含 history），问数据一轮
+    一条（自动重来不多算），评测这类系统派生的运行、别人的个人应用刷新和个人蓝图试运行都不进。出现 ≥3 次的簇标记为晋升
+    候选。embedder 是聚类用的向量模型：本地哈希的语义能力弱，结果只是下限。
     """
-    from sqlalchemy import not_
-
     from app.api.deps import current_principal
-    from app.auth.access import hidden_runs
-    from app.memory.embeddings import cosine, embed_texts
+    from app.chat.questions import cluster_questions, embedder, recent_questions
 
-    rows = list(
-        await session.execute(
-            select(Run.id, Run.input, Run.workflow_name, Run.created_at)
-            # 别人的个人应用刷新、个人蓝图试运行只给拥有者（同运行列表），不进聚类
-            .where(Run.run_class != "formal", not_(hidden_runs(current_principal())))
-            .order_by(Run.created_at.desc())
-            .limit(limit)
-        )
-    )
-    items = []
-    for rid, input_payload, wf_name, created in rows:
-        text = json.dumps(input_payload or {}, ensure_ascii=False, sort_keys=True)
-        if len(text) <= 4:  # 空输入没有聚类意义
-            continue
-        items.append({"run_id": rid, "text": text, "workflow": wf_name,
-                      "at": created.isoformat() if created else None})
-    if not items:
-        return {"clusters": [], "considered": 0}
+    questions = await recent_questions(session, current_principal(), limit=limit)
+    if not questions:
+        return {"clusters": [], "considered": 0, "embedder": embedder()}
+    clusters = await cluster_questions(questions, threshold=threshold)
 
-    vectors = await embed_texts([i["text"] for i in items])
-    clusters: list[dict[str, Any]] = []
-    for i, item in enumerate(items):
-        placed = False
-        for cluster in clusters:
-            if cosine(vectors[i], vectors[cluster["seed"]]) >= threshold:
-                cluster["members"].append(item)
-                placed = True
-                break
-        if not placed:
-            clusters.append({"seed": i, "members": [item]})
+    def _at(value: Any) -> str | None:
+        return value.isoformat() if value else None
 
     out = [
         {
-            "count": len(c["members"]),
-            "representative": c["members"][0]["text"][:200],
-            "workflow": c["members"][0]["workflow"],
-            "run_ids": [m["run_id"] for m in c["members"]][:20],
-            "first_at": c["members"][-1]["at"],
-            "last_at": c["members"][0]["at"],
-            "promote_candidate": len(c["members"]) >= 3,
+            "count": c.count,
+            "representative": c.members[0].text[:200],
+            "workflow": c.members[0].workflow,
+            "run_ids": [m.run_id for m in c.members if m.run_id][:20],
+            "turn_ids": [m.turn_id for m in c.members if m.turn_id][:20],
+            "first_at": _at(c.members[-1].at),
+            "last_at": _at(c.members[0].at),
+            "promote_candidate": c.count >= 3,
         }
         for c in clusters
-        if len(c["members"]) >= 2
+        if c.count >= 2
     ]
     out.sort(key=lambda c: c["count"], reverse=True)
     return {
         "clusters": out,
-        "considered": len(items),
+        "considered": len(questions),
+        "embedder": embedder(),
         "hint": "被标记为可固化的问题反复出现，建议用「提取模板」把它固定为工作流中的一步",
     }

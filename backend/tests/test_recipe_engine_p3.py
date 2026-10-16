@@ -119,7 +119,9 @@ def test_problem_fix_table_follows_spec_3_1():
         "label_unparsed": "declare_total", "value_not_number": "declare_placeholder",
         "axis_extra_cells": "ignore_cells", "column_extra": "ignore_cells", "row_unclaimed": "ignore_cells",
         "outside_number": "ignore_cells", "hidden_rows": "declare_hidden", "hidden_cols": "declare_hidden",
-        "sheet_missing": "rename_sheet"}
+        "sheet_missing": "rename_sheet",
+        # 期 5：没配小计的列表里像小计的行
+        "subtotal_suspect": "declare_subtotals"}
     assert set(recipe_engine.PROBLEM_FIX.values()) <= set(FIX_KINDS)
     # edit_members 只来自静态校验；cell_unclaimed、rows_after_stop 没有修复按钮
     assert "edit_members" not in recipe_engine.PROBLEM_FIX.values()
@@ -367,9 +369,17 @@ def _column_extra():
     return sales_book(edit=edit), LIST
 
 
+def _subtotal_suspect():
+    def edit(ws):
+        ws.insert_rows(6)
+        ws["A6"], ws["D6"], ws["E6"] = "小计", N, N + 1
+    return sales_book(edit=edit), LIST
+
+
 @pytest.mark.parametrize("code", sorted(recipe_engine.PROBLEM_FIX))
 def test_fix_args_never_carry_cell_values(code):
-    book, recipe = _column_extra() if code == "column_extra" else _crosstab_cases()[code]
+    book, recipe = (_column_extra() if code == "column_extra" else _subtotal_suspect() if code == "subtotal_suspect"
+                    else _crosstab_cases()[code])
     ex = run(book, recipe)
     hits = [p for p in ex.problems if p.code == code and p.fix_args is not None]
     assert hits, f"{code}：{[(p.code, p.fix, p.message) for p in ex.problems]}"

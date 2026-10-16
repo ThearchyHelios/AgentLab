@@ -79,7 +79,7 @@ def test_accumulate_list_table_message_does_not_promise_future_versions():
     r["sheets"][0]["context"] = [{}]
     _rec, problems = validate_recipe(r)
     assert [p.code for p in problems] == ["accumulate_unkeyed"]
-    assert "列表形态的表目前只支持每期替换" in problems[0].message and "后续版本" not in problems[0].message
+    assert "没有指定每一行属于哪一期" in problems[0].message and "后续版本" not in problems[0].message
 
 
 # ==========================================================================

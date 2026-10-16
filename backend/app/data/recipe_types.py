@@ -300,11 +300,32 @@ class TotalRow(_M):
     keep_as: str | None = None
 
 
+class Subtotals(_M):
+    """穿插在明细中间的小计行：不作数据，按它所管的那一组明细逐列求和核对；keep_as 给了就另存一张表。"""
+
+    #: 小计标签所在的列（列名）
+    label_column: str
+    #: 小计行的标签以这个词开头（match_key 比较）。取自实际格子文字的候选词，不能含数字
+    pick: str = Field(min_length=1, max_length=12)
+    #: 一行小计管哪几行明细：since_previous 上一行小计（或表头）之后的全部明细；group_column 紧挨在它上面、
+    #: group_column 这一列取值相同的那几行明细
+    scope: Literal["since_previous", "group_column"] = "since_previous"
+    #: scope=group_column 时按哪一列分组（列名）；since_previous 时为 None
+    group_column: str | None = None
+    #: 原表的小计另存成哪张表（kind=reported_total）；None 只核对不另存
+    keep_as: str | None = None
+
+
 class ListRows(_M):
     #: 数据中间的空行：stop 到此为止（默认）；skip 跳过继续（回执记个数）
     blank_rows: Literal["stop", "skip"] = "stop"
     #: 合计行：到合计行为止，合计行按列求和核对
     total_row: TotalRow | None = None
+    #: 期 5：穿插在明细中间的小计行（Subtotals）。默认 None = 期 4 的行为（像小计的行照常是数据或起草失败）
+    subtotals: Subtotals | None = None
+    #: 期 5：人确认过这张列表没有小计行：以合计字样开头的行就是数据（「累计充值」这类键值清单），执行器不再报
+    #: subtotal_suspect，每期也就不用再勾那一项确认。和 subtotals 二选一（静态校验 subtotals_conflict）
+    no_subtotals: bool = False
 
 
 class ListValues(_M):
@@ -315,6 +336,18 @@ class ListValues(_M):
     #: 列表里的公式（金额 = 单价 × 数量）：accept_cached 按保存值（默认）；reject 拒收。
     #: 固定行为：工作簿设了打开时重算（fullCalcOnLoad）时，未经核对的公式格一律拒收
     formula: Literal["accept_cached", "reject"] = "accept_cached"
+
+
+class ListPeriod(_M):
+    """列表按期累积时，每一行属于哪一期，二选一：column 按表里的一个日期列，每行的日期都要落在本期的统计期内；
+    synthesize 每行加上本期统计期的起、止两列（明细里没有日期列，或者日期不代表它属于哪一期时）。"""
+
+    #: 按这个日期列（ListColumn.name，类型 DATE）核对；和 synthesize 二选一
+    column: str | None = None
+    #: 怎么核对：within_context 每行的日期都要落在本期统计期内（空着的也不行）
+    check: Literal["within_context"] = "within_context"
+    #: 加统计期起、止两列（LIST_PERIOD_START、LIST_PERIOD_END）；和 column 二选一
+    synthesize: Literal["统计期"] | None = None
 
 
 class ListBlock(_M):
@@ -333,6 +366,8 @@ class ListBlock(_M):
     merged_data: Literal["reject", "fill"] = "reject"
     #: 期 3：按表头忽略的列（IgnoreColumn），只针对这些列；其余多出的列照 extra_columns。默认空 = 期 2 的行为
     ignore_columns: list[IgnoreColumn] = Field(default_factory=list, max_length=50)
+    #: 期 5：按期累积时每一行属于哪一期（ListPeriod）。默认 None = 期 4 的行为（列表只能每期替换）
+    period: ListPeriod | None = None
 
 
 Block = Annotated[Union[CrosstabBlock, ListBlock], Field(discriminator="layout")]
@@ -441,9 +476,10 @@ class Problem:
     fix_args: dict[str, Any] | None = None
 
 
-#: 修复按钮的九种（P3-SPEC 3.2 ①–⑨）。Problem.fix、FixProposal.kind、确认项 fix:<目标键> 的 kind 都取自这里
+#: 修复按钮的种类（P3-SPEC 3.2 ①–⑨；期 5 加 declare_subtotals：列表中间像小计的行改作小计核对）。Problem.fix、
+#: FixProposal.kind、确认项 fix:<目标键> 的 kind 都取自这里
 FIX_KINDS = ("remove_label", "add_label", "edit_members", "rename_title", "declare_total", "ignore_cells",
-             "declare_placeholder", "declare_hidden", "rename_sheet")
+             "declare_placeholder", "declare_hidden", "rename_sheet", "declare_subtotals")
 
 
 @dataclass
@@ -462,13 +498,14 @@ CheckStatus = Literal["passed", "mismatch", "unverifiable", "info"]
 
 @dataclass
 class CheckResult:
-    #: 稳定 id：K1… 合计核对、G1… 公式引用、T1… 列表合计、R1… 关系（沿用配方里的 id）、C1 统计期、C2 文件名、
-    #: N1… 行数、P1… 主键；期 3 的并集整体核对 U1 行数、U2 主键、U3 统计期（物化时跑，都是结构类，P3-SPEC 2.7）。
+    #: 稳定 id：K1… 合计核对、G1… 公式引用、T1… 列表合计（期 5 起也含列表中间的小计）、R1… 关系（沿用配方里的
+    #: id）、C1 统计期、C2 文件名、N1… 行数、P1… 主键、D1… 列表的日期落在统计期内（期 5，ListPeriod.column）；
+    #: 期 3 的并集整体核对 U1 行数、U2 主键、U3 统计期（物化时跑，都是结构类，P3-SPEC 2.7）。
     #: F 编号留给系统发现的事实（Fact.id），两者不混用
     id: str
     kind: Literal["derived_sum", "formula_refs", "column_sum", "relation_sum_eq", "relation_not_comparable",
                   "context_agree", "filename_period", "row_count", "pk_unique",
-                  "union_rows", "union_pk", "union_period"]
+                  "union_rows", "union_pk", "union_period", "period_rows"]
     title: str
     status: CheckStatus
     #: 不通过时的类别：structure / data_quality / info
@@ -759,9 +796,10 @@ class SheetsOut:
 #: hidden_excluded = hidden.rows=exclude 排除的隐藏行；blank_skipped = 列表 blank_rows=skip 跳过的空行；
 #: ignored_rows = 交叉表 ignore_rows 忽略的行；ignored_outside = ignore_outside 忽略了区域外数字格的行；
 #: after_stop = 列表停止之后没导入的文字行；total_not_kept = 参与核对、但不另存的合计行（交叉表 keep_as 为空的
-#: derived 段、列表 total_row.keep_as 为空的合计行）
+#: derived 段、列表 total_row.keep_as 为空的合计行）；期 5：subtotal = 列表中间的小计行（参与核对、不进数据，
+#: 另存与否都记在这里：它们都不在本表里）
 ExcludedReason = Literal["hidden_excluded", "blank_skipped", "ignored_rows", "ignored_outside", "after_stop",
-                         "total_not_kept"]
+                         "total_not_kept", "subtotal"]
 
 
 @dataclass
@@ -1031,6 +1069,15 @@ def prose_problems(template: str, *, known: dict[str, set[str]] | None = None) -
 
 #: 列表合计行另存成表时，合计项列的固定列名
 LIST_TOTAL_DIM = "合计项"
+#: 期 5：列表的小计行另存成表时，小计项列的固定列名
+LIST_SUBTOTAL_DIM = "小计项"
+#: 期 5：列表按期累积、由系统给每行加统计期时（ListPeriod.synthesize）的两列：本期统计期的第一天、最后一天，
+#: 写法 YYYY-MM-DD（同 DATE 列，存 TEXT）
+LIST_PERIOD_START = "统计期起"
+LIST_PERIOD_END = "统计期止"
+#: 期 5：小计核对的键（核对编号 T、合计格 DerivedItem.segment）= 块 id 加这个后缀。块 id 在整份配方内唯一，
+#: 同一块的合计行用块 id 本身，两者不相混
+SUBTOTAL_KEY = "·小计"
 _SQL_TYPE = {"INTEGER": "INTEGER", "REAL": "REAL", "TEXT": "TEXT", "DATE": "TEXT"}
 
 
@@ -1107,14 +1154,40 @@ def derive_tables(recipe: Recipe) -> tuple[dict[str, list[ColumnOut]], list[Reci
                 cols = [ColumnOut(c.name, _SQL_TYPE[c.type], header=c.header,
                                   role="measure" if c.type in ("INTEGER", "REAL") else "text")
                         for c in block.columns]
+                if block.period is not None and block.period.synthesize:
+                    # 期 5：每行加上本期统计期的起止（role=period：没有格子来历，取值来自统计期）
+                    cols += [ColumnOut(LIST_PERIOD_START, "TEXT", role="period"),
+                             ColumnOut(LIST_PERIOD_END, "TEXT", role="period")]
                 put(block.table, cols, base)
                 total = block.rows.total_row
+                numeric = [c for c in cols if c.type in ("INTEGER", "REAL")]
                 if total is not None and total.keep_as:
                     tcols = [ColumnOut(LIST_TOTAL_DIM, "TEXT", role="dim")]
-                    tcols += [ColumnOut(c.name, c.type, header=c.header, role="value")
-                              for c in cols if c.type in ("INTEGER", "REAL")]
+                    tcols += [ColumnOut(c.name, c.type, header=c.header, role="value") for c in numeric]
                     put(total.keep_as, tcols, f"{base}/rows/total_row")
+                sub = block.rows.subtotals
+                if sub is not None and sub.keep_as:
+                    # 期 5：小计另存：小计项（标签的规范写法）、按组小计时的分组列、各数字列
+                    scols = [ColumnOut(LIST_SUBTOTAL_DIM, "TEXT", role="dim")]
+                    if sub.scope == "group_column" and sub.group_column:
+                        scols.append(ColumnOut(sub.group_column, "TEXT", role="dim"))
+                    scols += [ColumnOut(c.name, c.type, header=c.header, role="value") for c in numeric]
+                    put(sub.keep_as, scols, f"{base}/rows/subtotals")
     return out, problems
+
+
+def list_period_columns(recipe: Recipe) -> dict[str, tuple[str, ...]]:
+    """期 5：列表写入的表 → 它按什么分期：("column", 日期列) 或 ("synthesize", 统计期起列, 统计期止列)。只列配了
+    ListBlock.period 的列表；累积计划的 U3、单期的 D 核对、说明里「按哪一列筛选」共用这一份。"""
+    out: dict[str, tuple[str, ...]] = {}
+    for sheet in recipe.sheets:
+        for block in sheet.blocks:
+            if isinstance(block, ListBlock) and block.period is not None:
+                if block.period.synthesize:
+                    out.setdefault(block.table, ("synthesize", LIST_PERIOD_START, LIST_PERIOD_END))
+                elif block.period.column:
+                    out.setdefault(block.table, ("column", block.period.column))
+    return out
 
 
 # ==========================================================================
@@ -1130,10 +1203,13 @@ def accumulate_blockers(recipe: Recipe) -> list[RecipeProblem]:
     1. 至少一个工作表配置了统计期上下文（SheetRecipe.context 非空），否则报 accumulate_needs_period（path=/mode）；
     2. derive_tables 推出的每张表都「按统计期分得开」，否则逐表报 accumulate_unkeyed（path=/tables/{ti}，表没在
        tables 里声明时指向第一个写入它的块），消息写明哪一条不满足：
-       - 只由交叉表块写入（measures、dimension 段，或者 derived 段的 keep_as）——列表写入的表一律不满足；
-       - 写入它的每个交叉表块，axis.checks 都含 covers_context（日期恰好落在统计期内）；
-       - 这张表的 grain 含那个块的 axis.name。
-    两条都成立时，各期的日期集合互不相交（统计期不重叠由累积计划保证），主键里不需要另加统计期列。
+       - 交叉表写入的（measures、dimension 段，或者 derived 段的 keep_as）：写入它的每个交叉表块，axis.checks 都含
+         covers_context（日期恰好落在统计期内），并且这张表的 grain 含那个块的 axis.name；
+       - 期 5：列表写入的明细表：写入它的每个列表块都配了 period（按日期列核对，或加统计期起止两列），并且所在的
+         工作表配了统计期。列表的合计行、小计行另存的表不能累积：各期的合计项、小计项相同，主键分不开各期；
+       - 同一张表不能既由交叉表又由列表写入。
+    都成立时，各期的行按统计期分得开（统计期不重叠由累积计划保证；列表明细跨期重复的同一条记录由并集的主键核对
+    U2 拒收）。
     """
     problems: list[RecipeProblem] = []
     if not any(sheet.context for sheet in recipe.sheets):
@@ -1143,6 +1219,11 @@ def accumulate_blockers(recipe: Recipe) -> list[RecipeProblem]:
     # 表名 → 写入它的块（去重，按配方顺序）和第一个块的路径
     writers: dict[str, list[CrosstabBlock | ListBlock]] = {}
     first_path: dict[str, str] = {}
+
+    #: 列表的合计行、小计行另存的表 → 写入它的块
+    totals: dict[str, list[ListBlock]] = {}
+    #: 列表块 → 所在工作表有没有配统计期
+    ctx_of: dict[int, bool] = {}
 
     def _add(table: str, block: CrosstabBlock | ListBlock, path: str) -> None:
         got = writers.setdefault(table, [])
@@ -1161,16 +1242,32 @@ def accumulate_blockers(recipe: Recipe) -> list[RecipeProblem]:
                         _add(seg.keep_as.table, block, path)
             else:
                 _add(block.table, block, path)
-                total = block.rows.total_row
-                if total is not None and total.keep_as:
-                    _add(total.keep_as, block, path)
+                ctx_of[id(block)] = bool(sheet.context)
+                for kept in (block.rows.total_row.keep_as if block.rows.total_row else None,
+                             block.rows.subtotals.keep_as if block.rows.subtotals else None):
+                    if kept:
+                        _add(kept, block, path)
+                        totals.setdefault(kept, []).append(block)
 
     index = {t.name: ti for ti, t in enumerate(recipe.tables)}
     grains = {t.name: list(t.grain) for t in recipe.tables}
     for name in tables:
         blocks = writers.get(name, [])
-        if any(isinstance(b, ListBlock) for b in blocks):
-            reasons = ["列表形态的表目前只支持每期替换"]
+        lists = [b for b in blocks if isinstance(b, ListBlock)]
+        if lists and len(lists) != len(blocks):
+            reasons = ["同一张表既由交叉表又由列表写入，各期的行分不开"]
+        elif name in totals:
+            reasons = ["列表的合计行、小计行另存的表不能按期累积：各期的合计项、小计项相同，主键分不开各期"
+                       "（可以改为只核对、不另存）"]
+        elif lists:
+            reasons = []
+            unbound = [b.id for b in lists if b.period is None]
+            if unbound:
+                reasons.append("、".join(f"列表「{x}」" for x in unbound)
+                               + "没有指定每一行属于哪一期（按日期列核对，或加统计期起止两列）")
+            no_ctx = [b.id for b in lists if b.period is not None and not ctx_of.get(id(b))]
+            if no_ctx:
+                reasons.append("、".join(f"列表「{x}」" for x in no_ctx) + "所在的工作表没有配置统计期")
         else:
             reasons = []
             uncovered = [b.id for b in blocks if isinstance(b, CrosstabBlock) and "covers_context" not in b.axis.checks]

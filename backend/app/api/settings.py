@@ -10,7 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
-from app.api.coded import CodedHTTPException
+from app.api.coded import PUBLIC_URL_ENV_LOCKED, CodedHTTPException
+from app.core import public_url
 from app.core.errors import explain, not_configured, raw
 from app.core.config import settings as app_settings
 from app.core.crypto import encrypt, mask
@@ -604,35 +605,32 @@ def catalog_draft_values(stored: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# 通知：定时任务推送 Webhook 时拼运行链接用的对外访问地址
+# 对外访问地址：通知、Webhook 里的链接，单点登录的回调，来源核对（core/public_url.py）
 # --------------------------------------------------------------------------
 
 #: 设置里 notify 这一组。public_base_url 是别人打开 AgentLab 用的地址（https://agentlab.example.com），通知里的
-#: 运行链接 = 它 + /runs/{运行 id}。服务端不知道自己在反向代理后面叫什么，只能由人填；留空的通知里不附链接
-NOTIFY_GROUP = "notify"
-NOTIFY_DEFAULTS: dict[str, Any] = {"public_base_url": None}
-NOTIFY_SETTING_LABEL = {"public_base_url": "对外访问地址"}
+#: 运行链接 = 它 + /runs/{运行 id}。服务端不知道自己在反向代理后面叫什么，只能由人填；留空的通知里不附链接。
+#: 全站只认一个对外地址（core/public_url.py）：环境变量 AGENTLAB_PUBLIC_URL 设了的话这一项不生效、不能改（PUT 回 409）。
+#: 键名沿用 notify 一组，界面上在「设置 → 通用」
+NOTIFY_GROUP = public_url.SETTING_GROUP
+NOTIFY_DEFAULTS: dict[str, Any] = {public_url.SETTING_KEY: None}
+NOTIFY_SETTING_LABEL = {public_url.SETTING_KEY: "对外访问地址"}
+#: GET /api/settings 另给的只读一组：{value: 生效的对外访问地址, env_locked: 是不是环境变量指定的}。设置页据此显示
+#: 「由环境变量指定」；PUT 带上它也不落库（同 limits）
+PUBLIC_URL_GROUP = "public_url"
 
 
 def _base_url_problem(value: Any) -> str | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
-    label = NOTIFY_SETTING_LABEL["public_base_url"]
+    label = NOTIFY_SETTING_LABEL[public_url.SETTING_KEY]
     hint = (f"「{label}」需要是 http:// 或 https:// 开头的完整地址（例如 https://agentlab.example.com），"
-            f"留空表示通知里不附运行链接，当前为「{value}」")
+            f"留空表示通知里不附链接，当前为「{value}」")
     if not isinstance(value, str):
         return hint
-    from urllib.parse import urlsplit
-
-    try:
-        parts = urlsplit(value.strip())
-    except ValueError:
-        return hint
-    if parts.scheme not in ("http", "https") or not parts.hostname or " " in value.strip():
-        return hint
-    if parts.query or parts.fragment:
-        return f"「{label}」不能带 ? 或 # 之后的部分，运行链接会接在地址后面，当前为「{value}」"
-    return None
+    if (problem := public_url.url_problem(value)) == "suffix":
+        return f"「{label}」不能带 ? 或 # 之后的部分，链接会接在地址后面，当前为「{value}」"
+    return hint if problem else None
 
 
 def notify_problem(value: Any) -> str | None:
@@ -651,16 +649,21 @@ def notify_problem(value: Any) -> str | None:
 def notify_values(stored: Any) -> dict[str, Any]:
     """库里存的（或刚写进来的）notify 一组 → 补齐默认、规范化：去掉首尾空白和末尾的 /，空串当没填；存坏了的按没填。"""
     stored = stored if isinstance(stored, dict) else {}
-    url = stored.get("public_base_url")
-    if not isinstance(url, str) or not url.strip() or _base_url_problem(url):
-        return {"public_base_url": None}
-    return {"public_base_url": url.strip().rstrip("/")}
+    return {public_url.SETTING_KEY: public_url.normalize(stored.get(public_url.SETTING_KEY))}
 
 
 async def notify_settings(session: AsyncSession) -> dict[str, Any]:
-    """设置里的 notify 一组，没存过的补默认。定时任务推送 Webhook 时从这里读。"""
+    """设置里存的 notify 一组，没存过的补默认。要拼链接的地方不读它：一律经 core/public_url（环境变量优先）。"""
     row = await session.get(Setting, NOTIFY_GROUP)
     return notify_values(row.value if row else None)
+
+
+def public_url_values(stored_notify: Any) -> dict[str, Any]:
+    """GET /api/settings 里只读的 public_url 一组：生效的那个地址（环境变量优先，其次库里存的这一项），是不是环境变量
+    指定的。按库里存的算，不读进程缓存：设置页看到的就是落库的样子。"""
+    locked = public_url.env_locked()
+    value = public_url.env_url() if locked else notify_values(stored_notify)[public_url.SETTING_KEY]
+    return {"value": value, "env_locked": locked}
 
 
 # --------------------------------------------------------------------------
@@ -754,7 +757,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     JUDGE_GROUP: dict(JUDGE_DEFAULTS),
     # 核查（双盲复算、反方审稿、审批质询）：核查模型、三项的开关和上限、每日金额上限。和裁判一组一样由用户定
     VERIFY_GROUP: verify_values(None),
-    # 通知：定时任务的 Webhook 里拼运行链接用的对外访问地址
+    # 对外访问地址（存在 notify 一组）：通知、Webhook 里的链接，单点登录的回调，来源核对。环境变量优先（core/public_url.py）
     NOTIFY_GROUP: notify_values(None),
     # 起草模型：数据目录起草、按配方导入的 AI 起草用的模型，留空沿用助手的模型
     CATALOG_DRAFT_GROUP: catalog_draft_values(None),
@@ -808,6 +811,7 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     # limits 是服务端配置（环境变量），只读：库里可能存着旧版设置页写进去的一份
     #（见过 max_agent_steps: 25），它从来不生效，却会盖住真实的上限，界面照着错的数许诺
     stored.pop("limits", None)
+    stored.pop(PUBLIC_URL_GROUP, None)
     # 裁判、核查的每日计数是引擎记的账，不是用户设置：设置页整组回写时带着一份旧的，会把今天的花费清零
     stored.pop(JUDGE_SPEND, None)
     stored.pop(VERIFY_SPEND, None)
@@ -818,6 +822,7 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     merged[JUDGE_GROUP] = judge_values(stored.get(JUDGE_GROUP))
     merged[VERIFY_GROUP] = verify_values(stored.get(VERIFY_GROUP))
     merged[NOTIFY_GROUP] = notify_values(stored.get(NOTIFY_GROUP))
+    merged[PUBLIC_URL_GROUP] = public_url_values(stored.get(NOTIFY_GROUP))
     merged[CATALOG_DRAFT_GROUP] = catalog_draft_values(stored.get(CATALOG_DRAFT_GROUP))
     merged[APPS_GROUP] = apps_values(stored.get(APPS_GROUP))
     for key, value in stored.items():
@@ -910,6 +915,11 @@ async def put_settings(
             raise HTTPException(422, problem)
         # 存规范化之后的：末尾带 / 的地址拼链接会多出一个斜杠
         payload.values[NOTIFY_GROUP] = notify_values(payload.values[NOTIFY_GROUP])
+        if public_url.env_locked() and payload.values[NOTIFY_GROUP] != await notify_settings(session):
+            # 环境变量指定了对外访问地址：改这一项不会生效，照实拒绝，不悄悄存一个用不上的值。原样写回（整组回写）不算改
+            raise CodedHTTPException(
+                409, f"对外访问地址由环境变量 {public_url.ENV_NAME} 指定（{public_url.env_url()}），不能在设置里修改。"
+                     "要改请改部署配置后重启服务", PUBLIC_URL_ENV_LOCKED, field=f"{NOTIFY_GROUP}.{public_url.SETTING_KEY}")
     if APPS_GROUP in payload.values:
         if problem := apps_problem(payload.values[APPS_GROUP]):
             raise HTTPException(422, problem)
@@ -917,9 +927,9 @@ async def put_settings(
     if found := await _provider_problem(session, payload.values):
         raise CodedHTTPException(422, found[1], PROVIDER_INVALID, field=found[0])
     for key, value in payload.values.items():
-        if key in (TRUST_KEY, "limits", JUDGE_SPEND, VERIFY_SPEND, *_hidden_groups()):
+        if key in (TRUST_KEY, "limits", PUBLIC_URL_GROUP, JUDGE_SPEND, VERIFY_SPEND, *_hidden_groups()):
             # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，
-            # 会把刚在工具页改的档位冲掉。limits 是环境变量定的，写进库也不生效。
+            # 会把刚在工具页改的档位冲掉。limits 是环境变量定的、public_url 是算出来的，写进库也不生效。
             # 裁判、核查的每日计数是引擎记的账，只有引擎自己写。登录设置只经 /api/auth/settings 改（_hidden_groups）
             continue
         row = await session.get(Setting, key)
@@ -928,6 +938,9 @@ async def put_settings(
         else:
             session.add(Setting(key=key, value=value))
     await session.commit()
+    if NOTIFY_GROUP in payload.values:
+        # 中间件、单点登录的回调按进程缓存取对外访问地址：写完库就刷新，不用重启
+        public_url.remember(payload.values[NOTIFY_GROUP][public_url.SETTING_KEY])
     return await get_settings(session)
 
 

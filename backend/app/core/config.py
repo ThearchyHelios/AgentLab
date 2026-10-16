@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_DIR = BACKEND_DIR.parent
+
+#: 嵌入白名单里一项的主机部分：域名（可以 *. 开头）或方括号里的 IPv6，可以带端口；不许路径、查询、用户名
+_ORIGIN_HOST = re.compile(r"(?:\*\.)?(?:[A-Za-z0-9-]+\.)*[A-Za-z0-9-]+(?::\d{1,5})?|\[[0-9A-Fa-f:.]+\](?::\d{1,5})?")
 
 # session_id 拼进路径前必须过这一关。允许的字符刻意收得很窄：字母数字加
 # 连字符下划线——点号也不放行，免得出现 ".." 这种能往上走的名字。
@@ -60,9 +64,17 @@ class Settings(BaseSettings):
     auth_session_max_days: int = 7
     # 会话 cookie 带不带 Secure。不设时按请求本身是不是 https 定：本机 http 开发照常能登录
     auth_cookie_secure: bool | None = None
-    # 对外的访问地址（反向代理后面时填，如 https://agentlab.example.com）。OIDC 的回调地址按它拼；
-    # 不设时按请求的 Host 拼
+    # 对外的访问地址（反向代理后面时填，如 https://agentlab.example.com）。全站只认一个（core/public_url.py）：
+    # 设了它，设置里的「对外访问地址」就不生效、不能改；通知和 Webhook 的链接、OIDC 的回调、来源核对都按它拼。
+    # 不设时用设置里的那一项，再没有就按请求的 Host 拼（通知里不附链接）
     public_url: str = ""
+
+    # --- 安全响应头（app/web_security.py）---
+    # 允许哪些站点用 iframe 嵌整站（同站的门户，如 https://portal.example.com），逗号分隔。本站自己总是允许的。
+    # 不设时只有本站能嵌（frame-ancestors 'self'，另加 X-Frame-Options: SAMEORIGIN）
+    frame_ancestors: Annotated[list[str], NoDecode] = []
+    # 分享页（/s）允许被哪些站点嵌，逗号分隔，写法同上。分享页只认这一项，不认上面那一项
+    embed_origins: Annotated[list[str], NoDecode] = []
 
     # --- 沙箱 ---
     sandbox_backend: str = "auto"  # auto | microvm | seatbelt | bubblewrap | local | off
@@ -121,7 +133,8 @@ class Settings(BaseSettings):
         "https://223.5.5.5/resolve",
     ]
 
-    @field_validator("http_tool_allowlist", "http_tool_fake_ip_ranges", "http_tool_doh_urls", mode="before")
+    @field_validator("http_tool_allowlist", "http_tool_fake_ip_ranges", "http_tool_doh_urls", "frame_ancestors",
+                     "embed_origins", mode="before")
     @classmethod
     def _comma_list(cls, value: object) -> object:
         # 环境变量里写逗号分隔；也兼容 JSON 数组的写法
@@ -133,6 +146,37 @@ class Settings(BaseSettings):
                 return json.loads(text)
             return [part.strip() for part in text.split(",") if part.strip()]
         return value
+
+    @field_validator("public_url")
+    @classmethod
+    def _valid_public_url(cls, value: str) -> str:
+        # 写错了启动时就报出来：以前拼出 agentlab.example.com/api/auth/oidc/callback 这样的回调，到登录时才发现
+        from app.core.public_url import ENV_NAME, normalize, url_problem
+
+        if not value.strip():
+            return ""
+        if problem := url_problem(value):
+            what = "不能带 ? 或 # 之后的部分" if problem == "suffix" else "需要是 http:// 或 https:// 开头的完整地址"
+            raise ValueError(f"{ENV_NAME}={value!r} {what}，例如 https://agentlab.example.com")
+        return normalize(value) or ""
+
+    @field_validator("frame_ancestors", "embed_origins")
+    @classmethod
+    def _valid_origins(cls, value: list[str], info: Any) -> list[str]:
+        # 只收「协议://主机[:端口]」，主机可以写 *.example.com。路径、裸 *、没写协议的写错了启动时就报出来，别到嵌入
+        # 失败（或者整站被谁都能嵌）才发现。'self' 本来就有，写了也不重复
+        name = f"AGENTLAB_{(info.field_name or '').upper()}"
+        out: list[str] = []
+        for raw in value:
+            item = raw.strip().rstrip("/")
+            if item == "'self'":
+                continue
+            scheme, _, host = item.partition("://")
+            if scheme.lower() not in ("http", "https") or not _ORIGIN_HOST.fullmatch(host):
+                raise ValueError(f"{name} 里的「{raw}」需要写成「协议://主机」（可以带端口），例如 https://portal.example.com")
+            if (origin := f"{scheme.lower()}://{host.lower()}") not in out:
+                out.append(origin)
+        return out
 
     @field_validator("auth_cookie_secure", mode="before")
     @classmethod

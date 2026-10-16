@@ -25,6 +25,7 @@ import { localActor, setLocalActor } from '../lib/actor'
 import {
   AGENT_GUARD_TEXT, APP_SETTING_TEXT, DRAFT_MODEL_SETTING_TEXT, IDENTITY_TEXT, JUDGE_SETTING_TEXT, NOTIFY_TEXT, PROVIDER_REF_TEXT,
   SETTINGS_ROLE_TEXT, TOOL_GATE_TEXT, VERIFY_SETTING_TEXT, judgeByModelText, judgeUnlimitedText,
+  GENERAL_SETTING_TEXT,
 } from '../lib/terms'
 import { atLeast, loginOn, prefsLocalOnly, usePrincipal } from '../store/auth'
 import type { ThemePref } from '../lib/theme'
@@ -32,6 +33,7 @@ import {
   ProviderOptions, VerifySection, verifyChanged, verifyDraftOf, verifyErrors, verifyLabels, verifyPayload, type VerifyDraft,
 } from './VerifySettings'
 import { DraftModelSection } from './DraftModelSettings'
+import { GeneralTab } from './settings/GeneralTab'
 import { IdentityTab } from './settings/IdentityTab'
 import { NotifyTab } from './settings/NotifyTab'
 import { AuditTab } from './settings/AuditTab'
@@ -41,6 +43,8 @@ import { AuditTab } from './settings/AuditTab'
 const TABS = [
   { key: 'providers', label: '模型接入' },
   { key: 'prefs', label: '偏好设置' },
+  // 全站共用的部署设置：对外访问地址（环境变量指定时只读）
+  { key: 'general', label: GENERAL_SETTING_TEXT.tab },
   { key: 'system', label: '运行环境' },
   // 应用平台（A7）：登录方式和人、通知渠道、管理类操作的留痕
   { key: 'identity', label: IDENTITY_TEXT.tab },
@@ -74,12 +78,13 @@ export function SettingsPage() {
   return (
     <div className="flex h-full flex-col">
       <PageHeader icon={<SettingsIcon size={13} />} title="设置"
-                  subtitle={builder ? '模型接入、偏好、运行环境、身份和通知' : SETTINGS_ROLE_TEXT.subtitleUser} />
+                  subtitle={builder ? '模型接入、偏好、对外访问地址、运行环境、身份和通知' : SETTINGS_ROLE_TEXT.subtitleUser} />
       <Tabs tabs={tabs} active={tab} onChange={change} label="设置" idPrefix="settings" />
       <TabPanel idPrefix="settings" tabKey={tab} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-4xl p-4">
           {tab === 'providers' && <ProvidersTab />}
           {tab === 'prefs' && (builder ? <PrefsTab /> : <PersonalPrefs />)}
+          {tab === 'general' && <GeneralTab />}
           {tab === 'system' && <SystemTab />}
           {tab === 'identity' && <IdentityTab />}
           {tab === 'notify' && <NotifyTab />}

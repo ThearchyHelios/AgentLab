@@ -30,6 +30,7 @@ from app.data.recipe_parsers import hour_range, hour_range_total, match_key, tex
 from app.data.recipe_types import (
     UNION_VER, AccumulatePlan, ChangeClass, CheckResult, ColumnOut, CrosstabBlock, DerivedSegment,
     DimensionSegment, PartInfo, Recipe, UnionPart, UnionReport, accumulate_blockers, derive_tables,
+    list_period_columns,
 )
 from app.data.table_versions import settle_journal, sha_json
 
@@ -508,14 +509,19 @@ def union_options(parts: list[tuple[str, str, str]], target_recipe_sha: str, *,
 
 
 class _Table:
-    """并集里的一张表：列（目标配方的在前、退役的按给定顺序追加在后）、主键、日期轴列。"""
+    """并集里的一张表：列（目标配方的在前、退役的按给定顺序追加在后）、主键、日期轴列。期 5：列表写入的表按 period
+    分期（list_period_columns）：按日期列的，U3 核对那一列落在该期统计期内；加统计期起止两列的，核对两列就是该期。"""
 
-    def __init__(self, name: str, cols: list[ColumnOut], grain: list[str]) -> None:
+    def __init__(self, name: str, cols: list[ColumnOut], grain: list[str],
+                 period: tuple[str, ...] | None = None) -> None:
         self.name = name
         self.cols = cols
         self.grain = grain
         self.axis = next((c.name for c in cols if c.role == "axis"), None)
         self.names = [c.name for c in cols]
+        self.period = period if period is None or all(c in self.names for c in period[1:]) else None
+        if self.axis is None and self.period is not None and self.period[0] == "column":
+            self.axis = self.period[1]
 
 
 def _copy_col(col: ColumnOut) -> ColumnOut:
@@ -551,6 +557,7 @@ def _layout(target: Recipe, parts: list[UnionPart],
 
     out: dict[str, _Table] = {}
     retired = retired or {}
+    periods = list_period_columns(target)
     for name, cols in tables.items():
         mine = [_copy_col(c) for c in cols]
         known = {c.name for c in mine}
@@ -561,7 +568,7 @@ def _layout(target: Recipe, parts: list[UnionPart],
             mine.append(_copy_col(found) if found is not None else _copy_col(col))
             known.add(col.name)
         spec = specs.get(name)
-        out[name] = _Table(name, mine, list(spec.grain) if spec is not None else [])
+        out[name] = _Table(name, mine, list(spec.grain) if spec is not None else [], periods.get(name))
     for name, cols in retired.items():
         if name in out:
             continue
@@ -831,20 +838,36 @@ def _finish(conn: sqlite3.Connection, layout: dict[str, _Table], parts: list[Uni
             u2.append(f"表「{table.name}」有 {dup} 组主键重复")
     checks.append(_check("U2", "union_pk", "累积后主键不重复", checked=len(keyed), failed=u2, sql=sql2))
 
-    # U3 统计期：第 k 期的 rowid 区间里，日期都在 [start_k, end_k] 之内
+    # U3 统计期：第 k 期的 rowid 区间里，日期都在 [start_k, end_k] 之内。期 5：按日期列分期的列表，日期为空也算不在；
+    # 加统计期起止两列的列表，两列必须正好是这一期
     u3: list[str] = []
     sql3, params3, checked3 = None, [], 0
     for k, (part, ranges) in enumerate(zip(parts, part_rows), 1):
         for name, span in ranges.items():
-            axis = layout[name].axis
-            if axis is None or axis not in part_cols[k - 1].get(name, []):
-                continue
+            table = layout[name]
+            have = part_cols[k - 1].get(name, [])
             a, b = span["union"]
+            if table.period is not None and table.period[0] == "synthesize":
+                start_col, end_col = table.period[1], table.period[2]
+                if start_col not in have or end_col not in have or b < a:
+                    continue
+                checked3 += 1
+                sql3 = (f"SELECT COUNT(*) FROM {_q(name)} WHERE rowid BETWEEN ? AND ? "
+                        f"AND ({_q(start_col)} IS NOT ? OR {_q(end_col)} IS NOT ?)")
+                params3 = [a, b, part.start, part.end]
+                bad = conn.execute(sql3, params3).fetchone()[0]
+                if bad:
+                    u3.append(f"第 {k} 期（{_period_text(part.start, part.end)}）的「{name}」有 {bad} 行的统计期不是这一期")
+                continue
+            axis = table.axis
+            if axis is None or axis not in have:
+                continue
             if b < a:
                 continue
             checked3 += 1
+            nulls = f"{_q(axis)} IS NULL OR " if table.period is not None else ""
             sql3 = (f"SELECT COUNT(*) FROM {_q(name)} WHERE rowid BETWEEN ? AND ? "
-                    f"AND ({_q(axis)} < ? OR {_q(axis)} > ?)")
+                    f"AND ({nulls}{_q(axis)} < ? OR {_q(axis)} > ?)")
             params3 = [a, b, part.start, part.end]
             bad = conn.execute(sql3, params3).fetchone()[0]
             if bad:

@@ -24,13 +24,19 @@ VIEW = "latest"
 INSTANCE_VIEW = "inst"
 ENTRY = "start"
 RECONCILER = "reconciler"
+#: 派生不了时的机器码：工作流、版本不存在（404）
+WORKFLOW_GONE = "workflow_not_found"
+VERSION_GONE = "workflow_version_not_found"
 
 
 class DeriveRefused(Exception):
-    def __init__(self, status_code: int, message: str) -> None:
+    """派生不了。code 是给程序认的机器码，接口照它回。"""
+
+    def __init__(self, status_code: int, message: str, code: str) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+        self.code = code
 
 
 def _safe(text: str) -> str:
@@ -45,10 +51,10 @@ async def derive_app(session: AsyncSession, workflow_id: str, version: int, *, n
 
     workflow = await session.get(Workflow, workflow_id)
     if workflow is None:
-        raise DeriveRefused(404, "工作流不存在，可能已被删除")
+        raise DeriveRefused(404, "工作流不存在，可能已被删除", WORKFLOW_GONE)
     row = await version_row(session, workflow_id, version)
     if row is None:
-        raise DeriveRefused(404, f"「{workflow.name}」不存在 v{version} 版本")
+        raise DeriveRefused(404, f"「{workflow.name}」不存在 v{version} 版本", VERSION_GONE)
     state = PinState(alias=PIN, pin={"workflow_id": workflow_id, "version": version}, workflow=workflow, row=row)
     schedule = (await session.execute(select(Schedule).where(
         Schedule.workflow_id == workflow_id, Schedule.run_class == "formal", Schedule.enabled.is_(True))

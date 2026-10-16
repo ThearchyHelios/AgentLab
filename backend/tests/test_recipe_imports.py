@@ -260,7 +260,7 @@ def fake_pipeline(state: FakeState) -> Pipeline:
 
     return Pipeline(
         validate=validate, recipe_sha256=recipe.recipe_sha256, canonical=recipe.canonical_recipe,
-        apply_patch=recipe.apply_patch, scan=lambda raw: fake_scan(raw, state),
+        apply_patch=recipe.apply_patch, scan=lambda raw, _filename: fake_scan(raw, state),
         scan_to_json=xlsx_scan.scan_to_json, scan_from_json=xlsx_scan.scan_from_json, read_grid=fake_grid,
         preview=xlsx_cells.preview, execute=execute, run_checks=run_checks, column_null_counts=null_counts,
         build_notes=build_notes, apply_notes=recipe_notes.apply_notes, detect_facts=detect_facts, draft=draft,

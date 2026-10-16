@@ -943,6 +943,7 @@ export interface PriorAcceptance {
 /** 排除的行的原因（契约 ExcludedRows.reason） */
 export type ExcludedReason =
   | 'hidden_excluded' | 'blank_skipped' | 'ignored_rows' | 'ignored_outside' | 'after_stop' | 'total_not_kept'
+  | 'subtotal'
   | (string & {})
 
 /** 回执里的「排除的行」（契约 ExcludedRows）。按表头忽略的列不在这里（记在回执的 ignored_columns） */
@@ -1260,6 +1261,8 @@ export interface ImportRecord {
   period_start: string | null
   period_end: string | null
   signed_by: string | null
+  /** 署名是不是认证过的身份：按这一期导入清单里记下的（05-已知遗留 (c)），旧清单记的是 false。老后端不给 */
+  signed_by_verified?: boolean
   /** 接受的条数 */
   overrides: number
   waivers: number
@@ -1582,10 +1585,10 @@ export interface Conversation {
   /** 列表里的副标题，让人一眼认出是哪次聊天 */
   last_question: string
   /**
-   * 最后一轮停在哪。左栏对这次没打开过的会话也能标出运行中、待审批、失败。
-   * 没有轮次时为 null；老后端不给
+   * 最后一轮停在哪。左栏对这次没打开过的会话也能标出运行中、待审批、失败、被驳回（rejected：运行被审批人驳回结束，
+   * 服务端 cancelled + end_reason=rejected）。没有轮次时为 null；老后端不给
    */
-  last_status?: 'running' | 'waiting' | 'error' | 'cancelled' | 'suspended' | 'done' | null
+  last_status?: 'running' | 'waiting' | 'error' | 'cancelled' | 'rejected' | 'suspended' | 'done' | null
   /** 最后一轮的运行。建图阶段就断了的没有 */
   last_run_id?: string | null
 }
@@ -1699,6 +1702,17 @@ export interface ReviewResult {
   retry: boolean
   severity: 'broken' | 'degraded' | ''
   signals: ReviewSignal[]
+  /**
+   * 要不要带着原图重来一次、重来时交给助手的话（服务端 backend/app/chat/turn.py 按这一轮试过几次判）：要就是那句话，不要
+   * 是 null。老服务端没有这个字段，问数据页照原来的规则自己判
+   */
+  retry_instruction?: string | null
+  /** 复核这一次的用量（服务端 providers/usage.py 的汇总，没调模型时全 0）：这一轮的花费 = 助手 + 运行 + 复核 */
+  usage?: {
+    cost_usd?: number | null; unpriced_calls?: number; calls?: number; input_tokens?: number; output_tokens?: number
+    by_model?: Record<string, { input_tokens: number; output_tokens: number; calls: number; cost_usd: number
+      unpriced_calls: number }>
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -3528,7 +3542,8 @@ export interface CatalogProfileTaskDetail extends CatalogProfileTaskRow {
   findings: CatalogProfileFinding[]
   skipped: CatalogProfileSkip[]
   /** 日期类列的取值范围 */
-  date_ranges: { column: string; min: string; max: string }[]
+  /** invalid：零日期、占位日期这类不计入最小值和最大值的个数（没有时不给） */
+  date_ranges: { column: string; min: string; max: string; invalid?: number }[]
   query_log: CatalogProfileQuery[]
 }
 
@@ -4470,4 +4485,14 @@ export interface DataSourceName {
   description?: string
   kind?: string
   enabled?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// 驳回 ≠ 失败（docs/design/next-round/05-已知遗留.md (a)，总方案 X9）
+
+/** 运行为什么结束在 cancelled（服务端 Run.end_reason）：rejected 人工驳回，stopped 手动停止。其余终态、老运行为空 */
+export type RunEndReason = 'rejected' | 'stopped'
+
+export interface Run {
+  end_reason?: RunEndReason | null
 }

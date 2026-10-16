@@ -1237,8 +1237,8 @@ def build_bundle(
 ) -> dict[str, Any]:
     """一次已封存运行 → 页面里的数据（bundle-data）。
 
-    - run：运行记录的几样（id、workflow_id、workflow_name、version、version_hash、run_class、status、
-      started_at、finished_at）
+    - run：运行记录的几样（id、workflow_id、workflow_name、version、version_hash、run_class、status、end_reason、
+      started_at、finished_at）。end_reason 分开同是 cancelled 的被驳回和手动停止（05-已知遗留 (a)），不在封存范围内
     - events：这次运行的全部事件 (seq, type, node_id, data)，按数据库里 seq 的顺序。和封存核对
       （runner.verify_manifest）读的是同一个顺序：seq 相同的几条，浏览器按这里的先后排，清单才算得一样
     - manifest_seq / manifest_hash：封存范围（老运行是按结束事件推算的那个，legacy 为真）和封存哈希
@@ -1306,7 +1306,7 @@ def build_bundle(
         "meta": {
             "run_id": run.get("id"), "workflow_id": run.get("workflow_id"), "workflow_name": display_name(run),
             "version": run.get("version"), "version_hash": run.get("version_hash"),
-            "run_class": run.get("run_class"), "status": run.get("status"),
+            "run_class": run.get("run_class"), "status": run.get("status"), "end_reason": run.get("end_reason"),
             "started_at": _iso(run.get("started_at")), "finished_at": _iso(run.get("finished_at")),
             "manifest_seq": manifest_seq, "manifest_hash": manifest_hash, "legacy": bool(legacy),
             "tier": _tier(sealed), "exported_at": exported_at,

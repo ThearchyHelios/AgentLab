@@ -28,6 +28,7 @@ from app.engine.toolcalls import (
 from app.providers import catalog
 from app.providers.factory import ModelSpec, bind_tools_safely, get_chat_model
 from app.engine.sql_problems import event_checks
+from app.data import catalog_view
 from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_reads_only, run_scope_fixed, run_versions
 from app.tools.registry import (
     ToolArgsError,
@@ -317,6 +318,8 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 mask_results=run_masks_results(ctx.run),
                 force_readonly=run_reads_only(ctx.run),
                 fixed_scope=run_scope_fixed(ctx.run),
+                # 读哪一份数据目录：发起时定下的（data/catalog_view.py），审批恢复、续跑都沿用
+                catalog_view=catalog_view.of_run(ctx.run),
                 # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
                 emit=ctx.emit,
             )

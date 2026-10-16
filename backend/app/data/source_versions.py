@@ -110,6 +110,16 @@ def load_manifest(artifact_id: str | None) -> dict[str, Any] | None:
     return doc if isinstance(doc, dict) else None
 
 
+def _signer_verified(artifact_id: str | None) -> bool:
+    """导入清单里记下的「署名是否认证」；没有清单（简单导入）、读不出来的照实算未认证。"""
+    try:
+        doc = load_manifest(artifact_id)
+    except ValueError:
+        return False
+    signer = (doc or {}).get("signed_by")
+    return bool(signer.get("verified")) if isinstance(signer, dict) else False
+
+
 def _rows_of(report: dict[str, Any] | None) -> dict[str, int]:
     """构建回执里各表的行数（执行器回执、期 1 的解析回执都是 tables: [{name, rows}]）。"""
     out: dict[str, int] = {}
@@ -394,7 +404,7 @@ def columns_doc(report: dict[str, Any], periods: list[str]) -> dict[str, dict[st
 def manifest_doc(*, source_id: str, snapshot_id: str, action: str, recipe: dict[str, Any],
                  union: dict[str, Any], parts: list[Part | dict[str, Any]], report: dict[str, Any],
                  label_sets: list[Any], gaps: list[dict[str, str]], replaced: Any, removed: Any,
-                 notes: SchemaNotes, signed_by: str | None) -> dict[str, Any]:
+                 notes: SchemaNotes, signed_by: str | None, signer_verified: bool = False) -> dict[str, Any]:
     """快照清单（2.9）。parts 按统计期排序，与 report.part_rows 同序；本期写成 dict（导入记录还没落库）。"""
     part_rows = report.get("part_rows") or []
     keys = []
@@ -422,7 +432,8 @@ def manifest_doc(*, source_id: str, snapshot_id: str, action: str, recipe: dict[
         "checks": copy.deepcopy(report.get("checks") or []),
         "notes": {"templates": dict(notes.templates),
                   "rendered": {t: {"comment": n.comment, "columns": dict(n.columns)} for t, n in notes.tables.items()}},
-        "signed_by": {"name": signed_by, "verified": False},
+        # 是否认证照实记（05-已知遗留 (c)，同导入清单）
+        "signed_by": {"name": signed_by, "verified": bool(signer_verified and signed_by)},
         "created_at": utcnow().isoformat(),
     }
 
@@ -684,8 +695,10 @@ async def _current(session: AsyncSession, source: DataSource) -> _Current:
                     mode=snap.mode or "replace", recipe=recipe)
 
 
-def _revoked_record(reason: str, signed_by: str | None) -> dict[str, Any]:
-    return {"at": utcnow().isoformat(), "reason": reason, "signed_by": signed_by or None, "signed_by_verified": False}
+def _revoked_record(reason: str, signed_by: str | None, signer_verified: bool = False) -> dict[str, Any]:
+    """作废接受的记录。是否认证照实记（05-已知遗留 (c)）：开了登录、署名是登录的人时为真。"""
+    return {"at": utcnow().isoformat(), "reason": reason, "signed_by": signed_by or None,
+            "signed_by_verified": bool(signer_verified and signed_by)}
 
 
 async def rollback_target(session: AsyncSession, source: DataSource, import_id: str) -> SourceSnapshot | None:
@@ -739,7 +752,8 @@ async def revoke_plan(session: AsyncSession, source: DataSource, imp: TableImpor
 
 
 async def _rebuild_without(session: AsyncSession, cur: _Current, imp: TableImport, *, expected_current: str | None,
-                           kind: str, reason: str, signed_by: str | None, revoke: bool) -> tuple[str, bool]:
+                           kind: str, reason: str, signed_by: str | None, revoke: bool,
+                           signer_verified: bool = False) -> tuple[str, bool]:
     """从当前版本去掉一期、生成（或复用、复活）新快照（7.4）。配方和导入模式不变。返回 (快照 id, 是否复用)。
 
     revoke=True 时同一个事务里写 table_imports.revoked（7.5）：复用路径在调 activate_snapshot 之前改好（随它的提交
@@ -758,7 +772,7 @@ async def _rebuild_without(session: AsyncSession, cur: _Current, imp: TableImpor
     sid = table_versions.snapshot_id(source_id, keep, recipe_types.RECIPE_ENGINE_VER, mode="accumulate",
                                      recipe_sha=target_sha)
     imp_id = imp.id
-    revoked = _revoked_record(reason, signed_by) if revoke else None
+    revoked = _revoked_record(reason, signed_by, signer_verified) if revoke else None
     activation = {"kind": kind, "import_id": imp_id, "reason": reason, "signed_by": signed_by}
 
     existing = await session.get(SourceSnapshot, sid)
@@ -871,7 +885,7 @@ async def _rebuild_without(session: AsyncSession, cur: _Current, imp: TableImpor
                        "table_hashes": dict((info.union_report or report_json or {}).get("table_hashes") or {}),
                        "union_ver": recipe_types.UNION_VER},
                 parts=parts, report=info.union_report or report_json or {}, label_sets=label_sets, gaps=gaps,
-                replaced=None, removed=removed, notes=notes, signed_by=signed_by)
+                replaced=None, removed=removed, notes=notes, signed_by=signed_by, signer_verified=signer_verified)
             cache["snapshot_manifest"] = await artifact_store.put_json(
                 doc, kind="snapshot_manifest", meta={"source_id": source_id, "snapshot_id": info.snapshot_id})
         return cache
@@ -931,7 +945,7 @@ def _check_base(cur: _Current, expected_current: str | None) -> None:
 
 
 async def remove_period(session: AsyncSession, source: DataSource, import_id: str, *, expected_current: str | None,
-                        reason: str, signed_by: str | None) -> dict[str, Any]:
+                        reason: str, signed_by: str | None, signer_verified: bool = False) -> dict[str, Any]:
     """POST …/imports/{id}/remove（7.4）。"""
     imp = await session.get(TableImport, import_id)
     if imp is None or imp.source_id != source.id:
@@ -947,13 +961,15 @@ async def remove_period(session: AsyncSession, source: DataSource, import_id: st
     if len(cur.imports) < 2:
         raise ImportRefused(409, "last_period", _LAST_PERIOD)
     sid, reused = await _rebuild_without(session, cur, imp, expected_current=expected_current, kind="remove_period",
-                                         reason=reason, signed_by=signed_by, revoke=False)
+                                         reason=reason, signed_by=signed_by, revoke=False,
+                                         signer_verified=signer_verified)
     return {"snapshot_id": sid, "removed_import_id": import_id, "reused": reused}
 
 
 async def revoke_acceptance(session: AsyncSession, source: DataSource, import_id: str, *,
                             expected_current: str | None, expected_target: str | None,
-                            ack_mask_lost: list[str] | None, reason: str, signed_by: str | None) -> dict[str, Any]:
+                            ack_mask_lost: list[str] | None, reason: str, signed_by: str | None,
+                            signer_verified: bool = False) -> dict[str, Any]:
     """POST …/imports/{id}/revoke-acceptance（7.5）。累积模式（至少两期）= 移除这一期；否则回滚到第 5 节定义的目标。"""
     imp = await session.get(TableImport, import_id)
     if imp is None or imp.source_id != source.id:
@@ -968,7 +984,7 @@ async def revoke_acceptance(session: AsyncSession, source: DataSource, import_id
     if _accumulating(cur):
         sid, _reused = await _rebuild_without(session, cur, imp, expected_current=expected_current,
                                               kind="revoke_acceptance", reason=reason, signed_by=signed_by,
-                                              revoke=True)
+                                              revoke=True, signer_verified=signer_verified)
         return {"snapshot_id": sid, "action": "remove_period"}
     target = await rollback_target(session, source, imp.id)
     if target is None:
@@ -976,7 +992,7 @@ async def revoke_acceptance(session: AsyncSession, source: DataSource, import_id
     if target.id != expected_target:
         raise ImportRefused(409, "revoke_target_changed", _TARGET_CHANGED)
     target_id = target.id
-    imp.revoked = _revoked_record(reason, signed_by)
+    imp.revoked = _revoked_record(reason, signed_by, signer_verified)
     try:
         await table_versions.activate_snapshot(
             session, source, target_id, expected_current=expected_current, kind="revoke_acceptance", reason=reason,
@@ -1049,6 +1065,8 @@ async def import_records(session: AsyncSession, source: DataSource, imps: list[T
             # 按配方导入才有（简单导入为空）：配方、统计期、署名，接受的条数
             "recipe_id": imp.recipe_id, "period_start": imp.period_start, "period_end": imp.period_end,
             "signed_by": imp.signed_by, "overrides": len(imp.overrides or []), "waivers": len(imp.waivers or []),
+            # 署名是不是认证过的身份：按这一期导入清单里记下的（05-已知遗留 (c)；旧清单写的是 False，照记下的说，不改写）
+            "signed_by_verified": _signer_verified(imp.manifest_artifact),
             # 期 3（7.6）
             "acceptances": _acceptance_rows(imp), "revoked": imp.revoked, "manifest_artifact": imp.manifest_artifact,
             "recipe_seq": seqs.get(imp.recipe_id) if imp.recipe_id else None, "in_current": in_current,

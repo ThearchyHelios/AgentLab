@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.coded import AUTH_REQUIRED
 from app.api.deps import Principal, current_principal, decode_actor, ensure_role
 from app.auth import (
     MODES, SETTING_KEY, current_mode, env_mode, load_settings, remember_settings, stored_settings, user_can_chat,
@@ -25,7 +26,6 @@ from app.auth import oidc, sessions
 from app.auth.audit import record
 from app.auth.passwords import hash_password, password_problem, verify_password
 from app.core import crypto
-from app.core.config import settings
 from app.db.base import get_session
 from app.db.models import Setting, User
 
@@ -60,7 +60,7 @@ async def me(x_actor: str | None = Header(default=None), session: AsyncSession =
         return await principal_full(session, Principal(username=actor, display_name=actor, role="admin", mode="off"))
     if not principal.username:
         can_bootstrap = principal.mode == "local" and not await _local_admin_exists(session)
-        return JSONResponse(status_code=401, content={"detail": "请先登录", "code": "auth_required",
+        return JSONResponse(status_code=401, content={"detail": "请先登录", "code": AUTH_REQUIRED,
                                                       "mode": principal.mode, "can_bootstrap": can_bootstrap})
     return await principal_full(session, principal)
 
@@ -113,7 +113,10 @@ async def logout(request: Request, session: AsyncSession = Depends(get_session))
 
 
 def _redirect_uri(request: Request) -> str:
-    base = settings.public_url.rstrip("/") or str(request.base_url).rstrip("/")
+    """回调地址：对外访问地址（环境变量优先，其次设置，core/public_url.py），都没有按请求自己的地址拼。"""
+    from app.core.public_url import public_base_url
+
+    base = public_base_url() or str(request.base_url).rstrip("/")
     return f"{base}/api/auth/oidc/callback"
 
 

@@ -5,7 +5,8 @@
 再导出，调用方和测试不用改；_transport、RETRY_DELAYS 仍是这个模块自己的（测试照旧替换它们），send 每次调用时读。
 
 通知里只有任务名、状态、出具档位、缺口条数、运行链接、封存哈希（界面上叫清单哈希）前 12 位和起止时间，失败时
-另写失败节点的名字和下一步（不许诺能继续运行）；运行成功结束后和同一任务上一次成功的运行的对比（auto_compare）只写
+另写失败节点的名字和下一步（不许诺能继续运行）；被人驳回的那一期按「运行结束」推「未出具（被驳回）」、写驳回的那一步，
+手动停止的不推；运行成功结束后和同一任务上一次成功的运行的对比（auto_compare）只写
 各类指标的个数和对比页链接。不放报告里的具体数字，也不放失败时的原始报错——报错里可能带着查询到的数据，Webhook
 推去的群不一定有权看。
 """
@@ -71,6 +72,11 @@ NEXT_AS_USUAL = "下一次触发会照常发起"
 #: 从没开始执行、任务又不在排期上（停用了）：原因刚写过，记录页上也没有更多可看的，下一步是重新发起。「立即运行」
 #: 是定时任务页上那个按钮的名字，停用的任务也能点
 RERUN_ACTION = "如需重新发起，请在 AgentLab 的「定时任务」中点击「立即运行」"
+#: 被人驳回的那一期（cancelled + end_reason=rejected，next-round X9）：是人的决定，不是故障。按「运行结束」推（订阅
+#: 「运行失败」的人盯的是故障），标题、状态照实写被驳回；驳回的备注不写（可能带着数），驳回的是哪一步写节点名
+REJECTED_HEADLINE = "未出具（被驳回）"
+REJECTED_STATUS = "被驳回"
+REJECTED_ACTION = "驳回的说明请在 AgentLab 的「记录」中查看"
 
 
 # --------------------------------------------------------------------------
@@ -110,11 +116,17 @@ class Notice:
     #: 挂起的原因是写外部系统的结果未知（等核实，核实后自动接着跑），不是服务重启。只在 suspended 时有意义
     action_pending: bool = False
     error_node: str | None = None
+    #: 运行结束在 cancelled 的原因（Run.end_reason）：rejected 时按「未出具（被驳回）」说，error_node 是驳回的那一步
+    end_reason: str | None = None
     next_fire: bool = False
     compare: dict[str, Any] | None = None
     compare_url: str | None = None
     fmt: str | None = None
     signed: bool = False
+
+    @property
+    def rejected(self) -> bool:
+        return self.status == "cancelled" and self.end_reason == "rejected"
 
     @property
     def never_started(self) -> bool:
@@ -142,6 +154,8 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
         headline = "未能发起运行"
     elif notice.suspended:
         headline = "运行已挂起"
+    elif notice.rejected:
+        headline = REJECTED_HEADLINE
     else:
         headline = _HEADLINE.get(notice.event, notice.event)
     title = f"定时任务「{notice.schedule_name}」{headline}"
@@ -163,6 +177,10 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
         lines += [("原因", ACTION_PENDING_REASON), ("处理", ACTION_PENDING_ACTION)]
     elif notice.suspended:
         lines += [("原因", SUSPENDED_REASON), ("处理", SUSPENDED_ACTION)]
+    elif notice.rejected:
+        if notice.error_node:
+            lines.append(("驳回节点", f"「{notice.error_node}」"))
+        lines.append(("处理", f"{REJECTED_ACTION}；{NEXT_AS_USUAL}" if notice.next_fire else REJECTED_ACTION))
     elif notice.status == "failed":
         # 不写原始报错（可能带着查询到的数据），写失败节点的名字和下一步
         if notice.error_node:
@@ -219,6 +237,8 @@ def _status_label(notice: Notice) -> str:
         if notice.pending_approvals:
             return "等待审批"
         return "已挂起，等待核实" if notice.action_pending else "已挂起，可继续运行"
+    if notice.rejected:
+        return REJECTED_STATUS
     return _STATUS_LABEL.get(notice.status or "", notice.status or "")
 
 
@@ -239,7 +259,9 @@ def _links(notice: Notice) -> list[tuple[str, str]]:
 
 def _message(notice: Notice) -> core.Message:
     title, lines, _ = message(notice)
-    return core.Message(title=title, lines=lines, links=_links(notice), ok=notice.event in ("finished", "test"))
+    # 被驳回的那一期按 finished 推，但没出具：不画成成功的颜色
+    return core.Message(title=title, lines=lines, links=_links(notice),
+                        ok=notice.event in ("finished", "test") and not notice.rejected)
 
 
 def _text(notice: Notice) -> str:
@@ -332,8 +354,15 @@ async def _record(schedule_id: str, fire_id: str | None, run_id: str | None, eve
 
 #: 运行到了这些状态才可能要推送
 _WATCHED = ("succeeded", "failed", "cancelled", "interrupted")
-#: 结束的运行 → 事件。cancelled 是有人手动停的，不推。interrupted 分停在审批和挂起两种，见 _state_of
+#: 结束的运行 → 事件。cancelled 是有人手动停的，不推；被驳回的（end_reason=rejected）按 finished 推，见 _event_of。
+#: interrupted 分停在审批和挂起两种，见 _state_of
 _EVENT_OF = {"succeeded": "finished", "failed": "failed", "cancelled": None}
+
+
+def _event_of(run: Run) -> str | None:
+    if run.status == "cancelled" and run.end_reason == "rejected":
+        return "finished"
+    return _EVENT_OF[run.status]
 
 
 @dataclass
@@ -395,9 +424,10 @@ async def notify_due(now: datetime | None = None) -> int:
                 .order_by(ScheduleFire.created_at)
             )).all()
             if rows:
-                from app.api.settings import notify_settings
+                # 链接里的地址：全站同一个对外访问地址（环境变量优先，其次设置，core/public_url.py）
+                from app.core import public_url
 
-                base_url = (await notify_settings(session))["public_base_url"]
+                base_url = await public_url.refresh(session)
             for fire, run in rows:
                 seen = await _state_of(session, fire, run, now)
                 if seen.state is None or seen.state == fire.notified_status:
@@ -469,7 +499,7 @@ async def _state_of(session: Any, fire: ScheduleFire, run: Run | None, now: date
         since = run.finished_at or run.updated_at or fire.created_at
         if not sealed and (now - service.as_utc(since)).total_seconds() < SEAL_WAIT_S:
             return _Seen(None)
-        return _Seen(run.status, _EVENT_OF[run.status], sealed=sealed)
+        return _Seen(run.status, _event_of(run), sealed=sealed)
     if run.status != "interrupted":
         return _Seen(None)
     counts = dict((await session.execute(
@@ -516,7 +546,9 @@ async def _notice(session: Any, schedule: Schedule, fire: ScheduleFire, run: Run
         pending_approvals=pending or None,
         suspended=run is not None and run.status == "interrupted" and not pending,
         action_pending=seen.action_pending,
-        error_node=_failed_node(run) if run is not None and run.status == "failed" else None,
+        error_node=_failed_node(run) if run is not None and (run.status == "failed" or run.end_reason == "rejected")
+        else None,
+        end_reason=run.end_reason if run is not None else None,
         next_fire=bool(schedule.enabled and schedule.next_run_at is not None),
     )
 

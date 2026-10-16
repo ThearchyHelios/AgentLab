@@ -8,7 +8,7 @@ from typing import Any
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.engine.approval import read_decision
-from app.engine.context import NodeContext, NodeError
+from app.engine.context import NodeContext, NodeError, NodeRejected
 from app.engine.replay import ask, once
 from app.engine.state import GraphState, merge_usage, message_text, template_context
 from app.providers import catalog
@@ -52,7 +52,7 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             "__decision__": "approved" if approved else "rejected",
         }
         if not approved and ctx.cfg("stop_on_reject", False):
-            raise NodeError(ctx.node.id, f"人工驳回：{result['note'] or '未说明原因'}")
+            raise NodeRejected.of(ctx, f"人工驳回：{result['note'] or '未说明原因'}", kind="approve", decision=decision)
     else:  # edit / input
         # 驳回在这两种模式下以前是个摆设：__decision__ 硬编码成 approved，
         # approved 字段看都不看。界面上按钮在、toast 说"已驳回"，运行却照常
@@ -65,7 +65,7 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 只有结构体里明说了"不"才算驳回：这两种模式下裸字符串就是内容本身，
         # 用户在输入框里回一句"no"是在交稿，不是在驳回。
         if isinstance(response, dict) and decision.rejected:
-            raise NodeError(ctx.node.id, f"人工驳回：{decision.note or '未说明原因'}")
+            raise NodeRejected.of(ctx, f"人工驳回：{decision.note or '未说明原因'}", kind=mode, decision=decision)
         note = decision.note if isinstance(response, dict) else ""   # 裸字符串是内容，不是备注
         result = {"value": decision.value, "note": note, "__decision__": "approved"}
 

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from sqlalchemy import select
 
+from app.api.coded import (
+    ARTIFACT_FORBIDDEN, ARTIFACT_KIND_FORBIDDEN, ARTIFACT_NOT_FOUND, ARTIFACT_TAMPERED, CodedHTTPException,
+)
 from app.api.deps import can_read_artifact, current_principal
 from app.core import artifact_store
 
@@ -23,14 +26,14 @@ async def get_artifact(artifact_id: str) -> dict[str, Any]:
     principal = current_principal()
     restricted = principal.mode != "off" and not principal.at_least("builder")
     if principal.mode != "off" and not await can_read_artifact(principal, artifact_id):
-        raise HTTPException(403, "没有权限查看这件工件")
+        raise CodedHTTPException(403, "没有权限查看这件工件", ARTIFACT_FORBIDDEN)
     try:
         content = artifact_store.load(artifact_id)
     except ValueError as e:
         # 哈希对不上：明确报给调用方，这正是工件库存在的意义
-        raise HTTPException(409, str(e)) from e
+        raise CodedHTTPException(409, str(e), ARTIFACT_TAMPERED) from e
     if content is None:
-        raise HTTPException(404, "工件不存在，可能已被删除")
+        raise CodedHTTPException(404, "工件不存在，可能已被删除", ARTIFACT_NOT_FOUND)
     if restricted:
         content = await _masked_for_user(principal, artifact_id, content)
     return {"id": artifact_id, "content": content}
@@ -68,7 +71,7 @@ async def _masked_for_user(principal: Any, artifact_id: str, content: Any) -> An
         return await _masked_metrics(principal, artifact_id, content, rows)
     if _RECEIPT in kinds and isinstance(content, dict):
         return await _masked_receipt(content, rows)
-    raise HTTPException(403, "这类工件的原文只对搭建者及以上的角色开放")
+    raise CodedHTTPException(403, "这类工件的原文只对搭建者及以上的角色开放", ARTIFACT_KIND_FORBIDDEN)
 
 
 async def _masked_snapshot(content: dict[str, Any], *, endpoint: bool) -> dict[str, Any]:
@@ -106,7 +109,7 @@ async def _masked_metrics(principal: Any, artifact_id: str, card: dict[str, Any]
             owner = (run_id, node_id or "")
             break
     if owner is None:
-        raise HTTPException(403, "没有权限查看这件工件")
+        raise CodedHTTPException(403, "没有权限查看这件工件", ARTIFACT_FORBIDDEN)
     sealed = await _sealed(owner[0])
     masks = _Masks(sealed)
     metrics: list[Any] = []

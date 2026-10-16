@@ -13,6 +13,7 @@ import type {
   RunEvent, RunStatus, Skill, ToolChange, ToolInfo, ToolTrust, UpgradeResult, UploadDecision, UploadMixedColumn, UploadResult,
   UploadShapeReason, ValidationIssue, VarIssue, Variable, Workflow, WorkflowVersion,
 } from '../types'
+import type { UnlistedRuns } from '../typesApp'
 import {
   ApiError, BASE, NETWORK_MESSAGE, actorHeader, codeOf, del, describeDetail, failure, get, isGatewayFailure, parseBody,
   patch, post, put, qs, report, request, upload, type RequestOptions, type UploadOptions,
@@ -563,6 +564,14 @@ export const api = {
       /** 按运行来源筛（X3）；none 是来源未记录的老运行 */
       origin_kind?: string
     }) => get<Run[]>(`/runs${qs(params)}`),
+    /**
+     * 同样的筛选下，列表因为「系统派生的运行默认不列」而没列出的次数（评测、口径对账、口径召回，next-round X1）。按来源
+     * 筛了的什么都不藏，total 为 0。老后端没有这个接口（404），调用方当作 0
+     */
+    unlisted: (params?: {
+      workflow_id?: string; status?: RunStatus | RunStatus[] | string; run_class?: 'formal' | 'exploratory'
+      q?: string; origin_kind?: string
+    }) => get<UnlistedRuns>(`/runs/unlisted${qs(params)}`),
     get: (id: string) => get<Run>(`/runs/${id}`),
     /** 这次运行实际跑的那张图（运行时的快照），不是工作流现在的样子 */
     graph: (id: string) => get<{ graph: GraphSpec; workflow_id: string | null; version: number | null }>(
@@ -871,7 +880,8 @@ export const api = {
     setModel: (body: { provider?: string | null; model?: string | null }) =>
       put<CopilotModel>('/copilot/model', body),
     /** 跑完之后复核一次。干净的运行后端直接返回 verdict='ok'，不调模型 */
-    review: (body: { run_id: string; question: string }) =>
+    /** attempt：这一轮已经自动试了几次（从 0 数），服务端据此决定给不给 retry_instruction。老服务端不认它，忽略 */
+    review: (body: { run_id: string; question: string; attempt?: number }) =>
       post<ReviewResult>('/copilot/review', body),
     /**
      * 一键升级为可追溯结构：先按确定的规则改写（llm 换成报告撰写、问数据的图插入报告节点……），

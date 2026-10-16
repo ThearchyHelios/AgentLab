@@ -56,6 +56,9 @@ class RunOut(BaseModel):
     input: dict[str, Any]
     output: dict[str, Any]
     error: str | None
+    #: 结束在 cancelled 的原因（docs/design/next-round/00-总方案.md X9）：rejected 人工驳回、stopped 手动停止。
+    #: 其余终态、加这一列之前的运行为空。界面、通知、定时推送都读这一个字段，不再解析报错原文
+    end_reason: str | None = None
     usage: dict[str, Any]
     run_class: str | None = "exploratory"
     version: int | None = None
@@ -171,13 +174,54 @@ async def list_runs(
     以前只有 limit：待审批的运行排在第 145 位，列表只取 100 条，点了徽标也找不到它。
     筛选都走服务端，翻页用 created_at 做游标（before 传上一页最后一条的 created_at）。
     别人的个人应用刷新、个人蓝图试运行不列（只给拥有者，auth/access.hidden_runs），管理员也一样。
+    没按来源筛时，系统派生的运行（评测、口径对账、口径召回：engine/origin.SYSTEM_ORIGINS）默认不列——几十道评测题的运行
+    会把真实用户的运行挤出第一页；按来源点名就列。没列出几次由 GET /api/runs/unlisted 照实说，界面写在列表底下。
     """
+    stmt = _filtered(select(Run), workflow_id=workflow_id, status=status, run_class=run_class, q=q,
+                     schedule_id=schedule_id, origin_kind=origin_kind)
+    stmt = stmt.order_by(Run.created_at.desc()).limit(limit)
+    if before is not None:
+        stmt = stmt.where(Run.created_at < before)
+    return list((await session.execute(stmt)).scalars())
+
+
+@router.get("/unlisted")
+async def unlisted_runs(
+    workflow_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    run_class: str | None = None,
+    q: str | None = Query(default=None),
+    schedule_id: str | None = Query(default=None),
+    origin_kind: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """同样的筛选下，运行列表因为「系统派生的运行默认不列」而没列出的有几次：{total, by_origin: {来源: 次数}}。
+
+    按来源筛了的（origin_kind 给了）什么都不藏，total 为 0。别人的个人应用刷新、个人蓝图试运行不算在内：它们不是「没列出」，
+    是读不了。"""
+    from sqlalchemy import func
+
+    from app.engine.origin import SYSTEM_ORIGINS
+
+    if _csv(origin_kind):
+        return {"total": 0, "by_origin": {}}
+    stmt = _filtered(select(Run.origin_kind, func.count()), workflow_id=workflow_id, status=status, run_class=run_class,
+                     q=q, schedule_id=schedule_id, origin_kind=",".join(SYSTEM_ORIGINS))
+    rows = (await session.execute(stmt.group_by(Run.origin_kind))).all()
+    by_origin = {kind: int(n) for kind, n in rows if kind and n}
+    return {"total": sum(by_origin.values()), "by_origin": by_origin}
+
+
+def _filtered(stmt: Any, *, workflow_id: str | None, status: str | None, run_class: str | None, q: str | None,
+              schedule_id: str | None, origin_kind: str | None) -> Any:
+    """运行列表的筛选条件（列表和「没列出几次」共用一份）。"""
     from sqlalchemy import not_
 
     from app.api.deps import current_principal
     from app.auth.access import hidden_runs
+    from app.engine.origin import counted_runs
 
-    stmt = select(Run).where(not_(hidden_runs(current_principal()))).order_by(Run.created_at.desc()).limit(limit)
+    stmt = stmt.where(not_(hidden_runs(current_principal())))
     if workflow_id == UNSAVED:
         stmt = stmt.where(Run.workflow_id.is_(None))
     elif workflow_id:
@@ -193,9 +237,10 @@ async def list_runs(
     if origins := _csv(origin_kind):
         kinds = [o for o in origins if o != NO_ORIGIN]
         stmt = stmt.where(or_(Run.origin_kind.in_(kinds), *([Run.origin_kind.is_(None)] if NO_ORIGIN in origins else [])))
-    if before is not None:
-        stmt = stmt.where(Run.created_at < before)
-    return list((await session.execute(stmt)).scalars())
+    else:
+        # 没点名来源：只列计入统计的运行，系统派生的（评测、口径对账、召回）不列；来源为空的老运行照常列出
+        stmt = stmt.where(counted_runs())
+    return stmt
 
 
 def _csv(value: str | None) -> list[str]:
@@ -289,11 +334,13 @@ async def cancel_run(run_id: str, x_actor: str | None = Header(default=None)) ->
             run = await session.get(Run, run_id)
         if run is None:
             raise HTTPException(404, "运行记录不存在")
-        raise HTTPException(409, _cannot_cancel(run.status))
+        raise HTTPException(409, _cannot_cancel(run.status, run.end_reason))
     return {"ok": True, "status": outcome}
 
 
-def _cannot_cancel(status: str) -> str:
+def _cannot_cancel(status: str, end_reason: str | None = None) -> str:
+    if status == "cancelled" and end_reason == "rejected":
+        return "这次运行已被驳回结束，没有要停止的。"
     return {
         "succeeded": "这次运行已完成，没有要停止的。",
         "failed": "这次运行已失败结束，没有要停止的；如需继续，请点「继续运行」。",
@@ -396,7 +443,7 @@ async def continue_run(
     except KeyError as e:
         raise _missing(e) from e
     except ContinueRefused as e:
-        # 正式运行带图（formal_graph_locked）、写入结果未知还没核实（action_unresolved）：带机器码
+        # 正式运行带图（formal_graph_locked）、写入结果未知还没核实（action_unresolved）、被驳回了的（run_rejected）：带机器码
         raise CodedHTTPException(409, str(e), e.code) from e
     except ValueError as e:
         raise HTTPException(409, str(e)) from e

@@ -265,3 +265,37 @@ def test_trial_inputs_follow_the_cadence():
     inputs = trial_inputs(get_template("periodic_board").example(), at=datetime(2026, 10, 15, 3, tzinfo=timezone.utc))
     assert inputs == {"period": "2026-W41", "period_start": "2026-10-05", "period_end": "2026-10-11"}
     assert trial_inputs(get_template("approval").example()) == {}
+
+
+def test_freeform_people_rows_follow_the_imported_graph():
+    """自由形的「谁来做」按导入的图列（05-已知遗留 (d)）：同一个岗位用在几处合成一行、说明写全；发起人、表达式派单的步骤是
+    只读行；没有人工节点和写入的图一行都没有。卡片上留着、图里已经没有的岗位照实提醒，不静默删掉。"""
+    from app.blueprints.ops import blueprint_issues
+    from app.blueprints.templates import freeform
+
+    graph = {"nodes": [
+        c.node("start", "input", "发起", fields=[{"name": "q"}]),
+        c.node("a", "human", "初审", mode="approve", assignee={"kind": "slot", "slot": "finance"},
+               on_timeout={"action": "escalate", "to_slot": "director"}, due="PT1H"),
+        c.node("b", "human", "复审", mode="approve", assignee={"kind": "slot", "slot": "finance"}),
+        c.node("me", "human", "本人确认", mode="approve", assignee={"kind": "initiator"}),
+        c.node("calc", "human", "按金额派", mode="approve", assignee={"kind": "expression", "expression": "input.q"}),
+        c.node("done", "output", "完成", fields=[])],
+        "edges": [c.edge("start", "a"), c.edge("a", "b"), c.edge("b", "me"), c.edge("me", "calc"), c.edge("calc", "done")]}
+    spec = {**get_template("freeform").example(), "people": [
+        {"id": "finance", "who": c.user_item([{"kind": "user", "name": "zhang"}])},
+        {"id": "gone", "who": c.user_item([{"kind": "user", "name": "li"}])}]}
+    rows = freeform.people_rows(c.with_graph(spec, graph))
+    assert [(r["kind"], r["slot"], r["path"]) for r in rows] == [
+        ("slot", "finance", "/people/0/who"), ("slot", "director", "/people/1/who"),
+        ("initiator", None, None), ("expression", None, None)]
+    assert rows[0]["label"] == "「初审」、「复审」" and rows[0]["detail"] == "「初审」处理；「复审」处理"
+    assert rows[1]["detail"] == "「初审」超时升级" and rows[0]["who"] == [{"kind": "user", "name": "zhang"}]
+    issues = blueprint_issues(spec, for_="publish", graph=graph)
+    unbound = [i for i in issues if i["code"] == "bp.people_unbound"]
+    assert [(i["path"], i["slot"], i["level"]) for i in unbound] == [("/people/1/who", "director", "error")]
+    assert [i["level"] for i in blueprint_issues(spec, for_="trial", graph=graph) if i["code"] == "bp.people_unbound"] \
+        == ["warning"], "试运行时待办派给试运行的人自己，不挡"
+    stale = [i for i in issues if i["code"] == "bp.template_mismatch" and "gone" in i["message"]]
+    assert stale and stale[0]["level"] == "warning"
+    assert freeform.people_rows(c.with_graph(get_template("freeform").example(), freeform.example_graph())) == []

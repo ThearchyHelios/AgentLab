@@ -964,9 +964,10 @@ async def test_the_other_doors_to_a_private_run_are_shut_too(monkeypatch):
     bob_trial = await wait(r.json()["run_id"])
     question = {"question": "上周各门店的销售额"}
     async with SessionLocal() as session:
-        # 聚类只列两条以上的簇：别的探索运行放两条
+        # 聚类只列两条以上的簇：别的探索运行放两条。用画布试跑：问数据的问题按轮次取（app/chat/questions.py），
+        # 没挂在任何一轮上的问数据运行不单独算
         shared, also = (Run(workflow_name="共享的运行", graph=KPI, status="succeeded", run_class="exploratory",
-                            origin_kind="chat", started_by="bob", input=question) for _ in range(2))
+                            origin_kind="canvas", started_by="bob", input=question) for _ in range(2))
         session.add_all([shared, also])
         await session.flush()
         for run_id in (trial.id, refresh.id, bob_trial.id):

@@ -72,8 +72,13 @@ export function fillRecipeDefaults(input: Recipe | null | undefined): Recipe | n
         block.extra_columns ??= 'reject'
         block.ignore_columns ??= []
         block.merged_data ??= 'reject'
-        block.rows = { blank_rows: 'stop', total_row: null, ...(isObj(block.rows) ? block.rows : {}) }
+        block.rows = { blank_rows: 'stop', total_row: null, subtotals: null, no_subtotals: false, ...(isObj(block.rows) ? block.rows : {}) }
         if (isObj(block.rows.total_row)) block.rows.total_row.keep_as ??= null
+        if (isObj(block.rows.subtotals)) {
+          block.rows.subtotals = { scope: 'since_previous', group_column: null, keep_as: null, ...block.rows.subtotals }
+        }
+        block.period ??= null
+        if (isObj(block.period)) block.period = { column: null, check: 'within_context', synthesize: null, ...block.period }
         block.values = {
           blank: 'null', text_number: 'reject', formula: 'accept_cached', ...(isObj(block.values) ? block.values : {}),
         }
@@ -97,6 +102,10 @@ export interface RecipeColumn { name: string; type: string; role: string; header
 
 /** 列表合计行另存的表固定有这一列（契约 LIST_TOTAL_DIM） */
 const LIST_TOTAL_DIM = '合计项'
+/** 期 5：列表小计另存的表固定有这一列（契约 LIST_SUBTOTAL_DIM） */
+const LIST_SUBTOTAL_DIM = '小计项'
+/** 期 5：列表每行加统计期时的两列（契约 LIST_PERIOD_START / LIST_PERIOD_END） */
+const LIST_PERIOD_COLUMNS = ['统计期起', '统计期止']
 
 /**
  * 由配方推出每张表的列，照服务端 derive_tables 的顺序：宽表 = 轴、各指标；长表 = 轴、维度、常量（按列名排序）、
@@ -140,11 +149,18 @@ export function tableColumns(recipe: Recipe | null): Map<string, RecipeColumn[]>
           name: String(c?.name ?? ''), type: c?.type === 'DATE' ? 'TEXT' : String(c?.type ?? 'TEXT'),
           role: c?.type === 'INTEGER' || c?.type === 'REAL' ? 'measure' : 'text', header: c?.header,
         }))
-        put(block.table, cols)
+        const synth = isObj(block.period) && block.period.synthesize
+          ? LIST_PERIOD_COLUMNS.map((name) => ({ name, type: 'TEXT', role: 'period' })) : []
+        put(block.table, [...cols, ...synth])
+        const numeric = cols.filter((c) => c.type === 'INTEGER' || c.type === 'REAL').map((c) => ({ ...c, role: 'value' }))
         const total = block.rows?.total_row
         if (isObj(total) && total.keep_as) {
-          put(total.keep_as, [{ name: LIST_TOTAL_DIM, type: 'TEXT', role: 'dim' },
-            ...cols.filter((c) => c.type === 'INTEGER' || c.type === 'REAL').map((c) => ({ ...c, role: 'value' }))])
+          put(total.keep_as, [{ name: LIST_TOTAL_DIM, type: 'TEXT', role: 'dim' }, ...numeric])
+        }
+        const sub = block.rows?.subtotals
+        if (isObj(sub) && sub.keep_as) {
+          const group = sub.scope === 'group_column' && sub.group_column ? [{ name: String(sub.group_column), type: 'TEXT', role: 'dim' }] : []
+          put(sub.keep_as, [{ name: LIST_SUBTOTAL_DIM, type: 'TEXT', role: 'dim' }, ...group, ...numeric])
         }
       }
     }
@@ -164,6 +180,7 @@ export function renameTable(r: Recipe, old: string, nu: string) {
       if (!isObj(block)) continue
       if (block.table === old) block.table = nu
       if (isObj(block.rows?.total_row) && block.rows.total_row.keep_as === old) block.rows.total_row.keep_as = nu
+      if (isObj(block.rows?.subtotals) && block.rows.subtotals.keep_as === old) block.rows.subtotals.keep_as = nu
       for (const seg of arr(block.segments)) {
         if (!isObj(seg)) continue
         if (seg.table === old) seg.table = nu
@@ -205,6 +222,11 @@ function renameRefs(r: Recipe, table: string, old: string, nu: string) {
       if (block.table === table && isObj(block.rows?.total_row) && block.rows.total_row.label_column === old) {
         block.rows.total_row.label_column = nu
       }
+      if (block.table === table && isObj(block.rows?.subtotals)) {
+        if (block.rows.subtotals.label_column === old) block.rows.subtotals.label_column = nu
+        if (block.rows.subtotals.group_column === old) block.rows.subtotals.group_column = nu
+      }
+      if (block.table === table && isObj(block.period) && block.period.column === old) block.period.column = nu
       for (const seg of arr(block.segments)) {
         if (isObj(seg?.verify) && seg.verify.against_table === table && seg.verify.value === old) seg.verify.value = nu
       }
@@ -736,6 +758,10 @@ function ListEditor({ s, b, block, edit }: { s: number; b: number; block: any; e
   const at = (r: Recipe) => r.sheets[s].blocks[b]
   const columns: any[] = arr(block.columns)
   const total = isObj(block.rows?.total_row) ? block.rows.total_row : null
+  const subtotals = isObj(block.rows?.subtotals) ? block.rows.subtotals : null
+  const period = isObj(block.period) ? block.period : null
+  const periodKind = period?.synthesize ? 'synthesize' : period?.column ? 'column' : 'none'
+  const dateColumns = columns.filter((c) => c?.type === 'DATE').map((c) => String(c?.name ?? ''))
   return (
     <Group title={RECIPE_TEXT.listBlock(String(block.id))} attr={{ 'data-list-block': String(block.id) }}>
       <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
@@ -853,6 +879,87 @@ function ListEditor({ s, b, block, edit }: { s: number; b: number; block: any; e
                            if (old && v) renameTable(r, old, v)
                            else at(r).rows.total_row.keep_as = v || null
                          })} />
+            </FieldWrap>
+          </div>
+        )}
+      </FieldWrap>
+      <FieldWrap path={`${base}/rows/subtotals`} label={RECIPE_TEXT.subtotals} hint={RECIPE_TEXT.subtotalsHint}>
+        <Check path={`${base}/rows/subtotals`} checked={!!subtotals}
+               onChange={(on) => edit((r) => {
+                 const x = at(r)
+                 x.rows = isObj(x.rows) ? x.rows : {}
+                 x.rows.subtotals = on
+                   ? { label_column: arr(x.columns)[0]?.name ?? '', pick: '小计', scope: 'since_previous', group_column: null, keep_as: null }
+                   : null
+                 // 有小计和「没有小计行」只能二选一（后端静态校验 subtotals_conflict）
+                 if (on) x.rows.no_subtotals = false
+               })}>
+          {RECIPE_TEXT.subtotalsOn}
+        </Check>
+        {!subtotals && (
+          <div className="mt-1">
+            <Check path={`${base}/rows/no_subtotals`} checked={block.rows?.no_subtotals === true}
+                   onChange={(on) => edit((r) => {
+                     const x = at(r)
+                     x.rows = isObj(x.rows) ? x.rows : {}
+                     x.rows.no_subtotals = on
+                   })}>
+              {RECIPE_TEXT.noSubtotals}
+            </Check>
+          </div>
+        )}
+        {subtotals && (
+          <div className="mt-1 grid grid-cols-1 gap-2 md:grid-cols-3" data-list-subtotals={String(block.id)}>
+            <FieldWrap path={`${base}/rows/subtotals/label_column`} label={RECIPE_TEXT.subtotalLabelColumn}>
+              <Select path={`${base}/rows/subtotals/label_column`} value={subtotals.label_column ?? ''} label={RECIPE_TEXT.subtotalLabelColumn}
+                      options={columns.map((c) => String(c?.name ?? ''))}
+                      onChange={(v) => edit((r) => { at(r).rows.subtotals.label_column = v })} />
+            </FieldWrap>
+            <FieldWrap path={`${base}/rows/subtotals/pick`} label={RECIPE_TEXT.subtotalPick}>
+              <TextInput path={`${base}/rows/subtotals/pick`} value={subtotals.pick ?? ''} label={RECIPE_TEXT.subtotalPick}
+                         onCommit={(v) => edit((r) => { at(r).rows.subtotals.pick = v })} />
+            </FieldWrap>
+            <FieldWrap path={`${base}/rows/subtotals/keep_as`} label={RECIPE_TEXT.subtotalKeep}>
+              <TextInput path={`${base}/rows/subtotals/keep_as`} value={subtotals.keep_as ?? ''} allowEmpty label={RECIPE_TEXT.subtotalKeep}
+                         onCommit={(v) => edit((r) => {
+                           const old = at(r).rows.subtotals.keep_as
+                           if (old && v) renameTable(r, old, v)
+                           else at(r).rows.subtotals.keep_as = v || null
+                         })} />
+            </FieldWrap>
+            <FieldWrap path={`${base}/rows/subtotals/scope`} label={RECIPE_TEXT.subtotalScope} className="md:col-span-2">
+              <Radios path={`${base}/rows/subtotals/scope`} value={subtotals.scope ?? 'since_previous'} label={RECIPE_TEXT.subtotalScope}
+                      choices={RECIPE_CHOICE_LABEL.subtotalScope}
+                      onChange={(v) => edit((r) => {
+                        const x = at(r).rows.subtotals
+                        x.scope = v
+                        x.group_column = v === 'group_column' ? (x.group_column ?? arr(at(r).columns)[0]?.name ?? null) : null
+                      })} />
+            </FieldWrap>
+            {subtotals.scope === 'group_column' && (
+              <FieldWrap path={`${base}/rows/subtotals/group_column`} label={RECIPE_TEXT.subtotalGroupColumn}>
+                <Select path={`${base}/rows/subtotals/group_column`} value={subtotals.group_column ?? ''} label={RECIPE_TEXT.subtotalGroupColumn}
+                        options={columns.map((c) => String(c?.name ?? ''))}
+                        onChange={(v) => edit((r) => { at(r).rows.subtotals.group_column = v })} />
+              </FieldWrap>
+            )}
+          </div>
+        )}
+      </FieldWrap>
+      <FieldWrap path={`${base}/period`} label={RECIPE_TEXT.listPeriod} hint={RECIPE_TEXT.listPeriodHint}>
+        <Radios path={`${base}/period`} value={periodKind} label={RECIPE_TEXT.listPeriod}
+                choices={RECIPE_CHOICE_LABEL.listPeriod}
+                onChange={(v) => edit((r) => {
+                  const x = at(r)
+                  x.period = v === 'none' ? null
+                    : v === 'synthesize' ? { column: null, check: 'within_context', synthesize: '统计期' }
+                      : { column: dateColumns[0] ?? '', check: 'within_context', synthesize: null }
+                })} />
+        {periodKind === 'column' && (
+          <div className="mt-1 max-w-xs">
+            <FieldWrap path={`${base}/period/column`} label={RECIPE_TEXT.listPeriodColumn}>
+              <Select path={`${base}/period/column`} value={period?.column ?? ''} label={RECIPE_TEXT.listPeriodColumn}
+                      options={dateColumns} onChange={(v) => edit((r) => { at(r).period.column = v })} />
             </FieldWrap>
           </div>
         )}

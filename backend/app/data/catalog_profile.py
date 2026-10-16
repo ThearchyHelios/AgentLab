@@ -41,9 +41,9 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date as _date, datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects import mysql, oracle, postgresql, sqlite
@@ -99,7 +99,7 @@ _NUMBER_FIELDS: dict[str, tuple[str, float, float, bool]] = {
     "table_max_queries": ("每张表最多查询数", 1, 200, True),
     "table_max_s": ("每张表时长上限（秒）", 10, 600, False),
     "query_timeout_s": ("单条查询时限（秒）", 1, 60, False),
-    "sample_size": ("抽样键值数", 10, 10_000, True),
+    "sample_size": ("核对键值数", 10, 10_000, True),
     "max_scan_rows": ("整表统计行数上限", 0, 10_000_000, True),
 }
 _ENABLED_LABEL = "开启数据剖析"
@@ -241,16 +241,96 @@ def sql_literal(value: Any, kind: str | None) -> str | None:
     return "'" + value.replace("'", "''") + "'"
 
 
+#: 定长文字类型（CHAR(2)、NCHAR、bpchar、CHARACTER(2)）：PostgreSQL、Oracle 取回的值带尾随空格补齐
+_FIXED_CHAR = re.compile(r"^\s*(?:N?CHAR|BPCHAR|CHARACTER)\b(?!\s+VARYING)", re.IGNORECASE)
+
+
+def is_fixed_char(type_name: str | None) -> bool:
+    """定长文字列（CHAR(n)）：值的尾随空格是补齐出来的，不是取值的一部分（SQL 比较时也不算）。"""
+    return bool(type_name) and bool(_FIXED_CHAR.match(str(type_name)))
+
+
+class KeyLiterals(NamedTuple):
+    """key_literals 的结果。literals：去父表里对的 IN 列表字面量（去重、保持顺序）；unmatchable：按类型就对不上父键、
+    算作没对上的键值个数（去重后）；unsafe：值本身不能安全拼进 SQL、不计入核对的个数。"""
+    literals: list[str]
+    unmatchable: int
+    unsafe: int
+
+
+def key_literals(values: list[Any], kind: str | None, *, parent: str | None,
+                 child_type: str | None) -> KeyLiterals:
+    """从子表取回的键值 → 去父表里对的 IN 列表字面量（KeyLiterals）。
+
+    字面量按**被指向列**的类型族写（catalog.column_family），不是按子表取回的值：
+    - 父列是文字、子列是数：写成 '123'。PostgreSQL 上 varchar 列 IN (123) 直接报「operator does not exist」；
+    - 父列是数、子列是文字：只拼整数写法的值（'0012' 也照 12 写）。别的（'A1'、'WALKIN'）不拼——Oracle 上数字列
+      IN ('A1') 会把字面量转成数报 ORA-01722，MySQL 会把 'A1' 转成 0 去比、对上不该对上的行——但它们**照样是子表
+      的键值**：整数主键里永远没有 'WALKIN'，所以算作没对上，计入 unmatchable，由调用方留在覆盖率的分母里。要是
+      从分母里拿掉，散客代号占九成的一列只剩 1 个整数写法的键对上，就成了「覆盖率 100%」；
+    - 父列是时间：不在这里处理，_check_relation 先整条跳过（各家时间字面量写法不同、精度不同，键不核对）；
+    - 父列类型认不出：照子表取回的值的类型写（sql_literal，以前的做法）。
+    子表是定长文字（CHAR(n)）时先去掉尾随空格：PG、Oracle 取回的 'A ' 拿去和 VARCHAR 父列比就对不上，而按 CHAR 的
+    语义尾随空格本来就不算。不安全的值（反斜杠、「:名字」、控制字符、太长）照 sql_literal 的规矩跳过，记进 unsafe
+    （调用方另记「类型不支持核对，未计入」）。两个不同的取值写成同一个字面量（'0012' 和 '12'）只算一个，不算 unsafe。
+    """
+    if parent == "time":
+        raise ValueError("被指向列是日期时间的关系不核对键值（见 _check_relation）")
+    fixed = is_fixed_char(child_type)
+    out: list[str] = []
+    unmatchable: set[str] = set()
+    unsafe = 0
+    for value in values:
+        if fixed and isinstance(value, str):
+            value = value.rstrip(" ")
+        if parent == "text":
+            if isinstance(value, bool):
+                unsafe += 1
+                continue
+            if isinstance(value, (int, float, Decimal)):
+                lit = sql_literal(value, "number")
+                lit = None if lit is None else "'" + lit + "'"
+            else:
+                lit = sql_literal(value, "text")
+        elif parent == "number":
+            if isinstance(value, str):
+                text = value.strip()
+                if not _INT_TEXT.fullmatch(text):
+                    unmatchable.add(text)
+                    continue
+                lit = str(int(text))
+            else:
+                lit = sql_literal(value, "number")
+        else:
+            lit = sql_literal(value, kind)
+        if lit is None:
+            unsafe += 1
+        else:
+            out.append(lit)
+    return KeyLiterals(list(dict.fromkeys(out)), len(unmatchable), unsafe)
+
+
 _DIALECT_MODULES = {"sqlite": sqlite, "postgres": postgresql, "postgresql": postgresql, "mysql": mysql,
                     "mariadb": mysql, "oracle": oracle}
 
 
+#: 日期列的最小值、最大值只看这个区间里的值（含下限、不含上限）：0000-00-00（MySQL 关了严格模式写进去的零日期）、
+#: 0001-01-01、9999-12-31（「没有」「永久」的占位日期）、PostgreSQL 的 -infinity / infinity 都落在区间外。区间外的
+#: 值照实数出来（「有 N 个无效日期未计入」），不让一个占位日期把业务日期的范围撑成两千年。两端整天排除：带时刻的
+#: 9999-12-31 23:59:59、文字存的「0001-01-01 00:00:00」也算占位
+VALID_DATE_FROM = "0001-01-02"
+VALID_DATE_BEFORE = "9999-12-31"
+_ISO_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
 class SqlDialect:
-    """剖析 SQL 的方言差异：标识符怎么加引号、怎么只取前 n 行、统计信息在哪个系统视图里。只拼字符串，不连库。
+    """剖析 SQL 的方言差异：标识符怎么加引号、怎么只取前 n 行、统计信息在哪个系统视图里、日期字面量和按天截断
+    怎么写、有没有块采样。只拼字符串，不连库。
 
     标识符交给 SQLAlchemy 各方言的 identifier_preparer：需要时才加引号（memberTags 加、visits 不加），
     MySQL 用反引号。Oracle 尤其不能一律加双引号：探查拿到的表名是 SQLAlchemy 规整过的小写，库里其实是
-    大写，"visits" 加了引号就成了另一张不存在的表；不加引号 Oracle 自己转大写才对得上。
+    大写，"visits" 加了引号就成了另一张不存在的表；不加引号 Oracle 自己转大写才对得上。反过来，库里真是小写的
+    对象（建表时写了 "visits"）探查时记了 quote_name，这种要强制加引号、不转大写（table、column、stats_sql）。
     """
 
     def __init__(self, kind: str | None) -> None:
@@ -262,13 +342,64 @@ class SqlDialect:
         self._prep = self._dialect.identifier_preparer
         self.oracle = self.kind == "oracle"
 
-    def quote(self, name: str) -> str:
-        return self._prep.quote(name)
+    def quote(self, name: str, *, force: bool = False) -> str:
+        """标识符。force：探查记了 quote_name 的名字，原样加引号（Oracle 小写带引号的对象）。"""
+        return self._prep.quote_identifier(name) if force else self._prep.quote(name)
 
     def table(self, meta: dict[str, Any] | None, name: str) -> str:
         """写进 FROM 的表名：探查时指定了 schema 的带上它（Oracle 只读账号名下没有对象，全靠 schema 前缀）。"""
         schema = (meta or {}).get("schema")
-        return f"{self._prep.quote_schema(schema)}.{self.quote(name)}" if schema else self.quote(name)
+        quoted = self.quote(name, force=(meta or {}).get("quote_name") is True)
+        return f"{self._prep.quote_schema(schema)}.{quoted}" if schema else quoted
+
+    def column(self, meta: dict[str, Any] | None, name: str) -> str:
+        """写进 SQL 的列名：表结构里这一列记了 quote_name 的强制加引号。"""
+        cols = (meta or {}).get("columns") or []
+        entry = next((c for c in cols if isinstance(c, dict) and c.get("name") == name), None)
+        return self.quote(name, force=bool(entry and entry.get("quote_name") is True))
+
+    def date_literal(self, value: Any, *, text: bool = False) -> str:
+        """日期字面量（取值观察的时间窗口、日期列的有效区间用）。PostgreSQL、MySQL、Oracle 都认 DATE 'YYYY-MM-DD'；
+        SQLite 没有日期类型，日期存成文字，写字符串。text：列是文字存的日期（VARCHAR），按字符串比——PostgreSQL 上
+        varchar 和 date 比较会直接报错。只收真实存在的日期（date 或 YYYY-MM-DD），别的抛 ValueError：拼进 SQL 的
+        只能是我们自己算出来的日子。"""
+        if isinstance(value, datetime):
+            value = value.date()
+        if isinstance(value, _date):
+            day = value.isoformat()
+        elif isinstance(value, str) and _ISO_DAY.fullmatch(value):
+            try:
+                day = _date.fromisoformat(value).isoformat()
+            except ValueError:
+                raise ValueError(f"不是有效的日期：{value}") from None
+        else:
+            raise ValueError(f"不是有效的日期：{value!r}")
+        if text or self.kind == "sqlite":
+            return f"'{day}'"
+        return f"DATE '{day}'"
+
+    def day_trunc(self, column: str) -> str:
+        """时间列截到天（按日行数用）。PostgreSQL CAST(x AS DATE)；MySQL DATE(x)；Oracle 必须用 TRUNC(x)：Oracle 的
+        DATE 带时分秒，CAST(ts AS DATE) 截不掉；SQLite 的日期是文字，取前 10 个字符。"""
+        if self.kind in ("postgres", "postgresql"):
+            return f"CAST({column} AS DATE)"
+        if self.kind in ("mysql", "mariadb"):
+            return f"DATE({column})"
+        if self.oracle:
+            return f"TRUNC({column})"
+        return f"substr({column}, 1, 10)"
+
+    def sample_from(self, table: str, percent: float) -> str | None:
+        """块采样的 FROM：PostgreSQL TABLESAMPLE SYSTEM (p)、Oracle SAMPLE BLOCK (p)，按数据块随机取约 p% 的行；
+        MySQL、SQLite 没有块采样，返回 None（调用方退回「按存储顺序的前 N 行」，并照实写口径）。"""
+        p = float(percent)
+        if not (0 < p < 100):
+            raise ValueError(f"采样比例要在 0 到 100 之间：{percent}")
+        if self.kind in ("postgres", "postgresql"):
+            return f"{table} TABLESAMPLE SYSTEM ({p:g})"
+        if self.oracle:
+            return f"{table} SAMPLE BLOCK ({p:g})"
+        return None
 
     def limit(self, sql: str, n: int) -> str:
         """只取前 n 行。Oracle 11g 没有 LIMIT 也没有 FETCH FIRST，一律套一层 ROWNUM。"""
@@ -304,7 +435,8 @@ class SqlDialect:
         if self.oracle:
             denorm = self._dialect.denormalize_name
             owner = sql_literal(denorm(schema), "text") if schema else "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"
-            table = sql_literal(denorm(name), "text")
+            # 小写带引号的对象（quote_name）在数据字典里就是小写，不能转成大写去找
+            table = sql_literal(name if (meta or {}).get("quote_name") is True else denorm(name), "text")
             if not (owner and table):
                 return None
             return f"SELECT NUM_ROWS FROM ALL_TABLES WHERE OWNER = {owner} AND TABLE_NAME = {table}"
@@ -335,8 +467,49 @@ class SqlDialect:
                f"WHERE {column} IS NOT NULL GROUP BY {column} ORDER BY cnt DESC, {column}")
         return self.limit(sql, n)
 
-    def min_max_sql(self, table: str, columns: list[str]) -> str:
-        return f"SELECT {', '.join(f'MIN({c}), MAX({c})' for c in columns)} FROM {table}"
+    def min_max_sql(self, table: str, columns: list[tuple[str, bool]]) -> str:
+        """日期列的最小值、最大值和无效日期的个数：每列三个值（MIN、MAX、区间外的个数）。columns 是 (写进 SQL 的列,
+        是不是文字存的日期)。只看有效区间（VALID_DATE_FROM ≤ x < VALID_DATE_BEFORE）里的值，见 VALID_DATE_FROM。
+        整表统计，只对小表用。"""
+        parts = []
+        for c, text in columns:
+            lo = self.date_literal(VALID_DATE_FROM, text=text)
+            hi = self.date_literal(VALID_DATE_BEFORE, text=text)
+            valid = f"{c} >= {lo} AND {c} < {hi}"
+            parts.append(f"MIN(CASE WHEN {valid} THEN {c} END), MAX(CASE WHEN {valid} THEN {c} END), "
+                         f"SUM(CASE WHEN {c} < {lo} OR {c} >= {hi} THEN 1 ELSE 0 END)")
+        return f"SELECT {', '.join(parts)} FROM {table}"
+
+    # ---- 取值观察（下一轮第 3 波用）：窗口、按日行数、块采样。这里先把各方言的写法定下来，金样和容器集成测试都覆盖
+
+    def _window(self, column: str, since: Any, text: bool) -> str:
+        """时间窗口的条件：since 起（含），并且早于占位日期 9999-12-31——PostgreSQL 的 infinity、Oracle 的 9999-12-31
+        都大于任何一天，不截掉上端就会在「最近 35 天」里多出一天。"""
+        return (f"{column} >= {self.date_literal(since, text=text)} "
+                f"AND {column} < {self.date_literal(VALID_DATE_BEFORE, text=text)}")
+
+    def day_volume_sql(self, table: str, column: str, since: Any, *, text: bool = False) -> str:
+        """最近若干天按天计数：since 起（含）每天几行。只在日期列打头有索引时对大表发（走索引的范围扫描）。"""
+        day = self.day_trunc(column)
+        return (f"SELECT {day} AS d, COUNT(*) AS n FROM {table} "
+                f"WHERE {self._window(column, since, text)} GROUP BY {day} ORDER BY d")
+
+    def window_value_counts_sql(self, table: str, column: str, date_column: str, since: Any, n: int, *,
+                                text: bool = False) -> str:
+        """时间窗口里的取值分布：业务日期 since 起（含）的行里，出现最多的 n 个取值和各自的行数。"""
+        sql = (f"SELECT {column}, COUNT(*) AS cnt FROM {table} "
+               f"WHERE {self._window(date_column, since, text)} AND {column} IS NOT NULL "
+               f"GROUP BY {column} ORDER BY cnt DESC, {column}")
+        return self.limit(sql, n)
+
+    def sample_value_counts_sql(self, table: str, column: str, percent: float, n: int) -> str | None:
+        """块采样里的取值分布；没有块采样的方言返回 None。"""
+        source = self.sample_from(table, percent)
+        if source is None:
+            return None
+        sql = (f"SELECT {column}, COUNT(*) AS cnt FROM {source} WHERE {column} IS NOT NULL "
+               f"GROUP BY {column} ORDER BY cnt DESC, {column}")
+        return self.limit(sql, n)
 
 
 # ==========================================================================
@@ -581,8 +754,10 @@ async def estimate_size(run: Callable[..., Awaitable[QueryResult]], dialect: Sql
     """先读统计信息；读不到（SQLite、没分析过的表）再数到 max_scan_rows + 1 行为止。
 
     统计信息为 0 或负数（PostgreSQL 没分析过的表是 -1，MySQL 的估算值可能是 0）当作不知道：一张其实很大的表
-    要是被当成空表，后面就会对它做整表统计。返回 (行数, 途中没查成的几条)。这张表的查询次数、时长用完（或者任务止损）
-时抛 _Stop。
+    要是被当成空表，后面就会对它做整表统计。统计信息说的行数不超过 max_scan_rows 时也再数一次（多一条有上限的
+    计数）：统计信息可能是很久以前的（表后来涨到了几千万行，ANALYZE 没再跑过），照它把大表当小表，就会对它做
+    整表的 COUNT(DISTINCT)、MIN/MAX。数过的结果是准数（count），数到上限还没数完就按大表算（at_least）。
+    返回 (行数, 途中没查成的几条)。这张表的查询次数、时长用完（或者任务止损）时抛 _Stop。
     """
     skips: list[_Skip] = []
     sql = dialect.stats_sql(meta, name)
@@ -592,7 +767,9 @@ async def estimate_size(run: Callable[..., Awaitable[QueryResult]], dialect: Sql
         except _Skip as e:
             skips.append(e)
         else:
-            if rows is not None and rows > 0:
+            if rows is not None and rows > max(max_scan_rows, 0):
+                return TableSize(rows, "stats"), skips
+            if rows is not None and rows > 0 and max_scan_rows <= 0:
                 return TableSize(rows, "stats"), skips
     if max_scan_rows <= 0:
         return TableSize(None, "unknown"), skips
@@ -752,6 +929,8 @@ class _CodesOutcome:
     rows: int
     note: str
     complete: bool = False
+    #: 列定义（ENUM）列出的取值：这次没出现的也写进码值（含义待填），码值是「可能的取值」
+    declared: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -901,6 +1080,11 @@ def _column(meta: dict[str, Any], name: str) -> str | None:
                  if isinstance(c, dict) and str(c.get("name", "")).lower() == lowered), None)
 
 
+def _column_meta(meta: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """表结构里这一列（类型、取值列表、quote_name）；name 是表结构里的写法（_column 的返回值）。"""
+    return next((c for c in meta.get("columns") or [] if isinstance(c, dict) and c.get("name") == name), None)
+
+
 def _constraint(meta: dict[str, Any], column: str) -> str | None:
     """这一列单独是主键或某个唯一约束时返回「主键」/「唯一约束」，否则 None。"""
     wanted = [column.lower()]
@@ -950,7 +1134,7 @@ async def _unique(cx: _TableCx, table: str, meta: dict[str, Any], column: str,
     if not size.within(cx.settings.max_scan_rows):
         return None, "too_large"
     d = cx.dialect
-    res = await cx.run(d.unique_check_sql(d.table(meta, table), d.quote(column)))
+    res = await cx.run(d.unique_check_sql(d.table(meta, table), d.column(meta, column)))
     row = res.rows[0] if res.rows else [None, None]
     total, distinct = _as_int(row[0]), _as_int(row[1])
     if total is None or distinct is None:
@@ -969,20 +1153,39 @@ def _fk_note(child: tuple[bool | None, str]) -> str:
     return f"{catalog.PROFILE_NOTE_PREFIX}外键约束已保证引用完整，未抽样核对覆盖率；子表一侧{basis}：{shape}"
 
 
+#: MySQL 上比较文字按列的排序规则：常见的排序规则不分大小写（_ci），PAD SPACE 的还忽略尾随空格。覆盖率、唯一性、
+#: 码值的分组都按它算，写进说明，人才知道「A01」和「a01」在这里算同一个值
+MYSQL_COLLATION_NOTE = "MySQL 按列的排序规则比较文字（常见的排序规则不分大小写），覆盖率和唯一性按它计算"
+MYSQL_CODES_COLLATION_NOTE = "MySQL 按列的排序规则分组（常见的排序规则不分大小写），大小写不同的写法可能并成一个取值"
+
+
+def _collation_note(dialect: SqlDialect, family: str | None, note: str) -> str | None:
+    """MySQL、MariaDB 上文字列（或类型认不出的列）的排序规则说明；别的方言、数字列没有。"""
+    return note if dialect.kind in ("mysql", "mariadb") and family in ("text", None) else None
+
+
 def _relation_note(*, sample: int, matched: int, coverage: float, scan_cap: int | None,
                    skipped_values: int, parent: tuple[bool | None, str], child: tuple[bool | None, str] | None,
-                   holds: bool) -> str:
-    """关系的剖析备注：抽样规模、覆盖率、父键和子键唯一的依据。人据此判断这条结论有多可靠。
-    不写日期：什么时候剖析的看这一项的 updated_at（界面按本地时间显示）。"""
+                   holds: bool, unmatchable: int = 0, collation: str | None = None) -> str:
+    """关系的剖析备注：取了多少个键值、看了多少行、覆盖率、父键和子键唯一的依据。人据此判断这条结论有多可靠。
+    不写日期：什么时候剖析的看这一项的 updated_at（界面按本地时间显示）。
+
+    不说「抽样」：DISTINCT … LIMIT 取的是数据库先给出的那几个值，大表上是按存储顺序的前若干行里的值，不是随机抽的
+    （多半是最老的数据）。unmatchable：被指向列是数字、子表取到的却不是整数写法的键值个数（key_literals）——已经算在
+    sample 里、算作没对上，这里说明为什么没去父表里对。"""
     parts: list[str] = []
     low = coverage < catalog.PROFILE_VERIFY_COVERAGE
     if low:
-        parts.append(f"抽样覆盖率 {_percent(coverage)}，可能不是这条关系")
-    scope = f"（只看前 {scan_cap} 行）" if scan_cap else ""
-    sampled = f"子表抽样 {sample} 个不同键值{scope}，父表对上 {matched} 个"
+        parts.append(f"覆盖率 {_percent(coverage)}，可能不是这条关系")
+    scope = f"（按存储顺序只看前 {scan_cap} 行）" if scan_cap else ""
+    sampled = f"子表取了 {sample} 个不同键值{scope}，父表对上 {matched} 个"
     parts.append(sampled if low else f"{sampled}，覆盖率 {_percent(coverage)}")
     if skipped_values:
         parts.append(f"另有 {skipped_values} 个键值的类型不支持核对，未计入")
+    if unmatchable:
+        parts.append(f"其中 {unmatchable} 个不是整数写法，被指向列是数字，算作没对上")
+    if collation:
+        parts.append(collation)
     unique, how = parent
     if unique is True:
         parts.append(f"被指向列是{how}" if how in ("主键", "唯一约束") else "被指向列经计数核对唯一")
@@ -1026,24 +1229,32 @@ async def _check_relation(cx: _TableCx, table: str, rel: dict[str, Any], out: _T
         return
 
     d, s = cx.dialect, cx.settings
+    child_col, parent_col = _column_meta(meta, col), _column_meta(pmeta, pcol)
+    parent_family = catalog.column_family(parent_col)
+    if parent_family == "time":
+        # 时间键不核对：各家时间字面量写法、精度不同，拼出来的 IN 列表对不对得上说不准。不发子表的取值查询
+        raise _Skip("unsupported", f"{parent}.{pcol} 是日期时间，各库的时间写法和精度不同，不核对这种关系的覆盖率")
     size = await cx.size_with_data(table, result)
     scan_cap = cx.scan_cap(size)
     child_table, parent_table = d.table(meta, table), d.table(pmeta, parent)
-    res = await cx.run(d.distinct_sample_sql(child_table, d.quote(col), s.sample_size, scan_cap=scan_cap),
+    res = await cx.run(d.distinct_sample_sql(child_table, d.column(meta, col), s.sample_size, scan_cap=scan_cap),
                        max_rows=s.sample_size)
     kind = (res.column_types or {}).get(res.columns[0]) if res.columns else None
     values = [row[0] for row in res.rows if row]
-    literals = list(dict.fromkeys(lit for v in values if (lit := sql_literal(v, kind)) is not None))
+    literals, unmatchable, unsafe = key_literals(values, kind, parent=parent_family,
+                                                 child_type=(child_col or {}).get("type"))
     if not values:
         raise _Skip("no_data", f"{table}.{col} 没有非空值，无法核对")
-    if not literals:
+    if not literals and not unmatchable:
         raise _Skip("unsupported", f"{table}.{col} 的取值类型不支持核对（只核对整数和文字）")
+    # 分母是子表取到的全部键值：不是整数写法、按类型就对不上整数父键的（unmatchable）也在里面，算作没对上
+    sample = len(literals) + unmatchable
     matched = 0
     for start in range(0, len(literals), IN_CHUNK):
-        sql = d.match_count_sql(parent_table, d.quote(pcol), literals[start:start + IN_CHUNK])
+        sql = d.match_count_sql(parent_table, d.column(pmeta, pcol), literals[start:start + IN_CHUNK])
         matched += _as_int(_first(await cx.run(sql))) or 0
     matched = min(matched, len(literals))
-    coverage = round(matched / len(literals), 4)
+    coverage = round(matched / sample, 4)
 
     parent_unique = await _unique(cx, parent, pmeta, pcol, result)
     child_unique = await _unique(cx, table, meta, col, result) if parent_unique[0] else None
@@ -1051,12 +1262,13 @@ async def _check_relation(cx: _TableCx, table: str, rel: dict[str, Any], out: _T
     if child_unique is not None:
         cardinality = "one_to_one" if child_unique[0] is True else "many_to_one"
     holds = coverage >= catalog.PROFILE_VERIFY_COVERAGE and cardinality is not None
-    note = _relation_note(sample=len(literals), matched=matched, coverage=coverage, scan_cap=scan_cap,
-                          skipped_values=len(values) - len(literals), parent=parent_unique, child=child_unique,
-                          holds=holds)
+    note = _relation_note(sample=sample, matched=matched, coverage=coverage, scan_cap=scan_cap,
+                          skipped_values=unsafe, parent=parent_unique, child=child_unique, holds=holds,
+                          unmatchable=unmatchable,
+                          collation=_collation_note(d, parent_family, MYSQL_COLLATION_NOTE))
     checked = child_unique is not None and child_unique[0] is not None
     out.relations.append(_RelationOutcome(rid=str(rel["id"]), target=_relation_target(rel), coverage=coverage,
-                                          cardinality=cardinality, holds=holds, sample=len(literals),
+                                          cardinality=cardinality, holds=holds, sample=sample,
                                           matched=matched, note=note, cardinality_checked=checked))
 
 
@@ -1076,17 +1288,28 @@ _NOT_CODE_TAILS = frozenset({"id", "no", "num", "number", "name", "desc", "descr
                              "at", "date", "time", "on", "amount", "price", "count", "qty", "rate", "url"})
 #: 像日期的取值：2026-07-01、2026/07/01，后面可以跟时间
 _DATE_TEXT = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}")
+#: 日期列最小值、最大值不计入的值（见 VALID_DATE_FROM）在说明里的说法
+INVALID_DATES = "零日期 0000-00-00、0001-01-01、9999-12-31 这类占位日期或无穷大"
 
 
-def _code_type_ok(type_name: str | None) -> bool:
-    """整数，或者短文字（定长不超过 MAX_CODE_LEN；SQLite 的 TEXT 不带长度，也算）。"""
-    t = (type_name or "").upper()
+def _is_enum(type_name: str | None, enum_values: Any = None) -> bool:
+    """取值列表有限的列：MySQL 的 ENUM(…) / SET(…)，或者探查记了取值列表（PostgreSQL 的枚举：类型写法只是类型名，
+    setup_status 这种以 set 开头的名字不算 SET，见 catalog._MYSQL_ENUM）。"""
+    return bool(enum_values) or catalog._mysql_enum_kind(type_name) is not None
+
+
+def _code_type_ok(type_name: str | None, enum_values: Any = None) -> bool:
+    """ENUM / SET（取值列表有限，直接算码值候选）、整数，或者短文字（定长不超过 MAX_CODE_LEN；SQLite 的 TEXT 不带
+    长度，也算）。类型是按方言编译的完整写法：VARCHAR2(20 CHAR) 的长度按 20 算。"""
+    if _is_enum(type_name, enum_values):
+        return True
+    t = catalog._type_words(type_name)
     if not t or any(k in t for k in ("CLOB", "BLOB", "BINARY", "JSON", "DATE", "TIME", "INTERVAL", "REAL", "FLOAT",
                                      "DOUBLE", "BOOL")):
         return False
     if "INT" in t:
         return True
-    size = re.search(r"\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)", t)
+    size = re.search(r"\(\s*(\d+)(?:\s+(?:CHAR|BYTE))?\s*(?:,\s*(\d+)\s*)?\)", t)
     if any(k in t for k in ("NUMBER", "NUMERIC", "DECIMAL")):
         return size is None or not size.group(2) or int(size.group(2)) == 0
     if any(k in t for k in ("CHAR", "TEXT", "STRING")):
@@ -1100,9 +1323,9 @@ def _looks_like_code(name: str) -> bool:
 
 
 def _code_columns(meta: dict[str, Any], notes: dict[str, Any]) -> list[str]:
-    """要取值分布的列：目录里度量类型记为状态的、剖析以前提过码值候选的（再核一次）、或者类型和命名像状态、
-    类型、渠道的整数或短文字列。主键、唯一约束列、关系里的键列不算；码值人工确认或驳回过的不再取。
-    被遮罩的列也列出来，由检查记为「被遮罩」跳过——要让人看得见为什么它没有码值。"""
+    """要取值分布的列：目录里度量类型记为状态的、剖析以前提过码值候选的（再核一次）、ENUM / SET 列（取值列表有限，
+    不看名字）、或者类型和命名像状态、类型、渠道的整数或短文字列。主键、唯一约束列、关系里的键列不算；码值人工确认
+    或驳回过的不再取。被遮罩的列也列出来，由检查记为「被遮罩」跳过——要让人看得见为什么它没有码值。"""
     pk = [c.lower() for c in meta.get("primary_key") or []]
     unique = {str(g[0]).lower() for g in meta.get("unique") or [] if isinstance(g, list) and len(g) == 1}
     keys = {str(c).lower() for r in notes.get("relations") or [] if isinstance(r, dict) for c in r.get("columns") or []}
@@ -1117,23 +1340,28 @@ def _code_columns(meta: dict[str, Any], notes: dict[str, Any]) -> list[str]:
         status_measure = (isinstance(measure, dict) and measure.get("value") == "status"
                           and measure.get("status") != "rejected")
         profiled = isinstance(codes, dict) and codes.get("source") == "profile"
-        if not (status_measure or profiled or _looks_like_code(name)):
+        enum = _is_enum(col.get("type"), col.get("enum_values"))
+        if not (status_measure or profiled or enum or _looks_like_code(name)):
             continue
         lowered = name.lower()
-        if (pk == [lowered]) or lowered in unique or lowered in keys or not _code_type_ok(col.get("type")):
+        if (pk == [lowered]) or lowered in unique or lowered in keys or not _code_type_ok(col.get("type"),
+                                                                                           col.get("enum_values")):
             continue
         out.append(name)
     return out
 
 
-def _code_key(value: Any) -> str | None:
-    """取值分布里的一个取值 → 码值（文字）。只认整数和不太长的文字。"""
+def _code_key(value: Any, *, fixed: bool = False) -> str | None:
+    """取值分布里的一个取值 → 码值（文字）。只认整数和不太长的文字。fixed：定长文字列（CHAR(n)），去掉补齐的尾随
+    空格（PG、Oracle 取回的是 'A '，WHERE status = 'A' 照样对得上，码值写 'A'）。"""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() else None
+    if isinstance(value, str) and fixed:
+        value = value.rstrip(" ")
     if isinstance(value, str) and value.strip() and len(value) <= MAX_CODE_LEN and not _CONTROL.search(value):
         return value
     return None
@@ -1151,34 +1379,53 @@ async def _check_codes(cx: _TableCx, table: str, column: str, out: _TableOutcome
     if cx.is_masked(column):
         raise _Skip("masked", f"{table}.{column} 在数据源设置中被遮罩，不取值", carry=False)
     d, meta = cx.dialect, cx.tables[table]
+    col_meta = _column_meta(meta, column) or {}
     size = await cx.size_with_data(table, result)
     scan_cap = cx.scan_cap(size)
-    res = await cx.run(d.value_counts_sql(d.table(meta, table), d.quote(column), CODES_MAX + 1, scan_cap=scan_cap),
+    res = await cx.run(d.value_counts_sql(d.table(meta, table), d.column(meta, column), CODES_MAX + 1,
+                                          scan_cap=scan_cap),
                        max_rows=CODES_MAX + 1)
     if not res.rows:
         raise _Skip("no_data", f"{table}.{column} 没有非空值，无法取值分布")
     if len(res.rows) > CODES_MAX:
         raise _Skip("high_cardinality", f"{table}.{column} 的取值超过 {CODES_MAX} 个，不作为码值候选", carry=False)
-    values: list[tuple[str, int]] = []
+    fixed = is_fixed_char(col_meta.get("type"))
+    enum = _is_enum(col_meta.get("type"), col_meta.get("enum_values"))
+    counts: dict[str, int] = {}
     for row in res.rows:
-        key = _code_key(row[0])
+        key = _code_key(row[0], fixed=fixed)
         if key is None:
             raise _Skip("unsupported", f"{table}.{column} 的取值不是整数或短文字，不作为码值候选", carry=False)
-        values.append((key, _as_int(row[1]) or 0))
-    if len(values) >= 3 and all(n == 1 for _, n in values):
-        # 每个取值只出现一次（票种编码 T01…T09）：这是一列标识，不是状态码
+        counts[key] = counts.get(key, 0) + (_as_int(row[1]) or 0)
+    values = list(counts.items())
+    if len(values) >= 3 and all(n == 1 for _, n in values) and not enum:
+        # 每个取值只出现一次（票种编码 T01…T09）：这是一列标识，不是状态码。ENUM 的取值列表是列定义给的，不按这条判
         raise _Skip("high_cardinality", f"{table}.{column} 的取值各不相同，像标识而不是码值，不作为码值候选",
                     carry=False)
     rows = sum(n for _, n in values)
-    scope = f"按前 {scan_cap} 行统计" if scan_cap else "统计全表"
+    # 不说「抽样」：大表看的是按存储顺序的前若干行（多半是最老的数据），不是随机抽的
+    scope = f"按存储顺序取前 {scan_cap} 行统计" if scan_cap else "统计全表"
     spread = "、".join(f"{k}（{_share(n, rows)}）" for k, n in values)
-    note = f"{NOTE_PREFIX}{scope}，{rows} 行非空值共 {len(values)} 个取值：{spread}。"
-    out.codes.append(_CodesOutcome(column=column, values=values, rows=rows, note=note, complete=scan_cap is None))
+    extra: list[str] = []
+    # ENUM 的取值列表（SET 的是成员，取值是成员的组合，不算）：这次没出现的也是可能的取值
+    is_set = catalog._mysql_enum_kind(col_meta.get("type")) == "SET"
+    declared = [] if is_set else [str(v) for v in col_meta.get("enum_values") or []]
+    unseen = [v for v in declared if v not in counts]
+    if unseen:
+        extra.append(f"列定义里另有 {len(unseen)} 个取值这次没有出现：{'、'.join(unseen[:CODES_MAX])}")
+    family = "text" if enum else catalog.column_family(col_meta)
+    collation = _collation_note(d, family, MYSQL_CODES_COLLATION_NOTE)
+    if collation:
+        extra.append(collation)
+    tail = "".join(f"；{x}" for x in extra)
+    note = f"{NOTE_PREFIX}{scope}，{rows} 行非空值共 {len(values)} 个取值：{spread}{tail}。"
+    out.codes.append(_CodesOutcome(column=column, values=values, rows=rows, note=note, complete=scan_cap is None,
+                                   declared=unseen))
 
 
 def _is_date_column(col: dict[str, Any]) -> bool:
     """日期类列（catalog.is_date_column：和 SQL 检查认时间列是同一个判断）。"""
-    return catalog.is_date_column(str(col.get("name") or ""), col.get("type"))
+    return catalog.is_date_column(str(col.get("name") or ""), col.get("type"), enum_values=col.get("enum_values"))
 
 
 async def _check_dates(cx: _TableCx, table: str, columns: list[str], total: int, out: _TableOutcome,
@@ -1190,20 +1437,31 @@ async def _check_dates(cx: _TableCx, table: str, columns: list[str], total: int,
     if not size.within(cx.settings.max_scan_rows):
         raise _Skip("too_large", f"{table} 的行数超过整表统计的行数上限（{cx.settings.max_scan_rows} 行），"
                                  "不取日期列的最小值和最大值")
-    res = await cx.run(d.min_max_sql(d.table(meta, table), [d.quote(c) for c in columns]))
+    # 文字存的日期（SQLite 的 TEXT、业务库里的 VARCHAR 日期）按字符串和有效区间比；日期类型的按日期字面量比
+    texts = [catalog.column_family(_column_meta(meta, c)) != "time" for c in columns]
+    res = await cx.run(d.min_max_sql(d.table(meta, table), [(d.column(meta, c), t) for c, t in zip(columns, texts)]))
     row = res.rows[0] if res.rows else []
+    invalid: dict[str, int] = {}
     for i, column in enumerate(columns):
-        low, high = (row[2 * i], row[2 * i + 1]) if len(row) >= 2 * i + 2 else (None, None)
+        low, high, bad = (row[3 * i], row[3 * i + 1], row[3 * i + 2]) if len(row) >= 3 * i + 3 else (None, None, 0)
+        invalid[column] = _as_int(bad) or 0
         if low is None or high is None or not (_DATE_TEXT.match(str(low)) and _DATE_TEXT.match(str(high))):
             continue
-        result.date_ranges.append({"column": column, "min": str(low), "max": str(high)})
+        found: dict[str, Any] = {"column": column, "min": str(low), "max": str(high)}
+        if invalid[column]:
+            found["invalid"] = invalid[column]
+        result.date_ranges.append(found)
     if total != 1:
         return
     if not result.date_ranges:
+        if invalid.get(columns[0]):
+            raise _Skip("no_data", f"{table}.{columns[0]} 只有 {invalid[columns[0]]} 个无效日期（{INVALID_DATES}），"
+                                   "没有可识别的日期值")
         raise _Skip("no_data", f"{table}.{columns[0]} 没有可识别的日期值")
     found = result.date_ranges[0]
+    dropped = (f"另有 {found['invalid']} 个无效日期（{INVALID_DATES}）未计入，" if found.get("invalid") else "")
     note = (f"{NOTE_PREFIX}表里只有这一个日期类列，取值从 {str(found['min'])[:19]} 到 "
-            f"{str(found['max'])[:19]}，可作为业务日期的参考。")
+            f"{str(found['max'])[:19]}，{dropped}可作为业务日期的参考。")
     out.business_date = _DateOutcome(column=found["column"], low=found["min"], high=found["max"], note=note)
 
 
@@ -1226,7 +1484,7 @@ def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, 
     elif status == "verified":
         summary = f"覆盖率 {_percent(o.coverage)}，" + ("仍为有确证" if previous == "verified" else "升为有确证")
     elif o.coverage < catalog.PROFILE_VERIFY_COVERAGE:
-        summary = f"抽样覆盖率 {_percent(o.coverage)}，保持推断"
+        summary = f"覆盖率 {_percent(o.coverage)}，保持推断"
     else:
         summary = "被指向列未核实唯一，保持推断"
     return {"kind": "relation", "path": f"relations.{o.rid}", "target": o.target,
@@ -1241,6 +1499,8 @@ def _codes_value(c: _CodesOutcome, item: dict[str, Any] | None) -> dict[str, str
     沿用它的含义；它写了、数据里没出现的取值也留着——码值是「可能的取值」，没出现不等于不存在。"""
     old = item.get("value") if isinstance(item, dict) and isinstance(item.get("value"), dict) else {}
     value = {key: str(old.get(key) or "") for key, _ in c.values}
+    for key in c.declared:
+        value.setdefault(key, str(old.get(key) or ""))
     for key, meaning in old.items():
         if key not in value and isinstance(meaning, str) and meaning.strip():
             value[key] = meaning
@@ -1744,8 +2004,8 @@ def ensure_enabled(row: Any, settings: ProfileSettings | None = None) -> Profile
 
 #: 有效行过滤核对的说法（写进这一项的 note；前面是模型给的依据）
 FILTER_CHECKED = "剖析核对：排除 {share} 的行（共 {rows} 行）"
-FILTER_SAMPLED = "剖析核对：按前 {rows} 行统计，排除 {share} 的行"
-FILTER_SAMPLED_EDGE = "剖析核对：按前 {rows} 行统计，{what}，请人工核对"
+FILTER_SAMPLED = "剖析核对：按存储顺序取前 {rows} 行统计，排除 {share} 的行"
+FILTER_SAMPLED_EDGE = "剖析核对：按存储顺序取前 {rows} 行统计，{what}，请人工核对"
 FILTER_UNCHECKED = "没有核对排除比例（{why}）"
 FILTER_NOT_ENABLED = "数据源没有开数据剖析"
 

@@ -555,3 +555,15 @@ async def test_checker_builds_relation_graph_lazily_and_reuses_it(cache, monkeyp
     checker.check(FANOUT[0])
     checker.check(FANOUT[1])
     assert calls == [1]
+
+
+def test_a_postgres_enum_whose_type_name_says_date_is_not_a_time_column():
+    """PG 的枚举编译出来就是类型名本身（update_date_kind 里也有 DATE）：探查记下了 enum_values 的列，SQL 检查和剖析一样
+    不把它当时间列。以前 SQL 检查认时间列时没把取值列表传进去，剖析不认、SQL 检查却认，两边对不上。"""
+    from app.data.sqlcheck import _Table
+
+    meta = {"columns": [{"name": "kind", "type": "update_date_kind", "enum_values": ["a", "b"]},
+                        {"name": "paid_on", "type": "DATE"}]}
+    table = _Table(alias="t", name="t", meta=meta, notes={}, order=0)
+    assert not table.temporal("kind")
+    assert table.temporal("paid_on")

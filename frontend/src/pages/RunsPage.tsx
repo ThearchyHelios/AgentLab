@@ -18,7 +18,7 @@ import {
 } from './runs/model'
 import { ORIGIN_TEXT, TASK_LOG_TEXT, UNSAVED_NAME, originLabel } from '../lib/terms'
 import { RunTabs, type TabItem } from './runs/parts'
-import { useApprovalQueue, useRunList, useStatusCounts, useTaskQueue } from './runs/useRunsData'
+import { useApprovalQueue, useRunList, useStatusCounts, useTaskQueue, useUnlistedRuns } from './runs/useRunsData'
 import './runs/runs.css'
 
 /**
@@ -95,6 +95,8 @@ export function RunsPage() {
 
   const filters = { codes, runClass, workflowId, q: parsed.q, origin }
   const list = useRunList(filters, tab !== 'approvals' && !impossible)
+  // 系统派生的运行（评测、口径对账、召回）默认不列：列表底下照实写有几次没列出
+  const unlisted = useUnlistedRuns(filters, epoch, tab !== 'approvals' && !impossible)
   // 计数两份：页签和分段上的跟着当前的类别、工作流、名称条件走；右侧总览说的
   // 是全局——筛掉了不代表事情没了
   const narrowed = !!(runClass || workflowId || parsed.q || origin)
@@ -251,6 +253,7 @@ export function RunsPage() {
                 emptyBody={tab === 'all' ? '在问数据或画布中发起运行后，完整轨迹会记录在这里。' : undefined}
                 filtered={filterNote}
                 onClear={clearFilters}
+                unlisted={unlisted}
               />
             )}
           </div>

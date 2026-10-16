@@ -6,8 +6,9 @@ import {
 } from '../../components/ui'
 import { formatDateTime } from '../../lib/format'
 import { NOTIFY_TEXT as T, SETTINGS_ROLE_TEXT } from '../../lib/terms'
+import { NOTIFY_PERSONAL_EVENT_LABEL } from '../../lib/termsApp'
 import { useAtLeast } from '../../store/auth'
-import type { NotifyChannelRow } from '../../typesApp'
+import type { NotifyChannelRow, NotifyEventRow } from '../../typesApp'
 
 /*
  * 设置 → 通知（A4 第 7 条）：待办、动作的事件推送到哪些地址。格式只有 Webhook 的四种（Q6），发送核心和定时任务的
@@ -18,6 +19,9 @@ import type { NotifyChannelRow } from '../../typesApp'
 
 const FORMATS = ['generic', 'feishu', 'wecom', 'dingtalk'] as const
 const EVENTS = Object.keys(T.eventLabel)
+/** 事件在这个范围的渠道上怎么叫：个人渠道的实例结束只推自己发起的，叫「我发起的实例完成 / 失败」 */
+const eventLabel = (event: string, scope: string): string =>
+  (scope === 'user' ? NOTIFY_PERSONAL_EVENT_LABEL[event] : undefined) ?? T.eventLabel[event] ?? event
 
 export function NotifyTab() {
   const builder = useAtLeast('builder')
@@ -86,7 +90,7 @@ export function NotifyTab() {
                   </div>
                   <div className="truncate text-2xs text-faint">
                     <span className="mono">{row.url_host}</span>
-                    {row.events.length > 0 && ` · ${row.events.map((e) => T.eventLabel[e] ?? e).join('、')}`}
+                    {row.events.length > 0 && ` · ${row.events.map((e) => eventLabel(e, row.scope)).join('、')}`}
                   </div>
                 </div>
                 <label className="flex items-center gap-1 text-2xs">
@@ -120,7 +124,7 @@ function Deliveries() {
         <div className="divide-y rounded-lg border text-2xs">
           {rows.map((d) => (
             <div key={d.id} className="flex items-center gap-2 px-3 py-1.5">
-              <span className="w-28 shrink-0 text-dim">{T.eventLabel[d.event] ?? d.event}</span>
+              <span className="w-28 shrink-0 text-dim">{T.deliveryEventLabel[d.event] ?? T.eventLabel[d.event] ?? d.event}</span>
               <span className="min-w-0 flex-1 truncate text-faint">{d.error ?? (d.http_status ? `HTTP ${d.http_status}` : '')}</span>
               <span className="shrink-0" style={{ color: d.status === 'ok' ? 'var(--ok)' : d.status === 'failed' ? 'var(--st-failed)' : undefined }}>
                 {d.status === 'ok' ? '已送达' : d.status === 'failed' ? '失败' : d.status}
@@ -144,6 +148,13 @@ function ChannelEditor({ row, onClose, onSaved }: {
     url: '', secret: '', events: row?.events ?? ['task.opened', 'action.unknown'],
   })
   const [busy, setBusy] = useState(false)
+  // 列哪些事件由服务端说（notify/service.EVENTS 的 scopes）：这种范围的渠道收得到的才列，登记了还没推送的不列（勾了收不到）。
+  // 已经订阅着的、刚勾上的照样列出来，看得到、能取消
+  const [registry, setRegistry] = useState<NotifyEventRow[] | null>(null)
+  const [registryFailed, setRegistryFailed] = useState(false)
+  useEffect(() => { api.notify.events().then(setRegistry).catch(() => setRegistryFailed(true)) }, [])
+  const offered = EVENTS.filter((ev) => form.events.includes(ev) || row?.events.includes(ev)
+    || registry?.some((r) => r.event === ev && r.scopes.includes(form.scope)))
   const save = async () => {
     setBusy(true)
     try {
@@ -206,15 +217,17 @@ function ChannelEditor({ row, onClose, onSaved }: {
         </Field>
         <fieldset>
           <legend className="label">{T.events}</legend>
-          <div className="grid grid-cols-3 gap-1.5">
-            {EVENTS.map((ev) => (
-              <label key={ev} className="flex items-center gap-1.5 text-xs">
+          <div className="grid grid-cols-3 gap-1.5" data-notify-events={registry ? form.scope : ''}>
+            {offered.map((ev) => (
+              <label key={ev} className="flex items-center gap-1.5 text-xs" data-notify-event={ev}>
                 <input type="checkbox" className="accent-[var(--accent)]" checked={form.events.includes(ev)}
                        onChange={(e) => setForm({ ...form, events: e.target.checked ? [...form.events, ev] : form.events.filter((x) => x !== ev) })} />
-                {T.eventLabel[ev]}
+                {eventLabel(ev, form.scope)}
               </label>
             ))}
           </div>
+          {registryFailed ? <p className="mt-1 text-2xs" style={{ color: 'var(--st-failed)' }} role="alert">{T.eventsError}</p>
+            : !registry && <p className="mt-1 flex items-center gap-1 text-2xs text-faint"><Spinner size={10} /> {T.eventsLoading}</p>}
         </fieldset>
       </div>
     </Modal>

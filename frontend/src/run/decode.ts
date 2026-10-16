@@ -6,7 +6,7 @@ import {
   ABSENCE_CLAIM_TEXT, ACTION_CONFIRM_TEXT, ACTION_ENV_LABEL, ACTION_LOG_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, LOOK_TEXT, MERGE_TEXT,
   ORIGIN_TEXT, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, TASK_KIND_LABEL, TASK_LOG_TEXT, TASK_STATUS_LABEL, TASK_TEXT, TYPE_LABEL, originLabel,
   CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, MASKED_CELL_TEXT, NODE_TYPE_LABEL,
-  VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText, FILE_TEXT,
+  VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText, FILE_TEXT, REJECTED_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -2673,6 +2673,12 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 用户主动停下的，不是出错：收成中性的"已取消"，不画红色的失败。谁停的、放弃等
         // 审批时一并关了几条，写在副标题上——多人用时「怎么没了」得有个交代
         settle(endingOf(event, awaiting)!)
+        if (d.reason === 'rejected') {
+          // 人的驳回（05-已知遗留 (a)）：同样不是出错，标题写「被驳回」，副标题写谁在哪一步驳回、备注
+          out.push({ id: `rc-${seq}`, seq, kind: 'lifecycle', status: 'cancelled', title: REJECTED_TEXT.title,
+                     sub: REJECTED_TEXT.sub(d), ...(d.node_id ? { nodeId: String(d.node_id) } : {}) })
+          break
+        }
         // 说法和画布胶囊的那一句一致：「张工 放弃了这次运行，1 条待审批一并关闭」
         const who = typeof d.actor === 'string' && d.actor.trim() ? d.actor.trim() : ''
         const said = String(d.message ?? '').trim()

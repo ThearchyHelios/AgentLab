@@ -173,8 +173,8 @@ async def test_unknown_result_with_lookup_is_reconciled_automatically_and_sent_o
         await run_manager.continue_failed(run_id)
     assert refused.value.code == "action_unresolved"
 
-    assert await actions.tick(utcnow()) == 0       # 还没到第一次查询的时候
-    assert await actions.tick(utcnow() + timedelta(minutes=2)) == 1
+    assert rec.id not in await actions.tick(utcnow())       # 还没到第一次查询的时候
+    assert rec.id in await actions.tick(utcnow() + timedelta(minutes=2))
     final = await _wait(run_id, ("succeeded", "failed"))
     assert final.status == "succeeded", final.error
     assert len(erp.writes()) == 1 and len(erp.lookups) == 1
@@ -410,7 +410,7 @@ async def test_a_changed_params_schema_does_not_fail_a_write_that_already_went_o
     with pytest.raises(actions.ActionPending):
         await actions.prepare(run_id=run_id, node_id="pay", exec_no=1, capability=caps[PAY], args=args)
 
-    assert await actions.tick(utcnow() + timedelta(minutes=2)) == 1
+    assert rec.id in await actions.tick(utcnow() + timedelta(minutes=2))
     final = await _wait(run_id, ("succeeded", "failed"))
     assert final.status == "succeeded", final.error
     assert len(erp.writes()) == 1
@@ -457,9 +457,15 @@ async def test_a_rejected_confirmation_reads_as_a_decision_not_a_fault(erp, capa
     run_id = await _formal(pay_graph())
     task = await _task(run_id, "action_confirm")
     await tasks.respond(task.id, ANN, decision="reject", note="金额不对")
-    final = await _wait(run_id, ("succeeded", "failed"))
-    # 引擎里驳回就是节点失败、运行结束（没有可走的出口）；说法写成未确认（被驳回），实例页按人的决定说
-    assert final.status == "failed" and final.error.startswith("「pay」未确认（被驳回），没有发送：金额不对")
+    final = await _wait(run_id, ("succeeded", "failed", "cancelled"))
+    # 驳回是人的决定，不是故障（05-已知遗留 (a)）：运行收成 cancelled + end_reason=rejected，原话照旧写未确认（被驳回），
+    # run.cancelled 带上在哪一步、谁、备注；实例页按人的决定说
+    assert (final.status, final.end_reason) == ("cancelled", "rejected")
+    assert final.error.startswith("「pay」未确认（被驳回），没有发送：金额不对")
+    [ended] = await _events(run_id, "run.cancelled")
+    assert {k: ended.data[k] for k in ("reason", "node_id", "kind", "decision", "note")} == {
+        "reason": "rejected", "node_id": "pay", "kind": "action_confirm", "decision": "reject", "note": "金额不对"}
+    assert not await _events(run_id, "run.failed")
     view = await _instance_view(run_id)
     assert (view["hdr"]["status_code"], view["hdr"]["status_text"]) == ("cancelled", "「pay」未确认（被驳回）")
     step = next(s for s in view["tl"]["steps"] if s["node"] == "pay")
@@ -481,7 +487,7 @@ async def test_unknown_then_reconciled_reads_as_waiting_then_a_footnote(erp, cap
     [row] = view["act"]["records"]
     assert row["state"] == "unknown" and "error" not in row and "ReadTimeout" in row["note"]
 
-    assert await actions.tick(utcnow() + timedelta(minutes=2)) == 1
+    assert row["id"] in await actions.tick(utcnow() + timedelta(minutes=2))
     final = await _wait(run_id, ("succeeded", "failed"))
     assert final.status == "succeeded", final.error
     view = await _instance_view(run_id)

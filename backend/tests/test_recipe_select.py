@@ -210,16 +210,30 @@ def _subtotals() -> Book:
 
 
 @pytest.mark.parametrize("ref,bottom,where", [
-    ("A1:C7", "box", "第 4 行像合计行"),       # 小计夹在框中间
     ("A1:C4", "box", "第 4 行像合计行"),       # 框到小计为止：它下面紧接着还有明细，是夹在中间的小计
     ("A1:C3", "box", "第 4 行像合计行"),       # 框到小计上一行：下一行是小计，同上
-    ("A1:C3", "auto", "第 4 行像合计行"),      # 按规则推断：起草器在这里记失败，框选同样不收
 ])
 def test_subtotal_in_the_middle_is_never_imported_as_data(ref, bottom, where):
     b = _subtotals()
     res = selection_edit(None, b.grid, sel(ref, "list", "明细", bottom=bottom), extraction=None)
     assert not res.ok and set(codes(res)) == {"selection_bottom_not_anchorable"}, res.problems
     assert where in res.problems[0].message and "明细!A4" in res.problems[0].cells
+
+
+@pytest.mark.parametrize("ref,bottom", [
+    ("A1:C7", "box"),        # 小计夹在框中间、合计在框底
+    ("A1:C3", "auto"),       # 按规则推断：起草器把夹在中间的小计提议成小计（期 5），框选同样
+])
+def test_subtotal_in_the_middle_becomes_subtotals_not_data(ref, bottom):
+    """期 5：夹在中间、第一列以合计字样开头的行提议成小计（ListRows.subtotals）：不进数据，按各组明细核对。"""
+    b = _subtotals()
+    res = selection_edit(None, b.grid, sel(ref, "list", "明细", bottom=bottom), extraction=None)
+    assert res.ok, res.problems
+    [op] = res.ops                                       # 配方为空：一条根替换，新建只有这一个块的配方
+    block = op["value"]["sheets"][0]["blocks"][0]
+    assert block["rows"]["subtotals"] == {"label_column": "地区", "pick": "小计", "scope": "since_previous",
+                                         "group_column": None, "keep_as": None}
+    assert block["rows"]["total_row"]["pick"] == "合计"
 
 
 def test_total_word_in_another_column_is_not_imported_as_data():

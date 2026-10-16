@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 
 import pytest
@@ -365,7 +366,7 @@ async def test_profile_marks_codes_complete_only_when_the_whole_table_was_read(c
     capped = await make_source(scenic_db, options=_on(max_scan_rows=0, sample_size=10), draft=["visits"])
     await _profile(client, capped, ["visits"])
     codes = (await _notes(client, capped, "visits"))["notes"]["columns"]["status"]["codes"]
-    assert "按前 10 行统计" in codes["note"] and "complete" not in codes
+    assert "按存储顺序取前 10 行统计" in codes["note"] and "complete" not in codes
 
 
 # ==========================================================================
@@ -406,6 +407,95 @@ async def test_rerun_on_another_day_with_same_data_keeps_the_version(client, mak
     assert set(codes["value"]) == {"0", "1", "2"} and codes["updated_at"] == DAY3
     # A7：说明里不写日期（以前写的是 UTC 日期，和界面上的本地时间对不上），时间以这一项的 updated_at 为准
     assert codes["note"].startswith("数据剖析：") and "2026-10-03" not in codes["note"]
+
+
+#: 升级前剖析写的说法 → 现在的说法（下一轮 C1：大表看的是按存储顺序的前 N 行，不是抽样）。测试里反过来用：把新写法
+#: 改回旧写法，模拟升级前写进目录的备注
+_WORDING = (("覆盖率 ", "抽样覆盖率 ", "，可能不是这条关系"), ("子表取了 ", "子表抽样 ", None),
+            ("（按存储顺序只看前 ", "（只看前 ", None), ("按存储顺序取前 ", "按前 ", None))
+
+
+def _legacy(note: str) -> str:
+    out = note
+    for new, old, tail in _WORDING:
+        if tail:
+            out = re.sub(re.escape(new) + r"(\S+?)" + re.escape(tail), lambda m: old + m.group(1) + tail, out)
+        else:
+            out = out.replace(new, old)
+    return out
+
+
+def _profile_notes(notes: dict) -> list[dict]:
+    """目录里剖析写了备注的项（关系、码值、业务日期）。"""
+    found = [r for r in notes.get("relations") or [] if catalog.is_profile_note(r.get("note"))]
+    for column in (notes.get("columns") or {}).values():
+        found += [item for item in column.values() if isinstance(item, dict)
+                  and catalog.is_profile_note(item.get("note"))]
+    bdate = notes.get("business_date")
+    return found + ([bdate] if isinstance(bdate, dict) and catalog.is_profile_note(bdate.get("note")) else [])
+
+
+def test_profile_notes_in_the_old_wording_are_the_same_note():
+    """改过的四处说法：旧写法和新写法一字之外都一样才算同一句；数变了、或者不是剖析写的备注，照旧算不同。"""
+    old = "数据剖析：抽样覆盖率 15%，可能不是这条关系；子表抽样 20 个不同键值（只看前 100 行），父表对上 3 个；被指向列是主键。"
+    new = "数据剖析：覆盖率 15%，可能不是这条关系；子表取了 20 个不同键值（按存储顺序只看前 100 行），父表对上 3 个；被指向列是主键。"
+    assert catalog.same_profile_note(old, new) and catalog.same_profile_note(new, old)
+    assert catalog.same_profile_note(old.replace("数据剖析：", "数据剖析（2026-10-01）："), new)
+    assert not catalog.same_profile_note(old, new.replace("对上 3 个", "对上 4 个"))
+    codes_old = "数据剖析（2026-10-01）：按前 10 行统计，10 行非空值共 2 个取值：1（90%）、0（10%）。"
+    codes_new = "数据剖析：按存储顺序取前 10 行统计，10 行非空值共 2 个取值：1（90%）、0（10%）。"
+    assert catalog.same_profile_note(codes_old, codes_new)
+    assert not catalog.same_profile_note(codes_old, codes_new.replace("前 10 行", "前 20 行"))
+    # 起草写的有效行过滤备注：只认接在后面的剖析核对那句
+    filter_old = "依据：status 为 1 才是有效记录。剖析核对：按前 100,000 行统计，排除 3% 的行"
+    filter_new = "依据：status 为 1 才是有效记录。剖析核对：按存储顺序取前 100,000 行统计，排除 3% 的行"
+    assert catalog.same_profile_note(filter_old, filter_new)
+    assert not catalog.same_profile_note(filter_old, filter_new.replace("3%", "4%"))
+    # 不是剖析写的备注：「抽样覆盖率」是人写的原话，不换
+    assert not catalog.same_profile_note("人工备注：抽样覆盖率 15%，可能不是这条关系",
+                                         "人工备注：覆盖率 15%，可能不是这条关系")
+    assert not catalog.same_profile_note(new, "覆盖率 15%，可能不是这条关系")
+
+
+async def test_rerun_after_upgrade_keeps_the_version_when_only_the_wording_changed(client, make_source, tmp_path):
+    """升级前写进目录的剖析备注用的是旧说法（「抽样覆盖率」「子表抽样」「（只看前 N 行）」「按前 N 行统计」）。数据
+    没变、升级后第一次重新剖析：结论一字不差、只是措辞改了，不算变化——否则每张有剖析结论的表都升一个版本，发布时
+    记下的目录版本对不上，之后每次正式运行都提醒「目录有变化」。"""
+    path = scenic.build(tmp_path / "wording.db")
+    db = sqlite3.connect(path)
+    try:
+        db.execute("CREATE TABLE lots (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        db.executemany("INSERT INTO lots VALUES (?, ?)", [(i, f"{i} 号停车区") for i in (1, 2, 3)])
+        db.executemany("INSERT INTO parking_records VALUES (?, ?, ?, ?, ?, ?)",
+                       [(i, 1 + i % 20, None, "2026-08-01 09:00:00", None, 10.0) for i in range(1, 101)])
+        db.commit()
+    finally:
+        db.close()
+    tables = ["visits", "parking_records"]
+    whole = await make_source(path, options=_on(), draft=tables)
+    capped = await make_source(path, options=_on(max_scan_rows=0, sample_size=10), draft=tables)
+    seen: set[str] = set()
+    for sid in (whole, capped):
+        await _profile(client, sid, tables)
+        for table in tables:
+            detail = await _notes(client, sid, table)
+            notes = detail["notes"]
+            for item in _profile_notes(notes):
+                old = _legacy(item["note"])
+                seen |= {o for _, o, _ in _WORDING if o in old}
+                item["note"] = old
+            async with SessionLocal() as session:
+                await catalog.write_entry(session, sid, table, notes, if_version=detail["version"], actor=None)
+    assert seen == {o for _, o, _ in _WORDING}, "四处旧说法都写进了目录"
+
+    for sid in (whole, capped):
+        before = {t: await _notes(client, sid, t) for t in tables}
+        body = await _profile(client, sid, tables)
+        for table in tables:
+            done = _table(body, table)
+            assert (done["added"], done["updated"], done["removed"]) == (0, 0, 0), (table, done)
+            assert done["version"] == before[table]["version"]
+            assert (await _notes(client, sid, table))["notes"] == before[table]["notes"]
 
 
 def test_merge_ignores_a_profile_note_that_only_changed_its_date():

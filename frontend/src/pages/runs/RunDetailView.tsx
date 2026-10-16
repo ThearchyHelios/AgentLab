@@ -205,7 +205,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
   const aimed = focus && !goneFromCanvas(focus) ? focus : null
   const canvasHref = hrefFor(aimed)
   // 还在往前走的叫「打开」（接着看实时的、去处理），停下的叫「回放」
-  const replayable = code === 'succeeded' || code === 'failed' || code === 'cancelled'
+  const replayable = code === 'succeeded' || code === 'failed' || code === 'cancelled' || code === 'rejected'
   const dup = !!run.workflow_id && duplicateNames(workflows.map((w) => ({ id: w.id, name: w.name }))).has(run.workflow_name)
 
   // ---- 动作 ----
@@ -730,7 +730,10 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
 /** 事件之外的事实（查到的状态、有没有审批）和事件推出的相位合成一个显示码 */
 function displayCode(run: Run, phase: RunPhase, pending: boolean | undefined): StatusCode {
   switch (phase) {
-    case 'running': case 'queued': case 'waiting': case 'succeeded': case 'failed': case 'cancelled':
+    case 'cancelled':
+      // 被驳回只看服务端的 end_reason（05-已知遗留 (a)）
+      return run.end_reason === 'rejected' ? 'rejected' : 'cancelled'
+    case 'running': case 'queued': case 'waiting': case 'succeeded': case 'failed':
       return phase
     case 'suspended':
       // 后端写的是 interrupted：服务重启打断、没有审批，叫「已挂起 · 可续跑」

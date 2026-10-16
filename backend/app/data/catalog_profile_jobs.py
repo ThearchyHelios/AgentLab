@@ -58,6 +58,9 @@ from app.db.models import CatalogDraftJob, CatalogProfileJob, CatalogProfileTask
 
 logger = logging.getLogger(__name__)
 
+#: 剖析任务占同源队（叫法登记在运行时里，见 core/job_runtime.register_lane_kind）
+runtime.register_lane_kind("profile", "剖析")
+
 #: 一个任务最多几张表
 MAX_TABLES = 500
 #: 每个源保留几个结束了的剖析任务（某张表最近一次剖析所在的任务另外保留）

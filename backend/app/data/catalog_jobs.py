@@ -55,6 +55,11 @@ logger = logging.getLogger(__name__)
 
 _OPEN = runtime.OPEN
 
+#: 起草这边占同源队的几种事（叫法登记在运行时里，见 core/job_runtime.register_lane_kind）：后台起草任务、同步起草、导入目录
+runtime.register_lane_kind("draft", "起草")
+runtime.register_lane_kind("sync_draft", "同步起草")
+runtime.register_lane_kind("import", "导入目录")
+
 #: 一个任务最多几张表；起草要求、本次说明最多几个字
 MAX_TABLES = 500
 GUIDANCE_MAX = 2000

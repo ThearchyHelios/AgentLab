@@ -572,17 +572,18 @@ async def _continue(run_id: str, actor: str | None) -> Any:
         return None
 
 
-async def tick(now: datetime | None = None) -> int:
-    """调度循环每一拍：对登记了 lookup 的结果未知动作带退避地查询。返回查了几条。"""
+async def tick(now: datetime | None = None) -> list[str]:
+    """调度循环每一拍：对登记了 lookup 的结果未知动作带退避地查询。交回这一拍查过的动作记录 id（同 tasks.tick）。"""
     now = now or utcnow()
     async with SessionLocal() as session:
         due = list((await session.execute(select(ActionRecord.id, ActionRecord.next_lookup_at).where(
             ActionRecord.state == "unknown", ActionRecord.next_lookup_at.is_not(None),
             ActionRecord.next_lookup_at <= now))).all())
-    done = 0
+    done: list[str] = []
     for action_id, claimed_at in due:
         try:
-            done += await _lookup(action_id, claimed_at, now)
+            if await _lookup(action_id, claimed_at, now):
+                done.append(action_id)
         except Exception:  # noqa: BLE001 - 一条出错不拖住这一拍的其他动作
             logger.exception("动作 %s 的结果查询失败，下一拍再试", action_id)
     return done

@@ -159,12 +159,16 @@ class TableKind:
 
     @classmethod
     async def load(cls, sources: list[Any], *, graph: Mapping[str, Any] | None = None,
-                   picker: Picker | None = None) -> TableKind:
-        """读各源的数据目录。graph 是现有工作流（改图时的原图、追问时上一轮的图），概览里列出它查过的表。"""
-        from app.tools.datasource import _catalog_of
+                   picker: Picker | None = None, catalog_view: Any = None) -> TableKind:
+        """读各源的数据目录。graph 是现有工作流（改图时的原图、追问时上一轮的图），概览里列出它查过的表。
 
+        读哪一份目录由 catalog_view 定（data/catalog_view.py：当前目录、目录快照、关；只用已核实的项），不给是当前目录。
+        查看结果里的目录和运行时 db_schema 给模型看的、自查用的是同一份——评测的「目录对照」量的才是整份贡献。"""
+        from app.data.catalog_view import CatalogView, read
+
+        view = CatalogView.parse(catalog_view)
         seeds = graph_tables(graph, sources)
-        plans = [SourcePlan(source=s, entries=await _catalog_of(s) if introspect.table_names(s) else {},
+        plans = [SourcePlan(source=s, entries=await read(view, s) if introspect.table_names(s) else {},
                             seeds=seeds.get(s.name, [])) for s in sources]
         return cls(plans, picker=picker)
 

@@ -49,8 +49,8 @@ export const SEGMENT_CODES: StatusCode[] = RUN_STATUS_ORDER
  * 打断后没有审批——要看待审批列表才分得开。approvals 还没加载时传 null，按
  * 等待审批算（最常见的来源），不会在加载的那一瞬间闪成「已挂起」。
  */
-export function runCode(run: Pick<Run, 'id' | 'status'>, approvals: Approval[] | null): StatusCode {
-  if (run.status !== 'interrupted') return resolveStatus(run.status)
+export function runCode(run: Pick<Run, 'id' | 'status' | 'end_reason'>, approvals: Approval[] | null): StatusCode {
+  if (run.status !== 'interrupted') return resolveStatus(run.status, { endReason: run.end_reason })
   return resolveStatus(run.status, {
     pendingApproval: approvals == null ? undefined : hasPendingApproval(approvals, run.id),
   })
@@ -93,6 +93,8 @@ for (const [word, codes] of [
   ['挂起', ['held']], ['中断', ['held']], ['已中断', ['held']], ['可继续运行', ['held']],
   ['interrupted', ['waiting', 'held']],
   ['取消', ['cancelled']], ['canceled', ['cancelled']],
+  // 被驳回（审批人的决定，不是失败）：屏幕上写「被驳回」，人也会只搜「驳回」
+  ['驳回', ['rejected']], ['已驳回', ['rejected']],
   ['出错', ['failed']], ['报错', ['failed']], ['error', ['failed']],
   ['排队', ['queued']], ['执行中', ['running']], ['进行中', ['running']],
 ] as [string, StatusCode[]][]) addWord(word, codes)
@@ -217,7 +219,7 @@ export type ShapeKind = 'active' | 'wait' | 'other' | 'unknown' | 'live'
 export interface RunShape {
   /** 各段占墙钟的比例，加起来是 1；空数组 = 连墙钟都不知道 */
   segs: { kind: ShapeKind; frac: number; open?: boolean }[]
-  /** 收在哪种结局上：只给要注意的几种，已完成不标 */
+  /** 收在哪种结局上：只给要注意的几种，已完成不标。被驳回和已取消同一个结束标记（同 lib/status 的剪影和颜色） */
   end: 'failed' | 'cancelled' | 'suspended' | null
   title: string
 }
@@ -266,7 +268,7 @@ export function runShape(
     }
   }
 
-  const end: RunShape['end'] = code === 'failed' ? 'failed' : code === 'cancelled' ? 'cancelled'
+  const end: RunShape['end'] = code === 'failed' ? 'failed' : code === 'cancelled' || code === 'rejected' ? 'cancelled'
     : code === 'held' || code === 'suspended' ? 'suspended' : null
   if (t.wallMs == null || t.wallMs <= 0) {
     return { segs: [], end, title: t.activeMs != null ? timingTitle(t) : '没有时长记录' }

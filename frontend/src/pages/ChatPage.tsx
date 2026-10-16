@@ -17,14 +17,15 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { canLeave, leavePass } from '../lib/leave'
 import { formatNumber, formatTime } from '../lib/format'
-import { CHAT_BLUEPRINT_TEXT } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT, REJECTED_TEXT, TURN_COST_TEXT, runCostText } from '../lib/terms'
 import { useCatalog, useCatalogListState, useDatasources, useOnReconnect, type CatalogListState } from '../store/catalog'
 import { useAtLeast } from '../store/auth'
 import { useBlueprint } from '../store/blueprint'
 import type { BlueprintScope } from '../typesBlueprint'
 import { blueprintPath, useCreateScope } from './blueprints/shared'
 import {
-  agentSteps, busyTurn, isBusy, stepsVisible, useChat, type Attempt, type ChatTurn, type Failure, type ScopeSource,
+  agentSteps, busyTurn, isBusy, stepsVisible, turnCost, usageOfTurn, useChat, type Attempt, type ChatTurn, type Failure,
+  type ScopeSource,
 } from '../store/chat'
 import { lastVisited, useConversations } from '../store/conversations'
 import {
@@ -383,7 +384,8 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
       : turn.phase === 'error' ? 'error'
       : live || turn.phase === 'checking' ? 'running' : 'done',
     // 没核对上的不知道结局，用「未运行」那个空心点，不画成完成也不画成失败
-    statusCode: turn.phase === 'cancelled' ? 'cancelled'
+    // 被人驳回的（turn.rejected，服务端 end_reason=rejected）照 lib/status 写「被驳回」，不写「已取消」
+    statusCode: turn.phase === 'cancelled' ? (turn.rejected ? 'rejected' : 'cancelled')
       : turn.phase === 'suspended' ? 'suspended'
       // 助手反问：这一轮结束了，在等用户回答
       : turn.asked && turn.phase === 'done' ? 'waiting'
@@ -422,9 +424,32 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     // 可能先到一两条事件，流会拿第一步的起点顶上，计时器从提问那天跑起
     startedAt: live ? turn.startedAt : null,
     elapsedMs: !live && turn.endedAt ? turn.endedAt - turn.startedAt : turn.meta?.ms ?? undefined,
+    cost: costOf(turn),
   }
   streamCache.set(turn, out)
   return out
+}
+
+/**
+ * 这一轮的花费（助手建图 + 运行 + 复核，store 的 usageOfTurn）：没花钱、也没有估不出的（演示模型、老轮次）不写。
+ * 悬停写各部分，估不出的照实说金额只是下限
+ */
+function costOf(turn: ChatTurn): StreamTurn['cost'] {
+  const usage = usageOfTurn(turn)
+  const total = turnCost(usage)
+  if (!usage || !total || (!total.usd && !total.unpriced)) return undefined
+  const text = runCostText(total.usd, total.unpriced)
+  if (!text) return undefined
+  const part = (label: string, u: { cost_usd?: number | null; unpriced_calls?: number } | undefined) =>
+    `${label} ${runCostText(u?.cost_usd ?? 0, u?.unpriced_calls ?? 0) ?? '—'}`
+  const run = turnCost({ earlier: usage.earlier, run: usage.run })
+  const parts = [
+    part(TURN_COST_TEXT.copilot, usage.copilot),
+    part(TURN_COST_TEXT.run, run ? { cost_usd: run.usd, unpriced_calls: run.unpriced } : undefined),
+    part(TURN_COST_TEXT.review, usage.review),
+  ].join(' · ')
+  return { text, title: [TURN_COST_TEXT.title(parts), total.unpriced ? TURN_COST_TEXT.unpriced(total.unpriced) : '']
+    .filter(Boolean).join('\n') }
 }
 
 /**
@@ -729,6 +754,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
 
   // 中断、取消、没核对上在流里不出红框（它们不是故障），为什么停、停了意味着什么在这里说
   const note = kind === 'suspended' || kind === 'unknown' ? turn.failure
+    : kind === 'cancelled' && turn.rejected ? { title: '', reason: REJECTED_TEXT.chatReason, hint: turn.rejected.sub }
     : kind === 'cancelled' ? { title: '', reason: turn.run ? '你已停止本轮，对应的运行也已一并取消。' : '你在搭建工作流时停止了本轮。' }
     : null
 
@@ -800,7 +826,7 @@ function remedyOf(t: ChatTurn): Remedy | null {
 }
 
 const OUTCOME: Record<Attempt['outcome'], string> = {
-  failed: 'failed', cancelled: 'cancelled', suspended: 'suspended',
+  failed: 'failed', cancelled: 'cancelled', rejected: 'rejected', suspended: 'suspended',
   unusable: 'failed', partial: 'waiting', done: 'succeeded',
 }
 

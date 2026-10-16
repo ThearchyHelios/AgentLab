@@ -4,12 +4,13 @@ import clsx from 'clsx'
 import { api } from '../../api/client'
 import { Field, Notice, Spinner, isComposing, toast, useRadioGroup } from '../../components/ui'
 import { errorMessage } from '../../lib/errors'
+import { cleanPublicUrl, isPublicUrl, publicAddressOf } from '../../lib/publicUrl'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import type { ScheduleEvent, ScheduleWebhook, ScheduleWebhookTest } from '../../types'
-import { SCHEDULE_EVENTS, WEBHOOK_FORMATS, isHttpUrl, webhookTestText, type FormField, type WebhookForm } from './model'
+import { SCHEDULE_EVENTS, WEBHOOK_FORMATS, webhookTestText, type FormField, type WebhookForm } from './model'
 
 /**
- * Webhook 通知：格式、地址、签名密钥、订阅事件、发送测试消息，外加通知里运行、对比页链接用的服务访问地址。
+ * Webhook 通知：格式、地址、签名密钥、订阅事件、发送测试消息，外加通知里运行、对比页链接用的对外访问地址（快捷入口）。
  *
  * 地址和密钥保存之后服务端不再返回明文：地址只显示主机和末 4 位（url_hint），可以替换或删除；密钥只说「已设置」，
  * 可以替换或清除。没点替换时请求里不带它们，改别的字段不会把地址清掉。测试消息用的是已保存的设置，
@@ -195,11 +196,12 @@ function SecretField({ value: w, saved, onChange, error }: {
 }
 
 /**
- * 通知里运行、对比页链接用的服务访问地址：设置里 notify 一组的 public_base_url，所有定时任务共用。这里给出当前值和修改入口，
- * 写的时候先重读一遍 notify 组、只换这一项，不把同组别的设置冲掉
+ * 通知里运行、对比页链接用的对外访问地址：全站只有一个（lib/publicUrl.ts，「设置 → 通用」），这里给出当前值和修改的快捷入口。
+ * 环境变量指定了的只显示、写明由环境变量指定，不给修改。写的时候先重读一遍 notify 组、只换这一项，不把同组别的设置冲掉
  */
 function LinkBase() {
   const [value, setValue] = useState<string | null | undefined>(undefined)
+  const [env, setEnv] = useState(false)
   const [failed, setFailed] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
@@ -208,13 +210,18 @@ function LinkBase() {
   useEffect(() => {
     let alive = true
     api.settings.get()
-      .then((s) => { if (alive) setValue(typeof s?.notify?.public_base_url === 'string' ? s.notify.public_base_url : null) })
+      .then((s) => {
+        if (!alive) return
+        const address = publicAddressOf(s)
+        setValue(address.value)
+        setEnv(address.env)
+      })
       .catch(() => { if (alive) setFailed(true) })
     return () => { alive = false }
   }, [])
 
-  const cleaned = draft.trim().replace(/\/+$/, '')
-  const invalid = !!cleaned && !isHttpUrl(cleaned)
+  const cleaned = cleanPublicUrl(draft)
+  const invalid = !!cleaned && !isPublicUrl(cleaned)
   const save = async () => {
     if (invalid || busy) return
     setBusy(true)
@@ -222,7 +229,7 @@ function LinkBase() {
       const current = await api.settings.get()
       const notify = { ...(current?.notify ?? {}), public_base_url: cleaned || null }
       const out = await api.settings.put({ notify })
-      setValue(typeof out?.notify?.public_base_url === 'string' ? out.notify.public_base_url : notify.public_base_url)
+      setValue(out?.notify ? publicAddressOf(out).value : notify.public_base_url)
       setFailed(false)
       setEditing(false)
       toast.ok(cleaned ? T.linkBaseSaved : T.linkBaseCleared)
@@ -240,12 +247,13 @@ function LinkBase() {
         <span className={clsx('min-w-0 break-all', value ? 'mono text-fg' : 'text-faint')}>
           {failed ? T.linkBaseFailed : value === undefined ? <Spinner size={10} /> : value ? T.linkBaseValue(value) : T.linkBaseUnset}
         </span>
-        {!editing && value !== undefined && (
+        {!editing && value !== undefined && !env && (
           <button type="button" className="btn btn-xs" onClick={() => { setDraft(value ?? ''); setEditing(true) }} data-link-base-edit="">
             {value ? T.linkBaseEdit : T.linkBaseSet}
           </button>
         )}
       </div>
+      {env && <p className="mt-1 text-2xs leading-relaxed text-faint" data-link-base-env="">{T.linkBaseEnv}</p>}
       {editing && (
         <div className="mt-2">
           <Field label={T.linkBaseLabel} htmlFor="schedule-link-base" hint={T.linkBaseHint} error={invalid ? T.linkBaseInvalid : undefined}>

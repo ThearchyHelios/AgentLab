@@ -177,7 +177,8 @@ class Pipeline:
     recipe_sha256: Callable[[Recipe], str]
     canonical: Callable[[Recipe], dict[str, Any]]
     apply_patch: Callable[[dict[str, Any], list[dict[str, Any]]], dict[str, Any]]
-    scan: Callable[[bytes], WorkbookScan]
+    #: (原件, 文件名) → 扫描结果。文件名定按 CSV 读还是按工作簿读（csv_grid.scan_any）
+    scan: Callable[[bytes, str], WorkbookScan]
     scan_to_json: Callable[[WorkbookScan], dict[str, Any]]
     scan_from_json: Callable[[dict[str, Any]], WorkbookScan]
     read_grid: Callable[..., Grid]
@@ -225,7 +226,7 @@ class Pipeline:
 def default_pipeline() -> Pipeline:
     """接上真模块。函数体里惰性导入：这些模块（openpyxl、执行器、起草器）导入不便宜，接口模块加载时不必付。"""
     from app.data import (
-        recipe, recipe_accumulate, recipe_ai, recipe_checks, recipe_compare, recipe_confirm, recipe_diff,
+        csv_grid, recipe, recipe_accumulate, recipe_ai, recipe_checks, recipe_compare, recipe_confirm, recipe_diff,
         recipe_engine, recipe_fixes, recipe_notes, recipe_select, recipe_suggest, xlsx_cells, xlsx_scan,
     )
 
@@ -234,7 +235,8 @@ def default_pipeline() -> Pipeline:
         recipe_sha256=recipe.recipe_sha256,
         canonical=recipe.canonical_recipe,
         apply_patch=recipe.apply_patch,
-        scan=xlsx_scan.scan,
+        # CSV / TSV 也走配方：csv_grid 适配成一张「工作表」，其余照旧交给 xlsx_scan（Excel 期 5）
+        scan=csv_grid.scan_any,
         scan_to_json=xlsx_scan.scan_to_json,
         scan_from_json=xlsx_scan.scan_from_json,
         read_grid=xlsx_cells.read_grid,
@@ -473,7 +475,7 @@ def _open_book(p: Pipeline, raw: bytes, scan: WorkbookScan) -> _Book:
 
 def _book_of(p: Pipeline, snap: _Snap) -> _Book:
     raw = _read_raw(snap.raw_sha256)
-    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw)
+    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw, snap.file_name)
     return _open_book(p, raw, scan)
 
 
@@ -771,7 +773,7 @@ class _Staged:
 
 def _stage_work(p: Pipeline, raw: bytes, filename: str) -> _Staged:
     """首次导入（或切换）的暂存：扫描、网格预览、规则起草（带干跑）、对草稿做一次静态校验。"""
-    scan = p.scan(raw)
+    scan = p.scan(raw, filename)
     book = _open_book(p, raw, scan)
     dry = _Capture(_dry_fn(p, book, filename, {}))
     d = p.draft(scan, book.grids, filename, validate=lambda data, f, o: p.validate(data, facts=f, origin=o),
@@ -859,7 +861,7 @@ async def stage_upload(session: AsyncSession, *, raw: bytes, filename: str, name
 def _replay_work(p: Pipeline, raw: bytes, current: dict[str, Any], filename: str, snap: _Snap,
                  *, evaluate: bool) -> tuple[_Staged, _Eval | None]:
     """上传新一期 / 修改配方：扫描（或取存下的扫描）、按现行配方的写法取系统发现，修改配方时再评估一遍。"""
-    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw)
+    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw, filename)
     book = _open_book(p, raw, scan)
     facts = p.detect_facts(book.grids, scan, recipe=current)
     staged = _Staged(scan_json=p.scan_to_json(scan), previews=[p.preview(g) for g in book.grids.values()],
@@ -1859,7 +1861,7 @@ def _trial_work(p: Pipeline, snap: _Snap, work: dict[str, Any], facts: DraftFact
     if parsed is None or problems:
         return _TrialRun(parsed=parsed, problems=list(problems))
     raw = _read_raw(snap.raw_sha256)
-    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw)
+    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw, snap.file_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     # 先写 .tmp- 再改名：半成品归启动清理（_sweep_tmp）管，发布、回收不会把半个库当成试运行库
     tmp = path.parent / f"{path.name}{raw_store.TMP_MARK}{secrets.token_hex(6)}"
@@ -2361,7 +2363,7 @@ def _manifest(*, staging_id: str, kind: str, source_id: str, info: table_version
               ex_dict: dict[str, Any], file: dict[str, Any], recipe_meta: dict[str, Any], checks: list[dict[str, Any]],
               overrides: list[dict[str, Any]], waivers: list[dict[str, Any]], confirmed: list[dict[str, Any]],
               notes: SchemaNotes, ai: dict[str, Any], signed_by: str | None,
-              edits: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+              edits: list[dict[str, Any]] | None = None, signer_verified: bool = False) -> dict[str, Any]:
     receipt = copy.deepcopy(ex_dict)
     receipt.pop("problems", None)
     return {
@@ -2383,7 +2385,8 @@ def _manifest(*, staging_id: str, kind: str, source_id: str, info: table_version
         "ai": ai,
         # 期 3：修复、框选的修改记录（含已被整份替换覆盖的，作为历史；不带撤销用的修改前起点）
         "edits": copy.deepcopy(list(edits or [])),
-        "signed_by": {"name": signed_by, "verified": False},
+        # 是否认证照实记（05-已知遗留 (c)）：开了登录、署名是登录的人时为真。以前写死 False，封存的证据记错了事实
+        "signed_by": {"name": signed_by, "verified": bool(signer_verified and signed_by)},
         "staging_id": staging_id, "kind": kind,
         "created_at": _now_iso(),
     }
@@ -2411,7 +2414,8 @@ def _file_sha(path: Path) -> str | None:
 
 
 async def commit_staging(session: AsyncSession, staging: ImportStaging, *, trial_id: str, confirmations: list[str],
-                         acceptances: list[Acceptance], signed_by: str | None) -> CommitResult:
+                         acceptances: list[Acceptance], signed_by: str | None,
+                         signer_verified: bool = False) -> CommitResult:
     """POST imports/{id}/commit（7.8）：预检 → （与现行导入相同时）不新建记录 → 发布构建、写配方、导入记录、
     快照、清单，切指针。失败时指针不动，暂存区退回 drafting（试运行库已被发布流程消耗）。
 
@@ -2532,6 +2536,8 @@ async def commit_staging(session: AsyncSession, staging: ImportStaging, *, trial
 
     ex = extraction_from_dict(ex_dict)
     who = signed_by or staging.signed_by
+    # 署名是这次请求的（signed_by）才谈得上认证；退回暂存区上记的那个，是否认证这里不知道，照实记未认证
+    who_verified = bool(signer_verified and signed_by)
     acc = [Acceptance(check_id=a.check_id, reason=a.reason.strip(), signed_by=who) for a in given.values()]
     # 这一期自己的说明（带实际的接受）进它的导入清单：版本页逐期显示「改写后的那一句」从这里取（第 5 节）。
     # 快照冻结的说明在多期时另按各期最弱的结论合并（2.8），只剩本期时就是它
@@ -2603,7 +2609,8 @@ async def commit_staging(session: AsyncSession, staging: ImportStaging, *, trial
             file={"name": file_name, "size": file_size, "raw_sha256": raw_sha},
             recipe_meta={"id": recipe_id, "sha256": recipe_sha, "origin": origin, "canonical": canonical},
             checks=checks_full, overrides=overrides, waivers=waivers, confirmed=confirmed,
-            notes=notes if union_info is None else period_notes, ai=ai, signed_by=who, edits=edits)
+            notes=notes if union_info is None else period_notes, ai=ai, signed_by=who, edits=edits,
+            signer_verified=who_verified)
 
     async def schema_cache_for(view: table_versions.SourceView, info: table_versions.PublishInfo) -> dict[str, Any]:
         from app.core import artifact_store
@@ -2663,7 +2670,7 @@ async def commit_staging(session: AsyncSession, staging: ImportStaging, *, trial
                    "table_hashes": dict(union_report.get("table_hashes") or {}), "union_ver": recipe_types.UNION_VER},
             parts=ordered, report=union_report, label_sets=list((plan or {}).get("label_sets") or []),
             gaps=list((plan or {}).get("gaps") or []), replaced=(plan or {}).get("replaces"), removed=None,
-            notes=notes, signed_by=who)
+            notes=notes, signed_by=who, signer_verified=who_verified)
         smid = await artifact_store.put_json(doc, kind="snapshot_manifest",
                                              meta={"source_id": source_id, "snapshot_id": info.snapshot_id})
         cache["import_manifests"] = [mid if iid is None else by_imp[iid].info.manifest_artifact

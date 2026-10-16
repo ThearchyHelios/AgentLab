@@ -8,7 +8,7 @@ import { confirmDialog, Kbd, Spinner, StatusBadge, toast } from '../components/u
 import { formatCost, formatDuration, formatLapse, formatOffset, formatSpan, formatTokens, NONE } from '../lib/format'
 import { isTypingTarget, matchShortcut } from '../lib/keys'
 import { statusMeta, STATUS, type StatusCode } from '../lib/status'
-import { COST_TEXT, issuanceLabel, runClassLabel, runCostText } from '../lib/terms'
+import { COST_TEXT, REJECTED_TEXT, issuanceLabel, runClassLabel, runCostText } from '../lib/terms'
 import { lastStampOf, projectSettled, useDock, waitedMs } from '../canvas/RunTimeline'
 import { structureSig, useStudio } from '../store/studio'
 import type { RunEvent } from '../types'
@@ -111,29 +111,35 @@ export function phaseLabel(phase: RunPhase): string {
 
 /**
  * 这次运行是怎么取消的：run.cancelled 带着谁放弃的（actor）和一句说明（放弃等审批、
- * 挂起的运行时才有，如「放弃了这次运行，1 条待审批一并关闭」）。按事件数组缓存
+ * 挂起的运行时才有，如「放弃了这次运行，1 条待审批一并关闭」）。按事件数组缓存。
+ *
+ * 被人驳回结束的也是 run.cancelled（reason=rejected，05-已知遗留 (a)）：rejected 为真，note 写谁在哪一步驳回、备注
+ * （REJECTED_TEXT.sub，同时间线那一行）。以前一律写「张工 取消了本次运行」，驳回的人并没有停过它
  */
-const cancelCache = new WeakMap<RunEvent[], string>()
-function cancelNote(events: RunEvent[]): string {
+const cancelCache = new WeakMap<RunEvent[], { note: string; rejected: boolean }>()
+function cancelNote(events: RunEvent[]): { note: string; rejected: boolean } {
   const hit = cancelCache.get(events)
   if (hit != null) return hit
-  let note = ''
+  let out = { note: '', rejected: false }
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const e = events[i]
     if (!String(e.type).startsWith('run.')) continue
-    if (e.type === 'run.cancelled') {
+    if (e.type === 'run.cancelled' && e.data?.reason === 'rejected') {
+      out = { note: REJECTED_TEXT.sub(e.data), rejected: true }
+    } else if (e.type === 'run.cancelled') {
       const who = typeof e.data?.actor === 'string' ? e.data.actor.trim() : ''
       const what = typeof e.data?.message === 'string' ? e.data.message.trim() : ''
-      note = what ? `${who ? `${who} ` : ''}${what}` : who ? `${who} 取消了本次运行` : ''
+      out = { note: what ? `${who ? `${who} ` : ''}${what}` : who ? `${who} 取消了本次运行` : '', rejected: false }
     }
     break
   }
-  cancelCache.set(events, note)
-  return note
+  cancelCache.set(events, out)
+  return out
 }
 
 function headlineOf(t: Trace, phase: RunPhase, states: Record<string, NodeState>, at: number,
-                    label: (id: string) => string, errorText: string | null | undefined, cancelled = ''): string {
+                    label: (id: string) => string, errorText: string | null | undefined, cancelled = '',
+                    rejected = false): string {
   const running = Object.keys(states).filter((id) => states[id] === 'running')
   switch (phase) {
     case 'queued':
@@ -167,6 +173,8 @@ function headlineOf(t: Trace, phase: RunPhase, states: Record<string, NodeState>
     case 'succeeded':
       return t.issuance?.tier ? `运行完成 · ${issuanceLabel(t.issuance.tier)}` : '运行完成'
     case 'cancelled': {
+      // 被驳回：那一句已经写了在哪一步（「张工 驳回了「付款」：…」），不再接「停在「付款」」
+      if (rejected) return cancelled || REJECTED_TEXT.title
       const stopped = Object.keys(states).filter((id) => states[id] === 'cancelled')
       const where = stopped.length ? `停在「${label(stopped[0])}」` : '已取消'
       return cancelled ? `${cancelled} · ${where}` : where
@@ -187,7 +195,9 @@ export function useRunGlance(active: boolean): RunGlance {
   const runError = useStudio((s) => s.run?.error)
   const nodes = useStudio((s) => s.nodes)
   const edges = useStudio((s) => s.edges)
-  const cancelled = useStudio((s) => (s.runPhase === 'cancelled' ? cancelNote(s.events) : ''))
+  const ending = useStudio((s) => (s.runPhase === 'cancelled' ? cancelNote(s.events) : null))
+  // 被驳回只看服务端说的（run.cancelled 的 reason，或运行记录的 end_reason），不按报错原文猜
+  const runRejected = useStudio((s) => s.run?.end_reason === 'rejected')
   const limitMs = useRunLimit()
   const ticking = active && replayAt == null && isActivePhase(phaseLive)
   const now = useRunClock(ticking)
@@ -229,6 +239,11 @@ export function useRunGlance(active: boolean): RunGlance {
   const remainingMs = limitMs != null && phase === 'running' && drive && drive[1] == null
     ? Math.max(0, limitMs - (at - drive[0])) : null
 
+  // 结局是被驳回：只在没拖游标、停在最后时这么说（回放到中途说的是那一刻的相位）
+  const rejectedEnd = replayAt == null && phase === 'cancelled' && (!!ending?.rejected || runRejected)
+  const cancelled = ending?.note ?? ''
+  const code: StatusCode = rejectedEnd ? 'rejected' : phase
+
   const attention: Attention[] = []
   for (const c of cells) {
     if (c.state !== 'failed') continue
@@ -251,9 +266,9 @@ export function useRunGlance(active: boolean): RunGlance {
   }
 
   return {
-    phase, code: phase, label: phaseLabel(phase), replay: replayAt != null, at,
+    phase, code, label: code === 'rejected' ? STATUS.rejected.label : phaseLabel(phase), replay: replayAt != null, at,
     elapsedMs: proj.elapsedMs, activeMs: proj.activeMs, waitMs: proj.waitMs,
-    headline: headlineOf(trace, phase, states, at, label, runError, replayAt == null ? cancelled : ''),
+    headline: headlineOf(trace, phase, states, at, label, runError, replayAt == null ? cancelled : '', rejectedEnd),
     executing: phase === 'running' && cells.some((c) => c.state === 'running' && !trace.nodes[c.id]?.looping),
     cells, done, visited, parallelNow: proj.parallelNow, series: trace.parallelSeries,
     tokens, cost, unpriced, remainingMs, limitMs, attention,

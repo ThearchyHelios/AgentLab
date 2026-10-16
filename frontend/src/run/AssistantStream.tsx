@@ -119,6 +119,8 @@ export interface StreamTurn {
   startedAt?: number | null
   /** 跑完的轮次花了多久（毫秒）。不给就从「完成」那一行推 */
   elapsedMs?: number
+  /** 这一轮的花费（问数据页给：助手建图 + 运行 + 复核）。text 进头部小标签，title 是悬停时各部分的明细 */
+  cost?: { text: string; title: string }
   /**
    * 头部要不要提醒。phase 只分得出跑没跑完；「图放上去了，但还有 2 处问题」
    * 也是 done，头部却不该是一个安静的绿勾
@@ -613,6 +615,7 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
     progress.total ? `${progress.done}/${progress.total} 节点` : '',
     !live && queries ? `${queries} 次查询` : '',
     !live ? took : '',
+    !live && turn.cost ? turn.cost.text : '',
   ].filter(Boolean)
   const fraction = progress.total ? Math.min(1, progress.done / progress.total) : undefined
   // 节点轨：图不大时一个节点一格，按状态着色——跑到哪、哪一步跳过了、卡在哪一眼看全。
@@ -636,7 +639,8 @@ function TurnHead({ turn }: { turn: StreamTurn }) {
           {verdict && <span data-verdict="" style={{ color: verdictTone }}> · {verdict}</span>}
         </span>
         {tags.length > 0 && (
-          <span className="tnum min-w-0 shrink truncate text-2xs text-dim">{tags.join(' · ')}</span>
+          <span className="tnum min-w-0 shrink truncate text-2xs text-dim" title={!live ? turn.cost?.title : undefined}
+                data-turn-cost={!live && turn.cost ? '' : undefined}>{tags.join(' · ')}</span>
         )}
         {tier && (
           // 出具档位也挂在吸顶的头上：往下翻到报告中段时，"这份结论能不能当真"还看得见。

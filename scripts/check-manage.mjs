@@ -731,6 +731,77 @@ await section('设置 · 应用：使用者可以建个人应用（只有管理�
   await builder.close()
 })
 
+await section('设置 · 通用：对外访问地址', async () => {
+  // 全站只认一个对外访问地址（服务端 core/public_url.py）：环境变量优先，其次这里填的（存在 notify 一组）。通知和 Webhook 的
+  // 链接、单点登录的回调、来源核对都按它。管理员能改；环境变量指定了的只显示、写明来源；搭建者只看
+  let stored = await get('/settings')
+  stored = { ...stored, notify: { ...(stored.notify ?? {}), public_base_url: null }, public_url: { value: null, env_locked: false } }
+  const { page, sent, errors, natives, close } = await open('/settings/general', {
+    handlers: [
+      [/^GET \/settings$/, (route) => json(stored)(route)],
+      [/^PUT \/settings$/, (route, { body }) => {
+        stored = { ...stored, ...body.values, public_url: { value: body.values.notify?.public_base_url ?? null, env_locked: false } }
+        return json(stored)(route)
+      }],
+    ],
+  })
+  const box = page.locator('[data-general-public-url]')
+  await box.waitFor()
+  check('设置页有「通用」标签，里面是对外访问地址', (await page.getByRole('tab', { name: '通用' }).getAttribute('aria-selected')) === 'true'
+    && (await box.innerText()).includes('对外访问地址'))
+  const said = await box.innerText()
+  check('……写明它管哪几件事：通知和 Webhook 的链接、单点登录的回调、来源核对', said.includes('Webhook') && said.includes('单点登录')
+    && said.includes('来源'), said.replace(/\s+/g, ' '))
+  const input = box.locator('[data-public-url-input]')
+  const save = box.locator('[data-public-url-save]')
+  check('没改动时保存不可点', await save.isDisabled())
+  await input.fill('https://agentlab.example.com/?from=x')
+  check('带 ? 的地址：当场标错、不让存', await save.isDisabled() && (await box.innerText()).includes('不带 ? 或 #'))
+  await input.fill('agentlab.example.com')
+  check('没写协议：同样不让存', await save.isDisabled())
+  await input.fill('https://agentlab.example.com/')
+  await page.getByRole('tab', { name: '运行环境' }).click()
+  await page.waitForTimeout(300)
+  check('改了没保存就切标签：先问', (await dialog(page).innerText().catch(() => '')).includes('还没保存'))
+  await dialog(page).getByRole('button', { name: '返回保存' }).click()
+  await page.waitForTimeout(200)
+  check('……选「返回保存」：还在通用页，改动还在', page.url().endsWith('/settings/general')
+    && (await input.inputValue()) === 'https://agentlab.example.com/')
+  await save.click()
+  await until(() => sent.some((x) => x.key === 'PUT /settings'))
+  const put = sent.filter((x) => x.key === 'PUT /settings').at(-1)?.body?.values
+  check('保存只 PUT notify 一组、去掉末尾的斜杠，同组别的项原样带回', Object.keys(put ?? {}).join() === 'notify'
+    && put.notify.public_base_url === 'https://agentlab.example.com', JSON.stringify(put))
+  check('……存完按钮回到不可点', await until(() => save.isDisabled()))
+  check('没有运行时报错、原生对话框', errors.length === 0 && natives.length === 0, [...errors, ...natives][0] ?? '')
+  await close()
+
+  // 环境变量指定了：只显示它、写明来源，不给输入框
+  const env = await open('/settings/general', {
+    handlers: [[/^GET \/settings$/, json({ ...stored, public_url: { value: 'https://agentlab.example.internal', env_locked: true } })]],
+  })
+  const ro = env.page.locator('[data-public-url-readonly="env"]')
+  await ro.waitFor()
+  const roText = await ro.innerText()
+  check('环境变量指定的：显示它、写明由 AGENTLAB_PUBLIC_URL 指定，不给输入框', roText.includes('https://agentlab.example.internal')
+    && roText.includes('AGENTLAB_PUBLIC_URL') && await env.page.locator('[data-public-url-input]').count() === 0, roText)
+  await env.close()
+
+  // 搭建者（开了登录）：只看，写明只有管理员可以修改
+  const builder = await open('/settings/general', {
+    handlers: [
+      [/^GET \/auth\/me$/, json({ mode: 'local', username: 'lisi', display_name: '李四', role: 'builder', groups: [], verified: true })],
+      [/^GET \/settings$/, json(stored)],
+    ],
+  })
+  const ro2 = builder.page.locator('[data-public-url-readonly="role"]')
+  await ro2.waitFor()
+  const ro2Text = await ro2.innerText()
+  check('搭建者：只显示当前值、写明只有管理员可以修改', ro2Text.includes('https://agentlab.example.com') && ro2Text.includes('只有管理员')
+    && await builder.page.locator('[data-public-url-input]').count() === 0, ro2Text)
+  await builder.close()
+})
+
 await section('设置 · 点名的接入已停用或不存在', async () => {
   // 点名停用的接入以前照常调用，现在运行时照实报错（K1）：存着的值后来被停用了，那一格下面要说；别的停用接入列着但选不了；
   // 服务端按项拒收（422 带 field）时整句落到那一格下面、焦点移过去，保存条上原因不截断。接入表、设置读写都是假的
@@ -2162,8 +2233,9 @@ await section('数据 · 表格：按配方导入', async () => {
   await dropZone.waitFor({ timeout: 4000 }).catch(() => {})
   const pickHint = await dropZone.innerText().catch(() => '')
   const accept = await dropZone.locator('input[type="file"]').getAttribute('accept').catch(() => '')
-  check('选文件区写「拖入文件」，提示的格式与选择框收的一致（.xlsx、.xlsm）', pickHint.includes('拖入文件')
-        && accept === '.xlsx,.xlsm' && pickHint.includes('.xlsx') && pickHint.includes('.xlsm'), `${pickHint} | ${accept}`)
+  check('选文件区写「拖入文件」，提示的格式与选择框收的一致（.xlsx、.xlsm、CSV / TSV）', pickHint.includes('拖入文件')
+        && accept === '.xlsx,.xlsm,.csv,.tsv' && pickHint.includes('.xlsx') && pickHint.includes('.xlsm')
+        && pickHint.includes('CSV'), `${pickHint} | ${accept}`)
   const dropFile = async (name) => {
     const dt = await page.evaluateHandle((n) => {
       const d = new DataTransfer()
@@ -2174,9 +2246,9 @@ await section('数据 · 表格：按配方导入', async () => {
     await dropZone.dispatchEvent('drop', { dataTransfer: dt })
     await page.waitForTimeout(200)
   }
-  await dropFile('drop_flow.csv')
-  check('……拖进来的不是 Excel：不选中，说明只支持 .xlsx、.xlsm', await dropZone.locator('[data-wizard-file]').count() === 0
-        && (await page.locator('body').innerText()).includes('不是 Excel 文件'))
+  await dropFile('drop_flow.pdf')
+  check('……拖进来的不是 Excel 或 CSV：不选中，说明支持哪几种', await dropZone.locator('[data-wizard-file]').count() === 0
+        && (await page.locator('body').innerText()).includes('不是 Excel 或 CSV 文件'))
   await dropFile('drop_flow.xlsx')
   check('……拖进来的文件被选中，名字取自文件名', (await dropZone.locator('[data-wizard-file]').innerText().catch(() => '')).includes('drop_flow.xlsx')
         && (await dialog(page).locator('[data-wizard-name]').inputValue().catch(() => '')) === 'drop_flow')
@@ -2300,13 +2372,21 @@ await section('数据 · 表格：按配方导入', async () => {
   await until(async () => puts().length === 5, 4000)
   check('切换「数据中间的空行」：发 PUT，blank_rows 变成跳过', puts()[4]?.body?.recipe?.sheets?.[1]?.blocks?.[0]?.rows?.blank_rows === 'skip')
   await page.waitForTimeout(300)
+  // 期 5：没配小计时可以声明「没有小计行」（以合计字样开头的行照常是数据，不再每期报「像小计的行」要人确认）
+  replies.recipe.push(echo())
+  await panel.locator('[data-field="/sheets/1/blocks/0/rows/no_subtotals"]').check()
+  await until(async () => puts().length === 6, 4000)
+  const noSub = puts()[5]?.body?.recipe?.sheets?.[1]?.blocks?.[0]?.rows
+  check('勾选「没有小计行」：发 PUT，no_subtotals 为 true、没有配小计', noSub?.no_subtotals === true && !noSub?.subtotals,
+        JSON.stringify(noSub ?? {}))
+  await page.waitForTimeout(300)
   // 有问题的配方：一条对得上字段（单位），一条对不上（挂到面板顶部）
   replies.recipe.push(echo({ recipe_problems: [
     { path: '/tables/0/units/分区甲', code: 'unit_label_conflict', message: '表「日客流量」：列「分区甲」的单位与标签「分区甲（人次）」不一致' },
     { path: '/sheets/0/blocks/0/label_offset', code: 'schema', message: '第 1 个工作表的交叉表：标签列偏移只能是紧挨日期的左侧一列' },
   ] }))
   await panel.locator('[data-field="/tables/0/units/分区甲"]').selectOption('人')
-  await until(async () => puts().length === 6, 4000)
+  await until(async () => puts().length === 7, 4000)
   await page.waitForTimeout(300)
   const trialBtn = wizard().locator('[data-trial-run]')
   check('配方有问题时「试运行」禁用', await trialBtn.isDisabled())
@@ -2320,8 +2400,8 @@ await section('数据 · 表格：按配方导入', async () => {
   await panel.locator('[data-recipe-paste-toggle]').click()
   await panel.locator('[data-recipe-paste] textarea').fill(JSON.stringify(FLOW_RECIPE))
   await panel.locator('[data-recipe-paste] button', { hasText: '保存配方' }).click()
-  await until(async () => puts().length === 7, 4000)
-  check('「粘贴配方」发 PUT，body 就是粘贴的配方', JSON.stringify(puts()[6]?.body?.recipe) === JSON.stringify(FLOW_RECIPE))
+  await until(async () => puts().length === 8, 4000)
+  check('「粘贴配方」发 PUT，body 就是粘贴的配方', JSON.stringify(puts()[7]?.body?.recipe) === JSON.stringify(FLOW_RECIPE))
   await page.waitForTimeout(300)
   check('……问题清掉以后「试运行」可用', await trialBtn.isEnabled())
   // 连续修改：上一次 PUT 还没回来就接着改。上一次回来时，排在后面的修改不能被服务端那份盖掉，

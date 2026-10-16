@@ -9,7 +9,9 @@
 - /api 下不存在的路径照旧是 JSON 404。排除 /api 写在路由的路径规则里，不在处理函数里判断——
   否则 POST /api/不存在 会因为「路径对上了、方法不对」变成 405；
 - 只注册 GET / HEAD 的 HTTP 路由，WebSocket 不经过这里；
-- index.html 不缓存，发版后刷新即生效；assets/ 下的文件名带内容哈希，长缓存。
+- index.html 不缓存，发版后刷新即生效；assets/ 下的文件名带内容哈希，长缓存；
+- index.html 另带严格 script-src 的上报策略（Content-Security-Policy-Report-Only）：启动时按构建产物里的内联脚本算
+  sha256（web_security.script_policy），只上报、不拦。其余安全头由 web_security 的中间件统一补。
 """
 from __future__ import annotations
 
@@ -19,6 +21,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from starlette.convertors import Convertor, register_url_convertor
+
+from app.web_security import REPORT_ONLY_HEADER, script_policy
 
 _NO_CACHE = "no-cache"
 _IMMUTABLE = "public, max-age=31536000, immutable"
@@ -72,7 +76,12 @@ def mount_web(app: FastAPI, dist: Path) -> None:
             "先构建前端（cd frontend && pnpm build），或者去掉这个设置"
         )
 
+    # 哈希按启动这一刻的 index.html 算：换了构建产物要重启服务，哈希才跟着换（只上报不拦，对不上也只多几条上报）
+    page_headers = {"Cache-Control": _NO_CACHE, REPORT_ONLY_HEADER: script_policy(index.read_text(encoding="utf-8"))}
+
     def respond(target: Path, *, immutable: bool = False) -> FileResponse:
+        if target in (index, index.resolve()):
+            return FileResponse(target, media_type=_media_type(target), headers=page_headers)
         return FileResponse(
             target,
             media_type=_media_type(target),

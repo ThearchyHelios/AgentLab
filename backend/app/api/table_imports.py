@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
 from app.api.datasources import _NAME_PATTERN, _out, read_upload
-from app.api.deps import current_principal, signer_of
+from app.api.deps import current_principal, signer_of, signer_verified
 from app.data import recipe_imports, table_versions
 from app.data.recipe_imports import EditRequest, ImportRefused
 from app.data.recipe_types import Acceptance, AiAvailability, PeriodInput, Recipe, Selection
@@ -422,7 +422,8 @@ async def commit(staging_id: str, request: Request, x_actor: str | None = Header
     try:
         result = await recipe_imports.commit_staging(
             session, staging, trial_id=trial_id if isinstance(trial_id, str) else "",
-            confirmations=confirmations, acceptances=_acceptances(body.get("acceptances"), who), signed_by=who)
+            confirmations=confirmations, acceptances=_acceptances(body.get("acceptances"), who), signed_by=who,
+            signer_verified=signer_verified())
     except _REFUSALS as e:
         raise _refused(e) from e
     source = await session.get(DataSource, result.source_id, populate_existing=True)

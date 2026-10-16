@@ -21,7 +21,7 @@ from app.core.crypto import encrypt
 from app.db.base import SessionLocal
 from app.db.models import NotifyChannel, NotifyDelivery
 from app.notify import core
-from app.notify.service import EVENTS, EVENT_LABEL, channel_out
+from app.notify.service import EVENTS, channel_out, subscribe_problem
 
 router = APIRouter(prefix="/api/notify", tags=["notify"])
 
@@ -61,12 +61,14 @@ async def _safe_personal(scope: str, url: str) -> None:
         raise HTTPException(422, problem)
 
 
-def _validated(payload: ChannelIn, *, url: str | None) -> None:
+def _validated(payload: ChannelIn, *, url: str | None, saved: list[str] | None = None) -> None:
+    """saved 是渠道已经订阅着的事件：只核对这次新勾的（notify/service.subscribe_problem）。以前存下的照旧——当时界面对
+    哪种渠道都列全部事件，现在才按事件推给哪几条路核对，不能让这些渠道连开关、改名都 422。"""
     if payload.format not in core.FORMATS:
         raise HTTPException(422, f"消息格式只能是{'、'.join(core.FORMAT_LABEL.values())}之一")
-    unknown = [e for e in payload.events if e not in EVENTS]
-    if unknown:
-        raise HTTPException(422, f"不认识的通知事件：{'、'.join(unknown)}。可选：{'、'.join(EVENT_LABEL.values())}")
+    for event in dict.fromkeys(payload.events):
+        if event not in (saved or ()) and (problem := subscribe_problem(event, payload.scope)):
+            raise HTTPException(422, problem)
     if url is not None and (problem := core.format_problem(payload.format, url)):
         raise HTTPException(422, problem)
 
@@ -84,8 +86,10 @@ async def list_channels() -> dict[str, Any]:
 
 
 @router.get("/events")
-async def list_events() -> list[dict[str, str]]:
-    return [{"event": e, "label": EVENT_LABEL[e]} for e in EVENTS]
+async def list_events() -> list[dict[str, Any]]:
+    """登记的通知事件和推给哪几条路（typesApp.ts 的 NotifyEventRow）：设置页、应用的通知按 scopes 列可订阅的事件。
+    scopes 是空的，是登记了、还没有推送的，照实给出来，由界面不列。"""
+    return [{"event": name, "label": event.label, "scopes": list(event.scopes)} for name, event in EVENTS.items()]
 
 
 @router.post("/channels", status_code=201)
@@ -150,9 +154,9 @@ async def update_channel(channel_id: str, payload: ChannelIn) -> dict[str, Any]:
             from app.core.crypto import decrypt
 
             current = decrypt(row.url) or ""
-            _validated(payload, url=current or None)
+            _validated(payload, url=current or None, saved=list(row.events or []))
         else:
-            _validated(payload, url=url)
+            _validated(payload, url=url, saved=list(row.events or []))
             await _safe_personal(row.scope, url)
             row.url = encrypt(url)
         row.name, row.format = payload.name.strip(), payload.format

@@ -9,6 +9,8 @@
 //   - 卡片：卡头标状态（缺按服务端检查、待确认、已确认），对到数据的项写表、中文名、粒度、业务日期、为什么；「修改」发 bp_set
 //     （纯值），确认只改状态，「确认全部」一次带上整张卡片待确认的几项，加一项发 bp_add（纯值）；缺项时「用真数试一次」置灰并写清缺什么；
 //   - 写回卡片：目标能力没登记查询时摆「结果不明时谁去核实」（服务端 reconciler_needed），缺时只挡发布，选人发 bp_set；
+//   - 自由形的「谁来做」（05-已知遗留 (d)）：按服务端的 derived_people 一行一行摆（岗位、核实人能选人，发起人、表达式的
+//     只读），不能加减步骤、不改会签；没绑的照服务端的 bp.people_unbound 标「缺」；选人发 bp_set 到那一行的 path；
 //   - 反问：助手的 bp_ask 画成可点的选项，「这一轮在等你回答」常显，输入框提示回答；点选项就是把它作为下一轮发出去（回答记在
 //     问题上、这一轮落进蓝图对话都是服务端做的，前端不另记）；
 //   - 关节：只列生成关节，按卡片填的汇总一句；「让助手填」走 fill-joints-stream，逐组写进度，组之间并行；
@@ -77,7 +79,8 @@ const TEMPLATES = [
     cards: [{ card: 'purpose', note: '必填' }, { card: 'fields', note: '必填：发起时填什么' }, { card: 'people', note: '必填：谁审批' },
       { card: 'writeback', note: '可选：通过后写回哪个系统' }, { card: 'access', note: '' }] },
   { id: 'freeform', version: 1, label: '自由形', description: '从已有的运行或工作流导入', applies_when: '', tags: [], personal: '只读部分',
-    cards: [{ card: 'purpose', note: '' }, { card: 'cadence', note: '' }, { card: 'access', note: '' }] },
+    cards: [{ card: 'purpose', note: '' }, { card: 'cadence', note: '' },
+      { card: 'people', note: '可选：只定每一步由谁做；会签、时限、超时在画布上改' }, { card: 'access', note: '' }] },
 ]
 
 const item = (value, source = 'assistant', status, why = null) =>
@@ -548,6 +551,55 @@ await section('写回：结果不明时谁去核实（能力没登记查询才�
   await third.page.locator('[data-card="writeback"]').waitFor({ timeout: 15000 })
   check('登记了查询、以前选过人：照样摆出来，写明用不上', await third.page.locator('[data-bp-item="/writeback/reconciler"]').count() === 1
     && await third.page.locator('[data-bp-reconciler-hint="unused"]').count() === 1)
+})
+
+// ---------------------------------------------------------------- 自由形：谁来做
+
+/** 从已发布的「财务审批（岗位）+ 写回（没登记查询）」工作流导入的自由形蓝图：服务端按图列出的「谁来做」（freeform.people_rows） */
+const FREE_ROWS = [
+  { kind: 'slot', slot: 'finance', label: '「财务审批」', detail: '「财务审批」处理', path: '/people/0/who', who: null,
+    uses: [{ node_id: 'review', title: '财务审批', role: 'assignee' }] },
+  { kind: 'reconciler', slot: 'reconciler', label: '写入结果不明时谁去核实', detail: '「写回报销单」写入结果不明时去核实',
+    path: '/writeback/reconciler', who: null, uses: [{ node_id: 'pay', title: '写回报销单', role: 'reconcile' }] },
+  { kind: 'initiator', slot: null, label: '「本人确认」', detail: '由发起人自己处理', path: null, who: null,
+    uses: [{ node_id: 'me', title: '本人确认', role: 'assignee' }] },
+]
+const unboundAt = (path, message) => ({ code: 'bp.people_unbound', level: 'error', path, message, slot: 'x',
+  plain: { title: '有一步还没定谁来处理', why: '流程走到这一步就没人接手', who: 'you', action: '在「谁来做」里选人、组或岗位。' } })
+const FREE = () => ({ ...clone(BP), template_id: 'freeform',
+  spec: { ...clone(SPEC), template: { id: 'freeform', version: 1 }, data: [], people: [] },
+  joints: {}, derived_people: clone(FREE_ROWS),
+  issues: [unboundAt('/people/0/who', '「财务审批」还没定谁来处理（「财务审批」处理）'),
+    unboundAt('/writeback/reconciler', '写入结果不明时谁去核实还没定')] })
+
+await section('自由形：「谁来做」按导入的图列出，只定由谁做（05-已知遗留 (d)）', async () => {
+  const state = { bp: FREE() }
+  const { page } = await open({ state })
+  await page.goto(`${WEB}/blueprints/bp_week`)
+  const card = page.locator('[data-card="people"]')
+  await card.waitFor({ timeout: 15000 })
+  check('按服务端给的行摆：岗位、核实人、只读的发起人', (await card.locator('[data-bp-derived]').evaluateAll(
+    (els) => els.map((e) => e.getAttribute('data-bp-derived')))).join(',') === 'slot,reconciler,initiator')
+  check('行名、用途照服务端写（节点在图上的名字）', (await card.locator('[data-bp-derived="slot"]').innerText()).includes('「财务审批」处理'))
+  check('没绑的标「缺」，卡头也是缺', await card.locator('[data-bp-item="/people/0/who"]').getAttribute('data-item-status') === 'missing'
+    && await card.locator('[data-bp-item="/writeback/reconciler"]').getAttribute('data-item-status') === 'missing'
+    && await card.getAttribute('data-card-status') === 'missing')
+  check('卡片上照白话写缺什么、怎么改（核实人那一条也归在这张卡片上）',
+    (await card.locator('[data-card-issues]').getAttribute('data-card-issues')) === '2')
+  check('发起人的那一步只读：没有「修改」', await card.locator('[data-bp-derived="initiator"] [data-bp-edit]').count() === 0)
+  check('不能加减步骤：没有「加一步」、没有删除', await card.locator('[data-bp-add="/people"]').count() === 0
+    && await card.locator('[data-bp-remove]').count() === 0)
+  const row = card.locator('[data-bp-item="/people/0/who"]')
+  await row.locator('[data-bp-edit]').click()
+  const editor = row.locator('[data-bp-editor]')
+  await editor.locator('[data-principal-picker] input').fill('zhang')
+  await editor.locator('[data-principal-picker] input').press('Enter')
+  await row.locator('[data-bp-save]').click()
+  check('选人：bp_set 到那一行的 path，值是一组人或组', await until(() => (state.patches ?? []).length === 1)
+    && JSON.stringify(state.patches[0].ops) === JSON.stringify([
+      { op: 'bp_set', path: '/people/0/who', value: [{ kind: 'user', name: 'zhang' }] }]),
+    JSON.stringify(state.patches?.[0]))
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
 })
 
 // ---------------------------------------------------------------- 反问

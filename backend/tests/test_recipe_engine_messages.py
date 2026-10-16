@@ -318,6 +318,30 @@ def c_total_row_blank(mp):
     return _run(sales_book(edit=edit), LIST), [N]
 
 
+def c_subtotal_blank(mp):
+    """期 5：穿插的小计行数字格全空：没有一列能核对，结构类。"""
+    data = list_recipe()
+    data["sheets"][0]["blocks"][0]["rows"]["subtotals"] = {"label_column": "地区", "pick": "小计"}
+
+    def edit(ws):
+        ws["D4"] = N
+        ws.insert_rows(6)
+        ws["A6"] = "小计"                             # 第 6 行是小计：标签在，数字格全空
+    return _run(sales_book(edit=edit), data), [N]
+
+
+def c_subtotal_suspect(mp):
+    """期 5：没配小计时，首列以合计字样开头、其余文字列空着的行像夹在中间的小计：照常导入，要人确认。"""
+    data = list_recipe()
+
+    def edit(ws):
+        ws["D4"] = N
+        ws.insert_rows(6)
+        ws["A6"] = "小计"
+        ws["D6"] = N
+    return _run(sales_book(edit=edit), data), [N]
+
+
 def c_value_not_integer(mp):
     return _run(_flow(_set(C11=9876.54)), FLOW), [9876.54]
 
@@ -423,6 +447,7 @@ NEXT_STEPS = {
     "hidden_cols": "在配方面板的「隐藏列」中选择「照常导入」",
     "total_row_missing": "在配方面板的「合计行」中取消「有合计行」",
     "total_row_blank": "在配方面板的「合计行」中取消「有合计行」",
+    "subtotal_blank": "在配方面板的「小计行」中取消「有小计行」",
 }
 
 

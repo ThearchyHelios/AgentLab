@@ -473,6 +473,9 @@ export async function purgeConversation(c: Conversation, navigate: NavigateFunct
 /**
  * 这个会话此刻值得标出来的状态（已经取回内存的）。正常完成的不标：正常态安静，
  * 异常态才醒目。
+ *
+ * 被驳回的标（不画异常色）：是审批人的决定，发问的人不一定知道——在等审批的那一问被驳回之后，不标就像是答完了。以前
+ * 驳回记成失败，标的是「失败」
  */
 function liveStatus(turns: ChatTurn[]): string | null {
   if (!turns.length) return null
@@ -481,12 +484,13 @@ function liveStatus(turns: ChatTurn[]): string | null {
   const last = turns[turns.length - 1]
   if (last.phase === 'error') return 'failed'
   if (last.phase === 'suspended') return 'suspended'
+  if (last.phase === 'cancelled' && last.rejected) return 'rejected'
   return null
 }
 
-/** 没打开过的会话：列表接口带来的最后一轮状态。完成、取消的不标，同上 */
+/** 没打开过的会话：列表接口带来的最后一轮状态。完成、取消的不标，被驳回的标，同上 */
 const LIST_STATUS: Partial<Record<NonNullable<Conversation['last_status']>, string>> = {
-  running: 'running', waiting: 'waiting', error: 'failed', suspended: 'suspended',
+  running: 'running', waiting: 'waiting', error: 'failed', suspended: 'suspended', rejected: 'rejected',
 }
 const listStatus = (c: Conversation): string | null => (c.last_status && LIST_STATUS[c.last_status]) || null
 

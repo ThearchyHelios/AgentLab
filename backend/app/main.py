@@ -30,6 +30,7 @@ from app.core.config import settings
 from app.db.base import init_db
 from app.engine.runner import run_manager
 from app.seed import seed_defaults
+from app.web_security import SecurityHeaders
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,16 +146,20 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 async def _platform_startup() -> None:
-    """应用平台的启动整理（BE-1）：登录设置读进缓存；自定义工具请求头、MCP env 和请求头里的存量明文加密一遍（幂等）；
-    存量的内网 MCP 服务改为绑定登记端点（只在升级后第一次启动时做）；能力登记同步一次。后三样出错只记日志：最坏是登记
-    暂时不全，不该让服务起不来。"""
+    """应用平台的启动整理（BE-1）：登录设置、对外访问地址读进缓存；自定义工具请求头、MCP env 和请求头里的存量明文加密
+    一遍（幂等）；存量的内网 MCP 服务改为绑定登记端点（只在升级后第一次启动时做）；能力登记同步一次。后三样出错只记
+    日志：最坏是登记暂时不全，不该让服务起不来。"""
     from app.auth import current_mode, load_settings
     from app.capabilities import registry as capability_registry
     from app.capabilities.secrets import seal_existing
+    from app.core import public_url
     from app.db.base import SessionLocal
 
     await load_settings(force=True)
     logger.info("登录方式：%s", current_mode())
+    # 对外访问地址（core/public_url.py）同样读进缓存：中间件核对来源时不查库
+    if address := await public_url.refresh():
+        logger.info("对外访问地址：%s（%s）", address, "环境变量" if public_url.env_locked() else "设置")
     try:
         if sealed := await seal_existing():
             logger.info("已加密 %d 处存量的明文密钥（自定义工具请求头、MCP 环境变量和请求头）", sealed)
@@ -192,6 +197,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# 安全响应头（app/web_security.py）：最后加、在最外层，CORS 预检和登录检查自己回的 401 / 403 也带上
+app.add_middleware(SecurityHeaders)
 
 # 路由级权限（§3.12）。关登录时这些依赖全部放行；开了登录，中间件先挡掉没登录的，这里再按角色和运行挡
 _BUILDER = [require_role("builder")]
@@ -238,6 +245,7 @@ for router, guard in (
     (identity_api.router, _ADMIN),
     # 选人用的名录（用户名、显示名、是否停用、组名）：岗位绑定、应用授权由搭建者做，只读
     (identity_api.directory_router, _BUILDER),
+    (identity_api.candidates_router, _USER),
     # 能力登记、端点：搭建者只读，改动在接口里要管理员
     (capabilities_api.router, _BUILDER),
     # 普通用户建应用：个人应用的接口共用 /api/apps 前缀，要在 apps_api 之前登记；蓝图助手共用 /api/copilot 前缀，

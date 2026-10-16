@@ -215,7 +215,8 @@ async def _stream_graph(client, monkeypatch, conv_id: str, lines: list[str]) -> 
     }) as r:
         last = {}
         async for line in r.aiter_lines():
-            if line.startswith("data: "):
+            # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+            if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                 last = json.loads(line[6:])
     return last
 

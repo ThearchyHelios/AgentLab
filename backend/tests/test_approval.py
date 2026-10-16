@@ -138,9 +138,10 @@ async def test_tool_node_takes_a_refusal_as_a_refusal():
     run_id = await _start(_calc_graph())
     await _wait(run_id, ("interrupted",))
     await run_manager.resume(run_id, "拒绝")
-    run = await _wait(run_id, ("failed", "succeeded"))
+    run = await _wait(run_id, ("failed", "succeeded", "cancelled"))
 
-    assert run.status == "failed" and "驳回" in (run.error or "")
+    # 驳回是人的决定，运行收成 cancelled + end_reason=rejected（05-已知遗留 (a)）
+    assert (run.status, run.end_reason) == ("cancelled", "rejected") and "驳回" in (run.error or "")
     assert not [e for e in await _events(run_id) if e.type == "tool.start"], "被拒绝的工具执行了"
 
 
@@ -208,8 +209,8 @@ async def test_a_refused_write_leaves_the_data_alone(writable):
     run_id = await _start(_query_graph(tool, "WITH k AS (SELECT 1) DELETE FROM t"))
     await _wait(run_id, ("interrupted",))
     await run_manager.resume(run_id, "拒绝")
-    run = await _wait(run_id, ("failed", "succeeded"))
-    assert run.status == "failed"
+    run = await _wait(run_id, ("failed", "succeeded", "cancelled"))
+    assert (run.status, run.end_reason) == ("cancelled", "rejected")
     assert count() == 5
 
 
@@ -392,5 +393,5 @@ async def test_parallel_rejection_with_content_is_still_a_rejection():
                              approval_id=pending["h1"].id)
     await run_manager.resume(run_id, {"approved": False, "note": "不行", "value": "乙"},
                              approval_id=pending["h2"].id)
-    run = await _wait(run_id, ("failed", "succeeded"))
-    assert run.status == "failed" and "驳回" in (run.error or ""), run.error
+    run = await _wait(run_id, ("failed", "succeeded", "cancelled"))
+    assert (run.status, run.end_reason) == ("cancelled", "rejected") and "驳回" in (run.error or ""), run.error

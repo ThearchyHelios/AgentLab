@@ -43,9 +43,9 @@ async def _turn(client, conv_id: str, question: str = "订单数多少", **patch
     return turn
 
 
-async def _run(status: str, *, pending: bool = False) -> str:
+async def _run(status: str, *, pending: bool = False, end_reason: str | None = None) -> str:
     async with SessionLocal() as session:
-        run = Run(workflow_name="状态测试", status=status)
+        run = Run(workflow_name="状态测试", status=status, end_reason=end_reason)
         session.add(run)
         await session.flush()
         if pending:
@@ -160,6 +160,39 @@ async def test_the_list_says_where_each_conversation_last_stopped(client):
     listed = await _listed(client)
     got = {cid: (listed[cid]["last_status"], listed[cid]["last_run_id"]) for cid in cases}
     assert got == cases
+
+
+async def test_a_rejected_turn_is_listed_as_rejected_not_cancelled(client):
+    """被审批人驳回结束的一轮（运行 cancelled + end_reason=rejected，05-已知遗留 (a)）：列表说「被驳回」，不和手动停止混成
+    cancelled——发问的人不一定知道被驳回了，以前驳回记成失败，列表标的是「失败」。认法两条：前端落库时记下的
+    meta.rejected，和页面关掉、轮次还停在 running 时运行的 end_reason。手动停止照旧是 cancelled。"""
+    cases: dict[str, tuple[str, str | None]] = {}
+
+    conv = await _conversation(client, "驳回：前端落库了")
+    run = await _run("cancelled", end_reason="rejected")
+    await _turn(client, conv, run_id=run, status="error", error="已取消",
+                meta={"v": 1, "runId": run, "outcome": "cancelled", "rejected": {"sub": "张工 驳回了「付款」"}})
+    cases[conv] = ("rejected", run)
+
+    conv = await _conversation(client, "驳回：页面关了")
+    run = await _run("cancelled", end_reason="rejected")
+    await _turn(client, conv, run_id=run)
+    cases[conv] = ("rejected", run)
+
+    conv = await _conversation(client, "手动停止：页面关了")
+    run = await _run("cancelled", end_reason="stopped")
+    await _turn(client, conv, run_id=run)
+    cases[conv] = ("cancelled", run)
+
+    conv = await _conversation(client, "手动停止：前端落库了")
+    run = await _run("cancelled", end_reason="stopped")
+    await _turn(client, conv, run_id=run, status="error", error="已取消", meta={"v": 1, "runId": run, "outcome": "cancelled"})
+    cases[conv] = ("cancelled", run)
+
+    listed = await _listed(client)
+    assert {cid: (listed[cid]["last_status"], listed[cid]["last_run_id"]) for cid in cases} == cases
+    detail = (await client.get(f"/api/conversations/{next(iter(cases))}")).json()
+    assert detail["last_status"] == "rejected"
 
 
 async def test_only_the_last_turn_counts(client):

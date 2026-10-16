@@ -402,7 +402,7 @@ async def test_a_big_table_is_checked_on_its_first_rows(scenic):
     found = await catalog_profile.check_valid_filter(source, "visits", source.schema_cache["tables"]["visits"],
                                                       "status = 1")
     assert found.sampled and found.rows == 100
-    assert found.note.startswith("剖析核对：按前 100 行统计，")
+    assert found.note.startswith("剖析核对：按存储顺序取前 100 行统计，")
 
 
 async def test_unchecked_filters_are_kept_with_the_reason(scenic, tmp_path):

@@ -54,6 +54,25 @@ export interface Directory {
   groups: { name: string; label: string }[]
 }
 
+/**
+ * 使用者选人的候选从哪个池取（GET /api/directory/candidates，05-已知遗留 (b)）：form 是表单里的选人控件（入口表单带 app_id、
+ * entry，待办表单带 task_id，都带 field），review 是个人应用提交审核
+ */
+export type CandidateSource =
+  | { purpose: 'form'; app_id?: string; entry?: string; task_id?: string; field: string }
+  | { purpose: 'review' }
+
+/**
+ * 候选池给的那一份：只有用户名和显示名（不给是否停用、角色、邮箱，停用的不列）。needs_query：应用授权给了所有人，
+ * 不输入开头不列；truncated：符合的超过了上限（最多 50 位）
+ */
+export interface Candidates {
+  users: { username: string; display_name: string }[]
+  groups: { name: string; label: string }[]
+  truncated: boolean
+  needs_query?: boolean
+}
+
 export interface AuditRow {
   id: string
   at: string
@@ -100,6 +119,11 @@ export interface FormField {
   'x-widget'?: FormWidget
   /** 文件控件的限制，只配 x-widget: file */
   'x-file'?: FileLimits
+  /**
+   * 选人控件的候选池，只配 x-widget: principal：app（能用这个应用的人，缺省）、group:<组>、slot:<岗位>
+   * （服务端 auth/directory.pool_problem，05-已知遗留 (b)）
+   */
+  'x-principal'?: { pool: string }
 }
 
 export interface FormSchema {
@@ -113,11 +137,12 @@ export interface FormSchema {
 
 /**
  * 前后端同一种错误格式（服务端 apps/spec.FORM_ERROR_CODES）。file：文件控件的值不是上传后拿回的引用、类型或大小不合
- * x-file 的限制，或提交时核对引用没过（不是这个人传的、已经用过）
+ * x-file 的限制，或提交时核对引用没过（不是这个人传的、已经用过）；principal：开了登录时选人控件的值不在候选池里
+ * （服务端 auth/directory.principal_errors，05-已知遗留 (b)）
  */
 export interface FormError {
   path: string
-  code: 'required' | 'type' | 'enum' | 'minimum' | 'maximum' | 'min_length' | 'max_length' | 'max_items' | 'format' | 'file'
+  code: 'required' | 'type' | 'enum' | 'minimum' | 'maximum' | 'min_length' | 'max_length' | 'max_items' | 'format' | 'file' | 'principal'
   message: string
 }
 
@@ -695,6 +720,16 @@ export interface NotifyChannelRow {
   enabled: boolean
 }
 
+/**
+ * 登记的通知事件（GET /api/notify/events，服务端 notify/service.EVENTS，总方案 X6）。scopes 是推给哪几条路：global
+ * 全局渠道自己订阅，user 相关的人自己的个人渠道，app 应用版本里的订阅；空的是登记了、还没有推送的，界面上不列
+ */
+export interface NotifyEventRow {
+  event: string
+  label: string
+  scopes: ('global' | 'user' | 'app')[]
+}
+
 // ---------------------------------------------------------------------------
 // 运行来源（§2.10 X3）与助手查看（§2.9 L2）
 // ---------------------------------------------------------------------------
@@ -703,6 +738,16 @@ export interface NotifyChannelRow {
 export type OriginKind =
   | 'chat' | 'canvas' | 'launcher' | 'schedule' | 'app_entry' | 'app_view' | 'app_backfill' | 'hook' | 'api'
   | 'trial' | 'personal_app'
+  | 'eval' | 'ledger_issue' | 'reconcile' | 'recall'
+
+/**
+ * GET /api/runs/unlisted：同样的筛选下，记录页因为「系统派生的运行默认不列」而没列出的次数。系统派生的是评测、口径对账、
+ * 口径召回（服务端 engine/origin.SYSTEM_ORIGINS）：不进使用统计，按来源点名才列
+ */
+export interface UnlistedRuns {
+  total: number
+  by_origin: Partial<Record<OriginKind, number>>
+}
 
 /** 查看的对象。caliber 是已发布口径卡上的指标（蓝图助手复用口径时看，服务端 look/calibers.py） */
 export interface LookObject {

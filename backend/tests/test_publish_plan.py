@@ -186,6 +186,30 @@ async def test_a_failed_trial_blocks_the_plan(client, tmp_path):
     assert "plan.untrialed" not in codes
 
 
+async def test_a_rejected_trial_is_a_warning_not_a_failure(client, tmp_path):
+    """最近一次试运行在某一步被驳回（cancelled + end_reason=rejected）：那是人的决定，不说成「试运行失败了」、不挡发布，
+    照实提醒没走完（05-已知遗留 (a)）。"""
+    from sqlalchemy import update
+
+    bp = await _board_from_run(client, tmp_path)
+    async with SessionLocal() as session:
+        trial = await session.get(Run, bp["last_trial_run_id"])
+        node_id = trial.graph["nodes"][-1]["id"]
+        label = trial.graph["nodes"][-1]["data"]["label"]
+        await session.execute(update(Run).where(Run.id == trial.id).values(
+            status="cancelled", end_reason="rejected", error_node_id=node_id, error="人工驳回：不对"))
+        await session.commit()
+    plan = (await client.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).json()
+    codes = {p["code"]: p for p in plan["problems"]}
+    assert "plan.trial_failed" not in codes and "plan.untrialed" not in codes
+    rejected = codes["plan.trial_rejected"]
+    assert rejected["level"] == "warning" and rejected["message"] == f"最近一次试运行在「{label}」被驳回、没有走完"
+    assert rejected["plain"]["title"] == "最近一次试运行被驳回、没有走完"
+    assert plan["ok"] is True, [p["code"] for p in plan["problems"] if p["level"] == "error"]
+    summary = {x["step"]: x["text"] for x in plan["summary"]}
+    assert "被驳回、没有走完" in summary["publish_workflow"]
+
+
 async def test_a_process_with_an_unbound_step_stops_at_preflight(client):
     wf_id = await s.published_workflow(s.expense_graph(), f"报销-{uuid.uuid4().hex[:4]}", description="报销审批")
     bp = (await client.post("/api/blueprints", json={"source": {"kind": "workflow_version", "id": wf_id},
@@ -194,8 +218,12 @@ async def test_a_process_with_an_unbound_step_stops_at_preflight(client):
     assert (await client.post(f"/api/blueprints/{bp['id']}/instantiate")).status_code == 200
     plan = (await client.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).json()
     assert plan["ok"] is False
-    unbound = [p for p in plan["problems"] if p["code"] == "app.slot_unbound"]
-    assert unbound and unbound[0]["plain"]["who"] == "you" and "谁来做" in unbound[0]["plain"]["action"]
+    # 自由形按导入的图列出「谁来做」（05-已知遗留 (d)）：会签的 finance、超时升级的 director 各一行，没绑人报在那一行上；
+    # 应用检查说的是同一件事（app.slot_unbound），不再重复列——它指的「谁来做」以前在自由形蓝图上不存在
+    unbound = {p["path"]: p for p in plan["problems"] if p["code"] == "bp.people_unbound"}
+    assert set(unbound) == {"/people/0/who", "/people/1/who"}
+    assert unbound["/people/0/who"]["plain"]["who"] == "you" and "谁来做" in unbound["/people/0/who"]["plain"]["action"]
+    assert "app.slot_unbound" not in {p["code"] for p in plan["problems"]}
     # 流程类不跑第一次；已发布的那一版按哈希复用，不另存
     assert plan["options"]["first_run"] is False
     summary = {x["step"]: x["text"] for x in plan["summary"]}
@@ -229,6 +257,59 @@ async def erp_write():
             await session.execute(delete(Capability).where(Capability.name == name))
             await session.commit()
             await registry.refresh_cache(session)
+
+
+async def test_a_freeform_blueprint_binds_who_does_each_step_of_the_imported_graph(client, erp_write):
+    """从已发布的「财务审批（岗位 finance）+ 写回（没登记查询）」工作流建自由形蓝图（05-已知遗留 (d)）：卡片上按图列出两行
+    ——finance 和写入结果不明时的核实人；不选人时发布单在这两行上报 bp.people_unbound，不再有指不到卡片的 app.slot_unbound /
+    app.reconciler_unbound；选好人之后绑到应用的岗位，发布单不再挡。卡片上只定由谁做，改会签被拒（在画布上改）。"""
+    from app.blueprints.publish_plan import bindings_of
+
+    graph = {"nodes": [
+        s.node("start", "input", "发起", fields=[{"name": "amount", "type": "number"}]),
+        s.node("review", "human", "财务审批", mode="approve", title="审一下", assignee={"kind": "slot", "slot": "finance"}),
+        s.node("pay", "tool", "写回报销单", tool=erp_write, args={}),
+        s.node("done", "output", "完成", fields=[{"name": "结论", "value": "已写回"}])],
+        "edges": [{"source": "start", "target": "review"},
+                  {"source": "review", "target": "pay", "sourceHandle": "approved"},
+                  {"source": "pay", "target": "done"}]}
+    wf_id = await s.published_workflow(graph, f"写回-{uuid.uuid4().hex[:4]}", description="报销写回")
+    bp = (await client.post("/api/blueprints", json={"source": {"kind": "workflow_version", "id": wf_id},
+                                                     "scope": "shared"})).json()
+    await s.edit_spec(bp["id"], purpose=s.item("报销审批后写回"))
+    assert (await client.post(f"/api/blueprints/{bp['id']}/instantiate")).status_code == 200
+    out = (await client.get(f"/api/blueprints/{bp['id']}")).json()
+    rows = out["derived_people"]
+    assert [(r["kind"], r["slot"], r["path"], r["who"]) for r in rows] == [
+        ("slot", "finance", "/people/0/who", None), ("reconciler", "reconciler", "/writeback/reconciler", None)]
+    assert rows[0]["label"] == "「财务审批」" and rows[0]["detail"] == "「财务审批」处理"
+    assert rows[1]["detail"] == "「写回报销单」写入结果不明时去核实"
+
+    plan = (await client.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).json()
+    assert plan["ok"] is False
+    codes = [p["code"] for p in plan["problems"]]
+    assert sorted(p["path"] for p in plan["problems"] if p["code"] == "bp.people_unbound") == [
+        "/people/0/who", "/writeback/reconciler"]
+    assert "app.slot_unbound" not in codes and "app.reconciler_unbound" not in codes
+    summary_you = [p for p in plan["problems"] if p["code"] == "bp.people_unbound"]
+    assert all(p["who"] == "you" for p in summary_you)
+
+    refused = await client.patch(f"/api/blueprints/{bp['id']}", json={"ops": [
+        {"op": "bp_set", "path": "/people/0/policy", "value": {"kind": "all"}}]})
+    assert refused.status_code == 422 and refused.json()["code"] == "bp.template_mismatch"
+    assert "在画布上改" in refused.json()["detail"]
+    r = await client.patch(f"/api/blueprints/{bp['id']}", json={"ops": [
+        {"op": "bp_set", "path": "/people/0/who", "value": [{"kind": "user", "name": "zhang"}]},
+        {"op": "bp_set", "path": "/writeback/reconciler", "value": [{"kind": "group", "name": "财务组"}]}]})
+    assert r.status_code == 200, r.text
+    rows = r.json()["derived_people"]
+    assert rows[0]["who"] == [{"kind": "user", "name": "zhang"}] and rows[1]["who"] == [{"kind": "group", "name": "财务组"}]
+    assert not [i for i in r.json()["issues"] if i["code"] == "bp.people_unbound"]
+    assert bindings_of(await s.blueprint(bp["id"]))["slots"] == {
+        "finance": [{"kind": "user", "name": "zhang"}], "reconciler": [{"kind": "group", "name": "财务组"}]}
+    plan = (await client.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).json()
+    codes = [p["code"] for p in plan["problems"]]
+    assert "bp.people_unbound" not in codes and "app.slot_unbound" not in codes and "app.reconciler_unbound" not in codes
 
 
 async def test_the_reconciler_comes_from_the_writeback_card(client, erp_write):
@@ -500,8 +581,8 @@ async def test_problems_are_split_into_three_kinds(client):
     plan = (await client.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).json()
     assert all(p["who"] in ("you", "assistant", "admin") for p in plan["problems"])
     assert {p["source"] for p in plan["problems"]} <= {"blueprint", "plan", "workflow", "schedule", "app", "grants"}
-    unbound = next(p for p in plan["problems"] if p["code"] == "app.slot_unbound")
-    assert unbound["who"] == "you" and unbound["source"] == "app"
+    unbound = next(p for p in plan["problems"] if p["code"] == "bp.people_unbound")
+    assert unbound["who"] == "you" and unbound["source"] == "blueprint"
 
 
 # --------------------------------------------------------------------------

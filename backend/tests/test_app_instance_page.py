@@ -258,7 +258,7 @@ async def test_after_escalation_the_rule_is_one_director_not_zero_of_three():
     run_id = await _start(app_id, "报销审批·钱七")
     task = await _task(run_id)
     await tasks.respond(task.id, user(a), decision="approve")
-    assert await tasks.tick(utcnow() + timedelta(hours=2)) >= 1
+    assert task.id in await tasks.tick(utcnow() + timedelta(hours=2))
     detail = await tasks.detail(task.id, user(boss))
     p = detail["progress"]
     # 升级加派的那一份不算进会签人数：还是 1/2，另写升级给了谁、他一人说了算
