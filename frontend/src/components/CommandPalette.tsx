@@ -5,7 +5,7 @@ import type { NavigateFunction } from 'react-router-dom'
 import { create } from 'zustand'
 import clsx from 'clsx'
 import {
-  Bell, BellOff, BookOpen, CalendarClock, Database, FlaskConical, History, Hourglass, Inbox, Keyboard, LayoutGrid,
+  Bell, BellOff, BookOpen, CalendarClock, Database, FlaskConical, Gauge, History, Hourglass, Inbox, Keyboard, LayoutGrid,
   MessageSquare, MessageSquarePlus, Monitor, Plus, Search, Settings, SunMoon, Workflow as WorkflowIcon, Wrench,
 } from 'lucide-react'
 import { ApiError, api } from '../api/client'
@@ -21,6 +21,7 @@ import { isMac } from '../lib/keys'
 import { formatDateTime, formatTime, parseServerTime, shortId } from '../lib/format'
 import { statusLabel } from '../lib/status'
 import { APP_TEXT, SCHEDULE_TEXT, WORKFLOW_STATUS_LABEL, runClassLabel, runName } from '../lib/terms'
+import { EVAL_TEXT } from '../lib/termsEval'
 import { errorMessage } from '../lib/errors'
 import { disableNotify, enableNotify, notifySupported, useSignals } from '../lib/notify'
 import { canLeave, leavePass } from '../lib/leave'
@@ -63,6 +64,8 @@ export const PAGES: PageDef[] = [
   { to: '/knowledge', label: '知识', hint: '知识库、长期记忆、方法论 Skill', icon: BookOpen, shortcut: 'Alt+6', keywords: 'knowledge kb memory skill 知识库 记忆 文档' },
   // 后加的页排在设置前面，设置留在最底下、快捷键也不动：⌥7 按了好几个版本，改了等于让人重新记
   { to: '/schedules', label: SCHEDULE_TEXT.title, hint: SCHEDULE_TEXT.hint, icon: CalendarClock, shortcut: 'Alt+8', keywords: 'schedules schedule cron 定时 计划 周期 自动运行' },
+  // 评测（评测-D8）：搭建者以上可见（使用者的页面表在 visiblePages 里收窄，用不着另判），同样排在设置前面；快捷键用最后一个空着的 ⌥0
+  { to: '/evals', label: EVAL_TEXT.nav, hint: EVAL_TEXT.hint, icon: Gauge, shortcut: 'Alt+0', keywords: 'evals eval evaluation 评测 回归 题集 准确率 A/B 口径命中 重复度' },
   { to: '/settings', label: '设置', hint: '模型接入、偏好、运行环境', icon: Settings, shortcut: 'Alt+7', keywords: 'settings provider 模型 署名 主题 偏好' },
 ]
 

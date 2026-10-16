@@ -3921,17 +3921,61 @@ export const SCHEDULE_TEXT = {
   targetGone: (name: string) => `${name}（已不存在）`,
   view: '查看',
   viewLabel: (name: string) => `查看定时任务「${name}」`,
-  /** 非工作流目标的设置是只读的：启用、暂停、立即运行、触发历史照常可用 */
+  /**
+   * 数据源维护的定时：建和改在数据源页的「定时维护」里（next-round 03 B4，维护要做哪几步跟着数据源走），这里只读地列出；启用、
+   * 暂停、立即运行、触发历史照常可用
+   */
   targetSettingsTitle: '设置',
-  targetSettingsNote: (kind: string) => `这个定时任务的目标是${kind}：可以启用、暂停、立即运行和查看触发历史；名称、频率和目标在这里只能查看，不能修改`,
+  maintenanceNote: '这个定时任务是数据源的定时维护：要做哪几步、频率和时段在数据源页的「定时维护」里设置，这里只能查看。启用、暂停、立即运行和触发历史照常可用',
+  toDataSource: '去数据源页设置',
   targetField: '目标',
   graceField: '补发宽限',
+  /** 新建时先选定时什么：工作流（发起运行）还是评测题集（评一次） */
+  targetKindLabel: '定时什么',
+  targetKindHint: {
+    workflow: '按周期发起工作流运行',
+    eval_suite: '按周期评一次题集（按题集的默认变体、每题 1 次），有退步、没评完时推给订阅了的通知渠道',
+    source_maintenance: '数据源的定时维护在数据源页设置',
+  } as Record<import('../types').ScheduleTargetKind, string>,
+  suite: '评测题集',
+  suitePlaceholder: '选择题集',
+  suitesLoading: '正在读取题集…',
+  suitesEmpty: '还没有题集，请先在评测页新建',
+  toEvals: '去评测',
+  /** 目标是评测题集：表单上方那一句 */
+  evalTargetNote: '目标是评测题集：到点按题集的默认变体评一次（每题 1 次）；上一次评测还没结束就跳过这一次。消息只推订阅了「定时评测有退步」「定时评测没有评完」的全局通知渠道，不推 Webhook',
+  openSuite: '打开题集',
+  /** 触发历史里那一次评测：点了去评测详情 */
+  evalFireTitle: '打开这一次评测',
 
   // ---- 立即运行的结果
   /** 目标是评测题集：发起的是一次评测，没有运行可看 */
   evalStarted: '已发起一次评测',
   /** 触发历史里评测题集那一次：评测的编号 */
   evalFire: (short: string) => `评测 #${short}`,
+  /**
+   * 数据源维护的一次触发：建的是探查、剖析任务，没有运行。和数据源页「定时维护」的「最近一次」同一个写法（步骤的叫法同服务端
+   * source_maintenance.STEP_LABEL）
+   */
+  maintenanceStep: { introspect: '探查结构', profile_needed: '剖析需要的表', observe: '取值观察' } as Record<
+    import('../types').ScheduleMaintenanceStep, string>,
+  maintenanceJobKind: { introspect: '探查任务', profile: '剖析任务' } as Record<'introspect' | 'profile', string>,
+  maintenanceJobs: '建了任务',
+  maintenanceJob: (step: string, kind: string, id: string, tables: number | null) =>
+    `${step}：${kind} #${id.slice(0, 6)}${tables != null ? `（${formatNumber(tables)} 张表）` : ''}`,
+  maintenanceJobTitle: {
+    introspect: '去数据源页看这个数据源的探查结果',
+    profile: '去数据目录看这个剖析任务的进度和结果',
+  } as Record<'introspect' | 'profile', string>,
+  maintenanceSkipped: (step: string, reason: string) => `${step}没有执行：${reason}`,
+  /** 维护没有建任务（发起失败、跳过）：不写「未发起运行」，维护本来就不发起运行 */
+  maintenanceNoJobs: '没有建任务',
+  /** 刚触发、任务还在建（服务端按已发起给，任务还没记上） */
+  maintenanceLaunching: '正在建维护任务',
+  maintenanceStarted: '已开始维护',
+  maintenanceBusy: '上一次维护（或别的探查、剖析）还没做完，这一次已跳过',
+  maintenanceFailed: (reason: string | null) => (reason ? `没有开始维护：${reason}` : '没有开始维护'),
+  maintenanceStartedHint: '已建好这一次维护的任务',
   runStarted: '已发起运行',
   runSkipped: '上一次运行尚未结束，本次已按重叠策略跳过',
   runFailed: (reason: string | null) => (reason ? `未能发起运行：${reason}` : '未能发起运行'),
@@ -4173,6 +4217,8 @@ export const SCHEDULE_TEXT = {
     notPublished: '这个工作流还没有发布版本，正式运行需要已发布的版本。请先发布，或改用探索运行',
     inputsMissing: (names: string) => `必填输入「${names}」还没有填写`,
     inputsUnknown: (names: string) => `输入「${names}」对不上工作流的输入字段，请移除`,
+    /** 非工作流目标（评测题集）没选目标 */
+    target: (kind: string) => `请选择要定时的${kind}`,
   },
   /** 「还需处理」里各项的叫法 */
   problemField: {

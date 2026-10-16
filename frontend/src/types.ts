@@ -3867,6 +3867,20 @@ export interface ScheduleFireCompare {
 }
 
 /** 一次触发（触发历史的一行） */
+/** 数据源定时维护的步骤（app/data/source_maintenance.STEPS） */
+export type ScheduleMaintenanceStep = 'introspect' | 'profile_needed' | 'observe'
+
+/**
+ * 数据源维护的一次触发建了什么（app/data/source_maintenance 记在触发上的 inputs）：要做的步骤、建了的探查 / 剖析任务（step 是
+ * 这个任务做的那几步，剖析、观察合成一个任务时写成 profile_needed+observe）、没执行的步骤和原因。和数据源页「定时维护」的
+ * 「最近一次」读的是同一份
+ */
+export interface ScheduleMaintenanceInputs {
+  steps?: ScheduleMaintenanceStep[]
+  jobs?: { step: string; kind: 'introspect' | 'profile'; id: string; tables?: number; scope?: string }[]
+  skipped?: { step: ScheduleMaintenanceStep; reason: string }[]
+}
+
 export interface ScheduleFire {
   id: string
   /** 计划触发的时间；手动运行是按下的那一刻 */
@@ -3880,6 +3894,8 @@ export interface ScheduleFire {
   reason: string | null
   /** 目标是评测题集时这一次触发建的那次评测（没有 run_id）；老服务端不给 */
   eval_run_id?: string | null
+  /** 目标是数据源维护时这一次建了哪些任务、哪几步没执行和原因（触发记录的 inputs）；别的目标为 null，老服务端不给 */
+  inputs?: ScheduleMaintenanceInputs | null
   notified: ScheduleFireNotice[]
   /**
    * 和同一定时任务上一次成功的运行的对比。运行没有成功结束、没有可比的、还没算、比不了、任何一边又在执行（不在终态）

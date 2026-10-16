@@ -7,7 +7,7 @@ import { StatusPill, confirmDialog, toast } from '../../components/ui'
 import { formatDateTime, parseServerTime } from '../../lib/format'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import type { Schedule, ScheduleFire, ScheduleFireStatus, ScheduleRunResult } from '../../types'
-import { browserTimezone, formatUntil, formatZoned } from './model'
+import { browserTimezone, formatUntil, formatZoned, maintenanceSummary } from './model'
 
 // -------------------------------------------------------------------------
 // 启用开关
@@ -97,7 +97,8 @@ export function FireStatusChip({ fire }: { fire: ScheduleFire }) {
   return (
     <span
       className="chip shrink-0"
-      title={fire.reason || (fire.eval_run_id && fire.status === 'started' ? T.evalStarted : T.fireStatusHint[fire.status])
+      title={fire.reason || (fire.status === 'started' && fire.eval_run_id ? T.evalStarted
+        : fire.status === 'started' && fire.inputs?.jobs?.length ? T.maintenanceStartedHint : T.fireStatusHint[fire.status])
         || undefined}
       data-fire-status-chip={fire.status}
       style={{
@@ -172,7 +173,8 @@ export async function setEnabled(s: Schedule, enabled: boolean): Promise<Schedul
 }
 
 /**
- * 立即运行：发起了就给「查看运行」直达，跳过、被拒照实说原因。返回这次触发（出错时 null），
+ * 立即运行：发起了就给「查看运行」直达，跳过、被拒照实说原因。目标是评测题集的说发起了一次评测；目标是数据源维护的说开始
+ * 维护、详情里逐行写建了哪几个任务和没执行的步骤（维护没有运行，不说「未能发起」）。返回这次触发（出错时 null），
  * 调用方拿它更新「上次触发」和触发历史
  */
 export async function runNow(s: Schedule, navigate: (to: string) => void): Promise<ScheduleRunResult | null> {
@@ -184,6 +186,12 @@ export async function runNow(s: Schedule, navigate: (to: string) => void): Promi
     } else if (r.fire?.status === 'started' && r.fire.eval_run_id) {
       // 目标是评测题集：发起的是一次评测，没有一次运行可看
       toast.ok(T.evalStarted)
+    } else if (r.fire && targetKindOf(s) === 'source_maintenance') {
+      // 目标是数据源维护：建的是探查、剖析任务（在触发历史里逐个链得到），跳过、没开始的照服务端的原因说
+      const detail = maintenanceSummary(r.fire.inputs)
+      if (r.fire.status === 'started') toast.ok(T.maintenanceStarted, detail ? { detail } : undefined)
+      else if (r.fire.status === 'skipped_overlap') toast.warn(T.maintenanceBusy, r.fire.reason ? { detail: r.fire.reason } : undefined)
+      else toast.error(T.maintenanceFailed(r.fire.reason ?? null))
     } else if (r.fire?.status === 'skipped_overlap' || r.fire?.status === 'skipped_misfire') {
       toast.warn(r.fire.status === 'skipped_overlap' ? T.runSkipped : T.fireStatus.skipped_misfire,
         r.fire.reason ? { detail: r.fire.reason } : undefined)

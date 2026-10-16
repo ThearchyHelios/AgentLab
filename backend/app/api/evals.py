@@ -24,6 +24,18 @@
   GET /evaluations/{id}/compare?base=（和上一次或点名的那一次比：指纹差异、逐题转移和归因）；GET /pairs/{pair_id}（A/B 配对表和
   精确 McNemar）；POST /suites/{id}/cleanup（按保留规则清理更早的明细）。「口径命中与重复度」的 E1–E4 直接用口径账本的
   GET /api/ledger/stats（总方案 X2：只有一份实现）。
+
+第 4 波评测页（细案 01 第 18 项）缺的几样，补在这里（统计、能不能做都由这里给，界面只显示）：
+- GET /suites 每个题集另带 latest（最近一次评测的状态和准确率）、trend（同一变体最近几次评完的准确率，旧的在前）、schedules
+  （目标是这个题集的定时任务）——列表页不再为每个题集再取一遍历次评测；
+- GET /evaluations/{id} 另带 actions：停止、只重试没做完的、重新评分、钉住 / 取消基线现在能不能做（和那几个接口拒收的条件
+  同一份），以及 open（没做完的项数）；
+- POST /suites/{id}/cases/preview：写 SQL 定期望时的第一步——按此刻渲染、过只读守卫、跑一次和期望同一条路的 SQL 探针，交回
+  结果的列和前几行（界面上点选格或列）；用到遮罩列的照保存时那一道拒收、照实写原因（不回 422）；
+- GET /signals：「口径命中与重复度」页签的判据（细案 copilot-look-and-caliber-ledger §3.8 的参考线：E1 ≥30% / <10%，
+  E3 ≥20%）、当前窗口和往前几个窗口各自落在哪一档、成员不少于 3 的问题类（可以加入题集或提取模板）。数都出自
+  ledger/stats.compute_stats 和 chat/questions（全站各一份），这里只按窗口调它们、按判据分档。每个窗口都要聚一次问题，页面
+  另调 /api/ledger/stats：问题的向量由 chat/questions 在进程里留一份，同一句话只取一次（配了远程向量模型时不按窗口重发）。
 """
 from __future__ import annotations
 
@@ -37,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
 from app.api.deps import actor_of
-from app.db.base import get_session, new_id, utcnow
+from app.db.base import SessionLocal, get_session, new_id, utcnow
 from app.db.models_eval import EvalCase, EvalCatalogSnapshot, EvalRun, EvalSuite
 from app.eval import cases as case_rules
 from app.eval import gold as gold_rules
@@ -223,8 +235,70 @@ async def _insert_case(session: AsyncSession, suite: EvalSuite, fields: dict[str
 # ==========================================================================
 
 
+#: 列表里每个题集最多看最近几次评测（最近一次、趋势都从这几次里取）；趋势最多几个点
+OVERVIEW_RUNS = 30
+TREND_POINTS = 8
+
+
+def _rate_of(run: EvalRun) -> dict[str, Any] | None:
+    """一次评测总表里的准确率（stats.rate 的形状：passed、n、rate、ci）；还没有总表的为 None。"""
+    acc = (run.summary or {}).get("accuracy")
+    return dict(acc) if isinstance(acc, dict) else None
+
+
+async def _overview(session: AsyncSession, suite_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """每个题集：最近一次评测（不论结束没有）、同一变体最近几次评完的准确率（趋势，旧的在前）、目标是它的定时任务。
+
+    趋势只连同一变体（fingerprint.variant_key，和上一次比挑基准同一个认法）的几次：换了模型、换了目录的那几次不连成一条线，
+    免得把「换了配置」读成「变好了 / 变差了」。A/B 的几臂各是一次评测，同一变体的那一臂才进趋势。"""
+    from app.db.models import Schedule
+    from app.eval import runner
+    from app.scheduler import cron
+
+    out: dict[str, dict[str, Any]] = {sid: {"latest": None, "trend": [], "schedules": []} for sid in suite_ids}
+    if not suite_ids:
+        return out
+    ranked = select(EvalRun, func.row_number().over(partition_by=EvalRun.suite_id,
+                                                    order_by=EvalRun.created_at.desc()).label("n")) \
+        .where(EvalRun.suite_id.in_(suite_ids)).subquery()
+    from sqlalchemy.orm import aliased
+
+    run_alias = aliased(EvalRun, ranked)
+    rows = list((await session.execute(select(run_alias).where(ranked.c.n <= OVERVIEW_RUNS)
+                                       .order_by(run_alias.created_at.desc()))).scalars())
+    await runner.reconcile_stale(session, rows)
+    by_suite: dict[str, list[EvalRun]] = {}
+    for row in rows:
+        by_suite.setdefault(row.suite_id, []).append(row)
+    for sid, runs in by_suite.items():
+        latest = runs[0]
+        out[sid]["latest"] = {"id": latest.id, "status": latest.status, "running": runner.running(latest),
+                              "arm": latest.arm, "pair_id": latest.pair_id, "trigger": latest.trigger,
+                              "created_at": _iso(latest.created_at), "finished_at": _iso(latest.finished_at),
+                              "counts": dict(latest.counts or {}), "accuracy": _rate_of(latest),
+                              "traced_accuracy": dict((latest.summary or {}).get("traced_accuracy") or {}) or None}
+        finished = [r for r in runs if r.status in ("succeeded", "partial") and _rate_of(r) is not None]
+        if finished:
+            key = (finished[0].fingerprint or {}).get("variant_key")
+            same = [r for r in finished if (r.fingerprint or {}).get("variant_key") == key][:TREND_POINTS]
+            out[sid]["trend"] = [{"id": r.id, "created_at": _iso(r.created_at), "arm": r.arm, **(_rate_of(r) or {})}
+                                 for r in reversed(same)]
+    schedules = (await session.execute(select(Schedule).where(
+        Schedule.target_kind == "eval_suite", Schedule.target_id.in_(suite_ids))
+        .order_by(Schedule.created_at))).scalars()
+    for row in schedules:
+        try:
+            text = cron.describe(row.cron, row.timezone)
+        except cron.CronError:
+            text = f"按 cron 表达式 {row.cron}（{row.timezone}）"
+        out[row.target_id]["schedules"].append({"id": row.id, "name": row.name, "enabled": row.enabled,
+                                                "description_text": text, "next_run_at": _iso(row.next_run_at)})
+    return out
+
+
 @router.get("/suites")
 async def list_suites(archived: bool = False, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """题集（归档的不列，archived=true 时一起列）。每个题集另带 latest、trend、schedules（_overview）。"""
     query = select(EvalSuite).order_by(EvalSuite.updated_at.desc())
     if not archived:
         query = query.where(EvalSuite.archived.is_(False))
@@ -239,7 +313,8 @@ async def list_suites(archived: bool = False, session: AsyncSession = Depends(ge
             counts[suite_id]["cases"] += n
             if enabled:
                 counts[suite_id]["enabled"] += n
-    return {"suites": [_suite_out(r, counts=counts[r.id], site=site) for r in rows]}
+    overview = await _overview(session, [r.id for r in rows])
+    return {"suites": [{**_suite_out(r, counts=counts[r.id], site=site), **overview[r.id]} for r in rows]}
 
 
 @router.post("/suites", status_code=201)
@@ -266,6 +341,7 @@ async def get_suite(suite_id: str, session: AsyncSession = Depends(get_session))
     active = [c for c in out if not c["archived"]]
     return {**_suite_out(suite, counts={"cases": len(active), "enabled": sum(1 for c in active if c["enabled"])},
                          site=await _site(session)),
+            **(await _overview(session, [suite_id]))[suite_id],
             "cases": out, "pending_upgrades": sum(1 for c in active if (c["upgrade"] or {}).get("pending"))}
 
 
@@ -340,6 +416,62 @@ async def trial_unsaved(suite_id: str, request: Request, session: AsyncSession =
     suite = await _suite(session, suite_id)
     fields = await _validated(session, suite, await _body(request))
     return {"trial": (await _trial(session, suite, fields, actor_of(x_actor))).to_dict()}
+
+
+#: 预览最多交回几行（界面上点选格或列用；多行期望的取值仍由试算按整份结果算）
+PREVIEW_ROWS = 50
+
+
+@router.post("/suites/{suite_id}/cases/preview")
+async def preview_sql(suite_id: str, request: Request, session: AsyncSession = Depends(get_session),
+                      x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """写 SQL 定期望的第一步：{datasource_id, sql}（SQL 可以带 {{ schedule.* }}）。按此刻渲染、过只读守卫、跑一次和期望同一条路
+    的 SQL 探针（裸图探索运行，来源 eval），交回结果的列和前 PREVIEW_ROWS 行，界面上据此点选格或列、再去试算。
+
+    结果里有遮罩列、取不到结果、运行失败、超时的，照保存时那一道拒收、照实写原因（status 不是 ok，reason、code 同试算）——不回
+    422：这是在写题的途中，界面把原因落在 SQL 那一格下面。{status, reason, code, columns, rows, row_count, truncated, run_id,
+    rendered}。"""
+    from app.core import artifact_store
+    from app.db.models import Artifact
+
+    suite = await _suite(session, suite_id)
+    body = await _body(request)
+    probe = {"question": "（预览）", "gold": {"kind": "sql", "datasource_id": body.get("datasource_id"),
+                                            "sql": body.get("sql")},
+             # 只为跑一次探针：「没有数据」这一种期望不取任何格，取不到值时下面照样交回结果
+             "expectations": [{"id": "preview", "kind": "none"}]}
+    try:
+        fields = normalize_case(probe)
+        await resolve_case(session, fields, tz=suite.timezone)
+    except CaseInvalid as e:
+        # 没选数据源、SQL 空着、变量写错、没过只读守卫：照实写原因、指明是哪一格
+        return {"status": "invalid", "reason": e.message, "code": e.code, "field": e.field, "columns": [], "rows": [],
+                "row_count": None, "truncated": False, "run_id": None, "rendered": {}}
+    outcome = await _trial(session, suite, fields, actor_of(x_actor))
+    out: dict[str, Any] = {"status": outcome.status, "reason": outcome.reason, "code": outcome.code, "columns": [],
+                           "rows": [], "row_count": None, "truncated": False,
+                           "run_id": outcome.run_ids[0] if outcome.run_ids else None,
+                           "rendered": dict(outcome.rendered or {})}
+    if outcome.status not in ("ok", "no_value") or not outcome.run_ids:
+        return out
+    async with SessionLocal() as read:
+        refs = (await read.execute(select(Artifact.id).where(
+            Artifact.run_id == outcome.run_ids[0], Artifact.kind == "query_snapshot",
+            Artifact.node_id == gold_rules.QUERY_NODE).order_by(Artifact.created_at.desc()))).scalars().all()
+    snapshot = None
+    for ref in refs:
+        try:
+            snapshot = artifact_store.load(ref)
+        except ValueError:
+            snapshot = None
+        if isinstance(snapshot, dict):
+            break
+    if not isinstance(snapshot, dict):
+        return {**out, "status": "failed", "reason": "预览的运行没有留下查询结果", "code": gold_rules.GOLD_FAILED}
+    rows = [list(r) if isinstance(r, (list, tuple)) else [r] for r in snapshot.get("rows") or []]
+    return {**out, "status": "ok", "reason": None, "code": None, "columns": [str(c) for c in snapshot.get("columns") or []],
+            "rows": rows[:PREVIEW_ROWS], "row_count": snapshot.get("row_count", len(rows)),
+            "truncated": bool(snapshot.get("truncated")) or len(rows) > PREVIEW_ROWS, "shown": min(len(rows), PREVIEW_ROWS)}
 
 
 @router.patch("/suites/{suite_id}/cases/{case_id}")
@@ -859,7 +991,29 @@ async def get_evaluation(evaluation_id: str, session: AsyncSession = Depends(get
                                      .where(EvalResult.eval_run_id == row.id, EvalResult.status == "running")
                                      .order_by(EvalResult.seq))).all()
     return {**_evaluation_out(row),
-            "current": [{"case_seq": seq, "repeat": rep, "arm": arm, "doing": doing} for seq, rep, arm, doing in running]}
+            "current": [{"case_seq": seq, "repeat": rep, "arm": arm, "doing": doing} for seq, rep, arm, doing in running],
+            "actions": await _actions(session, row)}
+
+
+async def _actions(session: AsyncSession, row: EvalRun) -> dict[str, Any]:
+    """这次评测现在能做哪几件事（界面照它摆按钮，不自己判）：和 stop / retry / rescore / pin 几个接口拒收的条件同一份。
+    open 是这次评测（A/B 的话几臂合起来）还没做完的项数：停止、中断、出错、到了上限没开评的，重试就是把它们接着做。"""
+    from app.core import job_runtime as runtime
+    from app.db.models_eval import EvalResult
+    from app.eval import runner
+
+    active = row.status in runtime.ACTIVE
+    leader = runner.leader_of(row)
+    arms = list((await session.execute(select(EvalRun.id).where(
+        (EvalRun.id == leader) | (EvalRun.pair_id == leader)))).scalars())
+    open_items = int(await session.scalar(select(func.count()).select_from(EvalResult).where(
+        EvalResult.eval_run_id.in_(arms), EvalResult.status != "ok")) or 0)
+    suite = await session.get(EvalSuite, row.suite_id)
+    cleaned = row.cleaned_at is not None
+    finished = row.status in ("succeeded", "partial")
+    return {"stop": active, "retry": not active and not cleaned and open_items > 0 and suite is not None
+            and not suite.archived, "rescore": not active and not cleaned,
+            "pin": finished and not row.pinned, "unpin": bool(row.pinned), "open": open_items, "cleaned": cleaned}
 
 
 @router.get("/evaluations/{evaluation_id}/results")
@@ -876,7 +1030,16 @@ async def evaluation_results(evaluation_id: str, session: AsyncSession = Depends
         EvalCase.id.in_({r["case_id"] for r in results if r["case_id"]})))).all()) if results else {}
     for r in results:
         r["question"] = questions.get(r["case_id"])
+        r["cost"] = _result_cost(r.get("usage") or {})
     return {"evaluation_id": row.id, "cleaned": row.cleaned_at is not None, "results": results}
+
+
+def _result_cost(usage: dict[str, Any]) -> dict[str, Any]:
+    """一题的花费：助手（runner 记的 assistant 已含复核）+ 写作 + 结论裁判，和这次评测记在账上的同一份；估不出金额的调用另计
+    次数（界面写「≥」或「金额无法估算」）。加在服务端：界面不算数。"""
+    roles = [usage.get(k) or {} for k in ("assistant", "writer", "judge")]
+    return {"cost_usd": round(sum(float(r.get("cost_usd") or 0) for r in roles), 6),
+            "unpriced_calls": sum(int(r.get("unpriced_calls") or 0) for r in roles)}
 
 
 @router.get("/evaluations/{evaluation_id}/results/{result_id}")
@@ -995,6 +1158,97 @@ async def get_pair(pair_id: str, session: AsyncSession = Depends(get_session)) -
     table = None if cleaned else compare.pair_table(
         [(r.arm or r.id, await runner.result_rows(session, r.id)) for r in rows])
     return {"pair_id": pair_id, "evaluations": [_evaluation_out(r) for r in rows], "table": table, "cleaned": cleaned}
+
+
+# ==========================================================================
+# 口径命中与重复度（E1、E3）：判据、分档、窗口趋势、成员不少于 3 的问题类
+# ==========================================================================
+
+#: 判据（docs/design/copilot-look-and-caliber-ledger.md §3.8，已修订为持续统计的参考线）：E1 等价命中率 ≥30% 值得按口径走、
+#: <10% 先只做对账、介于两者之间先加强规范化；E3 问题重复度 ≥20% 沉淀有价值。只作参考，不卡门
+E1_ROUTE, E1_LOW, E3_WORTH = 0.30, 0.10, 0.20
+SIGNAL_CRITERIA = {
+    "e1": [{"band": "route", "at_least": E1_ROUTE, "text": "等价命中率 ≥ 30%：值得按已治理的口径走"},
+           {"band": "normalize", "at_least": E1_LOW, "text": "10%–30%：先加强规范化，让写法不同的等价 SQL 认得出"},
+           {"band": "reconcile", "at_least": 0.0, "text": "< 10%：先只做口径对账"}],
+    "e3": [{"band": "worth", "at_least": E3_WORTH, "text": "问题重复度 ≥ 20%：把反复问的问题沉淀成口径有价值"},
+           {"band": "not_yet", "at_least": 0.0, "text": "< 20%：反复问的问题还不多"}],
+    "note": "参考线出自口径账本的设计文档，只作参考，不卡门",
+}
+SIGNAL_DAYS_MAX = 365
+SIGNAL_POINTS_MAX = 12
+#: 每类最多列几个问题
+CLUSTER_MEMBERS = 10
+
+
+def _e1_band(rate: float | None) -> str | None:
+    if rate is None:
+        return None
+    return "route" if rate >= E1_ROUTE else "normalize" if rate >= E1_LOW else "reconcile"
+
+
+def _e3_band(share: float | None) -> str | None:
+    if share is None:
+        return None
+    return "worth" if share >= E3_WORTH else "not_yet"
+
+
+def _point(stats: dict[str, Any], since: Any, until: Any) -> dict[str, Any]:
+    """一个窗口的 E1、E3（取自 ledger/stats.compute_stats 的结果，不另算）和各自落在哪一档。"""
+    e1, e3 = stats.get("e1") or {}, stats.get("e3") or {}
+    rate = (e1.get("rates") or {}).get("proven")
+    share = e3.get("cluster_share")
+    return {"since": _iso(since), "until": _iso(until),
+            "e1": {"rate": rate, "n": int(e1.get("with_candidates") or 0), "queries": int(e1.get("queries") or 0),
+                   "band": _e1_band(rate)},
+            "e3": {"share": share, "n": int(e3.get("questions") or 0), "lower_bound": e3.get("repeated_share"),
+                   "band": _e3_band(share)}}
+
+
+@router.get("/signals")
+async def signals(days: int = 30, points: int = 6, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """「口径命中与重复度」页签：判据、最近 days 天和往前 points - 1 个同样长的窗口各自的 E1、E3（趋势，旧的在前），以及最近
+    days 天里成员不少于 3 的问题类。
+
+    E1、E3 的数只出自口径账本的 compute_stats（总方案 X2，全站一份；评测运行不计入，见 engine/origin.counted_runs），问题类只出自
+    chat/questions（和 E3、认证队列同一份：只取问题原文、不含 history、排除系统派生的运行）。界面上的详细分布另调
+    GET /api/ledger/stats。每一类给代表问题、最近几个成员和最近一个挂着运行的成员（「提取模板」就从那次运行提取）。"""
+    from datetime import timedelta
+
+    from app.api.deps import current_principal
+    from app.chat.questions import cluster_questions, embedder, recent_questions
+    from app.ledger.stats import QUESTION_LIMIT, REPEAT_RUNS, compute_stats
+
+    if not 1 <= days <= SIGNAL_DAYS_MAX:
+        raise CodedHTTPException(422, f"窗口需要是 1 到 {SIGNAL_DAYS_MAX} 天", case_rules.CASE_INVALID, field="days")
+    if not 1 <= points <= SIGNAL_POINTS_MAX:
+        raise CodedHTTPException(422, f"趋势需要是 1 到 {SIGNAL_POINTS_MAX} 个窗口", case_rules.CASE_INVALID,
+                                 field="points")
+    principal = current_principal()
+    now = utcnow()
+    span = timedelta(days=days)
+    trend = []
+    for i in reversed(range(points)):
+        until = now - span * i
+        since = until - span
+        trend.append(_point(await compute_stats(session, since=since, until=until, principal=principal), since, until))
+    since = now - span
+    questions = [q for q in await recent_questions(session, principal, limit=QUESTION_LIMIT)
+                 if q.at is None or q.at >= since]
+    clusters = []
+    for c in await cluster_questions(questions) if questions else []:
+        if c.count < REPEAT_RUNS:
+            continue
+        with_run = next((m for m in c.members if m.run_id), None)
+        clusters.append({"count": c.count, "representative": c.members[0].text[:500],
+                         "first_at": _iso(c.members[-1].at), "last_at": _iso(c.members[0].at),
+                         "members": [{"text": m.text[:500], "at": _iso(m.at), "run_id": m.run_id, "turn_id": m.turn_id}
+                                     for m in c.members[:CLUSTER_MEMBERS]],
+                         "run_id": with_run.run_id if with_run else None})
+    clusters.sort(key=lambda c: c["count"], reverse=True)
+    return {"window": {"since": _iso(since), "until": _iso(now), "days": days}, "criteria": SIGNAL_CRITERIA,
+            "current": trend[-1], "trend": trend, "clusters": clusters, "questions": len(questions),
+            "threshold": REPEAT_RUNS, "embedder": embedder()}
 
 
 @router.post("/suites/{suite_id}/cleanup")

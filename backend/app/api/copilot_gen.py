@@ -41,6 +41,11 @@ _ASK_OPS = ("ask", "bp_ask")
 _STOP_OPS = ("done", "look", *_ASK_OPS)
 #: 不占次数的查看回话（need 没写、次数用完）连着来几次就不再接着写：模型在原地打转，再要下去只是花钱
 _IDLE_LOOKS = 2
+#: 读到停下的那一行（done、look、ask）之后，最多再收多少字。照约定那一行就是这一次输出的最后一行，后面只剩流末尾那一段
+#: 用量（Anthropic 的输出 token、OpenAI 兼容系开了 stream_usage 的用量都在最后一段才报）：读完它，这一次的花费才报得全，
+#: 问数据页这一轮的花费、评测按角色的成本才不是下限。超过这么多字说明模型还在往下写闲话：不为它付钱，当场关流，这一次的
+#: 用量记成没报全（providers/usage.py 照实记估不出，不当成报全了）
+DRAIN_CHARS = 400
 
 
 # ==========================================================================
@@ -72,9 +77,24 @@ class CopilotIncomplete(Exception):
         self.detail = detail
 
 
+async def _drain(stream: Any, already: int) -> None:
+    """停下的那一行之后把模型的流读完（内容一概不要），只为收到流末尾才报的用量；读到超过 DRAIN_CHARS 字（模型还在写闲话）
+    就不读了，交回调用方关流。already 是缓冲里那一行后面已经收到的字数。"""
+    from app.engine.state import message_text as _text
+    from app.engine.state import thinking_text
+
+    seen = already
+    async for chunk in stream:
+        seen += len(_text(chunk)) + len(thinking_text(chunk) or "")
+        if seen > DRAIN_CHARS:
+            return
+
+
 async def _iter_ops(model: Any, messages: list[Any], *, lines: list[str] | None = None):
     """流式读模型输出，按行切出操作。done、look、ask 之后即停——后面就算有闲话也不要了；look 之后停下也就是
-    「读到这一行就停止本次输出」，模型那条流随之关掉。
+    「读到这一行就停止本次输出」。停下之后不马上关流：交出那一行、调用方接着要下一条时先把流读完（_drain，内容丢掉，最多
+    DRAIN_CHARS 字），流末尾那一段用量才收得到——以前读到这一行就关流，输出 token 一个都拿不到，问数据这一轮的花费多半是下限
+    （第 1 波遗留）。
 
     除了操作，还把模型的思考原样转出去（thinking_text：Claude 的 thinking 块、OpenAI 兼容系的 reasoning_content），
     不把非 JSON 行当成思考。lines 给了的话，认出来的操作行原样记进去：接着写时作为 assistant 消息交回模型。
@@ -101,6 +121,7 @@ async def _iter_ops(model: Any, messages: list[Any], *, lines: list[str] | None 
                         lines.append(line.strip())
                     yield op
                     if op.get("op") in _STOP_OPS:
+                        await _drain(stream, len(buffer))
                         return
             cut = _cut_off(chunk) or cut
     op = _parse_op_line(buffer)

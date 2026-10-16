@@ -21,6 +21,7 @@ import {
 } from './model'
 import { ClassChip, LiveElapsed, TierChip } from './parts'
 import { ScheduleTag, useScheduleNames } from '../schedules/parts'
+import { EvalTag } from './EvalSource'
 import type { RunList, StatusCounts, TaskQueue } from './useRunsData'
 
 // -------------------------------------------------------------------------
@@ -391,6 +392,8 @@ function RunRow({ run, code, approval, selected, dup, flash, now, onOpen, schedu
           </span>
         )}
         {run.schedule_id && <ScheduleTag scheduleId={run.schedule_id} name={scheduleName} />}
+        {/* 评测发起的：点一下回到评测里对应的那道题 */}
+        {run.origin_kind === 'eval' && <EvalTag run={run} />}
         {/* 来源：定时任务那一种上面的标记已经说了；来源未记录的老运行在列表里不标，详情页照实写 */}
         {run.origin_kind && run.origin_kind !== 'schedule' && <OriginChip kind={run.origin_kind} />}
         <span className="flex-1" />

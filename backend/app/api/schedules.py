@@ -349,7 +349,22 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
     对比和比的时候两边的封存绑定（auto_compare）：哪一边现在不在终态（被继续执行）、被删掉、清单哈希和比的时候不一样
     （重新封存过）都给 null——对比页按现在的封存现算，记下的计数和点进去看到的会对不上，或者干脆比不了。工件读不出来、
     被改过的同样给 null。基准已经不是现在挑出来的那一次（auto_compare.outdated：中间隔着的运行事后接着运行成功了）也
-    给 null：运行详情里同名的入口比的是另一次。"""
+    给 null：运行详情里同名的入口比的是另一次。
+
+    inputs 只在目标是数据源维护时给：{steps, jobs: [{step, kind, id, tables, scope?}], skipped: [{step, reason}]}——这一次
+    建了哪几个探查、剖析任务，哪几步没执行和原因（app/data/source_maintenance 记在触发上的那一份）。维护没有运行，触发历史、
+    「上次触发」和立即运行的答复靠它写出建了什么，不写「未发起运行」。别的目标给 null：工作流触发的 inputs 是按模板渲染的
+    工作流输入，触发历史不列。"""
+    maintenance = set((await session.execute(select(Schedule.id).where(
+        Schedule.id.in_({f.schedule_id for f in fires}), Schedule.target_kind == "source_maintenance"))).scalars()) \
+        if fires else set()
+
+    def inputs_of(f: ScheduleFire) -> dict[str, Any] | None:
+        if f.schedule_id not in maintenance:
+            return None
+        raw = f.inputs if isinstance(f.inputs, dict) else {}
+        return {key: raw[key] for key in ("steps", "jobs", "skipped") if key in raw}
+
     compared = {f.id: f.compare_artifact for f in fires if f.compare_artifact and f.run_id}
     compares = await auto_compare.briefs(list(compared.values()))
     stale = await auto_compare.outdated(session, compares)
@@ -389,6 +404,7 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
         "run_status": current.get(f.run_id, (None, None))[0] if f.run_id else None,
         # 目标是评测题集时这一次触发建的那次评测（没有运行 id）
         "eval_run_id": f.eval_run_id,
+        "inputs": inputs_of(f),
         "reason": None if f.id in launching else f.reason,
         "notified": notified.get(f.id, []),
         "compare": compare_of(f),
