@@ -330,6 +330,18 @@ def c_subtotal_blank(mp):
     return _run(sales_book(edit=edit), data), [N]
 
 
+def c_subtotal_suspect(mp):
+    """期 5：没配小计时，首列以合计字样开头、其余文字列空着的行像夹在中间的小计：照常导入，要人确认。"""
+    data = list_recipe()
+
+    def edit(ws):
+        ws["D4"] = N
+        ws.insert_rows(6)
+        ws["A6"] = "小计"
+        ws["D6"] = N
+    return _run(sales_book(edit=edit), data), [N]
+
+
 def c_value_not_integer(mp):
     return _run(_flow(_set(C11=9876.54)), FLOW), [9876.54]
 

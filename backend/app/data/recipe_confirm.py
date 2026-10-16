@@ -1260,6 +1260,14 @@ def _period_items(bag: _Bag, recipe: Recipe, ex: dict[str, Any], ctx: ConfirmCon
         bag.add(f"rows_after_stop:{blk}", "；".join(str(p.get("message") or "") for p in probs),
                 "、".join(cells[:20]), source="outside")
 
+    # 期 5：没配小计的列表里像小计的数据行：照常导入了，要人确认它们确实是数据（不是的话用修复按钮改作小计核对）
+    for p in ex.get("problems") or []:
+        p = plain(p)
+        if isinstance(p, dict) and p.get("code") == "subtotal_suspect":
+            blk = str((p.get("fix_args") or {}).get("block") or "、".join(str(c) for c in p.get("cells") or []))
+            bag.add(f"subtotal_suspect:{blk}", str(p.get("message") or ""),
+                    "、".join(str(c) for c in (p.get("cells") or [])[:20]), source="outside")
+
     # 列表块只有表头、没有数据行（AU-1）：问题对象里没有块键，按消息里的「列表「块」」认
     for p in ex.get("problems") or []:
         p = plain(p)

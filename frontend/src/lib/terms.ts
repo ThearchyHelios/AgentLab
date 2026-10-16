@@ -1859,6 +1859,7 @@ export const FIX_KIND_LABEL: Record<string, string> = {
   edit_members: '更新关系成员',
   rename_title: '改分段标题',
   declare_total: '改作合计核对',
+  declare_subtotals: '改作小计核对',
   ignore_cells: '按文字忽略',
   declare_placeholder: '声明占位符',
   declare_hidden: '设置隐藏行处理',

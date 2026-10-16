@@ -473,9 +473,10 @@ class Problem:
     fix_args: dict[str, Any] | None = None
 
 
-#: 修复按钮的九种（P3-SPEC 3.2 ①–⑨）。Problem.fix、FixProposal.kind、确认项 fix:<目标键> 的 kind 都取自这里
+#: 修复按钮的种类（P3-SPEC 3.2 ①–⑨；期 5 加 declare_subtotals：列表中间像小计的行改作小计核对）。Problem.fix、
+#: FixProposal.kind、确认项 fix:<目标键> 的 kind 都取自这里
 FIX_KINDS = ("remove_label", "add_label", "edit_members", "rename_title", "declare_total", "ignore_cells",
-             "declare_placeholder", "declare_hidden", "rename_sheet")
+             "declare_placeholder", "declare_hidden", "rename_sheet", "declare_subtotals")
 
 
 @dataclass

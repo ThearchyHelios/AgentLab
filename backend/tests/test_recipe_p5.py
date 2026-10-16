@@ -433,3 +433,46 @@ def test_csv_drafts_a_list_and_the_engine_runs_it(tmp_path):
     # 回执的坐标照 Excel 打开这个 CSV 时的 A1 写
     [excluded] = [x for x in ex.rows_excluded if x.reason == "subtotal"]
     assert excluded.sheet == "CSV" and excluded.rows == [[4, 4]]
+
+
+# ==========================================================================
+# 没配小计时，像小计的行：照常导入、要人确认，带「改作小计核对」的修复按钮
+# ==========================================================================
+
+
+def test_a_subtotal_like_row_without_subtotals_is_flagged_and_fixable(tmp_path):
+    from app.data import recipe_confirm, recipe_fixes
+    from app.data.recipe import apply_patch
+
+    plain = _list(STORE_COLS, rows={"total_row": {"label_column": "地区", "pick": "合计"}})
+    ex = _run(_book(STORES), plain)
+    [p] = [p for p in ex.problems if p.code == "subtotal_suspect"]
+    assert p.category == "confirm" and p.fix == "declare_subtotals"
+    assert p.cells == ["明细!A4", "明细!A7"] and p.fix_args["pick"] == "小计" and p.fix_args["label_column"] == "地区"
+    assert ex.ok                                      # 需确认类：照常导入，提交时勾确认项
+    full = Recipe.model_validate(plain).model_dump(mode="json")
+    [prop] = recipe_fixes.propose_fixes(full, [recipe_fixes.dataclasses.asdict(p)], [], None)
+    assert prop.kind == "declare_subtotals" and [o.value for o in prop.options] == ["check_only", "keep"]
+    res = recipe_fixes.fix_ops(full, prop, "check_only", None)
+    assert res.ok, res.problems
+    fixed = apply_patch(full, res.ops)
+    assert fixed["sheets"][0]["blocks"][0]["rows"]["subtotals"]["pick"] == "小计"
+    db = str(tmp_path / "f.db")
+    ex2 = _run(_book(STORES), fixed, db)
+    assert ex2.ok and not [p for p in ex2.problems if p.code == "subtotal_suspect"]
+    assert _checks(db, ex2, fixed)["T2"].status == "passed"
+    keep = apply_patch(full, recipe_fixes.fix_ops(full, prop, "keep", None).ops)
+    assert keep["tables"][-1] == {"name": "明细_小计", "grain": [], "kind": "reported_total", "units": {}, "note": ""}
+    assert validate_recipe(keep, facts=None, origin="rules")[1] == []
+    # 确认项：没改作小计核对就提交的，要勾「确实是数据」
+    items = recipe_confirm.confirm_items(recipe_confirm.ConfirmContext(kind="first", recipe=plain, extraction=ex,
+                                                                       checks=[]))
+    [item] = [i for i in items if i.id == "subtotal_suspect:列表1"]
+    assert item.required and "改作小计核对" in item.label
+
+
+def test_ordinary_rows_starting_with_a_total_word_are_not_flagged():
+    """首列以「累计」开头、别的文字列有字的是数据（「累计积分卡」这种商品名），不当成像小计的行。"""
+    rows = [("商品", "门店", "金额"), ("累计积分卡", "门店一", 10), ("普通卡", "门店二", 20)]
+    ex = _run(_book(rows), _list([("商品", "TEXT"), ("门店", "TEXT"), ("金额", "INTEGER")]))
+    assert ex.ok and not [p for p in ex.problems if p.code == "subtotal_suspect"]

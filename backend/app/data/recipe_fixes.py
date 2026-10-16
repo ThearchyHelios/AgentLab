@@ -253,6 +253,8 @@ def _key(kind: str, target: dict[str, Any]) -> str:
         return f"declare_hidden:{t['sheet']}:{t['axis']}"
     if kind == "rename_sheet":
         return f"rename_sheet:{t['sheet_id']}"
+    if kind == "declare_subtotals":
+        return f"declare_subtotals:{t['block']}"
     raise KeyError(kind)
 
 
@@ -751,6 +753,62 @@ def _o_declare_total(recipe: dict, p: FixProposal, opt: FixOption, reason: str |
 
 
 # ==========================================================================
+# 期 5：列表中间像小计的行改作小计核对
+# ==========================================================================
+
+
+def _subtotal_keep_name(recipe: dict, block: dict) -> str:
+    used = {collide_key(t.get("name") or "") for t in recipe.get("tables") or []}
+    return unique_name(f"{block.get('table')}_小计", used)
+
+
+def _p_declare_subtotals(recipe: dict, prob: Any, args: dict, anchor: FixAnchor) -> FixProposal | None:
+    """subtotal_suspect → 列表块加 rows.subtotals（标签列、开头词取自执行器给的 fix_args：文件里的合计字样）。
+    块已经配了小计、标签列不在块里、开头词含数字时不提议。"""
+    found = find_block(recipe, args.get("block"))
+    if found is None:
+        return None
+    _si, _bi, block = found
+    label, pick = args.get("label_column"), args.get("pick")
+    if block.get("layout") != "list" or (block.get("rows") or {}).get("subtotals"):
+        return None
+    if label not in [c.get("name") for c in block.get("columns") or []] or not isinstance(pick, str) \
+            or not pick or has_digit(pick):
+        return None
+    target = {"block": block["id"], "label_column": label, "pick": pick}
+    keep = _subtotal_keep_name(recipe, block)
+    return _proposal("declare_subtotals", _key("declare_subtotals", target), code=_get(prob, "code"),
+                     title=f"列表「{block['id']}」中间「{pick}」开头的行是小计",
+                     cells=list(args.get("cells") or _get(prob, "cells") or []), target=target,
+                     options=[FixOption("check_only", "改作小计核对，不另存",
+                                        detail="每行小计按上一行小计之后的明细逐列求和核对，小计行不进数据，记进回执的"
+                                               "「排除的行」"),
+                              FixOption("keep", f"改作小计核对，原值另存表「{keep}」",
+                                        detail="同上，原表的小计另存成一张表；另存的小计表不能按期累积")],
+                     anchor=anchor)
+
+
+def _o_declare_subtotals(recipe: dict, p: FixProposal, opt: FixOption, reason: str | None) -> tuple[list, list[str]]:
+    found = find_block(recipe, p.target.get("block"))
+    if found is None:
+        raise _Stale
+    si, bi, block = found
+    if (block.get("rows") or {}).get("subtotals"):
+        raise _Stale
+    keep = _subtotal_keep_name(recipe, block) if opt.value == "keep" else None
+    value = {"label_column": p.target["label_column"], "pick": p.target["pick"], "scope": "since_previous",
+             "group_column": None, "keep_as": keep}
+    ops: list[dict[str, Any]] = [{"op": "add", "path": ptr("sheets", si, "blocks", bi, "rows", "subtotals"),
+                                  "value": value}]
+    if keep:
+        ops.append({"op": "add", "path": "/tables/-", "value": {
+            "name": keep, "grain": [], "kind": "reported_total", "units": {}, "note": ""}})
+    summary = [f"列表「{block['id']}」中间「{p.target['pick']}」开头的行改作小计核对，不进数据"
+               + (f"，原值另存表「{keep}」" if keep else "，不另存")]
+    return ops, summary
+
+
+# ==========================================================================
 # ⑥ 忽略（按文字记）
 # ==========================================================================
 
@@ -998,12 +1056,13 @@ _Builder = Callable[[dict, Any, dict, FixAnchor], "FixProposal | None"]
 _BUILDERS: dict[str, _Builder] = {
     "remove_label": _p_remove_label, "add_label": _p_add_label, "rename_title": _p_rename_title,
     "declare_total": _p_declare_total, "ignore_cells": _p_ignore_cells, "declare_placeholder": _p_declare_placeholder,
-    "declare_hidden": _p_declare_hidden, "rename_sheet": _p_rename_sheet,
+    "declare_hidden": _p_declare_hidden, "rename_sheet": _p_rename_sheet, "declare_subtotals": _p_declare_subtotals,
 }
 _OPS: dict[str, Callable[[dict, FixProposal, FixOption, str | None], tuple[list, list[str]]]] = {
     "remove_label": _o_remove_label, "add_label": _o_add_label, "edit_members": _o_edit_members,
     "rename_title": _o_rename_title, "declare_total": _o_declare_total, "ignore_cells": _o_ignore_cells,
     "declare_placeholder": _o_declare_placeholder, "declare_hidden": _o_declare_hidden, "rename_sheet": _o_rename_sheet,
+    "declare_subtotals": _o_declare_subtotals,
 }
 
 
@@ -1064,6 +1123,8 @@ def _edit_title(p: FixProposal, opt: FixOption) -> str:
         return f"工作表「{t.get('sheet')}」：{opt.label}"
     if p.kind == "rename_sheet":
         return opt.label
+    if p.kind == "declare_subtotals":
+        return f"列表「{t.get('block')}」中间「{t.get('pick')}」开头的行{opt.label}"
     return p.title
 
 

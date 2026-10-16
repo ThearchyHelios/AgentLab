@@ -67,7 +67,8 @@ from app.data import engine as _data_engine
 from app.data import tabular, xlsx_cells
 from app.data.names import canon
 from app.data.recipe_parsers import (
-    AxisDate, HourRange, HourTotal, Period, classify_outside, cn_date_range, cn_year_month, filename_period,
+    TOTAL_WORDS, AxisDate, HourRange, HourTotal, Period, classify_outside, cn_date_range, cn_year_month,
+    filename_period,
     hour_range, hour_range_total, is_pure_period_cell, looks_numeric_text, match_key, month_day_or_date,
     period_residue, text_label, thousands_number,
 )
@@ -110,6 +111,7 @@ PROBLEM_CODES: dict[str, str] = {
     "header_not_found": "structure", "header_ambiguous": "structure", "column_missing": "structure",
     "column_extra": "structure", "rows_after_stop": "confirm", "total_row_missing": "structure",
     "total_row_blank": "structure", "list_empty": "confirm", "subtotal_blank": "structure",
+    "subtotal_suspect": "confirm",
     # 值
     "value_not_integer": "structure", "value_text_number": "structure", "value_blank": "structure",
     "value_error": "structure", "value_not_number": "structure", "value_not_date": "structure",
@@ -133,6 +135,7 @@ PROBLEM_FIX: dict[str, str] = {
     "axis_extra_cells": "ignore_cells", "column_extra": "ignore_cells", "row_unclaimed": "ignore_cells",
     "outside_number": "ignore_cells",
     "hidden_rows": "declare_hidden", "hidden_cols": "declare_hidden", "sheet_missing": "rename_sheet",
+    "subtotal_suspect": "declare_subtotals",
 }
 
 #: 列表找表头的窗口：从 after_title 的下一行（或已用区域首行）起往下这么多行
@@ -1675,6 +1678,10 @@ class _ListRun:
         self.sub_rows: dict[int, list[int]] = {}
         #: 期 5：加统计期起止两列（ListPeriod.synthesize）：每行末尾两格占位，统计期定下来以后由 _Sink 换成真值
         self.synth = block.period is not None and block.period.synthesize is not None
+        #: 期 5：没配小计时，像夹在明细中间的小计的数据行（行号）和命中的合计字样：照常按数据导入，收尾时报
+        #: subtotal_suspect 要人确认（带修复按钮：改作小计核对）
+        self.suspects: list[int] = []
+        self.suspect_word: str | None = None
 
     # ---------------- 喂入 ----------------
 
@@ -1742,6 +1749,7 @@ class _ListRun:
         if self.located:
             for i, text in self.headers_read.items():
                 self.eng.headers[(self.block.table, self.cols[i].name)] = text
+        self._report_suspects()
 
     # ---------------- 表头 ----------------
 
@@ -2068,7 +2076,47 @@ class _ListRun:
             if label is not None and match_key(_text(label.value)).startswith(self.sub_key):
                 self._subtotal_row(r, inb, cells, label)
                 return
+        elif (word := self._suspect_word(inb)) is not None:
+            self.suspects.append(r)
+            self.suspect_word = self.suspect_word or word
         self._record(r, inb, cells, fills)
+
+    def _suspect_word(self, inb: dict[int, GridCell]) -> str | None:
+        """期 5：这一行像不像夹在明细中间的小计（配方没配 subtotals 时才看）：首列是以合计字样（TOTAL_WORDS）开头的文字，
+        其余文字、日期列都空着，至少一格有数。像的话返回那个字样。以前这种行静默当数据导入，求和就把小计重复算了
+        进去（H2）；现在照常导入，但收尾时报出来要人确认，并给「改作小计核对」的修复按钮。合计行已经在前面认走了。"""
+        cell = inb.get(self.c1)
+        if cell is None or cell.formula is not None or not isinstance(cell.value, str):
+            return None
+        key = match_key(cell.value)
+        word = next((w for w in TOTAL_WORDS if key.startswith(w)), None)
+        if word is None or not any(self.colmap.get(i) == self.c1 for i in range(len(self.cols))):
+            return None
+        numeric = False
+        for i, col in enumerate(self.cols):
+            c = self.colmap.get(i)
+            if c is None or c == self.c1 or c not in inb:
+                continue
+            if col.type in ("TEXT", "DATE"):
+                return None
+            numeric = True
+        return word if numeric else None
+
+    def _report_suspects(self) -> None:
+        """收尾：像小计的数据行合成一条 subtotal_suspect（需确认），修复参数带块 id、标签列、字样、行号和标签格。"""
+        if not self.suspects or not self.located:
+            return
+        label = next(col.name for i, col in enumerate(self.cols) if self.colmap.get(i) == self.c1)
+        cells = [self.sh.coord(r, self.c1) for r in self.suspects]
+        rows = _rows_text(self.suspects)
+        word = self.suspect_word or ""
+        where = (f"{self.where}：第 {rows} 行像夹在明细中间的小计（「{label}」列以「{word}」开头、其余文字列为空），"
+                 "按数据导入了")
+        msg = (f"{where}。如果它们是小计，对这一列求和会把小计重复算进去：请用修复按钮改作小计核对；"
+               "确实是数据时，确认后照常导入")
+        self.eng.problems.add("subtotal_suspect", msg, where, cells[:CELLS_MAX], sheet=self.sh.name,
+                              fix_args={"block": self.block.id, "label_column": label, "pick": word,
+                                        "rows": list(self.suspects), "cells": cells[:CELLS_MAX]})
 
     def _plan(self) -> list[tuple[Any, int, bool, str]]:
         """每列的（列定义、所在列号、是不是主键、位置说明）：定下表头之后算一次，逐行复用。"""
