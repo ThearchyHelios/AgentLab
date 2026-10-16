@@ -198,7 +198,7 @@ async def test_reading_the_sealed_answer_and_the_per_case_sql_match(engine_on, m
 async def test_rescoring_reads_the_seal_and_never_calls_a_model(engine_on, monkeypatch, tmp_path):
     from app.db.base import SessionLocal
     from app.db.models_eval import EvalResult, EvalRun
-    from app.eval import rescore
+    from app.eval import rescore, score
     from app.providers import mock_model
     from tests import eval_samples as es
     from tests import ledger_samples as ls
@@ -229,5 +229,7 @@ async def test_rescoring_reads_the_seal_and_never_calls_a_model(engine_on, monke
     async with SessionLocal() as session:
         row = (await session.execute(select(EvalResult).where(EvalResult.eval_run_id == er_id))).scalar_one()
         assert row.verdict == "pass" and row.scores[0]["outcome"] == "traced"
-        assert (await session.get(EvalRun, er_id)).summary["accuracy"]["passed"] == 1
+        rescored = await session.get(EvalRun, er_id)
+        assert rescored.summary["accuracy"]["passed"] == 1 and rescored.summary["rescored_at"]
+        assert rescored.fingerprint["scorer_version"] == score.SCORER_VERSION
     await es.drop_suites()

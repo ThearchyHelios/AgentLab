@@ -13,7 +13,7 @@ from typing import Any
 
 from sqlalchemy import select
 
-from app.db.base import SessionLocal
+from app.db.base import SessionLocal, utcnow
 from app.db.models_eval import EvalCase, EvalResult, EvalRun
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,10 @@ async def rescore(eval_run_id: str) -> int:
                     setattr(row, key, value)
         await session.flush()
         run = await session.get(EvalRun, eval_run_id)
-        await runner.refresh_summary(session, run)
+        # 指纹里的评分规则版本跟着换：和别的评测比时照实标出「评分规则」一项变没变
+        run.fingerprint = {**dict(run.fingerprint or {}), "scorer_version": score.SCORER_VERSION}
+        summary = await runner.refresh_summary(session, run)
+        run.summary = {**summary, "rescored_at": utcnow().isoformat()}
         await session.commit()
     return changed
 

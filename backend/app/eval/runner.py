@@ -33,9 +33,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -236,8 +235,6 @@ class _Arm:
     view: dict[str, Any] | None = None
     #: 这一臂的名字（A/B 时）
     name: str | None = None
-    #: 这一臂各项：{(题目 id, 第几次): 结果 id}
-    items: dict[tuple[str, int], str] = field(default_factory=dict)
 
 
 @dataclass

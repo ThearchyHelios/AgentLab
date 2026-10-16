@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 
 import httpx
 import pytest
@@ -22,7 +22,7 @@ from sqlalchemy import delete, select
 
 from app.core.crypto import encrypt
 from app.db.base import SessionLocal, utcnow
-from app.db.models import NotifyChannel, Schedule, ScheduleFire
+from app.db.models import NotifyChannel, Schedule
 from app.db.models_eval import EvalResult, EvalRun
 from app.engine.runner import run_manager
 from app.eval import answer as answer_mod

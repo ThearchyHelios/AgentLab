@@ -7,8 +7,6 @@
 """
 from __future__ import annotations
 
-from datetime import timedelta
-
 import pytest
 
 import app.db.models  # noqa: F401 - conftest 按已导入的模型建表
