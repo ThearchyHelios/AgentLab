@@ -225,6 +225,49 @@ async def test_fixed_mode_stays_on_the_runs_it_was_created_with(world):  # noqa:
     assert moving["view"]["sources"]["latest"]["run_id"] == second.id
 
 
+async def test_runs_issued_from_questions_are_never_the_latest(world):  # noqa: F811
+    """问数据的答案按口径正式出具的运行（ledger_issue）参数是从某人的提问里绑出来的：应用页、趋势、分享链接（latest 和建
+    fixed 时取的那次）、视图数据接口的「最近一次封存」都不取它，下载报告也不认它（复核 H1）。"""
+    from app.engine.launch import launch_run
+
+    svc = await auth_env.make_service()
+    wf, h = await workflow(KPI)
+    app_id = await published(world, board(wf, h), [("user", "svc-portal", "observe")])
+    regular = await formal(wf, "W1")
+    async with SessionLocal() as s:
+        launched = await launch_run(s, workflow_id=wf, run_class="formal", version=1, input_payload={"week": "W9"},
+                                    actor="编辑", origin_kind="ledger_issue", origin={"source_run": "提问那次"},
+                                    expect_hash=h)
+    issued = await wait(launched.id)
+    assert issued.status == "succeeded" and issued.manifest_hash, "出具的运行成功并封存了，是更新的那一次"
+    admin = await auth_env.login("root")
+    page = (await admin.get(f"/api/apps/{app_id}/pages/home")).json()
+    assert page["sources"]["latest"]["run_id"] == regular.id, "看板不换成某人提问的那组参数"
+    points = page["tree"][1]["data"]["series"][-1]["points"]
+    assert [p["run_id"] for p in points] == [regular.id], "趋势里也没有它"
+    _, secret = await auth_env.make_key(svc, scopes=("apps.read",))
+    data = (await auth_env.keyed(secret).get(f"/api/apps/{app_id}/views/latest/data")).json()
+    assert data["state"] == "ok" and data["run_id"] == regular.id, "视图数据接口同一个取法"
+    fixed = await share(app_id, mode="fixed")
+    latest = await share(app_id)
+    for made in (fixed, latest):
+        async with anonymous(**{HEADER: made["key"]}) as c:
+            body = (await c.get("/api/shares/page")).json()
+            assert body["view"]["sources"]["latest"]["run_id"] == regular.id, made["mode"]
+            refused = await c.get("/api/shares/report.html", params={"run": issued.id})
+            assert refused.status_code == 404 and refused.json()["code"] == "share_run_not_shared", made["mode"]
+
+
+def test_every_run_origin_is_classified_for_latest_sealed():
+    """每种运行来源都要说清算不算「最近一次封存」：以后加了来源、没在 apps/resolve 归类的，这里先失败。"""
+    from app.apps.resolve import NOT_SEALED_ORIGINS, SEALED_ORIGINS
+    from app.engine.origin import ORIGIN_KINDS
+
+    assert not set(SEALED_ORIGINS) & set(NOT_SEALED_ORIGINS)
+    assert set(SEALED_ORIGINS) | set(NOT_SEALED_ORIGINS) == set(ORIGIN_KINDS)
+    assert "ledger_issue" in NOT_SEALED_ORIGINS and "app_backfill" in NOT_SEALED_ORIGINS
+
+
 async def test_report_download_only_for_the_shares_runs_and_masked(world, monkeypatch, tmp_path):  # noqa: F811
     import sqlite3
 

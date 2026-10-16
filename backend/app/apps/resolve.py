@@ -52,6 +52,18 @@ PAGE_CACHE_SIZE = 256
 
 #: 按新口径补算的运行来源（engine/origin.py）
 BACKFILL_ORIGIN = "app_backfill"
+#: 「最近一次封存」认哪几种来源的正式运行：latest_sealed 视图、趋势、分享链接（latest，以及建 fixed 时取的那几次）、视图
+#: 数据接口、补算判断「新版本算过没有」都经 sealed_runs，这里改一处都跟上。按白名单认，以后加的来源默认不算，要算的在这里
+#: 登记（tests/test_shares.py 核对 ORIGIN_KINDS 每种都归了类）。算的：定时、手动的正式运行、应用的入口和按需视图、入站
+#: 钩子、直接调接口；加来源这一列之前的老运行（origin_kind 为空）也算。
+SEALED_ORIGINS = ("launcher", "schedule", "app_entry", "app_view", "hook", "api")
+#: 不算的，各有原因：
+#: - app_backfill：按新口径补算的是现在才算的历史期，不是「最近一次」；趋势另经 trend_runs 按它对应的输入期排进去；
+#: - ledger_issue：问数据的答案按已治理口径正式出具（docs/design/next-round/02-口径账本.md §5），参数是从某人的提问里
+#:   绑出来的。取到它，看板、趋势、分享链接就悄悄换成了那个人问的那组数；
+#: - 其余是探索运行（问数据、画布试跑、试运行、个人应用的刷新，评测、口径对账、口径召回），本来就不是正式运行。
+NOT_SEALED_ORIGINS = (BACKFILL_ORIGIN, "ledger_issue", "chat", "canvas", "trial", "personal_app", "eval", "reconcile",
+                      "recall")
 
 VIEW_REFUSED = "app_view_refused"
 DAILY_LIMIT = "app_view_daily_limit"
@@ -138,8 +150,8 @@ async def sealed_runs(session: AsyncSession, workflow_id: Any, version: Any, gra
     """钉住版本（同一 graph_hash）最近 n 次成功且已封存的正式运行，新的在前。
 
     sealed_now 认的是「这一次结束时封的」：失败后接着跑完、新封存还没补上的那一刻，带着的是旧封存，不算。
-    按新口径补算的运行（app_backfill）不算：它们是现在才算的历史期，「最近一次」不能取到它们；趋势另经 trend_runs
-    按它们对应的输入期排进去。"""
+    来源只认 SEALED_ORIGINS（和老运行）：按新口径补算的（app_backfill）、问数据按口径出具的（ledger_issue）都不是
+    「最近一次」，原因见 NOT_SEALED_ORIGINS。"""
     from sqlalchemy import or_
 
     from app.scheduler.auto_compare import sealed_now
@@ -148,7 +160,7 @@ async def sealed_runs(session: AsyncSession, workflow_id: Any, version: Any, gra
         return []
     query = select(Run).where(Run.workflow_id == workflow_id, Run.version == version, Run.run_class == "formal",
                               Run.status == "succeeded", Run.version_hash == graph_hash,
-                              or_(Run.origin_kind.is_(None), Run.origin_kind != BACKFILL_ORIGIN))
+                              or_(Run.origin_kind.is_(None), Run.origin_kind.in_(SEALED_ORIGINS)))
     if isinstance(origin, str) and origin.startswith("schedule:"):
         query = query.where(Run.schedule_id == origin[len("schedule:"):])
     rows = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.created_at.desc())
