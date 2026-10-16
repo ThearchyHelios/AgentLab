@@ -82,7 +82,7 @@ class EvalCase(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     suite_id: Mapped[str] = mapped_column(ForeignKey("eval_suites.id", ondelete="CASCADE"))
-    # 题号：题集里从 1 起，删了的题号不复用（运行名「评测：题集名·第 n 题」按它写）
+    # 题号：题集里从 1 起、按建的先后（运行名「评测：题集名·第 n 题」按它写）。和上一次比按题目 id 和指纹配对，不按题号
     seq: Mapped[int] = mapped_column(Integer)
     kind: Mapped[str] = mapped_column(String(20), default="ask")
     # 问法。可以带 {{ schedule.* }} 变量（按评测的截至时间渲染成明确的日期）
