@@ -72,6 +72,7 @@ async def _for_key(principal: Any, items: list[dict[str, Any]]) -> list[dict[str
         return items
     from sqlalchemy import select
 
+    from app.auth.access import PRIVATE_ORIGINS
     from app.db.base import SessionLocal
     from app.db.models import App, Run
 
@@ -81,7 +82,7 @@ async def _for_key(principal: Any, items: list[dict[str, Any]]) -> list[dict[str
         personal = set((await session.execute(select(App.id).where(App.id.in_(app_ids or {""}),
                                                                    App.scope == "personal"))).scalars())
         private = set((await session.execute(select(Run.id).where(
-            Run.id.in_(run_ids or {""}), Run.origin_kind.in_(("personal_app", "trial"))))).scalars())
+            Run.id.in_(run_ids or {""}), Run.origin_kind.in_(PRIVATE_ORIGINS)))).scalars())
     return [i for i in items if i.get("app_id") not in personal and i.get("run_id") not in private
             and (principal.app_ids is None or i.get("app_id") in principal.app_ids)]
 

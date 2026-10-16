@@ -315,7 +315,8 @@ function KeyCreator({ settings, onClose, onIssued }: {
   onClose: () => void
   onIssued: (k: AccessKeyIssued) => void
 }) {
-  const [services, setServices] = useState<ServiceAccountRow[]>([])
+  // null：还在取（管理员才取）；取到之后才判「还不能建」
+  const [services, setServices] = useState<ServiceAccountRow[] | null>(settings.admin ? null : [])
   const [apps, setApps] = useState<AppSummary[] | null>(null)
   // 拥有者：'' 是我自己（个人访问密钥），否则是服务账号 id
   const [owner, setOwner] = useState<string | null>(settings.can_create_personal ? '' : null)
@@ -364,13 +365,13 @@ function KeyCreator({ settings, onClose, onIssued }: {
              </button>
            </>}>
       <div className="space-y-3" data-access-key-form="">
-        {owner === null && !services.length && <Notice tone="warn">{T.noOwner}</Notice>}
+        {owner === null && services !== null && !services.length && <Notice tone="warn">{T.noOwner}</Notice>}
         {settings.admin && (
           <Field label={T.owner}>
             {(p) => (
               <select {...p} className="field" value={owner ?? ''} onChange={(e) => setOwner(e.target.value)} data-access-key-owner="">
                 {settings.can_create_personal && <option value="">{T.ownerMe}</option>}
-                {services.map((s) => <option key={s.id} value={s.id}>{T.ownerService(s.username)}</option>)}
+                {(services ?? []).map((s) => <option key={s.id} value={s.id}>{T.ownerService(s.username)}</option>)}
               </select>
             )}
           </Field>

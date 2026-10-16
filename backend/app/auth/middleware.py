@@ -112,13 +112,12 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
         from app.api.deps import reset_principal, set_principal
-        from app.auth import current_mode, refusal
+        from app.auth import current_mode, keys, refusal
 
         # 登录设置在启动时读进缓存（main.py 的 _platform_startup），改设置的接口改完就刷新；这里不查库
         mode = current_mode()
         headers = _headers(scope)
-        from app.auth import keys
-
+        # 带访问密钥的请求另走一条路：只按密钥认，不看 cookie、不查 CSRF（见模块说明）
         if (secret := keys.bearer(headers)) is not None:
             await self._with_key(scope, receive, send, secret, mode)
             return

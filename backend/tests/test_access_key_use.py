@@ -287,6 +287,9 @@ async def test_service_accounts_are_never_assigned_tasks(world):
     _, secret = await auth_env.make_key(svc, scopes=("tasks.read", "tasks.respond"))
     r = await auth_env.keyed(secret).post(f"/api/tasks/{task.id}/respond", json={"decision": "approve"})
     assert r.json()["code"] == "key_scope_missing", "服务账号的密钥没有回复待办这一项"
+    admin = await auth_env.login("root")
+    r = await admin.post(f"/api/tasks/{task.id}/reassign", json={"to": [{"kind": "user", "name": "svc-portal"}]})
+    assert r.status_code == 422 and r.json()["code"] == "reassign_service", "改派给服务账号拒收"
 
 
 # ---------------------------------------------------------------- 封顶在使用者

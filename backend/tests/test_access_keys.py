@@ -339,3 +339,34 @@ async def test_service_accounts_are_marked_in_the_directory_and_kept_out_of_assi
 
         assert set(await _members(s, "ops")) == {"ana"}, "候选池里不列服务账号"
         assert "svc-bi" not in (await review_pool(s)).users
+
+
+async def test_grants_take_service_accounts_but_slot_bindings_do_not():
+    """服务账号能拿应用授权（外部系统按授权读应用），岗位绑定里算错：派给它的待办没人能处理。"""
+    from app.api.apps import grants_problem
+    from app.apps.lint import _Issues, _lint_slot_principals
+
+    await auth_env.turn_on_local()
+    await auth_env.make_service("svc-bi")
+    async with SessionLocal() as s:
+        wanted, problem = await grants_problem(s, [("user", "svc-bi", "observe")])
+        assert problem is None and wanted == [("user", "svc-bi", "observe")]
+        out = _Issues()
+        await _lint_slot_principals(s, {"approver": {"label": "审批人"}},
+                                    {"approver": [{"kind": "user", "name": "svc-bi"}]}, out)
+    assert [(i["level"], i["code"], i["problem"]) for i in out.items] == [
+        ("error", "app.slot_principal_unknown", "service")]
+    assert "服务账号" in out.items[0]["message"]
+
+
+async def test_scheduler_stop_flushes_the_request_buffer():
+    """关停时还攒在进程里的请求记录写进库（没起调度循环时也写）。"""
+    from app.scheduler.loop import runner
+
+    await auth_env.turn_on_local()
+    svc = await auth_env.make_service()
+    row, secret = await auth_env.make_key(svc)
+    await auth_env.keyed(secret).get("/api/auth/me")
+    await runner.stop()
+    async with SessionLocal() as s:
+        assert [r.key_id for r in (await s.execute(select(AccessKeyRequest))).scalars()] == [row.id]

@@ -397,8 +397,10 @@ async def _check_task(session: Any, principal: Any, task_id: str) -> None:
     elif principal.app_ids is not None:
         # 不属于应用的待办（画布、定时任务里的审批）：限定了应用的密钥碰不到
         raise _forbidden(APP_FORBIDDEN_TEXT, KEY_APP_FORBIDDEN)
+    from app.auth.access import PRIVATE_ORIGINS
+
     run = await session.get(Run, task.run_id) if task.run_id else None
-    if run is not None and (getattr(run, "origin_kind", None) or "") in ("personal_app", "trial"):
+    if run is not None and (getattr(run, "origin_kind", None) or "") in PRIVATE_ORIGINS:
         raise _forbidden(APP_PERSONAL_TEXT, KEY_APP_PERSONAL)
 
 
@@ -519,7 +521,9 @@ async def once(principal: Any, idem_key: str | None, *, route: str, request: Any
         return await replay(previous)
     try:
         out = await run(reclaimed)
-    except BaseException as e:
+    except Exception as e:
+        # 被拒（表单不对、发起不了）：记成 rejected，同一个键可以重试。请求被取消（客户端断开）不在这里收：记录停在
+        # processing，过了 STALE_S 同一个键能重新认领（同钩子）
         await book.finish(owner, key, status="rejected", detail=(str(e) or type(e).__name__)[:500])
         raise
     note_run(out.get("run_id"))
