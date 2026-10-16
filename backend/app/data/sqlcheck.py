@@ -326,7 +326,7 @@ class _Table:
         「唯一日期列」和这里认的时间列对得上）。"""
         meta = next((c for c in self.meta.get("columns") or []
                      if isinstance(c, Mapping) and str(c.get("name")).lower() == column.lower()), None)
-        return catalog.is_date_column(column, (meta or {}).get("type"))
+        return catalog.is_date_column(column, (meta or {}).get("type"), enum_values=(meta or {}).get("enum_values"))
 
 
 #: 一列解析到的位置：(表, 列的真名)
