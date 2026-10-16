@@ -261,3 +261,16 @@ async def test_first_introspect_after_upgrade_only_builds_a_baseline(client, sho
         orders = (await session.execute(select(SourceObject).where(
             SourceObject.source_id == sid, SourceObject.name == "orders"))).scalar_one()
     assert orders.struct_version == 1
+
+
+def test_the_offline_verifier_names_the_publish_drift_events():
+    """可验证报告的离线核对页：schema.drift 和 catalog.drift 一样写在正式运行的封存范围里，事件清单要给中文说法（叫法照
+    总方案 X10：结构变化，和「数据目录变化」分开），不显示原文 schema.drift。"""
+    import re
+
+    script = (Path(__file__).resolve().parents[1] / "app" / "bundle" / "verifier.js").read_text(encoding="utf-8")
+    block = re.search(r"const EVENT_LABEL = \{(.*?)\n  \}", script, re.S)
+    assert block, "verifier.js 里找不到 EVENT_LABEL"
+    labels = dict(re.findall(r"'([a-z_.]+)': '([^']+)'", block.group(1)))
+    assert labels.get("catalog.drift") == "数据目录变化"
+    assert labels.get("schema.drift") == "表结构变化"
