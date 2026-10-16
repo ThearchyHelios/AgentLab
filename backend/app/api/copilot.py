@@ -200,7 +200,8 @@ NODE_REFERENCE = """\
   {{ nodes.报告节点id.text }}），审批卡会附上这份报告的核对概况
 - validate：JSON Schema 校验，可自动让模型修复。config: {schema, source, max_retries}
 - transform：数据整形。config: {mode: expression|template|json, expression/template, assign_to}
-- subgraph：嵌套另一个工作流。config: {workflow_id, input}
+- subgraph：嵌套另一个工作流。config: {workflow_id, workflow_version, input}：workflow_version 写固定的版本号（1、2…），
+  不写就跟随那个工作流最新的发布版本。问数据里不要拿子工作流去拼已发布的口径（子工作流里的数报告引用不到）
 - metrics：口径卡。报告里要出现的数字、以及所有派生计算（比率、增幅、占比、差值）都登记在这里。
   config: {caliber, caliber_version, metrics:[{id, name, unit, decimals, format, expression}], on_missing, assign_to}
   expression 是受限表达式（不是模板）：vars.kpi.gmv、cell(nodes.fetch, 0, 'gmv')、
