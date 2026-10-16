@@ -8,7 +8,7 @@ import pytest
 
 from app.data import csv_grid, recipe_engine, xlsx_cells
 from app.data.recipe_types import Recipe
-from app.data.xlsx_scan import UnsupportedTable, scan_from_json, scan_to_json
+from app.data.xlsx_scan import SheetScan, UnsupportedTable, scan_from_json, scan_to_json
 
 CSV = ("订单号,下单日期,门店,金额,备注\n"
        "A001,2026-08-01,一号店,120,\n"
@@ -31,13 +31,13 @@ def test_scan_gives_one_visible_sheet_with_bounds_and_row_counts():
     scan = csv_grid.scan(CSV)
     assert scan.format == "csv" and len(scan.sheets) == 1
     sh = scan.sheets[0]
-    assert sh.name == csv_grid.CSV_SHEET and sh.state == "visible" and sh.path == csv_grid.CSV_PATH
+    assert sh.name == csv_grid.CSV_SHEET and sh.state == "visible" and sh.path == csv_grid.CSV_PATH + ","
     assert (sh.bounds.min_row, sh.bounds.min_col, sh.bounds.max_row, sh.bounds.max_col) == (1, 1, 5, 6)
     # 空字段不算非空格；第 4 行是空行
     assert sh.row_runs == [(1, 1, 5), (2, 2, 4), (3, 3, 5), (5, 5, 6)]
     assert sh.nonempty == 20
     again = scan_from_json(scan_to_json(scan))
-    assert again.format == "csv" and again.sheets[0].path == csv_grid.CSV_PATH
+    assert again.format == "csv" and again.sheets[0].path == csv_grid.CSV_PATH + ","
 
 
 def test_cell_values_are_typed_only_when_unambiguous():
@@ -71,9 +71,47 @@ def test_semicolon_and_tab_delimiters_and_gbk():
 
 
 def test_scan_any_dispatches_and_keeps_the_xlsx_refusal():
-    assert csv_grid.scan_any(CSV).format == "csv"
+    assert csv_grid.scan_any(CSV, "orders.csv").format == "csv"
+    assert csv_grid.scan_any(CSV, "ORDERS.CSV").format == "csv"
     with pytest.raises(UnsupportedTable):
-        csv_grid.scan_any(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 100)
+        csv_grid.scan_any(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 100, "old.xls")
+
+
+def test_only_csv_and_tsv_names_are_read_as_csv():
+    """复核反例：以前只看内容，不是 zip / OLE、前 64KB 没有 NUL 就当 CSV 读。系统导出的「HTML 表格冒充 .xls」、
+    误传的文本文件，都被拆成一张叫「CSV」的工作表去起草。现在和简单导入（tabular）一样按扩展名定：只有 .csv / .tsv
+    按 CSV 读；别的照旧交给 xlsx_scan 拒收。"""
+    with pytest.raises(UnsupportedTable) as e:
+        csv_grid.scan_any(CSV, "orders.txt")
+    assert "不是有效的 .xlsx" in str(e.value)
+    html = "<html><body><table><tr><td>订单号</td><td>金额</td></tr></table></body></html>".encode("utf-8")
+    for raw in (html, b"\xef\xbb\xbf  \r\n" + html, b"\xff\xfe" + "<table><tr><td>a</td></tr></table>".encode("utf-16-le"),
+                b'<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"/>'):
+        with pytest.raises(UnsupportedTable) as e:
+            csv_grid.scan_any(raw, "report.xls")
+        assert "网页或 XML" in str(e.value) and "另存为 .xlsx 或 .csv" in str(e.value)
+    # 扩展名是 .csv、内容却不是文字（图片之类改了扩展名）：按 CSV 读不了，照实说
+    with pytest.raises(UnsupportedTable) as e:
+        csv_grid.scan_any(b"\x89PNG\r\n\x1a\n\x00\x00", "orders.csv")
+    assert "不是文字" in str(e.value)
+
+
+def test_tsv_is_always_tab_separated_and_the_delimiter_is_kept_for_reading():
+    """.tsv 一律按制表符分隔（同 tabular）：每行逗号个数一样的 TSV，嗅探会挑逗号（csv.Sniffer 优先逗号）。
+    扫描时定下的分隔符记在工作表的 path 里，之后读格子（重放、试运行）用同一个，不再各嗅各的。"""
+    raw = "名称,规格\t金额\n甲,1kg\t10\n乙,2kg\t20\n".encode("utf-8")      # 每行一个逗号、一个制表符
+    scan = csv_grid.scan_any(raw, "goods.tsv")
+    assert scan.sheets[0].path == csv_grid.CSV_PATH + "\t"
+    grid = xlsx_cells.read_grid(raw, scan_from_json(scan_to_json(scan)), csv_grid.CSV_SHEET)
+    assert grid.get(2, 1).value == "甲,1kg" and grid.get(2, 2).value == 10
+    # 这一版之前的暂存区：path 只有「csv:」，读的时候再嗅
+    assert csv_grid.is_csv_sheet(SheetScan(name="CSV", state="visible", path=csv_grid.CSV_PATH))
+    assert csv_grid.sheet_delimiter(SheetScan(name="CSV", state="visible", path=csv_grid.CSV_PATH)) is None
+    assert not csv_grid.is_csv_sheet(SheetScan(name="明细", state="visible", path="xl/worksheets/sheet1.xml"))
+    sniffed = csv_grid.scan_any(raw, "goods.csv")
+    assert sniffed.sheets[0].path == csv_grid.CSV_PATH + ","        # 同样的内容叫 .csv：照嗅探的来（逗号）
+    grid = xlsx_cells.read_grid(raw, sniffed, csv_grid.CSV_SHEET)
+    assert grid.get(2, 1).value == "甲" and grid.get(2, 2).value == "1kg\t10"
 
 
 def test_too_many_columns_is_refused():

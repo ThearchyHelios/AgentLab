@@ -2,9 +2,12 @@
 和网格（Grid / 逐行流），之后的执行器、核对、说明、溯源、按期累积全部复用，不另写一套 CSV 的解析（否则会和配方
 语言分叉，违背「一种说法」）。
 
-**怎么认出是 CSV。** 看内容不看扩展名（配方的几个入口只拿得到原件字节）：不是 zip（xlsx）、不是旧版 .xls 的 OLE
-文件头、前 64 KB 里没有 NUL 字节（图片、PDF 这类二进制文件都有），就按 CSV 读。编码识别、分隔符嗅探复用 tabular
-读 CSV 的那一段（UTF-8 / GB18030 / 带 BOM 的 UTF-16，逗号、分号、制表符、竖线）。
+**怎么认出是 CSV。** 和简单导入（tabular._CSV）一样按扩展名定：只有 .csv / .tsv 按 CSV 读，并且内容得是文字
+（不是 zip、不是旧版 .xls 的 OLE 文件头、前 64 KB 里没有 NUL 字节）。以前只看内容，企业系统常见的「HTML 表格冒充
+.xls」、误传的文本文件都会被拆成一张叫「CSV」的工作表去起草、核对，不再像以前那样明确拒收；现在别的扩展名照旧交给
+xlsx_scan 拒收，内容是网页或 XML 的另给一句能照着做的话。编码识别复用 tabular 读 CSV 的那一段（UTF-8 / GB18030 /
+带 BOM 的 UTF-16）；.tsv 一律按制表符分隔（同 tabular），.csv 嗅探逗号、分号、制表符、竖线。扫描时定下的分隔符
+记进工作表的 path（CSV_PATH 后面跟分隔符），之后读格子用同一个，不再各嗅各的。
 
 **坐标沿用「工作表!A1」。** 细案原写「格子坐标记成 R{行}C{列}」，这里没这么做（见交付说明的偏离项）：坐标在执行器、
 核对、修复按钮、框选、溯源、裁判摘录、前端网格里一共有十来处解析和拼写，引入第二种写法就要处处认两种，漏一处就是
@@ -28,13 +31,23 @@ from typing import Any, Iterator
 from app.data.recipe_types import GridCell
 from app.data.xlsx_scan import Bounds, SheetScan, UnsupportedTable, WorkbookScan
 
-__all__ = ["CSV_PATH", "CSV_SHEET", "MAX_COLS", "MAX_ROWS", "CsvTable", "cell_value", "looks_like_csv", "parse",
-           "rows", "scan", "scan_any"]
+__all__ = ["CSV_PATH", "CSV_SHEET", "CSV_SUFFIXES", "MAX_COLS", "MAX_ROWS", "CsvTable", "cell_value", "is_csv_sheet",
+           "looks_like_csv", "looks_like_markup", "parse", "rows", "scan", "scan_any", "sheet_delimiter"]
 
 #: CSV 的「工作表名」：配方按它认（SheetMatch.name），每月的文件名不同也认得出
 CSV_SHEET = "CSV"
-#: SheetScan.path 的取值：读取层据此知道这张「工作表」要从 CSV 里读，不去压缩包里找 XML
+#: SheetScan.path 的开头：读取层据此知道这张「工作表」要从 CSV 里读，不去压缩包里找 XML。后面跟着扫描时定下的分隔符
+#: （"csv:,"、"csv:\t"）；只有「csv:」的（这一版之前的暂存区）读的时候再嗅一次
 CSV_PATH = "csv:"
+#: 按 CSV 读的扩展名，和简单导入（tabular._CSV）一致
+CSV_SUFFIXES = (".csv", ".tsv")
+#: 嗅探认的分隔符
+_DELIMITERS = ",;\t|"
+#: 内容是网页或 XML（「HTML 表格冒充 .xls」、Excel 2003 的 XML 表格）时的说法
+MARKUP_MESSAGE = ("无法打开该文件：它其实是网页或 XML 格式（有的系统导出的「Excel」文件是这样），不是 Excel 工作簿。"
+                  "请用 Excel 打开后另存为 .xlsx 或 .csv 再上传")
+NOT_TEXT_MESSAGE = ("无法按 CSV 读取这个文件：扩展名是 CSV，内容却不是文字（可能是图片、PDF 之类的文件改了扩展名）。"
+                    "请确认上传的文件，或在 Excel 中另存为 .csv 后重新上传")
 #: 和 Excel 的上限一致：超过的 CSV 用 Excel 打开也装不下，交给模型的格子坐标也写不出来
 MAX_ROWS = 1_048_576
 MAX_COLS = 16_384
@@ -55,6 +68,24 @@ def looks_like_csv(raw: bytes) -> bool:
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return True
     return b"\x00" not in raw[:_SNIFF]
+
+
+def looks_like_markup(raw: bytes) -> bool:
+    """内容是网页或 XML：去掉 BOM 和开头的空白后以「<」开头。真的工作簿以 zip（PK）或 OLE 文件头开头，不会是这样。"""
+    head = raw[:4096]
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            text = head.decode("utf-16", errors="ignore")
+        except UnicodeDecodeError:
+            return False
+    else:
+        text = head.decode("latin-1")
+    return text.lstrip("\ufeff\xef\xbb\xbf \t\r\n").startswith("<")
+
+
+def _suffix(filename: str | None) -> str:
+    name = str(filename or "").rsplit("/", 1)[-1]
+    return "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
 
 def cell_value(text: str) -> Any:
@@ -79,15 +110,17 @@ class CsvTable:
     delimiter: str
 
 
-def parse(raw: bytes) -> CsvTable:
-    """原件 → 记录。编码、分隔符照 tabular 读 CSV 的做法；字段太长、引号不配对读不了时抛 UnsupportedTable。"""
+def parse(raw: bytes, delimiter: str | None = None) -> CsvTable:
+    """原件 → 记录。编码照 tabular 读 CSV 的做法；delimiter 不给时嗅探（同 tabular）。字段太长、引号不配对读不了时抛
+    UnsupportedTable。"""
     from app.data import tabular
 
     text = tabular._decode_csv(raw)
-    try:
-        delimiter = csv.Sniffer().sniff(text[:8192], delimiters=",;\t|").delimiter
-    except csv.Error:
-        delimiter = ","       # 嗅不出来就按最常见的来
+    if delimiter is None:
+        try:
+            delimiter = csv.Sniffer().sniff(text[:8192], delimiters=_DELIMITERS).delimiter
+        except csv.Error:
+            delimiter = ","       # 嗅不出来就按最常见的来
     records: list[list[str]] = []
     try:
         for record in csv.reader(io.StringIO(text, newline=""), delimiter=delimiter):
@@ -109,11 +142,22 @@ def _cells(table: CsvTable) -> Iterator[tuple[int, list[tuple[int, GridCell]]]]:
             yield r, out
 
 
-def scan(raw: bytes) -> WorkbookScan:
-    """CSV 原件 → 扫描结果：一张可见工作表（名字 CSV_SHEET、路径 CSV_PATH），边界、非空格数、逐行非空格数的游程。
-    没有合并区、隐藏行列、公式、错误值、离群格（CSV 里每一格都是写出来的，没有残留格式）。"""
-    table = parse(raw)
-    sheet = SheetScan(name=CSV_SHEET, state="visible", path=CSV_PATH)
+def is_csv_sheet(sheet: Any) -> bool:
+    """这张「工作表」是 CSV 适配出来的（path 以 CSV_PATH 开头）。"""
+    return str(getattr(sheet, "path", "") or "").startswith(CSV_PATH)
+
+
+def sheet_delimiter(sheet: Any) -> str | None:
+    """扫描时定下的分隔符（记在 path 里）；这一版之前的暂存区没记，返回 None（读的时候再嗅）。"""
+    tail = str(getattr(sheet, "path", "") or "")[len(CSV_PATH):]
+    return tail if len(tail) == 1 and tail in _DELIMITERS else None
+
+
+def scan(raw: bytes, *, delimiter: str | None = None) -> WorkbookScan:
+    """CSV 原件 → 扫描结果：一张可见工作表（名字 CSV_SHEET、路径 CSV_PATH 加分隔符），边界、非空格数、逐行非空格数的
+    游程。没有合并区、隐藏行列、公式、错误值、离群格（CSV 里每一格都是写出来的，没有残留格式）。"""
+    table = parse(raw, delimiter)
+    sheet = SheetScan(name=CSV_SHEET, state="visible", path=CSV_PATH + table.delimiter)
     lo_r = lo_c = hi_r = hi_c = 0
     runs: list[tuple[int, int, int]] = []
     for r, cells in _cells(table):
@@ -134,12 +178,20 @@ def scan(raw: bytes) -> WorkbookScan:
     return WorkbookScan(sheets=[sheet], format="csv")
 
 
-def scan_any(raw: bytes) -> WorkbookScan:
-    """配方导入的扫描入口：CSV 走这里的适配，其余照旧交给 xlsx_scan（读不了照旧拒收，文案不变）。"""
+def scan_any(raw: bytes, filename: str | None) -> WorkbookScan:
+    """配方导入的扫描入口：.csv / .tsv 走这里的适配（.tsv 按制表符分隔），其余照旧交给 xlsx_scan（读不了照旧拒收，
+    文案不变）；内容是网页或 XML 的另给一句能照着做的话（MARKUP_MESSAGE）。扩展名是 CSV、内容却是工作簿（xlsx 改了
+    扩展名）的照工作簿读。"""
     from app.data import xlsx_scan
 
-    if looks_like_csv(raw):
-        return scan(raw)
+    suffix = _suffix(filename)
+    if suffix in CSV_SUFFIXES:
+        if looks_like_csv(raw):
+            return scan(raw, delimiter="\t" if suffix == ".tsv" else None)
+        if raw[:4] != b"PK\x03\x04":
+            raise UnsupportedTable(NOT_TEXT_MESSAGE)
+    elif looks_like_markup(raw):
+        raise UnsupportedTable(MARKUP_MESSAGE)
     return xlsx_scan.scan(raw)
 
 

@@ -43,7 +43,7 @@ def _book(rows: list[tuple[Any, ...]], *, sheet: str = "明细", top: list[tuple
 
 
 def _run(raw: bytes, recipe: dict[str, Any], db: str | None = None, filename: str = "明细.xlsx", **kw: Any):
-    scan = csv_grid.scan_any(raw)
+    scan = csv_grid.scan_any(raw, filename)
     return recipe_engine.execute(Recipe.model_validate(recipe), raw, filename, scan, db, **kw)
 
 
@@ -314,7 +314,7 @@ def _ok_validate(data, facts, origin):
 
 
 def _draft(raw: bytes, filename: str = "明细.xlsx"):
-    scan = csv_grid.scan_any(raw)
+    scan = csv_grid.scan_any(raw, filename)
     grids = {s.name: xlsx_cells.read_grid(raw, scan, s.name, max_rows=recipe_suggest.DRAFT_MAX_ROWS)
              for s in scan.sheets if s.state == "visible" and s.nonempty}
 
