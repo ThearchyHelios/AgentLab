@@ -559,7 +559,7 @@ export function freqProblem(f: Freq): string | null {
   return null
 }
 
-/** 以 http:// 或 https:// 开头、中间没有空白的地址（Webhook、服务访问地址都用它） */
+/** 以 http:// 或 https:// 开头、中间没有空白的地址（Webhook 地址用它；对外访问地址另有 lib/publicUrl 的 isPublicUrl） */
 export function isHttpUrl(text: string): boolean {
   return /^https?:\/\/\S+$/i.test(text.trim())
 }
