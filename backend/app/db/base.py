@@ -248,6 +248,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # 第 2 波：服务账号（users.kind）；剖析上传表格源时的快照
     ("users", "kind", "VARCHAR(20) DEFAULT 'person'"),
     ("catalog_profile_tasks", "snapshot_id", "VARCHAR(32)"),
+    # 第 3 波：发布时这一版引用的表的结构版本
+    ("workflow_versions", "schema_versions", "JSON"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。

@@ -26,6 +26,9 @@ router = APIRouter(prefix="/api/ledger", tags=["ledger"])
 #: 口径账本里按运行读的那几个（一个答案里每个数的口径标签等，docs/design/next-round/02-口径账本.md）：挂在
 #: /api/runs/{run_id}/ledger… 下，和证据接口同一道门（main.py 挂 evidence_scope：使用者只读、而且要能读这次运行）
 runs_router = APIRouter(prefix="/api/runs", tags=["ledger"])
+#: 按口径正式出具、口径对账这类要写的（docs/design/next-round/02-口径账本.md 做法 5、6）：使用者也能发起（总方案拍板
+#: 账本-L5：对账都可以，正式出具只限有权使用的应用固定着的口径版本），所以 main.py 只挂登录即可，接口里按运行和应用授权再判
+answers_router = APIRouter(prefix="/api/ledger/answers", tags=["ledger"])
 
 
 @router.get("/workflow-versions/{workflow_id}/{version}")

@@ -629,6 +629,9 @@ class WorkflowVersion(Base, TimestampMixin):
     retire_note: Mapped[str | None] = mapped_column(Text, default=None)
     # 发布时这一版用到的能力的治理版本：{能力名: version}。正式运行发起时有漂移只提醒、不拦
     capability_versions: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    # 发布时这一版直接引用的表的结构版本 {源名: {表名: 结构版本}}（next-round 03 B1）：正式运行发起时比对，变了只提醒、
+    # 不拦（schema.drift），写法照 catalog_versions。加这一列之前发布的版本为空
+    schema_versions: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     workflow: Mapped[Workflow] = relationship(back_populates="versions")
 

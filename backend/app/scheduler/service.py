@@ -86,6 +86,40 @@ def target_of(schedule: Any) -> tuple[str, str]:
     return kind, getattr(schedule, "target_id", None) or ""
 
 
+#: 非工作流目标各由一个模块处理（next-round X4）：模块里有
+#:   async def fire(*, schedule_id, fire_at, kind, actor, target_id, name, tz, cron_expr) -> ScheduleFire | None
+#:     到点发起一次（持着 launch_lock 调用）；触发记录用本模块的 record_fire 写，和工作流同一套去重、同一种状态词
+#:   async def check_target(session, target_id) -> str | None
+#:     建任务、改目标时核对目标（存在、可用），不合规返回给人看的一句，合规返回 None
+#: 按需导入（评测、数据源维护的模块要导入本模块，模块级互相导入会成环）
+_TARGET_MODULES = {"eval_suite": "app.eval.scheduled", "source_maintenance": "app.data.source_maintenance"}
+
+
+def target_handler(kind: str) -> Any | None:
+    """处理这种目标的模块；不认识的种类为 None。"""
+    import importlib
+
+    module = _TARGET_MODULES.get(kind)
+    return importlib.import_module(module) if module else None
+
+
+async def record_fire(schedule_id: str, fire_at: datetime, kind: str, status: str, reason: str | None,
+                      inputs: dict[str, Any] | None = None, **columns: Any) -> ScheduleFire | None:
+    """非工作流目标写触发记录（同 _record：同一次触发已经记过就交回已有的那一条）。columns 写额外的列，比如评测的
+    eval_run_id。"""
+    fire = await _record(schedule_id, fire_at, kind, status, reason, inputs or {})
+    if fire is not None and columns:
+        async with SessionLocal() as session:
+            row = await session.get(ScheduleFire, fire.id)
+            if row is not None:
+                for key, value in columns.items():
+                    setattr(row, key, value)
+                await session.commit()
+                await session.refresh(row)
+                return row
+    return fire
+
+
 def target_columns(kind: str, target_id: str) -> dict[str, str]:
     """写目标的几列：{target_kind, target_id, workflow_id}。workflow 时 target_id 同 workflow_id；别的种类 workflow_id 存空串
     （老表的非空约束）。种类不认识、id 为空抛 ValueError。"""
@@ -325,8 +359,12 @@ async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: st
             name, run_class = schedule.name, schedule.run_class
             tz, cron_expr, template = schedule.timezone, schedule.cron, schedule.input_template
         if target_kind != "workflow":
-            reason = TARGET_UNSUPPORTED.format(kind=TARGET_LABEL.get(target_kind, target_kind))
-            return await _record(schedule_id, fire_at, kind, "failed_to_start", reason, {})
+            handler = target_handler(target_kind)
+            if handler is None:
+                reason = TARGET_UNSUPPORTED.format(kind=TARGET_LABEL.get(target_kind, target_kind))
+                return await _record(schedule_id, fire_at, kind, "failed_to_start", reason, {})
+            return await handler.fire(schedule_id=schedule_id, fire_at=fire_at, kind=kind, actor=actor,
+                                      target_id=target_id, name=name, tz=tz, cron_expr=cron_expr)
         return await _fire_workflow(schedule_id, fire_at, kind, actor=actor, name=name, workflow_id=target_id,
                                     run_class=run_class, tz=tz, cron_expr=cron_expr, template=template)
 
