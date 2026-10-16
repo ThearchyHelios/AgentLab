@@ -596,9 +596,17 @@ def _mine() -> list[asyncio.Task[Any]]:
 
 
 async def drain() -> None:
-    """等这个事件循环里的后台比对都做完（测试用）。"""
-    while tasks := _mine():
-        await asyncio.gather(*tasks, return_exceptions=True)
+    """等这个事件循环里的后台比对都做完（测试用）。只等还没做完的：已经做完、还留在登记里的（完成回调还没来得及跑）顺手
+    去掉——不然对着做完的任务反复 gather，事件循环原地空转（并行跑全量测试时偶发过）。"""
+    while True:
+        tasks = _mine()
+        for task in tasks:
+            if task.done():
+                _background.discard(task)
+        live = [task for task in tasks if not task.done()]
+        if not live:
+            return
+        await asyncio.gather(*live, return_exceptions=True)
 
 
 async def shutdown() -> None:
