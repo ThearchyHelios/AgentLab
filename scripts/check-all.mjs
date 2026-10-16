@@ -99,6 +99,7 @@ const ORDER = [
   'app-editor',      // 应用编辑：固定版本、派生、页面树和属性面板、检查定位、发布时选处置、助手流
   'capabilities',    // 能力登记、端点、密钥掩码；设置页的身份、通知、审计
   'access-keys',     // 设置页的访问密钥：服务账号、密钥只显示一次、撤销、轮换、最近的请求、接口说明
+  'share',           // 分享链接：/s 分享页不进外壳、印章常显、页脚、下载报告、撤销后的说明、嵌入；应用编辑里的分享管理
   // 普通用户建应用（docs/design/normal-user-apps.md §4.8）：全是伪造接口、不连真数据
   'blueprint',       // 新建应用的起点、蓝图卡片、反问、试运行、发布摘要
   'personal',        // 个人应用：建、刷新、提交审核
@@ -115,7 +116,7 @@ const ESTIMATE = {
   // 占位，换成真检查时按实测改
   schedules: 60, compare: 45, verify: 71, inquiry: 60, bundle: 16, whatif: 33, 'report-export': 30,
   // 应用平台：还没实测，按同类页面估（全是伪造接口、不连真数据）
-  apps: 60, inbox: 45, 'app-editor': 45, capabilities: 30, 'access-keys': 30,
+  apps: 60, inbox: 45, 'app-editor': 45, capabilities: 30, 'access-keys': 30, share: 30,
   // 普通用户建应用：还没实测，按同类页面估
   blueprint: 90, personal: 45, records: 30, files: 30,
 }
