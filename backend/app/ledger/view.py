@@ -116,6 +116,11 @@ async def run_view(run_id: str) -> dict[str, Any]:
     recorded = await store.latest(run_id)
     if recorded is None:
         why = ledger_match.ineligible(run)
+        if why == ledger_match.NOT_SEALED and run.status == "succeeded" \
+                and ledger_match.wanted(run.run_class, run.origin_kind):
+            # runner 先发 run.finished、落库，再封存、再排上比对（engine/runner._finalize）：页面收到 run.finished 立刻来取，
+            # 这一下还没封存。这不是「不比对」，是封存完就比——照实答 pending，页面按退避接着取；这里不另排按需比对
+            return {**base, "state": "pending"}
         sealed = await _sealed(run_id) if why is None else None
         if sealed is not None and not sealed.queries:
             why = ledger_match.NO_QUERIES
