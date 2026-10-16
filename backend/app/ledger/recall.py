@@ -494,9 +494,10 @@ def _group_state(group: Group) -> tuple[str, str | None]:
     return "pending", group.refused
 
 
-async def batches(session: Any, workflow_id: str, version: int, *, principal: Any = None) -> dict[str, Any]:
+async def batches(session: Any, workflow_id: str, version: int) -> dict[str, Any]:
     """版本历史里「这一版的召回」：每组的结论（数变了 / 没变 / 无法重算：原因 / 重算失败 / 还在算 / 未重算），「另有 M 组
-    未重算」和能不能接着算。参数是遮过的（不给使用者看遮罩值：这个接口只给搭建者，还是照规矩遮）。"""
+    未重算」和能不能接着算。接口只给搭建者（api/ledger 的 router）：参数原样给，同他在召回运行的输入里读到的一样；使用者
+    看的是 recall 待办（task_payload，按遮罩换过）。"""
     from app.api.settings import LEDGER_DEFAULTS, ledger_settings
 
     plan = await build_plan(session, workflow_id, int(version))
@@ -1397,15 +1398,18 @@ def after_publish(workflow_id: str, version: int, actor: str | None) -> bool:
 
 
 async def resume(*, days: int = RESUME_DAYS) -> dict[str, int]:
-    """启动时：最近 days 天发布过的版本，自动那一批没发完的接着发；结束了还没收尾的召回运行补上收尾；表结构变化的游标没有
-    时从现在开始（升级之前的变化不追）。"""
+    """启动时：最近 days 天发布过、现在仍是当前发布版的版本，自动那一批没发完的接着发（之后又发布了更新的版本的不再接着做：
+    新版本的召回本来就覆盖更早的所有版本）；结束了还没收尾的召回运行补上收尾；表结构变化的游标没有时从现在开始（升级之前的
+    变化不追）。"""
     from app.db.models import WorkflowVersion
 
     since = utcnow() - timedelta(days=days)
     async with SessionLocal() as session:
         rows = (await session.execute(select(WorkflowVersion.workflow_id, WorkflowVersion.version, WorkflowVersion.published_by)
+                                      .join(Workflow, Workflow.id == WorkflowVersion.workflow_id)
                                       .where(WorkflowVersion.published_at >= since,
-                                             WorkflowVersion.level.is_not(None)))).all()
+                                             WorkflowVersion.level.is_not(None),
+                                             Workflow.published_version == WorkflowVersion.version))).all()
         unsettled = [r for (r,) in (await session.execute(select(Run.id).where(
             Run.origin_kind == ORIGIN, Run.status.in_(("succeeded", "failed", "cancelled")),
             Run.manifest_hash.is_not(None)))).all()]

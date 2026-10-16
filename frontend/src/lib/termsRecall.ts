@@ -145,6 +145,8 @@ export const RECALL_TEXT = {
       values: '依据有变：出现了触及有效记录条件的新码值',
       catalog_edit: '依据有变：处理数据源变化时改了数据目录',
     } as Record<string, string>,
+    /** 认不出是哪一种依据变了（缺字段、以后加的种类）：只说依据有变，不猜 */
+    basisGeneric: '答案的依据有变',
     basisItems: (labels: string[]) => labels.join('、'),
     newErrors: (count: number) => `按新目录检查新出现 ${n(count)} 条错误级问题`,
     sub: '封存后追加，不在封存范围内',

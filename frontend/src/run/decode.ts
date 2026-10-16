@@ -2452,7 +2452,7 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         out.push({
           id: `lb-${seq}`, seq, kind: 'note', status: 'done', code: 'ledger_basis_changed',
           level: errors > 0 || d.kind === 'structure' ? 'warn' : 'info',
-          title: R.basis[String(d.kind)] ?? R.basis.catalog,
+          title: R.basis[String(d.kind)] ?? R.basisGeneric,
           sub: R.sub,
           ...(where ? { meta: where } : {}),
           ...(labels.length || errors ? { detail: [labels.length ? R.basisItems(labels) : '', errors ? R.newErrors(errors) : '']

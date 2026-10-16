@@ -1927,7 +1927,8 @@ await section('口径召回：封存后的核对结论与依据有变（ledger.r
     .find((s) => s.code === 'ledger_basis_changed')
   check('表结构变了：依据的表结构已变', structure?.title === '依据的表结构已变' && structure?.level === 'warn', structure?.title)
   const odd = run(E(5, 'ledger.recalled', null, {}), E(6, 'ledger.basis_changed', null, { kind: 'x', items: 'y' }))
-  check('缺字段：不出 undefined、不瞎填数', !odd.some((s) => /undefined|NaN/.test(`${s.title}${s.sub ?? ''}${s.detail ?? ''}${s.meta ?? ''}`)),
+  check('缺字段：不出 undefined、不瞎填数，认不出的结论和种类不猜', !odd.some((s) => /undefined|NaN/.test(`${s.title}${s.sub ?? ''}${s.detail ?? ''}${s.meta ?? ''}`))
+    && odd.some((s) => s.title === '口径召回核对') && odd.some((s) => s.title === '答案的依据有变'),
     odd.map((s) => s.title).join(' | '))
   const phase = [E(4, 'run.finished', null, {}), E(5, 'ledger.recalled', null, {}), E(6, 'ledger.basis_changed', null, {})]
     .reduce((s, ev) => mod.nextPhase(s, ev), { phase: 'running', awaiting: false })

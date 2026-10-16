@@ -561,3 +561,44 @@ async def test_recall_graph_is_deterministic_and_events_have_offline_labels(monk
     assert labels["ledger.matched"] == "比对已发布口径"
     assert _summary("ledger.recalled", {"role": "answer", "changed": False, "to_version": 2}) == "已按 v2 核对，不影响"
     assert _summary("ledger.basis_changed", {"kind": "structure", "items": [{"label": "x"}]}) == "依据的表结构有变（1 项）"
+
+
+async def test_restart_resumes_the_auto_batch_and_settles_finished_runs(monkeypatch):
+    """服务重启：计划从已有召回运行重算——自动那一批没发完的接着发，结束了还没收尾的补上收尾（不建任务表）。"""
+    from app.db.base import utcnow
+    from app.db.models import WorkflowVersion
+
+    await ledger_settings(auto_issue=False, issue_daily_limit=100_000, recall_limit=2)
+    wf = await S.publish()
+    await answer(monkeypatch)
+    await answer(monkeypatch, "2026-09-01", "2026-09-05")
+    await publish_v2(wf)
+    async with SessionLocal() as session:
+        row = (await session.execute(select(WorkflowVersion).where(WorkflowVersion.workflow_id == wf,
+                                                                   WorkflowVersion.version == 2))).scalar_one()
+        row.published_at = utcnow()
+        await session.commit()
+    # 「重启之前」：只发起了一组，收尾也没做（进程在这之后没了）
+    monkeypatch.setattr(recall, "schedule_settle", lambda run_id: None)
+    async with SessionLocal() as session:
+        plan = await recall.build_plan(session, wf, 2)
+    first = await recall._launch_group(plan, plan.todo()[0], batch="auto", actor=None)
+    first = await S.wait(first.id)
+    assert await recall_tasks(first.id) == [] and await events(first.id, EventType.LEDGER_RECALLED) == []
+    monkeypatch.undo()
+    out = await recall.resume()
+    # 同一个测试库里别的用例的版本也会被接着做：只数这一份口径的
+    assert out["launched"] >= 1 and out["settled"] >= 1
+    async with SessionLocal() as session:
+        runs = await recall.recall_runs(session, wf, 2)
+    assert len(runs) == 2 and {r.origin["batch"] for r in runs} == {"auto"}
+    for run in runs:
+        await S.wait(run.id)
+    await recall.drain()
+    assert len(await recall_tasks(first.id)) == 1, "补上的收尾照样开了待办"
+    async with SessionLocal() as session:
+        view = await recall.batches(session, wf, 2)
+    assert view["counts"]["changed"] == 2 and view["remaining"] == 0
+    await recall.resume()
+    async with SessionLocal() as session:
+        assert len(await recall.recall_runs(session, wf, 2)) == 2, "再重启一次：都算过了，不再发起"
