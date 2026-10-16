@@ -532,6 +532,19 @@ function handlers(state, replies = {}) {
   const P = 'check-prof-[a-z]+'
   return [
     [/^GET \/datasources$/, (route) => json(state.sources)(route)],
+    // 数据源的变化、取值观察、后台任务条（next-round 第 4 波）：这里没有，给空的（不放行到服务端去查一个假的源）
+    [/^GET \/datasources\/check-prof-[a-z]+\/changes$/, json({ items: [], total: 0, counts: { pending: 0, open: 0, by_severity: { action: 0, warning: 0, info: 0 } } })],
+    [/^GET \/datasources\/check-prof-[a-z]+\/observations$/, json({ table: '', series: [] })],
+    // 后台任务条的队列：照服务端（同源队先后），在做的在前、排着的按建的先后（05 (g)：界面不自己排）
+    [new RegExp(`^GET /datasources/${P}/background-jobs$`), (route, { key }) => {
+      const src = parts(key)[2]
+      const active = [...state.djobs.map((j) => ['draft', draftOut(j)]), ...state.pjobs.map((j) => ['profile', jobOut(j)])]
+        .filter(([, j]) => j.source_id === src && JOB_ACTIVE.has(j.status))
+        .sort(([, a], [, b]) => (b.status === 'running') - (a.status === 'running') || a.created_at.localeCompare(b.created_at))
+      return json({ items: active.map(([kind, j], i) => ({ kind, id: j.id, status: j.status, total: j.total, done: j.done,
+        waiting_for: j.status === 'queued' ? j.waiting_for ?? null : null, position: i })) })(route)
+    }],
+    [/^GET \/datasources\/upkeep$/, json({ items: [] })],
     [new RegExp(`^GET /datasources/${P}/schema$`), (route, { key }) =>
       json({ tables: state.tables[parts(key)[2]].filter((t) => !t.missing).map((t) => t.name), summary: '', synced_at: T0 })(route)],
     [new RegExp(`^GET /datasources/${P}/catalog$`), (route, { key }) => json(listOf(state, parts(key)[2]))(route)],
@@ -650,6 +663,10 @@ const textOf = async (loc) => (await loc.first().innerText({ timeout: 800 }).cat
 const inBox = (page, sel) => textOf(box(page).locator(sel))
 const taskLine = (page, name) => box(page).locator(`[data-profile-task="${name}"]`)
 const head = (page) => page.locator('[data-catalog-profile]')
+/** 后台任务条上的一项（进度只在这一处，05 (g)） */
+const stripJob = (page, kind) => page.locator(`[data-catalog-job-strip] [data-catalog-job="${kind}"]`)
+const stripText = (page, kind) => textOf(stripJob(page, kind).locator('[data-catalog-job-text]'))
+const stripKinds = (page) => page.locator('[data-catalog-job-strip] [data-catalog-job]').evaluateAll((els) => els.map((e) => e.getAttribute('data-catalog-job')))
 /** 表清单一行的「剖析」一格（去掉给读屏的「数据剖析：」）；没有这一格为空串 */
 const rowProfile = async (page, name) => (await textOf(page.locator(`[data-catalog-row="${name}"] [data-row-profile]`))).replace(/^数据剖析：\s*/, '')
 const toasts = (page) => page.locator('[data-toast]').allInnerTexts().then((t) => t.join(' | ')).catch(() => '')
@@ -906,21 +923,23 @@ await section('剖析 · 进行中：逐表进度、后台继续与停止', asyn
   await shot(page, 'profile-running')
   await cleanCopy(page, '进行中')
 
-  // 关掉对话框：任务不停，页头换成进度入口；表清单的「剖析」一格写排队、剖析中
+  // 关掉对话框：任务不停，页头只换图标、读屏写「进行中」，进度在下方的后台任务条上；表清单的「剖析」一格写排队、剖析中
   settle(state, job, 'visits', { status: 'running', done: { relation: 0, codes: 1, date: 0 }, queries: 3, elapsed_ms: 1500, current: '正在取 visits.page 的码值候选' })
   await until(async () => (await inBox(page, '[data-profile-task="visits"] [data-profile-task-status]')) === '剖析中')
   await page.locator('[data-profile-hide]').click()
   check('「在后台继续」：对话框关上，没有发停止', await until(async () => (await box(page).count()) === 0) && count(sent, /\/cancel$/) === 0)
-  check('……页头换成「剖析 1/5」，读屏念得出', await until(async () => (await head(page).getAttribute('data-catalog-profile')) === 'running')
-        && (await head(page).getAttribute('aria-label')) === '剖析 1/5' && (await textOf(head(page))) === '剖析 1/5', await textOf(head(page)))
+  check('……页头只做入口：读屏写「数据剖析（进行中）」，不写数字', await until(async () => (await head(page).getAttribute('data-catalog-profile')) === 'running')
+        && (await head(page).getAttribute('aria-label')) === '数据剖析（进行中）' && !/\d/.test(await textOf(head(page))), await head(page).getAttribute('aria-label'))
+  check('……进度在后台任务条上：「剖析 1/5」', await until(async () => (await stripText(page, 'profile')) === '剖析 1/5'), await stripText(page, 'profile'))
   check('……表清单：剖析完的写「刚刚剖析」，正在剖析的写「剖析中」，后面的写「排队剖析」', await until(async () =>
     (await rowProfile(page, 'orders')) === '刚刚剖析' && (await rowProfile(page, 'visits')) === '剖析中' && (await rowProfile(page, 'products')) === '排队剖析'),
   [await rowProfile(page, 'orders'), await rowProfile(page, 'visits'), await rowProfile(page, 'products')].join(' / '))
-  // 最近查询多数超时：服务端给提醒，关着对话框时页头的入口带提醒色，悬停写全文
+  // 最近查询多数超时：服务端给提醒，关着对话框时写在后台任务条上剖析那一行（全文，窄屏、触屏也看得见），页头不再挂提醒
   const NOTICE = '最近 6 条查询有 4 条超时，数据库响应变慢了；剖析会继续，可以停止，换在业务不忙的时候再剖析'
   job.notice = NOTICE
-  check('多数超时的提醒：页头入口带提醒标记，悬停写全文', await until(async () => (await page.locator('[data-catalog-profile-notice]').count()) === 1)
-        && (await head(page).getAttribute('title')).includes(NOTICE))
+  check('多数超时的提醒：写在后台任务条上剖析那一行，写全文', await until(async () =>
+    (await textOf(stripJob(page, 'profile').locator('[data-catalog-job-notice]'))) === NOTICE))
+  check('……页头只做入口，不带提醒标记', await page.locator('[data-catalog-profile-notice]').count() === 0)
   await shot(page, 'profile-header')
   await head(page).click()
   check('点页头：回到对话框，直接是进行中的任务，提醒写在进度条下面', await until(async () => (await phase(page)) === 'running')
@@ -946,7 +965,8 @@ await section('剖析 · 进行中：逐表进度、后台继续与停止', asyn
   check('……汇总照实写：5 张表，完成 1，部分完成 1，已停止 3', (await inBox(page, '[data-profile-counts]')) === '5 张表：完成 1，部分完成 1，已停止 3',
     await inBox(page, '[data-profile-counts]'))
   check('……可以重试没做完的 4 张', (await textOf(page.locator('[data-profile-retry]'))).includes('重试没做完的表（4 张）'))
-  check('……页头回到「数据剖析」', await until(async () => (await head(page).getAttribute('data-catalog-profile')) === ''))
+  check('……页头回到「数据剖析」，任务条收起', await until(async () => (await head(page).getAttribute('data-catalog-profile')) === ''
+        && (await head(page).getAttribute('aria-label')) === '数据剖析' && await stripJob(page, 'profile').count() === 0))
   const polls = () => count(sent, new RegExp(`^GET .*profile-jobs/${job.id}$`))
   const n = polls()
   await sleep(3200)
@@ -1342,7 +1362,9 @@ await section('剖析 · 和起草排队', async () => {
   Object.assign(draft.tasks[0], { status: 'ok', finished_at: isoNow() })
   const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: handlers(state) })
   await page.locator('[data-catalog-row]').first().waitFor()
-  check('页头的起草入口写进度「起草 1/3」', await until(async () => (await page.locator('[data-catalog-draft-head="running"]').getAttribute('aria-label')) === '起草 1/3'))
+  check('页头的起草入口读屏写「起草（进行中）」，进度「起草 1/3」在后台任务条上', await until(async () =>
+    (await page.locator('[data-catalog-draft-head="running"]').getAttribute('aria-label')) === '起草（进行中）' && (await stripText(page, 'draft')) === '起草 1/3'),
+  await stripText(page, 'draft'))
   await openDialog(page)
   check('同源有起草任务：按钮写「排队剖析」，下面写起草任务结束后自动开始', (await textOf(page.locator('[data-profile-start]'))).includes('排队剖析')
         && (await page.locator('[data-profile-start]').getAttribute('data-profile-start')) === 'queue'
@@ -1353,16 +1375,18 @@ await section('剖析 · 和起草排队', async () => {
   check('……建出来是排队，写「排在起草任务后面，起草结束后自动开始」、开始时按起草后的目录再定', job.waiting_for === 'draft' && (await inBox(page, '[data-profile-title]')).startsWith('排队中')
         && (await inBox(page, '[data-profile-waiting="draft"]')) === '排在起草任务后面，起草结束后自动开始。要剖析哪些表，开始时按起草后的目录再定')
   await page.locator('[data-profile-hide]').click()
-  check('……页头写「剖析 排队中」，悬停写排在起草任务后面', await until(async () => (await head(page).getAttribute('data-catalog-profile')) === 'queued')
-        && (await textOf(head(page))) === '剖析 排队中' && (await head(page).getAttribute('title')).includes('排在起草任务后面'))
+  check('……页头读屏写「数据剖析（排队中）」，任务条按服务端的先后：起草在前，剖析「排队中，起草结束后开始」', await until(async () =>
+    (await head(page).getAttribute('data-catalog-profile')) === 'queued' && (await head(page).getAttribute('aria-label')) === '数据剖析（排队中）'
+    && JSON.stringify(await stripKinds(page)) === '["draft","profile"]' && (await stripText(page, 'profile')) === '剖析 排队中，起草结束后开始'),
+  `${JSON.stringify(await stripKinds(page))} ${await stripText(page, 'profile')}`)
   await shot(page, 'profile-queued')
   // 起草结束、剖析开始
   for (const t of draft.tasks) Object.assign(t, { status: 'ok', finished_at: isoNow() })
   Object.assign(draft, { status: 'succeeded', finished_at: isoNow() })
   settle(state, job, job.tasks[0].table_name, { status: 'running', queries: 2 })
   await goto(page, `/data/catalog/${S1}`)
-  check('起草结束后剖析开始：页头写「剖析 0/5」', await until(async () => (await head(page).getAttribute('aria-label')) === `剖析 0/${job.tasks.length}`),
-    await head(page).getAttribute('aria-label').catch(() => ''))
+  check('起草结束后剖析开始：任务条写「剖析 0/5」，页头读屏写「进行中」', await until(async () => (await stripText(page, 'profile')) === `剖析 0/${job.tasks.length}`
+        && (await head(page).getAttribute('aria-label')) === '数据剖析（进行中）'), await stripText(page, 'profile'))
 
   // 反过来：剖析在进行时起草，排在剖析后面
   await page.locator('[data-catalog-draft]').first().click()
@@ -1373,10 +1397,10 @@ await section('剖析 · 和起草排队', async () => {
   check('……建出来的起草任务排在剖析后面：写「排在剖析任务后面，剖析结束后自动开始」', await until(async () =>
     (await textOf(draftBox.locator('[data-draft-waiting="profile"]'))) === '排在剖析任务后面，剖析结束后自动开始'))
   await page.locator('[data-draft-hide]').click()
-  check('……目录页上方的起草进度也这么写', await until(async () => (await textOf(page.locator('[data-catalog-draft-progress]'))).includes('起草任务排在剖析任务后面，剖析结束后自动开始')),
-    await textOf(page.locator('[data-catalog-draft-progress]')))
-  check('……页头的起草入口写「起草 排队中」，悬停写排在剖析任务后面', (await textOf(page.locator('[data-catalog-draft-head="queued"]'))) === '起草 排队中'
-        && (await page.locator('[data-catalog-draft-head="queued"]').getAttribute('title')).includes('排在剖析任务后面'))
+  check('……任务条按服务端的先后：剖析在前，起草「排队中，剖析结束后开始」', await until(async () => JSON.stringify(await stripKinds(page)) === '["profile","draft"]'
+        && (await stripText(page, 'draft')) === '起草 排队中，剖析结束后开始'), `${JSON.stringify(await stripKinds(page))} ${await stripText(page, 'draft')}`)
+  check('……页头的起草入口读屏写「起草（排队中）」，不写数字', (await page.locator('[data-catalog-draft-head="queued"]').getAttribute('aria-label')) === '起草（排队中）'
+        && !/\d/.test(await textOf(page.locator('[data-catalog-draft-head="queued"]'))))
   stopJob(job)
   check('写请求只有建剖析任务、建起草任务', writes(sent, /./).every((s) => /(profile|draft)-jobs$/.test(s.key)), JSON.stringify(writes(sent, /./).map((s) => s.key)))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
@@ -1534,6 +1558,14 @@ await section('剖析 · 窄屏', async () => {
   const inner = await box(page).evaluate((el) => el.scrollWidth - el.clientWidth)
   check('……进行中、展开一张表：对话框在视口里，正文不横向滚动', !!d && d.x >= 0 && d.x + d.width <= 390 && inner <= 1, `${JSON.stringify(d)} ${inner}`)
   await shot(page, 'profile-narrow')
+  // 关掉对话框：后台任务条在窄屏上看得见，「最近查询多数超时」写全文（没有悬停也读得到），不撑宽页面
+  job.notice = '最近 6 条查询有 4 条超时，数据库响应变慢了；剖析会继续，可以停止，换在业务不忙的时候再剖析'
+  await page.locator('[data-profile-hide]').click()
+  await until(async () => (await stripJob(page, 'profile').locator('[data-catalog-job-notice]').count()) === 1)
+  const strip = await page.locator('[data-catalog-job-strip]').boundingBox()
+  check('……窄屏：后台任务条看得见、提醒写全文，不横向滚动', !!strip && strip.width <= 390 && await stripJob(page, 'profile').isVisible()
+        && (await textOf(stripJob(page, 'profile').locator('[data-catalog-job-notice]'))).includes('换在业务不忙的时候再剖析') && await overflow() <= 1,
+  `${JSON.stringify(strip)} ${await overflow()}`)
   stopJob(job)
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()

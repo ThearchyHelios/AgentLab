@@ -343,15 +343,17 @@ await section('设置 → 通知：可订阅的事件照服务端登记列（总
   }
   const every = ['task.opened', 'run.finished', 'run.failed', 'action.unknown']
   // 第 3 波起：定时评测的两个事件只推全局渠道（评测是搭建者们共用的一把尺，不归哪个人；服务端 notify/service.notify_eval）；
-  // 访问密钥快到期推给全局渠道（服务账号的密钥）和个人渠道（个人密钥），每天的待办汇总只推个人渠道
+  // 访问密钥快到期推给全局渠道（服务账号的密钥）和个人渠道（个人密钥），每天的待办汇总只推个人渠道。
+  // 第 4 波：数据源有变化要处理只推全局渠道（按源汇总，notify_source_changed）
   check('全局渠道：推给全局渠道的几项', await waitFor(page, async () => await dlg.locator('[data-notify-events="global"]').count() === 1)
-    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done', 'eval.regressed', 'eval.failed', 'key.expiring']),
+    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done', 'source.changed', 'eval.regressed', 'eval.failed', 'key.expiring']),
     JSON.stringify(await listed()))
   const text = await dlg.innerText()
   // 只推定时发起的评测：叫法照实带「定时」，勾上的人不会以为手动发起的那次也推
   check('评测的两个事件照实说是定时的', ['定时评测有退步', '定时评测没有评完'].every((t) => text.includes(t)), text)
   check('从来推不到的不列', !['待办升级', '待办超时', '待办处理完', '动作失败', '动作已生效'].some((t) => text.includes(t)), text)
-  check('登记了还没推送的不列', !['数据源有变化要处理', '口径升版，答案的数变了']
+  check('……「数据源有变化要处理」列着（第 4 波打开了订阅）', text.includes('数据源有变化要处理'), text)
+  check('登记了还没推送的不列', !['口径升版，答案的数变了']
     .some((t) => text.includes(t)), text)
   check('只推个人渠道的「每天的待办汇总」全局渠道不列', !text.includes('每天的待办汇总'), text)
   check('应用的渠道：不列只发给提交人的「我提交审核的应用有结果」', await scope('app')
