@@ -23,7 +23,7 @@ from app.data import catalog, catalog_profile, catalog_profile_jobs, catalog_pro
 from app.data import table_versions
 from app.data.engine import MASK_COLUMNS_OPTION
 from app.db.base import SessionLocal
-from app.db.models import CatalogProfileTask, DataSource
+from app.db.models import CatalogProfileJob, CatalogProfileTask, DataSource
 from app.db.models_sources import SourceChange, TableObservation
 from app.main import app
 from tests.fixtures.sources import drop_source, introspect_now
@@ -300,3 +300,159 @@ def test_coverage_drop_only_when_crossing_the_verified_line():
         {"kind": "codes", "path": "columns.x.codes"},
     ])
     assert [(d["path"], d["before"], d["after"]) for d in drops] == [("relations.r1", 0.99, 0.6)]
+
+
+# ==========================================================================
+# 观察写库出错只回滚它自己：辅助步骤失败不挡剖析（保存点）
+# ==========================================================================
+
+
+def _unserializable(monkeypatch, kind: str) -> None:
+    """让某一种观察带上序列化不了的值：写 table_observations 那一刻 flush 报错（模拟观察写库出错）。"""
+    real = observe._observation
+
+    def broken(k, column, basis, data, refs):
+        out = real(k, column, basis, data, refs)
+        if k == kind:
+            out["data"] = {**out["data"], "bad": object()}
+        return out
+
+    monkeypatch.setattr(observe, "_observation", broken)
+
+
+async def _job_and_task(job_id: str):
+    async with SessionLocal() as session:
+        job = await session.get(CatalogProfileJob, job_id)
+        [task] = (await session.execute(select(CatalogProfileTask).where(CatalogProfileTask.job_id == job_id))).scalars()
+        return job, task
+
+
+async def test_observation_write_error_does_not_take_the_profile_down(shop, monkeypatch):
+    """一条观察写库出错（flush 报错）只回滚这条观察的保存点：同一张表的剖析结果、写进目录的结论照常提交，别的观察照常
+    落库，任务照常结束。以前和剖析共用一个事务又没有保存点：这条一错整个事务就回滚了，外层提交时抛错，剖析写的目录跟着
+    丢掉。"""
+    sid, _ = shop
+    async with SessionLocal() as session:
+        # secret 记成状态类的度量、去掉码值：剖析会给它取值分布、往目录里提一份码值（这次剖析有东西写进目录）
+        entry = await catalog.read_entry(session, sid, "orders")
+        notes = entry.notes
+        notes["columns"]["secret"] = {"measure": catalog.make_item("status", "llm")}
+        before = await catalog.write_entry(session, sid, "orders", notes, if_version=entry.version, actor="测试员")
+    _unserializable(monkeypatch, "freshness")
+    job_id = await _observe(sid, scope="maintenance")
+    job, task = await _job_and_task(job_id)
+    async with SessionLocal() as session:
+        after = await catalog.read_entry(session, sid, "orders")
+    assert job.status == "succeeded", job.error
+    assert task.status == "ok" and task.error is None
+    assert task.added == 1 and after.version == before.version + 1 and task.version == after.version
+    assert after.notes["columns"]["secret"]["codes"]["source"] == "profile", "剖析写进目录的结论照常提交"
+    got = {(o.kind, o.column_name) for o in await _obs(sid)}
+    assert ("freshness", "paid_on") not in got, "出错的那条观察回滚了"
+    assert {("rows", ""), ("codes_observe", "status"), ("daily_volume", "paid_on")} <= got, "别的观察照常落库"
+
+
+async def test_a_failing_observation_takes_its_revoke_back_with_it(shop, monkeypatch):
+    """前一条观察撤销了「已列全」、随后它记变化时出错：整条观察连同撤销一起回滚，不会只撤了已列全却没有那条变化；后一条
+    观察照常撤销另一列的已列全、记下变化，这张表的结果照常提交。以前没有保存点：撤销留在事务里、变化没记上，后面的观察
+    也不再保存。"""
+    from app.data import source_changes
+
+    sid, path = shop
+    async with SessionLocal() as session:
+        entry = await catalog.read_entry(session, sid, "orders")
+        notes = entry.notes
+        notes["columns"]["secret"]["codes"] = catalog.make_item({"y": "保密"}, "human", complete=True)
+        await catalog.write_entry(session, sid, "orders", notes, if_version=entry.version, actor="测试员")
+    db = sqlite3.connect(path)
+    db.execute("INSERT INTO orders VALUES (999, 'held', ?, 1, 'x')", ((TODAY - timedelta(days=2)).isoformat(),))
+    db.commit()
+    db.close()
+    async with SessionLocal() as session:
+        base = (await catalog.read_entry(session, sid, "orders")).version
+    real = source_changes.record
+
+    async def broken(session, source, change, detected):
+        if change.column == "status":
+            change.after = {**(change.after or {}), "bad": object()}
+        return await real(session, source, change, detected)
+
+    monkeypatch.setattr(source_changes, "record", broken)
+    job_id = await _observe(sid)
+    job, task = await _job_and_task(job_id)
+    async with SessionLocal() as session:
+        after = await catalog.read_entry(session, sid, "orders")
+        changes = list((await session.execute(select(SourceChange).where(SourceChange.source_id == sid))).scalars())
+    assert job.status == "succeeded", job.error
+    assert task.status == "ok" and task.error is None, "这张表的结果照常提交"
+    assert [(c.kind, c.column_name) for c in changes] == [("codes_new", "secret")]
+    assert after.version == base + 1 and after.updated_by == observe.OBSERVER
+    assert catalog.codes_complete(after.notes["columns"]["status"]["codes"]), "status 那条观察回滚了：已列全没撤"
+    assert not catalog.codes_complete(after.notes["columns"]["secret"]["codes"])
+    got = {(o.kind, o.column_name) for o in await _obs(sid)}
+    assert ("codes_observe", "status") not in got and ("codes_observe", "secret") in got
+
+
+async def test_coverage_drop_write_error_rolls_back_only_itself(shop):
+    """记关联覆盖率下降出错（这里是更新已有那一条时 flush 报错）只回滚它自己：同一个事务里这张表的剖析结果照常提交。"""
+    from app.data.source_changes import Detected
+
+    sid, _ = shop
+    drop = {"kind": "relation", "path": "relations.r1", "target": "orders → stores", "previous_coverage": 0.99,
+            "coverage": 0.6}
+    detected = Detected(job_kind="profile")
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, sid)
+        assert await observe.record_coverage_drops(session, row, "orders", SimpleNamespace(findings=[drop]),
+                                                   detected=detected) == 1
+        await session.commit()
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, sid)
+        entry = await catalog.read_entry(session, sid, "orders")
+        await catalog.write_entry(session, sid, "orders", {**entry.notes, "description": catalog.make_item(
+            "订单", "human")}, if_version=entry.version, actor="测试员", commit=False)
+        # 同一个指纹再测到（更新那一条），这次带上序列化不了的值
+        bad = {**drop, "target": object()}
+        assert await observe.record_coverage_drops(session, row, "orders", SimpleNamespace(findings=[bad]),
+                                                   detected=detected) == 0
+        await session.commit()
+    async with SessionLocal() as session:
+        after = await catalog.read_entry(session, sid, "orders")
+        [change] = (await session.execute(select(SourceChange).where(SourceChange.source_id == sid))).scalars()
+    assert after.version == entry.version + 1 and after.notes["description"]["value"] == "订单", "同一事务的写入照常提交"
+    assert change.seen_count == 1 and change.before["target"] == "orders → stores", "出错的那次更新回滚了"
+
+
+async def test_revoke_writes_against_the_database_version_not_the_session_cache(shop):
+    """撤销已列全按库里的目录版本写。会话里还握着保存点回滚前的那个目录对象时（干净对象在身份表里只是弱引用，平常早被
+    回收，但异常的回溯、调用方的变量都会握住它），它上面是回滚掉的版本：拿它去写乐观锁对不上，write_entry 回滚的是整个
+    会话，同一个事务里先写的东西（这里是一条观察，代表这张表的剖析结果）跟着丢掉。"""
+    import contextlib
+
+    from app.db.models import CatalogNote
+
+    sid, _ = shop
+    async with SessionLocal() as session:
+        entry = await catalog.read_entry(session, sid, "orders")
+        notes = entry.notes
+        notes["columns"]["secret"]["codes"] = catalog.make_item({"y": "保密"}, "human", complete=True)
+        base = (await catalog.write_entry(session, sid, "orders", notes, if_version=entry.version,
+                                          actor="测试员")).version
+    async with SessionLocal() as session:
+        session.add(TableObservation(source_id=sid, table_name="orders", column_name="", kind="rows",
+                                     basis={"method": "count"}, basis_key="count", data={"rows": 1}))
+        await session.flush()
+        held = (await session.execute(select(CatalogNote).where(CatalogNote.source_id == sid))).scalar_one()
+        with contextlib.suppress(RuntimeError):
+            async with session.begin_nested():
+                assert await observe._revoke_complete(session, sid, "orders", "status") == base + 1
+                raise RuntimeError("这条观察随后出错")
+        assert held.version == base + 1, "前提：会话里握着的对象上还是回滚掉的版本"
+        assert await observe._revoke_complete(session, sid, "orders", "secret") == base + 1
+        await session.commit()
+    async with SessionLocal() as session:
+        after = await catalog.read_entry(session, sid, "orders")
+    assert after.version == base + 1 and after.updated_by == observe.OBSERVER
+    assert catalog.codes_complete(after.notes["columns"]["status"]["codes"]), "回滚掉的那次撤销没有生效"
+    assert not catalog.codes_complete(after.notes["columns"]["secret"]["codes"])
+    assert [(o.kind, o.data) for o in await _obs(sid)] == [("rows", {"rows": 1})], "同一个事务里先写的照常提交"

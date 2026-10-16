@@ -23,6 +23,11 @@
 列）留最近 26 条；拿同口径的历史比出取值变化写进 source_changes。机器唯一能写进目录的事：数据证明码值表不再列全时撤销
 「已列全」（目录版本 +1，现有的目录漂移、冻结快照、SQL 检查自然跟上）；新取值本身、含义、状态都不改，交给人在变化里处理。
 
+**观察出错不挡剖析**：每条观察（连同它比出的变化、它撤销的已列全）、每条覆盖率下降各占一个保存点（SAVEPOINT）。一条写库
+出错（flush 报错之类）只回滚它自己的保存点，这张表的剖析结果、写进目录的结论和别的观察照常提交；只靠 try/except 不够：
+没有保存点时 flush 一出错 SQLAlchemy 就把整个事务回滚了，外层提交这张表的结果时跟着抛错。撤销已列全按库里的目录版本写
+（见 _revoke_complete）：catalog.write_entry 乐观锁对不上时回滚的是整个会话，保存点挡不住。
+
 **什么时候观察**：剖析任务的范围 observe（只观察）和 maintenance（需要剖析的表 + 观察到期的表，定时维护用）才带观察检查；
 人点的「需要剖析 / 全部 / 指定的表」照旧不观察。观察到期（observe_due）：有数据目录、不是视图的表，从没观察过，或者上一次
 观察在 OBSERVE_EVERY_H 小时以前。
@@ -39,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data import catalog
 from app.db.base import utcnow
+from app.db.models import CatalogNote
 from app.db.models_sources import TableObservation
 
 logger = logging.getLogger(__name__)
@@ -311,76 +317,99 @@ def _rules_columns(notes: Mapping[str, Any], meta: Mapping[str, Any] | None, tab
 
 
 async def _revoke_complete(session: AsyncSession, source_id: str, table: str, column: str) -> int | None:
-    """撤销码值项上的「已列全」（目录版本 +1，不提交）：值、含义、状态、来源都不动。撞上别人刚改过重读重来，最多三次。
-    已经不是已列全了（别人刚改过）返回 None。"""
-    for _attempt in range(3):
-        entry = await catalog.read_entry(session, source_id, table)
-        if entry is None:
-            return None
-        notes = entry.notes
-        item = ((notes.get("columns") or {}).get(column) or {}).get("codes")
-        if not catalog.codes_complete(item):
-            return None
-        item.pop("complete", None)
-        item["updated_at"] = catalog.now_iso()
-        try:
-            written = await catalog.write_entry(session, source_id, table, notes, if_version=entry.version,
-                                                actor=OBSERVER, commit=False)
-        except catalog.CatalogConflict:
-            continue
-        return written.version
-    return None
+    """撤销码值项上的「已列全」（目录版本 +1，不提交）：值、含义、状态、来源都不动。已经不是已列全了（别人刚改过）返回
+    None。
+
+    目录从库里重读（populate_existing），不用会话里缓存的那个对象：前一条观察撤销过、随后它的保存点回滚了，那个对象上还是
+    回滚掉的版本（只 refresh 过、没改过的对象，保存点回滚时 SQLAlchemy 不让它过期）。身份表对这种干净对象只是弱引用，平常
+    早被回收、下次查询从库里重建；可只要别处还握着它（异常的回溯、调用方的变量），拿它的版本去写，乐观锁就对不上，而
+    write_entry 冲突时回滚的是整个会话、不只是保存点，这张表的剖析结果跟着丢掉——所以不赌它有没有被回收，也不在同一个
+    事务里撞了重试。重读之后到写进去之间别人提交不了新的目录版本：这张表的结果在同一个事务里已经写过（剖析任务的
+    _save_table），这个事务拿着 SQLite 的写锁。"""
+    await session.execute(select(CatalogNote).where(CatalogNote.source_id == source_id, CatalogNote.table_name == table)
+                          .execution_options(populate_existing=True))
+    entry = await catalog.read_entry(session, source_id, table)
+    if entry is None:
+        return None
+    notes = entry.notes
+    item = ((notes.get("columns") or {}).get(column) or {}).get("codes")
+    if not catalog.codes_complete(item):
+        return None
+    item.pop("complete", None)
+    item["updated_at"] = catalog.now_iso()
+    written = await catalog.write_entry(session, source_id, table, notes, if_version=entry.version, actor=OBSERVER,
+                                        commit=False)
+    return written.version
 
 
 async def save(session: AsyncSession, source: Any, table: str, result: Any, *, job_id: str | None,
                seq: int | None, detected: Any) -> int:
     """这张表这一次的观察写进 table_observations、和同口径的历史比，比出来的取值变化写进 source_changes（不提交：和剖析
-    结果、目录在同一个事务里）。返回记了几条新变化。出错只记日志、不挡剖析（观察是辅助步骤）。"""
-    from app.data import source_changes as sc
-    from app.data import value_drift as vd
-
+    结果、目录在同一个事务里）。返回记了几条新变化。每条观察一个保存点，出错只回滚那一条、记日志，不挡剖析（观察是辅助
+    步骤，见模块说明）。"""
     observations = list(getattr(result, "observations", None) or [])
     if not observations:
         return 0
-    fresh = 0
+    # 剖析这张表自己的写入先落下去：那里出错是剖析的事，照常往外抛，不算在观察头上
+    await session.flush()
     try:
-        entry = await catalog.read_entry(session, source.id, table)
-        notes = entry.notes if entry else {}
-        meta = ((getattr(source, "schema_cache", None) or {}).get("tables") or {}).get(table)
-        rules = _rules_columns(notes, meta, table, getattr(source, "kind", None))
-        now = utcnow()
-        today = now.date()
-        for obs in observations:
-            kind, column = obs["kind"], obs["column"]
-            history = await _history(session, source.id, table, kind, column)
-            session.add(TableObservation(source_id=source.id, table_name=table, column_name=column, kind=kind,
-                                         basis=obs["basis"], basis_key=obs["basis_key"], data=obs["data"],
-                                         job_id=job_id, task_seq=seq, at=now))
-            await session.flush()
-            await _prune(session, source.id, table, kind, column)
-            item = ((notes.get("columns") or {}).get(column) or {}).get("codes") if column else None
-            known = list((item or {}).get("value") or {}) if isinstance(item, Mapping) and \
-                item.get("status") != "rejected" else []
-            current = vd.Obs(kind, obs["basis_key"], obs["data"], now)
-            past = [vd.Obs(h.kind, h.basis_key, h.data or {}, h.at) for h in history]
-            findings = vd.compare(current, past, today=today, known=known,
-                                  complete=catalog.codes_complete(item))
-            for f in findings:
-                after = dict(f.after) if isinstance(f.after, Mapping) else {"value": f.after}
-                if f.revoke_complete:
-                    version = await _revoke_complete(session, source.id, table, column)
-                    after.update(complete_revoked=version is not None, catalog_version=version)
-                touched = bool(column) and column.lower() in rules
-                change = sc.NewChange(kind=f.kind, table=table, column=column or None, severity=f.severity,
-                                      before=f.before, after=after,
-                                      basis={"method": obs["basis"].get("method"), "key": obs["basis_key"],
-                                             "query_refs": obs["basis"].get("query_refs") or []},
-                                      affects={"catalog": [], "templates": [], "rules_touched": touched},
-                                      key=(obs["basis_key"], f.key))
-                _row, new = await sc.record(session, source, change, detected)
-                fresh += int(new)
-    except Exception:  # noqa: BLE001 - 观察是辅助步骤：落库、比较出错不挡剖析结果
-        logger.exception("保存 %s 的取值观察时出错", table)
+        async with session.begin_nested():
+            entry = await catalog.read_entry(session, source.id, table)
+            notes = entry.notes if entry else {}
+            meta = ((getattr(source, "schema_cache", None) or {}).get("tables") or {}).get(table)
+            rules = _rules_columns(notes, meta, table, getattr(source, "kind", None))
+    except Exception:  # noqa: BLE001 - 观察是辅助步骤
+        logger.exception("保存 %s 的取值观察时读目录出错", table)
+        return 0
+    now = utcnow()
+    fresh = 0
+    for obs in observations:
+        try:
+            async with session.begin_nested():
+                new = await _save_one(session, source, table, obs, notes=notes, rules=rules, now=now, job_id=job_id,
+                                      seq=seq, detected=detected)
+        except Exception:  # noqa: BLE001 - 这一条回滚了，别的观察和剖析结果照常
+            logger.exception("保存 %s 的取值观察（%s %s）时出错", table, obs.get("kind"), obs.get("column") or "")
+            continue
+        fresh += new
+    return fresh
+
+
+async def _save_one(session: AsyncSession, source: Any, table: str, obs: Mapping[str, Any], *,
+                    notes: Mapping[str, Any], rules: set[str], now: datetime, job_id: str | None, seq: int | None,
+                    detected: Any) -> int:
+    """一条观察：落库、修剪、和同口径的历史比，比出来的变化逐条记下（要撤销已列全的先撤销）。在调用方的保存点里：
+    中间哪一步出错，这条观察、它撤销的已列全、它记的变化一起回滚，不会只撤了已列全却没有那条变化。返回记了几条新变化。"""
+    from app.data import source_changes as sc
+    from app.data import value_drift as vd
+
+    kind, column = obs["kind"], obs["column"]
+    history = await _history(session, source.id, table, kind, column)
+    session.add(TableObservation(source_id=source.id, table_name=table, column_name=column, kind=kind,
+                                 basis=obs["basis"], basis_key=obs["basis_key"], data=obs["data"],
+                                 job_id=job_id, task_seq=seq, at=now))
+    await session.flush()
+    await _prune(session, source.id, table, kind, column)
+    item = ((notes.get("columns") or {}).get(column) or {}).get("codes") if column else None
+    known = list((item or {}).get("value") or {}) if isinstance(item, Mapping) and \
+        item.get("status") != "rejected" else []
+    current = vd.Obs(kind, obs["basis_key"], obs["data"], now)
+    past = [vd.Obs(h.kind, h.basis_key, h.data or {}, h.at) for h in history]
+    fresh = 0
+    for f in vd.compare(current, past, today=now.date(), known=known, complete=catalog.codes_complete(item)):
+        after = dict(f.after) if isinstance(f.after, Mapping) else {"value": f.after}
+        if f.revoke_complete:
+            version = await _revoke_complete(session, source.id, table, column)
+            after.update(complete_revoked=version is not None, catalog_version=version)
+        touched = bool(column) and column.lower() in rules
+        change = sc.NewChange(kind=f.kind, table=table, column=column or None, severity=f.severity,
+                              before=f.before, after=after,
+                              basis={"method": obs["basis"].get("method"), "key": obs["basis_key"],
+                                     "query_refs": obs["basis"].get("query_refs") or []},
+                              affects={"catalog": [], "templates": [], "rules_touched": touched},
+                              key=(obs["basis_key"], f.key))
+        _row, new = await sc.record(session, source, change, detected)
+        fresh += int(new)
     return fresh
 
 
@@ -401,26 +430,32 @@ def coverage_drops(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]
 
 async def record_coverage_drops(session: AsyncSession, source: Any, table: str, result: Any, *, detected: Any) -> int:
     """这张表这次剖析里覆盖率掉下来的关系记成 coverage_drop（不提交，和剖析结果同一个事务）。人点的剖析也记：变化记录是
-    全站一份。出错只记日志。"""
+    全站一份。每条一个保存点，出错只回滚那一条、记日志（同 save）。"""
     from app.data import source_changes as sc
 
-    try:
-        fresh = 0
-        for drop in coverage_drops(getattr(result, "findings", None) or []):
-            _row, new = await sc.record(session, source, sc.NewChange(
-                kind=sc.COVERAGE_DROP, table=table, severity="warning",
-                before={"coverage": drop["before"], "path": drop["path"], "target": drop["target"]},
-                after={"coverage": drop["after"], "confirmed": drop["confirmed"]},
-                basis={"method": "relation_sample", "key": "relation"},
-                affects={"catalog": [{"table": table, "path": drop["path"], "label": drop["target"],
-                                      "status": "confirmed" if drop["confirmed"] else "proposed",
-                                      "source": None, "needs_action": False}], "templates": [], "rules_touched": False},
-                key=(drop["path"], round(float(drop["after"]), 3))), detected)
-            fresh += int(new)
-        return fresh
-    except Exception:  # noqa: BLE001
-        logger.exception("记录 %s 的关联覆盖率下降时出错", table)
+    drops = coverage_drops(getattr(result, "findings", None) or [])
+    if not drops:
         return 0
+    await session.flush()                # 同 save：剖析自己的写入先落下去
+    fresh = 0
+    for drop in drops:
+        try:
+            async with session.begin_nested():
+                _row, new = await sc.record(session, source, sc.NewChange(
+                    kind=sc.COVERAGE_DROP, table=table, severity="warning",
+                    before={"coverage": drop["before"], "path": drop["path"], "target": drop["target"]},
+                    after={"coverage": drop["after"], "confirmed": drop["confirmed"]},
+                    basis={"method": "relation_sample", "key": "relation"},
+                    affects={"catalog": [{"table": table, "path": drop["path"], "label": drop["target"],
+                                          "status": "confirmed" if drop["confirmed"] else "proposed",
+                                          "source": None, "needs_action": False}],
+                             "templates": [], "rules_touched": False},
+                    key=(drop["path"], round(float(drop["after"]), 3))), detected)
+        except Exception:  # noqa: BLE001
+            logger.exception("记录 %s 的关联覆盖率下降（%s）时出错", table, drop.get("path"))
+            continue
+        fresh += int(new)
+    return fresh
 
 
 # ==========================================================================
