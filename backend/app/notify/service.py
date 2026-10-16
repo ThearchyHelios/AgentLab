@@ -35,7 +35,7 @@ from typing import Any
 from sqlalchemy import select
 
 from app.db.base import SessionLocal, utcnow
-from app.db.models import App, AppVersion, NotifyChannel, NotifyDelivery, Run, Task, TaskAssignment, User
+from app.db.models import App, AppVersion, NotifyChannel, NotifyDelivery, Run, Setting, Task, TaskAssignment, User
 from app.notify.core import Message, Outcome, host_of
 
 logger = logging.getLogger(__name__)
@@ -74,10 +74,11 @@ EVENTS: dict[str, Event] = {
     # 定时评测有题从通过变成不通过 / 评测没跑完（01 第 15 项）：题集名、通过数、退步题数、链接；不放期望值和答案里的数
     "eval.regressed": Event("评测有退步", ()),
     "eval.failed": Event("评测失败", ()),
-    # 每天一条待办汇总（04 B3）：只推个人渠道；条数、最早的时限、最多 5 条（节点在图上的名字）、去待办箱的链接
-    "task.digest": Event("每天的待办汇总", ()),
-    # 访问密钥到期前 7 天、1 天各一次（04 B3）：个人密钥推本人，服务账号的推全局渠道；密钥名、到期日、链接
-    "key.expiring": Event("访问密钥快到期", ()),
+    # 每天一条待办汇总（04 B3，notify_digest）：只推个人渠道；条数、最早的时限、最多 5 条（节点在图上的名字）、去待办箱的链接
+    "task.digest": Event("每天的待办汇总", ("user",)),
+    # 访问密钥到期前 7 天、1 天各一次（04 B3，notify_key_expiring）：个人密钥推本人的个人渠道，服务账号的推全局渠道；
+    # 密钥名、到期日、链接
+    "key.expiring": Event("访问密钥快到期", ("global", "user")),
 }
 EVENT_LABEL = {name: event.label for name, event in EVENTS.items()}
 
@@ -133,14 +134,23 @@ async def personal_url_problem(url: str) -> str | None:
     return None
 
 
-def channel_out(row: NotifyChannel) -> dict[str, Any]:
-    """渠道的接口形状（typesApp.ts 的 NotifyChannelRow）：地址只回主机名，密钥只说配没配。"""
+def channel_out(row: NotifyChannel, owner_email: str | None = None) -> dict[str, Any]:
+    """渠道的接口形状（typesApp.ts 的 NotifyChannelRow）：地址只回主机名，密钥只说配没配。
+
+    邮件渠道（notify/mail.py）没有主机名：mail_to 是发给谁——个人渠道是拥有者的账号邮箱（owner_email，没有邮箱是空的），
+    全局、应用的是填的那几个收件地址（搭建者以上才看得到这些渠道，改地址时要整份重填，所以照原样给）。"""
     from app.core.crypto import decrypt
 
     url = decrypt(row.url) or ""
-    return {"id": row.id, "name": row.name, "scope": row.scope, "owner_id": row.owner_id, "format": row.format,
-            "url_host": host_of(url) if url else "", "signed": bool(row.secret), "events": list(row.events or []),
-            "enabled": row.enabled}
+    out = {"id": row.id, "name": row.name, "scope": row.scope, "owner_id": row.owner_id, "format": row.format,
+           "url_host": host_of(url) if url and row.format != "email" else "", "signed": bool(row.secret),
+           "events": list(row.events or []), "enabled": row.enabled}
+    if row.format == "email":
+        if row.scope == "user":
+            out["mail_to"] = [owner_email] if owner_email else []
+        else:
+            out["mail_to"] = [p.strip() for p in url.split(",") if p.strip()]
+    return out
 
 
 def generic_body(message: dict[str, Any], msg: Message) -> dict[str, Any]:
@@ -237,8 +247,61 @@ async def _where(session: Any, run: Run | None) -> str:
     return f"工作流「{run.workflow_name}」" if run.workflow_name else ""
 
 
+#: 管理员开了「默认发邮件给待办处理人」（设置 mail.default_for_assignees，04 细案 B2、集成-I5）之后，给哪些人自动建过个人
+#: 邮件渠道：设置表里一行 {用户 id: 建的时间}（通知自己记的账，键的开头同 notify/digest.STATE_PREFIX，设置接口不列）。只在
+#: 第一次派到待办时建一次——本人删掉了就是不要，不再替他建回来
+MAIL_AUTO_KEY = "notify_state:mail_auto"
+_mail_auto_lock = asyncio.Lock()
+
+
+async def ensure_assignee_mail(users: list[str]) -> int:
+    """派到待办的人还没有个人邮件渠道时自动给他建一个（默认订阅 mail.ASSIGNEE_EVENTS），本人之后可以改订阅、可以关。
+
+    只在开了登录（个人渠道挂在认证过的账号上）、邮件服务启用、管理员开了这个开关时做；服务账号、停用的人不建。缺省关：刚配好
+    SMTP 的部署不该突然往外发邮件（照实说、不意外）。交回这次建了几个。同一时刻只做一份：两条待办同时派给同一个人不建两个。"""
+    from app.auth import current_mode
+    from app.core.crypto import encrypt
+    from app.notify import mail
+
+    if not users or current_mode() == "off":
+        return 0
+    async with _mail_auto_lock, SessionLocal() as session:
+        cfg = await mail.load_config(session)
+        if not (cfg.enabled and cfg.default_for_assignees):
+            return 0
+        ids = list((await session.execute(select(User.id).where(
+            User.username.in_(users), User.kind != "service", User.disabled.is_(False)))).scalars())
+        record = await session.get(Setting, MAIL_AUTO_KEY)
+        done = dict(record.value or {}) if record is not None else {}
+        fresh = [uid for uid in ids if uid not in done]
+        if not fresh:
+            return 0
+        have = set((await session.execute(select(NotifyChannel.owner_id).where(
+            NotifyChannel.scope == "user", NotifyChannel.format == "email",
+            NotifyChannel.owner_id.in_(fresh)))).scalars())
+        made = 0
+        for uid in fresh:
+            if uid not in have:
+                session.add(NotifyChannel(name=mail.ASSIGNEE_CHANNEL_NAME, scope="user", owner_id=uid, format="email",
+                                          url=encrypt(mail.PERSONAL_PLACEHOLDER), events=list(mail.ASSIGNEE_EVENTS)))
+                made += 1
+            done[uid] = utcnow().isoformat()
+        if record is None:
+            session.add(Setting(key=MAIL_AUTO_KEY, value=done))
+        else:
+            record.value = done
+        await session.commit()
+        return made
+
+
 async def notify_task(task_id: str, event: str, *, users: list[str]) -> int:
-    """待办的通知（task.opened / reassigned / escalated / reminded）。users 是这次要通知到的人（派给的用户名）。返回推了几个渠道。"""
+    """待办的通知（task.opened / reassigned / escalated / reminded）。users 是这次要通知到的人（派给的用户名）。返回推了几个渠道。
+
+    管理员开了「默认发邮件给待办处理人」时，先给还没有个人邮件渠道的处理人建一个（ensure_assignee_mail），这一条就推得到。"""
+    try:
+        await ensure_assignee_mail(users)
+    except Exception:  # noqa: BLE001 - 自动建渠道出错不挡这条待办的通知
+        logger.exception("给待办 %s 的处理人自动建邮件渠道失败", task_id)
     async with SessionLocal() as session:
         task = await session.get(Task, task_id)
         if task is None:
@@ -357,3 +420,109 @@ async def notify_action(action_id: str, event: str) -> int:
                "subject": {"action_id": action_id, "run_id": rec.run_id, "task_id": task_id}}
     return await _push(channels, message, subject_kind="action", subject_id=action_id, event=event,
                        run_id=rec.run_id, task_id=task_id)
+
+
+# --------------------------------------------------------------------------
+# 每天的待办汇总、访问密钥快到期（04 细案 B3）：什么时候推由 notify/digest.py 在调度循环里定，这里只拼消息、推送
+# --------------------------------------------------------------------------
+
+#: 汇总里最多列几条
+DIGEST_ITEMS = 5
+
+
+def _utc(moment: Any) -> Any:
+    """库里的时间一律按 UTC 认（待办的时限是不带时区的 UTC），比较前统一成带时区的。"""
+    from datetime import timezone
+
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def _local(moment: Any) -> str:
+    return _utc(moment).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+async def notify_digest(user_id: str) -> int:
+    """给一个人发今天的待办汇总（task.digest）：只推他自己订阅了这件事的个人渠道。没有待办不发（不每天发一条「0 条」）。
+
+    内容（P4、X6）：条数、最早的时限、最多 DIGEST_ITEMS 条（节点在图上的名字，加所在应用和时限）、去待办箱的链接；不放按运行
+    数据渲染出来的待办标题。「派给我的」和待办箱同一个判断（process/tasks._mine）。返回推了几个渠道。"""
+    from app.auth import current_mode
+    from app.auth.sessions import principal_of
+    from app.process.tasks import _mine
+
+    event = "task.digest"
+    async with SessionLocal() as session:
+        user = await session.get(User, user_id)
+        if user is None or user.disabled or user.kind == "service":
+            return 0
+        channels = [c for c in await _channels(session, event, None, [user.username])
+                    if c.scope == "user" and c.owner_id == user.id]
+        if not channels:
+            return 0
+        principal = await principal_of(session, user, current_mode())
+        query = select(Task).where(Task.status == "pending")
+        if (clause := _mine(principal)) is not None:
+            query = query.where(clause)
+        tasks = list((await session.execute(query)).scalars())
+        if not tasks:
+            return 0
+        # 有时限的在前、时限早的在前；没有时限的按开出的先后
+        far = _utc(utcnow().replace(year=9999))
+        tasks.sort(key=lambda t: (_utc(t.due_at) if t.due_at else far, _utc(t.created_at) if t.created_at else far))
+        runs = {r.id: r for r in (await session.execute(select(Run).where(
+            Run.id.in_({t.run_id for t in tasks[:DIGEST_ITEMS]})))).scalars()}
+        names = {a.id: a.name for a in (await session.execute(select(App).where(
+            App.id.in_({t.app_id for t in tasks[:DIGEST_ITEMS] if t.app_id})))).scalars()}
+        base = await _base_url(session)
+    lines = [("状态", "待处理"), ("条数", f"{len(tasks)} 条")]
+    dues = [t.due_at for t in tasks if t.due_at is not None]
+    if dues:
+        lines.append(("最早时限", _local(min(dues, key=_utc))))
+    for task in tasks[:DIGEST_ITEMS]:
+        run = runs.get(task.run_id)
+        node = _label(run.graph if run else None, task.node_id) if task.node_id else task.title[:80]
+        where = f"应用「{names[task.app_id]}」" if task.app_id in names else (
+            f"工作流「{run.workflow_name}」" if run is not None and run.workflow_name else "")
+        tail = [where] if where else []
+        if task.due_at is not None:
+            tail.append(f"时限 {_local(task.due_at)}")
+        lines.append(("待办", f"「{node}」" + (f"（{'，'.join(tail)}）" if tail else "")))
+    if len(tasks) > DIGEST_ITEMS:
+        lines.append(("另有", f"{len(tasks) - DIGEST_ITEMS} 条，见待办箱"))
+    message = {"event": event, "status": "pending", "title": f"你有 {len(tasks)} 条待办",
+               "lines": lines, "links": [("去待办箱", f"{base}/apps?tab=inbox")] if base else [],
+               "subject": {"user_id": user_id, "tasks": len(tasks)}}
+    return await _push(channels, message, subject_kind="digest", subject_id=user_id, event=event, run_id=None,
+                       task_id=None)
+
+
+async def notify_key_expiring(key_id: str, days: int) -> int:
+    """访问密钥快到期了（key.expiring，到期前 7 天、1 天各一次，由 notify/digest 判断时候到没到、记审计）。
+
+    个人访问密钥推给拥有者自己订阅了这件事的个人渠道；服务账号的密钥推给订阅了它的全局渠道（服务账号不能登录，没有个人
+    渠道）。消息只有密钥名、开头一截、到期时间和去轮换的链接，不放密钥本身。返回推了几个渠道。"""
+    from app.db.models_identity import AccessKey
+
+    event = "key.expiring"
+    async with SessionLocal() as session:
+        key = await session.get(AccessKey, key_id)
+        if key is None:
+            return 0
+        owner = await session.get(User, key.owner_user_id)
+        if owner is None:
+            return 0
+        service = owner.kind == "service"
+        found = await _channels(session, event, None, [] if service else [owner.username])
+        channels = [c for c in found if (c.scope == "global" if service else c.scope == "user" and c.owner_id == owner.id)]
+        if not channels:
+            return 0
+        base = await _base_url(session)
+    left = "1 天内" if days <= 1 else f"{days} 天后"
+    lines = [("状态", "快到期"), ("密钥", f"「{key.name[:80]}」（{key.prefix}…）"),
+             ("拥有者", f"服务账号 {owner.username}" if service else (owner.display_name or owner.username)),
+             ("到期", _local(key.expires_at))]
+    message = {"event": event, "status": "expiring", "title": f"访问密钥「{key.name[:80]}」将在{left}到期",
+               "lines": lines, "links": [("去轮换", f"{base}/settings/keys")] if base else [],
+               "subject": {"key_id": key_id, "days": days}}
+    return await _push(channels, message, subject_kind="access_key", subject_id=key_id, event=event, run_id=None,
+                       task_id=None)

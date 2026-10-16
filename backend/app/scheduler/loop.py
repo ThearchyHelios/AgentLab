@@ -123,14 +123,17 @@ async def tick(now: datetime | None = None) -> None:
 async def process_due(now: datetime | None = None) -> None:
     """流程的一拍（app/process）：待办的提醒、升级、超时驳回（永不自动批准）；结果未知的写入按退避去查；
     上传了却一直没提交的文件过了时限清掉（app/files，每小时一次）；访问密钥的请求记录批量写库、过了保留期的清掉
-    （auth/keys.py，每小时清一次：每个请求同步写一行会和运行抢 SQLite 的写锁，所以攒到这一拍写）。
+    （auth/keys.py，每小时清一次：每个请求同步写一行会和运行抢 SQLite 的写锁，所以攒到这一拍写）；每天到点发待办汇总、
+    访问密钥到期前 7 天和 1 天各提醒一次（notify/digest.py，04 细案 B3：按日期认领、按审计去重，推送放在后台，不拖这一拍）。
     各自出错只记日志：这一拍出错不该让调度循环停下，下一拍照常再查。"""
     from app.auth import keys
     from app.files import store as files_store
+    from app.notify import digest
     from app.process import actions, tasks
 
     for name, step in (("待办的时限处理", tasks.tick), ("写入结果的查询", actions.tick),
-                       ("没有提交的上传文件清理", files_store.cleanup_tick), ("访问密钥的请求记录", keys.tick)):
+                       ("没有提交的上传文件清理", files_store.cleanup_tick), ("访问密钥的请求记录", keys.tick),
+                       ("每天的待办汇总", digest.digest_due), ("访问密钥快到期的提醒", digest.keys_due)):
         try:
             done = await step(now)
             if isinstance(done, list) and done:

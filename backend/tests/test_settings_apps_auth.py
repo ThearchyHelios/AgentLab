@@ -33,16 +33,17 @@ async def clean():
 async def test_daily_limit_is_a_registered_setting_with_default_200():
     async with auth_env.client() as c:
         body = (await c.get("/api/settings")).json()
-        assert body[APPS_GROUP] == {"on_demand_daily_limit": 200, "user_personal_apps": False}
+        assert body[APPS_GROUP] == {"on_demand_daily_limit": 200, "user_personal_apps": False, "share_links": False}
         put = await c.put("/api/settings", json={"values": {APPS_GROUP: {"on_demand_daily_limit": 30}}})
         assert put.status_code == 200, put.text
-        assert put.json()[APPS_GROUP] == {"on_demand_daily_limit": 30, "user_personal_apps": False}
+        assert put.json()[APPS_GROUP] == {"on_demand_daily_limit": 30, "user_personal_apps": False, "share_links": False}
         assert (await c.get("/api/settings")).json()[APPS_GROUP] == {"on_demand_daily_limit": 30,
-                                                                    "user_personal_apps": False}
+                                                                    "user_personal_apps": False, "share_links": False}
     async with SessionLocal() as session:
-        assert await apps_settings(session) == {"on_demand_daily_limit": 30, "user_personal_apps": False}
-    assert apps_values({"on_demand_daily_limit": "坏的", "user_personal_apps": "开"}) == {
-        "on_demand_daily_limit": 200, "user_personal_apps": False}, "存坏了的按默认"
+        assert await apps_settings(session) == {"on_demand_daily_limit": 30, "user_personal_apps": False,
+                                                "share_links": False}
+    assert apps_values({"on_demand_daily_limit": "坏的", "user_personal_apps": "开", "share_links": 1}) == {
+        "on_demand_daily_limit": 200, "user_personal_apps": False, "share_links": False}, "存坏了的按默认"
 
 
 @pytest.mark.parametrize("value, fragment", [
@@ -81,7 +82,7 @@ async def test_auth_settings_are_not_read_or_written_here():
     await auth_env.make_user("bob", "builder")
     bob = await auth_env.login("bob")
     assert (await bob.get("/api/settings")).json()[APPS_GROUP] == {"on_demand_daily_limit": 200,
-                                                                    "user_personal_apps": False}
+                                                                    "user_personal_apps": False, "share_links": False}
     assert (await bob.put("/api/settings", json={"values": {APPS_GROUP: {"on_demand_daily_limit": 1}}})
             ).status_code == 403, "设置页的应用一组只有管理员能改"
     assert (await bob.put("/api/settings", json={"values": {APPS_GROUP: {"user_personal_apps": True}}})

@@ -30,8 +30,11 @@ from app.notify import service
 TERMS_TS = Path(__file__).resolve().parents[2] / "frontend" / "src" / "lib" / "terms.ts"
 URL = "https://hooks.example.com/agentlab/notify-events-5d1c"
 
-#: 本轮登记的六个（总方案 X6）：都还没有推送
+#: 本轮登记的六个（总方案 X6）
 THIS_ROUND = ("source.changed", "ledger.recall", "eval.regressed", "eval.failed", "task.digest", "key.expiring")
+#: 其中已经实现了推送、打开了订阅的（推给哪几条路）：每天的待办汇总只推个人渠道；访问密钥快到期，个人密钥推本人、服务账号的
+#: 推全局渠道（第 3 波 W3-d，notify/digest.py）
+PUSHED_THIS_ROUND = {"task.digest": {"user"}, "key.expiring": {"global", "user"}}
 
 
 @pytest.fixture
@@ -54,7 +57,10 @@ def test_this_rounds_events_are_registered_once_and_not_pushed_yet():
     for name in THIS_ROUND:
         assert name in service.EVENTS, f"{name} 没有登记"
         assert service.EVENTS[name].label, name
-        assert service.EVENTS[name].scopes == (), f"{name} 还没有推送：不该有人订阅得到"
+        if name in PUSHED_THIS_ROUND:
+            assert set(service.EVENTS[name].scopes) == PUSHED_THIS_ROUND[name], name
+        else:
+            assert service.EVENTS[name].scopes == (), f"{name} 还没有推送：不该有人订阅得到"
     assert len({e.label for e in service.EVENTS.values()}) == len(service.EVENTS), "两个事件叫成了同一句"
     assert service.EVENT_LABEL == {k: v.label for k, v in service.EVENTS.items()}
 
@@ -66,6 +72,7 @@ def test_events_that_are_pushed_today_keep_their_audience():
         "task.opened": every, "run.finished": every, "run.failed": every, "action.unknown": every,
         # 发给提交人自己（和订阅了它的全局渠道），不归哪个应用
         "review.done": {"global", "user"},
+        **PUSHED_THIS_ROUND,
     }
     for event in service.EVENTS.values():
         assert set(event.scopes) <= every

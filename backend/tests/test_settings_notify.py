@@ -1,4 +1,5 @@
-"""通知设置（api/settings.py 的 notify 一组）：定时任务的 Webhook 里拼运行链接用的对外访问地址。
+"""通知设置（api/settings.py 的 notify 一组）：定时任务的 Webhook 里拼运行链接用的对外访问地址，和每天的待办汇总几点发
+（digest_at，缺省 09:00，04 细案 B3）。
 
 - 默认没填（null），通知里就不附运行链接
 - 只收 http(s) 开头的完整地址；末尾的 / 去掉、首尾空白去掉，空串当没填；带 ? 或 # 的拒收
@@ -31,9 +32,9 @@ def client() -> AsyncClient:
 async def test_default_is_no_link():
     async with client() as c:
         body = (await c.get("/api/settings")).json()
-    assert body["notify"] == {"public_base_url": None}
+    assert body["notify"] == {"public_base_url": None, "digest_at": "09:00"}
     async with SessionLocal() as session:
-        assert await notify_settings(session) == {"public_base_url": None}
+        assert await notify_settings(session) == {"public_base_url": None, "digest_at": "09:00"}
 
 
 @pytest.mark.parametrize("given, stored", [
@@ -47,10 +48,10 @@ async def test_saved_and_normalized(given, stored):
     async with client() as c:
         put = await c.put("/api/settings", json={"values": {NOTIFY_GROUP: {"public_base_url": given}}})
         assert put.status_code == 200, put.text
-        assert put.json()["notify"] == {"public_base_url": stored}
-        assert (await c.get("/api/settings")).json()["notify"] == {"public_base_url": stored}
+        assert put.json()["notify"] == {"public_base_url": stored, "digest_at": "09:00"}
+        assert (await c.get("/api/settings")).json()["notify"] == {"public_base_url": stored, "digest_at": "09:00"}
     async with SessionLocal() as session:
-        assert await notify_settings(session) == {"public_base_url": stored}
+        assert await notify_settings(session) == {"public_base_url": stored, "digest_at": "09:00"}
 
 
 @pytest.mark.parametrize("value, fragment", [
@@ -73,5 +74,27 @@ async def test_invalid_values_are_refused_in_chinese(value, fragment):
 
 
 def test_broken_stored_value_reads_as_unset():
-    assert notify_values({"public_base_url": "不是地址"}) == {"public_base_url": None}
-    assert notify_values("坏掉的") == {"public_base_url": None}
+    assert notify_values({"public_base_url": "不是地址", "digest_at": "25:00"}) == {"public_base_url": None,
+                                                                                    "digest_at": "09:00"}
+    assert notify_values("坏掉的") == {"public_base_url": None, "digest_at": "09:00"}
+
+
+@pytest.mark.parametrize("given, ok", [("08:30", True), ("23:59", True), ("00:00", True), ("24:00", False),
+                                        ("9:00", False), ("09:60", False), (900, False), ("", False)])
+async def test_digest_time_is_hh_mm(given, ok):
+    async with client() as c:
+        put = await c.put("/api/settings", json={"values": {NOTIFY_GROUP: {"digest_at": given}}})
+        if ok:
+            assert put.status_code == 200, put.text
+            assert put.json()["notify"]["digest_at"] == given
+        else:
+            assert put.status_code == 422
+            assert "待办汇总的发送时间" in put.json()["detail"]
+
+
+async def test_changing_digest_time_keeps_the_public_address():
+    """只给汇总时间的一组：对外访问地址不被冲成没填（设置页的通知分别保存这两项）。"""
+    async with client() as c:
+        await c.put("/api/settings", json={"values": {NOTIFY_GROUP: {"public_base_url": "https://agentlab.example.com"}}})
+        put = await c.put("/api/settings", json={"values": {NOTIFY_GROUP: {"digest_at": "17:45"}}})
+        assert put.json()["notify"] == {"public_base_url": "https://agentlab.example.com", "digest_at": "17:45"}
