@@ -244,7 +244,7 @@ def _expectation(raw: Any, i: int, *, gold_kind: str | None, taken: set[str]) ->
                 if not isinstance(cond, Mapping) or not cond or not all(
                         isinstance(k, str) and k.strip() and isinstance(v, (str, int, float)) and not isinstance(v, bool)
                         for k, v in cond.items()):
-                    raise CaseInvalid(f"{where}的 where 需要是「列名：取值」的对象，例如 {{\"地区\": \"华南\"}}",
+                    raise CaseInvalid(f"{where}的 where 需要是「列名：取值」的对象，例如「地区：华南」，取值只能是文字或数字",
                                       f"{path}.where")
                 if "row" in raw:
                     raise CaseInvalid(f"{where}按 where 找行时不写 row", f"{path}.row")

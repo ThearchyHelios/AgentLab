@@ -75,7 +75,7 @@ CANCEL_GRACE_S = 15.0
 QUERY_NODE = "gold_q"
 
 #: 口径升版的三种处置（评测里的说法；节点上的 upgrade_policy 叫法见 engine/labels）
-UPGRADE_LABEL = {"recompute": "改钉新版本（历史在这里断开）", "dual": "新旧两版各算一份期望",
+UPGRADE_LABEL = {"recompute": "改为固定新版本（历史在这里断开）", "dual": "新旧两版各算一份期望",
                  "incomparable": "旧题归档，按新版本另建新题"}
 
 
@@ -319,13 +319,13 @@ def _sql_value(exp: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dict[str,
             if not hits:
                 raise _NoValue(f"期望 SQL 的结果里没有 {cond} 的行" + ("（结果被截断，只取回了前几行）" if truncated else ""))
             if len(hits) > 1:
-                raise _NoValue(f"期望 SQL 的结果里 {cond} 的行有 {len(hits)} 行，取不准是哪一行：请在 where 里多写一列")
+                raise _NoValue(f"期望 SQL 的结果里 {cond} 的行有 {len(hits)} 行，无法确定是哪一行：请在 where 里多写一列")
             ri = hits[0]
         else:
             ri = int(exp.get("row") or 0)
             if ri >= len(rows):
-                raise _NoValue("期望 SQL 没有返回行，取不到值：期望没有数据的题请把期望写成「没有数据」" if not rows else
-                               f"期望 SQL 只返回了 {len(rows)} 行，取不到第 {ri + 1} 行")
+                raise _NoValue("期望 SQL 没有返回行，没有可用的值：期望没有数据的题请把期望写成「没有数据」" if not rows else
+                               f"期望 SQL 只返回了 {len(rows)} 行，没有第 {ri + 1} 行")
         value = rows[ri][ci] if ci < len(rows[ri]) else None
         if value is None:
             raise _NoValue(f"期望的那一格（第 {ri + 1} 行「{columns[ci]}」）是空值：期望没有数据的题请把期望写成「没有数据」")
@@ -487,7 +487,7 @@ async def upgrade_state(session: AsyncSession, gold: Mapping[str, Any], pinned: 
     if errors:
         message = f"口径已升版到 v{latest}，待处置"
     elif retired:
-        message = f"钉住的「{pinned.workflow_name}」v{pinned.version} 已退役，待处置"
+        message = f"固定的「{pinned.workflow_name}」v{pinned.version} 已退役，待处置"
     versions: tuple[int, ...] = (pinned.version,)
     if policy == "dual" and upgrade and int(upgrade.get("to_version") or 0) > pinned.version:
         versions = (pinned.version, int(upgrade["to_version"]))
@@ -681,15 +681,15 @@ async def plan_dispose(session: AsyncSession, case: Mapping[str, Any], policy: s
     try:
         pinned = await derive.load_pinned(session, gold["workflow_id"], gold["version"], gold["node_id"])
     except derive.NotDerivable as e:
-        raise DisposeRefused(f"钉住的口径读不出来：{e.message}", CALIBER_NOT_REUSABLE) from e
+        raise DisposeRefused(f"固定的口径版本无法读取：{e.message}", CALIBER_NOT_REUSABLE) from e
     state = await upgrade_state(session, gold, pinned)
     if not state.pending or state.latest is None or state.latest <= pinned.version:
-        raise DisposeRefused("这道题钉的口径没有待处置的新版本" if not state.pending else
-                             f"{state.message}：已经没有更新的已发布版本可以改钉，只能另建新题或删除这道题",
+        raise DisposeRefused("这道题固定的口径没有待处置的新版本" if not state.pending else
+                             f"{state.message}：已经没有更新的已发布版本可以改为固定，只能另建新题或删除这道题",
                              DISPOSE_NOTHING)
     latest = state.latest
     if policy == "dual" and state.retired:
-        raise DisposeRefused(f"钉住的 v{pinned.version} 已退役，不能新旧两版并算：请改钉新版本或另建新题", DISPOSE_INVALID)
+        raise DisposeRefused(f"固定的 v{pinned.version} 已退役，不能新旧两版并算：请改为固定新版本或另建新题", DISPOSE_INVALID)
     try:
         newer = await derive.load_pinned(session, gold["workflow_id"], latest, gold["node_id"])
     except derive.NotDerivable as e:
