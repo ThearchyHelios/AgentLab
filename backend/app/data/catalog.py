@@ -1827,7 +1827,7 @@ async def resolve_draft_model(session: AsyncSession) -> tuple[Any, str]:
     起草出来的目录会被当成真的写进库里。
     """
     from app.data.draft_model import DraftModelUnavailable, draft_unavailable, resolve_draft_provider
-    from app.providers.factory import ModelSpec, ProviderNotConfigured, build_chat_model
+    from app.providers.factory import ProviderNotConfigured
 
     try:
         provider, choice = await resolve_draft_provider(
@@ -1835,13 +1835,22 @@ async def resolve_draft_model(session: AsyncSession) -> tuple[Any, str]:
             mock_reason="当前只有演示用的模型接入，无法用于起草数据目录。请到「设置 → 模型接入」添加真实的模型接入")
     except DraftModelUnavailable as e:
         raise CatalogModelUnavailable(str(e)) from e
-    spec = ModelSpec(provider=choice.provider, model=choice.model, max_tokens=MODEL_MAX_TOKENS, temperature=0,
-                     timeout=MODEL_TIMEOUT_S, max_retries=0)
     try:
-        big = build_chat_model(provider, spec)
-        small = build_chat_model(provider, spec.model_copy(update={"max_tokens": MODEL_FALLBACK_MAX_TOKENS}))
+        return build_draft_model(provider, choice.provider, choice.model)
     except ProviderNotConfigured as e:
         raise CatalogModelUnavailable(draft_unavailable(e, choice.origin)) from e
+
+
+def build_draft_model(provider: Any, provider_name: str | None, model: str | None) -> tuple[DraftModel, str]:
+    """按起草的规矩建模型对象（温度 0、额度 MODEL_MAX_TOKENS、服务方嫌大时退回 MODEL_FALLBACK_MAX_TOKENS、时限
+    MODEL_TIMEOUT_S、SDK 不重试，见 resolve_draft_model）：(模型, 模型 id)。接入由调用方解析好；缺 key 之类抛
+    ProviderNotConfigured，说法由调用方定。评测的影子起草指定起草模型时也走这里（app/eval/snapshots.py）。"""
+    from app.providers.factory import ModelSpec, build_chat_model
+
+    spec = ModelSpec(provider=provider_name, model=model, max_tokens=MODEL_MAX_TOKENS, temperature=0,
+                     timeout=MODEL_TIMEOUT_S, max_retries=0)
+    big = build_chat_model(provider, spec)
+    small = build_chat_model(provider, spec.model_copy(update={"max_tokens": MODEL_FALLBACK_MAX_TOKENS}))
     model_id = spec.model or provider.default_model or ""
     return DraftModel(big, small, model_id), model_id
 
@@ -2081,6 +2090,23 @@ def missing_table_error(name: str) -> str:
 WRITE_CONFLICT_ERROR = "这张表的数据目录正被其他人修改，请稍后再起草"
 
 
+def merge_draft(existing: Mapping[str, Any] | None, source: Any, table: str, modeled: Any = None, *,
+                at: str) -> tuple[dict[str, Any], MergeStats]:
+    """一张表的起草并入一份目录（纯函数，不读写库）：数据库注释、外键约束、命名推断照做，modeled（catalog_draft.
+    ModelOutcome，没用模型时为 None）有可用内容的再并上，规则见 merge_notes（模型各段都写出来或只写出一部分时按完整覆盖
+    删掉说已经不存在的列的那些项）。write_draft 写库之前、评测的影子起草写进内存里的目录副本（app/eval/snapshots.py）
+    都用它，并入的规矩只有这一份。"""
+    structure = draft_structure(source, table)
+    meta = ((getattr(source, "schema_cache", None) or {}).get("tables") or {}).get(table) or {}
+    columns = [str(c["name"]) for c in meta.get("columns") or [] if isinstance(c, dict) and c.get("name") is not None]
+    merged, stats = merge_notes(existing or {}, structure.notes, covered=structure.covered, at=at, columns=columns)
+    if modeled is not None and modeled.items:
+        covered = frozenset({"llm"}) if modeled.status in ("ok", "partial") else frozenset()
+        merged, more = merge_notes(merged, modeled.notes, covered=covered, at=at, columns=columns)
+        stats += more
+    return merged, stats
+
+
 async def write_draft(session: AsyncSession, source: Any, table: str, modeled: Any = None, *, at: str,
                       actor: str | None) -> TableDraftResult:
     """一张表的起草并入目录并写入：数据库注释、外键约束、命名推断照做，modeled（catalog_draft.ModelOutcome，
@@ -2096,26 +2122,16 @@ async def write_draft(session: AsyncSession, source: Any, table: str, modeled: A
     - 写入撞上别人刚改过（乐观锁）就重读重并，最多三次。
     """
     result = TableDraftResult(table=table)
-    structure = draft_structure(source, table)
-    meta = ((getattr(source, "schema_cache", None) or {}).get("tables") or {}).get(table) or {}
-    columns = [str(c["name"]) for c in meta.get("columns") or [] if isinstance(c, dict) and c.get("name") is not None]
-    model_draft: TableDraft | None = None
     if modeled is not None:
         result.parts_total = modeled.parts_total
         result.model_error = modeled.error
         if modeled.items:
             result.model_items = modeled.items
             result.blank = list(getattr(modeled, "blank", None) or [])
-            model_draft = TableDraft(notes=modeled.notes, covered=frozenset({"llm"})
-                                     if modeled.status in ("ok", "partial") else frozenset())
     for _attempt in range(3):
         entry = await read_entry(session, source.id, table)
         version = entry.version if entry else 0
-        merged, stats = merge_notes(entry.notes if entry else {}, structure.notes, covered=structure.covered, at=at,
-                                    columns=columns)
-        if model_draft is not None:
-            merged, more = merge_notes(merged, model_draft.notes, covered=model_draft.covered, at=at, columns=columns)
-            stats += more
+        merged, stats = merge_draft(entry.notes if entry else {}, source, table, modeled, at=at)
         result.added, result.updated, result.removed = stats.added, stats.updated, stats.removed
         result.version = version
         if entry is None and not merged:

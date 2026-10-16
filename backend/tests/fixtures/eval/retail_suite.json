@@ -1,0 +1,172 @@
+{
+  "format": "agentlab-eval-suite",
+  "version": 1,
+  "exported_at": "2026-10-16T00:00:00+00:00",
+  "suite": {
+    "name": "零售样例题集",
+    "description": "配 tests/fixtures/acceptance/retail.py 的虚构零售库（数据源名 retail_demo）：支付日归属、退款、取消、华南高于华东几个口径陷阱，一道期望答「没有数据」的题，一道问法含糊、期望反问的题。用于演示、验收和真实模型回归；店名、金额都是虚构的",
+    "timezone": "Asia/Shanghai",
+    "budget": {}
+  },
+  "cases": [
+    {
+      "seq": 1,
+      "kind": "ask",
+      "question": "上周（{{ schedule.last_week_start }} 至 {{ schedule.last_week_end }}）的销售额是多少？",
+      "datasources": [
+        "retail_demo"
+      ],
+      "tags": [
+        "口径陷阱",
+        "支付日归属",
+        "相对日期"
+      ],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_demo",
+        "sql": "SELECT ROUND(SUM(amount), 2) AS 销售额 FROM orders WHERE status = 'paid' AND paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}'"
+      },
+      "expectations": [
+        {
+          "id": "sales",
+          "kind": "scalar",
+          "column": "销售额",
+          "label": "上周销售额（按支付日归属、不含退款和取消）"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 2,
+      "kind": "ask",
+      "question": "上周（{{ schedule.last_week_start }} 至 {{ schedule.last_week_end }}）有多少单退款？退款金额是多少？",
+      "datasources": [
+        "retail_demo"
+      ],
+      "tags": [
+        "口径陷阱",
+        "退款"
+      ],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_demo",
+        "sql": "SELECT COUNT(*) AS 退款单数, ROUND(SUM(amount), 2) AS 退款金额 FROM orders WHERE status = 'refunded' AND paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}'"
+      },
+      "expectations": [
+        {
+          "id": "refund_orders",
+          "kind": "scalar",
+          "column": "退款单数",
+          "label": "上周退款单数"
+        },
+        {
+          "id": "refund_amount",
+          "kind": "scalar",
+          "column": "退款金额",
+          "label": "上周退款金额"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 3,
+      "kind": "ask",
+      "question": "上周（{{ schedule.last_week_start }} 至 {{ schedule.last_week_end }}）下单后取消的订单有多少单？",
+      "datasources": [
+        "retail_demo"
+      ],
+      "tags": [
+        "口径陷阱",
+        "取消"
+      ],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_demo",
+        "sql": "SELECT COUNT(*) AS 取消单数 FROM orders WHERE status = 'cancelled' AND order_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}'"
+      },
+      "expectations": [
+        {
+          "id": "cancelled",
+          "kind": "scalar",
+          "column": "取消单数",
+          "label": "上周取消的订单数（按下单日）"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 4,
+      "kind": "ask",
+      "question": "上周（{{ schedule.last_week_start }} 至 {{ schedule.last_week_end }}）华南和华东的销售额各是多少？哪个地区更高？",
+      "datasources": [
+        "retail_demo"
+      ],
+      "tags": [
+        "口径陷阱",
+        "地区对比"
+      ],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_demo",
+        "sql": "SELECT s.region AS 地区, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN stores s ON s.id = o.store_id WHERE o.status = 'paid' AND o.paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}' AND s.region IN ('华南', '华东') GROUP BY s.region ORDER BY 销售额 DESC"
+      },
+      "expectations": [
+        {
+          "id": "by_region",
+          "kind": "table",
+          "keys": [
+            "地区"
+          ],
+          "ordered": true,
+          "label": "华南、华东上周的销售额，按销售额从高到低"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 5,
+      "kind": "ask",
+      "question": "上周（{{ schedule.last_week_start }} 至 {{ schedule.last_week_end }}）华中区的销售额是多少？",
+      "datasources": [
+        "retail_demo"
+      ],
+      "tags": [
+        "拒答",
+        "没有数据"
+      ],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_demo",
+        "sql": "SELECT s.region AS 地区, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN stores s ON s.id = o.store_id WHERE s.region = '华中' AND o.status = 'paid' AND o.paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}' GROUP BY s.region"
+      },
+      "expectations": [
+        {
+          "id": "no_data",
+          "kind": "none",
+          "label": "没有华中区的门店，应答「没有数据」，不给数"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 6,
+      "kind": "ask",
+      "question": "最近卖得怎么样？",
+      "datasources": [
+        "retail_demo"
+      ],
+      "tags": [
+        "问法含糊"
+      ],
+      "gold": null,
+      "expectations": [
+        {
+          "id": "clarify",
+          "kind": "ask",
+          "label": "问法含糊（哪段时间、哪个指标都没说），应先反问"
+        }
+      ],
+      "enabled": true
+    }
+  ]
+}

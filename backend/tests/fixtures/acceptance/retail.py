@@ -13,6 +13,9 @@
 
 customers.phone 是手机号，验收时把它设成遮罩列，检验质询、证据面板、可验证报告不露原值。append_day 给定时任务
 验收用：两次触发之间往「昨天」追加几单，制造「只数据变」。
+
+评测的零售样例题集（tests/fixtures/eval/retail_suite.json）按数据源名 SOURCE_NAME 对上这个库：生成之后登记成这个名字的
+只读数据源，再导入题集（POST /api/evals/suites/import），题目的期望都按这个库算。
 """
 from __future__ import annotations
 
@@ -24,6 +27,8 @@ from pathlib import Path
 
 DAYS = 60
 SEED = 20261006
+#: 零售样例题集里写的数据源名
+SOURCE_NAME = "retail_demo"
 
 #: (门店 id, 店名, 地区, 城市)：华南门店多、客单价高，华东次之
 STORES = [
