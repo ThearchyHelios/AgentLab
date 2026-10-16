@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import clsx from 'clsx'
 import { Link } from 'react-router-dom'
 import { Scale } from 'lucide-react'
 import { ApiError, api } from '../api/client'
@@ -9,8 +10,8 @@ import { LEDGER_UI } from '../lib/termsLedger'
 import { useAtLeast } from '../store/auth'
 import { useLedger } from '../store/ledger'
 import type {
-  LedgerField, LedgerPairOptions, LedgerReconcileAction, LedgerReconcileIn, LedgerReconciled, LedgerReconcileGroup,
-  LedgerRelated, RunLedger,
+  LedgerFeedback, LedgerFeedbackVerdict, LedgerField, LedgerPairOptions, LedgerReconcileAction, LedgerReconcileIn, LedgerReconciled,
+  LedgerReconcileGroup, LedgerRelated, RunLedger,
 } from '../typesLedger'
 import { BindingList, DiffList, caliberOf } from './LedgerStep'
 
@@ -26,6 +27,8 @@ import { BindingList, DiffList, caliberOf } from './LedgerStep'
  * - 结果（ReconcileResults）：每一组对照写按你的问法、按口径、差值（另附相对差），每个数按
  *   /runs/{对账运行}/evidence/metrics/{对账卡}/{指标} 取值，点一下打开它的出处链（apps/EvidenceDrawer，和应用页点数同一套）。
  *   哪几个指标是一组由服务端给（reconciled.groups），这里不按命名规则拼。
+ * - 反馈（FeedbackRow）：对账跑完之后问一句「差在哪」的说明有没有帮人看懂——「说明有用 / 看不懂」，记成对账运行上的封存后
+ *   事件（服务端 ledger/feedback），统计 E2 数它。同一个人改主意只算最后一次；看的人选过哪个、各几个人都由服务端给。
  */
 
 const NEEDS_PAIRS = 'ledger_reconcile_needs_pairs'
@@ -229,7 +232,55 @@ function GroupRow({ runId, card, group, onOpen }: {
   )
 }
 
-function ReconcileCard({ item, data, original }: { item: LedgerReconciled; data?: RunLedger; original?: string }) {
+/**
+ * 「差在哪」的说明有没有帮人看懂：说明有用 / 看不懂。按下的那个是看的人最后一次给的（服务端的 mine），可以改；回来的是这次
+ * 对账现在的反馈，账本再取一次（别处挂着的同一张卡跟着变）
+ */
+function FeedbackRow({ runId, item, readOnly }: { runId: string; item: LedgerReconciled; readOnly: boolean }) {
+  const refresh = useLedger((s) => s.refresh)
+  const [fb, setFb] = useState<LedgerFeedback | undefined>(item.feedback)
+  const [busy, setBusy] = useState<LedgerFeedbackVerdict | null>(null)
+  useEffect(() => { setFb(item.feedback) }, [item.feedback])
+  const F = LEDGER_UI.result.feedback
+  const give = async (verdict: LedgerFeedbackVerdict) => {
+    setBusy(verdict)
+    try {
+      const out = await api.caliberLedger.feedback(runId, item.run_id, verdict)
+      setFb(out.feedback)
+      toast.ok(F.saved)
+      refresh(runId)
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setBusy(null)
+    }
+  }
+  const counts = fb ? F.counts(fb.useful, fb.unclear) : ''
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-2xs" data-ledger-feedback={fb?.mine ?? ''}>
+      <span className="text-dim">{F.ask}</span>
+      {(['useful', 'unclear'] as const).map((v) => (
+        <button key={v} type="button" className={clsx('btn btn-xs', fb?.mine === v ? 'btn-primary' : 'btn-ghost')}
+                aria-pressed={fb?.mine === v} disabled={readOnly || busy != null}
+                title={readOnly ? F.readOnly : undefined} onClick={() => void give(v)} data-ledger-feedback-give={v}>
+          {busy === v ? <Spinner size={11} /> : null}{F[v]}
+        </button>
+      ))}
+      {fb?.mine && <span className="text-faint" data-ledger-feedback-mine="">{F.mine(fb.mine)}</span>}
+      {counts && <span className="text-faint" data-ledger-feedback-counts="">{counts}</span>}
+    </div>
+  )
+}
+
+/** 这张对账卡对照的那份相关口径「差在哪」（问数据的轮次里卡片上方没有这一段，反馈要有说的是什么） */
+function whereOf(data: RunLedger | undefined, item: LedgerReconciled): LedgerRelated | undefined {
+  return (data?.queries ?? []).find((q) => q.artifact === item.query)?.candidates
+    .find((c) => c.caliber === item.caliber && c.status === 'related')
+}
+
+function ReconcileCard({ runId, item, data, original, readOnly, showWhere }: {
+  runId: string; item: LedgerReconciled; data?: RunLedger; original?: string; readOnly: boolean; showWhere: boolean
+}) {
   const builder = useAtLeast('builder')
   const [all, setAll] = useState(false)
   const [target, setTarget] = useState<EvidenceTarget | null>(null)
@@ -240,6 +291,7 @@ function ReconcileCard({ item, data, original }: { item: LedgerReconciled; data?
   const R = LEDGER_UI.result
   const state = item.status === 'succeeded' ? 'succeeded' : item.status === 'failed' ? 'failed'
     : item.status === 'cancelled' ? 'cancelled' : 'running'
+  const where = showWhere ? whereOf(data, item) : undefined
   return (
     <div className="mt-1.5 rounded border px-2 py-1.5" data-ledger-reconciled={item.run_id} data-ledger-reconciled-state={state}>
       <div className="flex flex-wrap items-center gap-1.5 text-2xs">
@@ -264,20 +316,33 @@ function ReconcileCard({ item, data, original }: { item: LedgerReconciled; data?
           {original && <p className="mt-1 text-2xs text-faint" data-ledger-original="">{R.original(original)}</p>}
         </>
       )}
+      {state === 'succeeded' && showWhere && where && (
+        <div className="mt-1 text-2xs" data-ledger-reconciled-where="">
+          <div className="text-faint">{LEDGER_UI.step.where}</div>
+          <DiffList related={where} />
+        </div>
+      )}
+      {state === 'succeeded' && <FeedbackRow runId={runId} item={item} readOnly={readOnly} />}
       <EvidenceDrawer target={target} onClose={() => setTarget(null)} />
     </div>
   )
 }
 
-/** 对过的账（新的在前）。original：从证据面板打开时，正文里这个数写的是什么 */
-export function ReconcileResults({ items, data, original }: {
-  runId: string; items: LedgerReconciled[]; data?: RunLedger; original?: string
+/**
+ * 对过的账（新的在前）。runId 是答案的运行（反馈记在它名下的对账上）；original：从证据面板打开时，正文里这个数写的是什么；
+ * showWhere：卡片上方没有「差在哪」时（问数据的轮次）卡里写一份，反馈问的就是它；readOnly：对话在回收站里，只看不反馈
+ */
+export function ReconcileResults({ runId, items, data, original, showWhere = false, readOnly = false }: {
+  runId: string; items: LedgerReconciled[]; data?: RunLedger; original?: string; showWhere?: boolean; readOnly?: boolean
 }) {
   const sorted = useMemo(() => items, [items])
   if (!sorted.length) return null
   return (
     <div data-ledger-reconciled-list="">
-      {sorted.map((item) => <ReconcileCard key={item.run_id} item={item} data={data} original={original} />)}
+      {sorted.map((item) => (
+        <ReconcileCard key={item.run_id} runId={runId} item={item} data={data} original={original} readOnly={readOnly}
+                       showWhere={showWhere} />
+      ))}
     </div>
   )
 }

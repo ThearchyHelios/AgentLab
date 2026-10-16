@@ -17,7 +17,7 @@
 // EVIDENCE_SHOTS=<目录> 时亮暗两套各截几张，供人眼复核。
 import { readFileSync } from 'node:fs'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
-import { ledgerOf } from './ledger-fixtures.mjs'
+import { RECALL, ledgerOf } from './ledger-fixtures.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const CHROME = process.env.CHROME_PATH
@@ -4205,6 +4205,40 @@ await section('ledger', '口径账本：来自口径的数字挂小标记（受�
   check('同一次运行只取一次账本（正文两份、面板开了几次都共用一份，比对过了不再轮询）', asked === 1, `${asked} 次`)
   check('没有运行时报错', r.errors.length === 0, r.errors.join(' | '))
   await r.ctx.close()
+})
+
+await section('ledger-recall', '口径账本：答案身上的召回标记写在「口径」一步里（已按 vN 核对，不影响；依据有变；有待办时链到待办）', async () => {
+  // 召回在原答案的运行上追加 ledger.recalled、ledger.basis_changed（封存后），账本接口的 recall 把它们交出来（02 做法 7）。
+  // 以前它们只在运行时间线里，证据面板、问数据的轮次都看不见。没比对的答案（state 不是 matched）照样可能被标依据有变
+  for (const [name, LED] of [['matched', { ...ledgerOf(fx.run_id), recall: RECALL }],
+    ['ineligible', { run_id: fx.run_id, state: 'ineligible', reason: '这种来源的运行不比对', note: '封存后比对，不在封存范围内',
+      recall: { checked: [], basis: RECALL.basis, tasks: [] } }]]) {
+    const r = await open('/ui-harness.html?evidence=1', { before: (page) => page.route(
+      (u) => new URL(u).pathname === `/api/runs/${fx.run_id}/ledger`, (route) => route.fulfill({ json: LED })) })
+    const p = r.page
+    const part = p.locator('[data-evidence-panel] [data-ev-ledger]')
+    await openSeg(p, 's6', '[data-ev-ledger]')
+    const marks = p.locator('[data-evidence-panel] [data-ledger-recall]')
+    await marks.waitFor({ timeout: 4000 }).catch(() => {})
+    const text = (await marks.innerText().catch(() => '')).replace(/\s+/g, ' ')
+    if (name === 'matched') {
+      check('比对过的答案：「口径」一步写「已按口径「周报口径」v3 核对，不影响」（核对过两次只写最近那一版）',
+        text.includes('已按口径「周报口径」v3 核对，不影响') && !text.includes('v2 核对') && await p.locator('[data-evidence-panel] [data-ledger-recall-checked]').count() === 1,
+        text)
+      check('……依据有变：目录那一类两次的项数相加，写按新目录新出现几条错误级问题', text.includes('依据的数据目录有变（3 项）')
+        && text.includes('按新目录检查新出现 1 条错误级问题'), text)
+      const link = p.locator('[data-evidence-panel] [data-ledger-recall-task="tk-recall-1"] a')
+      check('……看的人手上有说的是这个答案的召回待办：写数变了、链到待办', text.includes('口径升到 v2，这个答案用到的数变了')
+        && await link.getAttribute('href').catch(() => null) === '/apps/inbox/tk-recall-1', text)
+      check('……标记写在「口径」一步里，标签照旧', await part.getAttribute('data-ev-ledger').catch(() => null) === 'caliber')
+      if (SHOTS) await p.locator('[data-evidence-panel]').screenshot({ path: `${SHOTS}/ledger-recall.png` }).catch(() => {})
+    } else {
+      check('不比对的答案：没有标签，「口径」一步只写依据有变', await part.getAttribute('data-ev-ledger').catch(() => null) === 'recall'
+        && text.includes('依据的数据目录有变（3 项）') && !text.includes('核对，不影响'), text)
+    }
+    check(`没有运行时报错（${name}）`, r.errors.length === 0, r.errors.join(' | '))
+    await r.ctx.close()
+  }
 })
 
 check('没有运行时报错（组件预览）', harness.errors.length === 0, harness.errors.join(' | '))

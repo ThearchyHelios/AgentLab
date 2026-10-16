@@ -182,6 +182,44 @@ export interface LedgerReconciled {
   card?: string
   groups?: LedgerReconcileGroup[]
   created_at?: string | null
+  /** 「说明有用 / 看不懂」（服务端 ledger/feedback.feedback_of）：看的这个人最后一次给的、各几个人 */
+  feedback?: LedgerFeedback
+}
+
+export type LedgerFeedbackVerdict = 'useful' | 'unclear'
+
+/** 对账结果上的反馈：mine 是看的这个人最后一次给的（没给过为空），useful / unclear 是各几个人（每人只算最后一次） */
+export interface LedgerFeedback {
+  mine?: LedgerFeedbackVerdict | null
+  useful: number
+  unclear: number
+}
+
+/** POST /api/ledger/answers/{run}/reconcile/{对账运行}/feedback 的答复 */
+export interface LedgerFeedbackOut {
+  run_id: string
+  feedback: LedgerFeedback
+}
+
+/**
+ * 答案身上的召回标记（GET /runs/{id}/ledger 的 recall，服务端 ledger/recall.answer_marks；细案做法 7「依据有变」「已按 vN
+ * 核对，不影响」）。几种 state 都可能带：没比对过、不比对的答案照样可能被标依据有变。不放数、表名、取值
+ */
+export interface LedgerRecallMarks {
+  /** 口径升版后召回重算、数没变：在这个答案上记的「已按 vN 核对，不影响」 */
+  checked?: {
+    workflow_id?: string | null
+    workflow_name?: string | null
+    from_version?: number | null
+    to_version?: number | null
+    recall_run?: string | null
+    changed?: boolean
+    at?: string | null
+  }[]
+  /** 依据有变：kind 是 catalog（目录里影响数字的项被驳回或修改）/ structure（表结构）/ values（新码值）/ catalog_edit */
+  basis?: { kind?: string | null; items?: number; new_errors?: number; at?: string | null }[]
+  /** 看的这个人手上、说的是这个答案的 recall 待办（还没处理的） */
+  tasks?: { id: string; reason?: string; to_version?: number | null }[]
 }
 
 export interface LedgerCaliber {
@@ -220,6 +258,7 @@ export interface RunLedger {
   actions?: LedgerAction[]
   issued?: LedgerIssued[]
   reconciled?: LedgerReconciled[]
+  recall?: LedgerRecallMarks
 }
 
 /** 证据片段接口（GET /runs/{id}/evidence/segments/{seg}）的 ledger 键：这个片段的标签和比对的来历 */

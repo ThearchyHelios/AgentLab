@@ -113,6 +113,34 @@ export const LEDGER_UI = {
     less: '收起',
     original: (text: string) => `原答案里写的是 ${text}；对账时按同样的 SQL 重新取数，数据有变化时两者可能不同`,
     openRun: '打开对账运行',
+    /** 「差在哪」的说明有没有帮人看懂（统计 E2 数它，衡量差异说明写得好不好） */
+    feedback: {
+      ask: '「差在哪」的说明有帮助吗？',
+      useful: '说明有用',
+      unclear: '看不懂',
+      mine: (v: 'useful' | 'unclear') => `你选了「${v === 'useful' ? '说明有用' : '看不懂'}」，可以改`,
+      counts: (useful: number, unclear: number) => [useful ? `${formatNumber(useful)} 人觉得有用` : '',
+        unclear ? `${formatNumber(unclear)} 人看不懂` : ''].filter(Boolean).join(' · '),
+      saved: '已记下你的反馈',
+      readOnly: '对话在回收站中，恢复后才能反馈',
+    },
+  },
+
+  // ---- 答案身上的召回标记（问数据的轮次、证据面板「口径」一步） ----
+  recall: {
+    /** 口径升版后在同一份数据上重算过、数没变 */
+    checked: (caliber: string) => `已按口径${caliber} 核对，不影响`,
+    /** 依据有变：目录里影响数字的项被驳回或修改、出现新码值、处理变化时改了目录（目录类），表或列被删、类型变了（表结构） */
+    basis: (what: 'catalog' | 'structure' | 'other', items: number) =>
+      `${what === 'structure' ? '依据的表结构有变' : what === 'catalog' ? '依据的数据目录有变' : '答案的依据有变'}`
+      + `${items ? `（${formatNumber(items)} 项）` : ''}`,
+    newErrors: (n: number) => `按新目录检查新出现 ${formatNumber(n)} 条错误级问题`,
+    basisHint: '答案本身没有改：它依据的数据目录或表结构在答案之后有变化，请核对是否还能用',
+    /** 看的这个人手上说的是这个答案的 recall 待办：口径升版后数变了的、依据有变检查出新问题的 */
+    taskCaliber: (version: number | null | undefined) => `口径升到 ${version != null ? `v${version}` : '新版本'}，这个答案用到的数变了`,
+    taskBasis: '依据有变，按新目录检查出了新的问题',
+    taskOther: '有一条召回待办',
+    task: '去待办处理',
   },
 
   // ---- 问数据：轮次底部的摘要 ----

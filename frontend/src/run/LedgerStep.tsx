@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
-import { BookMarked, RotateCw, Scale } from 'lucide-react'
+import { BookMarked, CircleCheck, Inbox, RotateCw, Scale, TriangleAlert } from 'lucide-react'
 import { ApiError, api } from '../api/client'
 import { Spinner, StatusBadge, toast } from '../components/ui'
 import { errorMessage } from '../lib/errors'
@@ -9,7 +9,8 @@ import { LEDGER_UI, caliberName } from '../lib/termsLedger'
 import { useAtLeast } from '../store/auth'
 import { useLedger, useRunLedger, type LedgerSlot } from '../store/ledger'
 import type {
-  LedgerBinding, LedgerIssueAction, LedgerIssued, LedgerLabel, LedgerReconcileAction, LedgerRelated, RunLedger, SegmentLedger,
+  LedgerBinding, LedgerIssueAction, LedgerIssued, LedgerLabel, LedgerRecallMarks, LedgerReconcileAction, LedgerRelated, RunLedger,
+  SegmentLedger,
 } from '../typesLedger'
 import { ReconcileDialog, ReconcileResults } from './LedgerReconcile'
 
@@ -19,7 +20,9 @@ import { ReconcileDialog, ReconcileResults } from './LedgerReconcile'
  *   · 按口径正式出具；相关口径——差在哪 + 看差多少（口径对账：核对参数 → 发起 → 三个数各自点得开）；这次的推理——
  *   写「没有相关的已发布口径」；没比对的写原因。比对还没出结果时写「正在比对口径」，store/ledger 按退避轮询，
  *   等满了还没结论照实说、给「再取一次」；
- * - 按口径正式出具那一项（IssueControl）和出具过的正式运行（IssuedList）：问数据的轮次摘要用同一份。
+ * - 按口径正式出具那一项（IssueControl）和出具过的正式运行（IssuedList）：问数据的轮次摘要用同一份；
+ * - 答案身上的召回标记（RecallMarks）：「已按口径「X」vN 核对，不影响」、依据有变、说的是这个答案的召回待办（链到待办），
+ *   「口径」一步和问数据的轮次底部用同一份。
  *
  * 界面层不放逻辑：标签、能不能出具、能不能自动、不能的原因、要不要先核对参数都是服务端给的（GET /runs/{id}/ledger），
  * 这里只照着画。比对在封存之后做，脚注写明「封存后比对，不在封存范围内」，事后补比的另写按哪种口径回看。
@@ -90,6 +93,60 @@ export function LedgerWaiting({ slot, runId, compact = false }: { slot: LedgerSl
       <span className="flex items-center gap-1.5 text-dim"><Spinner size={11} /> {LEDGER_UI.step.pending}</span>
       {!compact && <span className="mt-0.5 block text-2xs text-faint">{LEDGER_UI.step.pendingSub}</span>}
     </div>
+  )
+}
+
+/** 依据有变的几种归成两类说：目录（目录里影响数字的项、新码值、处理变化时改了目录）和表结构；认不出的只说依据有变，不猜 */
+const BASIS_GROUP: Record<string, 'catalog' | 'structure'> = {
+  catalog: 'catalog', values: 'catalog', catalog_edit: 'catalog', structure: 'structure',
+}
+
+/** 有没有要画的召回标记 */
+export const hasRecallMarks = (recall: LedgerRecallMarks | undefined) =>
+  !!(recall?.checked?.some((c) => !c.changed) || recall?.basis?.length || recall?.tasks?.length)
+
+/**
+ * 答案身上的召回标记（细案做法 7）：「已按口径「X」v3 核对，不影响」、「依据的数据目录有变（2 项）」，看的这个人手上有说的
+ * 是这个答案的 recall 待办时链到待办。标记是服务端从这次运行上封存后追加的 ledger.recalled、ledger.basis_changed 读出来的
+ * （ledger/recall.answer_marks），这里只照着写；同一份口径核对过几次只写最近的那一版，依据有变按两类各写一行、项数相加
+ */
+export function RecallMarks({ recall }: { recall?: LedgerRecallMarks }) {
+  if (!hasRecallMarks(recall)) return null
+  const R = LEDGER_UI.recall
+  const checked = new Map<string, NonNullable<LedgerRecallMarks['checked']>[number]>()
+  for (const c of recall?.checked ?? []) if (!c.changed) checked.set(String(c.workflow_id ?? ''), c)
+  const basis = new Map<'catalog' | 'structure' | 'other', { items: number; errors: number }>()
+  for (const b of recall?.basis ?? []) {
+    const group = BASIS_GROUP[String(b.kind ?? '')] ?? 'other'
+    const cur = basis.get(group) ?? { items: 0, errors: 0 }
+    basis.set(group, { items: cur.items + (b.items ?? 0), errors: cur.errors + (b.new_errors ?? 0) })
+  }
+  const tasks = recall?.tasks ?? []
+  return (
+    <ul className="space-y-0.5 text-2xs" data-ledger-recall="">
+      {[...checked.values()].map((c) => (
+        <li key={`c-${c.workflow_id ?? ''}`} className="flex items-start gap-1.5 text-dim" data-ledger-recall-checked={c.to_version ?? ''}>
+          <CircleCheck size={11} className="mt-[2px] shrink-0 text-faint" aria-hidden />
+          <span>{R.checked(caliberName(c.workflow_name, c.to_version))}</span>
+        </li>
+      ))}
+      {[...basis.entries()].map(([group, b]) => (
+        <li key={`b-${group}`} className="flex items-start gap-1.5" data-ledger-recall-basis={group}>
+          <TriangleAlert size={11} className="mt-[2px] shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden />
+          <span title={R.basisHint}>
+            {R.basis(group, b.items)}
+            {b.errors > 0 && <span className="text-dim"> · {R.newErrors(b.errors)}</span>}
+          </span>
+        </li>
+      ))}
+      {tasks.map((t) => (
+        <li key={`t-${t.id}`} className="flex flex-wrap items-start gap-1.5" data-ledger-recall-task={t.id}>
+          <Inbox size={11} className="mt-[2px] shrink-0 text-faint" aria-hidden />
+          <span>{t.reason === 'caliber' ? R.taskCaliber(t.to_version) : t.reason === 'catalog' ? R.taskBasis : R.taskOther}</span>
+          <Link to={`/apps/inbox/${encodeURIComponent(t.id)}`} className="text-[var(--accent)] hover:underline">{R.task}</Link>
+        </li>
+      ))}
+    </ul>
   )
 }
 
@@ -251,8 +308,13 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
       return (
         <Section title={LEDGER_UI.step.title} data-ev-ledger="unreadable">
           <p className="text-dim">{LEDGER_UI.step.unreadable(data.reason ?? '')}</p>
+          <RecallMarks recall={data.recall} />
         </Section>
       )
+    }
+    // 没比对的答案照样可能被标依据有变：标记说的是整个答案，这一步只写它
+    if (data && hasRecallMarks(data.recall)) {
+      return <Section title={LEDGER_UI.step.title} data-ev-ledger="recall"><RecallMarks recall={data.recall} /></Section>
     }
     return null
   }
@@ -304,7 +366,7 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
                     <Scale size={11} aria-hidden /> {LEDGER_UI.reconcile.button}
                   </button>
                 ) : r.comparable === false ? <p className="mt-1 text-2xs text-faint">{r.reason || LEDGER_UI.step.notComparable}</p> : null}
-                {!!done.length && <ReconcileResults runId={runId} items={done} data={data} original={segText} />}
+                {!!done.length && <ReconcileResults runId={runId} items={done} data={data} original={segText} readOnly={readOnly} />}
               </div>
             )
           })}
@@ -316,6 +378,7 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
       {label.kind === 'unknown' && (
         <p className="text-dim" data-ledger-unknown="">{LEDGER_TEXT.kind.unknown}{label.reason ? `：${label.reason}` : ''}</p>
       )}
+      {hasRecallMarks(data?.recall) && <div className="mt-1.5"><RecallMarks recall={data?.recall} /></div>}
       {data && <LedgerFootnote data={data} />}
       {dialog && data && (
         <ReconcileDialog runId={runId} action={dialog.action} related={dialog.related} onClose={() => setDialog(null)} />

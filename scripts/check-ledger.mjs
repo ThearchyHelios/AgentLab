@@ -6,7 +6,8 @@
 //     之后才追加）；等满了还没有结论照实说、给「再取一次」，点了重新取、取到就画；三种情况（来自口径 / 相关口径 / 这次的
 //     推理）各写各的；
 //   - 口径对账：核对参数（推断的参数要先核对）→ 发起（认不出列怎么配时照 409 带回的选项选对照的指标，再发起）→ 结果卡片：
-//     这次 / 口径 / 差值 / 相对差四个数各自取值、点开是出处链；请求体逐项核对；
+//     这次 / 口径 / 差值 / 相对差四个数各自取值、点开是出处链；请求体逐项核对；做完的卡片上问「差在哪」的说明有没有帮助
+//     （说明有用 / 看不懂，统计 E2）：请求体只有 verdict，选过的按下、写各几个人，能改主意；没做完的不问；
 //   - 可沉淀的问题：工作流列表弹窗里的抽屉，三类来源分开写；「固化成口径草稿」走 from-run 的 freeze（带同组的别的运行）、
 //     打开画布；聚类按人挑的那一轮固化；「不是口径」要写理由；
 //   - 使用者看到的入口照服务端的动作：不能出具的写原因（请搭建者出具）、不摆出具按钮，能对账的照样对账；出具过的正式运行
@@ -180,8 +181,15 @@ await section('「口径」一步的三种情况：来自口径、相关口径�
 // ---------------------------------------------------------------- 对账
 
 await section('口径对账：核对参数 → 发起 → 选对照的指标 → 三个数各自点得开', async () => {
-  const state = { posts: [], reconciled: [], polls: 0 }
+  const state = { posts: [], reconciled: [], polls: 0, feedback: [] }
   const extra = (method, p, body) => {
+    // 「说明有用 / 看不懂」：服务端交回这次对账现在的反馈（看的人最后一次给的、各几个人；另有一个人之前说过有用）
+    if (method === 'POST' && p === `/ledger/answers/${RUN}/reconcile/run-rec-1/feedback`) {
+      state.feedback.push(body)
+      const fb = { mine: body?.verdict, useful: 1 + (body?.verdict === 'useful' ? 1 : 0), unclear: body?.verdict === 'unclear' ? 1 : 0 }
+      state.reconciled = state.reconciled.map((r) => ({ ...r, feedback: fb }))
+      return { json: { run_id: 'run-rec-1', feedback: fb } }
+    }
     if (method === 'POST' && p === `/ledger/answers/${RUN}/reconcile`) {
       state.posts.push(body)
       if (!body?.pairs) {
@@ -236,6 +244,7 @@ await section('口径对账：核对参数 → 发起 → 选对照的指标 →
   const card = page.locator('[data-evidence-panel] [data-ledger-reconciled="run-rec-1"]')
   const running = await card.waitFor({ timeout: 6000 }).then(() => true, () => false)
   check('结果卡片：对账运行还在进行时写「对账进行中」', running && (await card.innerText()).includes('对账进行中'))
+  check('……还没做完：不问说明有没有用', await card.locator('[data-ledger-feedback-give]').count() === 0)
   const done = await page.locator('[data-evidence-panel] [data-ledger-reconciled-state="succeeded"]').waitFor({ timeout: 12000 }).then(() => true, () => false)
   check('……再取一次（运行还没结束时接着等），做完了画出每组对照', done)
   await until(async () => (await card.innerText()).includes(RECONCILE_VALUES.diff_0), 5000)
@@ -244,6 +253,24 @@ await section('口径对账：核对参数 → 发起 → 选对照的指标 →
     && cardText.includes(`按口径 ${RECONCILE_VALUES.cal_0}`) && cardText.includes(`差值 ${RECONCILE_VALUES.diff_0}`)
     && cardText.includes(`相对差 ${RECONCILE_VALUES.rel_0}`), cardText)
   check('……写参数从哪来、原答案里写的是什么', cardText.includes('按核对过的参数') && cardText.includes('原答案里写的是 8.7%'), cardText)
+
+  // 「差在哪」的说明有没有帮人看懂（02 做法 10 的 E2）：做完的卡片上问一句，记成对账运行上的封存后事件
+  const fbRow = card.locator('[data-ledger-feedback]')
+  check('做完的卡片问「差在哪」的说明有没有帮助：说明有用 / 看不懂', (await fbRow.innerText().catch(() => '')).includes('说明有用')
+    && await card.locator('[data-ledger-feedback-give]').count() === 2, await fbRow.innerText().catch(() => ''))
+  await card.locator('[data-ledger-feedback-give="unclear"]').click()
+  await until(() => state.feedback.length === 1)
+  check('点「看不懂」：请求体只有 verdict，记在这次答案的这次对账上', JSON.stringify(state.feedback[0]) === JSON.stringify({ verdict: 'unclear' }),
+    JSON.stringify(state.feedback[0]))
+  const pressed = await until(async () => await card.locator('[data-ledger-feedback-give="unclear"]').getAttribute('aria-pressed') === 'true', 4000)
+  const fbText = (await fbRow.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('……选过的按下，写各几个人（服务端给的数）', pressed && fbText.includes('1 人觉得有用') && fbText.includes('1 人看不懂'), fbText)
+  await card.locator('[data-ledger-feedback-give="useful"]').click()
+  await until(() => state.feedback.length === 2)
+  const changed = await until(async () => await card.locator('[data-ledger-feedback-give="useful"]').getAttribute('aria-pressed') === 'true', 4000)
+  check('改主意：再点「说明有用」照样记一条，按下的换过来', changed && JSON.stringify(state.feedback[1]) === JSON.stringify({ verdict: 'useful' })
+    && await card.locator('[data-ledger-feedback-give="unclear"]').getAttribute('aria-pressed') === 'false')
+
   await card.locator('[data-ledger-value="diff_0"]').click()
   const drawer = page.locator('[data-evidence-panel="side"]').last()
   const opened = await until(async () => (await drawer.innerText().catch(() => '')).includes('差值'), 5000)

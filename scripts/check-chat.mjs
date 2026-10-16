@@ -33,14 +33,17 @@
 //  17. 口径账本（next-round 02）：交付了的轮次底部写「正在比对口径」，按退避再取到比对出结果、比完不再取；一行摘要
 //      （几个数来自哪份口径）、按口径正式出具和对账按钮照服务端给的动作摆；出具、对账的写请求在浏览器层拦下并核对请求体，
 //      出具过的正式运行挂在轮次下面（档位、打开运行）。
-//  18. 过程里被驳回的那一步（node.failed 带 reason=rejected）：停止的剪影、中性色、行尾写「被驳回」，不画成完成的绿勾。
+//  18. 过程里被驳回的那一步（node.failed 带 reason=rejected）：停止的剪影、中性色、行尾写「被驳回」，不画成完成的绿勾；
+//  19. 答案身上的召回标记（账本接口的 recall）写在轮次底部：「已按口径「X」vN 核对，不影响」、依据有变（目录 / 表结构，几项、
+//      按新目录新出现几条错误级问题），看的人手上有说的是这个答案的召回待办时链到待办；没比对的答案照样写依据有变；做完的
+//      对账卡上写「差在哪」、问说明有没有帮助（说明有用 / 看不懂）。
 //
 // 所有写请求都被拦在浏览器里，不碰任何库。
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
 // 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-chat.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 import { mkdirSync, readFileSync } from 'node:fs'
-import { ISSUE, RECONCILE, WHOLE, WHOLE_LABELS, ledgerOf } from './ledger-fixtures.mjs'
+import { ISSUE, RECALL, RECONCILE, WHOLE, WHOLE_LABELS, ledgerOf, metricDetail, reconciledOf } from './ledger-fixtures.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const CHROME = process.env.CHROME_PATH
@@ -1648,6 +1651,58 @@ for (const theme of THEMES) {
       await page.screenshot({ path: `${SHOTS}/ledger-${theme}.png` })
       check('没有运行时报错', errors.length === 0, errors[0] ?? '')
       await ctx.close()
+    } finally {
+      ctl.ledgerConvs = false
+    }
+  })
+
+  await section('recall', '口径账本：答案身上的召回标记写在轮次底部（已按 vN 核对，不影响；依据有变；有待办时链到待办）', async () => {
+    // 召回在原答案的运行上追加 ledger.recalled、ledger.basis_changed（封存后），账本接口的 recall 把它们交出来（02 做法 7）。
+    // 以前只在「过程」里点开才看得到，使用者又进不了记录页。没比对的答案（state 不是 matched）照样可能被标依据有变
+    ctl.ledgerConvs = true
+    try {
+      // 比对过的那份另带一次做完的对账（另有两个人说过说明有用）：轮次里卡片上方没有「差在哪」，卡里写一份，反馈问的就是它
+      const reconciled = [{ ...reconciledOf('succeeded'), feedback: { mine: null, useful: 2, unclear: 0 } }]
+      for (const [name, LED] of [['matched', { ...ledgerOf('run-led', { labels: WHOLE_LABELS, whole: WHOLE, actions: [], reconciled }),
+        recall: RECALL }],
+        ['ineligible', { run_id: 'run-led', state: 'ineligible', reason: '这种来源的运行不比对', note: '封存后比对，不在封存范围内',
+          recall: { checked: [], basis: [{ kind: 'structure', items: 1, new_errors: 0, at: iso(5) }], tasks: [] } }]]) {
+        const { page, ctx, errors } = await open(theme)
+        await page.route(/\/api\/artifacts\//, (route) => route.fulfill({ json: { id: EVIDENCE.doc_artifact,
+          content: { ...EVIDENCE.doc, run_id: 'run-led' } } }))
+        await page.route(/\/api\/runs\/run-led\/evidence(\/.*)?(\?.*)?$/, (route) => {
+          const m = new URL(route.request().url()).pathname.match(/\/segments\/([^/]+)$/)
+          return m ? route.fulfill({ json: EVIDENCE.segments[decodeURIComponent(m[1])] ?? {} }) : route.fulfill({ json: EVIDENCE.graph })
+        })
+        await page.route(/\/api\/runs\/run-led\/ledger$/, (route) => route.fulfill({ json: LED }))
+        await page.route(/\/api\/runs\/run-rec-1\/evidence\/metrics\/reconcile\/[^/]+$/, (route) =>
+          route.fulfill({ json: metricDetail('run-rec-1', new URL(route.request().url()).pathname.split('/').at(-1)) }))
+        await goto(page, 'c0ledgr')
+        const marks = page.locator('[data-ledger-turn] [data-ledger-recall]').first()
+        const shown = await marks.waitFor({ timeout: 8000 }).then(() => true, () => false)
+        const text = shown ? (await marks.innerText()).replace(/\s+/g, ' ') : ''
+        if (name === 'matched') {
+          check('轮次底部写「已按口径「周报口径」v3 核对，不影响」（核对过两次只写最近那一版）', shown
+            && text.includes('已按口径「周报口径」v3 核对，不影响') && !text.includes('v2 核对'), text)
+          check('……依据有变：项数相加，写按新目录新出现几条错误级问题', text.includes('依据的数据目录有变（3 项）')
+            && text.includes('按新目录检查新出现 1 条错误级问题'), text)
+          const link = marks.locator('[data-ledger-recall-task="tk-recall-1"] a')
+          check('……有说的是这个答案的召回待办：写数变了、链到待办', text.includes('口径升到 v2，这个答案用到的数变了')
+            && await link.getAttribute('href').catch(() => null) === '/apps/inbox/tk-recall-1', text)
+          check('……和摘要在同一张账本卡里', await page.locator('[data-ledger-turn="matched"] [data-ledger-recall]').count() === 1)
+          const card = page.locator('[data-ledger-turn] [data-ledger-reconciled="run-rec-1"]')
+          const where = (await card.locator('[data-ledger-reconciled-where]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+          check('轮次里做完的对账卡：写「差在哪」，下面问说明有没有帮助、写各几个人', where.includes('口径只保留状态为已支付的行')
+            && (await card.locator('[data-ledger-feedback]').innerText().catch(() => '')).includes('2 人觉得有用')
+            && await card.locator('[data-ledger-feedback-give]').count() === 2, where)
+          await page.screenshot({ path: `${SHOTS}/ledger-recall-${theme}.png` })
+        } else {
+          check('不比对的答案：轮次底部只写依据有变（表结构）', shown && text.includes('依据的表结构有变（1 项）')
+            && await page.locator('[data-ledger-turn="recall"]').count() === 1 && await page.locator('[data-ledger-summary]').count() === 0, text)
+        }
+        check(`没有运行时报错（${name}）`, errors.length === 0, errors[0] ?? '')
+        await ctx.close()
+      }
     } finally {
       ctl.ledgerConvs = false
     }

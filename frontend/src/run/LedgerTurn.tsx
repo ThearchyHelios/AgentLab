@@ -4,13 +4,17 @@ import { LEDGER_TEXT } from '../lib/terms'
 import { LEDGER_UI } from '../lib/termsLedger'
 import { useRunLedger } from '../store/ledger'
 import type { LedgerIssueAction, LedgerReconcileAction, LedgerRelated, RunLedger } from '../typesLedger'
-import { IssueControl, IssuedList, LedgerFootnote, LedgerWaiting, caliberOf, ledgerEnabled, ledgerErrorShown } from './LedgerStep'
+import {
+  IssueControl, IssuedList, LedgerFootnote, LedgerWaiting, RecallMarks, caliberOf, hasRecallMarks, ledgerEnabled, ledgerErrorShown,
+} from './LedgerStep'
 import { ReconcileDialog, ReconcileResults } from './LedgerReconcile'
 
 /**
  * 问数据轮次底部的口径账本（docs/design/next-round/02-口径账本.md 做法 11）：一行摘要（「3 个数来自口径「周销售」v3，
  * 1 个数是这次的推理」）和对应的动作——整题等价时按口径正式出具（能自动的写正在自动出具），有相关口径时对账；
- * 正式出具的结果（自动的、一键的）挂在轮次下面、点开去运行；对过的账一张结果卡片，三个数各自点得开。
+ * 正式出具的结果（自动的、一键的）挂在轮次下面、点开去运行；对过的账一张结果卡片，三个数各自点得开，卡里写「差在哪」、
+ * 问说明有没有帮助（说明有用 / 看不懂）。答案身上的召回标记（「已按口径「X」vN 核对，不影响」、依据有变、说的是这个答案的
+ * 召回待办）也写在这里：以前只在「过程」里点开才看得到，使用者又进不了记录页；没比对的答案照样可能带着，单独写一行。
  *
  * 比对在封存之后做：轮次刚交付时写「正在比对口径」，store/ledger 按退避再取，等满了还没结论照实说、给「再取一次」。
  * 不靠实时流（ledger.matched 追加时这次运行的事件总线已经关了）。界面层不放逻辑：每个数的标签、整题判断、能不能出具、
@@ -62,12 +66,21 @@ export function LedgerTurn({ runId, runClass, done, readOnly = false }: {
       </div>
     )
   }
-  if (!data || data.state !== 'matched' || !summary) return null
+  if (!data) return null
+  // 召回标记（依据有变、已按 vN 核对）说的是整个答案：没比对过、不比对的答案照样可能带着，单独写一行
+  const marked = hasRecallMarks(data.recall)
+  if (data.state !== 'matched' || !summary) {
+    return marked ? (
+      <div className="w-full basis-full rounded-md border px-2.5 py-2 text-xs" data-ledger-turn="recall">
+        <RecallMarks recall={data.recall} />
+      </div>
+    ) : null
+  }
   const issue = (data.actions ?? []).find((a): a is LedgerIssueAction => a.kind === 'issue')
   const reconciles = reconcileEntries(data)
   const issued = data.issued ?? []
   const reconciled = data.reconciled ?? []
-  if (!summary.total && !issued.length && !reconciled.length) return null
+  if (!summary.total && !issued.length && !reconciled.length && !marked) return null
   const whole = data.whole
   return (
     <div className="w-full basis-full space-y-1.5 rounded-md border px-2.5 py-2 text-xs" data-ledger-turn="matched">
@@ -83,6 +96,7 @@ export function LedgerTurn({ runId, runClass, done, readOnly = false }: {
           {LEDGER_UI.turn.whole(caliberOf(whole), LEDGER_TEXT.how[whole.how === 'composed' ? 'composed' : 'independent'])}
         </p>
       )}
+      <RecallMarks recall={data.recall} />
       {(issue || reconciles.length > 0) && (
         <div className="flex flex-wrap items-start gap-1.5" data-ledger-actions="">
           {issue && <IssueControl runId={runId} action={issue} slot={slot} readOnly={readOnly} />}
@@ -96,7 +110,7 @@ export function LedgerTurn({ runId, runClass, done, readOnly = false }: {
         </div>
       )}
       <IssuedList data={data} />
-      {reconciled.length > 0 && <ReconcileResults runId={runId} items={reconciled} data={data} />}
+      {reconciled.length > 0 && <ReconcileResults runId={runId} items={reconciled} data={data} showWhere readOnly={readOnly} />}
       <LedgerFootnote data={data} />
       {dialog && <ReconcileDialog runId={runId} action={dialog.action} related={dialog.related} onClose={() => setDialog(null)} />}
     </div>

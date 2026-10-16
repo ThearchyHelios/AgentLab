@@ -3,7 +3,8 @@
  *
  * - run：GET /api/runs/{id}/ledger，一次运行里每个数的口径标签、整题判断、能做的动作、出具过的正式运行、对过的账；
  * - issue：按口径正式出具（参数只由服务端从比对工件里取，这里只能选「按哪份口径」）；
- * - reconcile：口径对账（点开才跑一次确定性派生的只读图）；
+ * - reconcile：口径对账（点开才跑一次确定性派生的只读图）；feedback：对账结果上的「说明有用 / 看不懂」（记成对账运行上的
+ *   封存后事件，统计 E2 数它）；
  * - certifyQueue / dismiss：可沉淀的问题、「不是口径」（搭建者及以上）；
  * - freeze：固化成口径草稿（/copilot/from-run 的 freeze 选项，报告引用的查询变成固定 SQL 的取数节点）。
  *
@@ -11,7 +12,7 @@
  * 请求函数从 ./http 导入，不从 ./client 导入（client.ts 要导入这个文件，反过来就成了循环）。
  */
 import type {
-  CertifyQueue, FreezeOut, LedgerIssueOut, LedgerReconcileIn, LedgerReconcileOut, RunLedger,
+  CertifyQueue, FreezeOut, LedgerFeedbackOut, LedgerFeedbackVerdict, LedgerIssueOut, LedgerReconcileIn, LedgerReconcileOut, RunLedger,
 } from '../typesLedger'
 import { get, post, type RequestOptions } from './http'
 
@@ -21,6 +22,8 @@ export const caliberLedger = {
   run: (runId: string, opts?: RequestOptions) => get<RunLedger>(`/runs/${encodeURIComponent(runId)}/ledger`, opts),
   issue: (runId: string, body: { workflow_id: string; version: number }) => post<LedgerIssueOut>(`${at(runId)}/issue`, body),
   reconcile: (runId: string, body: LedgerReconcileIn) => post<LedgerReconcileOut>(`${at(runId)}/reconcile`, body),
+  feedback: (runId: string, reconcileId: string, verdict: LedgerFeedbackVerdict) =>
+    post<LedgerFeedbackOut>(`${at(runId)}/reconcile/${encodeURIComponent(reconcileId)}/feedback`, { verdict }),
   certifyQueue: (opts?: RequestOptions) => get<CertifyQueue>('/ledger/certify-queue', opts),
   dismiss: (body: { item_id: string; kind?: string; note: string }) =>
     post<{ ok: boolean; item_id: string }>('/ledger/certify-queue/dismiss', body),

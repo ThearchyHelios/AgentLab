@@ -51,6 +51,25 @@ export function ledgerOf(runId, { whole, actions, issued = [], reconciled = [], 
   }
 }
 
+/**
+ * 答案身上的召回标记（服务端 ledger/recall.answer_marks）：周报口径升到 v3 重算过、数没变（同一份口径核对过两次，只写最近
+ * 那一版）；目录里影响数字的两项被驳回、按新目录检查新出现 1 条错误级问题，另有一次出现了新码值（同归「数据目录」那一类，
+ * 项数相加）；看的这个人手上有一条说的是这个答案的 recall 待办（订单口径升到 v2，数变了）
+ */
+export const RECALL = {
+  checked: [
+    { workflow_id: 'wf-weekly', workflow_name: '周报口径', from_version: 1, to_version: 2, recall_run: 'run-rc0', changed: false,
+      at: '2026-10-14T01:00:00+00:00' },
+    { workflow_id: 'wf-weekly', workflow_name: '周报口径', from_version: 2, to_version: 3, recall_run: 'run-rc1', changed: false,
+      at: '2026-10-15T01:00:00+00:00' },
+  ],
+  basis: [
+    { kind: 'catalog', items: 2, new_errors: 1, at: '2026-10-15T02:00:00+00:00' },
+    { kind: 'values', items: 1, new_errors: 0, at: '2026-10-15T03:00:00+00:00' },
+  ],
+  tasks: [{ id: 'tk-recall-1', reason: 'caliber', to_version: 2 }],
+}
+
 /** 看差多少（s8 那条查询、订单口径）：参数是推断的，要先核对 */
 export const RECONCILE = {
   kind: 'reconcile', query: 'q-orders', caliber: ORDERS.caliber, workflow_id: ORDERS.workflow_id, version: 1, node_id: 'fetch',
