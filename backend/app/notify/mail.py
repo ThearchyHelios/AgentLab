@@ -253,7 +253,8 @@ _FOOTER = "这封邮件由 AgentLab 自动发出，请勿直接回复。不想�
 def build(cfg: MailConfig, to: list[str], msg: Message, *, unsubscribe: str | None) -> EmailMessage:
     """一封邮件：纯文本一份、HTML 一份（全部转义）。unsubscribe 是「设置 → 通知」的完整地址，没有就不带退订头。"""
     em = EmailMessage()
-    em["Subject"] = f"【AgentLab】{msg.title}"[:200]
+    # 标题里的换行（应用名、节点名是人起的）合成空格：邮件头里有换行就是头注入，标准库也会直接拒收
+    em["Subject"] = f"【AgentLab】{' '.join(msg.title.split())}"[:200]
     em["From"] = formataddr((cfg.from_name or DEFAULTS["from_name"], cfg.from_addr or ""))
     em["To"] = ", ".join(to)
     em["Date"] = formatdate(localtime=True)

@@ -77,14 +77,23 @@ def smtp(monkeypatch):
 
 @pytest.fixture(autouse=True)
 async def clean():
+    """前后各清一遍：同一个进程里别的测试留下的渠道、投递记录不算进来。"""
+    await _clean()
     yield
     await service.drain()
+    await _clean()
+
+
+async def _clean() -> None:
     async with SessionLocal() as session:
         await session.execute(delete(NotifyDelivery))
         await session.execute(delete(NotifyChannel))
         await session.execute(delete(Setting).where(Setting.key.in_([mail.GROUP, "notify", service.MAIL_AUTO_KEY])))
         await session.execute(delete(User).where(User.username.like("mail-%")))
         await session.commit()
+    from app.core import public_url
+
+    public_url.remember(None)   # 发信时按库里的对外访问地址对齐了缓存：删了那一行，缓存也清掉
 
 
 async def configure(**over) -> None:
@@ -100,6 +109,9 @@ async def configure(**over) -> None:
         notify = await session.get(Setting, "notify")
         if notify is None:
             session.add(Setting(key="notify", value={"public_base_url": "https://agentlab.example.com"}))
+        else:
+            # 别的测试留下的 notify 一组：对外访问地址换成这里要的（退订头按它拼）
+            notify.value = {**(notify.value or {}), "public_base_url": "https://agentlab.example.com"}
         await session.commit()
 
 
@@ -239,6 +251,11 @@ async def test_partially_refused_recipients_are_said_plainly(smtp, monkeypatch):
     monkeypatch.setattr(FakeSMTP, "send_message", lambda self, em, from_addr=None, to_addrs=None: {"x@example.com": (550, b"no")})
     out = await mail.send(_cfg(), ["ana@example.com", "x@example.com"], Message(title="t"), label="测试")
     assert out.ok is True and out.error == "已交给邮件服务器，其中 1 个收件地址被拒收"
+
+
+def test_line_breaks_in_titles_never_reach_the_headers():
+    em = mail.build(_cfg(), ["ana@example.com"], Message(title="新的待办：审批\r\nBcc: x@example.com"), unsubscribe=None)
+    assert em["Subject"] == "【AgentLab】新的待办：审批 Bcc: x@example.com" and em["Bcc"] is None
 
 
 def test_ssl_security_uses_no_starttls(smtp):

@@ -8,13 +8,15 @@ notify_key_expiring），推送放在后台（service.spawn）：接收端挂住
   一条（没有待办的人不发）；
 - 按日期在 settings 表里认领一行（键 STATE_PREFIX + "digest:<日期>"，主键冲突就是已经认领过）：同一天只发一次，重启了也不
   重发。认领之后推送失败不补发——通知本来就是至多一次，投递记录里照实记失败。停机错过的那一天不补；
-- 认领行只留最近 KEEP_DAYS 天。
+- 认领行只留最近 KEEP_DAYS 天；
+- 关登录时不发：「派给我的」要认得出是谁（关登录时人人等同管理员，待办箱里是全部待办），个人渠道本来也只挂在认证过的账号上。
 
 访问密钥快到期（key.expiring）：
 - 到期前 7 天、1 天各推一次（THRESHOLDS）：个人访问密钥推给拥有者的个人渠道，服务账号的推给订阅了的全局渠道；
 - 去重靠审计：推之前先记一条 access_key.expiring（data.days 是哪一档），记过的不再推（进程里另记一份，省得每拍查审计）；
 - 不推的：建的时候离到期已经不到这一档（自己设了短有效期，知道它快到期）；轮换下来、24 小时后到期的旧密钥（新的那把已经
-  在用）；撤销了的；拥有者停用了的；个人密钥开关关着时的个人密钥（本来就不认了）。
+  在用）；撤销了的；拥有者停用了的；个人密钥开关关着时的个人密钥（本来就不认了）；关登录时的一概不推（访问密钥只在开了登录时
+  生效）。
 
 这两种状态（认领行、自动建过邮件渠道的人）存在 settings 表里，键都以 STATE_PREFIX 开头：它们是通知自己记的账，不是用户设置，
 GET /api/settings 不列、PUT 不收（api/settings.py）。
@@ -85,12 +87,13 @@ async def _claim(day: str, now: datetime) -> bool:
 async def digest_due(now: datetime | None = None) -> list[str]:
     """到点了就认领今天、给订阅了汇总的人各发一条（后台推）。交回这一拍要发给谁（用户 id），没到点、已经发过是空的。"""
     from app.api.settings import NOTIFY_GROUP
+    from app.auth import current_mode
     from app.notify import service
 
     now = now or utcnow()
     local = now.astimezone()
     day = local.date().isoformat()
-    if day in _claimed:
+    if day in _claimed or current_mode() == "off":
         return []
     async with SessionLocal() as session:
         row = await session.get(Setting, NOTIFY_GROUP)
@@ -123,13 +126,15 @@ async def _digest_one(user_id: str) -> None:
 
 async def keys_due(now: datetime | None = None) -> list[str]:
     """访问密钥快到期了的，按档推一次（见模块说明）。交回这一拍推了哪几把（密钥 id）。"""
-    from app.auth import personal_keys_enabled
+    from app.auth import current_mode, personal_keys_enabled
     from app.auth.audit import record
     from app.auth.keys import SERVICE_KIND
     from app.db.models import AuditEvent
     from app.db.models_identity import AccessKey
     from app.notify import service
 
+    if current_mode() == "off":
+        return []
     now = now or utcnow()
     horizon = now + timedelta(days=max(THRESHOLDS))
     async with SessionLocal() as session:

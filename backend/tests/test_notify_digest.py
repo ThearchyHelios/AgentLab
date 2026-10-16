@@ -51,21 +51,38 @@ async def login_on(received):
     """开着账号密码登录（个人渠道挂在认证过的账号上）。依赖 received：收尾时等推送推完，假的接收端还在。"""
     await auth_env.reset()
     digest.forget()
-    await auth_env.turn_on_local()
     async with SessionLocal() as session:
+        # 别的测试可能留下了 notify 一组、渠道和投递记录：整组换成这里要的，渠道和记录先清掉
+        await session.execute(delete(Setting).where(Setting.key == "notify"))
+        await session.execute(delete(NotifyDelivery))
+        await session.execute(delete(NotifyChannel))
         session.add(Setting(key="notify", value={"public_base_url": "https://agentlab.example.com",
                                                  "digest_at": "09:00"}))
         await session.commit()
-    yield
+    await auth_env.turn_on_local()
+    try:
+        yield
+    finally:
+        await _cleanup()
+
+
+async def _cleanup() -> None:
     await service.drain()
     async with SessionLocal() as session:
-        for model in (NotifyDelivery, NotifyChannel, TaskAssignment, Task):
+        mine = select(Run.id).where(Run.workflow_name == "汇总测试")
+        tasks = select(Task.id).where(Task.run_id.in_(mine))
+        await session.execute(delete(TaskAssignment).where(TaskAssignment.task_id.in_(tasks)))
+        await session.execute(delete(Task).where(Task.run_id.in_(mine)))
+        for model in (NotifyDelivery, NotifyChannel):
             await session.execute(delete(model))
         await session.execute(delete(Run).where(Run.workflow_name == "汇总测试"))
         await session.execute(delete(App).where(App.name == "报销审批"))
         await session.execute(delete(Setting).where(Setting.key.like(digest.STATE_PREFIX + "%")))
         await session.execute(delete(Setting).where(Setting.key == "notify"))
         await session.commit()
+    from app.core import public_url
+
+    public_url.remember(None)
     digest.forget()
     await auth_env.reset()
 
@@ -149,6 +166,23 @@ async def test_digest_follows_the_configured_time_and_skips_people_with_nothing_
     assert await digest.digest_due(local(17, 30)) == [cy.id]
     await service.drain()
     assert received == [], "没有待办不发「0 条」"
+
+
+async def test_nothing_is_sent_when_login_is_off(received):
+    """关登录时「派给我的」认不出是谁（人人等同管理员），访问密钥也不生效：汇总、到期提醒都不发，也不认领今天。"""
+    ana = await auth_env.make_user("ana", "user")
+    await personal(ana, ["task.digest"])
+    await tasks_for("ana", 2)
+    svc = await auth_env.make_service("svc-off")
+    key, _ = await auth_env.make_key(svc, days=3)
+    await _age(key, 30)
+    from app.auth import remember_settings
+
+    remember_settings({})
+    assert await digest.digest_due(local(9, 0)) == []
+    assert await digest.keys_due(utcnow()) == []
+    async with SessionLocal() as session:
+        assert await session.get(Setting, digest.DIGEST_CLAIM + local(9, 0).astimezone().date().isoformat()) is None
 
 
 async def test_claim_rows_are_not_listed_as_settings(received):

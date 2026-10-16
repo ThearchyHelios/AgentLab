@@ -701,7 +701,8 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
     # 会有（Source.message），不进 problems——进了，页面顶上挂一块「无法显示」，使用者以为应用坏了
     for source in ctx.sources.values():
         await _load(session, source)
-    for entry in spec.get("entries") or []:
+    # 分享链接里不能发起：入口的表单不下发
+    for entry in (spec.get("entries") or []) if share is None else []:
         form = resolve_form(spec, entry.get("form"))
         if form is not None and entry.get("id"):
             ctx.forms[str(entry["id"])] = form
