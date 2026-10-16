@@ -1024,6 +1024,7 @@ async def source_masks(catalog: dict[str, Any], *, loader: Callable[[str], Any] 
 # 每日计数
 # --------------------------------------------------------------------------
 
+
 def _today() -> str:
     """裁判这本账的日历：本地日期（同 engine/spend._today）。单独留一个名字：测试换掉它来模拟裁判这边跨天。"""
     return spend._today()
