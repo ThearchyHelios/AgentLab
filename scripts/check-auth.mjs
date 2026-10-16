@@ -10,7 +10,7 @@
 //   - 非 GET 请求都带 X-AgentLab-Request 头（服务端开登录时据此防跨站）；
 //   - 使用者（user 角色）：导航只有「应用」和「设置」，别的地址送回应用首页，⌥ 数字切不到看不见的页；没有署名框，
 //     账户菜单写显示名、角色、退出登录；待办卡写「以登录身份处理」；
-//   - 搭建者：导航九项都在，账户菜单写搭建者；
+//   - 搭建者：导航十项都在（第 4 波加了「评测」，搭建者以上可见），账户菜单写搭建者；
 //   - 关登录：/login 直接回首页；导航底部是署名入口，没有账户菜单；应用首页挂「未开启登录」的说明；
 //   - 管理员允许使用者问数据时（D-c）：问数据页只取数据源的名字（/api/datasources/names），不取完整列表和表结构；
 //   - 使用者的设置页只剩偏好设置（主题）和通知，换主题只存本机、不写服务端（D-s）；
@@ -262,12 +262,13 @@ await section('会话中途失效：401 整页跳登录', async () => {
   check('任何接口回 401 都跳 /login，带上原处', await page.waitForURL(/\/login\?next=/, { timeout: 15000 }).then(() => true, () => false), page.url())
 })
 
-await section('搭建者：导航九项、账户菜单', async () => {
+await section('搭建者：导航十项、账户菜单', async () => {
   const state = { mode: 'local', who: 'builder', writes: [] }
   const page = await open(state)
   await page.goto(`${WEB}/apps`)
   await nav(page).waitFor({ timeout: 15000 })
-  check('导航九项都在', (await navLabels(page)).length === 9, (await navLabels(page)).join(','))
+  check('导航十项都在（含搭建者以上可见的「评测」）', (await navLabels(page)).length === 10 && (await navLabels(page)).includes('评测'),
+    (await navLabels(page)).join(','))
   await nav(page).locator('[data-account]').click()
   check('账户菜单写搭建者', (await page.locator('[data-account-role]').innerText()) === '搭建者')
 })
@@ -292,7 +293,7 @@ await section('关登录：登录页回首页、署名入口、说明行', async
   await page.goto(`${WEB}/login`)
   check('/login 回首页', await page.waitForURL(/\/chat/, { timeout: 15000 }).then(() => true, () => false), page.url())
   await nav(page).waitFor({ timeout: 8000 })
-  check('导航九项', (await navLabels(page)).length === 9)
+  check('导航十项', (await navLabels(page)).length === 10)
   check('底部是署名入口', (await nav(page).locator('a[href="/settings/prefs"]').count()) === 1)
   check('没有账户菜单', (await nav(page).locator('[data-account]').count()) === 0)
   await page.goto(`${WEB}/apps`)
