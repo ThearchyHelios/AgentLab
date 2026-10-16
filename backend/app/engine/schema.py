@@ -1443,7 +1443,7 @@ def evidence_issues(spec: GraphSpec) -> list[ValidationIssue]:
                     "evidence_role", level="error")
         elif node.type == NodeType.METRICS:
             if cfg.get("caliber_from") not in (None, "", {}):
-                out.extend(_caliber_from_issues(node, UPGRADE_POLICIES, UPGRADE_POLICY_LABELS))
+                out.extend(_caliber_from_issues(node, UPGRADE_POLICIES, UPGRADE_POLICY_LABELS, spec))
             warned: set[str] = set()
             for i, producer in _caliber_inputs(node, spec):
                 role = str(producer.config.get("evidence_role") or "compute")
@@ -1457,8 +1457,12 @@ def evidence_issues(spec: GraphSpec) -> list[ValidationIssue]:
     return out
 
 
-def _caliber_from_issues(node: GraphNode, policies: set[str], labels: dict[str, str]) -> list[ValidationIssue]:
-    """钉住别的工作流里一张口径卡：{workflow_id, workflow_version, node_id} 三项都要写对。"""
+def _caliber_from_issues(node: GraphNode, policies: set[str], labels: dict[str, str],
+                         spec: GraphSpec | None = None) -> list[ValidationIssue]:
+    """钉住别的工作流里一张口径卡：{workflow_id, workflow_version, node_id} 三项都要写对。
+
+    可选的 nodes（节点改名映射，next-round 02 做法 4）：那一版口径卡读的取数节点拷进这张图时改了名，{原 id: 这张图里的 id}。
+    形状和运行时同一个判断（metrics.rename_problem）；改名后的节点要在这张图里、在口径卡上游——不然运行时口径卡取不到输入。"""
     cfg = node.config
     ref = cfg.get("caliber_from")
     out: list[ValidationIssue] = []
@@ -1475,6 +1479,21 @@ def _caliber_from_issues(node: GraphNode, policies: set[str], labels: dict[str, 
             or int(version) < 1:
         add(f"「{field_label('caliber_from')}」需要选择具体的版本号（1、2…），当前为「{version}」：不固定版本，"
             "口径会随上游变化", "caliber_from.workflow_version")
+    if ref.get("nodes") not in (None, {}):
+        from app.engine.nodes.metrics import rename_problem
+
+        if problem := rename_problem(ref.get("nodes")):
+            add(f"「{field_label('caliber_from')}」的节点改名映射有误：{problem}", "caliber_from.nodes")
+        elif spec is not None:
+            nodes = spec.node_map()
+            upstream = _ancestors(spec, node.id)
+            for old, new in ref["nodes"].items():
+                if new not in nodes:
+                    add(f"「{field_label('caliber_from')}」把取数节点「{old}」改名为「{new}」，但工作流中没有节点「{new}」",
+                        "caliber_from.nodes")
+                elif new not in upstream:
+                    add(f"「{field_label('caliber_from')}」改名后的取数节点「{nodes[new].title}」不在口径卡的上游：口径卡计算时"
+                        "它还没有执行。请把它连到口径卡之前", "caliber_from.nodes")
     if cfg.get("metrics"):
         add(f"已设置「{field_label('caliber_from')}」，将按所引用的口径卡计算，此处填写的「{field_label('metrics')}」"
             "不会生效", "metrics", level="warning")

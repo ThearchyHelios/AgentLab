@@ -65,7 +65,7 @@ from app.engine.evidence import DEFAULT_FORMAT, RenderError, is_number, render_n
 from app.engine.expressions import ExpressionError, cell_value, leaf_refs, parse_expression
 from app.engine.labels import TYPE_LABEL, field_label
 from app.engine.merge_query import MERGE_SOURCE
-from app.engine.nodes.metrics import _REF_HEAD, _display_of
+from app.engine.nodes.metrics import _REF_HEAD, _display_of, source_expression
 from app.engine.toolcalls import QUERY_PREFIX
 
 UNCHANGED = "unchanged"
@@ -568,9 +568,13 @@ def _shown(value: Any) -> str:
     return text if len(text) <= _SHOWN_MAX else text[:_SHOWN_MAX] + "…"
 
 
-def _expression(metric: dict[str, Any]) -> str:
-    """表达式的规范写法：空白、括号写法不同的算同一个。解析不了的照原文。"""
-    raw = str(metric.get("expression") or "").strip()
+def _expression(metric: dict[str, Any], source: Any = None) -> str:
+    """表达式的规范写法：空白、括号写法不同的算同一个。解析不了的照原文。
+
+    source 是这张卡的来源（指标集上的 source）：钉住别处口径卡、取数节点拷进图里时改了名的（caliber_from.nodes，
+    next-round 02 做法 4），先按映射换回那一版里的写法再比——同一份口径换了节点名不算口径变了；取数本身变没变照旧按
+    输入的出处说。"""
+    raw = source_expression(str(metric.get("expression") or "").strip(), source)
     try:
         return ast.unparse(parse_expression(raw)[0])
     except (ExpressionError, ValueError):
@@ -1715,7 +1719,7 @@ def _caliber_reasons(bm: dict[str, Any], tm: dict[str, Any], bc: dict[str, Any],
                      defs: tuple[dict[str, Any] | None, dict[str, Any] | None] = (None, None)) -> list[str]:
     """口径变了的地方，一处一句；没变返回空列表。defs 是两次运行图里这个指标的定义（老卡没记小数位、格式时用）。"""
     out = []
-    if _expression(bm) != _expression(tm):
+    if _expression(bm, bc.get("source")) != _expression(tm, tc.get("source")):
         out.append(f"表达式由「{_shown(bm.get('expression'))}」改为「{_shown(tm.get('expression'))}」")
     before, after = str(bc.get("caliber_version") or ""), str(tc.get("caliber_version") or "")
     if before != after:
