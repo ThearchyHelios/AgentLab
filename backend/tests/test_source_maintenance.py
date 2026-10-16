@@ -208,3 +208,28 @@ async def test_steps_api_and_check_target(client, tmp_path):
             assert await sm.check_target(session, sid) == sm.NOT_MAINTAINED
     finally:
         await drop_source(sid)
+
+
+async def test_scheduler_switched_off_never_fires_maintenance(client, tmp_path, made):
+    """AGENTLAB_SCHEDULER 关着（测试环境就是关着的，见 conftest）：调度循环不起，到点的维护不会触发——拷来的数据目录不替原库
+    查业务库。照实说：这时没有触发记录（定时只有一套，没起循环就没有「这一拍」）。"""
+    import asyncio
+
+    from app import scheduler
+
+    sid = await _source(client, tmp_path / "f.db")
+    try:
+        schedule_id = await _schedule(sid, next_run_at=utcnow() - timedelta(minutes=1))
+        made.append(schedule_id)
+        assert scheduler.scheduler_enabled() is False
+        await scheduler.start()
+        await asyncio.sleep(0.3)
+        await scheduler.stop()
+        async with SessionLocal() as session:
+            fires = list((await session.execute(select(ScheduleFire).where(
+                ScheduleFire.schedule_id == schedule_id))).scalars())
+            jobs = list((await session.execute(select(IntrospectJob).where(
+                IntrospectJob.source_id == sid, IntrospectJob.trigger == "schedule"))).scalars())
+        assert fires == [] and jobs == []
+    finally:
+        await drop_source(sid)

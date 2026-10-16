@@ -224,7 +224,9 @@ async def _codes(cx: Any, table: str, column: str, meta: Mapping[str, Any], size
         text = catalog.column_family(cp._column_meta(dict(meta), str(day))) != "time"
         sql = d.window_value_counts_sql(t, c, d.column(dict(meta), str(day)), since, n, text=text)
     else:
-        percent = sample_percent(size.rows, max(cx.settings.max_scan_rows, cx.settings.sample_size))
+        # 数到上限、只知道「至少多少行」的按下限取档（取到的档偏大，多看一点，不会少看）
+        percent = sample_percent(size.rows if size.rows is not None else size.at_least,
+                                 max(cx.settings.max_scan_rows, cx.settings.sample_size))
         sampled = d.sample_value_counts_sql(t, c, percent, n) if percent else None
         if sampled is not None:
             basis, sql = {"method": "sample", "percent": percent}, sampled
@@ -382,6 +384,45 @@ async def save(session: AsyncSession, source: Any, table: str, result: Any, *, j
     return fresh
 
 
+def coverage_drops(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """关系核对的结论里覆盖率掉到有确证的线以下的（以前够、这次不够）：[{path, target, before, after}]。剖析本身照旧按
+    规则降回推断（或只给人工确认的补上新的覆盖率），这里只把「覆盖率下降」记成一条取值变化。"""
+    out: list[dict[str, Any]] = []
+    line = catalog.PROFILE_VERIFY_COVERAGE
+    for f in findings:
+        if not isinstance(f, Mapping) or f.get("kind") != "relation":
+            continue
+        before, after = f.get("previous_coverage"), f.get("coverage")
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before >= line > after:
+            out.append({"path": f.get("path"), "target": f.get("target"), "before": before, "after": after,
+                        "confirmed": bool(f.get("confirmed"))})
+    return out
+
+
+async def record_coverage_drops(session: AsyncSession, source: Any, table: str, result: Any, *, detected: Any) -> int:
+    """这张表这次剖析里覆盖率掉下来的关系记成 coverage_drop（不提交，和剖析结果同一个事务）。人点的剖析也记：变化记录是
+    全站一份。出错只记日志。"""
+    from app.data import source_changes as sc
+
+    try:
+        fresh = 0
+        for drop in coverage_drops(getattr(result, "findings", None) or []):
+            _row, new = await sc.record(session, source, sc.NewChange(
+                kind=sc.COVERAGE_DROP, table=table, severity="warning",
+                before={"coverage": drop["before"], "path": drop["path"], "target": drop["target"]},
+                after={"coverage": drop["after"], "confirmed": drop["confirmed"]},
+                basis={"method": "relation_sample", "key": "relation"},
+                affects={"catalog": [{"table": table, "path": drop["path"], "label": drop["target"],
+                                      "status": "confirmed" if drop["confirmed"] else "proposed",
+                                      "source": None, "needs_action": False}], "templates": [], "rules_touched": False},
+                key=(drop["path"], round(float(drop["after"]), 3))), detected)
+            fresh += int(new)
+        return fresh
+    except Exception:  # noqa: BLE001
+        logger.exception("记录 %s 的关联覆盖率下降时出错", table)
+        return 0
+
+
 # ==========================================================================
 # 观察到期、给助手的观察结论
 # ==========================================================================
@@ -438,5 +479,5 @@ async def observed_facts(session: AsyncSession, source_id: str,
 
 
 __all__ = ["KIND_LABEL", "OBSERVE_CODES_MAX", "OBSERVE_EVERY_H", "OBSERVE_KINDS", "OBSERVER", "SAMPLE_LADDER",
-           "WINDOW_DAYS", "basis_key", "basis_text", "code_columns", "execute", "last_observed", "observe_reason",
-           "observed_facts", "plan_observations", "sample_percent", "save"]
+           "WINDOW_DAYS", "basis_key", "basis_text", "code_columns", "coverage_drops", "execute", "last_observed", "observe_reason",
+           "observed_facts", "plan_observations", "record_coverage_drops", "sample_percent", "save"]

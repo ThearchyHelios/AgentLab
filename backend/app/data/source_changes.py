@@ -374,10 +374,13 @@ def resolve(row: SourceChange, *, action: str, by: str | None, note: str | None 
     return row
 
 
-def _catalog_paths(row: SourceChange) -> list[dict[str, Any]]:
-    """影响面里这张表上的目录项（清理目录时删的就是它们）。"""
-    items = ((row.affects or {}).get("catalog") or [])
-    return [i for i in items if isinstance(i, Mapping) and i.get("table") == row.table_name and i.get("path")]
+def _catalog_paths(row: SourceChange) -> dict[str, list[str]]:
+    """影响面里的目录项，按表分（清理目录时删的就是它们）：这张表上的，和别的表指向它的关联关系。"""
+    out: dict[str, list[str]] = {}
+    for item in (row.affects or {}).get("catalog") or []:
+        if isinstance(item, Mapping) and item.get("table") and item.get("path"):
+            out.setdefault(str(item["table"]), []).append(str(item["path"]))
+    return out
 
 
 def without_paths(notes: Mapping[str, Any], paths: Iterable[str]) -> dict[str, Any]:
@@ -397,8 +400,8 @@ async def handle(session: AsyncSession, source: Any, row: SourceChange, action: 
                  note: str | None = None, codes: Mapping[str, str] | None = None) -> dict[str, Any]:
     """执行一个处理动作并记下 resolution（提交）。返回 {change, catalog_version?, job?}。
 
-    - clean_catalog：把影响面里这张表上说到这些列的项从目录里去掉（整份写入，乐观锁），记目录版本。影响面里没有目录项的
-      抛 ChangeInvalid。
+    - clean_catalog：把影响面里说到这些列（这张表）的目录项去掉——这张表上的、别的表指向它的关联关系——逐表整份写入
+      （乐观锁），记这张表的目录版本（别的表也动了的另记 catalog_versions）。影响面里没有目录项的抛 ChangeInvalid。
     - add_codes：码值的新取值加进目录（catalog.save_patch，含义待填写；依据写「数据源变化 #编号」），只给 codes_new。codes
       给了就按它加（{码: 含义}，含义可以空），不给就加这条变化测到的新码值。
     - redraft：建一个只含这张表的起草任务；reprofile：建一个只含这张表的剖析任务。建不了（模型没配、剖析没开、同源正忙）
@@ -418,22 +421,29 @@ async def handle(session: AsyncSession, source: Any, row: SourceChange, action: 
     job_id: str | None = None
     table = row.table_name
     if action == "clean_catalog":
-        paths = [str(i["path"]) for i in _catalog_paths(row)]
-        if not paths:
+        by_table = _catalog_paths(row)
+        if not by_table:
             raise ChangeInvalid("这条变化的影响面里没有目录项，不需要清理")
-        entry = await catalog.read_entry(session, source.id, table)
-        if entry is None:
+        versions: dict[str, int] = {}
+        for owner, paths in by_table.items():
+            entry = await catalog.read_entry(session, source.id, owner)
+            if entry is None:
+                continue
+            written = await catalog.write_entry(session, source.id, owner, without_paths(entry.notes, paths),
+                                                if_version=entry.version, actor=actor, commit=False)
+            versions[owner] = written.version
+        if not versions:
             raise ChangeInvalid(f"{table} 已经没有数据目录了")
-        notes = without_paths(entry.notes, paths)
-        written = await catalog.write_entry(session, source.id, table, notes, if_version=entry.version, actor=actor,
-                                            commit=False)
-        version = written.version
+        # 记这张表的目录版本；别的表（指向它的关联关系）也动了的，另记在 catalog_versions 里
+        version = versions.get(table, next(iter(versions.values())))
+        if len(versions) > 1:
+            out["catalog_versions"] = versions
     elif action == "add_codes":
         if row.kind != CODES_NEW or not row.column_name:
             raise ChangeInvalid("只有「出现了新码值」能加入码值")
         wanted = dict(codes) if codes else {str(c): "" for c in ((row.after or {}).get("codes") or [])}
         if not wanted or not all(isinstance(k, str) and isinstance(v, str) for k, v in wanted.items()):
-            raise ChangeInvalid("要加入的码值应为 {码值: 含义} 的对照，含义可以先空着")
+            raise ChangeInvalid("要加入的码值应为「码值 → 含义」的对照，含义可以先空着")
         entry = await catalog.read_entry(session, source.id, table)
         current = entry.version if entry else 0
         meta_tables = (getattr(source, "schema_cache", None) or {}).get("tables") or None
@@ -453,6 +463,8 @@ async def handle(session: AsyncSession, source: Any, row: SourceChange, action: 
         job_id = await _redraft(session, source, table, actor, row.id)
         out["job"] = {"kind": "draft", "id": job_id}
     resolve(row, action=action, by=actor, note=note, catalog_version=version, job_id=job_id)
+    if "catalog_versions" in out:
+        row.resolution = {**(row.resolution or {}), "catalog_versions": out["catalog_versions"]}
     await session.commit()
     if version is not None:
         out["catalog_version"] = version

@@ -1509,7 +1509,8 @@ def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, 
     return {"kind": "relation", "path": f"relations.{o.rid}", "target": o.target,
             "columns": list(rel.get("columns") or []), "to_table": rel.get("to_table"),
             "to_columns": list(rel.get("to_columns") or []), "status": status, "confirmed": confirmed,
-            "previous_status": previous, "coverage": o.coverage, "cardinality": o.cardinality,
+            "previous_status": previous, "previous_coverage": rel.get("coverage"), "coverage": o.coverage,
+            "cardinality": o.cardinality,
             "cardinality_checked": o.cardinality_checked, "sample": o.sample, "matched": o.matched, "summary": summary}
 
 

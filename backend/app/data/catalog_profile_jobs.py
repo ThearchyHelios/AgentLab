@@ -159,13 +159,21 @@ async def task_rows(session: AsyncSession, job_id: str) -> list[Any]:
     )).all())
 
 
+#: 取值观察的四类检查在逐表进度里合成一类（observe）
+_OBSERVE_GROUP = frozenset({"rows", "codes_observe", "freshness", "daily_volume"})
+
+
 def _by_kind(checks: list[Any]) -> dict[str, list[int]]:
-    """检查项按种类的进度：{relation: [结束了的, 总数], codes: […], date: […]}。结束了的含跳过的。"""
-    out = {"relation": [0, 0], "codes": [0, 0], "date": [0, 0]}
+    """检查项按种类的进度：{relation: [结束了的, 总数], codes: […], date: […], observe: […]}。结束了的含跳过的；取值观察的
+    四类合成 observe 一类。"""
+    out = {"relation": [0, 0], "codes": [0, 0], "date": [0, 0], "observe": [0, 0]}
     for check in checks:
-        if not isinstance(check, dict) or check.get("kind") not in out:
+        if not isinstance(check, dict):
             continue
-        pair = out[check["kind"]]
+        kind = "observe" if check.get("kind") in _OBSERVE_GROUP else check.get("kind")
+        if kind not in out:
+            continue
+        pair = out[kind]
         pair[1] += 1
         if check.get("state") in ("done", "skipped"):
             pair[0] += 1
@@ -1111,15 +1119,19 @@ class _ProfileRun(runtime.JobRun):
         if values := self._counters():
             await session.execute(update(CatalogProfileJob).where(CatalogProfileJob.id == self.job_id).values(**values)
                                   .execution_options(synchronize_session=False))
-        if result.observations and self.cx is not None:
-            # 取值观察：观察记录、比出的取值变化、撤销「已列全」都和这张表的结果、目录在同一个事务里
+        if self.cx is not None and (result.observations or result.findings):
+            # 取值观察：观察记录、比出的取值变化、撤销「已列全」，以及关联覆盖率的下降，都和这张表的结果、目录在同一个
+            # 事务里
             from app.data import catalog_profile_observe
             from app.data.source_changes import Detected
 
             detected = Detected(job_kind="profile", job_id=self.job_id, task_seq=seq,
                                 trigger=self._trigger["trigger"], actor=self.actor, fire_at=self._trigger["fire_at"])
-            await catalog_profile_observe.save(session, self.cx.source, result.table, result, job_id=self.job_id,
-                                               seq=seq, detected=detected)
+            if result.observations:
+                await catalog_profile_observe.save(session, self.cx.source, result.table, result, job_id=self.job_id,
+                                                   seq=seq, detected=detected)
+            await catalog_profile_observe.record_coverage_drops(session, self.cx.source, result.table, result,
+                                                                detected=detected)
 
     async def _finish(self, session: AsyncSession) -> None:
         """剖析完：万一还有没收尾的表（进度回调写库失败之类）记失败；有 failed、partial、cancelled 的表是 partial，否则

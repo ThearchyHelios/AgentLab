@@ -5,8 +5,12 @@
 2. 用 AgentLab 自己的探查（app.data.introspect）读结构，核对类型写法、ENUM 取值、Oracle 小写带引号的名字、索引首列；
 3. 用 AgentLab 自己的剖析（catalog_profile.profile_table，目录读写换成内存里的）逐表剖析，经只读连接、守卫、单条时限，
    和线上走的是同一条路；
-4. 直接跑取值观察要用的新查询（按日行数、时间窗口里的取值分布、块采样）；
-5. 断言：所有查询零报错（留痕里没有超时、失败、守卫拒），每个结论和下面按夹具定义手算的一致。
+4. 直接跑取值观察要用的新查询（按日行数、时间窗口里的取值分布、块采样、最新业务日期）；
+5. 对象索引的字典查询（第 2 波，data/source_objects.list_objects：MySQL information_schema.TABLES、PostgreSQL pg_class 加
+   obj_description、Oracle ALL_OBJECTS 加 ALL_TAB_COMMENTS）：走字典查询（不退回 Inspector）、类型、注释、行数估算对得上；
+6. 取值观察的四类检查（第 3 波，data/catalog_profile_observe）经剖析引擎跑一遍（只观察，目录读写换成内存里的）：行数、
+   码值观察（小表整表、大表 PG / Oracle 块采样、MySQL 按存储顺序的前 N 行）、最新业务日期（大表业务日期列打头有索引）；
+7. 断言：所有查询零报错（留痕里没有超时、失败、守卫拒），每个结论和下面按夹具定义手算的一致。
 
 夹具的数（手算的依据）：orders 40 行，id 1–40。
 - store_code = id % 5 + 1（整数子列，指向文字主键 stores.code，'1'–'5' 都在）；
@@ -36,7 +40,7 @@ from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 
 from app.core.crypto import encrypt  # noqa: E402
-from app.data import catalog, catalog_profile, introspect  # noqa: E402
+from app.data import catalog, catalog_profile, introspect, source_objects  # noqa: E402
 from app.data import engine as data_engine  # noqa: E402
 from app.data.catalog_profile import ProfileSettings, SqlDialect  # noqa: E402
 
@@ -122,9 +126,13 @@ def _ddl(t: Target) -> list[str]:
             f"{_q(t, 'level')} {intg}", f"paid_at {ts}", f"{_q(t, 'date')} DATE"]
     if t.mysql:
         cols.append("pay_way ENUM('cash','card','coupon')")
-    out = [f"CREATE TABLE stores (code {vc}(10) PRIMARY KEY, name {vc}(20))",
-           f"CREATE TABLE orders ({', '.join(cols)})",
+    orders = f"CREATE TABLE orders ({', '.join(cols)})"
+    if t.mysql:
+        orders += " COMMENT='订单'"
+    out = [f"CREATE TABLE stores (code {vc}(10) PRIMARY KEY, name {vc}(20))", orders,
            "CREATE INDEX ix_orders_paid_at ON orders (paid_at)"]
+    if not t.mysql:
+        out.append("COMMENT ON TABLE orders IS '订单'")
     events = f"CREATE TABLE events (id {intg} PRIMARY KEY, kind {vc}(10))"
     if t.pg:
         events += " WITH (autovacuum_enabled = false)"
@@ -218,7 +226,8 @@ async def _setup(t: Target) -> None:
 # ---------------------------------------------------------------- 剖析：目录换成内存里的
 
 
-async def _profile(source: Any, tables: list[str], notes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+async def _profile(source: Any, tables: list[str], notes: dict[str, dict[str, Any]], *,
+                   observe: bool = False) -> dict[str, Any]:
     cx = catalog_profile.make_context(source, SETTINGS, options={})
     captured: dict[str, Any] = {}
 
@@ -233,7 +242,7 @@ async def _profile(source: Any, tables: list[str], notes: dict[str, dict[str, An
         raise AssertionError(f"剖析要了没预料的库操作：{fn}")
 
     for table in tables:
-        await catalog_profile.profile_table(cx, table, db=db)
+        await catalog_profile.profile_table(cx, table, db=db, regular=not observe, observe=observe)
     return captured
 
 
@@ -359,6 +368,50 @@ async def run_target(t: Target) -> None:
             check(total <= N_EVENTS_OLD + N_EVENTS_NEW, f"块采样跑得通（取到 {total} 行）")
         else:
             check(sampled is None, "MySQL / MariaDB 没有块采样，照实返回 None")
+        # ---- 对象索引的字典查询（第 2 波）
+        index = await source_objects.list_objects(source, None)
+        found = {o.name: o for o in index.objects}
+        check(index.method == "dictionary" and index.note is None,
+              f"对象索引走字典查询，没有退回 Inspector：{index.method} {index.note or ''}")
+        wanted = {"orders", "events", "stores"} | ({"visits"} if t.oracle else set())
+        check(wanted <= set(found), f"对象索引列出了夹具表：{sorted(found)}")
+        check(found["orders"].kind == "table" and found["orders"].comment == "订单",
+              f"对象索引的类型、表注释：{found.get('orders')}")
+        if t.oracle:
+            check(found["visits"].quote is True, "Oracle 小写带引号的表在对象索引里记了 quote")
+        est = found["events"].est_rows
+        check(est is None or est > 0, f"对象索引的行数估算（做过统计的表）：{est}")
+
+        # ---- 取值观察（第 3 波）：只观察，经剖析引擎、只读守卫、单条时限
+        paid = _key(orders, "paid_at")
+        obs_notes = {
+            "orders": {"business_date": {"value": {"column": paid}, "source": "human", "status": "confirmed"},
+                       "columns": {_key(orders, "status"): {"codes": {"value": {"A": "", "B": ""}, "source": "human",
+                                                                      "status": "confirmed", "complete": True}}}},
+            "events": {"columns": {_key(events, "kind"): {"codes": {"value": {"open": "", "close": ""},
+                                                                    "source": "profile", "status": "proposed"}}}},
+        }
+        seen = await _profile(source, ["orders", "events"], obs_notes, observe=True)
+        logs = [q for _, r in seen.values() for q in r.query_log]
+        bad = [f"{q['kind']} {q['target']}：{q['outcome']} {q['detail']}" for q in logs if q["outcome"] != "ok"]
+        check(not bad, f"取值观察的 {len(logs)} 条查询零报错" + (f"：{bad[:3]}" if bad else ""))
+        got_o = {(o["kind"], o["column"].lower()): o for o in seen["orders"][1].observations}
+        got_e = {(o["kind"], o["column"].lower()): o for o in seen["events"][1].observations}
+        check(got_o.get(("rows", ""), {}).get("data", {}).get("rows") == N_ORDERS, f"orders 的行数观察：{got_o.get(('rows', ''))}")
+        codes = got_o.get(("codes_observe", "status"))
+        check(codes is not None and codes["basis_key"] == "full"
+              and Counter(dict(map(tuple, codes["data"]["values"]))) == EXPECT["status"],
+              f"小表的码值观察看整表、和手算一致：{codes and codes['data']}")
+        fresh = got_o.get(("freshness", "paid_at"))
+        check(fresh is not None and fresh["data"]["max"][:19].replace("T", " ") == str(EXPECT["paid_at"][1]),
+              f"最新业务日期排除了无效日期、和手算一致：{fresh and fresh['data']}")
+        ev = got_e.get(("codes_observe", "kind"))
+        method = "sample" if (t.pg or t.oracle) else "first_rows"
+        check(ev is not None and ev["basis"]["method"] == method,
+              f"大表、没有业务日期：{'块采样' if method == 'sample' else '按存储顺序的前 N 行'}（{ev and ev['basis_key']}）")
+        res = await data_engine.run_query(source, d.max_date_sql(tbl, paid_col))
+        check(bool(res.rows) and str(res.rows[0][0])[:19].replace("T", " ") == str(EXPECT["paid_at"][1]),
+              f"max_date_sql 直接跑：{res.rows}")
     finally:
         await data_engine.engines.invalidate(source.id)
 

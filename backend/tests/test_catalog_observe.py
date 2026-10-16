@@ -289,3 +289,14 @@ async def test_observation_is_not_the_last_profile_and_reaches_the_table_detail(
         "观察之后才加遮罩的列：渲染那一刻滤掉"
     detail = schema_view.table_detail(row, "orders", profile=facts)
     assert f"最新业务日期 paid_on 到 {latest}" in detail
+
+
+def test_coverage_drop_only_when_crossing_the_verified_line():
+    """关联覆盖率从够有确证的线（95%）掉到线以下才记 coverage_drop；没有以前的覆盖率、没掉过线的不记。"""
+    drops = observe.coverage_drops([
+        {"kind": "relation", "path": "relations.r1", "target": "a → b", "previous_coverage": 0.99, "coverage": 0.6},
+        {"kind": "relation", "path": "relations.r2", "target": "c → d", "previous_coverage": 0.99, "coverage": 0.97},
+        {"kind": "relation", "path": "relations.r3", "target": "e → f", "previous_coverage": None, "coverage": 0.5},
+        {"kind": "codes", "path": "columns.x.codes"},
+    ])
+    assert [(d["path"], d["before"], d["after"]) for d in drops] == [("relations.r1", 0.99, 0.6)]
