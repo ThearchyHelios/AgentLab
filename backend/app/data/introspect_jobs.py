@@ -19,6 +19,12 @@
 - **保留**（prune）：每个源保留最近 KEEP_JOBS 个结束了的探查任务。
 
 任务最后的状态：有表读不到是 partial，否则 succeeded；整体出错（数据源没了、连不上）是 failed。
+
+**结构变化**（第 3 波，next-round 03 B1）：探查顺带把前后差异记进 source_changes（data/source_changes.py），每条带影响面
+（data/catalog_impact.structure_impact）。刷新对象索引时记新出现的表、真删除的表（第一次建索引只建基线）；开始执行时记
+离开范围的、有数据目录的表，以及范围规则和上一次探查不同（scope_changed）；逐批读完时拿上一次的结构和这一次的比
+（data/schema_diff.diff_table），在范围里却读不到结构的记 table_reflect_failed（不算删除）。升级后第一次读到（结构版本 0）
+只建基线。记变化出错只记日志，不挡探查。任务上记 trigger（manual 人点的 / schedule 定时维护）和定时的 fire_at。
 """
 from __future__ import annotations
 
@@ -271,6 +277,7 @@ async def preview(session: AsyncSession, row: Any, *, schema: str | None = None,
         return out
     async with so.source_lock(row.id):
         stats = await so.refresh_index(session, row.id, configured, result, legacy=row.schema_cache)
+        await _record_index_changes(session, row, stats, _detected(None, "manual", None))
         await session.commit()
     plan = await so.plan_for(session, row, rules)
     out.update(stored=True, objects=[o.name for o in result.objects], scope=plan.summary(), added=stats.added,
@@ -278,9 +285,10 @@ async def preview(session: AsyncSession, row: Any, *, schema: str | None = None,
     return out
 
 
-async def prepare(session: AsyncSession, row: Any, *, actor: str | None,
-                  trigger: str = "manual") -> tuple[IntrospectJob, int]:
-    """建一个排队的探查任务（还没开始，调用方接着 manager.start）。返回 (任务, 几张表)。
+async def prepare(session: AsyncSession, row: Any, *, actor: str | None, trigger: str = "manual",
+                  fire_at: str | None = None, schedule_id: str | None = None) -> tuple[IntrospectJob, int]:
+    """建一个排队的探查任务（还没开始，调用方接着 manager.start）。返回 (任务, 几张表)。trigger 是 manual（人点的）或
+    schedule（定时维护：fire_at、schedule_id 记进任务的 scope，留痕这一次是哪一次触发建的）。
 
     上传表格、记录表抛 IntrospectRefused；同源已有排队或进行中的探查任务抛 IntrospectBusy；对象清单拿不到抛
     IntrospectFailed（失败照实记进 schema_cache）；规则命中超过上限抛 ScopeTooLarge（对象索引照样刷新了）。
@@ -306,6 +314,7 @@ async def prepare(session: AsyncSession, row: Any, *, actor: str | None,
         rules = so.ScopeRules.from_options(row.options)
         plan = await so.plan_for(session, row, rules)
         if plan.over:
+            await _record_index_changes(session, row, stats, _detected(None, trigger, actor, fire_at))
             await session.commit()
             raise ScopeTooLarge(plan)
         summary = {**plan.summary(rules), "index_method": stats.method, "index_capped": stats.capped,
@@ -313,6 +322,10 @@ async def prepare(session: AsyncSession, row: Any, *, actor: str | None,
                    "adopted": stats.adopted}
         if candidates:
             summary["available_schemas"] = candidates
+        if fire_at:
+            summary["fire_at"] = fire_at
+        if schedule_id:
+            summary["schedule_id"] = schedule_id
         job = IntrospectJob(id=new_id(), source_id=source_id, status="queued", trigger=trigger, schema_name=schema,
                             scope=summary, created_by=actor)
         session.add(job)
@@ -323,6 +336,7 @@ async def prepare(session: AsyncSession, row: Any, *, actor: str | None,
             raise IntrospectBusy(busy_message(SimpleNamespace(name=name), None)) from e
         session.add_all([IntrospectTask(job_id=job.id, seq=i, table_name=table, reason=reason)
                          for i, (table, reason) in enumerate(plan.in_scope.items())])
+        await _record_index_changes(session, row, stats, _detected(job.id, trigger, actor, fire_at))
         await session.commit()
     try:
         await prune(session, source_id)
@@ -343,6 +357,93 @@ async def prune(session: AsyncSession, source_id: str, *, keep: int = KEEP_JOBS)
     await session.execute(delete(IntrospectJob).where(IntrospectJob.id.in_(victims)))
     await session.commit()
     return len(victims)
+
+
+# ==========================================================================
+# 结构变化（next-round 03 B1）
+# ==========================================================================
+
+#: 一次刷新对象索引最多记几条「新出现的表」（几千个按月新建的分区表这类：照实记前面的，其余只进日志）
+ADDED_RECORDED = 200
+
+
+def _detected(job_id: str | None, trigger: str, actor: str | None, fire_at: str | None = None,
+              task_seq: int | None = None) -> Any:
+    from app.data.source_changes import Detected
+
+    return Detected(job_kind="introspect", job_id=job_id, task_seq=task_seq, trigger=trigger or "manual",
+                    actor=actor, fire_at=fire_at)
+
+
+async def _record_index_changes(session: AsyncSession, row: Any, stats: so.RefreshStats, detected: Any) -> None:
+    """刷新对象索引得出的表级变化（不提交）：新出现的表（table_added；这个 schema 第一次建索引时全是新的，只建基线）、
+    真删除的表（table_removed，带影响面：目录里这张表的项、别的表指向它的关联关系、写死它的已发布模板）。出错只记日志。"""
+    if not stats.removed_names and not (stats.added_names and not stats.first_build):
+        return
+    from app.data import catalog_impact
+    from app.data import schema_diff as sd
+    from app.data import source_changes as sc
+
+    try:
+        now = utcnow().isoformat()
+        changes: list[sc.NewChange] = []
+        added = [] if stats.first_build else list(stats.added_names)
+        if len(added) > ADDED_RECORDED:
+            logger.warning("数据源 %s 这次新出现 %d 个对象，变化记录只记前 %d 个", row.name, len(added), ADDED_RECORDED)
+        for name in added[:ADDED_RECORDED]:
+            changes.append(sc.NewChange(kind=sd.TABLE_ADDED, table=name, severity="info", key=now))
+        if stats.removed_names:
+            schema = so.index_schema(row)
+            gone = {r.name: r for r in (await session.execute(select(SourceObject).where(
+                SourceObject.source_id == row.id, SourceObject.schema_name == schema,
+                SourceObject.name.in_(stats.removed_names)))).scalars()}
+            tables_after = dict((row.schema_cache or {}).get("tables") or {})
+            specs = await catalog_impact.published_specs(session)
+            for name in stats.removed_names:
+                obj = gone.get(name)
+                version = int(obj.struct_version or 0) if obj is not None else 0
+                meta = obj.meta if obj is not None and isinstance(obj.meta, dict) else None
+                [(affects, severity)] = await catalog_impact.structure_impact(
+                    session, row, name, [sd.Diff(sd.TABLE_REMOVED)], before_meta=meta,
+                    tables_after={k: v for k, v in tables_after.items() if k != name}, specs=specs)
+                changes.append(sc.NewChange(
+                    kind=sd.TABLE_REMOVED, table=name, severity=severity, affects=affects,
+                    before={"kind": obj.kind if obj is not None else "table"}, struct_version_before=version or None,
+                    key=(obj.removed_at.isoformat() if obj is not None and obj.removed_at else now)))
+        await sc.record_all(session, row, changes, detected)
+    except Exception:  # noqa: BLE001 - 记变化出错不挡探查
+        logger.exception("数据源 %s 记录表级的结构变化时出错", getattr(row, "name", "?"))
+
+
+async def _record_scope_changes(session: AsyncSession, row: Any, job: IntrospectJob, leaving: list[str],
+                                entering: int) -> None:
+    """开始执行、把范围写进对象索引时（不提交）：有数据目录的表离开了范围（table_left_scope，不算删除），和范围规则跟上一次
+    探查不同（scope_changed：前后的规则、进出各几张）。出错只记日志。"""
+    from app.data import catalog
+    from app.data import schema_diff as sd
+    from app.data import source_changes as sc
+
+    try:
+        detected = _detected(job.id, job.trigger, job.created_by, (job.scope or {}).get("fire_at"))
+        changes: list[sc.NewChange] = []
+        if leaving:
+            noted = set((await catalog.read_catalog(session, row.id)).keys())
+            for name in leaving:
+                if name in noted:
+                    changes.append(sc.NewChange(kind=sd.TABLE_LEFT_SCOPE, table=name, severity="info", key=job.id))
+        previous = (await session.execute(
+            select(IntrospectJob).where(IntrospectJob.source_id == job.source_id, IntrospectJob.id != job.id,
+                                        IntrospectJob.started_at.is_not(None),
+                                        IntrospectJob.created_at <= job.created_at)
+            .order_by(IntrospectJob.created_at.desc()).limit(1))).scalar_one_or_none()
+        before = (previous.scope or {}).get("rules") if previous is not None else None
+        after = (job.scope or {}).get("rules")
+        if isinstance(before, dict) and isinstance(after, dict) and before != after:
+            changes.append(sc.NewChange(kind=sd.SCOPE, table="", severity="info", before={"rules": before},
+                                        after={"rules": after, "entered": entering, "left": len(leaving)}, key=job.id))
+        await sc.record_all(session, row, changes, detected)
+    except Exception:  # noqa: BLE001
+        logger.exception("数据源 %s 记录探查范围的变化时出错", getattr(row, "name", "?"))
 
 
 # ==========================================================================
@@ -425,11 +526,31 @@ async def startup() -> int:
 # ==========================================================================
 
 
+def _side(diff: Any, which: str) -> Any:
+    """一条差异的前（before）或后（after），疑似改名的另一半记在这一侧（{…, rename}）。"""
+    value = getattr(diff, which)
+    if diff.rename:
+        base = dict(value) if isinstance(value, dict) else ({"value": value} if value is not None else {})
+        return {**base, "rename": dict(diff.rename)}
+    return value
+
+
+def json_key(value: Any) -> str:
+    import json
+
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+
 class _IntrospectRun(runtime.JobRun):
     """一个探查任务在后台的一次执行（进队、停止、收尾的框架在 runtime.JobRun）。"""
 
     kind = "introspect"
     model = IntrospectJob
+
+    def __init__(self, job_id: str) -> None:
+        super().__init__(job_id)
+        #: 已发布模板和解析好的图（catalog_impact.published_specs）：这次探查里各批的影响面共用，第一次用到时读
+        self._specs: list[Any] | None = None
 
     async def _stopped(self) -> None:
         if self.stop_reason == "user":
@@ -510,8 +631,15 @@ class _IntrospectRun(runtime.JobRun):
             counts = {r: 0 for r in so.SCOPE_REASONS}
             for reason in reasons.values():
                 counts[reason] = counts.get(reason, 0) + 1
+            before = set((await session.execute(select(SourceObject.name).where(
+                SourceObject.source_id == source_id, SourceObject.schema_name == schema,
+                SourceObject.in_scope.is_(True)))).scalars())
             plan = so.ScopePlan(in_scope=reasons, counts=counts, cap=0, index_total=0, out_of_scope=0)
             await so.apply_scope(session, source_id, schema, plan)
+            row = await session.get(DataSource, source_id)
+            if job is not None and row is not None:
+                await _record_scope_changes(session, row, job, sorted(before - set(reasons)),
+                                            len(set(reasons) - before))
             await session.commit()
 
     async def _recheck(self, session: AsyncSession, source_id: str) -> Any:
@@ -540,8 +668,15 @@ class _IntrospectRun(runtime.JobRun):
 
     async def _save_batch(self, session: AsyncSession, source_id: str, schema: str, batch: list[tuple[int, str]],
                           got: so.Reflected) -> None:
-        """一批读完：读到的结构写进对象索引，逐表记 ok / failed 和结构版本。"""
+        """一批读完：读到的结构写进对象索引，逐表记 ok / failed 和结构版本；拿上一次的结构和这一次的比，变化记进
+        source_changes（同一个事务）。"""
+        old = {r.name: r for r in (await session.execute(
+            select(SourceObject.name, SourceObject.meta, SourceObject.struct_version, SourceObject.fingerprint,
+                   SourceObject.reflect_error).where(
+                SourceObject.source_id == source_id, SourceObject.schema_name == schema,
+                SourceObject.name.in_([name for _, name in batch])))).all()}
         versions = await so.save_reflected(session, source_id, schema, got)
+        await self._record_diffs(session, source_id, batch, got, old, versions)
         now = utcnow()
         for seq, name in batch:
             if name in got.tables:
@@ -553,6 +688,60 @@ class _IntrospectRun(runtime.JobRun):
                                   .values(**values, struct_version=versions.get(name, 0), finished_at=now)
                                   .execution_options(synchronize_session=False))
         await session.commit()
+
+    async def _record_diffs(self, session: AsyncSession, source_id: str, batch: list[tuple[int, str]],
+                            got: so.Reflected, old: dict[str, Any], versions: dict[str, int]) -> None:
+        """这一批的结构差异（不提交）：读到的表指纹变了、又不是基线（schema_diff.is_baseline）的，逐条比出变化、算影响面；
+        以前读得到、这次读不到的记 table_reflect_failed。出错只记日志，不挡探查。"""
+        from app.data import catalog_impact
+        from app.data import schema_diff as sd
+        from app.data import source_changes as sc
+
+        try:
+            todo: list[tuple[int, str, list[Any], dict[str, Any] | None]] = []
+            failed: list[tuple[int, str]] = []
+            for seq, name in batch:
+                prev = old.get(name)
+                if prev is None:
+                    continue
+                if name in got.tables:
+                    meta = got.tables[name]
+                    if sd.is_baseline(prev.struct_version, prev.meta) or so.fingerprint(meta) == prev.fingerprint:
+                        continue
+                    diffs = sd.diff_table(prev.meta, meta)
+                    if diffs:
+                        todo.append((seq, name, diffs, prev.meta))
+                elif name in got.skipped and isinstance(prev.meta, dict) and prev.meta and not prev.reflect_error:
+                    failed.append((seq, name))
+            if not todo and not failed:
+                return
+            job = await session.get(IntrospectJob, self.job_id)
+            row = await session.get(DataSource, source_id)
+            if job is None or row is None:
+                return
+            fire_at = (job.scope or {}).get("fire_at")
+            if self._specs is None:
+                self._specs = await catalog_impact.published_specs(session)
+            tables_after = {**dict((row.schema_cache or {}).get("tables") or {}), **got.tables}
+            for seq, name, diffs, before in todo:
+                impacts = await catalog_impact.structure_impact(session, row, name, diffs, before_meta=before,
+                                                                tables_after=tables_after, specs=self._specs)
+                after_v, before_v = versions.get(name), old[name].struct_version
+                changes = [sc.NewChange(kind=d.kind, table=name, column=d.column, severity=severity,
+                                        before=_side(d, "before"), after=_side(d, "after"), affects=affects,
+                                        struct_version_before=before_v, struct_version_after=after_v,
+                                        key=(after_v, d.key, json_key(d.before), json_key(d.after)))
+                           for d, (affects, severity) in zip(diffs, impacts)]
+                await sc.record_all(session, row, changes,
+                                    _detected(self.job_id, job.trigger, job.created_by, fire_at, seq))
+            for seq, name in failed:
+                await sc.record(session, row, sc.NewChange(
+                    kind=sd.TABLE_REFLECT_FAILED, table=name, severity="warning",
+                    after={"error": got.skipped.get(name)}, struct_version_before=old[name].struct_version,
+                    key=(old[name].struct_version, got.skipped.get(name))),
+                    _detected(self.job_id, job.trigger, job.created_by, fire_at, seq))
+        except Exception:  # noqa: BLE001
+            logger.exception("探查任务 %s 记录结构变化时出错", self.job_id)
 
     async def _finish(self, session: AsyncSession, source_id: str) -> None:
         """读完：物化 schema_cache、盖同步时间；有表读不到是 partial，否则 succeeded。"""

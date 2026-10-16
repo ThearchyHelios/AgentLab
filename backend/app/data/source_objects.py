@@ -446,6 +446,11 @@ class RefreshStats:
     note: str | None = None
     #: 第一次建对象索引时从升级前的老缓存接进来几张（legacy_seed）
     adopted: int = 0
+    #: 这次新出现的、不在了（真删除）的对象名（结构变化按它记 table_added / table_removed，next-round 03 B1）；
+    #: first_build：这个 schema 的对象索引是这一次才建起来的——全是新的，只建基线、不记「新出现的表」
+    added_names: list[str] = field(default_factory=list)
+    removed_names: list[str] = field(default_factory=list)
+    first_build: bool = False
 
 
 def _chunks(items: list[Any], size: int = 500) -> Iterable[list[Any]]:
@@ -548,14 +553,18 @@ async def refresh_index(session: AsyncSession, source_id: str, schema: str, resu
         await session.execute(update(_SO).where(_SO.id.in_(chunk)).values(removed_at=None)
                               .execution_options(synchronize_session=False))
     gone: list[str] = []
+    gone_names: list[str] = []
     if not result.capped:
-        gone = [r.id for name, r in existing.items() if name not in seen and r.removed_at is None]
+        gone_names = [name for name, r in existing.items() if name not in seen and r.removed_at is None]
+        gone = [existing[name].id for name in gone_names]
         for chunk in _chunks(gone):
-            # 真删除：不在范围里了，结构（meta）留着——下一波的结构差异要拿它和以前比
+            # 真删除：不在范围里了，结构（meta）留着——结构差异（data/schema_diff）要拿它和以前比、算影响面
             await session.execute(update(_SO).where(_SO.id.in_(chunk)).values(removed_at=now, in_scope=False)
                                   .execution_options(synchronize_session=False))
     return RefreshStats(total=len(seen), added=len(new_rows), removed=len(gone), method=result.method,
-                        capped=result.capped, note=result.note, adopted=len(seeds))
+                        capped=result.capped, note=result.note, adopted=len(seeds),
+                        added_names=[r["name"] for r in new_rows] if existing else [], removed_names=gone_names,
+                        first_build=not existing)
 
 
 async def live_objects(session: AsyncSession, source_id: str, schema: str) -> list[tuple[str, str]]:

@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import artifact_store
 from app.core.events import EventType
-from app.data.catalog_impact import catalog_drift
+from app.data.catalog_impact import catalog_drift, schema_drift
 from app.apps.versions import is_published, subgraph_pin_problems
 from app.db.models import Run, Workflow, WorkflowVersion
 from app.engine.governance import governance_note, unresolved_caliber_upgrades
@@ -165,9 +165,13 @@ async def launch_run(
         # 数据目录和口径卡不同：目录是给人和助手看的说明，不是运行的输入。发布之后变了只提醒、不拦——
         # 拦下来等于让一次文字修订卡住正式出具
         catalog_changes = await catalog_drift(session, snapshot.catalog_versions)
+        # 表结构同理（next-round 03 B1）：发布之后结构版本变了只提醒、不拦——只是加了一列不该卡住正式出具，真删了列查询
+        # 本身会照实报错
+        schema_changes = await schema_drift(session, snapshot.schema_versions)
     else:
         upgrade_events = []
         catalog_changes = []
+        schema_changes = []
         if workflow_id:
             workflow = await session.get(Workflow, workflow_id)
             if not workflow:
@@ -197,6 +201,10 @@ async def launch_run(
         # SQL 用到的，possible Agent 可能查询的（界面分开说）
         notes.append((EventType.CATALOG_DRIFT, None,
                       {"version": run_version, "count": len(catalog_changes), "tables": catalog_changes}))
+    if schema_changes:
+        # 回看这次正式出具，能知道当时的表结构和发布时不一样：哪几张表、发布时和现在的结构版本、还没处理的变化
+        notes.append((EventType.SCHEMA_DRIFT, None,
+                      {"version": run_version, "count": len(schema_changes), "tables": schema_changes}))
     if capability_changes:
         # 能力的治理（读写效果、审批、遮罩……）发布之后改过：同目录漂移，只提醒、不拦，之后回看这次运行知道差在哪
         notes.append(("log", None, {
