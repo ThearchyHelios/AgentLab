@@ -919,7 +919,17 @@ async def review_entry(session: AsyncSession, source_id: str, table: str, path: 
     if if_version != current:
         raise CatalogConflict(table, current)
     notes = review_item(entry.notes if entry else {}, path, action)
-    return await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
+    written = await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
+    after_review(source_id, table, entry.notes if entry else None, written)
+    return written
+
+
+def after_review(source_id: str, table: str, before: Mapping[str, Any] | None, written: CatalogEntry) -> None:
+    """审阅、人工编辑、保存提案写进目录之后（已提交）：影响数字的项被驳回或改了的，口径账本在后台找出依据了它的答案、标
+    「依据有变」（ledger/recall.after_review，docs/design/next-round/02-口径账本.md 做法 7 二）。不挡这次写入，出错只记日志。"""
+    from app.ledger import recall
+
+    recall.after_review(source_id, table, before, written.notes, written.version)
 
 
 async def save_human_edit(session: AsyncSession, source_id: str, table: str, submitted: Mapping[str, Any], *,
@@ -939,7 +949,9 @@ async def save_human_edit(session: AsyncSession, source_id: str, table: str, sub
         schema_cache = getattr(row, "schema_cache", None)
     notes = apply_human_edit(entry.notes if entry else {}, submitted, table=table,
                              inferable=structure_relation_ids(schema_cache, table))
-    return await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
+    written = await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
+    after_review(source_id, table, entry.notes if entry else None, written)
+    return written
 
 
 # ==========================================================================
@@ -1251,7 +1263,9 @@ async def save_patch(session: AsyncSession, source_id: str, table: str, changes:
     if if_version != current:
         raise CatalogConflict(table, current)
     notes = apply_patch(entry.notes if entry else {}, changes, table=table, tables=tables)
-    return await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
+    written = await write_entry(session, source_id, table, notes, if_version=current, actor=actor)
+    after_review(source_id, table, entry.notes if entry else None, written)
+    return written
 
 
 # ==========================================================================

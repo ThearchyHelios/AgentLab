@@ -92,6 +92,16 @@ class EventType(StrEnum):
     # algo, counts, trigger}。追加在封存之后（post_seal），是批注不是证据：比对依据的已发布口径在运行之外，不能混进运行
     # 自身的封存事实；封存核对照旧一致
     LEDGER_MATCHED = "ledger.matched"
+    # 口径召回（02 做法 7）：口径发布新版本后，在同一份数据上把新旧两版各算一次（召回运行，origin_kind=recall）。召回运行
+    # 结束时在它自己身上记一条结论 {role: recall, changed, workflow_id, from_version, to_version, metrics, answers, tasks}；
+    # 数没变的那几个原答案的运行上各记一条 {role: answer, changed: false, recall_run, workflow_id, from_version,
+    # to_version}，界面上写「已按 vN 核对，不影响」（数变了的开 recall 待办，不在原答案上记）。同 ledger.matched：追加在
+    # 封存之后（post_seal），是批注不是证据，不进封存范围
+    LEDGER_RECALLED = "ledger.recalled"
+    # 答案依据的东西变了（02 做法 7 二、三）：kind=catalog 目录里影响数字的一项被驳回或改了（冻结的目录里看得到这一项）；
+    # structure 用到的表或列被删、列的类型变了；values 触及有效记录条件的新码值；catalog_edit 处理变化时改了目录。带数据源、
+    # 表、哪几项（路径和叫法），按新目录跑 SQL 检查新出现的错误级问题条数。同上，封存之后追加，不进封存范围
+    LEDGER_BASIS_CHANGED = "ledger.basis_changed"
 
     # 应用平台（docs/design/app-platform-and-look.md §3.11）
     # 运行来源：发起时写进 launch_run 的 notes，在封存范围内（engine/origin.py）

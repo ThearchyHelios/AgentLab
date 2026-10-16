@@ -577,9 +577,12 @@ async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: Wo
     workflow.published_by = actor
     await session.commit()
     # 口径账本（next-round 02 做法 8）：从问数据固化出的口径发布了，来源运行在后台按它补比一次（不挡发布）
+    from app.ledger import recall as ledger_recall
     from app.ledger.certify import after_publish
 
     after_publish(workflow.id, workflow.origin)
+    # 口径召回（next-round 02 做法 7、拍板 L6）：用过旧版本的答案在后台按计划排队重算（每次最多 recall_limit 组），失败不影响发布
+    ledger_recall.after_publish(workflow.id, snapshot.version, actor)
     return {
         "ok": True,
         "level": level,
@@ -588,6 +591,20 @@ async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: Wo
         "published_by": workflow.published_by,
         "catalog_versions": recorded_versions(snapshot.catalog_versions),
     }
+
+
+@router.get("/{workflow_id}/recall-preview")
+async def recall_preview(workflow_id: str, version: int | None = None,
+                         session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """发布弹窗的召回预告（next-round 02 做法 7、8）：把 version（缺省是最新保存的那一版）发布成新版本之后，旧版本被多少问数
+    回答、导出、定时任务、应用用过，预计自动重算几组，超出上限的几组（「另有 M 组未重算」），不能重算的原因各几组。和发布之后
+    真的召回走同一份计划（ledger/recall.build_plan），规模一致。只读，不发起。"""
+    from app.ledger import recall as ledger_recall
+
+    workflow = await session.get(Workflow, workflow_id)
+    if not workflow:
+        raise HTTPException(404, _GONE)
+    return await ledger_recall.preview(session, workflow_id, int(version or workflow.version))
 
 
 # --------------------------------------------------------------------------

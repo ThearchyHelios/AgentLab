@@ -22,7 +22,8 @@
     使用次数比运行次数多时两个都写（「被 2 次运行用到，使用 5 次」），和清单、运行列表上的数都对得上。
 - **批量审阅**（review_batch，POST /catalog/review/batch）：逐表按 if_version 乐观锁，同一张表的几条在一次写入里完成，
   一张表冲突、写不进去不影响别的表；路径不对、表不存在逐条报（results 和请求一一对应）。审阅的规则同单项审阅
-  （catalog.review_item）。
+  （catalog.review_item）。写进去之后影响数字的项被驳回了的，口径账本在后台标依据了它的答案「依据有变」
+  （catalog.after_review → ledger/recall，next-round 02 做法 7 二）。
 - **被哪些运行用过**（table_runs，GET /catalog/{table}/usage）：取法同使用次数（catalog.query_snapshot_tables），按运行
   去重，新的在前；total 是运行次数。
 - **进度**（review_progress，GET /catalog/review-progress）：常用表（使用次数前 TOP_N 张，和起草对话框「使用次数最多的
@@ -379,6 +380,8 @@ async def review_batch(session: AsyncSession, source: Any, items: Iterable[Batch
             continue
         for i in applied:
             results[i] = _result(items[i], ok=True, version=written.version)
+        # 驳回了影响数字的项：口径账本在后台标依据了它的答案「依据有变」（catalog.after_review，同单项审阅）
+        catalog.after_review(source.id, key, entry.notes if entry else None, written)
     return [r for r in results if r is not None]
 
 

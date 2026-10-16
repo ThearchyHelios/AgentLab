@@ -17,8 +17,9 @@
   段对话的算重复的形状，给出这样的形状几个、有重复形状的运行占几成；问题聚类（app/chat/questions：全站唯一的聚类，只取问题
   原文、不含 history、排除系统派生的运行）里 ≥ REPEAT_RUNS 个问题的类占几成。认证队列的转化（第 3 波，ledger/certify）：固化成
   口径草稿几份（origin.freeze 的工作流）、其中发布了几份、点了「不是口径」几项。
-- E4 召回：每个口径版本被用了多少次（比对里等价已证明的运行数、这一版的正式运行数）。每次发布召回了几组、其中数变了的比例要等
-  召回（第 4 波），这之前照实写没有数据，只给召回运行的次数。
+- E4 召回：每个口径版本被用了多少次（比对里等价已证明的运行数、这一版的正式运行数）；每次发布（口径升到某一版）召回了几组、
+  收过尾的几组、其中数变了的几组和比例、重算失败的几组（ledger/recall：召回运行和它收尾时记的 ledger.recalled，第 4 波）。
+  按召回运行的发起时间筛窗口；表结构变了之后的口径试算不算召回。
 """
 from __future__ import annotations
 
@@ -43,7 +44,6 @@ DIFF_GROUPS = ("time", "filter", "aggregate", "join", "other", "parse")
 STATUSES = ("proven", "composed", "related", "none", "skipped")
 #: 没有数据时的说法（这一块的功能还没做）
 NOT_YET_RECONCILE = "对账面板的反馈在第 4 波接上，目前没有数据"
-NOT_YET_RECALL = "召回在第 4 波接上，目前没有数据"
 #: 聚类最多取几个问题（同治理接口的上限）
 QUESTION_LIMIT = 500
 
@@ -294,7 +294,50 @@ async def _e4(session: Any, contents: list[dict[str, Any]], **scope: Any) -> dic
     usage = [{"caliber": key, "workflow_id": key.rsplit("@", 1)[0], "version": int(key.rsplit("@", 1)[1]),
               "proven_runs": proven.get(key, 0), "formal_runs": formal.get(key, 0)}
              for key in sorted(set(proven) | set(formal))]
-    return {"usage": usage, "recall_runs": recalls, "per_publish": {"available": False, "note": NOT_YET_RECALL}}
+    return {"usage": usage, "recall_runs": recalls, "per_publish": await _per_publish(session, **scope)}
+
+
+async def _per_publish(session: Any, **scope: Any) -> dict[str, Any]:
+    """每次发布召回了几组、其中数变了的比例（E4 下半）：按（工作流、新版本）分，读召回运行收尾时记的结论。"""
+    from app.core.events import EventType
+    from app.db.models import Run, RunEvent
+
+    stmt = select(Run.id, Run.origin).where(Run.origin_kind == "recall")
+    if scope.get("run_ids") is not None:
+        stmt = stmt.where(Run.id.in_(list(scope["run_ids"])))
+    else:
+        if scope.get("since") is not None:
+            stmt = stmt.where(Run.created_at >= scope["since"])
+        if scope.get("until") is not None:
+            stmt = stmt.where(Run.created_at < scope["until"])
+    runs = [(rid, o) for rid, o in (await session.execute(stmt)).all()
+            if isinstance(o, dict) and not o.get("probe") and o.get("workflow_id")]
+    settled: dict[str, dict[str, Any]] = {}
+    if runs:
+        rows = (await session.execute(select(RunEvent.run_id, RunEvent.data).where(
+            RunEvent.run_id.in_([r for r, _ in runs]), RunEvent.type == EventType.LEDGER_RECALLED)
+            .order_by(RunEvent.seq))).all()
+        for rid, data in rows:
+            if isinstance(data, dict) and data.get("role") == "recall":
+                settled[rid] = data
+    by: dict[tuple[str, int], dict[str, int]] = {}
+    for rid, origin in runs:
+        key = (str(origin["workflow_id"]), int(origin.get("to_version") or 0))
+        item = by.setdefault(key, {"groups": 0, "settled": 0, "changed": 0, "failed": 0})
+        item["groups"] += 1
+        data = settled.get(rid)
+        if data is None:
+            continue
+        item["settled"] += 1
+        if data.get("outcome") == "failed":
+            item["failed"] += 1
+        elif data.get("changed"):
+            item["changed"] += 1
+    items = [{"caliber": ledger_labels.caliber_key(w, v), "workflow_id": w, "version": v, **c,
+              "changed_rate": _ratio(c["changed"], c["settled"] - c["failed"])}
+             for (w, v), c in sorted(by.items())]
+    return {"available": True, "publishes": items, "groups": sum(i["groups"] for i in items),
+            "changed": sum(i["changed"] for i in items)}
 
 
 async def compute_stats(session: Any, *, since: datetime | None = None, until: datetime | None = None,
