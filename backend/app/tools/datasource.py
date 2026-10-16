@@ -754,7 +754,7 @@ async def _store_schema(source: Any, ctx: ToolContext, *,
     # 「本次运行目录：关」。不进内容哈希，缺省视图不记，快照和以前一字不差
     from app.data.catalog_view import CatalogView, describe
 
-    if (view := describe(CatalogView.parse(ctx.catalog_view))) is not None:
+    if (view := describe(CatalogView.parse(getattr(ctx, "catalog_view", None)))) is not None:
         meta["catalog_view"] = view
     try:
         return await put_json(content, kind=SCHEMA_SNAPSHOT, run_id=ctx.run_id or "", node_id=ctx.node_id or "",

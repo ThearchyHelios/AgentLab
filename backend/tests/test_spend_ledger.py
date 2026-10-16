@@ -12,7 +12,8 @@ from sqlalchemy import delete
 from app.db.base import SessionLocal
 from app.db.models import Setting
 from app.engine import judge, spend
-from app.engine.spend import Ledger, eval_spend, judge_spend, verify_spend
+from app.engine.judge import judge_spend
+from app.engine.spend import Ledger, eval_spend, verify_spend
 
 
 @pytest.fixture(autouse=True)
@@ -70,9 +71,12 @@ async def test_one_book_hitting_its_cap_does_not_squeeze_the_others():
     assert (await eval_spend.daily())["usd"] == pytest.approx(1.5)
 
 
-async def test_all_books_roll_over_on_the_same_clock(monkeypatch):
-    """三本账按同一个本地日期滚动（spend._today）：裁判不再自己另有一份时钟。"""
+async def test_all_books_roll_over_on_the_local_date(monkeypatch):
+    """三本账按同一个本地日期滚动（spend._today）；裁判那本另留一个 judge._today，换它只动裁判这一本。"""
     monkeypatch.setattr(spend, "_today", lambda: "2026-01-02")
     assert await judge_spend.charge(0.1, limit=None, priced=True) == "2026-01-02"
     assert (await judge.daily_spend())["date"] == "2026-01-02"
     assert (await eval_spend.daily())["date"] == "2026-01-02"
+    monkeypatch.setattr(judge, "_today", lambda: "2026-01-03")
+    assert (await judge.daily_spend())["date"] == "2026-01-03"
+    assert (await verify_spend.daily())["date"] == "2026-01-02"

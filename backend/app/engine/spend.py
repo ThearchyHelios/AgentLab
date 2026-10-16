@@ -7,7 +7,7 @@
 要是再抄一份就是第三份。现在都是 Ledger(key) 的实例，各记各的键：
 
 - verify_spend：核查——双盲复算、反方审稿、审批质询里的模型调用；
-- judge_spend：结论句裁判（engine/judge.py）；
+- judge_spend：结论句裁判（实例在 engine/judge.py，键 judge_spend：日历跟着 judge._today，裁判的测试换它模拟跨天）；
 - eval_spend：评测（预留，第 3 波的评测执行接上；设置和接口在那时加）。
 
 **为什么各记各的。** 核查是一个 agent 查库、来回好几轮，一次花的钱比裁判判一份报告多得多；评测一次几十道题。记在同一本
@@ -111,9 +111,8 @@ class Ledger:
                 await session.commit()
 
 
-#: 核查、裁判、评测各一本
+#: 核查、评测各一本（裁判那本在 engine/judge.py 的 judge_spend）
 verify_spend = Ledger("verify_spend")
-judge_spend = Ledger("judge_spend")
 eval_spend = Ledger("eval_spend")
 
 #: 核查那本账的老名字（verify_agent、设置接口、已有测试从这里取）
@@ -135,4 +134,4 @@ async def settle(date: str, delta: float) -> None:
     await verify_spend.settle(date, delta)
 
 
-__all__ = ["Ledger", "SPEND_KEY", "charge", "daily_spend", "eval_spend", "judge_spend", "settle", "verify_spend"]
+__all__ = ["Ledger", "SPEND_KEY", "charge", "daily_spend", "eval_spend", "settle", "verify_spend"]

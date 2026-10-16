@@ -856,7 +856,7 @@ JUDGE_DEFAULTS: dict[str, Any] = {
     "daily_max_usd": 2.0,         # 全局每日裁判金额上限（按本地日期）
 }
 #: 每日计数存在设置表的这一行：{date: 本地日期, usd, calls, unpriced_calls}。不从设置接口进出（账本见 engine/spend.py）
-SPEND_KEY = spend.judge_spend.key
+SPEND_KEY = "judge_spend"
 _COUNTS = frozenset({"report_max_claims"})
 _SECONDS = frozenset({"report_timeout_s"})
 
@@ -1024,8 +1024,14 @@ async def source_masks(catalog: dict[str, Any], *, loader: Callable[[str], Any] 
 # 每日计数
 # --------------------------------------------------------------------------
 
+def _today() -> str:
+    """裁判这本账的日历：本地日期（同 engine/spend._today）。单独留一个名字：测试换掉它来模拟裁判这边跨天。"""
+    return spend._today()
+
+
 #: 裁判这本每日账（engine/spend.py 的 Ledger：预留、找补、按本地日期滚动和核查、评测是同一套代码，各记各的键）
-_LEDGER = spend.judge_spend
+judge_spend = spend.Ledger(SPEND_KEY, today=lambda: _today())
+_LEDGER = judge_spend
 
 
 async def daily_spend() -> dict[str, Any]:
