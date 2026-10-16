@@ -426,9 +426,31 @@ async def test_without_webhook_old_fires_are_not_pushed_later(recorder):
 
 
 async def test_cancelled_run_is_not_pushed(recorder):
-    _, fire_id, _ = await make(run_status="cancelled")
+    _, fire_id, run_id = await make(run_status="cancelled")
+    await set_run(run_id, end_reason="stopped")
     await webhook.notify_due()
     assert recorder.requests == [] and (await fire_row(fire_id)).notified_status == "cancelled"
+
+
+async def test_a_rejected_run_is_pushed_as_not_issued(recorder):
+    """被人驳回的那一期（cancelled + end_reason=rejected）：按「运行结束」推「未出具（被驳回）」，写驳回的那一步，不写驳回的
+    备注和原话（可能带着数）；订阅「运行失败」的不收（05-已知遗留 (a)）。"""
+    _, fire_id, run_id = await make(run_status="cancelled", output={}, fmt="wecom", url=WECOM)
+    await set_run(run_id, end_reason="rejected", error_node_id="pay", error="「付款」未确认（被驳回），没有发送：金额 0042 不对",
+                  graph={"nodes": [{"id": "pay", "type": "tool", "data": {"label": "付款", "config": {}}}],
+                         "edges": []})
+    assert await webhook.notify_due() == 1
+    content = json.loads(recorder.requests[0].content)["markdown"]["content"]
+    assert "定时任务「门店周报」未出具（被驳回）" in content and '状态：<font color="warning">被驳回</font>' in content
+    assert "驳回节点：「付款」" in content and "失败" not in content
+    assert "0042" not in content and "金额" not in content
+    assert (await fire_row(fire_id)).notified_status == "cancelled"
+    [delivery] = await deliveries(fire_id)
+    assert delivery.event == "finished"
+
+    _, only_failed, other = await make(run_status="cancelled", output={}, events=("failed",))
+    await set_run(other, end_reason="rejected")
+    assert await webhook.notify_due() == 0 and (await fire_row(only_failed)).notified_status == "cancelled"
 
 
 async def test_waits_for_the_seal_before_pushing(recorder):

@@ -11,7 +11,7 @@ from langgraph.func import task
 
 from app.core.artifact_store import canonical_json, content_hash
 from app.engine.approval import read_decision
-from app.engine.context import NodeContext, NodeError
+from app.engine.context import NodeContext, NodeError, NodeRejected
 from app.engine.evidence import ledger_enabled, next_exec, query_entry_fields, schema_ledger_entry
 from app.engine.replay import ask, once
 from app.engine.state import GraphState
@@ -127,8 +127,8 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         await once(ctx, EventType.HUMAN_RESOLVED, tool=name, approved=decision.approved,
                    note=decision.note, actor=ctx.actor(), **({"always": True} if always else {}))
         if not decision.approved:
-            raise NodeError(ctx.node.id, f"工具 {name} 的调用已被驳回"
-                            + (f"：{decision.note}" if decision.note else ""))
+            raise NodeRejected.of(ctx, f"工具 {name} 的调用已被驳回" + (f"：{decision.note}" if decision.note else ""),
+                                  kind="tool", decision=decision)
 
     limit = limit_of(tool, name, args)
     ctx.emit(EventType.TOOL_START, tool=name, args=args, **limit_fields(limit))
@@ -299,10 +299,11 @@ async def _run_write(state: GraphState, ctx: NodeContext, name: str, args: dict[
         await once(ctx, EventType.HUMAN_RESOLVED, tool=name, approved=decision.approved, note=decision.note,
                    actor=ctx.actor(), payload_hash=confirmed)
         if not decision.approved:
-            # 驳回是人的决定，不是故障：运行到这里结束（状态记失败，没有可走的出口），说法写成「未确认（被驳回）」，
-            # 实例页按待办的结论另说（apps/resolve.instance_states）
-            raise NodeError(ctx.node.id, f"「{ctx.node.title}」未确认（被驳回），没有发送"
-                            + (f"：{decision.note}" if decision.note else ""))
+            # 驳回是人的决定，不是故障：运行到这里结束（没有可走的出口），收成 cancelled + end_reason=rejected
+            # （NodeRejected），说法写成「未确认（被驳回）」，实例页、通知按同一个结论说（apps/resolve.instance_state）
+            raise NodeRejected.of(ctx, f"「{ctx.node.title}」未确认（被驳回），没有发送"
+                                  + (f"：{decision.note}" if decision.note else ""),
+                                  kind="action_confirm", decision=decision)
         if confirmed != prep.payload_hash:
             # 动作确认不接受改参数：要改在上游的表单里改。确认之后上游的数据变了，看过的就不是要发的，拒发
             raise NodeError(ctx.node.id, f"「{name}」确认时看到的内容和现在要发送的不一致（内容指纹对不上），"
@@ -380,8 +381,8 @@ async def run_code(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         await once(ctx, EventType.HUMAN_RESOLVED, approved=decision.approved, note=decision.note,
                    actor=ctx.actor())
         if not decision.approved:
-            raise NodeError(ctx.node.id, "代码执行已被驳回"
-                            + (f"：{decision.note}" if decision.note else ""))
+            raise NodeRejected.of(ctx, "代码执行已被驳回" + (f"：{decision.note}" if decision.note else ""),
+                                  kind="code", decision=decision)
 
     # 隔离档位：strict 要硬件级（microVM），fast 要低延迟（Seatbelt/bwrap），
     # 留空跟随整机默认。要的那档不可用时会安静退回默认，不阻断运行。

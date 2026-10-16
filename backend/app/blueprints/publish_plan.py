@@ -70,6 +70,8 @@ NOT_INSTANTIATED = "plan.not_instantiated"
 GRAPH_CHANGED = "plan.graph_changed"
 UNTRIALED = "plan.untrialed"
 TRIAL_FAILED = "plan.trial_failed"
+#: 最近一次试运行在某一步被人驳回、没有走完（cancelled + end_reason=rejected）：人的决定，不是故障，不挡发布、照实说
+TRIAL_REJECTED = "plan.trial_rejected"
 TRIAL_DIFFERS = "plan.trial_differs"
 #: 蓝图检查：写回的结果不明时没人核实（blueprints/ops.blueprint_issues）
 RECONCILER_UNBOUND = "bp.reconciler_unbound"
@@ -363,11 +365,28 @@ async def _preflight(session: AsyncSession, bp: Blueprint, target: _Target, *, l
     if is_trial_of(trial, bp) and trial.status == "failed":
         why = (trial.error or "").strip().splitlines()[0][:200] if (trial.error or "").strip() else ""
         out.append(_problem(TRIAL_FAILED, f"最近一次试运行失败了{f'：{why}' if why else ''}", source="plan"))
+    elif is_trial_of(trial, bp) and trial.status == "cancelled" and trial.end_reason == "rejected":
+        # 搭建者在试运行里驳回了写入、审批：那是他的决定，不是图出了错，不说成「试运行失败了」、也不挡发布；只照实说
+        # 没走完——驳回之后的步骤没用真数看过
+        where = _node_title(trial.graph, trial.error_node_id)
+        out.append(_problem(TRIAL_REJECTED, f"最近一次试运行{f'在「{where}」' if where else ''}被驳回、没有走完",
+                            "warning", source="plan"))
     elif not is_trial_of(trial, bp) or trial.status != "succeeded":
         out.append(_problem(UNTRIALED, "还没有成功的试运行：发布之前没用真数看过结果", "warning", source="plan"))
     elif graph_hash(trial.graph or {}) != target.digest:
         out.append(_problem(TRIAL_DIFFERS, "发布的内容和最近一次试运行不同：试运行之后又改过", "warning", source="plan"))
     return [_with_who(p) for p in out]
+
+
+def _node_title(graph: Any, node_id: str | None) -> str | None:
+    """节点在图上的名字（没有名字的给 id）；没有节点时为 None。"""
+    if not node_id:
+        return None
+    for node in (graph or {}).get("nodes") or []:
+        if isinstance(node, dict) and node.get("id") == node_id:
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            return str(data.get("label") or node_id)
+    return node_id
 
 
 def _with_who(issue: dict[str, Any]) -> dict[str, Any]:
@@ -428,6 +447,7 @@ def _summary(bp: Blueprint, target: _Target, *, level: str, first_run: bool, opt
         if current and current > target.version else ""
     codes = {p.get("code") for p in problems}
     tried = "；发布的内容和最近一次试运行不同（试运行之后又改过），建议再试一次" if TRIAL_DIFFERS in codes else \
+        "；最近一次试运行被驳回、没有走完" if TRIAL_REJECTED in codes else \
         "；还没有用真数试运行过" if UNTRIALED in codes else ""
     if target.published_as == level:
         say("publish_workflow", f"「{name}」v{target.version} 已经按{LEVEL_TEXT[level]}级别发布过，不重复发布{tried}")

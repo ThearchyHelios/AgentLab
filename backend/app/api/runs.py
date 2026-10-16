@@ -56,6 +56,9 @@ class RunOut(BaseModel):
     input: dict[str, Any]
     output: dict[str, Any]
     error: str | None
+    #: 结束在 cancelled 的原因（docs/design/next-round/00-总方案.md X9）：rejected 人工驳回、stopped 手动停止。
+    #: 其余终态、加这一列之前的运行为空。界面、通知、定时推送都读这一个字段，不再解析报错原文
+    end_reason: str | None = None
     usage: dict[str, Any]
     run_class: str | None = "exploratory"
     version: int | None = None
@@ -289,11 +292,13 @@ async def cancel_run(run_id: str, x_actor: str | None = Header(default=None)) ->
             run = await session.get(Run, run_id)
         if run is None:
             raise HTTPException(404, "运行记录不存在")
-        raise HTTPException(409, _cannot_cancel(run.status))
+        raise HTTPException(409, _cannot_cancel(run.status, run.end_reason))
     return {"ok": True, "status": outcome}
 
 
-def _cannot_cancel(status: str) -> str:
+def _cannot_cancel(status: str, end_reason: str | None = None) -> str:
+    if status == "cancelled" and end_reason == "rejected":
+        return "这次运行已被驳回结束，没有要停止的。"
     return {
         "succeeded": "这次运行已完成，没有要停止的。",
         "failed": "这次运行已失败结束，没有要停止的；如需继续，请点「继续运行」。",
@@ -396,7 +401,7 @@ async def continue_run(
     except KeyError as e:
         raise _missing(e) from e
     except ContinueRefused as e:
-        # 正式运行带图（formal_graph_locked）、写入结果未知还没核实（action_unresolved）：带机器码
+        # 正式运行带图（formal_graph_locked）、写入结果未知还没核实（action_unresolved）、被驳回了的（run_rejected）：带机器码
         raise CodedHTTPException(409, str(e), e.code) from e
     except ValueError as e:
         raise HTTPException(409, str(e)) from e

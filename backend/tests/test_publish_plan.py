@@ -186,6 +186,30 @@ async def test_a_failed_trial_blocks_the_plan(client, tmp_path):
     assert "plan.untrialed" not in codes
 
 
+async def test_a_rejected_trial_is_a_warning_not_a_failure(client, tmp_path):
+    """最近一次试运行在某一步被驳回（cancelled + end_reason=rejected）：那是人的决定，不说成「试运行失败了」、不挡发布，
+    照实提醒没走完（05-已知遗留 (a)）。"""
+    from sqlalchemy import update
+
+    bp = await _board_from_run(client, tmp_path)
+    async with SessionLocal() as session:
+        trial = await session.get(Run, bp["last_trial_run_id"])
+        node_id = trial.graph["nodes"][-1]["id"]
+        label = trial.graph["nodes"][-1]["data"]["label"]
+        await session.execute(update(Run).where(Run.id == trial.id).values(
+            status="cancelled", end_reason="rejected", error_node_id=node_id, error="人工驳回：不对"))
+        await session.commit()
+    plan = (await client.post(f"/api/blueprints/{bp['id']}/publish-plan", json={"level": "published"})).json()
+    codes = {p["code"]: p for p in plan["problems"]}
+    assert "plan.trial_failed" not in codes and "plan.untrialed" not in codes
+    rejected = codes["plan.trial_rejected"]
+    assert rejected["level"] == "warning" and rejected["message"] == f"最近一次试运行在「{label}」被驳回、没有走完"
+    assert rejected["plain"]["title"] == "最近一次试运行被驳回、没有走完"
+    assert plan["ok"] is True, [p["code"] for p in plan["problems"] if p["level"] == "error"]
+    summary = {x["step"]: x["text"] for x in plan["summary"]}
+    assert "被驳回、没有走完" in summary["publish_workflow"]
+
+
 async def test_a_process_with_an_unbound_step_stops_at_preflight(client):
     wf_id = await s.published_workflow(s.expense_graph(), f"报销-{uuid.uuid4().hex[:4]}", description="报销审批")
     bp = (await client.post("/api/blueprints", json={"source": {"kind": "workflow_version", "id": wf_id},

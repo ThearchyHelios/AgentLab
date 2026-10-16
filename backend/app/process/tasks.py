@@ -761,8 +761,9 @@ async def _notify(task_id: str, event: str, users: list[str]) -> int:
 # --------------------------------------------------------------------------
 
 
-async def tick(now: datetime | None = None) -> int:
-    """调度循环每一拍：提醒、升级、超时驳回（永不自动批准）。返回处理的条数。试运行的待办不处理（只显示时限）。"""
+async def tick(now: datetime | None = None) -> list[str]:
+    """调度循环每一拍：提醒、升级、超时驳回（永不自动批准）。交回这一拍处理过的待办 id（生效可查：办了哪几条，
+    不只是几条；测试按自己造的那条断言，不受同一个库里别的待办影响）。试运行的待办不处理（只显示时限）。"""
     now = now or utcnow()
     action = func.json_extract(Task.on_timeout, "$.action")
     trial = select(Run.id).where(Run.origin_kind == TRIAL_ORIGIN)
@@ -773,10 +774,11 @@ async def tick(now: datetime | None = None) -> int:
                 and_(Task.due_at.is_not(None), Task.due_at <= now, action == "reject"),
                 and_(Task.due_at.is_not(None), Task.due_at <= now, action == "escalate", Task.escalation_level == 0),
             )).order_by(Task.due_at))).scalars())
-    done = 0
+    done: list[str] = []
     for task_id in due:
         try:
-            done += await _on_timeout(task_id, now)
+            if await _on_timeout(task_id, now):
+                done.append(task_id)
         except Exception:  # noqa: BLE001 - 一条出错不拖住这一拍的其他待办
             logger.exception("待办 %s 的超时处理失败，下一拍再试", task_id)
     return done
@@ -838,7 +840,9 @@ async def _on_timeout(task_id: str, now: datetime) -> int:
     from app.engine.runner import run_manager
 
     try:
-        await run_manager.resume(run_id, {"approved": False, "note": EXPIRED_NOTE}, approval_id=approval_id)
+        # expired：节点据此把这次驳回记成超时驳回（engine/approval.Decision.expired → NodeRejected.decision）
+        await run_manager.resume(run_id, {"approved": False, "note": EXPIRED_NOTE, "expired": True},
+                                 approval_id=approval_id)
     except (ValueError, KeyError):
         logger.warning("待办 %s 超时驳回时运行已无法恢复", task_id)
         async with SessionLocal() as session:

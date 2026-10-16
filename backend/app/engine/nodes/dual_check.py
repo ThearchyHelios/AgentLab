@@ -70,7 +70,7 @@ from app.db.base import SessionLocal
 from app.db.models import DataSource
 from app.engine import deadline, recompute
 from app.engine.approval import read_decision
-from app.engine.context import NodeContext, NodeError
+from app.engine.context import NodeContext, NodeError, NodeRejected
 from app.engine.dual_check_facts import preview, preview_joint, record_choices, upload_dates
 from app.engine.evidence import build_catalog, is_number, next_exec
 from app.engine.expressions import ExpressionError, _cell_call, _chain_root, cell_value, column_kind, numeric_text, \
@@ -1396,7 +1396,7 @@ def _choices(ctx: NodeContext, response: Any, rows: list[dict[str, Any]]) -> tup
     填写模式一样：这一步没有驳回的出口。"""
     decision = read_decision(response)
     if isinstance(response, dict) and decision.rejected:
-        raise NodeError(ctx.node.id, f"人工驳回：{decision.note or '未说明原因'}")
+        raise NodeRejected.of(ctx, f"人工驳回：{decision.note or '未说明原因'}", kind="dual_check", decision=decision)
     value = decision.value if isinstance(decision.value, dict) else response if isinstance(response, dict) else {}
     raw = value.get("choices") if isinstance(value.get("choices"), dict) else {}
     choices = {r["metric_id"]: raw[r["metric_id"]] for r in rows if raw.get(r["metric_id"]) in CHOICES}

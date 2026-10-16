@@ -519,15 +519,19 @@ async def test_a_missing_choice_is_recorded_as_no_choice(monkeypatch, shop, clie
     assert not logs(evs, "dual_check_catalog") and await notes_of(source_id) is None
 
 
-async def test_rejecting_the_approval_fails_the_node(monkeypatch, shop, client):
+async def test_rejecting_the_approval_ends_the_run_as_rejected(monkeypatch, shop, client):
+    """明确驳回裁决：人的决定，不是故障（05-已知遗留 (a)）。运行收成 cancelled + end_reason=rejected，原话照旧。"""
     name, _ = shop
     Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
     run = await start(graph(name, BY_ORDER_DATE))
     approval = await pending(run.id)
     res = await client.post(f"/api/approvals/{approval.id}/decide", json={"approved": False, "note": "口径要重新对"})
     assert res.status_code == 200, res.text
-    done = await wait(run.id, ("succeeded", "failed"))
-    assert done.status == "failed" and "人工驳回" in (done.error or "") and "口径要重新对" in done.error
+    done = await wait(run.id, ("succeeded", "failed", "cancelled"))
+    assert (done.status, done.end_reason) == ("cancelled", "rejected"), done.error
+    assert "人工驳回" in (done.error or "") and "口径要重新对" in done.error
+    [ended] = [e for e in await events(run.id) if e.type == "run.cancelled"]
+    assert (ended.data["kind"], ended.data["note"]) == ("dual_check", "口径要重新对")
 
 
 async def test_on_reject_fail_stops_the_run(monkeypatch, shop, client):
