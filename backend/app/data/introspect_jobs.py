@@ -51,7 +51,7 @@ STOPPED_ERROR = "探查已停止"
 SOURCE_GONE = "数据源不存在，可能已被删除"
 SOURCE_DISABLED = "数据源「{name}」已停用，探查已停止"
 JOB_ERROR = "探查任务出错：{line}"
-CONNECT_ERROR = "读表结构时连不上数据库：{line}"
+CONNECT_ERROR = "读表结构时无法连接数据库：{line}"
 UPLOAD_REFUSED = "上传的表格无需重新探查，重新上传即可更新"
 RECORDS_REFUSED = "记录表的结构由应用的表单维护，无需重新探查"
 

@@ -864,3 +864,13 @@ export interface CapabilityReviewOutcome {
   error: string | null
   code: string | null
 }
+
+// ---------------------------------------------------------------------------
+// 大库下的查看（docs/design/next-round/03-数据接入与目录维护.md A2，第 2 波 W2-a）
+
+export interface LookObject {
+  /** 点名或挑中探查范围外的表，当场读了结构、加进了探查范围（全名） */
+  added_to_scope?: string[]
+  /** 候选太多、先按需求检索：交给挑选模型的表有几张 */
+  prefiltered?: number
+}

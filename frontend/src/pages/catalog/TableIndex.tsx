@@ -1,12 +1,14 @@
-import { memo, useCallback, useEffect, useRef } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
-import { AlertTriangle, History, Info, ScanSearch, Search, Sparkles, X } from 'lucide-react'
+import { AlertTriangle, History, Info, Plus, ScanSearch, Search, Sparkles, X } from 'lucide-react'
 import clsx from 'clsx'
-import type { CatalogProfileTaskStatus, CatalogTableRow } from '../../types'
-import { useRadioGroup, useTicker } from '../../components/ui'
+import { api } from '../../api/client'
+import type { CatalogProfileTaskStatus, CatalogSearchItem, CatalogTableRow } from '../../types'
+import { Spinner, toast, useRadioGroup, useTicker } from '../../components/ui'
 import { formatNumber } from '../../lib/format'
 import {
-  CATALOG_DRAFT_TEXT as DT, CATALOG_KIND_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT, PROFILE_TEXT as PT,
+  CATALOG_ABSENT_TEXT as AT, CATALOG_DRAFT_TEXT as DT, CATALOG_KIND_LABEL, CATALOG_SCOPE_TEXT as ScT, CATALOG_TEXT as CT,
+  CATALOG_UI_TEXT as UT, PROFILE_TEXT as PT,
 } from '../../lib/terms'
 import { CountBadges } from './parts'
 import { LIST_FILTERS, LIST_SORTS, progressOf } from './model'
@@ -24,11 +26,18 @@ import type { ListFilter, ListSort } from './model'
 // 开了数据剖析的源（或者剖析过的表）第二行多一格「剖析」：未剖析 / 3 天前剖析 / 剖析部分完成 / 剖析失败 / 剖析中 / 排队剖析，
 // 需要剖析的（从没剖析过、上次没做完、之后出现了新的待核实关系）用提醒色，悬停写上次剖析的时间和原因。筛选组下面另有
 // 「需要剖析」开关，和审阅进度的筛选叠加（审阅进度的四项数字照旧按审阅算），口径同剖析范围里的「需要剖析的表」。
+//
+// 几千张表的库（next-round 03 A1、A2）：清单只列探查范围内的表，一次画 PAGE 行，「显示更多」再画下一批（不引入虚拟列表）；
+// 表结构里没有的表按服务端给的原因分开说（表已不在、在探查范围外、读不到结构……），只有真删除才说「表已不在」。有范围外的
+// 表时，搜索词同时在对象索引里找，范围外的命中列在清单下面，可以「加入范围」。
 // ===========================================================================
+
+/** 清单一次画几行 */
+const PAGE = 200
 
 export function TableIndex({
   rows, total, counts, query, onQuery, filter, onFilter, usedOnly = false, onUsedOnly, sort, onSort, selected, onSelected, active, onOpen,
-  onDraft, onProfile, profileOn = false, profileLive, dueOnly = false, onDueOnly, dueTotal = 0,
+  onDraft, onProfile, profileOn = false, profileLive, dueOnly = false, onDueOnly, dueTotal = 0, sourceId, outside = 0, onAdded,
 }: {
   /** 筛选、排序后的行 */
   rows: CatalogTableRow[]
@@ -60,6 +69,12 @@ export function TableIndex({
   onDueOnly?: (v: boolean) => void
   /** 需要剖析的表有几张（按搜索词算） */
   dueTotal?: number
+  /** 这个数据源（在对象索引里找范围外的表、加入范围用） */
+  sourceId?: string
+  /** 探查范围外有几张表：有的话搜索词同时在对象索引里找 */
+  outside?: number
+  /** 加入范围之后（清单要重取） */
+  onAdded?: () => void
 }) {
   const radio = useRadioGroup(LIST_FILTERS, filter, onFilter)
   const listRef = useRef<HTMLUListElement>(null)
@@ -67,6 +82,15 @@ export function TableIndex({
   const lastClicked = useRef<number | null>(null)
   const picked = rows.filter((r) => selected.has(r.table_name)).length
   const all = rows.length > 0 && picked === rows.length
+  // 分批画：换了搜索词、筛选、排序就回到第一批；打开的那张在后面的批次里时多画到它
+  const [limit, setLimit] = useState(PAGE)
+  useEffect(() => { setLimit(PAGE) }, [query, filter, sort, usedOnly, dueOnly])
+  useEffect(() => {
+    if (!active) return
+    const i = rows.findIndex((r) => r.table_name === active)
+    if (i >= limit) setLimit(Math.ceil((i + 1) / PAGE) * PAGE)
+  }, [active, rows])
+  const shown = rows.length > limit ? rows.slice(0, limit) : rows
   // 「3 天前剖析」「12 分钟前剖析」隔一分钟重算一次
   const now = useTicker(60_000, profileOn)
 
@@ -111,7 +135,7 @@ export function TableIndex({
   }, [])
 
   const onRowKey = useCallback((i: number, e: ReactKeyboardEvent<HTMLButtonElement>) => {
-    const n = latest.current.rows.length
+    const n = listRef.current?.querySelectorAll('[data-catalog-open-row]').length ?? latest.current.rows.length
     let j = -1
     if (e.key === 'ArrowDown') j = Math.min(n - 1, i + 1)
     else if (e.key === 'ArrowUp') j = Math.max(0, i - 1)
@@ -204,10 +228,21 @@ export function TableIndex({
       </div>
 
       <ul ref={listRef} className="relative min-h-0 flex-1 overflow-y-auto" aria-label={CT.tableCount(rows.length, total)}>
-        {rows.map((r, i) => (
+        {shown.map((r, i) => (
           <Row key={r.table_name} row={r} index={i} active={r.table_name === active} checked={selected.has(r.table_name)}
                onToggle={toggle} onOpen={onOpen} onKey={onRowKey} profileOn={profileOn} live={profileLive?.get(r.table_name) ?? null} now={now} />
         ))}
+        {rows.length > shown.length && (
+          <li className="border-b border-hairline px-3 py-2">
+            <button type="button" className="btn btn-sm w-full tnum" onClick={() => setLimit((n) => n + PAGE)}
+                    data-catalog-more={`${shown.length}/${rows.length}`}>
+              {ScT.more(shown.length, rows.length)}
+            </button>
+          </li>
+        )}
+        {sourceId && outside > 0 && query.trim() && (
+          <OutsideMatches sourceId={sourceId} query={query} onAdded={onAdded} />
+        )}
       </ul>
 
       {selected.size > 0 && (
@@ -296,8 +331,11 @@ const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen
           <span className="tnum shrink-0" title={CT.usageHint} data-row-usage={r.usage}>{CT.usage(r.usage)}</span>
         </span>
         {!r.in_schema && (
-          <span className="mt-0.5 flex items-center gap-1 text-2xs text-[var(--warn)]" data-row-missing="">
-            <AlertTriangle size={10} aria-hidden /> {CT.missing}
+          // 为什么不在：服务端给的原因（老服务端不给时照旧说表结构中已没有）
+          <span className="mt-0.5 flex items-center gap-1 text-2xs"
+                style={{ color: r.absent_reason === 'out_of_scope' || r.absent_reason === 'unknown' ? 'var(--st-waiting)' : 'var(--warn)' }}
+                data-row-missing={r.absent_reason ?? ''}>
+            <AlertTriangle size={10} aria-hidden /> {(r.absent_reason && AT.label[r.absent_reason]) || CT.missing}
           </span>
         )}
         {last && (
@@ -318,3 +356,71 @@ const Row = memo(function Row({ row: r, index, active, checked, onToggle, onOpen
     </li>
   )
 })
+
+/**
+ * 搜索词在对象索引里的命中（探查范围外的那些）：每行一张，「加入范围」当场读结构、记进探查范围的显式列出，加完清单重取。
+ * 停手 300 毫秒再查，旧的请求作废
+ */
+function OutsideMatches({ sourceId, query, onAdded }: { sourceId: string; query: string; onAdded?: () => void }) {
+  const [items, setItems] = useState<CatalogSearchItem[] | null>(null)
+  const [total, setTotal] = useState(0)
+  const [failed, setFailed] = useState(false)
+  const [adding, setAdding] = useState('')
+  useEffect(() => {
+    const ctl = new AbortController()
+    setItems(null)
+    setFailed(false)
+    const timer = setTimeout(() => {
+      api.dataCatalog.search(sourceId, query.trim(), { signal: ctl.signal })
+        .then((got) => {
+          const outside = got.items.filter((i) => !i.in_scope)
+          setItems(outside)
+          setTotal(Math.max(got.total - (got.items.length - outside.length), outside.length))
+        })
+        .catch(() => { if (!ctl.signal.aborted) setFailed(true) })
+    }, 300)
+    return () => { ctl.abort(); clearTimeout(timer) }
+  }, [sourceId, query])
+
+  const add = async (name: string) => {
+    setAdding(name)
+    try {
+      const out = await api.dataCatalog.addToScope(sourceId, [name])
+      if (out.added.length) toast.ok(ScT.added(out.added))
+      for (const f of out.failed) toast.warn(ScT.readFailed(f.name, f.error))
+      for (const r of out.refused) toast.warn(ScT.addFailed(r.name, r.reason))
+      setItems((cur) => (cur ?? []).filter((i) => i.name !== name || !!out.refused.length))
+      onAdded?.()
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setAdding('')
+    }
+  }
+
+  if (failed) return <li className="px-3 py-2 text-2xs text-faint">{ScT.searchFailed}</li>
+  if (items === null) return <li className="flex items-center gap-1.5 px-3 py-2 text-2xs text-faint"><Spinner size={10} /> {ScT.searching}</li>
+  if (!items.length) return null
+  return (
+    <li className="border-b border-hairline" data-catalog-outside={items.length}>
+      <p className="px-3 pb-1 pt-2.5 text-2xs font-medium text-dim" title={ScT.outsideHint}>{ScT.outsideHead(total)}</p>
+      <ul>
+        {items.map((i) => (
+          <li key={i.name} className="flex items-center gap-2 px-3 py-1.5 text-2xs" data-catalog-outside-row={i.name}>
+            <span className="min-w-0 flex-1">
+              <span className="mono block truncate text-xs text-fg" title={i.qualified}>{i.name}</span>
+              <span className="block truncate text-faint">
+                {[i.comment, i.kind === 'view' ? ScT.view : '', i.est_rows ? ScT.estRows(i.est_rows) : ''].filter(Boolean).join(' · ')}
+              </span>
+            </span>
+            <button type="button" className="btn btn-xs shrink-0" disabled={!!adding} onClick={() => void add(i.name)}
+                    title={ScT.outsideHint} data-catalog-add-scope={i.name}>
+              {adding === i.name ? <Spinner size={10} /> : <Plus size={10} aria-hidden />} {adding === i.name ? ScT.adding : ScT.add}
+            </button>
+          </li>
+        ))}
+      </ul>
+      {total > items.length && <p className="px-3 pb-2 text-2xs text-faint">{ScT.outsideMore(total - items.length)}</p>}
+    </li>
+  )
+}

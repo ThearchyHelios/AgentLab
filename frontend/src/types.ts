@@ -3061,7 +3061,7 @@ export interface CatalogDraftJob {
    * 排在同一个数据源的剖析任务后面（起草和剖析同源串行，按建立顺序）：剖析结束后自动开始。不在等时为 null；
    * 老服务端没有这个键
    */
-  waiting_for?: 'profile' | null
+  waiting_for?: 'profile' | 'introspect' | null
   tasks: CatalogDraftTask[]
 }
 
@@ -3072,7 +3072,7 @@ export interface CatalogActiveDraftJob {
   total: number
   done: number
   /** 排在剖析任务后面（同 CatalogDraftJob.waiting_for） */
-  waiting_for?: 'profile' | null
+  waiting_for?: 'profile' | 'introspect' | null
 }
 
 /** 清单一行上这张表最近一次起草的结果 */
@@ -3563,7 +3563,7 @@ export interface CatalogProfileJob {
   /** 重试建的任务记着原任务的 id */
   retry_of: string | null
   /** 排在同一个数据源的起草任务后面：起草结束后自动开始。不在等时为 null */
-  waiting_for: 'draft' | null
+  waiting_for: 'draft' | 'introspect' | null
   total: number
   /** 已结束的表数 */
   done: number
@@ -3605,7 +3605,7 @@ export interface CatalogActiveProfileJob {
   status: CatalogProfileJobStatus
   total: number
   done: number
-  waiting_for: 'draft' | null
+  waiting_for: 'draft' | 'introspect' | null
 }
 
 // ===========================================================================
@@ -4495,4 +4495,179 @@ export type RunEndReason = 'rejected' | 'stopped'
 
 export interface Run {
   end_reason?: RunEndReason | null
+}
+
+// ---------------------------------------------------------------------------
+// 大库：对象索引、探查范围、后台探查（docs/design/next-round/03-数据接入与目录维护.md A1、A2，第 2 波 W2-a）
+
+/** 探查范围的摘要（服务端 schema_cache.scope）：范围内几张、读到结构的、读不到的、范围外的、上限、各原因几张 */
+export interface SchemaScope {
+  in_scope: number
+  reflected: number
+  failed: number
+  out_of_scope: number
+  cap: number
+  index_total: number
+  pinned: number
+  explicit: number
+  rule: number
+  on_demand: number
+  /** dictionary 字典查询 / inspector 退回 Inspector（没有注释） */
+  index_method?: string
+  /** 对象索引超过了 5 万个的上限，只收了按名字排序的前面那些 */
+  index_capped?: boolean
+  index_at?: string
+}
+
+export type IntrospectJobStatus = 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'cancelled' | 'interrupted'
+
+/** 同源队里排在前面的事（waiting_for）：起草、剖析、导入目录、同步起草 */
+export type LaneKind = 'draft' | 'profile' | 'import' | 'sync_draft' | 'introspect'
+
+/** 数据源卡片上最近一个探查任务（DataSourceOut.introspect_job） */
+export interface IntrospectJobBrief {
+  id: string
+  status: IntrospectJobStatus
+  total: number
+  done: number
+  failed: number
+  cancelled: number
+  waiting_for: LaneKind | null
+  finished_at: string | null
+  error: string | null
+}
+
+/** GET /datasources/{id}/introspect-jobs/{job_id} 的 job */
+export interface IntrospectJob {
+  id: string
+  source_id: string
+  status: IntrospectJobStatus
+  /** manual 人点的 | schedule 定时维护 */
+  trigger: string
+  schema: string
+  created_by: string | null
+  created_at: string | null
+  started_at: string | null
+  finished_at: string | null
+  total: number
+  done: number
+  counts: Record<'pending' | 'running' | 'ok' | 'failed' | 'cancelled', number>
+  /** 正在读的那张表 */
+  current: string | null
+  /** 读不到结构的表（最多 50 张）和原因 */
+  failures: { name: string; error: string | null }[]
+  error: string | null
+  /** 建任务那一刻的范围：规则原样、各原因几张、对象索引的情况 */
+  scope: Partial<SchemaScope> & { rules?: IntrospectScopeRules; hits?: number; added?: number; removed?: number }
+  waiting_for: LaneKind | null
+}
+
+/** 探查范围的规则（数据源 options.introspect_scope） */
+export interface IntrospectScopeRules {
+  mode: 'all' | 'rules'
+  include: string[]
+  exclude: string[]
+  /** 显式列出：一律进范围 */
+  tables: string[]
+  /** 显式移出：有数据目录、被已发布模板用到的表也排得掉 */
+  removed: string[]
+  views: boolean
+  max_tables: number
+  updated_by?: string | null
+  updated_at?: string | null
+}
+
+/** 按规则对着对象索引数的命中 */
+export interface IntrospectScopePreview {
+  in_scope: number
+  /** 计上限的那部分（规则、一律在范围内、显式列出；按需加入的另算） */
+  hits: number
+  cap: number
+  out_of_scope: number
+  index_total: number
+  pinned: number
+  explicit: number
+  rule: number
+  on_demand: number
+  over: boolean
+}
+
+/** 按需加入、目录页手工加入范围的留痕 */
+export interface IntrospectScopeTrail {
+  name: string
+  scope_reason: string | null
+  /** look 助手查看 | db_schema 运行时查表结构 | catalog 目录页 */
+  via: 'look' | 'db_schema' | 'catalog' | null
+  by: string | null
+  run_id: string | null
+  conversation_id: string | null
+  ref: string | null
+  need: string | null
+  at: string | null
+}
+
+/** GET / PUT /datasources/{id}/introspect-scope、POST …/preview */
+export interface IntrospectScope {
+  scope: IntrospectScopeRules
+  defaults: { max_tables: number; max_limit: number; index_limit: number; rules_max: number }
+  /** 没有对象索引时为 null：先刷新对象索引才数得出命中 */
+  preview: IntrospectScopePreview | null
+  index: { ready: boolean; schema: string; method: string | null; capped: boolean; at: string | null; total: number | null }
+  /** 一律在范围内的表（举前 20 个例子） */
+  pinned_sample: string[]
+  on_demand: IntrospectScopeTrail[]
+}
+
+export interface DataSource {
+  /** 探查范围的摘要；升级前探查的源、上传表格为 null */
+  schema_scope?: SchemaScope | null
+  /** 最近一个探查任务；没有（或升级前同步探查的）为 null */
+  introspect_job?: IntrospectJobBrief | null
+}
+
+/**
+ * 表结构里没有这张表时为什么（目录清单、表详情的 absent_reason）：removed 表已不在（真删除）、missing 数据源里从来没有、
+ * out_of_scope 在探查范围外、reflect_failed 在范围里却读不到结构、unknown 说不清（升级前只探查了一部分的老缓存）
+ */
+export type CatalogAbsentReason = 'removed' | 'missing' | 'out_of_scope' | 'reflect_failed' | 'unknown'
+
+export interface CatalogTableRow {
+  absent_reason?: CatalogAbsentReason | null
+}
+
+export interface CatalogDetail {
+  absent_reason?: CatalogAbsentReason | null
+}
+
+export interface CatalogList {
+  /** 探查范围的摘要；升级前探查的源、上传表格为 null */
+  scope?: SchemaScope | null
+}
+
+/** GET /datasources/{id}/catalog/search 的一项：对象索引里按名字、注释找到的表（含探查范围外的） */
+export interface CatalogSearchItem {
+  name: string
+  qualified: string
+  kind: 'table' | 'view'
+  comment: string | null
+  est_rows: number | null
+  in_scope: boolean
+  scope_reason: string | null
+  absent_reason: CatalogAbsentReason | null
+}
+
+export interface CatalogSearch {
+  items: CatalogSearchItem[]
+  total: number
+  /** 有对象索引（没有的只在表结构里找） */
+  indexed: boolean
+}
+
+/** POST /datasources/{id}/catalog/scope/add */
+export interface CatalogScopeAdd {
+  added: string[]
+  already: string[]
+  failed: { name: string; error: string }[]
+  refused: { name: string; reason: string }[]
+  scope: SchemaScope | null
 }

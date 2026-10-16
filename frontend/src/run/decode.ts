@@ -3222,6 +3222,9 @@ export function lookEventOf(op: CopilotOp): LookEvent | null {
         ...(total != null ? { total } : {}),
         ...(total != null && explored != null && explored < total ? { explored } : {}),
         ...(num(x.catalog_tables) != null ? { catalog_tables: num(x.catalog_tables) } : {}),
+        // 按需加入探查范围的表（next-round 03 A2）；老服务端没有这一项
+        ...(names(x.added_to_scope).length ? { added_to_scope: names(x.added_to_scope) } : {}),
+        ...(num(x.prefiltered) != null ? { prefiltered: num(x.prefiltered) } : {}),
       }
     })
   const status = op.status === 'index' || op.status === 'failed' ? op.status : 'ok'
@@ -3256,6 +3259,7 @@ function lookLine(o: LookObject): string {
     o.named.length ? LOOK_TEXT.named(o.named) : '',
     o.picked?.length ? LOOK_TEXT.picked(o.picked) : '',
     o.joined?.length ? LOOK_TEXT.joined(o.joined) : '',
+    o.added_to_scope?.length ? LOOK_TEXT.added(o.added_to_scope) : '',
   ].filter(Boolean)
   // 口径卡（caliber）是蓝图对到的已发布口径卡上的指标（docs/design/normal-user-apps.md N2）
   const kind = o.kind

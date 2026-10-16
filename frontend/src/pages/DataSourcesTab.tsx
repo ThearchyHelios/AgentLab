@@ -6,8 +6,10 @@ import {
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api, uploadDecision } from '../api/client'
-import type { IntrospectPreview, TableSchema, UploadProgress } from '../api/client'
-import type { CurrentSnapshot, DataSource, UploadDecision, UploadMixedColumn, UploadResult } from '../types'
+import type { IntrospectOut, IntrospectPreview, TableSchema, UploadProgress } from '../api/client'
+import type {
+  CurrentSnapshot, DataSource, IntrospectJob, IntrospectJobBrief, UploadDecision, UploadMixedColumn, UploadResult,
+} from '../types'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
   confirmDialog, DeleteButton, EmptyState, ErrorState, Field, HealthPill, IconButton, Modal, promptDialog,
@@ -21,8 +23,8 @@ import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } fro
 import type { HealthRecord } from '../lib/health'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
 import {
-  CATALOG_TEXT, MASK_BOUNDARY_TEXT, PROFILE_TEXT, RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL, RECIPE_TEXT, UPLOAD_CONVERSION_LABEL,
-  UPLOAD_SHAPE_LABEL, UPLOAD_TEXT, VERSIONS_TEXT,
+  CATALOG_TEXT, INTROSPECT_SCOPE_TEXT, INTROSPECT_TEXT, MASK_BOUNDARY_TEXT, PROFILE_TEXT, RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL,
+  RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT, VERSIONS_TEXT,
 } from '../lib/terms'
 import { useLoginOn } from '../store/auth'
 import { useRunClock } from '../run/useRunClock'
@@ -33,6 +35,7 @@ import {
 } from './catalog/profile'
 import type { ProfileForm } from './catalog/profile'
 import { ImportWizard } from './import/ImportWizard'
+import { IntrospectScopeDialog } from './IntrospectScopeDialog'
 import type { WizardEntry } from './import/ImportWizard'
 import { VersionsDialog } from './import/VersionsDialog'
 
@@ -316,24 +319,90 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
   // 上传的表格只有一个库，结构随版本冻结，谈不上「和配置的 schema 对不上」
   const schemaDrift = !uploaded && cachedSchema != null && cachedSchema !== configured
 
+  // 探查是后台任务（next-round 03 A1）：卡片跟着最近一个任务走，进行中、排队中时每秒取一次进度，结束了换上新的表数、
+  // 说一句结果。页面刷新后进来，服务端给的 introspect_job 还在进行就接着跟
+  const [job, setJob] = useState<IntrospectJob | IntrospectJobBrief | null>(row.introspect_job ?? null)
+  const [stopping, setStopping] = useState(false)
+  const [scoping, setScoping] = useState(false)
+  const jobActive = !!job && (job.status === 'queued' || job.status === 'running')
+  useEffect(() => {
+    const next = row.introspect_job ?? null
+    if (next && (!job || next.id !== job.id || (!jobActive && next.status !== job.status))) setJob(next)
+  }, [row.introspect_job?.id, row.introspect_job?.status])
+
+  const announce = (j: IntrospectJob, source: DataSource) => {
+    const outside = source.schema_scope?.out_of_scope ?? 0
+    if (j.status === 'succeeded') toast.ok(INTROSPECT_TEXT.done(row.name, source.table_count ?? 0, outside))
+    else if (j.status === 'partial') toast.warn(INTROSPECT_TEXT.partial(row.name, j.counts.ok, j.counts.failed))
+    else if (j.status === 'cancelled') toast.info(INTROSPECT_TEXT.cancelled(row.name, j.counts.ok, j.total))
+    else if (j.status === 'interrupted') toast.warn(INTROSPECT_TEXT.interrupted(row.name))
+    else if (j.status === 'failed') toast.error(INTROSPECT_TEXT.failed(row.name, j.error ?? ''))
+    if (j.status === 'succeeded' && !source.table_count && !source.schema_error) toast.warn(INTROSPECT_TEXT.empty)
+  }
+
+  useEffect(() => {
+    if (!job || !jobActive) return
+    let alive = true
+    const timer = setInterval(async () => {
+      try {
+        const out = await api.datasources.introspectJob(row.id, job.id)
+        if (!alive) return
+        setJob(out.job)
+        if (out.job.status !== 'queued' && out.job.status !== 'running') {
+          setStopping(false)
+          onChange(out.source)
+          announce(out.job, out.source)
+        }
+      } catch {
+        // 取不到这一次的进度：下一秒再取（断网时页面顶上有横幅）
+      }
+    }, 1000)
+    return () => { alive = false; clearInterval(timer) }
+  }, [job?.id, jobActive])
+
+  const started = (out: IntrospectOut) => {
+    onChange(out.source)
+    setJob(out.job)
+    toast.info(INTROSPECT_TEXT.started(row.name, out.job.total))
+  }
+
+  /** 开始探查。规则命中超过上限：照实说命中多少张，给「调整探查范围」；已经有任务在跑：跟上那一个 */
   const introspect = async () => {
-    if (busy) return
+    if (busy || jobActive) return
     busySince.current = Date.now()
     setBusy('introspect')
     try {
-      const next = await api.datasources.introspect(row.id)
-      onChange(next)
-      if (next.table_count) {
-        toast.ok(`「${row.name}」探查到 ${formatNumber(next.table_count)} 个对象`)
-      } else if (!next.schema_error) {
-        // 连得上、也没报错，就是这个 schema 下真的没有对象。探查失败的红字
-        // 卡片自己会显示，不再叠一条 toast
-        toast.warn('连接成功，但该 schema 下没有对象，请检查 schema 名称是否正确')
+      started(await api.datasources.introspect(row.id))
+    } catch (e) {
+      const code = e instanceof ApiError ? e.code : undefined
+      if (code === 'scope_too_large') {
+        toast.error(e, { action: { label: INTROSPECT_TEXT.tooLargeAction, onClick: () => setScoping(true) } })
+      } else if (code === 'introspect_busy') {
+        toast.info(humanizeError(e).reason || humanizeError(e).title)
+        const active = await api.datasources.activeIntrospectJob(row.id).catch(() => null)
+        if (active?.job) setJob(active.job)
+      } else {
+        toast.error(e)
+        // 对象清单都拿不到：失败照实记进了表结构缓存（原因、能选的 schema），重取一次卡片才看得到
+        if (code === 'introspect_failed') onReload()
       }
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const stop = async () => {
+    if (!job || stopping) return
+    setStopping(true)
+    try {
+      const out = await api.datasources.cancelIntrospect(row.id, job.id)
+      setJob(out.job)
+      onChange(out.source)
+      announce(out.job, out.source)
     } catch (e) {
       toast.error(e)
     } finally {
-      setBusy('')
+      setStopping(false)
     }
   }
 
@@ -390,13 +459,15 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
       return
     }
     try {
-      const next = await api.datasources.introspect(row.id)
-      onChange(next)
-      toast.ok(`已将「${row.name}」的 schema 改为 ${schema}，探查到 ${formatNumber(next.table_count ?? 0)} 个对象`)
+      // 探查是后台任务：开始了就跟着进度，结束时说结果
+      const out = await api.datasources.introspect(row.id)
+      onChange(out.source)
+      setJob(out.job)
+      toast.info(INTROSPECT_TEXT.schemaChanged(schema))
     } catch (e) {
       // 配置已经改了、缓存还是旧的：卡片上那行「结构和配置对不上」会一直提醒
       const h = humanizeError(e)
-      toast.error(`schema 已改为 ${schema}，但重新探查失败（${h.title}）：助手读取的仍是原来的结构。请再次点击「探查结构」`, { detail: h.raw })
+      toast.error(INTROSPECT_TEXT.schemaChangedFailed(schema, h.reason || h.title), { detail: h.raw })
     } finally {
       setBusy('')
     }
@@ -481,11 +552,25 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
           </button>
           {/* 上传的表格不探查：结构在导入时随版本冻结，服务端也不接受（要更新就重新上传） */}
           {!uploaded && (
-            <button className="btn btn-sm tnum" disabled={!!busy} onClick={() => void introspect()}
-                    title="读取表结构并缓存，助手据此编写 SQL">
+            <button className="btn btn-sm tnum" disabled={!!busy || jobActive} onClick={() => void introspect()}
+                    title={INTROSPECT_TEXT.buttonHint} data-introspect-start="">
               {busy === 'introspect'
-                ? <><Spinner size={11} /> 探查中 {formatDuration(clock - busySince.current)}</>
-                : <><RefreshCw size={11} aria-hidden /> 探查结构</>}
+                ? <><Spinner size={11} /> {INTROSPECT_TEXT.button} {formatDuration(clock - busySince.current)}</>
+                : jobActive && job
+                  ? <><Spinner size={11} /> {job.status === 'queued' ? INTROSPECT_TEXT.queued : INTROSPECT_TEXT.running(job.done, job.total)}</>
+                  : <><RefreshCw size={11} aria-hidden /> {INTROSPECT_TEXT.button}</>}
+            </button>
+          )}
+          {!uploaded && jobActive && (
+            <button className="btn btn-sm" disabled={stopping} onClick={() => void stop()} title={INTROSPECT_TEXT.stopHint}
+                    data-introspect-stop="">
+              {stopping ? <Spinner size={11} /> : <X size={11} aria-hidden />} {INTROSPECT_TEXT.stop}
+            </button>
+          )}
+          {!uploaded && (
+            <button className="btn btn-sm btn-ghost" onClick={() => setScoping(true)} title={INTROSPECT_SCOPE_TEXT.openHint}
+                    data-introspect-scope-open="">
+              <Layers size={11} aria-hidden /> <span className="hidden sm:inline">{INTROSPECT_SCOPE_TEXT.open}</span>
             </button>
           )}
           {row.open_staging && (
@@ -523,6 +608,12 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 pb-2.5 pt-1.5 text-2xs text-faint">
         <Address row={row} meta={meta} uploaded={uploaded} />
         {row.options?.schema && <span className="chip">schema {row.options.schema}</span>}
+        {!uploaded && !!row.schema_scope?.out_of_scope && (
+          <span className="chip tnum" title={INTROSPECT_TEXT.scopeChipHint}
+                data-introspect-scope={`${row.schema_scope.in_scope}/${row.schema_scope.index_total}`}>
+            {INTROSPECT_TEXT.scopeChip(row.schema_scope.in_scope, row.schema_scope.index_total)}
+          </span>
+        )}
         {masks.length > 0 && (
           <span className="chip" data-mask-columns={masks.join(',')} title={`在证据面板中显示为「已遮罩」：${masks.join('、')}`}>
             <EyeOff size={10} aria-hidden /> 遮罩 {formatNumber(masks.length)} 列
@@ -549,6 +640,10 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
         )}
         {!!row.tools?.length && <span className="mono">{row.tools.join(' · ')}</span>}
       </div>
+      {scoping && (
+        <IntrospectScopeDialog source={row} onClose={() => setScoping(false)} onSaved={onReload}
+                               onRun={() => void introspect()} />
+      )}
       {masking && (
         <MaskColumnsDialog row={row} onClose={() => setMasking(false)}
                            onSaved={(next) => { setMasking(false); onChange(next); syncCatalog() }} />
@@ -567,6 +662,8 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
           <ErrorState compact error={record} onRetry={() => void test()} />
         </div>
       )}
+
+      {!uploaded && job && <IntrospectJobLine job={job} />}
 
       {row.schema_error && (
         <div
@@ -666,6 +763,59 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
 
       {open && row.table_count > 0 && <SchemaBrowser row={row} />}
     </article>
+  )
+}
+
+/**
+ * 卡片上探查任务的那一行：进行中写进度条、正在读哪张、排在谁后面；最近一次没做完（部分读不到、停止、中断、失败）常驻一行
+ * 写明结果，读不到的表展开看。做完了的不占地方（结果已经在表数和同步时间上）
+ */
+function IntrospectJobLine({ job }: { job: IntrospectJob | IntrospectJobBrief }) {
+  const full = 'counts' in job ? job : null
+  if (job.status === 'queued' || job.status === 'running') {
+    const pct = job.total ? Math.round((job.done / job.total) * 100) : 0
+    const text = job.status === 'queued'
+      ? (job.waiting_for ? INTROSPECT_TEXT.queuedBehind(job.waiting_for) : INTROSPECT_TEXT.queued)
+      : INTROSPECT_TEXT.running(job.done, job.total)
+    return (
+      <div className="mx-3 mb-2 space-y-1 text-2xs" data-introspect-job={job.status} data-introspect-progress={`${job.done}/${job.total}`}>
+        <div className="flex items-center gap-2 text-dim">
+          <span className="tnum">{text}</span>
+          {full?.current && <span className="mono min-w-0 truncate text-faint">{INTROSPECT_TEXT.current(full.current)}</span>}
+        </div>
+        <div className="h-1 overflow-hidden rounded-full bg-hover" role="progressbar" aria-label={text}
+             aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={job.done}>
+          <div className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-300" style={{ width: `${pct}%` }} />
+        </div>
+      </div>
+    )
+  }
+  const failed = full ? full.counts.failed : (job as IntrospectJobBrief).failed
+  const ok = full ? full.counts.ok : job.done - (job as IntrospectJobBrief).cancelled - (job as IntrospectJobBrief).failed
+  const text = job.status === 'partial' ? INTROSPECT_TEXT.result.partial(failed)
+    : job.status === 'cancelled' ? INTROSPECT_TEXT.result.cancelled(ok, job.total)
+      : job.status === 'interrupted' ? INTROSPECT_TEXT.result.interrupted
+        : job.status === 'failed' ? INTROSPECT_TEXT.result.failed(job.error ?? '')
+          : ''
+  if (!text) return null
+  return (
+    <div className="mx-3 mb-2 flex items-start gap-1.5 text-2xs leading-relaxed"
+         style={{ color: job.status === 'failed' ? 'var(--err)' : 'var(--warn)' }} data-introspect-result={job.status}>
+      <AlertTriangle size={11} className="mt-px shrink-0" aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p>{text}</p>
+        {!!full?.failures.length && (
+          <details className="text-faint">
+            <summary className="cursor-pointer">{INTROSPECT_TEXT.failuresHead}（{formatNumber(full.failures.length)}）</summary>
+            <ul className="mt-0.5 space-y-0.5">
+              {full.failures.map((f) => (
+                <li key={f.name} className="break-all"><span className="mono">{f.name}</span>{f.error ? `：${f.error}` : ''}</li>
+              ))}
+            </ul>
+          </details>
+        )}
+      </div>
+    </div>
   )
 }
 
