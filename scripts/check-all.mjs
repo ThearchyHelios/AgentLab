@@ -123,8 +123,8 @@ const ESTIMATE = {
   apps: 60, inbox: 45, 'app-editor': 45, capabilities: 30, 'access-keys': 30, share: 30,
   // 普通用户建应用：还没实测，按同类页面估
   blueprint: 90, personal: 45, records: 30, files: 30,
-  // 下一轮第 4 波：占位，换成真检查时按实测改
-  'catalog-changes': 60, evals: 90, ledger: 60,
+  // 下一轮第 4 波：2026-10-16 两套服务、八道并行时的实测
+  'catalog-changes': 43, evals: 33, ledger: 31,
 }
 // 最慢的两项按段拆成几份。用的是它们自己的段过滤：最后一份用 *_SKIP 兜住「其余全部」，以后新加的段
 // 不用改这里也跑得到（拆出去的那几份要是一段都没对上，那一份会报「一项都没跑」）。
