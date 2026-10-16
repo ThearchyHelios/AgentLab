@@ -34,7 +34,7 @@ from app.data.engine import CATALOG_DRAFT_GUIDANCE_OPTION
 from app.db.base import SessionLocal
 from app.db.models import CatalogDraftJob, CatalogDraftTask, DataSource
 from app.main import app as _fastapi_app
-from tests.fixtures.sources import drop_source
+from tests.fixtures.sources import drop_source, introspect_now
 
 PHONES = [f"139000000{i:02d}" for i in range(1, 31)]
 
@@ -154,8 +154,7 @@ async def _source(client, tmp_path, *, profile: bool = True, guidance: str | Non
         await session.commit()
         sid = row.id
     _CREATED.append(sid)
-    r = await client.post(f"/api/datasources/{sid}/introspect")
-    assert r.status_code == 200, r.text
+    await introspect_now(client, sid)
     async with SessionLocal() as session:
         await catalog.write_entry(session, sid, "orders", notes if notes is not None else ORDERS_NOTES,
                                   if_version=0, actor=None)

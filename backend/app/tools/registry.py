@@ -363,6 +363,13 @@ def prepare_args(
 
     # 少了哪个必填的，就是多出来那个想写的；一个必填都不缺时，退而看还空着哪个可选字段
     missing = [k for k in required if k not in args] or [k for k in props if k not in args]
+    if len(unknown) == 1 and len(missing) > 1:
+        # 空着的可选字段不止一个（db_schema 有 table、keyword 两个）：只有拼写明显接近的那一个才算唯一候选
+        import difflib
+
+        close = [k for k in missing if difflib.SequenceMatcher(None, unknown[0].lower(), k.lower()).ratio() >= 0.8]
+        if len(close) == 1:
+            missing = close
     residual: ValidationError | None = None
     if len(unknown) == 1 and len(missing) == 1:
         fixed = dict(args)

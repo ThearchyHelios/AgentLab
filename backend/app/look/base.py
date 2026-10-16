@@ -7,7 +7,8 @@ look 行（模型输出）：
 look 事件（发给前端、存进 meta.looks）：
   {"op":"look","id":"L1","by":"model"|"system","need":"…","status":"ok"|"index"|"failed","reason"?,
    "elapsed_ms":…,"objects":[{"kind":"table","source":…,"source_id":…,"named":[…],"picked":[…],"joined":[…],
-   "missing":[…],"total":…,"explored"?:…,"catalog_tables":…,"schema_synced_at":…,"catalog_versions":{…}},
+   "missing":[…],"total":…,"explored"?:…,"catalog_tables":…,"schema_synced_at":…,"catalog_versions":{…},
+   "added_to_scope"?:[…],"prefiltered"?:…},
    {"kind":"capability","named":[…],"missing":[…],"versions":{…}},
    {"kind":"workflow_version","named":[…],"missing":[…]}]}
 """
@@ -27,6 +28,13 @@ CONTEXT_TABLE_LIMIT = 16    # 一次查看最多给几张表的详情（含中�
 #: 挑选时限。经 OpenAI 兼容接入的推理模型关不掉思考（look/pick.PICK_MAX_TOKENS），先想再写：原来的 20 秒常常想到一半就
 #: 掐了，交回目录让主模型自己再看一遍反而更慢
 PICK_TIMEOUT_S = 45
+#: 大库的检索预筛（next-round 03 A2）：候选超过这么多张时，挑选模型只看检索（schema_view.search_tables）的前这么多个命中、
+#: 工作流已用到的表、命中表的一跳关联表（最多 NEIGHBOR_LIMIT 张），挑选提示词从几万字降到几千字；不超过时照旧给整份目录
+PREFILTER_LIMIT = 120
+NEIGHBOR_LIMIT = 40
+#: 按需加入（目录-D4）：点名或挑中探查范围外的表，当场只读反射这一张、落盘、留痕。每次查看最多几张，每次运行最多几张
+ON_DEMAND_PER_LOOK = 4
+ON_DEMAND_PER_RUN = 8
 
 
 class LookTarget(TypedDict, total=False):

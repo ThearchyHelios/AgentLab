@@ -77,7 +77,12 @@ class _SchemaArgs(BaseModel):
     # 实测一次 8 步的运行里 7 步花在这上面，最后只剩一步来真查数据（run dd9927e6）
     table: str | list[str] | None = Field(
         default=None,
-        description='表名。可以一次给多张："user" 或 ["user","roles"]；留空则列出所有表',
+        description='表名。可以一次给多张："user" 或 ["user","roles"]；留空则列出表（表多时只列前 50 张）',
+    )
+    # 几千张表的库（next-round 03 A2）：不知道表名时按需求的关键词查，和助手 look 用同一个检索
+    keyword: str | None = Field(
+        default=None,
+        description="不知道表名时写要查的内容的关键词（如「退货 门店」），按表名、注释、数据目录检索相关的表",
     )
 
 
@@ -278,13 +283,54 @@ async def build_datasource_tools(
             tools.extend(_unavailable_tool(row, prefix, str(e)) for prefix in prefixes)
             continue
         entries = await _catalog_of(row, ctx.catalog_view)
+        facts, outside = await _extras_of(source)
+        if outside is not None:
+            # 有对象索引的源：按需加入以后两个工具都要看到新的表结构（查询时的 SQL 检查、冻结的表结构快照）
+            source = _LiveSource(source)
         for prefix in prefixes:
             if prefix == QUERY_PREFIX:
                 tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries, force_readonly=force_readonly,
-                                              mask_results=mask_results))
+                                              mask_results=mask_results, outside=outside))
             else:
-                tools.append(_make_schema_tool(source, fixed=fixed, catalog=entries))
+                tools.append(_make_schema_tool(source, fixed=fixed, catalog=entries, facts=facts, ctx=ctx,
+                                               outside=outside))
     return tools
+
+
+class _LiveSource:
+    """建工具时的数据源，schema_cache 可以换（运行时按需加入探查范围以后）：查询工具、表结构工具拿的是同一个对象，加进来的表
+    两边都看得到。别的属性照原来的。不是 ORM 对象，换它不会写回库（库里由 source_objects.rebuild_schema_cache 写）。"""
+
+    def __init__(self, base: Any) -> None:
+        self._base = base
+        self.schema_cache = getattr(base, "schema_cache", None) or {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+async def _extras_of(source: Any) -> tuple[dict[str, dict[str, Any]], frozenset[str] | None]:
+    """建工具时读一次（和目录同一时机）：这个源的剖析事实（db_schema 的表详情附一节，next-round 遗留 e）、对象索引里探查
+    范围外的对象（name_key；SQL 检查照实列「未按目录检查的表」，点名时按需加入）。没有对象索引的源（上传表格、升级前探查的）
+    范围外是 None。读不到就当没有：少一节说明，不挡工具。"""
+    from app.data import catalog_profile_jobs, source_objects
+    from app.db.base import SessionLocal
+
+    facts: dict[str, dict[str, Any]] = {}
+    outside: frozenset[str] | None = None
+    source_id = getattr(source, "id", None)
+    if not source_id:
+        return facts, outside
+    try:
+        async with SessionLocal() as session:
+            if (getattr(source, "schema_cache", None) or {}).get("tables"):
+                facts = await catalog_profile_jobs.last_facts(session, source_id)
+            if isinstance((getattr(source, "schema_cache", None) or {}).get("scope"), dict) \
+                    and (getattr(source, "origin", None) or "manual") == "manual":
+                outside = await source_objects.outside_names(session, source)
+    except Exception:  # noqa: BLE001
+        logger.exception("读数据源 %s 的剖析事实、对象索引失败，这次不给", getattr(source, "name", "?"))
+    return facts, outside
 
 
 async def _catalog_of(row: Any, view: Any = None) -> dict[str, data_catalog.CatalogEntry]:
@@ -552,7 +598,8 @@ def _unavailable_tool(row: DataSource, prefix: str, reason: str) -> StructuredTo
 
 def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
                      catalog: Mapping[str, data_catalog.CatalogEntry] | None = None,
-                     force_readonly: bool = False, mask_results: bool = False) -> StructuredTool:
+                     force_readonly: bool = False, mask_results: bool = False,
+                     outside: frozenset[str] | None = None) -> StructuredTool:
     """source 是手工源的 DataSource，或上传源绑定快照的 SourceView（字段同名）。
 
     fixed：上传源的版本是这次运行固定的（找不到时的说法不同）。
@@ -565,19 +612,22 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
     那里已经有的值（这个 agent 前面的查询遮掉的、调用方交进来的）这一次也按值换，数据源没设遮罩也一样：先查号码、
     再查写着号码的备注或别的库，后一份同样遮好。按值换只换文字格，数值格照原样（存下的是证据）。查询失败时报错原话里
     的值也换（masking.mask_error_text）。
+    outside：对象索引里探查范围外的对象（name_key）。查询用到范围外、表结构里没有的表时，结果里照实列出
+    unchecked_tables（「未按目录检查的表」）：SQL 检查只按范围内的表结构和目录查，不新增检查规则。
     """
     # 数据源在 options.query_timeout_s 里配了就用它，否则取缺省。数据库按它停下语句，
     # 引擎按它告诉界面上限是多少（metadata["timeout_s"]）
     seconds = query_timeout(source)
     # 基于数据目录的 SQL 检查器：和冻结进表结构快照的是同一版目录。第一次查询时才建（关系图也是用到才建）
-    checker: list[SqlChecker] = []
+    checker: list[tuple[int, SqlChecker]] = []
 
     def _checker() -> SqlChecker:
-        if not checker:
-            checker.append(SqlChecker(kind=source.kind, schema_cache=source.schema_cache,
-                                      notes={name: entry.notes for name, entry in (catalog or {}).items()},
-                                      source_name=source.name))
-        return checker[0]
+        # 表结构换过（按需加入了表）就重建：检查按的是此刻的表结构
+        if not checker or checker[0][0] != id(source.schema_cache):
+            checker[:] = [(id(source.schema_cache), SqlChecker(
+                kind=source.kind, schema_cache=source.schema_cache,
+                notes={name: entry.notes for name, entry in (catalog or {}).items()}, source_name=source.name))]
+        return checker[0][1]
 
     async def _run(sql: str, limit: int | None = None) -> str:
         if gone := _vanished(source, fixed):
@@ -646,6 +696,8 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
         # 快照和以前一字不差
         if checks := await _sql_checks(_checker(), sql):
             payload["checks"] = checks
+        if outside and (unchecked := _unchecked_tables(sql, source, outside)):
+            payload["unchecked_tables"] = unchecked
         # 表结构快照：这次查询时数据源的结构冻结下来，报告里写的表名、字段名按它核对。事后数据源
         # 重新探查、改了结构，已经跑完的运行核对的还是当时那一份。上传源冻结的是绑定快照里那份
         if schema := await _store_schema(source, ctx, catalog=catalog):
@@ -707,6 +759,21 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
                   else (lambda args: is_dangerous_call(source, str(args.get("sql") or ""))),
                   "timeout_s": seconds},
     )
+
+
+#: 查询结果里「未按目录检查的表」那一项交给模型时的说明（键名 unchecked_tables 本身就是给它看的）
+def _unchecked_tables(sql: str, source: Any, outside: frozenset[str]) -> list[str]:
+    """SQL 里用到的、在对象索引里探查范围外、表结构里没有的表（照 SQL 里的写法）。认不出表就当没有。"""
+    from app.data.names import name_key
+    from app.engine.evidence import sql_tables
+
+    try:
+        names = sql_tables(sql)
+    except Exception:  # noqa: BLE001
+        return []
+    cache = getattr(source, "schema_cache", None)
+    return [t for t in dict.fromkeys(names)
+            if name_key(str(t).rsplit(".", 1)[-1]) in outside and data_catalog.resolve_table_name(cache, str(t)) is None]
 
 
 async def _sql_checks(checker: SqlChecker, sql: str) -> list[dict[str, Any]]:
@@ -784,43 +851,158 @@ def _schema_tables(table: str | list[str] | None) -> list[str]:
     return [t.strip() for one in names for t in one.split(",") if t.strip()]
 
 
+#: db_schema 不传 table 时最多列几张（几千张表的库整份列出来没法看，也塞不进上下文）、按 keyword 检索给几个
+SCHEMA_LIST_LIMIT = 50
+SCHEMA_KEYWORD_LIMIT = 30
+SCHEMA_MORE_PROMPT = "…另有 {n} 张没有列出：用 keyword 按要查的内容检索，或者 table 直接点名"
+SCHEMA_KEYWORD_HEAD = "数据源「{source}」里和「{keyword}」相关的表（按相关程度排）："
+SCHEMA_KEYWORD_NONE = "数据源「{source}」里没有检索到和「{keyword}」相关的表：换个说法，或者 table 直接点名"
+SCHEMA_OUTSIDE_MARK = "（探查范围外：table 点名它会按需加入）"
+SCHEMA_ADDED_PROMPT = "（{table} 在探查范围外，这次按需加入了探查范围、当场读了结构）"
+SCHEMA_RUN_CAPPED = "这次运行最多按需加入 {limit} 张探查范围外的表，已经用完"
+
+
 def _make_schema_tool(source: Any, *, fixed: bool = False,
-                      catalog: Mapping[str, data_catalog.CatalogEntry] | None = None) -> StructuredTool:
+                      catalog: Mapping[str, data_catalog.CatalogEntry] | None = None,
+                      facts: Mapping[str, Mapping[str, Any]] | None = None, ctx: ToolContext | None = None,
+                      outside: frozenset[str] | None = None) -> StructuredTool:
     """source 同 _make_query_tool：上传源的表结构取绑定快照里冻结的那份。
 
-    catalog：建工具时读到的数据目录，查单表时附在字段清单后面。单表的说法和助手查看、/schema 接口是同一份
-    （data/schema_view.table_detail）：遮罩列只给列名和类型，它的注释和目录项都不给（look 文档 D6）。
+    catalog：建工具时读到的数据目录，查单表时附在字段清单后面；facts：剖析事实，单表详情里附一节。单表的说法和助手查看、
+    /schema 接口是同一份（data/schema_view.table_detail）：遮罩列只给列名和类型，它的注释和目录项都不给（look 文档 D6）。
+
+    几千张表的库（next-round 03 A2）：不传 table 时只列范围内前 SCHEMA_LIST_LIMIT 张、提示用 keyword 或 table；keyword 和
+    助手 look 用同一个检索（schema_view.search_tables）。点名探查范围外的表（outside 里有）当场只读反射、加进范围（每次运行
+    最多 ON_DEMAND_PER_RUN 张，留痕记这次运行和节点）；表已不在、读不到结构、范围外没加进来的分开说。
     """
     notes = {name: entry.notes for name, entry in (catalog or {}).items()}
 
-    async def _run(table: str | list[str] | None = None) -> str:
+    async def _run(table: str | list[str] | None = None, keyword: str | None = None) -> str:
         if gone := _vanished(source, fixed):
             return f"{DATA_UNAVAILABLE}{gone}"
         wanted = _schema_tables(table)
         if wanted:
-            return "\n\n".join(schema_view.table_detail(source, t, catalog_notes=notes) for t in wanted)
+            added_lines: list[str] = []
+            missing = [t for t in wanted if introspect.find_table(source, t) is None]
+            reasons: dict[str, str] = {}
+            if missing and outside is not None:
+                reasons, added_lines = await _on_demand(source, missing, ctx)
+            parts = []
+            for t in wanted:
+                if introspect.find_table(source, t) is not None or t not in reasons:
+                    parts.append(schema_view.table_detail(source, t, catalog_notes=notes, profile=facts))
+                else:
+                    parts.append(reasons[t])
+            return "\n\n".join(parts + added_lines)
+        if keyword and keyword.strip():
+            return await _keyword_list(source, notes, keyword.strip(), outside)
         tables = introspect.table_names(source)
         if not tables:
             # 把实情交出去，而不是让它去点一个它点不到的按钮
             return f"数据源「{source.name}」的结构信息不可用。" + _no_schema_note(source)
         raw = set(unshaped_tables(source))
         totals = set(reported_total_tables(source))
-        return f"数据源「{source.name}」共 {len(tables)} 张表：\n" + "\n".join(
-            f"  {n}" + ("（按原样导入、未经规整，不能直接对列求和）" if n in raw else "")
-            + (REPORTED_TOTAL_MARK if n in totals else "") for n in tables
-        )
+        shown = tables[:SCHEMA_LIST_LIMIT]
+        total = max(len(tables), int((getattr(source, "schema_cache", None) or {}).get("total") or 0))
+        head = f"数据源「{source.name}」共 {total} 张表" + (f"，探查范围内 {len(tables)} 张" if total > len(tables) else "")
+        lines = [f"  {n}" + ("（按原样导入、未经规整，不能直接对列求和）" if n in raw else "")
+                 + (REPORTED_TOTAL_MARK if n in totals else "") for n in shown]
+        if total > len(shown):
+            lines.append("  " + SCHEMA_MORE_PROMPT.format(n=total - len(shown)))
+        return head + "：\n" + "\n".join(lines)
 
     return StructuredTool(
         name=f"{SCHEMA_PREFIX}{source.name}",
         description=(
             f"查看数据源「{source.name}」的表结构。"
-            "写 SQL 前先用它确认字段名。不传 table 则列出所有表；"
-            "**要看多张表就一次全传进来**（table 可以是数组），不要一张一张问。"
+            "写 SQL 前先用它确认字段名。不传 table 则列出表（表多时只列前 50 张）；"
+            "**要看多张表就一次全传进来**（table 可以是数组），不要一张一张问；"
+            "不知道表名时用 keyword 按要查的内容检索。"
         ),
         args_schema=_SchemaArgs,
         coroutine=_run,
         func=None,
     )
+
+
+async def _keyword_list(source: Any, notes: Mapping[str, Mapping[str, Any]], keyword: str,
+                        outside: frozenset[str] | None) -> str:
+    """按 keyword 检索（范围内的表、对象索引里范围外的对象），每个命中一行：表名｜中文名（范围外的是注释、标出来）。"""
+    objects: list[Any] = []
+    if outside:
+        from app.data import source_objects
+        from app.db.base import SessionLocal
+
+        try:
+            async with SessionLocal() as session:
+                objects = await source_objects.outside_objects(session, source)
+        except Exception:  # noqa: BLE001 - 读不到范围外的清单就只检索范围内的
+            objects = []
+    hits = schema_view.search_tables(source, notes, keyword, outside=objects, limit=SCHEMA_KEYWORD_LIMIT)
+    if not hits:
+        return SCHEMA_KEYWORD_NONE.format(source=source.name, keyword=keyword)
+    by_name = {o.name: o for o in objects}
+    tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
+    schema = (getattr(source, "schema_cache", None) or {}).get("schema")
+    lines = [SCHEMA_KEYWORD_HEAD.format(source=source.name, keyword=keyword)]
+    for hit in hits:
+        if hit.in_scope:
+            lines.append("  " + data_catalog.render_table_index(getattr(source, "schema_cache", None),
+                                                                 {k: data_catalog.visible_notes(v)
+                                                                  for k, v in notes.items()}, tables=[hit.name])
+                         if hit.name in tables else f"  {hit.name}")
+        else:
+            obj = by_name.get(hit.name)
+            comment = f"｜{obj.comment}" if obj is not None and obj.comment else ""
+            lines.append(f"  {f'{schema}.{hit.name}' if schema else hit.name}{comment}{SCHEMA_OUTSIDE_MARK}")
+    return "\n".join(lines)
+
+
+async def _on_demand(source: Any, missing: list[str], ctx: ToolContext | None) -> tuple[dict[str, str], list[str]]:
+    """db_schema 点名了表结构里没有的表：探查范围外、对象索引里有的当场加进范围（每次运行最多 ON_DEMAND_PER_RUN 张），
+    别的说清为什么不在。返回 ({点名: 交回的那句话}，加进来的提示行)；加进来的表不在前一个字典里（调用方照常给详情）。"""
+    from app.data import source_objects as so
+    from app.db.base import SessionLocal
+    from app.look.base import ON_DEMAND_PER_LOOK, ON_DEMAND_PER_RUN
+
+    out: dict[str, str] = {}
+    lines: list[str] = []
+    try:
+        async with SessionLocal() as session:
+            reasons = await so.absent_reasons(session, source, missing)
+            used = await so.count_added_in_run(session, ctx.run_id) if ctx is not None and ctx.run_id else 0
+    except Exception:  # noqa: BLE001 - 查不了原因就照旧说
+        logger.exception("db_schema 查表不在的原因失败（数据源 %s）", getattr(source, "name", "?"))
+        return out, lines
+    limit = ON_DEMAND_PER_RUN if ctx is not None and ctx.run_id else ON_DEMAND_PER_LOOK
+    room = max(limit - used, 0)
+    candidates = [t for t in missing if reasons.get(t) == so.ABSENT_OUT_OF_SCOPE]
+    take = candidates[:room]
+    for t in missing:
+        if t in take:
+            continue
+        why = SCHEMA_RUN_CAPPED.format(limit=limit) if t in candidates else ""
+        text = schema_view.absent_detail(source, t, reasons.get(t), why=why,
+                                         error=((getattr(source, "schema_cache", None) or {}).get("skipped") or {})
+                                         .get(t))
+        if text is not None:
+            out[t] = text
+    if take:
+        got = await so.add_to_scope(getattr(source, "id", ""), take, trail=so.Trail(
+            via=so.VIA_SCHEMA_TOOL, run_id=(ctx.run_id or None) if ctx else None,
+            ref=(ctx.node_id or None) if ctx else None,
+            need=f"运行时 {SCHEMA_PREFIX}{getattr(source, 'name', '')} 点名：{'、'.join(take)}"))
+        if got.cache is not None and got.added:
+            source.schema_cache = got.cache
+        for t in take:
+            key = data_catalog.resolve_table_name(getattr(source, "schema_cache", None), t)
+            if key is not None:
+                lines.append(SCHEMA_ADDED_PROMPT.format(table=key))
+                continue
+            why = got.failed.get(t) or got.refused.get(t) or next(
+                (v for k, v in {**got.failed, **got.refused}.items() if k.lower() == t.lower()), "")
+            out[t] = schema_view.absent_detail(source, t, so.ABSENT_OUT_OF_SCOPE, why=why) or why
+    return out, lines
 
 
 def is_dangerous_call(source: Any, sql: str) -> bool:

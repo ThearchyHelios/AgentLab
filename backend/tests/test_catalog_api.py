@@ -16,7 +16,7 @@ from app.db.models import DataSource
 from app.main import app as _fastapi_app
 from tests.fixtures.catalog import scenic
 from tests.fixtures.catalog.fake_model import FakeModel
-from tests.fixtures.sources import drop_source
+from tests.fixtures.sources import drop_source, introspect_now
 
 ACTOR = {"X-Actor": quote("王敏")}
 
@@ -35,8 +35,7 @@ async def source_id(client, scenic_db):
         session.add(row)
         await session.commit()
         sid = row.id
-    r = await client.post(f"/api/datasources/{sid}/introspect")
-    assert r.status_code == 200, r.text
+    await introspect_now(client, sid)
     yield sid
     await drop_source(sid)
 

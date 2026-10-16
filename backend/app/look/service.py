@@ -165,6 +165,11 @@ class LookService:
         """真正查看：(交回的正文, objects[], 这一次给出详情的对象的身份)。status / reason 写进 record。"""
         targets = parse_targets(line)
         sources = _sources(line)
+        for kind in self.kinds.values():
+            # 这一次查看开始：按需加入的上限按次数算、留痕要记需求原文和查看编号（只有表这一类用得着）
+            begin = getattr(kind, "begin", None)
+            if callable(begin):
+                begin(need=need, ref=str(record.get("id") or ""))
         unknown = [t["kind"] for t in targets if t["kind"] not in self.kinds]
         named: dict[str, list[LookTarget]] = {}
         picks: dict[str, list[str] | None] = {}

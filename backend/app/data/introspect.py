@@ -248,8 +248,128 @@ def index_first_columns(indexes: list[dict[str, Any]], pk: list[str]) -> list[st
     return sorted(first)
 
 
+def reflect_names(sync_conn: Any, target_schema: str | None, picked: list[str],
+                  views: set[str] | frozenset[str]) -> dict[str, Any]:
+    """在一条同步连接上反射给出的这几个对象（名字是 Inspector 列出的写法），返回 {tables, skipped, failures}：
+
+    - tables：{名字: 表结构}——列（名字、按方言编译的类型、可空、注释）、主键、表注释、是不是视图；读得到的话还有外键约束
+      （foreign_keys）、唯一约束 / 唯一索引（unique）、打头有索引的列（index_first_columns）——读不到的表不写这几个键；
+    - skipped：{名字: 原因}，反射不出来的对象（读不到列、权限不够）；
+    - failures：{名字: 驱动的原话}，批量失败后逐个重试时报错的那些。
+
+    整库探查（introspect）和后台探查任务（data/introspect_jobs.py，按批调它）共用这一份：探查范围里的表一批一批读，
+    读法、跳过的规矩和整库探查一字不差。"""
+    inspector = sa_inspect(sync_conn)
+
+    # 批量反射接口（SQLAlchemy 2.0）。
+    #
+    # **别指望它能治超时。** 实测 60 张表：逐表调用 121 次往返、批量 122 次
+    # ——SQLAlchemy 的反射缓存本来就把 get_columns / get_pk_constraint 合并
+    # 成了同一次底层查询，而 MySQL 方言压根没实现 get_multi_*，落到基类
+    # 还是每表一次 SHOW CREATE TABLE。真正能少往返的是 PostgreSQL 这类
+    # 原生实现了批量的方言。
+    #
+    # 换成它是因为这是 2.0 的正经接口、少三层 try/except，不是因为它快。
+    # shop 那次 "Lost connection to MySQL server during query"
+    # （run 554a0f92）多半是偶发的服务端超时——所以真正的对策不在这里，
+    # 在下面：失败要如实记成失败，让工具和界面都说真话。
+    #
+    # 批量是一锤子买卖：其中一个对象反射出错，整批都拿不到。SQLite 连接关了双引号
+    # 字符串兼容以后，老库里一个写着 `"yes" AS flag` 的视图就让 PRAGMA 报错；以前这里
+    # 吞掉异常返回空，好好的表跟着一起消失，探查却显示「成功、0 张表」。所以批量失败
+    # 时逐个对象再取一遍，只跳过真正取不到的那个，名字和原因记进 skipped。
+    failures: dict[str, str] = {}
+
+    def _multi(fn: Any, single: Any, names: list[str], *,
+               errors: dict[str, str] | None = None, ok: set[str] | None = None) -> dict[Any, Any]:
+        """批量反射，失败时逐个对象重试。ok 给了的话，记下真正读到了的对象名：批量成功时是全部
+        （没有约束的表批量接口也会给空列表，或者干脆不给），逐个重试时只有没报错的那些。"""
+        if not names:
+            return {}
+        try:
+            got = dict(fn(schema=target_schema, filter_names=names, kind=ObjectKind.ANY))
+            if ok is not None:
+                ok.update(names)
+            return got
+        except NotImplementedError:
+            return {}          # 表注释这类不是所有方言都支持
+        except Exception:  # noqa: BLE001 - 批量取不到，逐个对象再试
+            pass
+        out: dict[Any, Any] = {}
+        for name in names:
+            try:
+                out[(target_schema, name)] = single(name, schema=target_schema)
+                if ok is not None:
+                    ok.add(name)
+            except NotImplementedError:
+                break
+            except Exception as e:  # noqa: BLE001 - 只跳过这一个对象
+                if errors is not None:
+                    errors[name] = first_line(e) or describe_exception(e)
+                if not out and len(errors or ()) >= _GIVE_UP_AFTER:
+                    break      # 开头几个全取不到，多半是连接本身出了问题，不再挨个耗时间
+        return out
+
+    columns_by = _multi(inspector.get_multi_columns, inspector.get_columns, picked,
+                        errors=failures)
+    readable = [n for n in picked if columns_by.get((target_schema, n))]
+    pk_by = _multi(inspector.get_multi_pk_constraint, inspector.get_pk_constraint, readable)
+    comment_by = _multi(inspector.get_multi_table_comment, inspector.get_table_comment, readable)
+    # 外键和唯一约束给数据目录起草关系用（data/catalog.py）。放在列、主键、注释之后读：PostgreSQL 上一条
+    # 语句报错会让整个事务作废，先读的那几样不能被它连累。读不到的表不写这两个键（ok 集合里没有它），
+    # 下游据此分得清「读过、没有」和「不知道」——升级前探查的缓存里也没有这两个键。
+    fk_ok: set[str] = set()
+    uq_ok: set[str] = set()
+    ix_ok: set[str] = set()
+    fk_by = _multi(inspector.get_multi_foreign_keys, inspector.get_foreign_keys, readable, errors={}, ok=fk_ok)
+    uq_by = _multi(inspector.get_multi_unique_constraints, inspector.get_unique_constraints, readable,
+                   errors={}, ok=uq_ok)
+    ix_by = _multi(inspector.get_multi_indexes, inspector.get_indexes, readable, errors={}, ok=ix_ok)
+    try:
+        default_schema = inspector.default_schema_name
+    except Exception:  # noqa: BLE001 - 只用来判断外键是不是指向别的 schema
+        default_schema = None
+
+    tables: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+    for name in picked:
+        key = (target_schema, name)
+        columns = columns_by.get(key)
+        if not columns:
+            # 这个对象反射不出来，跳过，别毁掉整次探查；但要留下名字和原因
+            skipped[name] = failures.get(name) or "读不到列"
+            continue
+        pk = (pk_by.get(key) or {}).get("constrained_columns") or []
+        comment = (comment_by.get(key) or {}).get("text")
+
+        tables[name] = {
+            # 写 SQL 要用的全名。没有 schema 前缀时 Oracle 直接 ORA-00942——
+            # 只读账号名下没有这些对象，全靠跨 schema 授权
+            "qualified": f"{target_schema}.{name}" if target_schema else name,
+            "schema": target_schema,
+            "columns": [column_entry(c, sync_conn.dialect) for c in columns],
+            "primary_key": pk,
+            "comment": comment,
+            "is_view": name in views,
+        }
+        if _forced_quote(name):
+            tables[name]["quote_name"] = True
+        if name in fk_ok:
+            tables[name]["foreign_keys"] = _foreign_keys(fk_by.get(key) or [], target_schema, default_schema)
+        if name in uq_ok:
+            tables[name]["unique"] = _unique_groups(uq_by.get(key) or [],
+                                                    (ix_by.get(key) or []) if name in ix_ok else [], pk)
+        if name in ix_ok:
+            tables[name]["index_first_columns"] = index_first_columns(ix_by.get(key) or [], pk)
+    return {"tables": tables, "skipped": skipped, "failures": failures}
+
+
 async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any]:
-    """探查整个库的结构，结果直接存进 DataSource.schema_cache。
+    """一次性探查整个库的结构（最多 _MAX_TABLES 个对象），返回 schema_cache 的形状，不落盘。
+
+    上传表格发布新版本时核对表结构（data/table_versions.py）、测试夹具建表结构用它：对象少，一次读完。手工登记的数据库
+    源走对象索引 + 探查范围 + 后台探查任务（data/source_objects.py、data/introspect_jobs.py），schema_cache 由
+    rebuild_schema_cache 从范围内已反射的行物化，不再经这里截断。
 
     每张表：列（名字、类型、可空、注释）、主键、表注释、是不是视图；读得到的话还有外键约束
     （foreign_keys）和唯一约束 / 唯一索引（unique）——读不到的表不写这两个键，探查照常完成。
@@ -259,110 +379,12 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
 
     def _collect(sync_conn: Any) -> dict[str, Any]:
         inspector = sa_inspect(sync_conn)
-        target_schema = target
-        names = inspector.get_table_names(schema=target_schema)
-        views = inspector.get_view_names(schema=target_schema)
+        names = inspector.get_table_names(schema=target)
+        views = inspector.get_view_names(schema=target)
         truncated = len(names) + len(views) > _MAX_TABLES
         picked = (names + views)[:_MAX_TABLES]
-
-        # 批量反射接口（SQLAlchemy 2.0）。
-        #
-        # **别指望它能治超时。** 实测 60 张表：逐表调用 121 次往返、批量 122 次
-        # ——SQLAlchemy 的反射缓存本来就把 get_columns / get_pk_constraint 合并
-        # 成了同一次底层查询，而 MySQL 方言压根没实现 get_multi_*，落到基类
-        # 还是每表一次 SHOW CREATE TABLE。真正能少往返的是 PostgreSQL 这类
-        # 原生实现了批量的方言。
-        #
-        # 换成它是因为这是 2.0 的正经接口、少三层 try/except，不是因为它快。
-        # shop 那次 "Lost connection to MySQL server during query"
-        # （run 554a0f92）多半是偶发的服务端超时——所以真正的对策不在这里，
-        # 在下面：失败要如实记成失败，让工具和界面都说真话。
-        #
-        # 批量是一锤子买卖：其中一个对象反射出错，整批都拿不到。SQLite 连接关了双引号
-        # 字符串兼容以后，老库里一个写着 `"yes" AS flag` 的视图就让 PRAGMA 报错；以前这里
-        # 吞掉异常返回空，好好的表跟着一起消失，探查却显示「成功、0 张表」。所以批量失败
-        # 时逐个对象再取一遍，只跳过真正取不到的那个，名字和原因记进 skipped。
-        failures: dict[str, str] = {}
-
-        def _multi(fn: Any, single: Any, names: list[str], *,
-                   errors: dict[str, str] | None = None, ok: set[str] | None = None) -> dict[Any, Any]:
-            """批量反射，失败时逐个对象重试。ok 给了的话，记下真正读到了的对象名：批量成功时是全部
-            （没有约束的表批量接口也会给空列表，或者干脆不给），逐个重试时只有没报错的那些。"""
-            try:
-                got = dict(fn(schema=target_schema, filter_names=names, kind=ObjectKind.ANY))
-                if ok is not None:
-                    ok.update(names)
-                return got
-            except NotImplementedError:
-                return {}          # 表注释这类不是所有方言都支持
-            except Exception:  # noqa: BLE001 - 批量取不到，逐个对象再试
-                pass
-            out: dict[Any, Any] = {}
-            for name in names:
-                try:
-                    out[(target_schema, name)] = single(name, schema=target_schema)
-                    if ok is not None:
-                        ok.add(name)
-                except NotImplementedError:
-                    break
-                except Exception as e:  # noqa: BLE001 - 只跳过这一个对象
-                    if errors is not None:
-                        errors[name] = first_line(e) or describe_exception(e)
-                    if not out and len(errors or ()) >= _GIVE_UP_AFTER:
-                        break      # 开头几个全取不到，多半是连接本身出了问题，不再挨个耗时间
-            return out
-
-        columns_by = _multi(inspector.get_multi_columns, inspector.get_columns, picked,
-                            errors=failures)
-        readable = [n for n in picked if columns_by.get((target_schema, n))]
-        pk_by = _multi(inspector.get_multi_pk_constraint, inspector.get_pk_constraint, readable)
-        comment_by = _multi(inspector.get_multi_table_comment, inspector.get_table_comment, readable)
-        # 外键和唯一约束给数据目录起草关系用（data/catalog.py）。放在列、主键、注释之后读：PostgreSQL 上一条
-        # 语句报错会让整个事务作废，先读的那几样不能被它连累。读不到的表不写这两个键（ok 集合里没有它），
-        # 下游据此分得清「读过、没有」和「不知道」——升级前探查的缓存里也没有这两个键。
-        fk_ok: set[str] = set()
-        uq_ok: set[str] = set()
-        ix_ok: set[str] = set()
-        fk_by = _multi(inspector.get_multi_foreign_keys, inspector.get_foreign_keys, readable, errors={}, ok=fk_ok)
-        uq_by = _multi(inspector.get_multi_unique_constraints, inspector.get_unique_constraints, readable,
-                       errors={}, ok=uq_ok)
-        ix_by = _multi(inspector.get_multi_indexes, inspector.get_indexes, readable, errors={}, ok=ix_ok)
-        try:
-            default_schema = inspector.default_schema_name
-        except Exception:  # noqa: BLE001 - 只用来判断外键是不是指向别的 schema
-            default_schema = None
-
-        tables: dict[str, Any] = {}
-        skipped: dict[str, str] = {}
-        for name in picked:
-            key = (target_schema, name)
-            columns = columns_by.get(key)
-            if not columns:
-                # 这个对象反射不出来，跳过，别毁掉整次探查；但要留下名字和原因
-                skipped[name] = failures.get(name) or "读不到列"
-                continue
-            pk = (pk_by.get(key) or {}).get("constrained_columns") or []
-            comment = (comment_by.get(key) or {}).get("text")
-
-            tables[name] = {
-                # 写 SQL 要用的全名。没有 schema 前缀时 Oracle 直接 ORA-00942——
-                # 只读账号名下没有这些对象，全靠跨 schema 授权
-                "qualified": f"{target_schema}.{name}" if target_schema else name,
-                "schema": target_schema,
-                "columns": [column_entry(c, sync_conn.dialect) for c in columns],
-                "primary_key": pk,
-                "comment": comment,
-                "is_view": name in views,
-            }
-            if _forced_quote(name):
-                tables[name]["quote_name"] = True
-            if name in fk_ok:
-                tables[name]["foreign_keys"] = _foreign_keys(fk_by.get(key) or [], target_schema, default_schema)
-            if name in uq_ok:
-                tables[name]["unique"] = _unique_groups(uq_by.get(key) or [],
-                                                        (ix_by.get(key) or []) if name in ix_ok else [], pk)
-            if name in ix_ok:
-                tables[name]["index_first_columns"] = index_first_columns(ix_by.get(key) or [], pk)
+        got = reflect_names(sync_conn, target, picked, set(views))
+        tables, skipped, failures = got["tables"], got["skipped"], got["failures"]
         payload: dict[str, Any] = {"tables": tables, "truncated": truncated,
                                    "total": len(names) + len(views)}
         if failures and not tables:
