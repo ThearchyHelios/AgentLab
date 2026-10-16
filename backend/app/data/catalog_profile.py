@@ -43,7 +43,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from datetime import date as _date, datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects import mysql, oracle, postgresql, sqlite
@@ -250,30 +250,42 @@ def is_fixed_char(type_name: str | None) -> bool:
     return bool(type_name) and bool(_FIXED_CHAR.match(str(type_name)))
 
 
+class KeyLiterals(NamedTuple):
+    """key_literals 的结果。literals：去父表里对的 IN 列表字面量（去重、保持顺序）；unmatchable：按类型就对不上父键、
+    算作没对上的键值个数（去重后）；unsafe：值本身不能安全拼进 SQL、不计入核对的个数。"""
+    literals: list[str]
+    unmatchable: int
+    unsafe: int
+
+
 def key_literals(values: list[Any], kind: str | None, *, parent: str | None,
-                 child_type: str | None) -> tuple[list[str], int]:
-    """从子表取回的键值 → 去父表里对的 IN 列表字面量（去重、保持顺序）：(字面量, 因为两端类型不同没拼的个数)。
+                 child_type: str | None) -> KeyLiterals:
+    """从子表取回的键值 → 去父表里对的 IN 列表字面量（KeyLiterals）。
 
     字面量按**被指向列**的类型族写（catalog.column_family），不是按子表取回的值：
     - 父列是文字、子列是数：写成 '123'。PostgreSQL 上 varchar 列 IN (123) 直接报「operator does not exist」；
-    - 父列是数、子列是文字：只收整数写法的值（'0012' 也照 12 写），别的（'A1'）计入不同类型、不拼。Oracle 上
-      数字列 IN ('A1') 会把字面量转成数报 ORA-01722，MySQL 会把 'A1' 转成 0 去比、对上不该对上的行；
-    - 父列是时间：键不核对（各家时间字面量写法不同、精度不同），全部计入不同类型；
+    - 父列是数、子列是文字：只拼整数写法的值（'0012' 也照 12 写）。别的（'A1'、'WALKIN'）不拼——Oracle 上数字列
+      IN ('A1') 会把字面量转成数报 ORA-01722，MySQL 会把 'A1' 转成 0 去比、对上不该对上的行——但它们**照样是子表
+      的键值**：整数主键里永远没有 'WALKIN'，所以算作没对上，计入 unmatchable，由调用方留在覆盖率的分母里。要是
+      从分母里拿掉，散客代号占九成的一列只剩 1 个整数写法的键对上，就成了「覆盖率 100%」；
+    - 父列是时间：不在这里处理，_check_relation 先整条跳过（各家时间字面量写法不同、精度不同，键不核对）；
     - 父列类型认不出：照子表取回的值的类型写（sql_literal，以前的做法）。
     子表是定长文字（CHAR(n)）时先去掉尾随空格：PG、Oracle 取回的 'A ' 拿去和 VARCHAR 父列比就对不上，而按 CHAR 的
-    语义尾随空格本来就不算。不安全的值（反斜杠、「:名字」、控制字符、太长）照 sql_literal 的规矩跳过，不算类型不同。
+    语义尾随空格本来就不算。不安全的值（反斜杠、「:名字」、控制字符、太长）照 sql_literal 的规矩跳过，记进 unsafe
+    （调用方另记「类型不支持核对，未计入」）。两个不同的取值写成同一个字面量（'0012' 和 '12'）只算一个，不算 unsafe。
     """
+    if parent == "time":
+        raise ValueError("被指向列是日期时间的关系不核对键值（见 _check_relation）")
     fixed = is_fixed_char(child_type)
     out: list[str] = []
-    mismatched = 0
+    unmatchable: set[str] = set()
+    unsafe = 0
     for value in values:
         if fixed and isinstance(value, str):
             value = value.rstrip(" ")
-        if parent == "time":
-            mismatched += 1
-            continue
         if parent == "text":
             if isinstance(value, bool):
+                unsafe += 1
                 continue
             if isinstance(value, (int, float, Decimal)):
                 lit = sql_literal(value, "number")
@@ -284,16 +296,18 @@ def key_literals(values: list[Any], kind: str | None, *, parent: str | None,
             if isinstance(value, str):
                 text = value.strip()
                 if not _INT_TEXT.fullmatch(text):
-                    mismatched += 1
+                    unmatchable.add(text)
                     continue
                 lit = str(int(text))
             else:
                 lit = sql_literal(value, "number")
         else:
             lit = sql_literal(value, kind)
-        if lit is not None:
+        if lit is None:
+            unsafe += 1
+        else:
             out.append(lit)
-    return list(dict.fromkeys(out)), mismatched
+    return KeyLiterals(list(dict.fromkeys(out)), len(unmatchable), unsafe)
 
 
 _DIALECT_MODULES = {"sqlite": sqlite, "postgres": postgresql, "postgresql": postgresql, "mysql": mysql,
@@ -1152,12 +1166,13 @@ def _collation_note(dialect: SqlDialect, family: str | None, note: str) -> str |
 
 def _relation_note(*, sample: int, matched: int, coverage: float, scan_cap: int | None,
                    skipped_values: int, parent: tuple[bool | None, str], child: tuple[bool | None, str] | None,
-                   holds: bool, mismatched: int = 0, collation: str | None = None) -> str:
+                   holds: bool, unmatchable: int = 0, collation: str | None = None) -> str:
     """关系的剖析备注：取了多少个键值、看了多少行、覆盖率、父键和子键唯一的依据。人据此判断这条结论有多可靠。
     不写日期：什么时候剖析的看这一项的 updated_at（界面按本地时间显示）。
 
     不说「抽样」：DISTINCT … LIMIT 取的是数据库先给出的那几个值，大表上是按存储顺序的前若干行里的值，不是随机抽的
-    （多半是最老的数据）。mismatched：和被指向列类型不同、没拼进核对的键值个数（key_literals）。"""
+    （多半是最老的数据）。unmatchable：被指向列是数字、子表取到的却不是整数写法的键值个数（key_literals）——已经算在
+    sample 里、算作没对上，这里说明为什么没去父表里对。"""
     parts: list[str] = []
     low = coverage < catalog.PROFILE_VERIFY_COVERAGE
     if low:
@@ -1167,8 +1182,8 @@ def _relation_note(*, sample: int, matched: int, coverage: float, scan_cap: int 
     parts.append(sampled if low else f"{sampled}，覆盖率 {_percent(coverage)}")
     if skipped_values:
         parts.append(f"另有 {skipped_values} 个键值的类型不支持核对，未计入")
-    if mismatched:
-        parts.append(f"另有 {mismatched} 个键值和被指向列的类型不同（两端类型不同），未计入")
+    if unmatchable:
+        parts.append(f"其中 {unmatchable} 个不是整数写法，被指向列是数字，算作没对上")
     if collation:
         parts.append(collation)
     unique, how = parent
@@ -1214,6 +1229,11 @@ async def _check_relation(cx: _TableCx, table: str, rel: dict[str, Any], out: _T
         return
 
     d, s = cx.dialect, cx.settings
+    child_col, parent_col = _column_meta(meta, col), _column_meta(pmeta, pcol)
+    parent_family = catalog.column_family(parent_col)
+    if parent_family == "time":
+        # 时间键不核对：各家时间字面量写法、精度不同，拼出来的 IN 列表对不对得上说不准。不发子表的取值查询
+        raise _Skip("unsupported", f"{parent}.{pcol} 是日期时间，各库的时间写法和精度不同，不核对这种关系的覆盖率")
     size = await cx.size_with_data(table, result)
     scan_cap = cx.scan_cap(size)
     child_table, parent_table = d.table(meta, table), d.table(pmeta, parent)
@@ -1221,24 +1241,20 @@ async def _check_relation(cx: _TableCx, table: str, rel: dict[str, Any], out: _T
                        max_rows=s.sample_size)
     kind = (res.column_types or {}).get(res.columns[0]) if res.columns else None
     values = [row[0] for row in res.rows if row]
-    child_col, parent_col = _column_meta(meta, col), _column_meta(pmeta, pcol)
-    parent_family = catalog.column_family(parent_col)
-    literals, mismatched = key_literals(values, kind, parent=parent_family,
-                                        child_type=(child_col or {}).get("type"))
+    literals, unmatchable, unsafe = key_literals(values, kind, parent=parent_family,
+                                                 child_type=(child_col or {}).get("type"))
     if not values:
         raise _Skip("no_data", f"{table}.{col} 没有非空值，无法核对")
-    if not literals and mismatched:
-        their = {"number": "数字", "text": "文字", "time": "日期时间"}.get(parent_family or "", "其他类型")
-        raise _Skip("unsupported", f"两端类型不同：{parent}.{pcol} 是{their}，{table}.{col} 取到的值对不上这种类型，"
-                                   "无法核对")
-    if not literals:
+    if not literals and not unmatchable:
         raise _Skip("unsupported", f"{table}.{col} 的取值类型不支持核对（只核对整数和文字）")
+    # 分母是子表取到的全部键值：不是整数写法、按类型就对不上整数父键的（unmatchable）也在里面，算作没对上
+    sample = len(literals) + unmatchable
     matched = 0
     for start in range(0, len(literals), IN_CHUNK):
         sql = d.match_count_sql(parent_table, d.column(pmeta, pcol), literals[start:start + IN_CHUNK])
         matched += _as_int(_first(await cx.run(sql))) or 0
     matched = min(matched, len(literals))
-    coverage = round(matched / len(literals), 4)
+    coverage = round(matched / sample, 4)
 
     parent_unique = await _unique(cx, parent, pmeta, pcol, result)
     child_unique = await _unique(cx, table, meta, col, result) if parent_unique[0] else None
@@ -1246,14 +1262,13 @@ async def _check_relation(cx: _TableCx, table: str, rel: dict[str, Any], out: _T
     if child_unique is not None:
         cardinality = "one_to_one" if child_unique[0] is True else "many_to_one"
     holds = coverage >= catalog.PROFILE_VERIFY_COVERAGE and cardinality is not None
-    unsafe = len(values) - mismatched - len(literals)
-    note = _relation_note(sample=len(literals), matched=matched, coverage=coverage, scan_cap=scan_cap,
-                          skipped_values=max(unsafe, 0), parent=parent_unique, child=child_unique, holds=holds,
-                          mismatched=mismatched,
+    note = _relation_note(sample=sample, matched=matched, coverage=coverage, scan_cap=scan_cap,
+                          skipped_values=unsafe, parent=parent_unique, child=child_unique, holds=holds,
+                          unmatchable=unmatchable,
                           collation=_collation_note(d, parent_family, MYSQL_COLLATION_NOTE))
     checked = child_unique is not None and child_unique[0] is not None
     out.relations.append(_RelationOutcome(rid=str(rel["id"]), target=_relation_target(rel), coverage=coverage,
-                                          cardinality=cardinality, holds=holds, sample=len(literals),
+                                          cardinality=cardinality, holds=holds, sample=sample,
                                           matched=matched, note=note, cardinality_checked=checked))
 
 
@@ -1468,7 +1483,7 @@ def _relation_finding(o: _RelationOutcome, rel: dict[str, Any], *, status: str, 
     elif status == "verified":
         summary = f"覆盖率 {_percent(o.coverage)}，" + ("仍为有确证" if previous == "verified" else "升为有确证")
     elif o.coverage < catalog.PROFILE_VERIFY_COVERAGE:
-        summary = f"抽样覆盖率 {_percent(o.coverage)}，保持推断"
+        summary = f"覆盖率 {_percent(o.coverage)}，保持推断"
     else:
         summary = "被指向列未核实唯一，保持推断"
     return {"kind": "relation", "path": f"relations.{o.rid}", "target": o.target,

@@ -567,18 +567,48 @@ def _undated(note: str) -> str:
     return _PROFILE_NOTE_DAY.sub("数据剖析", note, count=1)
 
 
+#: 剖析备注改过的说法：(升级前的写法, 现在的写法)。大表看的是按存储顺序的前 N 行（多半是最老的数据）、关系取的是
+#: 数据库先给出的那几个键值，都不是随机抽样，说法改成照实的（data/catalog_profile.py 的 _relation_note、码值的
+#: 「统计范围」、FILTER_SAMPLED）。只换这几处固定的句式，换完和现在的写法一字不差才算同一句
+_LEGACY_PROFILE_WORDING = (
+    (re.compile(r"抽样覆盖率 (?=\S+?，可能不是这条关系)"), "覆盖率 "),
+    (re.compile(r"子表抽样 (?=\d+ 个不同键值)"), "子表取了 "),
+    (re.compile(r"（只看前 (?=\d+ 行）)"), "（按存储顺序只看前 "),
+    (re.compile(r"按前 (?=[\d,]+ 行统计)"), "按存储顺序取前 "),
+)
+#: 起草时核对有效行过滤写进备注的那句（catalog_profile.FILTER_SAMPLED / FILTER_SAMPLED_EDGE）：接在模型给的依据后面，
+#: 整段不以「数据剖析：」开头，只换这一句
+_LEGACY_FILTER_WORDING = re.compile(r"剖析核对：按前 (?=[\d,]+ 行统计)")
+
+
+def _current_wording(note: str) -> str:
+    """剖析备注里升级前的说法换成现在的写法（_LEGACY_PROFILE_WORDING）。只用来比较，不改写目录里存着的备注。"""
+    for pattern, now in _LEGACY_PROFILE_WORDING:
+        note = pattern.sub(now, note)
+    return note
+
+
 def same_profile_note(a: Any, b: Any) -> bool:
     """两段备注是否相同；数据剖析写的备注只差开头的日期（升级前每次都写当天的日期），或者一段带日期、一段是不带
-    日期的新写法，也算相同。
+    日期的新写法，或者只差改过的几处说法（_LEGACY_PROFILE_WORDING：「抽样覆盖率」→「覆盖率」之类），也算相同。
 
     隔天重跑、数据没变，结论一字不差、只有日期变了：要是这也算「变了」，目录就升一个版本，发布时记下的目录版本
-    对不上，之后每次正式运行都提醒「目录有变化」。升级后第一次重新剖析也是一样：结论没变，只是新写法不带日期。
+    对不上，之后每次正式运行都提醒「目录有变化」。升级后第一次重新剖析也是一样：结论没变，只是新写法不带日期、
+    措辞改了。算相同时保留旧的那段（目录不动），旧说法要等结论真的变了、重写备注时才换掉。
+
+    起草写的备注（有效行过滤）里接着的剖析核对那句同理，只认那一句的旧说法（_LEGACY_FILTER_WORDING）。
     """
     if a == b:
         return True
-    if not (is_profile_note(a) and is_profile_note(b)):
+    if not (isinstance(a, str) and isinstance(b, str)):
         return False
-    return _undated(a) == _undated(b)
+    profile_a, profile_b = is_profile_note(a), is_profile_note(b)
+    if profile_a and profile_b:
+        return _current_wording(_undated(a)) == _current_wording(_undated(b))
+    if profile_a or profile_b:
+        return False
+    return (_LEGACY_FILTER_WORDING.sub("剖析核对：按存储顺序取前 ", a)
+            == _LEGACY_FILTER_WORDING.sub("剖析核对：按存储顺序取前 ", b))
 
 
 def _same_core(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:

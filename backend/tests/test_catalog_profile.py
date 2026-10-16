@@ -23,7 +23,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
-from app.data import catalog_profile, catalog_profile_jobs
+from app.data import catalog, catalog_profile, catalog_profile_jobs
 from app.data import engine as data_engine
 from app.data.catalog_profile import PROFILE_OPTION, ProfileSettings
 from app.db.base import SessionLocal
@@ -325,6 +325,39 @@ async def test_wrong_name_relation_stays_proposed_with_coverage_in_note(client, 
     ranges = {d["column"] for d in _table(body, "parking_records")["date_ranges"]}
     assert ranges == {"entered_at"}           # exited_at 全是空值
     assert "business_date" not in (await _notes(client, sid, "parking_records"))["notes"]
+
+
+async def test_text_keys_that_cannot_be_integers_count_as_unmatched(client, make_source, tmp_path):
+    """模型起草的关系：orders.customer_ref（文字）指向 customers.id（整数主键），可取值大多是散客代号。不是整数写法的
+    文字永远对不上整数主键，算作没对上、留在分母里——不能从分母里拿掉，把 1 个对上的键说成覆盖率 100% 升为有确证。"""
+    path = str(tmp_path / "walkin.db")
+    db = sqlite3.connect(path)
+    try:
+        db.executescript("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL);"
+                         "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_ref TEXT, amount INTEGER);")
+        db.executemany("INSERT INTO customers VALUES (?, ?)", [(i, f"会员{i}") for i in (1, 2, 3)])
+        refs = ["WALKIN"] * 90 + ["1"] * 10 + [f"GUEST{i}" for i in range(30)]
+        db.executemany("INSERT INTO orders VALUES (?, ?, ?)", [(i, ref, 10) for i, ref in enumerate(refs, 1)])
+        db.commit()
+    finally:
+        db.close()
+    sid = await make_source(path, options=_on())
+    rel_id = catalog.relation_id("orders", ["customer_ref"], "customers", ["id"])
+    async with SessionLocal() as session:
+        await catalog.write_entry(session, sid, "orders", {"relations": [
+            {"id": rel_id, "columns": ["customer_ref"], "to_table": "customers", "to_columns": ["id"],
+             "cardinality": "many_to_one", "coverage": None, "source": "llm", "status": "proposed"}]},
+            if_version=0, actor=None)
+
+    body = await _profile(client, sid, ["orders"])
+    rel = _relation((await _notes(client, sid, "orders"))["notes"], "customer_ref")
+    assert (rel["source"], rel["status"]) == ("profile", "proposed")
+    assert rel["coverage"] == round(1 / 32, 4)
+    assert "覆盖率 3.1%" in rel["note"] and "可能不是这条关系" in rel["note"]
+    assert "子表取了 32 个不同键值，父表对上 1 个" in rel["note"]
+    assert "31 个不是整数写法" in rel["note"] and "未计入" not in rel["note"]
+    finding = _table(body, "orders")["findings"][0]
+    assert (finding["status"], finding["sample"], finding["matched"]) == ("proposed", 32, 1)
 
 
 async def test_confirmed_relation_only_gets_coverage_and_cardinality(client, make_source, scenic_db):

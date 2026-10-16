@@ -135,22 +135,94 @@ def test_index_first_columns_are_recorded():
 
 
 def test_key_literals_follow_the_parent_family():
-    lits, mismatched = catalog_profile.key_literals([12, 7], "number", parent="text", child_type="INTEGER")
-    assert lits == ["'12'", "'7'"] and mismatched == 0
-    lits, mismatched = catalog_profile.key_literals(["12", "A1", "-3"], "text", parent="number",
-                                                    child_type="VARCHAR(10)")
-    assert lits == ["12", "-3"] and mismatched == 1
-    lits, mismatched = catalog_profile.key_literals([1, 2], "number", parent="time", child_type="INTEGER")
-    assert lits == [] and mismatched == 2
+    assert catalog_profile.key_literals([12, 7], "number", parent="text", child_type="INTEGER") == (
+        ["'12'", "'7'"], 0, 0)
+    # 父列是数、子列是文字：只拼整数写法；'A1' 按类型就对不上整数父键，记进 unmatchable（调用方算作没对上）
+    assert catalog_profile.key_literals(["12", "A1", "-3", "A1 "], "text", parent="number",
+                                        child_type="VARCHAR(10)") == (["12", "-3"], 1, 0)
+    # 父列是时间的关系整条不核对（_check_relation 先跳过），这里不收
+    with pytest.raises(ValueError):
+        catalog_profile.key_literals([1, 2], "number", parent="time", child_type="INTEGER")
     # 父列类型不知道：照子表取回的值的类型写（以前的做法）
-    assert catalog_profile.key_literals([3, "x"], None, parent=None, child_type=None) == (["3", "'x'"], 0)
+    assert catalog_profile.key_literals([3, "x"], None, parent=None, child_type=None) == (["3", "'x'"], 0, 0)
+
+
+def test_key_literals_count_unsafe_values_but_not_duplicate_spellings():
+    """不能安全拼进 SQL 的值记进 unsafe（备注写「类型不支持核对，未计入」）；'0012' 和 '12' 写成同一个字面量，只算一个，
+    不能被当成「不支持核对」。"""
+    found = catalog_profile.key_literals(["0012", "12", "a\\b", True], "text", parent="text", child_type="TEXT")
+    assert found == (["'0012'", "'12'"], 0, 2)
+    found = catalog_profile.key_literals(["0012", "12"], "text", parent="number", child_type="TEXT")
+    assert found == (["12"], 0, 0)
+
+
+_REL = {"id": "r1", "columns": ["customer_ref"], "to_table": "customers", "to_columns": ["id"], "source": "llm",
+        "status": "proposed"}
+
+
+def _relation_cx(values: list[Any], parent_type: str, matched: int):
+    """orders.customer_ref（文字）→ customers.id（parent_type）的关系核对用的执行状态：取值查询回 values，父表的核对
+    查询回 matched，唯一性计数回「有重复」。seen 记下发出的每条 SQL。"""
+    settings = ProfileSettings(enabled=True)
+    source = type("S", (), {"id": "s1", "name": "shop", "kind": "postgresql", "options": {}})()
+    tables = {"orders": {"columns": [{"name": "id", "type": "INTEGER"}, {"name": "customer_ref", "type": "TEXT"}],
+                         "primary_key": ["id"]},
+              "customers": {"columns": [{"name": "id", "type": parent_type}], "primary_key": ["id"]}}
+    job = catalog_profile.ProfileContext(source=source, settings=settings, dialect=SqlDialect("postgresql"),
+                                         runner=None, tables=tables, masked=set())
+    job.sizes.update({"orders": TableSize(130, "count"), "customers": TableSize(3, "count")})
+    cx = catalog_profile._TableCx(job, "orders", catalog_profile.TableResult(table="orders"),
+                                  catalog_profile.TableHooks())
+    seen: list[str] = []
+
+    async def run(sql: str, **_kw: Any) -> QueryResult:
+        seen.append(sql)
+        if "SELECT DISTINCT" in sql:
+            rows = [[v] for v in values]
+            return QueryResult(columns=["k"], rows=rows, row_count=len(rows), truncated=False, elapsed_ms=1, sql=sql,
+                               column_types={"k": "text"})
+        if " IN (" in sql:
+            return _result(matched)
+        return QueryResult(columns=["a", "b"], rows=[[130, len(values)]], row_count=1, truncated=False, elapsed_ms=1,
+                           sql=sql)
+    cx.run = run  # type: ignore[method-assign]
+    return cx, seen
+
+
+@pytest.mark.parametrize("values, parent_type, coverage, sample, matched", [
+    # 九成是散客代号、只有 1 个整数写法对得上：以前分母里拿掉了对不上类型的，测成 100%
+    (["WALKIN", "1"] + [f"GUEST{i}" for i in range(30)], "INTEGER", round(1 / 32, 4), 32, 1),
+    # 全都不是整数写法：一条 IN 都不用发，覆盖率 0%，照样是「可能不是这条关系」，不是「无法核对」
+    (["WALKIN", "GUEST1"], "INTEGER", 0.0, 2, 0),
+    (["1", "2"], "INTEGER", 1.0, 2, 2),
+])
+def test_relation_coverage_counts_type_mismatches_as_unmatched(values, parent_type, coverage, sample, matched):
+    cx, seen = _relation_cx(values, parent_type, matched)
+    out, result = catalog_profile._TableOutcome(), catalog_profile.TableResult(table="orders")
+    asyncio.run(catalog_profile._check_relation(cx, "orders", _REL, out, result))
+    [rel] = out.relations
+    assert (rel.coverage, rel.sample, rel.matched, rel.holds) == (coverage, sample, matched, coverage == 1.0)
+    if coverage < 1:
+        assert "可能不是这条关系" in rel.note and "未计入" not in rel.note
+    if sample > matched and matched == 0:
+        assert not any("IN (" in sql for sql in seen), "没有整数写法的键值：不发父表的核对查询"
+
+
+def test_time_keys_are_not_checked_and_send_no_query():
+    cx, seen = _relation_cx(["2026-09-01"], "DATE", 0)
+    out, result = catalog_profile._TableOutcome(), catalog_profile.TableResult(table="orders")
+    with pytest.raises(catalog_profile._Skip) as skipped:
+        asyncio.run(catalog_profile._check_relation(cx, "orders", _REL, out, result))
+    assert skipped.value.reason == "unsupported" and "日期时间" in str(skipped.value)
+    assert "两端类型不同" not in str(skipped.value)
+    assert seen == [], "时间键不核对，一条查询都不发"
 
 
 def test_char_keys_lose_their_padding():
     """PG、Oracle 的 CHAR(n) 取回来带尾随空格：拼成 'A ' 去和 VARCHAR 父列比就对不上。"""
-    lits, _ = catalog_profile.key_literals(["A ", "BC"], "text", parent="text", child_type="CHAR(2)")
+    lits = catalog_profile.key_literals(["A ", "BC"], "text", parent="text", child_type="CHAR(2)").literals
     assert lits == ["'A'", "'BC'"]
-    lits, _ = catalog_profile.key_literals(["A "], "text", parent="text", child_type="VARCHAR(2)")
+    lits = catalog_profile.key_literals(["A "], "text", parent="text", child_type="VARCHAR(2)").literals
     assert lits == ["'A '"]
 
 
@@ -283,7 +355,7 @@ def test_sample_percent_must_be_between_0_and_100(bad):
 
 def test_notes_say_storage_order_not_sampling():
     note = catalog_profile._relation_note(sample=2000, matched=2000, coverage=1.0, scan_cap=100_000, skipped_values=0,
-                                          mismatched=0, parent=(True, "主键"), child=(False, "count"), holds=True,
+                                          unmatchable=0, parent=(True, "主键"), child=(False, "count"), holds=True,
                                           collation=None)
     assert "按存储顺序只看前 100000 行" in note and "抽样" not in note
     assert catalog_profile.FILTER_SAMPLED.format(rows="100", share="1%").startswith("剖析核对：按存储顺序取前 100 行统计")
@@ -291,6 +363,6 @@ def test_notes_say_storage_order_not_sampling():
 
 def test_mysql_notes_mention_the_collation():
     note = catalog_profile._relation_note(sample=10, matched=10, coverage=1.0, scan_cap=None, skipped_values=0,
-                                          mismatched=0, parent=(True, "主键"), child=(False, "count"), holds=True,
+                                          unmatchable=0, parent=(True, "主键"), child=(False, "count"), holds=True,
                                           collation=catalog_profile.MYSQL_COLLATION_NOTE)
     assert "排序规则" in note and "不分大小写" in note

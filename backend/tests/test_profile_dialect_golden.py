@@ -53,7 +53,7 @@ def _queries(kind: str) -> list[tuple[str, str | None]]:
         d.table(META["visits"], "visits")
     status, code = d.column(META["orders"], "status"), d.column(META["stores"], "code")
     level = d.column(META["visits"], "level")
-    keys, _ = key_literals([12, 7], "number", parent="text", child_type="INTEGER")
+    keys = key_literals([12, 7], "number", parent="text", child_type="INTEGER").literals
     out: list[tuple[str, str | None]] = [
         ("stats", d.stats_sql(META["orders"], "orders")),
         ("stats_quoted", d.stats_sql(META["visits"], "visits")),
@@ -158,7 +158,7 @@ def _in_families(sql: str, kind: str, schema: dict[str, dict[str, str]]) -> list
 def test_in_list_literals_have_the_parent_columns_family(kind, parent_type, child_values, child_type):
     d = SqlDialect(kind)
     parent = {"name": "code", "type": parent_type}
-    literals, _ = key_literals(child_values, None, parent=catalog.column_family(parent), child_type=child_type)
+    literals = key_literals(child_values, None, parent=catalog.column_family(parent), child_type=child_type).literals
     assert literals
     sql = d.match_count_sql("stores", d.quote("code"), literals[:IN_CHUNK])
     found = _in_families(sql, kind, {"stores": {"code": parent_type}})
