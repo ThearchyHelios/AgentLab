@@ -1,11 +1,11 @@
 """题集的形状与校验（细案 01 做法 7、17；评测-D9）。
 
 题集：name（必填）、description、timezone（题目里的 {{ schedule.* }} 按它算）、default_variant（发起评测时缺省用的变体，
-第 3 波解析；这里只要求是对象）、budget（只存改过的项）、archived。改题集带上读到的 version（乐观锁，接口回 409）。
+形状按 app/eval/variants.normalize_variant 核对）、budget（只存改过的项）、archived。改题集带上读到的 version（乐观锁，接口回 409）。
 
 **预算**（评测-D9，用户拍板）：缺省见 db/models_eval.DEFAULT_BUDGET——同时 2 题、每题 900 秒、单次评测 2 美元、评测每日
-5 美元。daily_max_usd 是评测那本账（engine/spend 的第三本，第 3 波接上）的当日上限：评测单独记账，不挤占裁判、核查的额度。
-这一波只定字段和取值范围，执行（预留、找补、触顶不再开新题）在第 3 波。
+5 美元。全站的缺省在设置 eval 一组（管理员改），题集上改过的项盖过它；daily_max_usd 是评测那本账（engine/spend.eval_spend）
+的当日上限：评测单独记账，不挤占裁判、核查的额度，题集只能往下收。执行（预留、找补、触顶不再开新题）见 app/eval/runner.py。
 """
 from __future__ import annotations
 
@@ -63,9 +63,16 @@ def normalize_budget(raw: Any) -> dict[str, Any]:
     return out
 
 
-def effective_budget(stored: Mapping[str, Any] | None) -> dict[str, Any]:
-    """生效的预算：缺省加上题集改过的项。"""
-    return {**DEFAULT_BUDGET, **{k: v for k, v in (stored or {}).items() if k in DEFAULT_BUDGET}}
+def effective_budget(stored: Mapping[str, Any] | None, site: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """生效的预算：评测-D9 的缺省 ← 设置里 eval 一组（全站，管理员定，api/settings.eval_settings）← 题集改过的项。
+
+    评测每日的金额上限是全站那一本账（engine/spend.eval_spend）的上限：题集只能往下收（取两者小的），搭建者改题集不能
+    越过管理员定的每日上限。"""
+    base = {**DEFAULT_BUDGET, **{k: v for k, v in (site or {}).items() if k in DEFAULT_BUDGET}}
+    own = {k: v for k, v in (stored or {}).items() if k in DEFAULT_BUDGET}
+    out = {**base, **own}
+    out["daily_max_usd"] = min(float(base["daily_max_usd"]), float(own.get("daily_max_usd", base["daily_max_usd"])))
+    return out
 
 
 def normalize_suite(body: Mapping[str, Any], *, current: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -96,6 +103,13 @@ def normalize_suite(body: Mapping[str, Any], *, current: Mapping[str, Any] | Non
     variant = pick("default_variant", {}) or {}
     if not isinstance(variant, Mapping) or len(canonical_json(variant)) > VARIANT_MAX:
         raise _invalid("默认变体需要是一个对象", "default_variant")
+    # 形状按变体的规矩核对（app/eval/variants.py）；存的是写进来的样子，没写的项发起时按设置补
+    from app.eval.variants import normalize_variant
+
+    try:
+        normalize_variant(variant)
+    except CaseInvalid as e:
+        raise _invalid(f"默认变体：{e.message}", "default_variant") from e
     archived = pick("archived", False)
     if not isinstance(archived, bool):
         raise _invalid("是否归档需要是 true 或 false", "archived")

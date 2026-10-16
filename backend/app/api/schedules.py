@@ -1,6 +1,13 @@
 """定时任务：按周期自动发起工作流运行，结束、失败、停在审批时推送 Webhook，运行成功结束后和同一任务上一次成功的运行
 自动对比。
 
+**目标种类**（docs/design/next-round/00-总方案.md X4：定时只有一套）：target_kind 是 workflow（缺省，字段和行为一字不变）、
+eval_suite（跑一次评测题集）或 source_maintenance（维护一个数据源）。非工作流目标写 target_id，不写 workflow_id、输入模板、
+运行类别和 Webhook：核对目标交给各自的模块（scheduler/service.check_target → app/eval/scheduled、app/data/source_maintenance）；
+它们的通知走通知渠道的订阅（评测有退步、评测失败……），不走定时任务的 Webhook——Webhook 的三种事件（运行结束、运行失败、
+等待审批）说的是这一次发起的那次运行，非工作流目标没有那一次运行，配上了也收不到，所以照实拒收。接口返回带 target_kind、
+target_id、target_name（目标现在的名字，不在了用保存时记下的那一份）。
+
 形状按前后端约定（Schedule、Fire 两种对象，见 _schedule_out、_fire_outs）。Webhook 地址和签名密钥加密存放，接口
 只给主机和末 4 位（url_hint）、有没有密钥（has_secret）。请求体自己解析、自己校验：错误一律回中文 detail，表单
 据 field 把报错落到那一格（422 {detail, code, field}，同 api/coded.py）。后台的调度循环在 app/scheduler 里。
@@ -24,9 +31,12 @@ from app.scheduler import auto_compare, cron, service, webhook
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
 
-#: 请求不合规（422）的机器码。field 是出错的那一项：name、workflow_id、cron、timezone、run_class、input_template、
-#: enabled、overlap、misfire_grace_s、webhook、version、limit、before
+#: 请求不合规（422）的机器码。field 是出错的那一项：name、target_kind、target_id、workflow_id、cron、timezone、run_class、
+#: input_template、enabled、overlap、misfire_grace_s、webhook、version、limit、before
 SCHEDULE_INVALID = "schedule_invalid"
+#: 非工作流目标配了 Webhook（见模块说明）
+NO_WEBHOOK = ("目标是「{kind}」的定时任务不推 Webhook：Webhook 的事件说的是定时发起的那次运行。要收这类定时的通知，"
+              "请在「设置 → 通知」的渠道里订阅对应的事件")
 _GONE = "定时任务不存在，可能已被删除"
 #: 错过的触发在多少秒内补发：默认 1 小时，最长 7 天
 DEFAULT_GRACE_S = 3600
@@ -94,6 +104,35 @@ def _workflow_id(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise _invalid("请选择要定时运行的工作流", "workflow_id")
     return value.strip()
+
+
+def _target_kind(value: Any) -> str:
+    if value not in service.TARGET_KINDS:
+        labels = "、".join(service.TARGET_LABEL[k] for k in service.TARGET_KINDS)
+        raise _invalid(f"定时任务的目标需要是{labels}之一{_current(value)}", "target_kind")
+    return value
+
+
+def _target_id(value: Any, kind: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise _invalid(f"请选择要定时的{service.TARGET_LABEL[kind]}", "target_id")
+    return value.strip()
+
+
+def _target_extras(body: dict[str, Any], kind: str) -> None:
+    """非工作流目标不写工作流、输入模板、Webhook（见模块说明）；运行类别带了也只认合法的写法，不存。"""
+    label = service.TARGET_LABEL[kind]
+    if not _blank(body.get("workflow_id")):
+        raise _invalid(f"目标是「{label}」的定时任务不指定工作流", "workflow_id")
+    if body.get("input_template") not in (None, {}):
+        raise _invalid(f"目标是「{label}」的定时任务没有输入模板", "input_template")
+    hook = body.get("webhook")
+    if isinstance(hook, dict) and not _blank(hook.get("url")):
+        raise _invalid(NO_WEBHOOK.format(kind=label), "webhook")
+    if hook is not None and not isinstance(hook, dict):
+        raise _invalid("Webhook 设置需要是一个对象，或者为空表示不推送", "webhook")
+    if "run_class" in body:
+        _run_class(body["run_class"])
 
 
 def _cron(value: Any) -> str:
@@ -348,6 +387,8 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
         "status": "started" if f.id in launching else f.status,
         "run_id": f.run_id,
         "run_status": current.get(f.run_id, (None, None))[0] if f.run_id else None,
+        # 目标是评测题集时这一次触发建的那次评测（没有运行 id）
+        "eval_run_id": f.eval_run_id,
         "reason": None if f.id in launching else f.reason,
         "notified": notified.get(f.id, []),
         "compare": compare_of(f),
@@ -358,22 +399,35 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
 async def _schedule_outs(session: AsyncSession, rows: list[Schedule]) -> list[dict[str, Any]]:
     ids = [r.id for r in rows]
     names: dict[str, str] = {}
+    targets: dict[str, str | None] = {}
     last: dict[str, dict[str, Any]] = {}
     if rows:
         names = dict((await session.execute(
-            select(Workflow.id, Workflow.name).where(Workflow.id.in_({r.workflow_id for r in rows})))).all())
+            select(Workflow.id, Workflow.name).where(Workflow.id.in_({r.workflow_id for r in rows if r.workflow_id})))).all())
+        for r in rows:
+            kind, target_id = service.target_of(r)
+            if kind != "workflow":
+                targets[r.id] = await service.target_name(session, kind, target_id)
         newest = (select(ScheduleFire.schedule_id, func.max(ScheduleFire.created_at).label("at"))
                   .where(ScheduleFire.schedule_id.in_(ids)).group_by(ScheduleFire.schedule_id).subquery())
         fires = list((await session.execute(select(ScheduleFire).join(newest, and_(
             ScheduleFire.schedule_id == newest.c.schedule_id, ScheduleFire.created_at == newest.c.at)))).scalars())
         for out, fire in zip(await _fire_outs(session, fires), fires):
             last.setdefault(fire.schedule_id, out)
+    def target(r: Schedule) -> dict[str, Any]:
+        kind, target_id = service.target_of(r)
+        name = names.get(r.workflow_id) if kind == "workflow" else targets.get(r.id)
+        # 目标还在就给它现在的名字；删掉之后用保存时记下的那一份
+        return {"target_kind": kind, "target_id": target_id, "target_label": service.TARGET_LABEL.get(kind, kind),
+                "target_name": name or r.workflow_name, "target_exists": name is not None}
+
     return [{
         "id": r.id,
         "name": r.name,
+        **target(r),
         "workflow_id": r.workflow_id,
-        # 工作流还在就给它现在的名字；删掉之后用保存时记下的那一份
-        "workflow_name": names.get(r.workflow_id) or r.workflow_name,
+        # 工作流还在就给它现在的名字；删掉之后用保存时记下的那一份。非工作流目标这一项是目标的名字（同 target_name）
+        "workflow_name": names.get(r.workflow_id) or targets.get(r.id) or r.workflow_name,
         "cron": r.cron,
         "timezone": r.timezone,
         "run_class": r.run_class,
@@ -467,7 +521,18 @@ async def create_schedule(request: Request, session: AsyncSession = Depends(get_
 
 def schedule_values(body: dict[str, Any]) -> dict[str, Any]:
     """建定时任务的请求体 → 规范化之后的列（不含工作流名、下一次触发），逐项校验，不对抛 422（带 field）。只读，
-    不碰库：发布单的预检用它「只检查」，建任务的接口和发布单建任务都先过它。"""
+    不碰库：发布单的预检用它「只检查」，建任务的接口和发布单建任务都先过它。
+
+    target_kind 缺省 workflow：交回的键和以前一字不差。非工作流目标交回 target_kind、target_id，运行类别存探索（不用它）、
+    输入模板为空、没有 Webhook。"""
+    kind = _target_kind(body.get("target_kind", "workflow"))
+    if kind != "workflow":
+        _target_extras(body, kind)
+        return {"name": _name(body.get("name")), "target_kind": kind, "target_id": _target_id(body.get("target_id"), kind),
+                "cron": _cron(body.get("cron")), "timezone": _timezone(body.get("timezone")),
+                "run_class": "exploratory", "input_template": {}, "enabled": _enabled(body.get("enabled", True)),
+                "overlap": _overlap(body.get("overlap", "skip")),
+                "misfire_grace_s": _grace(body.get("misfire_grace_s", DEFAULT_GRACE_S)), "webhook": None}
     values = {"name": _name(body.get("name")), "workflow_id": _workflow_id(body.get("workflow_id")),
               "cron": _cron(body.get("cron")), "timezone": _timezone(body.get("timezone")),
               "run_class": _run_class(body.get("run_class", "formal")),
@@ -486,10 +551,29 @@ def template_problem(template: dict[str, str], graph: Any, workflow_name: str) -
     return None
 
 
+async def _check_target(session: AsyncSession, kind: str, target_id: str) -> str:
+    """非工作流目标：交给它的模块核对（存在、可用），交回目标现在的名字。不对抛 422（field=target_id）。"""
+    if problem := await service.check_target(session, kind, target_id):
+        raise _invalid(problem, "target_id")
+    return await service.target_name(session, kind, target_id) or ""
+
+
 async def create_schedule_row(session: AsyncSession, body: dict[str, Any], *, actor: str | None) -> Schedule:
     """校验并建一个定时任务（提交）。建任务的接口和发布单（停用着建，应用发布后再启用）共用。"""
     values = schedule_values(body)
     hook = values.pop("webhook")
+    if values.get("target_kind", "workflow") != "workflow":
+        kind, target_id = values.pop("target_kind"), values.pop("target_id")
+        name = await _check_target(session, kind, target_id)
+        # 目标的几列只经 scheduler/service 的一处封装写（非工作流目标：workflow_id 存空串）；workflow_name 记保存时的目标名
+        values |= service.target_columns(kind, target_id)
+        row = Schedule(**values, workflow_name=name,
+                       next_run_at=service.next_run(values["cron"], values["timezone"], values["enabled"]),
+                       created_by=actor, **_webhook_columns(None))
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return row
     workflow = await _check_workflow(session, values["workflow_id"], values["run_class"], values["input_template"])
     # 目标的几列只经 scheduler/service 的一处封装写（工作流目标：target_id 同 workflow_id）
     values |= service.target_columns("workflow", values["workflow_id"])
@@ -527,6 +611,11 @@ async def update_schedule(schedule_id: str, request: Request,
         raise HTTPException(409, f"这个定时任务已被修改（当前是第 {row.version} 版，提交的是第 {version} 版），"
                                  "请刷新后再保存")
     values: dict[str, Any] = {}
+    kind, current_target = service.target_of(row)
+    if "target_kind" in body and _target_kind(body["target_kind"]) != kind:
+        raise _invalid("定时任务的目标种类建好之后不能改：请新建一个定时任务", "target_kind")
+    if kind != "workflow":
+        return await _update_target_schedule(session, row, body, kind, current_target, version)
     if "name" in body:
         values["name"] = _name(body["name"])
     if "workflow_id" in body:
@@ -574,6 +663,40 @@ async def update_schedule(schedule_id: str, request: Request,
     await session.commit()
     session.expire_all()
     return await _schedule_out(session, await _get(session, schedule_id))
+
+
+async def _update_target_schedule(session: AsyncSession, row: Schedule, body: dict[str, Any], kind: str,
+                                  current_target: str, version: int) -> dict[str, Any]:
+    """改一个非工作流目标的定时任务：名称、目标（同一种）、cron、时区、启用、重叠、补发宽限。工作流、输入模板、运行类别、
+    Webhook 不适用（带了照实拒；整份表单带回来的空值不算）。目标真改了才重新核对。"""
+    probe = {k: body[k] for k in ("workflow_id", "input_template", "webhook", "run_class") if k in body}
+    if probe.get("webhook") is None:
+        probe.pop("webhook", None)
+    _target_extras(probe, kind)
+    values: dict[str, Any] = {}
+    if "name" in body:
+        values["name"] = _name(body["name"])
+    if "target_id" in body:
+        target_id = _target_id(body["target_id"], kind)
+        if target_id != current_target:
+            values["workflow_name"] = await _check_target(session, kind, target_id)
+            values |= service.target_columns(kind, target_id)
+    for key, check in (("cron", _cron), ("timezone", _timezone), ("enabled", _enabled), ("overlap", _overlap),
+                       ("misfire_grace_s", _grace)):
+        if key in body:
+            values[key] = check(body[key])
+    if any(k in values and values[k] != getattr(row, k) for k in ("cron", "timezone", "enabled")):
+        values["next_run_at"] = _next_after_edit(row, values.get("cron", row.cron), values.get("timezone", row.timezone),
+                                                 values.get("enabled", row.enabled))
+    result = await session.execute(
+        update(Schedule).where(Schedule.id == row.id, Schedule.version == version)
+        .values(**values, version=version + 1).execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(409, "这个定时任务刚被别人修改过，请刷新后再保存")
+    await session.commit()
+    session.expire_all()
+    return await _schedule_out(session, await _get(session, row.id))
 
 
 async def retime(session: AsyncSession, row: Schedule, body: dict[str, Any]) -> Schedule:
@@ -644,7 +767,8 @@ async def delete_schedule(schedule_id: str, session: AsyncSession = Depends(get_
 async def run_now(schedule_id: str, session: AsyncSession = Depends(get_session),
                   x_actor: str | None = Header(default=None)) -> dict[str, Any]:
     """立即触发一次（kind=manual），停用的任务也可以。规则和到点触发相同：上一次运行没结束就跳过，正式运行只从当前
-    发布版本发起。运行记在点按钮的人名下，没有署名时记在「定时任务：<名字>」名下。返回 {fire, run_id}。
+    发布版本发起。运行记在点按钮的人名下，没有署名时记在「定时任务：<名字>」名下。返回 {fire, run_id}；目标是评测题集的，
+    发起的是一次评测，fire.eval_run_id 是它，run_id 为空。
 
     触发时间取到秒：连点两下落在同一秒的，交回同一条触发记录，不会发起两次。"""
     await _get(session, schedule_id)

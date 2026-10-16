@@ -21,9 +21,9 @@
 - 起草按表计费，大库很贵：只起草题集用得到的表（从期望 SQL、口径的取数 SQL 推，plan_tables），开始前先估算花费
   （estimate，照实写是按经验估的、不含思考）。
 
-进程内的后台任务（core/job_runtime 的 JobManager）：服务重启时没结束的标中断、不自动续跑。startup() 是给 main.py 启动
-整理调的那一步（接进 lifespan 和评测执行一起，第 3 波）；在那之前读接口按 reconcile_stale 当场整理：记着进行中、这个进程
-里却没在跑的，照实标中断。
+进程内的后台任务（core/job_runtime 的 JobManager）：服务重启时没结束的标中断、不自动续跑。startup() 在 main.py 的启动整理里
+调（和评测执行一起），关停时 manager.shutdown()；读接口另按 reconcile_stale 当场整理：记着进行中、这个进程里却没在跑的，
+照实标中断。
 """
 from __future__ import annotations
 

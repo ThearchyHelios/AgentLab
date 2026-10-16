@@ -71,9 +71,10 @@ EVENTS: dict[str, Event] = {
     "source.changed": Event("数据源有变化要处理", ()),
     # 口径升版后召回重算，数真变了（02 第 7 项）：答案的主人有 recall 待办；口径名、版本、链接，不放新旧值和差值
     "ledger.recall": Event("口径升版，答案的数变了", ()),
-    # 定时评测有题从通过变成不通过 / 评测没跑完（01 第 15 项）：题集名、通过数、退步题数、链接；不放期望值和答案里的数
-    "eval.regressed": Event("评测有退步", ()),
-    "eval.failed": Event("评测失败", ()),
+    # 定时评测有题从通过变成不通过 / 评测没跑完（01 第 15 项）：题集名、通过数、退步题数、链接；不放期望值和答案里的数。
+    # 只推全局渠道：评测是搭建者们共用的一把尺，不归哪个人（notify_eval）
+    "eval.regressed": Event("评测有退步", ("global",)),
+    "eval.failed": Event("评测失败", ("global",)),
     # 每天一条待办汇总（04 B3）：只推个人渠道；条数、最早的时限、最多 5 条（节点在图上的名字）、去待办箱的链接
     "task.digest": Event("每天的待办汇总", ()),
     # 访问密钥到期前 7 天、1 天各一次（04 B3）：个人密钥推本人，服务账号的推全局渠道；密钥名、到期日、链接
@@ -357,3 +358,36 @@ async def notify_action(action_id: str, event: str) -> int:
                "subject": {"action_id": action_id, "run_id": rec.run_id, "task_id": task_id}}
     return await _push(channels, message, subject_kind="action", subject_id=action_id, event=event,
                        run_id=rec.run_id, task_id=task_id)
+
+
+async def notify_eval(eval_run_id: str, event: str, *, passed: int, graded: int, regressed: int) -> int:
+    """定时评测的通知（eval.regressed 有一道题从通过变成不通过、eval.failed 没评完：失败、到了上限、止损）。只推订阅了它的
+    全局渠道。消息里只有题集名、状态、通过几题、退步几题、评测编号和链接（细案 01 做法 15、总方案 X6）：不放期望值、答案里的数、
+    题目原文。链接去发起它的那条定时任务的触发历史（评测页在第 4 波）。"""
+    from app.db.models_eval import EvalRun, EvalSuite
+
+    async with SessionLocal() as session:
+        run = await session.get(EvalRun, eval_run_id)
+        if run is None:
+            return 0
+        suite = await session.get(EvalSuite, run.suite_id)
+        channels = await _channels(session, event, None, [])
+        if not channels:
+            return 0
+        base = await _base_url(session)
+    name = (suite.name if suite is not None else "题集")[:80]
+    regressed_event = event == "eval.regressed"
+    status = {"succeeded": "评完了", "partial": "没评完", "failed": "失败", "cancelled": "已停止",
+              "interrupted": "中断"}.get(run.status, run.status)
+    lines = [("状态", status), ("通过", f"{passed} / {graded} 题")]
+    if regressed_event or regressed:
+        lines.append(("退步", f"{regressed} 题"))
+    if run.arm:
+        lines.append(("对照", run.arm[:40]))
+    lines.append(("评测", f"#{eval_run_id[:6]}"))
+    links = [("查看定时任务", f"{base}/schedules/{run.schedule_id}?tab=history")] if base and run.schedule_id else []
+    message = {"event": event, "status": run.status, "ok": False,
+               "title": f"评测「{name}」{'有退步' if regressed_event else '没有评完'}", "lines": lines, "links": links,
+               "subject": {"eval_run_id": eval_run_id, "suite_id": run.suite_id, "schedule_id": run.schedule_id}}
+    return await _push(channels, message, subject_kind="eval_run", subject_id=eval_run_id, event=event, run_id=None,
+                       task_id=None)

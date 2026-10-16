@@ -81,6 +81,8 @@ from app.engine.labels import DUAL_CHECK_FIELD_LABEL, DUAL_CHECK_ON_REJECT_LABEL
 from app.engine.masking import derived_columns
 from app.engine.schema import DUAL_CHECK_ON_REJECT, NodeType, dual_check_card
 from app.engine.state import GraphState
+# 原值和盲算值按相对误差比、相差比例：和评测（app/eval/score.py）同一个函数（engine/tolerance.py）
+from app.engine.tolerance import agree as _agree, delta_pct as _delta_pct
 
 #: 节点产出的状态：跳过、全部一致、核成了一部分（其余无法复算）、一个都没核成、人已裁决
 SKIPPED, AGREED, PARTIAL, NONE_CHECKED, RESOLVED = "skipped", "agreed", "partial", "unchecked", "resolved"
@@ -999,24 +1001,6 @@ def _limit_text(limit: str | None, options: _Options) -> str:
     if limit in LIMIT_CODES:
         return "已达核查的上限"
     return "轮数已用完"
-
-
-def _agree(original: Any, blind: Any, tolerance: float) -> bool:
-    """按相对误差比（原值为 0 时按绝对误差）。"""
-    if original == blind:
-        return True
-    if not (_number(original) and _number(blind)):
-        return False
-    if original == 0:
-        return abs(blind) <= tolerance
-    return abs(blind - original) <= tolerance * abs(original)
-
-
-def _delta_pct(original: Any, blind: Any) -> float | None:
-    """相差比例，口径同运行对比：(盲算值 − 原流程值) ÷ |原流程值| × 100，两位小数；原流程值为 0 时为 None。"""
-    if not (_number(original) and _number(blind)) or original == 0:
-        return None
-    return round((blind - original) / abs(original) * 100, 2)
 
 
 def _compare(row: dict[str, Any], metric: dict[str, Any], results: dict[str, Any], options: _Options,
