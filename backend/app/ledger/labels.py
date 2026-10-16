@@ -30,6 +30,8 @@ HOWS = ("independent", "composed")
 #: 界面上标签要写明的两句：比对在封存之后做，不在封存范围内；事后补比的是按现在的口径回看
 POST_SEAL_NOTE = "封存后比对，不在封存范围内"
 RETRO_NOTE = "按现在的口径回看"
+#: 固化出的口径发布之后对来源运行补比的（store 的 trigger=certified）
+CERTIFIED_NOTE = "按之后发布的口径回看"
 #: 发布级别的叫法（同 blueprints/publish_plan.LEVEL_TEXT、前端 lib/terms.ts）
 LEVEL_TEXT = {"published": "已发布", "governed": "受管"}
 MASKED = "已遮罩"
@@ -356,6 +358,6 @@ def related_view(item: Mapping[str, Any], *, hide: Callable[[Any], bool], shown:
     return out
 
 
-__all__ = ["HOWS", "KINDS", "LEVEL_TEXT", "POST_SEAL_NOTE", "RETRO_NOTE", "binding_view", "caliber_key",
+__all__ = ["CERTIFIED_NOTE", "HOWS", "KINDS", "LEVEL_TEXT", "POST_SEAL_NOTE", "RETRO_NOTE", "binding_view", "caliber_key",
            "card_expressions", "cell_label", "diff_view", "label_doc", "metric_label", "related_view", "view_label",
            "whole_of"]

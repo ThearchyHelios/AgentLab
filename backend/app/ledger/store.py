@@ -32,8 +32,8 @@ FORMAT = "agentlab.caliber_match/1"
 #: 2（第 3 波）：认出助手选用的口径（查询 composed、标签 how=composed），指标的标签记它取自哪几条查询（queries，认证队列
 #: 认「被报告引用的查询」用）
 ALGO = "2"
-#: 触发方式（见模块说明）
-TRIGGERS = ("sealed", "backfill", "on_demand")
+#: 触发方式（见模块说明）。certified（第 3 波）：从问数据固化出的口径发布之后，对来源运行补比的（ledger/certify）
+TRIGGERS = ("sealed", "backfill", "on_demand", "certified")
 
 
 @dataclass(frozen=True)

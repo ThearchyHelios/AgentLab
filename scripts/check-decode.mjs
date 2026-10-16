@@ -1850,6 +1850,9 @@ await section('口径账本：封存后比对已发布口径（ledger.matched）
   const late = run({ counts: { proven: 0, related: 0, none: 1, skipped: 1 }, trigger: 'backfill' }).find((s) => s.code === 'ledger_matched')
   check('事后补比的写明按现在的口径回看；没比完的是提醒', late?.title === '比对已发布口径：1 条没有相关的已发布口径，1 条没有比完'
     && late?.sub === '封存后比对，不在封存范围内 · 按现在的口径回看' && late?.level === 'warn', `${late?.title} / ${late?.sub} / ${late?.level}`)
+  const certified = run({ counts: { proven: 1 }, trigger: 'certified' }).find((s) => s.code === 'ledger_matched')
+  check('固化出的口径发布后补比的写明按之后发布的口径回看', certified?.sub === '封存后比对，不在封存范围内 · 按之后发布的口径回看',
+    certified?.sub)
   const odd = run({ counts: 'x' }).find((s) => s.code === 'ledger_matched')
   check('缺字段：只说比对过，不出 undefined、不瞎填数', odd?.title === '比对已发布口径' && !/undefined|NaN/.test(`${odd?.title}${odd?.sub}`),
     odd?.title)

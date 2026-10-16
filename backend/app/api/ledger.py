@@ -161,3 +161,30 @@ async def reconcile_answer(run_id: str, payload: ReconcileIn) -> dict[str, Any]:
     except ledger_reconcile.ReconcileRefused as e:
         raise CodedHTTPException(e.status_code, e.message, e.code) from e
     return {"run_id": run.id, "reconciled": ledger_reconcile.reconciled_view(run)}
+
+
+@router.get("/certify-queue")
+async def certify_queue(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """可沉淀的问题（认证队列，app/ledger/certify.py）：确定性重复的 SQL 形状、问题聚类、被反复用的答案。每项给代表问题、
+    轮次、（形状的）参数候选和相关口径；点过「不是口径」的不再列。固化走 POST /api/copilot/from-run（freeze: true）。"""
+    from app.api.deps import current_principal
+    from app.ledger import certify
+
+    return await certify.queue(session, principal=current_principal())
+
+
+class DismissIn(BaseModel):
+    item_id: str = Field(min_length=1, max_length=64)
+    kind: str | None = Field(default=None, max_length=20)
+    note: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/certify-queue/dismiss")
+async def certify_dismiss(payload: DismissIn, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """「不是口径」：记一条审计（ledger.certify.dismiss），这一项之后不再进队。"""
+    from app.ledger import certify
+
+    if payload.kind is not None and payload.kind not in certify.KINDS:
+        raise HTTPException(422, "可沉淀的问题只有三种：确定性重复、问题聚类、被反复用的答案")
+    await certify.dismiss(session, payload.item_id, kind=payload.kind, note=payload.note)
+    return {"ok": True, "item_id": payload.item_id}

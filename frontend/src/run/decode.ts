@@ -2411,7 +2411,8 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           id: `lm-${seq}`, seq, kind: 'note', status: 'done', code: 'ledger_matched',
           level: typeof counts.skipped === 'number' && counts.skipped > 0 ? 'warn' : 'info',
           title: LEDGER_TEXT.timeline(counts),
-          sub: [LEDGER_TEXT.sub, retro ? LEDGER_TEXT.retro : ''].filter(Boolean).join(' · '),
+          sub: [LEDGER_TEXT.sub, d.trigger === 'certified' ? LEDGER_TEXT.certified : retro ? LEDGER_TEXT.retro : '']
+            .filter(Boolean).join(' · '),
         })
         break
       }

@@ -4522,6 +4522,8 @@ export const LEDGER_TEXT = {
   /** 副标题：比对在封存之后；事后补比、打开时按需比的另写一句 */
   sub: '封存后比对，不在封存范围内',
   retro: '按现在的口径回看',
+  /** 从问数据固化出的口径发布之后，对来源运行补比的那一次（服务端 trigger=certified） */
+  certified: '按之后发布的口径回看',
   /** 标签的四种、认法的两种（第 4 波的证据面板、轮次摘要用同一套） */
   kind: { caliber: '来自口径', related: '相关口径', reasoning: '这次的推理', unknown: '没有比对' },
   how: { independent: '等价已证明', composed: '助手选用' },

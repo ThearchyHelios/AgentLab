@@ -98,7 +98,8 @@ def _stamp(recorded: store.Recorded) -> dict[str, Any]:
         if isinstance(recorded.ts, (int, float)) else None
     return {"artifact": recorded.artifact, "algo": recorded.algo, "trigger": recorded.trigger, "retro": recorded.retro,
             "matched_at": at, "post_seal": True, "note": ledger_labels.POST_SEAL_NOTE,
-            **({"retro_note": ledger_labels.RETRO_NOTE} if recorded.retro else {})}
+            **({"retro_note": ledger_labels.CERTIFIED_NOTE if recorded.trigger == "certified"
+                else ledger_labels.RETRO_NOTE} if recorded.retro else {})}
 
 
 async def run_view(run_id: str) -> dict[str, Any]:

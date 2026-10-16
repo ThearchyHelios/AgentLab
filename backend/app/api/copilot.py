@@ -2591,6 +2591,10 @@ class FromRunIn(BaseModel):
     #: 问数据回答上点「做成应用」时带上：这次运行出自哪段对话的哪一轮，记进新工作流的来源（workflows.origin）
     conversation_id: str | None = None
     turn_id: str | None = None
+    #: 固化成口径草稿（next-round 02 做法 8，app/ledger/certify.freeze）：报告引用的查询变成固定 SQL 的取数节点，跨轮变化
+    #: 的字面量成为参数（不保留 Agent）。peers 是同一组（同一个 SQL 形状）的别的运行，认哪些字面量位置变了
+    freeze: bool = False
+    peers: list[str] = Field(default_factory=list, max_length=50)
 
 
 @router.post("/from-run")
@@ -2612,6 +2616,15 @@ async def extract_template(
 
     # 对话只是记进来源：不能用的不让记（D-d），不存在的照旧记下 id
     await _ensure_conversation_access(session, payload.conversation_id)
+    if payload.freeze:
+        # 固化成口径草稿：取数是固定的 SQL（以后比对认得出等价），不是保留 Agent 的执行路径
+        from app.ledger.certify import CertifyRefused, freeze
+
+        try:
+            return await freeze(session, payload.run_id, peers=payload.peers, name=payload.name,
+                                conversation_id=payload.conversation_id, turn_id=payload.turn_id)
+        except CertifyRefused as e:
+            raise HTTPException(e.status_code, e.message) from e
     try:
         path = await extract_run_path(session, payload.run_id)
     except PathRefused as e:
