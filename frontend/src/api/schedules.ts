@@ -9,7 +9,7 @@
  */
 import type {
   Schedule, ScheduleCreate, ScheduleFirePage, SchedulePatch, SchedulePreview, SchedulePreviewRequest, ScheduleRunResult,
-  ScheduleVariable, ScheduleWebhookTest,
+  ScheduleTargetCreate, ScheduleVariable, ScheduleWebhookTest,
 } from '../types'
 import { del, get, patch, post, qs, request, type RequestOptions } from './http'
 
@@ -18,7 +18,7 @@ const at = (id: string) => `/schedules/${encodeURIComponent(id)}`
 export const schedules = {
   list: (opts?: RequestOptions) => get<{ items: Schedule[] }>('/schedules', opts),
   get: (id: string, opts?: RequestOptions) => get<Schedule>(at(id), opts),
-  create: (body: ScheduleCreate) => post<Schedule>('/schedules', body),
+  create: (body: ScheduleCreate | ScheduleTargetCreate) => post<Schedule>('/schedules', body),
   /** 只带改了的字段和读到的版本；Webhook 的地址省略表示不改、空串表示删除 */
   update: (id: string, body: SchedulePatch) => patch<Schedule>(at(id), body),
   remove: (id: string) => del(at(id)),

@@ -34,8 +34,15 @@ URL = "https://hooks.example.com/agentlab/notify-events-5d1c"
 THIS_ROUND = ("source.changed", "ledger.recall", "eval.regressed", "eval.failed", "task.digest", "key.expiring")
 #: 其中已经实现了推送、打开了订阅的（推给哪几条路）：定时评测的两个只推全局渠道（第 3 波 W3-c，notify_eval）；每天的待办汇总
 #: 只推个人渠道；访问密钥快到期，个人密钥推本人、服务账号的推全局渠道（第 3 波 W3-d，notify/digest.py）。其余还没有
-PUSHED_THIS_ROUND = {"eval.regressed": {"global"}, "eval.failed": {"global"},
-                     "task.digest": {"user"}, "key.expiring": {"global", "user"}}
+PUSHED_THIS_ROUND = {
+    "eval.regressed": {"global"},
+    "eval.failed": {"global"},
+    "task.digest": {"user"},
+    "key.expiring": {"global", "user"},
+    # 第 4 波：W4-d 打开 source.changed 时在这里加它推给的几条路
+    # （两行之间隔一行不动的，两个包各改各的、合并不撞）
+    # 第 4 波：W4-a 打开 ledger.recall 时在这里加它推给的几条路
+}
 
 
 @pytest.fixture

@@ -313,15 +313,19 @@ async def test_concurrent_requests_issue_once(monkeypatch):
 async def test_ledger_settings_have_defaults_and_refuse_bad_values(client):
     await reset_ledger()
     body = (await client.get("/api/settings")).json()
-    assert body["ledger"] == {"auto_issue": True, "issue_daily_limit": 20, "match_timeout_s": 8}
+    assert body["ledger"] == {"auto_issue": True, "issue_daily_limit": 20, "match_timeout_s": 8, "recall_limit": 50}
     bad = await client.put("/api/settings", json={"values": {"ledger": {"auto_issue": "yes"}}})
     assert bad.status_code == 422 and "自动按口径正式出具" in bad.json()["detail"]
     bad = await client.put("/api/settings", json={"values": {"ledger": {"match_timeout_s": 600}}})
     assert bad.status_code == 422 and "口径比对时限" in bad.json()["detail"]
+    bad = await client.put("/api/settings", json={"values": {"ledger": {"recall_limit": -1}}})
+    assert bad.status_code == 422 and "口径升版后每次最多重算几组" in bad.json()["detail"]
     ok = await client.put("/api/settings", json={"values": {"ledger": {"auto_issue": False, "issue_daily_limit": 5,
                                                                         "match_timeout_s": 3}}})
     assert ok.status_code == 200 and ok.json()["ledger"] == {"auto_issue": False, "issue_daily_limit": 5,
-                                                             "match_timeout_s": 3}
+                                                             "match_timeout_s": 3, "recall_limit": 50}
+    ok = await client.put("/api/settings", json={"values": {"ledger": {"recall_limit": 0}}})
+    assert ok.status_code == 200 and ok.json()["ledger"]["recall_limit"] == 0
 
 
 async def test_auto_issue_goes_by_the_askers_permissions_when_login_is_on(monkeypatch):

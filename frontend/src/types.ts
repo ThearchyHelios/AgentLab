@@ -3950,6 +3950,22 @@ export interface ScheduleCreate {
   webhook: ScheduleWebhookIn | null
 }
 
+/**
+ * POST /api/schedules 建非工作流目标（评测题集、数据源维护，总方案 X4）的请求体：写 target_kind、target_id，不写工作流、
+ * 输入模板和 Webhook（服务端回 422，field 是那一项）；运行类别不用。改的时候照样用 SchedulePatch（只带 name、cron、timezone、
+ * enabled、misfire_grace_s 这几项）
+ */
+export interface ScheduleTargetCreate {
+  name: string
+  target_kind: Exclude<ScheduleTargetKind, 'workflow'>
+  target_id: string
+  cron: string
+  timezone: string
+  enabled: boolean
+  overlap: 'skip'
+  misfire_grace_s: number
+}
+
 /** PATCH /api/schedules/{id} 的请求体：只带改了的字段，外加读到的版本 */
 export type SchedulePatch = Partial<Omit<ScheduleCreate, 'webhook'>> & {
   webhook?: ScheduleWebhookIn

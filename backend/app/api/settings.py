@@ -741,11 +741,15 @@ async def apps_settings(session: AsyncSession) -> dict[str, Any]:
 #: 设置里 ledger 这一组。auto_issue：问数据的答案整题等价于受管口径（Agent 独立写的 SQL 被证明等价、版本受管、图里没有人工
 #: 节点和写入）时自动按口径发起一次正式运行（拍板 L1；不满足的只给一键）。issue_daily_limit：每天最多按口径正式出具几次
 #: （自动的、一键的合计，0 表示不再出具）：正式运行含报告撰写的模型费用。match_timeout_s：一次运行的口径比对最多算几秒，
-#: 超时的照实记没比完（ledger/match.py）。召回的上限在第 4 波加。只有管理员能改（整个设置接口的改动都要管理员）
+#: 超时的照实记没比完（ledger/match.py）。recall_limit：口径发布新版本后，一次最多自动重算几组受影响的答案（02 做法 7、拍板 L6，
+#: 缺省 50；超出的照实写「另有 M 组未重算」，可以手动接着算；0 表示发布后不自动重算，只列出受影响的答案）。只有管理员能改
+#: （整个设置接口的改动都要管理员）
 LEDGER_GROUP = "ledger"
-LEDGER_DEFAULTS: dict[str, Any] = {"auto_issue": True, "issue_daily_limit": 20, "match_timeout_s": 8}
+LEDGER_DEFAULTS: dict[str, Any] = {"auto_issue": True, "issue_daily_limit": 20, "match_timeout_s": 8, "recall_limit": 50}
 LEDGER_SETTING_LABEL = {"auto_issue": "自动按口径正式出具", "issue_daily_limit": "按口径正式出具每日上限",
-                        "match_timeout_s": "口径比对时限（秒）"}
+                        "match_timeout_s": "口径比对时限（秒）", "recall_limit": "口径升版后每次最多重算几组"}
+#: 一次发布最多自动重算几组：召回只跑口径的数据部分、不调模型，但每组都查业务库
+LEDGER_RECALL_MAX = 1000
 #: 时限的范围：太短比不完一份口径，太长占着比对的线程
 LEDGER_TIMEOUT_RANGE = (1, 60)
 
@@ -753,6 +757,10 @@ LEDGER_TIMEOUT_RANGE = (1, 60)
 def _timeout_ok(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) \
         and LEDGER_TIMEOUT_RANGE[0] <= value <= LEDGER_TIMEOUT_RANGE[1]
+
+
+def _recall_limit_ok(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= LEDGER_RECALL_MAX
 
 
 def ledger_problem(value: Any) -> str | None:
@@ -768,6 +776,9 @@ def ledger_problem(value: Any) -> str | None:
         if key == "issue_daily_limit" and not _daily_limit_ok(item):
             return (f"「{LEDGER_SETTING_LABEL[key]}」需要是 0 到 {APPS_DAILY_LIMIT_MAX:,} 之间的整数（0 表示不再按口径出具），"
                     f"当前为「{item}」")
+        if key == "recall_limit" and not _recall_limit_ok(item):
+            return (f"「{LEDGER_SETTING_LABEL[key]}」需要是 0 到 {LEDGER_RECALL_MAX:,} 之间的整数（0 表示发布后不自动重算），"
+                    f"当前为「{item}」")
         if key == "match_timeout_s" and not _timeout_ok(item):
             return (f"「{LEDGER_SETTING_LABEL[key]}」需要是 {LEDGER_TIMEOUT_RANGE[0]} 到 {LEDGER_TIMEOUT_RANGE[1]} 之间的数，"
                     f"当前为「{item}」")
@@ -778,9 +789,11 @@ def ledger_values(stored: Any) -> dict[str, Any]:
     """库里存的（或刚写进来的）ledger 一组 → 补齐默认；存坏了的项按默认（自动出具的开关存坏了按关，宁可少出具）。"""
     stored = stored if isinstance(stored, dict) else {}
     auto, limit, timeout = stored.get("auto_issue"), stored.get("issue_daily_limit"), stored.get("match_timeout_s")
+    recall = stored.get("recall_limit")
     return {"auto_issue": auto if isinstance(auto, bool) else (LEDGER_DEFAULTS["auto_issue"] if auto is None else False),
             "issue_daily_limit": limit if _daily_limit_ok(limit) else LEDGER_DEFAULTS["issue_daily_limit"],
-            "match_timeout_s": timeout if _timeout_ok(timeout) else LEDGER_DEFAULTS["match_timeout_s"]}
+            "match_timeout_s": timeout if _timeout_ok(timeout) else LEDGER_DEFAULTS["match_timeout_s"],
+            "recall_limit": recall if _recall_limit_ok(recall) else LEDGER_DEFAULTS["recall_limit"]}
 
 
 async def ledger_settings(session: AsyncSession) -> dict[str, Any]:
