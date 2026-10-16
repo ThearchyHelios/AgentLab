@@ -39,7 +39,8 @@ PUSHED_THIS_ROUND = {
     "eval.failed": {"global"},
     "task.digest": {"user"},
     "key.expiring": {"global", "user"},
-    # 第 4 波：W4-d 打开 source.changed 时在这里加它推给的几条路
+    # 第 4 波 W4-d：数据源有变化要处理，按源汇总、只推全局渠道（notify_source_changed）；链接落到「变化」标签页
+    "source.changed": {"global"},
     # （两行之间隔一行不动的，两个包各改各的、合并不撞）
     # 第 4 波：W4-a 打开 ledger.recall 时在这里加它推给的几条路
 }

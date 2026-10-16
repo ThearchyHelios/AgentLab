@@ -68,7 +68,7 @@ EVENTS: dict[str, Event] = {
     "review.done": Event("我提交审核的应用有结果", ("global", "user")),
     # ---- 本轮登记的（总方案 X6）：scopes 为空的还没有推送；实现推送的那一块只改自己这一行的 scopes，消息照模块说明的规矩 ----
     # 数据源有要处理的结构 / 取值变化（03 B3）：只推 severity 为 action 的，按源汇总；源名、各级别条数、链接
-    "source.changed": Event("数据源有变化要处理", ()),
+    "source.changed": Event("数据源有变化要处理", ("global",)),
     # 口径升版后召回重算，数真变了（02 第 7 项）：答案的主人有 recall 待办；口径名、版本、链接，不放新旧值和差值
     "ledger.recall": Event("口径升版，答案的数变了", ()),
     # 定时评测有题从通过变成不通过 / 评测没跑完（01 第 15 项）：题集名、通过数、退步题数、链接；不放期望值和答案里的数。
@@ -434,7 +434,7 @@ async def notify_source_changed(source_id: str) -> int:
     """数据源有要处理的变化（source.changed，03 B3 ④、目录-D9）：只推还要人看（开着、知道了还没处理）的「要处理」级变化，
     按源汇总；消息里只有源名、各级别条数和链接，不放表名、列名、取值。探查、剖析任务结束时有新的「要处理」变化才调。
 
-    这一行的 scopes 第 4 波有了「变化」标签页才打开：现在 _channels 推不出去，这里返回 0（照实：没有界面看不了的通知不发）。"""
+    只推全局渠道（按源汇总，不归哪个人）；链接落到数据目录页的「变化」标签页（第 4 波 W4-d 有了这个标签页才打开订阅）。"""
     from app.data import source_changes
     from app.db.models import DataSource
 
@@ -454,7 +454,7 @@ async def notify_source_changed(source_id: str) -> int:
     lines = [("数据源", f"「{row.name}」"), ("要处理", f"{by['action']} 条"), ("提醒", f"{by.get('warning', 0)} 条"),
              ("说明", f"{by.get('info', 0)} 条")]
     message = {"event": event, "status": "action", "title": f"数据源「{row.name[:80]}」有 {by['action']} 个变化要处理",
-               "lines": lines, "links": [("去看看", f"{base}/data/catalog/{source_id}")] if base else [],
+               "lines": lines, "links": [("去看看", f"{base}/data/catalog/{source_id}?view=changes")] if base else [],
                "subject": {"source_id": source_id}}
     return await _push(channels, message, subject_kind="source", subject_id=source_id, event=event, run_id=None,
                        task_id=None)

@@ -8,7 +8,7 @@ source_changes.record 记一条。守的是：
   apply_patch（含义待填写、依据写变化编号）、记目录版本；知道了只改状态；剖析没开时「重新剖析」照实 422；
 - 同一个变化再次测到只更新 last_seen_at、seen_count；
 - list_changes 按 seq 游标拉、affecting 按表反查、triggers_recall 只认结构类和触及规则的新码值；
-- source.changed 的推送：订阅还没打开时推不出去；打开后（测试里临时打开）消息里只有源名、条数和链接。
+- source.changed 的推送：没有渠道订阅时推不出去；全局渠道订阅了，消息里只有源名、条数和链接（第 4 波打开了订阅）。
 """
 from __future__ import annotations
 
@@ -194,7 +194,7 @@ async def test_cursor_pull_affecting_and_recall_triggers(shop):
 
 async def test_source_changed_message_has_only_name_counts_and_link(shop, monkeypatch):
     sid, name = shop["id"], shop["name"]
-    assert await service.notify_source_changed(sid) == 0, "订阅还没打开（第 4 波）：推不出去"
+    assert await service.notify_source_changed(sid) == 0, "没有渠道订阅它：推不出去"
     got: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -203,7 +203,6 @@ async def test_source_changed_message_has_only_name_counts_and_link(shop, monkey
 
     monkeypatch.setattr(core, "_transport", httpx.MockTransport(handler))
     monkeypatch.setattr(core, "RETRY_DELAYS", (0, 0, 0))
-    monkeypatch.setitem(service.EVENTS, "source.changed", service.Event("数据源有变化要处理", ("global",)))
     async with SessionLocal() as session:
         from app.core.crypto import encrypt
         from app.db.models import NotifyChannel
