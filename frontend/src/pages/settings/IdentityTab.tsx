@@ -6,7 +6,7 @@ import {
   useRadioGroup,
 } from '../../components/ui'
 import { formatDateTime } from '../../lib/format'
-import { AUTH_MODE_LABEL, IDENTITY_TEXT as T, ROLE_LABEL } from '../../lib/terms'
+import { ACCESS_KEY_TEXT, AUTH_MODE_LABEL, IDENTITY_TEXT as T, ROLE_LABEL } from '../../lib/terms'
 import { useAtLeast, useAuth } from '../../store/auth'
 import type { AuthMode, GroupRow, Role, UserRow } from '../../typesApp'
 
@@ -192,22 +192,29 @@ function UsersSection({ mode }: { mode: AuthMode }) {
                   <span className="mono font-medium">{u.username}</span>
                   {u.display_name && u.display_name !== u.username && <span className="text-dim">{u.display_name}</span>}
                   {u.source === 'oidc' && <span className="chip">{T.sourceOidc}</span>}
+                  {u.kind === 'service' && <span className="chip" data-user-service="">{ACCESS_KEY_TEXT.serviceTag}</span>}
                   {u.disabled && <span className="chip text-faint">{T.disabled}</span>}
                 </div>
                 <div className="text-2xs text-faint">
-                  {u.email ? `${u.email} · ` : ''}{u.last_login_at ? T.lastLogin(formatDateTime(u.last_login_at)) : T.neverLogin}
+                  {u.kind === 'service' ? T.serviceManaged
+                    : <>{u.email ? `${u.email} · ` : ''}{u.last_login_at ? T.lastLogin(formatDateTime(u.last_login_at)) : T.neverLogin}</>}
                 </div>
               </div>
-              <select className="field h-7 w-28 py-0 text-xs" value={u.role} aria-label={`${T.role}：${u.username}`}
-                      onChange={(e) => void update(u, { role: e.target.value as Role })}>
-                {ROLES.map((r) => <option key={r} value={r}>{ROLE_LABEL[r]}</option>)}
-              </select>
-              {u.source === 'local' && (
-                <button className="btn btn-xs btn-ghost" onClick={() => void resetPassword(u)}>{T.passwordReset}</button>
+              {/* 服务账号的角色固定是使用者、没有密码，停用和启用在「访问密钥」里做（服务端同样拒改） */}
+              {u.kind !== 'service' && (
+                <>
+                  <select className="field h-7 w-28 py-0 text-xs" value={u.role} aria-label={`${T.role}：${u.username}`}
+                          onChange={(e) => void update(u, { role: e.target.value as Role })}>
+                    {ROLES.map((r) => <option key={r} value={r}>{ROLE_LABEL[r]}</option>)}
+                  </select>
+                  {u.source === 'local' && (
+                    <button className="btn btn-xs btn-ghost" onClick={() => void resetPassword(u)}>{T.passwordReset}</button>
+                  )}
+                  <button className="btn btn-xs btn-ghost" onClick={() => void update(u, { disabled: !u.disabled })}>
+                    {u.disabled ? T.enable : T.disable}
+                  </button>
+                </>
               )}
-              <button className="btn btn-xs btn-ghost" onClick={() => void update(u, { disabled: !u.disabled })}>
-                {u.disabled ? T.enable : T.disable}
-              </button>
             </div>
           ))}
         </div>

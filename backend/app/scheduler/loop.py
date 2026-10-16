@@ -122,13 +122,15 @@ async def tick(now: datetime | None = None) -> None:
 
 async def process_due(now: datetime | None = None) -> None:
     """流程的一拍（app/process）：待办的提醒、升级、超时驳回（永不自动批准）；结果未知的写入按退避去查；
-    上传了却一直没提交的文件过了时限清掉（app/files，每小时一次）。
+    上传了却一直没提交的文件过了时限清掉（app/files，每小时一次）；访问密钥的请求记录批量写库、过了保留期的清掉
+    （auth/keys.py，每小时清一次：每个请求同步写一行会和运行抢 SQLite 的写锁，所以攒到这一拍写）。
     各自出错只记日志：这一拍出错不该让调度循环停下，下一拍照常再查。"""
+    from app.auth import keys
     from app.files import store as files_store
     from app.process import actions, tasks
 
     for name, step in (("待办的时限处理", tasks.tick), ("写入结果的查询", actions.tick),
-                       ("没有提交的上传文件清理", files_store.cleanup_tick)):
+                       ("没有提交的上传文件清理", files_store.cleanup_tick), ("访问密钥的请求记录", keys.tick)):
         try:
             done = await step(now)
             if isinstance(done, list) and done:
@@ -194,6 +196,13 @@ class _Runner:
             # 兜底：万一还是落下了一份（以后改循环时漏掉上面的条件），不让它在关停期间接着推
             await _settle(self.notify, 0)
         self.task = self.notify = None
+        # 关停前把还攒在进程里的访问密钥请求记录写进库（没起调度循环时也写：请求记录不该因为关停丢掉最后一拍）
+        from app.auth import keys
+
+        try:
+            await keys.flush()
+        except Exception:  # noqa: BLE001 - 写不进去只记日志，不拦关停
+            logger.exception("关停前写访问密钥的请求记录失败")
         if tick is not None or notify is not None:
             logger.info("定时任务调度已停止")
 

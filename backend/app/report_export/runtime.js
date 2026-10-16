@@ -70,6 +70,12 @@
     hashBad: '工件哈希核对失败', hashNone: '未能读取工件',
     note: '说明',
     close: '关闭', openAria: (text) => `查看出处：${text}`,
+    // 口径（口径账本，封存后比对）：来自口径 / 相关口径 / 这次的推理 / 没比对
+    ledger: '口径', ledgerFrom: (name, version, level) => `来自口径「${name}」v${version}${level ? `（${level}）` : ''}`,
+    ledgerHow: { independent: '等价已证明', composed: '助手选用' },
+    ledgerRelated: '相关口径', ledgerReasoning: '这次的推理：没有相关的已发布口径', ledgerUnknown: '没有比对',
+    dBinding: '参数', dDiffers: '差在哪', dHow: '怎么认的', dColumnOf: '对应口径的列',
+    unnamed: '已删除的工作流',
   }
 
   const MASKED = '已遮罩'
@@ -396,6 +402,39 @@
     entity: entityPart, quote: quotePart,
   }
 
+  /** 口径一步（口径账本给的标签，服务端已按遮罩给）：来自口径的写明哪一版、级别、怎么认的、参数；相关口径写差在哪；
+   *  这次的推理、没比对照实说。比对在封存之后，底下写明不在封存范围内（note），事后补比的另写按现在的口径回看 */
+  function ledgerPart(label, ledger) {
+    const body = []
+    const nameOf = (x) => x.workflow_name || T.unnamed
+    const bindingText = (items) => (Array.isArray(items) && items.length
+      ? items.map((b) => `${b.field} = ${b.masked ? MASKED : valueText(b.value)}`).join('；') : NONE)
+    if (label.kind === 'caliber') {
+      body.push(h('p', {}, T.ledgerFrom(nameOf(label), label.version, label.level_text || '')))
+      body.push(kv([
+        [T.dHow, T.ledgerHow[label.how] || String(label.how || NONE)],
+        [T.dBinding, bindingText(label.binding)],
+        label.column ? [T.dColumnOf, String(label.column)] : null,
+      ]))
+    } else if (label.kind === 'related') {
+      body.push(h('p', {}, T.ledgerRelated))
+      for (const item of Array.isArray(label.related) ? label.related : []) {
+        const lines = (((item.diff || {}).items) || []).map((d) => h('li', {}, String(d.text || '')))
+        body.push(h('p', { class: 'sub' }, T.ledgerFrom(nameOf(item), item.version, item.level_text || '')))
+        if (item.reason) body.push(h('p', { class: 'muted' }, String(item.reason)))
+        if (lines.length) body.push(h('p', { class: 'sub' }, T.dDiffers), h('ul', {}, lines))
+      }
+      if (label.reason) body.push(h('p', { class: 'muted' }, String(label.reason)))
+    } else if (label.kind === 'reasoning') {
+      body.push(h('p', {}, T.ledgerReasoning))
+    } else {
+      body.push(h('p', {}, T.ledgerUnknown + (label.reason ? `：${label.reason}` : '')))
+    }
+    const notes = [ledger.note, ledger.retro ? ledger.retro_note : null].filter(Boolean).join(' · ')
+    if (notes) body.push(h('p', { class: 'muted' }, notes))
+    return h('section', { class: 'part', 'data-step': 'ledger' }, h('h3', {}, T.ledger), h('div', { class: 'part-body' }, ...body))
+  }
+
   // ------------------------------------------------------------------ 面板
 
   function detailOf(seg, chain, note) {
@@ -407,6 +446,9 @@
         [T.dNode, nodeLabel((view.data.meta.report || {}).node_id)],
       ])))
     const parts = [head]
+    const ledger = isObj(view.data.ledger) ? view.data.ledger : null
+    const label = ledger ? own(ledger.labels, seg.dataset.seg) : undefined
+    if (isObj(label)) parts.push(ledgerPart(label, ledger))
     if (chain && chain.length) {
       for (const step of chain) {
         const render = PARTS[step.step]

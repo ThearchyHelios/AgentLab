@@ -28,6 +28,15 @@ CATALOG_PROFILE_FINISHED = "catalog_profile_finished"
 CATALOG_DRAFT_BUSY = "catalog_draft_busy"
 CATALOG_DRAFT_MODEL_UNAVAILABLE = "catalog_draft_model_unavailable"
 CATALOG_DRAFT_FINISHED = "catalog_draft_finished"
+#: 后台探查（api/datasources.py 的 /introspect，next-round 03 A1）：同一个源已有排队或进行中的探查任务（409，界面改去
+#: GET /introspect-jobs/active 显示那一个）；探查范围的规则命中超过上限（409，另带 hits、cap、pinned，不建任务、不截断）；
+#: 要停止的探查任务已经结束了（409）；对象清单都拿不到（400，连不上、schema 不对：失败照实记进了表结构缓存）
+INTROSPECT_BUSY = "introspect_busy"
+SCOPE_TOO_LARGE = "scope_too_large"
+INTROSPECT_FINISHED = "introspect_finished"
+INTROSPECT_FAILED = "introspect_failed"
+#: 探查范围的规则不合规（422）
+SCOPE_INVALID = "scope_invalid"
 
 # ---------------------------------------------------------------- 集成接口（04 细案 A7）
 # 外部系统用访问密钥调的应用、待办、工件接口，以及角色、运行读权限的拒绝：按 code 认是哪种错，detail 照旧是给人看的那句
@@ -80,17 +89,20 @@ PUBLIC_URL_ENV_LOCKED = "public_url_env_locked"
 
 
 class CodedHTTPException(HTTPException):
-    """field：出错的是哪一项（表单据此把报错落到那一格）。可选，没有就不出现在返回里。"""
+    """field：出错的是哪一项（表单据此把报错落到那一格）。可选，没有就不出现在返回里。extra：给程序读的几个数（探查范围
+    超上限时的命中数、上限），并进返回体；不能盖掉 detail、code、field。"""
 
-    def __init__(self, status_code: int, detail: str, code: str, *, field: str | None = None) -> None:
+    def __init__(self, status_code: int, detail: str, code: str, *, field: str | None = None,
+                 extra: dict[str, object] | None = None) -> None:
         super().__init__(status_code, detail)
         self.code = code
         self.field = field
+        self.extra = {k: v for k, v in (extra or {}).items() if k not in ("detail", "code", "field")}
 
 
 async def coded_handler(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, CodedHTTPException)
-    content: dict[str, str] = {"detail": exc.detail, "code": exc.code}
+    content: dict[str, object] = {**getattr(exc, "extra", {}), "detail": exc.detail, "code": exc.code}
     if exc.field:
         content["field"] = exc.field
     return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)

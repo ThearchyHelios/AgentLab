@@ -174,6 +174,18 @@ const until = async (fn, ms = 8000, step = 200) => {
   return v
 }
 const delayed = (ms, data, status = 200) => async (route) => { await new Promise((r) => setTimeout(r, ms)); return json(data, status)(route) }
+/**
+ * 后台探查（next-round 03 A1）的假任务：POST /introspect 回 202 和排队中的任务，GET 任务回做完了的样子。界面开始探查后
+ * 每秒取一次进度，结束了换上任务里带回来的数据源
+ */
+const introspectJob = (sourceId, total = 3, extra = {}) => ({
+  id: `job-${sourceId}`, source_id: sourceId, status: 'queued', trigger: 'manual', schema: '', created_by: null,
+  created_at: ago(0), started_at: null, finished_at: null, total, done: 0,
+  counts: { pending: total, running: 0, ok: 0, failed: 0, cancelled: 0 }, current: null, failures: [], error: null,
+  scope: {}, waiting_for: null, ...extra,
+})
+const introspectDone = (job) => ({ ...job, status: 'succeeded', done: job.total, finished_at: ago(0),
+  counts: { ...job.counts, pending: 0, running: 0, ok: job.total } })
 const shot = async (page, name) => { if (SHOTS) await page.screenshot({ path: `${SHOTS}/${name}.png` }) }
 const text = (page) => page.locator('main').innerText()
 const dialog = (page) => page.locator('[role="dialog"]').last()
@@ -1165,11 +1177,15 @@ await section('数据 · 数据库', async () => {
         const hit = cur.options.schema === 'mes'
         cur = { ...cur, cached_schema: cur.options.schema ?? '', table_count: hit ? 3 : 0, schema_error: hit ? '' : empty.schema_error,
                 schema_synced_at: hit ? ago(0) : cur.schema_synced_at }
-        return json(cur)(route)
+        return json({ job: introspectJob(cur.id), source: cur }, 202)(route)
       }],
       [/^POST \/datasources\/check-manage-drift\/introspect$/, (route) => {
         drift = { ...drift, cached_schema: drift.options.schema, schema_synced_at: ago(0) }
-        return json(drift)(route)
+        return json({ job: introspectJob(drift.id), source: drift }, 202)(route)
+      }],
+      [/^GET \/datasources\/check-manage-(empty|drift)\/introspect-jobs\/[^/]+$/, (route, { key }) => {
+        const row = key.includes('check-manage-empty') ? cur : drift
+        return json({ job: introspectDone(introspectJob(row.id)), source: row })(route)
       }],
       // 后端的规矩：连接配置（地址、账号、库）改了，上次测连接的结果作废
       [/^PATCH \/datasources\/check-manage-empty$/, (route, { body }) => {
@@ -1184,7 +1200,12 @@ await section('数据 · 数据库', async () => {
       [/^POST \/datasources\/[^/]+\/introspect/, (route, { url }) => {
         const id = url.pathname.split('/')[3]
         const row = sources.find((s) => s.id === id)
-        return json({ ...row, schema_synced_at: new Date().toISOString() })(route)
+        return json({ job: introspectJob(id, row?.table_count ?? 1), source: { ...row, schema_synced_at: new Date().toISOString() } }, 202)(route)
+      }],
+      [/^GET \/datasources\/[^/]+\/introspect-jobs\/[^/]+$/, (route, { url }) => {
+        const id = url.pathname.split('/')[3]
+        const row = sources.find((s) => s.id === id)
+        return json({ job: introspectDone(introspectJob(id, row?.table_count ?? 1)), source: { ...row, schema_synced_at: new Date().toISOString() } })(route)
       }],
     ],
   })
@@ -1426,6 +1447,133 @@ await section('数据 · 数据库', async () => {
   }
   // 术语表：右栏那位叫「助手」，「Copilot」只能出现在按钮提示里
   check('正文里不写「Copilot」，统一叫「助手」', !(await text(page)).includes('Copilot'))
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('数据 · 后台探查与探查范围', async () => {
+  // 探查是后台任务（next-round 03 A1）：卡片上看得到进度、能停止、停了写明结果；几千张表的库按「探查范围」读取，规则命中
+  // 超过上限时服务端拒绝并说出命中数，界面给「调整探查范围」；范围面板边改边数命中（服务端算，不连库），说明一律在范围内的表。
+  // 全部是假的：一个 3,000 张表的假库，任务怎么往前走由检查推
+  const base = {
+    id: 'check-manage-big', name: 'zz_bigdb', kind: 'mysql', host: '10.0.0.8', port: 3306, database: 'erp', username: 'reader',
+    options: {}, readonly: true, description: '检查脚本的大库', enabled: true, password_masked: '', has_password: false,
+    table_count: 400, schema_synced_at: ago(86400_000), cached_schema: '', schema_error: '', available_schemas: [],
+    tools: ['db_query__zz_bigdb'], last_checked_at: null, last_check_ok: null, last_latency_ms: null, last_error: null,
+    origin: 'manual', current_snapshot: null, introspect_job: null,
+    schema_scope: { in_scope: 400, reflected: 400, failed: 0, out_of_scope: 2600, cap: 500, index_total: 3000, pinned: 3, explicit: 0,
+      rule: 397, on_demand: 0, index_method: 'dictionary', index_capped: false },
+  }
+  let big = base
+  let rules = { mode: 'all', include: [], exclude: [], tables: [], removed: [], views: true, max_tables: 500 }
+  let indexed = false
+  let job = null
+  const hitsOf = (r) => (r.mode === 'rules' && r.include.includes('ord_*') ? 400 : 3000)
+  const previewOf = (r) => {
+    const hits = hitsOf(r)
+    return { in_scope: hits, hits, cap: r.max_tables, out_of_scope: 3000 - hits, index_total: 3000, pinned: 3, explicit: 0,
+      rule: hits - 3, on_demand: 0, over: hits > r.max_tables }
+  }
+  const scopeOut = (r = rules) => ({
+    scope: rules, defaults: { max_tables: 500, max_limit: 2000, index_limit: 50000, rules_max: 100 },
+    preview: indexed ? previewOf(r) : null,
+    index: { ready: indexed, schema: '', method: indexed ? 'dictionary' : null, capped: false, at: indexed ? ago(0) : null, total: indexed ? 3000 : null },
+    pinned_sample: ['ord_dim_store', 'fin_ledger', 'mbr_card'], on_demand: [],
+  })
+  const { page, sent, natives, errors, close } = await open('/data/databases', {
+    handlers: [
+      [/^GET \/datasources$/, (route) => json([...sources, big])(route)],
+      [/^GET \/datasources\/check-manage-big\/introspect-scope$/, (route) => json(scopeOut())(route)],
+      [/^POST \/datasources\/check-manage-big\/introspect-scope\/preview$/, (route, { body }) => json(scopeOut(body.scope))(route)],
+      [/^PUT \/datasources\/check-manage-big\/introspect-scope$/, (route, { body }) => { rules = body.scope; return json(scopeOut())(route) }],
+      [/^POST \/datasources\/check-manage-big\/introspect$/, (route, { url }) => {
+        if (url.searchParams.get('dry_run') === 'true') {
+          indexed = true
+          return json({ dry_run: true, schema: '', table_count: 3000, tables: [], truncated: true, total: 3000, schema_error: '',
+            available_schemas: [], stored: true, scope: previewOf(rules), index_method: 'dictionary', index_capped: false })(route)
+        }
+        const hits = hitsOf(rules)
+        if (hits > rules.max_tables) {
+          return json({ detail: `按探查范围的规则命中 ${hits.toLocaleString('en-US')} 张表（其中有数据目录或被已发布模板用到、一律在范围内的 3 张），超过上限 500 张，没有开始探查。请在「探查范围」里收窄规则（加包含、排除的通配），或者把上限调高（最多 2,000 张）`,
+            code: 'scope_too_large', hits, cap: rules.max_tables, pinned: 3 }, 409)(route)
+        }
+        job = introspectJob(big.id, hits, { status: 'running', started_at: ago(0), counts: { pending: hits, running: 0, ok: 0, failed: 0, cancelled: 0 } })
+        return json({ job, source: big }, 202)(route)
+      }],
+      [/^GET \/datasources\/check-manage-big\/introspect-jobs\/[^/]+$/, (route) => {
+        if (job && job.status === 'running') {
+          const done = Math.min(job.done + 50, job.total - 25)
+          job = { ...job, done, current: `ord_line_${done}`, counts: { ...job.counts, ok: done, pending: job.total - done } }
+        }
+        return json({ job, source: big })(route)
+      }],
+      [/^POST \/datasources\/check-manage-big\/introspect-jobs\/[^/]+\/cancel$/, (route) => {
+        job = { ...job, status: 'cancelled', finished_at: ago(0), done: job.total,
+          counts: { ...job.counts, pending: 0, cancelled: job.total - job.counts.ok } }
+        big = { ...big, introspect_job: { id: job.id, status: 'cancelled', total: job.total, done: job.total, failed: 0,
+          cancelled: job.counts.cancelled, waiting_for: null, finished_at: ago(0), error: null } }
+        return json({ job, source: big })(route)
+      }],
+    ],
+  })
+  const card = page.locator(`[data-source="${base.name}"]`)
+  await card.waitFor()
+  check('卡片上写探查范围：范围内几张 / 对象一共几张', (await card.locator('[data-introspect-scope]').getAttribute('data-introspect-scope')) === '400/3000'
+    && (await card.locator('[data-introspect-scope]').innerText()).includes('探查范围 400 / 3,000'))
+
+  // 缺省范围（全部对象，上限 500）碰到 3,000 张：拒绝并说出命中数，给「调整探查范围」
+  await card.locator('[data-introspect-start]').click()
+  const toastBox = page.locator('[role="status"], [role="alert"]').filter({ hasText: '命中 3,000 张' }).first()
+  check('规则命中超过上限：照实说命中了多少张、上限多少', await toastBox.waitFor({ timeout: 4000 }).then(() => true, () => false))
+  const adjust = page.getByRole('button', { name: '调整探查范围' })
+  check('……给「调整探查范围」', await adjust.count() >= 1)
+  check('……没有开始任务：卡片上没有进度', await card.locator('[data-introspect-job]').count() === 0)
+  await adjust.first().click()
+  const dlg = page.locator('[data-scope-dialog]')
+  check('点了打开探查范围面板', await dlg.waitFor({ timeout: 4000 }).then(() => true, () => false))
+
+  // 还没有对象索引：先刷新（一条字典查询，只看不存）
+  check('……还没有对象索引时说清、给「刷新对象索引」', (await dlg.innerText()).includes('还没有对象索引'))
+  await dlg.locator('[data-scope-refresh]').first().click()
+  await until(() => dlg.locator('[data-scope-hits]').getAttribute('data-scope-hits').then((v) => v === '3000/500'))
+  const dry = sent.filter((x) => x.key === 'POST /datasources/check-manage-big/introspect').at(-1)
+  check('……刷新对象索引发的是 dry_run（不反射、不改表结构）', !!dry?.url.includes('dry_run=true'), dry?.url ?? '')
+  const hitsText = await dlg.locator('[data-scope-hits]').innerText()
+  check('……刷新后数出命中：超过上限的写明，会被拒绝', hitsText.includes('超过上限') && hitsText.includes('3,000'), hitsText.replace(/\s+/g, ' '))
+  check('……说明一律在范围内的表（有目录、被已发布模板用到）', (await dlg.locator('[data-scope-pinned]').innerText()).includes('规则排不掉'))
+  check('……超上限时「保存并探查」点不了', await page.locator('[data-scope-save-run]').isDisabled())
+
+  // 边改边数：改成按规则 + 包含 ord_*，停手后问服务端
+  await dlg.locator('[data-scope-mode="rules"]').check()
+  await dlg.locator('[data-scope-input="include"]').fill('ord_*\nord_*')
+  await until(() => dlg.locator('[data-scope-hits]').getAttribute('data-scope-hits').then((v) => v === '400/500'))
+  const pv = sent.filter((x) => x.key === 'POST /datasources/check-manage-big/introspect-scope/preview').at(-1)
+  check('改规则时边改边问命中数（服务端算）：按规则、包含去重后的 ord_*', pv?.body?.scope?.mode === 'rules'
+    && JSON.stringify(pv?.body?.scope?.include) === '["ord_*"]', JSON.stringify(pv?.body ?? {}))
+  check('……命中回到上限以内', (await dlg.locator('[data-scope-hits]').innerText()).includes('命中 400 张，上限 500 张'))
+  await shot(page, 'introspect-scope')
+  await page.locator('[data-scope-save-run]').click()
+  await until(() => card.locator('[data-introspect-job]').count().then((n) => n === 1))
+  const put = sent.filter((x) => x.key === 'PUT /datasources/check-manage-big/introspect-scope').at(-1)
+  check('「保存并探查」：先保存规则', put?.body?.scope?.mode === 'rules' && put?.body?.scope?.max_tables === 500, JSON.stringify(put?.body ?? {}))
+  check('……再开始探查：卡片上有进度条', await card.locator('[data-introspect-job] [role="progressbar"]').count() === 1)
+  await until(async () => ((await card.locator('[data-introspect-job]').getAttribute('data-introspect-progress')) ?? '').startsWith('100/'), 6000)
+  const progress = await card.locator('[data-introspect-job]').getAttribute('data-introspect-progress')
+  check('……每秒取一次进度，往前走', /^(1|2|3)\d\d\/400$/.test(progress ?? ''), progress ?? '')
+  check('……写正在读哪张', (await card.locator('[data-introspect-job]').innerText()).includes('正在读取'))
+  check('……进行中「探查结构」点不了，旁边有「停止」', await card.locator('[data-introspect-start]').isDisabled()
+    && await card.locator('[data-introspect-stop]').count() === 1)
+  await shot(page, 'introspect-running')
+
+  // 停止：读完的照常更新，卡片常驻一行结果
+  await card.locator('[data-introspect-stop]').click()
+  await until(() => card.locator('[data-introspect-result="cancelled"]').count().then((n) => n === 1))
+  const result = await card.locator('[data-introspect-result]').innerText().catch(() => '')
+  check('停止后卡片上写明：已停止、读完了几张、其余保留上一次的结构', result.includes('上次探查已停止') && result.includes('其余保留上一次的结构'), result)
+  check('……发了停止请求', sent.some((x) => x.key.endsWith('/cancel')))
+  check('……进度条不见了，「停止」也不在了', await card.locator('[data-introspect-job]').count() === 0
+    && await card.locator('[data-introspect-stop]').count() === 0)
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()

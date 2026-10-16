@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
 import { KeyRound, Plus } from 'lucide-react'
 import { api } from '../../../api/client'
-import type { AppHookRow } from '../../../typesApp'
+import type { AppHookRow, HookReceipts } from '../../../typesApp'
+import { RecentRequests, type RecentRequestRow } from '../../../components/RecentRequests'
+import { HOOK_RECEIPT_TEXT, RECENT_REQUESTS_TEXT } from '../../../lib/termsApp'
 import {
   CopyButton, DeleteButton, EmptyState, ErrorState, Field, SectionBar, Skeleton, Spinner, confirmDialog, toast,
 } from '../../../components/ui'
@@ -115,7 +117,8 @@ function Grants() {
                 <div className="text-xs font-medium" data-app-grant-title="">{GRANT_ROLE_LABEL[role]}</div>
                 <p className="mt-0.5 text-2xs leading-relaxed text-faint">{GRANT_ROLE_HINT[role]}</p>
               </div>
-              <PrincipalPicker label={GRANT_ROLE_LABEL[role]} allowEveryone={role !== 'manage'}
+              {/* 服务账号能拿授权（外部系统按授权读应用）；岗位绑定那边不能选它 */}
+              <PrincipalPicker label={GRANT_ROLE_LABEL[role]} allowEveryone={role !== 'manage'} allowService
                                value={items.filter((g) => g.role === role).map((g) => ({ kind: g.principal_kind, name: g.principal }))}
                                onChange={(v) => {
                                  setItems((cur) => [...(cur ?? []).filter((g) => g.role !== role),
@@ -142,6 +145,8 @@ export function HooksSection() {
   const [loadError, setLoadError] = useState<unknown>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [shown, setShown] = useState<{ name: string; secret: string; path: string | null } | null>(null)
+  /** 展开了哪一个钩子的收件记录 */
+  const [receiptsOf, setReceiptsOf] = useState<string | null>(null)
   const load = useCallback(() => {
     api.apps.hooks(appId).then((list) => { setRows(list); setLoadError(null) }).catch(setLoadError)
   }, [appId])
@@ -200,8 +205,12 @@ export function HooksSection() {
   }
 
   const status = (name: string, declared: boolean) => (
-    <HookStatus name={name} state={stateOf(name)} declared={declared} busy={busy === name} loaded={!!rows}
-                onRotate={() => void rotate(name)} onToggle={(v) => void toggle(name, v)} onRemove={() => void removeKey(name)} />
+    <>
+      <HookStatus name={name} state={stateOf(name)} declared={declared} busy={busy === name} loaded={!!rows}
+                  receipts={receiptsOf === name} onReceipts={() => setReceiptsOf(receiptsOf === name ? null : name)}
+                  onRotate={() => void rotate(name)} onToggle={(v) => void toggle(name, v)} onRemove={() => void removeKey(name)} />
+      {receiptsOf === name && stateOf(name)?.has_secret && <HookReceiptsPanel appId={appId} name={name} />}
+    </>
   )
 
   return (
@@ -263,13 +272,15 @@ export function HooksSection() {
   )
 }
 
-/** 一行钩子的服务端状态：发布版里有没有、生成过密钥没有、启用；生成 / 轮换、删除密钥 */
-function HookStatus({ name, state, declared, busy, loaded, onRotate, onToggle, onRemove }: {
+/** 一行钩子的服务端状态：发布版里有没有、生成过密钥没有、启用；生成 / 轮换、删除密钥；展开收件记录 */
+function HookStatus({ name, state, declared, busy, loaded, receipts, onReceipts, onRotate, onToggle, onRemove }: {
   name: string
   state: AppHookRow | undefined
   declared: boolean
   busy: boolean
   loaded: boolean
+  receipts: boolean
+  onReceipts: () => void
   onRotate: () => void
   onToggle: (enabled: boolean) => void
   onRemove: () => void
@@ -288,6 +299,12 @@ function HookStatus({ name, state, declared, busy, loaded, onRotate, onToggle, o
         : <span style={{ color: 'var(--st-waiting)' }}>{T.hookNotPublished}</span>}
       <span className="flex-1" />
       {has && (
+        <button type="button" className="btn btn-xs btn-ghost" onClick={onReceipts} aria-expanded={receipts}
+                data-app-hook-receipts-toggle={name}>
+          {receipts ? HOOK_RECEIPT_TEXT.hide : HOOK_RECEIPT_TEXT.show}
+        </button>
+      )}
+      {has && (
         <label className="flex items-center gap-1" title={T.hookEnabledHint}>
           <input type="checkbox" className="accent-[var(--accent)]" checked={state!.enabled} disabled={busy}
                  onChange={(e) => onToggle(e.target.checked)} data-app-hook-enabled="" />
@@ -304,6 +321,35 @@ function HookStatus({ name, state, declared, busy, loaded, onRotate, onToggle, o
           {T.hookDeleteKey}
         </button>
       )}
+    </div>
+  )
+}
+
+/**
+ * 钩子的收件记录（04 细案 A6）：最近 100 条验过签名的请求（状态、原因、发起的实例或解决的待办）和近 1 小时验签失败的次数。
+ * 和访问密钥的「最近的请求」同一个组件
+ */
+function HookReceiptsPanel({ appId, name }: { appId: string; name: string }) {
+  const [data, setData] = useState<HookReceipts | null>(null)
+  const [error, setError] = useState<unknown>(null)
+  const load = useCallback(() => {
+    setError(null)
+    api.apps.hookReceipts(appId, name).then(setData).catch(setError)
+  }, [appId, name])
+  useEffect(load, [load])
+  const rows: RecentRequestRow[] | null = data ? data.items.map((r, i) => ({
+    key: `${r.idem_key}-${i}`, at: r.received_at,
+    tone: r.status === 'accepted' ? 'ok' : r.status === 'rejected' ? 'bad' : 'pending',
+    result: HOOK_RECEIPT_TEXT.status[r.status] ?? r.status, what: `${HOOK_RECEIPT_TEXT.idem} ${r.idem_key}`, detail: r.detail,
+    ref: r.run_id ? { label: RECENT_REQUESTS_TEXT.instance, id: r.run_id,
+      to: `/apps/${encodeURIComponent(appId)}/instances/${encodeURIComponent(r.run_id)}` }
+      : r.task_id ? { label: RECENT_REQUESTS_TEXT.task, id: r.task_id } : null,
+  })) : null
+  return (
+    <div className="space-y-1 rounded-lg border bg-bg px-2.5 py-2" data-app-hook-receipts={name}>
+      <div className="text-2xs font-medium">{HOOK_RECEIPT_TEXT.title(name)}</div>
+      <RecentRequests rows={rows} error={error} onRetry={load} empty={HOOK_RECEIPT_TEXT.empty}
+                      summary={data ? HOOK_RECEIPT_TEXT.failures(data.signature_failures) : undefined} />
     </div>
   )
 }

@@ -26,6 +26,11 @@ export interface Principal {
    * 设置，开关随认人、登录接口一起给（服务端 api/auth.principal_full）；老服务端不给时按关
    */
   user_personal_apps?: boolean
+  /**
+   * 管理员开没开个人访问密钥（auth.personal_keys，docs/design/next-round/04-对外集成与触达.md A1）：关着时不是管理员的人在设置
+   * 里看不到「访问密钥」（建不了，已有的个人密钥也不生效）。老服务端不给时按关
+   */
+  personal_keys?: boolean
 }
 
 export interface UserRow {
@@ -38,6 +43,8 @@ export interface UserRow {
   source: 'local' | 'oidc'
   last_login_at: string | null
   created_at: string
+  /** person 人；service 服务账号（只持有访问密钥，在「设置 → 访问密钥」里管）。老服务端没有这一项，按人算 */
+  kind?: 'person' | 'service'
 }
 
 export interface GroupRow {
@@ -50,7 +57,8 @@ export interface GroupRow {
 
 /** 选人用的名录（GET /api/directory，搭建者及以上只读）：只有用户名、显示名、是否停用和组名 */
 export interface Directory {
-  users: { username: string; display_name: string; disabled: boolean }[]
+  /** service：服务账号（能拿应用授权，不能被派待办：岗位绑定、改派里不能选它） */
+  users: { username: string; display_name: string; disabled: boolean; service?: boolean }[]
   groups: { name: string; label: string }[]
 }
 
@@ -863,4 +871,152 @@ export interface CapabilityReviewOutcome {
   version: number | null
   error: string | null
   code: string | null
+}
+
+// ---------------------------------------------------------------------------
+// 大库下的查看（docs/design/next-round/03-数据接入与目录维护.md A2，第 2 波 W2-a）
+
+export interface LookObject {
+  /** 点名或挑中探查范围外的表，当场读了结构、加进了探查范围（全名） */
+  added_to_scope?: string[]
+  /** 候选太多、先按需求检索：交给挑选模型的表有几张 */
+  prefiltered?: number
+}
+
+// ---------------------------------------------------------------------------
+// 访问密钥与服务账号（docs/design/next-round/04-对外集成与触达.md A1–A7，服务端 api/access_keys.py、auth/keys.py）
+// ---------------------------------------------------------------------------
+
+/** 能申请的权限（auth/keys.SCOPES）；另有不用申请的 me */
+export type AccessKeyScope = 'apps.read' | 'apps.run' | 'tasks.read' | 'tasks.respond' | 'reports.read'
+
+/** 一把密钥现在能不能用：能用 / 已撤销 / 已过期 / 拥有者停用了 */
+export type AccessKeyState = 'active' | 'revoked' | 'expired' | 'owner_disabled'
+
+export interface AccessKeyRow {
+  id: string
+  name: string
+  /** 明文开头一截（agl_ 加随机串前 8 位），只用来认是哪一把 */
+  prefix: string
+  scopes: AccessKeyScope[]
+  /** 限定的应用；null 是不限应用 */
+  app_ids: string[] | null
+  owner: { id: string; username: string | null; display_name: string | null; kind: 'person' | 'service' | null }
+  /** 个人访问密钥（拥有者是人）；false 是服务账号的 */
+  personal: boolean
+  state: AccessKeyState
+  expires_at: string
+  revoked_at: string | null
+  revoked_by: string | null
+  last_used_at: string | null
+  last_used_ip: string | null
+  /** 轮换出来的新密钥记着从哪一把换来 */
+  rotated_from: string | null
+  created_by: string | null
+  created_at: string
+}
+
+/** 建、轮换的回包：明文 key 只在这一次出现 */
+export interface AccessKeyIssued extends AccessKeyRow {
+  key: string
+  /** 轮换时：旧的那一把（24 小时后到期） */
+  previous?: AccessKeyRow
+}
+
+export interface ServiceAccountRow {
+  id: string
+  username: string
+  display_name: string
+  disabled: boolean
+  created_by: string | null
+  created_at: string
+  /** 没撤销的密钥有几把 */
+  keys: number
+}
+
+export interface AccessKeySettings {
+  /** 开没开登录：关登录时访问密钥不生效 */
+  login_on: boolean
+  /** 个人访问密钥的开关（管理员开，缺省关） */
+  personal_keys: boolean
+  admin: boolean
+  can_create_personal: boolean
+  scopes: AccessKeyScope[]
+  /** 新建时缺省勾上的（只有读的） */
+  read_scopes: AccessKeyScope[]
+  /** 只给个人密钥的（回复待办） */
+  personal_scopes: AccessKeyScope[]
+  expires_default_days: number
+  expires_max_days: number
+}
+
+/** 一把密钥的一次请求（access_key_requests）：路由模板，不是带参数的路径 */
+export interface AccessKeyRequestRow {
+  at: string
+  method: string
+  route: string
+  status: number
+  run_id: string | null
+  ip: string | null
+}
+
+/** 接口说明（GET /api/access-keys/reference）：从门禁那张表生成 */
+export interface AccessKeyReference {
+  base_url: string | null
+  header: string
+  idempotency_header: string
+  scopes: AccessKeyScope[]
+  implicit_scope: string
+  personal_scopes: AccessKeyScope[]
+  rate_per_minute: number
+  common_errors: string[]
+  routes: { method: string; path: string; scope: string; summary: string; errors: string[]; idempotent: boolean }[]
+}
+
+/** 钩子最近收到的请求（GET /api/apps/{id}/hooks/{name}/receipts） */
+export interface HookReceiptRow {
+  idem_key: string
+  status: 'processing' | 'accepted' | 'rejected'
+  received_at: string | null
+  run_id: string | null
+  task_id: string | null
+  detail: string | null
+}
+
+export interface HookReceipts {
+  items: HookReceiptRow[]
+  /** 最近一小时验签失败了几次（不落库，只在服务端进程里数） */
+  signature_failures: number
+  window_s: number
+}
+
+/**
+ * 视图数据 agentlab.viewdata/1（GET /api/apps/{id}/views/{view}/data，A5）：给外部系统拉封存的数。前端暂时不用，类型照服务端
+ * apps/resolve.view_data 写
+ */
+export interface ViewData {
+  format: 'agentlab.viewdata/1'
+  app: { id: string; version: number }
+  view: { id: string; kind: 'latest_sealed' | 'on_demand' }
+  state: 'ok' | 'empty' | 'running' | 'error'
+  /** 按需视图：规整后的参数 */
+  params?: Record<string, unknown>
+  run_id: string | null
+  manifest_hash: string | null
+  stamp: Record<string, any> | null
+  metrics: {
+    node: string
+    node_label: string
+    caliber: string | null
+    caliber_version: string | null
+    id: string
+    name: string
+    unit: string
+    /** 原值；遮罩的为 null */
+    value: unknown
+    text: string
+    state: 'ok' | 'masked' | 'missing'
+    evidence: { run_id: string; eid: string | null; node: string; metric: string }
+  }[]
+  message?: string
 }

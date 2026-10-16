@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -18,6 +18,8 @@ from app.api import (
     actions as actions_api, apps as apps_api, auth as auth_api, capabilities as capabilities_api, hooks as hooks_api,
     identity as identity_api, ledger as ledger_api, notify as notify_api, tasks as tasks_api,
 )
+# 下一轮第 2 波（docs/design/next-round）：评测、访问密钥
+from app.api import access_keys as access_keys_api, evals as evals_api
 # 普通用户建应用（docs/design/normal-user-apps.md §3.10）：蓝图、模板、文件、个人应用。权限在接口里按蓝图的范围和拥有者判
 from app.api import (
     blueprints as blueprints_api, copilot_blueprint, files as files_api, personal as personal_api,
@@ -25,6 +27,7 @@ from app.api import (
 )
 from app.api.coded import CodedHTTPException, coded_handler
 from app.api.deps import chat_scope, evidence_scope, private_run_scope, require_role, role_by_method, run_scope
+from app.auth.keys import key_gate
 from app.auth.middleware import AuthMiddleware
 from app.core.config import settings
 from app.db.base import init_db
@@ -106,6 +109,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await catalog_profile_jobs.startup()
     except Exception:  # noqa: BLE001
         logger.exception("数据剖析任务的启动整理失败，服务照常启动")
+    # 后台探查任务（next-round 03 A1）同一个规矩：没做完的标中断，读完的表物化进表结构，不自动续跑
+    from app.data import introspect_jobs
+
+    try:
+        await introspect_jobs.startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("探查任务的启动整理失败，服务照常启动")
 
     await run_manager.setup()
     # 流程：存量的待审批补建待办（派给任何人，幂等）；上次进程没了时已发出、没拿到结果的写入收成结果未知、安排核实
@@ -138,6 +148,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await scheduler.stop()
         await catalog_jobs.manager.shutdown()
         await catalog_profile_jobs.manager.shutdown()
+        await introspect_jobs.manager.shutdown()
         await run_manager.shutdown()
         from app.sandbox.manager import sandbox_manager
 
@@ -180,11 +191,14 @@ async def _platform_startup() -> None:
         logger.exception("能力登记同步失败，服务照常启动")
 
 
+# 访问密钥的门禁（app/auth/keys.py 的 key_gate，docs/design/next-round/04-对外集成与触达.md A2）挂在全站一次：每个路由都先过它，
+# 按访问密钥认出来的请求只放行 KEY_ROUTES 里的接口；别的认法（会话、关登录、钩子）一律放过，由各组路由自己的依赖判
 app = FastAPI(
     title="AgentLab",
     description="可视化 Agent 编排实验台",
     version="0.1.0",
     lifespan=lifespan,
+    dependencies=[Depends(key_gate)],
 )
 
 # 身份（app/auth/middleware.py）：按请求认出是谁、核对 CSRF。加在 CORS 之前，CORS 就在它外面一层：
@@ -214,6 +228,8 @@ for router, guard in (
     (bundle.router, [*_BUILDER, private_run_scope]),
     (inquiry.router, [*_BUILDER, private_run_scope]),
     (whatif.router, [*_BUILDER, private_run_scope]),
+    # 口径账本按运行读的接口（/api/runs/{run_id}/ledger…）：和证据同一道门
+    (ledger_api.runs_router, [evidence_scope]),
     (runs.router, [run_scope]),
     (runs.approvals_router, _BUILDER),
     (evidence.router, [evidence_scope]),
@@ -262,6 +278,9 @@ for router, guard in (
     (hooks_api.router, []),
     (notify_api.router, _USER),
     (ledger_api.router, _BUILDER),
+    # 下一轮第 2 波：评测只给搭建者；访问密钥登录即可，接口里再按本人 / 管理员判
+    (evals_api.router, _BUILDER),
+    (access_keys_api.router, _USER),
 ):
     app.include_router(router, dependencies=guard)
 

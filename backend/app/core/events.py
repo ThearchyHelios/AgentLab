@@ -83,6 +83,11 @@ class EventType(StrEnum):
     # 探索运行里按需裁判的结论句判定：点开哪句才判哪句，追加在封存之后（post_seal），是批注不是证据。
     # 封存核对只覆盖 manifest_seq 之前的事件，追加它不影响 verify；封存的报告文档一个字都不改
     EVIDENCE_JUDGED = "evidence.judged"
+    # 口径账本（docs/design/next-round/02-口径账本.md 做法 2）：探索运行封存之后，后台拿这次执行的 SQL 和已发布口径的取数比对，
+    # 结果存成内容寻址工件（kind=caliber_match，格式 agentlab.caliber_match/1），再追加这一条：{artifact, manifest_hash,
+    # algo, counts, trigger}。追加在封存之后（post_seal），是批注不是证据：比对依据的已发布口径在运行之外，不能混进运行
+    # 自身的封存事实；封存核对照旧一致
+    LEDGER_MATCHED = "ledger.matched"
 
     # 应用平台（docs/design/app-platform-and-look.md §3.11）
     # 运行来源：发起时写进 launch_run 的 notes，在封存范围内（engine/origin.py）

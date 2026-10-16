@@ -115,7 +115,8 @@ async def _look_service(session: AsyncSession, payload: GenerateIn, sources: lis
     里给哪一份数据目录（data/catalog_view.py），不给是当前目录。"""
     spec = await copilot_model_spec(session, payload, max_tokens=copilot_context.PICK_MAX_TOKENS)
     return await copilot_context.look_service(sources, spec=spec, graph=graph, kinds=kinds,
-                                              answer=payload.intent == "answer", catalog_view=catalog_view)
+                                              answer=payload.intent == "answer", catalog_view=catalog_view,
+                                              trail={"conversation_id": getattr(payload, "conversation_id", None)})
 
 
 NODE_REFERENCE = """\

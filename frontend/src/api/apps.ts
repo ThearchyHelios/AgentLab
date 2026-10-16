@@ -5,7 +5,7 @@
  * 入口提交校验失败回 422，ApiError 的 body 里带 {errors: FormError[]}。
  */
 import type {
-  AppBindings, AppDetail, AppGrant, AppHookRow, AppList, AppSpec, AppSummary, AppVersionRow, BackfillPlan, BackfillResult,
+  AppBindings, AppDetail, AppGrant, AppHookRow, AppList, HookReceipts, AppSpec, AppSummary, AppVersionRow, BackfillPlan, BackfillResult,
   ComponentCatalog, Disposition, InstanceRow, LintIssue, PublishResult, ViewModel,
 } from '../typesApp'
 import type { ConversationDetail, EvidenceSegmentDetail } from '../types'
@@ -72,6 +72,8 @@ export const apps = {
   setHookEnabled: (id: string, name: string, enabled: boolean) => patch<AppHookRow>(hookAt(id, name), { enabled }),
   /** 删掉这个名字的密钥行：外部系统再用旧密钥签的请求一律拒收 */
   deleteHook: (id: string, name: string) => del(hookAt(id, name)),
+  /** 钩子最近收到的请求（manage）：状态、原因、发起的实例或解决的待办，加近 1 小时验签失败几次（04 细案 A6） */
+  hookReceipts: (id: string, name: string) => get<HookReceipts>(`${hookAt(id, name)}/receipts`),
   /**
    * 应用编辑器里助手的对话（D-e，manage）：取这个应用的那段对话，没有就建（kind=app、归属这个应用）。带着历史轮次；
    * 老服务端只回对话本身时由调用方再按 id 取一次

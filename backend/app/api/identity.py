@@ -24,6 +24,8 @@ from app.db.models import AuditEvent, Group, GroupMember, User
 from app.db.models_identity import ROLES
 
 router = APIRouter(prefix="/api", tags=["identity"])
+#: 服务账号的用户名开头（auth/keys.SERVICE_PREFIX）：这里建的人不能用它，免得和服务账号混在一起
+_SERVICE_PREFIX = "svc-"
 #: 人和组的名录（GET /api/directory）：只读、给搭建者及以上（main.py 挂 require_role("builder")），岗位绑定、应用授权的
 #: 选人控件据此给候选、核对填的名字在不在。只有用户名、显示名、是否停用和组名，不含邮箱、角色、登录时间
 directory_router = APIRouter(prefix="/api", tags=["identity"])
@@ -40,7 +42,9 @@ def user_out(row: User) -> dict[str, Any]:
     return {"id": row.id, "username": row.username, "display_name": row.display_name or row.username,
             "email": row.email, "role": row.role, "disabled": row.disabled,
             "source": "oidc" if row.oidc_subject else "local", "last_login_at": _iso(row.last_login_at),
-            "created_at": _iso(row.created_at)}
+            "created_at": _iso(row.created_at),
+            # 服务账号（next-round 04 A1）在「设置 → 访问密钥」里建和停用，这里只标出来
+            "kind": row.kind or "person"}
 
 
 @router.get("/users")
@@ -65,6 +69,8 @@ def _check_role(role: str) -> None:
 @router.post("/users", status_code=201)
 async def create_user(payload: UserIn, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     _check_role(payload.role)
+    if payload.username.lower().startswith(_SERVICE_PREFIX):
+        raise HTTPException(422, f"{_SERVICE_PREFIX} 开头的用户名留给服务账号：服务账号请在「设置 → 访问密钥」里建")
     if payload.password and (problem := password_problem(payload.password)):
         raise HTTPException(422, problem)
     if (await session.execute(select(User.id).where(User.username == payload.username))).first():
@@ -101,6 +107,9 @@ async def update_user(user_id: str, payload: UserPatch, session: AsyncSession = 
     row = await session.get(User, user_id)
     if row is None:
         raise HTTPException(404, "用户不存在")
+    if row.kind == "service" and ((payload.role is not None and payload.role != row.role) or payload.password):
+        # 服务账号角色固定使用者、没有口令、不能登录（访问密钥一律按使用者算，next-round 04 A1、A3）
+        raise HTTPException(409, "服务账号的角色固定是使用者，也不能设密码：它只持有访问密钥，在「设置 → 访问密钥」里管理")
     changes: dict[str, Any] = {}
     if payload.role is not None and payload.role != row.role:
         _check_role(payload.role)
@@ -222,7 +231,9 @@ async def directory(session: AsyncSession = Depends(get_session)) -> dict[str, A
     from app.auth.directory import load_directory
 
     known = await load_directory(session)
-    return {"users": [{"username": u.username, "display_name": u.display_name, "disabled": u.disabled}
+    # 服务账号另标 service：岗位绑定、改派不能选它（不能被派待办），应用授权能选
+    return {"users": [{"username": u.username, "display_name": u.display_name, "disabled": u.disabled,
+                       **({"service": True} if u.service else {})}
                       for u in known.users.values()],
             "groups": [{"name": g.name, "label": g.label} for g in known.groups.values()]}
 

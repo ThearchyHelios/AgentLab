@@ -492,9 +492,10 @@ function JobView({ sourceId, job, running, stopping, busy, filled, returnTo, onS
            aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={value}>
         <div className="h-full rounded-full transition-[width] duration-300" style={{ width: `${pct}%`, background: tone }} />
       </div>
-      {queued && job.waiting_for === 'draft' && (
-        <p className="flex items-start gap-1.5 text-2xs leading-relaxed text-dim" data-profile-waiting="draft">
-          <Info size={11} className="mt-px shrink-0" style={{ color: 'var(--accent)' }} aria-hidden /> <span>{PT.waitingDraft}</span>
+      {queued && (job.waiting_for === 'draft' || job.waiting_for === 'introspect') && (
+        <p className="flex items-start gap-1.5 text-2xs leading-relaxed text-dim" data-profile-waiting={job.waiting_for}>
+          <Info size={11} className="mt-px shrink-0" style={{ color: 'var(--accent)' }} aria-hidden />
+          <span>{job.waiting_for === 'draft' ? PT.waitingDraft : PT.waitingIntrospect}</span>
         </p>
       )}
       {notice && <Notice tone="warn" className="break-words" attr={{ 'data-profile-notice': '' }}>{notice}</Notice>}

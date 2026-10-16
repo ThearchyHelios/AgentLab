@@ -14,7 +14,7 @@ import type { AuditRow } from '../../typesApp'
 
 const KINDS: Record<string, string> = {
   auth: '登录方式', user: '用户', group: '组', app: '应用', grant: '授权', endpoint: '端点', capability: '能力',
-  workflow_version: '工作流版本', channel: '通知渠道',
+  workflow_version: '工作流版本', channel: '通知渠道', access_key: '访问密钥',
 }
 
 export function AuditTab() {

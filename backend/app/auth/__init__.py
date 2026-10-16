@@ -5,7 +5,8 @@ api/deps.py 只定接口，这里给实现：
 - middleware.py：按请求认出是谁（会话 cookie），写进 api/deps 的 contextvar；非 GET 请求核对 X-AgentLab-Request 头和 Origin；
 - sessions.py / passwords.py：会话（库里只存 token 的 sha256）、口令（hashlib.scrypt）、登录失败退避；
 - oidc.py：授权码 + PKCE；access.py：运行、工件的读权限；audit.py：管理类操作的留痕；signing.py：身份断言；
-- chat_policy.py：开了问数据的使用者能运行什么样的图（节点、工具的白名单）。
+- chat_policy.py：开了问数据的使用者能运行什么样的图（节点、工具的白名单）；
+- keys.py：访问密钥（服务账号和个人访问密钥）的签发、认人、门禁、限流、幂等、请求记录、接口说明。
 
 关登录（off，默认）时：中间件什么都不做，所有依赖放行，行为和加这一层之前一模一样。
 """
@@ -53,6 +54,15 @@ def stored_settings() -> dict[str, Any]:
 def user_can_chat() -> bool:
     """开登录后 user 角色能不能问数据（Q2，默认不能，管理员开关）。"""
     return bool(_stored.get("user_can_chat"))
+
+
+#: 登录设置里「个人访问密钥」开关的键（docs/design/next-round/04-对外集成与触达.md A1，界面上在「设置 → 访问密钥」）
+PERSONAL_KEYS = "personal_keys"
+
+
+def personal_keys_enabled() -> bool:
+    """个人访问密钥开没开（集成-I2，默认关，管理员开关）。关着时建不了个人密钥，已有的个人密钥也不认（auth/keys.py）。"""
+    return bool(_stored.get(PERSONAL_KEYS))
 
 
 async def load_settings(force: bool = False) -> dict[str, Any]:

@@ -16,6 +16,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+from tests.fixtures.sources import introspect_now
 
 
 @pytest.fixture
@@ -57,10 +58,13 @@ async def _cache(source_id: str) -> dict:
 
 async def test_cached_schema_says_which_schema_the_cache_came_from(client, source):
     assert source["cached_schema"] is None, "没探过就是没有缓存"
-    r = await client.post(f"/api/datasources/{source['id']}/introspect")
-    assert r.json()["cached_schema"] == "", "按默认 schema 探的写空串，和「没探过」分开"
-    r = await client.post(f"/api/datasources/{source['id']}/introspect", params={"schema": "main"})
-    assert r.json()["cached_schema"] == "main"
+    out = await introspect_now(client, source["id"])
+    assert out["cached_schema"] == "", "按默认 schema 探的写空串，和「没探过」分开"
+    # 一个数据源一个 schema（目录-D2）：真探查只按配置里的 schema，要换先改配置
+    r = await client.patch(f"/api/datasources/{source['id']}", json={"options": {"schema": "main"}})
+    assert r.status_code == 200, r.text
+    out = await introspect_now(client, source["id"])
+    assert out["cached_schema"] == "main"
     listed = next(s for s in (await client.get("/api/datasources")).json() if s["id"] == source["id"])
     assert listed["cached_schema"] == "main"
 
@@ -71,7 +75,7 @@ async def test_cached_schema_says_which_schema_the_cache_came_from(client, sourc
 
 
 async def test_a_dry_run_shows_what_is_there_without_touching_the_cache(client, source):
-    await client.post(f"/api/datasources/{source['id']}/introspect")
+    await introspect_now(client, source["id"])
     before = await _cache(source["id"])
 
     r = await client.post(f"/api/datasources/{source['id']}/introspect",
@@ -89,7 +93,7 @@ async def test_a_dry_run_shows_what_is_there_without_touching_the_cache(client, 
 
 
 async def test_a_dry_run_that_finds_nothing_says_why_and_still_leaves_the_cache(client, source):
-    await client.post(f"/api/datasources/{source['id']}/introspect")
+    await introspect_now(client, source["id"])
     before = await _cache(source["id"])
 
     r = await client.post(f"/api/datasources/{source['id']}/introspect",
@@ -104,9 +108,17 @@ async def test_a_dry_run_that_finds_nothing_says_why_and_still_leaves_the_cache(
 
 
 async def test_without_dry_run_the_cache_is_still_replaced(client, source):
-    r = await client.post(f"/api/datasources/{source['id']}/introspect", params={"schema": "main"})
-    assert r.json()["table_count"] == 3
+    r = await client.patch(f"/api/datasources/{source['id']}", json={"options": {"schema": "main"}})
+    assert r.status_code == 200, r.text
+    out = await introspect_now(client, source["id"])
+    assert out["table_count"] == 3
     assert (await _cache(source["id"]))["cache"]["schema"] == "main"
+
+
+async def test_a_real_introspect_with_another_schema_is_refused(client, source):
+    """真探查不接受临时换 schema：一个数据源一个 schema，对象索引、探查范围都按配置里的那个记。"""
+    r = await client.post(f"/api/datasources/{source['id']}/introspect", params={"schema": "other"})
+    assert r.status_code == 422 and "schema" in r.json()["detail"]
 
 
 # --------------------------------------------------------------------------
@@ -115,7 +127,7 @@ async def test_without_dry_run_the_cache_is_still_replaced(client, source):
 
 
 async def test_table_schema_comes_with_structured_columns(client, source):
-    await client.post(f"/api/datasources/{source['id']}/introspect")
+    await introspect_now(client, source["id"])
     body = (await client.get(f"/api/datasources/{source['id']}/schema",
                              params={"table": "orders"})).json()
     assert body["found"] is True
@@ -133,7 +145,7 @@ async def test_table_schema_comes_with_structured_columns(client, source):
 
 
 async def test_an_unknown_table_has_no_columns_but_keeps_the_explanation(client, source):
-    await client.post(f"/api/datasources/{source['id']}/introspect")
+    await introspect_now(client, source["id"])
     body = (await client.get(f"/api/datasources/{source['id']}/schema",
                              params={"table": "nope"})).json()
     assert body["found"] is False and body["columns"] == []

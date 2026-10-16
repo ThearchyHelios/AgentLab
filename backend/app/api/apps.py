@@ -256,8 +256,13 @@ async def list_apps(include_archived: bool = False, scope: str | None = None,
         query = query.where(App.scope == "personal")
     elif scope == "shared":
         query = query.where(or_(App.scope == "shared", App.scope.is_(None)))
+    from app.auth.keys import app_allowed
+
     items = []
     for app in (await session.execute(query)).scalars():
+        if not app_allowed(principal, app):
+            # 访问密钥（04 细案 A2）：个人应用不列，限定了应用的只列那几个
+            continue
         role = await app_role(session, principal, app)
         if role is None:
             if _sees_stub(principal, app):
@@ -639,8 +644,9 @@ async def grants_problem(session: AsyncSession, items: list[tuple[str, str, str]
             wanted.append(key)
     if (mode := auth_mode()) != "off":
         known = await load_directory(session)
+        # 服务账号能拿授权（外部系统按授权读应用，docs/design/next-round/04-对外集成与触达.md A1），这里不算对不上
         refused = [f"「{ROLE_TEXT[role]}」里的{m.text}" for kind, who, role in wanted
-                   if (m := mismatch(known, mode, kind, who)) is not None and m.blocking]
+                   if (m := mismatch(known, mode, kind, who, allow_service=True)) is not None and m.blocking]
         if refused:
             return wanted, f"{'；'.join(refused)}：授权只能给名录里在用的人和组，请移除或从候选中重新选择"
     return wanted, None
@@ -772,6 +778,17 @@ async def delete_hook(app_id: str, name: str, session: AsyncSession = Depends(ge
     await session.commit()
 
 
+@router.get("/{app_id}/hooks/{name}/receipts")
+async def hook_receipts(app_id: str, name: str, session: AsyncSession = Depends(get_session),
+                        x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """这个钩子最近收到的请求（04 细案 A6，要管理权限）：最近 100 条的幂等键、状态、时间、发起的实例或解决的待办、被拒的
+    原因，另给近 1 小时验签失败几次（不落库，只在进程里按钩子数）。还没生成密钥的是空的。"""
+    from app.process import hooks
+
+    app, _ = await _app(session, app_id, _principal(x_actor), "manage")
+    return await hooks.recent_receipts(session, app.id, name)
+
+
 # --------------------------------------------------------------------------
 # 使用：页面、入口、实例、视图刷新
 # --------------------------------------------------------------------------
@@ -830,21 +847,59 @@ class StartIn(BaseModel):
 
 @router.post("/{app_id}/entries/{entry_id}", status_code=201)
 async def start(app_id: str, entry_id: str, payload: StartIn, session: AsyncSession = Depends(get_session),
-                x_actor: str | None = Header(default=None)) -> Any:
-    """发起一个实例。表单没通过校验回 422，带 {errors: [{path, code, message}]}。"""
+                x_actor: str | None = Header(default=None),
+                idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> Any:
+    """发起一个实例。表单没通过校验回 422，带 {errors: [{path, code, message}]}。
+
+    用访问密钥发起（docs/design/next-round/04-对外集成与触达.md A4）：必须带 Idempotency-Key，同一个键重发交回同一个实例
+    （duplicate: true），处理到一半服务停了的同一个键能认领回已发起的实例；入口表单里有文件控件的 422
+    （key_files_unsupported：文件要先在应用里上传，密钥不开上传接口）。"""
     from app.apps.entries import EntryRefused, FormRejected, start_entry
     from app.apps.resolve import instance_title
+    from app.auth import keys
     from app.engine.launch import LaunchRefused
 
     principal = _principal(x_actor)
     app, _ = await _app(session, app_id, principal, "use")
+    idem = keys.idempotency_of(idempotency_key) if principal.via == "key" else None
+
+    async def launch(reclaimed: bool = False) -> dict[str, Any]:
+        if reclaimed and idem and (run_id := await keys.started_before(principal, idem)):
+            # 上一次处理到一半服务停了：实例其实已经发起，交回它，不再发起一个
+            return await replay({"run_id": run_id})
+        run = await start_entry(app.id, entry_id, payload.values, principal, idempotency_key=idem)
+        return {"run_id": run.id, "title": instance_title(run)}
+
+    async def replay(previous: dict[str, Any]) -> dict[str, Any]:
+        run = await session.get(Run, previous.get("run_id")) if previous.get("run_id") else None
+        return {"run_id": previous.get("run_id"), "title": instance_title(run) if run is not None else "",
+                **({"duplicate": True} if previous.get("duplicate") else {})}
+
     try:
-        run = await start_entry(app.id, entry_id, payload.values, principal)
+        if principal.via != "key":
+            return await launch()
+        await _refuse_key_files(session, app, entry_id)
+        return await keys.once(principal, idem, route=f"POST /api/apps/{app.id}/entries/{entry_id}",
+                               request=payload.values, run=launch, replay=replay)
     except FormRejected as e:
         return JSONResponse(status_code=422, content={"detail": "表单没有通过校验", "code": FORM_INVALID, "errors": e.errors})
     except (EntryRefused, LaunchRefused) as e:
         raise _view_refused(e) from e
-    return {"run_id": run.id, "title": instance_title(run)}
+
+
+async def _refuse_key_files(session: AsyncSession, app: App, entry_id: str) -> None:
+    """用访问密钥发起时，入口表单（当前发布版）里有文件控件的拒（422 key_files_unsupported）。发布版、入口不存在的放过去，
+    由发起照旧报。"""
+    from app.apps.tree import entry_of, resolve_form
+    from app.auth import keys
+    from app.files.store import file_fields
+
+    version = await _previous(session, app)
+    spec = (version.spec or {}) if version is not None else {}
+    entry = entry_of(spec, entry_id)
+    if entry is not None and file_fields(resolve_form(spec, entry.get("form"))):
+        raise CodedHTTPException(422, "这个入口的表单里要传文件，不能用访问密钥发起：请在应用里发起",
+                                 keys.KEY_FILES_UNSUPPORTED)
 
 
 @router.get("/{app_id}/instances")
@@ -899,23 +954,57 @@ class RefreshIn(BaseModel):
 
 @router.post("/{app_id}/views/{view_id}/refresh")
 async def refresh_view(app_id: str, view_id: str, payload: RefreshIn, session: AsyncSession = Depends(get_session),
-                       x_actor: str | None = Header(default=None)) -> Any:
-    """按需视图：发起一次运行，或者命中缓存、接上同一个参数正在运行的那次。"""
+                       x_actor: str | None = Header(default=None),
+                       idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> Any:
+    """按需视图：发起一次运行，或者命中缓存、接上同一个参数正在运行的那次。
+
+    用访问密钥刷新（04 细案 A4，集成-I3）：同发起实例，必须带 Idempotency-Key，同一个键重发交回同一次运行。刷新本来就按
+    参数去重（缓存、同一组参数只跑一份），幂等键再管住「上一次失败、缓存被清掉之后重发又发起一次」这种情形。"""
     from app.apps.entries import FormRejected
     from app.apps.resolve import ViewRefused, run_view
+    from app.auth import keys
     from app.engine.launch import LaunchRefused
 
     principal = _principal(x_actor)
     app, _ = await _app(session, app_id, principal, "use")
     version = await _current_version(session, app)
-    try:
+
+    async def refresh(_reclaimed: bool = False) -> dict[str, Any]:
+        # 重新认领时照样走 run_view：上一次已经发起的那次在缓存里，命中它或者接上它，不会再发起一次
         run, cached = await run_view(session, app=app, version=version, view_id=view_id, params=payload.params,
                                      principal=principal, actor=actor_of(x_actor))
+        return {"run_id": run.id, "cached": cached}
+
+    async def replay(previous: dict[str, Any]) -> dict[str, Any]:
+        return {"run_id": previous.get("run_id"), "cached": False, "duplicate": True}
+
+    try:
+        if principal.via != "key":
+            return await refresh()
+        return await keys.once(principal, idempotency_key, route=f"POST /api/apps/{app.id}/views/{view_id}/refresh",
+                               request=payload.params, run=refresh, replay=replay)
     except FormRejected as e:
         return JSONResponse(status_code=422, content={"detail": "参数没有通过校验", "code": FORM_INVALID, "errors": e.errors})
     except (ViewRefused, LaunchRefused) as e:
         raise _view_refused(e) from e
-    return {"run_id": run.id, "cached": cached}
+
+
+@router.get("/{app_id}/views/{view_id}/data")
+async def view_data(app_id: str, view_id: str, params: str | None = None, session: AsyncSession = Depends(get_session),
+                    x_actor: str | None = Header(default=None)) -> dict[str, Any]:
+    """视图数据（agentlab.viewdata/1，04 细案 A5）：按当前发布版解析这个视图取的是哪一次封存的正式运行，交出印章、清单哈希、
+    口径卡指标的原值和渲染文字（遮罩的 value 为 null）、证据指针。按需视图读 ?params= 这组参数上次算的结果，不发起运行，
+    没算过的 state=empty。界面和访问密钥都能用；个人应用没有发布版（409）。"""
+    from app.apps.resolve import ViewRefused, view_data as data_of
+
+    principal = _principal(x_actor)
+    app, role = await _app(session, app_id, principal, "use")
+    version = await _current_version(session, app)
+    try:
+        return await data_of(session, app, version=version, view_id=view_id, params=_params(params),
+                             principal=principal, role=role)
+    except ViewRefused as e:
+        raise _view_refused(e) from e
 
 
 # --------------------------------------------------------------------------

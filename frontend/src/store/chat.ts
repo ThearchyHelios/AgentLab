@@ -1628,10 +1628,15 @@ async function launch(
 ) {
   const { patch } = flow
   try {
-    const run = await api.runs.start({
-      graph, input: fillInput(graph, question, historyOf(flow.conversationId, flow.turnId)),
-      origin: 'chat',
-    })
+    // 这一轮在服务端的 id（开轮请求可能还在路上，等它）：运行记下属于哪段对话、哪一轮（服务端核对后封存进运行来源）。
+    // 开轮没成的（serverId 为空）不带，运行照常发起
+    const turnId = findTurn(flow.conversationId, flow.turnId)?.serverId ?? (await serverIds.get(flow.turnId)) ?? null
+    const body = { graph, input: fillInput(graph, question, historyOf(flow.conversationId, flow.turnId)), origin: 'chat' as const }
+    // 来源核对不过（对话刚被删、这一轮已不在）：来源只是留痕，不挡这一轮的回答，不带来源照常发起
+    const run = await (turnId
+      ? api.runs.start({ ...body, origin_ref: { conversation_id: flow.conversationId, turn_id: turnId } })
+        .catch((e) => (e instanceof ApiError && e.code === 'origin_ref_invalid' ? api.runs.start(body) : Promise.reject(e)))
+      : api.runs.start(body))
     // 启动请求在路上时用户点了停止或重试：运行已经起来了，得追一个取消过去
     if (!flow.alive()) {
       void api.runs.cancel(run.id).catch(() => undefined)

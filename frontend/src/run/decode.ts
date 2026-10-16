@@ -6,7 +6,7 @@ import {
   ABSENCE_CLAIM_TEXT, ACTION_CONFIRM_TEXT, ACTION_ENV_LABEL, ACTION_LOG_TEXT, CATALOG_DRIFT_TEXT, CATALOG_PATCH_TEXT, COPILOT_CONTEXT_TEXT, JUDGE_TEXT, LOOK_TEXT, MERGE_TEXT,
   ORIGIN_TEXT, RUN_SQL_CHECK_TEXT, SQL_CHECK_TEXT, TASK_KIND_LABEL, TASK_LOG_TEXT, TASK_STATUS_LABEL, TASK_TEXT, TYPE_LABEL, originLabel,
   CATALOG_TABLE_FIELD_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, INQUIRY_TEXT, JUDGE_TRUNCATED_TEXT, MASKED_CELL_TEXT, NODE_TYPE_LABEL,
-  VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText, FILE_TEXT, REJECTED_TEXT,
+  VERIFY_TRUNCATED_TEXT, BP_OP_TEXT, TEMPLATE_LABEL, bpPathText, FILE_TEXT, REJECTED_TEXT, LEDGER_TEXT,
   claimTally,
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
@@ -2402,6 +2402,20 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         break
       }
 
+      case 'ledger.matched': {
+        // 口径账本：探索运行封存之后，服务端在后台拿这次执行的 SQL 和已发布口径比对过了。追加在封存之后、不在封存范围内；
+        // 事件里只有几条查询各是什么情况，逐个数的标签走 GET /runs/{id}/ledger
+        const counts = d.counts && typeof d.counts === 'object' ? d.counts : {}
+        const retro = typeof d.trigger === 'string' && d.trigger !== 'sealed'
+        out.push({
+          id: `lm-${seq}`, seq, kind: 'note', status: 'done', code: 'ledger_matched',
+          level: typeof counts.skipped === 'number' && counts.skipped > 0 ? 'warn' : 'info',
+          title: LEDGER_TEXT.timeline(counts),
+          sub: [LEDGER_TEXT.sub, retro ? LEDGER_TEXT.retro : ''].filter(Boolean).join(' · '),
+        })
+        break
+      }
+
       case 'approval.inquiry':
         // 审批人在批准前就待审的报告提问（审批质询）：运行停在审批上时服务端追加这一条，node_id 为空，运行本身没动、
         // 报告也不改（相位照旧，见 nextPhase）。封存之后探索运行也能问，带 post_seal。一条事件就是一问一答，挂在顶层
@@ -3222,6 +3236,9 @@ export function lookEventOf(op: CopilotOp): LookEvent | null {
         ...(total != null ? { total } : {}),
         ...(total != null && explored != null && explored < total ? { explored } : {}),
         ...(num(x.catalog_tables) != null ? { catalog_tables: num(x.catalog_tables) } : {}),
+        // 按需加入探查范围的表（next-round 03 A2）；老服务端没有这一项
+        ...(names(x.added_to_scope).length ? { added_to_scope: names(x.added_to_scope) } : {}),
+        ...(num(x.prefiltered) != null ? { prefiltered: num(x.prefiltered) } : {}),
       }
     })
   const status = op.status === 'index' || op.status === 'failed' ? op.status : 'ok'
@@ -3256,6 +3273,7 @@ function lookLine(o: LookObject): string {
     o.named.length ? LOOK_TEXT.named(o.named) : '',
     o.picked?.length ? LOOK_TEXT.picked(o.picked) : '',
     o.joined?.length ? LOOK_TEXT.joined(o.joined) : '',
+    o.added_to_scope?.length ? LOOK_TEXT.added(o.added_to_scope) : '',
   ].filter(Boolean)
   // 口径卡（caliber）是蓝图对到的已发布口径卡上的指标（docs/design/normal-user-apps.md N2）
   const kind = o.kind

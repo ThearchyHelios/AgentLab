@@ -793,7 +793,13 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
                                 for c in step.get("masked") or []))
     verdict = _effective_verdicts(chosen, sealed)[0].get(str(unit.get("id")))
     challenged = _challenge_of(sealed, chosen, str(unit.get("id")))
+    # 口径账本（next-round 02 做法 3）：这个数来自哪一份口径。比对在封存之后做、不在封存范围内，标签里写明；没比对过的运行
+    # （老运行、不是数的片段）没有这个键，返回一字不差
+    from app.ledger.view import segment_label
+
+    ledger = await segment_label(sealed, chosen.node_id, str(seg["id"]))
     return {
+        **({"ledger": ledger} if ledger is not None else {}),
         "report": {"node_id": chosen.node_id, "doc_artifact": chosen.doc_artifact},
         "segment": {"id": seg["id"], "text": seg.get("text"), "kind": seg.get("kind"), "state": seg.get("state"),
                     "span": seg.get("span"), "unit": unit.get("id"),
@@ -2791,7 +2797,8 @@ async def export_report_html(run_id: str, report: str | None = None) -> Response
     正文由服务端按报告文档渲染（不执行脚本也读得到）；带出处链的数据嵌在页面里，执行脚本后每个数字、
     无证据的数字、可疑的表名字段名都点得开——面板是网页上证据面板同一个拼法（_chain）：口径卡、口径与
     版本、原式、代入式、输入、复算、SQL、被引用的行。封存状态逐项标明；没封存的运行照常导出（和网页上
-    读报告一个道理）。只读：不追加任何事件，不改运行记录。
+    读报告一个道理）。不追加运行事件、不改运行记录，只记一条导出审计（report.exported，next-round 02 做法 9：召回要找得到
+    谁导出过这份报告）。口径账本比对过的运行，面板最上面多「口径」一步（同一份标签，写明封存后比对、不在封存范围内）。
 
     一次运行里有好几份报告时用 ?report=<节点 id> 指定；不指定取成果里标注的那一份（和片段接口同一个选法）。
     选报告、错误码和片段接口相同（run_not_found、evidence_report_not_found、evidence_doc_tampered、
@@ -2853,14 +2860,34 @@ async def export_report_html(run_id: str, report: str | None = None) -> Response
         info = {"id": run.id, "workflow_id": run.workflow_id, "workflow_name": run.workflow_name,
                 "run_class": run.run_class, "status": run.status, "end_reason": run.end_reason,
                 "started_at": run.started_at, "finished_at": run.finished_at}
+    from app.ledger.view import report_labels
+
+    ledger = await report_labels(sealed, chosen.node_id)
     data = build_report(info, report_node=chosen.node_id, doc_artifact=chosen.doc_artifact,
                         doc_hash_ok=chosen.hash_ok, doc=doc, seal=sealed.seal, chains=chains, refs=refs,
-                        notes=notes, nodes=nodes, exported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
-    return Response(render_html(data, doc), media_type="text/html; charset=utf-8", headers={
+                        notes=notes, nodes=nodes, exported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        ledger=ledger)
+    page = render_html(data, doc)
+    await record_export(run_id, "html", report_node=chosen.node_id, doc_artifact=chosen.doc_artifact)
+    return Response(page, media_type="text/html; charset=utf-8", headers={
         "Content-Disposition": content_disposition(attachment_name(info), run_id=run_id),
         # 导出的是这一刻的报告和出处，不该被哪一层缓存下来、换给下一个请求
         "Cache-Control": "no-store",
     })
+
+
+async def record_export(run_id: str, fmt: str, **data: Any) -> None:
+    """导出了一份报告（报告导出 html、可验证报告 bundle）：记一条审计 report.exported（subject 是这次运行），谁导出、导出的
+    哪份报告文档。召回（口径升版后追回已交付的答案）据此找得到导出人。审计写不进去只记日志，不挡下载。"""
+    from app.auth.audit import record
+
+    try:
+        async with SessionLocal() as session:
+            await record(session, "report.exported", "run", run_id,
+                         data={"format": fmt, **{k: v for k, v in data.items() if v is not None}})
+            await session.commit()
+    except Exception:  # noqa: BLE001 - 留痕失败不挡下载，但要看得见
+        logger.exception("运行 %s 的报告导出审计没有写进去", run_id)
 
 
 #: R14 之后（绑定快照、取引擎、编译核对、回查、行级核对）会抛的三类异常，按 _snapshot_failure 的顺序映射

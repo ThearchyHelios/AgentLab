@@ -14,7 +14,8 @@ import { DeleteButton, EmptyState, ErrorState, Notice, Skeleton, Spinner, confir
 import { useLeaveGuard } from '../../lib/leave'
 import { formatDateTime, formatNumber, formatTime } from '../../lib/format'
 import {
-  CATALOG_ASSISTANT_TEXT as AT, CATALOG_CARDINALITY_LABEL, CATALOG_DRAFT_TEXT as DT, CATALOG_IMPACT_TEXT, CATALOG_KIND_HINT, CATALOG_KIND_LABEL,
+  CATALOG_ABSENT_TEXT, CATALOG_ASSISTANT_TEXT as AT, CATALOG_CARDINALITY_LABEL, CATALOG_DRAFT_TEXT as DT, CATALOG_IMPACT_TEXT,
+  CATALOG_KIND_HINT, CATALOG_KIND_LABEL,
   CATALOG_REVIEW_TEXT as RT, CATALOG_TABLE_FIELD_HINT, CATALOG_TABLE_FIELD_LABEL, CATALOG_TEXT as CT, CATALOG_UI_TEXT as UT,
   CATALOG_USAGE_TEXT, CODES_TEXT as KT, PROFILE_TEXT as PT,
 } from '../../lib/terms'
@@ -560,7 +561,10 @@ export function TableDetail({
             </Notice>
           )}
           {!detail.in_schema && (
-            <Notice tone="warn" attr={{ 'data-catalog-missing': '' }}>{CT.missingBody}</Notice>
+            // 为什么不在：服务端给的原因分开说，只有真删除才说「表已不在」；老服务端不给原因时照旧
+            <Notice tone="warn" attr={{ 'data-catalog-missing': detail.absent_reason ?? '' }}>
+              {(detail.absent_reason && CATALOG_ABSENT_TEXT.body[detail.absent_reason]) || CT.missingBody}
+            </Notice>
           )}
           {detail.system_notes && <SystemNotesNotice />}
           {edit && <Notice tone="info">{CT.editHint}。{CT.clearHint}。</Notice>}

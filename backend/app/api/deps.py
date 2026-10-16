@@ -3,7 +3,8 @@
 登录方式三种：off（默认，今天的行为）、local、oidc。各接口不直接碰请求头或会话，只问这里：
 - actor_of(header)：记在各「人」列上的名字。关登录时照旧解码 X-Actor（自报署名）；开了登录返回认证过的
   用户名，请求头一律不看——这样各接口的签名一个都不用改；
-- current_principal()：完整身份（用户名、角色、组、是否认证过、登录方式），中间件按请求写进 contextvar；
+- current_principal()：完整身份（用户名、角色、组、是否认证过、登录方式、经什么认出来的），中间件按请求写进 contextvar。
+  访问密钥认出来的身份（via=key）一律按使用者算，另带这把密钥的 scope 和限定的应用（auth/keys.py）；
 - require_role(role)：挂在 main.py 的 include_router(..., dependencies=[...]) 上的路由级依赖；
 - can_read_run / can_read_artifact：运行、工件的读权限（user 角色只能读有授权的应用视图运行、自己参与的实例）；
 - ensure_role / ensure_can_publish：接口内部按请求内容判定的权限（MCP 的 stdio、受管级发布、版本退役，Q8）；
@@ -52,6 +53,15 @@ class Principal:
     groups: tuple[str, ...] = field(default_factory=tuple)
     verified: bool = False
     mode: str = "off"
+    #: 经什么认出来的（docs/design/next-round/04-对外集成与触达.md A2）：off 关登录的自报署名；session 会话 cookie（开登录时
+    #: 匿名也是这一种：没认出会话）；key 访问密钥；hook 入站钩子的签名；share 分享链接（第 3 波）
+    via: str = "session"
+    #: 按访问密钥认出来的（via=key）：哪一把、叫什么、带哪些 scope、限定在哪些应用（None 是不限应用）。别的认法都是空的。
+    #: 权限封顶在使用者（A3，auth/keys.principal_for_key）：role 一律是 user，这几项只在门禁（auth/keys.key_gate）里再收窄
+    key_id: str | None = None
+    key_name: str | None = None
+    scopes: frozenset[str] = field(default_factory=frozenset)
+    app_ids: tuple[str, ...] | None = None
 
     def at_least(self, role: str) -> bool:
         return ROLE_RANK.get(self.role, 0) >= ROLE_RANK.get(role, 99)
@@ -122,7 +132,7 @@ def current_principal() -> Principal:
     principal = _principal.get()
     if principal is not None:
         return principal
-    return Principal(username=None, role="admin", verified=False, mode="off")
+    return Principal(username=None, role="admin", verified=False, mode="off", via="off")
 
 
 def actor_verified() -> bool:

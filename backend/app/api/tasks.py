@@ -62,13 +62,43 @@ async def list_tasks(
     statuses = None if status == "all" else _csv(status) or ["pending"]
     items = await task_service.list_tasks(principal, assigned=assigned, statuses=statuses, app_id=app_id,
                                           run_id=run_id, limit=limit)
-    return {"items": items}
+    return {"items": await _for_key(principal, items)}
+
+
+async def _for_key(principal: Any, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """访问密钥（04 细案 A2）：个人应用、只给拥有者的运行（个人应用的刷新、蓝图试运行）里的待办不列；限定了应用的只列那几个
+    应用里的（不属于应用的待办也不列）。不是密钥认出来的原样交回。"""
+    if getattr(principal, "via", None) != "key":
+        return items
+    from sqlalchemy import select
+
+    from app.auth.access import PRIVATE_ORIGINS
+    from app.db.base import SessionLocal
+    from app.db.models import App, Run
+
+    app_ids = {i.get("app_id") for i in items if i.get("app_id")}
+    run_ids = {i.get("run_id") for i in items if i.get("run_id")}
+    async with SessionLocal() as session:
+        personal = set((await session.execute(select(App.id).where(App.id.in_(app_ids or {""}),
+                                                                   App.scope == "personal"))).scalars())
+        private = set((await session.execute(select(Run.id).where(
+            Run.id.in_(run_ids or {""}), Run.origin_kind.in_(PRIVATE_ORIGINS)))).scalars())
+    return [i for i in items if i.get("app_id") not in personal and i.get("run_id") not in private
+            and (principal.app_ids is None or i.get("app_id") in principal.app_ids)]
 
 
 @router.get("/count")
 async def count_tasks(mine: int = 1, x_actor: str | None = Header(default=None)) -> dict[str, Any]:
-    """导航徽标：派给我的、待处理的待办数，按来源分开（apps：应用里的；other：画布、定时任务的审批）；latest 是最新一条的开出时间。"""
-    return await task_service.count(principal_of(x_actor))
+    """导航徽标：派给我的、待处理的待办数，按来源分开（apps：应用里的；other：画布、定时任务的审批）；latest 是最新一条的开出时间。
+
+    访问密钥按它碰得到的那几条数（同列表的 _for_key），不另写一份计数的口径。"""
+    principal = principal_of(x_actor)
+    if getattr(principal, "via", None) != "key":
+        return await task_service.count(principal)
+    items = await _for_key(principal, await task_service.list_tasks(principal, statuses=["pending"], limit=500))
+    stamps = [i.get("created_at") for i in items if i.get("created_at")]
+    apps = sum(1 for i in items if i.get("app_id"))
+    return {"mine": len(items), "apps": apps, "other": len(items) - apps, "latest": max(stamps) if stamps else None}
 
 
 @router.get("/{task_id}")

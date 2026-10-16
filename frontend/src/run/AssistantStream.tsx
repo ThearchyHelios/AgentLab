@@ -191,7 +191,7 @@ export function AssistantStream({
   empty?: ReactNode
   /** 这一轮要不要插审批卡——插槽而不是内建，因为不同页面接流的方式不同 */
   approvalsFor?: (turn: StreamTurn) => ReactNode
-  onOpenGraph?: (graph: any, question?: string) => void
+  onOpenGraph?: (graph: any, question?: string, turnId?: string) => void
   footer?: ReactNode
   /** 每一轮结束之后的动作槽：重试、接着跑、让 Copilot 再修……由页面决定放什么 */
   renderTurnActions?: (turn: StreamTurn, index: number) => ReactNode
@@ -443,7 +443,7 @@ function flash(el: HTMLElement, kind: 'failed' | 'focus'): () => void {
 
 function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
   turn: StreamTurn; last: boolean; approvals?: ReactNode
-  onOpenGraph?: (graph: any, question?: string) => void
+  onOpenGraph?: (graph: any, question?: string, turnId?: string) => void
   onFollowUp?: (text: string) => void
 }) {
   const { dense } = useContext(Ctx)
@@ -551,7 +551,7 @@ function TurnCard({ turn, last, approvals, onOpenGraph, onFollowUp }: {
 
           {!!turn.graph?.nodes?.length && (
             <GraphPeek graph={turn.graph} note={turn.graphNote}
-                       onOpen={onOpenGraph && ((g) => onOpenGraph(g, turn.question))} />
+                       onOpen={onOpenGraph && ((g) => onOpenGraph(g, turn.question, turn.id))} />
           )}
         </div>
       </div>

@@ -2,7 +2,8 @@ import type {
   ActivateSnapshotBody, ActivateSnapshotOut, AiPreview, CatalogAssistantEvent, CatalogAssistantRequest, CatalogDetail, CatalogDraftJob,
   CatalogImpact, CatalogImportReport, CatalogList, CatalogNotes, CatalogPatchPreview, CatalogPatchSubmit, CatalogProfileJob, CatalogProfileTaskDetail,
   CatalogReviewAction, CatalogReviewBatchItem, CatalogReviewBatchResult, CatalogReviewKind, CatalogReviewProgress, CatalogReviewQueue,
-  CatalogTableUsage, CommitOut, CurrentRecipe, EditPreview,
+  CatalogScopeAdd, CatalogSearch, CatalogTableUsage, CommitOut, CurrentRecipe, EditPreview, IntrospectJob, IntrospectScope,
+  IntrospectScopeRules,
   EditRequest, ImportRecord,
   ManifestOut, PurgeRawBody, PurgeRawOut, QuestionAnswer, Recipe, RedraftRulesOut, RemovePeriodBody, RemovePeriodOut,
   RevokeAcceptanceBody, RevokeAcceptanceOut, SnapshotOut, Staging,
@@ -28,6 +29,7 @@ import { reportExport } from './reportExport'
 import { apps, ledger } from './apps'
 import { actions, tasks } from './tasks'
 import { auth, identity } from './auth'
+import { accessKeys } from './accessKeys'
 import { capabilities, endpoints, notify } from './capabilities'
 // 普通用户建应用（typesBlueprint.ts 是接口约定）
 import { blueprints, files, personal, templates } from './blueprints'
@@ -132,18 +134,32 @@ export interface ProviderDraft {
   extra?: Record<string, any>
 }
 
-/** 探查结构的预览（dry_run）：只看不存，缓存和同步时间都没动 */
+/**
+ * 探查结构的预览（dry_run）：只看不存，表结构缓存和同步时间都没动。配置里的那个 schema 刷新了对象索引（stored），别的 schema
+ * 只看不存；table_count 是对象索引里的对象数，scope 是按探查范围的规则数的命中
+ */
 export interface IntrospectPreview {
   dry_run: true
   /** 这次探的是哪个 schema，'' 是默认 schema */
   schema: string
   table_count: number
-  /** 带 schema 前缀的对象全名，最多 200 个 */
+  /** 带 schema 前缀的对象全名，最多 200 个（举例用） */
   tables: string[]
   truncated: boolean
   total: number
   schema_error: string
   available_schemas: string[]
+  /** 老服务端没有下面几项 */
+  stored?: boolean
+  scope?: { hits: number; cap: number; in_scope: number; out_of_scope: number; over: boolean } & Record<string, number | boolean>
+  index_method?: string
+  index_capped?: boolean
+}
+
+/** 探查结构（后台任务）的回执、任务进度、停止：任务和数据源此刻的样子 */
+export interface IntrospectOut {
+  job: IntrospectJob
+  source: DataSource
 }
 
 /** 一张表的结构化列信息（和给模型看的 detail 文本出自同一份缓存） */
@@ -225,8 +241,14 @@ export const api = {
   workflows: {
     list: (opts?: RequestOptions) => get<Workflow[]>('/workflows', opts),
     get: (id: string) => get<Workflow>(`/workflows/${id}`),
-    create: (body: { name: string; description?: string; graph?: GraphSpec; tags?: string[] }) =>
-      post<Workflow>('/workflows', body),
+    /**
+     * origin：新工作流出自哪次运行、哪段对话、哪一轮（问数据的「在画布里打开」带上，next-round 02 做法 9）。服务端核对运行
+     * 读得到、对话用得了、这一轮属于这段对话，对不上回 422（workflow_origin_invalid）
+     */
+    create: (body: {
+      name: string; description?: string; graph?: GraphSpec; tags?: string[]
+      origin?: { run_id: string; conversation_id?: string; turn_id?: string }
+    }) => post<Workflow>('/workflows', body),
     update: (id: string, body: Partial<Workflow> & { note?: string }) =>
       patch<Workflow>(`/workflows/${id}`, body),
     remove: (id: string) => del(`/workflows/${id}`),
@@ -299,8 +321,28 @@ export const api = {
         ? upload<UploadResult>('/datasources/upload', form, opts)
         : request<UploadResult>('/datasources/upload', { method: 'POST', body: form, signal: opts?.signal })
     },
-    introspect: (id: string, schema?: string) =>
-      post<any>(`/datasources/${id}/introspect${schema ? `?schema=${encodeURIComponent(schema)}` : ''}`, {}),
+    /**
+     * 探查结构：后台任务（202，回 {job, source}）。规则命中超过上限 409 scope_too_large（带 hits、cap）；同源已有探查任务
+     * 409 introspect_busy；对象清单都拿不到 400 introspect_failed（失败照实记进了表结构缓存）。真探查只按配置里的 schema
+     */
+    introspect: (id: string) => post<IntrospectOut>(`/datasources/${encodeURIComponent(id)}/introspect`, {}),
+    introspectJob: (id: string, jobId: string, opts?: RequestOptions) =>
+      get<IntrospectOut>(`/datasources/${encodeURIComponent(id)}/introspect-jobs/${encodeURIComponent(jobId)}`, opts),
+    activeIntrospectJob: (id: string, opts?: RequestOptions) =>
+      get<{ job: IntrospectJob | null }>(`/datasources/${encodeURIComponent(id)}/introspect-jobs/active`, opts),
+    /** 停止探查：排队的直接停，进行中的停在当前这一批之后，读完的表照常更新进表结构。已经结束的 409 introspect_finished */
+    cancelIntrospect: (id: string, jobId: string) =>
+      post<IntrospectOut>(`/datasources/${encodeURIComponent(id)}/introspect-jobs/${encodeURIComponent(jobId)}/cancel`, {}),
+    /** 探查范围：规则、命中数（对着存着的对象索引数，不连库）、一律在范围内的表、按需加入的留痕 */
+    introspectScope: (id: string, opts?: RequestOptions) =>
+      get<IntrospectScope>(`/datasources/${encodeURIComponent(id)}/introspect-scope`, opts),
+    /** 按改了一半的规则数命中（不存、不连库） */
+    previewIntrospectScope: (id: string, scope: IntrospectScopeRules, opts?: RequestOptions) =>
+      request<IntrospectScope>(`/datasources/${encodeURIComponent(id)}/introspect-scope/preview`,
+        { method: 'POST', body: JSON.stringify({ scope }), signal: opts?.signal }),
+    /** 保存探查范围的规则：下一次探查时生效。规则不合规 422 scope_invalid */
+    saveIntrospectScope: (id: string, scope: IntrospectScopeRules) =>
+      put<IntrospectScope>(`/datasources/${encodeURIComponent(id)}/introspect-scope`, { scope }),
     /** 换个 schema 看看：只返回探到的结果，不覆盖缓存（Copilot 看到的还是原来那份） */
     previewSchema: (id: string, schema?: string) =>
       post<IntrospectPreview>(`/datasources/${id}/introspect${qs({ schema, dry_run: 'true' })}`, {}),
@@ -466,6 +508,11 @@ export const api = {
     /** 存数据源的起草要求（去首尾空白，最多 2000 字，空串清除）。上传表格建的源存在它自己的数据源上 */
     putGuidance: (sourceId: string, guidance: string) =>
       put<{ guidance: string | null }>(`${catalogBase(sourceId)}/guidance`, { guidance }),
+    /** 在对象索引里按名字、注释找表（含探查范围外的）；清单只列范围内的，范围外的靠它找到再加入 */
+    search: (sourceId: string, q: string, opts?: RequestOptions) =>
+      get<CatalogSearch>(`${catalogBase(sourceId)}/search${qs({ q, limit: 50 })}`, opts),
+    /** 把范围外的表加进探查范围：当场读结构，并记进探查范围的「显式列出」 */
+    addToScope: (sourceId: string, tables: string[]) => post<CatalogScopeAdd>(`${catalogBase(sourceId)}/scope/add`, { tables }),
     /**
      * 剖析任务（后台进行：逐表对业务库发只读查询，一条一条发，每张表一结束就写进目录）。剖析会对业务库发查询，默认关闭，
      * 按数据源开启。和同一个数据源的起草任务按建立顺序排队（起草在排队、进行中时剖析建成 queued、waiting_for 为 draft）
@@ -582,6 +629,11 @@ export const api = {
       run_class?: 'formal' | 'exploratory'; version?: number
       /** 运行来源（X3）：客户端只能声明 chat、canvas、launcher、api（不传按 api 记），其余由服务端写 */
       origin?: 'chat' | 'canvas' | 'launcher' | 'api'
+      /**
+       * 问数据的运行属于哪段对话、哪一轮（只在 origin 是 chat 时收，next-round 02 做法 9）：服务端核对后写进运行来源、在封存
+       * 范围内。对话、轮次对不上回 422（origin_ref_invalid）
+       */
+      origin_ref?: { conversation_id: string; turn_id: string }
     }) => post<Run>('/runs', body),
     artifacts: (id: string) => get<any[]>(`/runs/${id}/artifacts`),
     /** 从失败的节点接着跑。graph 只能带改过配置的同一张图，结构必须一致 */
@@ -907,6 +959,8 @@ export const api = {
   actions,
   auth,
   identity,
+  // 访问密钥与服务账号（下一轮第 2 波）
+  accessKeys,
   capabilities,
   endpoints,
   notify,

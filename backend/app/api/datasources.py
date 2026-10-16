@@ -17,14 +17,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
-from app.api.coded import PROFILE_SETTINGS_INVALID, CodedHTTPException
-from app.api.deps import signer_of, signer_verified
+from app.api.coded import (
+    INTROSPECT_BUSY, INTROSPECT_FAILED, INTROSPECT_FINISHED, PROFILE_SETTINGS_INVALID, SCOPE_INVALID, SCOPE_TOO_LARGE,
+    CodedHTTPException,
+)
+from app.api.deps import actor_of, signer_of, signer_verified
 from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
 from app.data import catalog as data_catalog
 from app.data.catalog_profile import profile_settings_rejection, without_legacy
 from app.data import introspect as introspect_mod
+from app.data import introspect_jobs, source_objects
 from app.data import table_versions
 from app.data.engine import (
     CATALOG_DRAFT_GUIDANCE_OPTION, MASK_COLUMNS_OPTION, MAX_QUERY_TIMEOUT_S, QUERY_TIMEOUT_OPTION, SUPPORTED_KINDS,
@@ -113,6 +117,12 @@ class DataSourceOut(BaseModel):
     current_recipe: dict[str, Any] | None = None
     #: 这个源最近一个未结束的导入暂存区：{id, kind, status, created_at}
     open_staging: dict[str, Any] | None = None
+    #: 探查范围的摘要（schema_cache 的 scope：in_scope、reflected、failed、out_of_scope、cap、index_total、各原因几张）；
+    #: 升级前探查的源、上传表格没有，为 None
+    schema_scope: dict[str, Any] | None = None
+    #: 最近一个探查任务（进行中、排队中的，或者最近结束的那个）：{id, status, total, done, failed, cancelled, waiting_for,
+    #: finished_at, error}；没探查过（或者是升级前同步探查的）为 None
+    introspect_job: dict[str, Any] | None = None
 
 
 def _cached_schema(cache: dict[str, Any]) -> str | None:
@@ -130,7 +140,8 @@ def _import_mode(row: DataSource) -> str | None:
 #: options 里由别的接口维护的项：数据源表单不显示、不提交它们，整份回写 options 时原样留着（同模型接入 extra 里的
 #: last_check）。数据目录的起草要求只经 PUT /catalog/guidance 改（api/catalog.py）：表单把认不得的项放进「高级参数」
 #: 的单行输入框，多行的要求会被压成一行
-_MANAGED_OPTIONS = (CATALOG_DRAFT_GUIDANCE_OPTION,)
+#: 探查范围（introspect_scope）同理：只经 PUT /introspect-scope 改，表单整份回写 options 时原样留着
+_MANAGED_OPTIONS = (CATALOG_DRAFT_GUIDANCE_OPTION, source_objects.SCOPE_OPTION)
 
 
 def _shown_options(options: dict[str, Any] | None) -> dict[str, Any]:
@@ -144,11 +155,13 @@ def _with_managed(options: dict[str, Any], saved: dict[str, Any] | None) -> dict
 
 
 def _to_out(row: DataSource, snapshot: dict[str, Any] | None = None,
-            recipe_info: dict[str, Any] | None = None) -> DataSourceOut:
+            recipe_info: dict[str, Any] | None = None, job: dict[str, Any] | None = None) -> DataSourceOut:
     cache = row.schema_cache or {}
     tables = cache.get("tables") or {}
     recipe_info = recipe_info or {}
     return DataSourceOut(
+        schema_scope=dict(cache["scope"]) if isinstance(cache.get("scope"), dict) else None,
+        introspect_job=job,
         origin=row.origin or "manual", current_snapshot=snapshot,
         import_mode=_import_mode(row), current_recipe=recipe_info.get("current_recipe"),
         open_staging=recipe_info.get("open_staging"),
@@ -277,7 +290,8 @@ async def _recipe_infos(session: AsyncSession, rows: list[DataSource]) -> dict[s
 
 async def _out(session: AsyncSession, row: DataSource) -> DataSourceOut:
     return _to_out(row, (await _snapshot_infos(session, [row])).get(row.id),
-                   (await _recipe_infos(session, [row])).get(row.id))
+                   (await _recipe_infos(session, [row])).get(row.id),
+                   await introspect_jobs.job_brief(session, await introspect_jobs.latest_job(session, row.id)))
 
 
 #: 上传源上由系统维护的字段：连接一律从快照解析，database 只作显示
@@ -356,7 +370,8 @@ async def list_sources(session: AsyncSession = Depends(get_session)) -> list[Dat
     rows = list((await session.execute(select(DataSource).order_by(DataSource.name))).scalars())
     snaps = await _snapshot_infos(session, rows)
     recipes = await _recipe_infos(session, rows)
-    return [_to_out(r, snaps.get(r.id), recipes.get(r.id)) for r in rows]
+    jobs = await introspect_jobs.latest_briefs(session, [r.id for r in rows if not _is_upload(r) and not _is_records(r)])
+    return [_to_out(r, snaps.get(r.id), recipes.get(r.id), jobs.get(r.id)) for r in rows]
 
 
 #: 每种库都有的「查询时限」。数据库按它自己停下语句，不只是后端不再等
@@ -805,64 +820,238 @@ async def _test_saved(session: AsyncSession, row: DataSource) -> dict[str, Any]:
 
 
 class IntrospectPreview(BaseModel):
-    """只看不存的探查结果。缓存、同步时间都没动。"""
+    """只看不存的探查结果（dry_run）：刷新对象索引（配置里的 schema）或者只看（别的 schema），按探查范围的规则数命中。
+    不反射、不动表结构缓存和同步时间。"""
 
     dry_run: bool = True
     #: 这次探的是哪个 schema，"" 是默认 schema
     schema_: str = Field(default="", serialization_alias="schema")
+    #: 对象索引里有几个对象（表和视图）
     table_count: int = 0
-    #: 带 schema 前缀的对象全名，最多 200 个（和真探查的上限一样）
+    #: 带 schema 前缀的对象全名，最多 200 个（举例用；全部的在对象索引里）
     tables: list[str] = Field(default_factory=list)
+    #: 对象多于上面列出的
     truncated: bool = False
     total: int = 0
     schema_error: str = ""
     available_schemas: list[str] = Field(default_factory=list)
+    #: 配置里的那个 schema：对象索引存下来了（别的 schema 只看不存）
+    stored: bool = False
+    #: 按探查范围的规则数的命中（source_objects.ScopePlan.summary：hits、cap、in_scope、pinned、rule、explicit、on_demand、
+    #: out_of_scope、index_total）；over 是超没超上限
+    scope: dict[str, Any] = Field(default_factory=dict)
+    #: 对象清单是怎么拿的：dictionary 字典查询 / inspector 退回 Inspector（没有注释）；capped 超过了对象索引的上限
+    index_method: str = ""
+    index_capped: bool = False
 
 
-@router.post("/{source_id}/introspect", response_model=DataSourceOut | IntrospectPreview)
+#: 预览时举例列出的对象最多几个
+_PREVIEW_NAMES = 200
+
+
+def _preview_response(preview: IntrospectPreview) -> JSONResponse:
+    """dry_run 是同步的只看不存：200（真探查才是 202 建任务）。"""
+    return JSONResponse(status_code=200, content=preview.model_dump(by_alias=True, mode="json"))
+
+
+def _explained(e: BaseException, row: DataSource) -> str:
+    reason, hint = _explain_connect(e, (row.kind or "").lower())
+    return f"探查表结构失败：{reason}" + (f"。{hint}" if hint else "")
+
+
+def _introspect_refusal(row: DataSource) -> None:
+    if _is_upload(row):
+        raise HTTPException(409, introspect_jobs.UPLOAD_REFUSED)
+    if _is_records(row):
+        raise HTTPException(409, introspect_jobs.RECORDS_REFUSED)
+
+
+def _too_large(e: introspect_jobs.ScopeTooLarge) -> CodedHTTPException:
+    plan = e.plan
+    return CodedHTTPException(409, str(e), SCOPE_TOO_LARGE, extra={
+        "hits": plan.capped_count, "cap": plan.cap, "pinned": plan.counts.get("pinned", 0),
+        "in_scope": len(plan.in_scope), "index_total": plan.index_total})
+
+
+@router.post("/{source_id}/introspect", status_code=202, response_model=None)
 async def introspect_source(
     source_id: str,
     schema: str | None = None,
-    dry_run: bool = Query(default=False, description="只返回探到的结构，不写缓存"),
+    dry_run: bool = Query(default=False, description="只刷新对象索引、数命中，不反射、不写表结构缓存"),
+    x_actor: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
-) -> DataSourceOut | IntrospectPreview:
-    """探查结构并缓存。显式动作，不做后台轮询——生产库不该被实验工具定时扫。
+) -> Any:
+    """探查结构：后台任务（202，返回 {job, source}；进度读 GET /introspect-jobs/{job_id}）。
 
-    dry_run=true 只看不存：「换个 schema 看看」以前一探就把缓存换掉，用户随后
-    选了「不改」，助手此刻看到的也已经是另一套表了。
+    请求里先刷新对象索引（一条字典查询）、按探查范围的规则圈表、核上限：规则命中超过上限 409 scope_too_large（带命中数，
+    不建任务、不截断）；同源已有排队或进行中的探查任务 409 introspect_busy；对象清单都拿不到 400 introspect_failed（失败
+    照实记进表结构缓存，卡片上看得到原因和能选的 schema）。任务在后台按批只读反射，和同源的起草、剖析排同一条队。
 
-    上传的表格不探查：结构在发布那一刻随快照冻结，重新探查只会让缓存和快照对不上。
+    dry_run=true 只看不存（同步，200）：配置里的 schema 刷新对象索引、返回命中数；schema 写了别的时只看那个 schema 里有
+    什么，对象索引、表结构缓存、配置都不动（「换个 schema 看看」）。
+
+    上传的表格不探查：结构在发布那一刻随快照冻结，重新探查只会让缓存和快照对不上。一个数据源一个 schema（目录-D2）：
+    真探查只按配置里的 schema，要换 schema 先改数据源设置。
     """
     row = await _get_or_404(session, source_id)
-    if _is_upload(row):
-        raise HTTPException(409, "上传的表格无需重新探查，重新上传即可更新")
-    if _is_records(row):
-        raise HTTPException(409, "记录表的结构由应用的表单维护，无需重新探查")
-    try:
-        cache = await introspect_mod.introspect(row, schema=schema)
-    except Exception as e:  # noqa: BLE001
-        reason, hint = _explain_connect(e, (row.kind or "").lower())
-        raise HTTPException(400, f"探查表结构失败：{reason}" + (f"。{hint}" if hint else "")) from e
+    _introspect_refusal(row)
     if dry_run:
-        tables = cache.get("tables") or {}
-        return IntrospectPreview(
-            schema_=str(cache.get("schema") or ""),
-            table_count=len(tables),
-            tables=[m.get("qualified", n) for n, m in tables.items()],
-            truncated=bool(cache.get("truncated")),
-            total=int(cache.get("total") or 0),
-            schema_error=str(cache.get("error") or "") if cache.get("failed") else "",
-            available_schemas=list(cache.get("available_schemas") or []),
-        )
-    row.schema_cache = cache
-    # 失败也要把缓存存下来——里面的 available_schemas 正是下一步的线索——
-    # 但**不能盖上"已同步"的戳**。以前盖了，于是界面显示同步过、工具却说
-    # "还没探查过"，两边都不说真话（run 554a0f92）
-    if not row.schema_cache.get("failed"):
-        row.schema_synced_at = datetime.now(timezone.utc)
+        try:
+            got = await introspect_jobs.preview(session, row, schema=schema)
+        except introspect_jobs.IntrospectFailed as e:
+            return _preview_response(IntrospectPreview(
+                schema_=schema or str(source_objects.index_schema(row)), schema_error=str(e),
+                available_schemas=await introspect_mod.list_schemas(row)))
+        names = got["objects"]
+        prefix = got["schema"]
+        return _preview_response(IntrospectPreview(
+            schema_=prefix, table_count=len(names), total=got["index_total"],
+            tables=[f"{prefix}.{n}" if prefix else n for n in names[:_PREVIEW_NAMES]],
+            truncated=len(names) > _PREVIEW_NAMES, stored=bool(got.get("stored")),
+            scope={**got["scope"], "over": got["scope"]["hits"] > got["scope"]["cap"]},
+            index_method=got["index_method"], index_capped=bool(got["index_capped"]),
+            available_schemas=[] if names else await introspect_mod.list_schemas(row),
+        ))
+    if schema and schema.strip() and schema.strip() != source_objects.index_schema(row):
+        raise HTTPException(422, "一个数据源只探查配置里的那个 schema。要换 schema，请先在数据源设置里改「schema」，"
+                                 "或者用「预览其他 schema」只看不存")
+    try:
+        job, _n = await introspect_jobs.prepare(session, row, actor=actor_of(x_actor))
+    except introspect_jobs.IntrospectBusy as e:
+        raise CodedHTTPException(409, str(e), INTROSPECT_BUSY) from e
+    except introspect_jobs.ScopeTooLarge as e:
+        raise _too_large(e) from e
+    except introspect_jobs.IntrospectFailed as e:
+        raise CodedHTTPException(400, _explained(e.cause, row), INTROSPECT_FAILED) from e
+    introspect_jobs.manager.start(job.id)
+    await session.refresh(row)
+    return JSONResponse(status_code=202, content=jsonable_encoder({
+        "job": await introspect_jobs.job_out(session, job), "source": (await _out(session, row)).model_dump()}))
+
+
+async def _job_or_404(session: AsyncSession, source_id: str, job_id: str) -> Any:
+    job = await introspect_jobs.load(session, source_id, job_id)
+    if job is None:
+        raise HTTPException(404, "探查任务不存在，可能已被清理")
+    return job
+
+
+@router.get("/{source_id}/introspect-jobs/active")
+async def active_introspect_job(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """排队或进行中的探查任务；没有是 {job: null}。"""
+    await _get_or_404(session, source_id)
+    return {"job": await introspect_jobs.job_out(session, await introspect_jobs.active_job(session, source_id))}
+
+
+@router.get("/{source_id}/introspect-jobs/latest")
+async def latest_introspect_job(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """最近建的探查任务（任何状态）；没有是 {job: null}。"""
+    await _get_or_404(session, source_id)
+    return {"job": await introspect_jobs.job_out(session, await introspect_jobs.latest_job(session, source_id))}
+
+
+@router.get("/{source_id}/introspect-jobs/{job_id}")
+async def get_introspect_job(source_id: str, job_id: str,
+                             session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """一个探查任务（进度、读不到的表）和数据源此刻的样子（结束了以后卡片据此换上新的表数）。"""
+    row = await _get_or_404(session, source_id)
+    job = await _job_or_404(session, source_id, job_id)
+    return {"job": await introspect_jobs.job_out(session, job), "source": (await _out(session, row)).model_dump()}
+
+
+@router.post("/{source_id}/introspect-jobs/{job_id}/cancel")
+async def cancel_introspect_job(source_id: str, job_id: str,
+                                session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """停止探查：排队的直接停；进行中的停在当前这一批之后，读完的表照常更新进表结构。已经结束的 409 introspect_finished。"""
+    await _get_or_404(session, source_id)
+    job = await _job_or_404(session, source_id, job_id)
+    try:
+        await introspect_jobs.cancel(session, job)
+    except introspect_jobs.IntrospectFinished as e:
+        raise CodedHTTPException(409, str(e), INTROSPECT_FINISHED) from e
+    session.expire_all()
+    row = await _get_or_404(session, source_id)
+    job = await _job_or_404(session, source_id, job_id)
+    return {"job": await introspect_jobs.job_out(session, job), "source": (await _out(session, row)).model_dump()}
+
+
+# --------------------------------------------------------------------------
+# 探查范围
+# --------------------------------------------------------------------------
+
+
+class ScopeIn(BaseModel):
+    #: {mode, include, exclude, tables, removed, views, max_tables}（source_objects.ScopeRules）。手工读成 dict 核对：说法要
+    #: 是中文的一句话（rules_problem）
+    scope: dict[str, Any]
+
+
+async def _scope_out(session: AsyncSession, row: DataSource, rules: source_objects.ScopeRules | None = None,
+                     ) -> dict[str, Any]:
+    """探查范围面板要的：规则、缺省和上限、按规则对着存着的对象索引数的命中、对象索引的情况、pinned 几张（举几个例子）、
+    按需加入的表和留痕。没有对象索引的源（升级前探查的、还没探查过的）命中是 null：先「刷新对象索引」或探查一次。"""
+    stored = source_objects.ScopeRules.from_options(row.options)
+    rules = rules or stored
+    schema = source_objects.index_schema(row)
+    indexed = await source_objects.has_index(session, row.id, schema)
+    preview: dict[str, Any] | None = None
+    pinned: list[str] = []
+    if indexed:
+        plan = await source_objects.plan_for(session, row, rules)
+        preview = {**plan.summary(), "over": plan.over}
+        pinned = [n for n, r in plan.in_scope.items() if r == "pinned"][:20]
+    cache = row.schema_cache or {}
+    scope = cache.get("scope") if isinstance(cache.get("scope"), dict) else {}
+    return {
+        "scope": stored.to_dict(),
+        "defaults": {"max_tables": source_objects.SCOPE_DEFAULT, "max_limit": source_objects.SCOPE_MAX,
+                     "index_limit": source_objects.INDEX_LIMIT, "rules_max": source_objects.RULES_MAX},
+        "preview": preview,
+        "index": {"ready": indexed, "schema": schema, "method": scope.get("index_method"),
+                  "capped": bool(scope.get("index_capped")), "at": scope.get("index_at"),
+                  "total": scope.get("index_total")},
+        "pinned_sample": pinned,
+        "on_demand": await source_objects.on_demand_list(session, row) if indexed else [],
+    }
+
+
+def _parse_rules(raw: Any) -> source_objects.ScopeRules:
+    if problem := source_objects.rules_problem(raw):
+        raise CodedHTTPException(422, problem, SCOPE_INVALID)
+    return source_objects.ScopeRules.from_dict(raw)
+
+
+@router.get("/{source_id}/introspect-scope")
+async def get_introspect_scope(source_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """探查范围：规则、命中数（对着存着的对象索引数，不连库）、pinned、按需加入的留痕。"""
+    row = await _get_or_404(session, source_id)
+    _introspect_refusal(row)
+    return await _scope_out(session, row)
+
+
+@router.post("/{source_id}/introspect-scope/preview")
+async def preview_introspect_scope(source_id: str, payload: ScopeIn,
+                                   session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """按交来的规则数命中（不存、不连库）：面板上边改边看命中多少张、超没超上限。"""
+    row = await _get_or_404(session, source_id)
+    _introspect_refusal(row)
+    return await _scope_out(session, row, _parse_rules(payload.scope))
+
+
+@router.put("/{source_id}/introspect-scope")
+async def put_introspect_scope(source_id: str, payload: ScopeIn, x_actor: str | None = Header(default=None),
+                               session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """保存探查范围的规则（记下谁、什么时候改的）。超上限也存得下：下次探查时会被拒绝并说出命中数，面板上提前看得到。
+    规则只在下一次探查时生效：已有的表结构不动。"""
+    row = await _get_or_404(session, source_id)
+    _introspect_refusal(row)
+    rules = _parse_rules(payload.scope)
+    rules.updated_by = actor_of(x_actor)
+    rules.updated_at = datetime.now(timezone.utc).isoformat()
+    row.options = {**(row.options or {}), source_objects.SCOPE_OPTION: rules.to_dict()}
     await session.commit()
     await session.refresh(row)
-    return _to_out(row)
+    return await _scope_out(session, row)
 
 
 @router.get("/{source_id}/schema")
@@ -881,10 +1070,19 @@ async def get_schema(source_id: str, table: str | None = None,
         # 和 db_schema 工具、助手查看同一个说法（schema_view.table_detail）：有数据目录的表，字段清单后面附上目录；
         # 遮罩列只给列名和类型
         entries = await data_catalog.read_catalog(session, found.id)
+        from app.data import catalog_profile_jobs
+
+        key = data_catalog.resolve_table_name(getattr(row, "schema_cache", None), table)
+        # 剖析事实（行数、日期范围）：四处同一段文字（next-round 遗留 e）
+        facts = await catalog_profile_jobs.last_facts(session, found.id, [key]) if key else {}
+        detail = schema_view.table_detail(row, table, catalog_notes={n: e.notes for n, e in entries.items()},
+                                          profile=facts)
+        if meta is None and (absent := await _absent_text(session, found, row, table)):
+            detail = absent
         return {
             "table": table,
             # 给模型看的那段文本；界面画表格用下面的结构化字段
-            "detail": schema_view.table_detail(row, table, catalog_notes={n: e.notes for n, e in entries.items()}),
+            "detail": detail,
             "found": meta is not None,
             "qualified": meta.get("qualified", table) if meta else None,
             "kind": ("view" if meta.get("is_view") else "table") if meta else None,
@@ -896,6 +1094,19 @@ async def get_schema(source_id: str, table: str | None = None,
         "summary": introspect_mod.summary(row),
         "synced_at": row.schema_synced_at.isoformat() if row.schema_synced_at else None,
     }
+
+
+async def _absent_text(session: AsyncSession, found: DataSource, row: Any, table: str) -> str | None:
+    """/schema?table= 点名的表不在表结构里：有对象索引的手工源说清是哪一种「不在」（表已不在、范围外、读不到结构）。"""
+    from app.data import schema_view
+
+    if _is_upload(found) or _is_records(found):
+        return None
+    reason = (await source_objects.absent_reasons(session, found, [table])).get(table)
+    if reason == source_objects.ABSENT_UNKNOWN or reason is None:
+        return None
+    error = ((row.schema_cache or {}).get("skipped") or {}).get(table)
+    return schema_view.absent_detail(row, table, reason, error=error)
 
 
 # --------------------------------------------------------------------------

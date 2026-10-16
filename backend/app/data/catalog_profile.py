@@ -969,15 +969,18 @@ class ProfileContext:
     #: 遮罩的列（小写）。遮罩按列名生效、不分大小写、不分表，和证据面板的比法一致
     masked: set[str]
     sizes: dict[str, TableSize] = field(default_factory=dict)
+    #: 对象索引里探查范围外的对象（name_key）：关系指向它们时说「在探查范围外」，不说「表结构里没有」
+    outside: frozenset[str] = frozenset()
 
 
-def make_context(source: Any, settings: ProfileSettings, *, options: dict[str, Any] | None) -> ProfileContext:
+def make_context(source: Any, settings: ProfileSettings, *, options: dict[str, Any] | None,
+                 outside: frozenset[str] = frozenset()) -> ProfileContext:
     """剖析任务的上下文。options 是数据源记录的 options（遮罩按它）；不支持的数据库类型抛 ValueError。"""
     dialect = SqlDialect(getattr(source, "kind", None))
     return ProfileContext(source=source, settings=settings, dialect=dialect,
                           runner=SourceRunner(source, settings, dialect),
                           tables=(getattr(source, "schema_cache", None) or {}).get("tables") or {},
-                          masked=masked_of(options))
+                          masked=masked_of(options), outside=outside)
 
 
 def masked_of(options: dict[str, Any] | None) -> set[str]:
@@ -1216,7 +1219,7 @@ async def _check_relation(cx: _TableCx, table: str, rel: dict[str, Any], out: _T
     """从子表取至多 sample_size 个不同的非空键值，去父表里数对上几个，得到覆盖率；再看父键、子键唯不唯一。"""
     # 两端在表结构里的写法；按规则不查的（多列、不在表结构里、指向视图、碰到遮罩列）plan_checks 已经列成跳过，这里再判
     # 一遍只是兜底
-    parent, col, pcol = _relation_ends(table, rel, cx.tables, cx.job.masked)
+    parent, col, pcol = _relation_ends(table, rel, cx.tables, cx.job.masked, cx.job.outside)
     meta, pmeta = cx.tables[table], cx.tables[parent]
 
     if rel.get("source") == "fk":
@@ -1677,15 +1680,25 @@ class PlannedCheck:
                 "detail": detail, "queries": 0}
 
 
-def _relation_ends(table: str, rel: dict[str, Any], tables: dict[str, Any], masked: set[str]) -> tuple[str, str, str]:
+#: 被指向的表在探查范围外（对象索引里有）：不是「表结构里没有」，重新探查也没用，要把它加进探查范围
+OUT_OF_SCOPE_PARENT = "被指向的表 {table} 在探查范围外，可以在数据源的「探查范围」里加入它（或在数据目录页搜索它、加入范围）"
+
+
+def _relation_ends(table: str, rel: dict[str, Any], tables: dict[str, Any], masked: set[str],
+                   outside: frozenset[str] | set[str] = frozenset()) -> tuple[str, str, str]:
     """一条关系两端在表结构里的写法：(被指向的表, 子表的列, 被指向的列)。按规则不查的抛 _Skip：多列组成的、表结构里
-    没有的表或列、被指向的是视图、两端有被遮罩的列（遮罩的列不出现在任何一条剖析查询里）。"""
+    没有的表或列、被指向的是视图、两端有被遮罩的列（遮罩的列不出现在任何一条剖析查询里）。outside 是对象索引里探查范围外
+    的对象（name_key）：被指向的表在里面时说「在探查范围外，可以加入范围」，不说「表结构里没有、请重新探查」。"""
+    from app.data.names import name_key
+
     cols, to_cols = list(rel.get("columns") or []), list(rel.get("to_columns") or [])
     to_table = str(rel.get("to_table") or "")
     if len(cols) != 1 or len(to_cols) != 1:
         raise _Skip("unsupported", "多列组成的关联关系暂不剖析")
     meta = tables[table]
     parent = to_table if to_table in tables else catalog.resolve_table_name({"tables": tables}, to_table)
+    if parent is None and outside and name_key(to_table.rsplit(".", 1)[-1]) in outside:
+        raise _Skip("out_of_scope", OUT_OF_SCOPE_PARENT.format(table=to_table))
     if parent is None:
         raise _Skip("missing", f"表结构里没有被指向的表 {to_table}，请先重新探查结构")
     pmeta = tables[parent]
@@ -1702,12 +1715,13 @@ def _relation_ends(table: str, rel: dict[str, Any], tables: dict[str, Any], mask
 
 
 def plan_checks(table: str, meta: dict[str, Any] | None, notes: dict[str, Any] | None, *, tables: dict[str, Any],
-                masked: set[str]) -> list[PlannedCheck]:
+                masked: set[str], outside: frozenset[str] | set[str] = frozenset()) -> list[PlannedCheck]:
     """这张表要做的检查，按价值排：关系、码值、日期。范围（profile_checks）、建任务时列出的检查项、执行时用的都是这一份：
     先列全再执行，中途停下时没做的每一项都要记下原因。视图、表结构里没有的表返回空列表。
 
     按规则不查的也列出来（带 skip）：被遮罩的码值列、日期列，多列的、两端不在表结构里的、指向视图的、碰到遮罩列的关系——
-    要让人看得见为什么它没有结论。masked 是遮罩的列（小写）。"""
+    要让人看得见为什么它没有结论。masked 是遮罩的列（小写）；outside 是对象索引里探查范围外的对象（name_key，见
+    _relation_ends）。"""
     if not isinstance(meta, dict) or meta.get("is_view"):
         return []
     notes = notes or {}
@@ -1715,7 +1729,7 @@ def plan_checks(table: str, meta: dict[str, Any] | None, notes: dict[str, Any] |
     for rel in _relation_candidates(notes):
         skip: tuple[str, str, bool] | None = None
         try:
-            _relation_ends(table, rel, tables, masked)
+            _relation_ends(table, rel, tables, masked, outside)
         except _Skip as e:
             skip = (e.reason, e.detail, e.carry)
         checks.append(PlannedCheck("relation", _relation_target(rel), f"relations.{rel['id']}", skip, relation=rel))
@@ -1891,7 +1905,7 @@ async def profile_table(cx: ProfileContext, table: str, *,
         await db(_record, cx.source.id, table, None, result, actor, hooks.recorded)
         return result
     notes = await db(_read_notes, cx.source.id, table)
-    plan = plan_checks(table, meta, notes, tables=cx.tables, masked=cx.masked)
+    plan = plan_checks(table, meta, notes, tables=cx.tables, masked=cx.masked, outside=cx.outside)
     out = _TableOutcome()
     tcx = _TableCx(cx, table, result, hooks)
     result.checks = [p.as_check() for p in plan]
@@ -2086,8 +2100,9 @@ async def check_valid_filter(source: Any, table: str, meta: dict[str, Any] | Non
         return _unchecked(str(e))
     cap = max(int(settings.sample_size), int(settings.max_scan_rows))
     # 和存进目录的是同一条（catalog._model_facts 存的就是这个写法）：列换成真名、按方言加引号，别的照原文
-    cond = sqlcheck.canonical_valid_filter(parsed, quote=dialect.quote)
-    cols = ", ".join(dialect.quote(c) for c in parsed.columns)
+    # 列按表结构里记的 quote_name 强制加引号（Oracle 小写带引号的列：不加引号 Oracle 转成大写，找的是另一列）
+    cond = sqlcheck.canonical_valid_filter(parsed, quote=lambda c: dialect.column(meta, c))
+    cols = ", ".join(dialect.column(meta, c) for c in parsed.columns)
     inner = dialect.limit(f"SELECT {cols} FROM {dialect.table(meta, table)}", cap)
     sql = f"SELECT COUNT(*) AS n, SUM(CASE WHEN {cond} THEN 0 ELSE 1 END) AS x FROM ({inner}) s"
     try:
