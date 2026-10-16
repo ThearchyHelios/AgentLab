@@ -195,7 +195,8 @@ async def _stream(monkeypatch, model, source):
                                  json={"instruction": "上周订单金额多少", "intent": "answer",
                                        "datasource_ids": [source]}) as r:
             async for line in r.aiter_lines():
-                if line.startswith("data: "):
+                # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+                if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                     events.append(json.loads(line[6:]))
     return events
 

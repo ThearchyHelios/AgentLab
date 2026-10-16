@@ -87,7 +87,8 @@ async def _events(client, monkeypatch, model, base: dict | None = BASE) -> list[
     async with client.stream("POST", "/api/copilot/generate-stream",
                              json={"instruction": "并行算同比和环比", "base_graph": base}) as r:
         async for line in r.aiter_lines():
-            if line.startswith("data: "):
+            # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+            if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                 out.append(json.loads(line[6:]))
     return out
 
@@ -263,7 +264,8 @@ async def test_a_rejected_budget_falls_back_to_the_old_one(client, monkeypatch, 
     async with client.stream("POST", "/api/copilot/generate-stream",
                              json={"instruction": "加一支同比", "base_graph": BASE}) as r:
         async for line in r.aiter_lines():
-            if line.startswith("data: "):
+            # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+            if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                 events.append(json.loads(line[6:]))
     assert 8192 in asked
     assert big.calls == 1 and small.calls == 1
@@ -284,7 +286,8 @@ async def test_other_rejections_are_not_retried(client, monkeypatch):
     async with client.stream("POST", "/api/copilot/generate-stream",
                              json={"instruction": "改一下", "base_graph": BASE}) as r:
         async for line in r.aiter_lines():
-            if line.startswith("data: "):
+            # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+            if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                 events.append(json.loads(line[6:]))
     assert small.calls == 0
     assert events[-1]["op"] == "error"

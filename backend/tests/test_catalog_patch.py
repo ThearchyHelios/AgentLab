@@ -268,7 +268,8 @@ async def _stream(monkeypatch, model, source, base_graph=None):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         async with client.stream("POST", "/api/copilot/generate-stream", json=body) as r:
             async for line in r.aiter_lines():
-                if line.startswith("data: "):
+                # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+                if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                     events.append(json.loads(line[6:]))
     return events
 
