@@ -72,7 +72,7 @@ export function fillRecipeDefaults(input: Recipe | null | undefined): Recipe | n
         block.extra_columns ??= 'reject'
         block.ignore_columns ??= []
         block.merged_data ??= 'reject'
-        block.rows = { blank_rows: 'stop', total_row: null, subtotals: null, ...(isObj(block.rows) ? block.rows : {}) }
+        block.rows = { blank_rows: 'stop', total_row: null, subtotals: null, no_subtotals: false, ...(isObj(block.rows) ? block.rows : {}) }
         if (isObj(block.rows.total_row)) block.rows.total_row.keep_as ??= null
         if (isObj(block.rows.subtotals)) {
           block.rows.subtotals = { scope: 'since_previous', group_column: null, keep_as: null, ...block.rows.subtotals }
@@ -891,9 +891,23 @@ function ListEditor({ s, b, block, edit }: { s: number; b: number; block: any; e
                  x.rows.subtotals = on
                    ? { label_column: arr(x.columns)[0]?.name ?? '', pick: '小计', scope: 'since_previous', group_column: null, keep_as: null }
                    : null
+                 // 有小计和「没有小计行」只能二选一（后端静态校验 subtotals_conflict）
+                 if (on) x.rows.no_subtotals = false
                })}>
           {RECIPE_TEXT.subtotalsOn}
         </Check>
+        {!subtotals && (
+          <div className="mt-1">
+            <Check path={`${base}/rows/no_subtotals`} checked={block.rows?.no_subtotals === true}
+                   onChange={(on) => edit((r) => {
+                     const x = at(r)
+                     x.rows = isObj(x.rows) ? x.rows : {}
+                     x.rows.no_subtotals = on
+                   })}>
+              {RECIPE_TEXT.noSubtotals}
+            </Check>
+          </div>
+        )}
         {subtotals && (
           <div className="mt-1 grid grid-cols-1 gap-2 md:grid-cols-3" data-list-subtotals={String(block.id)}>
             <FieldWrap path={`${base}/rows/subtotals/label_column`} label={RECIPE_TEXT.subtotalLabelColumn}>

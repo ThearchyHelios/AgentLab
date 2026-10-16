@@ -476,3 +476,62 @@ def test_ordinary_rows_starting_with_a_total_word_are_not_flagged():
     rows = [("商品", "门店", "金额"), ("累计积分卡", "门店一", 10), ("普通卡", "门店二", 20)]
     ex = _run(_book(rows), _list([("商品", "TEXT"), ("门店", "TEXT"), ("金额", "INTEGER")]))
     assert ex.ok and not [p for p in ex.problems if p.code == "subtotal_suspect"]
+
+
+def _suspects(data: list[tuple[Any, ...]], columns: list[tuple[str, str]], **block: Any) -> list[str]:
+    ex = _run(_book(data), _list(columns, **block))
+    assert ex.ok, [p.message for p in ex.problems]
+    return [c for p in ex.problems if p.code == "subtotal_suspect" for c in p.cells]
+
+
+def test_a_two_column_key_value_list_is_never_flagged():
+    """复核反例：只有「标签文字列 + 数字列」的键值清单，「其余文字列为空」自然成立，不能据此说它像小计——
+    「累计收入」「汇总调整」是普通的数据行。最后一行以合计字样开头也一样。"""
+    cols = [("项目", "TEXT"), ("金额", "INTEGER")]
+    assert _suspects([("项目", "金额"), ("门票收入", 100), ("累计收入", 300), ("汇总调整", 5), ("餐饮收入", 50)],
+                     cols) == []
+    assert _suspects([("项目", "金额"), ("门票收入", 100), ("餐饮收入", 50), ("合计调整项", 5)], cols) == []
+
+
+def test_only_rows_between_details_are_flagged():
+    """像小计的行要夹在明细中间：上下相邻的明细在某个文字列上有值、这一行空着；后面还得有明细（或者是合计行）。
+    放在最后、后面没有明细的不报（那不是「夹在中间」）；上下的明细那一列本来就空着的也不报。"""
+    cols = [("地区", "TEXT"), ("门店", "TEXT"), ("金额", "INTEGER")]
+    head = ("地区", "门店", "金额")
+    # 最后一行：后面没有明细，也没有合计行
+    assert _suspects([head, ("分区甲", "门店一", 100), ("分区甲", "门店二", 200), ("小计", None, 300)], cols) == []
+    # 上面的明细「门店」也空着：不是因为小计才空的
+    assert _suspects([head, ("分区甲", None, 100), ("累计调整", None, 5), ("分区乙", "门店三", 50)], cols) == []
+    # 下面的明细「门店」空着：同样不报
+    assert _suspects([head, ("分区甲", "门店一", 100), ("累计调整", None, 5), ("分区乙", None, 50)], cols) == []
+    # 夹在明细中间：报
+    assert _suspects([head, ("分区甲", "门店一", 100), ("小计", None, 100), ("分区乙", "门店三", 50)],
+                     cols) == ["明细!A3"]
+    # 最后一组的小计后面紧跟合计行：也在列表里面，报
+    total = {"rows": {"total_row": {"label_column": "地区", "pick": "合计"}}}
+    assert _suspects([head, ("分区甲", "门店一", 100), ("小计", None, 100), ("合计", None, 100)], cols,
+                     **total) == ["明细!A3"]
+
+
+def test_declaring_no_subtotals_keeps_such_rows_as_data_without_asking(tmp_path):
+    """人确认过「这张列表没有小计行」（rows.no_subtotals）：以合计字样开头的行照常是数据，不再每期报 subtotal_suspect、
+    不再每期要勾确认；这个声明本身是放宽，配上的那一次要确认一次。和 subtotals 只能二选一。"""
+    from app.data import recipe_confirm
+
+    recipe = _list(STORE_COLS, rows={"total_row": {"label_column": "地区", "pick": "合计"}, "no_subtotals": True})
+    assert validate_recipe(recipe, facts=None, origin="rules")[1] == []
+    db = str(tmp_path / "n.db")
+    ex = _run(_book(STORES), recipe, db)
+    assert ex.ok and not [p for p in ex.problems if p.code == "subtotal_suspect"]
+    assert _rows(db, 'SELECT COUNT(*) FROM "明细"') == [(6,)]          # 两行「小计」照常是数据
+    items = recipe_confirm.confirm_items(recipe_confirm.ConfirmContext(kind="first", recipe=recipe, extraction=ex,
+                                                                       checks=[]))
+    ids = [i.id for i in items]
+    assert "no_subtotals:列表1" in ids and not [i for i in ids if i.startswith("subtotal_suspect:")]
+    sigs = recipe_confirm.recipe_item_signatures(Recipe.model_validate(recipe))
+    assert sigs["no_subtotals:列表1"] != recipe_confirm.recipe_item_signatures(
+        Recipe.model_validate(_list(STORE_COLS)))["no_subtotals:列表1"]
+    both = _stores_recipe()
+    both["sheets"][0]["blocks"][0]["rows"]["no_subtotals"] = True
+    probs = validate_recipe(both, facts=None, origin="rules")[1]
+    assert [p.code for p in probs] == ["subtotals_conflict"] and probs[0].path.endswith("/rows/no_subtotals")

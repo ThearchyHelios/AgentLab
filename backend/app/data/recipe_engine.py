@@ -1679,9 +1679,14 @@ class _ListRun:
         #: 期 5：加统计期起止两列（ListPeriod.synthesize）：每行末尾两格占位，统计期定下来以后由 _Sink 换成真值
         self.synth = block.period is not None and block.period.synthesize is not None
         #: 期 5：没配小计时，像夹在明细中间的小计的数据行（行号）和命中的合计字样：照常按数据导入，收尾时报
-        #: subtotal_suspect 要人确认（带修复按钮：改作小计核对）
+        #: subtotal_suspect 要人确认（带修复按钮：改作小计核对）。人声明过没有小计（no_subtotals）的不看
         self.suspects: list[int] = []
         self.suspect_word: str | None = None
+        self.watch_suspects = block.rows.subtotals is None and not block.rows.no_subtotals
+        #: 上一行普通明细在哪些文字、日期列（列序号，不含标签所在的首列）上有值；还没有明细时是空集
+        self.prev_filled: frozenset[int] = frozenset()
+        #: 等着下一行明细确认的候选：(行号, 合计字样, 上一行明细有值、这一行空着的列)
+        self.pending: list[tuple[int, str, frozenset[int]]] = []
 
     # ---------------- 喂入 ----------------
 
@@ -2069,6 +2074,8 @@ class _ListRun:
             label = inb.get(self.colmap.get(self.total_idx, -1))
             pick = match_key(block.rows.total_row.pick)  # type: ignore[union-attr]
             if label is not None and match_key(_text(label.value)).startswith(pick):
+                if self.watch_suspects:
+                    self._settle_suspects(None)
                 self._total_row(r, inb, cells, label)
                 return
         if self.sub_idx is not None:
@@ -2076,15 +2083,43 @@ class _ListRun:
             if label is not None and match_key(_text(label.value)).startswith(self.sub_key):
                 self._subtotal_row(r, inb, cells, label)
                 return
-        elif (word := self._suspect_word(inb)) is not None:
-            self.suspects.append(r)
-            self.suspect_word = self.suspect_word or word
+        elif self.watch_suspects:
+            self._watch_suspect(r, inb)
         self._record(r, inb, cells, fills)
 
+    def _watch_suspect(self, r: int, inb: dict[int, GridCell]) -> None:
+        """期 5：没配小计、也没声明没有小计时，认夹在明细中间的小计（照常按数据导入，收尾时报 subtotal_suspect）。
+
+        要同时满足才算：首列以合计字样开头、其余文字和日期列都空着、至少一格有数（_suspect_word）；上一行明细在某个
+        文字或日期列上有值、这一行那一列空着；下一行明细在同一列上也有值，或者下面紧跟着合计行。所以候选先挂着，
+        等下一行明细来了再定（_settle_suspects）。
+
+        为什么这么严（复核反例）：只有「标签列 + 数字列」的键值清单（「累计收入 300」「汇总调整 5」），「其余文字列
+        为空」自然成立，什么也说明不了；放在最后、后面没有明细的行也不是「夹在中间」。报错了就是每期都要勾的
+        确认项，按配方导入一期的无人值守运行会被它挡住。"""
+        filled = frozenset(i for i, col in enumerate(self.cols)
+                           if col.type in ("TEXT", "DATE") and (c := self.colmap.get(i)) is not None
+                           and c != self.c1 and c in inb)
+        word = self._suspect_word(inb) if self.prev_filled else None
+        if word is not None:
+            self.pending.append((r, word, self.prev_filled))
+            return
+        self._settle_suspects(filled)
+        self.prev_filled = filled
+
+    def _settle_suspects(self, filled: frozenset[int] | None) -> None:
+        """挂着的候选有了下文：filled 是紧跟着的那行明细有值的文字、日期列（None 是紧跟着合计行）。上一行明细有值、
+        候选空着的列，下一行明细也有值，才算夹在明细中间。"""
+        for row, word, gap in self.pending:
+            if filled is None or gap & filled:
+                self.suspects.append(row)
+                self.suspect_word = self.suspect_word or word
+        self.pending = []
+
     def _suspect_word(self, inb: dict[int, GridCell]) -> str | None:
-        """期 5：这一行像不像夹在明细中间的小计（配方没配 subtotals 时才看）：首列是以合计字样（TOTAL_WORDS）开头的文字，
-        其余文字、日期列都空着，至少一格有数。像的话返回那个字样。以前这种行静默当数据导入，求和就把小计重复算了
-        进去（H2）；现在照常导入，但收尾时报出来要人确认，并给「改作小计核对」的修复按钮。合计行已经在前面认走了。"""
+        """期 5：这一行本身像不像小计：首列是以合计字样（TOTAL_WORDS）开头的文字，其余文字、日期列都空着，至少一格
+        有数。像的话返回那个字样。以前这种行静默当数据导入，求和就把小计重复算了进去（H2）；现在照常导入，但收尾时
+        报出来要人确认，并给「改作小计核对」的修复按钮。合计行已经在前面认走了。上下文的条件见 _watch_suspect。"""
         cell = inb.get(self.c1)
         if cell is None or cell.formula is not None or not isinstance(cell.value, str):
             return None
@@ -2110,10 +2145,10 @@ class _ListRun:
         cells = [self.sh.coord(r, self.c1) for r in self.suspects]
         rows = _rows_text(self.suspects)
         word = self.suspect_word or ""
-        where = (f"{self.where}：第 {rows} 行像夹在明细中间的小计（「{label}」列以「{word}」开头、其余文字列为空），"
-                 "按数据导入了")
+        where = (f"{self.where}：第 {rows} 行像夹在明细中间的小计（「{label}」列以「{word}」开头，上下明细都有值的"
+                 "文字列在这一行空着），按数据导入了")
         msg = (f"{where}。如果它们是小计，对这一列求和会把小计重复算进去：请用修复按钮改作小计核对；"
-               "确实是数据时，确认后照常导入")
+               "确实是数据时，确认后照常导入；以后各期不想再确认，在配方的「小计行」里勾选「没有小计行」")
         self.eng.problems.add("subtotal_suspect", msg, where, cells[:CELLS_MAX], sheet=self.sh.name,
                               fix_args={"block": self.block.id, "label_column": label, "pick": word,
                                         "rows": list(self.suspects), "cells": cells[:CELLS_MAX]})

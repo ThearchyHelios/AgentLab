@@ -1644,6 +1644,8 @@ export const RECIPE_TEXT = {
   subtotalScope: '一行小计管哪些明细',
   subtotalGroupColumn: '按哪一列分组',
   subtotalKeep: '原表小计另存为表（留空则只核对）',
+  /** 人确认过列表里没有小计（ListRows.no_subtotals）：像小计的行照常是数据，不再每期报「像小计的行」要人确认 */
+  noSubtotals: '没有小计行（以合计字样开头的行也是数据，不再提醒）',
   listPeriod: '按期累积时每一行属于哪一期',
   listPeriodColumn: '按哪个日期列核对',
   listPeriodHint: '列表要按期累积，每一行都要说得出属于哪一期；所在工作表要配置统计期（表内没有时，每期试运行时录入）。导入模式另在「导入模式」中选',

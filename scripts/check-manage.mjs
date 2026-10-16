@@ -2301,13 +2301,21 @@ await section('数据 · 表格：按配方导入', async () => {
   await until(async () => puts().length === 5, 4000)
   check('切换「数据中间的空行」：发 PUT，blank_rows 变成跳过', puts()[4]?.body?.recipe?.sheets?.[1]?.blocks?.[0]?.rows?.blank_rows === 'skip')
   await page.waitForTimeout(300)
+  // 期 5：没配小计时可以声明「没有小计行」（以合计字样开头的行照常是数据，不再每期报「像小计的行」要人确认）
+  replies.recipe.push(echo())
+  await panel.locator('[data-field="/sheets/1/blocks/0/rows/no_subtotals"]').check()
+  await until(async () => puts().length === 6, 4000)
+  const noSub = puts()[5]?.body?.recipe?.sheets?.[1]?.blocks?.[0]?.rows
+  check('勾选「没有小计行」：发 PUT，no_subtotals 为 true、没有配小计', noSub?.no_subtotals === true && !noSub?.subtotals,
+        JSON.stringify(noSub ?? {}))
+  await page.waitForTimeout(300)
   // 有问题的配方：一条对得上字段（单位），一条对不上（挂到面板顶部）
   replies.recipe.push(echo({ recipe_problems: [
     { path: '/tables/0/units/分区甲', code: 'unit_label_conflict', message: '表「日客流量」：列「分区甲」的单位与标签「分区甲（人次）」不一致' },
     { path: '/sheets/0/blocks/0/label_offset', code: 'schema', message: '第 1 个工作表的交叉表：标签列偏移只能是紧挨日期的左侧一列' },
   ] }))
   await panel.locator('[data-field="/tables/0/units/分区甲"]').selectOption('人')
-  await until(async () => puts().length === 6, 4000)
+  await until(async () => puts().length === 7, 4000)
   await page.waitForTimeout(300)
   const trialBtn = wizard().locator('[data-trial-run]')
   check('配方有问题时「试运行」禁用', await trialBtn.isDisabled())
@@ -2321,8 +2329,8 @@ await section('数据 · 表格：按配方导入', async () => {
   await panel.locator('[data-recipe-paste-toggle]').click()
   await panel.locator('[data-recipe-paste] textarea').fill(JSON.stringify(FLOW_RECIPE))
   await panel.locator('[data-recipe-paste] button', { hasText: '保存配方' }).click()
-  await until(async () => puts().length === 7, 4000)
-  check('「粘贴配方」发 PUT，body 就是粘贴的配方', JSON.stringify(puts()[6]?.body?.recipe) === JSON.stringify(FLOW_RECIPE))
+  await until(async () => puts().length === 8, 4000)
+  check('「粘贴配方」发 PUT，body 就是粘贴的配方', JSON.stringify(puts()[7]?.body?.recipe) === JSON.stringify(FLOW_RECIPE))
   await page.waitForTimeout(300)
   check('……问题清掉以后「试运行」可用', await trialBtn.isEnabled())
   // 连续修改：上一次 PUT 还没回来就接着改。上一次回来时，排在后面的修改不能被服务端那份盖掉，

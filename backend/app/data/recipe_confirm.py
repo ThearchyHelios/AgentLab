@@ -527,6 +527,7 @@ def _signatures(recipe: Recipe, sheet_name: Callable[[SheetRecipe], str]) -> dic
                 subt = block.rows.subtotals
                 out[f"subtotals:{block.id}"] = _sig(
                     None if subt is None else (subt.label_column, subt.pick, subt.scope, subt.group_column, subt.keep_as))
+                out[f"no_subtotals:{block.id}"] = _sig(block.rows.no_subtotals)
                 period = block.period
                 out[f"list_period:{block.id}"] = _sig(None if period is None else (period.column, period.synthesize))
     for r in recipe.relations:
@@ -1076,6 +1077,10 @@ def _recipe_items(bag: _Bag, recipe: Recipe, ex: dict[str, Any], facts: Any, *, 
             nums = [c.name for c in b.columns if c.type in ("INTEGER", "REAL")]
             detail = f"{scope}；按明细核对的列：{'、'.join(nums)}" if nums else f"{scope}；这个块没有数字列，不核对"
             bag.add(f"subtotals:{b.id}", f"{prefix}改作核对、不进数据{keep}", detail)
+        elif b.rows.no_subtotals:
+            # 声明没有小计行是放宽：以合计字样开头的行从此照常进数据，不再报「像小计」。配上（或改过）的那一次确认
+            bag.add(f"no_subtotals:{b.id}", f"「{b.id}」没有小计行：以合计字样开头的行都按数据导入，不再提醒像小计的行",
+                    "如果其实有穿插的小计，对这些列求和会把小计重复算进去")
         period = b.period
         if period is not None and period.column:
             bag.add(f"list_period:{b.id}", f"「{b.id}」每一行的「{period.column}」都要在本期统计期内",

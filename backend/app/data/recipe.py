@@ -274,7 +274,7 @@ _FIELD_LABEL = {
     "parts": "组成列", "claims": "认领", "a": "一方", "b": "另一方", "reason": "理由",
     "ignore_rows": "按行标签忽略的行", "ignore_columns": "按表头忽略的列", "ignore_outside": "按同一行文字忽略的数字",
     "label": "标签", "anchor": "同一行的文字",
-    "subtotals": "小计行", "scope": "小计管哪些明细", "group_column": "分组的列", "period": "每行属于哪一期",
+    "subtotals": "小计行", "no_subtotals": "没有小计行", "scope": "小计管哪些明细", "group_column": "分组的列", "period": "每行属于哪一期",
     "column": "日期列", "check": "核对方式", "synthesize": "加统计期列",
 }
 
@@ -1036,11 +1036,14 @@ class _Checker:
 
     def check_subtotals(self, base: tuple[Any, ...], block: ListBlock, names: list[str]) -> None:
         """期 5：小计行的标签列、分组列要是这个列表的列；按组小计要给分组列；小计和合计的开头词不能互为前缀
-        （「合计」「合计小计」：一行就分不清是小计还是合计）。"""
+        （「合计」「合计小计」：一行就分不清是小计还是合计）；配了小计又声明没有小计（no_subtotals）是矛盾的。"""
         sub = block.rows.subtotals
         if sub is None:
             return
         sp = base + ("rows", "subtotals")
+        if block.rows.no_subtotals:
+            self.add(base + ("rows", "no_subtotals"), "subtotals_conflict",
+                     "配了小计行，又声明了这张列表没有小计行：二选一")
         if sub.label_column not in names:
             self.add(sp + ("label_column",), "column_unknown",
                      f"小计标签所在的列「{sub.label_column}」不在这个列表的列里{self._near(sub.label_column, names)}")

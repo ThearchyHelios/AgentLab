@@ -323,6 +323,9 @@ class ListRows(_M):
     total_row: TotalRow | None = None
     #: 期 5：穿插在明细中间的小计行（Subtotals）。默认 None = 期 4 的行为（像小计的行照常是数据或起草失败）
     subtotals: Subtotals | None = None
+    #: 期 5：人确认过这张列表没有小计行：以合计字样开头的行就是数据（「累计充值」这类键值清单），执行器不再报
+    #: subtotal_suspect，每期也就不用再勾那一项确认。和 subtotals 二选一（静态校验 subtotals_conflict）
+    no_subtotals: bool = False
 
 
 class ListValues(_M):
