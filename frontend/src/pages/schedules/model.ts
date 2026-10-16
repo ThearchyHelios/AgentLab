@@ -5,8 +5,8 @@
  */
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import type {
-  Schedule, ScheduleCreate, ScheduleEvent, SchedulePatch, ScheduleRunClass, ScheduleWebhookFormat, ScheduleWebhookIn,
-  ScheduleWebhookTest, Workflow, WorkflowVersion,
+  Schedule, ScheduleCreate, ScheduleEvent, SchedulePatch, ScheduleRunClass, ScheduleTargetCreate, ScheduleTargetKind,
+  ScheduleWebhookFormat, ScheduleWebhookIn, ScheduleWebhookTest, Workflow, WorkflowVersion,
 } from '../../types'
 export * from '../../lib/freq'
 import { DEFAULT_FREQ, DEFAULT_GRACE_S, browserTimezone, cronOf, freqOf, freqProblem, type Freq } from '../../lib/freq'
@@ -173,6 +173,66 @@ export function rebaseForm(cur: ScheduleForm, sent: ScheduleForm, saved: Schedul
       events: hook('events'),
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// 非工作流目标（评测题集；数据源维护在数据源页建、在这里只读）：表单 ⇄ 请求体
+// ---------------------------------------------------------------------------
+
+/** 新建时能选的目标种类：数据源维护在数据源页的「定时维护」里建（next-round 03 B4），这里只列出、只读 */
+export const CREATABLE_TARGETS: readonly ScheduleTargetKind[] = ['workflow', 'eval_suite']
+
+/**
+ * 非工作流目标的表单：名称、目标、频率、时区、补发宽限，新建时另有「创建后立即启用」（修改时启用、暂停走页头的开关）。
+ * 没有工作流、输入模板、运行类别和 Webhook：这几样对它们不适用，服务端带了照实拒
+ */
+export interface TargetForm {
+  name: string
+  targetKind: Exclude<ScheduleTargetKind, 'workflow'>
+  targetId: string
+  freq: Freq
+  timezone: string
+  enabled: boolean
+  misfireGraceS: number
+}
+
+export function targetFormOf(s: Schedule | null, init?: { targetKind?: Exclude<ScheduleTargetKind, 'workflow'>; targetId?: string },
+  timezone: string = browserTimezone()): TargetForm {
+  if (!s) {
+    return { name: '', targetKind: init?.targetKind ?? 'eval_suite', targetId: init?.targetId ?? '', freq: { ...DEFAULT_FREQ },
+      timezone, enabled: true, misfireGraceS: DEFAULT_GRACE_S }
+  }
+  return {
+    name: s.name, targetKind: (s.target_kind && s.target_kind !== 'workflow' ? s.target_kind : 'eval_suite'),
+    targetId: s.target_id ?? '', freq: freqOf(s.cron), timezone: s.timezone, enabled: s.enabled, misfireGraceS: s.misfire_grace_s,
+  }
+}
+
+export function targetCreateBody(f: TargetForm): ScheduleTargetCreate {
+  return {
+    name: f.name.trim(), target_kind: f.targetKind, target_id: f.targetId, cron: cronOf(f.freq), timezone: f.timezone,
+    enabled: f.enabled, overlap: 'skip', misfire_grace_s: f.misfireGraceS,
+  }
+}
+
+/** 修改时交上去的字段（不含 version）：只带改了的（同 patchBody，和表单初值比），什么都没改返回 null。目标建好之后不在这里改 */
+export function targetPatchBody(f: TargetForm, initial: TargetForm): Omit<SchedulePatch, 'version'> | null {
+  const out: Omit<SchedulePatch, 'version'> = {}
+  if (f.name.trim() !== initial.name.trim()) out.name = f.name.trim()
+  if (cronOf(f.freq) !== cronOf(initial.freq)) out.cron = cronOf(f.freq)
+  if (f.timezone !== initial.timezone) out.timezone = f.timezone
+  if (f.misfireGraceS !== initial.misfireGraceS) out.misfire_grace_s = f.misfireGraceS
+  return Object.keys(out).length ? out : null
+}
+
+/** 非工作流目标的表单还缺什么（名称、目标、频率）：交上去之前先在这里拦，说法同工作流的表单 */
+export function targetProblems(f: TargetForm): Partial<Record<'name' | 'target' | 'freq', string>> {
+  const out: Partial<Record<'name' | 'target' | 'freq', string>> = {}
+  if (!f.name.trim()) out.name = T.problem.name
+  if (!f.targetId) out.target = T.problem.target(T.targetKind[f.targetKind])
+  const freq = freqProblem(f.freq)
+  if (freq) out.freq = freq
+  return out
 }
 
 /**

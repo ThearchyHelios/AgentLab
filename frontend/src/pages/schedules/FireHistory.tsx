@@ -144,8 +144,12 @@ function FireRow({ fire: f, tz, now }: { fire: ScheduleFire; tz: string; now: nu
             <ChevronRight size={11} aria-hidden />
           </Link>
         ) : f.eval_run_id ? (
-          // 目标是评测题集：这一次发起的是一次评测（评测页在后续版本），这里只写编号
-          <span className="shrink-0 text-2xs text-dim" data-fire-eval={f.eval_run_id}>{T.evalFire(f.eval_run_id.slice(0, 6))}</span>
+          // 目标是评测题集：这一次发起的是一次评测，链到评测详情（进度、逐题结果、和上一次比）
+          <Link to={`/evals/runs/${encodeURIComponent(f.eval_run_id)}`} title={T.evalFireTitle} data-fire-eval={f.eval_run_id}
+                className="inline-flex shrink-0 items-center gap-1.5 text-2xs text-dim hover:text-fg hover:underline">
+            {T.evalFire(f.eval_run_id.slice(0, 6))}
+            <ChevronRight size={11} aria-hidden />
+          </Link>
         ) : <span className="shrink-0 text-2xs text-faint">{T.noRun}</span>}
       </div>
       {f.reason && (

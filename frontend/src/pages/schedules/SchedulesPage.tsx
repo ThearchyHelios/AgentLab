@@ -149,8 +149,8 @@ function ScheduleListPage() {
 
 /**
  * 一行：名字（链到详情）、目标和频率；下次运行、上次触发；右边启用开关、立即运行、编辑、删除。
- * 窄屏上右边的按钮整组折到下一行，不挤名字。目标不是工作流的（评测题集、数据源维护）标出种类、不标运行类别，
- * 「编辑」写「查看」：这类定时的设置在这里只读
+ * 窄屏上右边的按钮整组折到下一行，不挤名字。目标不是工作流的（评测题集、数据源维护）标出种类、不标运行类别；数据源维护的
+ * 「编辑」写「查看」：它的设置在数据源页改，这里只读
  */
 function ScheduleRow({ s, now, busy, onToggle, onRun, onDelete }: {
   s: Schedule; now: number; busy?: 'toggle' | 'run' | 'delete'
@@ -158,6 +158,8 @@ function ScheduleRow({ s, now, busy, onToggle, onRun, onDelete }: {
 }) {
   const kind = targetKindOf(s)
   const workflow = kind === 'workflow'
+  /** 在这一页改得了设置的：工作流、评测题集；数据源维护在数据源页改 */
+  const editable = kind !== 'source_maintenance'
   const target = targetText(s)
   return (
     <li className="rounded-lg border bg-panel px-3 py-2.5" data-schedule-row={s.id} data-enabled={String(s.enabled)}>
@@ -184,8 +186,8 @@ function ScheduleRow({ s, now, busy, onToggle, onRun, onDelete }: {
             {busy === 'run' ? <Spinner size={11} /> : <Play size={11} aria-hidden />} {T.runNow}
           </button>
           <Link to={`/schedules/${encodeURIComponent(s.id)}`} className="btn btn-sm btn-ghost"
-                aria-label={workflow ? T.editLabel(s.name) : T.viewLabel(s.name)} data-schedule-edit="">
-            {workflow ? T.edit : T.view}
+                aria-label={editable ? T.editLabel(s.name) : T.viewLabel(s.name)} data-schedule-edit="">
+            {editable ? T.edit : T.view}
           </Link>
           <IconButton label={T.deleteLabel(s.name)} onClick={onDelete} disabled={!!busy} data-schedule-delete=""
                       className="text-faint hover:bg-st-failed/10 hover:text-[var(--err)]" icon={<Trash2 size={12} />} />

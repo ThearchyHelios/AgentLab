@@ -33,6 +33,7 @@ import { TracePane } from './TracePane'
 import { useRunDetail } from './useRunDetail'
 import { useCompareEntry } from './compare/entry'
 import { RunScheduleSource } from '../schedules/parts'
+import { RunEvalSource } from './EvalSource'
 
 /**
  * 一次运行的详情：头部读数、凭证、排错路径，下面分三个视图——
@@ -599,6 +600,8 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
                   {run.started_by || '未署名'} 发起
                 </span>
               )}
+              {/* 评测发起的：链回评测里对应的那道题（键盘可达；记录页的「评测」标记只能鼠标点） */}
+              {run.origin_kind === 'eval' && <><span>·</span><RunEvalSource run={run} /></>}
               <span>·</span>
               <span className="tnum">{formatNumber(d.events.length)} 条事件</span>
               {workflowGone && <span>· 工作流已删除</span>}

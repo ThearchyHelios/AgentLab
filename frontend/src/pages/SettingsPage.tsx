@@ -33,6 +33,7 @@ import {
   ProviderOptions, VerifySection, verifyChanged, verifyDraftOf, verifyErrors, verifyLabels, verifyPayload, type VerifyDraft,
 } from './VerifySettings'
 import { DraftModelSection } from './DraftModelSettings'
+import { EvalSettingsSection } from './EvalSettings'
 import { GeneralTab } from './settings/GeneralTab'
 import { IdentityTab } from './settings/IdentityTab'
 import { NotifyTab } from './settings/NotifyTab'
@@ -1179,6 +1180,8 @@ function PrefsTab() {
 
           {values.verify && <VerifySection cur={verifyCur} onEdit={editVerify} refresh={verifySaves}
                                            errors={fieldError?.field === 'verify.provider' ? { ...verifyErrs, provider: fieldError.message } : verifyErrs} />}
+
+          {values.eval && <EvalSettingsSection />}
 
           {values.catalog_draft && (
             <DraftModelSection provider={cur.draftProvider} model={cur.draftModel} onEdit={edit}

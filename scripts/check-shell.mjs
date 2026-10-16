@@ -145,12 +145,13 @@ await section('导航', '=== 导航 ===', async () => {
   const box = await nav(page).boundingBox()
   check('导航宽 64px（w-16）', Math.round(box.width) === 64, `${box.width}`)
   const labels = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').allInnerTexts()
-  // 定时任务是后加的，排在设置前面；设置留在最底下，快捷键还是 ⌥7（定时任务用 ⌥8）。应用（⌥9）排在编排后面
-  check('导航九项：问数据、编排、应用、记录、数据、工具、知识、定时任务、设置',
-    labels.join(',') === '问数据,编排,应用,记录,数据,工具,知识,定时任务,设置', labels.join(','))
+  // 定时任务是后加的，排在设置前面；设置留在最底下，快捷键还是 ⌥7（定时任务用 ⌥8）。应用（⌥9）排在编排后面。
+  // 评测（next-round 评测-D8，搭建者以上）也排在设置前面，用最后一个空着的 ⌥0
+  check('导航十项：问数据、编排、应用、记录、数据、工具、知识、定时任务、评测、设置',
+    labels.join(',') === '问数据,编排,应用,记录,数据,工具,知识,定时任务,评测,设置', labels.join(','))
   const keys = await nav(page).locator('li > a[aria-keyshortcuts]').evaluateAll((els) => els.map((el) => el.getAttribute('aria-keyshortcuts')))
-  check('原有快捷键都没动：问数据 ⌥1、编排 ⌥2、记录 ⌥3 … 设置 ⌥7、定时任务 ⌥8；应用是 ⌥9',
-    keys.join(',') === 'Alt+1,Alt+2,Alt+9,Alt+3,Alt+4,Alt+5,Alt+6,Alt+8,Alt+7', keys.join(','))
+  check('原有快捷键都没动：问数据 ⌥1、编排 ⌥2、记录 ⌥3 … 设置 ⌥7、定时任务 ⌥8；应用是 ⌥9、评测是 ⌥0',
+    keys.join(',') === 'Alt+1,Alt+2,Alt+9,Alt+3,Alt+4,Alt+5,Alt+6,Alt+8,Alt+0,Alt+7', keys.join(','))
   const fontSize = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').first()
     .evaluate((el) => getComputedStyle(el).fontSize)
   check('导航标签 11px', fontSize === '11px', fontSize)
@@ -181,6 +182,8 @@ await section('导航', '=== 导航 ===', async () => {
   check('⌥8 切到定时任务页', await page.waitForURL(/\/schedules(\?|$)/, { timeout: 5000 }).then(() => true, () => false), page.url())
   await page.keyboard.press('Alt+Digit9')
   check('⌥9 切到应用页', await page.waitForURL(/\/apps(\?|$)/, { timeout: 5000 }).then(() => true, () => false), page.url())
+  await page.keyboard.press('Alt+Digit0')
+  check('⌥0 切到评测页', await page.waitForURL(/\/evals(\?|$)/, { timeout: 5000 }).then(() => true, () => false), page.url())
 
   await page.goto(`${WEB}/settings/datasources`)
   check('旧地址 /settings/datasources 重定向到 /data', await page.waitForURL(/\/data(\/|$)/, { timeout: 8000 }).then(() => true, () => false), page.url())
@@ -191,7 +194,7 @@ await section('导航', '=== 导航 ===', async () => {
   for (const end = Date.now() + 3000; !(await lit()).startsWith('数据') && Date.now() < end;) await page.waitForTimeout(100)
   check('数据页点亮「数据」', (await lit()).startsWith('数据'), await lit())
 
-  // 矮窗口：导航按高度收紧，最底下的遥测点和署名不能被切掉
+  // 矮窗口：导航按高度收紧，最底下的遥测点和署名不能被切掉（十个导航项：600、520、480 三种高度各量一遍）
   const bottomFits = () => page.evaluate(() => {
     const n = document.querySelector('nav[aria-label="主导航"]')
     const t = document.querySelector('[data-telemetry]').getBoundingClientRect()

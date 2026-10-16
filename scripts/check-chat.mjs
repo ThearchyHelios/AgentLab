@@ -586,6 +586,13 @@ async function fakeApi(route) {
   if (path === '/copilot/review' && method === 'POST') {
     const wait = ctl.reviewDelay[body().run_id]
     if (wait) await new Promise((r) => setTimeout(r, wait))
+    if (ctl.lateReview && String(body().run_id).startsWith('run-decide')) {
+      // 复核慢过问数据页等的上限（检查里调短成几百毫秒）：答案先交出去，这一次复核的用量晚到了照样要记进这一轮
+      await new Promise((r) => setTimeout(r, ctl.lateReview))
+      log.reviews.push(body())
+      return json({ verdict: 'ok', note: '', answer: null, retry: false, severity: '', signals: [], retry_instruction: null,
+                    usage: { cost_usd: 0.004, unpriced_calls: 0, calls: 1 } })
+    }
     if (String(body().run_id).startsWith('run-decide')) {
       // 新服务端：第一次判不可用、给出重来的那句话；重来之后的那次没问题、不再重来。各带复核的用量
       log.reviews.push(body())
@@ -1677,6 +1684,26 @@ for (const theme of THEMES) {
     const title = await tag.getAttribute('title').catch(() => '')
     check('头部写这一轮的花费，悬停分得清助手、运行、复核', tagText.includes('$0.067') && (title ?? '').includes('助手建图')
       && (title ?? '').includes('复核'), `${tagText} | ${title}`)
+
+    // 复核慢过等待上限：答案先交出去，复核这一次的用量晚到了照记（这一轮的花费照实是助手 + 运行 + 复核，复核不落下）
+    ctl.lateReview = 900
+    await page.evaluate(() => window.__chatReviewWait(200))
+    const patchesBefore = log.patches.length
+    await send(page, '照服务端的决定：复核晚到的那一轮')
+    const delivered = await page.waitForFunction(() => {
+      const t = window.__chat.getState().byConversation.c0emptg?.at(-1)
+      return t?.phase === 'done' && t?.question?.includes('复核晚到')
+    }, null, { timeout: 8000 }).then(() => true, () => false)
+    const early = (await chatState(page)).byConversation.c0emptg.at(-1)
+    check('复核没等到：答案先交出去，这时还没有复核的用量', delivered && !early.usage?.review, JSON.stringify(early.usage))
+    await page.waitForTimeout(1200)
+    const lateTurn = (await chatState(page)).byConversation.c0emptg.at(-1)
+    const lateMeta = log.patches.slice(patchesBefore).filter((x) => x.body?.meta?.usage).at(-1)?.body?.meta?.usage
+    check('复核晚到：它的用量照记进这一轮并落库', Math.abs((lateTurn.usage?.review?.cost_usd ?? 0) - 0.004) < 1e-9
+      && Math.abs((lateMeta?.review?.cost_usd ?? 0) - 0.004) < 1e-9 && Math.abs((lateMeta?.copilot?.cost_usd ?? 0) - 0.012) < 1e-9,
+      JSON.stringify(lateMeta))
+    ctl.lateReview = 0
+    await page.evaluate(() => window.__chatReviewWait(25_000))
 
     // 只建不跑：autorun 没写 false，next 是 ready，前端照 next 走、不发起运行
     const before = log.runStarts.length

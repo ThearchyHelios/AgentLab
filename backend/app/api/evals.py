@@ -1029,7 +1029,16 @@ async def evaluation_results(evaluation_id: str, session: AsyncSession = Depends
         EvalCase.id.in_({r["case_id"] for r in results if r["case_id"]})))).all()) if results else {}
     for r in results:
         r["question"] = questions.get(r["case_id"])
+        r["cost"] = _result_cost(r.get("usage") or {})
     return {"evaluation_id": row.id, "cleaned": row.cleaned_at is not None, "results": results}
+
+
+def _result_cost(usage: dict[str, Any]) -> dict[str, Any]:
+    """一题的花费：助手（runner 记的 assistant 已含复核）+ 写作 + 结论裁判，和这次评测记在账上的同一份；估不出金额的调用另计
+    次数（界面写「≥」或「金额无法估算」）。加在服务端：界面不算数。"""
+    roles = [usage.get(k) or {} for k in ("assistant", "writer", "judge")]
+    return {"cost_usd": round(sum(float(r.get("cost_usd") or 0) for r in roles), 6),
+            "unpriced_calls": sum(int(r.get("unpriced_calls") or 0) for r in roles)}
 
 
 @router.get("/evaluations/{evaluation_id}/results/{result_id}")

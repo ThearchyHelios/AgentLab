@@ -200,3 +200,23 @@ def test_bands_follow_the_reference_lines():
     assert [evals._e1_band(x) for x in (None, 0.05, 0.1, 0.29, 0.3)] == [None, "reconcile", "normalize", "normalize",
                                                                            "route"]
     assert [evals._e3_band(x) for x in (None, 0.19, 0.2)] == [None, "not_yet", "worth"]
+
+
+async def test_each_result_carries_its_total_cost(client, source):
+    """逐题结果带这一题的花费：助手（已含复核）+ 写作 + 结论裁判，估不出的另计次数——界面直接显示，不自己加。"""
+    suite_id = await es.make_suite(source["id"], name=f"虚构题集_{uuid.uuid4().hex[:6]}")
+    try:
+        run_id = await _evaluation(suite_id, status="succeeded", key="A", passed=1, n=1, minutes_ago=1)
+        async with SessionLocal() as session:
+            session.add(EvalResult(eval_run_id=run_id, seq=1, case_id=None, case_seq=1, case_hash="h", repeat=0,
+                                   status="ok", verdict="pass", usage={
+                                       "assistant": {"cost_usd": 0.012, "unpriced_calls": 0},
+                                       "review": {"cost_usd": 0.002, "unpriced_calls": 0},
+                                       "writer": {"cost_usd": 0.03, "unpriced_calls": 1},
+                                       "judge": {"cost_usd": 0.001, "calls": 1}}))
+            await session.commit()
+        [row] = (await client.get(f"/api/evals/evaluations/{run_id}/results")).json()["results"]
+        # 复核已经算在助手里（runner 记的 assistant = 建图 + 复核），不重复加
+        assert row["cost"] == {"cost_usd": 0.043, "unpriced_calls": 1}, row["cost"]
+    finally:
+        await es.drop_suites()

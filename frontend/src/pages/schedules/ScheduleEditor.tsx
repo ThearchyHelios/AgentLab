@@ -279,7 +279,7 @@ function WorkflowField({ form, workflows, state, workflow, base, error, onPick, 
 // 预览
 // ---------------------------------------------------------------------------
 
-type PreviewState =
+export type PreviewState =
   | { status: 'idle' }
   | { status: 'loading'; data?: SchedulePreview; timezone?: string }
   | { status: 'ok'; data: SchedulePreview; timezone: string }
@@ -293,7 +293,7 @@ const PREVIEW_DEBOUNCE_MS = 400
  * 接下来 5 次触发和渲染出的输入（服务端算，前端不自己解析 cron）。改动中保留上一次的结果并标「正在计算」；
  * 非法时清掉上一次的时间，只留服务端的说明，免得人照着旧的时间以为新的频率没问题
  */
-function usePreview(cron: string, timezone: string, template: Record<string, string>, workflowId: string): PreviewState {
+export function usePreview(cron: string, timezone: string, template: Record<string, string>, workflowId: string): PreviewState {
   const [state, setState] = useState<PreviewState>({ status: 'idle' })
   const key = JSON.stringify([cron, timezone, Object.entries(template).sort(([a], [b]) => a.localeCompare(b)), workflowId])
   useEffect(() => {
@@ -329,7 +329,7 @@ function usePreview(cron: string, timezone: string, template: Record<string, str
   return state
 }
 
-function PreviewBox({ preview }: { preview: PreviewState }) {
+export function PreviewBox({ preview }: { preview: PreviewState }) {
   const data = preview.status === 'ok' || preview.status === 'loading' ? preview.data : undefined
   const tz = preview.status === 'ok' || preview.status === 'loading' ? preview.timezone : undefined
   return (

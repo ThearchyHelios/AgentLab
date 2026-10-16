@@ -1,19 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import clsx from 'clsx'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, CalendarClock, Play, Trash2 } from 'lucide-react'
 import { ApiError, api } from '../../api/client'
-import { EmptyState, ErrorState, IconButton, PageHeader, Skeleton, Spinner, Tabs, toast, useTicker } from '../../components/ui'
+import {
+  EmptyState, ErrorState, IconButton, PageHeader, Skeleton, Spinner, Tabs, toast, useRadioGroup, useTicker,
+} from '../../components/ui'
 import { leavePass } from '../../lib/leave'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import { useOnReconnect } from '../../store/catalog'
-import type { Schedule, ScheduleFire } from '../../types'
+import type { Schedule, ScheduleFire, ScheduleTargetKind } from '../../types'
 import { FireHistory } from './FireHistory'
 import {
   EnableSwitch, LastFire, NextRun, isUnsupported, rememberScheduleNames, removeSchedule, runNow, setEnabled, targetKindOf,
   targetText,
 } from './parts'
-import { graceLabel } from './model'
+import { CREATABLE_TARGETS, graceLabel } from './model'
 import { ScheduleEditor } from './ScheduleEditor'
+import { TargetEditor } from './TargetEditor'
 
 const BACK = (
   <Link to="/schedules" className="btn btn-sm btn-ghost" aria-label={T.back} title={T.back} data-schedule-back="">
@@ -21,22 +25,42 @@ const BACK = (
   </Link>
 )
 
-/** 新建定时任务（/schedules/new）。创建成功进它的详情页，替换掉这一条历史：后退不回到一张空表单 */
+/**
+ * 新建定时任务（/schedules/new）：先选定时什么——工作流（发起运行）还是评测题集（评一次）；数据源的定时维护在数据源页建，
+ * 不在这里。?target_kind=eval_suite&target_id=… 直接落到评测题集、选好题集（评测页的「设定时」）。创建成功进它的详情页，
+ * 替换掉这一条历史：后退不回到一张空表单
+ */
 export function ScheduleCreatePage() {
   const navigate = useNavigate()
+  const [params] = useSearchParams()
+  const [kind, setKind] = useState<ScheduleTargetKind>(params.get('target_kind') === 'eval_suite' ? 'eval_suite' : 'workflow')
+  const radio = useRadioGroup(CREATABLE_TARGETS, kind, setKind)
+  const onSaved = (s: Schedule) => {
+    rememberScheduleNames([s])
+    toast.ok(T.created(s.name))
+    // 表单刚保存完、离开守卫还没来得及撤：这一跳带通行证
+    navigate(`/schedules/${encodeURIComponent(s.id)}`, leavePass({ replace: true }))
+  }
   return (
     <div className="flex h-full flex-col" data-schedules-page="new">
       <PageHeader icon={<CalendarClock size={13} />} title={T.newTitle} subtitle={T.hint} actions={BACK} />
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <ScheduleEditor
-          schedule={null}
-          onSaved={(s) => {
-            rememberScheduleNames([s])
-            toast.ok(T.created(s.name))
-            // 表单刚保存完、离开守卫还没来得及撤：这一跳带通行证
-            navigate(`/schedules/${encodeURIComponent(s.id)}`, leavePass({ replace: true }))
-          }}
-        />
+        <div className="mx-auto max-w-5xl px-4 pt-4" data-schedule-target-kinds="">
+          <div className="label" id="schedule-target-kind">{T.targetKindLabel}</div>
+          <div role="radiogroup" aria-labelledby="schedule-target-kind" className="flex flex-wrap gap-1">
+            {CREATABLE_TARGETS.map((k) => (
+              <button key={k} type="button" {...radio(k)} onClick={() => setKind(k)} data-schedule-target-kind-pick={k}
+                      className={clsx('rounded-md border px-2.5 py-1 text-xs transition-colors',
+                        kind === k ? 'border-[var(--accent)] bg-accent-soft text-fg' : 'text-dim hover:bg-hover')}>
+                {T.targetKind[k]}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1 text-2xs leading-relaxed text-faint">{T.targetKindHint[kind]}</p>
+        </div>
+        {kind === 'workflow'
+          ? <ScheduleEditor key="workflow" schedule={null} onSaved={onSaved} />
+          : <TargetEditor key="eval_suite" schedule={null} init={{ targetId: params.get('target_id') ?? undefined }} onSaved={onSaved} />}
       </div>
     </div>
   )
@@ -238,9 +262,25 @@ export function ScheduleDetailPage({ id }: { id: string }) {
           <Tabs tabs={[{ key: 'settings', label: T.tabs.settings }, { key: 'history', label: T.tabs.history }]}
                 active={tab} onChange={pickTab} label={T.title} idPrefix="schedule" />
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {settingsSeen && targetKindOf(schedule) !== 'workflow' && (
+            {settingsSeen && targetKindOf(schedule) === 'source_maintenance' && (
               <div role="tabpanel" id="schedule-panel-settings" aria-labelledby="schedule-tab-settings" hidden={tab !== 'settings'}>
                 <TargetSettings schedule={schedule} />
+              </div>
+            )}
+            {settingsSeen && targetKindOf(schedule) === 'eval_suite' && (
+              <div role="tabpanel" id="schedule-panel-settings" aria-labelledby="schedule-tab-settings" hidden={tab !== 'settings'}>
+                <TargetEditor
+                  key={resetKey}
+                  schedule={schedule}
+                  version={version}
+                  onSaved={(s) => {
+                    wrote()
+                    rememberScheduleNames([s])
+                    setSchedule(s)
+                    setVersion(s.version)
+                  }}
+                  onReload={() => void reload()}
+                />
               </div>
             )}
             {settingsSeen && targetKindOf(schedule) === 'workflow' && (
@@ -272,8 +312,8 @@ export function ScheduleDetailPage({ id }: { id: string }) {
 }
 
 /**
- * 目标不是工作流的定时任务（评测题集、数据源维护）的设置：只读地列出名称、目标、频率、时区、补发宽限。工作流那张表单
- * （选工作流、运行类别、输入模板、Webhook）对它们不适用；页头的启用开关、立即运行、删除和触发历史照常可用
+ * 数据源维护的定时任务的设置：只读地列出名称、目标、频率、时区、补发宽限，链到数据源页（维护要做哪几步、频率和时段在数据源页的
+ * 「定时维护」里改，next-round 03 B4）。页头的启用开关、立即运行、删除和触发历史照常可用
  */
 function TargetSettings({ schedule }: { schedule: Schedule }) {
   const kind = targetKindOf(schedule)
@@ -286,7 +326,11 @@ function TargetSettings({ schedule }: { schedule: Schedule }) {
   ]
   return (
     <div className="mx-auto max-w-3xl space-y-3 p-4" data-schedule-target-settings={kind}>
-      <p className="text-xs text-dim">{T.targetSettingsNote(T.targetKind[kind])}</p>
+      <p className="text-xs text-dim">{T.maintenanceNote}</p>
+      <Link to={`/data/databases?source=${encodeURIComponent(schedule.target_id ?? '')}`} className="btn btn-sm"
+            data-schedule-to-source={schedule.target_id ?? ''}>
+        {T.toDataSource}
+      </Link>
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 rounded-lg border bg-panel p-3 text-xs">
         {rows.map(([label, value]) => (
           <div key={label} className="contents">
