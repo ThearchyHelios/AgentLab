@@ -285,6 +285,22 @@ async def run_model_draft(model: Any, source: Any, tables: Sequence[str], *,
     return await run.run()
 
 
+#: 影子起草不核对有效行过滤的排除比例：那一步要经剖析的只读守卫查业务库（FILTER_UNCHECKED 的原因）
+SHADOW_NOT_CHECKED = "影子起草只看表结构、不查业务库"
+
+
+async def run_shadow_draft(model: Any, source: Any, tables: Sequence[str], *,
+                           existing: Mapping[str, Mapping[str, Any]] | None = None,
+                           background: Background | None = None,
+                           hooks: Hooks | None = None) -> dict[str, ModelOutcome]:
+    """影子起草的入口（评测的目录快照，docs/design/next-round/01-效果度量与回归评测.md 做法 6）：和 run_model_draft 同一个
+    起草引擎、同样的分段和失败处理，只有一处不同——开了数据剖析的源，表级那段写完后不经剖析去业务库数有效行过滤排除了
+    多少行（_vet），照收、note 写明没有核对（SHADOW_NOT_CHECKED）。影子起草要的是「只看表结构」：不查业务库、不占数据源
+    的队。写不写目录由调用方定（评测写进内存里的目录副本，不调 write_entry）。"""
+    run = _Run(model, source, tables, existing or {}, background or Background(), hooks or Hooks(), offline=True)
+    return await run.run()
+
+
 # ==========================================================================
 # 并发名额
 # ==========================================================================
@@ -862,8 +878,10 @@ def _halves(pieces: list[_Piece]) -> tuple[list[_Piece], list[_Piece]] | None:
 
 class _Run:
     def __init__(self, model: Any, source: Any, tables: Sequence[str], existing: Mapping[str, Mapping[str, Any]],
-                 background: Background, hooks: Hooks) -> None:
+                 background: Background, hooks: Hooks, *, offline: bool = False) -> None:
         self.model = model
+        #: 影子起草（run_shadow_draft）：不查业务库
+        self.offline = offline
         self.hooks = hooks
         #: structured 结构化输出；text 纯文本、从正文取 JSON。结构化输出用不了时这次起草后面都改走纯文本
         self.mode = "structured"
@@ -1647,9 +1665,9 @@ class _Run:
             return
         from app.data import catalog_profile
 
-        if not self.profiling.enabled:
+        if not self.profiling.enabled or self.offline:
             found = catalog_profile.FilterCheck(True, catalog_profile.FILTER_UNCHECKED.format(
-                why=catalog_profile.FILTER_NOT_ENABLED))
+                why=SHADOW_NOT_CHECKED if self.offline else catalog_profile.FILTER_NOT_ENABLED))
         else:
             try:
                 found = await catalog_profile.check_valid_filter(self.source, st.name, dict(st.meta),
@@ -1828,4 +1846,4 @@ __all__ = ["BUDGET_WORDS", "Background", "CallReport", "FAILURE_LABEL", "Hooks",
            "REASON_ABANDONED", "REASON_CALL", "REASON_CAPPED", "REASON_EXHAUSTED", "REASON_FORMAT", "REASON_HALTED",
            "REASON_HOLLOW", "REASON_MISSING", "REASON_OMITTED", "REASON_RETRIED", "REASON_SPLIT", "REASON_SPLIT_PARTS",
            "REASON_TIMEOUT", "REASON_TRUNCATED", "REASON_UNANSWERED", "SEG", "classify_failure", "model_gate",
-           "parts_for", "run_model_draft"]
+           "SHADOW_NOT_CHECKED", "parts_for", "run_model_draft", "run_shadow_draft"]
