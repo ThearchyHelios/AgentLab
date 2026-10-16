@@ -114,7 +114,8 @@ async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition',
     needs_upgrade: false, pending_tasks: 0, my_role: 'manage', updated_at: '2026-10-10T02:00:00Z', draft: clone(spec),
     draft_bindings: { slots: {} }, created_by: '检查脚本', ...(backfill ? { backfill } : {}) }
   const state = { app, patches: [], lints: 0, publishes: [], derives: [], creates: [], streams: [], pages: [],
-    hooks: clone(hooks), rotates: [], hookPatches: [], hookDeletes: [], backfills: [], turns: [], turnPatches: [], conversations: 0,
+    hooks: clone(hooks), rotates: [], hookPatches: [], hookDeletes: [], receipts: [], backfills: [], turns: [], turnPatches: [],
+    conversations: 0,
     archives: 0 }
 
   await page.route(/\/api\//, (route) => {
@@ -165,6 +166,15 @@ async function open({ path = '/apps/app-ae/edit/pages', publish = 'disposition',
       const [, , , , , name, action] = url.pathname.split('/')
       if (!name) return json(route, { items: state.hooks })
       const hook = decodeURIComponent(name)
+      // 收件记录（04 细案 A6）：形状同服务端 process/hooks.recent_receipts
+      if (action === 'receipts') {
+        state.receipts.push(hook)
+        return json(route, { window_s: 3600, signature_failures: 2, items: [
+          { idem_key: 'pay-2', status: 'rejected', received_at: '2026-10-14T03:00:00Z', run_id: null, task_id: null,
+            detail: '没有在等这个关联键的待办（可能已处理过，或还没走到这一步）' },
+          { idem_key: 'pay-1', status: 'accepted', received_at: '2026-10-14T02:00:00Z', run_id: 'run-hook-1', task_id: 'task-1',
+            detail: null }] })
+      }
       if (action === 'rotate') {
         state.rotates.push(hook)
         return json(route, { id: `h-${hook}`, name: hook, kind: 'signal', entry_id: null, enabled: true, has_secret: true,
@@ -481,6 +491,17 @@ await section('钩子：按名字列出声明和密钥状态；生成的密钥�
     && (await shown.locator('[data-app-hook-secret-value]').innerText()).includes('secret-of-paid-0123456789')
     && (await shown.innerText()).includes('只显示这一次') && await shown.getByRole('button', { name: '复制' }).count() >= 1)
   check('……附入站地址', (await shown.locator('[data-app-hook-url]').innerText()).endsWith('/api/hooks/h-paid'))
+  // 收件记录（04 细案 A6）：生成过密钥的钩子能展开，列出状态、原因和发起的实例，另写近 1 小时验签失败几次
+  await page.locator('[data-app-hook-receipts-toggle="old"]').click()
+  const receipts = page.locator('[data-app-hook-receipts="old"]')
+  check('收件记录按名字取', await waitFor(page, async () => state.receipts.includes('old')), JSON.stringify(state.receipts))
+  check('……被拒的标红、写原因，接受的带实例链接', await waitFor(page, async () => await receipts.locator('[data-recent-request]').count() === 2)
+    && await receipts.locator('[data-recent-request="bad"] [data-recent-request-detail]').innerText().then((t) => t.includes('没有在等'))
+    && await receipts.locator('[data-recent-request="ok"] a[href$="/instances/run-hook-1"]').count() === 1)
+  check('……近 1 小时验签失败的次数照实写', (await receipts.locator('[data-recent-requests-summary]').innerText()).includes('验签失败 2 次'))
+  // 伪造的列表在生成之后不变：paid 那一行仍是没生成过密钥
+  check('没生成过密钥的钩子没有收件记录可看', await paid.locator('[data-app-hook-state="none"]').count() === 1
+    && await paid.locator('[data-app-hook-receipts-toggle]').count() === 0)
   await page.locator('[data-app-hook-delete="old"]').click()
   await page.locator('[role="dialog"]').getByRole('button', { name: '删除密钥' }).click()
   check('删除密钥按名字发', await waitFor(page, async () => state.hookDeletes.length === 1) && state.hookDeletes[0] === 'old')

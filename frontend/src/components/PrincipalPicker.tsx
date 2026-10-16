@@ -37,6 +37,11 @@ export interface PrincipalPickerProps {
    * 不看它
    */
   source?: CandidateSource
+  /**
+   * 能不能选服务账号（docs/design/next-round/04-对外集成与触达.md A1）：应用授权能（外部系统按授权读应用）；岗位绑定、改派
+   * 不能（服务账号只持有访问密钥，回复不了待办）——缺省不能，名录里的服务账号不列、填了说清是服务账号
+   */
+  allowService?: boolean
 }
 
 /** 边输入边取候选：停手这么久再去问，不是每敲一个字问一次 */
@@ -49,15 +54,20 @@ function loadDirectory(): Promise<Directory | null> {
   return directory
 }
 
-/** 这一项在名录里对不上的地方：没有这个人或组（missing）、人停用了（disabled）。名录没取到、选的是所有人时不判 */
-function problemOf(p: Principal, known: Directory | null): 'missing' | 'disabled' | null {
+/**
+ * 这一项在名录里对不上的地方：没有这个人或组（missing）、人停用了（disabled）、是服务账号而这里不收（service）。名录没取到、
+ * 选的是所有人时不判
+ */
+function problemOf(p: Principal, known: Directory | null, allowService: boolean): 'missing' | 'disabled' | 'service' | null {
   if (!known || p.kind === 'everyone') return null
   if (p.kind === 'group') return known.groups.some((g) => g.name === p.name) ? null : 'missing'
   const user = known.users.find((u) => u.username === p.name)
-  return !user ? 'missing' : user.disabled ? 'disabled' : null
+  return !user ? 'missing' : user.disabled ? 'disabled' : user.service && !allowService ? 'service' : null
 }
 
-export function PrincipalPicker({ value, onChange, allowEveryone = false, single = false, label, source }: PrincipalPickerProps) {
+export function PrincipalPicker({
+  value, onChange, allowEveryone = false, single = false, label, source, allowService = false,
+}: PrincipalPickerProps) {
   const uid = useId().replace(/[^a-zA-Z0-9_-]/g, '')
   const loginOn = useLoginOn()
   // 名录给搭建者及以上（使用者读不到，不去取：取了也是 403）
@@ -112,12 +122,13 @@ export function PrincipalPicker({ value, onChange, allowEveryone = false, single
         return
       }
     }
-    const problem = problemOf(item, known)
+    const problem = problemOf(item, known, allowService)
     const soft = problem === 'missing' && oidc
     if (problem && !(soft && anyway)) {
       setRefused({
         item, soft,
-        message: problem === 'disabled' ? PRINCIPAL_TEXT.disabledUser(item.name)
+        message: problem === 'service' ? PRINCIPAL_TEXT.serviceUser(item.name)
+          : problem === 'disabled' ? PRINCIPAL_TEXT.disabledUser(item.name)
           : soft ? PRINCIPAL_TEXT.unknownOidc(item.name)
           : item.kind === 'group' ? PRINCIPAL_TEXT.unknownGroup(item.name) : PRINCIPAL_TEXT.unknownUser(item.name),
       })
@@ -134,7 +145,8 @@ export function PrincipalPicker({ value, onChange, allowEveryone = false, single
     ? (!pool ? [] : kind === 'user' ? pool.users.map((u) => ({ value: u.username, label: u.display_name }))
       : pool.groups.map((g) => ({ value: g.name, label: g.label })))
     : !known ? [] : kind === 'user'
-      ? known.users.filter((u) => !u.disabled).map((u) => ({ value: u.username, label: u.display_name }))
+      ? known.users.filter((u) => !u.disabled && (allowService || !u.service))
+        .map((u) => ({ value: u.username, label: u.display_name }))
       : known.groups.map((g) => ({ value: g.name, label: g.label }))
   /** 候选池要先输入开头才列（应用授权给了所有人）、列不全（超过上限） */
   const poolHint = asking && pool
@@ -146,7 +158,7 @@ export function PrincipalPicker({ value, onChange, allowEveryone = false, single
       {value.length > 0 && (
         <ul className="mb-1.5 flex flex-wrap gap-1" aria-label={label}>
           {value.map((p) => {
-            const problem = problemOf(p, known)
+            const problem = problemOf(p, known, allowService)
             return (
               <li key={`${p.kind}:${p.name}`} className="chip flex items-center gap-1" data-principal={p.kind}
                   data-principal-problem={problem ?? undefined}
@@ -156,7 +168,8 @@ export function PrincipalPicker({ value, onChange, allowEveryone = false, single
                   {p.kind === 'everyone' ? PRINCIPAL_TEXT.everyone : shown.current.get(p.name) ?? p.name}
                 </span>
                 <span className="sr-only">（{PRINCIPAL_TEXT[p.kind]}）</span>
-                {problem && <span className="text-2xs">· {problem === 'disabled' ? PRINCIPAL_TEXT.disabledTag : PRINCIPAL_TEXT.missingTag}</span>}
+                {problem && <span className="text-2xs">· {problem === 'disabled' ? PRINCIPAL_TEXT.disabledTag
+                  : problem === 'service' ? PRINCIPAL_TEXT.serviceTag : PRINCIPAL_TEXT.missingTag}</span>}
                 <button type="button" className="-mr-0.5 rounded text-faint hover:text-fg" aria-label={PRINCIPAL_TEXT.remove(p.kind === 'everyone' ? PRINCIPAL_TEXT.everyone : p.name)}
                         onClick={() => remove(p)}>
                   <X size={11} aria-hidden />

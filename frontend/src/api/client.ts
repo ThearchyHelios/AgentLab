@@ -28,6 +28,7 @@ import { reportExport } from './reportExport'
 import { apps, ledger } from './apps'
 import { actions, tasks } from './tasks'
 import { auth, identity } from './auth'
+import { accessKeys } from './accessKeys'
 import { capabilities, endpoints, notify } from './capabilities'
 // 普通用户建应用（typesBlueprint.ts 是接口约定）
 import { blueprints, files, personal, templates } from './blueprints'
@@ -907,6 +908,8 @@ export const api = {
   actions,
   auth,
   identity,
+  // 访问密钥与服务账号（下一轮第 2 波）
+  accessKeys,
   capabilities,
   endpoints,
   notify,

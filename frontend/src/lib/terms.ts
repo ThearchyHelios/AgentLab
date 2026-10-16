@@ -5409,9 +5409,11 @@ export const IDENTITY_TEXT = {
   removeGroup: (name: string) => `删除组「${name}」？`,
   removeGroupBody: '应用里绑定到这个组的岗位和授权将失效。',
   offNote: '当前关闭登录：用户和组仅在开启登录后生效',
+  /** 服务账号（只持有访问密钥）：角色、密码不在这里改 */
+  serviceManaged: '服务账号：没有密码、不能登录，在「设置 → 访问密钥」里管理',
   adminOnly: '只有管理员可以管理身份',
   audit: '审计',
-  auditHint: '管理类操作的留痕：登录方式、角色、组、授权、应用发布、端点、能力治理、版本退役',
+  auditHint: '管理类操作的留痕：登录方式、角色、组、授权、应用发布、端点、能力治理、版本退役、访问密钥',
   auditEmpty: '还没有审计记录',
   auditVerified: '已登录',
   auditUnverified: '自报署名',

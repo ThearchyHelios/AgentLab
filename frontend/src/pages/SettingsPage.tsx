@@ -37,6 +37,8 @@ import { GeneralTab } from './settings/GeneralTab'
 import { IdentityTab } from './settings/IdentityTab'
 import { NotifyTab } from './settings/NotifyTab'
 import { AuditTab } from './settings/AuditTab'
+import { AccessKeysTab } from './settings/AccessKeysTab'
+import { ACCESS_KEY_TEXT } from '../lib/termsApp'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
 // 数据源搬去了顶级的「数据」页（/data），/settings/datasources 跳过去
@@ -49,12 +51,14 @@ const TABS = [
   // 应用平台（A7）：登录方式和人、通知渠道、管理类操作的留痕
   { key: 'identity', label: IDENTITY_TEXT.tab },
   { key: 'notify', label: NOTIFY_TEXT.tab },
+  // 访问密钥（下一轮第 2 波）：管理员管服务账号和全部密钥，别人管自己的个人访问密钥
+  { key: 'keys', label: ACCESS_KEY_TEXT.tab },
   { key: 'audit', label: IDENTITY_TEXT.audit },
 ]
 
 /** 只给管理员的页签（§3.12）：登录方式和人、审计 */
 const ADMIN_TABS = new Set(['identity', 'audit'])
-/** 开了登录的使用者只剩个人的：主题、通知渠道（个人） */
+/** 开了登录的使用者只剩个人的：主题、通知渠道（个人）；管理员开了个人访问密钥时另有自己的访问密钥 */
 const USER_TABS = new Set(['prefs', 'notify'])
 
 export function SettingsPage() {
@@ -63,7 +67,11 @@ export function SettingsPage() {
   const builder = atLeast(me, 'builder')
   const admin = atLeast(me, 'admin')
   // 按角色收起：关登录时所有人等同管理员，全部页签照旧
-  const tabs = TABS.filter((t) => (builder ? admin || !ADMIN_TABS.has(t.key) : USER_TABS.has(t.key)))
+  // 访问密钥：管理员（关登录时人人等同管理员，页里照实说不生效）一直有；别人要管理员开了个人访问密钥才有——关着时建不了，
+  // 已有的个人密钥也不生效，给一页空的没有用
+  const keys = admin || !!me?.personal_keys
+  const tabs = TABS.filter((t) => (t.key === 'keys' ? keys
+    : builder ? admin || !ADMIN_TABS.has(t.key) : USER_TABS.has(t.key)))
   // datasources 也算认得：否则 useTabRoute 会先把地址纠正回 providers，和下面的跳转打架
   const [tab, setTab] = useTabRoute([...tabs.map((t) => t.key), ...(builder ? ['datasources'] : [])], builder ? 'providers' : 'prefs')
 
@@ -78,7 +86,7 @@ export function SettingsPage() {
   return (
     <div className="flex h-full flex-col">
       <PageHeader icon={<SettingsIcon size={13} />} title="设置"
-                  subtitle={builder ? '模型接入、偏好、对外访问地址、运行环境、身份和通知' : SETTINGS_ROLE_TEXT.subtitleUser} />
+                  subtitle={builder ? '模型接入、偏好、对外访问地址、运行环境、身份、通知和访问密钥' : SETTINGS_ROLE_TEXT.subtitleUser} />
       <Tabs tabs={tabs} active={tab} onChange={change} label="设置" idPrefix="settings" />
       <TabPanel idPrefix="settings" tabKey={tab} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-4xl p-4">
@@ -88,6 +96,7 @@ export function SettingsPage() {
           {tab === 'system' && <SystemTab />}
           {tab === 'identity' && <IdentityTab />}
           {tab === 'notify' && <NotifyTab />}
+          {tab === 'keys' && <AccessKeysTab />}
           {tab === 'audit' && <AuditTab />}
         </div>
       </TabPanel>

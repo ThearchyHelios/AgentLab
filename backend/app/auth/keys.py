@@ -309,7 +309,7 @@ KEY_ROUTES: dict[tuple[str, str], KeyRoute] = {
         (*_APP, *_PUBLISHED, *_IDEM, "app_entry_not_found", "app_needs_upgrade", "form_invalid", KEY_FILES_UNSUPPORTED,
          "run_launch_refused"), idempotent=True),
     ("POST", "/api/apps/{app_id}/views/{view_id}/refresh"): KeyRoute(
-        "apps.run", "按需视图按参数运行一次（命中缓存或接上同一组参数正在跑的那次就不再发起）。必须带 Idempotency-Key；"
+        "apps.run", "按需视图按参数运行一次（命中缓存或接上同一组参数正在运行的那次就不再发起）。必须带 Idempotency-Key；"
         "沿用每个应用每天的次数上限",
         (*_APP, *_PUBLISHED, *_IDEM, "app_view_refused", "app_needs_upgrade", "app_view_daily_limit", "form_invalid",
          "run_launch_refused"), idempotent=True),

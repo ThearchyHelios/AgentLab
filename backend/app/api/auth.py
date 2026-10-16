@@ -36,9 +36,12 @@ _OIDC_FIELDS = ("issuer", "client_id", "client_secret", "scopes", "username_clai
 
 
 def principal_out(p: Principal) -> dict[str, Any]:
+    from app.auth import personal_keys_enabled
+
+    # personal_keys：管理员开没开个人访问密钥（next-round 04 A1），不是管理员的人在设置里据此给不给「访问密钥」一页
     return {"mode": p.mode, "username": p.username, "display_name": p.display_name or p.username,
             "role": p.role or "user", "groups": list(p.groups), "verified": p.verified,
-            "user_can_chat": user_can_chat()}
+            "user_can_chat": user_can_chat(), "personal_keys": personal_keys_enabled()}
 
 
 async def principal_full(session: AsyncSession, p: Principal) -> dict[str, Any]:
