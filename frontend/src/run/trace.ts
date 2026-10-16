@@ -21,9 +21,13 @@ import { applyDerived, type GraphLike } from './derive'
 export type RunPhase =
   | 'idle' | 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'suspended'
 
+/**
+ * rejected：这一步被人驳回（node.failed 带 reason=rejected，总方案 X9）。是人的决定、不是故障：不画失败色，不算「失败于 X」，
+ * 下游也不是「被阻断」（运行收成了 cancelled，没走到的照旧是未到达）。老运行的 node.failed 没有 reason，照旧是 failed
+ */
 export type NodeState =
   | 'idle' | 'queued' | 'running' | 'waiting' | 'done' | 'failed' | 'skipped'
-  | 'cancelled' | 'suspended' | 'blocked' | 'unreached'
+  | 'cancelled' | 'suspended' | 'blocked' | 'unreached' | 'rejected'
 
 export interface Segment {
   start: number
@@ -568,6 +572,8 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       if (!nodeId) break
       const n = node(nodeId)
       const failed = type === 'node.failed'
+      // 被人驳回的那一步（服务端在 node.failed 上带 reason=rejected）：这一段收成「被驳回」，不是失败
+      const rejected = failed && d.reason === 'rejected'
       // 节点跑完了，决定已经生效（兜底 human.resolved 没发出来的老运行）
       if (!failed && next.book.asking[nodeId]) delete book().asking[nodeId]
       const ms = num(d.duration_ms)
@@ -583,7 +589,7 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       if (open >= 0) {
         const seg = n.segments[open]
         if (!tsOk && ms != null) end = seg.start + ms
-        patchSeg(n, open, { end, status: failed ? 'failed' : 'done' })
+        patchSeg(n, open, { end, status: rejected ? 'rejected' : failed ? 'failed' : 'done' })
       }
       // 容器里还开着的成员、调度段：节点都结束了，它们不可能还在跑
       n.segments.forEach((s, i) => {
@@ -597,10 +603,11 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       // 漏了 tool.end 的工具随节点一起收掉；记一条刻度，下一轮回放时不带着上一轮的「在跑」
       if (n.toolsRunning) { n.toolsRunning = 0; mark(n) }
       n.looping = looping
-      n.state = failed ? 'failed' : looping ? 'running' : 'done'
+      n.state = rejected ? 'rejected' : failed ? 'failed' : looping ? 'running' : 'done'
       if (failed) {
+        // 驳回的原话照样留着（卡片、航迹悬停写得出是谁驳回、为什么），但它不是「最近一次失败」：不拿它当失败的节点
         n.error = String(d.error ?? '')
-        book().lastFailed = nodeId
+        if (!rejected) book().lastFailed = nodeId
       } else {
         n.attempt = num(d.attempt) ?? n.attempt
       }

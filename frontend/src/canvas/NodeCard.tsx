@@ -18,7 +18,7 @@ import { explainRunError } from '../lib/explain'
 import { formatDuration, formatLapse, formatNumber, formatTokens, NONE, shortId } from '../lib/format'
 import { statusMeta } from '../lib/status'
 import {
-  CHALLENGE_TEXT, claimTally, DUAL_CHECK_TEXT, issuanceLabel, reportStampText, RUN_CLASS_LABEL, UPGRADE_POLICY_LABEL,
+  CHALLENGE_TEXT, claimTally, DUAL_CHECK_TEXT, issuanceLabel, REJECTED_TEXT, reportStampText, RUN_CLASS_LABEL, UPGRADE_POLICY_LABEL,
 } from '../lib/terms'
 import { useReportStamp, type ReportStamp } from './reportStamp'
 import { ApprovalCard } from '../run/RunPanel'
@@ -559,6 +559,14 @@ function readingOf({ state, view, type, config, skewMs, timed, fanIn, facts, sin
         noteTitle: why.title,
       }
     }
+    case 'rejected':
+      // 被人驳回（node.failed 带 reason=rejected）：人的决定，不是失败。状态字已经写了「被驳回」，槽里写原话的第一句
+      // （「人工驳回：数字对不上」），整句放悬停；不按失败去归类、讲处理建议
+      return {
+        main: formatDuration(n?.lastDurationMs ?? runtime?.durationMs),
+        note: error ? firstSentence(error) : REJECTED_TEXT.card,
+        noteTitle: error || undefined,
+      }
     case 'queued':
       return { main: '', note: fanIn > 1 ? '等待其余上游完成' : '上游已交付，等待开始' }
     case 'skipped':

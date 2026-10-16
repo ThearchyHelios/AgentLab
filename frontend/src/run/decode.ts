@@ -93,7 +93,8 @@ export type StepKind =
  * suspended：服务重启时还在跑的步骤，断点还在，可以接着跑。
  * skipped：skip_if 成立、这一步没有执行。和"根本没轮到"是两回事，得留痕。
  */
-export type StepStatus = 'running' | 'done' | 'failed' | 'waiting' | 'cancelled' | 'suspended' | 'skipped'
+/** rejected：这一步被人驳回（node.failed 带 reason=rejected）。人的决定，不是失败：不画红、不算出错 */
+export type StepStatus = 'running' | 'done' | 'failed' | 'waiting' | 'cancelled' | 'suspended' | 'skipped' | 'rejected'
 
 /** 节点的某一次执行。循环体、轮询类节点一次运行里会执行几十上百次 */
 export interface Exec {
@@ -394,7 +395,7 @@ export function decodePhase(events: RunEvent[], final?: RunFinal): RunPhase {
 
 const STEP_OF: Partial<Record<NodeState, StepStatus>> = {
   done: 'done', failed: 'failed', waiting: 'waiting', cancelled: 'cancelled',
-  suspended: 'suspended', running: 'running', skipped: 'skipped',
+  suspended: 'suspended', running: 'running', skipped: 'skipped', rejected: 'rejected',
 }
 const stepStatusOf = (state: NodeState): StepStatus => STEP_OF[state] ?? 'done'
 
@@ -2018,10 +2019,31 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
       }
 
       case 'node.failed': {
-        // 节点失败时还在进行中的那次调用就是出错的那次，跟节点一起算失败，不留给清扫写成已取消
-        closeLlm(nodeId, 'failed', at)
         const step = nodeId ? nodeSteps.get(nodeId) : undefined
         const ms = num(d.duration_ms)
+        if (d.reason === 'rejected') {
+          // 人的驳回（服务端给被驳回的那一步的 node.failed 带 reason=rejected，总方案 X9）：这一步写「被驳回」，副标题写谁、
+          // 备注，原话放展开里；不画红、不当成出错（老运行的 node.failed 没有 reason，照旧按失败画）
+          closeLlm(nodeId, 'cancelled', at)
+          const sub = REJECTED_TEXT.step(d)
+          if (step) {
+            const cur = execOf(nodeId)
+            if (cur) { cur.status = 'rejected'; if (ms != null) cur.ms = ms }
+            step.status = 'rejected'
+            step.level = undefined
+            step.sub = sub
+            step.detail = String(d.error ?? '')
+            step.ms = ms
+            step.meta = dur(ms)
+          } else {
+            push({ id: `nr-${seq}`, seq, kind: 'lifecycle', status: 'rejected', title: REJECTED_TEXT.title, sub,
+                   ...(d.error ? { detail: String(d.error) } : {}), nodeId }, nodeId)
+          }
+          trackTeam(event)
+          break
+        }
+        // 节点失败时还在进行中的那次调用就是出错的那次，跟节点一起算失败，不留给清扫写成已取消
+        closeLlm(nodeId, 'failed', at)
         // detail 是原始异常：给排查用，不给人读，折起来
         const raw = typeof d.detail === 'string' && d.detail ? d.detail : undefined
         if (step) {

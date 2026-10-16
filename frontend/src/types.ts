@@ -1506,7 +1506,8 @@ export interface UpgradeResult {
 /** 单个节点在一次运行中的实时状态，驱动画布上的高亮。 */
 export interface NodeRuntime {
   /** cancelled / suspended 是终态清扫时收的：运行被取消或服务重启时还没跑完的节点 */
-  status: 'idle' | 'running' | 'done' | 'failed' | 'waiting' | 'skipped' | 'cancelled' | 'suspended'
+  /** rejected：这一步被人驳回（node.failed 带 reason=rejected，run/trace 的 NodeState 同名） */
+  status: 'idle' | 'running' | 'done' | 'failed' | 'waiting' | 'skipped' | 'cancelled' | 'suspended' | 'rejected'
   durationMs?: number
   preview?: any
   error?: string
