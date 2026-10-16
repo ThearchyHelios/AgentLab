@@ -23,6 +23,7 @@ import { bundle, dispositionName } from './bundle'
 import { compare } from './compare'
 import { inquiry } from './inquiry'
 import { schedules } from './schedules'
+import { sourceChanges } from './sourceChanges'
 import { whatif } from './whatif'
 import { reportExport } from './reportExport'
 // 应用平台：各自的接口文件，这里只挂上去
@@ -948,6 +949,8 @@ export const api = {
 
   // ---- 复核套件：各功能的接口在自己的文件里（api/<名字>.ts），这里只挂上去 ----
   schedules,
+  // 数据源的变化、取值观察、定时维护的步骤、后台任务条（下一轮第 4 波，typesSource.ts 是接口约定）
+  sourceChanges,
   compare,
   bundle,
   inquiry,

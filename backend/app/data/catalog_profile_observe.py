@@ -556,7 +556,16 @@ def _shown(kind: str, data: Mapping[str, Any]) -> dict[str, Any]:
                 "truncated": bool(data.get("truncated"))}
     if kind == "daily_volume":
         days = data.get("days") if isinstance(data.get("days"), Mapping) else {}
-        series = sorted((str(d), int(n)) for d, n in days.items() if isinstance(n, (int, float)))
+        counts = {str(d)[:10]: int(n) for d, n in days.items() if isinstance(n, (int, float))}
+        # 窗口里没数据的日子补 0：只列有数据的日子，断了的那几天在图上就看不出来
+        try:
+            first, last = date.fromisoformat(str(data.get("since"))[:10]), date.fromisoformat(str(data.get("until"))[:10])
+        except ValueError:
+            first = last = None
+        if first and last and 0 <= (last - first).days <= WINDOW_DAYS + 7:
+            for i in range((last - first).days + 1):
+                counts.setdefault((first + timedelta(days=i)).isoformat(), 0)
+        series = sorted(counts.items())
         return {"since": data.get("since"), "until": data.get("until"), "days": [list(p) for p in series],
                 "total": sum(n for _, n in series), "days_with_data": sum(1 for _, n in series if n > 0)}
     if kind == "freshness":

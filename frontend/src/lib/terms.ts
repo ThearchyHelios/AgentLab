@@ -6278,3 +6278,5 @@ export const CAPABILITY_REVIEW_TEXT: typeof CATALOG_REVIEW_TEXT = {
 // 应用平台使用面的文案（FE-5 维护）。调用方照旧从 lib/terms 导入
 export * from './termsApp'
 export * from './termsBlueprint'
+// 数据源的变化、定时维护、后台任务条（下一轮第 4 波 W4-d）
+export * from './termsSource'

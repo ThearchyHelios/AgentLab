@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
-  ArrowLeft, BookMarked, Database, Download, ListFilter as ListFilterIcon, ScanSearch, Sparkles, TriangleAlert, Upload,
+  ArrowLeft, BookMarked, Clock, Database, Download, ListFilter as ListFilterIcon, ScanSearch, Sparkles, Upload,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
@@ -14,12 +14,12 @@ import { useCatalog, useDatasources, useOnReconnect } from '../../store/catalog'
 import { errorMessage } from '../../lib/errors'
 import { formatNumber } from '../../lib/format'
 import {
-  CATALOG_DRAFT_TEXT as DT, CATALOG_REVIEW_TEXT as RT, CATALOG_TEXT as CT, CATALOG_TRANSFER_TEXT as XT, PROFILE_TEXT as PT,
-  SCHEMA_PARTIAL_TEXT as SPT,
+  CATALOG_DRAFT_TEXT as DT, CATALOG_REVIEW_TEXT as RT, CATALOG_TEXT as CT, CATALOG_TRANSFER_TEXT as XT, JOB_STRIP_TEXT as JT,
+  PROFILE_TEXT as PT, SCHEMA_PARTIAL_TEXT as SPT, SOURCE_CHANGE_TEXT as GT,
 } from '../../lib/terms'
 import { StatusLegend, SystemNotesNotice } from './parts'
 import { DraftDialog } from './DraftDialog'
-import { isJobActive, jobBlank, retryableCount, useDraftJob, waitsForProfile } from './draftJob'
+import { isJobActive, jobBlank, retryableCount, useDraftJob } from './draftJob'
 import type { DraftPreset, DraftStartBody } from './draftJob'
 import { ProfileDialog } from './ProfileDialog'
 import { ProfileSettingsDialog } from './ProfileSettings'
@@ -32,7 +32,12 @@ import { TableIndex } from './TableIndex'
 import { ReviewOverview, ReviewQueue } from './ReviewQueue'
 import { ImportDialog } from './TransferDialog'
 import { itemKey, reviewParamsOf, writeReviewParams } from './review'
-import type { CatalogView } from './review'
+import { ChangesQueue } from './ChangesQueue'
+import { ChangeDetail, ChangesOverview } from './ChangeDetail'
+import { changesParamsOf, clearChanges, isChangesView, writeChangesParams, writtenTables } from './changes'
+import { JobStrip, stripItems, useSourceJobs } from './JobStrip'
+import type { StripItem } from './JobStrip'
+import type { SourceChangeCategory, SourceChangeCounts, SourceChangeResolveOut, SourceChangeStatusFilter } from '../../typesSource'
 import { dueCount, filterCounts, listParamsOf, progressOf, rowFromDetail, usageSummary, visibleRows, writeListParams } from './model'
 import type { ListFilter, ListParams, ListSort } from './model'
 
@@ -48,13 +53,17 @@ import type { ListFilter, ListParams, ListSort } from './model'
 // 清单的搜索词、筛选、排序和「只看运行中查询过的表」记在地址的查询参数里（q / filter / sort / used），刷新、前进后退
 // 都不丢；在清单和表详情之间跳转时带着它们走。
 //
-// 左栏有两个视图：表清单（逐表看）和审阅队列（view=review：跨表按优先级列出推断项，成批确认、驳回，筛选记在 kind /
-// rtable 里）。从队列点开一项，右栏是所在表的详情，地址带着那一项（item），详情滚到那一项、列出用过这张表的运行。
+// 左栏有三个视图：表清单（逐表看）、审阅队列（view=review：跨表按优先级列出推断项，成批确认、驳回，筛选记在 kind /
+// rtable 里）和变化（view=changes：探查、取值观察测到的结构变化、取值变化，按要处理 / 提醒 / 说明分组，筛选记在 cstatus /
+// ccat 里）。从队列点开一项，右栏是所在表的详情，地址带着那一项（item），详情滚到那一项、列出用过这张表的运行；从变化里点开
+// 一条（change），右栏是它的依据、影响面和处理。
 // 页头的「导出目录」「导入目录」把整理好的目录带到另一个实例（导入先预览，确认后才写）。
 //
-// 起草、剖析都是服务端的后台任务（draftJob.ts、profileJob.ts），状态在这一页上：关掉对话框照常进行，页头的「起草」「数据
-// 剖析」换成进度入口（「起草 3/20」「剖析 12/40」「剖析 排队中」），点开对应的对话框；结束时右下角提示，可以回到结果。
-// 同一个数据源的起草和剖析按建立顺序排队：一个在排队、进行中时，另一个建出来是排队，前一个结束后自动开始。
+// 起草、剖析都是服务端的后台任务（draftJob.ts、profileJob.ts），状态在这一页上：关掉对话框照常进行；结束时右下角提示，可以
+// 回到结果。同一个数据源的探查、起草、剖析在同一条队里排队：一个在排队、进行中时，另一个建出来是排队，前一个结束后自动开始。
+// 进度只在页头下方的后台任务条上（JobStrip，按服务端给的队列先后列出，next-round 05 (g)）；页头的「起草」「数据剖析」只是
+// 入口，进行中换转圈、排队中换时钟，读屏名称写状态、不写数字。
+// 地址里带 pjob / djob 时打开那个剖析、起草任务的进度（定时维护的「最近一次」从数据源页链过来）。
 // ===========================================================================
 
 export function CatalogPage() {
@@ -135,7 +144,12 @@ export function CatalogPage() {
   carriedRef.current = carried
   /** 审阅视图：view=review 时左栏是审阅队列；kind、rtable 是队列的筛选；item 是右栏从队列打开的那一项 */
   const review = useMemo(() => reviewParamsOf(params), [params])
-  const inReview = review.view === 'review'
+  /** 变化视图：view=changes 时左栏是变化列表；cstatus、ccat 是筛选；change 是右栏打开的那一条 */
+  const inChanges = isChangesView(params)
+  const changesParams = useMemo(() => changesParamsOf(params), [params])
+  const pageView: PageView = inChanges ? 'changes' : review.view
+  const inReview = pageView === 'review'
+  const openChangeId = inChanges ? changesParams.change || null : null
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
   /**
    * 起草对话框开着没有、打开时显示什么：setup 选范围开始；job 显示页面跟着的任务（进行中的进度、刚结束的结果）。
@@ -248,12 +262,12 @@ export function CatalogPage() {
   const onGuidanceSaved = useCallback((g: string | null) => {
     setData((cur) => cur && ({ ...cur, guidance: g }))
   }, [])
-  // 上方的进度：跟着的任务在进行就按它；跟着的就是清单说的那一个、已经结束了，就不信清单（清单还没重取回来）
+  // 起草任务现在的样子：跟着的任务在进行就按它；跟着的就是清单说的那一个、已经结束了，就不信清单（清单还没重取回来）
   const listActive = isJobActive(data?.active_job) ? data?.active_job ?? null : null
-  const stripJob: { done: number; total: number; status: string; waiting_for?: string | null } | null = draftJob && (draftActive || draftJob.id === listActive?.id)
+  const stripJob: { id: string; done: number; total: number; status: string; waiting_for?: string | null } | null = draftJob && (draftActive || draftJob.id === listActive?.id)
     ? (draftActive ? draftJob : null)
     : listActive
-  // 调用接连没写出来的提醒：关着对话框时也要看得到（上方的进度带着它）
+  // 调用接连没写出来的提醒：关着对话框时也要看得到（后台任务条上起草那一行带着它）
   const stripNotice = draftActive ? draftJob?.notice?.trim() || null : null
 
   const options = savedOptions?.sourceId === sourceId ? savedOptions.options : source?.options
@@ -288,7 +302,7 @@ export function CatalogPage() {
   const profileActive = isJobActive(profileJob)
   // 页头的剖析进度：同起草，跟着的任务在进行就按它；跟着的就是清单说的那一个、已经结束了，就不信清单
   const listProfile = isJobActive(data?.active_profile_job) ? data?.active_profile_job ?? null : null
-  const profileStrip: { done: number; total: number; status: string; waiting_for?: string | null } | null =
+  const profileStrip: { id: string; done: number; total: number; status: string; waiting_for?: string | null } | null =
     profileJob && (profileActive || profileJob.id === listProfile?.id) ? (profileActive ? profileJob : null) : listProfile
   /** 跟着的剖析任务里各表的状态（表清单的「剖析」一格据此写排队、剖析中） */
   const profileLive = useMemo(() => new Map<string, CatalogProfileTaskStatus>(
@@ -320,6 +334,70 @@ export function CatalogPage() {
       toast.error(e)
     }
   }, [sourceId, profile.job?.id, profile.track])
+  /** 打开起草对话框显示某个任务：页面跟着的那一个直接打开；别的（变化里「重新起草」建的）先取来 */
+  const openDraftJob = useCallback(async (jobId: string) => {
+    if (draft.job?.id === jobId) {
+      setDraftOpen({ view: 'job' })
+      return
+    }
+    const src = sourceId
+    try {
+      const { job } = await api.dataCatalog.draftJob(src, jobId)
+      if (sourceRef.current !== src) return
+      draft.track(job)
+      setDraftOpen({ view: 'job' })
+    } catch (e) {
+      toast.error(e)
+    }
+  }, [sourceId, draft.job?.id, draft.track])
+  const openJob = useCallback((kind: 'draft' | 'profile', id: string) => {
+    if (kind === 'draft') void openDraftJob(id)
+    else void openProfileJob(id)
+  }, [openDraftJob, openProfileJob])
+  // 地址里带着 pjob / djob（定时维护的「最近一次」从数据源页链过来）：打开那个任务的进度，参数用过就去掉
+  const linkedJob = params.get('pjob') ? `profile:${params.get('pjob')}` : params.get('djob') ? `draft:${params.get('djob')}` : ''
+  const linkedSeen = useRef('')
+  useEffect(() => {
+    if (!linkedJob || linkedSeen.current === linkedJob || !data) return
+    linkedSeen.current = linkedJob
+    const [kind, id] = linkedJob.split(':')
+    openJob(kind as 'draft' | 'profile', id)
+    const next = new URLSearchParams(window.location.search)
+    next.delete('pjob')
+    next.delete('djob')
+    navigate({ search: next.toString() ? `?${next.toString()}` : '' }, { replace: true })
+  }, [linkedJob, data, openJob, navigate])
+
+  /**
+   * 后台任务条：服务端排好的队列（探查、起草、剖析），起草、剖析换上页面跟着的任务的数和提醒。页面上的任务换了状态就重取一次
+   * 队列（排在谁后面跟着变）
+   */
+  const profileNotice = profileActive ? profileJob?.notice?.trim() || null : null
+  const jobsKick = `${stripJob?.id ?? ''}:${stripJob?.status ?? ''}|${profileStrip?.id ?? ''}:${profileStrip?.status ?? ''}`
+  const sourceJobs = useSourceJobs(sourceId, jobsKick)
+  const jobItems = useMemo(() => stripItems(sourceJobs.items, {
+    draft: stripJob ? { kind: 'draft', id: stripJob.id, status: stripJob.status, done: stripJob.done, total: stripJob.total,
+      waiting_for: stripJob.waiting_for ?? null, position: null, notice: stripNotice } : null,
+    profile: profileStrip ? { kind: 'profile', id: profileStrip.id, status: profileStrip.status, done: profileStrip.done,
+      total: profileStrip.total, waiting_for: profileStrip.waiting_for ?? null, position: null, notice: profileNotice } : null,
+  }), [sourceJobs.items, stripJob, stripNotice, profileStrip, profileNotice])
+  const openStripItem = useCallback((item: StripItem) => {
+    if (item.kind === 'introspect') navigate(`${back}#source-${encodeURIComponent(sourceId)}`)
+    else openJob(item.kind, item.id)
+  }, [navigate, back, sourceId, openJob])
+
+  // 变化视图：标签上的「N 条要处理」、处理过一条之后左栏重取
+  const [changeCounts, setChangeCounts] = useState<{ src: string; counts: SourceChangeCounts } | null>(null)
+  const [changesSeq, setChangesSeq] = useState(0)
+  const loadChangeCounts = useCallback(() => {
+    const src = sourceId
+    api.sourceChanges.list(src, { limit: 1 }).then((r) => setChangeCounts({ src, counts: r.counts }), () => {})
+  }, [sourceId])
+  useEffect(() => { loadChangeCounts() }, [loadChangeCounts])
+  useOnReconnect(loadChangeCounts)
+  const actionCount = changeCounts?.src === sourceId ? changeCounts.counts.by_severity.action : 0
+  const onChangeCounts = useCallback((counts: SourceChangeCounts) => setChangeCounts({ src: sourceId, counts }), [sourceId])
+
   const tableProfile: TableProfileProps = useMemo(() => ({
     job: profileJob, onStart: profileTable, onShowActive: profile.showActive, onSettings: () => setProfileSettingsOpen(true),
     onOpenJob: (id: string | null) => void openProfileJob(id),
@@ -376,10 +454,29 @@ export function CatalogPage() {
     const next = fn(new URLSearchParams(window.location.search)).toString()
     navigate({ search: next ? `?${next}` : '' }, opts)
   }, [navigate])
-  /** 换视图（表清单 / 审阅队列）：记进地址（后退回到上一个视图），右栏正在看的表不动 */
-  const setView = useCallback((v: CatalogView) => {
-    patchSearch((prev) => writeReviewParams(prev, { view: v, item: '' }))
+  /** 换视图（表清单 / 审阅队列 / 变化）：记进地址（后退回到上一个视图），右栏正在看的表不动 */
+  const setView = useCallback((v: PageView) => {
+    patchSearch((prev) => (v === 'changes'
+      ? writeChangesParams(writeReviewParams(prev, { item: '' }), { open: true })
+      : clearChanges(writeReviewParams(prev, { view: v, item: '' }))))
   }, [patchSearch])
+  /** 变化视图的筛选：替换当前这条历史 */
+  const setChangesFilter = useCallback((p: { status?: SourceChangeStatusFilter; category?: SourceChangeCategory | null }) => {
+    patchSearch((prev) => writeChangesParams(prev, p), { replace: true })
+  }, [patchSearch])
+  /** 打开一条变化：右栏是它，地址带着它（表详情里点「去处理」也走这里，切到变化视图） */
+  const openChange = useCallback((id: string) => {
+    const q = writeChangesParams(clearChanges(carriedRef.current), { open: true, change: id, status: changesParams.status,
+      category: changesParams.category }).toString()
+    navigate(`${base}${q ? `?${q}` : ''}`)
+  }, [navigate, base, changesParams.status, changesParams.category])
+  /** 窄屏：从一条变化回到变化列表 */
+  const closeChange = useCallback(() => patchSearch((prev) => writeChangesParams(prev, { change: '' })), [patchSearch])
+  /** 从一条变化去看它说的那张表：切回表清单 */
+  const openChangeTable = useCallback((t: string) => {
+    const q = clearChanges(writeReviewParams(carriedRef.current, { view: 'list', item: '' })).toString()
+    navigate(`${base}/${encodeURIComponent(t)}${q ? `?${q}` : ''}`)
+  }, [navigate, base])
   /** 审阅队列的筛选：替换当前这条历史（筛选不该占满后退键） */
   const setReviewParams = useCallback((p: { kind?: CatalogReviewKind; table?: string }) => {
     patchSearch((prev) => writeReviewParams(prev, p), { replace: true })
@@ -394,6 +491,17 @@ export function CatalogPage() {
     setDrafted((cur) => ({ seq: cur.seq + 1, tables: new Set(tables) }))
     void load()
   }, [load])
+  /** 处理过一条变化：左栏重取、计数跟着变；动了目录的重取清单、重新载入那几张表；建了任务的跟上（清单带着进行中的任务） */
+  const onChangeResolved = useCallback((out: SourceChangeResolveOut) => {
+    setChangesSeq((n) => n + 1)
+    loadChangeCounts()
+    const tables = writtenTables(out.change, out.catalog_versions)
+    if (tables.length) onTablesWritten(tables)
+    else if (out.job) void load()
+    if (out.job) sourceJobs.refresh()
+  }, [loadChangeCounts, onTablesWritten, load, sourceJobs.refresh])
+  /** 右栏有内容（打开了一张表、一条变化）：窄屏一次只显示一栏，这时显示右栏 */
+  const rightOpen = !!table || !!openChangeId
   const activeReviewKey = inReview && table && review.item ? itemKey({ table_name: table, path: review.item }) : null
   const proposedTotal = useMemo(() => rows.reduce((n, r) => n + (r.in_schema ? r.counts.proposed : 0), 0), [rows])
 
@@ -438,36 +546,28 @@ export function CatalogPage() {
       <Sparkles size={11} aria-hidden /> {CT.draft}
     </button>
   )
-  // 页头的「数据剖析」「起草」：任务在排队、进行中时换成进度入口（「剖析 12/40」「剖析 排队中」），点开对应的对话框
-  // （关掉对话框任务照常进行）；排在另一种任务后面时悬停写明。窄屏只留图标，标题才放得下（进度在读屏的名称里）
-  const profileQueued = profileStrip?.status === 'queued'
-  const profileLabel = profileStrip ? (profileQueued ? PT.headerQueued : PT.headerRunning(profileStrip.done, profileStrip.total)) : PT.action
-  const profileTitle = profileStrip
-    ? (profileQueued ? (profileStrip.waiting_for === 'draft' ? PT.headerQueuedDraft
-      : profileStrip.waiting_for === 'introspect' ? PT.headerQueuedIntrospect : PT.headerQueuedHint)
-      : PT.headerRunningHint(profileStrip.done, profileStrip.total))
-    : PT.actionHint
-  // 最近查询多数超时的提醒：对话框关着时也要看得到（页头的入口换成提醒色，悬停写全文）
-  const profileNotice = profileActive ? profileJob?.notice?.trim() || null : null
+  // 页头的「数据剖析」「起草」只是入口（进度在下方的后台任务条上，05 (g)）：进行中换转圈图标、排队中换时钟，读屏名称写状态、
+  // 不写数字；点开对应的对话框（关掉对话框任务照常进行）。窄屏只留图标，标题才放得下
+  const headState = (job: { status: string } | null) => (job?.status === 'queued' ? 'queued' : job?.status === 'running' ? 'running' : null)
+  const headLabel = (label: string, state: 'queued' | 'running' | null) =>
+    (state === 'running' ? JT.headRunning(label) : state === 'queued' ? JT.headQueued(label) : label)
+  const headIcon = (state: 'queued' | 'running' | null, idle: ReactNode) =>
+    (state === 'running' ? <Spinner size={11} /> : state === 'queued' ? <Clock size={11} aria-hidden /> : idle)
+  const profileState = headState(profileStrip)
+  const profileLabel = headLabel(PT.action, profileState)
   const headerProfile = (
-    <button type="button" className="btn btn-sm" onClick={openProfile} aria-label={profileLabel} title={profileNotice ? `${profileTitle}。${profileNotice}` : profileTitle}
-            data-catalog-profile={profileStrip?.status ?? ''} data-progress={profileStrip ? `${profileStrip.done}/${profileStrip.total}` : undefined}>
-      {profileStrip && !profileQueued ? <Spinner size={11} /> : <ScanSearch size={11} aria-hidden />}
-      <span className="tnum hidden sm:inline">{profileLabel}</span>
-      {profileNotice && <TriangleAlert size={11} className="shrink-0 text-[var(--warn)]" aria-hidden data-catalog-profile-notice="" />}
+    <button type="button" className="btn btn-sm" onClick={openProfile} aria-label={profileLabel} title={profileState ? profileLabel : PT.actionHint}
+            data-catalog-profile={profileStrip?.status ?? ''}>
+      {headIcon(profileState, <ScanSearch size={11} aria-hidden />)}
+      <span className="hidden sm:inline">{PT.action}</span>
     </button>
   )
-  const draftQueued = stripJob?.status === 'queued'
-  const draftLabel = stripJob ? (draftQueued ? DT.headerQueued : DT.headerRunning(stripJob.done, stripJob.total)) : CT.draft
-  const draftTitle = stripJob
-    ? (draftQueued ? (waitsForProfile(stripJob) ? DT.headerQueuedProfile
-      : stripJob.waiting_for === 'introspect' ? DT.headerQueuedIntrospect : DT.headerQueuedHint)
-      : DT.headerRunningHint(stripJob.done, stripJob.total))
-    : CT.draft
+  const draftState = headState(stripJob)
+  const draftLabel = headLabel(CT.draft, draftState)
   const headerDraft = (
-    <button type="button" className="btn btn-sm" onClick={openDraft} aria-label={draftLabel} title={draftTitle} data-catalog-draft=""
+    <button type="button" className="btn btn-sm" onClick={openDraft} aria-label={draftLabel} title={draftLabel} data-catalog-draft=""
             data-catalog-draft-head={stripJob?.status ?? ''}>
-      {stripJob && !draftQueued ? <Spinner size={11} /> : <Sparkles size={11} aria-hidden />} <span className="tnum hidden sm:inline">{draftLabel}</span>
+      {headIcon(draftState, <Sparkles size={11} aria-hidden />)} <span className="hidden sm:inline">{CT.draft}</span>
     </button>
   )
 
@@ -495,10 +595,15 @@ export function CatalogPage() {
   } else {
     body = (
       <div className="flex min-h-0 flex-1">
-        <aside className={clsx('min-h-0 w-full flex-col border-r lg:flex lg:w-[380px] lg:shrink-0 xl:w-[420px]', table ? 'hidden' : 'flex')}>
-          <ViewTabs view={review.view} proposed={proposedTotal} onChange={setView} />
-          <div role="tabpanel" id="catalog-view-panel" aria-labelledby={`catalog-view-tab-${review.view}`} className="flex min-h-0 flex-1 flex-col">
-            {inReview
+        <aside className={clsx('min-h-0 w-full flex-col border-r lg:flex lg:w-[380px] lg:shrink-0 xl:w-[420px]', rightOpen ? 'hidden' : 'flex')}>
+          <ViewTabs view={pageView} proposed={proposedTotal} changes={actionCount} onChange={setView} />
+          <div role="tabpanel" id="catalog-view-panel" aria-labelledby={`catalog-view-tab-${pageView}`} className="flex min-h-0 flex-1 flex-col">
+            {inChanges
+              ? (
+                <ChangesQueue sourceId={sourceId} params={changesParams} activeId={openChangeId} refreshKey={changesSeq}
+                              onParams={setChangesFilter} onOpen={(c) => openChange(c.id)} onCounts={onChangeCounts} />
+              )
+              : inReview
               ? (
                 <ReviewQueue sourceId={sourceId} rows={rows} kind={review.kind} table={review.table} activeKey={activeReviewKey}
                              detailSync={detailSync} onParams={setReviewParams} onOpenItem={openReviewItem} onChanged={onTablesWritten} />
@@ -544,15 +649,22 @@ export function CatalogPage() {
               )}
           </div>
         </aside>
-        <section className={clsx('min-h-0 min-w-0 flex-1 flex-col lg:flex', table ? 'flex' : 'hidden')} aria-label={table ?? CT.overviewTitle}>
-          {table
+        <section className={clsx('min-h-0 min-w-0 flex-1 flex-col lg:flex', rightOpen ? 'flex' : 'hidden')} aria-label={table ?? CT.overviewTitle}>
+          {openChangeId
+            ? (
+              <ChangeDetail sourceId={sourceId} changeId={openChangeId} onBack={closeChange} onResolved={onChangeResolved}
+                            onOpenTable={openChangeTable} onOpenJob={openJob} />
+            )
+            : table
             ? (
               <TableDetail sourceId={sourceId} table={table} rows={rows} drafted={drafted} fillCodes={fillCodes} prev={prev} next={next}
                            onFillDone={onFillDone} onOpen={openTable} onBack={backToList} onDetail={onDetail}
                            draftBusy={!!stripJob} onRedraft={redraftTable} onDraftGuidance={draftWithGuidance}
                            profileEnabled={profileSettings.enabled} focusPath={inReview ? review.item || null : null} usageOpen={inReview}
-                           profile={tableProfile} />
+                           profile={tableProfile} onOpenChange={openChange} />
             )
+            : inChanges
+              ? <ChangesOverview />
             : inReview
               ? <ReviewOverview />
               : <Overview rows={rows} empty={empty} systemNotes={data.system_notes} draft={draftButton(true)} onOpen={openTable}
@@ -596,7 +708,7 @@ export function CatalogPage() {
                              scoped={!!data.scope} onGoSource={() => navigate(back)} />
       )}
       {hasTables && usage.used > 0 && !empty && <UsageSummary {...usage} active={usedOnly ? filter : null} onFocus={focusUsed} />}
-      {hasTables && stripJob && !draftOpen && <DraftStrip job={stripJob} notice={stripNotice} onOpen={openDraft} />}
+      {hasTables && <JobStrip items={jobItems} onOpen={openStripItem} />}
       {body}
       {draftOpen && data && (
         <DraftDialog
@@ -660,45 +772,6 @@ export function CatalogPage() {
   )
 }
 
-/**
- * 起草任务在进行：目录页上方一条进度（关掉对话框任务照常进行，每张表起草完就写进目录）。点「查看进度」回到对话框。
- * notice：调用接连没写出来时服务端给的提醒，跟着写一行（全文在悬停里，对话框里也有）
- */
-function DraftStrip({ job, notice, onOpen }: {
-  job: { done: number; total: number; status: string; waiting_for?: string | null }
-  notice: string | null
-  onOpen: () => void
-}) {
-  // 排在剖析任务后面（同一个数据源的起草和剖析按建立顺序排队）：写明剖析结束后自动开始
-  const text = job.status === 'queued'
-    ? (waitsForProfile(job) ? DT.stripQueuedProfile(job.total)
-      : job.waiting_for === 'introspect' ? DT.stripQueuedIntrospect(job.total) : DT.stripQueued(job.total))
-    : DT.strip(job.done, job.total)
-  return (
-    <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2 text-xs"
-         style={{ background: 'color-mix(in srgb, var(--accent) 6%, var(--bg-panel))' }}
-         data-catalog-draft-progress={`${job.done}/${job.total}`}>
-      <Spinner size={12} />
-      <div className="min-w-0 flex-1">
-        <p className="truncate font-medium" title={text}>{text}</p>
-        {notice && (
-          <p className="mt-0.5 flex min-w-0 items-center gap-1 text-2xs text-[var(--warn)]" role="status" title={notice}
-             data-catalog-draft-notice="">
-            <TriangleAlert size={10} className="shrink-0" aria-hidden />
-            <span className="min-w-0 truncate">{notice}</span>
-          </p>
-        )}
-        <div className="mt-1 h-1 max-w-xs overflow-hidden rounded-full bg-hover" role="progressbar" aria-label={text}
-             aria-valuemin={0} aria-valuemax={job.total} aria-valuenow={job.done}>
-          <div className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-300"
-               style={{ width: `${job.total ? (job.done / job.total) * 100 : 0}%` }} />
-        </div>
-      </div>
-      <button type="button" className="btn btn-sm shrink-0" onClick={onOpen} data-catalog-draft-open="">{DT.stripOpen}</button>
-    </div>
-  )
-}
-
 /** 存成文件（同运行记录里的下载）：浏览器下载，文件名照给的 */
 function saveFile(name: string, blob: Blob) {
   const url = URL.createObjectURL(blob)
@@ -709,13 +782,17 @@ function saveFile(name: string, blob: Blob) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-const VIEWS: CatalogView[] = ['list', 'review']
+/** 数据目录页左栏的三个视图 */
+type PageView = 'list' | 'review' | 'changes'
+const VIEWS: PageView[] = ['list', 'review', 'changes']
 
 /**
- * 左栏上方的两个视图：表清单（逐表看）、审阅队列（跨表按优先级看推断项，带着还有几项待确认）。标签页语义，
- * ←→ Home End 切换
+ * 左栏上方的三个视图：表清单（逐表看）、审阅队列（跨表按优先级看推断项，带着还有几项待确认）、变化（探查、取值观察测到的
+ * 结构变化和取值变化，带着几条要处理）。标签页语义，←→ Home End 切换
  */
-function ViewTabs({ view, proposed, onChange }: { view: CatalogView; proposed: number; onChange: (v: CatalogView) => void }) {
+function ViewTabs({ view, proposed, changes, onChange }: {
+  view: PageView; proposed: number; changes: number; onChange: (v: PageView) => void
+}) {
   const refs = useRef<Record<string, HTMLButtonElement | null>>({})
   const move = (e: ReactKeyboardEvent, i: number) => {
     const j = rovingTarget(e, i, VIEWS.length, 'horizontal')
@@ -730,12 +807,17 @@ function ViewTabs({ view, proposed, onChange }: { view: CatalogView; proposed: n
         const selected = view === v
         return (
           <button key={v} ref={(el) => { refs.current[v] = el }} type="button" role="tab" id={`catalog-view-tab-${v}`} aria-selected={selected}
-                  aria-controls="catalog-view-panel" tabIndex={selected ? 0 : -1} title={RT.viewHint[v]}
+                  aria-controls="catalog-view-panel" tabIndex={selected ? 0 : -1} title={v === 'changes' ? GT.viewHint : RT.viewHint[v]}
                   onClick={() => onChange(v)} onKeyDown={(e) => move(e, i)} data-catalog-view-tab={v}
                   className={clsx('relative px-3 py-2 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--accent)]',
                     selected ? 'text-fg' : 'text-faint hover:text-dim')}>
-            {RT.view[v]}
+            {v === 'changes' ? GT.view : RT.view[v]}
             {v === 'review' && proposed > 0 && <span className="tnum ml-1.5 text-2xs text-faint">{formatNumber(proposed)}</span>}
+            {v === 'changes' && changes > 0 && (
+              <span className="tnum ml-1.5 text-2xs text-[var(--err)]" data-catalog-changes-count={changes}>
+                <span aria-hidden>{formatNumber(changes)}</span><span className="sr-only">{GT.badge(changes)}</span>
+              </span>
+            )}
             {selected && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded bg-[var(--accent)]" aria-hidden />}
           </button>
         )

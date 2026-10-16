@@ -34,6 +34,7 @@ import { isProfileBusy } from './profileJob'
 import { PROFILE_TASK_ICON, ProfileTaskBody } from './ProfileDialog'
 import { TableAssistant } from './TableAssistant'
 import { TableUsageList } from './TableUsage'
+import { TableChanges } from './TableChanges'
 import {
   COLUMN_FIELDS, DATE_KEYS, TABLE_FIELDS, buildNotes, changeCount, columnPath, confirmProposed, countsOf, formFromNotes,
   relationDraft, relationPath, relationRemoval, tablePath, unknownKeys, validateForm,
@@ -49,6 +50,8 @@ import type { CodesItem, ColumnField, EditForm, RelationDraft, TableField, Table
 //
 // 「数据剖析」一节：这张表上次剖析的时间、发起人、所属任务、行数估算和来源、日期范围、发现、跳过的项、发过的查询；
 // 「剖析这张表」建只含这张表的剖析任务（没开剖析时引到剖析设置；已有剖析任务时写明它到哪了、这张表在不在里面）。
+// 「结构与取值变化」一节（TableChanges）：这张表测到的变化（点开到「变化」视图里处理）、撤销过的「已列全」、最近几次取值观察
+// 和各自的口径。
 // ===========================================================================
 
 const KINDS = Object.keys(CATALOG_KIND_LABEL) as CatalogTableKind[]
@@ -69,7 +72,7 @@ type Conflict = 'edit' | 'review'
 
 export function TableDetail({
   sourceId, table, rows, drafted, fillCodes, onFillDone, prev, next, onOpen, onBack, onDetail, draftBusy = false, onRedraft, onDraftGuidance,
-  profileEnabled = false, focusPath = null, usageOpen = false, profile,
+  profileEnabled = false, focusPath = null, usageOpen = false, profile, onOpenChange,
 }: {
   sourceId: string
   table: string
@@ -108,6 +111,8 @@ export function TableDetail({
   usageOpen?: boolean
   /** 数据剖析：页面跟着的剖析任务、建只含这张表的任务、打开剖析设置和剖析对话框 */
   profile?: TableProfileProps
+  /** 「结构与取值变化」一节里点开一条变化：到数据目录页的「变化」视图里处理它。不给就不画这一节 */
+  onOpenChange?: (id: string) => void
 }) {
   const [detail, setDetail] = useState<CatalogDetail | null>(null)
   const [loadError, setLoadError] = useState<unknown>(null)
@@ -636,6 +641,8 @@ export function TableDetail({
             <ProfileSection table={detail.table_name} detail={detail} row={rows.find((r) => r.table_name === table) ?? null}
                             enabled={profileEnabled} profile={profile} onFillCodes={detail.in_schema ? fillCodesOf : undefined} />
           )}
+
+          {onOpenChange && <TableChanges sourceId={sourceId} table={detail.table_name} refreshKey={detail.version} onOpenChange={onOpenChange} />}
 
           <section aria-labelledby="catalog-sec-impact" data-catalog-section="impact">
             <div className="mb-2 flex flex-wrap items-baseline gap-2">

@@ -341,3 +341,23 @@ def test_schedule_target_columns_are_the_ones_the_page_uses():
     """数据源设置里建的维护定时：target_kind / target_id 写法和调度那一套同一处封装（X4）。"""
     cols = scheduler_service.target_columns("source_maintenance", "src-x")
     assert cols["target_kind"] == "source_maintenance" and cols["target_id"] == "src-x" and cols["workflow_id"] == ""
+
+
+async def test_daily_volume_fills_the_days_without_data(client, shop):
+    """按日行数只记了有数据的日子：窗口里断了的那几天补 0，界面上的小柱图才看得出断档。"""
+    sid = shop["id"]
+    async with SessionLocal() as session:
+        session.add(TableObservation(source_id=sid, table_name="orders", column_name="paid_on", kind="daily_volume",
+                                     basis={"method": "window", "column": "paid_on", "days": 35, "since": "2026-10-01"},
+                                     basis_key="window:paid_on:35",
+                                     data={"since": "2026-10-01", "until": "2026-10-05",
+                                           "days": {"2026-10-01": 30, "2026-10-02": 28, "2026-10-05": 31}},
+                                     at=utcnow()))
+        await session.commit()
+    body = (await client.get(f"/api/datasources/{sid}/observations", params={"table": "orders"})).json()
+    [daily] = [s for s in body["series"] if s["kind"] == "daily_volume"]
+    point = daily["points"][0]
+    assert point["data"]["days"] == [["2026-10-01", 30], ["2026-10-02", 28], ["2026-10-03", 0], ["2026-10-04", 0],
+                                     ["2026-10-05", 31]]
+    assert point["data"]["days_with_data"] == 3 and point["data"]["total"] == 89
+    assert point["basis_text"] == "业务日期 paid_on 最近 35 天"
