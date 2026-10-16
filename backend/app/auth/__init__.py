@@ -15,7 +15,9 @@ import logging
 import os
 from typing import Any
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends
+
+from app.api.coded import AUTH_REQUIRED, ROLE_REQUIRED, CodedHTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -77,17 +79,24 @@ def remember_settings(value: dict[str, Any]) -> None:
     _loaded = True
 
 
+def refusal(principal: Any, role: str) -> CodedHTTPException | None:
+    """principal 够不够 role：够（或关登录）是 None；不够交回该回的错——没登录 401（auth_required），角色不够 403
+    （role_required）。路由级依赖、接口内部的 ensure_role、中间件拦 /docs 都用它，同一个判断、同一句话。"""
+    if principal.mode == "off":
+        return None
+    if not principal.username:
+        return CodedHTTPException(401, "请先登录", AUTH_REQUIRED)
+    if not principal.at_least(role):
+        return CodedHTTPException(403, f"没有权限：这项操作需要{ROLE_LABEL.get(role, role)}及以上的角色", ROLE_REQUIRED)
+    return None
+
+
 def require(role: str) -> None:
-    """当前请求至少是 role，否则 401（没登录）/ 403（角色不够）。关登录时放行。"""
+    """当前请求至少是 role，否则 401（没登录）/ 403（角色不够），都带 code。关登录时放行。"""
     from app.api.deps import current_principal
 
-    principal = current_principal()
-    if principal.mode == "off":
-        return
-    if not principal.username:
-        raise HTTPException(401, "请先登录")
-    if not principal.at_least(role):
-        raise HTTPException(403, f"没有权限：这项操作需要{ROLE_LABEL.get(role, role)}及以上的角色")
+    if (refused := refusal(current_principal(), role)) is not None:
+        raise refused
 
 
 def role_dependency(role: str) -> Any:

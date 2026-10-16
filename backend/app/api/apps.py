@@ -12,14 +12,18 @@ import dataclasses
 import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.coded import CodedHTTPException
+from app.api.coded import (
+    APP_BINDINGS_INVALID, APP_DRAFT_INVALID, APP_GRANTS_INVALID, APP_HOOK_NOT_DECLARED, APP_HOOK_NOT_FOUND,
+    APP_INSTANCE_NOT_FOUND, APP_NOT_FOUND, APP_PARAMS_INVALID, APP_VERSION_NOT_FOUND, RUN_LAUNCH_REFUSED,
+    CodedHTTPException,
+)
 from app.api.deps import Principal, actor_of, current_principal
 from app.apps.access import ROLE_TEXT, app_role, at_least, grants_of
 from app.db.base import get_session
@@ -60,11 +64,11 @@ def _principal(x_actor: str | None) -> Principal:
 async def _app(session: AsyncSession, app_id: str, principal: Principal, need: str) -> tuple[App, str]:
     app = await session.get(App, app_id)
     if app is None:
-        raise HTTPException(404, APP_GONE)
+        raise CodedHTTPException(404, APP_GONE, APP_NOT_FOUND)
     role = await app_role(session, principal, app)
     if role is None:
-        # 没有任何授权的人不该知道这个应用在不在
-        raise HTTPException(404, APP_GONE)
+        # 没有任何授权的人不该知道这个应用在不在：码和不存在的一样
+        raise CodedHTTPException(404, APP_GONE, APP_NOT_FOUND)
     if not at_least(role, need):
         raise CodedHTTPException(403, f"需要这个应用的「{ROLE_TEXT[need]}」权限", NO_ACCESS)
     return app, role
@@ -314,7 +318,7 @@ async def derive(payload: DeriveIn, session: AsyncSession = Depends(get_session)
     try:
         return {"spec": await derive_app(session, payload.workflow_id, payload.version, name=payload.name)}
     except DeriveRefused as e:
-        raise HTTPException(e.status_code, e.message) from e
+        raise CodedHTTPException(e.status_code, e.message, e.code) from e
 
 
 @router.get("/{app_id}")
@@ -359,13 +363,13 @@ async def update_app(app_id: str, payload: AppPatch, session: AsyncSession = Dep
     app, role = await _app(session, app_id, principal, "manage")
     _refuse_archived(app, "修改")
     if payload.draft_bindings is not None and (problem := _bindings_problem(payload.draft_bindings)):
-        raise HTTPException(422, problem)
+        raise CodedHTTPException(422, problem, APP_BINDINGS_INVALID)
     if app.scope == "personal" and payload.draft is not None:
         # 个人应用的草稿就是在用的那一份：只许改呈现，固定的蓝图、视图来源只由「存成我的应用」改
         from app.blueprints.personal import draft_problem
 
         if problem := draft_problem(app.draft or {}, payload.draft):
-            raise HTTPException(422, problem)
+            raise CodedHTTPException(422, problem, APP_DRAFT_INVALID)
     for key in ("name", "description", "icon"):
         if (value := getattr(payload, key)) is not None:
             setattr(app, key, value)
@@ -568,7 +572,7 @@ async def get_version(app_id: str, version: int, session: AsyncSession = Depends
     row = (await session.execute(select(AppVersion).where(
         AppVersion.app_id == app.id, AppVersion.version == version))).scalar_one_or_none()
     if row is None:
-        raise HTTPException(404, f"「{app.name}」没有 v{version}")
+        raise CodedHTTPException(404, f"「{app.name}」没有 v{version}", APP_VERSION_NOT_FOUND)
     # 岗位绑定是这一个部署里的人和组：管理者才看得到
     return {**_version_row(row), "spec": row.spec, "bindings": row.bindings if role == "manage" else {"slots": {}}}
 
@@ -611,7 +615,7 @@ async def put_grants(app_id: str, payload: GrantsIn, session: AsyncSession = Dep
     _refuse_personal(app, "授权给别人")
     wanted, problem = await grants_problem(session, [(i.principal_kind, i.principal, i.role) for i in payload.items])
     if problem:
-        raise HTTPException(422, problem)
+        raise CodedHTTPException(422, problem, APP_GRANTS_INVALID)
     return {"items": await replace_grants(session, app, wanted, actor=actor_of(x_actor))}
 
 
@@ -713,7 +717,8 @@ async def rotate_hook(app_id: str, name: str, session: AsyncSession = Depends(ge
     draft, published, rows = await _hook_state(session, app)
     declared = draft.get(name) or published.get(name)
     if declared is None:
-        raise HTTPException(404, f"草稿和当前发布版里都没有声明钩子「{name}」，请先在「钩子」一节里声明它")
+        raise CodedHTTPException(404, f"草稿和当前发布版里都没有声明钩子「{name}」，请先在「钩子」一节里声明它",
+                                 APP_HOOK_NOT_DECLARED)
     # 从读行锁到提交：两位管理者同时点「生成密钥」，后到的那次读得到前一次插入的行，只轮换它（见 process/hooks.py）
     async with hooks.hook_lock(app.id, name):
         row, secret, created = await hooks.rotate_hook(session, app.id, name, kind=declared["kind"],
@@ -731,7 +736,7 @@ async def _hook_named(session: AsyncSession, app: App, name: str) -> AppHook:
 
     row = await hook_row(session, app.id, name)
     if row is None:
-        raise HTTPException(404, f"钩子「{name}」还没有生成密钥")
+        raise CodedHTTPException(404, f"钩子「{name}」还没有生成密钥", APP_HOOK_NOT_FOUND)
     return row
 
 
@@ -778,9 +783,9 @@ def _params(raw: str | None) -> dict[str, Any]:
     try:
         value = json.loads(raw)
     except ValueError as e:
-        raise HTTPException(422, "页面参数需要是 JSON 对象") from e
+        raise CodedHTTPException(422, "页面参数需要是 JSON 对象", APP_PARAMS_INVALID) from e
     if not isinstance(value, dict):
-        raise HTTPException(422, "页面参数需要是 JSON 对象")
+        raise CodedHTTPException(422, "页面参数需要是 JSON 对象", APP_PARAMS_INVALID)
     return value
 
 
@@ -788,14 +793,16 @@ async def _instance(session: AsyncSession, app: App, run_id: str, principal: Pri
     """实例要属于这个应用；只有 use 的人只能看自己发起的（关登录时都能看）。"""
     run = await session.get(Run, run_id)
     if run is None or run.app_id != app.id or run.origin_kind not in ("app_entry", "hook"):
-        raise HTTPException(404, "实例不存在")
+        raise CodedHTTPException(404, "实例不存在", APP_INSTANCE_NOT_FOUND)
     if principal.mode != "off" and not at_least(role, "observe") and run.started_by != principal.username:
         raise CodedHTTPException(403, "只能查看自己发起的实例", NO_ACCESS)
     return run
 
 
-def _view_refused(e: Any) -> HTTPException:
-    return CodedHTTPException(e.status_code, e.message, e.code) if e.code else HTTPException(e.status_code, e.message)
+def _view_refused(e: Any) -> CodedHTTPException:
+    """视图、入口、补算、发起运行的拒绝 → 带 code 的 HTTP 错误。只有引擎不发起运行（LaunchRefused）有不带码的几种（工作流
+    没发布、版本不存在、图没通过校验……），补上同一类的 run_launch_refused，detail 照旧说清是哪一种。"""
+    return CodedHTTPException(e.status_code, e.message, e.code or RUN_LAUNCH_REFUSED)
 
 
 @router.get("/{app_id}/pages/{page_id}")

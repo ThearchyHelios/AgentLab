@@ -26,8 +26,10 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends
 from starlette.requests import HTTPConnection
+
+from app.api.coded import CHAT_FORBIDDEN, ROLE_REQUIRED, RUN_FORBIDDEN, RUN_PRIVATE, CodedHTTPException
 
 #: 登录方式
 AUTH_MODES = ("off", "local", "oidc")
@@ -140,7 +142,7 @@ async def can_read_artifact(principal: Principal, artifact_id: str) -> bool:
 
 
 def ensure_role(role: str) -> None:
-    """接口内部用：至少是 role，否则 401（没登录）/ 403（角色不够）。关登录时放行。
+    """接口内部用：至少是 role，否则 401（没登录，auth_required）/ 403（角色不够，role_required）。关登录时放行。
     用在要看请求内容才知道要什么角色的地方（比如 MCP 的 stdio 只有管理员能建）。"""
     from app.auth import require
 
@@ -169,8 +171,8 @@ async def ensure_conversation_access(session: Any, conversation_id: str | None) 
     return await check(session, conversation_id)
 
 
-def _forbidden() -> HTTPException:
-    return HTTPException(403, "没有权限查看这次运行")
+def _forbidden() -> CodedHTTPException:
+    return CodedHTTPException(403, "没有权限查看这次运行", RUN_FORBIDDEN)
 
 
 #: user 角色在自己的问数据运行上能读的（GET /api/runs/{id} 之后的部分）：运行记录、事件、运行时的图，加上实时流
@@ -235,13 +237,13 @@ async def _run_scope(conn: HTTPConnection) -> None:
         return
     ensure_role("user")
     if not user_can_chat():
-        raise HTTPException(403, _RUNS_FOR_BUILDERS)
+        raise CodedHTTPException(403, _RUNS_FOR_BUILDERS, ROLE_REQUIRED)
     method = conn.scope.get("method", "GET")
     run_id = conn.path_params.get("run_id")
     if run_id is None:
         if method == "POST" and conn.url.path.rstrip("/") == "/api/runs":
             return
-        raise HTTPException(403, _RUNS_FOR_BUILDERS)
+        raise CodedHTTPException(403, _RUNS_FOR_BUILDERS, ROLE_REQUIRED)
     run = await _load_run(run_id)
     rest = conn.url.path.rstrip("/").removeprefix(f"/api/runs/{run_id}")
     if method == "GET" and rest in _CHAT_RUN_READS:
@@ -252,7 +254,7 @@ async def _run_scope(conn: HTTPConnection) -> None:
         raise _forbidden()
     if method == "POST" and rest == "/cancel":
         return
-    raise HTTPException(403, "没有权限：这项操作需要搭建者及以上的角色")
+    raise CodedHTTPException(403, "没有权限：这项操作需要搭建者及以上的角色", ROLE_REQUIRED)
 
 
 async def _load_run(run_id: str | None) -> Any:
@@ -282,7 +284,7 @@ async def _refuse_private(conn: HTTPConnection, principal: Principal) -> None:
             from fastapi import WebSocketException, status
 
             raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
-        raise HTTPException(403, PRIVATE_RUN)
+        raise CodedHTTPException(403, PRIVATE_RUN, RUN_PRIVATE)
 
 
 async def _private_run_scope(conn: HTTPConnection) -> None:
@@ -310,7 +312,7 @@ async def _evidence_scope(conn: HTTPConnection) -> None:
         return
     ensure_role("user")
     if conn.scope.get("method", "GET") != "GET":
-        raise HTTPException(403, "没有权限：这项操作需要搭建者及以上的角色")
+        raise CodedHTTPException(403, "没有权限：这项操作需要搭建者及以上的角色", ROLE_REQUIRED)
     run_id = conn.path_params.get("run_id")
     if not run_id or not await can_read_run(principal, run_id):
         raise _forbidden()
@@ -327,7 +329,8 @@ async def _chat_scope(conn: HTTPConnection) -> None:
     method = conn.scope.get("method", "GET")
     if user_can_chat() and (path.startswith("/api/conversations") or (method, path) in _CHAT_ROUTES):
         return
-    raise HTTPException(403, "没有权限：问数据和助手需要搭建者及以上的角色，或由管理员为使用者开启问数据")
+    raise CodedHTTPException(403, "没有权限：问数据和助手需要搭建者及以上的角色，或由管理员为使用者开启问数据",
+                             CHAT_FORBIDDEN)
 
 
 #: user 角色开了问数据时能用的其余接口：问数据的生成流、读当前助手模型、问数据页选数据源用的数据源名单

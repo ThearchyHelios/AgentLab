@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.coded import AUTH_REQUIRED
 from app.api.deps import Principal, current_principal, decode_actor, ensure_role
 from app.auth import (
     MODES, SETTING_KEY, current_mode, env_mode, load_settings, remember_settings, stored_settings, user_can_chat,
@@ -59,7 +60,7 @@ async def me(x_actor: str | None = Header(default=None), session: AsyncSession =
         return await principal_full(session, Principal(username=actor, display_name=actor, role="admin", mode="off"))
     if not principal.username:
         can_bootstrap = principal.mode == "local" and not await _local_admin_exists(session)
-        return JSONResponse(status_code=401, content={"detail": "请先登录", "code": "auth_required",
+        return JSONResponse(status_code=401, content={"detail": "请先登录", "code": AUTH_REQUIRED,
                                                       "mode": principal.mode, "can_bootstrap": can_bootstrap})
     return await principal_full(session, principal)
 
