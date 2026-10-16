@@ -703,6 +703,7 @@ export interface NotifyChannelRow {
 export type OriginKind =
   | 'chat' | 'canvas' | 'launcher' | 'schedule' | 'app_entry' | 'app_view' | 'app_backfill' | 'hook' | 'api'
   | 'trial' | 'personal_app'
+  | 'eval' | 'ledger_issue' | 'reconcile' | 'recall'
 
 /** 查看的对象。caliber 是已发布口径卡上的指标（蓝图助手复用口径时看，服务端 look/calibers.py） */
 export interface LookObject {

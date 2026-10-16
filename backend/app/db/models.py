@@ -654,6 +654,9 @@ class Run(Base, TimestampMixin):
     input: Mapped[dict[str, Any]] = mapped_column(default=dict)
     output: Mapped[dict[str, Any]] = mapped_column(default=dict)
     error: Mapped[str | None] = mapped_column(Text, default=None)
+    # 运行为什么结束在 cancelled（docs/design/next-round/00-总方案.md X9）：rejected 人工驳回、stopped 手动停止。
+    # 其余终态、加这一列之前的运行为空
+    end_reason: Mapped[str | None] = mapped_column(String(20), default=None)
     usage: Mapped[dict[str, Any]] = mapped_column(default=dict)  # tokens / cost / 各节点耗时
     started_at: Mapped[datetime | None] = mapped_column(default=None)
     finished_at: Mapped[datetime | None] = mapped_column(default=None)
@@ -975,6 +978,12 @@ class Schedule(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(200), default="")
+    # 定时的目标（next-round X4，定时只有一套）：workflow 发起工作流运行；eval_suite 跑一次评测题集；
+    # source_maintenance 维护一个数据源（探查、剖析、取值观察）。加这一列之前的任务都是 workflow
+    target_kind: Mapped[str] = mapped_column(String(20), default="workflow")
+    # 目标的 id：workflow 时同 workflow_id；其余两种是题集 id、数据源 id
+    target_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    # 非空（老表的约束，只加不改的迁移放宽不了）：目标不是工作流时存空串，读写都经 scheduler/service 里的一处封装
     workflow_id: Mapped[str] = mapped_column(String(32), index=True)
     # 保存时的工作流名。工作流还在时接口给它现在的名字，删掉之后才用这一份
     workflow_name: Mapped[str] = mapped_column(String(200), default="")
@@ -1020,6 +1029,8 @@ class ScheduleFire(Base):
     # started | skipped_overlap | skipped_misfire | failed_to_start
     status: Mapped[str] = mapped_column(String(30), default="started")
     run_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    # 目标是评测题集时，这一次触发建的那次评测（target_kind=eval_suite，next-round X4）
+    eval_run_id: Mapped[str | None] = mapped_column(String(32), default=None)
     reason: Mapped[str | None] = mapped_column(Text, default=None)
     # 渲染后的输入，就是交给运行的那一份
     inputs: Mapped[dict[str, Any]] = mapped_column(default=dict)

@@ -5114,6 +5114,10 @@ export const ORIGIN_LABEL: Record<OriginKind, string> = {
   api: '接口',
   trial: '蓝图试运行',
   personal_app: '个人应用刷新',
+  eval: '评测',
+  ledger_issue: '按口径正式出具',
+  reconcile: '口径对账',
+  recall: '口径召回',
 }
 
 export const ORIGIN_TEXT = {

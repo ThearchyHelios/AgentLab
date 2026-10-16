@@ -239,6 +239,12 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("apps", "scope", "VARCHAR(20) DEFAULT 'shared'"),
     ("apps", "owner", "VARCHAR(100)"),
     ("apps", "blueprint_id", "VARCHAR(32)"),
+    # 下一轮（docs/design/next-round/00-总方案.md X4、X9）：运行为什么结束在 cancelled；定时的目标种类和 id；
+    # 定时触发建的那次评测。存量行：end_reason 为空，target_kind 是 workflow（target_id 由 scheduler 按 workflow_id 读）
+    ("runs", "end_reason", "VARCHAR(20)"),
+    ("schedules", "target_kind", "VARCHAR(20) DEFAULT 'workflow'"),
+    ("schedules", "target_id", "VARCHAR(32)"),
+    ("schedule_fires", "eval_run_id", "VARCHAR(32)"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。

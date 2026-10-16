@@ -24,6 +24,11 @@ ORIGIN_KINDS = (
     "api",           # 直接调接口，没说是哪
     "trial",         # 蓝图的试运行（探索运行，docs/design/normal-user-apps.md N4）
     "personal_app",  # 个人应用的刷新（探索运行，N7）
+    # 下一轮（docs/design/next-round/00-总方案.md X1）：都只能由服务端写
+    "eval",          # 评测：作答和算期望的运行（探索运行）
+    "ledger_issue",  # 问数据的答案按已治理口径正式出具（正式运行）
+    "reconcile",     # 口径对账：这次的取数和口径在同一份数据上各算一次（探索运行）
+    "recall",        # 口径召回：新旧两版口径在同一份数据上各算一次（探索运行）
 )
 
 #: 客户端在 POST /api/runs 里能声明的来源
