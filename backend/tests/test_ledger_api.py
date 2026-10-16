@@ -18,7 +18,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from app.db.base import SessionLocal
-from app.db.models import AuditEvent, Workflow, WorkflowVersion
+from app.db.models import AuditEvent, Workflow
 from app.engine.runner import run_manager
 from app.ledger import match as ledger_match
 from app.main import app
@@ -27,16 +27,9 @@ from tests import ledger_samples as S
 
 @pytest.fixture(autouse=True)
 async def engine_up(tmp_path):
-    from app.db.base import utcnow
-
     await run_manager.setup()
     path = tmp_path / "shop.db"
-    S.build_shop(path)
-    await S.set_source(path)
-    async with SessionLocal() as session:
-        for row in (await session.execute(select(WorkflowVersion).where(WorkflowVersion.retired_at.is_(None)))).scalars():
-            row.retired_at = utcnow()
-        await session.commit()
+    await S.fresh_source(path)
     yield path
     await ledger_match.drain()
     await run_manager.shutdown()
@@ -115,8 +108,8 @@ async def test_masked_binding_values_and_sql_fragments_are_withheld(client, monk
     await S.publish(graph=S.caliber_graph(template))
     graph = S.chain(
         S.node("start", "input"),
-        S.node("p", "tool", tool="db_query__shop", args={"sql": "SELECT phone FROM orders ORDER BY id"}),
-        S.node("q", "tool", tool="db_query__shop",
+        S.node("p", "tool", tool=S.tool(), args={"sql": "SELECT phone FROM orders ORDER BY id"}),
+        S.node("q", "tool", tool=S.tool(),
                args={"sql": "SELECT SUM(amount) AS gmv FROM orders WHERE phone = '13800000001'"}),
         S.node("write", "report", instructions="写答案"),
         S.node("out", "output", fields=[{"name": "答案", "value": "{{ nodes.write.text }}"}]))

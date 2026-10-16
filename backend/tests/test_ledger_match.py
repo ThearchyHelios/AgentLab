@@ -30,16 +30,7 @@ from tests import ledger_samples as S
 async def engine_up(tmp_path):
     await run_manager.setup()
     path = tmp_path / "shop.db"
-    S.build_shop(path)
-    await S.set_source(path)
-    # 每个用例自己发布口径：先把别的用例发布的退役掉，候选口径只看这一个用例的
-    from app.db.models import WorkflowVersion
-    from app.db.base import utcnow
-
-    async with SessionLocal() as session:
-        for row in (await session.execute(select(WorkflowVersion).where(WorkflowVersion.retired_at.is_(None)))).scalars():
-            row.retired_at = utcnow()
-        await session.commit()
+    await S.fresh_source(path)
     yield path
     await ledger_match.drain()
     await run_manager.shutdown()
@@ -68,7 +59,7 @@ async def test_an_equivalent_query_is_proven_and_its_number_comes_from_the_calib
     assert content["format"] == store.FORMAT and content["algo"] == store.ALGO and content["run_id"] == row.id
     assert content["manifest_hash"] == row.manifest_hash
     [query] = content["queries"]
-    assert query["status"] == "proven" and query["source"] == "shop" and query["tables"] == ["orders"]
+    assert query["status"] == "proven" and query["source"] == S.CURRENT["source"] and query["tables"] == ["orders"]
     [cand] = query["candidates"]
     assert cand["caliber"] == f"{wf}@1" and cand["level"] == "governed" and cand["node_id"] == "fetch"
     assert cand["binding"] == {"start": "2026-09-01", "end": "2026-09-08"}
@@ -283,7 +274,7 @@ async def test_only_sealed_query_snapshots_are_compared(monkeypatch):
 
     await S.publish()
     row = await S.explore(monkeypatch, S.EQUIVALENT, text="本周销售额 [[v:Q1.r0.销售额]]。")
-    await put_json({"sql": S.WITH_REFUNDS, "source": "shop", "columns": ["gmv"], "rows": [[1]]},
+    await put_json({"sql": S.WITH_REFUNDS, "source": S.CURRENT["source"], "columns": ["gmv"], "rows": [[1]]},
                    kind="query_snapshot", run_id=row.id, node_id="q")
     await ledger_match.match_run(row.id, trigger="on_demand")
     recorded, _ = await matched(row.id)
@@ -298,3 +289,17 @@ async def test_cells_inside_a_table_are_labelled_the_same_way(monkeypatch):
     [labels] = [r["labels"] for r in recorded.content["reports"].values()]
     assert len(labels) >= 2 and all(label["kind"] == "caliber" and label["caliber"] == f"{wf}@1"
                                     for label in labels.values())
+
+
+async def test_backfill_starts_in_the_background_when_the_scheduler_is_on(monkeypatch):
+    started = []
+
+    async def fake_backfill(**kw):
+        started.append(kw)
+        return 0
+
+    monkeypatch.setattr(settings, "scheduler", True)
+    monkeypatch.setattr(ledger_match, "backfill", fake_backfill)
+    assert ledger_match.start_backfill() is True
+    await ledger_match.drain()
+    assert started == [{}]

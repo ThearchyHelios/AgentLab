@@ -1,6 +1,7 @@
 """口径账本测试共用的虚构样本：一个店铺库、一份受管口径「周销售」、跑一次探索运行。数据全是编的。
 
-- 店铺库 shop（SQLite）：orders(id, region, status, amount, paid_at, phone)，九单，状态有 paid / refunded / open。
+- 店铺库（SQLite）：orders(id, region, status, amount, paid_at, phone)，九单，状态有 paid / refunded / open。每个用例一个
+  名字不同的数据源（fresh_source）：候选口径按数据源预筛，别的用例发布的口径不会混进来，也不必去动别的用例的数据。
 - 口径「周销售」v1（受管）：入口两个字段 start / end，取数节点 fetch 的 SQL 是
   SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND paid_at >= '{{ input.start }}' AND paid_at < '{{ input.end }}'，
   口径卡 card 上一个指标 gmv = cell(nodes.fetch, 0, 'gmv')。
@@ -55,11 +56,30 @@ def build_shop(path) -> None:
     db.close()
 
 
+#: 这个用例的数据源名（fresh_source 换）：图里的查询工具是 db_query__<它>
+CURRENT = {"source": "shop"}
+
+
+def tool() -> str:
+    return f"db_query__{CURRENT['source']}"
+
+
+async def fresh_source(path) -> str:
+    """建库、起一个这个用例专用的数据源（名字不重复），返回数据源名。"""
+    import uuid
+
+    build_shop(path)
+    CURRENT["source"] = f"shop_{uuid.uuid4().hex[:8]}"
+    await set_source(path)
+    return CURRENT["source"]
+
+
 async def set_source(path, *, options: dict[str, Any] | None = None) -> str:
+    name = CURRENT["source"]
     async with SessionLocal() as session:
-        row = (await session.execute(select(DataSource).where(DataSource.name == "shop"))).scalar_one_or_none()
+        row = (await session.execute(select(DataSource).where(DataSource.name == name))).scalar_one_or_none()
         if row is None:
-            row = DataSource(name="shop", kind="sqlite", database=str(path), readonly=True, enabled=True)
+            row = DataSource(name=name, kind="sqlite", database=str(path), readonly=True, enabled=True)
             session.add(row)
         row.database, row.kind, row.enabled, row.readonly = str(path), "sqlite", True, True
         row.options = dict(options or {})
@@ -73,7 +93,7 @@ def caliber_graph(sql: str = TEMPLATE, *, expression: str = "cell(nodes.fetch, 0
     return chain(
         node("start", "input", fields=[{"name": "start", "required": True}, {"name": "end", "required": True},
                                        {"name": "store", "default": "all"}]),
-        node("fetch", "tool", tool="db_query__shop", args={"sql": sql}),
+        node("fetch", "tool", tool=tool(), args={"sql": sql}),
         node("card", "metrics", caliber="周销售", caliber_version="v1", metrics=[
             {"id": "gmv", "name": "销售额", "unit": "元", "decimals": 2, "format": "thousands", "expression": expression}]),
         node("write", "report", instructions="写周销售"),
@@ -99,7 +119,7 @@ async def publish(name: str = "周销售", *, graph: dict[str, Any] | None = Non
 
 
 def explore_graph(sql: str, *, card_expression: str | None = None) -> dict[str, Any]:
-    parts = [node("start", "input"), node("q", "tool", tool="db_query__shop", args={"sql": sql})]
+    parts = [node("start", "input"), node("q", "tool", tool=tool(), args={"sql": sql})]
     if card_expression:
         parts.append(node("mine", "metrics", caliber="我的口径", caliber_version="v1", metrics=[
             {"id": "gmv", "name": "销售额", "unit": "元", "decimals": 2, "format": "thousands",

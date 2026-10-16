@@ -67,6 +67,7 @@ SNAPSHOT_TAMPERED = "查询快照与哈希不一致，疑似被修改，不比�
 SNAPSHOT_MISSING = "查询快照读不出来，不比对"
 NO_SQL = "查询快照里没有 SQL，不比对"
 PARSE_FAILED = "这次的 SQL 无法解析，没有比对"
+MERGED = "合并查询的格不和口径比对（它的数来自各个输入的查询）"
 MORE_CANDIDATES = "另有 {n} 份相关口径没有比对（每条查询最多比 {max} 份）"
 
 #: 不比对的原因（GET 账本时照实说）
@@ -364,6 +365,10 @@ def compute(sealed: Any, calibers: list[Caliber], kinds: dict[str, str | None], 
     by_key = {c.key: {"level": c.level, "fields": c.summary()["fields"], "expressions": list(c.expressions)}
               for c in considered}
     by_artifact = {q["artifact"]: q for q in results}
+    # 合并查询的快照不比（read_queries 跳过了它），引用了它的格照实写为什么没比对；不进工件的 queries，统计不数它
+    for artifact in sealed.queries:
+        by_artifact.setdefault(artifact, {"artifact": artifact, "status": "skipped", "reason": MERGED,
+                                          "candidates": []})
     sealed_cards = {artifact for _, artifact in sealed.ledger}
 
     def load_card(artifact: str) -> dict[str, Any] | None:
