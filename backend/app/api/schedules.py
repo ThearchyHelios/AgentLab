@@ -491,6 +491,8 @@ async def create_schedule_row(session: AsyncSession, body: dict[str, Any], *, ac
     values = schedule_values(body)
     hook = values.pop("webhook")
     workflow = await _check_workflow(session, values["workflow_id"], values["run_class"], values["input_template"])
+    # 目标的几列只经 scheduler/service 的一处封装写（工作流目标：target_id 同 workflow_id）
+    values |= service.target_columns("workflow", values["workflow_id"])
     row = Schedule(**values, workflow_name=workflow.name,
                    next_run_at=service.next_run(values["cron"], values["timezone"], values["enabled"]),
                    created_by=actor, **_webhook_columns(hook))
@@ -528,7 +530,8 @@ async def update_schedule(schedule_id: str, request: Request,
     if "name" in body:
         values["name"] = _name(body["name"])
     if "workflow_id" in body:
-        values["workflow_id"] = _workflow_id(body["workflow_id"])
+        # 目标的几列一起改（scheduler/service.target_columns）：只改 workflow_id 的话 target_id 还指着原来的工作流
+        values |= service.target_columns("workflow", _workflow_id(body["workflow_id"]))
     if "cron" in body:
         values["cron"] = _cron(body["cron"])
     if "timezone" in body:
