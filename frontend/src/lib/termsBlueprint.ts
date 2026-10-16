@@ -356,6 +356,13 @@ export const BP_EDIT_TEXT = {
   reconcilerHint: '这项写入能力没登记查询：写回的结果不明时（请求发出去了、没拿到答复），平台查不了，也不会自动重发，'
     + '要有人去目标系统里看写进去没有。只能由你来选。',
   reconcilerUnused: '这项写入能力已经登记了查询，结果不明时平台自己去查：这一项用不上了，发布时不会派给他们。',
+  /**
+   * 自由形的「谁来做」（05-已知遗留 (d)）：按导入的图列出，只定由谁做；行名、会签、时限、超时都来自图，要改回画布
+   */
+  freeformPeopleHint: '按导入的图列出：这里只定每一步由谁做，会签、时限、超时和步骤本身在画布上改。',
+  freeformPeopleEmpty: '导入的图里没有要指定由谁处理的步骤。',
+  freeformWho: '谁来做',
+  freeformReadOnly: '图上已经写定，这里不用选',
   removeTitle: (where: string) => `删掉${where}？`,
   removeConfirm: '删掉',
   template: '换一个场景',

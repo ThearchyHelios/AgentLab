@@ -379,7 +379,7 @@ def _derived_people(blueprint: Any) -> list[dict[str, Any]]:
     from app.blueprints.templates import freeform
     from app.blueprints.templates._common import with_graph
 
-    return freeform.people_rows(with_graph(blueprint.spec or {}, blueprint.graph))
+    return freeform.people_rows(with_graph(blueprint.spec or {}, getattr(blueprint, "graph", None)))
 
 
 def blueprint_out(blueprint: Any, *, issues: bool = True, extra: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -398,7 +398,7 @@ def blueprint_out(blueprint: Any, *, issues: bool = True, extra: list[dict[str, 
         "conversation_id": blueprint.conversation_id, "workflow_id": blueprint.workflow_id, "app_id": blueprint.app_id,
         "last_trial_run_id": blueprint.last_trial_run_id, "graph_hash": blueprint.graph_hash, "joints": joints,
         "copied_from": blueprint.copied_from,
-        "reconciler_needed": needs_reconciler(with_graph(blueprint.spec or {}, blueprint.graph)),
+        "reconciler_needed": needs_reconciler(with_graph(blueprint.spec or {}, getattr(blueprint, "graph", None))),
         "derived_people": _derived_people(blueprint) if is_freeform(blueprint.spec or {}) else None,
         "created_at": blueprint.created_at.isoformat() if blueprint.created_at else None,
         "updated_at": blueprint.updated_at.isoformat() if blueprint.updated_at else None,
