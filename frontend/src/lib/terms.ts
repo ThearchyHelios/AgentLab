@@ -759,6 +759,21 @@ export function runCostText(usd: number | null | undefined, unpriced: number, ap
   return `${(approx || unpriced > 0) && usd > 0 ? '≥ ' : ''}${formatCost(usd)}`
 }
 
+/**
+ * 问数据一轮的花费：助手建图（含挑表、接着写、自查修正）+ 运行 + 复核（next-round 细案 01 做法 3）。以前只算运行那份，
+ * 这一轮的花费是低报的
+ */
+export const TURN_COST_TEXT = {
+  copilot: '助手建图',
+  run: '运行',
+  review: '复核',
+  /** 悬停说明的第一行，parts 是「助手建图 $0.012 · 运行 $0.03 · 复核 $0」 */
+  title: (parts: string) => `这一轮的花费：${parts}`,
+  /** n 次调用的金额估不出来：金额只是下限 */
+  unpriced: (n: number) =>
+    `其中 ${formatNumber(n)} 次调用的金额无法估算（模型不在价格目录中，或用量没有报全），未计入，实际花费不低于此数`,
+} as const
+
 export const JUDGE_SETTING_TEXT = {
   label: '证据裁判',
   hint: '报告中的结论句（如「增长主要来自新客首单」）由另一个模型按证据逐句判断：正式运行由报告撰写节点当场裁判，探索运行在点击时逐句裁判。判断由模型给出，不是系统核对，界面上一律标注「非确定」。',

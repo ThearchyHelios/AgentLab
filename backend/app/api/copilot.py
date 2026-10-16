@@ -1792,11 +1792,13 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
     拒绝在这里抛 HTTPException（调用方没迭代到第一条就知道）。catalog_view 是这一轮读哪一份数据目录（data/catalog_view.py：
     查看的表详情、自查的 SQL 检查器都按它），不给是当前目录。
 
-    最后多交一条 usage（providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
+    final 带 next（chat/turn.next_step：run 运行、ready 只建不跑、fail 判失败），问数据页照它走。最后多交一条 usage
+    （providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
     unpriced_calls}——这一轮助手建图（含挑表、接着写、自查修正）花了多少。前面每一条和抽出来之前逐条一样。运行不在这里，
     不计。
     """
     from app.api.deps import restricted
+    from app.chat import turn
     from app.data.catalog_view import CatalogView
     from app.data.sqlcheck import load_checkers
     from app.db.base import SessionLocal
@@ -1859,7 +1861,8 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
                 # 先问清楚才能动手，什么都还没改：这一轮到此为止。照样发一条 final 收尾，带上问题（asked）和没动过的图：
                 # 前端据此把这一轮记成「助手反问」、问题进历史（以前流就这么断了，问数据页一直停在「进行中」），
                 # 不运行、不重排。图给一份对象（画布上原来的图、问数据上一轮的图，都没有就是空图），老前端照样认得
-                yield _asked_final(gen.asked, payload.base_graph, prev_graph)
+                asked_final = _asked_final(gen.asked, payload.base_graph, prev_graph)
+                yield {**asked_final, "next": turn.next_step(asked_final)}
                 return
             # 只发了目录修改提案，既没回答也没改图（用户只是在说一条数据事实）：补一句回答收尾，
             # 不能按下面的「模型没有给出任何修改」报错——提案已经摆在用户面前了
@@ -1945,6 +1948,8 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
                 # 改了图又问了用户（这一轮照样结束、不自动运行）：问题跟着 final 交付，前端记进这一轮
                 **({"asked": _asked_of(gen.asked)} if gen.asked is not None else {}),
             }
+            # 建完之后怎么走（chat/turn.next_step）：run 运行、ready 只建不跑、fail 判失败。问数据页照它走，评测用同一个函数
+            final["next"] = turn.next_step(final)
         except Exception as e:  # noqa: BLE001
             final = {"op": "error", "message": f"模型返回的工作流结构有误：{graph_error(e)}",
                      "hint": "请重试，或把需求描述得更具体", "detail": raw_error(e)}

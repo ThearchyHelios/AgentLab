@@ -17,14 +17,15 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { canLeave, leavePass } from '../lib/leave'
 import { formatNumber, formatTime } from '../lib/format'
-import { CHAT_BLUEPRINT_TEXT } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT, TURN_COST_TEXT, runCostText } from '../lib/terms'
 import { useCatalog, useCatalogListState, useDatasources, useOnReconnect, type CatalogListState } from '../store/catalog'
 import { useAtLeast } from '../store/auth'
 import { useBlueprint } from '../store/blueprint'
 import type { BlueprintScope } from '../typesBlueprint'
 import { blueprintPath, useCreateScope } from './blueprints/shared'
 import {
-  agentSteps, busyTurn, isBusy, stepsVisible, useChat, type Attempt, type ChatTurn, type Failure, type ScopeSource,
+  agentSteps, busyTurn, isBusy, stepsVisible, turnCost, usageOfTurn, useChat, type Attempt, type ChatTurn, type Failure,
+  type ScopeSource,
 } from '../store/chat'
 import { lastVisited, useConversations } from '../store/conversations'
 import {
@@ -422,9 +423,32 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     // 可能先到一两条事件，流会拿第一步的起点顶上，计时器从提问那天跑起
     startedAt: live ? turn.startedAt : null,
     elapsedMs: !live && turn.endedAt ? turn.endedAt - turn.startedAt : turn.meta?.ms ?? undefined,
+    cost: costOf(turn),
   }
   streamCache.set(turn, out)
   return out
+}
+
+/**
+ * 这一轮的花费（助手建图 + 运行 + 复核，store 的 usageOfTurn）：没花钱、也没有估不出的（演示模型、老轮次）不写。
+ * 悬停写各部分，估不出的照实说金额只是下限
+ */
+function costOf(turn: ChatTurn): StreamTurn['cost'] {
+  const usage = usageOfTurn(turn)
+  const total = turnCost(usage)
+  if (!usage || !total || (!total.usd && !total.unpriced)) return undefined
+  const text = runCostText(total.usd, total.unpriced)
+  if (!text) return undefined
+  const part = (label: string, u: { cost_usd?: number | null; unpriced_calls?: number } | undefined) =>
+    `${label} ${runCostText(u?.cost_usd ?? 0, u?.unpriced_calls ?? 0) ?? '—'}`
+  const run = turnCost({ earlier: usage.earlier, run: usage.run })
+  const parts = [
+    part(TURN_COST_TEXT.copilot, usage.copilot),
+    part(TURN_COST_TEXT.run, run ? { cost_usd: run.usd, unpriced_calls: run.unpriced } : undefined),
+    part(TURN_COST_TEXT.review, usage.review),
+  ].join(' · ')
+  return { text, title: [TURN_COST_TEXT.title(parts), total.unpriced ? TURN_COST_TEXT.unpriced(total.unpriced) : '']
+    .filter(Boolean).join('\n') }
 }
 
 /**

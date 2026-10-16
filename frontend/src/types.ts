@@ -1699,6 +1699,17 @@ export interface ReviewResult {
   retry: boolean
   severity: 'broken' | 'degraded' | ''
   signals: ReviewSignal[]
+  /**
+   * 要不要带着原图重来一次、重来时交给助手的话（服务端 backend/app/chat/turn.py 按这一轮试过几次判）：要就是那句话，不要
+   * 是 null。老服务端没有这个字段，问数据页照原来的规则自己判
+   */
+  retry_instruction?: string | null
+  /** 复核这一次的用量（服务端 providers/usage.py 的汇总，没调模型时全 0）：这一轮的花费 = 助手 + 运行 + 复核 */
+  usage?: {
+    cost_usd?: number | null; unpriced_calls?: number; calls?: number; input_tokens?: number; output_tokens?: number
+    by_model?: Record<string, { input_tokens: number; output_tokens: number; calls: number; cost_usd: number
+      unpriced_calls: number }>
+  }
 }
 
 // -------------------------------------------------------------------------

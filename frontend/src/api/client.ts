@@ -880,7 +880,8 @@ export const api = {
     setModel: (body: { provider?: string | null; model?: string | null }) =>
       put<CopilotModel>('/copilot/model', body),
     /** 跑完之后复核一次。干净的运行后端直接返回 verdict='ok'，不调模型 */
-    review: (body: { run_id: string; question: string }) =>
+    /** attempt：这一轮已经自动试了几次（从 0 数），服务端据此决定给不给 retry_instruction。老服务端不认它，忽略 */
+    review: (body: { run_id: string; question: string; attempt?: number }) =>
       post<ReviewResult>('/copilot/review', body),
     /**
      * 一键升级为可追溯结构：先按确定的规则改写（llm 换成报告撰写、问数据的图插入报告节点……），

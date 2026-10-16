@@ -154,6 +154,32 @@ export interface TurnMeta {
    * 有多久没动静：后端按 updated_at 算，而重试一轮昨天的问题时 created_at 是昨天的
    */
   at?: number
+  /** 这一轮的花费：助手建图、运行、复核各一份（next-round 细案 01 做法 3），见 TurnUsage */
+  usage?: TurnUsage
+}
+
+/**
+ * 一份用量：服务端 providers/usage.py 的汇总（助手建图的 usage 操作、复核结果的 usage），或者运行的 usage。cost_usd 只是
+ * 估得出的那部分；unpriced_calls 次估不出（模型不在价格目录里，或者用量没报全），这时金额前写「≥」
+ */
+export interface UsageTotal {
+  cost_usd?: number | null
+  unpriced_calls?: number
+  calls?: number
+  input_tokens?: number
+  output_tokens?: number
+}
+
+/**
+ * 这一轮的花费 = 助手建图 + 运行 + 复核（以前只有运行那份，问数据的花费是低报的）。自动重来、用户点的重试都还是这一轮：
+ * 前几次建图、复核累加在 copilot / review 里，被换掉的运行累加在 earlier 里；run 是当前这次运行（落库时从 run.usage 抄一份，
+ * 恢复的历史轮次不用回源就有数）
+ */
+export interface TurnUsage {
+  copilot?: UsageTotal
+  review?: UsageTotal
+  earlier?: UsageTotal
+  run?: UsageTotal
 }
 
 export interface ChatTurn {
@@ -227,6 +253,8 @@ export interface ChatTurn {
   writing?: { chars: number; thought: string } | null
   /** 这一问只查这几个数据源。重试、重新问都沿用它 */
   scope?: ScopeSource[]
+  /** 这一轮到目前为止的助手建图、复核、被换掉的运行的用量（当前这次运行的在 run.usage），见 TurnUsage */
+  usage?: TurnUsage
   /**
    * 助手问回来的那句话（N11）：这一轮到此结束，问题作为这一轮的内容显示、进历史，输入框提示回答它；用户的回答就是下一轮。
    * 以前这里没有分支：只问不改的一轮流结束时既没有 final 也没有 reply，这一轮一直停在「正在理解需求」
@@ -449,8 +477,56 @@ function buildMeta(t: ChatTurn): TurnMeta {
     asked: t.asked ? true : undefined,
     evidence: hasEvidence(t.output) || t.meta?.evidence || undefined,
     looks: lookList(t),
+    usage: usageOfTurn(t),
     at: Date.now(),
   }
+}
+
+const USAGE_KEYS = ['cost_usd', 'unpriced_calls', 'calls', 'input_tokens', 'output_tokens'] as const
+
+/** 两份用量相加（缺的当 0）。b 不是对象时原样交回 a */
+export function addUsage(a: UsageTotal | undefined, b: UsageTotal | null | undefined): UsageTotal | undefined {
+  if (!b || typeof b !== 'object') return a
+  const out: UsageTotal = { ...(a ?? {}) }
+  for (const k of USAGE_KEYS) {
+    const v = Number(b[k] ?? 0)
+    if (Number.isFinite(v) && v) out[k] = Number(out[k] ?? 0) + v
+  }
+  if (out.cost_usd != null) out.cost_usd = Math.round(out.cost_usd * 1e6) / 1e6
+  return out
+}
+
+/** 运行的 usage（形状同 UsageTotal，可能带别的键）→ 只留要记的几项 */
+function usageTotal(u: Record<string, any> | null | undefined): UsageTotal | undefined {
+  return u && typeof u === 'object' ? addUsage({}, u) : undefined
+}
+
+/** 这一轮现在的用量：内存里累加的那几份，加上当前这次运行的（运行还没回来时沿用落库的那份） */
+export function usageOfTurn(t: ChatTurn): TurnUsage | undefined {
+  const base = t.usage ?? t.meta?.usage
+  const run = usageTotal(t.run?.usage) ?? base?.run
+  const out: TurnUsage = { ...(base ?? {}), ...(run ? { run } : {}) }
+  return Object.keys(out).length ? out : undefined
+}
+
+/** 当前这次运行换下来了（自动重来、用户点重试）：它的用量并进 earlier，这一轮的花费不丢这一笔 */
+function retireRun(t: ChatTurn): TurnUsage | undefined {
+  const u = usageOfTurn(t)
+  if (!u?.run) return u
+  const { run, ...rest } = u
+  return { ...rest, earlier: addUsage(rest.earlier, run) }
+}
+
+/**
+ * 这一轮的花费：助手 + 运行 + 复核。一份都没有（老轮次、还没开始）是 null。unpriced 是估不出金额的调用次数：
+ * 有的话金额只是下限，界面写「≥」（lib/terms 的 runCostText）
+ */
+export function turnCost(u: TurnUsage | undefined): { usd: number; unpriced: number; calls: number } | null {
+  if (!u) return null
+  const parts = [u.copilot, u.review, u.earlier, u.run].filter(Boolean) as UsageTotal[]
+  if (!parts.length) return null
+  const sum = parts.reduce<UsageTotal>((acc, p) => addUsage(acc, p) ?? acc, {})
+  return { usd: Number(sum.cost_usd ?? 0), unpriced: Number(sum.unpriced_calls ?? 0), calls: Number(sum.calls ?? 0) }
 }
 
 /** 这一轮的查看记录：操作流里有就取操作流的（重试会重新查看），恢复的历史轮次没有操作流，沿用 meta 里的 */
@@ -934,6 +1010,8 @@ export const useChat = create<ChatState>((set, get) => ({
       runStatus: undefined, clipped: undefined, pendingRun: false, steps: undefined,
       hydrated: 'done', startedAt: Date.now(), endedAt: undefined, attempt: 0, cancel: null,
       noQuery: false, thinking: '', writing: null, scope: scope?.length ? scope : undefined,
+      // 上一次的运行换下来了，它花的钱还算在这一轮里
+      usage: retireRun(t),
     }))
     void flow.persist({ status: 'running', error: '', answer: '' })
 
@@ -1246,8 +1324,22 @@ function historyOf(conversationId: string, upToTurnId: string): string {
   return lines.slice(-6).join('\n\n')
 }
 
-/** 一轮最多自动再试一次。第二次还不行多半是问题本身没说清，该让用户介入 */
+/**
+ * 一轮最多自动再试一次。第二次还不行多半是问题本身没说清，该让用户介入。
+ * 这几个决定（要不要运行、要不要重来、重来说什么）已经下沉到服务端 backend/app/chat/turn.py：final 带 next，复核带
+ * retry_instruction，这里照它们走；下面这份常量和两种重来的措辞只在老服务端（没给这两个字段）时用，和服务端那份逐字
+ * 对照（backend/tests/test_chat_turn_policy.py）
+ */
 const MAX_ATTEMPTS = 2
+
+/** 重来时交给助手的话（同服务端 chat/turn.py 的 RETRY_WITH_BASE / RETRY_FROM_SCRATCH），只在老服务端时自己拼 */
+function retryInstruction(question: string, reason: string, hasBase: boolean): string {
+  return hasBase
+    ? `这个工作流上一次运行没有成功：${reason}。\n\n`
+      + `请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），`
+      + `改完继续回答原来的问题：${question}`
+    : `${question}\n\n（上一次没有成功：${reason}。请针对这个原因调整，重新给出完整的工作流。）`
+}
 
 interface PlanArgs {
   /** 用户原本问的是什么。跑图取数、复核都要用它，不能被重试的补充说明污染 */
@@ -1298,26 +1390,25 @@ function plan(flow: Flow, args: PlanArgs) {
    * 这里会清空这一次的过程和答案——它是自动补救，用户还没拿到过答案。用户主动
    * 点的重试走 retryTurn，上一次要留档。
    */
-  const retry = (reason: string) => {
-    if (attempt + 1 >= MAX_ATTEMPTS || !flow.alive()) return false
+  const retry = (reason: string, instruction?: string) => {
+    // 服务端给了那句话（复核的 retry_instruction）就是它已经按次数判过可以重来；老服务端由这里按次数判
+    if ((!instruction && attempt + 1 >= MAX_ATTEMPTS) || !flow.alive()) return false
     const base = built && (built.nodes?.length ?? 0) > 0 ? built : null
-    patch(() => ({
+    patch((t) => ({
       attempt: attempt + 1,
       phase: 'planning',
       status: base ? '上次运行未成功，正在调整工作流…' : '上次运行未成功，正在重新生成工作流…',
       ops: [], events: [], run: null, output: null, final: undefined, runStatus: undefined,
       review: null, reviewRaw: null, rawOutput: null, lastSeq: 0, failure: null, error: '',
+      // 换下来的那次运行花的钱还是这一轮的
+      usage: retireRun(t),
     }))
     plan(flow, {
       question,
       attempt: attempt + 1,
       baseGraph: base,
       scope,
-      instruction: base
-        ? `这个工作流上一次运行没有成功：${reason}。\n\n`
-          + `请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），`
-          + `改完继续回答原来的问题：${question}`
-        : `${question}\n\n（上一次没有成功：${reason}。请针对这个原因调整，重新给出完整的工作流。）`,
+      instruction: instruction ?? retryInstruction(question, reason, !!base),
     })
     return true
   }
@@ -1417,8 +1508,13 @@ function plan(flow: Flow, args: PlanArgs) {
           const blockers = ((op.issues ?? []) as ValidationIssue[])
             .filter((i) => i.level === 'error')
             .map((i) => i.message)
-          if (blockers.length && !selfChecked && retry(`生成的工作流没有通过校验：${blockers.join('；')}`)) break
-          if (blockers.length) {
+          // 建完之后怎么走由服务端定（final.next，backend/app/chat/turn.py 的 next_step）：run / ready / fail。
+          // 老服务端没给 next：照原来的规则——有 error 级问题时自查过就判失败、没自查过重来一次；autorun=false 只建不跑
+          const next: string = op.next === 'run' || op.next === 'ready' || op.next === 'fail' ? op.next
+            : blockers.length ? (selfChecked ? 'fail' : 'retry')
+            : op.autorun === false ? 'ready' : 'run'
+          if (next === 'retry' && retry(`生成的工作流没有通过校验：${blockers.join('；')}`)) break
+          if (next === 'fail' || next === 'retry') {
             // 自查修正过（或重来一次）还是没过。校验消息是写给画布用户的（"先拖一个节点进来"），
             // 直接甩给一个在问数据页打字的人毫无意义——先给一句他能照做的，
             // 原文留在技术细节里作线索
@@ -1433,7 +1529,7 @@ function plan(flow: Flow, args: PlanArgs) {
 
           // 用户要的是流程本身时（「设计一个每天跑的工作流」），建完就跑
           // 等于替他多花一次钱，而他要的是那张图
-          if (op.autorun === false) {
+          if (next === 'ready') {
             // 问了用户的不自动运行（服务端 autorun 为假）：图摆着等「运行」，问题照样作为这一轮的内容、进历史
             patch(() => ({
               graph, phase: 'ready', status: asked ? CHAT_BLUEPRINT_TEXT.asked : PHASE_TEXT.ready, cancel: null,
@@ -1447,9 +1543,15 @@ function plan(flow: Flow, args: PlanArgs) {
             graph, phase: 'running', status: PHASE_TEXT.running,
             explanation: op.explanation ?? '',
           }))
-          void launch(flow, graph, question, retry)
+          void launch(flow, graph, question, retry, attempt)
           break
         }
+        case 'usage':
+          // 这一轮助手建图花了多少（服务端 answer_ops 最后一条）：累加进这一轮的用量、随 meta 落库。结局（final、reply）
+          // 那一下已经落过库了，这里再写一次 meta
+          patch((t) => ({ usage: { ...(t.usage ?? t.meta?.usage), copilot: addUsage((t.usage ?? t.meta?.usage)?.copilot, op) } }))
+          void flow.persist()
+          break
         case 'error':
           // 后端给的是三段：message 人话、hint 怎么办、detail 原始异常。
           // 原文不再截成一行甩给用户，收进可展开、可复制的技术细节
@@ -1498,7 +1600,8 @@ function plan(flow: Flow, args: PlanArgs) {
 }
 
 async function launch(
-  flow: Flow, graph: GraphSpec, question: string, retry?: (reason: string) => boolean,
+  flow: Flow, graph: GraphSpec, question: string, retry?: (reason: string, instruction?: string) => boolean,
+  attempt = 0,
 ) {
   const { patch } = flow
   try {
@@ -1517,7 +1620,7 @@ async function launch(
     // 另开一页，它就成了「断在建图阶段」，放久了还会被当成断了写回 error。
     // 「跑一下」发起时库里那行还是 done，一并改成 running
     void flow.persist({ run_id: run.id, status: 'running' })
-    watch(flow, run.id, 0, question, retry)
+    watch(flow, run.id, 0, question, retry, attempt)
   } catch (e) {
     // 发起那一下没到后端：流程是好的，原样再发起就行。通用的「稍等几秒会自动重试」
     // 在这里不成立——这一页没有谁会替它重发
@@ -1600,7 +1703,7 @@ function penOf(patch: Patch): { add: (e: RunEvent) => void; clear: () => void } 
  */
 function watch(
   flow: Flow, runId: string, after = 0,
-  question = '', retry?: (reason: string) => boolean,
+  question = '', retry?: (reason: string, instruction?: string) => boolean, attempt = 0,
 ) {
   const { patch, conversationId, turnId } = flow
   /** 这条流上已经见到结局事件了，stream.end 不用再判一次 */
@@ -1699,7 +1802,7 @@ function watch(
         patch(() => ({ status: '正在核对结果…', runStatus: 'succeeded' }))
         // 跑完不等于答对：先接住这次编排，确认没问题再交付
         void settle(flow, runId, question, d.output ?? null, {
-          truncated: d.output_truncated === true, retry,
+          truncated: d.output_truncated === true, retry, attempt,
         })
         break
     }
@@ -1727,7 +1830,7 @@ function watch(
     if (status === 'succeeded') {
       // 结局事件在断线时丢了：成果以库里为准
       ended = true
-      void settle(flow, runId, question, null, { retry })
+      void settle(flow, runId, question, null, { retry, attempt })
       return
     }
     // 失败、取消、或者运行不见了：状态和原因让 hydrate 去读
@@ -1754,7 +1857,11 @@ function watch(
 async function settle(
   flow: Flow, runId: string, question: string,
   eventOutput: Record<string, any> | null,
-  opts: { truncated?: boolean; retry?: (reason: string) => boolean; run?: Run; endedAt?: number },
+  opts: {
+    truncated?: boolean; retry?: (reason: string, instruction?: string) => boolean; run?: Run; endedAt?: number
+    /** 这一轮已经自动试了几次（从 0 数）：交给复核，服务端据此决定给不给 retry_instruction */
+    attempt?: number
+  },
 ) {
   const { patch } = flow
 
@@ -1781,7 +1888,7 @@ async function settle(
     // 复核慢到一定程度就不等了。它是补一层说明，不该反过来把答案扣住不放——
     // 干净的运行后端 15ms 就返回，会走到这个上限的都是真叫了模型的那些
     result = await Promise.race([
-      api.copilot.review({ run_id: runId, question }),
+      api.copilot.review({ run_id: runId, question, attempt: opts.attempt ?? 0 }),
       new Promise<null>((r) => setTimeout(() => r(null), REVIEW_TIMEOUT_MS)),
     ])
   } catch { /* 复核用不了就按原样交付，下面照常走 */ }
@@ -1796,8 +1903,21 @@ async function settle(
   // 事后排查"它当时为什么没警告我"，靠的就是这个区别
   const review = result && result.verdict !== 'ok' ? result : null
 
-  // 答案根本不可信，而且原因说得清楚——重建一次图再跑，别让用户自己发现
-  if (review?.retry && review.severity === 'broken' && opts.retry) {
+  // 复核这一次的用量也是这一轮的花费（服务端 review_of_run 的 usage；老服务端没有）
+  if (result?.usage) {
+    const spent = result.usage
+    patch((t) => ({ usage: { ...(t.usage ?? t.meta?.usage), review: addUsage((t.usage ?? t.meta?.usage)?.review, spent) } }))
+  }
+
+  // 答案根本不可信，而且原因说得清楚——重建一次图再跑，别让用户自己发现。要不要重来、重来说什么由服务端定（复核的
+  // retry_instruction，backend/app/chat/turn.py）：给了那句话就照它重来，给的是 null 就不重来。老服务端没有这个字段时
+  // 照原来的规则自己判
+  if (opts.retry && result && 'retry_instruction' in result) {
+    if (result.retry_instruction) {
+      const reason = review ? review.signals.map((s) => s.detail).join('；') || review.note : ''
+      if (opts.retry(reason, result.retry_instruction)) return
+    }
+  } else if (review?.retry && review.severity === 'broken' && opts.retry) {
     const reason = review.signals.map((s) => s.detail).join('；') || review.note
     if (opts.retry(reason)) return
   }

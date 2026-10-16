@@ -4,7 +4,8 @@
 问数据页照旧收 SSE。这里守：
 
 - 几种结局（建图交付、直接回答、只问不改、自查改不好、模型出错、没给操作、输出被截断）的 SSE 输出，和抽出来之前
-  逐条一样（剧本见 SCENARIOS，抽出来之前录下的输出在 fixtures/copilot_answer_ops_baseline.json），末尾只多一条 usage；
+  逐条一样（剧本见 SCENARIOS，抽出来之前录下的输出在 fixtures/copilot_answer_ops_baseline.json），末尾只多一条 usage，
+  final 只多一个 next（问数据一轮的决定，chat/turn.py）；
 - 直接迭代 answer_ops 和 SSE 收到的是同一串；
 - 开流前的拒绝（模型没配好、限定的数据源都不在）照旧是 HTTP 错误，不进流。
 
@@ -130,12 +131,19 @@ async def _sse(client, body: dict) -> list[dict]:
 BODY = {"instruction": "数一数门店", "intent": "answer"}
 
 
+#: final 带的 next（chat/turn.next_step）：问数据页照它走
+NEXT = {"graph_ok": "run", "graph_fixed": "run", "check_failed": "fail", "ask_only": "ready"}
+
+
 @pytest.mark.parametrize("name", list(SCENARIOS))
 async def test_the_sse_output_is_unchanged_but_for_a_trailing_usage(client, monkeypatch, name):
     _use(monkeypatch, _Scripted(*SCENARIOS[name]))
     got = await _sse(client, BODY)
     expected = json.loads(BASELINE.read_text(encoding="utf-8"))[name]
     assert got[-1]["op"] == "usage", got[-1]
+    # final 多了 next（问数据一轮的决定下沉到后端），别的一个字不变
+    finals = [op for op in got if op["op"] == "final"]
+    assert [op.pop("next") for op in finals] == ([NEXT[name]] if name in NEXT else [])
     assert got[:-1] == expected
 
 
